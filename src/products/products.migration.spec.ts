@@ -378,6 +378,7 @@ describe('миграция 002', () => {
       '006_host_agent_per_host.sql',
       '007_selfservice.sql',
       '008_domains.sql',
+      '009_product_actions.sql',
     ]);
   });
 

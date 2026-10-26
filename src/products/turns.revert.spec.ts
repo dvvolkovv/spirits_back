@@ -59,3 +59,14 @@ describe('TurnsService.revert', () => {
     );
   });
 });
+
+describe('канал отката', () => {
+  it('откат несёт канал, из которого попросили; по умолчанию web', async () => {
+    const pg = { query: jest.fn(async (sql: string) => (sql.includes('FROM product_turns') ? { rows: [{ id: 't1', sha_before: 'abc' }] } : { rows: [] })) };
+    const svc = new TurnsService(pg as any, { checkTokenBalance: jest.fn(), deductTokens: jest.fn() } as any);
+    const spy = jest.spyOn(svc, 'enqueue').mockResolvedValue({ id: 'new', status: 'queued' } as any);
+    await svc.revert({ productId: 'p1', turnId: 't1', userId: 'u1', channel: 'telegram' });
+    await svc.revert({ productId: 'p1', turnId: 't1', userId: 'u1' });
+    expect(spy.mock.calls.map((c) => c[0].channel)).toEqual(['telegram', 'web']);
+  });
+});

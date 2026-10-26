@@ -39,13 +39,23 @@ export interface ProductToolTokenOpts {
   client?: ProductToolClient;
   scope?: ProductToolScope;
   agent?: ProductToolAgent;
+  /** Метка хода чата (uuid) — см. ProductToolClaims.turn. */
+  turn?: string;
 }
 
 /** Что несёт проверенный токен. */
-export interface ProductToolClaims extends ProductToolTokenOpts {
+export interface ProductToolClaims extends Omit<ProductToolTokenOpts, 'turn'> {
   userId: string;
   channel: ProductToolChannel;
+  /**
+   * Метка хода чата, в котором выпущен токен. По ней чат-сервис в конце хода
+   * находит карточки, заведённые этим ходом. null — у старых токенов и у
+   * вызовов вне хода.
+   */
+  turn: string | null;
 }
+
+const TURN_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Необязательные поля — одна проверка на выпуск и на разбор. Незнакомое
@@ -105,7 +115,15 @@ export function signProductToolToken(
   // Незнакомый канал — отказ: без срока jwt.sign выпустил бы вечный токен.
   const ttl = TTL_SECONDS[channel];
   if (!ttl) throw new Error(`Неизвестный канал: ${channel}`);
-  return jwt.sign({ userId, type: PRODUCT_TOOL_TOKEN_TYPE, channel, ...extraClaims(opts) }, secret(), { expiresIn: ttl });
+  // Метка хода — не через extraClaims: при разборе кривая метка не роняет
+  // токен (карточки просто не найдутся), а при выпуске — ошибка в коде.
+  const { turn, ...rest } = opts;
+  if (turn !== undefined && !TURN_RE.test(turn)) throw new Error('Метка хода — не uuid');
+  return jwt.sign(
+    { userId, type: PRODUCT_TOOL_TOKEN_TYPE, channel, ...extraClaims(rest), ...(turn ? { turn } : {}) },
+    secret(),
+    { expiresIn: ttl },
+  );
 }
 
 /**
@@ -134,10 +152,11 @@ export function verifyProductToolToken(token: string): ProductToolClaims {
   if (!userId || typeof userId !== 'string') {
     throw new Error('В токене нет владельца');
   }
+  const turn = typeof payload?.turn === 'string' && TURN_RE.test(payload.turn) ? payload.turn : null;
   const raw = payload?.channel;
   const channel = raw === undefined || raw === null ? 'web' : raw;
   if (channel !== 'web' && channel !== 'telegram') {
     throw new Error(`Неизвестный канал в токене: ${raw}`);
   }
-  return { userId, channel, ...extraClaims(payload) };
+  return { userId, channel, ...extraClaims(payload), turn };
 }

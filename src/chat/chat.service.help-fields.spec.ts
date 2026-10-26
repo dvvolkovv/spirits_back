@@ -81,7 +81,7 @@ describe('streamUniversalAgent: справка', () => {
 
   it('веб: токен несёт язык, клиент web и штатного ассистента', async () => {
     const f = await harness().run('12', { activity: true, ask: false });
-    expect(verifyProductToolToken(f.products_token)).toEqual({ userId: 'u-test', channel: 'web', lang: 'ru', client: 'web', agent: 'staff' });
+    expect(verifyProductToolToken(f.products_token)).toEqual({ userId: 'u-test', channel: 'web', lang: 'ru', client: 'web', agent: 'staff', turn: expect.stringMatching(/^[0-9a-f-]{36}$/) });
   });
 
   it('без ui (Flutter) — клиент app', async () => {

@@ -7,6 +7,7 @@ import { DomainsService } from './domains.service';
 import { DnsResolver } from './domain-dns';
 import { TurnsService, SLEEPING_REFUSAL, BLOCKED_REFUSAL } from './turns.service';
 import { PRODUCT_TOOL_WAIT_MS } from '../common/relay-budget';
+import { FREE_MONTH_PRODUCTS } from './rent.service';
 
 const PG = process.env.PROVISIONING_PG_URL;
 const maybe = PG ? describe : describe.skip;
@@ -32,6 +33,14 @@ maybe('инструмент продуктов против живого Postgre
   const mkProduct = async (o: {
     user?: string; name: string; slug: string; domain?: string | null;
     kind?: string; status?: string;
+    // Ревью, круг 2, пункт 4: по умолчанию 'done', чтобы существующие
+    // сценарии (ниже) не поменяли смысл — но параметр ЕСТЬ, и явно
+    // означает «нет совсем» (не вставлять строку) / 'failed' / 'queued',
+    // иначе mkProduct прятал бы РОВНО ту регрессию, которую чинит правка
+    // круга 2 пункта 2 (см. тест freeMonthsLeft ниже): все продукты в
+    // старой версии функции заводились уже 'done', и freeMonthsLeft не
+    // отличал бы старый предикат (status='done') от нового (status<>'failed').
+    job?: 'done' | 'failed' | 'queued' | 'none';
   }) => {
     const r = await pool.query(
       `INSERT INTO products (user_id, name, slug, domain, kind, status,
@@ -43,7 +52,25 @@ maybe('инструмент продуктов против живого Postgre
         `/srv/${o.slug}`, `hash-${o.slug}`,
       ],
     );
-    return r.rows[0].id as string;
+    const id = r.rows[0].id as string;
+    // Ревью, пункт 11, правка круга 2 пункт 2: freeMonthsLeft (ниже) считает
+    // продукты, у которых ЕСТЬ НЕ ПРОВАЛИВШЕЕСЯ задание провижининга
+    // (kind='provision' AND status <> 'failed', freeMonthCountedJobSql в
+    // rent.service.ts) — иначе человек, чьё заведение ни разу не поднялось,
+    // не жёг бы свой бесплатный месяц. mkProduct во ВСЕХ тестах этого файла
+    // заводит продукт, который заведомо работал (default 'running' или
+    // статус, в который переходят ТОЛЬКО из running), поэтому этот след
+    // кладётся сюда безусловно (job: 'done' по умолчанию) — без него
+    // freeMonthsLeft во всех существующих сценариях списка молча перестал бы
+    // убывать.
+    const job = o.job ?? 'done';
+    if (job !== 'none') {
+      await pool.query(
+        `INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'provision', $2)`,
+        [id, job],
+      );
+    }
+    return id;
   };
 
   beforeAll(async () => {
@@ -174,8 +201,71 @@ maybe('инструмент продуктов против живого Postgre
       expect(out.ok).toBe(true);
       expect(out.products).toEqual([]);
       expect(out.say).toMatch(/нет|ни одного/i);
-      // Отдельного пункта «Продукты» в меню нет — это вкладка Студии.
-      expect(out.say).toMatch(/в Студии, вкладка «Продукты»/);
+      // С задачи 8 завести продукт может сам ассистент — action="create".
+      expect(out.say).toMatch(/action="create"/);
+      // Свежий пользователь без продуктов — бесплатный месяц ещё впереди.
+      expect(out.say).toMatch(/первый месяц бесплатно/);
+    });
+
+    // Ревью после финального, пункт 2: пользователь без ЖИВЫХ продуктов не
+    // обязательно «свежий» — он мог завести и удалить их раньше. freeMonthsLeft
+    // считает ВСЕХ продуктов за всё время (см. тест ниже), и say обязан
+    // сказать правду про ИМЕННО ЭТОГО человека, а не про типичный случай.
+    it('пустой список, но бесплатные месяцы уже исчерпаны удалёнными продуктами — говорим «сразу платный»', async () => {
+      for (let i = 0; i < FREE_MONTH_PRODUCTS; i++) {
+        const id = await mkProduct({ name: `Продукт ${i}`, slug: `burned-${i}` });
+        await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [id]);
+      }
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
+      const out: any = await svc.execute(OWNER, { action: 'list' });
+      expect(out.products).toEqual([]);
+      expect(out.freeMonthsLeft).toBe(0);
+      expect(out.say).toMatch(/сразу платный/);
+      expect(out.say).not.toMatch(/первый месяц бесплатно/);
+    });
+
+    // Решение владельца 26.10.2026: freeMonthsLeft считает продукты этого
+    // user_id за всё время, включая архивные и стёртые (как и CASE в
+    // ProvisioningService.create), а не только живых — иначе ассистент
+    // пообещал бы бесплатный месяц, который сервер уже не даст. Правка круга
+    // 2 пункта 2: счёт смотрит не на саму строку products, а на то, есть ли у
+    // неё НЕ ПРОВАЛИВШЕЕСЯ задание провижининга (freeMonthCountedJobSql) —
+    // здесь mkProduct(job:'done') это условие уже выполняет, поэтому
+    // архивация в этом сценарии ничего не меняет и демонстрирует только
+    // «за всё время», а не сам предикат — тот проверяют тесты ниже.
+    it('freeMonthsLeft — из продуктов за всё время (с заданием провижининга), не только живых', async () => {
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
+
+      const empty: any = await svc.execute(OWNER, { action: 'list' });
+      expect(empty.freeMonthsLeft).toBe(FREE_MONTH_PRODUCTS);
+
+      const id = await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      const withOne: any = await svc.execute(OWNER, { action: 'list' });
+      expect(withOne.freeMonthsLeft).toBe(FREE_MONTH_PRODUCTS - 1);
+
+      // Архивация не возвращает слот: продукт всё равно был одним из первых.
+      await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [id]);
+      const afterArchive: any = await svc.execute(OWNER, { action: 'list' });
+      expect(afterArchive.freeMonthsLeft).toBe(FREE_MONTH_PRODUCTS - 1);
+    });
+
+    // Ревью, круг 2, пункт 4: без этих двух тестов mkProduct(job:'done')
+    // безусловно во всех остальных сценариях прятал бы саму правку круга 2
+    // пункта 2 — freeMonthsLeft вела бы себя одинаково со старым условием
+    // (status='done') и с новым (status<>'failed'), раз ни один продукт в
+    // файле не заводится ни провалившимся, ни «ещё заводящимся».
+    it('провалившееся задание — продукт не считается, бесплатный месяц не горит', async () => {
+      await mkProduct({ name: 'Не поднялся', slug: 'never-ran', status: 'failed', job: 'failed' });
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
+      const out: any = await svc.execute(OWNER, { action: 'list' });
+      expect(out.freeMonthsLeft).toBe(FREE_MONTH_PRODUCTS);
+    });
+
+    it('задание ещё в очереди/работает (не done) — продукт УЖЕ считается', async () => {
+      await mkProduct({ name: 'Заводится', slug: 'still-provisioning', status: 'provisioning', job: 'queued' });
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
+      const out: any = await svc.execute(OWNER, { action: 'list' });
+      expect(out.freeMonthsLeft).toBe(FREE_MONTH_PRODUCTS - 1);
     });
 
     it('архивированные не показываются', async () => {

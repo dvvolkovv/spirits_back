@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger, OnModuleInit, Optional, forwardRef } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -25,6 +26,8 @@ import { shortsEnabled } from '../shorts/short-env';
 import { fetchMediaBytes } from '../common/net/own-media';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
 import { InsightsCallbackService, shouldRouteToInsights } from '../insights/insights-callback.service';
+import { TgProductActionsService, shouldRouteToProductActions } from './tg-product-actions.service';
+import { stripProductActionBlocks } from '../products/product-action-tail';
 
 // Лимит размера файла, который мы готовы скачать с Telegram и передать в Claude.
 // Telegram сам отдаёт через Bot API до 20 МБ; больше — нужен MTProto, не наш кейс.
@@ -170,6 +173,10 @@ export class TgBotService implements OnModuleInit {
     // сторожит shorts.module.spec.ts.
     @Optional() @Inject(forwardRef(() => ShortsApprovalService))
     private readonly shortsApproval?: ShortsApprovalService,
+    // Карточки продуктов (удаление, ключи бота). После роликов, последним и
+    // @Optional: спеки собирают сервис позиционно. Что модуль его подставляет,
+    // сторожит tg-bot.product-actions-wiring.spec.ts.
+    @Optional() private readonly productActionsTg?: TgProductActionsService,
   ) {}
 
   async onModuleInit() {
@@ -425,6 +432,21 @@ export class TgBotService implements OnModuleInit {
     // чатом сводки, а не связкой ассистентов.
     if (shouldRouteToInsights(data)) {
       await this.insights?.handleCallback(cb);
+      return;
+    }
+
+    // Кнопки карточки продукта — до проверки привязки: владельца действия
+    // сверяет обработчик по привязанному Telegram, а не по связке ассистентов.
+    if (shouldRouteToProductActions(data)) {
+      if (this.productActionsTg) {
+        await this.productActionsTg.handleCallback(cb);
+      } else {
+        // Сервиса нет (например, модуль собран без ProductsModule) — кнопка
+        // всё равно должна погасить спиннер у нажавшего, иначе он крутится
+        // бесконечно. См. tg-bot.product-actions-wiring.spec.ts — она и
+        // проверяет, что в проде сервис подключён и сюда не попадаем.
+        await this.grammy.answerCallbackQuery(cb.id, {}).catch(() => undefined);
+      }
       return;
     }
 
@@ -1029,18 +1051,46 @@ export class TgBotService implements OnModuleInit {
       // него никто не писал (см. productsOwnerForTurn). Считается ПОСЛЕ
       // persistUserMessage: текущее сообщение уже в истории и тоже учтено.
       const productsOwner = await this.productsOwnerForTurn(cfg, msg);
+      const productsTurn = randomUUID();
+      const productsSince = new Date();
+
+      // Карточка (удаление, ключи бота) могла открыться внутри manage_product
+      // ДО того, как ход упал — generateReply мог дойти до инструмента и
+      // свалиться позже (сеть, лимит), и тогда обычная отправка карточек
+      // ниже просто не выполнится. closure и флаг — чтобы послать карточки
+      // ровно один раз, откуда бы их ни позвали: takeForTurn сам не отдаст
+      // вторую порцию (attached_at), но без флага код читался бы так, будто
+      // вызов может повториться по смыслу.
+      let cardsSent = false;
+      const sendProductCards = async (chatId: number): Promise<void> => {
+        if (cardsSent || !productsOwner || !this.productActionsTg) return;
+        cardsSent = true;
+        await this.productActionsTg
+          .sendForTurn({ userId: productsOwner.linkeonId, turn: productsTurn, since: productsSince, chatId, isPrivate: msg.chat?.type === 'private', lang: turnLang })
+          .catch((e: any) => this.logger.warn(`карточки продуктов не отправлены в чат ${chatId}: ${e?.message}`));
+      };
 
       let reply: { text: string; costUsd: number };
       try {
         reply = await this.router.generateReply(cfg, ownerFirstName, attachments, (ev) => {
           if (ev.kind === 'tool_use') editStatus(labelFor(ev.name)).catch(() => {});
-        }, workspace ?? undefined, { productsOwner });
+        }, workspace ?? undefined, { productsOwner, turn: productsTurn });
       } catch (e: any) {
         // Не вылетаем тихо — пишем юзеру в статус и оставляем след в БД.
         await this.recordTurnFailure(cfg, msg.chat.id, statusMsgId, e, turnLang);
         statusMsgId = null; // не удалять в finally — оставляем как уведомление
+        // Ход упал уже ПОСЛЕ того, как manage_product открыл карточку —
+        // без этого вызова она осталась бы висеть в БД навсегда: следующий
+        // ход того же пользователя заберёт её по своему turn, не по этому.
+        await sendProductCards(msg.chat.id);
         throw e;
       }
+
+      // Карточка продукта, которую модель мог скопировать в текст ответа (она
+      // видит actionId из результата manage_product и старые блоки в
+      // истории) — вырезаем до того, как текст уйдёт человеку и в историю:
+      // в Telegram такой блок показался бы как код (см. src/products/product-action-tail.ts).
+      reply = { ...reply, text: stripProductActionBlocks(reply.text) };
 
       // Claude отработал — гасим status-throttle, typing-loop, и удаляем статус,
       // дальше каждый исходящий канал (voice/photo/document) выставит свой action.
@@ -1118,6 +1168,8 @@ export class TgBotService implements OnModuleInit {
           this.logger.warn(`sandbox file ${path.basename(f)} send failed in chat ${outMsg.chat.id}: ${e.message}`);
         }
       }
+
+      await sendProductCards(outMsg.chat.id);
 
       const totalCostUsd = reply.costUsd + voiceTtsCostUsd;
       // Два курса, а не один на сумму: ход Claude — по курсу подписки, озвучка

@@ -4,6 +4,7 @@ import { MiscModule } from '../misc/misc.module';
 import { ProductsController } from './products.controller';
 import { RunnerController } from './runner.controller';
 import { HostController } from './host.controller';
+import { ProductActionsController } from './product-actions.controller';
 import { ProductsService } from './products.service';
 import { TurnsService } from './turns.service';
 import { TurnEventsService } from './turn-events.service';
@@ -17,13 +18,16 @@ import { RentService } from './rent.service';
 import { BlockService } from './block.service';
 import { ProductToolService } from './product-tool.service';
 import { DomainsService } from './domains.service';
+import { ProductActionsService } from './product-actions.service';
+import { ProductLifecycleService } from './product-lifecycle.service';
+import { ProductLifecycleTool } from './product-lifecycle-tool';
 
 @Module({
   imports: [CommonModule, MiscModule],
   // HostController обязан быть ЗДЕСЬ, а не только существовать: маршруты
   // незарегистрированного контроллера отдают 404, а все тесты вида
   // `new HostController(mock)` остаются зелёными. Сторож — products.routes.spec.ts.
-  controllers: [ProductsController, RunnerController, HostController],
+  controllers: [ProductsController, RunnerController, HostController, ProductActionsController],
   providers: [
     ProductsService,
     TurnsService,
@@ -65,7 +69,29 @@ import { DomainsService } from './domains.service';
     // незарегистрированным провайдером — падение старта ГРОМКОЕ, по тому же
     // принципу, что и у HostsService/LimitsService/BlockService выше.
     DomainsService,
+    // Журнал ожидающих действий и жизненный цикл продукта (удалить, вернуть,
+    // откатить, создать бота) — задача 10. Без регистрации здесь
+    // ProductActionsController не поднимается вовсе: обе службы — его
+    // конструкторские зависимости, а Nest не запускает контроллер с
+    // незарегистрированным провайдером — падение старта ГРОМКОЕ, по тому же
+    // принципу, что и у HostsService/LimitsService/BlockService выше.
+    // Экспортируются: их зовут чат (вклейка карточки в ответ) и Telegram-бот.
+    ProductActionsService,
+    ProductLifecycleService,
+    // Новые действия manage_product (create/delete/restore/revert). Сам
+    // ProductLifecycleTool никуда не экспортируется: его зовёт только
+    // ProductToolService внутри этого же модуля.
+    ProductLifecycleTool,
   ],
-  exports: [ProductsService, TurnsService, ProvisioningService, RentService, ProductToolService, DomainsService],
+  exports: [
+    ProductsService,
+    TurnsService,
+    ProvisioningService,
+    RentService,
+    ProductToolService,
+    DomainsService,
+    ProductActionsService,
+    ProductLifecycleService,
+  ],
 })
 export class ProductsModule {}

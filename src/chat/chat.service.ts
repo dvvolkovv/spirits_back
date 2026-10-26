@@ -1,4 +1,5 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { relayAuthHeaders } from './relay-auth';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
@@ -26,6 +27,8 @@ import { ASK_RULE } from './ask-rule';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
 import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, LINKEON_HELP_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
+import { ProductActionsService } from '../products/product-actions.service';
+import { productActionTail, stripProductActionBlocks } from '../products/product-action-tail';
 import { ChatFileStore, PERSIST_TURN_BUDGET_MS } from './chat-files/chat-file-store';
 import { RelayOutputFile, collectOutputFiles, outputFileLines, storeRelayLinks } from './chat-files/relay-links';
 import { BalanceContextService } from '../tokens/balance-context.service';
@@ -435,6 +438,10 @@ export class ChatService {
     // той же причине, что chatFiles; что он подключён, сторожит
     // chat.module.chat-files.spec.ts.
     @Optional() private readonly costGrowth?: CostGrowthService,
+    // Карточки действий продуктов (создание бота, удаление). Последним и
+    // @Optional по той же причине, что chatFiles; что модуль подключён,
+    // сторожит chat.product-actions-wiring.spec.ts.
+    @Optional() private readonly productActions?: ProductActionsService,
   ) {}
 
   /**
@@ -1156,7 +1163,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // (productsRelayFields), Маша — локальным CLI: тот же /webhook/mcp/products
     // по loopback, токен этого пользователя с каналом web — правки ложатся в
     // product_turns с channel='web'. Токен уходит в файл конфига 0600, не в argv.
-    const products = productsCliMcp(userId, 'web', { lang: userLanguage, client: clientKind(storeBuild, ui), agent: 'staff' });
+    const productsTurn = randomUUID();
+    const products = productsCliMcp(userId, 'web', { lang: userLanguage, client: clientKind(storeBuild, ui), agent: 'staff', turn: productsTurn });
     // Звали ли в этом ходе инструмент продуктов — от этого зависит карта ниже.
     let usedProductsTool = false;
 
@@ -1271,6 +1279,19 @@ ${LanguageService.buildDirective(userLanguage)}`;
         } catch (e: any) {
           this.logger.error(`Metaphor card error: ${e.message}`);
         }
+      }
+
+      // Модели нельзя доверять печатать блок product-action самой: она видит
+      // старые блоки в истории и знает actionId из результата инструмента —
+      // могла бы скопировать чужой/просроченный блок или повторить свежий
+      // второй раз. Чистим ответ ПЕРЕД тем, как сервер допишет свой (или не
+      // допишет вовсе, если действий за этот ход нет).
+      fullText = stripProductActionBlocks(fullText);
+      try {
+        const taken = (await this.productActions?.takeForTurn(userId, productsTurn, new Date(turnStartedAt), 'web')) ?? [];
+        fullText += productActionTail(taken, ui.cards, userLanguage);
+      } catch (e: any) {
+        this.logger.warn(`product action attach failed: ${e.message}`);
       }
 
       const tokensUsed = inputTokens + outputTokens;
@@ -1622,6 +1643,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
     const streamStartTime = Date.now();
     const chunks: string[] = []; // hoisted so catch block can access partial response
+    // M4: хвост карточки продукта, который успел дописать обычный путь (см.
+    // «Карточки продуктов, заведённые этим ходом» ниже), ДО того, как апстрим
+    // упал уже после него. Без этой памятки catch-ветка чистит ОБЪЕДИНЁННЫЙ
+    // текст от всех ```product-action``` блоков сразу — включая уже
+    // прикреплённый серверный хвост, не только модельный мусор, — а повторный
+    // takeForTurn() находит пустую выборку (attached_at уже выставлен
+    // обычным путём) и новый хвост не допишет. Карточка пропадает из истории
+    // молча. Хранит именно УЖЕ ДОПИСАННЫЙ текст хвоста, а не факт «дописан» —
+    // catch-ветка дописывает его назад, а не вызывает productActionTail
+    // второй раз.
+    let attachedProductActionTail = '';
 
     // Файлы хода из done.outputFiles. Обработчик done синхронный, а файлы
     // сначала надо скопировать в наше хранилище (chat-files), поэтому ссылки
@@ -1823,6 +1855,15 @@ ${LanguageService.buildDirective(userLanguage)}`;
       }
     };
 
+    // Метка хода — одна на оба вызова upstream (самолечение пустого потока
+    // зовёт его второй раз) И на catch ниже: если апстрим рвётся ПОСЛЕ того,
+    // как модель уже открыла карточку (инструмент продуктов отработал до
+    // обрыва), её нельзя терять — catch забирает её тем же nonce, а не
+    // заводит новый (под новым nonce карточка осталась бы висеть «ничьей» до
+    // следующего хода). Вынесено ДО try, поэтому и объявлено здесь, а не
+    // внутри.
+    const productsTurn = randomUUID();
+
     try {
       // Ход пошёл в upstream — с этого места и до finally его нельзя рвать
       // рестартом. Инкремент внутри try, чтобы декремент в finally был парным
@@ -1892,11 +1933,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // Инструмент продуктов. В отличие от MCP-инструментов на общей точке,
         // владелец едет ПОДПИСЬЮ в заголовке, а не подсказкой в промпте:
         // телефоном в аргументе правились бы чужие сайты.
-        // Тот же токен открывает справку: язык, клиент и вид ассистента едут в подписи.
+        // Тот же токен открывает справку: язык, клиент и вид ассистента едут в
+        // подписи; там же метка хода — по ней в конце хода забираются карточки.
         const pf = productsRelayFields(userId, {
           lang: userLanguage,
           client: clientKind(storeBuild, ui),
           agent: agentId.startsWith('custom:') ? 'custom' : 'staff',
+          turn: productsTurn,
         });
         fd.append('products_token', pf.products_token);
         fd.append('products_mcp_url', pf.products_mcp_url);
@@ -2164,6 +2207,41 @@ ${LanguageService.buildDirective(userLanguage)}`;
         this.logger.warn(`speech marker injection failed: ${e.message}`);
       }
 
+      // Модели нельзя доверять печатать блок product-action самой: она видит
+      // старые блоки в истории и знает actionId из результата инструмента —
+      // могла бы скопировать чужой/просроченный блок или повторить свежий
+      // второй раз. Чистим ОБЪЕДИНЁННЫЙ текст, а не каждый chunk по отдельности
+      // (как [VIDEO_JOB:...] выше): поток режет ответ на чанки произвольно, и
+      // блок на границе двух чанков построчная чистка просто не увидит.
+      // Правим сам chunks (а не локальную переменную) — из него ниже собирают
+      // и fullText для end.content, и persistResponse отдельно пересобирает
+      // тот же chunks.join('') для истории; поправить только одну копию
+      // значило бы разойтись между потоком и тем, что ляжет в БД.
+      {
+        const joined = chunks.join('');
+        const cleaned = stripProductActionBlocks(joined);
+        if (cleaned !== joined) chunks.splice(0, chunks.length, cleaned);
+      }
+
+      // Карточки продуктов, заведённые этим ходом: блок для клиента с
+      // карточками, ссылка на кабинет — для остальных.
+      try {
+        const taken = (await this.productActions?.takeForTurn(userId, productsTurn, new Date(streamStartTime), 'web')) ?? [];
+        const tail = productActionTail(taken, ui.cards, userLanguage);
+        if (tail) {
+          chunks.push(tail);
+          safeWrite({ type: 'item', content: tail });
+          // M4: запоминаем ровно то, что дописали, — если апстрим упадёт
+          // ПОСЛЕ этой точки (но до конца функции), catch-ветка не должна
+          // ни звать takeForTurn второй раз (вернёт [] — карточка уже
+          // забрана), ни стирать этот хвост общей чисткой product-action
+          // блоков.
+          attachedProductActionTail = tail;
+        }
+      } catch (e: any) {
+        this.logger.warn(`product action attach failed: ${e.message}`);
+      }
+
       const fullText = chunks.join('');
       // Text cost. Основной путь — от РЕАЛЬНОЙ стоимости хода: file-agent
       // присылает costUsd в событии `done`, мы переводим его в Linkeon-токены
@@ -2241,6 +2319,47 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // хода всё равно надо скопировать и дописать ссылкой, иначе их потерял
       // бы именно тот случай, ради которого pendingFiles вынесены перед try.
       try { await flushFileLinks(); } catch (e: any) { this.logger.warn(`flushFileLinks in catch failed: ${e.message}`); }
+      // Карточки продуктов — та же история, что с файлами выше: апстрим мог
+      // упасть ПОСЛЕ того, как модель успела дёрнуть инструмент продуктов
+      // (правка уже встала в product_actions), но до конца потока. Без этого
+      // карточка осталась бы «ничьей»: тот же productsTurn её больше не
+      // подхватит (следующий ход заведёт новый nonce), а старый поиск по
+      // created_at её бы нашёл, но только если бы такой поиск тут был.
+      // takeForTurn безопасно вызывать даже если обычная ветка уже успела
+      // забрать карточки этим же productsTurn — UPDATE ... WHERE attached_at
+      // IS NULL во второй раз просто не находит строк и вернёт [] (см.
+      // ProductActionsService.takeForTurn), так что задвоения нет ни здесь
+      // само по себе, ни на стыке с успешной веткой.
+      //
+      // M4: НО если обычная ветка успела дописать свой хвост ДО падения
+      // (attachedProductActionTail не пуст), повторный takeForTurn вернул бы
+      // [] — карточка уже забрана, — и безусловная чистка ```product-action```
+      // блоков ниже стёрла бы именно этот, уже прикреплённый, хвост: он
+      // синтаксически такой же блок, как и модельный мусор, который чистка
+      // обязана снимать. Карточка пропадала бы из истории молча. Поэтому в
+      // этом случае чистим только то, что ДО хвоста, не трогая сам хвост и
+      // не вызывая takeForTurn/productActionTail второй раз, — а хвост в
+      // поток уже уехал обычной веткой, повторный safeWrite тут не нужен.
+      try {
+        if (attachedProductActionTail) {
+          const last = chunks[chunks.length - 1];
+          if (last === attachedProductActionTail) chunks.pop();
+          const cleaned = stripProductActionBlocks(chunks.join(''));
+          chunks.splice(0, chunks.length, cleaned, attachedProductActionTail);
+        } else {
+          const joined = chunks.join('');
+          const cleaned = stripProductActionBlocks(joined);
+          if (cleaned !== joined) chunks.splice(0, chunks.length, cleaned);
+          const taken = (await this.productActions?.takeForTurn(userId, productsTurn, new Date(streamStartTime), 'web')) ?? [];
+          const tail = productActionTail(taken, ui.cards, userLanguage);
+          if (tail) {
+            chunks.push(tail);
+            safeWrite({ type: 'item', content: tail });
+          }
+        }
+      } catch (e: any) {
+        this.logger.warn(`product action attach failed in catch: ${e.message}`);
+      }
       // Try to write error to response; safeWrite is a no-op if client gone.
       const errText = 'Ошибка запуска агента. Попробуйте ещё раз.';
       safeWrite({ type: 'item', content: errText });

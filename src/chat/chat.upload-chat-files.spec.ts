@@ -251,3 +251,55 @@ describe('uploadAndChat — activeStreams (beginStream/endStream)', () => {
     expect(svc.getActiveStreamCount()).toBe(0);
   });
 });
+
+/**
+ * M5: этот путь (upload-and-chat) ни разу не вызывает stripProductActionBlocks
+ * — модельный ```product-action``` блок, скопированный из истории разговора
+ * (та же модель видит actionId старых, уже решённых действий, что и в
+ * streamUniversalAgent), уходил в `end.content` и в историю как есть и
+ * рисовал бы ВТОРУЮ карточку старого действия при следующей загрузке
+ * истории.
+ */
+describe('uploadAndChat — модельный блок product-action вырезается (M5)', () => {
+  beforeEach(() => { jest.clearAllMocks(); delete process.env.AGENT_URL; });
+
+  const FAKE_ID = 'ffffffff-1111-4ccc-8ddd-eeeeeeeeeeee';
+  const FAKE_BLOCK = '```product-action\n{"id":"' + FAKE_ID + '"}\n```';
+
+  it('блок из ответа модели вырезается и в потоке, и в end, и в истории', async () => {
+    const pg = makePg();
+    const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
+    const svc = new ChatService(
+      pg as any, null as any, null as any, null as any, language as any,
+      undefined, undefined, undefined, undefined,
+    );
+    const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+    const ctrl = new ChatController(svc, jwtSvc as any, null as any, undefined);
+    const post = jest.fn(async () => ({
+      data: sseStream([
+        { type: 'delta', text: 'Разобрал документ.\n\n' + FAKE_BLOCK },
+        { type: 'done' },
+      ]),
+    }));
+    (axios as any).default = { post };
+    (axios as any).post = post;
+    const req = {
+      headers: { authorization: 'Bearer token' },
+      files: [{ originalname: 'scan.jpg', buffer: Buffer.from('x'), mimetype: 'image/jpeg', size: 1 }],
+      body: { message: 'разбери', assistantId: '12' },
+    } as any;
+    const res = makeRes();
+
+    await ctrl.uploadAndChat(req, res);
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+
+    const end = res.written.find((w: any) => w.type === 'end');
+    expect(end.content).not.toContain('```product-action');
+    expect(end.content).not.toContain(FAKE_ID);
+    expect(end.content).toContain('Разобрал документ.');
+
+    const saved = pg.calls.find((c) => /INSERT INTO custom_chat_history/.test(c.sql) && /'ai'/.test(c.sql))?.params[2];
+    expect(saved).not.toContain('```product-action');
+    expect(saved).not.toContain(FAKE_ID);
+  });
+});

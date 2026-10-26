@@ -142,12 +142,15 @@ describe('ProvisioningService.claimJob', () => {
     // `WHERE status = 'queued' OR status = 'running'` проверку выше проходит:
     // подстрока "status = 'queued'" на месте. А означает это, что уже выданное
     // задание достаётся второму агенту — ровно то, от чего поставлен
-    // SKIP LOCKED. Дизъюнкции в этом запросе нет нигде и быть не должно.
+    // SKIP LOCKED. Дизъюнкции НА j.status в этом запросе нет нигде и быть не
+    // должно — задача 7 завела свою, но на p.archived_at/p.purged_at (сон
+    // удалённого продукта), и к j.status она не касается.
     const { svc, calls } = makeService();
 
     await svc.claimJob('own');
 
-    expect(calls[0].sql).not.toMatch(/\bOR\b/);
+    expect(calls[0].sql).not.toMatch(/j\.status\s*=\s*'queued'\s*OR/);
+    expect(calls[0].sql).not.toMatch(/OR\s+j\.status/);
   });
 
   it('очередь разбирается с головы: старшее задание первым', async () => {
@@ -499,7 +502,7 @@ describe('claimJob: вид задания', () => {
     await svc.claimJob('own');
 
     expect(calls[0].sql).toMatch(
-      /CASE j\.kind\s+WHEN 'provision' THEN p\.status = 'provisioning'\s+WHEN 'sleep' THEN p\.status IN \('sleeping','blocked'\)\s+(?:--[^\n]*\n\s*)*WHEN 'domain' THEN p\.status IN \('running','degraded','sleeping','blocked'\)\s+ELSE p\.status = 'sleeping'\s+END/,
+      /CASE j\.kind\s+WHEN 'provision' THEN p\.status = 'provisioning'\s+WHEN 'sleep' THEN p\.status IN \('sleeping','blocked','archived'\)\s+(?:--[^\n]*\n\s*)*WHEN 'domain' THEN p\.status IN \('running','degraded','sleeping','blocked'\)\s+ELSE p\.status = 'sleeping'\s+END/,
     );
   });
 
@@ -520,11 +523,15 @@ describe('claimJob: вид задания', () => {
 
     const sql = calls[0].sql;
     // Из сна и пробуждения своя ветка про 'blocked' — только у 'sleep'
-    // ('domain' пускает погашенного ради отвязки, см. claimJob).
-    expect(sql).toMatch(/WHEN 'sleep' THEN p\.status IN \('sleeping','blocked'\)/);
-    // ELSE (то есть 'wake') остаётся узким: 'blocked' в нём быть не должно.
+    // ('domain' пускает погашенного ради отвязки, см. claimJob). Задача 7
+    // добавила туда же 'archived' — тем же способом, тем же списком.
+    expect(sql).toMatch(/WHEN 'sleep' THEN p\.status IN \('sleeping','blocked','archived'\)/);
+    // ELSE (то есть 'wake') остаётся узким: ни 'blocked', ни 'archived' в нём
+    // быть не должно — архивный продукт разворот EXISTS отсекает раньше (см.
+    // «пробуждение удалённого не выдаётся» в provisioning.archived.spec.ts).
     expect(sql).toMatch(/ELSE p\.status = 'sleeping'/);
     expect(sql).not.toMatch(/ELSE p\.status IN \([^)]*blocked/);
+    expect(sql).not.toMatch(/ELSE p\.status IN \([^)]*archived/);
   });
 
   it('на сне и пробуждении токен НЕ выпускается', async () => {
@@ -784,7 +791,12 @@ describe('ProvisioningService.completeJob', () => {
 
     const product = productPart(calls);
     expect(product).toMatch(/WHEN 'provision' THEN 'failed'/);
-    expect(product).toMatch(/WHEN 'sleep' THEN\s+CASE WHEN products\.status = 'blocked' THEN 'blocked' ELSE 'degraded' END/);
+    // Задача 7: тот же приём, что и у 'blocked', распространён на 'archived'
+    // — сорвавшийся сон удалённого продукта оставляет его удалённым, а не
+    // уводит в 'degraded' (который платит аренду и принимает правки).
+    expect(product).toMatch(
+      /WHEN 'sleep' THEN\s+CASE WHEN products\.status IN \('blocked','archived'\) THEN products\.status ELSE 'degraded' END/,
+    );
     // У пробуждения своей ветки НЕТ — оно попадает в ELSE и сохраняет
     // собственный статус. Явная ветка 'wake' здесь была бы лишним местом,
     // которое обязано совпадать со словарём видов.
@@ -809,12 +821,14 @@ describe('ProvisioningService.completeJob', () => {
     await svc.completeJob('j-1', { ok: false, error: 'docker stop не отработал' });
 
     const product = productPart(calls);
-    // Статус блокированного сохраняется...
-    expect(product).toMatch(/CASE WHEN products\.status = 'blocked' THEN 'blocked' ELSE 'degraded' END/);
+    // Статус блокированного (и, с задачи 7, удалённого) сохраняется...
+    expect(product).toMatch(
+      /CASE WHEN products\.status IN \('blocked','archived'\) THEN products\.status ELSE 'degraded' END/,
+    );
     // ...и признак сна у него тоже: продукт мог спать за неуплату ДО гашения,
     // и снятие блокировки вернёт его в 'sleeping' — уже без объяснения.
     expect(product).toMatch(
-      /CASE WHEN products\.status = 'blocked'\s+THEN products\.sleep_reason ELSE NULL END/,
+      /CASE WHEN products\.status IN \('blocked','archived'\)\s+THEN products\.sleep_reason ELSE NULL END/,
     );
   });
 

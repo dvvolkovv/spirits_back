@@ -9,6 +9,7 @@ import { ConfigService } from '@nestjs/config';
 import { PgService } from '../common/services/pg.service';
 import { DomainsService } from './domains.service';
 import { ProductsController } from './products.controller';
+import { FREE_MONTH_PRODUCTS } from './rent.service';
 
 /**
  * Реестр машин. Отдаёт РАЗНЫЕ машины разным аудиториям и разные значения в
@@ -34,7 +35,15 @@ function makeService(over: any = {}) {
   const pg = {
     query: jest.fn(async (sql: string, params: any[] = []) => {
       calls.push({ sql, params });
-      if (sql.includes('SELECT count(*)')) return { rows: [{ count: over.slugTaken ? '1' : '0' }] };
+      // `startsWith`, а не `includes`: с бесплатным месяцем (26.10.2026,
+      // позже уточнённым в ревью пунктом 11) сам INSERT INTO products несёт
+      // внутри CASE подзапрос `(SELECT count(*) FROM products p2 WHERE …)` —
+      // `includes` перехватывал бы и его, подменяя ответ INSERT ответом
+      // проверки слага.
+      if (sql.startsWith('SELECT count(*)')) return { rows: [{ count: over.slugTaken ? '1' : '0' }] };
+      if (sql.includes('SELECT 1 FROM products WHERE tg_bot_id')) {
+        return { rows: over.botBusy ? [{ x: 1 }] : [] };
+      }
       if (sql.includes('INSERT INTO product_provision_jobs') && over.jobInsertFails) {
         throw Object.assign(new Error('деталь для лога'), { code: '23505' });
       }
@@ -48,7 +57,9 @@ function makeService(over: any = {}) {
       if (sql.includes('INSERT INTO products') && over.productInsertError) {
         throw Object.assign(new Error('boom'), over.productInsertError);
       }
-      if (sql.includes('INSERT INTO products')) return { rows: [{ id: 'p-1' }], rowCount: 1 };
+      if (sql.includes('INSERT INTO products')) {
+        return { rows: [{ id: 'p-1', free_month: over.freeMonth ?? true }], rowCount: 1 };
+      }
       return { rows: [], rowCount: 1 };
     }),
   };
@@ -62,12 +73,22 @@ function makeService(over: any = {}) {
       if (over.overLimit) throw new UnprocessableEntityException('предел аккаунта');
     }),
   };
+  const svc = new ProvisioningService(pg as any, secrets as any, hosts as any, limits as any);
+  // I2: без этой заглушки каждый тест ниже с kind:'bot' и секретом BOT_TOKEN
+  // бил бы по настоящему Telegram (новая проверка в create()) — токены во
+  // всех этих тестах фиктивные и заведомо не прошли бы getMe. По умолчанию —
+  // «токен живой», чтобы форма и остальное поведение create() проверялись
+  // как раньше, независимо от содержимого BOT_TOKEN. `over.botCheck`
+  // подменяет результат целиком — для тестов самой этой проверки.
+  const checkBot = jest.fn(async () => over.botCheck ?? { ok: true, id: 9000000001, username: 'studio_bot' });
+  (svc as any).checkBot = checkBot;
   return {
-    svc: new ProvisioningService(pg as any, secrets as any, hosts as any, limits as any),
+    svc,
     calls,
     secrets,
     hosts,
     limits,
+    checkBot,
   };
 }
 
@@ -108,7 +129,7 @@ describe('ProvisioningService.create', () => {
 
     const res = await svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 's', kind: 'site', secrets: {} });
 
-    expect(res).toEqual({ productId: expect.any(String) });
+    expect(res).toEqual({ productId: expect.any(String), freeMonth: expect.any(Boolean) });
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
     expect(insert.params[7]).toMatch(/^[0-9a-f]{64}$/);
   });
@@ -210,9 +231,28 @@ describe('ProvisioningService.create', () => {
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
     expect(insert.sql).toContain(
       '(id, user_id, name, slug, kind, status, checkout_path, runner_token_hash,\n' +
-        '                               secrets_encrypted, domain, host_ip, health_url, host_id)',
+        '                               secrets_encrypted, domain, host_ip, health_url, host_id, tg_bot_id, paid_until)',
     );
-    expect(insert.sql).toContain('VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)');
+    // paid_until, пятнадцатой колонкой: CASE внутри самого INSERT (решение
+    // владельца 26.10.2026, см. комментарий в create()) — первым
+    // FREE_MONTH_PRODUCTS продуктам человека за всю историю месяц, остальным
+    // now(). $2 — тот же userId, что и второй колонкой выше; второй раз он
+    // назван здесь не для красоты: это и есть «кому принадлежит счёт».
+    //
+    // Ревью, пункт 11, правка круга 2 пункт 2: считаются не ВСЕ строки этого
+    // userId, а только те, у которых есть НЕ ПРОВАЛИВШЕЕСЯ задание
+    // провижининга (EXISTS по product_provision_jobs kind='provision'
+    // status <> 'failed', freeMonthCountedJobSql в rent.service.ts) —
+    // продукт, чьё заведение так и не поднялось, бесплатный месяц не жжёт, а
+    // заводящийся (queued/running) — жжёт уже сейчас, не дожидаясь успеха.
+    expect(insert.sql).toContain(
+      'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,\n' +
+        "                 CASE WHEN (SELECT count(*) FROM products p2 WHERE p2.user_id = $2\n" +
+        "                              AND EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.product_id = p2.id AND j.kind = 'provision' AND j.status <> 'failed')) < $15\n" +
+        "                        THEN now() + interval '1 month'\n" +
+        '                        ELSE now()\n' +
+        '                      END)',
+    );
     expect(insert.params).toEqual([
       res.productId,
       'u-1',
@@ -244,6 +284,12 @@ describe('ProvisioningService.create', () => {
       // очереди, через десять минут его хоронит сборщик зависших, и владелец
       // читает про истёкший срок.
       'clients',
+      // tg_bot_id, четырнадцатой колонкой. Студия сайт/бота без токена
+      // заводит и это поле не передаёт вовсе — null, а не колонка по
+      // умолчанию в DDL: заведение задаёт его явно, как и прочие поля.
+      null,
+      // FREE_MONTH_PRODUCTS, пятнадцатым параметром — порог CASE выше.
+      FREE_MONTH_PRODUCTS,
     ]);
   });
 
@@ -265,12 +311,16 @@ describe('ProvisioningService.create', () => {
       '139.59.210.42',
       'http://127.0.0.1:3000/health',
       'own',
+      null,
+      FREE_MONTH_PRODUCTS,
     ]);
     expect(params(client).slice(9)).toEqual([
       's2.c.linkeon.io',
       '10.1.2.3',
       'http://127.0.0.1:3000/health',
       'clients',
+      null,
+      FREE_MONTH_PRODUCTS,
     ]);
   });
 
@@ -463,6 +513,60 @@ describe('ProvisioningService.create', () => {
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
     expect(insert.params).toContain(res.productId);
     expect(res.productId).not.toBe('p-1');
+  });
+
+  // --- бесплатный месяц (решение владельца 26.10.2026) ------------------
+
+  it('freeMonth в ответе — ровно то, что вернул free_month из RETURNING', async () => {
+    // `=== true` в реализации: подложенное отсюда — не boolean, а строка или
+    // отсутствующая строка, — обязано читаться как «не бесплатно», а не как
+    // истина через приведение типа.
+    const trueCase = makeService({ freeMonth: true });
+    const falseCase = makeService({ freeMonth: false });
+
+    const resTrue = await trueCase.svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 's1', kind: 'site', secrets: {} });
+    const resFalse = await falseCase.svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 's2', kind: 'site', secrets: {} });
+
+    expect(resTrue.freeMonth).toBe(true);
+    expect(resFalse.freeMonth).toBe(false);
+  });
+
+  it('пустая или сломанная выдача RETURNING читается как «не бесплатно», а не как истина', async () => {
+    const pg = {
+      query: jest.fn(async (sql: string, params: any[] = []) => {
+        // `startsWith`, а не `includes` (ревью, пункт 8): с задачи 11 сам
+        // INSERT несёт внутри CASE подзапрос `(SELECT count(*) FROM products
+        // p2 WHERE … EXISTS …)` — `includes` перехватывал бы и его, подменяя
+        // ответ INSERT ответом проверки слага, и ветка «пустая выдача» ниже
+        // для INSERT никогда не исполнялась бы на самом деле.
+        if (sql.startsWith('SELECT count(*)')) return { rows: [{ count: '0' }] };
+        if (sql.includes('INSERT INTO products')) return { rows: [], rowCount: 1 }; // пустая выдача
+        return { rows: [], rowCount: 1 };
+      }),
+    };
+    const hosts = { pickForNewProduct: jest.fn(async () => ({ id: 'clients', publicIp: '10.1.2.3', domainSuffix: 'c.linkeon.io' })) };
+    const limits = { assertCanCreate: jest.fn(async () => undefined) };
+    const secrets = { encrypt: jest.fn(() => Buffer.from('шифр')) };
+    const broken = new ProvisioningService(pg as any, secrets as any, hosts as any, limits as any);
+
+    const res = await broken.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site3', kind: 'site', secrets: {} });
+
+    expect(res.freeMonth).toBe(false);
+  });
+
+  it('CASE считает продуктов этого userId внутри самого INSERT, порогом — FREE_MONTH_PRODUCTS', async () => {
+    const { svc, calls } = makeService();
+
+    await svc.create({ userId: 'u-7', isAdmin: false, name: 'X', slug: 'site4', kind: 'site', secrets: {} });
+
+    const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
+    expect(insert.sql).toContain('(SELECT count(*) FROM products p2 WHERE p2.user_id = $2');
+    // Ревью, пункт 11, правка круга 2 пункт 2: считаются не ВСЕ строки, а
+    // только с НЕ ПРОВАЛИВШИМСЯ заданием провижининга — EXISTS по
+    // product_provision_jobs, status <> 'failed' (было строже — status='done').
+    expect(insert.sql).toContain("kind = 'provision' AND j.status <> 'failed'");
+    expect(insert.params[1]).toBe('u-7');
+    expect(insert.params[14]).toBe(FREE_MONTH_PRODUCTS);
   });
 
   it('задание ставится ПОСЛЕ продукта и ровно на него', async () => {
@@ -761,6 +865,94 @@ describe('ProvisioningService.create', () => {
     expect(fix.params[0]).toBe(
       calls.find((c) => c.sql.includes('INSERT INTO products'))!.params[0],
     );
+  });
+
+  // --- I2: Студия заводит бота без tgBotId — create() проверяет токен сам ---
+
+  it('I2: отвергнутый токен — 400 до всякой записи', async () => {
+    const { svc, calls, checkBot } = makeService({ botCheck: { ok: false, reason: 'rejected' } });
+
+    await expect(
+      svc.create({ userId: 'u-1', isAdmin: false, name: 'Бот', slug: 'studio-bot', kind: 'bot', secrets: { BOT_TOKEN: '123456:настоящийНастоящийНастоящий' } }),
+    ).rejects.toThrow(/Telegram не принял токен/);
+
+    expect(checkBot).toHaveBeenCalledWith('123456:настоящийНастоящийНастоящий');
+    expect(sqlOf(calls)).not.toContain('INSERT INTO products');
+  });
+
+  it('I2: форма токена не подходит — тот же 400, до записи', async () => {
+    const { svc, calls } = makeService({ botCheck: { ok: false, reason: 'bad_form' } });
+
+    await expect(
+      svc.create({ userId: 'u-1', isAdmin: false, name: 'Бот', slug: 'studio-bot2', kind: 'bot', secrets: { BOT_TOKEN: 'не токен' } }),
+    ).rejects.toThrow(/Telegram не принял токен/);
+
+    expect(sqlOf(calls)).not.toContain('INSERT INTO products');
+  });
+
+  it('I2: Telegram недоступен — продукт заводится, tg_bot_id — NULL', async () => {
+    const { svc, calls } = makeService({ botCheck: { ok: false, reason: 'unreachable' } });
+
+    const res = await svc.create({
+      userId: 'u-1', isAdmin: false, name: 'Бот', slug: 'studio-bot3', kind: 'bot',
+      secrets: { BOT_TOKEN: '123456:чтоУгодно' },
+    });
+
+    expect(res.productId).toEqual(expect.any(String));
+    const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
+    // tgBotId — предпоследним параметром: последний теперь FREE_MONTH_PRODUCTS
+    // (порог CASE paid_until, решение владельца 26.10.2026).
+    expect(insert.params[insert.params.length - 2]).toBeNull();
+  });
+
+  it('I2: токен живой — tg_bot_id от getMe уходит в INSERT', async () => {
+    const { svc, calls } = makeService({ botCheck: { ok: true, id: 555, username: 'studio_bot' } });
+
+    const res = await svc.create({
+      userId: 'u-1', isAdmin: false, name: 'Бот', slug: 'studio-bot4', kind: 'bot',
+      secrets: { BOT_TOKEN: '123456:чтоУгодно' },
+    });
+
+    expect(res.productId).toEqual(expect.any(String));
+    const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
+    expect(insert.params[insert.params.length - 2]).toBe(555);
+  });
+
+  it('I2: тот же бот уже работает в другом продукте — 409 до записи', async () => {
+    const { svc, calls } = makeService({ botCheck: { ok: true, id: 555 }, botBusy: true });
+
+    await expect(
+      svc.create({ userId: 'u-1', isAdmin: false, name: 'Бот', slug: 'studio-bot5', kind: 'bot', secrets: { BOT_TOKEN: '123456:чтоУгодно' } }),
+    ).rejects.toThrow(/бот уже работает в другом продукте/);
+
+    expect(sqlOf(calls)).not.toContain('INSERT INTO products');
+  });
+
+  it('I2: tgBotId уже передан (путь ассистента) — свой getMe не зовётся', async () => {
+    // Полная противоположность всем тестам выше: completeCreateBot уже
+    // проверил токен и передал готовый tgBotId — повторный поход в Telegram
+    // здесь был бы вторым getMe за тот же токен без всякой нужды.
+    const { svc, calls, checkBot } = makeService();
+
+    await svc.create({
+      userId: 'u-1', isAdmin: false, name: 'Бот', slug: 'studio-bot6', kind: 'bot',
+      secrets: { BOT_TOKEN: '123456:чтоУгодно' }, tgBotId: 777,
+    });
+
+    expect(checkBot).not.toHaveBeenCalled();
+    const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
+    expect(insert.params[insert.params.length - 2]).toBe(777);
+  });
+
+  it('I2: бот без секрета BOT_TOKEN вовсе — getMe не зовётся, tg_bot_id — NULL', async () => {
+    const { svc, calls, checkBot } = makeService();
+
+    const res = await svc.create({ userId: 'u-1', isAdmin: false, name: 'Бот', slug: 'studio-bot7', kind: 'bot', secrets: {} });
+
+    expect(checkBot).not.toHaveBeenCalled();
+    const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
+    expect(insert.params[insert.params.length - 2]).toBeNull();
+    expect(res.productId).toEqual(expect.any(String));
   });
 });
 

@@ -1,10 +1,15 @@
-import { HttpException, Injectable, Logger } from '@nestjs/common';
+import { HttpException, Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { PRODUCT_TOOL_WAIT_MS } from '../common/relay-budget';
 import { TurnsService, SLEEPING_REFUSAL, BLOCKED_REFUSAL } from './turns.service';
 import { DomainErrorReason, DomainRecordToSet, DomainRefusalCode, DomainStatus, DomainsService, DomainView } from './domains.service';
 import { normalizeDomain, readableDomain } from './domain-name';
 import { ProductToolChannel } from './product-tool.token';
+import { ProductLifecycleTool } from './product-lifecycle-tool';
+import { FREE_MONTH_PRODUCTS, RENT_TOKENS, freeMonthCountedJobSql } from './rent.service';
+
+/** «50 000» — как в остальных текстах для людей (products-cli-tool.ts, platform-kb/values.ts). */
+const RENT_TOKEN_TEXT = String(RENT_TOKENS).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
 
 /** Продукт глазами ассистента: без внутренностей, только то, что можно назвать вслух. */
 export interface ProductMatch {
@@ -122,10 +127,32 @@ export function domainForAssistant(v: DomainView): DomainForAssistant {
 
 const NOT_WORKING = ' Не говори, что домен работает.';
 
-/** Ответ на list у пользователя без продуктов. Отдельного пункта «Продукты» в меню нет — это вкладка Студии. */
-export const NO_PRODUCTS_SAY =
-  'У пользователя нет ни одного продукта. Завести продукт ты не можешь — это делается кнопкой ' +
-  'в Студии, вкладка «Продукты».';
+/**
+ * Ответ на list у пользователя без продуктов. С задачи 8 завести продукт может сам ассистент.
+ *
+ * Решение владельца 26.10.2026: бесплатный месяц — только первым
+ * FREE_MONTH_PRODUCTS продуктам человека за всё время (считаются и удалённые),
+ * дальше аренда сразу платная. Числа — из констант, а не литералами: разъедется
+ * цена или число бесплатных месяцев с кодом — этот текст соврёт молча.
+ *
+ * ФУНКЦИЯ, А НЕ КОНСТАНТА (ревью после финального, пункт 2). У пользователя
+ * без ЖИВЫХ продуктов freeMonthsLeft не обязан быть равен FREE_MONTH_PRODUCTS:
+ * он мог завести и удалить их раньше, а мог и завести прямо сейчас, не
+ * дождавшись заведения (freeMonthsLeft считает все продукты, у которых есть
+ * НЕ провалившееся задание провижининга — см. комментарий у list() ниже и
+ * freeMonthCountedJobSql в rent.service.ts) — и тогда этот текст, говоря
+ * безусловно «первый месяц бесплатно», соврал бы ровно тому, кто уже выбрал
+ * свой лимит. Ветка «осталось 0» зеркалит непустой список ниже — тем же
+ * условием freeMonthsLeft > 0, а не отдельно выдуманным.
+ */
+export function noProductsSay(freeMonthsLeft: number): string {
+  return 'У пользователя пока нет продуктов. Создать можешь ты — action="create" (kind "site" или "bot"). ' +
+    'До вызова назови условия: ' +
+    (freeMonthsLeft > 0
+      ? `первый месяц бесплатно — бесплатных месяцев осталось: ${freeMonthsLeft}, дальше — ${RENT_TOKEN_TEXT} токенов в месяц`
+      : `следующий продукт — сразу платный: ${RENT_TOKEN_TEXT} токенов в месяц`) +
+    ', не больше двух продуктов на аккаунт.';
+}
 
 /**
  * Что сказать про отказавшую заявку — по коду причины, а не по `error`
@@ -231,6 +258,9 @@ export class ProductToolService {
     private readonly pg: PgService,
     private readonly turns: TurnsService,
     private readonly domains: DomainsService,
+    // Новые действия (create, delete, restore, revert). @Optional и последним:
+    // спеки собирают сервис позиционно с тремя аргументами.
+    @Optional() private readonly lifecycleTool?: ProductLifecycleTool,
   ) {}
 
   /**
@@ -282,18 +312,57 @@ export class ProductToolService {
    * product_turns.channel у правки. По умолчанию web — так было до появления
    * канала, и так ставит правки релей веб-ассистентов.
    */
-  async execute(userId: string, input: any, channel: ProductToolChannel = 'web'): Promise<any> {
+  async execute(userId: string, input: any, channel: ProductToolChannel = 'web', turn: string | null = null): Promise<any> {
     const action = String(input?.action ?? '').trim();
     if (action === 'list') return this.list(userId);
     if (action === 'edit') return this.edit(userId, input, channel);
-    if (action === 'status') return this.status(userId, input);
+    if (action === 'status') {
+      if (input?.actionId && this.lifecycleTool) return this.lifecycleTool.actionStatus(userId, input.actionId);
+      return this.status(userId, input);
+    }
     if (action === 'domain') return this.domain(userId, input);
+    if (this.lifecycleTool) {
+      if (action === 'create') return this.lifecycleTool.create(userId, input, channel, turn);
+      if (action === 'restore') return this.lifecycleTool.restore(userId, input, channel);
+      if (action === 'delete' || action === 'revert') {
+        const resolved = await this.resolveOne(userId, input);
+        if (resolved.ok === false) return resolved;
+        const { product } = resolved;
+        if (action === 'delete') return this.lifecycleTool.delete(userId, product, channel, turn);
+        try {
+          const r = await this.lifecycleTool.revert(userId, product, input?.turnId, channel);
+          if (r.ok === false) return { ok: false, reason: r.reason, product, say: r.message };
+          const outcome = await this.waitForOutcome(r.turnId);
+          // Только у revert: edit не трогаем — «откат» там был бы неправдой,
+          // а здесь исход — именно откат предыдущей правки.
+          const say = outcome.outcome === 'done'
+            ? `${outcome.say} Это был откат: продукт вернулся к версии до выбранной правки.`
+            : outcome.say;
+          return { ...outcome, product, say };
+        } catch (e: any) {
+          return this.refusal(e, product);
+        }
+      }
+    }
     return {
       ok: false,
       reason: 'bad_action',
-      say: 'Неизвестное действие. Доступны: list (показать продукты), edit (поставить правку), ' +
-           'status (узнать исход правки), domain (свой домен сайта).',
+      say: 'Неизвестное действие. Доступны: list, create, edit, status, revert, delete, restore, domain.',
     };
+  }
+
+  /**
+   * Продукт по описанию из поля `product` — общий путь delete/revert.
+   * Та же неоднозначность и «не найдено», что раньше были инлайн в execute().
+   */
+  private async resolveOne(userId: string, input: any): Promise<{ ok: true; product: ProductMatch } | { ok: false; reason: string; [k: string]: any }> {
+    const matches = await this.resolve(userId, String(input?.product ?? ''));
+    if (matches.length > 1) {
+      return { ok: false, reason: 'ambiguous', matches,
+        say: 'Под это описание подходит несколько продуктов. СПРОСИ у пользователя, какой именно, и повтори вызов. Не выбирай сам.' };
+    }
+    if (!matches.length) return { ok: false, reason: 'not_found', products: (await this.list(userId)).products, say: 'Такого продукта у пользователя нет.' };
+    return { ok: true, product: matches[0] };
   }
 
   private async list(userId: string) {
@@ -315,20 +384,58 @@ export class ProductToolService {
         })),
       );
 
+    const deleted = this.lifecycleTool ? await this.lifecycleTool.listDeleted(userId) : [];
+
+    // СКОЛЬКО БЕСПЛАТНЫХ МЕСЯЦЕВ ЕЩЁ ОСТАЛОСЬ (решение владельца 26.10.2026).
+    // Отдельным запросом, а не фильтром по products выше: тот отбирает
+    // ТОЛЬКО живые (archived_at IS NULL) и пуст у пользователя без единого
+    // живого продукта — а бесплатные месяцы считают строки за всё время,
+    // включая удалённые и стёртые (см. комментарий у ProvisioningService.create
+    // и у FREE_MONTH_PRODUCTS). Фильтром из `products` этот счёт не получить
+    // никак, он обязан быть отдельным.
+    //
+    // Ревью, пункт 11, правка круга 2 пункт 2: считаются продукты с НЕ
+    // ПРОВАЛИВШИМСЯ заданием провижининга (product_provision_jobs:
+    // kind='provision' AND status <> 'failed', freeMonthCountedJobSql в
+    // rent.service.ts) — ТЕМ ЖЕ условием, что в INSERT ProvisioningService.create,
+    // из одного и того же фрагмента SQL. Было строже (status='done'
+    // буквально) — и это было дырой: продукт, который ТОЛЬКО ЗАВОДИТСЯ
+    // (queued/running), не светился в счёте вовсе, и list() называл человеку
+    // с одним реально поднявшимся и одним заводящимся продуктом ещё один
+    // бесплатный месяц, которого сервер уже не даст на следующем create().
+    // Продукт, чьё заведение ни разу не поднялось (status='failed', агенту
+    // хоста не дозвонились или он сам отказал), по-прежнему не должен жечь
+    // человеку бесплатный месяц — ровно для этого лимит и считался, а не
+    // ради количества строк в таблице.
+    const everCount = await this.pg.query(
+      `SELECT count(*) FROM products p WHERE p.user_id = $1 AND ${freeMonthCountedJobSql('p')}`,
+      [userId],
+    );
+    const freeMonthsLeft = Math.max(0, FREE_MONTH_PRODUCTS - Number(everCount.rows[0]?.count ?? 0));
+
     if (!products.length) {
       return {
         ok: true,
         products,
-        say: NO_PRODUCTS_SAY,
+        deleted,
+        freeMonthsLeft,
+        say: noProductsSay(freeMonthsLeft),
       };
     }
     const hasBot = products.some((p) => p.kind === 'bot');
     return {
       ok: true,
       products,
+      deleted,
+      freeMonthsLeft,
       say:
         'Продукты пользователя. Правку ставь действием edit, назвав продукт именем.' +
-        (hasBot ? ' У бота домена нет вовсе — это нормально, а не поломка: адрес есть только у сайтов.' : ''),
+        (hasBot ? ' У бота домена нет вовсе — это нормально, а не поломка: адрес есть только у сайтов.' : '') +
+        (deleted.length ? ' Удалённые (deleted) можно вернуть действием restore до purge_after.' : '') +
+        // Коротко и ДО create: модель называет условие верно, не дожидаясь отказа аренды.
+        (freeMonthsLeft > 0
+          ? ` Следующий новый продукт ещё в счёт бесплатного месяца (осталось ${freeMonthsLeft} из ${FREE_MONTH_PRODUCTS}).`
+          : ` Следующий новый продукт — сразу платный: ${RENT_TOKEN_TEXT} токенов в месяц.`),
     };
   }
 
@@ -366,7 +473,7 @@ export class ProductToolService {
         products,
         say: products.length
           ? 'Такого продукта у пользователя нет. Вот что есть — уточни, какой из них он имел в виду.'
-          : 'У пользователя нет ни одного продукта. Завести продукт ты не можешь — это делается кнопкой в кабинете.',
+          : 'У пользователя нет ни одного продукта. Создать его можно действием create.',
       };
     }
 
@@ -596,12 +703,20 @@ export const PRODUCT_TOOLS = [
   {
     name: PRODUCT_TOOL_NAME,
     description:
-      'Посмотреть и ПРАВИТЬ продукты пользователя (сайты и телеграм-боты, которые он разместил в Линкеоне). ' +
+      'Посмотреть, СОЗДАТЬ, ПРАВИТЬ, удалить и вернуть продукты пользователя (сайты и телеграм-боты, которые он разместил в Линкеоне). ' +
       'Ты видишь только продукты этого пользователя — чужих тебе не покажут ни по имени, ни по идентификатору.\n' +
-      '• action="list" — показать его продукты: имя, адрес, состояние. У ботов адреса нет вовсе — это норма.\n' +
+      '• action="list" — его продукты: имя, адрес, состояние; удалённые, которые ещё можно вернуть, — в deleted с датой purge_after. У ботов адреса нет вовсе — это норма.\n' +
+      `• action="create" — создать: { kind: "site" | "bot", name, prompt? }. ДО вызова назови условия: первый месяц бесплатно — для первых ${FREE_MONTH_PRODUCTS} продуктов человека за всё время (удалённые тоже считаются), дальше сразу ${RENT_TOKEN_TEXT} токенов в месяц, ` +
+      'не больше двух продуктов на аккаунт, — и получи согласие (freeMonthsLeft в list подскажет, какое условие сейчас верно). Сайт создаётся сразу. Для бота сервер сам прикрепит к ответу защищённую карточку: ' +
+      'пользователь введёт в неё токен от @BotFather и ключи сервисов, и бот создастся, когда он её отправит. ' +
+      'prompt — что продукт должен делать: эта правка поставится сама, как только продукт поднимется.\n' +
       '• action="edit" — поставить правку: product (как пользователь назвал продукт) + prompt (что именно сделать, ' +
       'своими словами и подробно — правку исполняет ассистент внутри продукта, он видит только его файлы).\n' +
-      '• action="status" — узнать, чем кончилась правка: product или turnId.\n' +
+      '• action="status" — узнать, чем кончилась правка (product или turnId) или карточка (actionId).\n' +
+      '• action="revert" — откатить правку: product и turnId; без turnId — последнюю применённую. Откат — тоже правка: дождись outcome.\n' +
+      '• action="delete" — удалить: product. Сервер прикрепит к ответу карточку с кнопкой «Удалить»; продукт удалится, только когда пользователь нажмёт её. ' +
+      'После удаления его можно вернуть 30 дней, оплаченный период не возвращается. Не говори «удалил», пока status не вернёт done.\n' +
+      '• action="restore" — вернуть удалённый: product. Нужно свободное место в пределе аккаунта.\n' +
       '• action="domain" — свой домен сайта: { product, domain } — привязать; { product } — узнать состояние; ' +
       '{ product, check: true } — проверить DNS сейчас; { product, remove: true } — отвязать. Вернутся records — ' +
       'записи для регистратора: называй их ДОСЛОВНО (тип, имя, значение), не пересказывая, и обязательно скажи ' +
@@ -624,29 +739,31 @@ export const PRODUCT_TOOLS = [
       'какой именно править, и вызови снова с точным именем. Не выбирай сам.\n' +
       'ЕСЛИ reason="sleeping" — продукт спит из-за нехватки токенов на аренду: предложи пополнить баланс. ' +
       'ЕСЛИ reason="blocked" — продукт остановлен администратором: пополнение НЕ ПОМОЖЕТ, не предлагай его.\n' +
-      'ЧЕГО ТЫ НЕ МОЖЕШЬ: завести новый продукт (это кнопка в Студии, вкладка «Продукты»; продуктов не больше ' +
-      'двух на аккаунт), погасить продукт, загрузить в него файлы, передать в него ключи. Не обещай этого.\n' +
-      'КЛЮЧИ, ТОКЕНЫ И ПАРОЛИ в prompt не вписывай никогда: текст правки хранится в истории и попадает в git ' +
-      'продукта. Ключи сторонних сервисов бот получает только при создании — полем «Дополнительные ключи» в ' +
-      'форме нового продукта; сменить их после создания пока нельзя. Прислал пользователь ключ в чат — в правку ' +
-      'его не передавай и посоветуй ключи в переписку не присылать.\n' +
+      'КАРТОЧКИ: ответ с pending значит, что действие ждёт пользователя. О карточке говори «под ответом карточка» ' +
+      '(в Telegram — «ниже сообщение с кнопкой»), не пересказывай её и не выдумывай. ЧЕГО ТЫ НЕ МОЖЕШЬ: загрузить в продукт файлы.\n' +
+      'КЛЮЧИ, ТОКЕНЫ И ПАРОЛИ в prompt не вписывай никогда: текст правки хранится в истории и попадает в git продукта. ' +
+      'Ключи в разговоре не проси — их вводят только в защищённую карточку при создании бота. Прислал пользователь ключ в чат — ' +
+      'никуда его не передавай и посоветуй ключи в переписку не присылать. Сменить ключи после создания пока нельзя.\n' +
       'ПРО ДЕНЬГИ: разговор с тобой и правка продукта тарифицируются ОТДЕЛЬНО. Когда сообщаешь результат правки — ' +
       'назови расход за ход, чтобы два списания за одну просьбу не выглядели ошибкой.',
     input_schema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['list', 'edit', 'status', 'domain'] },
+        action: { type: 'string', enum: ['list', 'edit', 'status', 'domain', 'create', 'delete', 'restore', 'revert'] },
+        kind: { type: 'string', enum: ['site', 'bot'], description: 'Для create: "site" — сайт, "bot" — телеграм-бот.' },
+        name: { type: 'string', description: 'Для create: название продукта, как его назвал пользователь.' },
+        actionId: { type: 'string', description: 'Для status: идентификатор карточки из прошлого ответа (pending.actionId).' },
         product: {
           type: 'string',
-          description: 'Как пользователь назвал продукт: имя («магазин цветов»), слаг или домен. Для edit обязательно.',
+          description: 'Как пользователь назвал продукт: имя («магазин цветов»), слаг или домен. Для edit, delete, restore, revert обязательно.',
         },
         prompt: {
           type: 'string',
-          description: 'Что именно сделать с продуктом. Подробно и своими словами. Обязательно для edit.',
+          description: 'Что сделать с продуктом (edit) или что он должен делать (create). Подробно и своими словами.',
         },
         turnId: {
           type: 'string',
-          description: 'Идентификатор правки из прошлого вызова edit. Для status вместо product.',
+          description: 'Идентификатор правки из прошлого вызова edit: для status вместо product, для revert — какую откатить.',
         },
         domain: {
           type: 'string',

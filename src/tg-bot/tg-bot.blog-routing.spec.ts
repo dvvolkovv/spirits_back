@@ -32,7 +32,7 @@ describe('роутинг блога в живом обработчике', () =>
   const identity = { getLinkeonIdByTgUserId: jest.fn() };
   const configs = { ensurePrivateConfig: jest.fn(), getActiveByTgChatId: jest.fn() };
   const commands = { handleAgentCallback: jest.fn(), handleLanguageCallback: jest.fn(), handleAssistants: jest.fn() };
-  const grammy = { sendMessage: jest.fn() };
+  const grammy = { sendMessage: jest.fn(), answerCallbackQuery: jest.fn() };
   const blog = { handleCallback: jest.fn(), handleReplyEdit: jest.fn(), handleCaseCommand: jest.fn() };
   const pg = { query: jest.fn() };
 
@@ -55,6 +55,7 @@ describe('роутинг блога в живом обработчике', () =>
   beforeEach(() => {
     jest.resetAllMocks();
     pg.query.mockResolvedValue({ rows: [] });
+    grammy.answerCallbackQuery.mockResolvedValue({});
     (svc as any).handleChatMessage = jest.fn();
     // «команда реплаем остаётся командой» подменяет handleDmCommand на
     // экземпляре — снимаем подмену, каждый тест видит метод с прототипа.
@@ -99,6 +100,31 @@ describe('роутинг блога в живом обработчике', () =>
 
     expect(insights.handleCallback).toHaveBeenCalledWith(cb);
     expect(blog.handleCallback).not.toHaveBeenCalled();
+    expect(identity.getLinkeonIdByTgUserId).not.toHaveBeenCalled();
+  });
+
+  it('кнопка карточки продукта уходит в её обработчик и у непривязанного пользователя', async () => {
+    const productActionsTg = { handleCallback: jest.fn() };
+    const withPa = new TgBotService(
+      pg as any, identity as any, {} as any, configs as any, {} as any, {} as any, {} as any,
+      commands as any, {} as any, grammy as any, {} as any, {} as any, blog as any,
+      undefined, undefined, undefined, productActionsTg as any,
+    );
+    identity.getLinkeonIdByTgUserId.mockResolvedValue(null);
+    const cb = { id: 'cb4', data: 'pa:ok:11111111-2222-3333-4444-555555555555', from: { id: 42 }, message: { chat: { id: 42 } } };
+    await (withPa as any).handleCallbackQuery(cb);
+    expect(productActionsTg.handleCallback).toHaveBeenCalledWith(cb);
+    expect(identity.getLinkeonIdByTgUserId).not.toHaveBeenCalled();
+  });
+
+  // Без TgProductActionsService (сервис @Optional, модуль мог собраться без
+  // ProductsModule) кнопка карточки всё равно должна погасить спиннер у
+  // нажавшего — иначе он крутится вечно (item 6 ревью задачи 12).
+  it('кнопка карточки продукта без TgProductActionsService — спиннер всё равно гасится', async () => {
+    identity.getLinkeonIdByTgUserId.mockResolvedValue(null);
+    const cb = { id: 'cb5', data: 'pa:ok:11111111-2222-3333-4444-555555555555', from: { id: 42 }, message: { chat: { id: 42 } } };
+    await (svc as any).handleCallbackQuery(cb);
+    expect(grammy.answerCallbackQuery).toHaveBeenCalledWith('cb5', {});
     expect(identity.getLinkeonIdByTgUserId).not.toHaveBeenCalled();
   });
 

@@ -9,10 +9,12 @@ import {
 } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { PgService } from '../common/services/pg.service';
+import { BotTokenCheck, checkBotToken } from './bot-token-check';
 import { AGENT_OUTDATED_MARKER } from './domain-name';
 import { HostsService } from './hosts.service';
 import { LimitsService } from './limits.service';
 import { SecretsService } from './secrets.service';
+import { FREE_MONTH_PRODUCTS, freeMonthCountedJobSql } from './rent.service';
 
 export type ProductKind = 'site' | 'bot';
 
@@ -31,6 +33,18 @@ export interface CreateInput {
    * машине — то есть тихую ошибку маршрутизации вместо ошибки типов.
    */
   isAdmin: boolean;
+  /**
+   * Идентификатор бота Telegram (из getMe), уже проверенный вызывающим.
+   *
+   * Заполняется ТОЛЬКО путём ассистента (product-lifecycle.service), после
+   * успешного getMe и до создания продукта — так гонка «второй токен успел
+   * пройти раннюю проверку, пока первый ждал ответ Telegram» ловится не
+   * кодом между SELECT и UPDATE, а партиционным UNIQUE-индексом
+   * `products_tg_bot_live` (009): столкновение приходит сюда как 23505, а не
+   * как молчаливый дубль. Студия продукт без бота заводит и это поле не
+   * передаёт вовсе.
+   */
+  tgBotId?: number;
 }
 
 /**
@@ -412,6 +426,23 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
   private fetchFn: (url: string, init?: RequestInit) => Promise<{ status: number }> = (url, init) =>
     fetch(url, init);
 
+  /**
+   * Подменяется в тестах — тот же приём, что `checkBot` в
+   * product-lifecycle.service.ts (поле, а не прямой вызов), и по той же
+   * причине: иначе каждый существующий тест на заведение бота со
+   * строкой-заглушкой вместо токена бил бы по настоящему Telegram.
+   *
+   * Нужен ЗДЕСЬ, а не только там: путь ассистента (openCreateBot/
+   * completeCreateBot) проверяет токен САМ и передаёт уже проверенный
+   * `tgBotId` сюда — а путь Студии (ProductsController.create) идёт прямо в
+   * `create()`, минуя lifecycle-сервис целиком, и `tgBotId` не передаёт
+   * вовсе (I2). Без проверки здесь Студия заводит бота без tg_bot_id, и ни
+   * ранняя проверка, ни партиционный UNIQUE products_tg_bot_live такой
+   * продукт не видят — два контейнера опрашивают Telegram за один токен, и
+   * один молча теряет обновления (история 25.10).
+   */
+  private checkBot: (token: string) => Promise<BotTokenCheck> = (t) => checkBotToken(t);
+
   constructor(
     private readonly pg: PgService,
     private readonly secrets: SecretsService,
@@ -487,7 +518,7 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    *
    * Живой runner-токен здесь НЕ выпускается — см. комментарий к hash ниже.
    */
-  async create(input: CreateInput): Promise<{ productId: string }> {
+  async create(input: CreateInput): Promise<{ productId: string; freeMonth: boolean }> {
     if (input.kind !== 'site' && input.kind !== 'bot') {
       throw new BadRequestException('неизвестная форма продукта');
     }
@@ -566,6 +597,57 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     const taken = await this.pg.query(`SELECT count(*) FROM products WHERE slug = $1`, [input.slug]);
     if (Number(taken.rows[0].count) > 0) throw new ConflictException('слаг уже занят');
 
+    // I2: ЧЕТВЁРТАЯ проверка — токен бота Студии, и она СТОИТ ПОСЛЕ трёх
+    // проверок по базе выше, а не вместе с разбором формы в начале метода.
+    // Причина та же, по которой предел и машина спрашиваются раньше слага
+    // (см. комментарий выше): getMe — поход во внешнюю сеть (до 8 секунд), и
+    // тратить его на форму, которая всё равно отказала бы по пределу, по
+    // месту на машинах или по занятому слагу, незачем — человек поправил бы
+    // токен, нажал снова и только тогда узнал, что заводить всё равно
+    // некуда. Слаг и секреты из `entries` выше не ходят в сеть вовсе, поэтому
+    // стоят раньше этой проверки, а не после неё.
+    //
+    // `tgBotId` уже проставлен — путь ассистента (openCreateBot/
+    // completeCreateBot) сам вызвал getMe и передал результат сюда; повторная
+    // проверка была бы вторым походом в Telegram за тот же токен. Студия
+    // (ProductsController.create) `tgBotId` не передаёт никогда — вот ровно
+    // тот случай, который эта проверка чинит.
+    let tgBotId = input.tgBotId ?? null;
+    if (input.kind === 'bot' && !tgBotId) {
+      const token = (input.secrets ?? {}).BOT_TOKEN;
+      if (typeof token === 'string' && token.trim() !== '') {
+        const check = await this.checkBot(token.trim());
+        // `check.ok === false`, а не `!check.ok`: strictNullChecks выключен
+        // (tsconfig этого репо) — негативная форма не сужает дискриминированное
+        // объединение до ветки с `reason`, а сравнение с литералом сужает верно
+        // (та же ловушка, что в product-lifecycle.service.ts).
+        if (check.ok === false) {
+          if (check.reason === 'unreachable') {
+            // Telegram не ответил — не вина человека и не повод отказывать в
+            // заведении. Продукт заводится без tg_bot_id; backfillBotIdsTick
+            // (product-lifecycle.service.ts) донесёт метку позже, когда
+            // Telegram снова станет доступен. Лог — без токена.
+            this.logger.warn('заведение бота: getMe недоступен, tg_bot_id проставит бэкафилл позже');
+          } else {
+            throw new BadRequestException('Telegram не принял токен бота — скопируйте его целиком из @BotFather');
+          }
+        } else {
+          // Ранняя проверка — тот же приём, что у completeCreateBot: без неё
+          // человек с уже занятым токеном получил бы 500 на INSERT вместо
+          // понятного «бот уже работает в другом продукте». Окончательный
+          // барьер — партиционный UNIQUE products_tg_bot_live ниже, на самом
+          // INSERT: эта проверка гонку (два getMe параллельно) не ловит, её
+          // ловит индекс.
+          const busy = await this.pg.query(
+            `SELECT 1 FROM products WHERE tg_bot_id = $1 AND archived_at IS NULL LIMIT 1`,
+            [check.id],
+          );
+          if (busy.rows.length) throw new ConflictException('бот уже работает в другом продукте');
+          tgBotId = check.id;
+        }
+      }
+    }
+
     // id генерируется здесь, а не в базе: секреты шифруются с привязкой к нему
     // (AAD), а значит он нужен ДО INSERT. Вариант «вставить, потом обновить»
     // дал бы окно, в котором продукт есть, а секретов нет.
@@ -591,11 +673,90 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       ? this.secrets.encrypt(input.secrets, productId)
       : null;
 
+    // ПЕРВЫЙ МЕСЯЦ БЕСПЛАТНО — ТОЛЬКО ПЕРВЫМ FREE_MONTH_PRODUCTS ПРОДУКТАМ ЧЕЛОВЕКА ЗА ВСЮ ИСТОРИЮ.
+    //
+    // Решение владельца 26.10.2026. Раньше срок полностью держался на DEFAULT
+    // колонки products.paid_until (004_rent.sql), и этот INSERT её не
+    // перечислял вовсе — поэтому там до сих пор написано, что перечислять её
+    // здесь «и не должен»: это было верно до этой правки, а не навсегда.
+    // Свежему продукту DEFAULT всегда даёт месяц. Но удаление в этом проекте
+    // мягкое (archived_at, а не DELETE), и LimitsService считает занятость
+    // предела ТОЛЬКО по archived_at IS NULL — то есть «завести → удалить →
+    // завести» снимает с человека предел немедленно и тут же выдаёт второй
+    // бесплатный месяц, третий, сколько угодно.
+    //
+    // СЧИТАЮТСЯ ВСЕ СТРОКИ ЭТОГО user_id, А НЕ ТОЛЬКО ЖИВЫЕ (при условии ниже
+    // про задание). Удалённый (archived_at не NULL) и даже стёртый
+    // (purged_at не NULL) продукт остаётся строкой в той же таблице products
+    // — не считать их значило бы вернуть ровно ту дыру, которую чинит эта
+    // правка.
+    //
+    // ВЫЧИСЛЯЕТСЯ ВНУТРИ INSERT, ОДНИМ ОПЕРАТОРОМ, А НЕ ОТДЕЛЬНЫМ SELECT
+    // ПЕРЕД НИМ. Отдельный count(*) читал бы снимок, который для второго из
+    // двух одновременных заведений одного человека устареет к моменту записи.
+    // ОСТАТОЧНАЯ ГОНКА СТАЛА УЖЕ, А НЕ ШИРЕ (ревью, круг 2, пункт 2 — круг 1
+    // описывал её как «два параллельных create() одного userId», и это было
+    // верно при условии `status='done'`, но с переходом на «есть
+    // незавалившееся задание» ниже окно сузилось). ЭТОТ INSERT не видит СВОЁ
+    // СОБСТВЕННОЕ задание — оно ставится отдельным INSERT уже ПОСЛЕ него (см.
+    // код сразу после этого try/catch) — то есть окно гонки — это ровно
+    // момент между двумя РАЗНЫМИ INSERT products одного userId, у которых НИ
+    // У ОДНОГО ещё нет ни одной строки задания: только тогда оба могут
+    // увидеть одинаковый count и оба получить бесплатный месяц. Как только у
+    // первого из двух появляется queued-задание (следующая же строка кода
+    // после INSERT products), второй его уже увидит — раньше с условием
+    // `status='done'` это не помогало бы вовсе, задание требовалось ДОВЕСТИ
+    // до конца. Она не закрывается здесь и не обязана: входом в неё можно
+    // воспользоваться не больше раз, чем позволяет сам предел аккаунта
+    // (LimitsService.assertCanCreate, DEFAULT_MAX_PRODUCTS) — assertCanCreate
+    // стоит раньше этого INSERT и бьёт собственную гонку тем же способом
+    // (см. её комментарий «предел мягкий под одновременными заявками»), то
+    // есть цена ошибки здесь уже заранее ограничена, а не бесконечна.
+    //
+    // БЕЗ ИСКЛЮЧЕНИЯ ДЛЯ АДМИНИСТРАТОРА. RentService.chargeRent/tick аренду
+    // списывает по status/paid_until, не глядя на isAdmin — правило одно на
+    // всех. У LimitsService администратор исключён из предела количества
+    // (другое решение, другая причина — своя машина со своим потолком), но
+    // это не довод заводить второе понятие «свой» и здесь.
+    // РЕВЬЮ, ПУНКТ 11 (владелец-дружественный счёт), ПРАВКА КРУГА 2 ПУНКТ 2.
+    // Считаются продукты, у которых есть НЕ ПРОВАЛИВШЕЕСЯ задание
+    // провижининга: `product_provision_jobs` со строкой `kind='provision' AND
+    // status <> 'failed'` (см. freeMonthCountedJobSql, rent.service.ts —
+    // единый фрагмент для этого INSERT и для ProductToolService.list). Было
+    // строже — `status='done'` — и именно это было дырой: продукт, который
+    // ТОЛЬКО ЗАВОДИТСЯ (queued/running, completeJob ещё не отчитался), читался
+    // как «не считается», и человек с одним реально поднявшимся продуктом и
+    // одним заводящимся получал ТРЕТИЙ бесплатный месяц. Отчёт completeJob()
+    // об успехе (см. его докблок выше) переводит задание в 'done' — но
+    // считать теперь нужно начиная с 'queued', а не только с этого момента.
+    // Строка задания остаётся с продуктом НАВСЕГДА, даже если его потом
+    // удалят (archived_at) или сотрут (purged_at): FK у
+    // product_provision_jobs — ON DELETE CASCADE, но здесь это DELETE из
+    // products не происходит, продукт только архивируется.
+    //
+    // ПОЧЕМУ НЕ products.status. Текущий статус рассказывает только о
+    // СЕЙЧАС: у удалённого продукта это 'archived' независимо от того, работал
+    // ли он раньше, — различить «сгорел месяц, а он всё равно не поднялся» и
+    // «работал, потом удалили» по одной колонке status нельзя. Job-история
+    // переживает архивацию, а текущий статус — нет.
+    //
+    // ДРУГОГО, более прямого маркера («ready_at», «promoted_at» и т.п.) в
+    // схеме НЕТ — promoteReady() переводит в running по измеримому факту
+    // (heartbeat + ответ), но не оставляет персистентной отметки «был живым»,
+    // переживающей смену статуса. product_provision_jobs — единственный
+    // снимок, который переживает весь жизненный цикл продукта.
+    let freeMonth = false;
     try {
-      await this.pg.query(
+      const ins = await this.pg.query(
         `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash,
-                               secrets_encrypted, domain, host_ip, health_url, host_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+                               secrets_encrypted, domain, host_ip, health_url, host_id, tg_bot_id, paid_until)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                 CASE WHEN (SELECT count(*) FROM products p2 WHERE p2.user_id = $2
+                              AND ${freeMonthCountedJobSql('p2')}) < $15
+                        THEN now() + interval '1 month'
+                        ELSE now()
+                      END)
+         RETURNING paid_until > now() + interval '27 days' AS free_month`,
         [
           productId,
           input.userId,
@@ -621,8 +782,24 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
           // агенту достанется работа, и по ней же кабинет судит о жизни
           // агента (hostAgentsLiveForUser).
           host.id,
+          // Пишется ТЕМ ЖЕ оператором, что заводит продукт — не отдельным
+          // UPDATE после. Между «создали» и «пометили бот занятым» отдельный
+          // UPDATE оставлял бы окно, где два INSERT с одним tg_bot_id оба
+          // проходят (ни у одного ещё нет метки), а партиционный индекс
+          // ниже стоит именно на products, а не на промежуточном шаге.
+          //
+          // `tgBotId` — локальная переменная, а не `input.tgBotId ?? null`:
+          // она несёт ещё и результат проверки Студии чуть выше (I2), которой
+          // у `input.tgBotId` просто нет.
+          tgBotId,
+          FREE_MONTH_PRODUCTS,
         ],
       );
+      // `=== true`, а не приведение к истинности: сравнение в RETURNING
+      // отдаёт настоящий boolean, но лишняя защита от NULL/undefined дешевле,
+      // чем молчаливое «бесплатно» при пустой выдаче (та же осторожность,
+      // что в LimitsService.assertCanCreate).
+      freeMonth = ins.rows?.[0]?.free_month === true;
     } catch (e: any) {
       // Гонка: между SELECT count(*) и этим INSERT слаг мог занять
       // параллельный запрос. Продукта при этом не остаётся, страдает только
@@ -637,6 +814,15 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       // 500. Имена ограничений сняты с живой базы.
       if (e?.code === '23505' && e?.constraint === 'products_slug_key') {
         throw new ConflictException('слаг уже занят');
+      }
+      // Та же гонка, но за токен бота: два ожидающих подтверждения с одним
+      // getMe прошли раннюю проверку оба (она читает только живые продукты,
+      // а на этот момент ни у одного ещё нет строки), и вторым INSERT сюда
+      // бьёт products_tg_bot_live (009_product_actions.sql). Сообщение то же,
+      // что у ранней проверки в completeCreateBot — карточка вернётся в
+      // ожидание с одинаковым текстом независимо от того, где гонка поймана.
+      if (e?.code === '23505' && e?.constraint === 'products_tg_bot_live') {
+        throw new ConflictException('бот уже работает в другом продукте');
       }
       throw e;
     }
@@ -664,7 +850,7 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       throw e;
     }
 
-    return { productId };
+    return { productId, freeMonth };
   }
 
   /**
@@ -773,7 +959,18 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
            WHERE j.status = 'queued'
              AND EXISTS (SELECT 1 FROM products p
                           WHERE p.id = j.product_id
-                            AND p.archived_at IS NULL
+                            -- Удалённый (архивный, но ещё не стёртый) продукт
+                            -- получает от агента ТОЛЬКО сон: контейнер
+                            -- гасится, домен уходит на заглушку. Пробуждение,
+                            -- домен и заведение архивному не выдаются —
+                            -- вторая ветка OR истинна исключительно для
+                            -- 'sleep'. Стёртому (purged_at не NULL) — ничего,
+                            -- даже сон: восстанавливать уже нечего. OR стоит
+                            -- ВНУТРИ EXISTS и j.status не трогает, поэтому
+                            -- SKIP LOCKED и отбор строго по 'queued' ниже не
+                            -- меняются (сторож — «очередь читается ТОЛЬКО по
+                            -- queued», provisioning.job.spec.ts).
+                            AND (p.archived_at IS NULL OR (j.kind = 'sleep' AND p.purged_at IS NULL))
                             -- Метка машины. Условие внутри EXISTS, то есть
                             -- ВНУТРИ отбора, а не поверх него: наложенное
                             -- снаружи (на claimed или на итоговый SELECT), оно
@@ -807,7 +1004,7 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                             --     поднимет контейнер обратно через секунды.
                             AND CASE j.kind
                                   WHEN 'provision' THEN p.status = 'provisioning'
-                                  WHEN 'sleep' THEN p.status IN ('sleeping','blocked')
+                                  WHEN 'sleep' THEN p.status IN ('sleeping','blocked','archived')
                                   -- Своя ветка ОБЯЗАТЕЛЬНА: без неё 'domain'
                                   -- попал бы в ELSE и выдавался бы только
                                   -- спящим — у работающего висел бы вечно.
@@ -849,8 +1046,11 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
               -- бы первый блок с этим server_name.
               , COALESCE((SELECT d.names FROM product_domains d
                            WHERE d.product_id = p.id
-                             -- CASE, а не дизъюнкция: её в этом запросе нет
-                             -- нигде (сторож — «очередь читается ТОЛЬКО по queued»).
+                             -- CASE, а не дизъюнкция на j.status: такой в этом
+                             -- запросе нет нигде (сторож — «очередь читается
+                             -- ТОЛЬКО по queued», provisioning.job.spec.ts —
+                             -- OR на p.archived_at/p.purged_at выше j.status
+                             -- не касается).
                              AND CASE d.status
                                    WHEN 'active' THEN true
                                    WHEN 'issuing' THEN
@@ -861,7 +1061,7 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                                      END
                                    ELSE false
                                  END), '{}') AS custom_names
-              , CASE WHEN p.status = 'blocked' THEN 'asleep'
+              , CASE WHEN p.status IN ('blocked','archived') THEN 'asleep'
                      WHEN p.status = 'sleeping' AND NOT ${wokenSql('p.id')} THEN 'asleep'
                      ELSE 'proxy' END AS vhost_mode
          FROM claimed c
@@ -1033,12 +1233,12 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
           SET status = CASE closed.kind
                          WHEN 'provision' THEN 'failed'
                          WHEN 'sleep' THEN
-                           CASE WHEN products.status = 'blocked' THEN 'blocked' ELSE 'degraded' END
+                           CASE WHEN products.status IN ('blocked','archived') THEN products.status ELSE 'degraded' END
                          ELSE products.status
                        END,
               sleep_reason = CASE closed.kind
                                WHEN 'sleep' THEN
-                                 CASE WHEN products.status = 'blocked'
+                                 CASE WHEN products.status IN ('blocked','archived')
                                       THEN products.sleep_reason ELSE NULL END
                                ELSE products.sleep_reason
                              END,
@@ -1621,11 +1821,18 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
               END
         -- archived_at выводит строку из-под гейта СОВСЕМ: архивный продукт,
         -- застрявший в provisioning с закрытым заданием, не переводится и не
-        -- хоронится — состояние без выхода. Сегодня оно недостижимо, потому
-        -- что products.archived_at не пишет ни одна строка кода; принятый в
-        -- репозитории приём (см. promoteReady и claimJob) выводит архивные
-        -- из-под обработки сам, и здесь он повторён однородности ради. Как
-        -- только архивация появится, этому случаю понадобится свой исход.
+        -- хоронится — состояние без выхода.
+        --
+        -- Сегодня (очередь «ассистент ведёт продукт целиком») archived_at
+        -- УЖЕ пишет код — completeDelete, product-lifecycle.service.ts. Но
+        -- это состояние всё равно практически недостижимо: openDelete там
+        -- же отказывает открывать карточку удаления продукту в
+        -- status = 'provisioning' («продукт ещё заводится — удалить его
+        -- можно через минуту») — то есть archived_at у provisioning-строки
+        -- взяться неоткуда штатным путём. Условие здесь — не для текущего
+        -- заведения, а на случай, если этот запрет когда-нибудь снимут, и
+        -- тот же приём, что у promoteReady/claimJob, повторён однородности
+        -- ради. Если снимут — этому случаю понадобится свой исход.
         WHERE p.status = 'provisioning' AND p.archived_at IS NULL
           AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
                            WHERE j.product_id = p.id AND j.status IN ('queued','running'))

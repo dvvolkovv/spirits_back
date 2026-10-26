@@ -80,7 +80,7 @@ describe('TgRouterService.generateReply: инструмент продуктов
     expect(opts.mcpServers?.products?.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/webhook\/mcp\/products$/);
     const bearer = String(opts.mcpServers.products.headers?.Authorization ?? '');
     expect(verifyProductToolToken(bearer.replace(/^Bearer /, ''))).toEqual({
-      userId: 'u-owner', channel: 'telegram', lang: 'ru', client: 'telegram', agent: 'staff',
+      userId: 'u-owner', channel: 'telegram', lang: 'ru', client: 'telegram', agent: 'staff', turn: null,
     });
   });
 
@@ -388,12 +388,17 @@ describe('TgBotService.handleChatMessage: гейт и вложения', () => {
       getFile: jest.fn(async (id: string) => ({ file_path: `documents/${id}.xlsx` })),
       downloadFile: jest.fn(async () => Buffer.from('xlsx-bytes')),
     };
+    const productActionsTg = {
+      handleCallback: jest.fn(async () => {}),
+      sendForTurn: jest.fn(async () => { order.push('sendForTurn'); }),
+    };
     const svc = new TgBotService(
       pg as any, identity as any, null as any, null as any, router as any,
       null as any, billing as any, commands as any, meetings as any, grammy as any, null as any, null as any,
+      null as any, undefined, undefined, undefined, productActionsTg as any,
     );
     (svc as any).logger = { error: () => {}, warn: () => {}, log: () => {}, debug: () => {} };
-    return { svc, router, order };
+    return { svc, router, order, productActionsTg };
   }
 
   const CFG: any = {
@@ -414,10 +419,51 @@ describe('TgBotService.handleChatMessage: гейт и вложения', () => {
     const { svc, router, order } = makeTurnBot({ linkeonId: 'u-owner', solo: true });
     await (svc as any).handleChatMessage(groupMsg(111), CFG);
     expect(router.generateReply).toHaveBeenCalledTimes(1);
-    expect(generateOpts(router)).toEqual({ productsOwner: { linkeonId: 'u-owner', tgUserId: 111 } });
+    // turn — метка хода (случайный uuid на каждый вызов, задача 12): по ней
+    // takeForTurn отличает карточки этого хода от чужих в то же окно времени.
+    expect(generateOpts(router)).toEqual({ productsOwner: { linkeonId: 'u-owner', tgUserId: 111 }, turn: expect.any(String) });
     // Текущее сообщение уже сохранено к моменту проверки — оно тоже учтено.
     expect(order.indexOf('persist')).toBeLessThan(order.indexOf('onlySpeakerIs'));
     expect(order.indexOf('onlySpeakerIs')).toBeLessThan(order.indexOf('generateReply'));
+  });
+
+  // Задача 12, ревью: карточка (удаление, ключи бота), открытая manage_product
+  // внутри хода, обязана уйти той же меткой хода (turn), что и generateReply —
+  // иначе sendForTurn забрал бы карточки другого хода или не забрал бы ничего.
+  it('sendForTurn получает ту же метку хода (turn), что ушла в generateReply', async () => {
+    const { svc, router, productActionsTg } = makeTurnBot({ linkeonId: 'u-owner', solo: true });
+    await (svc as any).handleChatMessage(groupMsg(111), CFG);
+    expect(productActionsTg.sendForTurn).toHaveBeenCalledTimes(1);
+    expect(productActionsTg.sendForTurn.mock.calls[0][0].turn).toBe(generateOpts(router).turn);
+  });
+
+  it('sendForTurn: isPrivate — по типу чата сообщения (группа/личка), а не по конфигу', async () => {
+    const group = makeTurnBot({ linkeonId: 'u-owner', solo: true });
+    await (group.svc as any).handleChatMessage(groupMsg(111), CFG);
+    expect(group.productActionsTg.sendForTurn.mock.calls[0][0].isPrivate).toBe(false);
+
+    const priv = makeTurnBot({ linkeonId: 'u-owner', solo: true });
+    await (priv.svc as any).handleChatMessage(groupMsg(111, { chat: { id: -100123, type: 'private' } }), CFG);
+    expect(priv.productActionsTg.sendForTurn.mock.calls[0][0].isPrivate).toBe(true);
+  });
+
+  it('sendForTurn: chatId — чат, куда фактически ушёл ответ (outMsg.chat.id)', async () => {
+    const { svc, productActionsTg } = makeTurnBot({ linkeonId: 'u-owner', solo: true });
+    await (svc as any).handleChatMessage(groupMsg(111), CFG);
+    expect(productActionsTg.sendForTurn.mock.calls[0][0].chatId).toBe(-100123);
+  });
+
+  // Ревью задачи 12, пункт 3: если generateReply упал ПОСЛЕ того, как
+  // manage_product успел открыть карточку, карточка не должна остаться висеть
+  // в БД навсегда — её забирает только turn этого хода, а следующий ход
+  // заведёт свой.
+  it('generateReply упал — карточка всё равно уходит, тем же turn', async () => {
+    const { svc, router, productActionsTg } = makeTurnBot({ linkeonId: 'u-owner', solo: true });
+    router.generateReply.mockRejectedValueOnce(new Error('upstream прервался'));
+    await expect((svc as any).handleChatMessage(groupMsg(111), CFG)).rejects.toThrow('upstream прервался');
+    expect(productActionsTg.sendForTurn).toHaveBeenCalledTimes(1);
+    expect(productActionsTg.sendForTurn.mock.calls[0][0].turn).toBe(generateOpts(router).turn);
+    expect(productActionsTg.sendForTurn.mock.calls[0][0].chatId).toBe(-100123);
   });
 
   it('пишет не владелец: инструмента нет', async () => {
@@ -456,6 +502,27 @@ describe('TgBotService.handleChatMessage: гейт и вложения', () => {
     await (svc as any).handleChatMessage(docMsg(111), CFG);
     expect(router.persistUserMessage).toHaveBeenCalled();
     expect(workspaceFiles()).toEqual(['dds.xlsx']);
+  });
+
+  // Модель видит actionId своего же manage_product в результате инструмента и
+  // старые блоки в истории — и может скопировать ```product-action``` в сам
+  // ответ. В Telegram это ушло бы как код-блок, поэтому сервер вырезает его
+  // из текста до отправки и до сохранения в историю (как уже делает веб —
+  // src/products/product-action-tail.ts).
+  it('блок ```product-action```, который скопировала модель, вырезается из текста до отправки и сохранения', async () => {
+    const { svc, router } = makeTurnBot({ linkeonId: 'u-owner', solo: true });
+    router.generateReply.mockResolvedValueOnce({
+      text: 'Готово.\n\n```product-action\n{"id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}\n```',
+      costUsd: 0.01,
+    });
+    const msg = groupMsg(111);
+    await (svc as any).handleChatMessage(msg, CFG);
+    const grammy = (svc as any).grammy;
+    // Первый sendMessage в ход — статус «Думаю…»; реальный ответ — последний.
+    const calls = grammy.sendMessage.mock.calls.filter((c: any[]) => c[0] === msg.chat.id);
+    const sentText = calls[calls.length - 1]?.[1];
+    expect(sentText).toBe('Готово.');
+    expect(router.persistAssistantReply).toHaveBeenCalledWith(CFG, 'Готово.', expect.anything(), expect.anything());
   });
 });
 

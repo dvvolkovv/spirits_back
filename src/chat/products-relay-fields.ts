@@ -16,7 +16,8 @@ import { ProductToolTokenOpts, signProductToolToken } from '../products/product-
  * честно ответит «нет ни одного» — это дешевле, чем запрос в базу на каждом
  * ходе ради того, чтобы иногда не показать инструмент.
  *
- * opts — язык, клиент и вид ассистента для справки (platform-kb): едут в подписи токена.
+ * opts — язык, клиент и вид ассистента для справки (platform-kb) и метка хода
+ * (opts.turn — по ней чат забирает карточки продуктов): едут в подписи токена.
  */
 export function productsRelayFields(
   userId: string,

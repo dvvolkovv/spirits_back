@@ -13,11 +13,13 @@
 export interface ClientUi {
   activity: boolean;
   ask: boolean;
+  /** Карточки действий продуктов (блок product-action). */
+  cards: boolean;
 }
 
 // Заморожен: общий объект-константа, случайная мутация по ссылке не должна
 // расползаться на другие места, где она возвращается напрямую.
-export const NO_CLIENT_UI: Readonly<ClientUi> = Object.freeze({ activity: false, ask: false });
+export const NO_CLIENT_UI: Readonly<ClientUi> = Object.freeze({ activity: false, ask: false, cards: false });
 
 export function parseClientUi(raw: unknown): ClientUi {
   let v: unknown = raw;
@@ -30,5 +32,5 @@ export function parseClientUi(raw: unknown): ClientUi {
   }
   if (!v || typeof v !== 'object') return { ...NO_CLIENT_UI };
   const o = v as Record<string, unknown>;
-  return { activity: o.activity === true, ask: o.ask === true };
+  return { activity: o.activity === true, ask: o.ask === true, cards: o.cards === true };
 }

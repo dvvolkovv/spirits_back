@@ -2,25 +2,25 @@ import { parseClientUi, NO_CLIENT_UI } from './client-ui';
 
 describe('parseClientUi — что умеет клиент чата', () => {
   it('объект от веба: обе возможности', () => {
-    expect(parseClientUi({ activity: true, ask: true })).toEqual({ activity: true, ask: true });
+    expect(parseClientUi({ activity: true, ask: true })).toEqual({ activity: true, ask: true, cards: false });
   });
 
   it('строка с JSON — так приходит multipart загрузки файла', () => {
-    expect(parseClientUi('{"activity":true}')).toEqual({ activity: true, ask: false });
+    expect(parseClientUi('{"activity":true}')).toEqual({ activity: true, ask: false, cards: false });
   });
 
   it('нет поля — клиент ничего нового не умеет (мобилка, старый веб)', () => {
-    expect(parseClientUi(undefined)).toEqual({ activity: false, ask: false });
+    expect(parseClientUi(undefined)).toEqual({ activity: false, ask: false, cards: false });
   });
 
   it('признаётся только строгое true', () => {
-    expect(parseClientUi({ activity: 'true', ask: 1 })).toEqual({ activity: false, ask: false });
+    expect(parseClientUi({ activity: 'true', ask: 1 })).toEqual({ activity: false, ask: false, cards: false });
   });
 
   it('мусор равен отсутствию поля', () => {
-    expect(parseClientUi('{not json')).toEqual({ activity: false, ask: false });
-    expect(parseClientUi(42)).toEqual({ activity: false, ask: false });
-    expect(parseClientUi(null)).toEqual({ activity: false, ask: false });
+    expect(parseClientUi('{not json')).toEqual({ activity: false, ask: false, cards: false });
+    expect(parseClientUi(42)).toEqual({ activity: false, ask: false, cards: false });
+    expect(parseClientUi(null)).toEqual({ activity: false, ask: false, cards: false });
   });
 
   it('NO_CLIENT_UI заморожен — общий объект нельзя случайно замутировать по ссылке', () => {

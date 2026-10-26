@@ -64,7 +64,7 @@ describe('инструмент продуктов для локального CL
     const r = productsCliMcp('79030169187', 'web');
     const bearer = bearerOf(r);
     expect(bearer).toMatch(/^Bearer \S+$/);
-    expect(verifyProductToolToken(bearer.replace(/^Bearer /, ''))).toEqual({ userId: '79030169187', channel: 'web' });
+    expect(verifyProductToolToken(bearer.replace(/^Bearer /, ''))).toEqual({ userId: '79030169187', channel: 'web', turn: null });
   });
 
   it('для Telegram токен несёт канал telegram', () => {
@@ -72,6 +72,7 @@ describe('инструмент продуктов для локального CL
     expect(verifyProductToolToken(bearerOf(r).replace(/^Bearer /, ''))).toEqual({
       userId: '70000000000',
       channel: 'telegram',
+      turn: null,
     });
   });
 
@@ -165,7 +166,7 @@ describe('инструмент продуктов для локального CL
     it('поля справки едут в токен инструмента продуктов', () => {
       const r = productsCliMcp('u-test', 'telegram', { lang: 'de', client: 'telegram', agent: 'staff' });
       expect(verifyProductToolToken(bearerOf(r).replace(/^Bearer /, ''))).toEqual({
-        userId: 'u-test', channel: 'telegram', lang: 'de', client: 'telegram', agent: 'staff',
+        userId: 'u-test', channel: 'telegram', lang: 'de', client: 'telegram', agent: 'staff', turn: null,
       });
     });
 
@@ -175,7 +176,35 @@ describe('инструмент продуктов для локального CL
       expect(r.mcpServers.products.url).toBe(productsCliMcp('u-owner', 'telegram').mcpServers.products.url);
       expect(r.toolName).toBe(LINKEON_HELP_CLI_TOOL_NAME);
       const claims = verifyProductToolToken(String(r.mcpServers.products.headers?.Authorization).replace(/^Bearer /, ''));
-      expect(claims).toEqual({ userId: 'u-owner', channel: 'telegram', lang: 'ru', client: 'telegram', scope: 'help', agent: 'custom' });
+      expect(claims).toEqual({ userId: 'u-owner', channel: 'telegram', lang: 'ru', client: 'telegram', scope: 'help', agent: 'custom', turn: null });
     });
+  });
+});
+
+// Маша и TG-бот берут промпт отсюда, веб-ассистенты — из промпта релея; новые
+// действия manage_product обязаны быть в обоих, с числами из констант.
+describe('промпт CLI знает весь жизненный цикл продукта', () => {
+  const { PRODUCTS_CLI_PROMPT } = require('./products-cli-tool');
+  const { RENT_TOKENS, FREE_MONTH_PRODUCTS } = require('./rent.service');
+  const { DEFAULT_MAX_PRODUCTS } = require('./limits.service');
+  const { DELETE_GRACE_DAYS } = require('./product-actions.service');
+
+  it('create, delete, restore, revert и status по actionId', () => {
+    for (const a of ['create', 'delete', 'restore', 'revert']) expect(PRODUCTS_CLI_PROMPT).toContain(`action: "${a}"`);
+    expect(PRODUCTS_CLI_PROMPT).toMatch(/action: "status", actionId/);
+    expect(PRODUCTS_CLI_PROMPT).toMatch(/Не говори «создал» или «удалил», пока status не вернёт done/);
+  });
+
+  it('условия — из констант аренды, предела и срока возврата', () => {
+    expect(PRODUCTS_CLI_PROMPT).toContain(String(RENT_TOKENS).replace(/\B(?=(\d{3})+(?!\d))/g, ' '));
+    expect(PRODUCTS_CLI_PROMPT).toContain(`не больше ${DEFAULT_MAX_PRODUCTS} продуктов`);
+    expect(PRODUCTS_CLI_PROMPT).toContain(`вернуть можно ${DELETE_GRACE_DAYS} дней`);
+  });
+
+  // Решение владельца 26.10.2026: бесплатный месяц — не каждому продукту, а
+  // только первым FREE_MONTH_PRODUCTS за всю историю аккаунта.
+  it('бесплатный месяц — из константы FREE_MONTH_PRODUCTS, не литералом', () => {
+    expect(PRODUCTS_CLI_PROMPT).toContain(`первых ${FREE_MONTH_PRODUCTS} продуктов`);
+    expect(PRODUCTS_CLI_PROMPT).toMatch(/удалённые тоже считаются/);
   });
 });

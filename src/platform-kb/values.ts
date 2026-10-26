@@ -2,8 +2,9 @@ import { IMAGE_TOKENS_HD, IMAGE_TOKENS_STD } from '../misc/image-pricing';
 import { computeOwnVoiceSurcharge, computeVeoConcatQuote, computeVeoQuote, needsVeoConcat } from '../video/video.dto';
 import { LISTEN_MAX_CHARS, maxCharsFor, RATE_LIMIT_PER_MIN, tokenCostFor } from '../speech/speech.service';
 import { LIMITS as PEER_LIMITS } from '../peer/peer.dto';
-import { RENT_TOKENS } from '../products/rent.service';
+import { FREE_MONTH_PRODUCTS, RENT_TOKENS } from '../products/rent.service';
 import { DEFAULT_MAX_PRODUCTS } from '../products/limits.service';
+import { DELETE_GRACE_DAYS } from '../products/product-actions.service';
 import { MAX_ROUTINES_PER_USER } from '../routine-push/routine-store.service';
 import { PACKAGES } from '../payments/packages';
 import { PRIEM_PACKAGES } from '../payments/priem.service';
@@ -79,7 +80,9 @@ export const V = {
   pendingMax: String(PEER_LIMITS.MAX_PENDING_OUTGOING),
   requestsPerHour: String(Math.round((PEER_LIMITS.RATE_MAX_PER_WINDOW * 3600) / PEER_LIMITS.RATE_WINDOW_SEC)),
   rentTokens: fmt(RENT_TOKENS),
+  freeMonthProducts: String(FREE_MONTH_PRODUCTS),
   maxProducts: String(DEFAULT_MAX_PRODUCTS),
+  deleteGraceDays: String(DELETE_GRACE_DAYS),
   maxRoutines: String(MAX_ROUTINES_PER_USER),
   lowBalance: fmt(LOW_BALANCE_THRESHOLD),
   lowBalanceEveryHours: String(Math.round(WARN_COOLDOWN_MS / 3_600_000)),

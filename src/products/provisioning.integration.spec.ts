@@ -144,9 +144,18 @@ maybe('провижининг против живого Postgres', () => {
    * исполняет вовсе. Заглушка предела, отдающая «можно» на любой вход, сделала
    * бы каждый сценарий ниже зелёным при полностью отсутствующей реализации.
    */
-  const makeSvc = (probe?: (url: string, init?: any) => Promise<{ status: number }>) => {
+  // Счётчик, а не константа: каждый вызов makeSvc() без явного checkBot
+  // получает СВОЙ id бота. Константа заставила бы любые два теста, оба
+  // создающие бота через create() без явного checkBot, столкнуться на
+  // products_tg_bot_live, хотя друг другу они не мешают.
+  let botIdSeq = 900000000;
+  const makeSvc = (
+    probe?: (url: string, init?: any) => Promise<{ status: number }>,
+    checkBot?: (token: string) => Promise<{ ok: true; id: number; username: string } | { ok: false; reason: 'bad_form' | 'rejected' | 'unreachable' }>,
+  ) => {
     const svc = new ProvisioningService(pg as any, secrets, new HostsService(pg as any), new LimitsService(pg as any));
     (svc as any).fetchFn = probe ?? (async () => ({ status: 200 }));
+    (svc as any).checkBot = checkBot ?? (async () => ({ ok: true, id: ++botIdSeq, username: 'studio_bot' }));
     return svc;
   };
 
@@ -1278,6 +1287,100 @@ maybe('провижининг против живого Postgres', () => {
     expect(e.code).toBe('23505');
     expect(e.constraint).toBe('products_runner_token_hash_key');
   });
+
+  // ═════ I2: Студия заводит бота без tgBotId — create() проверяет сам ═════
+  //
+  // Юнит-тесты provisioning.create.spec.ts сторожат форму нового кода
+  // (SQL-подстроки, позицию tg_bot_id в params) на заглушенном pg. Здесь —
+  // против ЖИВОГО partial UNIQUE products_tg_bot_live: заглушка его не
+  // исполняет вовсе, и «вторая Студия с тем же токеном бота получает 409»
+  // осталась бы недоказанной.
+  describe('I2: ранняя проверка и UNIQUE products_tg_bot_live на пути Студии', () => {
+    it('два живых бота с одним токеном: первый получает tg_bot_id, второй — 409 на ранней проверке', async () => {
+      await ensureHost('own');
+      const sameId = async (_t: string) => ({ ok: true as const, id: 424242, username: 'shared_bot' });
+
+      const first = await makeSvc(undefined, sameId).create({
+        userId: 'u-1', isAdmin: true, name: 'первый бот', slug: 'tg-dup-1', kind: 'bot',
+        secrets: { BOT_TOKEN: '424242:первый' },
+      });
+      const row1 = await getProduct(first.productId);
+      expect(row1.tg_bot_id).toBe('424242');
+
+      const e = await makeSvc(undefined, sameId)
+        .create({
+          userId: 'u-2', isAdmin: true, name: 'второй бот', slug: 'tg-dup-2', kind: 'bot',
+          secrets: { BOT_TOKEN: '424242:второй' },
+        })
+        .then(() => null)
+        .catch((err: any) => err);
+
+      expect(e).toBeInstanceOf(ConflictException);
+      expect(e.getStatus()).toBe(409);
+      expect(String(e.message)).toMatch(/бот уже работает в другом продукте/);
+      // Второй продукт не остался висячим: отказ пойман ДО INSERT.
+      const second = await pool.query('SELECT count(*) FROM products WHERE slug = $1', ['tg-dup-2']);
+      expect(Number(second.rows[0].count)).toBe(0);
+    });
+
+    it('гонка: конкурент занимает tg_bot_id МЕЖДУ ранней проверкой и INSERT — ловит UNIQUE, не ранняя проверка', async () => {
+      // Воспроизведено точно, тем же приёмом, что и '18в. слаг, занятый ПОСЛЕ
+      // проверки' выше: подмена происходит внутри ответа на тот самый SELECT,
+      // а не через таймеры или Promise.all, у которых реальная гонка на одной
+      // короткой операции не гарантирована. Ранняя SELECT-проверка читает
+      // состояние ДО вставки и здесь нарочно видит пусто — отбивает гонку
+      // только партиционный UNIQUE на самом INSERT.
+      await ensureHost('own');
+      let raced = false;
+      const racingPg = {
+        query: async (sql: string, params?: any[]) => {
+          const r = await pool.query(sql, params);
+          if (!raced && sql.includes('SELECT 1 FROM products WHERE tg_bot_id')) {
+            raced = true;
+            await pool.query(
+              `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path,
+                                     runner_token_hash, host_id, host_ip, tg_bot_id)
+               VALUES ($1, 'u-конкурент', 'конкурент', 'tg-race-competitor', 'bot', 'provisioning',
+                       '/product', $2, 'own', '139.59.210.42', 909090)`,
+              [crypto.randomUUID(), crypto.randomBytes(32).toString('hex')],
+            );
+          }
+          return r;
+        },
+      };
+      const svc = new ProvisioningService(racingPg as any, secrets, new HostsService(racingPg as any), new LimitsService(racingPg as any));
+      (svc as any).checkBot = async () => ({ ok: true, id: 909090, username: 'raced_bot' });
+
+      const e = await svc
+        .create({ userId: 'u-1', isAdmin: true, name: 'race a', slug: 'tg-race-a', kind: 'bot', secrets: { BOT_TOKEN: '909090:a' } })
+        .then(() => null)
+        .catch((err: any) => err);
+
+      expect(raced).toBe(true);
+      expect(e).toBeInstanceOf(ConflictException);
+      expect(e.getStatus()).toBe(409);
+      // Продукт гонки остался ровно один — наш create() не довставил свой.
+      const live = await pool.query(`SELECT count(*) FROM products WHERE tg_bot_id = '909090' AND archived_at IS NULL`);
+      expect(Number(live.rows[0].count)).toBe(1);
+      const all = await pool.query(`SELECT count(*) FROM products WHERE slug = 'tg-race-a'`);
+      expect(Number(all.rows[0].count)).toBe(0);
+    });
+
+    it('Telegram недоступен — бот Студии заводится без tg_bot_id, а не отказом', async () => {
+      await ensureHost('own');
+      const unreachable = async (_t: string) => ({ ok: false as const, reason: 'unreachable' as const });
+      const svc = makeSvc(undefined, unreachable);
+
+      const r = await svc.create({
+        userId: 'u-1', isAdmin: true, name: 'бот без ответа', slug: 'tg-unreachable', kind: 'bot',
+        secrets: { BOT_TOKEN: '123456:чтоУгодно' },
+      });
+
+      const row = await getProduct(r.productId);
+      expect(row.status).toBe('provisioning');
+      expect(row.tg_bot_id).toBeNull();
+    });
+  });
   // ═══════════════════════════ retry ═══════════════════════════
 
   /** Сорванное заведение: продукт в failed с причиной и закрытым заданием. */
@@ -1682,6 +1785,176 @@ maybe('провижининг против живого Postgres', () => {
     await expect(
       pool.query(`INSERT INTO product_user_limits (user_id, max_products) VALUES ('u-дубль', 9)`),
     ).rejects.toThrow(/product_user_limits_pkey/);
+  });
+
+  // ═══ бесплатный месяц — только первым FREE_MONTH_PRODUCTS продуктам человека (решение владельца 26.10.2026) ═══
+
+  /**
+   * Ревью, пункт 11: счёт бесплатных месяцев смотрит не на СТРОКУ products, а
+   * на след провижининга (product_provision_jobs: kind='provision' AND
+   * status <> 'failed', freeMonthCountedJobSql в rent.service.ts) — ровно
+   * тем же условием, что в самом INSERT. create() ставит задание только
+   * 'queued' — а с правки круга 2 пункта 2 это УЖЕ считается (счёт смотрит
+   * на «не провалилось», а не на «завершилось успехом») — поэтому
+   * markRanOnce() здесь нужен только тестам, которым важно смоделировать
+   * РЕАЛЬНО поднявшийся продукт (в тестах нет живого агента хоста, который
+   * доводил бы задание до 'done' сам), а не самому счёту свободных месяцев:
+   * тест 109 ниже нарочно НЕ зовёт markRanOnce на одном из продуктов, чтобы
+   * показать именно эту разницу.
+   */
+  async function markRanOnce(productId: string) {
+    await pool.query(
+      `UPDATE product_provision_jobs SET status = 'done', finished_at = now() WHERE product_id = $1 AND kind = 'provision'`,
+      [productId],
+    );
+  }
+
+  it('105. первые FREE_MONTH_PRODUCTS продуктов человека — аренда оплачена на месяц вперёд', async () => {
+    // Раньше INSERT вовсе не перечислял paid_until, и DEFAULT колонки отдавал
+    // этот месяц каждому продукту безусловно. Теперь — явно, внутри самого
+    // INSERT (provisioning.service.ts): первым FREE_MONTH_PRODUCTS продуктам
+    // человека за всю историю — тот же месяц, остальным — now().
+    await ensureHost('clients');
+    const svc = makeSvc();
+
+    const first = await svc.create({ userId: 'u-free-month', isAdmin: false, name: 'первый', slug: 'fm-first', kind: 'site', secrets: {} });
+    await markRanOnce(first.productId);
+    const second = await svc.create({ userId: 'u-free-month', isAdmin: false, name: 'второй', slug: 'fm-second', kind: 'site', secrets: {} });
+
+    expect(first.freeMonth).toBe(true);
+    expect(second.freeMonth).toBe(true);
+
+    for (const id of [first.productId, second.productId]) {
+      const row = await getProduct(id);
+      const days = (new Date(row.paid_until).getTime() - Date.now()) / 86_400_000;
+      // Окно в сутки с запасом: месяц — календарный, в феврале он короче.
+      expect(days).toBeGreaterThan(27);
+      expect(days).toBeLessThan(32);
+    }
+  });
+
+  it('106. третий продукт после удаления второго — аренда сразу платная', async () => {
+    // Предел аккаунта (считает только archived_at IS NULL) снимается удалением
+    // немедленно, а счёт бесплатных месяцев — нет: удалённый продукт всё равно
+    // был одним из первых FREE_MONTH_PRODUCTS. Без этого «завести → удалить →
+    // завести» выдавало бы бесплатный месяц заново до бесконечности — ровно та
+    // дыра, которую чинит эта правка (см. комментарий у FREE_MONTH_PRODUCTS).
+    await ensureHost('clients');
+    const svc = makeSvc();
+
+    const first = await svc.create({ userId: 'u-free-month-2', isAdmin: false, name: 'первый', slug: 'fm3-first', kind: 'site', secrets: {} });
+    await markRanOnce(first.productId);
+    const second = await svc.create({ userId: 'u-free-month-2', isAdmin: false, name: 'второй', slug: 'fm3-second', kind: 'site', secrets: {} });
+    await markRanOnce(second.productId);
+    await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [second.productId]);
+
+    const third = await svc.create({ userId: 'u-free-month-2', isAdmin: false, name: 'третий', slug: 'fm3-third', kind: 'site', secrets: {} });
+
+    expect(third.freeMonth).toBe(false);
+    const row = await getProduct(third.productId);
+    const seconds = Math.abs(new Date(row.paid_until).getTime() - Date.now()) / 1000;
+    expect(seconds).toBeLessThan(10);
+  });
+
+  it('107. стёртый (purged_at) продукт всё равно занимает место в счёте бесплатных месяцев', async () => {
+    // Если бы считались только живые строки, стёртый продукт освобождал бы
+    // слот бесплатного месяца НАВСЕГДА — тот же приём, что у теста 106 для
+    // простого удаления, но для случая, где человек дождался стирания
+    // (очередь 2) и тут же завёл новый.
+    await ensureHost('clients');
+    const svc = makeSvc();
+
+    const a = await svc.create({ userId: 'u-free-month-3', isAdmin: false, name: 'стёртый', slug: 'fm4-purged', kind: 'site', secrets: {} });
+    await markRanOnce(a.productId);
+    await pool.query('UPDATE products SET archived_at = now(), purged_at = now() WHERE id = $1', [a.productId]);
+
+    // Второй из первых FREE_MONTH_PRODUCTS — счёт на момент его INSERT равен 1
+    // (стёртый), 1 < 2 — ещё бесплатно.
+    const b = await svc.create({ userId: 'u-free-month-3', isAdmin: false, name: 'второй', slug: 'fm4-second', kind: 'site', secrets: {} });
+    await markRanOnce(b.productId);
+    expect(b.freeMonth).toBe(true);
+
+    // Третий — счёт на момент его INSERT равен 2 (стёртый + второй), 2 не
+    // меньше 2 — платный. Останься true, значило бы, что стёртая строка не
+    // посчиталась.
+    const c = await svc.create({ userId: 'u-free-month-3', isAdmin: false, name: 'третий', slug: 'fm4-third', kind: 'site', secrets: {} });
+    expect(c.freeMonth).toBe(false);
+  });
+
+  it('108. продукт, чьё заведение ни разу не поднялось, не жжёт бесплатный месяц — а поднявшийся и удалённый жжёт', async () => {
+    // Ревью, пункт 11 (владелец-дружественный счёт). failedProduct() ставит
+    // задание kind='provision' в status='failed' — это и есть «никогда не
+    // достиг running». Такой продукт не должен считаться в FREE_MONTH_PRODUCTS.
+    //
+    // Предел аккаунта (LimitsService, DEFAULT_MAX_PRODUCTS) считает ЖИВЫЕ
+    // строки (archived_at IS NULL) независимо от бесплатного месяца — он не
+    // предмет этого теста, поэтому каждый продукт здесь архивируется сразу
+    // после своей проверки: иначе третье/четвёртое create() упёрлось бы не в
+    // счёт бесплатных месяцев, а в этот отдельный предел.
+    await ensureHost('clients');
+    const userId = 'u-free-month-marker';
+    const failed = await failedProduct({ slug: 'fm-never-ran' });
+    await pool.query('UPDATE products SET user_id = $2, archived_at = now() WHERE id = $1', [failed.id, userId]);
+    const svc = makeSvc();
+
+    // Счёт «реально работавших» для этого человека — 0 (failed не считается
+    // ни живым, ни архивным — у него никогда не было успешного заведения),
+    // хотя по счёту СТРОК это уже второй продукт.
+    const second = await svc.create({ userId, isAdmin: false, name: 'второй', slug: 'fm-after-failed', kind: 'site', secrets: {} });
+    expect(second.freeMonth).toBe(true);
+    await markRanOnce(second.productId);
+    await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [second.productId]);
+
+    // Третий — реально поднявшийся (second уже в счёте: 1 < 2).
+    const third = await svc.create({ userId, isAdmin: false, name: 'третий', slug: 'fm-third-ok', kind: 'site', secrets: {} });
+    expect(third.freeMonth).toBe(true);
+    await markRanOnce(third.productId);
+    // Удаление не освобождает место в СЧЁТЕ — third РЕАЛЬНО работал.
+    await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [third.productId]);
+
+    // Четвёртый — счёт теперь 2 (second + third, оба реально поднялись и
+    // попали в счёт), 2 не меньше 2 — платный. Удалённые second и third всё
+    // равно считаются именно потому, что они РАБОТАЛИ, в отличие от failed.
+    const fourth = await svc.create({ userId, isAdmin: false, name: 'четвёртый', slug: 'fm-fourth', kind: 'site', secrets: {} });
+    expect(fourth.freeMonth).toBe(false);
+  });
+
+  it('109. продукт, который ТОЛЬКО ЗАВОДИТСЯ (задание queued, не done), тоже считается — иначе одновременное заведение даёт больше двух бесплатных месяцев', async () => {
+    // Ревью, круг 2, пункт 2. Старое условие (status='done' буквально) видело
+    // ЗАВОДЯЩИЙСЯ продукт как «не считается» — человек с одним РЕАЛЬНО
+    // поднявшимся продуктом и одним, который в эту секунду заводится
+    // (например, одновременно создал сайт и бота), на третьем create() видел
+    // бы count=1 (только первый) и получал бы ТРЕТИЙ бесплатный месяц. Новое
+    // условие — «есть НЕ ПРОВАЛИВШЕЕСЯ задание» — считает second сразу,
+    // не дожидаясь completeJob.
+    await ensureHost('clients');
+    const userId = 'u-free-month-inflight';
+    const svc = makeSvc();
+
+    const first = await svc.create({ userId, isAdmin: false, name: 'первый', slug: 'fm5-first', kind: 'site', secrets: {} });
+    await markRanOnce(first.productId);
+    expect(first.freeMonth).toBe(true);
+    // Живой слот предела (DEFAULT_MAX_PRODUCTS, не предмет этого теста)
+    // освобождается архивацией — иначе второе/третье create() упёрлось бы не
+    // в счёт бесплатных месяцев, а в этот отдельный предел (как в тесте 108).
+    await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [first.productId]);
+
+    // Второй — создан, но ЕЩЁ ЗАВОДИТСЯ (например, второй продукт сразу
+    // после первого, живого агента хоста в тесте нет). create() сам ставит
+    // заданию статус 'queued' (см. provisioning.service.ts) — здесь НЕ зовём
+    // markRanOnce, оставляя его таким нарочно.
+    const second = await svc.create({ userId, isAdmin: false, name: 'второй', slug: 'fm5-second', kind: 'site', secrets: {} });
+    expect(second.freeMonth).toBe(true);
+    const secondJob = await pool.query(`SELECT status FROM product_provision_jobs WHERE product_id = $1 AND kind = 'provision'`, [second.productId]);
+    expect(secondJob.rows[0].status).toBe('queued');
+    await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [second.productId]);
+
+    // Счёт для третьего — first (done) + second (queued, ещё заводится) = 2,
+    // 2 не меньше 2 → платный. Со старым условием (status='done') второй не
+    // посчитался бы, и third получил бы freeMonth=true — ровно та дыра,
+    // которую чинит эта правка.
+    const third = await svc.create({ userId, isAdmin: false, name: 'третий', slug: 'fm5-third', kind: 'site', secrets: {} });
+    expect(third.freeMonth).toBe(false);
   });
 
   // ═══════════════ отметка о жизни агента хоста ═══════════════
