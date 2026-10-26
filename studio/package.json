@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Студия коротких роликов Linkeon: съёмка кабинета, озвучка SpeechKit, сборка в Remotion",
   "scripts": {
-    "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts src/plural.test.ts src/script.test.ts src/answer.test.ts src/ffprobe.test.ts src/config.test.ts src/tts.test.ts src/render/props.test.ts src/errors.test.ts src/frame.test.ts src/answer-motion.test.ts src/capture/run-capture.test.ts src/worker/storage.test.ts src/worker/jobs.test.ts",
+    "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts src/plural.test.ts src/script.test.ts src/answer.test.ts src/ffprobe.test.ts src/config.test.ts src/tts.test.ts src/render/props.test.ts src/errors.test.ts src/frame.test.ts src/answer-motion.test.ts src/capture/run-capture.test.ts src/worker/storage.test.ts src/worker/jobs.test.ts src/capture/promo.test.ts",
     "test:render": "tsx --test src/render/render.fixture.ts",
     "test:db": "tsx --test src/worker/db.integration.ts",
     "typecheck": "tsc --noEmit",

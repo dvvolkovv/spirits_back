@@ -9,6 +9,7 @@ import { probeFile } from '../ffprobe';
 import { CAPTURE_SCALE, CAPTURE_VIEWPORT } from '../frame';
 import type { CaptureResult, Scene } from '../types';
 import type { Session } from './login';
+import { hidePromoCss } from './promo';
 
 /** Окно съёмки и плотность — из frame.ts: 360×640 при плотности 3 — ровно кадр 1080×1920. */
 export const VIEWPORT = CAPTURE_VIEWPORT;
@@ -177,6 +178,9 @@ export async function captureChat(
       await page.screenshot({ path: shot('blocked.png') });
       throw new StudioError('blocked', `capture: кабинет не дошёл до чата — см. ${shot('blocked.png')}`, true);
     }
+    // Рекламные плашки кабинета — не в кадр (promo.ts). Стиль живёт до конца
+    // съёмки: страница одна, без перезагрузки.
+    await page.addStyleTag({ content: hidePromoCss() });
     await waitIdle(page);
     const picked = (await page.locator('[data-testid="assistant-dropdown-btn"]').innerText().catch(() => '')).trim();
     if (!picked.includes(scene.assistantName)) {
