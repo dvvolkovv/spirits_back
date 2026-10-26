@@ -521,7 +521,10 @@ ${recent}
     // productsOwner — чьи продукты может править этот ход и его Telegram-id.
     // Задаёт ТОЛЬКО tg-bot.service, и только когда пишет сам владелец и никто
     // другой не писал (productsOwnerForTurn). Не задан — ход ровно прежний.
-    opts: { productsOwner?: { linkeonId: string; tgUserId: number } } = {},
+    // turn — метка хода (случайный uuid, заводит tg-bot.service на каждый
+    // вызов): по ней takeForTurn забирает именно карточки ЭТОГО хода, а не
+    // чужие, заведённые в то же окно времени (см. ProductActionsService).
+    opts: { productsOwner?: { linkeonId: string; tgUserId: number }; turn?: string } = {},
   ): Promise<{ text: string; costUsd: number }> {
     const { systemPrompt } = await this.resolveSystemPrompt(cfg);
     const history = await this.loadHistory(cfg.id);
@@ -534,7 +537,7 @@ ${recent}
     let products: ReturnType<typeof productsCliMcp> | null = null;
     if (owner) {
       if (this.historyIsOwnersOnly(history, owner.tgUserId)) {
-        products = productsCliMcp(owner.linkeonId, 'telegram');
+        products = productsCliMcp(owner.linkeonId, 'telegram', opts.turn);
       } else {
         this.logger.warn(`products tool withheld in config ${cfg.id}: history snapshot has a non-owner line`);
       }

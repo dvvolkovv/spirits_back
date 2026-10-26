@@ -140,6 +140,18 @@ const ru = {
   cmd_resume_all: 'Снова отвечать в группах',
   cmd_resume_here: 'Снова отвечать здесь',
   cmd_help: 'Что умеет бот',
+
+  // Карточки продуктов (product-actions)
+  pa_delete_prompt: 'Удалить «{name}»? Продукт выключится сразу, вернуть его можно до {date} — попросите ассистента. Оплаченный период не возвращается.',
+  pa_delete_btn: 'Удалить',
+  pa_cancel_btn: 'Отмена',
+  pa_deleted: '«{name}» удалён. Вернуть можно до {date} — попросите ассистента.',
+  pa_cancelled: 'Удаление отменено.',
+  pa_closed: 'Это подтверждение уже закрыто.',
+  pa_failed: 'Не получилось: {reason}',
+  pa_create_bot_prompt: 'Чтобы создать бота «{name}», введите токен от @BotFather и ключи сервисов в защищённой форме. В переписку их не присылайте.',
+  pa_create_bot_btn: 'Ввести ключи',
+  pa_open_cabinet_btn: 'Открыть в кабинете',
 };
 
 export type TgTextKey = keyof typeof ru;
@@ -248,6 +260,17 @@ const en: Catalog = {
   cmd_resume_all: "Reply in groups again",
   cmd_resume_here: "Reply here again",
   cmd_help: "What the bot can do",
+
+  pa_delete_prompt: "Delete “{name}”? It will be switched off right away; you can restore it until {date} — just ask the assistant. The paid period is not refunded.",
+  pa_delete_btn: "Delete",
+  pa_cancel_btn: "Cancel",
+  pa_deleted: "“{name}” has been deleted. You can restore it until {date} — just ask the assistant.",
+  pa_cancelled: "Deletion cancelled.",
+  pa_closed: "This confirmation is already closed.",
+  pa_failed: "That didn't work: {reason}",
+  pa_create_bot_prompt: "To create the bot “{name}”, enter the token from @BotFather and your service keys in the secure form. Please don't send them in the chat.",
+  pa_create_bot_btn: "Enter keys",
+  pa_open_cabinet_btn: "Open in your account",
 };
 
 const de: Catalog = {
@@ -353,6 +376,17 @@ const de: Catalog = {
   cmd_resume_all: 'In Gruppen wieder antworten',
   cmd_resume_here: 'Hier wieder antworten',
   cmd_help: 'Was der Bot kann',
+
+  pa_delete_prompt: '„{name}“ löschen? Das Produkt wird sofort abgeschaltet; du kannst es bis {date} zurückholen – frag einfach den Assistenten. Der bezahlte Zeitraum wird nicht erstattet.',
+  pa_delete_btn: 'Löschen',
+  pa_cancel_btn: 'Abbrechen',
+  pa_deleted: '„{name}“ ist gelöscht. Zurückholen kannst du es bis {date} – frag einfach den Assistenten.',
+  pa_cancelled: 'Löschen abgebrochen.',
+  pa_closed: 'Diese Bestätigung ist bereits geschlossen.',
+  pa_failed: 'Das hat nicht geklappt: {reason}',
+  pa_create_bot_prompt: 'Um den Bot „{name}“ anzulegen, gib das Token von @BotFather und die Schlüssel deiner Dienste im geschützten Formular ein. Schick sie bitte nicht in den Chat.',
+  pa_create_bot_btn: 'Schlüssel eingeben',
+  pa_open_cabinet_btn: 'Im Konto öffnen',
 };
 
 /**
@@ -475,6 +509,17 @@ const fr: Catalog = frenchTypography({
   cmd_resume_all: 'Réactiver le bot dans les groupes',
   cmd_resume_here: 'Réactiver le bot ici',
   cmd_help: 'Ce que fait le bot',
+
+  pa_delete_prompt: 'Supprimer « {name} » ? Le produit sera désactivé tout de suite ; vous pourrez le restaurer jusqu’au {date} — il suffit de le demander à l’assistant. La période déjà payée n’est pas remboursée.',
+  pa_delete_btn: 'Supprimer',
+  pa_cancel_btn: 'Annuler',
+  pa_deleted: '« {name} » a été supprimé. Vous pouvez le restaurer jusqu’au {date} — il suffit de le demander à l’assistant.',
+  pa_cancelled: 'Suppression annulée.',
+  pa_closed: 'Cette confirmation est déjà close.',
+  pa_failed: 'Cela n’a pas marché : {reason}',
+  pa_create_bot_prompt: 'Pour créer le bot « {name} », saisissez le jeton de @BotFather et les clés de vos services dans le formulaire sécurisé. Ne les envoyez pas dans la discussion.',
+  pa_create_bot_btn: 'Saisir les clés',
+  pa_open_cabinet_btn: 'Ouvrir dans votre espace',
 });
 
 const es: Catalog = {
@@ -580,6 +625,17 @@ const es: Catalog = {
   cmd_resume_all: 'Volver a responder en los grupos',
   cmd_resume_here: 'Volver a responder aquí',
   cmd_help: 'Qué sabe hacer el bot',
+
+  pa_delete_prompt: '¿Eliminar «{name}»? Se apagará de inmediato; puedes recuperarlo hasta el {date}, solo pídeselo al asistente. El periodo ya pagado no se reembolsa.',
+  pa_delete_btn: 'Eliminar',
+  pa_cancel_btn: 'Cancelar',
+  pa_deleted: '«{name}» se ha eliminado. Puedes recuperarlo hasta el {date}, solo pídeselo al asistente.',
+  pa_cancelled: 'Eliminación cancelada.',
+  pa_closed: 'Esta confirmación ya está cerrada.',
+  pa_failed: 'No ha funcionado: {reason}',
+  pa_create_bot_prompt: 'Para crear el bot «{name}», introduce el token de @BotFather y las claves de tus servicios en el formulario seguro. No las envíes por el chat.',
+  pa_create_bot_btn: 'Introducir claves',
+  pa_open_cabinet_btn: 'Abrir en tu cuenta',
 };
 
 const pt: Catalog = {
@@ -685,6 +741,17 @@ const pt: Catalog = {
   cmd_resume_all: 'Voltar a responder nos grupos',
   cmd_resume_here: 'Voltar a responder aqui',
   cmd_help: 'O que o bot sabe fazer',
+
+  pa_delete_prompt: 'Eliminar «{name}»? O produto é desligado de imediato; podes recuperá-lo até {date} — basta pedires ao assistente. O período já pago não é reembolsado.',
+  pa_delete_btn: 'Eliminar',
+  pa_cancel_btn: 'Cancelar',
+  pa_deleted: '«{name}» foi eliminado. Podes recuperá-lo até {date} — basta pedires ao assistente.',
+  pa_cancelled: 'Eliminação cancelada.',
+  pa_closed: 'Esta confirmação já está fechada.',
+  pa_failed: 'Não resultou: {reason}',
+  pa_create_bot_prompt: 'Para criar o bot «{name}», introduz o token do @BotFather e as chaves dos teus serviços no formulário seguro. Não as envies pela conversa.',
+  pa_create_bot_btn: 'Introduzir chaves',
+  pa_open_cabinet_btn: 'Abrir na tua conta',
 };
 
 const zh: Catalog = {
@@ -790,6 +857,17 @@ const zh: Catalog = {
   cmd_resume_all: '在群组中恢复回复',
   cmd_resume_here: '在此恢复回复',
   cmd_help: '机器人能做什么',
+
+  pa_delete_prompt: '删除「{name}」？产品会立即停用；在 {date} 之前可以恢复——告诉助手即可。已支付的期限不予退还。',
+  pa_delete_btn: '删除',
+  pa_cancel_btn: '取消',
+  pa_deleted: '「{name}」已删除。在 {date} 之前可以恢复——告诉助手即可。',
+  pa_cancelled: '已取消删除。',
+  pa_closed: '此确认已关闭。',
+  pa_failed: '未能完成：{reason}',
+  pa_create_bot_prompt: '要创建机器人「{name}」，请在安全表单中输入 @BotFather 提供的令牌和各项服务的密钥。请不要在聊天中发送。',
+  pa_create_bot_btn: '输入密钥',
+  pa_open_cabinet_btn: '在个人中心打开',
 };
 
 export const TG_TEXTS: Record<TgLang, Catalog> = { ru, en, es, de, fr, zh, pt };
@@ -807,6 +885,12 @@ export function tgText(
 
 export function formatTgNumber(lang: string | null | undefined, n: number): string {
   return n.toLocaleString(NUMBER_LOCALE[LanguageService.normalize(lang) as TgLang]);
+}
+
+/** Дата на языке человека: «24 ноября» / «November 24» — без года, карточкам он не нужен. */
+export function formatTgDate(lang: string | null | undefined, iso: string | Date): string {
+  return new Intl.DateTimeFormat(NUMBER_LOCALE[LanguageService.normalize(lang) as TgLang], { day: 'numeric', month: 'long' })
+    .format(new Date(iso));
 }
 
 /**

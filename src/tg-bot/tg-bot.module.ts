@@ -21,6 +21,8 @@ import { RoomModule } from '../meeting/room.module';
 import { BlogModule } from '../blog/blog.module';
 import { InsightsModule } from '../insights/insights.module';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
+import { ProductsModule } from '../products/products.module';
+import { TgProductActionsService } from './tg-product-actions.service';
 
 @Module({
   // forwardRef на BlogModule — вторая половина разрыва кольца: блог берёт
@@ -36,12 +38,17 @@ import { CostGrowthService } from '../cost-growth/cost-growth.service';
     // Кнопки сводки «Затыки недели»: модуль сводки шлёт через TgGrammyClient,
     // а бот зовёт его обработчик — кольцо рвётся forwardRef с обеих сторон.
     forwardRef(() => InsightsModule),
+    // Карточки продуктов (удаление, ключи бота): ProductActionsService и
+    // ProductLifecycleService — конструкторские зависимости
+    // TgProductActionsService. Кольца нет: products ничего не импортирует
+    // отсюда — forwardRef не нужен.
+    ProductsModule,
   ],
   controllers: [TgBotController, TgBotConfigController],
   providers: [
     TgBotService, TgGrammyClient, TgIdentityService, TgConfigService,
     TgClaimService, TgRouterService, TgVoiceService, TgBillingService, TgCommandsService,
-    TgVideoDispatchService, TgMeetingService, CostGrowthService,
+    TgVideoDispatchService, TgMeetingService, CostGrowthService, TgProductActionsService,
   ],
   exports: [
     TgBotService, TgGrammyClient, TgIdentityService, TgConfigService,

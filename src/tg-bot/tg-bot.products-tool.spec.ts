@@ -442,7 +442,9 @@ describe('TgBotService.handleChatMessage: гейт и вложения', () => {
     const msg = groupMsg(111);
     await (svc as any).handleChatMessage(msg, CFG);
     const grammy = (svc as any).grammy;
-    const sentText = grammy.sendMessage.mock.calls.find((c: any[]) => c[0] === msg.chat.id)?.[1];
+    // Первый sendMessage в ход — статус «Думаю…»; реальный ответ — последний.
+    const calls = grammy.sendMessage.mock.calls.filter((c: any[]) => c[0] === msg.chat.id);
+    const sentText = calls[calls.length - 1]?.[1];
     expect(sentText).toBe('Готово.');
     expect(router.persistAssistantReply).toHaveBeenCalledWith(CFG, 'Готово.', expect.anything(), expect.anything());
   });

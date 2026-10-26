@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger, OnModuleInit, Optional, forwardRef } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -23,6 +24,8 @@ import { BlogApprovalService } from '../blog/blog-approval.service';
 import { fetchMediaBytes } from '../common/net/own-media';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
 import { InsightsCallbackService, shouldRouteToInsights } from '../insights/insights-callback.service';
+import { TgProductActionsService, shouldRouteToProductActions } from './tg-product-actions.service';
+import { stripProductActionBlocks } from '../products/product-action-tail';
 
 // Лимит размера файла, который мы готовы скачать с Telegram и передать в Claude.
 // Telegram сам отдаёт через Bot API до 20 МБ; больше — нужен MTProto, не наш кейс.
@@ -154,6 +157,9 @@ export class TgBotService implements OnModuleInit {
     // сервис позиционно; кольцо модулей рвётся forwardRef, как у блога.
     @Optional() @Inject(forwardRef(() => InsightsCallbackService))
     private readonly insights?: InsightsCallbackService,
+    // Карточки продуктов (удаление, ключи бота). Последним и @Optional:
+    // спеки собирают сервис позиционно.
+    @Optional() private readonly productActionsTg?: TgProductActionsService,
   ) {}
 
   async onModuleInit() {
@@ -375,6 +381,13 @@ export class TgBotService implements OnModuleInit {
     // чатом сводки, а не связкой ассистентов.
     if (shouldRouteToInsights(data)) {
       await this.insights?.handleCallback(cb);
+      return;
+    }
+
+    // Кнопки карточки продукта — до проверки привязки: владельца действия
+    // сверяет обработчик по привязанному Telegram, а не по связке ассистентов.
+    if (shouldRouteToProductActions(data)) {
+      await this.productActionsTg?.handleCallback(cb);
       return;
     }
 
@@ -977,18 +990,26 @@ export class TgBotService implements OnModuleInit {
       // него никто не писал (см. productsOwnerForTurn). Считается ПОСЛЕ
       // persistUserMessage: текущее сообщение уже в истории и тоже учтено.
       const productsOwner = await this.productsOwnerForTurn(cfg, msg);
+      const productsTurn = randomUUID();
+      const productsSince = new Date();
 
       let reply: { text: string; costUsd: number };
       try {
         reply = await this.router.generateReply(cfg, ownerFirstName, attachments, (ev) => {
           if (ev.kind === 'tool_use') editStatus(labelFor(ev.name)).catch(() => {});
-        }, workspace ?? undefined, { productsOwner });
+        }, workspace ?? undefined, { productsOwner, turn: productsTurn });
       } catch (e: any) {
         // Не вылетаем тихо — пишем юзеру в статус и оставляем след в БД.
         await this.recordTurnFailure(cfg, msg.chat.id, statusMsgId, e, turnLang);
         statusMsgId = null; // не удалять в finally — оставляем как уведомление
         throw e;
       }
+
+      // Карточка продукта, которую модель мог скопировать в текст ответа (она
+      // видит actionId из результата manage_product и старые блоки в
+      // истории) — вырезаем до того, как текст уйдёт человеку и в историю:
+      // в Telegram такой блок показался бы как код (см. src/products/product-action-tail.ts).
+      reply = { ...reply, text: stripProductActionBlocks(reply.text) };
 
       // Claude отработал — гасим status-throttle, typing-loop, и удаляем статус,
       // дальше каждый исходящий канал (voice/photo/document) выставит свой action.
@@ -1065,6 +1086,12 @@ export class TgBotService implements OnModuleInit {
         } catch (e: any) {
           this.logger.warn(`sandbox file ${path.basename(f)} send failed in chat ${outMsg.chat.id}: ${e.message}`);
         }
+      }
+
+      if (productsOwner && this.productActionsTg) {
+        await this.productActionsTg
+          .sendForTurn({ userId: productsOwner.linkeonId, turn: productsTurn, since: productsSince, chatId: outMsg.chat.id, isPrivate: msg.chat?.type === 'private', lang: turnLang })
+          .catch((e: any) => this.logger.warn(`карточки продуктов не отправлены в чат ${outMsg.chat.id}: ${e?.message}`));
       }
 
       const totalCostUsd = reply.costUsd + voiceTtsCostUsd;
