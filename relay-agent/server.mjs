@@ -20,9 +20,16 @@ const app = express();
 const PORT = 3033;
 const UPLOAD_DIR = "/tmp/agent-uploads";
 const OUTPUT_DIR = "/tmp/agent-output";
+// Конфиги хода (session-mcp-config.mjs) — в СВОЁМ подкаталоге, не вперемешку
+// с загрузками пользователя: уборка осиротевших (sweepStaleMcpConfigs ниже)
+// иначе сканировала бы ТУ ЖЕ папку, что и настоящие файлы пользователя, и
+// совпадение суффикса имени с чьей-то загрузкой было бы потенциальной
+// опечаткой с чужими данными. 0700 — файлы внутри несут чужие Bearer-токены.
+const MCP_CONFIG_DIR = path.join(UPLOAD_DIR, "mcp");
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+fs.mkdirSync(MCP_CONFIG_DIR, { recursive: true, mode: 0o700 });
 
 app.use(cors());
 // Ходы принимаются только от бэков с секретом (relay-auth.mjs). Файлы —
@@ -297,13 +304,17 @@ function endRun(tag) {
 const sweepRuns = () => reap(finishedRun(liveRuns)).then(logReaped, () => {});
 setInterval(sweepRuns, 5 * 60 * 1000).unref();
 
-// Осиротевшие конфиги хода (session-mcp-config.mjs): `finally` в /chat не
-// отработал (SIGKILL, падение процесса релея) — файл с чужими Bearer-токенами
-// остался на диске. Возраст, не список активных сессий: так же безопасно, как
-// sweepRuns выше. Ходы столько не живут — час с большим запасом.
+// Полные пути конфигов ИДУЩИХ ходов этого процесса — /chat добавляет при
+// записи, убирает в finally. Уборка ниже обязана их пропускать: консультация
+// или self-heal ретрай могут идти дольше SESSION_MCP_MAX_AGE_MS, а конфиг
+// при этом валиден. Для осиротевших — finally ПРЕЖНЕГО процесса не
+// отработал (SIGKILL, падение релея) — такой файл не попал в liveSet этого
+// процесса (своего не было), и единственный сигнал — возраст: файл несёт
+// чужие Bearer-токены, оставлять его нельзя.
+const liveMcpConfigPaths = new Set();
 const SESSION_MCP_MAX_AGE_MS = 60 * 60 * 1000;
 const sweepStaleMcpConfigs = () => {
-  const removed = sweepStaleSessionMcpConfigs(UPLOAD_DIR, SESSION_MCP_MAX_AGE_MS);
+  const removed = sweepStaleSessionMcpConfigs(MCP_CONFIG_DIR, SESSION_MCP_MAX_AGE_MS, liveMcpConfigPaths);
   if (removed.length) console.log("осиротевших конфигов хода удалено: " + removed.length);
 };
 setInterval(sweepStaleMcpConfigs, 5 * 60 * 1000).unref();
@@ -585,9 +596,14 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       }
       // Имя — на ХОД, не на сессию (sessionMcpConfigName, session-mcp-config.mjs):
       // общее имя на сессию было гонкой — finally чужого хода той же сессии
-      // мог удалить файл этого, ещё живого.
-      sessionMcpPath = path.join(UPLOAD_DIR, sessionMcpConfigName(fsKey, randomUUID()));
+      // мог удалить файл этого, ещё живого. Каталог — MCP_CONFIG_DIR, свой,
+      // не вперемешку с загрузками пользователя.
+      sessionMcpPath = path.join(MCP_CONFIG_DIR, sessionMcpConfigName(fsKey, randomUUID()));
       fs.writeFileSync(sessionMcpPath, JSON.stringify(base), { mode: 0o600 });
+      // В Set — сразу после успешной записи: с этого момента уборка
+      // (sweepStaleMcpConfigs) обязана пропускать этот файл, что бы ни
+      // показал возраст. Убирается в finally ниже, вместе с самим файлом.
+      liveMcpConfigPaths.add(sessionMcpPath);
       mcpConfigPath = sessionMcpPath;
       if (wantLinkeon) allowedTools += "," + LINKEON_TOOLS;
       if (wantTalerid) { allowedTools += "," + TALERID_TOOLS; systemPrompt += TALERID_PROMPT; }
@@ -604,7 +620,10 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       // умею». Файл мог успеть частично записаться (fs.writeFileSync упал на
       // полпути, например ENOSPC) — недописанный конфиг с чужими токенами на
       // диске оставлять нельзя.
-      if (sessionMcpPath) { try { fs.unlinkSync(sessionMcpPath); } catch {} }
+      if (sessionMcpPath) {
+        liveMcpConfigPaths.delete(sessionMcpPath);
+        try { fs.unlinkSync(sessionMcpPath); } catch {}
+      }
       sessionMcpPath = null;
       mcpConfigPath = BASE_MCP_PATH;
       allowedTools = BASE_TOOLS;
@@ -1089,7 +1108,14 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
     // Remove the per-session MCP config (it holds the user's Bearer tokens —
     // linkeon, talerid, products). Файл ОДИН на всех постояльцев: уборка по старому
     // talerid-специфичному имени оставляла бы токены на диске в открытом виде.
-    if (sessionMcpPath) { try { fs.unlinkSync(sessionMcpPath); } catch {} }
+    // Из liveMcpConfigPaths — ДО unlink: иначе параллельная уборка (другой
+    // таймер того же процесса) могла бы между delete и unlink решить, что
+    // файл уже не живой, и всё равно его тронуть — безвредно (тот же файл),
+    // но порядок на будущее аккуратнее.
+    if (sessionMcpPath) {
+      liveMcpConfigPaths.delete(sessionMcpPath);
+      try { fs.unlinkSync(sessionMcpPath); } catch {}
+    }
   });
 });
 
