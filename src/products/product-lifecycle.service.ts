@@ -4,7 +4,7 @@ import { ProvisioningService } from './provisioning.service';
 import { LimitsService } from './limits.service';
 import { REKEY_REFUSAL, TurnsService, TURN_SILENCE_SQL } from './turns.service';
 import { RENT_TOKENS, SLEEP_REASON_NO_TOKENS } from './rent.service';
-import { ActionChannel, ConfirmedVia, DELETE_GRACE_DAYS, ProductActionsService } from './product-actions.service';
+import { ActionChannel, ConfirmedVia, DELETE_GRACE_DAYS, JOB_KILLED_BY_DELETE, ProductActionsService } from './product-actions.service';
 import { BotTokenCheck, checkBotToken } from './bot-token-check';
 import { randomSuffix, siteSlugCandidates, slugWithSuffix } from './product-slug';
 import { SecretsService } from './secrets.service';
@@ -436,9 +436,9 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       // Пробуждение и прочее в очереди архивному не выдаются и заняли бы
       // место единственного активного задания — снимаем.
       await this.pg.query(
-        `UPDATE product_provision_jobs SET status = 'failed', error = 'снято удалением', finished_at = now()
+        `UPDATE product_provision_jobs SET status = 'failed', error = $2::text, finished_at = now()
           WHERE product_id = $1 AND status = 'queued' AND kind <> 'sleep'`,
-        [row.product_id],
+        [row.product_id, JOB_KILLED_BY_DELETE],
       );
       // Правка продукта — туда же, тем же приёмом, что у блокировки
       // администратора (block.service.ts, killed_turns): 'queued' наравне с
@@ -537,10 +537,11 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     // очереди. Доснимаем здесь. Возврат снимает архив раньше, чем ставит своё
     // пробуждение, — его задание сюда не попадает.
     await this.pg.query(
-      `UPDATE product_provision_jobs j SET status = 'failed', error = 'снято удалением', finished_at = now()
+      `UPDATE product_provision_jobs j SET status = 'failed', error = $1::text, finished_at = now()
          FROM products p
         WHERE j.product_id = p.id AND p.archived_at IS NOT NULL
           AND j.status = 'queued' AND j.kind <> 'sleep'`,
+      [JOB_KILLED_BY_DELETE],
     );
     return this.queueSleepForDeleted();
   }

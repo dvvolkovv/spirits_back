@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
+import { JOB_KILLED_BY_BLOCK } from './block.service';
 
 export type ActionKind = 'create_site' | 'create_bot' | 'keys' | 'delete' | 'restore' | 'revert' | 'purge';
 export type ActionStatus = 'pending' | 'working' | 'done' | 'failed' | 'expired' | 'cancelled';
@@ -34,6 +35,16 @@ export const REKEY_FAILED_SAY =
  */
 export const REKEY_UNKNOWN_SAY =
   'Смена ключей прервалась на машине продукта, и он может не отвечать. Если продукт молчит дольше нескольких минут — напишите в поддержку.';
+
+/**
+ * Что записывается в задание, снятое удалением продукта (completeDelete,
+ * sleepDeletedTick в product-lifecycle.service.ts). Общая строка — а не два
+ * свободных литерала там и третий здесь в sweepStuck — чтобы «снято
+ * удалением» не разошлось при правке одного места и не осталось незамеченным
+ * другим: sweepStuck сверяет error по этой строке, отличая REKEY_GONE_SAY от
+ * REKEY_FAILED_SAY.
+ */
+export const JOB_KILLED_BY_DELETE = 'снято удалением';
 
 /** Смена ключей снята удалением продукта до того, как агент её взял. */
 export const REKEY_GONE_SAY = 'Продукт удалён — ключи не менялись.';
@@ -108,6 +119,8 @@ export function toView(row: ActionRow, now: Date = new Date()): ActionView {
     productName: row.product_name ?? (typeof row.payload?.name === 'string' ? row.payload.name : null),
     productKind: row.kind === 'create_bot'
       ? 'bot'
+      : row.kind === 'create_site'
+      ? 'site'
       : (row.payload?.productKind === 'site' || row.payload?.productKind === 'bot' ? row.payload.productKind : null),
     keyNames: Array.isArray(row.payload?.keyNames) ? row.payload.keyNames : [],
     expiresAt: row.expires_at ? new Date(row.expires_at).toISOString() : null,
@@ -244,12 +257,26 @@ export class ProductActionsService {
    * действие принадлежит вызывающему. Коробка ключей стирается и здесь:
    * pending-карточка шифротекста не держит никогда — новый набор пишется
    * только вместе с заданием (ProductKeysService).
+   *
+   * Условие на отсутствие активного задания — страховка: карточка с заданием
+   * rekey в очереди или в работе уже СОВЕРШАЕТСЯ на машине, и откат в pending
+   * здесь потерял бы это из вида (а стирание коробки — новые ключи, которые
+   * задание как раз применяет). По архитектуре задание ставится тем же
+   * оператором, что отправляет карточку (ProductKeysService), поэтому путь
+   * «есть активное задание → всё равно зовут release» не штатный — это
+   * именно защита от будущей ошибки вызывающего, а не наблюдаемый сегодня
+   * случай.
    */
   async release(id: string, result: Record<string, unknown>): Promise<void> {
     if (!UUID_RE.test(String(id))) return;
     await this.pg.query(
       `UPDATE product_actions SET status = 'pending', confirmed_via = NULL, result = $2::jsonb, secrets_box = NULL
-        WHERE id = $1 AND status = 'working'`,
+        WHERE id = $1 AND status = 'working'
+          -- $1, а не коррелированный id: сравнение со своим же id внутри
+          -- подзапроса было бы неоднозначным — у product_provision_jobs
+          -- тоже есть столбец id, и он перекрыл бы внешний (действие на
+          -- единственную строку $1 — коррелировать нечем, она и так одна).
+          AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = $1 AND j.status IN ('queued','running'))`,
       [id, JSON.stringify(result)],
     );
   }
@@ -281,6 +308,14 @@ export class ProductActionsService {
    *     ли агент забрать задание (см. CASE ниже).
    * Карточку с ЖИВЫМ заданием (queued/running) не трогаем ни при каком сроке:
    * отправленная на 29-й минуте, она иначе умерла бы при работающем агенте.
+   * done — туда же: completeRekeyJob закрывает задание и карточку ОДНИМ
+   * оператором (см. его докблок в provisioning.service.ts), поэтому снаружи
+   * статусы «задание done» и «карточка working» видны одновременно только
+   * если тот оператор не нашёл карточку в working (её закрыли откуда-то ещё
+   * в то же мгновение) — то есть ключи, возможно, уже заменены и перенесены
+   * в products.secrets_encrypted. Трогать такую карточку здесь — соврать
+   * «не вышло» поверх настоящего успеха; честнее оставить её человеку на
+   * разбор (ровно как позднее сообщение об успехе в plan item 18).
    *
    * expires_at у working НЕ продлевается claim-ом (он остаётся таким же,
    * каким был у pending) — поэтому срок в прошлом у working-строки надёжно
@@ -291,6 +326,10 @@ export class ProductActionsService {
    *
    * Вторым оператором — стирание коробок у закрытых карточек: страховка на
    * случай закрытия мимо finish/release (ручная правка, будущий код).
+   * status <> 'working', а не список терминальных статусов: ловит и pending
+   * (куда коробка по инварианту не должна попадать вовсе — open() её не
+   * пишет, release() стирает сам) тем же условием, без необходимости
+   * перечислять статусы второй раз и забыть добавить новый.
    */
   async sweepStuck(): Promise<number> {
     const r = await this.pg.query(
@@ -301,14 +340,21 @@ export class ProductActionsService {
               -- (started_at есть) и снятое снаружи — исход на машине
               -- неизвестен; не забранное — ключи точно не менялись, и текст
               -- называет, кто снял (удаление, блокировка, сборщик).
+              -- Карточка ключей (kind = 'keys') без задания вообще — ключи
+              -- заведомо не менялись (заведение задания и отправка карточки —
+              -- один оператор, ProductKeysService), поэтому ей сразу идёт тот
+              -- же текст и reason, что у «не забравшего» случая, а не общая
+              -- формулировка для прочих видов действий.
               result = CASE
+                WHEN NOT EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id) AND a.kind = 'keys'
+                  THEN jsonb_build_object('error', $1::text, 'reason', 'rekey_failed')
                 WHEN NOT EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id)
                   THEN jsonb_build_object('error', 'Действие прервалось — попросите ассистента повторить')
                 WHEN EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id AND j.started_at IS NOT NULL)
                   THEN jsonb_build_object('error', $2::text, 'reason', 'rekey_unknown')
-                WHEN EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id AND j.error = 'снято удалением')
-                  THEN jsonb_build_object('error', $3::text, 'reason', 'gone')
                 WHEN EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id AND j.error = $5::text)
+                  THEN jsonb_build_object('error', $3::text, 'reason', 'gone')
+                WHEN EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id AND j.error = $6::text)
                   THEN jsonb_build_object('error', $4::text, 'reason', 'blocked')
                 ELSE jsonb_build_object('error', $1::text, 'reason', 'rekey_failed')
               END,
@@ -319,14 +365,10 @@ export class ProductActionsService {
           AND (EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id AND j.status = 'failed')
                OR a.expires_at < now() - interval '10 minutes')
        RETURNING a.id`,
-      // Текст блокировки — литералом, а не импортом из block.service: тот
-      // тянет за собой весь модуль. Совпадение с JOB_KILLED_BY_BLOCK
-      // сторожит product-actions.sweep.pg.spec.ts.
-      [REKEY_FAILED_SAY, REKEY_UNKNOWN_SAY, REKEY_GONE_SAY, REKEY_BLOCKED_SAY, 'снято блокировкой администратора'],
+      [REKEY_FAILED_SAY, REKEY_UNKNOWN_SAY, REKEY_GONE_SAY, REKEY_BLOCKED_SAY, JOB_KILLED_BY_DELETE, JOB_KILLED_BY_BLOCK],
     );
     await this.pg.query(
-      `UPDATE product_actions SET secrets_box = NULL
-        WHERE secrets_box IS NOT NULL AND status IN ('done','failed','expired','cancelled')`,
+      `UPDATE product_actions SET secrets_box = NULL WHERE secrets_box IS NOT NULL AND status <> 'working'`,
     );
     return r.rows.length;
   }
