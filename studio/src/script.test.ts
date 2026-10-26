@@ -105,6 +105,21 @@ test('ролик со сценками: реплика hook лишняя', () =>
   assert.ok(validateScript(s, capture).some((p) => /реплики hook быть не должно/.test(p)));
 });
 
+test('ролик со сценками: реплика hook с другим текстом — одна проблема, а не две', () => {
+  const s = skitScript();
+  s.lines.unshift({ id: 'h', scene: 'hook', text: 'Совсем другая зацепка' });
+  const problems = validateScript(s, capture);
+  assert.equal(problems.filter((p) => /hook/.test(p)).length, 1);
+});
+
+test('ролик со сценками: нет самих сценок — названы обе', () => {
+  const s = skitScript();
+  s.skits = {} as Script['skits'];
+  const problems = validateScript(s, capture);
+  assert.ok(problems.includes('нет сценки conflict'));
+  assert.ok(problems.includes('нет сценки punchline'));
+});
+
 test('ролик со сценками: сценка без реплик и реплика с несуществующим абзацем', () => {
   const s = skitScript();
   s.skits = { conflict: skitPlan([]), punchline: skitPlan([{ hero: 'kesha', text: 'Износ.', box: 7 }]) };

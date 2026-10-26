@@ -89,12 +89,32 @@ test('сценки: конфликт → вопрос → ответ → раз�
   assert.deepEqual(t.scenes.final, { from: 1104, duration: 128 });
   assert.equal(t.totalFrames, 1232);
   assert.deepEqual(t.segments.map((s) => [s.lineId, s.from]), [['q', 240], ['a1', 368], ['a2', 616], ['f', 1104]]);
+  assert.deepEqual(t.segments[1], { lineId: 'a1', scene: 'answer', text: 'a1', box: 1, audio: 'voice/a1.mp3', from: 368, duration: 240 });
 });
 
 test('сценки: реплики hook нет — зацепка идёт надписью поверх сценки', () => {
   assert.throws(
     () => buildSkitTimeline([line('h', 'hook', 1500), ...skitLines()], clips, 30),
-    (e: unknown) => e instanceof StudioError && e.code === 'script_invalid',
+    (e: unknown) => e instanceof StudioError && e.code === 'script_invalid' && /реплики hook быть не должно/.test(e.message),
+  );
+});
+
+test('сценки: длина клипа из animation.json проверяется — NaN, 0 и клип короче зацепки', () => {
+  for (const bad of [Number.NaN, 0, -5000, 1000, null as unknown as number, undefined as unknown as number]) {
+    assert.throws(
+      () => buildSkitTimeline(skitLines(), { ...clips, punchline: bad }, 30),
+      (e: unknown) => e instanceof StudioError && e.code === 'no_input' && !e.retryable && /клип сценки punchline/.test(e.message),
+      `длина ${bad}`,
+    );
+  }
+});
+
+test('сценки: на границе 25 с сообщение не противоречит себе и разбивает длину', () => {
+  // 480 кадров клипов + 245 кадров реплик + три паузы по 8 = 749 кадров, 24,97 с.
+  const ls = [line('q', 'question', 2000), line('a1', 'answer', 4167, 1), line('f', 'final', 2000)];
+  assert.throws(
+    () => buildSkitTimeline(ls, clips, 30),
+    (e: unknown) => e instanceof StudioError && e.code === 'too_short' && /ролик 24\.97 с — короче 25 с \(сценки 16\.00 с, озвучка 8\.97 с\)/.test(e.message),
   );
 });
 

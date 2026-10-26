@@ -18,10 +18,14 @@ test('рендер фикстуры со сценками: 1080×1920, 25–45 �
   const ff = (...args: string[]) => execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...args]);
   ff('-f', 'lavfi', '-i', 'color=c=0xedfaed:s=1080x1920', '-frames:v', '1', path.join(dir, 'question.png'));
   ff('-f', 'lavfi', '-i', 'color=c=white:s=1080x5400', '-frames:v', '1', path.join(dir, 'answer.png'));
+  // Паузы на краях клипов — как у Omni: у конфликта 2,3 с тишины в конце, у развязки — в
+  // начале. Стыки «конфликт → вопрос» и «ответ → развязка» дают 2,3 и ≈2,6 с тишины: их
+  // пропускает только SKIT_LIMITS (у обычного ролика предел 2 с).
+  const voice = { conflict: 'sine=frequency=220:duration=5.7,apad', punchline: 'sine=frequency=220:duration=5.7,adelay=2300,apad' };
   for (const [kind, color] of [['conflict', 'orange'], ['punchline', 'purple']] as const) {
     const d = path.join(dir, 'skits', `fx-${kind}`);
     fs.mkdirSync(d, { recursive: true });
-    ff('-f', 'lavfi', '-i', `color=c=${color}:s=720x1280:d=8`, '-f', 'lavfi', '-i', 'sine=frequency=220:duration=8', '-shortest',
+    ff('-f', 'lavfi', '-i', `color=c=${color}:s=720x1280:d=8`, '-f', 'lavfi', '-i', voice[kind], '-shortest',
       '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', path.join(d, 'clip.mp4'));
     ff('-f', 'lavfi', '-i', `color=c=${color}:s=720x1280`, '-frames:v', '1', path.join(d, 'keyframe.png'));
   }
@@ -91,4 +95,7 @@ test('рендер фикстуры со сценками: 1080×1920, 25–45 �
   assert.deepEqual(r.problems, []);
   assert.ok(r.durationSec >= 25 && r.durationSec <= 45, `длина ${r.durationSec}`);
   assert.ok(fs.statSync(r.cover).size > 10_000, 'обложка подозрительно мала');
+  // Обложка — сценка 1 с надписью-зацепкой, без субтитров: на месте плашки субтитра — сам клип (оранжевый).
+  const px = execFileSync('ffmpeg', ['-v', 'error', '-i', r.cover, '-vf', 'format=rgb24,crop=1:1:120:1270', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-']);
+  assert.ok(px[0] > 200 && px[2] < 80, `на обложке субтитр реплики: пиксель ${[...px].join(',')}`);
 });

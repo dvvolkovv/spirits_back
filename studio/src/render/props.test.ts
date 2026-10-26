@@ -103,7 +103,10 @@ test('пропсы со сценками: клипы и субтитры реп�
   const p = buildSkitProps(capture, skitScript, skitVoiced, animation, '/run');
   assert.equal(p.clips.conflict.video, 'skits/fc/clip.mp4');
   assert.equal(p.clips.punchline.video, 'skits/fp/clip.mp4');
-  assert.deepEqual(p.clips.conflict.cues[0], { key: 'conflict-0-0', text: 'Обои потёрли! Залог мой!', from: 15, duration: 90 });
+  assert.deepEqual(p.clips.conflict.cues, [
+    { key: 'conflict-0-0', text: 'Обои потёрли! Залог мой!', from: 15, duration: 90 },
+    { key: 'conflict-1-0', text: 'Спокойно.', from: 120, duration: 90 },
+  ]);
   assert.equal(p.timeline.scenes.punchline.from, 864);
   assert.deepEqual(p.clips.punchline.cues[0], { key: 'punchline-0-0', text: 'Это износ.', from: 879, duration: 75 });
   assert.equal(p.hook, 'Хозяйка оставит залог?');
@@ -120,8 +123,50 @@ test('клип снят под другую сценку — no_input без п�
 
 test('субтитры реплик сценки не наезжают друг на друга и не выходят за сценку', () => {
   const conflict = { ...animation.skits.conflict!, cues: [{ line: 0, startMs: 1017, endMs: 2035 }, { line: 1, startMs: 2035, endMs: 9000 }] };
-  const cues = buildSkitProps(capture, skitScript, skitVoiced, { ...animation, skits: { ...animation.skits, conflict } }, '/run').clips.conflict.cues;
+  const p = buildSkitProps(capture, skitScript, skitVoiced, { ...animation, skits: { ...animation.skits, conflict } }, '/run');
+  const cues = p.clips.conflict.cues;
   for (let i = 1; i < cues.length; i++) assert.ok(cues[i].from >= cues[i - 1].from + cues[i - 1].duration, `субтитр ${i} начинается внутри предыдущего`);
   const last = cues[cues.length - 1];
-  assert.ok(last.from + last.duration <= 240, 'субтитр вылез за сценку конфликта');
+  assert.ok(last.from + last.duration <= p.timeline.scenes.conflict.duration, 'субтитр вылез за сценку конфликта');
+  // Пересечение во времени (правка руками) подрезается, а не даёт два субтитра в одном кадре.
+  const overlap = { ...animation.skits.conflict!, cues: [{ line: 0, startMs: 2000, endMs: 4000 }, { line: 1, startMs: 3000, endMs: 6000 }] };
+  const o = buildSkitProps(capture, skitScript, skitVoiced, { ...animation, skits: { ...animation.skits, conflict: overlap } }, '/run').clips.conflict.cues;
+  assert.deepEqual(o.map((c) => [c.key, c.from, c.duration]), [['conflict-0-0', 60, 60], ['conflict-1-0', 120, 60]]);
+});
+
+test('время реплик сценки не сходится со сценарием — no_input, а не ролик без субтитров', () => {
+  for (const cues of [[], [{ line: 0, startMs: 500, endMs: 3500 }], [{ line: 0, startMs: 500, endMs: 3500 }, { line: 5, startMs: 4000, endMs: 7000 }], [{ line: 0, startMs: Number.NaN, endMs: 3500 }, { line: 1, startMs: 4000, endMs: 7000 }]]) {
+    const conflict = { ...animation.skits.conflict!, cues };
+    assert.throws(
+      () => buildSkitProps(capture, skitScript, skitVoiced, { ...animation, skits: { ...animation.skits, conflict } }, '/run'),
+      (e: unknown) => e instanceof StudioError && e.code === 'no_input' && !e.retryable && /время реплик сценки conflict/.test(e.message),
+      JSON.stringify(cues),
+    );
+  }
+});
+
+test('клипы не по 8 с: сцены и субтитры идут за настоящей длиной клипа', () => {
+  const skits = { conflict: { ...animation.skits.conflict!, durationMs: 7000 }, punchline: { ...animation.skits.punchline!, durationMs: 9400 } };
+  const p = buildSkitProps(capture, skitScript, skitVoiced, { ...animation, skits }, '/run');
+  assert.deepEqual(p.timeline.scenes.conflict, { from: 0, duration: 210 });
+  assert.equal(p.timeline.scenes.question.from, 210);
+  assert.equal(p.timeline.scenes.punchline.duration, 282);
+  assert.equal(p.timeline.scenes.final.from, p.timeline.scenes.punchline.from + 282);
+  assert.deepEqual(p.clips.conflict.cues[1], { key: 'conflict-1-0', text: 'Спокойно.', from: 120, duration: 90 });
+});
+
+test('длинная реплика сценки — два куска субтитров со своими ключами', () => {
+  const long = 'Обои потёрли, плитку поцарапали, ковёр испортили — залог мой!';
+  const script: Script = { ...skitScript, skits: { ...skitScript.skits!, conflict: skitPlan('fc', [long, 'Спокойно.']) } };
+  const cues = buildSkitProps(capture, script, skitVoiced, animation, '/run').clips.conflict.cues;
+  assert.deepEqual(cues.map((c) => c.key), ['conflict-0-0', 'conflict-0-1', 'conflict-1-0']);
+  assert.equal(cues.slice(0, 2).map((c) => c.text).join(' '), long);
+  assert.equal(cues[1].from + cues[1].duration, 105);
+});
+
+test('в сценарии нет сценок — script_invalid', () => {
+  assert.throws(
+    () => buildSkitProps(capture, { ...skitScript, skits: undefined }, skitVoiced, animation, '/run'),
+    (e: unknown) => e instanceof StudioError && e.code === 'script_invalid' && !e.retryable,
+  );
 });
