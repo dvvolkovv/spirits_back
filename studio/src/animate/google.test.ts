@@ -281,7 +281,7 @@ test('готово, но без видео — omni_rejected с текстом �
 
 test('не дождались — omni_timeout: генерация может ещё закончиться; срок — по часам, а не по числу опросов', async () => {
   const a = fake([inProgress, inProgress, inProgress]);
-  await assert.rejects(waitClip(a.deps, 'i'), (e: unknown) => isErr('omni_timeout', true)(e) && /не дождались/.test((e as Error).message));
+  await assert.rejects(waitClip(a.deps, 'i'), (e: unknown) => isErr('omni_timeout', true)(e) && /не дождались/.test((e as Error).message) && /последний статус: in_progress/.test((e as Error).message));
   const slow = fake(Array.from({ length: 10 }, () => inProgress), 40);
   slow.deps.pollTimeoutMs = 100;
   await assert.rejects(waitClip(slow.deps, 'i'), isErr('omni_timeout', true));
