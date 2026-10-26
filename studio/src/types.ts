@@ -126,24 +126,29 @@ export interface SkitLine {
 export interface Skit {
   cast: { hero: string; role: string }[];
   setting: string;
+  /** Первый кадр — по нему рисуется кадр-эталон. */
+  opening: string;
+  /** Что происходит за 8 секунд — по нему Omni оживляет кадр. */
   action: string;
   lines: SkitLine[];
 }
 
-/** Сценка, готовая к оживлению: промпты собрал бэкенд (src/shorts/short-skit-prompts.ts, SkitPlan). */
+/** Сценка, готовая к оживлению: промпты и отпечатки собрал бэкенд (src/shorts/short-skit-prompts.ts, SkitPlan). */
 export interface SkitPlan {
   skit: Skit;
   /** Версия листа труппы: портреты — assets/troupe/<версия>/<id>.png. */
   troupeVersion: string;
-  /** Чьи портреты нужны кадру — по порядку состава, без повторов. */
+  /** Чьи портреты нужны кадру — в порядке состава. */
   heroes: string[];
   keyframePrompt: string;
   videoPrompt: string;
-  /** Отпечаток промптов и версии труппы: клип с тем же отпечатком не переснимается. */
+  /** Отпечаток кадра-эталона: кадр лежит в keyframes/<отпечаток>.png и с тем же отпечатком не перерисовывается. */
+  keyframeFingerprint: string;
+  /** Отпечаток клипа (включает отпечаток кадра): клип с тем же отпечатком не переснимается. */
   fingerprint: string;
 }
 
-/** Время реплики сценки в клипе. */
+/** Время реплики сценки в клипе: line — номер в skit.lines с 0, время — мс от начала клипа. */
 export interface SkitCue {
   line: number;
   startMs: number;
@@ -153,18 +158,26 @@ export interface SkitCue {
 /** Готовая сценка. Пути — относительно папки ролика. */
 export interface SkitClip {
   fingerprint: string;
+  /** keyframes/<отпечаток кадра>.png */
   keyframe: string;
+  /** skits/<отпечаток клипа>/clip.mp4 — громкость уже выровнена. */
   clip: string;
   durationMs: number;
   /** Что распознал SpeechKit в клипе. */
   heard: string;
   cues: SkitCue[];
-  /** Сколько клипов Omni ушло на эту сценку. */
+  /** Номер удачной попытки в последнем запуске animate; оплаченные клипы считает omniSeconds. */
   attempts: number;
+  /** Настройки бесплатной обработки (громкость, пороги пауз): при их смене клип переобрабатывается из raw.mp4, без Omni. */
+  post: string;
 }
 
-/** animation.json папки ролика — итог задания animate. */
-export interface Animation {
+/**
+ * animation.json папки ролика — итог задания animate. Сценки — Partial:
+ * частично заполненный файл — нормальное состояние (одна сценка готова,
+ * другая упала). Не Animation: так называется тип DOM.
+ */
+export interface ShortAnimation {
   /** Секунды Omni, потраченные на ролик, со всеми попытками. */
   omniSeconds: number;
   skits: Partial<Record<SkitKind, SkitClip>>;
@@ -176,7 +189,7 @@ export interface SkitTimeline {
   totalFrames: number;
 }
 
-/** Субтитр с абсолютным кадром начала — у реплик сценок. */
+/** Субтитр в кадрах от начала ролика — у реплик сценок. */
 export interface ClipCue {
   key: string;
   text: string;

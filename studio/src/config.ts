@@ -33,8 +33,7 @@ function required(env: Env, name: string): string {
 /**
  * Разбор окружения без побочных эффектов: файл .env читает вызывающий
  * (`import 'dotenv/config'`). needs говорит, какие ключи обязательны:
- * съёмке — демо-номер и секрет debug-ручек, озвучке — SpeechKit,
- * оживлению сценок — ключ Google.
+ * съёмке — демо-номер и секрет debug-ручек, озвучке — SpeechKit, оживлению сценок — ключи Google и SpeechKit.
  */
 export function parseConfig(env: Env, needs: { capture: boolean; tts: boolean; worker?: boolean; animate?: boolean }): StudioConfig {
   const cabinetUrl = (env.CABINET_URL?.trim() || 'https://test.linkeon.io').replace(/\/+$/, '');
@@ -47,15 +46,16 @@ export function parseConfig(env: Env, needs: { capture: boolean; tts: boolean; w
     basicAuth = { username: ba.slice(0, i), password: ba.slice(i + 1) };
   }
   const worker = needs.worker === true;
+  const speech = needs.tts || needs.animate === true;
   return {
     cabinetUrl,
     apiUrl,
     basicAuth,
     demoPhone: needs.capture ? assertDemoPhone(required(env, 'DEMO_PHONE')) : (env.DEMO_PHONE?.trim() ?? ''),
     debugSecret: needs.capture ? required(env, 'DEBUG_SECRET') : '',
-    speechkitKey: needs.tts ? required(env, 'YANDEX_SPEECHKIT_API_KEY') : '',
-    speechkitFolder: needs.tts ? required(env, 'YANDEX_TTS_FOLDER_ID') : '',
-    googleKey: needs.animate === true ? required(env, 'GOOGLE_AI_API_KEY') : (env.GOOGLE_AI_API_KEY?.trim() ?? ''),
+    speechkitKey: speech ? required(env, 'YANDEX_SPEECHKIT_API_KEY') : '',
+    speechkitFolder: speech ? required(env, 'YANDEX_TTS_FOLDER_ID') : '',
+    googleKey: needs.animate === true ? required(env, 'GOOGLE_AI_API_KEY') : '',
     databaseUrl: worker ? required(env, 'DATABASE_URL') : '',
     minio: worker
       ? {
