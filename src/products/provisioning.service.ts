@@ -134,8 +134,15 @@ export interface ClaimedJob {
   dropNames?: string[];
   /**
    * Telegram владельца — только боту, только у provision и rekey. Уходит в
-   * окружение `OWNER_TG_ID`. Пустая строка (только у rekey) — привязки больше
-   * нет: агент снимает переменную. Ключа нет — не трогать.
+   * окружение `OWNER_TG_ID`. Привязка есть — значение (цифры); привязки нет
+   * ИЛИ чтение привязки отказало — поля нет вовсе, переменная не трогается.
+   *
+   * Пустую строку (снять переменную) сервер НЕ присылает, хотя агент её
+   * понимает (задача 7, не используется отсюда): отвязка Telegram в кабинете
+   * строку tg_user_identities не удаляет, поэтому «привязки нет» почти всегда
+   * означало бы «владелец её вовсе не заводил» — и пустая строка молча
+   * снимала бы OWNER_TG_ID, поставленный руками у продукта, заведённого до
+   * очереди 2 (решение контроллера по ревью задачи 9).
    */
   ownerTgId?: string;
 }
@@ -988,8 +995,13 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                                   -- коробкой ключей в карточке и только без идущей правки —
                                   -- пересоздание контейнера убило бы ход молча.
                                   WHEN 'rekey' THEN p.status IN ('running','degraded')
+                                                 -- product_id и kind — не только id: j.action_id
+                                                 -- может указывать на карточку, которую подменили
+                                                 -- (FK допускает это) или чей вид не 'keys' — такую
+                                                 -- коробку расшифровывать и слать агенту нельзя.
                                                  AND EXISTS (SELECT 1 FROM product_actions ka
-                                                              WHERE ka.id = j.action_id AND ka.status = 'working'
+                                                              WHERE ka.id = j.action_id AND ka.product_id = p.id
+                                                                AND ka.kind = 'keys' AND ka.status = 'working'
                                                                 AND ka.secrets_box IS NOT NULL)
                                                  AND NOT EXISTS (SELECT 1 FROM product_turns t
                                                                   WHERE t.product_id = p.id AND t.status IN ('queued','running'))
@@ -1070,9 +1082,17 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
 
     const jobKind = row.job_kind as JobKind;
 
-    // Ключи: заведению — из продукта, смене ключей — из коробки её карточки
-    // (тот же AAD — id продукта). Прочим видам ключи не нужны и не
-    // расшифровываются вовсе.
+    // ДВА аргумента: коробка привязана к продукту через AAD. Признак
+    // «секретов нет» — NULL (в secrets_encrypted у заведения, задача 3 кладёт
+    // именно его, а не коробку от {}; в secrets_box у карточки ключей —
+    // когда набор пуст), и читаться он обязан ДО вызова: decrypt на null —
+    // сырой TypeError.
+    //
+    // Сну и пробуждению секреты не нужны вовсе: контейнер уже собран, и
+    // переменные окружения в нём. Расшифровывать их здесь значило бы гонять
+    // секреты клиента по сети на каждое усыпление ни за чем. Заведению —
+    // из продукта, смене ключей — из коробки её карточки (тот же AAD — id
+    // продукта). Прочим видам ключи не нужны и не расшифровываются вовсе.
     let secrets: Record<string, string> = {};
     if (jobKind === 'provision' && row.box) secrets = this.secrets.decrypt(row.box, row.product_id);
     if (jobKind === 'rekey' && row.rekey_box) secrets = this.secrets.decrypt(row.rekey_box, row.product_id);
@@ -1083,13 +1103,13 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     // модуля tg-bot, и её отказ не должен ронять опрос агента (задание уже
     // забрано, токен выпущен — 500 здесь оставил бы его до сборщика).
     // Три исхода чтения: id — поставить; null — привязки нет; undefined —
-    // прочитать не удалось. Заведению без привязки ключ не нужен вовсе; смене
-    // ключей «привязки нет» — пустая строка: агент снимет устаревший
-    // OWNER_TG_ID. «Не удалось» не трогает ничего.
+    // прочитать не удалось. ОБА последних исхода — поле отсутствует, ключ не
+    // трогается: пустая строка (снять переменную) здесь не шлётся вовсе —
+    // см. комментарий у ClaimedJob.ownerTgId про отвязку в кабинете.
     const owner = row.kind === 'bot' && (jobKind === 'provision' || jobKind === 'rekey')
       ? await this.ownerTgIdOf(row.user_id)
       : undefined;
-    const ownerTgId = typeof owner === 'string' ? owner : owner === null && jobKind === 'rekey' ? '' : undefined;
+    const ownerTgId = typeof owner === 'string' ? owner : undefined;
 
     return {
       jobId: row.job_id,
