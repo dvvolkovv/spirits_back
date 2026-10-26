@@ -94,11 +94,16 @@ describe('Маша в вебе: инструмент продуктов', () => 
     expect(opts.mcpServers.products.url).toBe('http://127.0.0.1:3001/webhook/mcp/products');
   });
 
-  it('токен — этого пользователя и канала web', async () => {
+  it('токен — этого пользователя и канала web, с меткой хода', async () => {
     const { opts } = await runMasha();
     const bearer = String(opts.mcpServers.products.headers?.Authorization ?? '');
     expect(bearer).toMatch(/^Bearer /);
-    expect(verifyProductToolToken(bearer.replace(/^Bearer /, ''))).toEqual({ userId: USER, channel: 'web', turn: null });
+    const claims = verifyProductToolToken(bearer.replace(/^Bearer /, ''));
+    // Метка хода — чат-сервис генерирует её сам (randomUUID) на каждый ход
+    // Маши, чтобы в конце хода забрать ровно карточки, заведённые этим ходом.
+    expect(claims.userId).toBe(USER);
+    expect(claims.channel).toBe('web');
+    expect(claims.turn).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
   });
 
   it('автоодобрены ровно продукты, поиск файлов и сообщение в поддержку, встроенные тулы не включаются', async () => {
