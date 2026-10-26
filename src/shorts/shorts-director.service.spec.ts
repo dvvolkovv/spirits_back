@@ -1,6 +1,7 @@
 import { ShortsDirectorService } from './shorts-director.service';
 import { StageFatalError } from './short-jobs';
-import { DIRECTOR_SYSTEM } from './short-prompts';
+import { DIRECTOR_SKIT_SYSTEM, DIRECTOR_SYSTEM } from './short-prompts';
+import { MAX_SKIT_REWRITES } from './shorts-director.service';
 import { rowToShort } from './shorts.types';
 
 const AGENTS = [
@@ -120,5 +121,74 @@ describe('ShortsDirectorService.direct', () => {
     const health = { ...REPLY, assistantId: 30 };
     const { svc } = setup(health);
     await expect(svc.direct(video({ angle: 'calm', assistant_id: null }))).resolves.toBeUndefined();
+  });
+});
+
+describe('ShortsDirectorService.direct — ролик со сценками', () => {
+  const SKIT = {
+    cast: [{ hero: 'galina', role: 'хозяйка квартиры' }, { hero: 'kesha', role: 'жилец' }],
+    setting: 'a rented flat hallway, a tiny scuff on the wallpaper',
+    opening: 'The goose stands in the doorway, the capybara holds a suitcase.',
+    action: 'The goose points a wing at the scuff and hisses. The capybara takes out a phone.',
+    lines: [{ hero: 'galina', text: 'Обои потёрли! Залог мой!' }, { hero: 'kesha', text: 'Спокойно. Спрошу у юриста.' }],
+  };
+  const LONG = { ...SKIT, lines: [{ hero: 'galina', text: 'Раз два три четыре пять шесть семь восемь девять десять одиннадцать двенадцать тринадцать.' }] };
+
+  function skitSetup(replies: any[]) {
+    const queue = [...replies];
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        if (sql.includes("scene->>'question'")) return { rows: [{ q: 'Вопрос из прошлого ролика' }] };
+        if (sql.includes("scene->'skit'")) return { rows: [{ skit: { ...SKIT, setting: 'a kitchen', action: 'The cat stamps a paper.' } }, { skit: null }] };
+        return { rows: [], rowCount: 1 };
+      }),
+    };
+    const relay = { ask: jest.fn(async () => JSON.stringify(queue.shift())) };
+    const agents = { getAgents: jest.fn(async () => AGENTS) };
+    return { svc: new ShortsDirectorService(pg as any, relay as any, agents as any), pg, relay };
+  }
+
+  it('сцена и сценка 1 — из одного ответа; системный промпт сценок, прошлые сценки — режиссёру', async () => {
+    const { svc, pg, relay } = skitSetup([{ ...REPLY, skit: SKIT }]);
+    await svc.direct(video({ format: 'skit' }));
+    const [system, message] = relay.ask.mock.calls[0] as any[];
+    expect(system).toBe(DIRECTOR_SKIT_SYSTEM);
+    expect(message).toContain('<<<СЦЕНКИ\n- a kitchen — The cat stamps a paper.\nСЦЕНКИ>>>');
+    const update = pg.query.mock.calls.find(([sql]: [string]) => sql.includes("SET status = 'capture_queued'"));
+    expect(JSON.parse(update[1][1]).skit).toEqual(SKIT);
+    // Прошлые сценки — только у роликов, где они есть.
+    expect(pg.query.mock.calls.find(([sql]: [string]) => sql.includes("scene->'skit'"))[0]).toContain("scene ? 'skit'");
+  });
+
+  it('сценка нарушила правила — переписка с перечнем и прошлым вариантом; второй вариант записан', async () => {
+    const { svc, pg, relay } = skitSetup([{ ...REPLY, skit: LONG }, { ...REPLY, skit: SKIT }]);
+    await svc.direct(video({ format: 'skit' }));
+    expect(relay.ask).toHaveBeenCalledTimes(2);
+    const second = relay.ask.mock.calls[1][1] as string;
+    expect(second).toContain('Сценка нарушила правила — исправь:\n- сценка 1 (конфликт): правило 17: реплика 1 — 13 слов, больше 12');
+    expect(second).toContain('<<<СЦЕНКА 1\n');
+    const update = pg.query.mock.calls.find(([sql]: [string]) => sql.includes("SET status = 'capture_queued'"));
+    expect(JSON.parse(update[1][1]).skit).toEqual(SKIT);
+  });
+
+  it(`нарушения и после ${MAX_SKIT_REWRITES} переписок — StageFatalError, ролик не записан`, async () => {
+    const { svc, pg, relay } = skitSetup(Array.from({ length: MAX_SKIT_REWRITES + 1 }, () => ({ ...REPLY, skit: LONG })));
+    await expect(svc.direct(video({ format: 'skit' }))).rejects.toThrow(StageFatalError);
+    expect(relay.ask).toHaveBeenCalledTimes(MAX_SKIT_REWRITES + 1);
+    expect(pg.query.mock.calls.some(([sql]: [string]) => sql.includes("SET status = 'capture_queued'"))).toBe(false);
+  });
+
+  it('ответ без сценки у ролика со сценками — ошибка разбора (повтор этапа), а не сцена без сценки', async () => {
+    const { svc } = skitSetup([REPLY]);
+    await expect(svc.direct(video({ format: 'skit' }))).rejects.toThrow(/режиссёр: skit — объект/);
+  });
+
+  it('ролик «Только чат» — без сценки, без запроса прошлых сценок, прежний промпт', async () => {
+    const { svc, pg, relay } = skitSetup([REPLY]);
+    await svc.direct(video({ format: 'chat' }));
+    expect(relay.ask.mock.calls[0][0]).toBe(DIRECTOR_SYSTEM);
+    expect(pg.query.mock.calls.some(([sql]: [string]) => sql.includes("scene->'skit'"))).toBe(false);
+    const update = pg.query.mock.calls.find(([sql]: [string]) => sql.includes("SET status = 'capture_queued'"));
+    expect('skit' in JSON.parse(update[1][1])).toBe(false);
   });
 });
