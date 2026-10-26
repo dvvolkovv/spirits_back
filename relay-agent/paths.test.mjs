@@ -10,7 +10,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { randomUUID } from "crypto";
-import { sessionFsKey, uploadFileName, fallbackFileName } from "./paths.mjs";
+import { sessionFsKey, uploadFileName, fallbackFileName, sessionOutputDir } from "./paths.mjs";
 
 const DIR = fs.mkdtempSync(path.join(os.tmpdir(), "paths-test-"));
 process.on("exit", () => fs.rmSync(DIR, { recursive: true, force: true }));
@@ -89,4 +89,28 @@ test("имя файла не может уползти в другой ката�
   const built = uploadFileName("../../../home/dv/.ssh/authorized_keys", sessionFsKey(SID, "x"));
   assert.ok(!built.includes("/"), "в имени не должно остаться слэшей: " + built);
   assert.equal(tryCreate(built), null);
+});
+
+// sid в GET /session/:sid/files приходит прямо из URL, Express сам его
+// раскодирует. sessionOutputDir — единственное место, где sid превращается в
+// путь на диске для этого обработчика; sid проверяется и символьно (только
+// [A-Za-z0-9_.-]), и финальным сравнением итогового пути с каталогом вывода.
+test("sessionOutputDir: обычный sid — путь внутри каталога вывода", () => {
+  const BASE = "/tmp/agent-output";
+  assert.equal(sessionOutputDir(BASE, SID), path.join(BASE, SID));
+});
+
+test("sessionOutputDir: sid вне алфавита или целиком '.'/'..' — null", () => {
+  const BASE = "/tmp/agent-output";
+  const evil = [
+    "../..",        // составной выход
+    "..",           // голый родитель
+    ".",            // голый «текущий»
+    "",             // пустой
+    "/etc",         // абсолютный путь вместо имени
+    "../",          // то, во что раскодируется "..%2F"
+  ];
+  for (const sid of evil) {
+    assert.equal(sessionOutputDir(BASE, sid), null, "sid " + JSON.stringify(sid) + " должен быть отклонён");
+  }
 });

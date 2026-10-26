@@ -14,3 +14,9 @@ _old-backups/
 sessions/
 uploads/
 *.log
+
+# Секреты бэков и режим проверки (relay-auth.mjs). Живут только на сервере,
+# права 600. Звёздочка — из-за атомической записи (временный файл рядом,
+# потом mv): relay-secrets.tmp-* тоже не должен попасть в git.
+relay-secrets*
+relay-auth-mode*

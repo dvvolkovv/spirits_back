@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
+import { relayAuthHeaders } from '../chat/relay-auth';
 
 /**
  * Разбор SSE-потока релея. Вынесен отдельной чистой функцией, чтобы
@@ -36,9 +37,10 @@ export class BlogRelayClient {
     fd.append('sessionId', sessionId);
 
     const resp = await axios.post(`${agentUrl}/chat`, fd, {
-      headers: fd.getHeaders(),
+      headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
       responseType: 'stream',
       timeout: 300_000,
+      maxRedirects: 0,
     });
 
     const raw = await new Promise<string>((resolve, reject) => {

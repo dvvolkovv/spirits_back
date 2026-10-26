@@ -40,6 +40,7 @@ BACK_KEYS=(
   # MCP_SECRET не копируется: у test свой с 07.10.2026. Общий секрет
   # превращал утечку .env стенда в ключ от /mcp прода (календари, рутины,
   # генерация за чужие токены).
+  # RELAY_SECRET не копируется: у стенда свой (relay-secret, docs/superpowers/specs/2026-10-26-relay-secret-design.md).
   TELEGRAM_BOT_TOKEN
   TELEGRAM_WEBHOOK_SECRET
   META_APP_ID

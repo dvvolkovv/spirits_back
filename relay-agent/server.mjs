@@ -4,12 +4,14 @@ import cors from "cors";
 import { randomUUID } from "crypto";
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import { sessionFsKey, uploadFileName, fallbackFileName } from "./paths.mjs";
+import { sessionFsKey, uploadFileName, fallbackFileName, sessionOutputDir } from "./paths.mjs";
 import { eventCallContext, tailDialogue } from "./session-tail.mjs";
 import { RUN_ENV, runTag, finishedRun, reap } from "./proc-reaper.mjs";
 import { costBaseline, runCost } from "./turn-cost.mjs";
 import { createUndelivered, withCarried } from "./undelivered-files.mjs";
+import { createRelayAuth } from "./relay-auth.mjs";
 
 const app = express();
 const PORT = 3033;
@@ -20,6 +22,14 @@ fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
 app.use(cors());
+// Ходы принимаются только от бэков с секретом (relay-auth.mjs). Файлы —
+// рядом с server.mjs, права 600, не в git; режим log пишет «отказ был бы»
+// и пропускает, enforce отвечает 401.
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+app.use(createRelayAuth({
+  secretsPath: process.env.RELAY_SECRETS_FILE || path.join(HERE, "relay-secrets"),
+  modePath: process.env.RELAY_AUTH_MODE_FILE || path.join(HERE, "relay-auth-mode"),
+}));
 app.use(express.json());
 app.use("/files", express.static(OUTPUT_DIR));
 
@@ -1052,8 +1062,8 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
 });
 
 app.get("/session/:sid/files", (req, res) => {
-  const outDir = path.join(OUTPUT_DIR, req.params.sid);
-  if (!fs.existsSync(outDir)) return res.json([]);
+  const outDir = sessionOutputDir(OUTPUT_DIR, req.params.sid);
+  if (!outDir || !fs.existsSync(outDir)) return res.json([]);
   const files = [];
   const walk = (dir, prefix) => {
     for (const item of fs.readdirSync(dir)) {

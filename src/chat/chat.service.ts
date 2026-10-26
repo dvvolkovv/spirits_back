@@ -1,4 +1,5 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
+import { relayAuthHeaders } from './relay-auth';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { ChatToolsService } from './chat-tools';
@@ -1901,9 +1902,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
         fd.append('products_mcp_url', pf.products_mcp_url);
 
         const agentRes = await axios.post(`${AGENT_URL}/chat`, fd, {
-          headers: fd.getHeaders(),
+          headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
           responseType: 'stream',
           timeout: RELAY_TURN_BUDGET_MS,
+          maxRedirects: 0,
         });
 
         await new Promise<void>((resolve, reject) => {
@@ -2021,9 +2023,16 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // адресом. Готовый адрес самодостаточен — ради него relay не дёргаем.
           const listed = hasEmpty
             ? await axios
-                .get(`${AGENT_URL}/session/${encodeURIComponent(sid)}/files`, { timeout: 10_000 })
+                .get(`${AGENT_URL}/session/${encodeURIComponent(sid)}/files`, {
+                  timeout: 10_000,
+                  headers: relayAuthHeaders(),
+                  maxRedirects: 0,
+                })
                 .then((r) => (Array.isArray(r.data) ? r.data : []))
-                .catch(() => [] as any[])
+                .catch((e) => {
+                  if (e?.response?.status === 401) this.logger.warn('релей отклонил секрет (401)');
+                  return [] as any[];
+                })
             : [];
 
           let resolved = resolveEmptyFileLinks(full, listed, AGENT_URL);
@@ -2445,9 +2454,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
     let costUsd = 0;
     const turnCost = new RelayTurnCost();
     const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
-      headers: fd.getHeaders(),
+      headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
       responseType: 'stream',
       timeout: 300000,
+      maxRedirects: 0,
     });
     await new Promise<void>((resolve, reject) => {
       let buffer = '';
