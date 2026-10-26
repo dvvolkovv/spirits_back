@@ -35,6 +35,9 @@ function makeService(over: any = {}) {
     query: jest.fn(async (sql: string, params: any[] = []) => {
       calls.push({ sql, params });
       if (sql.includes('SELECT count(*)')) return { rows: [{ count: over.slugTaken ? '1' : '0' }] };
+      if (sql.includes('SELECT 1 FROM products WHERE tg_bot_id')) {
+        return { rows: over.botBusy ? [{ x: 1 }] : [] };
+      }
       if (sql.includes('INSERT INTO product_provision_jobs') && over.jobInsertFails) {
         throw Object.assign(new Error('деталь для лога'), { code: '23505' });
       }
@@ -62,12 +65,22 @@ function makeService(over: any = {}) {
       if (over.overLimit) throw new UnprocessableEntityException('предел аккаунта');
     }),
   };
+  const svc = new ProvisioningService(pg as any, secrets as any, hosts as any, limits as any);
+  // I2: без этой заглушки каждый тест ниже с kind:'bot' и секретом BOT_TOKEN
+  // бил бы по настоящему Telegram (новая проверка в create()) — токены во
+  // всех этих тестах фиктивные и заведомо не прошли бы getMe. По умолчанию —
+  // «токен живой», чтобы форма и остальное поведение create() проверялись
+  // как раньше, независимо от содержимого BOT_TOKEN. `over.botCheck`
+  // подменяет результат целиком — для тестов самой этой проверки.
+  const checkBot = jest.fn(async () => over.botCheck ?? { ok: true, id: 9000000001, username: 'studio_bot' });
+  (svc as any).checkBot = checkBot;
   return {
-    svc: new ProvisioningService(pg as any, secrets as any, hosts as any, limits as any),
+    svc,
     calls,
     secrets,
     hosts,
     limits,
+    checkBot,
   };
 }
 
@@ -767,6 +780,92 @@ describe('ProvisioningService.create', () => {
     expect(fix.params[0]).toBe(
       calls.find((c) => c.sql.includes('INSERT INTO products'))!.params[0],
     );
+  });
+
+  // --- I2: Студия заводит бота без tgBotId — create() проверяет токен сам ---
+
+  it('I2: отвергнутый токен — 400 до всякой записи', async () => {
+    const { svc, calls, checkBot } = makeService({ botCheck: { ok: false, reason: 'rejected' } });
+
+    await expect(
+      svc.create({ userId: 'u-1', isAdmin: false, name: 'Бот', slug: 'studio-bot', kind: 'bot', secrets: { BOT_TOKEN: '123456:настоящийНастоящийНастоящий' } }),
+    ).rejects.toThrow(/Telegram не принял токен/);
+
+    expect(checkBot).toHaveBeenCalledWith('123456:настоящийНастоящийНастоящий');
+    expect(sqlOf(calls)).not.toContain('INSERT INTO products');
+  });
+
+  it('I2: форма токена не подходит — тот же 400, до записи', async () => {
+    const { svc, calls } = makeService({ botCheck: { ok: false, reason: 'bad_form' } });
+
+    await expect(
+      svc.create({ userId: 'u-1', isAdmin: false, name: 'Бот', slug: 'studio-bot2', kind: 'bot', secrets: { BOT_TOKEN: 'не токен' } }),
+    ).rejects.toThrow(/Telegram не принял токен/);
+
+    expect(sqlOf(calls)).not.toContain('INSERT INTO products');
+  });
+
+  it('I2: Telegram недоступен — продукт заводится, tg_bot_id — NULL', async () => {
+    const { svc, calls } = makeService({ botCheck: { ok: false, reason: 'unreachable' } });
+
+    const res = await svc.create({
+      userId: 'u-1', isAdmin: false, name: 'Бот', slug: 'studio-bot3', kind: 'bot',
+      secrets: { BOT_TOKEN: '123456:чтоУгодно' },
+    });
+
+    expect(res.productId).toEqual(expect.any(String));
+    const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
+    expect(insert.params[insert.params.length - 1]).toBeNull();
+  });
+
+  it('I2: токен живой — tg_bot_id от getMe уходит в INSERT', async () => {
+    const { svc, calls } = makeService({ botCheck: { ok: true, id: 555, username: 'studio_bot' } });
+
+    const res = await svc.create({
+      userId: 'u-1', isAdmin: false, name: 'Бот', slug: 'studio-bot4', kind: 'bot',
+      secrets: { BOT_TOKEN: '123456:чтоУгодно' },
+    });
+
+    expect(res.productId).toEqual(expect.any(String));
+    const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
+    expect(insert.params[insert.params.length - 1]).toBe(555);
+  });
+
+  it('I2: тот же бот уже работает в другом продукте — 409 до записи', async () => {
+    const { svc, calls } = makeService({ botCheck: { ok: true, id: 555 }, botBusy: true });
+
+    await expect(
+      svc.create({ userId: 'u-1', isAdmin: false, name: 'Бот', slug: 'studio-bot5', kind: 'bot', secrets: { BOT_TOKEN: '123456:чтоУгодно' } }),
+    ).rejects.toThrow(/бот уже работает в другом продукте/);
+
+    expect(sqlOf(calls)).not.toContain('INSERT INTO products');
+  });
+
+  it('I2: tgBotId уже передан (путь ассистента) — свой getMe не зовётся', async () => {
+    // Полная противоположность всем тестам выше: completeCreateBot уже
+    // проверил токен и передал готовый tgBotId — повторный поход в Telegram
+    // здесь был бы вторым getMe за тот же токен без всякой нужды.
+    const { svc, calls, checkBot } = makeService();
+
+    await svc.create({
+      userId: 'u-1', isAdmin: false, name: 'Бот', slug: 'studio-bot6', kind: 'bot',
+      secrets: { BOT_TOKEN: '123456:чтоУгодно' }, tgBotId: 777,
+    });
+
+    expect(checkBot).not.toHaveBeenCalled();
+    const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
+    expect(insert.params[insert.params.length - 1]).toBe(777);
+  });
+
+  it('I2: бот без секрета BOT_TOKEN вовсе — getMe не зовётся, tg_bot_id — NULL', async () => {
+    const { svc, calls, checkBot } = makeService();
+
+    const res = await svc.create({ userId: 'u-1', isAdmin: false, name: 'Бот', slug: 'studio-bot7', kind: 'bot', secrets: {} });
+
+    expect(checkBot).not.toHaveBeenCalled();
+    const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
+    expect(insert.params[insert.params.length - 1]).toBeNull();
+    expect(res.productId).toEqual(expect.any(String));
   });
 });
 

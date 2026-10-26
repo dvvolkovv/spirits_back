@@ -9,6 +9,7 @@ import {
 } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { PgService } from '../common/services/pg.service';
+import { BotTokenCheck, checkBotToken } from './bot-token-check';
 import { AGENT_OUTDATED_MARKER } from './domain-name';
 import { HostsService } from './hosts.service';
 import { LimitsService } from './limits.service';
@@ -424,6 +425,23 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
   private fetchFn: (url: string, init?: RequestInit) => Promise<{ status: number }> = (url, init) =>
     fetch(url, init);
 
+  /**
+   * Подменяется в тестах — тот же приём, что `checkBot` в
+   * product-lifecycle.service.ts (поле, а не прямой вызов), и по той же
+   * причине: иначе каждый существующий тест на заведение бота со
+   * строкой-заглушкой вместо токена бил бы по настоящему Telegram.
+   *
+   * Нужен ЗДЕСЬ, а не только там: путь ассистента (openCreateBot/
+   * completeCreateBot) проверяет токен САМ и передаёт уже проверенный
+   * `tgBotId` сюда — а путь Студии (ProductsController.create) идёт прямо в
+   * `create()`, минуя lifecycle-сервис целиком, и `tgBotId` не передаёт
+   * вовсе (I2). Без проверки здесь Студия заводит бота без tg_bot_id, и ни
+   * ранняя проверка, ни партиционный UNIQUE products_tg_bot_live такой
+   * продукт не видят — два контейнера опрашивают Telegram за один токен, и
+   * один молча теряет обновления (история 25.10).
+   */
+  private checkBot: (token: string) => Promise<BotTokenCheck> = (t) => checkBotToken(t);
+
   constructor(
     private readonly pg: PgService,
     private readonly secrets: SecretsService,
@@ -578,6 +596,57 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     const taken = await this.pg.query(`SELECT count(*) FROM products WHERE slug = $1`, [input.slug]);
     if (Number(taken.rows[0].count) > 0) throw new ConflictException('слаг уже занят');
 
+    // I2: ЧЕТВЁРТАЯ проверка — токен бота Студии, и она СТОИТ ПОСЛЕ трёх
+    // проверок по базе выше, а не вместе с разбором формы в начале метода.
+    // Причина та же, по которой предел и машина спрашиваются раньше слага
+    // (см. комментарий выше): getMe — поход во внешнюю сеть (до 8 секунд), и
+    // тратить его на форму, которая всё равно отказала бы по пределу, по
+    // месту на машинах или по занятому слагу, незачем — человек поправил бы
+    // токен, нажал снова и только тогда узнал, что заводить всё равно
+    // некуда. Слаг и секреты из `entries` выше не ходят в сеть вовсе, поэтому
+    // стоят раньше этой проверки, а не после неё.
+    //
+    // `tgBotId` уже проставлен — путь ассистента (openCreateBot/
+    // completeCreateBot) сам вызвал getMe и передал результат сюда; повторная
+    // проверка была бы вторым походом в Telegram за тот же токен. Студия
+    // (ProductsController.create) `tgBotId` не передаёт никогда — вот ровно
+    // тот случай, который эта проверка чинит.
+    let tgBotId = input.tgBotId ?? null;
+    if (input.kind === 'bot' && !tgBotId) {
+      const token = (input.secrets ?? {}).BOT_TOKEN;
+      if (typeof token === 'string' && token.trim() !== '') {
+        const check = await this.checkBot(token.trim());
+        // `check.ok === false`, а не `!check.ok`: strictNullChecks выключен
+        // (tsconfig этого репо) — негативная форма не сужает дискриминированное
+        // объединение до ветки с `reason`, а сравнение с литералом сужает верно
+        // (та же ловушка, что в product-lifecycle.service.ts).
+        if (check.ok === false) {
+          if (check.reason === 'unreachable') {
+            // Telegram не ответил — не вина человека и не повод отказывать в
+            // заведении. Продукт заводится без tg_bot_id; backfillBotIdsTick
+            // (product-lifecycle.service.ts) донесёт метку позже, когда
+            // Telegram снова станет доступен. Лог — без токена.
+            this.logger.warn('заведение бота: getMe недоступен, tg_bot_id проставит бэкафилл позже');
+          } else {
+            throw new BadRequestException('Telegram не принял токен бота — скопируйте его целиком из @BotFather');
+          }
+        } else {
+          // Ранняя проверка — тот же приём, что у completeCreateBot: без неё
+          // человек с уже занятым токеном получил бы 500 на INSERT вместо
+          // понятного «бот уже работает в другом продукте». Окончательный
+          // барьер — партиционный UNIQUE products_tg_bot_live ниже, на самом
+          // INSERT: эта проверка гонку (два getMe параллельно) не ловит, её
+          // ловит индекс.
+          const busy = await this.pg.query(
+            `SELECT 1 FROM products WHERE tg_bot_id = $1 AND archived_at IS NULL LIMIT 1`,
+            [check.id],
+          );
+          if (busy.rows.length) throw new ConflictException('бот уже работает в другом продукте');
+          tgBotId = check.id;
+        }
+      }
+    }
+
     // id генерируется здесь, а не в базе: секреты шифруются с привязкой к нему
     // (AAD), а значит он нужен ДО INSERT. Вариант «вставить, потом обновить»
     // дал бы окно, в котором продукт есть, а секретов нет.
@@ -638,7 +707,11 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
           // UPDATE оставлял бы окно, где два INSERT с одним tg_bot_id оба
           // проходят (ни у одного ещё нет метки), а партиционный индекс
           // ниже стоит именно на products, а не на промежуточном шаге.
-          input.tgBotId ?? null,
+          //
+          // `tgBotId` — локальная переменная, а не `input.tgBotId ?? null`:
+          // она несёт ещё и результат проверки Студии чуть выше (I2), которой
+          // у `input.tgBotId` просто нет.
+          tgBotId,
         ],
       );
     } catch (e: any) {

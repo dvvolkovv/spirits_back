@@ -144,9 +144,18 @@ maybe('провижининг против живого Postgres', () => {
    * исполняет вовсе. Заглушка предела, отдающая «можно» на любой вход, сделала
    * бы каждый сценарий ниже зелёным при полностью отсутствующей реализации.
    */
-  const makeSvc = (probe?: (url: string, init?: any) => Promise<{ status: number }>) => {
+  // Счётчик, а не константа: каждый вызов makeSvc() без явного checkBot
+  // получает СВОЙ id бота. Константа заставила бы любые два теста, оба
+  // создающие бота через create() без явного checkBot, столкнуться на
+  // products_tg_bot_live, хотя друг другу они не мешают.
+  let botIdSeq = 900000000;
+  const makeSvc = (
+    probe?: (url: string, init?: any) => Promise<{ status: number }>,
+    checkBot?: (token: string) => Promise<{ ok: true; id: number; username: string } | { ok: false; reason: 'bad_form' | 'rejected' | 'unreachable' }>,
+  ) => {
     const svc = new ProvisioningService(pg as any, secrets, new HostsService(pg as any), new LimitsService(pg as any));
     (svc as any).fetchFn = probe ?? (async () => ({ status: 200 }));
+    (svc as any).checkBot = checkBot ?? (async () => ({ ok: true, id: ++botIdSeq, username: 'studio_bot' }));
     return svc;
   };
 
@@ -1277,6 +1286,100 @@ maybe('провижининг против живого Postgres', () => {
     expect(e).not.toBeInstanceOf(ConflictException);
     expect(e.code).toBe('23505');
     expect(e.constraint).toBe('products_runner_token_hash_key');
+  });
+
+  // ═════ I2: Студия заводит бота без tgBotId — create() проверяет сам ═════
+  //
+  // Юнит-тесты provisioning.create.spec.ts сторожат форму нового кода
+  // (SQL-подстроки, позицию tg_bot_id в params) на заглушенном pg. Здесь —
+  // против ЖИВОГО partial UNIQUE products_tg_bot_live: заглушка его не
+  // исполняет вовсе, и «вторая Студия с тем же токеном бота получает 409»
+  // осталась бы недоказанной.
+  describe('I2: ранняя проверка и UNIQUE products_tg_bot_live на пути Студии', () => {
+    it('два живых бота с одним токеном: первый получает tg_bot_id, второй — 409 на ранней проверке', async () => {
+      await ensureHost('own');
+      const sameId = async (_t: string) => ({ ok: true as const, id: 424242, username: 'shared_bot' });
+
+      const first = await makeSvc(undefined, sameId).create({
+        userId: 'u-1', isAdmin: true, name: 'первый бот', slug: 'tg-dup-1', kind: 'bot',
+        secrets: { BOT_TOKEN: '424242:первый' },
+      });
+      const row1 = await getProduct(first.productId);
+      expect(row1.tg_bot_id).toBe('424242');
+
+      const e = await makeSvc(undefined, sameId)
+        .create({
+          userId: 'u-2', isAdmin: true, name: 'второй бот', slug: 'tg-dup-2', kind: 'bot',
+          secrets: { BOT_TOKEN: '424242:второй' },
+        })
+        .then(() => null)
+        .catch((err: any) => err);
+
+      expect(e).toBeInstanceOf(ConflictException);
+      expect(e.getStatus()).toBe(409);
+      expect(String(e.message)).toMatch(/бот уже работает в другом продукте/);
+      // Второй продукт не остался висячим: отказ пойман ДО INSERT.
+      const second = await pool.query('SELECT count(*) FROM products WHERE slug = $1', ['tg-dup-2']);
+      expect(Number(second.rows[0].count)).toBe(0);
+    });
+
+    it('гонка: конкурент занимает tg_bot_id МЕЖДУ ранней проверкой и INSERT — ловит UNIQUE, не ранняя проверка', async () => {
+      // Воспроизведено точно, тем же приёмом, что и '18в. слаг, занятый ПОСЛЕ
+      // проверки' выше: подмена происходит внутри ответа на тот самый SELECT,
+      // а не через таймеры или Promise.all, у которых реальная гонка на одной
+      // короткой операции не гарантирована. Ранняя SELECT-проверка читает
+      // состояние ДО вставки и здесь нарочно видит пусто — отбивает гонку
+      // только партиционный UNIQUE на самом INSERT.
+      await ensureHost('own');
+      let raced = false;
+      const racingPg = {
+        query: async (sql: string, params?: any[]) => {
+          const r = await pool.query(sql, params);
+          if (!raced && sql.includes('SELECT 1 FROM products WHERE tg_bot_id')) {
+            raced = true;
+            await pool.query(
+              `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path,
+                                     runner_token_hash, host_id, host_ip, tg_bot_id)
+               VALUES ($1, 'u-конкурент', 'конкурент', 'tg-race-competitor', 'bot', 'provisioning',
+                       '/product', $2, 'own', '139.59.210.42', 909090)`,
+              [crypto.randomUUID(), crypto.randomBytes(32).toString('hex')],
+            );
+          }
+          return r;
+        },
+      };
+      const svc = new ProvisioningService(racingPg as any, secrets, new HostsService(racingPg as any), new LimitsService(racingPg as any));
+      (svc as any).checkBot = async () => ({ ok: true, id: 909090, username: 'raced_bot' });
+
+      const e = await svc
+        .create({ userId: 'u-1', isAdmin: true, name: 'race a', slug: 'tg-race-a', kind: 'bot', secrets: { BOT_TOKEN: '909090:a' } })
+        .then(() => null)
+        .catch((err: any) => err);
+
+      expect(raced).toBe(true);
+      expect(e).toBeInstanceOf(ConflictException);
+      expect(e.getStatus()).toBe(409);
+      // Продукт гонки остался ровно один — наш create() не довставил свой.
+      const live = await pool.query(`SELECT count(*) FROM products WHERE tg_bot_id = '909090' AND archived_at IS NULL`);
+      expect(Number(live.rows[0].count)).toBe(1);
+      const all = await pool.query(`SELECT count(*) FROM products WHERE slug = 'tg-race-a'`);
+      expect(Number(all.rows[0].count)).toBe(0);
+    });
+
+    it('Telegram недоступен — бот Студии заводится без tg_bot_id, а не отказом', async () => {
+      await ensureHost('own');
+      const unreachable = async (_t: string) => ({ ok: false as const, reason: 'unreachable' as const });
+      const svc = makeSvc(undefined, unreachable);
+
+      const r = await svc.create({
+        userId: 'u-1', isAdmin: true, name: 'бот без ответа', slug: 'tg-unreachable', kind: 'bot',
+        secrets: { BOT_TOKEN: '123456:чтоУгодно' },
+      });
+
+      const row = await getProduct(r.productId);
+      expect(row.status).toBe('provisioning');
+      expect(row.tg_bot_id).toBeNull();
+    });
   });
   // ═══════════════════════════ retry ═══════════════════════════
 
