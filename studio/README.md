@@ -33,6 +33,35 @@ studio/scripts/node-run.sh "npm run render -- out/<папка-съёмки>"
 Лицензия Remotion — бесплатная, пока в компании не больше трёх человек
 (remotion.pro/license).
 
+## Конвейер (план 2)
+
+Ролики заказывает и ведёт API (`src/shorts/`): режиссёр пишет сцену, сценарист —
+сценарий, бот присылает готовый ролик владельцу. Студия — рабочий процесс,
+который забирает из `short_video` задания `capture` и `render`:
+
+```bash
+studio/scripts/node-run.sh "npm run worker -- --once"   # одно задание и выход
+# Цикл (npm run worker) — не через node-run: он держал бы лок воркдерева 30 минут.
+# Цикл живёт под PM2 (план 3).
+```
+
+- Захват — `FOR UPDATE SKIP LOCKED` с арендой 30 минут: задание упавшего
+  процесса вернётся в очередь само.
+- Сбой — с кодом (`src/errors.ts`): повтор до трёх попыток с паузой 2 минуты;
+  озвучка вне 30–60 с — сценарий назад сценаристу; остальное — `failed`, и API
+  пишет владельцу.
+- Файлы — в MinIO, бакет `MINIO_BUCKET_VIDEOS`:
+  `shorts/<id>/capture-<попытка>/{question,answer}.png`, `shorts/<id>/{video.mp4,cover.jpg}`.
+- Рабочие папки — `out/jobs/<id>/`, старше недели удаляются при старте.
+
+Окружение рабочего процесса — `DATABASE_URL` и `MINIO_*` той же среды, что API
+(см. `.env.example`). На стенде ролик запускается из админского API:
+
+```bash
+studio/scripts/node-run.sh "npx tsx scripts/stand-admin.ts order topic='…' rubric=assistant assistantId:=10"
+studio/scripts/node-run.sh "npx tsx scripts/stand-admin.ts start_now id=<uuid>"
+```
+
 ## Что важно знать о кабинете
 
 - В пустом «чистом листе» кабинет сам отправляет приветствие («Привет! Расскажи

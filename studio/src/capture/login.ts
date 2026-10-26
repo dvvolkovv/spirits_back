@@ -5,8 +5,8 @@ import { StudioError } from '../errors';
 
 // UUID-вебхуки входа — из spirits_front/src/services/authService.ts
 // (те же стоят в e2e-помощниках фронта, tests/e2e/helpers/login.ts).
-const SMS_WEBHOOK = '898c938d-f094-455c-86af-969617e62f7a';
-const CHECK_WEBHOOK = 'a376a8ed-3bf7-4f23-aaa5-236eea72871b';
+export const SMS_WEBHOOK = '898c938d-f094-455c-86af-969617e62f7a';
+export const CHECK_WEBHOOK = 'a376a8ed-3bf7-4f23-aaa5-236eea72871b';
 
 export interface Session {
   accessToken: string;

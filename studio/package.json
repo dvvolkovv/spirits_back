@@ -10,7 +10,8 @@
     "test:db": "tsx --test src/worker/db.integration.ts",
     "typecheck": "tsc --noEmit",
     "capture": "tsx src/capture/run-capture.ts",
-    "render": "tsx src/render/run-render.ts"
+    "render": "tsx src/render/run-render.ts",
+    "worker": "tsx src/worker/worker.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1025.0",
