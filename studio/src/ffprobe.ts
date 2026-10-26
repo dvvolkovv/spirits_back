@@ -91,12 +91,14 @@ export async function probeFile(file: string): Promise<ProbeInfo> {
 /**
  * Тишина в файле. По умолчанию — провалы звука в готовом ролике (−45 дБ, от
  * 0,5 с); паузы между репликами сценки ищутся своими порогами (animate/cues.ts).
+ * Порог — число в дБ: строку без «dB» ffmpeg не принимает, и сбой случился бы
+ * уже после оплаченного клипа.
  */
-export async function detectSilences(file: string, totalSec: number, o: { noise?: string; minSec?: number } = {}): Promise<Silence[]> {
+export async function detectSilences(file: string, totalSec: number, o: { noiseDb?: number; minSec?: number } = {}): Promise<Silence[]> {
   // silencedetect пишет в stderr, ffmpeg при этом выходит с кодом 0.
   const { stderr } = await run(
     'ffmpeg',
-    ['-hide_banner', '-nostats', '-i', file, '-af', `silencedetect=noise=${o.noise ?? '-45dB'}:d=${o.minSec ?? 0.5}`, '-f', 'null', '-'],
+    ['-hide_banner', '-nostats', '-i', file, '-af', `silencedetect=noise=${o.noiseDb ?? -45}dB:d=${o.minSec ?? 0.5}`, '-f', 'null', '-'],
     { maxBuffer: 16 * 1024 * 1024 },
   );
   return parseSilences(stderr, totalSec);
