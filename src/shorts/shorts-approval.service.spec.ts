@@ -7,6 +7,7 @@ import { InputFile } from 'grammy';
 import { NoFreeSlotError } from '../blog/blog-slots';
 import { approveShortIntoSlot } from './short-slot-claim';
 import { REVIEW_LEASE_MINUTES, ShortsApprovalService } from './shorts-approval.service';
+import { planSkits } from './short-skit-prompts';
 
 const ID = '6f1c2a9e-0d4b-4c3e-9a51-3b2f7c8d9e10';
 const OWNER = 777;
@@ -273,6 +274,8 @@ describe('ShortsApprovalService', () => {
         ['rejected', 'no', /^Ролик отклонён/],
         ['published', 'no', /^Ролик уже опубликован/],
         ['writing', 'note', /переписывается/],
+        ['animating', 'ok', /переделывается/],
+        ['animate_queued', 'note', /оживают/],
       ];
       for (const [status, action, text] of cases) {
         const { svc, tg, pg } = setup(row({ status }));
@@ -492,5 +495,36 @@ describe('ShortsApprovalService', () => {
       expect(tg.sendMessage).not.toHaveBeenCalled();
       expect(pg.query.mock.calls.some((c: any[]) => String(c[0]).includes('failure_notified = false'))).toBe(false);
     });
+  });
+});
+
+describe('ShortsApprovalService — ролик со сценками', () => {
+  const env = { ...process.env };
+  beforeEach(() => {
+    process.env.BLOG_APPROVER_TG_ID = String(OWNER);
+    process.env.SHORTS_ENABLED = 'true';
+    delete process.env.SHORTS_STAND;
+  });
+  afterAll(() => {
+    process.env = env;
+  });
+
+  it('в подписи владельцу — состав сценок и траты на Omni', async () => {
+    const skit = (cast: Array<{ hero: string; role: string }>, box?: number) => ({
+      cast, setting: 'a hallway', opening: 'o', action: 'a', lines: [{ hero: cast[0].hero, text: 'Реплика', ...(box ? { box } : {}) }],
+    });
+    const skits = planSkits({
+      conflict: skit([{ hero: 'galina', role: 'хозяйка квартиры' }, { hero: 'kesha', role: 'жилец' }]) as any,
+      punchline: skit([{ hero: 'kesha', role: 'жилец' }, { hero: 'galina', role: 'хозяйка квартиры' }], 1) as any,
+    });
+    const { svc, tg } = setup(fresh({
+      format: 'skit',
+      script: { hook: 'h', voice: 'madirus', speed: 1.1, lines: [], final: { assistantsCount: 18 }, skits },
+      animation: { omniSeconds: 16, keyframes: 2, skits: {} },
+    }));
+    await svc.sendPendingReviews();
+    const caption = (tg.sendVideo.mock.calls[0] as any[])[2].caption as string;
+    expect(caption).toContain('Сценки: Гусыня Галина Петровна — хозяйка квартиры, Капибара Кеша — жилец');
+    expect(caption).toContain('Omni: 16 с, кадров 2 ≈ $1,86');
   });
 });

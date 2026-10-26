@@ -7,8 +7,11 @@ import {
   buildCaptions,
   buildReviewCaption,
   clip,
+  omniSpendLine,
+  skitCastLine,
   tidyTags,
 } from './short-captions';
+import { planSkits } from './short-skit-prompts';
 
 /** Одиночный суррогат без пары — признак того, что эмодзи разрезали пополам. */
 const hasLoneSurrogate = (s: string): boolean =>
@@ -127,9 +130,34 @@ describe('buildReviewCaption', () => {
     expect(buildReviewCaption({ ...base, stand: true }).caption.startsWith('[СТЕНД]')).toBe(true);
   });
 
+  it('ролик со сценками — состав и траты на Omni после вопроса', () => {
+    const r = buildReviewCaption({ ...base, skits: { cast: 'Гусыня Галина Петровна — хозяйка квартиры, Капибара Кеша — жилец', animation: { omniSeconds: 16, keyframes: 2, skits: {} } } });
+    expect(r.caption).toContain('Вопрос: «Проверьте договор»\nСценки: Гусыня Галина Петровна — хозяйка квартиры, Капибара Кеша — жилец\nOmni: 16 с, кадров 2 ≈ $1,86\nВыйдет:');
+    expect(buildReviewCaption(base).caption).not.toContain('Omni');
+  });
+
   it('вопрос из эмодзи — подпись укладывается в предел по единицам UTF-16', () => {
     const r = buildReviewCaption({ ...base, question: '😀'.repeat(2000) });
     expect(r.caption.length).toBeLessThanOrEqual(TG_CAPTION_MAX);
     expect(hasLoneSurrogate(r.caption)).toBe(false);
+  });
+});
+
+describe('skitCastLine и omniSpendLine', () => {
+  const skit = (cast: Array<{ hero: any; role: string }>) => ({
+    cast, setting: 's', opening: 'o', action: 'a', lines: [{ hero: cast[0].hero, text: 'Реплика', box: 1 }],
+  });
+
+  it('герои — по первому появлению, у каждого его роль; повтор в развязке не дублируется', () => {
+    const skits = planSkits({
+      conflict: skit([{ hero: 'galina', role: 'хозяйка квартиры' }, { hero: 'kesha', role: 'жилец' }]) as any,
+      punchline: skit([{ hero: 'kesha', role: 'жилец' }, { hero: 'boris', role: 'чиновник' }]) as any,
+    });
+    expect(skitCastLine(skits)).toBe('Гусыня Галина Петровна — хозяйка квартиры, Капибара Кеша — жилец, Кот Борис Аркадьевич — чиновник');
+  });
+
+  it('траты: секунды Omni по $0,10 и кадры по $0,13; оживления ещё не было — нули', () => {
+    expect(omniSpendLine({ omniSeconds: 24, keyframes: 3, skits: {} })).toBe('Omni: 24 с, кадров 3 ≈ $2,79');
+    expect(omniSpendLine(null)).toBe('Omni: 0 с, кадров 0 ≈ $0,00');
   });
 });
