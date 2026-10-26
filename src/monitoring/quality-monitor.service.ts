@@ -63,6 +63,9 @@ export class QualityMonitorService {
       // реальной сессией юзера/node-3-раннером (иначе r.linkeon отдаёт пустой
       // поток из-за занятой сессии). Инцидент 2026-07-12.
       const probeSession = `qprobe_${assistantId}_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+      // Без инструментов Linkeon: проба проверяет текст ответа, а ход идёт от
+      // тестового аккаунта (спека 2026-10-26-mcp-turn-token, «Кто не получает»).
+      // linkeonTools по умолчанию false (ревью 26.10.2026) — отдельный флаг не нужен.
       text = await this.chat!.generateAgentReply(probeUser, assistantId, prompt, probeSession);
     } catch (e: any) {
       hardFail = `generate failed: ${e?.message || 'unknown'}`;

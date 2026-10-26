@@ -472,6 +472,16 @@ describe('разговор наполняет профиль', () => {
     expect(SUMMARY_FIDELITY_RULES.join(' ')).toMatch(/НЕ ВЫВОДИ из него родственную роль/);
   });
 
+  // Ревью 26.10.2026: linkeonTools — явное включение (AgentReplyOpts),
+  // итоги звонка им не пользуются, опции не передаём вовсе.
+  it('complete: резюме звонка опций linkeonTools не передаёт', async () => {
+    const d = completeDeps([{ role: 'user', text: 'привет', ts: 1 }]);
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+    await svc.complete('call-1', { transcript: [], usage });
+
+    expect((d.chat.generateAgentReply as jest.Mock).mock.calls[0][4]).toBeUndefined();
+  });
+
   it('complete: если финальный полнее staged — берём финальный', async () => {
     const d = completeDeps([{ role: 'assistant', text: 'приветствие', ts: 1 }]);
     const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);

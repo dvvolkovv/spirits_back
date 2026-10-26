@@ -1,11 +1,3 @@
 {
-  "mcpServers": {
-    "linkeon": {
-      "type": "http",
-      "url": "https://my.linkeon.io/mcp",
-      "headers": {
-        "Authorization": "Bearer <MCP_SECRET из .env прода — в репозиторий не класть>"
-      }
-    }
-  }
+  "mcpServers": {}
 }

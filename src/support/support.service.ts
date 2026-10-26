@@ -567,8 +567,10 @@ ${healthSummary}
     );
     const row = res.rows[0];
     if (!row) return { error: 'user not found' };
+    // user_id в ответе нет: ответ уходит модели, а идентификатор аккаунта
+    // (у телефонных пользователей — номер) ей не нужен (спека
+    // 2026-10-26-mcp-turn-token-design.md).
     return {
-      user_id: row.user_id,
       tokens: Number(row.tokens || 0),
       email: row.email,
       is_admin: row.isadmin === true || row.isadmin === 'true',

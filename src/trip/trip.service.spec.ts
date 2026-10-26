@@ -280,6 +280,11 @@ describe('computeCopilotState', () => {
         new Date('2026-08-06T02:30:00Z'),
       );
       expect(chat.generateAgentReply).toHaveBeenCalled();
+      // Ревью 26.10.2026: linkeonTools — явное включение (AgentReplyOpts),
+      // «Путь» — один из путей, где ассистент реально может позвать инструмент.
+      expect(chat.generateAgentReply).toHaveBeenCalledWith(
+        'u1', '14', expect.any(String), undefined, { linkeonTools: true },
+      );
       expect(store.upsert).toHaveBeenCalledWith(
         'u1',
         expect.any(String),

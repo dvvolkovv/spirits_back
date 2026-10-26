@@ -3,6 +3,7 @@ import * as path from 'path';
 import { AuthController } from './auth.controller';
 import { JwtService } from '../common/services/jwt.service';
 import { signProductToolToken } from '../products/product-tool.token';
+import { signLinkeonToolToken } from '../mcp/linkeon-tool.token';
 
 /**
  * Привязать новый способ входа к аккаунту и открыть голосовой канал можно
@@ -19,6 +20,7 @@ const notAccess: Array<[string, () => string]> = [
   ['обновления', () => jwt.signRefresh('u-1')],
   ['инструмента продуктов', () => signProductToolToken('u-1')],
   ['инструмента продуктов из Telegram', () => signProductToolToken('u-1', 'telegram')],
+  ['инструмента Linkeon', () => signLinkeonToolToken('u-1')],
 ];
 
 function mockRes() {

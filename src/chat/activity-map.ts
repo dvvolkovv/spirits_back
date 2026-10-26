@@ -29,8 +29,10 @@ export interface ActivityEvent {
 
 export interface ActivityOwner {
   userId: string;
-  /** Ключ сессии релея: с него начинается имя загруженного файла на диске релея. */
+  /** Ключ сессии релея: с него начинается имя загрузки у релея без fs_key и у загрузок до 26.10.2026. */
   relaySessionId?: string;
+  /** fs_key хода (linkeon-relay-fields.ts): с него начинается имя загрузки у релея с fs_key. */
+  fsKey?: string;
 }
 
 const BY_NAME: Record<string, ActivityKind> = {
@@ -135,10 +137,17 @@ function fileName(filePath: string, who: ActivityOwner): string | undefined {
     // [a-zA-Z0-9._-], на «_», а сам ключ обрезает до RELAY_FS_KEY_MAX символов
     // (relay-agent/paths.mjs, sessionFsKey/uploadFileName) — здесь та же обрезка,
     // иначе у длинного relaySessionId префикс не совпадёт и имя не отрежется.
-    if (who.relaySessionId) {
-      const fsKey = who.relaySessionId.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, RELAY_FS_KEY_MAX);
-      const prefix = `${fsKey}_`;
-      if (base.startsWith(prefix)) base = base.slice(prefix.length);
+    // Префикс — ключ папки хода: fs_key, а у релея без него и у загрузок до
+    // выката — санитизированный ключ сессии. Срезается первый совпавший.
+    const keys = [
+      who.fsKey,
+      who.relaySessionId?.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, RELAY_FS_KEY_MAX),
+    ].filter((k): k is string => !!k);
+    for (const key of keys) {
+      if (base.startsWith(`${key}_`)) {
+        base = base.slice(key.length + 1);
+        break;
+      }
     }
     const stem = base.replace(/\.[^.]*$/, '');
     // Кириллическое имя после релея — строка подчёркиваний («выписка.pdf» →

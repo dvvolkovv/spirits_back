@@ -98,8 +98,11 @@ export class SpecialistJobService {
       // К вопросу приписываем требование краткости: ответ пойдёт в голос.
       // В voice_call_jobs и в чат специалиста кладём вопрос БЕЗ приписки —
       // там нужен тот вопрос, который задал Роман, а не наша служебка.
+      // Консультация — путь, где ассистент реально может позвать инструмент
+      // Linkeon: AgentReplyOpts.linkeonTools — явно true (в отличие от её
+      // сжатия, condense() ниже, — там модель только переформулирует текст).
       const reply = await this.withTimeout(
-        this.chat.generateAgentReplyWithCharge(userId, String(agentId), `${VOICE_BRIEF}\n\n${question}`, sessionId),
+        this.chat.generateAgentReplyWithCharge(userId, String(agentId), `${VOICE_BRIEF}\n\n${question}`, sessionId, { linkeonTools: true }),
         JOB_TIMEOUT_MS,
       );
 

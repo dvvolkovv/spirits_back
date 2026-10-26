@@ -401,6 +401,10 @@ cd ~/Downloads/spirits_back/tests && node runner.js  # api (32) + e2e (18) = 50
 - `POST /webhook/soulmate/chat` — стриминг чат (NDJSON: begin/item/end). Body: `{chatInput, assistant}` или `{message, assistantId}`
 - `GET /webhook/chat/history?assistantId=` — история чата
 - `DELETE /webhook/chat/history?assistantId=` — очистка истории
+- `POST /webhook/mcp/linkeon` — инструменты ассистентов релея (`mcp__linkeon__*`); Bearer — токен хода (`src/mcp/linkeon-tool.token.ts`), пользователь из подписи, аргумента `userId` нет. Ручная проверка — токен выпускается на самом сервере и не печатается:
+  ```bash
+  ssh dvolkov@212.113.106.202 'cd ~/spirits_back && umask 077 && node -e "require(\"dotenv\").config(); const t = require(\"./dist/mcp/linkeon-tool.token\").signLinkeonToolToken(\"70000000000\"); process.stdout.write(\"Authorization: Bearer \" + t + \"\\n\")" > /tmp/lt.hdr && curl -s -m 20 -X POST http://127.0.0.1:3001/webhook/mcp/linkeon -H @/tmp/lt.hdr -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}" | grep -o "\"name\":\"[a-z_]*\"" | head -3; rm -f /tmp/lt.hdr'
+  ```
 
 ### Tokens & Payments
 - `GET /webhook/user/tokens/` — баланс токенов
@@ -491,6 +495,7 @@ Synthetic-раннер шлёт отчёты на `SYNTHETIC_PUSH_URL` — на 
 - `REDIS_URL` — Redis local
 - `NEO4J_URI` / `NEO4J_PASSWORD` — Neo4j Docker
 - `JWT_SECRET` — JWT signing
+- `RELAY_FS_SALT` — соль ключа папки хода на релее (`fs_key`, `src/chat/linkeon-relay-fields.ts`); у прода и стенда свои; смена переименует папки новых ходов (старые ссылки живут)
 - `OPENROUTER_API_KEY` — OpenRouter для LLM
 - `SMSAERO_LOGIN` / `SMSAERO_API_KEY` — SMS Aero
 - `YOOKASSA_SHOP_ID` / `YOOKASSA_SECRET_KEY` — YooKassa

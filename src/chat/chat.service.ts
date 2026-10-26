@@ -26,6 +26,7 @@ import { toActivity } from './activity-map';
 import { ASK_RULE } from './ask-rule';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
+import { LinkeonRelayFields, appendLinkeonFields, linkeonRelayFields } from './linkeon-relay-fields';
 import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, LINKEON_HELP_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
 import { ProductActionsService } from '../products/product-actions.service';
 import { productActionTail, stripProductActionBlocks } from '../products/product-action-tail';
@@ -255,6 +256,20 @@ export function resolveEmptyFileLinks(
   }
 
   return out;
+}
+
+/** Что ещё уходит релею в ответе ассистента вне чата (agentReply). */
+export interface AgentReplyOpts {
+  /**
+   * Инструменты Linkeon (mcp__linkeon__*) от имени userId — токен хода и
+   * папка по fs_key (linkeon-relay-fields.ts). По умолчанию — НЕТ (ревью
+   * 26.10.2026): голосовые фоновые пути (итоги звонка, сжатие консультации,
+   * голосовая заметка и документ) и проба качества ассистента об инструментах
+   * даже не спрашивают, и получать от них токен ни к чему. Явно true — только
+   * там, где ассистент реально может позвать инструмент: рутины, «Путь» и
+   * консультация специалиста в звонке (не её сжатие, voice_condense).
+   */
+  linkeonTools?: boolean;
 }
 
 @Injectable()
@@ -796,7 +811,7 @@ export class ChatService {
     /** Сборка из стора и что умеет клиент — для справки (client-kind.ts). */
     storeBuild?: boolean;
     ui?: ClientUi;
-  }): Promise<{ sessionId: string; systemPrompt: string; history: string; products: { products_token: string; products_mcp_url: string } }> {
+  }): Promise<{ sessionId: string; systemPrompt: string; history: string; products: { products_token: string; products_mcp_url: string }; linkeon: LinkeonRelayFields }> {
     const { userId, assistantId, freshSessionId } = p;
     const profileText = p.profileText || '';
     const userLanguage = await this.language.resolveUserLanguage(userId, p.requestLang);
@@ -853,8 +868,10 @@ export class ChatService {
       client: clientKind(!!p.storeBuild, p.ui ?? NO_CLIENT_UI),
       agent: isCustom ? 'custom' : 'staff',
     });
+    // Инструменты Linkeon и папка хода — те же, что у текстового хода этой сессии.
+    const linkeon = linkeonRelayFields(userId, sessionId);
 
-    return { sessionId, systemPrompt, history, products };
+    return { sessionId, systemPrompt, history, products, linkeon };
   }
 
   async streamChat(
@@ -1875,6 +1892,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Ключ сессии релея: и в запросе, и для шагов работы — релей кладёт
       // загрузки под именем «<ключ>_<файл>», и префикс надо срезать.
       const relaySid = relaySessionKey(userId, assistantId, userLanguage, fresh ? freshSessionId : undefined);
+      // Инструменты Linkeon и папка хода на релее — токеном хода и ключом без
+      // номера телефона (linkeon-relay-fields.ts). Один раз на ход: повтор
+      // self-heal идёт с теми же полями и в ту же папку.
+      const linkeonFields = linkeonRelayFields(userId, relaySid);
       const callUpstreamOnce = async (): Promise<void> => {
         const FormData = require('form-data');
         const fd = new FormData();
@@ -1930,9 +1951,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
           fd.append('talerid_mcp_url', tid.mcpUrl);
         }
 
-        // Инструмент продуктов. В отличие от MCP-инструментов на общей точке,
-        // владелец едет ПОДПИСЬЮ в заголовке, а не подсказкой в промпте:
-        // телефоном в аргументе правились бы чужие сайты.
+        // Инструмент продуктов. Владелец едет ПОДПИСЬЮ в заголовке, а не
+        // подсказкой в промпте: телефоном в аргументе правились бы чужие сайты.
         // Тот же токен открывает справку: язык, клиент и вид ассистента едут в
         // подписи; там же метка хода — по ней в конце хода забираются карточки.
         const pf = productsRelayFields(userId, {
@@ -1943,6 +1963,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
         });
         fd.append('products_token', pf.products_token);
         fd.append('products_mcp_url', pf.products_mcp_url);
+        // Инструменты Linkeon (mcp__linkeon__*): пользователь — в подписи
+        // токена, а не в аргументе, который пишет модель; папка хода — fs_key.
+        appendLinkeonFields(fd, linkeonFields);
 
         const agentRes = await axios.post(`${AGENT_URL}/chat`, fd, {
           headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
@@ -1983,7 +2006,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
                     // Шаг работы для клиента, который его рисует (activity-map.ts).
                     // В chunks не идёт: к тексту ответа отношения не имеет.
                     if (ui.activity) {
-                      const step = toActivity(ev.tool, ev.input, { userId, relaySessionId: relaySid });
+                      const step = toActivity(ev.tool, ev.input, { userId, relaySessionId: relaySid, fsKey: linkeonFields.fs_key });
                       if (step) safeWrite(step);
                     }
                   } else if (ev.type === 'result' && ev.text) {
@@ -2061,22 +2084,41 @@ ${LanguageService.buildDirective(userLanguage)}`;
         const hasEmpty = /\[[^\]]+\]\(\s*\)/.test(full);
         const hasBareUrl = full.includes(`${AGENT_URL}/files/`);
         if ((hasEmpty || hasBareUrl) && !clientDisconnected) {
-          const sid = fresh && freshSessionId ? freshSessionId : `${userId}_${assistantId}`;
+          // null — запрос упал (ошибка, не честное «пусто»); на нём запасной
+          // запрос не делаем (ревью 26.10.2026): тот же релей тем же секретом
+          // откажет и там, а повтор только тратит время самого хода.
+          const listSession = (sid: string): Promise<any[] | null> =>
+            axios
+              .get(`${AGENT_URL}/session/${encodeURIComponent(sid)}/files`, {
+                timeout: 10_000,
+                headers: relayAuthHeaders(),
+                maxRedirects: 0,
+              })
+              .then((r) => (Array.isArray(r.data) ? r.data : []))
+              .catch((e) => {
+                if (e?.response?.status === 401) this.logger.warn('релей отклонил секрет (401)');
+                return null;
+              });
           // Список нужен только чтобы сопоставить ИМЯ из пустых скобок с
           // адресом. Готовый адрес самодостаточен — ради него relay не дёргаем.
-          const listed = hasEmpty
-            ? await axios
-                .get(`${AGENT_URL}/session/${encodeURIComponent(sid)}/files`, {
-                  timeout: 10_000,
-                  headers: relayAuthHeaders(),
-                  maxRedirects: 0,
-                })
-                .then((r) => (Array.isArray(r.data) ? r.data : []))
-                .catch((e) => {
-                  if (e?.response?.status === 401) this.logger.warn('релей отклонил секрет (401)');
-                  return [] as any[];
-                })
-            : [];
+          // Папка хода — fs_key (linkeon-relay-fields.ts); пусто или нет fs_key
+          // (нет секретов для него — см. linkeon-relay-fields.ts) — папка по
+          // ключу сессии хода: релей ещё без fs_key или файл из хода до
+          // выката. До 26.10.2026 здесь стоял ключ без языка
+          // (`<userId>_<assistantId>`), и обычный ход смотрел не в свою папку.
+          // Второй запрос — только когда первый честно ответил «пусто», а не
+          // когда упал.
+          let listed: any[] = [];
+          if (hasEmpty) {
+            const byFsKey = linkeonFields.fs_key ? await listSession(linkeonFields.fs_key) : [];
+            if (byFsKey === null) {
+              listed = [];
+            } else if (byFsKey.length > 0) {
+              listed = byFsKey;
+            } else {
+              listed = (await listSession(relaySid)) ?? [];
+            }
+          }
 
           let resolved = resolveEmptyFileLinks(full, listed, AGENT_URL);
 
@@ -2107,7 +2149,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
             )).join('\n');
             chunks.push(tail);
             safeWrite({ type: 'item', content: tail });
-            this.logger.log(`filled ${resolved.length} file link(s) for ${sid}`);
+            this.logger.log(`filled ${resolved.length} file link(s) for ${relaySid}`);
           }
         }
       } catch (e: any) {
@@ -2471,8 +2513,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * вызывающих, которые токены не списывают (резюме звонка, синтетические
    * пробы, поездки, пуши). Поэтому и строки billing[…] в логе не печатает.
    */
-  async generateAgentReply(userId: string, assistantId: string, message: string, sessionIdOverride?: string): Promise<string> {
-    const { text } = await this.agentReply(userId, assistantId, message, sessionIdOverride, false);
+  async generateAgentReply(
+    userId: string, assistantId: string, message: string, sessionIdOverride?: string, opts: AgentReplyOpts = {},
+  ): Promise<string> {
+    const { text } = await this.agentReply(userId, assistantId, message, sessionIdOverride, false, opts);
     return text;
   }
 
@@ -2494,13 +2538,14 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * — как в двух других путях.
    */
   async generateAgentReplyWithCharge(
-    userId: string, assistantId: string, message: string, sessionIdOverride?: string,
+    userId: string, assistantId: string, message: string, sessionIdOverride?: string, opts: AgentReplyOpts = {},
   ): Promise<{ text: string; tokens: number; costUsd: number }> {
-    return this.agentReply(userId, assistantId, message, sessionIdOverride, true);
+    return this.agentReply(userId, assistantId, message, sessionIdOverride, true, opts);
   }
 
   private async agentReply(
     userId: string, assistantId: string, message: string, sessionIdOverride: string | undefined, billed: boolean,
+    opts: AgentReplyOpts = {},
   ): Promise<{ text: string; tokens: number; costUsd: number }> {
     const isNumeric = /^\d+$/.test(assistantId);
     const agentRes = isNumeric
@@ -2561,11 +2606,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // поток при конкурентном обращении к ЗАНЯТОЙ сессии — инцидент 2026-07-12).
     // Язык в ключе сессии — по той же причине, что в основном пути: релей
     // резюмит прежний разговор, и накопленный русский перевешивает промпт.
-    fd.append(
-      'sessionId',
-      sessionIdOverride ||
-        relaySessionKey(userId, assistantId, await this.language.resolveUserLanguage(userId)),
-    );
+    const relaySid = sessionIdOverride ||
+      relaySessionKey(userId, assistantId, await this.language.resolveUserLanguage(userId));
+    fd.append('sessionId', relaySid);
+    // Инструменты Linkeon — только когда вызывающий явно сказал linkeonTools:
+    // true (см. AgentReplyOpts); по умолчанию — нет.
+    if (opts.linkeonTools === true) appendLinkeonFields(fd, linkeonRelayFields(userId, relaySid));
     const chunks: string[] = [];
     const usage: SdkUsageTotals = {
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,

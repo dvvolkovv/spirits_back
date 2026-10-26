@@ -81,7 +81,9 @@ export class RoutinePushService implements OnModuleInit {
 
   // ── Доставка одной рутины ────────────────────────────────────────────────────
   private async deliver(userId: string, assistantId: string, prompt: string, title?: string): Promise<number> {
-    const text = await this.chat.generateAgentReply(userId, assistantId, prompt);
+    // Рутина — путь, где ассистент реально может позвать инструмент Linkeon
+    // (картинка, рутина, календарь): AgentReplyOpts.linkeonTools — явно true.
+    const text = await this.chat.generateAgentReply(userId, assistantId, prompt, undefined, { linkeonTools: true });
     if (!text || !text.trim()) {
       this.logger.warn(`routine deliver: empty text for ${userId} / assistant ${assistantId}`);
       return 0;

@@ -115,6 +115,19 @@ describe('VoiceDocumentService', () => {
     expect(doc.content).toContain('Первый пункт. Второй пункт.');
   });
 
+  // Ревью 26.10.2026: linkeonTools — явное включение (AgentReplyOpts),
+  // голосовой документ им не пользуется, опции не передаём вовсе.
+  it('голосовой документ опций linkeonTools не передаёт', async () => {
+    const pg = makePg();
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'тело', tokens: 1200, costUsd: 0.33 })) };
+    const svc = new VoiceDocumentService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeStorage() as any, makeLang() as any);
+
+    await svc.create(CALL, ROOM, 'user-1', 'План запуска', 'по пунктам');
+    await svc.drainForTests();
+
+    expect(chat.generateAgentReplyWithCharge.mock.calls[0][4]).toBeUndefined();
+  });
+
   it('о начале и готовности сообщается в комнату', async () => {
     const lk = { send: jest.fn(async () => {}) };
     const svc = new VoiceDocumentService(makePg() as any, { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'текст', tokens: 1200, costUsd: 0.33 })) } as any, lk as any, makeStorage() as any, makeLang() as any);
@@ -569,6 +582,16 @@ describe('заметка по итогам звонка (дефекты влад
     expect(prompt).toContain('операция на сердце');
     expect(prompt).toContain('скоро заседание');
     expect(prompt).toContain('Разговор целиком');
+  });
+
+  // Ревью 26.10.2026: linkeonTools — явное включение (AgentReplyOpts),
+  // голосовая заметка им не пользуется, опции не передаём вовсе.
+  it('голосовая заметка опций linkeonTools не передаёт', async () => {
+    const notes = makeNotes();
+    const { svc, chat } = makeSvc(notes);
+    await svc.createNote(CALL, ROOM, 'user-1', 'Мой разговор', 'запиши детали моей истории');
+    await svc.drainForTests();
+    expect(chat.generateAgentReplyWithCharge.mock.calls[0][4]).toBeUndefined();
   });
 
   it('промпт не велит экономить на деталях', async () => {

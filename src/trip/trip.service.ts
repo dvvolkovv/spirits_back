@@ -389,7 +389,9 @@ export class TripService implements OnModuleInit {
       const day = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Yekaterinburg' }).format(now);
       const existing = await this.dayFramingStore?.get(userId, day, window);
       if (existing && existing.factsHash === hash) return; // факты не изменились — уже есть свежая строка
-      const raw = await this.chat?.generateAgentReply(userId, FRAMING_ASSISTANT_ID, framingPrompt(facts));
+      // «Путь» — путь, где ассистент реально может позвать инструмент Linkeon:
+      // AgentReplyOpts.linkeonTools — явно true.
+      const raw = await this.chat?.generateAgentReply(userId, FRAMING_ASSISTANT_ID, framingPrompt(facts), undefined, { linkeonTools: true });
       const text = (raw || '').trim();
       if (!text) return;
       const action = null; // v1 — см. doc-комментарий выше

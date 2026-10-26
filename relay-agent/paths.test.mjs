@@ -10,7 +10,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { randomUUID } from "crypto";
-import { sessionFsKey, uploadFileName, fallbackFileName, sessionOutputDir } from "./paths.mjs";
+import { sessionFsKey, turnFsKey, uploadFileName, fallbackFileName, sessionOutputDir } from "./paths.mjs";
 
 const DIR = fs.mkdtempSync(path.join(os.tmpdir(), "paths-test-"));
 process.on("exit", () => fs.rmSync(DIR, { recursive: true, force: true }));
@@ -28,7 +28,7 @@ function tryCreate(name) {
   }
 }
 
-const SID = "79093464922_12"; // как их шлёт бэкенд: <телефон>_<n>
+const SID = "70000000000_12"; // как их шлёт бэкенд: <телефон>_<n>; номер — тестовый (CLAUDE.md)
 
 test("кириллическая выписка на ~280 символов укладывается в NAME_MAX", () => {
   const name = "Выписка по счёту дебетовой карты за период с 29.01.2026, " +
@@ -113,4 +113,42 @@ test("sessionOutputDir: sid вне алфавита или целиком '.'/'.
   for (const sid of evil) {
     assert.equal(sessionOutputDir(BASE, sid), null, "sid " + JSON.stringify(sid) + " должен быть отклонён");
   }
+});
+
+// fs_key от бэка (spirits_back src/chat/linkeon-relay-fields.ts): 32 hex от
+// HMAC ключа сессии. Им называются папка хода и загрузки — без номера.
+const FS_KEY = "0123456789abcdef0123456789abcdef";
+
+test("turnFsKey: корректный fs_key от бэка — он и есть ключ папки", () => {
+  assert.equal(turnFsKey(FS_KEY, SID, "x"), FS_KEY);
+});
+
+test("turnFsKey: нет fs_key — прежний ключ из sessionId", () => {
+  assert.equal(turnFsKey(undefined, SID, "x"), SID);
+  assert.equal(turnFsKey("", SID, "x"), SID);
+});
+
+test("turnFsKey: кривой fs_key не принимается — прежний ключ", () => {
+  const bad = [FS_KEY.toUpperCase(), FS_KEY.slice(1), FS_KEY + "0", "../" + FS_KEY.slice(3), FS_KEY.slice(0, 31) + "/", ["a"], 123];
+  for (const b of bad) {
+    assert.equal(turnFsKey(b, SID, "x"), SID, "принят " + JSON.stringify(b));
+  }
+});
+
+test("с fs_key в путях нет номера: загрузка, папка вывода, список файлов", () => {
+  const key = turnFsKey(FS_KEY, SID, "x");
+  const upload = uploadFileName("egrul.pdf", key);
+  assert.equal(upload, FS_KEY + "_egrul.pdf");
+  assert.equal(tryCreate(upload), null);
+  const out = sessionOutputDir("/tmp/agent-output", key);
+  assert.equal(out, path.join("/tmp/agent-output", FS_KEY));
+  const phone = SID.split("_")[0];
+  // Контроль: та же пара функций на ПРЕЖНЕМ ключе (без fs_key) номер
+  // содержит — иначе проверка ниже была бы тавтологией (true по построению
+  // FS_KEY, что бы ни стояло в SID) и не смогла бы упасть на реальном баге.
+  const legacyKey = sessionFsKey(SID, "x");
+  const legacyUpload = uploadFileName("egrul.pdf", legacyKey);
+  assert.ok(legacyUpload.includes(phone), "подготовка теста: без fs_key номер должен быть в пути");
+  assert.notEqual(upload, legacyUpload);
+  for (const p of [upload, out]) assert.ok(!p.includes(phone), p);
 });
