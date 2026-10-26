@@ -103,6 +103,50 @@ describe('точка инструментов Linkeon: пользователь 
     await client.close();
   });
 
+  // Ревью 26.10.2026: на пути по токену в лог — короткая строка-счётчик,
+  // без значений (ни пользователя из подписи, ни чужого userId из аргумента).
+  it('userId в аргументах на пути по токену — строка-счётчик без значений', async () => {
+    const { ctrl, tools } = make();
+    const warn = jest.spyOn((ctrl as any).logger, 'warn').mockImplementation(() => undefined);
+    await ctrl.callTool(bearer('u-owner'), 'generate_image', { prompt: 'x', userId: '70000000000' });
+    expect(warn).toHaveBeenCalledWith('mcp: userId в аргументах проигнорирован, tool=generate_image');
+    const logged = JSON.stringify(warn.mock.calls);
+    expect(logged).not.toContain('70000000000');
+    expect(logged).not.toContain('u-owner');
+    expect(tools.executeTool).toHaveBeenCalledWith('u-owner', 'generate_image', { prompt: 'x' });
+  });
+
+  it('без userId в аргументах на пути по токену — строка-счётчик не пишется', async () => {
+    const { ctrl } = make();
+    const warn = jest.spyOn((ctrl as any).logger, 'warn').mockImplementation(() => undefined);
+    await ctrl.callTool(bearer('u-owner'), 'generate_image', { prompt: 'x' });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  // Ревью 26.10.2026: путь по токену не зовёт тот же logger.warn, что
+  // переходный путь по общему секрету — иначе по логу нельзя будет отличить,
+  // кто ещё зовёт точку общим секретом (шаг 3 выката).
+  it('путь по токену не пишет строку «вызов по общему секрету»', async () => {
+    const { ctrl } = make();
+    const warn = jest.spyOn((ctrl as any).logger, 'warn').mockImplementation(() => undefined);
+    await ctrl.callTool(bearer('u-owner'), 'generate_image', { prompt: 'x' });
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('общему секрету'));
+  });
+
+  // Ревью 26.10.2026: «смешивание» — MCP_SECRET задан (переходный путь ещё не
+  // снят), но в заголовке — токен хода, а не общий секрет. Пользователь — из
+  // подписи, чужой args.userId игнорируется, как и без MCP_SECRET.
+  it('смешивание: MCP_SECRET задан, но в заголовке — токен хода; args.userId — чужой', async () => {
+    process.env.MCP_SECRET = 'shared-spec';
+    try {
+      const { ctrl, tools } = make();
+      await ctrl.callTool(bearer('u-owner'), 'generate_image', { prompt: 'кот', userId: '70000000000' });
+      expect(tools.executeTool).toHaveBeenCalledWith('u-owner', 'generate_image', { prompt: 'кот' });
+    } finally {
+      delete process.env.MCP_SECRET;
+    }
+  });
+
   describe('переходный путь: общий MCP_SECRET', () => {
     const SHARED = 'Bearer shared-spec';
     beforeEach(() => { process.env.MCP_SECRET = 'shared-spec'; });
@@ -141,6 +185,18 @@ describe('точка инструментов Linkeon: пользователь 
     it('неверный секрет — 401', async () => {
       const { ctrl, tools } = make();
       await expect(ctrl.callTool('Bearer not-the-secret', 'generate_image', { userId: 'u-1' })).rejects.toThrow(UnauthorizedException);
+      expect(tools.executeTool).not.toHaveBeenCalled();
+    });
+
+    // Ревью 26.10.2026: сравнение — timingSafeEqual над SHA-256 обеих строк,
+    // а не над самими строками: у node:crypto timingSafeEqual буферы разной
+    // длины роняют сравнение исключением (RangeError), а не честным «не равны».
+    it('секрет неправильной длины — тоже 401, а не исключение', async () => {
+      const { ctrl, tools } = make();
+      await expect(ctrl.callTool('Bearer x', 'generate_image', { userId: 'u-1' })).rejects.toThrow(UnauthorizedException);
+      await expect(
+        ctrl.callTool(`Bearer ${'shared-spec'.repeat(5)}`, 'generate_image', { userId: 'u-1' }),
+      ).rejects.toThrow(UnauthorizedException);
       expect(tools.executeTool).not.toHaveBeenCalled();
     });
 
