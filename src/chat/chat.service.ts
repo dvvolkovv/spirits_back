@@ -26,6 +26,7 @@ import { toActivity } from './activity-map';
 import { ASK_RULE } from './ask-rule';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
+import { appendLinkeonFields, linkeonRelayFields } from './linkeon-relay-fields';
 import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, LINKEON_HELP_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
 import { ProductActionsService } from '../products/product-actions.service';
 import { productActionTail, stripProductActionBlocks } from '../products/product-action-tail';
@@ -1875,6 +1876,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Ключ сессии релея: и в запросе, и для шагов работы — релей кладёт
       // загрузки под именем «<ключ>_<файл>», и префикс надо срезать.
       const relaySid = relaySessionKey(userId, assistantId, userLanguage, fresh ? freshSessionId : undefined);
+      // Инструменты Linkeon и папка хода на релее — токеном хода и ключом без
+      // номера телефона (linkeon-relay-fields.ts). Один раз на ход: повтор
+      // self-heal идёт с теми же полями и в ту же папку.
+      const linkeonFields = linkeonRelayFields(userId, relaySid);
       const callUpstreamOnce = async (): Promise<void> => {
         const FormData = require('form-data');
         const fd = new FormData();
@@ -1930,9 +1935,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
           fd.append('talerid_mcp_url', tid.mcpUrl);
         }
 
-        // Инструмент продуктов. В отличие от MCP-инструментов на общей точке,
-        // владелец едет ПОДПИСЬЮ в заголовке, а не подсказкой в промпте:
-        // телефоном в аргументе правились бы чужие сайты.
+        // Инструмент продуктов. Владелец едет ПОДПИСЬЮ в заголовке, а не
+        // подсказкой в промпте: телефоном в аргументе правились бы чужие сайты.
         // Тот же токен открывает справку: язык, клиент и вид ассистента едут в
         // подписи; там же метка хода — по ней в конце хода забираются карточки.
         const pf = productsRelayFields(userId, {
@@ -1943,6 +1947,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
         });
         fd.append('products_token', pf.products_token);
         fd.append('products_mcp_url', pf.products_mcp_url);
+        // Инструменты Linkeon (mcp__linkeon__*): пользователь — в подписи
+        // токена, а не в аргументе, который пишет модель; папка хода — fs_key.
+        appendLinkeonFields(fd, linkeonFields);
 
         const agentRes = await axios.post(`${AGENT_URL}/chat`, fd, {
           headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
@@ -1983,7 +1990,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
                     // Шаг работы для клиента, который его рисует (activity-map.ts).
                     // В chunks не идёт: к тексту ответа отношения не имеет.
                     if (ui.activity) {
-                      const step = toActivity(ev.tool, ev.input, { userId, relaySessionId: relaySid });
+                      const step = toActivity(ev.tool, ev.input, { userId, relaySessionId: relaySid, fsKey: linkeonFields.fs_key });
                       if (step) safeWrite(step);
                     }
                   } else if (ev.type === 'result' && ev.text) {
@@ -2061,22 +2068,29 @@ ${LanguageService.buildDirective(userLanguage)}`;
         const hasEmpty = /\[[^\]]+\]\(\s*\)/.test(full);
         const hasBareUrl = full.includes(`${AGENT_URL}/files/`);
         if ((hasEmpty || hasBareUrl) && !clientDisconnected) {
-          const sid = fresh && freshSessionId ? freshSessionId : `${userId}_${assistantId}`;
+          const listSession = (sid: string) =>
+            axios
+              .get(`${AGENT_URL}/session/${encodeURIComponent(sid)}/files`, {
+                timeout: 10_000,
+                headers: relayAuthHeaders(),
+                maxRedirects: 0,
+              })
+              .then((r) => (Array.isArray(r.data) ? r.data : []))
+              .catch((e) => {
+                if (e?.response?.status === 401) this.logger.warn('релей отклонил секрет (401)');
+                return [] as any[];
+              });
           // Список нужен только чтобы сопоставить ИМЯ из пустых скобок с
           // адресом. Готовый адрес самодостаточен — ради него relay не дёргаем.
-          const listed = hasEmpty
-            ? await axios
-                .get(`${AGENT_URL}/session/${encodeURIComponent(sid)}/files`, {
-                  timeout: 10_000,
-                  headers: relayAuthHeaders(),
-                  maxRedirects: 0,
-                })
-                .then((r) => (Array.isArray(r.data) ? r.data : []))
-                .catch((e) => {
-                  if (e?.response?.status === 401) this.logger.warn('релей отклонил секрет (401)');
-                  return [] as any[];
-                })
-            : [];
+          // Папка хода — fs_key (linkeon-relay-fields.ts); пусто — папка по
+          // ключу сессии хода: релей ещё без fs_key или файл из хода до
+          // выката. До 26.10.2026 здесь стоял ключ без языка
+          // (`<userId>_<assistantId>`), и обычный ход смотрел не в свою папку.
+          let listed: any[] = [];
+          if (hasEmpty) {
+            listed = await listSession(linkeonFields.fs_key);
+            if (listed.length === 0) listed = await listSession(relaySid);
+          }
 
           let resolved = resolveEmptyFileLinks(full, listed, AGENT_URL);
 
@@ -2107,7 +2121,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
             )).join('\n');
             chunks.push(tail);
             safeWrite({ type: 'item', content: tail });
-            this.logger.log(`filled ${resolved.length} file link(s) for ${sid}`);
+            this.logger.log(`filled ${resolved.length} file link(s) for ${relaySid}`);
           }
         }
       } catch (e: any) {
