@@ -119,7 +119,7 @@ export function buildSkitTimeline(lines: VoicedLine[], clips: Record<SkitKind, n
     if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < SKIT_HOOK_MS || ms > SKIT_CLIP_MAX_MS) {
       throw new StudioError(
         'no_input',
-        `timeline: клип сценки ${kind} — ${JSON.stringify(ms) ?? 'нет'} мс, нужен ${SKIT_HOOK_MS / 1000}–${SKIT_CLIP_MAX_MS / 1000} с: переснимите (npm run animate)`,
+        `timeline: клип сценки ${kind} — ${JSON.stringify(ms) ?? 'нет'} мс, нужен ${SKIT_HOOK_MS / 1000}–${SKIT_CLIP_MAX_MS / 1000} с: удалите запись сценки в animation.json и запустите npm run animate — клип переобработается из raw.mp4 без Omni`,
         false,
       );
     }

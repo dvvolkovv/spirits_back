@@ -199,7 +199,7 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
   const conflictKeyframeGone = (why: string): StudioError =>
     new StudioError(
       'no_input',
-      `animate: кадра конфликта ${keyframeBase('conflict')} нет, а ${why} — верните кадр или удалите keyframes/, skits/ и поле pending в animation.json ролика, чтобы начать пару заново`,
+      `animate: кадра конфликта ${keyframeBase('conflict')} нет, а ${why} — верните кадр или удалите keyframes/ и skits/ ролика и поля skits и pending в animation.json (omniSeconds и keyframes оставить — это счёт денег), чтобы начать пару заново`,
       false,
     );
 

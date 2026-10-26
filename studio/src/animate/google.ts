@@ -318,6 +318,8 @@ export async function waitClip(d: GoogleDeps, id: string): Promise<Buffer> {
   const deadline = now() + limit;
   // Сон и таймауты запросов обрезаются остатком срока: иначе опрос выходил за срок на минуты.
   const left = (): number => Math.max(1000, deadline - now());
+  // Последний увиденный статус — в тексте срока: незнакомый конечный статус иначе выглядел бы как «долго».
+  let lastStatus = 'ответа не было';
   while (now() < deadline) {
     await sleep(Math.min(every, Math.max(0, deadline - now())));
     let st: Interaction;
@@ -335,6 +337,7 @@ export async function waitClip(d: GoogleDeps, id: string): Promise<Buffer> {
         throw err.code === 'google_auth' || err.code === 'google_quota' ? err : unreadable(id, `опрос отвергнут — ${err.message}`);
       }
       st = (JSON.parse(r.raw) ?? {}) as Interaction;
+      lastStatus = typeof st.status === 'string' && st.status ? st.status : 'пустой';
     } catch (e) {
       if (e instanceof StudioError) throw e;
       continue;
@@ -363,5 +366,5 @@ export async function waitClip(d: GoogleDeps, id: string): Promise<Buffer> {
     if (st.status === 'failed' || st.status === 'cancelled') throw interactionFailure(st, d.apiKey);
     // in_progress, queued, пустой или незнакомый статус — ждём дальше.
   }
-  throw new StudioError('omni_timeout', `omni: не дождались клипа за ${Math.round(limit / 60_000)} мин — генерация может ещё закончиться`, true);
+  throw new StudioError('omni_timeout', `omni: не дождались клипа за ${Math.round(limit / 60_000)} мин (последний статус: ${lastStatus}) — генерация может ещё закончиться`, true);
 }

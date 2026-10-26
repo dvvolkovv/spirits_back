@@ -66,7 +66,7 @@ export function buildSkitProps(capture: CaptureResult, script: Script, voiced: T
     // Субтитры сценок обязательны: большинство смотрит без звука. animate пишет по записи
     // на реплику, по порядку; другое — ошибка, а не ролик с пропавшими субтитрами.
     if (got.length !== lines.length || got.some((c, n) => c.line !== n || !Number.isFinite(c.startMs) || !Number.isFinite(c.endMs))) {
-      throw new StudioError('no_input', `props: время реплик сценки ${kind} не сходится со сценарием (реплик ${lines.length}, записей ${got.length}) — перезапустите npm run animate`, false);
+      throw new StudioError('no_input', `props: время реплик сценки ${kind} не сходится со сценарием (реплик ${lines.length}, записей ${got.length}) — удалите skits.${kind} в animation.json и запустите npm run animate: клип переобработается из raw.mp4 без Omni`, false);
     }
     // Начало и конец переводятся в кадры по отдельности: округление длины давало кадр
     // с двумя субтитрами. Субтитр не начинается раньше конца предыдущего и не выходит за
@@ -77,7 +77,7 @@ export function buildSkitProps(capture: CaptureResult, script: Script, voiced: T
       const a = Math.max(prevEnd, msToFrames(c.startMs, FPS));
       const b = Math.min(msToFrames(c.endMs, FPS), duration);
       if (a >= b) {
-        throw new StudioError('no_input', `props: реплике ${n + 1} сценки ${kind} не осталось ни кадра (${c.startMs}–${c.endMs} мс) — перезапустите npm run animate`, false);
+        throw new StudioError('no_input', `props: реплике ${n + 1} сценки ${kind} не осталось ни кадра (${c.startMs}–${c.endMs} мс) — удалите skits.${kind} в animation.json и запустите npm run animate: клип переобработается из raw.mp4 без Omni`, false);
       }
       prevEnd = b;
       return captionCues(splitCaption(lines[n].text), from + a, b - a).map((q, i) => ({ key: `${kind}-${n}-${i}`, ...q }));
