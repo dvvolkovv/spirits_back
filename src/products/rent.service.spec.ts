@@ -134,7 +134,9 @@ describe('RentService.chargeRent — форма запроса', () => {
     await svc.chargeRent('p-1');
 
     expect(RENT_TOKENS).toBe(50_000);
-    expect(calls[0].params).toEqual(['p-1', RENT_TOKENS]);
+    // Третий параметр — anchorNow (I2): по умолчанию false, его собственная
+    // форма проверяется отдельным тестом ниже.
+    expect(calls[0].params).toEqual(['p-1', RENT_TOKENS, false]);
     // Число, вшитое в текст запроса, разъедется с константой молча.
     expect(calls[0].sql).not.toContain('50000');
   });
