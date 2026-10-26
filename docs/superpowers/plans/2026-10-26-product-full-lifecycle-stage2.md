@@ -2253,6 +2253,9 @@ describe('OWNER_TG_ID — лучшим усилием', () => {
     const job = await svc.claimJob('clients');
     expect(job).toMatchObject({ jobId: 'j', jobKind: 'provision' });
     expect(job).not.toHaveProperty('ownerTgId');
+    // Без этой проверки тест зеленел бы и без реализации: привязку обязаны
+    // СПРОСИТЬ — и пережить отказ.
+    expect(pg.query.mock.calls.some(([sql]) => String(sql).includes('tg_user_identities'))).toBe(true);
   });
 });
 
@@ -2302,7 +2305,7 @@ maybe('выдача rekey и purge против живого Postgres', () => {
   });
   beforeEach(async () => {
     await pool.query('TRUNCATE products, product_provision_jobs, product_turns, product_actions, product_host_agent, product_hosts RESTART IDENTITY CASCADE');
-    await pool.query('TRUNCATE tg_user_identities');
+    await pool.query('TRUNCATE tg_user_identities CASCADE');
     await pool.query(
       `INSERT INTO product_hosts (id, ssh_target, public_ip, domain_suffix, agent_token_hash, capacity, audience)
        VALUES ('clients', 'root@10.9.9.9', '10.9.9.9', 'c.example', 'x', 20, 'clients')`,
@@ -2365,9 +2368,11 @@ maybe('выдача rekey и purge против живого Postgres', () => {
     await pool.query(`INSERT INTO product_provision_jobs (product_id, status) VALUES ($1, 'queued')`, [site]);
     expect(await svc.claimJob('clients')).not.toHaveProperty('ownerTgId');
 
+    // Смена ключей у владельца без привязки — ПУСТАЯ строка: агент снимет
+    // устаревший OWNER_TG_ID (владелец отвязал Telegram), а не оставит его.
     const other = await product({ status: 'running', userId: 'u2' });
     await rekeyJob(other, { BOT_TOKEN: '123456:TEST-new' });
-    expect(await svc.claimJob('clients')).not.toHaveProperty('ownerTgId');
+    expect(await svc.claimJob('clients')).toMatchObject({ jobKind: 'rekey', ownerTgId: '' });
 
     const mine = await product({ status: 'running' });
     await rekeyJob(mine, { BOT_TOKEN: '123456:TEST-new' });
@@ -2397,8 +2402,9 @@ Run (нода, бэк): `src/products/provisioning.rekey-purge.spec.ts`. Expecte
    */
   dropNames?: string[];
   /**
-   * Telegram владельца — только боту, только у provision и rekey и только при
-   * привязке (tg_user_identities). Уходит в окружение `OWNER_TG_ID`.
+   * Telegram владельца — только боту, только у provision и rekey. Уходит в
+   * окружение `OWNER_TG_ID`. Пустая строка (только у rekey) — привязки больше
+   * нет: агент снимает переменную. Ключа нет — не трогать.
    */
   ownerTgId?: string;
 ```
@@ -2466,9 +2472,14 @@ Expected: `ok`. Не нашлась строка — сверить отступ
     // Отдельным чтением ПОСЛЕ выдачи и лучшим усилием: таблица привязок — из
     // модуля tg-bot, и её отказ не должен ронять опрос агента (задание уже
     // забрано, токен выпущен — 500 здесь оставил бы его до сборщика).
-    const ownerTgId = row.kind === 'bot' && (jobKind === 'provision' || jobKind === 'rekey')
+    // Три исхода чтения: id — поставить; null — привязки нет; undefined —
+    // прочитать не удалось. Заведению без привязки ключ не нужен вовсе; смене
+    // ключей «привязки нет» — пустая строка: агент снимет устаревший
+    // OWNER_TG_ID. «Не удалось» не трогает ничего.
+    const owner = row.kind === 'bot' && (jobKind === 'provision' || jobKind === 'rekey')
       ? await this.ownerTgIdOf(row.user_id)
       : undefined;
+    const ownerTgId = typeof owner === 'string' ? owner : owner === null && jobKind === 'rekey' ? '' : undefined;
 ```
 в возвращаемом объекте строку `secrets: jobKind === 'provision' && row.box ? this.secrets.decrypt(row.box, row.product_id) : {},` заменить на `secrets,`, а после строки `vhostMode: …,` добавить:
 
@@ -2485,18 +2496,20 @@ Expected: `ok`. Не нашлась строка — сверить отступ
    * Telegram владельца для OWNER_TG_ID — лучшим усилием. Таблица чужого
    * модуля (tg-bot/migrations/001_tg_bot_schema.sql): её отказ — строка в лог
    * и бот без OWNER_TG_ID (каркас тогда сам подскажет chat_id на /start), а
-   * не сорванная выдача. Без привязки — undefined, ключа в задании нет.
+   * не сорванная выдача. Возвращает id; null — привязки нет; undefined —
+   * прочитать не удалось (тогда ничего не ставится и не снимается).
    */
-  private async ownerTgIdOf(userId: string): Promise<string | undefined> {
+  private async ownerTgIdOf(userId: string): Promise<string | null | undefined> {
     try {
       const r = await this.pg.query(
         `SELECT tg_user_id::text AS id FROM tg_user_identities WHERE linkeon_user_id = $1 LIMIT 1`,
         [userId],
       );
       const id = r.rows?.[0]?.id;
+      if (id === undefined) return null;
       return typeof id === 'string' && /^\d{1,20}$/.test(id) ? id : undefined;
     } catch (e: any) {
-      this.logger.warn(`OWNER_TG_ID не прочитан (${e?.message}) — бот уедет без него`);
+      this.logger.warn(`OWNER_TG_ID не прочитан (${e?.message}) — переменная не ставится и не снимается`);
       return undefined;
     }
   }
@@ -2533,7 +2546,7 @@ import { HostsService } from './hosts.service';
 import { LimitsService } from './limits.service';
 import { RentService } from './rent.service';
 import { SecretsService } from './secrets.service';
-import { REKEY_FAILED_SAY } from './product-actions.service';
+import { REKEY_FAILED_SAY, REKEY_UNKNOWN_SAY } from './product-actions.service';
 
 const PG = process.env.PROVISIONING_PG_URL;
 const maybe = PG ? describe : describe.skip;
@@ -2685,6 +2698,30 @@ maybe('отчёт агента по rekey и purge против живого Pos
     expect(JSON.stringify(log.rows[0].result)).not.toContain('certbot');
   });
 
+  it('откат не удался — rekey_unknown: свой текст карточки и logger.error со слагом', async () => {
+    const p = await product({ status: 'running', secrets: { BOT_TOKEN: '123456:TEST-old' } });
+    const { actionId, jobId } = await runningRekey(p, { BOT_TOKEN: '123456:TEST-bad' }, { newKeyNames: ['BOT_TOKEN'], removedNames: [] });
+    const errors: string[] = [];
+    (svc as any).logger = { error: (m: string) => errors.push(m), warn: () => undefined, log: () => undefined, debug: () => undefined };
+    await svc.completeJob(jobId, { ok: false, error: 'НА ХОСТЕ ОСТАЛОСЬ: старый контейнер не вернул имя\nключи не применены: …; откат не удался' });
+    const a = await actionRow(actionId);
+    expect(a.result).toEqual({ error: REKEY_UNKNOWN_SAY, reason: 'rekey_unknown' });
+    const slug = (await productRow(p)).slug;
+    expect(errors.some((m) => m.includes(slug) && /неизвестен/.test(m))).toBe(true);
+  });
+
+  it('поздний успех после снятия задания — база не тронута, logger.error с правдой', async () => {
+    const p = await product({ status: 'running', secrets: { BOT_TOKEN: '123456:TEST-old' } });
+    const before = await productRow(p);
+    const { jobId } = await runningRekey(p, { BOT_TOKEN: '123456:TEST-new' }, { newKeyNames: ['BOT_TOKEN'], removedNames: [] });
+    await pool.query(`UPDATE product_provision_jobs SET status = 'failed', error = 'снято блокировкой администратора' WHERE id = $1`, [jobId]);
+    const errors: string[] = [];
+    (svc as any).logger = { error: (m: string) => errors.push(m), warn: () => undefined, log: () => undefined, debug: () => undefined };
+    await svc.completeJob(jobId, { ok: true });
+    expect((await productRow(p)).secrets_encrypted.equals(before.secrets_encrypted)).toBe(true);
+    expect(errors.some((m) => m.includes(before.slug) && /в контейнере новые ключи, в базе прежние/.test(m))).toBe(true);
+  });
+
   it('сборщик называет свой срок у смены ключей и стирания', async () => {
     const p = await product({ status: 'running' });
     const { jobId } = await runningRekey(p, { BOT_TOKEN: '123456:TEST-x' }, { newKeyNames: ['BOT_TOKEN'], removedNames: [] });
@@ -2716,13 +2753,36 @@ Run (нода, бэк): `src/products/provisioning.complete-rekey-purge.spec.ts`
 export const REKEY_FAILED_SAY =
   'Ключи не применены — продукт работает со старыми ключами. Попробуйте ещё раз через несколько минут; не выйдет — напишите в поддержку.';
 
+/**
+ * Смена ключей, исход которой на машине НЕИЗВЕСТЕН: откат не удался, агент
+ * бросил смену по сроку, задание сняли у агента в руках. Продукт может не
+ * отвечать — честно так и сказать; на сервере это logger.error со слагом.
+ */
+export const REKEY_UNKNOWN_SAY =
+  'Смена ключей прервалась на машине продукта, и он может не отвечать. Если продукт молчит дольше нескольких минут — напишите в поддержку.';
+
+/** Смена ключей снята удалением продукта до того, как агент её взял. */
+export const REKEY_GONE_SAY = 'Продукт удалён — ключи не менялись.';
+
+/** Смена ключей снята блокировкой администратора до того, как агент её взял. */
+export const REKEY_BLOCKED_SAY = 'Продукт остановлен администратором — ключи не менялись.';
+
 /** Итог несостоявшегося стирания в журнале: обход повторит его сам. */
 export const PURGE_FAILED_SAY = 'Стирание не удалось — повторится автоматически';
 ```
 
 - [ ] **Step 4: Разводка и два отчёта** в `src/products/provisioning.service.ts`
 
-1. Импорт: `import { PURGE_FAILED_SAY, REKEY_FAILED_SAY } from './product-actions.service';`
+1. Импорт: `import { PURGE_FAILED_SAY, REKEY_FAILED_SAY, REKEY_UNKNOWN_SAY } from './product-actions.service';` и рядом с `DOMAIN_ERROR_MAX`:
+
+```ts
+/**
+ * Признаки отказа смены ключей, после которого состояние машины неизвестно:
+ * describeFailure агента ставит «НА ХОСТЕ ОСТАЛОСЬ:» перед остатками, срок
+ * агента (overdue) пишет «НЕИЗВЕСТНО», откат rekey.ts — «откат не удался».
+ */
+const REKEY_UNKNOWN_RE = /НА ХОСТЕ ОСТАЛОСЬ|НЕИЗВЕСТНО|откат не удался/;
+```
 2. В `completeJob` строку `if (kindRow.rows[0]?.kind === 'domain') return this.completeDomainJob(jobId, result);` заменить на:
 
 ```ts
@@ -2755,6 +2815,7 @@ export const PURGE_FAILED_SAY = 'Стирание не удалось — пов
    * снимке, одном на весь оператор.
    */
   private async completeRekeyJob(jobId: string, result: { ok: boolean; error?: string }) {
+    const unknown = !result.ok && REKEY_UNKNOWN_RE.test(result.error ?? '');
     const r = await this.pg.query(
       `WITH closed AS (
           UPDATE product_provision_jobs
@@ -2779,20 +2840,36 @@ export const PURGE_FAILED_SAY = 'Стирание не удалось — пов
                  secrets_box = NULL,
                  result = CASE WHEN $2::boolean
                                THEN jsonb_build_object('keyNames', COALESCE(a.payload->'newKeyNames', '[]'::jsonb))
-                               ELSE jsonb_build_object('error', $4::text, 'reason', 'rekey_failed') END,
+                               ELSE jsonb_build_object('error', $4::text, 'reason', $5::text) END,
                  resolved_at = now()
             FROM closed WHERE a.id = closed.action_id AND a.status = 'working'
           RETURNING a.payload->>'tgBotId' AS tg_bot_id
        )
        SELECT (SELECT count(*) FROM closed)::int AS closed,
               (SELECT product_id FROM closed) AS product_id,
+              (SELECT slug FROM products WHERE id = (SELECT product_id FROM closed)) AS slug,
               (SELECT tg_bot_id FROM finished) AS tg_bot_id`,
-      [jobId, result.ok, result.error ?? 'без причины', REKEY_FAILED_SAY],
+      [jobId, result.ok, result.error ?? 'без причины', unknown ? REKEY_UNKNOWN_SAY : REKEY_FAILED_SAY, unknown ? 'rekey_unknown' : 'rekey_failed'],
     );
     const row = r.rows[0];
     if (!row?.closed) {
-      this.logger.warn(`отчёт по незапущенному заданию rekey ${jobId} — ключи не тронуты`);
+      if (result.ok) {
+        // ПОЗДНИЙ УСПЕХ: задание сняли раньше (блокировка, сборщик по сроку),
+        // а агент дошёл до конца. База не меняется (замок status='running'),
+        // но правда расходится: в контейнере НОВЫЕ ключи, в базе — прежние.
+        // Громко: это разбор руками, а не рутина.
+        const who = await this.pg
+          .query(`SELECT p.slug FROM product_provision_jobs j JOIN products p ON p.id = j.product_id WHERE j.id = $1`, [jobId])
+          .then((q: any) => q.rows[0]?.slug ?? '?')
+          .catch(() => '?');
+        this.logger.error(`смена ключей ${who}: агент применил новые ключи после того, как задание ${jobId} сняли — в контейнере новые ключи, в базе прежние, сверить руками`);
+      } else {
+        this.logger.warn(`отчёт по незапущенному заданию rekey ${jobId} — ключи не тронуты`);
+      }
       return;
+    }
+    if (unknown) {
+      this.logger.error(`смена ключей ${row.slug}: исход на машине неизвестен, продукт может не отвечать — ${String(result.error ?? '').slice(0, 300)}`);
     }
     // Метка бота — отдельным оператором и лучшим усилием: частичный UNIQUE
     // products_tg_bot_live мог занять другой живой продукт между проверкой в
