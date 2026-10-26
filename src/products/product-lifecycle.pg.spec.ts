@@ -222,6 +222,36 @@ maybe('жизненный цикл продукта против живого Po
       expect(Number(jobs.rows[0].count)).toBe(1);
     });
 
+    it('3 провалившихся сна подряд — тик больше не ставит, предупреждает раз; провалы до архивации не считаются', async () => {
+      const userId = 'u-sleep-cap';
+      const archivedAt = new Date();
+      const productId = await insertProduct({
+        userId, status: 'archived', slug: 'sleep-cap-1',
+        archivedAt, purgeAfter: new Date(Date.now() + 30 * 86_400_000),
+      });
+      // Провал ДО архивации — из прошлого цикла архив/возврат, считаться не должен.
+      await pool.query(
+        `INSERT INTO product_provision_jobs (product_id, kind, status, created_at) VALUES ($1, 'sleep', 'failed', $2)`,
+        [productId, new Date(archivedAt.getTime() - 60_000)],
+      );
+      for (let i = 0; i < 3; i++) {
+        await pool.query(
+          `INSERT INTO product_provision_jobs (product_id, kind, status, created_at) VALUES ($1, 'sleep', 'failed', now())`,
+          [productId],
+        );
+      }
+      const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+
+      expect(await svc.queueSleepForDeleted(productId)).toBe(0);
+      expect(warn).toHaveBeenCalledTimes(1);
+      // Повторный тик — предупреждение в логе не дублируется (один раз на процесс).
+      expect(await svc.queueSleepForDeleted(productId)).toBe(0);
+      expect(warn).toHaveBeenCalledTimes(1);
+
+      const sleeps = await pool.query(`SELECT count(*) FROM product_provision_jobs WHERE product_id = $1 AND kind = 'sleep' AND status = 'queued'`, [productId]);
+      expect(Number(sleeps.rows[0].count)).toBe(0);
+    });
+
     it('тик доснимает застрявшее в очереди пробуждение архивного и ставит сон; живого не трогает', async () => {
       // Так выглядит удаление, у которого снятие чужих заданий оборвалось:
       // продукт уже в архиве, а его wake всё ещё queued.
