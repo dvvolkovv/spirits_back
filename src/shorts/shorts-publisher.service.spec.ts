@@ -87,6 +87,8 @@ function fakeDb(over: Record<string, any> = {}, opts: FakeOpts = {}) {
 
 function setup(db = fakeDb(), channel: string | null = '-1003290853538', platforms: string[] = ['telegram', 'youtube']) {
   const tg = {
+    // Бот поднят: TgGrammyClient создаёт его в onModuleInit, только если задан TG_BOT_TOKEN.
+    getBot: jest.fn((): any => ({})),
     sendVideo: jest.fn(async (): Promise<any> => SENT),
     sendDocument: jest.fn(async () => ({ message_id: 601 })),
     sendMessage: jest.fn(async () => ({ message_id: 602 })),
@@ -165,6 +167,26 @@ describe('ShortsPublisherService.publish', () => {
     expect(db.v.status).toBe('published');
   });
 
+  it('бот Telegram не поднят (нет TG_BOT_TOKEN) — отказ до отправки: обычный повтор, а не «пост мог выйти»', async () => {
+    const { svc, tg, storage, db } = setup();
+    tg.getBot.mockReturnValue(undefined);
+    await svc.publish(ID);
+    expect(tg.sendVideo).not.toHaveBeenCalled();
+    expect(storage.download).not.toHaveBeenCalled();
+    expect(db.pubs.get('telegram')).toMatchObject({ status: 'failed', last_error: 'бот Telegram не настроен — TG_BOT_TOKEN' });
+    expect(db.v.status).toBe('approved');
+    expect(db.v.last_error).toMatch(/telegram: бот Telegram не настроен — TG_BOT_TOKEN/);
+    expect(db.v.last_error).not.toMatch(/пост мог выйти/);
+
+    // Предел попыток — как у любого отказа: failed с этапом publishing.
+    const last = setup(fakeDb({ attempts: MAX_PUBLISH_ATTEMPTS - 1 }));
+    last.tg.getBot.mockReturnValue(undefined);
+    await last.svc.publish(ID);
+    expect(last.tg.sendVideo).not.toHaveBeenCalled();
+    expect([last.db.v.status, last.db.v.failed_from]).toEqual(['failed', 'publishing']);
+    expect(last.db.v.last_error).not.toMatch(/пост мог выйти/);
+  });
+
   it('ролик не в approved — ничего не отправляется', async () => {
     const { svc, tg } = setup(fakeDb({ status: 'pending_review' }));
     await svc.publish(ID);
@@ -233,6 +255,9 @@ describe('ShortsPublisherService.publish', () => {
     expect(db.v.attempts).toBe(1);
     expect(db.v).toMatchObject({ status: 'failed', failed_from: 'publishing', failure_notified: false });
     expect(db.v.last_error).toMatch(/^публикация: telegram: пост мог выйти/);
+    // Что делать — тем же текстом, что уйдёт владельцу: действия админки роликов, а не несуществующая кнопка.
+    expect(db.v.last_error).toContain('если пост вышел — mark_published со ссылкой на пост, иначе retry');
+    expect(db.v.last_error).not.toContain('«Повторить»');
 
     await svc.publish(ID);
     expect(tg.sendVideo).toHaveBeenCalledTimes(1);

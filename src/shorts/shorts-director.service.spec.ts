@@ -58,6 +58,23 @@ describe('ShortsDirectorService.direct', () => {
     expect(params[4]).toBe('Залог при аренде');
   });
 
+  it('новая сцена — новый круг сценариста: прошлые съёмка, сценарий, подписи, отзыв студии и счёт переписок сбрасываются', async () => {
+    // «Переснять», просьба сценариста о другой сцене и повтор с этапа режиссёра идут через эту запись.
+    const { svc, pg } = setup();
+    await svc.direct(video({
+      writer_rounds: 2, writer_feedback: 'озвучка 63 с — сократи',
+      script: { hook: 'Старая зацепка', voice: 'v', speed: 1, lines: [], final: { assistantsCount: 9 } },
+      captions: { telegram: 'TG', vk: 'VK', youtube: { title: 'T', description: 'D', tags: [] } },
+    }));
+    const [sql] = pg.query.mock.calls[1] as any[];
+    expect(sql).toMatch(/SET status = 'capture_queued'/);
+    expect(sql).toMatch(/writer_rounds = 0/);
+    expect(sql).toMatch(/writer_feedback = NULL/);
+    expect(sql).toMatch(/script = NULL/);
+    expect(sql).toMatch(/captions = NULL/);
+    expect(sql).toMatch(/capture = NULL/);
+  });
+
   it('слаг уже есть — не меняется (метки ролика постоянны)', async () => {
     const { svc, pg } = setup();
     await svc.direct(video({ slug: 'old_slug_ab12' }));

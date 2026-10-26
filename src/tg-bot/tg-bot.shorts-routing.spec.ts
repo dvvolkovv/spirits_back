@@ -77,6 +77,21 @@ describe('роутинг роликов в живом обработчике', (
     expect((svc as any).handleChatMessage).toHaveBeenCalled();
   });
 
+  it('ролики упали на реплае (база моргнула) — реплай не теряется: уходит ассистенту, сбой — в лог', async () => {
+    identity.getLinkeonIdByTgUserId.mockResolvedValue('u-1');
+    configs.ensurePrivateConfig.mockResolvedValue({ id: 'cfg-1' });
+    blog.handleReplyEdit.mockResolvedValue(false);
+    shorts.handleReplyEdit.mockRejectedValue(new Error('Connection terminated unexpectedly'));
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+    try {
+      await expect((svc as any).handleMessage(replyMsg())).resolves.toBeUndefined();
+      expect((svc as any).handleChatMessage).toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('Connection terminated unexpectedly'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('/short владельца забирают ролики — ответа про неизвестную команду нет', async () => {
     blog.handleCaseCommand.mockResolvedValue(false);
     shorts.handleShortCommand.mockResolvedValue(true);

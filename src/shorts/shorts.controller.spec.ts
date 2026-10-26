@@ -106,7 +106,8 @@ describe('POST admin/shorts', () => {
     const capture = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'capture_queued' })] } : { rows: [video()] }));
     await capture.ctl.action({ action: 'retry', id: ID }, res());
     const upd = capture.pg.query.mock.calls.find((c: any[]) => String(c[0]).includes("WHERE id = $1 AND status = 'failed'")) as any[];
-    expect(upd[1]).toEqual([ID, 'capture_queued', 'capturing']);
+    // Без замечания owner_note не трогается (COALESCE с NULL).
+    expect(upd[1]).toEqual([ID, 'capture_queued', 'capturing', null]);
 
     const pub = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'approved' })] } : { rows: [video({ failed_from: 'publishing', approved_at: '2026-10-25T00:00:00Z' })] }));
     await pub.ctl.action({ action: 'retry', id: ID }, res());
@@ -114,6 +115,76 @@ describe('POST admin/shorts', () => {
 
     const never = setup(() => ({ rows: [video({ failed_from: 'publishing', approved_at: null })] }));
     await expect(never.ctl.action({ action: 'retry', id: ID }, res())).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  const retryWrite = (pg: any) =>
+    pg.query.mock.calls.find((c: any[]) => String(c[0]).includes("WHERE id = $1 AND status = 'failed' AND failed_from = $3")) as any[];
+
+  it('retry { from: directing, note } — с режиссёра, а не с этапа падения; замечание дописано к прежним', async () => {
+    // Сценарист дважды просил другую сцену — повтор с writing упал бы тем же.
+    const failed = video({ failed_from: 'writing', owner_note: 'Сценарист: нужен вопрос про субаренду\nСценарист: ответ слишком общий' });
+    const { ctl, pg } = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'directing', failed_from: null })] } : { rows: [failed] }));
+    await ctl.action({ action: 'retry', id: ID, from: 'directing', note: 'Возьми вопрос про возврат залога' }, res());
+    const upd = retryWrite(pg);
+    expect(String(upd[0])).toContain('owner_note = COALESCE($4::text, owner_note)');
+    expect(String(upd[0])).toContain('writer_rounds = 0');
+    expect(upd[1]).toEqual([
+      ID, 'directing', 'writing',
+      'Сценарист: нужен вопрос про субаренду\nСценарист: ответ слишком общий\nВозьми вопрос про возврат залога',
+    ]);
+  });
+
+  it('retry { from: writing } — новый текст по той же съёмке', async () => {
+    const failed = video({ failed_from: 'rendering', capture: { answerText: 'ответ', paragraphs: [] } });
+    const { ctl, pg } = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'writing', failed_from: null })] } : { rows: [failed] }));
+    await ctl.action({ action: 'retry', id: ID, from: 'writing' }, res());
+    expect(retryWrite(pg)[1]).toEqual([ID, 'writing', 'rendering', null]);
+  });
+
+  it('retry { from } у упавшей публикации — 409: её повторяют только своим путём', async () => {
+    const pub = video({ failed_from: 'publishing', approved_at: '2026-10-25T00:00:00Z', capture: { paragraphs: [] } });
+    for (const from of ['directing', 'writing']) {
+      const { ctl, pg } = setup(() => ({ rows: [pub] }));
+      await expect(ctl.action({ action: 'retry', id: ID, from }, res())).rejects.toBeInstanceOf(ConflictException);
+      expect(pg.query.mock.calls.some((c: any[]) => String(c[0]).startsWith('UPDATE'))).toBe(false);
+    }
+  });
+
+  it('retry { from: writing } без съёмки — 409 «нечего писать»', async () => {
+    const { ctl, pg } = setup(() => ({ rows: [video({ failed_from: 'capturing', capture: null })] }));
+    await expect(ctl.action({ action: 'retry', id: ID, from: 'writing' }, res())).rejects.toThrow(/нечего писать — нет съёмки/);
+    expect(pg.query.mock.calls.some((c: any[]) => String(c[0]).startsWith('UPDATE'))).toBe(false);
+  });
+
+  it('retry — неизвестный from или note не строкой — 400', async () => {
+    const { ctl } = setup(() => ({ rows: [video()] }));
+    await expect(ctl.action({ action: 'retry', id: ID, from: 'rendering' }, res())).rejects.toBeInstanceOf(BadRequestException);
+    await expect(ctl.action({ action: 'retry', id: ID, from: 'directing', note: 42 }, res())).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('reject — упавший ролик отклоняется, если нигде не вышел', async () => {
+    const { ctl, pg } = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'rejected' })] } : { rows: [video()] }));
+    const r = res();
+    await ctl.action({ action: 'reject', id: ID }, r);
+    const upd = pg.query.mock.calls.find((c: any[]) => String(c[0]).includes("SET status = 'rejected'")) as any[];
+    const sql = String(upd[0]).replace(/\s+/g, ' ');
+    expect(sql).toContain("WHERE id = $1 AND status = 'failed'");
+    expect(sql).toContain("AND NOT EXISTS (SELECT 1 FROM short_publication p WHERE p.short_id = short_video.id AND p.status IN ('published', 'manual_pending', 'manual_done'))");
+    expect(upd[1]).toEqual([ID]);
+    expect(r.body.status).toBe('rejected');
+  });
+
+  it('reject — ролик уже вышел на площадке — 409; не упавший — 409', async () => {
+    const released = setup((sql) => {
+      if (sql.includes('RETURNING')) return { rows: [] };
+      if (sql.includes('AS released')) return { rows: [{ status: 'failed', released: true }] };
+      return { rows: [video({ failed_from: 'publishing', approved_at: '2026-10-25T00:00:00Z' })] };
+    });
+    await expect(released.ctl.action({ action: 'reject', id: ID }, res())).rejects.toThrow(/уже вышел/);
+
+    const review = setup(() => ({ rows: [video({ status: 'pending_review', failed_from: null })] }));
+    await expect(review.ctl.action({ action: 'reject', id: ID }, res())).rejects.toBeInstanceOf(ConflictException);
+    expect(review.pg.query.mock.calls.some((c: any[]) => String(c[0]).startsWith('UPDATE'))).toBe(false);
   });
 
   it('mark_published — отмечает telegram вышедшим и возвращает ролик в approved', async () => {
