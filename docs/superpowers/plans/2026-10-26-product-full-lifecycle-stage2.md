@@ -958,3 +958,796 @@ git -C $B add product-runner/src/host/fake-host.ts && git -C $B commit -q -m "ru
 Run (нода, агент): без списка файлов (`npx jest`). Expected: все наборы PASS, число тестов = базовая линия + 6 (задача 3 добавила свои). Затем tsc агента.
 
 ---
+
+### Task 5: Агент — смена ключей (`rekey`) с откатом
+
+**Files:**
+- Create: `product-runner/src/host/rekey.ts`
+- Modify: `product-runner/src/host/provision.ts` (экспорт `validateSecrets` и `containerTaken`; поле `waitInside` в `ProvisionDeps`)
+- Test: `product-runner/src/host/rekey.spec.ts` (новый)
+
+Форма пересоздания — та же, что у `scripts/product-image-roll.sh` (`do_recreate`/`do_restore`), где она обкатана на живых клиентах: настройки снимаются с живого контейнера ДО разрушения, старый контейнер не удаляется, а переименовывается и живёт, пока новый не доказал здоровье (в нём единственная копия `RUNNER_TOKEN` — сервер хранит только sha256). Отличия: вместо строк шаблона — `{{json .}}` и разбор в коде (значение с переводом строки не ломает счёт строк), а меняются только ключи владельца.
+
+- [ ] **Step 1: Тесты**
+
+`product-runner/src/host/rekey.spec.ts`:
+
+```ts
+/**
+ * Смена ключей против симулятора хоста. Спрашивается СОСТОЯНИЕ хоста (какой
+ * контейнер жив, с каким окружением, на каком образе и порту), а не форма
+ * команд — см. шапку sleep.spec.ts.
+ */
+import { FakeHost, OAUTH, deps } from './fake-host';
+import { ProvisionDeps, provision } from './provision';
+import { REKEY_BACKUP_SUFFIX, rekeyProduct, RekeyJob } from './rekey';
+
+let host: FakeHost;
+beforeEach(() => {
+  host = new FakeHost();
+});
+
+async function seedBot(slug = 'bot1', secrets: Record<string, string> = { BOT_TOKEN: 'old', API_KEY: 'k1' }) {
+  await provision({ slug, kind: 'bot', name: 'Бот', runnerToken: 'ткн-раннера', secrets }, deps(host));
+}
+async function seedSite(slug = 'shop', secrets: Record<string, string> = { API_KEY: 'k1' }) {
+  return (await provision({ slug, kind: 'site', name: 'Сайт', runnerToken: 'ткн-раннера', secrets }, deps(host))).port!;
+}
+const botJob = (over: Partial<RekeyJob> = {}): RekeyJob => ({
+  slug: 'bot1', kind: 'bot', secrets: { BOT_TOKEN: 'new', NEW_KEY: 'n' }, dropNames: ['API_KEY'], ...over,
+});
+/** Сайт «отвечает» ровно тогда, когда симулятор считает его здоровым; срок — ноль, чтобы отказ не ждал минуту. */
+const siteDeps = (over: Partial<ProvisionDeps> = {}) =>
+  deps(host, { waitPort: async (p) => host.probePort(p), waitPortTimeoutMs: 0, ...over });
+
+describe('смена ключей: успех', () => {
+  it('бот: новые ключи в окружении, снятые ушли, переменные платформы на месте', async () => {
+    await seedBot();
+    await rekeyProduct(botJob(), deps(host, { waitPortTimeoutMs: 0 }));
+
+    const c = host.containers.get('bot1')!;
+    expect(c.env.BOT_TOKEN).toBe('new');
+    expect(c.env.NEW_KEY).toBe('n');
+    expect('API_KEY' in c.env).toBe(false);
+    expect(c.env.RUNNER_TOKEN).toBe('ткн-раннера');
+    expect(c.env.CLAUDE_CODE_OAUTH_TOKEN).toBe(OAUTH);
+    expect(c.env.LINKEON_URL).toBeTruthy();
+    expect(c.mount).toBe('/srv/products/bot1:/product');
+    expect(host.isRunning('bot1')).toBe(true);
+    expect(host.containers.has(`bot1${REKEY_BACKUP_SUFFIX}`)).toBe(false);
+  });
+
+  it('сайт: тот же порт, домен не трогается вовсе', async () => {
+    const port = await seedSite();
+    const vhostCalls = host.ran('product-vhost').length;
+    await rekeyProduct({ slug: 'shop', kind: 'site', secrets: { API_KEY: 'k2' }, dropNames: [] }, siteDeps());
+
+    expect(host.containers.get('shop')!.publish).toBe(`127.0.0.1:${port}:3000`);
+    expect(host.containers.get('shop')!.env.API_KEY).toBe('k2');
+    expect(host.vhostMode('shop')).toBe('live');
+    expect(host.ran('product-vhost').length).toBe(vhostCalls);
+  });
+
+  it('переменные, о которых сервер не знает, остаются как были', async () => {
+    // У продуктов, заведённых руками (product-provision.sh), в окружении бывает
+    // то, чего нет в зашифрованном наборе. Снимать их нельзя: сервер о них не
+    // знает и вернуть не сможет.
+    await seedBot();
+    host.containers.get('bot1')!.env.HAND_MADE = '1';
+    await rekeyProduct(botJob(), deps(host, { waitPortTimeoutMs: 0 }));
+    expect(host.containers.get('bot1')!.env.HAND_MADE).toBe('1');
+  });
+
+  it('OWNER_TG_ID из задания ставится боту рядом с ключами', async () => {
+    await seedBot();
+    await rekeyProduct(botJob({ ownerTgId: '42' }), deps(host, { waitPortTimeoutMs: 0 }));
+    expect(host.containers.get('bot1')!.env.OWNER_TG_ID).toBe('42');
+  });
+
+  it('метка образа на месте — запуск по ней же: контейнер остаётся в отборе обновления образа', async () => {
+    host.tagImage('linkeon-product:base', 'sha256:v1', []);
+    await seedBot();
+    await rekeyProduct(botJob(), deps(host, { waitPortTimeoutMs: 0 }));
+    expect(host.containers.get('bot1')!.image).toBe('linkeon-product:base');
+    expect(host.containers.get('bot1')!.imageId).toBe('sha256:v1');
+  });
+
+  it('метку передвинули — тот же образ по его стабильной метке, а не новый образ', async () => {
+    host.tagImage('linkeon-product:base', 'sha256:v1', []);
+    host.tagImage('linkeon-product:src-aaaaaaaaaaaa', 'sha256:v1', []);
+    await seedBot();
+    host.tagImage('linkeon-product:base', 'sha256:v2', []);
+    await rekeyProduct(botJob(), deps(host, { waitPortTimeoutMs: 0 }));
+    expect(host.containers.get('bot1')!.imageId).toBe('sha256:v1');
+    expect(host.containers.get('bot1')!.image).toBe('linkeon-product:src-aaaaaaaaaaaa');
+  });
+});
+
+describe('смена ключей: откат и отказы', () => {
+  it('нездоровый бот — откат: старый контейнер со старыми ключами в работе', async () => {
+    await seedBot();
+    host.healthy = (_name, c) => c.env.BOT_TOKEN !== 'плохой';
+    await expect(rekeyProduct(botJob({ secrets: { BOT_TOKEN: 'плохой' } }), deps(host, { waitPortTimeoutMs: 0 })))
+      .rejects.toThrow(/ключи не применены.*старыми ключами/);
+    const c = host.containers.get('bot1')!;
+    expect(c.env.BOT_TOKEN).toBe('old');
+    expect(c.env.API_KEY).toBe('k1');
+    expect(host.isRunning('bot1')).toBe(true);
+    expect(host.containers.has(`bot1${REKEY_BACKUP_SUFFIX}`)).toBe(false);
+  });
+
+  it('нездоровый сайт — откат, порт и домен прежние', async () => {
+    const port = await seedSite();
+    host.healthy = (_name, c) => c.env.API_KEY !== 'плохой';
+    await expect(rekeyProduct({ slug: 'shop', kind: 'site', secrets: { API_KEY: 'плохой' }, dropNames: [] }, siteDeps()))
+      .rejects.toThrow(/ключи не применены/);
+    expect(host.containers.get('shop')!.env.API_KEY).toBe('k1');
+    expect(host.isRunning('shop')).toBe(true);
+    expect(host.probePort(port)).toBe(true);
+    expect(host.vhostMode('shop')).toBe('live');
+  });
+
+  it('docker run отказал — откат, и в причине нет значений ключей', async () => {
+    await seedBot();
+    host.before = (argv) => {
+      if (argv[1] === 'run' && argv.includes('BOT_TOKEN=секрет-новый')) {
+        throw new Error(`Command failed: ${argv.join(' ')}\ndocker: Error response from daemon: boom`);
+      }
+    };
+    const err = await rekeyProduct(botJob({ secrets: { BOT_TOKEN: 'секрет-новый' } }), deps(host, { waitPortTimeoutMs: 0 }))
+      .catch((e) => e);
+    expect(String(err.message)).toMatch(/boom/);
+    expect(String(err.message)).not.toContain('секрет-новый');
+    expect(String(err.message)).not.toContain('ткн-раннера');
+    expect(host.containers.get('bot1')!.env.BOT_TOKEN).toBe('old');
+    expect(host.isRunning('bot1')).toBe(true);
+  });
+
+  it('остаток прерванной смены — отказ до любого изменения', async () => {
+    await seedBot();
+    await host.run(['docker', 'run', '-d', '--name', `bot1${REKEY_BACKUP_SUFFIX}`, '--restart', 'unless-stopped', 'linkeon-product:base']);
+    host.calls.length = 0;
+    await expect(rekeyProduct(botJob(), deps(host))).rejects.toThrow(/прерванной смены ключей/);
+    expect(host.calls.some((c) => c[1] === 'stop' || c[1] === 'rename' || c[1] === 'run')).toBe(false);
+  });
+
+  it('спящему продукту ключи не меняются', async () => {
+    await seedBot();
+    await host.run(['docker', 'stop', 'bot1']);
+    await expect(rekeyProduct(botJob(), deps(host))).rejects.toThrow(/не запущен/);
+    expect(host.containers.get('bot1')!.env.BOT_TOKEN).toBe('old');
+  });
+
+  it('метки того же образа нет — отказ до изменений', async () => {
+    host.tagImage('linkeon-product:base', 'sha256:v1', []);
+    await seedBot();
+    host.tagImage('linkeon-product:base', 'sha256:v2', []);
+    await expect(rekeyProduct(botJob(), deps(host))).rejects.toThrow(/не помечен/);
+    expect(host.isRunning('bot1')).toBe(true);
+    expect(host.containers.get('bot1')!.env.BOT_TOKEN).toBe('old');
+  });
+
+  it('без RUNNER_TOKEN в окружении — отказ до изменений: пересоздание потеряло бы раннер', async () => {
+    await host.run(['docker', 'run', '-d', '--name', 'bot1', '--restart', 'unless-stopped', '-e', 'LINKEON_URL=https://x', 'linkeon-product:base']);
+    await expect(rekeyProduct(botJob(), deps(host))).rejects.toThrow(/RUNNER_TOKEN/);
+    expect(host.calls.some((c) => c[1] === 'stop')).toBe(false);
+  });
+
+  it('занятое имя в новом наборе или в снимаемых — отказ до изменений', async () => {
+    await seedBot();
+    await expect(rekeyProduct(botJob({ secrets: { BOT_TOKEN: 'n', RUNNER_TOKEN: 'подмена' } }), deps(host))).rejects.toThrow(/занято/);
+    await expect(rekeyProduct(botJob({ dropNames: ['LINKEON_URL'] }), deps(host))).rejects.toThrow(/платформы/);
+    expect(host.containers.get('bot1')!.env.RUNNER_TOKEN).toBe('ткн-раннера');
+  });
+
+  it('бот без BOT_TOKEN в новом наборе — отказ', async () => {
+    await seedBot();
+    await expect(rekeyProduct(botJob({ secrets: { NEW_KEY: 'n' } }), deps(host))).rejects.toThrow(/BOT_TOKEN/);
+  });
+
+  it('слаг не по форме — отказ до первого вызова docker', async () => {
+    await expect(rekeyProduct(botJob({ slug: '../x' }), deps(host))).rejects.toThrow(/слаг/);
+    expect(host.calls).toHaveLength(0);
+  });
+});
+```
+
+- [ ] **Step 2: Коммит, прогон — FAIL** (`Cannot find module './rekey'`)
+
+```bash
+git -C $B add product-runner/src/host/rekey.spec.ts && git -C $B commit -q -m "test(runner): смена ключей — пересоздание, откат, отказы до изменений (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, агент): `src/host/rekey.spec.ts`.
+
+- [ ] **Step 3: Экспорт и зависимость в `provision.ts`**
+
+1. `function validateSecrets(` → `export function validateSecrets(`; `async function containerTaken(` → `export async function containerTaken(` (комментарий над каждой: «Экспорт — ради rekey.ts и purge.ts: проверка одна на все хостовые шаги»).
+2. В `interface ProvisionDeps` после `waitPort`:
+
+```ts
+  /**
+   * Ответил ли продукт на /health ИЗНУТРИ контейнера (бот порта не публикует).
+   * Необязательное: по умолчанию — `docker exec … node -e` через этот же run
+   * (rekey.ts, waitInsideVia), подмена — только для тестов.
+   */
+  waitInside?: (slug: string, timeoutMs: number) => Promise<boolean>;
+```
+
+- [ ] **Step 4: Реализация**
+
+`product-runner/src/host/rekey.ts`:
+
+```ts
+/**
+ * СМЕНА КЛЮЧЕЙ ВЛАДЕЛЬЦА — задание `rekey` (очередь 2).
+ *
+ * Переменные окружения контейнера задаются один раз, при `docker run`, —
+ * поменять их можно только пересозданием. Пересоздаётся с ТЕМ ЖЕ образом,
+ * портом, каталогом, лимитами и переменными платформы; меняются только ключи
+ * владельца: `dropNames` и имена нового набора уходят, новый набор приходит.
+ *
+ * ## Почему настройки — с живого контейнера, а не «как при заведении»
+ *
+ * В контейнере лежит RUNNER_TOKEN, и взять его второй раз негде: сервер хранит
+ * только sha256 (см. шапку sleep.ts). Рядом с ним так же молча потерялись бы
+ * порт, привязка каталога и лимиты. Поэтому всё снимается `docker inspect`
+ * ДО первого разрушающего шага, а старый контейнер не удаляется, а
+ * переименовывается в `<слаг>__rekey` и живёт, пока новый не доказал здоровье.
+ * Та же форма, что у scripts/product-image-roll.sh (do_recreate/do_restore).
+ *
+ * ## Почему JSON, а не шаблоны по строке
+ *
+ * product-image-roll.sh читает `.Config.Env` построчно и потому сторожит
+ * число строк против `{{len .Config.Env}}`: значение с переводом строки
+ * (приватный ключ PEM) иначе разваливается на две переменные. Здесь
+ * `{{json .}}` и разбор в коде — перевод строки внутри значения ничего не
+ * ломает, а приватные ключи владельцы как раз и присылают.
+ *
+ * ## Образ — тот же, запуск — по метке
+ *
+ * Запуск по голому идентификатору выбросил бы контейнер из отбора
+ * product-image-roll.sh НАВСЕГДА (отбор по `.Config.Image` с префиксом
+ * `linkeon-product:`): раннер внутри перестал бы обновляться. Поэтому по
+ * `.Config.Image`, если метка по-прежнему указывает на образ контейнера; если
+ * её передвинули (контейнер пропущен прошлым обновлением образа) — по
+ * стабильной метке `linkeon-product:src-*` того же образа; нет такой — отказ
+ * ДО изменений: смена ключей не должна втихую менять раннер.
+ *
+ * ## Здоровье
+ *
+ * Сайт — тот же `waitPort`, что у заведения и пробуждения (200 и `sha` с
+ * опубликованного порта). Бот наружу ничего не публикует, его `/health`
+ * слушает 127.0.0.1:3000 внутри контейнера — спрашиваем изнутри, `docker
+ * exec … node -e`, и требуем `"ok":true`. Нездоров — откат: новый контейнер
+ * снимается, старый получает имя обратно и поднимается.
+ *
+ * ## Чего здесь нет
+ *
+ * vhost не трогается: порт тот же. Причина отказа `docker run` берётся только
+ * из stderr: в `message` execFile лежит вся командная строка, а в ней —
+ * значения старых ключей, которых нет в задании и которые маска `redact` по
+ * известным значениям не знает.
+ */
+import { isReservedEnvName, containerTaken, CONTAINER_PORT, DEFAULTS, ownerTgIdFor, ProvisionDeps, SLUG_RE, validateSecrets } from './provision';
+import { ProductKind } from './skeleton';
+
+export interface RekeyJob {
+  slug: string;
+  kind: ProductKind;
+  /** ПОЛНЫЙ новый набор ключей владельца (после замены, удаления и добавления). */
+  secrets: Record<string, string>;
+  /** Имена старых ключей, которых в новом наборе нет: уходят из окружения. */
+  dropNames: string[];
+  /** Telegram владельца бота — ставится рядом с ключами (см. ownerTgIdFor). */
+  ownerTgId?: string;
+}
+
+/** Имя старого контейнера на время смены. Не `__pre_`: то — страховка обновления образа. */
+export const REKEY_BACKUP_SUFFIX = '__rekey';
+
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const STABLE_TAG_RE = /^linkeon-product:src-[0-9a-f]{12}$/;
+
+/** /health изнутри контейнера бота: выход 0 только при `"ok":true`. */
+const HEALTH_INSIDE =
+  `fetch('http://127.0.0.1:${CONTAINER_PORT}/health',{signal:AbortSignal.timeout(2000)})` +
+  '.then((r)=>r.json()).then((b)=>process.exit(b&&b.ok===true?0:1),()=>process.exit(1))';
+
+/** Ожидание /health изнутри — по умолчанию для ProvisionDeps.waitInside. */
+export function waitInsideVia(deps: ProvisionDeps): (slug: string, timeoutMs: number) => Promise<boolean> {
+  return async (slug, timeoutMs) => {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      try {
+        await deps.run(['docker', 'exec', slug, 'node', '-e', HEALTH_INSIDE]);
+        return true;
+      } catch {
+        // Ещё не поднялся или нездоров — спросим снова до срока.
+      }
+      if (Date.now() >= deadline) return false;
+      await new Promise((r) => setTimeout(r, DEFAULTS.probeEveryMs));
+    }
+  };
+}
+
+/**
+ * Причина отказа программы без командной строки. execFile кладёт в message
+ * «Command failed: <весь argv>\n<stderr>» — argv со значениями ключей наружу
+ * не идёт; без этой приставки (наш собственный throw) — текст как есть.
+ */
+function reasonOf(e: any): string {
+  const m = String(e?.message ?? e ?? '').trim();
+  if (!m.startsWith('Command failed:')) return m.slice(0, 300) || 'без причины';
+  const nl = m.indexOf('\n');
+  return (nl >= 0 ? m.slice(nl + 1).trim() : '').slice(0, 300) || 'без причины';
+}
+
+async function inspectJson(deps: ProvisionDeps, argv: string[]): Promise<any> {
+  const out = await deps.run(argv);
+  try {
+    return JSON.parse(out);
+  } catch {
+    // Вывод inspect несёт окружение с ключами — в текст отказа он не идёт.
+    throw new Error(`${argv.slice(0, 3).join(' ')}: ответ не JSON — ничего не тронуто`);
+  }
+}
+
+function envName(entry: string): string {
+  const i = entry.indexOf('=');
+  return i >= 0 ? entry.slice(0, i) : entry;
+}
+
+function validateDropNames(raw: unknown): string[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new Error('dropNames — не список');
+  for (const n of raw) {
+    if (typeof n !== 'string' || !ENV_NAME_RE.test(n)) throw new Error(`имя снимаемого ключа не годится: ${JSON.stringify(n)}`);
+    // Сервер шлёт только имена ключей владельца. Переменная платформы здесь —
+    // поломка на сервере, а снять её значило бы остаться без раннера.
+    if (isReservedEnvName(n)) throw new Error(`снимать переменную платформы нельзя: ${n}`);
+  }
+  return raw as string[];
+}
+
+/** Что снято с живого контейнера ДО любого разрушения. */
+interface Captured {
+  imageRef: string;
+  ownEnv: string[];
+  publish: string[];
+  mounts: string[];
+  restart: string;
+  memory: number;
+  nanoCpus: number;
+  /** Порт хоста для /health сайта. */
+  port?: number;
+}
+
+async function capture(job: RekeyJob, deps: ProvisionDeps): Promise<Captured> {
+  const c = await inspectJson(deps, ['docker', 'inspect', '--format', '{{json .}}', job.slug]);
+  if (c?.State?.Running !== true) {
+    throw new Error(`контейнер ${job.slug} не запущен — ключи спящему продукту не меняются, ничего не тронуто`);
+  }
+  const net = c?.HostConfig?.NetworkMode;
+  if (net !== 'bridge' && net !== 'default') throw new Error(`сеть контейнера ${JSON.stringify(net)} воспроизвести не умею — ничего не тронуто`);
+  if (c?.HostConfig?.Privileged === true) throw new Error('контейнер privileged — воспроизвести не умею, ничего не тронуто');
+
+  const imageId = String(c?.Image ?? '');
+  const configImage = String(c?.Config?.Image ?? '');
+  if (!imageId) throw new Error(`у контейнера ${job.slug} нет образа — ничего не тронуто`);
+  const img = await inspectJson(deps, ['docker', 'image', 'inspect', '--format', '{{json .}}', imageId]);
+
+  let imageRef: string | undefined;
+  if (configImage && configImage !== imageId) {
+    try {
+      const byTag = await inspectJson(deps, ['docker', 'image', 'inspect', '--format', '{{json .}}', configImage]);
+      if (byTag?.Id === imageId) imageRef = configImage;
+    } catch {
+      // Метки больше нет — ищем стабильную ниже.
+    }
+  }
+  if (!imageRef) {
+    const tags: string[] = Array.isArray(img?.RepoTags) ? img.RepoTags : [];
+    imageRef = tags.find((t) => STABLE_TAG_RE.test(t));
+  }
+  if (!imageRef) {
+    throw new Error(
+      `образ контейнера ${job.slug} больше не помечен — смена ключей сменила бы и раннер; ` +
+        'ключи сменятся после обновления образа (product-image-roll.sh), ничего не тронуто',
+    );
+  }
+
+  // Свои переменные = контейнерные МИНУС пришедшие из ТОГО образа, с которого
+  // контейнер запущен: вернуть переменные образа флагом -e значило бы
+  // законсервировать старое значение по умолчанию (довод product-image-roll.sh).
+  const imageEnv = new Set<string>(Array.isArray(img?.Config?.Env) ? img.Config.Env : []);
+  const env: unknown[] = Array.isArray(c?.Config?.Env) ? c.Config.Env : [];
+  const ownEnv = env.filter((e): e is string => typeof e === 'string' && !imageEnv.has(e));
+  const filled = (name: string) => ownEnv.some((e) => envName(e) === name && e.length > name.length + 1);
+  if (!filled('RUNNER_TOKEN') || !filled('LINKEON_URL')) {
+    throw new Error(`в окружении ${job.slug} нет RUNNER_TOKEN или LINKEON_URL — пересоздание потеряло бы раннер, ничего не тронуто`);
+  }
+
+  const publish: string[] = [];
+  let port: number | undefined;
+  for (const [key, binds] of Object.entries(c?.HostConfig?.PortBindings ?? {})) {
+    const m = /^(\d+)\/tcp$/.exec(key);
+    if (!m || !Array.isArray(binds)) throw new Error(`публикацию ${key} воспроизвести не умею — ничего не тронуто`);
+    for (const b of binds as any[]) {
+      const hostPort = String(b?.HostPort ?? '');
+      if (!/^\d+$/.test(hostPort)) throw new Error(`публикацию ${key} воспроизвести не умею — ничего не тронуто`);
+      publish.push(`${b?.HostIp ? `${b.HostIp}:` : ''}${hostPort}:${m[1]}`);
+      if (Number(m[1]) === CONTAINER_PORT) port = Number(hostPort);
+    }
+  }
+
+  const mounts: string[] = [];
+  for (const m of Array.isArray(c?.Mounts) ? c.Mounts : []) {
+    if (m?.Type !== 'bind' || !m?.Source || !m?.Destination) {
+      throw new Error('монтирование не bind — воспроизвести не умею, ничего не тронуто');
+    }
+    mounts.push(`${m.Source}:${m.Destination}${m.RW === false ? ':ro' : ''}`);
+  }
+
+  return {
+    imageRef,
+    ownEnv,
+    publish,
+    mounts,
+    restart: String(c?.HostConfig?.RestartPolicy?.Name ?? ''),
+    memory: Number(c?.HostConfig?.Memory ?? 0),
+    nanoCpus: Number(c?.HostConfig?.NanoCpus ?? 0),
+    port,
+  };
+}
+
+/** Окружение нового контейнера: свои переменные без заменяемых имён + новый набор. */
+export function rekeyEnv(ownEnv: string[], secrets: Array<[string, string]>, dropNames: string[], ownerTgId?: string): string[] {
+  const replaced = new Set<string>([...dropNames, ...secrets.map(([k]) => k)]);
+  if (ownerTgId !== undefined) replaced.add('OWNER_TG_ID');
+  const kept = ownEnv.filter((e) => !replaced.has(envName(e)));
+  const added = secrets.map(([k, v]) => `${k}=${v}`);
+  return ownerTgId !== undefined ? [...kept, ...added, `OWNER_TG_ID=${ownerTgId}`] : [...kept, ...added];
+}
+
+function runArgv(slug: string, cap: Captured, env: string[]): string[] {
+  const argv = ['docker', 'run', '-d', '--name', slug];
+  if (cap.restart && cap.restart !== 'no') argv.push('--restart', cap.restart);
+  for (const m of cap.mounts) argv.push('-v', m);
+  for (const p of cap.publish) argv.push('-p', p);
+  for (const e of env) argv.push('-e', e);
+  if (cap.memory > 0) argv.push(`--memory=${cap.memory}`);
+  if (cap.nanoCpus > 0) argv.push(`--cpus=${(cap.nanoCpus / 1e9).toFixed(3)}`);
+  argv.push(cap.imageRef);
+  return argv;
+}
+
+/** Вернуть старый контейнер. Пустой список — продукт снова со старыми ключами. */
+async function rollback(slug: string, backup: string, deps: ProvisionDeps): Promise<string[]> {
+  try {
+    if (await containerTaken(deps, slug)) await deps.run(['docker', 'rm', '-f', slug]);
+  } catch (e: any) {
+    return [`новый контейнер ${slug} не снят (${reasonOf(e)}); старый лежит под именем ${backup}`];
+  }
+  try {
+    await deps.run(['docker', 'rename', backup, slug]);
+  } catch (e: any) {
+    return [`старый контейнер не вернул имя и лежит под ${backup} (${reasonOf(e)})`];
+  }
+  try {
+    await deps.run(['docker', 'start', slug]);
+  } catch (e: any) {
+    return [`старый контейнер ${slug} не поднялся (${reasonOf(e)})`];
+  }
+  return [];
+}
+
+/** Сменить ключи владельца. Бросает на любом отказе; до `docker stop` — без изменений на хосте. */
+export async function rekeyProduct(job: RekeyJob, deps: ProvisionDeps): Promise<void> {
+  const phase = deps.onPhase ?? (() => {});
+
+  // --- Всё, что может отказать, — до первого изменения на хосте. ---
+  if (!SLUG_RE.test(job.slug)) throw new Error(`слаг не годится: ${JSON.stringify(job.slug)}`);
+  if (job.kind !== 'site' && job.kind !== 'bot') throw new Error(`неизвестная форма продукта: ${JSON.stringify(job.kind)}`);
+  const secrets = validateSecrets(job.secrets);
+  if (job.kind === 'bot' && !secrets.some(([k]) => k === 'BOT_TOKEN')) {
+    throw new Error('в новом наборе нет BOT_TOKEN — бот остался бы без токена, ничего не тронуто');
+  }
+  const dropNames = validateDropNames(job.dropNames);
+  const ownerTgId = ownerTgIdFor(job);
+  const backup = `${job.slug}${REKEY_BACKUP_SUFFIX}`;
+  if (await containerTaken(deps, backup)) {
+    throw new Error(`на хосте остался ${backup} от прерванной смены ключей — сверить руками, ничего не тронуто`);
+  }
+  const cap = await capture(job, deps);
+  if (job.kind === 'site' && cap.port === undefined) {
+    throw new Error(`у сайта ${job.slug} нет опубликованного порта — проверить здоровье нечем, ничего не тронуто`);
+  }
+  const argv = runArgv(job.slug, cap, rekeyEnv(cap.ownEnv, secrets, dropNames, ownerTgId));
+
+  // --- Дальше — разрушающая часть. ---
+  await deps.run(['docker', 'stop', job.slug]);
+  try {
+    await deps.run(['docker', 'rename', job.slug, backup]);
+  } catch (e: any) {
+    await deps.run(['docker', 'start', job.slug]).catch(() => undefined);
+    throw new Error(`docker rename отказал — контейнер возвращён в работу со старыми ключами: ${reasonOf(e)}`);
+  }
+
+  let reason: string | undefined;
+  try {
+    await deps.run(argv);
+    const timeoutMs = deps.waitPortTimeoutMs ?? DEFAULTS.waitPortTimeoutMs;
+    const healthy = job.kind === 'site'
+      ? await deps.waitPort(cap.port as number, timeoutMs)
+      : await (deps.waitInside ?? waitInsideVia(deps))(job.slug, timeoutMs);
+    if (!healthy) reason = `продукт не ответил на /health за ${Math.round(timeoutMs / 1000)} с с новыми ключами`;
+  } catch (e: any) {
+    reason = `docker run с новыми ключами отказал: ${reasonOf(e)}`;
+  }
+
+  if (reason === undefined) {
+    phase(`ключи ${job.slug} сменены`);
+    try {
+      await deps.run(['docker', 'rm', '-f', backup]);
+    } catch (e: any) {
+      // Ключи уже новые, отказывать поздно. Но в старом контейнере лежат
+      // СТАРЫЕ ключи — и следующая смена откажет на нём (см. начало функции).
+      phase(`ВНИМАНИЕ: старый контейнер ${backup} со старыми ключами не убран (${reasonOf(e)}) — убрать руками`);
+    }
+    return;
+  }
+
+  const left = await rollback(job.slug, backup, deps);
+  const err = new Error(
+    `ключи не применены: ${reason}; ` + (left.length ? 'откат не удался' : 'продукт возвращён со старыми ключами'),
+  );
+  if (left.length) (err as any).leftovers = left;
+  throw err;
+}
+```
+
+- [ ] **Step 5: Коммит, прогон — PASS**
+
+```bash
+git -C $B add product-runner/src/host && git -C $B commit -q -m "runner: смена ключей — пересоздание тем же образом с откатом на нездоровье" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, агент): `src/host/rekey.spec.ts src/host/provision.spec.ts src/host/sleep.spec.ts src/host/fake-host.spec.ts`. Expected: PASS. Затем tsc агента.
+
+---
+
+### Task 6: Агент — стирание (`purge`) со строгой проверкой пути
+
+**Files:**
+- Create: `product-runner/src/host/purge.ts`
+- Test: `product-runner/src/host/purge.spec.ts` (новый)
+
+- [ ] **Step 1: Тесты**
+
+`product-runner/src/host/purge.spec.ts`:
+
+```ts
+import { FakeHost, deps } from './fake-host';
+import { provision } from './provision';
+import { productDirFor, purgeProduct } from './purge';
+import { REKEY_BACKUP_SUFFIX } from './rekey';
+
+let host: FakeHost;
+beforeEach(() => {
+  host = new FakeHost();
+});
+
+const seed = (slug: string, kind: 'site' | 'bot' = 'site') =>
+  provision({ slug, kind, name: slug, runnerToken: 'ткн', secrets: kind === 'bot' ? { BOT_TOKEN: 'т' } : {} }, deps(host));
+
+describe('стирание', () => {
+  it('сайт: vhost, сертификат своего домена, контейнер и каталог — всё снято', async () => {
+    await seed('shop');
+    host.certs.add('linkeon-shop');
+    await purgeProduct({ slug: 'shop', kind: 'site' }, deps(host));
+    expect(host.isClean('shop')).toBe(true);
+    expect(host.certs.has('linkeon-shop')).toBe(false);
+    expect(host.removedDirs).toEqual(['/srv/products/shop']);
+  });
+
+  it('vhost снимается ДО контейнера: иначе порт ушёл бы соседу под живым доменом', async () => {
+    await seed('shop');
+    host.calls.length = 0;
+    await purgeProduct({ slug: 'shop', kind: 'site' }, deps(host));
+    const reload = host.calls.findIndex((c) => c[0] === 'systemctl');
+    const rm = host.calls.findIndex((c) => c[0] === 'docker' && c[1] === 'rm');
+    expect(reload).toBeGreaterThanOrEqual(0);
+    expect(rm).toBeGreaterThan(reload);
+  });
+
+  it('бот: контейнер и каталог; nginx и certbot не зовутся', async () => {
+    await seed('bot1', 'bot');
+    host.calls.length = 0;
+    await purgeProduct({ slug: 'bot1', kind: 'bot' }, deps(host));
+    expect(host.isClean('bot1')).toBe(true);
+    expect(host.calls.some((c) => c[0] === 'systemctl' || c[0] === 'certbot' || c[0] === 'rm')).toBe(false);
+  });
+
+  it('спящий (остановленный) контейнер и остаток прерванной смены ключей тоже снимаются', async () => {
+    await seed('bot1', 'bot');
+    await host.run(['docker', 'stop', 'bot1']);
+    await host.run(['docker', 'rename', 'bot1', `bot1${REKEY_BACKUP_SUFFIX}`]);
+    await purgeProduct({ slug: 'bot1', kind: 'bot' }, deps(host));
+    expect(host.containers.has(`bot1${REKEY_BACKUP_SUFFIX}`)).toBe(false);
+    expect(host.isClean('bot1')).toBe(true);
+  });
+
+  it('повтор стирания проходит: потерянный отчёт не превращается в вечный отказ', async () => {
+    await seed('shop');
+    await purgeProduct({ slug: 'shop', kind: 'site' }, deps(host));
+    await expect(purgeProduct({ slug: 'shop', kind: 'site' }, deps(host))).resolves.toBeUndefined();
+  });
+
+  it('соседний продукт не тронут', async () => {
+    await seed('shop');
+    await seed('shop2');
+    await purgeProduct({ slug: 'shop', kind: 'site' }, deps(host));
+    expect(host.dirs.has('/srv/products/shop2')).toBe(true);
+    expect(host.isRunning('shop2')).toBe(true);
+    expect(host.vhostMode('shop2')).toBe('live');
+  });
+
+  it('vhost не снялся — контейнер и каталог остаются: порт держит живой домен', async () => {
+    await seed('shop');
+    host.before = (argv) => {
+      if (argv[0] === 'systemctl') throw new Error('Job for nginx.service failed');
+    };
+    await expect(purgeProduct({ slug: 'shop', kind: 'site' }, deps(host))).rejects.toThrow(/nginx/);
+    expect(host.containers.has('shop')).toBe(true);
+    expect(host.dirs.has('/srv/products/shop')).toBe(true);
+  });
+
+  it('certbot отказал не «нет сертификата» — отказ, контейнер цел', async () => {
+    await seed('shop');
+    host.certs.add('linkeon-shop');
+    host.before = (argv) => {
+      if (argv[0] === 'certbot') throw new Error('Another instance of Certbot is already running');
+    };
+    await expect(purgeProduct({ slug: 'shop', kind: 'site' }, deps(host))).rejects.toThrow(/certbot/i);
+    expect(host.containers.has('shop')).toBe(true);
+  });
+});
+
+describe('путь стирания — только /srv/products/<слаг>', () => {
+  it.each(['', '.', '..', 'a/b', '../etc', 'shop/..', '-rf', 'SHOP', 'shop ', 'shop\nx'])(
+    'слаг %j — отказ до ЛЮБОГО вызова',
+    async (slug) => {
+      await expect(purgeProduct({ slug, kind: 'site' }, deps(host))).rejects.toThrow(/слаг/);
+      expect(host.calls).toHaveLength(0);
+      expect(host.removedDirs).toHaveLength(0);
+    },
+  );
+
+  it.each(['/', '/srv', 'srv/products', '/srv/../products', ''])(
+    'каталог продуктов %j — отказ до ЛЮБОГО вызова',
+    async (productsDir) => {
+      await expect(purgeProduct({ slug: 'shop', kind: 'site' }, deps(host, { productsDir }))).rejects.toThrow(/каталог продуктов/);
+      expect(host.calls).toHaveLength(0);
+    },
+  );
+
+  it('годный путь собирается ровно из каталога и слага, хвостовой слэш не мешает', () => {
+    expect(productDirFor('/srv/products/', 'shop')).toBe('/srv/products/shop');
+    expect(productDirFor('/srv/products', 'a-1')).toBe('/srv/products/a-1');
+  });
+});
+```
+
+- [ ] **Step 2: Коммит, прогон — FAIL** (`Cannot find module './purge'`)
+
+```bash
+git -C $B add product-runner/src/host/purge.spec.ts && git -C $B commit -q -m "test(runner): стирание — порядок шагов и строгий путь (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, агент): `src/host/purge.spec.ts`.
+
+- [ ] **Step 3: Реализация**
+
+`product-runner/src/host/purge.ts`:
+
+```ts
+/**
+ * СТИРАНИЕ УДАЛЁННОГО ПРОДУКТА — задание `purge` (очередь 2).
+ *
+ * Через 30 дней после удаления продукт стирается насовсем: vhost и сертификат
+ * своего домена, контейнер (и остаток прерванной смены ключей), каталог
+ * `/srv/products/<слаг>` с чекаутом и данными. Это единственное место агента,
+ * где каталог продукта удаляется целиком, — поэтому путь собирается и
+ * сверяется здесь, своей проверкой, ДО любого вызова: слаг приехал по сети, а
+ * платит за ошибку эта машина (довод шапки provision.ts про `rm -rf`).
+ *
+ * ## Порядок — как у подчистки заведения
+ *
+ * vhost первым: снятый контейнер возвращает порт в оборот (`freePort` смотрит
+ * в `docker ps`), и живой vhost стёртого продукта отдал бы его домен чужому
+ * продукту. Не снялся vhost — дальше не идём. Каталог — последним: из-под
+ * живого контейнера его удалять нельзя.
+ *
+ * ## Почему не product-vhost
+ *
+ * У скрипта нет режима удаления; файл конфига и перечитывание — ровно те, что
+ * снимает подчистка заведения (cleanup в provision.ts). Сертификат своего
+ * домена — `certbot delete`, «сертификата нет» не отказ (повтор, бот).
+ *
+ * ## Повтор безопасен
+ *
+ * Каждый шаг спрашивает, есть ли что снимать: повторная выдача (потерянный
+ * отчёт) проходит, а не превращается в вечный отказ стирания.
+ */
+import { dirname, isAbsolute, resolve } from 'path';
+import { containerTaken, DEFAULTS, ProvisionDeps, SLUG_RE } from './provision';
+import { certName } from './domain';
+import { REKEY_BACKUP_SUFFIX } from './rekey';
+import { ProductKind } from './skeleton';
+
+export interface PurgeJob {
+  slug: string;
+  kind: ProductKind;
+}
+
+/**
+ * Каталог продукта — или отказ. Проверки, все до первого вызова:
+ *   - слаг по SLUG_RE (нет `/`, `..`, пустоты, ведущего дефиса, заглавных);
+ *   - каталог продуктов абсолютный и не ближе двух уровней к корню (`/` и
+ *     `/srv` целиком — не «каталог продуктов»);
+ *   - нормализованный путь лежит РОВНО на уровень ниже каталога продуктов и
+ *     равен `<каталог>/<слаг>` — `resolve` снимает `..` и лишние слэши, и
+ *     сверяется уже результат.
+ */
+export function productDirFor(productsDir: string, slug: string): string {
+  if (typeof slug !== 'string' || !SLUG_RE.test(slug)) throw new Error(`слаг не годится: ${JSON.stringify(slug)}`);
+  if (typeof productsDir !== 'string' || !productsDir || !isAbsolute(productsDir)) {
+    throw new Error(`каталог продуктов ${JSON.stringify(productsDir)} не абсолютный — стирать нечего`);
+  }
+  const root = resolve(productsDir);
+  if (root.split('/').filter(Boolean).length < 2) {
+    throw new Error(`каталог продуктов ${JSON.stringify(productsDir)} слишком близко к корню — стирать из него нельзя`);
+  }
+  const dir = resolve(root, slug);
+  if (dirname(dir) !== root || dir !== `${root}/${slug}`) {
+    throw new Error(`путь ${dir} вне каталога продуктов ${root} — ничего не тронуто`);
+  }
+  return dir;
+}
+
+const fullText = (e: any): string => `${e?.message ?? e ?? ''}\n${typeof e?.stdout === 'string' ? e.stdout : ''}`;
+
+export async function purgeProduct(job: PurgeJob, deps: ProvisionDeps): Promise<void> {
+  const phase = deps.onPhase ?? (() => {});
+  // Путь — первым делом: слаг не по форме не доходит ни до одного вызова.
+  const dir = productDirFor(deps.productsDir ?? DEFAULTS.productsDir, job.slug);
+  if (job.kind !== 'site' && job.kind !== 'bot') throw new Error(`неизвестная форма продукта: ${JSON.stringify(job.kind)}`);
+
+  if (job.kind === 'site') {
+    const nginxConfDir = deps.nginxConfDir ?? DEFAULTS.nginxConfDir;
+    await deps.run(['rm', '-f', `${nginxConfDir}/${job.slug}.conf`]);
+    await deps.run(['systemctl', 'reload', 'nginx']);
+    try {
+      await deps.run(['certbot', 'delete', '--cert-name', certName(job.slug), '--non-interactive']);
+    } catch (e: any) {
+      if (!/No certificate found/i.test(fullText(e))) {
+        throw new Error(`certbot не удалил сертификат ${certName(job.slug)} — контейнер и каталог не тронуты`);
+      }
+    }
+  }
+
+  for (const name of [job.slug, `${job.slug}${REKEY_BACKUP_SUFFIX}`]) {
+    if (await containerTaken(deps, name)) await deps.run(['docker', 'rm', '-f', name]);
+  }
+
+  if (await deps.exists(dir)) await deps.removeDir(dir);
+  phase(`продукт ${job.slug} стёрт`);
+}
+```
+
+- [ ] **Step 4: Коммит, прогон — PASS**
+
+```bash
+git -C $B add product-runner/src/host/purge.ts && git -C $B commit -q -m "runner: стирание удалённого продукта — vhost, сертификат, контейнер, каталог по строгому пути" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, агент): `src/host/purge.spec.ts src/host/rekey.spec.ts`. Expected: PASS. Затем tsc агента.
+
+---
