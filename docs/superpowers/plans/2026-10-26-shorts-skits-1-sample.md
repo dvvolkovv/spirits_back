@@ -873,7 +873,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 NODE_RUN_DIR=. "$WT"/studio/scripts/node-run.sh "npx ts-node scripts/shorts-skit-plan.ts studio/samples/zalog/skits.json studio/samples/zalog/script.base.json /tmp/skit-plan-check.json && node -e 'const s=require(\"/tmp/skit-plan-check.json\"); for (const k of [\"conflict\",\"punchline\"]) { const p=s.skits[k]; if (p.fingerprint.length !== 16 || p.keyframeFingerprint.length !== 16 || !p.videoPrompt.includes(\"«\") || p.troupeVersion !== \"v1\") throw new Error(k); } if (!s.skits.punchline.keyframePrompt.includes(\"previous scene\")) throw new Error(\"continuity\"); console.log(\"PLAN_OK\", s.skits.punchline.heroes.join(\",\"))' && (npx ts-node scripts/shorts-skit-plan.ts studio/samples/zalog/script.base.json studio/samples/zalog/script.base.json /tmp/skit-plan-bad.json || echo BAD_INPUT_EXIT=\$?)"
 ```
 
-Expected: `skit-plan: /tmp/skit-plan-check.json — conflict <16 hex>, punchline <16 hex>`, затем `PLAN_OK kesha,galina`. Вход без сценок CLI отвергает: `skit-plan: studio/samples/zalog/script.base.json — нужны обе сценки: conflict и punchline`, затем `BAD_INPUT_EXIT=2`.
+Expected: `skit-plan: /tmp/skit-plan-check.json — conflict <16 hex> (кадр <16 hex>), punchline <16 hex> (кадр <16 hex>)`, затем `PLAN_OK kesha,galina`. Вход без сценок CLI отвергает: `skit-plan: studio/samples/zalog/script.base.json — нужны обе сценки: conflict и punchline`, затем `BAD_INPUT_EXIT=2`.
 
 ---
 
@@ -4130,15 +4130,19 @@ Expected: `answer.png  capture.json  question.png`. Если папки съём
 NODE_RUN_DIR=. "$WT"/studio/scripts/node-run.sh "npx ts-node scripts/shorts-skit-plan.ts studio/samples/zalog/skits.json studio/samples/zalog/script.base.json studio/out/skit-sample-1/script.json"
 ```
 
-Expected: `skit-plan: studio/out/skit-sample-1/script.json — conflict <16 hex>, punchline <16 hex>`.
+Expected: `skit-plan: studio/out/skit-sample-1/script.json — conflict <16 hex> (кадр <16 hex>), punchline <16 hex> (кадр <16 hex>)`.
 
 - [ ] **Step 4: Оживление**
 
+Первый живой запуск — с пределом 16 с: по клипу на сценку. Порог сверки речи и нормализация ещё не проверены на голосах Omni, и без предела систематическое несовпадение само сняло бы по три клипа на сценку (≈ $5) до того, как человек увидит распознанный текст.
+
 ```bash
-"$WT"/studio/scripts/node-run.sh "npm run animate -- out/skit-sample-1"
+"$WT"/studio/scripts/node-run.sh "MAX_OMNI_SECONDS=16 npm run animate -- out/skit-sample-1"
 ```
 
-Запускать с `run_in_background`. Expected (через 3–10 минут): строки `animate conflict: попыток 1…3, услышано «…»`, `animate punchline: …`, затем `animate: готово — Omni 16 с, кадров 2 (≈ $1.86)` (больше, если были пересъёмки).
+Запускать с `run_in_background`. Expected (через 3–10 минут): строки `animate conflict: попыток 1, услышано «…»`, `animate punchline: …`, затем `animate: готово — Omni 16 с, кадров 2 (≈ $1.86)`. Если сценка не прошла, а предел выбран, — `omni_budget`; настоящая причина — в строках `animate <сценка>: попытка 1 — …` выше в выводе. Следующие запуски — с пределом, равным `omniSeconds` из `animation.json` плюс 8 на каждый новый клип, который решено снять.
+
+**Перепроверка брака — бесплатно.** После правки `match.ts` или пределов клипа забракованный клип проверяется заново без Omni: переименовать нужный `skits/<отпечаток>/rejected-<время>.mp4` в `raw.mp4` той же папки и запустить шаг 4 с пределом, равным уже потраченному (`omniSeconds` из `animation.json`): принятый клип встанет без новой оплаты, не принятый упрётся в `omni_budget`, ничего не потратив.
 
 Если упало (текст ошибки начинается с имени сценки):
 - `google_quota` — поминутный лимит или квота на сегодня (текст говорит, какой); повторить тем же шагом — после суточной квоты ≈ после 11:00 МСК. Готовая сценка не переснимется, запущенная генерация дождётся;
@@ -4146,7 +4150,11 @@ Expected: `skit-plan: studio/out/skit-sample-1/script.json — conflict <16 hex>
 - `keyframe` без повтора (промпт кадра заблокирован) — переписать `setting` или `opening` сценки в `studio/samples/zalog/skits.json`, шаг 3 и снова шаг 4;
 - `model_gone` или `google_auth` — остановиться и сообщить владельцу;
 - `omni_unreadable` — генерация готова и оплачена, но студия её не забрала: остановиться, поправить разбор ответа в `studio/src/animate/google.ts` тестом на этом ответе и повторить шаг 4 — запуск заберёт ту же генерацию без оплаты;
-- `speech_mismatch` после 3 попыток — посмотреть `heard` в выводе и забракованные клипы `skits/<отпечаток>/rejected-*.mp4`. Если Omni говорит, но SpeechKit систематически пишет иначе (имена, междометия), — это правка нормализации в `match.ts` тестом на этом самом `heard` (задача 17), а не повод перезапускать вслепую. Порог `MATCH_THRESHOLD` трогать только от случайного шума: снижение ради нормализации затупит проверку для всех клипов.
+- `omni_rejected` (фильтр Omni) — переписать `action` или реплики сценки в `studio/samples/zalog/skits.json`, шаг 3 и снова шаг 4, а не перезапускать как есть;
+- `clip_invalid` — посмотреть `skits/<отпечаток>/rejected-*.mp4` и причину в выводе; после правки пределов — перепроверка брака (выше);
+- `stt` — повторить шаг 4: клип оплачен и лежит, запуск только распознает его снова;
+- код 124 или 137 от `node-run.sh` (30 минут) — повторить шаг 4: запуск дождётся сохранённой генерации;
+- `speech_mismatch` — посмотреть `heard` в выводе и забракованные клипы `skits/<отпечаток>/rejected-*.mp4`. Если Omni говорит, но SpeechKit систематически пишет иначе (имена, междометия), — это правка нормализации в `match.ts` тестом на этом самом `heard` (задача 17), а не повод перезапускать вслепую. Порог `MATCH_THRESHOLD` трогать только от случайного шума: снижение ради нормализации затупит проверку для всех клипов.
 
 - [ ] **Step 5: Сборка**
 
