@@ -5,7 +5,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { randomUUID } from "crypto";
-import { sessionMcpConfigName, sweepStaleSessionMcpConfigs } from "./session-mcp-config.mjs";
+import { sessionMcpConfigName, sweepStaleSessionMcpConfigs, LIVE_MAX_AGE_MS, ensureMcpConfigDir, removeLiveConfigs } from "./session-mcp-config.mjs";
 
 const FS_KEY = "0123456789abcdef0123456789abcdef";
 
@@ -80,4 +80,58 @@ test("sweepStaleSessionMcpConfigs: чужие файлы (не конфиг хо
 
 test("sweepStaleSessionMcpConfigs: несуществующая папка — пустой список, не бросает", () => {
   assert.deepEqual(sweepStaleSessionMcpConfigs("/tmp/does-not-exist-" + randomUUID(), 1000, new Set()), []);
+});
+
+// Живой — не вечный: если close у дочернего процесса так и не пришёл, файл с
+// токенами не должен лежать до рестарта.
+test("sweepStaleSessionMcpConfigs: живой файл старше LIVE_MAX_AGE_MS удаляется и выходит из Set", () => {
+  const DIR = fs.mkdtempSync(path.join(os.tmpdir(), "session-mcp-sweep-"));
+  try {
+    const live = path.join(DIR, sessionMcpConfigName(FS_KEY, randomUUID()));
+    fs.writeFileSync(live, "{}");
+    const oldSec = (Date.now() - LIVE_MAX_AGE_MS - 60 * 1000) / 1000;
+    fs.utimesSync(live, oldSec, oldSec);
+    const set = new Set([live]);
+    const removed = sweepStaleSessionMcpConfigs(DIR, 30 * 60 * 1000, set);
+    assert.deepEqual(removed, [path.basename(live)]);
+    assert.equal(fs.existsSync(live), false);
+    assert.equal(set.has(live), false);
+  } finally {
+    fs.rmSync(DIR, { recursive: true, force: true });
+  }
+});
+
+// Каталог могут снести посреди работы (rm -rf /tmp/agent-uploads/*) — без
+// него каждый ход молча остался бы без инструментов до рестарта.
+test("ensureMcpConfigDir: снесённый каталог создаётся заново, права — 0700 и у существующего", () => {
+  const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "session-mcp-dir-"));
+  try {
+    const dir = path.join(ROOT, "mcp");
+    ensureMcpConfigDir(dir);
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+    fs.chmodSync(dir, 0o755);
+    ensureMcpConfigDir(dir);
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+    fs.rmSync(dir, { recursive: true });
+    ensureMcpConfigDir(dir);
+    assert.equal(fs.existsSync(dir), true);
+  } finally {
+    fs.rmSync(ROOT, { recursive: true, force: true });
+  }
+});
+
+// Остановка процесса (pm2 restart) — process.exit без finally ходов.
+test("removeLiveConfigs: удаляет все живые конфиги и чистит Set; пропавший файл не мешает", () => {
+  const DIR = fs.mkdtempSync(path.join(os.tmpdir(), "session-mcp-sweep-"));
+  try {
+    const a = path.join(DIR, sessionMcpConfigName(FS_KEY, randomUUID()));
+    const b = path.join(DIR, sessionMcpConfigName(FS_KEY, randomUUID()));
+    fs.writeFileSync(a, "{}");
+    const set = new Set([a, b]);
+    removeLiveConfigs(set);
+    assert.equal(fs.existsSync(a), false);
+    assert.equal(set.size, 0);
+  } finally {
+    fs.rmSync(DIR, { recursive: true, force: true });
+  }
 });

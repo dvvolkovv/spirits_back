@@ -13,7 +13,7 @@ import { costBaseline, runCost } from "./turn-cost.mjs";
 import { createUndelivered, withCarried } from "./undelivered-files.mjs";
 import { createRelayAuth } from "./relay-auth.mjs";
 import { LINKEON_TOOLS, linkeonServer, bearerServer } from "./linkeon-mcp.mjs";
-import { sessionMcpConfigName, sweepStaleSessionMcpConfigs } from "./session-mcp-config.mjs";
+import { sessionMcpConfigName, sweepStaleSessionMcpConfigs, ensureMcpConfigDir, removeLiveConfigs } from "./session-mcp-config.mjs";
 import { snapshotDir, changedFiles } from "./turn-files.mjs";
 
 const app = express();
@@ -29,7 +29,7 @@ const MCP_CONFIG_DIR = path.join(UPLOAD_DIR, "mcp");
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-fs.mkdirSync(MCP_CONFIG_DIR, { recursive: true, mode: 0o700 });
+ensureMcpConfigDir(MCP_CONFIG_DIR);
 
 app.use(cors());
 // Ходы принимаются только от бэков с секретом (relay-auth.mjs). Файлы —
@@ -223,8 +223,11 @@ function persistNow() {
     fs.writeFileSync(SESSION_STORE_PATH, JSON.stringify(Object.fromEntries(sessionMap)));
   } catch { /* остановке помешать не можем */ }
 }
+// Конфиги идущих ходов несут чужие токены, а process.exit до finally ходов
+// не доходит — убираются здесь (liveMcpConfigPaths объявлен ниже, сигнал
+// приходит уже после инициализации модуля).
 for (const sig of ["SIGTERM", "SIGINT"]) {
-  process.on(sig, () => { persistNow(); process.exit(0); });
+  process.on(sig, () => { persistNow(); removeLiveConfigs(liveMcpConfigPaths); process.exit(0); });
 }
 
 // Ротация раздутых сессий: бесконечный --resume копит мегабайты английского
@@ -576,6 +579,10 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   const wantLinkeon = !!linkeonSrv;
   const wantTalerid = !!taleridSrv;
   const wantProducts = !!productsSrv;
+  // Поле пришло, но отбито — без этой строки инструменты пропадали бы молча.
+  for (const [name, srv] of [["linkeon", linkeonSrv], ["talerid", taleridSrv], ["products", productsSrv]]) {
+    if (req.body[name + "_token"] && !srv) console.log("сервер " + name + " не подключён: токен или адрес отбиты");
+  }
 
   if (wantLinkeon || wantTalerid || wantProducts) {
     try {
@@ -592,6 +599,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       // мог удалить файл этого, ещё живого. Каталог — MCP_CONFIG_DIR, свой,
       // не вперемешку с загрузками пользователя.
       sessionMcpPath = path.join(MCP_CONFIG_DIR, sessionMcpConfigName(fsKey, randomUUID()));
+      ensureMcpConfigDir(MCP_CONFIG_DIR);
       fs.writeFileSync(sessionMcpPath, JSON.stringify(base), { mode: 0o600 });
       // В Set — сразу после успешной записи: с этого момента уборка
       // (sweepStaleMcpConfigs) обязана пропускать этот файл, что бы ни
@@ -1099,10 +1107,8 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
     // Remove the per-session MCP config (it holds the user's Bearer tokens —
     // linkeon, talerid, products). Файл ОДИН на всех постояльцев: уборка по старому
     // talerid-специфичному имени оставляла бы токены на диске в открытом виде.
-    // Из liveMcpConfigPaths — ДО unlink: иначе параллельная уборка (другой
-    // таймер того же процесса) могла бы между delete и unlink решить, что
-    // файл уже не живой, и всё равно его тронуть — безвредно (тот же файл),
-    // но порядок на будущее аккуратнее.
+    // Из liveMcpConfigPaths и с диска — синхронно, в одном тике: уборка между
+    // ними вклиниться не может.
     if (sessionMcpPath) {
       liveMcpConfigPaths.delete(sessionMcpPath);
       try { fs.unlinkSync(sessionMcpPath); } catch {}
