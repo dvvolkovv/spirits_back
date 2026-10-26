@@ -166,7 +166,7 @@ describe('инструмент продуктов для локального CL
     it('поля справки едут в токен инструмента продуктов', () => {
       const r = productsCliMcp('u-test', 'telegram', { lang: 'de', client: 'telegram', agent: 'staff' });
       expect(verifyProductToolToken(bearerOf(r).replace(/^Bearer /, ''))).toEqual({
-        userId: 'u-test', channel: 'telegram', lang: 'de', client: 'telegram', agent: 'staff',
+        userId: 'u-test', channel: 'telegram', lang: 'de', client: 'telegram', agent: 'staff', turn: null,
       });
     });
 
@@ -176,7 +176,7 @@ describe('инструмент продуктов для локального CL
       expect(r.mcpServers.products.url).toBe(productsCliMcp('u-owner', 'telegram').mcpServers.products.url);
       expect(r.toolName).toBe(LINKEON_HELP_CLI_TOOL_NAME);
       const claims = verifyProductToolToken(String(r.mcpServers.products.headers?.Authorization).replace(/^Bearer /, ''));
-      expect(claims).toEqual({ userId: 'u-owner', channel: 'telegram', lang: 'ru', client: 'telegram', scope: 'help', agent: 'custom' });
+      expect(claims).toEqual({ userId: 'u-owner', channel: 'telegram', lang: 'ru', client: 'telegram', scope: 'help', agent: 'custom', turn: null });
     });
   });
 });

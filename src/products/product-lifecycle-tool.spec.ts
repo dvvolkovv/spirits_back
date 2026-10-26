@@ -127,6 +127,18 @@ describe('новые действия инструмента', () => {
     expect(lifecycle.restore).not.toHaveBeenCalled();
   });
 
+  // Ход без метки (загрузка файла, старый токен): сервер не прикрепит
+  // карточку к ответу — обещать «под ответом» модели нельзя.
+  it('без метки хода — карточка в кабинете, а не «под ответом»', async () => {
+    const h = harness();
+    const bot = await h.svc.execute('u1', { action: 'create', kind: 'bot', name: 'Бот' }, 'web', null);
+    expect(bot.say).toMatch(/Студия → Продукты/);
+    expect(bot.say).not.toMatch(/Под твоим ответом/);
+    const del = await h.svc.execute('u1', { action: 'delete', product: 'магазин' }, 'web', null);
+    expect(del.say).toMatch(/Студия → Продукты/);
+    expect(del.say).not.toMatch(/Под твоим ответом/);
+  });
+
   it('create bot — канал telegram: карточка приходит отдельным сообщением', async () => {
     const h = harness();
     const r = await h.svc.execute('u1', { action: 'create', kind: 'bot', name: 'Бот' }, 'telegram', 'turn-1');

@@ -200,7 +200,7 @@ describe('uploadAndChat: файл уходит в сессию разговор�
   it('везёт поля точки продуктов — продукты, файлы и справка, как у текстового хода', async () => {
     const f = await upload(makePg(), { ui: JSON.stringify({ activity: true, ask: true }) });
     expect(f.products_mcp_url).toMatch(/\/webhook\/mcp\/products$/);
-    expect(verifyProductToolToken(f.products_token)).toEqual({ userId: 'u1', channel: 'web', lang: 'ru', client: 'web', agent: 'staff' });
+    expect(verifyProductToolToken(f.products_token)).toEqual({ userId: 'u1', channel: 'web', lang: 'ru', client: 'web', agent: 'staff', turn: null });
   });
 
   it('без ui (Flutter) — клиент app', async () => {

@@ -57,6 +57,6 @@ describe('поля инструмента продуктов для релея',
 
   it('язык, клиент и вид ассистента для справки едут в подписи токена', () => {
     const f = productsRelayFields('u-test', { lang: 'en', client: 'app', agent: 'custom' });
-    expect(verifyProductToolToken(f.products_token)).toEqual({ userId: 'u-test', channel: 'web', lang: 'en', client: 'app', agent: 'custom' });
+    expect(verifyProductToolToken(f.products_token)).toEqual({ userId: 'u-test', channel: 'web', lang: 'en', client: 'app', agent: 'custom', turn: null });
   });
 });
