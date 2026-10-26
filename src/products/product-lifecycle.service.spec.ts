@@ -358,6 +358,14 @@ describe('откат и первая правка', () => {
     expect(h.turns.revert).toHaveBeenCalledWith({ productId: 'p1', turnId: 't-last', userId: 'u1', channel: 'telegram' });
   });
 
+  it('turnId не похож на uuid — bad_turn без обращения к базе (M6)', async () => {
+    const h = harness();
+    const r = await h.svc.revert({ userId: 'u1', productId: 'p1', turnId: 'не-uuid-а-что-то-от-модели', channel: 'web' });
+    expect(r).toEqual({ ok: false, reason: 'bad_turn', message: 'Такой правки у продукта нет' });
+    expect(h.turns.revert).not.toHaveBeenCalled();
+    expect(h.calls.some((c) => c.sql.includes('product_turns'))).toBe(false);
+  });
+
   it('первая правка ставится поднявшимся продуктам, сбой одной не роняет остальные', async () => {
     const h = harness({ pg: (sql) => (sql.includes('WITH picked AS') ? { rows: [
       { id: 'p1', user_id: 'u1', first_prompt: 'А', first_prompt_channel: 'telegram' },
