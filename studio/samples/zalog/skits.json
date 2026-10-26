@@ -1,0 +1,26 @@
+{
+  "conflict": {
+    "cast": [
+      { "hero": "galina", "role": "хозяйка квартиры" },
+      { "hero": "kesha", "role": "жилец" }
+    ],
+    "setting": "shabby hallway of a rented flat, an open door, a suitcase by the wall",
+    "action": "The capybara with a suitcase holds out a paw for the deposit. The goose blocks the doorway, jabs a wing at a tiny scuff on the wallpaper, hisses and flaps her wings. At the end the capybara calmly takes out a phone.",
+    "lines": [
+      { "hero": "galina", "text": "Обои потёрли! Залог мой, весь до копейки!" },
+      { "hero": "kesha", "text": "Спокойно. Спрошу у юриста." }
+    ]
+  },
+  "punchline": {
+    "cast": [
+      { "hero": "kesha", "role": "жилец" },
+      { "hero": "galina", "role": "хозяйка квартиры" }
+    ],
+    "setting": "shabby hallway of a rented flat, an open door, a suitcase by the wall",
+    "action": "The capybara calmly holds the phone up towards the goose like a document. The goose freezes, her feathers stand on end, the bunch of keys drops from her wing, then she slowly lowers her wings.",
+    "lines": [
+      { "hero": "kesha", "text": "Три года — это нормальный износ. Залог верните.", "box": 1 },
+      { "hero": "galina", "text": "Га-га… ладно." }
+    ]
+  }
+}
