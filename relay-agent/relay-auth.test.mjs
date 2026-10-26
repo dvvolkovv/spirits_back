@@ -2,6 +2,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import express from "express";
+import http from "node:http";
+import multer from "multer";
 import { parseSecrets, parseMode, isAuthorized, createRelayAuth } from "./relay-auth.mjs";
 
 // Реальные секреты — 64-символьный hex (32 случайных байта); в тестах
@@ -186,4 +188,73 @@ test("тихий отчёт о переменах: ошибка чтения —
   t.t = 62_000;
   call();                                    // та же ошибка снова — не повторяем
   assert.equal(logs.filter((l) => l.includes("relay-secrets")).length, 1);
+});
+
+// Сырой http.request — в отличие от fetch(), не нормализует путь (точки,
+// двойные слэши) на стороне клиента: проверяем, что сервер сам не пропустит
+// такие пути как «свободные».
+function rawRequest(base, method, rawPath, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(base);
+    const req = http.request(
+      { hostname: u.hostname, port: u.port, method, path: rawPath, headers },
+      (res) => {
+        res.resume();
+        res.on("end", () => resolve(res.statusCode));
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+test("OPTIONS — без проверки (preflight)", async () => {
+  const s = await serve({ M: "enforce" }, { t: 0 });
+  try {
+    const status = await rawRequest(s.base, "OPTIONS", "/chat");
+    assert.notEqual(status, 401);
+  } finally { await s.close(); }
+});
+
+test("log: верный секрет — тишина, ни строки в лог", async () => {
+  const t = { t: 0 };
+  const s = await serve({ S: `${LONG_A}\n`, M: "log\n" }, t);
+  try {
+    const r = await fetch(`${s.base}/chat`, { method: "POST", headers: { "X-Agent-Secret": LONG_A } });
+    assert.equal(r.status, 200);
+    assert.deepEqual(s.logs, []);
+  } finally { await s.close(); }
+});
+
+test("enforce: нестандартные пути не проходят как разрешённые (сырой http, без заголовка)", async () => {
+  const s = await serve({ S: `${LONG_A}\n`, M: "enforce" }, { t: 0 });
+  try {
+    for (const p of ["/CHAT", "/chat/", "//chat", "/files/../chat"]) {
+      const status = await rawRequest(s.base, "POST", p);
+      assert.ok(status === 401 || status === 404, `${p} → ожидали 401 или 404, получили ${status}`);
+    }
+    const headStatus = await rawRequest(s.base, "HEAD", "/session/x/files");
+    assert.equal(headStatus, 401);
+  } finally { await s.close(); }
+});
+
+test("enforce: 401 раньше multer — тело запроса не разбирается", async () => {
+  let multerRan = false;
+  const app = express();
+  app.use(createRelayAuth({
+    secretsPath: "S", modePath: "M",
+    readFile: (p) => {
+      if (p === "M") return "enforce";
+      const e = new Error("ENOENT"); e.code = "ENOENT"; throw e;
+    },
+    now: () => 0, log: () => {},
+  }));
+  app.post("/chat", multer().single("file"), (req, res) => { multerRan = true; res.json({ ok: true }); });
+  const server = await new Promise((r) => { const srv = app.listen(0, "127.0.0.1", () => r(srv)); });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const status = await rawRequest(base, "POST", "/chat", { "content-type": "multipart/form-data; boundary=x" });
+    assert.equal(status, 401);
+    assert.equal(multerRan, false);
+  } finally { await new Promise((r) => server.close(r)); }
 });
