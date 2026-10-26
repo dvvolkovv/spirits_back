@@ -10,6 +10,7 @@ import {
   Logger,
 } from '@nestjs/common';
 import { Request, Response } from 'express';
+import { createHash, timingSafeEqual } from 'crypto';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
@@ -33,6 +34,18 @@ export type McpCaller = { kind: 'token'; userId: string } | { kind: 'shared' };
 /** Поле userId — только в схеме переходного пути и без примера номера. */
 const LEGACY_USER_ID_DESCRIPTION =
   'Current user id from the system context. Required on the transitional shared-secret path — the server uses it to bill tokens and attribute history.';
+
+/**
+ * Сравнение без утечки через тайминг. SHA-256 обеих строк — fixed-length
+ * вход для timingSafeEqual: сами буферы `a`/`b` сравнивать нельзя, у
+ * node:crypto timingSafeEqual буферы разной длины бросают RangeError, а не
+ * честно отвечают «не равны».
+ */
+function safeEqual(a: string, b: string): boolean {
+  const ha = createHash('sha256').update(a).digest();
+  const hb = createHash('sha256').update(b).digest();
+  return timingSafeEqual(ha, hb);
+}
 
 /**
  * Инструменты Linkeon для ассистентов релея (mcp__linkeon__*). Спека:
@@ -63,7 +76,7 @@ export class McpController {
   private caller(authHeader?: string): McpCaller {
     const header = authHeader || '';
     const shared = process.env.MCP_SECRET || '';
-    if (shared && header === `Bearer ${shared}`) return { kind: 'shared' };
+    if (shared && safeEqual(header, `Bearer ${shared}`)) return { kind: 'shared' };
     const raw = header.replace(/^Bearer\s+/i, '').trim();
     if (!raw) throw new UnauthorizedException('Нет токена');
     try {
@@ -125,6 +138,10 @@ export class McpController {
     let userId: string;
     if (caller.kind === 'token') {
       userId = caller.userId;
+      // Строка-счётчик, без значений: видно, что релей (или старая его копия)
+      // ещё пишет userId в аргумент, но какой именно — не нужно и незачем
+      // печатать (ни пользователя из подписи, ни чужого userId из аргумента).
+      if (argUserId) this.logger.warn(`mcp: userId в аргументах проигнорирован, tool=${String(name).slice(0, 64)}`);
     } else {
       // Без пользователя и аргументов: по этой строке видно, что переходный
       // путь ещё кто-то зовёт (шаг 3 выката).
