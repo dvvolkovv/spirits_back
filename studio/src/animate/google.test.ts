@@ -105,6 +105,17 @@ test('HTTP-ошибки Google: квота, ключ и снятая модел�
   assert.ok(isErr('keyframe', true)(googleHttpError('keyframe', 500, 'oops')));
 });
 
+test('свой ключ любого формата вырезается из текста ошибки буквально', async () => {
+  const key = 'k-live-0123456789-not-an-aiza-key';
+  const { deps } = fake([{ status: 403, body: JSON.stringify({ error: { code: 403, message: `Consumer 'api_key:${key}' has been suspended.` } }) }]);
+  deps.apiKey = key;
+  await assert.rejects(generateKeyframe(deps, 'p', []), (e: unknown) => e instanceof StudioError && !e.message.includes(key) && /<ключ>/.test(e.message));
+});
+
+test('429 без вида лимита — не «жди до утра», а повтор через несколько минут', () => {
+  assert.match(googleHttpError('omni', 429, '{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"Resource has been exhausted (e.g. check quota)."}}').message, /вид лимита Google не указал/);
+});
+
 test('ключ из ответа Google в сообщение не попадает — и на границе обрезки', () => {
   const body = JSON.stringify({ error: { code: 403, message: "Consumer 'api_key:AIzaSyTESTKEY0123456789abcdefghij' has been suspended." } });
   assert.doesNotMatch(googleHttpError('omni', 403, body).message, /AIzaSyTESTKEY/);
@@ -211,13 +222,40 @@ test('скачивание: сбой сети — следующий опрос,
   const a = fake([byLink(GOOGLE_FILE), new TypeError('fetch failed'), done(mp4)]);
   a.deps.pollTimeoutMs = 100;
   assert.deepEqual(await waitClip(a.deps, 'i'), mp4);
+  // 401/403 — студия не может забрать оплаченный клип: id сохраняется (omni_unreadable), новой генерации нет.
   const b = fake([byLink(GOOGLE_FILE), { status: 403, body: 'forbidden' }]);
-  await assert.rejects(waitClip(b.deps, 'i'), (e: unknown) => isErr('omni_failed', false)(e) && /по ссылке не отдаётся: HTTP 403/.test((e as Error).message));
+  await assert.rejects(waitClip(b.deps, 'i'), (e: unknown) => isErr('omni_unreadable', false)(e) && /по ссылке не отдаётся: HTTP 403/.test((e as Error).message));
+  // 404/410 — файла больше нет: новая генерация оправданна.
+  const c = fake([byLink(GOOGLE_FILE), { status: 404, body: 'gone' }]);
+  await assert.rejects(waitClip(c.deps, 'i'), (e: unknown) => isErr('omni_failed', false)(e) && /файла по ссылке уже нет/.test((e as Error).message));
+  const bad = fake([byLink('not a url')]);
+  await assert.rejects(waitClip(bad.deps, 'i'), (e: unknown) => isErr('omni_unreadable', false)(e) && /ссылка на клип неверна/.test((e as Error).message));
 });
 
-test('ответ неожиданной формы — не TypeError, а понятная ошибка', async () => {
-  const { deps } = fake([{ body: { status: 'completed', steps: { type: 'model_output' } } }]);
-  await assert.rejects(waitClip(deps, 'i'), isErr('omni_rejected', true));
+test('скачивание: ключ уходит только по https', async () => {
+  const plain = fake([byLink('http://generativelanguage.googleapis.com/v1beta/files/abc:download'), () => new Response(new Uint8Array(Buffer.from('MP4')), { status: 200 })]);
+  await waitClip(plain.deps, 'i');
+  assert.equal((plain.calls[1].init?.headers as Record<string, string>)['x-goog-api-key'], undefined);
+});
+
+test('готовый ответ неожиданной формы — omni_unreadable без повтора: генерация оплачена, её надо забрать, а не снимать заново', async () => {
+  const a = fake([{ body: { status: 'completed', steps: { type: 'model_output' } } }]);
+  await assert.rejects(waitClip(a.deps, 'int-7'), (e: unknown) => isErr('omni_unreadable', false)(e) && /int-7/.test((e as Error).message) && /нет ни видео, ни текста/.test((e as Error).message));
+  const b = fake([{ body: { status: 'completed', steps: [{ type: 'model_output', content: [{ type: 'video', file_uri: 'x' }] }] } }]);
+  await assert.rejects(waitClip(b.deps, 'i'), (e: unknown) => isErr('omni_unreadable', false)(e) && /поля: type, file_uri/.test((e as Error).message));
+});
+
+test('опрос своей генерации отвергнут (400) — не фильтр контента, а omni_unreadable', async () => {
+  const { deps } = fake([{ status: 400, body: '{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"bad name"}}' }]);
+  await assert.rejects(waitClip(deps, 'i'), (e: unknown) => isErr('omni_unreadable', false)(e) && /опрос отвергнут/.test((e as Error).message));
+});
+
+test('опрос не выходит за срок: сон обрезается остатком', async () => {
+  const { deps } = fake([inProgress, inProgress, inProgress]);
+  deps.pollEveryMs = 70;
+  deps.pollTimeoutMs = 100;
+  await assert.rejects(waitClip(deps, 'i'), isErr('omni_timeout', true));
+  assert.equal(deps.now!(), 100);
 });
 
 test('отказ фильтра приходит массивом errors — повторяемый omni_rejected, и с числовым кодом 3', async () => {

@@ -55,6 +55,22 @@ test('междометия через дефис и без гласных не �
   assert.deepEqual(speechCheck(['Ш-ш-ш! Залог мой!'], 'залог мой'), { ok: true, share: 1, silentLines: [] });
 });
 
+test('междометие или крик последним предложением не дают ложного отказа, если SpeechKit их не записал', () => {
+  for (const line of ['Залог мой! Ага!', 'Обои потёрли! Ааа!', 'Залог мой! Ого!', 'Залог мой! Кря!', 'Залог мой! Гав-гав!']) {
+    const r = speechCheck([line], line.split('!')[0]);
+    assert.equal(r.ok, true, `${line}: ${JSON.stringify(r)}`);
+  }
+  // Настоящее последнее предложение по-прежнему ловится.
+  assert.deepEqual(speechCheck(['Спокойно. Спрошу у юриста.'], 'спокойно').silentLines, [0]);
+});
+
+test('повтор слога через тире или неразрывный дефис склеивается, как через дефис', () => {
+  for (const dash of ['-', String.fromCharCode(0x2011), String.fromCharCode(0x2013)]) {
+    const r = speechCheck([`Ой${dash}ой${dash}ой! Залог мой!`], 'залог мой');
+    assert.equal(r.ok, true, `${JSON.stringify(dash)}: ${JSON.stringify(r)}`);
+  }
+});
+
 test('знак ударения не делит слово', () => {
   assert.deepEqual(speechWords('за' + String.fromCharCode(0x301) + 'лог'), ['залог']);
 });
