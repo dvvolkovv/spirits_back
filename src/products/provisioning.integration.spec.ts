@@ -1880,6 +1880,7 @@ maybe('провижининг против живого Postgres', () => {
     // Ревью, пункт 11 (владелец-дружественный счёт). failedProduct() ставит
     // задание kind='provision' в status='failed' — это и есть «никогда не
     // достиг running». Такой продукт не должен считаться в FREE_MONTH_PRODUCTS.
+    await ensureHost('clients');
     const userId = 'u-free-month-marker';
     const failed = await failedProduct({ slug: 'fm-never-ran' });
     await pool.query('UPDATE products SET user_id = $2 WHERE id = $1', [failed.id, userId]);
