@@ -262,10 +262,12 @@ export function resolveEmptyFileLinks(
 export interface AgentReplyOpts {
   /**
    * Инструменты Linkeon (mcp__linkeon__*) от имени userId — токен хода и
-   * папка по fs_key (linkeon-relay-fields.ts). По умолчанию — да: у рутин,
-   * «Пути», голосовых документов, итогов и консультаций звонка пользователь
-   * настоящий. Нет — у пробы качества (quality-monitor): служебный ход
-   * тестового аккаунта.
+   * папка по fs_key (linkeon-relay-fields.ts). По умолчанию — НЕТ (ревью
+   * 26.10.2026): голосовые фоновые пути (итоги звонка, сжатие консультации,
+   * голосовая заметка и документ) и проба качества ассистента об инструментах
+   * даже не спрашивают, и получать от них токен ни к чему. Явно true — только
+   * там, где ассистент реально может позвать инструмент: рутины, «Путь» и
+   * консультация специалиста в звонке (не её сжатие, voice_condense).
    */
   linkeonTools?: boolean;
 }
@@ -2607,8 +2609,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const relaySid = sessionIdOverride ||
       relaySessionKey(userId, assistantId, await this.language.resolveUserLanguage(userId));
     fd.append('sessionId', relaySid);
-    // Инструменты Linkeon — от имени userId по токену хода (см. AgentReplyOpts).
-    if (opts.linkeonTools !== false) appendLinkeonFields(fd, linkeonRelayFields(userId, relaySid));
+    // Инструменты Linkeon — только когда вызывающий явно сказал linkeonTools:
+    // true (см. AgentReplyOpts); по умолчанию — нет.
+    if (opts.linkeonTools === true) appendLinkeonFields(fd, linkeonRelayFields(userId, relaySid));
     const chunks: string[] = [];
     const usage: SdkUsageTotals = {
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
