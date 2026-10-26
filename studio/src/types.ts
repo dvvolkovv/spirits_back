@@ -65,6 +65,8 @@ export interface Script {
   lines: ScriptLine[];
   /** Число ассистентов — из базы; его же словами произносит финальная реплика (сценарий пишет бэкенд). */
   final: { assistantsCount: number; disclaimer?: string };
+  /** Сценки — у ролика формата «Сценки». Без них ролик собирается по-старому (композиция Short). */
+  skits?: Record<SkitKind, SkitPlan>;
 }
 
 export interface VoicedLine extends ScriptLine {
@@ -107,4 +109,91 @@ export type ShortProps = {
   boxes: ImageBox[];
   timeline: Timeline;
   final: { assistantsCount: number; disclaimer?: string };
+};
+
+// ── Сценки (спека docs/superpowers/specs/2026-10-26-shorts-skits-design.md) ──
+
+export type SkitKind = 'conflict' | 'punchline';
+
+export interface SkitLine {
+  /** id героя труппы (src/shorts/short-troupe.ts бэкенда). */
+  hero: string;
+  text: string;
+  /** Абзац ответа, на который опирается утверждение по существу (только в развязке). */
+  box?: number;
+}
+
+export interface Skit {
+  cast: { hero: string; role: string }[];
+  setting: string;
+  action: string;
+  lines: SkitLine[];
+}
+
+/** Сценка, готовая к оживлению: промпты собрал бэкенд (src/shorts/short-skit-prompts.ts, SkitPlan). */
+export interface SkitPlan {
+  skit: Skit;
+  /** Версия листа труппы: портреты — assets/troupe/<версия>/<id>.png. */
+  troupeVersion: string;
+  /** Чьи портреты нужны кадру — по порядку состава, без повторов. */
+  heroes: string[];
+  keyframePrompt: string;
+  videoPrompt: string;
+  /** Отпечаток промптов и версии труппы: клип с тем же отпечатком не переснимается. */
+  fingerprint: string;
+}
+
+/** Время реплики сценки в клипе. */
+export interface SkitCue {
+  line: number;
+  startMs: number;
+  endMs: number;
+}
+
+/** Готовая сценка. Пути — относительно папки ролика. */
+export interface SkitClip {
+  fingerprint: string;
+  keyframe: string;
+  clip: string;
+  durationMs: number;
+  /** Что распознал SpeechKit в клипе. */
+  heard: string;
+  cues: SkitCue[];
+  /** Сколько клипов Omni ушло на эту сценку. */
+  attempts: number;
+}
+
+/** animation.json папки ролика — итог задания animate. */
+export interface Animation {
+  /** Секунды Omni, потраченные на ролик, со всеми попытками. */
+  omniSeconds: number;
+  skits: Partial<Record<SkitKind, SkitClip>>;
+}
+
+export interface SkitTimeline {
+  segments: Segment[];
+  scenes: Record<SkitKind | 'question' | 'answer' | 'final', SceneSpan>;
+  totalFrames: number;
+}
+
+/** Субтитр с абсолютным кадром начала — у реплик сценок. */
+export interface ClipCue {
+  key: string;
+  text: string;
+  from: number;
+  duration: number;
+}
+
+/** Пропсы композиции SkitShort. Как и ShortProps — type, а не interface. */
+export type SkitShortProps = {
+  fps: number;
+  hook: string;
+  badge?: string;
+  questionShot: string;
+  answerShot: string;
+  answerShotHeight: number;
+  boxes: ImageBox[];
+  timeline: SkitTimeline;
+  final: { assistantsCount: number; disclaimer?: string };
+  clips: Record<SkitKind, { video: string; cues: ClipCue[] }>;
 };

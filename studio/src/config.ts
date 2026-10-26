@@ -15,6 +15,8 @@ export interface StudioConfig {
   debugSecret: string;
   speechkitKey: string;
   speechkitFolder: string;
+  /** Ключ Google (Nano Banana Pro и Omni) — заданию animate. */
+  googleKey: string;
   /** База и хранилище рабочего процесса (studio/src/worker); вне него — пусто. */
   databaseUrl: string;
   minio: MinioConfig | null;
@@ -31,9 +33,10 @@ function required(env: Env, name: string): string {
 /**
  * Разбор окружения без побочных эффектов: файл .env читает вызывающий
  * (`import 'dotenv/config'`). needs говорит, какие ключи обязательны:
- * съёмке — демо-номер и секрет debug-ручек, озвучке — SpeechKit.
+ * съёмке — демо-номер и секрет debug-ручек, озвучке — SpeechKit,
+ * оживлению сценок — ключ Google.
  */
-export function parseConfig(env: Env, needs: { capture: boolean; tts: boolean; worker?: boolean }): StudioConfig {
+export function parseConfig(env: Env, needs: { capture: boolean; tts: boolean; worker?: boolean; animate?: boolean }): StudioConfig {
   const cabinetUrl = (env.CABINET_URL?.trim() || 'https://test.linkeon.io').replace(/\/+$/, '');
   const apiUrl = (env.API_URL?.trim() || cabinetUrl).replace(/\/+$/, '');
   let basicAuth: StudioConfig['basicAuth'] = null;
@@ -52,6 +55,7 @@ export function parseConfig(env: Env, needs: { capture: boolean; tts: boolean; w
     debugSecret: needs.capture ? required(env, 'DEBUG_SECRET') : '',
     speechkitKey: needs.tts ? required(env, 'YANDEX_SPEECHKIT_API_KEY') : '',
     speechkitFolder: needs.tts ? required(env, 'YANDEX_TTS_FOLDER_ID') : '',
+    googleKey: needs.animate === true ? required(env, 'GOOGLE_AI_API_KEY') : (env.GOOGLE_AI_API_KEY?.trim() ?? ''),
     databaseUrl: worker ? required(env, 'DATABASE_URL') : '',
     minio: worker
       ? {

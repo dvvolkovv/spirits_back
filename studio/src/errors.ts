@@ -22,6 +22,16 @@ export type StudioErrorCode =
   | 'tts'
   | 'video_invalid'
   | 'no_input'
+  | 'keyframe'
+  | 'omni_rejected'
+  | 'omni_failed'
+  | 'omni_budget'
+  | 'google_quota'
+  | 'google_auth'
+  | 'model_gone'
+  | 'speech_mismatch'
+  | 'clip_invalid'
+  | 'stt'
   | 'unknown';
 
 /**
