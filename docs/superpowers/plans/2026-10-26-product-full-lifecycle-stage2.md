@@ -4920,7 +4920,7 @@ Run (нода, фронт): `src/components/products src/services/productActions
 ### Task 19: Фронт — тексты карточки ключей и формы Студии, 7 языков
 
 **Files (фронт):**
-- Modify: `src/i18n/locales/{ru,en,de,fr,es,pt,zh}.json` (`products.action.keys.*`, `products.new.extraSecrets.hint`)
+- Modify: `src/i18n/locales/{ru,en,de,fr,es,pt,zh}.json` (`products.action.keys.*`, `products.action.keys.errors.*` — 19 причин отказа, `products.new.extraSecrets.hint`)
 
 Правка — node-скриптом, а не руками и не `translate-locales` (без ключа переписывает локаль, заметка памяти). Файлы локалей канонические (`JSON.stringify(…, null, 2) + '\n'`, проверено на `a369a67`), поэтому перезапись скриптом даёт дифф только по правленым ключам. Французские неразрывные пробелы (у «», `:`, `?`) ставятся символом `String.fromCharCode(0xa0)` — НЕ последовательностью `\u…` (заметка «Write портит \uXXXX»). `keys.unsupported` здесь ещё НЕ удаляется: его читает карточка до задачи 20a, удаляет задача 20b.
 
@@ -4930,6 +4930,156 @@ Run (нода, фронт): `src/components/products src/services/productActions
 cd /Users/dmitry/Downloads/spirits_front/.worktrees/product-lifecycle-2 && node - <<'EOF'
 const fs = require('fs');
 const NB = String.fromCharCode(0xa0);
+// Тексты причин отказа карточки ключей (result.reason сервера: задачи 10, 12, 13).
+const ERRORS = {
+      ru: {
+        nothing: 'Ничего не изменено: впишите новое значение, уберите или добавьте ключ.',
+        bad_shape: 'Карточка устарела — обновите её и введите ключи снова.',
+        bad_input: 'Ключ {{field}} не принят: проверьте имя (латиница, цифры, «_», не занятое платформой) и значение (не пустое, до 8192 знаков).',
+        too_many: 'Ключей слишком много — не больше 64 на продукт.',
+        bot_token: 'Токен бота убрать нельзя — его можно только заменить.',
+        busy_turn: 'Сейчас идёт правка продукта — отправьте карточку, когда она закончится.',
+        busy: 'Машина продукта сейчас занята — отправьте карточку через минуту.',
+        bad_token: 'Telegram не принял токен бота — скопируйте его целиком из @BotFather.',
+        token_unchecked: 'Не удалось проверить токен в Telegram — попробуйте ещё раз через минуту.',
+        bot_in_use: 'Этот бот уже работает в другом продукте — создайте в @BotFather нового бота.',
+        gone: 'Продукт удалён — ключи не менялись.',
+        blocked: 'Продукт остановлен администратором — ключи не менялись; напишите в поддержку.',
+        sleeping: 'Продукт спит: не хватило токенов на аренду. Пополните баланс — он проснётся, и ключи можно будет сменить.',
+        provisioning: 'Продукт ещё заводится — ключи можно сменить через минуту.',
+        failed_product: 'Продукт не завёлся — сначала его нужно завести заново.',
+        unavailable: 'Продукт сейчас недоступен — ключи не менялись.',
+        state_changed: 'Продукт сменил состояние — ключи не менялись. Попросите ассистента ещё раз.',
+        rekey_failed: 'Ключи не применены — продукт работает со старыми ключами. Попробуйте ещё раз через несколько минут.',
+        rekey_unknown: 'Смена ключей прервалась, и продукт может не отвечать. Если он молчит дольше нескольких минут — напишите в поддержку.',
+      },
+      en: {
+        nothing: 'Nothing changed: enter a new value, remove a key or add one.',
+        bad_shape: 'This card is out of date — reload it and enter the keys again.',
+        bad_input: 'Key {{field}} was not accepted: check the name (Latin letters, digits, “_”, not reserved by the platform) and the value (not empty, up to 8192 characters).',
+        too_many: 'Too many keys — no more than 64 per product.',
+        bot_token: 'The bot token can’t be removed — only replaced.',
+        busy_turn: 'The product is being edited right now — send the card when the edit finishes.',
+        busy: 'The product’s machine is busy — send the card in a minute.',
+        bad_token: 'Telegram didn’t accept the bot token — copy it in full from @BotFather.',
+        token_unchecked: 'Couldn’t check the token with Telegram — try again in a minute.',
+        bot_in_use: 'This bot already works in another product — create a new bot in @BotFather.',
+        gone: 'The product has been deleted — the keys were not changed.',
+        blocked: 'The product has been stopped by an administrator — the keys were not changed; please contact support.',
+        sleeping: 'The product is asleep: there weren’t enough tokens for the rent. Top up your balance — it will wake up, and you can change the keys.',
+        provisioning: 'The product is still being set up — you can change the keys in a minute.',
+        failed_product: 'The product failed to start — it needs to be set up again first.',
+        unavailable: 'The product is unavailable right now — the keys were not changed.',
+        state_changed: 'The product’s state changed — the keys were not changed. Ask the assistant again.',
+        rekey_failed: 'The keys were not applied — the product runs with the old keys. Try again in a few minutes.',
+        rekey_unknown: 'The key change was interrupted, and the product may not respond. If it stays silent for more than a few minutes, contact support.',
+      },
+      de: {
+        nothing: 'Nichts geändert: Gib einen neuen Wert ein, entferne einen Schlüssel oder füge einen hinzu.',
+        bad_shape: 'Diese Karte ist veraltet — lade sie neu und gib die Schlüssel noch einmal ein.',
+        bad_input: 'Schlüssel {{field}} wurde nicht angenommen: Prüfe den Namen (lateinische Buchstaben, Ziffern, „_“, nicht von der Plattform belegt) und den Wert (nicht leer, bis 8192 Zeichen).',
+        too_many: 'Zu viele Schlüssel — höchstens 64 pro Produkt.',
+        bot_token: 'Das Bot-Token lässt sich nicht entfernen — nur ersetzen.',
+        busy_turn: 'Gerade läuft eine Änderung am Produkt — schick die Karte, wenn sie fertig ist.',
+        busy: 'Die Maschine des Produkts ist gerade beschäftigt — schick die Karte in einer Minute.',
+        bad_token: 'Telegram hat das Bot-Token nicht angenommen — kopiere es vollständig aus @BotFather.',
+        token_unchecked: 'Das Token konnte bei Telegram nicht geprüft werden — versuch es in einer Minute noch einmal.',
+        bot_in_use: 'Dieser Bot arbeitet schon in einem anderen Produkt — leg in @BotFather einen neuen Bot an.',
+        gone: 'Das Produkt ist gelöscht — die Schlüssel wurden nicht geändert.',
+        blocked: 'Das Produkt wurde von einem Administrator gestoppt — die Schlüssel wurden nicht geändert; wende dich an den Support.',
+        sleeping: 'Das Produkt schläft: Die Tokens für die Miete haben nicht gereicht. Lade dein Guthaben auf — dann wacht es auf, und du kannst die Schlüssel ändern.',
+        provisioning: 'Das Produkt wird noch eingerichtet — die Schlüssel kannst du in einer Minute ändern.',
+        failed_product: 'Das Produkt ist nicht gestartet — es muss zuerst neu eingerichtet werden.',
+        unavailable: 'Das Produkt ist gerade nicht verfügbar — die Schlüssel wurden nicht geändert.',
+        state_changed: 'Der Zustand des Produkts hat sich geändert — die Schlüssel wurden nicht geändert. Frag den Assistenten noch einmal.',
+        rekey_failed: 'Die Schlüssel wurden nicht übernommen — das Produkt läuft mit den alten Schlüsseln. Versuch es in ein paar Minuten noch einmal.',
+        rekey_unknown: 'Der Schlüsselwechsel wurde unterbrochen, und das Produkt antwortet vielleicht nicht. Wenn es länger als ein paar Minuten still bleibt, wende dich an den Support.',
+      },
+      fr: {
+        nothing: `Rien n’a changé${NB}: saisissez une nouvelle valeur, supprimez ou ajoutez une clé.`,
+        bad_shape: 'Cette carte n’est plus à jour — rechargez-la et saisissez à nouveau les clés.',
+        bad_input: `La clé {{field}} n’a pas été acceptée${NB}: vérifiez le nom (lettres latines, chiffres, «${NB}_${NB}», non réservé par la plateforme) et la valeur (non vide, 8192 caractères au plus).`,
+        too_many: 'Trop de clés — 64 au maximum par produit.',
+        bot_token: 'Le jeton du bot ne peut pas être supprimé — seulement remplacé.',
+        busy_turn: 'Une modification du produit est en cours — envoyez la carte une fois qu’elle sera terminée.',
+        busy: 'La machine du produit est occupée — envoyez la carte dans une minute.',
+        bad_token: 'Telegram n’a pas accepté le jeton du bot — copiez-le en entier depuis @BotFather.',
+        token_unchecked: 'Impossible de vérifier le jeton auprès de Telegram — réessayez dans une minute.',
+        bot_in_use: 'Ce bot fonctionne déjà dans un autre produit — créez un nouveau bot dans @BotFather.',
+        gone: 'Le produit a été supprimé — les clés n’ont pas été modifiées.',
+        blocked: `Le produit a été arrêté par un administrateur — les clés n’ont pas été modifiées${NB}; contactez le support.`,
+        sleeping: `Le produit est en veille${NB}: les jetons ne suffisaient pas pour la location. Rechargez votre solde — il se réveillera et vous pourrez changer les clés.`,
+        provisioning: 'Le produit est encore en cours de création — vous pourrez changer les clés dans une minute.',
+        failed_product: 'Le produit n’a pas démarré — il faut d’abord le recréer.',
+        unavailable: 'Le produit est indisponible pour le moment — les clés n’ont pas été modifiées.',
+        state_changed: 'L’état du produit a changé — les clés n’ont pas été modifiées. Redemandez à l’assistant.',
+        rekey_failed: 'Les clés n’ont pas été appliquées — le produit fonctionne avec les anciennes clés. Réessayez dans quelques minutes.',
+        rekey_unknown: 'Le changement de clés a été interrompu et le produit risque de ne pas répondre. S’il reste muet plus de quelques minutes, contactez le support.',
+      },
+      es: {
+        nothing: 'No has cambiado nada: escribe un valor nuevo, quita una clave o añade otra.',
+        bad_shape: 'Esta tarjeta está desactualizada: recárgala e introduce las claves de nuevo.',
+        bad_input: 'No se aceptó la clave {{field}}: revisa el nombre (letras latinas, cifras, «_», no reservado por la plataforma) y el valor (no vacío, hasta 8192 caracteres).',
+        too_many: 'Demasiadas claves: 64 como máximo por producto.',
+        bot_token: 'El token del bot no se puede quitar, solo sustituir.',
+        busy_turn: 'Ahora se está haciendo un cambio en el producto: envía la tarjeta cuando termine.',
+        busy: 'La máquina del producto está ocupada: envía la tarjeta dentro de un minuto.',
+        bad_token: 'Telegram no aceptó el token del bot: cópialo entero de @BotFather.',
+        token_unchecked: 'No se pudo comprobar el token en Telegram: inténtalo de nuevo dentro de un minuto.',
+        bot_in_use: 'Este bot ya funciona en otro producto: crea un bot nuevo en @BotFather.',
+        gone: 'El producto se ha eliminado: las claves no se cambiaron.',
+        blocked: 'Un administrador ha detenido el producto: las claves no se cambiaron; escribe al soporte.',
+        sleeping: 'El producto está en reposo: no hubo tokens suficientes para el alquiler. Recarga tu saldo: se despertará y podrás cambiar las claves.',
+        provisioning: 'El producto todavía se está creando: podrás cambiar las claves dentro de un minuto.',
+        failed_product: 'El producto no llegó a arrancar: primero hay que crearlo de nuevo.',
+        unavailable: 'El producto no está disponible ahora mismo: las claves no se cambiaron.',
+        state_changed: 'El estado del producto cambió: las claves no se cambiaron. Pídeselo de nuevo al asistente.',
+        rekey_failed: 'Las claves no se aplicaron: el producto funciona con las claves anteriores. Inténtalo de nuevo dentro de unos minutos.',
+        rekey_unknown: 'El cambio de claves se interrumpió y puede que el producto no responda. Si sigue sin responder más de unos minutos, escribe al soporte.',
+      },
+      pt: {
+        nothing: 'Nada foi alterado: escreve um valor novo, remove ou acrescenta uma chave.',
+        bad_shape: 'Este cartão está desatualizado — recarrega-o e introduz as chaves de novo.',
+        bad_input: 'A chave {{field}} não foi aceite: verifica o nome (letras latinas, algarismos, «_», não reservado pela plataforma) e o valor (não vazio, até 8192 caracteres).',
+        too_many: 'Chaves a mais — no máximo 64 por produto.',
+        bot_token: 'O token do bot não pode ser removido — só substituído.',
+        busy_turn: 'Está a decorrer uma alteração ao produto — envia o cartão quando terminar.',
+        busy: 'A máquina do produto está ocupada — envia o cartão daqui a um minuto.',
+        bad_token: 'O Telegram não aceitou o token do bot — copia-o inteiro do @BotFather.',
+        token_unchecked: 'Não foi possível verificar o token no Telegram — tenta de novo daqui a um minuto.',
+        bot_in_use: 'Este bot já funciona noutro produto — cria um bot novo no @BotFather.',
+        gone: 'O produto foi eliminado — as chaves não foram alteradas.',
+        blocked: 'O produto foi parado por um administrador — as chaves não foram alteradas; contacta o suporte.',
+        sleeping: 'O produto está em repouso: os tokens não chegaram para o aluguer. Carrega o saldo — ele acorda e podes alterar as chaves.',
+        provisioning: 'O produto ainda está a ser criado — podes alterar as chaves daqui a um minuto.',
+        failed_product: 'O produto não arrancou — primeiro é preciso criá-lo de novo.',
+        unavailable: 'O produto não está disponível neste momento — as chaves não foram alteradas.',
+        state_changed: 'O estado do produto mudou — as chaves não foram alteradas. Pede de novo ao assistente.',
+        rekey_failed: 'As chaves não foram aplicadas — o produto funciona com as chaves antigas. Tenta de novo daqui a alguns minutos.',
+        rekey_unknown: 'A alteração das chaves foi interrompida e o produto pode não responder. Se continuar calado mais do que alguns minutos, contacta o suporte.',
+      },
+      zh: {
+        nothing: '没有任何更改：请输入新值、删除或添加密钥。',
+        bad_shape: '此卡片已过期——请刷新后重新输入密钥。',
+        bad_input: '密钥 {{field}} 未被接受：请检查名称（拉丁字母、数字、“_”，且未被平台占用）和值（不能为空，最多 8192 个字符）。',
+        too_many: '密钥过多——每个产品最多 64 个。',
+        bot_token: '机器人令牌不能删除，只能替换。',
+        busy_turn: '产品正在修改中——请在修改完成后再提交卡片。',
+        busy: '产品所在的机器正忙——请一分钟后再提交卡片。',
+        bad_token: 'Telegram 未接受机器人令牌——请从 @BotFather 完整复制。',
+        token_unchecked: '无法在 Telegram 验证令牌——请一分钟后重试。',
+        bot_in_use: '该机器人已在另一个产品中运行——请在 @BotFather 创建新的机器人。',
+        gone: '产品已删除——密钥未更改。',
+        blocked: '产品已被管理员停用——密钥未更改；请联系客服。',
+        sleeping: '产品处于休眠：租金所需的代币不足。请充值——产品会自动唤醒，之后即可更改密钥。',
+        provisioning: '产品仍在创建中——一分钟后即可更改密钥。',
+        failed_product: '产品未能启动——需要先重新创建。',
+        unavailable: '产品暂时不可用——密钥未更改。',
+        state_changed: '产品状态已变化——密钥未更改。请再次向助手提出。',
+        rekey_failed: '密钥未生效——产品仍在使用旧密钥。请几分钟后重试。',
+        rekey_unknown: '密钥更换被中断，产品可能无响应。如果超过几分钟仍无响应，请联系客服。',
+      },
+};
 const T = {
   ru: {
     keys: {
@@ -5040,7 +5190,7 @@ const T = {
 for (const [lang, t] of Object.entries(T)) {
   const f = `src/i18n/locales/${lang}.json`;
   const d = JSON.parse(fs.readFileSync(f, 'utf8'));
-  d.products.action.keys = { ...d.products.action.keys, ...t.keys };
+  d.products.action.keys = { ...d.products.action.keys, ...t.keys, errors: ERRORS[lang] };
   const h = d.products.new.extraSecrets.hint;
   if (!h.includes(t.hintOld)) { console.error(`${lang}: в подсказке формы нет ожидаемой фразы — сверить вручную`); process.exit(1); }
   d.products.new.extraSecrets.hint = h.replace(t.hintOld, t.hintNew);
@@ -5050,18 +5200,18 @@ console.log('ok');
 EOF
 git -C /Users/dmitry/Downloads/spirits_front/.worktrees/product-lifecycle-2 diff --stat
 ```
-Expected: `ok`; в `diff --stat` — ровно 7 файлов локалей, по 15–20 строк в каждом. Иное (сотни строк) — файл был не каноническим: `git checkout -- src/i18n/locales` и написать в отчёт.
+Expected: `ok`; в `diff --stat` — ровно 7 файлов локалей, по 35–45 строк в каждом. Иное (сотни строк) — файл был не каноническим: `git checkout -- src/i18n/locales` и написать в отчёт.
 
-- [ ] **Step 2: Проверки локалей**
-
-Run (нода, фронт): `pnpm check-locales && pnpm check-keys && pnpm check-hardcoded` (после `git checkout --detach $SHA`). Expected: зелёные (`check-locale-format` красный на `main` и без нас — заметка «i18n-скрипты фронта»; сравнить его вывод с выводом на `origin/main`, новых строк быть не должно).
-
-- [ ] **Step 3: Коммит**
+- [ ] **Step 2: Коммит и пуш** (до проверок: на ноду код едет только через git)
 
 ```bash
 git -C $F add src/i18n/locales && git -C $F commit -q -m "i18n(products): тексты карточки ключей; форма Студии — ключи можно сменить через ассистента (7 языков)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 git -C $F push -q origin HEAD:refs/heads/feat/product-lifecycle-2
 ```
+
+- [ ] **Step 3: Проверки локалей**
+
+Run (нода, фронт): `pnpm check-locales && pnpm check-keys && pnpm check-hardcoded` (после `git fetch -q origin && git checkout -q --detach $SHA`, где `SHA=$(git -C $F rev-parse HEAD)`). Expected: зелёные (`check-locale-format` красный на `main` и без нас — заметка «i18n-скрипты фронта»; сравнить его вывод с выводом на `origin/main`, новых строк быть не должно).
 
 ---
 
