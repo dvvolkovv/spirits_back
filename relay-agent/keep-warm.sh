@@ -5,9 +5,11 @@
 # 'analyst-keepwarm' so they show up in journalctl + monitor.taler.tirol push.
 set -euo pipefail
 sid="keepwarm-$(date -u +%Y%m%dT%H%M%SZ)"
+secret=$(grep -v '^#' "$(dirname "$0")/relay-secrets" 2>/dev/null | grep -m1 . || true)
 status=$(curl -sS -o /tmp/keepwarm.out -w '%{http_code}' \
   --connect-timeout 10 --max-time 90 \
   -X POST http://127.0.0.1:3033/chat \
+  -H "X-Agent-Secret: ${secret}" \
   -F "sessionId=$sid" -F 'message=ping') || status=000
 if [[ "$status" == "200" ]]; then
   logger -t analyst-keepwarm "ok sid=$sid"

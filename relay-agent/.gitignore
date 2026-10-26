@@ -14,3 +14,7 @@ _old-backups/
 sessions/
 uploads/
 *.log
+
+# Секреты бэков и режим проверки (relay-auth.mjs). Живут только на сервере, права 600.
+relay-secrets
+relay-auth-mode
