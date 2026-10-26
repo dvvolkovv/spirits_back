@@ -3,6 +3,8 @@
  * и в личку владельцу, поэтому несут начало ответа: без него неясно, что
  * модель прислала вместо JSON — переспросила, извинилась или оборвалась.
  */
+import { Skit, SkitLine } from './short-skit-prompts';
+import { TroupeId } from './short-troupe';
 
 /** Сколько символов сырого ответа кладём в ошибку — как RAW_SNIPPET_CHARS блога. */
 export const RAW_SNIPPET_CHARS = 300;
@@ -77,16 +79,44 @@ export function extractJsonObject(raw: string, who: string): Record<string, any>
   return parsed;
 }
 
+/**
+ * Сценка из ответа модели — полями (спека сценок, «Кто пишет сценки»). Разбор
+ * отвергает только то, что не назвать нарушением: не объект, кривой номер
+ * абзаца. Правила 16–18 и английские поля проверяет checkSkitRules — их
+ * нарушения уходят модели на переписку, а не в повтор этапа.
+ */
+export function parseSkit(v: unknown, who: string, field: string): Skit {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) {
+    throw new Error(`${who}: ${field} — объект {cast, setting, opening, action, lines}`);
+  }
+  const o = v as Record<string, any>;
+  const cast = Array.isArray(o.cast) ? o.cast.map((c: any) => ({ hero: str(c?.hero) as TroupeId, role: str(c?.role) })) : [];
+  const lines = Array.isArray(o.lines)
+    ? o.lines.map((l: any, i: number): SkitLine => {
+        const line: SkitLine = { hero: str(l?.hero) as TroupeId, text: str(l?.text) };
+        if (l?.box !== null && l?.box !== undefined && l?.box !== '') {
+          const box = Number(l.box);
+          if (!Number.isInteger(box)) throw new Error(`${who}: ${field}, реплика ${i + 1} — box должен быть номером абзаца`);
+          line.box = box;
+        }
+        return line;
+      })
+    : [];
+  return { cast, setting: str(o.setting), opening: str(o.opening), action: str(o.action), lines };
+}
+
 export interface DirectorReply {
   assistantId: number;
   question: string;
   followups: string[];
   title: string;
+  /** Сценка 1 (конфликт) — у ролика формата skit. */
+  skit: Skit | null;
 }
 
 export function parseDirectorReply(
   raw: string,
-  ctx: { assistantIds: ReadonlySet<number>; fixedAssistantId: number | null },
+  ctx: { assistantIds: ReadonlySet<number>; fixedAssistantId: number | null; skit?: boolean },
 ): DirectorReply {
   const o = extractJsonObject(raw, 'режиссёр');
   const assistantId = Number(o.assistantId);
@@ -111,7 +141,8 @@ export function parseDirectorReply(
   }
   const title = str(o.title);
   if (len(title) < 3) throw new Error('режиссёр: нет рабочего названия ролика');
-  return { assistantId, question, followups, title: Array.from(title).slice(0, MAX_TITLE_CHARS).join('') };
+  const skit = ctx.skit ? parseSkit(o.skit, 'режиссёр', 'skit') : null;
+  return { assistantId, question, followups, title: Array.from(title).slice(0, MAX_TITLE_CHARS).join(''), skit };
 }
 
 export interface WriterReply {
@@ -122,16 +153,23 @@ export interface WriterReply {
   question: string;
   lines: Array<{ box: number; text: string }>;
   captions: { telegram: string; vk: string; youtube: { title: string; description: string; tags: string[] } };
+  /**
+   * Сценки ролика формата skit: развязка обязательна, конфликт — только если
+   * сценарист его переписал по замечанию (иначе null: остаётся прежний).
+   */
+  skits: { conflict: Skit | null; punchline: Skit | null };
 }
+
+const NO_SKITS: WriterReply['skits'] = { conflict: null, punchline: null };
 
 const EMPTY_CAPTIONS: WriterReply['captions'] = { telegram: '', vk: '', youtube: { title: '', description: '', tags: [] } };
 
-export function parseWriterReply(raw: string): WriterReply {
+export function parseWriterReply(raw: string, opts: { skit?: boolean } = {}): WriterReply {
   const o = extractJsonObject(raw, 'сценарист');
   if (o.needsRecapture === true) {
     const reason = str(o.reason);
     if (!reason) throw new Error('сценарист: просит переснять, но не объяснил почему');
-    return { needsRecapture: true, reason, hook: '', hookBox: null, question: '', lines: [], captions: EMPTY_CAPTIONS };
+    return { needsRecapture: true, reason, hook: '', hookBox: null, question: '', lines: [], captions: EMPTY_CAPTIONS, skits: NO_SKITS };
   }
   const hook = str(o.hook);
   if (!hook) throw new Error('сценарист: нет зацепки');
@@ -157,5 +195,11 @@ export function parseWriterReply(raw: string): WriterReply {
   };
   if (!captions.telegram) throw new Error('сценарист: нет подписи для Telegram');
   if (!captions.youtube.title) throw new Error('сценарист: нет заголовка для YouTube');
-  return { needsRecapture: false, reason: '', hook, hookBox, question, lines, captions };
+  const skits = opts.skit
+    ? {
+        conflict: o.conflict === null || o.conflict === undefined ? null : parseSkit(o.conflict, 'сценарист', 'conflict'),
+        punchline: parseSkit(o.punchline, 'сценарист', 'punchline'),
+      }
+    : NO_SKITS;
+  return { needsRecapture: false, reason: '', hook, hookBox, question, lines, captions, skits };
 }
