@@ -239,15 +239,16 @@ describe('ProvisioningService.create', () => {
     // now(). $2 — тот же userId, что и второй колонкой выше; второй раз он
     // назван здесь не для красоты: это и есть «кому принадлежит счёт».
     //
-    // Ревью, пункт 11: считаются не ВСЕ строки этого userId, а только те, у
-    // которых есть след успешного провижининга (EXISTS по
-    // product_provision_jobs kind='provision' status='done') — продукт, чьё
-    // заведение так и не поднялось, бесплатный месяц не жжёт.
+    // Ревью, пункт 11, правка круга 2 пункт 2: считаются не ВСЕ строки этого
+    // userId, а только те, у которых есть НЕ ПРОВАЛИВШЕЕСЯ задание
+    // провижининга (EXISTS по product_provision_jobs kind='provision'
+    // status <> 'failed', freeMonthCountedJobSql в rent.service.ts) —
+    // продукт, чьё заведение так и не поднялось, бесплатный месяц не жжёт, а
+    // заводящийся (queued/running) — жжёт уже сейчас, не дожидаясь успеха.
     expect(insert.sql).toContain(
       'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,\n' +
         "                 CASE WHEN (SELECT count(*) FROM products p2 WHERE p2.user_id = $2\n" +
-        "                              AND EXISTS (SELECT 1 FROM product_provision_jobs j\n" +
-        "                                           WHERE j.product_id = p2.id AND j.kind = 'provision' AND j.status = 'done')) < $15\n" +
+        "                              AND EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.product_id = p2.id AND j.kind = 'provision' AND j.status <> 'failed')) < $15\n" +
         "                        THEN now() + interval '1 month'\n" +
         '                        ELSE now()\n' +
         '                      END)',
@@ -560,9 +561,10 @@ describe('ProvisioningService.create', () => {
 
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
     expect(insert.sql).toContain('(SELECT count(*) FROM products p2 WHERE p2.user_id = $2');
-    // Ревью, пункт 11: считаются не ВСЕ строки, а только со следом успешного
-    // провижининга — EXISTS по product_provision_jobs.
-    expect(insert.sql).toContain("kind = 'provision' AND j.status = 'done'");
+    // Ревью, пункт 11, правка круга 2 пункт 2: считаются не ВСЕ строки, а
+    // только с НЕ ПРОВАЛИВШИМСЯ заданием провижининга — EXISTS по
+    // product_provision_jobs, status <> 'failed' (было строже — status='done').
+    expect(insert.sql).toContain("kind = 'provision' AND j.status <> 'failed'");
     expect(insert.params[1]).toBe('u-7');
     expect(insert.params[14]).toBe(FREE_MONTH_PRODUCTS);
   });
