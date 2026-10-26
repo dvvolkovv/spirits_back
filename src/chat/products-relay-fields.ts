@@ -1,4 +1,4 @@
-import { signProductToolToken } from '../products/product-tool.token';
+import { ProductToolTokenOpts, signProductToolToken } from '../products/product-tool.token';
 
 /**
  * Поля, которыми бэкенд передаёт релею доступ к инструменту продуктов.
@@ -15,11 +15,17 @@ import { signProductToolToken } from '../products/product-tool.token';
  * Шлётся ВСЕГДА, всем ассистентам. У пользователя без продуктов инструмент
  * честно ответит «нет ни одного» — это дешевле, чем запрос в базу на каждом
  * ходе ради того, чтобы иногда не показать инструмент.
+ *
+ * opts — язык, клиент и вид ассистента для справки (platform-kb) и метка хода
+ * (opts.turn — по ней чат забирает карточки продуктов): едут в подписи токена.
  */
-export function productsRelayFields(userId: string, turn?: string): { products_token: string; products_mcp_url: string } {
+export function productsRelayFields(
+  userId: string,
+  opts: ProductToolTokenOpts = {},
+): { products_token: string; products_mcp_url: string } {
   const base = (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '');
   return {
-    products_token: signProductToolToken(userId, 'web', turn),
+    products_token: signProductToolToken(userId, 'web', opts),
     products_mcp_url: `${base}/webhook/mcp/products`,
   };
 }

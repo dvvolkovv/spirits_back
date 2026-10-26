@@ -21,6 +21,9 @@ import { MailService } from '../common/services/mail.service';
 import { LanguageService } from '../common/services/language.service';
 import { buildOwnerReplyEmail } from './support-mail';
 import { platformSections } from '../chat/platform-guide';
+import { executeLinkeonHelp, linkeonHelpTool, LINKEON_HELP_TOOL_NAME } from '../platform-kb/linkeon-help';
+import type { KbClient } from '../platform-kb/kb.types';
+import { EventsService } from '../events/events.service';
 
 @Injectable()
 export class SupportService implements OnModuleInit {
@@ -31,6 +34,10 @@ export class SupportService implements OnModuleInit {
     @Optional() private readonly telegram?: TelegramNotifierService,
     @Optional() private readonly video?: VideoService,
     @Optional() private readonly mail?: MailService,
+    // Статистика вызовов справки (как у products-mcp.controller.ts) — не
+    // критична для работы поддержки, поэтому @Optional, а не жёсткая
+    // зависимость.
+    @Optional() private readonly events?: EventsService,
   ) {}
 
   async onModuleInit() {
@@ -166,7 +173,9 @@ export class SupportService implements OnModuleInit {
 
   // -------------------- User → AI flow --------------------
 
-  async postUserMessage(userId: string, dto: PostUserMessageDto): Promise<{ ticketId: string }> {
+  async postUserMessage(
+    userId: string, dto: PostUserMessageDto, opts: { storeBuild?: boolean } = {},
+  ): Promise<{ ticketId: string }> {
     const content = (dto.content || '').trim();
     if (!content) throw new BadRequestException('content required');
     if (content.length > LIMITS.MESSAGE_MAX) {
@@ -209,7 +218,7 @@ export class SupportService implements OnModuleInit {
 
     // Generate AI response only if ticket is still AI-handled.
     if (ticket.status === 'ai_handling') {
-      this.generateAiResponse(ticket.id, userId).catch((e) =>
+      this.generateAiResponse(ticket.id, userId, opts).catch((e) =>
         this.logger.error(`AI response failed for ticket ${ticket.id}: ${e.message}`),
       );
     }
@@ -271,12 +280,14 @@ export class SupportService implements OnModuleInit {
 
   // -------------------- AI response (tool-loop) --------------------
 
-  private async generateAiResponse(ticketId: string, userId: string): Promise<void> {
+  private async generateAiResponse(
+    ticketId: string, userId: string, opts: { storeBuild?: boolean } = {},
+  ): Promise<void> {
     const history = await this.listMessages(userId, ticketId, true);
     const profile = await this.getUserContextData(userId);
     const health = await this.getServiceHealth();
 
-    const systemPrompt = this.buildSystemPrompt(profile, health);
+    const systemPrompt = this.buildSystemPrompt(profile, health, opts);
 
     const conversation = history
       .filter((m) => m.sender_type === 'user' || m.sender_type === 'ai' || m.sender_type === 'owner')
@@ -298,7 +309,8 @@ export class SupportService implements OnModuleInit {
       .join('\n\n');
     const prompt = priorTurns ? `${priorTurns}\n\nUSER: ${lastUser}` : `USER: ${lastUser}`;
 
-    const mcp = this.buildSupportMcp(ticketId, userId);
+    const lang = LanguageService.normalize(profile?.language);
+    const mcp = this.buildSupportMcp(ticketId, userId, { lang, client: opts.storeBuild ? 'store' : 'web' });
     let finalText = '';
     let escalated = false;
     const toolInvocations: any[] = [];
@@ -373,63 +385,90 @@ export class SupportService implements OnModuleInit {
   // MCP-сервер для tool-loop: 1:1 порт SUPPORT_TOOLS на zod-схемы Agent SDK.
   // Handlers закрывают замыкания на ticketId/userId, дальше делегируют в
   // существующий executeTool — тот ничего не знает про MCP, остаётся как был.
-  private buildSupportMcp(ticketId: string, userId: string): any {
+  private buildSupportMcp(ticketId: string, userId: string, help: { lang: string; client: KbClient } = { lang: 'ru', client: 'web' }): any {
+    return createSdkMcpServer({ name: 'support-tools', tools: this.supportToolDefs(ticketId, userId, help) });
+  }
+
+  /** Определения инструментов поддержки — отдельно от сервера, чтобы их можно было проверить тестом. */
+  private supportToolDefs(ticketId: string, userId: string, help: { lang: string; client: KbClient } = { lang: 'ru', client: 'web' }): any[] {
     const dispatch = async (name: string, args: any) => {
       const result = await this.executeTool(ticketId, userId, name, args || {});
       return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
     };
-    return createSdkMcpServer({
-      name: 'support-tools',
-      tools: [
-        tool(
-          'get_user_context',
-          'Fetch current user context: token balance, isAdmin flag, email, preferred agent, profile name, account age.',
-          {},
-          async (a: any) => dispatch('get_user_context', a),
-        ),
-        tool(
-          'get_recent_jobs',
-          "List the user's most recent image/video generation jobs (last 10). Useful if they complain about a generation that failed, was slow, or returned wrong result.",
-          { kind: z.enum(['video', 'image', 'all']).optional() },
-          async (a: any) => dispatch('get_recent_jobs', a),
-        ),
-        tool(
-          'check_service_health',
-          'Return current status of platform services (backend, database, LLM, video, payments). Call this when the user reports something is broken or you need to verify availability before answering.',
-          {},
-          async (a: any) => dispatch('check_service_health', a),
-        ),
-        tool(
-          'refund_tokens',
-          'Credit tokens back to the user when there is a clear, verifiable reason (failed job tied to upstream issue, confirmed double-charge, service was down at charge time). DO NOT use just because user wants more tokens or is unhappy with quality. Hard limits: ≤10k per call, ≤20k per ticket, ≤30k per user/day — exceeding fails the call, then escalate.',
-          {
-            amount: z.number().int(),
-            reason: z.string(),
-            reference: z.string().optional(),
-          },
-          async (a: any) => dispatch('refund_tokens', a),
-        ),
-        tool(
-          'rerun_failed_job',
-          'Re-queue a failed video-generation job: refunds tokens + queues identical new job. Verify failure tied to upstream issue first. Supported: Veo jobs (text2video, image2video). Old Kling jobs (model kling-*, modes extend/lipsync) cannot be rerun — Kling is retired; refund and tell the user to create the video again.',
-          { job_id: z.string() },
-          async (a: any) => dispatch('rerun_failed_job', a),
-        ),
-        tool(
-          'escalate_to_owner',
-          'Flag the ticket for a human owner to pick up. Use when: user explicitly asks for a human, you cannot solve the issue with available tools, you detect a payment/refund dispute, refund_tokens failed due to limits, or you have asked clarifying questions 3+ times without progress.',
-          {
-            reason: z.string(),
-            urgency: z.enum(['low', 'normal', 'high', 'critical']).optional(),
-            summary: z.string(),
-          },
-          async (a: any) => dispatch('escalate_to_owner', a),
-        ),
-      ],
-    });
+    return [
+      tool(
+        'get_user_context',
+        'Fetch current user context: token balance, isAdmin flag, email, preferred agent, profile name, account age.',
+        {},
+        async (a: any) => dispatch('get_user_context', a),
+      ),
+      tool(
+        'get_recent_jobs',
+        "List the user's most recent image/video generation jobs (last 10). Useful if they complain about a generation that failed, was slow, or returned wrong result.",
+        { kind: z.enum(['video', 'image', 'all']).optional() },
+        async (a: any) => dispatch('get_recent_jobs', a),
+      ),
+      tool(
+        'check_service_health',
+        'Return current status of platform services (backend, database, LLM, video, payments). Call this when the user reports something is broken or you need to verify availability before answering.',
+        {},
+        async (a: any) => dispatch('check_service_health', a),
+      ),
+      tool(
+        'refund_tokens',
+        'Credit tokens back to the user when there is a clear, verifiable reason (failed job tied to upstream issue, confirmed double-charge, service was down at charge time). DO NOT use just because user wants more tokens or is unhappy with quality. Hard limits: ≤10k per call, ≤20k per ticket, ≤30k per user/day — exceeding fails the call, then escalate.',
+        {
+          amount: z.number().int(),
+          reason: z.string(),
+          reference: z.string().optional(),
+        },
+        async (a: any) => dispatch('refund_tokens', a),
+      ),
+      tool(
+        'rerun_failed_job',
+        'Re-queue a failed video-generation job: refunds tokens + queues identical new job. Verify failure tied to upstream issue first. Supported: Veo jobs (text2video, image2video). Old Kling jobs (model kling-*, modes extend/lipsync) cannot be rerun — Kling is retired; refund and tell the user to create the video again.',
+        { job_id: z.string() },
+        async (a: any) => dispatch('rerun_failed_job', a),
+      ),
+      tool(
+        'escalate_to_owner',
+        'Flag the ticket for a human owner to pick up. Use when: user explicitly asks for a human, you cannot solve the issue with available tools, you detect a payment/refund dispute, refund_tokens failed due to limits, or you have asked clarifying questions 3+ times without progress.',
+        {
+          reason: z.string(),
+          urgency: z.enum(['low', 'normal', 'high', 'critical']).optional(),
+          summary: z.string(),
+        },
+        async (a: any) => dispatch('escalate_to_owner', a),
+      ),
+      // Справка о платформе (platform-kb): та же сборка статей, что у ассистентов.
+      // Язык и клиент — из профиля и заголовка запроса, не из аргументов модели.
+      tool(
+        LINKEON_HELP_TOOL_NAME,
+        linkeonHelpTool(help.client).description,
+        { topics: z.array(z.string()).min(1).max(3) },
+        async (a: any) => {
+          const result = executeLinkeonHelp(a, help);
+          // Та же статистика, что у точки продуктов (mcp/products-mcp.controller.ts):
+          // о чём спрашивают через справку, независимо от канала её вызова.
+          this.events?.track('linkeon_help_call', {
+            userId,
+            props: {
+              channel: 'support',
+              client: help.client,
+              lang: help.lang,
+              scope: 'full',
+              agent: 'support',
+              topics: result.articles.map((x: any) => x.id),
+              index: !!result.index,
+            },
+          });
+          return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
+        },
+      ),
+    ];
   }
 
-  private buildSystemPrompt(profile: any, health?: { services: any[] }): string {
+  private buildSystemPrompt(profile: any, health?: { services: any[] }, opts: { storeBuild?: boolean } = {}): string {
     const lang = LanguageService.normalize(profile?.language);
     const healthSummary = (() => {
       if (!health?.services?.length) return 'нет данных (мониторинг не запускался)';
@@ -451,11 +490,12 @@ export class SupportService implements OnModuleInit {
 ${LanguageService.buildDirective(lang)}
 
 ПЛАТФОРМА. LINKEON.IO — AI-ассистенты для бизнеса и личного роста. Разделы и кнопки (называй их так, как они подписаны у пользователя, — в кавычках):
-${platformSections(lang)}
+${platformSections(lang, { store: opts.storeBuild })}
 
 ТВОЯ РОЛЬ.
 - Помогай юзеру решать вопросы по использованию платформы.
-- Если что-то технически сломано — сначала вызови check_service_health, потом сообщи честно.
+- На вопрос «как сделать», «сколько стоит» или «как устроено» — сначала возьми статью инструментом linkeon_help и отвечай по ней.
+- При сбое или упавшей генерации — сначала get_recent_jobs и check_service_health, потом сообщи честно; к linkeon_help за справкой обращайся отдельно, если нужно.
 - Если речь о конкретной генерации — вызови get_recent_jobs, чтобы увидеть статус.
 - Если юзер хочет вернуть деньги, спорит об оплате, сообщает о баге, который ты не можешь исправить, или явно просит человека — вызови escalate_to_owner.
 - Токены за явный, проверяемый сбой (упавшая генерация в get_recent_jobs, подтверждённое двойное списание токенов) возвращай сам через refund_tokens — в пределах его лимитов; не хватило лимита — escalate_to_owner. Возврат денег не обещай: его решает команда.

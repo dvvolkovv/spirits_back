@@ -26,6 +26,9 @@ export interface MagicLinkLimits {
  */
 export const MAGIC_LINK_LIMIT_DEFAULTS: Readonly<MagicLinkLimits> = Object.freeze({ perAddress: 3, global: 60 });
 
+/** Сколько живёт ссылка для входа из письма. Её же называет справка (platform-kb/values.ts). */
+export const MAGIC_LINK_TTL_SECONDS = 600;
+
 export const MAGIC_LINK_LIMIT_ENV: Readonly<Record<keyof MagicLinkLimits, string>> = Object.freeze({
   perAddress: 'EMAIL_LIMIT_PER_ADDRESS_10MIN',
   global: 'EMAIL_LIMIT_GLOBAL_10MIN',
@@ -122,7 +125,7 @@ export class EmailService {
   async generateMagicToken(email: string): Promise<string> {
     if (!this.redis) throw new Error('redis not configured');
     const token = crypto.randomBytes(32).toString('base64url');
-    await this.redis.set(`ml-${token}`, email, 600);
+    await this.redis.set(`ml-${token}`, email, MAGIC_LINK_TTL_SECONDS);
     return token;
   }
 

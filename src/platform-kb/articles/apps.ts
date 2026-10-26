@@ -1,0 +1,37 @@
+import type { KbArticle } from '../kb.types';
+
+// источник: Android — spirits_front src/components/settings/SettingsView.tsx:384-405; src/androidApp.ts:11; src/main.tsx:28-41 (обновления по воздуху)
+// источник: мини-приложение — spirits_front src/tma/App.tsx:16, choiceFlow.ts:20-67, screens/WalletScreen.tsx:11-16; src/tg-bot/tg-bot.service.ts:342-348
+// источник: виджет — spirits_front src/services/widgetClient.ts:63-92; src/app-widget/app-widget.controller.ts:7-18,110-141
+// источник: кнопка web_app — только непривязанному (tg-bot.service.ts:233-239,340-348); кнопка меню бота «Open Linkeon» → my.linkeon.io/tma/ задана в BotFather для всех чатов (проверено getChatMenuButton 25.10.2026), в коде её нет
+export const apps: KbArticle = {
+  id: 'apps',
+  title: 'Приложения',
+  summary: 'приложения: Android, мини-приложение в Telegram, виджет, iPhone',
+  related: ['account', 'routines'],
+  render: ({ q, paid, nonStore }) => `
+## Что это
+Где ещё работает Linkeon, кроме сайта: Android-приложение, мини-приложение в Telegram, виджет на экране телефона.
+
+## Где
+Android — ${q('settings')} → ${q('android')}${nonStore(` → ${q('apkDownload')}`)}. Мини-приложение — кнопка «Open Linkeon» рядом с полем ввода в чате с ботом Linkeon (t.me/LinkeonAgentBot); пока Telegram не привязан к аккаунту, бот присылает в личке и кнопку «Открыть Linkeon».
+
+## Как
+${nonStore('- Android-приложение ставится файлом, не через Google Play; обновления приходят сами.')}
+- На iPhone — my.linkeon.io в браузере; сайт можно добавить на экран «Домой», тогда работают и уведомления.
+- Мини-приложение: ${q('tmaDay')} (фокус дня, события, задачи), ассистенты со звонком Роману, поиск${paid(`, ${q('tmaWallet')} (баланс и расход)`)}, профиль. Первый вход — новый аккаунт или вход в существующий.
+- Виджет Android показывает последнего ассистента, его реплику и энергию дня; долгое нажатие на значок приложения — быстрые действия.
+
+## Чего нельзя
+${paid('- Оплатить внутри мини-приложения — пополнение откроется в браузере.')}
+- Открыть мини-приложение вне Telegram.
+
+## Если не получается
+${nonStore('- Android не ставит файл — разрешить установку из этого источника в настройках телефона.')}
+- Мини-приложение не открывается — открыть кнопкой «Open Linkeon» в чате с ботом Linkeon.
+- Ничего не помогло — ${q('support')} в разделе ${q('help')}.
+
+## Как устроено
+Android-приложение — тот же кабинет, что сайт, в оболочке приложения; мини-приложение — отдельные экраны внутри Telegram на том же аккаунте.
+`,
+};

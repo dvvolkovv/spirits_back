@@ -1,6 +1,7 @@
 import { ChatService } from './chat.service';
 import { AgentsService } from '../agents/agents.service';
 import { platformGuide, TOOLS_LIST_NOTE } from './platform-guide';
+import { LINKEON_HELP_CLI_TOOL_NAME } from '../products/products-cli-tool';
 
 /**
  * Системный промпт Маши (agent.id === 3, локальный claude CLI, не релей).
@@ -151,10 +152,13 @@ describe('системный промпт Маши', () => {
   });
 
   describe('«Что есть в Linkeon»', () => {
-    it('тот же блок о платформе, что у ассистентов релея', async () => {
+    it('тот же перечень разделов, что у ассистентов релея, плюс правило справки и инициатива', async () => {
+      // Маша — локальный CLI, инструмент справки у неё выдан всегда (в отличие от
+      // приветствия без тулов, которое отпало с удалением DeepSeek), поэтому карта
+      // идёт с helpTool+initiative напрямую, без отдельного linkeonHelpPrompt.
       const { system } = await mashaSystemPrompt();
 
-      expect(system).toContain(platformGuide('ru'));
+      expect(system).toContain(platformGuide('ru', { helpTool: LINKEON_HELP_CLI_TOOL_NAME, initiative: true }));
     });
 
     it('без пометки про инструменты релея: их у Маши нет', async () => {

@@ -1,9 +1,10 @@
-import { Controller, Get, Post, Body, Param, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Body, Param, Query, Headers, UseGuards } from '@nestjs/common';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { SupportService } from './support.service';
 import { PostUserMessageDto } from './support.dto';
+import { isStoreBuild } from '../chat/client-kind';
 
 @Controller('support')
 @UseGuards(JwtGuard)
@@ -41,8 +42,12 @@ export class SupportController {
   }
 
   @Post('message')
-  async postMessage(@CurrentUser() u: any, @Body() dto: PostUserMessageDto) {
-    return this.support.postUserMessage(u.userId, dto);
+  async postMessage(
+    @CurrentUser() u: any,
+    @Body() dto: PostUserMessageDto,
+    @Headers('x-linkeon-distribution') distribution?: string,
+  ) {
+    return this.support.postUserMessage(u.userId, dto, { storeBuild: isStoreBuild(distribution) });
   }
 
   @Get('health')

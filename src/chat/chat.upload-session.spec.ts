@@ -3,6 +3,7 @@ import axios from 'axios';
 import { ChatService } from './chat.service';
 import { ChatController } from './chat.controller';
 import { relaySessionKey } from './relay-session';
+import { verifyProductToolToken } from '../products/product-tool.token';
 
 jest.mock('axios');
 jest.mock('../common/telegram-alert', () => ({ sendTelegramAlert: jest.fn(async () => {}) }));
@@ -194,5 +195,16 @@ describe('uploadAndChat: файл уходит в сессию разговор�
 
     expect(fields.systemPrompt).toContain(PROFILE);
     expect(fields.message).toBe('что тут по листам?');
+  });
+
+  it('везёт поля точки продуктов — продукты, файлы и справка, как у текстового хода', async () => {
+    const f = await upload(makePg(), { ui: JSON.stringify({ activity: true, ask: true }) });
+    expect(f.products_mcp_url).toMatch(/\/webhook\/mcp\/products$/);
+    expect(verifyProductToolToken(f.products_token)).toEqual({ userId: 'u1', channel: 'web', lang: 'ru', client: 'web', agent: 'staff' });
+  });
+
+  it('без ui (Flutter) — клиент app', async () => {
+    const f = await upload(makePg());
+    expect(verifyProductToolToken(f.products_token).client).toBe('app');
   });
 });

@@ -15,8 +15,9 @@ describe('карточки продуктов в ходе чата', () => {
   });
 
   it('метка хода уходит в токен и релея, и Маши', () => {
-    expect(SRC).toContain('productsRelayFields(userId, productsTurn)');
-    expect(SRC).toContain("productsCliMcp(userId, 'web', productsTurn)");
+    // Метка едет полем opts рядом с полями справки (язык, клиент, вид ассистента).
+    expect(SRC).toMatch(/productsRelayFields\(userId, \{[^}]*turn: productsTurn,?\s*\}\)/);
+    expect(SRC).toMatch(/productsCliMcp\(userId, 'web', \{[^}]*turn: productsTurn \}\)/);
   });
 
   // Было 2 (релей, Маша) до ревью задачи 11. Третий — в catch-ветке релея:

@@ -9,6 +9,7 @@
     "worker",
     "voice-host",
     "product-runner",
+    "studio",
     "**/*spec.ts"
   ]
 }

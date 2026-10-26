@@ -1,4 +1,5 @@
 import * as jwt from 'jsonwebtoken';
+import { SUPPORTED_LANGUAGES } from '../common/services/language.service';
 
 /**
  * Отдельный тип, а не 'access'. Токен уезжает на релей и живёт там в файле
@@ -15,8 +16,35 @@ export const PRODUCT_TOOL_TOKEN_TYPE = 'product-tool';
  */
 export type ProductToolChannel = 'web' | 'telegram';
 
+/**
+ * Для справки (platform-kb): на каком клиенте ход и на каком языке подписи.
+ * Едут в подписи по той же причине, что владелец и канал: поле запроса пишет
+ * модель.
+ *   client — web | app (Flutter) | store (сборки из сторов) | telegram;
+ *   scope  — full (по умолчанию) или help: только справка, без продуктов и
+ *            файлов, — для ходов Telegram-группы с посторонними;
+ *   agent  — staff | custom, только для учёта вызовов справки.
+ * Все поля необязательны: токен без них (выпущенный до 24.10.2026) — прежний.
+ */
+export type ProductToolClient = 'web' | 'app' | 'store' | 'telegram';
+export type ProductToolScope = 'full' | 'help';
+export type ProductToolAgent = 'staff' | 'custom';
+
+const CLIENTS: readonly string[] = ['web', 'app', 'store', 'telegram'];
+const SCOPES: readonly string[] = ['full', 'help'];
+const AGENTS: readonly string[] = ['staff', 'custom'];
+
+export interface ProductToolTokenOpts {
+  lang?: string;
+  client?: ProductToolClient;
+  scope?: ProductToolScope;
+  agent?: ProductToolAgent;
+  /** Метка хода чата (uuid) — см. ProductToolClaims.turn. */
+  turn?: string;
+}
+
 /** Что несёт проверенный токен. */
-export interface ProductToolClaims {
+export interface ProductToolClaims extends Omit<ProductToolTokenOpts, 'turn'> {
   userId: string;
   channel: ProductToolChannel;
   /**
@@ -28,6 +56,25 @@ export interface ProductToolClaims {
 }
 
 const TURN_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Необязательные поля — одна проверка на выпуск и на разбор. Незнакомое
+ * значение подписать могли только мы сами, то есть это ошибка в коде: отказ,
+ * как у незнакомого канала. scope=full не пишется вовсе — его отсутствие и есть full.
+ */
+function extraClaims(src: any): ProductToolTokenOpts {
+  const out: ProductToolTokenOpts = {};
+  const check = (field: string, value: unknown, allowed: readonly string[]) => {
+    if (typeof value !== 'string' || !allowed.includes(value)) {
+      throw new Error(`Неизвестное значение ${field} в токене: ${value}`);
+    }
+  };
+  if (src?.lang != null) { check('lang', src.lang, SUPPORTED_LANGUAGES); out.lang = src.lang; }
+  if (src?.client != null) { check('client', src.client, CLIENTS); out.client = src.client; }
+  if (src?.scope != null) { check('scope', src.scope, SCOPES); if (src.scope === 'help') out.scope = 'help'; }
+  if (src?.agent != null) { check('agent', src.agent, AGENTS); out.agent = src.agent; }
+  return out;
+}
 
 /**
  * Сколько живёт токен — по каналу.
@@ -60,13 +107,20 @@ function previousSecret(): string | null {
  * Канал по умолчанию — web: так чеканит релей (веб-ассистенты), и так же
  * разбираются токены, выпущенные до появления канала.
  */
-export function signProductToolToken(userId: string, channel: ProductToolChannel = 'web', turn?: string): string {
+export function signProductToolToken(
+  userId: string,
+  channel: ProductToolChannel = 'web',
+  opts: ProductToolTokenOpts = {},
+): string {
   // Незнакомый канал — отказ: без срока jwt.sign выпустил бы вечный токен.
   const ttl = TTL_SECONDS[channel];
   if (!ttl) throw new Error(`Неизвестный канал: ${channel}`);
+  // Метка хода — не через extraClaims: при разборе кривая метка не роняет
+  // токен (карточки просто не найдутся), а при выпуске — ошибка в коде.
+  const { turn, ...rest } = opts;
   if (turn !== undefined && !TURN_RE.test(turn)) throw new Error('Метка хода — не uuid');
   return jwt.sign(
-    { userId, type: PRODUCT_TOOL_TOKEN_TYPE, channel, ...(turn ? { turn } : {}) },
+    { userId, type: PRODUCT_TOOL_TOKEN_TYPE, channel, ...extraClaims(rest), ...(turn ? { turn } : {}) },
     secret(),
     { expiresIn: ttl },
   );
@@ -100,9 +154,9 @@ export function verifyProductToolToken(token: string): ProductToolClaims {
   }
   const turn = typeof payload?.turn === 'string' && TURN_RE.test(payload.turn) ? payload.turn : null;
   const raw = payload?.channel;
-  if (raw === undefined || raw === null) return { userId, channel: 'web', turn };
-  if (raw !== 'web' && raw !== 'telegram') {
+  const channel = raw === undefined || raw === null ? 'web' : raw;
+  if (channel !== 'web' && channel !== 'telegram') {
     throw new Error(`Неизвестный канал в токене: ${raw}`);
   }
-  return { userId, channel: raw, turn };
+  return { userId, channel, ...extraClaims(payload), turn };
 }

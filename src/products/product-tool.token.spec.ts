@@ -95,4 +95,39 @@ describe('токен инструмента продуктов', () => {
   it('незнакомый канал при выпуске — отказ, а не вечный токен', () => {
     expect(() => signProductToolToken('79030169187', 'sms' as any)).toThrow(/канал/i);
   });
+
+  // Справка (platform-kb, 24.10.2026): язык, клиент, область и вид ассистента
+  // едут в подписи, как владелец и канал, — их не пишет модель.
+  describe('поля справки', () => {
+    it('lang, client, scope=help и agent переживают подпись и разбор', () => {
+      const t = signProductToolToken('u-test', 'telegram', { lang: 'en', client: 'telegram', scope: 'help', agent: 'custom' });
+      expect(verifyProductToolToken(t)).toEqual({
+        userId: 'u-test', channel: 'telegram', lang: 'en', client: 'telegram', scope: 'help', agent: 'custom', turn: null,
+      });
+    });
+
+    it('scope=full в токен не пишется: его отсутствие и есть full', () => {
+      const t = signProductToolToken('u-test', 'web', { scope: 'full' });
+      expect((jwt.decode(t) as any).scope).toBeUndefined();
+      expect(verifyProductToolToken(t)).toEqual({ userId: 'u-test', channel: 'web', turn: null });
+    });
+
+    it('без полей — токен прежнего вида', () => {
+      expect(verifyProductToolToken(signProductToolToken('u-test'))).toEqual({ userId: 'u-test', channel: 'web', turn: null });
+    });
+
+    it.each([
+      ['lang', { lang: 'xx' }],
+      ['client', { client: 'tv' }],
+      ['scope', { scope: 'all' }],
+      ['agent', { agent: 'bot' }],
+    ])('незнакомое %s при выпуске — отказ', (_field, opts) => {
+      expect(() => signProductToolToken('u-test', 'web', opts as any)).toThrow(/Неизвестное значение/);
+    });
+
+    it('незнакомое значение в подписанном токене — отказ при разборе', () => {
+      const odd = jwt.sign({ userId: 'u-test', type: PRODUCT_TOOL_TOKEN_TYPE, channel: 'web', scope: 'root' }, process.env.JWT_SECRET!);
+      expect(() => verifyProductToolToken(odd)).toThrow(/Неизвестное значение scope/);
+    });
+  });
 });
