@@ -2801,3 +2801,863 @@ git -C $B add src/products && git -C $B commit -q -m "products: отчёт аг�
 Run (нода, бэк): `src/products/provisioning.complete-rekey-purge.spec.ts src/products/provisioning.rekey-purge.spec.ts src/products/provisioning.job.spec.ts src/products/provisioning.integration.spec.ts src/products/domains.jobs.spec.ts`. Expected: PASS. Затем tsc бэка.
 
 ---
+
+### Task 11: Сервер — правки не ставятся, пока меняются ключи
+
+**Files:**
+- Modify: `src/products/turns.service.ts` (новая константа рядом с `BLOCKED_REFUSAL` ~122; `enqueue` ~305–316)
+- Modify: `src/products/product-tool.service.ts` (`refusal` ~499–522, импорт)
+- Test: `src/products/turns.enqueue.spec.ts` (опция мока и тест), `src/products/product-tool.rekey.spec.ts` (новый)
+
+Пересоздание контейнера посреди хода убивает ход молча (раннер живёт внутри контейнера). С одной стороны выдачу `rekey` держит отсутствие правок (задача 9), с другой — эта задача: пока `rekey` в очереди или идёт, новая правка не ставится.
+
+- [ ] **Step 1: Тесты**
+
+В `src/products/turns.enqueue.spec.ts`:
+1. В тип опций `makeService` добавить `rekeying?: boolean;`, а в мок `pg.query` первой строкой тела (до ветки `SELECT status FROM products`):
+
+```ts
+      if (sql.includes("kind = 'rekey'")) return { rows: opts.rekeying ? [{ x: 1 }] : [] };
+```
+2. Импорт: `REKEY_REFUSAL` рядом с `BLOCKED_REFUSAL`. В конец файла:
+
+```ts
+describe('правка во время смены ключей', () => {
+  it('пока rekey в очереди или идёт — 409 со своим текстом, ход не ставится', async () => {
+    const { svc, calls } = makeService({ rekeying: true });
+    await expect(svc.enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: 'п' })).rejects.toThrow(ConflictException);
+    await expect(svc.enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: 'п' })).rejects.toThrow(REKEY_REFUSAL);
+    expect(calls.some((c) => c.sql.includes('INSERT INTO product_turns'))).toBe(false);
+    const q = calls.find((c) => c.sql.includes("kind = 'rekey'"))!;
+    expect(q.sql).toMatch(/status IN \('queued','running'\)/);
+  });
+
+  it('спящему по-прежнему свой отказ — проверка ключей стоит после статусов', async () => {
+    const { svc } = makeService({ rekeying: true, productStatus: 'sleeping' });
+    await expect(svc.enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: 'п' })).rejects.toThrow(SLEEPING_REFUSAL);
+  });
+});
+```
+
+`src/products/product-tool.rekey.spec.ts`:
+
+```ts
+import { ConflictException } from '@nestjs/common';
+import { ProductToolService } from './product-tool.service';
+import { REKEY_REFUSAL } from './turns.service';
+
+const PRODUCT = { id: 'p1', name: 'Магазин', slug: 'magazin', domain: null, kind: 'bot', status: 'running' };
+
+describe('отказ правке во время смены ключей — ассистенту свой reason', () => {
+  it('reason rekeying, без предложения пополнить', async () => {
+    const pg = { query: jest.fn(async (sql: string) => (sql.includes('FROM products') ? { rows: [PRODUCT] } : { rows: [] })) };
+    const turns = { enqueue: jest.fn(async () => { throw new ConflictException(REKEY_REFUSAL); }) };
+    const svc = new ProductToolService(pg as any, turns as any, {} as any);
+    const r: any = await svc.execute('u1', { action: 'edit', product: 'Магазин', prompt: 'поменяй приветствие' });
+    expect(r).toMatchObject({ ok: false, reason: 'rekeying', canTopUp: false });
+    expect(r.say).toMatch(/через пару минут/);
+  });
+});
+```
+
+- [ ] **Step 2: Коммит, прогон — FAIL** (`REKEY_REFUSAL` не экспортируется)
+
+```bash
+git -C $B add src/products/turns.enqueue.spec.ts src/products/product-tool.rekey.spec.ts && git -C $B commit -q -m "test(products): правка во время смены ключей — 409 и свой reason (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/products/turns.enqueue.spec.ts src/products/product-tool.rekey.spec.ts`.
+
+- [ ] **Step 3: Реализация**
+
+`src/products/turns.service.ts` — после `BLOCKED_REFUSAL`:
+
+```ts
+/**
+ * Отказ правке, пока меняются ключи продукта (задание rekey в очереди или
+ * идёт). Смена ключей ПЕРЕСОЗДАЁТ контейнер, а раннер живёт внутри него:
+ * поставленная сейчас правка была бы убита посреди хода молча, а
+ * выдача rekey ждала бы её конца (claimJob) — то есть правка и ключи
+ * загораживали бы друг друга до сборщика. 409, а не 402: деньги тут ни при
+ * чём, кабинет показывает текст сервера (см. BLOCKED_REFUSAL).
+ */
+export const REKEY_REFUSAL = 'Сейчас меняются ключи продукта — правку можно поставить через пару минут.';
+```
+
+В `enqueue` сразу после блока
+
+```ts
+    if (productStatus !== 'running') {
+      throw new ConflictException('Продукт сейчас недоступен для правок');
+    }
+```
+вставить:
+
+```ts
+    // После статусов (у спящего и погашенного — свои тексты) и ДО баланса:
+    // пополнение смену ключей не ускорит. Отдельным запросом, а не полем
+    // SELECT статуса: тот же запрос читают мок-спеки модуля по подстроке.
+    const rekey = await this.pg.query(
+      `SELECT 1 FROM product_provision_jobs
+        WHERE product_id = $1 AND kind = 'rekey' AND status IN ('queued','running') LIMIT 1`,
+      [input.productId],
+    );
+    if (rekey.rows.length) throw new ConflictException(REKEY_REFUSAL);
+```
+
+`src/products/product-tool.service.ts`: в импорт из `./turns.service` добавить `REKEY_REFUSAL`; в `refusal` перед веткой `'Недостаточно токенов'`:
+
+```ts
+    if (msg === REKEY_REFUSAL) {
+      return { ok: false, reason: 'rekeying', canTopUp: false, product,
+        say: `${REKEY_REFUSAL} Повтори правку через пару минут — продукт перезапускается с новыми ключами.` };
+    }
+```
+
+- [ ] **Step 4: Коммит, прогон — PASS**
+
+```bash
+git -C $B add src/products && git -C $B commit -q -m "products: правка не ставится, пока меняются ключи; свой reason ассистенту" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/products/turns.enqueue.spec.ts src/products/product-tool.rekey.spec.ts src/products/turns.revert.spec.ts src/products/product-tool.spec.ts src/products/product-lifecycle.pg.spec.ts`. Expected: PASS. Затем tsc бэка.
+
+---
+
+### Task 12: Сервер — журнал: вид продукта в карточке, коробки не переживают действие
+
+**Files:**
+- Modify: `src/products/product-actions.service.ts` (`ActionView`/`toView` ~38–77; `release` ~206–213; `finish` ~219–227; `sweepStuck` ~243–253)
+- Test: `src/products/product-actions.sweep.pg.spec.ts` (новый, живая база), `src/products/product-actions.service.spec.ts` (вид)
+
+Три правки журнала под смену ключей:
+1. `productKind` в виде — карточка не предлагает «Убрать» у `BOT_TOKEN` бота.
+2. Подметальщик `working` не трогает карточку, у которой задание `rekey` ещё в очереди или идёт (иначе карточка, отправленная на 29-й минуте, умерла бы через 11 минут при живом задании), и закрывает ту, чьё задание сняли снаружи (сборщик, удаление, возврат), — с текстом смены ключей.
+3. Коробка (`secrets_box`) стирается ЛЮБЫМ закрытием карточки (`finish`, `release`, подметальщик) — шифротекст живёт не дольше задания (спека, «Журнал»).
+
+- [ ] **Step 1: Тесты**
+
+В `src/products/product-actions.service.spec.ts`, в `describe('вид действия', …)`:
+
+```ts
+  it('вид продукта — из payload; у карточки бота — всегда bot', () => {
+    expect(toView(row({ payload: { productKind: 'site' } }), now).productKind).toBe('site');
+    expect(toView(row({ kind: 'create_bot', payload: {} }), now).productKind).toBe('bot');
+    expect(toView(row({ payload: {} }), now).productKind).toBeNull();
+  });
+```
+
+`src/products/product-actions.sweep.pg.spec.ts`:
+
+```ts
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
+import { Pool } from 'pg';
+import { MIGRATIONS } from './products.service';
+import { ProductActionsService, REKEY_FAILED_SAY } from './product-actions.service';
+
+const PG = process.env.PROVISIONING_PG_URL;
+const maybe = PG ? describe : describe.skip;
+
+maybe('подметальщик журнала и коробки ключей против живого Postgres', () => {
+  let pool: Pool;
+  let svc: ProductActionsService;
+
+  async function product() {
+    const id = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash)
+       VALUES ($1, 'u1', 'П', $2, 'bot', 'running', '/product', $3)`,
+      [id, `s-${id.slice(0, 8)}`, `h-${id}`],
+    );
+    return id;
+  }
+  async function keysCard(productId: string, o: { expired: boolean; job?: 'queued' | 'running' | 'failed' }) {
+    const a = await pool.query(
+      `INSERT INTO product_actions (user_id, product_id, kind, status, channel, secrets_box, expires_at)
+       VALUES ('u1', $1, 'keys', 'working', 'web', '\\x01020304'::bytea,
+               CASE WHEN $2 THEN now() - interval '20 minutes' ELSE now() + interval '20 minutes' END)
+       RETURNING id`,
+      [productId, o.expired],
+    );
+    if (o.job) {
+      await pool.query(
+        `INSERT INTO product_provision_jobs (product_id, kind, status, action_id) VALUES ($1, 'rekey', $2, $3)`,
+        [productId, o.job, a.rows[0].id],
+      );
+    }
+    return a.rows[0].id as string;
+  }
+  const card = async (id: string) => (await pool.query(`SELECT status, secrets_box, result FROM product_actions WHERE id = $1`, [id])).rows[0];
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: PG, max: 4 });
+    for (const f of MIGRATIONS) await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', f), 'utf8'));
+    svc = new ProductActionsService({ query: (s: string, p?: any[]) => pool.query(s, p) } as any);
+  });
+  beforeEach(() => pool.query('TRUNCATE products, product_provision_jobs, product_actions RESTART IDENTITY CASCADE'));
+  afterAll(async () => {
+    await pool.query('TRUNCATE products, product_provision_jobs, product_actions RESTART IDENTITY CASCADE');
+    await pool.end();
+  });
+
+  it('карточка с живым заданием rekey не подметается даже после срока', async () => {
+    const p = await product();
+    const id = await keysCard(p, { expired: true, job: 'running' });
+    await svc.sweepStuck();
+    expect((await card(id)).status).toBe('working');
+  });
+
+  it('задание сняли снаружи — карточка failed с текстом смены ключей, коробка стёрта', async () => {
+    const p = await product();
+    const id = await keysCard(p, { expired: false, job: 'failed' });
+    await svc.sweepStuck();
+    const c = await card(id);
+    expect(c.status).toBe('failed');
+    expect(c.secrets_box).toBeNull();
+    expect(c.result).toEqual({ error: REKEY_FAILED_SAY, reason: 'rekey_failed' });
+  });
+
+  it('прежнее поведение: working без задания после срока + 10 минут — failed с общим текстом', async () => {
+    const p = await product();
+    const id = await keysCard(p, { expired: true });
+    await svc.sweepStuck();
+    expect((await card(id)).result).toEqual({ error: 'Действие прервалось — попросите ассистента повторить' });
+  });
+
+  it('закрытая карточка с коробкой — коробка стирается подметальщиком', async () => {
+    const p = await product();
+    const id = await keysCard(p, { expired: false });
+    await pool.query(`UPDATE product_actions SET status = 'done' WHERE id = $1`, [id]);
+    await svc.sweepStuck();
+    expect((await card(id)).secrets_box).toBeNull();
+  });
+
+  it('finish и release стирают коробку сами', async () => {
+    const p = await product();
+    const a = await keysCard(p, { expired: false });
+    await svc.release(a, { error: 'поправьте' });
+    expect((await card(a)).secrets_box).toBeNull();
+    const b = await keysCard(p, { expired: false });
+    await svc.finish(b, 'failed', { error: 'x' });
+    expect((await card(b)).secrets_box).toBeNull();
+  });
+});
+```
+
+- [ ] **Step 2: Коммит, прогон — FAIL**
+
+```bash
+git -C $B add src/products/product-actions.service.spec.ts src/products/product-actions.sweep.pg.spec.ts && git -C $B commit -q -m "test(products): журнал — вид продукта, подметальщик смены ключей, коробки (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/products/product-actions.service.spec.ts src/products/product-actions.sweep.pg.spec.ts`.
+
+- [ ] **Step 3: Реализация** в `src/products/product-actions.service.ts`
+
+1. `ActionView` — после `productName`:
+
+```ts
+  /** Форма продукта: карточка ключей не предлагает убрать BOT_TOKEN у бота. */
+  productKind: 'site' | 'bot' | null;
+```
+и в `toView` после `productName: …,`:
+
+```ts
+    productKind: row.kind === 'create_bot'
+      ? 'bot'
+      : (row.payload?.productKind === 'site' || row.payload?.productKind === 'bot' ? row.payload.productKind : null),
+```
+
+2. `release`: строку `` `UPDATE product_actions SET status = 'pending', confirmed_via = NULL, result = $2::jsonb `` заменить на `` `UPDATE product_actions SET status = 'pending', confirmed_via = NULL, result = $2::jsonb, secrets_box = NULL ``; в докблок: «Коробка ключей стирается и здесь: pending-карточка шифротекста не держит никогда — новый набор пишется только вместе с заданием (ProductKeysService)».
+
+3. `finish`: в `SET` после `resolved_at = now(),` добавить `secrets_box = NULL,`; в докблок: «Любое закрытие стирает коробку ключей: шифротекст живёт не дольше задания».
+
+4. `sweepStuck` целиком:
+
+```ts
+  /**
+   * working-карточки без исхода. Два случая:
+   *   - процесс умер между claim и finish/release (обрыв с базой, падение) —
+   *     у карточки нет задания, и срок в прошлом больше чем на 10 минут
+   *     отличает мертвеца от живой операции (сама работа — секунды);
+   *   - смена ключей: задание rekey сняли снаружи (сборщик зависших,
+   *     удаление продукта, возврат) — исход в карточку не записан. Такая
+   *     карточка закрывается с текстом смены ключей, без ожидания срока.
+   * Карточку с ЖИВЫМ заданием (queued/running) не трогаем ни при каком сроке:
+   * отправленная на 29-й минуте, она иначе умерла бы при работающем агенте.
+   *
+   * Вторым оператором — стирание коробок у закрытых карточек: страховка на
+   * случай закрытия мимо finish/release (ручная правка, будущий код).
+   */
+  async sweepStuck(): Promise<number> {
+    const r = await this.pg.query(
+      `UPDATE product_actions a
+          SET status = 'failed',
+              secrets_box = NULL,
+              result = CASE
+                WHEN EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id)
+                  THEN jsonb_build_object('error', $1::text, 'reason', 'rekey_failed')
+                ELSE jsonb_build_object('error', 'Действие прервалось — попросите ассистента повторить')
+              END,
+              resolved_at = now()
+        WHERE a.status = 'working'
+          AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
+                           WHERE j.action_id = a.id AND j.status IN ('queued','running','done'))
+          AND (EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = a.id AND j.status = 'failed')
+               OR a.expires_at < now() - interval '10 minutes')
+       RETURNING a.id`,
+      [REKEY_FAILED_SAY],
+    );
+    await this.pg.query(
+      `UPDATE product_actions SET secrets_box = NULL
+        WHERE secrets_box IS NOT NULL AND status IN ('done','failed','expired','cancelled')`,
+    );
+    return r.rows.length;
+  }
+```
+`REKEY_FAILED_SAY` объявлен в этом же файле (задача 10) — объявление стоит выше класса.
+
+Юнит-сторож `sweepStuck` в `product-actions.service.spec.ts` (~101–110) проверяет `calls[0]`: `status = 'working'`, `expires_at < now() - interval '10 minutes'`, `status = 'failed'`, `Действие прервалось`, отсутствие `BOT_TOKEN|pending` — новая форма всё это сохраняет.
+
+- [ ] **Step 4: Коммит, прогон — PASS**
+
+```bash
+git -C $B add src/products/product-actions.service.ts && git -C $B commit -q -m "products: журнал — вид продукта в карточке; подметальщик не трогает живую смену ключей; коробки стираются закрытием" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/products/product-actions.service.spec.ts src/products/product-actions.sweep.pg.spec.ts src/products/product-actions.pg.spec.ts src/products/product-actions.controller.spec.ts src/products/product-lifecycle.service.spec.ts src/products/product-lifecycle.pg.spec.ts`. Expected: PASS. Затем tsc бэка.
+
+---
+
+### Task 13: Сервер — карточка ключей: открыть и отправить
+
+**Files:**
+- Create: `src/products/product-keys.service.ts`
+- Test: `src/products/product-keys.service.spec.ts` (новый, моки), `src/products/product-keys.pg.spec.ts` (новый, живая база: карточка → выдача → отчёт)
+
+Правила:
+- открыть — только живому продукту в `running`/`degraded`; спящему, погашенному, заводящемуся, не заведённому — отказ своим текстом; в карточку — ИМЕНА текущих ключей (расшифровка на сервере, значения дальше этого метода не идут);
+- отправить — `{set, remove}`; поправимое (форма, занятое имя, неверный токен, бот занят, идёт правка, машина занята, «ничего не изменено») возвращает карточку в `pending` с `result.error` и `field`; непоправимое (продукт удалён, уснул, погашен) — `failed`;
+- `BOT_TOKEN` бота сменился — `getMe`; Telegram не принял/не ответил — поправимо; бот уже в другом живом продукте — поправимо; `tgBotId` уходит в payload карточки (пишется в продукт отчётом об успехе, задача 10);
+- новый набор = старый − `remove` + `set`, проверяется ЦЕЛИКОМ `secretsProblem` (задача 2); шифруется `SecretsService` с AAD id продукта; задание `rekey` и коробка пишутся ОДНИМ оператором, коробка — только если задание встало;
+- значения ключей не попадают ни в payload, ни в result, ни в лог, ни в ответ — только имена.
+
+- [ ] **Step 1: Тесты на моках**
+
+`src/products/product-keys.service.spec.ts`:
+
+```ts
+import { ProductKeysService } from './product-keys.service';
+import { SecretsService } from './secrets.service';
+
+const KEY = '00112233445566778899aabbccddeeff0f1e2d3c4b5a69788796a5b4c3d2e1f0';
+const secrets = new SecretsService({ get: (k: string) => (k === 'PRODUCT_SECRETS_KEY' ? KEY : undefined) } as any);
+const PID = 'aaaaaaaa-bbbb-4ccc-8ddd-000000000001';
+const AID = 'aaaaaaaa-bbbb-4ccc-8ddd-0000000000a1';
+const CANARY = 'КАНАРЕЙКА-значение-ключа-7f3e';
+
+function harness(o: { status?: string; kind?: 'site' | 'bot'; block?: string | null; old?: Record<string, string>; turns?: number; jobs?: number; taken?: boolean; queued?: number; tgBotId?: number | null } = {}) {
+  const calls: Array<{ sql: string; params: any[] }> = [];
+  const product = {
+    id: PID, name: 'Бот', slug: 'bot-x', kind: o.kind ?? 'bot', status: o.status ?? 'running',
+    block_reason: o.block ?? null, tg_bot_id: o.tgBotId ?? 111,
+    secrets_encrypted: secrets.encrypt(o.old ?? { BOT_TOKEN: '111111:TEST-old', OLD_KEY: 'o' }, PID),
+  };
+  const pg = {
+    query: jest.fn(async (sql: string, params: any[] = []) => {
+      calls.push({ sql, params });
+      if (sql.includes('FROM products') && sql.includes('user_id = $2')) return { rows: [product] };
+      if (sql.includes('FROM product_turns')) return { rows: [{ turns: o.turns ?? 0, jobs: o.jobs ?? 0 }] };
+      if (sql.includes('tg_bot_id = $1')) return { rows: o.taken ? [{ x: 1 }] : [] };
+      if (sql.includes('INSERT INTO product_provision_jobs')) return { rows: [{ queued: o.queued ?? 1 }] };
+      return { rows: [] };
+    }),
+  };
+  const actions = {
+    open: jest.fn(async () => ({ id: AID, expiresAt: '2026-10-26T10:30:00.000Z' })),
+    claim: jest.fn(async () => ({ id: AID, user_id: 'u1', product_id: PID, kind: 'keys', status: 'working', channel: 'web', payload: {}, result: null })),
+    release: jest.fn(async () => undefined),
+    finish: jest.fn(async () => undefined),
+  };
+  const svc = new ProductKeysService(pg as any, actions as any, secrets);
+  (svc as any).checkBot = jest.fn(async () => ({ ok: true, id: 222, username: 'new_bot' }));
+  return { svc, pg, calls, actions, product };
+}
+
+describe('карточка ключей: открыть', () => {
+  it('в карточку — имена текущих ключей по алфавиту, без значений', async () => {
+    const h = harness({ old: { OLD_KEY: CANARY, BOT_TOKEN: '111111:TEST-old' } });
+    const r = await h.svc.open({ userId: 'u1', productId: PID, channel: 'web', turn: null });
+    expect(r).toMatchObject({ ok: true, actionId: AID, keyNames: ['BOT_TOKEN', 'OLD_KEY'] });
+    expect(h.actions.open).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'keys', productId: PID,
+      payload: { name: 'Бот', slug: 'bot-x', productKind: 'bot', keyNames: ['BOT_TOKEN', 'OLD_KEY'] },
+    }));
+    expect(JSON.stringify(h.actions.open.mock.calls)).not.toContain(CANARY);
+  });
+
+  it.each([
+    ['sleeping', null, 'sleeping'],
+    ['blocked', 'нарушение', 'blocked'],
+    ['running', 'нарушение', 'blocked'],
+    ['provisioning', null, 'provisioning'],
+    ['failed', null, 'failed_product'],
+  ])('статус %s (блок %s) — отказ %s, карточка не открывается', async (status, block, reason) => {
+    const h = harness({ status, block });
+    const r = await h.svc.open({ userId: 'u1', productId: PID, channel: 'web', turn: null });
+    expect(r).toMatchObject({ ok: false, reason });
+    expect(h.actions.open).not.toHaveBeenCalled();
+  });
+});
+
+describe('карточка ключей: отправить', () => {
+  const send = (h: ReturnType<typeof harness>, set: unknown, remove: unknown = []) =>
+    h.svc.complete({ userId: 'u1', actionId: AID, set, remove, via: 'chat' });
+
+  it('замена, удаление и добавление — один оператор с заданием и коробкой; в payload только имена', async () => {
+    const h = harness();
+    const r = await send(h, { NEW_KEY: CANARY }, ['OLD_KEY']);
+    expect(r).toEqual({ ok: true, queued: true });
+    const ins = h.calls.find((c) => c.sql.includes('INSERT INTO product_provision_jobs'))!;
+    expect(ins.sql).toMatch(/'rekey'/);
+    expect(ins.sql).toMatch(/secrets_box = \$2/);
+    const [actionId, box, patch] = ins.params;
+    expect(actionId).toBe(AID);
+    expect(secrets.decrypt(box, PID)).toEqual({ BOT_TOKEN: '111111:TEST-old', NEW_KEY: CANARY });
+    expect(JSON.parse(patch)).toEqual({ newKeyNames: ['BOT_TOKEN', 'NEW_KEY'], removedNames: ['OLD_KEY'], changedNames: ['NEW_KEY'] });
+    expect(h.actions.release).not.toHaveBeenCalled();
+    expect(h.actions.finish).not.toHaveBeenCalled();
+  });
+
+  it('значение ключа не уходит никуда, кроме коробки: ни в SQL-параметры текстом, ни в ответ, ни в лог', async () => {
+    const h = harness();
+    const logs: string[] = [];
+    (h.svc as any).logger = { warn: (m: string) => logs.push(m), error: (m: string) => logs.push(m), log: (m: string) => logs.push(m) };
+    const r = await send(h, { NEW_KEY: CANARY, BAD_ONE: '' });
+    const textParams = h.calls.flatMap((c) => c.params).filter((p) => !Buffer.isBuffer(p));
+    expect(JSON.stringify(textParams)).not.toContain(CANARY);
+    expect(JSON.stringify(r)).not.toContain(CANARY);
+    expect(JSON.stringify(h.actions.release.mock.calls)).not.toContain(CANARY);
+    expect(logs.join('\n')).not.toContain(CANARY);
+  });
+
+  it.each([
+    [{}, [], 'nothing'],
+    [{ A: 'x' }, ['A'], 'bad_input'],
+    [{ PORT: '1' }, [], 'bad_input'],
+    [{ OWNER_TG_ID: '1' }, [], 'bad_input'],
+    [{ 'A B': '1' }, [], 'bad_input'],
+    [{ A: '' }, [], 'bad_input'],
+    [{}, ['BOT_TOKEN'], 'bad_input'],
+    [{}, ['NO_SUCH'], 'bad_input'],
+    ['не объект', [], 'bad_input'],
+    [{}, 'не список', 'bad_input'],
+  ])('set %j, remove %j — поправимо (%s): карточка снова ждёт, задания нет', async (set, remove, reason) => {
+    const h = harness();
+    const r = await send(h, set, remove);
+    expect(r).toMatchObject({ ok: false, reason });
+    expect(h.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ error: expect.any(String) }));
+    expect(h.calls.some((c) => c.sql.includes('INSERT INTO product_provision_jobs'))).toBe(false);
+  });
+
+  it('идёт правка или машина занята — поправимо, своим текстом', async () => {
+    const a = harness({ turns: 1 });
+    expect(await send(a, { NEW_KEY: 'n' })).toMatchObject({ ok: false, reason: 'busy_turn' });
+    const b = harness({ jobs: 1 });
+    expect(await send(b, { NEW_KEY: 'n' })).toMatchObject({ ok: false, reason: 'busy' });
+  });
+
+  it('новый BOT_TOKEN: getMe; Telegram не принял — поправимо, поле BOT_TOKEN', async () => {
+    const h = harness();
+    (h.svc as any).checkBot = jest.fn(async () => ({ ok: false, reason: 'rejected' }));
+    const r = await send(h, { BOT_TOKEN: '222222:TEST-new' });
+    expect(r).toMatchObject({ ok: false, reason: 'bad_token' });
+    expect(h.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ field: 'BOT_TOKEN' }));
+  });
+
+  it('новый BOT_TOKEN другого бота, который уже в живом продукте, — поправимо', async () => {
+    const h = harness({ taken: true });
+    expect(await send(h, { BOT_TOKEN: '222222:TEST-new' })).toMatchObject({ ok: false, reason: 'bot_in_use' });
+  });
+
+  it('новый BOT_TOKEN свободного бота — tgBotId в payload, токен без пробелов по краям', async () => {
+    const h = harness();
+    await send(h, { BOT_TOKEN: '  222222:TEST-new  ' });
+    expect((h.svc as any).checkBot).toHaveBeenCalledWith('222222:TEST-new');
+    const ins = h.calls.find((c) => c.sql.includes('INSERT INTO product_provision_jobs'))!;
+    expect(JSON.parse(ins.params[2]).tgBotId).toBe(222);
+  });
+
+  it('тот же BOT_TOKEN — Telegram не спрашивается', async () => {
+    const h = harness();
+    await send(h, { BOT_TOKEN: '111111:TEST-old', NEW_KEY: 'n' });
+    expect((h.svc as any).checkBot).not.toHaveBeenCalled();
+  });
+
+  it.each([['sleeping', null], ['running', 'блок']])('продукт в %s (блок %s) к моменту отправки — карточка failed', async (status, block) => {
+    const h = harness({ status, block });
+    const r = await send(h, { NEW_KEY: 'n' });
+    expect(r.ok).toBe(false);
+    expect(h.actions.finish).toHaveBeenCalledWith(AID, 'failed', expect.objectContaining({ error: expect.any(String) }));
+  });
+
+  it('продукт сменил состояние между проверкой и записью — failed, коробки нет', async () => {
+    const h = harness({ queued: 0 });
+    const r = await send(h, { NEW_KEY: 'n' });
+    expect(r).toMatchObject({ ok: false, reason: 'state_changed' });
+    expect(h.actions.finish).toHaveBeenCalledWith(AID, 'failed', expect.any(Object));
+  });
+
+  it('чужая, закрытая или просроченная карточка — not_pending, база не трогается', async () => {
+    const h = harness();
+    h.actions.claim.mockResolvedValueOnce(null as any);
+    expect(await send(h, { NEW_KEY: 'n' })).toMatchObject({ ok: false, reason: 'not_pending' });
+    expect(h.calls).toHaveLength(0);
+  });
+});
+```
+
+- [ ] **Step 2: Тест против живой базы** — вся цепочка: карточка → выдача агенту → отчёт
+
+`src/products/product-keys.pg.spec.ts`:
+
+```ts
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
+import { Pool } from 'pg';
+import { MIGRATIONS } from './products.service';
+import { ProvisioningService } from './provisioning.service';
+import { HostsService } from './hosts.service';
+import { LimitsService } from './limits.service';
+import { RentService } from './rent.service';
+import { SecretsService } from './secrets.service';
+import { ProductActionsService } from './product-actions.service';
+import { ProductKeysService } from './product-keys.service';
+
+const PG = process.env.PROVISIONING_PG_URL;
+const maybe = PG ? describe : describe.skip;
+const KEY = '00112233445566778899aabbccddeeff0f1e2d3c4b5a69788796a5b4c3d2e1f0';
+
+maybe('смена ключей целиком против живого Postgres', () => {
+  let pool: Pool;
+  let provisioning: ProvisioningService;
+  let keys: ProductKeysService;
+  let actions: ProductActionsService;
+  const secrets = new SecretsService({ get: (k: string) => (k === 'PRODUCT_SECRETS_KEY' ? KEY : undefined) } as any);
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: PG, max: 8 });
+    for (const f of MIGRATIONS) await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', f), 'utf8'));
+    const pg = { query: (s: string, p?: any[]) => pool.query(s, p) };
+    provisioning = new ProvisioningService(pg as any, secrets, new HostsService(pg as any), new LimitsService(pg as any), new RentService(pg as any));
+    actions = new ProductActionsService(pg as any);
+    keys = new ProductKeysService(pg as any, actions, secrets);
+    (keys as any).checkBot = async () => ({ ok: true, id: 222, username: 'new_bot' });
+  });
+  beforeEach(async () => {
+    await pool.query('TRUNCATE products, product_provision_jobs, product_turns, product_actions, product_host_agent, product_hosts RESTART IDENTITY CASCADE');
+    await pool.query(
+      `INSERT INTO product_hosts (id, ssh_target, public_ip, domain_suffix, agent_token_hash, capacity, audience)
+       VALUES ('clients', 'root@10.9.9.9', '10.9.9.9', 'c.example', 'x', 20, 'clients')`,
+    );
+  });
+  afterAll(async () => {
+    await pool.query('TRUNCATE products, product_provision_jobs, product_turns, product_actions, product_host_agent, product_hosts RESTART IDENTITY CASCADE');
+    await pool.end();
+  });
+
+  async function bot() {
+    const id = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash, host_id, tg_bot_id, secrets_encrypted)
+       VALUES ($1, 'u1', 'Бот', $2, 'bot', 'running', '/product', $3, 'clients', 111, $4)`,
+      [id, `b-${id.slice(0, 8)}`, `h-${id}`, secrets.encrypt({ BOT_TOKEN: '111111:TEST-old', OLD_KEY: 'o' }, id)],
+    );
+    return id;
+  }
+
+  it('карточка → задание с коробкой → агент получает новый набор → отчёт переносит ключи и метку бота', async () => {
+    const p = await bot();
+    const opened = await keys.open({ userId: 'u1', productId: p, channel: 'web', turn: null });
+    expect(opened).toMatchObject({ ok: true, keyNames: ['BOT_TOKEN', 'OLD_KEY'] });
+    const actionId = (opened as any).actionId;
+
+    expect(await keys.complete({ userId: 'u1', actionId, set: { BOT_TOKEN: '222222:TEST-new', NEW_KEY: 'n' }, remove: ['OLD_KEY'], via: 'cabinet' }))
+      .toEqual({ ok: true, queued: true });
+
+    const job = await provisioning.claimJob('clients');
+    expect(job).toMatchObject({ jobKind: 'rekey', secrets: { BOT_TOKEN: '222222:TEST-new', NEW_KEY: 'n' }, dropNames: ['OLD_KEY'] });
+
+    await provisioning.completeJob(job!.jobId, { ok: true });
+
+    const row = (await pool.query(`SELECT secrets_encrypted, tg_bot_id FROM products WHERE id = $1`, [p])).rows[0];
+    expect(secrets.decrypt(row.secrets_encrypted, p)).toEqual({ BOT_TOKEN: '222222:TEST-new', NEW_KEY: 'n' });
+    expect(Number(row.tg_bot_id)).toBe(222);
+    const a = (await pool.query(`SELECT status, secrets_box, payload, result FROM product_actions WHERE id = $1`, [actionId])).rows[0];
+    expect(a.status).toBe('done');
+    expect(a.secrets_box).toBeNull();
+    expect(JSON.stringify(a)).not.toMatch(/TEST-new|TEST-old/);
+  });
+
+  it('пока задание стоит, правка не ставится, а второе нажатие той же карточки — not_pending', async () => {
+    const p = await bot();
+    const { actionId } = (await keys.open({ userId: 'u1', productId: p, channel: 'web', turn: null })) as any;
+    await keys.complete({ userId: 'u1', actionId, set: { NEW_KEY: 'n' }, remove: [], via: 'chat' });
+    expect(await keys.complete({ userId: 'u1', actionId, set: { NEW_KEY: 'm' }, remove: [], via: 'chat' })).toMatchObject({ reason: 'not_pending' });
+    const jobs = await pool.query(`SELECT count(*)::int AS n FROM product_provision_jobs WHERE product_id = $1 AND kind = 'rekey'`, [p]);
+    expect(jobs.rows[0].n).toBe(1);
+  });
+
+  it('у продукта уже стоит задание — поправимо, коробка не записана', async () => {
+    const p = await bot();
+    await pool.query(`INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'domain', 'queued')`, [p]);
+    const { actionId } = (await keys.open({ userId: 'u1', productId: p, channel: 'web', turn: null })) as any;
+    expect(await keys.complete({ userId: 'u1', actionId, set: { NEW_KEY: 'n' }, remove: [], via: 'chat' })).toMatchObject({ reason: 'busy' });
+    const a = (await pool.query(`SELECT status, secrets_box FROM product_actions WHERE id = $1`, [actionId])).rows[0];
+    expect(a).toEqual({ status: 'pending', secrets_box: null });
+  });
+});
+```
+
+- [ ] **Step 3: Коммит, прогон — FAIL** (`Cannot find module './product-keys.service'`)
+
+```bash
+git -C $B add src/products/product-keys.service.spec.ts src/products/product-keys.pg.spec.ts && git -C $B commit -q -m "test(products): карточка ключей — правила, канарейка, вся цепочка до отчёта (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/products/product-keys.service.spec.ts src/products/product-keys.pg.spec.ts`.
+
+- [ ] **Step 4: Реализация**
+
+`src/products/product-keys.service.ts`:
+
+```ts
+import { Injectable, Logger } from '@nestjs/common';
+import { PgService } from '../common/services/pg.service';
+import { BotTokenCheck, checkBotToken } from './bot-token-check';
+import { ActionChannel, ActionRow, ConfirmedVia, ProductActionsService } from './product-actions.service';
+import { secretsProblem } from './secret-rules';
+import { SecretsService } from './secrets.service';
+
+export type KeysFail = { ok: false; reason: string; message: string };
+
+/**
+ * Отказ по состоянию продукта — один на открытие и на отправку: продукт мог
+ * уснуть или попасть под блокировку, пока карточка ждала нажатия.
+ */
+function statusRefusal(p: { status: string; block_reason: string | null }): KeysFail | null {
+  if (p.block_reason !== null || p.status === 'blocked') {
+    return { ok: false, reason: 'blocked', message: 'Продукт остановлен администратором — ключи меняются через поддержку' };
+  }
+  if (p.status === 'sleeping') {
+    return { ok: false, reason: 'sleeping', message: 'Продукт спит: не хватило токенов на аренду. Ключи меняются у работающего продукта — пополните баланс, он проснётся сам' };
+  }
+  if (p.status === 'provisioning') {
+    return { ok: false, reason: 'provisioning', message: 'Продукт ещё заводится — ключи можно сменить через минуту' };
+  }
+  if (p.status === 'failed') {
+    return { ok: false, reason: 'failed_product', message: 'Продукт не завёлся — сначала его нужно завести заново' };
+  }
+  if (p.status !== 'running' && p.status !== 'degraded') {
+    return { ok: false, reason: 'unavailable', message: 'Продукт сейчас недоступен' };
+  }
+  return null;
+}
+
+/**
+ * Смена ключей владельца карточкой (очередь 2). Открывает карточку с ИМЕНАМИ
+ * текущих ключей и принимает её отправку: проверяет новый набор теми же
+ * правилами, что заведение, шифрует его в коробку карточки и одним
+ * оператором ставит задание rekey агенту машины. Ключи в базе продукта
+ * меняются только отчётом агента об успехе (ProvisioningService).
+ *
+ * Значения ключей живут здесь только в локальных переменных: в payload и
+ * result — имена, в логе — ничего от значений, в ответе — ничего.
+ */
+@Injectable()
+export class ProductKeysService {
+  private readonly logger = new Logger(ProductKeysService.name);
+  /** Поле, а не прямой вызов: тесты подменяют Telegram (тот же приём, что у lifecycle). */
+  private checkBot: (token: string) => Promise<BotTokenCheck> = (t) => checkBotToken(t);
+
+  constructor(
+    private readonly pg: PgService,
+    private readonly actions: ProductActionsService,
+    private readonly secrets: SecretsService,
+  ) {}
+
+  async open(i: { userId: string; productId: string; channel: ActionChannel; turn: string | null }):
+    Promise<{ ok: true; actionId: string; expiresAt: string; keyNames: string[] } | KeysFail> {
+    const r = await this.pg.query(
+      `SELECT id, name, slug, kind, status, block_reason, secrets_encrypted FROM products
+        WHERE id = $1 AND user_id = $2 AND archived_at IS NULL`,
+      [i.productId, i.userId],
+    );
+    const p = r.rows[0];
+    if (!p) return { ok: false, reason: 'not_found', message: 'Такого продукта нет' };
+    const refusal = statusRefusal(p);
+    if (refusal) return refusal;
+    let keyNames: string[];
+    try {
+      keyNames = p.secrets_encrypted ? Object.keys(this.secrets.decrypt(p.secrets_encrypted, p.id)).sort() : [];
+    } catch (e: any) {
+      this.logger.error(`ключи продукта ${p.id} не расшифровались: ${e?.message}`);
+      return { ok: false, reason: 'failed', message: 'Ключи продукта сейчас не читаются — напишите в поддержку' };
+    }
+    const { id, expiresAt } = await this.actions.open({
+      userId: i.userId, productId: p.id, kind: 'keys', channel: i.channel, turn: i.turn,
+      payload: { name: p.name, slug: p.slug, productKind: p.kind, keyNames },
+    });
+    return { ok: true, actionId: id, expiresAt, keyNames };
+  }
+
+  async complete(i: { userId: string; actionId: string; set: unknown; remove: unknown; via: ConfirmedVia }):
+    Promise<{ ok: true; queued: true } | KeysFail> {
+    const row = await this.actions.claim(i.userId, i.actionId, i.via);
+    if (!row || row.kind !== 'keys' || !row.product_id) {
+      if (row) await this.actions.release(row.id, row.result ?? {});
+      return { ok: false, reason: 'not_pending', message: 'Карточка уже закрыта или срок вышел' };
+    }
+    try {
+      return await this.submit(row, i);
+    } catch (e: any) {
+      // Непонятная ошибка между claim и исходом — без release карточка умерла
+      // бы в working (claim и cancel требуют pending). В лог — только текст
+      // ошибки: параметры запросов pg в message не кладёт.
+      this.logger.warn(`keys ${row.id} упал между claim и исходом: ${e?.message ?? e}`);
+      const message = 'Не получилось — попробуйте ещё раз позже';
+      await this.actions.release(row.id, { error: message });
+      return { ok: false, reason: 'failed', message };
+    }
+  }
+
+  private async submit(row: ActionRow, i: { userId: string; set: unknown; remove: unknown }): Promise<{ ok: true; queued: true } | KeysFail> {
+    const fix = async (message: string, reason: string, field?: string): Promise<KeysFail> => {
+      await this.actions.release(row.id, field ? { error: message, field } : { error: message });
+      return { ok: false, reason, message };
+    };
+    const fail = async (message: string, reason: string): Promise<KeysFail> => {
+      await this.actions.finish(row.id, 'failed', { error: message, reason });
+      return { ok: false, reason, message };
+    };
+
+    const r = await this.pg.query(
+      `SELECT id, kind, status, block_reason, secrets_encrypted, tg_bot_id FROM products
+        WHERE id = $1 AND user_id = $2 AND archived_at IS NULL`,
+      [row.product_id, i.userId],
+    );
+    const p = r.rows[0];
+    if (!p) return fail('Продукт удалён — ключи менять не у чего', 'not_found');
+    const refusal = statusRefusal(p);
+    if (refusal) return fail(refusal.message, refusal.reason);
+
+    // --- Форма тела. Значения — только в set, и только строками. ---
+    const set: Record<string, string> = {};
+    if (i.set !== undefined && i.set !== null) {
+      if (typeof i.set !== 'object' || Array.isArray(i.set)) return fix('Ключи пришли не в той форме — обновите карточку', 'bad_input');
+      for (const [k, v] of Object.entries(i.set as Record<string, unknown>)) {
+        if (typeof v !== 'string') return fix(`секрет ${k}: значение должно быть непустой строкой`, 'bad_input', k);
+        set[k] = k === 'BOT_TOKEN' ? v.trim() : v;
+      }
+    }
+    if (i.remove !== undefined && i.remove !== null && (!Array.isArray(i.remove) || i.remove.some((n) => typeof n !== 'string'))) {
+      return fix('Список удаляемых ключей не в той форме — обновите карточку', 'bad_input');
+    }
+    const remove = [...new Set((i.remove as string[] | undefined) ?? [])];
+    if (!Object.keys(set).length && !remove.length) return fix('Ничего не изменено: замените, уберите или добавьте ключ', 'nothing');
+    const both = remove.find((n) => Object.prototype.hasOwnProperty.call(set, n));
+    if (both) return fix(`Ключ ${both} и заменён, и убран — оставьте что-то одно`, 'bad_input', both);
+    if (p.kind === 'bot' && remove.includes('BOT_TOKEN')) return fix('Токен бота убрать нельзя — его можно только заменить', 'bad_input', 'BOT_TOKEN');
+
+    // --- Занятость: правка и задание машины. ---
+    const busy = await this.pg.query(
+      `SELECT (SELECT count(*) FROM product_turns WHERE product_id = $1 AND status IN ('queued','running'))::int AS turns,
+              (SELECT count(*) FROM product_provision_jobs WHERE product_id = $1 AND status IN ('queued','running'))::int AS jobs`,
+      [p.id],
+    );
+    if (busy.rows[0]?.turns > 0) return fix('Сейчас идёт правка продукта — отправьте карточку, когда она закончится', 'busy_turn');
+    if (busy.rows[0]?.jobs > 0) return fix('Машина продукта сейчас занята — отправьте карточку через минуту', 'busy');
+
+    // --- Новый набор целиком и проверка теми же правилами, что заведение. ---
+    const old: Record<string, string> = p.secrets_encrypted ? this.secrets.decrypt(p.secrets_encrypted, p.id) : {};
+    const missing = remove.find((n) => !Object.prototype.hasOwnProperty.call(old, n));
+    if (missing) return fix(`Ключа ${missing} у продукта нет`, 'bad_input', missing);
+    // Object.fromEntries, а не присваивание: имя `__proto__` форму переменной
+    // проходит, а `obj['__proto__'] = …` своего ключа не создаёт.
+    const merged: Record<string, string> = Object.fromEntries([
+      ...Object.entries(old).filter(([k]) => !remove.includes(k) && !Object.prototype.hasOwnProperty.call(set, k)),
+      ...Object.entries(set),
+    ]);
+    const problem = secretsProblem(merged);
+    if (problem) return fix(problem.message, 'bad_input', problem.field);
+    if (p.kind === 'bot' && !merged.BOT_TOKEN) return fix('У бота должен быть BOT_TOKEN', 'bad_input', 'BOT_TOKEN');
+
+    // --- Новый токен бота — в Telegram, до записи чего-либо. ---
+    let tgBotId: number | undefined;
+    if (p.kind === 'bot' && set.BOT_TOKEN !== undefined && set.BOT_TOKEN !== old.BOT_TOKEN) {
+      const check = await this.checkBot(set.BOT_TOKEN);
+      // `=== false`, а не `!check.ok`: strictNullChecks выключен (см. «Общее»).
+      if (check.ok === false) {
+        return fix(
+          check.reason === 'unreachable'
+            ? 'Не удалось проверить токен в Telegram — попробуйте ещё раз через минуту'
+            : 'Telegram не принял токен бота — скопируйте его целиком из @BotFather',
+          'bad_token', 'BOT_TOKEN',
+        );
+      }
+      if (Number(p.tg_bot_id) !== check.id) {
+        const taken = await this.pg.query(
+          `SELECT 1 FROM products WHERE tg_bot_id = $1 AND archived_at IS NULL AND id <> $2 LIMIT 1`,
+          [check.id, p.id],
+        );
+        if (taken.rows.length) return fix('Этот бот уже работает в другом продукте — создайте в @BotFather нового бота', 'bot_in_use', 'BOT_TOKEN');
+        tgBotId = check.id;
+      }
+    }
+
+    // --- Задание и коробка — одним оператором; коробка — только при задании. ---
+    const patch = {
+      newKeyNames: Object.keys(merged).sort(),
+      removedNames: Object.keys(old).filter((n) => !Object.prototype.hasOwnProperty.call(merged, n)).sort(),
+      changedNames: Object.keys(set).filter((k) => old[k] !== set[k]).sort(),
+      ...(tgBotId !== undefined ? { tgBotId } : {}),
+    };
+    const box = this.secrets.encrypt(merged, p.id);
+    let q: any;
+    try {
+      q = await this.pg.query(
+        `WITH ins AS (
+            INSERT INTO product_provision_jobs (product_id, kind, status, action_id)
+            SELECT pr.id, 'rekey', 'queued', a.id
+              FROM product_actions a JOIN products pr ON pr.id = a.product_id
+             WHERE a.id = $1 AND a.status = 'working'
+               AND pr.archived_at IS NULL AND pr.status IN ('running','degraded') AND pr.block_reason IS NULL
+            RETURNING action_id
+         ), upd AS (
+            UPDATE product_actions a SET secrets_box = $2, payload = a.payload || $3::jsonb
+              FROM ins WHERE a.id = ins.action_id
+            RETURNING a.id
+         )
+         SELECT (SELECT count(*) FROM ins)::int AS queued`,
+        [row.id, box, JSON.stringify(patch)],
+      );
+    } catch (e: any) {
+      if (e?.code === '23505' && e?.constraint === 'product_provision_jobs_one_active') {
+        return fix('Машина продукта сейчас занята — отправьте карточку через минуту', 'busy');
+      }
+      throw e;
+    }
+    if (!q.rows[0]?.queued) return fail('Продукт сменил состояние — ключи не меняются, попросите ассистента ещё раз', 'state_changed');
+    return { ok: true, queued: true };
+  }
+}
+```
+
+Сторож «значения не уходят»: тест канарейки выше проверяет параметры запросов (кроме `Buffer` коробки), ответ, `release` и лог.
+
+- [ ] **Step 5: Коммит, прогон — PASS**
+
+```bash
+git -C $B add src/products/product-keys.service.ts && git -C $B commit -q -m "products: карточка ключей — имена при открытии; отправка ставит rekey с коробкой одним оператором" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/products/product-keys.service.spec.ts src/products/product-keys.pg.spec.ts src/products/provisioning.rekey-purge.spec.ts`. Expected: PASS. Затем tsc бэка.
+
+---
