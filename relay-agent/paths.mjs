@@ -55,3 +55,25 @@ export function fallbackFileName(originalname, fsKey, uuid) {
   const ext = path.extname(originalname).replace(/[^a-zA-Z0-9.]/g, "").slice(0, EXT_MAX);
   return fsKey + "_" + uuid + ext;
 }
+
+// sid в GET /session/:sid/files идёт прямо из URL (Express сам его
+// раскодирует) в path.join(outputDir, sid) — проверяется отдельно, не через
+// sessionFsKey (та функция не отбивает "/", она санитизирует одно сегментное
+// имя файла, а не путь из нескольких сегментов). Допустимы только
+// [A-Za-z0-9_.-]; "/" среди них нет, поэтому составной выход вида "../.."
+// отсекается уже алфавитом. Отдельно отбиваются голые "." и ".." — это
+// разрешённые символы, но как целый сегмент означают "текущий"/"родитель".
+// Финальная проверка — путь должен остаться строго внутри outputDir.
+// Не прошло — null; вызывающий код отвечает так же, как на несуществующий
+// каталог.
+const SID_RE = /^[A-Za-z0-9_.-]+$/;
+
+export function sessionOutputDir(outputDir, sid) {
+  if (typeof sid !== "string" || sid === "" || sid === "." || sid === "..") return null;
+  if (!SID_RE.test(sid)) return null;
+  const base = path.resolve(outputDir);
+  const resolved = path.resolve(path.join(base, sid));
+  const rel = path.relative(base, resolved);
+  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+  return resolved;
+}
