@@ -192,6 +192,13 @@ describe('удаление', () => {
     expect(h.actions.open).not.toHaveBeenCalled();
   });
 
+  it('продукт остановлен администратором — удалить нельзя, карточка не открывается', async () => {
+    const h = harness({ pg: (sql) => (sql.includes('FROM products WHERE id = $1 AND user_id = $2 AND archived_at IS NULL') ? { rows: [{ id: 'p1', name: 'М', slug: 'm', kind: 'site', status: 'blocked', block_reason: 'жалоба' }] } : null) });
+    const r = await h.svc.openDelete({ userId: 'u1', productId: 'p1', channel: 'web', turn: null });
+    expect(r).toMatchObject({ ok: false, reason: 'blocked' });
+    expect(h.actions.open).not.toHaveBeenCalled();
+  });
+
   it('по нажатию: архив на 30 дней, чужие задания сняты, сон поставлен, итог с датой и прежним статусом', async () => {
     const until = new Date('2026-11-24T10:00:00Z');
     const h = harness({ pg: (sql) => (sql.includes("SET archived_at = now()") ? { rows: [{ purge_after: until, prev_status: 'running' }] } : null) });

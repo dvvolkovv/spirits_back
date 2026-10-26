@@ -66,6 +66,14 @@ describe('новые действия инструмента', () => {
     expect(h.lifecycle.restore).toHaveBeenCalledWith({ userId: 'u1', productId: 'p9', channel: 'web' });
   });
 
+  it('delete — продукт остановлен администратором: карточка не открывается, отказ доходит до ассистента', async () => {
+    const h = harness();
+    h.lifecycle.openDelete.mockResolvedValue({ ok: false, reason: 'blocked', message: 'Продукт остановлен администратором — удалить его можно через поддержку' } as any);
+    const r = await h.svc.execute('u1', { action: 'delete', product: 'магазин' }, 'web', 't');
+    expect(r).toMatchObject({ ok: false, reason: 'blocked', product: PRODUCT });
+    expect(r.say).toMatch(/поддержку/);
+  });
+
   it('restore — продукт был сломан (failed) до удаления: не обещать пополнение, не называть «спит»', async () => {
     const h = harness();
     h.lifecycle.restore.mockResolvedValue({ ok: true, status: 'failed', waking: false } as any);
