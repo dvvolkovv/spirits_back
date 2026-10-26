@@ -1,4 +1,4 @@
-import { VoiceCallService } from './voice-call.service';
+import { SUMMARY_FIDELITY_RULES, VoiceCallService } from './voice-call.service';
 import { CASH_MARKUP, CASH_TOKENS_PER_USD, RUB_PER_TOKEN, RUB_PER_USD } from '../common/billing-rates';
 import type { CompletePayload } from './voice-call.types';
 
@@ -447,6 +447,29 @@ describe('разговор наполняет профиль', () => {
     await svc.complete('call-1', { transcript: [{ role: 'assistant', text: 'Роман на связи', ts: 9 }], usage });
     expect(d.pg.updatedTranscript).toHaveLength(3);
     expect(d.pg.updatedTranscript!.map((t: any) => t.text)).toContain('вторая');
+  });
+
+  /**
+   * Разбор трёх живых разговоров 24–25.10.2026 нашёл в резюме два искажения
+   * одной природы: модель ДОСТРАИВАЛА недостающее до связного текста —
+   * «не готов сейчас говорить» превратила в «решили не делать», а из
+   * искажённого распознаванием имени вывела родственную роль «старший».
+   * Правила против достраивания обязаны доезжать до промпта резюме.
+   */
+  it('complete: в промпт резюме уходят правила точности', async () => {
+    const d = completeDeps([{ role: 'user', text: 'я не готов сейчас это решать', ts: 1 }]);
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+    await svc.complete('call-1', { transcript: [], usage });
+
+    const prompt = (d.chat.generateAgentReply as jest.Mock).mock.calls[0][2] as string;
+    for (const rule of SUMMARY_FIDELITY_RULES) {
+      expect(prompt).toContain(rule);
+    }
+    // Расшифровка при этом на месте — правила её не вытеснили.
+    expect(prompt).toContain('я не готов сейчас это решать');
+    // И сами правила говорят именно про усиление и про людей.
+    expect(SUMMARY_FIDELITY_RULES.join(' ')).toMatch(/НЕ решение против/);
+    expect(SUMMARY_FIDELITY_RULES.join(' ')).toMatch(/НЕ ВЫВОДИ из него родственную роль/);
   });
 
   it('complete: если финальный полнее staged — берём финальный', async () => {

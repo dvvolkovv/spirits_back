@@ -31,6 +31,37 @@ describe('VoiceCallReaperService', () => {
     attendee = { removeBot: jest.fn().mockResolvedValue(true) };
   });
 
+  /**
+   * Регрессия на мертворождённые звонки (24.10.2026): строка висела в
+   * 'dialing' семьдесят минут, хотя сессия воркера закрылась через пять.
+   */
+  it('звонок без единой реплики подбирается по короткому порогу', async () => {
+    const seen: string[] = [];
+    pg.query.mockImplementation(async (sql: string) => {
+      seen.push(sql);
+      return sql.includes('jsonb_array_length(transcript)')
+        ? { rows: [{ id: 'dead-1', room_name: 'voice_dead-1' }], rowCount: 1 }
+        : { rows: [], rowCount: 0 };
+    });
+    await svc().reap();
+
+    const q = seen.find((x) => x.includes('jsonb_array_length(transcript)'))!;
+    expect(q).toMatch(/status = 'dialing'/);
+    expect(q).toMatch(/provider = 'linkeon'/);
+    expect(livekit.closeRoom).toHaveBeenCalledWith('voice_dead-1');
+  });
+
+  it('живой разговор с репликами под короткий порог не попадает', async () => {
+    // Условие пустого транскрипта — в самом SQL: проверяем, что оно там есть
+    // и что порог применяется только к 'dialing', а не к 'active'.
+    const seen: string[] = [];
+    pg.query.mockImplementation(async (sql: string) => { seen.push(sql); return { rows: [], rowCount: 0 }; });
+    await svc().reap();
+    const q = seen.find((x) => x.includes('jsonb_array_length(transcript)'))!;
+    expect(q).toMatch(/coalesce\(jsonb_array_length\(transcript\), 0\) = 0/);
+    expect(q).not.toMatch(/'active'/);
+  });
+
   function svc(withAttendee: any = attendee) {
     // Реапер зовёт настоящий VoiceCallService: правило «как убирать бота»
     // живёт там, потому что нужно и на завершении звонка. Заглушки — только
