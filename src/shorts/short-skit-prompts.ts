@@ -22,6 +22,9 @@ import { Hero, heroById, TROUPE_VERSION, TroupeId } from './short-troupe';
 
 export type SkitKind = 'conflict' | 'punchline';
 
+/** Сценки по порядку в ролике: конфликт открывает ролик, развязка идёт после ответа. */
+export const SKIT_KINDS: readonly SkitKind[] = ['conflict', 'punchline'];
+
 export interface SkitLine {
   hero: TroupeId;
   /** По-русски, до 12 слов. */
@@ -78,7 +81,7 @@ const sentence = (s: string): string => {
 export const MAX_SKIT_LINE_WORDS = 12;
 export const MAX_SKIT_WORDS = 25;
 /** Слово — токен с буквой или цифрой, как в short-rules.ts: тире между словами не слово. */
-const wordCount = (s: string): number => s.split(/\s+/).filter((w) => /[\p{L}\p{N}]/u.test(w)).length;
+export const wordCount = (s: string): number => s.split(/\s+/).filter((w) => /[\p{L}\p{N}]/u.test(w)).length;
 
 /**
  * Поля сценки проверяются до промптов: опечатка в имени поля дала бы «undefined»

@@ -1,5 +1,7 @@
 import { isHealthAssistant } from './short-assistants';
-import { PROVOCATIVE_ANGLES, ShortAngle, ShortParagraph, ShortScript } from './shorts.types';
+import { MAX_SKIT_LINE_WORDS, MAX_SKIT_WORDS, SKIT_KINDS, Skit, SkitKind, wordCount } from './short-skit-prompts';
+import { heroById } from './short-troupe';
+import { PROVOCATIVE_ANGLES, ShortAngle, ShortFormat, ShortParagraph, ShortScript } from './shorts.types';
 
 /**
  * Проверка сценария до отправки владельцу (спека, «Правила текста»).
@@ -29,6 +31,10 @@ export interface RulesInput {
   /** Вопрос режиссёра: он стоит в кадре, его числа и слова — не выдумка сценариста. */
   sceneQuestion?: string;
   assistantsCount: number;
+  /** Формат ролика; без него — chat, как в плане 2. */
+  format?: ShortFormat;
+  /** Сценки ролика формата skit — поля от режиссёра и сценариста, до сборки промптов. */
+  skits?: Partial<Record<SkitKind, Skit>>;
 }
 
 /**
@@ -47,6 +53,93 @@ export const MAX_ANSWER_LINES = 4;
 export const WELCOME_GIFT_TOKENS = 25000;
 const GAP_SEC = 0.25;
 const MIN_HOOK_SEC = 2;
+
+/**
+ * Зацепка ролика со сценками — немая надпись поверх конфликта: её читают за 3 с,
+ * поэтому она короче, чем у озвученной зацепки (спека сценок, «Что уточнил образец»).
+ */
+export const MAX_SKIT_HOOK_WORDS = 6;
+/** Пересказ ответа голосом ассистента в ролике со сценками — 1–2 реплики (спека сценок, «Кто пишет сценки»). */
+export const MIN_SKIT_ANSWER_LINES = 1;
+export const MAX_SKIT_ANSWER_LINES = 2;
+/**
+ * Коридор оценки озвучки ролика со сценками: с двумя клипами по 8 с ролик
+ * должен уложиться в 25–45 с у студии; запас — на погрешность оценки.
+ */
+export const MIN_SKIT_ESTIMATED_SEC = 11;
+export const MAX_SKIT_ESTIMATED_SEC = 26;
+/** Как сценка называется в нарушениях и подписях владельцу — так же её зовёт студия. */
+export const SKIT_LABELS: Record<SkitKind, string> = { conflict: 'сценка 1 (конфликт)', punchline: 'сценка 2 (развязка)' };
+
+const normRole = (s: unknown): string => String(s ?? '').trim().toLowerCase().replace(/ё/g, 'е');
+
+/**
+ * Правила 16–18 и форма сценки — до промптов и до денег (спека сценок,
+ * «Правила»). Режиссёр проверяет сценку 1 (абзацев ответа у него ещё нет —
+ * paragraphs = null), сценарист — обе. Каждое сообщение называет сценку.
+ */
+export function checkSkitRules(skit: unknown, kind: SkitKind, paragraphs: ShortParagraph[] | null): string[] {
+  const at = SKIT_LABELS[kind];
+  const out: string[] = [];
+  const add = (m: string) => {
+    const t = `${at}: ${m}`;
+    if (!out.includes(t)) out.push(t);
+  };
+  if (!skit || typeof skit !== 'object') return [`${at}: сценки нет`];
+  const s = skit as Partial<Skit>;
+  // Место, первый кадр и действие идут прямо в промпты генераторов: русский текст
+  // и текст в кавычках генератор картинок рисует надписью.
+  for (const f of ['setting', 'opening', 'action'] as const) {
+    const v: unknown = s[f];
+    if (typeof v !== 'string' || !v.trim()) add(`нет поля ${f}`);
+    else if (/[а-яё«»"“”„]/i.test(v)) add(`поле ${f} — по-английски и без кавычек: оно идёт прямо в промпт генератора`);
+  }
+  // Правило 16: только герои труппы, разные, у каждого роль из его списка.
+  const cast = Array.isArray(s.cast) ? s.cast : [];
+  if (cast.length < 2 || cast.length > 3) add(`в составе ${cast.length} героев — нужно 2–3`);
+  const inCast = new Set<string>();
+  for (const c of cast) {
+    const hero = heroById(String(c?.hero ?? ''));
+    if (!hero) {
+      add(`правило 16: героя «${c?.hero}» нет в труппе`);
+      continue;
+    }
+    if (inCast.has(hero.id)) add(`правило 16: ${hero.name} в составе дважды`);
+    inCast.add(hero.id);
+    if (!hero.roles.map(normRole).includes(normRole(c?.role))) {
+      add(`правило 16: роль «${String(c?.role ?? '').trim()}» не из ролей героя ${hero.name} (${hero.roles.join(', ')})`);
+    }
+  }
+  // Правило 17: 1–3 реплики, каждая до 12 слов, вместе до 25.
+  const lines = Array.isArray(s.lines) ? s.lines : [];
+  if (lines.length < 1 || lines.length > 3) add(`правило 17: реплик ${lines.length} — нужно 1–3`);
+  let total = 0;
+  lines.forEach((l, i) => {
+    const text = typeof l?.text === 'string' ? l.text.trim() : '';
+    if (!text) {
+      add(`реплика ${i + 1} пустая`);
+      return;
+    }
+    if (!inCast.has(String(l?.hero))) add(`реплика ${i + 1}: говорит «${l?.hero}», а его нет в составе`);
+    const n = wordCount(text);
+    total += n;
+    if (n > MAX_SKIT_LINE_WORDS) add(`правило 17: реплика ${i + 1} — ${n} слов, больше ${MAX_SKIT_LINE_WORDS}`);
+  });
+  if (total > MAX_SKIT_WORDS) add(`правило 17: в репликах ${total} слов, больше ${MAX_SKIT_WORDS}`);
+  // Правило 18: советов по существу герои не дают; утверждение по существу —
+  // только в развязке и со ссылкой на абзац настоящего ответа.
+  const boxed = lines.filter((l) => l?.box !== undefined && l?.box !== null);
+  if (kind === 'conflict') {
+    if (boxed.length) add('правило 18: в конфликте герои не дают советов по существу — у реплик сценки 1 не бывает box');
+  } else {
+    if (!boxed.length) add('правило 18: утверждение по существу в развязке ссылается на абзац ответа — укажи box у этой реплики');
+    if (paragraphs) {
+      const known = new Set(paragraphs.map((p) => p.n));
+      for (const l of boxed) if (!known.has(Number(l.box))) add(`правило 18: box ${l.box} — такого абзаца в ответе нет`);
+    }
+  }
+  return out;
+}
 
 const chars = (s: string): number => Array.from(String(s ?? '')).length;
 
@@ -392,30 +485,36 @@ export function checkScriptRules(i: RulesInput): string[] {
   const s = i.script;
   const known = new Set(i.paragraphs.map((p) => p.n));
   const scene = (name: string) => s.lines.filter((l) => l.scene === name);
+  // Ролик со сценками: зацепка — немая надпись поверх конфликта, ответ пересказывают 1–2 реплики.
+  const skitFormat = i.format === 'skit';
 
-  // Раскадровка: зацепка → вопрос → ответ → финал.
+  // Раскадровка: зацепка → вопрос → ответ → финал (у сценок зацепка не звучит).
   const hook = String(s.hook ?? '').trim();
   // Тире и прочие знаки — не слова.
   const hookWords = hook.split(/\s+/).filter((w) => /[\p{L}\p{N}]/u.test(w)).length;
+  const maxHookWords = skitFormat ? MAX_SKIT_HOOK_WORDS : MAX_HOOK_WORDS;
   if (!hook) add('нет зацепки');
-  else if (hookWords > MAX_HOOK_WORDS) add(`зацепка длиннее ${MAX_HOOK_WORDS} слов`);
-  const ORDER = ['hook', 'question', 'answer', 'final'];
+  else if (hookWords > maxHookWords) add(`зацепка длиннее ${maxHookWords} слов`);
+  const ORDER = skitFormat ? ['question', 'answer', 'final'] : ['hook', 'question', 'answer', 'final'];
   let at = 0;
   for (const l of s.lines) {
     const k = ORDER.indexOf(l.scene);
     if (k < at) {
-      add(`реплика ${l.id}: сцены идут не по порядку зацепка → вопрос → ответ → финал`);
+      add(`реплика ${l.id}: сцены идут не по порядку ${skitFormat ? 'вопрос → ответ → финал' : 'зацепка → вопрос → ответ → финал'}`);
       break;
     }
     at = k;
   }
   const hooks = scene('hook');
-  if (hooks.length !== 1) add('зацепка — ровно одна реплика');
+  if (skitFormat) {
+    if (hooks.length) add('у ролика со сценками зацепка — надпись поверх сценки: реплики hook быть не должно');
+  } else if (hooks.length !== 1) add('зацепка — ровно одна реплика');
   else if (hooks[0].text.trim() !== hook) add('текст реплики зацепки должен совпадать с зацепкой');
   if (!scene('question').length) add('нет реплики вопроса');
   const answers = scene('answer');
-  if (answers.length < MIN_ANSWER_LINES || answers.length > MAX_ANSWER_LINES) {
-    add(`реплик ответа ${answers.length} — нужно ${MIN_ANSWER_LINES}–${MAX_ANSWER_LINES}`);
+  const [minAnswers, maxAnswers] = skitFormat ? [MIN_SKIT_ANSWER_LINES, MAX_SKIT_ANSWER_LINES] : [MIN_ANSWER_LINES, MAX_ANSWER_LINES];
+  if (answers.length < minAnswers || answers.length > maxAnswers) {
+    add(`реплик ответа ${answers.length} — нужно ${minAnswers}–${maxAnswers}`);
   }
   for (const l of answers) {
     if (l.box === undefined || l.box === null || !known.has(l.box)) {
@@ -426,6 +525,9 @@ export function checkScriptRules(i: RulesInput): string[] {
     if (l.scene !== 'answer' && l.box !== undefined && l.box !== null) add(`реплика ${l.id} сцены ${l.scene} не должна ссылаться на абзац`);
   }
   if (scene('final').length !== 1) add('финал — ровно одна реплика');
+  if (skitFormat) {
+    for (const kind of SKIT_KINDS) for (const m of checkSkitRules(i.skits?.[kind], kind, i.paragraphs)) add(m);
+  }
 
   // Подача.
   const provocative = PROVOCATIVE_ANGLES.includes(i.angle);
@@ -444,21 +546,33 @@ export function checkScriptRules(i: RulesInput): string[] {
   }
   if (provocative && isHealthAssistant(i.assistantName)) add('правило 12: темы здоровья — только в спокойной подаче');
 
-  // Длина по оценке.
+  // Длина по оценке. У сценок озвучка — только голос ассистента и финал: клипы идут своим звуком.
   const est = estimateSpeechSec(s);
-  if (est < MIN_ESTIMATED_SEC) {
-    add(`сценарий звучит примерно ${Math.round(est)} с, нужно ${MIN_ESTIMATED_SEC}–${MAX_ESTIMATED_SEC} с: добавь реплику или перескажи абзац подробнее`);
+  const [minSec, maxSec] = skitFormat ? [MIN_SKIT_ESTIMATED_SEC, MAX_SKIT_ESTIMATED_SEC] : [MIN_ESTIMATED_SEC, MAX_ESTIMATED_SEC];
+  if (est < minSec) {
+    add(`сценарий звучит примерно ${Math.round(est)} с, нужно ${minSec}–${maxSec} с: добавь реплику или перескажи абзац подробнее`);
   }
-  if (est > MAX_ESTIMATED_SEC) {
-    add(`сценарий звучит примерно ${Math.round(est)} с, нужно ${MIN_ESTIMATED_SEC}–${MAX_ESTIMATED_SEC} с: сократи реплики`);
+  if (est > maxSec) {
+    add(`сценарий звучит примерно ${Math.round(est)} с, нужно ${minSec}–${maxSec} с: сократи реплики`);
   }
 
-  // Тексты сценариста, у каждого — место. Финал пишет код, его здесь нет.
+  // Тексты сценариста, у каждого — место. Финал пишет код, его здесь нет. Реплики сценок — тоже тексты ролика.
   const spoken = s.lines.filter((l) => l.scene !== 'final');
-  if (spoken.some((l) => BRAND_SPOKEN.test(l.text))) add('название сервиса звучит только в финале — убери его из реплик');
+  const skitLines = skitFormat
+    ? SKIT_KINDS.flatMap((kind) =>
+        (Array.isArray(i.skits?.[kind]?.lines) ? i.skits[kind].lines : []).map((l, n) => ({
+          place: `${SKIT_LABELS[kind]}, реплика ${n + 1}`,
+          text: String(l?.text ?? ''),
+        })),
+      )
+    : [];
+  if ([...spoken.map((l) => l.text), ...skitLines.map((l) => l.text)].some((t) => BRAND_SPOKEN.test(t))) {
+    add('название сервиса звучит только в финале — убери его из реплик');
+  }
   const c = i.captions;
   const texts = [
     ...spoken.map((l) => ({ place: `реплика ${l.id}`, text: l.text })),
+    ...skitLines,
     { place: 'подпись telegram', text: c.telegram },
     { place: 'подпись vk', text: c.vk },
     { place: 'youtube.title', text: c.youtube.title },
