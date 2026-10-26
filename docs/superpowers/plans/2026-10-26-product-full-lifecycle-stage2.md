@@ -1751,3 +1751,388 @@ git -C $B add product-runner/src/host/purge.ts && git -C $B commit -q -m "runner
 Run (нода, агент): `src/host/purge.spec.ts src/host/rekey.spec.ts`. Expected: PASS. Затем tsc агента.
 
 ---
+
+### Task 7: Агент — виды `rekey` и `purge` в цикле агента
+
+**Files:**
+- Modify: `product-runner/src/host/api.ts:16-58` (`HostJob`: `dropNames`, докблок `jobKind`)
+- Modify: `product-runner/src/host/index.ts` (`HostDeps` ~15–48, `KNOWN_KINDS` ~164, `workFor` ~207–251, `overdue` ~261–286, `RealDepsParts`/`realDeps` ~578–617)
+- Test: `product-runner/src/host/index.spec.ts` (`makeDeps` ~41–65 и новый `describe`)
+
+- [ ] **Step 1: Тесты**
+
+В `product-runner/src/host/index.spec.ts`:
+
+1. Импорты: `import { RekeyJob } from './rekey';` и `import { PurgeJob } from './purge';`.
+2. В `makeDeps` после `const domain = …`:
+
+```ts
+  const rekey = jest.fn(async (_job: RekeyJob): Promise<void> => undefined);
+  const purge = jest.fn(async (_job: PurgeJob): Promise<void> => undefined);
+```
+в объект `deps` после `domain,` — `rekey,` и `purge,`; в возвращаемый объект — `rekey, purge`.
+3. В конец файла:
+
+```ts
+const REKEY_JOB: HostJob = {
+  ...JOB, kind: 'bot', jobKind: 'rekey', runnerToken: '', port: null,
+  secrets: { BOT_TOKEN: 'новый-секрет-бота' }, dropNames: ['OLD_KEY'], ownerTgId: '42',
+};
+const PURGE_JOB: HostJob = { ...JOB, jobKind: 'purge', runnerToken: '', secrets: {}, port: 8003 };
+
+describe('смена ключей и стирание (очередь 2)', () => {
+  it('оба вида агенту знакомы', () => {
+    expect(KNOWN_KINDS).toEqual(expect.arrayContaining(['rekey', 'purge']));
+  });
+
+  it('rekey: шагу уезжает выжимка — ключи, снимаемые имена, владелец; порта в отчёте нет', async () => {
+    const { deps, poll, provision, rekey, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: REKEY_JOB });
+
+    await tick(deps);
+
+    expect(provision).not.toHaveBeenCalled();
+    expect(rekey).toHaveBeenCalledWith({
+      slug: 'shop', kind: 'bot', secrets: { BOT_TOKEN: 'новый-секрет-бота' }, dropNames: ['OLD_KEY'], ownerTgId: '42',
+    });
+    expect(complete).toHaveBeenCalledWith('j-1', { ok: true });
+  });
+
+  it('purge: шагу — только слаг и форма', async () => {
+    const { deps, poll, purge, sleepProduct, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: PURGE_JOB });
+
+    await tick(deps);
+
+    expect(sleepProduct).not.toHaveBeenCalled();
+    expect(purge).toHaveBeenCalledWith({ slug: 'shop', kind: 'site' });
+    expect(complete).toHaveBeenCalledWith('j-1', { ok: true });
+  });
+
+  it('отказ смены ключей уходит на сервер без значений ключей', async () => {
+    const { deps, poll, rekey, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: REKEY_JOB });
+    rekey.mockRejectedValue(new Error('ключи не применены: эхо новый-секрет-бота из docker'));
+
+    await tick(deps);
+
+    const report = lastReport(complete);
+    expect(report.ok).toBe(false);
+    expect(JSON.stringify(report)).not.toContain('новый-секрет-бота');
+    expect(JSON.stringify(report)).toMatch(/ключи не применены/);
+  });
+
+  it('срок смены ключей назван своими словами, а не «провижининг»', async () => {
+    const { deps, poll, rekey, complete } = makeDeps({ provisionTimeoutMs: 5 });
+    poll.mockResolvedValue({ ok: true, job: REKEY_JOB });
+    rekey.mockImplementation(() => new Promise<void>(() => {}));
+
+    await tick(deps);
+
+    const report = lastReport(complete) as { ok: false; error: string };
+    expect(report.error).toMatch(/смена ключей не уложилась/);
+    expect(report.error).toMatch(/__rekey/);
+  });
+
+  it('боевая сборка: фазы смены ключей маскируют её новые значения', async () => {
+    const logs: string[] = [];
+    let captured: ProvisionDeps | undefined;
+    const deps = realDeps(CONFIG, {
+      log: (m) => logs.push(m),
+      buildDeps: (overrides) => overrides as ProvisionDeps,
+      rekey: async (_job, d) => {
+        captured = d;
+      },
+    });
+    await deps.rekey({ slug: 'shop', kind: 'bot', secrets: { BOT_TOKEN: 'новый-секрет-бота' }, dropNames: [] });
+    captured!.onPhase!('docker сказал: новый-секрет-бота');
+    expect(logs.join('\n')).not.toContain('новый-секрет-бота');
+    expect(logs.join('\n')).toContain('***');
+  });
+});
+```
+
+- [ ] **Step 2: Коммит, прогон — FAIL** (у `HostDeps` нет `rekey`/`purge`, у `HostJob` нет `dropNames`)
+
+```bash
+git -C $B add product-runner/src/host/index.spec.ts && git -C $B commit -q -m "test(runner): виды rekey и purge в цикле агента (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, агент): `src/host/index.spec.ts`.
+
+- [ ] **Step 3: Реализация**
+
+`product-runner/src/host/api.ts`, в `interface HostJob`:
+- в докблоке `jobKind` строку «Вид работы: `provision`, `sleep`, `wake` или `domain`» заменить на «Вид работы: `provision`, `sleep`, `wake`, `domain`, `rekey` или `purge`»;
+- после `vhostMode?` добавить:
+
+```ts
+  /**
+   * Смена ключей (rekey): имена старых ключей владельца, которых нет в новом
+   * наборе, — уходят из окружения. Новый набор целиком — в `secrets`
+   * (расшифровывается сервером при выдаче, как у заведения).
+   */
+  dropNames?: string[];
+```
+
+`product-runner/src/host/index.ts`:
+
+1. Импорты после строки с `./domain`:
+
+```ts
+import { RekeyJob, rekeyProduct as rekeyReal } from './rekey';
+import { PurgeJob, purgeProduct as purgeReal } from './purge';
+```
+
+2. В `HostDeps` после `domain: …;`:
+
+```ts
+  /**
+   * Смена ключей владельца и стирание удалённого (очередь 2). Обязательные по
+   * той же причине, что сон и пробуждение: забытые в сборке, они были бы
+   * TypeError в рантайме на каждом задании при зелёном прогоне.
+   */
+  rekey: (job: RekeyJob) => Promise<void>;
+  purge: (job: PurgeJob) => Promise<void>;
+```
+
+3. `export const KNOWN_KINDS = ['provision', 'sleep', 'wake', 'domain', 'rekey', 'purge'] as const;`
+
+4. В `workFor` после строки `if (kind === 'provision') return deps.provision(job);`:
+
+```ts
+  // Смене ключей — выжимка: новый набор, снимаемые имена, владелец бота.
+  // Токена раннера нет и не нужно — пересоздание берёт его из живого
+  // контейнера (rekey.ts). Порта в отчёте нет: он не меняется.
+  if (kind === 'rekey') {
+    return deps
+      .rekey({
+        slug: job.slug,
+        kind: job.kind,
+        secrets: job.secrets ?? {},
+        dropNames: job.dropNames ?? [],
+        ownerTgId: job.ownerTgId,
+      })
+      .then(() => ({}));
+  }
+  // Стиранию — только слаг и форма: путь и всё, что снимается, оно выводит
+  // само и само же проверяет (purge.ts).
+  if (kind === 'purge') return deps.purge({ slug: job.slug, kind: job.kind }).then(() => ({}));
+```
+
+5. В `overdue` перед `default:`:
+
+```ts
+    case 'rekey':
+      return (
+        `смена ключей не уложилась в ${sec} с и брошена: состояние хоста НЕИЗВЕСТНО — `
+        + 'продукт мог остаться под именем <слаг>__rekey со старыми ключами, сверить руками'
+      );
+    case 'purge':
+      return (
+        `стирание не уложилось в ${sec} с и брошено: состояние хоста НЕИЗВЕСТНО — `
+        + 'часть продукта могла остаться; повтор стирания безопасен'
+      );
+```
+
+6. В `RealDepsParts` после `domain?: …;`:
+
+```ts
+  rekey?: (job: RekeyJob, deps: ProvisionDeps) => Promise<void>;
+  purge?: (job: PurgeJob, deps: ProvisionDeps) => Promise<void>;
+```
+в `realDeps` после `const doDomain = …`:
+
+```ts
+  const doRekey = parts.rekey ?? rekeyReal;
+  const doPurge = parts.purge ?? purgeReal;
+```
+и в возвращаемый объект после `domain: …,`:
+
+```ts
+    // Смене ключей маска фаз — С ЗАДАНИЕМ: в её фазах бывает текст отказа
+    // docker, а значения новых ключей знает только задание (довод заведения).
+    rekey: (job: RekeyJob) => doRekey(job, build(provisionOverrides(config, log, { secrets: job.secrets }))),
+    purge: (job: PurgeJob) => doPurge(job, build(provisionOverrides(config, log))),
+```
+
+- [ ] **Step 4: Коммит, прогон — PASS** (весь пакет)
+
+```bash
+git -C $B add product-runner/src/host && git -C $B commit -q -m "runner: агент исполняет rekey и purge — выжимки, сроки, маска фаз" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, агент): `npx jest` без списка и `npx tsc -p tsconfig.json --noEmit` и `npm run build >/dev/null && ls dist/host/rekey.js dist/host/purge.js`. Expected: все наборы PASS; оба файла собраны.
+
+---
+
+### Task 8: Агент — каркас бота знает владельца; ключи можно сменить
+
+**Files:**
+- Modify: `product-runner/src/host/skeleton.ts` (`botServerJs` ~221–339, `keysSection` ~373–403, `BOT_AUDIENCE_SECTION` ~463–472)
+- Test: `product-runner/src/host/skeleton.spec.ts`
+
+Правило спеки: с привязкой — владелец `OWNER_TG_ID`; без неё — первая сборка отвечает на `/start` chat_id и подсказкой. Решение принимается В РАНТАЙМЕ по `process.env.OWNER_TG_ID`, а не при сборке каркаса: переменная может появиться позже (смена ключей ставит её ботам, заведённым до очереди 2), а `server.js` и `CLAUDE.md` коммитятся один раз.
+
+- [ ] **Step 1: Тесты**
+
+В `describe('каркас, поднятый как на машине клиента', …)` (`product-runner/src/host/skeleton.spec.ts`, ~751) добавить:
+
+```ts
+    const sent = (run: Booted): string => {
+      const i = run.fetches.findIndex((u) => u.includes('sendMessage'));
+      return JSON.parse(run.fetchInits[i].body).text;
+    };
+    const start = (fromId: number) => ({
+      replies: [
+        { ok: true, result: [{ update_id: 1, message: { text: '/start', chat: { id: fromId }, from: { id: fromId } } }] },
+        { ok: true, result: [] },
+      ],
+      maxCalls: 6,
+    });
+
+    it('без OWNER_TG_ID /start отвечает chat_id и подсказкой, что с ним делать', async () => {
+      const run = boot(skeletonFor('bot', 'X', SLUG)['server.js'], { ...start(777001), env: { BOT_TOKEN: 'Т', PORT: '3000' } });
+      await drain();
+      expect(sent(run)).toContain('777001');
+      expect(sent(run)).toMatch(/назовите этот номер ассистенту/);
+    });
+
+    it('с OWNER_TG_ID владелец узнан и chat_id не печатается', async () => {
+      const run = boot(skeletonFor('bot', 'X', SLUG)['server.js'], { ...start(777001), env: { BOT_TOKEN: 'Т', PORT: '3000', OWNER_TG_ID: '777001' } });
+      await drain();
+      expect(sent(run)).toMatch(/владелец/);
+      expect(sent(run)).not.toContain('777001');
+    });
+
+    it('с OWNER_TG_ID постороннему — обычный ответ без chat_id и без «владелец»', async () => {
+      const run = boot(skeletonFor('bot', 'X', SLUG)['server.js'], { ...start(555), env: { BOT_TOKEN: 'Т', PORT: '3000', OWNER_TG_ID: '777001' } });
+      await drain();
+      expect(sent(run)).toBe('Бот заведён и ждёт правок.');
+    });
+
+    it('/start@имя_бота в группе — тоже /start', async () => {
+      const run = boot(skeletonFor('bot', 'X', SLUG)['server.js'], {
+        replies: [
+          { ok: true, result: [{ update_id: 1, message: { text: '/start@shop_bot', chat: { id: -100 }, from: { id: 9 } } }] },
+          { ok: true, result: [] },
+        ],
+        maxCalls: 6,
+        env: { BOT_TOKEN: 'Т', PORT: '3000' },
+      });
+      await drain();
+      expect(sent(run)).toContain('-100');
+    });
+```
+
+В `describe('каркас под ключи, данные и расписание', …)` добавить:
+
+```ts
+  it('ключи можно сменить через ассистента — каркас не обещает «нельзя»', () => {
+    for (const kind of KINDS) {
+      const md = skeletonFor(kind, 'X', SLUG, ['A'])['CLAUDE.md'];
+      expect(md).not.toMatch(/пока нельзя/);
+      expect(md).toMatch(/защищённая карточка/);
+      expect(md).toMatch(/Object\.keys\(process\.env\)/);
+    }
+  });
+
+  it('у бота владелец — OWNER_TG_ID, если он есть; у сайта переменной нет', () => {
+    const md = skeletonFor('bot', 'X', SLUG)['CLAUDE.md'];
+    expect(md).toMatch(/`OWNER_TG_ID`/);
+    expect(md).toMatch(/message\.from\.id/);
+    expect(skeletonFor('site', 'X', SLUG)['CLAUDE.md']).not.toMatch(/OWNER_TG_ID/);
+  });
+```
+
+- [ ] **Step 2: Коммит, прогон — FAIL**
+
+```bash
+git -C $B add product-runner/src/host/skeleton.spec.ts && git -C $B commit -q -m "test(runner): каркас бота — владелец по OWNER_TG_ID, /start с chat_id (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, агент): `src/host/skeleton.spec.ts`.
+
+- [ ] **Step 3: Реализация** в `product-runner/src/host/skeleton.ts`
+
+⚠ `botServerJs` — шаблонная строка TypeScript: внутри неё `\s`, `\w`, `\/` молча превращаются в `s`, `w`, `/`. Поэтому в коде бота — ни одного регэкспа, только операции со строками; `${` внутри — только экранированные `\${`, как у соседних строк.
+
+1. В `botServerJs` после строки `const TOKEN = process.env.BOT_TOKEN;` добавить:
+
+```js
+// Telegram-идентификатор владельца. Задаёт платформа, если владелец привязал
+// Telegram в Linkeon; без привязки — пусто, и бот на /start подсказывает
+// человеку его chat_id. Читается при старте: смена ключей перезапускает
+// контейнер, и новое значение придёт вместе с ним.
+const OWNER = String(process.env.OWNER_TG_ID || "");
+```
+
+2. Блок `if (u.message?.text) { … }` заменить на:
+
+```js
+        if (u.message?.text) {
+          const chatId = u.message.chat.id;
+          const fromId = String((u.message.from && u.message.from.id) || chatId);
+          // "/start" и "/start@имя_бота" (так команда приходит в группе) —
+          // без регэкспа: строка шаблона съела бы его обратные слэши.
+          const first = String(u.message.text).trim().split(" ")[0];
+          const isStart = first === "/start" || first.startsWith("/start@");
+          let text = "Бот заведён и ждёт правок.";
+          if (isStart && !OWNER) {
+            text += " Ваш chat_id: " + chatId + ". Если это ваш бот — назовите этот номер ассистенту в Linkeon, чтобы бот узнавал вас.";
+          } else if (isStart && fromId === OWNER) {
+            text += " Вы — его владелец: правки — в чате Linkeon.";
+          }
+          // await обязателен: без него пачка обновлений даёт неограниченную
+          // пачку одновременных исходящих.
+          await fetch(\`https://api.telegram.org/bot\${TOKEN}/sendMessage\`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ chat_id: chatId, text }),
+            signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+          });
+        }
+```
+
+3. В `keysSection` комментарий над `const where` и сам `where` заменить на:
+
+```ts
+  // С очереди 2 ключи меняются после заведения: ассистент в чате Linkeon
+  // открывает владельцу защищённую карточку, контейнер пересоздаётся с новыми
+  // ключами. Список имён выше — на момент заведения, отсюда строка про
+  // Object.keys: какие ключи есть СЕЙЧАС, ассистент правок узнаёт сам.
+  const where =
+    'Сменить, добавить или убрать ключ владелец может сам: попросить ассистента в чате Linkeon — '
+    + 'откроется защищённая карточка, и продукт перезапустится с новыми ключами. Так и ответить владельцу.';
+```
+и в возвращаемый массив после строки `` `  в истории и попадает в git. ${where}`, `` добавить две строки:
+
+```ts
+    '- Список выше — на момент заведения: ключи могли смениться. Какие имена есть',
+    '  сейчас — `Object.keys(process.env)` (только имена, без значений).',
+```
+
+4. `BOT_AUDIENCE_SECTION` целиком:
+
+```ts
+const BOT_AUDIENCE_SECTION = [
+  '## Кому бот отвечает',
+  'Если бот присылает данные владельца — отчёты, суммы, всё, что получено по',
+  'его ключам, — отвечать ими только владельцу. Если в окружении есть',
+  '`OWNER_TG_ID` — это Telegram-идентификатор владельца: владелец тот, у кого',
+  '`message.from.id` равен ему (сравнивать строками). Переменную задаёт',
+  'платформа, если владелец привязал Telegram в Linkeon.',
+  'Если `OWNER_TG_ID` нет — владельца узнавать по chat_id, который он сам',
+  'назвал в тексте правки (chat_id не секрет): пусть бот на `/start` отвечает',
+  'человеку его chat_id, а владелец передаст его следующей правкой. chat_id',
+  'хранить в `data/`. Не назначать владельцем того, кто первым нажал `/start`:',
+  'имя бота находится поиском. Остальным — короткий отказ без данных.',
+].join('\n');
+```
+Докблок над ним дополнить абзацем: «С очереди 2 владельца знает платформа: `OWNER_TG_ID` из привязки Telegram (provision.ts, rekey.ts). chat_id из текста правки — запасной путь для владельца без привязки».
+
+- [ ] **Step 4: Коммит, прогон — PASS**
+
+```bash
+git -C $B add product-runner/src/host/skeleton.ts && git -C $B commit -q -m "runner: каркас бота — владелец по OWNER_TG_ID, /start с chat_id; ключи меняются через ассистента" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, агент): `src/host/skeleton.spec.ts src/host/provision.spec.ts`. Expected: PASS, в том числе «server.js остаётся синтаксически валидным JavaScript при любом имени» и сторожа темпа опроса.
+
+---
