@@ -1,5 +1,9 @@
 import { SKIT_KINDS, type CaptureResult, type Script } from './types';
 
+/** Предел слов зацепки — тот же, что у API (src/shorts/short-rules.ts: MAX_HOOK_WORDS, MAX_SKIT_HOOK_WORDS). */
+export const HOOK_MAX_WORDS = 8;
+export const SKIT_HOOK_MAX_WORDS = 6;
+
 /**
  * То, что студия может проверить сама до озвучки: у каждой реплики ответа
  * есть абзац, и такой абзац снят. Правила текста (цифры, конкуренты,
@@ -11,8 +15,9 @@ export function validateScript(script: Script, capture: Pick<CaptureResult, 'box
   const hook = script.hook?.trim() ?? '';
   if (!hook) problems.push('нет зацепки');
   // Словом считаем токен с буквой или цифрой — тем же фильтром, что API (short-rules.ts):
-  // тире и прочие знаки между репликами не слова.
-  if (hook.split(/\s+/).filter((w) => /[\p{L}\p{N}]/u.test(w)).length > 8) problems.push('зацепка длиннее 8 слов');
+  // тире и прочие знаки между репликами не слова. У сценок зацепка — надпись, её читают за 3 с.
+  const maxHookWords = script.skits ? SKIT_HOOK_MAX_WORDS : HOOK_MAX_WORDS;
+  if (hook.split(/\s+/).filter((w) => /[\p{L}\p{N}]/u.test(w)).length > maxHookWords) problems.push(`зацепка длиннее ${maxHookWords} слов`);
   if (!script.voice?.trim()) problems.push('не задан голос');
 
   const ids = new Set<string>();
