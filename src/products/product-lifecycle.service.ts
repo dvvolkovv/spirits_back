@@ -460,78 +460,113 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       await this.actions.record({ userId: i.userId, productId: p.id, kind: 'restore', channel: i.channel, status: 'failed', payload: { name: p.name }, result: { reason: f.reason, error: f.message } });
       return f;
     }
-    // Сон удаления, ещё не выданный агенту, усыпил бы вернувшийся продукт.
-    await this.pg.query(
-      `UPDATE product_provision_jobs SET status = 'failed', error = 'снято возвратом', finished_at = now()
-        WHERE product_id = $1 AND status = 'queued'`,
-      [p.id],
-    );
-    // M3: статус ДО удаления — из последнего завершённого действия delete по
-    // этому продукту (completeDelete кладёт его туда же, куда и restoreUntil).
-    // Продукт, удалённый сломанным (failed), вернувшись sleeping, молча
-    // начал бы списывать аренду за контейнер, который никогда не работал, —
-    // пополнение баланса его не починит.
-    const prevR = await this.pg.query(
-      `SELECT result->>'prevStatus' AS prev_status FROM product_actions
-        WHERE product_id = $1 AND kind = 'delete' AND status = 'done'
-        ORDER BY created_at DESC LIMIT 1`,
-      [p.id],
-    );
-    const prevStatus: string | null = prevR.rows[0]?.prev_status ?? null;
-    let r: any;
+    // M2: снятие очереди и снятие архива — в ОДНОЙ транзакции, с FOR UPDATE
+    // на строке продукта В САМОМ НАЧАЛЕ, а не только на UPDATE products ниже.
+    // Без этого между «снять очередь» и «снять архив» помещается чужой
+    // коммит: минутный тик queueSleepForDeleted мог вставить НОВЫЙ 'sleep',
+    // которого снятие очереди уже не увидело, — и этот сон переживал возврат.
+    // queueSleepForDeleted со своей стороны блокируется на той же строке
+    // (FOR UPDATE OF p в его INSERT…SELECT) — иначе захват здесь никого не
+    // ждал бы, и тик всё равно читал бы archived_at мимо этой транзакции.
+    const client = await this.pg.getClient();
     try {
-      r = await this.pg.query(
-        `UPDATE products
-            SET archived_at = NULL, purge_after = NULL,
-                status = CASE WHEN block_reason IS NOT NULL THEN 'blocked' WHEN $4 = 'failed' THEN 'failed' ELSE 'sleeping' END,
-                sleep_reason = CASE WHEN block_reason IS NULL AND $4 IS DISTINCT FROM 'failed' AND paid_until <= now() THEN $3 ELSE sleep_reason END
-          WHERE id = $1 AND user_id = $2 AND archived_at IS NOT NULL AND purged_at IS NULL AND purge_after > now()
-          RETURNING status, paid_until > now() AS paid`,
-        [p.id, i.userId, SLEEP_REASON_NO_TOKENS, prevStatus],
+      await client.query('BEGIN');
+      const locked = await client.query(
+        `SELECT 1 FROM products
+          WHERE id = $1 AND user_id = $2 AND archived_at IS NOT NULL AND purged_at IS NULL
+          FOR UPDATE`,
+        [p.id, i.userId],
       );
-    } catch (e: any) {
-      // Токен бота этого (ещё архивного) продукта мог за время архива
-      // перейти живому продукту: частичный UNIQUE products_tg_bot_live
-      // смотрит только на archived_at IS NULL, и снятие архива здесь делает
-      // строку живой — то есть второй живой строкой с тем же tg_bot_id.
-      // completeDelete tg_bot_id с архивного продукта не снимает (он не
-      // участвует в индексе, пока продукт архивный), поэтому гонка возможна
-      // не на удалении, а именно здесь, на возврате.
-      if (e?.code === '23505' && e?.constraint === 'products_tg_bot_live') {
-        const message = 'Этот бот уже работает в другом продукте — удалённого не вернуть, пока его токен занят';
-        await this.actions.record({ userId: i.userId, productId: p.id, kind: 'restore', channel: i.channel, status: 'failed', payload: { name: p.name }, result: { reason: 'bot_in_use', error: message } });
-        return { ok: false, reason: 'bot_in_use', message };
+      if (!locked.rows[0]) {
+        await client.query('ROLLBACK');
+        return { ok: false, reason: 'not_found', message: 'Удалённого продукта с таким именем нет' };
       }
-      throw e;
-    }
-    const row = r.rows[0];
-    if (!row) return { ok: false, reason: 'not_found', message: 'Удалённого продукта с таким именем нет' };
-    let waking = false;
-    if (row.status === 'sleeping' && row.paid) {
-      // Оплаченный период ещё идёт — будим сами: подметальщик аренды будит
-      // только тех, на кого хватает баланса на новый месяц.
-      const w = await this.pg.query(
-        `INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'wake', 'queued')
-         ON CONFLICT DO NOTHING RETURNING product_id`,
+
+      // Сон удаления, ещё не выданный агенту, усыпил бы вернувшийся продукт.
+      await client.query(
+        `UPDATE product_provision_jobs SET status = 'failed', error = 'снято возвратом', finished_at = now()
+          WHERE product_id = $1 AND status = 'queued'`,
         [p.id],
       );
-      if (w.rows.length > 0) {
-        waking = true;
-      } else {
-        // ON CONFLICT молчит не только на повторный клик здесь: RentService
-        // (wakeTick) мог поставить 'wake' на этот же продукт между нашим
-        // UPDATE products выше и этим INSERT, пока мы не держали продукт
-        // архивным ни секунды лишней. `waking = false` в таком случае было
-        // бы неправдой — задание уже в очереди, просто не нашим INSERT.
-        const existing = await this.pg.query(
-          `SELECT 1 FROM product_provision_jobs WHERE product_id = $1 AND kind = 'wake' AND status IN ('queued','running')`,
+      // M3: статус ДО удаления — из последнего завершённого действия delete
+      // по этому продукту (completeDelete кладёт его туда же, куда и
+      // restoreUntil). Продукт, удалённый сломанным (failed), вернувшись
+      // sleeping, молча начал бы списывать аренду за контейнер, который
+      // никогда не работал, — пополнение баланса его не починит.
+      const prevR = await client.query(
+        `SELECT result->>'prevStatus' AS prev_status FROM product_actions
+          WHERE product_id = $1 AND kind = 'delete' AND status = 'done'
+          ORDER BY created_at DESC LIMIT 1`,
+        [p.id],
+      );
+      const prevStatus: string | null = prevR.rows[0]?.prev_status ?? null;
+
+      let r: any;
+      try {
+        r = await client.query(
+          `UPDATE products
+              SET archived_at = NULL, purge_after = NULL,
+                  status = CASE WHEN block_reason IS NOT NULL THEN 'blocked' WHEN $4 = 'failed' THEN 'failed' ELSE 'sleeping' END,
+                  sleep_reason = CASE WHEN block_reason IS NULL AND $4 IS DISTINCT FROM 'failed' AND paid_until <= now() THEN $3 ELSE sleep_reason END
+            WHERE id = $1 AND user_id = $2 AND archived_at IS NOT NULL AND purged_at IS NULL AND purge_after > now()
+            RETURNING status, paid_until > now() AS paid`,
+          [p.id, i.userId, SLEEP_REASON_NO_TOKENS, prevStatus],
+        );
+      } catch (e: any) {
+        // Токен бота этого (ещё архивного) продукта мог за время архива
+        // перейти живому продукту: частичный UNIQUE products_tg_bot_live
+        // смотрит только на archived_at IS NULL, и снятие архива здесь
+        // делает строку живой — то есть второй живой строкой с тем же
+        // tg_bot_id. completeDelete tg_bot_id с архивного продукта не
+        // снимает (он не участвует в индексе, пока продукт архивный),
+        // поэтому гонка возможна не на удалении, а именно здесь, на
+        // возврате.
+        if (e?.code === '23505' && e?.constraint === 'products_tg_bot_live') {
+          await client.query('ROLLBACK');
+          const message = 'Этот бот уже работает в другом продукте — удалённого не вернуть, пока его токен занят';
+          await this.actions.record({ userId: i.userId, productId: p.id, kind: 'restore', channel: i.channel, status: 'failed', payload: { name: p.name }, result: { reason: 'bot_in_use', error: message } });
+          return { ok: false, reason: 'bot_in_use', message };
+        }
+        throw e;
+      }
+      const row = r.rows[0];
+      if (!row) {
+        await client.query('ROLLBACK');
+        return { ok: false, reason: 'not_found', message: 'Удалённого продукта с таким именем нет' };
+      }
+      let waking = false;
+      if (row.status === 'sleeping' && row.paid) {
+        // Оплаченный период ещё идёт — будим сами: подметальщик аренды будит
+        // только тех, на кого хватает баланса на новый месяц.
+        const w = await client.query(
+          `INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'wake', 'queued')
+           ON CONFLICT DO NOTHING RETURNING product_id`,
           [p.id],
         );
-        waking = existing.rows.length > 0;
+        if (w.rows.length > 0) {
+          waking = true;
+        } else {
+          // ON CONFLICT молчит не только на повторный клик здесь: RentService
+          // (wakeTick) мог поставить 'wake' на этот же продукт между нашим
+          // UPDATE products выше и этим INSERT, пока мы не держали продукт
+          // архивным ни секунды лишней. `waking = false` в таком случае было
+          // бы неправдой — задание уже в очереди, просто не нашим INSERT.
+          const existing = await client.query(
+            `SELECT 1 FROM product_provision_jobs WHERE product_id = $1 AND kind = 'wake' AND status IN ('queued','running')`,
+            [p.id],
+          );
+          waking = existing.rows.length > 0;
+        }
       }
+      await client.query('COMMIT');
+      await this.actions.record({ userId: i.userId, productId: p.id, kind: 'restore', channel: i.channel, status: 'done', payload: { name: p.name }, result: { status: row.status, waking } });
+      return { ok: true, status: row.status, waking };
+    } catch (e: any) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw e;
+    } finally {
+      client.release();
     }
-    await this.actions.record({ userId: i.userId, productId: p.id, kind: 'restore', channel: i.channel, status: 'done', payload: { name: p.name }, result: { status: row.status, waking } });
-    return { ok: true, status: row.status, waking };
   }
 
   /**

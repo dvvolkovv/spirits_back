@@ -6,15 +6,30 @@ const TOKEN = '1234567890:AAH9sdfjKJHkjh34kjh5kjh6KJHkjhKJHkj';
 
 function harness(o: { pg?: (sql: string, params: any[]) => any; createErrors?: any[] } = {}) {
   const calls: Array<{ sql: string; params: any[] }> = [];
+  const dispatch = async (sql: string, params: any[] = []) => {
+    calls.push({ sql, params });
+    const custom = o.pg?.(sql, params);
+    if (custom) return custom;
+    if (sql.includes('FROM ai_profiles_consolidated')) return { rows: [{ isadmin: false }] };
+    if (sql.includes('SELECT domain FROM products')) return { rows: [{ domain: 'magazin.c.linkeon.io' }] };
+    // Захват строки продукта в restore() (M2) — по умолчанию «всё ещё
+    // архивный», раз тест не сказал обратное через свой o.pg: без этого
+    // default все существующие сценарии возврата читали бы not_found.
+    if (sql.includes('FOR UPDATE') && sql.includes('archived_at IS NOT NULL AND purged_at IS NULL')) {
+      return { rows: [{ x: 1 }] };
+    }
+    return { rows: [], rowCount: 0 };
+  };
+  // getClient — M2: restore() ведёт транзакцию на выделенном соединении, а
+  // не через пул. Клиент здесь — тот же dispatch, что у pg.query: мок видит
+  // BEGIN/COMMIT/ROLLBACK (падают в общий дефолт) и реальные SQL одинаково,
+  // h.calls копит и те, и эти.
   const pg = {
-    query: jest.fn(async (sql: string, params: any[] = []) => {
-      calls.push({ sql, params });
-      const custom = o.pg?.(sql, params);
-      if (custom) return custom;
-      if (sql.includes('FROM ai_profiles_consolidated')) return { rows: [{ isadmin: false }] };
-      if (sql.includes('SELECT domain FROM products')) return { rows: [{ domain: 'magazin.c.linkeon.io' }] };
-      return { rows: [], rowCount: 0 };
-    }),
+    query: jest.fn((sql: string, params: any[] = []) => dispatch(sql, params)),
+    getClient: jest.fn(async () => ({
+      query: jest.fn((sql: string, params: any[] = []) => dispatch(sql, params)),
+      release: jest.fn(),
+    })),
   };
   const createErrors = [...(o.createErrors ?? [])];
   const provisioning = {

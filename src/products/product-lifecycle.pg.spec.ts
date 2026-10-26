@@ -42,13 +42,16 @@ maybe('жизненный цикл продукта против живого Po
   jest.setTimeout(30_000);
 
   let pool: Pool;
-  let pg: { query: (sql: string, params?: any[]) => Promise<any> };
+  // getClient — для M2: restore() берёт выделенное соединение под BEGIN/
+  // COMMIT (как это делает настоящий PgService.getClient), а не пул, где
+  // BEGIN и следующий запрос рискуют уехать на разные соединения.
+  let pg: { query: (sql: string, params?: any[]) => Promise<any>; getClient: () => Promise<any> };
   let secrets: SecretsService;
   let svc: ProductLifecycleService;
 
   beforeAll(async () => {
     pool = new Pool({ connectionString: PG, max: 8 });
-    pg = { query: (sql: string, params?: any[]) => pool.query(sql, params) };
+    pg = { query: (sql: string, params?: any[]) => pool.query(sql, params), getClient: () => pool.connect() };
     secrets = new SecretsService({ get: (k: string) => (k === 'PRODUCT_SECRETS_KEY' ? KEY : undefined) } as any);
 
     for (const f of MIGRATIONS) {
