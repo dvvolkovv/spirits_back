@@ -384,7 +384,9 @@ describe('TgBotService.handleChatMessage: гейт и вложения', () => {
     const { svc, router, order } = makeTurnBot({ linkeonId: 'u-owner', solo: true });
     await (svc as any).handleChatMessage(groupMsg(111), CFG);
     expect(router.generateReply).toHaveBeenCalledTimes(1);
-    expect(generateOpts(router)).toEqual({ productsOwner: { linkeonId: 'u-owner', tgUserId: 111 } });
+    // turn — метка хода (случайный uuid на каждый вызов, задача 12): по ней
+    // takeForTurn отличает карточки этого хода от чужих в то же окно времени.
+    expect(generateOpts(router)).toEqual({ productsOwner: { linkeonId: 'u-owner', tgUserId: 111 }, turn: expect.any(String) });
     // Текущее сообщение уже сохранено к моменту проверки — оно тоже учтено.
     expect(order.indexOf('persist')).toBeLessThan(order.indexOf('onlySpeakerIs'));
     expect(order.indexOf('onlySpeakerIs')).toBeLessThan(order.indexOf('generateReply'));
