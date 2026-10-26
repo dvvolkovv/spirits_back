@@ -138,17 +138,19 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     return r.rows[0]?.isadmin === true;
   }
 
-  private async setFirstPrompt(productId: string, prompt: unknown, channel: ActionChannel): Promise<void> {
+  /** Возвращает true, только если правка реально поставлена (пустой prompt — не ошибка, но и не постановка). */
+  private async setFirstPrompt(productId: string, prompt: unknown, channel: ActionChannel): Promise<boolean> {
     const p = String(prompt ?? '').trim();
-    if (!p) return;
+    if (!p) return false;
     await this.pg.query(
       `UPDATE products SET first_prompt = $2, first_prompt_channel = $3 WHERE id = $1`,
       [productId, p, channel === 'telegram' ? 'telegram' : 'web'],
     );
+    return true;
   }
 
   async createSite(i: { userId: string; name: unknown; prompt?: unknown; channel: ActionChannel }):
-    Promise<{ ok: true; productId: string; slug: string; domain: string | null; freeMonth: boolean } | LifecycleFail> {
+    Promise<{ ok: true; productId: string; slug: string; domain: string | null; freeMonth: boolean; firstPromptSet: boolean } | LifecycleFail> {
     const name = cleanName(i.name);
     if (!name) return { ok: false, reason: 'bad_name', message: `Имя продукта — от 1 до ${NAME_MAX} знаков` };
     const isAdmin = await this.isAdmin(i.userId);
@@ -172,21 +174,31 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     }
     // Сайт уже создан — он СУЩЕСТВУЕТ и работает, что бы ни случилось дальше.
     // Раньше первая правка, чтение домена и запись в журнал жили внутри
-    // того же try, что и create(): обрыв любого из них ловился тем же catch,
-    // что занятый слаг, и превращал успех в failed. Человек видел отказ,
-    // пробовал тем же именем снова и заводил ВТОРОЙ сайт поверх первого.
-    // Приём тот же, что у completeCreateBot: продукт важнее хвостов, лог
-    // без секретов, итог всё равно ok (domain может остаться null).
+    // ОДНОГО try: обрыв первого шага (например, первой правки) оставлял бы
+    // domain null и журнал пустым, хотя оба эти шага ни от чего не зависят
+    // и прекрасно сделались бы сами. Три шага — три try: каждый СВОЙ сбой не
+    // должен гасить два других. Приём тот же, что у completeCreateBot:
+    // продукт важнее хвостов, лог без секретов, итог всё равно ok (domain
+    // может остаться null).
     let domain: string | null = null;
+    let firstPromptSet = false;
     try {
-      await this.setFirstPrompt(created.productId, i.prompt, i.channel);
+      firstPromptSet = await this.setFirstPrompt(created.productId, i.prompt, i.channel);
+    } catch (e: any) {
+      this.logger.warn(`сайт ${created.productId} создан, но первая правка не поставлена: ${e?.stack ?? e?.message ?? e}`);
+    }
+    try {
       const d = await this.pg.query(`SELECT domain FROM products WHERE id = $1`, [created.productId]);
       domain = d.rows[0]?.domain ?? null;
+    } catch (e: any) {
+      this.logger.warn(`сайт ${created.productId} создан, но домен не прочитан: ${e?.stack ?? e?.message ?? e}`);
+    }
+    try {
       await this.actions.record({ userId: i.userId, productId: created.productId, kind: 'create_site', channel: i.channel, status: 'done', payload: { name, slug: created.slug } });
     } catch (e: any) {
-      this.logger.warn(`сайт ${created.productId} создан, но первая правка/домен/журнал не доделаны: ${e?.stack ?? e?.message ?? e}`);
+      this.logger.warn(`сайт ${created.productId} создан, но запись в журнал не прошла: ${e?.stack ?? e?.message ?? e}`);
     }
-    return { ok: true, productId: created.productId, slug: created.slug, domain, freeMonth: created.freeMonth };
+    return { ok: true, productId: created.productId, slug: created.slug, domain, freeMonth: created.freeMonth, firstPromptSet };
   }
 
   async openCreateBot(i: { userId: string; name: unknown; prompt?: unknown; channel: ActionChannel; turn: string | null }):
@@ -356,11 +368,19 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
         // по новой версии, которую только что создал тот же оператор). Без
         // FOR UPDATE конкурентности тут и не нужно: CTE читает снимок ДО
         // изменений того же оператора, а блокировка строки — у самого UPDATE.
+        // AND block_reason IS NULL — I4 продолжение: блокировку администратор
+        // мог поставить ПОСЛЕ того, как openDelete открыл карточку (между
+        // открытием и нажатием кнопки «Удалить» проходит время, человек
+        // читает условия). Без этого условия completeDelete архивировал бы
+        // продукт независимо от блокировки — то же обходное удаление, ради
+        // закрытия которого заведена проверка в openDelete, только с другой
+        // стороны той же карточки.
         `WITH old AS (SELECT status FROM products WHERE id = $1 AND user_id = $2)
          UPDATE products
             SET archived_at = now(), purge_after = now() + make_interval(days => $3),
                 status = 'archived', first_prompt = NULL, first_prompt_channel = NULL
           WHERE id = $1 AND user_id = $2 AND archived_at IS NULL AND status <> 'provisioning'
+                AND block_reason IS NULL
           RETURNING purge_after, (SELECT status FROM old) AS prev_status`,
         [row.product_id, i.userId, DELETE_GRACE_DAYS],
       );
@@ -374,6 +394,18 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       return { ok: false, reason: 'failed', message };
     }
     if (!r.rows[0]) {
+      // 0 строк — ЛИБО продукт уже удалён/ещё заводится, ЛИБО блокировка
+      // появилась между openDelete и этим нажатием (условие выше её теперь
+      // отбивает). Перечитываем строку, чтобы отличить одно от другого: без
+      // этого человек услышал бы «уже удалён», хотя продукт жив и просто
+      // остановлен администратором — для него пополнение/повтор не лечат
+      // ничего, нужна поддержка.
+      const cur = await this.pg.query(`SELECT block_reason FROM products WHERE id = $1 AND user_id = $2`, [row.product_id, i.userId]);
+      if (cur.rows[0]?.block_reason != null) {
+        const message = 'Продукт остановлен администратором — удалить его можно через поддержку';
+        await this.actions.finish(row.id, 'failed', { reason: 'blocked', error: message });
+        return { ok: false, reason: 'blocked', message };
+      }
       await this.actions.finish(row.id, 'failed', { error: 'Продукт уже удалён или ещё заводится' });
       return { ok: false, reason: 'gone', message: 'Продукт уже удалён или ещё заводится' };
     }
@@ -426,7 +458,7 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     // тупик только для глаз: ни кабинет, ни «Сайты и боты» не показывают
     // product_provision_jobs вовсе, только лог.
     const capped = await this.pg.query(
-      `SELECT p.id FROM products p
+      `SELECT p.id, p.slug FROM products p
         WHERE p.archived_at IS NOT NULL AND p.purged_at IS NULL AND p.status = 'archived'
           AND ($1::uuid IS NULL OR p.id = $1::uuid)
           AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
@@ -441,7 +473,13 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       // строкой каждую минуту все оставшиеся дни возврата.
       if (this.warnedSleepCap.has(row.id)) continue;
       this.warnedSleepCap.add(row.id);
-      this.logger.warn(`сон удалённого продукта ${row.id} не ставится: 3 провала подряд, нужен ручной разбор`);
+      // I1: error, а не warn — без сна контейнер удалённого продукта МОЖЕТ
+      // продолжать работать до стирания (purge, очередь 2): для сайта это
+      // лишний расход на машине без оплаты, а для бота — то, что он
+      // продолжает отвечать пользователям Telegram, хотя владелец его
+      // удалил. Это не рутинная подсказка в лог, а повод для ручного
+      // разбора, и error здесь — громкость по делу.
+      this.logger.error(`сон удалённого продукта ${row.id} (${row.slug}) не ставится: 3 провала подряд, нужен ручной разбор — контейнер мог остаться работающим до стирания`);
     }
 
     const r = await this.pg.query(
@@ -493,8 +531,7 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
   async restore(i: { userId: string; productId: string; channel: ActionChannel }):
     Promise<{ ok: true; status: 'sleeping' | 'blocked' | 'failed'; waking: boolean } | LifecycleFail> {
     const cur = await this.pg.query(
-      `SELECT p.id, p.name, p.purge_after, p.block_reason,
-              EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.product_id = p.id AND j.status = 'running') AS busy
+      `SELECT p.id, p.name, p.purge_after, p.block_reason
          FROM products p
         WHERE p.id = $1 AND p.user_id = $2 AND p.archived_at IS NOT NULL AND p.purged_at IS NULL`,
       [i.productId, i.userId],
@@ -502,7 +539,10 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     const p = cur.rows[0];
     if (!p) return { ok: false, reason: 'not_found', message: 'Удалённого продукта с таким именем нет' };
     if (new Date(p.purge_after) <= new Date()) return { ok: false, reason: 'expired', message: 'Срок возврата вышел' };
-    if (p.busy) return { ok: false, reason: 'busy', message: 'Машина продукта сейчас занята — попробуйте через минуту' };
+    // «Занято» больше НЕ проверяется здесь отдельным SELECT — см. занятость
+    // внутри транзакции ниже (после FOR UPDATE на заданиях): снаружи этот
+    // SELECT читал бы снимок, который claimJob успевал состарить между ним
+    // и записью, — ту же форму гонки M2 закрывает FOR UPDATE на products.
     try {
       await this.limits.assertCanCreate(i.userId, await this.isAdmin(i.userId));
     } catch (e: any) {
@@ -519,6 +559,9 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     // (FOR UPDATE OF p в его INSERT…SELECT) — иначе захват здесь никого не
     // ждал бы, и тик всё равно читал бы archived_at мимо этой транзакции.
     const client = await this.pg.getClient();
+    // Заполняется ТОЛЬКО по пути успеха, ПОСЛЕ COMMIT (ниже) — запись в
+    // журнал делается уже снаружи try/finally, см. комментарий там.
+    let committed: { status: string; waking: boolean } | null = null;
     try {
       await client.query('BEGIN');
       const locked = await client.query(
@@ -532,6 +575,24 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
         return { ok: false, reason: 'not_found', message: 'Удалённого продукта с таким именем нет' };
       }
 
+      // М4: «занято» проверяется ЗДЕСЬ, FOR UPDATE на самих заданиях, а не
+      // отдельным SELECT до транзакции. Раньше между тем ранним SELECT и
+      // снятием очереди ниже помещался claimJob: задание успевало перейти
+      // queued → running, и возврат гасил занятый контейнер, ничего об этом
+      // не зная. FOR UPDATE (без SKIP LOCKED) здесь не читает чужой снимок, а
+      // ЗАПИРАЕТ строку: claimJob берёт задания только через `FOR UPDATE SKIP
+      // LOCKED` (см. docblock claimJob), и, пока мы держим эту блокировку, он
+      // просто пропускает запертые строки — выдать их в running до нашего
+      // COMMIT/ROLLBACK ему нечем.
+      const jobs = await client.query(
+        `SELECT id, status FROM product_provision_jobs WHERE product_id = $1 AND status IN ('queued','running') FOR UPDATE`,
+        [p.id],
+      );
+      if (jobs.rows.some((j: any) => j.status === 'running')) {
+        await client.query('ROLLBACK');
+        return { ok: false, reason: 'busy', message: 'Машина продукта сейчас занята — попробуйте через минуту' };
+      }
+
       // Сон удаления, ещё не выданный агенту, усыпил бы вернувшийся продукт.
       await client.query(
         `UPDATE product_provision_jobs SET status = 'failed', error = 'снято возвратом', finished_at = now()
@@ -543,10 +604,15 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       // restoreUntil). Продукт, удалённый сломанным (failed), вернувшись
       // sleeping, молча начал бы списывать аренду за контейнер, который
       // никогда не работал, — пополнение баланса его не починит.
+      // resolved_at, а не created_at: это момент, когда карточку ЗАКРЫЛИ
+      // (completeDelete пишет его тем же finish()), а не когда её открыли.
+      // Карточка может висеть pending минутами, и вторая, более РАННЕ
+      // открытая, но ПОЗЖЕ подтверждённая попытка удаления обязана считаться
+      // последней — по created_at порядок вышел бы обратным.
       const prevR = await client.query(
         `SELECT result->>'prevStatus' AS prev_status FROM product_actions
           WHERE product_id = $1 AND kind = 'delete' AND status = 'done'
-          ORDER BY created_at DESC LIMIT 1`,
+          ORDER BY resolved_at DESC LIMIT 1`,
         [p.id],
       );
       const prevStatus: string | null = prevR.rows[0]?.prev_status ?? null;
@@ -596,11 +662,21 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
         if (w.rows.length > 0) {
           waking = true;
         } else {
-          // ON CONFLICT молчит не только на повторный клик здесь: RentService
-          // (wakeTick) мог поставить 'wake' на этот же продукт между нашим
-          // UPDATE products выше и этим INSERT, пока мы не держали продукт
-          // архивным ни секунды лишней. `waking = false` в таком случае было
-          // бы неправдой — задание уже в очереди, просто не нашим INSERT.
+          // ON CONFLICT молчит НЕ на гонку с RentService.wakeTick — такой
+          // гонки здесь больше нет (и, строго говоря, не было с тех пор, как
+          // снятие архива переехало в эту же транзакцию): products заперт
+          // FOR UPDATE с самого начала транзакции, а wakeTick видит только
+          // ЗАКОММИЧЕННОЕ состояние — пока мы не дошли до COMMIT, он читает
+          // archived_at НЕ NULL и этот продукт как кандидата на пробуждение
+          // не видит вовсе, поставить сюда 'wake' параллельно ему нечем.
+          // Единственная причина, по которой здесь всё-таки может лежать
+          // чужое задание 'wake' — повторный клик по той же карточке; но и
+          // его исключает FOR UPDATE на products выше (вторая, параллельная
+          // restore() на тот же id ждёт эту транзакцию и после неё видит
+          // продукт уже не архивным). ON CONFLICT и этот SELECT остаются
+          // защитой на случай, если какая-то из этих гарантий когда-нибудь
+          // сломается молча — `waking = false` в таком случае была бы
+          // неправдой, если задание всё-таки оказалось в очереди.
           const existing = await client.query(
             `SELECT 1 FROM product_provision_jobs WHERE product_id = $1 AND kind = 'wake' AND status IN ('queued','running')`,
             [p.id],
@@ -609,13 +685,35 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
         }
       }
       await client.query('COMMIT');
-      await this.actions.record({ userId: i.userId, productId: p.id, kind: 'restore', channel: i.channel, status: 'done', payload: { name: p.name }, result: { status: row.status, waking } });
-      return { ok: true, status: row.status, waking };
+      committed = { status: row.status, waking };
     } catch (e: any) {
       await client.query('ROLLBACK').catch(() => undefined);
       throw e;
     } finally {
       client.release();
+    }
+    // Журнал — ПОСЛЕ COMMIT и release, не внутри try/finally выше: запиши
+    // его там, и сбой записи (поймав собственный же catch) звал бы ROLLBACK
+    // ПОСЛЕ уже прошедшего COMMIT — для базы это не откат (транзакция уже
+    // зафиксирована), а для вызывающего — брошенное исключение поверх
+    // продукта, который на самом деле уже успешно вернулся. Лучшее усилие:
+    // сбой журнала не должен портить случившийся успех. Достичь этой строки,
+    // не вернувшись и не бросив раньше, можно только пройдя путь успеха
+    // внутри try — то есть `committed` здесь всегда заполнен.
+    try {
+      await this.actions.record({ userId: i.userId, productId: p.id, kind: 'restore', channel: i.channel, status: 'done', payload: { name: p.name }, result: committed });
+    } catch (e: any) {
+      this.logger.warn(`restore ${p.id}: успешный возврат не записан в журнал: ${e?.message}`);
+    }
+    return { ok: true, status: committed!.status as 'sleeping' | 'blocked' | 'failed', waking: committed!.waking };
+  }
+
+  /** Отказ отката — в журнал как failed. Лучшее усилие: сбой записи самого журнала не должен топить отказ, который он описывает. */
+  private async recordRevertRefusal(i: { userId: string; productId: string; channel: ActionChannel }, target: string, reason: string, error: string): Promise<void> {
+    try {
+      await this.actions.record({ userId: i.userId, productId: i.productId, kind: 'revert', channel: i.channel, status: 'failed', payload: target ? { turnId: target } : {}, result: { reason, error } });
+    } catch (e: any) {
+      this.logger.warn(`revert ${i.productId}: отказ (${reason}) не записан в журнал: ${e?.message}`);
     }
   }
 
@@ -630,15 +728,6 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
    * текст с причиной для ассистента; здесь никакого try/catch нет намеренно,
    * а не по недосмотру.
    */
-  /** Отказ отката — в журнал как failed. Лучшее усилие: сбой записи самого журнала не должен топить отказ, который он описывает. */
-  private async recordRevertRefusal(i: { userId: string; productId: string; channel: ActionChannel }, target: string, reason: string, error: string): Promise<void> {
-    try {
-      await this.actions.record({ userId: i.userId, productId: i.productId, kind: 'revert', channel: i.channel, status: 'failed', payload: target ? { turnId: target } : {}, result: { reason, error } });
-    } catch (e: any) {
-      this.logger.warn(`revert ${i.productId}: отказ (${reason}) не записан в журнал: ${e?.message}`);
-    }
-  }
-
   async revert(i: { userId: string; productId: string; turnId?: string | null; channel: ActionChannel }):
     Promise<{ ok: true; turnId: string } | LifecycleFail> {
     let target = String(i.turnId ?? '').trim();
@@ -680,7 +769,15 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     // failed) живёт в product_turns у СЛЕДУЮЩЕГО хода (turn.id), который
     // только поставлен в очередь. queued:true — явная метка «не путай со
     // статусом отменённого хода», а не забытое поле.
-    await this.actions.record({ userId: i.userId, productId: i.productId, kind: 'revert', channel: i.channel, status: 'done', payload: { turnId: target }, result: { turnId: turn.id, queued: true } });
+    //
+    // try/catch — тем же приёмом, что у restore() после COMMIT: ход отката
+    // УЖЕ поставлен в очередь (turns.revert отработал), и сбой этой записи в
+    // журнал не должен превращать случившийся успех в брошенное исключение.
+    try {
+      await this.actions.record({ userId: i.userId, productId: i.productId, kind: 'revert', channel: i.channel, status: 'done', payload: { turnId: target }, result: { turnId: turn.id, queued: true } });
+    } catch (e: any) {
+      this.logger.warn(`revert ${i.productId}: успешный откат (${turn.id}) не записан в журнал: ${e?.message}`);
+    }
     return { ok: true, turnId: turn.id };
   }
 

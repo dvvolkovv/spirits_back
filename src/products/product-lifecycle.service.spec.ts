@@ -59,7 +59,7 @@ describe('создание сайта', () => {
   it('занят чистый слаг — берётся с хвостом; первая правка запоминается; журнал', async () => {
     const h = harness({ createErrors: [new ConflictException('слаг уже занят')] });
     const r = await h.svc.createSite({ userId: 'u1', name: 'Магазин', prompt: 'Лендинг с ценами', channel: 'web' });
-    expect(r).toEqual({ ok: true, productId: 'p-new', slug: 'magazin-zzzzzz', domain: 'magazin.c.linkeon.io', freeMonth: true });
+    expect(r).toEqual({ ok: true, productId: 'p-new', slug: 'magazin-zzzzzz', domain: 'magazin.c.linkeon.io', freeMonth: true, firstPromptSet: true });
     expect(h.provisioning.create.mock.calls.map((c: any) => c[0].slug)).toEqual(['magazin', 'magazin-zzzzzz']);
     expect(h.provisioning.create.mock.calls[1][0]).toMatchObject({ kind: 'site', secrets: {}, isAdmin: false });
     expect(h.calls.some((c) => c.sql.includes('SET first_prompt') && c.params[1] === 'Лендинг с ценами' && c.params[2] === 'web')).toBe(true);
@@ -92,14 +92,38 @@ describe('создание сайта', () => {
     expect(r).toEqual({ ok: false, reason: 'failed', message: 'Не получилось — попробуйте ещё раз позже' });
   });
 
-  it('сайт создан, но первая правка/домен/журнал упали — всё равно ok:true, второй сайт не заводится', async () => {
+  it('сайт создан, но первая правка упала — домен и журнал всё равно обрабатываются, ok:true, второй сайт не заводится', async () => {
+    // Три шага (первая правка, домен, журнал) — ТРИ отдельных try: раньше
+    // одного общего try хватало, чтобы падение первого шага молча снесло
+    // domain в null и оставило журнал пустым, хотя оба эти шага ни от чего
+    // не зависят и прекрасно сделались бы сами.
     const h = harness({ pg: (sql) => (sql.includes('SET first_prompt') ? Promise.reject(new Error('connection reset by peer')) : undefined) });
     const warn = jest.spyOn((h.svc as any).logger, 'warn').mockImplementation(() => undefined);
     const r = await h.svc.createSite({ userId: 'u1', name: 'Магазин', prompt: 'Лендинг', channel: 'web' });
-    expect(r).toEqual({ ok: true, productId: 'p-new', slug: 'magazin', domain: null, freeMonth: true });
+    expect(r).toEqual({ ok: true, productId: 'p-new', slug: 'magazin', domain: 'magazin.c.linkeon.io', freeMonth: true, firstPromptSet: false });
     // Один вызов create — отказ ПОСЛЕ заведения не должен выглядеть как
     // занятый слаг и запускать повторную попытку со следующим кандидатом.
     expect(h.provisioning.create).toHaveBeenCalledTimes(1);
+    expect(h.actions.record).toHaveBeenCalledWith(expect.objectContaining({ kind: 'create_site', status: 'done' }));
+    expect(warn).toHaveBeenCalled();
+  });
+
+  it('сайт создан, но домен не прочитался — первая правка и журнал всё равно пишутся', async () => {
+    const h = harness({ pg: (sql) => (sql.includes('SELECT domain FROM products') ? Promise.reject(new Error('connection reset by peer')) : undefined) });
+    const warn = jest.spyOn((h.svc as any).logger, 'warn').mockImplementation(() => undefined);
+    const r = await h.svc.createSite({ userId: 'u1', name: 'Магазин', prompt: 'Лендинг', channel: 'web' });
+    expect(r).toEqual({ ok: true, productId: 'p-new', slug: 'magazin', domain: null, freeMonth: true, firstPromptSet: true });
+    expect(h.calls.some((c) => c.sql.includes('SET first_prompt'))).toBe(true);
+    expect(h.actions.record).toHaveBeenCalledWith(expect.objectContaining({ kind: 'create_site', status: 'done' }));
+    expect(warn).toHaveBeenCalled();
+  });
+
+  it('сайт создан, но запись в журнал упала — первая правка и домен всё равно обрабатываются', async () => {
+    const h = harness({ pg: (sql) => (sql.includes('SELECT domain FROM products') ? undefined : undefined) });
+    (h.actions.record as any).mockRejectedValueOnce(new Error('connection reset by peer'));
+    const warn = jest.spyOn((h.svc as any).logger, 'warn').mockImplementation(() => undefined);
+    const r = await h.svc.createSite({ userId: 'u1', name: 'Магазин', prompt: 'Лендинг', channel: 'web' });
+    expect(r).toEqual({ ok: true, productId: 'p-new', slug: 'magazin', domain: 'magazin.c.linkeon.io', freeMonth: true, firstPromptSet: true });
     expect(warn).toHaveBeenCalled();
   });
 });
@@ -243,6 +267,36 @@ describe('удаление', () => {
     expect(h.actions.release).toHaveBeenCalledWith(ACT, {});
   });
 
+  it('блокировка появилась между открытием карточки и нажатием «Удалить» — сообщаем про поддержку, а не «уже удалён»', async () => {
+    const h = harness({
+      pg: (sql) => {
+        if (sql.includes('SET archived_at = now()')) return { rows: [] }; // block_reason IS NULL не прошло
+        if (sql.includes('SELECT block_reason FROM products WHERE id = $1 AND user_id = $2')) return { rows: [{ block_reason: 'жалоба' }] };
+        return undefined;
+      },
+    });
+    h.actions.claim.mockResolvedValue({ id: ACT, kind: 'delete', product_id: 'p1', channel: 'web', payload: {} });
+    const r = await h.svc.completeDelete({ userId: 'u1', actionId: ACT, via: 'chat' });
+    expect(r).toEqual({ ok: false, reason: 'blocked', message: 'Продукт остановлен администратором — удалить его можно через поддержку' });
+    expect(h.actions.finish).toHaveBeenCalledWith(ACT, 'failed', {
+      reason: 'blocked', error: 'Продукт остановлен администратором — удалить его можно через поддержку',
+    });
+  });
+
+  it('0 строк без блокировки — «уже удалён или ещё заводится», как раньше', async () => {
+    const h = harness({
+      pg: (sql) => {
+        if (sql.includes('SET archived_at = now()')) return { rows: [] };
+        if (sql.includes('SELECT block_reason FROM products WHERE id = $1 AND user_id = $2')) return { rows: [{ block_reason: null }] };
+        return undefined;
+      },
+    });
+    h.actions.claim.mockResolvedValue({ id: ACT, kind: 'delete', product_id: 'p1', channel: 'web', payload: {} });
+    const r = await h.svc.completeDelete({ userId: 'u1', actionId: ACT, via: 'chat' });
+    expect(r).toEqual({ ok: false, reason: 'gone', message: 'Продукт уже удалён или ещё заводится' });
+    expect(h.actions.finish).toHaveBeenCalledWith(ACT, 'failed', { error: 'Продукт уже удалён или ещё заводится' });
+  });
+
   it('обрыв с базой на архивации — карточка возвращается в pending, не умирает навсегда', async () => {
     const h = harness({ pg: (sql) => (sql.includes('SET archived_at = now()') ? Promise.reject(new Error('connection reset by peer')) : undefined) });
     h.actions.claim.mockResolvedValue({ id: ACT, kind: 'delete', product_id: 'p1', channel: 'web', payload: {} });
@@ -274,20 +328,39 @@ describe('возврат', () => {
   const deleted = (over: any = {}) => ({ id: 'p1', name: 'М', purge_after: new Date(Date.now() + 86_400_000), block_reason: null, busy: false, ...over });
 
   it('срок вышел — отказ', async () => {
-    const h = harness({ pg: (sql) => (sql.includes('AS busy') ? { rows: [deleted({ purge_after: new Date(Date.now() - 1000) })] } : null) });
+    const h = harness({ pg: (sql) => (sql.includes('p.purge_after, p.block_reason') ? { rows: [deleted({ purge_after: new Date(Date.now() - 1000) })] } : null) });
     expect(await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' })).toMatchObject({ ok: false, reason: 'expired' });
   });
 
   it('предел занят — отказ текстом предела', async () => {
-    const h = harness({ pg: (sql) => (sql.includes('AS busy') ? { rows: [deleted()] } : null) });
+    const h = harness({ pg: (sql) => (sql.includes('p.purge_after, p.block_reason') ? { rows: [deleted()] } : null) });
     h.limits.assertCanCreate.mockRejectedValue(new UnprocessableEntityException('Предел — 2 продукта'));
     expect(await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' })).toMatchObject({ ok: false, reason: 'limit' });
+  });
+
+  // M4: «занято» проверяется ТЕПЕРЬ внутри транзакции (FOR UPDATE на самих
+  // заданиях), а не отдельным SELECT до неё — старый ранний SELECT оставлял
+  // окно, в которое помещался claimJob (queued → running), и возврат гасил
+  // занятый контейнер, ничего об этом не зная.
+  it('задание продукта сейчас running — busy, транзакция откатывается', async () => {
+    const h = harness({
+      pg: (sql) => {
+        if (sql.includes('p.purge_after, p.block_reason')) return { rows: [deleted()] };
+        if (sql.includes("status IN ('queued','running') FOR UPDATE")) return { rows: [{ id: 'job-1', status: 'running' }] };
+        return null;
+      },
+    });
+    const r = await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' });
+    expect(r).toEqual({ ok: false, reason: 'busy', message: 'Машина продукта сейчас занята — попробуйте через минуту' });
+    expect(h.calls.some((c) => c.sql === 'ROLLBACK')).toBe(true);
+    expect(h.calls.some((c) => c.sql.includes('SET archived_at = NULL'))).toBe(false);
+    expect(h.actions.record).not.toHaveBeenCalled();
   });
 
   it('оплаченный период идёт — снимаем архив и будим', async () => {
     const h = harness({
       pg: (sql) => {
-        if (sql.includes('AS busy')) return { rows: [deleted()] };
+        if (sql.includes('p.purge_after, p.block_reason')) return { rows: [deleted()] };
         if (sql.includes('SET archived_at = NULL')) return { rows: [{ status: 'sleeping', paid: true }] };
         if (sql.includes("'wake', 'queued'")) return { rows: [{ product_id: 'p1' }] };
         return null;
@@ -299,7 +372,7 @@ describe('возврат', () => {
   it('wake уже стоял в очереди (RentService успел раньше) — waking всё равно true', async () => {
     const h = harness({
       pg: (sql) => {
-        if (sql.includes('AS busy')) return { rows: [deleted()] };
+        if (sql.includes('p.purge_after, p.block_reason')) return { rows: [deleted()] };
         if (sql.includes('SET archived_at = NULL')) return { rows: [{ status: 'sleeping', paid: true }] };
         // ON CONFLICT молчит — чужой wake уже есть; мы проверяем это отдельным SELECT.
         if (sql.includes("'wake', 'queued'")) return { rows: [] };
@@ -313,7 +386,7 @@ describe('возврат', () => {
   it('погашенный администратором возвращается погашенным и не будится', async () => {
     const h = harness({
       pg: (sql) => {
-        if (sql.includes('AS busy')) return { rows: [deleted({ block_reason: 'жалоба' })] };
+        if (sql.includes('p.purge_after, p.block_reason')) return { rows: [deleted({ block_reason: 'жалоба' })] };
         if (sql.includes('SET archived_at = NULL')) return { rows: [{ status: 'blocked', paid: true }] };
         return null;
       },
@@ -325,7 +398,7 @@ describe('возврат', () => {
   it('продукт был сломан (failed) до удаления — возвращается failed, не спит и не будится', async () => {
     const h = harness({
       pg: (sql) => {
-        if (sql.includes('AS busy')) return { rows: [deleted()] };
+        if (sql.includes('p.purge_after, p.block_reason')) return { rows: [deleted()] };
         if (sql.includes("kind = 'delete' AND status = 'done'")) return { rows: [{ prev_status: 'failed' }] };
         if (sql.includes('SET archived_at = NULL')) return { rows: [{ status: 'failed', paid: true }] };
         return null;
@@ -341,7 +414,7 @@ describe('возврат', () => {
   it('токен бота за время архива достался другому живому продукту — bot_in_use, не 500', async () => {
     const h = harness({
       pg: (sql) => {
-        if (sql.includes('AS busy')) return { rows: [deleted()] };
+        if (sql.includes('p.purge_after, p.block_reason')) return { rows: [deleted()] };
         if (sql.includes('SET archived_at = NULL')) {
           const e: any = new Error('duplicate key value violates unique constraint "products_tg_bot_live"');
           e.code = '23505';

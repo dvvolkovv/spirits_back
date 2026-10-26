@@ -265,13 +265,15 @@ maybe('жизненный цикл продукта против живого Po
           [productId],
         );
       }
-      const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+      // I1: error, а не warn — контейнер без сна может остаться работающим
+      // до стирания, это повод для ручного разбора, не рутинная подсказка.
+      const error = jest.spyOn((svc as any).logger, 'error').mockImplementation(() => undefined);
 
       expect(await svc.queueSleepForDeleted(productId)).toBe(0);
-      expect(warn).toHaveBeenCalledTimes(1);
+      expect(error).toHaveBeenCalledTimes(1);
       // Повторный тик — предупреждение в логе не дублируется (один раз на процесс).
       expect(await svc.queueSleepForDeleted(productId)).toBe(0);
-      expect(warn).toHaveBeenCalledTimes(1);
+      expect(error).toHaveBeenCalledTimes(1);
 
       const sleeps = await pool.query(`SELECT count(*) FROM product_provision_jobs WHERE product_id = $1 AND kind = 'sleep' AND status = 'queued'`, [productId]);
       expect(Number(sleeps.rows[0].count)).toBe(0);
