@@ -5,6 +5,7 @@
 // рестарта. Значение заголовка в лог не пишется никогда.
 import crypto from "crypto";
 import fs from "fs";
+import { performance } from "node:perf_hooks";
 
 export const RELOAD_MS = 30_000;
 export const HEADER = "x-agent-secret";
@@ -39,17 +40,46 @@ const FREE = (req) =>
 export function createRelayAuth({
   secretsPath,
   modePath,
-  now = () => Date.now(),
+  now = () => performance.now(),
   readFile = (p) => fs.readFileSync(p, "utf8"),
   log = (line) => console.log(line),
 }) {
   let cache = { at: -Infinity, secrets: [], mode: "log" };
+  // Тихий отчёт о переменах: сравниваем с итогом ПРЕДЫДУЩЕЙ перечитки и
+  // пишем строку только когда что-то реально изменилось — молчим на первой
+  // загрузке и пока конфигурация стабильна. Значения секретов в лог не
+  // попадают, только код ошибки (если она есть) и счётчики.
+  let last = null;
+
+  const readOrError = (p) => {
+    try {
+      return { text: readFile(p), errCode: null };
+    } catch (e) {
+      return { text: "", errCode: (e && (e.code || e.message)) || "ERR" };
+    }
+  };
+
   const load = () => {
     if (now() - cache.at < RELOAD_MS) return cache;
-    let secrets = [];
-    let mode = "log";
-    try { secrets = parseSecrets(readFile(secretsPath)); } catch {}
-    try { mode = parseMode(readFile(modePath)); } catch {}
+
+    const secretsRead = readOrError(secretsPath);
+    const modeRead = readOrError(modePath);
+    const secrets = secretsRead.errCode ? [] : parseSecrets(secretsRead.text);
+    const mode = modeRead.errCode ? "log" : parseMode(modeRead.text);
+
+    if (last) {
+      if (secretsRead.errCode && secretsRead.errCode !== last.secretsErr) {
+        log(`relay-auth: relay-secrets: ${secretsRead.errCode}`);
+      }
+      if (modeRead.errCode && modeRead.errCode !== last.modeErr) {
+        log(`relay-auth: relay-auth-mode: ${modeRead.errCode}`);
+      }
+      if (mode !== last.mode || secrets.length !== last.secretsCount) {
+        log(`relay-auth: режим ${mode}, секретов ${secrets.length}`);
+      }
+    }
+    last = { mode, secretsCount: secrets.length, secretsErr: secretsRead.errCode, modeErr: modeRead.errCode };
+
     cache = { at: now(), secrets, mode };
     return cache;
   };
