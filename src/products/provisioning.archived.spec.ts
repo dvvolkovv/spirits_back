@@ -6,6 +6,7 @@ import { MIGRATIONS } from './products.service';
 import { ProvisioningService } from './provisioning.service';
 import { HostsService } from './hosts.service';
 import { LimitsService } from './limits.service';
+import { RentService } from './rent.service';
 import { SecretsService } from './secrets.service';
 
 const PG = process.env.PROVISIONING_PG_URL;
@@ -33,7 +34,10 @@ maybe('сон удалённого продукта против живого Po
     for (const f of MIGRATIONS) await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', f), 'utf8'));
     const pg = { query: (s: string, p?: any[]) => pool.query(s, p) };
     const secrets = new SecretsService({ get: (k: string) => (k === 'PRODUCT_SECRETS_KEY' ? KEY : undefined) } as any);
-    svc = new ProvisioningService(pg as any, secrets, new HostsService(pg as any), new LimitsService(pg as any));
+    // Настоящий RentService на том же пуле: этот файл promoteReady не зовёт,
+    // но пятый аргумент теперь обязателен — живой сервис дешевле заглушки и
+    // не рискует молча разойтись с реальным поведением.
+    svc = new ProvisioningService(pg as any, secrets, new HostsService(pg as any), new LimitsService(pg as any), new RentService(pg as any));
   });
   beforeEach(async () => {
     await pool.query('TRUNCATE products, product_provision_jobs, product_turns, product_host_agent, product_hosts RESTART IDENTITY CASCADE');

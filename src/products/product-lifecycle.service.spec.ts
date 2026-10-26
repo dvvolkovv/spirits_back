@@ -1,5 +1,6 @@
 import { ConflictException, UnprocessableEntityException } from '@nestjs/common';
 import { ProductLifecycleService, DELETE_GRACE_DAYS } from './product-lifecycle.service';
+import { RENT_TOKENS } from './rent.service';
 
 const ACT = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 const TOKEN = '1234567890:AAH9sdfjKJHkjh34kjh5kjh6KJHkjhKJHkj';
@@ -358,15 +359,79 @@ describe('возврат', () => {
   });
 
   it('оплаченный период идёт — снимаем архив и будим', async () => {
+    const paidUntil = new Date(Date.now() + 5 * 86_400_000);
     const h = harness({
       pg: (sql) => {
         if (sql.includes('p.purge_after, p.block_reason')) return { rows: [deleted()] };
-        if (sql.includes('SET archived_at = NULL')) return { rows: [{ status: 'sleeping', paid: true }] };
+        if (sql.includes('SET archived_at = NULL')) return { rows: [{ status: 'sleeping', paid: true, paid_until: paidUntil }] };
         if (sql.includes("'wake', 'queued'")) return { rows: [{ product_id: 'p1' }] };
         return null;
       },
     });
-    expect(await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' })).toEqual({ ok: true, status: 'sleeping', waking: true });
+    expect(await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' })).toEqual({
+      ok: true, status: 'sleeping', waking: true, paid: true, paidUntil: paidUntil.toISOString(), balance: 0,
+    });
+  });
+
+  // Задача «Отступления очереди 1», п.2: раньше истёкший период безусловно
+  // писал «не хватило токенов» и ждал подметальщика (до минуты), даже когда
+  // денег с запасом хватает. Теперь restore() сам ставит пробуждение — не
+  // дожидаясь RentService.wakeTick.
+  it('период истёк, но баланс покрывает аренду — всё равно будим, не ждём подметальщика', async () => {
+    const paidUntil = new Date(Date.now() - 86_400_000);
+    const h = harness({
+      pg: (sql) => {
+        if (sql.includes('p.purge_after, p.block_reason')) return { rows: [deleted()] };
+        if (sql.includes('FROM ai_profiles_consolidated')) return { rows: [{ tokens: RENT_TOKENS }] };
+        if (sql.includes('SET archived_at = NULL')) return { rows: [{ status: 'sleeping', paid: false, paid_until: paidUntil }] };
+        if (sql.includes("'wake', 'queued'")) return { rows: [{ product_id: 'p1' }] };
+        return null;
+      },
+    });
+    expect(await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' })).toEqual({
+      ok: true, status: 'sleeping', waking: true, paid: false, paidUntil: paidUntil.toISOString(), balance: RENT_TOKENS,
+    });
+    // $5 — тот самый affordable, от которого в самой записи зависит, писать
+    // ли SLEEP_REASON_NO_TOKENS (см. CASE в UPDATE): true здесь означает
+    // «не писать», несмотря на то что период истёк.
+    const upd = h.calls.find((c) => c.sql.includes('SET archived_at = NULL'))!;
+    expect(upd.params[4]).toBe(true);
+  });
+
+  it('период истёк и баланса не хватает — не будим, баланс назван в ответе', async () => {
+    const paidUntil = new Date(Date.now() - 86_400_000);
+    const h = harness({
+      pg: (sql) => {
+        if (sql.includes('p.purge_after, p.block_reason')) return { rows: [deleted()] };
+        if (sql.includes('FROM ai_profiles_consolidated')) return { rows: [{ tokens: 12_345 }] };
+        if (sql.includes('SET archived_at = NULL')) return { rows: [{ status: 'sleeping', paid: false, paid_until: paidUntil }] };
+        return null;
+      },
+    });
+    expect(await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' })).toEqual({
+      ok: true, status: 'sleeping', waking: false, paid: false, paidUntil: paidUntil.toISOString(), balance: 12_345,
+    });
+    expect(h.calls.some((c) => c.sql.includes("'wake', 'queued'"))).toBe(false);
+    const upd = h.calls.find((c) => c.sql.includes('SET archived_at = NULL'))!;
+    expect(upd.params[4]).toBe(false);
+  });
+
+  // M1 (ревью): баланс хватает — CASE снимает старую причину сна (NULL),
+  // а не оставляет лежать прежнюю «Не хватило токенов» от прошлого раза.
+  it('M1: баланс хватает — пятый параметр чистит sleep_reason (ветка THEN NULL), а не только ветка «писать»', async () => {
+    const paidUntil = new Date(Date.now() - 86_400_000);
+    const h = harness({
+      pg: (sql) => {
+        if (sql.includes('p.purge_after, p.block_reason')) return { rows: [deleted()] };
+        if (sql.includes('FROM ai_profiles_consolidated')) return { rows: [{ tokens: RENT_TOKENS }] };
+        if (sql.includes('SET archived_at = NULL')) return { rows: [{ status: 'sleeping', paid: false, paid_until: paidUntil }] };
+        if (sql.includes("'wake', 'queued'")) return { rows: [{ product_id: 'p1' }] };
+        return null;
+      },
+    });
+    await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' });
+    const upd = h.calls.find((c) => c.sql.includes('SET archived_at = NULL'))!;
+    expect(upd.sql).toContain('THEN NULL');
   });
 
   // Ревью, круг 2, пункт 11: старое имя теста («RentService успел раньше»)
@@ -381,25 +446,27 @@ describe('возврат', () => {
     const h = harness({
       pg: (sql) => {
         if (sql.includes('p.purge_after, p.block_reason')) return { rows: [deleted()] };
-        if (sql.includes('SET archived_at = NULL')) return { rows: [{ status: 'sleeping', paid: true }] };
+        if (sql.includes('SET archived_at = NULL')) return { rows: [{ status: 'sleeping', paid: true, paid_until: new Date(Date.now() + 5 * 86_400_000) }] };
         // ON CONFLICT молчит — чужой wake уже есть; мы проверяем это отдельным SELECT.
         if (sql.includes("'wake', 'queued'")) return { rows: [] };
         if (sql.includes("kind = 'wake' AND status IN")) return { rows: [{ '?column?': 1 }] };
         return null;
       },
     });
-    expect(await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' })).toEqual({ ok: true, status: 'sleeping', waking: true });
+    const r = await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' });
+    expect(r).toMatchObject({ ok: true, status: 'sleeping', waking: true, paid: true, balance: 0 });
   });
 
   it('погашенный администратором возвращается погашенным и не будится', async () => {
     const h = harness({
       pg: (sql) => {
         if (sql.includes('p.purge_after, p.block_reason')) return { rows: [deleted({ block_reason: 'жалоба' })] };
-        if (sql.includes('SET archived_at = NULL')) return { rows: [{ status: 'blocked', paid: true }] };
+        if (sql.includes('SET archived_at = NULL')) return { rows: [{ status: 'blocked', paid: true, paid_until: new Date(Date.now() + 5 * 86_400_000) }] };
         return null;
       },
     });
-    expect(await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' })).toEqual({ ok: true, status: 'blocked', waking: false });
+    const r = await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' });
+    expect(r).toMatchObject({ ok: true, status: 'blocked', waking: false, balance: 0 });
     expect(h.calls.some((c) => c.sql.includes("'wake', 'queued'"))).toBe(false);
   });
 
@@ -408,12 +475,12 @@ describe('возврат', () => {
       pg: (sql) => {
         if (sql.includes('p.purge_after, p.block_reason')) return { rows: [deleted()] };
         if (sql.includes("kind = 'delete' AND status = 'done'")) return { rows: [{ prev_status: 'failed' }] };
-        if (sql.includes('SET archived_at = NULL')) return { rows: [{ status: 'failed', paid: true }] };
+        if (sql.includes('SET archived_at = NULL')) return { rows: [{ status: 'failed', paid: true, paid_until: new Date(Date.now() + 5 * 86_400_000) }] };
         return null;
       },
     });
     const r = await h.svc.restore({ userId: 'u1', productId: 'p1', channel: 'web' });
-    expect(r).toEqual({ ok: true, status: 'failed', waking: false });
+    expect(r).toMatchObject({ ok: true, status: 'failed', waking: false, balance: 0 });
     const upd = h.calls.find((c) => c.sql.includes('SET archived_at = NULL'))!;
     expect(upd.params[3]).toBe('failed');
     expect(h.calls.some((c) => c.sql.includes("'wake', 'queued'"))).toBe(false);

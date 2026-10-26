@@ -20,7 +20,7 @@ import { HostsService } from './hosts.service';
 import { DEFAULT_MAX_PRODUCTS, LimitsService } from './limits.service';
 import { MIGRATIONS, ProductsService } from './products.service';
 import { ProvisioningService } from './provisioning.service';
-import { RentService } from './rent.service';
+import { RENT_TOKENS, RentService, SLEEP_REASON_NO_TOKENS } from './rent.service';
 import { SecretsService } from './secrets.service';
 import { BLOCKED_REFUSAL, SLEEPING_REFUSAL, TurnsService } from './turns.service';
 
@@ -153,7 +153,7 @@ maybe('провижининг против живого Postgres', () => {
     probe?: (url: string, init?: any) => Promise<{ status: number }>,
     checkBot?: (token: string) => Promise<{ ok: true; id: number; username: string } | { ok: false; reason: 'bad_form' | 'rejected' | 'unreachable' }>,
   ) => {
-    const svc = new ProvisioningService(pg as any, secrets, new HostsService(pg as any), new LimitsService(pg as any));
+    const svc = new ProvisioningService(pg as any, secrets, new HostsService(pg as any), new LimitsService(pg as any), new RentService(pg as any));
     (svc as any).fetchFn = probe ?? (async () => ({ status: 200 }));
     (svc as any).checkBot = checkBot ?? (async () => ({ ok: true, id: ++botIdSeq, username: 'studio_bot' }));
     return svc;
@@ -1242,7 +1242,7 @@ maybe('провижининг против живого Postgres', () => {
         return r;
       },
     };
-    const svc = new ProvisioningService(racingPg as any, secrets, new HostsService(racingPg as any), new LimitsService(racingPg as any));
+    const svc = new ProvisioningService(racingPg as any, secrets, new HostsService(racingPg as any), new LimitsService(racingPg as any), new RentService(racingPg as any));
 
     const e = await svc
       .create({ userId: 'u-9', isAdmin: true, name: 'гонка', slug: 'raced-slug', kind: 'site', secrets: {} })
@@ -1348,7 +1348,7 @@ maybe('провижининг против живого Postgres', () => {
           return r;
         },
       };
-      const svc = new ProvisioningService(racingPg as any, secrets, new HostsService(racingPg as any), new LimitsService(racingPg as any));
+      const svc = new ProvisioningService(racingPg as any, secrets, new HostsService(racingPg as any), new LimitsService(racingPg as any), new RentService(racingPg as any));
       (svc as any).checkBot = async () => ({ ok: true, id: 909090, username: 'raced_bot' });
 
       const e = await svc
@@ -3623,13 +3623,161 @@ maybe('провижининг против живого Postgres', () => {
       expect((await getProduct(p.id)).runner_token_hash).toBe(hashBefore);
       await svc.completeJob(wakeJob!.jobId, { ok: true });
 
-      // 6. Перевод по измеримому факту — и продукт снова платит.
+      // 6. Перевод по измеримому факту — и аренда списывается СРАЗУ при этом
+      // же переходе, внутри promoteReady (задача «Отступления очереди 1»,
+      // п.1). Раньше здесь продукт работал бы бесплатно до завтрашнего
+      // оборота rent().tick() — ровно та дыра, из-за которой пункт и завёлся:
+      // «проснулся → списание» ждало отдельного суточного тика.
       await pool.query(`UPDATE products SET runner_seen_at = now() WHERE id = $1`, [p.id]);
       expect(await svc.promoteReady()).toBe(1);
       const row = await getProduct(p.id);
       expect([row.status, row.sleep_reason]).toEqual(['running', null]);
-      expect(await rent().chargeRent(p.id)).toBe(true);
+      expect(new Date(row.paid_until).getTime()).toBeGreaterThan(Date.now());
       expect(await balanceOf('u-1')).toBe(70_000);
+      // Суточный tick следом не находит, что списывать — период уже занят
+      // первой арендой при старте: это и есть защита от двойного списания.
+      expect(await rent().chargeRent(p.id)).toBe(false);
+    });
+  });
+
+  /**
+   * ПЕРВАЯ АРЕНДА ПРИ СТАРТЕ — задача «Отступления очереди 1», пункт 1.
+   *
+   * Прод, 26.10.2026: продукт без бесплатного месяца получает `paid_until =
+   * now()` прямо в INSERT (CASE внутри create(), см. freeMonthCountedJobSql),
+   * а списывал аренду только суточный `rent().tick()`. Между «поднялся» и
+   * «пришёл тик» он работал бесплатно — до суток, а «создать → удалить до
+   * тика» было бы бесплатным хостингом навсегда без единой строки в логе.
+   * `RentService.chargeOnStart` (зовёт её только `promoteReady`, см. там)
+   * закрывает это окно: аренда списывается тем же тактом, что переводит
+   * продукт в running.
+   */
+  describe('первая аренда при старте', () => {
+    beforeAll(ensureBillingTables);
+    beforeEach(() => pool.query('TRUNCATE ai_profiles_consolidated, token_transactions'));
+    afterAll(() => pool.query('TRUNCATE ai_profiles_consolidated, token_transactions'));
+
+    /** Продукт, которому ПОРА платить: paid_until уже не в будущем, как у
+     *  продукта без бесплатного месяца сразу после заведения. */
+    const dueOnStart = (slug: string, status = 'provisioning') =>
+      product({ slug, status, seenAgo: '10 seconds' }).then(async (p) => {
+        await pool.query(`UPDATE products SET paid_until = now() WHERE id = $1`, [p.id]);
+        return p;
+      });
+
+    it('непервый продукт платит аренду тем же тактом, что переводится в running', async () => {
+      const p = await dueOnStart('rent-on-start-ok');
+      await setBalance('u-1', 120_000);
+
+      expect(await makeSvc().promoteReady()).toBe(1);
+
+      const row = await getProduct(p.id);
+      expect(row.status).toBe('running');
+      // «≈ +1 месяц»: занятый период отсчитывается от МОМЕНТА заведения
+      // (paid_until была уже в прошлом), а не от текущей секунды проверки —
+      // отсюда зазор в несколько секунд, а не точное равенство.
+      const monthAhead = Date.now() + 29 * 24 * 3600 * 1000;
+      expect(new Date(row.paid_until).getTime()).toBeGreaterThan(monthAhead);
+      expect(await balanceOf('u-1')).toBe(120_000 - RENT_TOKENS);
+      // Одна транзакция — одна строка в учёте, не ноль и не две.
+      expect(await ledgerOf('u-1')).toHaveLength(1);
+    });
+
+    it('не хватает токенов на аренду при старте — продукт уходит в сон', async () => {
+      const p = await dueOnStart('rent-on-start-poor');
+      await setBalance('u-1', 10_000);
+
+      await makeSvc().promoteReady();
+
+      const row = await getProduct(p.id);
+      expect([row.status, row.sleep_reason]).toEqual(['sleeping', SLEEP_REASON_NO_TOKENS]);
+      // Баланс не тронут: частичный отказ (списать сколько есть) здесь
+      // запрещён тем же правилом, что в `chargeRent` — см. комментарий там.
+      expect(await balanceOf('u-1')).toBe(10_000);
+      expect(await ledgerOf('u-1')).toEqual([]);
+      expect(await jobsOf(p.id)).toEqual(['queued']);
+    });
+
+    it('продукт с бесплатным месяцем при переводе в running аренду не платит', async () => {
+      // БЕЗ dueOnStart: paid_until — DEFAULT колонки (месяц вперёд), то есть
+      // ровно то состояние, в котором бесплатный продукт выходит из create().
+      const p = await product({ slug: 'rent-on-start-free', status: 'provisioning', seenAgo: '10 seconds' });
+      await setBalance('u-1', 120_000);
+
+      expect(await makeSvc().promoteReady()).toBe(1);
+
+      expect((await getProduct(p.id)).status).toBe('running');
+      expect(await balanceOf('u-1')).toBe(120_000);
+      expect(await ledgerOf('u-1')).toEqual([]);
+    });
+
+    it('суточный тик сразу после старта аренду повторно не списывает', async () => {
+      // Race-safety с rent().tick(): обе функции зовут один и тот же
+      // chargeRent с одними и теми же предусловиями (`paid_until <= now()`),
+      // поэтому тик, пришедший следом за promoteReady, просто не находит,
+      // что списывать — тот же механизм, что защищает от двух процессов
+      // кластера (см. docblock chargeRent/tick).
+      const p = await dueOnStart('rent-on-start-no-double');
+      await setBalance('u-1', 120_000);
+
+      await makeSvc().promoteReady();
+      expect(await balanceOf('u-1')).toBe(120_000 - RENT_TOKENS);
+
+      await rent().tick();
+
+      expect(await balanceOf('u-1')).toBe(120_000 - RENT_TOKENS);
+      expect(await ledgerOf('u-1')).toHaveLength(1);
+      expect((await getProduct(p.id)).status).toBe('running');
+    });
+
+    // I2 (ревью): просрочка МЕНЬШЕ месяца на старте — продукт полежал спящим
+    // (сон/удаление/неудачное заведение) 5 дней, не 40, как в тесте выше.
+    // Суточный tick() в этом случае законно анкерит период от СТАРОГО
+    // paid_until (владелец ничего не доплачивает за задержку сборщика), но
+    // на СТАРТЕ такой якорь был бы неправ: пользователь получил бы на 5 дней
+    // короче оплаченного месяца. chargeOnStart анкерит именно `now()`.
+    it('просрочка меньше месяца на старте — период от сегодня, а не от старого paid_until (на 5 дней короче)', async () => {
+      const p = await product({ slug: 'rent-on-start-short-overdue', status: 'sleeping', seenAgo: '10 seconds' });
+      await pool.query(`UPDATE products SET paid_until = now() - interval '5 days', sleep_reason = $2 WHERE id = $1`, [
+        p.id,
+        SLEEP_REASON_NO_TOKENS,
+      ]);
+      await job(p.id, { kind: 'wake', status: 'done', finishedAgo: '1 second' });
+      await setBalance('u-1', 120_000);
+
+      expect(await makeSvc().promoteReady()).toBe(1);
+
+      const row = await getProduct(p.id);
+      expect([row.status, row.sleep_reason]).toEqual(['running', null]);
+      // Старый (неверный для старта) якорь дал бы old_paid_until + 1 месяц =
+      // сегодня + 25 дней — заметно МЕНЬШЕ 29 дней вперёд.
+      const monthAhead = Date.now() + 29 * 24 * 3600 * 1000;
+      expect(new Date(row.paid_until).getTime()).toBeGreaterThan(monthAhead);
+      expect(await balanceOf('u-1')).toBe(120_000 - RENT_TOKENS);
+      expect(await ledgerOf('u-1')).toHaveLength(1);
+    });
+
+    it('разбуженный продукт с истёкшим периодом платит аренду при переводе в running', async () => {
+      // Тот же путь, что сценарий 76 выше, но изолированно и прицельно на сам
+      // факт списания при ПРОБУЖДЕНИИ, а не только при первом заведении:
+      // promoteReady — единственное место, где статус становится running
+      // (см. комментарий у WOKEN_SQL/promoteReady), и ветка 'sleeping' AND
+      // WOKEN_SQL проходит через тот же вызов chargeOnStart, что и ветка
+      // 'provisioning'.
+      const p = await product({ slug: 'rent-on-wake', status: 'sleeping', seenAgo: '10 seconds' });
+      await pool.query(`UPDATE products SET paid_until = now() - interval '40 days', sleep_reason = $2 WHERE id = $1`, [
+        p.id,
+        SLEEP_REASON_NO_TOKENS,
+      ]);
+      await job(p.id, { kind: 'wake', status: 'done', finishedAgo: '1 second' });
+      await setBalance('u-1', 120_000);
+
+      expect(await makeSvc().promoteReady()).toBe(1);
+
+      const row = await getProduct(p.id);
+      expect([row.status, row.sleep_reason]).toEqual(['running', null]);
+      expect(await balanceOf('u-1')).toBe(120_000 - RENT_TOKENS);
+      expect(await ledgerOf('u-1')).toHaveLength(1);
     });
   });
 
@@ -4181,6 +4329,7 @@ maybe('провижининг против живого Postgres', () => {
           secrets,
           new HostsService(gatedPg as any),
           new LimitsService(gatedPg as any),
+          new RentService(gatedPg as any),
         );
 
       const all = await Promise.all(
@@ -5485,7 +5634,7 @@ maybe('провижининг против живого Postgres', () => {
           },
         };
         const raced = () =>
-          new ProvisioningService(gatedPg as any, secrets, new HostsService(gatedPg as any), new LimitsService(gatedPg as any));
+          new ProvisioningService(gatedPg as any, secrets, new HostsService(gatedPg as any), new LimitsService(gatedPg as any), new RentService(gatedPg as any));
 
         const both = await Promise.all([
           refusedOn(
