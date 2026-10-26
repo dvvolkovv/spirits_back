@@ -177,6 +177,16 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     Promise<{ ok: true; actionId: string; expiresAt: string } | LifecycleFail> {
     const name = cleanName(i.name);
     if (!name) return { ok: false, reason: 'bad_name', message: `Имя бота — от 1 до ${NAME_MAX} знаков` };
+    // M8: предел — до открытия карточки, а не после того, как человек введёт
+    // в неё токен бота и ключи сервисов (completeCreateBot проверяет его
+    // уже постфактум, на create()). Отбитый предел после ввода токена —
+    // потраченное доверие: человек отдал секрет боту, который не завёлся бы
+    // всё равно.
+    try {
+      await this.limits.assertCanCreate(i.userId, await this.isAdmin(i.userId));
+    } catch (e: any) {
+      return failOf(e, 'Нет места в пределе', this.logger);
+    }
     const prompt = String(i.prompt ?? '').trim();
     const { id, expiresAt } = await this.actions.open({
       userId: i.userId, productId: null, kind: 'create_bot', channel: i.channel, turn: i.turn,
