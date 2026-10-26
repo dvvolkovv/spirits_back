@@ -21,28 +21,42 @@
  * число строк против `{{len .Config.Env}}`: значение с переводом строки
  * (приватный ключ PEM) иначе разваливается на две переменные. Здесь
  * `{{json .}}` и разбор в коде — перевод строки внутри значения ничего не
- * ломает, а приватные ключи владельцы как раз и присылают.
+ * ломает, а приватные ключи владельцы как раз и присылают. Контейнер
+ * спрашивается с `--type container`: без него docker при отсутствии
+ * контейнера отдал бы образ с тем же именем, и разбор пошёл бы по чужому
+ * объекту.
  *
  * ## Образ — тот же, запуск — по метке
  *
  * Запуск по голому идентификатору выбросил бы контейнер из отбора
  * product-image-roll.sh НАВСЕГДА (отбор по `.Config.Image` с префиксом
  * `linkeon-product:`): раннер внутри перестал бы обновляться. Поэтому по
- * `.Config.Image`, если метка по-прежнему указывает на образ контейнера; если
- * её передвинули (контейнер пропущен прошлым обновлением образа) — по
- * стабильной метке `linkeon-product:src-*` того же образа; нет такой — отказ
- * ДО изменений: смена ключей не должна втихую менять раннер.
+ * `.Config.Image`, если это метка `linkeon-product:` и она по-прежнему
+ * указывает на образ контейнера. Иначе — метку передвинули (контейнер
+ * пропущен прошлым обновлением образа) или контейнер запущен по
+ * идентификатору либо чужой меткой — по стабильной метке
+ * `linkeon-product:src-*` того же образа: так продукт заодно возвращается в
+ * отбор. Нет такой — отказ ДО изменений: смена ключей не должна втихую
+ * менять раннер. Метку могут передвинуть и между inspect и запуском, поэтому
+ * после `docker run` образ нового контейнера сверяется по идентификатору
+ * (как verify_image в product-image-roll.sh); не тот — откат.
  *
  * ## Здоровье
  *
  * `/health` спрашивается ИЗНУТРИ контейнера (`docker exec … node -e`) — у
- * бота порта наружу нет вовсе — и по правилу раннера (`checkHealth` в
- * deploy.ts): 2xx, не HTML ни по заголовку, ни по телу, JSON с непустым
- * `sha`. Одно правило на сайт и бота: «здоров» не должно значить разное в
+ * бота порта наружу нет вовсе — по правилу раннера (`checkHealth` в
+ * deploy.ts: 2xx, не HTML ни по заголовку, ни по телу) и строже него, как
+ * probe заведения: JSON с непустым `sha` обязателен (см. HEALTH_INSIDE).
+ * Одно правило на сайт и бота: «здоров» не должно значить разное в
  * зависимости от формы продукта. Сайту сверх того — `waitPort`, как при
  * заведении и пробуждении: опубликованный порт обязан ответить тоже, иначе
- * домен смотрел бы в пустоту. Нездоров — откат: новый контейнер снимается,
- * старый получает имя обратно и поднимается.
+ * домен смотрел бы в пустоту.
+ *
+ * Здоров — это ДВА ответа через паузу, а не один: ключ, который код владельца
+ * читает лениво (на первом запросе к своему API), валит процесс уже после
+ * первого ответа. Убранный к тому моменту старый контейнер было бы не
+ * вернуть. Второй взгляд — одной пробой, без нового ожидания: срок смены
+ * ограничен. Нездоров — откат.
  *
  * ## Откат — по состоянию хоста, а не по тому, какой шаг отказал
  *
@@ -52,7 +66,10 @@
  * новый (или никого), он снимается, старый получает имя обратно; нет —
  * старый так и стоит под своим именем, и его остаётся только поднять. Что
  * `<слаг>__rekey` до начала смены не было, проверено первым делом (остаток
- * прерванной смены — отказ до изменений).
+ * прерванной смены — отказ до изменений). `docker start` отвечает 0, как
+ * только процесс запущен, — упавший через секунду тоже; поэтому после него
+ * пауза и состояние контейнера, как в do_restore. Не удержался — остаток, и
+ * сервер узнаёт, что исход неизвестен.
  *
  * ## Чего здесь нет
  *
@@ -91,13 +108,19 @@ export interface RekeyJob {
 /** Имя старого контейнера на время смены. Не `__pre_`: то — страховка обновления образа. */
 export const REKEY_BACKUP_SUFFIX = '__rekey';
 
+/** Пауза перед повторным взглядом — как `sleep 3` в do_restore. См. ProvisionDeps.settleMs. */
+const SETTLE_MS = 3_000;
+
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const STABLE_TAG_RE = /^linkeon-product:src-[0-9a-f]{12}$/;
 const IPV4_RE = /^\d{1,3}(?:\.\d{1,3}){3}$/;
 
 /**
- * /health изнутри контейнера — правило checkHealth раннера (deploy.ts):
- * 2xx, не text/html, в теле нет HTML, JSON с непустым sha. Выход 0 — здоров.
+ * /health изнутри контейнера. Правило — checkHealth раннера (deploy.ts): 2xx,
+ * не text/html, в теле нет HTML. И СТРОЖЕ него, как probe заведения
+ * (provision.ts): JSON с непустым sha обязателен. checkHealth требует sha
+ * только когда есть с чем сверить; здесь сверять не с чем, но 2xx без sha —
+ * не ответ продукта, и здоровьем не считается. Выход 0 — здоров.
  * Без регэкспов с обратными слэшами: строка уходит в argv как есть.
  * Экспорт — ради теста самого правила (rekey.spec.ts): симулятор хоста
  * скрипт только компилирует.
@@ -110,7 +133,7 @@ export const HEALTH_INSIDE =
   "process.exit(r.status>=200&&r.status<300&&!html&&typeof sha==='string'&&sha.length>0?0:1)})" +
   '.catch(()=>process.exit(1))';
 
-/** Ожидание /health изнутри — по умолчанию для ProvisionDeps.waitInside. */
+/** Ожидание /health изнутри — по умолчанию для ProvisionDeps.waitInside. Срок 0 — одна проба. */
 export function waitInsideVia(deps: ProvisionDeps): (slug: string, timeoutMs: number) => Promise<boolean> {
   return async (slug, timeoutMs) => {
     const deadline = Date.now() + timeoutMs;
@@ -155,19 +178,47 @@ function clip(text: string): string {
   return t ? t.slice(0, 300) : 'без причины';
 }
 
-/** inspect с разбором JSON. Отказ — без вывода: в нём окружение с ключами. */
-async function inspectJson(deps: ProvisionDeps, argv: string[]): Promise<any> {
+const pause = (ms: number) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve());
+
+/** `docker inspect` именно контейнера (см. шапку: «Почему JSON»). */
+function containerInspect(name: string): string[] {
+  return ['docker', 'inspect', '--type', 'container', '--format', '{{json .}}', name];
+}
+
+/**
+ * inspect с разбором JSON. `what` — что читали, словами: «контейнер shop»,
+ * «образ sha256:…». Вывод в текст отказа не идёт: в нём окружение с ключами.
+ */
+async function inspectJson(deps: ProvisionDeps, argv: string[], what: string): Promise<any> {
   let out: string;
   try {
     out = await deps.run(argv);
   } catch (e) {
-    throw new Error(`${argv.slice(0, 3).join(' ')} отказал (${reasonOf(e, argv)}) — ничего не тронуто`);
+    throw new Error(`не прочитать ${what}: ${reasonOf(e, argv)}`);
   }
   try {
     return JSON.parse(out);
   } catch {
-    throw new Error(`${argv.slice(0, 3).join(' ')}: ответ не JSON — ничего не тронуто`);
+    throw new Error(`не прочитать ${what}: docker inspect ответил не JSON`);
   }
+}
+
+/** То же до первого изменения: отказ называет, что хост не тронут. */
+async function inspectBefore(deps: ProvisionDeps, argv: string[], what: string): Promise<any> {
+  try {
+    return await inspectJson(deps, argv, what);
+  } catch (e) {
+    throw new Error(`${(e as Error).message} — ничего не тронуто`);
+  }
+}
+
+/** Запущен и не в петле перезапусков (у docker Restarting идёт вместе с Running=true). */
+function upAndSteady(c: any): boolean {
+  return c?.State?.Running === true && c?.State?.Restarting !== true;
+}
+
+function statusOf(c: any): string {
+  return String(c?.State?.Status ?? 'состояние неизвестно').slice(0, 40);
 }
 
 function envName(entry: string): string {
@@ -188,8 +239,11 @@ function validateDropNames(raw: unknown): string[] {
 }
 
 /** Что снято с живого контейнера ДО любого разрушения. */
-interface Captured {
+export interface Captured {
+  /** Чем запускать новый: метка `linkeon-product:` того же образа. */
   imageRef: string;
+  /** Идентификатор образа старого контейнера — с ним сверяется новый. */
+  imageId: string;
   ownEnv: string[];
   publish: string[];
   mounts: string[];
@@ -207,10 +261,14 @@ function nonNegativeInt(value: unknown, what: string): number {
   return n;
 }
 
-async function capture(job: RekeyJob, deps: ProvisionDeps): Promise<Captured> {
-  const c = await inspectJson(deps, ['docker', 'inspect', '--format', '{{json .}}', job.slug]);
+/**
+ * Снять настройки с живого контейнера. Только чтение; любой отказ — до
+ * изменений на хосте. Экспорт — ради теста по рукописному inspect.
+ */
+export async function capture(job: RekeyJob, deps: ProvisionDeps): Promise<Captured> {
+  const c = await inspectBefore(deps, containerInspect(job.slug), `контейнер ${job.slug}`);
   if (c?.State?.Running !== true) {
-    throw new Error(`контейнер ${job.slug} не запущен — ключи спящему продукту не меняются, ничего не тронуто`);
+    throw new Error(`контейнер ${job.slug} не запущен (спит или прервана прошлая смена ключей) — ничего не тронуто`);
   }
   const net = c?.HostConfig?.NetworkMode;
   if (net !== 'bridge' && net !== 'default') throw new Error(`сеть контейнера ${JSON.stringify(net)} воспроизвести не умею — ничего не тронуто`);
@@ -219,12 +277,15 @@ async function capture(job: RekeyJob, deps: ProvisionDeps): Promise<Captured> {
   const imageId = String(c?.Image ?? '');
   const configImage = String(c?.Config?.Image ?? '');
   if (!imageId) throw new Error(`у контейнера ${job.slug} нет образа — ничего не тронуто`);
-  const img = await inspectJson(deps, ['docker', 'image', 'inspect', '--format', '{{json .}}', imageId]);
+  const img = await inspectBefore(deps, ['docker', 'image', 'inspect', '--format', '{{json .}}', imageId], `образ ${imageId}`);
 
   let imageRef: string | undefined;
-  if (configImage && configImage !== imageId) {
+  // Своя метка годится, только пока указывает на образ контейнера. Идентификатор
+  // и чужая метка не годятся вовсе: запуск по ним выбросил бы продукт из
+  // отбора обновления образа (см. шапку).
+  if (configImage.startsWith('linkeon-product:')) {
     try {
-      const byTag = await inspectJson(deps, ['docker', 'image', 'inspect', '--format', '{{json .}}', configImage]);
+      const byTag = await inspectJson(deps, ['docker', 'image', 'inspect', '--format', '{{json .}}', configImage], `метку ${configImage}`);
       if (byTag?.Id === imageId) imageRef = configImage;
     } catch {
       // Метки больше нет — ищем стабильную ниже.
@@ -282,8 +343,13 @@ async function capture(job: RekeyJob, deps: ProvisionDeps): Promise<Captured> {
 
   const mounts: string[] = [];
   for (const m of Array.isArray(c?.Mounts) ? c.Mounts : []) {
-    if (m?.Type !== 'bind' || !m?.Source || !m?.Destination) {
+    if (m?.Type !== 'bind' || typeof m?.Source !== 'string' || typeof m?.Destination !== 'string' || !m.Source || !m.Destination) {
       throw new Error('монтирование не bind — воспроизвести не умею, ничего не тронуто');
+    }
+    // `-v` режет по двоеточию: путь с ним уехал бы в docker run другим
+    // монтированием — и всплыл бы отказом уже ПОСЛЕ остановки старого.
+    if (m.Source.includes(':') || m.Destination.includes(':')) {
+      throw new Error('монтирование с «:» в пути воспроизвести не умею — ничего не тронуто');
     }
     mounts.push(`${m.Source}:${m.Destination}${m.RW === false ? ':ro' : ''}`);
   }
@@ -294,6 +360,7 @@ async function capture(job: RekeyJob, deps: ProvisionDeps): Promise<Captured> {
 
   return {
     imageRef,
+    imageId,
     ownEnv,
     publish,
     mounts,
@@ -334,7 +401,8 @@ function memoryFlag(bytes: number): string {
   return `--memory=${bytes}`;
 }
 
-function runArgv(slug: string, cap: Captured, env: string[]): string[] {
+/** argv нового `docker run` — в формах заведения. Экспорт — ради теста по рукописному inspect. */
+export function runArgv(slug: string, cap: Captured, env: string[]): string[] {
   const argv = ['docker', 'run', '-d', '--name', slug];
   if (cap.restart) argv.push('--restart', cap.restart);
   for (const m of cap.mounts) argv.push('-v', m);
@@ -350,7 +418,7 @@ function runArgv(slug: string, cap: Captured, env: string[]): string[] {
 
 /**
  * Вернуть старый контейнер в работу — по состоянию хоста (см. шапку).
- * Пустой список — продукт снова со старыми ключами.
+ * Пустой список — продукт снова со старыми ключами и держится запущенным.
  */
 async function restore(slug: string, backup: string, deps: ProvisionDeps): Promise<string[]> {
   let renamed: boolean;
@@ -362,10 +430,11 @@ async function restore(slug: string, backup: string, deps: ProvisionDeps): Promi
   if (renamed) {
     // Под именем продукта — новый контейнер или никого: старый уже под
     // резервным именем.
+    const rmNew = ['docker', 'rm', '-f', slug];
     try {
-      if (await containerTaken(deps, slug)) await deps.run(['docker', 'rm', '-f', slug]);
+      if (await containerTaken(deps, slug)) await deps.run(rmNew);
     } catch (e) {
-      return [`новый контейнер ${slug} не снят (${reasonOf(e, ['docker', 'rm', '-f', slug])}); старый лежит под именем ${backup}`];
+      return [`новый контейнер ${slug} не снят (${reasonOf(e, rmNew)}); старый лежит под именем ${backup}`];
     }
     const back = ['docker', 'rename', backup, slug];
     try {
@@ -380,7 +449,57 @@ async function restore(slug: string, backup: string, deps: ProvisionDeps): Promi
   } catch (e) {
     return [`старый контейнер ${slug} не поднялся (${reasonOf(e, start)})`];
   }
+  // Пауза и состояние, как do_restore; без полного ожидания /health — срок
+  // смены ограничен, а «не удержался» и так отдаёт исход на ручной разбор.
+  await pause(deps.settleMs ?? SETTLE_MS);
+  try {
+    const c = await inspectJson(deps, containerInspect(slug), `старый контейнер ${slug}`);
+    if (!upAndSteady(c)) return [`старый контейнер не поднялся после отката: ${slug} — ${statusOf(c)}`];
+  } catch (e) {
+    return [`старый контейнер не поднялся после отката: ${reasonOf(e)}`];
+  }
   return [];
+}
+
+/**
+ * Поднять новый контейнер и убедиться, что он тот и здоров. undefined — да;
+ * строка — причина отката.
+ */
+async function startNew(job: RekeyJob, cap: Captured, argv: string[], deps: ProvisionDeps): Promise<string | undefined> {
+  try {
+    await deps.run(argv);
+  } catch (e) {
+    return `docker run с новыми ключами отказал: ${reasonOf(e, argv)}`;
+  }
+  const timeoutMs = deps.waitPortTimeoutMs ?? DEFAULTS.waitPortTimeoutMs;
+  const settleMs = deps.settleMs ?? SETTLE_MS;
+  const inside = deps.waitInside ?? waitInsideVia(deps);
+  const what = `новый контейнер ${job.slug}`;
+  try {
+    // Тот ли образ: метку могли передвинуть между inspect и запуском.
+    const fresh = await inspectJson(deps, containerInspect(job.slug), what);
+    if (String(fresh?.Image ?? '') !== cap.imageId) {
+      return `новый контейнер поднят не на образе старого: метку ${cap.imageRef} передвинули на ходу`;
+    }
+    const sec = Math.round(timeoutMs / 1000);
+    if (!(await inside(job.slug, timeoutMs))) return `продукт не ответил на /health за ${sec} с с новыми ключами`;
+    if (job.kind === 'site' && !(await deps.waitPort(cap.port as number, timeoutMs))) {
+      return `сайт не ответил на порту ${cap.port} за ${sec} с с новыми ключами`;
+    }
+    // Второй взгляд — через паузу и одной пробой (см. шапку: «Здоровье»).
+    await pause(settleMs);
+    const later = await inspectJson(deps, containerInspect(job.slug), what);
+    const again =
+      upAndSteady(later) &&
+      (await inside(job.slug, 0)) &&
+      (job.kind !== 'site' || (await deps.waitPort(cap.port as number, 0)));
+    if (!again) {
+      return `продукт ответил на /health, а через ${Math.round(settleMs / 1000)} с — нет (${statusOf(later)})`;
+    }
+  } catch (e) {
+    return `проверка нового контейнера отказала: ${reasonOf(e)}`;
+  }
+  return undefined;
 }
 
 /** Сменить ключи владельца. Бросает на любом отказе; до `docker stop` — без изменений на хосте. */
@@ -434,32 +553,29 @@ export async function rekeyProduct(job: RekeyJob, deps: ProvisionDeps): Promise<
     throw await failed(`docker rename отказал: ${reasonOf(e, rename)}`);
   }
 
-  try {
-    await deps.run(argv);
-  } catch (e) {
-    throw await failed(`docker run с новыми ключами отказал: ${reasonOf(e, argv)}`);
-  }
-
-  const timeoutMs = deps.waitPortTimeoutMs ?? DEFAULTS.waitPortTimeoutMs;
-  const sec = Math.round(timeoutMs / 1000);
-  let unhealthy: string | undefined;
-  try {
-    if (!(await (deps.waitInside ?? waitInsideVia(deps))(job.slug, timeoutMs))) {
-      unhealthy = `продукт не ответил на /health за ${sec} с с новыми ключами`;
-    } else if (job.kind === 'site' && !(await deps.waitPort(cap.port as number, timeoutMs))) {
-      unhealthy = `сайт не ответил на порту ${cap.port} за ${sec} с с новыми ключами`;
-    }
-  } catch (e) {
-    unhealthy = `проверка здоровья отказала: ${reasonOf(e)}`;
-  }
+  const unhealthy = await startNew(job, cap, argv, deps);
   if (unhealthy !== undefined) throw await failed(unhealthy);
 
   phase(`ключи ${job.slug} сменены`);
-  try {
-    await deps.run(['docker', 'rm', '-f', backup]);
-  } catch (e) {
-    // Ключи уже новые, отказывать поздно. Но в старом контейнере лежат
-    // СТАРЫЕ ключи — и следующая смена откажет на нём (см. начало функции).
-    phase(`ВНИМАНИЕ: старый контейнер ${backup} со старыми ключами не убран (${reasonOf(e, ['docker', 'rm', '-f', backup])}) — убрать руками`);
+  const rmOld = ['docker', 'rm', '-f', backup];
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await deps.run(rmOld);
+      return;
+    } catch (e) {
+      if (attempt < 2) {
+        await pause(deps.settleMs ?? SETTLE_MS);
+        continue;
+      }
+      // Ключи уже новые, отказывать поздно: отчёт об успехе — правда. Но в
+      // старом контейнере лежат СТАРЫЕ ключи, и следующая смена откажет на нём
+      // (остаток прерванной смены). Поля для заметки в отчёте об успехе нет
+      // (JobReport `{ ok: true, port? }`), поэтому — громкая фаза в журнал.
+      phase(
+        `ВНИМАНИЕ: ключи ${job.slug} сменены, но старый контейнер ${backup} со старыми ключами не убран ` +
+          `(${reasonOf(e, rmOld)}) — убрать руками: пока он есть, следующая смена ключей откажет`,
+      );
+      return;
+    }
   }
 }

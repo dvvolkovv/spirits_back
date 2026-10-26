@@ -78,6 +78,16 @@ export class FakeHost {
   healthy: (name: string, c: { env: Record<string, string> }) => boolean = () => true;
 
   /**
+   * Падает ли процесс контейнера сразу после старта (сосед съел память,
+   * сломан entrypoint). Как у docker: `docker run`/`docker start` при этом
+   * отвечают успехом — они отвечают за запуск процесса, а не за то, что он
+   * удержался. Дальше по политике: с `--restart` docker крутит петлю
+   * перезапусков (inspect — Running и Restarting, "restarting"), без неё
+   * контейнер выходит ("exited"). По умолчанию не падает никто.
+   */
+  crashing: (name: string, c: { env: Record<string, string> }) => boolean = () => false;
+
+  /**
    * Завести образ под меткой (или передвинуть метку на другой образ).
    *
    * Образы в Docker неизменяемы: один и тот же идентификатор не может
@@ -119,13 +129,21 @@ export class FakeHost {
     throw new Error(`Unable to find image '${ref}' locally`);
   }
 
-  /** Сайт отвечает на порту: запущенный контейнер с этой публикацией и здоровый. */
+  /** Сайт отвечает на порту: запущенный (не в петле перезапусков) контейнер с этой публикацией и здоровый. */
   probePort(port: number): boolean {
     for (const [name, c] of this.containers) {
       if (this.stopped.has(name) || !c.publish) continue;
-      if (Number(c.publish.split(':')[1]) === port) return this.healthy(name, c);
+      if (Number(c.publish.split(':')[1]) === port) return this.stateOf(name) === 'running' && this.healthy(name, c);
     }
     return false;
+  }
+
+  /** Состояние как `.State.Status` у docker — с учётом `crashing` и политики перезапуска. */
+  private stateOf(name: string): 'running' | 'restarting' | 'exited' {
+    if (this.stopped.has(name)) return 'exited';
+    const c = this.containers.get(name)!;
+    if (!this.crashing(name, c)) return 'running';
+    return (c.restart ?? 'no') === 'no' ? 'exited' : 'restarting';
   }
 
   /** Файлы vhost в /etc/nginx/sites-products. Значение — порт proxy_pass. */
@@ -277,7 +295,11 @@ export class FakeHost {
         throw new Error(`docker exec: симулятор знает только node -e: ${args.join(' ')}`);
       }
       if (!this.containers.has(name)) throw new Error(`No such container: ${name}`);
-      if (this.stopped.has(name)) throw new Error(`Error response from daemon: container ${name} is not running`);
+      const state = this.stateOf(name);
+      if (state === 'exited') throw new Error(`Error response from daemon: container ${name} is not running`);
+      if (state === 'restarting') {
+        throw new Error(`Error response from daemon: Container ${name} is restarting, wait until the container is running`);
+      }
       // `node -e` сперва КОМПИЛИРУЕТ скрипт и только потом выполняет его:
       // синтаксическая ошибка — exit 1 ДО того, как код владельца хоть раз
       // отработал. Ломаная строка HEALTH_INSIDE (задача 5 — rekey.ts)
@@ -328,12 +350,26 @@ export class FakeHost {
    * Симулятор воспроизводит обе.
    */
   private dockerInspect(args: string[]): string {
-    const [flag, format, name, ...extra] = args;
-    if (flag !== '--format' || !format || !name || extra.length) {
-      throw new Error(`docker inspect: симулятор знает только --format <шаблон> <имя>: ${args.join(' ')}`);
+    // Флаги — в любом порядке, как у docker; имя — одно.
+    let format: string | undefined;
+    let type: string | undefined;
+    const names: string[] = [];
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === '--format') format = args[++i];
+      else if (args[i] === '--type') type = args[++i];
+      else if (args[i].startsWith('-')) throw new Error(`docker inspect: неизвестный флаг ${args[i]}`);
+      else names.push(args[i]);
     }
-    // Живой docker на несуществующем объекте отвечает именно так и rc=1.
-    if (!this.containers.has(name)) throw new Error(`Error: No such object: ${name}`);
+    if (!format || names.length !== 1) {
+      throw new Error(`docker inspect: симулятор знает только [--type container] --format <шаблон> <имя>: ${args.join(' ')}`);
+    }
+    if (type !== undefined && type !== 'container') {
+      throw new Error(`docker inspect --type ${type}: симулятор знает только --type container`);
+    }
+    const name = names[0];
+    // Живой docker на несуществующем объекте отвечает именно так и rc=1;
+    // с --type container — «No such container».
+    if (!this.containers.has(name)) throw new Error(type ? `Error: No such container: ${name}` : `Error: No such object: ${name}`);
 
     if (format === '{{json .}}') {
       return `${JSON.stringify(this.inspectWhole(name))}\n`;
@@ -375,6 +411,7 @@ export class FakeHost {
    */
   private inspectWhole(name: string): any {
     const c = this.containers.get(name)!;
+    const state = this.stateOf(name);
     const ownNames = new Set(Object.keys(c.env));
     const ownEnv = Object.entries(c.env).map(([k, v]) => `${k}=${v}`);
     const imageEnv = (this.images.get(c.imageId ?? this.resolveImage(c.image))?.env ?? []).filter(
@@ -386,7 +423,9 @@ export class FakeHost {
       Name: `/${name}`,
       Image: c.imageId ?? this.resolveImage(c.image),
       Config: { Image: c.image, Env: [...ownEnv, ...imageEnv] },
-      State: { Running: !this.stopped.has(name), Status: this.stopped.has(name) ? 'exited' : 'running' },
+      // Restarting вместе с Running=true — так docker показывает петлю
+      // перезапусков (StateString: Running && Restarting → "restarting").
+      State: { Running: state !== 'exited', Restarting: state === 'restarting', Status: state },
       HostConfig: {
         PortBindings: c.publish ? { [`${containerPort}/tcp`]: [{ HostIp: hostIp, HostPort: hostPort }] } : {},
         Memory: c.memory ?? 0,

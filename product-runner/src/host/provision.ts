@@ -312,6 +312,12 @@ export interface ProvisionDeps {
    * (rekey.ts, waitInsideVia), подмена — только для тестов.
    */
   waitInside?: (slug: string, timeoutMs: number) => Promise<boolean>;
+  /**
+   * Пауза смены ключей перед повторным взглядом (rekey.ts): второй ответ
+   * /health нового контейнера и состояние старого после отката. По умолчанию
+   * 3 с — как `sleep 3` в do_restore product-image-roll.sh; ноль — в тестах.
+   */
+  settleMs?: number;
 
   productsDir?: string;
   image?: string;
