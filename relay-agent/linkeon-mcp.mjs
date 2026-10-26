@@ -24,13 +24,21 @@ export const LINKEON_TOOLS = [
   "mcp__linkeon__calculate_human_design",
 ].join(",");
 
-// Сервер linkeon для конфига хода или null. Поля приходят из multipart как
-// есть: повторённое поле — массив, поэтому проверяется тип; перевод строки в
-// токене раздвоил бы заголовок.
+// Поле multipart как пришло: повторённое — массив, и regex.test() на нём
+// молча вызывает Array.prototype.toString() ("https://a,https://b"), которую
+// та же регулярка пропустила бы как валидный URL. typeof === "string" ловит
+// это явно. Общая проверка для всех трёх постояльцев (linkeon/talerid/products,
+// см. server.mjs) — тесты здесь же, linkeon-mcp.test.mjs.
+export function isHttpsUrl(value) {
+  return typeof value === "string" && /^https:\/\//.test(value);
+}
+
+// Сервер linkeon для конфига хода или null. Токен — из multipart как есть:
+// перевод строки в нём раздвоил бы заголовок, повторённое поле — массив.
 export function linkeonServer(body) {
   const token = body && body.linkeon_token;
   const url = body && body.linkeon_mcp_url;
   if (typeof token !== "string" || token === "" || /[\r\n]/.test(token)) return null;
-  if (typeof url !== "string" || !/^https:\/\//.test(url)) return null;
+  if (!isHttpsUrl(url)) return null;
   return { type: "http", url, headers: { Authorization: "Bearer " + token } };
 }

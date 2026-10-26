@@ -12,7 +12,7 @@ import { RUN_ENV, runTag, finishedRun, reap } from "./proc-reaper.mjs";
 import { costBaseline, runCost } from "./turn-cost.mjs";
 import { createUndelivered, withCarried } from "./undelivered-files.mjs";
 import { createRelayAuth } from "./relay-auth.mjs";
-import { LINKEON_TOOLS, linkeonServer } from "./linkeon-mcp.mjs";
+import { LINKEON_TOOLS, linkeonServer, isHttpsUrl } from "./linkeon-mcp.mjs";
 import { sessionMcpConfigName, sweepStaleSessionMcpConfigs } from "./session-mcp-config.mjs";
 import { snapshotDir, changedFiles } from "./turn-files.mjs";
 
@@ -563,12 +563,11 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   const _taleridMcpUrl = req.body.talerid_mcp_url;
   const _productsToken = req.body.products_token;
   const _productsMcpUrl = req.body.products_mcp_url;
-  // typeof === "string" ОБЯЗАТЕЛЕН, не только /^https:\/\//.test(...): повторённое
-  // multipart-поле — массив, а regex.test() на массиве молча вызывает его
-  // Array.prototype.toString() ("https://a,https://b"), который той же регуляркой
-  // проходит как валидный URL. Как в linkeonServer (linkeon-mcp.mjs).
-  const wantTalerid = !!(_taleridToken && typeof _taleridMcpUrl === "string" && /^https:\/\//.test(_taleridMcpUrl));
-  const wantProducts = !!(_productsToken && typeof _productsMcpUrl === "string" && /^https:\/\//.test(_productsMcpUrl));
+  // isHttpsUrl (linkeon-mcp.mjs) — та же проверка, что у linkeonServer: отбивает
+  // повторённое multipart-поле (массив), которое regex.test() иначе пропустил бы
+  // через неявный Array.prototype.toString().
+  const wantTalerid = !!(_taleridToken && isHttpsUrl(_taleridMcpUrl));
+  const wantProducts = !!(_productsToken && isHttpsUrl(_productsMcpUrl));
 
   if (wantLinkeon || wantTalerid || wantProducts) {
     try {
