@@ -67,6 +67,9 @@ export class ProductLifecycleTool {
     return r.rows.map((x: any) => ({ ...x, purge_after: new Date(x.purge_after).toISOString() }));
   }
 
+  // Без метки хода (загрузка файла, токен старого вида) сервер карточку к
+  // ответу не прикрепит — она есть только в кабинете, и say говорит это
+  // прямо: иначе модель пообещала бы карточку «под ответом», которой не будет.
   async create(userId: string, input: any, channel: ProductToolChannel, turn: string | null) {
     const kind = String(input?.kind ?? '').trim();
     if (kind === 'site') {
@@ -87,9 +90,11 @@ export class ProductLifecycleTool {
       return {
         ok: true,
         pending: { actionId: r.actionId, kind: 'create_bot', expiresAt: r.expiresAt },
-        say: (channel === 'telegram'
-          ? 'Ниже придёт сообщение с кнопкой: пользователь откроет защищённую форму'
-          : 'Под твоим ответом появится защищённая карточка: пользователь')
+        say: (!turn
+          ? 'Защищённая карточка ждёт пользователя в кабинете (Студия → Продукты): там он'
+          : channel === 'telegram'
+            ? 'Ниже придёт сообщение с кнопкой: пользователь откроет защищённую форму'
+            : 'Под твоим ответом появится защищённая карточка: пользователь')
           + ' введёт в неё токен бота от @BotFather и ключи сервисов. Ключи в переписке не проси. ' +
           'Бот создастся, когда он отправит карточку; итог — действием status с этим actionId.',
       };
@@ -104,7 +109,9 @@ export class ProductLifecycleTool {
       ok: true,
       pending: { actionId: r.actionId, kind: 'delete', expiresAt: r.expiresAt },
       product,
-      say: (channel === 'telegram' ? 'Ниже придёт сообщение с кнопкой «Удалить».' : 'Под твоим ответом появится карточка с кнопкой «Удалить».') +
+      say: (!turn
+        ? 'Карточка с кнопкой «Удалить» ждёт пользователя в кабинете (Студия → Продукты).'
+        : channel === 'telegram' ? 'Ниже придёт сообщение с кнопкой «Удалить».' : 'Под твоим ответом появится карточка с кнопкой «Удалить».') +
         ` Продукт удалится, только когда пользователь нажмёт её. Вернуть его можно будет ${DELETE_GRACE_DAYS} дней, оплаченный период не возвращается. ` +
         'Не говори «удалил», пока status не вернёт done.',
     };
