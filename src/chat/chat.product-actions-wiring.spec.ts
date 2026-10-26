@@ -19,8 +19,14 @@ describe('карточки продуктов в ходе чата', () => {
     expect(SRC).toContain("productsCliMcp(userId, 'web', productsTurn)");
   });
 
-  it('оба пути забирают карточки своего хода', () => {
-    expect(SRC.match(/productActions\?\.takeForTurn\(/g)?.length).toBe(2);
+  // Было 2 (релей, Маша) до ревью задачи 11. Третий — в catch-ветке релея:
+  // апстрим может порваться ПОСЛЕ того, как модель дёрнула инструмент
+  // продуктов, но до чистого конца потока, — без своего takeForTurn там
+  // карточка терялась бы навсегда (под тем же productsTurn её больше никто
+  // не спросит). Задвоения не бывает: takeForTurn помечает attached_at, и
+  // второй вызов тем же nonce (обычная ветка уже забрала) вернёт [].
+  it('карточки своего хода забирают три места: релей (успех и catch) и Маша', () => {
+    expect(SRC.match(/productActions\?\.takeForTurn\(/g)?.length).toBe(3);
   });
 
   it('ProductsModule подключён к ChatModule — иначе @Optional молча выключит карточки', () => {
