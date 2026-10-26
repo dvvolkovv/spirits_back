@@ -20,8 +20,8 @@ test('незнакомая ошибка — unknown с повтором; StudioE
   assert.equal(toStudioError('строка').message, 'строка');
 });
 
-test('длина озвучки — к сценаристу, а не в повтор сборки', () => {
-  for (const code of ['too_long', 'too_short', 'line_too_short'] as const) assert.ok(WRITER_FEEDBACK_CODES.has(code));
+test('длина озвучки и отвергнутый студией сценарий — к сценаристу, а не в повтор сборки', () => {
+  for (const code of ['too_long', 'too_short', 'line_too_short', 'script_invalid'] as const) assert.ok(WRITER_FEEDBACK_CODES.has(code));
   assert.ok(!WRITER_FEEDBACK_CODES.has('answer_rejected'));
 });
 

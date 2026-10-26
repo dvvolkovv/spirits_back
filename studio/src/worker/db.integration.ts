@@ -196,6 +196,22 @@ describe('очередь студии против живого Postgres', { ski
     );
   });
 
+  it('сценарий, отвергнутый студией (script_invalid), — назад сценаристу; после третьего круга — failed с этапа сценариста', async () => {
+    const id = await insert('render_queued', { writer_rounds: 2 });
+    const job = await claimJob(pool, 'render');
+    const message = 'render: сценарий не прошёл проверку:\n- зацепка длиннее 8 слов';
+    assert.equal(await failJob(pool, job!, new StudioError('script_invalid', message, false)), 'writer');
+    const r = await row(id);
+    assert.deepEqual([r.status, r.writer_feedback, r.attempts, r.lease_until], ['writing', message, 0, null]);
+
+    // Сценарист сдал третий вариант: writer_rounds + 1, отзыв студии стёрт (shorts-writer.service.ts).
+    await pool.query(`UPDATE short_video SET status = 'render_queued', writer_rounds = 3, writer_feedback = NULL WHERE id = $1`, [id]);
+    const last = await claimJob(pool, 'render');
+    assert.equal(await failJob(pool, last!, new StudioError('script_invalid', message, false)), 'failed');
+    const f = await row(id);
+    assert.deepEqual([f.status, f.failed_from, f.writer_feedback, f.failure_notified, f.lease_until], ['failed', 'writing', message, false, null]);
+  });
+
   it('last_error: у незнакомой ошибки — только первая строка; предел 1000 — по символам', async () => {
     const id = await insert('capture_queued');
     const job = await claimJob(pool, 'capture');
