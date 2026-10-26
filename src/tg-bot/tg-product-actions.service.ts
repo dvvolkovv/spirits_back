@@ -56,9 +56,16 @@ export class TgProductActionsService {
           ]] };
         } else if (a.kind === 'create_bot') {
           text = tgText(i.lang, 'pa_create_bot_prompt', { name });
+          // Строка запроса, а не фрагмент: Telegram дописывает в адрес СВОИ
+          // параметры запуска во фрагмент (#tgWebAppData=...), и не каждый
+          // клиент гарантированно сохраняет фрагмент, который был в адресе
+          // до открытия. Строку запроса Telegram не трогает вовсе — фронт
+          // (actionFromLocation) читает её первой, а #pa= держит запасным
+          // путём.
+          const sep = TMA_URL.includes('?') ? '&' : '?';
           reply_markup = { inline_keyboard: [[
             i.isPrivate
-              ? { text: tgText(i.lang, 'pa_create_bot_btn'), web_app: { url: `${TMA_URL}#pa=${a.id}` } }
+              ? { text: tgText(i.lang, 'pa_create_bot_btn'), web_app: { url: `${TMA_URL}${sep}pa=${a.id}` } }
               : { text: tgText(i.lang, 'pa_open_cabinet_btn'), url: `${CABINET}/studio?tab=products&action=${a.id}` },
           ]] };
         } else {

@@ -49,7 +49,7 @@ describe('карточки продуктов в Telegram', () => {
     const h = harness();
     h.actions.takeForTurn.mockResolvedValue([{ id: ID, kind: 'create_bot', payload: { name: 'Бот' } }] as any);
     await h.svc.sendForTurn({ userId: 'u1', turn: 't', since: new Date(), chatId: 100, isPrivate: true, lang: 'ru' });
-    expect((h.grammy.sendMessage.mock.calls[0] as any[])[2].reply_markup.inline_keyboard[0][0].web_app.url).toMatch(new RegExp(`/tma/#pa=${ID}$`));
+    expect((h.grammy.sendMessage.mock.calls[0] as any[])[2].reply_markup.inline_keyboard[0][0].web_app.url).toMatch(new RegExp(`/tma/\\?pa=${ID}$`));
     await h.svc.sendForTurn({ userId: 'u1', turn: 't', since: new Date(), chatId: -100, isPrivate: false, lang: 'ru' });
     expect((h.grammy.sendMessage.mock.calls[1] as any[])[2].reply_markup.inline_keyboard[0][0].url).toMatch(new RegExp(`/studio\\?tab=products&action=${ID}$`));
   });
