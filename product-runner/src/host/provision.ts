@@ -171,6 +171,11 @@ const RESERVED_ENV = [
   'TURN_TIMEOUT_MS',
   'POLL_TIMEOUT_MS',
   'REQUEST_TIMEOUT_MS',
+  // Владелец бота (очередь 2): Telegram-идентификатор, который кладёт сама
+  // платформа из привязки владельца. Ключ клиента с этим именем подменил бы,
+  // кому бот отвечает данными владельца. Третья копия — secret-rules.ts на
+  // сервере и secretNames.ts в кабинете.
+  'OWNER_TG_ID',
 ];
 
 /**
@@ -193,7 +198,7 @@ const RESERVED_ENV_EXCEPTIONS = ['NODE_ENV'];
  * читают в нижнем регистре так же, как в верхнем.
  *
  * ТРИ КОПИИ ОДНОЙ ПРОВЕРКИ. Эта — последний рубеж перед `docker run -e`.
- * Вторая — `isReservedSecretName` на сервере (`src/products/provisioning.service.ts`):
+ * Вторая — `isReservedSecretName` на сервере (`src/products/secret-rules.ts`):
  * она отвечает 400 до записи продукта. Третья — в форме кабинета
  * (`spirits_front/src/components/products/secretNames.ts`), ради объяснения на
  * месте. Разъехаться им нельзя: имя, которое сервер принял, а хост отверг,
@@ -279,6 +284,13 @@ export interface ProvisionJob {
    * бы домен клиента. Необязательное — сервер старше агента поля не шлёт.
    */
   customNames?: string[];
+  /**
+   * Telegram-идентификатор владельца — только у бота и только при привязанном
+   * Telegram (очередь 2). Уходит в окружение `OWNER_TG_ID`, чтобы бот узнавал
+   * владельца сам, без chat_id в тексте правки. Необязательное: сервер старше
+   * агента поля не шлёт, а у владельца без привязки его нет.
+   */
+  ownerTgId?: string;
 }
 
 /** Запуск программы БЕЗ шелла. Возвращает stdout. */
@@ -334,6 +346,23 @@ function validateSecrets(raw: Record<string, string> | undefined): Array<[string
   return entries;
 }
 
+/** Идентификатор Telegram — целое число; 20 знаков с запасом над bigint. */
+const OWNER_TG_ID_RE = /^\d{1,20}$/;
+
+/**
+ * OWNER_TG_ID для этого задания или undefined. Только боту: сайту владелец
+ * в Telegram ни к чему, а лишняя переменная в общем окружении — лишнее, что
+ * может прочитать код продукта. Не число — отказ: зовётся до первого
+ * изменения на хосте. Экспорт — ради смены ключей (rekey.ts).
+ */
+export function ownerTgIdFor(job: { kind: ProductKind; ownerTgId?: string | null }): string | undefined {
+  if (job.kind !== 'bot' || job.ownerTgId === undefined || job.ownerTgId === null) return undefined;
+  if (typeof job.ownerTgId !== 'string' || !OWNER_TG_ID_RE.test(job.ownerTgId)) {
+    throw new Error(`OWNER_TG_ID не число: ${JSON.stringify(job.ownerTgId)}`);
+  }
+  return job.ownerTgId;
+}
+
 function dockerRunArgv(
   job: ProvisionJob,
   dir: string,
@@ -341,6 +370,7 @@ function dockerRunArgv(
   oauthToken: string,
   secrets: Array<[string, string]>,
   cfg: { image: string; linkeonUrl: string },
+  ownerTgId?: string,
 ): string[] {
   const argv = [
     'docker',
@@ -363,6 +393,7 @@ function dockerRunArgv(
   argv.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${oauthToken}`);
   argv.push('-e', `PRODUCT_START_SCRIPT=${START_SCRIPT}`);
   argv.push('-e', `PORT=${CONTAINER_PORT}`);
+  if (ownerTgId !== undefined) argv.push('-e', `OWNER_TG_ID=${ownerTgId}`);
   argv.push('--memory=1g', '--cpus=1', cfg.image);
   return argv;
 }
@@ -475,6 +506,7 @@ export async function provision(job: ProvisionJob, deps: ProvisionDeps): Promise
     throw new Error('в задании нет токена раннера — продукт не получит ни одной задачи');
   }
   const secrets = validateSecrets(job.secrets);
+  const ownerTgId = ownerTgIdFor(job);
   // Имена проверяются здесь же, до первого изменения: иначе мусорное имя
   // всплыло бы только на product-vhost — после `docker run`, ценой подчистки
   // исправного контейнера.
@@ -529,7 +561,7 @@ export async function provision(job: ProvisionJob, deps: ProvisionDeps): Promise
     phase(`чекаут ${dir} создан`);
 
     done.push('container');
-    await deps.run(dockerRunArgv(job, dir, port, oauthToken, secrets, cfg));
+    await deps.run(dockerRunArgv(job, dir, port, oauthToken, secrets, cfg, ownerTgId));
     phase(`контейнер ${job.slug} поднят`);
 
     if (port !== undefined) {
