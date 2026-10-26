@@ -51,6 +51,7 @@ const deps: JobDeps = {
       maxOmniSeconds: hooks.maxOmniSeconds,
       onSave: hooks.onSave,
       onFile: hooks.onFile,
+      onDiscard: hooks.onDiscard,
       log,
     }),
   render: (runDir) => renderRun(runDir),

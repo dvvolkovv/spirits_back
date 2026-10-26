@@ -139,7 +139,7 @@ export function googleHttpError(what: 'keyframe' | 'omni', status: number, body:
     return new StudioError('google_auth', `${what}: Google не принимает запросы ключа (HTTP ${status}, FAILED_PRECONDITION) — биллинг или регион: ${said}`, false);
   }
   if (status === 404) {
-    return new StudioError('model_gone', `${what}: модель недоступна (HTTP 404) — Google её снял; переключите формат на «Только чат». ${said}`, false);
+    return new StudioError('model_gone', `${what}: модель недоступна (HTTP 404) — Google её снял; переключите формат на «Только чат» и повторите ролик с from=writing (или directing). ${said}`, false);
   }
   if (what === 'omni' && status === 400 && (err?.status === 'INVALID_ARGUMENT' || /INVALID_ARGUMENT/.test(body))) {
     return new StudioError('omni_rejected', `omni: Google отклонил запрос (фильтр контента или промпт): ${said}`, true);

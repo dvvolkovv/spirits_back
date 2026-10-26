@@ -53,6 +53,12 @@ export interface AnimateDeps {
   onSave?(anim: ShortAnimation): Promise<void>;
   /** Новый файл папки — кадр, raw.mp4, clip.mp4 (путь относительно неё): рабочий процесс кладёт его в MinIO. */
   onFile?(rel: string): Promise<void>;
+  /**
+   * Забракованный raw.mp4 (путь относительно папки): рабочий процесс удаляет его
+   * из MinIO. Иначе захват на другом сервере или после чистки папки восстановил
+   * бы брак — и принял бы его за оплаченный, ещё не проверенный клип.
+   */
+  onDiscard?(rel: string): Promise<void>;
 }
 
 /** Расширение кадра по его типу: Nano Banana Pro отдаёт JPEG. */
@@ -67,6 +73,12 @@ const SCENE: Record<SkitKind, string> = { conflict: 'сценка 1 (конфл�
  */
 const KEEP_PENDING: ReadonlySet<StudioErrorCode> = new Set<StudioErrorCode>(['omni_timeout', 'google_auth', 'google_quota', 'omni_unreadable']);
 const FINGERPRINT = /^[0-9a-z-]+$/;
+/**
+ * Сбой хранилища (выгрузка, удаление брака) — не попытка Omni: из цикла попыток
+ * сценки он выходит сразу, и задание повторяется с паузой. Файл уже в папке —
+ * повтор новых денег не стоит.
+ */
+class StorageError extends StudioError {}
 
 /** Последняя строка stderr ffmpeg — причина; первая строка сообщения execFile — сама команда. */
 const failText = (e: unknown): string => {
@@ -171,13 +183,24 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
       throw e instanceof StudioError ? e : new StudioError('unknown', `animate: animation.json не сохранился наружу — ${failText(e)}`, false);
     }
   };
+  /** Что этот запуск уже выгрузил: кадр из папки мог не дойти до хранилища в прошлом захвате. */
+  const uploaded = new Set<string>();
   /** Файл — наружу; сетевой сбой повторяем: файл уже лежит в папке, новых денег повтор не стоит. */
   const upload = async (rel: string): Promise<void> => {
     if (!deps.onFile) return;
     try {
       await deps.onFile(rel);
+      uploaded.add(rel);
     } catch (e) {
-      throw new StudioError('unknown', `animate: ${rel} не выгрузился в хранилище — ${failText(e)}`, true);
+      throw new StorageError('unknown', `animate: ${rel} не выгрузился в хранилище — ${failText(e)}`, true);
+    }
+  };
+  const discard = async (rel: string): Promise<void> => {
+    if (!deps.onDiscard) return;
+    try {
+      await deps.onDiscard(rel);
+    } catch (e) {
+      throw new StorageError('unknown', `animate: брак ${rel} не удалился из хранилища — ${failText(e)}`, true);
     }
   };
   const lufs = deps.lufs ?? CLIP_LUFS;
@@ -235,7 +258,12 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
   /** Кадр-эталон сценки; нарисованный с тем же отпечатком кадра не перерисовывается. */
   const ensureKeyframe = async (kind: SkitKind): Promise<string> => {
     const have = findKeyframe(kind);
-    if (have) return have;
+    if (have) {
+      // Кадр из папки мог не дойти до хранилища: без него другой сервер не нарисует
+      // развязку и не переснимет конфликт.
+      if (!uploaded.has(have)) await upload(have);
+      return have;
+    }
     // Перерисовать кадр конфликта можно, пока по нему не нарисована и не снята развязка.
     if (kind === 'conflict' && (findKeyframe('punchline') || hasRaw('punchline') || hasPending('punchline') || anim.skits.punchline?.fingerprint === plans.punchline.fingerprint)) {
       throw conflictKeyframeGone('по нему уже нарисована развязка');
@@ -259,9 +287,10 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
       }
       const kf = `${keyframeBase(kind)}.${KEYFRAME_EXT[img.mime] ?? 'png'}`;
       await local('кадр не записался', () => writeAtomic(abs(kf), img.data));
-      await upload(kf);
+      // Счёт — до выгрузки: кадр оплачен, даже если хранилище моргнёт.
       anim.keyframes = (anim.keyframes ?? 0) + 1;
       await save();
+      await upload(kf);
       return kf;
     }
     throw new StudioError(last!.code, `${last!.message} — кадр не нарисован за ${MAX_SKIT_ATTEMPTS} попытки`, false);
@@ -279,7 +308,7 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     const raw = abs(skitFile(kind, 'raw.mp4'));
     const clip = skitFile(kind, 'clip.mp4');
     const next = abs(skitFile(kind, 'clip.next.mp4'));
-    const reject = (code: 'clip_invalid' | 'speech_mismatch', msg: string): never => {
+    const reject = async (code: 'clip_invalid' | 'speech_mismatch', msg: string): Promise<never> => {
       fs.rmSync(next, { force: true });
       if (accepted) {
         // Принятый клип не бракуется молча: владелец его уже видел, а пересъёмка стоит денег.
@@ -293,16 +322,19 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
       // Брак откладывается, а не удаляется: после подстройки порогов его можно перепроверить.
       fs.renameSync(raw, abs(skitFile(kind, `rejected-${new Date().toISOString().replace(/[:.]/g, '-')}.mp4`)));
       fs.rmSync(abs(clip), { force: true });
+      // И из хранилища: брак, восстановленный следующим захватом, снова прошёл бы
+      // сверку — или сошёл бы за клип запущенной генерации.
+      await discard(skitFile(kind, 'raw.mp4'));
       throw new StudioError(code, msg, true);
     };
     const rawProbe: ProbeInfo = await probeFile(raw).catch((e: unknown) => reject('clip_invalid', `файл от Omni не читается — ${failText(e)}`));
     const early = checkClip(rawProbe, []);
-    if (early.length) reject('clip_invalid', `клип не прошёл проверку — ${early.join('; ')}`);
+    if (early.length) await reject('clip_invalid', `клип не прошёл проверку — ${early.join('; ')}`);
     // Громкость — до проверки тишины: её проверяет и готовый ролик, уже по выровненному звуку.
     await local('громкость', () => normalizeLoudness(raw, next, lufs));
     const probe = await local('проверка выровненного клипа', () => probeFile(next));
     const problems = checkClip(probe, await local('поиск тишины', () => detectSilences(next, probe.durationSec)));
-    if (problems.length) reject('clip_invalid', `клип не прошёл проверку — ${problems.join('; ')}`);
+    if (problems.length) await reject('clip_invalid', `клип не прошёл проверку — ${problems.join('; ')}`);
 
     let heard: string;
     let share: number;
@@ -320,7 +352,7 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
         const why = check.silentLines.length
           ? `не услышаны реплики ${check.silentLines.map((i) => i + 1).join(', ')}`
           : `речь не сошлась с репликами (${Math.round(check.share * 100)}%)`;
-        reject('speech_mismatch', `${why}, услышано: «${heard.slice(0, 200)}»`);
+        await reject('speech_mismatch', `${why}, услышано: «${heard.slice(0, 200)}»`);
       }
       share = check.share;
     }
@@ -347,7 +379,7 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     if (anim.omniSeconds + CLIP_SEC > budget) {
       throw new StudioError(
         'omni_budget',
-        `на ролик ушло ${anim.omniSeconds} с Omni вместе с запущенными, предел — ${budget} с: лимит пересъёмок сценок; поднять — MAX_OMNI_SECONDS=<секунды> npm run animate`,
+        `на ролик ушло ${anim.omniSeconds} с Omni вместе с запущенными, предел — ${budget} с: лимит пересъёмок сценок; поднять — настройка «Предел секунд Omni» (update_settings maxOmniSeconds; в CLI — MAX_OMNI_SECONDS=<секунды> npm run animate)`,
         false,
       );
     }
@@ -370,6 +402,8 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
       );
     }
     // Оплаченный клип уже скачан, а id генерации остался (процесс упал между записью клипа и сохранением) — id больше не нужен.
+    // raw.mp4 рядом с id бывает только так: новый клип не запускается, пока raw.mp4 есть, а брак
+    // уходит и из папки, и из хранилища (reject, onDiscard) — восстановленный raw.mp4 не забракован.
     if (hasRaw(kind) && hasPending(kind)) delete anim.pending![kind];
     // Запись под другой отпечаток больше не годится: сборка её и так не возьмёт.
     delete anim.skits[kind];
@@ -424,6 +458,8 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
         }
         return await finish(kind, attempt, null);
       } catch (e) {
+        // Сбой хранилища — не попытка Omni: задание повторится с паузой, клип уже в папке.
+        if (e instanceof StorageError) throw e;
         const err = toStudioError(e);
         // Секунды возвращаются, только если Google явно отказал в запуске: при
         // потерянном ответе генерация могла начаться и будет оплачена.

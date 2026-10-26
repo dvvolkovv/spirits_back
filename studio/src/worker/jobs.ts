@@ -12,7 +12,14 @@ export interface AnimateHooks {
   maxOmniSeconds: number;
   onSave(anim: ShortAnimation): Promise<void>;
   onFile(rel: string): Promise<void>;
+  onDiscard(rel: string): Promise<void>;
 }
+
+/**
+ * Паузы перед повторами записи animation в базу. Сбой записи id генерации —
+ * не «задание не наше»: без повтора «Повторить» заплатило бы за запущенный клип.
+ */
+export const SAVE_RETRY_DELAYS_MS = [1_000, 3_000];
 
 export interface JobDeps {
   queue: Queue;
@@ -23,6 +30,8 @@ export interface JobDeps {
   animate: (runDir: string, hooks: AnimateHooks) => Promise<ShortAnimation>;
   render: (runDir: string) => Promise<RenderResult>;
   log: (line: string) => void;
+  /** Паузы повторов записи animation в базу; по умолчанию SAVE_RETRY_DELAYS_MS (тестам — короче). */
+  saveRetryDelaysMs?: number[];
 }
 
 /** Ключи MinIO — контракт с API: видео и обложку он шлёт в Telegram отсюда. */
@@ -109,10 +118,33 @@ async function restoreAnimation(job: Job, runDir: string, storage: Storage): Pro
 }
 
 /**
+ * animation из базы — и id генерации из своей папки, которого в базе нет: запись
+ * id после запуска не дошла до базы (сбой), а генерация оплачена. Берётся только
+ * id под нынешний отпечаток сценки, у которой нет ни id в базе, ни принятого клипа.
+ * Резерв секунд под него в базе уже есть: он пишется до запуска.
+ */
+function withLocalPending(job: Job, animPath: string): ShortAnimation {
+  const merged: ShortAnimation = { ...job.animation!, pending: { ...job.animation!.pending } };
+  let local: ShortAnimation['pending'] = {};
+  try {
+    local = JSON.parse(fs.readFileSync(animPath, 'utf8'))?.pending ?? {};
+  } catch {
+    return merged;
+  }
+  for (const kind of SKIT_KINDS) {
+    const fp = job.script!.skits![kind].fingerprint;
+    const lp = local?.[kind];
+    if (lp?.fingerprint === fp && !merged.pending![kind] && merged.skits?.[kind]?.fingerprint !== fp) merged.pending![kind] = lp;
+  }
+  return merged;
+}
+
+/**
  * Оживление сценок (studio/src/animate/run-animate.ts). Счёт денег — из базы:
- * локальный animation.json перезаписывается её версией. По ходу задание
- * сохраняет animation в базу (резерв секунд, id генерации) и кладёт новые
- * файлы в MinIO — падение процесса не стоит новой оплаты.
+ * локальный animation.json перезаписывается её версией (плюс id генерации,
+ * не дошедший до базы, — withLocalPending). По ходу задание сохраняет animation
+ * в базу (резерв секунд, id генерации), кладёт новые файлы в MinIO и удаляет
+ * оттуда брак — падение процесса не стоит новой оплаты.
  * @returns false — итог не записан: задание забрал другой процесс
  */
 export async function runAnimate(job: Job, d: JobDeps): Promise<boolean> {
@@ -124,15 +156,30 @@ export async function runAnimate(job: Job, d: JobDeps): Promise<boolean> {
   fs.mkdirSync(runDir, { recursive: true });
   fs.writeFileSync(path.join(runDir, 'script.json'), JSON.stringify(job.script, null, 2));
   const animPath = path.join(runDir, 'animation.json');
-  if (job.animation) fs.writeFileSync(animPath, JSON.stringify(job.animation, null, 2));
+  if (job.animation) fs.writeFileSync(animPath, JSON.stringify(withLocalPending(job, animPath), null, 2));
   else fs.rmSync(animPath, { force: true });
   await restoreAnimation(job, runDir, d.storage);
+  const delays = d.saveRetryDelaysMs ?? SAVE_RETRY_DELAYS_MS;
   const animation = await d.animate(runDir, {
     maxOmniSeconds: await d.queue.maxOmniSeconds(),
+    // false — задание не наше, без повтора; брошенная ошибка — сбой базы, повтор с паузой.
     onSave: async (a) => {
-      if (!(await d.queue.saveAnimation(job, a))) throw new StudioError('unknown', GONE, false);
+      for (let i = 0; ; i++) {
+        let ours: boolean;
+        try {
+          ours = await d.queue.saveAnimation(job, a);
+        } catch (e) {
+          if (i >= delays.length) throw e;
+          d.log(`animate ${job.id}: animation не записался в базу (${toStudioError(e).message}) — повтор через ${delays[i]} мс`);
+          await new Promise((r) => setTimeout(r, delays[i]));
+          continue;
+        }
+        if (!ours) throw new StudioError('unknown', GONE, false);
+        return;
+      }
     },
     onFile: (rel) => d.storage.put(animationKey(job.id, rel), path.join(runDir, rel), contentType(rel)),
+    onDiscard: (rel) => d.storage.remove(animationKey(job.id, rel)),
   });
   return d.queue.completeAnimate(job, animation);
 }
