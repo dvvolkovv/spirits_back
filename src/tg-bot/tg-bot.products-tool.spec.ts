@@ -427,6 +427,25 @@ describe('TgBotService.handleChatMessage: гейт и вложения', () => {
     expect(router.persistUserMessage).toHaveBeenCalled();
     expect(workspaceFiles()).toEqual(['dds.xlsx']);
   });
+
+  // Модель видит actionId своего же manage_product в результате инструмента и
+  // старые блоки в истории — и может скопировать ```product-action``` в сам
+  // ответ. В Telegram это ушло бы как код-блок, поэтому сервер вырезает его
+  // из текста до отправки и до сохранения в историю (как уже делает веб —
+  // src/products/product-action-tail.ts).
+  it('блок ```product-action```, который скопировала модель, вырезается из текста до отправки и сохранения', async () => {
+    const { svc, router } = makeTurnBot({ linkeonId: 'u-owner', solo: true });
+    router.generateReply.mockResolvedValueOnce({
+      text: 'Готово.\n\n```product-action\n{"id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}\n```',
+      costUsd: 0.01,
+    });
+    const msg = groupMsg(111);
+    await (svc as any).handleChatMessage(msg, CFG);
+    const grammy = (svc as any).grammy;
+    const sentText = grammy.sendMessage.mock.calls.find((c: any[]) => c[0] === msg.chat.id)?.[1];
+    expect(sentText).toBe('Готово.');
+    expect(router.persistAssistantReply).toHaveBeenCalledWith(CFG, 'Готово.', expect.anything(), expect.anything());
+  });
 });
 
 // ─── статус в чате ───────────────────────────────────────────────────────────

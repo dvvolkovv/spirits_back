@@ -102,6 +102,20 @@ describe('роутинг блога в живом обработчике', () =>
     expect(identity.getLinkeonIdByTgUserId).not.toHaveBeenCalled();
   });
 
+  it('кнопка карточки продукта уходит в её обработчик и у непривязанного пользователя', async () => {
+    const productActionsTg = { handleCallback: jest.fn() };
+    const withPa = new TgBotService(
+      pg as any, identity as any, {} as any, configs as any, {} as any, {} as any, {} as any,
+      commands as any, {} as any, grammy as any, {} as any, {} as any, blog as any,
+      undefined, undefined, productActionsTg as any,
+    );
+    identity.getLinkeonIdByTgUserId.mockResolvedValue(null);
+    const cb = { id: 'cb4', data: 'pa:ok:11111111-2222-3333-4444-555555555555', from: { id: 42 }, message: { chat: { id: 42 } } };
+    await (withPa as any).handleCallbackQuery(cb);
+    expect(productActionsTg.handleCallback).toHaveBeenCalledWith(cb);
+    expect(identity.getLinkeonIdByTgUserId).not.toHaveBeenCalled();
+  });
+
   it('кнопка ассистента в блог не уходит', async () => {
     identity.getLinkeonIdByTgUserId.mockResolvedValue('u-1');
 
