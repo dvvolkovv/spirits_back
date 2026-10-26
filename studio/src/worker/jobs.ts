@@ -21,7 +21,11 @@ export const shotKey = (id: string, attempt: number, name: string): string => `s
 export const videoKey = (id: string): string => `shorts/${id}/video.mp4`;
 export const coverKey = (id: string): string => `shorts/${id}/cover.jpg`;
 
-export async function runCapture(job: Job, d: JobDeps): Promise<void> {
+/** Итог или сбой не записан: аренда истекла, и задание теперь не за этим захватом. */
+const GONE = 'задание забрал другой процесс — итог не записан';
+
+/** @returns false — итог не записан: задание забрал другой процесс */
+export async function runCapture(job: Job, d: JobDeps): Promise<boolean> {
   if (!job.scene) throw new StudioError('no_input', 'у ролика нет сцены', false);
   const runDir = path.join(d.workRoot, job.id, `capture-${job.attempts}`);
   const result = await d.capture(job.scene, runDir, await d.queue.minAnswerChars());
@@ -30,12 +34,11 @@ export async function runCapture(job: Job, d: JobDeps): Promise<void> {
   await d.storage.put(questionShotKey, path.join(runDir, result.questionShot), 'image/png');
   await d.storage.put(answerShotKey, path.join(runDir, result.answerShot), 'image/png');
   const { questionShot: _q, answerShot: _a, ...rest } = result;
-  if (!(await d.queue.completeCapture(job.id, { ...rest, questionShotKey, answerShotKey }))) {
-    d.log(`capture ${job.id}: ролик ушёл из capturing, пока шла съёмка — результат не записан`);
-  }
+  return d.queue.completeCapture(job, { ...rest, questionShotKey, answerShotKey });
 }
 
-export async function runRender(job: Job, d: JobDeps): Promise<void> {
+/** @returns false — итог не записан: задание забрал другой процесс */
+export async function runRender(job: Job, d: JobDeps): Promise<boolean> {
   if (!job.capture || !job.script) throw new StudioError('no_input', 'у ролика нет съёмки или сценария', false);
   const runDir = path.join(d.workRoot, job.id, `render-${job.attempts}`);
   fs.mkdirSync(runDir, { recursive: true });
@@ -50,9 +53,7 @@ export async function runRender(job: Job, d: JobDeps): Promise<void> {
   await d.storage.put(videoKey(job.id), r.video, 'video/mp4');
   await d.storage.put(coverKey(job.id), r.cover, 'image/jpeg');
   const out = { videoKey: videoKey(job.id), coverKey: coverKey(job.id), durationMs: Math.round(r.durationSec * 1000) };
-  if (!(await d.queue.completeRender(job.id, out))) {
-    d.log(`render ${job.id}: ролик ушёл из rendering, пока шла сборка — результат не записан`);
-  }
+  return d.queue.completeRender(job, out);
 }
 
 /** Сборка — первой: ролик ближе к концу пути и к владельцу. */
@@ -65,13 +66,12 @@ export async function runOne(d: JobDeps): Promise<boolean> {
     if (!job) continue;
     d.log(`${kind} ${job.id}: попытка ${job.attempts}`);
     try {
-      if (kind === 'capture') await runCapture(job, d);
-      else await runRender(job, d);
-      d.log(`${kind} ${job.id}: готово`);
+      const written = kind === 'capture' ? await runCapture(job, d) : await runRender(job, d);
+      d.log(`${kind} ${job.id}: ${written ? 'готово' : GONE}`);
     } catch (e) {
       const err = toStudioError(e);
       const outcome = await d.queue.fail(job, err);
-      d.log(`${kind} ${job.id}: ${err.code} — ${err.message} → ${outcome}`);
+      d.log(`${kind} ${job.id}: ${err.code} — ${err.message} → ${outcome === 'gone' ? GONE : outcome}`);
     }
     return true;
   }
