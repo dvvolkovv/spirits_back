@@ -219,6 +219,36 @@ describe('ShortsWriterService.write — ролик со сценками', () =>
     expect(script.skits.conflict.fingerprint).toBe(accepted.conflict.fingerprint);
   });
 
+  it('круг по отзыву студии: сценки, которые модель всё же вернула с правкой, не берутся — отпечатки принятых', async () => {
+    const accepted = planSkits({ conflict: CONFLICT as any, punchline: PUNCHLINE as any });
+    const echo = {
+      ...SKIT_GOOD,
+      conflict: { ...CONFLICT, lines: [{ hero: 'galina', text: 'Обои потёрли! Залог мой.' }, CONFLICT.lines[1]] },
+      punchline: { ...PUNCHLINE, action: `${PUNCHLINE.action} ` + 'She sighs.' },
+    };
+    const { svc, pg } = setup([echo]);
+    await svc.write(skitVideo({
+      writer_feedback: 'озвучка 29 с — сократи на 3 с',
+      script: { hook: 'Старая', voice: 'madirus', speed: 1.1, lines: [], final: { assistantsCount: 18 }, skits: accepted },
+    }));
+    const script = JSON.parse((pg.query.mock.calls[0] as any[])[1][1]);
+    expect(script.skits.conflict.fingerprint).toBe(accepted.conflict.fingerprint);
+    expect(script.skits.punchline.fingerprint).toBe(accepted.punchline.fingerprint);
+  });
+
+  it('круг по замечанию (без отзыва студии) — переписанная развязка берётся', async () => {
+    const accepted = planSkits({ conflict: CONFLICT as any, punchline: PUNCHLINE as any });
+    const rewritten = { ...PUNCHLINE, action: 'The goose faints theatrically onto the suitcase.' };
+    const { svc, pg } = setup([{ ...SKIT_GOOD, punchline: rewritten }]);
+    await svc.write(skitVideo({
+      owner_note: 'Развязка смешнее',
+      script: { hook: 'Старая', voice: 'madirus', speed: 1.1, lines: [], final: { assistantsCount: 18 }, skits: accepted },
+    }));
+    const script = JSON.parse((pg.query.mock.calls[0] as any[])[1][1]);
+    expect(script.skits.punchline.skit).toEqual(rewritten);
+    expect(script.skits.punchline.fingerprint).not.toBe(accepted.punchline.fingerprint);
+  });
+
   it('без принятой развязки ответ без punchline — ошибка разбора (повтор этапа)', async () => {
     const { punchline, ...noPunchline } = SKIT_GOOD;
     const { svc } = setup([noPunchline]);
