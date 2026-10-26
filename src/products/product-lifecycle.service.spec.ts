@@ -113,6 +113,14 @@ describe('создание бота', () => {
     expect(h.actions.open).not.toHaveBeenCalled();
   });
 
+  it('предел занят — отказ до открытия карточки (M8), токен бота у человека не просим напрасно', async () => {
+    const h = harness();
+    h.limits.assertCanCreate.mockRejectedValue(new UnprocessableEntityException('Предел — 2 продукта на один аккаунт'));
+    const r = await h.svc.openCreateBot({ userId: 'u1', name: 'Бот', channel: 'web', turn: null });
+    expect(r).toEqual({ ok: false, reason: 'limit', message: 'Предел — 2 продукта на один аккаунт' });
+    expect(h.actions.open).not.toHaveBeenCalled();
+  });
+
   it('Telegram не принял токен — карточка снова ждёт, с ошибкой; заведения нет', async () => {
     const h = harness();
     h.actions.claim.mockResolvedValue(claimed);
