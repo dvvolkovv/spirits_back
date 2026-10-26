@@ -306,6 +306,12 @@ export interface ProvisionDeps {
   readHostSecret: (path: string) => Promise<string>;
   /** Отвечает ли порт. Ожидание по факту вместо `sleep 12`. */
   waitPort: (port: number, timeoutMs: number) => Promise<boolean>;
+  /**
+   * Ответил ли продукт на /health ИЗНУТРИ контейнера (бот порта не публикует).
+   * Необязательное: по умолчанию — `docker exec … node -e` через этот же run
+   * (rekey.ts, waitInsideVia), подмена — только для тестов.
+   */
+  waitInside?: (slug: string, timeoutMs: number) => Promise<boolean>;
 
   productsDir?: string;
   image?: string;
@@ -323,7 +329,8 @@ export interface ProvisionDeps {
 /** Что успели создать — в порядке создания. Подчистка идёт по этому списку назад. */
 type Step = 'dir' | 'container' | 'vhost';
 
-function validateSecrets(raw: Record<string, string> | undefined): Array<[string, string]> {
+// Экспорт — ради rekey.ts и purge.ts: проверка одна на все хостовые шаги.
+export function validateSecrets(raw: Record<string, string> | undefined): Array<[string, string]> {
   const entries = Object.entries(raw ?? {});
   for (const [key, value] of entries) {
     if (!SECRET_KEY_RE.test(key)) {
@@ -354,9 +361,14 @@ const OWNER_TG_ID_RE = /^\d{1,20}$/;
  * в Telegram ни к чему, а лишняя переменная в общем окружении — лишнее, что
  * может прочитать код продукта. Не число — отказ: зовётся до первого
  * изменения на хосте. Экспорт — ради смены ключей (rekey.ts).
+ *
+ * Пустая строка — то же, что нет поля. Ею сервер говорит «привязки нет»:
+ * смена ключей по ней СНИМАЕТ переменную, и эта ветка живёт в rekey.ts
+ * отдельно, до вызова сюда. Заведению снимать нечего, а отказ на '' сорвал
+ * бы заведение каждого бота, стоит серверу прислать её и при заведении.
  */
 export function ownerTgIdFor(job: { kind: ProductKind; ownerTgId?: string | null }): string | undefined {
-  if (job.kind !== 'bot' || job.ownerTgId === undefined || job.ownerTgId === null) return undefined;
+  if (job.kind !== 'bot' || job.ownerTgId === undefined || job.ownerTgId === null || job.ownerTgId === '') return undefined;
   if (typeof job.ownerTgId !== 'string' || !OWNER_TG_ID_RE.test(job.ownerTgId)) {
     throw new Error(`OWNER_TG_ID не число: ${JSON.stringify(job.ownerTgId)}`);
   }
@@ -398,7 +410,8 @@ function dockerRunArgv(
   return argv;
 }
 
-async function containerTaken(deps: ProvisionDeps, slug: string): Promise<boolean> {
+// Экспорт — ради rekey.ts и purge.ts: проверка одна на все хостовые шаги.
+export async function containerTaken(deps: ProvisionDeps, slug: string): Promise<boolean> {
   // `-a`: остановленный контейнер с этим именем так же занимает имя, и
   // `docker run` на него споткнётся.
   const out = await deps.run([
