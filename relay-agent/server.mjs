@@ -6,7 +6,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import { sessionFsKey, uploadFileName, fallbackFileName } from "./paths.mjs";
+import { sessionFsKey, uploadFileName, fallbackFileName, sessionOutputDir } from "./paths.mjs";
 import { eventCallContext, tailDialogue } from "./session-tail.mjs";
 import { RUN_ENV, runTag, finishedRun, reap } from "./proc-reaper.mjs";
 import { costBaseline, runCost } from "./turn-cost.mjs";
@@ -1062,8 +1062,8 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
 });
 
 app.get("/session/:sid/files", (req, res) => {
-  const outDir = path.join(OUTPUT_DIR, req.params.sid);
-  if (!fs.existsSync(outDir)) return res.json([]);
+  const outDir = sessionOutputDir(OUTPUT_DIR, req.params.sid);
+  if (!outDir || !fs.existsSync(outDir)) return res.json([]);
   const files = [];
   const walk = (dir, prefix) => {
     for (const item of fs.readdirSync(dir)) {
