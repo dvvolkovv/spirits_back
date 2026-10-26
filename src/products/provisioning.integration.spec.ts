@@ -1880,28 +1880,36 @@ maybe('провижининг против живого Postgres', () => {
     // Ревью, пункт 11 (владелец-дружественный счёт). failedProduct() ставит
     // задание kind='provision' в status='failed' — это и есть «никогда не
     // достиг running». Такой продукт не должен считаться в FREE_MONTH_PRODUCTS.
+    //
+    // Предел аккаунта (LimitsService, DEFAULT_MAX_PRODUCTS) считает ЖИВЫЕ
+    // строки (archived_at IS NULL) независимо от бесплатного месяца — он не
+    // предмет этого теста, поэтому каждый продукт здесь архивируется сразу
+    // после своей проверки: иначе третье/четвёртое create() упёрлось бы не в
+    // счёт бесплатных месяцев, а в этот отдельный предел.
     await ensureHost('clients');
     const userId = 'u-free-month-marker';
     const failed = await failedProduct({ slug: 'fm-never-ran' });
-    await pool.query('UPDATE products SET user_id = $2 WHERE id = $1', [failed.id, userId]);
+    await pool.query('UPDATE products SET user_id = $2, archived_at = now() WHERE id = $1', [failed.id, userId]);
     const svc = makeSvc();
 
-    // Счёт «реально работавших» для этого человека — 0 (failed не считается),
+    // Счёт «реально работавших» для этого человека — 0 (failed не считается
+    // ни живым, ни архивным — у него никогда не было успешного заведения),
     // хотя по счёту СТРОК это уже второй продукт.
     const second = await svc.create({ userId, isAdmin: false, name: 'второй', slug: 'fm-after-failed', kind: 'site', secrets: {} });
     expect(second.freeMonth).toBe(true);
     await markRanOnce(second.productId);
+    await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [second.productId]);
 
     // Третий — реально поднявшийся (second уже в счёте: 1 < 2).
     const third = await svc.create({ userId, isAdmin: false, name: 'третий', slug: 'fm-third-ok', kind: 'site', secrets: {} });
     expect(third.freeMonth).toBe(true);
     await markRanOnce(third.productId);
-    // Удаление не освобождает место в счёте — third РЕАЛЬНО работал.
+    // Удаление не освобождает место в СЧЁТЕ — third РЕАЛЬНО работал.
     await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [third.productId]);
 
     // Четвёртый — счёт теперь 2 (second + third, оба реально поднялись и
-    // попали в счёт), 2 не меньше 2 — платный. Удалённый third всё равно
-    // считается именно потому, что он РАБОТАЛ, в отличие от failed.
+    // попали в счёт), 2 не меньше 2 — платный. Удалённые second и third всё
+    // равно считаются именно потому, что они РАБОТАЛИ, в отличие от failed.
     const fourth = await svc.create({ userId, isAdmin: false, name: 'четвёртый', slug: 'fm-fourth', kind: 'site', secrets: {} });
     expect(fourth.freeMonth).toBe(false);
   });
