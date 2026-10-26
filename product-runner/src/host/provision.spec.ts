@@ -1143,6 +1143,16 @@ describe('владелец бота — OWNER_TG_ID (очередь 2)', () => {
     expect('OWNER_TG_ID' in host.containers.get('kafe-ulej')!.env).toBe(false);
   });
 
+  it('пустая строка — как нет поля: бот заводится без переменной, а не отказом', async () => {
+    // Пустой строкой сервер говорит «привязки нет» — так её шлёт смена
+    // ключей, чтобы СНЯТЬ переменную (rekey.ts, своя ветка). Заведению
+    // снимать нечего, а отказ на '' сорвал бы заведение каждого бота, стоит
+    // серверу прислать её и сюда.
+    await provision(job({ slug: 'bot-ulej', kind: 'bot', secrets: { BOT_TOKEN: 'т' }, ownerTgId: '' }), deps(host));
+    expect(host.isRunning('bot-ulej')).toBe(true);
+    expect('OWNER_TG_ID' in host.containers.get('bot-ulej')!.env).toBe(false);
+  });
+
   it('не число — отказ до первого изменения на хосте', async () => {
     // Значение приезжает по сети. argv без шелла пробел в флаг не превратит,
     // но идентификатор Telegram — всегда число, и всё прочее — признак
