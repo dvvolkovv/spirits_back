@@ -307,9 +307,14 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
         // «спал за неуплату» от «вернуть туда, где и было сломано» (M3) —
         // продукту, удалённому в failed, пополнение баланса не поможет, и
         // sleeping со sleep_reason «нет токенов» было бы неправдой владельцу.
-        // old — отдельным CTE с FOR UPDATE, а не чтением уже обновлённой
-        // строки: RETURNING видит только ПОСЛЕ своего же SET.
-        `WITH old AS (SELECT status FROM products WHERE id = $1 AND user_id = $2 FOR UPDATE)
+        // old — отдельным CTE, а не чтением уже обновлённой строки: RETURNING
+        // видит только ПОСЛЕ своего же SET. FOR UPDATE в old НЕ ставить —
+        // измерено на живой PostgreSQL 16: с ним пара CTE+UPDATE одной строки
+        // отдаёт prev_status пустым (EvalPlanQual перечитывает старую строку
+        // по новой версии, которую только что создал тот же оператор). Без
+        // FOR UPDATE конкурентности тут и не нужно: CTE читает снимок ДО
+        // изменений того же оператора, а блокировка строки — у самого UPDATE.
+        `WITH old AS (SELECT status FROM products WHERE id = $1 AND user_id = $2)
          UPDATE products
             SET archived_at = now(), purge_after = now() + make_interval(days => $3),
                 status = 'archived', first_prompt = NULL, first_prompt_channel = NULL
