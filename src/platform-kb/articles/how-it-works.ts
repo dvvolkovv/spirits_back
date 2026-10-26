@@ -3,7 +3,7 @@ import type { KbArticle } from '../kb.types';
 // Публичный уровень «как устроено» (решение владельца 24.10.2026). ВЫЧИТКА ВЛАДЕЛЬЦЕМ — вся статья.
 // источник: разговоры — src/common/chat-model.ts; src/chat/chat.service.ts (релей, Маша)
 // источник: картинки — src/misc/misc.service.ts:586-611; видео — src/misc/veo.service.ts:6; свой голос — src/voice-avatar/voice-avatar.service.ts:13-17
-// источник: озвучка — src/speech/voices.ts:28-48; диктовка — src/voice/speechkit-stt.service.ts:6-10
+// источник: озвучка — src/speech/voices.ts:28-48; голосовой ввод — src/voice/speechkit-stt.service.ts (SPEECHKIT_LANGUAGE_CODES), src/voice/voice-ws.ts (язык профиля)
 // источник: звонок — voice-host/src/agent.ts:15,133-135; поиск — src/misc/misc.service.ts:893-1038
 // источник: данные — src/neo4j/neo4j.service.ts:97-215; src/business-profile/business-profile.types.ts; src/calendar/crypto.ts
 // источник: третьи лица — spirits_front src/components/onboarding/LegalModal.tsx:580-771 (политика конфиденциальности)
@@ -19,7 +19,7 @@ export const howItWorks: KbArticle = {
 - Разговоры с ассистентами, ИИ-поддержка, поиск людей и разбор совместимости — модели Claude (Anthropic).
 - Картинки — модели Google Gemini (Nano Banana). Видео — Google Gemini Omni; свой голос в видео — ElevenLabs.
 - Озвучка ответов: русский — Яндекс SpeechKit, другие языки — OpenAI.
-- Голосовой ввод в чате — Яндекс SpeechKit, только русская речь.
+- Голосовой ввод в чате — Яндекс SpeechKit, на языке профиля (кроме китайского).
 - Голосовые сообщения в Telegram распознаёт и озвучивает OpenAI.
 - Голосовой звонок и встречи — голосовая модель реального времени OpenAI.
 - Поиск людей по смыслу — эмбеддинги OpenAI и графовая база с векторным поиском.

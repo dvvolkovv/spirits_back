@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import * as path from 'path';
+import { DEFAULT_LANGUAGE } from '../common/services/language.service';
 
 /**
  * Потоковый STT через Yandex SpeechKit v3 (gRPC bidi-stream RecognizeStreaming).
@@ -21,6 +22,34 @@ export interface SttStreamHandle {
 }
 
 const SK_ENDPOINT = 'stt.api.cloud.yandex.net:443';
+
+/**
+ * Язык Linkeon (profile_data.language, корень: ru, en…) → код языка SpeechKit v3.
+ *
+ * Перечень SpeechKit — «Модели распознавания» в документации Yandex Cloud
+ * (aistudio.yandex.ru/docs/ru/speechkit/stt/models; на 26.10.2026: ru-RU, en-US,
+ * de-DE, es-ES, fr-FR, pt-PT, pt-BR, it-IT, nl-NL, pl-PL, fi-FI, sv-SE, tr-TR,
+ * he-IL, kk-KZ, uz-UZ и auto). Китайского там нет.
+ *
+ * pt — европейский (pt-PT): так переведён интерфейс и так отвечают ассистенты.
+ *
+ * Языка нет в карте — диктовка не открывается (voice-ws отвечает
+ * lang_unsupported). Раньше здесь был зашит ru-RU для всех, и человек с
+ * английским профилем получал вместо своих слов русскую кашу.
+ */
+export const SPEECHKIT_LANGUAGE_CODES: Readonly<Record<string, string>> = Object.freeze({
+  ru: 'ru-RU',
+  en: 'en-US',
+  de: 'de-DE',
+  es: 'es-ES',
+  fr: 'fr-FR',
+  pt: 'pt-PT',
+});
+
+/** Есть ли у SpeechKit распознавание для языка Linkeon (корень, не полный тег). */
+export function isSttLanguageSupported(lang: string | null | undefined): boolean {
+  return !!lang && Object.prototype.hasOwnProperty.call(SPEECHKIT_LANGUAGE_CODES, lang);
+}
 
 @Injectable()
 export class SpeechkitSttService implements OnModuleInit {
@@ -49,13 +78,20 @@ export class SpeechkitSttService implements OnModuleInit {
   /**
    * Открывает потоковую сессию распознавания. Возвращает handle для подачи
    * аудио-чанков (LPCM16/16k/mono) и завершения. Текст приходит в колбэки.
+   * language — язык Linkeon (корень); без поддержки SpeechKit — ошибка без
+   * обращения к Яндексу (см. SPEECHKIT_LANGUAGE_CODES).
    */
-  openStream(cb: SttStreamCallbacks): SttStreamHandle {
+  openStream(cb: SttStreamCallbacks, language: string = DEFAULT_LANGUAGE): SttStreamHandle {
     const apiKey = process.env.YANDEX_SPEECHKIT_API_KEY;
     if (!this.RecognizerCtor || !apiKey) {
       cb.onError(new Error('SpeechKit STT не сконфигурирован'));
       return { push: () => {}, end: () => {} };
     }
+    if (!isSttLanguageSupported(language)) {
+      cb.onError(new Error(`SpeechKit STT: язык «${language}» не поддерживается`));
+      return { push: () => {}, end: () => {} };
+    }
+    const languageCode = SPEECHKIT_LANGUAGE_CODES[language];
 
     const client = new this.RecognizerCtor(SK_ENDPOINT, grpc.credentials.createSsl());
     const md = new grpc.Metadata();
@@ -85,7 +121,7 @@ export class SpeechkitSttService implements OnModuleInit {
       call.write({ session_options: { recognition_model: {
         audio_format: { raw_audio: { audio_encoding: 'LINEAR16_PCM', sample_rate_hertz: 16000, audio_channel_count: 1 } },
         text_normalization: { text_normalization: 'TEXT_NORMALIZATION_ENABLED' },
-        language_restriction: { restriction_type: 'WHITELIST', language_code: ['ru-RU'] },
+        language_restriction: { restriction_type: 'WHITELIST', language_code: [languageCode] },
         audio_processing_type: 'REAL_TIME',
       } } });
     } catch (e: any) {

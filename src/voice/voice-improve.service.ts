@@ -2,8 +2,11 @@ import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
 
 /**
- * «Причесать» надиктованный голосом русский текст [2026-08-23]: расставить пунктуацию/заглавные и
+ * «Причесать» надиктованный голосом текст [2026-08-23]: расставить пунктуацию/заглавные и
  * поправить очевидные ошибки падежей/согласования от распознавания речи — БЕЗ изменения смысла.
+ * Язык любой: диктовка слушает на языке профиля [2026-10-26], поэтому промпт не про «русский текст»
+ * и прямо запрещает перевод. Написан по-английски намеренно: русский промпт тянул модель отвечать
+ * по-русски (та же история, что с языковой директивой в LanguageService.buildDirective).
  * Вызывается ТОЛЬКО по явному согласию пользователя (кнопка «Улучшить» + предупреждение о внешнем ИИ
  * на клиенте). Fail-safe: любой сбой/нет ключа → возвращаем исходный текст (ничего не теряем).
  */
@@ -21,10 +24,13 @@ export class VoiceImproveService {
     const url = openaiKey ? 'https://api.openai.com/v1/chat/completions' : 'https://openrouter.ai/api/v1/chat/completions';
     const model = openaiKey ? (process.env.IMPROVE_MODEL || 'gpt-4o-mini') : 'openai/gpt-4o-mini';
     const system =
-      'Ты корректируешь русский текст, надиктованный голосом (распознавание речи). Задача: расставь ' +
-      'пунктуацию и заглавные буквы, исправь ОЧЕВИДНЫЕ ошибки падежей и согласования, возникшие при ' +
-      'распознавании. СТРОГО: не меняй смысл, не добавляй и не убирай факты и слова по существу, ' +
-      'не отвечай на текст и не комментируй — только исправь его. Верни ТОЛЬКО исправленный текст.';
+      'You proofread text dictated by voice (speech recognition output). The text may be in any language. ' +
+      'Keep it in the SAME language it is written in and never translate it, not even partly: ' +
+      'a German text stays German, an English text stays English, and so on. ' +
+      'Add punctuation and capital letters, and fix OBVIOUS grammar errors caused by recognition ' +
+      '(wrong endings, case, agreement). STRICTLY: do not change the meaning, do not add or remove ' +
+      'facts or substantive words, do not answer the text or comment on it — only correct it. ' +
+      'Return ONLY the corrected text.';
     try {
       const resp = await axios.post(
         url,
