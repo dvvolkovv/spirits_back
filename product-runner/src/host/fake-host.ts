@@ -17,7 +17,8 @@
  * Собственные свойства симулятора сторожит fake-host.spec.ts: он общий, и
  * незамеченная правка ослабила бы сразу обе батареи.
  */
-import { ProvisionDeps } from './provision';
+import { Script } from 'vm';
+import { DEFAULTS, ProvisionDeps } from './provision';
 
 export class FakeHost {
   /** Каталоги чекаутов: путь → файлы. */
@@ -40,8 +41,10 @@ export class FakeHost {
       imageId?: string;
       cmd: string[];
       restart?: string;
-      memory?: string;
-      cpus?: string;
+      /** Байты — уже проверенные и переведённые из `--memory=` в `dockerRun` (см. `parseMemory`). */
+      memory?: number;
+      /** NanoCPUs — уже проверенные и переведённые из `--cpus=` в `dockerRun` (см. `parseCpus`). */
+      cpus?: number;
     }
   >();
   /**
@@ -64,25 +67,56 @@ export class FakeHost {
 
   /**
    * Здоров ли контейнер для `/health` — общий для `docker exec` (бот) и
-   * `probePort` (сайт). По умолчанию здоров любой запущенный; тест подменяет
-   * правило, чтобы «нездоровым» был именно контейнер с плохими ключами.
+   * `probePort` (сайт). Моделирует код ВЛАДЕЛЬЦА продукта: он падает без
+   * нужных ему ключей (например, без рабочего ключа платёжного API), а не
+   * сам каркас. Плохой `BOT_TOKEN` сам по себе каркас бота НЕ валит: сервер
+   * проверяет токен через `getMe` ДО того, как отдать его контейнеру, —
+   * это тест на уровне `provision.ts`/`rekey.ts`, а не на этом правиле.
+   * По умолчанию здоров любой запущенный; тест подменяет правило под свой
+   * сценарий «нездоровых» ключей.
    */
   healthy: (name: string, c: { env: Record<string, string> }) => boolean = () => true;
 
-  /** Завести образ под меткой (или передвинуть метку на другой образ). */
+  /**
+   * Завести образ под меткой (или передвинуть метку на другой образ).
+   *
+   * Образы в Docker неизменяемы: один и тот же идентификатор не может
+   * обзавестись другим окружением задним числом. Повторный вызов с тем же
+   * `id`, но другим `env`, — ошибка заводящего теста, а не разрешённая
+   * мутация: не отловленная здесь, она тихо переписала бы окружение образа
+   * уже СОЗДАННЫХ контейнеров (inspectWhole читает его по `imageId` заново
+   * при каждом inspect).
+   */
   tagImage(tag: string, id: string, env: string[] = []): void {
-    this.images.set(id, { env });
+    const existing = this.images.get(id);
+    if (existing) {
+      const same = existing.env.length === env.length && existing.env.every((e, i) => e === env[i]);
+      if (!same) {
+        throw new Error(`tagImage: образ ${id} уже заведён с другим окружением — образы в Docker неизменяемы`);
+      }
+    } else {
+      this.images.set(id, { env: Object.freeze([...env]) as string[] });
+    }
     this.tags.set(tag, id);
   }
 
-  /** Идентификатор по метке или идентификатору; незнакомая метка заводит пустой образ. */
+  /**
+   * Идентификатор по метке или идентификатору. Автозавод пустого образа —
+   * ТОЛЬКО для `DEFAULTS.image`: это единственный образ, который заводящие
+   * помощники спеков (`run()` и т.п.) используют без явного `tagImage`.
+   * Любая другая незнакомая ссылка — отказ, как у живого docker: симулятор,
+   * заводящий образ под любым именем, зеленил бы опечатку в `cfg.image`.
+   */
   private resolveImage(ref: string): string {
     if (this.images.has(ref)) return ref;
     const id = this.tags.get(ref);
     if (id) return id;
-    const fresh = `sha256:fake-${ref}`;
-    this.tagImage(ref, fresh, []);
-    return fresh;
+    if (ref === DEFAULTS.image) {
+      const fresh = `sha256:fake-${ref}`;
+      this.tagImage(ref, fresh, []);
+      return fresh;
+    }
+    throw new Error(`Unable to find image '${ref}' locally`);
   }
 
   /** Сайт отвечает на порту: запущенный контейнер с этой публикацией и здоровый. */
@@ -238,10 +272,23 @@ export class FakeHost {
     if (sub === 'exec') {
       // Ровно та форма, которой смена ключей спрашивает /health бота:
       // `docker exec <имя> node -e <скрипт>`. Прочее — отказ.
-      const [name, bin, flag] = args;
-      if (bin !== 'node' || flag !== '-e' || args.length !== 4) throw new Error(`docker exec: симулятор знает только node -e: ${args.join(' ')}`);
+      const [name, bin, flag, script, ...extra] = args;
+      if (bin !== 'node' || flag !== '-e' || script === undefined || extra.length) {
+        throw new Error(`docker exec: симулятор знает только node -e: ${args.join(' ')}`);
+      }
       if (!this.containers.has(name)) throw new Error(`No such container: ${name}`);
       if (this.stopped.has(name)) throw new Error(`Error response from daemon: container ${name} is not running`);
+      // `node -e` сперва КОМПИЛИРУЕТ скрипт и только потом выполняет его:
+      // синтаксическая ошибка — exit 1 ДО того, как код владельца хоть раз
+      // отработал. Ломаная строка HEALTH_INSIDE (задача 5 — rekey.ts)
+      // обязана падать здесь же, а не тихо считаться здоровой правилом
+      // `healthy`, которое моделирует только РАБОТАЮЩИЙ, но нездоровый код.
+      try {
+        // eslint-disable-next-line no-new -- компиляция без исполнения — весь смысл проверки.
+        new Script(script);
+      } catch {
+        throw new Error('Command failed: exit status 1');
+      }
       if (!this.healthy(name, this.containers.get(name)!)) throw new Error('Command failed: exit status 1');
       return '';
     }
@@ -314,25 +361,40 @@ export class FakeHost {
 
   /**
    * Контейнер целиком — в форме `docker inspect --format '{{json .}}'`.
-   * Config.Env, как у docker: переменные образа, затем свои; своя с тем же
-   * именем заменяет переменную образа (одна строка, новое значение).
+   *
+   * Config.Env, как у живого docker: СНАЧАЛА переменные КОНТЕЙНЕРА (`-e`, в
+   * порядке argv — ровно как docker кладёт их в Config.Env), ПОТОМ —
+   * переменные ОБРАЗА, которые не переопределены. Переопределённая
+   * переменная образа в списке не повторяется: она и так видна в своей
+   * (контейнерной) позиции с новым значением.
+   *
+   * Mounts не показывает анонимный volume на `/product`, который живой
+   * контейнер без `-v` получил бы от `VOLUME ["/product"]` в Dockerfile:
+   * ни заведение, ни смена ключей его не читают, и усложнять симулятор
+   * ради того, что никто не проверяет, — не повод.
    */
   private inspectWhole(name: string): any {
     const c = this.containers.get(name)!;
-    const own = new Set(Object.keys(c.env));
-    const imageEnv = (this.images.get(c.imageId ?? this.resolveImage(c.image))?.env ?? []).filter((e) => !own.has(e.slice(0, e.indexOf('='))));
+    const ownNames = new Set(Object.keys(c.env));
+    const ownEnv = Object.entries(c.env).map(([k, v]) => `${k}=${v}`);
+    const imageEnv = (this.images.get(c.imageId ?? this.resolveImage(c.image))?.env ?? []).filter(
+      (e) => !ownNames.has(e.slice(0, e.indexOf('='))),
+    );
     const [hostIp, hostPort, containerPort] = c.publish ? c.publish.split(':') : [];
     const [source, destination] = c.mount ? c.mount.split(':') : [];
     return {
       Name: `/${name}`,
       Image: c.imageId ?? this.resolveImage(c.image),
-      Config: { Image: c.image, Env: [...imageEnv, ...Object.entries(c.env).map(([k, v]) => `${k}=${v}`)] },
+      Config: { Image: c.image, Env: [...ownEnv, ...imageEnv] },
       State: { Running: !this.stopped.has(name), Status: this.stopped.has(name) ? 'exited' : 'running' },
       HostConfig: {
         PortBindings: c.publish ? { [`${containerPort}/tcp`]: [{ HostIp: hostIp, HostPort: hostPort }] } : {},
-        Memory: memoryBytes(c.memory),
-        NanoCpus: c.cpus ? Math.round(Number(c.cpus) * 1e9) : 0,
-        RestartPolicy: { Name: c.restart ?? '' },
+        Memory: c.memory ?? 0,
+        NanoCpus: c.cpus ?? 0,
+        // Docker всегда отдаёт MaximumRetryCount (0 вне политики "on-failure");
+        // Name "no" — ровно то, что видно у контейнера без --restart вовсе
+        // (так лежат в карте только контейнеры, заведённые спеками руками).
+        RestartPolicy: { Name: c.restart ?? 'no', MaximumRetryCount: 0 },
         NetworkMode: 'bridge',
         Privileged: false,
       },
@@ -423,8 +485,8 @@ export class FakeHost {
     let image = '';
     let publish: string | undefined;
     let restart = '';
-    let memory: string | undefined;
-    let cpus: string | undefined;
+    let memory: number | undefined;
+    let cpus: number | undefined;
     const env: Record<string, string> = {};
     const cmd: string[] = [];
 
@@ -439,8 +501,24 @@ export class FakeHost {
       if (a === '-d') continue;
       if (a === '--name') { name = args[++i]; continue; }
       if (a === '--restart') { restart = args[++i]; continue; }
-      if (a === '-v') { mount = args[++i]; continue; }
-      if (a === '-p') { publish = args[++i]; continue; }
+      if (a === '-v') {
+        const raw = args[++i];
+        // Симулятор знает только простой bind-mount без опций — ровно так
+        // его зовут заведение и смена ключей. `:ro`/`:rw` молча долетели бы
+        // до inspectWhole и были бы обрезаны `split(':')` на первые две
+        // части без единого предупреждения, что третья выброшена.
+        if (!/^[^:]+:[^:]+$/.test(raw)) throw new Error(`docker run: неизвестная форма -v: ${raw}`);
+        mount = raw;
+        continue;
+      }
+      if (a === '-p') {
+        const raw = args[++i];
+        // Та же причина, что у -v: заведение и пробуждение публикуют порт
+        // ровно в форме IP:HOST:CONTAINER — только её симулятор обязан знать.
+        if (!/^\d{1,3}(?:\.\d{1,3}){3}:\d+:\d+$/.test(raw)) throw new Error(`docker run: неизвестная форма -p: ${raw}`);
+        publish = raw;
+        continue;
+      }
       if (a === '-e') {
         const pair = args[++i];
         const eq = pair.indexOf('=');
@@ -449,8 +527,8 @@ export class FakeHost {
         env[pair.slice(0, eq)] = pair.slice(eq + 1);
         continue;
       }
-      if (a.startsWith('--memory=')) { memory = a.slice('--memory='.length); continue; }
-      if (a.startsWith('--cpus=')) { cpus = a.slice('--cpus='.length); continue; }
+      if (a.startsWith('--memory=')) { memory = parseMemory(a.slice('--memory='.length)); continue; }
+      if (a.startsWith('--cpus=')) { cpus = parseCpus(a.slice('--cpus='.length)); continue; }
       if (a.startsWith('-')) throw new Error(`docker run: неизвестный флаг ${a}`);
       image = a;
     }
@@ -537,13 +615,57 @@ export class FakeHost {
   }
 }
 
-/** `--memory=1g` / `--memory=1073741824` → байты, как в HostConfig.Memory. */
-function memoryBytes(raw: string | undefined): number {
-  if (!raw) return 0;
-  const m = /^(\d+(?:\.\d+)?)([kmg]?)$/i.exec(raw);
-  if (!m) throw new Error(`--memory: непонятное значение ${raw}`);
-  const mul = { '': 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 }[m[2].toLowerCase() as '' | 'k' | 'm' | 'g'];
-  return Math.round(Number(m[1]) * mul);
+/** Единицы `--memory`, как у Docker (go-units `RAMInBytes`, бинарные степени 1024). */
+const MEMORY_UNITS: Record<string, number> = {
+  '': 1,
+  b: 1,
+  k: 1024,
+  kb: 1024,
+  kib: 1024,
+  m: 1024 ** 2,
+  mb: 1024 ** 2,
+  mib: 1024 ** 2,
+  g: 1024 ** 3,
+  gb: 1024 ** 3,
+  gib: 1024 ** 3,
+};
+
+/**
+ * `--memory=1g` / `--memory=1073741824` → байты, как в HostConfig.Memory.
+ * Отказ — ТЕКСТОМ, которым отвечает живой docker CLI на мусор в значении
+ * (клиентская проверка флага, до обращения к daemon'у).
+ */
+function parseMemory(raw: string): number {
+  const m = /^(\d+(?:\.\d+)?)([a-zA-Z]*)$/.exec(raw);
+  const unit = m ? m[2].toLowerCase() : undefined;
+  if (!m || unit === undefined || !(unit in MEMORY_UNITS)) {
+    throw new Error(`invalid argument "${raw}" for "-m, --memory" flag: invalid size: '${raw}'`);
+  }
+  return Math.round(Number(m[1]) * MEMORY_UNITS[unit]);
+}
+
+/** Сколько CPU «есть» у симулированного хоста — предел для `--cpus`. */
+const SIMULATED_HOST_CPUS = 4;
+
+/**
+ * `--cpus=1` → NanoCpus (целое, cpus × 1e9), как в HostConfig.NanoCpus.
+ * Два разных отказа, как у живого docker: мусор в значении — клиентская
+ * ошибка разбора флага; число вне диапазона — ответ daemon'а, знающего,
+ * сколько CPU у хоста физически есть.
+ */
+function parseCpus(raw: string): number {
+  if (!/^\d+(?:\.\d+)?$/.test(raw)) {
+    throw new Error(`invalid argument "${raw}" for "--cpus" flag: strconv.ParseFloat: parsing "${raw}": invalid syntax`);
+  }
+  const value = Number(raw);
+  if (value < 0.01 || value > SIMULATED_HOST_CPUS) {
+    throw new Error(
+      `Range of CPUs is from 0.01 to ${SIMULATED_HOST_CPUS.toFixed(2)}, as there are only ${SIMULATED_HOST_CPUS} CPUs available`,
+    );
+  }
+  // Целое число nanocpus: ближайшее к value*1e9 отличается от самого value
+  // не больше чем на 0.5e-9 CPU — глубже 1e-9 точности Docker и не считает.
+  return Math.round(value * 1e9);
 }
 
 export const OAUTH = 'оаут-токен-хоста';

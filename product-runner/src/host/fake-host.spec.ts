@@ -254,11 +254,14 @@ describe('контейнер целиком и образы — для смен�
     const j = JSON.parse(await host.run(['docker', 'inspect', '--format', '{{json .}}', 'shop']));
     expect(j.Image).toBe('sha256:aaa');
     expect(j.Config.Image).toBe('linkeon-product:base');
-    expect(j.Config.Env).toEqual(['PATH=/usr/bin', 'CHECKOUT_PATH=/product', 'RUNNER_TOKEN=ткн', 'API_KEY=k']);
+    // Исправлено по ревью: живой docker кладёт СВОИ переменные (-e, в
+    // порядке argv) первыми, переменные образа — следом; было наоборот.
+    expect(j.Config.Env).toEqual(['RUNNER_TOKEN=ткн', 'API_KEY=k', 'PATH=/usr/bin', 'CHECKOUT_PATH=/product']);
     expect(j.HostConfig.PortBindings).toEqual({ '3000/tcp': [{ HostIp: '127.0.0.1', HostPort: '8001' }] });
     expect(j.HostConfig.Memory).toBe(1073741824);
     expect(j.HostConfig.NanoCpus).toBe(1e9);
-    expect(j.HostConfig.RestartPolicy).toEqual({ Name: 'unless-stopped' });
+    // Исправлено по ревью: живой docker всегда отдаёт MaximumRetryCount.
+    expect(j.HostConfig.RestartPolicy).toEqual({ Name: 'unless-stopped', MaximumRetryCount: 0 });
     expect(j.Mounts).toEqual([{ Type: 'bind', Source: '/srv/products/shop', Destination: '/product', RW: true }]);
     expect(j.State.Running).toBe(true);
   });
@@ -310,5 +313,68 @@ describe('контейнер целиком и образы — для смен�
     host.healthy = (_name, c) => c.env.API_KEY !== 'плохой';
     host.containers.get('shop')!.env.API_KEY = 'плохой';
     expect(host.probePort(8001)).toBe(false);
+  });
+
+  it('exec node: синтаксическая ошибка в скрипте — отказ ДО правила здоровья, а не вместо него', async () => {
+    // node -e компилирует скрипт прежде, чем выполнить его; ломаная строка
+    // (например, кривой HEALTH_INSIDE из rekey.ts) обязана упасть здесь же —
+    // `healthy` вообще не должно вызываться.
+    await run('bot');
+    host.healthy = () => {
+      throw new Error('healthy не должен был вызваться: скрипт не скомпилировался');
+    };
+    await expect(host.run(['docker', 'exec', 'bot', 'node', '-e', 'this ( is not valid js'])).rejects.toThrow(/exit/);
+  });
+
+  it('--memory: мусор — отказ как у docker; kb/mb/gb и ...ib принимаются', async () => {
+    await expect(
+      host.run(['docker', 'run', '-d', '--name', 'z1', '--restart', 'unless-stopped', '--memory=мусор', 'linkeon-product:base']),
+    ).rejects.toThrow(/--memory/);
+
+    await host.run(['docker', 'run', '-d', '--name', 'z2', '--restart', 'unless-stopped', '--memory=512mb', 'linkeon-product:base']);
+    const j = JSON.parse(await host.run(['docker', 'inspect', '--format', '{{json .}}', 'z2']));
+    expect(j.HostConfig.Memory).toBe(512 * 1024 ** 2);
+  });
+
+  it('--cpus: мусор и значение вне диапазона хоста (0.01..4) — отказ', async () => {
+    const run2 = (name: string, cpus: string) =>
+      host.run(['docker', 'run', '-d', '--name', name, '--restart', 'unless-stopped', `--cpus=${cpus}`, 'linkeon-product:base']);
+    await expect(run2('z3', 'много')).rejects.toThrow(/--cpus/);
+    await expect(run2('z4', '8')).rejects.toThrow(/Range of CPUs/);
+    await expect(run2('z5', '0.001')).rejects.toThrow(/Range of CPUs/);
+  });
+
+  it('образ неизменяем: тот же id с другим окружением — отказ; переезд метки не меняет уже созданный контейнер', async () => {
+    host.tagImage('linkeon-product:base', 'sha256:aaa', ['A=1']);
+    await run('shop');
+
+    expect(() => host.tagImage('linkeon-product:base', 'sha256:aaa', ['A=2'])).toThrow(/sha256:aaa/);
+
+    // Переезд метки на НОВЫЙ id — это разрешённое обновление образа
+    // (`product-image-roll.sh`): уже созданный контейнер своего id не теряет.
+    host.tagImage('linkeon-product:base', 'sha256:bbb', ['B=1']);
+    const j = JSON.parse(await host.run(['docker', 'inspect', '--format', '{{json .}}', 'shop']));
+    expect(j.Image).toBe('sha256:aaa');
+    expect(j.Config.Env).toEqual(['A=1']);
+  });
+
+  it('-p и -v в непонятной форме — отказ, а не тихий разбор мимо значения', async () => {
+    const base = ['docker', 'run', '-d', '--name', 'z6', '--restart', 'unless-stopped'];
+    await expect(host.run([...base, '-p', '8001:3000', 'linkeon-product:base'])).rejects.toThrow(/-p/);
+    await expect(
+      host.run([...base, '-v', '/srv/products/z6:/product:ro', 'linkeon-product:base']),
+    ).rejects.toThrow(/-v/);
+  });
+
+  it('незнакомый образ (не DEFAULTS.image и не заведённый tagImage) — отказ, как у живого docker', async () => {
+    await expect(
+      host.run(['docker', 'run', '-d', '--name', 'z7', '--restart', 'unless-stopped', 'левый-образ:1']),
+    ).rejects.toThrow(/Unable to find image/);
+  });
+
+  it('RestartPolicy "no" и MaximumRetryCount у контейнера без --restart (заведён вручную, как в provision.spec.ts)', async () => {
+    host.containers.set('legacy', { mount: '', env: {}, image: 'linkeon-product:base', cmd: [] });
+    const j = JSON.parse(await host.run(['docker', 'inspect', '--format', '{{json .}}', 'legacy']));
+    expect(j.HostConfig.RestartPolicy).toEqual({ Name: 'no', MaximumRetryCount: 0 });
   });
 });
