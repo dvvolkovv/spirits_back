@@ -93,12 +93,13 @@ export class ProductsMcpController {
 
   /** Вынесено из makeServer по той же причине: здесь живёт разбор владельца. */
   async callTool(authHeader: string | undefined, args: any, name: string = PRODUCT_TOOLS[0].name) {
-    const { userId, channel } = this.owner(authHeader);
+    const { userId, channel, turn } = this.owner(authHeader);
     // userId из запроса выбрасывается ЯВНО, а не игнорируется по невнимательности:
     // поле могло бы приехать и перекрыть владельца при любой будущей правке
-    // execute(), которая начнёт заглядывать в input. channel — туда же: канал
-    // хода (web/telegram) несёт подпись токена, а не поле, которое пишет модель.
-    const { userId: _drop, channel: _dropChannel, ...input } = args ?? {};
+    // execute(), которая начнёт заглядывать в input. channel и turn — туда же:
+    // канал хода (web/telegram) и метка хода несут подпись токена, а не поле,
+    // которое пишет модель — иначе модель могла бы приписать карточку чужому ходу.
+    const { userId: _drop, channel: _dropChannel, turn: _dropTurn, ...input } = args ?? {};
     if (!this.toolsFor(channel).some((t) => t.name === name)) {
       return { ok: false, error: `Неизвестный инструмент: ${name}` };
     }
@@ -124,7 +125,7 @@ export class ProductsMcpController {
         summary: input.summary,
       });
     }
-    return this.tool.execute(userId, input, channel);
+    return this.tool.execute(userId, input, channel, turn);
   }
 
   private makeServer(authHeader?: string): Server {
