@@ -4340,15 +4340,13 @@ Expected: `syntax-ok` и строка `roll-busy|1` (без правки был�
 
 ---
 
-### Task 15: Сервер — действие `keys` инструмента, отправка карточки, «уже стёрт», регистрация
+### Task 15a: Сервер — действие `keys` в инструменте, «уже стёрт» / «стирается», описание
 
 **Files:**
 - Modify: `src/products/product-lifecycle-tool.ts` (конструктор, новые `keys` и `resolveGone`, `restore`, `actionStatus`)
 - Modify: `src/products/product-tool.service.ts` (`execute` ~315–352, `PRODUCT_TOOLS` ~702–790)
-- Modify: `src/products/product-actions.controller.ts` (DTO, конструктор, ветка `keys`)
-- Modify: `src/products/products.module.ts` (`ProductKeysService`, `ProductPurgeService`)
 - Modify: `src/products/product-tool.defs.spec.ts` (~10–18, ~73–79, ~104–108)
-- Test: `src/products/product-lifecycle-tool.keys.spec.ts` (новый), `src/products/product-actions.controller.keys.spec.ts` (новый)
+- Test: `src/products/product-lifecycle-tool.keys.spec.ts` (новый)
 
 - [ ] **Step 1: Тесты**
 
@@ -4360,11 +4358,12 @@ import { ProductLifecycleTool } from './product-lifecycle-tool';
 
 const PRODUCT = { id: 'p1', name: 'Бот отчётов', slug: 'bot-otchet', domain: null, kind: 'bot', status: 'running' };
 
-function harness(o: { gone?: boolean } = {}) {
+function harness(o: { gone?: 'purged' | 'expired' } = {}) {
   const pg = {
     query: jest.fn(async (sql: string) => {
       if (sql.includes('purged_at IS NOT NULL OR purge_after <= now()')) {
-        return { rows: o.gone ? [{ id: 'p0', name: 'Старый сайт', slug: 'old', kind: 'site', purge_after: '2026-09-01T00:00:00.000Z' }] : [] };
+        return { rows: o.gone ? [{ id: 'p0', name: 'Старый сайт', slug: 'old', kind: 'site', purge_after: '2026-09-01T00:00:00.000Z',
+          purged_at: o.gone === 'purged' ? '2026-09-01T01:00:00.000Z' : null }] : [] };
       }
       if (sql.includes('archived_at IS NOT NULL')) return { rows: [] };
       if (sql.includes('FROM products')) return { rows: [PRODUCT] };
@@ -4417,35 +4416,20 @@ describe('действие keys', () => {
   });
 });
 
-describe('restore стёртого', () => {
-  it('«уже стёрт» вместо «такого нет»', async () => {
-    const h = harness({ gone: true });
+describe('restore после срока', () => {
+  it('стёртый — «уже стёрт», а не «такого нет»', async () => {
+    const h = harness({ gone: 'purged' });
     const r: any = await h.svc.execute('u1', { action: 'restore', product: 'старый сайт' });
     expect(r).toMatchObject({ ok: false, reason: 'purged' });
     expect(r.say).toMatch(/уже стёрт/);
   });
-});
-```
 
-`src/products/product-actions.controller.keys.spec.ts`:
-
-```ts
-import { ProductActionsController } from './product-actions.controller';
-
-const ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
-
-describe('отправка карточки ключей', () => {
-  it('set и remove уходят в сервис ключей; ответ — вид без значений', async () => {
-    const row = { id: ID, user_id: 'u1', product_id: 'p1', kind: 'keys', status: 'pending', channel: 'web', confirmed_via: null,
-      payload: { keyNames: ['A'] }, result: null, created_at: new Date(), expires_at: new Date(Date.now() + 60_000),
-      resolved_at: null, tg_chat_id: null, tg_message_id: null, product_name: 'Бот' };
-    const actions = { get: jest.fn(async () => row) };
-    const keys = { complete: jest.fn(async () => ({ ok: true, queued: true })) };
-    const limiter = { check: jest.fn(async () => undefined) };
-    const ctrl = new ProductActionsController(actions as any, {} as any, limiter as any, keys as any);
-    const out = await ctrl.submit({ userId: 'u1' }, ID, { set: { B: 'секрет-значение' }, remove: ['A'], via: 'chat' } as any);
-    expect(keys.complete).toHaveBeenCalledWith({ userId: 'u1', actionId: ID, set: { B: 'секрет-значение' }, remove: ['A'], via: 'chat' });
-    expect(JSON.stringify(out)).not.toContain('секрет-значение');
+  it('срок вышел, но машина ещё не стёрла — «стирается», а не «уже стёрт»', async () => {
+    const h = harness({ gone: 'expired' });
+    const r: any = await h.svc.execute('u1', { action: 'restore', product: 'старый сайт' });
+    expect(r).toMatchObject({ ok: false, reason: 'expiring' });
+    expect(r.say).toMatch(/стирается/);
+    expect(r.say).not.toMatch(/уже стёрт/);
   });
 });
 ```
@@ -4464,9 +4448,9 @@ describe('отправка карточки ключей', () => {
 - [ ] **Step 2: Коммит, прогон — FAIL**
 
 ```bash
-git -C $B add src/products/product-lifecycle-tool.keys.spec.ts src/products/product-actions.controller.keys.spec.ts src/products/product-tool.defs.spec.ts && git -C $B commit -q -m "test(products): действие keys, отправка карточки ключей, возврат стёртого (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git -C $B add src/products/product-lifecycle-tool.keys.spec.ts src/products/product-tool.defs.spec.ts && git -C $B commit -q -m "test(products): действие keys, возврат после срока (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
-Run (нода, бэк): `src/products/product-lifecycle-tool.keys.spec.ts src/products/product-actions.controller.keys.spec.ts src/products/product-tool.defs.spec.ts`.
+Run (нода, бэк): `src/products/product-lifecycle-tool.keys.spec.ts src/products/product-tool.defs.spec.ts`.
 
 - [ ] **Step 3: Инструмент** — `src/products/product-lifecycle-tool.ts`
 
@@ -4504,19 +4488,23 @@ Run (нода, бэк): `src/products/product-lifecycle-tool.keys.spec.ts src/pr
 4. После `resolveDeleted`:
 
 ```ts
-  /** Удалённые, которые уже не вернуть: стёрты или срок возврата вышел. */
-  private async resolveGone(userId: string, query: string): Promise<DeletedProduct[]> {
+  /** Удалённые, которые уже не вернуть: стёрты (purged) или срок возврата вышел, а машина ещё не стёрла. */
+  private async resolveGone(userId: string, query: string): Promise<Array<DeletedProduct & { purged: boolean }>> {
     const raw = String(query ?? '').trim().toLowerCase();
     if (!raw) return [];
     const like = `%${raw.replace(/([\\%_])/g, '\\$1')}%`;
     const r = await this.pg.query(
-      `SELECT id, name, slug, kind, purge_after FROM products
+      `SELECT id, name, slug, kind, purge_after, purged_at FROM products
         WHERE user_id = $1 AND archived_at IS NOT NULL AND (purged_at IS NOT NULL OR purge_after <= now())
           AND (id::text = $2 OR lower(slug) = $2 OR lower(name) LIKE $3)
         ORDER BY archived_at DESC LIMIT 1`,
       [userId, raw, like],
     );
-    return r.rows.map((x: any) => ({ ...x, purge_after: x.purge_after ? new Date(x.purge_after).toISOString() : null }));
+    return r.rows.map((x: any) => ({
+      id: x.id, name: x.name, slug: x.slug, kind: x.kind,
+      purge_after: x.purge_after ? new Date(x.purge_after).toISOString() : null,
+      purged: x.purged_at !== null && x.purged_at !== undefined,
+    }));
   }
 ```
 5. В `restore` первой строкой ветки `if (!matches.length) {`:
@@ -4524,9 +4512,14 @@ Run (нода, бэк): `src/products/product-lifecycle-tool.keys.spec.ts src/pr
 ```ts
       const gone = await this.resolveGone(userId, String(input?.product ?? ''));
       if (gone.length) {
+        const g = gone[0];
+        // «Уже стёрт» — только когда машина правда стёрла (purged_at). Срок
+        // вышел, а стирание ещё в очереди — честное «стирается».
         return {
-          ok: false, reason: 'purged', product: gone[0],
-          say: `«${gone[0].name}» уже стёрт: срок возврата (${DELETE_GRACE_DAYS} дней) вышел, вернуть его нельзя. Можно завести новый продукт.`,
+          ok: false, reason: g.purged ? 'purged' : 'expiring', product: g,
+          say: g.purged
+            ? `«${g.name}» уже стёрт: срок возврата (${DELETE_GRACE_DAYS} дней) вышел, вернуть его нельзя. Можно завести новый продукт.`
+            : `Срок возврата «${g.name}» (${DELETE_GRACE_DAYS} дней) вышел — продукт стирается, вернуть его нельзя. Можно завести новый продукт.`,
         };
       }
 ```
@@ -4546,6 +4539,7 @@ Run (нода, бэк): `src/products/product-lifecycle-tool.keys.spec.ts src/pr
 ```
 (скобки и отступы — по месту, тернарная цепочка продолжается).
 
+
 - [ ] **Step 4: Разводка и описание** — `src/products/product-tool.service.ts`
 
 1. В `execute` условие `if (action === 'delete' || action === 'revert') {` → `if (action === 'delete' || action === 'revert' || action === 'keys') {`, и после строки `if (action === 'delete') return this.lifecycleTool.delete(userId, product, channel, turn);`:
@@ -4561,7 +4555,7 @@ Run (нода, бэк): `src/products/product-lifecycle-tool.keys.spec.ts src/pr
       '• action="keys" — сменить, убрать или добавить ключи продукта (токен бота, ключи сервисов): product. Сервер прикрепит к ответу защищённую карточку с ИМЕНАМИ текущих ключей; значения вводит только пользователь, продукт перезапустится с новыми ключами. ' +
       'Спящему и остановленному продукту ключи не меняются. Не говори «ключи обновлены», пока status с actionId не вернёт done.\n' +
 ```
-и в `restore` дописать: `После стирания (через 30 дней) вернуть нельзя — ответ reason="purged".`
+и в `restore` дописать: `Через 30 дней удалённый стирается насовсем и не возвращается — ответ reason="purged" (стёрт) или "expiring" (срок вышел, стирается).`
 
 3. Абзац «КЛЮЧИ, ТОКЕНЫ И ПАРОЛИ…» целиком:
 
@@ -4572,7 +4566,67 @@ Run (нода, бэк): `src/products/product-lifecycle-tool.keys.spec.ts src/pr
 ```
 4. В схеме: `action.enum` — добавить `'keys'`; описание `product` — `'… Для edit, delete, restore, revert, keys обязательно.'`.
 
-- [ ] **Step 5: Ручка отправки** — `src/products/product-actions.controller.ts`
+
+- [ ] **Step 5: Коммит, прогон — PASS**
+
+```bash
+git -C $B add src/products && git -C $B commit -q -m "products: действие keys инструмента; возврат после срока — «уже стёрт» или «стирается»" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/products/product-lifecycle-tool.keys.spec.ts src/products/product-tool.defs.spec.ts src/products/product-lifecycle-tool.spec.ts src/products/product-tool.spec.ts src/mcp`. Expected: PASS. Затем tsc бэка. (`ProductKeysService` в модуле ещё не зарегистрирован — до задачи 15b инструмент в живом приложении отвечает «Смена ключей сейчас недоступна»; тесты собирают инструмент сами.)
+
+---
+
+### Task 15b: Сервер — отправка карточки ключей и регистрация в модуле
+
+**Files:**
+- Modify: `src/products/product-actions.controller.ts` (DTO, конструктор, ветка `keys`)
+- Modify: `src/products/products.module.ts` (`ProductKeysService`, `ProductPurgeService`)
+- Modify: `src/products/products.routes.spec.ts` (сторож регистрации)
+- Test: `src/products/product-actions.controller.keys.spec.ts` (новый)
+
+- [ ] **Step 1: Тесты**
+
+`src/products/product-actions.controller.keys.spec.ts`:
+
+```ts
+import { ProductActionsController } from './product-actions.controller';
+
+const ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+
+describe('отправка карточки ключей', () => {
+  it('set и remove уходят в сервис ключей; ответ — вид без значений', async () => {
+    const row = { id: ID, user_id: 'u1', product_id: 'p1', kind: 'keys', status: 'pending', channel: 'web', confirmed_via: null,
+      payload: { keyNames: ['A'] }, result: null, created_at: new Date(), expires_at: new Date(Date.now() + 60_000),
+      resolved_at: null, tg_chat_id: null, tg_message_id: null, product_name: 'Бот' };
+    const actions = { get: jest.fn(async () => row) };
+    const keys = { complete: jest.fn(async () => ({ ok: true, queued: true })) };
+    const limiter = { check: jest.fn(async () => undefined) };
+    const ctrl = new ProductActionsController(actions as any, {} as any, limiter as any, keys as any);
+    const out = await ctrl.submit({ userId: 'u1' }, ID, { set: { B: 'секрет-значение' }, remove: ['A'], via: 'chat' } as any);
+    expect(keys.complete).toHaveBeenCalledWith({ userId: 'u1', actionId: ID, set: { B: 'секрет-значение' }, remove: ['A'], via: 'chat' });
+    expect(JSON.stringify(out)).not.toContain('секрет-значение');
+  });
+});
+```
+Сторож регистрации — в `src/products/products.routes.spec.ts` (там уже импортированы `MODULE_METADATA` и `ProductsModule`, см. тест «все три контроллера объявлены в ProductsModule» ~194): импорты `import { ProductKeysService } from './product-keys.service';` и `import { ProductPurgeService } from './product-purge.service';`, и тест рядом:
+
+```ts
+  it('смена ключей и обход стирания зарегистрированы в ProductsModule', () => {
+    // @Optional-зависимость инструмента и контроллера без регистрации молча
+    // пуста: тесты зелёные, а ассистент отвечает «смена ключей недоступна».
+    const providers = Reflect.getMetadata(MODULE_METADATA.PROVIDERS, ProductsModule) ?? [];
+    expect(providers).toEqual(expect.arrayContaining([ProductKeysService, ProductPurgeService]));
+  });
+```
+
+- [ ] **Step 2: Коммит, прогон — FAIL**
+
+```bash
+git -C $B add src/products/product-actions.controller.keys.spec.ts src/products/products.routes.spec.ts && git -C $B commit -q -m "test(products): отправка карточки ключей и регистрация (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/products/product-actions.controller.keys.spec.ts src/products/products.routes.spec.ts`.
+
+- [ ] **Step 3: Ручка отправки** — `src/products/product-actions.controller.ts`
 
 1. Импорты: `IsArray, IsString` из `class-validator`; `Optional` из `@nestjs/common`; `import { ProductKeysService } from './product-keys.service';`.
 2. В `SubmitActionDto`:
@@ -4590,7 +4644,8 @@ Run (нода, бэк): `src/products/product-lifecycle-tool.keys.spec.ts src/pr
 ```
 В докблок класса: «Ключи (`keys`) — `{set, remove}`: значения уходят в ProductKeysService и дальше только в коробку карточки; ответ — `toView`, в котором значений нет по построению».
 
-- [ ] **Step 6: Регистрация** — `src/products/products.module.ts`
+
+- [ ] **Step 4: Регистрация** — `src/products/products.module.ts`
 
 Импорты `ProductKeysService`, `ProductPurgeService`; в `providers` после `ProductLifecycleTool,`:
 
@@ -4602,24 +4657,13 @@ Run (нода, бэк): `src/products/product-lifecycle-tool.keys.spec.ts src/pr
     ProductKeysService,
     ProductPurgeService,
 ```
-Сторож регистрации — в `src/products/products.routes.spec.ts` (там уже импортированы `MODULE_METADATA` и `ProductsModule`, см. тест «все три контроллера объявлены в ProductsModule» ~194): импорты `import { ProductKeysService } from './product-keys.service';` и `import { ProductPurgeService } from './product-purge.service';`, и тест рядом:
 
-```ts
-  it('смена ключей и обход стирания зарегистрированы в ProductsModule', () => {
-    // @Optional-зависимость инструмента и контроллера без регистрации молча
-    // пуста: тесты зелёные, а ассистент отвечает «смена ключей недоступна».
-    const providers = Reflect.getMetadata(MODULE_METADATA.PROVIDERS, ProductsModule) ?? [];
-    expect(providers).toEqual(expect.arrayContaining([ProductKeysService, ProductPurgeService]));
-  });
-```
-Этот тест краснеет до правки модуля — прогнать его вместе с остальными на шаге 7.
-
-- [ ] **Step 7: Коммит, прогон — PASS**
+- [ ] **Step 5: Коммит, прогон — PASS**
 
 ```bash
-git -C $B add src/products && git -C $B commit -q -m "products: действие keys инструмента и отправка карточки ключей; «продукт уже стёрт»; регистрация" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git -C $B add src/products && git -C $B commit -q -m "products: отправка карточки ключей; ProductKeysService и ProductPurgeService в модуле" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
-Run (нода, бэк): `src/products/product-lifecycle-tool.keys.spec.ts src/products/product-actions.controller.keys.spec.ts src/products/product-tool.defs.spec.ts src/products/product-lifecycle-tool.spec.ts src/products/product-tool.spec.ts src/products/product-actions.controller.spec.ts src/products/products.routes.spec.ts src/mcp`. Expected: PASS. Затем tsc бэка.
+Run (нода, бэк): `src/products/product-actions.controller.keys.spec.ts src/products/products.routes.spec.ts src/products/product-actions.controller.spec.ts src/products/product-lifecycle-tool.keys.spec.ts`. Expected: PASS. Затем tsc бэка и `npm run build >/dev/null && ls dist/main.js` (модуль поднимается только в сборке — DI-ошибка регистрации видна при старте, а не в jest).
 
 ---
 
