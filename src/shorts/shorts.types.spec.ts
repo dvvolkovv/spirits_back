@@ -1,5 +1,6 @@
 import {
   ALLOWED_TRANSITIONS,
+  IN_WORK_STATUSES,
   MAX_OWNER_NOTE_CHARS,
   ShortStatus,
   appendOwnerNote,
@@ -31,6 +32,20 @@ describe('машина состояний роликов', () => {
     expect(canTransition('rendering', 'writing')).toBe(true);
     expect(canTransition('writing', 'directing')).toBe(true);
   });
+
+  it('оживление: сценарист → очередь → задание → сборка; повтор задания и сбой', () => {
+    expect(canTransition('writing', 'animate_queued')).toBe(true);
+    expect(ALLOWED_TRANSITIONS.animate_queued).toEqual(['animating']);
+    expect([...ALLOWED_TRANSITIONS.animating].sort()).toEqual(['animate_queued', 'failed', 'render_queued']);
+    expect(canTransition('failed', 'animate_queued')).toBe(true);
+    // На сборку — только из writing (chat) и из оживления (skit); мимо оживления skit не пройдёт по коду сценариста.
+    expect(STATUSES.filter((s) => canTransition(s, 'render_queued')).sort()).toEqual(['animating', 'failed', 'rendering', 'writing']);
+  });
+
+  it('ролик на оживлении — в работе: держит слот и считается в предел', () => {
+    expect(IN_WORK_STATUSES).toContain('animate_queued');
+    expect(IN_WORK_STATUSES).toContain('animating');
+  });
 });
 
 describe('retryTarget', () => {
@@ -41,6 +56,7 @@ describe('retryTarget', () => {
     expect(retryTarget(failed('directing'))).toBe('directing');
     expect(retryTarget(failed('capturing'))).toBe('capture_queued');
     expect(retryTarget(failed('writing'))).toBe('writing');
+    expect(retryTarget(failed('animating'))).toBe('animate_queued');
     expect(retryTarget(failed('rendering'))).toBe('render_queued');
   });
 
@@ -55,7 +71,7 @@ describe('retryTarget', () => {
   });
 
   it('повтор всегда ведёт по разрешённому переходу', () => {
-    const failedFroms: ShortStatus[] = ['directing', 'capturing', 'writing', 'rendering', 'publishing'];
+    const failedFroms: ShortStatus[] = ['directing', 'capturing', 'writing', 'animating', 'rendering', 'publishing'];
     for (const failedFrom of failedFroms) {
       const target = retryTarget(failed(failedFrom, new Date()));
       expect(target).not.toBeNull();
@@ -83,6 +99,13 @@ describe('rowToShort', () => {
     expect(v.writerRounds).toBe(0);
     expect(v.angleLocked).toBe(true);
     expect(v.scene).toBeNull();
+    expect(v.animation).toBeNull();
+  });
+
+  it('формат: skit — только явно; без поля — chat, как в плане 2', () => {
+    expect(rowToShort({ format: 'skit' }).format).toBe('skit');
+    expect(rowToShort({ format: 'chat' }).format).toBe('chat');
+    expect(rowToShort({}).format).toBe('chat');
   });
 });
 
