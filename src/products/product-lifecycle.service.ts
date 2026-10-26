@@ -302,11 +302,19 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     let r: any;
     try {
       r = await this.pg.query(
-        `UPDATE products
+        // prevStatus — статус ДО архивации, а не текущий ('archived'),
+        // который эта же команда ставит ниже: без него возврат не отличил бы
+        // «спал за неуплату» от «вернуть туда, где и было сломано» (M3) —
+        // продукту, удалённому в failed, пополнение баланса не поможет, и
+        // sleeping со sleep_reason «нет токенов» было бы неправдой владельцу.
+        // old — отдельным CTE с FOR UPDATE, а не чтением уже обновлённой
+        // строки: RETURNING видит только ПОСЛЕ своего же SET.
+        `WITH old AS (SELECT status FROM products WHERE id = $1 AND user_id = $2 FOR UPDATE)
+         UPDATE products
             SET archived_at = now(), purge_after = now() + make_interval(days => $3),
                 status = 'archived', first_prompt = NULL, first_prompt_channel = NULL
           WHERE id = $1 AND user_id = $2 AND archived_at IS NULL AND status <> 'provisioning'
-          RETURNING purge_after`,
+          RETURNING purge_after, (SELECT status FROM old) AS prev_status`,
         [row.product_id, i.userId, DELETE_GRACE_DAYS],
       );
     } catch (e: any) {
@@ -354,7 +362,7 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       this.logger.warn(`completeDelete ${row.id}: снятие заданий или постановка сна не прошли — доделает тик: ${e?.stack ?? e?.message ?? e}`);
     }
     const restoreUntil = new Date(r.rows[0].purge_after).toISOString();
-    await this.actions.finish(row.id, 'done', { restoreUntil });
+    await this.actions.finish(row.id, 'done', { restoreUntil, prevStatus: r.rows[0].prev_status ?? null });
     return { ok: true, restoreUntil };
   }
 
@@ -428,7 +436,7 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
   }
 
   async restore(i: { userId: string; productId: string; channel: ActionChannel }):
-    Promise<{ ok: true; status: 'sleeping' | 'blocked'; waking: boolean } | LifecycleFail> {
+    Promise<{ ok: true; status: 'sleeping' | 'blocked' | 'failed'; waking: boolean } | LifecycleFail> {
     const cur = await this.pg.query(
       `SELECT p.id, p.name, p.purge_after, p.block_reason,
               EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.product_id = p.id AND j.status = 'running') AS busy
@@ -453,16 +461,28 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
         WHERE product_id = $1 AND status = 'queued'`,
       [p.id],
     );
+    // M3: статус ДО удаления — из последнего завершённого действия delete по
+    // этому продукту (completeDelete кладёт его туда же, куда и restoreUntil).
+    // Продукт, удалённый сломанным (failed), вернувшись sleeping, молча
+    // начал бы списывать аренду за контейнер, который никогда не работал, —
+    // пополнение баланса его не починит.
+    const prevR = await this.pg.query(
+      `SELECT result->>'prevStatus' AS prev_status FROM product_actions
+        WHERE product_id = $1 AND kind = 'delete' AND status = 'done'
+        ORDER BY created_at DESC LIMIT 1`,
+      [p.id],
+    );
+    const prevStatus: string | null = prevR.rows[0]?.prev_status ?? null;
     let r: any;
     try {
       r = await this.pg.query(
         `UPDATE products
             SET archived_at = NULL, purge_after = NULL,
-                status = CASE WHEN block_reason IS NOT NULL THEN 'blocked' ELSE 'sleeping' END,
-                sleep_reason = CASE WHEN block_reason IS NULL AND paid_until <= now() THEN $3 ELSE sleep_reason END
+                status = CASE WHEN block_reason IS NOT NULL THEN 'blocked' WHEN $4 = 'failed' THEN 'failed' ELSE 'sleeping' END,
+                sleep_reason = CASE WHEN block_reason IS NULL AND $4 IS DISTINCT FROM 'failed' AND paid_until <= now() THEN $3 ELSE sleep_reason END
           WHERE id = $1 AND user_id = $2 AND archived_at IS NOT NULL AND purged_at IS NULL AND purge_after > now()
           RETURNING status, paid_until > now() AS paid`,
-        [p.id, i.userId, SLEEP_REASON_NO_TOKENS],
+        [p.id, i.userId, SLEEP_REASON_NO_TOKENS, prevStatus],
       );
     } catch (e: any) {
       // Токен бота этого (ещё архивного) продукта мог за время архива

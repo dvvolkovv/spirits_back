@@ -66,6 +66,15 @@ describe('новые действия инструмента', () => {
     expect(h.lifecycle.restore).toHaveBeenCalledWith({ userId: 'u1', productId: 'p9', channel: 'web' });
   });
 
+  it('restore — продукт был сломан (failed) до удаления: не обещать пополнение, не называть «спит»', async () => {
+    const h = harness();
+    h.lifecycle.restore.mockResolvedValue({ ok: true, status: 'failed', waking: false } as any);
+    const r = await h.svc.execute('u1', { action: 'restore', product: 'старый' });
+    expect(r).toMatchObject({ ok: true, restored: { status: 'failed', waking: false } });
+    expect(r.say).not.toMatch(/пополнить баланс/);
+    expect(r.say).toMatch(/не работал|сломан|поломк/);
+  });
+
   it('revert — исход отката, как у правки, плюс пометка «это был откат»', async () => {
     const h = harness();
     const r = await h.svc.execute('u1', { action: 'revert', product: 'магазин' }, 'web');

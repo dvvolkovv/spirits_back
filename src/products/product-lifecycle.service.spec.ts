@@ -234,7 +234,7 @@ describe('удаление', () => {
     const warn = jest.spyOn((h.svc as any).logger, 'warn').mockImplementation(() => undefined);
     const r = await h.svc.completeDelete({ userId: 'u1', actionId: ACT, via: 'chat' });
     expect(r).toEqual({ ok: true, restoreUntil: until.toISOString() });
-    expect(h.actions.finish).toHaveBeenCalledWith(ACT, 'done', { restoreUntil: until.toISOString() });
+    expect(h.actions.finish).toHaveBeenCalledWith(ACT, 'done', { restoreUntil: until.toISOString(), prevStatus: null });
     expect(warn).toHaveBeenCalled();
   });
 });
