@@ -86,7 +86,7 @@ tsc фронта: `npx tsc -p tsconfig.app.json --noEmit 2>&1 | grep -c 'error T
 3. **Связь «задание — карточка» — колонка `product_provision_jobs.action_id`** (миграция 010, обязательная: её читает каждая выдача задания). Новый набор ключей лежит в `product_actions.secrets_box` тем же `SecretsService` и с тем же AAD (id продукта), поэтому при успехе переносится в `products.secrets_encrypted` как есть, без перешифровки; пустой набор — `NULL`, как у заведения.
 4. **Агент получает полный новый набор ключей владельца и список снимаемых имён (`dropNames`).** Из окружения контейнера уходят ровно `dropNames` и имена нового набора, приходят новые значения. Переменные, о которых сервер не знает (заведённые руками у старых продуктов), и переменные платформы не трогаются.
 5. **Образ для пересоздания — тот же, но запуск по метке.** Агент запускает новый контейнер по `.Config.Image` (метке), если она по-прежнему указывает на образ контейнера; если метку передвинули (контейнер пропущен прошлым обновлением образа) — по метке `linkeon-product:src-*` того же образа; такой нет — отказ до изменений. Запуск по голому идентификатору выбросил бы контейнер из отбора `scripts/product-image-roll.sh` навсегда (отбор идёт по `.Config.Image` с префиксом `linkeon-product:`).
-6. **Здоровье после `rekey`.** Сайт — тот же `waitPort`, что у заведения и пробуждения (200 и непустой `sha` с опубликованного порта). Бот порта не публикует — его `/health` спрашивается изнутри контейнера: `docker exec <слаг> node -e …` и `"ok":true`, как в спеке.
+6. **Здоровье после `rekey` — правилом раннера, а не `"ok":true` спеки.** `/health` спрашивается изнутри контейнера (`docker exec <слаг> node -e …`) по правилу `checkHealth` раннера (`product-runner/src/deploy.ts:15-55`): 2xx, не HTML ни по заголовку, ни по телу, JSON с непустым `sha`. Одно правило для сайта и бота; сайту сверх того — тот же `waitPort`, что у заведения и пробуждения: опубликованный порт тоже обязан ответить.
 7. **Прерванная смена ключей — ручной разбор.** Если на машине остался контейнер `<слаг>__rekey` (агент умер посреди прошлой смены), `rekey` отказывает до изменений: по одному состоянию хоста нельзя понять, какой контейнер несёт подтверждённые ключи.
 8. **Правки и смена ключей не пересекаются с обеих сторон.** Пока у продукта есть правка `queued/running`, отправка карточки возвращает её в `pending` с ошибкой («идёт правка — отправьте, когда закончится»), а выдача `rekey` агенту требует отсутствия активных правок; пока `rekey` в очереди или идёт — `turns.enqueue` отвечает 409.
 9. **`OWNER_TG_ID` получает и бот при смене ключей**, если Telegram владельца привязан, — так он доезжает до ботов, заведённых до очереди 2. Ищется отдельным чтением `tg_user_identities` после выдачи задания и лучшим усилием (таблица чужого модуля; отказ чтения не ломает выдачу). Сайтам `OWNER_TG_ID` не передаётся.
@@ -206,8 +206,8 @@ ssh dv@85.192.61.231 "cd ~/ci/wt/pl2-front && source ~/.nvm/nvm.sh >/dev/null &&
 **Files:**
 - Create: `src/products/migrations/010_rekey_purge.sql`
 - Modify: `src/products/migrations/004_rent.sql:85-90` (словарь `product_provision_jobs_kind_check`)
-- Modify: `src/products/products.service.ts:66-85` (`MIGRATIONS`), `:147-151` (`FATAL_MIGRATIONS`) и докблок над `MIGRATIONS`
-- Modify: `src/products/products.migration.spec.ts:380-382` (литеральный список), `:649-650` (словарь видов)
+- Modify: `src/products/products.service.ts:76-86` (`MIGRATIONS`), `:147-151` (`FATAL_MIGRATIONS`) и докблок над `MIGRATIONS` (~60–74)
+- Modify: `src/products/products.migration.spec.ts:51-73` (сценарий «не падает от НЕобязательной» — 010 станет обязательной), `:380-382` (литеральный список), `:649-650` (словарь видов)
 - Test: `src/products/rekey-purge.migration.spec.ts` (новый)
 
 - [ ] **Step 1: Тесты**
@@ -380,6 +380,15 @@ END $$;
 ```
 
 `src/products/products.migration.spec.ts`:
+- в сценарии «не падает, если применение НЕобязательной миграции бросает ошибку» (~51–73) мок бросает `boom` на ВСЁ, кроме маркеров 006 и 008; с 010 в `FATAL_MIGRATIONS` старт упал бы от обязательной миграции, и сценарий проверял бы не то. После строки `if (String(sql).includes('CREATE TABLE IF NOT EXISTS product_domains')) return { rows: [] };` добавить:
+
+```ts
+        // 010 — тоже обязательная (очередь 2: её колонку читает каждая
+        // выдача задания), поэтому исправна здесь по той же причине. Маркер —
+        // замок в первой строке файла.
+        if (String(sql).includes("hashtext('products/010_rekey_purge')")) return { rows: [] };
+```
+  а в комментарий над моком к «006 и 008» дописать «и 010»;
 - в литеральном списке после `'009_product_actions.sql',` добавить `'010_rekey_purge.sql',`;
 - ожидание словаря `.toEqual(['domain', 'provision', 'sleep', 'wake'])` заменить на `.toEqual(['domain', 'provision', 'purge', 'rekey', 'sleep', 'wake'])` и в комментарий теста дописать: «'rekey' и 'purge' — очередь 2 (010), по той же причине объявлены здесь же».
 
@@ -803,10 +812,15 @@ Run (нода, агент): `src/host/fake-host.spec.ts`.
       env: Record<string, string>;
       /** Чем контейнер запущен — метка или идентификатор, как было в argv (`.Config.Image`). */
       image: string;
-      /** Идентификатор образа, на который метка указывала В МОМЕНТ запуска (`.Image`). */
-      imageId: string;
+      /**
+       * Идентификатор образа, на который метка указывала В МОМЕНТ запуска
+       * (`.Image`). Необязательные (и restart тоже): спеки заведения кладут
+       * контейнер в карту руками (`provision.spec.ts` ~323, ~336) без этих
+       * полей; inspectWhole подставляет умолчания.
+       */
+      imageId?: string;
       cmd: string[];
-      restart: string;
+      restart?: string;
       memory?: string;
       cpus?: string;
     }
@@ -912,19 +926,19 @@ Run (нода, агент): `src/host/fake-host.spec.ts`.
   private inspectWhole(name: string): any {
     const c = this.containers.get(name)!;
     const own = new Set(Object.keys(c.env));
-    const imageEnv = (this.images.get(c.imageId)?.env ?? []).filter((e) => !own.has(e.slice(0, e.indexOf('='))));
+    const imageEnv = (this.images.get(c.imageId ?? this.resolveImage(c.image))?.env ?? []).filter((e) => !own.has(e.slice(0, e.indexOf('='))));
     const [hostIp, hostPort, containerPort] = c.publish ? c.publish.split(':') : [];
     const [source, destination] = c.mount ? c.mount.split(':') : [];
     return {
       Name: `/${name}`,
-      Image: c.imageId,
+      Image: c.imageId ?? this.resolveImage(c.image),
       Config: { Image: c.image, Env: [...imageEnv, ...Object.entries(c.env).map(([k, v]) => `${k}=${v}`)] },
       State: { Running: !this.stopped.has(name), Status: this.stopped.has(name) ? 'exited' : 'running' },
       HostConfig: {
         PortBindings: c.publish ? { [`${containerPort}/tcp`]: [{ HostIp: hostIp, HostPort: hostPort }] } : {},
         Memory: memoryBytes(c.memory),
         NanoCpus: c.cpus ? Math.round(Number(c.cpus) * 1e9) : 0,
-        RestartPolicy: { Name: c.restart },
+        RestartPolicy: { Name: c.restart ?? '' },
         NetworkMode: 'bridge',
         Privileged: false,
       },
@@ -1156,6 +1170,33 @@ describe('смена ключей: откат и отказы', () => {
     await expect(rekeyProduct(botJob({ slug: '../x' }), deps(host))).rejects.toThrow(/слаг/);
     expect(host.calls).toHaveLength(0);
   });
+
+  it('OWNER_TG_ID пустой строкой — владелец отвязал Telegram: переменная снимается', async () => {
+    await seedBot();
+    host.containers.get('bot1')!.env.OWNER_TG_ID = '42';
+    await rekeyProduct(botJob({ ownerTgId: '' }), deps(host, { waitPortTimeoutMs: 0 }));
+    expect('OWNER_TG_ID' in host.containers.get('bot1')!.env).toBe(false);
+  });
+
+  it('OWNER_TG_ID не пришёл вовсе — переменная остаётся как была', async () => {
+    await seedBot();
+    host.containers.get('bot1')!.env.OWNER_TG_ID = '42';
+    await rekeyProduct(botJob(), deps(host, { waitPortTimeoutMs: 0 }));
+    expect(host.containers.get('bot1')!.env.OWNER_TG_ID).toBe('42');
+  });
+
+  it('шаг, снятый по сроку, не выносит в причину командную строку с ключами', async () => {
+    await seedBot();
+    host.before = (argv) => {
+      if (argv[1] === 'run' && argv.includes('BOT_TOKEN=секрет-срок')) {
+        throw new Error(`docker не уложился в 300 с и снят по сроку: Command failed: ${argv.join(' ')}\n`);
+      }
+    };
+    const err = await rekeyProduct(botJob({ secrets: { BOT_TOKEN: 'секрет-срок' } }), deps(host, { waitPortTimeoutMs: 0 })).catch((e) => e);
+    expect(String(err.message)).toMatch(/снят по сроку/);
+    expect(String(err.message)).not.toContain('секрет-срок');
+    expect(String(err.message)).not.toContain('ткн-раннера');
+  });
 });
 ```
 
@@ -1222,11 +1263,14 @@ Run (нода, агент): `src/host/rekey.spec.ts`.
  *
  * ## Здоровье
  *
- * Сайт — тот же `waitPort`, что у заведения и пробуждения (200 и `sha` с
- * опубликованного порта). Бот наружу ничего не публикует, его `/health`
- * слушает 127.0.0.1:3000 внутри контейнера — спрашиваем изнутри, `docker
- * exec … node -e`, и требуем `"ok":true`. Нездоров — откат: новый контейнер
- * снимается, старый получает имя обратно и поднимается.
+ * `/health` спрашивается ИЗНУТРИ контейнера (`docker exec … node -e`) — у
+ * бота порта наружу нет вовсе — и по правилу раннера (`checkHealth` в
+ * deploy.ts): 2xx, не HTML ни по заголовку, ни по телу, JSON с непустым
+ * `sha`. Одно правило на сайт и бота: «здоров» не должно значить разное в
+ * зависимости от формы продукта. Сайту сверх того — `waitPort`, как при
+ * заведении и пробуждении: опубликованный порт обязан ответить тоже, иначе
+ * домен смотрел бы в пустоту. Нездоров — откат: новый контейнер снимается,
+ * старый получает имя обратно и поднимается.
  *
  * ## Чего здесь нет
  *
@@ -1255,10 +1299,17 @@ export const REKEY_BACKUP_SUFFIX = '__rekey';
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const STABLE_TAG_RE = /^linkeon-product:src-[0-9a-f]{12}$/;
 
-/** /health изнутри контейнера бота: выход 0 только при `"ok":true`. */
+/**
+ * /health изнутри контейнера — правило checkHealth раннера (deploy.ts):
+ * 2xx, не text/html, в теле нет HTML, JSON с непустым sha. Выход 0 — здоров.
+ * Без регэкспов с обратными слэшами: строка уходит в argv как есть.
+ */
 const HEALTH_INSIDE =
-  `fetch('http://127.0.0.1:${CONTAINER_PORT}/health',{signal:AbortSignal.timeout(2000)})` +
-  '.then((r)=>r.json()).then((b)=>process.exit(b&&b.ok===true?0:1),()=>process.exit(1))';
+  `fetch('http://127.0.0.1:${CONTAINER_PORT}/health',{redirect:'manual',signal:AbortSignal.timeout(2000)})` +
+  ".then(async(r)=>{const ct=(r.headers.get('content-type')||'').toLowerCase();const b=await r.text();" +
+  "let sha;try{sha=JSON.parse(b).sha}catch(e){}" +
+  "const html=ct.includes('text/html')||/<!doctype html|<html/i.test(b);" +
+  "process.exit(r.status>=200&&r.status<300&&!html&&typeof sha==='string'&&sha.length>0?0:1)},()=>process.exit(1))";
 
 /** Ожидание /health изнутри — по умолчанию для ProvisionDeps.waitInside. */
 export function waitInsideVia(deps: ProvisionDeps): (slug: string, timeoutMs: number) => Promise<boolean> {
@@ -1284,9 +1335,13 @@ export function waitInsideVia(deps: ProvisionDeps): (slug: string, timeoutMs: nu
  */
 function reasonOf(e: any): string {
   const m = String(e?.message ?? e ?? '').trim();
-  if (!m.startsWith('Command failed:')) return m.slice(0, 300) || 'без причины';
-  const nl = m.indexOf('\n');
-  return (nl >= 0 ? m.slice(nl + 1).trim() : '').slice(0, 300) || 'без причины';
+  // Не только в начале: снятый по сроку шаг приходит как «docker не
+  // уложился в N с и снят по сроку: Command failed: <argv>…» (hostDeps.run).
+  const at = m.indexOf('Command failed:');
+  if (at < 0) return m.slice(0, 300) || 'без причины';
+  const rest = m.slice(at);
+  const nl = rest.indexOf('\n');
+  return `${m.slice(0, at)}${nl >= 0 ? rest.slice(nl + 1) : ''}`.trim().slice(0, 300) || 'без причины';
 }
 
 async function inspectJson(deps: ProvisionDeps, argv: string[]): Promise<any> {
@@ -1408,12 +1463,17 @@ async function capture(job: RekeyJob, deps: ProvisionDeps): Promise<Captured> {
 }
 
 /** Окружение нового контейнера: свои переменные без заменяемых имён + новый набор. */
+/**
+ * Окружение нового контейнера. ownerTgId: строка цифр — поставить
+ * OWNER_TG_ID; пустая строка — снять (владелец отвязал Telegram); undefined —
+ * не трогать (сервер не знает: старый сервер или отказ чтения привязки).
+ */
 export function rekeyEnv(ownEnv: string[], secrets: Array<[string, string]>, dropNames: string[], ownerTgId?: string): string[] {
   const replaced = new Set<string>([...dropNames, ...secrets.map(([k]) => k)]);
   if (ownerTgId !== undefined) replaced.add('OWNER_TG_ID');
   const kept = ownEnv.filter((e) => !replaced.has(envName(e)));
   const added = secrets.map(([k, v]) => `${k}=${v}`);
-  return ownerTgId !== undefined ? [...kept, ...added, `OWNER_TG_ID=${ownerTgId}`] : [...kept, ...added];
+  return ownerTgId ? [...kept, ...added, `OWNER_TG_ID=${ownerTgId}`] : [...kept, ...added];
 }
 
 function runArgv(slug: string, cap: Captured, env: string[]): string[] {
@@ -1460,7 +1520,9 @@ export async function rekeyProduct(job: RekeyJob, deps: ProvisionDeps): Promise<
     throw new Error('в новом наборе нет BOT_TOKEN — бот остался бы без токена, ничего не тронуто');
   }
   const dropNames = validateDropNames(job.dropNames);
-  const ownerTgId = ownerTgIdFor(job);
+  // Пустая строка у бота — «снять OWNER_TG_ID» (см. rekeyEnv); иначе — та же
+  // проверка формы, что при заведении.
+  const ownerTgId = job.kind === 'bot' && job.ownerTgId === '' ? '' : ownerTgIdFor(job);
   const backup = `${job.slug}${REKEY_BACKUP_SUFFIX}`;
   if (await containerTaken(deps, backup)) {
     throw new Error(`на хосте остался ${backup} от прерванной смены ключей — сверить руками, ничего не тронуто`);
@@ -1484,9 +1546,8 @@ export async function rekeyProduct(job: RekeyJob, deps: ProvisionDeps): Promise<
   try {
     await deps.run(argv);
     const timeoutMs = deps.waitPortTimeoutMs ?? DEFAULTS.waitPortTimeoutMs;
-    const healthy = job.kind === 'site'
-      ? await deps.waitPort(cap.port as number, timeoutMs)
-      : await (deps.waitInside ?? waitInsideVia(deps))(job.slug, timeoutMs);
+    const inside = await (deps.waitInside ?? waitInsideVia(deps))(job.slug, timeoutMs);
+    const healthy = inside && (job.kind !== 'site' || (await deps.waitPort(cap.port as number, timeoutMs)));
     if (!healthy) reason = `продукт не ответил на /health за ${Math.round(timeoutMs / 1000)} с с новыми ключами`;
   } catch (e: any) {
     reason = `docker run с новыми ключами отказал: ${reasonOf(e)}`;
@@ -3681,7 +3742,7 @@ Run (нода, бэк): `src/products/product-keys.service.spec.ts src/products/
 
 **Files:**
 - Create: `src/products/product-purge.service.ts`
-- Modify: `src/products/product-lifecycle.service.ts` (`sleepDeletedTick` ~215–228: не снимать `purge`)
+- Modify: `src/products/product-lifecycle.service.ts` (`sleepDeletedTick` ~533–544: не снимать `purge`)
 - Test: `src/products/product-purge.service.spec.ts` (новый: чистые функции пути), `src/products/product-purge.pg.spec.ts` (новый: обход и копии против живой базы и временного каталога)
 
 - [ ] **Step 1: Тесты**
