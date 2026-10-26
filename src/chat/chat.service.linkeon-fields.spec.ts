@@ -138,7 +138,13 @@ describe('streamUniversalAgent: поля инструментов Linkeon', () =
   });
 });
 
-describe('agentReply: поля инструментов Linkeon', () => {
+// Ревью 26.10.2026: linkeonTools — явное включение, по умолчанию false.
+// Голосовые фоновые пути (итоги звонка, сжатие консультации, голосовая
+// заметка и документ) и проба качества инструментов фактически не вызывают,
+// и получать от них токен ни к чему. Явно true — только там, где ассистент
+// реально может позвать инструмент: рутины, «Путь», консультация специалиста
+// в звонке (не её сжатие, voice_condense).
+describe('agentReply: поля инструментов Linkeon — только по явному включению', () => {
   const AGENT = { id: 12, name: 'Роман', display_name: 'Роман', description: '', system_prompt: '', category: 'business' };
   function replyHarness() {
     const pg = { query: jest.fn(async (sql: string) => (/FROM agents WHERE id/.test(sql) ? { rows: [AGENT] } : { rows: [] })) };
@@ -150,9 +156,25 @@ describe('agentReply: поля инструментов Linkeon', () => {
     return { svc, last };
   }
 
-  it('рутина и «Путь» (без своей сессии): токен пользователя, fs_key его сессии', async () => {
+  it('без опций (голосовые фоновые пути, проба качества) — полей нет', async () => {
     const { svc, last } = replyHarness();
-    await svc.generateAgentReply('u-routine', '12', 'утренний текст');
+    await svc.generateAgentReply('u-voice', '12', 'итоги', 'voice_summary_abc');
+    const f = last();
+    expect(f.sessionId).toBe('voice_summary_abc');
+    for (const k of ['linkeon_token', 'linkeon_mcp_url', 'fs_key']) expect(f[k]).toBeUndefined();
+  });
+
+  it('linkeonTools: false — явно, тот же эффект, что и без опций', async () => {
+    const { svc, last } = replyHarness();
+    await svc.generateAgentReply('70000000000', '12', 'проба', 'qprobe_12_1', { linkeonTools: false });
+    const f = last();
+    expect(f.sessionId).toBe('qprobe_12_1');
+    for (const k of ['linkeon_token', 'linkeon_mcp_url', 'fs_key']) expect(f[k]).toBeUndefined();
+  });
+
+  it('linkeonTools: true (рутина и «Путь», без своей сессии): токен пользователя, fs_key его сессии', async () => {
+    const { svc, last } = replyHarness();
+    await svc.generateAgentReply('u-routine', '12', 'утренний текст', undefined, { linkeonTools: true });
     const f = last();
     const sid = relaySessionKey('u-routine', '12', 'ru');
     expect(f.sessionId).toBe(sid);
@@ -160,28 +182,11 @@ describe('agentReply: поля инструментов Linkeon', () => {
     expect(f.fs_key).toBe(relayFsKey(sid));
   });
 
-  it('итоги звонка (своя сессия): fs_key — от этой сессии', async () => {
+  it('linkeonTools: true (консультация специалиста в звонке, со списанием): поля тоже есть', async () => {
     const { svc, last } = replyHarness();
-    await svc.generateAgentReply('u-voice', '12', 'итоги', 'voice_summary_abc');
-    const f = last();
-    expect(f.sessionId).toBe('voice_summary_abc');
-    expect(verifyLinkeonToolToken(f.linkeon_token)).toEqual({ userId: 'u-voice' });
-    expect(f.fs_key).toBe(relayFsKey('voice_summary_abc'));
-  });
-
-  it('голосовой документ (со списанием): поля тоже есть', async () => {
-    const { svc, last } = replyHarness();
-    await svc.generateAgentReplyWithCharge('u-voice', '12', 'документ', 'voice_doc_c1_d1');
+    await svc.generateAgentReplyWithCharge('u-voice', '12', 'вопрос', 'voice_12_1', { linkeonTools: true });
     const f = last();
     expect(verifyLinkeonToolToken(f.linkeon_token)).toEqual({ userId: 'u-voice' });
-    expect(f.fs_key).toBe(relayFsKey('voice_doc_c1_d1'));
-  });
-
-  it('linkeonTools: false (проба качества) — полей нет', async () => {
-    const { svc, last } = replyHarness();
-    await svc.generateAgentReply('70000000000', '12', 'проба', 'qprobe_12_1', { linkeonTools: false });
-    const f = last();
-    expect(f.sessionId).toBe('qprobe_12_1');
-    for (const k of ['linkeon_token', 'linkeon_mcp_url', 'fs_key']) expect(f[k]).toBeUndefined();
+    expect(f.fs_key).toBe(relayFsKey('voice_12_1'));
   });
 });

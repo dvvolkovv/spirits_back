@@ -346,4 +346,31 @@ describe('списание за консультацию', () => {
       expect.objectContaining({ type: 'specialist_answer', text: 'ответ' }),
     );
   });
+
+  // Ревью 26.10.2026: linkeonTools — явное включение (AgentReplyOpts), по
+  // умолчанию false. Консультация специалиста — путь, где ассистент реально
+  // может позвать инструмент; её сжатие (voice_condense) — нет, см. ниже.
+  it('консультация специалиста зовёт модель с { linkeonTools: true }', async () => {
+    const pg = makePg();
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'ответ', tokens: 1200, costUsd: 0.33 })) };
+    const svc = new SpecialistJobService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeLang() as any);
+
+    await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'Можно ли так?');
+    await svc.drainForTests();
+
+    expect(chat.generateAgentReplyWithCharge.mock.calls[0][4]).toEqual({ linkeonTools: true });
+  });
+
+  it('сжатие длинного ответа (voice_condense) опции не передаёт', async () => {
+    const pg = makePg();
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'коротко', tokens: 10, costUsd: 0 })) };
+    const svc = new SpecialistJobService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeLang() as any);
+
+    // SPOKEN_ANSWER_LIMIT (specialist-job.service.ts) — 1200; длиннее запускает сжатие.
+    const longAnswer = 'а'.repeat(1300);
+    await (svc as any).condense('user-1', 'Алексей', longAnswer);
+
+    expect(chat.generateAgentReplyWithCharge).toHaveBeenCalledTimes(1);
+    expect(chat.generateAgentReplyWithCharge.mock.calls[0][4]).toBeUndefined();
+  });
 });

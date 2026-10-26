@@ -23,13 +23,15 @@ describe('проба качества — без инструментов Linkeo
     }
   });
 
-  it('ответ ассистента зовётся с { linkeonTools: false } в своей qprobe-сессии', async () => {
+  // Ревью 26.10.2026: linkeonTools по умолчанию false — отдельный флаг пробе
+  // не нужен, достаточно не передавать опции вовсе.
+  it('ответ ассистента зовётся без опций (linkeonTools по умолчанию — false) в своей qprobe-сессии', async () => {
     const chat = { generateAgentReply: jest.fn(async (..._a: any[]) => 'Желаю вам хорошего дня!') };
     const synthetic = { record: jest.fn(async () => {}) };
     const svc = new QualityMonitorService({ query: jest.fn(async () => ({ rows: [] })) } as any, chat as any, synthetic as any);
     await svc.qualityProbe();
     expect(chat.generateAgentReply).toHaveBeenCalledWith(
-      '70000000000', '12', expect.any(String), expect.stringMatching(/^qprobe_12_/), { linkeonTools: false },
+      '70000000000', '12', expect.any(String), expect.stringMatching(/^qprobe_12_/),
     );
   });
 });
