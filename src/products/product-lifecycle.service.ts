@@ -277,13 +277,20 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
   async openDelete(i: { userId: string; productId: string; channel: ActionChannel; turn: string | null }):
     Promise<{ ok: true; actionId: string; expiresAt: string } | LifecycleFail> {
     const r = await this.pg.query(
-      `SELECT id, name, slug, kind, status FROM products WHERE id = $1 AND user_id = $2 AND archived_at IS NULL`,
+      `SELECT id, name, slug, kind, status, block_reason FROM products WHERE id = $1 AND user_id = $2 AND archived_at IS NULL`,
       [i.productId, i.userId],
     );
     const p = r.rows[0];
     if (!p) return { ok: false, reason: 'not_found', message: 'Такого продукта нет' };
     if (p.status === 'provisioning') {
       return { ok: false, reason: 'provisioning', message: 'Продукт ещё заводится — удалить его можно через минуту' };
+    }
+    // I4: удаление блокированного продукта освободило бы его слот в пределе
+    // (assertCanCreate считает по archived_at, не по block_reason) и дало
+    // человеку способ обойти блокировку — создать тем же именем новый
+    // продукт вместо того, который остановил администратор.
+    if (p.block_reason !== null) {
+      return { ok: false, reason: 'blocked', message: 'Продукт остановлен администратором — удалить его можно через поддержку' };
     }
     const { id, expiresAt } = await this.actions.open({
       userId: i.userId, productId: p.id, kind: 'delete', channel: i.channel, turn: i.turn,
