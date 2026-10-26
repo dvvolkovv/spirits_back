@@ -45,6 +45,14 @@ export interface AnimateDeps {
   lufs?: number;
   maxOmniSeconds?: number;
   log?(msg: string): void;
+  /**
+   * Каждое сохранение animation.json — наружу: рабочий процесс пишет его в базу,
+   * чтобы резерв секунд и id генерации пережили падение процесса. Сохранения
+   * идут по порядку, без обгонов; сбой — ошибка без повтора (задание уже не наше).
+   */
+  onSave?(anim: ShortAnimation): Promise<void>;
+  /** Новый файл папки — кадр, raw.mp4, clip.mp4 (путь относительно неё): рабочий процесс кладёт его в MinIO. */
+  onFile?(rel: string): Promise<void>;
 }
 
 /** Расширение кадра по его типу: Nano Banana Pro отдаёт JPEG. */
@@ -144,11 +152,32 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
 
   const animPath = path.join(runDir, 'animation.json');
   const anim = loadAnimation(animPath);
-  const save = (): void => {
+  // Снимок берётся в момент вызова, отправка наружу — цепочкой: две сценки
+  // сохраняются вперемешку, и запись постарше не должна лечь поверх новой.
+  let saving: Promise<void> = Promise.resolve();
+  const save = async (): Promise<void> => {
+    const text = JSON.stringify(anim, null, 2);
     try {
-      writeAtomic(animPath, JSON.stringify(anim, null, 2));
+      writeAtomic(animPath, text);
     } catch (e) {
       throw new StudioError('unknown', `animate: animation.json не записался — ${failText(e)}`, false);
+    }
+    if (!deps.onSave) return;
+    const snapshot = JSON.parse(text) as ShortAnimation;
+    saving = saving.then(() => deps.onSave!(snapshot));
+    try {
+      await saving;
+    } catch (e) {
+      throw e instanceof StudioError ? e : new StudioError('unknown', `animate: animation.json не сохранился наружу — ${failText(e)}`, false);
+    }
+  };
+  /** Файл — наружу; сетевой сбой повторяем: файл уже лежит в папке, новых денег повтор не стоит. */
+  const upload = async (rel: string): Promise<void> => {
+    if (!deps.onFile) return;
+    try {
+      await deps.onFile(rel);
+    } catch (e) {
+      throw new StudioError('unknown', `animate: ${rel} не выгрузился в хранилище — ${failText(e)}`, true);
     }
   };
   const lufs = deps.lufs ?? CLIP_LUFS;
@@ -230,8 +259,9 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
       }
       const kf = `${keyframeBase(kind)}.${KEYFRAME_EXT[img.mime] ?? 'png'}`;
       await local('кадр не записался', () => writeAtomic(abs(kf), img.data));
+      await upload(kf);
       anim.keyframes = (anim.keyframes ?? 0) + 1;
-      save();
+      await save();
       return kf;
     }
     throw new StudioError(last!.code, `${last!.message} — кадр не нарисован за ${MAX_SKIT_ATTEMPTS} попытки`, false);
@@ -299,6 +329,7 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     const totalMs = Math.round((probe.videoSec ?? probe.durationSec) * 1000);
     const pauses = await local('поиск пауз', () => detectSilences(next, probe.durationSec, PAUSE_DETECT));
     await local('клип не записался', () => fs.renameSync(next, abs(clip)));
+    await upload(clip);
     log(`animate ${kind}: готово${accepted ? ' (переобработка без Omni)' : ` с попытки ${attempt}`}, речь ${Math.round(share * 100)}%`);
     return {
       fingerprint: plan.fingerprint,
@@ -338,9 +369,11 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
         false,
       );
     }
+    // Оплаченный клип уже скачан, а id генерации остался (процесс упал между записью клипа и сохранением) — id больше не нужен.
+    if (hasRaw(kind) && hasPending(kind)) delete anim.pending![kind];
     // Запись под другой отпечаток больше не годится: сборка её и так не возьмёт.
     delete anim.skits[kind];
-    save();
+    await save();
 
     let last: StudioError | null = null;
     const codes: string[] = [];
@@ -362,11 +395,11 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
             // должны пройти предел, когда места осталось на одну.
             anim.omniSeconds += CLIP_SEC;
             reserved = true;
-            save();
+            await save();
             id = await deps.startClip(plan.videoPrompt, image);
             started = true;
             anim.pending = { ...anim.pending, [kind]: { id, fingerprint: plan.fingerprint } };
-            save();
+            await save();
           }
           let mp4: Buffer;
           try {
@@ -375,15 +408,19 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
             const err = toStudioError(e);
             if (!KEEP_PENDING.has(err.code)) {
               delete anim.pending![kind];
-              save();
+              await save();
               throw err;
             }
             // id остаётся: следующая попытка или запуск дождётся этой генерации.
             throw err.retryable ? err : new StudioError(err.code, `${err.message} (id ${id} — pending.${kind} в animation.json; удалите его, чтобы снять клип заново)`, false);
           }
           await local('клип не записался', () => writeAtomic(raw, mp4));
+          await upload(skitFile(kind, 'raw.mp4'));
           delete anim.pending![kind];
-          save();
+          await save();
+        } else {
+          // Оплаченный клип уже в папке (сбой распознавания, выгрузки, перезапуск) — он должен лежать и снаружи.
+          await upload(skitFile(kind, 'raw.mp4'));
         }
         return await finish(kind, attempt, null);
       } catch (e) {
@@ -392,7 +429,7 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
         // потерянном ответе генерация могла начаться и будет оплачена.
         if (reserved && !started && CLEAR_REFUSALS.has(err.code)) {
           anim.omniSeconds -= CLIP_SEC;
-          save();
+          await save();
         }
         last = err;
         codes.push(err.code);
@@ -405,6 +442,8 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     throw new StudioError(last!.code, `${last!.message} — после ${MAX_SKIT_ATTEMPTS} попыток (${codes.join(', ')})`, false);
   };
 
+  // Первое сохранение — до любых трат: задание, которое уже не наше (onSave отказал), не нарисует ни кадра.
+  await save();
   const todo = SKIT_KINDS.filter((k) => !reusable(k));
   if (todo.length) {
     // Кадр конфликта нужен первым: по нему рисуется развязка. Если его нет, а по
@@ -427,7 +466,9 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     const results = await Promise.allSettled(
       todo.map(async (kind) => {
         anim.skits[kind] = await animateSkit(kind);
-        save();
+        // Клип принят — запущенной генерации этой сценки больше нет, что бы ни помешало убрать id раньше.
+        if (anim.pending?.[kind]?.fingerprint === plans[kind].fingerprint) delete anim.pending[kind];
+        await save();
       }),
     );
     const failures = results
@@ -444,7 +485,7 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
       throw new StudioError(main.err.code, failures.map((f) => `${SCENE[f.kind]}: ${f.err.message}`).join('; '), main.err.retryable);
     }
   }
-  save();
+  await save();
   return anim;
 }
 
