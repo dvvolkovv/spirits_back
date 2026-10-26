@@ -95,6 +95,22 @@ describe('контейнеры', () => {
     expect(withoutA.trim()).toBe('');
   });
 
+  it('docker ps без фильтра перечисляет имена: с -a — все, без — только запущенные', async () => {
+    // Так стирание (purge.ts) ищет страховки обновления образа `<слаг>__pre_<хеш>`:
+    // хеша оно не знает, а маску отдавать docker не хочет — сверяет имена само.
+    await run('a');
+    await run('b');
+    await host.run(['docker', 'stop', 'b']);
+
+    const all = await host.run(['docker', 'ps', '-a', '--format', '{{.Names}}']);
+    const running = await host.run(['docker', 'ps', '--format', '{{.Names}}']);
+
+    expect(all.split('\n').filter(Boolean).sort()).toEqual(['a', 'b']);
+    expect(running.split('\n').filter(Boolean)).toEqual(['a']);
+    await expect(host.run(['docker', 'ps', '-a', '--format', '{{.Ports}}'])).rejects.toThrow(/\{\{\.Names\}\}/);
+    expect(await new FakeHost().run(['docker', 'ps', '-a', '--format', '{{.Names}}'])).toBe('');
+  });
+
   it('имя занято и погашенным контейнером', async () => {
     await run('a');
     await host.run(['docker', 'stop', 'a']);
@@ -412,5 +428,18 @@ describe('контейнер целиком и образы — для смен�
     host.containers.set('legacy', { mount: '', env: {}, image: 'linkeon-product:base', cmd: [] });
     const j = JSON.parse(await host.run(['docker', 'inspect', '--format', '{{json .}}', 'legacy']));
     expect(j.HostConfig.RestartPolicy).toEqual({ Name: 'no', MaximumRetryCount: 0 });
+  });
+});
+
+describe('файлы', () => {
+  it('realpath — как fs.realpath в мире без ссылок: путь нормализован, несуществующий — ENOENT', async () => {
+    // Ссылок симулятор не изображает: их проверяет purge.spec.ts на настоящей
+    // ФС. Но код ENOENT обязан быть тем же, что у fs: по нему стирание
+    // отличает «каталога уже нет» (повтор) от «путь не прочитан» (отказ).
+    await host.writeFiles('/srv/products/shop', { 'server.js': '' });
+
+    expect(await host.realpath('/srv/products/shop')).toBe('/srv/products/shop');
+    expect(await host.realpath('/srv/products/x/../shop/')).toBe('/srv/products/shop');
+    await expect(host.realpath('/srv/products/nope')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });
