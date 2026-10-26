@@ -118,6 +118,11 @@ export class TgProductActionsService {
         text = await this.textForClosedAction(id, lang, name);
       } else if (r.reason === 'gone') {
         text = tgText(lang, 'pa_gone');
+      } else if (r.reason === 'blocked') {
+        // Ревью, круг 2, пункт 7: свой текст, а не общий pa_failed —
+        // «попробуйте ещё раз позже» неправда, когда причина — блокировка
+        // администратором, повтор её не снимает, нужна поддержка.
+        text = tgText(lang, 'pa_blocked');
       } else {
         // Сырой r.message — только в лог бэкенда (его уже написал
         // completeDelete), сюда он не идёт: это русский/технический текст,

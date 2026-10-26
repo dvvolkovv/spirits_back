@@ -153,6 +153,11 @@ const ru = {
   // только в логе.
   pa_gone: 'Продукт уже удалён или ещё заводится.',
   pa_failed: 'Не получилось — попробуйте ещё раз позже.',
+  // Ревью, круг 2, пункт 7: отдельный текст, а не общий pa_failed — у
+  // completeDelete есть свой reason='blocked' (продукт остановлен
+  // администратором), и «попробуйте ещё раз позже» тут неправда — повтор не
+  // поможет, нужна поддержка.
+  pa_blocked: 'Продукт остановлен администратором — удалить его можно через поддержку.',
   pa_create_bot_prompt: 'Чтобы создать бота «{name}», введите токен от @BotFather и ключи сервисов в защищённой форме. В переписку их не присылайте.',
   pa_create_bot_btn: 'Ввести ключи',
   pa_open_cabinet_btn: 'Открыть в кабинете',
@@ -273,6 +278,7 @@ const en: Catalog = {
   pa_closed: "This confirmation is already closed.",
   pa_gone: "The product has already been deleted, or is still being set up.",
   pa_failed: "That didn't work — please try again later.",
+  pa_blocked: "The product has been stopped by an administrator — you can delete it through support.",
   pa_create_bot_prompt: "To create the bot “{name}”, enter the token from @BotFather and your service keys in the secure form. Please don't send them in the chat.",
   pa_create_bot_btn: "Enter keys",
   pa_open_cabinet_btn: "Open in your account",
@@ -390,6 +396,7 @@ const de: Catalog = {
   pa_closed: 'Diese Bestätigung ist bereits geschlossen.',
   pa_gone: 'Das Produkt ist bereits gelöscht oder wird noch eingerichtet.',
   pa_failed: 'Das hat nicht geklappt – versuch es später noch mal.',
+  pa_blocked: 'Das Produkt wurde von einem Administrator gestoppt – löschen kannst du es über den Support.',
   pa_create_bot_prompt: 'Um den Bot „{name}“ anzulegen, gib das Token von @BotFather und die Schlüssel deiner Dienste im geschützten Formular ein. Schick sie bitte nicht in den Chat.',
   pa_create_bot_btn: 'Schlüssel eingeben',
   pa_open_cabinet_btn: 'Im Konto öffnen',
@@ -524,6 +531,7 @@ const fr: Catalog = frenchTypography({
   pa_closed: 'Cette confirmation est déjà close.',
   pa_gone: 'Le produit est déjà supprimé, ou encore en cours de création.',
   pa_failed: 'Cela n’a pas marché — réessayez plus tard.',
+  pa_blocked: 'Le produit a été arrêté par un administrateur — vous pouvez le supprimer en passant par le support.',
   pa_create_bot_prompt: 'Pour créer le bot « {name} », saisissez le jeton de @BotFather et les clés de vos services dans le formulaire sécurisé. Ne les envoyez pas dans la discussion.',
   pa_create_bot_btn: 'Saisir les clés',
   pa_open_cabinet_btn: 'Ouvrir dans votre espace',
@@ -641,6 +649,7 @@ const es: Catalog = {
   pa_closed: 'Esta confirmación ya está cerrada.',
   pa_gone: 'El producto ya está eliminado o todavía se está creando.',
   pa_failed: 'No ha funcionado — inténtalo de nuevo más tarde.',
+  pa_blocked: 'El producto ha sido detenido por un administrador — puedes eliminarlo a través del soporte.',
   pa_create_bot_prompt: 'Para crear el bot «{name}», introduce el token de @BotFather y las claves de tus servicios en el formulario seguro. No las envíes por el chat.',
   pa_create_bot_btn: 'Introducir claves',
   pa_open_cabinet_btn: 'Abrir en tu cuenta',
@@ -758,6 +767,7 @@ const pt: Catalog = {
   pa_closed: 'Esta confirmação já está fechada.',
   pa_gone: 'O produto já foi eliminado ou ainda está a ser configurado.',
   pa_failed: 'Não resultou — tenta outra vez mais tarde.',
+  pa_blocked: 'O produto foi parado por um administrador — podes eliminá-lo através do suporte.',
   pa_create_bot_prompt: 'Para criar o bot «{name}», introduz o token do @BotFather e as chaves dos teus serviços no formulário seguro. Não as envies pela conversa.',
   pa_create_bot_btn: 'Introduzir chaves',
   pa_open_cabinet_btn: 'Abrir na tua conta',
@@ -875,6 +885,7 @@ const zh: Catalog = {
   pa_closed: '此确认已关闭。',
   pa_gone: '产品已被删除，或仍在创建中。',
   pa_failed: '未能完成，请稍后再试。',
+  pa_blocked: '产品已被管理员停止——如需删除，请联系客服。',
   pa_create_bot_prompt: '要创建机器人「{name}」，请在安全表单中输入 @BotFather 提供的令牌和各项服务的密钥。请不要在聊天中发送。',
   pa_create_bot_btn: '输入密钥',
   pa_open_cabinet_btn: '在个人中心打开',

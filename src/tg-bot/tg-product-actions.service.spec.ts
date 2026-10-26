@@ -145,6 +145,20 @@ describe('карточки продуктов в Telegram', () => {
     expect(text).not.toMatch(/стектрейс/);
   });
 
+  // Ревью, круг 2, пункт 7: reason='blocked' — свой текст (pa_blocked), а не
+  // общий pa_failed («попробуйте ещё раз позже» неправда для блокировки).
+  it('completeDelete reason=blocked — отдельный текст про поддержку, не общий pa_failed', async () => {
+    const h = harness({ owner: 42, profileLang: 'ru' });
+    h.lifecycle.completeDelete.mockResolvedValueOnce({
+      ok: false, reason: 'blocked',
+      message: 'Продукт остановлен администратором — удалить его можно через поддержку',
+    } as any);
+    await h.svc.handleCallback({ id: 'cb', data: `pa:ok:${ID}`, from: { id: 42 }, message: { chat: { id: 100 }, message_id: 77 } });
+    const [, , text] = h.grammy.editMessageText.mock.calls[0] as any[];
+    expect(text).toMatch(/остановлен администратором/);
+    expect(text).not.toMatch(/попробуйте ещё раз позже/);
+  });
+
   // not_pending — повторное нажатие или нажатие после того, как действие уже
   // закрылось где-то ещё: текст должен звучать по тому, чем действие стало на
   // самом деле, а не единым «подтверждение закрыто».
