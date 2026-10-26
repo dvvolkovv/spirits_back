@@ -221,6 +221,33 @@ maybe('жизненный цикл продукта против живого Po
       const jobs = await pool.query(`SELECT count(*) FROM product_provision_jobs WHERE product_id = $1 AND kind = 'sleep'`, [productId]);
       expect(Number(jobs.rows[0].count)).toBe(1);
     });
+
+    it('тик доснимает застрявшее в очереди пробуждение архивного и ставит сон; живого не трогает', async () => {
+      // Так выглядит удаление, у которого снятие чужих заданий оборвалось:
+      // продукт уже в архиве, а его wake всё ещё queued.
+      const archived = await insertProduct({
+        userId: 'u-orphan', status: 'archived', slug: 'orphan-1',
+        archivedAt: new Date(), purgeAfter: new Date(Date.now() + 30 * 86_400_000),
+      });
+      const live = await insertProduct({ userId: 'u-orphan', status: 'sleeping', slug: 'orphan-2' });
+      const stuck = await pool.query(
+        `INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'wake', 'queued') RETURNING id`,
+        [archived],
+      );
+      const liveWake = await pool.query(
+        `INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'wake', 'queued') RETURNING id`,
+        [live],
+      );
+
+      expect(await svc.sleepDeletedTick()).toBe(1);
+
+      const stuckRow = (await pool.query('SELECT status, error FROM product_provision_jobs WHERE id = $1', [stuck.rows[0].id])).rows[0];
+      expect(stuckRow).toMatchObject({ status: 'failed', error: 'снято удалением' });
+      const sleep = await pool.query(`SELECT count(*) FROM product_provision_jobs WHERE product_id = $1 AND kind = 'sleep' AND status = 'queued'`, [archived]);
+      expect(Number(sleep.rows[0].count)).toBe(1);
+      const liveRow = (await pool.query('SELECT status FROM product_provision_jobs WHERE id = $1', [liveWake.rows[0].id])).rows[0];
+      expect(liveRow.status).toBe('queued');
+    });
   });
 
   describe('возврат', () => {
