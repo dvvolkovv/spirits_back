@@ -14,7 +14,7 @@ import { AGENT_OUTDATED_MARKER } from './domain-name';
 import { HostsService } from './hosts.service';
 import { LimitsService } from './limits.service';
 import { SecretsService } from './secrets.service';
-import { FREE_MONTH_PRODUCTS } from './rent.service';
+import { FREE_MONTH_PRODUCTS, freeMonthCountedJobSql } from './rent.service';
 
 export type ProductKind = 'site' | 'bot';
 
@@ -685,17 +685,28 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     // завести» снимает с человека предел немедленно и тут же выдаёт второй
     // бесплатный месяц, третий, сколько угодно.
     //
-    // СЧИТАЮТСЯ ВСЕ СТРОКИ ЭТОГО user_id, А НЕ ТОЛЬКО ЖИВЫЕ. Удалённый
-    // (archived_at не NULL) и даже стёртый (purged_at не NULL) продукт
-    // остаётся строкой в той же таблице products — не считать их значило бы
-    // вернуть ровно ту дыру, которую чинит эта правка.
+    // СЧИТАЮТСЯ ВСЕ СТРОКИ ЭТОГО user_id, А НЕ ТОЛЬКО ЖИВЫЕ (при условии ниже
+    // про задание). Удалённый (archived_at не NULL) и даже стёртый
+    // (purged_at не NULL) продукт остаётся строкой в той же таблице products
+    // — не считать их значило бы вернуть ровно ту дыру, которую чинит эта
+    // правка.
     //
     // ВЫЧИСЛЯЕТСЯ ВНУТРИ INSERT, ОДНИМ ОПЕРАТОРОМ, А НЕ ОТДЕЛЬНЫМ SELECT
     // ПЕРЕД НИМ. Отдельный count(*) читал бы снимок, который для второго из
     // двух одновременных заведений одного человека устареет к моменту записи.
-    // ОСТАТОЧНАЯ ГОНКА ЕСТЬ: два параллельных create() одного userId оба
-    // могут увидеть count меньше FREE_MONTH_PRODUCTS и оба получить бесплатный
-    // месяц. Она не закрывается здесь и не обязана: входом в неё можно
+    // ОСТАТОЧНАЯ ГОНКА СТАЛА УЖЕ, А НЕ ШИРЕ (ревью, круг 2, пункт 2 — круг 1
+    // описывал её как «два параллельных create() одного userId», и это было
+    // верно при условии `status='done'`, но с переходом на «есть
+    // незавалившееся задание» ниже окно сузилось). ЭТОТ INSERT не видит СВОЁ
+    // СОБСТВЕННОЕ задание — оно ставится отдельным INSERT уже ПОСЛЕ него (см.
+    // код сразу после этого try/catch) — то есть окно гонки — это ровно
+    // момент между двумя РАЗНЫМИ INSERT products одного userId, у которых НИ
+    // У ОДНОГО ещё нет ни одной строки задания: только тогда оба могут
+    // увидеть одинаковый count и оба получить бесплатный месяц. Как только у
+    // первого из двух появляется queued-задание (следующая же строка кода
+    // после INSERT products), второй его уже увидит — раньше с условием
+    // `status='done'` это не помогало бы вовсе, задание требовалось ДОВЕСТИ
+    // до конца. Она не закрывается здесь и не обязана: входом в неё можно
     // воспользоваться не больше раз, чем позволяет сам предел аккаунта
     // (LimitsService.assertCanCreate, DEFAULT_MAX_PRODUCTS) — assertCanCreate
     // стоит раньше этого INSERT и бьёт собственную гонку тем же способом
@@ -707,14 +718,21 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     // всех. У LimitsService администратор исключён из предела количества
     // (другое решение, другая причина — своя машина со своим потолком), но
     // это не довод заводить второе понятие «свой» и здесь.
-    // РЕВЬЮ, ПУНКТ 11 (владелец-дружественный счёт). Считаются ТОЛЬКО
-    // продукты, у которых есть след успешного провижининга:
-    // `product_provision_jobs` со строкой `kind='provision' AND status='done'`.
-    // Это ставит completeJob() РОВНО в момент, когда агент хоста отчитался об
-    // успешном заведении (см. его докблок выше) — и эта строка остаётся с
-    // продуктом НАВСЕГДА, даже если его потом удалят (archived_at) или сотрут
-    // (purged_at): FK у product_provision_jobs — ON DELETE CASCADE, но здесь
-    // это DELETE из products не происходит, продукт только архивируется.
+    // РЕВЬЮ, ПУНКТ 11 (владелец-дружественный счёт), ПРАВКА КРУГА 2 ПУНКТ 2.
+    // Считаются продукты, у которых есть НЕ ПРОВАЛИВШЕЕСЯ задание
+    // провижининга: `product_provision_jobs` со строкой `kind='provision' AND
+    // status <> 'failed'` (см. freeMonthCountedJobSql, rent.service.ts —
+    // единый фрагмент для этого INSERT и для ProductToolService.list). Было
+    // строже — `status='done'` — и именно это было дырой: продукт, который
+    // ТОЛЬКО ЗАВОДИТСЯ (queued/running, completeJob ещё не отчитался), читался
+    // как «не считается», и человек с одним реально поднявшимся продуктом и
+    // одним заводящимся получал ТРЕТИЙ бесплатный месяц. Отчёт completeJob()
+    // об успехе (см. его докблок выше) переводит задание в 'done' — но
+    // считать теперь нужно начиная с 'queued', а не только с этого момента.
+    // Строка задания остаётся с продуктом НАВСЕГДА, даже если его потом
+    // удалят (archived_at) или сотрут (purged_at): FK у
+    // product_provision_jobs — ON DELETE CASCADE, но здесь это DELETE из
+    // products не происходит, продукт только архивируется.
     //
     // ПОЧЕМУ НЕ products.status. Текущий статус рассказывает только о
     // СЕЙЧАС: у удалённого продукта это 'archived' независимо от того, работал
@@ -734,8 +752,7 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                                secrets_encrypted, domain, host_ip, health_url, host_id, tg_bot_id, paid_until)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                  CASE WHEN (SELECT count(*) FROM products p2 WHERE p2.user_id = $2
-                              AND EXISTS (SELECT 1 FROM product_provision_jobs j
-                                           WHERE j.product_id = p2.id AND j.kind = 'provision' AND j.status = 'done')) < $15
+                              AND ${freeMonthCountedJobSql('p2')}) < $15
                         THEN now() + interval '1 month'
                         ELSE now()
                       END)

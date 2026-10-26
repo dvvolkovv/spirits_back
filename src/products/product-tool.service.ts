@@ -6,7 +6,7 @@ import { DomainErrorReason, DomainRecordToSet, DomainRefusalCode, DomainStatus, 
 import { normalizeDomain, readableDomain } from './domain-name';
 import { ProductToolChannel } from './product-tool.token';
 import { ProductLifecycleTool } from './product-lifecycle-tool';
-import { FREE_MONTH_PRODUCTS, RENT_TOKENS } from './rent.service';
+import { FREE_MONTH_PRODUCTS, RENT_TOKENS, freeMonthCountedJobSql } from './rent.service';
 
 /** «50 000» — как в остальных текстах для людей (products-cli-tool.ts, platform-kb/values.ts). */
 const RENT_TOKEN_TEXT = String(RENT_TOKENS).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
@@ -137,8 +137,10 @@ const NOT_WORKING = ' Не говори, что домен работает.';
  *
  * ФУНКЦИЯ, А НЕ КОНСТАНТА (ревью после финального, пункт 2). У пользователя
  * без ЖИВЫХ продуктов freeMonthsLeft не обязан быть равен FREE_MONTH_PRODUCTS:
- * он мог завести и удалить их раньше (freeMonthsLeft считает ВСЕХ продуктов
- * за всё время, см. комментарий у list() ниже) — и тогда этот текст, говоря
+ * он мог завести и удалить их раньше, а мог и завести прямо сейчас, не
+ * дождавшись заведения (freeMonthsLeft считает все продукты, у которых есть
+ * НЕ провалившееся задание провижининга — см. комментарий у list() ниже и
+ * freeMonthCountedJobSql в rent.service.ts) — и тогда этот текст, говоря
  * безусловно «первый месяц бесплатно», соврал бы ровно тому, кто уже выбрал
  * свой лимит. Ветка «осталось 0» зеркалит непустой список ниже — тем же
  * условием freeMonthsLeft > 0, а не отдельно выдуманным.
@@ -387,21 +389,26 @@ export class ProductToolService {
     // СКОЛЬКО БЕСПЛАТНЫХ МЕСЯЦЕВ ЕЩЁ ОСТАЛОСЬ (решение владельца 26.10.2026).
     // Отдельным запросом, а не фильтром по products выше: тот отбирает
     // ТОЛЬКО живые (archived_at IS NULL) и пуст у пользователя без единого
-    // живого продукта — а бесплатные месяцы считают ВСЕ строки за всё время,
+    // живого продукта — а бесплатные месяцы считают строки за всё время,
     // включая удалённые и стёртые (см. комментарий у ProvisioningService.create
     // и у FREE_MONTH_PRODUCTS). Фильтром из `products` этот счёт не получить
     // никак, он обязан быть отдельным.
     //
-    // Ревью, пункт 11: считаются ТОЛЬКО продукты со следом успешного
-    // провижининга (product_provision_jobs: kind='provision' AND
-    // status='done') — ТЕМ ЖЕ условием, что в INSERT ProvisioningService.create.
+    // Ревью, пункт 11, правка круга 2 пункт 2: считаются продукты с НЕ
+    // ПРОВАЛИВШИМСЯ заданием провижининга (product_provision_jobs:
+    // kind='provision' AND status <> 'failed', freeMonthCountedJobSql в
+    // rent.service.ts) — ТЕМ ЖЕ условием, что в INSERT ProvisioningService.create,
+    // из одного и того же фрагмента SQL. Было строже (status='done'
+    // буквально) — и это было дырой: продукт, который ТОЛЬКО ЗАВОДИТСЯ
+    // (queued/running), не светился в счёте вовсе, и list() называл человеку
+    // с одним реально поднявшимся и одним заводящимся продуктом ещё один
+    // бесплатный месяц, которого сервер уже не даст на следующем create().
     // Продукт, чьё заведение ни разу не поднялось (status='failed', агенту
-    // хоста не дозвонились или он сам отказал), не должен жечь человеку
-    // бесплатный месяц — ровно для этого считался лимит FREE_MONTH_PRODUCTS,
-    // а не ради количества строк в таблице.
+    // хоста не дозвонились или он сам отказал), по-прежнему не должен жечь
+    // человеку бесплатный месяц — ровно для этого лимит и считался, а не
+    // ради количества строк в таблице.
     const everCount = await this.pg.query(
-      `SELECT count(*) FROM products p WHERE p.user_id = $1
-         AND EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.product_id = p.id AND j.kind = 'provision' AND j.status = 'done')`,
+      `SELECT count(*) FROM products p WHERE p.user_id = $1 AND ${freeMonthCountedJobSql('p')}`,
       [userId],
     );
     const freeMonthsLeft = Math.max(0, FREE_MONTH_PRODUCTS - Number(everCount.rows[0]?.count ?? 0));

@@ -1791,11 +1791,16 @@ maybe('провижининг против живого Postgres', () => {
 
   /**
    * Ревью, пункт 11: счёт бесплатных месяцев смотрит не на СТРОКУ products, а
-   * на след успешного провижининга (product_provision_jobs: kind='provision'
-   * AND status='done') — ровно тем же условием, что в самом INSERT. create()
-   * ставит задание только 'queued'; в тестах ниже нет живого агента хоста,
-   * который довёл бы его до 'done' сам, поэтому сценарии, где продукт должен
-   * считаться «использовавшим» свою долю лимита, помечают это явно.
+   * на след провижининга (product_provision_jobs: kind='provision' AND
+   * status <> 'failed', freeMonthCountedJobSql в rent.service.ts) — ровно
+   * тем же условием, что в самом INSERT. create() ставит задание только
+   * 'queued' — а с правки круга 2 пункта 2 это УЖЕ считается (счёт смотрит
+   * на «не провалилось», а не на «завершилось успехом») — поэтому
+   * markRanOnce() здесь нужен только тестам, которым важно смоделировать
+   * РЕАЛЬНО поднявшийся продукт (в тестах нет живого агента хоста, который
+   * доводил бы задание до 'done' сам), а не самому счёту свободных месяцев:
+   * тест 109 ниже нарочно НЕ зовёт markRanOnce на одном из продуктов, чтобы
+   * показать именно эту разницу.
    */
   async function markRanOnce(productId: string) {
     await pool.query(
@@ -1912,6 +1917,44 @@ maybe('провижининг против живого Postgres', () => {
     // равно считаются именно потому, что они РАБОТАЛИ, в отличие от failed.
     const fourth = await svc.create({ userId, isAdmin: false, name: 'четвёртый', slug: 'fm-fourth', kind: 'site', secrets: {} });
     expect(fourth.freeMonth).toBe(false);
+  });
+
+  it('109. продукт, который ТОЛЬКО ЗАВОДИТСЯ (задание queued, не done), тоже считается — иначе одновременное заведение даёт больше двух бесплатных месяцев', async () => {
+    // Ревью, круг 2, пункт 2. Старое условие (status='done' буквально) видело
+    // ЗАВОДЯЩИЙСЯ продукт как «не считается» — человек с одним РЕАЛЬНО
+    // поднявшимся продуктом и одним, который в эту секунду заводится
+    // (например, одновременно создал сайт и бота), на третьем create() видел
+    // бы count=1 (только первый) и получал бы ТРЕТИЙ бесплатный месяц. Новое
+    // условие — «есть НЕ ПРОВАЛИВШЕЕСЯ задание» — считает second сразу,
+    // не дожидаясь completeJob.
+    await ensureHost('clients');
+    const userId = 'u-free-month-inflight';
+    const svc = makeSvc();
+
+    const first = await svc.create({ userId, isAdmin: false, name: 'первый', slug: 'fm5-first', kind: 'site', secrets: {} });
+    await markRanOnce(first.productId);
+    expect(first.freeMonth).toBe(true);
+    // Живой слот предела (DEFAULT_MAX_PRODUCTS, не предмет этого теста)
+    // освобождается архивацией — иначе второе/третье create() упёрлось бы не
+    // в счёт бесплатных месяцев, а в этот отдельный предел (как в тесте 108).
+    await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [first.productId]);
+
+    // Второй — создан, но ЕЩЁ ЗАВОДИТСЯ (например, второй продукт сразу
+    // после первого, живого агента хоста в тесте нет). create() сам ставит
+    // заданию статус 'queued' (см. provisioning.service.ts) — здесь НЕ зовём
+    // markRanOnce, оставляя его таким нарочно.
+    const second = await svc.create({ userId, isAdmin: false, name: 'второй', slug: 'fm5-second', kind: 'site', secrets: {} });
+    expect(second.freeMonth).toBe(true);
+    const secondJob = await pool.query(`SELECT status FROM product_provision_jobs WHERE product_id = $1 AND kind = 'provision'`, [second.productId]);
+    expect(secondJob.rows[0].status).toBe('queued');
+    await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [second.productId]);
+
+    // Счёт для третьего — first (done) + second (queued, ещё заводится) = 2,
+    // 2 не меньше 2 → платный. Со старым условием (status='done') второй не
+    // посчитался бы, и third получил бы freeMonth=true — ровно та дыра,
+    // которую чинит эта правка.
+    const third = await svc.create({ userId, isAdmin: false, name: 'третий', slug: 'fm5-third', kind: 'site', secrets: {} });
+    expect(third.freeMonth).toBe(false);
   });
 
   // ═══════════════ отметка о жизни агента хоста ═══════════════
