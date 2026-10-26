@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
 import { MIGRATIONS } from './products.service';
-import { ProvisioningService } from './provisioning.service';
+import { PURGED_TEXT, ProvisioningService } from './provisioning.service';
 import { HostsService } from './hosts.service';
 import { LimitsService } from './limits.service';
 import { RentService } from './rent.service';
@@ -30,7 +30,9 @@ const quietLogger = (errors: string[], warns: string[] = []) => ({
  * ложная тревога: машину никто не трогал. Плюс 10 минут правки получают 409.
  */
 describe('выдача rekey: коробка не читается', () => {
-  it('задание закрыто отказом смены ключей (rekey_failed), агенту — «заданий нет»', async () => {
+  const isClose = (sql: string) => /WITH closed AS/.test(sql) && sql.includes("kind = 'rekey'");
+
+  function harness(o: { decrypt?: () => never; closeFails?: boolean } = {}) {
     const calls: { sql: string; params: any[] }[] = [];
     const pg = {
       query: jest.fn(async (sql: string, params: any[] = []) => {
@@ -44,27 +46,56 @@ describe('выдача rekey: коробка не читается', () => {
             }],
           };
         }
-        if (/WITH closed AS/.test(sql) && sql.includes("kind = 'rekey'")) {
+        if (isClose(sql)) {
+          if (o.closeFails) throw new Error('Connection terminated unexpectedly');
           return { rows: [{ closed: 1, swapped: 0, product_id: 'p-1', slug: 'shop', tg_bot_id: null }], rowCount: 1 };
         }
         return { rows: [] };
       }),
     };
-    const secrets = new SecretsService({ get: (k: string) => (k === 'PRODUCT_SECRETS_KEY' ? KEY : undefined) } as any);
+    const secrets = o.decrypt
+      ? ({ decrypt: jest.fn(o.decrypt) } as any)
+      : new SecretsService({ get: (k: string) => (k === 'PRODUCT_SECRETS_KEY' ? KEY : undefined) } as any);
     const svc = new ProvisioningService(pg as any, secrets, {} as any, {} as any, {} as any);
     const errors: string[] = [];
     (svc as any).logger = quietLogger(errors);
+    return { svc, calls, errors };
+  }
+
+  it('задание закрыто отказом смены ключей (rekey_failed), агенту — «заданий нет»', async () => {
+    const { svc, calls, errors } = harness();
 
     await expect(svc.claimJob('clients')).resolves.toBeNull();
 
-    const done = calls.filter((c) => /WITH closed AS/.test(c.sql) && c.sql.includes("kind = 'rekey'"));
+    const done = calls.filter((c) => isClose(c.sql));
     expect(done).toHaveLength(1);
     expect(done[0].params).toEqual(['j-1', false, BOX_UNREADABLE, REKEY_FAILED_SAY, 'rekey_failed']);
     // Привязку Telegram спрашивать незачем — задание не выдаётся.
     expect(calls.some((c) => c.sql.includes('tg_user_identities'))).toBe(false);
     // Громко и со слагом, но без содержимого коробки.
-    expect(errors.some((m) => m.includes('shop'))).toBe(true);
+    expect(errors.some((m) => m.includes('shop') && m.includes('закрыто отказом'))).toBe(true);
     expect(JSON.stringify({ calls: calls.map((c) => c.params), errors })).not.toContain('TEST-secret');
+  });
+
+  it('SyntaxError разбора тела — его текст (цитата расшифрованного) в лог не идёт', async () => {
+    // JSON.parse в новых Node цитирует кусок разбираемого текста — то есть
+    // расшифрованные значения ключей.
+    const { svc, errors } = harness({
+      decrypt: () => {
+        throw new SyntaxError('Unexpected token \'x\', "{"BOT_TOKEN":"123456:TEST-secret"x" is not valid JSON');
+      },
+    });
+    await expect(svc.claimJob('clients')).resolves.toBeNull();
+    expect(errors.some((m) => m.includes('shop'))).toBe(true);
+    expect(errors.join('\n')).not.toContain('TEST-secret');
+  });
+
+  it('закрыть задание не удалось — агенту всё равно «заданий нет», в логе нет «закрыто отказом»', async () => {
+    const { svc, errors } = harness({ closeFails: true });
+    await expect(svc.claimJob('clients')).resolves.toBeNull();
+    expect(errors.some((m) => m.includes('shop') && m.includes('j-1'))).toBe(true);
+    expect(errors.join('\n')).not.toContain('закрыто отказом');
+    expect(errors.join('\n')).not.toContain('TEST-secret');
   });
 });
 
@@ -189,10 +220,19 @@ maybe('отчёт агента по rekey и purge против живого Pos
       `INSERT INTO product_domains (product_id, domain, names, token, status) VALUES ($1, 'shop.example.ru', '{shop.example.ru}', 't', 'active')`,
       [p],
     );
+    // Домен ДРУГОГО продукта обязан пережить стирание (сторож условия по
+    // product_id в DELETE).
+    const other = await product({ status: 'running', kind: 'site' });
+    await pool.query(
+      `INSERT INTO product_domains (product_id, domain, names, token, status) VALUES ($1, 'other.example.ru', '{other.example.ru}', 't2', 'active')`,
+      [other],
+    );
     await pool.query(`INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'provision', 'done')`, [p]);
     const j = await pool.query(`INSERT INTO product_provision_jobs (product_id, kind, status, started_at) VALUES ($1, 'purge', 'running', now()) RETURNING id`, [p]);
 
     await svc.completeJob(j.rows[0].id, { ok: true });
+
+    expect((await pool.query(`SELECT domain FROM product_domains WHERE product_id = $1`, [other])).rows).toEqual([{ domain: 'other.example.ru' }]);
 
     const row = await productRow(p);
     expect(row.purged_at).not.toBeNull();
@@ -214,6 +254,102 @@ maybe('отчёт агента по rekey и purge против живого Pos
     expect(JSON.stringify(log.rows[0].result)).not.toContain('certbot');
   });
 
+  it('успех purge: тексты правок и первая правка в журнале стёрты, числа и чужие строки на месте', async () => {
+    const p = await product({ status: 'archived', archived: true, kind: 'site' });
+    const other = await product({ status: 'running', kind: 'site' });
+    const turn = async (productId: string, o: { result?: string | null; error?: string | null; status: string; tokens: number }) =>
+      (await pool.query(
+        `INSERT INTO product_turns (product_id, user_id, channel, prompt, result, error, status, tokens_spent, sha_before, sha_after, started_at, finished_at)
+         VALUES ($1, 'u1', 'web', 'сделай кнопку «купить»', $2, $3, $4, $5, 'aaa111', 'bbb222', now() - interval '2 hours', now() - interval '1 hour')
+         RETURNING id`,
+        [productId, o.result ?? null, o.error ?? null, o.status, o.tokens],
+      )).rows[0].id as string;
+    const t1 = await turn(p, { result: 'кнопка добавлена', status: 'done', tokens: 1234 });
+    const t2 = await turn(p, { error: 'claude упал на файле secret.txt', status: 'failed', tokens: 7 });
+    const t3 = await turn(p, { status: 'reverted', tokens: 0 });
+    const tOther = await turn(other, { result: 'кнопка добавлена', status: 'done', tokens: 5 });
+    const card = async (productId: string) =>
+      (await pool.query(
+        `INSERT INTO product_actions (user_id, product_id, kind, status, channel, payload, result, resolved_at)
+         VALUES ('u1', $1, 'create_site', 'done', 'web', $2::jsonb, '{}'::jsonb, now()) RETURNING id`,
+        [productId, JSON.stringify({ name: 'П', prompt: 'магазин чая с доставкой' })],
+      )).rows[0].id as string;
+    const c1 = await card(p);
+    const cOther = await card(other);
+    const j = await pool.query(`INSERT INTO product_provision_jobs (product_id, kind, status, started_at) VALUES ($1, 'purge', 'running', now()) RETURNING id`, [p]);
+
+    await svc.completeJob(j.rows[0].id, { ok: true });
+
+    const turnRow = async (id: string) =>
+      (await pool.query(`SELECT prompt, result, error, status, tokens_spent::int AS tokens, sha_before, sha_after, started_at IS NOT NULL AS started FROM product_turns WHERE id = $1`, [id])).rows[0];
+    expect(await turnRow(t1)).toEqual({ prompt: PURGED_TEXT, result: PURGED_TEXT, error: null, status: 'done', tokens: 1234, sha_before: 'aaa111', sha_after: 'bbb222', started: true });
+    expect(await turnRow(t2)).toEqual({ prompt: PURGED_TEXT, result: null, error: PURGED_TEXT, status: 'failed', tokens: 7, sha_before: 'aaa111', sha_after: 'bbb222', started: true });
+    expect((await turnRow(t3)).prompt).toBe(PURGED_TEXT);
+    expect(await turnRow(tOther)).toMatchObject({ prompt: 'сделай кнопку «купить»', result: 'кнопка добавлена', tokens: 5 });
+    expect((await actionRow(c1)).payload).toEqual({ name: 'П' });
+    expect((await actionRow(cOther)).payload).toEqual({ name: 'П', prompt: 'магазин чая с доставкой' });
+  });
+
+  it('отказ purge — тексты правок не тронуты', async () => {
+    const p = await product({ status: 'archived', archived: true, kind: 'site' });
+    await pool.query(`INSERT INTO product_turns (product_id, user_id, channel, prompt, result, status) VALUES ($1, 'u1', 'web', 'правка', 'итог', 'done')`, [p]);
+    const j = await pool.query(`INSERT INTO product_provision_jobs (product_id, kind, status, started_at) VALUES ($1, 'purge', 'running', now()) RETURNING id`, [p]);
+    await svc.completeJob(j.rows[0].id, { ok: false, error: 'rm отказал' });
+    expect((await pool.query(`SELECT prompt, result FROM product_turns WHERE product_id = $1`, [p])).rows).toEqual([{ prompt: 'правка', result: 'итог' }]);
+  });
+
+  it('успех purge у неудалённого продукта — ничего не стёрто, журнал «стёрт» не пишется, logger.error', async () => {
+    // Выдача purge неудалённому невозможна (claimJob требует archived и срок),
+    // но строку products как «стёртую» помечает только сам удалённый.
+    const p = await product({ status: 'running', kind: 'site', secrets: { A: '1' } });
+    const before = await productRow(p);
+    await pool.query(`INSERT INTO product_turns (product_id, user_id, channel, prompt, status) VALUES ($1, 'u1', 'web', 'правка', 'done')`, [p]);
+    const j = await pool.query(`INSERT INTO product_provision_jobs (product_id, kind, status, started_at) VALUES ($1, 'purge', 'running', now()) RETURNING id`, [p]);
+    const errors: string[] = [];
+    (svc as any).logger = quietLogger(errors);
+    await svc.completeJob(j.rows[0].id, { ok: true });
+    const row = await productRow(p);
+    expect(row.purged_at).toBeNull();
+    expect(row.secrets_encrypted.equals(before.secrets_encrypted)).toBe(true);
+    expect(row.first_prompt).toBe('первая');
+    expect((await pool.query(`SELECT prompt FROM product_turns WHERE product_id = $1`, [p])).rows[0].prompt).toBe('правка');
+    expect((await pool.query(`SELECT 1 FROM product_actions WHERE product_id = $1 AND kind = 'purge' AND status = 'done'`, [p])).rows).toHaveLength(0);
+    expect(errors.some((m) => m.includes(before.slug))).toBe(true);
+  });
+
+  it('повтор того же отчёта с неизвестным исходом — warn, а не вторая тревога', async () => {
+    const p = await product({ status: 'running', secrets: { BOT_TOKEN: '123456:TEST-old' } });
+    const { jobId } = await runningRekey(p, { BOT_TOKEN: '123456:TEST-bad' }, { newKeyNames: ['BOT_TOKEN'], removedNames: [] });
+    const report = { ok: false, error: 'ключи не применены: продукт не ответил; откат не удался' };
+    const errors: string[] = [];
+    const warns: string[] = [];
+    (svc as any).logger = quietLogger(errors, warns);
+    await svc.completeJob(jobId, report);
+    expect(errors).toHaveLength(1);
+    await svc.completeJob(jobId, report);
+    expect(errors).toHaveLength(1);
+    expect(warns).toHaveLength(1);
+  });
+
+  it('отчёт с неизвестным исходом по заданию, снятому снаружи, — тревога «снятому»', async () => {
+    const p = await product({ status: 'running', secrets: { BOT_TOKEN: '123456:TEST-old' } });
+    const before = await productRow(p);
+    const { jobId } = await runningRekey(p, { BOT_TOKEN: '123456:TEST-bad' }, { newKeyNames: ['BOT_TOKEN'], removedNames: [] });
+    await pool.query(`UPDATE product_provision_jobs SET status = 'failed', error = 'срок смены ключей истёк (10 мин)' WHERE id = $1`, [jobId]);
+    const errors: string[] = [];
+    (svc as any).logger = quietLogger(errors);
+    await svc.completeJob(jobId, { ok: false, error: 'ключи не применены: продукт не ответил; откат не удался' });
+    expect(errors.some((m) => m.includes(before.slug) && /снятому/.test(m))).toBe(true);
+  });
+
+  it('смена BOT_TOKEN у удалённого продукта: tg_bot_id новый, даже если номер занят живым — для честного возврата', async () => {
+    const p = await product({ status: 'archived', archived: true, tgBotId: 111, secrets: { BOT_TOKEN: '111111:TEST-old' } });
+    await product({ status: 'running', tgBotId: 222 });
+    const { jobId } = await runningRekey(p, { BOT_TOKEN: '222222:TEST-new' }, { newKeyNames: ['BOT_TOKEN'], removedNames: [], tgBotId: 222 });
+    await svc.completeJob(jobId, { ok: true });
+    expect(Number((await productRow(p)).tg_bot_id)).toBe(222);
+  });
+
   it('откат не удался — rekey_unknown: свой текст карточки и logger.error со слагом', async () => {
     const p = await product({ status: 'running', secrets: { BOT_TOKEN: '123456:TEST-old' } });
     const { actionId, jobId } = await runningRekey(p, { BOT_TOKEN: '123456:TEST-bad' }, { newKeyNames: ['BOT_TOKEN'], removedNames: [] });
@@ -230,9 +366,14 @@ maybe('отчёт агента по rekey и purge против живого Pos
   // машины за ними стоит. «неизвестный вид задания» — агент старее сервера,
   // хост не тронут; «не началась … НЕИЗВЕСТНО» — эта смена хост не трогала,
   // но прежняя, брошенная по сроку, ещё идёт — продукт может не отвечать.
+  // Остаток прерванной смены и незапущенный контейнер — тоже rekey_unknown:
+  // хост не тронут этой сменой, но продукт уже в состоянии, которое повтором
+  // не лечится (разбор руками). Обратная сторона — rekey-report-markers.spec.ts
+  // агента: там тексты сверяются с этой же регуляркой.
   it.each([
     ['ключи не применены: docker run с новыми ключами отказал: код 125; продукт возвращён со старыми ключами', 'rekey_failed'],
-    ['контейнер s-x не запущен (спит или прервана прошлая смена ключей) — ничего не тронуто', 'rekey_failed'],
+    ['контейнер s-x не запущен (спит или прервана прошлая смена ключей) — ничего не тронуто', 'rekey_unknown'],
+    ['на хосте остался s-x__rekey от прерванной смены ключей — сверить руками, ничего не тронуто', 'rekey_unknown'],
     ['неизвестный вид задания: "rekey". Агент умеет provision, sleep, wake, domain — эта работа сделана НЕ БЫЛА, на хосте ничего не тронуто. Похоже, сервер новее агента на машине продуктов.', 'rekey_failed'],
     ['смена ключей не уложилась в 480 с и брошена: состояние хоста НЕИЗВЕСТНО — продукт мог остаться под именем s-x__rekey со старыми ключами, сверить руками', 'rekey_unknown'],
     ['смена ключей над s-x не началась: прежняя работа над этим продуктом, брошенная по сроку, ещё идёт на хосте — это задание ничего не тронуло. Состояние продукта НЕИЗВЕСТНО', 'rekey_unknown'],
