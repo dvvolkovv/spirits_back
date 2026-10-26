@@ -19,12 +19,18 @@
 - формат `chat` как запасной; остаток задачи 37 плана 2 (сквозной прогон на стенде) на новом формате.
 
 **Что план уточняет в спеке** (дописывается в спеку в задаче 17):
-- `SkitPlan` несёт `troupeVersion`. Отпечаток сценки — первые 16 hex от sha256 версии труппы и двух промптов: промпты собирает код, поэтому порядок полей сценки на отпечаток не влияет, а правка шаблона промпта переснимает сценку.
-- Кадры рисуются по очереди: кадр развязки рисуется по кадру конфликта. Клипы снимаются параллельно.
+- У сценки есть поле `opening` — первый кадр (по нему рисуется кадр-эталон); `action` — всё действие за 8 с (по нему Omni оживляет кадр). Место, первый кадр и действие пишутся по-английски: они идут прямо в промпты. Реплики — по-русски. Роль героя в промпты не идёт: русский текст в кавычках генератор картинок рисует надписью.
+- Отпечатков два (первые 16 hex от sha256): отпечаток кадра — от вида сценки, версии труппы и промпта кадра, у развязки ещё от отпечатка кадра конфликта; отпечаток клипа — от отпечатка кадра и промпта видео. Кадр лежит в `keyframes/<отпечаток кадра>.png`, клип — в `skits/<отпечаток клипа>/`. Новая реплика переснимает только клип своей сценки с прежнего кадра; новое место конфликта перерисовывает и развязку. Промпты собирает код, поэтому порядок полей на отпечатки не влияет, а правка шаблона переснимает сценку.
+- Кадры рисуются по очереди: кадр развязки — по кадру конфликта. Клипы снимаются параллельно. После отказа фильтра кадр не перерисовывается: по нему уже могла быть нарисована развязка.
+- `planSkits` проверяет сценку до промптов: 2–3 разных героя, 1–3 реплики, непустые место, первый кадр, действие, роли и реплики. Ошибка называет сценку.
+- Облик героя пишется через зверя («a cat boss», а не «a boss»): иначе генератор дорисует отдельного человека. Голоса Кеши и Бориса разведены по высоте. В паспортах сверх таблицы спеки роли: «заёмщик» (Кеша), «начальник» (Борис), «мастер» (Михалыч), «риелтор» (Жорик).
 - Секунды Omni резервируются до запуска клипа и возвращаются, если запуск не состоялся (квота, сеть). Так две параллельные сценки не проходят предел вдвоём.
-- Ошибки распознавания не пересъёмка: SpeechKit повторяется сам до трёх раз, затем задание падает без повтора — клип Omni уже оплачен.
+- Ошибки распознавания не пересъёмка: SpeechKit повторяется сам до трёх раз, затем задание падает без повтора — клип Omni уже оплачен. SpeechKit просится писать числа словами (`rawResults=true`).
+- Сверка речи сравнивает только слова с кириллицей (числа и латиницу SpeechKit пишет по-своему), склеенный повтор слога («гага») засчитывает за «га-га» и отдельно ловит проглоченную реплику — клип не годится, если от реплики не услышано ни одного слова от трёх букв.
+- Субтитры реплик сценки: пара «отрезок речи — реплика» засчитывается, только если длина отрезка правдоподобна для длины текста; если отрезков больше, чем реплик, граница встаёт в паузу, ближайшую к оценке по тексту. Порог тишины — число в дБ.
 - Пауза в клипе и в ролике со сценками — до 3 с (стартовое значение; сверяется на образце). Паузы между репликами ищутся порогом −30 дБ, от 0,25 с.
-- Место и действие сценки пишутся по-английски: они идут прямо в промпты генераторов. Реплики — по-русски.
+- Зацепка ролика со сценками — немая надпись поверх конфликта, держится 3 с (`SKIT_HOOK_MS`). Для плана 4: у зацепки сценок предел слов строже (≈ 5–6 слов, ≈ 30 знаков) — её читают.
+- `animation.json` студии (`ShortAnimation`): сценки — `Partial` (частично заполненный файл — нормальное состояние), пути — относительно папки ролика; в плане 4 — ключи MinIO. Оживление требует ключей Google и SpeechKit; ключ Google вне оживления не читается.
 
 ---
 
@@ -78,12 +84,12 @@
 
 ### Task 1: Портреты труппы в студии
 
-Лист утверждён владельцем 26.10.2026 (`~/Downloads/linkeon_shorts/troupe-v1.png`, 1376×768). Портреты вырезаются по проверенным границам: в кадр не попадают соседи.
+Лист утверждён владельцем 26.10.2026 (`~/Downloads/linkeon_shorts/troupe-v1.png`, 1376×768). Портреты вырезаются по проверенным границам. Герои на листе местами заходят друг на друга, поэтому у четырёх портретов куски соседей по краям закрашиваются цветом фона.
 
 **Files:**
 - Create: `studio/assets/troupe/v1/sheet.png`, `kesha.png`, `galina.png`, `boris.png`, `mikhalych.png`, `zhorik.png`
 
-- [ ] **Step 1: Скопировать лист и вырезать портреты**
+- [ ] **Step 1: Скопировать лист, вырезать портреты и закрасить куски соседей**
 
 Это лёгкая операция, её можно делать на маке.
 
@@ -96,6 +102,13 @@ for spec in kesha:262:560:30:130 galina:252:560:302:120 boris:282:560:542:130 mi
   IFS=: read n w h x y <<<"$spec"
   ffmpeg -hide_banner -loglevel error -y -i "$D/sheet.png" -vf "crop=$w:$h:$x:$y" "$D/$n.png"
 done
+# Герои на листе заходят друг на друга: у четырёх портретов по краям остаются куски
+# соседей. Они закрашиваются полосами по 8 px цветом фона из соседнего столбца.
+fill() { ffmpeg -hide_banner -loglevel error -y -i "$D/$1.png" -vf "$2" "$D/$1.fill.png" && mv "$D/$1.fill.png" "$D/$1.png"; }
+fill boris 'drawbox=x=0:y=290:w=16:h=8:color=0xdfc499:t=fill,drawbox=x=0:y=298:w=16:h=8:color=0xddc098:t=fill,drawbox=x=0:y=306:w=16:h=8:color=0xdec495:t=fill,drawbox=x=0:y=314:w=16:h=8:color=0xe0c295:t=fill,drawbox=x=0:y=322:w=16:h=8:color=0xe2c698:t=fill,drawbox=x=0:y=330:w=16:h=8:color=0xe0c496:t=fill,drawbox=x=0:y=338:w=16:h=8:color=0xe0c59c:t=fill,drawbox=x=0:y=346:w=16:h=8:color=0xdec79d:t=fill,drawbox=x=0:y=354:w=16:h=8:color=0xe1c69d:t=fill,drawbox=x=0:y=362:w=16:h=8:color=0xe1c49a:t=fill,drawbox=x=0:y=370:w=16:h=8:color=0xe4c699:t=fill,drawbox=x=0:y=378:w=16:h=8:color=0xe3c79a:t=fill,drawbox=x=0:y=386:w=16:h=8:color=0xe1ca9b:t=fill,drawbox=x=0:y=394:w=16:h=8:color=0xe1ca9b:t=fill,drawbox=x=0:y=402:w=16:h=8:color=0xe4ca9b:t=fill,drawbox=x=0:y=410:w=16:h=5:color=0xe4c99e:t=fill,drawbox=x=256:y=476:w=26:h=8:color=0xdec398:t=fill,drawbox=x=256:y=484:w=26:h=8:color=0xddc096:t=fill,drawbox=x=256:y=492:w=26:h=8:color=0xd9bb8d:t=fill,drawbox=x=256:y=500:w=26:h=8:color=0xd4b488:t=fill,drawbox=x=256:y=508:w=26:h=8:color=0xccac7f:t=fill'
+fill mikhalych 'drawbox=x=0:y=275:w=17:h=8:color=0xe0c698:t=fill,drawbox=x=0:y=283:w=17:h=8:color=0xdec69a:t=fill,drawbox=x=0:y=291:w=17:h=8:color=0xe0c697:t=fill,drawbox=x=0:y=299:w=17:h=8:color=0xdec798:t=fill,drawbox=x=0:y=307:w=17:h=8:color=0xe0c399:t=fill,drawbox=x=0:y=315:w=17:h=8:color=0xe0c698:t=fill,drawbox=x=0:y=323:w=17:h=8:color=0xe0c59a:t=fill,drawbox=x=0:y=331:w=17:h=8:color=0xdfc597:t=fill,drawbox=x=0:y=339:w=17:h=8:color=0xe0c698:t=fill,drawbox=x=0:y=347:w=17:h=8:color=0xdfc79b:t=fill,drawbox=x=0:y=355:w=17:h=8:color=0xdec496:t=fill,drawbox=x=0:y=363:w=17:h=8:color=0xdec294:t=fill,drawbox=x=0:y=371:w=17:h=8:color=0xdfc597:t=fill,drawbox=x=0:y=379:w=17:h=8:color=0xdfc597:t=fill,drawbox=x=0:y=387:w=17:h=8:color=0xe1c99d:t=fill,drawbox=x=0:y=395:w=17:h=8:color=0xdfc99a:t=fill,drawbox=x=0:y=403:w=17:h=8:color=0xe1cb9b:t=fill,drawbox=x=0:y=411:w=17:h=8:color=0xe1ca9e:t=fill,drawbox=x=0:y=419:w=17:h=1:color=0xe3cd9e:t=fill'
+fill zhorik 'drawbox=x=0:y=285:w=24:h=8:color=0xddc194:t=fill,drawbox=x=0:y=293:w=24:h=8:color=0xdcc090:t=fill,drawbox=x=0:y=301:w=24:h=8:color=0xdcbe8e:t=fill,drawbox=x=0:y=309:w=24:h=8:color=0xdcbf95:t=fill,drawbox=x=0:y=317:w=24:h=8:color=0xdec69a:t=fill,drawbox=x=0:y=325:w=24:h=8:color=0xdfc49b:t=fill,drawbox=x=0:y=333:w=24:h=8:color=0xdbc495:t=fill,drawbox=x=0:y=341:w=24:h=8:color=0xdec496:t=fill,drawbox=x=0:y=349:w=24:h=8:color=0xe0c698:t=fill,drawbox=x=0:y=357:w=24:h=8:color=0xe1c598:t=fill,drawbox=x=0:y=365:w=24:h=8:color=0xe1c798:t=fill,drawbox=x=0:y=373:w=24:h=8:color=0xdfc898:t=fill,drawbox=x=0:y=381:w=24:h=8:color=0xe0c698:t=fill,drawbox=x=0:y=389:w=24:h=8:color=0xe0c99a:t=fill,drawbox=x=0:y=397:w=24:h=8:color=0xe2c699:t=fill'
+fill galina 'drawbox=x=233:y=452:w=19:h=8:color=0xe3cc9d:t=fill,drawbox=x=233:y=460:w=19:h=8:color=0xe4c99e:t=fill,drawbox=x=233:y=468:w=19:h=8:color=0xe2c89a:t=fill,drawbox=x=233:y=476:w=19:h=8:color=0xdfc499:t=fill,drawbox=x=233:y=484:w=19:h=8:color=0xdfc096:t=fill,drawbox=x=233:y=492:w=19:h=6:color=0xdbbd90:t=fill'
 ls -la "$D"
 ```
 
@@ -108,7 +121,7 @@ ffmpeg -hide_banner -loglevel error -y -i "$D/kesha.png" -i "$D/galina.png" -i "
   -filter_complex "[0][1][2][3][4]hstack=inputs=5" /tmp/troupe-strip.png
 ```
 
-Открыть `/tmp/troupe-strip.png` (Read). Expected: слева направо капибара в свитере, гусыня в фартуке с ключами, кот в костюме со штампом, бобр в комбинезоне, енот в клетчатом пиджаке. У каждого портрета по краям нет кусков соседей. Если кусок соседа виден — сдвинуть `x` или уменьшить `w` этого героя на 5–10 px и повторить шаги 1–2.
+Открыть `/tmp/troupe-strip.png` (Read). Expected: слева направо капибара в свитере, гусыня в фартуке с ключами, кот в костюме со штампом, бобр в комбинезоне, енот в клетчатом пиджаке. У каждого портрета по краям нет кусков соседей. Если кусок соседа виден — закрасить его так же, функцией `fill` (прямоугольник полосами цветом соседнего фона), и повторить шаг 2.
 
 - [ ] **Step 3: Commit**
 
@@ -141,23 +154,30 @@ import * as path from 'path';
 import { heroById, TROUPE, TROUPE_VERSION } from './short-troupe';
 
 describe('труппа', () => {
-  it('пятеро героев утверждённого листа, id без повторов', () => {
+  it('пятеро героев утверждённого листа', () => {
     expect(TROUPE.map((h) => h.id)).toEqual(['kesha', 'galina', 'boris', 'mikhalych', 'zhorik']);
-    expect(TROUPE_VERSION).toBe('v1');
   });
 
-  it('у каждого — облик и голос для промптов, роли и коронная фраза', () => {
+  it('промпт Omni однозначно называет говорящего, генераторам уходит только английский', () => {
+    const who = TROUPE.map((h) => h.who);
+    expect(new Set(who).size).toBe(who.length);
     for (const h of TROUPE) {
-      expect(h.look.length).toBeGreaterThan(20);
+      expect(h.who).toMatch(/^the [a-z]+( [a-z]+)*$/);
+      expect(h.look).toContain(h.who.replace(/^the /, ''));
       expect(h.voice).toMatch(/voice$/);
-      expect(h.who).toMatch(/^the [a-z]+$/);
+      expect(`${h.who} ${h.look} ${h.voice}`).not.toMatch(/[а-яё]/i);
+    }
+  });
+
+  it('у каждого — роли и коронная фраза для режиссёра и сценариста', () => {
+    for (const h of TROUPE) {
       expect(h.roles.length).toBeGreaterThan(0);
       expect(h.catchphrases.length).toBeGreaterThan(0);
     }
   });
 
-  it('heroById находит героя и не находит чужого', () => {
-    expect(heroById('galina')?.name).toBe('Гусыня Галина Петровна');
+  it('heroById находит героя по id и не находит чужого', () => {
+    for (const h of TROUPE) expect(heroById(h.id)).toBe(h);
     expect(heroById('fox')).toBeUndefined();
   });
 
@@ -195,8 +215,12 @@ Expected: FAIL — `Cannot find module './short-troupe'`.
  * из них код собирает промпты Nano Banana и Omni (short-skit-prompts.ts).
  * Роли, манера и коронные фразы — по-русски: их читают режиссёр и сценарист.
  * Портреты — studio/assets/troupe/<версия>/<id>.png, вырезаны из листа,
- * утверждённого владельцем 26.10.2026. Новый герой или правка облика — новая
- * версия листа, а не правка этой: старые ролики остаются со своими портретами.
+ * утверждённого владельцем 26.10.2026.
+ *
+ * Текст паспорта (голос, уточнение облика) правится на месте: отпечатки сценок
+ * считаются от промптов, и сценки с новым текстом переснимутся сами. Новая
+ * версия листа нужна, когда меняется картинка — новый герой или новый облик:
+ * старые ролики остаются со своими портретами.
  */
 export const TROUPE_VERSION = 'v1';
 
@@ -208,10 +232,16 @@ export interface Hero {
   name: string;
   /** Кто это в кадре, коротко: им промпт Omni называет говорящего. */
   who: string;
+  /**
+   * Облик — совпадает с портретом: текст и картинка вместе уходят в Nano Banana.
+   * Профессия — через зверя («a cat boss»), а не «a boss»: иначе генератор
+   * дорисует отдельного человека.
+   */
   look: string;
   /** Описание голоса для Omni: одно и то же в каждом промпте держит голос узнаваемым. */
   voice: string;
   manner: string;
+  /** Правило 16: в сценке у героя роль только из этого списка. */
   roles: string[];
   catchphrases: string[];
 }
@@ -222,7 +252,7 @@ export const TROUPE: readonly Hero[] = [
     name: 'Капибара Кеша',
     who: 'the capybara',
     look: 'a brown capybara with a calm, slightly sleepy face, wearing a chunky beige knitted sweater',
-    voice: 'calm, low, unhurried adult male voice',
+    voice: 'soft, calm, unhurried mid-pitched male voice',
     manner: 'Главный герой, «обычный человек». Невозмутим, сколько бы на него ни кричали. Не спорит и не паникует — открывает Linkeon.',
     roles: ['жилец', 'работник', 'покупатель', 'клиент', 'сосед', 'муж', 'предприниматель', 'заёмщик'],
     catchphrases: ['Спокойно. Сейчас спрошу.'],
@@ -231,9 +261,9 @@ export const TROUPE: readonly Hero[] = [
     id: 'galina',
     name: 'Гусыня Галина Петровна',
     who: 'the goose',
-    look: 'a white goose with an orange beak and orange feet, a grumpy elderly lady in a pink floral apron, holding a bunch of keys',
+    look: 'a white goose with an orange beak and orange feet, a grumpy elderly goose lady wearing a cream apron with a pink rose print, holding a bunch of keys',
     voice: 'shrill, loud, grumpy elderly female voice',
-    manner: 'Вечный противник. Скандалит, шипит, машет крыльями, тычет крылом. В развязке сдаётся.',
+    manner: 'Вечный противник. Скандалит, шипит, машет крыльями, тычет крылом в «улики». В развязке сдаётся.',
     roles: ['хозяйка квартиры', 'соседка', 'свекровь', 'вахтёрша', 'продавщица'],
     catchphrases: ['Га-га… ладно.'],
   },
@@ -241,8 +271,8 @@ export const TROUPE: readonly Hero[] = [
     id: 'boris',
     name: 'Кот Борис Аркадьевич',
     who: 'the cat',
-    look: 'a fat grey tabby cat with yellow eyes, a pompous boss in a too-tight navy suit, white shirt and striped tie, holding a wooden rubber stamp',
-    voice: 'lazy, deep, pompous male voice',
+    look: 'a fat grey tabby cat with yellow eyes, a pompous cat boss wearing a too-tight navy suit, white shirt and striped tie, holding a rubber stamp with a wooden handle',
+    voice: 'booming, lazy, pompous bass voice',
     manner: 'Начальник. Важный и ленивый, всё «не положено». Ставит печать — и засыпает.',
     roles: ['работодатель', 'начальник', 'чиновник', 'налоговая', 'управляющая компания'],
     catchphrases: ['Не положено.'],
@@ -251,7 +281,7 @@ export const TROUPE: readonly Hero[] = [
     id: 'mikhalych',
     name: 'Бобр Михалыч',
     who: 'the beaver',
-    look: 'a brown beaver with big front teeth, a handyman in blue denim overalls with a leather tool belt and a pencil behind the ear',
+    look: 'a brown beaver with big front teeth, a beaver handyman wearing blue denim overalls with a leather tool belt and a pencil behind his ear',
     voice: 'hoarse, cheerful middle-aged male voice',
     manner: 'Мастер. Работяга, вечно всё переделывает, смета растёт на глазах.',
     roles: ['подрядчик', 'сантехник', 'автосервис', 'строитель', 'мастер'],
@@ -261,7 +291,7 @@ export const TROUPE: readonly Hero[] = [
     id: 'zhorik',
     name: 'Енот Жорик',
     who: 'the raccoon',
-    look: 'a raccoon with a sly grin, a salesman in a brown checkered jacket, white shirt and a gold chain',
+    look: 'a raccoon with a sly grin, a raccoon salesman wearing a brown checkered jacket, white shirt and a gold chain',
     voice: 'fast-talking, slick, ingratiating male voice',
     manner: 'Хитрый продавец. Говорит быстро, обещает золотые горы, мелкий шрифт прячет.',
     roles: ['продавец', 'кредитный менеджер', 'мошенник по телефону', 'турагент', 'риелтор'],
@@ -284,11 +314,13 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 NODE_RUN_DIR=. "$WT"/studio/scripts/node-run.sh "npx jest src/shorts/short-troupe.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"
 ```
 
-Expected: `Tests: 4 passed`, затем `TSC_OK`.
+Expected: `Tests: 5 passed`, затем `TSC_OK`.
 
 ---
 
-### Task 3: Промпты сценок и отпечаток (API)
+### Task 3: Промпты сценок и отпечатки (API)
+
+Отпечатков у сценки два. Кадр-эталон студия хранит по отпечатку кадра, клип — по отпечатку клипа, который включает отпечаток кадра. У развязки отпечаток кадра включает отпечаток кадра конфликта: её кадр рисуется по нему. Поэтому новая реплика переснимает только клип своей сценки с прежнего кадра, а новое место конфликта перерисовывает и развязку. Пару сценок планирует `planSkits`.
 
 **Files:**
 - Create: `src/shorts/short-skit-prompts.ts`
@@ -299,7 +331,17 @@ Expected: `Tests: 4 passed`, затем `TSC_OK`.
 `src/shorts/short-skit-prompts.spec.ts`:
 
 ```ts
-import { buildKeyframePrompt, buildVideoPrompt, planSkit, Skit, SKIT_FORBIDDEN, skitFingerprint } from './short-skit-prompts';
+import { heroById, TROUPE_VERSION } from './short-troupe';
+import {
+  buildKeyframePrompt,
+  buildVideoPrompt,
+  planSkit,
+  planSkits,
+  Skit,
+  SKIT_FORBIDDEN,
+  SKIT_FRAMING,
+  skitFingerprints,
+} from './short-skit-prompts';
 
 const conflict = (): Skit => ({
   cast: [
@@ -307,77 +349,169 @@ const conflict = (): Skit => ({
     { hero: 'kesha', role: 'жилец' },
   ],
   setting: 'shabby hallway of a rented flat',
-  action: 'The goose blocks the doorway and hisses.',
+  opening: 'The goose blocks the doorway, the capybara stands with a suitcase',
+  action: 'The goose hisses and flaps her wings.',
   lines: [
     { hero: 'galina', text: 'Обои потёрли! Залог мой!' },
     { hero: 'kesha', text: 'Спокойно. Спрошу у юриста.' },
   ],
 });
 
+const punchline = (): Skit => ({
+  ...conflict(),
+  opening: 'The capybara holds up the phone',
+  action: 'The goose lowers her wings.',
+  lines: [
+    { hero: 'kesha', text: 'Три года — нормальный износ.', box: 1 },
+    { hero: 'galina', text: 'Га-га… ладно.' },
+  ],
+});
+
+const galina = heroById('galina');
+const kesha = heroById('kesha');
+
 describe('промпт кадра', () => {
-  it('облик героев из паспортов, роли, место, начало действия и постоянные запреты', () => {
+  it('облик героев из паспортов по порядку, место, первый кадр, рамка и запреты', () => {
     const p = buildKeyframePrompt(conflict(), { continuity: false });
-    expect(p).toContain('a white goose');
-    expect(p).toContain('a brown capybara');
-    expect(p).toContain('«хозяйка квартиры»');
-    expect(p).toContain('shabby hallway of a rented flat');
-    expect(p).toContain('The goose blocks the doorway and hisses.');
-    expect(p).toContain('Exactly 2 characters');
+    expect(p).toContain(`1) ${galina.look}; 2) ${kesha.look}.`);
+    expect(p).toContain('Exactly 2 characters, each appears once.');
+    expect(p).toContain('Setting: shabby hallway of a rented flat.');
+    expect(p).toContain('The picture: The goose blocks the doorway, the capybara stands with a suitcase.');
+    expect(p).toContain(SKIT_FRAMING);
     expect(p).toContain(SKIT_FORBIDDEN);
     expect(p).not.toContain('previous scene');
+    expect(p).not.toContain('hisses');
+  });
+
+  it('без кириллицы и «ёлочек»: надписи генератор картинок рисует охотно', () => {
+    expect(buildKeyframePrompt(conflict(), { continuity: false })).not.toMatch(/[а-яё«»]/i);
   });
 
   it('у развязки — опора на кадр конфликта', () => {
-    expect(buildKeyframePrompt(conflict(), { continuity: true })).toContain('previous scene');
+    expect(buildKeyframePrompt(conflict(), { continuity: true })).toContain('The last image is the previous scene');
   });
 
-  it('герой не из труппы — ошибка', () => {
+  it('точка в конце фразы не удваивается, лишние пробелы схлопываются', () => {
     const s = conflict();
-    s.cast[0] = { hero: 'fox' as any, role: 'лиса' };
-    expect(() => buildKeyframePrompt(s, { continuity: false })).toThrow(/fox.*нет в труппе/);
+    s.setting = '  hallway.  ';
+    s.opening = 'Goose   at the door';
+    const p = buildKeyframePrompt(s, { continuity: false });
+    expect(p).toContain('Setting: hallway. The picture: Goose at the door.');
+  });
+
+  it('состав: чужой герой, повтор, пустой — ошибка', () => {
+    const fox = conflict();
+    fox.cast[0] = { hero: 'fox' as any, role: 'лиса' };
+    expect(() => buildKeyframePrompt(fox, { continuity: false })).toThrow(/fox.*нет в труппе/);
+    const twice = conflict();
+    twice.cast[1] = { hero: 'galina', role: 'соседка' };
+    expect(() => buildKeyframePrompt(twice, { continuity: false })).toThrow(/galina.*дважды/);
+    const empty = conflict();
+    empty.cast = [];
+    expect(() => buildKeyframePrompt(empty, { continuity: false })).toThrow(/нет героев/);
   });
 });
 
 describe('промпт видео', () => {
-  it('реплики по порядку, слово в слово, с голосом говорящего', () => {
+  it('действие и реплики по порядку, слово в слово, с голосом говорящего', () => {
     const p = buildVideoPrompt(conflict());
+    expect(p).toContain('The goose hisses and flaps her wings.');
     const first = p.indexOf('«Обои потёрли! Залог мой!»');
     const second = p.indexOf('«Спокойно. Спрошу у юриста.»');
     expect(first).toBeGreaterThan(0);
     expect(second).toBeGreaterThan(first);
-    expect(p).toContain('the goose, shrill, loud, grumpy elderly female voice: «Обои');
-    expect(p).toContain('in Russian');
+    expect(p).toContain(`1) ${galina.who} (${galina.voice}) says in Russian: «Обои`);
+    expect(p).toContain('Only the speaker talks');
     expect(p).toContain(SKIT_FORBIDDEN);
   });
 
-  it('реплика героя не из состава сценки — ошибка', () => {
+  it('реплика героя не из состава и сценка без реплик — ошибка', () => {
     const s = conflict();
     s.lines.push({ hero: 'boris', text: 'Не положено.' });
     expect(() => buildVideoPrompt(s)).toThrow(/boris.*не в составе/);
+    const mute = conflict();
+    mute.lines = [];
+    expect(() => buildVideoPrompt(mute)).toThrow(/нет реплик/);
   });
 });
 
-describe('отпечаток и план', () => {
-  it('та же сценка — тот же отпечаток; другая реплика — другой', () => {
-    const a = planSkit(conflict(), 'conflict');
-    expect(planSkit(conflict(), 'conflict').fingerprint).toBe(a.fingerprint);
-    expect(a.fingerprint).toMatch(/^[0-9a-f]{16}$/);
+describe('отпечатки', () => {
+  const pair = () => planSkits({ conflict: conflict(), punchline: punchline() });
+
+  it('та же пара — те же отпечатки; порядок полей не важен', () => {
+    const a = pair();
+    expect(a.conflict.fingerprint).toMatch(/^[0-9a-f]{16}$/);
+    expect(a.conflict.keyframeFingerprint).toMatch(/^[0-9a-f]{16}$/);
+    const reordered = Object.fromEntries(Object.entries(conflict()).reverse()) as unknown as Skit;
+    const b = planSkits({ conflict: reordered, punchline: punchline() });
+    expect(b.conflict.fingerprint).toBe(a.conflict.fingerprint);
+    expect(b.punchline.fingerprint).toBe(a.punchline.fingerprint);
+  });
+
+  it('правка реплики конфликта — новый клип конфликта с прежнего кадра, развязка та же', () => {
+    const a = pair();
     const s = conflict();
     s.lines[1].text = 'Спокойно.';
-    expect(planSkit(s, 'conflict').fingerprint).not.toBe(a.fingerprint);
+    const b = planSkits({ conflict: s, punchline: punchline() });
+    expect(b.conflict.keyframeFingerprint).toBe(a.conflict.keyframeFingerprint);
+    expect(b.conflict.fingerprint).not.toBe(a.conflict.fingerprint);
+    expect(b.punchline).toEqual(a.punchline);
   });
 
-  it('отпечаток зависит от версии труппы', () => {
-    const p = planSkit(conflict(), 'conflict');
-    expect(skitFingerprint({ ...p, troupeVersion: 'v2' })).not.toBe(p.fingerprint);
+  it('новое место конфликта перерисовывает и развязку', () => {
+    const a = pair();
+    const s = conflict();
+    s.setting = 'stairwell of an old block of flats';
+    const b = planSkits({ conflict: s, punchline: punchline() });
+    expect(b.conflict.keyframeFingerprint).not.toBe(a.conflict.keyframeFingerprint);
+    expect(b.punchline.keyframeFingerprint).not.toBe(a.punchline.keyframeFingerprint);
+    expect(b.punchline.fingerprint).not.toBe(a.punchline.fingerprint);
   });
 
-  it('развязка отличается опорой на кадр; герои — без повторов, в порядке состава', () => {
-    const c = planSkit(conflict(), 'conflict');
-    expect(planSkit(conflict(), 'punchline').fingerprint).not.toBe(c.fingerprint);
-    expect(c.heroes).toEqual(['galina', 'kesha']);
-    expect(c.troupeVersion).toBe('v1');
+  it('роль и опора на абзац отпечатки не меняют', () => {
+    const a = pair();
+    const c = conflict();
+    c.cast[0].role = 'соседка';
+    const p = punchline();
+    p.lines[0].box = 5;
+    const b = planSkits({ conflict: c, punchline: p });
+    expect(b.conflict.fingerprint).toBe(a.conflict.fingerprint);
+    expect(b.punchline.fingerprint).toBe(a.punchline.fingerprint);
+  });
+
+  it('версия труппы входит в оба отпечатка', () => {
+    const base = { kind: 'conflict' as const, keyframePrompt: 'k', videoPrompt: 'v' };
+    const v1 = skitFingerprints({ ...base, troupeVersion: 'v1' });
+    const v2 = skitFingerprints({ ...base, troupeVersion: 'v2' });
+    expect(v2.keyframeFingerprint).not.toBe(v1.keyframeFingerprint);
+    expect(v2.fingerprint).not.toBe(v1.fingerprint);
+  });
+
+  it('пустые поля, состав и реплики ловятся до промптов — с именем сценки', () => {
+    const p = punchline();
+    delete (p as any).setting;
+    expect(() => planSkits({ conflict: conflict(), punchline: p })).toThrow(/сценка punchline: пустое поле setting/);
+    const c = conflict();
+    c.lines[0].text = '  ';
+    expect(() => planSkits({ conflict: c, punchline: punchline() })).toThrow(/сценка conflict: пустая реплика героя galina/);
+    const one = conflict();
+    one.cast = [one.cast[0]];
+    one.lines = [one.lines[0]];
+    expect(() => planSkits({ conflict: one, punchline: punchline() })).toThrow(/сценка conflict: в составе нужно 2–3 героя/);
+    const fox = punchline();
+    fox.cast[0] = { hero: 'fox' as any, role: 'лиса' };
+    expect(() => planSkits({ conflict: conflict(), punchline: fox })).toThrow(/сценка punchline: героя «fox» нет в труппе/);
+  });
+
+  it('развязку без кадра конфликта не планируем', () => {
+    expect(() => planSkit(punchline(), 'punchline')).toThrow(/planSkits/);
+  });
+
+  it('план несёт сценку, версию труппы и героев в порядке состава', () => {
+    const c = pair().conflict;
     expect(c.skit).toEqual(conflict());
+    expect(c.troupeVersion).toBe(TROUPE_VERSION);
+    expect(c.heroes).toEqual(['galina', 'kesha']);
   });
 });
 ```
@@ -400,13 +534,21 @@ Expected: FAIL — `Cannot find module './short-skit-prompts'`.
 
 ```ts
 /**
- * Сценки роликов: форма, промпты для Nano Banana и Omni, отпечаток.
+ * Сценки роликов: форма, промпты для Nano Banana и Omni, отпечатки.
  *
  * Спека: docs/superpowers/specs/2026-10-26-shorts-skits-design.md, «Кто пишет
  * сценки». Режиссёр и сценарист отдают сценку полями, а промпт собирает код:
  * так облик и голос героев одинаковы из ролика в ролик, а запреты (текст,
- * экраны, логотипы, дети) не забываются. Место и действие пишутся
- * по-английски — они идут прямо в промпт; реплики — по-русски.
+ * экраны, логотипы, дети) не забываются. Место, первый кадр и действие пишутся
+ * по-английски — они идут прямо в промпты; реплики — по-русски. Роль героя в
+ * промпты не идёт: русский текст в кавычках генератор картинок охотно рисует
+ * надписью.
+ *
+ * Отпечатков два. Кадр-эталон студия хранит по отпечатку кадра, клип — по
+ * отпечатку клипа, который включает отпечаток кадра. Кадр развязки рисуется по
+ * кадру конфликта, поэтому его отпечаток включает отпечаток кадра конфликта:
+ * новое место конфликта перерисует и развязку, а новая реплика переснимет
+ * только клип своей сценки — с прежнего кадра.
  *
  * `SkitPlan` — то, что читает студия (зеркало studio/src/types.ts).
  */
@@ -424,9 +566,13 @@ export interface SkitLine {
 }
 
 export interface Skit {
-  /** 2–3 героя; role — из ролей героя. */
+  /** 2–3 разных героя; role — из ролей героя, для режиссёра и сценариста. */
   cast: { hero: TroupeId; role: string }[];
+  /** Место, одной фразой. */
   setting: string;
+  /** Первый кадр: расстановка и позы до начала действия — по нему рисуется кадр-эталон. */
+  opening: string;
+  /** Что происходит за 8 секунд и визуальный гэг — по нему Omni оживляет кадр. */
   action: string;
   /** 1–3 реплики, всего до 25 слов. */
   lines: SkitLine[];
@@ -435,39 +581,62 @@ export interface Skit {
 export interface SkitPlan {
   skit: Skit;
   troupeVersion: string;
-  /** Чьи портреты нужны кадру — по порядку состава, без повторов. */
+  /** Чьи портреты нужны кадру — в порядке состава. */
   heroes: TroupeId[];
   keyframePrompt: string;
   videoPrompt: string;
+  /** Отпечаток кадра-эталона: по нему студия хранит и переиспользует кадр. */
+  keyframeFingerprint: string;
+  /** Отпечаток клипа: отпечаток кадра и промпт видео. Клип с тем же отпечатком не переснимается. */
   fingerprint: string;
 }
 
 export const SKIT_STYLE =
   'Claymation stop-motion: handmade plasticine characters with visible fingerprints and clay texture, warm miniature set lighting.';
-export const SKIT_FRAMING =
-  'Tall vertical 9:16 phone frame. The picture fills the whole frame edge to edge: no borders, no letterbox bars, no split screen. The camera is close, the characters are big.';
+export const SKIT_FRAMING = [
+  'Tall vertical 9:16 phone frame.',
+  'The picture fills the whole frame edge to edge: no borders, no letterbox bars, no blurred bands, no split screen, no picture-in-picture; the wall continues above and the floor below all the way to the edges.',
+  'The characters are big, their faces in the middle of the frame, between a third and three fifths of its height: the top third is calm background, and the lower part shows only bodies, floor and props — titles go there.',
+].join(' ');
 export const SKIT_FORBIDDEN =
-  'No text, letters, subtitles or logos anywhere. Any phone is seen from the back, its screen is not visible. No real people and no children.';
+  'No text, letters, subtitles or logos anywhere. Any phone, monitor or TV is turned away, its screen is not visible. No real people and no children.';
+
+/** Пробелы схлопнуты: лишний пробел от модели не должен менять отпечаток — пересъёмка стоит денег. */
+const clean = (s: string): string => String(s ?? '').replace(/\s+/g, ' ').trim();
+/** Фраза с точкой в конце — модель пишет то с точкой, то без. */
+const sentence = (s: string): string => {
+  const t = clean(s);
+  return /[.!?…]$/.test(t) ? t : `${t}.`;
+};
 
 function castHeroes(skit: Skit): Hero[] {
+  if (!skit.cast?.length) throw new Error('в сценке нет героев');
+  const seen = new Set<string>();
   return skit.cast.map((c) => {
     const h = heroById(c.hero);
-    if (!h) throw new Error(`skit: героя «${c.hero}» нет в труппе ${TROUPE_VERSION}`);
+    if (!h) throw new Error(`героя «${c.hero}» нет в труппе ${TROUPE_VERSION}`);
+    if (seen.has(h.id)) throw new Error(`«${c.hero}» дважды в составе сценки`);
+    seen.add(h.id);
     return h;
   });
 }
 
-/** Кадр-эталон: начало сценки. У развязки — опора на кадр конфликта (последний из присланных портретов). */
+/**
+ * Кадр-эталон: первый кадр сценки. Картинки уходят в генератор так: портреты
+ * героев в порядке состава, у развязки последней — кадр конфликта.
+ */
 export function buildKeyframePrompt(skit: Skit, o: { continuity: boolean }): string {
   const heroes = castHeroes(skit);
-  const cast = skit.cast.map((c, i) => `${i + 1}) ${heroes[i].look}, playing «${c.role}»`).join('; ');
+  const cast = heroes.map((h, i) => `${i + 1}) ${h.look}`).join('; ');
   return [
     SKIT_STYLE,
-    `Keep every character exactly as in the reference portraits: ${cast}.`,
+    `The first ${heroes.length} images are portraits of the characters, in this order: ${cast}. Keep each character's look exactly as in the portrait; poses follow the scene.`,
+    o.continuity
+      ? 'The last image is the previous scene: keep the same costumes and lighting, and the same place unless the setting below says otherwise.'
+      : '',
     `Exactly ${heroes.length} characters, each appears once.`,
-    o.continuity ? 'Same place, costumes and lighting as in the last reference image (the previous scene).' : '',
-    `Setting: ${skit.setting}.`,
-    `The opening moment of the scene: ${skit.action}`,
+    sentence(`Setting: ${skit.setting}`),
+    sentence(`The picture: ${skit.opening}`),
     SKIT_FRAMING,
     SKIT_FORBIDDEN,
   ]
@@ -475,43 +644,82 @@ export function buildKeyframePrompt(skit: Skit, o: { continuity: boolean }): str
     .join(' ');
 }
 
-/** Клип: действие и реплики по порядку, каждая — с голосом говорящего из паспорта. */
+/** Клип: действие и реплики по порядку, у каждой — кто говорит и каким голосом (из паспорта). */
 export function buildVideoPrompt(skit: Skit): string {
   const cast = new Set(castHeroes(skit).map((h) => h.id));
+  if (!skit.lines?.length) throw new Error('в сценке нет реплик');
   const said = skit.lines
     .map((l, i) => {
       const h = heroById(l.hero);
-      if (!h || !cast.has(h.id)) throw new Error(`skit: «${l.hero}» говорит реплику, но не в составе сценки`);
-      return `${i + 1}) ${h.who}, ${h.voice}: «${l.text}»`;
+      if (!h || !cast.has(h.id)) throw new Error(`«${l.hero}» говорит реплику, но не в составе сценки`);
+      return `${i + 1}) ${h.who} (${h.voice}) says in Russian: «${clean(l.text)}»`;
     })
     .join(' ');
   return [
     SKIT_STYLE,
     'Animate this image: keep the characters, the set and the lighting exactly as in it.',
-    skit.action,
-    `Dialogue in Russian, spoken clearly in this order, each line word for word: ${said}`,
-    'Lips move with the speech. Slightly jerky stop-motion movement, small comic gestures, no camera cuts, no music.',
+    sentence(skit.action),
+    `Dialogue, spoken clearly in this order, each line word for word: ${said}`,
+    'The first line starts right away. Only the speaker talks, the others listen; mouths and beaks move with the speech.',
+    'Slightly jerky stop-motion movement, small comic gestures, no camera cuts, no music.',
     SKIT_FORBIDDEN,
   ].join(' ');
 }
 
-/** Отпечаток — от версии труппы и обоих промптов: правка шаблона тоже переснимает сценку. */
-export function skitFingerprint(p: Pick<SkitPlan, 'troupeVersion' | 'keyframePrompt' | 'videoPrompt'>): string {
-  return createHash('sha256').update([p.troupeVersion, p.keyframePrompt, p.videoPrompt].join('\n')).digest('hex').slice(0, 16);
+/**
+ * Поля сценки проверяются до промптов: опечатка в имени поля дала бы «undefined»
+ * в платном промпте, а сценарий проверяется только на сборке — после трат.
+ */
+function assertSkit(skit: Skit): void {
+  if (!skit || typeof skit !== 'object') throw new Error('нет сценки');
+  for (const f of ['setting', 'opening', 'action'] as const) {
+    if (!clean(skit[f])) throw new Error(`пустое поле ${f}`);
+  }
+  if (!Array.isArray(skit.cast) || skit.cast.length < 2 || skit.cast.length > 3) throw new Error('в составе нужно 2–3 героя');
+  for (const c of skit.cast) if (!clean(c?.role)) throw new Error(`у героя ${c?.hero} нет роли`);
+  if (!Array.isArray(skit.lines) || skit.lines.length < 1 || skit.lines.length > 3) throw new Error('нужно 1–3 реплики');
+  for (const l of skit.lines) if (!clean(l?.text)) throw new Error(`пустая реплика героя ${l?.hero}`);
 }
 
-export function planSkit(skit: Skit, kind: SkitKind): SkitPlan {
-  const keyframePrompt = buildKeyframePrompt(skit, { continuity: kind === 'punchline' });
-  const videoPrompt = buildVideoPrompt(skit);
-  const heroes = [...new Set(skit.cast.map((c) => c.hero))];
-  return {
-    skit,
-    troupeVersion: TROUPE_VERSION,
-    heroes,
-    keyframePrompt,
-    videoPrompt,
-    fingerprint: skitFingerprint({ troupeVersion: TROUPE_VERSION, keyframePrompt, videoPrompt }),
-  };
+const hash16 = (parts: string[]): string => createHash('sha256').update(JSON.stringify(parts)).digest('hex').slice(0, 16);
+
+/** Отпечатки сценки. У развязки в отпечаток кадра входит отпечаток кадра конфликта. */
+export function skitFingerprints(p: {
+  kind: SkitKind;
+  troupeVersion: string;
+  keyframePrompt: string;
+  videoPrompt: string;
+  conflictKeyframe?: string;
+}): { keyframeFingerprint: string; fingerprint: string } {
+  const keyframeFingerprint = hash16([p.kind, p.troupeVersion, p.keyframePrompt, p.conflictKeyframe ?? '']);
+  return { keyframeFingerprint, fingerprint: hash16([keyframeFingerprint, p.videoPrompt]) };
+}
+
+/** Одна сценка. Развязке нужен отпечаток кадра конфликта — пару планирует planSkits. Ошибки — с именем сценки. */
+export function planSkit(skit: Skit, kind: SkitKind, conflictKeyframe?: string): SkitPlan {
+  if (kind === 'punchline' && !conflictKeyframe) {
+    throw new Error('сценка punchline: развязка рисуется по кадру конфликта — планируйте пару через planSkits');
+  }
+  try {
+    assertSkit(skit);
+    const keyframePrompt = buildKeyframePrompt(skit, { continuity: kind === 'punchline' });
+    const videoPrompt = buildVideoPrompt(skit);
+    return {
+      skit,
+      troupeVersion: TROUPE_VERSION,
+      heroes: skit.cast.map((c) => c.hero),
+      keyframePrompt,
+      videoPrompt,
+      ...skitFingerprints({ kind, troupeVersion: TROUPE_VERSION, keyframePrompt, videoPrompt, conflictKeyframe }),
+    };
+  } catch (e) {
+    throw new Error(`сценка ${kind}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+export function planSkits(s: Record<SkitKind, Skit>): Record<SkitKind, SkitPlan> {
+  const conflict = planSkit(s.conflict, 'conflict');
+  return { conflict, punchline: planSkit(s.punchline, 'punchline', conflict.keyframeFingerprint) };
 }
 ```
 
@@ -519,19 +727,19 @@ export function planSkit(skit: Skit, kind: SkitKind): SkitPlan {
 
 ```bash
 git -C "$WT" add src/shorts/short-skit-prompts.ts
-git -C "$WT" commit -m "feat(shorts): промпты сценок кодом — облик и голос из паспортов, постоянные запреты, отпечаток
+git -C "$WT" commit -m "feat(shorts): промпты сценок кодом — облик и голос из паспортов, постоянные запреты, отпечатки кадра и клипа
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 NODE_RUN_DIR=. "$WT"/studio/scripts/node-run.sh "npx jest src/shorts/short-skit-prompts.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"
 ```
 
-Expected: `Tests: 8 passed`, затем `TSC_OK`.
+Expected: `Tests: 15 passed`, затем `TSC_OK`.
 
 ---
 
 ### Task 4: Сценарий образца с готовыми промптами
 
-CLI бэкенда превращает сценки образца в `SkitPlan` и кладёт их в сценарий студии. Студия — отдельный ESM-пакет и не может импортировать код бэкенда, поэтому промпты собираются здесь.
+CLI бэкенда превращает сценки образца в пару `SkitPlan` (`planSkits`) и кладёт её в сценарий студии. Студия — отдельный ESM-пакет и не может импортировать код бэкенда, поэтому промпты собираются здесь.
 
 Сценарий образца построен на настоящей съёмке стенда (ролик `987f6045`, юрист Алексей, залог). Абзацы его ответа: 1 — «Нормальный износ за три года жизни — не повод оставлять залог себе…», 3 — ст. 622 ГК РФ про нормальный износ, 5 — ст. 15 ГК РФ: ущерб хозяйка должна доказать.
 
@@ -550,8 +758,9 @@ CLI бэкенда превращает сценки образца в `SkitPlan
       { "hero": "galina", "role": "хозяйка квартиры" },
       { "hero": "kesha", "role": "жилец" }
     ],
-    "setting": "shabby hallway of a rented flat, an open door, a suitcase by the wall",
-    "action": "The capybara with a suitcase holds out a paw for the deposit. The goose blocks the doorway, jabs a wing at a tiny scuff on the wallpaper, hisses and flaps her wings. At the end the capybara calmly takes out a phone.",
+    "setting": "a tidy but slightly worn hallway of a rented flat, the front door open",
+    "opening": "The capybara stands next to his suitcase and holds out an open paw; the goose blocks the doorway with her wings spread wide.",
+    "action": "The goose points a wing at a tiny scuff on the wallpaper, hisses and flaps her wings. The capybara listens calmly. At the end he takes a phone out of his sweater pocket, its back to the camera.",
     "lines": [
       { "hero": "galina", "text": "Обои потёрли! Залог мой, весь до копейки!" },
       { "hero": "kesha", "text": "Спокойно. Спрошу у юриста." }
@@ -562,10 +771,11 @@ CLI бэкенда превращает сценки образца в `SkitPlan
       { "hero": "kesha", "role": "жилец" },
       { "hero": "galina", "role": "хозяйка квартиры" }
     ],
-    "setting": "shabby hallway of a rented flat, an open door, a suitcase by the wall",
-    "action": "The capybara calmly holds the phone up towards the goose like a document. The goose freezes, her feathers stand on end, the bunch of keys drops from her wing, then she slowly lowers her wings.",
+    "setting": "a tidy but slightly worn hallway of a rented flat, the front door open",
+    "opening": "The goose stands in the doorway with her wings raised, clutching her bunch of keys; the capybara calmly holds up his phone towards her like an official document, its back to the camera.",
+    "action": "The capybara speaks calmly, still holding up the phone. Then the goose freezes, her feathers stand on end, the keys clatter to the floor, and she slowly lowers her wings.",
     "lines": [
-      { "hero": "kesha", "text": "Три года — это нормальный износ. Залог верните.", "box": 1 },
+      { "hero": "kesha", "text": "За три года это нормальный износ. Залог верните.", "box": 1 },
       { "hero": "galina", "text": "Га-га… ладно." }
     ]
   }
@@ -576,13 +786,13 @@ CLI бэкенда превращает сценки образца в `SkitPlan
 
 ```json
 {
-  "hook": "Хозяйка оставит весь залог из-за потёртых обоев?",
+  "hook": "Весь залог — за потёртые обои?",
   "hookBox": 1,
   "voice": "madirus",
   "speed": 1.1,
   "lines": [
-    { "id": "q", "scene": "question", "text": "Я Алексей, юрист. Жилец спросил: хозяйка не отдаёт залог из-за потёртых обоев — она вправе?" },
-    { "id": "a1", "scene": "answer", "box": 3, "text": "Квартиру возвращают с учётом нормального износа. Потёртые обои и пара царапин за три года — это он и есть." },
+    { "id": "q", "scene": "question", "text": "Я Алексей, юрист. Жилец спросил, законно ли это." },
+    { "id": "a1", "scene": "answer", "box": 3, "text": "Квартиру возвращают с учётом нормального износа. Потёртые у дивана обои и пара царапин на ламинате за три года — это и есть износ." },
     { "id": "a2", "scene": "answer", "box": 5, "text": "Ущерб хозяйка должна доказать и обосновать сумму. Сказать «не верну, и всё» нельзя." },
     { "id": "f", "scene": "final", "voice": "alena", "text": "Линкеон — восемнадцать ассистентов. Ссылка — в описании и в профиле." }
   ],
@@ -604,25 +814,44 @@ CLI бэкенда превращает сценки образца в `SkitPlan
  *
  * skits.json — { conflict: Skit, punchline: Skit } (src/shorts/short-skit-prompts.ts);
  * script.base.json — сценарий студии без сценок (studio/src/types.ts, Script).
+ * Ошибка входа — сообщение с именем файла и код 2: скрипт — последняя проверка
+ * сценок перед платными генерациями.
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { planSkit, Skit } from '../src/shorts/short-skit-prompts';
+import { planSkits, Skit } from '../src/shorts/short-skit-prompts';
+
+function fail(file: string, msg: string): never {
+  console.error(`skit-plan: ${file} — ${msg}`);
+  process.exit(2);
+}
+
+function readJson(file: string): any {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    return fail(file, e instanceof Error ? e.message : String(e));
+  }
+}
 
 const [skitsPath, basePath, outPath] = process.argv.slice(2);
 if (!skitsPath || !basePath || !outPath) {
   console.error('usage: npx ts-node scripts/shorts-skit-plan.ts <skits.json> <script.base.json> <out/script.json>');
   process.exit(2);
 }
-const skits = JSON.parse(fs.readFileSync(skitsPath, 'utf8')) as { conflict: Skit; punchline: Skit };
-const base = JSON.parse(fs.readFileSync(basePath, 'utf8'));
-const script = {
-  ...base,
-  skits: { conflict: planSkit(skits.conflict, 'conflict'), punchline: planSkit(skits.punchline, 'punchline') },
-};
+const skits = readJson(skitsPath) as { conflict?: Skit; punchline?: Skit };
+if (!skits?.conflict || !skits?.punchline) fail(skitsPath, 'нужны обе сценки: conflict и punchline');
+const base = readJson(basePath);
+let plans: ReturnType<typeof planSkits>;
+try {
+  plans = planSkits({ conflict: skits.conflict, punchline: skits.punchline });
+} catch (e) {
+  fail(skitsPath, e instanceof Error ? e.message : String(e));
+}
+const script = { ...base, skits: plans };
 fs.mkdirSync(path.dirname(outPath), { recursive: true });
 fs.writeFileSync(outPath, JSON.stringify(script, null, 2));
-console.log(`skit-plan: ${outPath} — conflict ${script.skits.conflict.fingerprint}, punchline ${script.skits.punchline.fingerprint}`);
+console.log(`skit-plan: ${outPath} — conflict ${plans.conflict.fingerprint}, punchline ${plans.punchline.fingerprint}`);
 ```
 
 - [ ] **Step 3: Закоммитить и прогнать CLI на ноде**
@@ -632,10 +861,10 @@ git -C "$WT" add scripts/shorts-skit-plan.ts studio/samples/zalog
 git -C "$WT" commit -m "feat(shorts): сценарий образца со сценками — CLI кладёт в сценарий студии готовые промпты
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
-NODE_RUN_DIR=. "$WT"/studio/scripts/node-run.sh "npx ts-node scripts/shorts-skit-plan.ts studio/samples/zalog/skits.json studio/samples/zalog/script.base.json /tmp/skit-plan-check.json && node -e 'const s=require(\"/tmp/skit-plan-check.json\"); for (const k of [\"conflict\",\"punchline\"]) { const p=s.skits[k]; if (p.fingerprint.length !== 16 || !p.videoPrompt.includes(\"«\") || p.troupeVersion !== \"v1\") throw new Error(k); } console.log(\"PLAN_OK\", s.skits.punchline.heroes.join(\",\"))'"
+NODE_RUN_DIR=. "$WT"/studio/scripts/node-run.sh "npx ts-node scripts/shorts-skit-plan.ts studio/samples/zalog/skits.json studio/samples/zalog/script.base.json /tmp/skit-plan-check.json && node -e 'const s=require(\"/tmp/skit-plan-check.json\"); for (const k of [\"conflict\",\"punchline\"]) { const p=s.skits[k]; if (p.fingerprint.length !== 16 || p.keyframeFingerprint.length !== 16 || !p.videoPrompt.includes(\"«\") || p.troupeVersion !== \"v1\") throw new Error(k); } if (!s.skits.punchline.keyframePrompt.includes(\"previous scene\")) throw new Error(\"continuity\"); console.log(\"PLAN_OK\", s.skits.punchline.heroes.join(\",\"))' && (npx ts-node scripts/shorts-skit-plan.ts studio/samples/zalog/script.base.json studio/samples/zalog/script.base.json /tmp/skit-plan-bad.json || echo BAD_INPUT_EXIT=\$?)"
 ```
 
-Expected: `skit-plan: /tmp/skit-plan-check.json — conflict <16 hex>, punchline <16 hex>`, затем `PLAN_OK kesha,galina`.
+Expected: `skit-plan: /tmp/skit-plan-check.json — conflict <16 hex>, punchline <16 hex>`, затем `PLAN_OK kesha,galina`. Вход без сценок CLI отвергает: `skit-plan: studio/samples/zalog/script.base.json — нужны обе сценки: conflict и punchline`, затем `BAD_INPUT_EXIT=2`.
 
 ---
 
@@ -653,22 +882,47 @@ Expected: `skit-plan: /tmp/skit-plan-check.json — conflict <16 hex>, punchline
 В конец `studio/src/config.test.ts`:
 
 ```ts
-test('оживлению сценок нужен ключ Google', () => {
+test('оживлению сценок нужны ключи Google и SpeechKit; без оживления ключ Google не читается', () => {
   const animate = { capture: false, tts: false, animate: true };
-  assert.throws(() => parseConfig({}, animate), /GOOGLE_AI_API_KEY/);
-  assert.equal(parseConfig({ GOOGLE_AI_API_KEY: 'g' }, animate).googleKey, 'g');
-  assert.equal(parseConfig({}, none).googleKey, '');
+  const speech = { YANDEX_SPEECHKIT_API_KEY: 'k', YANDEX_TTS_FOLDER_ID: 'f' };
+  assert.throws(() => parseConfig(speech, animate), /GOOGLE_AI_API_KEY/);
+  assert.throws(() => parseConfig({ GOOGLE_AI_API_KEY: 'g' }, animate), /YANDEX_SPEECHKIT_API_KEY/);
+  const c = parseConfig({ GOOGLE_AI_API_KEY: 'g', ...speech }, animate);
+  assert.equal(c.googleKey, 'g');
+  assert.equal(c.speechkitKey, 'k');
+  assert.equal(parseConfig({ GOOGLE_AI_API_KEY: 'g' }, none).googleKey, '');
 });
 ```
 
-В `src/shorts/shorts.contract.spec.ts` в первый тест, в список полей, после `'disclaimer',` дописать поля сценок:
+В `src/shorts/shorts.contract.spec.ts` после строки `import * as path from 'path';` добавить `import { planSkits } from './short-skit-prompts';`, а перед последней строкой файла `});` — новый тест. Он ищет поле внутри своего типа (имена `skits` и `fingerprint` есть и в соседних типах) и берёт имена полей из настоящего плана сценок бэкенда, поэтому ловит рассинхрон в обе стороны:
 
 ```ts
-      'paragraphs', 'hookBox', 'badge', 'assistantsCount', 'disclaimer',
-      'skits', 'troupeVersion', 'heroes', 'keyframePrompt', 'videoPrompt', 'fingerprint',
+  it('сценки: студия знает те же поля, что пишет план сценок бэкенда, и в тех же типах', () => {
+    const types = studio('types.ts');
+    // Поле ищется внутри своего типа: skits и fingerprint есть и в соседних типах.
+    const block = (name: string): string => {
+      const m = types.match(new RegExp(`(?:interface ${name}(?: extends [^{]+)? |type ${name} = )\\{([\\s\\S]*?)\\n\\}`));
+      if (!m) throw new Error(`studio/src/types.ts: нет типа ${name}`);
+      return m[1];
+    };
+    const has = (name: string, field: string) => expect(block(name)).toMatch(new RegExp(`^\\s*${field}\\??:`, 'm'));
+    has('Script', 'skits');
+    const skit = {
+      cast: [{ hero: 'galina' as const, role: 'хозяйка квартиры' }, { hero: 'kesha' as const, role: 'жилец' }],
+      setting: 'hallway',
+      opening: 'at the door',
+      action: 'argue',
+      lines: [{ hero: 'kesha' as const, text: 'Это износ.', box: 1 }],
+    };
+    const { punchline } = planSkits({ conflict: skit, punchline: skit });
+    for (const f of Object.keys(punchline)) has('SkitPlan', f);
+    for (const f of Object.keys(punchline.skit)) has('Skit', f);
+    for (const f of Object.keys(punchline.skit.lines[0])) has('SkitLine', f);
+    const kind = /export type SkitKind = ([^;]+);/;
+    expect(types.match(kind)?.[1]).toBe(fs.readFileSync(path.join(__dirname, 'short-skit-prompts.ts'), 'utf8').match(kind)?.[1]);
+  });
 ```
 
-(строка `'paragraphs', 'hookBox', 'badge', 'assistantsCount', 'disclaimer',` уже есть — после неё добавляется вторая строка).
 
 - [ ] **Step 2: Закоммитить красное и убедиться, что падает**
 
@@ -681,7 +935,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 NODE_RUN_DIR=. "$WT"/studio/scripts/node-run.sh "npx jest src/shorts/shorts.contract.spec.ts"
 ```
 
-Expected: оба FAIL — в конфиге нет `googleKey` (тест ждёт ошибку про `GOOGLE_AI_API_KEY`), в `types.ts` нет `skits?:`.
+Expected: оба FAIL — тест конфига ждёт ошибку про `GOOGLE_AI_API_KEY`; сторож контракта не находит поле `skits` в типе `Script` студии.
 
 - [ ] **Step 3: Типы сценок**
 
@@ -713,24 +967,29 @@ export interface SkitLine {
 export interface Skit {
   cast: { hero: string; role: string }[];
   setting: string;
+  /** Первый кадр — по нему рисуется кадр-эталон. */
+  opening: string;
+  /** Что происходит за 8 секунд — по нему Omni оживляет кадр. */
   action: string;
   lines: SkitLine[];
 }
 
-/** Сценка, готовая к оживлению: промпты собрал бэкенд (src/shorts/short-skit-prompts.ts, SkitPlan). */
+/** Сценка, готовая к оживлению: промпты и отпечатки собрал бэкенд (src/shorts/short-skit-prompts.ts, SkitPlan). */
 export interface SkitPlan {
   skit: Skit;
   /** Версия листа труппы: портреты — assets/troupe/<версия>/<id>.png. */
   troupeVersion: string;
-  /** Чьи портреты нужны кадру — по порядку состава, без повторов. */
+  /** Чьи портреты нужны кадру — в порядке состава. */
   heroes: string[];
   keyframePrompt: string;
   videoPrompt: string;
-  /** Отпечаток промптов и версии труппы: клип с тем же отпечатком не переснимается. */
+  /** Отпечаток кадра-эталона: кадр лежит в keyframes/<отпечаток>.png и с тем же отпечатком не перерисовывается. */
+  keyframeFingerprint: string;
+  /** Отпечаток клипа (включает отпечаток кадра): клип с тем же отпечатком не переснимается. */
   fingerprint: string;
 }
 
-/** Время реплики сценки в клипе. */
+/** Время реплики сценки в клипе: line — номер в skit.lines с 0, время — мс от начала клипа. */
 export interface SkitCue {
   line: number;
   startMs: number;
@@ -740,18 +999,26 @@ export interface SkitCue {
 /** Готовая сценка. Пути — относительно папки ролика. */
 export interface SkitClip {
   fingerprint: string;
+  /** keyframes/<отпечаток кадра>.png */
   keyframe: string;
+  /** skits/<отпечаток клипа>/clip.mp4 — громкость уже выровнена. */
   clip: string;
   durationMs: number;
   /** Что распознал SpeechKit в клипе. */
   heard: string;
   cues: SkitCue[];
-  /** Сколько клипов Omni ушло на эту сценку. */
+  /** Номер удачной попытки в последнем запуске animate; оплаченные клипы считает omniSeconds. */
   attempts: number;
+  /** Настройки бесплатной обработки (громкость, пороги пауз): при их смене клип переобрабатывается из raw.mp4, без Omni. */
+  post: string;
 }
 
-/** animation.json папки ролика — итог задания animate. */
-export interface Animation {
+/**
+ * animation.json папки ролика — итог задания animate. Сценки — Partial:
+ * частично заполненный файл — нормальное состояние (одна сценка готова,
+ * другая упала). Не Animation: так называется тип DOM.
+ */
+export interface ShortAnimation {
   /** Секунды Omni, потраченные на ролик, со всеми попытками. */
   omniSeconds: number;
   skits: Partial<Record<SkitKind, SkitClip>>;
@@ -763,7 +1030,7 @@ export interface SkitTimeline {
   totalFrames: number;
 }
 
-/** Субтитр с абсолютным кадром начала — у реплик сценок. */
+/** Субтитр в кадрах от начала ролика — у реплик сценок. */
 export interface ClipCue {
   key: string;
   text: string;
@@ -820,13 +1087,15 @@ export type SkitShortProps = {
 
 2. Сигнатура: `needs: { capture: boolean; tts: boolean; worker?: boolean; animate?: boolean }`.
 
-3. В возвращаемый объект после `speechkitFolder: …,`:
+3. После строки `const worker = needs.worker === true;` добавить `const speech = needs.tts || needs.animate === true;` — оживление распознаёт речь клипа, и пустой ключ SpeechKit всплыл бы уже после оплаты Omni. В возвращаемом объекте строки `speechkitKey: …` и `speechkitFolder: …` заменить тремя строками:
 
 ```ts
-    googleKey: needs.animate === true ? required(env, 'GOOGLE_AI_API_KEY') : (env.GOOGLE_AI_API_KEY?.trim() ?? ''),
+    speechkitKey: speech ? required(env, 'YANDEX_SPEECHKIT_API_KEY') : '',
+    speechkitFolder: speech ? required(env, 'YANDEX_TTS_FOLDER_ID') : '',
+    googleKey: needs.animate === true ? required(env, 'GOOGLE_AI_API_KEY') : '',
 ```
 
-4. В комментарий над `parseConfig` дописать: «оживлению сценок — ключ Google».
+4. В комментарии над `parseConfig` фразу «озвучке — SpeechKit.» продолжить: «озвучке — SpeechKit, оживлению сценок — ключи Google и SpeechKit.» Ключ Google вне оживления не читается.
 
 В `studio/.env.example` после строки `YANDEX_TTS_FOLDER_ID=`:
 
@@ -846,7 +1115,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 NODE_RUN_DIR=. "$WT"/studio/scripts/node-run.sh "npx jest src/shorts/shorts.contract.spec.ts"
 ```
 
-Expected: студия — все тесты `pass`, затем `TSC_OK`; бэкенд — `Tests: 3 passed`.
+Expected: студия — все тесты `pass`, затем `TSC_OK`; бэкенд — `Tests: 4 passed`.
 
 ---
 
@@ -864,33 +1133,48 @@ Expected: студия — все тесты `pass`, затем `TSC_OK`; бэк
 ```ts
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { MATCH_THRESHOLD, speechMatch, speechWords } from './match';
+import { MATCH_THRESHOLD, speechCheck, speechWords } from './match';
 
-test('слова — без регистра, знаков и с «е» вместо «ё»', () => {
+test('слова — без регистра, знаков и с «е» вместо «ё»; дефис делит слово; NFD приводится к NFC', () => {
   assert.deepEqual(speechWords('Обои потёрли! Залог — мой.'), ['обои', 'потерли', 'залог', 'мой']);
   assert.deepEqual(speechWords('Га-га… ладно.'), ['га', 'га', 'ладно']);
+  assert.deepEqual(speechWords('потёрли'.normalize('NFD')), ['потерли']);
 });
 
-test('всё сказано — 1, ничего не услышано — 0', () => {
+test('всё сказано — годится; ничего не услышано — нет, обе реплики проглочены', () => {
   const lines = ['Обои потёрли! Залог мой!', 'Спокойно. Спрошу у юриста.'];
-  assert.equal(speechMatch(lines, 'обои потерли залог мой спокойно спрошу у юриста'), 1);
-  assert.equal(speechMatch(lines, ''), 0);
+  assert.deepEqual(speechCheck(lines, 'обои потерли залог мой спокойно спрошу у юриста'), { ok: true, share: 1, silentLines: [] });
+  assert.deepEqual(speechCheck(lines, ''), { ok: false, share: 0, silentLines: [0, 1] });
 });
 
-test('часть реплик проглочена — доля услышанных слов', () => {
-  assert.equal(speechMatch(['раз два три четыре'], 'раз два'), 0.5);
+test('числа цифрами и латиница не сверяются: SpeechKit пишет их по-своему', () => {
+  assert.equal(speechCheck(['Залог 40 000 рублей.'], 'залог сорок тысяч рублей').share, 1);
+  assert.equal(speechCheck(['Спрошу у Linkeon.'], 'спрошу у линкеон').share, 1);
+});
+
+test('слитное «гага» засчитывается за «га-га»', () => {
+  assert.deepEqual(speechCheck(['Га-га… ладно.'], 'гага ладно'), { ok: true, share: 1, silentLines: [] });
+  assert.equal(speechCheck(['Ай-ай-ай!'], 'айайай').share, 1);
+});
+
+test('проглоченная короткая реплика ловится, даже когда общая доля выше порога', () => {
+  const r = speechCheck(['Обои потёрли! Залог мой, весь до копейки!', 'Спокойно. Спрошу у юриста.'], 'обои потерли залог мой весь до копейки');
+  assert.ok(r.share >= MATCH_THRESHOLD);
+  assert.deepEqual(r.silentLines, [1]);
+  assert.equal(r.ok, false);
+});
+
+test('часть слов перевраны — доля услышанных; доля на пороге годится', () => {
+  assert.deepEqual(speechCheck(['раз два три четыре пять'], 'раз два три'), { ok: true, share: 0.6, silentLines: [] });
+  assert.equal(speechCheck(['раз два три четыре пять'], 'раз два').ok, false);
 });
 
 test('повтор слова считается столько раз, сколько сказан', () => {
-  assert.equal(speechMatch(['га га ладно'], 'га ладно'), 2 / 3);
+  assert.equal(speechCheck(['да да ладно'], 'да ладно').share, 2 / 3);
 });
 
 test('реплик нет — сверять нечего', () => {
-  assert.equal(speechMatch([], 'что угодно'), 1);
-});
-
-test('стартовый порог — 0,6', () => {
-  assert.equal(MATCH_THRESHOLD, 0.6);
+  assert.deepEqual(speechCheck([], 'что угодно'), { ok: true, share: 1, silentLines: [] });
 });
 ```
 
@@ -920,9 +1204,16 @@ Expected: FAIL — модуля `./match` нет (`ERR_MODULE_NOT_FOUND`).
 
 /** Доля слов реплик, которая должна прозвучать. Стартовая; окончательная подбирается на ролике-образце. */
 export const MATCH_THRESHOLD = 0.6;
+/** Слово короче — междометие или предлог: по нему не судят, прозвучала ли реплика. */
+const MIN_LINE_WORD = 3;
 
+/**
+ * Слова текста: NFC, нижний регистр, «ё» → «е», без знаков. Дефис делит слово
+ * («Га-га» → «га», «га»). Порядок слов и лишние слова при сверке не важны.
+ */
 export function speechWords(s: string): string[] {
   return s
+    .normalize('NFC')
     .toLowerCase()
     .replace(/ё/g, 'е')
     .replace(/[^\p{L}\p{N}]+/gu, ' ')
@@ -931,12 +1222,38 @@ export function speechWords(s: string): string[] {
     .filter(Boolean);
 }
 
-/** Доля слов реплик (с повторами), найденных в распознанном тексте. Реплик нет — 1. */
-export function speechMatch(lines: string[], heard: string): number {
-  const expected = lines.flatMap(speechWords);
-  if (!expected.length) return 1;
+/**
+ * Сверяются только слова с кириллицей: числа SpeechKit пишет то словами, то
+ * цифрами, латиницу («Linkeon») — по-своему, и пересъёмка этого не лечит.
+ */
+const checkable = (w: string): boolean => /\p{Script=Cyrillic}/u.test(w);
+
+/** Слитное «гага» на месте «га-га» из реплик — повтор слога: так SpeechKit пишет междометия. */
+function unglue(w: string, vocab: Set<string>): string[] {
+  if (vocab.has(w)) return [w];
+  for (let n = 2; n <= w.length / 2; n++) {
+    const syl = w.slice(0, n);
+    if (w.length % n === 0 && vocab.has(syl) && syl.repeat(w.length / n) === w) return Array<string>(w.length / n).fill(syl);
+  }
+  return [w];
+}
+
+export interface SpeechCheck {
+  /** Клип годится: доля не ниже порога и ни одна реплика не проглочена. */
+  ok: boolean;
+  /** Доля сверяемых слов реплик (с повторами), найденных в распознанном. */
+  share: number;
+  /** Номера реплик (с 0), от которых не услышано ни одного слова от трёх букв. */
+  silentLines: number[];
+}
+
+export function speechCheck(lines: string[], heard: string): SpeechCheck {
+  const perLine = lines.map((l) => speechWords(l).filter(checkable));
+  const vocab = new Set(perLine.flat());
   const pool = new Map<string, number>();
-  for (const w of speechWords(heard)) pool.set(w, (pool.get(w) ?? 0) + 1);
+  for (const w of speechWords(heard).flatMap((x) => unglue(x, vocab))) pool.set(w, (pool.get(w) ?? 0) + 1);
+  const heardWords = new Set(pool.keys());
+  const expected = perLine.flat();
   let hit = 0;
   for (const w of expected) {
     const left = pool.get(w) ?? 0;
@@ -945,7 +1262,12 @@ export function speechMatch(lines: string[], heard: string): number {
       pool.set(w, left - 1);
     }
   }
-  return hit / expected.length;
+  const share = expected.length ? hit / expected.length : 1;
+  const silentLines = perLine
+    .map((words, i) => ({ i, long: words.filter((w) => w.length >= MIN_LINE_WORD) }))
+    .filter(({ long }) => long.length > 0 && !long.some((w) => heardWords.has(w)))
+    .map(({ i }) => i);
+  return { ok: share >= MATCH_THRESHOLD && silentLines.length === 0, share, silentLines };
 }
 ```
 
@@ -959,7 +1281,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 "$WT"/studio/scripts/node-run.sh "npx tsx --test src/animate/match.test.ts"
 ```
 
-Expected: `# pass 6`, `# fail 0`.
+Expected: `# pass 8`, `# fail 0`.
 
 ---
 
@@ -1022,6 +1344,49 @@ test('отрезков нет — делится весь клип; реплик
   ]);
   assert.deepEqual(lineCues([], [{ startMs: 0, endMs: 8000 }], 8000), []);
 });
+
+test('паузы не по порядку, перекрытые и вложенные — отрезки всё равно по порядку и без пересечений', () => {
+  const silences = [
+    { start: 5.0, end: 6.0, duration: 1.0 },
+    { start: 1.0, end: 2.0, duration: 1.0 },
+    { start: 1.5, end: 2.5, duration: 1.0 },
+    { start: 5.2, end: 5.4, duration: 0.2 },
+  ];
+  assert.deepEqual(voicedSpans(silences, 8000), [
+    { startMs: 0, endMs: 1000 },
+    { startMs: 2500, endMs: 5000 },
+    { startMs: 6000, endMs: 8000 },
+  ]);
+});
+
+test('тишина на весь клип — отрезков нет; отрезок ровно 300 мс остаётся, 299 мс — нет; пауза за концом клипа не тянет отрезок', () => {
+  assert.deepEqual(voicedSpans([{ start: 0, end: 8, duration: 8 }], 8000), []);
+  assert.deepEqual(voicedSpans([{ start: 0.3, end: 8, duration: 7.7 }], 8000), [{ startMs: 0, endMs: 300 }]);
+  assert.deepEqual(voicedSpans([{ start: 0.299, end: 8, duration: 7.701 }], 8000), []);
+  assert.deepEqual(voicedSpans([{ start: 8.3, end: 8.6, duration: 0.3 }], 8000), [{ startMs: 0, endMs: 8000 }]);
+});
+
+test('в репликах по два предложения — граница встаёт в паузу между героями, а не посреди речи', () => {
+  const lines = ['Обои потёрли! Залог мой!', 'Спокойно. Спрошу у юриста.'];
+  const spans = [
+    { startMs: 500, endMs: 1200 },
+    { startMs: 1500, endMs: 4200 },
+    { startMs: 4600, endMs: 5400 },
+    { startMs: 5700, endMs: 6600 },
+  ];
+  assert.deepEqual(lineCues(lines, spans, 8000), [
+    { line: 0, startMs: 500, endMs: 4200 },
+    { line: 1, startMs: 4600, endMs: 6600 },
+  ]);
+});
+
+test('отрезков столько же, сколько реплик, но случайно (стук и слитная речь) — делится по длине текста', () => {
+  const lines = ['Обои потёрли! Залог мой!', 'Спокойно. Спрошу у юриста.'];
+  assert.deepEqual(lineCues(lines, [{ startMs: 300, endMs: 700 }, { startMs: 1500, endMs: 6000 }], 8000), [
+    { line: 0, startMs: 300, endMs: 3036 },
+    { line: 1, startMs: 3036, endMs: 6000 },
+  ]);
+});
 ```
 
 В `studio/package.json` в `scripts.test` заменить хвост `src/animate/match.test.ts"` на `src/animate/match.test.ts src/animate/cues.test.ts"`.
@@ -1046,12 +1411,14 @@ Expected: FAIL — модуля `./cues` нет.
 /**
  * Тишина в файле. По умолчанию — провалы звука в готовом ролике (−45 дБ, от
  * 0,5 с); паузы между репликами сценки ищутся своими порогами (animate/cues.ts).
+ * Порог — число в дБ: строку без «dB» ffmpeg не принимает, и сбой случился бы
+ * уже после оплаченного клипа.
  */
-export async function detectSilences(file: string, totalSec: number, o: { noise?: string; minSec?: number } = {}): Promise<Silence[]> {
+export async function detectSilences(file: string, totalSec: number, o: { noiseDb?: number; minSec?: number } = {}): Promise<Silence[]> {
   // silencedetect пишет в stderr, ffmpeg при этом выходит с кодом 0.
   const { stderr } = await run(
     'ffmpeg',
-    ['-hide_banner', '-nostats', '-i', file, '-af', `silencedetect=noise=${o.noise ?? '-45dB'}:d=${o.minSec ?? 0.5}`, '-f', 'null', '-'],
+    ['-hide_banner', '-nostats', '-i', file, '-af', `silencedetect=noise=${o.noiseDb ?? -45}dB:d=${o.minSec ?? 0.5}`, '-f', 'null', '-'],
     { maxBuffer: 16 * 1024 * 1024 },
   );
   return parseSilences(stderr, totalSec);
@@ -1071,47 +1438,83 @@ import type { SkitCue } from '../types';
  * поэтому порог выше, чем у проверки провалов звука в готовом ролике.
  * Стартовые значения; сверяются на ролике-образце.
  */
-export const PAUSE_DETECT = { noise: '-30dB', minSec: 0.25 };
+export const PAUSE_DETECT = { noiseDb: -30, minSec: 0.25 } as const;
 
-/** Отрезок речи короче этого — щелчок или вздох, а не реплика. */
+/** Отрезок речи короче этого — щелчок или стук, а не реплика. */
 const MIN_SPAN_MS = 300;
+/** Во сколько раз доля отрезка в речи может отличаться от доли текста реплики, чтобы считать их парой. */
+const SPAN_TEXT_RATIO = 3;
 
 export interface Span {
   startMs: number;
   endMs: number;
 }
 
-/** Отрезки речи — промежутки между паузами. */
+/**
+ * Отрезки речи — промежутки между паузами, по порядку и без пересечений.
+ * Паузы могут прийти не по порядку и перекрываться; всё зажимается в клип.
+ */
 export function voicedSpans(silences: Silence[], totalMs: number, minMs = MIN_SPAN_MS): Span[] {
   const spans: Span[] = [];
   let cursor = 0;
   for (const s of [...silences].sort((a, b) => a.start - b.start)) {
-    const start = Math.round(s.start * 1000);
+    const start = Math.min(totalMs, Math.round(s.start * 1000));
     if (start - cursor >= minMs) spans.push({ startMs: cursor, endMs: start });
-    cursor = Math.max(cursor, Math.round(s.end * 1000));
+    cursor = Math.max(cursor, start, Math.min(totalMs, Math.round(s.end * 1000)));
   }
   if (totalMs - cursor >= minMs) spans.push({ startMs: cursor, endMs: totalMs });
   return spans;
 }
 
+const distance = (gap: Span, t: number): number => (t < gap.startMs ? gap.startMs - t : t > gap.endMs ? t - gap.endMs : 0);
+
 /**
- * Время субтитров реплик сценки. Отрезков речи столько же, сколько реплик, —
- * реплика на отрезок. Иначе речь (от начала первого отрезка до конца
- * последнего; без отрезков — весь клип) делится пропорционально длине реплик.
+ * Время субтитров реплик сценки по отрезкам речи из voicedSpans.
+ * - Отрезков столько же, сколько реплик, и доля каждого в речи похожа на долю
+ *   текста его реплики (не дальше чем в SPAN_TEXT_RATIO раз), — реплика на отрезок.
+ * - Отрезков больше (в реплике два предложения — пауза и внутри) — граница
+ *   каждой реплики встаёт в паузу, ближайшую к оценке по длине текста.
+ * - Иначе речь от начала первого отрезка до конца последнего (без отрезков —
+ *   весь клип) делится по длине текста.
  */
 export function lineCues(lines: string[], spans: Span[], totalMs: number): SkitCue[] {
   if (!lines.length) return [];
-  if (spans.length === lines.length) return spans.map((s, i) => ({ line: i, startMs: s.startMs, endMs: s.endMs }));
-  const from = spans.length ? spans[0].startMs : 0;
-  const to = spans.length ? spans[spans.length - 1].endMs : totalMs;
   const weights = lines.map((l) => Math.max(1, l.length));
   const total = weights.reduce((n, w) => n + w, 0);
+  const voiced = spans.reduce((n, s) => n + s.endMs - s.startMs, 0);
+  const plausible = spans.every((s, i) => {
+    const r = (s.endMs - s.startMs) / voiced / (weights[i] / total);
+    return r >= 1 / SPAN_TEXT_RATIO && r <= SPAN_TEXT_RATIO;
+  });
+  if (spans.length === lines.length && plausible) return spans.map((s, i) => ({ line: i, startMs: s.startMs, endMs: s.endMs }));
+
+  const from = spans.length ? spans[0].startMs : 0;
+  const to = spans.length ? spans[spans.length - 1].endMs : totalMs;
+  const gaps = spans.slice(1).map((s, i) => ({ startMs: spans[i].endMs, endMs: s.startMs }));
+  const snap = spans.length > lines.length;
   const cues: SkitCue[] = [];
   let at = from;
+  let acc = 0;
+  let next = 0;
   lines.forEach((_, i) => {
-    const end = i === lines.length - 1 ? to : Math.round(at + ((to - from) * weights[i]) / total);
-    cues.push({ line: i, startMs: at, endMs: end });
-    at = end;
+    acc += weights[i];
+    if (i === lines.length - 1) {
+      cues.push({ line: i, startMs: at, endMs: to });
+      return;
+    }
+    const est = from + Math.round(((to - from) * acc) / total);
+    if (!snap) {
+      cues.push({ line: i, startMs: at, endMs: est });
+      at = est;
+      return;
+    }
+    // Каждой следующей границе нужна своя пауза — их и оставляем в запасе.
+    const left = lines.length - 2 - i;
+    let best = next;
+    for (let j = next; j < gaps.length - left; j++) if (distance(gaps[j], est) < distance(gaps[best], est)) best = j;
+    cues.push({ line: i, startMs: at, endMs: gaps[best].startMs });
+    at = gaps[best].endMs;
+    next = best + 1;
   });
   return cues;
 }
@@ -1133,7 +1536,7 @@ Expected: все `pass`, `# fail 0`.
 
 ### Task 8: Клиент Google — кадр Nano Banana Pro и клип Omni
 
-Формы запросов и ответов сняты живыми вызовами 24–26.10.2026 (`src/misc/veo.service.ts` в `origin/main`, прототипы `~/shorts-style/keys.py` и `omni.py` на ноде).
+Формы запросов и ответов сняты живыми вызовами 24–26.10.2026 (`src/misc/veo.service.ts` в `origin/main`, прототипы `~/shorts-style/keys.py` и `omni.py` на ноде). Генерация Omni оплачивается с запуска, поэтому клиент держится за неё: сбой опроса (сеть, таймаут, обрыв тела, не-JSON, 5xx, 408, 429, незнакомый статус) — повод опросить ещё раз, а не бросить клип. У каждого запроса таймаут, срок опроса — по часам. Поминутный лимит пережидается на месте. Кадр возвращается со своим типом: Nano Banana Pro отдаёт JPEG. Ключ в сообщения не попадает, даже если Google повторил его в ответе.
 
 **Files:**
 - Create: `studio/src/animate/google.ts`
@@ -1148,21 +1551,45 @@ Expected: все `pass`, `# fail 0`.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { StudioError } from '../errors';
-import { CLIP_SEC, generateKeyframe, googleHttpError, KEYFRAME_MODEL, OMNI_MODEL, startClip, waitClip, type GoogleDeps } from './google';
+import {
+  CLEAR_REFUSALS,
+  CLIP_SEC,
+  generateKeyframe,
+  googleHttpError,
+  imageMime,
+  KEYFRAME_MODEL,
+  OMNI_MODEL,
+  rateLimitDelayMs,
+  startClip,
+  waitClip,
+  type GoogleDeps,
+} from './google';
 
-type Reply = { status?: number; body: unknown } | Error;
+type Reply = { status?: number; body: unknown } | Error | (() => Response);
 
-/** Подделка fetch: отвечает по очереди и запоминает запросы. */
-function fake(replies: Reply[]) {
+/** Подделка fetch с виртуальными часами: пауза двигает время, каждый запрос — на costMs. */
+function fake(replies: Reply[], costMs = 0) {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
+  let t = 0;
   const f = (async (url: string | URL | Request, init?: RequestInit) => {
     calls.push({ url: String(url), init });
+    t += costMs;
     const r = replies.shift();
     if (!r) throw new Error('fake: ответов больше нет');
     if (r instanceof Error) throw r;
+    if (typeof r === 'function') return r();
     return new Response(typeof r.body === 'string' ? r.body : JSON.stringify(r.body), { status: r.status ?? 200 });
   }) as typeof fetch;
-  const deps: GoogleDeps = { apiKey: 'KEY', fetch: f, sleep: async () => {}, pollEveryMs: 1, pollTimeoutMs: 3 };
+  const deps: GoogleDeps = {
+    apiKey: 'AIzaSyTESTKEY0123456789abcdefghij',
+    fetch: f,
+    sleep: async (ms) => {
+      t += ms;
+    },
+    now: () => t,
+    pollEveryMs: 1,
+    pollTimeoutMs: 3,
+  };
   return { deps, calls };
 }
 
@@ -1172,16 +1599,28 @@ const isErr = (code: string, retryable: boolean) => (e: unknown) =>
 const done = (data: Buffer) => ({
   body: { status: 'completed', steps: [{ type: 'thought' }, { type: 'model_output', content: [{ type: 'text', text: 'вот' }, { type: 'video', data: data.toString('base64') }] }] },
 });
+const inProgress = { body: { status: 'in_progress' } };
+const torn = () =>
+  new Response(
+    new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('{"status":"completed","steps":[{"type":"model_output","content":[{"type":"video","data":"AAAA'));
+        c.error(new TypeError('terminated'));
+      },
+    }),
+    { status: 200 },
+  );
+const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]);
 
-test('кадр: портреты инлайном перед текстом, 9:16, ключ в заголовке, картинка из ответа', async () => {
-  const png = Buffer.from('PNG');
+test('кадр: портреты инлайном перед текстом, 9:16, ключ в заголовке, картинка с её типом', async () => {
   const { deps, calls } = fake([
-    { body: { candidates: [{ content: { parts: [{ text: 'ok' }, { inlineData: { mimeType: 'image/png', data: png.toString('base64') } }] } }] } },
+    { body: { candidates: [{ content: { parts: [{ text: 'ok' }, { inlineData: { mimeType: 'image/jpeg', data: JPEG.toString('base64') } }] } }] } },
   ]);
   const refs = [{ data: Buffer.from('a'), mime: 'image/png' }, { data: Buffer.from('b'), mime: 'image/png' }];
-  assert.deepEqual(await generateKeyframe(deps, 'промпт', refs), png);
+  assert.deepEqual(await generateKeyframe(deps, 'промпт', refs), { data: JPEG, mime: 'image/jpeg' });
   assert.match(calls[0].url, new RegExp(`models/${KEYFRAME_MODEL}:generateContent$`));
-  assert.equal((calls[0].init?.headers as Record<string, string>)['x-goog-api-key'], 'KEY');
+  assert.equal((calls[0].init?.headers as Record<string, string>)['x-goog-api-key'], deps.apiKey);
+  assert.ok(calls[0].init?.signal, 'у запроса нет таймаута');
   const body = JSON.parse(String(calls[0].init?.body));
   const parts = body.contents[0].parts;
   assert.equal(parts.length, 3);
@@ -1190,63 +1629,110 @@ test('кадр: портреты инлайном перед текстом, 9:1
   assert.deepEqual(body.generationConfig, { responseModalities: ['IMAGE'], imageConfig: { aspectRatio: '9:16' } });
 });
 
-test('кадр без картинки (RECITATION приходит без ошибки) — повторяемая ошибка с причиной', async () => {
-  const { deps } = fake([{ body: { candidates: [{ finishReason: 'RECITATION', content: { parts: [] } }] } }]);
-  await assert.rejects(generateKeyframe(deps, 'p', []), (e: unknown) => isErr('keyframe', true)(e) && /RECITATION/.test((e as Error).message));
+test('тип картинки без mimeType — по сигнатуре', async () => {
+  assert.equal(imageMime(JPEG), 'image/jpeg');
+  assert.equal(imageMime(Buffer.from([0x89, 0x50, 0x4e, 0x47])), 'image/png');
+  const { deps } = fake([{ body: { candidates: [{ content: { parts: [{ inlineData: { data: JPEG.toString('base64') } }] } }] } }]);
+  assert.equal((await generateKeyframe(deps, 'p', [])).mime, 'image/jpeg');
+});
+
+test('кадр без картинки: RECITATION — повторяемая ошибка, заблокированный промпт — без повтора', async () => {
+  const a = fake([{ body: { candidates: [{ finishReason: 'RECITATION', content: { parts: [] } }] } }]);
+  await assert.rejects(generateKeyframe(a.deps, 'p', []), (e: unknown) => isErr('keyframe', true)(e) && /RECITATION/.test((e as Error).message));
+  const b = fake([{ body: { promptFeedback: { blockReason: 'PROHIBITED_CONTENT' } } }]);
+  await assert.rejects(generateKeyframe(b.deps, 'p', []), (e: unknown) => isErr('keyframe', false)(e) && /PROHIBITED_CONTENT/.test((e as Error).message));
 });
 
 test('HTTP-ошибки Google: квота, ключ и снятая модель не повторяются', () => {
   assert.ok(isErr('google_quota', false)(googleHttpError('omni', 429, '{}')));
   assert.ok(isErr('google_quota', false)(googleHttpError('keyframe', 400, 'RESOURCE_EXHAUSTED')));
   assert.ok(isErr('google_auth', false)(googleHttpError('omni', 403, 'denied')));
+  const badKey = JSON.stringify({ error: { code: 400, status: 'INVALID_ARGUMENT', message: 'API key not valid.', details: [{ reason: 'API_KEY_INVALID' }] } });
+  assert.ok(isErr('google_auth', false)(googleHttpError('omni', 400, badKey)));
   assert.ok(isErr('model_gone', false)(googleHttpError('omni', 404, 'not found')));
   assert.ok(isErr('omni_rejected', true)(googleHttpError('omni', 400, '{"error":{"status":"INVALID_ARGUMENT"}}')));
   assert.ok(isErr('omni_failed', true)(googleHttpError('omni', 503, 'unavailable')));
   assert.ok(isErr('keyframe', true)(googleHttpError('keyframe', 500, 'oops')));
 });
 
-test('запуск клипа: Omni, фоновый, кадр и текст, 9:16 720p 8 с', async () => {
+test('ключ из ответа Google в сообщение не попадает', () => {
+  const body = JSON.stringify({ error: { code: 403, message: "Consumer 'api_key:AIzaSyTESTKEY0123456789abcdefghij' has been suspended." } });
+  assert.doesNotMatch(googleHttpError('omni', 403, body).message, /AIzaSyTESTKEY/);
+});
+
+test('поминутный лимит пережидается на месте и не сжигает попытку; суточный — нет', async () => {
+  const perMinute = { status: 429, body: { error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'Quota exceeded', details: [{ retryDelay: '7s' }] } } };
+  assert.equal(rateLimitDelayMs(JSON.stringify(perMinute.body)), 7000);
+  const daily = JSON.stringify({ error: { code: 429, message: 'Quota exceeded for metric: generate_content_free_tier_requests, limit: 0' } });
+  assert.equal(rateLimitDelayMs(daily), null);
+  const { deps, calls } = fake([perMinute, { body: { candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: 'AA==' } }] } }] } }]);
+  assert.equal((await generateKeyframe(deps, 'p', [])).mime, 'image/png');
+  assert.equal(calls.length, 2);
+});
+
+test('запуск клипа: Omni, фоновый, кадр с его типом и текст, 9:16 720p 8 с', async () => {
   const { deps, calls } = fake([{ body: { id: 'int-1', status: 'in_progress' } }]);
-  assert.equal(await startClip(deps, 'сценка', { data: Buffer.from('kf'), mime: 'image/png' }), 'int-1');
+  assert.equal(await startClip(deps, 'сценка', { data: JPEG, mime: 'image/jpeg' }), 'int-1');
   assert.match(calls[0].url, /\/v1beta\/interactions$/);
+  assert.equal((calls[0].init?.headers as Record<string, string>)['x-goog-api-key'], deps.apiKey);
   const body = JSON.parse(String(calls[0].init?.body));
   assert.equal(body.model, OMNI_MODEL);
   assert.equal(body.background, true);
   assert.deepEqual(body.input, [
-    { type: 'image', data: Buffer.from('kf').toString('base64'), mime_type: 'image/png' },
+    { type: 'image', data: JPEG.toString('base64'), mime_type: 'image/jpeg' },
     { type: 'text', text: 'сценка' },
   ]);
   assert.deepEqual(body.response_format, { type: 'video', aspect_ratio: '9:16', resolution: '720p', duration: `${CLIP_SEC}s` });
 });
 
-test('запуск без id — повторяемая ошибка', async () => {
-  const { deps } = fake([{ body: { status: 'in_progress' } }]);
-  await assert.rejects(startClip(deps, 'p', { data: Buffer.from('k'), mime: 'image/png' }), isErr('omni_failed', true));
+test('запуск: ответ потерян или без id — повторяемая ошибка «могла начаться», секунды не возвращаются', async () => {
+  const a = fake([new TypeError('fetch failed')]);
+  await assert.rejects(startClip(a.deps, 'p', { data: JPEG, mime: 'image/jpeg' }), (e: unknown) => isErr('omni_failed', true)(e) && /могла начаться/.test((e as Error).message));
+  const b = fake([{ body: '<html>' }]);
+  await assert.rejects(startClip(b.deps, 'p', { data: JPEG, mime: 'image/jpeg' }), isErr('omni_failed', true));
+  assert.equal(CLEAR_REFUSALS.has('omni_failed'), false);
+  assert.equal(CLEAR_REFUSALS.has('omni_rejected'), true);
+  assert.equal(CLEAR_REFUSALS.has('google_quota'), true);
 });
 
 test('ожидание: в работе → готово, видео из шага model_output', async () => {
   const mp4 = Buffer.from('MP4');
-  const { deps, calls } = fake([{ body: { status: 'in_progress' } }, done(mp4)]);
+  const { deps, calls } = fake([inProgress, done(mp4)]);
   assert.deepEqual(await waitClip(deps, 'int-1'), mp4);
   assert.match(calls[0].url, /\/interactions\/int-1$/);
 });
 
-test('ожидание: сбой сети и 5xx при опросе не сжигают генерацию', async () => {
+test('ожидание: сбой сети, обрыв тела, не-JSON, 5xx, 408, 429 и незнакомый статус не бросают оплаченную генерацию', async () => {
   const mp4 = Buffer.from('MP4');
-  const { deps } = fake([new Error('ECONNRESET'), { status: 503, body: 'x' }, done(mp4)]);
+  const { deps } = fake([new Error('ECONNRESET'), torn, { body: '<html>' }, { status: 503, body: 'x' }, { status: 408, body: '{}' }, { status: 429, body: '{}' }, { body: { status: 'queued' } }, { body: {} }, done(mp4)]);
+  deps.pollTimeoutMs = 100;
   assert.deepEqual(await waitClip(deps, 'i'), mp4);
 });
 
-test('отказ фильтра приходит массивом errors — повторяемый omni_rejected', async () => {
-  const { deps } = fake([{ body: { status: 'failed', errors: [{ code: 'INVALID_ARGUMENT', message: 'There was a problem processing your request' }] } }]);
-  await assert.rejects(waitClip(deps, 'i'), isErr('omni_rejected', true));
+test('ожидание: готовый клип ссылкой скачивается с ключом в заголовке', async () => {
+  const { deps, calls } = fake([
+    { body: { status: 'completed', steps: [{ type: 'model_output', content: [{ type: 'video', uri: 'https://files.example/abc' }] }] } },
+    () => new Response(new Uint8Array(Buffer.from('MP4')), { status: 200 }),
+  ]);
+  assert.deepEqual(await waitClip(deps, 'i'), Buffer.from('MP4'));
+  assert.equal(calls[1].url, 'https://files.example/abc');
+  assert.equal((calls[1].init?.headers as Record<string, string>)['x-goog-api-key'], deps.apiKey);
 });
 
-test('прочий провал — omni_failed; квота в провале — google_quota', async () => {
+test('отказ фильтра приходит массивом errors — повторяемый omni_rejected, и с числовым кодом 3', async () => {
+  const a = fake([{ body: { status: 'failed', errors: [{ code: 'INVALID_ARGUMENT', message: 'There was a problem processing your request' }] } }]);
+  await assert.rejects(waitClip(a.deps, 'i'), isErr('omni_rejected', true));
+  const b = fake([{ body: { status: 'failed', errors: [{ code: 3, status: 'INVALID_ARGUMENT', message: 'problem' }] } }]);
+  await assert.rejects(waitClip(b.deps, 'i'), isErr('omni_rejected', true));
+});
+
+test('прочий провал и нехватка мощностей после приёма — omni_failed с повтором; 404 опроса — не «модель снята»', async () => {
   const a = fake([{ body: { status: 'failed', errors: [{ code: 'INTERNAL', message: 'boom' }] } }]);
   await assert.rejects(waitClip(a.deps, 'i'), isErr('omni_failed', true));
   const b = fake([{ body: { status: 'failed', errors: [{ code: 'RESOURCE_EXHAUSTED', message: 'quota exceeded' }] } }]);
-  await assert.rejects(waitClip(b.deps, 'i'), isErr('google_quota', false));
+  await assert.rejects(waitClip(b.deps, 'i'), isErr('omni_failed', true));
+  const c = fake([{ status: 404, body: '{"error":{"message":"Interaction not found"}}' }]);
+  await assert.rejects(waitClip(c.deps, 'i'), isErr('omni_failed', true));
 });
 
 test('готово, но без видео — omni_rejected с текстом модели', async () => {
@@ -1254,9 +1740,13 @@ test('готово, но без видео — omni_rejected с текстом �
   await assert.rejects(waitClip(deps, 'i'), (e: unknown) => isErr('omni_rejected', true)(e) && /Не могу/.test((e as Error).message));
 });
 
-test('не дождались — omni_failed', async () => {
-  const { deps } = fake([{ body: { status: 'in_progress' } }, { body: { status: 'in_progress' } }, { body: { status: 'in_progress' } }]);
-  await assert.rejects(waitClip(deps, 'i'), (e: unknown) => isErr('omni_failed', true)(e) && /не дождались/.test((e as Error).message));
+test('не дождались — omni_failed; срок считается по часам, а не по числу опросов', async () => {
+  const a = fake([inProgress, inProgress, inProgress]);
+  await assert.rejects(waitClip(a.deps, 'i'), (e: unknown) => isErr('omni_failed', true)(e) && /не дождались/.test((e as Error).message));
+  const slow = fake(Array.from({ length: 10 }, () => inProgress), 40);
+  slow.deps.pollTimeoutMs = 100;
+  await assert.rejects(waitClip(slow.deps, 'i'), isErr('omni_failed', true));
+  assert.ok(slow.calls.length <= 3, `опросов ${slow.calls.length} — срок не считает время запросов`);
 });
 ```
 
@@ -1279,13 +1769,14 @@ Expected: FAIL — модуля `./google` нет.
 `studio/src/animate/google.ts`:
 
 ```ts
-import { StudioError } from '../errors';
+import { StudioError, type StudioErrorCode } from '../errors';
 
 /**
  * Google Generative Language API: кадр-эталон (Nano Banana Pro) и клип сценки
  * (Gemini Omni Flash, Interactions API). Формы запросов сняты живыми вызовами
- * 24–26.10.2026 — см. src/misc/veo.service.ts бэкенда. В ошибки не попадают
- * ни ключ, ни картинки.
+ * 24–26.10.2026 — см. src/misc/veo.service.ts бэкенда. Ключ — только в
+ * заголовке; в сообщения ошибок он не попадает, даже если Google повторил его
+ * в ответе.
  */
 const API = 'https://generativelanguage.googleapis.com/v1beta';
 export const KEYFRAME_MODEL = 'gemini-3-pro-image-preview';
@@ -1293,11 +1784,23 @@ export const OMNI_MODEL = 'gemini-omni-1.1-flash';
 /** Длина клипа сценки, секунды: сценки по 8 с, без продления (спека). */
 export const CLIP_SEC = 8;
 
+/** Таймаут одного запроса: кадр рисуется до пары минут, запуск и опрос — быстрые. */
+const KEYFRAME_TIMEOUT_MS = 180_000;
+const START_TIMEOUT_MS = 120_000;
+const POLL_TIMEOUT_MS = 120_000;
+const DOWNLOAD_TIMEOUT_MS = 120_000;
+/** Поминутный лимит пережидается на месте, не сжигая попытку: до двух раз, не дольше полутора минут. */
+const RATE_RETRIES = 2;
+const MAX_RATE_WAIT_MS = 90_000;
+const DOWNLOAD_ATTEMPTS = 3;
+const MAX_VIDEO_BYTES = 200 * 1024 * 1024;
+
 export interface GoogleDeps {
   apiKey: string;
   fetch?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
-  /** Опрос Omni: шаг и предел на одну генерацию. */
+  now?: () => number;
+  /** Опрос Omni: шаг и срок на одну генерацию — по часам, а не по числу опросов. */
   pollEveryMs?: number;
   pollTimeoutMs?: number;
 }
@@ -1307,47 +1810,127 @@ export interface ImageInput {
   mime: string;
 }
 
+/**
+ * Отказы Google, после которых клип точно не запущен — секунды Omni можно
+ * вернуть. После прочих сбоев запуска (5xx, потерянный ответ) генерация могла
+ * начаться и будет оплачена.
+ */
+export const CLEAR_REFUSALS: ReadonlySet<StudioErrorCode> = new Set<StudioErrorCode>(['google_quota', 'google_auth', 'model_gone', 'omni_rejected']);
+
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const headers = (d: GoogleDeps) => ({ 'x-goog-api-key': d.apiKey, 'Content-Type': 'application/json' });
+/** Ключи Google начинаются с «AIza»; Google повторяет ключ, например, в 403 «Consumer … suspended». */
+const redact = (s: string): string => s.replace(/AIza[0-9A-Za-z_-]{20,}/g, '<ключ>');
+const errText = (e: unknown): string => redact(e instanceof Error ? e.message : String(e));
+
+/** Тип картинки по сигнатуре: Nano Banana Pro отдаёт JPEG, хотя кадры принято звать .png. */
+export function imageMime(buf: Buffer): string {
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
+  return 'image/png';
+}
+
+interface GoogleError {
+  code?: number;
+  status?: string;
+  message?: string;
+  details?: Array<{ reason?: string; retryDelay?: string; violations?: Array<{ quotaId?: string }> }>;
+}
+
+function parseError(body: string): GoogleError | undefined {
+  try {
+    return (JSON.parse(body) as { error?: GoogleError } | null)?.error ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Пауза, которую стоит выждать при поминутном лимите; null — лимит не поминутный (суточный, биллинг). */
+export function rateLimitDelayMs(body: string): number | null {
+  const err = parseError(body);
+  const details = err?.details ?? [];
+  const sec = parseFloat(details.find((x) => x.retryDelay)?.retryDelay ?? '');
+  if (Number.isFinite(sec) && sec > 0) return sec * 1000 <= MAX_RATE_WAIT_MS ? Math.ceil(sec * 1000) : null;
+  const perMinute = details.some((x) => x.violations?.some((v) => /PerMinute/i.test(v.quotaId ?? ''))) || /per ?minute/i.test(err?.message ?? '');
+  return perMinute ? 60_000 : null;
+}
 
 /**
  * HTTP-ошибка Google → StudioError. Квота, ключ и снятая модель повтором не
  * лечатся: каждая лишняя попытка Omni стоит денег.
  */
 export function googleHttpError(what: 'keyframe' | 'omni', status: number, body: string): StudioError {
-  const text = body.slice(0, 300);
-  if (status === 429 || /RESOURCE_EXHAUSTED|exceeded your current quota/i.test(body)) {
-    return new StudioError('google_quota', `${what}: квота Google на сегодня исчерпана — повторить после ≈ 11:00 МСК (HTTP ${status})`, false);
+  const err = parseError(body);
+  const said = redact((err?.message ?? body).slice(0, 300));
+  const reasons = (err?.details ?? []).map((x) => x.reason).filter(Boolean).join(', ');
+  if (status === 429 || err?.status === 'RESOURCE_EXHAUSTED' || /RESOURCE_EXHAUSTED|exceeded your current quota/i.test(body)) {
+    return new StudioError('google_quota', `${what}: лимит Google исчерпан (HTTP ${status}) — суточная квота обновляется ≈ в 11:00 МСК: ${said}`, false);
   }
-  if (status === 401 || status === 403) return new StudioError('google_auth', `${what}: Google отклонил ключ GOOGLE_AI_API_KEY (HTTP ${status})`, false);
+  if (status === 401 || status === 403 || reasons.includes('API_KEY_INVALID') || /API key not valid/i.test(body)) {
+    return new StudioError('google_auth', `${what}: Google отклонил ключ GOOGLE_AI_API_KEY (HTTP ${status}${reasons ? `, ${reasons}` : ''}): ${said}`, false);
+  }
   if (status === 404) {
-    return new StudioError('model_gone', `${what}: модель недоступна (HTTP 404) — Google её снял; переключите формат на «Только чат». ${text}`, false);
+    return new StudioError('model_gone', `${what}: модель недоступна (HTTP 404) — Google её снял; переключите формат на «Только чат». ${said}`, false);
   }
-  if (what === 'omni' && status === 400 && /INVALID_ARGUMENT/.test(body)) {
-    return new StudioError('omni_rejected', `omni: Google отклонил запрос (фильтр контента или промпт): ${text}`, true);
+  if (what === 'omni' && status === 400 && (err?.status === 'INVALID_ARGUMENT' || /INVALID_ARGUMENT/.test(body))) {
+    return new StudioError('omni_rejected', `omni: Google отклонил запрос (фильтр контента или промпт): ${said}`, true);
   }
-  return new StudioError(what === 'omni' ? 'omni_failed' : 'keyframe', `${what}: Google ответил HTTP ${status}: ${text}`, true);
+  return new StudioError(what === 'omni' ? 'omni_failed' : 'keyframe', `${what}: Google ответил HTTP ${status}: ${said}`, true);
 }
 
-export async function generateKeyframe(d: GoogleDeps, prompt: string, refs: ImageInput[]): Promise<Buffer> {
+/** Запрос с таймаутом; поминутный 429 пережидается здесь же. Сбой сети выходит наружу как есть. */
+async function request(d: GoogleDeps, url: string, init: RequestInit, timeoutMs: number): Promise<{ status: number; ok: boolean; raw: string }> {
   const f = d.fetch ?? fetch;
+  const sleep = d.sleep ?? realSleep;
+  for (let i = 0; ; i++) {
+    const resp = await f(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    const raw = await resp.text();
+    if (resp.status === 429 && i < RATE_RETRIES) {
+      const wait = rateLimitDelayMs(raw);
+      if (wait != null) {
+        await sleep(wait);
+        continue;
+      }
+    }
+    return { status: resp.status, ok: resp.ok, raw };
+  }
+}
+
+interface KeyframeReply {
+  promptFeedback?: { blockReason?: string };
+  candidates?: Array<{ finishReason?: string; content?: { parts?: Array<{ inlineData?: { mimeType?: string; data?: string } }> } }>;
+}
+
+export async function generateKeyframe(d: GoogleDeps, prompt: string, refs: ImageInput[]): Promise<ImageInput> {
   const body = {
     contents: [{ parts: [...refs.map((r) => ({ inlineData: { mimeType: r.mime, data: r.data.toString('base64') } })), { text: prompt }] }],
     generationConfig: { responseModalities: ['IMAGE'], imageConfig: { aspectRatio: '9:16' } },
   };
-  const resp = await f(`${API}/models/${KEYFRAME_MODEL}:generateContent`, { method: 'POST', headers: headers(d), body: JSON.stringify(body) });
-  const raw = await resp.text();
-  if (!resp.ok) throw googleHttpError('keyframe', resp.status, raw);
-  const cand = (JSON.parse(raw) as { candidates?: Array<{ finishReason?: string; content?: { parts?: Array<{ inlineData?: { data?: string } }> } }> })
-    .candidates?.[0];
-  const img = (cand?.content?.parts ?? []).find((p) => p?.inlineData?.data);
+  let r: { status: number; ok: boolean; raw: string };
+  try {
+    r = await request(d, `${API}/models/${KEYFRAME_MODEL}:generateContent`, { method: 'POST', headers: headers(d), body: JSON.stringify(body) }, KEYFRAME_TIMEOUT_MS);
+  } catch (e) {
+    throw new StudioError('keyframe', `keyframe: запрос не прошёл — ${errText(e)}`, true);
+  }
+  if (!r.ok) throw googleHttpError('keyframe', r.status, r.raw);
+  let reply: KeyframeReply;
+  try {
+    reply = (JSON.parse(r.raw) ?? {}) as KeyframeReply;
+  } catch {
+    throw new StudioError('keyframe', `keyframe: ответ не JSON: ${redact(r.raw.slice(0, 200))}`, true);
+  }
+  // Заблокированный промпт не пройдёт и со второго раза — не тратим попытки.
+  const blocked = reply.promptFeedback?.blockReason;
+  if (blocked) throw new StudioError('keyframe', `keyframe: Nano Banana заблокировал промпт (${blocked})`, false);
+  const cand = reply.candidates?.[0];
+  const part = (cand?.content?.parts ?? []).find((p) => p?.inlineData?.data);
   // RECITATION и прочие отказы приходят без ошибки HTTP — просто без картинки.
-  if (!img?.inlineData?.data) throw new StudioError('keyframe', `keyframe: Nano Banana не вернул картинку (${cand?.finishReason ?? 'без причины'})`, true);
-  return Buffer.from(img.inlineData.data, 'base64');
+  if (!part?.inlineData?.data) throw new StudioError('keyframe', `keyframe: Nano Banana не вернул картинку (${cand?.finishReason ?? 'без причины'})`, true);
+  const data = Buffer.from(part.inlineData.data, 'base64');
+  return { data, mime: part.inlineData.mimeType || imageMime(data) };
 }
 
 export async function startClip(d: GoogleDeps, prompt: string, image: ImageInput): Promise<string> {
-  const f = d.fetch ?? fetch;
   const body = {
     model: OMNI_MODEL,
     background: true,
@@ -1357,62 +1940,101 @@ export async function startClip(d: GoogleDeps, prompt: string, image: ImageInput
     ],
     response_format: { type: 'video', aspect_ratio: '9:16', resolution: '720p', duration: `${CLIP_SEC}s` },
   };
-  const resp = await f(`${API}/interactions`, { method: 'POST', headers: headers(d), body: JSON.stringify(body) });
-  const raw = await resp.text();
-  if (!resp.ok) throw googleHttpError('omni', resp.status, raw);
-  const id = (JSON.parse(raw) as { id?: string }).id;
-  if (!id) throw new StudioError('omni_failed', `omni: в ответе нет id взаимодействия: ${raw.slice(0, 200)}`, true);
+  let r: { status: number; ok: boolean; raw: string };
+  try {
+    r = await request(d, `${API}/interactions`, { method: 'POST', headers: headers(d), body: JSON.stringify(body) }, START_TIMEOUT_MS);
+  } catch (e) {
+    throw new StudioError('omni_failed', `omni: запуск — ответ потерян, генерация могла начаться: ${errText(e)}`, true);
+  }
+  if (!r.ok) throw googleHttpError('omni', r.status, r.raw);
+  let id: string | undefined;
+  try {
+    id = (JSON.parse(r.raw) as { id?: string } | null)?.id;
+  } catch {
+    id = undefined;
+  }
+  if (!id) throw new StudioError('omni_failed', `omni: запуск — в ответе нет id, генерация могла начаться: ${redact(r.raw.slice(0, 200))}`, true);
   return id;
 }
 
 interface Interaction {
   status?: string;
-  errors?: Array<{ code?: string; message?: string }>;
-  error?: { code?: string; message?: string };
-  steps?: Array<{ type?: string; content?: Array<{ type?: string; data?: string; text?: string }> }>;
+  errors?: Array<{ code?: string | number; status?: string; message?: string }>;
+  error?: { code?: string | number; status?: string; message?: string };
+  steps?: Array<{ type?: string; content?: Array<{ type?: string; data?: string; uri?: string; text?: string }> }>;
 }
 
-/** Ждёт клип. Сбой сети и 5xx при опросе — не повод бросать оплаченную генерацию: опрос продолжается. */
-export async function waitClip(d: GoogleDeps, id: string): Promise<Buffer> {
+function interactionFailure(st: Interaction): StudioError {
+  // Провал приходит массивом errors: [{ code, message }] (живой ответ 24.10.2026).
+  const errs = Array.isArray(st.errors) ? st.errors : st.error ? [st.error] : [];
+  const first = errs.find((e) => e?.message) ?? errs[0];
+  const msg = redact(String(first?.message ?? `взаимодействие ${st.status}`).slice(0, 300));
+  const code = String(first?.code ?? '');
+  if (code === 'INVALID_ARGUMENT' || code === '3' || first?.status === 'INVALID_ARGUMENT') {
+    return new StudioError('omni_rejected', `omni: отказ фильтра — ${msg}`, true);
+  }
+  return new StudioError('omni_failed', `omni: ${msg}`, true);
+}
+
+/** Готовый клип ссылкой (Files API): ключ — в заголовке, размер — с потолком, повтор — здесь же. */
+async function download(d: GoogleDeps, uri: string): Promise<Buffer> {
   const f = d.fetch ?? fetch;
+  let last = '';
+  for (let i = 1; i <= DOWNLOAD_ATTEMPTS; i++) {
+    try {
+      const resp = await f(uri, { headers: { 'x-goog-api-key': d.apiKey }, signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const buf = Buffer.from(await resp.arrayBuffer());
+      if (buf.length > MAX_VIDEO_BYTES) throw new StudioError('omni_failed', `omni: клип ссылкой больше ${MAX_VIDEO_BYTES >> 20} МБ`, false);
+      return buf;
+    } catch (e) {
+      if (e instanceof StudioError) throw e;
+      last = errText(e);
+    }
+  }
+  throw new StudioError('omni_failed', `omni: клип ссылкой не скачался за ${DOWNLOAD_ATTEMPTS} попытки — ${last}`, true);
+}
+
+/**
+ * Ждёт клип. Генерация уже оплачена, поэтому сбой опроса (сеть, таймаут,
+ * обрыв тела, не-JSON, 5xx, 408, 429) — не повод её бросать: опрос
+ * продолжается. Ошибка — только явный провал взаимодействия или срок.
+ */
+export async function waitClip(d: GoogleDeps, id: string): Promise<Buffer> {
   const sleep = d.sleep ?? realSleep;
+  const now = d.now ?? Date.now;
   const every = d.pollEveryMs ?? 10_000;
   const limit = d.pollTimeoutMs ?? 6 * 60_000;
-  for (let waited = 0; waited < limit; waited += every) {
+  const deadline = now() + limit;
+  while (now() < deadline) {
     await sleep(every);
-    let resp: Response;
+    let st: Interaction;
     try {
-      resp = await f(`${API}/interactions/${id}`, { headers: { 'x-goog-api-key': d.apiKey } });
-    } catch {
+      const r = await request(d, `${API}/interactions/${id}`, { headers: { 'x-goog-api-key': d.apiKey } }, POLL_TIMEOUT_MS);
+      if (!r.ok) {
+        if (r.status >= 500 || r.status === 408 || r.status === 429) continue;
+        if (r.status === 404) throw new StudioError('omni_failed', `omni: взаимодействие ${id} не найдено (HTTP 404)`, true);
+        throw googleHttpError('omni', r.status, r.raw);
+      }
+      st = (JSON.parse(r.raw) ?? {}) as Interaction;
+    } catch (e) {
+      if (e instanceof StudioError) throw e;
       continue;
     }
-    const raw = await resp.text();
-    if (!resp.ok) {
-      if (resp.status >= 500) continue;
-      throw googleHttpError('omni', resp.status, raw);
+    if (st.status === 'completed') {
+      const parts = (st.steps ?? []).filter((s) => s?.type === 'model_output').flatMap((s) => s.content ?? []);
+      const video = parts.filter((c) => c?.type === 'video').pop();
+      if (video?.data) return Buffer.from(video.data, 'base64');
+      if (video?.uri) return download(d, video.uri);
+      const said = parts
+        .filter((c) => c?.type === 'text' && c.text)
+        .map((c) => c.text)
+        .join(' ')
+        .trim();
+      throw new StudioError('omni_rejected', `omni: видео нет${said ? ` — модель ответила: ${redact(said.slice(0, 300))}` : ''}`, true);
     }
-    const st = JSON.parse(raw) as Interaction;
-    if (st.status === 'in_progress') continue;
-    if (st.status !== 'completed') {
-      // Провал приходит массивом errors: [{ code, message }] (живой ответ 24.10.2026).
-      const errs = Array.isArray(st.errors) ? st.errors : st.error ? [st.error] : [];
-      const first = errs.find((e) => e?.message) ?? errs[0];
-      const msg = first?.message ?? `взаимодействие ${st.status ?? 'без статуса'}`;
-      if (first?.code === 'INVALID_ARGUMENT') throw new StudioError('omni_rejected', `omni: отказ фильтра — ${msg}`, true);
-      if (first?.code === 'RESOURCE_EXHAUSTED' || /quota/i.test(msg)) {
-        throw new StudioError('google_quota', `omni: квота Google на сегодня исчерпана — повторить после ≈ 11:00 МСК (${msg})`, false);
-      }
-      throw new StudioError('omni_failed', `omni: ${msg}`, true);
-    }
-    const parts = (st.steps ?? []).filter((s) => s?.type === 'model_output').flatMap((s) => s.content ?? []);
-    const video = parts.filter((c) => c?.type === 'video').pop();
-    if (video?.data) return Buffer.from(video.data, 'base64');
-    const said = parts
-      .filter((c) => c?.type === 'text' && c.text)
-      .map((c) => c.text)
-      .join(' ')
-      .trim();
-    throw new StudioError('omni_rejected', `omni: видео нет${said ? ` — модель ответила: ${said.slice(0, 300)}` : ''}`, true);
+    if (st.status === 'failed' || st.status === 'cancelled') throw interactionFailure(st);
+    // in_progress, queued, пустой или незнакомый статус — ждём дальше.
   }
   throw new StudioError('omni_failed', `omni: не дождались клипа за ${Math.round(limit / 60_000)} мин`, true);
 }
@@ -1428,7 +2050,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 "$WT"/studio/scripts/node-run.sh "npx tsx --test src/animate/google.test.ts && npm run typecheck && echo TSC_OK"
 ```
 
-Expected: `# pass 11`, `# fail 0`, затем `TSC_OK`.
+Expected: `# pass 15`, `# fail 0`, затем `TSC_OK`.
 
 ---
 
@@ -1446,65 +2068,107 @@ Expected: `# pass 11`, `# fail 0`, затем `TSC_OK`.
 ```ts
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { StudioError } from '../errors';
-import { recognize } from './stt';
+import { recognize, speechAudio } from './stt';
 
-type Reply = { status?: number; body: unknown } | Error;
+type Reply = { status?: number; body: unknown } | Error | (() => Response);
 
 function fake(replies: Reply[]) {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const pauses: number[] = [];
   const f = (async (url: string | URL | Request, init?: RequestInit) => {
     calls.push({ url: String(url), init });
     const r = replies.shift();
     if (!r) throw new Error('fake: ответов больше нет');
     if (r instanceof Error) throw r;
+    if (typeof r === 'function') return r();
     return new Response(typeof r.body === 'string' ? r.body : JSON.stringify(r.body), { status: r.status ?? 200 });
   }) as typeof fetch;
-  return { f, calls };
+  const sleep = async (ms: number) => {
+    pauses.push(ms);
+  };
+  return { f, calls, pauses, sleep };
 }
 
-const creds = { apiKey: 'K', folderId: 'F' };
-const noSleep = async () => {};
+const creds = { apiKey: 'SECRET-SPEECH-KEY', folderId: 'F' };
+const sttFailed = (e: unknown) => e instanceof StudioError && e.code === 'stt' && !e.retryable;
 
-test('распознавание: ru-RU, oggopus, каталог в адресе, ключ в заголовке, тело — звук', async () => {
-  const { f, calls } = fake([{ body: { result: 'обои потерли' } }]);
-  assert.equal(await recognize(Buffer.from('OGG'), creds, { fetch: f, sleep: noSleep }), 'обои потерли');
+/** Тело обрывается посреди чтения — так рвётся соединение. */
+const torn = () =>
+  new Response(
+    new ReadableStream({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('{"result":"обои'));
+        c.error(new TypeError('terminated'));
+      },
+    }),
+    { status: 200 },
+  );
+
+test('распознавание: ru-RU, oggopus, числа словами, каталог в адресе, ключ в заголовке, тело — звук', async () => {
+  const { f, calls, sleep } = fake([{ body: { result: 'обои потерли' } }]);
+  assert.equal(await recognize(Buffer.from('OGG'), creds, { fetch: f, sleep }), 'обои потерли');
   const url = new URL(calls[0].url);
   assert.equal(url.origin + url.pathname, 'https://stt.api.cloud.yandex.net/speech/v1/stt:recognize');
   assert.equal(url.searchParams.get('lang'), 'ru-RU');
   assert.equal(url.searchParams.get('format'), 'oggopus');
+  assert.equal(url.searchParams.get('rawResults'), 'true');
   assert.equal(url.searchParams.get('folderId'), 'F');
-  assert.equal((calls[0].init?.headers as Record<string, string>).Authorization, 'Api-Key K');
+  assert.equal((calls[0].init?.headers as Record<string, string>).Authorization, 'Api-Key SECRET-SPEECH-KEY');
   assert.deepEqual(Buffer.from(calls[0].init?.body as Uint8Array), Buffer.from('OGG'));
+  assert.ok(calls[0].init?.signal, 'у запроса нет таймаута');
 });
 
 test('пустой результат — пустая строка', async () => {
-  const { f } = fake([{ body: {} }]);
-  assert.equal(await recognize(Buffer.from('OGG'), creds, { fetch: f, sleep: noSleep }), '');
+  const { f, sleep } = fake([{ body: {} }]);
+  assert.equal(await recognize(Buffer.from('OGG'), creds, { fetch: f, sleep }), '');
 });
 
-test('сбой сети и 5xx повторяются здесь же', async () => {
-  const { f, calls } = fake([new Error('ECONNRESET'), { status: 503, body: 'busy' }, { body: { result: 'да' } }]);
-  assert.equal(await recognize(Buffer.from('OGG'), creds, { fetch: f, sleep: noSleep }), 'да');
-  assert.equal(calls.length, 3);
+test('сбой сети, обрыв тела, не-JSON, 5xx и 429 повторяются здесь же, с нарастающими паузами', async () => {
+  const { f, calls, pauses, sleep } = fake([new Error('ECONNRESET'), torn, { body: '<html>' }, { status: 429, body: 'quota' }, { body: { result: 'да' } }]);
+  await assert.rejects(recognize(Buffer.from('OGG'), creds, { fetch: f, sleep }), sttFailed);
+  assert.equal(calls.length, 4);
+  assert.deepEqual(pauses, [2000, 10000, 30000]);
+  const second = fake([{ status: 503, body: 'busy' }, { body: { result: 'да' } }]);
+  assert.equal(await recognize(Buffer.from('OGG'), creds, { fetch: second.f, sleep: second.sleep }), 'да');
 });
 
-test('три сбоя подряд — ошибка без повтора: клип уже оплачен, пересъёмка не поможет', async () => {
-  const { f, calls } = fake([{ status: 503, body: 'a' }, { status: 503, body: 'b' }, { status: 503, body: 'c' }]);
+test('все попытки неудачны — ошибка stt без повтора: клип уже оплачен, пересъёмка не поможет', async () => {
+  const { f, calls, sleep } = fake([{ status: 503, body: 'a' }, { status: 503, body: 'b' }, { status: 503, body: 'c' }, { status: 503, body: 'd' }]);
+  await assert.rejects(recognize(Buffer.from('OGG'), creds, { fetch: f, sleep }), sttFailed);
+  assert.equal(calls.length, 4);
+});
+
+test('4xx (ключ, права) — сразу ошибка без повтора, ключ из текста ответа вырезан', async () => {
+  const { f, calls, sleep } = fake([{ status: 401, body: 'unauthorized: SECRET-SPEECH-KEY' }]);
   await assert.rejects(
-    recognize(Buffer.from('OGG'), creds, { fetch: f, sleep: noSleep }),
-    (e: unknown) => e instanceof StudioError && e.code === 'stt' && !e.retryable,
-  );
-  assert.equal(calls.length, 3);
-});
-
-test('4xx (ключ, права) — сразу ошибка без повтора', async () => {
-  const { f, calls } = fake([{ status: 401, body: 'unauthorized' }]);
-  await assert.rejects(
-    recognize(Buffer.from('OGG'), creds, { fetch: f, sleep: noSleep }),
-    (e: unknown) => e instanceof StudioError && e.code === 'stt' && !e.retryable && /401/.test(e.message),
+    recognize(Buffer.from('OGG'), creds, { fetch: f, sleep }),
+    (e: unknown) => sttFailed(e) && /401/.test((e as Error).message) && !(e as Error).message.includes('SECRET-SPEECH-KEY'),
   );
   assert.equal(calls.length, 1);
+});
+
+test('ответ 200 с ошибкой вместо текста — повтор, а не пустая строка', async () => {
+  const { f, sleep } = fake([{ body: { error_code: 'BAD_REQUEST', error_message: 'x' } }, { body: { result: 'ладно' } }]);
+  assert.equal(await recognize(Buffer.from('OGG'), creds, { fetch: f, sleep }), 'ладно');
+});
+
+test('звук клипа — ogg/opus, один канал, 48 кГц', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-stt-'));
+  const clip = path.join(dir, 'clip.mp4');
+  execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=black:s=64x64:d=2', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=2', '-ac', '2', '-shortest', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', clip]);
+  return speechAudio(clip, path.join(dir, 'speech.webm')).then((out) => {
+    const probe = JSON.parse(execFileSync('ffprobe', ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', out]).toString());
+    assert.equal(probe.format.format_name, 'ogg');
+    assert.equal(probe.streams[0].codec_name, 'opus');
+    assert.equal(probe.streams[0].channels, 1);
+    assert.equal(probe.streams[0].sample_rate, '48000');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
 });
 ```
 
@@ -1533,8 +2197,12 @@ import { StudioError } from '../errors';
 
 const run = promisify(execFile);
 const STT_URL = 'https://stt.api.cloud.yandex.net/speech/v1/stt:recognize';
-const STT_ATTEMPTS = 3;
-const STT_PAUSE_MS = 2000;
+/** Паузы перед повторами: сбой SpeechKit на десятки секунд пережидается здесь, а не пересъёмкой. */
+const STT_PAUSES_MS = [2_000, 10_000, 30_000];
+/** Распознавание 10 секунд звука занимает секунды; без таймаута fetch ждёт до 5 минут. */
+const STT_TIMEOUT_MS = 30_000;
+/** Предел SpeechKit v1 — 30 с звука. */
+const MAX_SPEECH_SEC = 29;
 
 export interface SttCreds {
   apiKey: string;
@@ -1546,36 +2214,76 @@ export interface SttOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
-/** Звук клипа → ogg/opus, моно 48 кГц: так его принимает SpeechKit v1 (до 30 с и 1 МБ). */
+/**
+ * Звук клипа → ogg/opus, моно 48 кГц, не длиннее 29 с: так его принимает
+ * SpeechKit v1 (до 30 с и 1 МБ). Минус 6 дБ — запас: сведение стерео в моно
+ * поднимает громкий звук выше 0 dBFS.
+ */
 export async function speechAudio(clip: string, out: string): Promise<string> {
-  await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', clip, '-vn', '-ac', '1', '-ar', '48000', '-c:a', 'libopus', '-b:a', '32k', out]);
+  try {
+    await run('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-y', '-i', clip,
+      '-vn', '-t', String(MAX_SPEECH_SEC), '-ac', '1', '-af', 'volume=-6dB', '-ar', '48000', '-c:a', 'libopus', '-b:a', '32k', '-f', 'ogg',
+      out,
+    ]);
+  } catch (e) {
+    const stderr = String((e as { stderr?: string }).stderr ?? '').trim().split('\n').pop();
+    throw new Error(`ffmpeg: звук клипа не извлёкся — ${stderr || (e instanceof Error ? e.message.split('\n')[0] : String(e))}`);
+  }
   return out;
 }
 
+/** Текст сетевой ошибки с причиной: у fetch она лежит в cause.code (ECONNREFUSED и т. п.). */
+function netError(e: unknown): string {
+  const cause = (e as { cause?: { code?: string } })?.cause?.code;
+  return `${e instanceof Error ? e.message : String(e)}${cause ? ` (${cause})` : ''}`;
+}
+
 /**
- * Распознавание SpeechKit v1 (те же ключи, что у синтеза). Сбой сети и 5xx
- * повторяются здесь же, до трёх раз: клип Omni уже оплачен, и пересъёмка из-за
- * моргнувшего SpeechKit стоила бы денег. Поэтому наружу ошибка выходит без
- * повтора. В ошибку не попадают ни ключ, ни звук.
+ * Распознавание SpeechKit v1 (те же ключи, что у синтеза). Числа — словами
+ * (`rawResults=true`): реплики сценок пишутся словами. Сбой сети, таймаут,
+ * обрыв или не-JSON тела, 5xx и 429 повторяются здесь же: клип Omni уже
+ * оплачен, и пересъёмка из-за моргнувшего SpeechKit стоила бы денег. Поэтому
+ * наружу ошибка выходит только `stt` и без повтора. Ключ из текста ответа
+ * вырезается.
  */
 export async function recognize(ogg: Buffer, creds: SttCreds, o: SttOptions = {}): Promise<string> {
   const f = o.fetch ?? fetch;
   const sleep = o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-  const url = `${STT_URL}?${new URLSearchParams({ lang: 'ru-RU', format: 'oggopus', folderId: creds.folderId })}`;
+  const url = `${STT_URL}?${new URLSearchParams({ lang: 'ru-RU', format: 'oggopus', rawResults: 'true', folderId: creds.folderId })}`;
+  const hide = (s: string): string => (creds.apiKey ? s.split(creds.apiKey).join('***') : s);
   let last = '';
-  for (let attempt = 1; attempt <= STT_ATTEMPTS; attempt++) {
-    if (attempt > 1) await sleep(STT_PAUSE_MS);
-    let resp: Response;
+  for (let attempt = 0; attempt <= STT_PAUSES_MS.length; attempt++) {
+    if (attempt > 0) await sleep(STT_PAUSES_MS[attempt - 1]);
+    let status = 0;
+    let raw = '';
     try {
-      resp = await f(url, { method: 'POST', headers: { Authorization: `Api-Key ${creds.apiKey}` }, body: new Uint8Array(ogg) });
+      const resp = await f(url, {
+        method: 'POST',
+        headers: { Authorization: `Api-Key ${creds.apiKey}` },
+        body: new Uint8Array(ogg),
+        signal: AbortSignal.timeout(STT_TIMEOUT_MS),
+      });
+      status = resp.status;
+      raw = await resp.text();
     } catch (e) {
-      last = e instanceof Error ? e.message : String(e);
+      last = netError(e);
       continue;
     }
-    const raw = await resp.text();
-    if (resp.ok) return String((JSON.parse(raw) as { result?: string }).result ?? '');
-    last = `SpeechKit ${resp.status} ${raw.slice(0, 200)}`;
-    if (resp.status < 500) break;
+    if (status >= 200 && status < 300) {
+      let reply: { result?: unknown; error_code?: unknown } | null = null;
+      try {
+        reply = JSON.parse(raw) as { result?: unknown; error_code?: unknown } | null;
+      } catch {
+        reply = null;
+      }
+      if (reply && typeof reply.result === 'string') return reply.result;
+      if (reply && reply.result === undefined && reply.error_code === undefined) return '';
+      last = `SpeechKit ${status}: в ответе нет распознанного текста — ${hide(raw.slice(0, 200))}`;
+      continue;
+    }
+    last = `SpeechKit ${status} ${hide(raw.slice(0, 200))}`;
+    if (status < 500 && status !== 429) break;
   }
   throw new StudioError('stt', `stt: распознать речь не удалось — ${last}`, false);
 }
@@ -1591,7 +2299,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 "$WT"/studio/scripts/node-run.sh "npx tsx --test src/animate/stt.test.ts"
 ```
 
-Expected: `# pass 5`, `# fail 0`.
+Expected: `# pass 7`, `# fail 0`.
 
 ---
 
@@ -1609,7 +2317,12 @@ Expected: `# pass 5`, `# fail 0`.
 ```ts
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { CLIP_LIMITS, CLIP_LUFS, checkClip } from './clip-check';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { detectSilences, probeFile } from '../ffprobe';
+import { CLIP_LIMITS, CLIP_LUFS, checkClip, normalizeLoudness } from './clip-check';
 
 const probe = { durationSec: 8, width: 720, height: 1280, hasAudio: true };
 
@@ -1617,24 +2330,50 @@ test('нормальный клип Omni проходит', () => {
   assert.deepEqual(checkClip(probe, [{ start: 3, end: 3.8, duration: 0.8 }]), []);
 });
 
-test('длина вне 6,5–9,5 с', () => {
-  assert.match(checkClip({ ...probe, durationSec: 4 }, []).join(), /длина 4\.0 с/);
-  assert.match(checkClip({ ...probe, durationSec: 12 }, []).join(), /длина 12\.0 с/);
+test('длина вне 6,5–9,5 с; границы включительно; NaN — «не определена»', () => {
+  assert.deepEqual(checkClip({ ...probe, durationSec: 4 }, []), ['длина 4.0 с вне 6.5–9.5 с']);
+  assert.deepEqual(checkClip({ ...probe, durationSec: 12 }, []), ['длина 12.0 с вне 6.5–9.5 с']);
+  assert.deepEqual(checkClip({ ...probe, durationSec: 6.5 }, []), []);
+  assert.deepEqual(checkClip({ ...probe, durationSec: 9.5 }, []), []);
+  assert.deepEqual(checkClip({ ...probe, durationSec: Number.NaN }, []), ['длина не определена — ffprobe не вернул длительность']);
 });
 
-test('нет видео, кадр не вертикальный, нет звука', () => {
-  assert.match(checkClip({ ...probe, width: 0, height: 0 }, []).join(), /нет видеодорожки/);
-  assert.match(checkClip({ ...probe, width: 1280, height: 720 }, []).join(), /не вертикальный/);
-  assert.match(checkClip({ ...probe, hasAudio: false }, []).join(), /нет звука/);
+test('нет видео — ровно одна причина; квадрат и горизонталь — не вертикальный; нет звука', () => {
+  assert.deepEqual(checkClip({ ...probe, width: 0, height: 0 }, []), ['нет видеодорожки']);
+  assert.deepEqual(checkClip({ ...probe, width: 720, height: 0 }, []), ['нет видеодорожки']);
+  assert.deepEqual(checkClip({ ...probe, width: 720, height: 720 }, []), ['кадр 720×720 не вертикальный']);
+  assert.deepEqual(checkClip({ ...probe, width: 1280, height: 720 }, []), ['кадр 1280×720 не вертикальный']);
+  assert.deepEqual(checkClip({ ...probe, hasAudio: false }, []), ['нет звука']);
 });
 
-test('тишина длиннее 3 с — реплика не прозвучала', () => {
-  assert.match(checkClip(probe, [{ start: 4, end: 7.5, duration: 3.5 }]).join(), /тишина 3\.5 с с 4\.0 с/);
+test('тишина внутри — до 3 с включительно, на краях — до 2,4 с', () => {
+  assert.deepEqual(checkClip(probe, [{ start: 4, end: 7, duration: 3 }]), []);
+  assert.deepEqual(checkClip(probe, [{ start: 4, end: 7.5, duration: 3.5 }]), ['тишина 3.5 с с 4.0 с']);
+  assert.deepEqual(checkClip(probe, [{ start: 0, end: 2.4, duration: 2.4 }]), []);
+  assert.deepEqual(checkClip(probe, [{ start: 0, end: 2.6, duration: 2.6 }]), ['тишина 2.6 с с 0.0 с (на краю клипа)']);
+  assert.deepEqual(checkClip(probe, [{ start: 5.3, end: 8, duration: 2.7 }]), ['тишина 2.7 с с 5.3 с (на краю клипа)']);
 });
 
 test('стартовые пределы и громкость', () => {
-  assert.deepEqual(CLIP_LIMITS, { minSec: 6.5, maxSec: 9.5, maxSilenceSec: 3 });
-  assert.equal(CLIP_LUFS, -16);
+  assert.deepEqual(CLIP_LIMITS, { minSec: 6.5, maxSec: 9.5, maxSilenceSec: 3, maxEdgeSilenceSec: 2.4 });
+  assert.equal(CLIP_LUFS, -19);
+});
+
+test('громкость: звук не сдвигается и не длиннее видео', { timeout: 60_000 }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-loudnorm-'));
+  const raw = path.join(dir, 'raw.mp4');
+  const out = path.join(dir, 'clip.mp4');
+  // Тон 6,0–6,5 с — в последних трёх секундах; звук 8,05 с при видео 8 с: длина не кратна 100 мс.
+  execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'lavfi', '-i', 'color=c=green:s=720x1280:r=24:d=8',
+    '-f', 'lavfi', '-i', 'aevalsrc=0.05*sin(2*PI*300*t)*between(t\\,6\\,6.5):s=48000:d=8.05',
+    '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', raw]);
+  await normalizeLoudness(raw, out);
+  const p = await probeFile(out);
+  assert.ok(Math.abs(p.durationSec - 8) < 0.05, `длина ${p.durationSec} с`);
+  const [lead] = await detectSilences(out, p.durationSec);
+  assert.ok(Math.abs(lead.end - 6) < 0.02, `тон начался в ${lead.end} с вместо 6,0 с`);
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 ```
 
@@ -1662,40 +2401,60 @@ import { promisify } from 'node:util';
 import type { ProbeInfo, Silence } from '../ffprobe';
 import { CLIP_SEC } from './google';
 
+/**
+ * Клип сценки перед тем, как взять его в ролик: проверка (длина, вертикальный
+ * кадр, звук, тишина) и выравнивание громкости с голосом ассистента.
+ */
 const run = promisify(execFile);
 
 /**
- * Пределы клипа сценки. Тишина до 3 с: между репликами сценки бывают паузы.
- * Стартовое значение; сверяется на ролике-образце.
+ * Пределы клипа сценки. Тишина до 3 с: между репликами бывают паузы. На краях
+ * клипа строже — 2,4 с: на стыке со сценой рядом тишина складывается с паузой
+ * перед голосом ассистента, и её поймала бы уже проверка готового ролика.
+ * Стартовые значения; сверяются на ролике-образце.
  */
-export const CLIP_LIMITS = { minSec: CLIP_SEC - 1.5, maxSec: CLIP_SEC + 1.5, maxSilenceSec: 3 };
+export const CLIP_LIMITS = { minSec: CLIP_SEC - 1.5, maxSec: CLIP_SEC + 1.5, maxSilenceSec: 3, maxEdgeSilenceSec: 2.4 };
 
 /**
- * Громкость клипов, LUFS. Стартовая; на образце сверяется с голосом SpeechKit
- * (ffmpeg -af ebur128), чтобы после живой сценки ответ не звучал тише или громче.
+ * Громкость клипов, LUFS: голос SpeechKit в роликах плана 2 звучит на −19,5
+ * (замер 26.10.2026), клип Omni без выравнивания — около −16. Стартовая; на
+ * образце сверяется (ffmpeg -af ebur128).
  */
-export const CLIP_LUFS = -16;
+export const CLIP_LUFS = -19;
 
+/**
+ * Проблемы клипа; пустой список — клип годен. Тишина — из detectSilences с
+ * порогами по умолчанию (−45 дБ, от 0,5 с), по уже выровненному клипу.
+ */
 export function checkClip(probe: ProbeInfo, silences: Silence[]): string[] {
   const problems: string[] = [];
-  if (!(probe.durationSec >= CLIP_LIMITS.minSec && probe.durationSec <= CLIP_LIMITS.maxSec)) {
+  if (!Number.isFinite(probe.durationSec) || probe.durationSec <= 0) {
+    problems.push('длина не определена — ffprobe не вернул длительность');
+  } else if (probe.durationSec < CLIP_LIMITS.minSec || probe.durationSec > CLIP_LIMITS.maxSec) {
     problems.push(`длина ${probe.durationSec.toFixed(1)} с вне ${CLIP_LIMITS.minSec}–${CLIP_LIMITS.maxSec} с`);
   }
   if (!probe.width || !probe.height) problems.push('нет видеодорожки');
   else if (probe.height <= probe.width) problems.push(`кадр ${probe.width}×${probe.height} не вертикальный`);
   if (!probe.hasAudio) problems.push('нет звука');
   for (const s of silences) {
-    if (s.duration > CLIP_LIMITS.maxSilenceSec) problems.push(`тишина ${s.duration.toFixed(1)} с с ${s.start.toFixed(1)} с`);
+    const edge = s.start <= 0.05 || (Number.isFinite(probe.durationSec) && s.end >= probe.durationSec - 0.05);
+    const limit = edge ? CLIP_LIMITS.maxEdgeSilenceSec : CLIP_LIMITS.maxSilenceSec;
+    if (s.duration > limit) problems.push(`тишина ${s.duration.toFixed(1)} с с ${s.start.toFixed(1)} с${edge ? ' (на краю клипа)' : ''}`);
   }
   return problems;
 }
 
-/** Громкость клипа — к CLIP_LUFS; видео не перекодируется. */
+/**
+ * Громкость клипа — к CLIP_LUFS, видео не перекодируется. Запас тишины (apad)
+ * уводит выдачу буфера loudnorm за конец клипа: без него метки времени звука
+ * в последних секундах сдвигаются, и Remotion срезает конец. -shortest
+ * обрезает звук по видео.
+ */
 export async function normalizeLoudness(input: string, output: string, lufs = CLIP_LUFS): Promise<void> {
   await run('ffmpeg', [
     '-hide_banner', '-loglevel', 'error', '-y', '-i', input,
-    '-c:v', 'copy', '-af', `loudnorm=I=${lufs}:TP=-1.5:LRA=11`, '-ar', '48000', '-c:a', 'aac', '-b:a', '192k',
-    output,
+    '-c:v', 'copy', '-af', `apad=pad_dur=3,loudnorm=I=${lufs}:TP=-1.5:LRA=11`, '-ar', '48000', '-c:a', 'aac', '-b:a', '192k',
+    '-shortest', output,
   ]);
 }
 ```
@@ -1710,13 +2469,13 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 "$WT"/studio/scripts/node-run.sh "npx tsx --test src/animate/clip-check.test.ts"
 ```
 
-Expected: `# pass 5`, `# fail 0`.
+Expected: `# pass 6`, `# fail 0`.
 
 ---
 
 ### Task 11: Задание «оживление»
 
-Сердце плана. Порядок: кадр конфликта → обе сценки параллельно (кадр развязки рисуется по кадру конфликта). У каждой сценки — до трёх клипов Omni. Готовая сценка с тем же отпечатком не переснимается.
+Сердце плана. Порядок: кадр конфликта → обе сценки параллельно (кадр развязки рисуется по кадру конфликта). У каждой сценки — до трёх клипов Omni. Готовое не переделывается: кадр лежит в `keyframes/<отпечаток кадра>.png`, клип — в `skits/<отпечаток клипа>/`. После отказа фильтра кадр не перерисовывается: по нему уже могла быть нарисована развязка.
 
 **Files:**
 - Create: `studio/src/animate/run-animate.ts`
@@ -1735,7 +2494,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { StudioError } from '../errors';
-import type { Animation, Script, SkitKind, SkitPlan } from '../types';
+import type { Script, ShortAnimation, SkitKind, SkitPlan } from '../types';
 import { animateRun, type AnimateDeps } from './run-animate';
 
 const ff = (...args: string[]) => execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...args]);
@@ -1745,18 +2504,20 @@ const LINES: Record<SkitKind, string[]> = {
   punchline: ['Три года — нормальный износ.', 'Га-га… ладно.'],
 };
 
-function plan(kind: SkitKind, lines = LINES[kind], fingerprint = `fp-${kind}`): SkitPlan {
+function plan(kind: SkitKind, lines = LINES[kind], fingerprint = `fp-${kind}`, keyframeFingerprint = `kf-${kind}`): SkitPlan {
   return {
     skit: {
       cast: [{ hero: 'galina', role: 'хозяйка квартиры' }, { hero: 'kesha', role: 'жилец' }],
       setting: 'hallway',
+      opening: 'at the door',
       action: 'argue',
       lines: lines.map((text, i) => ({ hero: i % 2 ? 'kesha' : 'galina', text })),
     },
     troupeVersion: 'v1',
     heroes: ['galina', 'kesha'],
-    keyframePrompt: `kf ${kind}`,
+    keyframePrompt: `kf ${kind} ${keyframeFingerprint}`,
     videoPrompt: `video ${kind}: ${lines.join(' / ')}`,
+    keyframeFingerprint,
     fingerprint,
   };
 }
@@ -1790,9 +2551,11 @@ function fakes(
     start?: (kind: SkitKind, n: number) => void;
     clip?: (kind: SkitKind, n: number) => Buffer;
     keyframeDelayMs?: Partial<Record<SkitKind, number>>;
+    keyframeImage?: { data: Buffer; mime: string };
+    recognize?: (kind: SkitKind, attempt: number) => string;
   } = {},
 ) {
-  const calls = { keyframe: [] as Array<{ kind: SkitKind; refs: number }>, start: [] as SkitKind[] };
+  const calls = { keyframe: [] as Array<{ kind: SkitKind; refs: number }>, start: [] as SkitKind[], startMime: [] as string[] };
   const ids = new Map<string, { kind: SkitKind; n: number }>();
   const deps: AnimateDeps = {
     keyframe: async (prompt, refs) => {
@@ -1800,12 +2563,13 @@ function fakes(
       calls.keyframe.push({ kind, refs: refs.length });
       const delay = o.keyframeDelayMs?.[kind] ?? 0;
       if (delay) await new Promise((r) => setTimeout(r, delay));
-      return env.png;
+      return o.keyframeImage ?? { data: env.png, mime: 'image/png' };
     },
-    startClip: async (prompt) => {
+    startClip: async (prompt, image) => {
       const kind = kindOf(prompt);
       const n = calls.start.filter((k) => k === kind).length + 1;
       calls.start.push(kind);
+      calls.startMime.push(image.mime);
       o.start?.(kind, n);
       const id = `id-${calls.start.length}`;
       ids.set(id, { kind, n });
@@ -1815,13 +2579,13 @@ function fakes(
       const { kind, n } = ids.get(id)!;
       return o.clip ? o.clip(kind, n) : env.clip;
     },
-    recognize: async (_ogg, ctx) => (o.heard ? o.heard(ctx.kind, ctx.attempt) : LINES[ctx.kind].join(' ')),
+    recognize: async (_ogg, ctx) => (o.recognize ?? o.heard ?? ((kind: SkitKind) => LINES[kind].join(' ')))(ctx.kind, ctx.attempt),
     troupeDir: env.troupeDir,
   };
   return { deps, calls };
 }
 
-const readAnim = (runDir: string): Animation => JSON.parse(fs.readFileSync(path.join(runDir, 'animation.json'), 'utf8'));
+const readAnim = (runDir: string): ShortAnimation => JSON.parse(fs.readFileSync(path.join(runDir, 'animation.json'), 'utf8'));
 
 test('обе сценки: кадры по очереди, клипы, речь сошлась, секунды Omni посчитаны', { timeout: 120_000 }, async () => {
   const env = setup();
@@ -1833,6 +2597,7 @@ test('обе сценки: кадры по очереди, клипы, речь 
   for (const kind of ['conflict', 'punchline'] as const) {
     const s = anim.skits[kind]!;
     assert.equal(s.fingerprint, `fp-${kind}`);
+    assert.equal(s.keyframe, `keyframes/kf-${kind}.png`);
     assert.equal(s.attempts, 1);
     assert.equal(s.cues.length, 2);
     assert.ok(Math.abs(s.durationMs - 8000) < 200, `длина ${s.durationMs}`);
@@ -1847,11 +2612,11 @@ test('повторный запуск с теми же сценками ниче
   await animateRun(env.runDir, fakes(env).deps);
   const again = fakes(env);
   const anim = await animateRun(env.runDir, again.deps);
-  assert.deepEqual(again.calls, { keyframe: [], start: [] });
+  assert.deepEqual(again.calls, { keyframe: [], start: [], startMime: [] });
   assert.equal(anim.omniSeconds, 16);
 });
 
-test('правка развязки переснимает только развязку', { timeout: 120_000 }, async () => {
+test('правка реплик развязки — новый клип с прежнего кадра, конфликт не трогается', { timeout: 120_000 }, async () => {
   const env = setup();
   await animateRun(env.runDir, fakes(env).deps);
   const lines = ['Это износ, верните залог.', 'Га-га… ладно.'];
@@ -1860,14 +2625,30 @@ test('правка развязки переснимает только разв
     writeScript(env.runDir, { conflict: plan('conflict'), punchline: plan('punchline', lines, 'fp-punchline-2') });
     const second = fakes(env);
     const anim = await animateRun(env.runDir, second.deps);
-    assert.deepEqual(second.calls.keyframe, [{ kind: 'punchline', refs: 3 }]);
+    assert.deepEqual(second.calls.keyframe, []);
     assert.deepEqual(second.calls.start, ['punchline']);
     assert.equal(anim.skits.conflict!.fingerprint, 'fp-conflict');
     assert.equal(anim.skits.punchline!.fingerprint, 'fp-punchline-2');
+    assert.equal(anim.skits.punchline!.keyframe, 'keyframes/kf-punchline.png');
     assert.equal(anim.omniSeconds, 24);
   } finally {
     LINES.punchline = ['Три года — нормальный износ.', 'Га-га… ладно.'];
   }
+});
+
+test('новое место конфликта перерисовывает обе сценки: развязка — по новому кадру конфликта', { timeout: 120_000 }, async () => {
+  const env = setup();
+  await animateRun(env.runDir, fakes(env).deps);
+  writeScript(env.runDir, {
+    conflict: plan('conflict', LINES.conflict, 'fp-conflict-2', 'kf-conflict-2'),
+    punchline: plan('punchline', LINES.punchline, 'fp-punchline-2', 'kf-punchline-2'),
+  });
+  const second = fakes(env);
+  const anim = await animateRun(env.runDir, second.deps);
+  assert.deepEqual(second.calls.keyframe, [{ kind: 'conflict', refs: 2 }, { kind: 'punchline', refs: 3 }]);
+  assert.deepEqual([...second.calls.start].sort(), ['conflict', 'punchline']);
+  assert.equal(anim.skits.punchline!.keyframe, 'keyframes/kf-punchline-2.png');
+  assert.equal(anim.omniSeconds, 32);
 });
 
 test('речь не сошлась — пересъёмка клипа без нового кадра', { timeout: 120_000 }, async () => {
@@ -1879,7 +2660,7 @@ test('речь не сошлась — пересъёмка клипа без н
   assert.equal(anim.omniSeconds, 24);
 });
 
-test('отказ фильтра — новый кадр и новая попытка', { timeout: 120_000 }, async () => {
+test('отказ фильтра — новая попытка с прежним кадром: по нему уже нарисована развязка', { timeout: 120_000 }, async () => {
   const env = setup();
   const { deps, calls } = fakes(env, {
     start: (kind, n) => {
@@ -1888,7 +2669,7 @@ test('отказ фильтра — новый кадр и новая попыт
   });
   const anim = await animateRun(env.runDir, deps);
   assert.equal(anim.skits.conflict!.attempts, 2);
-  assert.equal(calls.keyframe.filter((k) => k.kind === 'conflict').length, 2);
+  assert.equal(calls.keyframe.filter((k) => k.kind === 'conflict').length, 1);
   assert.equal(anim.omniSeconds, 16, 'несостоявшийся запуск не списывается');
 });
 
@@ -1953,6 +2734,57 @@ test('нет портрета героя — ошибка без повтора'
     (e: unknown) => e instanceof StudioError && e.code === 'script_invalid' && /kesha/.test(e.message),
   );
 });
+
+test('кадр в JPEG сохраняется .jpg и уходит в Omni как image/jpeg', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 16, 74, 70, 73, 70]);
+  const { deps, calls } = fakes(env, { keyframeImage: { data: jpeg, mime: 'image/jpeg' } });
+  const anim = await animateRun(env.runDir, deps);
+  assert.equal(anim.skits.conflict!.keyframe, 'keyframes/kf-conflict.jpg');
+  assert.deepEqual(calls.startMime, ['image/jpeg', 'image/jpeg']);
+});
+
+test('запуск с потерянным ответом — секунды не возвращаются: генерация могла начаться', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const { deps } = fakes(env, {
+    start: (kind, n) => {
+      if (kind === 'conflict' && n === 1) throw new StudioError('omni_failed', 'omni: запуск — ответ потерян, генерация могла начаться', true);
+    },
+  });
+  const anim = await animateRun(env.runDir, deps);
+  assert.equal(anim.skits.conflict!.attempts, 2);
+  assert.equal(anim.omniSeconds, 24);
+});
+
+test('распознавание упало — перезапуск берёт уже оплаченный клип, а не снимает новый', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const first = fakes(env, {
+    recognize: (kind) => {
+      if (kind === 'conflict') throw new StudioError('stt', 'stt: распознать речь не удалось', false);
+      return LINES[kind].join(' ');
+    },
+  });
+  await assert.rejects(animateRun(env.runDir, first.deps), (e: unknown) => e instanceof StudioError && e.code === 'stt');
+  assert.equal(readAnim(env.runDir).omniSeconds, 16);
+  const second = fakes(env);
+  const anim = await animateRun(env.runDir, second.deps);
+  assert.deepEqual(second.calls.start, []);
+  assert.equal(anim.skits.conflict!.fingerprint, 'fp-conflict');
+  assert.equal(anim.omniSeconds, 16);
+});
+
+test('новая громкость — сценка переобрабатывается из оплаченного клипа, без Omni', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const first = await animateRun(env.runDir, fakes(env).deps);
+  assert.match(first.skits.conflict!.post, /^lufs=-19;/);
+  const second = fakes(env);
+  const anim = await animateRun(env.runDir, { ...second.deps, lufs: -23 });
+  assert.deepEqual(second.calls.start, []);
+  assert.deepEqual(second.calls.keyframe, []);
+  assert.match(anim.skits.conflict!.post, /^lufs=-23;/);
+  assert.match(anim.skits.punchline!.post, /^lufs=-23;/);
+  assert.equal(anim.omniSeconds, 16);
+});
 ```
 
 В `studio/package.json`:
@@ -1983,11 +2815,11 @@ import { fileURLToPath } from 'node:url';
 import { parseConfig } from '../config';
 import { StudioError, toStudioError } from '../errors';
 import { detectSilences, probeFile } from '../ffprobe';
-import type { Animation, Script, SkitClip, SkitKind, SkitPlan } from '../types';
-import { checkClip, normalizeLoudness } from './clip-check';
+import type { Script, ShortAnimation, SkitClip, SkitKind, SkitPlan } from '../types';
+import { checkClip, CLIP_LUFS, normalizeLoudness } from './clip-check';
 import { lineCues, PAUSE_DETECT, voicedSpans } from './cues';
-import { CLIP_SEC, generateKeyframe, startClip, waitClip, type GoogleDeps, type ImageInput } from './google';
-import { MATCH_THRESHOLD, speechMatch } from './match';
+import { CLEAR_REFUSALS, CLIP_SEC, generateKeyframe, imageMime, startClip, waitClip, type GoogleDeps, type ImageInput } from './google';
+import { speechCheck } from './match';
 import { recognize, speechAudio } from './stt';
 
 const STUDIO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
@@ -1998,65 +2830,102 @@ export const MAX_SKIT_ATTEMPTS = 3;
 export const DEFAULT_MAX_OMNI_SECONDS = 48;
 
 export interface AnimateDeps {
-  keyframe(prompt: string, refs: ImageInput[]): Promise<Buffer>;
+  keyframe(prompt: string, refs: ImageInput[]): Promise<ImageInput>;
   startClip(prompt: string, image: ImageInput): Promise<string>;
   waitClip(id: string): Promise<Buffer>;
   recognize(ogg: Buffer, ctx: { kind: SkitKind; attempt: number }): Promise<string>;
   /** Корень портретов труппы; по умолчанию studio/assets/troupe. */
   troupeDir?: string;
+  /** Громкость клипов, LUFS; по умолчанию CLIP_LUFS. */
+  lufs?: number;
   maxOmniSeconds?: number;
   log?(msg: string): void;
 }
 
+/** Расширение кадра по его типу: Nano Banana Pro отдаёт JPEG. */
+const KEYFRAME_EXT: Record<string, string> = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' };
+
 /**
- * Оживление сценок папки ролика: script.json (со сценками) → animation.json и
- * skits/<отпечаток>/{keyframe.png, raw.mp4, speech.ogg, clip.mp4}.
+ * Оживление сценок папки ролика: script.json (со сценками) → animation.json,
+ * keyframes/<отпечаток кадра>.<jpg|png> и skits/<отпечаток клипа>/{raw.mp4, speech.ogg, clip.mp4}.
  *
  * Кадр развязки рисуется по кадру конфликта (то же место и костюмы), поэтому
- * сначала кадр конфликта, потом обе сценки параллельно. Сценка с тем же
- * отпечатком и файлами на месте не переснимается — так замечание, которое
- * правит одну сценку, переснимает только её.
+ * сначала кадр конфликта, потом обе сценки параллельно. Готовое не
+ * переделывается: кадр с тем же отпечатком кадра не перерисовывается, клип с
+ * тем же отпечатком клипа не переснимается. Новая реплика переснимает только
+ * клип своей сценки, новое место конфликта перерисовывает и развязку — это
+ * решают отпечатки (src/shorts/short-skit-prompts.ts бэкенда). Оплаченный клип
+ * (raw.mp4) лежит, пока его не забраковали: если задание упало уже после
+ * клипа (распознавание, ffmpeg), перезапуск возьмёт его, а не снимет новый.
+ * Так же, без Omni, клип переобрабатывается, когда меняются громкость или
+ * пороги пауз (поле post у готовой сценки).
  */
-export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Animation> {
+export async function animateRun(runDir: string, deps: AnimateDeps): Promise<ShortAnimation> {
   const script = JSON.parse(fs.readFileSync(path.join(runDir, 'script.json'), 'utf8')) as Script;
   const plans = script.skits;
   if (!plans?.conflict || !plans?.punchline) {
     throw new StudioError('script_invalid', 'animate: в сценарии нет сценок (skits.conflict и skits.punchline)', false);
   }
   const animPath = path.join(runDir, 'animation.json');
-  const anim: Animation = fs.existsSync(animPath) ? JSON.parse(fs.readFileSync(animPath, 'utf8')) : { omniSeconds: 0, skits: {} };
+  const anim: ShortAnimation = fs.existsSync(animPath) ? JSON.parse(fs.readFileSync(animPath, 'utf8')) : { omniSeconds: 0, skits: {} };
   const save = () => fs.writeFileSync(animPath, JSON.stringify(anim, null, 2));
   const budget = deps.maxOmniSeconds ?? DEFAULT_MAX_OMNI_SECONDS;
+  const lufs = deps.lufs ?? CLIP_LUFS;
+  // Настройки бесплатной части обработки: при их смене готовая сценка переобрабатывается из raw.mp4.
+  const post = `lufs=${lufs};pause=${PAUSE_DETECT.noiseDb}dB/${PAUSE_DETECT.minSec}s`;
   const troupeDir = deps.troupeDir ?? path.join(STUDIO_ROOT, 'assets', 'troupe');
   const log = deps.log ?? (() => {});
   const abs = (rel: string) => path.join(runDir, rel);
   const rel = (kind: SkitKind, name: string) => path.posix.join('skits', plans[kind].fingerprint, name);
+  const keyframeBase = (kind: SkitKind) => path.posix.join('keyframes', plans[kind].keyframeFingerprint);
+  const findKeyframe = (kind: SkitKind): string | null => {
+    for (const ext of Object.values(KEYFRAME_EXT)) {
+      const rel = `${keyframeBase(kind)}.${ext}`;
+      if (fs.existsSync(abs(rel))) return rel;
+    }
+    return null;
+  };
+  const readImage = (file: string): ImageInput => {
+    const data = fs.readFileSync(file);
+    return { data, mime: imageMime(data) };
+  };
   const giveUp = (e: StudioError) => new StudioError(e.code, `${e.message} — после ${MAX_SKIT_ATTEMPTS} попыток`, false);
 
   const reusable = (kind: SkitKind): boolean => {
     const prev = anim.skits[kind];
-    return !!prev && prev.fingerprint === plans[kind].fingerprint && fs.existsSync(abs(prev.clip)) && fs.existsSync(abs(prev.keyframe));
+    return (
+      !!prev &&
+      prev.fingerprint === plans[kind].fingerprint &&
+      prev.post === post &&
+      fs.existsSync(abs(prev.clip)) &&
+      fs.existsSync(abs(prev.keyframe))
+    );
   };
 
   const portraits = (plan: SkitPlan): ImageInput[] =>
     plan.heroes.map((h) => {
       const f = path.join(troupeDir, plan.troupeVersion, `${h}.png`);
       if (!fs.existsSync(f)) throw new StudioError('script_invalid', `animate: нет портрета героя ${h} (труппа ${plan.troupeVersion})`, false);
-      return { data: fs.readFileSync(f), mime: 'image/png' };
+      return readImage(f);
     });
 
-  /** Кадр-эталон сценки; нарисованный с тем же отпечатком не перерисовывается. */
+  /** Кадр-эталон сценки; нарисованный с тем же отпечатком кадра не перерисовывается. */
   const ensureKeyframe = async (kind: SkitKind): Promise<string> => {
-    const kf = rel(kind, 'keyframe.png');
-    if (fs.existsSync(abs(kf))) return kf;
+    const have = findKeyframe(kind);
+    if (have) return have;
     const refs = portraits(plans[kind]);
-    if (kind === 'punchline') refs.push({ data: fs.readFileSync(abs(rel('conflict', 'keyframe.png'))), mime: 'image/png' });
+    if (kind === 'punchline') {
+      const conflictKeyframe = findKeyframe('conflict');
+      if (!conflictKeyframe) throw new StudioError('unknown', 'animate: развязку не нарисовать — нет кадра конфликта', false);
+      refs.push(readImage(abs(conflictKeyframe)));
+    }
     let last: StudioError | null = null;
     for (let attempt = 1; attempt <= MAX_SKIT_ATTEMPTS; attempt++) {
       try {
-        const png = await deps.keyframe(plans[kind].keyframePrompt, refs);
+        const img = await deps.keyframe(plans[kind].keyframePrompt, refs);
+        const kf = `${keyframeBase(kind)}.${KEYFRAME_EXT[img.mime] ?? 'png'}`;
         fs.mkdirSync(path.dirname(abs(kf)), { recursive: true });
-        fs.writeFileSync(abs(kf), png);
+        fs.writeFileSync(abs(kf), img.data);
         return kf;
       } catch (e) {
         last = toStudioError(e);
@@ -2088,36 +2957,49 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Ani
       let started = false;
       try {
         const kf = await ensureKeyframe(kind);
-        if (anim.omniSeconds + CLIP_SEC > budget) {
-          throw new StudioError('omni_budget', `animate: на ролик ушло ${anim.omniSeconds} с Omni, предел — ${budget} с: лимит пересъёмок сценок`, false);
+        if (!fs.existsSync(raw)) {
+          if (anim.omniSeconds + CLIP_SEC > budget) {
+            throw new StudioError('omni_budget', `animate: на ролик ушло ${anim.omniSeconds} с Omni, предел — ${budget} с: лимит пересъёмок сценок`, false);
+          }
+          // Секунды резервируются до запуска: сценки идут параллельно, и обе не
+          // должны пройти предел, когда места осталось на одну.
+          anim.omniSeconds += CLIP_SEC;
+          reserved = true;
+          const id = await deps.startClip(plan.videoPrompt, readImage(abs(kf)));
+          started = true;
+          save();
+          fs.mkdirSync(path.dirname(raw), { recursive: true });
+          fs.writeFileSync(raw, await deps.waitClip(id));
         }
-        // Секунды резервируются до запуска: сценки идут параллельно, и обе не
-        // должны пройти предел, когда места осталось на одну.
-        anim.omniSeconds += CLIP_SEC;
-        reserved = true;
-        const id = await deps.startClip(plan.videoPrompt, { data: fs.readFileSync(abs(kf)), mime: 'image/png' });
-        started = true;
-        save();
-        fs.writeFileSync(raw, await deps.waitClip(id));
 
         // Нечитаемый файл — вина клипа, а не студии: такой клип переснимается.
-        const probe = await probeFile(raw).catch((e: unknown): never => {
-          throw new StudioError('clip_invalid', `animate ${kind}: файл от Omni не читается — ${e instanceof Error ? e.message : String(e)}`, true);
-        });
-        const problems = checkClip(probe, await local(kind, 'поиск тишины', () => detectSilences(raw, probe.durationSec)));
-        if (problems.length) throw new StudioError('clip_invalid', `animate ${kind}: клип не прошёл проверку — ${problems.join('; ')}`, true);
+        // Забракованный клип удаляется: следующая попытка снимет новый.
+        const reject = (code: 'clip_invalid' | 'speech_mismatch', msg: string): never => {
+          fs.rmSync(raw, { force: true });
+          fs.rmSync(abs(clip), { force: true });
+          throw new StudioError(code, msg, true);
+        };
+        const probe = await probeFile(raw).catch((e: unknown) =>
+          reject('clip_invalid', `animate ${kind}: файл от Omni не читается — ${e instanceof Error ? e.message : String(e)}`),
+        );
+        // Сначала громкость: тишину проверяет и готовый ролик — уже по выровненному звуку.
+        await local(kind, 'громкость', () => normalizeLoudness(raw, abs(clip), lufs));
+        const problems = checkClip(probe, await local(kind, 'поиск тишины', () => detectSilences(abs(clip), probe.durationSec)));
+        if (problems.length) reject('clip_invalid', `animate ${kind}: клип не прошёл проверку — ${problems.join('; ')}`);
 
-        const ogg = await local(kind, 'звук для распознавания', () => speechAudio(raw, abs(rel(kind, 'speech.ogg'))));
+        const ogg = await local(kind, 'звук для распознавания', () => speechAudio(abs(clip), abs(rel(kind, 'speech.ogg'))));
         const heard = await deps.recognize(fs.readFileSync(ogg), { kind, attempt });
-        const score = speechMatch(texts, heard);
-        if (score < MATCH_THRESHOLD) {
-          throw new StudioError('speech_mismatch', `animate ${kind}: речь не сошлась с репликами (${Math.round(score * 100)}%), услышано: «${heard.slice(0, 200)}»`, true);
+        const check = speechCheck(texts, heard);
+        if (!check.ok) {
+          const why = check.silentLines.length
+            ? `не услышаны реплики ${check.silentLines.map((i) => i + 1).join(', ')}`
+            : `речь не сошлась с репликами (${Math.round(check.share * 100)}%)`;
+          reject('speech_mismatch', `animate ${kind}: ${why}, услышано: «${heard.slice(0, 200)}»`);
         }
 
-        await local(kind, 'громкость', () => normalizeLoudness(raw, abs(clip)));
         const totalMs = Math.round(probe.durationSec * 1000);
         const pauses = await local(kind, 'поиск пауз', () => detectSilences(abs(clip), probe.durationSec, PAUSE_DETECT));
-        log(`animate ${kind}: готово с попытки ${attempt}, речь ${Math.round(score * 100)}%`);
+        log(`animate ${kind}: готово с попытки ${attempt}, речь ${Math.round(check.share * 100)}%`);
         return {
           fingerprint: plan.fingerprint,
           keyframe: kf,
@@ -2126,15 +3008,18 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Ani
           heard,
           cues: lineCues(texts, voicedSpans(pauses, totalMs), totalMs),
           attempts: attempt,
+          post,
         };
       } catch (e) {
-        // Запуск не состоялся — деньги не ушли, резерв возвращается.
-        if (reserved && !started) anim.omniSeconds -= CLIP_SEC;
+        const err = toStudioError(e);
+        // Секунды возвращаются, только если Google явно отказал в запуске: при
+        // потерянном ответе генерация могла начаться и будет оплачена.
+        if (reserved && !started && CLEAR_REFUSALS.has(err.code)) anim.omniSeconds -= CLIP_SEC;
         save();
-        last = toStudioError(e);
+        last = err;
         if (!last.retryable) throw last;
-        // Фильтр мог зацепиться за сам кадр — следующая попытка рисует новый.
-        if (last.code === 'omni_rejected') fs.rmSync(abs(rel(kind, 'keyframe.png')), { force: true });
+        // Кадр не перерисовывается и после отказа фильтра: по кадру конфликта уже
+        // могла быть нарисована развязка, и новый кадр развёл бы место и костюмы сценок.
         log(`animate ${kind}: попытка ${attempt} — ${last.message}`);
       }
     }
@@ -2201,7 +3086,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 "$WT"/studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts && npm run typecheck && echo TSC_OK"
 ```
 
-Expected: `# pass 11`, `# fail 0`, затем `TSC_OK`. Если тест «предел секунд Omni» нестабилен (конфликт и развязка резервируют в другом порядке) — увеличить `keyframeDelayMs.punchline` до 200 мс, а не ослаблять проверку.
+Expected: `# pass 16`, `# fail 0`, затем `TSC_OK`. Если тест «предел секунд Omni» нестабилен (конфликт и развязка резервируют в другом порядке) — увеличить `keyframeDelayMs.punchline` до 200 мс, а не ослаблять проверку.
 
 ---
 
@@ -2262,11 +3147,12 @@ test('сценки: короткая реплика ответа — line_too_sh
 
 ```ts
 const skitPlan = (lines: Array<{ hero: string; text: string; box?: number }>): SkitPlan => ({
-  skit: { cast: [{ hero: 'galina', role: 'хозяйка квартиры' }, { hero: 'kesha', role: 'жилец' }], setting: 's', action: 'a', lines },
+  skit: { cast: [{ hero: 'galina', role: 'хозяйка квартиры' }, { hero: 'kesha', role: 'жилец' }], setting: 's', opening: 'o', action: 'a', lines },
   troupeVersion: 'v1',
   heroes: ['galina', 'kesha'],
   keyframePrompt: 'k',
   videoPrompt: 'v',
+  keyframeFingerprint: 'kf',
   fingerprint: 'f',
 });
 
@@ -2297,9 +3183,11 @@ test('ролик со сценками: сценка без реплик и ре
   assert.ok(problems.some((p) => /сценки punchline ссылается на абзац 7/.test(p)));
 });
 
-test('ролик со сценками: без отпечатка студия не поймёт, что переснимать', () => {
+test('ролик со сценками: без отпечатков студия не поймёт, что переснимать', () => {
   const s = skitScript();
   s.skits = { ...s.skits!, conflict: { ...s.skits!.conflict, fingerprint: '' } };
+  assert.ok(validateScript(s, capture).includes('у сценки conflict нет отпечатка'));
+  s.skits = { ...s.skits!, conflict: { ...s.skits!.conflict, fingerprint: 'f', keyframeFingerprint: '' } };
   assert.ok(validateScript(s, capture).includes('у сценки conflict нет отпечатка'));
 });
 ```
@@ -2332,6 +3220,8 @@ import type { LineScene, Segment, SkitKind, SkitTimeline, Timeline, VoicedLine }
 /** Ролик со сценками: 25–45 с (спека сценок, «Ролик»). */
 export const SKIT_MIN_TOTAL_MS = 25_000;
 export const SKIT_MAX_TOTAL_MS = 45_000;
+/** Зацепка ролика со сценками — немая надпись поверх конфликта: её читают, а не слушают, поэтому дольше. */
+export const SKIT_HOOK_MS = 3000;
 ```
 
 3. После `const ORDER: LineScene[] = ['hook', 'question', 'answer', 'final'];` добавить:
@@ -2438,7 +3328,7 @@ export function buildSkitTimeline(lines: VoicedLine[], clips: Record<SkitKind, n
         problems.push(`нет сценки ${kind}`);
         continue;
       }
-      if (!p.fingerprint) problems.push(`у сценки ${kind} нет отпечатка`);
+      if (!p.fingerprint || !p.keyframeFingerprint) problems.push(`у сценки ${kind} нет отпечатка`);
       if (!p.skit?.lines?.length) problems.push(`в сценке ${kind} нет реплик`);
       for (const l of p.skit?.lines ?? []) {
         if (l.box != null && !known.has(l.box)) {
@@ -2480,7 +3370,7 @@ Expected: все `pass` (прежние тесты таймлайна и сце�
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildProps, buildSkitProps } from './props';
-import type { Animation, CaptureResult, Script, SkitPlan } from '../types';
+import type { CaptureResult, Script, ShortAnimation, SkitPlan } from '../types';
 import { StudioError } from '../errors';
 ```
 
@@ -2488,11 +3378,12 @@ import { StudioError } from '../errors';
 
 ```ts
 const skitPlan = (fingerprint: string, lines: string[]): SkitPlan => ({
-  skit: { cast: [{ hero: 'galina', role: 'хозяйка' }, { hero: 'kesha', role: 'жилец' }], setting: 's', action: 'a', lines: lines.map((text) => ({ hero: 'kesha', text })) },
+  skit: { cast: [{ hero: 'galina', role: 'хозяйка' }, { hero: 'kesha', role: 'жилец' }], setting: 's', opening: 'o', action: 'a', lines: lines.map((text) => ({ hero: 'kesha', text })) },
   troupeVersion: 'v1',
   heroes: ['galina', 'kesha'],
   keyframePrompt: 'k',
   videoPrompt: 'v',
+  keyframeFingerprint: `kf-${fingerprint}`,
   fingerprint,
 });
 
@@ -2512,12 +3403,12 @@ const skitScript: Script = {
 const skitMs: Record<string, number> = { q: 4000, a1: 8000, a2: 8000, f: 4000 };
 const skitVoiced = skitScript.lines.map((l) => ({ id: l.id, file: `/run/voice/${l.id}.mp3`, durationMs: skitMs[l.id] }));
 
-const animation: Animation = {
+const animation: ShortAnimation = {
   omniSeconds: 16,
   skits: {
-    conflict: { fingerprint: 'fc', keyframe: 'skits/fc/keyframe.png', clip: 'skits/fc/clip.mp4', durationMs: 8000, heard: '', attempts: 1,
+    conflict: { fingerprint: 'fc', keyframe: 'keyframes/kf-fc.png', clip: 'skits/fc/clip.mp4', durationMs: 8000, heard: '', attempts: 1, post: 'lufs=-19',
       cues: [{ line: 0, startMs: 500, endMs: 3500 }, { line: 1, startMs: 4000, endMs: 7000 }] },
-    punchline: { fingerprint: 'fp', keyframe: 'skits/fp/keyframe.png', clip: 'skits/fp/clip.mp4', durationMs: 8000, heard: '', attempts: 1,
+    punchline: { fingerprint: 'fp', keyframe: 'keyframes/kf-fp.png', clip: 'skits/fp/clip.mp4', durationMs: 8000, heard: '', attempts: 1, post: 'lufs=-19',
       cues: [{ line: 0, startMs: 500, endMs: 3000 }] },
   },
 };
@@ -2534,11 +3425,19 @@ test('пропсы со сценками: клипы и субтитры реп�
 });
 
 test('клип снят под другую сценку — no_input без повтора', () => {
-  const stale: Animation = { ...animation, skits: { ...animation.skits, punchline: { ...animation.skits.punchline!, fingerprint: 'old' } } };
+  const stale: ShortAnimation = { ...animation, skits: { ...animation.skits, punchline: { ...animation.skits.punchline!, fingerprint: 'old' } } };
   assert.throws(
     () => buildSkitProps(capture, skitScript, skitVoiced, stale, '/run'),
     (e: unknown) => e instanceof StudioError && e.code === 'no_input' && !e.retryable && /punchline/.test(e.message),
   );
+});
+
+test('субтитры реплик сценки не наезжают друг на друга и не выходят за сценку', () => {
+  const conflict = { ...animation.skits.conflict!, cues: [{ line: 0, startMs: 1017, endMs: 2035 }, { line: 1, startMs: 2035, endMs: 9000 }] };
+  const cues = buildSkitProps(capture, skitScript, skitVoiced, { ...animation, skits: { ...animation.skits, conflict } }, '/run').clips.conflict.cues;
+  for (let i = 1; i < cues.length; i++) assert.ok(cues[i].from >= cues[i - 1].from + cues[i - 1].duration, `субтитр ${i} начинается внутри предыдущего`);
+  const last = cues[cues.length - 1];
+  assert.ok(last.from + last.duration <= 240, 'субтитр вылез за сценку конфликта');
 });
 ```
 
@@ -2565,7 +3464,7 @@ import { StudioError } from '../errors';
 import { FRAME } from '../frame';
 import { buildSkitTimeline, buildTimeline, FPS, msToFrames } from '../timeline';
 import type { TtsResult } from '../tts';
-import type { Animation, CaptureResult, ClipCue, Script, ShortProps, SkitClip, SkitKind, SkitShortProps, VoicedLine } from '../types';
+import type { CaptureResult, ClipCue, Script, ShortAnimation, ShortProps, SkitClip, SkitKind, SkitShortProps, VoicedLine } from '../types';
 
 function assertFrame(capture: CaptureResult): void {
   if (capture.answerShotWidth !== FRAME.width) {
@@ -2607,7 +3506,7 @@ export function buildProps(capture: CaptureResult, script: Script, voiced: TtsRe
 }
 
 /** Пропсы композиции SkitShort: то же плюс клипы сценок и субтитры их реплик в кадрах ролика. */
-export function buildSkitProps(capture: CaptureResult, script: Script, voiced: TtsResult[], animation: Animation, runDir: string): SkitShortProps {
+export function buildSkitProps(capture: CaptureResult, script: Script, voiced: TtsResult[], animation: ShortAnimation, runDir: string): SkitShortProps {
   assertFrame(capture);
   const skits = script.skits;
   if (!skits) throw new StudioError('script_invalid', 'props: в сценарии нет сценок', false);
@@ -2620,12 +3519,16 @@ export function buildSkitProps(capture: CaptureResult, script: Script, voiced: T
     clips[kind] = c;
   }
   const timeline = buildSkitTimeline(voicedLines(script, voiced, runDir), { conflict: clips.conflict.durationMs, punchline: clips.punchline.durationMs }, FPS);
+  // Начало и конец реплики переводятся в кадры по отдельности: округление
+  // длины давало кадр с двумя субтитрами. Конец не выходит за сценку.
   const cues = (kind: SkitKind): ClipCue[] =>
     clips[kind].cues.flatMap((c) => {
+      const scene = timeline.scenes[kind];
+      const a = msToFrames(c.startMs, FPS);
+      const b = Math.min(msToFrames(c.endMs, FPS), scene.duration);
+      if (a >= b) return [];
       const text = skits[kind].skit.lines[c.line]?.text ?? '';
-      const from = timeline.scenes[kind].from + msToFrames(c.startMs, FPS);
-      const duration = Math.max(1, msToFrames(c.endMs - c.startMs, FPS));
-      return captionCues(splitCaption(text), from, duration).map((q, i) => ({ key: `${kind}-${c.line}-${i}`, ...q }));
+      return captionCues(splitCaption(text), scene.from + a, b - a).map((q, i) => ({ key: `${kind}-${c.line}-${i}`, ...q }));
     });
   return {
     fps: FPS,
@@ -2782,7 +3685,7 @@ export const Clip: React.FC<{ video: string; hook?: string; hookFrames?: number 
 ```tsx
 import React from 'react';
 import { AbsoluteFill, Audio, Sequence, staticFile } from 'remotion';
-import { MIN_HOOK_MS, msToFrames } from '../timeline';
+import { msToFrames, SKIT_HOOK_MS } from '../timeline';
 import type { SkitShortProps } from '../types';
 import { Captions, CueCaptions } from './Caption';
 import { Answer } from './scenes/Answer';
@@ -2799,7 +3702,7 @@ export const SkitShort: React.FC<SkitShortProps> = (p) => {
   return (
     <AbsoluteFill style={{ backgroundColor: '#000' }}>
       <Sequence from={scenes.conflict.from} durationInFrames={scenes.conflict.duration}>
-        <Clip video={p.clips.conflict.video} hook={p.hook} hookFrames={msToFrames(MIN_HOOK_MS, p.fps)} />
+        <Clip video={p.clips.conflict.video} hook={p.hook} hookFrames={msToFrames(SKIT_HOOK_MS, p.fps)} />
       </Sequence>
       <Sequence from={scenes.question.from} durationInFrames={scenes.question.duration}>
         <Question questionShot={p.questionShot} durationInFrames={scenes.question.duration} badge={p.badge} />
@@ -3006,11 +3909,12 @@ test('рендер фикстуры со сценками: 1080×1920, 25–45 �
     }),
   );
   const plan = (kind: string, texts: string[]) => ({
-    skit: { cast: [{ hero: 'galina', role: 'хозяйка' }, { hero: 'kesha', role: 'жилец' }], setting: 's', action: 'a', lines: texts.map((text) => ({ hero: 'kesha', text })) },
+    skit: { cast: [{ hero: 'galina', role: 'хозяйка' }, { hero: 'kesha', role: 'жилец' }], setting: 's', opening: 'o', action: 'a', lines: texts.map((text) => ({ hero: 'kesha', text })) },
     troupeVersion: 'v1',
     heroes: ['galina', 'kesha'],
     keyframePrompt: 'k',
     videoPrompt: 'v',
+    keyframeFingerprint: `fx-kf-${kind}`,
     fingerprint: `fx-${kind}`,
   });
   fs.writeFileSync(
@@ -3031,6 +3935,7 @@ test('рендер фикстуры со сценками: 1080×1920, 25–45 �
     durationMs: 8000,
     heard: '',
     attempts: 1,
+    post: 'lufs=-19',
     cues: [{ line: 0, startMs: 500, endMs: 3500 }, { line: 1, startMs: 4000, endMs: 7000 }],
   });
   fs.writeFileSync(path.join(dir, 'animation.json'), JSON.stringify({ omniSeconds: 16, skits: { conflict: clip('conflict'), punchline: clip('punchline') } }));
@@ -3058,11 +3963,14 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 - [ ] **Step 3: Пределы ролика со сценками**
 
-В `studio/src/ffprobe.ts` после `export const SHORT_LIMITS …;`:
+В `studio/src/ffprobe.ts` к импортам добавить `import { CLIP_LIMITS } from './animate/clip-check';` (clip-check импортирует из ffprobe только типы — цикла нет), а после `export const SHORT_LIMITS …;`:
 
 ```ts
-/** Ролик со сценками: 25–45 с, паузы между репликами сценок — до 3 с (спека сценок, «Ролик»). */
-export const SKIT_LIMITS: VerifyLimits = { ...SHORT_LIMITS, minSec: 25, maxSec: 45, maxSilenceSec: 3 };
+/**
+ * Ролик со сценками: 25–45 с; паузы — те же, что внутри клипа сценки
+ * (CLIP_LIMITS, animate/clip-check.ts): между репликами сценок бывают паузы.
+ */
+export const SKIT_LIMITS: VerifyLimits = { ...SHORT_LIMITS, minSec: 25, maxSec: 45, maxSilenceSec: CLIP_LIMITS.maxSilenceSec };
 ```
 
 - [ ] **Step 4: Сборка по формату сценария**
@@ -3083,7 +3991,7 @@ import { StudioError } from '../errors';
 import { detectSilences, probeFile, SHORT_LIMITS, SKIT_LIMITS, verifyVideo } from '../ffprobe';
 import { validateScript } from '../script';
 import { synthesizeAll } from '../tts';
-import type { Animation, CaptureResult, Script, ShortProps, SkitShortProps } from '../types';
+import type { CaptureResult, Script, ShortAnimation, ShortProps, SkitShortProps } from '../types';
 import { buildProps, buildSkitProps } from './props';
 ```
 
@@ -3097,7 +4005,7 @@ import { buildProps, buildSkitProps } from './props';
   if (script.skits) {
     const animPath = path.join(runDir, 'animation.json');
     if (!fs.existsSync(animPath)) throw new StudioError('no_input', 'render: у ролика со сценками нет animation.json — сначала npm run animate', false);
-    const animation = JSON.parse(fs.readFileSync(animPath, 'utf8')) as Animation;
+    const animation = JSON.parse(fs.readFileSync(animPath, 'utf8')) as ShortAnimation;
     inputProps = buildSkitProps(capture, script, voiced, animation, runDir);
     compositionId = 'SkitShort';
     limits = SKIT_LIMITS;
@@ -3200,7 +4108,7 @@ Expected: `skit-plan: studio/out/skit-sample-1/script.json — conflict <16 hex>
 Если упало:
 - `google_quota` — квота на сегодня; повторить после ≈ 11:00 МСК тем же шагом (готовая сценка не переснимется);
 - `model_gone` или `google_auth` — остановиться и сообщить владельцу;
-- `speech_mismatch` после 3 попыток — посмотреть `heard` в выводе и `skits/<отпечаток>/raw.mp4`. Если Omni говорит, но SpeechKit слышит иначе (имена, «га-га»), — это довод снизить `MATCH_THRESHOLD` в задаче 17, а не повод перезапускать вслепую.
+- `speech_mismatch` после 3 попыток — посмотреть `heard` в выводе и `skits/<отпечаток>/raw.mp4`. Если Omni говорит, но SpeechKit систематически пишет иначе (имена, междометия), — это правка нормализации в `match.ts` тестом на этом самом `heard` (задача 17), а не повод перезапускать вслепую. Порог `MATCH_THRESHOLD` трогать только от случайного шума: снижение ради нормализации затупит проверку для всех клипов.
 
 - [ ] **Step 5: Сборка**
 
@@ -3222,7 +4130,9 @@ scp -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o C
 Открыть `/tmp/skit-sample-1-strip.jpg` (Read) и проверить:
 - герои узнаваемы по листу труппы, их ровно двое, лишних персонажей нет;
 - в кадрах Omni нет надписей, экранов телефона и логотипов;
-- зацепка видна в первые 2 с, субтитры реплик сценок стоят ниже середины и не наезжают на зацепку;
+- зацепка видна в первые 3 с, субтитры реплик сценок стоят ниже середины и не наезжают на зацепку;
+- морды героев не под зацепкой (верхняя треть кадра) и не под субтитрами;
+- в кадре развязки то же место и те же костюмы, что в конфликте;
 - вопрос, ответ с рамкой абзаца и финал — как у принятого образца плана 1.
 
 Громкость: `I:` клипов и `voice/a1.mp3` расходятся не больше чем на 2 LU. Если больше — записать замер для задачи 17 (там меняется `CLIP_LUFS`).
