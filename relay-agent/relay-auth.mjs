@@ -10,11 +10,16 @@ import { performance } from "node:perf_hooks";
 export const RELOAD_MS = 30_000;
 export const HEADER = "x-agent-secret";
 
+// Строки короче 32 символов отбрасываем: настоящий секрет — 64-символьный
+// hex (32 случайных байта), короткая строка — почти наверняка перепутанный
+// файл (например, случайно подсунутый relay-auth-mode).
+const MIN_SECRET_LEN = 32;
+
 export function parseSecrets(text) {
   return String(text || "")
     .split("\n")
     .map((s) => s.trim())
-    .filter((s) => s && !s.startsWith("#"));
+    .filter((s) => s && !s.startsWith("#") && s.length >= MIN_SECRET_LEN);
 }
 
 export function parseMode(text) {
