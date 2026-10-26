@@ -4,6 +4,8 @@ import { ChatService } from './chat.service';
 import { ChatController } from './chat.controller';
 import { relaySessionKey } from './relay-session';
 import { verifyProductToolToken } from '../products/product-tool.token';
+import { relayFsKey } from './linkeon-relay-fields';
+import { verifyLinkeonToolToken } from '../mcp/linkeon-tool.token';
 
 jest.mock('axios');
 jest.mock('../common/telegram-alert', () => ({ sendTelegramAlert: jest.fn(async () => {}) }));
@@ -137,6 +139,21 @@ async function upload(pg: Pg, body: any = {}): Promise<Record<string, string>> {
   return fieldsOf(post.mock.calls[0][1]);
 }
 
+/** Как upload(), но со своей лентой событий релея; отдаёт и поля, и то, что ушло клиенту. */
+async function uploadRun(body: any, events: any[]): Promise<{ fields: Record<string, string>; written: any[] }> {
+  const svc = makeService(makePg());
+  const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+  const neo4j = { getProfileDescription: jest.fn(async () => PROFILE) };
+  const ctrl = new ChatController(svc, jwtSvc as any, neo4j as any, undefined);
+  const post = jest.fn(async () => ({ data: sseStream(events) }));
+  (axios as any).default = { post };
+  (axios as any).post = post;
+  const res = makeRes();
+  await ctrl.uploadAndChat(makeReq(body), res);
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+  return { fields: fieldsOf((post.mock.calls[0] as any[])[1]), written: res.written };
+}
+
 describe('relaySessionKey', () => {
   it('обычный ход: язык — часть ключа', () => {
     expect(relaySessionKey('u1', '12', 'ru')).toBe('u1_12_ru');
@@ -206,5 +223,26 @@ describe('uploadAndChat: файл уходит в сессию разговор�
   it('без ui (Flutter) — клиент app', async () => {
     const f = await upload(makePg());
     expect(verifyProductToolToken(f.products_token).client).toBe('app');
+  });
+});
+
+describe('uploadAndChat: инструменты Linkeon и папка хода', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  it('везёт токен хода, адрес точки и fs_key той же сессии, что у текстового хода', async () => {
+    const f = await upload(makePg());
+    expect(verifyLinkeonToolToken(f.linkeon_token)).toEqual({ userId: 'u1' });
+    expect(f.linkeon_mcp_url).toMatch(/\/webhook\/mcp\/linkeon$/);
+    expect(f.fs_key).toBe(relayFsKey(relaySessionKey('u1', '12', 'ru')));
+  });
+
+  it('шаг работы: загрузка с префиксом fs_key — без префикса', async () => {
+    const fsKey = relayFsKey(relaySessionKey('u1', '12', 'ru'));
+    const { written } = await uploadRun({ ui: JSON.stringify({ activity: true, ask: false }) }, [
+      { type: 'tool', tool: 'Read', input: JSON.stringify({ file_path: `/tmp/agent-uploads/${fsKey}_egrul.pdf` }) },
+      { type: 'delta', text: ANSWER },
+      { type: 'done' },
+    ]);
+    expect(written).toContainEqual({ type: 'activity', kind: 'read_upload', detail: 'egrul.pdf' });
   });
 });
