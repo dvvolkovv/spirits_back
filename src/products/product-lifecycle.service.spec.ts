@@ -75,6 +75,17 @@ describe('создание сайта', () => {
     const r = await h.svc.createSite({ userId: 'u1', name: 'Магазин', channel: 'web' });
     expect(r).toEqual({ ok: false, reason: 'failed', message: 'Не получилось — попробуйте ещё раз позже' });
   });
+
+  it('сайт создан, но первая правка/домен/журнал упали — всё равно ok:true, второй сайт не заводится', async () => {
+    const h = harness({ pg: (sql) => (sql.includes('SET first_prompt') ? Promise.reject(new Error('connection reset by peer')) : undefined) });
+    const warn = jest.spyOn((h.svc as any).logger, 'warn').mockImplementation(() => undefined);
+    const r = await h.svc.createSite({ userId: 'u1', name: 'Магазин', prompt: 'Лендинг', channel: 'web' });
+    expect(r).toEqual({ ok: true, productId: 'p-new', slug: 'magazin', domain: null });
+    // Один вызов create — отказ ПОСЛЕ заведения не должен выглядеть как
+    // занятый слаг и запускать повторную попытку со следующим кандидатом.
+    expect(h.provisioning.create).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalled();
+  });
 });
 
 describe('создание бота', () => {
