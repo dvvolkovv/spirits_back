@@ -1,6 +1,7 @@
 {
   "chat": "chat.title",
   "listen": "chat.listen",
+  "voiceInput": "chat.voice_start",
   "fresh": "chat.fresh_mode_label",
   "files": "chat.files.open",
   "call": "chat.voice_call.start",
