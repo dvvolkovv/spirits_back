@@ -139,7 +139,15 @@ describe('ShortsDirectorService.direct — ролик со сценками', ()
     const pg = {
       query: jest.fn(async (sql: string) => {
         if (sql.includes("scene->>'question'")) return { rows: [{ q: 'Вопрос из прошлого ролика' }] };
-        if (sql.includes("scene->'skit'")) return { rows: [{ skit: { ...SKIT, setting: 'a kitchen', action: 'The cat stamps a paper.' } }, { skit: null }] };
+        if (sql.includes("scene->'skit'")) {
+          return {
+            rows: [
+              { skit: { ...SKIT, setting: 'a kitchen', action: 'The cat stamps a paper.' }, punchline: { ...SKIT, action: 'The cat falls asleep on the stamp.' } },
+              { skit: { ...SKIT, setting: 'a garage', action: 'The beaver adds a zero.' }, punchline: null },
+              { skit: null, punchline: null },
+            ],
+          };
+        }
         return { rows: [], rowCount: 1 };
       }),
     };
@@ -153,7 +161,12 @@ describe('ShortsDirectorService.direct — ролик со сценками', ()
     await svc.direct(video({ format: 'skit' }));
     const [system, message] = relay.ask.mock.calls[0] as any[];
     expect(system).toBe(DIRECTOR_SKIT_SYSTEM);
-    expect(message).toContain('<<<СЦЕНКИ\n- a kitchen — The cat stamps a paper.\nСЦЕНКИ>>>');
+    // Прошлые сценки — и развязки: шутка развязки повторяется так же, как место.
+    expect(message).toContain(
+      '<<<СЦЕНКИ\n- a kitchen — The cat stamps a paper.; развязка: The cat falls asleep on the stamp.\n- a garage — The beaver adds a zero.\nСЦЕНКИ>>>',
+    );
+    expect(pg.query.mock.calls.find(([sql]: [string]) => sql.includes("scene->'skit'"))[0]).toContain("script->'skits'->'punchline'->'skit'");
+    expect(message).not.toContain('ПРОШЛАЯ СЦЕНКА 1');
     const update = pg.query.mock.calls.find(([sql]: [string]) => sql.includes("SET status = 'capture_queued'"));
     expect(JSON.parse(update[1][1]).skit).toEqual(SKIT);
     // Прошлые сценки — только у роликов, где они есть.
@@ -166,9 +179,28 @@ describe('ShortsDirectorService.direct — ролик со сценками', ()
     expect(relay.ask).toHaveBeenCalledTimes(2);
     const second = relay.ask.mock.calls[1][1] as string;
     expect(second).toContain('Сценка нарушила правила — исправь:\n- сценка 1 (конфликт): правило 17: реплика 1 — 13 слов, больше 12');
-    expect(second).toContain('<<<СЦЕНКА 1\n');
+    // Вопрос отвергнутого варианта — оставить: исправляется только сценка.
+    expect(second).toContain(`Твой прошлый вариант — ассистента и вопрос оставь, исправь только сценку 1:\n<<<ВОПРОС\n${REPLY.question}\nВОПРОС>>>\n<<<СЦЕНКА 1\n`);
     const update = pg.query.mock.calls.find(([sql]: [string]) => sql.includes("SET status = 'capture_queued'"));
     expect(JSON.parse(update[1][1]).skit).toEqual(SKIT);
+  });
+
+  it('правила текста у сценки 1 — тоже до записи: название сервиса в реплике — на переписку', async () => {
+    const BRAND = { ...SKIT, lines: [SKIT.lines[0], { hero: 'kesha', text: 'Спокойно. Спрошу в Linkeon.' }] };
+    const { svc, relay } = skitSetup([{ ...REPLY, skit: BRAND }, { ...REPLY, skit: SKIT }]);
+    await svc.direct(video({ format: 'skit' }));
+    expect(relay.ask).toHaveBeenCalledTimes(2);
+    expect(relay.ask.mock.calls[1][1]).toContain('- название сервиса — только в финале: убери его (сценка 1 (конфликт), реплика 2)');
+  });
+
+  it('«Переснять»: сценка 1 прошлой сцены — режиссёру, придумать другую', async () => {
+    const { svc, relay } = skitSetup([{ ...REPLY, skit: SKIT }]);
+    const old = { ...SKIT, setting: 'an old office' };
+    await svc.direct(video({ format: 'skit', scene: { kind: 'chat', assistantId: 10, assistantName: 'Алексей', question: 'Старый вопрос', followups: ['x'], skit: old } }));
+    const message = relay.ask.mock.calls[0][1] as string;
+    expect(message).toContain('Сценка 1 прошлой сцены — придумай другую:\n<<<ПРОШЛАЯ СЦЕНКА 1\n');
+    expect(message).toContain('setting: an old office');
+    expect(message).not.toContain('Твой прошлый вариант');
   });
 
   it(`нарушения и после ${MAX_SKIT_REWRITES} переписок — StageFatalError, ролик не записан`, async () => {

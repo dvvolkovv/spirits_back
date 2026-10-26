@@ -129,7 +129,7 @@ describe('parseWriterReply', () => {
     expect(() => parseWriterReply(JSON.stringify({ ...w, lines: [{ text: 'без номера' }] }))).toThrow(/box/);
   });
 
-  it('ролик со сценками: развязка обязательна, конфликт — только если переписан', () => {
+  it('ролик со сценками: развязка обязательна, пока нет принятой; конфликт — только если переписан', () => {
     const punchline = {
       cast: [{ hero: 'kesha', role: 'жилец' }, { hero: 'galina', role: 'хозяйка квартиры' }],
       setting: 'the same hallway', opening: 'The capybara holds up the phone.', action: 'The goose drops the keys.',
@@ -140,7 +140,15 @@ describe('parseWriterReply', () => {
     expect(r.skits.punchline?.lines).toEqual([{ hero: 'kesha', text: 'Это износ.', box: 3 }, { hero: 'galina', text: 'Га-га… ладно.' }]);
     const conflict = { ...punchline, lines: [{ hero: 'galina', text: 'Залог мой!' }] };
     expect(parseWriterReply(JSON.stringify({ ...w, punchline, conflict }), { skit: true }).skits.conflict?.lines).toEqual([{ hero: 'galina', text: 'Залог мой!' }]);
-    expect(() => parseWriterReply(JSON.stringify(w), { skit: true })).toThrow(/сценарист: punchline — объект/);
+    expect(() => parseWriterReply(JSON.stringify(w), { skit: true })).toThrow('сценарист: нет сценки 2 — развязки (punchline)');
+    expect(() => parseWriterReply(JSON.stringify({ ...w, punchline: 'a hallway' }), { skit: true })).toThrow(/сценарист: punchline — объект/);
+    // С принятой развязкой сценарист её не повторяет: null — остаётся принятая, её клип не переснимается.
+    expect(parseWriterReply(JSON.stringify(w), { skit: true, acceptedPunchline: true }).skits).toEqual({ conflict: null, punchline: null });
+    // «Не меняю» модели — null, пустая строка, false, пустой объект — это не сценка.
+    for (const empty of [null, '', false, {}]) {
+      expect(parseWriterReply(JSON.stringify({ ...w, punchline, conflict: empty }), { skit: true }).skits.conflict).toBeNull();
+      expect(parseWriterReply(JSON.stringify({ ...w, punchline: empty }), { skit: true, acceptedPunchline: true }).skits.punchline).toBeNull();
+    }
     // Без формата skit сценки не разбираются вовсе.
     expect(parseWriterReply(JSON.stringify({ ...w, punchline })).skits).toEqual({ conflict: null, punchline: null });
   });
@@ -152,11 +160,11 @@ describe('parseWriterReply', () => {
 });
 
 describe('parseSkit', () => {
-  it('поля — строками без пробелов по краям; пустой box — нет box; кривой box — ошибка с местом', () => {
+  it('поля — строками без пробелов по краям, id героя — строчными; пустой box — нет box; кривой box — ошибка с местом', () => {
     const s = parseSkit({
-      cast: [{ hero: ' kesha ', role: ' жилец ' }],
+      cast: [{ hero: ' Kesha ', role: ' жилец ' }],
       setting: ' a hallway ', opening: 'o', action: 'a',
-      lines: [{ hero: 'kesha', text: ' Спокойно. ', box: '' }, { hero: 'kesha', text: 'Да', box: null }],
+      lines: [{ hero: 'KESHA', text: ' Спокойно. ', box: '' }, { hero: 'kesha', text: 'Да', box: null }],
     }, 'режиссёр', 'skit');
     expect(s).toEqual({
       cast: [{ hero: 'kesha', role: 'жилец' }],

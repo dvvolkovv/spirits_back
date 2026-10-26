@@ -271,6 +271,35 @@ describe('промпты сценок', () => {
       }
     }
     expect(troupeBrief().split('\n')).toHaveLength(TROUPE.length + 1);
+    // Кто в кадре по-английски — им героев называют английские поля сценки.
+    for (const h of TROUPE) expect(troupeBrief()).toContain(`- ${h.id} — ${h.name} (${h.who}): `);
+  });
+
+  it('оба: реплика — только звучащие слова, 8–14 слов, Кеша в каждой сценке, пример — строкой «Пример:»', () => {
+    for (const system of [DIRECTOR_SKIT_SYSTEM, WRITER_SKIT_SYSTEM]) {
+      for (const s of ['только слова, которые звучат', '8–14 слов на сценку', 'Кеша — в каждой сценке', 'у Кеши — в конфликте, у противника — в развязке']) {
+        expect(system).toContain(s);
+      }
+      expect(system.split('\n').filter((l) => l.startsWith('Пример: '))).toHaveLength(1);
+    }
+  });
+
+  it('пример сценки из промпта сам проходит правила сценок', () => {
+    const example: Skit = {
+      cast: [{ hero: 'galina', role: 'хозяйка квартиры' }, { hero: 'kesha', role: 'жилец' }],
+      setting: 'a small rented flat hallway, a tiny scuff on the wallpaper by the door',
+      opening: 'the goose stands in the doorway with a bunch of keys, the capybara holds a suitcase',
+      action: 'the goose points a wing at the scuff and hisses, feathers bristling, the capybara calmly takes out a phone',
+      lines: [{ hero: 'galina', text: 'Обои потёрли! Весь залог мой!' }, { hero: 'kesha', text: 'Спокойно. Сейчас спрошу.' }],
+    };
+    const line = DIRECTOR_SKIT_SYSTEM.split('\n').find((l) => l.startsWith('Пример: '));
+    for (const v of [example.setting, example.opening, example.action, ...example.lines.map((l) => l.text)]) expect(line).toContain(v);
+    expect(checkSkitRules(example, 'conflict', null)).toEqual([]);
+  });
+
+  it('режиссёр сценок знает правила текста 1–15: сценарист его сценку без замечаний не трогает', () => {
+    for (let n = 1; n <= 15; n++) expect(DIRECTOR_SKIT_SYSTEM).toContain(`\n${n}. `);
+    expect(DIRECTOR_SKIT_SYSTEM).toContain('только из твоего вопроса');
   });
 
   it('оба знают правила сценок 16–20, приёмы юмора и английские поля без кавычек', () => {
@@ -283,9 +312,13 @@ describe('промпты сценок', () => {
   });
 
   it('сценарист сценок: надпись до 6 слов, 1–2 реплики, развязка с box, конфликт — только по замечанию, правила 1–15', () => {
-    for (const s of ['до 6 слов', '1–2 реплики', 'с его номером в box', 'conflict — только если замечания', 'и для реплик героев']) {
+    for (const s of ['до 6 слов', '1–2 реплики', 'с его номером в box', 'conflict — только если замечания или нарушения', 'и для реплик героев', 'принятая сценка 2', 'Отзыв студии — о длине озвучки']) {
       expect(WRITER_SKIT_SYSTEM).toContain(s);
     }
+    // Примеры зацепок сценок — сами до 6 слов.
+    const examples = WRITER_SKIT_SYSTEM.split('Подачи и примеры зацепок:')[1].split('Зацепка цепляет')[0].match(/(?<=\. )«[^»]+»/g);
+    expect(examples).toHaveLength(4);
+    for (const e of examples) expect(e.split(/\s+/).filter((w) => /[\p{L}\p{N}]/u.test(w)).length).toBeLessThanOrEqual(6);
     for (let n = 1; n <= 15; n++) expect(WRITER_SKIT_SYSTEM).toContain(`\n${n}. `);
   });
 
@@ -295,7 +328,9 @@ describe('промпты сценок', () => {
     const q = 'Хозяин квартиры не возвращает залог — что делать?';
     const filled = t[0].replace(/"(?:<[^>"]*>|\.\.\.)"/g, JSON.stringify(q)).replace(/<[^>]*>/g, '10');
     const r = parseDirectorReply(filled, { assistantIds: new Set([10]), fixedAssistantId: null, skit: true });
-    expect(r.skit).toMatchObject({ setting: q, opening: q, action: q, cast: [{ hero: q, role: q }], lines: [{ hero: q, text: q }] });
+    // id героя разбор приводит к строчным.
+    const id = q.toLowerCase();
+    expect(r.skit).toMatchObject({ setting: q, opening: q, action: q, cast: [{ hero: id, role: q }], lines: [{ hero: id, text: q }] });
   });
 
   it('шаблоны сценариста сценок разбираются parseWriterReply со сценкой', () => {
@@ -305,7 +340,7 @@ describe('промпты сценок', () => {
     const text = 'Залог?';
     const filled = script.replace(/"(?:<[^>"]*>|\.\.\.)"/g, JSON.stringify(text)).replace(/<[^>]*>/g, '3');
     const r = parseWriterReply(filled, { skit: true });
-    expect(r.skits.punchline?.lines).toEqual([{ hero: text, text, box: 3 }]);
+    expect(r.skits.punchline?.lines).toEqual([{ hero: text.toLowerCase(), text, box: 3 }]);
     expect(r.skits.conflict).toBeNull();
   });
 
@@ -320,7 +355,7 @@ describe('промпты сценок', () => {
       const lines = Array.from({ length: answers }, (_, k) => ({ box: k + 1, text: 'х'.repeat(k === 0 ? total - 60 - each * (answers - 1) : each) }));
       return estimateSpeechSec(buildScript(
         { hook: 'х'.repeat(30), hookBox: 1, question: 'х'.repeat(60), lines },
-        { voice: 'madirus', narratorVoice: 'alena', assistantsCount: 18, skits },
+        { voice: 'madirus', narratorVoice: 'alena', assistantsCount: 18, format: 'skit', skits },
       ));
     };
     for (let answers = MIN_SKIT_ANSWER_LINES; answers <= MAX_SKIT_ANSWER_LINES; answers++) {
@@ -337,34 +372,62 @@ describe('промпты сценок', () => {
       'action: The goose hisses and flaps.',
       'реплика 1, kesha [3]: Это износ.',
     ].join('\n'));
-    expect(recentSkitLine({ ...conflict, action: 'х'.repeat(300) })).toHaveLength(200);
+    expect(recentSkitLine(conflict, { ...conflict, action: 'The goose drops the keys.' })).toBe(
+      'a rented flat hallway — The goose hisses and flaps.; развязка: The goose drops the keys.',
+    );
+    expect(recentSkitLine(conflict)).toBe('a rented flat hallway — The goose hisses and flaps.');
+    expect(recentSkitLine({ ...conflict, action: 'х'.repeat(400) })).toHaveLength(300);
   });
 
-  it('сообщение режиссёру сценок: прошлые сценки, отвергнутая сценка и нарушения — данными', () => {
+  it('сообщение режиссёру сценок: прошлые сценки, отвергнутая сценка с её вопросом и нарушения — данными', () => {
     const m = buildDirectorMessage({
       rubric: 'assistant', angle: 'calm', topicHint: null, fixedAssistant: null, assistants: [], recentQuestions: [],
       ownerNote: null, previousQuestion: null,
-      skit: { recent: ['a kitchen — the cat stamps a paper'], previous: conflict, violations: ['сценка 1 (конфликт): правило 17: реплика 1 — 13 слов, больше 12'] },
+      skit: {
+        recent: ['a kitchen — the cat stamps a paper'],
+        replaced: null,
+        rejected: { question: 'Можно ли оставить залог?', skit: conflict },
+        violations: ['сценка 1 (конфликт): правило 17: реплика 1 — 13 слов, больше 12'],
+      },
     });
     expect(m).toContain('<<<СЦЕНКИ\n- a kitchen — the cat stamps a paper\nСЦЕНКИ>>>');
-    expect(m).toContain('<<<СЦЕНКА 1\ncast: galina — хозяйка квартиры');
+    expect(m).toContain('Твой прошлый вариант — ассистента и вопрос оставь, исправь только сценку 1:\n<<<ВОПРОС\nМожно ли оставить залог?\nВОПРОС>>>\n<<<СЦЕНКА 1\ncast: galina — хозяйка квартиры');
     expect(m).toContain('Сценка нарушила правила — исправь:\n- сценка 1 (конфликт): правило 17');
+    expect(m).not.toContain('ПРОШЛАЯ СЦЕНКА 1');
+    const replaced = buildDirectorMessage({
+      rubric: 'assistant', angle: 'calm', topicHint: null, fixedAssistant: null, assistants: [], recentQuestions: [],
+      ownerNote: null, previousQuestion: 'Старый вопрос',
+      skit: { recent: [], replaced: conflict, rejected: null, violations: [] },
+    });
+    expect(replaced).toContain('Сценка 1 прошлой сцены — придумай другую:\n<<<ПРОШЛАЯ СЦЕНКА 1\ncast: galina');
+    expect(replaced).not.toContain('Твой прошлый вариант');
     const plain = buildDirectorMessage({
       rubric: 'assistant', angle: 'calm', topicHint: null, fixedAssistant: null, assistants: [], recentQuestions: [], ownerNote: null, previousQuestion: null,
     });
     expect(plain).not.toContain('СЦЕНК');
   });
 
-  it('сообщение сценаристу сценок: конфликт, который открывает ролик, и прошлая развязка — данными', () => {
-    const m = buildWriterMessage({
-      rubric: 'assistant', angle: 'uncomfortable', assistantName: 'Алексей', assistantDescription: 'юрист',
+  it('сообщение сценаристу сценок: конфликт, который открывает ролик, принятая и отвергнутая развязки — данными, порознь', () => {
+    const base = {
+      rubric: 'assistant' as const, angle: 'uncomfortable' as const, assistantName: 'Алексей', assistantDescription: 'юрист',
       question: 'Вопрос', paragraphs: [{ n: 1, text: 'Абзац' }], ownerNote: null, writerFeedback: null,
       previousScript: null, violations: [],
-      skit: { conflict, previousPunchline: { ...conflict, lines: [{ hero: 'kesha', text: 'Износ.', box: 1 }] } },
+    };
+    const m = buildWriterMessage({
+      ...base,
+      skit: { conflict, acceptedPunchline: null, rejectedPunchline: { ...conflict, lines: [{ hero: 'kesha', text: 'Износ.', box: 1 }] } },
     });
     expect(m).toContain('Сценка 1 (конфликт) — открывает ролик:\n<<<СЦЕНКА 1\n');
     expect(m).toContain('Прошлый вариант сценки 2:\n<<<СЦЕНКА 2\n');
     expect(m).toContain('реплика 1, kesha [1]: Износ.');
+    expect(m).not.toContain('ПРИНЯТАЯ');
+    const accepted = buildWriterMessage({
+      ...base,
+      skit: { conflict, acceptedPunchline: { ...conflict, lines: [{ hero: 'kesha', text: 'Это износ.', box: 1 }] }, rejectedPunchline: null },
+    });
+    expect(accepted).toContain('Принятая сценка 2 (развязка) — не пиши punchline, если замечания и нарушения её не касаются:\n<<<ПРИНЯТАЯ СЦЕНКА 2\n');
+    expect(accepted).toContain('реплика 1, kesha [1]: Это износ.');
+    expect(accepted).not.toContain('Прошлый вариант сценки 2');
   });
 
   it('пример конфликта из теста сам проходит правила сценок', () => {

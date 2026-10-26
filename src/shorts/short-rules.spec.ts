@@ -1,4 +1,4 @@
-import { RulesInput, checkScriptRules, checkSkitRules, estimateSpeechSec, numbersIn } from './short-rules';
+import { RulesInput, checkScriptRules, checkSkitRules, checkSkitTextRules, estimateSpeechSec, numbersIn } from './short-rules';
 import { Skit } from './short-skit-prompts';
 import { ShortScript } from './shorts.types';
 
@@ -128,7 +128,7 @@ describe('checkScriptRules', () => {
 
   it('название сервиса в репликах — только в финале', () => {
     const s = withLine('q', `${script().lines[1].text} Это Линкеон.`);
-    expect(checkScriptRules(input({ script: s })).join('\n')).toMatch(/только в финале/);
+    expect(checkScriptRules(input({ script: s }))).toContain('название сервиса — только в финале: убери его (реплика q)');
   });
 
   it('длина: короче 32 с и длиннее 55 с', () => {
@@ -553,7 +553,7 @@ describe('checkSkitRules — правила 16–18 и форма сценки',
     const s = conflict();
     s.cast = [{ hero: 'fox' as any, role: 'лиса' }, { hero: 'kesha', role: 'Жилец' }, { hero: 'kesha', role: 'сосед' }];
     expect(checkSkitRules(s, 'conflict', null)).toEqual([
-      'сценка 1 (конфликт): правило 16: героя «fox» нет в труппе',
+      'сценка 1 (конфликт): правило 16: героя «fox» нет в труппе — есть kesha, galina, boris, mikhalych, zhorik',
       'сценка 1 (конфликт): правило 16: Капибара Кеша в составе дважды',
       'сценка 1 (конфликт): реплика 1: говорит «galina», а его нет в составе',
     ]);
@@ -561,6 +561,31 @@ describe('checkSkitRules — правила 16–18 и форма сценки',
     r.cast[0].role = 'тёща';
     expect(checkSkitRules(r, 'conflict', null)).toEqual([
       'сценка 1 (конфликт): правило 16: роль «тёща» не из ролей героя Гусыня Галина Петровна (хозяйка квартиры, соседка, свекровь, вахтёрша, продавщица)',
+    ]);
+  });
+
+  it('правило 16: роль — из списка или она же с уточнением целыми словами; Кеша — в каждой сценке', () => {
+    const s = conflict();
+    s.cast = [{ hero: 'galina', role: 'Хозяйка  квартиры на Тверской' }, { hero: 'kesha', role: 'жилец' }];
+    expect(checkSkitRules(s, 'conflict', null)).toEqual([]);
+    s.cast[1].role = 'соседка';
+    expect(checkSkitRules(s, 'conflict', null)).toEqual([
+      'сценка 1 (конфликт): правило 16: роль «соседка» не из ролей героя Капибара Кеша (жилец, работник, покупатель, клиент, сосед, муж, предприниматель, заёмщик)',
+    ]);
+    const r = conflict();
+    r.cast = [{ hero: 'galina', role: 'хозяйка квартиры' }, { hero: 'boris', role: 'начальник' }];
+    r.lines = [{ hero: 'galina', text: 'Обои потёрли! Залог мой!' }, { hero: 'boris', text: 'Не положено.' }];
+    expect(checkSkitRules(r, 'conflict', null)).toEqual([
+      'сценка 1 (конфликт): правило 16: Капибара Кеша (kesha) играет в каждой сценке — добавь его в состав',
+    ]);
+  });
+
+  it('реплика — только слова, которые звучат, и по-русски', () => {
+    const s = conflict();
+    s.lines = [{ hero: 'galina', text: '(шипит) Обои потёрли! *машет крылом*' }, { hero: 'kesha', text: 'Calm down, I will ask.' }];
+    expect(checkSkitRules(s, 'conflict', null)).toEqual([
+      'сценка 1 (конфликт): реплика 1: только слова, которые звучат — ремарки в скобках и звёздочках Omni прочтёт вслух, движения пиши в action',
+      'сценка 1 (конфликт): реплика 2 — по-русски: герои говорят по-русски',
     ]);
   });
 
@@ -606,6 +631,30 @@ describe('checkSkitRules — правила 16–18 и форма сценки',
       'сценка 1 (конфликт): нет поля action',
     ]);
     expect(checkSkitRules(null, 'punchline', paragraphs)).toEqual(['сценка 2 (развязка): сценки нет']);
+  });
+});
+
+describe('checkSkitTextRules — правила текста у сценки 1 режиссёра', () => {
+  const src = {
+    angle: 'uncomfortable' as const,
+    sceneQuestion: 'Хозяйка хочет оставить себе залог 50 тысяч за потёртые обои. Так можно?',
+    assistantsCount: 18,
+  };
+
+  it('корректная проходит; число из вопроса — не выдумка', () => {
+    const c = conflict();
+    c.lines[0].text = 'Обои потёрли! Все 50 тысяч мои!';
+    expect(checkSkitTextRules(c, 'conflict', src)).toEqual([]);
+  });
+
+  it('название сервиса, брань и число не из вопроса — с местом', () => {
+    const c = conflict();
+    c.lines[0].text = 'Только идиот подпишет такое! Отдай 70 тысяч!';
+    c.lines[1].text = 'Спокойно. Спрошу в Linkeon.';
+    const out = checkSkitTextRules(c, 'conflict', src);
+    expect(out).toContain('название сервиса — только в финале: убери его (сценка 1 (конфликт), реплика 2)');
+    expect(out).toContain('правило 1: числа «70 тысяч» нет в ответе ассистента (сценка 1 (конфликт), реплика 1)');
+    expect(out.some((m) => m.startsWith('правило 14:') && m.endsWith('(сценка 1 (конфликт), реплика 1)'))).toBe(true);
   });
 });
 
@@ -659,7 +708,15 @@ describe('checkScriptRules — ролик со сценками', () => {
     c.lines[1].text = 'Спокойно. Спрошу в Linkeon.';
     const out = checkScriptRules(skitInput({ skits: { conflict: c, punchline: punchline() } }));
     expect(out).toContain('правило 1: числа «50 тысяч» нет в ответе ассистента (сценка 1 (конфликт), реплика 1)');
-    expect(out).toContain('название сервиса звучит только в финале — убери его из реплик');
+    expect(out).toContain('название сервиса — только в финале: убери его (сценка 1 (конфликт), реплика 2)');
+  });
+
+  it('немая зацепка — тоже текст ролика: правила текста и название сервиса', () => {
+    const s = skitScript();
+    s.hook = 'Linkeon: 50 тысяч за обои?';
+    const out = checkScriptRules(skitInput({ script: s }));
+    expect(out).toContain('название сервиса — только в финале: убери его (зацепка)');
+    expect(out).toContain('правило 1: числа «50 тысяч» нет в ответе ассистента (зацепка)');
   });
 
   it('длина озвучки — коридор сценок 11–26 с, а не 32–55 с', () => {

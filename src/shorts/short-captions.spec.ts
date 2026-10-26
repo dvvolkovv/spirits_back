@@ -158,6 +158,7 @@ describe('skitCastLine и omniSpendLine', () => {
 
   it('траты: секунды Omni по $0,10 и кадры по $0,13; оживления ещё не было — нули', () => {
     expect(omniSpendLine({ omniSeconds: 24, keyframes: 3, skits: {} })).toBe('Omni: 24 с, кадров 3 ≈ $2,79');
+    expect(omniSpendLine({ omniSeconds: 16, keyframes: 2, skits: {} }, 48)).toBe('Omni: 16 из 48 с, кадров 2 ≈ $1,86');
     expect(omniSpendLine(null)).toBe('Omni: 0 с, кадров 0 ≈ $0,00');
   });
 });

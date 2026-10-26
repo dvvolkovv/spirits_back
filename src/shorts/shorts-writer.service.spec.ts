@@ -196,13 +196,45 @@ describe('ShortsWriterService.write — ролик со сценками', () =>
     expect(script.skits.conflict.skit).toEqual(rewritten);
   });
 
-  it('круг по замечанию: конфликт и прошлая развязка — из сценария, а не из сцены', async () => {
+  it('круг по замечанию: конфликт и принятая развязка — из сценария, а не из сцены', async () => {
     const accepted = planSkits({ conflict: { ...CONFLICT, setting: 'an accepted hallway' } as any, punchline: PUNCHLINE as any });
     const { svc, relay } = setup([SKIT_GOOD]);
     await svc.write(skitVideo({ script: { hook: 'Старая', voice: 'madirus', speed: 1.1, lines: [], final: { assistantsCount: 18 }, skits: accepted } }));
     const message = relay.ask.mock.calls[0][1] as string;
     expect(message).toContain('setting: an accepted hallway');
-    expect(message).toContain('Прошлый вариант сценки 2:\n<<<СЦЕНКА 2\n');
+    expect(message).toContain('Принятая сценка 2 (развязка) — не пиши punchline, если замечания и нарушения её не касаются:\n<<<ПРИНЯТАЯ СЦЕНКА 2\n');
+    expect(message).not.toContain('Прошлый вариант сценки 2');
+  });
+
+  it('отзыв студии о длине: развязку сценарист не повторяет — принятая остаётся, её отпечаток тот же, клип не переснимется', async () => {
+    const accepted = planSkits({ conflict: CONFLICT as any, punchline: PUNCHLINE as any });
+    const { punchline, ...noPunchline } = SKIT_GOOD;
+    const { svc, pg } = setup([noPunchline]);
+    await svc.write(skitVideo({
+      writer_feedback: 'озвучка 29 с — сократи на 3 с',
+      script: { hook: 'Старая', voice: 'madirus', speed: 1.1, lines: [], final: { assistantsCount: 18 }, skits: accepted },
+    }));
+    const script = JSON.parse((pg.query.mock.calls[0] as any[])[1][1]);
+    expect(script.skits.punchline.fingerprint).toBe(accepted.punchline.fingerprint);
+    expect(script.skits.conflict.fingerprint).toBe(accepted.conflict.fingerprint);
+  });
+
+  it('без принятой развязки ответ без punchline — ошибка разбора (повтор этапа)', async () => {
+    const { punchline, ...noPunchline } = SKIT_GOOD;
+    const { svc } = setup([noPunchline]);
+    await expect(svc.write(skitVideo())).rejects.toThrow('сценарист: нет сценки 2 — развязки (punchline)');
+  });
+
+  it('у skit без спланированных сценок реплики зацепки нет и в отвергнутом варианте', async () => {
+    const noBox = { ...SKIT_GOOD, punchline: { ...PUNCHLINE, lines: [{ hero: 'kesha', text: 'Это износ.' }, PUNCHLINE.lines[1]] } };
+    const { svc, relay } = setup([noBox, SKIT_GOOD]);
+    await svc.write(skitVideo());
+    const second = relay.ask.mock.calls[1][1] as string;
+    expect(second).toContain(`Прошлый вариант:\nзацепка: ${SKIT_GOOD.hook} (hookBox 3)`);
+    expect(second).not.toContain('реплики hook быть не должно');
+    // Отвергнутая развязка — «прошлым вариантом», не принятой.
+    expect(second).toContain('Прошлый вариант сценки 2:\n<<<СЦЕНКА 2\n');
+    expect(second).not.toContain('ПРИНЯТАЯ');
   });
 
   it('развязка без box — переписка с перечнем; второй вариант проходит', async () => {

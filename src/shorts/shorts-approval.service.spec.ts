@@ -50,7 +50,7 @@ function setup(dbRow: any = row()) {
     answerCallbackQuery: jest.fn(async () => true),
   };
   const storage = { download: jest.fn(async () => Buffer.from('bytes')) };
-  const settings = { get: jest.fn(async () => ({ slotDays: [2, 4, 6], slotHourMsk: 18 })) };
+  const settings = { get: jest.fn(async () => ({ slotDays: [2, 4, 6], slotHourMsk: 18, maxOmniSeconds: 48 })) };
   const topics = { addManual: jest.fn(async (): Promise<any> => ({ id: 'new' })) };
   const svc = new ShortsApprovalService(pg as any, tg as any, storage as any, settings as any, topics as any);
   return { svc, pg, tg, storage, topics };
@@ -224,7 +224,7 @@ describe('ShortsApprovalService', () => {
       });
       const { svc, tg } = setup();
       await svc.handleCallback(cb('ok'));
-      expect(approveShortIntoSlot).toHaveBeenCalledWith(expect.anything(), ID, new Date('2030-01-01T15:00:00.000Z'), { slotDays: [2, 4, 6], slotHourMsk: 18 });
+      expect(approveShortIntoSlot).toHaveBeenCalledWith(expect.anything(), ID, new Date('2030-01-01T15:00:00.000Z'), { slotDays: [2, 4, 6], slotHourMsk: 18, maxOmniSeconds: 48 });
       expect(tg.answerCallbackQuery).toHaveBeenCalledWith('cb', { text: 'Одобрено. Опубликую завтра в 18:00 МСК.' });
       expect(tg.sendMessage).toHaveBeenCalledWith(OWNER, 'Одобрено. Опубликую завтра в 18:00 МСК.');
     });
@@ -525,6 +525,6 @@ describe('ShortsApprovalService — ролик со сценками', () => {
     await svc.sendPendingReviews();
     const caption = (tg.sendVideo.mock.calls[0] as any[])[2].caption as string;
     expect(caption).toContain('Сценки: Гусыня Галина Петровна — хозяйка квартиры, Капибара Кеша — жилец');
-    expect(caption).toContain('Omni: 16 с, кадров 2 ≈ $1,86');
+    expect(caption).toContain('Omni: 16 из 48 с, кадров 2 ≈ $1,86');
   });
 });

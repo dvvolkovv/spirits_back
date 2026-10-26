@@ -41,10 +41,16 @@ describe('buildScript — ролик со сценками', () => {
 
   it('без реплики зацепки: она надпись поверх сценки; сценки с промптами — в сценарии', () => {
     const skits = planSkits({ conflict, punchline });
-    const s = buildScript(reply, { voice: 'madirus', narratorVoice: 'alena', assistantsCount: 18, skits });
+    const s = buildScript(reply, { voice: 'madirus', narratorVoice: 'alena', assistantsCount: 18, format: 'skit', skits });
     expect(s.lines.map((l) => l.id)).toEqual(['q', 'a1', 'a2', 'f']);
     expect(s.hook).toBe(reply.hook);
     expect(s.skits).toBe(skits);
+  });
+
+  it('реплику зацепки решает формат: у skit без спланированных сценок её тоже нет', () => {
+    const s = buildScript(reply, { voice: 'madirus', narratorVoice: 'alena', assistantsCount: 18, format: 'skit' });
+    expect(s.lines.map((l) => l.id)).toEqual(['q', 'a1', 'a2', 'f']);
+    expect('skits' in s).toBe(false);
   });
 
   it('у chat поля skits нет вовсе', () => {
