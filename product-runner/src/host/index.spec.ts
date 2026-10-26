@@ -1446,8 +1446,11 @@ describe('смена ключей и стирание (очередь 2)', () =>
     poll.mockResolvedValueOnce({ ok: true, job: REKEY_JOB });
     poll.mockResolvedValueOnce({ ok: true, job: { ...REKEY_JOB, jobId: 'j-2' } });
 
-    await tick(deps); // снято по сроку: report об отказе, первая работа ещё жива в фоне
-    await tick(deps); // обязана подождать первую, прежде чем позвать rekey второй раз
+    await tick(deps); // снято по сроку (10 мс): report об отказе, первая работа ещё жива в фоне
+    // Второму заданию хватит бюджета и дождаться первую (60 мс), и отработать
+    // самой: без очереди по слагу оно бы стартовало поверх первой немедленно.
+    deps.config.provisionTimeoutMs = 200;
+    await tick(deps);
 
     expect(rekey).toHaveBeenCalledTimes(2);
     expect(complete).toHaveBeenNthCalledWith(1, 'j-1', expect.objectContaining({ ok: false }));
