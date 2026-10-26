@@ -25,6 +25,8 @@ const DOWNLOAD_TIMEOUT_MS = 120_000;
 const RATE_RETRIES = 2;
 const MAX_RATE_WAIT_MS = 90_000;
 const MAX_VIDEO_BYTES = 200 * 1024 * 1024;
+/** 404 опроса подряд, после которых генерация считается потерянной: свежую Google иногда не показывает опросу секунды. */
+const POLL_NOT_FOUND_LIMIT = 3;
 
 export interface GoogleDeps {
   apiKey: string;
@@ -320,6 +322,7 @@ export async function waitClip(d: GoogleDeps, id: string): Promise<Buffer> {
   const left = (): number => Math.max(1000, deadline - now());
   // Последний увиденный статус — в тексте срока: незнакомый конечный статус иначе выглядел бы как «долго».
   let lastStatus = 'ответа не было';
+  let notFound = 0;
   while (now() < deadline) {
     await sleep(Math.min(every, Math.max(0, deadline - now())));
     let st: Interaction;
@@ -331,12 +334,17 @@ export async function waitClip(d: GoogleDeps, id: string): Promise<Buffer> {
           continue;
         }
         if (r.status >= 500 || r.status === 408) continue;
-        if (r.status === 404) throw new StudioError('omni_failed', `omni: взаимодействие ${id} не найдено (HTTP 404)`, true);
+        if (r.status === 404) {
+          // Новая оплата — только после нескольких 404 подряд: одиночный бывает и у живой генерации.
+          if (++notFound < POLL_NOT_FOUND_LIMIT) continue;
+          throw new StudioError('omni_failed', `omni: взаимодействие ${id} не найдено (HTTP 404, ${POLL_NOT_FOUND_LIMIT} раза подряд)`, true);
+        }
         const err = googleHttpError('omni', r.status, r.raw, d.apiKey);
         // Отказ на опросе своей генерации — не фильтр, а сбой API или студии: генерация может быть оплачена.
         throw err.code === 'google_auth' || err.code === 'google_quota' ? err : unreadable(id, `опрос отвергнут — ${err.message}`);
       }
       st = (JSON.parse(r.raw) ?? {}) as Interaction;
+      notFound = 0;
       lastStatus = typeof st.status === 'string' && st.status ? st.status : 'пустой';
     } catch (e) {
       if (e instanceof StudioError) throw e;
