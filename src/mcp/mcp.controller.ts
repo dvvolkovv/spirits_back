@@ -34,7 +34,19 @@ export type McpCaller = { kind: 'token'; userId: string } | { kind: 'shared' };
 const LEGACY_USER_ID_DESCRIPTION =
   'Current user id from the system context. Required on the transitional shared-secret path — the server uses it to bill tokens and attribute history.';
 
-@Controller('/mcp')
+/**
+ * Инструменты Linkeon для ассистентов релея (mcp__linkeon__*). Спека:
+ * docs/superpowers/specs/2026-10-26-mcp-turn-token-design.md.
+ *
+ * Два адреса одной логики:
+ *   • /webhook/mcp/linkeon — основной. Подпуть остаётся под глобальным
+ *     префиксом: исключение в main.ts — ровно путь `mcp` (тот же разбор, что
+ *     у /webhook/mcp/products). Доступен и на стенде, где nginx пропускает
+ *     только /webhook/*.
+ *   • /mcp — прежний, до снятия переходного пути (шаг 4 выката).
+ * Сторож адресов — mcp.controller.routes.spec.ts (живое приложение Nest).
+ */
+@Controller(['mcp', 'mcp/linkeon'])
 export class McpController {
   private readonly logger = new Logger(McpController.name);
 
