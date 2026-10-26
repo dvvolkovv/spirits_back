@@ -74,8 +74,18 @@ describe('поля инструментов Linkeon для релея', () => {
       const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
       try {
         expect(relayFsKey('79030169187_12_ru')).toBeUndefined();
-        expect(linkeonRelayFields('79030169187', '79030169187_12_ru').fs_key).toBeUndefined();
         expect(warn).toHaveBeenCalledTimes(1);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('ни одного секрета — linkeonRelayFields тоже без fs_key', () => {
+      put('RELAY_FS_SALT', undefined);
+      put('JWT_SECRET', undefined);
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+      try {
+        expect(linkeonRelayFields('79030169187', '79030169187_12_ru').fs_key).toBeUndefined();
       } finally {
         warn.mockRestore();
       }

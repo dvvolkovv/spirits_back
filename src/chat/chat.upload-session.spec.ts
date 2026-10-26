@@ -10,6 +10,14 @@ import { verifyLinkeonToolToken } from '../mcp/linkeon-tool.token';
 jest.mock('axios');
 jest.mock('../common/telegram-alert', () => ({ sendTelegramAlert: jest.fn(async () => {}) }));
 
+// relayFsKey (ревью 26.10.2026) без секретов не выдаёт fs_key вовсе — тестам
+// этого файла, которые сверяют fs_key, нужен хоть один.
+const OLD_JWT_SECRET = process.env.JWT_SECRET;
+beforeAll(() => { process.env.JWT_SECRET = 'chat-upload-session-spec'; });
+afterAll(() => {
+  if (OLD_JWT_SECRET === undefined) delete process.env.JWT_SECRET; else process.env.JWT_SECRET = OLD_JWT_SECRET;
+});
+
 /**
  * Ход с ВЛОЖЕНИЯМИ уходит в ТУ ЖЕ сессию релея, что и текстовый ход.
  *
