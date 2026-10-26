@@ -358,12 +358,39 @@ describe('откат и первая правка', () => {
     expect(h.turns.revert).toHaveBeenCalledWith({ productId: 'p1', turnId: 't-last', userId: 'u1', channel: 'telegram' });
   });
 
-  it('turnId не похож на uuid — bad_turn без обращения к базе (M6)', async () => {
+  it('turnId не похож на uuid — bad_turn без обращения к базе (M6), отказ записан в журнал', async () => {
     const h = harness();
     const r = await h.svc.revert({ userId: 'u1', productId: 'p1', turnId: 'не-uuid-а-что-то-от-модели', channel: 'web' });
     expect(r).toEqual({ ok: false, reason: 'bad_turn', message: 'Такой правки у продукта нет' });
     expect(h.turns.revert).not.toHaveBeenCalled();
     expect(h.calls.some((c) => c.sql.includes('product_turns'))).toBe(false);
+    expect(h.actions.record).toHaveBeenCalledWith(expect.objectContaining({ kind: 'revert', status: 'failed', result: expect.objectContaining({ reason: 'bad_turn' }) }));
+  });
+
+  it('нет применённых правок — отказ записан в журнал (M7)', async () => {
+    const h = harness({ pg: (sql) => (sql.includes("status = 'done' AND sha_before IS NOT NULL") ? { rows: [] } : null) });
+    const r = await h.svc.revert({ userId: 'u1', productId: 'p1', channel: 'web' });
+    expect(r).toMatchObject({ ok: false, reason: 'no_turns' });
+    expect(h.actions.record).toHaveBeenCalledWith(expect.objectContaining({ kind: 'revert', status: 'failed', result: expect.objectContaining({ reason: 'no_turns' }) }));
+  });
+
+  it('очередь правок отказала (сон/блок/занят) — отказ записан в журнал, а бросок долетает как есть (M7)', async () => {
+    const h = harness({ pg: (sql) => (sql.includes("status = 'done' AND sha_before IS NOT NULL") ? { rows: [{ id: 't-last' }] } : null) });
+    const refusal = new ConflictException('Продукт спит — пополните баланс');
+    h.turns.revert.mockRejectedValue(refusal);
+    await expect(h.svc.revert({ userId: 'u1', productId: 'p1', channel: 'web' })).rejects.toBe(refusal);
+    expect(h.actions.record).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'revert', status: 'failed', result: expect.objectContaining({ error: expect.stringContaining('пополните баланс') }),
+    }));
+  });
+
+  it('успешный откат — журнал done с queued:true, исход живёт в product_turns (M7)', async () => {
+    const h = harness({ pg: (sql) => (sql.includes("status = 'done' AND sha_before IS NOT NULL") ? { rows: [{ id: 't-last' }] } : null) });
+    const r = await h.svc.revert({ userId: 'u1', productId: 'p1', channel: 'web' });
+    expect(r).toEqual({ ok: true, turnId: 't-rev' });
+    expect(h.actions.record).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'revert', status: 'done', result: { turnId: 't-rev', queued: true },
+    }));
   });
 
   it('первая правка ставится поднявшимся продуктам, сбой одной не роняет остальные', async () => {

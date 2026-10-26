@@ -12,6 +12,8 @@ import { randomSuffix, siteSlugCandidates, slugWithSuffix } from './product-slug
 // оба места; отсюда реэкспорт для инструмента, Telegram и спек.
 export { DELETE_GRACE_DAYS };
 const NAME_MAX = 80;
+/** Форма product_actions/product_turns.id. Та же маска, что в product-actions.service.ts. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type LifecycleFail = { ok: false; reason: string; message: string };
 
@@ -595,9 +597,25 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
    * текст с причиной для ассистента; здесь никакого try/catch нет намеренно,
    * а не по недосмотру.
    */
+  /** Отказ отката — в журнал как failed. Лучшее усилие: сбой записи самого журнала не должен топить отказ, который он описывает. */
+  private async recordRevertRefusal(i: { userId: string; productId: string; channel: ActionChannel }, target: string, reason: string, error: string): Promise<void> {
+    try {
+      await this.actions.record({ userId: i.userId, productId: i.productId, kind: 'revert', channel: i.channel, status: 'failed', payload: target ? { turnId: target } : {}, result: { reason, error } });
+    } catch (e: any) {
+      this.logger.warn(`revert ${i.productId}: отказ (${reason}) не записан в журнал: ${e?.message}`);
+    }
+  }
+
   async revert(i: { userId: string; productId: string; turnId?: string | null; channel: ActionChannel }):
     Promise<{ ok: true; turnId: string } | LifecycleFail> {
     let target = String(i.turnId ?? '').trim();
+    if (target && !UUID_RE.test(target)) {
+      // M6: turnId модель передаёт с чужих слов — не угадала форму, не
+      // переврала базу. Без этой проверки raw-запрос в turns.revert уронил
+      // бы «invalid input syntax for type uuid» прямо в ответ ассистенту.
+      await this.recordRevertRefusal(i, target, 'bad_turn', 'Такой правки у продукта нет');
+      return { ok: false, reason: 'bad_turn', message: 'Такой правки у продукта нет' };
+    }
     if (!target) {
       const r = await this.pg.query(
         `SELECT id FROM product_turns
@@ -606,10 +624,30 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
         [i.productId, i.userId],
       );
       target = r.rows[0]?.id ?? '';
-      if (!target) return { ok: false, reason: 'no_turns', message: 'У продукта нет применённых правок, которые можно откатить' };
+      if (!target) {
+        const message = 'У продукта нет применённых правок, которые можно откатить';
+        await this.recordRevertRefusal(i, '', 'no_turns', message);
+        return { ok: false, reason: 'no_turns', message };
+      }
     }
-    const turn = await this.turns.revert({ productId: i.productId, turnId: target, userId: i.userId, channel: i.channel === 'telegram' ? 'telegram' : 'web' });
-    await this.actions.record({ userId: i.userId, productId: i.productId, kind: 'revert', channel: i.channel, status: 'done', payload: { turnId: target }, result: { newTurnId: turn.id } });
+    let turn: { id: string };
+    try {
+      turn = await this.turns.revert({ productId: i.productId, turnId: target, userId: i.userId, channel: i.channel === 'telegram' ? 'telegram' : 'web' });
+    } catch (e: any) {
+      // M7: отказы очереди правок (сон/блок/занят/нет токенов/не найден)
+      // ВСЁ ЕЩЁ долетают до вызывающего БРОСКОМ, как документировано выше, —
+      // этот catch ничего не решает за вызывающего (product-tool.service.ts,
+      // refusal()), только дописывает строку в журнал: без неё отказ отката
+      // не оставлял следа вовсе, в отличие от удаления и возврата.
+      const msg = typeof e?.response === 'string' ? e.response : (e?.response?.message ?? e?.message ?? String(e));
+      await this.recordRevertRefusal(i, target, 'refused', msg);
+      throw e;
+    }
+    // Итог отката — НЕ 'done' с полным результатом: исход (reverted/done/
+    // failed) живёт в product_turns у СЛЕДУЮЩЕГО хода (turn.id), который
+    // только поставлен в очередь. queued:true — явная метка «не путай со
+    // статусом отменённого хода», а не забытое поле.
+    await this.actions.record({ userId: i.userId, productId: i.productId, kind: 'revert', channel: i.channel, status: 'done', payload: { turnId: target }, result: { turnId: turn.id, queued: true } });
     return { ok: true, turnId: turn.id };
   }
 
