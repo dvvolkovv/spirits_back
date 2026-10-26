@@ -292,9 +292,9 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     try {
       // Продукт уже архивирован — отказ здесь не должен выглядеть отказом
       // удаления (оно случилось) и не должен оставить карточку в working:
-      // sleepDeletedTick (60 с) всё равно переставит сон архивному продукту
-      // без сна, так что неудавшийся INSERT не теряет его навсегда — только
-      // лог и переход к finish(done).
+      // sleepDeletedTick (60 с) доснимет застрявшие задания и поставит сон
+      // архивному продукту без сна, так что оборванный шаг не теряет его
+      // навсегда — только лог и переход к finish(done).
       //
       // Пробуждение и прочее в очереди архивному не выдаются и заняли бы
       // место единственного активного задания — снимаем.
@@ -337,7 +337,18 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     return r.rows.length;
   }
 
-  sleepDeletedTick(): Promise<number> {
+  async sleepDeletedTick(): Promise<number> {
+    // Снятие заданий в completeDelete могло оборваться. Тогда queued-задание
+    // архивного продукта не выдаётся никому (claimJob архивному отдаёт только
+    // sleep) и вечно загораживает сон: queueSleepForDeleted ждёт пустой
+    // очереди. Доснимаем здесь. Возврат снимает архив раньше, чем ставит своё
+    // пробуждение, — его задание сюда не попадает.
+    await this.pg.query(
+      `UPDATE product_provision_jobs j SET status = 'failed', error = 'снято удалением', finished_at = now()
+         FROM products p
+        WHERE j.product_id = p.id AND p.archived_at IS NOT NULL
+          AND j.status = 'queued' AND j.kind <> 'sleep'`,
+    );
     return this.queueSleepForDeleted();
   }
 
