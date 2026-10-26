@@ -2136,3 +2136,668 @@ git -C $B add product-runner/src/host/skeleton.ts && git -C $B commit -q -m "run
 Run (нода, агент): `src/host/skeleton.spec.ts src/host/provision.spec.ts`. Expected: PASS, в том числе «server.js остаётся синтаксически валидным JavaScript при любом имени» и сторожа темпа опроса.
 
 ---
+
+### Task 9: Сервер — выдача `rekey` и `purge`, `OWNER_TG_ID` боту
+
+**Files:**
+- Modify: `src/products/provisioning.service.ts` (`JobKind` ~56, `ClaimedJob` ~62–126, `claimJob` ~950–1126, новый приватный `ownerTgIdOf`)
+- Test: `src/products/provisioning.rekey-purge.spec.ts` (новый; живая база + один тест на моке)
+
+- [ ] **Step 1: Тесты**
+
+`src/products/provisioning.rekey-purge.spec.ts`:
+
+```ts
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
+import { Pool } from 'pg';
+import { MIGRATIONS } from './products.service';
+import { ProvisioningService } from './provisioning.service';
+import { HostsService } from './hosts.service';
+import { LimitsService } from './limits.service';
+import { RentService } from './rent.service';
+import { SecretsService } from './secrets.service';
+
+const KEY = '00112233445566778899aabbccddeeff0f1e2d3c4b5a69788796a5b4c3d2e1f0';
+const secretsOf = () => new SecretsService({ get: (k: string) => (k === 'PRODUCT_SECRETS_KEY' ? KEY : undefined) } as any);
+
+describe('OWNER_TG_ID — лучшим усилием', () => {
+  it('таблицы привязок нет — задание всё равно выдаётся, без OWNER_TG_ID', async () => {
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        if (sql.includes("SET status = 'running'")) {
+          return { rows: [{ job_id: 'j', job_kind: 'provision', product_id: 'p', user_id: 'u', slug: 's', name: 'Б', kind: 'bot', port: null, box: null, token_issued: true, custom_names: [], vhost_mode: 'proxy' }] };
+        }
+        if (sql.includes('tg_user_identities')) throw new Error('relation "tg_user_identities" does not exist');
+        return { rows: [] };
+      }),
+    };
+    const svc = new ProvisioningService(pg as any, secretsOf(), {} as any, {} as any, {} as any);
+    const job = await svc.claimJob('clients');
+    expect(job).toMatchObject({ jobId: 'j', jobKind: 'provision' });
+    expect(job).not.toHaveProperty('ownerTgId');
+  });
+});
+
+const PG = process.env.PROVISIONING_PG_URL;
+const maybe = PG ? describe : describe.skip;
+
+maybe('выдача rekey и purge против живого Postgres', () => {
+  let pool: Pool;
+  let svc: ProvisioningService;
+  const secrets = secretsOf();
+
+  async function product(o: { status: string; kind?: 'site' | 'bot'; userId?: string; archived?: boolean; purgeAfter?: string; purged?: boolean }) {
+    const id = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash, host_id,
+                             archived_at, purge_after, purged_at)
+       VALUES ($1, $2, 'П', $3, $4, $5, '/product', $6, 'clients',
+               CASE WHEN $7 THEN now() - interval '31 days' END, $8::timestamptz, CASE WHEN $9 THEN now() END)`,
+      [id, o.userId ?? 'u1', `s-${id.slice(0, 8)}`, o.kind ?? 'bot', o.status, `h-${id}`, !!o.archived, o.purgeAfter ?? null, !!o.purged],
+    );
+    return id;
+  }
+
+  async function rekeyJob(productId: string, set: Record<string, string> | null, payload: any = {}) {
+    const a = await pool.query(
+      `INSERT INTO product_actions (user_id, product_id, kind, status, channel, payload, secrets_box)
+       VALUES ('u1', $1, 'keys', 'working', 'web', $2::jsonb, $3) RETURNING id`,
+      [productId, JSON.stringify(payload), set ? secrets.encrypt(set, productId) : null],
+    );
+    await pool.query(
+      `INSERT INTO product_provision_jobs (product_id, kind, status, action_id) VALUES ($1, 'rekey', 'queued', $2)`,
+      [productId, a.rows[0].id],
+    );
+    return a.rows[0].id as string;
+  }
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: PG, max: 8 });
+    for (const f of MIGRATIONS) await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', f), 'utf8'));
+    // Своя копия таблицы привязок: она из модуля tg-bot (001_tg_bot_schema.sql),
+    // а список MIGRATIONS здесь — только продукты. Форма — та же, что там.
+    await pool.query(`CREATE TABLE IF NOT EXISTS tg_user_identities (
+      linkeon_user_id text PRIMARY KEY, tg_user_id bigint UNIQUE NOT NULL,
+      tg_username text, tg_first_name text, bound_at timestamptz NOT NULL DEFAULT now())`);
+    const pg = { query: (s: string, p?: any[]) => pool.query(s, p) };
+    svc = new ProvisioningService(pg as any, secrets, new HostsService(pg as any), new LimitsService(pg as any), new RentService(pg as any));
+  });
+  beforeEach(async () => {
+    await pool.query('TRUNCATE products, product_provision_jobs, product_turns, product_actions, product_host_agent, product_hosts RESTART IDENTITY CASCADE');
+    await pool.query('TRUNCATE tg_user_identities');
+    await pool.query(
+      `INSERT INTO product_hosts (id, ssh_target, public_ip, domain_suffix, agent_token_hash, capacity, audience)
+       VALUES ('clients', 'root@10.9.9.9', '10.9.9.9', 'c.example', 'x', 20, 'clients')`,
+    );
+  });
+  afterAll(async () => {
+    await pool.query('TRUNCATE products, product_provision_jobs, product_turns, product_actions, product_host_agent, product_hosts RESTART IDENTITY CASCADE');
+    await pool.end();
+  });
+
+  it('rekey работающему: новый набор расшифрован, снимаемые имена приехали, токена раннера нет', async () => {
+    const p = await product({ status: 'running' });
+    await rekeyJob(p, { BOT_TOKEN: '123456:TEST-new', NEW_KEY: 'n' }, { removedNames: ['OLD_KEY'] });
+    const job = await svc.claimJob('clients');
+    expect(job).toMatchObject({ productId: p, jobKind: 'rekey', secrets: { BOT_TOKEN: '123456:TEST-new', NEW_KEY: 'n' }, dropNames: ['OLD_KEY'] });
+    expect(job).not.toHaveProperty('runnerToken');
+  });
+
+  it('rekey без коробки ключей не выдаётся вовсе — агент не снял бы ключи впустую', async () => {
+    const p = await product({ status: 'running' });
+    await rekeyJob(p, null);
+    expect(await svc.claimJob('clients')).toBeNull();
+  });
+
+  it('rekey ждёт конца правки', async () => {
+    const p = await product({ status: 'running' });
+    await rekeyJob(p, { BOT_TOKEN: '123456:TEST-new' });
+    await pool.query(`INSERT INTO product_turns (product_id, user_id, channel, prompt, status) VALUES ($1, 'u1', 'web', 'п', 'running')`, [p]);
+    expect(await svc.claimJob('clients')).toBeNull();
+    await pool.query(`UPDATE product_turns SET status = 'done' WHERE product_id = $1`, [p]);
+    expect(await svc.claimJob('clients')).toMatchObject({ jobKind: 'rekey' });
+  });
+
+  it.each(['sleeping', 'blocked', 'provisioning', 'failed'])('rekey продукту в %s не выдаётся', async (status) => {
+    const p = await product({ status });
+    await rekeyJob(p, { BOT_TOKEN: '123456:TEST-new' });
+    expect(await svc.claimJob('clients')).toBeNull();
+  });
+
+  it('purge — удалённому после срока; до срока, стёртому и живому — нет', async () => {
+    const due = await product({ status: 'archived', archived: true, purgeAfter: new Date(Date.now() - 60_000).toISOString() });
+    const early = await product({ status: 'archived', archived: true, purgeAfter: new Date(Date.now() + 86_400_000).toISOString() });
+    const gone = await product({ status: 'archived', archived: true, purgeAfter: new Date(Date.now() - 60_000).toISOString(), purged: true });
+    const live = await product({ status: 'running' });
+    for (const id of [early, gone, live, due]) {
+      await pool.query(`INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'purge', 'queued')`, [id]);
+    }
+    const job = await svc.claimJob('clients');
+    expect(job).toMatchObject({ productId: due, jobKind: 'purge', secrets: {} });
+    expect(await svc.claimJob('clients')).toBeNull();
+  });
+
+  it('OWNER_TG_ID: бот владельца с привязкой — при заведении и при смене ключей; сайт и бот без привязки — нет', async () => {
+    await pool.query(`INSERT INTO tg_user_identities (linkeon_user_id, tg_user_id) VALUES ('u1', 777001)`);
+    const bot = await product({ status: 'provisioning' });
+    await pool.query(`INSERT INTO product_provision_jobs (product_id, status) VALUES ($1, 'queued')`, [bot]);
+    expect(await svc.claimJob('clients')).toMatchObject({ jobKind: 'provision', ownerTgId: '777001' });
+
+    const site = await product({ status: 'provisioning', kind: 'site' });
+    await pool.query(`INSERT INTO product_provision_jobs (product_id, status) VALUES ($1, 'queued')`, [site]);
+    expect(await svc.claimJob('clients')).not.toHaveProperty('ownerTgId');
+
+    const other = await product({ status: 'running', userId: 'u2' });
+    await rekeyJob(other, { BOT_TOKEN: '123456:TEST-new' });
+    expect(await svc.claimJob('clients')).not.toHaveProperty('ownerTgId');
+
+    const mine = await product({ status: 'running' });
+    await rekeyJob(mine, { BOT_TOKEN: '123456:TEST-new' });
+    expect(await svc.claimJob('clients')).toMatchObject({ jobKind: 'rekey', ownerTgId: '777001' });
+  });
+});
+```
+
+- [ ] **Step 2: Коммит, прогон — FAIL**
+
+```bash
+git -C $B add src/products/provisioning.rekey-purge.spec.ts && git -C $B commit -q -m "test(products): выдача rekey и purge, OWNER_TG_ID боту (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/products/provisioning.rekey-purge.spec.ts`. Expected: FAIL (выдача `null` для rekey/purge; нет `ownerTgId`).
+
+- [ ] **Step 3: Типы**
+
+В `src/products/provisioning.service.ts`:
+- `export type JobKind = 'provision' | 'sleep' | 'wake' | 'domain' | 'rekey' | 'purge';` (над ним в докблок: «rekey и purge — очередь 2, словарь в 004 расширен миграцией очереди 2»);
+- в `ClaimedJob` после `vhostMode`:
+
+```ts
+  /**
+   * Смена ключей (rekey): имена старых ключей владельца, которых нет в новом
+   * наборе. Новый набор — в `secrets`, расшифрован из коробки карточки
+   * (product_actions.secrets_box). У прочих видов ключа нет.
+   */
+  dropNames?: string[];
+  /**
+   * Telegram владельца — только боту, только у provision и rekey и только при
+   * привязке (tg_user_identities). Уходит в окружение `OWNER_TG_ID`.
+   */
+  ownerTgId?: string;
+```
+
+- [ ] **Step 4: SQL выдачи** — точными заменами, со сверкой числа вхождений
+
+```bash
+cd /Users/dmitry/Downloads/spirits_back/.worktrees/product-lifecycle-2 && node - <<'EOF'
+const fs = require('fs');
+const f = 'src/products/provisioning.service.ts';
+let s = fs.readFileSync(f, 'utf8');
+const sp = (n) => ' '.repeat(n);
+const pairs = [
+  ["AND (p.archived_at IS NULL OR (j.kind = 'sleep' AND p.purged_at IS NULL))",
+   "AND (p.archived_at IS NULL OR (j.kind IN ('sleep','purge') AND p.purged_at IS NULL))"],
+  [sp(34) + "ELSE p.status = 'sleeping'\n" + sp(32) + "END)",
+   sp(34) + "-- Смена ключей (очередь 2): только работающему, только с\n" +
+   sp(34) + "-- коробкой ключей в карточке и только без идущей правки —\n" +
+   sp(34) + "-- пересоздание контейнера убило бы ход молча.\n" +
+   sp(34) + "WHEN 'rekey' THEN p.status IN ('running','degraded')\n" +
+   sp(34) + "               AND EXISTS (SELECT 1 FROM product_actions ka\n" +
+   sp(34) + "                            WHERE ka.id = j.action_id AND ka.status = 'working'\n" +
+   sp(34) + "                              AND ka.secrets_box IS NOT NULL)\n" +
+   sp(34) + "               AND NOT EXISTS (SELECT 1 FROM product_turns t\n" +
+   sp(34) + "                                WHERE t.product_id = p.id AND t.status IN ('queued','running'))\n" +
+   sp(34) + "-- Стирание: удалённому и только после срока возврата —\n" +
+   sp(34) + "-- возврат мог успеть между постановкой и выдачей.\n" +
+   sp(34) + "WHEN 'purge' THEN p.status = 'archived' AND p.purge_after <= now()\n" +
+   sp(34) + "ELSE p.status = 'sleeping'\n" + sp(32) + "END)"],
+  [sp(10) + "RETURNING id, product_id, kind\n",
+   sp(10) + "RETURNING id, product_id, kind, action_id\n"],
+  [sp(14) + "(i.id IS NOT NULL) AS token_issued\n",
+   sp(14) + "(i.id IS NOT NULL) AS token_issued,\n" +
+   sp(14) + "p.user_id AS user_id, a.secrets_box AS rekey_box, a.payload AS rekey_payload\n"],
+  [sp(9) + "LEFT JOIN issued i ON i.id = c.product_id`,",
+   sp(9) + "LEFT JOIN issued i ON i.id = c.product_id\n" + sp(9) + "LEFT JOIN product_actions a ON a.id = c.action_id`,"],
+];
+for (const [a, b] of pairs) {
+  const n = s.split(a).length - 1;
+  if (n !== 1) { console.error(`вхождений ${n}: ${a.slice(0, 80)}`); process.exit(1); }
+  s = s.replace(a, b);
+}
+fs.writeFileSync(f, s);
+console.log('ok');
+EOF
+```
+Expected: `ok`. Не нашлась строка — сверить отступы (`sed -n 1015,1085p src/products/provisioning.service.ts | sed 's/ /·/g'`), поправить строку в скрипте и повторить.
+
+Комментарий над `claimJob` (раздел «СТАТУС ПРОДУКТА СВЕРЯЕТСЯ ПО ВИДУ ЗАДАНИЯ») дополнить абзацем: «Смена ключей (rekey) — работающему, с коробкой ключей в своей карточке (action_id) и без идущей правки; стирание (purge) — удалённому после purge_after. Удалённому, кроме сна, выдаётся только стирание».
+
+- [ ] **Step 5: Разбор строки выдачи**
+
+В `claimJob` после `const jobKind = row.job_kind as JobKind;` и перед `return {` вставить:
+
+```ts
+    // Ключи: заведению — из продукта, смене ключей — из коробки её карточки
+    // (тот же AAD — id продукта). Прочим видам ключи не нужны и не
+    // расшифровываются вовсе.
+    let secrets: Record<string, string> = {};
+    if (jobKind === 'provision' && row.box) secrets = this.secrets.decrypt(row.box, row.product_id);
+    if (jobKind === 'rekey' && row.rekey_box) secrets = this.secrets.decrypt(row.rekey_box, row.product_id);
+    const dropNames = jobKind === 'rekey'
+      ? (Array.isArray(row.rekey_payload?.removedNames) ? row.rekey_payload.removedNames.filter((n: unknown) => typeof n === 'string') : [])
+      : undefined;
+    // Отдельным чтением ПОСЛЕ выдачи и лучшим усилием: таблица привязок — из
+    // модуля tg-bot, и её отказ не должен ронять опрос агента (задание уже
+    // забрано, токен выпущен — 500 здесь оставил бы его до сборщика).
+    const ownerTgId = row.kind === 'bot' && (jobKind === 'provision' || jobKind === 'rekey')
+      ? await this.ownerTgIdOf(row.user_id)
+      : undefined;
+```
+в возвращаемом объекте строку `secrets: jobKind === 'provision' && row.box ? this.secrets.decrypt(row.box, row.product_id) : {},` заменить на `secrets,`, а после строки `vhostMode: …,` добавить:
+
+```ts
+      ...(dropNames !== undefined ? { dropNames } : {}),
+      ...(ownerTgId !== undefined ? { ownerTgId } : {}),
+```
+Комментарий у прежней строки `secrets:` (про сон и пробуждение) перенести к новому блоку выше.
+
+Новый приватный метод — сразу после `claimJob`:
+
+```ts
+  /**
+   * Telegram владельца для OWNER_TG_ID — лучшим усилием. Таблица чужого
+   * модуля (tg-bot/migrations/001_tg_bot_schema.sql): её отказ — строка в лог
+   * и бот без OWNER_TG_ID (каркас тогда сам подскажет chat_id на /start), а
+   * не сорванная выдача. Без привязки — undefined, ключа в задании нет.
+   */
+  private async ownerTgIdOf(userId: string): Promise<string | undefined> {
+    try {
+      const r = await this.pg.query(
+        `SELECT tg_user_id::text AS id FROM tg_user_identities WHERE linkeon_user_id = $1 LIMIT 1`,
+        [userId],
+      );
+      const id = r.rows?.[0]?.id;
+      return typeof id === 'string' && /^\d{1,20}$/.test(id) ? id : undefined;
+    } catch (e: any) {
+      this.logger.warn(`OWNER_TG_ID не прочитан (${e?.message}) — бот уедет без него`);
+      return undefined;
+    }
+  }
+```
+
+- [ ] **Step 6: Коммит, прогон — PASS + регрессия выдачи**
+
+```bash
+git -C $B add src/products/provisioning.service.ts && git -C $B commit -q -m "products: выдача rekey (коробка карточки, без идущей правки) и purge (после срока); OWNER_TG_ID боту" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/products/provisioning.rekey-purge.spec.ts src/products/provisioning.job.spec.ts src/products/provisioning.archived.spec.ts src/products/provisioning.integration.spec.ts src/products/domains.jobs.spec.ts src/products/host.controller.spec.ts`. Expected: PASS; число тестов регрессионных наборов — как в базовой линии. Затем tsc бэка.
+
+---
+
+### Task 10: Сервер — отчёт агента по `rekey` и `purge`, сборщик
+
+**Files:**
+- Modify: `src/products/product-actions.service.ts` (константы текстов для людей)
+- Modify: `src/products/provisioning.service.ts` (`completeJob` ~1165–1171, новые `completeRekeyJob` и `completePurgeJob`, `failStaleProvisioning` ~1801–1804)
+- Test: `src/products/provisioning.complete-rekey-purge.spec.ts` (новый, живая база)
+
+- [ ] **Step 1: Тесты**
+
+`src/products/provisioning.complete-rekey-purge.spec.ts`:
+
+```ts
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
+import { Pool } from 'pg';
+import { MIGRATIONS } from './products.service';
+import { ProvisioningService } from './provisioning.service';
+import { HostsService } from './hosts.service';
+import { LimitsService } from './limits.service';
+import { RentService } from './rent.service';
+import { SecretsService } from './secrets.service';
+import { REKEY_FAILED_SAY } from './product-actions.service';
+
+const PG = process.env.PROVISIONING_PG_URL;
+const maybe = PG ? describe : describe.skip;
+const KEY = '00112233445566778899aabbccddeeff0f1e2d3c4b5a69788796a5b4c3d2e1f0';
+
+maybe('отчёт агента по rekey и purge против живого Postgres', () => {
+  let pool: Pool;
+  let svc: ProvisioningService;
+  const secrets = new SecretsService({ get: (k: string) => (k === 'PRODUCT_SECRETS_KEY' ? KEY : undefined) } as any);
+
+  async function product(o: { status: string; kind?: 'site' | 'bot'; archived?: boolean; tgBotId?: number | null; secrets?: Record<string, string> } ) {
+    const id = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash, host_id,
+                             archived_at, purge_after, tg_bot_id, secrets_encrypted, first_prompt)
+       VALUES ($1, 'u1', 'П', $2, $3, $4, '/product', $5, 'clients',
+               CASE WHEN $6 THEN now() - interval '31 days' END, CASE WHEN $6 THEN now() - interval '1 day' END, $7, $8, 'первая')`,
+      [id, `s-${id.slice(0, 8)}`, o.kind ?? 'bot', o.status, `h-${id}`, !!o.archived, o.tgBotId ?? null,
+       o.secrets ? secrets.encrypt(o.secrets, id) : null],
+    );
+    return id;
+  }
+
+  /** Задание уже у агента (running), как после claimJob. */
+  async function runningRekey(productId: string, set: Record<string, string>, payload: any) {
+    const a = await pool.query(
+      `INSERT INTO product_actions (user_id, product_id, kind, status, channel, payload, secrets_box)
+       VALUES ('u1', $1, 'keys', 'working', 'web', $2::jsonb, $3) RETURNING id`,
+      [productId, JSON.stringify(payload), secrets.encrypt(set, productId)],
+    );
+    const j = await pool.query(
+      `INSERT INTO product_provision_jobs (product_id, kind, status, action_id, started_at) VALUES ($1, 'rekey', 'running', $2, now()) RETURNING id`,
+      [productId, a.rows[0].id],
+    );
+    return { actionId: a.rows[0].id as string, jobId: j.rows[0].id as string };
+  }
+
+  const productRow = async (id: string) => (await pool.query(`SELECT * FROM products WHERE id = $1`, [id])).rows[0];
+  const actionRow = async (id: string) => (await pool.query(`SELECT * FROM product_actions WHERE id = $1`, [id])).rows[0];
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: PG, max: 8 });
+    for (const f of MIGRATIONS) await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', f), 'utf8'));
+    const pg = { query: (s: string, p?: any[]) => pool.query(s, p) };
+    svc = new ProvisioningService(pg as any, secrets, new HostsService(pg as any), new LimitsService(pg as any), new RentService(pg as any));
+  });
+  beforeEach(async () => {
+    await pool.query('TRUNCATE products, product_provision_jobs, product_turns, product_actions, product_domains, product_host_agent, product_hosts RESTART IDENTITY CASCADE');
+    await pool.query(
+      `INSERT INTO product_hosts (id, ssh_target, public_ip, domain_suffix, agent_token_hash, capacity, audience)
+       VALUES ('clients', 'root@10.9.9.9', '10.9.9.9', 'c.example', 'x', 20, 'clients')`,
+    );
+  });
+  afterAll(async () => {
+    await pool.query('TRUNCATE products, product_provision_jobs, product_turns, product_actions, product_domains, product_host_agent, product_hosts RESTART IDENTITY CASCADE');
+    await pool.end();
+  });
+
+  it('успех rekey: ключи из коробки в продукте, коробка стёрта, карточка done с новыми именами', async () => {
+    const p = await product({ status: 'running', secrets: { BOT_TOKEN: '123456:TEST-old', OLD_KEY: 'o' } });
+    const { actionId, jobId } = await runningRekey(p, { BOT_TOKEN: '123456:TEST-old', NEW_KEY: 'n' }, { newKeyNames: ['BOT_TOKEN', 'NEW_KEY'], removedNames: ['OLD_KEY'] });
+
+    await svc.completeJob(jobId, { ok: true });
+
+    expect(secrets.decrypt((await productRow(p)).secrets_encrypted, p)).toEqual({ BOT_TOKEN: '123456:TEST-old', NEW_KEY: 'n' });
+    const a = await actionRow(actionId);
+    expect(a.status).toBe('done');
+    expect(a.secrets_box).toBeNull();
+    expect(a.result).toEqual({ keyNames: ['BOT_TOKEN', 'NEW_KEY'] });
+    expect(JSON.stringify(a)).not.toContain('TEST-old');
+  });
+
+  it('пустой новый набор — secrets_encrypted NULL, как у заведения без ключей', async () => {
+    const p = await product({ status: 'running', kind: 'site', secrets: { A: '1' } });
+    const { jobId } = await runningRekey(p, {}, { newKeyNames: [], removedNames: ['A'] });
+    await svc.completeJob(jobId, { ok: true });
+    expect((await productRow(p)).secrets_encrypted).toBeNull();
+  });
+
+  it('отказ rekey: ключи прежние, коробка стёрта, карточка failed с человеческим текстом, продукт не тронут', async () => {
+    const p = await product({ status: 'running', secrets: { BOT_TOKEN: '123456:TEST-old' } });
+    const before = await productRow(p);
+    const { actionId, jobId } = await runningRekey(p, { BOT_TOKEN: '123456:TEST-bad' }, { newKeyNames: ['BOT_TOKEN'], removedNames: [] });
+
+    await svc.completeJob(jobId, { ok: false, error: 'ключи не применены: продукт не ответил на /health' });
+
+    const after = await productRow(p);
+    expect(after.secrets_encrypted.equals(before.secrets_encrypted)).toBe(true);
+    expect(after.status).toBe('running');
+    expect(after.provision_error).toBeNull();
+    const a = await actionRow(actionId);
+    expect(a.status).toBe('failed');
+    expect(a.secrets_box).toBeNull();
+    expect(a.result).toEqual({ error: REKEY_FAILED_SAY, reason: 'rekey_failed' });
+    const j = (await pool.query(`SELECT status, error FROM product_provision_jobs WHERE id = $1`, [jobId])).rows[0];
+    expect(j).toEqual({ status: 'failed', error: 'ключи не применены: продукт не ответил на /health' });
+  });
+
+  it('повторный отчёт — ничего не меняет', async () => {
+    const p = await product({ status: 'running', secrets: { BOT_TOKEN: '123456:TEST-old' } });
+    const { actionId, jobId } = await runningRekey(p, { BOT_TOKEN: '123456:TEST-new' }, { newKeyNames: ['BOT_TOKEN'], removedNames: [] });
+    await svc.completeJob(jobId, { ok: true });
+    await svc.completeJob(jobId, { ok: false, error: 'поздний отказ' });
+    expect((await actionRow(actionId)).status).toBe('done');
+    expect(secrets.decrypt((await productRow(p)).secrets_encrypted, p)).toEqual({ BOT_TOKEN: '123456:TEST-new' });
+  });
+
+  it('смена BOT_TOKEN: tg_bot_id новый; занят другим живым — отчёт проходит, метка прежняя', async () => {
+    const p = await product({ status: 'running', tgBotId: 111, secrets: { BOT_TOKEN: '123456:TEST-old' } });
+    const a1 = await runningRekey(p, { BOT_TOKEN: '222222:TEST-new' }, { newKeyNames: ['BOT_TOKEN'], removedNames: [], tgBotId: 222 });
+    await svc.completeJob(a1.jobId, { ok: true });
+    expect(Number((await productRow(p)).tg_bot_id)).toBe(222);
+
+    await product({ status: 'running', tgBotId: 333 });
+    const a2 = await runningRekey(p, { BOT_TOKEN: '333333:TEST-x' }, { newKeyNames: ['BOT_TOKEN'], removedNames: [], tgBotId: 333 });
+    await expect(svc.completeJob(a2.jobId, { ok: true })).resolves.toBeUndefined();
+    expect(Number((await productRow(p)).tg_bot_id)).toBe(222);
+    expect((await actionRow(a2.actionId)).status).toBe('done');
+  });
+
+  it('успех purge: purged_at, секреты и первая правка стёрты, домен снят, журнал system; строка и задания на месте', async () => {
+    const p = await product({ status: 'archived', archived: true, kind: 'site', secrets: { A: '1' } });
+    await pool.query(
+      `INSERT INTO product_domains (product_id, domain, names, token, status) VALUES ($1, 'shop.example.ru', '{shop.example.ru}', 't', 'active')`,
+      [p],
+    );
+    await pool.query(`INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'provision', 'done')`, [p]);
+    const j = await pool.query(`INSERT INTO product_provision_jobs (product_id, kind, status, started_at) VALUES ($1, 'purge', 'running', now()) RETURNING id`, [p]);
+
+    await svc.completeJob(j.rows[0].id, { ok: true });
+
+    const row = await productRow(p);
+    expect(row.purged_at).not.toBeNull();
+    expect(row.secrets_encrypted).toBeNull();
+    expect(row.first_prompt).toBeNull();
+    expect((await pool.query(`SELECT 1 FROM product_domains WHERE product_id = $1`, [p])).rows).toHaveLength(0);
+    expect((await pool.query(`SELECT count(*)::int AS n FROM product_provision_jobs WHERE product_id = $1`, [p])).rows[0].n).toBe(2);
+    const log = await pool.query(`SELECT kind, status, channel, payload FROM product_actions WHERE product_id = $1`, [p]);
+    expect(log.rows).toEqual([{ kind: 'purge', status: 'done', channel: 'system', payload: { name: 'П', slug: row.slug } }]);
+  });
+
+  it('отказ purge: продукт не помечен стёртым, журнал failed без сырой причины агента', async () => {
+    const p = await product({ status: 'archived', archived: true, kind: 'site' });
+    const j = await pool.query(`INSERT INTO product_provision_jobs (product_id, kind, status, started_at) VALUES ($1, 'purge', 'running', now()) RETURNING id`, [p]);
+    await svc.completeJob(j.rows[0].id, { ok: false, error: 'certbot не удалил сертификат linkeon-x' });
+    expect((await productRow(p)).purged_at).toBeNull();
+    const log = await pool.query(`SELECT status, result FROM product_actions WHERE product_id = $1`, [p]);
+    expect(log.rows[0].status).toBe('failed');
+    expect(JSON.stringify(log.rows[0].result)).not.toContain('certbot');
+  });
+
+  it('сборщик называет свой срок у смены ключей и стирания', async () => {
+    const p = await product({ status: 'running' });
+    const { jobId } = await runningRekey(p, { BOT_TOKEN: '123456:TEST-x' }, { newKeyNames: ['BOT_TOKEN'], removedNames: [] });
+    await pool.query(`UPDATE product_provision_jobs SET started_at = now() - interval '11 minutes' WHERE id = $1`, [jobId]);
+    await svc.failStaleProvisioning();
+    const j = (await pool.query(`SELECT status, error FROM product_provision_jobs WHERE id = $1`, [jobId])).rows[0];
+    expect(j).toEqual({ status: 'failed', error: 'срок смены ключей истёк (10 мин)' });
+    expect((await productRow(p)).status).toBe('running');
+  });
+});
+```
+
+- [ ] **Step 2: Коммит, прогон — FAIL**
+
+```bash
+git -C $B add src/products/provisioning.complete-rekey-purge.spec.ts && git -C $B commit -q -m "test(products): отчёт агента по rekey и purge (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/products/provisioning.complete-rekey-purge.spec.ts`. Expected: FAIL (`REKEY_FAILED_SAY` не экспортируется; отчёт уходит в общий путь).
+
+- [ ] **Step 3: Тексты для людей** — в `src/products/product-actions.service.ts` после `DELETE_GRACE_DAYS`:
+
+```ts
+/**
+ * Итог несостоявшейся смены ключей — для карточки и ассистента. Сырая причина
+ * агента (stderr docker, срок, откат) остаётся в product_provision_jobs.error:
+ * человеку она ничего не скажет, а значение ключа там в теории может
+ * оказаться (агент маскирует, но журнал карточки читается шире).
+ */
+export const REKEY_FAILED_SAY =
+  'Ключи не применены — продукт работает со старыми ключами. Попробуйте ещё раз через несколько минут; не выйдет — напишите в поддержку.';
+
+/** Итог несостоявшегося стирания в журнале: обход повторит его сам. */
+export const PURGE_FAILED_SAY = 'Стирание не удалось — повторится автоматически';
+```
+
+- [ ] **Step 4: Разводка и два отчёта** в `src/products/provisioning.service.ts`
+
+1. Импорт: `import { PURGE_FAILED_SAY, REKEY_FAILED_SAY } from './product-actions.service';`
+2. В `completeJob` строку `if (kindRow.rows[0]?.kind === 'domain') return this.completeDomainJob(jobId, result);` заменить на:
+
+```ts
+    const jobKind = kindRow.rows[0]?.kind;
+    if (jobKind === 'domain') return this.completeDomainJob(jobId, result);
+    // Смена ключей и стирание продукт по общему пути НЕ трогают: отказ
+    // смены ключей — не поломка заведения (продукт работает со старыми
+    // ключами), отказ стирания — не повод выводить удалённый из архива.
+    if (jobKind === 'rekey') return this.completeRekeyJob(jobId, result);
+    if (jobKind === 'purge') return this.completePurgeJob(jobId, result);
+```
+
+3. Два метода — сразу после `completeDomainJob`:
+
+```ts
+  /**
+   * Отчёт по смене ключей. ОДИН оператор, замок тот же (`status = 'running'`):
+   * закрыть задание, при успехе перенести коробку карточки в продукт, закрыть
+   * карточку и стереть коробку в любом исходе. Двумя операторами смерть
+   * процесса между ними оставила бы ключи в базе одними, а в контейнере —
+   * другими.
+   *
+   * Коробка переносится КАК ЕСТЬ: она зашифрована тем же SecretsService с тем
+   * же AAD (id продукта), что и products.secrets_encrypted. Пустой новый набор
+   * (newKeyNames пуст) — NULL, как у заведения без ключей: decrypt на коробке
+   * от {} никто не зовёт, признак «ключей нет» — NULL (см. create()).
+   *
+   * CTE act читает карточку из снимка ДО этого же оператора, поэтому коробка в
+   * swapped — ещё не стёртая finished. Порядок CTE тут не защита — защита в
+   * снимке, одном на весь оператор.
+   */
+  private async completeRekeyJob(jobId: string, result: { ok: boolean; error?: string }) {
+    const r = await this.pg.query(
+      `WITH closed AS (
+          UPDATE product_provision_jobs
+             SET status = CASE WHEN $2::boolean THEN 'done' ELSE 'failed' END,
+                 error = CASE WHEN $2::boolean THEN NULL ELSE $3::text END,
+                 finished_at = now()
+           WHERE id = $1 AND status = 'running' AND kind = 'rekey'
+          RETURNING product_id, action_id
+       ), act AS (
+          SELECT a.id, a.secrets_box, a.payload FROM product_actions a JOIN closed c ON a.id = c.action_id
+       ), swapped AS (
+          UPDATE products p
+             SET secrets_encrypted = CASE
+                   WHEN jsonb_array_length(COALESCE(act.payload->'newKeyNames', '[]'::jsonb)) = 0 THEN NULL
+                   ELSE act.secrets_box END
+            FROM closed, act
+           WHERE $2::boolean AND p.id = closed.product_id AND act.secrets_box IS NOT NULL
+          RETURNING p.id
+       ), finished AS (
+          UPDATE product_actions a
+             SET status = CASE WHEN $2::boolean THEN 'done' ELSE 'failed' END,
+                 secrets_box = NULL,
+                 result = CASE WHEN $2::boolean
+                               THEN jsonb_build_object('keyNames', COALESCE(a.payload->'newKeyNames', '[]'::jsonb))
+                               ELSE jsonb_build_object('error', $4::text, 'reason', 'rekey_failed') END,
+                 resolved_at = now()
+            FROM closed WHERE a.id = closed.action_id AND a.status = 'working'
+          RETURNING a.payload->>'tgBotId' AS tg_bot_id
+       )
+       SELECT (SELECT count(*) FROM closed)::int AS closed,
+              (SELECT product_id FROM closed) AS product_id,
+              (SELECT tg_bot_id FROM finished) AS tg_bot_id`,
+      [jobId, result.ok, result.error ?? 'без причины', REKEY_FAILED_SAY],
+    );
+    const row = r.rows[0];
+    if (!row?.closed) {
+      this.logger.warn(`отчёт по незапущенному заданию rekey ${jobId} — ключи не тронуты`);
+      return;
+    }
+    // Метка бота — отдельным оператором и лучшим усилием: частичный UNIQUE
+    // products_tg_bot_live мог занять другой живой продукт между проверкой в
+    // карточке и этим отчётом. Отказ уронил бы оператор выше целиком — и с
+    // ним перенос уже применённых в контейнере ключей.
+    if (result.ok && row.tg_bot_id) {
+      try {
+        await this.pg.query(
+          `UPDATE products SET tg_bot_id = $2, tg_bot_checked_at = now() WHERE id = $1 AND archived_at IS NULL`,
+          [row.product_id, row.tg_bot_id],
+        );
+      } catch (e: any) {
+        if (e?.code === '23505' && e?.constraint === 'products_tg_bot_live') {
+          this.logger.warn(`смена ключей продукта ${row.product_id}: новый бот уже числится за другим живым продуктом — tg_bot_id не обновлён`);
+        } else {
+          this.logger.error(`смена ключей продукта ${row.product_id}: tg_bot_id не записан (${e?.message})`);
+        }
+      }
+    }
+  }
+
+  /**
+   * Отчёт по стиранию. Строка продукта НЕ удаляется (спека, «Открыто на
+   * очередь 2»): задания продукта удалились бы каскадом, и счёт бесплатных
+   * месяцев (freeMonthCountedJobSql) сбросился бы — «удалить, дождаться
+   * стирания, завести снова» снова давало бы бесплатный месяц. Стираются
+   * ключи и первая правка, снимается строка своего домена (освобождает
+   * домен для других: индекс занятости product_domains_occupied), пишется
+   * строка журнала. Резервную копию стирает обход (product-purge.service).
+   *
+   * Один оператор и тот же замок `status = 'running'`. Журнал в исходе отказа —
+   * без сырой причины агента (она в задании).
+   */
+  private async completePurgeJob(jobId: string, result: { ok: boolean; error?: string }) {
+    const r = await this.pg.query(
+      `WITH closed AS (
+          UPDATE product_provision_jobs
+             SET status = CASE WHEN $2::boolean THEN 'done' ELSE 'failed' END,
+                 error = CASE WHEN $2::boolean THEN NULL ELSE $3::text END,
+                 finished_at = now()
+           WHERE id = $1 AND status = 'running' AND kind = 'purge'
+          RETURNING product_id
+       ), purged AS (
+          UPDATE products p
+             SET purged_at = now(), secrets_encrypted = NULL, first_prompt = NULL, first_prompt_channel = NULL
+            FROM closed
+           WHERE $2::boolean AND p.id = closed.product_id AND p.purged_at IS NULL
+          RETURNING p.id
+       ), domains AS (
+          DELETE FROM product_domains d USING purged WHERE d.product_id = purged.id
+          RETURNING d.product_id
+       ), logged AS (
+          INSERT INTO product_actions (user_id, product_id, kind, status, channel, payload, result, attached_at, resolved_at)
+          SELECT p.user_id, p.id, 'purge',
+                 CASE WHEN $2::boolean THEN 'done' ELSE 'failed' END, 'system',
+                 jsonb_build_object('name', p.name, 'slug', p.slug),
+                 CASE WHEN $2::boolean THEN '{}'::jsonb ELSE jsonb_build_object('error', $4::text) END,
+                 now(), now()
+            FROM products p JOIN closed c ON c.product_id = p.id
+          RETURNING id
+       )
+       SELECT (SELECT count(*) FROM closed)::int AS closed`,
+      [jobId, result.ok, result.error ?? 'без причины', PURGE_FAILED_SAY],
+    );
+    if (!r.rows[0]?.closed) this.logger.warn(`отчёт по незапущенному заданию purge ${jobId} — продукт не тронут`);
+  }
+```
+
+4. В `failStaleProvisioning` в `CASE kind` после строки `WHEN 'domain' THEN …` добавить:
+
+```ts
+                          WHEN 'rekey' THEN 'срок смены ключей истёк (${PROVISION_DEADLINE_MIN} мин)'
+                          WHEN 'purge' THEN 'срок стирания истёк (${PROVISION_DEADLINE_MIN} мин)'
+```
+Карточку зависшей смены ключей закрывает подметальщик журнала (задача 12): у неё задание `failed`, а исход не записан.
+
+- [ ] **Step 5: Коммит, прогон — PASS**
+
+```bash
+git -C $B add src/products && git -C $B commit -q -m "products: отчёт агента по смене ключей и стиранию — одним оператором; сроки сборщика" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, бэк): `src/products/provisioning.complete-rekey-purge.spec.ts src/products/provisioning.rekey-purge.spec.ts src/products/provisioning.job.spec.ts src/products/provisioning.integration.spec.ts src/products/domains.jobs.spec.ts`. Expected: PASS. Затем tsc бэка.
+
+---
