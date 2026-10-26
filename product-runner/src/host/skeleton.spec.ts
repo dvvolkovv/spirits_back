@@ -1033,6 +1033,51 @@ describe('skeletonFor', () => {
         expect(ms).toBeLessThan(120000);
       }
     });
+
+    const sent = (run: Booted): string => {
+      const i = run.fetches.findIndex((u) => u.includes('sendMessage'));
+      return JSON.parse(run.fetchInits[i].body).text;
+    };
+    const start = (fromId: number) => ({
+      replies: [
+        { ok: true, result: [{ update_id: 1, message: { text: '/start', chat: { id: fromId }, from: { id: fromId } } }] },
+        { ok: true, result: [] },
+      ],
+      maxCalls: 6,
+    });
+
+    it('без OWNER_TG_ID /start отвечает chat_id и подсказкой, что с ним делать', async () => {
+      const run = boot(skeletonFor('bot', 'X', SLUG)['server.js'], { ...start(777001), env: { BOT_TOKEN: 'Т', PORT: '3000' } });
+      await drain();
+      expect(sent(run)).toContain('777001');
+      expect(sent(run)).toMatch(/назовите этот номер ассистенту/);
+    });
+
+    it('с OWNER_TG_ID владелец узнан и chat_id не печатается', async () => {
+      const run = boot(skeletonFor('bot', 'X', SLUG)['server.js'], { ...start(777001), env: { BOT_TOKEN: 'Т', PORT: '3000', OWNER_TG_ID: '777001' } });
+      await drain();
+      expect(sent(run)).toMatch(/владелец/);
+      expect(sent(run)).not.toContain('777001');
+    });
+
+    it('с OWNER_TG_ID постороннему — обычный ответ без chat_id и без «владелец»', async () => {
+      const run = boot(skeletonFor('bot', 'X', SLUG)['server.js'], { ...start(555), env: { BOT_TOKEN: 'Т', PORT: '3000', OWNER_TG_ID: '777001' } });
+      await drain();
+      expect(sent(run)).toBe('Бот заведён и ждёт правок.');
+    });
+
+    it('/start@имя_бота в группе — тоже /start', async () => {
+      const run = boot(skeletonFor('bot', 'X', SLUG)['server.js'], {
+        replies: [
+          { ok: true, result: [{ update_id: 1, message: { text: '/start@shop_bot', chat: { id: -100 }, from: { id: 9 } } }] },
+          { ok: true, result: [] },
+        ],
+        maxCalls: 6,
+        env: { BOT_TOKEN: 'Т', PORT: '3000' },
+      });
+      await drain();
+      expect(sent(run)).toContain('-100');
+    });
   });
 });
 
@@ -1128,5 +1173,21 @@ describe('каркас под ключи, данные и расписание',
     // /start»: имя бота находится поиском, и первым может оказаться чужой.
     expect(md).toMatch(/назвал в тексте правки/);
     expect(md).toMatch(/Не назначать владельцем того, кто первым/);
+  });
+
+  it('ключи можно сменить через ассистента — каркас не обещает «нельзя»', () => {
+    for (const kind of KINDS) {
+      const md = skeletonFor(kind, 'X', SLUG, ['A'])['CLAUDE.md'];
+      expect(md).not.toMatch(/пока нельзя/);
+      expect(md).toMatch(/защищённая карточка/);
+      expect(md).toMatch(/Object\.keys\(process\.env\)/);
+    }
+  });
+
+  it('у бота владелец — OWNER_TG_ID, если он есть; у сайта переменной нет', () => {
+    const md = skeletonFor('bot', 'X', SLUG)['CLAUDE.md'];
+    expect(md).toMatch(/`OWNER_TG_ID`/);
+    expect(md).toMatch(/message\.from\.id/);
+    expect(skeletonFor('site', 'X', SLUG)['CLAUDE.md']).not.toMatch(/OWNER_TG_ID/);
   });
 });
