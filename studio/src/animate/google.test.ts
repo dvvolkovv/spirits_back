@@ -270,8 +270,15 @@ test('прочий провал и нехватка мощностей посл�
   await assert.rejects(waitClip(a.deps, 'i'), isErr('omni_failed', true));
   const b = fake([{ body: { status: 'failed', errors: [{ code: 'RESOURCE_EXHAUSTED', message: 'quota exceeded' }] } }]);
   await assert.rejects(waitClip(b.deps, 'i'), isErr('omni_failed', true));
-  const c = fake([{ status: 404, body: '{"error":{"message":"Interaction not found"}}' }]);
-  await assert.rejects(waitClip(c.deps, 'i'), isErr('omni_failed', true));
+  const gone = { status: 404, body: '{"error":{"message":"Interaction not found"}}' };
+  const c = fake([gone, gone, gone]);
+  c.deps.pollTimeoutMs = 100;
+  await assert.rejects(waitClip(c.deps, 'i'), (e: unknown) => isErr('omni_failed', true)(e) && /3 раза подряд/.test((e as Error).message));
+  // Одиночный 404 у живой генерации — не повод платить за новую.
+  const mp4 = Buffer.from('MP4');
+  const d = fake([gone, inProgress, gone, done(mp4)]);
+  d.deps.pollTimeoutMs = 100;
+  assert.deepEqual(await waitClip(d.deps, 'i'), mp4);
 });
 
 test('готово, но без видео — omni_rejected с текстом модели', async () => {
