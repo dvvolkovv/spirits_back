@@ -14,6 +14,7 @@ import { AGENT_OUTDATED_MARKER } from './domain-name';
 import { HostsService } from './hosts.service';
 import { LimitsService } from './limits.service';
 import { SecretsService } from './secrets.service';
+import { secretsProblem } from './secret-rules';
 import { FREE_MONTH_PRODUCTS, freeMonthCountedJobSql, RentService } from './rent.service';
 
 export type ProductKind = 'site' | 'bot';
@@ -136,48 +137,10 @@ export interface ClaimedJob {
 // ошибки).
 export const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
 
-// Имена секретов становятся переменными окружения контейнера. 'A B' и 'A=1'
-// там либо теряются, либо подменяют соседнюю переменную — в зависимости от
-// того, как агент соберёт env-файл.
-const SECRET_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-// Потолки набора секретов. Без них десять мегабайт уезжают в шифротекст, в
-// строку продукта, в тело задания и дальше в env контейнера — ограничение на
-// размер окружения процесса живёт уже в ядре хоста (ARG_MAX), и упрётся в него
-// не наш код, а запуск продукта, то есть отказ будет виден на чужой машине и
-// без объяснения.
-//
-// 8 КиБ на значение — с запасом под приватный ключ в PEM (RSA-4096 около
-// 3.2 КиБ) и JSON сервис-аккаунта; 64 имени — с запасом под всё, что видели у
-// живых продуктов; 64 символа на имя — предел разумного для переменной
-// окружения.
-const SECRET_NAME_MAX = 64;
-const SECRET_VALUE_MAX = 8192;
-const SECRET_COUNT_MAX = 64;
-
-// Занятые имена — копия списка агента хоста (`isReservedEnvName` в
-// product-runner/src/host/provision.ts, там же объяснение каждого имени) и
-// формы кабинета (spirits_front, src/components/products/secretNames.ts).
-// Разъехаться им нельзя. Пока проверка жила только на хосте, имя вроде PORT
-// сервер принимал, продукт записывался, а заведение падало в failed уже на
-// машине продуктов — с текстом, которого человек на своём экране не видит.
-const RESERVED_SECRET_NAMES = [
-  'LINKEON_URL', 'RUNNER_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'PRODUCT_START_SCRIPT',
-  'CHECKOUT_PATH', 'CLAUDE_BIN', 'PORT', 'HOME', 'PATH', 'NODE_OPTIONS',
-  'SHELL', 'USER', 'BASH_ENV', 'ENV', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
-  'POLL_INTERVAL_MS', 'TURN_TIMEOUT_MS', 'POLL_TIMEOUT_MS', 'REQUEST_TIMEOUT_MS',
-];
-const RESERVED_SECRET_PREFIXES = [
-  'ANTHROPIC_', 'CLAUDE_', 'NODE_', 'NPM_CONFIG_', 'LD_', 'GIT_', 'PM2_', 'SSL_', 'DOTENV_',
-];
-const RESERVED_SECRET_EXCEPTIONS = ['NODE_ENV'];
-
-/** Без учёта регистра: `https_proxy` читают так же, как `HTTPS_PROXY`. */
-export function isReservedSecretName(name: string): boolean {
-  const upper = name.toUpperCase();
-  if (RESERVED_SECRET_EXCEPTIONS.includes(upper)) return false;
-  return RESERVED_SECRET_NAMES.includes(upper) || RESERVED_SECRET_PREFIXES.some((p) => upper.startsWith(p));
-}
+// Правила ключей (форма имени, потолки, занятые имена) живут в
+// secret-rules.ts — их зовут и заведение, и смена ключей (очередь 2).
+// Реэкспорт — ради прежних импортов и комментариев, ссылающихся сюда.
+export { isReservedSecretName } from './secret-rules';
 
 // Путь ВНУТРИ контейнера продукта, а не на хосте: раннер живёт внутри
 // контейнера (агент провижининга — снаружи), и чекаут там у всех продуктов
@@ -545,29 +508,8 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     // «провижининг сорвался» без причины. Пустая строка доезжает до
     // контейнера переменной без значения: бот читает это как «токена нет» и
     // не стартует, тоже молча.
-    const entries = Object.entries(input.secrets ?? {});
-    if (entries.length > SECRET_COUNT_MAX) {
-      throw new BadRequestException(`секретов больше ${SECRET_COUNT_MAX}`);
-    }
-    for (const [name, value] of entries) {
-      if (!SECRET_NAME_RE.test(name)) {
-        throw new BadRequestException(`имя секрета ${JSON.stringify(name)} не переменная окружения`);
-      }
-      if (name.length > SECRET_NAME_MAX) {
-        throw new BadRequestException(`имя секрета длиннее ${SECRET_NAME_MAX} символов`);
-      }
-      if (isReservedSecretName(name)) {
-        throw new BadRequestException(`имя секрета ${name} занято платформой — назовите ключ иначе`);
-      }
-      if (typeof value !== 'string' || value === '') {
-        throw new BadRequestException(`секрет ${name}: значение должно быть непустой строкой`);
-      }
-      // Длина проверяется ПОСЛЕ типа: у не-строки .length либо отсутствует,
-      // либо означает что-то другое (у массива — число элементов).
-      if (value.length > SECRET_VALUE_MAX) {
-        throw new BadRequestException(`секрет ${name}: значение длиннее ${SECRET_VALUE_MAX} символов`);
-      }
-    }
+    const problem = secretsProblem(input.secrets ?? {});
+    if (problem) throw new BadRequestException(problem.message);
 
     // ТРИ ПРОВЕРКИ ПО БАЗЕ, И ПОРЯДОК МЕЖДУ НИМИ ОСОЗНАННЫЙ: СНАЧАЛА ТО, ЧЕГО
     // НЕ ПОЧИНИТЬ ФОРМОЙ.
