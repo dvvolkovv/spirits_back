@@ -19,6 +19,7 @@ import { parseClientUi } from './client-ui';
 import { isStoreBuild } from './client-kind';
 import { toActivity } from './activity-map';
 import { RelayOutputFile, collectOutputFiles, outputFileLines } from './chat-files/relay-links';
+import { stripProductActionBlocks } from '../products/product-action-tail';
 
 // Потолок загрузки и зачем он именно такой — в upload-limits.ts, вместе с
 // самой константой (менять его можно только вместе с ОБОИМИ nginx).
@@ -452,7 +453,16 @@ export class ChatController {
           clearInterval(pingTimer);
         }
       }
-      const fullText = chunks.join('');
+      // M5: этот путь (загрузка файла) ни разу не ходит в product-tool и
+      // ничего сам не прикрепляет — он только мог ДОНЕСТИ до пользователя
+      // то, что модель написала текстом. Модели нельзя доверять печатать
+      // ```product-action``` блок самой (тот же приём, что в chat.service.ts,
+      // streamUniversalAgent/agentReply): она видит старые блоки в истории
+      // и знает actionId из результатов прежних инструментов — скопированный
+      // оттуда блок рисует ВТОРУЮ карточку старого, уже решённого действия.
+      // Без чистки здесь текст уходил И в `end.content`, И в
+      // persistUploadTurn — то есть в историю — как есть.
+      const fullText = stripProductActionBlocks(chunks.join(''));
 
       if (fullText.length > 0) {
         // Индикатор считается тем же методом, что и списание в persistUploadTurn.
