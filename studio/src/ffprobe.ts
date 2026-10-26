@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { CLIP_LIMITS } from './animate/clip-check';
 import { FRAME } from './frame';
 
 const run = promisify(execFile);
@@ -60,6 +61,12 @@ export interface VerifyLimits {
 }
 
 export const SHORT_LIMITS: VerifyLimits = { minSec: 30, maxSec: 60, width: FRAME.width, height: FRAME.height, maxSilenceSec: 2 };
+
+/**
+ * Ролик со сценками: 25–45 с; паузы — те же, что внутри клипа сценки
+ * (CLIP_LIMITS, animate/clip-check.ts): между репликами сценок бывают паузы.
+ */
+export const SKIT_LIMITS: VerifyLimits = { ...SHORT_LIMITS, minSec: 25, maxSec: 45, maxSilenceSec: CLIP_LIMITS.maxSilenceSec };
 
 /**
  * Проверка готового ролика. Тишина длиннее предела — значит, реплика не

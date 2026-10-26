@@ -6,11 +6,11 @@ import { bundle } from '@remotion/bundler';
 import { renderMedia, renderStill, selectComposition } from '@remotion/renderer';
 import { parseConfig } from '../config';
 import { StudioError } from '../errors';
-import { detectSilences, probeFile, verifyVideo } from '../ffprobe';
+import { detectSilences, probeFile, SHORT_LIMITS, SKIT_LIMITS, verifyVideo } from '../ffprobe';
 import { validateScript } from '../script';
 import { synthesizeAll } from '../tts';
-import type { CaptureResult, Script } from '../types';
-import { buildProps } from './props';
+import type { CaptureResult, Script, ShortAnimation, ShortProps, SkitShortProps } from '../types';
+import { buildProps, buildSkitProps } from './props';
 
 const STUDIO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 
@@ -25,6 +25,8 @@ export interface RenderResult {
  * Папка съёмки (capture.json, script.json, скриншоты) → video.mp4 и cover.jpg
  * в той же папке. Папка служит publicDir бандла: staticFile() берёт файлы из неё.
  * skipTts — озвучка только из кеша (для фикстуры без сети).
+ * Сценарий со сценками собирается композицией SkitShort: нужен animation.json
+ * задания animate (npm run animate).
  */
 export async function renderRun(runDir: string, opts: { skipTts?: boolean } = {}): Promise<RenderResult> {
   const capture = JSON.parse(fs.readFileSync(path.join(runDir, 'capture.json'), 'utf8')) as CaptureResult;
@@ -35,12 +37,25 @@ export async function renderRun(runDir: string, opts: { skipTts?: boolean } = {}
   const cfg = parseConfig(process.env, { capture: false, tts: !opts.skipTts });
   const reqs = script.lines.map((l) => ({ id: l.id, text: l.text, voice: l.voice ?? script.voice, speed: script.speed ?? 1 }));
   const voiced = await synthesizeAll(reqs, path.join(runDir, 'voice'), { apiKey: cfg.speechkitKey, folderId: cfg.speechkitFolder });
-  const inputProps = buildProps(capture, script, voiced, runDir);
+  // Ролик со сценками собирается своей композицией из клипов задания animate.
+  let compositionId = 'Short';
+  let limits = SHORT_LIMITS;
+  let inputProps: ShortProps | SkitShortProps;
+  if (script.skits) {
+    const animPath = path.join(runDir, 'animation.json');
+    if (!fs.existsSync(animPath)) throw new StudioError('no_input', 'render: у ролика со сценками нет animation.json — сначала npm run animate', false);
+    const animation = JSON.parse(fs.readFileSync(animPath, 'utf8')) as ShortAnimation;
+    inputProps = buildSkitProps(capture, script, voiced, animation, runDir);
+    compositionId = 'SkitShort';
+    limits = SKIT_LIMITS;
+  } else {
+    inputProps = buildProps(capture, script, voiced, runDir);
+  }
 
   fs.copyFileSync(path.join(STUDIO_ROOT, 'public', 'logo.png'), path.join(runDir, 'logo.png'));
   const serveUrl = await bundle({ entryPoint: path.join(STUDIO_ROOT, 'src', 'remotion', 'index.ts'), publicDir: runDir });
   try {
-    const composition = await selectComposition({ serveUrl, id: 'Short', inputProps });
+    const composition = await selectComposition({ serveUrl, id: compositionId, inputProps });
     const video = path.join(runDir, 'video.mp4');
     await renderMedia({ composition, serveUrl, codec: 'h264', outputLocation: video, inputProps, concurrency: 2 });
     const cover = path.join(runDir, 'cover.jpg');
@@ -48,7 +63,7 @@ export async function renderRun(runDir: string, opts: { skipTts?: boolean } = {}
 
     const probe = await probeFile(video);
     const silences = await detectSilences(video, probe.durationSec);
-    return { video, cover, problems: verifyVideo(probe, silences), durationSec: probe.durationSec };
+    return { video, cover, problems: verifyVideo(probe, silences, limits), durationSec: probe.durationSec };
   } finally {
     // bundle() кладёт бандл и копию папки съёмки в новый каталог /tmp на каждый вызов
     // и сам его не удаляет — без этого сотни рендеров на сервере съедают диск.
