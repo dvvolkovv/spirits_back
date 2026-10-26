@@ -2,6 +2,7 @@ import { Controller, Post, Get, Delete, Body, Query, Req, Res, UseGuards, Option
 import { Request, Response } from 'express';
 import { ChatService, SdkUsageTotals, RelayTurnCost } from './chat.service';
 import { relayAuthHeaders } from './relay-auth';
+import { appendLinkeonFields } from './linkeon-relay-fields';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { JwtService } from '../common/services/jwt.service';
@@ -310,6 +311,8 @@ export class ChatController {
     // Продукты, поиск файлов и справка — те же поля, что у текстового хода.
     fd.append('products_token', handoff.products.products_token);
     fd.append('products_mcp_url', handoff.products.products_mcp_url);
+    // Инструменты Linkeon и папка хода — как у текстового хода (linkeon-relay-fields.ts).
+    appendLinkeonFields(fd, handoff.linkeon);
 
     // Set streaming headers
     res.status(200);
@@ -397,7 +400,7 @@ export class ChatController {
                 // Шаг работы (activity-map.ts): чтение большого PDF — ровно то
                 // место, где человек дольше всего смотрит на пустой пузырь.
                 if (ui.activity) {
-                  const step = toActivity(ev.tool, ev.input, { userId, relaySessionId: handoff.sessionId });
+                  const step = toActivity(ev.tool, ev.input, { userId, relaySessionId: handoff.sessionId, fsKey: handoff.linkeon.fs_key });
                   if (step) safeWrite(step);
                 }
               } else if (ev.type === 'result' && ev.text && chunks.length === 0) {

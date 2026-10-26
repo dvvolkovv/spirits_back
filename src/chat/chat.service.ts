@@ -26,7 +26,7 @@ import { toActivity } from './activity-map';
 import { ASK_RULE } from './ask-rule';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
-import { appendLinkeonFields, linkeonRelayFields } from './linkeon-relay-fields';
+import { LinkeonRelayFields, appendLinkeonFields, linkeonRelayFields } from './linkeon-relay-fields';
 import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, LINKEON_HELP_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
 import { ProductActionsService } from '../products/product-actions.service';
 import { productActionTail, stripProductActionBlocks } from '../products/product-action-tail';
@@ -809,7 +809,7 @@ export class ChatService {
     /** Сборка из стора и что умеет клиент — для справки (client-kind.ts). */
     storeBuild?: boolean;
     ui?: ClientUi;
-  }): Promise<{ sessionId: string; systemPrompt: string; history: string; products: { products_token: string; products_mcp_url: string } }> {
+  }): Promise<{ sessionId: string; systemPrompt: string; history: string; products: { products_token: string; products_mcp_url: string }; linkeon: LinkeonRelayFields }> {
     const { userId, assistantId, freshSessionId } = p;
     const profileText = p.profileText || '';
     const userLanguage = await this.language.resolveUserLanguage(userId, p.requestLang);
@@ -866,8 +866,10 @@ export class ChatService {
       client: clientKind(!!p.storeBuild, p.ui ?? NO_CLIENT_UI),
       agent: isCustom ? 'custom' : 'staff',
     });
+    // Инструменты Linkeon и папка хода — те же, что у текстового хода этой сессии.
+    const linkeon = linkeonRelayFields(userId, sessionId);
 
-    return { sessionId, systemPrompt, history, products };
+    return { sessionId, systemPrompt, history, products, linkeon };
   }
 
   async streamChat(
