@@ -4,7 +4,7 @@ import pg from 'pg';
 import { captureScene } from '../capture/run-capture';
 import { parseConfig } from '../config';
 import { renderRun } from '../render/run-render';
-import { pgQueue } from './db';
+import { LEASE_MINUTES, pgQueue } from './db';
 import { pruneOld, runOne, type JobDeps } from './jobs';
 import { s3Storage } from './storage';
 
@@ -18,6 +18,14 @@ import { s3Storage } from './storage';
  */
 const IDLE_MS = 15_000;
 const KEEP_DAYS = 7;
+/**
+ * Срок одного задания — на 2 минуты короче аренды. Зависший рендер или съёмку
+ * изнутри не прервать (Chromium, Remotion), поэтому по сроку процесс выходит:
+ * раньше, чем аренда истечёт и задание заберёт другой процесс, — двух сборок
+ * одного ролика сразу не бывает. Задание вернётся в очередь по истечении
+ * аренды, третья такая попытка уйдёт в failed (claimJob, db.ts).
+ */
+const JOB_DEADLINE_MS = (LEASE_MINUTES - 2) * 60_000;
 
 const cfg = parseConfig(process.env, { capture: true, tts: true, worker: true });
 const pool = new pg.Pool({ connectionString: cfg.databaseUrl, max: 2 });
@@ -45,7 +53,16 @@ if (pruned) log(`worker: удалено старых рабочих папок �
 log(`worker: старт${once ? ' (одно задание)' : ''}`);
 try {
   while (!stopping) {
-    const did = await runOne(deps);
+    const deadline = setTimeout(() => {
+      log(`worker: задание не уложилось в ${LEASE_MINUTES - 2} мин — выхожу, задание вернётся в очередь по истечении аренды`);
+      process.exit(1);
+    }, JOB_DEADLINE_MS);
+    let did: boolean;
+    try {
+      did = await runOne(deps);
+    } finally {
+      clearTimeout(deadline);
+    }
     if (once) {
       if (!did) log('worker: заданий нет');
       break;
