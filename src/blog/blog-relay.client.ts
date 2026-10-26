@@ -40,6 +40,7 @@ export class BlogRelayClient {
       headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
       responseType: 'stream',
       timeout: 300_000,
+      maxRedirects: 0,
     });
 
     const raw = await new Promise<string>((resolve, reject) => {

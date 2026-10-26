@@ -106,6 +106,7 @@ export class CleanAskService {
       headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
       responseType: 'stream',
       timeout: 300000,
+      maxRedirects: 0,
     });
     await new Promise<void>((resolve, reject) => {
       let buffer = '';

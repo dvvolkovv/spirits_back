@@ -1905,6 +1905,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
           responseType: 'stream',
           timeout: RELAY_TURN_BUDGET_MS,
+          maxRedirects: 0,
         });
 
         await new Promise<void>((resolve, reject) => {
@@ -2022,9 +2023,16 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // адресом. Готовый адрес самодостаточен — ради него relay не дёргаем.
           const listed = hasEmpty
             ? await axios
-                .get(`${AGENT_URL}/session/${encodeURIComponent(sid)}/files`, { timeout: 10_000, headers: relayAuthHeaders() })
+                .get(`${AGENT_URL}/session/${encodeURIComponent(sid)}/files`, {
+                  timeout: 10_000,
+                  headers: relayAuthHeaders(),
+                  maxRedirects: 0,
+                })
                 .then((r) => (Array.isArray(r.data) ? r.data : []))
-                .catch(() => [] as any[])
+                .catch((e) => {
+                  if (e?.response?.status === 401) this.logger.warn('релей отклонил секрет (401)');
+                  return [] as any[];
+                })
             : [];
 
           let resolved = resolveEmptyFileLinks(full, listed, AGENT_URL);
@@ -2449,6 +2457,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
       responseType: 'stream',
       timeout: 300000,
+      maxRedirects: 0,
     });
     await new Promise<void>((resolve, reject) => {
       let buffer = '';

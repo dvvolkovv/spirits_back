@@ -371,6 +371,7 @@ export class ChatController {
         headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
         responseType: 'stream',
         timeout: 600000,
+        maxRedirects: 0,
       });
 
       await new Promise<void>((resolve) => {
