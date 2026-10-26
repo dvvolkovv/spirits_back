@@ -41,7 +41,7 @@ describe('промпт кадра', () => {
   it('облик героев из паспортов по порядку, место, первый кадр, рамка и запреты', () => {
     const p = buildKeyframePrompt(conflict(), { continuity: false });
     expect(p).toContain(`1) ${galina.look}; 2) ${kesha.look}.`);
-    expect(p).toContain('Exactly 2 characters, each appears once.');
+    expect(p).toContain(`Exactly 2 characters — ${galina.who} and ${kesha.who} — each appears once.`);
     expect(p).toContain('Setting: shabby hallway of a rented flat.');
     expect(p).toContain('The picture: The goose blocks the doorway, the capybara stands with a suitcase.');
     expect(p).toContain(SKIT_FRAMING);
@@ -75,7 +75,7 @@ describe('промпт кадра', () => {
     expect(() => buildKeyframePrompt(twice, { continuity: false })).toThrow(/galina.*дважды/);
     const empty = conflict();
     empty.cast = [];
-    expect(() => buildKeyframePrompt(empty, { continuity: false })).toThrow(/нет героев/);
+    expect(() => buildKeyframePrompt(empty, { continuity: false })).toThrow(/2–3 героя/);
   });
 });
 
@@ -98,7 +98,7 @@ describe('промпт видео', () => {
     expect(() => buildVideoPrompt(s)).toThrow(/boris.*не в составе/);
     const mute = conflict();
     mute.lines = [];
-    expect(() => buildVideoPrompt(mute)).toThrow(/нет реплик/);
+    expect(() => buildVideoPrompt(mute)).toThrow(/1–3 реплики/);
   });
 });
 
@@ -160,14 +160,37 @@ describe('отпечатки', () => {
     expect(() => planSkits({ conflict: conflict(), punchline: p })).toThrow(/сценка punchline: пустое поле setting/);
     const c = conflict();
     c.lines[0].text = '  ';
-    expect(() => planSkits({ conflict: c, punchline: punchline() })).toThrow(/сценка conflict: пустая реплика героя galina/);
+    expect(() => planSkits({ conflict: c, punchline: punchline() })).toThrow(/сценка conflict: пустая реплика 1 \(galina\)/);
     const one = conflict();
     one.cast = [one.cast[0]];
     one.lines = [one.lines[0]];
     expect(() => planSkits({ conflict: one, punchline: punchline() })).toThrow(/сценка conflict: в составе нужно 2–3 героя/);
+    const four = conflict();
+    four.cast = [...four.cast, { hero: 'boris', role: 'начальник' }, { hero: 'zhorik', role: 'продавец' }];
+    expect(() => planSkits({ conflict: four, punchline: punchline() })).toThrow(/в составе нужно 2–3 героя/);
+    const mute = conflict();
+    mute.lines = [];
+    expect(() => planSkits({ conflict: mute, punchline: punchline() })).toThrow(/нужно 1–3 реплики/);
+    const roleless = conflict();
+    roleless.cast[1].role = ' ';
+    expect(() => planSkits({ conflict: roleless, punchline: punchline() })).toThrow(/у героя kesha нет роли/);
     const fox = punchline();
     fox.cast[0] = { hero: 'fox' as any, role: 'лиса' };
     expect(() => planSkits({ conflict: conflict(), punchline: fox })).toThrow(/сценка punchline: героя «fox» нет в труппе/);
+  });
+
+  it('место, первый кадр и действие — английские строки', () => {
+    const ru = conflict();
+    ru.opening = 'Гусыня в дверях, «Залог мой»';
+    expect(() => planSkits({ conflict: ru, punchline: punchline() })).toThrow(/сценка conflict: поле opening — по-английски/);
+    const obj = conflict();
+    (obj as any).setting = { en: 'hallway' };
+    expect(() => planSkits({ conflict: obj, punchline: punchline() })).toThrow(/пустое поле setting/);
+    expect(() => buildKeyframePrompt(ru, { continuity: false })).toThrow(/по-английски/);
+  });
+
+  it('отпечаток кадра конфликта передаётся только развязке', () => {
+    expect(() => planSkit(conflict(), 'conflict', 'abcdef0123456789')).toThrow(/только развязке/);
   });
 
   it('развязку без кадра конфликта не планируем', () => {

@@ -37,16 +37,22 @@ describe('контракт API и студии', () => {
     expect(jobs).toContain('shorts/${id}/cover.jpg');
   });
 
-  it('сценки: студия знает те же поля, что пишет план сценок бэкенда, и в тех же типах', () => {
+  it('сценки: студия и бэкенд объявляют одни и те же поля, план сценок пишет ровно их', () => {
     const types = studio('types.ts');
+    const back = fs.readFileSync(path.join(__dirname, 'short-skit-prompts.ts'), 'utf8');
     // Поле ищется внутри своего типа: skits и fingerprint есть и в соседних типах.
-    const block = (name: string): string => {
-      const m = types.match(new RegExp(`(?:interface ${name}(?: extends [^{]+)? |type ${name} = )\\{([\\s\\S]*?)\\n\\}`));
-      if (!m) throw new Error(`studio/src/types.ts: нет типа ${name}`);
+    const block = (src: string, file: string, name: string): string => {
+      const m = src.match(new RegExp(`(?:interface ${name}(?: extends [^{]+)? |type ${name} = )\\{([\\s\\S]*?)\\n\\}`));
+      if (!m) throw new Error(`${file}: нет типа ${name}`);
       return m[1];
     };
-    const has = (name: string, field: string) => expect(block(name)).toMatch(new RegExp(`^\\s*${field}\\??:`, 'm'));
-    has('Script', 'skits');
+    // Поля верхнего уровня — «имя:» или «имя?:» в начале строки; JSDoc и { … } в одну строку не мешают.
+    const fields = (src: string, file: string, name: string): string[] =>
+      [...block(src, file, name).matchAll(/^\s*(\w+)(\?)?:/gm)].map((m) => m[1] + (m[2] ?? '')).sort();
+    for (const t of ['SkitLine', 'Skit', 'SkitPlan']) {
+      expect({ [t]: fields(types, 'studio/src/types.ts', t) }).toEqual({ [t]: fields(back, 'short-skit-prompts.ts', t) });
+    }
+    expect(fields(types, 'studio/src/types.ts', 'Script')).toContain('skits?');
     const skit = {
       cast: [{ hero: 'galina' as const, role: 'хозяйка квартиры' }, { hero: 'kesha' as const, role: 'жилец' }],
       setting: 'hallway',
@@ -55,10 +61,9 @@ describe('контракт API и студии', () => {
       lines: [{ hero: 'kesha' as const, text: 'Это износ.', box: 1 }],
     };
     const { punchline } = planSkits({ conflict: skit, punchline: skit });
-    for (const f of Object.keys(punchline)) has('SkitPlan', f);
-    for (const f of Object.keys(punchline.skit)) has('Skit', f);
-    for (const f of Object.keys(punchline.skit.lines[0])) has('SkitLine', f);
+    expect(Object.keys(punchline).sort()).toEqual(fields(back, 'short-skit-prompts.ts', 'SkitPlan').map((f) => f.replace('?', '')).sort());
     const kind = /export type SkitKind = ([^;]+);/;
-    expect(types.match(kind)?.[1]).toBe(fs.readFileSync(path.join(__dirname, 'short-skit-prompts.ts'), 'utf8').match(kind)?.[1]);
+    expect(types.match(kind)?.[1]).toBeDefined();
+    expect(types.match(kind)?.[1]).toBe(back.match(kind)?.[1]);
   });
 });

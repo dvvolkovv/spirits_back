@@ -13,6 +13,8 @@ describe('труппа', () => {
     for (const h of TROUPE) {
       expect(h.who).toMatch(/^the [a-z]+( [a-z]+)*$/);
       expect(h.look).toContain(h.who.replace(/^the /, ''));
+      // Каждая часть облика — про зверя («a pompous cat boss», а не «a pompous boss»): иначе генератор дорисует человека.
+      for (const part of h.look.split(/, (?=an? )/)) expect(part).toContain(h.who.replace(/^the /, ''));
       expect(h.voice).toMatch(/voice$/);
       expect(`${h.who} ${h.look} ${h.voice}`).not.toMatch(/[а-яё]/i);
     }
