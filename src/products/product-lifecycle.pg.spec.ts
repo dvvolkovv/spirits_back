@@ -346,6 +346,43 @@ maybe('жизненный цикл продукта против живого Po
       expect(Number(wake.rows[0].count)).toBe(0);
     });
 
+    it('гонка с минутным тиком: queueSleepForDeleted не ставит сон продукту, который в тот же момент возвращают (M2)', async () => {
+      for (let attempt = 0; attempt < 6; attempt++) {
+        const userId = `u-restore-race-${attempt}`;
+        const productId = await insertProduct({
+          userId, status: 'archived', slug: `restore-race-${attempt}`,
+          archivedAt: new Date(), purgeAfter: new Date(Date.now() + 10 * 86_400_000),
+          paidUntil: new Date(Date.now() + 5 * 86_400_000),
+        });
+
+        const [restored] = await Promise.all([
+          svc.restore({ userId, productId, channel: 'web' }),
+          svc.queueSleepForDeleted(productId),
+        ]);
+        expect(restored.ok).toBe(true);
+
+        const row = (await pool.query('SELECT status, archived_at FROM products WHERE id = $1', [productId])).rows[0];
+        expect(row.archived_at).toBeNull();
+        // Либо тик успел ДО возврата (его сон снят возвратом и запись
+        // осталась failed/отменённым), либо ПОСЛЕ (архив уже снят, и тик
+        // его просто не находит) — в любом случае queued-сна для живого
+        // продукта не остаётся.
+        const sleepQueued = await pool.query(
+          `SELECT count(*) FROM product_provision_jobs WHERE product_id = $1 AND kind = 'sleep' AND status = 'queued'`,
+          [productId],
+        );
+        expect(Number(sleepQueued.rows[0].count)).toBe(0);
+        // waking правдив: если продукт sleeping (оплачен), задание wake стоит.
+        if ((restored as any).status === 'sleeping' && (restored as any).waking) {
+          const wake = await pool.query(
+            `SELECT count(*) FROM product_provision_jobs WHERE product_id = $1 AND kind = 'wake' AND status IN ('queued','running')`,
+            [productId],
+          );
+          expect(Number(wake.rows[0].count)).toBeGreaterThan(0);
+        }
+      }
+    });
+
     it('продукт был сломан (failed) до удаления — возврат отдаёт его обратно failed, без сна и аренды', async () => {
       const userId = 'u-restore-failed';
       const productId = await insertProduct({ userId, status: 'failed', slug: 'restore-failed-1' });
