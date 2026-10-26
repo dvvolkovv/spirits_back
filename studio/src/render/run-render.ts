@@ -18,6 +18,7 @@ export interface RenderResult {
   video: string;
   cover: string;
   problems: string[];
+  durationSec: number;
 }
 
 /**
@@ -47,7 +48,7 @@ export async function renderRun(runDir: string, opts: { skipTts?: boolean } = {}
 
     const probe = await probeFile(video);
     const silences = await detectSilences(video, probe.durationSec);
-    return { video, cover, problems: verifyVideo(probe, silences) };
+    return { video, cover, problems: verifyVideo(probe, silences), durationSec: probe.durationSec };
   } finally {
     // bundle() кладёт бандл и копию папки съёмки в новый каталог /tmp на каждый вызов
     // и сам его не удаляет — без этого сотни рендеров на сервере съедают диск.
