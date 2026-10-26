@@ -39,6 +39,7 @@ import {
   meetingIntro,
   resumeAck,
   farewell,
+  callTranscriptionPrompt,
   transcriptionPrompt,
   isTranscriptionEcho,
 } from './prompts.js';
@@ -583,15 +584,19 @@ export default defineAgent({
         // («Герман», «Норман»), и гейт, который сверяет текст, честно молчит
         // на прямое обращение. Замер и проверка поля на живом API — в
         // докстринге transcriptionPrompt().
-        ...(isMeeting
-          ? {
-              inputAudioTranscription: {
-                model: process.env.VOICE_TRANSCRIBE_MODEL || 'gpt-4o-transcribe',
-                language: 'ru',
-                prompt: transcriptionPrompt(agentName),
-              },
-            }
-          : {}),
+        //
+        // ⚠️ ЗВОНКУ ЭТО НУЖНО НЕ МЕНЬШЕ, ЧЕМ ВСТРЕЧЕ (26.10.2026). До этой даты блок стоял
+        // целиком под `isMeeting`, и звонок шёл на модели по умолчанию, без указания
+        // языка. В расшифровках владельца это выглядело как «Evet», «Ne zaman?» посреди
+        // русского разговора и «отказ от творения от Вэки» вместо «отказ от вейпа». На
+        // расшифровке стоит всё остальное: резюме пересказывает её, профиль извлекает из
+        // неё факты — и верный факт «поставил задачу на 31 октября» был отклонён
+        // проверкой ровно потому, что в тексте стояло «отказ от выплат».
+        inputAudioTranscription: {
+          model: process.env.VOICE_TRANSCRIBE_MODEL || 'gpt-4o-transcribe',
+          language: 'ru',
+          prompt: isMeeting ? transcriptionPrompt(agentName) : callTranscriptionPrompt(),
+        },
         // Пороги, create_response и interrupt_response — в session-options.ts
         // вместе с разбором, чем оплачено каждое значение. Вынесено туда
         // 20.10.2026: флаги меняли дважды по живым наблюдениям, и посреди
