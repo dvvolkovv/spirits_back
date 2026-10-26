@@ -1,5 +1,14 @@
 import { LinkPlatform } from './short-links';
-import { ANGLE_TITLES, RUBRIC_TITLES, ShortAngle, ShortCaptions, ShortRubric } from './shorts.types';
+import { SKIT_KINDS, SkitKind, SkitPlan } from './short-skit-prompts';
+import { heroById } from './short-troupe';
+import { ANGLE_TITLES, RUBRIC_TITLES, ShortAnimation, ShortAngle, ShortCaptions, ShortRubric } from './shorts.types';
+
+/**
+ * Цены для подписи владельцу (прайс Google на 26.10.2026): секунда Omni при
+ * 720p и кадр Nano Banana Pro. Те же числа печатает студия (studio/src/animate/google.ts).
+ */
+export const OMNI_USD_PER_SEC = 0.1;
+export const KEYFRAME_USD = 0.13;
 
 /** Telegram молча обрезает подпись длиннее — на этом обжигались с блогом. */
 export const TG_CAPTION_MAX = 1000;
@@ -75,6 +84,27 @@ export interface ReviewCaptionInput {
   question: string;
   when: string;
   captions: ShortCaptions;
+  /** Ролик со сценками: состав (skitCastLine) и траты на оживление. */
+  skits?: { cast: string; animation: ShortAnimation | null };
+}
+
+/** Состав сценок одной строкой: герой — роль, по первому появлению («Гусыня Галина Петровна — хозяйка квартиры, Капибара Кеша — жилец»). */
+export function skitCastLine(skits: Partial<Record<SkitKind, SkitPlan>>): string {
+  const seen = new Map<string, string>();
+  for (const kind of SKIT_KINDS) {
+    for (const c of skits[kind]?.skit?.cast ?? []) {
+      if (!seen.has(c.hero)) seen.set(c.hero, `${heroById(c.hero)?.name ?? c.hero} — ${c.role}`);
+    }
+  }
+  return [...seen.values()].join(', ');
+}
+
+/** Траты на оживление: «Omni: 16 с, кадров 2 ≈ $1,86». */
+export function omniSpendLine(a: ShortAnimation | null): string {
+  const seconds = a?.omniSeconds ?? 0;
+  const frames = a?.keyframes ?? 0;
+  const usd = (seconds * OMNI_USD_PER_SEC + frames * KEYFRAME_USD).toFixed(2).replace('.', ',');
+  return `Omni: ${seconds} с, кадров ${frames} ≈ $${usd}`;
 }
 
 /**
@@ -87,6 +117,7 @@ export function buildReviewCaption(i: ReviewCaptionInput): { caption: string; ex
     `Рубрика: ${RUBRIC_TITLES[i.rubric]} · подача: ${ANGLE_TITLES[i.angle].toLowerCase()}`,
     `Ассистент: ${i.assistantName}`,
     `Вопрос: «${clip(i.question, 300)}»`,
+    ...(i.skits ? [`Сценки: ${clip(i.skits.cast, 200)}`, omniSpendLine(i.skits.animation)] : []),
     `Выйдет: ${i.when}`,
   ].join('\n');
   const texts = [
