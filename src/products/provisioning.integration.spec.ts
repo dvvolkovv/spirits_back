@@ -1789,6 +1789,21 @@ maybe('провижининг против живого Postgres', () => {
 
   // ═══ бесплатный месяц — только первым FREE_MONTH_PRODUCTS продуктам человека (решение владельца 26.10.2026) ═══
 
+  /**
+   * Ревью, пункт 11: счёт бесплатных месяцев смотрит не на СТРОКУ products, а
+   * на след успешного провижининга (product_provision_jobs: kind='provision'
+   * AND status='done') — ровно тем же условием, что в самом INSERT. create()
+   * ставит задание только 'queued'; в тестах ниже нет живого агента хоста,
+   * который довёл бы его до 'done' сам, поэтому сценарии, где продукт должен
+   * считаться «использовавшим» свою долю лимита, помечают это явно.
+   */
+  async function markRanOnce(productId: string) {
+    await pool.query(
+      `UPDATE product_provision_jobs SET status = 'done', finished_at = now() WHERE product_id = $1 AND kind = 'provision'`,
+      [productId],
+    );
+  }
+
   it('105. первые FREE_MONTH_PRODUCTS продуктов человека — аренда оплачена на месяц вперёд', async () => {
     // Раньше INSERT вовсе не перечислял paid_until, и DEFAULT колонки отдавал
     // этот месяц каждому продукту безусловно. Теперь — явно, внутри самого
@@ -1798,6 +1813,7 @@ maybe('провижининг против живого Postgres', () => {
     const svc = makeSvc();
 
     const first = await svc.create({ userId: 'u-free-month', isAdmin: false, name: 'первый', slug: 'fm-first', kind: 'site', secrets: {} });
+    await markRanOnce(first.productId);
     const second = await svc.create({ userId: 'u-free-month', isAdmin: false, name: 'второй', slug: 'fm-second', kind: 'site', secrets: {} });
 
     expect(first.freeMonth).toBe(true);
@@ -1821,8 +1837,10 @@ maybe('провижининг против живого Postgres', () => {
     await ensureHost('clients');
     const svc = makeSvc();
 
-    await svc.create({ userId: 'u-free-month-2', isAdmin: false, name: 'первый', slug: 'fm3-first', kind: 'site', secrets: {} });
+    const first = await svc.create({ userId: 'u-free-month-2', isAdmin: false, name: 'первый', slug: 'fm3-first', kind: 'site', secrets: {} });
+    await markRanOnce(first.productId);
     const second = await svc.create({ userId: 'u-free-month-2', isAdmin: false, name: 'второй', slug: 'fm3-second', kind: 'site', secrets: {} });
+    await markRanOnce(second.productId);
     await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [second.productId]);
 
     const third = await svc.create({ userId: 'u-free-month-2', isAdmin: false, name: 'третий', slug: 'fm3-third', kind: 'site', secrets: {} });
@@ -1842,11 +1860,13 @@ maybe('провижининг против живого Postgres', () => {
     const svc = makeSvc();
 
     const a = await svc.create({ userId: 'u-free-month-3', isAdmin: false, name: 'стёртый', slug: 'fm4-purged', kind: 'site', secrets: {} });
+    await markRanOnce(a.productId);
     await pool.query('UPDATE products SET archived_at = now(), purged_at = now() WHERE id = $1', [a.productId]);
 
     // Второй из первых FREE_MONTH_PRODUCTS — счёт на момент его INSERT равен 1
     // (стёртый), 1 < 2 — ещё бесплатно.
     const b = await svc.create({ userId: 'u-free-month-3', isAdmin: false, name: 'второй', slug: 'fm4-second', kind: 'site', secrets: {} });
+    await markRanOnce(b.productId);
     expect(b.freeMonth).toBe(true);
 
     // Третий — счёт на момент его INSERT равен 2 (стёртый + второй), 2 не
@@ -1854,6 +1874,35 @@ maybe('провижининг против живого Postgres', () => {
     // посчиталась.
     const c = await svc.create({ userId: 'u-free-month-3', isAdmin: false, name: 'третий', slug: 'fm4-third', kind: 'site', secrets: {} });
     expect(c.freeMonth).toBe(false);
+  });
+
+  it('108. продукт, чьё заведение ни разу не поднялось, не жжёт бесплатный месяц — а поднявшийся и удалённый жжёт', async () => {
+    // Ревью, пункт 11 (владелец-дружественный счёт). failedProduct() ставит
+    // задание kind='provision' в status='failed' — это и есть «никогда не
+    // достиг running». Такой продукт не должен считаться в FREE_MONTH_PRODUCTS.
+    const userId = 'u-free-month-marker';
+    const failed = await failedProduct({ slug: 'fm-never-ran' });
+    await pool.query('UPDATE products SET user_id = $2 WHERE id = $1', [failed.id, userId]);
+    const svc = makeSvc();
+
+    // Счёт «реально работавших» для этого человека — 0 (failed не считается),
+    // хотя по счёту СТРОК это уже второй продукт.
+    const second = await svc.create({ userId, isAdmin: false, name: 'второй', slug: 'fm-after-failed', kind: 'site', secrets: {} });
+    expect(second.freeMonth).toBe(true);
+    await markRanOnce(second.productId);
+
+    // Третий — реально поднявшийся (second уже в счёте: 1 < 2).
+    const third = await svc.create({ userId, isAdmin: false, name: 'третий', slug: 'fm-third-ok', kind: 'site', secrets: {} });
+    expect(third.freeMonth).toBe(true);
+    await markRanOnce(third.productId);
+    // Удаление не освобождает место в счёте — third РЕАЛЬНО работал.
+    await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [third.productId]);
+
+    // Четвёртый — счёт теперь 2 (second + third, оба реально поднялись и
+    // попали в счёт), 2 не меньше 2 — платный. Удалённый third всё равно
+    // считается именно потому, что он РАБОТАЛ, в отличие от failed.
+    const fourth = await svc.create({ userId, isAdmin: false, name: 'четвёртый', slug: 'fm-fourth', kind: 'site', secrets: {} });
+    expect(fourth.freeMonth).toBe(false);
   });
 
   // ═══════════════ отметка о жизни агента хоста ═══════════════

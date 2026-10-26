@@ -219,6 +219,28 @@ maybe('жизненный цикл продукта против живого Po
       const sleep = await pool.query(`SELECT count(*) FROM product_provision_jobs WHERE product_id = $1 AND kind = 'sleep' AND status = 'queued'`, [productId]);
       expect(Number(sleep.rows[0].count)).toBe(1);
     });
+
+    it('блокировка администратором после открытия карточки — архивация отбивается, продукт жив (I4/ревью пункт 1)', async () => {
+      const userId = 'u-del-blocked';
+      const productId = await insertProduct({ userId, status: 'running', slug: 'del-blocked-1' });
+
+      const open = await svc.openDelete({ userId, productId, channel: 'web', turn: null });
+      expect(open.ok).toBe(true);
+
+      // Блокировка встала МЕЖДУ открытием карточки и нажатием «Удалить».
+      await pool.query(`UPDATE products SET status = 'blocked', block_reason = 'жалоба' WHERE id = $1`, [productId]);
+
+      const complete = await svc.completeDelete({ userId, actionId: (open as any).actionId, via: 'chat' });
+      expect(complete).toEqual({
+        ok: false, reason: 'blocked',
+        message: 'Продукт остановлен администратором — удалить его можно через поддержку',
+      });
+
+      const row = (await pool.query('SELECT status, archived_at, block_reason FROM products WHERE id = $1', [productId])).rows[0];
+      expect(row.archived_at).toBeNull();
+      expect(row.status).toBe('blocked');
+      expect(row.block_reason).toBe('жалоба');
+    });
   });
 
   describe('сон удалённых', () => {
@@ -308,6 +330,25 @@ maybe('жизненный цикл продукта против живого Po
   });
 
   describe('возврат', () => {
+    it('задание продукта сейчас running — busy, архив не снят (ревью, пункт 4: проверка внутри транзакции)', async () => {
+      const userId = 'u-restore-busy';
+      const productId = await insertProduct({
+        userId, status: 'archived', slug: 'restore-busy-1',
+        archivedAt: new Date(), purgeAfter: new Date(Date.now() + 10 * 86_400_000),
+      });
+      await pool.query(
+        `INSERT INTO product_provision_jobs (product_id, kind, status, started_at) VALUES ($1, 'sleep', 'running', now())`,
+        [productId],
+      );
+
+      const r = await svc.restore({ userId, productId, channel: 'web' });
+      expect(r).toEqual({ ok: false, reason: 'busy', message: 'Машина продукта сейчас занята — попробуйте через минуту' });
+
+      const row = (await pool.query('SELECT status, archived_at FROM products WHERE id = $1', [productId])).rows[0];
+      expect(row.status).toBe('archived');
+      expect(row.archived_at).not.toBeNull();
+    });
+
     it('в пределах срока: снимает архив, чужой сон отменяет, будит при оплаченном периоде', async () => {
       const userId = 'u-restore';
       const productId = await insertProduct({
@@ -351,41 +392,73 @@ maybe('жизненный цикл продукта против живого Po
       expect(Number(wake.rows[0].count)).toBe(0);
     });
 
-    it('гонка с минутным тиком: queueSleepForDeleted не ставит сон продукту, который в тот же момент возвращают (M2)', async () => {
-      for (let attempt = 0; attempt < 6; attempt++) {
-        const userId = `u-restore-race-${attempt}`;
-        const productId = await insertProduct({
-          userId, status: 'archived', slug: `restore-race-${attempt}`,
-          archivedAt: new Date(), purgeAfter: new Date(Date.now() + 10 * 86_400_000),
-          paidUntil: new Date(Date.now() + 5 * 86_400_000),
-        });
+    /**
+     * Опрос pg_stat_activity вместо фиксированного sleep — тот же приём, что
+     * waitForLockWaiters в provisioning.integration.spec.ts: ждём, пока
+     * запрос РЕАЛЬНО встанет в очередь на блокировку, а не гадаем со сколько
+     * миллисекунд ему на это хватит.
+     */
+    async function waitForLockWaiter() {
+      const until = Date.now() + 10_000;
+      for (;;) {
+        const r = await pool.query(
+          `SELECT count(*)::int AS n FROM pg_stat_activity
+            WHERE datname = current_database() AND state = 'active' AND wait_event_type = 'Lock'`,
+        );
+        if (r.rows[0].n >= 1) return;
+        if (Date.now() > until) throw new Error('на замок никто не встал — сценарий не воспроизвёлся');
+        await new Promise((res) => setTimeout(res, 50));
+      }
+    }
 
-        const [restored] = await Promise.all([
-          svc.restore({ userId, productId, channel: 'web' }),
-          svc.queueSleepForDeleted(productId),
-        ]);
-        expect(restored.ok).toBe(true);
+    it('гонка с минутным тиком: queueSleepForDeleted ждёт лок на строке продукта, не ставит сон уже вернувшемуся (M2)', async () => {
+      // Детерминированная версия M2 (ревью, пункт 7): раньше гонка ставилась
+      // через Promise.all(restore(), queueSleepForDeleted()) и исход зависел
+      // от того, кто первым доедет до базы — тест был вероятностным. Здесь
+      // клиент A держит явный FOR UPDATE на строке продукта, тик стартует и
+      // обязан встать в очередь именно на эту блокировку (а не проскочить
+      // мимо из-за случайного порядка), и только после этого A возвращает
+      // продукт и коммитит — тик обязан увидеть уже изменённую строку
+      // (EvalPlanQual) и не поставить сон.
+      const userId = 'u-restore-race';
+      const productId = await insertProduct({
+        userId, status: 'archived', slug: 'restore-race-1',
+        archivedAt: new Date(), purgeAfter: new Date(Date.now() + 10 * 86_400_000),
+      });
 
-        const row = (await pool.query('SELECT status, archived_at FROM products WHERE id = $1', [productId])).rows[0];
-        expect(row.archived_at).toBeNull();
-        // Либо тик успел ДО возврата (его сон снят возвратом и запись
-        // осталась failed/отменённым), либо ПОСЛЕ (архив уже снят, и тик
-        // его просто не находит) — в любом случае queued-сна для живого
-        // продукта не остаётся.
-        const sleepQueued = await pool.query(
-          `SELECT count(*) FROM product_provision_jobs WHERE product_id = $1 AND kind = 'sleep' AND status = 'queued'`,
+      const clientA = await pool.connect();
+      let tick!: Promise<number>;
+      try {
+        await clientA.query('BEGIN');
+        await clientA.query('SELECT 1 FROM products WHERE id = $1 FOR UPDATE', [productId]);
+
+        // Тик стартует НЕ дожидаясь его здесь — он обязан заблокироваться на
+        // FOR UPDATE OF p внутри своего INSERT…SELECT (queueSleepForDeleted),
+        // пока A держит строку.
+        tick = svc.queueSleepForDeleted(productId);
+        await waitForLockWaiter();
+
+        // A «возвращает» продукт и коммитит — строка освобождается, тик
+        // перечитывает её уже с archived_at = NULL.
+        await clientA.query(
+          `UPDATE products SET archived_at = NULL, purge_after = NULL, status = 'sleeping' WHERE id = $1`,
           [productId],
         );
-        expect(Number(sleepQueued.rows[0].count)).toBe(0);
-        // waking правдив: если продукт sleeping (оплачен), задание wake стоит.
-        if ((restored as any).status === 'sleeping' && (restored as any).waking) {
-          const wake = await pool.query(
-            `SELECT count(*) FROM product_provision_jobs WHERE product_id = $1 AND kind = 'wake' AND status IN ('queued','running')`,
-            [productId],
-          );
-          expect(Number(wake.rows[0].count)).toBeGreaterThan(0);
-        }
+        await clientA.query('COMMIT');
+      } finally {
+        clientA.release();
       }
+
+      expect(await tick).toBe(0);
+
+      const sleep = await pool.query(
+        `SELECT count(*) FROM product_provision_jobs WHERE product_id = $1 AND kind = 'sleep'`,
+        [productId],
+      );
+      expect(Number(sleep.rows[0].count)).toBe(0);
+      const row = (await pool.query('SELECT status, archived_at FROM products WHERE id = $1', [productId])).rows[0];
+      expect(row.archived_at).toBeNull();
+      expect(row.status).toBe('sleeping');
     });
 
     it('продукт был сломан (failed) до удаления — возврат отдаёт его обратно failed, без сна и аренды', async () => {

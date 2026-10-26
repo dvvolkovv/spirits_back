@@ -134,12 +134,23 @@ const NOT_WORKING = ' Не говори, что домен работает.';
  * FREE_MONTH_PRODUCTS продуктам человека за всё время (считаются и удалённые),
  * дальше аренда сразу платная. Числа — из констант, а не литералами: разъедется
  * цена или число бесплатных месяцев с кодом — этот текст соврёт молча.
+ *
+ * ФУНКЦИЯ, А НЕ КОНСТАНТА (ревью после финального, пункт 2). У пользователя
+ * без ЖИВЫХ продуктов freeMonthsLeft не обязан быть равен FREE_MONTH_PRODUCTS:
+ * он мог завести и удалить их раньше (freeMonthsLeft считает ВСЕХ продуктов
+ * за всё время, см. комментарий у list() ниже) — и тогда этот текст, говоря
+ * безусловно «первый месяц бесплатно», соврал бы ровно тому, кто уже выбрал
+ * свой лимит. Ветка «осталось 0» зеркалит непустой список ниже — тем же
+ * условием freeMonthsLeft > 0, а не отдельно выдуманным.
  */
-export const NO_PRODUCTS_SAY =
-  'У пользователя пока нет продуктов. Создать можешь ты — action="create" (kind "site" или "bot"). ' +
-  `До вызова назови условия: первый месяц бесплатно — для первых ${FREE_MONTH_PRODUCTS} продуктов человека ` +
-  `за всё время (удалённые тоже считаются), дальше сразу ${RENT_TOKEN_TEXT} токенов в месяц, ` +
-  'не больше двух продуктов на аккаунт.';
+export function noProductsSay(freeMonthsLeft: number): string {
+  return 'У пользователя пока нет продуктов. Создать можешь ты — action="create" (kind "site" или "bot"). ' +
+    'До вызова назови условия: ' +
+    (freeMonthsLeft > 0
+      ? `первый месяц бесплатно — бесплатных месяцев осталось: ${freeMonthsLeft}, дальше — ${RENT_TOKEN_TEXT} токенов в месяц`
+      : `следующий продукт — сразу платный: ${RENT_TOKEN_TEXT} токенов в месяц`) +
+    ', не больше двух продуктов на аккаунт.';
+}
 
 /**
  * Что сказать про отказавшую заявку — по коду причины, а не по `error`
@@ -380,7 +391,19 @@ export class ProductToolService {
     // включая удалённые и стёртые (см. комментарий у ProvisioningService.create
     // и у FREE_MONTH_PRODUCTS). Фильтром из `products` этот счёт не получить
     // никак, он обязан быть отдельным.
-    const everCount = await this.pg.query(`SELECT count(*) FROM products WHERE user_id = $1`, [userId]);
+    //
+    // Ревью, пункт 11: считаются ТОЛЬКО продукты со следом успешного
+    // провижининга (product_provision_jobs: kind='provision' AND
+    // status='done') — ТЕМ ЖЕ условием, что в INSERT ProvisioningService.create.
+    // Продукт, чьё заведение ни разу не поднялось (status='failed', агенту
+    // хоста не дозвонились или он сам отказал), не должен жечь человеку
+    // бесплатный месяц — ровно для этого считался лимит FREE_MONTH_PRODUCTS,
+    // а не ради количества строк в таблице.
+    const everCount = await this.pg.query(
+      `SELECT count(*) FROM products p WHERE p.user_id = $1
+         AND EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.product_id = p.id AND j.kind = 'provision' AND j.status = 'done')`,
+      [userId],
+    );
     const freeMonthsLeft = Math.max(0, FREE_MONTH_PRODUCTS - Number(everCount.rows[0]?.count ?? 0));
 
     if (!products.length) {
@@ -389,7 +412,7 @@ export class ProductToolService {
         products,
         deleted,
         freeMonthsLeft,
-        say: NO_PRODUCTS_SAY,
+        say: noProductsSay(freeMonthsLeft),
       };
     }
     const hasBot = products.some((p) => p.kind === 'bot');

@@ -707,13 +707,35 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     // всех. У LimitsService администратор исключён из предела количества
     // (другое решение, другая причина — своя машина со своим потолком), но
     // это не довод заводить второе понятие «свой» и здесь.
+    // РЕВЬЮ, ПУНКТ 11 (владелец-дружественный счёт). Считаются ТОЛЬКО
+    // продукты, у которых есть след успешного провижининга:
+    // `product_provision_jobs` со строкой `kind='provision' AND status='done'`.
+    // Это ставит completeJob() РОВНО в момент, когда агент хоста отчитался об
+    // успешном заведении (см. его докблок выше) — и эта строка остаётся с
+    // продуктом НАВСЕГДА, даже если его потом удалят (archived_at) или сотрут
+    // (purged_at): FK у product_provision_jobs — ON DELETE CASCADE, но здесь
+    // это DELETE из products не происходит, продукт только архивируется.
+    //
+    // ПОЧЕМУ НЕ products.status. Текущий статус рассказывает только о
+    // СЕЙЧАС: у удалённого продукта это 'archived' независимо от того, работал
+    // ли он раньше, — различить «сгорел месяц, а он всё равно не поднялся» и
+    // «работал, потом удалили» по одной колонке status нельзя. Job-история
+    // переживает архивацию, а текущий статус — нет.
+    //
+    // ДРУГОГО, более прямого маркера («ready_at», «promoted_at» и т.п.) в
+    // схеме НЕТ — promoteReady() переводит в running по измеримому факту
+    // (heartbeat + ответ), но не оставляет персистентной отметки «был живым»,
+    // переживающей смену статуса. product_provision_jobs — единственный
+    // снимок, который переживает весь жизненный цикл продукта.
     let freeMonth = false;
     try {
       const ins = await this.pg.query(
         `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash,
                                secrets_encrypted, domain, host_ip, health_url, host_id, tg_bot_id, paid_until)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                 CASE WHEN (SELECT count(*) FROM products WHERE user_id = $2) < $15
+                 CASE WHEN (SELECT count(*) FROM products p2 WHERE p2.user_id = $2
+                              AND EXISTS (SELECT 1 FROM product_provision_jobs j
+                                           WHERE j.product_id = p2.id AND j.kind = 'provision' AND j.status = 'done')) < $15
                         THEN now() + interval '1 month'
                         ELSE now()
                       END)

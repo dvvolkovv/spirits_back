@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { HttpException } from '@nestjs/common';
-import { PRODUCT_TOOLS, PRODUCT_TOOL_NAME, NO_PRODUCTS_SAY, ProductToolService, domainForAssistant, domainSay, DOMAIN_FAILED_SAY, DOMAIN_REFUSAL_SAY } from './product-tool.service';
+import { PRODUCT_TOOLS, PRODUCT_TOOL_NAME, noProductsSay, ProductToolService, domainForAssistant, domainSay, DOMAIN_FAILED_SAY, DOMAIN_REFUSAL_SAY } from './product-tool.service';
 import { DOMAIN_ERROR_REASONS, DomainView } from './domains.service';
 
 describe('определение инструмента продуктов', () => {
@@ -29,7 +29,13 @@ describe('определение инструмента продуктов', () 
     expect(tool().description).toMatch(/первый месяц бесплатно/);
     expect(tool().description).toMatch(/50[\s ]?000 токенов в месяц/);
     expect(tool().description).toMatch(/не больше двух продуктов/);
-    expect(NO_PRODUCTS_SAY).toMatch(/action="create"/);
+    expect(noProductsSay(1)).toMatch(/action="create"/);
+    // freeMonthsLeft = 0: условие — «сразу платный», а не «первый месяц
+    // бесплатно» — иначе у человека, уже выбравшего свой лимит удалёнными
+    // продуктами, ассистент пообещал бы то, что сервер не даст.
+    expect(noProductsSay(0)).toMatch(/сразу платный/);
+    expect(noProductsSay(0)).not.toMatch(/первый месяц бесплатно/);
+    expect(noProductsSay(1)).toMatch(/первый месяц бесплатно/);
   });
 
   it('описание domain: записи дословно, AAAA, без обещания, бесплатно', () => {

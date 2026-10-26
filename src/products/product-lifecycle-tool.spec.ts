@@ -17,7 +17,7 @@ function harness() {
     }),
   };
   const lifecycle = {
-    createSite: jest.fn(async () => ({ ok: true, productId: 'p-new', slug: 'magazin', domain: 'magazin.c.linkeon.io', freeMonth: true })),
+    createSite: jest.fn(async () => ({ ok: true, productId: 'p-new', slug: 'magazin', domain: 'magazin.c.linkeon.io', freeMonth: true, firstPromptSet: true })),
     openCreateBot: jest.fn(async () => ({ ok: true, actionId: 'a1', expiresAt: '2026-10-25T10:30:00.000Z' })),
     openDelete: jest.fn(async () => ({ ok: true, actionId: 'a2', expiresAt: '2026-10-25T10:30:00.000Z' })),
     restore: jest.fn(async () => ({ ok: true, status: 'sleeping', waking: true })),
@@ -47,7 +47,7 @@ describe('новые действия инструмента', () => {
     const r: any = await h.svc.execute('u1', { action: 'create', kind: 'site', name: 'Магазин' }, 'web', 'turn-1');
     expect(r.created.freeMonth).toBe(true);
     expect(r.say).toMatch(/первый месяц аренды бесплатный/i);
-    expect(r.say).not.toMatch(/спишется при первом обороте/);
+    expect(r.say).not.toMatch(/спишется в течение суток после запуска/);
   });
 
   it('create site — не первый бесплатный месяц: аренда и сон за нехватку токенов названы сразу', async () => {
@@ -55,9 +55,30 @@ describe('новые действия инструмента', () => {
     h.lifecycle.createSite.mockResolvedValue({ ok: true, productId: 'p-new', slug: 'magazin', domain: 'magazin.c.linkeon.io', freeMonth: false } as any);
     const r: any = await h.svc.execute('u1', { action: 'create', kind: 'site', name: 'Магазин' }, 'web', 'turn-1');
     expect(r.created.freeMonth).toBe(false);
-    expect(r.say).toMatch(/50 000 токенов спишется при первом обороте/);
+    expect(r.say).toMatch(/50 000 токенов спишется в течение суток после запуска/);
     expect(r.say).toMatch(/не хватит баланса — продукт уснёт до пополнения/);
     expect(r.say).not.toMatch(/первый месяц аренды бесплатный/i);
+  });
+
+  // Продукт СУЩЕСТВУЕТ (createSite уже отработал), а конкретно чтение домена
+  // сорвалось — «https://null» выглядело бы настоящим (сломанным) адресом,
+  // а не как отказ одного необязательного шага.
+  it('create site — домен не прочитался: без "https://null", адрес появится в списке позже', async () => {
+    const h = harness();
+    h.lifecycle.createSite.mockResolvedValue({ ok: true, productId: 'p-new', slug: 'magazin', domain: null, freeMonth: true, firstPromptSet: true } as any);
+    const r: any = await h.svc.execute('u1', { action: 'create', kind: 'site', name: 'Магазин' }, 'web', 'turn-1');
+    expect(r.say).not.toMatch(/null/);
+    expect(r.say).toMatch(/адрес появится в списке продуктов через минуту-две/);
+  });
+
+  // Прислал prompt, но setFirstPrompt реально не сработал — не обещаем
+  // постановку, которой не было.
+  it('create site — первая правка не поставилась: обещание «поставлена» не даём', async () => {
+    const h = harness();
+    h.lifecycle.createSite.mockResolvedValue({ ok: true, productId: 'p-new', slug: 'magazin', domain: 'magazin.c.linkeon.io', freeMonth: true, firstPromptSet: false } as any);
+    const r: any = await h.svc.execute('u1', { action: 'create', kind: 'site', name: 'Магазин', prompt: 'лендинг' }, 'web', 'turn-1');
+    expect(r.say).not.toMatch(/Первая правка по описанию поставлена/);
+    expect(r.say).toMatch(/Дальше — правки действием edit/);
   });
 
   it('create bot — карточка с меткой хода, ключи не просить', async () => {
@@ -202,7 +223,7 @@ describe('новые действия инструмента', () => {
     const h = harness();
     h.actions.get.mockResolvedValue({ id: 'a7', user_id: 'u1', product_id: 'p-new', kind: 'create_bot', status: 'done', channel: 'web', confirmed_via: 'chat', payload: {}, result: { productId: 'p-new', botUsername: 'shop_bot', freeMonth: false }, created_at: new Date(), expires_at: new Date(Date.now() + 60_000), resolved_at: new Date(), tg_chat_id: null, tg_message_id: null, product_name: 'Бот', purge_after: null } as any);
     const r: any = await h.svc.execute('u1', { action: 'status', actionId: 'a7' });
-    expect(r.say).toMatch(/50 000 токенов спишется при первом обороте/);
+    expect(r.say).toMatch(/50 000 токенов спишется в течение суток после запуска/);
   });
 
   it('status — pending/working тоже ok:true: карточка только что заведена, это не отказ', async () => {

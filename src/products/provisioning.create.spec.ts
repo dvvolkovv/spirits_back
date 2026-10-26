@@ -35,10 +35,11 @@ function makeService(over: any = {}) {
   const pg = {
     query: jest.fn(async (sql: string, params: any[] = []) => {
       calls.push({ sql, params });
-      // `startsWith`, а не `includes`: с бесплатным месяцем (26.10.2026)
-      // сам INSERT INTO products несёт внутри CASE подзапрос
-      // `(SELECT count(*) FROM products WHERE user_id = $2)` — `includes`
-      // перехватывал бы и его, подменяя ответ INSERT ответом проверки слага.
+      // `startsWith`, а не `includes`: с бесплатным месяцем (26.10.2026,
+      // позже уточнённым в ревью пунктом 11) сам INSERT INTO products несёт
+      // внутри CASE подзапрос `(SELECT count(*) FROM products p2 WHERE …)` —
+      // `includes` перехватывал бы и его, подменяя ответ INSERT ответом
+      // проверки слага.
       if (sql.startsWith('SELECT count(*)')) return { rows: [{ count: over.slugTaken ? '1' : '0' }] };
       if (sql.includes('SELECT 1 FROM products WHERE tg_bot_id')) {
         return { rows: over.botBusy ? [{ x: 1 }] : [] };
@@ -237,9 +238,16 @@ describe('ProvisioningService.create', () => {
     // FREE_MONTH_PRODUCTS продуктам человека за всю историю месяц, остальным
     // now(). $2 — тот же userId, что и второй колонкой выше; второй раз он
     // назван здесь не для красоты: это и есть «кому принадлежит счёт».
+    //
+    // Ревью, пункт 11: считаются не ВСЕ строки этого userId, а только те, у
+    // которых есть след успешного провижининга (EXISTS по
+    // product_provision_jobs kind='provision' status='done') — продукт, чьё
+    // заведение так и не поднялось, бесплатный месяц не жжёт.
     expect(insert.sql).toContain(
       'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,\n' +
-        '                 CASE WHEN (SELECT count(*) FROM products WHERE user_id = $2) < $15\n' +
+        "                 CASE WHEN (SELECT count(*) FROM products p2 WHERE p2.user_id = $2\n" +
+        "                              AND EXISTS (SELECT 1 FROM product_provision_jobs j\n" +
+        "                                           WHERE j.product_id = p2.id AND j.kind = 'provision' AND j.status = 'done')) < $15\n" +
         "                        THEN now() + interval '1 month'\n" +
         '                        ELSE now()\n' +
         '                      END)',
@@ -525,7 +533,12 @@ describe('ProvisioningService.create', () => {
   it('пустая или сломанная выдача RETURNING читается как «не бесплатно», а не как истина', async () => {
     const pg = {
       query: jest.fn(async (sql: string, params: any[] = []) => {
-        if (sql.includes('SELECT count(*)')) return { rows: [{ count: '0' }] };
+        // `startsWith`, а не `includes` (ревью, пункт 8): с задачи 11 сам
+        // INSERT несёт внутри CASE подзапрос `(SELECT count(*) FROM products
+        // p2 WHERE … EXISTS …)` — `includes` перехватывал бы и его, подменяя
+        // ответ INSERT ответом проверки слага, и ветка «пустая выдача» ниже
+        // для INSERT никогда не исполнялась бы на самом деле.
+        if (sql.startsWith('SELECT count(*)')) return { rows: [{ count: '0' }] };
         if (sql.includes('INSERT INTO products')) return { rows: [], rowCount: 1 }; // пустая выдача
         return { rows: [], rowCount: 1 };
       }),
@@ -540,13 +553,16 @@ describe('ProvisioningService.create', () => {
     expect(res.freeMonth).toBe(false);
   });
 
-  it('CASE считает ВСЕХ продуктов этого userId внутри самого INSERT, порогом — FREE_MONTH_PRODUCTS', async () => {
+  it('CASE считает продуктов этого userId внутри самого INSERT, порогом — FREE_MONTH_PRODUCTS', async () => {
     const { svc, calls } = makeService();
 
     await svc.create({ userId: 'u-7', isAdmin: false, name: 'X', slug: 'site4', kind: 'site', secrets: {} });
 
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
-    expect(insert.sql).toContain('(SELECT count(*) FROM products WHERE user_id = $2)');
+    expect(insert.sql).toContain('(SELECT count(*) FROM products p2 WHERE p2.user_id = $2');
+    // Ревью, пункт 11: считаются не ВСЕ строки, а только со следом успешного
+    // провижининга — EXISTS по product_provision_jobs.
+    expect(insert.sql).toContain("kind = 'provision' AND j.status = 'done'");
     expect(insert.params[1]).toBe('u-7');
     expect(insert.params[14]).toBe(FREE_MONTH_PRODUCTS);
   });
