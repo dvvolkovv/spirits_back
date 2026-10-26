@@ -1052,6 +1052,7 @@ describe('занятые имена секретов: процессы плат�
     'CLAUDE_BIN', 'PORT', 'HOME', 'PATH', 'NODE_OPTIONS', 'SHELL', 'USER', 'BASH_ENV', 'ENV',
     'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
     'POLL_INTERVAL_MS', 'TURN_TIMEOUT_MS', 'POLL_TIMEOUT_MS', 'REQUEST_TIMEOUT_MS',
+    'OWNER_TG_ID',
     // семейства
     'ANTHROPIC_BASE_URL', 'CLAUDE_CONFIG_DIR', 'NODE_TLS_REJECT_UNAUTHORIZED', 'NPM_CONFIG_REGISTRY',
     'LD_PRELOAD', 'GIT_SSH_COMMAND', 'PM2_HOME', 'SSL_CERT_FILE', 'DOTENV_CONFIG_PATH',
@@ -1117,5 +1118,39 @@ describe('ключи владельца в каркасе', () => {
       .filter(([, content]) => content.includes('значение-токена') || content.includes('значение-ключа'))
       .map(([file]) => file);
     expect(leaked).toEqual([]);
+  });
+});
+
+describe('владелец бота — OWNER_TG_ID (очередь 2)', () => {
+  // Платформенная переменная рядом с RUNNER_TOKEN: по ней бот узнаёт, кому
+  // отвечать данными владельца. Её кладёт сервер из привязанного Telegram
+  // владельца — не владелец полем ключей (имя занято, см. таблицу выше).
+  it('бот получает OWNER_TG_ID переменной окружения', async () => {
+    await provision(
+      job({ slug: 'bot-ulej', kind: 'bot', secrets: { BOT_TOKEN: 'т' }, ownerTgId: '123456789' }),
+      deps(host),
+    );
+    expect(host.containers.get('bot-ulej')!.env.OWNER_TG_ID).toBe('123456789');
+  });
+
+  it('без привязки переменной нет вовсе — не пустая строка', async () => {
+    await provision(job({ slug: 'bot-ulej', kind: 'bot', secrets: { BOT_TOKEN: 'т' } }), deps(host));
+    expect('OWNER_TG_ID' in host.containers.get('bot-ulej')!.env).toBe(false);
+  });
+
+  it('сайт OWNER_TG_ID не получает, даже если он пришёл в задании', async () => {
+    await provision(job({ ownerTgId: '123456789' }), deps(host));
+    expect('OWNER_TG_ID' in host.containers.get('kafe-ulej')!.env).toBe(false);
+  });
+
+  it('не число — отказ до первого изменения на хосте', async () => {
+    // Значение приезжает по сети. argv без шелла пробел в флаг не превратит,
+    // но идентификатор Telegram — всегда число, и всё прочее — признак
+    // поломки на сервере, а не повод заводить бота с мусором.
+    await expect(
+      provision(job({ slug: 'bot-ulej', kind: 'bot', secrets: { BOT_TOKEN: 'т' }, ownerTgId: '12 -e X=1' }), deps(host)),
+    ).rejects.toThrow(/OWNER_TG_ID/);
+    expect(host.containers.size).toBe(0);
+    expect(host.dirs.size).toBe(0);
   });
 });
