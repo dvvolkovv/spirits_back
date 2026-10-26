@@ -39,6 +39,7 @@ import {
   meetingIntro,
   resumeAck,
   farewell,
+  callTranscriptionPrompt,
   transcriptionPrompt,
   isTranscriptionEcho,
 } from './prompts.js';
@@ -583,15 +584,19 @@ export default defineAgent({
         // («Герман», «Норман»), и гейт, который сверяет текст, честно молчит
         // на прямое обращение. Замер и проверка поля на живом API — в
         // докстринге transcriptionPrompt().
-        ...(isMeeting
-          ? {
-              inputAudioTranscription: {
-                model: process.env.VOICE_TRANSCRIBE_MODEL || 'gpt-4o-transcribe',
-                language: 'ru',
-                prompt: transcriptionPrompt(agentName),
-              },
-            }
-          : {}),
+        //
+        // ⚠️ ЗВОНКУ ЭТО НУЖНО НЕ МЕНЬШЕ, ЧЕМ ВСТРЕЧЕ (26.10.2026). До этой даты блок стоял
+        // целиком под `isMeeting`, и звонок шёл на модели по умолчанию, без указания
+        // языка. В расшифровках владельца это выглядело как «Evet», «Ne zaman?» посреди
+        // русского разговора и «отказ от творения от Вэки» вместо «отказ от вейпа». На
+        // расшифровке стоит всё остальное: резюме пересказывает её, профиль извлекает из
+        // неё факты — и верный факт «поставил задачу на 31 октября» был отклонён
+        // проверкой ровно потому, что в тексте стояло «отказ от выплат».
+        inputAudioTranscription: {
+          model: process.env.VOICE_TRANSCRIBE_MODEL || 'gpt-4o-transcribe',
+          language: 'ru',
+          prompt: isMeeting ? transcriptionPrompt(agentName) : callTranscriptionPrompt(),
+        },
         // Пороги, create_response и interrupt_response — в session-options.ts
         // вместе с разбором, чем оплачено каждое значение. Вынесено туда
         // 20.10.2026: флаги меняли дважды по живым наблюдениям, и посреди
@@ -1616,6 +1621,47 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
         // коду установленного SDK.
         ...(isMeeting ? { inputOptions: meetingInputOptions() } : {}),
       });
+
+      // СТОРОЖ ПУСТОГО ЗВОНКА (26.10.2026).
+      //
+      // Что было. Человек нажимает «позвонить», бэкенд заводит строку и
+      // раздаёт job, воркер входит в комнату и произносит «Роман на связи» —
+      // а собеседник не подключается вовсе. Шесть таких звонков за три недели
+      // (24.10 11:05, 23.10 10:23, 11.10 09:27 и ещё три). В логе воркера
+      // видно по отсутствию строки participant_identity: комната остаётся
+      // пустой, через пять минут LiveKit удаляет её по emptyTimeout, процесс
+      // задания гибнет вместе с недоотправленным complete — и строка звонка
+      // висит в 'dialing', пока её через 70 минут не подберёт реапер.
+      //
+      // Для владельца это выглядело как «нажал, и ничего не произошло»: ни
+      // разговора, ни следа, ни объяснения.
+      //
+      // Поэтому: полторы минуты — и если в комнате по-прежнему никого, честно
+      // закрываемся с причиной, которую человек увидит в чате. Полторы, а не
+      // пять: за это время нормальное подключение успевает трижды, а Realtime
+      // перестаёт жечь сессию в пустоту. Встречи сторож не касается — там
+      // пустая комната штатна, людей ждут минутами.
+      if (!isMeeting) {
+        const EMPTY_CALL_MS = 90_000;
+        const guard = setTimeout(() => {
+          if (sessionClosed || sent) return;
+          if ((ctx.room.remoteParticipants?.size ?? 0) > 0) return;
+          void (async () => {
+            console.log('[звонок] собеседник так и не подключился — закрываюсь');
+            // failed, а не complete: разговора не было, списывать не за что,
+            // а причину человек должен увидеть.
+            sent = true;   // complete больше не нужен и не должен уехать следом
+            await backend
+              .failed(meta.callId, 'собеседник не подключился к звонку')
+              .catch((e) => console.error('failed не отправлен', e));
+            try { await session.close(); } catch { /* уже закрыта */ }
+            try { await ctx.room.disconnect(); } catch { /* уже отключены */ }
+          })();
+        }, EMPTY_CALL_MS);
+        guard.unref?.();
+        // Пришёл — сторож больше не нужен.
+        ctx.room.on(RoomEvent.ParticipantConnected, () => clearTimeout(guard));
+      }
 
       // С этого момента generateReply работает. До него в чужой комнате мы
       // уже сидим и уже слышим её чат — см. sessionStarted выше.

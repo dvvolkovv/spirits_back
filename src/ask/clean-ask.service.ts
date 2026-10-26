@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
 import { randomUUID } from 'crypto';
 import { AgentsService } from '../agents/agents.service';
+import { relayAuthHeaders } from '../chat/relay-auth';
 
 /**
  * «Поговорить начисто» [owner 2026-08-24] — запрос в облачный LLM, НЕ связанный с пользователем.
@@ -102,9 +103,10 @@ export class CleanAskService {
 
     const chunks: string[] = [];
     const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
-      headers: fd.getHeaders(),
+      headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
       responseType: 'stream',
       timeout: 300000,
+      maxRedirects: 0,
     });
     await new Promise<void>((resolve, reject) => {
       let buffer = '';

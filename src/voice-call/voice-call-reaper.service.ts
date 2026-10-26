@@ -32,6 +32,24 @@ const STALE_CALL_MS = 70 * 60 * 1000;
  */
 const STALE_MEETING_MS = 130 * 60 * 1000;
 
+/**
+ * Мертворождённый звонок: строка заведена, а разговора не случилось вовсе.
+ *
+ * Отдельный, КОРОТКИЙ порог. Общий час с запасом правилен для живого
+ * разговора, но для звонка, в котором не прозвучало ни реплики, он означает
+ * семьдесят минут призрака: 24.10.2026 строка c313ebd8 висела в 'dialing' с
+ * 06:05 до 07:20, хотя сессия воркера закрылась в 06:10 — процесс задания
+ * погиб вместе с недоотправленным complete, когда LiveKit удалил пустую
+ * комнату. Шесть таких строк за три недели.
+ *
+ * Десять минут: сторож пустой комнаты в воркере закрывает такой звонок за
+ * полторы (см. agent.ts), и этот порог — второй рубеж на случай, когда
+ * воркер не доживает до собственного сторожа. Живой разговор под него не
+ * попадёт: у него уже на первой минуте есть реплики, а условие требует
+ * ПУСТОГО транскрипта.
+ */
+const DEAD_CALL_MS = 10 * 60 * 1000;
+
 @Injectable()
 export class VoiceCallReaperService {
   private readonly logger = new Logger(VoiceCallReaperService.name);
@@ -63,6 +81,24 @@ export class VoiceCallReaperService {
       for (const row of stale.rows) {
         this.logger.warn(`[reap] звонок ${row.id} висел дольше порога — закрываю комнату`);
         // Комната создана ради этого звонка и вместе с ним и уходит.
+        await this.livekit.closeRoom(row.room_name);
+      }
+
+      // Мертворождённые — до общего порога: см. DEAD_CALL_MS. Условие на
+      // пустой транскрипт обязательно, иначе сюда попал бы живой разговор,
+      // у которого просто ещё не было progress-флаша.
+      const dead = await this.pg.query(
+        `UPDATE voice_calls
+            SET status = 'interrupted', ended_at = now()
+          WHERE status = 'dialing'
+            AND provider = 'linkeon'
+            AND started_at < now() - ($1 || ' milliseconds')::interval
+            AND coalesce(jsonb_array_length(transcript), 0) = 0
+          RETURNING id, room_name`,
+        [String(DEAD_CALL_MS)],
+      );
+      for (const row of dead.rows) {
+        this.logger.warn(`[reap] звонок ${row.id}: ни одной реплики — разговор не состоялся`);
         await this.livekit.closeRoom(row.room_name);
       }
 
