@@ -69,12 +69,16 @@ export function buildSkitProps(capture: CaptureResult, script: Script, voiced: T
       throw new StudioError('no_input', `props: время реплик сценки ${kind} не сходится со сценарием (реплик ${lines.length}, записей ${got.length}) — перезапустите npm run animate`, false);
     }
     // Начало и конец переводятся в кадры по отдельности: округление длины давало кадр
-    // с двумя субтитрами. Субтитр не начинается раньше конца предыдущего и не выходит за сценку.
+    // с двумя субтитрами. Субтитр не начинается раньше конца предыдущего и не выходит за
+    // сценку; частичное пересечение подрезается, а реплика, от которой не осталось ни
+    // кадра (вся за концом клипа, внутри предыдущей, конец раньше начала), — ошибка.
     let prevEnd = 0;
     return got.flatMap((c, n) => {
       const a = Math.max(prevEnd, msToFrames(c.startMs, FPS));
       const b = Math.min(msToFrames(c.endMs, FPS), duration);
-      if (a >= b) return [];
+      if (a >= b) {
+        throw new StudioError('no_input', `props: реплике ${n + 1} сценки ${kind} не осталось ни кадра (${c.startMs}–${c.endMs} мс) — перезапустите npm run animate`, false);
+      }
       prevEnd = b;
       return captionCues(splitCaption(lines[n].text), from + a, b - a).map((q, i) => ({ key: `${kind}-${n}-${i}`, ...q }));
     });

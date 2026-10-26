@@ -22,12 +22,17 @@ export interface RenderResult {
 }
 
 /** Что собирать: композиция, её пропсы, пропсы обложки и пределы проверки файла. */
-interface Build {
-  id: 'Short' | 'SkitShort';
-  props: ShortProps | SkitShortProps;
-  cover: ShortProps | SkitShortProps;
-  limits: VerifyLimits;
-}
+type Build =
+  | { id: 'Short'; props: ShortProps; cover: ShortProps; limits: VerifyLimits }
+  | { id: 'SkitShort'; props: SkitShortProps; cover: SkitShortProps; limits: VerifyLimits };
+
+const isFile = (file: string): boolean => {
+  try {
+    return fs.statSync(file).isFile();
+  } catch {
+    return false;
+  }
+};
 
 /**
  * animation.json задания animate — до озвучки и бандла: пропавший клип иначе
@@ -47,7 +52,7 @@ function readAnimation(runDir: string): ShortAnimation {
   if (!a?.skits || typeof a.skits !== 'object') throw fail('в animation.json нет сценок');
   for (const kind of SKIT_KINDS) {
     const c = a.skits[kind];
-    if (c && (typeof c.clip !== 'string' || !fs.existsSync(path.join(runDir, c.clip)))) throw fail(`нет файла клипа сценки ${kind} (${c.clip})`);
+    if (c && (typeof c.clip !== 'string' || !c.clip || !isFile(path.join(runDir, c.clip)))) throw fail(`нет файла клипа сценки ${kind} (${c.clip})`);
   }
   return a;
 }

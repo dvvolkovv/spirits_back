@@ -18,6 +18,8 @@ export const SKIT_MIN_TOTAL_MS = 25_000;
 export const SKIT_MAX_TOTAL_MS = 45_000;
 /** Зацепка ролика со сценками — немая надпись поверх конфликта: её читают, а не слушают, поэтому дольше. */
 export const SKIT_HOOK_MS = 3000;
+/** Клип сценки длиннее — не от Omni (CLIP_LIMITS.maxSec в animate/clip-check.ts): сценарист такое не исправит. */
+export const SKIT_CLIP_MAX_MS = 9500;
 
 const ORDER: LineScene[] = ['hook', 'question', 'answer', 'final'];
 /** Озвученные сцены ролика со сценками: зацепка — надпись поверх конфликта, реплики hook нет. */
@@ -109,12 +111,17 @@ export function buildSkitTimeline(lines: VoicedLine[], clips: Record<SkitKind, n
     throw new StudioError('script_invalid', 'timeline: у ролика со сценками зацепка — надпись поверх сценки, реплики hook быть не должно', false);
   }
   // Длины клипов приходят из animation.json: NaN молча отключил бы проверку 25–45 с,
-  // а клип короче зацепки обрезал бы надпись. CLIP_LIMITS сюда не импортируется:
+  // клип короче зацепки обрезал бы надпись, а слишком длинный ушёл бы сценаристу
+  // как «сократите озвучку». CLIP_LIMITS сюда не импортируется:
   // timeline.ts входит в бандл Remotion, а clip-check.ts тянет node:child_process.
   for (const kind of SKIT_KINDS) {
     const ms = clips[kind];
-    if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < SKIT_HOOK_MS) {
-      throw new StudioError('no_input', `timeline: клип сценки ${kind} — ${ms} мс, нужен не короче ${SKIT_HOOK_MS / 1000} с: переснимите (npm run animate)`, false);
+    if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < SKIT_HOOK_MS || ms > SKIT_CLIP_MAX_MS) {
+      throw new StudioError(
+        'no_input',
+        `timeline: клип сценки ${kind} — ${JSON.stringify(ms) ?? 'нет'} мс, нужен ${SKIT_HOOK_MS / 1000}–${SKIT_CLIP_MAX_MS / 1000} с: переснимите (npm run animate)`,
+        false,
+      );
     }
   }
   assertOrder(lines, SKIT_LINE_ORDER);
