@@ -4,6 +4,8 @@ import { HostApi, HostJob, JobReport, PollOutcome } from './api';
 import { hostDeps, provision as provisionReal, ProvisionDeps } from './provision';
 import { SleepJob, sleepProduct as sleepReal, wakeProduct as wakeReal } from './sleep';
 import { DomainJob, applyDomain } from './domain';
+import { RekeyJob, rekeyProduct as rekeyReal } from './rekey';
+import { PurgeJob, purgeProduct as purgeReal } from './purge';
 
 export const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -43,6 +45,13 @@ export interface HostDeps {
    * каждом выпуске при зелёном прогоне.
    */
   domain: (job: DomainJob) => Promise<void>;
+  /**
+   * Смена ключей владельца и стирание удалённого (очередь 2). Обязательные по
+   * той же причине, что сон и пробуждение: забытые в сборке, они были бы
+   * TypeError в рантайме на каждом задании при зелёном прогоне.
+   */
+  rekey: (job: RekeyJob) => Promise<void>;
+  purge: (job: PurgeJob) => Promise<void>;
   sleep?: (ms: number) => Promise<unknown>;
   log?: (message: string) => void;
 }
@@ -161,7 +170,7 @@ export async function tick(deps: HostDeps): Promise<void> {
 }
 
 /** Виды работы, которые агент умеет исполнять. */
-export const KNOWN_KINDS = ['provision', 'sleep', 'wake', 'domain'] as const;
+export const KNOWN_KINDS = ['provision', 'sleep', 'wake', 'domain', 'rekey', 'purge'] as const;
 export type JobKind = (typeof KNOWN_KINDS)[number];
 
 /**
@@ -214,6 +223,24 @@ function workFor(job: HostJob, deps: HostDeps): Promise<{ port?: number }> {
     );
   }
   if (kind === 'provision') return deps.provision(job);
+
+  // Смене ключей — выжимка: новый набор, снимаемые имена, владелец бота.
+  // Токена раннера нет и не нужно — пересоздание берёт его из живого
+  // контейнера (rekey.ts). Порта в отчёте нет: он не меняется.
+  if (kind === 'rekey') {
+    return deps
+      .rekey({
+        slug: job.slug,
+        kind: job.kind,
+        secrets: job.secrets ?? {},
+        dropNames: job.dropNames ?? [],
+        ownerTgId: job.ownerTgId,
+      })
+      .then(() => ({}));
+  }
+  // Стиранию — только слаг и форма: путь и всё, что снимается, оно выводит
+  // само и само же проверяет (purge.ts).
+  if (kind === 'purge') return deps.purge({ slug: job.slug, kind: job.kind }).then(() => ({}));
 
   // Своему домену — тоже выжимка: ни токена, ни секретов. Порт в отчёт не
   // кладётся (домен его не меняет, а `{ ok: true, port }` сервер прочёл бы как
@@ -276,6 +303,16 @@ function overdue(kind: string, budgetMs: number): string {
         `задание своего домена не уложилось в ${sec} с и брошено: состояние хоста НЕИЗВЕСТНО — `
         + 'конфиг и сертификат могли остаться частично, сверить `nginx -t` и `certbot certificates`'
       );
+    case 'rekey':
+      return (
+        `смена ключей не уложилась в ${sec} с и брошена: состояние хоста НЕИЗВЕСТНО — `
+        + 'продукт мог остаться под именем <слаг>__rekey со старыми ключами, сверить руками'
+      );
+    case 'purge':
+      return (
+        `стирание не уложилось в ${sec} с и брошено: состояние хоста НЕИЗВЕСТНО — `
+        + 'часть продукта могла остаться; повтор стирания безопасен'
+      );
     default:
       return (
         `провижининг не уложился в ${sec} с и брошен: состояние хоста НЕИЗВЕСТНО — `
@@ -283,6 +320,40 @@ function overdue(kind: string, budgetMs: number): string {
         + 'сверить руками'
       );
   }
+}
+
+/**
+ * Очередь работ по слагу ВНУТРИ ЭТОГО ПРОЦЕССА агента — не на сервере и не
+ * между машинами, одна карта на каждый объект `deps` (WeakMap, а не поле
+ * интерфейса: `realDeps`/`loop` держат один `deps` на весь процесс, и записи
+ * здесь живут ровно столько же; в тестах каждый `makeDeps()`/`realDeps()`
+ * заводит свой объект — своя, пустая очередь, без утечки между прогонами).
+ *
+ * Нужна из-за свойства `runJob`, описанного в его сроке: снятый по общему
+ * бюджету шаг (`overdue`) НЕ отменяет уже запущенную работу — `hostDeps.run`
+ * лишь роняет по сроку ОДНУ программу, а `rekeyProduct`/`purgeProduct` зовут
+ * их друг за другом и продолжают цепочку в фоне, пока агент уже отчитался об
+ * отказе. Без очереди следующее задание сервера на ТОМ ЖЕ слаге (повтор после
+ * «не уложилось», новое задание от владельца) уехало бы на хост ПОВЕРХ ещё
+ * идущей работы — тот же класс дефекта, что у брошенного заведения
+ * (см. `overdue`, случай `default`), но здесь он особенно дорогой: `rekey` и
+ * `purge` переименовывают и удаляют контейнеры по имени.
+ */
+const slugQueues = new WeakMap<HostDeps, Map<string, Promise<unknown>>>();
+
+/** Поставить работу над `slug` в очередь: ждёт окончания прежней на нём, что бы с ней ни случилось. */
+function queueBySlug<T>(deps: HostDeps, slug: string, run: () => Promise<T>): Promise<T> {
+  let bySlug = slugQueues.get(deps);
+  if (!bySlug) {
+    bySlug = new Map();
+    slugQueues.set(deps, bySlug);
+  }
+  const prior = bySlug.get(slug) ?? Promise.resolve();
+  const started = prior.then(run, run);
+  // Следующая работа на этом слаге ждёт ИМЕННО эту — не «раздели, убери если
+  // отказала»: отказ или отвал по сроку не значит, что хост уже чист.
+  bySlug.set(slug, started.then(() => undefined, () => undefined));
+  return started;
 }
 
 /**
@@ -306,7 +377,10 @@ export async function runJob(job: HostJob, deps: HostDeps): Promise<JobReport> {
   const budget = deps.config.provisionTimeoutMs ?? DEFAULT_PROVISION_TIMEOUT_MS;
   let timer: NodeJS.Timeout | undefined;
   try {
-    const work = workFor(job, deps);
+    // В очереди по слагу — не только rekey/purge: заведение, снятое по сроку
+    // (`overdue`, default), тем же образом может продолжаться в фоне, и
+    // следующее задание того же продукта ждёт его не менее честно.
+    const work = queueBySlug(deps, job.slug, () => workFor(job, deps));
     // Отдельной страховки от unhandled rejection здесь НЕТ, и это проверено, а
     // не предположено. Опасение было такое: гонку выиграл срок, брошенный
     // провижининг падает позже, обработчика у него нет — и процесс умирает
@@ -581,6 +655,8 @@ export interface RealDepsParts {
   sleepProduct?: (job: SleepJob, deps: ProvisionDeps) => Promise<void>;
   wakeProduct?: (job: SleepJob, deps: ProvisionDeps) => Promise<{ port?: number }>;
   domain?: (job: DomainJob, deps: ProvisionDeps) => Promise<void>;
+  rekey?: (job: RekeyJob, deps: ProvisionDeps) => Promise<void>;
+  purge?: (job: PurgeJob, deps: ProvisionDeps) => Promise<void>;
   buildDeps?: (overrides: Partial<ProvisionDeps>) => ProvisionDeps;
 }
 
@@ -590,6 +666,8 @@ export function realDeps(config: HostConfig, parts: RealDepsParts = {}): HostDep
   const doSleep = parts.sleepProduct ?? sleepReal;
   const doWake = parts.wakeProduct ?? wakeReal;
   const doDomain = parts.domain ?? applyDomain;
+  const doRekey = parts.rekey ?? rekeyReal;
+  const doPurge = parts.purge ?? purgeReal;
   const build = parts.buildDeps ?? hostDeps;
   return {
     config,
@@ -612,6 +690,10 @@ export function realDeps(config: HostConfig, parts: RealDepsParts = {}): HostDep
     sleepProduct: (job: SleepJob) => doSleep(job, build(provisionOverrides(config, log))),
     wakeProduct: (job: SleepJob) => doWake(job, build(provisionOverrides(config, log))),
     domain: (job: DomainJob) => doDomain(job, build(provisionOverrides(config, log))),
+    // Смене ключей маска фаз — С ЗАДАНИЕМ: в её фазах бывает текст отказа
+    // docker, а значения новых ключей знает только задание (довод заведения).
+    rekey: (job: RekeyJob) => doRekey(job, build(provisionOverrides(config, log, { secrets: job.secrets }))),
+    purge: (job: PurgeJob) => doPurge(job, build(provisionOverrides(config, log))),
     log,
   };
 }

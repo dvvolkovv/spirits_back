@@ -14,7 +14,7 @@ export interface HostJob extends ProvisionJob {
   jobId: string;
   productId: string;
   /**
-   * Вид работы: `provision`, `sleep`, `wake` или `domain` (JobKind в
+   * Вид работы: `provision`, `sleep`, `wake`, `domain`, `rekey` или `purge` (JobKind в
    * provisioning.service.ts). Тип здесь намеренно ШИРЕ союза — поле приезжает
    * по сети и не проверяется ничем, а объявленный союз означал бы «другого не
    * бывает» и однажды позволил бы выбросить ветку неизвестного вида как
@@ -55,6 +55,12 @@ export interface HostJob extends ProvisionJob {
   customNames?: string[];
   /** Режим конфига для задания domain: прокси или заглушка. Вычисляет сервер. */
   vhostMode?: 'proxy' | 'asleep';
+  /**
+   * Смена ключей (rekey): имена старых ключей владельца, которых нет в новом
+   * наборе, — уходят из окружения. Новый набор целиком — в `secrets`
+   * (расшифровывается сервером при выдаче, как у заведения).
+   */
+  dropNames?: string[];
 }
 
 /**
