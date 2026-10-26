@@ -19,6 +19,20 @@ import {
 import { CHAT_TOOLS, ChatToolsService } from '../chat/chat-tools';
 import { ChatService } from '../chat/chat.service';
 import { ProblemReportService, SUPPORT_NOTE } from '../problem-report/problem-report.service';
+import { verifyLinkeonToolToken } from './linkeon-tool.token';
+
+/**
+ * Кто зовёт инструмент — по Bearer.
+ *   token  — релей с токеном хода (linkeon-tool.token.ts): пользователь из подписи;
+ *   shared — переходный путь: общий MCP_SECRET, пользователь из args.userId,
+ *            как до 26.10.2026. Снимается шагом 4 выката (спека
+ *            docs/superpowers/specs/2026-10-26-mcp-turn-token-design.md).
+ */
+export type McpCaller = { kind: 'token'; userId: string } | { kind: 'shared' };
+
+/** Поле userId — только в схеме переходного пути и без примера номера. */
+const LEGACY_USER_ID_DESCRIPTION =
+  'Current user id from the system context. Required on the transitional shared-secret path — the server uses it to bill tokens and attribute history.';
 
 @Controller('/mcp')
 export class McpController {
@@ -33,75 +47,87 @@ export class McpController {
     private readonly chat: ChatService,
   ) {}
 
-  private auth(authHeader?: string) {
-    const secret = process.env.MCP_SECRET || '';
-    if (!secret) {
-      throw new UnauthorizedException('MCP_SECRET not configured on server');
-    }
-    if (!authHeader || authHeader !== `Bearer ${secret}`) {
-      throw new UnauthorizedException('Invalid bearer token');
+  /** Кто зовёт. Бросает 401 — значит звать инструмент нечем. */
+  private caller(authHeader?: string): McpCaller {
+    const header = authHeader || '';
+    const shared = process.env.MCP_SECRET || '';
+    if (shared && header === `Bearer ${shared}`) return { kind: 'shared' };
+    const raw = header.replace(/^Bearer\s+/i, '').trim();
+    if (!raw) throw new UnauthorizedException('Нет токена');
+    try {
+      return { kind: 'token', userId: verifyLinkeonToolToken(raw).userId };
+    } catch (e: any) {
+      throw new UnauthorizedException(`Токен не принят: ${e?.message}`);
     }
   }
 
   /**
-   * Build a fresh MCP server instance per request (stateless mode).
-   * Registers tools/list and tools/call handlers backed by ChatToolsService.
+   * tools/list. По токену — схемы инструментов как есть: пользователь в
+   * подписи, аргумента userId нет. По общему секрету — прежняя схема с
+   * обязательным userId: прежний релей пишет его в аргумент.
+   * Вынесено из makeServer ради проверяемости.
    */
-  private makeServer(): Server {
-    const server = new Server(
-      { name: 'linkeon-mcp', version: '1.0.0' },
-      { capabilities: { tools: {} } },
-    );
-
-    // tools/list — augment original schema with required userId argument
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: CHAT_TOOLS.map((t) => {
-        const origProps = (t.input_schema as any)?.properties ?? {};
-        const origRequired = (t.input_schema as any)?.required ?? [];
+  listTools(caller: McpCaller) {
+    return CHAT_TOOLS.map((t) => {
+      const schema: any = t.input_schema ?? {};
+      const properties: Record<string, any> = { ...(schema.properties ?? {}) };
+      const required: string[] = [...(schema.required ?? [])];
+      if (caller.kind === 'shared') {
         return {
           name: t.name,
           description: t.description,
           inputSchema: {
-            type: 'object',
-            properties: {
-              ...origProps,
-              userId: {
-                type: 'string',
-                description:
-                  'Current user phone (e.g. "79030169187"). Required for all calls — server uses it to bill tokens and attribute history.',
-              },
-            },
-            required: ['userId', ...origRequired],
+            type: 'object' as const,
+            properties: { ...properties, userId: { type: 'string', description: LEGACY_USER_ID_DESCRIPTION } },
+            required: ['userId', ...required],
           },
         };
-      }),
-    }));
+      }
+      return { name: t.name, description: t.description, inputSchema: { type: 'object' as const, properties, required } };
+    });
+  }
 
-    // tools/call — см. callTool.
+  private makeServer(authHeader?: string): Server {
+    const caller = this.caller(authHeader);
+    const server = new Server(
+      { name: 'linkeon-mcp', version: '1.0.0' },
+      { capabilities: { tools: {} } },
+    );
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: this.listTools(caller) }));
     server.setRequestHandler(CallToolRequestSchema, async (req: any) => {
       const { name, arguments: args } = req.params ?? {};
-      return this.callTool(name, args);
+      return this.callTool(authHeader, name, args);
     });
-
     return server;
   }
 
   /**
-   * tools/call: pop userId, delegate to ChatToolsService.executeTool.
+   * tools/call: пользователь — по Bearer, дальше ChatToolsService.executeTool.
    * Вынесено из makeServer ради проверяемости — как в products-mcp.controller.ts.
    */
-  async callTool(name: string, args: any) {
-    const userId = args?.userId;
-    if (!userId) {
-      return {
-        content: [{ type: 'text' as const, text: JSON.stringify({ ok: false, error: 'userId argument required' }) }],
-        isError: true,
-      };
+  async callTool(authHeader: string | undefined, name: string, args: any) {
+    const caller = this.caller(authHeader);
+    // userId из аргументов выбрасывается ЯВНО (как в products-mcp.controller.ts):
+    // по токену пользователь — только из подписи, поле модели не значит ничего.
+    const { userId: argUserId, ...toolArgs } = args ?? {};
+    let userId: string;
+    if (caller.kind === 'token') {
+      userId = caller.userId;
+    } else {
+      // Без пользователя и аргументов: по этой строке видно, что переходный
+      // путь ещё кто-то зовёт (шаг 3 выката).
+      this.logger.warn(`mcp: вызов по общему секрету (переходный путь), tool=${String(name).slice(0, 64)}`);
+      if (!argUserId) {
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify({ ok: false, error: 'userId argument required' }) }],
+          isError: true,
+        };
+      }
+      userId = String(argUserId);
     }
-    const { userId: _omit, ...toolArgs } = args;
     this.logger.log(`tools/call ${name} userId=${userId}`);
     const result: any = await this.tools.executeTool(userId, name, toolArgs);
-    const notified = !!result && result.ok === false && this.reportFailure(String(userId), String(name), result);
+    const notified = !!result && result.ok === false && this.reportFailure(userId, String(name), result);
     // Копия, а не правка объекта инструмента: если ответ когда-нибудь закешируют, поля не протекут в чужие вызовы.
     const out = notified ? { ...result, supportNotified: true, supportNote: SUPPORT_NOTE } : result;
     return {
@@ -139,10 +165,10 @@ export class McpController {
     @Res() res: Response,
     @Headers('authorization') auth?: string,
   ) {
-    this.auth(auth);
+    this.caller(auth); // отказ до всякой работы
     // Stateless: new transport per request, no session tracking.
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-    const server = this.makeServer();
+    const server = this.makeServer(auth);
     try {
       await server.connect(transport);
       await transport.handleRequest(req as any, res, req.body);
@@ -167,7 +193,7 @@ export class McpController {
 
   @Get()
   async get(@Res() res: Response, @Headers('authorization') auth?: string) {
-    this.auth(auth);
+    this.caller(auth);
     // Stateless mode — no server-initiated SSE stream is supported.
     res.status(405).json({
       jsonrpc: '2.0',
@@ -178,7 +204,7 @@ export class McpController {
 
   @Delete()
   async delete(@Res() res: Response, @Headers('authorization') auth?: string) {
-    this.auth(auth);
+    this.caller(auth);
     // Stateless — nothing to terminate.
     res.status(204).send();
   }
