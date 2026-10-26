@@ -68,6 +68,7 @@ ssh_remote() {
   case "$*" in
     *"seq 1"*) echo "OK 1" ;;
     *"git reset --hard origin/"*) [ -n "$BUILD_FAILS" ] && return 1 ;;
+    *"git cat-file -e origin/"*"src/chat/relay-auth.ts"*) [ -n "$NO_RELAY_AUTH" ] && return 1 ;;
   esac
   return 0
 }
@@ -101,6 +102,7 @@ function runDeployBackend(streams, env = {}) {
       HEALTH_WAIT_SECONDS: '3',
       NO_SHA: '',
       BUILD_FAILS: '',
+      NO_RELAY_AUTH: '',
       ...env,
     },
   });
@@ -215,6 +217,34 @@ describe('deploy.sh: живые ходы проверяются прямо пе�
     expect(revert).toMatch(/set -eo pipefail/);
     expect(revert).toMatch(/CI_SAME_AS=\$\(git rev-parse HEAD\)/);
     expect(revert).toMatch(/git diff --quiet "\$CI_SAME_AS" HEAD -- package-lock\.json/);
+  });
+
+  // 26.10.2026 на проде 10 минут стояла ветка со старой базой — без заголовка
+  // секрета для релея. В режиме enforce релей отказал бы во всех ходах.
+  it('в выкатываемом коммите нет src/chat/relay-auth.ts — ни ожидания, ни сборки, ни рестарта, выход 1', () => {
+    const { status, log } = runDeployBackend(['0'], { NO_RELAY_AUTH: '1' });
+    expect(status).toBe(1);
+    expect(indexOf(log, STREAMS)).toBe(-1);
+    expect(indexOf(log, BUILD)).toBe(-1);
+    expect(indexOf(log, RESTART)).toBe(-1);
+    expect(log.join('\n')).toMatch(/relay-auth\.ts/);
+  });
+
+  it('сторож секрета релея — до ожидания ходов и сборки, по выкатываемой ветке', () => {
+    const { status, log } = runDeployBackend(['0']);
+    expect(status).toBe(0);
+    const guard = indexOf(log, /^SSH: .*git cat-file -e origin\/main:src\/chat\/relay-auth\.ts/);
+    expect(guard).toBeGreaterThan(-1);
+    expect(guard).toBeLessThan(indexOf(log, STREAMS));
+    expect(guard).toBeLessThan(indexOf(log, BUILD));
+  });
+
+  it('SKIP_RELAY_AUTH_GUARD=1 — без проверки, с предупреждением', () => {
+    const { status, log } = runDeployBackend(['0'], { NO_RELAY_AUTH: '1', SKIP_RELAY_AUTH_GUARD: '1' });
+    expect(status).toBe(0);
+    expect(indexOf(log, /cat-file -e/)).toBe(-1);
+    expect(log.join('\n')).toMatch(/SKIP_RELAY_AUTH_GUARD/);
+    expect(indexOf(log, RESTART)).toBeGreaterThan(-1);
   });
 
   it('все строки, уходящие в ssh, — синтаксически верный shell', () => {

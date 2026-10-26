@@ -79,6 +79,9 @@
 #                        прямо перед pm2 restart (см. deploy_backend).
 #   FORCE_RESTART=1    — не ждать живые ходы (оборвёт чей-то ответ; только
 #                        когда прод лежит и ждать нечего).
+#   SKIP_RELAY_AUTH_GUARD=1 — выкатить бэк, в котором нет src/chat/relay-auth.ts
+#                        (заголовка секрета для релея). Только когда релей в
+#                        режиме log, иначе ни один ход ассистента не пройдёт.
 #
 #   SMOKE_ATTEMPTS=N   — сколько раз прогнать smoke прежде чем считать фазу
 #                        красной (default 2). Первый прогон ещё и прогревает
@@ -688,6 +691,22 @@ deploy_backend() {
   bold "=== BACKEND ($ENV_NAME) ==="
   bold "[back 1/3] pushing local commits to origin"
   push_local_repo "$LOCAL_BACK_DIR" "spirits_back"
+
+  # Сторож секрета релея [инцидент 2026-10-26]. Бэк шлёт релею X-Agent-Secret
+  # из src/chat/relay-auth.ts; ветка от базы старше него (19130f8) выкатывает
+  # бэк без заголовка. Так 26.10 на проде 10 минут стоял хотфикс со старой
+  # базой — релей был в режиме log и только записал это. В режиме enforce
+  # ни один ход ассистента не прошёл бы до следующего выката. Проверяется
+  # дерево, которое встанет на сервер (origin/<ветка> после fetch), до
+  # ожидания ходов и до сборки: здесь ещё ничего не тронуто.
+  if [[ "${SKIP_RELAY_AUTH_GUARD:-0}" == "1" ]]; then
+    red "  ⚠ SKIP_RELAY_AUTH_GUARD=1 — сторож секрета релея пропущен (релей обязан быть в режиме log)"
+  elif ! ssh_remote "cd $BACK_PATH && git fetch -q origin && git cat-file -e origin/${BRANCH}:src/chat/relay-auth.ts"; then
+    red "  ✗ ${ENV_NAME}: в origin/${BRANCH} нет src/chat/relay-auth.ts (или git fetch на сервере не прошёл)"
+    red "    ветка старше секрета релея — релей в режиме enforce откажет во всех ходах; ничего не тронуто"
+    red "    взять ветку от свежего main; осознанно в обход (релей в log) — SKIP_RELAY_AUTH_GUARD=1"
+    exit 1
+  fi
 
   local force=0
   [[ "${FORCE_RESTART:-0}" == "1" ]] && force=1
