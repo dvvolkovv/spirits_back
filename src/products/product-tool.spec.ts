@@ -7,6 +7,7 @@ import { DomainsService } from './domains.service';
 import { DnsResolver } from './domain-dns';
 import { TurnsService, SLEEPING_REFUSAL, BLOCKED_REFUSAL } from './turns.service';
 import { PRODUCT_TOOL_WAIT_MS } from '../common/relay-budget';
+import { FREE_MONTH_PRODUCTS } from './rent.service';
 
 const PG = process.env.PROVISIONING_PG_URL;
 const maybe = PG ? describe : describe.skip;
@@ -176,6 +177,26 @@ maybe('инструмент продуктов против живого Postgre
       expect(out.say).toMatch(/нет|ни одного/i);
       // С задачи 8 завести продукт может сам ассистент — action="create".
       expect(out.say).toMatch(/action="create"/);
+    });
+
+    // Решение владельца 26.10.2026: freeMonthsLeft считает ВСЕХ продуктов
+    // этого user_id за всё время (как и CASE в ProvisioningService.create),
+    // а не только живых — иначе ассистент пообещал бы бесплатный месяц,
+    // который сервер уже не даст.
+    it('freeMonthsLeft — из ВСЕХ продуктов за всё время, не только живых', async () => {
+      const svc = new ProductToolService(pg as any, {} as any, {} as any);
+
+      const empty: any = await svc.execute(OWNER, { action: 'list' });
+      expect(empty.freeMonthsLeft).toBe(FREE_MONTH_PRODUCTS);
+
+      const id = await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      const withOne: any = await svc.execute(OWNER, { action: 'list' });
+      expect(withOne.freeMonthsLeft).toBe(FREE_MONTH_PRODUCTS - 1);
+
+      // Архивация не возвращает слот: продукт всё равно был одним из первых.
+      await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [id]);
+      const afterArchive: any = await svc.execute(OWNER, { action: 'list' });
+      expect(afterArchive.freeMonthsLeft).toBe(FREE_MONTH_PRODUCTS - 1);
     });
 
     it('архивированные не показываются', async () => {
