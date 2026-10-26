@@ -123,6 +123,16 @@ export const BLOCKED_REFUSAL =
   'Продукт остановлен администратором — правки не принимаются. ' +
   'Пополнение здесь не поможет: напишите нам, если это ошибка.';
 
+/**
+ * Отказ правке, пока меняются ключи продукта (задание rekey в очереди или
+ * идёт). Смена ключей ПЕРЕСОЗДАЁТ контейнер, а раннер живёт внутри него:
+ * поставленная сейчас правка была бы убита посреди хода молча, а
+ * выдача rekey ждала бы её конца (claimJob) — то есть правка и ключи
+ * загораживали бы друг друга до сборщика. 409, а не 402: деньги тут ни при
+ * чём, кабинет показывает текст сервера (см. BLOCKED_REFUSAL).
+ */
+export const REKEY_REFUSAL = 'Сейчас меняются ключи продукта — правку можно поставить через пару минут.';
+
 @Injectable()
 export class TurnsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TurnsService.name);
@@ -305,6 +315,16 @@ export class TurnsService implements OnModuleInit, OnModuleDestroy {
     if (productStatus !== 'running') {
       throw new ConflictException('Продукт сейчас недоступен для правок');
     }
+
+    // После статусов (у спящего и погашенного — свои тексты) и ДО баланса:
+    // пополнение смену ключей не ускорит. Отдельным запросом, а не полем
+    // SELECT статуса: тот же запрос читают мок-спеки модуля по подстроке.
+    const rekey = await this.pg.query(
+      `SELECT 1 FROM product_provision_jobs
+        WHERE product_id = $1 AND kind = 'rekey' AND status IN ('queued','running') LIMIT 1`,
+      [input.productId],
+    );
+    if (rekey.rows.length) throw new ConflictException(REKEY_REFUSAL);
 
     // Порог тот же, что в чате с ассистентами: balance <= 0 запрещает ход.
     // Ход — это реальный запуск claude -p на VM, то есть живые деньги; при

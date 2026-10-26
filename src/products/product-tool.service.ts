@@ -1,7 +1,7 @@
 import { HttpException, Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { PRODUCT_TOOL_WAIT_MS } from '../common/relay-budget';
-import { TurnsService, SLEEPING_REFUSAL, BLOCKED_REFUSAL } from './turns.service';
+import { TurnsService, SLEEPING_REFUSAL, BLOCKED_REFUSAL, REKEY_REFUSAL } from './turns.service';
 import { DomainErrorReason, DomainRecordToSet, DomainRefusalCode, DomainStatus, DomainsService, DomainView } from './domains.service';
 import { normalizeDomain, readableDomain } from './domain-name';
 import { ProductToolChannel } from './product-tool.token';
@@ -504,6 +504,10 @@ export class ProductToolService {
     if (msg === BLOCKED_REFUSAL) {
       return { ok: false, reason: 'blocked', canTopUp: false, product,
         say: BLOCKED_REFUSAL + ' НЕ предлагай пользователю пополнить баланс — это не поможет.' };
+    }
+    if (msg === REKEY_REFUSAL) {
+      return { ok: false, reason: 'rekeying', canTopUp: false, product,
+        say: `${REKEY_REFUSAL} Повтори правку через пару минут — продукт перезапускается с новыми ключами.` };
     }
     if (msg === 'Недостаточно токенов') {
       return { ok: false, reason: 'no_tokens', canTopUp: true, product,
