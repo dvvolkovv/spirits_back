@@ -4508,3 +4508,501 @@ git -C $B add src/tg-bot && git -C $B commit -q -m "tg-bot: карточка к�
 Run (нода, бэк): `src/tg-bot`. Expected: PASS (включая сторожа каталогов `tg-i18n`). Затем tsc бэка.
 
 ---
+
+### Task 18: Фронт — третья копия занятых имён и ручка карточки
+
+**Files (фронт, `$F`):**
+- Modify: `src/components/products/secretNames.ts` (`RESERVED`), `src/components/products/secretNames.test.ts` (`RESERVED_TABLE`)
+- Modify: `src/services/productActionsApi.ts` (`ProductActionView`, `submit`)
+- Test: `src/services/productActionsApi.test.ts`
+
+- [ ] **Step 1: Тесты**
+
+`src/components/products/secretNames.test.ts`: в `RESERVED_TABLE` после `'POLL_INTERVAL_MS', 'TURN_TIMEOUT_MS', 'POLL_TIMEOUT_MS', 'REQUEST_TIMEOUT_MS',` добавить `'OWNER_TG_ID',` — таблица обязана остаться дословно такой же, как в двух копиях бэка (задачи 2 и 3).
+
+`src/services/productActionsApi.test.ts`, в `describe('ручки карточки', …)`:
+
+```ts
+  it('submit ключей — set, remove и источник, ничего сверх', async () => {
+    api.post.mockResolvedValue(json(200, { ...VIEW, kind: 'keys', status: 'working', productKind: 'bot' }));
+    const r = await productActionsApi.submit('a1', { set: { API_KEY: 'k' }, remove: ['OLD'], via: 'tma' });
+    expect(api.post).toHaveBeenCalledWith('/webhook/product-actions/a1', { set: { API_KEY: 'k' }, remove: ['OLD'], via: 'tma' });
+    expect(!isProblem(r) && r.productKind).toBe('bot');
+  });
+```
+
+- [ ] **Step 2: Коммит, прогон — FAIL** (`OWNER_TG_ID` не занят; `remove` нет в типе тела — vitest типы не проверяет, поэтому краснеет только таблица; тип проверит tsc на шаге 4)
+
+```bash
+git -C $F add src/components/products/secretNames.test.ts src/services/productActionsApi.test.ts && git -C $F commit -q -m "test(products): OWNER_TG_ID занят; отправка ключей set/remove (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, фронт): `src/components/products/secretNames.test.ts src/services/productActionsApi.test.ts`.
+
+- [ ] **Step 3: Реализация**
+
+`src/components/products/secretNames.ts`, в `RESERVED` после `'POLL_INTERVAL_MS', 'TURN_TIMEOUT_MS', 'POLL_TIMEOUT_MS', 'REQUEST_TIMEOUT_MS',`:
+
+```ts
+  // Telegram владельца бота — кладёт платформа (очередь 2). Ключ с этим именем
+  // подменил бы, кому бот отвечает данными владельца.
+  'OWNER_TG_ID',
+```
+и в шапке файла ссылку «Вторая — `isReservedSecretName` на сервере (`spirits_back/src/products/provisioning.service.ts`)» поправить на `spirits_back/src/products/secret-rules.ts`.
+
+`src/services/productActionsApi.ts`:
+- в `ProductActionView` после `productName`:
+
+```ts
+  /** Форма продукта (с очереди 2). Необязательное: сервер старше фронта поля не шлёт. */
+  productKind?: 'site' | 'bot' | null;
+```
+- в типе `result` добавить `keyNames?: string[];`;
+- сигнатура `submit`: `body: { confirm?: true; set?: Record<string, string>; remove?: string[]; via: ActionSource }`.
+
+- [ ] **Step 4: Коммит, прогон — PASS**
+
+```bash
+git -C $F add src && git -C $F commit -q -m "products: OWNER_TG_ID — третья копия занятых имён; ручка карточки знает remove и вид продукта" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, фронт): `src/components/products src/services/productActionsApi.test.ts`. Expected: PASS. Затем tsc фронта — не выше базовой линии.
+
+---
+
+### Task 19: Фронт — тексты карточки ключей и формы Студии, 7 языков
+
+**Files (фронт):**
+- Modify: `src/i18n/locales/{ru,en,de,fr,es,pt,zh}.json` (`products.action.keys.*`, `products.new.extraSecrets.hint`)
+
+Правка — node-скриптом, а не руками и не `translate-locales` (без ключа переписывает локаль, заметка памяти). Файлы локалей канонические (`JSON.stringify(…, null, 2) + '\n'`, проверено на `a369a67`), поэтому перезапись скриптом даёт дифф только по правленым ключам. Французские неразрывные пробелы (у «», `:`, `?`) ставятся символом `String.fromCharCode(0xa0)` — НЕ последовательностью `\u…` (заметка «Write портит \uXXXX»). `keys.unsupported` здесь ещё НЕ удаляется: его читает карточка до задачи 20.
+
+- [ ] **Step 1: Скрипт**
+
+```bash
+cd /Users/dmitry/Downloads/spirits_front/.worktrees/product-lifecycle-2 && node - <<'EOF'
+const fs = require('fs');
+const NB = String.fromCharCode(0xa0);
+const T = {
+  ru: {
+    keys: {
+      title: 'Ключи «{{name}}»',
+      hint: 'Значения уходят прямо на сервер — ассистент и история чата их не видят. Пустое поле — ключ остаётся прежним.',
+      current: 'Текущие ключи', none: 'Ключей пока нет.', newValue: 'Новое значение {{name}}', keepPlaceholder: 'оставить как есть',
+      remove: 'Убрать', undoRemove: 'Вернуть', willRemove: 'будет убран', addTitle: 'Добавить ключи',
+      duplicate: 'Такой ключ уже есть — замените его выше',
+      nothing: 'Ничего не изменено: впишите новое значение, уберите или добавьте ключ.',
+      submit: 'Сохранить ключи', submitting: 'Сохраняю…',
+      working: 'Меняю ключи и перезапускаю продукт — это займёт до пары минут.',
+      done: 'Ключи «{{name}}» обновлены, продукт перезапущен.',
+    },
+    hintOld: 'Сменить ключи после создания бота пока нельзя.',
+    hintNew: 'Сменить, убрать или добавить ключи потом можно, попросив ассистента.',
+  },
+  en: {
+    keys: {
+      title: 'Keys for “{{name}}”',
+      hint: 'The values go straight to the server — neither the assistant nor the chat history sees them. Leave a field empty to keep that key.',
+      current: 'Current keys', none: 'No keys yet.', newValue: 'New value for {{name}}', keepPlaceholder: 'keep as is',
+      remove: 'Remove', undoRemove: 'Keep', willRemove: 'will be removed', addTitle: 'Add keys',
+      duplicate: 'This key already exists — replace it above',
+      nothing: 'Nothing changed: enter a new value, remove a key or add one.',
+      submit: 'Save keys', submitting: 'Saving…',
+      working: 'Changing the keys and restarting the product — this takes up to a couple of minutes.',
+      done: 'Keys for “{{name}}” updated, the product has restarted.',
+    },
+    hintOld: 'For now, keys can’t be changed after the bot is created.',
+    hintNew: 'You can change, remove or add keys later by asking the assistant.',
+  },
+  de: {
+    keys: {
+      title: 'Schlüssel für „{{name}}“',
+      hint: 'Die Werte gehen direkt an den Server — weder der Assistent noch der Chatverlauf sieht sie. Leeres Feld — der Schlüssel bleibt, wie er ist.',
+      current: 'Aktuelle Schlüssel', none: 'Noch keine Schlüssel.', newValue: 'Neuer Wert für {{name}}', keepPlaceholder: 'unverändert lassen',
+      remove: 'Entfernen', undoRemove: 'Behalten', willRemove: 'wird entfernt', addTitle: 'Schlüssel hinzufügen',
+      duplicate: 'Diesen Schlüssel gibt es schon — ersetze ihn oben',
+      nothing: 'Nichts geändert: Gib einen neuen Wert ein, entferne einen Schlüssel oder füge einen hinzu.',
+      submit: 'Schlüssel speichern', submitting: 'Speichere…',
+      working: 'Die Schlüssel werden geändert und das Produkt neu gestartet — das dauert bis zu ein paar Minuten.',
+      done: 'Die Schlüssel für „{{name}}“ sind aktualisiert, das Produkt wurde neu gestartet.',
+    },
+    hintOld: 'Nach dem Anlegen des Bots lassen sich die Schlüssel vorerst nicht ändern.',
+    hintNew: 'Ändern, entfernen oder ergänzen kannst du die Schlüssel später, indem du den Assistenten fragst.',
+  },
+  fr: {
+    keys: {
+      title: `Clés de «${NB}{{name}}${NB}»`,
+      hint: 'Les valeurs vont directement au serveur — ni l’assistant ni l’historique de la discussion ne les voient. Champ vide — la clé reste inchangée.',
+      current: 'Clés actuelles', none: 'Aucune clé pour l’instant.', newValue: 'Nouvelle valeur de {{name}}', keepPlaceholder: 'laisser tel quel',
+      remove: 'Supprimer', undoRemove: 'Garder', willRemove: 'sera supprimée', addTitle: 'Ajouter des clés',
+      duplicate: 'Cette clé existe déjà — remplacez-la plus haut',
+      nothing: `Rien n’a changé${NB}: saisissez une nouvelle valeur, supprimez ou ajoutez une clé.`,
+      submit: 'Enregistrer les clés', submitting: 'Enregistrement…',
+      working: 'Changement des clés et redémarrage du produit — cela prend jusqu’à quelques minutes.',
+      done: `Les clés de «${NB}{{name}}${NB}» sont à jour, le produit a redémarré.`,
+    },
+    hintOld: 'Pour l’instant, les clés ne peuvent pas être modifiées après la création du bot.',
+    hintNew: 'Vous pourrez ensuite modifier, supprimer ou ajouter des clés en le demandant à l’assistant.',
+  },
+  es: {
+    keys: {
+      title: 'Claves de «{{name}}»',
+      hint: 'Los valores van directamente al servidor: ni el asistente ni el historial del chat los ven. Si dejas un campo vacío, la clave se queda como está.',
+      current: 'Claves actuales', none: 'Todavía no hay claves.', newValue: 'Nuevo valor de {{name}}', keepPlaceholder: 'dejar como está',
+      remove: 'Quitar', undoRemove: 'Mantener', willRemove: 'se quitará', addTitle: 'Añadir claves',
+      duplicate: 'Esta clave ya existe: sustitúyela arriba',
+      nothing: 'No has cambiado nada: escribe un valor nuevo, quita una clave o añade otra.',
+      submit: 'Guardar claves', submitting: 'Guardando…',
+      working: 'Cambiando las claves y reiniciando el producto: tardará hasta un par de minutos.',
+      done: 'Claves de «{{name}}» actualizadas; el producto se ha reiniciado.',
+    },
+    hintOld: 'Por ahora, las claves no se pueden cambiar después de crear el bot.',
+    hintNew: 'Más adelante puedes cambiar, quitar o añadir claves pidiéndoselo al asistente.',
+  },
+  pt: {
+    keys: {
+      title: 'Chaves de «{{name}}»',
+      hint: 'Os valores vão diretamente para o servidor — nem o assistente nem o histórico da conversa os veem. Campo vazio — a chave fica como está.',
+      current: 'Chaves atuais', none: 'Ainda não há chaves.', newValue: 'Novo valor de {{name}}', keepPlaceholder: 'manter como está',
+      remove: 'Remover', undoRemove: 'Manter', willRemove: 'vai ser removida', addTitle: 'Acrescentar chaves',
+      duplicate: 'Esta chave já existe — substitui-a acima',
+      nothing: 'Nada foi alterado: escreve um valor novo, remove ou acrescenta uma chave.',
+      submit: 'Guardar chaves', submitting: 'A guardar…',
+      working: 'A alterar as chaves e a reiniciar o produto — demora até alguns minutos.',
+      done: 'As chaves de «{{name}}» foram atualizadas e o produto reiniciou.',
+    },
+    hintOld: 'Por agora, as chaves não podem ser alteradas depois de criar o bot.',
+    hintNew: 'Mais tarde podes alterar, remover ou acrescentar chaves pedindo ao assistente.',
+  },
+  zh: {
+    keys: {
+      title: '「{{name}}」的密钥',
+      hint: '这些值直接发送到服务器——助手和聊天记录都看不到。留空则保持该密钥不变。',
+      current: '当前密钥', none: '暂无密钥。', newValue: '{{name}} 的新值', keepPlaceholder: '保持不变',
+      remove: '删除', undoRemove: '保留', willRemove: '将被删除', addTitle: '添加密钥',
+      duplicate: '该密钥已存在——请在上方替换',
+      nothing: '没有任何更改：请输入新值、删除或添加密钥。',
+      submit: '保存密钥', submitting: '正在保存…',
+      working: '正在更换密钥并重启产品——最多需要几分钟。',
+      done: '「{{name}}」的密钥已更新，产品已重启。',
+    },
+    hintOld: '目前，机器人创建后无法更改密钥。',
+    hintNew: '之后可以请助手更改、删除或添加密钥。',
+  },
+};
+for (const [lang, t] of Object.entries(T)) {
+  const f = `src/i18n/locales/${lang}.json`;
+  const d = JSON.parse(fs.readFileSync(f, 'utf8'));
+  d.products.action.keys = { ...d.products.action.keys, ...t.keys };
+  const h = d.products.new.extraSecrets.hint;
+  if (!h.includes(t.hintOld)) { console.error(`${lang}: в подсказке формы нет ожидаемой фразы — сверить вручную`); process.exit(1); }
+  d.products.new.extraSecrets.hint = h.replace(t.hintOld, t.hintNew);
+  fs.writeFileSync(f, JSON.stringify(d, null, 2) + '\n');
+}
+console.log('ok');
+EOF
+git -C /Users/dmitry/Downloads/spirits_front/.worktrees/product-lifecycle-2 diff --stat
+```
+Expected: `ok`; в `diff --stat` — ровно 7 файлов локалей, по 15–20 строк в каждом. Иное (сотни строк) — файл был не каноническим: `git checkout -- src/i18n/locales` и написать в отчёт.
+
+- [ ] **Step 2: Проверки локалей**
+
+Run (нода, фронт): `pnpm check-locales && pnpm check-keys && pnpm check-hardcoded` (после `git checkout --detach $SHA`). Expected: зелёные (`check-locale-format` красный на `main` и без нас — заметка «i18n-скрипты фронта»; сравнить его вывод с выводом на `origin/main`, новых строк быть не должно).
+
+- [ ] **Step 3: Коммит**
+
+```bash
+git -C $F add src/i18n/locales && git -C $F commit -q -m "i18n(products): тексты карточки ключей; форма Студии — ключи можно сменить через ассистента (7 языков)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git -C $F push -q origin HEAD:refs/heads/feat/product-lifecycle-2
+```
+
+---
+
+### Task 20: Фронт — форма ключей в карточке, Вебвизор, мини-приложение
+
+**Files (фронт):**
+- Modify: `src/components/products/ProductActionCard.tsx`
+- Modify: `src/components/products/ProductActionCard.test.tsx` (тест «виды действия без формы» ~300–314 и новый `describe`)
+- Modify: `src/components/webvisorPrivacy.test.ts` (~262–265)
+- Modify: `src/i18n/locales/*.json` (удалить `products.action.keys.unsupported`)
+- Create: `src/tma/App.test.tsx`
+
+- [ ] **Step 1: Тесты**
+
+`src/components/products/ProductActionCard.test.tsx`:
+1. В тесте «виды действия без формы — свой текст на «готово» и на «ожидание»» удалить третью часть (карточку `c` с `keys.unsupported`, четыре строки).
+2. В конец файла:
+
+```tsx
+describe('карточка ключей', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useRealTimers();
+  });
+  const keysView = (over: Partial<ProductActionView> = {}) =>
+    view({ kind: 'keys', productKind: 'site', productName: 'Сайт', keyNames: ['API_KEY', 'OLD_KEY'], ...over });
+  const buttonsByText = (c: HTMLElement, text: string) => [...c.querySelectorAll('button')].filter((b) => b.textContent === text);
+
+  it('имена ключей видны, значений нет; замена, удаление и новый ключ уходят в set и remove', async () => {
+    api.get.mockResolvedValue(keysView());
+    api.submit.mockResolvedValue(keysView({ status: 'working' }));
+    const { container } = mount(<ProductActionCard actionId="a1" via="chat" />);
+    await flush();
+    expect(visibleText(container)).toContain(tRu('products.action.keys.title', { name: 'Сайт' }));
+    expect(visibleText(container)).toContain('API_KEY');
+    const replaces = container.querySelectorAll('[data-testid="product-action-key-replace"]');
+    expect(replaces).toHaveLength(2);
+    expect((replaces[0] as HTMLInputElement).value).toBe('');
+    type(replaces[0], 'новое-значение');
+    click(buttonsByText(container, tRu('products.action.keys.remove'))[1]);
+    expect(visibleText(container)).toContain(tRu('products.action.keys.willRemove'));
+    await clickAsync(byButton(container, new RegExp(tRu('products.action.createBot.addKey')))!);
+    type(container.querySelector('input[placeholder="API_KEY"]')!, 'NEW_KEY');
+    type(container.querySelector('[data-testid="product-action-secret-value"]')!, 'n');
+    await clickAsync(byButton(container, new RegExp(tRu('products.action.keys.submit')))!);
+    expect(api.submit).toHaveBeenCalledWith('a1', { set: { API_KEY: 'новое-значение', NEW_KEY: 'n' }, remove: ['OLD_KEY'], via: 'chat' });
+  });
+
+  it('ничего не изменено — отказ на месте, на сервер не уходит', async () => {
+    api.get.mockResolvedValue(keysView());
+    const { container } = mount(<ProductActionCard actionId="a1" via="chat" />);
+    await flush();
+    await clickAsync(byButton(container, new RegExp(tRu('products.action.keys.submit')))!);
+    expect(api.submit).not.toHaveBeenCalled();
+    expect(visibleText(container)).toContain(tRu('products.action.keys.nothing'));
+  });
+
+  it('у бота токен убрать нельзя — кнопки «Убрать» у BOT_TOKEN нет', async () => {
+    api.get.mockResolvedValue(keysView({ productKind: 'bot', keyNames: ['BOT_TOKEN', 'API_KEY'] }));
+    const { container } = mount(<ProductActionCard actionId="a1" via="tma" />);
+    await flush();
+    expect(buttonsByText(container, tRu('products.action.keys.remove'))).toHaveLength(1);
+  });
+
+  it('новый ключ с именем существующего — ошибка строки, на сервер не уходит', async () => {
+    api.get.mockResolvedValue(keysView());
+    const { container } = mount(<ProductActionCard actionId="a1" via="chat" />);
+    await flush();
+    await clickAsync(byButton(container, new RegExp(tRu('products.action.createBot.addKey')))!);
+    type(container.querySelector('input[placeholder="API_KEY"]')!, 'API_KEY');
+    type(container.querySelector('[data-testid="product-action-secret-value"]')!, 'x');
+    await clickAsync(byButton(container, new RegExp(tRu('products.action.keys.submit')))!);
+    expect(api.submit).not.toHaveBeenCalled();
+    expect(visibleText(container)).toContain(tRu('products.action.keys.duplicate'));
+  });
+
+  it('готово и «в работе» — свои тексты ключей', async () => {
+    api.get.mockResolvedValueOnce(keysView({ status: 'done' }));
+    const a = mount(<ProductActionCard actionId="a1" via="chat" />);
+    await flush();
+    expect(visibleText(a.container)).toContain(tRu('products.action.keys.done', { name: 'Сайт' }));
+    api.get.mockResolvedValueOnce(keysView({ status: 'working' }));
+    const b = mount(<ProductActionCard actionId="a2" via="chat" />);
+    await flush();
+    expect(visibleText(b.container)).toContain(tRu('products.action.keys.working'));
+  });
+
+  it('«в работе» у ключей опрашивается дольше минуты: пересоздание контейнера бывает небыстрым', async () => {
+    vi.useFakeTimers();
+    api.get.mockResolvedValue(keysView({ status: 'working' }));
+    const { container } = mount(<ProductActionCard actionId="a1" via="chat" />);
+    await flush();
+    await actAsync(async () => { await vi.advanceTimersByTimeAsync(3000 * 25); });
+    expect(api.get.mock.calls.length).toBeGreaterThan(21);
+    expect(byButton(container, new RegExp(tRu('products.action.checkAgain')))).toBeNull();
+  });
+});
+```
+(Импорт `click` из `../../test/dom` в шапке файла уже есть.)
+
+`src/components/webvisorPrivacy.test.ts`, в тесте «токен бота и значения ключей — ym-disable-keys»:
+
+```ts
+    expect(classesOf(ProductActionCardSrc, 'product-action-key-replace', 'input')).toContain('ym-disable-keys');
+```
+
+`src/tma/App.test.tsx`:
+
+```tsx
+// @vitest-environment jsdom
+import React from 'react';
+import { describe, it, expect, vi } from 'vitest';
+import { mount, flush, visibleText, tRu } from '../test/dom';
+
+vi.mock('react-i18next', async () => {
+  const { tRu: t } = await import('../test/dom');
+  return { useTranslation: () => ({ t, i18n: { language: 'ru' } }) };
+});
+vi.mock('../services/productActionsApi', () => ({
+  productActionsApi: {
+    get: vi.fn(async () => ({
+      id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', kind: 'keys', status: 'pending', productId: 'p1', productName: 'Бот',
+      productKind: 'bot', keyNames: ['BOT_TOKEN'], expiresAt: null, restoreUntil: null, result: null,
+    })),
+    submit: vi.fn(),
+    cancel: vi.fn(),
+  },
+  isProblem: (x: any) => x?.ok === false,
+}));
+// Вкладки мини-приложения при ?pa= не рисуются — подменяем, чтобы их модули
+// не тянули в тест свои запросы и хранилища.
+vi.mock('./screens/DayScreen', () => ({ DayScreen: () => null }));
+vi.mock('./screens/AssistantsScreen', () => ({ AssistantsScreen: () => null }));
+vi.mock('./screens/SearchScreen', () => ({ SearchScreen: () => null }));
+vi.mock('./screens/WalletScreen', () => ({ WalletScreen: () => null }));
+vi.mock('./screens/ProfileScreen', () => ({ ProfileScreen: () => null }));
+vi.mock('./telegram', () => ({ closeApp: vi.fn() }));
+
+import { App } from './App';
+
+describe('мини-приложение: карточка ключей по кнопке из Telegram', () => {
+  it('?pa=<id> открывает карточку ключей вместо вкладок', async () => {
+    window.history.replaceState({}, '', '/tma/?pa=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee');
+    const { container } = mount(<App />);
+    await flush();
+    expect(visibleText(container)).toContain(tRu('products.action.keys.title', { name: 'Бот' }));
+    expect(container.querySelector('[data-testid="product-action-key-replace"]')).not.toBeNull();
+  });
+});
+```
+
+- [ ] **Step 2: Коммит, прогон — FAIL**
+
+```bash
+git -C $F add src/components/products/ProductActionCard.test.tsx src/components/webvisorPrivacy.test.ts src/tma/App.test.tsx && git -C $F commit -q -m "test(products): форма ключей в карточке, Вебвизор, мини-приложение (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, фронт): `src/components/products/ProductActionCard.test.tsx src/components/webvisorPrivacy.test.ts src/tma/App.test.tsx`.
+
+- [ ] **Step 3: Реализация** — `src/components/products/ProductActionCard.tsx`
+
+1. Под `WORKING_POLL_MAX_ATTEMPTS`:
+
+```tsx
+/**
+ * Смена ключей пересоздаёт контейнер и ждёт его /health — до пары минут, а
+ * не секунды, как удаление: минута опроса обрывалась бы на живой смене.
+ */
+const WORKING_POLL_MAX_ATTEMPTS_KEYS = 60;
+```
+2. Состояние рядом с `rows`/`rowErrors`:
+
+```tsx
+  // Ключи: новые значения существующих (пустое — «оставить как есть») и
+  // помеченные к удалению. Значения живут только здесь и в теле отправки.
+  const [replace, setReplace] = useState<Record<string, string>>({});
+  const [removed, setRemoved] = useState<string[]>([]);
+```
+3. В эффекте смены `actionId` после `setRowErrors([]);` — `setReplace({}); setRemoved([]);`. В `apply` в ветке `if (r.status !== 'pending') {` после `setRows([]);` — `setReplace({}); setRemoved([]);`.
+4. В эффекте опроса: перед `const timer = setInterval(` — `const maxAttempts = view?.kind === 'keys' ? WORKING_POLL_MAX_ATTEMPTS_KEYS : WORKING_POLL_MAX_ATTEMPTS;`, сравнение `attempts >= WORKING_POLL_MAX_ATTEMPTS` → `attempts >= maxAttempts`, в зависимости эффекта добавить `view?.kind`.
+5. После `submitBot`:
+
+```tsx
+  const toggleRemove = (n: string) =>
+    setRemoved((rs) => (rs.includes(n) ? rs.filter((x) => x !== n) : [...rs, n]));
+
+  const submitKeys = () => {
+    if (!view) return;
+    const existing = new Set(view.keyNames);
+    // Проверка новых строк — та же, что у формы бота; плюс повтор имени,
+    // которое уже есть выше: его меняют полем замены, а не новой строкой.
+    const errs = validateExtraSecrets(rows).map((e, i) =>
+      !e.name && existing.has(rows[i].name.trim()) ? { ...e, name: 'products.action.keys.duplicate' } : e,
+    );
+    setRowErrors(errs);
+    if (errs.some((e) => e.name || e.value)) return;
+    // Object.fromEntries, а не присваивание: см. extraSecretsPayload.
+    const set = Object.fromEntries([
+      ...view.keyNames
+        .filter((n) => !removed.includes(n))
+        .map((n) => [n, (replace[n] ?? '').trim()] as const)
+        .filter(([, v]) => v !== ''),
+      ...Object.entries(extraSecretsPayload(rows)),
+    ]);
+    const remove = view.keyNames.filter((n) => removed.includes(n));
+    if (!Object.keys(set).length && !remove.length) {
+      setError(t('products.action.keys.nothing'));
+      return;
+    }
+    void run(() => productActionsApi.submit(actionId, { set, remove, via }));
+  };
+```
+6. Блок новых строк вынести во вспомогательную функцию над `let body` (форма бота и форма ключей рисуют одно и то же):
+
+```tsx
+  const extraRows = (titleId: string, title: string) => (
+    <div role="group" aria-labelledby={titleId} className="space-y-2">
+      <p id={titleId} className="text-xs font-medium">{title}</p>
+      {/* строки — дословно прежний map(rows) из формы бота */}
+    </div>
+  );
+```
+Внутрь — без изменений прежний `{rows.map((row, i) => (…))}` и кнопка «Добавить ключ» из формы бота; в форме бота прежний `<div role="group" aria-labelledby="product-action-extra-title" …>…</div>` заменить на `{extraRows('product-action-extra-title', t('products.action.createBot.extraTitle'))}`.
+7. В ветке `view.status === 'working'` первую строку `<p>{t('products.action.working')}</p>` заменить на `<p>{view.kind === 'keys' ? t('products.action.keys.working') : t('products.action.working')}</p>`.
+8. В ветке `view.status === 'done'` перед последней альтернативой (`doneGeneric`) добавить `view.kind === 'keys' ? (<p>{t('products.action.keys.done', { name })}</p>) :`.
+9. Ветку `} else if (view.kind === 'keys') { body = <p>{t('products.action.keys.unsupported')}</p>; }` заменить на:
+
+```tsx
+  } else if (view.kind === 'keys') {
+    // BOT_TOKEN бота убрать нельзя — только заменить (сервер отбьёт тоже).
+    const canRemove = (n: string) => !(view.productKind === 'bot' && n === 'BOT_TOKEN');
+    body = (
+      <>
+        <p className="font-medium">{t('products.action.keys.title', { name })}</p>
+        <p className="text-xs text-gray-600">{t('products.action.keys.hint')}</p>
+        <div role="group" aria-labelledby="product-action-keys-current" className="space-y-2">
+          <p id="product-action-keys-current" className="text-xs font-medium">{t('products.action.keys.current')}</p>
+          {view.keyNames.length === 0 && <p className="text-xs text-gray-500">{t('products.action.keys.none')}</p>}
+          {view.keyNames.map((n) => (
+            <div key={n} className="flex gap-2 items-center">
+              <span className="w-2/5 font-mono text-xs break-all">{n}</span>
+              {removed.includes(n) ? (
+                <span className="flex-1 text-xs text-gray-500">{t('products.action.keys.willRemove')}</span>
+              ) : (
+                <input data-testid="product-action-key-replace" type="password" autoComplete="off" spellCheck={false}
+                  aria-label={t('products.action.keys.newValue', { name: n })} placeholder={t('products.action.keys.keepPlaceholder')}
+                  value={replace[n] ?? ''} disabled={busy}
+                  onChange={(e) => setReplace((r) => ({ ...r, [n]: e.target.value }))}
+                  className="ym-disable-keys flex-1 rounded-lg border border-gray-300 px-2 py-1.5 text-xs" />
+              )}
+              {canRemove(n) && (
+                <button type="button" disabled={busy} onClick={() => toggleRemove(n)} className="text-xs text-gray-500">
+                  {removed.includes(n) ? t('products.action.keys.undoRemove') : t('products.action.keys.remove')}
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+        {extraRows('product-action-keys-add', t('products.action.keys.addTitle'))}
+        <div className="flex gap-2">
+          <button type="button" disabled={busy} onClick={submitKeys}
+            className="px-4 py-1.5 rounded-lg bg-forest-600 text-white text-xs font-medium disabled:opacity-50">
+            {busy ? t('products.action.keys.submitting') : t('products.action.keys.submit')}
+          </button>
+          <button type="button" disabled={busy} onClick={() => void run(() => productActionsApi.cancel(actionId))}
+            className="px-4 py-1.5 rounded-lg border border-gray-300 text-xs">
+            {t('products.action.cancel')}
+          </button>
+        </div>
+      </>
+    );
+```
+10. Шапку компонента дополнить: «Смена ключей: имена текущих ключей — с сервера, значения не приходят никогда; поле замены пустое, пустое при отправке — ключ остаётся прежним. Поля значений — `ym-disable-keys` (сторож — webvisorPrivacy.test.ts)».
+
+`products.action.keys.unsupported` больше не читается — удалить из всех семи локалей:
+
+```bash
+cd /Users/dmitry/Downloads/spirits_front/.worktrees/product-lifecycle-2 && node -e "
+const fs=require('fs');
+for (const l of ['ru','en','de','fr','es','pt','zh']) {
+  const f='src/i18n/locales/'+l+'.json'; const d=JSON.parse(fs.readFileSync(f,'utf8'));
+  delete d.products.action.keys.unsupported; fs.writeFileSync(f, JSON.stringify(d,null,2)+'\n');
+}
+console.log('ok')"
+```
+
+- [ ] **Step 4: Коммит, прогон — PASS**
+
+```bash
+git -C $F add src && git -C $F commit -q -m "products: форма ключей в карточке — имена, замена, удаление, добавление; мини-приложение" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+Run (нода, фронт): `src/components/products src/components/chat src/tma src/components/webvisorPrivacy.test.ts src/services`, затем `pnpm check-locales && pnpm check-keys && pnpm check-hardcoded` и tsc фронта (не выше базовой линии). Expected: PASS.
+
+---
