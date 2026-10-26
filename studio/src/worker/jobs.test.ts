@@ -14,8 +14,9 @@ const ID = '6f1c2a9e-0d4b-4c3e-9a51-3b2f7c8d9e10';
 const scene: Scene = { kind: 'chat', assistantId: 10, assistantName: 'Алексей', question: 'Вопрос', followups: [] };
 const script = { hook: 'h', voice: 'madirus', lines: [], final: { assistantsCount: 18 } } as unknown as Script;
 
-function fakeQueue(jobs: Partial<Record<'capture' | 'render', Job>>) {
-  const calls: Record<string, unknown[]> = { capture: [], render: [], fail: [], claim: [] };
+/** written — что вернут записи итога; failOutcome — исход сбоя. jobs — задания, с которыми звали очередь. */
+function fakeQueue(jobs: Partial<Record<'capture' | 'render', Job>>, opts: { written?: boolean; failOutcome?: FailOutcome } = {}) {
+  const calls: Record<string, unknown[]> = { capture: [], render: [], fail: [], claim: [], jobs: [] };
   const queue: Queue = {
     async claim(kind) {
       calls.claim.push(kind);
@@ -23,17 +24,20 @@ function fakeQueue(jobs: Partial<Record<'capture' | 'render', Job>>) {
       delete jobs[kind];
       return job;
     },
-    async completeCapture(id, capture) {
-      calls.capture.push([id, capture]);
-      return true;
+    async completeCapture(j, capture) {
+      calls.capture.push([j.id, capture]);
+      calls.jobs.push(j);
+      return opts.written ?? true;
     },
-    async completeRender(id, out) {
-      calls.render.push([id, out]);
-      return true;
+    async completeRender(j, out) {
+      calls.render.push([j.id, out]);
+      calls.jobs.push(j);
+      return opts.written ?? true;
     },
-    async fail(job, err): Promise<FailOutcome> {
-      calls.fail.push([job.id, err]);
-      return 'retry';
+    async fail(j, err): Promise<FailOutcome> {
+      calls.fail.push([j.id, err]);
+      calls.jobs.push(j);
+      return opts.failOutcome ?? 'retry';
     },
     async minAnswerChars() {
       return 500;
@@ -150,6 +154,59 @@ test('незнакомая ошибка — unknown с повтором; зад�
   const b = fakeQueue({ capture: job('capture', { scene: null }) });
   await runOne(deps({ queue: b.queue, storage: fakeStorage().storage }));
   assert.deepEqual([(b.calls.fail[0] as [string, StudioError])[1].code, (b.calls.fail[0] as [string, StudioError])[1].retryable], ['no_input', false]);
+});
+
+const GONE = 'задание забрал другой процесс — итог не записан';
+
+test('итог и сбой — по захвату: очередь получает само задание с номером попытки', async () => {
+  const capture = { scene, questionShotKey: 'q', answerShotKey: 'a' } as unknown as StoredCapture;
+  const claimed = job('render', { attempts: 2, capture, script });
+  const { queue, calls } = fakeQueue({ render: claimed });
+  await runOne(deps({
+    queue,
+    storage: fakeStorage().storage,
+    render: async (runDir) => {
+      fs.writeFileSync(path.join(runDir, 'video.mp4'), 'видео');
+      fs.writeFileSync(path.join(runDir, 'cover.jpg'), 'обложка');
+      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 40 };
+    },
+  }));
+  assert.equal(calls.jobs[0], claimed);
+
+  const claimedCapture = job('capture', { attempts: 3 });
+  const b = fakeQueue({ capture: claimedCapture });
+  await runOne(deps({ queue: b.queue, storage: fakeStorage().storage, capture: async () => { throw new Error('ECONNRESET'); } }));
+  assert.equal(b.calls.jobs[0], claimedCapture);
+});
+
+test('задание забрал другой процесс: сбой — gone, итог — false; без исключения, строка в лог', async () => {
+  const failLog: string[] = [];
+  const a = fakeQueue({ capture: job('capture') }, { failOutcome: 'gone' });
+  const did = await runOne(deps({
+    queue: a.queue,
+    storage: fakeStorage().storage,
+    log: (line) => failLog.push(line),
+    capture: async () => { throw new Error('ECONNRESET'); },
+  }));
+  assert.equal(did, true);
+  assert.ok(failLog.some((line) => line.includes(`capture ${ID}`) && line.includes(GONE)), failLog.join('\n'));
+
+  const doneLog: string[] = [];
+  const capture = { scene, questionShotKey: 'q', answerShotKey: 'a' } as unknown as StoredCapture;
+  const b = fakeQueue({ render: job('render', { capture, script }) }, { written: false });
+  await runOne(deps({
+    queue: b.queue,
+    storage: fakeStorage().storage,
+    log: (line) => doneLog.push(line),
+    render: async (runDir) => {
+      fs.writeFileSync(path.join(runDir, 'video.mp4'), 'видео');
+      fs.writeFileSync(path.join(runDir, 'cover.jpg'), 'обложка');
+      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 40 };
+    },
+  }));
+  assert.equal(b.calls.fail.length, 0, 'неудавшаяся запись итога — не сбой задания');
+  assert.ok(doneLog.some((line) => line.includes(`render ${ID}`) && line.includes(GONE)), doneLog.join('\n'));
+  assert.equal(doneLog.some((line) => line.includes('готово')), false, doneLog.join('\n'));
 });
 
 test('нет заданий — false', async () => {

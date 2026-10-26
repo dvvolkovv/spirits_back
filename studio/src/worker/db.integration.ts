@@ -16,7 +16,9 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { StudioError } from '../errors';
-import { claimJob, completeCapture, completeRender, failJob, minAnswerChars, type StoredCapture } from './db';
+import {
+  LEASE_MINUTES, MAX_JOB_ATTEMPTS, claimJob, completeCapture, completeRender, failJob, minAnswerChars, type StoredCapture,
+} from './db';
 
 const DB_URL = process.env.STUDIO_PG_URL;
 const MIGRATION = fileURLToPath(new URL('../../../src/shorts/migrations/001_shorts.sql', import.meta.url));
@@ -77,21 +79,84 @@ describe('очередь студии против живого Postgres', { ski
     assert.deepEqual([again?.id, again?.attempts], [id, 2]);
   });
 
+  it('брошенное задание на последней попытке не забирается; аренда ещё идёт — не трогается', async () => {
+    const past = new Date(Date.now() - 60_000);
+    const swept = await insert('rendering', { attempts: MAX_JOB_ATTEMPTS, lease_until: past });
+    const live = await insert('rendering', { attempts: MAX_JOB_ATTEMPTS, lease_until: new Date(Date.now() + 600_000) });
+    const abandoned = await insert('rendering', { attempts: MAX_JOB_ATTEMPTS - 1, lease_until: past });
+    const job = await claimJob(pool, 'render');
+    assert.deepEqual([job?.id, job?.attempts], [abandoned, MAX_JOB_ATTEMPTS]);
+    assert.equal((await row(swept)).status, 'failed');
+    assert.deepEqual([(await row(live)).status, (await row(live)).attempts], ['rendering', MAX_JOB_ATTEMPTS]);
+    assert.equal(await claimJob(pool, 'render'), null);
+  });
+
+  it('последняя попытка с истёкшей арендой — при следующем захвате failed, владельцу напишет API', async () => {
+    const past = new Date(Date.now() - 60_000);
+    const render = await insert('rendering', { attempts: MAX_JOB_ATTEMPTS, lease_until: past, failure_notified: true });
+    const capture = await insert('capturing', { attempts: MAX_JOB_ATTEMPTS, lease_until: null, failure_notified: true });
+
+    assert.equal(await claimJob(pool, 'render'), null);
+    const r = await row(render);
+    assert.deepEqual(
+      [r.status, r.failed_from, r.failure_notified, r.lease_until, r.last_error],
+      ['failed', 'rendering', false, null, `сборка: задание не завершилось за ${LEASE_MINUTES} мин — рабочий процесс студии упал или завис`],
+    );
+    assert.equal((await row(capture)).status, 'capturing', 'захват сборки чужую очередь не трогает');
+
+    assert.equal(await claimJob(pool, 'capture'), null);
+    const c = await row(capture);
+    assert.deepEqual(
+      [c.status, c.failed_from, c.failure_notified, c.last_error],
+      ['failed', 'capturing', false, `съёмка: задание не завершилось за ${LEASE_MINUTES} мин — рабочий процесс студии упал или завис`],
+    );
+  });
+
   it('съёмка готова — writing и съёмка в базе', async () => {
     const id = await insert('capture_queued');
-    await claimJob(pool, 'capture');
+    const job = await claimJob(pool, 'capture');
     const capture = { scene, questionShotKey: 'shorts/x/capture-1/question.png', answerShotKey: 'shorts/x/capture-1/answer.png', paragraphs: [{ n: 1, text: 'a' }] } as unknown as StoredCapture;
-    assert.equal(await completeCapture(pool, id, capture), true);
+    assert.equal(await completeCapture(pool, job!, capture), true);
     const r = await row(id);
     assert.deepEqual([r.status, r.attempts, r.lease_until, r.capture.answerShotKey], ['writing', 0, null, 'shorts/x/capture-1/answer.png']);
   });
 
   it('сборка готова — pending_review без сообщения владельцу, с файлами', async () => {
     const id = await insert('render_queued', { review_message_id: 55 });
-    await claimJob(pool, 'render');
-    assert.equal(await completeRender(pool, id, { videoKey: 'shorts/x/video.mp4', coverKey: 'shorts/x/cover.jpg', durationMs: 44000 }), true);
+    const job = await claimJob(pool, 'render');
+    assert.equal(await completeRender(pool, job!, { videoKey: 'shorts/x/video.mp4', coverKey: 'shorts/x/cover.jpg', durationMs: 44000 }), true);
     const r = await row(id);
     assert.deepEqual([r.status, r.video_key, r.duration_ms, r.review_message_id], ['pending_review', 'shorts/x/video.mp4', 44000, null]);
+  });
+
+  it('опоздавшая сборка: аренда истекла, задание забрал другой процесс — ни сбой, ни итог не пишутся', async () => {
+    const id = await insert('render_queued');
+    const late = await claimJob(pool, 'render');
+    await pool.query(`UPDATE short_video SET lease_until = now() - interval '1 second' WHERE id = $1`, [id]);
+    const current = await claimJob(pool, 'render');
+    assert.deepEqual([late?.attempts, current?.attempts], [1, 2]);
+    const before = await row(id);
+
+    assert.equal(await failJob(pool, late!, new StudioError('tts', 'SpeechKit не ответил', true)), 'gone');
+    assert.equal(await failJob(pool, late!, new StudioError('no_input', 'нет сценария', false)), 'gone');
+    assert.equal(await failJob(pool, { ...late!, writerRounds: 1 }, new StudioError('too_long', 'длинно', false)), 'gone');
+    assert.equal(await failJob(pool, { ...late!, writerRounds: 3 }, new StudioError('too_long', 'длинно', false)), 'gone');
+    assert.equal(await completeRender(pool, late!, { videoKey: 'v', coverKey: 'c', durationMs: 1 }), false);
+    assert.deepEqual(await row(id), before);
+
+    assert.equal(await completeRender(pool, current!, { videoKey: 'shorts/x/video.mp4', coverKey: 'shorts/x/cover.jpg', durationMs: 44000 }), true);
+    assert.equal((await row(id)).status, 'pending_review');
+  });
+
+  it('опоздавшая съёмка — false, захват нового процесса цел', async () => {
+    const id = await insert('capture_queued');
+    const late = await claimJob(pool, 'capture');
+    await pool.query(`UPDATE short_video SET lease_until = now() - interval '1 second' WHERE id = $1`, [id]);
+    await claimJob(pool, 'capture');
+    const before = await row(id);
+    const capture = { scene, questionShotKey: 'q', answerShotKey: 'a' } as unknown as StoredCapture;
+    assert.equal(await completeCapture(pool, late!, capture), false);
+    assert.deepEqual(await row(id), before);
   });
 
   it('сбой с повтором — пауза в очереди; без повтора — failed с этапом', async () => {
@@ -110,16 +175,39 @@ describe('очередь студии против живого Postgres', { ski
     assert.deepEqual([f.status, f.failed_from, f.failure_notified], ['failed', 'capturing', false]);
   });
 
-  it('озвучка длиннее 60 с — сценарий назад сценаристу; после трёх кругов — failed', async () => {
-    const id = await insert('render_queued', { writer_rounds: 1 });
+  it('озвучка длиннее 60 с — сценарий назад сценаристу; после третьего круга — failed с этапа сценариста', async () => {
+    const id = await insert('render_queued', { writer_rounds: 2 });
     const job = await claimJob(pool, 'render');
     assert.equal(await failJob(pool, job!, new StudioError('too_long', 'timeline: ролик 63.2 с — длиннее 60 с', false)), 'writer');
     const r = await row(id);
-    assert.deepEqual([r.status, r.writer_feedback], ['writing', 'озвучка: timeline: ролик 63.2 с — длиннее 60 с']);
+    assert.deepEqual(
+      [r.status, r.writer_feedback, r.attempts, r.lease_until],
+      ['writing', 'озвучка: timeline: ролик 63.2 с — длиннее 60 с', 0, null],
+    );
 
-    await pool.query(`UPDATE short_video SET status = 'render_queued', writer_rounds = 3 WHERE id = $1`, [id]);
+    // Сценарист сдал третий вариант: writer_rounds + 1, отзыв студии стёрт (shorts-writer.service.ts).
+    await pool.query(`UPDATE short_video SET status = 'render_queued', writer_rounds = 3, writer_feedback = NULL WHERE id = $1`, [id]);
     const last = await claimJob(pool, 'render');
-    assert.equal(await failJob(pool, last!, new StudioError('too_long', 'снова длинно', false)), 'failed');
+    assert.equal(await failJob(pool, last!, new StudioError('too_long', 'timeline: ролик 61.0 с — длиннее 60 с', false)), 'failed');
+    const f = await row(id);
+    assert.deepEqual(
+      [f.status, f.failed_from, f.writer_feedback, f.failure_notified, f.lease_until, f.last_error],
+      ['failed', 'writing', 'озвучка: timeline: ролик 61.0 с — длиннее 60 с', false, null, 'сборка: timeline: ролик 61.0 с — длиннее 60 с'],
+    );
+  });
+
+  it('last_error: у незнакомой ошибки — только первая строка; предел 1000 — по символам', async () => {
+    const id = await insert('capture_queued');
+    const job = await claimJob(pool, 'capture');
+    const unknown = new StudioError('unknown', 'page.goto: net::ERR_CONNECTION_RESET\nCall log:\n  - navigating to "https://test.example/chat"', true);
+    assert.equal(await failJob(pool, job!, unknown), 'retry');
+    assert.equal((await row(id)).last_error, 'съёмка: page.goto: net::ERR_CONNECTION_RESET');
+
+    await pool.query(`UPDATE short_video SET lease_until = NULL WHERE id = $1`, [id]);
+    const second = await claimJob(pool, 'capture');
+    assert.equal(await failJob(pool, second!, new StudioError('answer_rejected', `x${'😀'.repeat(1200)}`, true)), 'retry');
+    // 9 символов «съёмка: x» и 991 эмодзи; .slice по UTF-16 оставил бы 495 эмодзи и половину суррогатной пары.
+    assert.equal((await row(id)).last_error, `съёмка: x${'😀'.repeat(991)}`);
   });
 
   it('порог длины ответа — из настроек', async () => {
