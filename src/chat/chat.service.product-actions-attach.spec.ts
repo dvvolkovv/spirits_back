@@ -108,7 +108,7 @@ function makeHarness(opts: HarnessOpts) {
     for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
   };
 
-  return { written, pgCalls, run, post, takeForTurn };
+  return { written, pgCalls, run, post, takeForTurn, svc };
 }
 
 const items = (written: any[]) => written.filter((w) => w.type === 'item').map((w) => w.content as string);
@@ -261,5 +261,79 @@ describe('streamUniversalAgent — карточка продукта переж�
     const end = endOf(h.written)!;
     expect(end.content).toBe('Ошибка запуска агента. Попробуйте ещё раз.');
     expect(end.content).not.toContain('```product-action');
+  });
+});
+
+/**
+ * M4: апстрим падает НЕ до хвоста (как в блоке выше), а ПОСЛЕ того, как
+ * обычный путь уже дописал серверный хвост в chunks и отправил его в поток
+ * (см. комментарий у attachedProductActionTail в chat.service.ts). До
+ * исправления общая чистка ```product-action``` блоков в catch стирала этот
+ * уже прикреплённый хвост наравне с модельным мусором, а takeForTurn второй
+ * раз находил пустую выборку (attached_at уже выставлен) — карточка
+ * пропадала из истории молча.
+ */
+describe('streamUniversalAgent — карточка продукта переживает обрыв ПОСЛЕ своего же прикрепления (M4)', () => {
+  const realSetTimeout = global.setTimeout;
+  const OLD_SECRET = process.env.JWT_SECRET;
+  beforeAll(() => {
+    process.env.JWT_SECRET = 'test-secret-for-product-tool';
+    (global as any).setTimeout = (fn: any, ms?: number, ...a: any[]) => {
+      const t: any = (realSetTimeout as any)(fn, ms, ...a);
+      if (t && typeof t.unref === 'function') t.unref();
+      return t;
+    };
+  });
+  afterAll(() => {
+    (global as any).setTimeout = realSetTimeout;
+    process.env.JWT_SECRET = OLD_SECRET;
+  });
+  beforeEach(() => jest.clearAllMocks());
+
+  it('падение в подсчёте стоимости ПОСЛЕ прикрепления хвоста — в истории ровно один серверный блок', async () => {
+    // Лента доходит до чистого конца (afterEvents по умолчанию 'end') —
+    // обычный путь успевает дописать хвост в chunks и отправить его
+    // safeWrite'ом. computeSdkCharge бросает РОВНО один раз — первый вызов,
+    // сразу после прикрепления хвоста (chat.service.ts, ~:2247); второй
+    // вызов — уже внутри persistResponse — отрабатывает настоящей
+    // реализацией, иначе ход не сохранился бы вовсе.
+    const h = makeHarness({ deltas: ['Завожу бота.'], takenActions: [{ id: ACTION_ID }] });
+    jest.spyOn(h.svc as any, 'computeSdkCharge').mockImplementationOnce(() => {
+      throw new Error('подсчёт стоимости упал');
+    });
+
+    await h.run(CARDS_UI);
+
+    // Хвост уехал клиенту ОДИН раз — обычным путём, до падения; catch его не
+    // дописывает повторно (safeWrite там для этого случая не зовётся).
+    expect(items(h.written).filter((c) => c.includes(SERVER_BLOCK))).toHaveLength(1);
+    // И в истории ровно один серверный блок, а не ноль (стёрт общей чисткой)
+    // и не два (дописан catch'ем поверх уже прикреплённого).
+    const saved = persistedAiText(h.pgCalls);
+    expect(saved).toContain(SERVER_BLOCK);
+    expect((String(saved).match(/```product-action/g) ?? []).length).toBe(1);
+    // takeForTurn в catch не зовётся повторно: карточка уже забрана обычным
+    // путём, второй вызов был бы напрасным походом в базу.
+    expect(h.takeForTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it('модельный мусор ДО хвоста вырезается, а сам хвост после падения остаётся целым', async () => {
+    // Комбинация двух сценариев: модель дописала свой блок (вырезается
+    // обычной чисткой ДО прикрепления хвоста — см. соседний describe выше),
+    // а падение случилось уже ПОСЛЕ того, как сервер успел прикрепить свой.
+    const h = makeHarness({
+      deltas: ['Завожу бота.\n\n```product-action\n{"id":"', FAKE_ID, '"}\n```'],
+      takenActions: [{ id: ACTION_ID }],
+    });
+    jest.spyOn(h.svc as any, 'computeSdkCharge').mockImplementationOnce(() => {
+      throw new Error('подсчёт стоимости упал');
+    });
+
+    await h.run(CARDS_UI);
+
+    const saved = persistedAiText(h.pgCalls);
+    expect(saved).toContain(SERVER_BLOCK);
+    expect(saved).not.toContain(FAKE_ID);
+    expect((String(saved).match(/```product-action/g) ?? []).length).toBe(1);
   });
 });

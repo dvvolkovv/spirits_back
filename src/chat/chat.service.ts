@@ -1642,6 +1642,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
     const streamStartTime = Date.now();
     const chunks: string[] = []; // hoisted so catch block can access partial response
+    // M4: хвост карточки продукта, который успел дописать обычный путь (см.
+    // «Карточки продуктов, заведённые этим ходом» ниже), ДО того, как апстрим
+    // упал уже после него. Без этой памятки catch-ветка чистит ОБЪЕДИНЁННЫЙ
+    // текст от всех ```product-action``` блоков сразу — включая уже
+    // прикреплённый серверный хвост, не только модельный мусор, — а повторный
+    // takeForTurn() находит пустую выборку (attached_at уже выставлен
+    // обычным путём) и новый хвост не допишет. Карточка пропадает из истории
+    // молча. Хранит именно УЖЕ ДОПИСАННЫЙ текст хвоста, а не факт «дописан» —
+    // catch-ветка дописывает его назад, а не вызывает productActionTail
+    // второй раз.
+    let attachedProductActionTail = '';
 
     // Файлы хода из done.outputFiles. Обработчик done синхронный, а файлы
     // сначала надо скопировать в наше хранилище (chat-files), поэтому ссылки
@@ -2211,6 +2222,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
         if (tail) {
           chunks.push(tail);
           safeWrite({ type: 'item', content: tail });
+          // M4: запоминаем ровно то, что дописали, — если апстрим упадёт
+          // ПОСЛЕ этой точки (но до конца функции), catch-ветка не должна
+          // ни звать takeForTurn второй раз (вернёт [] — карточка уже
+          // забрана), ни стирать этот хвост общей чисткой product-action
+          // блоков.
+          attachedProductActionTail = tail;
         }
       } catch (e: any) {
         this.logger.warn(`product action attach failed: ${e.message}`);
@@ -2304,15 +2321,32 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // IS NULL во второй раз просто не находит строк и вернёт [] (см.
       // ProductActionsService.takeForTurn), так что задвоения нет ни здесь
       // само по себе, ни на стыке с успешной веткой.
+      //
+      // M4: НО если обычная ветка успела дописать свой хвост ДО падения
+      // (attachedProductActionTail не пуст), повторный takeForTurn вернул бы
+      // [] — карточка уже забрана, — и безусловная чистка ```product-action```
+      // блоков ниже стёрла бы именно этот, уже прикреплённый, хвост: он
+      // синтаксически такой же блок, как и модельный мусор, который чистка
+      // обязана снимать. Карточка пропадала бы из истории молча. Поэтому в
+      // этом случае чистим только то, что ДО хвоста, не трогая сам хвост и
+      // не вызывая takeForTurn/productActionTail второй раз, — а хвост в
+      // поток уже уехал обычной веткой, повторный safeWrite тут не нужен.
       try {
-        const joined = chunks.join('');
-        const cleaned = stripProductActionBlocks(joined);
-        if (cleaned !== joined) chunks.splice(0, chunks.length, cleaned);
-        const taken = (await this.productActions?.takeForTurn(userId, productsTurn, new Date(streamStartTime), 'web')) ?? [];
-        const tail = productActionTail(taken, ui.cards, userLanguage);
-        if (tail) {
-          chunks.push(tail);
-          safeWrite({ type: 'item', content: tail });
+        if (attachedProductActionTail) {
+          const last = chunks[chunks.length - 1];
+          if (last === attachedProductActionTail) chunks.pop();
+          const cleaned = stripProductActionBlocks(chunks.join(''));
+          chunks.splice(0, chunks.length, cleaned, attachedProductActionTail);
+        } else {
+          const joined = chunks.join('');
+          const cleaned = stripProductActionBlocks(joined);
+          if (cleaned !== joined) chunks.splice(0, chunks.length, cleaned);
+          const taken = (await this.productActions?.takeForTurn(userId, productsTurn, new Date(streamStartTime), 'web')) ?? [];
+          const tail = productActionTail(taken, ui.cards, userLanguage);
+          if (tail) {
+            chunks.push(tail);
+            safeWrite({ type: 'item', content: tail });
+          }
         }
       } catch (e: any) {
         this.logger.warn(`product action attach failed in catch: ${e.message}`);
