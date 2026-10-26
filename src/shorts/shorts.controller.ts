@@ -219,6 +219,10 @@ export class ShortsController {
    * сцене: тот считает только хвост «Сценарист: …» после последнего замечания
    * владельца (shorts-writer.service.ts).
    *
+   * С `from` ролик берёт и формат из настроек: после «модель Omni недоступна»
+   * владелец переключает формат на «Только чат» и повторяет с писателя — ролик
+   * собирается без сценок. Без `from` формат прежний: этап повторяется как был.
+   *
    * Повтор публикации — только у ролика, который владелец одобрял, сразу (слот —
    * «сейчас») и только по упавшим площадкам: вышедшие не трогаются. Запись — с
    * условием на `failed_from`: цель выбрана по прочитанной неудаче, и путь
@@ -235,6 +239,7 @@ export class ShortsController {
       throw new ConflictException(`повторять нечего: ролик в статусе ${v.status}${v.failedFrom ? `, упал на этапе ${v.failedFrom}` : ''}`);
     }
     const ownerNote = typeof note === 'string' && note.trim() ? appendOwnerNote(v.ownerNote, note) : null;
+    const format = from != null ? (await this.settings.get()).format : null;
     if (target === 'approved') {
       await this.pg.query(
         `UPDATE short_publication SET status = 'pending', attempts = 0, last_error = NULL, updated_at = now()
@@ -246,10 +251,11 @@ export class ShortsController {
       `UPDATE short_video
           SET status = $2, attempts = 0, lease_until = NULL, last_error = NULL, failed_from = NULL,
               failure_notified = false, writer_rounds = 0, owner_note = COALESCE($4::text, owner_note),
+              format = COALESCE($5::text, format),
               slot_at = CASE WHEN $2 = 'approved' THEN now() ELSE slot_at END, updated_at = now()
         WHERE id = $1 AND status = 'failed' AND failed_from = $3
         RETURNING *`,
-      [id, target, v.failedFrom, ownerNote],
+      [id, target, v.failedFrom, ownerNote, format],
     );
     if (!r.rows.length) throw new ConflictException('ролик успел уйти из failed — обновите список');
     return rowToShort(r.rows[0]);

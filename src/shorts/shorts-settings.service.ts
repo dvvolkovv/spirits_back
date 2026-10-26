@@ -117,11 +117,9 @@ export class ShortsSettingsService {
   constructor(private readonly pg: PgService) {}
 
   async get(): Promise<ShortSettings> {
-    const r = await this.pg.query(
-      `SELECT slot_days, slot_hour_msk, prepare_lead_hours, min_answer_chars,
-              tg_channel_chat_id, platforms, narrator_voice, format, max_omni_seconds
-         FROM short_settings WHERE id = 1`,
-    );
+    // Все колонки: сорвавшийся накат 002 не должен ронять публикацию и одобрение —
+    // без новых колонок их поля возьмутся по умолчанию.
+    const r = await this.pg.query(`SELECT * FROM short_settings WHERE id = 1`);
     const row = r.rows[0];
     if (!row) return { ...SETTINGS_DEFAULTS };
     return {
