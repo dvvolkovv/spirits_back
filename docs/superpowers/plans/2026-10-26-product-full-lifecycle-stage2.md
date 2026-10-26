@@ -153,7 +153,7 @@ tsc фронта: `npx tsc -p tsconfig.app.json --noEmit 2>&1 | grep -c 'error T
 | Файл | Что | Задача |
 |---|---|---|
 | `src/components/products/secretNames.ts`, `secretNames.test.ts` | третья копия занятых имён + `OWNER_TG_ID` | 18 |
-| `src/services/productActionsApi.ts` | `remove`, `productKind`, `result.keyNames` | 18 |
+| `src/services/productActionsApi.ts` | `remove`, `productKind`, `result.keyNames`; `result.field` | 18, 20a |
 | `src/components/products/ProductActionCard.tsx`, `ProductActionCard.test.tsx` | форма ключей, перевод причин отказа | 20a |
 | `src/components/webvisorPrivacy.test.ts` | сторож Вебвизора для новых полей | 20b |
 | `src/i18n/locales/*.json` | `products.action.keys.*` и `keys.errors.*`, подсказка формы Студии, 7 языков; удаление `keys.unsupported` | 19, 20b |
@@ -5651,6 +5651,14 @@ Expected: падений не больше базовой линии; число
 | 12 | `src/products/turns.service.ts`: убрать проверку `REKEY_REFUSAL` | `turns.enqueue.spec.ts` — «пока rekey в очереди или идёт…» |
 | 13 | `src/products/product-purge.service.ts`: в `backupPathFor` убрать сравнение `path.resolve(m[1]) === want` (вернуть `want`) | `product-purge.service.spec.ts`, `product-purge.pg.spec.ts` — чужая копия не тронута |
 | 14 | фронт `ProductActionCard.tsx`: у `product-action-key-replace` убрать `ym-disable-keys` | `webvisorPrivacy.test.ts` |
+| 15 | `provisioning.service.ts`: в `completeRekeyJob` вместо `unknown ? 'rekey_unknown' : 'rekey_failed'` — всегда `'rekey_failed'` | `provisioning.complete-rekey-purge.spec.ts` — «откат не удался — rekey_unknown…» |
+| 16 | `provisioning.service.ts`: в `completeRekeyJob` убрать ветку `if (result.ok)` при `closed = 0` | `provisioning.complete-rekey-purge.spec.ts` — «поздний успех после снятия задания…» |
+| 17 | `product-purge.service.ts`: в `wipeExpired` убрать `AND purge_after <= now()` | `product-purge.pg.spec.ts` — «после срока возврата ключи… стираются» (не тронут ранний) |
+| 18 | `product-purge.service.ts`: в обоих счётчиках потолка убрать `AND j.started_at IS NOT NULL` | `product-purge.pg.spec.ts` — «…снятые до выдачи провалом не считаются» |
+| 19 | `product-keys.service.ts`: в `fix` не класть `reason` в result | `product-keys.service.spec.ts` — таблица поправимых отказов |
+| 20 | `product-runner/src/host/rekey.ts`: в `rekeyEnv` убрать `if (ownerTgId !== undefined) replaced.add('OWNER_TG_ID');` | `rekey.spec.ts` — «OWNER_TG_ID пустой строкой… снимается» |
+| 21 | фронт `ProductActionCard.tsx`: `keysErrorText` всегда возвращает `raw` | `ProductActionCard.test.tsx` — «поправимый отказ — текстом причины…» |
+| 22 | `product-runner/src/host/rekey.ts`: в `HEALTH_INSIDE` убрать проверку `typeof sha==='string'&&sha.length>0` | — юнит-тест на симуляторе этого не видит (exec симулирован); проверка — живая, задача 23 шаг 3; в отчёт записать как известное ограничение |
 
 Итог — таблицей в отчёт: поломка → какой тест покраснел. Не покраснело ничего — дописать тест, который ловит, и прогнать заново.
 
@@ -5662,7 +5670,7 @@ Expected: падений не больше базовой линии; число
 
 **Files:** Modify: `docs/superpowers/specs/2026-10-25-product-full-lifecycle-design.md`
 
-- [ ] **Step 1:** В конец спеки — раздел `## Отступления очереди 2 (по ходу исполнения, <дата>)`: пункты 1–15 из «Общее → Отступления от спеки» этого плана (кратко, по одному абзацу), плюс фактические расхождения, найденные исполнителями и ревью. В разделе «Открыто на очередь 2» отметить закрытое: «стирание только помечает `purged_at`» — сделано (задача 10); «удалённый продукт, у которого сон трижды не прошёл, может работать до стирания» — стирание снимает и работающий контейнер (задача 6), то есть «работает» теперь ограничено сроком возврата. Остальные пункты того раздела — перенести в новый подраздел «Открыто после очереди 2» как есть (тексты о деньгах в сборке из магазина, Flutter и блок карточки в истории, `end.content` на фронте, тексты `result.error` по-русски, Telegram-группа → кабинет, вторая карточка от самолечения).
+- [ ] **Step 1:** В конец спеки — раздел `## Отступления очереди 2 (по ходу исполнения, <дата>)`: пункты 1–21 из «Общее → Отступления от спеки» этого плана (кратко, по одному абзацу), плюс фактические расхождения, найденные исполнителями и ревью. Отдельным абзацем — известные ограничения: смена ключей, брошенная агентом по сроку, может продолжаться на машине в фоне и пересечься со следующим заданием продукта; поздний успех после снятия задания оставляет в контейнере новые ключи при прежних в базе (сигнал — `logger.error`); исход «неизвестен» сообщается человеку текстом и в лог, отдельного оповещения поддержки нет. В разделе «Открыто на очередь 2» отметить закрытое: «стирание только помечает `purged_at`» — сделано (задача 10); «удалённый продукт, у которого сон трижды не прошёл, может работать до стирания» — стирание снимает и работающий контейнер (задача 6), то есть «работает» теперь ограничено сроком возврата. Остальные пункты того раздела — перенести в новый подраздел «Открыто после очереди 2» как есть (тексты о деньгах в сборке из магазина, Flutter и блок карточки в истории, `end.content` на фронте, тексты `result.error` по-русски, Telegram-группа → кабинет, вторая карточка от самолечения).
 
 - [ ] **Step 2: Коммит**
 
@@ -5679,9 +5687,28 @@ git -C $B push -q origin HEAD:refs/heads/feat/product-lifecycle-2
 
 - [ ] **Step 1: Слияние** (OK владельца) — `feat/product-lifecycle-2` в `main` обоих репозиториев, как в очереди 1: `checkout --detach origin/main`, `merge --no-ff`, пуш `${SHA}:refs/heads/main` (в zsh — с фигурными скобками, заметка «zsh: «$VAR:r» в refspec»), сверка merge-base (заметка «push origin main ≠ HEAD»). В `origin/main` за это время приехали чужие коммиты — прогнать на мерже шаги 1–3 задачи 21.
 
+- [ ] **Step 1b: Проверка до выката — нет ли у живых продуктов ключа с именем `OWNER_TG_ID`** (OK владельца; только чтение, на проде, значения не печатаются). Имя становится занятым: у продукта, где владелец уже завёл такой ключ, следующая смена ключей откажет на `secretsProblem`, а агент — на заведении копии. Запуск — из каталога бэкенда прода, где собран `dist`:
+
+```bash
+ssh dvolkov@212.113.106.202 'cd ~/spirits_back && node -e "
+require(\"dotenv\").config();
+const { Pool } = require(\"pg\");
+const { SecretsService } = require(\"./dist/products/secrets.service\");
+const sec = new SecretsService({ get: (k) => process.env[k] });
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+pool.query(\"SELECT id, secrets_encrypted FROM products WHERE archived_at IS NULL AND secrets_encrypted IS NOT NULL\").then((r) => {
+  const hit = r.rows.filter((p) => { try { return Object.keys(sec.decrypt(p.secrets_encrypted, p.id)).some((k) => k.toUpperCase() === \"OWNER_TG_ID\"); } catch { return false; } });
+  console.log(\"products:\", r.rows.length, \"with OWNER_TG_ID:\", hit.map((p) => p.id).join(\",\") || \"none\");
+  return pool.end();
+});
+"'
+```
+Печатается только число продуктов и id совпавших — ни имён других ключей, ни значений. Expected: `with OWNER_TG_ID: none`. Иначе — СТОП, доложить владельцу (решение: переименовать ключ у продукта до выката).
+
 - [ ] **Step 2: Выкат** (отдельный OK владельца) — ОДИН раз, в тихое время, `deploy.sh` с ноды со свежих клонов, отвязанно, наблюдатель по логу (заметка «Выкат: правила»; флаги — как в очереди 1, `SKIP_BOTS=1`, пока у PHASE 5 нет ключа). Что знать заранее:
   - **Образ продуктов пересобирается и пересоздаёт ВСЕ работающие контейнеры продуктов.** Метка образа — хеш содержимого `product-runner/` (`product-image-roll.sh`), а очередь 2 его меняет (rekey, purge, каркас). Пересоздание — секунды на продукт, живые правки скрипт пропускает сам (стоп-сигнал «активный ход»). Поэтому тихое время и ОДИН выкат, а не по частям.
-  - **Спящие (остановленные) контейнеры пропускаются — это ожидаемо**: скрипт называет их в итоге и возвращает код 3. PHASE 4 считается зелёной, если в «не сделано» — только остановленные контейнеры (известные спящие и удалённые продукты); любая другая строка — разбор до следующего шага.
+  - **Спящие (остановленные) контейнеры пропускаются — это ожидаемо**: `product-image-roll.sh` называет их в итоге и возвращает код 3, а deploy.sh печатает «✗ PHASE 4 FAILED» и выходит с ненулевым кодом без «ALL PHASES GREEN». Это ПРИЕМЛЕМО, если в «не сделано» — только остановленные контейнеры: известные спящие, удалённые продукты и возможные остатки `<слаг>__rekey` / `<слаг>__pre_…` (они тоже остановлены). Любая другая строка («занят», «не разобран», отказ `docker run`, машина недоступна) — разбор до следующего шага.
+  - **Откат.** Прод (PHASE 2) откатывается сам при красном смоке (`rollback_phase`). PHASE 4 не откатывает ничего: агент на машине уже новый, а образ — новый у пересозданных контейнеров. Если новый агент ведёт себя плохо — повторить PHASE 4 с прежнего коммита: `git checkout` прежнего sha на проде нельзя (deploy.sh берёт агента из прод-коммита), поэтому откат = revert-коммит в `main` и новый выкат того же порядка, с OK владельца. Миграцию 010 откатывать не нужно: колонка `action_id` старому коду не мешает, словарь видов только расширен.
   - **Окно «сервер новее агента».** Бэк катится в PHASE 2, агент — в PHASE 4. Карточку ключей, отправленную в этом окне, старый агент честно отвергнет («неизвестный вид задания») — карточка станет `failed` с текстом «Ключи не применены…», ключи не тронуты. Первый обход стирания — через час после старта API (отступление 2), и удалённых со сроком в прошлом сейчас нет (первые удаления — 25–26.10, срок — с 25.11), так что `purge` в это окно не уходит.
   - **Релей не трогать.** Его копия `PRODUCTS_PROMPT` обновлена только в репозитории; описание действия `keys` ассистенты релея всё равно получают из схемы инструмента (`/webhook/mcp/products`). Выкат релея — другая сессия, по раннбуку релея.
   - После выката — заметка «Проверка выката»: хеш своего бандла фронта, PHASE 4 по всем машинам реестра, `journalctl -u linkeon-host-agent` на машине продуктов чист.
@@ -5692,7 +5719,7 @@ git -C $B push -q origin HEAD:refs/heads/feat/product-lifecycle-2
   3. правка во время смены ключей: сразу после отправки второй карточки поставить правку — 409 «Сейчас меняются ключи продукта…»;
   4. убрать `LIVE_CHECK` карточкой → `done`, переменной в контейнере нет;
   5. если владелец даст токен тестового бота — то же для бота: смена `BOT_TOKEN` на токен другого тестового бота (getMe, `tg_bot_id` обновился), бот отвечает на `/start`; без привязки Telegram — с chat_id в ответе (только у ботов, заведённых после выката);
-  6. удалить «Проверку ключей» карточкой; с OK владельца — `UPDATE products SET purge_after = now() WHERE slug = '<слаг>'` и `INSERT INTO product_provision_jobs (product_id, kind, status) SELECT id, 'purge', 'queued' FROM products WHERE slug = '<слаг>'`; через минуту: `purged_at` проставлен, `secrets_encrypted` NULL, строка продукта и его задания на месте, в `product_actions` строка `purge`/`done`/`system`; на машине нет ни контейнера, ни `/srv/products/<слаг>`, ни конфига nginx;
+  6. удалить «Проверку ключей» карточкой; дождаться, пока сон удаления отработает (`SELECT kind, status FROM product_provision_jobs WHERE product_id = (SELECT id FROM products WHERE slug = '<слаг>') ORDER BY created_at DESC LIMIT 1` → `sleep`/`done`); с OK владельца — `UPDATE products SET purge_after = now() WHERE slug = '<слаг>'` и `INSERT INTO product_provision_jobs (product_id, kind, status) SELECT p.id, 'purge', 'queued' FROM products p WHERE p.slug = '<слаг>' AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.product_id = p.id AND j.status IN ('queued','running'))` (вставилось 0 строк — у продукта ещё идёт задание, подождать и повторить); через минуту: `purged_at` проставлен, `secrets_encrypted` NULL, строка продукта и его задания на месте, в `product_actions` строка `purge`/`done`/`system`; на машине нет ни контейнера, ни `/srv/products/<слаг>`, ни конфига nginx;
   7. «верни Проверку ключей» → «уже стёрт».
 
 - [ ] **Step 4: Заметки памяти** — обновить `project_product_lifecycle_stage1.md` (или завести `…_stage2.md`): что выкачено (sha обоих репозиториев), что смена ключей и стирание живы, что релей ещё на старом тексте продуктов, что первые сроки стирания — с 25.11.
