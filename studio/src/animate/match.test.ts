@@ -43,3 +43,18 @@ test('повтор слова считается столько раз, скол
 test('реплик нет — сверять нечего', () => {
   assert.deepEqual(speechCheck([], 'что угодно'), { ok: true, share: 1, silentLines: [] });
 });
+
+test('проглоченное последнее предложение реплики ловится — обрыв в конце клипа', () => {
+  const r = speechCheck(['Обои потёрли! Залог мой!', 'Спокойно. Спрошу у юриста.'], 'обои потерли залог мой спокойно');
+  assert.deepEqual(r.silentLines, [1]);
+  assert.equal(r.ok, false);
+});
+
+test('междометия через дефис и без гласных не дают ложного отказа', () => {
+  assert.equal(speechCheck(['А-а-а! Обои!', 'Спокойно.'], 'ааа обои спокойно').ok, true);
+  assert.deepEqual(speechCheck(['Ш-ш-ш! Залог мой!'], 'залог мой'), { ok: true, share: 1, silentLines: [] });
+});
+
+test('знак ударения не делит слово', () => {
+  assert.deepEqual(speechWords('за' + String.fromCharCode(0x301) + 'лог'), ['залог']);
+});

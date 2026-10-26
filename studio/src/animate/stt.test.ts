@@ -55,9 +55,11 @@ test('распознавание: ru-RU, oggopus, числа словами, к�
   assert.ok(calls[0].init?.signal, 'у запроса нет таймаута');
 });
 
-test('пустой результат — пустая строка', async () => {
-  const { f, sleep } = fake([{ body: {} }]);
-  assert.equal(await recognize(Buffer.from('OGG'), creds, { fetch: f, sleep }), '');
+test('тишина — пустая строка; ответ без текста — повтор, а не пустая строка', async () => {
+  const a = fake([{ body: { result: '' } }]);
+  assert.equal(await recognize(Buffer.from('OGG'), creds, { fetch: a.f, sleep: a.sleep }), '');
+  const b = fake([{ body: {} }, { body: { result: 'ладно' } }]);
+  assert.equal(await recognize(Buffer.from('OGG'), creds, { fetch: b.f, sleep: b.sleep }), 'ладно');
 });
 
 test('сбой сети, обрыв тела, не-JSON, 5xx и 429 повторяются здесь же, с нарастающими паузами', async () => {
@@ -75,11 +77,11 @@ test('все попытки неудачны — ошибка stt без пов�
   assert.equal(calls.length, 4);
 });
 
-test('4xx (ключ, права) — сразу ошибка без повтора, ключ из текста ответа вырезан', async () => {
-  const { f, calls, sleep } = fake([{ status: 401, body: 'unauthorized: SECRET-SPEECH-KEY' }]);
+test('4xx (ключ, права) — сразу ошибка без повтора, ключ из текста ответа вырезан, даже на границе обрезки', async () => {
+  const { f, calls, sleep } = fake([{ status: 401, body: `${'x'.repeat(190)} SECRET-SPEECH-KEY` }]);
   await assert.rejects(
     recognize(Buffer.from('OGG'), creds, { fetch: f, sleep }),
-    (e: unknown) => sttFailed(e) && /401/.test((e as Error).message) && !(e as Error).message.includes('SECRET-SPEECH-KEY'),
+    (e: unknown) => sttFailed(e) && /401/.test((e as Error).message) && !(e as Error).message.includes('SECRET-SP'),
   );
   assert.equal(calls.length, 1);
 });

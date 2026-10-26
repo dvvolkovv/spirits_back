@@ -87,3 +87,17 @@ test('отрезков столько же, сколько реплик, но с
     { line: 1, startMs: 3036, endMs: 6000 },
   ]);
 });
+
+test('три реплики и лишние паузы — каждой следующей границе остаётся своя пауза', () => {
+  const spans = [
+    { startMs: 0, endMs: 300 },
+    { startMs: 600, endMs: 900 },
+    { startMs: 1200, endMs: 1500 },
+    { startMs: 1800, endMs: 9000 },
+  ];
+  assert.deepEqual(lineCues(['abc', 'abc', 'abc'], spans, 9000), [
+    { line: 0, startMs: 0, endMs: 900 },
+    { line: 1, startMs: 1200, endMs: 1500 },
+    { line: 2, startMs: 1800, endMs: 9000 },
+  ]);
+});

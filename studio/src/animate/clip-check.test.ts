@@ -19,6 +19,7 @@ test('длина вне 6,5–9,5 с; границы включительно; N
   assert.deepEqual(checkClip({ ...probe, durationSec: 6.5 }, []), []);
   assert.deepEqual(checkClip({ ...probe, durationSec: 9.5 }, []), []);
   assert.deepEqual(checkClip({ ...probe, durationSec: Number.NaN }, []), ['длина не определена — ffprobe не вернул длительность']);
+  assert.deepEqual(checkClip({ ...probe, durationSec: 0 }, []), ['длина не определена — ffprobe не вернул длительность']);
 });
 
 test('нет видео — ровно одна причина; квадрат и горизонталь — не вертикальный; нет звука', () => {
@@ -56,5 +57,21 @@ test('громкость: звук не сдвигается и не длинн�
   assert.ok(Math.abs(p.durationSec - 8) < 0.05, `длина ${p.durationSec} с`);
   const [lead] = await detectSilences(out, p.durationSec);
   assert.ok(Math.abs(lead.end - 6) < 0.02, `тон начался в ${lead.end} с вместо 6,0 с`);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('звук короче видео больше чем на 3 с — клип не укорачивается, хвост тишины ловится как край', { timeout: 60_000 }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-loudnorm-'));
+  const raw = path.join(dir, 'raw.mp4');
+  const out = path.join(dir, 'clip.mp4');
+  execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'lavfi', '-i', 'color=c=green:s=720x1280:r=24:d=8',
+    '-f', 'lavfi', '-i', 'aevalsrc=0.05*sin(2*PI*300*t):s=48000:d=4',
+    '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', raw]);
+  await normalizeLoudness(raw, out);
+  const p = await probeFile(out);
+  assert.ok(Math.abs(p.durationSec - 8) < 0.05, `длина ${p.durationSec} с`);
+  const problems = checkClip(p, await detectSilences(out, p.durationSec));
+  assert.ok(problems.some((x) => /на краю клипа/.test(x)), problems.join('; '));
   fs.rmSync(dir, { recursive: true, force: true });
 });

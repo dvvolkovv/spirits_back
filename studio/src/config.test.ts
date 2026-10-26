@@ -59,5 +59,6 @@ test('оживлению сценок нужны ключи Google и SpeechKit;
   const c = parseConfig({ GOOGLE_AI_API_KEY: 'g', ...speech }, animate);
   assert.equal(c.googleKey, 'g');
   assert.equal(c.speechkitKey, 'k');
+  assert.equal(c.speechkitFolder, 'f');
   assert.equal(parseConfig({ GOOGLE_AI_API_KEY: 'g' }, none).googleKey, '');
 });

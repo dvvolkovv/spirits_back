@@ -105,25 +105,57 @@ test('HTTP-ошибки Google: квота, ключ и снятая модел�
   assert.ok(isErr('keyframe', true)(googleHttpError('keyframe', 500, 'oops')));
 });
 
-test('ключ из ответа Google в сообщение не попадает', () => {
+test('ключ из ответа Google в сообщение не попадает — и на границе обрезки', () => {
   const body = JSON.stringify({ error: { code: 403, message: "Consumer 'api_key:AIzaSyTESTKEY0123456789abcdefghij' has been suspended." } });
   assert.doesNotMatch(googleHttpError('omni', 403, body).message, /AIzaSyTESTKEY/);
+  const edge = JSON.stringify({ error: { code: 500, message: `${'x'.repeat(290)} AIzaSyTESTKEY0123456789abcdefghij` } });
+  assert.doesNotMatch(googleHttpError('omni', 500, edge).message, /AIzaSy/);
 });
 
-test('поминутный лимит пережидается на месте и не сжигает попытку; суточный — нет', async () => {
+test('поминутный лимит пережидается на месте и не сжигает попытку; не дольше двух раз', async () => {
   const perMinute = { status: 429, body: { error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'Quota exceeded', details: [{ retryDelay: '7s' }] } } };
   assert.equal(rateLimitDelayMs(JSON.stringify(perMinute.body)), 7000);
-  const daily = JSON.stringify({ error: { code: 429, message: 'Quota exceeded for metric: generate_content_free_tier_requests, limit: 0' } });
-  assert.equal(rateLimitDelayMs(daily), null);
   const { deps, calls } = fake([perMinute, { body: { candidates: [{ content: { parts: [{ inlineData: { mimeType: 'image/png', data: 'AA==' } }] } }] } }]);
   assert.equal((await generateKeyframe(deps, 'p', [])).mime, 'image/png');
   assert.equal(calls.length, 2);
+  const stuck = fake([perMinute, perMinute, perMinute]);
+  await assert.rejects(generateKeyframe(stuck.deps, 'p', []), (e: unknown) => isErr('google_quota', false)(e) && /поминутный/.test((e as Error).message));
+  assert.equal(stuck.calls.length, 3);
+});
+
+test('суточная квота — даже с RetryInfo — и нулевая квота не пережидаются; долгая пауза — тоже', () => {
+  const daily = JSON.stringify({
+    error: {
+      code: 429,
+      status: 'RESOURCE_EXHAUSTED',
+      message: 'Quota exceeded',
+      details: [{ violations: [{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier' }] }, { retryDelay: '41s' }],
+    },
+  });
+  assert.equal(rateLimitDelayMs(daily), null);
+  assert.match(googleHttpError('keyframe', 429, daily).message, /суточная/);
+  const zero = JSON.stringify({ error: { code: 429, message: 'Quota exceeded for metric: generate_content_free_tier_requests, limit: 0' } });
+  assert.equal(rateLimitDelayMs(zero), null);
+  assert.match(googleHttpError('keyframe', 429, zero).message, /нулевая — проверить биллинг/);
+  assert.equal(rateLimitDelayMs(JSON.stringify({ error: { details: [{ retryDelay: '120s' }] } })), null);
+});
+
+test('биллинг или регион (FAILED_PRECONDITION) — ключ, без повтора; прочие 4xx при запуске — явный отказ', async () => {
+  const pre = JSON.stringify({ error: { code: 400, status: 'FAILED_PRECONDITION', message: 'User location is not supported' } });
+  assert.ok(isErr('google_auth', false)(googleHttpError('omni', 400, pre)));
+  const big = fake([{ status: 413, body: 'too large' }]);
+  await assert.rejects(startClip(big.deps, 'p', { data: JPEG, mime: 'image/jpeg' }), (e: unknown) => {
+    assert.ok(isErr('omni_rejected', true)(e));
+    assert.ok(CLEAR_REFUSALS.has((e as StudioError).code));
+    return true;
+  });
 });
 
 test('запуск клипа: Omni, фоновый, кадр с его типом и текст, 9:16 720p 8 с', async () => {
   const { deps, calls } = fake([{ body: { id: 'int-1', status: 'in_progress' } }]);
   assert.equal(await startClip(deps, 'сценка', { data: JPEG, mime: 'image/jpeg' }), 'int-1');
   assert.match(calls[0].url, /\/v1beta\/interactions$/);
+  assert.ok(calls[0].init?.signal, 'у запуска нет таймаута');
   assert.equal((calls[0].init?.headers as Record<string, string>)['x-goog-api-key'], deps.apiKey);
   const body = JSON.parse(String(calls[0].init?.body));
   assert.equal(body.model, OMNI_MODEL);
@@ -150,6 +182,7 @@ test('ожидание: в работе → готово, видео из шаг
   const { deps, calls } = fake([inProgress, done(mp4)]);
   assert.deepEqual(await waitClip(deps, 'int-1'), mp4);
   assert.match(calls[0].url, /\/interactions\/int-1$/);
+  assert.ok(calls[0].init?.signal, 'у опроса нет таймаута');
 });
 
 test('ожидание: сбой сети, обрыв тела, не-JSON, 5xx, 408, 429 и незнакомый статус не бросают оплаченную генерацию', async () => {
@@ -159,14 +192,32 @@ test('ожидание: сбой сети, обрыв тела, не-JSON, 5xx, 
   assert.deepEqual(await waitClip(deps, 'i'), mp4);
 });
 
-test('ожидание: готовый клип ссылкой скачивается с ключом в заголовке', async () => {
-  const { deps, calls } = fake([
-    { body: { status: 'completed', steps: [{ type: 'model_output', content: [{ type: 'video', uri: 'https://files.example/abc' }] }] } },
-    () => new Response(new Uint8Array(Buffer.from('MP4')), { status: 200 }),
-  ]);
+const byLink = (uri: string) => ({ body: { status: 'completed', steps: [{ type: 'model_output', content: [{ type: 'video', uri }] }] } });
+const GOOGLE_FILE = 'https://generativelanguage.googleapis.com/v1beta/files/abc:download';
+
+test('ожидание: готовый клип ссылкой скачивается; ключ уходит только хосту Google', async () => {
+  const { deps, calls } = fake([byLink(GOOGLE_FILE), () => new Response(new Uint8Array(Buffer.from('MP4')), { status: 200 })]);
   assert.deepEqual(await waitClip(deps, 'i'), Buffer.from('MP4'));
-  assert.equal(calls[1].url, 'https://files.example/abc');
+  assert.equal(calls[1].url, GOOGLE_FILE);
   assert.equal((calls[1].init?.headers as Record<string, string>)['x-goog-api-key'], deps.apiKey);
+  assert.ok(calls[1].init?.signal, 'у скачивания нет таймаута');
+  const evil = fake([byLink('https://evil.example/clip.mp4'), () => new Response(new Uint8Array(Buffer.from('MP4')), { status: 200 })]);
+  await waitClip(evil.deps, 'i');
+  assert.equal((evil.calls[1].init?.headers as Record<string, string>)['x-goog-api-key'], undefined);
+});
+
+test('скачивание: сбой сети — следующий опрос, а не новая генерация; 4xx — понятная ошибка без повтора', async () => {
+  const mp4 = Buffer.from('MP4');
+  const a = fake([byLink(GOOGLE_FILE), new TypeError('fetch failed'), done(mp4)]);
+  a.deps.pollTimeoutMs = 100;
+  assert.deepEqual(await waitClip(a.deps, 'i'), mp4);
+  const b = fake([byLink(GOOGLE_FILE), { status: 403, body: 'forbidden' }]);
+  await assert.rejects(waitClip(b.deps, 'i'), (e: unknown) => isErr('omni_failed', false)(e) && /по ссылке не отдаётся: HTTP 403/.test((e as Error).message));
+});
+
+test('ответ неожиданной формы — не TypeError, а понятная ошибка', async () => {
+  const { deps } = fake([{ body: { status: 'completed', steps: { type: 'model_output' } } }]);
+  await assert.rejects(waitClip(deps, 'i'), isErr('omni_rejected', true));
 });
 
 test('отказ фильтра приходит массивом errors — повторяемый omni_rejected, и с числовым кодом 3', async () => {
@@ -190,11 +241,19 @@ test('готово, но без видео — omni_rejected с текстом �
   await assert.rejects(waitClip(deps, 'i'), (e: unknown) => isErr('omni_rejected', true)(e) && /Не могу/.test((e as Error).message));
 });
 
-test('не дождались — omni_failed; срок считается по часам, а не по числу опросов', async () => {
+test('не дождались — omni_timeout: генерация может ещё закончиться; срок — по часам, а не по числу опросов', async () => {
   const a = fake([inProgress, inProgress, inProgress]);
-  await assert.rejects(waitClip(a.deps, 'i'), (e: unknown) => isErr('omni_failed', true)(e) && /не дождались/.test((e as Error).message));
+  await assert.rejects(waitClip(a.deps, 'i'), (e: unknown) => isErr('omni_timeout', true)(e) && /не дождались/.test((e as Error).message));
   const slow = fake(Array.from({ length: 10 }, () => inProgress), 40);
   slow.deps.pollTimeoutMs = 100;
-  await assert.rejects(waitClip(slow.deps, 'i'), isErr('omni_failed', true));
+  await assert.rejects(waitClip(slow.deps, 'i'), isErr('omni_timeout', true));
   assert.ok(slow.calls.length <= 3, `опросов ${slow.calls.length} — срок не считает время запросов`);
+});
+
+test('поминутный лимит при опросе пережидается в пределах срока', async () => {
+  const limit = { status: 429, body: { error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'Quota exceeded', details: [{ retryDelay: '90s' }] } } };
+  const { deps, calls } = fake([limit, inProgress, inProgress]);
+  deps.pollTimeoutMs = 100;
+  await assert.rejects(waitClip(deps, 'i'), isErr('omni_timeout', true));
+  assert.equal(calls.length, 1, 'после паузы до конца срока опросов быть не должно');
 });
