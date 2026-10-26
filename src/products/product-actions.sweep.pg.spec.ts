@@ -3,7 +3,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
 import { MIGRATIONS } from './products.service';
-import { ProductActionsService, REKEY_BLOCKED_SAY, REKEY_FAILED_SAY, REKEY_GONE_SAY, REKEY_UNKNOWN_SAY } from './product-actions.service';
+import {
+  JOB_KILLED_BY_DELETE,
+  ProductActionsService,
+  REKEY_BLOCKED_SAY,
+  REKEY_FAILED_SAY,
+  REKEY_GONE_SAY,
+  REKEY_UNKNOWN_SAY,
+} from './product-actions.service';
 import { JOB_KILLED_BY_BLOCK } from './block.service';
 
 const PG = process.env.PROVISIONING_PG_URL;
@@ -22,13 +29,16 @@ maybe('подметальщик журнала и коробки ключей п
     );
     return id;
   }
-  async function keysCard(productId: string, o: { expired: boolean; job?: 'queued' | 'running' | 'failed'; started?: boolean; error?: string }) {
+  async function keysCard(
+    productId: string,
+    o: { expired: boolean; job?: 'queued' | 'running' | 'done' | 'failed'; started?: boolean; error?: string; kind?: string },
+  ) {
     const a = await pool.query(
       `INSERT INTO product_actions (user_id, product_id, kind, status, channel, secrets_box, expires_at)
-       VALUES ('u1', $1, 'keys', 'working', 'web', '\\x01020304'::bytea,
+       VALUES ('u1', $1, $3, 'working', 'web', '\\x01020304'::bytea,
                CASE WHEN $2 THEN now() - interval '20 minutes' ELSE now() + interval '20 minutes' END)
        RETURNING id`,
-      [productId, o.expired],
+      [productId, o.expired, o.kind ?? 'keys'],
     );
     if (o.job) {
       await pool.query(
@@ -59,6 +69,20 @@ maybe('подметальщик журнала и коробки ключей п
     expect((await card(id)).status).toBe('working');
   });
 
+  it('то же для queued (задание в очереди, агент ещё не взял) — тоже не трогаем', async () => {
+    const p = await product();
+    const id = await keysCard(p, { expired: true, job: 'queued' });
+    await svc.sweepStuck();
+    expect((await card(id)).status).toBe('working');
+  });
+
+  it('то же для done — задание и карточку закрывает один оператор completeRekeyJob; видеть их врозь означает, что тот оператор ещё не нашёл карточку в working — не дописываем своё поверх', async () => {
+    const p = await product();
+    const id = await keysCard(p, { expired: true, job: 'done' });
+    await svc.sweepStuck();
+    expect((await card(id)).status).toBe('working');
+  });
+
   it('задание сняли до выдачи агенту (сборщик) — failed, «старые ключи», коробка стёрта', async () => {
     const p = await product();
     const id = await keysCard(p, { expired: false, job: 'failed', error: 'срок смены ключей истёк (10 мин)' });
@@ -78,7 +102,7 @@ maybe('подметальщик журнала и коробки ключей п
 
   it('снято удалением до выдачи — «продукт удалён», без слов о старых ключах', async () => {
     const p = await product();
-    const id = await keysCard(p, { expired: false, job: 'failed', error: 'снято удалением' });
+    const id = await keysCard(p, { expired: false, job: 'failed', error: JOB_KILLED_BY_DELETE });
     await svc.sweepStuck();
     expect((await card(id)).result).toEqual({ error: REKEY_GONE_SAY, reason: 'gone' });
   });
@@ -90,9 +114,16 @@ maybe('подметальщик журнала и коробки ключей п
     expect((await card(id)).result).toEqual({ error: REKEY_BLOCKED_SAY, reason: 'blocked' });
   });
 
-  it('прежнее поведение: working без задания после срока + 10 минут — failed с общим текстом', async () => {
+  it('карточка ключей без задания вообще (процесс умер до его постановки) — тот же текст rekey_failed, а не общий', async () => {
     const p = await product();
     const id = await keysCard(p, { expired: true });
+    await svc.sweepStuck();
+    expect((await card(id)).result).toEqual({ error: REKEY_FAILED_SAY, reason: 'rekey_failed' });
+  });
+
+  it('прочие виды действий (не keys) без задания после срока + 10 минут — прежний общий текст, без reason', async () => {
+    const p = await product();
+    const id = await keysCard(p, { expired: true, kind: 'delete' });
     await svc.sweepStuck();
     expect((await card(id)).result).toEqual({ error: 'Действие прервалось — попросите ассистента повторить' });
   });
@@ -113,5 +144,14 @@ maybe('подметальщик журнала и коробки ключей п
     const b = await keysCard(p, { expired: false });
     await svc.finish(b, 'failed', { error: 'x' });
     expect((await card(b)).secrets_box).toBeNull();
+  });
+
+  it('release не трогает карточку, у которой уже есть активное задание (queued/running) — задание важнее возврата в pending', async () => {
+    const p = await product();
+    const id = await keysCard(p, { expired: false, job: 'queued' });
+    await svc.release(id, { error: 'поправьте' });
+    const c = await card(id);
+    expect(c.status).toBe('working');
+    expect(c.secrets_box).not.toBeNull();
   });
 });

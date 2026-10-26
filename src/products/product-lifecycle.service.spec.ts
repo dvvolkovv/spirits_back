@@ -2,6 +2,7 @@ import { ConflictException, UnprocessableEntityException } from '@nestjs/common'
 import { ProductLifecycleService, DELETE_GRACE_DAYS } from './product-lifecycle.service';
 import { RENT_TOKENS } from './rent.service';
 import { REKEY_REFUSAL } from './turns.service';
+import { JOB_KILLED_BY_DELETE } from './product-actions.service';
 
 const ACT = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 const TOKEN = '1234567890:AAH9sdfjKJHkjh34kjh5kjh6KJHkjhKJHkj';
@@ -242,7 +243,7 @@ describe('удаление', () => {
     expect(r).toEqual({ ok: true, restoreUntil: until.toISOString() });
     const archive = h.calls.find((c) => c.sql.includes('SET archived_at = now()'))!;
     expect(archive.params).toEqual(['p1', 'u1', DELETE_GRACE_DAYS]);
-    expect(h.calls.some((c) => c.sql.includes("error = 'снято удалением'"))).toBe(true);
+    expect(h.calls.some((c) => c.sql.includes('error = $2::text') && c.params[1] === JOB_KILLED_BY_DELETE)).toBe(true);
     expect(h.calls.some((c) => c.sql.includes("'sleep', 'queued'") && c.params[0] === 'p1')).toBe(true);
     // prevStatus — чтобы возврат мог отличить «спал за неуплату» от «вернуть
     // туда, где и был сломан»: продукту, удалённому в failed, пополнение не
