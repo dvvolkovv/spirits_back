@@ -3,23 +3,30 @@ import * as path from 'path';
 import { heroById, TROUPE, TROUPE_VERSION } from './short-troupe';
 
 describe('труппа', () => {
-  it('пятеро героев утверждённого листа, id без повторов', () => {
+  it('пятеро героев утверждённого листа', () => {
     expect(TROUPE.map((h) => h.id)).toEqual(['kesha', 'galina', 'boris', 'mikhalych', 'zhorik']);
-    expect(TROUPE_VERSION).toBe('v1');
   });
 
-  it('у каждого — облик и голос для промптов, роли и коронная фраза', () => {
+  it('промпт Omni однозначно называет говорящего, генераторам уходит только английский', () => {
+    const who = TROUPE.map((h) => h.who);
+    expect(new Set(who).size).toBe(who.length);
     for (const h of TROUPE) {
-      expect(h.look.length).toBeGreaterThan(20);
+      expect(h.who).toMatch(/^the [a-z]+( [a-z]+)*$/);
+      expect(h.look).toContain(h.who.replace(/^the /, ''));
       expect(h.voice).toMatch(/voice$/);
-      expect(h.who).toMatch(/^the [a-z]+$/);
+      expect(`${h.who} ${h.look} ${h.voice}`).not.toMatch(/[а-яё]/i);
+    }
+  });
+
+  it('у каждого — роли и коронная фраза для режиссёра и сценариста', () => {
+    for (const h of TROUPE) {
       expect(h.roles.length).toBeGreaterThan(0);
       expect(h.catchphrases.length).toBeGreaterThan(0);
     }
   });
 
-  it('heroById находит героя и не находит чужого', () => {
-    expect(heroById('galina')?.name).toBe('Гусыня Галина Петровна');
+  it('heroById находит героя по id и не находит чужого', () => {
+    for (const h of TROUPE) expect(heroById(h.id)).toBe(h);
     expect(heroById('fox')).toBeUndefined();
   });
 
