@@ -53,8 +53,10 @@ export interface CreateInput {
  * `product_provision_jobs.kind` (004_rent.sql): разойдутся — сервер начнёт
  * отдавать вид, которого агент не знает, и получит честный отказ на каждом
  * задании.
+ *
+ * rekey и purge — очередь 2, словарь в 004 расширен миграцией очереди 2.
  */
-export type JobKind = 'provision' | 'sleep' | 'wake' | 'domain';
+export type JobKind = 'provision' | 'sleep' | 'wake' | 'domain' | 'rekey' | 'purge';
 
 /**
  * Задание, выданное агенту хоста. Единственное место, где открытый
@@ -124,6 +126,18 @@ export interface ClaimedJob {
    * promoteReady ещё не перевёл) — прокси: его конфиг уже прокси.
    */
   vhostMode: 'proxy' | 'asleep';
+  /**
+   * Смена ключей (rekey): имена старых ключей владельца, которых нет в новом
+   * наборе. Новый набор — в `secrets`, расшифрован из коробки карточки
+   * (product_actions.secrets_box). У прочих видов ключа нет.
+   */
+  dropNames?: string[];
+  /**
+   * Telegram владельца — только боту, только у provision и rekey. Уходит в
+   * окружение `OWNER_TG_ID`. Пустая строка (только у rekey) — привязки больше
+   * нет: агент снимает переменную. Ключа нет — не трогать.
+   */
+  ownerTgId?: string;
 }
 
 // Дефис только внутри. Регексп из плана (/^[a-z0-9-]{2,40}$/) пропускал '-rf'
@@ -842,6 +856,10 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    * погашенного. Режим его конфига (прокси или заглушка) и имена считает этот
    * же оператор — см. ClaimedJob.customNames и vhostMode.
    *
+   * Смена ключей (rekey) — работающему, с коробкой ключей в своей карточке
+   * (action_id) и без идущей правки; стирание (purge) — удалённому после
+   * purge_after. Удалённому, кроме сна, выдаётся только стирание.
+   *
    * ## ТОКЕН ПОВОРАЧИВАЕТСЯ ТОЛЬКО НА ЗАВЕДЕНИИ
    *
    * `issued` берёт только `kind = 'provision'`. Раннер живёт ВНУТРИ
@@ -924,7 +942,7 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                             -- SKIP LOCKED и отбор строго по 'queued' ниже не
                             -- меняются (сторож — «очередь читается ТОЛЬКО по
                             -- queued», provisioning.job.spec.ts).
-                            AND (p.archived_at IS NULL OR (j.kind = 'sleep' AND p.purged_at IS NULL))
+                            AND (p.archived_at IS NULL OR (j.kind IN ('sleep','purge') AND p.purged_at IS NULL))
                             -- Метка машины. Условие внутри EXISTS, то есть
                             -- ВНУТРИ отбора, а не поверх него: наложенное
                             -- снаружи (на claimed или на итоговый SELECT), оно
@@ -966,6 +984,18 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                                   -- у погашенного можно, выпустить нельзя
                                   -- (это сторожит DomainsService.tryIssue).
                                   WHEN 'domain' THEN p.status IN ('running','degraded','sleeping','blocked')
+                                  -- Смена ключей (очередь 2): только работающему, только с
+                                  -- коробкой ключей в карточке и только без идущей правки —
+                                  -- пересоздание контейнера убило бы ход молча.
+                                  WHEN 'rekey' THEN p.status IN ('running','degraded')
+                                                 AND EXISTS (SELECT 1 FROM product_actions ka
+                                                              WHERE ka.id = j.action_id AND ka.status = 'working'
+                                                                AND ka.secrets_box IS NOT NULL)
+                                                 AND NOT EXISTS (SELECT 1 FROM product_turns t
+                                                                  WHERE t.product_id = p.id AND t.status IN ('queued','running'))
+                                  -- Стирание: удалённому и только после срока возврата —
+                                  -- возврат мог успеть между постановкой и выдачей.
+                                  WHEN 'purge' THEN p.status = 'archived' AND p.purge_after <= now()
                                   ELSE p.status = 'sleeping'
                                 END)
            ORDER BY j.created_at ASC
@@ -975,7 +1005,7 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
           UPDATE product_provision_jobs
              SET status = 'running', started_at = now()
            WHERE id IN (SELECT id FROM picked)
-          RETURNING id, product_id, kind
+          RETURNING id, product_id, kind, action_id
        ), issued AS (
           UPDATE products
              SET runner_token_hash = $1
@@ -984,7 +1014,8 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
        )
        SELECT c.id AS job_id, c.kind AS job_kind, p.id AS product_id, p.slug AS slug,
               p.name AS name, p.kind AS kind, p.port AS port, p.secrets_encrypted AS box,
-              (i.id IS NOT NULL) AS token_issued
+              (i.id IS NOT NULL) AS token_issued,
+              p.user_id AS user_id, a.secrets_box AS rekey_box, a.payload AS rekey_payload
               -- Имена — в каждом задании (см. ClaimedJob.customNames), режим —
               -- для задания domain. Само выдаваемое задание domain режим не
               -- сбивает: wokenSql пропускает этот вид, и «проснулся» решает
@@ -1020,7 +1051,8 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                      ELSE 'proxy' END AS vhost_mode
          FROM claimed c
          JOIN products p ON p.id = c.product_id
-         LEFT JOIN issued i ON i.id = c.product_id`,
+         LEFT JOIN issued i ON i.id = c.product_id
+         LEFT JOIN product_actions a ON a.id = c.action_id`,
       [hash, hostId],
     );
     // Пустая очередь — обычное состояние: агент опрашивает нас в цикле.
@@ -1037,6 +1069,28 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     if (!row) return null;
 
     const jobKind = row.job_kind as JobKind;
+
+    // Ключи: заведению — из продукта, смене ключей — из коробки её карточки
+    // (тот же AAD — id продукта). Прочим видам ключи не нужны и не
+    // расшифровываются вовсе.
+    let secrets: Record<string, string> = {};
+    if (jobKind === 'provision' && row.box) secrets = this.secrets.decrypt(row.box, row.product_id);
+    if (jobKind === 'rekey' && row.rekey_box) secrets = this.secrets.decrypt(row.rekey_box, row.product_id);
+    const dropNames = jobKind === 'rekey'
+      ? (Array.isArray(row.rekey_payload?.removedNames) ? row.rekey_payload.removedNames.filter((n: unknown) => typeof n === 'string') : [])
+      : undefined;
+    // Отдельным чтением ПОСЛЕ выдачи и лучшим усилием: таблица привязок — из
+    // модуля tg-bot, и её отказ не должен ронять опрос агента (задание уже
+    // забрано, токен выпущен — 500 здесь оставил бы его до сборщика).
+    // Три исхода чтения: id — поставить; null — привязки нет; undefined —
+    // прочитать не удалось. Заведению без привязки ключ не нужен вовсе; смене
+    // ключей «привязки нет» — пустая строка: агент снимет устаревший
+    // OWNER_TG_ID. «Не удалось» не трогает ничего.
+    const owner = row.kind === 'bot' && (jobKind === 'provision' || jobKind === 'rekey')
+      ? await this.ownerTgIdOf(row.user_id)
+      : undefined;
+    const ownerTgId = typeof owner === 'string' ? owner : owner === null && jobKind === 'rekey' ? '' : undefined;
+
     return {
       jobId: row.job_id,
       productId: row.product_id,
@@ -1053,18 +1107,34 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       // виду значило бы обещать токен, которого могло не оказаться: условие
       // выпуска живёт в SQL, и разъехаться эти два места обязаны молча.
       ...(row.token_issued ? { runnerToken } : {}),
-      // ДВА аргумента: коробка привязана к продукту через AAD. Признак
-      // «секретов нет» — NULL в secrets_encrypted (задача 3 кладёт именно
-      // его, а не коробку от {}), и читаться он обязан ДО вызова: decrypt на
-      // null — сырой TypeError.
-      //
-      // Сну и пробуждению секреты не нужны вовсе: контейнер уже собран, и
-      // переменные окружения в нём. Расшифровывать их здесь значило бы гонять
-      // секреты клиента по сети на каждое усыпление ни за чем.
-      secrets: jobKind === 'provision' && row.box ? this.secrets.decrypt(row.box, row.product_id) : {},
+      secrets,
       customNames: Array.isArray(row.custom_names) ? row.custom_names : [],
       vhostMode: row.vhost_mode === 'asleep' ? 'asleep' : 'proxy',
+      ...(dropNames !== undefined ? { dropNames } : {}),
+      ...(ownerTgId !== undefined ? { ownerTgId } : {}),
     };
+  }
+
+  /**
+   * Telegram владельца для OWNER_TG_ID — лучшим усилием. Таблица чужого
+   * модуля (tg-bot/migrations/001_tg_bot_schema.sql): её отказ — строка в лог
+   * и бот без OWNER_TG_ID (каркас тогда сам подскажет chat_id на /start), а
+   * не сорванная выдача. Возвращает id; null — привязки нет; undefined —
+   * прочитать не удалось (тогда ничего не ставится и не снимается).
+   */
+  private async ownerTgIdOf(userId: string): Promise<string | null | undefined> {
+    try {
+      const r = await this.pg.query(
+        `SELECT tg_user_id::text AS id FROM tg_user_identities WHERE linkeon_user_id = $1 LIMIT 1`,
+        [userId],
+      );
+      const id = r.rows?.[0]?.id;
+      if (id === undefined) return null;
+      return typeof id === 'string' && /^\d{1,20}$/.test(id) ? id : undefined;
+    } catch (e: any) {
+      this.logger.warn(`OWNER_TG_ID не прочитан (${e?.message}) — переменная не ставится и не снимается`);
+      return undefined;
+    }
   }
 
   /**
