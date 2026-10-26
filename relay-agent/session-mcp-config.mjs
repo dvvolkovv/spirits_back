@@ -22,10 +22,14 @@ export function sessionMcpConfigName(fsKey, turnId) {
 }
 
 // Осиротевшие файлы — `finally` не отработал (SIGKILL, падение процесса
-// релея). Файл несёт чужие Bearer-токены, оставлять его нельзя. Чужой ЖИВОЙ
-// ход трогать тоже нельзя: возраст — единственный сигнал, не требующий
-// знать активные сессии. maxAgeMs — заведомо больше любого хода.
-export function sweepStaleSessionMcpConfigs(dir, maxAgeMs, now = Date.now()) {
+// релея). Файл несёт чужие Bearer-токены, оставлять его нельзя. Возраст сам
+// по себе НЕ доказывает, что ход завершился — консультация или self-heal
+// ретрай того же процесса могут идти дольше maxAgeMs, а конфиг при этом
+// валиден и используется. liveSet — полные пути конфигов идущих ходов
+// этого процесса (server.mjs: добавляет при записи, убирает в finally) —
+// такие пропускаются независимо от возраста. Для конфигов ПРЕЖНЕГО процесса
+// (он не попал в liveSet этого) возраст остаётся единственным сигналом.
+export function sweepStaleSessionMcpConfigs(dir, maxAgeMs, liveSet = new Set(), now = Date.now()) {
   const removed = [];
   let items;
   try {
@@ -36,6 +40,7 @@ export function sweepStaleSessionMcpConfigs(dir, maxAgeMs, now = Date.now()) {
   for (const item of items) {
     if (!item.endsWith(SUFFIX)) continue;
     const full = path.join(dir, item);
+    if (liveSet.has(full)) continue;
     try {
       const stat = fs.statSync(full);
       if (now - stat.mtimeMs > maxAgeMs) {
