@@ -109,7 +109,7 @@
  * Ровно этот случай и разбирает подчистка.
  */
 import { execFile } from 'child_process';
-import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
+import { mkdir, readFile, realpath, rm, stat, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { promisify } from 'util';
 import { ProductKind, skeletonFor } from './skeleton';
@@ -303,6 +303,14 @@ export interface ProvisionDeps {
   /** Есть ли что-то по пути — файл, каталог, что угодно. */
   exists: (path: string) => Promise<boolean>;
   removeDir: (dir: string) => Promise<void>;
+  /**
+   * Настоящий путь, как `fs.realpath`: ссылки раскрыты, `..` снят; нет пути —
+   * отказ с кодом ENOENT. Нужен стиранию (purge.ts): удаляется ровно
+   * `/srv/products/<слаг>`, а не то, куда ведёт ссылка по дороге. Обязательное,
+   * а не с умолчанием на fs: забытое в сборке зависимостей, оно молча шло бы
+   * по настоящей ФС — и из тестов на симуляторе тоже.
+   */
+  realpath: (path: string) => Promise<string>;
   readHostSecret: (path: string) => Promise<string>;
   /** Отвечает ли порт. Ожидание по факту вместо `sleep 12`. */
   waitPort: (port: number, timeoutMs: number) => Promise<boolean>;
@@ -671,8 +679,13 @@ export function hostDeps(overrides: Partial<ProvisionDeps> = {}): ProvisionDeps 
     },
 
     removeDir: async (dir: string) => {
+      // Ссылки внутри каталога (их может завести код продукта — каталог
+      // смонтирован в контейнер на запись) `rm` удаляет как ссылки и по ним не
+      // ходит: проверено на настоящей ФС в purge.spec.ts.
       await rm(dir, { recursive: true, force: true });
     },
+
+    realpath: (path: string) => realpath(path),
 
     readHostSecret: async (path: string) => readFile(path, 'utf8'),
 

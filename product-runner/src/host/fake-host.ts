@@ -17,6 +17,7 @@
  * Собственные свойства симулятора сторожит fake-host.spec.ts: он общий, и
  * незамеченная правка ослабила бы сразу обе батареи.
  */
+import { posix } from 'path';
 import { Script } from 'vm';
 import { DEFAULTS, ProvisionDeps } from './provision';
 
@@ -590,7 +591,17 @@ export class FakeHost {
   }
 
   private dockerPs(args: string[]): string {
-    const filter = args.includes('--filter') ? args[args.indexOf('--filter') + 1] : '';
+    if (!args.includes('--filter')) {
+      // Перечень имён целиком — так стирание (purge.ts) ищет страховки
+      // обновления образа `<слаг>__pre_<хеш>`: хеша оно не знает и сверяет
+      // имена само, по точной форме. Другие шаблоны (`{{.Ports}}` боевого
+      // freePort) симулятор не изображает: у него свой freePort.
+      const format = args.includes('--format') ? args[args.indexOf('--format') + 1] : '';
+      if (format !== '{{.Names}}') throw new Error(`docker ps без фильтра: симулятор знает только --format {{.Names}}, а не ${format}`);
+      const names = [...this.containers.keys()].filter((n) => args.includes('-a') || this.isRunning(n));
+      return names.length ? `${names.join('\n')}\n` : '';
+    }
+    const filter = args[args.indexOf('--filter') + 1];
     const m = /^name=\^(.+)\$$/.exec(filter);
     if (!m) throw new Error(`docker ps: неожиданный фильтр ${filter}`);
     // `-a` показывает и остановленные, без него — только запущенные. Разница
@@ -614,6 +625,21 @@ export class FakeHost {
   removeDir = async (dir: string): Promise<void> => {
     this.removedDirs.push(dir);
     this.dirs.delete(dir);
+  };
+
+  /**
+   * `fs.realpath` в мире без ссылок: путь нормализован, несуществующий —
+   * ENOENT с тем же `code`, что у fs (по нему стирание отличает «каталога уже
+   * нет» от «путь не прочитан»). Ссылки симулятор не изображает намеренно:
+   * их проверяет purge.spec.ts на настоящей ФС, а выдуманная модель ссылок
+   * проверяла бы выдумку.
+   */
+  realpath = async (path: string): Promise<string> => {
+    const p = posix.resolve(path);
+    if (!this.dirs.has(p)) {
+      throw Object.assign(new Error(`ENOENT: no such file or directory, realpath '${path}'`), { code: 'ENOENT' });
+    }
+    return p;
   };
 
   /**
@@ -715,6 +741,7 @@ export function deps(host: FakeHost, over: Partial<ProvisionDeps> = {}): Provisi
     writeFiles: host.writeFiles,
     exists: host.exists,
     removeDir: host.removeDir,
+    realpath: host.realpath,
     freePort: host.freePort,
     readHostSecret: async () => `${OAUTH}\n`,
     waitPort: async () => true,
