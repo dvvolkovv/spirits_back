@@ -242,6 +242,29 @@ describe('certbot', () => {
     expect(host.certs.has('linkeon-shop')).toBe(false);
   });
 
+  it('certificates --cert-name: блок с именами, как у живого certbot; нет сертификатов — «No certificates found.»', async () => {
+    const list = (name: string) => host.run(['certbot', 'certificates', '--cert-name', name]);
+    expect(await list('linkeon-shop')).toMatch(/No certificates found\./);
+
+    await certonly('linkeon-shop', 'a.ru', 'www.a.ru');
+    expect(await list('linkeon-shop')).toMatch(/Certificate Name: linkeon-shop\n[\s\S]*Domains: a\.ru www\.a\.ru\n/);
+    // Чужое имя — пустой список под заголовком, а не чужой блок.
+    const other = await list('linkeon-shop2');
+    expect(other).toMatch(/Found the following matching certs:/);
+    expect(other).not.toMatch(/Certificate Name/);
+
+    await host.run(['certbot', 'delete', '--cert-name', 'linkeon-shop', '--non-interactive']);
+    expect(await list('linkeon-shop')).toMatch(/No certificates found\./);
+  });
+
+  it('issueCert заводит сертификат с именами; заведённый без имён — отказ симулятора, а не выдуманные имена', async () => {
+    host.issueCert('linkeon-x', ['*.linkeon.io']);
+    expect(await host.run(['certbot', 'certificates', '--cert-name', 'linkeon-x'])).toMatch(/Domains: \*\.linkeon\.io\n/);
+
+    host.certs.add('linkeon-bare');
+    await expect(host.run(['certbot', 'certificates', '--cert-name', 'linkeon-bare'])).rejects.toThrow(/issueCert/);
+  });
+
   it('отказ выпуска — текстом, заданным тестом, и сертификата нет', async () => {
     host.certbotFails = 'Type: unauthorized';
 
@@ -441,5 +464,73 @@ describe('файлы', () => {
     expect(await host.realpath('/srv/products/shop')).toBe('/srv/products/shop');
     expect(await host.realpath('/srv/products/x/../shop/')).toBe('/srv/products/shop');
     await expect(host.realpath('/srv/products/nope')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('каталог продуктов и каталог конфигов nginx есть и на пустом хосте; убранный — ENOENT', async () => {
+    expect(await host.realpath('/srv/products')).toBe('/srv/products');
+    expect(await host.realpath('/etc/nginx/sites-products/')).toBe('/etc/nginx/sites-products');
+    host.baseDirs.delete('/srv/products');
+    await expect(host.realpath('/srv/products')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('pathKind — как lstat: каталог, файл конфига nginx, ничего', async () => {
+    await host.writeFiles('/srv/products/shop', {});
+    await host.run(['product-vhost', 'shop', '8001']);
+
+    expect(await host.pathKind('/srv/products/shop')).toBe('dir');
+    expect(await host.pathKind('/etc/nginx/sites-products/shop.conf')).toBe('other');
+    expect(await host.pathKind('/etc/nginx/sites-products/nope.conf')).toBe('absent');
+    expect(await host.pathKind('/srv/products/nope')).toBe('absent');
+  });
+});
+
+describe('идентификаторы контейнеров — для стирания', () => {
+  it('ps --no-trunc {{.ID}} {{.Names}}: полный id; без --no-trunc — 12 знаков; id переживает rename', async () => {
+    await run('a');
+    const full = (await host.run(['docker', 'ps', '-a', '--no-trunc', '--format', '{{.ID}} {{.Names}}'])).trim();
+    expect(full).toMatch(/^[0-9a-f]{64} a$/);
+    const short = (await host.run(['docker', 'ps', '-a', '--format', '{{.ID}} {{.Names}}'])).trim();
+    expect(short).toBe(`${full.slice(0, 12)} a`);
+
+    await host.run(['docker', 'rename', 'a', 'b']);
+    expect(host.idOf('b')).toBe(full.slice(0, 64));
+  });
+
+  it('rm ищет ссылку как docker: полный id → имя → начало id; неоднозначное начало — отказ', async () => {
+    await run('a');
+    await run('b');
+    await run('c');
+    host.containers.get('b')!.id = `ab${'1'.repeat(62)}`;
+    host.containers.get('c')!.id = `ab${'2'.repeat(62)}`;
+
+    await host.run(['docker', 'rm', '-f', '-v', host.idOf('a')]);
+    expect(host.containers.has('a')).toBe(false);
+
+    // Имени «ab» нет — docker берёт начало id, и тут оно неоднозначно.
+    await expect(host.run(['docker', 'rm', '-f', 'ab'])).rejects.toThrow(/multiple IDs found/);
+    // Однозначное начало снимает соседа: ровно эта опасность и закрыта
+    // снятием по полному идентификатору (purge.ts).
+    await host.run(['docker', 'rm', '-f', 'ab1']);
+    expect([...host.containers.keys()]).toEqual(['c']);
+
+    await expect(host.run(['docker', 'rm', '-f', '-x', 'c'])).rejects.toThrow(/флаг/);
+    await expect(host.run(['docker', 'rm', '-v', 'c'])).rejects.toThrow(/без -f/);
+  });
+
+  it('ps --filter volume=<путь>: контейнеры, смонтировавшие ровно этот путь (источник или назначение), и с -a — остановленные', async () => {
+    const mount = (name: string, v: string) =>
+      host.run(['docker', 'run', '-d', '--name', name, '--restart', 'unless-stopped', '-v', v, 'linkeon-product:base']);
+    await mount('own', '/srv/products/shop:/product');
+    await mount('spy', '/srv/products/shop:/data');
+    await mount('other', '/srv/products/shop2:/product');
+    await host.run(['docker', 'stop', 'spy']);
+    const ps = (...a: string[]) => host.run(['docker', 'ps', ...a, '--format', '{{.Names}}']);
+
+    expect((await ps('-a', '--filter', 'volume=/srv/products/shop')).split('\n').filter(Boolean).sort()).toEqual(['own', 'spy']);
+    expect((await ps('--filter', 'volume=/srv/products/shop')).trim()).toBe('own');
+    // Замерено на docker 29.8.0: совпадение точное — ни хвостовой слэш, ни родитель не подходят.
+    expect(await ps('-a', '--filter', 'volume=/srv/products/shop/')).toBe('');
+    expect(await ps('-a', '--filter', 'volume=/srv/products')).toBe('');
+    expect((await ps('-a', '--filter', 'volume=/data')).trim()).toBe('spy');
   });
 });
