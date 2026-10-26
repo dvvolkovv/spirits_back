@@ -9,6 +9,7 @@ import { ConfigService } from '@nestjs/config';
 import { PgService } from '../common/services/pg.service';
 import { DomainsService } from './domains.service';
 import { ProductsController } from './products.controller';
+import { FREE_MONTH_PRODUCTS } from './rent.service';
 
 /**
  * Реестр машин. Отдаёт РАЗНЫЕ машины разным аудиториям и разные значения в
@@ -51,7 +52,9 @@ function makeService(over: any = {}) {
       if (sql.includes('INSERT INTO products') && over.productInsertError) {
         throw Object.assign(new Error('boom'), over.productInsertError);
       }
-      if (sql.includes('INSERT INTO products')) return { rows: [{ id: 'p-1' }], rowCount: 1 };
+      if (sql.includes('INSERT INTO products')) {
+        return { rows: [{ id: 'p-1', free_month: over.freeMonth ?? true }], rowCount: 1 };
+      }
       return { rows: [], rowCount: 1 };
     }),
   };
@@ -121,7 +124,7 @@ describe('ProvisioningService.create', () => {
 
     const res = await svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 's', kind: 'site', secrets: {} });
 
-    expect(res).toEqual({ productId: expect.any(String) });
+    expect(res).toEqual({ productId: expect.any(String), freeMonth: expect.any(Boolean) });
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
     expect(insert.params[7]).toMatch(/^[0-9a-f]{64}$/);
   });
@@ -223,9 +226,20 @@ describe('ProvisioningService.create', () => {
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
     expect(insert.sql).toContain(
       '(id, user_id, name, slug, kind, status, checkout_path, runner_token_hash,\n' +
-        '                               secrets_encrypted, domain, host_ip, health_url, host_id, tg_bot_id)',
+        '                               secrets_encrypted, domain, host_ip, health_url, host_id, tg_bot_id, paid_until)',
     );
-    expect(insert.sql).toContain('VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)');
+    // paid_until, пятнадцатой колонкой: CASE внутри самого INSERT (решение
+    // владельца 26.10.2026, см. комментарий в create()) — первым
+    // FREE_MONTH_PRODUCTS продуктам человека за всю историю месяц, остальным
+    // now(). $2 — тот же userId, что и второй колонкой выше; второй раз он
+    // назван здесь не для красоты: это и есть «кому принадлежит счёт».
+    expect(insert.sql).toContain(
+      'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,\n' +
+        "               CASE WHEN (SELECT count(*) FROM products WHERE user_id = $2) < $15\n" +
+        "                      THEN now() + interval '1 month'\n" +
+        '                      ELSE now()\n' +
+        '                    END)',
+    );
     expect(insert.params).toEqual([
       res.productId,
       'u-1',
@@ -261,6 +275,8 @@ describe('ProvisioningService.create', () => {
       // заводит и это поле не передаёт вовсе — null, а не колонка по
       // умолчанию в DDL: заведение задаёт его явно, как и прочие поля.
       null,
+      // FREE_MONTH_PRODUCTS, пятнадцатым параметром — порог CASE выше.
+      FREE_MONTH_PRODUCTS,
     ]);
   });
 
@@ -482,6 +498,51 @@ describe('ProvisioningService.create', () => {
     const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
     expect(insert.params).toContain(res.productId);
     expect(res.productId).not.toBe('p-1');
+  });
+
+  // --- бесплатный месяц (решение владельца 26.10.2026) ------------------
+
+  it('freeMonth в ответе — ровно то, что вернул free_month из RETURNING', async () => {
+    // `=== true` в реализации: подложенное отсюда — не boolean, а строка или
+    // отсутствующая строка, — обязано читаться как «не бесплатно», а не как
+    // истина через приведение типа.
+    const trueCase = makeService({ freeMonth: true });
+    const falseCase = makeService({ freeMonth: false });
+
+    const resTrue = await trueCase.svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 's1', kind: 'site', secrets: {} });
+    const resFalse = await falseCase.svc.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 's2', kind: 'site', secrets: {} });
+
+    expect(resTrue.freeMonth).toBe(true);
+    expect(resFalse.freeMonth).toBe(false);
+  });
+
+  it('пустая или сломанная выдача RETURNING читается как «не бесплатно», а не как истина', async () => {
+    const pg = {
+      query: jest.fn(async (sql: string, params: any[] = []) => {
+        if (sql.includes('SELECT count(*)')) return { rows: [{ count: '0' }] };
+        if (sql.includes('INSERT INTO products')) return { rows: [], rowCount: 1 }; // пустая выдача
+        return { rows: [], rowCount: 1 };
+      }),
+    };
+    const hosts = { pickForNewProduct: jest.fn(async () => ({ id: 'clients', publicIp: '10.1.2.3', domainSuffix: 'c.linkeon.io' })) };
+    const limits = { assertCanCreate: jest.fn(async () => undefined) };
+    const secrets = { encrypt: jest.fn(() => Buffer.from('шифр')) };
+    const broken = new ProvisioningService(pg as any, secrets as any, hosts as any, limits as any);
+
+    const res = await broken.create({ userId: 'u-1', isAdmin: false, name: 'X', slug: 'site3', kind: 'site', secrets: {} });
+
+    expect(res.freeMonth).toBe(false);
+  });
+
+  it('CASE считает ВСЕХ продуктов этого userId внутри самого INSERT, порогом — FREE_MONTH_PRODUCTS', async () => {
+    const { svc, calls } = makeService();
+
+    await svc.create({ userId: 'u-7', isAdmin: false, name: 'X', slug: 'site4', kind: 'site', secrets: {} });
+
+    const insert = calls.find((c) => c.sql.includes('INSERT INTO products'))!;
+    expect(insert.sql).toContain('(SELECT count(*) FROM products WHERE user_id = $2)');
+    expect(insert.params[1]).toBe('u-7');
+    expect(insert.params[14]).toBe(FREE_MONTH_PRODUCTS);
   });
 
   it('задание ставится ПОСЛЕ продукта и ровно на него', async () => {

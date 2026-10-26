@@ -14,6 +14,7 @@ import { AGENT_OUTDATED_MARKER } from './domain-name';
 import { HostsService } from './hosts.service';
 import { LimitsService } from './limits.service';
 import { SecretsService } from './secrets.service';
+import { FREE_MONTH_PRODUCTS } from './rent.service';
 
 export type ProductKind = 'site' | 'bot';
 
@@ -517,7 +518,7 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    *
    * Живой runner-токен здесь НЕ выпускается — см. комментарий к hash ниже.
    */
-  async create(input: CreateInput): Promise<{ productId: string }> {
+  async create(input: CreateInput): Promise<{ productId: string; freeMonth: boolean }> {
     if (input.kind !== 'site' && input.kind !== 'bot') {
       throw new BadRequestException('неизвестная форма продукта');
     }
@@ -672,11 +673,51 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       ? this.secrets.encrypt(input.secrets, productId)
       : null;
 
+    // ПЕРВЫЙ МЕСЯЦ БЕСПЛАТНО — ТОЛЬКО ПЕРВЫМ FREE_MONTH_PRODUCTS ПРОДУКТАМ ЧЕЛОВЕКА ЗА ВСЮ ИСТОРИЮ.
+    //
+    // Решение владельца 26.10.2026. Раньше срок полностью держался на DEFAULT
+    // колонки products.paid_until (004_rent.sql), и этот INSERT её не
+    // перечислял вовсе — поэтому там до сих пор написано, что перечислять её
+    // здесь «и не должен»: это было верно до этой правки, а не навсегда.
+    // Свежему продукту DEFAULT всегда даёт месяц. Но удаление в этом проекте
+    // мягкое (archived_at, а не DELETE), и LimitsService считает занятость
+    // предела ТОЛЬКО по archived_at IS NULL — то есть «завести → удалить →
+    // завести» снимает с человека предел немедленно и тут же выдаёт второй
+    // бесплатный месяц, третий, сколько угодно.
+    //
+    // СЧИТАЮТСЯ ВСЕ СТРОКИ ЭТОГО user_id, А НЕ ТОЛЬКО ЖИВЫЕ. Удалённый
+    // (archived_at не NULL) и даже стёртый (purged_at не NULL) продукт
+    // остаётся строкой в той же таблице products — не считать их значило бы
+    // вернуть ровно ту дыру, которую чинит эта правка.
+    //
+    // ВЫЧИСЛЯЕТСЯ ВНУТРИ INSERT, ОДНИМ ОПЕРАТОРОМ, А НЕ ОТДЕЛЬНЫМ SELECT
+    // ПЕРЕД НИМ. Отдельный count(*) читал бы снимок, который для второго из
+    // двух одновременных заведений одного человека устареет к моменту записи.
+    // ОСТАТОЧНАЯ ГОНКА ЕСТЬ: два параллельных create() одного userId оба
+    // могут увидеть count меньше FREE_MONTH_PRODUCTS и оба получить бесплатный
+    // месяц. Она не закрывается здесь и не обязана: входом в неё можно
+    // воспользоваться не больше раз, чем позволяет сам предел аккаунта
+    // (LimitsService.assertCanCreate, DEFAULT_MAX_PRODUCTS) — assertCanCreate
+    // стоит раньше этого INSERT и бьёт собственную гонку тем же способом
+    // (см. её комментарий «предел мягкий под одновременными заявками»), то
+    // есть цена ошибки здесь уже заранее ограничена, а не бесконечна.
+    //
+    // БЕЗ ИСКЛЮЧЕНИЯ ДЛЯ АДМИНИСТРАТОРА. RentService.chargeRent/tick аренду
+    // списывает по status/paid_until, не глядя на isAdmin — правило одно на
+    // всех. У LimitsService администратор исключён из предела количества
+    // (другое решение, другая причина — своя машина со своим потолком), но
+    // это не довод заводить второе понятие «свой» и здесь.
+    let freeMonth = false;
     try {
-      await this.pg.query(
+      const ins = await this.pg.query(
         `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash,
-                               secrets_encrypted, domain, host_ip, health_url, host_id, tg_bot_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+                               secrets_encrypted, domain, host_ip, health_url, host_id, tg_bot_id, paid_until)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                 CASE WHEN (SELECT count(*) FROM products WHERE user_id = $2) < $15
+                        THEN now() + interval '1 month'
+                        ELSE now()
+                      END)
+         RETURNING paid_until > now() + interval '27 days' AS free_month`,
         [
           productId,
           input.userId,
@@ -712,8 +753,14 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
           // она несёт ещё и результат проверки Студии чуть выше (I2), которой
           // у `input.tgBotId` просто нет.
           tgBotId,
+          FREE_MONTH_PRODUCTS,
         ],
       );
+      // `=== true`, а не приведение к истинности: сравнение в RETURNING
+      // отдаёт настоящий boolean, но лишняя защита от NULL/undefined дешевле,
+      // чем молчаливое «бесплатно» при пустой выдаче (та же осторожность,
+      // что в LimitsService.assertCanCreate).
+      freeMonth = ins.rows?.[0]?.free_month === true;
     } catch (e: any) {
       // Гонка: между SELECT count(*) и этим INSERT слаг мог занять
       // параллельный запрос. Продукта при этом не остаётся, страдает только
@@ -764,7 +811,7 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       throw e;
     }
 
-    return { productId };
+    return { productId, freeMonth };
   }
 
   /**

@@ -1787,6 +1787,75 @@ maybe('провижининг против живого Postgres', () => {
     ).rejects.toThrow(/product_user_limits_pkey/);
   });
 
+  // ═══ бесплатный месяц — только первым FREE_MONTH_PRODUCTS продуктам человека (решение владельца 26.10.2026) ═══
+
+  it('105. первые FREE_MONTH_PRODUCTS продуктов человека — аренда оплачена на месяц вперёд', async () => {
+    // Раньше INSERT вовсе не перечислял paid_until, и DEFAULT колонки отдавал
+    // этот месяц каждому продукту безусловно. Теперь — явно, внутри самого
+    // INSERT (provisioning.service.ts): первым FREE_MONTH_PRODUCTS продуктам
+    // человека за всю историю — тот же месяц, остальным — now().
+    await ensureHost('clients');
+    const svc = makeSvc();
+
+    const first = await svc.create({ userId: 'u-free-month', isAdmin: false, name: 'первый', slug: 'fm-first', kind: 'site', secrets: {} });
+    const second = await svc.create({ userId: 'u-free-month', isAdmin: false, name: 'второй', slug: 'fm-second', kind: 'site', secrets: {} });
+
+    expect(first.freeMonth).toBe(true);
+    expect(second.freeMonth).toBe(true);
+
+    for (const id of [first.productId, second.productId]) {
+      const row = await getProduct(id);
+      const days = (new Date(row.paid_until).getTime() - Date.now()) / 86_400_000;
+      // Окно в сутки с запасом: месяц — календарный, в феврале он короче.
+      expect(days).toBeGreaterThan(27);
+      expect(days).toBeLessThan(32);
+    }
+  });
+
+  it('106. третий продукт после удаления второго — аренда сразу платная', async () => {
+    // Предел аккаунта (считает только archived_at IS NULL) снимается удалением
+    // немедленно, а счёт бесплатных месяцев — нет: удалённый продукт всё равно
+    // был одним из первых FREE_MONTH_PRODUCTS. Без этого «завести → удалить →
+    // завести» выдавало бы бесплатный месяц заново до бесконечности — ровно та
+    // дыра, которую чинит эта правка (см. комментарий у FREE_MONTH_PRODUCTS).
+    await ensureHost('clients');
+    const svc = makeSvc();
+
+    await svc.create({ userId: 'u-free-month-2', isAdmin: false, name: 'первый', slug: 'fm3-first', kind: 'site', secrets: {} });
+    const second = await svc.create({ userId: 'u-free-month-2', isAdmin: false, name: 'второй', slug: 'fm3-second', kind: 'site', secrets: {} });
+    await pool.query('UPDATE products SET archived_at = now() WHERE id = $1', [second.productId]);
+
+    const third = await svc.create({ userId: 'u-free-month-2', isAdmin: false, name: 'третий', slug: 'fm3-third', kind: 'site', secrets: {} });
+
+    expect(third.freeMonth).toBe(false);
+    const row = await getProduct(third.productId);
+    const seconds = Math.abs(new Date(row.paid_until).getTime() - Date.now()) / 1000;
+    expect(seconds).toBeLessThan(10);
+  });
+
+  it('107. стёртый (purged_at) продукт всё равно занимает место в счёте бесплатных месяцев', async () => {
+    // Если бы считались только живые строки, стёртый продукт освобождал бы
+    // слот бесплатного месяца НАВСЕГДА — тот же приём, что у теста 106 для
+    // простого удаления, но для случая, где человек дождался стирания
+    // (очередь 2) и тут же завёл новый.
+    await ensureHost('clients');
+    const svc = makeSvc();
+
+    const a = await svc.create({ userId: 'u-free-month-3', isAdmin: false, name: 'стёртый', slug: 'fm4-purged', kind: 'site', secrets: {} });
+    await pool.query('UPDATE products SET archived_at = now(), purged_at = now() WHERE id = $1', [a.productId]);
+
+    // Второй из первых FREE_MONTH_PRODUCTS — счёт на момент его INSERT равен 1
+    // (стёртый), 1 < 2 — ещё бесплатно.
+    const b = await svc.create({ userId: 'u-free-month-3', isAdmin: false, name: 'второй', slug: 'fm4-second', kind: 'site', secrets: {} });
+    expect(b.freeMonth).toBe(true);
+
+    // Третий — счёт на момент его INSERT равен 2 (стёртый + второй), 2 не
+    // меньше 2 — платный. Останься true, значило бы, что стёртая строка не
+    // посчиталась.
+    const c = await svc.create({ userId: 'u-free-month-3', isAdmin: false, name: 'третий', slug: 'fm4-third', kind: 'site', secrets: {} });
+    expect(c.freeMonth).toBe(false);
+  });
+
   // ═══════════════ отметка о жизни агента хоста ═══════════════
 
   /**
