@@ -59,11 +59,11 @@ describe('POST soulmate/chat: ui доезжает до сервиса', () => {
   };
 
   it('веб прислал ui — сервис получает обе возможности', async () => {
-    expect(await run({ ui: { activity: true, ask: true } })).toEqual({ activity: true, ask: true });
+    expect(await run({ ui: { activity: true, ask: true } })).toEqual({ activity: true, ask: true, cards: false });
   });
 
   it('без ui — ничего нового', async () => {
-    expect(await run({})).toEqual({ activity: false, ask: false });
+    expect(await run({})).toEqual({ activity: false, ask: false, cards: false });
   });
 });
 

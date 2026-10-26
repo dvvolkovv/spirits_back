@@ -1,4 +1,5 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { ChatToolsService } from './chat-tools';
@@ -24,6 +25,8 @@ import { ASK_RULE } from './ask-rule';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
 import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
+import { ProductActionsService } from '../products/product-actions.service';
+import { productActionTail } from '../products/product-action-tail';
 import { ChatFileStore, PERSIST_TURN_BUDGET_MS } from './chat-files/chat-file-store';
 import { RelayOutputFile, collectOutputFiles, outputFileLines, storeRelayLinks } from './chat-files/relay-links';
 import { BalanceContextService } from '../tokens/balance-context.service';
@@ -433,6 +436,10 @@ export class ChatService {
     // той же причине, что chatFiles; что он подключён, сторожит
     // chat.module.chat-files.spec.ts.
     @Optional() private readonly costGrowth?: CostGrowthService,
+    // Карточки действий продуктов (создание бота, удаление). Последним и
+    // @Optional по той же причине, что chatFiles; что модуль подключён,
+    // сторожит chat.product-actions-wiring.spec.ts.
+    @Optional() private readonly productActions?: ProductActionsService,
   ) {}
 
   /**
@@ -1134,7 +1141,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // (productsRelayFields), Маша — локальным CLI: тот же /webhook/mcp/products
     // по loopback, токен этого пользователя с каналом web — правки ложатся в
     // product_turns с channel='web'. Токен уходит в файл конфига 0600, не в argv.
-    const products = productsCliMcp(userId, 'web');
+    const productsTurn = randomUUID();
+    const products = productsCliMcp(userId, 'web', productsTurn);
     // Звали ли в этом ходе инструмент продуктов — от этого зависит карта ниже.
     let usedProductsTool = false;
 
@@ -1247,6 +1255,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
         } catch (e: any) {
           this.logger.error(`Metaphor card error: ${e.message}`);
         }
+      }
+
+      try {
+        const taken = (await this.productActions?.takeForTurn(userId, productsTurn, new Date(turnStartedAt), 'web')) ?? [];
+        fullText += productActionTail(taken, ui.cards, userLanguage);
+      } catch (e: any) {
+        this.logger.warn(`product action attach failed: ${e.message}`);
       }
 
       const tokensUsed = inputTokens + outputTokens;
@@ -1808,6 +1823,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Ключ сессии релея: и в запросе, и для шагов работы — релей кладёт
       // загрузки под именем «<ключ>_<файл>», и префикс надо срезать.
       const relaySid = relaySessionKey(userId, assistantId, userLanguage, fresh ? freshSessionId : undefined);
+      // Метка хода — одна на оба вызова upstream (самолечение пустого потока
+      // зовёт его второй раз): карточка не должна потеряться между ними.
+      const productsTurn = randomUUID();
       const callUpstreamOnce = async (): Promise<void> => {
         const FormData = require('form-data');
         const fd = new FormData();
@@ -1866,7 +1884,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // Инструмент продуктов. В отличие от MCP-инструментов на общей точке,
         // владелец едет ПОДПИСЬЮ в заголовке, а не подсказкой в промпте:
         // телефоном в аргументе правились бы чужие сайты.
-        const pf = productsRelayFields(userId);
+        const pf = productsRelayFields(userId, productsTurn);
         fd.append('products_token', pf.products_token);
         fd.append('products_mcp_url', pf.products_mcp_url);
 
@@ -2123,6 +2141,19 @@ ${LanguageService.buildDirective(userLanguage)}`;
         }
       } catch (e: any) {
         this.logger.warn(`speech marker injection failed: ${e.message}`);
+      }
+
+      // Карточки продуктов, заведённые этим ходом: блок для клиента с
+      // карточками, ссылка на кабинет — для остальных.
+      try {
+        const taken = (await this.productActions?.takeForTurn(userId, productsTurn, new Date(streamStartTime), 'web')) ?? [];
+        const tail = productActionTail(taken, ui.cards, userLanguage);
+        if (tail) {
+          chunks.push(tail);
+          safeWrite({ type: 'item', content: tail });
+        }
+      } catch (e: any) {
+        this.logger.warn(`product action attach failed: ${e.message}`);
       }
 
       const fullText = chunks.join('');
