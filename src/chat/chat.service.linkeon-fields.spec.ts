@@ -126,3 +126,51 @@ describe('streamUniversalAgent: поля инструментов Linkeon', () =
     expect(h.get.mock.calls[0][0]).toContain(`/session/${fsKey}/files`);
   });
 });
+
+describe('agentReply: поля инструментов Linkeon', () => {
+  const AGENT = { id: 12, name: 'Роман', display_name: 'Роман', description: '', system_prompt: '', category: 'business' };
+  function replyHarness() {
+    const pg = { query: jest.fn(async (sql: string) => (/FROM agents WHERE id/.test(sql) ? { rows: [AGENT] } : { rows: [] })) };
+    const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
+    const svc = new ChatService(pg as any, null as any, null as any, null as any, language as any, undefined, undefined, undefined, undefined);
+    const post = axios.post as jest.Mock;
+    post.mockImplementation(async () => ({ data: sseStream([{ type: 'delta', text: 'ок' }, { type: 'done' }]) }));
+    const last = () => fieldsOf(post.mock.calls[post.mock.calls.length - 1][1]);
+    return { svc, last };
+  }
+
+  it('рутина и «Путь» (без своей сессии): токен пользователя, fs_key его сессии', async () => {
+    const { svc, last } = replyHarness();
+    await svc.generateAgentReply('u-routine', '12', 'утренний текст');
+    const f = last();
+    const sid = relaySessionKey('u-routine', '12', 'ru');
+    expect(f.sessionId).toBe(sid);
+    expect(verifyLinkeonToolToken(f.linkeon_token)).toEqual({ userId: 'u-routine' });
+    expect(f.fs_key).toBe(relayFsKey(sid));
+  });
+
+  it('итоги звонка (своя сессия): fs_key — от этой сессии', async () => {
+    const { svc, last } = replyHarness();
+    await svc.generateAgentReply('u-voice', '12', 'итоги', 'voice_summary_abc');
+    const f = last();
+    expect(f.sessionId).toBe('voice_summary_abc');
+    expect(verifyLinkeonToolToken(f.linkeon_token)).toEqual({ userId: 'u-voice' });
+    expect(f.fs_key).toBe(relayFsKey('voice_summary_abc'));
+  });
+
+  it('голосовой документ (со списанием): поля тоже есть', async () => {
+    const { svc, last } = replyHarness();
+    await svc.generateAgentReplyWithCharge('u-voice', '12', 'документ', 'voice_doc_c1_d1');
+    const f = last();
+    expect(verifyLinkeonToolToken(f.linkeon_token)).toEqual({ userId: 'u-voice' });
+    expect(f.fs_key).toBe(relayFsKey('voice_doc_c1_d1'));
+  });
+
+  it('linkeonTools: false (проба качества) — полей нет', async () => {
+    const { svc, last } = replyHarness();
+    await svc.generateAgentReply('70000000000', '12', 'проба', 'qprobe_12_1', { linkeonTools: false });
+    const f = last();
+    expect(f.sessionId).toBe('qprobe_12_1');
+    for (const k of ['linkeon_token', 'linkeon_mcp_url', 'fs_key']) expect(f[k]).toBeUndefined();
+  });
+});
