@@ -21,7 +21,10 @@ import { rowToShort } from './shorts.types';
  */
 const PG = process.env.SHORTS_PG_URL;
 const maybe = PG ? describe : describe.skip;
-const MIGRATION = path.join(__dirname, 'migrations', '001_shorts.sql');
+const MIGRATIONS = ['001_shorts.sql', '002_skits.sql'].map((f) => path.join(__dirname, 'migrations', f));
+const migrate = async (pool: Pool) => {
+  for (const f of MIGRATIONS) await pool.query(fs.readFileSync(f, 'utf8'));
+};
 
 maybe('ролики против живого Postgres', () => {
   jest.setTimeout(60_000);
@@ -39,7 +42,7 @@ maybe('ролики против живого Postgres', () => {
       const n = await pool.query('SELECT count(*)::int AS n FROM short_video');
       if (n.rows[0].n > 0) throw new Error('в short_video уже есть строки — нужна одноразовая база, TRUNCATE их сотрёт');
     }
-    await pool.query(fs.readFileSync(MIGRATION, 'utf8'));
+    await migrate(pool);
     ours = true;
   });
 
@@ -75,12 +78,32 @@ maybe('ролики против живого Postgres', () => {
       await holder.query(`UPDATE short_video SET topic_hint = 'держу строку'`);
       await holder.query(`UPDATE short_settings SET slot_hour_msk = 19 WHERE id = 1`);
       const t0 = Date.now();
-      await pool.query(fs.readFileSync(MIGRATION, 'utf8'));
+      await migrate(pool);
       expect(Date.now() - t0).toBeLessThan(3000);
     } finally {
       await holder.query('ROLLBACK');
       holder.release();
     }
+  });
+
+  it('002 поверх роликов без формата: старые — chat, новые — skit; статусы оживления проходят CHECK', async () => {
+    await pool.query('ALTER TABLE short_video DROP COLUMN format');
+    const old = await insert({});
+    await migrate(pool);
+    const fresh = await insert({ status: 'animating' });
+    const rows = await pool.query('SELECT id, format FROM short_video');
+    const format = new Map(rows.rows.map((r) => [r.id, r.format]));
+    expect([format.get(old.id), format.get(fresh.id)]).toEqual(['chat', 'skit']);
+    await insert({ status: 'animate_queued' });
+    await expect(insert({ status: 'dancing' })).rejects.toThrow(/short_video_status_check/);
+    await expect(insert({ format: 'cartoon' })).rejects.toThrow(/check/);
+    const checks = await pool.query(
+      `SELECT count(*)::int AS n FROM pg_constraint
+        WHERE conrelid = 'public.short_video'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%''render_queued''%'`,
+    );
+    expect(checks.rows[0].n).toBe(1);
+    const s = await pool.query('SELECT format, max_omni_seconds FROM short_settings WHERE id = 1');
+    expect(s.rows[0]).toEqual({ format: 'skit', max_omni_seconds: 48 });
   });
 
   it('два одобрения в один планируемый слот — разные слоты, планируемый достаётся одному', async () => {
