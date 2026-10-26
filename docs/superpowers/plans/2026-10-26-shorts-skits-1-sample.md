@@ -37,10 +37,7 @@
   - Гейт типов бэкенда: `NODE_RUN_DIR=. "$WT"/studio/scripts/node-run.sh "npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`. jest типы не проверяет (`isolatedModules`).
   - Гейт типов студии: `"$WT"/studio/scripts/node-run.sh "npm run typecheck && echo TSC_OK"`.
 - **Любой вызов `node-run.sh` — с `timeout: 600000`;** долгие (рендер, оживление) — с `run_in_background`. Код 75 — воркдерево ноды занято другим прогоном (повторить позже), 3 — воркдерево не встало на коммит (команда не запускалась; это не «ожидаемый красный»), 255 — ssh сброшен по `MaxStartups` (повторить через 1–2 минуты, не петлёй).
-- **SSH к ноде — через одно мастер-соединение:** все `ssh` и `scp` в плане идут с `-o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m`. Ниже это `$SSHO`:
-  ```bash
-  SSHO='-o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o ControlPath=$HOME/.ssh/cm-%C -o ControlPersist=30m'
-  ```
+- **SSH к ноде — через одно мастер-соединение:** все `ssh` и `scp` в плане идут с опциями `-o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m`. Опции пишутся в команде явно: шелл агента — zsh, и переменная с опциями в нём не делится на слова — ssh получает одну строку и падает с `keyword connecttimeout extra arguments`.
 - **Живой чекаут `~/spirits_back` на ноде не трогать:** из него работает test.linkeon.io. Из его `.env` можно только читать.
 - **Ничего не вливать в main и не выкатывать.** Этот план выкат не требует вовсе.
 - **Секреты.** Ключ Google живёт только в `~/ci/wt/promo-shorts/studio/.env` на ноде. Не печатать его, не класть в репозиторий (репозитории Linkeon публичные), не передавать в командной строке.
@@ -3128,8 +3125,8 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Запускать с `run_in_background`. Expected: обе фикстуры `pass` (прежняя — обычный ролик — тоже), затем `TSC_OK`. Скопировать кадр середины конфликта и развязки и посмотреть глазами — на них видны зацепка (первые 2 с) и субтитры реплик:
 
 ```bash
-ssh $SSHO dv@85.192.61.231 'd=$(ls -dt /tmp/studio-skit-fixture-* | head -1); ffmpeg -hide_banner -loglevel error -y -i $d/video.mp4 -vf "select=eq(n\,30)+eq(n\,100)+eq(n\,900),scale=360:-1,tile=3x1" -frames:v 1 /tmp/skit-fixture-strip.jpg && echo $d'
-scp $SSHO dv@85.192.61.231:/tmp/skit-fixture-strip.jpg /tmp/skit-fixture-strip.jpg
+ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 'd=$(ls -dt /tmp/studio-skit-fixture-* | head -1); ffmpeg -hide_banner -loglevel error -y -i $d/video.mp4 -vf "select=eq(n\,30)+eq(n\,100)+eq(n\,900),scale=360:-1,tile=3x1" -frames:v 1 /tmp/skit-fixture-strip.jpg && echo $d'
+scp -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231:/tmp/skit-fixture-strip.jpg /tmp/skit-fixture-strip.jpg
 ```
 
 Открыть `/tmp/skit-fixture-strip.jpg` (Read). Expected: кадр 30 — оранжевый фон с крупной зацепкой сверху и субтитром «Обои потёрли! Залог мой!» ниже середины; кадр 100 — субтитр «Обои потёрли! Залог мой!» или «Спокойно.» без зацепки; кадр 900 — фиолетовая развязка с субтитром.
@@ -3171,7 +3168,7 @@ Expected: все сюиты `src/shorts` зелёные (интеграцион�
 - [ ] **Step 1: Ключ Google в `.env` студии на ноде — без вывода на экран**
 
 ```bash
-ssh $SSHO dv@85.192.61.231 'f=~/ci/wt/promo-shorts/studio/.env; grep -q "^GOOGLE_AI_API_KEY=." "$f" || grep "^GOOGLE_AI_API_KEY=" ~/spirits_back/.env >> "$f"; grep -c "^GOOGLE_AI_API_KEY=." "$f"'
+ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 'f=~/ci/wt/promo-shorts/studio/.env; grep -q "^GOOGLE_AI_API_KEY=." "$f" || grep "^GOOGLE_AI_API_KEY=" ~/spirits_back/.env >> "$f"; grep -c "^GOOGLE_AI_API_KEY=." "$f"'
 ```
 
 Expected: `1`. Если `0` — ключа нет и в `~/spirits_back/.env`: остановиться и спросить владельца.
@@ -3179,7 +3176,7 @@ Expected: `1`. Если `0` — ключа нет и в `~/spirits_back/.env`: �
 - [ ] **Step 2: Папка образца из настоящей съёмки**
 
 ```bash
-ssh $SSHO dv@85.192.61.231 'cd ~/ci/wt/promo-shorts/studio && src=out/jobs/987f6045-3275-42fe-8922-7305630782dd/render-1 && mkdir -p out/skit-sample-1 && cp $src/capture.json $src/question.png $src/answer.png out/skit-sample-1/ && ls out/skit-sample-1'
+ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 'cd ~/ci/wt/promo-shorts/studio && src=out/jobs/987f6045-3275-42fe-8922-7305630782dd/render-1 && mkdir -p out/skit-sample-1 && cp $src/capture.json $src/question.png $src/answer.png out/skit-sample-1/ && ls out/skit-sample-1'
 ```
 
 Expected: `answer.png  capture.json  question.png`. Если папки съёмки нет — остановиться и сообщить: нужна новая съёмка через рабочий процесс стенда, это отдельное решение.
@@ -3216,10 +3213,10 @@ Expected: `skit-plan: studio/out/skit-sample-1/script.json — conflict <16 hex>
 - [ ] **Step 6: Самопроверка до показа владельцу**
 
 ```bash
-ssh $SSHO dv@85.192.61.231 'cd ~/ci/wt/promo-shorts/studio/out/skit-sample-1 && ffmpeg -hide_banner -loglevel error -y -i video.mp4 -vf "fps=1/3,scale=270:-1,tile=7x2" -frames:v 1 strip.jpg && for f in skits/*/clip.mp4 voice/a1.mp3; do printf "%s " $f; ffmpeg -hide_banner -nostats -i $f -af ebur128 -f null - 2>&1 | grep -E "^ +I:" | tail -1; done'
+ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 'cd ~/ci/wt/promo-shorts/studio/out/skit-sample-1 && ffmpeg -hide_banner -loglevel error -y -i video.mp4 -vf "fps=1/3,scale=270:-1,tile=7x2" -frames:v 1 strip.jpg && for f in skits/*/clip.mp4 voice/a1.mp3; do printf "%s " $f; ffmpeg -hide_banner -nostats -i $f -af ebur128 -f null - 2>&1 | grep -E "^ +I:" | tail -1; done'
 mkdir -p ~/Downloads/linkeon_shorts
-scp $SSHO dv@85.192.61.231:ci/wt/promo-shorts/studio/out/skit-sample-1/video.mp4 ~/Downloads/linkeon_shorts/skit-sample-1.mp4
-scp $SSHO dv@85.192.61.231:ci/wt/promo-shorts/studio/out/skit-sample-1/strip.jpg /tmp/skit-sample-1-strip.jpg
+scp -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231:ci/wt/promo-shorts/studio/out/skit-sample-1/video.mp4 ~/Downloads/linkeon_shorts/skit-sample-1.mp4
+scp -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231:ci/wt/promo-shorts/studio/out/skit-sample-1/strip.jpg /tmp/skit-sample-1-strip.jpg
 ```
 
 Открыть `/tmp/skit-sample-1-strip.jpg` (Read) и проверить:
