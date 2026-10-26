@@ -6,7 +6,7 @@ import { PgService } from '../common/services/pg.service';
 import { StageFatalError } from './short-jobs';
 import { DirectorReply, parseDirectorReply } from './short-parse';
 import { AgentLite, DIRECTOR_SKIT_SYSTEM, DIRECTOR_SYSTEM, buildDirectorMessage, recentSkitLine, toAgents } from './short-prompts';
-import { checkSkitRules } from './short-rules';
+import { checkSkitRules, checkSkitTextRules } from './short-rules';
 import { Skit } from './short-skit-prompts';
 import { shortSlug } from './short-slug';
 import { isHealthAssistant } from './short-assistants';
@@ -48,21 +48,23 @@ export class ShortsDirectorService {
         ORDER BY created_at DESC LIMIT ${RECENT_QUESTIONS}`,
       [v.id],
     );
+    // Прошлые сценки — обе: шутка развязки повторяется так же, как место конфликта.
     const recentSkits = skitFormat
       ? (
           await this.pg.query(
-            `SELECT scene->'skit' AS skit FROM short_video
+            `SELECT scene->'skit' AS skit, script->'skits'->'punchline'->'skit' AS punchline FROM short_video
               WHERE id <> $1 AND scene ? 'skit'
               ORDER BY created_at DESC LIMIT ${RECENT_SKITS}`,
             [v.id],
           )
         ).rows
-          .map((r: any) => r.skit as Skit)
-          .filter((s) => s && typeof s === 'object')
-          .map(recentSkitLine)
+          .filter((r: any) => r.skit && typeof r.skit === 'object')
+          .map((r: any) => recentSkitLine(r.skit as Skit, r.punchline && typeof r.punchline === 'object' ? (r.punchline as Skit) : null))
       : [];
 
-    let previous: Skit | null = null;
+    // Сценка 1 прошлой сцены («Переснять», просьба сценариста) — режиссёр придумывает другую.
+    const replaced: Skit | null = skitFormat ? v.scene?.skit ?? null : null;
+    let rejected: { question: string; skit: Skit } | null = null;
     let violations: string[] = [];
     for (let round = 0; round <= MAX_SKIT_REWRITES; round++) {
       const message = buildDirectorMessage({
@@ -74,7 +76,7 @@ export class ShortsDirectorService {
         recentQuestions: recent.rows.map((r: any) => r.q).filter(Boolean),
         ownerNote: v.ownerNote,
         previousQuestion: v.scene?.question ?? null,
-        ...(skitFormat ? { skit: { recent: recentSkits, previous, violations } } : {}),
+        ...(skitFormat ? { skit: { recent: recentSkits, replaced, rejected, violations } } : {}),
       });
 
       // Новая сессия на каждый вызов: совпавший sessionId стенда и прода 18.10.2026
@@ -87,12 +89,18 @@ export class ShortsDirectorService {
         fixedAssistantId: fixed?.id ?? null,
         skit: skitFormat,
       });
-      // Правила 16–18 у сценки 1 — до записи: сценка с нарушением дошла бы до
-      // денег Omni. Нарушения уходят режиссёру на переписку, как сценаристу.
-      violations = skitFormat ? checkSkitRules(reply.skit, 'conflict', null) : [];
+      // Правила 16–18 и правила текста у сценки 1 — до записи: сценка с нарушением
+      // дошла бы до денег Omni, а сценарист без замечаний её не переписывает.
+      // Нарушения уходят режиссёру на переписку, как сценаристу.
+      violations = skitFormat
+        ? [
+            ...checkSkitRules(reply.skit, 'conflict', null),
+            ...checkSkitTextRules(reply.skit, 'conflict', { angle: v.angle, sceneQuestion: reply.question, assistantsCount: assistants.length }),
+          ]
+        : [];
       if (violations.length) {
         this.logger.warn(`ролик ${v.id}: сценка 1 не прошла правила (круг ${round + 1}): ${violations.join('; ')}`);
-        previous = reply.skit;
+        rejected = { question: reply.question, skit: reply.skit };
         continue;
       }
       await this.save(v, assistants, reply);

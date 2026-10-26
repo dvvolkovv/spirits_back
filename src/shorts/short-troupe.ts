@@ -44,7 +44,7 @@ export const TROUPE: readonly Hero[] = [
     who: 'the capybara',
     look: 'a brown capybara with a calm, slightly sleepy face, wearing a chunky beige knitted sweater',
     voice: 'soft, calm, unhurried mid-pitched male voice',
-    manner: 'Главный герой, «обычный человек». Невозмутим, сколько бы на него ни кричали. Не спорит и не паникует — открывает Linkeon.',
+    manner: 'Главный герой, «обычный человек». Невозмутим, сколько бы на него ни кричали. Не спорит и не паникует — спрашивает ассистента.',
     roles: ['жилец', 'работник', 'покупатель', 'клиент', 'сосед', 'муж', 'предприниматель', 'заёмщик'],
     catchphrases: ['Спокойно. Сейчас спрошу.'],
   },

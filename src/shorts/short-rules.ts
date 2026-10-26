@@ -1,6 +1,6 @@
 import { isHealthAssistant } from './short-assistants';
 import { MAX_SKIT_LINE_WORDS, MAX_SKIT_WORDS, SKIT_KINDS, Skit, SkitKind, wordCount } from './short-skit-prompts';
-import { heroById } from './short-troupe';
+import { TROUPE, heroById } from './short-troupe';
 import { PROVOCATIVE_ANGLES, ShortAngle, ShortFormat, ShortParagraph, ShortScript } from './shorts.types';
 
 /**
@@ -71,7 +71,17 @@ export const MAX_SKIT_ESTIMATED_SEC = 26;
 /** Как сценка называется в нарушениях и подписях владельцу — так же её зовёт студия. */
 export const SKIT_LABELS: Record<SkitKind, string> = { conflict: 'сценка 1 (конфликт)', punchline: 'сценка 2 (развязка)' };
 
-const normRole = (s: unknown): string => String(s ?? '').trim().toLowerCase().replace(/ё/g, 'е');
+const normRole = (s: unknown): string => String(s ?? '').trim().toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ');
+
+/** Роль из списка героя — или она же с уточнением целыми словами: «хозяйка квартиры на Тверской», но не «соседка» у «сосед». */
+const roleFits = (role: unknown, roles: string[]): boolean => {
+  const r = normRole(role);
+  return roles.map(normRole).some((x) => r === x || r.startsWith(`${x} `));
+};
+
+/** Ремарки — скобки, звёздочки, подчёркивания: Omni прочтёт их вслух. Движения — в action. */
+const STAGE_DIRECTION = /[()[\]*_]/;
+const CYRILLIC = /[а-яё]/i;
 
 /**
  * Правила 16–18 и форма сценки — до промптов и до денег (спека сценок,
@@ -101,15 +111,16 @@ export function checkSkitRules(skit: unknown, kind: SkitKind, paragraphs: ShortP
   for (const c of cast) {
     const hero = heroById(String(c?.hero ?? ''));
     if (!hero) {
-      add(`правило 16: героя «${c?.hero}» нет в труппе`);
+      add(`правило 16: героя «${c?.hero}» нет в труппе — есть ${TROUPE.map((h) => h.id).join(', ')}`);
       continue;
     }
     if (inCast.has(hero.id)) add(`правило 16: ${hero.name} в составе дважды`);
     inCast.add(hero.id);
-    if (!hero.roles.map(normRole).includes(normRole(c?.role))) {
+    if (!roleFits(c?.role, hero.roles)) {
       add(`правило 16: роль «${String(c?.role ?? '').trim()}» не из ролей героя ${hero.name} (${hero.roles.join(', ')})`);
     }
   }
+  if (cast.length && !inCast.has('kesha')) add('правило 16: Капибара Кеша (kesha) играет в каждой сценке — добавь его в состав');
   // Правило 17: 1–3 реплики, каждая до 12 слов, вместе до 25.
   const lines = Array.isArray(s.lines) ? s.lines : [];
   if (lines.length < 1 || lines.length > 3) add(`правило 17: реплик ${lines.length} — нужно 1–3`);
@@ -121,6 +132,8 @@ export function checkSkitRules(skit: unknown, kind: SkitKind, paragraphs: ShortP
       return;
     }
     if (!inCast.has(String(l?.hero))) add(`реплика ${i + 1}: говорит «${l?.hero}», а его нет в составе`);
+    if (STAGE_DIRECTION.test(text)) add(`реплика ${i + 1}: только слова, которые звучат — ремарки в скобках и звёздочках Omni прочтёт вслух, движения пиши в action`);
+    if (!CYRILLIC.test(text)) add(`реплика ${i + 1} — по-русски: герои говорят по-русски`);
     const n = wordCount(text);
     total += n;
     if (n > MAX_SKIT_LINE_WORDS) add(`правило 17: реплика ${i + 1} — ${n} слов, больше ${MAX_SKIT_LINE_WORDS}`);
@@ -477,6 +490,75 @@ function hitsOf(r: TextRule, text: string): { core: string; finding: string }[] 
   return hits;
 }
 
+interface PlacedText {
+  place: string;
+  text: string;
+}
+
+/** Откуда текст ролика может брать слова и числа: правило 1 и пересказ (allowFromAnswer). */
+interface TextSource {
+  angle: ShortAngle;
+  answerText: string;
+  sceneQuestion: string;
+  assistantsCount: number;
+}
+
+/** Реплики сценки с местом — как их называют нарушения и подписи владельцу. */
+function skitTexts(kind: SkitKind, skit: Skit | null | undefined): PlacedText[] {
+  return (Array.isArray(skit?.lines) ? skit.lines : []).map((l, n) => ({
+    place: `${SKIT_LABELS[kind]}, реплика ${n + 1}`,
+    text: String(l?.text ?? ''),
+  }));
+}
+
+/**
+ * Правила текста 1–15, которые проверяются по словам, у каждой находки — место.
+ * `spoken` — то, что звучит или стоит в кадре: в нём не бывает и названия
+ * сервиса (его говорит только финал); `captions` — подписи площадок.
+ */
+function textViolations(spoken: PlacedText[], captions: PlacedText[], src: TextSource): string[] {
+  const out: string[] = [];
+  const add = (m: string) => {
+    if (!out.includes(m)) out.push(m);
+  };
+  for (const t of spoken) if (BRAND_SPOKEN.test(t.text)) add(`название сервиса — только в финале: убери его (${t.place})`);
+  const texts = [...spoken, ...captions].map((t) => ({ place: t.place, text: String(t.text ?? '') }));
+  const provocative = PROVOCATIVE_ANGLES.includes(src.angle);
+  const sourceText = `${src.answerText ?? ''}\n${src.sceneQuestion ?? ''}`;
+  for (const r of TEXT_RULES) {
+    if (r.provocativeOnly && !provocative) continue;
+    // Пересказ — основы, на которые то же правило срабатывает в ответе или вопросе.
+    const retold = r.allowFromAnswer ? new Set(hitsOf(r, sourceText).map((h) => norm(h.core))) : null;
+    for (const t of texts) {
+      for (const hit of hitsOf(r, t.text)) {
+        if (retold?.has(norm(hit.core))) continue;
+        add(`${r.rule}: ${r.what} — «${hit.finding}» (${t.place})`);
+      }
+    }
+  }
+  const allowed = new Set([
+    ...numbersIn(src.answerText ?? ''),
+    ...numbersIn(src.sceneQuestion ?? ''),
+    String(src.assistantsCount),
+    String(WELCOME_GIFT_TOKENS),
+  ]);
+  for (const t of texts) {
+    for (const n of numberHits(t.text)) {
+      if (!allowed.has(n.value)) add(`правило 1: числа «${n.raw}» нет в ответе ассистента (${t.place})`);
+    }
+  }
+  return out;
+}
+
+/**
+ * Правила текста у сценки 1 — у режиссёра, до записи сцены: ответа ещё нет,
+ * числа берутся только из вопроса. Сценарист конфликт без замечаний не трогает,
+ * и нарушение, пропущенное здесь, ролик уже не исправил бы.
+ */
+export function checkSkitTextRules(skit: Skit | null, kind: SkitKind, src: Omit<TextSource, 'answerText'> & { answerText?: string }): string[] {
+  return textViolations(skitTexts(kind, skit), [], { ...src, answerText: src.answerText ?? '' });
+}
+
 export function checkScriptRules(i: RulesInput): string[] {
   const out: string[] = [];
   const add = (m: string) => {
@@ -556,52 +638,23 @@ export function checkScriptRules(i: RulesInput): string[] {
     add(`сценарий звучит примерно ${Math.round(est)} с, нужно ${minSec}–${maxSec} с: сократи реплики`);
   }
 
-  // Тексты сценариста, у каждого — место. Финал пишет код, его здесь нет. Реплики сценок — тоже тексты ролика.
-  const spoken = s.lines.filter((l) => l.scene !== 'final');
-  const skitLines = skitFormat
-    ? SKIT_KINDS.flatMap((kind) =>
-        (Array.isArray(i.skits?.[kind]?.lines) ? i.skits[kind].lines : []).map((l, n) => ({
-          place: `${SKIT_LABELS[kind]}, реплика ${n + 1}`,
-          text: String(l?.text ?? ''),
-        })),
-      )
-    : [];
-  if ([...spoken.map((l) => l.text), ...skitLines.map((l) => l.text)].some((t) => BRAND_SPOKEN.test(t))) {
-    add('название сервиса звучит только в финале — убери его из реплик');
-  }
+  // Тексты сценариста, у каждого — место. Финал пишет код, его здесь нет. Реплики
+  // сценок и немая зацепка сценок — тоже тексты ролика: зацепка стоит в кадре.
+  const spoken: PlacedText[] = [
+    ...(skitFormat ? [{ place: 'зацепка', text: hook }] : []),
+    ...s.lines.filter((l) => l.scene !== 'final').map((l) => ({ place: `реплика ${l.id}`, text: l.text })),
+    ...(skitFormat ? SKIT_KINDS.flatMap((kind) => skitTexts(kind, i.skits?.[kind])) : []),
+  ];
   const c = i.captions;
-  const texts = [
-    ...spoken.map((l) => ({ place: `реплика ${l.id}`, text: l.text })),
-    ...skitLines,
+  const captions: PlacedText[] = [
     { place: 'подпись telegram', text: c.telegram },
     { place: 'подпись vk', text: c.vk },
     { place: 'youtube.title', text: c.youtube.title },
     { place: 'youtube.description', text: c.youtube.description },
     // Через запятую: соседние теги не складываются в одну фразу.
     { place: 'youtube.tags', text: (c.youtube.tags ?? []).join(', ') },
-  ].map((t) => ({ place: t.place, text: String(t.text ?? '') }));
-  const sourceText = `${i.answerText ?? ''}\n${i.sceneQuestion ?? ''}`;
-  for (const r of TEXT_RULES) {
-    if (r.provocativeOnly && !provocative) continue;
-    // Пересказ — основы, на которые то же правило срабатывает в ответе или вопросе.
-    const retold = r.allowFromAnswer ? new Set(hitsOf(r, sourceText).map((h) => norm(h.core))) : null;
-    for (const t of texts) {
-      for (const hit of hitsOf(r, t.text)) {
-        if (retold?.has(norm(hit.core))) continue;
-        add(`${r.rule}: ${r.what} — «${hit.finding}» (${t.place})`);
-      }
-    }
-  }
-  const allowed = new Set([
-    ...numbersIn(i.answerText),
-    ...numbersIn(i.sceneQuestion ?? ''),
-    String(i.assistantsCount),
-    String(WELCOME_GIFT_TOKENS),
-  ]);
-  for (const t of texts) {
-    for (const n of numberHits(t.text)) {
-      if (!allowed.has(n.value)) add(`правило 1: числа «${n.raw}» нет в ответе ассистента (${t.place})`);
-    }
-  }
+  ];
+  const src = { angle: i.angle, answerText: i.answerText ?? '', sceneQuestion: i.sceneQuestion ?? '', assistantsCount: i.assistantsCount };
+  for (const m of textViolations(spoken, captions, src)) add(m);
   return out;
 }

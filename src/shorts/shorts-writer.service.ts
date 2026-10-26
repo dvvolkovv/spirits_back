@@ -63,7 +63,11 @@ export class ShortsWriterService {
     if (skitFormat && !conflict) {
       throw new StageFatalError('сценарист: у ролика со сценками нет сценки 1 — повторите с этапа режиссёра');
     }
-    let previousPunchline: Skit | null = skitFormat ? v.script?.skits?.punchline?.skit ?? null : null;
+    // Принятая развязка — из прошлого сценария: её клип мог быть уже снят. Сценарист
+    // её не повторяет, пока замечания её не касаются, — и она не переснимается
+    // при каждом «Замечании» или отзыве студии о длине озвучки.
+    const acceptedPunchline: Skit | null = skitFormat ? v.script?.skits?.punchline?.skit ?? null : null;
+    let rejectedPunchline: Skit | null = null;
     const [rows, settings] = await Promise.all([this.agents.getAgents('ru'), this.settings.get()]);
     const assistants = toAgents(rows);
     const name = v.scene.assistantName;
@@ -98,10 +102,10 @@ export class ShortsWriterService {
         previousScript: previous,
         previousCaptions,
         violations,
-        ...(skitFormat ? { skit: { conflict, previousPunchline } } : {}),
+        ...(skitFormat ? { skit: { conflict, acceptedPunchline, rejectedPunchline } } : {}),
       });
       const raw = await this.relay.ask(skitFormat ? WRITER_SKIT_SYSTEM : WRITER_SYSTEM, message, `short-write-${v.id}-${randomUUID()}`);
-      const reply = parseWriterReply(raw, { skit: skitFormat });
+      const reply = parseWriterReply(raw, { skit: skitFormat, acceptedPunchline: !!acceptedPunchline });
       if (reply.needsRecapture) {
         if (recapturesInRow(v.ownerNote) >= MAX_RECAPTURES) {
           throw new StageFatalError(`сценарист: уже дважды просил другую сцену — нужен взгляд владельца; последняя причина: ${reply.reason}`);
@@ -110,7 +114,7 @@ export class ShortsWriterService {
         return;
       }
       const paragraphs = v.capture.paragraphs ?? [];
-      const skits = skitFormat ? { conflict: reply.skits.conflict ?? conflict, punchline: reply.skits.punchline } : null;
+      const skits = skitFormat ? { conflict: reply.skits.conflict ?? conflict, punchline: reply.skits.punchline ?? acceptedPunchline } : null;
       // Промпты сценок — только из сценок без нарушений: planSkits на кривой
       // сценке бросает первую же ошибку, а правила называют все разом.
       let planned: Record<SkitKind, SkitPlan> | undefined;
@@ -122,7 +126,7 @@ export class ShortsWriterService {
           planError = String(e?.message ?? e);
         }
       }
-      const script = buildScript(reply, { ...options, skits: planned });
+      const script = buildScript(reply, { ...options, format: v.format, skits: planned });
       violations = checkScriptRules({
         angle: v.angle,
         assistantName: name,
@@ -142,7 +146,7 @@ export class ShortsWriterService {
         previousCaptions = reply.captions;
         if (skits) {
           conflict = skits.conflict;
-          previousPunchline = skits.punchline;
+          rejectedPunchline = reply.skits.punchline;
         }
         continue;
       }

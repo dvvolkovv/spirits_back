@@ -29,6 +29,11 @@ const PHONE = /(?:\+\d{1,3}[\s(-]*\d{2,3}|\b[78][\s(-]*\d{3})[\s)-]*\d{3}[\s-]*\
 const PII = [PHONE, /[\w.+-]+@[\w-]+\.[\w.]+/];
 
 const str = (v: unknown): string => (typeof v === 'string' ? v.trim() : '');
+/** Id героя — как в труппе: «Kesha» и « galina » модели — те же герои. */
+const heroId = (v: unknown): TroupeId => str(v).toLowerCase() as TroupeId;
+/** Поля сценки нет: null, пустая строка, false, пустой объект — модель так пишет «не меняю». */
+const absent = (v: unknown): boolean =>
+  v === null || v === undefined || v === '' || v === false || (typeof v === 'object' && !Array.isArray(v) && !Object.keys(v as object).length);
 const len = (s: string): number => Array.from(s).length;
 
 export function rawSnippet(text: string): string {
@@ -90,10 +95,10 @@ export function parseSkit(v: unknown, who: string, field: string): Skit {
     throw new Error(`${who}: ${field} — объект {cast, setting, opening, action, lines}`);
   }
   const o = v as Record<string, any>;
-  const cast = Array.isArray(o.cast) ? o.cast.map((c: any) => ({ hero: str(c?.hero) as TroupeId, role: str(c?.role) })) : [];
+  const cast = Array.isArray(o.cast) ? o.cast.map((c: any) => ({ hero: heroId(c?.hero), role: str(c?.role) })) : [];
   const lines = Array.isArray(o.lines)
     ? o.lines.map((l: any, i: number): SkitLine => {
-        const line: SkitLine = { hero: str(l?.hero) as TroupeId, text: str(l?.text) };
+        const line: SkitLine = { hero: heroId(l?.hero), text: str(l?.text) };
         if (l?.box !== null && l?.box !== undefined && l?.box !== '') {
           const box = Number(l.box);
           if (!Number.isInteger(box)) throw new Error(`${who}: ${field}, реплика ${i + 1} — box должен быть номером абзаца`);
@@ -154,8 +159,9 @@ export interface WriterReply {
   lines: Array<{ box: number; text: string }>;
   captions: { telegram: string; vk: string; youtube: { title: string; description: string; tags: string[] } };
   /**
-   * Сценки ролика формата skit: развязка обязательна, конфликт — только если
-   * сценарист его переписал по замечанию (иначе null: остаётся прежний).
+   * Сценки ролика формата skit — только переписанные: конфликт — по замечанию,
+   * развязка — всегда, пока принятой нет, а с принятой — по замечанию или
+   * отзыву (иначе null: остаётся принятая, и её клип не переснимается).
    */
   skits: { conflict: Skit | null; punchline: Skit | null };
 }
@@ -164,7 +170,7 @@ const NO_SKITS: WriterReply['skits'] = { conflict: null, punchline: null };
 
 const EMPTY_CAPTIONS: WriterReply['captions'] = { telegram: '', vk: '', youtube: { title: '', description: '', tags: [] } };
 
-export function parseWriterReply(raw: string, opts: { skit?: boolean } = {}): WriterReply {
+export function parseWriterReply(raw: string, opts: { skit?: boolean; acceptedPunchline?: boolean } = {}): WriterReply {
   const o = extractJsonObject(raw, 'сценарист');
   if (o.needsRecapture === true) {
     const reason = str(o.reason);
@@ -195,10 +201,11 @@ export function parseWriterReply(raw: string, opts: { skit?: boolean } = {}): Wr
   };
   if (!captions.telegram) throw new Error('сценарист: нет подписи для Telegram');
   if (!captions.youtube.title) throw new Error('сценарист: нет заголовка для YouTube');
+  if (opts.skit && absent(o.punchline) && !opts.acceptedPunchline) throw new Error('сценарист: нет сценки 2 — развязки (punchline)');
   const skits = opts.skit
     ? {
-        conflict: o.conflict === null || o.conflict === undefined ? null : parseSkit(o.conflict, 'сценарист', 'conflict'),
-        punchline: parseSkit(o.punchline, 'сценарист', 'punchline'),
+        conflict: absent(o.conflict) ? null : parseSkit(o.conflict, 'сценарист', 'conflict'),
+        punchline: absent(o.punchline) ? null : parseSkit(o.punchline, 'сценарист', 'punchline'),
       }
     : NO_SKITS;
   return { needsRecapture: false, reason: '', hook, hookBox, question, lines, captions, skits };

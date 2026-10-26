@@ -241,7 +241,9 @@ export class ShortsApprovalService {
       when,
       captions: v.captions,
       // Сценки: кто играл и во что обошлось оживление (спека сценок, «Одобрение»).
-      ...(v.script?.skits ? { skits: { cast: skitCastLine(v.script.skits), animation: v.animation } } : {}),
+      ...(v.script?.skits
+        ? { skits: { cast: skitCastLine(v.script.skits), animation: v.animation, maxOmniSeconds: (await this.settings.get()).maxOmniSeconds } }
+        : {}),
     });
     const msg: any = await this.tg.sendVideo(chatId, video, {
       caption,

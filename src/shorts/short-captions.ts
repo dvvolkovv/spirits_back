@@ -85,7 +85,7 @@ export interface ReviewCaptionInput {
   when: string;
   captions: ShortCaptions;
   /** Ролик со сценками: состав (skitCastLine) и траты на оживление. */
-  skits?: { cast: string; animation: ShortAnimation | null };
+  skits?: { cast: string; animation: ShortAnimation | null; maxOmniSeconds?: number };
 }
 
 /** Состав сценок одной строкой: герой — роль, по первому появлению («Гусыня Галина Петровна — хозяйка квартиры, Капибара Кеша — жилец»). */
@@ -99,12 +99,14 @@ export function skitCastLine(skits: Partial<Record<SkitKind, SkitPlan>>): string
   return [...seen.values()].join(', ');
 }
 
-/** Траты на оживление: «Omni: 16 с, кадров 2 ≈ $1,86». */
-export function omniSpendLine(a: ShortAnimation | null): string {
+/** Траты на оживление: «Omni: 16 из 48 с, кадров 2 ≈ $1,86» — с пределом, если он передан. */
+export function omniSpendLine(a: ShortAnimation | null, maxOmniSeconds?: number): string {
   const seconds = a?.omniSeconds ?? 0;
   const frames = a?.keyframes ?? 0;
   const usd = (seconds * OMNI_USD_PER_SEC + frames * KEYFRAME_USD).toFixed(2).replace('.', ',');
-  return `Omni: ${seconds} с, кадров ${frames} ≈ $${usd}`;
+  // Предел — рядом: владелец видит, сколько пересъёмок ещё осталось у ролика.
+  const of = Number.isInteger(maxOmniSeconds) ? ` из ${maxOmniSeconds}` : '';
+  return `Omni: ${seconds}${of} с, кадров ${frames} ≈ $${usd}`;
 }
 
 /**
@@ -117,7 +119,7 @@ export function buildReviewCaption(i: ReviewCaptionInput): { caption: string; ex
     `Рубрика: ${RUBRIC_TITLES[i.rubric]} · подача: ${ANGLE_TITLES[i.angle].toLowerCase()}`,
     `Ассистент: ${i.assistantName}`,
     `Вопрос: «${clip(i.question, 300)}»`,
-    ...(i.skits ? [`Сценки: ${clip(i.skits.cast, 200)}`, omniSpendLine(i.skits.animation)] : []),
+    ...(i.skits ? [`Сценки: ${clip(i.skits.cast, 200)}`, omniSpendLine(i.skits.animation, i.skits.maxOmniSeconds)] : []),
     `Выйдет: ${i.when}`,
   ].join('\n');
   const texts = [
