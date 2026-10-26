@@ -74,24 +74,35 @@ const sentence = (s: string): string => {
   return /[.!?…]$/.test(t) ? t : `${t}.`;
 };
 
+/** Правило 17 спеки: реплика — до 12 слов, сценка — до 25. Длиннее Omni не уложит в 8 с, и сверка речи забракует оплаченный клип. */
+export const MAX_SKIT_LINE_WORDS = 12;
+export const MAX_SKIT_WORDS = 25;
+/** Слово — токен с буквой или цифрой, как в short-rules.ts: тире между словами не слово. */
+const wordCount = (s: string): number => s.split(/\s+/).filter((w) => /[\p{L}\p{N}]/u.test(w)).length;
+
 /**
  * Поля сценки проверяются до промптов: опечатка в имени поля дала бы «undefined»
  * в платном промпте, а сценарий проверяется только на сборке — после трат.
- * Место, первый кадр и действие — английские строки: русский текст генератор
- * картинок охотно рисует надписью.
+ * Место, первый кадр и действие — английские строки без кавычек: русский текст
+ * и текст в кавычках генератор картинок охотно рисует надписью.
  */
 function assertSkit(skit: Skit): void {
   if (!skit || typeof skit !== 'object') throw new Error('нет сценки');
   for (const f of ['setting', 'opening', 'action'] as const) {
-    if (typeof skit[f] !== 'string' || !clean(skit[f])) throw new Error(`пустое поле ${f}`);
-    if (/[а-яё«»]/i.test(skit[f])) throw new Error(`поле ${f} — по-английски: оно идёт прямо в промпт генератора`);
+    const v: unknown = skit[f];
+    if (v == null || (typeof v === 'string' && !clean(v))) throw new Error(`пустое поле ${f}`);
+    if (typeof v !== 'string') throw new Error(`поле ${f} — не строка`);
+    if (/[а-яё«»"“”„]/i.test(skit[f])) throw new Error(`поле ${f} — по-английски и без кавычек: оно идёт прямо в промпт генератора`);
   }
   if (!Array.isArray(skit.cast) || skit.cast.length < 2 || skit.cast.length > 3) throw new Error('в составе нужно 2–3 героя');
   for (const c of skit.cast) if (typeof c?.role !== 'string' || !clean(c.role)) throw new Error(`у героя ${c?.hero} нет роли`);
   if (!Array.isArray(skit.lines) || skit.lines.length < 1 || skit.lines.length > 3) throw new Error('нужно 1–3 реплики');
   skit.lines.forEach((l, i) => {
     if (typeof l?.text !== 'string' || !clean(l.text)) throw new Error(`пустая реплика ${i + 1} (${l?.hero})`);
+    if (wordCount(l.text) > MAX_SKIT_LINE_WORDS) throw new Error(`реплика ${i + 1} длиннее ${MAX_SKIT_LINE_WORDS} слов — Omni не уложит её в 8 с`);
   });
+  const total = skit.lines.reduce((n, l) => n + wordCount(l.text), 0);
+  if (total > MAX_SKIT_WORDS) throw new Error(`в репликах ${total} слов, больше ${MAX_SKIT_WORDS} — Omni не уложит их в 8 с`);
 }
 
 function castHeroes(skit: Skit): Hero[] {
