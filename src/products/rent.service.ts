@@ -403,10 +403,16 @@ export class RentService implements OnModuleInit, OnModuleDestroy {
    */
   async chargeOnStart(productId: string): Promise<void> {
     try {
+      // Большинство стартов — продукты в бесплатном или оплаченном месяце:
+      // им платить нечего, и незачем брать замок на строке баланса ради
+      // заведомого «не списалось» (а следом — ложного предупреждения ниже).
+      if (!(await this.dueForRent(productId))) return;
       if (await this.chargeRent(productId, true)) return;
       if (await this.requestSleep(productId)) {
         this.logger.warn(`продукт ${productId}: аренды при старте не хватило — поставлен сон`);
-      } else {
+      } else if (await this.dueForRent(productId)) {
+        // Повторная проверка, а не вывод из двух false: между ними сосед по
+        // кластеру мог заплатить суточным оборотом — тогда молчать правильно.
         this.logger.warn(
           `продукт ${productId}: при старте не списалось и не ушло в сон (живой ход?) — ` +
             'останется бесплатным до ближайшего суточного tick',
@@ -415,6 +421,17 @@ export class RentService implements OnModuleInit, OnModuleDestroy {
     } catch (e: any) {
       this.logger.error(`первая аренда продукта ${productId} сорвалась: ${e?.message ?? e} — доберёт суточный tick`);
     }
+  }
+
+  /** Работает и срок оплаты вышел — тот же предикат, что у chargeRent и requestSleep. */
+  private async dueForRent(productId: string): Promise<boolean> {
+    const r = await this.pg.query(
+      `SELECT 1 FROM products
+        WHERE id = $1 AND archived_at IS NULL
+          AND status IN ('running','degraded') AND paid_until <= now()`,
+      [productId],
+    );
+    return r.rows.length > 0;
   }
 
   /**

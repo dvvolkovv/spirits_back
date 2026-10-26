@@ -239,15 +239,41 @@ describe('RentService.chargeOnStart — три исхода, не бросает
   afterEach(() => jest.restoreAllMocks());
 
   function makeSvcWithStubs() {
-    const svc = new RentService({ query: jest.fn() } as any);
+    // По умолчанию продукт к оплате (dueForRent → строка есть).
+    const query = jest.fn(async () => ({ rows: [{}] }));
+    const svc = new RentService({ query } as any);
     const log = {
       error: jest.spyOn((svc as any).logger, 'error').mockImplementation(() => undefined),
       warn: jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined),
     };
     const chargeRent = jest.spyOn(svc, 'chargeRent');
     const requestSleep = jest.spyOn(svc, 'requestSleep');
-    return { svc, log, chargeRent, requestSleep };
+    return { svc, log, chargeRent, requestSleep, query };
   }
+
+  // Бесплатный или оплаченный месяц: платить нечего — ни замка на балансе,
+  // ни ложного «останется бесплатным» в логе при каждом старте.
+  it('не к оплате — chargeRent не зовётся, лога нет', async () => {
+    const { svc, chargeRent, requestSleep, log, query } = makeSvcWithStubs();
+    query.mockResolvedValue({ rows: [] });
+
+    await svc.chargeOnStart('p-1');
+
+    expect(chargeRent).not.toHaveBeenCalled();
+    expect(requestSleep).not.toHaveBeenCalled();
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it('не списалось и не уснуло, но сосед уже заплатил — молчит', async () => {
+    const { svc, chargeRent, requestSleep, log, query } = makeSvcWithStubs();
+    query.mockResolvedValueOnce({ rows: [{}] }).mockResolvedValueOnce({ rows: [] });
+    chargeRent.mockResolvedValue(false);
+    requestSleep.mockResolvedValue(false);
+
+    await svc.chargeOnStart('p-1');
+
+    expect(log.warn).not.toHaveBeenCalled();
+  });
 
   it('списалось (chargeRent true) — requestSleep не зовётся, лога нет', async () => {
     const { svc, chargeRent, requestSleep, log } = makeSvcWithStubs();
