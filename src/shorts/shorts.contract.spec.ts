@@ -15,6 +15,7 @@ describe('контракт API и студии', () => {
     for (const field of [
       'assistantId', 'assistantName', 'followups', 'answerShotWidth', 'answerShotHeight', 'answerText', 'turns',
       'paragraphs', 'hookBox', 'badge', 'assistantsCount', 'disclaimer',
+      'skits', 'troupeVersion', 'heroes', 'keyframePrompt', 'videoPrompt', 'fingerprint',
     ]) {
       expect(types).toMatch(new RegExp(`\\b${field}\\??:`));
     }

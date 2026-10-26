@@ -50,3 +50,10 @@ test('рабочему процессу нужны база и MinIO; бакет
   assert.deepEqual(c.minio, { endpoint: 'http://127.0.0.1:9000', accessKey: 'a', secretKey: 's', bucket: 'linkeon-smm-videos' });
   assert.equal(parseConfig({}, none).minio, null);
 });
+
+test('оживлению сценок нужен ключ Google', () => {
+  const animate = { capture: false, tts: false, animate: true };
+  assert.throws(() => parseConfig({}, animate), /GOOGLE_AI_API_KEY/);
+  assert.equal(parseConfig({ GOOGLE_AI_API_KEY: 'g' }, animate).googleKey, 'g');
+  assert.equal(parseConfig({}, none).googleKey, '');
+});
