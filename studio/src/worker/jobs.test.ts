@@ -74,6 +74,9 @@ function fakeStorage() {
       fs.writeFileSync(dest, files.get(key)!);
       return true;
     },
+    async remove(key) {
+      files.delete(key);
+    },
   };
   return { storage, files, types };
 }

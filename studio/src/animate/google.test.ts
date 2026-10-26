@@ -100,6 +100,8 @@ test('HTTP-ошибки Google: квота, ключ и снятая модел�
   const badKey = JSON.stringify({ error: { code: 400, status: 'INVALID_ARGUMENT', message: 'API key not valid.', details: [{ reason: 'API_KEY_INVALID' }] } });
   assert.ok(isErr('google_auth', false)(googleHttpError('omni', 400, badKey)));
   assert.ok(isErr('model_gone', false)(googleHttpError('omni', 404, 'not found')));
+  // Владельцу — что делать: формат «Только чат» и повтор с писателя (shorts.controller.ts, retry берёт формат из настроек).
+  assert.match(googleHttpError('omni', 404, 'not found').message, /«Только чат» и повторите ролик с from=writing/);
   assert.ok(isErr('omni_rejected', true)(googleHttpError('omni', 400, '{"error":{"status":"INVALID_ARGUMENT"}}')));
   assert.ok(isErr('omni_failed', true)(googleHttpError('omni', 503, 'unavailable')));
   assert.ok(isErr('keyframe', true)(googleHttpError('keyframe', 500, 'oops')));

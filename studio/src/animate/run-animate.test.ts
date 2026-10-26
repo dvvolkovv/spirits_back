@@ -392,6 +392,24 @@ test('три несовпадения речи — сдаётся с причи�
   assert.equal(readAnim(env.runDir).omniSeconds, 32);
 });
 
+test('брак — и из хранилища: onDiscard получает raw.mp4 сценки; сбой удаления — повтор задания без нового клипа', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const discarded: string[] = [];
+  const first = fakes(env, { heard: (kind, call) => (kind === 'conflict' && call === 1 ? 'совсем другое' : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, { ...first.deps, onDiscard: async (rel) => { discarded.push(rel); } });
+  assert.deepEqual(discarded, ['skits/fp-conflict/raw.mp4']);
+  assert.equal(anim.skits.conflict?.attempts, 2);
+
+  const env2 = setup();
+  const second = fakes(env2, { heard: (kind, call) => (kind === 'conflict' && call === 1 ? 'совсем другое' : LINES[kind].join(' ')) });
+  await assert.rejects(
+    animateRun(env2.runDir, { ...second.deps, onDiscard: async () => { throw new Error('MinIO: 503'); } }),
+    (e: unknown) => isErr('unknown', true)(e) && /брак skits\/fp-conflict\/raw\.mp4 не удалился из хранилища/.test((e as Error).message),
+  );
+  // Новый клип конфликта не запускался: брак ещё лежит в хранилище, повтор задания его удалит.
+  assert.equal(second.calls.start.filter((k) => k === 'conflict').length, 1);
+});
+
 test('в сценарии нет сценок или план неполон — ошибка до трат', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-animate-'));
   roots.push(root);
@@ -580,7 +598,8 @@ test('файл не выгрузился — повторяемая ошибка
         if (rel.endsWith('raw.mp4') && failRaw) throw new Error('MinIO: 503');
       },
     }),
-    (e: unknown) => e instanceof StudioError && /не выгрузился в хранилище/.test((e as Error).message),
+    // Повторяемая, и сразу: сбой хранилища не съедает попытки Omni — задание повторится с паузой.
+    (e: unknown) => isErr('unknown', true)(e) && /не выгрузился в хранилище/.test((e as Error).message) && !/после \d+ попыток/.test((e as Error).message),
   );
   failRaw = false;
   const second = fakes(env);
