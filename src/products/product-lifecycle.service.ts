@@ -533,7 +533,7 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
   async sleepDeletedTick(): Promise<number> {
     // Снятие заданий в completeDelete могло оборваться. Тогда queued-задание
     // архивного продукта не выдаётся никому (claimJob архивному отдаёт только
-    // sleep) и вечно загораживает сон: queueSleepForDeleted ждёт пустой
+    // sleep и, после срока, purge) и вечно загораживает сон: queueSleepForDeleted ждёт пустой
     // очереди. Доснимаем здесь. Возврат снимает архив раньше, чем ставит своё
     // пробуждение, — его задание сюда не попадает. Стирание (purge, очередь 2)
     // — тоже задание архивного продукта, его не снимаем.
