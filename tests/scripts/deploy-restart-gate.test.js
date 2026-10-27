@@ -189,6 +189,14 @@ describe('deploy.sh: живые ходы проверяются прямо пе�
     expect(polls.some((l) => /^CALLS: /.test(l))).toBe(true);
   });
 
+  it('рабочий процесс студии перезапускается в шаге рестарта, после API, а не в сборке', () => {
+    const { log } = runDeployBackend(['0']);
+    const restart = log[indexOf(log, RESTART)];
+    expect(restart).toMatch(/\[ -f studio\/\.env \].*cd studio\s+pm2 startOrReload ecosystem\.config\.cjs > \/tmp\/studio-pm2\.log/);
+    expect(restart.indexOf('pm2 restart linkeon-api')).toBeLessThan(restart.indexOf('cd studio'));
+    expect(log[indexOf(log, BUILD)]).not.toMatch(/studio-pm2/);
+  });
+
   it('голосовой воркер перезапускается в шаге рестарта, а не в сборке', () => {
     const { log } = runDeployBackend(['0']);
     expect(log[indexOf(log, RESTART)]).toMatch(/pm2 startOrReload ecosystem\.config\.cjs/);
