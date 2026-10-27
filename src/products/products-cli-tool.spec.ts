@@ -198,7 +198,7 @@ describe('промпт CLI знает весь жизненный цикл пр�
   it('keys — карточкой; ключи в переписке не просить; удалённое стирается', () => {
     expect(PRODUCTS_CLI_PROMPT).toContain('action: "keys"');
     expect(PRODUCTS_CLI_PROMPT).toMatch(/Ключи в переписке не проси никогда/);
-    expect(PRODUCTS_CLI_PROMPT).toMatch(/предложи карточку keys/);
+    expect(PRODUCTS_CLI_PROMPT).toMatch(/выпустить новый[^.]*ввести его в карточку keys/);
     expect(PRODUCTS_CLI_PROMPT).toMatch(/Не говори «ключи обновлены», пока status не вернёт done/);
     expect(PRODUCTS_CLI_PROMPT).toMatch(/стирается насовсем/);
   });

@@ -17,7 +17,7 @@ describe('релей: продукты — ключи карточкой', () =>
   it('знает action keys и не просит ключи в переписке', () => {
     expect(block).toContain('action: "keys"');
     expect(block).toMatch(/Ключи в переписке не проси никогда/);
-    expect(block).toMatch(/предложи карточку keys/);
+    expect(block).toMatch(/выпустить новый[^.]*ввести его в карточку keys/);
     expect(block).toMatch(/стирается насовсем/);
   });
 
