@@ -1,16 +1,18 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { approverChatId } from '../blog/blog-approval.service';
-import { encryptSecret } from '../calendar/crypto';
+import { decryptSecret, encryptSecret } from '../calendar/crypto';
 import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { STAND_MARK } from './short-captions';
 import { isStand } from './short-env';
 import { ShortsSettingsService } from './shorts-settings.service';
-import { YoutubeMode } from './shorts.types';
-import { Http, axiosHttp } from './youtube/youtube-http';
-import { authorizeUrl, exchangeCode, fetchMyChannel, youtubeOAuthConfig } from './youtube/youtube-oauth';
+import { ShortVideo, YoutubeMode, shortsBucket } from './shorts.types';
+import { YoutubeAuthError, YoutubeMaybeUploaded, YoutubeNotUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
+import { Http, axiosHttp, clip } from './youtube/youtube-http';
+import { YoutubeOAuthConfig, authorizeUrl, exchangeCode, fetchMyChannel, refreshAccessToken, youtubeOAuthConfig } from './youtube/youtube-oauth';
 import { signState, verifyState } from './youtube/youtube-state';
+import { UploadMeta, checkUpload, sendFile, startUpload } from './youtube/youtube-upload';
 
 /** Слова режимов — в командах и в сообщениях владельцу. */
 export const MODE_WORDS: Record<YoutubeMode, string> = { manual: 'вручную', unlisted: 'по ссылке', public: 'публично' };
@@ -31,6 +33,15 @@ export interface ConnectPage {
   status: number;
   html: string;
 }
+
+/** «Образование»: ролики — короткие разборы житейских вопросов. */
+export const YOUTUBE_CATEGORY_ID = '27';
+
+/** Что делать с роликом на YouTube: набор владельцу (с заметкой — почему) или загрузка с этим доступом. */
+export type YoutubePlan = { kind: 'kit'; note: string | null } | { kind: 'upload'; privacy: 'unlisted' | 'public' };
+
+/** К набору, когда у ролика жива сессия загрузки: прошлая загрузка могла дойти (спека, «Публикация», п. 7). */
+export const PENDING_UPLOAD_NOTE = 'Прошлая загрузка этого ролика на YouTube могла дойти — проверьте канал, прежде чем выкладывать вручную.';
 
 /**
  * `/youtube [режим]` (и `/youtube@Бот`). null — не эта команда. arg пустой —
@@ -173,6 +184,158 @@ export class ShortsYoutubeService {
       await this.say(st.chatId, `YouTube не подключён: ${reason}`);
       return connectPage(502, 'Не получилось подключить канал', `${reason}. Пришлите боту /youtube и попробуйте ещё раз.`);
     }
+  }
+
+  /**
+   * Загрузка — только когда режим не «вручную», клиент OAuth есть и канал подключён;
+   * иначе набор. Набор при живой сессии загрузки ролика — с предупреждением: прошлая
+   * загрузка могла дойти, и ручная выкладка дала бы дубль.
+   */
+  async uploadPlan(shortId: string): Promise<YoutubePlan> {
+    const mode = (await this.settings.get()).youtubeMode;
+    let note: string | null;
+    if (mode === 'manual') {
+      note = null;
+    } else if (!youtubeOAuthConfig()) {
+      note = 'YouTube не настроен на сервере — набор вместо загрузки.';
+    } else {
+      const acc = await this.account();
+      if (acc?.status === 'connected') return { kind: 'upload', privacy: mode };
+      note = acc
+        ? 'Доступ к каналу YouTube пропал — набор вместо загрузки. Переподключить: /youtube'
+        : 'Канал YouTube не подключён — набор вместо загрузки. Подключить: /youtube';
+    }
+    if (await this.session(shortId)) note = [note, PENDING_UPLOAD_NOTE].filter(Boolean).join(' ');
+    return { kind: 'kit', note };
+  }
+
+  /**
+   * Загрузить ролик (спека, «Публикация»). Порядок: свежий access-токен (доступа нет —
+   * YoutubeAuthError, с признаком живой сессии), вопрос о прошлой сессии, новая загрузка.
+   * Новая загрузка начинается, только когда YouTube подтвердил, что прошлая не дошла:
+   * не догружена (incomplete) или кончилась отказом (failed). Истёкшая сессия (gone) —
+   * YoutubeUploadExpired: спросить не у кого, вслепую не грузим. Ответа нет —
+   * YoutubeMaybeUploaded, адрес сессии остаётся для следующей попытки.
+   */
+  async upload(v: ShortVideo, privacy: 'unlisted' | 'public', keepAlive: () => Promise<boolean>): Promise<{ videoId: string; url: string }> {
+    const yt = v.captions?.youtube;
+    if (!v.videoKey || !yt) throw new YoutubeNotUploaded('у ролика нет файла или подписей YouTube');
+    const cfg = youtubeOAuthConfig();
+    if (!cfg) throw new YoutubeNotUploaded('YouTube не настроен на сервере');
+    const acc = await this.account();
+    const previous = await this.session(v.id);
+    if (!acc || acc.status !== 'connected') throw new YoutubeAuthError('канал YouTube не подключён', !!previous);
+    let accessToken: string;
+    let video: Buffer;
+    try {
+      accessToken = await this.accessToken(cfg, acc, !!previous);
+      video = await this.storage.download({ bucket: shortsBucket(), key: v.videoKey });
+    } catch (e: any) {
+      // Прошлая загрузка ещё не проверена — сказать «ролика нет» нельзя (спека, «Публикация», п. 7).
+      if (previous && !(e instanceof YoutubeAuthError)) {
+        throw new YoutubeMaybeUploaded(`прошлая загрузка не проверена: ${clip(String(e?.message ?? e), 200)}`);
+      }
+      throw e;
+    }
+
+    if (previous) {
+      // Нет ответа — YoutubeMaybeUploaded наверх, адрес остаётся.
+      const st = await checkUpload(this.http, previous, accessToken, video.length);
+      if (st.state === 'complete') return this.done(v.id, st.videoId);
+      // Истекла: адрес не стираем — повтор снова получит 404 и снова пришлёт набор, а не загрузит вслепую.
+      if (st.state === 'gone') throw new YoutubeUploadExpired('YouTube уже не помнит прошлую загрузку этого ролика');
+      // incomplete или failed — прошлая загрузка не дошла: грузим заново.
+      await this.setSession(v.id, null);
+    }
+
+    const meta: UploadMeta = {
+      title: yt.title,
+      description: yt.description,
+      tags: yt.tags ?? [],
+      categoryId: YOUTUBE_CATEGORY_ID,
+      language: v.lang || 'ru',
+      privacy,
+    };
+    const sessionUrl = await startUpload(this.http, accessToken, meta, video.length);
+    await this.setSession(v.id, sessionUrl);
+    if (!(await keepAlive())) throw new YoutubeNotUploaded('ролик ушёл из publishing до отправки файла — не отправляю');
+    try {
+      return await this.done(v.id, await sendFile(this.http, sessionUrl, accessToken, video));
+    } catch (e: any) {
+      if (e instanceof YoutubeNotUploaded) {
+        // Явный отказ — итог сессии: на повторе она повторила бы его, спрашивать незачем.
+        await this.setSession(v.id, null);
+        throw e;
+      }
+      if (!(e instanceof YoutubeMaybeUploaded)) throw e;
+      // Снова без ответа — YoutubeMaybeUploaded наверх, адрес остаётся.
+      const st = await checkUpload(this.http, sessionUrl, accessToken, video.length);
+      if (st.state === 'complete') return this.done(v.id, st.videoId);
+      if (st.state === 'gone') throw new YoutubeUploadExpired('YouTube уже не помнит загрузку этого ролика');
+      await this.setSession(v.id, null);
+      if (st.state === 'failed') throw new YoutubeNotUploaded(`отправка файла: ${st.reason}`, st.status);
+      throw new YoutubeNotUploaded(`файл не дошёл до YouTube (${e.message})`);
+    }
+  }
+
+  /** Свежий access-токен. Доступа нет — аккаунт отозван с причиной и YoutubeAuthError (pending — у ролика жива сессия). */
+  private async accessToken(cfg: YoutubeOAuthConfig, acc: YoutubeAccount, pending: boolean): Promise<string> {
+    let refreshToken: string;
+    try {
+      refreshToken = decryptSecret(acc.refreshTokenEnc);
+    } catch {
+      await this.revoke('токен не расшифровался — сменился CALENDAR_SECRET_KEY?');
+      throw new YoutubeAuthError('токен канала не расшифровался — переподключите: /youtube', pending);
+    }
+    try {
+      return await refreshAccessToken(this.http, cfg, refreshToken);
+    } catch (e: any) {
+      if (!(e instanceof YoutubeAuthError)) throw e;
+      await this.revoke(e.message);
+      throw new YoutubeAuthError(e.message, pending);
+    }
+  }
+
+  /** После записи published: ссылка владельцу; при «по ссылке» — подсказка про «публично». Набор молчит: строки published нет. */
+  async notifyUploaded(shortId: string): Promise<void> {
+    try {
+      const r = await this.pg.query(
+        `SELECT url FROM short_publication WHERE short_id = $1 AND platform = 'youtube' AND status = 'published'`,
+        [shortId],
+      );
+      const url = r.rows[0]?.url;
+      if (!url) return;
+      const mode = (await this.settings.get()).youtubeMode;
+      const hint = mode === 'unlisted' ? '\nЕсли ролик открывается и не стал приватным — /youtube публично.' : '';
+      await this.say(approverChatId(), `Вышло на YouTube (${MODE_WORDS[mode]}): ${url}${hint}`);
+    } catch (e: any) {
+      this.logger.warn(`ролик ${shortId}: сообщение о YouTube не отправлено: ${e?.message ?? e}`);
+    }
+  }
+
+  /** Ролик на YouTube: стереть адрес сессии. Сбой стирания успех не отменяет. */
+  private async done(shortId: string, videoId: string): Promise<{ videoId: string; url: string }> {
+    await this.setSession(shortId, null).catch((e: any) => this.logger.warn(`ролик ${shortId}: адрес сессии не стёрт: ${e?.message ?? e}`));
+    return { videoId, url: `https://youtube.com/shorts/${videoId}` };
+  }
+
+  private async session(shortId: string): Promise<string | null> {
+    const r = await this.pg.query(`SELECT upload_session FROM short_publication WHERE short_id = $1 AND platform = 'youtube'`, [shortId]);
+    return r.rows[0]?.upload_session ?? null;
+  }
+
+  private async setSession(shortId: string, url: string | null): Promise<void> {
+    await this.pg.query(
+      `UPDATE short_publication SET upload_session = $2, updated_at = now() WHERE short_id = $1 AND platform = 'youtube'`,
+      [shortId, url],
+    );
+  }
+
+  private async revoke(reason: string): Promise<void> {
+    await this.pg.query(
+      `UPDATE short_youtube_account SET status = 'revoked', last_error = $1, updated_at = now() WHERE id = 1`,
+      [clip(reason, 300)],
+    );
   }
 
   private async statusText(chatId: number): Promise<string> {
