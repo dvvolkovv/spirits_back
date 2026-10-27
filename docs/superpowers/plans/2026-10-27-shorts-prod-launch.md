@@ -656,9 +656,9 @@ index a6500ef..0799bec 100755
 
 ### Task 5 (OK): Слияние в main и студия на стенде
 
-- [ ] **Step 1: Слияние** — в свежем клоне (как задача 17 плана 4): `git clone --branch main`, `git merge --no-ff origin/feat/shorts-prod`, прогон итога на ноде (`npx jest tests/scripts src/shorts`, гейт типов, `npm run build`, студия `npm test`), перемотка `main` только при `merge-base --is-ancestor origin/main HEAD`.
+- [x] **Step 1: Слияние** — в свежем клоне (как задача 17 плана 4): `git clone --branch main`, `git merge --no-ff origin/feat/shorts-prod`, прогон итога на ноде (`npx jest tests/scripts src/shorts`, гейт типов, `npm run build`, студия `npm test`), перемотка `main` только при `merge-base --is-ancestor origin/main HEAD`.
 
-- [ ] **Step 2: `studio/.env` стенда** — копия окружения студии из CI-воркдерева (значения стенда те же), права 600:
+- [x] **Step 2: `studio/.env` стенда** — копия окружения студии из CI-воркдерева (значения стенда те же), права 600:
 
 ```bash
 ssh dv@85.192.61.231 'test -f ~/spirits_back/studio/.env || install -m 600 ~/ci/wt/promo-shorts/studio/.env ~/spirits_back/studio/.env; grep -oE "^[A-Z_]+=" ~/spirits_back/studio/.env | sort | tr "\n" " "'
@@ -666,9 +666,9 @@ ssh dv@85.192.61.231 'test -f ~/spirits_back/studio/.env || install -m 600 ~/ci/
 
 Expected: имена `ADMIN_PHONE API_URL CABINET_BASIC_AUTH CABINET_URL DATABASE_URL DEBUG_SECRET DEMO_PHONE GOOGLE_AI_API_KEY MINIO_* YANDEX_*`.
 
-- [ ] **Step 3: Выкат на стенд** — `TEST_ONLY=1 BACK_ONLY=1` из свежих клонов на ноде (`~/deploy-clones/<имя>/{spirits_back,spirits_front}`, `test-server.env.local` и `tests/node_modules` из `~/dev/spirits_back`, `source ~/.nvm/nvm.sh`, `setsid -f` с pid-файлом, лог в `~/deploy-logs/`). Expected: в логе `studio:` без `FAILED`, `ALL PHASES GREEN`.
+- [x] **Step 3: Выкат на стенд** — `TEST_ONLY=1 BACK_ONLY=1` из свежих клонов на ноде (`~/deploy-clones/<имя>/{spirits_back,spirits_front}`, `test-server.env.local` и `tests/node_modules` из `~/dev/spirits_back`, `source ~/.nvm/nvm.sh`, `setsid -f` с pid-файлом, лог в `~/deploy-logs/`). Expected: в логе `studio:` без `FAILED`, `ALL PHASES GREEN`.
 
-- [ ] **Step 4: Процесс на стенде**
+- [x] **Step 4: Процесс на стенде**
 
 ```bash
 ssh dv@85.192.61.231 'source ~/.nvm/nvm.sh >/dev/null; pm2 describe linkeon-studio | grep -E "status|script path|exec cwd"; ps -o ni=,args= -C node | grep worker.ts; pm2 logs linkeon-studio --lines 5 --nostream; pm2 save'
@@ -676,25 +676,25 @@ ssh dv@85.192.61.231 'source ~/.nvm/nvm.sh >/dev/null; pm2 describe linkeon-stud
 
 Expected: `online`, `restart_time` 0 и `unstable restarts` 0 (цикл падений `online` не ловит), `nice` 19, в логе `worker: старт`.
 
-- [ ] **Step 5: Ролик через процесс PM2 и перезапуск во время задания** — формат «Только чат» на время прогона (без трат Google): `update_settings format=chat` → `order` → `start_now`. Когда процесс возьмёт съёмку или сборку (`status` `capturing` или `rendering`), — `pm2 restart linkeon-studio`. Expected: в логе `worker: pm2 shutdown — закончу текущее задание и выйду`, задание доведено, ролик доходит до `pending_review` без паузы на аренду, `attempts` не растёт, затем новый `worker: старт`. Формат обратно `skit`. Ручной `worker --once` из `~/ci/wt` на стенде больше не нужен.
+- [x] **Step 5: Ролик через процесс PM2 и перезапуск во время задания** — формат «Только чат» на время прогона (без трат Google): `update_settings format=chat` → `order` → `start_now`. Когда процесс возьмёт съёмку или сборку (`status` `capturing` или `rendering`), — `pm2 restart linkeon-studio`. Expected: в логе `worker: pm2 shutdown — закончу текущее задание и выйду`, задание доведено, ролик доходит до `pending_review` без паузы на аренду, `attempts` не растёт, затем новый `worker: старт`. Формат обратно `skit`. Ручной `worker --once` из `~/ci/wt` на стенде больше не нужен.
 
 ---
 
 ### Task 6 (OK): Прод — окружение, настройки, выкат
 
-- [ ] **Step 1: `studio/.env` прода** — на сервере, значения из `~/spirits_back/.env` прода, без вывода:
+- [x] **Step 1: `studio/.env` прода** — на сервере, значения из `~/spirits_back/.env` прода, без вывода:
 
 ```bash
 ssh dvolkov@212.113.106.202 'set -e; f=~/spirits_back/studio/.env; test ! -f $f; umask 077; { grep -E "^(DATABASE_URL|MINIO_ENDPOINT|MINIO_ACCESS_KEY|MINIO_SECRET_KEY|MINIO_BUCKET_VIDEOS|YANDEX_SPEECHKIT_API_KEY|YANDEX_TTS_FOLDER_ID|GOOGLE_AI_API_KEY|DEBUG_SECRET)=" ~/spirits_back/.env; echo CABINET_URL=https://my.linkeon.io; echo API_URL=https://my.linkeon.io; echo DEMO_PHONE=<демо-номер>; echo ADMIN_PHONE=<номер админа>; } > $f; grep -oE "^[A-Z_]+=" $f | sort | tr "\n" " "'
 ```
 
-- [ ] **Step 2: Канал** — до включения модуля, как велит спека:
+- [x] **Step 2: Канал** — до включения модуля, как велит спека:
 
 ```bash
 ssh dvolkov@212.113.106.202 'psql "$(grep -m1 "^DATABASE_URL=" ~/spirits_back/.env | cut -d= -f2-)" -Atc "UPDATE short_settings SET tg_channel_chat_id = '"'"'-1003046204962'"'"', updated_at = now() WHERE id = 1 RETURNING tg_channel_chat_id, platforms"'
 ```
 
-- [ ] **Step 3: Переменные модуля** — копия `.env` вне каталога приложения, строки дописываются, только если их нет:
+- [x] **Step 3: Переменные модуля** — копия `.env` вне каталога приложения, строки дописываются, только если их нет:
 
 ```bash
 ssh dvolkov@212.113.106.202 'set -e; cp ~/spirits_back/.env ~/env-spirits_back.bak-$(date +%Y%m%d%H%M); grep -q "^SHORTS_ENABLED=" ~/spirits_back/.env || printf "\nSHORTS_ENABLED=true\nSHORTS_AUTO_TOPICS=false\n" >> ~/spirits_back/.env; grep -E "^SHORTS_" ~/spirits_back/.env'
@@ -702,9 +702,9 @@ ssh dvolkov@212.113.106.202 'set -e; cp ~/spirits_back/.env ~/env-spirits_back.b
 
 API прочтёт их при рестарте, который сделает выкат.
 
-- [ ] **Step 4: Выкат** — `deploy.sh` из свежих клонов на ноде, `BACK_ONLY=1 SKIP_BOTS=1` (меняется только бэкенд; машина ботов с ноды не катится), отвязанно, с логом. Перед ним — `git log --oneline origin/main..origin/b2b` (ожидаемо три коммита «штурмана») и нет ли чужих выкатов (`pgrep -f '^bash scripts/deploy.sh'`). Expected: обе фазы зелёные.
+- [x] **Step 4: Выкат** — `deploy.sh` из свежих клонов на ноде, `BACK_ONLY=1 SKIP_BOTS=1` (меняется только бэкенд; машина ботов с ноды не катится), отвязанно, с логом. Перед ним — `git log --oneline origin/main..origin/b2b` (ожидаемо три коммита «штурмана») и нет ли чужих выкатов (`pgrep -f '^bash scripts/deploy.sh'`). Expected: обе фазы зелёные.
 
-- [ ] **Step 5: Проверка прода**
+- [x] **Step 5: Проверка прода**
 
 ```bash
 ssh dvolkov@212.113.106.202 'export PATH=$HOME/.npm-global/bin:$PATH; git -C ~/spirits_back log --oneline -1; grep -h "shorts migration" ~/.pm2/logs/linkeon-api-out*.log | tail -2; pm2 describe linkeon-studio | grep -E "status|exec cwd"; pm2 logs linkeon-studio --lines 5 --nostream; pm2 save'
@@ -712,11 +712,22 @@ ssh dvolkov@212.113.106.202 'export PATH=$HOME/.npm-global/bin:$PATH; git -C ~/s
 
 Expected: коммит слияния, `002_skits.sql applied`, `linkeon-studio` `online` без перезапусков, `worker: старт`.
 
-- [ ] **Step 6: Пробная съёмка и демо-аккаунт** — до первого ролика, без хода ассистента: `cd ~/spirits_back/studio && npx tsx src/capture/run-capture.ts scenes/sample-lawyer-lease.json --probe` (на проде). Первый вход заводит демо-аккаунт; проба показывает, что у нового аккаунта кабинет доходит до чата и нужного ассистента. Затем баланс демо-аккаунта — с запасом на месяцы (съёмка ≈ 2 000 токенов, стартовых 25 000 хватит примерно на 12): `curl -s -X POST -H "X-Debug-Secret: <из .env>" http://127.0.0.1:3001/webhook/debug/add-tokens/<демо-номер>/200000` (ручка работает только для тестовых номеров). Нехватка токенов потом видна сама: съёмка браком уйдёт в `failed`, владельцу придёт сообщение.
+- [x] **Step 6: Пробная съёмка и демо-аккаунт** — до первого ролика, без хода ассистента: `cd ~/spirits_back/studio && npx tsx src/capture/run-capture.ts scenes/sample-lawyer-lease.json --probe` (на проде). Первый вход заводит демо-аккаунт; проба показывает, что у нового аккаунта кабинет доходит до чата и нужного ассистента. Затем баланс демо-аккаунта — с запасом на месяцы (съёмка ≈ 2 000 токенов, стартовых 25 000 хватит примерно на 12): `curl -s -X POST -H "X-Debug-Secret: <из .env>" http://127.0.0.1:3001/webhook/debug/add-tokens/<демо-номер>/200000` (ручка работает только для тестовых номеров). Нехватка токенов потом видна сама: съёмка браком уйдёт в `failed`, владельцу придёт сообщение.
 
-- [ ] **Step 7: Предел на первый ролик** — `cd ~/spirits_back/studio && npx tsx scripts/stand-admin.ts update_settings settings:='{"maxOmniSeconds":16}'` (на проде, API на 127.0.0.1:3001). Expected: `format: skit`, `maxOmniSeconds: 16`, `tgChannelChatId: -1003046204962`.
+- [x] **Step 7: Предел на первый ролик** — `cd ~/spirits_back/studio && npx tsx scripts/stand-admin.ts update_settings settings:='{"maxOmniSeconds":16}'` (на проде, API на 127.0.0.1:3001). Expected: `format: skit`, `maxOmniSeconds: 16`, `tgChannelChatId: -1003046204962`.
 
 ---
+
+### Как прошли задачи 5–6 (27.10.2026)
+
+- **Стенд.** Слияние `bfb0b52d` (итог на ноде: 701 тест, гейт типов, сборка, студия 226/226), выкат `TEST_ONLY=1 BACK_ONLY=1` — все фазы зелёные; `linkeon-studio` `online`, `nice` 19, pm2 видит сам рабочий процесс (136 МБ), `pm2 save`.
+- **Перезапуск во время задания — вживую.** Во время съёмки: `worker: pm2 shutdown — закончу текущее задание и выйду`, съёмка доведена, `pm2 restart` ждал её 14 с. Во время сборки: сборка доведена, `restart` ждал 121 с, ролик сразу в `pending_review`, `attempts` не вырос, паузы на аренду нет.
+- **Всплыло и исправлено: длинный вопрос.** Ролик с вопросом в 358 знаков трижды падал `question_hidden`: внизу ленты под пузырём ещё «Думает» и отступ поля ввода, и верх пузыря уходил под шапку (замер на стенде: пузырь 49 px при границе 117 px). Лента теперь поднимается до верха пузыря (`revealLastUserMessage`, тест на настоящем Chromium — `studio/src/capture/reveal.test.ts`; `bdce3be` → `574c8d9`, слияние `fedc39a9`). Повтор того же ролика — съёмка с первой попытки.
+- **Прод.** `studio/.env` (значения из `.env` бэкенда прода, номера — со стенда, без вывода), канал `-1003046204962`, `SHORTS_ENABLED=true` и `SHORTS_AUTO_TOPICS=false` (копия `.env` — `~/env-spirits_back.bak-202610271028`), выкат `BACK_ONLY=1 SKIP_BOTS=1`: стенд и прод зелёные, на проде `fedc39a9`, `002_skits.sql applied`, `linkeon-studio` `online` без перезапусков, `npm ci` студии — полный (зависимостей не было), браузеры — только headless shell и Remotion; `pm2 save`.
+- **Фаза 4** (машины продуктов) — «не полностью»: на «clients» два спящих контейнера продуктов не пересоздаются нарочно (не будить неоплаченные), работающие уже на свежем образе; «own» синхронна. К роликам отношения не имеет; догнать после пробуждения — команда в логе выката.
+- **Проба и демо-аккаунт на проде.** Проба завела демо-аккаунт (стартовые 25 000, приветствие ассистента — 1 392 токена), кабинет дошёл до чата юриста; баланс пополнен до 200 216. Предел Omni — 16 с.
+- **Заметка на будущее:** AWS SDK v3 после первой недели января 2027 потребует Node ≥ 22, на проде v20.20.2 — до тех пор обновить Node на проде (касается и бэкенда), иначе обновления SDK встанут.
+
 
 ### Task 7 (OK): Первый ролик на проде — с владельцем
 
