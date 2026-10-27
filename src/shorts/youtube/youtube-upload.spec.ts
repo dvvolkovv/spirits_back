@@ -153,8 +153,11 @@ describe('checkUpload', () => {
     );
     expect(forbidden).toBeInstanceOf(YoutubeMaybeUploaded);
     expect(forbidden).toMatchObject({ status: 403 });
+    // Подсказка — перед причиной Google, не после: длинные документированные тексты причин
+    // (forbidden — 61 знак, insufficientPermissions — 84) не должны обрывать её посреди слова
+    // при склейке с YOUTUBE_MAY_BE_OUT и срезе до 500 знаков (toYoutube()/platform()).
     expect(forbidden.message).toBe(
-      'YouTube отказал в ответе о прошлой загрузке (HTTP 403 forbidden: forbidden) — так бывает, если канал переподключили другим аккаунтом; тогда переподключите прежним',
+      'YouTube отказал в ответе о прошлой загрузке — так бывает, если канал переподключили другим аккаунтом; тогда переподключите прежним (HTTP 403 forbidden: forbidden)',
     );
   });
 
