@@ -45,7 +45,11 @@ export class ZoomController {
     @Res() res: Response,
   ) {
     const base = (process.env.PUBLIC_BASE_URL || 'https://my.linkeon.io').replace(/\/+$/, '');
-    const back = (status: string) => res.redirect(`${base}/?zoom_connect=${status}`);
+    // Назад — на саму карточку Zoom в профиле (/profile?open=zoom: кабинет
+    // раскрывает «Настройки» и прокручивает к ней), а не на корень: корень
+    // уводил в чат и терял пометку исхода — ни «подключено», ни «отказались»
+    // человек не видел (RootRedirect переносит только ?assistant=).
+    const back = (status: string) => res.redirect(`${base}/profile?open=zoom&zoom_connect=${status}`);
 
     // Человек мог нажать «Отклонить» — это его право, а не сбой.
     if (error) return back('denied');
