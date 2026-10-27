@@ -233,9 +233,9 @@ export class ShortsYoutubeService {
       if (acc?.status === 'connected') {
         // Канал закреплён в .env, но подключали его раньше: пин могли задать
         // или сменить позже — без этой проверки ролик ушёл бы в канал из базы.
-        const expected = (process.env.YOUTUBE_CHANNEL_ID || '').trim();
-        if (!expected || acc.channelId === expected) return { kind: 'upload', privacy: mode };
-        note = `Подключён канал ${acc.channelTitle ?? acc.channelId}, а роликам нужен ${expected} (YOUTUBE_CHANNEL_ID) — набор вместо загрузки. Переподключить: /youtube`;
+        const mismatch = this.channelMismatch(acc);
+        if (!mismatch) return { kind: 'upload', privacy: mode };
+        note = `${mismatch.charAt(0).toUpperCase()}${mismatch.slice(1)} — набор вместо загрузки. Переподключить: /youtube`;
       } else {
         note = acc
           ? 'Доступ к каналу YouTube пропал — набор вместо загрузки. Переподключить: /youtube'
@@ -441,6 +441,8 @@ export class ShortsYoutubeService {
     if (acc.status === 'revoked') {
       return `YouTube: доступ к каналу ${name} пропал${acc.lastError ? ` (${acc.lastError})` : ''} — ролики идут набором.\n\n${howTo}`;
     }
+    const mismatch = this.channelMismatch(acc);
+    if (mismatch) return `YouTube: ${mismatch} — ролики идут набором.\n\n${howTo}`;
     return (
       `YouTube: подключён канал ${name}, режим — ${MODE_WORDS[s.youtubeMode]}.\n\n` +
       'Сменить режим: /youtube публично · /youtube по ссылке · /youtube вручную\n' +
@@ -452,11 +454,24 @@ export class ShortsYoutubeService {
     if (mode === 'manual') return 'Готово: YouTube — вручную, буду присылать набор.';
     const done = `Готово: ролики на YouTube — ${MODE_WORDS[mode]}.`;
     const acc = await this.account();
-    if (acc?.status === 'connected') return done;
+    const mismatch = acc?.status === 'connected' ? this.channelMismatch(acc) : null;
+    if (acc?.status === 'connected' && !mismatch) return done;
     const link = this.connectUrl(chatId);
     if (!link) return `${done} Но YouTube не настроен на этом сервере, поэтому пока набор.`;
-    const why = acc ? 'доступ к каналу пропал' : 'канал не подключён';
+    const why = mismatch ?? (acc ? 'доступ к каналу пропал' : 'канал не подключён');
     return `${done} Но ${why}, поэтому пока набор.\n\nПодключить (ссылка действует 15 минут):\n${link}`;
+  }
+
+  /**
+   * Канал закреплён в YOUTUBE_CHANNEL_ID — подключённый (связка в базе рабочая,
+   * токен не отозван), но не тот, не должен считаться исправным: иначе статус,
+   * смена режима и план загрузки молча работали бы с чужим каналом. null —
+   * пин не задан или совпал.
+   */
+  private channelMismatch(acc: YoutubeAccount): string | null {
+    const expected = (process.env.YOUTUBE_CHANNEL_ID || '').trim();
+    if (!expected || acc.channelId === expected) return null;
+    return `подключён канал «${acc.channelTitle ?? acc.channelId}», а роликам нужен ${expected} (YOUTUBE_CHANNEL_ID)`;
   }
 
   /** Сообщение владельцу. Сбой Telegram глотаем: он не повод ронять команду, подключение или публикацию. */
