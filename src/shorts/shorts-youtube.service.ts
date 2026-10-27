@@ -172,6 +172,11 @@ export class ShortsYoutubeService {
     }
     try {
       const ch = await fetchMyChannel(this.http, tokens.accessToken);
+      // Канал роликов закреплён в .env: другой — по ошибке или по чужой ссылке — не подключится.
+      const expected = (process.env.YOUTUBE_CHANNEL_ID || '').trim();
+      if (expected && ch.id !== expected) {
+        throw new Error(`выбран канал «${ch.title}» (${ch.id}), а роликам нужен ${expected} — войдите снова и выберите канал Linkeon`);
+      }
       await this.pg.query(
         `INSERT INTO short_youtube_account
                 (id, channel_id, channel_title, refresh_token_enc, scopes, status, last_error, connected_at, updated_at)
