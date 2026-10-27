@@ -547,10 +547,15 @@ bold "[4/8] реестр продуктов на проде"
 # проверять его HTTP нечем), отметка живости и СЧЁТЧИК АКТИВНЫХ ХОДОВ для плана.
 # Перед самим гашением счётчик перечитывается заново: между планом и действием
 # проходят минуты, и ход может начаться ровно в них.
+# «занят» — правка ИЛИ задание машины (rekey, сон, домен): пересоздание
+# контейнера из-под задания агента — та же гонка, что из-под правки (очередь
+# 2, смена ключей).
 CATALOG=$(prod_sql "SELECT p.slug, p.kind, p.status,
        coalesce(extract(epoch from p.runner_seen_at)::bigint::text, '0'),
        (SELECT count(*) FROM product_turns t
          WHERE t.product_id = p.id AND t.status IN ('queued','running'))
+       + (SELECT count(*) FROM product_provision_jobs j
+           WHERE j.product_id = p.id AND j.status IN ('queued','running'))
   FROM products p
  WHERE p.archived_at IS NULL
  ORDER BY p.slug") || die "реестр продуктов прочитать не удалось — без него нельзя узнать,
@@ -562,10 +567,12 @@ cat_field() { # cat_field <slug> <номер поля 2..5>
 }
 
 # Свежий вопрос про один продукт — ровно перед тем, как его гасить.
-active_turns() { # active_turns <slug> → число, либо пусто при отказе
+active_turns() { # active_turns <slug> → число (правки + задания машины), либо пусто при отказе
   local out
   out=$(prod_sql "SELECT (SELECT count(*) FROM product_turns t
                            WHERE t.product_id = p.id AND t.status IN ('queued','running'))
+                         + (SELECT count(*) FROM product_provision_jobs j
+                             WHERE j.product_id = p.id AND j.status IN ('queued','running'))
                     FROM products p WHERE p.slug = '$1' AND p.archived_at IS NULL") || return 1
   printf '%s' "$(tr -d '[:space:]' <<<"$out")"
 }
@@ -954,10 +961,24 @@ bold "[7/8] кто отстал"
 # повторный прогон видел бы лишь остановленный контейнер с незнакомым именем,
 # относил бы его к «спящим продуктам» и шёл мимо — а клиентский продукт так и
 # оставался бы лежать, причём молча. Поймано подставной машиной.
+#
+# <слаг>__rekey — страховка ДРУГОГО задания (смена ключей, product-runner/
+# src/host/rekey.ts), не этого скрипта: там старый контейнер переименовывается
+# в неё ещё ЖИВЫМ, и агент хоста умер до того, как новый доказал здоровье или
+# откат вернул имя назад. По одному состоянию хоста не понять, какие ключи
+# подтверждены, — пересоздавать её как страховку обновления образа нельзя,
+# только отдельная строка на ручной разбор (очередь 2, задача 14b).
 RESUME=""
 ORPHAN_BACKUPS=""
+REKEY_ORPHANS="" # <слаг>__rekey — прервана смена ключей, трогать нельзя
 while IFS='|' read -r n st img net priv; do
   [[ -n "$n" ]] || continue
+  case "$n" in
+    *__rekey)
+      add REKEY_ORPHANS "${n%__rekey} ($n)"
+      continue
+      ;;
+  esac
   case "$n" in *__pre_*) ;; *) continue ;; esac
   base="${n%%__pre_*}"
   if grep -q "^CT|$base|" <<<"$CONTAINERS"; then
@@ -978,7 +999,7 @@ STALE=""
 while IFS='|' read -r n st img net priv; do
   [[ -n "$n" ]] || continue
   # Страховочные разобраны выше и в общий отбор не попадают.
-  case "$n" in *__pre_*) continue ;; esac
+  case "$n" in *__pre_*|*__rekey) continue ;; esac
   if [[ "$st" != "running" ]]; then
     # Остановленный контейнер продукта — это, скорее всего, СПЯЩИЙ продукт.
     # Поднять его пересозданием значило бы разбудить неоплаченный продукт, а
@@ -1083,6 +1104,7 @@ EOS
   # Пропуски печатаются и в сухом прогоне: сухой прогон затем и нужен, чтобы
   # увидеть их ЗАРАНЕЕ, а не после того, как машина уже тронута.
   [[ -n "$ORPHAN_BACKUPS" ]] && red "ПРОДУКТ ЛЕЖИТ, страховка от ДРУГОГО содержимого (руками): $ORPHAN_BACKUPS"
+  [[ -n "$REKEY_ORPHANS" ]] && red "прервана смена ключей — ручной разбор: $REKEY_ORPHANS"
   [[ -n "$SKIP_STOPPED" ]] && plan "НЕ ТРОНУЛ БЫ (контейнер остановлен, скорее всего продукт спит): $SKIP_STOPPED"
   [[ -n "$SKIP_UNKNOWN" ]] && plan "НЕ ТРОНУЛ БЫ (непонятное устройство контейнера): $SKIP_UNKNOWN"
   [[ -n "$FRESH_LIST" ]]   && plan "уже на свежем образе, не тронул бы: $FRESH_LIST"
@@ -1610,6 +1632,14 @@ if [[ -n "$ORPHAN_BACKUPS" ]]; then
   red "ПРОДУКТ ЛЕЖИТ, а страховка осталась от ДРУГОГО содержимого: $ORPHAN_BACKUPS"
   echo "      Это остаток оборвавшегося захода прошлого выката. Поднять руками:" >&2
   echo "        ssh $TARGET '${SUDO:+sudo }docker rename <страховка> <имя продукта> && ${SUDO:+sudo }docker start <имя продукта>'" >&2
+fi
+if [[ -n "$REKEY_ORPHANS" ]]; then
+  INCOMPLETE=1
+  red "прервана смена ключей — ручной разбор: $REKEY_ORPHANS"
+  echo "      <слаг>__rekey — страховка задания rekey (смена ключей владельца), не этого" >&2
+  echo "      скрипта: агент хоста умер, пока новый контейнер не доказал здоровье. По одному" >&2
+  echo "      состоянию хоста не понять, чьи ключи подтверждены — не трогаю. Разобрать руками:" >&2
+  echo "        ssh $TARGET '${SUDO:+sudo }docker ps -a | grep __rekey'" >&2
 fi
 if [[ -n "$MAYBE_KILLED" ]]; then
   INCOMPLETE=1
