@@ -79,13 +79,17 @@ export function executeLinkeonHelp(
  * Описание инструмента. Перечень тем — по клиенту: сборке из стора не
  * показываем тем о деньгах. О строке «Ссылка…» сборке из стора не говорим:
  * в её статьях этой строки нет (render.ts — ссылок на кабинет ей не даём).
+ * Telegram — только сам адрес: бот шлёт простой текст, markdown-ссылка
+ * осталась бы скобками (linksRule('plain') в chat/platform-guide.ts).
  */
 export function linkeonHelpTool(client: KbClient, registry: readonly KbArticle[] = KB_ARTICLES) {
   const ids = topicsFor(client, registry).map((a) => a.id);
   const linkLine =
     client === 'store'
       ? ''
-      : 'Строка «Ссылка…» в разделе «Где» — полный адрес раздела: дай его человеку рядом с названием раздела. ';
+      : 'Строка «Ссылка…» в разделе «Где» — полный адрес раздела: дай его человеку рядом с названием раздела' +
+        (client === 'telegram' ? ' — только сам адрес, без markdown' : '') +
+        '. ';
   return {
     name: LINKEON_HELP_TOOL_NAME,
     description:
