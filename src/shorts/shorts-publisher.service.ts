@@ -9,7 +9,7 @@ import { buildYoutubeKeyboard } from './short-callback';
 import { STAND_MARK, clip } from './short-captions';
 import { isStand } from './short-env';
 import { SUPPORTED_PLATFORMS, ShortSettings, ShortsSettingsService } from './shorts-settings.service';
-import { PENDING_UPLOAD_NOTE, ShortsYoutubeService, YoutubePlan } from './shorts-youtube.service';
+import { PENDING_UPLOAD_NOTE, ShortsYoutubeService } from './shorts-youtube.service';
 import { ShortPlatform, ShortPublication, ShortVideo, rowToPublication, rowToShort, shortsBucket } from './shorts.types';
 import { YoutubeAuthError, YoutubeMaybeUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
 
@@ -52,15 +52,17 @@ interface PlatformResult {
   status: 'published' | 'manual_pending';
   externalId: string;
   url: string | null;
-  /** Доступ, с которым ролик загружен на YouTube; у набора и Telegram его нет. */
-  privacy?: 'unlisted' | 'public';
+  /** Доступ, с которым ролик загружен на YouTube; у набора и Telegram его нет; null — ролик нашёлся по прошлой сессии (доступ неизвестен). */
+  privacy?: 'unlisted' | 'public' | null;
 }
 
 /**
  * Чем кончилась площадка:
  * - `done` — вышла, отметка записана;
  * - `skipped` — строку не захватил: площадка уже отработала;
- * - `refused` — отказ Telegram или сбой до отправки: строка `failed`, обычный повтор;
+ * - `refused` — отказ Telegram или сбой до отправки: строка `failed`, обычный
+ *   повтор; или отказ попытки YouTube, в том числе «исход неизвестен» до
+ *   последней попытки: строка `failed`, повтор спросит YouTube о прошлой сессии;
  * - `unknown` — исход отправки в канал неизвестен: строка и ролик уже в `failed`;
  * - `unrecorded` — отправка прошла, а отметка в базу не легла: ролик остаётся
  *   в `publishing`, его разберёт сторож (`rearmStuck`).
@@ -131,10 +133,10 @@ export class ShortsPublisherService {
    * один пост. `approved_at IS NOT NULL` — публикатор сам не выпустит ролик,
    * которого человек не одобрял, что бы ни делали с ним другие части модуля.
    *
-   * Дальше — по площадкам: Telegram, затем набор YouTube (только когда Telegram
-   * вышел). Перед каждой площадкой — продление живости: иначе медленная
-   * выгрузка двух файлов пережила бы STUCK_PUBLISHING_MINUTES, и сторож забрал
-   * бы ролик у живой отправки. Ролик ушёл из publishing — останавливаемся.
+   * Дальше — по площадкам: Telegram, затем YouTube — загрузкой или набором
+   * (только когда Telegram вышел). Перед каждой площадкой — продление живости:
+   * иначе медленная выгрузка двух файлов пережила бы STUCK_PUBLISHING_MINUTES,
+   * и сторож забрал бы ролик у живой отправки. Ролик ушёл из publishing — останавливаемся.
    *
    * Итог — `published`; возврат в `approved` под повтор или, когда попытки
    * кончились, `failed` с сообщением владельцу. Неизвестный исход отправки в
@@ -174,12 +176,12 @@ export class ShortsPublisherService {
       if (out === 'unknown' || out === 'unrecorded') return;
     }
     const telegramDone = !platforms.includes('telegram') || (await this.rows(v.id)).some((r) => r.platform === 'telegram' && r.status === 'published');
-    let uploaded: 'unlisted' | 'public' | null = null;
+    let uploaded: { privacy: 'unlisted' | 'public' | null } | null = null;
     if (platforms.includes('youtube') && telegramDone) {
       if (!(await this.keepAlive(v.id))) return;
       const out = await this.platform(v, 'youtube', async () => {
         const r = await this.toYoutube(v);
-        uploaded = r.privacy ?? null;
+        uploaded = r.status === 'published' ? { privacy: r.privacy ?? null } : null;
         return r;
       });
       if (out === 'unrecorded') return;
@@ -188,7 +190,7 @@ export class ShortsPublisherService {
     await this.settle(v, platforms);
     // Ссылку владельцу — после записи и итога ролика, не задерживая публикацию (notifyUploaded не бросает);
     // только для загрузки и с тем доступом, с которым грузили. Набор — без сообщения.
-    if (uploaded) void this.youtube?.notifyUploaded(v.id, uploaded);
+    if (uploaded) void this.youtube?.notifyUploaded(v.id, uploaded.privacy);
   }
 
   /**
@@ -314,10 +316,14 @@ export class ShortsPublisherService {
    */
   private async recordSent(v: ShortVideo, platform: ShortPlatform, out: PlatformResult): Promise<boolean> {
     const sent = out.url ?? `сообщение ${out.externalId}`;
+    // Загрузка YouTube: адрес сессии стирается тем же запросом, что пишет published. Сотри его
+    // раньше — сбой этой записи вернул бы ролик в очередь без адреса, и повтор загрузил бы ролик
+    // второй раз. Telegram и набор колонку не трогают: им миграция 003 не нужна.
+    const clearSession = platform === 'youtube' && out.status === 'published' ? ', upload_session = NULL' : '';
     try {
       const r = await this.pg.query(
         `UPDATE short_publication
-            SET status = $3, external_id = $4, url = $5, last_error = NULL,
+            SET status = $3, external_id = $4, url = $5, last_error = NULL${clearSession},
                 published_at = CASE WHEN $3 = 'published' THEN now() ELSE published_at END, updated_at = now()
           WHERE short_id = $1 AND platform = $2 AND status IN ('pending', 'publishing', 'failed')`,
         [v.id, platform, out.status, out.externalId, out.url],
@@ -383,24 +389,30 @@ export class ShortsPublisherService {
    * отказ с YOUTUBE_MAY_BE_OUT, ролик уходит в failed.
    */
   private async toYoutube(v: ShortVideo): Promise<PlatformResult> {
-    const plan: YoutubePlan = this.youtube ? await this.youtube.uploadPlan(v.id) : { kind: 'kit', note: null };
+    const yt = this.youtube;
+    if (!yt) return this.youtubeKit(v, null);
+    const plan = await yt.uploadPlan(v.id);
     if (plan.kind === 'kit') return this.youtubeKit(v, plan.note);
     const last = v.attempts >= MAX_PUBLISH_ATTEMPTS;
     try {
-      const up = await this.youtube.upload(v, plan.privacy, () => this.keepAlive(v.id));
-      return { status: 'published', externalId: up.videoId, url: up.url, privacy: plan.privacy };
+      const up = await yt.upload(v, plan.privacy, () => this.keepAlive(v.id));
+      return { status: 'published', externalId: up.videoId, url: up.url, privacy: up.resumed ? null : plan.privacy };
     } catch (e: any) {
       if (e instanceof YoutubeAuthError) {
-        const pending = e.pendingUpload ? ` ${PENDING_UPLOAD_NOTE}` : '';
+        const pending = e.pendingUpload ? `\n${PENDING_UPLOAD_NOTE}` : '';
         return this.youtubeKit(v, `Доступ к каналу YouTube пропал (${e.message}) — набор вместо загрузки. Переподключить: /youtube${pending}`);
       }
       if (e instanceof YoutubeUploadExpired) {
-        return this.youtubeKit(v, `${e.message} — набор вместо загрузки. ${PENDING_UPLOAD_NOTE}`);
+        return this.youtubeKit(v, `${e.message} — набор вместо загрузки.\n${PENDING_UPLOAD_NOTE}`);
       }
       if (e instanceof YoutubeMaybeUploaded) {
         throw new Error(last ? `${YOUTUBE_MAY_BE_OUT} (${e.message})` : `${e.message} — повторю, сначала спрошу YouTube о прошлой загрузке`);
       }
-      if (last) return this.youtubeKit(v, `Не смог загрузить на YouTube: ${clip(String(e?.message ?? e), 300)}. Выложите вручную.`);
+      if (last) {
+        // Хвостовая точка причины Google иначе дала бы «quota.. Выложите».
+        const reason = clip(String(e?.message ?? e), 300).replace(/[.\s]+$/, '');
+        return this.youtubeKit(v, `Не смог загрузить на YouTube: ${reason}. Выложите вручную.`);
+      }
       throw e;
     }
   }

@@ -230,7 +230,15 @@ export class ShortsYoutubeService {
         ? 'Доступ к каналу YouTube пропал — набор вместо загрузки. Переподключить: /youtube'
         : 'Канал YouTube не подключён — набор вместо загрузки. Подключить: /youtube';
     }
-    if (await this.session(shortId)) note = [note, PENDING_UPLOAD_NOTE].filter(Boolean).join(' ');
+    let pending: boolean;
+    try {
+      pending = !!(await this.session(shortId));
+    } catch (e: any) {
+      // Не смогли прочитать адрес — не знаем, была ли загрузка: предупреждаем в безопасную сторону.
+      this.logger.warn(`ролик ${shortId}: адрес сессии YouTube не прочитан: ${e?.message ?? e}`);
+      pending = true;
+    }
+    if (pending) note = [note, PENDING_UPLOAD_NOTE].filter(Boolean).join('\n');
     return { kind: 'kit', note };
   }
 
@@ -242,13 +250,20 @@ export class ShortsYoutubeService {
    * YoutubeUploadExpired: спросить не у кого, вслепую не грузим. Ответа нет —
    * YoutubeMaybeUploaded, адрес сессии остаётся для следующей попытки.
    */
-  async upload(v: ShortVideo, privacy: 'unlisted' | 'public', keepAlive: () => Promise<boolean>): Promise<{ videoId: string; url: string }> {
+  async upload(v: ShortVideo, privacy: 'unlisted' | 'public', keepAlive: () => Promise<boolean>): Promise<{ videoId: string; url: string; resumed: boolean }> {
     const yt = v.captions?.youtube;
     if (!v.videoKey || !yt) throw new YoutubeNotUploaded('у ролика нет файла или подписей YouTube');
     const cfg = youtubeOAuthConfig();
     if (!cfg) throw new YoutubeNotUploaded('YouTube не настроен на сервере');
-    const acc = await this.account();
-    const previous = await this.session(v.id);
+    let acc: YoutubeAccount | null;
+    let previous: string | null;
+    try {
+      acc = await this.account();
+      previous = await this.session(v.id);
+    } catch (e: any) {
+      // Не знаем, жива ли прошлая загрузка, — «ролика нет» сказать нельзя.
+      throw new YoutubeMaybeUploaded(`не прочитал состояние загрузки: ${clip(String(e?.message ?? e), 200)}`);
+    }
     if (!acc || acc.status !== 'connected') throw new YoutubeAuthError('канал YouTube не подключён', !!previous);
     let accessToken: string;
     let video: Buffer;
@@ -266,7 +281,7 @@ export class ShortsYoutubeService {
     if (previous) {
       // Нет ответа — YoutubeMaybeUploaded наверх, адрес остаётся.
       const st = await checkUpload(this.http, previous, accessToken, video.length);
-      if (st.state === 'complete') return this.done(v.id, st.videoId, previous);
+      if (st.state === 'complete') return this.done(st.videoId, true);
       // Истекла: адрес не стираем — повтор снова получит 404 и снова пришлёт набор, а не загрузит вслепую.
       if (st.state === 'gone') throw new YoutubeUploadExpired('YouTube уже не помнит прошлую загрузку этого ролика');
       // incomplete или failed — прошлая загрузка не дошла: грузим заново.
@@ -287,7 +302,7 @@ export class ShortsYoutubeService {
     if (!(await this.claimSession(v.id, sessionUrl))) throw new YoutubeMaybeUploaded('строку YouTube держит другая попытка — исход её загрузки неизвестен');
     if (!(await keepAlive())) throw new YoutubeNotUploaded('ролик ушёл из publishing до отправки файла — не отправляю');
     try {
-      return await this.done(v.id, await sendFile(this.http, sessionUrl, accessToken, video), sessionUrl);
+      return this.done(await sendFile(this.http, sessionUrl, accessToken, video), false);
     } catch (e: any) {
       if (e instanceof YoutubeNotUploaded) {
         // Явный отказ — итог сессии: на повторе она повторила бы его, спрашивать незачем.
@@ -297,7 +312,7 @@ export class ShortsYoutubeService {
       if (!(e instanceof YoutubeMaybeUploaded)) throw e;
       // Снова без ответа — YoutubeMaybeUploaded наверх, адрес остаётся.
       const st = await checkUpload(this.http, sessionUrl, accessToken, video.length);
-      if (st.state === 'complete') return this.done(v.id, st.videoId, sessionUrl);
+      if (st.state === 'complete') return this.done(st.videoId, false);
       if (st.state === 'gone') throw new YoutubeUploadExpired('YouTube уже не помнит загрузку этого ролика');
       await this.clearSession(v.id, sessionUrl);
       if (st.state === 'failed') throw new YoutubeNotUploaded(`отправка файла: ${st.reason}`, st.status);
@@ -328,7 +343,7 @@ export class ShortsYoutubeService {
   }
 
   /** После записи published: ссылка владельцу; доступ — тот, с которым грузили; при «по ссылке» — подсказка про «публично». */
-  async notifyUploaded(shortId: string, privacy: 'unlisted' | 'public'): Promise<void> {
+  async notifyUploaded(shortId: string, privacy: 'unlisted' | 'public' | null): Promise<void> {
     try {
       const r = await this.pg.query(
         `SELECT url FROM short_publication WHERE short_id = $1 AND platform = 'youtube' AND status = 'published'`,
@@ -336,17 +351,22 @@ export class ShortsYoutubeService {
       );
       const url = r.rows[0]?.url;
       if (!url) return;
+      const word = privacy ? ` (${MODE_WORDS[privacy]})` : '';
       const hint = privacy === 'unlisted' ? '\nЕсли ролик открывается и не стал приватным — /youtube публично.' : '';
-      await this.say(approverChatId(), `Вышло на YouTube (${MODE_WORDS[privacy]}): ${url}${hint}`);
+      await this.say(approverChatId(), `Вышло на YouTube${word}: ${url}${hint}`);
     } catch (e: any) {
       this.logger.warn(`ролик ${shortId}: сообщение о YouTube не отправлено: ${e?.message ?? e}`);
     }
   }
 
-  /** Ролик на YouTube: стереть свой адрес сессии. Сбой стирания успех не отменяет. */
-  private async done(shortId: string, videoId: string, url: string): Promise<{ videoId: string; url: string }> {
-    await this.clearSession(shortId, url).catch((e: any) => this.logger.warn(`ролик ${shortId}: адрес сессии не стёрт: ${e?.message ?? e}`));
-    return { videoId, url: `https://youtube.com/shorts/${videoId}` };
+  /**
+   * Ролик на YouTube. Адрес сессии здесь не стираем: его стирает публикатор тем же запросом,
+   * что пишет published (recordSent). Сотри его раньше — сбой той записи вернул бы ролик в
+   * очередь без адреса, и повтор загрузил бы ролик второй раз. resumed — ролик нашёлся по
+   * прошлой сессии: его доступ — от прошлой попытки.
+   */
+  private done(videoId: string, resumed: boolean): { videoId: string; url: string; resumed: boolean } {
+    return { videoId, url: `https://youtube.com/shorts/${videoId}`, resumed };
   }
 
   /** Файл ролика из MinIO со сроком: зависшее скачивание не должно пережить порог сторожа публикатора. */
