@@ -583,8 +583,10 @@ export class ShortsPublisherService implements OnModuleInit {
    * тогда граница в 10 минут не гарантирована, но запись набора всё равно идёт под жетоном строки.
    */
   private async youtubeKit(v: ShortVideo, note: string | null, fence: number): Promise<PlatformResult> {
-    // «Вручную» — note пуст (uploadPlan в этом режиме не предупреждает), строки нет.
-    if (note) this.logger.warn(`ролик ${v.id}: YouTube набором — ${clip(note, 300)}`);
+    // Нет заметки — обычный набор (вручную без живой сессии, публикатор без сервиса YouTube), строки нет.
+    // uploadPlan склеивает заметку и PENDING_UPLOAD_NOTE через \n — сырой перевод строки развёл бы
+    // «YouTube набором» и «могла дойти» по разным строкам лога; · держит их в одной.
+    if (note) this.logger.warn(`ролик ${v.id}: YouTube набором — ${clip(note.replace(/\s*\n+\s*/g, ' · '), 300)}`);
     const chatId = approverChatId();
     if (!chatId) throw new Error('BLOG_APPROVER_TG_ID не задан — набор для YouTube отправить некому');
     if (!v.videoKey || !v.captions) throw new Error('у ролика нет файла или подписей');

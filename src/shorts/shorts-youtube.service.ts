@@ -147,7 +147,9 @@ export class ShortsYoutubeService {
     const cfg = youtubeOAuthConfig();
     if (!cfg) return connectPage(503, 'YouTube не настроен', 'На этом сервере не настроен клиент OAuth YouTube: нужны YOUTUBE_OAUTH_CLIENT_ID, YOUTUBE_OAUTH_CLIENT_SECRET и PUBLIC_BASE_URL.');
     if (q.error) {
-      this.logger.warn(`YouTube: вход в Google не завершён (error=${clip(q.error, 100)})`);
+      // До verifyState — сюда попадёт и чужой анонимный запрос; коды Google — [a-z_],
+      // перевод строки или прочий мусор в значении чистим, чтобы не исказить соседние строки лога.
+      this.logger.warn(`YouTube: вход в Google не завершён (error=${clip(q.error.replace(/[^\w.-]/g, '?'), 100)})`);
       return connectPage(200, 'Подключение отменено', 'Канал не подключён. Чтобы попробовать снова, пришлите боту /youtube.');
     }
     const st = verifyState(cfg.clientSecret, cfg.redirectUri, q.state);
@@ -156,6 +158,14 @@ export class ShortsYoutubeService {
       return connectPage(400, 'Ссылка устарела', 'Пришлите боту /youtube и откройте новую ссылку.');
     }
     if (!q.code) return connectPage(400, 'Нет кода от Google', 'Пришлите боту /youtube и попробуйте ещё раз.');
+    if ((process.env.CALENDAR_SECRET_KEY || '').length < 32) {
+      // Код Google одноразовый: потратить его на exchangeCode, не умея сохранить refresh-токен
+      // этим же ключом (accessToken() проверяет его так же при обновлении), — сжечь код впустую.
+      const reason = 'на сервере нет CALENDAR_SECRET_KEY — канал не подключить';
+      this.logger.error(`YouTube: ${reason}`);
+      void this.say(st.chatId, `YouTube не подключён: ${reason}`);
+      return connectPage(503, 'YouTube не настроен', `${reason}. Напишите администратору.`);
+    }
     let tokens: { accessToken: string; refreshToken: string; scope: string };
     try {
       tokens = await exchangeCode(this.http, cfg, q.code);
@@ -178,6 +188,8 @@ export class ShortsYoutubeService {
       if (expected && ch.id !== expected) {
         throw new Error(`выбран канал «${ch.title}» (${ch.id}), а роликам нужен ${expected} — войдите снова и выберите канал Linkeon`);
       }
+      // Шифруем до транзакции: внутри нужны только запросы к базе, не сторонние вычисления.
+      const tokenEnc = encryptSecret(tokens.refreshToken);
       // Аккаунт и режим — одной транзакцией: сбой второго запроса откатывает и первый,
       // а не оставляет канал записанным в базе при странице 502 владельцу.
       const mode: YoutubeMode = await inTransaction(this.pg, async (tx) => {
@@ -189,7 +201,7 @@ export class ShortsYoutubeService {
               SET channel_id = EXCLUDED.channel_id, channel_title = EXCLUDED.channel_title,
                   refresh_token_enc = EXCLUDED.refresh_token_enc, scopes = EXCLUDED.scopes,
                   status = 'connected', last_error = NULL, connected_at = now(), updated_at = now()`,
-          [ch.id, ch.title, encryptSecret(tokens.refreshToken), tokens.scope],
+          [ch.id, ch.title, tokenEnc, tokens.scope],
         );
         // Подключение при «вручную» включает «по ссылке»: первый ролик — проверка (спека, «Сценарий владельца»).
         // Канал хранится только в short_youtube_account; short_settings.youtube_channel_id не трогаем — одна правда.
@@ -252,8 +264,10 @@ export class ShortsYoutubeService {
     try {
       pending = !!(await this.session(shortId));
     } catch (e: any) {
-      if (e?.code === '42703') {
-        // Нет колонки — миграция 003 не накатилась: загрузок не было, предупреждать не о чем.
+      if (e?.code === '42703' && String(e?.message ?? '').includes('upload_session')) {
+        // Нет именно этой колонки — миграция 003 не накатилась: загрузок не было, предупреждать
+        // не о чем. 42703 про другую колонку (например, если запрос когда-нибудь пополнят новым
+        // условием) — не наш случай: безопасная сторона здесь, как при любой непонятной ошибке, — else.
         this.logger.error('YouTube: нет колонки upload_session — миграция 003 не накатилась; набор без предупреждения о прошлой загрузке');
         pending = false;
       } else {
