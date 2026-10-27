@@ -28,7 +28,7 @@ export const STUCK_PUBLISHING_MINUTES = 10;
 /**
  * Предел задержки ответа на продление живости перед отправкой (keepAliveFenced). От продления
  * до конца отправки должно уложиться в порог сторожа (STUCK_PUBLISHING_MINUTES, 10 мин): файл в
- * канал и файл набора идут до 500 с — таймаут grammy по умолчанию (timeoutSeconds в
+ * канал, файл и подпись набора идут до 500 с каждая — таймаут grammy по умолчанию (timeoutSeconds в
  * ApiClientOptions; TgGrammyClient создаёт Bot без своих опций), файл на YouTube — до 8 мин
  * (SEND_TIMEOUT_MS). С минутой задержки ответа обе отправки всё ещё короче 10 мин. Продление,
  * чей ответ шёл дольше, — без отправки: сторож мог бы вернуть ролик в очередь посреди неё, и
@@ -541,7 +541,10 @@ export class ShortsPublisherService {
    *
    * Под жетоном строки (см. platform()): набор шлёт и записывает только попытка, которая
    * держит строку. Иначе проснувшаяся старая попытка прислала бы набор, пока новая грузит
-   * ролик сама, — и ручная выкладка по набору дала бы дубль на канале.
+   * ролик сама, — и ручная выкладка по набору дала бы дубль на канале. Отправок две — файл и
+   * подпись, каждая до 500 с (таймаут grammy), поэтому продление с правилом KEEPALIVE_MAX_LAG_MS —
+   * перед каждой. Не прошло перед подписью — файл уже в личке: своя строка уйдёт в повтор, и
+   * следующая попытка пришлёт набор заново (второй файл безвреден), чужую строку не трогаем.
    */
   private async youtubeKit(v: ShortVideo, note: string | null, fence: number): Promise<PlatformResult> {
     const chatId = approverChatId();
@@ -556,6 +559,9 @@ export class ShortsPublisherService {
     await this.tg.sendDocument(chatId, video, `linkeon-${v.slug ?? v.id}.mp4`, {
       caption: clip(`${mark}Набор для YouTube Shorts — файл ролика${v.title ? ` «${v.title}»` : ''}.`, 1000),
     });
+    if (!(await this.keepAliveFenced(v, 'youtube', fence))) {
+      throw new YoutubeAttemptSuperseded('набор: файл ушёл, подпись не шлю — ролик или строку YouTube забрала другая попытка либо продление шло слишком долго');
+    }
     const msg: any = await this.tg.sendMessage(
       chatId,
       `${mark}${note ? `${note}\n\n` : ''}YouTube — заголовок:\n${yt.title}\n\nОписание:\n${yt.description}\n\nТеги: ${yt.tags.join(', ')}\n\n` +
