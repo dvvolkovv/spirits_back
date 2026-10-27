@@ -1622,7 +1622,8 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    * Свободный текст продукта стирается тем же оператором (решение контролёра
    * по ревью задачи 10 — «стирается насовсем»): prompt, result и error правок
    * (product_turns) заменяются меткой PURGED_TEXT, первая правка из payload
-   * карточек продукта (product_actions.payload->'prompt') удаляется. Числа
+   * карточек продукта (product_actions.payload->'prompt') и коробки ключей
+   * карточек (secrets_box) удаляются. Числа
    * (tokens_spent), статусы, sha и время остаются: по ним — деньги и история.
    *
    * Помечается «стёртым» только удалённый (archived_at не NULL): выдача purge
@@ -1662,9 +1663,12 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
             FROM purged WHERE t.product_id = purged.id
           RETURNING t.id
        ), prompts AS (
+          -- И коробки ключей карточек (secrets_box — тоже ключи): тот же
+          -- набор, что стирает обход после срока (product-purge.service.ts,
+          -- wipeExpired), — стёртый продукт не держит ключей нигде.
           UPDATE product_actions a
-             SET payload = a.payload - 'prompt'
-            FROM purged WHERE a.product_id = purged.id AND a.payload ? 'prompt'
+             SET payload = a.payload - 'prompt', secrets_box = NULL
+            FROM purged WHERE a.product_id = purged.id AND (a.payload ? 'prompt' OR a.secrets_box IS NOT NULL)
           RETURNING a.id
        ), logged AS (
           INSERT INTO product_actions (user_id, product_id, kind, status, channel, payload, result, attached_at, resolved_at)

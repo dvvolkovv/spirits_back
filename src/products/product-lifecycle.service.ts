@@ -729,7 +729,14 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
                     WHEN block_reason IS NULL AND $4 IS DISTINCT FROM 'failed' AND $5 THEN NULL
                     ELSE sleep_reason
                   END
-            WHERE id = $1 AND user_id = $2 AND archived_at IS NOT NULL AND purged_at IS NULL AND purge_after > now()
+            -- clock_timestamp(), а не now(): now() — время НАЧАЛА этой
+            -- транзакции, и возврат, начатый за миг до срока, прошёл бы уже
+            -- после него — когда почасовой обход стирания
+            -- (product-purge.service.ts, wipeExpired) успел стереть продукту
+            -- ключи и тексты. Часы здесь читаются под замком строки (захват
+            -- в начале транзакции): обход, стёрший ключи, закоммитил до нас,
+            -- а значит, и срок к этому мигу уже вышел.
+            WHERE id = $1 AND user_id = $2 AND archived_at IS NOT NULL AND purged_at IS NULL AND purge_after > clock_timestamp()
             RETURNING status, paid_until > now() AS paid, paid_until`,
           [p.id, i.userId, SLEEP_REASON_NO_TOKENS, prevStatus, affordable],
         );
@@ -754,7 +761,16 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       if (!botInUse) {
         const row = r.rows[0];
         if (!row) {
+          // Строка заперта (захват в начале транзакции) и была архивной и не стёртой —
+          // ноль строк здесь почти всегда значит «срок вышел, пока шёл
+          // возврат». Перечитываем под тем же замком, чтобы ответить правду,
+          // а не «такого продукта нет».
+          const why = await client.query(
+            `SELECT (purge_after IS NOT NULL AND purge_after <= clock_timestamp()) AS expired FROM products WHERE id = $1`,
+            [p.id],
+          );
           await client.query('ROLLBACK');
+          if (why.rows[0]?.expired === true) return { ok: false, reason: 'expired', message: 'Срок возврата вышел' };
           return { ok: false, reason: 'not_found', message: 'Удалённого продукта с таким именем нет' };
         }
         let waking = false;

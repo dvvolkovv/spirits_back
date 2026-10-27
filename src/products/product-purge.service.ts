@@ -18,6 +18,32 @@ export const PURGE_TICK_MS = 60 * 60 * 1000;
 const PURGE_FAIL_CAP = 3;
 
 /**
+ * Начало ЗАМОРОЖЕННОЙ формулировки отказа агента машины на незнакомый ему
+ * вид задания (product-runner/src/host/index.ts, unknownKindMessage) — тот же
+ * приём, что AGENT_OUTDATED_MARKER у своего домена (domain-name.ts). Агент
+ * ставится на машины отдельно от сервера (deploy.sh, PHASE 4), и сервер,
+ * выкаченный раньше, получает от старого агента на каждое стирание именно
+ * этот отказ — до первого обращения к хосту. Такой отказ — не провал
+ * стирания и в потолок не идёт. Сверяется только НАЧАЛО текста.
+ */
+export const PURGE_AGENT_OUTDATED = 'неизвестный вид задания: "purge". Агент умеет';
+const OUTDATED_SQL = `COALESCE(j.error, '') LIKE '${PURGE_AGENT_OUTDATED}%'`;
+
+/**
+ * Провалы стирания, которые идут в потолок, — одно выражение на оба
+ * запроса (предупреждение и постановка), чтобы они не разошлись:
+ *   - только после этой архивации (j.created_at >= p.archived_at), как у сна
+ *     удалённого: провалы прошлого цикла архив/возврат не считаются;
+ *   - только забранные агентом (started_at есть): снятые до выдачи —
+ *     возвратом, сборщиком при лежащем агенте — не провал (отступление 16);
+ *   - без отказов старого агента «неизвестный вид задания» (выше).
+ */
+const COUNTED_FAILURES_SQL = `(SELECT count(*) FROM product_provision_jobs j
+                WHERE j.product_id = p.id AND j.kind = 'purge' AND j.status = 'failed'
+                  AND j.started_at IS NOT NULL AND j.created_at >= p.archived_at
+                  AND NOT ${OUTDATED_SQL})`;
+
+/**
  * Корень резервных копий: PRODUCT_REPOS_DIR или ~/product-repos пользователя
  * процесса API — туда их кладёт scripts/product-backup-setup.sh
  * (REPO_ROOT=/home/dvolkov/product-repos, API на проде работает от dvolkov).
@@ -73,6 +99,12 @@ export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
    * поведение обхода множество не влияет.
    */
   private warned = new Set<string>();
+  /**
+   * Обход идёт — следующий пропускается. Час на обход с запасом, но копия
+   * на медленном диске или база под замком могут его растянуть, и два
+   * обхода наперегонки стирали бы одну копию и ставили одно задание дважды.
+   */
+  private running = false;
 
   constructor(private readonly pg: PgService) {}
 
@@ -93,9 +125,18 @@ export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
    * машины, ни от очереди.
    */
   async tick(): Promise<void> {
-    await this.safe('стирание ключей после срока', () => this.wipeExpired());
-    await this.safe('обход стирания', () => this.queuePurges());
-    await this.safe('стирание резервных копий', () => this.removeBackups());
+    if (this.running) {
+      this.logger.warn('прошлый обход стирания ещё идёт — этот пропущен');
+      return;
+    }
+    this.running = true;
+    try {
+      await this.safe('стирание ключей после срока', () => this.wipeExpired());
+      await this.safe('обход стирания', () => this.queuePurges());
+      await this.safe('стирание резервных копий', () => this.removeBackups());
+    } finally {
+      this.running = false;
+    }
   }
 
   private async safe(name: string, fn: () => Promise<unknown>): Promise<void> {
@@ -109,8 +150,10 @@ export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
   /**
    * Ключи и свободный текст удалённого не переживают срок возврата — даже
    * если стирание на машине упрётся в потолок провалов или машина лежит
-   * (отступление 16 плана). Вернуть такой продукт уже нельзя (restore требует
-   * purge_after > now()), так что ни ключи, ни тексты больше не нужны никому.
+   * (отступление 16 плана). Вернуть такой продукт уже нельзя: restore требует
+   * purge_after > clock_timestamp() под замком строки — часы, а не время
+   * начала своей транзакции, так что возврат, начатый за миг до срока, после
+   * этого стирания тоже не пройдёт. Ни ключи, ни тексты больше не нужны никому.
    *
    * Стирается тот же набор, что у completePurgeJob на сервере, — без того,
    * что зависит от машины: пометку «стёрт» ставит только отчёт агента, а
@@ -168,30 +211,52 @@ export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Потолок — 3 провала подряд ПОСЛЕ этой архивации, как у сна удалённого
-   * (j.created_at >= p.archived_at: провалы прошлого цикла архив/возврат не
-   * считаются). Считаются только задания, которые агент забрал (started_at
-   * есть): снятые до выдачи — возвратом, сборщиком при лежащем агенте — не
-   * провал стирания (отступление 16).
+   * Потолок — 3 провала подряд ПОСЛЕ этой архивации (COUNTED_FAILURES_SQL —
+   * что идёт в счёт). Задание ставится только продукту с машиной: claimJob
+   * выдаёт по метке машины (p.host_id = метка агента), и задание продукта
+   * без неё висело бы в очереди до сборщика, загораживая очередь продукта.
+   *
+   * Разбор для людей — один запрос по всем удалённым после срока и строка в
+   * лог раз на процесс на продукт:
+   *   - без машины — error: стирать на машине нечем, только на сервере;
+   *   - потолок — error: на машине остались каталог, контейнер и vhost;
+   *   - снято невыданным раз за разом — warn: агент машины не забирает
+   *     задания (лежит или не видит их), постановка не прекращается;
+   *   - отказ старого агента «неизвестный вид задания» — warn: агента пора
+   *     обновить, постановка не прекращается.
+   * Ключи и тексты на сервере к этому моменту уже стёрты (wipeExpired).
    */
   async queuePurges(): Promise<number> {
-    const capped = await this.pg.query(
-      `SELECT p.id, p.slug FROM products p
-        WHERE p.archived_at IS NOT NULL AND p.purged_at IS NULL AND p.status = 'archived'
-          AND p.purge_after IS NOT NULL AND p.purge_after <= now()
-          AND (SELECT count(*) FROM product_provision_jobs j
+    const due = await this.pg.query(
+      `SELECT p.id, p.slug, p.host_id,
+              ${COUNTED_FAILURES_SQL}::int AS failed,
+              (SELECT count(*) FROM product_provision_jobs j
                 WHERE j.product_id = p.id AND j.kind = 'purge' AND j.status = 'failed'
-                  AND j.started_at IS NOT NULL AND j.created_at >= p.archived_at) >= $1`,
-      [PURGE_FAIL_CAP],
+                  AND j.started_at IS NULL AND j.created_at >= p.archived_at)::int AS unclaimed,
+              (SELECT count(*) FROM product_provision_jobs j
+                WHERE j.product_id = p.id AND j.kind = 'purge' AND j.status = 'failed'
+                  AND j.created_at >= p.archived_at AND ${OUTDATED_SQL})::int AS outdated
+         FROM products p
+        WHERE p.archived_at IS NOT NULL AND p.purged_at IS NULL AND p.status = 'archived'
+          AND p.purge_after IS NOT NULL AND p.purge_after <= now()`,
     );
-    for (const row of capped.rows) {
-      // error, а не warn: без стирания на машине остаются каталог продукта,
-      // контейнер и vhost удалённого — повод для ручного разбора. Ключи и
-      // тексты на сервере к этому моменту уже стёрты (wipeExpired).
-      this.errorOnce(
-        `cap:${row.id}`,
-        `стирание продукта ${row.id} (${row.slug}) не ставится: ${PURGE_FAIL_CAP} провала подряд — нужен ручной разбор, на машине остались каталог и контейнер`,
-      );
+    for (const row of due.rows) {
+      if (row.host_id === null || row.host_id === undefined) {
+        this.errorOnce(`nohost:${row.id}`, `удалённый продукт ${row.id} (${row.slug}) без машины — стирание только на сервере: ключи и тексты стёрты, задание агенту не ставится`);
+        continue;
+      }
+      if (Number(row.failed) >= PURGE_FAIL_CAP) {
+        this.errorOnce(
+          `cap:${row.id}`,
+          `стирание продукта ${row.id} (${row.slug}) не ставится: ${PURGE_FAIL_CAP} провала подряд — нужен ручной разбор, на машине остались каталог и контейнер`,
+        );
+      }
+      if (Number(row.unclaimed) >= PURGE_FAIL_CAP) {
+        this.warnOnce(`unclaimed:${row.id}`, `стирание продукта ${row.id} (${row.slug}) снова и снова снимается невыданным (всего ${row.unclaimed}) — агент машины ${row.host_id} не забирает задания; продукт на машине остался`);
+      }
+      if (Number(row.outdated) > 0) {
+        this.warnOnce(`outdated:${row.id}`, `агент машины ${row.host_id} не знает задания purge (продукт ${row.slug}) — обновить агента; стирание ставится снова`);
+      }
     }
     // FOR UPDATE OF p — тот же замок, что у сна удалённых: возврат (restore)
     // держит строку продукта до COMMIT, и стирание, прочитавшее снимок до
@@ -201,11 +266,10 @@ export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
        SELECT p.id, 'purge', 'queued' FROM products p
         WHERE p.archived_at IS NOT NULL AND p.purged_at IS NULL AND p.status = 'archived'
           AND p.purge_after IS NOT NULL AND p.purge_after <= now()
+          AND p.host_id IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
                            WHERE j.product_id = p.id AND j.status IN ('queued','running'))
-          AND (SELECT count(*) FROM product_provision_jobs j
-                WHERE j.product_id = p.id AND j.kind = 'purge' AND j.status = 'failed'
-                  AND j.started_at IS NOT NULL AND j.created_at >= p.archived_at) < $1
+          AND ${COUNTED_FAILURES_SQL} < $1
           FOR UPDATE OF p
        ON CONFLICT DO NOTHING
        RETURNING product_id`,
@@ -282,14 +346,20 @@ export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
           await fs.promises.rm(where, { recursive: true, force: true });
         }
         // repo_url = $2 — обнуляем ровно то, по чему стирали: переписанный
-        // за это время repo_url указывает уже на другую копию.
-        await this.pg.query(
-          `UPDATE products SET repo_url = NULL WHERE id = $1 AND purged_at IS NOT NULL AND repo_url = $2`,
+        // за это время repo_url указывает уже на другую копию, и такое
+        // стирание не засчитывается (копии, на которую он теперь смотрит, мы
+        // не трогали).
+        const u = await this.pg.query(
+          `UPDATE products SET repo_url = NULL WHERE id = $1 AND purged_at IS NOT NULL AND repo_url = $2 RETURNING id`,
           [p.id, p.repo_url],
         );
-        removed += 1;
+        if (u.rows.length > 0) removed += 1;
       } catch (e: any) {
-        this.logger.error(`резервная копия ${p.slug} не стёрта: ${fsCode(e)}`);
+        // Раз на процесс на продукт и вид отказа, а не каждый час: копия без
+        // прав на удаление останется такой и через час. Другой вид отказа
+        // (сначала обрыв с базой, потом EACCES) — своя строка.
+        const code = fsCode(e);
+        this.errorOnce(`fail:${p.id}:${code}`, `резервная копия ${p.slug} не стёрта: ${code} — повтор каждый час, стереть руками`);
       }
     }
     return removed;
