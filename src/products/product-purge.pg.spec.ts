@@ -210,10 +210,14 @@ maybe('обход стирания и резервные копии против
     process.env.PRODUCT_REPOS_DIR = link;
     fs.mkdirSync(path.join(real, 'via-link.git'));
     const p = await deleted({ purgeAfterMs: -60_000, purged: true, slug: 'via-link', repoUrl: `backup@10.0.0.1:${link}/via-link.git` });
+    // Копии нет — но и корень не тот, что в настройке: «стирать нечего» тут
+    // не вывод, repo_url остаётся (сверка корня, а не только самой копии).
+    const empty = await deleted({ purgeAfterMs: -60_000, purged: true, slug: 'via-link-none', repoUrl: `backup@10.0.0.1:${link}/via-link-none.git` });
 
     expect(await svc.removeBackups()).toBe(0);
     expect(fs.existsSync(path.join(real, 'via-link.git'))).toBe(true);
     expect(await repoUrlOf(p.id)).toBe(`backup@10.0.0.1:${link}/via-link.git`);
+    expect(await repoUrlOf(empty.id)).toBe(`backup@10.0.0.1:${link}/via-link-none.git`);
   });
 
   it('каталога копий нет на машине — repo_url не обнуляется: «не знаю, что там» не равно «пусто»', async () => {

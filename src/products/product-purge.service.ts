@@ -272,6 +272,8 @@ export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
           continue;
         }
         if (st) {
+          // При сверенном корне и каталоге по lstat настоящий путь совпадает
+          // всегда — это страховка от подмены каталога ссылкой между lstat и rm.
           const real = await fs.promises.realpath(where);
           if (real !== where) {
             this.warnOnce(`odd:${p.id}`, `копия ${where} на деле ${real} — не трогаю, стереть руками`);
