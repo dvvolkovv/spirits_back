@@ -1,6 +1,6 @@
 import * as http from 'http';
 import { AddressInfo } from 'net';
-import { axiosHttp, clip, googleReason } from './youtube-http';
+import { axiosHttp, clip, googleReason, googleReasonCode } from './youtube-http';
 
 describe('googleReason', () => {
   it('ошибка API: reason и message', () => {
@@ -18,6 +18,19 @@ describe('googleReason', () => {
   it('строковое тело (HTML с upload_id) не берётся; длинная причина — не длиннее 300 знаков', () => {
     expect(googleReason({ status: 404, headers: {}, data: '<html>/upload?upload_id=SECRET</html>' })).toBe('HTTP 404');
     expect(googleReason({ status: 400, headers: {}, data: { error: { message: 'x'.repeat(1000) } } })).toHaveLength(300);
+  });
+});
+
+describe('googleReasonCode', () => {
+  it('объект с errors[0].reason — код причины', () => {
+    expect(googleReasonCode({ status: 403, headers: {}, data: { error: { errors: [{ reason: 'quotaExceeded' }] } } })).toBe('quotaExceeded');
+  });
+
+  it('строковое error, пустое тело, не-объект — null', () => {
+    expect(googleReasonCode({ status: 400, headers: {}, data: { error: 'invalid_grant', error_description: 'x' } })).toBeNull();
+    expect(googleReasonCode({ status: 403, headers: {}, data: {} })).toBeNull();
+    expect(googleReasonCode({ status: 403, headers: {}, data: undefined })).toBeNull();
+    expect(googleReasonCode({ status: 404, headers: {}, data: '<html>/upload?upload_id=SECRET</html>' })).toBeNull();
   });
 });
 

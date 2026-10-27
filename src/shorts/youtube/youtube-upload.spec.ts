@@ -105,12 +105,21 @@ describe('checkUpload', () => {
   it('308 без Range или с неполным Range — не догружено', async () => {
     expect(await checkUpload(fakeHttp(reply(308)).http, SESSION, 'at', 77)).toEqual({ state: 'incomplete' });
     expect(await checkUpload(fakeHttp(reply(308, {}, { range: 'bytes=0-41' })).http, SESSION, 'at', 77)).toEqual({ state: 'incomplete' });
+    expect(await checkUpload(fakeHttp(reply(308, {}, { range: 'bytes=0-99' })).http, SESSION, 'at', 1000)).toEqual({ state: 'incomplete' });
   });
 
   it('308 с Range до последнего байта — YouTube собирает ролик: YoutubeMaybeUploaded', async () => {
     const e = await caught(checkUpload(fakeHttp(reply(308, {}, { range: 'bytes=0-76' })).http, SESSION, 'at', 77));
     expect(e).toBeInstanceOf(YoutubeMaybeUploaded);
     expect(e).toMatchObject({ status: 308 });
+  });
+
+  it('308 с Range не по протоколу (не с нулевого байта или не разбирается) — исход неизвестен, YoutubeMaybeUploaded', async () => {
+    for (const range of ['bytes=100-200', 'garbage']) {
+      const e = await caught(checkUpload(fakeHttp(reply(308, {}, { range })).http, SESSION, 'at', 1000));
+      expect(e).toBeInstanceOf(YoutubeMaybeUploaded);
+      expect(e).toMatchObject({ status: 308 });
+    }
   });
 
   it('404 и 410 — сессии нет (gone)', async () => {
@@ -121,8 +130,24 @@ describe('checkUpload', () => {
   it('итоговый отказ 4xx — загрузка кончилась отказом (failed)', async () => {
     expect(await checkUpload(fakeHttp(reply(400, { error: { message: 'bad metadata' } })).http, SESSION, 'at', 1))
       .toEqual({ state: 'failed', status: 400, reason: 'HTTP 400 bad metadata' });
-    expect(await checkUpload(fakeHttp(reply(403, { error: { message: 'forbidden', errors: [{ reason: 'forbidden' }] } })).http, SESSION, 'at', 1))
-      .toEqual({ state: 'failed', status: 403, reason: 'HTTP 403 forbidden: forbidden' });
+  });
+
+  it('403 с явным лимитом (quotaExceeded, uploadLimitExceeded) — тоже failed', async () => {
+    for (const reason of ['quotaExceeded', 'uploadLimitExceeded']) {
+      expect(await checkUpload(fakeHttp(reply(403, { error: { message: 'limit', errors: [{ reason }] } })).http, SESSION, 'at', 1))
+        .toEqual({ state: 'failed', status: 403, reason: `HTTP 403 ${reason}: limit` });
+    }
+  });
+
+  it('403 без явного лимита — сессия бывает не этого аккаунта (переподключил другой менеджер бренд-канала): исход неизвестен', async () => {
+    const noBody = await caught(checkUpload(fakeHttp(reply(403)).http, SESSION, 'at', 1));
+    expect(noBody).toBeInstanceOf(YoutubeMaybeUploaded);
+    expect(noBody).toMatchObject({ status: 403 });
+    const forbidden = await caught(
+      checkUpload(fakeHttp(reply(403, { error: { message: 'forbidden', errors: [{ reason: 'forbidden' }] } })).http, SESSION, 'at', 1),
+    );
+    expect(forbidden).toBeInstanceOf(YoutubeMaybeUploaded);
+    expect(forbidden).toMatchObject({ status: 403 });
   });
 
   it('401, 408, 429, 5xx и обрыв — YoutubeMaybeUploaded', async () => {
