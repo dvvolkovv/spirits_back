@@ -17,7 +17,7 @@
 --   ALTER TABLE short_publication DROP COLUMN upload_session;
 --   ALTER TABLE short_settings DROP COLUMN youtube_mode;
 --   -- DROP TABLE short_youtube_account доступ у Google не отзывает: при окончательном откате
---   -- отозвать его в настройках аккаунта Google (Безопасность → Сторонние приложения); при
+--   -- отозвать его на странице https://myaccount.google.com/connections; при
 --   -- повторном выкате канал подключается заново командой /youtube.
 DO $shorts$
 BEGIN

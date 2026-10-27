@@ -173,7 +173,11 @@ describe('текст 003_youtube.sql', () => {
     expect(adds.map(([, t, c]) => `${t}.${c}`).sort()).toEqual(['short_publication.upload_session', 'short_settings.youtube_mode']);
     expect((sql.match(/ALTER TABLE/g) ?? []).length).toBe(adds.length);
     for (const [, table, column] of adds) {
-      expect(sql).toMatch(new RegExp(`table_name = '${table}' AND column_name = '${column}'\\) THEN\\s+ALTER TABLE ${table} ADD COLUMN ${column}`));
+      expect(sql).toMatch(
+        new RegExp(
+          `IF NOT EXISTS \\(SELECT 1 FROM information_schema\\.columns\\s+WHERE table_schema = 'public' AND table_name = '${table}' AND column_name = '${column}'\\) THEN\\s+ALTER TABLE ${table} ADD COLUMN ${column}`,
+        ),
+      );
     }
     expect(sql).toMatch(/IF to_regclass\('public\.short_youtube_account'\) IS NULL THEN\s+CREATE TABLE short_youtube_account/);
     expect(sql).not.toMatch(/ADD COLUMN IF NOT EXISTS/);
