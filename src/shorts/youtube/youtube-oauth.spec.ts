@@ -3,6 +3,7 @@ import { HttpRequest, HttpResponse } from './youtube-http';
 import { YOUTUBE_SCOPES, authorizeUrl, exchangeCode, fetchMyChannel, refreshAccessToken, youtubeOAuthConfig } from './youtube-oauth';
 
 const CFG = { clientId: 'cid.apps.googleusercontent.com', clientSecret: 'sec', redirectUri: 'https://test.linkeon.io/webhook/shorts/youtube/oauth/callback' };
+const FULL = YOUTUBE_SCOPES.join(' ');
 const reply = (status: number, data: any = {}, headers: any = {}): HttpResponse => ({ status, data, headers });
 
 function fakeHttp(...responses: Array<HttpResponse | Error>) {
@@ -50,8 +51,8 @@ describe('authorizeUrl', () => {
 
 describe('exchangeCode', () => {
   it('код → токены; запрос формой с секретом и адресом возврата', async () => {
-    const { http, calls } = fakeHttp(reply(200, { access_token: 'at', refresh_token: 'rt', scope: 'a b' }));
-    expect(await exchangeCode(http, CFG, 'code-1')).toEqual({ accessToken: 'at', refreshToken: 'rt', scope: 'a b' });
+    const { http, calls } = fakeHttp(reply(200, { access_token: 'at', refresh_token: 'rt', scope: FULL }));
+    expect(await exchangeCode(http, CFG, 'code-1')).toEqual({ accessToken: 'at', refreshToken: 'rt', scope: FULL });
     const body = new URLSearchParams(calls[0].data);
     expect(calls[0]).toMatchObject({ method: 'POST', url: 'https://oauth2.googleapis.com/token' });
     expect(body.get('grant_type')).toBe('authorization_code');
@@ -60,8 +61,13 @@ describe('exchangeCode', () => {
     expect(body.get('redirect_uri')).toBe(CFG.redirectUri);
   });
 
+  it('Google выдал не все разрешения (галочка загрузки снята) — понятная ошибка', async () => {
+    const { http } = fakeHttp(reply(200, { access_token: 'at', refresh_token: 'rt', scope: 'https://www.googleapis.com/auth/youtube.readonly' }));
+    await expect(exchangeCode(http, CFG, 'c')).rejects.toThrow(/не дал доступ на загрузку/);
+  });
+
   it('нет refresh-токена — понятная ошибка', async () => {
-    await expect(exchangeCode(fakeHttp(reply(200, { access_token: 'at' })).http, CFG, 'c')).rejects.toThrow(/refresh-токен/);
+    await expect(exchangeCode(fakeHttp(reply(200, { access_token: 'at', scope: FULL })).http, CFG, 'c')).rejects.toThrow(/refresh-токен/);
   });
 
   it('отказ Google — причина в ошибке', async () => {
@@ -77,14 +83,20 @@ describe('refreshAccessToken', () => {
     expect(new URLSearchParams(calls[0].data).get('grant_type')).toBe('refresh_token');
   });
 
-  it('invalid_grant — YoutubeAuthError с причиной', async () => {
-    const { http } = fakeHttp(reply(400, { error: 'invalid_grant', error_description: 'Token has been expired or revoked.' }));
-    await expect(refreshAccessToken(http, CFG, 'rt')).rejects.toThrow(new YoutubeAuthError('HTTP 400 invalid_grant: Token has been expired or revoked.'));
+  it('invalid_grant и unauthorized_client — YoutubeAuthError с причиной', async () => {
+    for (const error of ['invalid_grant', 'unauthorized_client']) {
+      const e = await refreshAccessToken(fakeHttp(reply(400, { error, error_description: 'd' })).http, CFG, 'rt').catch((x) => x);
+      expect(e).toBeInstanceOf(YoutubeAuthError);
+      expect(e).toMatchObject({ message: `HTTP 400 ${error}: d`, pendingUpload: false });
+    }
   });
 
-  it('5xx и обрыв — YoutubeNotUploaded: до загрузки не дошло', async () => {
-    await expect(refreshAccessToken(fakeHttp(reply(503, {})).http, CFG, 'rt')).rejects.toBeInstanceOf(YoutubeNotUploaded);
-    await expect(refreshAccessToken(fakeHttp(new Error('ECONNRESET')).http, CFG, 'rt')).rejects.toBeInstanceOf(YoutubeNotUploaded);
+  it('invalid_client, 5xx и обрыв — YoutubeNotUploaded: до загрузки не дошло', async () => {
+    const a = await refreshAccessToken(fakeHttp(reply(401, { error: 'invalid_client' })).http, CFG, 'rt').catch((x) => x);
+    expect(a).toBeInstanceOf(YoutubeNotUploaded);
+    expect(a).toMatchObject({ status: 401 });
+    expect(await refreshAccessToken(fakeHttp(reply(503, {})).http, CFG, 'rt').catch((x) => x)).toBeInstanceOf(YoutubeNotUploaded);
+    expect(await refreshAccessToken(fakeHttp(new Error('ECONNRESET')).http, CFG, 'rt').catch((x) => x)).toBeInstanceOf(YoutubeNotUploaded);
   });
 });
 
