@@ -186,6 +186,7 @@ describe('команда /youtube', () => {
     const { svc, said } = setup();
     await svc.handleCommand(dm('/youtube'));
     expect(said()[0]).toMatch(/^YouTube не настроен на этом сервере/);
+    expect(said()[0]).toContain('PUBLIC_BASE_URL');
   });
 
   it('стенд — пометка в сообщении', async () => {
@@ -525,12 +526,12 @@ describe('загрузка ролика', () => {
     expect(http.http).not.toHaveBeenCalled();
   });
 
-  it('строку держит другая попытка (строка не в publishing) — YoutubeNotUploaded, файл не отправлен', async () => {
+  it('строку держит другая попытка (строка не в publishing) — YoutubeMaybeUploaded: исход загрузки другой попытки неизвестен, файл не отправлен', async () => {
     const db = connected({ pub: 'failed' });
     const http = fakeHttp(TOKEN, reply(200, {}, { location: SESSION }));
     const { svc } = setup(db, http);
     const e = await caught(svc.upload(video, 'public', alive()));
-    expect(e).toBeInstanceOf(YoutubeNotUploaded);
+    expect(e).toBeInstanceOf(YoutubeMaybeUploaded);
     expect(e.message).toMatch(/другая попытка/);
     expect(http.calls).toHaveLength(2);
     expect(db.st.session).toBeNull();
@@ -595,24 +596,20 @@ describe('загрузка ролика', () => {
 });
 
 describe('сообщение о загрузке', () => {
+  const URL = 'https://youtube.com/shorts/abcdefghijk';
+
   it('«по ссылке» — ссылка и подсказка про «публично»', async () => {
-    const { svc, said } = setup(fakeDb({ mode: 'unlisted', published: 'https://youtube.com/shorts/abcdefghijk' }));
-    await svc.notifyUploaded('v1');
-    expect(said()).toEqual(['Вышло на YouTube (по ссылке): https://youtube.com/shorts/abcdefghijk\nЕсли ролик открывается и не стал приватным — /youtube публично.']);
+    const { svc, said } = setup(fakeDb({ mode: 'unlisted', published: URL }));
+    await svc.notifyUploaded('v1', 'unlisted');
+    expect(said()).toEqual([`Вышло на YouTube (по ссылке): ${URL}\nЕсли ролик открывается и не стал приватным — /youtube публично.`]);
   });
 
-  it('«публично» — без подсказки; набор (строки published нет) — молчим', async () => {
-    const a = setup(fakeDb({ mode: 'public', published: 'https://youtube.com/shorts/abcdefghijk' }));
-    await a.svc.notifyUploaded('v1');
-    expect(a.said()).toEqual(['Вышло на YouTube (публично): https://youtube.com/shorts/abcdefghijk']);
+  it('доступ — тот, с которым грузили, а не текущий режим; набор (строки published нет) — молчим', async () => {
+    const a = setup(fakeDb({ mode: 'manual', published: URL }));
+    await a.svc.notifyUploaded('v1', 'public');
+    expect(a.said()).toEqual([`Вышло на YouTube (публично): ${URL}`]);
     const b = setup(fakeDb({ mode: 'public' }));
-    await b.svc.notifyUploaded('v1');
+    await b.svc.notifyUploaded('v1', 'public');
     expect(b.tg.sendMessage).not.toHaveBeenCalled();
-  });
-
-  it('режим уже «вручную» — без слова режима', async () => {
-    const { svc, said } = setup(fakeDb({ mode: 'manual', published: 'https://youtube.com/shorts/abcdefghijk' }));
-    await svc.notifyUploaded('v1');
-    expect(said()).toEqual(['Вышло на YouTube: https://youtube.com/shorts/abcdefghijk']);
   });
 });
