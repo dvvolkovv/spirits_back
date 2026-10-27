@@ -11,12 +11,14 @@ export const calendars: KbArticle = {
   title: 'Календари',
   summary: 'календари: Яндекс, рабочий Outlook, Google и iCloud по ссылке, Taler ID, карточки событий и дел',
   related: ['routines', 'call'],
-  render: ({ q }) => `
+  render: ({ q, url }) => `
 ## Что это
 Ассистенты видят расписание и предлагают события и дела карточкой; в календарь они попадают только после нажатия пользователя.
 
 ## Где
 ${q('profile')} → ${q('settings')} → ${q('calendars')}; рядом — карточка ${q('talerid')}.
+Ссылка: ${url('calendars')}
+Ссылка на Taler ID: ${url('talerid')}
 
 ## Как
 - ${q('calYandex')}: логин и пароль приложения из настроек Яндекса; чтение и запись.

@@ -9,12 +9,13 @@ export const apps: KbArticle = {
   title: 'Приложения',
   summary: 'приложения: Android, мини-приложение в Telegram, виджет, iPhone',
   related: ['account', 'routines'],
-  render: ({ q, paid, nonStore }) => `
+  render: ({ q, paid, nonStore, url }) => `
 ## Что это
 Где ещё работает Linkeon, кроме сайта: Android-приложение, мини-приложение в Telegram, виджет на экране телефона.
 
 ## Где
 Android — ${q('settings')} → ${q('android')}${nonStore(` → ${q('apkDownload')}`)}. Мини-приложение — кнопка «Open Linkeon» рядом с полем ввода в чате с ботом Linkeon (t.me/LinkeonAgentBot); пока Telegram не привязан к аккаунту, бот присылает в личке и кнопку «Открыть Linkeon».
+Ссылка на настройки: ${url('settings')}
 
 ## Как
 ${nonStore('- Android-приложение ставится файлом, не через Google Play; обновления приходят сами.')}
