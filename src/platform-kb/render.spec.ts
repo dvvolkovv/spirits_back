@@ -1,4 +1,4 @@
-import { CLIENT_NOTES, dropEmptySections, renderArticle, renderIndex, topicsFor } from './render';
+import { CLIENT_NOTES, dropEmptySections, kbContext, renderArticle, renderIndex, topicsFor } from './render';
 import type { KbArticle } from './kb.types';
 
 const FAKE: KbArticle = {
@@ -79,5 +79,12 @@ describe('dropEmptySections', () => {
 
   it('последний заголовок без перевода строки — тоже пустой раздел', () => {
     expect(dropEmptySections('## А\nтекст\n\n## Б')).toBe('## А\nтекст\n\n');
+  });
+});
+
+describe('url() — адрес раздела для строки «Ссылка…»', () => {
+  it('полный адрес из таблицы section-links.ts, в любом языке и клиенте', () => {
+    expect(kbContext('ru', 'web').url('zoom')).toBe('https://my.linkeon.io/profile?open=zoom');
+    expect(kbContext('en', 'telegram').url('studioBots')).toBe('https://my.linkeon.io/studio?tab=bots');
   });
 });
