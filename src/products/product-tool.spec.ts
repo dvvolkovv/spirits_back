@@ -349,6 +349,21 @@ maybe('инструмент продуктов против живого Postgre
       expect(r.rows[0].channel).toBe('web');
     });
 
+    // Задача бэклога 642c5198: тот же путь, что выше, но с ключом в тексте —
+    // в строке хода значения нет, ассистенту сказано, что и под каким именем
+    // скрыто. Значение собирается во время прогона (публичный репозиторий).
+    it('ключ в тексте правки: в базе скрыт, ассистенту названо имя', async () => {
+      await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      const svc = new ProductToolService(pg as any, realTurns(), {} as any);
+      (svc as any).waitMs = 0;
+      const value = ['Ab', '3k', 'Q9', 'zX', '7mN', 'p2R', 'w8T', 'c5'].join('');
+      const out: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: `Подключи погоду, WEATHER_API_KEY=${value}` });
+      const r = await pool.query('SELECT prompt FROM product_turns');
+      expect(r.rows[0].prompt).toBe('Подключи погоду, WEATHER_API_KEY=[ключ скрыт]');
+      expect(out.secretsMasked).toEqual({ count: 1, names: ['WEATHER_API_KEY'] });
+      expect(out.say).toMatch(/WEATHER_API_KEY/);
+    });
+
     it('два магазина на «магазин» — УТОЧНЯЕТ, а не выбирает', async () => {
       await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
       await mkProduct({ name: 'Магазин книг', slug: 'books' });

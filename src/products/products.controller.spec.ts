@@ -105,6 +105,20 @@ describe('ProductsController.chat', () => {
     expect(lines.map((l) => l.type)).toEqual(['begin', 'item', 'end']);
   });
 
+  // Задача бэклога 642c5198: ключи из текста правки скрыты в enqueue —
+  // владелец узнаёт об этом первым событием, до ответа агента.
+  it('скрытые ключи — событие notice первым в потоке', async () => {
+    const { ctrl, turns } = makeController([{ type: 'begin' }, { type: 'end' }]);
+    turns.enqueue.mockResolvedValueOnce({ id: T, masked: { count: 2, names: ['WEATHER_API_KEY'] } } as any);
+    const res = makeRes();
+
+    await ctrl.chat(user, P, { prompt: 'любой' } as any, makeReq() as any, res as any);
+
+    const lines = res.chunks.join('').trim().split('\n').map((l) => JSON.parse(l));
+    expect(lines[0]).toEqual({ type: 'notice', code: 'secrets_masked', count: 2, names: ['WEATHER_API_KEY'], mask: '[ключ скрыт]' });
+    expect(lines.map((l) => l.type)).toEqual(['notice', 'begin', 'end']);
+  });
+
   it('проверяет владение продуктом до постановки хода', async () => {
     const { ctrl, products, turns } = makeController([{ type: 'end' }]);
 
