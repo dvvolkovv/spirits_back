@@ -11,7 +11,7 @@ import { isStand } from './short-env';
 import { SUPPORTED_PLATFORMS, ShortSettings, ShortsSettingsService } from './shorts-settings.service';
 import { PENDING_UPLOAD_NOTE, ShortsYoutubeService } from './shorts-youtube.service';
 import { ShortPlatform, ShortPublication, ShortVideo, rowToPublication, rowToShort, shortsBucket } from './shorts.types';
-import { YoutubeAuthError, YoutubeMaybeUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
+import { YoutubeAttemptSuperseded, YoutubeAuthError, YoutubeMaybeUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
 
 /** Сколько раз ролик пробует выйти. Попытку считает захват, счётчик переживает рестарт. */
 export const MAX_PUBLISH_ATTEMPTS = 3;
@@ -65,9 +65,11 @@ interface PlatformResult {
  *   последней попытки: строка `failed`, повтор спросит YouTube о прошлой сессии;
  * - `unknown` — исход отправки в канал неизвестен: строка и ролик уже в `failed`;
  * - `unrecorded` — отправка прошла, а отметка в базу не легла: ролик остаётся
- *   в `publishing`, его разберёт сторож (`rearmStuck`).
+ *   в `publishing`, его разберёт сторож (`rearmStuck`);
+ * - `superseded` — попытка уже не владеет строкой или роликом — жетон не совпал:
+ *   ничего не записано, выходим молча.
  */
-type PlatformOutcome = 'done' | 'skipped' | 'refused' | 'unknown' | 'unrecorded';
+type PlatformOutcome = 'done' | 'skipped' | 'refused' | 'unknown' | 'unrecorded' | 'superseded';
 
 /**
  * Отправка в канал началась, а ответа Telegram — ни «вышел», ни «отказ» — нет:
@@ -170,21 +172,23 @@ export class ShortsPublisherService {
       );
     }
     if (platforms.includes('telegram')) {
-      if (!(await this.keepAlive(v.id))) return;
+      if (!(await this.keepAlive(v))) return;
+      // Жетон строки Telegram не нужен: живость перед отправкой в канал — по ролику (keepAlive).
       const out = await this.platform(v, 'telegram', () => this.toTelegram(v, settings));
-      // unknown — строка и ролик уже в failed; unrecorded — ролик разберёт сторож. Набора YouTube нет в обоих случаях.
-      if (out === 'unknown' || out === 'unrecorded') return;
+      // unknown — строка и ролик уже в failed; unrecorded — ролик разберёт сторож; superseded — ролик и строка
+      // у новой попытки. Набора YouTube нет во всех трёх случаях.
+      if (out === 'unknown' || out === 'unrecorded' || out === 'superseded') return;
     }
     const telegramDone = !platforms.includes('telegram') || (await this.rows(v.id)).some((r) => r.platform === 'telegram' && r.status === 'published');
     let uploaded: { privacy: 'unlisted' | 'public' | null } | null = null;
     if (platforms.includes('youtube') && telegramDone) {
-      if (!(await this.keepAlive(v.id))) return;
-      const out = await this.platform(v, 'youtube', async () => {
-        const r = await this.toYoutube(v);
+      if (!(await this.keepAlive(v))) return;
+      const out = await this.platform(v, 'youtube', async (fence) => {
+        const r = await this.toYoutube(v, fence);
         uploaded = r.status === 'published' ? { privacy: r.privacy ?? null } : null;
         return r;
       });
-      if (out === 'unrecorded') return;
+      if (out === 'unrecorded' || out === 'superseded') return;
       if (out !== 'done') uploaded = null;
     }
     await this.settle(v, platforms);
@@ -252,20 +256,52 @@ export class ShortsPublisherService {
   /**
    * Продлить живость ролика: сторож считает осиротевшим ролик, чей updated_at
    * старше STUCK_PUBLISHING_MINUTES. false — ролик уже не в publishing (забрал
-   * сторож или перевели вручную): дальше слать нельзя.
+   * сторож или перевели вручную) или его держит новая попытка (жетон — attempts из
+   * захвата — не совпал): дальше слать нельзя.
    */
-  private async keepAlive(id: string): Promise<boolean> {
+  private async keepAlive(v: ShortVideo): Promise<boolean> {
     const r = await this.pg.query(
-      `UPDATE short_video SET updated_at = now() WHERE id = $1 AND status = 'publishing' RETURNING 1`,
-      [id],
+      `UPDATE short_video SET updated_at = now() WHERE id = $1 AND status = 'publishing' AND attempts = $2 RETURNING 1`,
+      [v.id, v.attempts],
     );
     if (r.rows.length) return true;
-    this.logger.warn(`ролик ${id} ушёл из publishing посреди публикации — останавливаюсь`);
+    this.logger.warn(`ролик ${v.id} ушёл из publishing посреди публикации или его взяла новая попытка — останавливаюсь`);
     return false;
   }
 
-  /** Площадка: захват строки (только pending/failed), отправка, отметка вместе с номером поста. */
-  private async platform(v: ShortVideo, platform: ShortPlatform, send: () => Promise<PlatformResult>): Promise<PlatformOutcome> {
+  /** Перед отправкой файла: ролик всё ещё у этой попытки и строка площадки — у неё же (оба жетона). */
+  private async keepAliveFenced(v: ShortVideo, platform: ShortPlatform, fence: number): Promise<boolean> {
+    const r = await this.pg.query(
+      `UPDATE short_video SET updated_at = now()
+        WHERE id = $1 AND status = 'publishing' AND attempts = $2
+          AND EXISTS (SELECT 1 FROM short_publication
+                       WHERE short_id = $1 AND platform = $3 AND status = 'publishing' AND attempts = $4)
+        RETURNING 1`,
+      [v.id, v.attempts, platform, fence],
+    );
+    if (r.rows.length) return true;
+    this.logger.warn(`ролик ${v.id}, ${platform}: ролик или строку забрала другая попытка — останавливаюсь`);
+    return false;
+  }
+
+  /**
+   * Площадка: захват строки (только pending/failed), отправка, отметка вместе с номером поста.
+   *
+   * Жетон попытки: attempts, который вернул захват строки (fence, его получает send), и
+   * attempts ролика из захвата в publish() (v.attempts). Все записи попытки после захвата —
+   * отказ, «исход неизвестен», живость, итог ролика — идут с условием на свой жетон: попытка,
+   * зависшая дольше порога сторожа, пока ролик и строку взяла новая, ничего в них не пишет
+   * (исход superseded). Отметка вышедшего — recordSent — без жетона, намеренно.
+   *
+   * Допущение. Счётчики растут только при захвате; обнуляют их лишь действия владельца после
+   * сбоя (retry и mark_published в shorts.controller.ts). После обнуления первая новая попытка
+   * получает тот же счёт, что и зависшая старая, если та была первой, — жетон их не различит.
+   * Для этого старая должна провисеть дольше порога сторожа (STUCK_PUBLISHING_MINUTES) и
+   * пережить нажатие владельца. У запросов к Google и скачиваний из MinIO сроки есть; без
+   * срока — только запрос в Postgres (у пула лишь connectionTimeoutMillis). Зависший дольше
+   * порога запрос, переживший нажатие владельца, принимаем как допущение.
+   */
+  private async platform(v: ShortVideo, platform: ShortPlatform, send: (fence: number) => Promise<PlatformResult>): Promise<PlatformOutcome> {
     const claim = await this.pg.query(
       `UPDATE short_publication SET status = 'publishing', attempts = attempts + 1, updated_at = now()
         WHERE short_id = $1 AND platform = $2 AND status IN ('pending', 'failed')
@@ -273,33 +309,44 @@ export class ShortsPublisherService {
       [v.id, platform],
     );
     if (!claim.rows.length) return 'skipped';
+    const fence = Number(claim.rows[0].attempts);
     let out: PlatformResult;
     try {
-      out = await send();
+      out = await send(fence);
     } catch (e: any) {
+      if (e instanceof YoutubeAttemptSuperseded) {
+        this.logger.warn(`ролик ${v.id}, ${platform}: попытку сменила новая — ничего не пишу (${e.message})`);
+        return 'superseded';
+      }
       const message = String(e?.message ?? e).slice(0, 500);
       if (e instanceof TelegramOutcomeUnknown) {
         this.logger.error(`ролик ${v.id}, ${platform}: исход отправки неизвестен, автоповтора не будет — ${e.causeMessage}`);
         // Строка и ролик — одним запросом: строка failed при ролике в publishing
-        // сторож вернул бы в approved, и повтор ушёл бы в канал сам.
+        // сторож вернул бы в approved, и повтор ушёл бы в канал сам. Оба — со своим
+        // жетоном, ролик — только вместе со своей строкой.
         await this.pg.query(
           `WITH pub AS (
              UPDATE short_publication SET status = 'failed', last_error = $3, updated_at = now()
-              WHERE short_id = $1 AND platform = $2 AND status = 'publishing'
+              WHERE short_id = $1 AND platform = $2 AND status = 'publishing' AND attempts = $5
+              RETURNING 1
            )
            UPDATE short_video SET status = 'failed', failed_from = 'publishing', last_error = $4,
                   failure_notified = false, updated_at = now()
-            WHERE id = $1 AND status = 'publishing'`,
-          [v.id, platform, message, `публикация: ${platform}: ${message}`.slice(0, 1000)],
+            WHERE id = $1 AND status = 'publishing' AND attempts = $6 AND EXISTS (SELECT 1 FROM pub)`,
+          [v.id, platform, message, `публикация: ${platform}: ${message}`.slice(0, 1000), fence, v.attempts],
         );
         return 'unknown';
       }
       this.logger.error(`ролик ${v.id}, ${platform}: ${e?.message ?? e}`);
-      await this.pg.query(
+      const r = await this.pg.query(
         `UPDATE short_publication SET status = 'failed', last_error = $3, updated_at = now()
-          WHERE short_id = $1 AND platform = $2 AND status = 'publishing'`,
-        [v.id, platform, message],
+          WHERE short_id = $1 AND platform = $2 AND status = 'publishing' AND attempts = $4`,
+        [v.id, platform, message, fence],
       );
+      if (!r.rowCount) {
+        this.logger.warn(`ролик ${v.id}, ${platform}: отказ не записан — строку держит другая попытка или сторож; выхожу`);
+        return 'superseded';
+      }
       return 'refused';
     }
     return (await this.recordSent(v, platform, out)) ? 'done' : 'unrecorded';
@@ -313,6 +360,9 @@ export class ShortsPublisherService {
    * успел счесть долгую отправку оборванной (`failed`) или владелец уже нажал
    * «Повторить» (`pending`), правда о вышедшем посте важнее — иначе следующий
    * повтор его продублирует.
+   *
+   * Без жетона: правда о вышедшем посте или загруженном ролике важнее — следующая
+   * попытка иначе выложила бы его снова.
    */
   private async recordSent(v: ShortVideo, platform: ShortPlatform, out: PlatformResult): Promise<boolean> {
     const sent = out.url ?? `сообщение ${out.externalId}`;
@@ -364,7 +414,7 @@ export class ShortsPublisherService {
       ...(v.durationMs ? { duration: Math.round(v.durationMs / 1000) } : {}),
     };
     // Перед необратимым шагом: ролик ещё наш (скачивание могло затянуться), и живости хватит на всю выгрузку.
-    if (!(await this.keepAlive(v.id))) throw new Error('ролик ушёл из publishing до отправки в канал — не отправляю');
+    if (!(await this.keepAlive(v))) throw new Error('ролик ушёл из publishing до отправки в канал — не отправляю');
     let msg: any;
     try {
       msg = await this.tg.sendVideo(Number(s.tgChannelChatId), video, options);
@@ -387,17 +437,22 @@ export class ShortsPublisherService {
    * последней попытке: ролик доходит до канала хотя бы руками. Если же на
    * последней попытке неизвестно, дошла ли загрузка, набора нет (дал бы дубль):
    * отказ с YOUTUBE_MAY_BE_OUT, ролик уходит в failed.
+   *
+   * fence — жетон строки YouTube из захвата: сервис читает и пишет сессию загрузки только
+   * с ним, а продление живости перед файлом проверяет и ролик, и строку.
    */
-  private async toYoutube(v: ShortVideo): Promise<PlatformResult> {
+  private async toYoutube(v: ShortVideo, fence: number): Promise<PlatformResult> {
     const yt = this.youtube;
     if (!yt) return this.youtubeKit(v, null);
     const plan = await yt.uploadPlan(v.id);
     if (plan.kind === 'kit') return this.youtubeKit(v, plan.note);
     const last = v.attempts >= MAX_PUBLISH_ATTEMPTS;
     try {
-      const up = await yt.upload(v, plan.privacy, () => this.keepAlive(v.id));
+      const up = await yt.upload(v, plan.privacy, () => this.keepAliveFenced(v, 'youtube', fence), fence);
       return { status: 'published', externalId: up.videoId, url: up.url, privacy: up.resumed ? null : plan.privacy };
     } catch (e: any) {
+      // Попытку сменила новая — ни набора, ни отказа: раньше веток ниже, иначе на последней попытке ушёл бы набор.
+      if (e instanceof YoutubeAttemptSuperseded) throw e;
       if (e instanceof YoutubeAuthError) {
         const pending = e.pendingUpload ? `\n${PENDING_UPLOAD_NOTE}` : '';
         return this.youtubeKit(v, `Доступ к каналу YouTube пропал (${e.message}) — набор вместо загрузки. Переподключить: /youtube${pending}`);
@@ -446,8 +501,8 @@ export class ShortsPublisherService {
     if (rows.length && rows.every((r) => SETTLED.includes(r.status))) {
       await this.pg.query(
         `UPDATE short_video SET status = 'published', published_at = now(), last_error = NULL, updated_at = now()
-          WHERE id = $1 AND status = 'publishing'`,
-        [v.id],
+          WHERE id = $1 AND status = 'publishing' AND attempts = $2`,
+        [v.id, v.attempts],
       );
       this.logger.log(`ролик ${v.id} опубликован`);
       return;
@@ -459,22 +514,25 @@ export class ShortsPublisherService {
     await this.finishAttempt(v, `публикация: ${problems || 'строк площадок нет'}`);
   }
 
-  /** Попытка не удалась: назад в `approved` под повтор или, когда попытки кончились, `failed` с сообщением владельцу. */
+  /**
+   * Попытка не удалась: назад в `approved` под повтор или, когда попытки кончились, `failed` с сообщением владельцу.
+   * С жетоном ролика: ролик, который уже держит новая попытка, старая не возвращает в очередь посреди её отправки.
+   */
   private async finishAttempt(v: ShortVideo, message: string): Promise<void> {
     const text = message.slice(0, 1000);
     if (v.attempts >= MAX_PUBLISH_ATTEMPTS) {
       await this.pg.query(
         `UPDATE short_video SET status = 'failed', failed_from = 'publishing', last_error = $2,
                 failure_notified = false, updated_at = now()
-          WHERE id = $1 AND status = 'publishing'`,
-        [v.id, text],
+          WHERE id = $1 AND status = 'publishing' AND attempts = $3`,
+        [v.id, text, v.attempts],
       );
     } else {
       // Тот же slot_at: строка та же, индекс одного ролика на слот её пропустит.
       await this.pg.query(
         `UPDATE short_video SET status = 'approved', last_error = $2, updated_at = now()
-          WHERE id = $1 AND status = 'publishing'`,
-        [v.id, text],
+          WHERE id = $1 AND status = 'publishing' AND attempts = $3`,
+        [v.id, text, v.attempts],
       );
     }
   }
