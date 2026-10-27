@@ -52,6 +52,12 @@ describe('axiosHttp против локального сервера', () => {
     },
     // Не читает тело и не отвечает: запрос держится, пока клиент не бросит его по сроку.
     '/hang': () => undefined,
+    // Пишет пробел каждые 50 мс: сокет активен, срок простоя не наступает — спасает только общий срок.
+    '/trickle': (_q, s) => {
+      s.writeHead(200, { 'content-type': 'application/json' });
+      const t = setInterval(() => s.write(' '), 50);
+      s.on('close', () => clearInterval(t));
+    },
     '/reset': (q) => q.socket.destroy(),
   };
 
@@ -95,6 +101,14 @@ describe('axiosHttp против локального сервера', () => {
     expect(Date.now() - t0).toBeLessThan(5000);
     expect(String(e.message)).not.toContain('secret-token');
     expect(e.config).toBeUndefined();
+  });
+
+  it('сокет активен, а ответ не кончается — отказ к общему сроку с понятным текстом', async () => {
+    const t0 = Date.now();
+    const e = await axiosHttp({ method: 'GET', url: `${base}/trickle`, timeout: 300 }).catch((x) => x);
+    expect(e).toBeInstanceOf(Error);
+    expect(e.message).toBe('общий срок 300 мс истёк');
+    expect(Date.now() - t0).toBeLessThan(2000);
   });
 
   it('обрыв соединения — исключение без секретов формы', async () => {

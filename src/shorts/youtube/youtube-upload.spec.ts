@@ -82,6 +82,13 @@ describe('sendFile', () => {
       expect(e).toMatchObject({ status });
     }
   });
+
+  it('адрес сессии не на googleapis.com — YoutubeNotUploaded, HTTP не вызван', async () => {
+    const { http, calls } = fakeHttp();
+    const e = await caught(sendFile(http, 'https://evil.example/upload', 'at', Buffer.from('x')));
+    expect(e).toBeInstanceOf(YoutubeNotUploaded);
+    expect(calls).toHaveLength(0);
+  });
 });
 
 describe('checkUpload', () => {
@@ -122,5 +129,11 @@ describe('checkUpload', () => {
     for (const r of [reply(401), reply(408), reply(429), reply(500), new Error('ETIMEDOUT')]) {
       expect(await caught(checkUpload(fakeHttp(r).http, SESSION, 'at', 1))).toBeInstanceOf(YoutubeMaybeUploaded);
     }
+  });
+
+  it('адрес сессии не на googleapis.com — gone, HTTP не вызван', async () => {
+    const { http, calls } = fakeHttp();
+    expect(await checkUpload(http, 'http://www.googleapis.com/upload', 'at', 1)).toEqual({ state: 'gone' });
+    expect(calls).toHaveLength(0);
   });
 });
