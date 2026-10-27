@@ -48,6 +48,29 @@ describe('таймер обхода стирания', () => {
     expect(tick).toHaveBeenCalledTimes(1);
   });
 
+  it('медленный обход не перекрывается следующим: пока идёт прошлый, новый пропускается', async () => {
+    const svc = new ProductPurgeService({ query: jest.fn() } as any);
+    (svc as any).logger = { error: jest.fn(), warn: jest.fn(), log: jest.fn() };
+    let finish!: () => void;
+    const wipe = jest
+      .spyOn(svc, 'wipeExpired')
+      .mockImplementationOnce(() => new Promise<number>((res) => (finish = () => res(0))))
+      .mockResolvedValue(0);
+    const queue = jest.spyOn(svc, 'queuePurges').mockResolvedValue(0);
+    jest.spyOn(svc, 'removeBackups').mockResolvedValue(0);
+
+    const slow = svc.tick();
+    await svc.tick();
+    expect(wipe).toHaveBeenCalledTimes(1);
+    expect(queue).not.toHaveBeenCalled();
+
+    finish();
+    await slow;
+    expect(queue).toHaveBeenCalledTimes(1);
+    await svc.tick();
+    expect(wipe).toHaveBeenCalledTimes(2);
+  });
+
   it('отказ одного шага обхода не отменяет остальные', async () => {
     const svc = new ProductPurgeService({ query: jest.fn() } as any);
     const wipe = jest.spyOn(svc, 'wipeExpired').mockRejectedValue(new Error('обрыв с базой'));

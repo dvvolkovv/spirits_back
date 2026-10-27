@@ -298,6 +298,25 @@ maybe('отчёт агента по rekey и purge против живого Pos
     expect((await pool.query(`SELECT prompt, result FROM product_turns WHERE product_id = $1`, [p])).rows).toEqual([{ prompt: 'правка', result: 'итог' }]);
   });
 
+  it('успех purge: коробки ключей карточек продукта стёрты тем же оператором, чужие на месте (как у обхода после срока)', async () => {
+    const p = await product({ status: 'archived', archived: true, kind: 'site' });
+    const other = await product({ status: 'running', kind: 'site' });
+    const keysCard = async (productId: string) =>
+      (await pool.query(
+        `INSERT INTO product_actions (user_id, product_id, kind, status, channel, payload, secrets_box)
+         VALUES ('u1', $1, 'keys', 'working', 'web', '{"keyNames":["A"]}'::jsonb, $2) RETURNING id`,
+        [productId, secrets.encrypt({ A: '123456:TEST-not-a-token' }, productId)],
+      )).rows[0].id as string;
+    const mine = await keysCard(p);
+    const theirs = await keysCard(other);
+    const j = await pool.query(`INSERT INTO product_provision_jobs (product_id, kind, status, started_at) VALUES ($1, 'purge', 'running', now()) RETURNING id`, [p]);
+
+    await svc.completeJob(j.rows[0].id, { ok: true });
+
+    expect(await actionRow(mine)).toMatchObject({ secrets_box: null, status: 'working', payload: { keyNames: ['A'] } });
+    expect((await actionRow(theirs)).secrets_box).not.toBeNull();
+  });
+
   it('успех purge у неудалённого продукта — ничего не стёрто, журнал «стёрт» не пишется, logger.error', async () => {
     // Выдача purge неудалённому невозможна (claimJob требует archived и срок),
     // но строку products как «стёртую» помечает только сам удалённый.

@@ -19,16 +19,33 @@ maybe('обход стирания и резервные копии против
   let pool: Pool;
   let svc: ProductPurgeService;
   let tmp: string;
+  let errors: string[];
+  let warns: string[];
+  // Настоящий путь временного каталога: на macOS os.tmpdir() — /var/…, а на
+  // деле /private/var/…, и сверка корня копий (realpath знак в знак)
+  // отказала бы на ровном месте.
+  const TMP_ROOT = fs.realpathSync(os.tmpdir());
+  const HOST = 'purge-host';
+  const OUTDATED = 'неизвестный вид задания: "purge". Агент умеет provision, sleep, wake, domain — эта работа сделана НЕ БЫЛА, на хосте ничего не тронуто. Похоже, сервер новее агента на машине продуктов.';
 
-  async function deleted(o: { purgeAfterMs: number; purged?: boolean; repoUrl?: string | null; slug?: string }) {
+  /** По умолчанию — удалённый 31 день назад, на машине HOST. */
+  async function deleted(o: {
+    purgeAfterMs: number | null; purged?: boolean; repoUrl?: string | null; slug?: string;
+    archived?: boolean; status?: string; host?: string | null;
+  }) {
     const id = crypto.randomUUID();
     const slug = o.slug ?? `d-${id.slice(0, 8)}`;
+    const archived = o.archived ?? true;
     await pool.query(
-      `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash,
+      `INSERT INTO products (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash, host_id,
                              archived_at, purge_after, purged_at, repo_url)
-       VALUES ($1, 'u1', 'П', $2, 'site', 'archived', '/product', $3, now() - interval '31 days',
-               now() + make_interval(secs => $4::double precision / 1000), CASE WHEN $5 THEN now() END, $6)`,
-      [id, slug, `h-${id}`, o.purgeAfterMs, !!o.purged, o.repoUrl ?? null],
+       VALUES ($1, 'u1', 'П', $2, 'site', $7, '/product', $3, $8,
+               CASE WHEN $9 THEN now() - interval '31 days' END,
+               CASE WHEN $4::double precision IS NULL THEN NULL
+                    ELSE now() + make_interval(secs => $4::double precision / 1000) END,
+               CASE WHEN $5 THEN now() END, $6)`,
+      [id, slug, `h-${id}`, o.purgeAfterMs, !!o.purged, o.repoUrl ?? null,
+       o.status ?? (archived ? 'archived' : 'running'), o.host === undefined ? HOST : o.host, archived],
     );
     return { id, slug };
   }
@@ -36,15 +53,30 @@ maybe('обход стирания и резервные копии против
     (await pool.query(`SELECT kind, status FROM product_provision_jobs WHERE product_id = $1 ORDER BY created_at`, [id])).rows;
   const repoUrlOf = async (id: string) =>
     (await pool.query(`SELECT repo_url FROM products WHERE id = $1`, [id])).rows[0].repo_url;
+  const failedPurge = (productId: string, o: { started: boolean; error?: string }) =>
+    pool.query(
+      `INSERT INTO product_provision_jobs (product_id, kind, status, started_at, error)
+       VALUES ($1, 'purge', 'failed', CASE WHEN $2 THEN now() END, $3)`,
+      [productId, o.started, o.error ?? null],
+    );
 
   beforeAll(async () => {
     pool = new Pool({ connectionString: PG, max: 4 });
     for (const f of MIGRATIONS) await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', f), 'utf8'));
-    svc = new ProductPurgeService({ query: (s: string, p?: any[]) => pool.query(s, p) } as any);
   });
   beforeEach(async () => {
-    await pool.query('TRUNCATE products, product_provision_jobs, product_actions RESTART IDENTITY CASCADE');
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pl2-purge-'));
+    await pool.query('TRUNCATE products, product_provision_jobs, product_actions, product_hosts RESTART IDENTITY CASCADE');
+    await pool.query(
+      `INSERT INTO product_hosts (id, ssh_target, public_ip, domain_suffix, agent_token_hash, capacity, audience)
+       VALUES ($1, 'root@10.77.0.1', '10.77.0.1', 'p.example', 'purge-spec-hash', 20, 'clients')`,
+      [HOST],
+    );
+    // Свежий сервис на тест: разовые предупреждения живут в нём (на процесс).
+    errors = [];
+    warns = [];
+    svc = new ProductPurgeService({ query: (s: string, p?: any[]) => pool.query(s, p) } as any);
+    (svc as any).logger = { error: (m: string) => errors.push(m), warn: (m: string) => warns.push(m), log: () => undefined };
+    tmp = fs.mkdtempSync(path.join(TMP_ROOT, 'pl2-purge-'));
     process.env.PRODUCT_REPOS_DIR = path.join(tmp, 'product-repos');
     fs.mkdirSync(process.env.PRODUCT_REPOS_DIR);
   });
@@ -53,7 +85,7 @@ maybe('обход стирания и резервные копии против
     fs.rmSync(tmp, { recursive: true, force: true });
   });
   afterAll(async () => {
-    await pool.query('TRUNCATE products, product_provision_jobs, product_actions RESTART IDENTITY CASCADE');
+    await pool.query('TRUNCATE products, product_provision_jobs, product_actions, product_hosts RESTART IDENTITY CASCADE');
     await pool.end();
   });
 
@@ -91,6 +123,78 @@ maybe('обход стирания и резервные копии против
       );
     }
     expect(await svc.queuePurges()).toBe(1);
+  });
+
+  it('отказы старого агента «неизвестный вид задания» в потолок не идут: на машине ничего не тронуто', async () => {
+    const p = await deleted({ purgeAfterMs: -60_000 });
+    for (let i = 0; i < 3; i++) await failedPurge(p.id, { started: true, error: OUTDATED });
+    expect(await svc.queuePurges()).toBe(1);
+    expect(errors.filter((m) => m.includes(p.slug))).toEqual([]);
+    // Но и не молча: агента машины пора обновить.
+    expect(warns.filter((m) => m.includes(p.slug) && m.includes('обновить'))).toHaveLength(1);
+
+    // Свой отказ в середине текста (цитата чужого ответа) — обычный провал.
+    await pool.query(`DELETE FROM product_provision_jobs WHERE product_id = $1`, [p.id]);
+    for (let i = 0; i < 3; i++) await failedPurge(p.id, { started: true, error: `rm отказал: ${OUTDATED}` });
+    expect(await svc.queuePurges()).toBe(0);
+  });
+
+  it('продукт без машины — стирание не ставится (его некому забрать), строка error в лог раз на процесс', async () => {
+    const p = await deleted({ purgeAfterMs: -60_000, host: null });
+    expect(await svc.queuePurges()).toBe(0);
+    expect(await svc.queuePurges()).toBe(0);
+    expect(await jobsOf(p.id)).toEqual([]);
+    const lines = errors.filter((m) => m.includes(p.slug));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/без машины.*стирание только на сервере/);
+  });
+
+  it('стирание снова и снова снято невыданным — предупреждение раз на процесс, постановка не прекращается', async () => {
+    const p = await deleted({ purgeAfterMs: -60_000 });
+    for (let i = 0; i < 3; i++) await failedPurge(p.id, { started: false, error: 'срок стирания истёк (10 мин)' });
+    expect(await svc.queuePurges()).toBe(1);
+    await pool.query(`UPDATE product_provision_jobs SET status = 'failed', finished_at = now() WHERE product_id = $1 AND status = 'queued'`, [p.id]);
+    expect(await svc.queuePurges()).toBe(1);
+    expect(warns.filter((m) => m.includes(p.slug) && m.includes('невыданным'))).toHaveLength(1);
+    expect(errors.filter((m) => m.includes(p.slug))).toEqual([]);
+  });
+
+  it('живой и вернувшийся продукты обход не трогает вовсе: ни ключей, ни текстов, ни заданий', async () => {
+    const live = await deleted({ archived: false, status: 'running', purgeAfterMs: null });
+    // Вернувшийся: restore() снимает и archived_at, и purge_after; здесь
+    // худший случай — срок остался в прошлом, а архива уже нет.
+    const restored = await deleted({ archived: false, status: 'sleeping', purgeAfterMs: -86_400_000 });
+    for (const p of [live, restored]) {
+      await pool.query(
+        `UPDATE products SET secrets_encrypted = decode('01', 'hex'), first_prompt = 'п', first_prompt_channel = 'web' WHERE id = $1`,
+        [p.id],
+      );
+      await pool.query(
+        `INSERT INTO product_turns (product_id, user_id, channel, prompt, result, status) VALUES ($1, 'u1', 'web', 'правка', 'итог', 'done')`,
+        [p.id],
+      );
+      await pool.query(
+        `INSERT INTO product_actions (user_id, product_id, kind, status, channel, payload, secrets_box)
+         VALUES ('u1', $1, 'create_site', 'done', 'web', '{"name":"П","prompt":"магазин"}'::jsonb, NULL),
+                ('u1', $1, 'keys', 'working', 'web', '{"keyNames":["A"]}'::jsonb, decode('02', 'hex'))`,
+        [p.id],
+      );
+    }
+
+    expect(await svc.wipeExpired()).toBe(0);
+    expect(await svc.queuePurges()).toBe(0);
+
+    for (const p of [live, restored]) {
+      const row = (await pool.query(`SELECT secrets_encrypted IS NOT NULL AS keys, first_prompt FROM products WHERE id = $1`, [p.id])).rows[0];
+      expect(row).toEqual({ keys: true, first_prompt: 'п' });
+      expect((await pool.query(`SELECT prompt, result FROM product_turns WHERE product_id = $1`, [p.id])).rows).toEqual([{ prompt: 'правка', result: 'итог' }]);
+      const cards = await pool.query(`SELECT kind, payload, secrets_box IS NOT NULL AS boxed FROM product_actions WHERE product_id = $1 ORDER BY kind`, [p.id]);
+      expect(cards.rows).toEqual([
+        { kind: 'create_site', payload: { name: 'П', prompt: 'магазин' }, boxed: false },
+        { kind: 'keys', payload: { keyNames: ['A'] }, boxed: true },
+      ]);
+      expect(await jobsOf(p.id)).toEqual([]);
+    }
   });
 
   it('после срока возврата ключи и первая правка стираются на сервере сразу — до машины', async () => {
@@ -240,5 +344,60 @@ maybe('обход стирания и резервные копии против
     expect(await svc.removeBackups()).toBe(1);
     expect(fs.existsSync(path.join(root, 'late-shop.git'))).toBe(false);
     expect(await repoUrlOf(mine.id)).toBeNull();
+  });
+
+  it('ссылка ВНУТРИ копии наружу удаляется как ссылка — то, куда она смотрит, цело', async () => {
+    const root = process.env.PRODUCT_REPOS_DIR!;
+    const outside = path.join(tmp, 'outside');
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, 'keep'), '1');
+    const copy = path.join(root, 'inner-link.git');
+    fs.mkdirSync(path.join(copy, 'hooks'), { recursive: true });
+    fs.symlinkSync(outside, path.join(copy, 'hooks', 'evil'));
+    fs.symlinkSync(path.join(outside, 'keep'), path.join(copy, 'HEAD'));
+    const p = await deleted({ purgeAfterMs: -60_000, purged: true, slug: 'inner-link', repoUrl: `${root}/inner-link.git` });
+
+    expect(await svc.removeBackups()).toBe(1);
+    expect(fs.existsSync(copy)).toBe(false);
+    expect(fs.readFileSync(path.join(outside, 'keep'), 'utf8')).toBe('1');
+    expect(await repoUrlOf(p.id)).toBeNull();
+  });
+
+  it('repo_url переписали, пока стирали, — новое значение остаётся, стирание не засчитано', async () => {
+    const root = process.env.PRODUCT_REPOS_DIR!;
+    const p = await deleted({ purgeAfterMs: -60_000, purged: true, slug: 'moved', repoUrl: `${root}/moved.git` });
+    fs.mkdirSync(path.join(root, 'moved.git'));
+    const racing = new ProductPurgeService({
+      query: async (s: string, q?: any[]) => {
+        if (/^\s*UPDATE products SET repo_url = NULL/.test(s)) {
+          await pool.query(`UPDATE products SET repo_url = 'backup@10.0.0.1:/elsewhere/moved.git' WHERE id = $1`, [q![0]]);
+        }
+        return pool.query(s, q);
+      },
+    } as any);
+    (racing as any).logger = (svc as any).logger;
+
+    expect(await racing.removeBackups()).toBe(0);
+    expect(await repoUrlOf(p.id)).toBe('backup@10.0.0.1:/elsewhere/moved.git');
+  });
+
+  it('копия не удаляется (нет прав) — строка error раз на процесс, а не каждый час; repo_url на месте', async () => {
+    const root = process.env.PRODUCT_REPOS_DIR!;
+    const copy = path.join(root, 'locked.git');
+    fs.mkdirSync(copy);
+    fs.writeFileSync(path.join(copy, 'HEAD'), 'ref: refs/heads/master\n');
+    const p = await deleted({ purgeAfterMs: -60_000, purged: true, slug: 'locked', repoUrl: `${root}/locked.git` });
+    fs.chmodSync(copy, 0o500);
+    try {
+      expect(await svc.removeBackups()).toBe(0);
+      expect(await svc.removeBackups()).toBe(0);
+    } finally {
+      fs.chmodSync(copy, 0o700);
+    }
+    expect(fs.existsSync(path.join(copy, 'HEAD'))).toBe(true);
+    expect(await repoUrlOf(p.id)).toBe(`${root}/locked.git`);
+    const lines = errors.filter((m) => m.includes('locked'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/EACCES/);
   });
 });
