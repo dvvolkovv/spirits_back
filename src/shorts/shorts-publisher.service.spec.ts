@@ -170,6 +170,21 @@ describe('ShortsPublisherService.publish', () => {
     expect(db.v.status).toBe('published');
   });
 
+  it('набор YouTube — заголовок и описание без угловых скобок (YouTube отверг бы их, 400)', async () => {
+    const db = fakeDb({
+      captions: {
+        telegram: 'TG-подпись', vk: 'VK',
+        youtube: { title: 'Залог <по договору>', description: 'Срок < 30 дней, штраф > 10%', tags: ['аренда'] },
+      },
+    });
+    const { svc, tg } = setup(db);
+    await svc.publish(ID);
+    const text = (tg.sendMessage.mock.calls[0] as any[])[1] as string;
+    expect(text).toContain('Залог ‹по договору›');
+    expect(text).toContain('Срок ‹ 30 дней, штраф › 10%');
+    expect(text).not.toMatch(/[<>]/);
+  });
+
   it('канал не настроен — Telegram упал, набора YouTube нет, ролик ждёт повтора', async () => {
     const { svc, tg, db } = setup(fakeDb(), null);
     await svc.publish(ID);

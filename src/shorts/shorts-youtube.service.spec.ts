@@ -471,6 +471,20 @@ describe('загрузка ролика', () => {
     expect(Buffer.isBuffer(http.calls[2].data)).toBe(true);
   });
 
+  it('заголовок и описание в теле начала сессии — без угловых скобок (YouTube отверг бы их, 400)', async () => {
+    const db = connected();
+    const http = fakeHttp(TOKEN, reply(200, {}, { location: SESSION }), reply(201, { id: 'abcdefghijk' }));
+    const { svc } = setup(db, http);
+    const dirty = {
+      ...video,
+      captions: { youtube: { title: 'Залог <по договору>', description: 'Срок < 30 дней, штраф > 10%', tags: ['аренда'] } },
+    };
+    await svc.upload(dirty, 'public', alive(), 1);
+    const start = http.calls[1];
+    expect(start.data.snippet.title).toBe('Залог ‹по договору›');
+    expect(start.data.snippet.description).toBe('Срок ‹ 30 дней, штраф › 10%');
+  });
+
   it('прошлая сессия загружена — тот же ролик, без новой загрузки', async () => {
     const db = connected({ session: SESSION });
     const http = fakeHttp(TOKEN, reply(200, { id: 'abcdefghijk' }));

@@ -10,6 +10,7 @@ import {
   omniSpendLine,
   skitCastLine,
   tidyTags,
+  youtubeSafe,
 } from './short-captions';
 import { planSkits } from './short-skit-prompts';
 
@@ -92,6 +93,13 @@ describe('tidyTags', () => {
     const result = tidyTags(tags);
     const total = result.reduce((sum, t) => sum + (t.includes(' ') ? t.length + 2 : t.length) + 1, 0);
     expect(total).toBeLessThanOrEqual(YT_TAGS_TOTAL_MAX);
+  });
+});
+
+describe('youtubeSafe', () => {
+  it('угловые скобки — на одиночные ёлочки (YouTube отверг бы `<` и `>`); без скобок текст не меняется', () => {
+    expect(youtubeSafe('Права <работника> > всего')).toBe('Права ‹работника› › всего');
+    expect(youtubeSafe('Залог при аренде')).toBe('Залог при аренде');
   });
 });
 
