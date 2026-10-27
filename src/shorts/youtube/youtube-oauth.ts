@@ -1,4 +1,4 @@
-import { YoutubeAuthError, YoutubeNotUploaded } from './youtube-errors';
+import { YoutubeAuthError, YoutubeCodeRejected, YoutubeNotUploaded } from './youtube-errors';
 import { Http, HttpResponse, clip, googleReason } from './youtube-http';
 
 /** Загрузка и чтение своего канала: channels.list?mine=true — узнать, какой канал подключил владелец. */
@@ -24,8 +24,9 @@ export interface YoutubeOAuthConfig {
 export function youtubeOAuthConfig(env: NodeJS.ProcessEnv = process.env): YoutubeOAuthConfig | null {
   const clientId = (env.YOUTUBE_OAUTH_CLIENT_ID || '').trim();
   const clientSecret = (env.YOUTUBE_OAUTH_CLIENT_SECRET || '').trim();
-  if (!clientId || !clientSecret) return null;
-  const base = (env.PUBLIC_BASE_URL || 'https://my.linkeon.io').trim().replace(/\/+$/, '');
+  // Без своего адреса среда не может принять возврат; подставлять прод нельзя — туда ушли бы state и подключение.
+  const base = (env.PUBLIC_BASE_URL || '').trim().replace(/\/+$/, '');
+  if (!clientId || !clientSecret || !base) return null;
   return { clientId, clientSecret, redirectUri: `${base}${CALLBACK_PATH}` };
 }
 
@@ -58,7 +59,10 @@ export async function exchangeCode(
     timeout: 15_000,
     data: form({ client_id: cfg.clientId, client_secret: cfg.clientSecret, redirect_uri: cfg.redirectUri, code, grant_type: 'authorization_code' }),
   });
-  if (r.status !== 200 || !r.data?.access_token) throw new Error(`обмен кода: ${googleReason(r)}`);
+  if (r.status !== 200 || !r.data?.access_token) {
+    if (r.data?.error === 'invalid_grant') throw new YoutubeCodeRejected(`обмен кода: ${googleReason(r)}`);
+    throw new Error(`обмен кода: ${googleReason(r)}`);
+  }
   if (!r.data.refresh_token) {
     throw new Error('Google не выдал refresh-токен — уберите доступ приложения в настройках аккаунта Google и подключите снова');
   }

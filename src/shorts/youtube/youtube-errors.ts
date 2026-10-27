@@ -38,3 +38,11 @@ export class YoutubeUploadExpired extends Error {
     this.name = 'YoutubeUploadExpired';
   }
 }
+
+/** Google отверг код входа (invalid_grant): код одноразовый и короткоживущий — чаще всего браузер повторил адрес возврата. */
+export class YoutubeCodeRejected extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'YoutubeCodeRejected';
+  }
+}

@@ -5,10 +5,10 @@ import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { STAND_MARK } from './short-captions';
-import { isStand } from './short-env';
+import { isStand, shortsEnabled } from './short-env';
 import { ShortsSettingsService } from './shorts-settings.service';
 import { ShortVideo, YoutubeMode, shortsBucket } from './shorts.types';
-import { YoutubeAuthError, YoutubeMaybeUploaded, YoutubeNotUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
+import { YoutubeAuthError, YoutubeCodeRejected, YoutubeMaybeUploaded, YoutubeNotUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
 import { Http, axiosHttp, clip } from './youtube/youtube-http';
 import { YoutubeOAuthConfig, authorizeUrl, exchangeCode, fetchMyChannel, refreshAccessToken, youtubeOAuthConfig } from './youtube/youtube-oauth';
 import { signState, verifyState } from './youtube/youtube-state';
@@ -42,6 +42,13 @@ export type YoutubePlan = { kind: 'kit'; note: string | null } | { kind: 'upload
 
 /** К набору, когда у ролика жива сессия загрузки: прошлая загрузка могла дойти (спека, «Публикация», п. 7). */
 export const PENDING_UPLOAD_NOTE = 'Прошлая загрузка этого ролика на YouTube могла дойти — проверьте канал, прежде чем выкладывать вручную.';
+
+/**
+ * Срок скачивания файла ролика из MinIO. Вместе с обновлением токена (15 с), вопросом о
+ * сессии и её началом (по 30 с) — с запасом меньше порога сторожа публикатора
+ * (STUCK_PUBLISHING_MINUTES): зависшая попытка не должна пережить возврат ролика в очередь.
+ */
+export const DOWNLOAD_TIMEOUT_MS = 3 * 60 * 1000;
 
 /**
  * `/youtube [режим]` (и `/youtube@Бот`). null — не эта команда. arg пустой —
@@ -130,7 +137,9 @@ export class ShortsYoutubeService {
         await this.say(chatId, await this.statusText(chatId));
       }
     } catch (e: any) {
-      await this.say(chatId, `YouTube: не получилось — ${String(e?.message ?? e).slice(0, 300)}`);
+      const reason = clip(String(e?.message ?? e), 300);
+      this.logger.error(`команда /youtube не выполнена: ${reason}`);
+      await this.say(chatId, `YouTube: не получилось — ${reason}`);
     }
     return true;
   }
@@ -146,8 +155,21 @@ export class ShortsYoutubeService {
       return connectPage(400, 'Ссылка устарела', 'Пришлите боту /youtube и откройте новую ссылку.');
     }
     if (!q.code) return connectPage(400, 'Нет кода от Google', 'Пришлите боту /youtube и попробуйте ещё раз.');
+    let tokens: { accessToken: string; refreshToken: string; scope: string };
     try {
-      const tokens = await exchangeCode(this.http, cfg, q.code);
+      tokens = await exchangeCode(this.http, cfg, q.code);
+    } catch (e: any) {
+      if (e instanceof YoutubeCodeRejected) {
+        // Код Google одноразовый: чаще всего браузер повторил адрес возврата. Страница перед глазами — в Telegram не пишем.
+        const acc = await this.account().catch((): YoutubeAccount | null => null);
+        if (acc?.status === 'connected' && acc.connectedAt && Date.now() - acc.connectedAt.getTime() < RECONNECT_GRACE_MS) {
+          return connectPage(200, 'Канал уже подключён', `Канал «${acc.channelTitle ?? acc.channelId}» подключён. Вкладку можно закрыть.`);
+        }
+        return connectPage(400, 'Ссылка устарела', 'Код Google уже использован или устарел. Пришлите боту /youtube и откройте новую ссылку.');
+      }
+      return this.connectFailed(st.chatId, e);
+    }
+    try {
       const ch = await fetchMyChannel(this.http, tokens.accessToken);
       await this.pg.query(
         `INSERT INTO short_youtube_account
@@ -171,19 +193,21 @@ export class ShortsYoutubeService {
       const mode: YoutubeMode = r.rows[0]?.youtube_mode ?? 'unlisted';
       const handle = ch.handle ? ` (${ch.handle})` : '';
       const check = mode === 'unlisted' ? ' Проверьте первый ролик: если открывается по ссылке и не стал приватным — /youtube публично.' : '';
-      await this.say(st.chatId, `YouTube подключён: канал «${ch.title}»${handle}. Ролики будут загружаться сами, режим — ${MODE_WORDS[mode]}.${check}`);
-      return connectPage(200, 'Канал подключён', `Канал «${ch.title}» подключён к роликам Linkeon. Вкладку можно закрыть — подтверждение пришло в Telegram.`);
+      const off = shortsEnabled() ? '' : ' Конвейер роликов на этом сервере пока выключен (SHORTS_ENABLED) — загрузка начнётся, когда его включат.';
+      // Страницу не держим ради Telegram: say() не бросает, а ждать его ответа браузеру незачем.
+      void this.say(st.chatId, `YouTube подключён: канал «${ch.title}»${handle}. Ролики будут загружаться сами, режим — ${MODE_WORDS[mode]}.${check}${off}`);
+      return connectPage(200, 'Канал подключён', `Канал «${ch.title}» подключён к роликам Linkeon. Вкладку можно закрыть — подтверждение придёт в Telegram.`);
     } catch (e: any) {
-      const reason = String(e?.message ?? e).slice(0, 300);
-      const acc = await this.account().catch((): YoutubeAccount | null => null);
-      if (acc?.status === 'connected' && acc.connectedAt && Date.now() - acc.connectedAt.getTime() < RECONNECT_GRACE_MS) {
-        // Браузер повторил адрес возврата: код уже обменян, канал подключён только что.
-        return connectPage(200, 'Канал уже подключён', `Канал «${acc.channelTitle ?? acc.channelId}» подключён. Вкладку можно закрыть.`);
-      }
-      this.logger.error(`подключение YouTube не удалось: ${reason}`);
-      await this.say(st.chatId, `YouTube не подключён: ${reason}`);
-      return connectPage(502, 'Не получилось подключить канал', `${reason}. Пришлите боту /youtube и попробуйте ещё раз.`);
+      return this.connectFailed(st.chatId, e);
     }
+  }
+
+  /** Подключение сорвалось по настоящей причине: в лог, владельцу в Telegram (не ждём) и страница 502. */
+  private connectFailed(chatId: number, e: any): ConnectPage {
+    const reason = clip(String(e?.message ?? e), 300);
+    this.logger.error(`подключение YouTube не удалось: ${reason}`);
+    void this.say(chatId, `YouTube не подключён: ${reason}`);
+    return connectPage(502, 'Не получилось подключить канал', `${reason}. Пришлите боту /youtube и попробуйте ещё раз.`);
   }
 
   /**
@@ -229,7 +253,7 @@ export class ShortsYoutubeService {
     let video: Buffer;
     try {
       accessToken = await this.accessToken(cfg, acc, !!previous);
-      video = await this.storage.download({ bucket: shortsBucket(), key: v.videoKey });
+      video = await this.download(v.videoKey);
     } catch (e: any) {
       // Прошлая загрузка ещё не проверена — сказать «ролика нет» нельзя (спека, «Публикация», п. 7).
       if (previous && !(e instanceof YoutubeAuthError)) {
@@ -241,11 +265,11 @@ export class ShortsYoutubeService {
     if (previous) {
       // Нет ответа — YoutubeMaybeUploaded наверх, адрес остаётся.
       const st = await checkUpload(this.http, previous, accessToken, video.length);
-      if (st.state === 'complete') return this.done(v.id, st.videoId);
+      if (st.state === 'complete') return this.done(v.id, st.videoId, previous);
       // Истекла: адрес не стираем — повтор снова получит 404 и снова пришлёт набор, а не загрузит вслепую.
       if (st.state === 'gone') throw new YoutubeUploadExpired('YouTube уже не помнит прошлую загрузку этого ролика');
       // incomplete или failed — прошлая загрузка не дошла: грузим заново.
-      await this.setSession(v.id, null);
+      await this.clearSession(v.id, previous);
     }
 
     const meta: UploadMeta = {
@@ -257,41 +281,46 @@ export class ShortsYoutubeService {
       privacy,
     };
     const sessionUrl = await startUpload(this.http, accessToken, meta, video.length);
-    await this.setSession(v.id, sessionUrl);
+    // Сессия без байтов ролика не создаёт: если строку держит другая попытка — бросить безопасно.
+    if (!(await this.claimSession(v.id, sessionUrl))) throw new YoutubeNotUploaded('строку YouTube держит другая попытка — файл не отправляю');
     if (!(await keepAlive())) throw new YoutubeNotUploaded('ролик ушёл из publishing до отправки файла — не отправляю');
     try {
-      return await this.done(v.id, await sendFile(this.http, sessionUrl, accessToken, video));
+      return await this.done(v.id, await sendFile(this.http, sessionUrl, accessToken, video), sessionUrl);
     } catch (e: any) {
       if (e instanceof YoutubeNotUploaded) {
         // Явный отказ — итог сессии: на повторе она повторила бы его, спрашивать незачем.
-        await this.setSession(v.id, null);
+        await this.clearSession(v.id, sessionUrl);
         throw e;
       }
       if (!(e instanceof YoutubeMaybeUploaded)) throw e;
       // Снова без ответа — YoutubeMaybeUploaded наверх, адрес остаётся.
       const st = await checkUpload(this.http, sessionUrl, accessToken, video.length);
-      if (st.state === 'complete') return this.done(v.id, st.videoId);
+      if (st.state === 'complete') return this.done(v.id, st.videoId, sessionUrl);
       if (st.state === 'gone') throw new YoutubeUploadExpired('YouTube уже не помнит загрузку этого ролика');
-      await this.setSession(v.id, null);
+      await this.clearSession(v.id, sessionUrl);
       if (st.state === 'failed') throw new YoutubeNotUploaded(`отправка файла: ${st.reason}`, st.status);
       throw new YoutubeNotUploaded(`файл не дошёл до YouTube (${e.message})`);
     }
   }
 
-  /** Свежий access-токен. Доступа нет — аккаунт отозван с причиной и YoutubeAuthError (pending — у ролика жива сессия). */
+  /** Свежий access-токен. Доступа нет — это подключение отозвано с причиной и YoutubeAuthError (pending — у ролика жива сессия). */
   private async accessToken(cfg: YoutubeOAuthConfig, acc: YoutubeAccount, pending: boolean): Promise<string> {
+    if ((process.env.CALENDAR_SECRET_KEY || '').length < 32) {
+      // Ошибка настройки сервера, а не отозванный доступ: подключение не трогаем.
+      throw new YoutubeNotUploaded('на сервере нет CALENDAR_SECRET_KEY — токен канала не расшифровать');
+    }
     let refreshToken: string;
     try {
       refreshToken = decryptSecret(acc.refreshTokenEnc);
     } catch {
-      await this.revoke('токен не расшифровался — сменился CALENDAR_SECRET_KEY?');
-      throw new YoutubeAuthError('токен канала не расшифровался — переподключите: /youtube', pending);
+      await this.revoke('токен не расшифровался — сменился CALENDAR_SECRET_KEY?', acc.refreshTokenEnc);
+      throw new YoutubeAuthError('токен канала не расшифровался', pending);
     }
     try {
       return await refreshAccessToken(this.http, cfg, refreshToken);
     } catch (e: any) {
       if (!(e instanceof YoutubeAuthError)) throw e;
-      await this.revoke(e.message);
+      await this.revoke(e.message, acc.refreshTokenEnc);
       throw new YoutubeAuthError(e.message, pending);
     }
   }
@@ -307,16 +336,28 @@ export class ShortsYoutubeService {
       if (!url) return;
       const mode = (await this.settings.get()).youtubeMode;
       const hint = mode === 'unlisted' ? '\nЕсли ролик открывается и не стал приватным — /youtube публично.' : '';
-      await this.say(approverChatId(), `Вышло на YouTube (${MODE_WORDS[mode]}): ${url}${hint}`);
+      const words = mode === 'manual' ? '' : ` (${MODE_WORDS[mode]})`;
+      await this.say(approverChatId(), `Вышло на YouTube${words}: ${url}${hint}`);
     } catch (e: any) {
       this.logger.warn(`ролик ${shortId}: сообщение о YouTube не отправлено: ${e?.message ?? e}`);
     }
   }
 
-  /** Ролик на YouTube: стереть адрес сессии. Сбой стирания успех не отменяет. */
-  private async done(shortId: string, videoId: string): Promise<{ videoId: string; url: string }> {
-    await this.setSession(shortId, null).catch((e: any) => this.logger.warn(`ролик ${shortId}: адрес сессии не стёрт: ${e?.message ?? e}`));
+  /** Ролик на YouTube: стереть свой адрес сессии. Сбой стирания успех не отменяет. */
+  private async done(shortId: string, videoId: string, url: string): Promise<{ videoId: string; url: string }> {
+    await this.clearSession(shortId, url).catch((e: any) => this.logger.warn(`ролик ${shortId}: адрес сессии не стёрт: ${e?.message ?? e}`));
     return { videoId, url: `https://youtube.com/shorts/${videoId}` };
+  }
+
+  /** Файл ролика из MinIO со сроком: зависшее скачивание не должно пережить порог сторожа публикатора. */
+  private async download(key: string): Promise<Buffer> {
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), DOWNLOAD_TIMEOUT_MS);
+    try {
+      return await this.storage.download({ bucket: shortsBucket(), key, abortSignal: abort.signal });
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async session(shortId: string): Promise<string | null> {
@@ -324,17 +365,35 @@ export class ShortsYoutubeService {
     return r.rows[0]?.upload_session ?? null;
   }
 
-  private async setSession(shortId: string, url: string | null): Promise<void> {
+  /**
+   * Адрес новой сессии — в строку площадки, только если строку держит публикация
+   * (publishing) и другой незавершённой загрузки в ней нет. Иначе другая попытка того же
+   * ролика уже грузит (сторож вернул ролик в очередь, пока эта висела): файл не отправляем.
+   */
+  private async claimSession(shortId: string, url: string): Promise<boolean> {
+    const r = await this.pg.query(
+      `UPDATE short_publication SET upload_session = $2, updated_at = now()
+        WHERE short_id = $1 AND platform = 'youtube' AND status = 'publishing' AND upload_session IS NULL`,
+      [shortId, url],
+    );
+    return r.rowCount === 1;
+  }
+
+  /** Стереть адрес — только свой: адрес другой попытки не трогаем. */
+  private async clearSession(shortId: string, url: string): Promise<void> {
     await this.pg.query(
-      `UPDATE short_publication SET upload_session = $2, updated_at = now() WHERE short_id = $1 AND platform = 'youtube'`,
+      `UPDATE short_publication SET upload_session = NULL, updated_at = now()
+        WHERE short_id = $1 AND platform = 'youtube' AND upload_session = $2`,
       [shortId, url],
     );
   }
 
-  private async revoke(reason: string): Promise<void> {
+  /** Отозвать — только то подключение, токен которого не сработал: переподключение посреди загрузки не трогаем. */
+  private async revoke(reason: string, tokenEnc: string): Promise<void> {
     await this.pg.query(
-      `UPDATE short_youtube_account SET status = 'revoked', last_error = $1, updated_at = now() WHERE id = 1`,
-      [clip(reason, 300)],
+      `UPDATE short_youtube_account SET status = 'revoked', last_error = $1, updated_at = now()
+        WHERE id = 1 AND refresh_token_enc = $2`,
+      [clip(reason, 300), tokenEnc],
     );
   }
 
@@ -363,7 +422,9 @@ export class ShortsYoutubeService {
     const acc = await this.account();
     if (acc?.status === 'connected') return done;
     const link = this.connectUrl(chatId);
-    return `${done} Но канал не подключён, поэтому пока набор.${link ? `\n\nПодключить (ссылка действует 15 минут):\n${link}` : ''}`;
+    if (!link) return `${done} Но YouTube не настроен на этом сервере, поэтому пока набор.`;
+    const why = acc ? 'доступ к каналу пропал' : 'канал не подключён';
+    return `${done} Но ${why}, поэтому пока набор.\n\nПодключить (ссылка действует 15 минут):\n${link}`;
   }
 
   /** Сообщение владельцу. Сбой Telegram глотаем: он не повод ронять команду, подключение или публикацию. */
