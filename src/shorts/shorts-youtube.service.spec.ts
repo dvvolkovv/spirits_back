@@ -1,6 +1,7 @@
 import { Logger } from '@nestjs/common';
 import { decryptSecret, encryptSecret } from '../calendar/crypto';
-import { PENDING_UPLOAD_NOTE, ShortsYoutubeService, connectPage, parseYoutubeCommand } from './shorts-youtube.service';
+import { STUCK_PUBLISHING_MINUTES } from './shorts-publisher.service';
+import { DOWNLOAD_TIMEOUT_MS, PENDING_UPLOAD_NOTE, ShortsYoutubeService, connectPage, parseYoutubeCommand } from './shorts-youtube.service';
 import { YoutubeAuthError, YoutubeMaybeUploaded, YoutubeNotUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
 import { HttpRequest, HttpResponse } from './youtube/youtube-http';
 import { verifyState } from './youtube/youtube-state';
@@ -10,12 +11,13 @@ const SECRET = 'GOCSPX-test-secret-0123456789';
 const reply = (status: number, data: any = {}, headers: any = {}): HttpResponse => ({ status, data, headers });
 
 /** База в миниатюре: ровно те запросы, что делает сервис YouTube. */
-function fakeDb(init: { account?: any; mode?: string; session?: string | null; published?: string | null } = {}) {
+function fakeDb(init: { account?: any; mode?: string; session?: string | null; published?: string | null; pub?: string; clearThrows?: boolean } = {}) {
   const st: any = {
     account: init.account ?? null,
     mode: init.mode ?? 'manual',
     session: init.session ?? null,
     published: init.published ?? null,
+    pub: init.pub ?? 'publishing',
   };
   const query = jest.fn(async (sql: string, p: any[] = []) => {
     const s = sql.replace(/\s+/g, ' ').trim();
@@ -32,12 +34,20 @@ function fakeDb(init: { account?: any; mode?: string; session?: string | null; p
       return { rows: [{ youtube_mode: st.mode }], rowCount: 1 };
     }
     if (s.startsWith("UPDATE short_youtube_account SET status = 'revoked'")) {
-      if (st.account) Object.assign(st.account, { status: 'revoked', last_error: p[0] });
-      return { rows: [], rowCount: st.account ? 1 : 0 };
+      if (!st.account || st.account.refresh_token_enc !== p[1]) return { rows: [], rowCount: 0 };
+      Object.assign(st.account, { status: 'revoked', last_error: p[0] });
+      return { rows: [], rowCount: 1 };
     }
     if (s.startsWith('SELECT upload_session FROM short_publication')) return { rows: [{ upload_session: st.session }] };
-    if (s.startsWith('UPDATE short_publication SET upload_session')) {
+    if (s.startsWith('UPDATE short_publication SET upload_session = $2')) {
+      if (st.pub !== 'publishing' || st.session !== null) return { rows: [], rowCount: 0 };
       st.session = p[1];
+      return { rows: [], rowCount: 1 };
+    }
+    if (s.startsWith('UPDATE short_publication SET upload_session = NULL')) {
+      if (init.clearThrows) throw new Error('Connection terminated unexpectedly');
+      if (st.session !== p[1]) return { rows: [], rowCount: 0 };
+      st.session = null;
       return { rows: [], rowCount: 1 };
     }
     if (s.startsWith('SELECT url FROM short_publication')) return { rows: st.published ? [{ url: st.published }] : [] };
@@ -83,6 +93,7 @@ beforeEach(() => {
   process.env.YOUTUBE_OAUTH_CLIENT_SECRET = SECRET;
   process.env.PUBLIC_BASE_URL = 'https://test.linkeon.io';
   process.env.CALENDAR_SECRET_KEY = 'k'.repeat(32);
+  process.env.SHORTS_ENABLED = 'true';
   delete process.env.SHORTS_STAND;
   jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
   jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
@@ -183,6 +194,20 @@ describe('команда /youtube', () => {
     await svc.handleCommand(dm('/youtube громко'));
     expect(said()[0].startsWith('[СТЕНД] ')).toBe(true);
   });
+
+  it('сбой записи режима — сообщение с причиной, команда обработана', async () => {
+    const { svc, settings, said } = setup();
+    settings.update.mockRejectedValueOnce(new Error('column "youtube_mode" does not exist'));
+    expect(await svc.handleCommand(dm('/youtube публично'))).toBe(true);
+    expect(said()[0]).toBe('YouTube: не получилось — column "youtube_mode" does not exist');
+  });
+
+  it('режим при отозванном доступе — «доступ к каналу пропал»', async () => {
+    const db = fakeDb({ account: { channel_id: 'UCx', channel_title: 'Linkeon', refresh_token_enc: 'e', status: 'revoked' } });
+    const { svc, said } = setup(db);
+    await svc.handleCommand(dm('/youtube публично'));
+    expect(said()[0]).toMatch(/^Готово: ролики на YouTube — публично\. Но доступ к каналу пропал, поэтому пока набор\./);
+  });
 });
 
 describe('адрес возврата Google', () => {
@@ -239,11 +264,19 @@ describe('адрес возврата Google', () => {
     expect(http.http).not.toHaveBeenCalled();
   });
 
-  it('Google отказал в обмене — 502 и причина владельцу', async () => {
-    const { svc, said } = setup(fakeDb(), fakeHttp(reply(400, { error: 'invalid_grant', error_description: 'Bad Request' })));
+  it('код уже использован, а недавнего подключения нет — 400 «Ссылка устарела», бот молчит', async () => {
+    const { svc, tg } = setup(fakeDb(), fakeHttp(reply(400, { error: 'invalid_grant', error_description: 'Bad Request' })));
+    const page = await svc.completeConnect({ code: 'c', state: stateFor() });
+    expect(page.status).toBe(400);
+    expect(page.html).toContain('Ссылка устарела');
+    expect(tg.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('прочий сбой обмена — 502, причина в лог и владельцу', async () => {
+    const { svc, said } = setup(fakeDb(), fakeHttp(reply(500, {})));
     const page = await svc.completeConnect({ code: 'c', state: stateFor() });
     expect(page.status).toBe(502);
-    expect(said()[0]).toBe('YouTube не подключён: обмен кода: HTTP 400 invalid_grant: Bad Request');
+    expect(said()[0]).toBe('YouTube не подключён: обмен кода: HTTP 500');
   });
 
   it('браузер повторил адрес возврата сразу после подключения — «уже подключён», бот молчит', async () => {
@@ -255,6 +288,31 @@ describe('адрес возврата Google', () => {
     expect(page.status).toBe(200);
     expect(page.html).toContain('Канал уже подключён');
     expect(tg.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('переподключение в пределах 10 минут сорвалось по настоящей причине — 502 и сообщение, а не «уже подключён»', async () => {
+    const db = fakeDb({
+      account: { channel_id: 'UCx', channel_title: 'Linkeon', refresh_token_enc: 'e', status: 'connected', connected_at: new Date().toISOString() },
+    });
+    const { svc, said } = setup(db, fakeHttp(tokensOk(), reply(200, { items: [] })));
+    const page = await svc.completeConnect({ code: 'c', state: stateFor() });
+    expect(page.status).toBe(502);
+    expect(said()[0]).toMatch(/^YouTube не подключён: у аккаунта нет канала YouTube/);
+  });
+
+  it('сбой Telegram страницу не роняет; сообщение — без превью ссылок', async () => {
+    const { svc, tg } = setup(fakeDb(), fakeHttp(tokensOk(), channelOk()));
+    tg.sendMessage.mockRejectedValue(new Error('Bad Gateway'));
+    const page = await svc.completeConnect({ code: 'c', state: stateFor() });
+    expect(page.status).toBe(200);
+    expect((tg.sendMessage.mock.calls[0] as any[])[2]).toEqual({ link_preview_options: { is_disabled: true } });
+  });
+
+  it('конвейер выключен — в сообщении о подключении предупреждение', async () => {
+    delete process.env.SHORTS_ENABLED;
+    const { svc, said } = setup(fakeDb(), fakeHttp(tokensOk(), channelOk()));
+    await svc.completeConnect({ code: 'c', state: stateFor() });
+    expect(said()[0]).toContain('Конвейер роликов на этом сервере пока выключен (SHORTS_ENABLED)');
   });
 
   it('нет клиента OAuth — 503', async () => {
@@ -466,6 +524,74 @@ describe('загрузка ролика', () => {
     expect(await caught(svc.upload({ ...video, captions: null }, 'public', alive()))).toBeInstanceOf(YoutubeNotUploaded);
     expect(http.http).not.toHaveBeenCalled();
   });
+
+  it('строку держит другая попытка (строка не в publishing) — YoutubeNotUploaded, файл не отправлен', async () => {
+    const db = connected({ pub: 'failed' });
+    const http = fakeHttp(TOKEN, reply(200, {}, { location: SESSION }));
+    const { svc } = setup(db, http);
+    const e = await caught(svc.upload(video, 'public', alive()));
+    expect(e).toBeInstanceOf(YoutubeNotUploaded);
+    expect(e.message).toMatch(/другая попытка/);
+    expect(http.calls).toHaveLength(2);
+    expect(db.st.session).toBeNull();
+  });
+
+  it('скачивание — со сроком: в хранилище уходит abortSignal', async () => {
+    const db = connected();
+    const { svc, storage } = setup(db, fakeHttp(TOKEN, reply(200, {}, { location: SESSION }), reply(201, { id: 'abcdefghijk' })));
+    await svc.upload(video, 'public', alive());
+    expect(storage.download).toHaveBeenCalledWith(expect.objectContaining({ key: 'shorts/v1/video.mp4', abortSignal: expect.any(Object) }));
+  });
+
+  it('сумма сроков до keepAlive (скачивание, токен, вопрос о сессии, её начало) меньше порога сторожа', () => {
+    expect(DOWNLOAD_TIMEOUT_MS + 15_000 + 30_000 + 30_000).toBeLessThan(STUCK_PUBLISHING_MINUTES * 60_000);
+  });
+
+  it('нет аккаунта при живой сессии — YoutubeAuthError с pendingUpload', async () => {
+    const e = await caught(setup(fakeDb({ mode: 'public', session: SESSION }), fakeHttp()).svc.upload(video, 'public', alive()));
+    expect(e).toBeInstanceOf(YoutubeAuthError);
+    expect(e.pendingUpload).toBe(true);
+  });
+
+  it('сбой скачивания без прошлой сессии — исходная ошибка', async () => {
+    const s = setup(connected(), fakeHttp(TOKEN));
+    s.storage.download.mockRejectedValueOnce(new Error('minio down'));
+    const e = await caught(s.svc.upload(video, 'public', alive()));
+    expect(e).not.toBeInstanceOf(YoutubeMaybeUploaded);
+    expect(e.message).toBe('minio down');
+  });
+
+  it('файл оборвался, затем 404 — YoutubeUploadExpired, адрес остаётся', async () => {
+    const db = connected();
+    const http = fakeHttp(TOKEN, reply(200, {}, { location: SESSION }), new Error('socket hang up'), reply(404));
+    const { svc } = setup(db, http);
+    expect(await caught(svc.upload(video, 'public', alive()))).toBeInstanceOf(YoutubeUploadExpired);
+    expect(db.st.session).toBe(SESSION);
+  });
+
+  it('сбой стирания адреса после успеха успех не отменяет', async () => {
+    const db = connected({ clearThrows: true });
+    const { svc } = setup(db, fakeHttp(TOKEN, reply(200, {}, { location: SESSION }), reply(201, { id: 'abcdefghijk' })));
+    expect((await svc.upload(video, 'public', alive())).videoId).toBe('abcdefghijk');
+  });
+
+  it('нет CALENDAR_SECRET_KEY — YoutubeNotUploaded, подключение не отзываем', async () => {
+    const db = connected();
+    delete process.env.CALENDAR_SECRET_KEY;
+    const e = await caught(setup(db, fakeHttp()).svc.upload(video, 'public', alive()));
+    expect(e).toBeInstanceOf(YoutubeNotUploaded);
+    expect(db.st.account.status).toBe('connected');
+  });
+
+  it('отзыв — только того подключения, чей токен не сработал', async () => {
+    const db = connected();
+    const token = db.st.account.refresh_token_enc;
+    const { svc } = setup(db, fakeHttp(reply(400, { error: 'invalid_grant' })));
+    await caught(svc.upload(video, 'public', alive()));
+    const revokeCall = db.query.mock.calls.find((c: any[]) => String(c[0]).includes("SET status = 'revoked'")) as any[];
+    expect(String(revokeCall[0])).toContain('refresh_token_enc = $2');
+    expect(revokeCall[1][1]).toBe(token);
+  });
 });
 
 describe('сообщение о загрузке', () => {
@@ -482,5 +608,11 @@ describe('сообщение о загрузке', () => {
     const b = setup(fakeDb({ mode: 'public' }));
     await b.svc.notifyUploaded('v1');
     expect(b.tg.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('режим уже «вручную» — без слова режима', async () => {
+    const { svc, said } = setup(fakeDb({ mode: 'manual', published: 'https://youtube.com/shorts/abcdefghijk' }));
+    await svc.notifyUploaded('v1');
+    expect(said()).toEqual(['Вышло на YouTube: https://youtube.com/shorts/abcdefghijk']);
   });
 });

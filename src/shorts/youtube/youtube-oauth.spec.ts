@@ -1,4 +1,4 @@
-import { YoutubeAuthError, YoutubeNotUploaded } from './youtube-errors';
+import { YoutubeAuthError, YoutubeCodeRejected, YoutubeNotUploaded } from './youtube-errors';
 import { HttpRequest, HttpResponse } from './youtube-http';
 import { YOUTUBE_SCOPES, authorizeUrl, exchangeCode, fetchMyChannel, refreshAccessToken, youtubeOAuthConfig } from './youtube-oauth';
 
@@ -29,9 +29,9 @@ describe('youtubeOAuthConfig', () => {
       .toEqual({ clientId: 'id', clientSecret: 's', redirectUri: 'https://test.linkeon.io/webhook/shorts/youtube/oauth/callback' });
   });
 
-  it('без PUBLIC_BASE_URL — прод', () => {
-    expect(youtubeOAuthConfig({ YOUTUBE_OAUTH_CLIENT_ID: 'id', YOUTUBE_OAUTH_CLIENT_SECRET: 's' })?.redirectUri)
-      .toBe('https://my.linkeon.io/webhook/shorts/youtube/oauth/callback');
+  it('без PUBLIC_BASE_URL — null: подставлять прод нельзя', () => {
+    expect(youtubeOAuthConfig({ YOUTUBE_OAUTH_CLIENT_ID: 'id', YOUTUBE_OAUTH_CLIENT_SECRET: 's' })).toBeNull();
+    expect(youtubeOAuthConfig({ YOUTUBE_OAUTH_CLIENT_ID: 'id', YOUTUBE_OAUTH_CLIENT_SECRET: 's', PUBLIC_BASE_URL: '  ' })).toBeNull();
   });
 });
 
@@ -70,9 +70,13 @@ describe('exchangeCode', () => {
     await expect(exchangeCode(fakeHttp(reply(200, { access_token: 'at', scope: FULL })).http, CFG, 'c')).rejects.toThrow(/refresh-токен/);
   });
 
-  it('отказ Google — причина в ошибке', async () => {
-    const { http } = fakeHttp(reply(400, { error: 'invalid_grant', error_description: 'Bad Request' }));
-    await expect(exchangeCode(http, CFG, 'c')).rejects.toThrow('обмен кода: HTTP 400 invalid_grant: Bad Request');
+  it('invalid_grant — YoutubeCodeRejected (код уже использован); прочий отказ — обычная ошибка с причиной', async () => {
+    const a = await exchangeCode(fakeHttp(reply(400, { error: 'invalid_grant', error_description: 'Bad Request' })).http, CFG, 'c').catch((x) => x);
+    expect(a).toBeInstanceOf(YoutubeCodeRejected);
+    expect(a.message).toBe('обмен кода: HTTP 400 invalid_grant: Bad Request');
+    const b = await exchangeCode(fakeHttp(reply(500, {})).http, CFG, 'c').catch((x) => x);
+    expect(b).not.toBeInstanceOf(YoutubeCodeRejected);
+    expect(b.message).toBe('обмен кода: HTTP 500');
   });
 });
 
