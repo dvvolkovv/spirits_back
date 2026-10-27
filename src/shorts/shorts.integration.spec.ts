@@ -1,10 +1,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
+import { decryptSecret, encryptSecret } from '../calendar/crypto';
 import { claimStage, stageFailed } from './short-jobs';
 import { approveShortIntoSlot } from './short-slot-claim';
 import { ShortsApprovalService } from './shorts-approval.service';
 import { ShortsPublisherService } from './shorts-publisher.service';
+import { ShortsSettingsService } from './shorts-settings.service';
+import { ShortsYoutubeService } from './shorts-youtube.service';
 import { rowToShort } from './shorts.types';
 
 /**
@@ -21,7 +24,7 @@ import { rowToShort } from './shorts.types';
  */
 const PG = process.env.SHORTS_PG_URL;
 const maybe = PG ? describe : describe.skip;
-const MIGRATIONS = ['001_shorts.sql', '002_skits.sql'].map((f) => path.join(__dirname, 'migrations', f));
+const MIGRATIONS = ['001_shorts.sql', '002_skits.sql', '003_youtube.sql'].map((f) => path.join(__dirname, 'migrations', f));
 const migrate = async (pool: Pool) => {
   for (const f of MIGRATIONS) await pool.query(fs.readFileSync(f, 'utf8'));
 };
@@ -232,5 +235,147 @@ maybe('ролики против живого Postgres', () => {
 
     expect((await video(fresh.id)).status).toBe('publishing');
     expect((await rows(fresh.id))[0].status).toBe('publishing');
+  });
+
+  describe('YouTube против живой базы', () => {
+    const OWNER = 37948399;
+    const saved = { ...process.env };
+    const reply = (status: number, data: any = {}, headers: any = {}) => ({ status, data, headers });
+    const reset = async () => {
+      await pool.query('TRUNCATE short_youtube_account');
+      await pool.query(`UPDATE short_settings SET youtube_mode = 'manual' WHERE id = 1`);
+    };
+
+    beforeAll(() => {
+      Object.assign(process.env, {
+        BLOG_APPROVER_TG_ID: String(OWNER),
+        YOUTUBE_OAUTH_CLIENT_ID: 'cid',
+        YOUTUBE_OAUTH_CLIENT_SECRET: 'GOCSPX-it-secret',
+        PUBLIC_BASE_URL: 'https://test.linkeon.io',
+        CALENDAR_SECRET_KEY: 'k'.repeat(32),
+      });
+    });
+    beforeEach(reset);
+    afterAll(async () => {
+      await reset();
+      process.env = saved;
+    });
+
+    function service(responses: any[]) {
+      const http = jest.fn(async () => {
+        const n = responses.shift();
+        if (!n) throw new Error('лишний запрос');
+        if (n instanceof Error) throw n;
+        return n;
+      });
+      const tg = { sendMessage: jest.fn(async () => ({ message_id: 1 })) };
+      const storage = { download: jest.fn(async () => Buffer.from('video-bytes')) };
+      const svc = new ShortsYoutubeService(pgLike() as any, tg as any, storage as any, new ShortsSettingsService(pgLike() as any));
+      svc.http = http as any;
+      return { svc, http, tg };
+    }
+
+    it('003: умолчание manual, CHECK режима, колонка сессии', async () => {
+      const def = await pool.query(
+        `SELECT column_default FROM information_schema.columns WHERE table_name = 'short_settings' AND column_name = 'youtube_mode'`,
+      );
+      expect(def.rows[0].column_default).toContain('manual');
+      await expect(pool.query(`UPDATE short_settings SET youtube_mode = 'private' WHERE id = 1`)).rejects.toThrow();
+      const col = await pool.query(
+        `SELECT 1 FROM information_schema.columns WHERE table_name = 'short_publication' AND column_name = 'upload_session'`,
+      );
+      expect(col.rowCount).toBe(1);
+    });
+
+    it('подключение пишет аккаунт и режим; повторное — та же единственная строка', async () => {
+      const ok = () => [
+        reply(200, { access_token: 'a', refresh_token: 'refresh-xyz', scope: 'https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly' }),
+        reply(200, { items: [{ id: 'UCu_Pq4rFXmTT8CDG27O_i2A', snippet: { title: 'Linkeon' } }] }),
+      ];
+      const { svc } = service([...ok(), ...ok()]);
+      const state = () => new URL(svc.connectUrl(OWNER)).searchParams.get('state');
+      expect((await svc.completeConnect({ code: 'c1', state: state() })).status).toBe(200);
+      expect((await svc.completeConnect({ code: 'c2', state: state() })).status).toBe(200);
+      const acc = await pool.query('SELECT * FROM short_youtube_account');
+      expect(acc.rowCount).toBe(1);
+      expect(acc.rows[0]).toMatchObject({ id: 1, channel_id: 'UCu_Pq4rFXmTT8CDG27O_i2A', status: 'connected' });
+      expect(decryptSecret(acc.rows[0].refresh_token_enc)).toBe('refresh-xyz');
+      const s = await pool.query('SELECT youtube_mode FROM short_settings WHERE id = 1');
+      expect(s.rows[0]).toEqual({ youtube_mode: 'unlisted' });
+    });
+
+    it('сессия загрузки: адрес в строке youtube до файла и после загрузки (стирает публикатор вместе с published)', async () => {
+      await pool.query(`INSERT INTO short_youtube_account (id, channel_id, refresh_token_enc) VALUES (1, 'UCx', $1)`, [encryptSecret('refresh-xyz')]);
+      const v = await insert({
+        status: 'publishing',
+        video_key: 'shorts/v/video.mp4',
+        captions: { telegram: 't', vk: 'v', youtube: { title: 'T', description: 'D', tags: [] } },
+      });
+      await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'youtube', 'publishing')`, [v.id]);
+      const SESSION = 'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=it1';
+      const read = async () =>
+        (await pool.query(`SELECT upload_session FROM short_publication WHERE short_id = $1 AND platform = 'youtube'`, [v.id])).rows[0].upload_session;
+      let seen: string | null = null;
+      const { svc } = service([reply(200, { access_token: 'a' }), reply(200, {}, { location: SESSION }), reply(201, { id: 'abcdefghijk' })]);
+      const out = await svc.upload(v, 'unlisted', async () => {
+        seen = await read();
+        return true;
+      });
+      expect(out.videoId).toBe('abcdefghijk');
+      expect(seen).toBe(SESSION);
+      expect(await read()).toBe(SESSION);
+    });
+
+    it('публикатор пишет published и стирает адрес сессии одним запросом (живой SQL recordSent)', async () => {
+      const v = await insert({
+        status: 'approved',
+        approved_at: new Date(),
+        slot_at: new Date(Date.now() - 60_000),
+        video_key: 'shorts/v/video.mp4',
+        cover_key: 'shorts/v/cover.jpg',
+        captions: { telegram: 't', vk: 'v', youtube: { title: 'T', description: 'D', tags: [] } },
+      });
+      await pool.query(
+        `INSERT INTO short_publication (short_id, platform, status, upload_session)
+         VALUES ($1, 'telegram', 'published', NULL), ($1, 'youtube', 'pending', $2)`,
+        [v.id, 'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=it2'],
+      );
+      const youtube = {
+        uploadPlan: async () => ({ kind: 'upload', privacy: 'unlisted' }),
+        upload: async () => ({ videoId: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk', resumed: true }),
+        notifyUploaded: jest.fn(async () => undefined),
+      };
+      const settings = { get: async () => ({ platforms: ['telegram', 'youtube'], tgChannelChatId: '-1003290853538' }) };
+      const publisher = new ShortsPublisherService(pgLike() as any, {} as any, {} as any, settings as any, youtube as any);
+      await publisher.publish(v.id);
+      const row = (await pool.query(
+        `SELECT status, external_id, upload_session FROM short_publication WHERE short_id = $1 AND platform = 'youtube'`,
+        [v.id],
+      )).rows[0];
+      expect(row).toEqual({ status: 'published', external_id: 'abcdefghijk', upload_session: null });
+      expect((await pool.query('SELECT status FROM short_video WHERE id = $1', [v.id])).rows[0].status).toBe('published');
+      expect(youtube.notifyUploaded).toHaveBeenCalledWith(v.id, null);
+    });
+
+    it('отзыв доступа и сообщение о загрузке — SQL против живой схемы', async () => {
+      await pool.query(`INSERT INTO short_youtube_account (id, channel_id, refresh_token_enc) VALUES (1, 'UCx', $1)`, [encryptSecret('refresh-xyz')]);
+      const v = await insert({
+        status: 'publishing',
+        video_key: 'shorts/v/video.mp4',
+        captions: { telegram: 't', vk: 'v', youtube: { title: 'T', description: 'D', tags: [] } },
+      });
+      await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'youtube', 'publishing')`, [v.id]);
+      const a = service([reply(400, { error: 'invalid_grant', error_description: 'revoked' })]);
+      await a.svc.upload(v, 'unlisted', async () => true).catch(() => undefined);
+      const acc = await pool.query('SELECT status, last_error FROM short_youtube_account');
+      expect(acc.rows[0]).toEqual({ status: 'revoked', last_error: 'HTTP 400 invalid_grant: revoked' });
+      await pool.query(
+        `UPDATE short_publication SET status = 'published', url = 'https://youtube.com/shorts/abcdefghijk' WHERE short_id = $1`,
+        [v.id],
+      );
+      const b = service([]);
+      await b.svc.notifyUploaded(v.id, 'public');
+      expect(b.tg.sendMessage).toHaveBeenCalledWith(OWNER, 'Вышло на YouTube (публично): https://youtube.com/shorts/abcdefghijk', expect.anything());
+    });
   });
 });
