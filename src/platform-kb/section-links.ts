@@ -24,6 +24,10 @@
  *
  * Оплаты здесь нет намеренно: ссылку на пополнение даёт блок баланса
  * (TOP_UP_URL), он знает про сборки для сторов.
+ *
+ * Сборке из стора (Flutter из App Store и Google Play) адресов кабинета не
+ * даём вовсе — ни в справке, ни в блоке, ни в поддержке: довод у
+ * platformSections (chat/platform-guide.ts).
  */
 export const CABINET_ORIGIN = 'https://my.linkeon.io';
 
@@ -56,9 +60,6 @@ export const SECTION_PATHS = {
 } as const;
 
 export type SectionKey = keyof typeof SECTION_PATHS;
-
-/** Разделы о деньгах: сборке из стора о них не говорят (как и о темах paidOnly). */
-export const PAID_SECTIONS: readonly SectionKey[] = ['partners'];
 
 /** Полный адрес раздела: sectionUrl('zoom') → https://my.linkeon.io/profile?open=zoom. */
 export function sectionUrl(key: SectionKey): string {

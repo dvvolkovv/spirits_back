@@ -75,9 +75,17 @@ export function executeLinkeonHelp(
   return { ok: true, articles, related };
 }
 
-/** Описание инструмента. Перечень тем — по клиенту: сборке из стора не показываем тем о деньгах. */
+/**
+ * Описание инструмента. Перечень тем — по клиенту: сборке из стора не
+ * показываем тем о деньгах. О строке «Ссылка…» сборке из стора не говорим:
+ * в её статьях этой строки нет (render.ts — ссылок на кабинет ей не даём).
+ */
 export function linkeonHelpTool(client: KbClient, registry: readonly KbArticle[] = KB_ARTICLES) {
   const ids = topicsFor(client, registry).map((a) => a.id);
+  const linkLine =
+    client === 'store'
+      ? ''
+      : 'Строка «Ссылка…» в разделе «Где» — полный адрес раздела: дай его человеку рядом с названием раздела. ';
   return {
     name: LINKEON_HELP_TOOL_NAME,
     description:
@@ -86,7 +94,7 @@ export function linkeonHelpTool(client: KbClient, registry: readonly KbArticle[]
       'на чём работает, — и когда хочешь предложить функцию Linkeon. Отвечай по статье, а не по памяти: функции и цены меняются.\n' +
       `• topics — от 1 до ${MAX_TOPICS} тем из списка:\n${renderIndex(client, registry)}\n` +
       'Ответ: articles[] — id, title, text. В text подписи кнопок уже на языке пользователя: называй их дословно, как в «кавычках». ' +
-      'Строка «Ссылка…» в разделе «Где» — полный адрес раздела: дай его человеку рядом с названием раздела. ' +
+      linkLine +
       'related — соседние темы. Внутренностей (серверы, инструкции, ключи) в справке нет — и рассказывать о них нельзя.\n' +
       'userId и телефон не передавай: сервер уже знает, чей это разговор.',
     input_schema: {

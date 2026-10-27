@@ -1,6 +1,6 @@
 import { LanguageService } from '../common/services/language.service';
 import { labelsFor } from './labels';
-import { sectionUrl } from './section-links';
+import { CABINET_ORIGIN, sectionUrl } from './section-links';
 import type { KbLabelKey } from './labels.generated';
 import type { KbArticle, KbClient, KbContext, KbLang } from './kb.types';
 
@@ -43,8 +43,23 @@ export function dropEmptySections(md: string): string {
     .join('');
 }
 
+/**
+ * Строка «Ссылка…: <адрес кабинета>» из раздела «Где» (url() в статьях) —
+ * целиком, с переводом строки.
+ *
+ * Сборке из стора её не отдаём. Это Flutter-приложение: ссылку оно открывает
+ * во внешнем браузере, а на страницах кабинета — баланс, покупка токенов и
+ * «Скачать APK» (правило Apple 3.1.1 и решение владельца 25.10.2026; довод
+ * целиком — у platformSections в chat/platform-guide.ts). Раздел «Где» при
+ * этом остаётся: путь по меню в нём есть всегда.
+ */
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const SECTION_LINK_LINE = new RegExp(`^Ссылка[^\\n]*: ${escapeRe(CABINET_ORIGIN)}/\\S*$\\n?`, 'gm');
+
 export function renderArticle(a: KbArticle, lang: string, client: KbClient): string {
-  let body = dropEmptySections(a.render(kbContext(lang, client)).trim());
+  let body = a.render(kbContext(lang, client)).trim();
+  if (client === 'store') body = body.replace(SECTION_LINK_LINE, '');
+  body = dropEmptySections(body);
   // В сборке для стора цен нет (paid() вырезан) — заголовок без «и цены».
   if (client === 'store') body = body.replace(/^## Лимиты и цены$/m, '## Лимиты');
   return [`# ${a.title}`, CLIENT_NOTES[client], body]

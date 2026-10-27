@@ -665,7 +665,7 @@ export class ChatService {
     profileText?: string;
     /** Клиент рисует карточки вопросов (см. client-ui.ts, ask-rule.ts). */
     ask?: boolean;
-    /** Сборка из стора: карта без партнёрской программы (см. platform-guide.ts). */
+    /** Сборка из стора: карта без партнёрской программы и без адресов кабинета (см. platform-guide.ts). */
     storeBuild?: boolean;
   }): Promise<string> {
     const { agentId, agentName, userId, userLanguage } = opts;

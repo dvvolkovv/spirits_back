@@ -1,6 +1,6 @@
 import { labelsFor } from '../platform-kb/labels';
 import type { KbLabels } from '../platform-kb/labels';
-import { sectionUrl } from '../platform-kb/section-links';
+import { sectionUrl, type SectionKey } from '../platform-kb/section-links';
 
 /**
  * Блок «Что есть в Linkeon» для системного промпта ассистента.
@@ -32,7 +32,7 @@ import { sectionUrl } from '../platform-kb/section-links';
 export interface PlatformGuideOpts {
   /** Полное имя инструмента справки. Без него — прежнее вступление: там, где инструмента нет. */
   helpTool?: string;
-  /** Сборка из стора: без партнёрской программы. */
+  /** Сборка из стора: без партнёрской программы и без адресов кабинета (см. platformSections). */
   store?: boolean;
   /** Правило инициативы — штатным ассистентам и боту в ходе владельца. */
   initiative?: boolean;
@@ -96,7 +96,9 @@ export function platformGuide(lang: string, opts: PlatformGuideOpts = {}): strin
     intro,
     platformSections(lang, { store: opts.store }),
     // Веб-чат, Маша и приложения рисуют markdown — ссылка может быть текстом.
-    linksRule('markdown'),
+    // Сборке из стора адресов не даём вовсе (platformSections) — правило ссылок
+    // ей ни к чему.
+    ...(opts.store ? [] : [linksRule('markdown')]),
     ...(opts.initiative ? [INITIATIVE_RULE] : []),
   ].join('\n');
 }
@@ -104,44 +106,55 @@ export function platformGuide(lang: string, opts: PlatformGuideOpts = {}): strin
 /**
  * Перечень разделов без вступления. Его же берёт ИИ-поддержка
  * (support.service.ts): совет «предложи связаться с поддержкой» ей ни к чему.
- * store — без партнёрской программы: она про деньги, а в сборке из стора о
- * деньгах молчим (справка там не отдаёт тему partners).
  *
- * Адрес раздела — в скобках сразу за названием, и за ним всегда «)»: по этой
- * скобке тест отличает /profile от /profile?open=… .
+ * Адрес раздела — в скобках сразу за названием. Скобку вокруг адреса
+ * Telegram, linkify кабинета и markdown-автоссылки в адрес не берут; по ней
+ * же тест отличает /profile от /profile?open=… .
+ *
+ * store — сборка из App Store или Google Play, то есть Flutter-приложение.
+ * В ней нет партнёрской программы: она про деньги, а в сборке из стора о
+ * деньгах молчим (справка там не отдаёт тему partners). И нет адресов
+ * кабинета вовсе: ссылку приложение из стора открывает во внешнем браузере, а
+ * на страницах кабинета — баланс, покупка токенов и «Скачать APK». Это и доступ
+ * к оплате мимо биллинга магазина, за который Apple отклоняла сборку по
+ * правилу 3.1.1 (tokens/balance-context.service.ts: баланс в сторе не
+ * показываем и не называем), и установка файлом, которую сборкам из сторов не
+ * упоминаем (решение владельца 25.10.2026 — ниже, у мобильного приложения).
+ * Раздел там называется подписью, путь к нему — по меню.
  */
 export function platformSections(lang: string, opts: { store?: boolean } = {}): string {
   const l = labelsFor(lang);
-  const u = sectionUrl;
-  const partners = opts.store ? '' : ` — и «${l.partners}» с «${l.invite}» (${u('partners')})`;
+  const u = (key: SectionKey): string => (opts.store ? '' : ` (${sectionUrl(key)})`);
+  const calendarsUrl = opts.store ? '' : `; ${sectionUrl('calendars')}`;
+  const partners = opts.store ? '' : ` — и «${l.partners}» с «${l.invite}»${u('partners')}`;
   return [
-    `• «${l.chat}» (${u('chat')}) — разговоры с ассистентами. Под ответом ассистента — «${l.listen}»: ответ голосом. ` +
+    `• «${l.chat}»${u('chat')} — разговоры с ассистентами. Под ответом ассистента — «${l.listen}»: ответ голосом. ` +
       `«${l.fresh}» — разговор без прошлой истории. «${l.files}» — картинки, видео и файлы этого разговора. ` +
       'Файл к сообщению прикладывается кнопкой «+».',
     `• «${l.call}» (кнопка со значком телефона) — голосовой звонок. В звонке отвечает только Роман.`,
     '• Ссылку на онлайн-встречу можно прислать в чат: если площадка поддерживается, появится карточка ' +
       `с кнопкой «${l.meetingJoin}», и по ней ассистент придёт на встречу. Чтобы ассистент заходил и на чужие ` +
-      `встречи в Zoom, в «${l.settings}» подключается «${l.zoom}» (${u('zoom')}).`,
-    `• «${l.networking}» (${u('networking')}) — поиск людей по ценностям и навыкам, проверка совместимости, ` +
+      `встречи в Zoom, в «${l.settings}» подключается «${l.zoom}»${u('zoom')}.`,
+    `• «${l.networking}»${u('networking')} — поиск людей по ценностям и навыкам, проверка совместимости, ` +
       'запросы на общение и чаты с другими пользователями.',
-    `• «${l.imageGen}» (${u('imageGen')}) и «${l.video}» (${u('video')}) — отдельные разделы для картинок и роликов.`,
-    `• «${l.studio}» (${u('studio')}): «${l.studioAgents}» — свои ассистенты со своими инструкциями; ` +
-      `«${l.studioBots}» (${u('studioBots')}) — бот с ассистентом для Telegram-группы пользователя; ` +
-      `«${l.studioProducts}» (${u('studioProducts')}) — свой сайт или Telegram-бот, который Linkeon размещает ` +
+    `• «${l.imageGen}»${u('imageGen')} и «${l.video}»${u('video')} — отдельные разделы для картинок и роликов.`,
+    `• «${l.studio}»${u('studio')}: «${l.studioAgents}» — свои ассистенты со своими инструкциями; ` +
+      `«${l.studioBots}»${u('studioBots')} — бот с ассистентом для Telegram-группы пользователя; ` +
+      `«${l.studioProducts}»${u('studioProducts')} — свой сайт или Telegram-бот, который Linkeon размещает ` +
       'и дорабатывает по просьбам обычными словами. Создать, удалить или вернуть продукт можно и попросив ассистента в чате.',
-    `• «${l.profile}» (${u('profile')}) — ценности, интересы и навыки (собираются сами из разговоров) и «${l.business}» — ` +
-      `что ассистенты знают о деле пользователя. Там же «${l.settings}» (${u('settings')}) — «${l.calendars}» (Яндекс, ` +
-      `рабочий Outlook, Google и iCloud по ссылке; ${u('calendars')}), «${l.zoom}» (${u('zoom')}), ` +
-      `«${l.talerid}» (${u('talerid')}), «${l.push}» (${u('push')}), «${l.routines}» (${u('routines')}), ` +
-      `«${l.voices}» (${u('voices')}), «${l.loginMethods}» (${u('loginMethods')}), ` +
+    `• «${l.profile}»${u('profile')} — ценности, интересы и навыки (собираются сами из разговоров) и «${l.business}» — ` +
+      `что ассистенты знают о деле пользователя. Там же «${l.settings}»${u('settings')} — «${l.calendars}» (Яндекс, ` +
+      `рабочий Outlook, Google и iCloud по ссылке${calendarsUrl}), «${l.zoom}»${u('zoom')}, ` +
+      `«${l.talerid}»${u('talerid')}, «${l.push}»${u('push')}, «${l.routines}»${u('routines')}, ` +
+      `«${l.voices}»${u('voices')}, «${l.loginMethods}»${u('loginMethods')}, ` +
       // Сборки из App Store/Google Play (store) ставятся самим стором — решение
       // владельца 25.10.2026: установку файлом (APK) им не упоминаем вовсе.
       `язык, приватность, «${l.android}»${opts.store ? '' : ' (Android, установка файлом)'}${partners}.`,
     // Человек ищет «интеграции» — так в кабинете ничего не называется.
     `• Отдельного раздела интеграций нет: подключения сервисов — карточки в «${l.settings}» (календари, Zoom, ` +
-      `Taler ID, способы входа), а привязка Telegram — карточка в «${l.profile}» (${u('telegram')}).`,
+      `Taler ID, способы входа), а привязка Telegram — карточка в «${l.profile}»${u('telegram')}.`,
     '• Linkeon открывается и внутри Telegram — как мини-приложение.',
-    `• «${l.help}» (${u('help')}) — краткая инструкция, частые вопросы и «${l.support}» (${u('support')}).`,
+    `• «${l.help}»${u('help')} — краткая инструкция, частые вопросы и «${l.support}»${u('support')}.`,
   ].join('\n');
 }
 

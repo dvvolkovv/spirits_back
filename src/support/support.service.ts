@@ -493,6 +493,15 @@ export class SupportService implements OnModuleInit {
     // Ссылки на разделы — полным адресом (linksRule('plain')): ответы
     // поддержки кабинет показывает простым текстом и делает ссылкой только
     // сам адрес (SupportView); markdown-ссылка осталась бы на экране скобками.
+    //
+    // Сборке из стора — ни адресов, ни правила ссылок: приложение из стора
+    // открывает ссылку во внешнем браузере, а в кабинете баланс, покупка и
+    // «Скачать APK» (правило Apple 3.1.1; довод целиком — у platformSections).
+    const platform = [
+      platformSections(lang, { store: opts.storeBuild }),
+      ...(opts.storeBuild ? [] : [linksRule('plain')]),
+    ].join('\n');
+
     // Язык ответа больше не зашит. Раньше здесь стояло «отвечай по-русски», и
     // человек, написавший в поддержку по-английски, получал русский ответ —
     // поймано при записи видео для Apple. Директива та же, что у ассистентов
@@ -501,8 +510,7 @@ export class SupportService implements OnModuleInit {
 ${LanguageService.buildDirective(lang)}
 
 ПЛАТФОРМА. LINKEON.IO — AI-ассистенты для бизнеса и личного роста. Разделы и кнопки (называй их так, как они подписаны у пользователя, — в кавычках):
-${platformSections(lang, { store: opts.storeBuild })}
-${linksRule('plain')}
+${platform}
 
 ТВОЯ РОЛЬ.
 - Помогай юзеру решать вопросы по использованию платформы.

@@ -9,7 +9,8 @@ export type KbLang = (typeof SUPPORTED_LANGUAGES)[number];
  *   web      — веб и Capacitor-приложение (тот же React, те же подписи);
  *   app      — Flutter-приложение: меню своё;
  *   store    — сборки из App Store и Google Play: ни токенов, ни баланса, ни оплаты
- *              (balance-context.service.ts — Apple отклоняла четырежды по 3.1.1);
+ *              (balance-context.service.ts — Apple отклоняла четырежды по 3.1.1),
+ *              ни ссылок на кабинет (render.ts, строка «Ссылка…»);
  *   telegram — ходы ботов в Telegram: всё делается в кабинете my.linkeon.io.
  */
 export const KB_CLIENTS = ['web', 'app', 'store', 'telegram'] as const;
@@ -37,7 +38,8 @@ export interface KbContext {
   /**
    * Полный адрес раздела кабинета для строки «Ссылка…» в разделе «Где»:
    * url('zoom') → https://my.linkeon.io/profile?open=zoom (section-links.ts).
-   * Адрес не зависит ни от языка, ни от клиента: работает он везде.
+   * Адрес не зависит ни от языка, ни от клиента. Сборке из стора строку
+   * «Ссылка…» не отдаём вовсе — её вырезает renderArticle (render.ts).
    */
   url: (key: SectionKey) => string;
 }
