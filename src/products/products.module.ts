@@ -21,6 +21,8 @@ import { DomainsService } from './domains.service';
 import { ProductActionsService } from './product-actions.service';
 import { ProductLifecycleService } from './product-lifecycle.service';
 import { ProductLifecycleTool } from './product-lifecycle-tool';
+import { ProductKeysService } from './product-keys.service';
+import { ProductPurgeService } from './product-purge.service';
 
 @Module({
   imports: [CommonModule, MiscModule],
@@ -82,6 +84,12 @@ import { ProductLifecycleTool } from './product-lifecycle-tool';
     // ProductLifecycleTool никуда не экспортируется: его зовёт только
     // ProductToolService внутри этого же модуля.
     ProductLifecycleTool,
+    // Очередь 2: карточка ключей (её зовут инструмент и ручка отправки) и
+    // почасовой обход стирания. Без регистрации здесь @Optional-зависимости
+    // инструмента и контроллера молча остались бы пустыми — ассистент
+    // отвечал бы «смена ключей недоступна» при полностью выкаченном коде.
+    ProductKeysService,
+    ProductPurgeService,
   ],
   exports: [
     ProductsService,

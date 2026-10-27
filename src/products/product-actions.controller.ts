@@ -1,14 +1,16 @@
-import { BadRequestException, Body, ConflictException, Controller, Get, HttpCode, NotFoundException, NotImplementedException, Param, Post, UseGuards } from '@nestjs/common';
-import { IsBoolean, IsIn, IsObject, IsOptional } from 'class-validator';
+import { BadRequestException, Body, ConflictException, Controller, Get, HttpCode, NotFoundException, NotImplementedException, Optional, Param, Post, UseGuards } from '@nestjs/common';
+import { IsArray, IsBoolean, IsIn, IsObject, IsOptional, IsString } from 'class-validator';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { IpRateLimiter } from '../common/guards/ip-rate-limit';
 import { ProductActionsService, toView } from './product-actions.service';
 import { ProductLifecycleService } from './product-lifecycle.service';
+import { ProductKeysService } from './product-keys.service';
 
 export class SubmitActionDto {
   @IsOptional() @IsBoolean() confirm?: boolean;
   @IsOptional() @IsObject() set?: Record<string, string>;
+  @IsOptional() @IsArray() @IsString({ each: true }) remove?: string[];
   @IsOptional() @IsIn(['chat', 'cabinet', 'tma']) via?: 'chat' | 'cabinet' | 'tma';
 }
 
@@ -18,6 +20,10 @@ export class SubmitActionDto {
  * `products/:id/...` соседнего контроллера. Чужое действие — 404, а не 403:
  * не выдавать его существование. Значения ключей в ответ не попадают никогда —
  * ответ строится из toView, в котором их нет по построению.
+ *
+ * Ключи (`keys`) — `{set, remove}`: значения уходят в ProductKeysService и
+ * дальше только в коробку карточки; ответ — `toView`, в котором значений нет
+ * по построению.
  */
 @Controller('')
 @UseGuards(JwtGuard)
@@ -26,6 +32,7 @@ export class ProductActionsController {
     private readonly actions: ProductActionsService,
     private readonly lifecycle: ProductLifecycleService,
     private readonly limiter: IpRateLimiter,
+    @Optional() private readonly keys?: ProductKeysService,
   ) {}
 
   @Get('product-actions')
@@ -59,7 +66,8 @@ export class ProductActionsController {
     } else if (row.kind === 'create_bot') {
       await this.lifecycle.completeCreateBot({ userId: user.userId, actionId: id, set: body?.set ?? {}, via });
     } else if (row.kind === 'keys') {
-      throw new NotImplementedException('Это действие появится позже');
+      if (!this.keys) throw new NotImplementedException('Смена ключей сейчас недоступна');
+      await this.keys.complete({ userId: user.userId, actionId: id, set: body?.set ?? {}, remove: body?.remove ?? [], via });
     } else {
       // create_site, restore, revert, purge — журнальные записи итога, не
       // ожидающие карточки (см. CardKind в product-actions.service):
