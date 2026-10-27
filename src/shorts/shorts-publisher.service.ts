@@ -356,8 +356,9 @@ export class ShortsPublisherService implements OnModuleInit {
    *   keepAliveFenced сверяет оба жетона, а сессию загрузки сервис YouTube читает и пишет только
    *   с жетоном строки;
    * - записи — отказ, «исход неизвестен», набор (manual_pending), живость, итог ролика — идут с
-   *   условием на свой жетон и в чужое не попадают (исход superseded). Свою строку проигравшая
-   *   попытка отдаёт как отказ (refused), а итог ролика пишется, только если ролик тоже её.
+   *   условием на свой жетон и в чужое не попадают (исход superseded); «исход неизвестен» гасит
+   *   ролик по своей строке, без жетона ролика. Свою строку проигравшая попытка отдаёт как отказ
+   *   (refused), а итог ролика пишется, только если ролик тоже её.
    * Без жетона — только отметка вышедшего (published в recordSent): правда о вышедшем важнее.
    *
    * Жетон строки монотонен: счётчик строки растёт только при захвате, и retry его не обнуляет
@@ -365,7 +366,9 @@ export class ShortsPublisherService implements OnModuleInit {
    * (shorts.controller.ts) и leave (shorts-approval.service.ts; после leave ролик вернётся в
    * публикацию только через пересъёмку и новое одобрение). Совпадение жетона ролика у зависшей и
    * новой попытки даёт лишь продление живости или запись итога ролика, но не повторную
-   * отправку: отправки охраняет жетон строки. Зависшая попытка, прошедшая эти проверки по ролику,
+   * отправку: отправки охраняет жетон строки, а запись «исход неизвестен» гасит ролик по своей
+   * строке, даже если жетон ролика уже совпал у другой попытки (её устаревший finishAttempt мог
+   * вернуть ролик в approved посреди нашей отправки). Зависшая попытка, прошедшая эти проверки по ролику,
    * может и сама захватить освободившуюся строку площадки (захват смотрит только на статус, не на
    * то, кто её держал) и отправить свой снимок ролика — это одна отправка, без дубля, но, если
    * тем временем было leave (пересъёмка), это будет отправка уже прежней версии ролика.
@@ -404,28 +407,39 @@ export class ShortsPublisherService implements OnModuleInit {
         return 'superseded';
       }
       if (e instanceof TelegramOutcomeUnknown) {
-        // Строка и ролик — одним запросом: строка failed при ролике в publishing
-        // сторож вернул бы в approved, и повтор ушёл бы в канал сам. Оба — со своим
-        // жетоном, ролик — только вместе со своей строкой.
+        // Строка и ролик — одним запросом: строка failed при ролике в publishing или approved
+        // ушла бы в повтор (сторож или следующий тик), и пост ушёл бы в канал второй раз.
+        // Строка — со своим жетоном; ролик — без жетона ролика, но только вместе со своей строкой
+        // (EXISTS pub). Безопасно: строка своя — значит, площадку захватила эта попытка, и в канал,
+        // кроме неё, никто не шлёт. Ролик в approved при своей строке в publishing бывает только от
+        // устаревшего finishAttempt при обнулённом счётчике (жетон ролика совпал) — без этой записи
+        // следующий тик отправил бы пост снова. Ролик в publishing у другой попытки дальше в канал
+        // не пойдёт: её продление перед отправкой не пройдёт (ролик failed), а её finishAttempt
+        // после нашего failed — пустой. Запрос возвращает оба факта — для точного лога.
         const r = await this.pg.query(
           `WITH pub AS (
              UPDATE short_publication SET status = 'failed', last_error = $3, updated_at = now()
               WHERE short_id = $1 AND platform = $2 AND status = 'publishing' AND attempts = $5
               RETURNING 1
+           ),
+           vid AS (
+             UPDATE short_video SET status = 'failed', failed_from = 'publishing', last_error = $4,
+                    failure_notified = false, updated_at = now()
+              WHERE id = $1 AND status IN ('publishing', 'approved') AND EXISTS (SELECT 1 FROM pub)
+              RETURNING 1
            )
-           UPDATE short_video SET status = 'failed', failed_from = 'publishing', last_error = $4,
-                  failure_notified = false, updated_at = now()
-            WHERE id = $1 AND status = 'publishing' AND attempts = $6 AND EXISTS (SELECT 1 FROM pub)
-            RETURNING 1`,
-          [v.id, platform, message, `публикация: ${platform}: ${message}`.slice(0, 1000), fence, v.attempts],
+           SELECT (SELECT count(*) FROM pub)::int AS pub, (SELECT count(*) FROM vid)::int AS vid`,
+          [v.id, platform, message, `публикация: ${platform}: ${message}`.slice(0, 1000), fence],
         );
-        if (!r.rows.length) {
+        const { pub, vid } = r.rows[0];
+        if (!pub) {
           this.logger.warn(
-            `ролик ${v.id}, ${platform}: исход неизвестен, но строку или ролик уже держит другая попытка или сторож — ничего не записано (${e.causeMessage})`,
+            `ролик ${v.id}, ${platform}: исход неизвестен, но строку уже держит другая попытка или сторож — ничего не записано (${e.causeMessage})`,
           );
           return 'superseded';
         }
-        this.logger.error(`ролик ${v.id}, ${platform}: исход отправки неизвестен, автоповтора не будет — ${e.causeMessage}`);
+        const video = vid ? '' : '; ролик уже не в публикации — его статус не тронут';
+        this.logger.error(`ролик ${v.id}, ${platform}: исход отправки неизвестен, автоповтора не будет${video} — ${e.causeMessage}`);
         return 'unknown';
       }
       this.logger.error(`ролик ${v.id}, ${platform}: ${e?.message ?? e}`);
