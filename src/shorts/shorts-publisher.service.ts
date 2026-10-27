@@ -7,7 +7,7 @@ import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { buildYoutubeKeyboard } from './short-callback';
-import { STAND_MARK, clip } from './short-captions';
+import { STAND_MARK, clip, youtubeSafe } from './short-captions';
 import { isStand } from './short-env';
 import { downloadShortFile } from './short-files';
 import { SUPPORTED_PLATFORMS, ShortSettings, ShortsSettingsService } from './shorts-settings.service';
@@ -577,8 +577,9 @@ export class ShortsPublisherService {
     }
     const msg: any = await this.tg.sendMessage(
       chatId,
-      `${mark}${note ? `${note}\n\n` : ''}YouTube — заголовок:\n${yt.title}\n\nОписание:\n${yt.description}\n\nТеги: ${yt.tags.join(', ')}\n\n` +
-        'Когда выложите, нажмите кнопку и пришлите ссылку ответом.',
+      // < и > YouTube отверг бы (400) — заменяем на ёлочки; теги уже чистит tidyTags при сборке подписей.
+      `${mark}${note ? `${note}\n\n` : ''}YouTube — заголовок:\n${youtubeSafe(yt.title)}\n\nОписание:\n${youtubeSafe(yt.description)}\n\n` +
+        `Теги: ${yt.tags.join(', ')}\n\nКогда выложите, нажмите кнопку и пришлите ссылку ответом.`,
       { reply_markup: buildYoutubeKeyboard(v.id) },
     );
     return { status: 'manual_pending', externalId: String(msg.message_id), url: null };

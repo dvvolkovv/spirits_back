@@ -39,6 +39,14 @@ function withTail(body: string, tail: string, max: number): string {
   return `${clip(body, max - tail.length)}${tail}`;
 }
 
+/**
+ * YouTube отвергает `<` и `>` в заголовке и описании (400 — ролик не загрузится, и
+ * Studio при ручной выкладке их тоже не примет): заменяем на похожие одиночные ёлочки.
+ */
+export function youtubeSafe(s: string): string {
+  return s.replace(/</g, '‹').replace(/>/g, '›');
+}
+
 export function tidyTags(tags: string[]): string[] {
   const out: string[] = [];
   const seen = new Set<string>();

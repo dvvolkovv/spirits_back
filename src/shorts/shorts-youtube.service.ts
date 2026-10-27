@@ -4,7 +4,7 @@ import { decryptSecret, encryptSecret } from '../calendar/crypto';
 import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
-import { STAND_MARK } from './short-captions';
+import { STAND_MARK, youtubeSafe } from './short-captions';
 import { isStand, shortsEnabled } from './short-env';
 import { downloadShortFile } from './short-files';
 import { ShortsSettingsService } from './shorts-settings.service';
@@ -308,8 +308,9 @@ export class ShortsYoutubeService {
     }
 
     const meta: UploadMeta = {
-      title: yt.title,
-      description: yt.description,
+      // YouTube отверг бы < и > (400) — заменяем на ёлочки; теги чистит tidyTags при сборке подписей.
+      title: youtubeSafe(yt.title),
+      description: youtubeSafe(yt.description),
       tags: yt.tags ?? [],
       categoryId: YOUTUBE_CATEGORY_ID,
       language: v.lang || 'ru',
