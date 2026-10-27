@@ -2020,6 +2020,14 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-youtube.se
 
 Expected: PASS.
 
+**Поправки ревью качества задач 5–6 (27.10, сделаны отдельными коммитами; полный текст — в коде ветки):**
+- Адрес сессии пишется compare-and-set: `claimSession` — только в строку `publishing` без чужого адреса, иначе `YoutubeNotUploaded` «строку держит другая попытка» (сессия без байтов ролика не создаёт); `clearSession` стирает только свой адрес; `done(shortId, videoId, url)`. Так две попытки одного ролика (сторож вернул ролик в очередь, пока первая висела) не дают второго ролика на канале.
+- Скачивание из MinIO — со сроком `DOWNLOAD_TIMEOUT_MS` (3 мин, `abortSignal`); тест на сумму сроков до `keepAlive` меньше `STUCK_PUBLISHING_MINUTES`.
+- `revoke(reason, tokenEnc)` — только при совпадении `refresh_token_enc`: переподключение посреди загрузки не отзывается. Пропавший `CALENDAR_SECRET_KEY` — `YoutubeNotUploaded`, подключение не отзывается.
+- `exchangeCode`: `invalid_grant` → `YoutubeCodeRejected`; страница «Канал уже подключён» — только для него и только при подключении меньше 10 минут назад (бот молчит); иначе «Ссылка устарела». Прочие сбои подключения — `connectFailed`: лог, сообщение (не ждём), 502. Сообщение о подключении — `void say()`; при выключенном конвейере — предупреждение про `SHORTS_ENABLED`.
+- `youtubeOAuthConfig` без `PUBLIC_BASE_URL` — `null`: подставлять прод нельзя.
+- Тексты: `modeChanged` различает «канал не подключён», «доступ пропал», «YouTube не настроен»; `notifyUploaded` при «вручную» пишет без слова режима; `handleCommand` логирует сбой.
+
 ---
 
 ### Task 7: Адрес возврата Google
@@ -2319,8 +2327,9 @@ import { PENDING_UPLOAD_NOTE, ShortsYoutubeService, YoutubePlan } from './shorts
 
 ```ts
 import { YoutubeAuthError, YoutubeMaybeUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
-import { clip } from './youtube/youtube-http';
 ```
+
+`clip` второй раз не импортировать: он уже есть в публикаторе из `./short-captions` и режет по целым символам.
 
 2. После константы `STUCK_OTHER` добавить:
 
@@ -2350,16 +2359,20 @@ export const YOUTUBE_MAY_BE_OUT =
   ) {}
 ```
 
-4. В `publish()` блок YouTube заменить на:
+4. В `publish()` блок YouTube и следующую за ним строку `await this.settle(v, platforms);` заменить на:
 
 ```ts
+    let youtubeDone = false;
     if (platforms.includes('youtube') && telegramDone) {
       if (!(await this.keepAlive(v.id))) return;
       const out = await this.platform(v, 'youtube', () => this.toYoutube(v));
       if (out === 'unrecorded') return;
-      // Ссылку владельцу — только после записи published; про набор сервис молчит сам.
-      if (out === 'done') await this.youtube?.notifyUploaded(v.id);
+      youtubeDone = out === 'done';
     }
+    await this.settle(v, platforms);
+    // Ссылку владельцу — после записи и итога ролика, не задерживая публикацию:
+    // notifyUploaded не бросает, а про набор (manual_pending) молчит сам.
+    if (youtubeDone) void this.youtube?.notifyUploaded(v.id);
 ```
 
 5. Перед методом `youtubeKit` добавить:
@@ -2602,7 +2615,7 @@ import { ShortsYoutubeService } from './shorts-youtube.service';
         captions: { telegram: 't', vk: 'v', youtube: { title: 'T', description: 'D', tags: [] } },
       });
       await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'youtube', 'publishing')`, [v.id]);
-      const SESSION = 'https://upload.example/s1';
+      const SESSION = 'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=it1';
       const read = async () =>
         (await pool.query(`SELECT upload_session FROM short_publication WHERE short_id = $1 AND platform = 'youtube'`, [v.id])).rows[0].upload_session;
       let seen: string | null = null;
@@ -2614,6 +2627,27 @@ import { ShortsYoutubeService } from './shorts-youtube.service';
       expect(out.videoId).toBe('abcdefghijk');
       expect(seen).toBe(SESSION);
       expect(await read()).toBeNull();
+    });
+
+    it('отзыв доступа и сообщение о загрузке — SQL против живой схемы', async () => {
+      await pool.query(`INSERT INTO short_youtube_account (id, channel_id, refresh_token_enc) VALUES (1, 'UCx', $1)`, [encryptSecret('refresh-xyz')]);
+      const v = await insert({
+        status: 'publishing',
+        video_key: 'shorts/v/video.mp4',
+        captions: { telegram: 't', vk: 'v', youtube: { title: 'T', description: 'D', tags: [] } },
+      });
+      await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'youtube', 'publishing')`, [v.id]);
+      const a = service([reply(400, { error: 'invalid_grant', error_description: 'revoked' })]);
+      await a.svc.upload(v, 'unlisted', async () => true).catch(() => undefined);
+      const acc = await pool.query('SELECT status, last_error FROM short_youtube_account');
+      expect(acc.rows[0]).toEqual({ status: 'revoked', last_error: 'HTTP 400 invalid_grant: revoked' });
+      await pool.query(
+        `UPDATE short_publication SET status = 'published', url = 'https://youtube.com/shorts/abcdefghijk' WHERE short_id = $1`,
+        [v.id],
+      );
+      const b = service([]);
+      await b.svc.notifyUploaded(v.id);
+      expect(b.tg.sendMessage).toHaveBeenCalledWith(OWNER, 'Вышло на YouTube: https://youtube.com/shorts/abcdefghijk', expect.anything());
     });
   });
 ```
