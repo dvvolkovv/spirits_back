@@ -3,7 +3,8 @@ import { GrammyError, HttpError, InputFile } from 'grammy';
 import { performance } from 'perf_hooks';
 import { buildYoutubeKeyboard } from './short-callback';
 import { KEEPALIVE_MAX_LAG_MS, MAX_PUBLISH_ATTEMPTS, STUCK_PUBLISHING_MINUTES, ShortsPublisherService, YOUTUBE_MAY_BE_OUT } from './shorts-publisher.service';
-import { DOWNLOAD_TIMEOUT_MS, PENDING_UPLOAD_NOTE } from './shorts-youtube.service';
+import { DOWNLOAD_TIMEOUT_MS } from './short-files';
+import { PENDING_UPLOAD_NOTE } from './shorts-youtube.service';
 import { YoutubeAttemptSuperseded, YoutubeAuthError, YoutubeMaybeUploaded, YoutubeNotUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
 import { SEND_TIMEOUT_MS } from './youtube/youtube-upload';
 

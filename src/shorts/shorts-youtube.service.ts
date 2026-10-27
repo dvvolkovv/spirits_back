@@ -6,8 +6,9 @@ import { StorageService } from '../common/services/storage.service';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { STAND_MARK } from './short-captions';
 import { isStand, shortsEnabled } from './short-env';
+import { downloadShortFile } from './short-files';
 import { ShortsSettingsService } from './shorts-settings.service';
-import { ShortVideo, YoutubeMode, shortsBucket } from './shorts.types';
+import { ShortVideo, YoutubeMode } from './shorts.types';
 import {
   YoutubeAttemptSuperseded, YoutubeAuthError, YoutubeCodeRejected, YoutubeMaybeUploaded, YoutubeNotUploaded, YoutubeUploadExpired,
 } from './youtube/youtube-errors';
@@ -44,13 +45,6 @@ export type YoutubePlan = { kind: 'kit'; note: string | null } | { kind: 'upload
 
 /** К набору, когда у ролика жива сессия загрузки: прошлая загрузка могла дойти (спека, «Публикация», п. 7). */
 export const PENDING_UPLOAD_NOTE = 'Прошлая загрузка этого ролика на YouTube могла дойти — проверьте канал, прежде чем выкладывать вручную.';
-
-/**
- * Срок скачивания файла ролика из MinIO. Вместе с обновлением токена (15 с), вопросом о
- * сессии и её началом (по 30 с) — с запасом меньше порога сторожа публикатора
- * (STUCK_PUBLISHING_MINUTES): зависшая попытка не должна пережить возврат ролика в очередь.
- */
-export const DOWNLOAD_TIMEOUT_MS = 3 * 60 * 1000;
 
 /**
  * `/youtube [режим]` (и `/youtube@Бот`). null — не эта команда. arg пустой —
@@ -264,13 +258,10 @@ export class ShortsYoutubeService {
    * YoutubeUploadExpired: спросить не у кого, вслепую не грузим. Ответа нет —
    * YoutubeMaybeUploaded, адрес сессии остаётся для следующей попытки.
    *
-   * fence — жетон попытки: attempts, который вернул публикатору захват строки YouTube.
-   * Адрес сессии читается и пишется только с условием «строка в publishing и её attempts —
-   * этот жетон». Попытка, зависшая дольше порога сторожа, пока строку захватила новая, не
-   * берёт чужой адрес, не стирает его, не кладёт свой и не шлёт файл —
-   * YoutubeAttemptSuperseded, публикатор выходит молча. keepAlive перед файлом проверяет
-   * и ролик, и строку (и что продление не шло слишком долго) — false значит то же самое:
-   * файл не шлём, свой адрес остаётся для следующей попытки.
+   * fence — жетон строки YouTube (см. platform() в shorts-publisher.service.ts): адрес сессии
+   * читается и пишется, только пока строку держит эта попытка, иначе YoutubeAttemptSuperseded.
+   * keepAlive вызывается перед отправкой файла: вернул false — слать файл нельзя
+   * (YoutubeAttemptSuperseded), свой адрес сессии остаётся для следующей попытки.
    */
   async upload(
     v: ShortVideo,
@@ -297,7 +288,7 @@ export class ShortsYoutubeService {
     let video: Buffer;
     try {
       accessToken = await this.accessToken(cfg, acc, !!previous);
-      video = await this.download(v.videoKey);
+      video = await downloadShortFile(this.storage, v.videoKey);
     } catch (e: any) {
       // Прошлая загрузка ещё не проверена — сказать «ролика нет» нельзя (спека, «Публикация», п. 7).
       if (previous && !(e instanceof YoutubeAuthError)) {
@@ -399,17 +390,6 @@ export class ShortsYoutubeService {
    */
   private done(videoId: string, resumed: boolean): { videoId: string; url: string; resumed: boolean } {
     return { videoId, url: `https://youtube.com/shorts/${videoId}`, resumed };
-  }
-
-  /** Файл ролика из MinIO со сроком: зависшее скачивание не должно пережить порог сторожа публикатора. */
-  private async download(key: string): Promise<Buffer> {
-    const abort = new AbortController();
-    const timer = setTimeout(() => abort.abort(), DOWNLOAD_TIMEOUT_MS);
-    try {
-      return await this.storage.download({ bucket: shortsBucket(), key, abortSignal: abort.signal });
-    } finally {
-      clearTimeout(timer);
-    }
   }
 
   /** Адрес сессии ролика — только чтение (план публикации). Загрузка читает его через ownSession, с жетоном. */

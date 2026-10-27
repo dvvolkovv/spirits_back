@@ -244,8 +244,10 @@ export class ShortsController {
     const ownerNote = typeof note === 'string' && note.trim() ? appendOwnerNote(v.ownerNote, note) : null;
     const format = from != null ? (await this.settings.get()).format : null;
     if (target === 'approved') {
+      // Счётчик строки не обнуляем: это жетон попытки (platform() публикатора) — обнулённый, он
+      // совпал бы с жетоном зависшей прежней попытки. Бюджет попыток — счётчик ролика.
       await this.pg.query(
-        `UPDATE short_publication SET status = 'pending', attempts = 0, last_error = NULL, updated_at = now()
+        `UPDATE short_publication SET status = 'pending', last_error = NULL, updated_at = now()
           WHERE short_id = $1 AND status = 'failed'`,
         [id],
       );

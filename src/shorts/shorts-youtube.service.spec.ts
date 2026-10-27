@@ -1,7 +1,8 @@
 import { Logger } from '@nestjs/common';
 import { decryptSecret, encryptSecret } from '../calendar/crypto';
 import { STUCK_PUBLISHING_MINUTES } from './shorts-publisher.service';
-import { DOWNLOAD_TIMEOUT_MS, PENDING_UPLOAD_NOTE, ShortsYoutubeService, connectPage, parseYoutubeCommand } from './shorts-youtube.service';
+import { DOWNLOAD_TIMEOUT_MS } from './short-files';
+import { PENDING_UPLOAD_NOTE, ShortsYoutubeService, connectPage, parseYoutubeCommand } from './shorts-youtube.service';
 import { YoutubeAttemptSuperseded, YoutubeAuthError, YoutubeMaybeUploaded, YoutubeNotUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
 import { HttpRequest, HttpResponse } from './youtube/youtube-http';
 import { verifyState } from './youtube/youtube-state';
