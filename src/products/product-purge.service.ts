@@ -12,8 +12,20 @@ import { PURGED_TEXT, SLUG_RE } from './provisioning.service';
  * час после срока. Первый обход — через час после старта, а не на старте:
  * выкат сервера идёт раньше выката агента машины (deploy.sh, PHASE 2 и 4), и
  * обход на старте отдал бы purge агенту, который его ещё не знает.
+ *
+ * Тот же час после КАЖДОГО рестарта отодвигал бы и стирание ключей — а
+ * решение владельца «стирать ключи сразу после срока», и выкаты идут
+ * несколько раз в день. Поэтому через WIPE_FIRST_DELAY_MS после старта —
+ * разовое стирание ключей и текстов на сервере (wipeExpired), и только оно:
+ * машины оно не касается, и довод выше к нему не относится. Постановка purge
+ * и стирание резервных копий остаются на часовом обходе.
  */
 export const PURGE_TICK_MS = 60 * 60 * 1000;
+/**
+ * Не на самом старте: в те же секунды ProductsService.onModuleInit накатывает
+ * миграции продуктов, а стиранию ключей минуты не важны — важны часы.
+ */
+export const WIPE_FIRST_DELAY_MS = 5 * 60 * 1000;
 /** Тот же потолок, что у сна удалённого (queueSleepForDeleted). */
 const PURGE_FAIL_CAP = 3;
 
@@ -93,6 +105,7 @@ function fsCode(e: any): string {
 export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(ProductPurgeService.name);
   private timer?: NodeJS.Timeout;
+  private firstWipeTimer?: NodeJS.Timeout;
   /**
    * Разовые предупреждения на процесс — тот же приём, что warnedSleepCap в
    * product-lifecycle.service.ts: подсказка живому человеку в логе, на
@@ -103,20 +116,43 @@ export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
    * Обход идёт — следующий пропускается. Час на обход с запасом, но копия
    * на медленном диске или база под замком могут его растянуть, и два
    * обхода наперегонки стирали бы одну копию и ставили одно задание дважды.
+   * Тот же флаг держит и раннее стирание ключей (wipeAfterStart): два
+   * стирания ключей наперегонки переписывали бы одни строки под замками.
    */
   private running = false;
 
   constructor(private readonly pg: PgService) {}
 
   onModuleInit() {
+    this.firstWipeTimer = setTimeout(() => void this.wipeAfterStart(), WIPE_FIRST_DELAY_MS);
     this.timer = setInterval(() => void this.tick(), PURGE_TICK_MS);
     // unref, иначе таймер держит процесс и jest не завершается (тот же приём,
     // что у таймеров product-lifecycle.service.ts).
+    this.firstWipeTimer.unref?.();
     this.timer.unref?.();
   }
 
   onModuleDestroy() {
+    if (this.firstWipeTimer) clearTimeout(this.firstWipeTimer);
     if (this.timer) clearInterval(this.timer);
+  }
+
+  /**
+   * Разовое стирание ключей вскоре после старта — только wipeExpired (см.
+   * WIPE_FIRST_DELAY_MS). Под тем же флагом, что обход: идёт обход — ключи
+   * сотрёт он, а раннее стирание пропускается.
+   */
+  async wipeAfterStart(): Promise<void> {
+    if (this.running) {
+      this.logger.warn('обход стирания уже идёт — раннее стирание ключей пропущено: ключи сотрёт он');
+      return;
+    }
+    this.running = true;
+    try {
+      await this.safe('стирание ключей после срока', () => this.wipeExpired());
+    } finally {
+      this.running = false;
+    }
   }
 
   /**
@@ -126,7 +162,7 @@ export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
    */
   async tick(): Promise<void> {
     if (this.running) {
-      this.logger.warn('прошлый обход стирания ещё идёт — этот пропущен');
+      this.logger.warn('прошлый обход стирания или раннее стирание ключей ещё идёт — этот обход пропущен');
       return;
     }
     this.running = true;
