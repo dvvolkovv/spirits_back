@@ -56,6 +56,7 @@ export const axiosHttp: Http = async (req) => {
     });
     return { status: r.status, headers: r.headers as Record<string, any>, data: r.data };
   } catch (e: any) {
+    if (abort.signal.aborted) throw new Error(`общий срок ${req.timeout} мс истёк`);
     // AxiosError несёт config — форму с client_secret и refresh-токеном, Bearer, адрес сессии.
     // Наружу — только код и сообщение: они уходят в логи, в last_error и владельцу.
     throw new Error(clip([e?.code, e?.message].filter(Boolean).join(': ') || 'сетевая ошибка', 200));

@@ -17,7 +17,7 @@ export interface UploadMeta {
 const short = (e: any): string => clip(String(e?.message ?? e), 200);
 
 /** Адрес сессии — только https на *.googleapis.com: дальше на него уходят файл и Bearer. */
-function isSessionUrl(location: unknown): location is string {
+export function isSessionUrl(location: unknown): location is string {
   if (typeof location !== 'string' || !location) return false;
   try {
     const u = new URL(location);
@@ -86,6 +86,7 @@ const refused = (status: number): boolean => status >= 400 && status < 500 && st
  * 429, 5xx — исход неизвестен (YoutubeMaybeUploaded): решает вопрос о сессии.
  */
 export async function sendFile(http: Http, sessionUrl: string, accessToken: string, body: Buffer): Promise<string> {
+  if (!isSessionUrl(sessionUrl)) throw new YoutubeNotUploaded('адрес сессии не на googleapis.com — файл не отправляю');
   let r: HttpResponse;
   try {
     r = await http({
@@ -121,6 +122,8 @@ export type UploadState =
  * - прочее и обрыв — YoutubeMaybeUploaded: ответа нет, решать нельзя.
  */
 export async function checkUpload(http: Http, sessionUrl: string, accessToken: string, size: number): Promise<UploadState> {
+  // негодный адрес — спросить не у кого: дальше набор с предупреждением
+  if (!isSessionUrl(sessionUrl)) return { state: 'gone' };
   let r: HttpResponse;
   try {
     r = await http({
