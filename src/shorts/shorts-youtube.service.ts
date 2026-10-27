@@ -111,7 +111,7 @@ export class ShortsYoutubeService {
     };
   }
 
-  /** Ссылка на вход для владельца; null — на этой среде нет клиента OAuth. */
+  /** Ссылка на вход для владельца; null — на этой среде не настроен клиент OAuth (id, секрет или PUBLIC_BASE_URL). */
   connectUrl(chatId: number): string | null {
     const cfg = youtubeOAuthConfig();
     return cfg ? authorizeUrl(cfg, signState(cfg.clientSecret, cfg.redirectUri, chatId)) : null;
@@ -147,7 +147,7 @@ export class ShortsYoutubeService {
   /** Адрес возврата Google: проверить state, обменять код, запомнить канал, сказать владельцу. */
   async completeConnect(q: { code?: string; state?: string; error?: string }): Promise<ConnectPage> {
     const cfg = youtubeOAuthConfig();
-    if (!cfg) return connectPage(503, 'YouTube не настроен', 'На этом сервере нет клиента OAuth YouTube.');
+    if (!cfg) return connectPage(503, 'YouTube не настроен', 'На этом сервере не настроен клиент OAuth YouTube: нужны YOUTUBE_OAUTH_CLIENT_ID, YOUTUBE_OAUTH_CLIENT_SECRET и PUBLIC_BASE_URL.');
     if (q.error) return connectPage(200, 'Подключение отменено', 'Канал не подключён. Чтобы попробовать снова, пришлите боту /youtube.');
     const st = verifyState(cfg.clientSecret, cfg.redirectUri, q.state);
     const owner = approverChatId();
@@ -165,6 +165,7 @@ export class ShortsYoutubeService {
         if (acc?.status === 'connected' && acc.connectedAt && Date.now() - acc.connectedAt.getTime() < RECONNECT_GRACE_MS) {
           return connectPage(200, 'Канал уже подключён', `Канал «${acc.channelTitle ?? acc.channelId}» подключён. Вкладку можно закрыть.`);
         }
+        this.logger.warn('YouTube: Google отверг код входа, недавнего подключения нет — страница «Ссылка устарела»');
         return connectPage(400, 'Ссылка устарела', 'Код Google уже использован или устарел. Пришлите боту /youtube и откройте новую ссылку.');
       }
       return this.connectFailed(st.chatId, e);
@@ -281,8 +282,9 @@ export class ShortsYoutubeService {
       privacy,
     };
     const sessionUrl = await startUpload(this.http, accessToken, meta, video.length);
-    // Сессия без байтов ролика не создаёт: если строку держит другая попытка — бросить безопасно.
-    if (!(await this.claimSession(v.id, sessionUrl))) throw new YoutubeNotUploaded('строку YouTube держит другая попытка — файл не отправляю');
+    // Сессия без байтов ролика не создаёт, но строку держит другая попытка — её исход неизвестен:
+    // «ролика нет» сказать нельзя, иначе на последней попытке ушёл бы набор и ручная выкладка дала бы дубль.
+    if (!(await this.claimSession(v.id, sessionUrl))) throw new YoutubeMaybeUploaded('строку YouTube держит другая попытка — исход её загрузки неизвестен');
     if (!(await keepAlive())) throw new YoutubeNotUploaded('ролик ушёл из publishing до отправки файла — не отправляю');
     try {
       return await this.done(v.id, await sendFile(this.http, sessionUrl, accessToken, video), sessionUrl);
@@ -325,8 +327,8 @@ export class ShortsYoutubeService {
     }
   }
 
-  /** После записи published: ссылка владельцу; при «по ссылке» — подсказка про «публично». Набор молчит: строки published нет. */
-  async notifyUploaded(shortId: string): Promise<void> {
+  /** После записи published: ссылка владельцу; доступ — тот, с которым грузили; при «по ссылке» — подсказка про «публично». */
+  async notifyUploaded(shortId: string, privacy: 'unlisted' | 'public'): Promise<void> {
     try {
       const r = await this.pg.query(
         `SELECT url FROM short_publication WHERE short_id = $1 AND platform = 'youtube' AND status = 'published'`,
@@ -334,10 +336,8 @@ export class ShortsYoutubeService {
       );
       const url = r.rows[0]?.url;
       if (!url) return;
-      const mode = (await this.settings.get()).youtubeMode;
-      const hint = mode === 'unlisted' ? '\nЕсли ролик открывается и не стал приватным — /youtube публично.' : '';
-      const words = mode === 'manual' ? '' : ` (${MODE_WORDS[mode]})`;
-      await this.say(approverChatId(), `Вышло на YouTube${words}: ${url}${hint}`);
+      const hint = privacy === 'unlisted' ? '\nЕсли ролик открывается и не стал приватным — /youtube публично.' : '';
+      await this.say(approverChatId(), `Вышло на YouTube (${MODE_WORDS[privacy]}): ${url}${hint}`);
     } catch (e: any) {
       this.logger.warn(`ролик ${shortId}: сообщение о YouTube не отправлено: ${e?.message ?? e}`);
     }
@@ -399,7 +399,7 @@ export class ShortsYoutubeService {
 
   private async statusText(chatId: number): Promise<string> {
     const link = this.connectUrl(chatId);
-    if (!link) return 'YouTube не настроен на этом сервере: нет YOUTUBE_OAUTH_CLIENT_ID и YOUTUBE_OAUTH_CLIENT_SECRET в .env.';
+    if (!link) return 'YouTube не настроен на этом сервере: нужны YOUTUBE_OAUTH_CLIENT_ID, YOUTUBE_OAUTH_CLIENT_SECRET и PUBLIC_BASE_URL в .env.';
     const [acc, s] = await Promise.all([this.account(), this.settings.get()]);
     const howTo =
       'Подключить: откройте ссылку (действует 15 минут), войдите в Google и выберите канал Linkeon. ' +
