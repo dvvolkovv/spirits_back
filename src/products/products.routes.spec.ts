@@ -15,6 +15,8 @@ import { RunnerController } from './runner.controller';
 import { HostController } from './host.controller';
 import { ProductActionsController, SubmitActionDto } from './product-actions.controller';
 import { ProductsModule } from './products.module';
+import { ProductKeysService } from './product-keys.service';
+import { ProductPurgeService } from './product-purge.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
 import { RunnerGuard } from './runner.guard';
@@ -203,6 +205,13 @@ describe('регистрация в модуле', () => {
     // кабинета и раннера.
     expect(controllers).toContain(ProductsController);
     expect(controllers).toContain(RunnerController);
+  });
+
+  it('смена ключей и обход стирания зарегистрированы в ProductsModule', () => {
+    // @Optional-зависимость инструмента и контроллера без регистрации молча
+    // пуста: тесты зелёные, а ассистент отвечает «смена ключей недоступна».
+    const providers = Reflect.getMetadata(MODULE_METADATA.PROVIDERS, ProductsModule) ?? [];
+    expect(providers).toEqual(expect.arrayContaining([ProductKeysService, ProductPurgeService]));
   });
 });
 
