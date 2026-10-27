@@ -256,6 +256,20 @@ describe('ссылки на разделы', () => {
     expect(KEYS.filter((k) => !s.includes(`${sectionUrl(k)})`))).toEqual([]);
   });
 
+  // Обратная проверка: адрес в блоке — только из таблицы section-links.ts.
+  // Путь, набранный мимо неё, дал бы ссылку, по которой кабинет откроет не ту
+  // карточку, — а таблицу сверяет с кабинетом общий сторож (section-links.spec.ts).
+  it.each([...SUPPORTED_LANGUAGES])('%s: любой адрес в блоке и в блоке Telegram — из таблицы разделов', (lang) => {
+    const known = new Set(KEYS.map(sectionUrl));
+    const found = [
+      platformGuide(lang, { helpTool: HELP, initiative: true }),
+      platformGuide(lang, { helpTool: HELP, initiative: true, store: true }),
+      telegramPlatformGuide(lang, { helpTool: HELP, initiative: true }),
+    ].flatMap((t) => [...t.matchAll(/https?:\/\/[^\s)»,;]+/g)].map((m) => m[0]));
+    expect(found.length).toBeGreaterThan(0);
+    expect(found.filter((u) => !known.has(u))).toEqual([]);
+  });
+
   // Сборка из стора — Flutter-приложение: ссылку оно открывает во внешнем
   // браузере, а на страницах кабинета — баланс, покупка токенов и «Скачать
   // APK» (правило Apple 3.1.1; решения владельца — у platformSections). Адресов

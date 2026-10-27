@@ -135,6 +135,14 @@ describe('ссылки на разделы в справке', () => {
     expect(problems).toEqual([]);
   });
 
+  // Проверки выше идут по статьям, а не по таблице: статью переименовали или
+  // убрали — её строка в ARTICLE_LINKS молча перестала бы проверяться.
+  it('в таблице ссылок статей — только существующие статьи и ключи разделов', () => {
+    const ids = new Set(KB_ARTICLES.map((a) => a.id));
+    expect(Object.keys(ARTICLE_LINKS).filter((id) => !ids.has(id))).toEqual([]);
+    expect(Object.values(ARTICLE_LINKS).flat().filter((k) => !(k in SECTION_PATHS))).toEqual([]);
+  });
+
   it('статьи вне таблицы — без строки «Ссылка» (таблица выше — полный перечень)', () => {
     expect(all.filter((v) => !ARTICLE_LINKS[v.id] && /^Ссылка/m.test(v.text)).map(where)).toEqual([]);
   });

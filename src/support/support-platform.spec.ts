@@ -1,5 +1,7 @@
 import { SupportService } from './support.service';
 import { linksRule, platformSections } from '../chat/platform-guide';
+import { SECTION_PATHS, sectionUrl, type SectionKey } from '../platform-kb/section-links';
+import { SUPPORTED_LANGUAGES } from '../common/services/language.service';
 
 // Для теста учёта вызовов справки — нужен SupportService с events-моком; не
 // используем service()/prompt() ниже, те не передают EventsService совсем.
@@ -46,6 +48,22 @@ describe('ИИ-поддержка знает разделы платформы',
     expect(p).toContain(linksRule('plain'));
     expect(p).not.toContain(linksRule('markdown'));
     expect(p).toContain('https://my.linkeon.io/profile?open=zoom');
+  });
+
+  // Обратная проверка: адрес в промпте поддержки — только из таблицы
+  // section-links.ts, которую сверяют с кабинетом (section-links.spec.ts).
+  it('любой адрес в промпте поддержки — из таблицы разделов', () => {
+    const known = new Set((Object.keys(SECTION_PATHS) as SectionKey[]).map(sectionUrl));
+    const service = new SupportService({ query: async () => ({ rows: [] }) } as any);
+    const found: string[] = [];
+    for (const language of SUPPORTED_LANGUAGES) {
+      for (const storeBuild of [false, true]) {
+        const p: string = (service as any).buildSystemPrompt({ language }, undefined, { storeBuild });
+        found.push(...[...p.matchAll(/https?:\/\/[^\s)»,;]+/g)].map((m) => m[0]));
+      }
+    }
+    expect(found.length).toBeGreaterThan(0);
+    expect(found.filter((u) => !known.has(u))).toEqual([]);
   });
 });
 
