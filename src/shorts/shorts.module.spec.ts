@@ -21,6 +21,8 @@ import { ShortsTopicService } from './shorts-topic.service';
 import { ShortsWriterService } from './shorts-writer.service';
 import { ShortsController } from './shorts.controller';
 import { ShortsCron } from './shorts.cron';
+import { ShortsYoutubeController } from './shorts-youtube.controller';
+import { ShortsYoutubeService } from './shorts-youtube.service';
 
 jest.setTimeout(120000);
 
@@ -49,6 +51,7 @@ describe('DI-граф роликов', () => {
     for (const cls of [
       ShortsSchemaService, ShortsSettingsService, ShortsTopicService, ShortsDirectorService, ShortsWriterService,
       ShortsApprovalService, ShortsPublisherService, ShortsCron, ShortsController,
+      ShortsYoutubeService, ShortsYoutubeController,
     ]) {
       expect(find(container, cls)).toBeInstanceOf(cls as any);
     }
@@ -58,6 +61,15 @@ describe('DI-граф роликов', () => {
     const { AppModule } = require('../app.module');
     const container = await buildGraph(AppModule);
     expect(find(container, TgBotService).shortsApproval).toBeInstanceOf(ShortsApprovalService);
+  });
+
+  it('бот и публикатор получают сервис YouTube — @Optional не прячет разрыв графа', async () => {
+    const { AppModule } = require('../app.module');
+    const container = await buildGraph(AppModule);
+    const youtube = find(container, ShortsYoutubeService);
+    expect(youtube).toBeInstanceOf(ShortsYoutubeService);
+    expect(find(container, TgBotService).shortsYoutube).toBe(youtube);
+    expect(find(container, ShortsPublisherService).youtube).toBe(youtube);
   });
 
   it('без AgentsModule граф роликов ломается — проверка не резиновая', async () => {

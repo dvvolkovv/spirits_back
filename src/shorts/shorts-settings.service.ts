@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { isValidVoice } from '../speech/voices';
-import { FORMATS, ShortFormat, ShortPlatform } from './shorts.types';
+import { FORMATS, ShortFormat, ShortPlatform, YOUTUBE_MODES, YoutubeMode } from './shorts.types';
 
 export interface ShortSettings {
   /** ISO-дни: 1 — понедельник … 7 — воскресенье. */
@@ -19,6 +19,8 @@ export interface ShortSettings {
   format: ShortFormat;
   /** Предел секунд Omni на ролик со всеми пересъёмками (спека сценок, «Отказы»). */
   maxOmniSeconds: number;
+  /** YouTube: manual — набор владельцу, unlisted («по ссылке») / public («публично») — загрузка с этим доступом (спека YouTube). */
+  youtubeMode: YoutubeMode;
 }
 
 export const SETTINGS_DEFAULTS: ShortSettings = {
@@ -31,6 +33,7 @@ export const SETTINGS_DEFAULTS: ShortSettings = {
   narratorVoice: 'alena',
   format: 'skit',
   maxOmniSeconds: 48,
+  youtubeMode: 'manual',
 };
 
 export type ShortSettingsPatch = Partial<ShortSettings>;
@@ -48,6 +51,7 @@ const COLUMNS: Record<keyof ShortSettings, string> = {
   narratorVoice: 'narrator_voice',
   format: 'format',
   maxOmniSeconds: 'max_omni_seconds',
+  youtubeMode: 'youtube_mode',
 };
 
 const intIn = (v: any, min: number, max: number): boolean => Number.isInteger(v) && v >= min && v <= max;
@@ -109,6 +113,15 @@ export function validateSettingsPatch(body: any): ShortSettingsPatch {
     if (!intIn(b.maxOmniSeconds, 8, 400)) throw new Error('maxOmniSeconds — 8–400 секунд Omni на ролик (клип — 8 с)');
     p.maxOmniSeconds = b.maxOmniSeconds;
   }
+  if (b.youtubeMode !== undefined) {
+    // Включает unlisted/public только владелец командой /youtube в боте (settings.update()
+    // напрямую, мимо этой проверки) — здесь, через админку, доступен только аварийный откат на manual.
+    if (b.youtubeMode === 'unlisted' || b.youtubeMode === 'public') {
+      throw new Error('youtubeMode: загрузку на YouTube включает только владелец командой /youtube в боте; через админку можно только manual');
+    }
+    if (b.youtubeMode !== 'manual') throw new Error('youtubeMode — только manual (набор); unlisted и public включает владелец командой /youtube');
+    p.youtubeMode = b.youtubeMode;
+  }
   return p;
 }
 
@@ -117,7 +130,7 @@ export class ShortsSettingsService {
   constructor(private readonly pg: PgService) {}
 
   async get(): Promise<ShortSettings> {
-    // Все колонки: сорвавшийся накат 002 не должен ронять публикацию и одобрение —
+    // Все колонки: сорвавшийся накат 002 или 003 не должен ронять публикацию и одобрение —
     // без новых колонок их поля возьмутся по умолчанию.
     const r = await this.pg.query(`SELECT * FROM short_settings WHERE id = 1`);
     const row = r.rows[0];
@@ -132,6 +145,7 @@ export class ShortsSettingsService {
       narratorVoice: row.narrator_voice || SETTINGS_DEFAULTS.narratorVoice,
       format: row.format === 'chat' ? 'chat' : SETTINGS_DEFAULTS.format,
       maxOmniSeconds: Number(row.max_omni_seconds ?? SETTINGS_DEFAULTS.maxOmniSeconds),
+      youtubeMode: YOUTUBE_MODES.includes(row.youtube_mode) ? row.youtube_mode : SETTINGS_DEFAULTS.youtubeMode,
     };
   }
 

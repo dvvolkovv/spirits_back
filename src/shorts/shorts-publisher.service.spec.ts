@@ -1,7 +1,10 @@
 import { Logger } from '@nestjs/common';
 import { GrammyError, HttpError, InputFile } from 'grammy';
 import { buildYoutubeKeyboard } from './short-callback';
-import { MAX_PUBLISH_ATTEMPTS, STUCK_PUBLISHING_MINUTES, ShortsPublisherService } from './shorts-publisher.service';
+import { MAX_PUBLISH_ATTEMPTS, STUCK_PUBLISHING_MINUTES, ShortsPublisherService, YOUTUBE_MAY_BE_OUT } from './shorts-publisher.service';
+import { PENDING_UPLOAD_NOTE } from './shorts-youtube.service';
+import { YoutubeAuthError, YoutubeMaybeUploaded, YoutubeNotUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
+import { SEND_TIMEOUT_MS } from './youtube/youtube-upload';
 
 const ID = '6f1c2a9e-0d4b-4c3e-9a51-3b2f7c8d9e10';
 const OWNER = 777;
@@ -85,7 +88,7 @@ function fakeDb(over: Record<string, any> = {}, opts: FakeOpts = {}) {
   return { query, v, pubs };
 }
 
-function setup(db = fakeDb(), channel: string | null = '-1003290853538', platforms: string[] = ['telegram', 'youtube']) {
+function setup(db = fakeDb(), channel: string | null = '-1003290853538', platforms: string[] = ['telegram', 'youtube'], youtube: any = undefined) {
   const tg = {
     // Бот поднят: TgGrammyClient создаёт его в onModuleInit, только если задан TG_BOT_TOKEN.
     getBot: jest.fn((): any => ({})),
@@ -95,7 +98,7 @@ function setup(db = fakeDb(), channel: string | null = '-1003290853538', platfor
   };
   const storage = { download: jest.fn(async () => Buffer.from('bytes')) };
   const settings = { get: jest.fn(async () => ({ platforms, tgChannelChatId: channel })) };
-  const svc = new ShortsPublisherService({ query: db.query } as any, tg as any, storage as any, settings as any);
+  const svc = new ShortsPublisherService({ query: db.query } as any, tg as any, storage as any, settings as any, youtube);
   return { svc, tg, storage, db };
 }
 
@@ -355,5 +358,183 @@ describe('ShortsPublisherService.rearmStuck', () => {
     const { s, params } = await run();
     expect(params[2]).toMatch(/отправка оборвалась/);
     expect(s).toContain("WHEN v.attempts >= $4 THEN 'публикация оборвалась, попыток было ' || v.attempts || ' — процесс перезапускался посреди отправки'");
+  });
+});
+
+describe('ShortsPublisherService.publish — YouTube загрузкой', () => {
+  const youtube = (plan: any) => ({
+    uploadPlan: jest.fn(async () => plan),
+    upload: jest.fn(),
+    notifyUploaded: jest.fn(async () => undefined),
+  });
+  const UPLOAD = { kind: 'upload', privacy: 'unlisted' };
+  const kitText = (tg: any): string => (tg.sendMessage.mock.calls[0] as any[])[1];
+
+  it('загрузка: строка youtube published с id и ссылкой, владельцу — сообщение, набора нет', async () => {
+    const yt = youtube(UPLOAD);
+    yt.upload.mockResolvedValue({ videoId: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk', resumed: false });
+    const { svc, tg, db } = setup(fakeDb(), '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(yt.uploadPlan).toHaveBeenCalledWith(ID);
+    expect(yt.notifyUploaded).toHaveBeenCalledWith(ID, 'unlisted');
+    expect(yt.upload).toHaveBeenCalledWith(expect.objectContaining({ id: ID }), 'unlisted', expect.any(Function));
+    expect(db.pubs.get('youtube')).toMatchObject({ status: 'published', external_id: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk' });
+    expect(tg.sendDocument).not.toHaveBeenCalled();
+    expect(db.v.status).toBe('published');
+  });
+
+  it('продление живости из загрузки — то же, что у публикатора', async () => {
+    const yt = youtube(UPLOAD);
+    yt.upload.mockImplementation(async (_v: any, _p: any, keepAlive: () => Promise<boolean>) => {
+      expect(await keepAlive()).toBe(true);
+      return { videoId: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk', resumed: false };
+    });
+    const { svc, db } = setup(fakeDb(), '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(db.v.status).toBe('published');
+  });
+
+  it('план — набор: заметка плана первой строкой, загрузки нет', async () => {
+    const yt = youtube({ kind: 'kit', note: 'Канал YouTube не подключён — набор вместо загрузки. Подключить: /youtube' });
+    const { svc, tg, db } = setup(fakeDb(), '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(yt.upload).not.toHaveBeenCalled();
+    expect(tg.sendDocument).toHaveBeenCalledTimes(1);
+    expect(kitText(tg).startsWith('Канал YouTube не подключён — набор вместо загрузки. Подключить: /youtube\n\nYouTube — заголовок:\nYT-заголовок')).toBe(true);
+    expect(yt.notifyUploaded).not.toHaveBeenCalled();
+    expect(db.pubs.get('youtube')).toMatchObject({ status: 'manual_pending' });
+  });
+
+  it('доступ пропал при загрузке — набор с причиной, ролик опубликован', async () => {
+    const yt = youtube(UPLOAD);
+    yt.upload.mockRejectedValue(new YoutubeAuthError('HTTP 400 invalid_grant: Token has been expired or revoked.'));
+    const { svc, tg, db } = setup(fakeDb(), '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(tg.sendDocument).toHaveBeenCalledTimes(1);
+    expect(kitText(tg)).toMatch(/^Доступ к каналу YouTube пропал \(HTTP 400 invalid_grant: Token has been expired or revoked\.\) — набор вместо загрузки\. Переподключить: \/youtube/);
+    expect(db.pubs.get('youtube')).toMatchObject({ status: 'manual_pending' });
+    expect(db.v.status).toBe('published');
+  });
+
+  it('отказ YouTube не на последней попытке — строка failed, ролик в approved, набора нет', async () => {
+    const yt = youtube(UPLOAD);
+    yt.upload.mockRejectedValue(new YoutubeNotUploaded('начало загрузки: HTTP 403 quotaExceeded: quota', 403));
+    const { svc, tg, db } = setup(fakeDb(), '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(tg.sendDocument).not.toHaveBeenCalled();
+    expect(db.pubs.get('telegram')).toMatchObject({ status: 'published' });
+    expect(db.pubs.get('youtube')).toMatchObject({ status: 'failed', last_error: 'начало загрузки: HTTP 403 quotaExceeded: quota' });
+    expect(db.v.status).toBe('approved');
+  });
+
+  it('отказ YouTube на последней попытке — набор с причиной, ролик опубликован', async () => {
+    const yt = youtube(UPLOAD);
+    yt.upload.mockRejectedValue(new YoutubeNotUploaded('начало загрузки: HTTP 403 quotaExceeded: quota', 403));
+    const { svc, tg, db } = setup(fakeDb({ attempts: MAX_PUBLISH_ATTEMPTS - 1 }), '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(tg.sendDocument).toHaveBeenCalledTimes(1);
+    expect(kitText(tg)).toMatch(/^Не смог загрузить на YouTube: начало загрузки: HTTP 403 quotaExceeded: quota\. Выложите вручную\./);
+    expect(db.v.status).toBe('published');
+  });
+
+  it('исход загрузки неизвестен не на последней попытке — повтор, набора нет', async () => {
+    const yt = youtube(UPLOAD);
+    yt.upload.mockRejectedValue(new YoutubeMaybeUploaded('отправка файла оборвалась: socket hang up'));
+    const { svc, tg, db } = setup(fakeDb(), '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(tg.sendDocument).not.toHaveBeenCalled();
+    expect(db.pubs.get('youtube').last_error).toMatch(/спрошу YouTube о прошлой загрузке/);
+    expect(db.v.status).toBe('approved');
+  });
+
+  it('исход неизвестен на последней попытке — набора нет, ролик failed с причиной про безопасный retry', async () => {
+    const yt = youtube(UPLOAD);
+    yt.upload.mockRejectedValue(new YoutubeMaybeUploaded('отправка файла оборвалась: socket hang up'));
+    const { svc, tg, db } = setup(fakeDb({ attempts: MAX_PUBLISH_ATTEMPTS - 1 }), '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(tg.sendDocument).not.toHaveBeenCalled();
+    expect(db.pubs.get('youtube')).toMatchObject({ status: 'failed' });
+    expect(db.v.status).toBe('failed');
+    expect(db.v.last_error).toContain(YOUTUBE_MAY_BE_OUT);
+  });
+
+  it('доступ пропал при живой сессии — к набору предупреждение проверить канал', async () => {
+    const yt = youtube(UPLOAD);
+    yt.upload.mockRejectedValue(new YoutubeAuthError('HTTP 400 invalid_grant', true));
+    const { svc, tg } = setup(fakeDb(), '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(kitText(tg)).toContain(PENDING_UPLOAD_NOTE);
+  });
+
+  it('YouTube не помнит прошлую загрузку — набор с предупреждением, ролик опубликован', async () => {
+    const yt = youtube(UPLOAD);
+    yt.upload.mockRejectedValue(new YoutubeUploadExpired('YouTube уже не помнит прошлую загрузку этого ролика'));
+    const { svc, tg, db } = setup(fakeDb(), '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(kitText(tg).startsWith(`YouTube уже не помнит прошлую загрузку этого ролика — набор вместо загрузки.\n${PENDING_UPLOAD_NOTE}`)).toBe(true);
+    expect(db.v.status).toBe('published');
+  });
+
+  it('срок выгрузки файла с запасом меньше порога сторожа: живую выгрузку сторож не заберёт', () => {
+    expect(SEND_TIMEOUT_MS + 60_000).toBeLessThan(STUCK_PUBLISHING_MINUTES * 60_000);
+  });
+
+  it('Telegram не вышел — к YouTube не идём', async () => {
+    const yt = youtube(UPLOAD);
+    const { svc, db } = setup(fakeDb(), null, ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(yt.uploadPlan).not.toHaveBeenCalled();
+    expect(db.pubs.get('youtube')).toMatchObject({ status: 'pending' });
+  });
+
+  it('загрузка: адрес сессии стирается тем же запросом, что пишет published; Telegram и набор колонку не трогают', async () => {
+    const recordOf = (db: any, platform: string) =>
+      db.query.mock.calls.find((c: any[]) => String(c[0]).replace(/\s+/g, ' ').startsWith('UPDATE short_publication SET status = $3') && c[1][1] === platform);
+    const yt = youtube(UPLOAD);
+    yt.upload.mockResolvedValue({ videoId: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk', resumed: false });
+    const a = setup(fakeDb(), '-1003290853538', ['telegram', 'youtube'], yt);
+    await a.svc.publish(ID);
+    expect(String(recordOf(a.db, 'youtube')[0])).toContain('upload_session = NULL');
+    expect(String(recordOf(a.db, 'telegram')[0])).not.toContain('upload_session');
+    const b = setup(fakeDb(), '-1003290853538', ['telegram', 'youtube'], youtube({ kind: 'kit', note: PENDING_UPLOAD_NOTE }));
+    await b.svc.publish(ID);
+    expect(String(recordOf(b.db, 'youtube')[0])).not.toContain('upload_session');
+  });
+
+  it('ролик нашёлся по прошлой сессии — сообщение без доступа (null)', async () => {
+    const yt = youtube(UPLOAD);
+    yt.upload.mockResolvedValue({ videoId: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk', resumed: true });
+    const { svc } = setup(fakeDb(), '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(yt.notifyUploaded).toHaveBeenCalledWith(ID, null);
+  });
+
+  it('отказ на последней попытке: хвостовая точка причины не задваивается', async () => {
+    const yt = youtube(UPLOAD);
+    yt.upload.mockRejectedValue(new YoutubeNotUploaded('начало загрузки: HTTP 403 quotaExceeded: quota.', 403));
+    const { svc, tg } = setup(fakeDb({ attempts: MAX_PUBLISH_ATTEMPTS - 1 }), '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(kitText(tg)).toMatch(/^Не смог загрузить на YouTube: начало загрузки: HTTP 403 quotaExceeded: quota\. Выложите вручную\./);
+  });
+
+  it('повтор после «исход неизвестен»: Telegram второй раз не уходит, на последней — failed без набора, retry — загрузка', async () => {
+    const yt = youtube(UPLOAD);
+    yt.upload.mockRejectedValue(new YoutubeMaybeUploaded('отправка файла оборвалась: socket hang up'));
+    const { svc, tg, db } = setup(fakeDb(), '-1003290853538', ['telegram', 'youtube'], yt);
+    for (let i = 1; i < MAX_PUBLISH_ATTEMPTS; i++) {
+      await svc.publish(ID);
+      expect([db.v.status, db.pubs.get('youtube').status]).toEqual(['approved', 'failed']);
+    }
+    await svc.publish(ID);
+    expect(tg.sendVideo).toHaveBeenCalledTimes(1);
+    expect(tg.sendDocument).not.toHaveBeenCalled();
+    expect(db.v.last_error).toContain(YOUTUBE_MAY_BE_OUT);
+    Object.assign(db.pubs.get('youtube'), { status: 'pending', attempts: 0 }); // retry из admin/shorts
+    Object.assign(db.v, { status: 'approved', attempts: 0 });
+    yt.upload.mockResolvedValue({ videoId: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk', resumed: true });
+    await svc.publish(ID);
+    expect(tg.sendVideo).toHaveBeenCalledTimes(1);
+    expect(db.v.status).toBe('published');
+    expect(yt.notifyUploaded).toHaveBeenCalledTimes(1);
   });
 });

@@ -10,13 +10,13 @@ describe('ShortsSettingsService', () => {
     const row = {
       slot_days: ['2', '4'], slot_hour_msk: '19', prepare_lead_hours: 12, min_answer_chars: 500,
       tg_channel_chat_id: '-1003290853538', platforms: ['telegram'], narrator_voice: 'jane',
-      format: 'chat', max_omni_seconds: '96',
+      format: 'chat', max_omni_seconds: '96', youtube_mode: 'public',
     };
     const svc = new ShortsSettingsService({ query: jest.fn(async () => ({ rows: [row] })) } as any);
     expect(await svc.get()).toEqual({
       slotDays: [2, 4], slotHourMsk: 19, prepareLeadHours: 12, minAnswerChars: 500,
       tgChannelChatId: '-1003290853538', platforms: ['telegram'], narratorVoice: 'jane',
-      format: 'chat', maxOmniSeconds: 96,
+      format: 'chat', maxOmniSeconds: 96, youtubeMode: 'public',
     });
   });
 
@@ -26,6 +26,24 @@ describe('ShortsSettingsService', () => {
     const [sql, args] = query.mock.calls[0] as any[];
     expect(sql).toBe('UPDATE short_settings SET slot_hour_msk = $1, platforms = $2, updated_at = now() WHERE id = 1');
     expect(args).toEqual([20, ['telegram']]);
+  });
+
+  it('незнакомый режим YouTube в базе — manual (набор)', async () => {
+    const svc = new ShortsSettingsService({ query: jest.fn(async () => ({ rows: [{ youtube_mode: 'private' }] })) } as any);
+    expect((await svc.get()).youtubeMode).toBe('manual');
+  });
+
+  it('нет колонки youtube_mode в строке — manual', async () => {
+    const svc = new ShortsSettingsService({ query: jest.fn(async () => ({ rows: [{}] })) } as any);
+    expect((await svc.get()).youtubeMode).toBe('manual');
+  });
+
+  it('режим YouTube пишется своей колонкой', async () => {
+    const query = jest.fn(async () => ({ rows: [] }));
+    await new ShortsSettingsService({ query } as any).update({ youtubeMode: 'unlisted' });
+    const [sql, args] = query.mock.calls[0] as any[];
+    expect(sql).toBe('UPDATE short_settings SET youtube_mode = $1, updated_at = now() WHERE id = 1');
+    expect(args).toEqual(['unlisted']);
   });
 });
 
@@ -59,5 +77,18 @@ describe('validateSettingsPatch', () => {
     [{ colour: 'red' }, /неизвестная настройка: colour/],
   ])('%j — ошибка', (body, message) => {
     expect(() => validateSettingsPatch(body)).toThrow(message);
+  });
+});
+
+describe('youtubeMode в правке настроек', () => {
+  it('по умолчанию — manual; через админку — только аварийный откат на manual, включение unlisted/public — только владельцем', () => {
+    expect(SETTINGS_DEFAULTS.youtubeMode).toBe('manual');
+    expect(validateSettingsPatch({ youtubeMode: 'manual' })).toEqual({ youtubeMode: 'manual' });
+    for (const mode of ['unlisted', 'public']) {
+      expect(() => validateSettingsPatch({ youtubeMode: mode })).toThrow(/только владелец/);
+    }
+    for (const bad of ['private', 'PUBLIC', '', null, 1]) {
+      expect(() => validateSettingsPatch({ youtubeMode: bad })).toThrow(/youtubeMode/);
+    }
   });
 });

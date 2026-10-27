@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { GrammyError, InputFile } from 'grammy';
 import { approverChatId } from '../blog/blog-approval.service';
 import { buildPostUrl } from '../blog/blog-publisher.service';
@@ -9,7 +9,9 @@ import { buildYoutubeKeyboard } from './short-callback';
 import { STAND_MARK, clip } from './short-captions';
 import { isStand } from './short-env';
 import { SUPPORTED_PLATFORMS, ShortSettings, ShortsSettingsService } from './shorts-settings.service';
+import { PENDING_UPLOAD_NOTE, ShortsYoutubeService } from './shorts-youtube.service';
 import { ShortPlatform, ShortPublication, ShortVideo, rowToPublication, rowToShort, shortsBucket } from './shorts.types';
+import { YoutubeAuthError, YoutubeMaybeUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
 
 /** Сколько раз ролик пробует выйти. Попытку считает захват, счётчик переживает рестарт. */
 export const MAX_PUBLISH_ATTEMPTS = 3;
@@ -33,6 +35,16 @@ export const POST_MAY_BE_OUT = 'пост мог выйти — проверьт�
 const STUCK_TELEGRAM = `${POST_MAY_BE_OUT} (отправка оборвалась — процесс перезапущен посреди публикации)`;
 const STUCK_OTHER = 'отправка оборвалась — процесс перезапущен посреди публикации';
 
+/**
+ * Причина для владельца, когда на последней попытке YouTube не ответил, дошла ли
+ * загрузка. Набора нет — ручная выкладка дала бы дубль. Повтор безопасен: перед
+ * новой загрузкой сервис YouTube спрашивает о сохранённой сессии (upload_session);
+ * если YouTube её уже не помнит (срок сессии не опубликован), придёт набор с
+ * просьбой проверить канал.
+ */
+export const YOUTUBE_MAY_BE_OUT =
+  'YouTube не ответил, дошла ли загрузка; retry безопасен — перед новой загрузкой спрошу YouTube о прошлой, а если он её уже не помнит, пришлю набор с просьбой проверить канал';
+
 /** Площадка своё отработала: вышла сама или ушла владельцу набором. */
 const SETTLED = ['published', 'manual_pending', 'manual_done'];
 
@@ -40,13 +52,17 @@ interface PlatformResult {
   status: 'published' | 'manual_pending';
   externalId: string;
   url: string | null;
+  /** Доступ, с которым ролик загружен на YouTube; у набора и Telegram его нет; null — ролик нашёлся по прошлой сессии (доступ неизвестен). */
+  privacy?: 'unlisted' | 'public' | null;
 }
 
 /**
  * Чем кончилась площадка:
  * - `done` — вышла, отметка записана;
  * - `skipped` — строку не захватил: площадка уже отработала;
- * - `refused` — отказ Telegram или сбой до отправки: строка `failed`, обычный повтор;
+ * - `refused` — отказ Telegram или сбой до отправки: строка `failed`, обычный
+ *   повтор; или отказ попытки YouTube, в том числе «исход неизвестен» до
+ *   последней попытки: строка `failed`, повтор спросит YouTube о прошлой сессии;
  * - `unknown` — исход отправки в канал неизвестен: строка и ролик уже в `failed`;
  * - `unrecorded` — отправка прошла, а отметка в базу не легла: ролик остаётся
  *   в `publishing`, его разберёт сторож (`rearmStuck`).
@@ -91,6 +107,9 @@ export class ShortsPublisherService {
     private readonly tg: TgGrammyClient,
     private readonly storage: StorageService,
     private readonly settings: ShortsSettingsService,
+    // Последним и @Optional: спеки собирают публикатор позиционно. Без сервиса — набор,
+    // как до автопубликации; что Nest его подставляет, сторожит shorts.module.spec.ts.
+    @Optional() private readonly youtube?: ShortsYoutubeService,
   ) {}
 
   /** Одобренные человеком ролики, чей слот наступил. */
@@ -114,10 +133,10 @@ export class ShortsPublisherService {
    * один пост. `approved_at IS NOT NULL` — публикатор сам не выпустит ролик,
    * которого человек не одобрял, что бы ни делали с ним другие части модуля.
    *
-   * Дальше — по площадкам: Telegram, затем набор YouTube (только когда Telegram
-   * вышел). Перед каждой площадкой — продление живости: иначе медленная
-   * выгрузка двух файлов пережила бы STUCK_PUBLISHING_MINUTES, и сторож забрал
-   * бы ролик у живой отправки. Ролик ушёл из publishing — останавливаемся.
+   * Дальше — по площадкам: Telegram, затем YouTube — загрузкой или набором
+   * (только когда Telegram вышел). Перед каждой площадкой — продление живости:
+   * иначе медленная выгрузка двух файлов пережила бы STUCK_PUBLISHING_MINUTES,
+   * и сторож забрал бы ролик у живой отправки. Ролик ушёл из publishing — останавливаемся.
    *
    * Итог — `published`; возврат в `approved` под повтор или, когда попытки
    * кончились, `failed` с сообщением владельцу. Неизвестный исход отправки в
@@ -157,11 +176,21 @@ export class ShortsPublisherService {
       if (out === 'unknown' || out === 'unrecorded') return;
     }
     const telegramDone = !platforms.includes('telegram') || (await this.rows(v.id)).some((r) => r.platform === 'telegram' && r.status === 'published');
+    let uploaded: { privacy: 'unlisted' | 'public' | null } | null = null;
     if (platforms.includes('youtube') && telegramDone) {
       if (!(await this.keepAlive(v.id))) return;
-      if ((await this.platform(v, 'youtube', () => this.youtubeKit(v))) === 'unrecorded') return;
+      const out = await this.platform(v, 'youtube', async () => {
+        const r = await this.toYoutube(v);
+        uploaded = r.status === 'published' ? { privacy: r.privacy ?? null } : null;
+        return r;
+      });
+      if (out === 'unrecorded') return;
+      if (out !== 'done') uploaded = null;
     }
     await this.settle(v, platforms);
+    // Ссылку владельцу — после записи и итога ролика, не задерживая публикацию (notifyUploaded не бросает);
+    // только для загрузки и с тем доступом, с которым грузили. Набор — без сообщения.
+    if (uploaded) void this.youtube?.notifyUploaded(v.id, uploaded.privacy);
   }
 
   /**
@@ -170,9 +199,11 @@ export class ShortsPublisherService {
    * STUCK_PUBLISHING_MINUTES. Его площадки в `publishing` — оборванные отправки:
    * - строка telegram — исход неизвестен (пост мог выйти): строка и ролик в
    *   `failed`, повтор — кнопкой владельца, а не по кругу в канал;
-   * - прочие (набор YouTube в личку — дубль безвреден): строка `failed`, ролик
-   *   в `approved` под повтор, а исчерпав попытки — в `failed`. Без предела
-   *   ролик, на котором процесс умирает, ходил бы по кругу бесконечно.
+   * - прочие: набор YouTube в личку — дубль безвреден; загрузка YouTube перед
+   *   повтором спрашивает YouTube о прошлой сессии (upload_session) — дубля на
+   *   канале нет. Строка failed, ролик в `approved` под повтор, а исчерпав
+   *   попытки — в `failed`. Без предела ролик, на котором процесс умирает,
+   *   ходил бы по кругу бесконечно.
    *
    * Один запрос — одна транзакция: строка telegram в `failed` не может остаться
    * при ролике в `approved` (это и был бы автоповтор). `FOR UPDATE` в выборке
@@ -285,10 +316,14 @@ export class ShortsPublisherService {
    */
   private async recordSent(v: ShortVideo, platform: ShortPlatform, out: PlatformResult): Promise<boolean> {
     const sent = out.url ?? `сообщение ${out.externalId}`;
+    // Загрузка YouTube: адрес сессии стирается тем же запросом, что пишет published. Сотри его
+    // раньше — сбой этой записи вернул бы ролик в очередь без адреса, и повтор загрузил бы ролик
+    // второй раз. Telegram и набор колонку не трогают: им миграция 003 не нужна.
+    const clearSession = platform === 'youtube' && out.status === 'published' ? ', upload_session = NULL' : '';
     try {
       const r = await this.pg.query(
         `UPDATE short_publication
-            SET status = $3, external_id = $4, url = $5, last_error = NULL,
+            SET status = $3, external_id = $4, url = $5, last_error = NULL${clearSession},
                 published_at = CASE WHEN $3 = 'published' THEN now() ELSE published_at END, updated_at = now()
           WHERE short_id = $1 AND platform = $2 AND status IN ('pending', 'publishing', 'failed')`,
         [v.id, platform, out.status, out.externalId, out.url],
@@ -347,11 +382,47 @@ export class ShortsPublisherService {
   }
 
   /**
-   * YouTube, пока Google не проверил приложение: владельцу — файл документом
-   * (без пережатия), заголовок, описание, теги и кнопка «Выложил на YouTube».
-   * Повторяется как обычно: дубль набора в личке безвреден.
+   * YouTube: загрузка, когда владелец подключил канал и выбрал режим, иначе набор.
+   * Набор вместо загрузки — и когда доступ пропал, и когда YouTube отказал на
+   * последней попытке: ролик доходит до канала хотя бы руками. Если же на
+   * последней попытке неизвестно, дошла ли загрузка, набора нет (дал бы дубль):
+   * отказ с YOUTUBE_MAY_BE_OUT, ролик уходит в failed.
    */
-  private async youtubeKit(v: ShortVideo): Promise<PlatformResult> {
+  private async toYoutube(v: ShortVideo): Promise<PlatformResult> {
+    const yt = this.youtube;
+    if (!yt) return this.youtubeKit(v, null);
+    const plan = await yt.uploadPlan(v.id);
+    if (plan.kind === 'kit') return this.youtubeKit(v, plan.note);
+    const last = v.attempts >= MAX_PUBLISH_ATTEMPTS;
+    try {
+      const up = await yt.upload(v, plan.privacy, () => this.keepAlive(v.id));
+      return { status: 'published', externalId: up.videoId, url: up.url, privacy: up.resumed ? null : plan.privacy };
+    } catch (e: any) {
+      if (e instanceof YoutubeAuthError) {
+        const pending = e.pendingUpload ? `\n${PENDING_UPLOAD_NOTE}` : '';
+        return this.youtubeKit(v, `Доступ к каналу YouTube пропал (${e.message}) — набор вместо загрузки. Переподключить: /youtube${pending}`);
+      }
+      if (e instanceof YoutubeUploadExpired) {
+        return this.youtubeKit(v, `${e.message} — набор вместо загрузки.\n${PENDING_UPLOAD_NOTE}`);
+      }
+      if (e instanceof YoutubeMaybeUploaded) {
+        throw new Error(last ? `${YOUTUBE_MAY_BE_OUT} (${e.message})` : `${e.message} — повторю, сначала спрошу YouTube о прошлой загрузке`);
+      }
+      if (last) {
+        // Хвостовая точка причины Google иначе дала бы «quota.. Выложите».
+        const reason = clip(String(e?.message ?? e), 300).replace(/[.\s]+$/, '');
+        return this.youtubeKit(v, `Не смог загрузить на YouTube: ${reason}. Выложите вручную.`);
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * YouTube набором: владельцу — файл документом (без пережатия), заголовок,
+   * описание, теги и кнопка «Выложил на YouTube». Заметка — почему набор
+   * вместо загрузки. Повторяется как обычно: дубль набора в личке безвреден.
+   */
+  private async youtubeKit(v: ShortVideo, note: string | null = null): Promise<PlatformResult> {
     const chatId = approverChatId();
     if (!chatId) throw new Error('BLOG_APPROVER_TG_ID не задан — набор для YouTube отправить некому');
     if (!v.videoKey || !v.captions) throw new Error('у ролика нет файла или подписей');
@@ -363,7 +434,7 @@ export class ShortsPublisherService {
     });
     const msg: any = await this.tg.sendMessage(
       chatId,
-      `${mark}YouTube — заголовок:\n${yt.title}\n\nОписание:\n${yt.description}\n\nТеги: ${yt.tags.join(', ')}\n\n` +
+      `${mark}${note ? `${note}\n\n` : ''}YouTube — заголовок:\n${yt.title}\n\nОписание:\n${yt.description}\n\nТеги: ${yt.tags.join(', ')}\n\n` +
         'Когда выложите, нажмите кнопку и пришлите ссылку ответом.',
       { reply_markup: buildYoutubeKeyboard(v.id) },
     );

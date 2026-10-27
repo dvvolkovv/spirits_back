@@ -22,6 +22,7 @@ import { MiscService } from '../misc/misc.service';
 import { VideoService } from '../video/video.service';
 import { BlogApprovalService } from '../blog/blog-approval.service';
 import { ShortsApprovalService } from '../shorts/shorts-approval.service';
+import { ShortsYoutubeService } from '../shorts/shorts-youtube.service';
 import { shortsEnabled } from '../shorts/short-env';
 import { fetchMediaBytes } from '../common/net/own-media';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
@@ -177,6 +178,10 @@ export class TgBotService implements OnModuleInit {
     // @Optional: спеки собирают сервис позиционно. Что модуль его подставляет,
     // сторожит tg-bot.product-actions-wiring.spec.ts.
     @Optional() private readonly productActionsTg?: TgProductActionsService,
+    // YouTube роликов: команда /youtube владельца. Последним и @Optional, как ролики выше:
+    // спеки собирают сервис позиционно. Что Nest его подставляет, сторожит shorts.module.spec.ts.
+    @Optional() @Inject(forwardRef(() => ShortsYoutubeService))
+    private readonly shortsYoutube?: ShortsYoutubeService,
   ) {}
 
   async onModuleInit() {
@@ -185,6 +190,9 @@ export class TgBotService implements OnModuleInit {
     // — норма, а не поломка, и предупреждение было бы шумом.
     if (!this.shortsApproval && shortsEnabled()) {
       this.logger.warn('ролики: ShortsApprovalService не подставлен — кнопки и /short роликов не работают');
+    }
+    if (!this.shortsYoutube && shortsEnabled()) {
+      this.logger.warn('ролики: ShortsYoutubeService не подставлен — /youtube не работает');
     }
 
     await this.applyMigration('001_tg_bot_schema.sql');
@@ -496,6 +504,9 @@ export class TgBotService implements OnModuleInit {
     if (await this.blogApproval.handleCaseCommand(msg)) return;
     // `/short <тема>` — заказ ролика владельцем; как и /case, до разбора команд.
     if (await this.shortsApproval?.handleShortCommand(msg)) return;
+    // `/youtube [режим]` — подключение канала и режим автозагрузки роликов; только владелец.
+    // В /help и в меню команд её нет намеренно — как /case и /short.
+    if (await this.shortsYoutube?.handleCommand(msg)) return;
 
     const text = msg.text.toLowerCase().trim();
     const cmd = text.split('@')[0].split(' ')[0];

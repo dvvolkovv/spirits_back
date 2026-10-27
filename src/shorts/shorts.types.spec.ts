@@ -6,6 +6,7 @@ import {
   appendOwnerNote,
   canTransition,
   retryTarget,
+  rowToPublication,
   rowToShort,
   shortsBucket,
 } from './shorts.types';
@@ -133,5 +134,13 @@ describe('shortsBucket', () => {
   it('общий бакет видео, по умолчанию linkeon-smm-videos', () => {
     expect(shortsBucket({})).toBe('linkeon-smm-videos');
     expect(shortsBucket({ MINIO_BUCKET_VIDEOS: 'videos-test' })).toBe('videos-test');
+  });
+});
+
+describe('rowToPublication: адрес сессии загрузки — не наружу', () => {
+  it('upload_session в объект площадки не попадает: адрес сессии — ключ на загрузку, а объект отдаёт админ-API', () => {
+    const p = rowToPublication({ short_id: 'x', platform: 'youtube', status: 'failed', upload_session: 'https://upload/abc' });
+    expect(p).not.toHaveProperty('uploadSession');
+    expect(JSON.stringify(p)).not.toContain('https://upload/abc');
   });
 });
