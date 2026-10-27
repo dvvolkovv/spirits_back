@@ -281,7 +281,7 @@ describe('карточка ключей: отправить', () => {
     expect(a.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ field: 'sk-live-…' }));
     const b = harness();
     expect(await send(b, {}, [pasted])).toMatchObject({ ok: false, reason: 'bad_shape' });
-    expect(b.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ field: 'sk-live-…' }));
+    expect(b.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ field: 'sk-live-…' }), { keyNames: ['BOT_TOKEN', 'OLD_KEY'] });
     const c = harness();
     expect(await send(c, { [pasted]: 42 })).toMatchObject({ ok: false, reason: 'bad_input' });
     expect(c.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ field: 'sk-live-…' }));
