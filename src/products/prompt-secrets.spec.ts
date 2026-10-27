@@ -9,12 +9,17 @@ import { maskedSecretsSay, maskSecrets, SECRET_MASK } from './prompt-secrets';
 const ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 const HEX = '0123456789abcdef';
 function rnd(n: number, seed: number, alphabet: string): string {
-  // Детерминированный разброс: тест должен падать одинаково на каждом прогоне.
-  let x = seed;
+  // Детерминированный разброс (mulberry32): тест должен падать одинаково на
+  // каждом прогоне. Простой линейный генератор давал вырожденные строки вроде
+  // «c9cccccc72ad…» — таких ключей в жизни не бывает.
+  let a = seed >>> 0;
   let out = '';
   for (let i = 0; i < n; i++) {
-    x = (x * 1103515245 + 12345) % 2147483648;
-    out += alphabet[(x >>> 8) % alphabet.length];
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    out += alphabet[((t ^ (t >>> 14)) >>> 0) % alphabet.length];
   }
   return out;
 }
@@ -175,6 +180,13 @@ describe('maskSecrets: что скрывается', () => {
   it('длинная случайная строка без имени — только если рядом сказано, что это ключ', () => {
     const r = maskSecrets(`вот ключ сервиса ${tok(40, 81)} пожалуйста`);
     expect(r.text).toBe(`вот ключ сервиса ${SECRET_MASK} пожалуйста`);
+  });
+
+  it('маска не заразна: ID строкой ниже скрытого ключа и «ключевые» в тексте — не признак', () => {
+    const id = join('1Bxi', tok(40, 82));
+    const text = `OZON_API_KEY=${tok(24, 83)}\nтаблица ${id}`;
+    expect(maskSecrets(text).text).toBe(`OZON_API_KEY=${SECRET_MASK}\nтаблица ${id}`);
+    unchanged(`ключевые слова и ID ${id}`);
   });
 
   it('несколько ключей: count — все, names — без повторов, в порядке появления', () => {

@@ -60,7 +60,7 @@ export interface MaskedSecrets extends SecretsMasked {
 /** Сколько имён отдаётся наружу: в плашку и ответ ассистенту, не в лог. */
 const NAMES_MAX = 10;
 /** Проходов до неподвижной точки: маска даёт новую границу слова, и изредка второй проход находит ещё одно значение. */
-const PASSES_MAX = 3;
+const PASSES_MAX = 4;
 /**
  * Разделитель временных заглушек: адреса и публичные значения на время
  * прохода вынимаются из текста, чтобы их не задели правила для свободного
@@ -104,6 +104,9 @@ function entropy(s: string): number {
 function looksRandom(s: string, o: { mixedCase?: boolean; entropy?: boolean } = {}): boolean {
   if ((s.match(/\d/g) ?? []).length < 2) return false;
   if (o.mixedCase && !(/[a-z]/.test(s) && /[A-Z]/.test(s))) return false;
+  // У шестнадцатеричной строки «слова» — это просто подряд идущие a–f
+  // («ecccccccc»), и доля слов о ней ничего не говорит: решают цифры.
+  if (/^[0-9a-f]+$/i.test(s)) return new Set(s).size >= 4;
   if (wordShare(s) >= 0.5) return false;
   return !o.entropy || entropy(s) >= 3.5;
 }
@@ -352,7 +355,7 @@ const KNOWN_FORMATS: KnownFormat[] = [
  *  - только в свободном тексте — адреса и data:-адреса к нему не попадают;
  *  - не внутри длинного base64 (BLOB_MIN_CHARS);
  *  - не публичные форматы (PUBLIC_FORMAT_RE);
- *  - только если рядом перед строкой сказано, что это ключ («ключ», «token»…):
+ *  - только если перед строкой сказано, что это ключ (secretWordBefore):
  *    голый ID таблицы в тексте — частое и законное содержимое правки, голый
  *    безымянный ключ — редкость.
  * `=` — только хвостом: иначе правило съедало бы пары `имя=значение` целиком.
@@ -363,10 +366,43 @@ const RANDOM_RE = /(?<![A-Za-z0-9_+=-])[A-Za-z0-9_+-]{32,160}={0,2}(?![A-Za-z0-9
 const PUBLIC_FORMAT_RE =
   /^(?:[EU]Q[A-Za-z0-9_-]{46}$|T[1-9A-HJ-NP-Za-km-z]{33}$|0x[0-9a-fA-F]{40}$|[13][1-9A-HJ-NP-Za-km-z]{25,34}$|6L[A-Za-z0-9_-]{38}$|sha(?:256|384|512)-)/;
 
-/** Слово, после которого длинная случайная строка — ключ, а не идентификатор. */
-const SECRET_CONTEXT_RE = /ключ|токен|секрет|пароль|key|token|secret|passw|credential|bearer|appid/i;
-/** Сколько знаков перед строкой смотреть в поисках такого слова. */
-const SECRET_CONTEXT_CHARS = 48;
+/** Слова, после которых длинная случайная строка — ключ, а не идентификатор. Целые слова: «ключевые» — не «ключ». */
+const SECRET_WORDS = new Set([
+  'key', 'keys', 'token', 'tokens', 'secret', 'secrets', 'password', 'passwords', 'passwd', 'pass', 'pwd',
+  'credential', 'credentials', 'bearer', 'apikey', 'appid',
+  'ключ', 'ключа', 'ключи', 'ключом', 'ключей', 'токен', 'токена', 'токены', 'токеном',
+  'секрет', 'секрета', 'секретный', 'пароль', 'пароля', 'паролем',
+]);
+/** Сколько слов перед строкой смотреть в поисках такого слова. */
+const SECRET_CONTEXT_WORDS = 4;
+const MASK_ATOM = '\u0001';
+
+/**
+ * Сказано ли перед местом, что дальше ключ: среди последних
+ * SECRET_CONTEXT_WORDS слов той же строки есть слово-признак.
+ *
+ * Считается в СЛОВАХ, а не в знаках, и маска — одно слово и никогда не
+ * признак. Иначе решение менялось бы от прохода к проходу: маска короче
+ * значения и подтягивала бы дальнее слово в окно, а слово «ключ» внутри самой
+ * маски делало бы её заразной — ID таблицы строкой ниже ключа скрывался бы
+ * следом (ревью, Minor 1; найдено проверкой идемпотентности на случайных смесях).
+ */
+function secretWordBefore(text: string, at: number): boolean {
+  const lineStart = text.lastIndexOf('\n', at - 1) + 1;
+  const words = text
+    .slice(Math.max(lineStart, at - 1000), at)
+    .split(SECRET_MASK)
+    .join(MASK_ATOM)
+    .split(/[ \t]+/)
+    .filter(Boolean)
+    .slice(-SECRET_CONTEXT_WORDS);
+  return words.some((w) =>
+    w
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .split(/[^A-Za-z\u0400-\u04FF]+/)
+      .some((part) => SECRET_WORDS.has(part.toLowerCase())),
+  );
+}
 /** С какой длины подряд идущий base64 (с `/` и `+`) — данные, а не ключ. */
 const BLOB_MIN_CHARS = 160;
 
@@ -471,15 +507,15 @@ function maskPass(input: string): MaskedSecrets {
   }));
 
   t = t.replace(AUTH_HEADER_RE, (m: string, head: string, v: string) => (looksRandom(v.replace(/=+$/, '')) ? head + p.hide() : m));
-  t = t.replace(CURL_USER_RE, (_m: string, head: string) => head + p.hide());
+  // Уже скрытое не скрывается второй раз: иначе каждый проход дописывал бы «скрыт]».
+  t = t.replace(CURL_USER_RE, (m: string, head: string, v: string) => (v.startsWith(SECRET_MASK.slice(0, 5)) ? m : head + p.hide()));
   for (const f of KNOWN_FORMATS) {
     t = t.replace(f.re, (m: string, at: number, whole: string) => (!f.check || f.check(m) ? p.hide(nameBefore(whole, at)) : m));
   }
   t = t.replace(RANDOM_RE, (m: string, at: number, whole: string) => {
     if (!looksRandom(m.replace(/=+$/, ''), { mixedCase: true, entropy: true })) return m;
     if (PUBLIC_FORMAT_RE.test(m) || insideBlob(whole, at, m.length)) return m;
-    if (!SECRET_CONTEXT_RE.test(whole.slice(Math.max(0, at - SECRET_CONTEXT_CHARS), at))) return m;
-    return p.hide(nameBefore(whole, at));
+    return secretWordBefore(whole, at) ? p.hide(nameBefore(whole, at)) : m;
   });
 
   const restore = (s: string): string => s.replace(HOLD_RE, (_m, i: string) => restore(kept[Number(i)]));
