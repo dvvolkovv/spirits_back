@@ -2139,6 +2139,72 @@ Expected: PASS.
 **Files:**
 - Modify: `src/shorts/shorts-publisher.service.ts`
 - Test: `src/shorts/shorts-publisher.service.spec.ts`
+- Modify: `src/shorts/shorts-youtube.service.ts` (шаг 0)
+- Test: `src/shorts/shorts-youtube.service.spec.ts` (шаг 0)
+
+- [ ] **Step 0: Правки сервиса YouTube по перепроверке ревью задач 5–6**
+
+В `src/shorts/shorts-youtube.service.spec.ts`:
+- тест «строку держит другая попытка (строка не в publishing) — YoutubeNotUploaded, файл не отправлен» переименовать в «… — YoutubeMaybeUploaded: исход загрузки другой попытки неизвестен, файл не отправлен» и ждать `toBeInstanceOf(YoutubeMaybeUploaded)`; проверка сообщения `/другая попытка/` остаётся;
+- в тесте «нет клиента OAuth на сервере — так и говорим» добавить `expect(said()[0]).toContain('PUBLIC_BASE_URL');`
+- блок `describe('сообщение о загрузке', …)` заменить на:
+
+```ts
+describe('сообщение о загрузке', () => {
+  const URL = 'https://youtube.com/shorts/abcdefghijk';
+
+  it('«по ссылке» — ссылка и подсказка про «публично»', async () => {
+    const { svc, said } = setup(fakeDb({ mode: 'unlisted', published: URL }));
+    await svc.notifyUploaded('v1', 'unlisted');
+    expect(said()).toEqual([`Вышло на YouTube (по ссылке): ${URL}\nЕсли ролик открывается и не стал приватным — /youtube публично.`]);
+  });
+
+  it('доступ — тот, с которым грузили, а не текущий режим; набор (строки published нет) — молчим', async () => {
+    const a = setup(fakeDb({ mode: 'manual', published: URL }));
+    await a.svc.notifyUploaded('v1', 'public');
+    expect(a.said()).toEqual([`Вышло на YouTube (публично): ${URL}`]);
+    const b = setup(fakeDb({ mode: 'public' }));
+    await b.svc.notifyUploaded('v1', 'public');
+    expect(b.tg.sendMessage).not.toHaveBeenCalled();
+  });
+});
+```
+
+Красный коммит «test(shorts): YouTube — ревью 5–6: другая попытка — исход неизвестен, доступ в сообщении из загрузки (красный)», прогон `npx jest src/shorts/shorts-youtube.service.spec.ts` — падают три теста.
+
+В `src/shorts/shorts-youtube.service.ts`:
+- в `upload()` строку с `claimSession` заменить на:
+
+```ts
+    // Сессия без байтов ролика не создаёт, но строку держит другая попытка — её исход неизвестен:
+    // «ролика нет» сказать нельзя, иначе на последней попытке ушёл бы набор и ручная выкладка дала бы дубль.
+    if (!(await this.claimSession(v.id, sessionUrl))) throw new YoutubeMaybeUploaded('строку YouTube держит другая попытка — исход её загрузки неизвестен');
+```
+
+- `notifyUploaded` заменить на:
+
+```ts
+  /** После записи published: ссылка владельцу; доступ — тот, с которым грузили; при «по ссылке» — подсказка про «публично». */
+  async notifyUploaded(shortId: string, privacy: 'unlisted' | 'public'): Promise<void> {
+    try {
+      const r = await this.pg.query(
+        `SELECT url FROM short_publication WHERE short_id = $1 AND platform = 'youtube' AND status = 'published'`,
+        [shortId],
+      );
+      const url = r.rows[0]?.url;
+      if (!url) return;
+      const hint = privacy === 'unlisted' ? '\nЕсли ролик открывается и не стал приватным — /youtube публично.' : '';
+      await this.say(approverChatId(), `Вышло на YouTube (${MODE_WORDS[privacy]}): ${url}${hint}`);
+    } catch (e: any) {
+      this.logger.warn(`ролик ${shortId}: сообщение о YouTube не отправлено: ${e?.message ?? e}`);
+    }
+  }
+```
+
+- «не настроен» называет все три переменные: в `statusText` — `'YouTube не настроен на этом сервере: нужны YOUTUBE_OAUTH_CLIENT_ID, YOUTUBE_OAUTH_CLIENT_SECRET и PUBLIC_BASE_URL в .env.'`; страница 503 в `completeConnect` — `connectPage(503, 'YouTube не настроен', 'На этом сервере не настроен клиент OAuth YouTube: нужны YOUTUBE_OAUTH_CLIENT_ID, YOUTUBE_OAUTH_CLIENT_SECRET и PUBLIC_BASE_URL.')`; комментарий у `connectUrl` — «null — на этой среде не настроен клиент OAuth (id, секрет или PUBLIC_BASE_URL)»;
+- в ветке «Ссылка устарела» (после `YoutubeCodeRejected` без недавнего подключения) перед `return` — `this.logger.warn('YouTube: Google отверг код входа, недавнего подключения нет — страница «Ссылка устарела»');`
+
+Коммит «fix(shorts): YouTube — ревью 5–6: другая попытка — исход неизвестен, доступ в сообщении из загрузки, тексты «не настроен», лог отвергнутого кода», зелёный прогон `npx jest src/shorts/shorts-youtube.service.spec.ts`.
 
 - [ ] **Step 1: Падающие тесты**
 
@@ -2184,10 +2250,10 @@ describe('ShortsPublisherService.publish — YouTube загрузкой', () => 
     const { svc, tg, db } = setup(fakeDb(), '-1003290853538', ['telegram', 'youtube'], yt);
     await svc.publish(ID);
     expect(yt.uploadPlan).toHaveBeenCalledWith(ID);
+    expect(yt.notifyUploaded).toHaveBeenCalledWith(ID, 'unlisted');
     expect(yt.upload).toHaveBeenCalledWith(expect.objectContaining({ id: ID }), 'unlisted', expect.any(Function));
     expect(db.pubs.get('youtube')).toMatchObject({ status: 'published', external_id: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk' });
     expect(tg.sendDocument).not.toHaveBeenCalled();
-    expect(yt.notifyUploaded).toHaveBeenCalledWith(ID);
     expect(db.v.status).toBe('published');
   });
 
@@ -2209,6 +2275,7 @@ describe('ShortsPublisherService.publish — YouTube загрузкой', () => 
     expect(yt.upload).not.toHaveBeenCalled();
     expect(tg.sendDocument).toHaveBeenCalledTimes(1);
     expect(kitText(tg).startsWith('Канал YouTube не подключён — набор вместо загрузки. Подключить: /youtube\n\nYouTube — заголовок:\nYT-заголовок')).toBe(true);
+    expect(yt.notifyUploaded).not.toHaveBeenCalled();
     expect(db.pubs.get('youtube')).toMatchObject({ status: 'manual_pending' });
   });
 
@@ -2359,20 +2426,31 @@ export const YOUTUBE_MAY_BE_OUT =
   ) {}
 ```
 
-4. В `publish()` блок YouTube и следующую за ним строку `await this.settle(v, platforms);` заменить на:
+4. В `interface PlatformResult` добавить поле:
 
 ```ts
-    let youtubeDone = false;
+  /** Доступ, с которым ролик загружен на YouTube; у набора и Telegram его нет. */
+  privacy?: 'unlisted' | 'public';
+```
+
+В `publish()` блок YouTube и следующую за ним строку `await this.settle(v, platforms);` заменить на:
+
+```ts
+    let uploaded: 'unlisted' | 'public' | null = null;
     if (platforms.includes('youtube') && telegramDone) {
       if (!(await this.keepAlive(v.id))) return;
-      const out = await this.platform(v, 'youtube', () => this.toYoutube(v));
+      const out = await this.platform(v, 'youtube', async () => {
+        const r = await this.toYoutube(v);
+        uploaded = r.privacy ?? null;
+        return r;
+      });
       if (out === 'unrecorded') return;
-      youtubeDone = out === 'done';
+      if (out !== 'done') uploaded = null;
     }
     await this.settle(v, platforms);
-    // Ссылку владельцу — после записи и итога ролика, не задерживая публикацию:
-    // notifyUploaded не бросает, а про набор (manual_pending) молчит сам.
-    if (youtubeDone) void this.youtube?.notifyUploaded(v.id);
+    // Ссылку владельцу — после записи и итога ролика, не задерживая публикацию (notifyUploaded не бросает);
+    // только для загрузки и с тем доступом, с которым грузили. Набор — без сообщения.
+    if (uploaded) void this.youtube?.notifyUploaded(v.id, uploaded);
 ```
 
 5. Перед методом `youtubeKit` добавить:
@@ -2391,7 +2469,7 @@ export const YOUTUBE_MAY_BE_OUT =
     const last = v.attempts >= MAX_PUBLISH_ATTEMPTS;
     try {
       const up = await this.youtube.upload(v, plan.privacy, () => this.keepAlive(v.id));
-      return { status: 'published', externalId: up.videoId, url: up.url };
+      return { status: 'published', externalId: up.videoId, url: up.url, privacy: plan.privacy };
     } catch (e: any) {
       if (e instanceof YoutubeAuthError) {
         const pending = e.pendingUpload ? ` ${PENDING_UPLOAD_NOTE}` : '';
@@ -2646,8 +2724,8 @@ import { ShortsYoutubeService } from './shorts-youtube.service';
         [v.id],
       );
       const b = service([]);
-      await b.svc.notifyUploaded(v.id);
-      expect(b.tg.sendMessage).toHaveBeenCalledWith(OWNER, 'Вышло на YouTube: https://youtube.com/shorts/abcdefghijk', expect.anything());
+      await b.svc.notifyUploaded(v.id, 'public');
+      expect(b.tg.sendMessage).toHaveBeenCalledWith(OWNER, 'Вышло на YouTube (публично): https://youtube.com/shorts/abcdefghijk', expect.anything());
     });
   });
 ```
