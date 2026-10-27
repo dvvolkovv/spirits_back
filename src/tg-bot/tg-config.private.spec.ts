@@ -87,4 +87,37 @@ describe('ensurePrivateConfig', () => {
     expect(insert[1][1]).toBe(777);
     expect(pg.query).toHaveBeenCalledTimes(4);
   });
+
+  // Параллельные апдейты одного чата (альбом — пачкой): оба вызова прочитали
+  // «конфига нет», вставка второго уступает первому (ON CONFLICT DO NOTHING).
+  describe('вставка уступила параллельной', () => {
+    it('живой конфиг того же владельца — возвращается он', async () => {
+      pg.query
+        .mockResolvedValueOnce({ rows: [] }) // активного нет
+        .mockResolvedValueOnce({ rows: [] }) // профиль
+        .mockResolvedValueOnce({ rows: [] }) // insert уступил
+        .mockResolvedValueOnce({ rows: [{ id: 'cfg-won', owner_user_id: 'u-1', tg_chat_id: '777', status: 'active' }] });
+
+      const cfg = await svc.ensurePrivateConfig('u-1', 777);
+
+      expect(cfg.id).toBe('cfg-won');
+      expect(pg.query.mock.calls[2][0]).toMatch(/ON CONFLICT \(tg_chat_id\) WHERE status IN \('active','silent'\) DO NOTHING/);
+      expect(pg.query.mock.calls[3][0]).toMatch(/SELECT \* FROM tg_bot_configs/);
+      expect(pg.query.mock.calls[3][1]).toEqual([777]);
+    });
+
+    it.each([
+      ['чужой', [{ id: 'cfg-x', owner_user_id: 'u-x', tg_chat_id: '777', status: 'active' }]],
+      ['пропал', []],
+    ])('живой конфиг %s — отказ, без второго архива и второй вставки', async (_label, rows) => {
+      pg.query
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows });
+
+      await expect(svc.ensurePrivateConfig('u-1', 777)).rejects.toThrow(/777/);
+      expect(pg.query).toHaveBeenCalledTimes(4);
+    });
+  });
 });
