@@ -159,7 +159,7 @@ describe('карточка ключей: отправить', () => {
     // истинности поля отнесла бы его к too_many.
     [{ '': 'x' }, [], 'bad_input'],
     [{}, ['BOT_TOKEN'], 'bot_token'],
-    [{}, ['NO_SUCH'], 'bad_input'],
+    [{}, ['NO_SUCH'], 'bad_shape'],
     ['не объект', [], 'bad_shape'],
     [{}, 'не список', 'bad_shape'],
     [Object.fromEntries(Array.from({ length: 64 }, (_, i) => [`K${i}`, 'v'])), [], 'too_many'],
@@ -197,10 +197,10 @@ describe('карточка ключей: отправить', () => {
     expect(JSON.parse(ins.params[2])).toEqual({ newKeyNames: ['BOT_TOKEN', 'OLD_KEY'], removedNames: [], changedNames: ['OLD_KEY'] });
   });
 
-  it('снять старый ключ с занятым именем карточкой нельзя — поправимо, поле этого ключа', async () => {
+  it('снять старый ключ с занятым именем карточкой нельзя — поправимо («карточка устарела»), поле этого ключа', async () => {
     const h = harness({ old: { BOT_TOKEN: '111111:TEST-old', OWNER_TG_ID: '42' } });
-    expect(await send(h, {}, ['OWNER_TG_ID'])).toMatchObject({ ok: false, reason: 'bad_input' });
-    expect(h.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ reason: 'bad_input', field: 'OWNER_TG_ID' }));
+    expect(await send(h, {}, ['OWNER_TG_ID'])).toMatchObject({ ok: false, reason: 'bad_shape' });
+    expect(h.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ reason: 'bad_shape', field: 'OWNER_TG_ID' }));
     expect(h.calls.some((c) => c.sql.includes('INSERT INTO product_provision_jobs'))).toBe(false);
   });
 
@@ -268,7 +268,7 @@ describe('карточка ключей: отправить', () => {
     expect(await send(a, { [pasted]: 'x' })).toMatchObject({ ok: false, reason: 'bad_input' });
     expect(a.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ field: 'sk-live-…' }));
     const b = harness();
-    expect(await send(b, {}, [pasted])).toMatchObject({ ok: false, reason: 'bad_input' });
+    expect(await send(b, {}, [pasted])).toMatchObject({ ok: false, reason: 'bad_shape' });
     expect(b.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ field: 'sk-live-…' }));
     const c = harness();
     expect(await send(c, { [pasted]: 42 })).toMatchObject({ ok: false, reason: 'bad_input' });

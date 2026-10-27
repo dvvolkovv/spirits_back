@@ -211,15 +211,19 @@ export class ProductKeysService {
       return fail(UNREADABLE_SAY, 'failed');
     }
     const old = ownerKeys(stored);
+    // Обе причины ниже — bad_shape («карточка устарела»), а не bad_input:
+    // в карточке таких имён нет (занятые платформой из keyNames выброшены,
+    // а «нет у продукта» — это ключ, который уже сняла другая карточка), и
+    // текст кабинета про правила имени ввёл бы человека в заблуждение.
     const reservedDrop = remove.find((n) => isReservedSecretName(n));
     if (reservedDrop !== undefined) {
       const shown = shownSecretName(reservedDrop);
-      return fix(`Ключ ${shown} — переменная платформы: карточкой его не убрать`, 'bad_input', shown);
+      return fix(`Ключ ${shown} — переменная платформы: карточкой его не убрать`, 'bad_shape', shown);
     }
     const missing = remove.find((n) => !has(old, n));
     if (missing !== undefined) {
       const shown = shownSecretName(missing);
-      return fix(`Ключа ${shown} у продукта нет`, 'bad_input', shown);
+      return fix(`Ключа ${shown} у продукта нет`, 'bad_shape', shown);
     }
     // Object.fromEntries, а не присваивание: имя `__proto__` форму переменной
     // проходит (как и у заведения), а `obj['__proto__'] = …` своего ключа не
