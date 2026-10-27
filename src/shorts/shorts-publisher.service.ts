@@ -9,7 +9,7 @@ import { buildYoutubeKeyboard } from './short-callback';
 import { STAND_MARK, clip } from './short-captions';
 import { isStand } from './short-env';
 import { SUPPORTED_PLATFORMS, ShortSettings, ShortsSettingsService } from './shorts-settings.service';
-import { PENDING_UPLOAD_NOTE, ShortsYoutubeService } from './shorts-youtube.service';
+import { DOWNLOAD_TIMEOUT_MS, PENDING_UPLOAD_NOTE, ShortsYoutubeService } from './shorts-youtube.service';
 import { ShortPlatform, ShortPublication, ShortVideo, rowToPublication, rowToShort, shortsBucket } from './shorts.types';
 import { YoutubeAttemptSuperseded, YoutubeAuthError, YoutubeMaybeUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
 
@@ -399,11 +399,7 @@ export class ShortsPublisherService {
     if (!s.tgChannelChatId) throw new Error('канал Telegram не настроен (short_settings.tg_channel_chat_id)');
     if (typeof this.tg.getBot === 'function' && !this.tg.getBot()) throw new Error('бот Telegram не настроен — TG_BOT_TOKEN');
     if (!v.videoKey || !v.coverKey || !v.captions) throw new Error('у ролика нет файла, обложки или подписей');
-    const bucket = shortsBucket();
-    const [video, cover] = await Promise.all([
-      this.storage.download({ bucket, key: v.videoKey }),
-      this.storage.download({ bucket, key: v.coverKey }),
-    ]);
+    const [video, cover] = await Promise.all([this.download(v.videoKey), this.download(v.coverKey)]);
     const options = {
       caption: v.captions.telegram,
       // cover (Bot API 8.3): thumbnail Telegram принимает только до 320 px и 200 КБ, кадр 1080×1920 он молча выбросил бы.
@@ -481,7 +477,7 @@ export class ShortsPublisherService {
     const chatId = approverChatId();
     if (!chatId) throw new Error('BLOG_APPROVER_TG_ID не задан — набор для YouTube отправить некому');
     if (!v.videoKey || !v.captions) throw new Error('у ролика нет файла или подписей');
-    const video = await this.storage.download({ bucket: shortsBucket(), key: v.videoKey });
+    const video = await this.download(v.videoKey);
     const mark = isStand() ? STAND_MARK : '';
     const yt = v.captions.youtube;
     await this.tg.sendDocument(chatId, video, `linkeon-${v.slug ?? v.id}.mp4`, {
@@ -494,6 +490,17 @@ export class ShortsPublisherService {
       { reply_markup: buildYoutubeKeyboard(v.id) },
     );
     return { status: 'manual_pending', externalId: String(msg.message_id), url: null };
+  }
+
+  /** Файл из MinIO со сроком: зависшее скачивание не должно пережить порог сторожа (STUCK_PUBLISHING_MINUTES). */
+  private async download(key: string): Promise<Buffer> {
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), DOWNLOAD_TIMEOUT_MS);
+    try {
+      return await this.storage.download({ bucket: shortsBucket(), key, abortSignal: abort.signal });
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async settle(v: ShortVideo, platforms: ShortPlatform[]): Promise<void> {
