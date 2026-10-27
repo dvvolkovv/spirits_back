@@ -191,6 +191,9 @@ export class TgBotService implements OnModuleInit {
     if (!this.shortsApproval && shortsEnabled()) {
       this.logger.warn('ролики: ShortsApprovalService не подставлен — кнопки и /short роликов не работают');
     }
+    if (!this.shortsYoutube && shortsEnabled()) {
+      this.logger.warn('ролики: ShortsYoutubeService не подставлен — /youtube не работает');
+    }
 
     await this.applyMigration('001_tg_bot_schema.sql');
     await this.applyMigration('002_tg_bot_custom_agent_fk.sql');
@@ -502,6 +505,7 @@ export class TgBotService implements OnModuleInit {
     // `/short <тема>` — заказ ролика владельцем; как и /case, до разбора команд.
     if (await this.shortsApproval?.handleShortCommand(msg)) return;
     // `/youtube [режим]` — подключение канала и режим автозагрузки роликов; только владелец.
+    // В /help и в меню команд её нет намеренно — как /case и /short.
     if (await this.shortsYoutube?.handleCommand(msg)) return;
 
     const text = msg.text.toLowerCase().trim();

@@ -1,6 +1,7 @@
 import { Controller, Get, Logger, Query, Res } from '@nestjs/common';
 import { Response } from 'express';
 import { ConnectPage, ShortsYoutubeService, connectPage } from './shorts-youtube.service';
+import { clip } from './youtube/youtube-http';
 
 const str = (x: unknown): string | undefined => (typeof x === 'string' ? x : undefined);
 
@@ -26,7 +27,7 @@ export class ShortsYoutubeController {
       page = await this.youtube.completeConnect({ code: str(q?.code), state: str(q?.state), error: str(q?.error) });
     } catch (e: any) {
       // completeConnect задуман без исключений; страховка — страница вместо JSON 500.
-      this.logger.error(`адрес возврата YouTube упал: ${e?.message ?? e}`);
+      this.logger.error(`адрес возврата YouTube упал: ${clip(String(e?.message ?? e), 300)}`, e?.stack);
       page = connectPage(500, 'Не получилось подключить канал', 'Пришлите боту /youtube и попробуйте ещё раз.');
     }
     res

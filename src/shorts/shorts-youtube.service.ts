@@ -230,10 +230,17 @@ export class ShortsYoutubeService {
       note = 'YouTube не настроен на сервере — набор вместо загрузки.';
     } else {
       const acc = await this.account();
-      if (acc?.status === 'connected') return { kind: 'upload', privacy: mode };
-      note = acc
-        ? 'Доступ к каналу YouTube пропал — набор вместо загрузки. Переподключить: /youtube'
-        : 'Канал YouTube не подключён — набор вместо загрузки. Подключить: /youtube';
+      if (acc?.status === 'connected') {
+        // Канал закреплён в .env, но подключали его раньше: пин могли задать
+        // или сменить позже — без этой проверки ролик ушёл бы в канал из базы.
+        const expected = (process.env.YOUTUBE_CHANNEL_ID || '').trim();
+        if (!expected || acc.channelId === expected) return { kind: 'upload', privacy: mode };
+        note = `Подключён канал ${acc.channelTitle ?? acc.channelId}, а роликам нужен ${expected} (YOUTUBE_CHANNEL_ID) — набор вместо загрузки. Переподключить: /youtube`;
+      } else {
+        note = acc
+          ? 'Доступ к каналу YouTube пропал — набор вместо загрузки. Переподключить: /youtube'
+          : 'Канал YouTube не подключён — набор вместо загрузки. Подключить: /youtube';
+      }
     }
     let pending: boolean;
     try {
