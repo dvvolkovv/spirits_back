@@ -6,6 +6,7 @@
  */
 import { ShortsSchemaService } from './shorts-schema.service';
 import { ALLOWED_TRANSITIONS, SLOT_HOLDING_STATUSES, RUBRICS, ANGLES, YOUTUBE_MODES } from './shorts.types';
+import { SETTINGS_DEFAULTS } from './shorts-settings.service';
 
 async function applied(): Promise<string[]> {
   const queries: string[] = [];
@@ -161,22 +162,25 @@ describe('текст 003_youtube.sql', () => {
   it('весь файл — один DO-блок под advisory-локом и lock_timeout', async () => {
     const sql = (await appliedYoutubeSql()).trim();
     expect(sql.startsWith('DO $shorts$')).toBe(true);
+    expect(sql.endsWith('$shorts$;')).toBe(true);
     expect(sql).toContain("pg_advisory_xact_lock(hashtext('shorts/003'))");
     expect(sql).toContain("set_config('lock_timeout', '5s', true)");
   });
 
   it('каждый ALTER TABLE — под проверкой information_schema, таблица — под to_regclass', async () => {
     const sql = await appliedYoutubeSql();
-    const alters = sql.match(/ALTER TABLE/g) ?? [];
-    const guarded = sql.match(/IF NOT EXISTS \(SELECT 1 FROM information_schema\.columns[\s\S]*?\) THEN\s+ALTER TABLE/g) ?? [];
-    expect(alters.length).toBe(2);
-    expect(guarded.length).toBe(alters.length);
+    const adds = [...sql.matchAll(/ALTER TABLE ([a-z_]+) ADD COLUMN ([a-z_]+)/g)];
+    expect(adds.map(([, t, c]) => `${t}.${c}`).sort()).toEqual(['short_publication.upload_session', 'short_settings.youtube_mode']);
+    expect((sql.match(/ALTER TABLE/g) ?? []).length).toBe(adds.length);
+    for (const [, table, column] of adds) {
+      expect(sql).toMatch(new RegExp(`table_name = '${table}' AND column_name = '${column}'\\) THEN\\s+ALTER TABLE ${table} ADD COLUMN ${column}`));
+    }
     expect(sql).toMatch(/IF to_regclass\('public\.short_youtube_account'\) IS NULL THEN\s+CREATE TABLE short_youtube_account/);
     expect(sql).not.toMatch(/ADD COLUMN IF NOT EXISTS/);
   });
 
   it('режимы в CHECK — ровно YOUTUBE_MODES, умолчание manual', async () => {
-    const m = (await appliedYoutubeSql()).match(/youtube_mode text NOT NULL DEFAULT 'manual'\s+CHECK \(youtube_mode IN \(([^)]*)\)\)/);
+    const m = (await appliedYoutubeSql()).match(new RegExp(`youtube_mode text NOT NULL DEFAULT '${SETTINGS_DEFAULTS.youtubeMode}'\\s+CHECK \\(youtube_mode IN \\(([^)]*)\\)\\)`));
     const listed = (m?.[1].match(/'([a-z_]+)'/g) ?? []).map((s) => s.slice(1, -1));
     expect(listed.sort()).toEqual([...YOUTUBE_MODES].sort());
   });

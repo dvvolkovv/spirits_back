@@ -33,6 +33,11 @@ describe('ShortsSettingsService', () => {
     expect((await svc.get()).youtubeMode).toBe('manual');
   });
 
+  it('нет колонки youtube_mode в строке — manual', async () => {
+    const svc = new ShortsSettingsService({ query: jest.fn(async () => ({ rows: [{}] })) } as any);
+    expect((await svc.get()).youtubeMode).toBe('manual');
+  });
+
   it('режим YouTube пишется своей колонкой', async () => {
     const query = jest.fn(async () => ({ rows: [] }));
     await new ShortsSettingsService({ query } as any).update({ youtubeMode: 'unlisted' });
@@ -76,10 +81,11 @@ describe('validateSettingsPatch', () => {
 });
 
 describe('youtubeMode в правке настроек', () => {
-  it('по умолчанию — manual; три режима принимаются; прочее — ошибка с именем поля', () => {
+  it('по умолчанию — manual; через админку — только аварийный откат на manual, включение unlisted/public — только владельцем', () => {
     expect(SETTINGS_DEFAULTS.youtubeMode).toBe('manual');
-    for (const mode of ['manual', 'unlisted', 'public']) {
-      expect(validateSettingsPatch({ youtubeMode: mode })).toEqual({ youtubeMode: mode });
+    expect(validateSettingsPatch({ youtubeMode: 'manual' })).toEqual({ youtubeMode: 'manual' });
+    for (const mode of ['unlisted', 'public']) {
+      expect(() => validateSettingsPatch({ youtubeMode: mode })).toThrow(/только владелец/);
     }
     for (const bad of ['private', 'PUBLIC', '', null, 1]) {
       expect(() => validateSettingsPatch({ youtubeMode: bad })).toThrow(/youtubeMode/);
