@@ -51,8 +51,28 @@ Omni на ролик (`MAX_OMNI_SECONDS`, в конвейере — настро
 ```bash
 studio/scripts/node-run.sh "npm run worker -- --once"   # одно задание и выход
 # Цикл (npm run worker) — не через node-run: он держал бы лок воркдерева 30 минут.
-# Цикл живёт под PM2 (план 3).
 ```
+
+### Под PM2: стенд и прод
+
+На серверах цикл — процесс `linkeon-studio` (`studio/ecosystem.config.cjs`):
+`nice -n 19`, один экземпляр, `kill_timeout` 10 минут — по SIGINT рабочий
+процесс доводит текущее задание и выходит. Его ставит и перезапускает
+`scripts/deploy.sh`, только если рядом лежит `studio/.env` (`~/spirits_back/studio/.env`
+на сервере, вне git, права 600): `npm ci` студии, браузеры Playwright и
+Remotion — в сборке бэкенда, `pm2 startOrReload` — в шаге рестарта после API,
+откат прода возвращает и студию. Без `studio/.env` выкат пишет «студия не
+настроена» и процесс не трогает.
+
+`studio/.env` сервера — значения той же среды, что `~/spirits_back/.env`:
+`DATABASE_URL`, `MINIO_*`, `YANDEX_SPEECHKIT_API_KEY`, `YANDEX_TTS_FOLDER_ID`,
+`GOOGLE_AI_API_KEY`, `DEBUG_SECRET`; плюс `CABINET_URL` и `API_URL` (адрес
+кабинета этой среды), `DEMO_PHONE` (790300XXXXX), `ADMIN_PHONE` (для
+`scripts/stand-admin.ts`), на стенде — `CABINET_BASIC_AUTH`. После первого
+запуска — `pm2 save`, чтобы процесс пережил перезагрузку сервера.
+
+Студия работает и под Node 20 (прод — v20.20.2): весь набор, живая очередь и
+обе фикстуры сборки проверены 27.10.2026.
 
 - Захват — `FOR UPDATE SKIP LOCKED` с арендой 30 минут: задание упавшего
   процесса вернётся в очередь само.
