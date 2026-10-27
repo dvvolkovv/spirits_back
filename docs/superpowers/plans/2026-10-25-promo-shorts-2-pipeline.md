@@ -1,6 +1,6 @@
 # Короткие ролики, план 2: конвейер на стенде — план реализации
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Ролик проходит весь путь без ручной сборки: тема → сцена (режиссёр) → съёмка студией → сценарий с проверкой правил → озвучка и сборка → видео владельцу в Telegram с кнопками → одобрение в слот → Telegram-канал и набор для YouTube. Итог проверяется сквозным прогоном на стенде test.linkeon.io.
 
@@ -113,14 +113,14 @@
 - Modify: `tsconfig.json`, `tsconfig.build.json`, `package.json` (блок `jest`)
 - Modify: `studio/scripts/node-run.sh`
 
-- [ ] **Step 1: Убедиться, что сборка API сейчас видит студию**
+- [x] **Step 1: Убедиться, что сборка API сейчас видит студию**
 
 Это нарочно ломаемая проверка: без неё шаг 5 нечем отличить от пустого прогона. `node-run.sh` пока умеет только `studio/`, поэтому — через `cd ..`:
 
 Run: `studio/scripts/node-run.sh "cd .. && npm ci --no-audit --no-fund >/dev/null 2>&1; npx tsc --listFilesOnly -p tsconfig.build.json | grep -c '/studio/' || true"`
 Expected: число больше нуля (файлы `studio/src/**` в списке сборки).
 
-- [ ] **Step 2: `node-run.sh` — каталог прогона и flock**
+- [x] **Step 2: `node-run.sh` — каталог прогона и flock**
 
 Заменить `studio/scripts/node-run.sh` целиком:
 
@@ -181,7 +181,7 @@ echo \"\$(date -Is) ${sha:0:7} ${dir} pid \$\$\" > ~/ci/wt/.promo-shorts.owner
 exec timeout -k 30 1800 bash -ec ${q}"
 ```
 
-- [ ] **Step 3: Исключить студию из сборки и тестов API**
+- [x] **Step 3: Исключить студию из сборки и тестов API**
 
 В `tsconfig.json` после `compilerOptions` добавить исключения. Без явного `exclude` tsc берёт все `.ts` дерева, включая `studio/`. Значения по умолчанию (`node_modules`, `outDir`) надо перечислить явно, раз список задаётся:
 
@@ -201,7 +201,7 @@ exec timeout -k 30 1800 bash -ec ${q}"
       "<rootDir>/studio/",
 ```
 
-- [ ] **Step 4: Коммит**
+- [x] **Step 4: Коммит**
 
 ```bash
 git -C "$WT" add tsconfig.json tsconfig.build.json package.json studio/scripts/node-run.sh
@@ -210,12 +210,12 @@ git -C "$WT" commit -m "build: студия вне сборки и тестов 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
 
-- [ ] **Step 5: Сборка больше не видит студию, гейт типов чистый**
+- [x] **Step 5: Сборка больше не видит студию, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx tsc --listFilesOnly -p tsconfig.build.json | grep -c '/studio/' || true; npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: `0`, затем `TSC_OK`.
 
-- [ ] **Step 6: jest в корне работает, студия зелёная**
+- [x] **Step 6: jest в корне работает, студия зелёная**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/blog/blog-slots.spec.ts"`
 Expected: `PASS src/blog/blog-slots.spec.ts`.
@@ -223,7 +223,7 @@ Expected: `PASS src/blog/blog-slots.spec.ts`.
 Run: `studio/scripts/node-run.sh "npm test"`
 Expected: `# pass 49`, `# fail 0`.
 
-- [ ] **Step 7: База уже красных сюит бота и блога**
+- [x] **Step 7: База уже красных сюит бота и блога**
 
 На `c787327` сюиты `src/tg-bot` и `src/blog` зелёные (25.10.2026: 57 passed, 3 skipped — интеграционные без своих баз). ESM-пакет агента `@anthropic-ai/claude-agent-sdk`, который тянет `misc.service.ts`, гасит ручной мок `__mocks__/@anthropic-ai/claude-agent-sdk.js` в корне репозитория. Копия репозитория для проверок без каталога `__mocks__` даёт ложные красные (`SyntaxError: Cannot use import statement outside a module`). База всё равно записывается: если `main` принесёт свою красную сюиту, дальше будет видно только новое:
 
@@ -247,7 +247,7 @@ rm -f /tmp/promo-jest.log; npx jest src/shorts src/tg-bot src/blog > /tmp/promo-
 - Create: `src/shorts/shorts.types.ts`
 - Test: `src/shorts/shorts.types.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/shorts.types.spec.ts`:
 
@@ -353,7 +353,7 @@ describe('shortsBucket', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/shorts.types.spec.ts
@@ -365,7 +365,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.types.spec.ts"`
 Expected: FAIL — `Cannot find module './shorts.types'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/shorts.types.ts`:
 
@@ -682,12 +682,12 @@ export function rowToPublication(row: any): ShortPublication {
 }
 ```
 
-- [ ] **Step 4: Тест проходит, гейт типов чистый**
+- [x] **Step 4: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.types.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS (все тесты файла), `TSC_OK`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/shorts.types.ts
@@ -705,7 +705,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/shorts-schema.service.ts`
 - Test: `src/shorts/shorts-schema.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/shorts-schema.spec.ts`:
 
@@ -774,7 +774,7 @@ describe('текст 001_shorts.sql', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/shorts-schema.spec.ts
@@ -786,7 +786,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-schema.spec.ts"`
 Expected: FAIL — `Cannot find module './shorts-schema.service'`.
 
-- [ ] **Step 3: Миграция**
+- [x] **Step 3: Миграция**
 
 `src/shorts/migrations/001_shorts.sql`:
 
@@ -928,7 +928,7 @@ END
 $shorts$;
 ```
 
-- [ ] **Step 4: Сервис наката**
+- [x] **Step 4: Сервис наката**
 
 `src/shorts/shorts-schema.service.ts`:
 
@@ -985,12 +985,12 @@ export class ShortsSchemaService implements OnModuleInit {
 }
 ```
 
-- [ ] **Step 5: Тест проходит, гейт типов чистый**
+- [x] **Step 5: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-schema.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
-- [ ] **Step 6: Коммит**
+- [x] **Step 6: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/migrations/001_shorts.sql src/shorts/shorts-schema.service.ts
@@ -1009,7 +1009,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/short-numbers.ts`
 - Test: `src/shorts/short-numbers.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/short-numbers.spec.ts`:
 
@@ -1049,7 +1049,7 @@ describe('finalLine', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/short-numbers.spec.ts
@@ -1061,7 +1061,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-numbers.spec.ts"`
 Expected: FAIL — `Cannot find module './short-numbers'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/short-numbers.ts`:
 
@@ -1118,12 +1118,12 @@ export function finalLine(assistantsCount: number): string {
 }
 ```
 
-- [ ] **Step 4: Тест проходит, гейт типов чистый**
+- [x] **Step 4: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-numbers.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/short-numbers.ts
@@ -1142,7 +1142,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/short-slug.ts`, `src/shorts/short-links.ts`
 - Test: `src/shorts/short-links.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/short-links.spec.ts`:
 
@@ -1199,7 +1199,7 @@ describe('ссылки роликов', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/short-links.spec.ts
@@ -1211,7 +1211,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-links.spec.ts"`
 Expected: FAIL — `Cannot find module './short-slug'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/short-slug.ts`:
 
@@ -1282,12 +1282,12 @@ export function shortLinks(base: string, target: string, slug: string): Record<L
 }
 ```
 
-- [ ] **Step 4: Тест проходит, гейт типов чистый**
+- [x] **Step 4: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-links.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/short-slug.ts src/shorts/short-links.ts
@@ -1306,7 +1306,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/short-assistants.ts`, `src/shorts/short-rhythm.ts`
 - Test: `src/shorts/short-assistants.spec.ts`, `src/shorts/short-rhythm.spec.ts`
 
-- [ ] **Step 1: Написать падающие тесты**
+- [x] **Step 1: Написать падающие тесты**
 
 `src/shorts/short-assistants.spec.ts`:
 
@@ -1420,7 +1420,7 @@ describe('pickAssistants', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тесты падают**
+- [x] **Step 2: Закоммитить и убедиться, что тесты падают**
 
 ```bash
 git -C "$WT" add src/shorts/short-assistants.spec.ts src/shorts/short-rhythm.spec.ts
@@ -1432,7 +1432,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-assistants.spec.ts src/shorts/short-rhythm.spec.ts"`
 Expected: FAIL — `Cannot find module './short-assistants'` и `'./short-rhythm'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/short-assistants.ts`:
 
@@ -1564,12 +1564,12 @@ export function pickAssistants(
 }
 ```
 
-- [ ] **Step 4: Тесты проходят, гейт типов чистый**
+- [x] **Step 4: Тесты проходят, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-assistants.spec.ts src/shorts/short-rhythm.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS (оба файла), `TSC_OK`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/short-assistants.ts src/shorts/short-rhythm.ts
@@ -1588,7 +1588,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/short-rules.ts`
 - Test: `src/shorts/short-rules.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/short-rules.spec.ts`:
 
@@ -1749,7 +1749,7 @@ describe('numbersIn и estimateSpeechSec', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/short-rules.spec.ts
@@ -1761,7 +1761,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-rules.spec.ts"`
 Expected: FAIL — `Cannot find module './short-rules'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/short-rules.ts`:
 
@@ -1979,14 +1979,14 @@ export function checkScriptRules(i: RulesInput): string[] {
 }
 ```
 
-- [ ] **Step 4: Тест проходит, гейт типов чистый**
+- [x] **Step 4: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-rules.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
 Если «честный сценарий» вдруг ловит замечание — это ошибка стоп-слова (ложное срабатывание), а не повод менять текст теста: сузить шаблон словесными границами, как у остальных.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/short-rules.ts
@@ -2005,7 +2005,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/short-parse.ts`
 - Test: `src/shorts/short-parse.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/short-parse.spec.ts`:
 
@@ -2097,7 +2097,7 @@ describe('parseWriterReply', () => {
 });
 ````
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/short-parse.spec.ts
@@ -2109,7 +2109,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-parse.spec.ts"`
 Expected: FAIL — `Cannot find module './short-parse'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/short-parse.ts`:
 
@@ -2253,12 +2253,12 @@ export function parseWriterReply(raw: string): WriterReply {
 }
 ```
 
-- [ ] **Step 4: Тест проходит, гейт типов чистый**
+- [x] **Step 4: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-parse.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/short-parse.ts
@@ -2275,7 +2275,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/short-callback.ts`
 - Test: `src/shorts/short-callback.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/short-callback.spec.ts`:
 
@@ -2338,7 +2338,7 @@ describe('ссылка YouTube', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/short-callback.spec.ts
@@ -2350,7 +2350,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-callback.spec.ts"`
 Expected: FAIL — `Cannot find module './short-callback'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/short-callback.ts`:
 
@@ -2419,12 +2419,12 @@ export function parseYoutubeUrl(text: unknown): { videoId: string; url: string }
 }
 ```
 
-- [ ] **Step 4: Тест проходит, гейт типов чистый**
+- [x] **Step 4: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-callback.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/short-callback.ts
@@ -2443,7 +2443,7 @@ Telegram молча обрезает подпись длиннее 1000 знак
 - Create: `src/shorts/short-captions.ts`
 - Test: `src/shorts/short-captions.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/short-captions.spec.ts`:
 
@@ -2529,7 +2529,7 @@ describe('buildReviewCaption', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/short-captions.spec.ts
@@ -2541,7 +2541,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-captions.spec.ts"`
 Expected: FAIL — `Cannot find module './short-captions'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/short-captions.ts`:
 
@@ -2639,12 +2639,12 @@ export function buildReviewCaption(i: ReviewCaptionInput): { caption: string; ex
 }
 ```
 
-- [ ] **Step 4: Тест проходит, гейт типов чистый**
+- [x] **Step 4: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-captions.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/short-captions.ts
@@ -2663,7 +2663,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/short-script.ts`
 - Test: `src/shorts/short-script.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/short-script.spec.ts`:
 
@@ -2701,7 +2701,7 @@ describe('buildScript', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/short-script.spec.ts
@@ -2713,7 +2713,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-script.spec.ts"`
 Expected: FAIL — `Cannot find module './short-script'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/short-script.ts`:
 
@@ -2758,12 +2758,12 @@ export function buildScript(reply: Pick<WriterReply, 'hook' | 'hookBox' | 'quest
 }
 ```
 
-- [ ] **Step 4: Тест проходит, гейт типов чистый**
+- [x] **Step 4: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-script.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/short-script.ts
@@ -2782,7 +2782,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/short-slot-claim.ts`
 - Test: `src/shorts/short-slot-claim.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/short-slot-claim.spec.ts`:
 
@@ -2856,7 +2856,7 @@ describe('approveShortIntoSlot', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/short-slot-claim.spec.ts
@@ -2868,7 +2868,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-slot-claim.spec.ts"`
 Expected: FAIL — `Cannot find module './short-slot-claim'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/short-slot-claim.ts`:
 
@@ -2942,12 +2942,12 @@ export async function approveShortIntoSlot(
 }
 ```
 
-- [ ] **Step 4: Тест проходит, гейт типов чистый**
+- [x] **Step 4: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-slot-claim.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/short-slot-claim.ts
@@ -2966,7 +2966,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/short-jobs.ts`
 - Test: `src/shorts/short-jobs.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/short-jobs.spec.ts`:
 
@@ -3025,7 +3025,7 @@ describe('stageFailed', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/short-jobs.spec.ts
@@ -3037,7 +3037,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-jobs.spec.ts"`
 Expected: FAIL — `Cannot find module './short-jobs'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/short-jobs.ts`:
 
@@ -3119,12 +3119,12 @@ export async function stageFailed(pg: Queryable, v: ShortVideo, label: string, e
 }
 ```
 
-- [ ] **Step 4: Тест проходит, гейт типов чистый**
+- [x] **Step 4: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-jobs.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/short-jobs.ts
@@ -3141,7 +3141,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/shorts-settings.service.ts`
 - Test: `src/shorts/shorts-settings.service.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/shorts-settings.service.spec.ts`:
 
@@ -3200,7 +3200,7 @@ describe('validateSettingsPatch', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/shorts-settings.service.spec.ts
@@ -3212,7 +3212,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-settings.service.spec.ts"`
 Expected: FAIL — `Cannot find module './shorts-settings.service'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/shorts-settings.service.ts`:
 
@@ -3354,12 +3354,12 @@ export class ShortsSettingsService {
 }
 ```
 
-- [ ] **Step 4: Тест проходит, гейт типов чистый**
+- [x] **Step 4: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-settings.service.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/shorts-settings.service.ts
@@ -3378,7 +3378,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/short-prompts.ts`
 - Test: `src/shorts/short-prompts.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/short-prompts.spec.ts`:
 
@@ -3469,7 +3469,7 @@ describe('buildWriterMessage', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/short-prompts.spec.ts
@@ -3481,7 +3481,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-prompts.spec.ts"`
 Expected: FAIL — `Cannot find module './short-prompts'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/short-prompts.ts`:
 
@@ -3630,12 +3630,12 @@ export function buildWriterMessage(i: WriterInput): string {
 }
 ```
 
-- [ ] **Step 4: Тест проходит, гейт типов чистый**
+- [x] **Step 4: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-prompts.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/short-prompts.ts
@@ -3654,7 +3654,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/shorts-director.service.ts`
 - Test: `src/shorts/shorts-director.service.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/shorts-director.service.spec.ts`:
 
@@ -3752,7 +3752,7 @@ describe('ShortsDirectorService.direct', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/shorts-director.service.spec.ts
@@ -3764,7 +3764,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-director.service.spec.ts"`
 Expected: FAIL — `Cannot find module './shorts-director.service'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/shorts-director.service.ts`:
 
@@ -3852,12 +3852,12 @@ export class ShortsDirectorService {
 }
 ```
 
-- [ ] **Step 4: Тест проходит, гейт типов чистый**
+- [x] **Step 4: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-director.service.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/shorts-director.service.ts
@@ -3876,7 +3876,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/shorts-writer.service.ts`
 - Test: `src/shorts/shorts-writer.service.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/shorts-writer.service.spec.ts`:
 
@@ -3997,7 +3997,7 @@ describe('ShortsWriterService.write', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/shorts-writer.service.spec.ts
@@ -4009,7 +4009,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-writer.service.spec.ts"`
 Expected: FAIL — `Cannot find module './shorts-writer.service'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/shorts-writer.service.ts`:
 
@@ -4135,12 +4135,12 @@ export class ShortsWriterService {
 }
 ```
 
-- [ ] **Step 4: Тест проходит, гейт типов чистый**
+- [x] **Step 4: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-writer.service.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/shorts-writer.service.ts
@@ -4159,7 +4159,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/shorts-topic.service.ts`
 - Test: `src/shorts/shorts-topic.service.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/shorts-topic.service.spec.ts`:
 
@@ -4300,7 +4300,7 @@ describe('ShortsTopicService.start', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/shorts-topic.service.spec.ts
@@ -4312,7 +4312,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-topic.service.spec.ts"`
 Expected: FAIL — `Cannot find module './shorts-topic.service'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/shorts-topic.service.ts`:
 
@@ -4521,12 +4521,12 @@ export class ShortsTopicService {
 }
 ```
 
-- [ ] **Step 4: Тест проходит, гейт типов чистый**
+- [x] **Step 4: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-topic.service.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/shorts-topic.service.ts
@@ -4545,7 +4545,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/short-env.ts`, `src/shorts/shorts-approval.service.ts`
 - Test: `src/shorts/shorts-approval.service.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/shorts-approval.service.spec.ts`:
 
@@ -4829,7 +4829,7 @@ describe('ShortsApprovalService', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/shorts-approval.service.spec.ts
@@ -4841,7 +4841,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-approval.service.spec.ts"`
 Expected: FAIL — `Cannot find module './shorts-approval.service'`.
 
-- [ ] **Step 3: Флаги окружения**
+- [x] **Step 3: Флаги окружения**
 
 `src/shorts/short-env.ts`:
 
@@ -4856,7 +4856,7 @@ export const autoTopicsEnabled = (): boolean => flag('SHORTS_AUTO_TOPICS');
 export const isStand = (): boolean => flag('SHORTS_STAND');
 ```
 
-- [ ] **Step 4: Сервис одобрения**
+- [x] **Step 4: Сервис одобрения**
 
 `src/shorts/shorts-approval.service.ts`:
 
@@ -5308,12 +5308,12 @@ export class ShortsApprovalService {
 }
 ```
 
-- [ ] **Step 5: Тест проходит, гейт типов чистый**
+- [x] **Step 5: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-approval.service.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
-- [ ] **Step 6: Коммит**
+- [x] **Step 6: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/short-env.ts src/shorts/shorts-approval.service.ts
@@ -5332,7 +5332,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/shorts-publisher.service.ts`
 - Test: `src/shorts/shorts-publisher.service.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/shorts-publisher.service.spec.ts`:
 
@@ -5472,7 +5472,7 @@ describe('ShortsPublisherService.publish', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/shorts-publisher.service.spec.ts
@@ -5484,7 +5484,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-publisher.service.spec.ts"`
 Expected: FAIL — `Cannot find module './shorts-publisher.service'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/shorts-publisher.service.ts`:
 
@@ -5707,12 +5707,12 @@ export class ShortsPublisherService {
 }
 ```
 
-- [ ] **Step 4: Тест проходит, гейт типов чистый**
+- [x] **Step 4: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-publisher.service.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/shorts-publisher.service.ts
@@ -5737,7 +5737,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/shorts.cron.ts`
 - Test: `src/shorts/shorts.cron.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/shorts.cron.spec.ts`:
 
@@ -5823,7 +5823,7 @@ describe('ShortsCron', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/shorts.cron.spec.ts
@@ -5835,7 +5835,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.cron.spec.ts"`
 Expected: FAIL — `Cannot find module './shorts.cron'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/shorts.cron.ts`:
 
@@ -5928,12 +5928,12 @@ export class ShortsCron {
 }
 ```
 
-- [ ] **Step 4: Тест проходит, гейт типов чистый**
+- [x] **Step 4: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.cron.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/shorts.cron.ts
@@ -5952,7 +5952,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `src/shorts/shorts.controller.ts`
 - Test: `src/shorts/shorts.controller.spec.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `src/shorts/shorts.controller.spec.ts`:
 
@@ -6081,7 +6081,7 @@ describe('POST admin/shorts', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add src/shorts/shorts.controller.spec.ts
@@ -6093,7 +6093,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.controller.spec.ts"`
 Expected: FAIL — `Cannot find module './shorts.controller'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `src/shorts/shorts.controller.ts`:
 
@@ -6267,12 +6267,12 @@ export class ShortsController {
 }
 ```
 
-- [ ] **Step 4: Тест проходит, гейт типов чистый**
+- [x] **Step 4: Тест проходит, гейт типов чистый**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.controller.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: PASS, `TSC_OK`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/shorts.controller.ts
@@ -6292,7 +6292,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Modify: `src/app.module.ts:31,87`, `src/tg-bot/tg-bot.module.ts`, `src/tg-bot/tg-bot.service.ts` (импорт ~21, после `shouldRouteToBlog` ~111, конструктор ~151, `handleMessage` ~275, `handleCallbackQuery` ~366, `handleDmCommand` ~411), `.env.example`
 - Test: `src/tg-bot/tg-bot.shorts-routing.spec.ts`, `src/shorts/shorts.module.spec.ts`
 
-- [ ] **Step 1: Написать падающие тесты**
+- [x] **Step 1: Написать падающие тесты**
 
 `src/tg-bot/tg-bot.shorts-routing.spec.ts`:
 
@@ -6480,7 +6480,7 @@ describe('DI-граф роликов', () => {
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тесты падают**
+- [x] **Step 2: Закоммитить и убедиться, что тесты падают**
 
 ```bash
 git -C "$WT" add src/tg-bot/tg-bot.shorts-routing.spec.ts src/shorts/shorts.module.spec.ts
@@ -6492,7 +6492,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/tg-bot/tg-bot.shorts-routing.spec.ts src/shorts/shorts.module.spec.ts"`
 Expected: FAIL — `shouldRouteToShorts is not a function` (или `undefined`), `Cannot find module './shorts.module'`.
 
-- [ ] **Step 3: Модуль**
+- [x] **Step 3: Модуль**
 
 `src/shorts/shorts.module.ts`:
 
@@ -6539,7 +6539,7 @@ import { ShortsCron } from './shorts.cron';
 export class ShortsModule {}
 ```
 
-- [ ] **Step 4: Подключение к приложению и к модулю бота**
+- [x] **Step 4: Подключение к приложению и к модулю бота**
 
 В `src/app.module.ts` после строки `import { BlogModule } from './blog/blog.module';` добавить:
 
@@ -6568,7 +6568,7 @@ import { ShortsModule } from '../shorts/shorts.module';
   ],
 ```
 
-- [ ] **Step 5: Врезки в `TgBotService`**
+- [x] **Step 5: Врезки в `TgBotService`**
 
 В `src/tg-bot/tg-bot.service.ts`:
 
@@ -6624,7 +6624,7 @@ export function shouldRouteToShorts(data?: string): boolean {
     if (await this.shortsApproval?.handleShortCommand(msg)) return;
 ```
 
-- [ ] **Step 6: Переменные в `.env.example`**
+- [x] **Step 6: Переменные в `.env.example`**
 
 В конец `.env.example` дописать:
 
@@ -6643,14 +6643,14 @@ export function shouldRouteToShorts(data?: string): boolean {
 # SHORTS_LINK_BASE=https://test.linkeon.io
 ```
 
-- [ ] **Step 7: Тесты проходят — новые и прежние спеки бота и блога**
+- [x] **Step 7: Тесты проходят — новые и прежние спеки бота и блога**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "rm -f /tmp/promo-jest.log; npx jest src/shorts src/tg-bot src/blog > /tmp/promo-jest.log 2>&1 || true; grep -q '^Tests: ' /tmp/promo-jest.log || { tail -30 /tmp/promo-jest.log; echo JEST_DID_NOT_RUN; exit 1; }; grep -oE '^FAIL [^ ]+' /tmp/promo-jest.log | sort -u > /tmp/promo-fail-now.txt; comm -13 ~/ci/promo-shorts-jest-fail-base.txt /tmp/promo-fail-now.txt > /tmp/promo-fail-new.txt; cat /tmp/promo-fail-new.txt; test ! -s /tmp/promo-fail-new.txt && echo NO_NEW_FAILS && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: `NO_NEW_FAILS` и `TSC_OK`. Сюиты задачи (`src/shorts/*`, `tg-bot.shorts-routing.spec.ts`) — PASS. Интеграционные `shorts.integration.spec.ts` и `blog-approval.integration.spec.ts` без своих переменных — skipped. Если база задачи 0 не пустая, её сюиты красными и остаются — это не от этой работы.
 
 Прежние спеки `src/tg-bot` собирают `TgBotService` из 13–14 аргументов. Новый параметр стоит последним и `@Optional`, поэтому они не меняются. Если среди новых красных — прежняя спека бота, сначала проверить её позиционные аргументы и не трогать порядок параметров.
 
-- [ ] **Step 8: Коммит**
+- [x] **Step 8: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/shorts.module.ts src/app.module.ts src/tg-bot/tg-bot.module.ts src/tg-bot/tg-bot.service.ts .env.example
@@ -6675,7 +6675,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 **Files:**
 - Test: `src/shorts/shorts.integration.spec.ts`
 
-- [ ] **Step 1: Одноразовая база на ноде (один раз)**
+- [x] **Step 1: Одноразовая база на ноде (один раз)**
 
 ```bash
 ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 "sudo -u postgres psql -qc \"CREATE ROLE shortsit LOGIN PASSWORD 'shortsit'\" 2>/dev/null; sudo -u postgres psql -qc 'DROP DATABASE IF EXISTS shorts_it' && sudo -u postgres psql -qc 'CREATE DATABASE shorts_it OWNER shortsit' && echo DB_OK"
@@ -6683,7 +6683,7 @@ ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o C
 
 Expected: `DB_OK`. Роль с паролем — как у `blog_notes`: node-pg ходит по TCP, peer-аутентификации у него нет.
 
-- [ ] **Step 2: Написать тест**
+- [x] **Step 2: Написать тест**
 
 `src/shorts/shorts.integration.spec.ts`:
 
@@ -6897,7 +6897,7 @@ maybe('ролики против живого Postgres', () => {
 });
 ```
 
-- [ ] **Step 3: Убедиться, что без базы файл пропускается, а с базой — зелёный**
+- [x] **Step 3: Убедиться, что без базы файл пропускается, а с базой — зелёный**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.integration.spec.ts"`
 Expected: `Tests: 7 skipped`.
@@ -6907,7 +6907,7 @@ Expected: `Tests: 7 passed`.
 
 Красный тест здесь — дефект SQL, а не теста. Гонка одобрений: два одинаковых слота — индекса `uq_short_video_slot` нет или он создан не тем предикатом (блокировка свободный слот не держит, его держит индекс); отказ с сырым 23505 — имя индекса в миграции разошлось с `SHORT_SLOT_INDEX`.
 
-- [ ] **Step 4: Коммит**
+- [x] **Step 4: Коммит**
 
 ```bash
 git -C "$WT" add src/shorts/shorts.integration.spec.ts
@@ -6930,7 +6930,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `studio/src/errors.ts`, `studio/src/errors.test.ts`
 - Modify: `studio/src/capture/chat-scene.ts`, `studio/src/capture/login.ts`, `studio/src/timeline.ts`, `studio/src/tts.ts`, `studio/src/render/run-render.ts`, `studio/package.json` (`test`)
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `studio/src/errors.test.ts`:
 
@@ -6994,7 +6994,7 @@ test('сцены не по порядку — script_invalid', () => {
     "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts src/plural.test.ts src/script.test.ts src/answer.test.ts src/ffprobe.test.ts src/config.test.ts src/tts.test.ts src/render/props.test.ts src/errors.test.ts",
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add studio/src/errors.test.ts studio/package.json
@@ -7006,7 +7006,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `studio/scripts/node-run.sh "npx tsx --test src/errors.test.ts"`
 Expected: FAIL — `Cannot find module '…/src/errors'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `studio/src/errors.ts`:
 
@@ -7059,7 +7059,7 @@ export function toStudioError(e: unknown): StudioError {
 }
 ```
 
-- [ ] **Step 4: Коды в местах, где студия бросает**
+- [x] **Step 4: Коды в местах, где студия бросает**
 
 Во всех файлах ниже добавить импорт `import { StudioError } from '../errors';` (в `src/timeline.ts` и `src/tts.ts` — `from './errors'`). Тексты сообщений не меняются: тесты и владелец их уже знают.
 
@@ -7110,12 +7110,12 @@ if (!resp.ok) throw new StudioError('tts', `tts ${r.id}: SpeechKit ${resp.status
 if (scriptProblems.length) throw new StudioError('script_invalid', `render: сценарий не прошёл проверку:\n- ${scriptProblems.join('\n- ')}`, false);
 ```
 
-- [ ] **Step 5: Тесты и типы зелёные**
+- [x] **Step 5: Тесты и типы зелёные**
 
 Run: `studio/scripts/node-run.sh "npx tsc --noEmit && npm test"`
 Expected: `tsc` без вывода; `# fail 0`.
 
-- [ ] **Step 6: Коммит**
+- [x] **Step 6: Коммит**
 
 ```bash
 git -C "$WT" add studio/src/errors.ts studio/src/capture/chat-scene.ts studio/src/capture/login.ts studio/src/timeline.ts studio/src/tts.ts studio/src/render/run-render.ts
@@ -7134,7 +7134,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `studio/src/frame.ts`, `studio/src/frame.test.ts`
 - Modify: `studio/src/remotion/theme.ts`, `studio/src/capture/chat-scene.ts`, `studio/src/ffprobe.ts`, `studio/src/render/props.ts`, `studio/src/render/props.test.ts`, `studio/package.json` (`test`)
 
-- [ ] **Step 1: Написать падающие тесты**
+- [x] **Step 1: Написать падающие тесты**
 
 `studio/src/frame.test.ts`:
 
@@ -7175,7 +7175,7 @@ test('снимок ответа не той ширины — frame_size без �
     "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts src/plural.test.ts src/script.test.ts src/answer.test.ts src/ffprobe.test.ts src/config.test.ts src/tts.test.ts src/render/props.test.ts src/errors.test.ts src/frame.test.ts",
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тесты падают**
+- [x] **Step 2: Закоммитить и убедиться, что тесты падают**
 
 ```bash
 git -C "$WT" add studio/src/frame.test.ts studio/src/render/props.test.ts studio/package.json
@@ -7187,7 +7187,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `studio/scripts/node-run.sh "npx tsx --test src/frame.test.ts src/render/props.test.ts"`
 Expected: FAIL — `Cannot find module '…/src/frame'`; тест `frame_size` падает — `Missing expected exception`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `studio/src/frame.ts`:
 
@@ -7246,12 +7246,12 @@ export const SHORT_LIMITS: VerifyLimits = { minSec: 30, maxSec: 60, width: FRAME
 
 и импорты `import { StudioError } from '../errors';`, `import { FRAME } from '../frame';`.
 
-- [ ] **Step 4: Тесты и типы зелёные**
+- [x] **Step 4: Тесты и типы зелёные**
 
 Run: `studio/scripts/node-run.sh "npx tsc --noEmit && npm test"`
 Expected: `tsc` без вывода; `# fail 0`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add studio/src/frame.ts studio/src/remotion/theme.ts studio/src/capture/chat-scene.ts studio/src/ffprobe.ts studio/src/render/props.ts
@@ -7269,7 +7269,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 **Files:**
 - Modify: `studio/src/types.ts`, `studio/src/boxes.ts`, `studio/src/boxes.test.ts`, `studio/src/capture/chat-scene.ts`, `studio/src/capture/login.ts`, `studio/src/capture/run-capture.ts`, `studio/src/render/props.ts`, `studio/src/render/props.test.ts`, `studio/src/render/render.fixture.ts`, `studio/scenes/sample-lawyer-lease.script.json`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 В конец `studio/src/boxes.test.ts` и в его импорт — `toAnswerLayout`:
 
@@ -7300,7 +7300,7 @@ test('полный текст абзацев — с теми же номерам
 - в `script` заменить `final: { disclaimer: 'Ответ ИИ, не заменяет специалиста' },` на `final: { assistantsCount: 18, disclaimer: 'Ответ ИИ, не заменяет специалиста' },`;
 - первый тест переименовать в `'пропсы: пути озвучки относительно папки съёмки, финал — из сценария'`, его проверки не меняются.
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add studio/src/boxes.test.ts studio/src/render/props.test.ts
@@ -7312,7 +7312,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `studio/scripts/node-run.sh "npx tsx --test src/boxes.test.ts src/render/props.test.ts"`
 Expected: FAIL — `toAnswerLayout is not a function`; в `props.test.ts` финал получает `assistantsCount: undefined`.
 
-- [ ] **Step 3: Типы**
+- [x] **Step 3: Типы**
 
 В `studio/src/types.ts`:
 
@@ -7341,7 +7341,7 @@ export interface Paragraph {
   final: { assistantsCount: number; disclaimer?: string };
 ```
 
-- [ ] **Step 4: Абзацы из DOM**
+- [x] **Step 4: Абзацы из DOM**
 
 `studio/src/boxes.ts` заменить целиком:
 
@@ -7422,12 +7422,12 @@ export function toImageBoxes(rects: CssRect[], scale: number, imageHeight = Infi
 - в `capture.json` убрать `assistantsCount: 18,` и добавить `paragraphs: [{ n: 1, text: 'a' }, { n: 2, text: 'b' }, { n: 3, text: 'c' }],`;
 - в `script.json` заменить `final: { disclaimer: 'Ответ ИИ, не заменяет специалиста' },` на `final: { assistantsCount: 18, disclaimer: 'Ответ ИИ, не заменяет специалиста' },`.
 
-- [ ] **Step 5: Тесты, типы и сквозной рендер зелёные**
+- [x] **Step 5: Тесты, типы и сквозной рендер зелёные**
 
 Run: `studio/scripts/node-run.sh "npx tsc --noEmit && npm test && npm run test:render"`
 Expected: `tsc` без вывода; `# fail 0` в обоих прогонах.
 
-- [ ] **Step 6: Коммит**
+- [x] **Step 6: Коммит**
 
 ```bash
 git -C "$WT" add studio/src/types.ts studio/src/boxes.ts studio/src/capture/chat-scene.ts studio/src/capture/login.ts studio/src/capture/run-capture.ts studio/src/render/props.ts studio/src/render/render.fixture.ts studio/scenes/sample-lawyer-lease.script.json
@@ -7450,7 +7450,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 **Files:**
 - Modify: `studio/src/types.ts`, `studio/src/script.ts`, `studio/src/script.test.ts`, `studio/src/timeline.ts`, `studio/src/timeline.test.ts`, `studio/src/render/props.ts`, `studio/src/render/props.test.ts`, `studio/src/remotion/Short.tsx`, `studio/src/remotion/scenes/Question.tsx`
 
-- [ ] **Step 1: Написать падающие тесты**
+- [x] **Step 1: Написать падающие тесты**
 
 В `studio/src/script.test.ts` в `good()` заменить `final: {},` на `final: { assistantsCount: 18 },` и дописать:
 
@@ -7487,7 +7487,7 @@ test('подпись реального кейса доходит до комп�
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тесты падают**
+- [x] **Step 2: Закоммитить и убедиться, что тесты падают**
 
 ```bash
 git -C "$WT" add studio/src/script.test.ts studio/src/timeline.test.ts studio/src/render/props.test.ts
@@ -7499,7 +7499,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `studio/scripts/node-run.sh "npx tsx --test src/script.test.ts src/timeline.test.ts src/render/props.test.ts"`
 Expected: FAIL — нет проверок `hookBox` и числа ассистентов, нет `MIN_ANSWER_LINE_MS`, `badge` — `undefined`.
 
-- [ ] **Step 3: Типы**
+- [x] **Step 3: Типы**
 
 В `studio/src/types.ts`, в `Script` после `hook: string;`:
 
@@ -7516,7 +7516,7 @@ Expected: FAIL — нет проверок `hookBox` и числа ассист�
   badge?: string;
 ```
 
-- [ ] **Step 4: Проверки**
+- [x] **Step 4: Проверки**
 
 `studio/src/script.ts` — после цикла по репликам, перед поиском `hookLine`:
 
@@ -7558,7 +7558,7 @@ export const MIN_ANSWER_LINE_MS = 1500;
     badge: script.badge,
 ```
 
-- [ ] **Step 5: Подпись в кадре вопроса**
+- [x] **Step 5: Подпись в кадре вопроса**
 
 `studio/src/remotion/scenes/Question.tsx` заменить целиком:
 
@@ -7613,12 +7613,12 @@ export const Question: React.FC<{ questionShot: string; durationInFrames: number
         <Question questionShot={p.questionShot} durationInFrames={scenes.question.duration} badge={p.badge} />
 ```
 
-- [ ] **Step 6: Тесты, типы и сквозной рендер зелёные**
+- [x] **Step 6: Тесты, типы и сквозной рендер зелёные**
 
 Run: `studio/scripts/node-run.sh "npx tsc --noEmit && npm test && npm run test:render"`
 Expected: `tsc` без вывода; `# fail 0` в обоих прогонах.
 
-- [ ] **Step 7: Коммит**
+- [x] **Step 7: Коммит**
 
 ```bash
 git -C "$WT" add studio/src/types.ts studio/src/script.ts studio/src/timeline.ts studio/src/render/props.ts studio/src/remotion/Short.tsx studio/src/remotion/scenes/Question.tsx
@@ -7637,7 +7637,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `studio/src/answer-motion.ts`, `studio/src/answer-motion.test.ts`
 - Modify: `studio/src/remotion/scenes/Answer.tsx`, `studio/package.json` (`test`)
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `studio/src/answer-motion.test.ts`:
 
@@ -7703,7 +7703,7 @@ test('рамка не уходит за кадр на пике приближе�
     "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts src/plural.test.ts src/script.test.ts src/answer.test.ts src/ffprobe.test.ts src/config.test.ts src/tts.test.ts src/render/props.test.ts src/errors.test.ts src/frame.test.ts src/answer-motion.test.ts",
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add studio/src/answer-motion.test.ts studio/package.json
@@ -7715,7 +7715,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `studio/scripts/node-run.sh "npx tsx --test src/answer-motion.test.ts"`
 Expected: FAIL — `Cannot find module '…/src/answer-motion'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `studio/src/answer-motion.ts`:
 
@@ -7862,12 +7862,12 @@ export const Answer: React.FC<{
 };
 ```
 
-- [ ] **Step 4: Тесты, типы и сквозной рендер зелёные**
+- [x] **Step 4: Тесты, типы и сквозной рендер зелёные**
 
 Run: `studio/scripts/node-run.sh "npx tsc --noEmit && npm test && npm run test:render"`
 Expected: `tsc` без вывода; `# fail 0` в обоих прогонах.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add studio/src/answer-motion.ts studio/src/remotion/scenes/Answer.tsx
@@ -7886,7 +7886,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Modify: `studio/src/capture/run-capture.ts`, `studio/package.json` (`test`)
 - Create: `studio/src/capture/run-capture.test.ts`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `studio/src/capture/run-capture.test.ts`:
 
@@ -7907,7 +7907,7 @@ test('команду capture можно импортировать: без ар�
     "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts src/plural.test.ts src/script.test.ts src/answer.test.ts src/ffprobe.test.ts src/config.test.ts src/tts.test.ts src/render/props.test.ts src/errors.test.ts src/frame.test.ts src/answer-motion.test.ts src/capture/run-capture.test.ts",
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add studio/src/capture/run-capture.test.ts studio/package.json
@@ -7919,7 +7919,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `studio/scripts/node-run.sh "npx tsx --test src/capture/run-capture.test.ts"`
 Expected: FAIL — импорт запускает команду, а она без аргументов выходит с `usage: npm run capture` и кодом 2.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `studio/src/capture/run-capture.ts` заменить целиком:
 
@@ -7972,12 +7972,12 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
 }
 ```
 
-- [ ] **Step 4: Тесты и типы зелёные**
+- [x] **Step 4: Тесты и типы зелёные**
 
 Run: `studio/scripts/node-run.sh "npx tsc --noEmit && npm test"`
 Expected: `tsc` без вывода; `# fail 0`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add studio/src/capture/run-capture.ts
@@ -7995,7 +7995,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 **Files:**
 - Modify: `studio/package.json`, `studio/package-lock.json`, `studio/src/config.ts`, `studio/src/config.test.ts`, `studio/.env.example`
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 В конец `studio/src/config.test.ts`:
 
@@ -8014,7 +8014,7 @@ test('рабочему процессу нужны база и MinIO; бакет
 });
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add studio/src/config.test.ts
@@ -8026,7 +8026,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `studio/scripts/node-run.sh "npx tsx --test src/config.test.ts"`
 Expected: FAIL — `Missing expected exception` (DATABASE_URL не требуется).
 
-- [ ] **Step 3: Конфиг**
+- [x] **Step 3: Конфиг**
 
 `studio/src/config.ts`. Добавить тип и расширить `StudioConfig` и `parseConfig`:
 
@@ -8088,7 +8088,7 @@ MINIO_SECRET_KEY=
 MINIO_BUCKET_VIDEOS=linkeon-smm-videos
 ```
 
-- [ ] **Step 4: Зависимости**
+- [x] **Step 4: Зависимости**
 
 В `studio/package.json`: в `dependencies` добавить `"@aws-sdk/client-s3": "^3.1025.0"`, `"pg": "^8.11.0"` и перенести туда `"tsx": "^4.23.12"` из `devDependencies`; в `devDependencies` добавить `"@types/pg": "^8.10.0"`. Порядок ключей — по алфавиту, как сейчас.
 
@@ -8099,7 +8099,7 @@ git -C "$WT" commit -m "feat(studio): окружение и зависимост
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
 
-- [ ] **Step 5: Поставить зависимости на ноде и забрать lock-файл**
+- [x] **Step 5: Поставить зависимости на ноде и забрать lock-файл**
 
 `npm install` перепишет `package-lock.json` в воркдереве ноды. Новый lock-файл забираем тем же прогоном и там же откатываем, под тем же локом: иначе следующий прогон упрётся в изменённый файл в дереве ноды. Весь вывод `npm install` — в stderr, в stdout — только lock-файл:
 
@@ -8127,7 +8127,7 @@ Expected: `npm ci` проходит по lock-файлу; `tsc` без выво�
 - Create: `studio/src/worker/db.ts`, `studio/src/worker/db.integration.ts`
 - Modify: `studio/package.json` (`test:db`)
 
-- [ ] **Step 1: Одноразовая база на ноде (один раз)**
+- [x] **Step 1: Одноразовая база на ноде (один раз)**
 
 ```bash
 ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 "sudo -u postgres psql -qc \"CREATE ROLE studioit LOGIN PASSWORD 'studioit'\" 2>/dev/null; sudo -u postgres psql -qc 'DROP DATABASE IF EXISTS studio_it' && sudo -u postgres psql -qc 'CREATE DATABASE studio_it OWNER studioit' && echo DB_OK"
@@ -8135,7 +8135,7 @@ ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o C
 
 Expected: `DB_OK`. База своя, не `shorts_it`: прогоны бэкенда и студии не стирают строки друг друга.
 
-- [ ] **Step 2: Написать тест**
+- [x] **Step 2: Написать тест**
 
 `studio/src/worker/db.integration.ts`:
 
@@ -8279,7 +8279,7 @@ describe('очередь студии против живого Postgres', { ski
     "test:db": "tsx --test src/worker/db.integration.ts",
 ```
 
-- [ ] **Step 3: Закоммитить и убедиться, что тест падает**
+- [x] **Step 3: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add studio/src/worker/db.integration.ts studio/package.json
@@ -8291,7 +8291,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `studio/scripts/node-run.sh "STUDIO_PG_URL=postgresql://studioit:studioit@127.0.0.1:5432/studio_it npm run test:db"`
 Expected: FAIL — `Cannot find module '…/src/worker/db'`.
 
-- [ ] **Step 4: Реализация**
+- [x] **Step 4: Реализация**
 
 `studio/src/worker/db.ts`:
 
@@ -8473,7 +8473,7 @@ export function pgQueue(db: Queryable): Queue {
 }
 ```
 
-- [ ] **Step 5: Тест проходит, типы чистые**
+- [x] **Step 5: Тест проходит, типы чистые**
 
 Run: `studio/scripts/node-run.sh "npx tsc --noEmit && STUDIO_PG_URL=postgresql://studioit:studioit@127.0.0.1:5432/studio_it npm run test:db"`
 Expected: `tsc` без вывода; `# pass 6`, `# fail 0`.
@@ -8481,7 +8481,7 @@ Expected: `tsc` без вывода; `# pass 6`, `# fail 0`.
 Run: `studio/scripts/node-run.sh "npm run test:db"`
 Expected: тесты пропущены (`# skipped 6` или описание помечено skip), не упали.
 
-- [ ] **Step 6: Коммит**
+- [x] **Step 6: Коммит**
 
 ```bash
 git -C "$WT" add studio/src/worker/db.ts
@@ -8498,7 +8498,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `studio/src/worker/storage.ts`, `studio/src/worker/storage.test.ts`
 - Modify: `studio/package.json` (`test`)
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `studio/src/worker/storage.test.ts`:
 
@@ -8549,7 +8549,7 @@ test('файл уходит в бакет под ключом, с типом; с
     "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts src/plural.test.ts src/script.test.ts src/answer.test.ts src/ffprobe.test.ts src/config.test.ts src/tts.test.ts src/render/props.test.ts src/errors.test.ts src/frame.test.ts src/answer-motion.test.ts src/capture/run-capture.test.ts src/worker/storage.test.ts",
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add studio/src/worker/storage.test.ts studio/package.json
@@ -8561,7 +8561,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `studio/scripts/node-run.sh "npx tsx --test src/worker/storage.test.ts"`
 Expected: FAIL — `Cannot find module '…/src/worker/storage'`.
 
-- [ ] **Step 3: Реализация**
+- [x] **Step 3: Реализация**
 
 `studio/src/worker/storage.ts`:
 
@@ -8604,12 +8604,12 @@ export function s3Storage(cfg: MinioConfig, client?: { send(cmd: any): Promise<a
 }
 ```
 
-- [ ] **Step 4: Тесты и типы зелёные**
+- [x] **Step 4: Тесты и типы зелёные**
 
 Run: `studio/scripts/node-run.sh "npx tsc --noEmit && npm test"`
 Expected: `tsc` без вывода; `# fail 0`.
 
-- [ ] **Step 5: Коммит**
+- [x] **Step 5: Коммит**
 
 ```bash
 git -C "$WT" add studio/src/worker/storage.ts
@@ -8628,7 +8628,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `studio/src/worker/jobs.ts`, `studio/src/worker/jobs.test.ts`
 - Modify: `studio/src/render/run-render.ts` (длительность в результате), `studio/package.json` (`test`)
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать падающий тест**
 
 `studio/src/worker/jobs.test.ts`:
 
@@ -8809,7 +8809,7 @@ test('старые рабочие папки удаляются, свежие �
     "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts src/plural.test.ts src/script.test.ts src/answer.test.ts src/ffprobe.test.ts src/config.test.ts src/tts.test.ts src/render/props.test.ts src/errors.test.ts src/frame.test.ts src/answer-motion.test.ts src/capture/run-capture.test.ts src/worker/storage.test.ts src/worker/jobs.test.ts",
 ```
 
-- [ ] **Step 2: Закоммитить и убедиться, что тест падает**
+- [x] **Step 2: Закоммитить и убедиться, что тест падает**
 
 ```bash
 git -C "$WT" add studio/src/worker/jobs.test.ts studio/package.json
@@ -8821,13 +8821,13 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `studio/scripts/node-run.sh "npx tsx --test src/worker/jobs.test.ts"`
 Expected: FAIL — `Cannot find module '…/src/worker/jobs'`.
 
-- [ ] **Step 3: Длительность в результате сборки**
+- [x] **Step 3: Длительность в результате сборки**
 
 `studio/src/render/run-render.ts`:
 - в `RenderResult` после `problems: string[];` добавить `durationSec: number;`;
 - `return { video, cover, problems: verifyVideo(probe, silences) };` → `return { video, cover, problems: verifyVideo(probe, silences), durationSec: probe.durationSec };`.
 
-- [ ] **Step 4: Реализация заданий**
+- [x] **Step 4: Реализация заданий**
 
 `studio/src/worker/jobs.ts`:
 
@@ -8928,12 +8928,12 @@ export function pruneOld(workRoot: string, days: number, now = Date.now()): numb
 }
 ```
 
-- [ ] **Step 5: Тесты и типы зелёные**
+- [x] **Step 5: Тесты и типы зелёные**
 
 Run: `studio/scripts/node-run.sh "npx tsc --noEmit && npm test"`
 Expected: `tsc` без вывода; `# fail 0`.
 
-- [ ] **Step 6: Коммит**
+- [x] **Step 6: Коммит**
 
 ```bash
 git -C "$WT" add studio/src/worker/jobs.ts studio/src/render/run-render.ts
@@ -8952,7 +8952,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 - Create: `studio/src/worker/worker.ts`, `studio/scripts/stand-admin.ts`, `src/shorts/shorts.contract.spec.ts`
 - Modify: `studio/src/capture/login.ts` (экспорт вебхуков входа), `studio/package.json` (`worker`), `studio/.env.example`, `studio/README.md`
 
-- [ ] **Step 1: Сторож контракта (бэкенд) — падающий тест**
+- [x] **Step 1: Сторож контракта (бэкенд) — падающий тест**
 
 `src/shorts/shorts.contract.spec.ts`:
 
@@ -9007,7 +9007,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.contract.spec.ts"`
 Expected: PASS: обе половины уже написаны (задачи 1, 26–27, 31, 33). Если тест красный — разошлись имена полей. Чинить расхождение в коде, не в тесте.
 
-- [ ] **Step 2: Рабочий процесс**
+- [x] **Step 2: Рабочий процесс**
 
 `studio/src/worker/worker.ts`:
 
@@ -9079,7 +9079,7 @@ process.exit(0);
     "worker": "tsx src/worker/worker.ts",
 ```
 
-- [ ] **Step 3: Админка стенда с ноды**
+- [x] **Step 3: Админка стенда с ноды**
 
 В `studio/src/capture/login.ts` объявления вебхуков сделать экспортом:
 
@@ -9187,7 +9187,7 @@ ADMIN_PHONE=
 ADMIN_API_URL=http://127.0.0.1:3001
 ```
 
-- [ ] **Step 4: README**
+- [x] **Step 4: README**
 
 В `studio/README.md` после раздела «Как устроен ролик» добавить:
 
@@ -9222,7 +9222,7 @@ studio/scripts/node-run.sh "npx tsx scripts/stand-admin.ts start_now id=<uuid>"
 ```
 ````
 
-- [ ] **Step 5: Типы и тесты зелёные, процесс запускается**
+- [x] **Step 5: Типы и тесты зелёные, процесс запускается**
 
 Run: `studio/scripts/node-run.sh "npx tsc --noEmit && npm test && npx tsc --noEmit --module ES2022 --moduleResolution bundler --target ES2022 --strict --skipLibCheck --types node scripts/stand-admin.ts"`
 Expected: без вывода ошибок; `# fail 0`. `tsconfig.json` студии включает только `src/`, поэтому скрипт проверяется отдельной командой.
@@ -9230,7 +9230,7 @@ Expected: без вывода ошибок; `# fail 0`. `tsconfig.json` студ
 Run: `studio/scripts/node-run.sh "DOTENV_CONFIG_PATH=/dev/null DEMO_PHONE=79030000001 DEBUG_SECRET=x YANDEX_SPEECHKIT_API_KEY=x YANDEX_TTS_FOLDER_ID=x npm run worker -- --once || echo EXIT=\$?"`
 Expected: падение с `studio: не задана переменная DATABASE_URL` и `EXIT=1` — без базы процесс не стартует молча. `DOTENV_CONFIG_PATH=/dev/null` не даёт `dotenv` подставить базу из `studio/.env`: иначе проверка забрала бы настоящее задание стенда.
 
-- [ ] **Step 6: Коммит**
+- [x] **Step 6: Коммит**
 
 ```bash
 git -C "$WT" add studio/src/worker/worker.ts studio/scripts/stand-admin.ts studio/src/capture/login.ts studio/package.json studio/.env.example studio/README.md
@@ -9249,22 +9249,22 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 
 **Files:** нет изменений.
 
-- [ ] **Step 1: Бэкенд — затронутые каталоги, живой Postgres, гейт типов**
+- [x] **Step 1: Бэкенд — затронутые каталоги, живой Postgres, гейт типов**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "rm -f /tmp/promo-jest.log; npx jest src/shorts src/tg-bot src/blog > /tmp/promo-jest.log 2>&1 || true; grep -q '^Tests: ' /tmp/promo-jest.log || { tail -30 /tmp/promo-jest.log; echo JEST_DID_NOT_RUN; exit 1; }; grep -oE '^FAIL [^ ]+' /tmp/promo-jest.log | sort -u > /tmp/promo-fail-now.txt; comm -13 ~/ci/promo-shorts-jest-fail-base.txt /tmp/promo-fail-now.txt > /tmp/promo-fail-new.txt; cat /tmp/promo-fail-new.txt; test ! -s /tmp/promo-fail-new.txt && echo NO_NEW_FAILS && SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts && npx tsc --noEmit -p tsconfig.build.json && echo TSC_OK"`
 Expected: `NO_NEW_FAILS`; интеграционный — `7 passed`; `TSC_OK`.
 
-- [ ] **Step 2: Сборка API не изменила раскладку `dist/`**
+- [x] **Step 2: Сборка API не изменила раскладку `dist/`**
 
 Run: `NODE_RUN_DIR=. studio/scripts/node-run.sh "rm -rf dist && npm run build >/dev/null && test -f dist/main.js && test ! -e dist/studio && test ! -e dist/src && echo BUILD_OK"`
 Expected: `BUILD_OK`. `dist/main.js` на месте, студии в сборке нет. Если появился `dist/src/` — `studio/` снова попала в `tsconfig.build.json`, и прод не стартует.
 
-- [ ] **Step 3: Студия — с нуля по lock-файлу, все прогоны**
+- [x] **Step 3: Студия — с нуля по lock-файлу, все прогоны**
 
 Run: `studio/scripts/node-run.sh "npm ci --no-audit --no-fund && npx tsc --noEmit && npm test && STUDIO_PG_URL=postgresql://studioit:studioit@127.0.0.1:5432/studio_it npm run test:db && npm run test:render"`
 Expected: `tsc` без вывода; `# fail 0` во всех трёх прогонах; сквозной рендер фикстуры проходит.
 
-- [ ] **Step 4: Финальное ревью ветки**
+- [x] **Step 4: Финальное ревью ветки**
 
 По правилам subagent-driven-development: ревьюер смотрит весь дифф `feat/promo-shorts` от `9d7c7a3` против спеки и этого плана. Замечания чинятся до задачи 36. Ревьюеру — без `git checkout` в общем воркдереве.
 
@@ -9276,7 +9276,7 @@ Expected: `tsc` без вывода; `# fail 0` во всех трёх прог�
 
 **Files:** нет изменений в репозитории; на стенде — `~/spirits_back/.env`.
 
-- [ ] **Step 1: Спросить владельца**
+- [x] **Step 1: Спросить владельца**
 
 Одним сообщением:
 - влить `feat/promo-shorts` в `main`;
@@ -9286,7 +9286,7 @@ Expected: `tsc` без вывода; `# fail 0` во всех трёх прог�
 
 Без явного «да» дальше не идти.
 
-- [ ] **Step 2: Слияние в чистом клоне**
+- [x] **Step 2: Слияние в чистом клоне**
 
 Ниже `SCRATCH` — каталог временных файлов сессии.
 
@@ -9301,14 +9301,14 @@ git -C "$SCRATCH/shorts-merge" merge --no-ff origin/feat/promo-shorts \
 
 Конфликт — остановиться и разобрать вручную. Вероятные места: `package.json` (блок `jest`), `tsconfig.build.json`, `src/app.module.ts`, `src/tg-bot/*`. Правки параллельных сессий в них не терять.
 
-- [ ] **Step 3: Прогон итога слияния на ноде**
+- [x] **Step 3: Прогон итога слияния на ноде**
 
 `node-run.sh` клона пушит ветку `merge/promo-shorts-2` (не `main`) и гоняет её точный коммит:
 
 Run: `NODE_RUN_DIR=. "$SCRATCH/shorts-merge/studio/scripts/node-run.sh" "npm ci --no-audit --no-fund >/dev/null; rm -f /tmp/promo-jest.log; npx jest src/shorts src/tg-bot src/blog > /tmp/promo-jest.log 2>&1 || true; grep -q '^Tests: ' /tmp/promo-jest.log || { tail -30 /tmp/promo-jest.log; echo JEST_DID_NOT_RUN; exit 1; }; grep -oE '^FAIL [^ ]+' /tmp/promo-jest.log | sort -u > /tmp/promo-fail-now.txt; comm -13 ~/ci/promo-shorts-jest-fail-base.txt /tmp/promo-fail-now.txt > /tmp/promo-fail-new.txt; cat /tmp/promo-fail-new.txt; test ! -s /tmp/promo-fail-new.txt && npx tsc --noEmit -p tsconfig.build.json && rm -rf dist && npm run build >/dev/null && test -f dist/main.js && echo MERGE_OK"`
 Expected: `MERGE_OK`. Если `main` за это время принёс свои красные сюиты, их видно в выводе списком — разобрать, чьи они, прежде чем вливать.
 
-- [ ] **Step 4: В main — только перемоткой, затем убрать временную ветку**
+- [x] **Step 4: В main — только перемоткой, затем убрать временную ветку**
 
 ```bash
 git -C "$SCRATCH/shorts-merge" fetch -q origin main
@@ -9320,7 +9320,7 @@ git -C "$SCRATCH/shorts-merge" push -q origin --delete merge/promo-shorts-2
 
 Если `FF_OK` не напечатался, `main` ушёл вперёд. Тогда `git -C "$SCRATCH/shorts-merge" merge origin/main`, затем снова шаги 3–4.
 
-- [ ] **Step 5: Переменные роликов на стенде**
+- [x] **Step 5: Переменные роликов на стенде**
 
 Копия `.env` кладётся вне каталога приложения. Строки дописываются, только если их ещё нет. Значения секретов не печатаются.
 
@@ -9330,7 +9330,7 @@ ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o C
 
 Expected: четыре строки `SHORTS_…`. API прочтёт их при рестарте, который сделает `deploy.sh`.
 
-- [ ] **Step 6: Выкат на стенд — отвязанно, из чистого клона, без `tail`**
+- [x] **Step 6: Выкат на стенд — отвязанно, из чистого клона, без `tail`**
 
 Рецепт «выкат со свежих клонов»: файл с кредами стенда и `node_modules` тестов — из общего чекаута.
 
@@ -9343,7 +9343,7 @@ ln -s ~/Downloads/spirits_back/tests/node_modules "$SCRATCH/deploy/spirits_back/
 
 Следить за логом `$SCRATCH/deploy-shorts.log` Monitor-ом, не убивать процесс. Ждать итоговой строки PHASE 1. Если smoke красный, разобрать причину по логу и показать владельцу. Сеть, DNS и браузерный слой стенда уже краснели не из-за кода. Сам откат при красной фазе test скрипт не делает.
 
-- [ ] **Step 7: Убедиться, что приехал наш код и таблицы созданы**
+- [x] **Step 7: Убедиться, что приехал наш код и таблицы созданы**
 
 ```bash
 ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 'git -C ~/spirits_back log -1 --format=%H; grep -c "shorts migration 001_shorts.sql applied" ~/.pm2/logs/linkeon-api-out*.log | tail -1; set -a; . ~/spirits_back/.env >/dev/null 2>&1; set +a; psql "$DATABASE_URL" -Atc "SELECT to_regclass('"'"'public.short_video'"'"'), (SELECT count(*) FROM short_settings)"'
@@ -9371,7 +9371,7 @@ Expected:
 
 **Files:** на ноде — `~/ci/wt/promo-shorts/studio/.env`.
 
-- [ ] **Step 1: Окружение рабочего процесса и админки на ноде**
+- [x] **Step 1: Окружение рабочего процесса и админки на ноде**
 
 База и MinIO — того же стенда, что API. Номер админа стенда — из таблицы «Тестовые аккаунты» в `CLAUDE.md` (роль Admin). Ниже он подставлен как `<номер-админа>`. В репозиторий номер не попадает.
 
@@ -9381,7 +9381,7 @@ ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o C
 
 Expected — только имена переменных: `ADMIN_PHONE= API_URL= CABINET_BASIC_AUTH= CABINET_URL= DATABASE_URL= DEBUG_SECRET= DEMO_PHONE= MINIO_ACCESS_KEY= MINIO_BUCKET_VIDEOS= MINIO_ENDPOINT= MINIO_SECRET_KEY= YANDEX_SPEECHKIT_API_KEY= YANDEX_TTS_FOLDER_ID=`.
 
-- [ ] **Step 2: Канал стенда и баланс демо-аккаунта**
+- [x] **Step 2: Канал стенда и баланс демо-аккаунта**
 
 ```bash
 ssh -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=6 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 'set -a; . ~/spirits_back/.env >/dev/null 2>&1; set +a; psql "$DATABASE_URL" -Atc "SELECT channel_chat_id FROM blog_settings WHERE id = 1"; psql "$DATABASE_URL" -Atc "SELECT tokens FROM ai_profiles_consolidated WHERE user_id = '"'"'79030000001'"'"'"'
@@ -9396,7 +9396,7 @@ Expected:
 Run: `studio/scripts/node-run.sh "npx tsx scripts/stand-admin.ts update_settings settings:='{\"tgChannelChatId\":\"-1003290853538\"}'"`
 Expected: `HTTP 200`, в ответе `"tgChannelChatId": "-1003290853538"`, `"platforms": ["telegram", "youtube"]`.
 
-- [ ] **Step 3: Заказ и запуск**
+- [x] **Step 3: Заказ и запуск**
 
 Run: `studio/scripts/node-run.sh "npx tsx scripts/stand-admin.ts order topic='Можно ли не вернуть залог за съёмную квартиру' rubric=assistant angle=uncomfortable assistantId:=10"`
 Expected: `HTTP 200`, `"status": "idea"`, `"angleLocked": true`. Запомнить `id`.
@@ -9404,7 +9404,7 @@ Expected: `HTTP 200`, `"status": "idea"`, `"angleLocked": true`. Запомни�
 Run: `studio/scripts/node-run.sh "npx tsx scripts/stand-admin.ts start_now id=<id>"`
 Expected: `HTTP 200`, `"status": "directing"`, `slotAt` — ближайший свободный вт/чт/сб 18:00 МСК.
 
-- [ ] **Step 4: Режиссёр (API, тик раз в минуту)**
+- [x] **Step 4: Режиссёр (API, тик раз в минуту)**
 
 Раз в минуту, не дольше 10 минут, смотреть `get id=<id>`.
 
@@ -9412,14 +9412,14 @@ Expected: `"status": "capture_queued"`, в `scene` — вопрос к Алек�
 
 Сорвалось — в `lastError` причина с префиксом «режиссёр:». Повторы идут сами через 1 и 10 минут.
 
-- [ ] **Step 5: Съёмка**
+- [x] **Step 5: Съёмка**
 
 Run: `studio/scripts/node-run.sh "npm run worker -- --once"`
 Expected: в логе `capture <id>: попытка 1`, через 1–5 минут — `capture <id>: готово`. `get` показывает `"status": "writing"` и `capture.paragraphs` с полным текстом абзацев.
 
 Если `answer_rejected` или `question_hidden`, ролик вернётся в очередь с паузой 2 минуты. Через 2 минуты повторить команду.
 
-- [ ] **Step 6: Сценарист (API)**
+- [x] **Step 6: Сценарист (API)**
 
 Раз в минуту, не дольше 10 минут, — `get id=<id>`.
 
@@ -9428,14 +9428,14 @@ Expected:
 - в `script` — зацепка до 8 слов, `hookBox`, 2–4 реплики с `box`, финал «Линкеон — … ассистентов…», `final.disclaimer` «Ответ ИИ, не заменяет юриста»;
 - в `captions.telegram` — ссылка `https://test.linkeon.io/chat?assistant=10&utm_source=telegram&utm_medium=short&utm_campaign=sh_<slug>`.
 
-- [ ] **Step 7: Сборка**
+- [x] **Step 7: Сборка**
 
 Run: `studio/scripts/node-run.sh "npm run worker -- --once"`
 Expected: `render <id>: готово` за 2–5 минут. `get` показывает `"status": "pending_review"`, `durationMs` в пределах 30 000–60 000 и `videoUrl`.
 
 Если `too_long` или `line_too_short`, сценарий ушёл обратно сценаристу (`writing`, `writerFeedback`). Тогда снова шаги 6–7.
 
-- [ ] **Step 8: Видео владельцу, замечание, новый вариант**
+- [x] **Step 8: Видео владельцу, замечание, новый вариант**
 
 Не позже чем через минуту тестовый бот присылает владельцу ролик с пометкой «[СТЕНД]» и четырьмя кнопками. Попросить владельца:
 1. посмотреть ролик;
@@ -9445,7 +9445,7 @@ Expected: бот отвечает «Принял замечание — попр
 
 Дальше — шаг 6, затем шаг 7. Владельцу приходит новый вариант.
 
-- [ ] **Step 9: Одобрение и публикация сейчас**
+- [x] **Step 9: Одобрение и публикация сейчас**
 
 Попросить владельца нажать «✅ Одобрить».
 Expected: всплывашка и сообщение «Одобрено. Опубликую …», `get` — `"status": "approved"`, `approvedAt` заполнен.
@@ -9456,12 +9456,12 @@ Expected: `HTTP 200`. Не позже чем через 5 минут:
 - владельцу — файл «Набор для YouTube Shorts» и сообщение с заголовком, описанием, тегами и кнопкой «▶️ Выложил на YouTube»;
 - `get`: `"status": "published"`, у `telegram` — `published` и `url` вида `https://t.me/…`, у `youtube` — `manual_pending`.
 
-- [ ] **Step 10: Ссылка YouTube**
+- [x] **Step 10: Ссылка YouTube**
 
 Попросить владельца нажать «▶️ Выложил на YouTube» и ответить на приглашение ссылкой на любой ролик Shorts. Для проверки годится чужой публичный, выкладывать наш на стенде не нужно.
 Expected: бот отвечает «Записал ссылку YouTube: https://youtube.com/shorts/…», `get` — у `youtube` статус `manual_done` и `url`.
 
-- [ ] **Step 11: Учения — сбой должен дойти до владельца**
+- [x] **Step 11 (заменён 27.10.2026 учениями плана 4 — сбой оживления; сообщение владельцу пришло): Учения — сбой должен дойти до владельца**
 
 Спека просит учения с нарочно сломанным релеем. Для этого пришлось бы править `.env` стенда и перезапускать API, поэтому релей здесь заменён сбоем съёмки. Путь «релей молчит → повтор через 1 и 10 минут → failed → сообщение» покрыт тестами задач 12, 20 и 23.
 
@@ -9489,7 +9489,7 @@ studio/scripts/node-run.sh "npm run worker -- --once"
 
 Expected: `retry` отвечает `"status": "capture_queued"`; съёмка проходит; ролик доходит до `writing`. Дальше он идёт обычным путём. Когда он придёт владельцу, попросить нажать «🗑 Отклонить».
 
-- [ ] **Step 12: Итог прогона — владельцу**
+- [x] **Step 12: Итог прогона — владельцу**
 
 Коротко:
 - что прошло на каждом шаге;
@@ -9506,11 +9506,11 @@ Expected: `retry` отвечает `"status": "capture_queued"`; съёмка п
 **Files:**
 - Modify: `docs/superpowers/specs/2026-10-24-promo-shorts-design.md`, этот план (галочки)
 
-- [ ] **Step 1: Спека — что уточнил план 2**
+- [x] **Step 1: Спека — что уточнил план 2**
 
 В спеку после раздела «Порядок работ» добавить раздел «Что уточнил план 2 (25.10.2026)». В нём — список из шапки этого плана («Что план уточняет в спеке») и строка «Проверено на стенде <дата>: заказ → … → ссылка YouTube; учения со сбоем съёмки — сообщение пришло».
 
-- [ ] **Step 2: Галочки и коммит**
+- [x] **Step 2: Галочки и коммит**
 
 Отметить выполненные шаги плана. Затем:
 
@@ -9522,7 +9522,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 git -C "$WT" push -q origin feat/promo-shorts
 ```
 
-- [ ] **Step 3: Память и следующий шаг**
+- [x] **Step 3: Память и следующий шаг**
 
 Обновить заметку `project_promo_shorts_studio.md` в памяти:
 - план 2 выполнен, конвейер в `main`;
