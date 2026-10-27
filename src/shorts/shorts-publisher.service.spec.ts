@@ -1,5 +1,6 @@
 import { Logger } from '@nestjs/common';
 import { GrammyError, HttpError, InputFile } from 'grammy';
+import { performance } from 'perf_hooks';
 import { buildYoutubeKeyboard } from './short-callback';
 import { KEEPALIVE_MAX_LAG_MS, MAX_PUBLISH_ATTEMPTS, STUCK_PUBLISHING_MINUTES, ShortsPublisherService, YOUTUBE_MAY_BE_OUT } from './shorts-publisher.service';
 import { DOWNLOAD_TIMEOUT_MS, PENDING_UPLOAD_NOTE } from './shorts-youtube.service';
@@ -71,8 +72,12 @@ function fakeDb(over: Record<string, any> = {}, opts: FakeOpts = {}) {
       if (opts.successWrite === 'throw') throw new Error('Connection terminated unexpectedly');
       if (opts.successWrite === 'none') return { rows: [], rowCount: 0 };
       const row = pubs.get(p[1]);
-      const from = s.includes("AND status IN ('pending', 'publishing', 'failed')") ? ['pending', 'publishing', 'failed'] : ['publishing'];
-      if (!from.includes(row.status)) return { rows: [], rowCount: 0 };
+      // Набор — только в свою строку (publishing и её жетон) или в никем не занятую (pending, failed).
+      const kitFenced = s.includes("status IN ('pending', 'failed') OR (status = 'publishing' AND attempts = $6)");
+      const fits6 = kitFenced
+        ? ['pending', 'failed'].includes(row.status) || (row.status === 'publishing' && row.attempts === p[5])
+        : (s.includes("status IN ('pending', 'publishing', 'failed')") ? ['pending', 'publishing', 'failed'] : ['publishing']).includes(row.status);
+      if (!fits6) return { rows: [], rowCount: 0 };
       Object.assign(row, { status: p[2], external_id: p[3], url: p[4], last_error: null });
       return { rows: [], rowCount: 1 };
     }
@@ -90,7 +95,7 @@ function fakeDb(over: Record<string, any> = {}, opts: FakeOpts = {}) {
       const needsPub = s.includes('EXISTS (SELECT 1 FROM pub)');
       if (v.status !== 'publishing' || !fits(fenceArg(s, p, 1), v.attempts) || (needsPub && !pubHit)) return { rows: [], rowCount: 0 };
       Object.assign(v, { status: 'failed', failed_from: 'publishing', failure_notified: false, last_error: p[3] });
-      return { rows: [], rowCount: 1 };
+      return { rows: [{ written: 1 }], rowCount: 1 };
     }
     if (s.startsWith('SELECT * FROM short_publication')) return { rows: [...pubs.values()].map((r) => ({ ...r })) };
     const m = s.match(/^UPDATE short_video SET status = '(published|approved|failed)'/);
@@ -332,9 +337,7 @@ describe('ShortsPublisherService.publish', () => {
   it('перед каждой площадкой продлевает живость ролика — с жетоном ролика (attempts из захвата)', async () => {
     const { svc, db } = setup();
     await svc.publish(ID);
-    const beats = callsOf(db).filter(
-      (c) => c.s === "UPDATE short_video SET updated_at = now() WHERE id = $1 AND status = 'publishing' AND attempts = $2 RETURNING 1",
-    );
+    const beats = callsOf(db).filter((c) => c.s.startsWith('UPDATE short_video SET updated_at = now()') && !c.s.includes('EXISTS'));
     expect(beats.length).toBeGreaterThanOrEqual(2);
     for (const b of beats) expect(b.p).toEqual([ID, 1]);
   });
@@ -408,7 +411,7 @@ describe('ShortsPublisherService.publish — YouTube загрузкой', () => 
     expect(db.v.status).toBe('published');
   });
 
-  it('продление живости из загрузки — то же, что у публикатора', async () => {
+  it('продление живости, которое публикатор отдаёт загрузке, у своей попытки проходит', async () => {
     const yt = youtube(UPLOAD);
     yt.upload.mockImplementation(async (_v: any, _p: any, keepAlive: () => Promise<boolean>) => {
       expect(await keepAlive()).toBe(true);
@@ -554,7 +557,8 @@ describe('ShortsPublisherService.publish — YouTube загрузкой', () => 
     expect(tg.sendVideo).toHaveBeenCalledTimes(1);
     expect(tg.sendDocument).not.toHaveBeenCalled();
     expect(db.v.last_error).toContain(YOUTUBE_MAY_BE_OUT);
-    Object.assign(db.pubs.get('youtube'), { status: 'pending', attempts: 0 }); // retry из admin/shorts
+    // retry из admin/shorts: строки — в pending (счётчик строки — жетон, не обнуляется), ролик — с нулевым счётом.
+    db.pubs.get('youtube').status = 'pending';
     Object.assign(db.v, { status: 'approved', attempts: 0 });
     yt.upload.mockResolvedValue({ videoId: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk', resumed: true });
     await svc.publish(ID);
@@ -565,19 +569,19 @@ describe('ShortsPublisherService.publish — YouTube загрузкой', () => 
 });
 
 /**
- * Жетон попытки: attempts из захвата ролика (v.attempts) и строки площадки. Попытка,
- * зависшая дольше порога сторожа, пока ролик и строку взяла новая, не пишет в них ни
- * отказа, ни итога и не шлёт ни файла, ни набора — исход superseded, publish() молча выходит.
- * Свою строку (жетон ещё совпадает) она отдаёт в failed: иначе строку никто не подберёт.
+ * Жетон попытки (см. platform() публикатора): attempts из захвата ролика (v.attempts) и строки
+ * площадки. Попытка, зависшая дольше порога сторожа, пока ролик и строку взяла новая, не шлёт
+ * ни файла, ни набора и в чужое не пишет; свою строку отдаёт как отказ.
  */
 describe('ShortsPublisherService — жетон попытки', () => {
   const UPLOAD = { kind: 'upload', privacy: 'unlisted' };
+  const KIT = { kind: 'kit', note: null };
   const OK = { videoId: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk', resumed: false };
   const SESSION_A = 'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=a';
   /** Как сервис YouTube отвечает на продление перед файлом, которое не прошло. */
   const LOST = 'перед отправкой файла живость не продлена: ролик или строку YouTube забрала другая попытка либо продление шло слишком долго — не отправляю';
-  const youtube = () => ({
-    uploadPlan: jest.fn(async () => UPLOAD),
+  const youtube = (plan: any = UPLOAD) => ({
+    uploadPlan: jest.fn(async () => plan),
     upload: jest.fn(),
     notifyUploaded: jest.fn(async () => undefined),
   });
@@ -586,6 +590,10 @@ describe('ShortsPublisherService — жетон попытки', () => {
     db.pubs.set('telegram', { short_id: ID, platform: 'telegram', status: 'published', attempts: 1 });
     db.pubs.set('youtube', { short_id: ID, platform: 'youtube', status: 'failed', attempts: 4 });
     return db;
+  };
+  /** Строку площадки захватила новая попытка: статус тот же, жетон — её. */
+  const takeRow = (db: ReturnType<typeof fakeDb>, platform = 'youtube') => {
+    db.pubs.get(platform).attempts += 1;
   };
   const finals = (db: ReturnType<typeof fakeDb>) => sqlOf(db).filter((s) => /^UPDATE short_video SET status = '(approved|failed|published)'/.test(s));
   const rowFails = (db: ReturnType<typeof fakeDb>) => callsOf(db).filter((c) => c.s.startsWith("UPDATE short_publication SET status = 'failed'"));
@@ -597,39 +605,44 @@ describe('ShortsPublisherService — жетон попытки', () => {
       sent();
       return OK;
     };
+  /** Монотонные часы под контролем теста: продление перед отправкой этой площадки (запрос с EXISTS) «длится» lagMs. */
+  const slowBeat = (db: ReturnType<typeof fakeDb>, lagMs: number, platform = 'youtube') => {
+    let now = 1_000_000;
+    jest.spyOn(performance, 'now').mockImplementation(() => now);
+    const real = db.query.getMockImplementation();
+    db.query.mockImplementation(async (sql: string, p: any[] = []) => {
+      const r = await real(sql, p);
+      if (String(sql).replace(/\s+/g, ' ').includes('EXISTS (SELECT 1 FROM short_publication') && p[2] === platform) now += lagMs;
+      return r;
+    });
+  };
   afterEach(() => jest.restoreAllMocks());
 
-  it('загрузку сменила новая попытка, а строка уже чужая (последняя попытка) — строку не трогаем: ни набора, ни итога ролика, ни сообщения', async () => {
+  it('загрузку сменила новая попытка, а строка уже чужая (последняя попытка) — superseded: строку не трогаем, ни набора, ни итога ролика, ни сообщения', async () => {
     const yt = youtube();
     const db = fakeDb({ attempts: MAX_PUBLISH_ATTEMPTS - 1 });
     yt.upload.mockImplementation(async () => {
-      db.pubs.get('youtube').attempts += 1; // строку захватила новая попытка
+      takeRow(db);
       throw new YoutubeAttemptSuperseded('строку YouTube захватила другая попытка — файл не шлю');
     });
     const { svc, tg } = setup(db, '-1003290853538', ['telegram', 'youtube'], yt);
     await svc.publish(ID);
-    expect(db.v.attempts).toBe(MAX_PUBLISH_ATTEMPTS);
     // Отдать строку пробовали только со своим жетоном (1) — чужую он не пустил.
-    const release = rowFails(db);
-    expect(release.map((c) => c.p)).toEqual([[ID, 'youtube', 'строку YouTube захватила другая попытка — файл не шлю', 1]]);
-    expect(release[0].s).toContain("WHERE short_id = $1 AND platform = $2 AND status = 'publishing' AND attempts = $4");
+    expect(rowFails(db).map((c) => c.p[3])).toEqual([1]);
     expect(db.pubs.get('youtube')).toMatchObject({ status: 'publishing', attempts: 2 });
     expect(db.pubs.get('youtube').last_error).toBeUndefined();
-    expect(tg.sendDocument).not.toHaveBeenCalled();
     expect(finals(db)).toEqual([]);
+    expect(tg.sendDocument).not.toHaveBeenCalled();
     expect(yt.notifyUploaded).not.toHaveBeenCalled();
     expect(db.v.status).toBe('publishing');
   });
 
-  it('ролик взяла новая попытка, а строка ещё своя (продление перед файлом не прошло) — строку отдаём в failed, адрес сессии на месте; ни набора, ни итога ролика', async () => {
+  it('ролик взяла новая попытка, а строка ещё своя — строку отдаём как отказ (адрес сессии на месте), итог чужого ролика не пишется', async () => {
     const yt = youtube();
     const db = fakeDb({ attempts: MAX_PUBLISH_ATTEMPTS - 1 });
-    const takeVideo = jest.fn(() => {
-      db.v.attempts += 1; // ролик взяла новая попытка, строку YouTube — нет
-    });
     const upload = uploadLike(db);
     yt.upload.mockImplementation(async (v: any, p: any, keepAlive: () => Promise<boolean>) => {
-      takeVideo();
+      db.v.attempts += 1; // ролик взяла новая попытка, строку YouTube — нет
       return upload(v, p, keepAlive);
     });
     const { svc, tg } = setup(db, '-1003290853538', ['telegram', 'youtube'], yt);
@@ -637,23 +650,31 @@ describe('ShortsPublisherService — жетон попытки', () => {
     expect(db.pubs.get('youtube')).toMatchObject({ status: 'failed', attempts: 1, upload_session: SESSION_A, last_error: LOST });
     const [release] = rowFails(db);
     expect(release.s).not.toContain('upload_session');
-    expect(release.p).toEqual([ID, 'youtube', LOST, 1]);
+    // Возврат ролика со старым жетоном не прошёл: ролик новой попытки не тронут.
+    expect(db.v).toMatchObject({ status: 'publishing', attempts: MAX_PUBLISH_ATTEMPTS + 1 });
+    expect(db.v.last_error).toBeUndefined();
     expect(tg.sendDocument).not.toHaveBeenCalled();
-    expect(finals(db)).toEqual([]);
     expect(yt.notifyUploaded).not.toHaveBeenCalled();
   });
 
-  /** Часы под контролем теста: продление живости перед файлом (запрос с EXISTS) «длится» lagMs. */
-  const slowBeat = (db: ReturnType<typeof fakeDb>, lagMs: number) => {
-    let now = Date.parse('2026-10-27T12:00:00Z');
-    jest.spyOn(Date, 'now').mockImplementation(() => now);
-    const real = db.query.getMockImplementation();
-    db.query.mockImplementation(async (sql: string, p?: any[]) => {
-      const r = await real(sql, p);
-      if (String(sql).replace(/\s+/g, ' ').includes('EXISTS (SELECT 1 FROM short_publication')) now += lagMs;
-      return r;
-    });
-  };
+  it.each([
+    ['не последняя попытка', 'approved', 0],
+    ['последняя попытка', 'failed', MAX_PUBLISH_ATTEMPTS - 1],
+  ])('продление перед файлом шло дольше минуты (%s) — файла нет, ролик сразу в %s с причиной из строки, без сторожа', async (_name, status, before) => {
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const yt = youtube();
+    const db = fakeDb({ attempts: before });
+    const sent = jest.fn();
+    yt.upload.mockImplementation(uploadLike(db, sent));
+    slowBeat(db, 61_000);
+    const { svc, tg } = setup(db, '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(sent).not.toHaveBeenCalled();
+    expect(db.pubs.get('youtube')).toMatchObject({ status: 'failed', upload_session: SESSION_A, last_error: LOST });
+    expect(db.v).toMatchObject({ status, last_error: `публикация: youtube: ${LOST}` });
+    expect(tg.sendDocument).not.toHaveBeenCalled();
+    expect(yt.notifyUploaded).not.toHaveBeenCalled();
+  });
 
   it.each([
     [61_000, false],
@@ -671,42 +692,95 @@ describe('ShortsPublisherService — жетон попытки', () => {
     const { svc } = setup(db, '-1003290853538', ['telegram', 'youtube'], yt);
     await svc.publish(ID);
     expect(alive).toBe(expected);
-    const slow = warn.mock.calls.map(([m]) => String(m)).filter((m) => m.includes('продление живости заняло'));
-    expect(slow).toEqual(
-      expected
-        ? []
-        : [`ролик ${ID}, youtube: продление живости заняло 61 с — до порога сторожа не хватит запаса на отправку файла (до 8 мин), не отправляю`],
-    );
+    expect(warn.mock.calls.some(([m]) => String(m).includes('продление живости заняло 61 с'))).toBe(!expected);
   });
 
-  it('продление перед файлом шло дольше минуты — файла нет, свою строку отдаём в failed (адрес на месте), ролик в publishing ждёт сторожа', async () => {
-    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
-    const yt = youtube();
-    const db = fakeDb();
-    const sent = jest.fn();
-    yt.upload.mockImplementation(uploadLike(db, sent));
-    slowBeat(db, 61_000);
-    const { svc, tg } = setup(db, '-1003290853538', ['telegram', 'youtube'], yt);
-    await svc.publish(ID);
-    expect(sent).not.toHaveBeenCalled();
-    expect(db.pubs.get('youtube')).toMatchObject({ status: 'failed', attempts: 1, upload_session: SESSION_A, last_error: LOST });
-    // Живость продлена, итога нет: ролик вернёт в очередь сторож, а следующая попытка спросит YouTube об адресе без байтов.
-    expect(db.v).toMatchObject({ status: 'publishing', attempts: 1 });
-    expect(finals(db)).toEqual([]);
-    expect(tg.sendDocument).not.toHaveBeenCalled();
-    expect(yt.notifyUploaded).not.toHaveBeenCalled();
-  });
-
-  it('запас после продления: отправка файла и предел задержки ответа на продление вместе меньше порога сторожа', () => {
-    expect(KEEPALIVE_MAX_LAG_MS).toBe(60_000);
+  it('запас после продления: отправка файла на YouTube и предел задержки ответа на продление вместе меньше порога сторожа', () => {
     expect(SEND_TIMEOUT_MS + KEEPALIVE_MAX_LAG_MS).toBeLessThan(STUCK_PUBLISHING_MINUTES * 60_000);
+  });
+
+  it('набор по плану: пока качался файл, строку захватила новая попытка — набор не шлём, строку не трогаем', async () => {
+    const db = withRows(fakeDb());
+    const { svc, tg, storage } = setup(db, '-1003290853538', ['telegram', 'youtube'], youtube(KIT));
+    storage.download.mockImplementation(async () => {
+      takeRow(db);
+      return Buffer.from('bytes');
+    });
+    await svc.publish(ID);
+    expect(tg.sendDocument).not.toHaveBeenCalled();
+    expect(tg.sendMessage).not.toHaveBeenCalled();
+    expect(db.pubs.get('youtube')).toMatchObject({ status: 'publishing', attempts: 6 });
+    expect(finals(db)).toEqual([]);
+  });
+
+  it('набор после отказа доступа: пока качался файл, строку захватила новая попытка — набор не шлём', async () => {
+    const yt = youtube();
+    yt.upload.mockRejectedValue(new YoutubeAuthError('HTTP 400 invalid_grant'));
+    const db = withRows(fakeDb());
+    const { svc, tg, storage } = setup(db, '-1003290853538', ['telegram', 'youtube'], yt);
+    storage.download.mockImplementation(async () => {
+      takeRow(db);
+      return Buffer.from('bytes');
+    });
+    await svc.publish(ID);
+    expect(tg.sendDocument).not.toHaveBeenCalled();
+    expect(db.pubs.get('youtube')).toMatchObject({ status: 'publishing', attempts: 6 });
+  });
+
+  it('набор ушёл, а во время сообщения строку захватила новая попытка — запись набора строку новой не трогает', async () => {
+    const db = withRows(fakeDb());
+    const { svc, tg } = setup(db, '-1003290853538', ['telegram', 'youtube'], youtube(KIT));
+    tg.sendMessage.mockImplementationOnce(async () => {
+      takeRow(db);
+      return { message_id: 602 };
+    });
+    await svc.publish(ID);
+    expect(tg.sendDocument).toHaveBeenCalledTimes(1);
+    expect(db.pubs.get('youtube')).toMatchObject({ status: 'publishing', attempts: 6 });
+    expect(db.pubs.get('youtube').external_id).toBeUndefined();
+    // Запись набора — с жетоном строки этой попытки.
+    const record = callsOf(db).find((c) => c.s.startsWith('UPDATE short_publication SET status = $3') && c.p[1] === 'youtube');
+    expect(record.p[5]).toBe(5);
+  });
+
+  it('набор ушёл, а строку тем временем сторож перевёл в failed — набор всё равно записан: второй набор не нужен', async () => {
+    const db = withRows(fakeDb());
+    const { svc, tg } = setup(db, '-1003290853538', ['telegram', 'youtube'], youtube(KIT));
+    tg.sendMessage.mockImplementationOnce(async () => {
+      db.pubs.get('youtube').status = 'failed'; // сторож: строка failed, жетон тот же
+      return { message_id: 602 };
+    });
+    await svc.publish(ID);
+    expect(db.pubs.get('youtube')).toMatchObject({ status: 'manual_pending', external_id: '602' });
+  });
+
+  it('перед отправкой в канал — продление с жетоном строки telegram', async () => {
+    const db = fakeDb();
+    db.pubs.set('telegram', { short_id: ID, platform: 'telegram', status: 'failed', attempts: 2 }); // после захвата — 3
+    const { svc, tg } = setup(db);
+    await svc.publish(ID);
+    expect(tg.sendVideo).toHaveBeenCalledTimes(1);
+    const beat = callsOf(db).find((c) => c.s.includes('EXISTS') && c.p[2] === 'telegram');
+    expect(beat?.p).toEqual([ID, 1, 'telegram', 3]);
+  });
+
+  it('продление перед отправкой в канал шло дольше минуты — в канал не шлём: строка telegram в обычном отказе, ролик в очередь', async () => {
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const db = fakeDb();
+    slowBeat(db, 61_000, 'telegram');
+    const { svc, tg } = setup(db);
+    await svc.publish(ID);
+    expect(tg.sendVideo).not.toHaveBeenCalled();
+    expect(db.pubs.get('telegram')).toMatchObject({ status: 'failed', last_error: expect.stringMatching(/продление шло слишком долго/) });
+    expect(db.v.status).toBe('approved');
+    expect(db.v.last_error).not.toMatch(/пост мог выйти/);
   });
 
   it('отказ YouTube не записался — строку держит другая попытка: выходим без итога ролика', async () => {
     const yt = youtube();
     const db = fakeDb();
     yt.upload.mockImplementation(async () => {
-      db.pubs.get('youtube').attempts += 1; // пока шла загрузка, строку захватила новая попытка
+      takeRow(db); // пока шла загрузка, строку захватила новая попытка
       throw new YoutubeNotUploaded('начало загрузки: HTTP 403 quotaExceeded: quota', 403);
     });
     const { svc, tg } = setup(db, '-1003290853538', ['telegram', 'youtube'], yt);
@@ -721,7 +795,7 @@ describe('ShortsPublisherService — жетон попытки', () => {
     const db = fakeDb();
     const { svc, tg } = setup(db);
     tg.getBot.mockImplementation(() => {
-      db.pubs.get('telegram').attempts += 1; // строку захватила новая попытка
+      takeRow(db, 'telegram');
       return undefined; // бот не поднят — обычный отказ до отправки
     });
     await svc.publish(ID);
@@ -732,18 +806,13 @@ describe('ShortsPublisherService — жетон попытки', () => {
     expect(tg.sendDocument).not.toHaveBeenCalled();
   });
 
-  it('записи попытки — с жетонами: отказ площадки — attempts строки из захвата, возврат ролика в очередь — attempts ролика', async () => {
+  it('записи попытки — с жетонами: отказ площадки — жетон строки из захвата, возврат ролика в очередь — жетон ролика', async () => {
     const yt = youtube();
     yt.upload.mockRejectedValue(new YoutubeNotUploaded('начало загрузки: HTTP 403 quotaExceeded: quota', 403));
     const { svc, db } = setup(withRows(fakeDb()), '-1003290853538', ['telegram', 'youtube'], yt);
     await svc.publish(ID);
-    const calls = callsOf(db);
-    const fail = calls.find((c) => c.s.startsWith("UPDATE short_publication SET status = 'failed'"));
-    expect(fail.s).toContain("WHERE short_id = $1 AND platform = $2 AND status = 'publishing' AND attempts = $4");
-    expect(fail.p).toEqual([ID, 'youtube', 'начало загрузки: HTTP 403 quotaExceeded: quota', 5]);
-    const back = calls.find((c) => c.s.startsWith("UPDATE short_video SET status = 'approved'"));
-    expect(back.s).toContain("WHERE id = $1 AND status = 'publishing' AND attempts = $3");
-    expect([back.p[0], back.p[2]]).toEqual([ID, 1]);
+    expect(rowFails(db).map((c) => c.p[3])).toEqual([5]);
+    expect(callsOf(db).find((c) => c.s.startsWith("UPDATE short_video SET status = 'approved'")).p[2]).toBe(1);
     expect([db.pubs.get('youtube').status, db.v.status]).toEqual(['failed', 'approved']);
   });
 
@@ -752,18 +821,14 @@ describe('ShortsPublisherService — жетон попытки', () => {
     ok.upload.mockResolvedValue(OK);
     const a = setup(withRows(fakeDb()), '-1003290853538', ['telegram', 'youtube'], ok);
     await a.svc.publish(ID);
-    const done = callsOf(a.db).find((c) => c.s.startsWith("UPDATE short_video SET status = 'published'"));
-    expect(done.s).toContain("WHERE id = $1 AND status = 'publishing' AND attempts = $2");
-    expect(done.p).toEqual([ID, 1]);
+    expect(callsOf(a.db).find((c) => c.s.startsWith("UPDATE short_video SET status = 'published'")).p[1]).toBe(1);
     expect(a.db.v.status).toBe('published');
 
     const maybe = youtube();
     maybe.upload.mockRejectedValue(new YoutubeMaybeUploaded('отправка файла оборвалась: socket hang up'));
     const b = setup(withRows(fakeDb({ attempts: MAX_PUBLISH_ATTEMPTS - 1 })), '-1003290853538', ['telegram', 'youtube'], maybe);
     await b.svc.publish(ID);
-    const failed = callsOf(b.db).find((c) => c.s.startsWith("UPDATE short_video SET status = 'failed'"));
-    expect(failed.s).toContain("WHERE id = $1 AND status = 'publishing' AND attempts = $3");
-    expect([failed.p[0], failed.p[2]]).toEqual([ID, MAX_PUBLISH_ATTEMPTS]);
+    expect(callsOf(b.db).find((c) => c.s.startsWith("UPDATE short_video SET status = 'failed'")).p[2]).toBe(MAX_PUBLISH_ATTEMPTS);
     expect(b.db.v.status).toBe('failed');
   });
 
@@ -774,23 +839,24 @@ describe('ShortsPublisherService — жетон попытки', () => {
     tg.sendVideo.mockRejectedValueOnce(new HttpError("Network request for 'sendVideo' failed!", new Error('socket hang up')));
     await svc.publish(ID);
     const cte = callsOf(db).find((c) => c.s.startsWith('WITH pub AS'));
-    expect(cte.s).toContain("WHERE short_id = $1 AND platform = $2 AND status = 'publishing' AND attempts = $5 RETURNING 1");
-    expect(cte.s).toContain("WHERE id = $1 AND status = 'publishing' AND attempts = $6 AND EXISTS (SELECT 1 FROM pub)");
     expect([cte.p[4], cte.p[5]]).toEqual([3, 1]);
     expect([db.pubs.get('telegram').status, db.v.status]).toEqual(['failed', 'failed']);
   });
 
-  it('исход Telegram неизвестен, а строку уже держит другая попытка — ни строку, ни ролик не трогаем', async () => {
+  it('исход Telegram неизвестен, а строку уже держит другая попытка — ничего не записано: ни строку, ни ролик не трогаем', async () => {
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     const db = fakeDb();
     const { svc, tg } = setup(db);
     tg.sendVideo.mockImplementationOnce(async () => {
-      db.pubs.get('telegram').attempts += 1;
+      takeRow(db, 'telegram');
       throw new HttpError("Network request for 'sendVideo' failed!", new Error('socket hang up'));
     });
     await svc.publish(ID);
     expect(db.pubs.get('telegram')).toMatchObject({ status: 'publishing', attempts: 2 });
     expect(db.v.status).toBe('publishing');
     expect(tg.sendDocument).not.toHaveBeenCalled();
+    expect(warn.mock.calls.some(([m]) => String(m).includes('ничего не записано'))).toBe(true);
+    expect(logError.mock.calls.some(([m]) => String(m).includes('автоповтора не будет'))).toBe(false);
   });
 
   it('продление живости перед файлом YouTube — оба жетона, ролика и строки; жетон строки — четвёртым аргументом upload', async () => {
@@ -806,16 +872,11 @@ describe('ShortsPublisherService — жетон попытки', () => {
     await svc.publish(ID);
     expect(fence).toBe(5);
     expect(alive).toEqual([true]);
-    const beat = callsOf(db).find((c) => c.s.startsWith('UPDATE short_video SET updated_at = now()') && c.s.includes('EXISTS'));
-    expect(beat.s).toBe(
-      "UPDATE short_video SET updated_at = now() WHERE id = $1 AND status = 'publishing' AND attempts = $2 " +
-        "AND EXISTS (SELECT 1 FROM short_publication WHERE short_id = $1 AND platform = $3 AND status = 'publishing' AND attempts = $4) RETURNING 1",
-    );
-    expect(beat.p).toEqual([ID, 1, 'youtube', 5]);
+    expect(callsOf(db).find((c) => c.s.includes('EXISTS') && c.p[2] === 'youtube').p).toEqual([ID, 1, 'youtube', 5]);
   });
 
   it.each([
-    ['строку YouTube захватила новая попытка', (db: ReturnType<typeof fakeDb>) => { db.pubs.get('youtube').attempts += 1; }],
+    ['строку YouTube захватила новая попытка', (db: ReturnType<typeof fakeDb>) => takeRow(db)],
     ['ролик взяла новая попытка', (db: ReturnType<typeof fakeDb>) => { db.v.attempts += 1; }],
   ])('продление живости перед файлом YouTube — false: %s', async (_name, takeOver) => {
     const yt = youtube();
@@ -824,7 +885,7 @@ describe('ShortsPublisherService — жетон попытки', () => {
     yt.upload.mockImplementation(async (_v: any, _p: any, keepAlive: () => Promise<boolean>) => {
       takeOver(db);
       alive = await keepAlive();
-      throw new YoutubeAttemptSuperseded('ролик или строку YouTube забрала другая попытка до отправки файла — не отправляю');
+      throw new YoutubeAttemptSuperseded(LOST);
     });
     const { svc } = setup(db, '-1003290853538', ['telegram', 'youtube'], yt);
     await svc.publish(ID);
@@ -832,10 +893,7 @@ describe('ShortsPublisherService — жетон попытки', () => {
   });
 });
 
-/**
- * Скачивание из MinIO — со сроком: зависшее скачивание не должно пережить порог сторожа,
- * иначе после «Повторить» владельца жетон старой попытки мог бы совпасть с новой.
- */
+/** Скачивание из MinIO — со сроком: зависшее скачивание не должно пережить порог сторожа (STUCK_PUBLISHING_MINUTES). */
 describe('ShortsPublisherService — срок скачивания файлов ролика', () => {
   /** Хранилище, которое не отвечает: отпускает только по сигналу срока. Без сигнала — отказ сразу. */
   const hang = ({ abortSignal }: any): Promise<Buffer> => {

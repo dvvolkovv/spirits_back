@@ -117,6 +117,16 @@ describe('POST admin/shorts', () => {
     await expect(never.ctl.action({ action: 'retry', id: ID }, res())).rejects.toBeInstanceOf(ConflictException);
   });
 
+  it('retry публикации не обнуляет счётчик строк площадок — это жетон попытки публикатора', async () => {
+    const pub = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'approved' })] } : { rows: [video({ failed_from: 'publishing', approved_at: '2026-10-25T00:00:00Z' })] }));
+    await pub.ctl.action({ action: 'retry', id: ID }, res());
+    const reset = pub.pg.query.mock.calls
+      .map((c: any[]) => String(c[0]).replace(/\s+/g, ' '))
+      .find((s: string) => s.startsWith("UPDATE short_publication SET status = 'pending'"));
+    expect(reset).toBeDefined();
+    expect(reset).not.toMatch(/attempts/);
+  });
+
   const retryWrite = (pg: any) =>
     pg.query.mock.calls.find((c: any[]) => String(c[0]).includes("WHERE id = $1 AND status = 'failed' AND failed_from = $3")) as any[];
 

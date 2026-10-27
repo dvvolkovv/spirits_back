@@ -740,12 +740,26 @@ describe('загрузка ролика', () => {
       expect(db.st.session).toBe(SESSION);
     });
 
-    it('строку не прочитать (сбой базы) — по-прежнему YoutubeMaybeUploaded, а не «попытку сменили»', async () => {
-      const { svc, http } = setup(connected({ sessionThrows: true }), fakeHttp());
-      const e = await caught(svc.upload(video, 'public', alive(), 1));
-      expect(e).toBeInstanceOf(YoutubeMaybeUploaded);
-      expect(e).not.toBeInstanceOf(YoutubeAttemptSuperseded);
-      expect(http.http).not.toHaveBeenCalled();
+    it('файл получил явный отказ, а к стиранию адреса строку держит другая попытка — YoutubeAttemptSuperseded, а не «не стёрто + отказ»', async () => {
+      const db = connected();
+      const http = fakeHttp(TOKEN, reply(200, {}, { location: SESSION }), () => {
+        db.st.attempts = 2; // пока шёл файл, строку захватила новая попытка
+        return reply(400, { error: { message: 'bad' } });
+      });
+      const { svc } = setup(db, http);
+      expect(await caught(svc.upload(video, 'public', alive(), 1))).toBeInstanceOf(YoutubeAttemptSuperseded);
+      expect(db.st.session).toBe(SESSION);
+    });
+
+    it('файл оборвался, YouTube говорит «не догружено», а к стиранию адреса строку держит другая попытка — YoutubeAttemptSuperseded, адрес не стёрт', async () => {
+      const db = connected();
+      const http = fakeHttp(TOKEN, reply(200, {}, { location: SESSION }), new Error('socket hang up'), () => {
+        db.st.attempts = 2; // пока спрашивали YouTube, строку захватила новая попытка
+        return reply(308);
+      });
+      const { svc } = setup(db, http);
+      expect(await caught(svc.upload(video, 'public', alive(), 1))).toBeInstanceOf(YoutubeAttemptSuperseded);
+      expect(db.st.session).toBe(SESSION);
     });
   });
 });

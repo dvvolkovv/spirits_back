@@ -492,6 +492,38 @@ maybe('ролики против живого Postgres', () => {
         expect(await videoRow(b.id)).toEqual({ status: 'publishing', attempts: 1, last_error: null });
       });
 
+      it('набор: запись manual_pending — с жетоном строки; строку, которую тем временем захватила новая попытка, не переписывает (живой SQL)', async () => {
+        const mk = (minutesAgo: number) =>
+          insert({
+            status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() - minutesAgo * 60_000),
+            video_key: 'shorts/v/video.mp4', captions: CAPTIONS,
+          });
+        const kitRow = async (id: string) =>
+          (await pool.query(`SELECT status, attempts, external_id FROM short_publication WHERE short_id = $1 AND platform = 'youtube'`, [id])).rows[0];
+        const storage = { download: jest.fn(async () => Buffer.from('bytes')) };
+        const settings = { get: async () => ({ platforms: ['youtube'], tgChannelChatId: null }) };
+        // Без сервиса YouTube публикатор шлёт набор.
+        const publisherWith = (sendMessage: () => Promise<any>) =>
+          new ShortsPublisherService(
+            pgLike() as any,
+            { sendDocument: jest.fn(async () => ({ message_id: 601 })), sendMessage: jest.fn(sendMessage) } as any,
+            storage as any,
+            settings as any,
+          );
+
+        const a = await mk(1);
+        await publisherWith(async () => ({ message_id: 602 })).publish(a.id);
+        expect(await kitRow(a.id)).toEqual({ status: 'manual_pending', attempts: 1, external_id: '602' });
+        expect((await videoRow(a.id)).status).toBe('published');
+
+        const b = await mk(2);
+        await publisherWith(async () => {
+          await pool.query(`UPDATE short_publication SET attempts = attempts + 1 WHERE short_id = $1 AND platform = 'youtube'`, [b.id]);
+          return { message_id: 603 };
+        }).publish(b.id);
+        expect(await kitRow(b.id)).toEqual({ status: 'publishing', attempts: 2, external_id: null });
+      });
+
       it('проигравшая попытка отдаёт свою строку: новая захватывает её, спрашивает YouTube о старом адресе (308 без Range), стирает и грузит заново — один PUT с файлом', async () => {
         await connect();
         await pool.query(`UPDATE short_settings SET youtube_mode = 'unlisted' WHERE id = 1`);
