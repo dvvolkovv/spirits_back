@@ -300,6 +300,7 @@ rollback_backend() {
   ssh_remote "
     set -eo pipefail
     cd $BACK_PATH
+    STUDIO_SAME_AS=\$(git rev-parse HEAD)
     git reset --hard $PRE_BACK_SHA
     npm ci --no-audit --no-fund 2>&1 | tail -3
     npm run build 2>&1 | tail -3
@@ -324,17 +325,9 @@ rollback_backend() {
         || { tail -20 /tmp/vh-pm2.log; echo 'voice-host: pm2 startOrReload FAILED'; exit 1; }
       cd ..
     fi
-    # Студия роликов — как в back_build_cmds и шаге рестарта: прежний код, его браузеры, процесс.
-    if [ -d studio ] && [ -f studio/.env ]; then
-      cd studio
-      npm ci --no-audit --no-fund > /tmp/studio-install.log 2>&1 \
-        || { tail -20 /tmp/studio-install.log; echo 'studio: npm ci FAILED'; exit 1; }
-      npx playwright install chromium > /tmp/studio-browsers.log 2>&1 \
-        || { tail -20 /tmp/studio-browsers.log; echo 'studio: браузеры не установились'; exit 1; }
-      pm2 startOrReload ecosystem.config.cjs > /tmp/studio-pm2.log 2>&1 \
-        || { tail -20 /tmp/studio-pm2.log; echo 'studio: pm2 startOrReload FAILED'; exit 1; }
-      cd ..
-    fi
+    # Студия роликов — последней, после API: прежний код, его зависимости и браузеры, процесс.
+    $(studio_build_cmds)
+    $(studio_restart_cmds)
   " && green "  ↩ backend rolled back ($ENV_NAME)" \
     || { red "  ✗ ROLLBACK BACKEND FAILED — $ENV_NAME needs manual intervention"; return 1; }
 }
@@ -675,24 +668,63 @@ back_build_cmds() {
     elif [ -d voice-host ]; then
       echo 'voice-host: .env отсутствует — LiveKit не настроен, воркер пропущен'
     fi
-    # Студия роликов: свой package.json, сборки нет (tsx), но нужны браузеры —
-    # съёмки (Playwright) и сборки ролика (Remotion). Ставим здесь, а не при первом
-    # ролике: недоехавший браузер должен ронять выкат, а не съёмку на проде.
-    # Признак настроенности — studio/.env: его кладут руками вместе с ключами.
-    if [ -d studio ] && [ -f studio/.env ]; then
+CMDS
+  studio_build_cmds
+}
+
+# Студия роликов (studio/): свой package.json, сборки нет (tsx), но нужны браузеры —
+# съёмки (Playwright) и сборки ролика (Remotion). Ставим в сборке, а не при первом
+# ролике: недоехавший браузер должен ронять выкат, а не съёмку на проде. Признак
+# настроенности — studio/.env (кладут руками вместе с ключами); коммит без
+# studio/ecosystem.config.cjs (план 2) студию не ставит — её процесс остановит
+# studio_restart_cmds. Зовётся из back_build_cmds (выкат и возврат сборки) и из отката.
+#
+# STUDIO_SAME_AS (или CI_SAME_AS возврата) — работающий коммит: npm ci сносит
+# node_modules под работающим процессом вместе с браузером Remotion
+# (node_modules/.remotion), поэтому он идёт, только если lock-файл студии сменился
+# или зависимостей ещё нет (первый выкат на сервер).
+studio_build_cmds() {
+  cat <<'CMDS'
+    if [ -d studio ] && [ -f studio/.env ] && [ -f studio/ecosystem.config.cjs ]; then
       cd studio
-      if [ -n "${CI_SAME_AS:-}" ] && git diff --quiet "$CI_SAME_AS" HEAD -- package-lock.json; then
+      studio_same="${STUDIO_SAME_AS:-${CI_SAME_AS:-}}"
+      if [ -n "$studio_same" ] && git diff --quiet "$studio_same" HEAD -- package-lock.json && [ -x node_modules/.bin/tsx ]; then
         echo 'studio: npm ci пропущен: package-lock.json тот же'
       else
-        npm ci --no-audit --no-fund > /tmp/studio-install.log 2>&1 \
-          || { tail -20 /tmp/studio-install.log; echo 'studio: npm ci FAILED'; exit 1; }
+        npm ci --no-audit --no-fund > "${TMPDIR:-/tmp}/studio-install.log" 2>&1 \
+          || { tail -20 "${TMPDIR:-/tmp}/studio-install.log"; echo 'studio: npm ci FAILED'; exit 1; }
       fi
-      { npx playwright install chromium \
-          && node --input-type=module -e 'import { ensureBrowser } from "@remotion/renderer"; await ensureBrowser();'; } > /tmp/studio-browsers.log 2>&1 \
-        || { tail -20 /tmp/studio-browsers.log; echo 'studio: браузеры не установились'; exit 1; }
+      # Только headless shell: его и запускает съёмка, полный Chrome (≈370 МБ) не нужен.
+      # Локальный playwright, а не npx: без пакета npx молча поставил бы последнюю версию.
+      { node_modules/.bin/playwright install --only-shell chromium \
+          && node --input-type=module -e 'import { ensureBrowser } from "@remotion/renderer"; await ensureBrowser();'; } > "${TMPDIR:-/tmp}/studio-browsers.log" 2>&1 \
+        || { tail -20 "${TMPDIR:-/tmp}/studio-browsers.log"; echo 'studio: браузеры не установились'; exit 1; }
       cd ..
+    elif [ -d studio ] && [ -f studio/.env ]; then
+      echo 'studio: в этом коммите нет studio/ecosystem.config.cjs — студия пропущена'
     elif [ -d studio ]; then
       echo 'studio: .env отсутствует — студия не настроена, рабочий процесс пропущен'
+    fi
+CMDS
+}
+
+# Перезапуск рабочего процесса студии. Остановка — сообщением shutdown
+# (ecosystem.config.cjs): процесс доводит текущее задание (до kill_timeout,
+# 10 минут) и выходит, поэтому вызов может ждать — его зовут отдельно от рестарта API.
+studio_restart_cmds() {
+  cat <<'CMDS'
+    if [ -d studio ] && [ -f studio/.env ]; then
+      if [ -f studio/ecosystem.config.cjs ]; then
+        cd studio
+        pm2 startOrReload ecosystem.config.cjs > "${TMPDIR:-/tmp}/studio-pm2.log" 2>&1 \
+          || { tail -20 "${TMPDIR:-/tmp}/studio-pm2.log"; echo 'studio: pm2 startOrReload FAILED'; exit 1; }
+        cd ..
+      else
+        # Коммит старше процесса PM2 (откат на план 2): новый код в памяти поверх
+        # старого дерева собирал бы ролики на чужих композициях — останавливаем.
+        pm2 delete linkeon-studio > /dev/null 2>&1 || true
+        echo 'studio: в этом коммите нет studio/ecosystem.config.cjs — рабочий процесс остановлен'
+      fi
     fi
 CMDS
 }
@@ -765,6 +797,7 @@ deploy_backend() {
   if ! ssh_remote "
     set -eo pipefail
     cd $BACK_PATH
+    STUDIO_SAME_AS=\$(git rev-parse HEAD)
     git fetch origin
     git reset --hard origin/$BRANCH
     $(back_build_cmds)
@@ -804,14 +837,6 @@ deploy_backend() {
         || { tail -20 /tmp/vh-pm2.log; echo 'voice-host: pm2 startOrReload FAILED'; exit 1; }
       cd ..
     fi
-    # Студия: SIGINT — рабочий процесс доводит текущее задание (до kill_timeout,
-    # 10 минут), чат не трогает. Съёмку как живой ход уже дождался wait_for_streams_drain.
-    if [ -d studio ] && [ -f studio/.env ]; then
-      cd studio
-      pm2 startOrReload ecosystem.config.cjs > /tmp/studio-pm2.log 2>&1 \
-        || { tail -20 /tmp/studio-pm2.log; echo 'studio: pm2 startOrReload FAILED'; exit 1; }
-      cd ..
-    fi
   " || { red "  backend restart failed ($ENV_NAME)"; exit 1; }
 
   bold "[back 3/3] health-wait"
@@ -839,6 +864,24 @@ deploy_backend() {
   ext=$(curl -s -m 12 ${BASIC_AUTH:+-u "$BASIC_AUTH"} -o /dev/null -w "%{http_code}" "${BASE_URL}/webhook/agents" 2>/dev/null) || ext="${ext:-000}"
   if [[ "$ext" == "200" ]]; then green "  ✓ снаружи ${BASE_URL} = 200"
   else yellow "  ⚠ снаружи ${BASE_URL} = $ext при живом бэкенде — маршрут/edge с этой машины"; fi
+
+  # Студия — отдельным вызовом и после проверки здоровья API: ожидание её задания
+  # (до 10 минут) не держит health-wait и smoke, а повтор ssh после обрыва
+  # (ssh_remote) не перезапускает API второй раз. Сбой на стенде останавливает
+  # выкат до прода; на проде API уже выкачен — только предупреждение.
+  bold "[back 3.5/3] рабочий процесс студии ($ENV_NAME)"
+  if ! ssh_remote "
+    set -e
+    cd $BACK_PATH
+    $(studio_restart_cmds)
+  "; then
+    if [[ "$ENV_NAME" == prod ]]; then
+      red "  ✗ prod: рабочий процесс студии не перезапустился — API выкачен, студию смотреть руками (pm2 logs linkeon-studio)"
+    else
+      red "  ✗ $ENV_NAME: рабочий процесс студии не перезапустился — прод не трогаю"
+      exit 1
+    fi
+  fi
 }
 
 deploy_frontend() {
