@@ -755,6 +755,24 @@ describe('ShortsPublisherService — жетон попытки', () => {
     expect(db.pubs.get('youtube')).toMatchObject({ status: 'manual_pending', external_id: '602' });
   });
 
+  it.each([
+    ['строка ещё своя (ролик взяла новая попытка) — строку отдаём как отказ', (db: ReturnType<typeof fakeDb>) => { db.v.attempts += 1; }, 'failed', 5],
+    ['строку держит новая попытка — ничего не пишем', (db: ReturnType<typeof fakeDb>) => takeRow(db), 'publishing', 6],
+  ])('набор: файл ушёл, а продление перед подписью не прошло — подпись не шлём; %s', async (_name, takeOver, rowStatus, rowAttempts) => {
+    const db = withRows(fakeDb());
+    const { svc, tg } = setup(db, '-1003290853538', ['telegram', 'youtube'], youtube(KIT));
+    tg.sendDocument.mockImplementationOnce(async () => {
+      takeOver(db);
+      return { message_id: 601 };
+    });
+    await svc.publish(ID);
+    expect(tg.sendDocument).toHaveBeenCalledTimes(1);
+    expect(tg.sendMessage).not.toHaveBeenCalled();
+    expect(db.pubs.get('youtube')).toMatchObject({ status: rowStatus, attempts: rowAttempts });
+    // Ролик не тронут: у своей строки итог ролика с чужим жетоном не прошёл, у чужой до итога не дошло.
+    expect(db.v.status).toBe('publishing');
+  });
+
   it('перед отправкой в канал — продление с жетоном строки telegram', async () => {
     const db = fakeDb();
     db.pubs.set('telegram', { short_id: ID, platform: 'telegram', status: 'failed', attempts: 2 }); // после захвата — 3
