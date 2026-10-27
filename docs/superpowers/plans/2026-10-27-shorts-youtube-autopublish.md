@@ -1665,13 +1665,24 @@ describe('загрузка ролика', () => {
     }
   });
 
-  it('прошлая сессия истекла (404) — YoutubeUploadExpired, адрес стёрт, новой загрузки нет', async () => {
+  it('прошлая сессия истекла (404) — YoutubeUploadExpired, адрес остаётся (повтор снова пришлёт набор), новой загрузки нет', async () => {
     const db = connected({ session: SESSION });
     const http = fakeHttp(TOKEN, reply(404));
     const { svc } = setup(db, http);
     expect(await caught(svc.upload(video, 'public', alive()))).toBeInstanceOf(YoutubeUploadExpired);
-    expect(db.st.session).toBeNull();
+    expect(db.st.session).toBe(SESSION);
     expect(http.calls).toHaveLength(2);
+  });
+
+  it('при живой сессии сбой токена или хранилища — YoutubeMaybeUploaded: прошлая загрузка не проверена, адрес остаётся', async () => {
+    const a = connected({ session: SESSION });
+    expect(await caught(setup(a, fakeHttp(reply(503, {}))).svc.upload(video, 'public', alive()))).toBeInstanceOf(YoutubeMaybeUploaded);
+    expect(a.st.session).toBe(SESSION);
+    const b = connected({ session: SESSION });
+    const s = setup(b, fakeHttp(TOKEN));
+    s.storage.download.mockRejectedValueOnce(new Error('minio down'));
+    expect(await caught(s.svc.upload(video, 'public', alive()))).toBeInstanceOf(YoutubeMaybeUploaded);
+    expect(b.st.session).toBe(SESSION);
   });
 
   it('о прошлой сессии нет ответа — YoutubeMaybeUploaded, адрес остаётся, новой загрузки нет', async () => {
@@ -1728,6 +1739,19 @@ describe('загрузка ролика', () => {
     const http = fakeHttp(TOKEN, reply(200, {}, { location: SESSION }), new Error('socket hang up'), reply(308));
     const { svc } = setup(db, http);
     expect(await caught(svc.upload(video, 'public', alive()))).toBeInstanceOf(YoutubeNotUploaded);
+    expect(db.st.session).toBeNull();
+  });
+
+  it('файл оборвался, а сессия кончилась отказом — YoutubeNotUploaded с причиной Google, адрес стёрт', async () => {
+    const db = connected();
+    const http = fakeHttp(
+      TOKEN, reply(200, {}, { location: SESSION }), new Error('socket hang up'),
+      reply(403, { error: { message: 'limit', errors: [{ reason: 'uploadLimitExceeded' }] } }),
+    );
+    const { svc } = setup(db, http);
+    const e = await caught(svc.upload(video, 'public', alive()));
+    expect(e).toBeInstanceOf(YoutubeNotUploaded);
+    expect(e).toMatchObject({ status: 403, message: 'отправка файла: HTTP 403 uploadLimitExceeded: limit' });
     expect(db.st.session).toBeNull();
   });
 
@@ -1810,7 +1834,7 @@ import { isStand } from './short-env';
 import { ShortsSettingsService } from './shorts-settings.service';
 import { ShortVideo, YoutubeMode, shortsBucket } from './shorts.types';
 import { YoutubeAuthError, YoutubeMaybeUploaded, YoutubeNotUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
-import { Http, axiosHttp } from './youtube/youtube-http';
+import { Http, axiosHttp, clip } from './youtube/youtube-http';
 import { YoutubeOAuthConfig, authorizeUrl, exchangeCode, fetchMyChannel, refreshAccessToken, youtubeOAuthConfig } from './youtube/youtube-oauth';
 import { signState, verifyState } from './youtube/youtube-state';
 import { UploadMeta, checkUpload, sendFile, startUpload } from './youtube/youtube-upload';
@@ -1871,16 +1895,27 @@ export const PENDING_UPLOAD_NOTE = 'Прошлая загрузка этого �
     const acc = await this.account();
     const previous = await this.session(v.id);
     if (!acc || acc.status !== 'connected') throw new YoutubeAuthError('канал YouTube не подключён', !!previous);
-    const accessToken = await this.accessToken(cfg, acc, !!previous);
-    const video = await this.storage.download({ bucket: shortsBucket(), key: v.videoKey });
+    let accessToken: string;
+    let video: Buffer;
+    try {
+      accessToken = await this.accessToken(cfg, acc, !!previous);
+      video = await this.storage.download({ bucket: shortsBucket(), key: v.videoKey });
+    } catch (e: any) {
+      // Прошлая загрузка ещё не проверена — сказать «ролика нет» нельзя (спека, «Публикация», п. 7).
+      if (previous && !(e instanceof YoutubeAuthError)) {
+        throw new YoutubeMaybeUploaded(`прошлая загрузка не проверена: ${clip(String(e?.message ?? e), 200)}`);
+      }
+      throw e;
+    }
 
     if (previous) {
       // Нет ответа — YoutubeMaybeUploaded наверх, адрес остаётся.
       const st = await checkUpload(this.http, previous, accessToken, video.length);
       if (st.state === 'complete') return this.done(v.id, st.videoId);
-      await this.setSession(v.id, null);
+      // Истекла: адрес не стираем — повтор снова получит 404 и снова пришлёт набор, а не загрузит вслепую.
       if (st.state === 'gone') throw new YoutubeUploadExpired('YouTube уже не помнит прошлую загрузку этого ролика');
       // incomplete или failed — прошлая загрузка не дошла: грузим заново.
+      await this.setSession(v.id, null);
     }
 
     const meta: UploadMeta = {
@@ -1906,8 +1941,9 @@ export const PENDING_UPLOAD_NOTE = 'Прошлая загрузка этого �
       // Снова без ответа — YoutubeMaybeUploaded наверх, адрес остаётся.
       const st = await checkUpload(this.http, sessionUrl, accessToken, video.length);
       if (st.state === 'complete') return this.done(v.id, st.videoId);
-      await this.setSession(v.id, null);
       if (st.state === 'gone') throw new YoutubeUploadExpired('YouTube уже не помнит загрузку этого ролика');
+      await this.setSession(v.id, null);
+      if (st.state === 'failed') throw new YoutubeNotUploaded(`отправка файла: ${st.reason}`, st.status);
       throw new YoutubeNotUploaded(`файл не дошёл до YouTube (${e.message})`);
     }
   }
@@ -1968,7 +2004,7 @@ export const PENDING_UPLOAD_NOTE = 'Прошлая загрузка этого �
   private async revoke(reason: string): Promise<void> {
     await this.pg.query(
       `UPDATE short_youtube_account SET status = 'revoked', last_error = $1, updated_at = now() WHERE id = 1`,
-      [reason.slice(0, 300)],
+      [clip(reason, 300)],
     );
   }
 ```
@@ -2283,6 +2319,7 @@ import { PENDING_UPLOAD_NOTE, ShortsYoutubeService, YoutubePlan } from './shorts
 
 ```ts
 import { YoutubeAuthError, YoutubeMaybeUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
+import { clip } from './youtube/youtube-http';
 ```
 
 2. После константы `STUCK_OTHER` добавить:
@@ -2353,7 +2390,7 @@ export const YOUTUBE_MAY_BE_OUT =
       if (e instanceof YoutubeMaybeUploaded) {
         throw new Error(last ? `${YOUTUBE_MAY_BE_OUT} (${e.message})` : `${e.message} — повторю, сначала спрошу YouTube о прошлой загрузке`);
       }
-      if (last) return this.youtubeKit(v, `Не смог загрузить на YouTube: ${String(e?.message ?? e).slice(0, 300)}. Выложите вручную.`);
+      if (last) return this.youtubeKit(v, `Не смог загрузить на YouTube: ${clip(String(e?.message ?? e), 300)}. Выложите вручную.`);
       throw e;
     }
   }
