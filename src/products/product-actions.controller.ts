@@ -1,16 +1,23 @@
 import { BadRequestException, Body, ConflictException, Controller, Get, HttpCode, NotFoundException, NotImplementedException, Optional, Param, Post, UseGuards } from '@nestjs/common';
-import { IsArray, IsBoolean, IsIn, IsObject, IsOptional, IsString } from 'class-validator';
+import { ArrayMaxSize, IsArray, IsBoolean, IsIn, IsObject, IsOptional, IsString, MaxLength } from 'class-validator';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { IpRateLimiter } from '../common/guards/ip-rate-limit';
 import { ProductActionsService, toView } from './product-actions.service';
 import { ProductLifecycleService } from './product-lifecycle.service';
 import { ProductKeysService } from './product-keys.service';
+import { SECRET_COUNT_MAX, SECRET_NAME_MAX } from './secret-rules';
 
 export class SubmitActionDto {
   @IsOptional() @IsBoolean() confirm?: boolean;
+  // `set` остаётся без потолка здесь (ревью 15b): его размер — не то же
+  // самое, что размер набора после смены. ProductKeysService.submit мержит
+  // его со старыми ключами (минус remove) и проверяет ИТОГОВЫЙ набор
+  // secretsProblem — тем же SECRET_COUNT_MAX/SECRET_NAME_MAX/SECRET_VALUE_MAX,
+  // что и заведение. Повторять потолок здесь пришлось бы по телу запроса, а
+  // не по тому, что получится после слияния, — лишняя проверка не того числа.
   @IsOptional() @IsObject() set?: Record<string, string>;
-  @IsOptional() @IsArray() @IsString({ each: true }) remove?: string[];
+  @IsOptional() @IsArray() @ArrayMaxSize(SECRET_COUNT_MAX) @IsString({ each: true }) @MaxLength(SECRET_NAME_MAX, { each: true }) remove?: string[];
   @IsOptional() @IsIn(['chat', 'cabinet', 'tma']) via?: 'chat' | 'cabinet' | 'tma';
 }
 

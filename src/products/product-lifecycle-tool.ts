@@ -222,7 +222,20 @@ export class ProductLifecycleTool {
     }
     const product = matches[0];
     const r = await this.lifecycle.restore({ userId, productId: product.id, channel });
-    if (r.ok === false) return { ok: false, reason: r.reason, product, say: r.message };
+    if (r.ok === false) {
+      // Гонка (ревью 15b): resolveDeleted прочитал продукт ДО дедлайна
+      // возврата, restore() проверил его ПОСЛЕ — срок вышел между двумя
+      // запросами. Тот же reason и текст, что resolveGone отдаёт на
+      // «стирается» (выше): описание действия обещает модели только
+      // purged/expiring, а не сырой reason="expired" сервиса.
+      if (r.reason === 'expired') {
+        return {
+          ok: false, reason: 'expiring', product,
+          say: `Срок возврата «${product.name}» (${DELETE_GRACE_DAYS} дней) вышел — продукт стирается, вернуть его нельзя. Можно завести новый продукт.`,
+        };
+      }
+      return { ok: false, reason: r.reason, product, say: r.message };
+    }
     // I1 (ревью): affordable — ТЕМ ЖЕ способом, что и внутри restore()
     // (`balance >= RENT_TOKENS`), но здесь своя переменная: ответ тула не
     // отдаёт её прямо, только balance, и ветка M7 ниже (waking=false, но
