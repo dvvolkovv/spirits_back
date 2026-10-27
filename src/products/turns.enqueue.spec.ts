@@ -377,3 +377,41 @@ describe('правка во время смены ключей', () => {
     expect(misc.checkTokenBalance).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * Задача бэклога 642c5198: ключ, вставленный в текст правки, не должен лечь
+ * открытым в product_turns.prompt и уйти модели правок. Значения собираются
+ * во время прогона — см. шапку prompt-secrets.spec.ts (публичный репозиторий).
+ */
+describe('ключи в тексте правки', () => {
+  const value = ['Ab', '3k', 'Q9', 'zX', '7mN', 'p2R', 'w8T', 'c5'].join('');
+
+  it('в базу уходит текст со скрытым значением, наружу — сколько и под каким именем', async () => {
+    const { svc, calls } = makeService();
+
+    const turn = await svc.enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: `подключи WEATHER_API_KEY=${value}` });
+
+    const insert = calls.find((c) => c.sql.includes('INSERT INTO product_turns'))!;
+    expect(insert.params[3]).toBe('подключи WEATHER_API_KEY=[ключ скрыт]');
+    expect(JSON.stringify(calls.map((c) => c.params))).not.toContain(value);
+    expect(turn).toEqual({ id: 't-1', status: 'queued', masked: { count: 1, names: ['WEATHER_API_KEY'] } });
+  });
+
+  it('без ключей — текст дословно и без поля masked', async () => {
+    const { svc, calls } = makeService();
+
+    const turn = await svc.enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: 'владелец — chat_id 123456789' });
+
+    expect(calls.find((c) => c.sql.includes('INSERT INTO product_turns'))!.params[3]).toBe('владелец — chat_id 123456789');
+    expect(turn).toEqual({ id: 't-1', status: 'queued' });
+    expect('masked' in turn).toBe(false);
+  });
+
+  it('отказ до записи (сон) — маска не нужна и не мешает отказу', async () => {
+    const { svc, calls } = makeService({ productStatus: 'sleeping' });
+    await expect(
+      svc.enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: `TOKEN=${value}` }),
+    ).rejects.toThrow(SLEEPING_REFUSAL);
+    expect(calls.some((c) => c.sql.includes('INSERT INTO product_turns'))).toBe(false);
+  });
+});

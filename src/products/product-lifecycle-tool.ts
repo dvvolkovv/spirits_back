@@ -6,6 +6,7 @@ import type { ProductMatch } from './product-tool.service';
 import type { ProductToolChannel } from './product-tool.token';
 import { RENT_TOKENS } from './rent.service';
 import { ProductKeysService } from './product-keys.service';
+import { maskedSecretsSay } from './prompt-secrets';
 
 /** «50 000» — как в остальных текстах для людей. Та же форма — для любого
  *  числа токенов (баланс в тексте «не хватает», п.2), не только для RENT_TOKENS. */
@@ -107,6 +108,7 @@ export class ProductLifecycleTool {
       return {
         ok: true,
         created: { kind: 'site', productId: r.productId, slug: r.slug, domain: r.domain, freeMonth: r.freeMonth },
+        ...(r.secretsMasked ? { secretsMasked: r.secretsMasked } : {}),
         // domain бывает null — заведение само отработало (сайт СУЩЕСТВУЕТ),
         // а чтение домена именно этим запросом сорвалось (см. createSite):
         // «https://null» выглядело бы настоящим адресом, а не как отказ
@@ -125,7 +127,8 @@ export class ProductLifecycleTool {
           // постановка упасть — ассистент не должен обещать то, чего не было.
           (r.firstPromptSet
             ? ' Первая правка по описанию поставлена и начнётся, когда сайт поднимется; её исход — действием status по имени продукта.'
-            : ' Дальше — правки действием edit.'),
+            : ' Дальше — правки действием edit.') +
+          (r.secretsMasked ? ` ${maskedSecretsSay(r.secretsMasked)}` : ''),
       };
     }
     if (kind === 'bot') {
@@ -134,13 +137,15 @@ export class ProductLifecycleTool {
       return {
         ok: true,
         pending: { actionId: r.actionId, kind: 'create_bot', expiresAt: r.expiresAt },
+        ...(r.secretsMasked ? { secretsMasked: r.secretsMasked } : {}),
         say: (!turn
           ? 'Защищённая карточка ждёт пользователя в кабинете (Студия → Продукты): там он'
           : channel === 'telegram'
             ? 'Ниже придёт сообщение с кнопкой: пользователь откроет защищённую форму'
             : 'Под твоим ответом появится защищённая карточка: пользователь')
           + ' введёт в неё токен бота от @BotFather и ключи сервисов. Ключи в переписке не проси. ' +
-          'Бот создастся, когда он отправит карточку; итог — действием status с этим actionId.',
+          'Бот создастся, когда он отправит карточку; итог — действием status с этим actionId.' +
+          (r.secretsMasked ? ` ${maskedSecretsSay(r.secretsMasked)}` : ''),
       };
     }
     return { ok: false, reason: 'bad_kind', say: 'Укажи kind: "site" (сайт) или "bot" (телеграм-бот) и name.' };

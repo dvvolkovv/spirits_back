@@ -336,3 +336,37 @@ describe('новые действия инструмента', () => {
     expect(r.deleted).toEqual([{ id: 'p9', name: 'Старый бот', slug: 'old', kind: 'bot', purge_after: '2026-11-24T10:00:00.000Z' }]);
   });
 });
+
+/** Задача бэклога 642c5198: что ассистент узнаёт о скрытых ключах при заведении. */
+describe('create: ключи в описании скрыты', () => {
+  const masked = { count: 1, names: ['WEATHER_API_KEY'] };
+
+  it('сайт — secretsMasked и фраза: значения скрыты, совет выпустить новый ключ и карточка keys', async () => {
+    const h = harness();
+    h.lifecycle.createSite.mockResolvedValue({ ok: true, productId: 'p-new', slug: 'magazin', domain: 'magazin.c.linkeon.io', freeMonth: true, firstPromptSet: true, secretsMasked: masked } as any);
+    const r: any = await h.svc.execute('u1', { action: 'create', kind: 'site', name: 'Магазин', prompt: 'x' }, 'web', 'turn-1');
+    expect(r.secretsMasked).toEqual(masked);
+    expect(r.say).toContain('WEATHER_API_KEY');
+    expect(r.say).toContain('«[ключ скрыт]»');
+    expect(r.say).toMatch(/выпустить новый ключ/);
+    expect(r.say).toMatch(/действие keys/);
+    // Основной смысл ответа не потерялся.
+    expect(r.say).toMatch(/Сайт создан/);
+  });
+
+  it('бот — то же в ответе с карточкой', async () => {
+    const h = harness();
+    h.lifecycle.openCreateBot.mockResolvedValue({ ok: true, actionId: 'a1', expiresAt: '2026-10-25T10:30:00.000Z', secretsMasked: masked } as any);
+    const r: any = await h.svc.execute('u1', { action: 'create', kind: 'bot', name: 'Бот', prompt: 'x' }, 'web', 'turn-1');
+    expect(r.secretsMasked).toEqual(masked);
+    expect(r.say).toMatch(/защищённая карточка/);
+    expect(r.say).toContain('«[ключ скрыт]»');
+  });
+
+  it('без маски — ни поля, ни фразы', async () => {
+    const h = harness();
+    const r: any = await h.svc.execute('u1', { action: 'create', kind: 'site', name: 'Магазин', prompt: 'лендинг' }, 'web', 'turn-1');
+    expect('secretsMasked' in r).toBe(false);
+    expect(r.say).not.toContain('[ключ скрыт]');
+  });
+});

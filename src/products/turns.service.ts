@@ -11,6 +11,7 @@ import {
 } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { MiscService } from '../misc/misc.service';
+import { maskSecrets } from './prompt-secrets';
 
 export interface EnqueueInput {
   productId: string;
@@ -24,6 +25,12 @@ export interface EnqueueInput {
 export interface TurnRow {
   id: string;
   status: string;
+  /**
+   * Сколько значений, похожих на ключи, скрыто в тексте правки перед записью
+   * (prompt-secrets.ts) и под какими именами. Есть только если скрыто хоть
+   * одно — по нему кабинет показывает плашку, а ассистент говорит человеку.
+   */
+  masked?: { count: number; names: string[] };
 }
 
 export type TurnStatus = 'queued' | 'running' | 'done' | 'failed' | 'reverted';
@@ -344,14 +351,22 @@ export class TurnsService implements OnModuleInit, OnModuleDestroy {
       throw new HttpException('Недостаточно токенов', HttpStatus.PAYMENT_REQUIRED);
     }
 
+    // Ключи из текста правки — ни в базу, ни модели правок (prompt-secrets.ts,
+    // задача бэклога 642c5198). Здесь, а не на входах, по той же причине, что
+    // и предусловия выше: входов три (кабинет, ассистент, первая правка), а
+    // через это место проходят все — новый вход не сможет о маске забыть.
+    // Не-строку не трогаем: её судьба (NOT NULL на null) — как была.
+    const masked = typeof input.prompt === 'string' ? maskSecrets(input.prompt) : null;
+
     try {
       const r = await this.pg.query(
         `INSERT INTO product_turns (product_id, user_id, channel, prompt, revert_to_sha, status)
          VALUES ($1, $2, $3, $4, $5, 'queued')
          RETURNING id, status`,
-        [input.productId, input.userId, input.channel, input.prompt, input.revertToSha ?? null],
+        [input.productId, input.userId, input.channel, masked ? masked.text : input.prompt, input.revertToSha ?? null],
       );
-      return r.rows[0];
+      const row: TurnRow = r.rows[0];
+      return masked && masked.count > 0 ? { ...row, masked: { count: masked.count, names: masked.names } } : row;
     } catch (e: any) {
       // Только замок product_turns_one_active. Это не ошибка сервера: клиент
       // отправил второй запрос, пока агент ещё работает над первым.

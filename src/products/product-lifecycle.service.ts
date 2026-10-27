@@ -8,6 +8,7 @@ import { ActionChannel, ConfirmedVia, DELETE_GRACE_DAYS, JOB_KILLED_BY_DELETE, P
 import { BotTokenCheck, checkBotToken } from './bot-token-check';
 import { randomSuffix, siteSlugCandidates, slugWithSuffix } from './product-slug';
 import { SecretsService } from './secrets.service';
+import { maskSecrets } from './prompt-secrets';
 
 // Срок возврата живёт в журнале (product-actions.service.ts) — одно число на
 // оба места; отсюда реэкспорт для инструмента, Telegram и спек.
@@ -17,6 +18,8 @@ const NAME_MAX = 80;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type LifecycleFail = { ok: false; reason: string; message: string };
+/** Итог маски ключей в тексте для продукта (prompt-secrets.ts) — только если скрыто хоть одно значение. */
+export type SecretsMasked = { count: number; names: string[] };
 
 /**
  * Что записывается в снятую правку при удалении продукта. Видит ВЛАДЕЛЕЦ — в
@@ -138,9 +141,16 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     return r.rows[0]?.isadmin === true;
   }
 
-  /** Возвращает true, только если правка реально поставлена (пустой prompt — не ошибка, но и не постановка). */
+  /**
+   * Возвращает true, только если правка реально поставлена (пустой prompt — не ошибка, но и не постановка).
+   *
+   * Маска ключей — и здесь, хотя входы (createSite, openCreateBot) скрывают
+   * их сами: first_prompt живёт открытым до тика первой правки, и новый вызов
+   * этого метода не должен суметь положить ключ мимо маски. Повторный проход
+   * по скрытому тексту ничего не меняет.
+   */
   private async setFirstPrompt(productId: string, prompt: unknown, channel: ActionChannel): Promise<boolean> {
-    const p = String(prompt ?? '').trim();
+    const p = maskSecrets(String(prompt ?? '').trim()).text;
     if (!p) return false;
     await this.pg.query(
       `UPDATE products SET first_prompt = $2, first_prompt_channel = $3 WHERE id = $1`,
@@ -150,8 +160,12 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
   }
 
   async createSite(i: { userId: string; name: unknown; prompt?: unknown; channel: ActionChannel }):
-    Promise<{ ok: true; productId: string; slug: string; domain: string | null; freeMonth: boolean; firstPromptSet: boolean } | LifecycleFail> {
+    Promise<{ ok: true; productId: string; slug: string; domain: string | null; freeMonth: boolean; firstPromptSet: boolean; secretsMasked?: SecretsMasked } | LifecycleFail> {
     const name = cleanName(i.name);
+    // Ключи из описания — до записи first_prompt (prompt-secrets.ts). Итог
+    // маски отдаётся наружу и при сорвавшейся постановке: ключ всё равно был
+    // в тексте, который ассистент собрал из разговора, и сказать об этом нужно.
+    const prompt = maskSecrets(String(i.prompt ?? '').trim());
     if (!name) return { ok: false, reason: 'bad_name', message: `Имя продукта — от 1 до ${NAME_MAX} знаков` };
     const isAdmin = await this.isAdmin(i.userId);
     let lastError: any = null;
@@ -183,7 +197,7 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     let domain: string | null = null;
     let firstPromptSet = false;
     try {
-      firstPromptSet = await this.setFirstPrompt(created.productId, i.prompt, i.channel);
+      firstPromptSet = await this.setFirstPrompt(created.productId, prompt.text, i.channel);
     } catch (e: any) {
       this.logger.warn(`сайт ${created.productId} создан, но первая правка не поставлена: ${e?.stack ?? e?.message ?? e}`);
     }
@@ -198,11 +212,14 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     } catch (e: any) {
       this.logger.warn(`сайт ${created.productId} создан, но запись в журнал не прошла: ${e?.stack ?? e?.message ?? e}`);
     }
-    return { ok: true, productId: created.productId, slug: created.slug, domain, freeMonth: created.freeMonth, firstPromptSet };
+    return {
+      ok: true, productId: created.productId, slug: created.slug, domain, freeMonth: created.freeMonth, firstPromptSet,
+      ...(prompt.count > 0 ? { secretsMasked: { count: prompt.count, names: prompt.names } } : {}),
+    };
   }
 
   async openCreateBot(i: { userId: string; name: unknown; prompt?: unknown; channel: ActionChannel; turn: string | null }):
-    Promise<{ ok: true; actionId: string; expiresAt: string } | LifecycleFail> {
+    Promise<{ ok: true; actionId: string; expiresAt: string; secretsMasked?: SecretsMasked } | LifecycleFail> {
     const name = cleanName(i.name);
     if (!name) return { ok: false, reason: 'bad_name', message: `Имя бота — от 1 до ${NAME_MAX} знаков` };
     // M8: предел — до открытия карточки, а не после того, как человек введёт
@@ -215,12 +232,18 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     } catch (e: any) {
       return failOf(e, 'Нет места в пределе', this.logger);
     }
-    const prompt = String(i.prompt ?? '').trim();
+    // payload.prompt карточки живёт до 30 минут и потом становится
+    // first_prompt — ключ не должен лежать открытым ни там, ни там.
+    const masked = maskSecrets(String(i.prompt ?? '').trim());
+    const prompt = masked.text;
     const { id, expiresAt } = await this.actions.open({
       userId: i.userId, productId: null, kind: 'create_bot', channel: i.channel, turn: i.turn,
       payload: { name, ...(prompt ? { prompt } : {}) },
     });
-    return { ok: true, actionId: id, expiresAt };
+    return {
+      ok: true, actionId: id, expiresAt,
+      ...(masked.count > 0 ? { secretsMasked: { count: masked.count, names: masked.names } } : {}),
+    };
   }
 
   /**

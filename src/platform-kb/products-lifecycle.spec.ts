@@ -3,6 +3,7 @@ import { renderArticle } from './render';
 import { V } from './values';
 import { DELETE_GRACE_DAYS } from '../products/product-actions.service';
 import { FREE_MONTH_PRODUCTS } from '../products/rent.service';
+import { SECRET_MASK } from '../products/prompt-secrets';
 
 /**
  * Справка о продуктах после того, как ассистент научился заводить, удалять и
@@ -36,6 +37,14 @@ describe('справка о продуктах: ассистент ведёт п
 
   it('ключи бота — только в защищённую карточку, не в переписку', () => {
     expect(web).toMatch(/защищённ\S* карточк/);
+  });
+
+  // Задача бэклога 642c5198: ключ в тексте правки скрывается до записи
+  // (prompt-secrets.ts). Текст обязан говорить именно это и тем же знаком,
+  // который человек увидит в истории правок.
+  it('ключ из текста правки скрывается — справка говорит тем же знаком, что история', () => {
+    expect(web).toContain(`«${SECRET_MASK}»`);
+    expect(web).toMatch(/вставленный прямо в текст правки, в продукт не попадёт/);
   });
 
   // Решение владельца 26.10.2026: бесплатный месяц — не каждому продукту, а

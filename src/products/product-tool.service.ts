@@ -1,7 +1,8 @@
 import { HttpException, Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { PRODUCT_TOOL_WAIT_MS } from '../common/relay-budget';
-import { TurnsService, SLEEPING_REFUSAL, BLOCKED_REFUSAL, REKEY_REFUSAL } from './turns.service';
+import { TurnsService, TurnRow, SLEEPING_REFUSAL, BLOCKED_REFUSAL, REKEY_REFUSAL } from './turns.service';
+import { maskedSecretsSay } from './prompt-secrets';
 import { DomainErrorReason, DomainRecordToSet, DomainRefusalCode, DomainStatus, DomainsService, DomainView } from './domains.service';
 import { normalizeDomain, readableDomain } from './domain-name';
 import { ProductToolChannel } from './product-tool.token';
@@ -479,15 +480,18 @@ export class ProductToolService {
     }
 
     const product = matches[0];
-    let turnId: string;
+    let turn: TurnRow;
     try {
-      const turn = await this.turns.enqueue({ productId: product.id, userId, channel, prompt });
-      turnId = turn.id;
+      turn = await this.turns.enqueue({ productId: product.id, userId, channel, prompt });
     } catch (e: any) {
       return this.refusal(e, product);
     }
 
-    return { ...(await this.waitForOutcome(turnId)), product };
+    const outcome = await this.waitForOutcome(turn.id);
+    // Скрытые ключи — после исхода, а не вместо него: правка поставлена и
+    // идёт как обычно, ассистенту нужно и то, и другое.
+    if (!turn.masked) return { ...outcome, product };
+    return { ...outcome, product, secretsMasked: turn.masked, say: `${outcome.say} ${maskedSecretsSay(turn.masked)}` };
   }
 
   /**
