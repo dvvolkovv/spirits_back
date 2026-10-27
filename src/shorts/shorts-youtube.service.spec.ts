@@ -19,7 +19,8 @@ const reply = (status: number, data: any = {}, headers: any = {}): HttpResponse 
 function fakeDb(
   init: {
     account?: any; mode?: string; session?: string | null; published?: string | null; pub?: string; attempts?: number;
-    noRow?: boolean; clearThrows?: boolean; sessionThrows?: boolean; sessionMissingColumn?: boolean; settingsUpdateThrows?: boolean;
+    noRow?: boolean; clearThrows?: boolean; sessionThrows?: boolean; sessionMissingColumn?: boolean; sessionOtherColumnMissing?: boolean;
+    settingsUpdateThrows?: boolean;
   } = {},
 ) {
   const st: any = {
@@ -30,14 +31,9 @@ function fakeDb(
     pub: init.pub ?? 'publishing',
     attempts: init.attempts ?? 1,
   };
-  /** BEGIN/COMMIT/ROLLBACK одной транзакции (M7) — остальные запросы в него не попадают. */
-  const log: string[] = [];
   const query = jest.fn(async (sql: string, p: any[] = []) => {
     const s = sql.replace(/\s+/g, ' ').trim();
-    if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(s)) {
-      log.push(s);
-      return { rows: [] };
-    }
+    if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(s)) return { rows: [] };
     if (s.startsWith('SELECT * FROM short_youtube_account')) return { rows: st.account ? [{ ...st.account }] : [] };
     if (s.startsWith('INSERT INTO short_youtube_account')) {
       st.account = {
@@ -47,7 +43,10 @@ function fakeDb(
       return { rows: [], rowCount: 1 };
     }
     if (s.startsWith("UPDATE short_settings SET youtube_mode = CASE")) {
-      if (init.settingsUpdateThrows) throw new Error('column "youtube_mode" does not exist');
+      // 003 — одна атомарная DO-транзакция: без колонки youtube_mode раньше упал бы сам INSERT
+      // аккаунта (другой колонки той же миграции), а не это UPDATE. Правдоподобный сбой здесь —
+      // что-то, что бьёт именно в эту попытку (блокировка), а не в схему.
+      if (init.settingsUpdateThrows) throw new Error('canceling statement due to lock timeout');
       if (st.mode === 'manual') st.mode = 'unlisted';
       return { rows: [{ youtube_mode: st.mode }], rowCount: 1 };
     }
@@ -58,6 +57,8 @@ function fakeDb(
     }
     if (s.startsWith('SELECT upload_session FROM short_publication')) {
       if (init.sessionMissingColumn) throw Object.assign(new Error('column "upload_session" does not exist'), { code: '42703' });
+      // 42703 той же ошибкой, но про другую колонку: не наш случай (пока она не упоминает upload_session).
+      if (init.sessionOtherColumnMissing) throw Object.assign(new Error('column "some_other_column" does not exist'), { code: '42703' });
       if (init.sessionThrows) throw new Error('Connection terminated unexpectedly');
       return { rows: [{ upload_session: st.session }] };
     }
@@ -82,9 +83,23 @@ function fakeDb(
     if (s.startsWith('SELECT url FROM short_publication')) return { rows: st.published ? [{ url: st.published }] : [] };
     throw new Error(`неожиданный запрос: ${s}`);
   });
-  // М7: inTransaction берёт выделенное соединение через getClient(), а не пул query() напрямую.
-  const getClient = jest.fn(async () => ({ query, release: jest.fn() }));
-  return { query, st, log, getClient };
+  /**
+   * M7: пул (query) и выделенное соединение транзакции (getClient().query) — РАЗНЫЕ функции,
+   * как в проде (PgService.query ходит через пул, PgService.getClient() — отдельное соединение).
+   * Если реализация напишет что-то транзакции мимо tx (на this.pg.query — то есть на пул), этот
+   * запрос не попадёт в viaTx, хотя состояние (через делегирование в query) всё равно обновится, —
+   * тест это заметит. release — проверить финализацию соединения (false — не поломано).
+   */
+  const viaTx: string[] = [];
+  const release = jest.fn();
+  const getClient = jest.fn(async () => ({
+    query: (sql: string, p?: any[]) => {
+      viaTx.push(sql.replace(/\s+/g, ' ').trim().split(' ').slice(0, 3).join(' '));
+      return query(sql, p);
+    },
+    release,
+  }));
+  return { query, st, viaTx, release, getClient };
 }
 
 /** Ответы Google по очереди; функция — ответ с побочным действием (например, чужой захват строки в этот момент). */
@@ -131,6 +146,7 @@ beforeEach(() => {
   delete process.env.YOUTUBE_CHANNEL_ID;
   jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
   jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+  jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
 });
 afterEach(() => jest.restoreAllMocks());
 afterAll(() => {
@@ -299,20 +315,29 @@ describe('адрес возврата Google', () => {
     );
     // M5: тот же факт — в лог сервера, не только в Telegram владельца.
     expect(log.mock.calls.some(([m]) => String(m).includes('YouTube подключён: канал UCu_Pq4rFXmTT8CDG27O_i2A «Linkeon», режим unlisted'))).toBe(true);
+    // M7: обе записи реально ушли через выделенное соединение транзакции (tx), а не мимо него на пул.
+    expect(db.viaTx).toEqual(['BEGIN', 'INSERT INTO short_youtube_account', 'UPDATE short_settings SET', 'COMMIT']);
   });
 
   /**
    * M7: раньше аккаунт мог записаться, а сбой UPDATE short_settings давал только страницу
    * 502 — канал оставался привязан без согласованного режима. Обе записи — в одной
    * транзакции: сбой второй откатывает и первую.
+   *
+   * Причина сбоя — блокировка, а не схема: 003 — один атомарный DO-блок, без колонки
+   * youtube_mode раньше упал бы сам INSERT аккаунта (другая колонка той же миграции), а не
+   * это UPDATE.
    */
   it('M7: сбой UPDATE short_settings — откат (ROLLBACK, без COMMIT), страница 502, причина владельцу', async () => {
     const db = fakeDb({ settingsUpdateThrows: true });
     const { svc, said } = setup(db, fakeHttp(tokensOk(), channelOk()));
     const page = await svc.completeConnect({ code: 'c', state: stateFor() });
     expect(page.status).toBe(502);
-    expect(said()[0]).toBe('YouTube не подключён: column "youtube_mode" does not exist');
-    expect(db.log).toEqual(['BEGIN', 'ROLLBACK']);
+    expect(said()[0]).toBe('YouTube не подключён: canceling statement due to lock timeout');
+    // Обе записи ушли через tx (иначе INSERT, случившийся мимо транзакции на пул, остался бы в базе
+    // необратимо), и откат — ROLLBACK, не COMMIT.
+    expect(db.viaTx).toEqual(['BEGIN', 'INSERT INTO short_youtube_account', 'UPDATE short_settings SET', 'ROLLBACK']);
+    expect(db.release).toHaveBeenCalledWith(false);
   });
 
   it('режим «публично» подключение не трогает', async () => {
@@ -332,6 +357,20 @@ describe('адрес возврата Google', () => {
     expect(tg.sendMessage).not.toHaveBeenCalled();
     // M5: исход виден и в логе, не только по отсутствию сообщения.
     expect(warn.mock.calls.some(([m]) => String(m).includes('YouTube: вход в Google не завершён (error=access_denied)'))).toBe(true);
+  });
+
+  /**
+   * error= читается до verifyState — на этот путь попадёт и чужой анонимный запрос. Код
+   * Google — [a-z_], так что перевод строки или прочий мусор в value — не легальное значение,
+   * а попытка исказить лог (например, подделать соседнюю строку).
+   */
+  it('error= очищен от переводов строк и прочего мусора перед логом', async () => {
+    const warn = jest.spyOn(Logger.prototype, 'warn');
+    const { svc } = setup();
+    await svc.completeConnect({ error: 'access_denied\n[Nest] ПОДДЕЛЬНАЯ строка лога', state: stateFor() });
+    const line = String(warn.mock.calls.find(([m]) => String(m).includes('вход в Google не завершён'))?.[0]);
+    expect(line).not.toMatch(/[\r\n]/);
+    expect(line).toContain('error=access_denied?');
   });
 
   it('чужой или битый state — 400, без запросов', async () => {
@@ -399,6 +438,21 @@ describe('адрес возврата Google', () => {
     delete process.env.YOUTUBE_OAUTH_CLIENT_ID;
     const { svc } = setup();
     expect((await svc.completeConnect({ code: 'c', state: 'x' })).status).toBe(503);
+  });
+
+  /**
+   * Код Google — одноразовый: потратить его на exchangeCode, не умея сохранить refresh-токен
+   * этим же ключом (accessToken() проверяет его точно так же при обновлении), значило бы
+   * сжечь код впустую — владельцу пришлось бы начинать заново с новой ссылки.
+   */
+  it('нет CALENDAR_SECRET_KEY — код Google не трогаем (одноразовый), 503 и сообщение', async () => {
+    delete process.env.CALENDAR_SECRET_KEY;
+    const { svc, said, http } = setup();
+    const page = await svc.completeConnect({ code: 'c', state: stateFor() });
+    expect(page.status).toBe(503);
+    expect(page.html).toContain('на сервере нет CALENDAR_SECRET_KEY — канал не подключить');
+    expect(http.http).not.toHaveBeenCalled();
+    expect(said()[0]).toBe('YouTube не подключён: на сервере нет CALENDAR_SECRET_KEY — канал не подключить');
   });
 
   it('текст страницы экранируется', () => {
@@ -774,6 +828,20 @@ describe('загрузка ролика', () => {
     expect(await svc.uploadPlan('v1')).toEqual({ kind: 'kit', note: null });
     expect(error.mock.calls.some(([m]) => String(m).includes('YouTube: нет колонки upload_session — миграция 003 не накатилась'))).toBe(true);
     expect(warn.mock.calls.some(([m]) => String(m).includes('адрес сессии YouTube не прочитан'))).toBe(false);
+  });
+
+  /**
+   * 42703 той же ошибкой, но про другую колонку (например, если запрос session() когда-нибудь
+   * пополнят новым условием) — не наш случай 003: безопасная сторона здесь — как при любой
+   * непонятной ошибке (pending = true), а не молчаливое «загрузок не было».
+   */
+  it('M1: 42703 с другим именем колонки — не считаем «003 не накатилась», обычное предупреждение', async () => {
+    const error = jest.spyOn(Logger.prototype, 'error');
+    const warn = jest.spyOn(Logger.prototype, 'warn');
+    const { svc } = setup(fakeDb({ mode: 'manual', sessionOtherColumnMissing: true }));
+    expect(await svc.uploadPlan('v1')).toEqual({ kind: 'kit', note: PENDING_UPLOAD_NOTE });
+    expect(error.mock.calls.some(([m]) => String(m).includes('миграция 003 не накатилась'))).toBe(false);
+    expect(warn.mock.calls.some(([m]) => String(m).includes('адрес сессии YouTube не прочитан'))).toBe(true);
   });
 
   /**

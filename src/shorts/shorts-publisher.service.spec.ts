@@ -464,6 +464,25 @@ describe('ShortsPublisherService.publish — YouTube загрузкой', () => 
     expect(warn.mock.calls.some(([m]) => String(m).includes('YouTube набором'))).toBe(false);
   });
 
+  /**
+   * uploadPlan склеивает заметку и PENDING_UPLOAD_NOTE через \n (shorts-youtube.service.ts) —
+   * сырой перевод строки в логе развёл бы «YouTube набором» и «могла дойти» по разным строкам
+   * лога, и grep по ролику нашёл бы только первую половину.
+   */
+  it('план — набор: многострочная заметка (доступ пропал + «могла дойти») — одна строка лога', async () => {
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const note =
+      'Доступ к каналу YouTube пропал — набор вместо загрузки. Переподключить: /youtube\n' +
+      'Прошлая загрузка этого ролика на YouTube могла дойти — проверьте канал, прежде чем выкладывать вручную.';
+    const yt = youtube({ kind: 'kit', note });
+    const { svc, tg } = setup(fakeDb(), '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(tg.sendDocument).toHaveBeenCalledTimes(1);
+    const line = String(warn.mock.calls.find(([m]) => String(m).startsWith(`ролик ${ID}: YouTube набором`))?.[0]);
+    expect(line).not.toContain('\n');
+    expect(line).toContain('Переподключить: /youtube · Прошлая загрузка этого ролика');
+  });
+
   it('доступ пропал при загрузке — набор с причиной, ролик опубликован', async () => {
     const yt = youtube(UPLOAD);
     yt.upload.mockRejectedValue(new YoutubeAuthError('HTTP 400 invalid_grant: Token has been expired or revoked.'));
