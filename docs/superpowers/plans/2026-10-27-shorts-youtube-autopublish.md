@@ -30,7 +30,7 @@
 |---|---|
 | `src/shorts/migrations/003_youtube.sql` (новый) | `short_settings.youtube_mode`, `short_publication.upload_session`, `short_youtube_account` |
 | `src/shorts/shorts-schema.service.ts` | катить 003 после 002 |
-| `src/shorts/shorts.types.ts` | `YoutubeMode`, `YOUTUBE_MODES`, `ShortPublication.uploadSession` |
+| `src/shorts/shorts.types.ts` | `YoutubeMode`, `YOUTUBE_MODES` (адрес сессии загрузки в `ShortPublication` не выносится — это ключ на загрузку) |
 | `src/shorts/shorts-settings.service.ts` | `youtubeMode` в настройках и в правке |
 | `src/shorts/youtube/youtube-http.ts` (новый) | тип `Http`, адаптер axios, `googleReason` |
 | `src/shorts/youtube/youtube-errors.ts` (новый) | `YoutubeAuthError`, `YoutubeNotUploaded`, `YoutubeMaybeUploaded` |
@@ -317,6 +317,12 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-schema.spe
 ```
 
 Expected: PASS, все три сюиты.
+
+**Поправки ревью качества (27.10, сделаны в задаче 1):**
+- `uploadSession` убран из `ShortPublication` и `rowToPublication`: объект площадки отдаёт админ-API, а адрес resumable-сессии работает как ключ на загрузку. Колонку `upload_session` читают и пишут прямым SQL (задача 6). Тест типов проверяет, что адрес наружу не попадает.
+- Тест защиты ALTER в 003 сверяет пары «таблица.колонка», DO-блок проверяется и по концу файла, умолчание режима связано с `SETTINGS_DEFAULTS.youtubeMode`.
+- Откат в шапке 003: перед `DROP COLUMN upload_session` — найти незавершённые загрузки и проверить канал; `DROP TABLE` не отзывает доступ у Google.
+- Админ-API (`update_settings`) может поставить только `youtubeMode: 'manual'` — аварийная остановка. `unlisted` и `public` включает только владелец командой `/youtube` (бот пишет режим через `settings.update()`, мимо валидации правки).
 
 ---
 
@@ -1062,7 +1068,6 @@ function fakeDb(init: { account?: any; mode?: string; session?: string | null; p
   const st: any = {
     account: init.account ?? null,
     mode: init.mode ?? 'manual',
-    channel: null,
     session: init.session ?? null,
     published: init.published ?? null,
   };
@@ -1076,8 +1081,7 @@ function fakeDb(init: { account?: any; mode?: string; session?: string | null; p
       };
       return { rows: [], rowCount: 1 };
     }
-    if (s.startsWith('UPDATE short_settings SET youtube_channel_id')) {
-      st.channel = p[0];
+    if (s.startsWith("UPDATE short_settings SET youtube_mode = CASE")) {
       if (st.mode === 'manual') st.mode = 'unlisted';
       return { rows: [{ youtube_mode: st.mode }], rowCount: 1 };
     }
@@ -1256,7 +1260,6 @@ describe('адрес возврата Google', () => {
     expect(db.st.account.refresh_token_enc).not.toContain('refresh-xyz');
     expect(decryptSecret(db.st.account.refresh_token_enc)).toBe('refresh-xyz');
     expect(db.st.mode).toBe('unlisted');
-    expect(db.st.channel).toBe('UCu_Pq4rFXmTT8CDG27O_i2A');
     expect(said()[0]).toBe(
       'YouTube подключён: канал «Linkeon» (@linkeons). Ролики будут загружаться сами, режим — по ссылке. ' +
         'Проверьте первый ролик: если открывается по ссылке и не стал приватным — /youtube публично.',
@@ -1486,14 +1489,13 @@ export class ShortsYoutubeService {
         [ch.id, ch.title, encryptSecret(tokens.refreshToken), tokens.scope],
       );
       // Подключение при «вручную» включает «по ссылке»: первый ролик — проверка (спека, «Сценарий владельца»).
+      // Канал хранится только в short_youtube_account; short_settings.youtube_channel_id не трогаем — одна правда.
       const r = await this.pg.query(
         `UPDATE short_settings
-            SET youtube_channel_id = $1,
-                youtube_mode = CASE WHEN youtube_mode = 'manual' THEN 'unlisted' ELSE youtube_mode END,
+            SET youtube_mode = CASE WHEN youtube_mode = 'manual' THEN 'unlisted' ELSE youtube_mode END,
                 updated_at = now()
           WHERE id = 1
           RETURNING youtube_mode`,
-        [ch.id],
       );
       const mode: YoutubeMode = r.rows[0]?.youtube_mode ?? 'unlisted';
       const handle = ch.handle ? ` (${ch.handle})` : '';
@@ -1580,6 +1582,7 @@ Expected: PASS.
 В `src/shorts/shorts-youtube.service.spec.ts`:
 - импорт крипто: `import { decryptSecret, encryptSecret } from '../calendar/crypto';`
 - новый импорт: `import { YoutubeAuthError, YoutubeMaybeUploaded, YoutubeNotUploaded } from './youtube/youtube-errors';`
+- в импорт сервиса добавить `PENDING_UPLOAD_NOTE`: `import { PENDING_UPLOAD_NOTE, ShortsYoutubeService, connectPage, parseYoutubeCommand } from './shorts-youtube.service';`
 - в конец файла:
 
 ```ts
@@ -1594,16 +1597,22 @@ describe('загрузка ролика', () => {
   const alive = () => jest.fn(async () => true);
 
   it('план: вручную — набор без заметки; нет канала, доступ пропал, нет клиента — набор с заметкой; иначе загрузка', async () => {
-    expect(await setup(fakeDb({ mode: 'manual' })).svc.uploadPlan()).toEqual({ kind: 'kit', note: null });
-    expect(await setup(fakeDb({ mode: 'public' })).svc.uploadPlan())
+    expect(await setup(fakeDb({ mode: 'manual' })).svc.uploadPlan('v1')).toEqual({ kind: 'kit', note: null });
+    expect(await setup(fakeDb({ mode: 'public' })).svc.uploadPlan('v1'))
       .toEqual({ kind: 'kit', note: 'Канал YouTube не подключён — набор вместо загрузки. Подключить: /youtube' });
-    expect(await setup(fakeDb({ mode: 'unlisted', account: { ...CONNECTED, refresh_token_enc: 'e', status: 'revoked' } })).svc.uploadPlan())
+    expect(await setup(fakeDb({ mode: 'unlisted', account: { ...CONNECTED, refresh_token_enc: 'e', status: 'revoked' } })).svc.uploadPlan('v1'))
       .toEqual({ kind: 'kit', note: 'Доступ к каналу YouTube пропал — набор вместо загрузки. Переподключить: /youtube' });
-    expect(await setup(fakeDb({ mode: 'unlisted', account: { ...CONNECTED, refresh_token_enc: 'e' } })).svc.uploadPlan())
+    expect(await setup(fakeDb({ mode: 'unlisted', account: { ...CONNECTED, refresh_token_enc: 'e' } })).svc.uploadPlan('v1'))
       .toEqual({ kind: 'upload', privacy: 'unlisted' });
     delete process.env.YOUTUBE_OAUTH_CLIENT_ID;
-    expect(await setup(fakeDb({ mode: 'public' })).svc.uploadPlan())
+    expect(await setup(fakeDb({ mode: 'public' })).svc.uploadPlan('v1'))
       .toEqual({ kind: 'kit', note: 'YouTube не настроен на сервере — набор вместо загрузки.' });
+  });
+
+  it('набор при живой сессии загрузки — с предупреждением проверить канал', async () => {
+    expect(await setup(fakeDb({ mode: 'manual', session: SESSION })).svc.uploadPlan('v1')).toEqual({ kind: 'kit', note: PENDING_UPLOAD_NOTE });
+    expect(await setup(fakeDb({ mode: 'public', session: SESSION, account: { ...CONNECTED, refresh_token_enc: 'e', status: 'revoked' } })).svc.uploadPlan('v1'))
+      .toEqual({ kind: 'kit', note: `Доступ к каналу YouTube пропал — набор вместо загрузки. Переподключить: /youtube ${PENDING_UPLOAD_NOTE}` });
   });
 
   it('загрузка: токен, сессия с метаданными, адрес лёг в базу до файла, файл, адрес стёрт', async () => {
@@ -1776,20 +1785,35 @@ export const YOUTUBE_CATEGORY_ID = '27';
 
 /** Что делать с роликом на YouTube: набор владельцу (с заметкой — почему) или загрузка с этим доступом. */
 export type YoutubePlan = { kind: 'kit'; note: string | null } | { kind: 'upload'; privacy: 'unlisted' | 'public' };
+
+/** К набору, когда у ролика жива сессия загрузки: прошлая загрузка могла дойти (спека, «Публикация», п. 7). */
+export const PENDING_UPLOAD_NOTE = 'Прошлая загрузка этого ролика на YouTube могла дойти — проверьте канал, прежде чем выкладывать вручную.';
 ```
 
 В класс перед `private async statusText` добавить:
 
 ```ts
-  /** Загрузка — только когда режим не «вручную», клиент OAuth есть и канал подключён; иначе набор. */
-  async uploadPlan(): Promise<YoutubePlan> {
+  /**
+   * Загрузка — только когда режим не «вручную», клиент OAuth есть и канал подключён;
+   * иначе набор. Набор при живой сессии загрузки ролика — с предупреждением: прошлая
+   * загрузка могла дойти, и ручная выкладка дала бы дубль.
+   */
+  async uploadPlan(shortId: string): Promise<YoutubePlan> {
     const mode = (await this.settings.get()).youtubeMode;
-    if (mode === 'manual') return { kind: 'kit', note: null };
-    if (!youtubeOAuthConfig()) return { kind: 'kit', note: 'YouTube не настроен на сервере — набор вместо загрузки.' };
-    const acc = await this.account();
-    if (!acc) return { kind: 'kit', note: 'Канал YouTube не подключён — набор вместо загрузки. Подключить: /youtube' };
-    if (acc.status === 'revoked') return { kind: 'kit', note: 'Доступ к каналу YouTube пропал — набор вместо загрузки. Переподключить: /youtube' };
-    return { kind: 'upload', privacy: mode };
+    let note: string | null;
+    if (mode === 'manual') {
+      note = null;
+    } else if (!youtubeOAuthConfig()) {
+      note = 'YouTube не настроен на сервере — набор вместо загрузки.';
+    } else {
+      const acc = await this.account();
+      if (acc?.status === 'connected') return { kind: 'upload', privacy: mode };
+      note = acc
+        ? 'Доступ к каналу YouTube пропал — набор вместо загрузки. Переподключить: /youtube'
+        : 'Канал YouTube не подключён — набор вместо загрузки. Подключить: /youtube';
+    }
+    if (await this.session(shortId)) note = [note, PENDING_UPLOAD_NOTE].filter(Boolean).join(' ');
+    return { kind: 'kit', note };
   }
 
   /**
@@ -2060,6 +2084,7 @@ describe('ShortsPublisherService.publish — YouTube загрузкой', () => 
     yt.upload.mockResolvedValue({ videoId: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk' });
     const { svc, tg, db } = setup(fakeDb(), '-1003290853538', ['telegram', 'youtube'], yt);
     await svc.publish(ID);
+    expect(yt.uploadPlan).toHaveBeenCalledWith(ID);
     expect(yt.upload).toHaveBeenCalledWith(expect.objectContaining({ id: ID }), 'unlisted', expect.any(Function));
     expect(db.pubs.get('youtube')).toMatchObject({ status: 'published', external_id: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk' });
     expect(tg.sendDocument).not.toHaveBeenCalled();
@@ -2233,7 +2258,7 @@ export const YOUTUBE_MAY_BE_OUT = 'YouTube не ответил, дошла ли 
    * отказ с YOUTUBE_MAY_BE_OUT, ролик уходит в failed.
    */
   private async toYoutube(v: ShortVideo): Promise<PlatformResult> {
-    const plan: YoutubePlan = this.youtube ? await this.youtube.uploadPlan() : { kind: 'kit', note: null };
+    const plan: YoutubePlan = this.youtube ? await this.youtube.uploadPlan(v.id) : { kind: 'kit', note: null };
     if (plan.kind === 'kit') return this.youtubeKit(v, plan.note);
     const last = v.attempts >= MAX_PUBLISH_ATTEMPTS;
     try {
@@ -2389,7 +2414,7 @@ import { ShortsYoutubeService } from './shorts-youtube.service';
     const reply = (status: number, data: any = {}, headers: any = {}) => ({ status, data, headers });
     const reset = async () => {
       await pool.query('TRUNCATE short_youtube_account');
-      await pool.query(`UPDATE short_settings SET youtube_mode = 'manual', youtube_channel_id = NULL WHERE id = 1`);
+      await pool.query(`UPDATE short_settings SET youtube_mode = 'manual' WHERE id = 1`);
     };
 
     beforeAll(() => {
@@ -2446,8 +2471,8 @@ import { ShortsYoutubeService } from './shorts-youtube.service';
       expect(acc.rowCount).toBe(1);
       expect(acc.rows[0]).toMatchObject({ id: 1, channel_id: 'UCu_Pq4rFXmTT8CDG27O_i2A', status: 'connected' });
       expect(decryptSecret(acc.rows[0].refresh_token_enc)).toBe('refresh-xyz');
-      const s = await pool.query('SELECT youtube_mode, youtube_channel_id FROM short_settings WHERE id = 1');
-      expect(s.rows[0]).toEqual({ youtube_mode: 'unlisted', youtube_channel_id: 'UCu_Pq4rFXmTT8CDG27O_i2A' });
+      const s = await pool.query('SELECT youtube_mode FROM short_settings WHERE id = 1');
+      expect(s.rows[0]).toEqual({ youtube_mode: 'unlisted' });
     });
 
     it('сессия загрузки: адрес в строке youtube до файла, после успеха — стёрт', async () => {

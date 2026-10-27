@@ -53,7 +53,8 @@ unverified API projects are not restricted to private viewing mode». Запис
    - `public` — «публично».
 
    Переключение: `/youtube вручную`, `/youtube по ссылке`, `/youtube публично`
-   (без учёта регистра).
+   (без учёта регистра). Через админ-API (`update_settings`) режим можно только
+   выключить (`manual`, аварийная остановка): включает загрузку только владелец.
 4. Подключение при режиме `manual` переводит его в `unlisted`: это проверка
    первого ролика. Остальные режимы подключение не трогает.
 5. Каждая автозагрузка — сообщение владельцу: «Вышло на YouTube (по ссылке):
@@ -87,7 +88,7 @@ unverified API projects are not restricted to private viewing mode». Запис
 `@Optional`-параметром, без него — набор), `tg-bot.service.ts` (сервис YouTube —
 последним `@Optional`-параметром, как сервис одобрения роликов, и строка в
 `handleDmCommand` рядом с `/short`), `shorts-settings.service.ts` (`youtubeMode`),
-`shorts.types.ts` (`uploadSession`, `YoutubeMode`), `shorts-schema.service.ts`
+`shorts.types.ts` (`YoutubeMode`), `shorts-schema.service.ts`
 (003), `shorts.module.ts` (провайдер, контроллер, экспорт). `ShortsApprovalService`
 не меняется.
 
@@ -104,7 +105,9 @@ unverified API projects are not restricted to private viewing mode». Запис
 - `short_settings.youtube_mode text NOT NULL DEFAULT 'manual'`
   `CHECK (youtube_mode IN ('manual','unlisted','public'))`.
 - `short_publication.upload_session text` — адрес resumable-сессии текущей
-  загрузки. Пишется до отправки файла, стирается после успеха.
+  загрузки. Пишется до отправки файла, стирается после успеха. Наружу не
+  выносится: адрес работает как ключ на загрузку, поэтому в `ShortPublication`
+  (его отдаёт админ-API) поля нет — сервис YouTube читает колонку прямым SQL.
 - `short_youtube_account` — одна строка (`id = 1`):
   - `channel_id text NOT NULL`, `channel_title text`;
   - `refresh_token_enc text NOT NULL` — AES-256-GCM через `src/calendar/crypto.ts`,
@@ -113,7 +116,8 @@ unverified API projects are not restricted to private viewing mode». Запис
   - `status text NOT NULL DEFAULT 'connected' CHECK (status IN ('connected','revoked'))`;
   - `last_error text`, `connected_at`, `updated_at`.
 
-  Подключение — upsert строки. Заодно `short_settings.youtube_channel_id = channel_id`.
+  Подключение — upsert строки. Канал хранится только здесь: `short_settings.youtube_channel_id`
+  (колонка 001) не трогаем — одна правда.
 
 Откат: код без YouTube этих колонок не читает (`SELECT *` настроек лишнее
 поле не роняет).
@@ -124,6 +128,8 @@ unverified API projects are not restricted to private viewing mode». Запис
 Telegram, через `platform()` с захватом строки. Внутри выбирается путь:
 
 - `youtube_mode = 'manual'` или аккаунта нет, или он `revoked` → набор (`youtubeKit`).
+  Если у ролика жива сессия загрузки (прошлая попытка могла дойти), к набору
+  добавляется предупреждение «проверьте канал, прежде чем выкладывать вручную».
 - Иначе — загрузка:
   1. В строке есть `upload_session` (прошлая попытка оборвалась) → спросить
      состояние сессии. Загружено — записать `published` с этим видео, новой
