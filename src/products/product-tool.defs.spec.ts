@@ -7,10 +7,10 @@ import { DOMAIN_ERROR_REASONS, DomainView } from './domains.service';
 describe('определение инструмента продуктов', () => {
   const tool = () => PRODUCT_TOOLS.find((t) => t.name === PRODUCT_TOOL_NAME)!;
 
-  it('инструмент ровно один, с восемью действиями', () => {
+  it('инструмент ровно один, с девятью действиями', () => {
     expect(PRODUCT_TOOLS).toHaveLength(1);
     expect((tool().input_schema as any).properties.action.enum.slice().sort())
-      .toEqual(['create', 'delete', 'domain', 'edit', 'list', 'restore', 'revert', 'status']);
+      .toEqual(['create', 'delete', 'domain', 'edit', 'keys', 'list', 'restore', 'revert', 'status']);
     const p = (tool().input_schema as any).properties;
     expect(p.kind.enum).toEqual(['site', 'bot']);
     expect(p.name.type).toBe('string');
@@ -75,7 +75,9 @@ describe('определение инструмента продуктов', () 
     expect(d).toMatch(/КЛЮЧИ, ТОКЕНЫ И ПАРОЛИ в prompt не вписывай/);
     expect(d).toMatch(/Ключи в разговоре не проси/);
     expect(d).toMatch(/защищённую карточку/);
-    expect(d).toMatch(/Сменить ключи после создания пока нельзя/);
+    expect(d).not.toMatch(/пока нельзя/);
+    expect(d).toMatch(/action="keys"/);
+    expect(d).toMatch(/предложи карточку keys/);
   });
 
   it('удаление — только по кнопке пользователя, с возвратом', () => {
@@ -102,7 +104,7 @@ describe('определение инструмента продуктов', () 
   });
 
   it('каждое действие названо в описании', () => {
-    for (const a of ['list', 'edit', 'status', 'domain', 'create', 'delete', 'restore', 'revert']) {
+    for (const a of ['list', 'edit', 'status', 'domain', 'create', 'delete', 'restore', 'revert', 'keys']) {
       expect(tool().description).toContain(`action="${a}"`);
     }
   });
