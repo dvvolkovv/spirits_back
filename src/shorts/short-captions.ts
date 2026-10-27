@@ -41,10 +41,19 @@ function withTail(body: string, tail: string, max: number): string {
 
 /**
  * YouTube отвергает `<` и `>` в заголовке и описании (400 — ролик не загрузится, и
- * Studio при ручной выкладке их тоже не примет): заменяем на похожие одиночные ёлочки.
+ * Studio при ручной выкладке их тоже не примет). Сначала сохраняем смысл операторов и
+ * стрелок (`<=`, `>=`, `->`, `<-`), потом одиночные `<`/`>` меняем на похожие ёлочки.
+ * Идемпотентна (youtubeSafe(youtubeSafe(s)) === youtubeSafe(s)): после первого прохода
+ * одиночных `<`/`>` не остаётся, повторный вызов — не меняет строку.
  */
 export function youtubeSafe(s: string): string {
-  return s.replace(/</g, '‹').replace(/>/g, '›');
+  return s
+    .replace(/<=/g, '≤')
+    .replace(/>=/g, '≥')
+    .replace(/->/g, '→')
+    .replace(/<-/g, '←')
+    .replace(/</g, '‹')
+    .replace(/>/g, '›');
 }
 
 export function tidyTags(tags: string[]): string[] {
@@ -71,14 +80,20 @@ export interface WriterCaptionTexts {
   youtube: { title: string; description: string; tags: string[] };
 }
 
-/** Подписи площадок: текст сценариста, ссылка с метками этой площадки, пометка о голосе. */
+/**
+ * Подписи площадок: текст сценариста, ссылка с метками этой площадки, пометка о голосе.
+ * Заголовок и описание YouTube — через youtubeSafe уже здесь (не только при отправке в
+ * upload() и наборе youtubeKit()): карточка проверки владельца (buildReviewCaption читает
+ * эти же captions) должна показывать то же, что уйдёт на YouTube. Повторный youtubeSafe
+ * при отправке — не лишний: функция идемпотентна, порчи текста не будет.
+ */
 export function buildCaptions(w: WriterCaptionTexts, links: Record<LinkPlatform, string>): ShortCaptions {
   return {
     telegram: withTail(w.telegram, `\n\n${links.telegram}\n\n${SYNTH_NOTE}`, TG_CAPTION_MAX),
     vk: withTail(w.vk || w.telegram, `\n\n${links.vk}\n\n${SYNTH_NOTE}`, VK_TEXT_MAX),
     youtube: {
-      title: clip(w.youtube.title, YT_TITLE_MAX),
-      description: withTail(w.youtube.description, `\n\n${links.youtube}\n\n${SYNTH_NOTE}`, YT_DESCRIPTION_MAX),
+      title: clip(youtubeSafe(w.youtube.title), YT_TITLE_MAX),
+      description: withTail(youtubeSafe(w.youtube.description), `\n\n${links.youtube}\n\n${SYNTH_NOTE}`, YT_DESCRIPTION_MAX),
       tags: tidyTags(w.youtube.tags),
     },
   };
