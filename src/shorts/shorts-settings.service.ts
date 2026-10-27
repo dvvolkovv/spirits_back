@@ -19,7 +19,7 @@ export interface ShortSettings {
   format: ShortFormat;
   /** Предел секунд Omni на ролик со всеми пересъёмками (спека сценок, «Отказы»). */
   maxOmniSeconds: number;
-  /** YouTube: manual — набор владельцу, unlisted/public — загрузка с этим доступом (спека YouTube). */
+  /** YouTube: manual — набор владельцу, unlisted («по ссылке») / public («публично») — загрузка с этим доступом (спека YouTube). */
   youtubeMode: YoutubeMode;
 }
 
@@ -114,7 +114,12 @@ export function validateSettingsPatch(body: any): ShortSettingsPatch {
     p.maxOmniSeconds = b.maxOmniSeconds;
   }
   if (b.youtubeMode !== undefined) {
-    if (!YOUTUBE_MODES.includes(b.youtubeMode)) throw new Error('youtubeMode — manual (набор), unlisted («по ссылке») или public');
+    // Включает unlisted/public только владелец командой /youtube в боте (settings.update()
+    // напрямую, мимо этой проверки) — здесь, через админку, доступен только аварийный откат на manual.
+    if (b.youtubeMode === 'unlisted' || b.youtubeMode === 'public') {
+      throw new Error('youtubeMode: загрузку на YouTube включает только владелец командой /youtube в боте; через админку можно только manual');
+    }
+    if (b.youtubeMode !== 'manual') throw new Error('youtubeMode — только manual (набор); unlisted и public включает владелец командой /youtube');
     p.youtubeMode = b.youtubeMode;
   }
   return p;
@@ -125,7 +130,7 @@ export class ShortsSettingsService {
   constructor(private readonly pg: PgService) {}
 
   async get(): Promise<ShortSettings> {
-    // Все колонки: сорвавшийся накат 002 не должен ронять публикацию и одобрение —
+    // Все колонки: сорвавшийся накат 002 или 003 не должен ронять публикацию и одобрение —
     // без новых колонок их поля возьмутся по умолчанию.
     const r = await this.pg.query(`SELECT * FROM short_settings WHERE id = 1`);
     const row = r.rows[0];

@@ -301,8 +301,6 @@ export interface ShortPublication {
   url: string | null;
   attempts: number;
   lastError: string | null;
-  /** Адрес resumable-сессии незавершённой загрузки YouTube (003); после успеха — null. */
-  uploadSession: string | null;
   publishedAt: Date | null;
   updatedAt: Date | null;
 }
@@ -366,7 +364,6 @@ export function rowToPublication(row: any): ShortPublication {
     url: row.url ?? null,
     attempts: Number(row.attempts || 0),
     lastError: row.last_error ?? null,
-    uploadSession: row.upload_session ?? null,
     publishedAt: date(row.published_at),
     updatedAt: date(row.updated_at),
   };

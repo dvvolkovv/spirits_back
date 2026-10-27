@@ -10,9 +10,15 @@
 -- EXISTS и на каждом старте ждал бы открытые записи (шапка 001).
 --
 -- ОТКАТ (код без YouTube этих колонок не читает): убрать 003 из ShortsSchemaService, затем
+--   -- Сначала проверить канал у незавершённых загрузок — загрузка могла дойти до YouTube,
+--   -- и код без YouTube на повторе пришлёт владельцу набор, а ручная выкладка даст дубль:
+--   --   SELECT short_id FROM short_publication WHERE platform = 'youtube' AND upload_session IS NOT NULL;
 --   DROP TABLE short_youtube_account;
 --   ALTER TABLE short_publication DROP COLUMN upload_session;
 --   ALTER TABLE short_settings DROP COLUMN youtube_mode;
+--   -- DROP TABLE short_youtube_account доступ у Google не отзывает: при окончательном откате
+--   -- отозвать его в настройках аккаунта Google (Безопасность → Сторонние приложения); при
+--   -- повторном выкате канал подключается заново командой /youtube.
 DO $shorts$
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('shorts/003'));
