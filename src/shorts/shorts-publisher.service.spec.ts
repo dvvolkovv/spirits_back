@@ -606,6 +606,29 @@ describe('ShortsPublisherService.publish — YouTube загрузкой', () => 
     expect(String(recordOf(b.db, 'youtube')[0])).not.toContain('upload_session');
   });
 
+  /**
+   * M8: итог ролика (settle) упал уже после записи published. Строка YouTube published —
+   * повтор её не захватит (захват только pending/failed), не загрузит и не сообщит: без
+   * отправки здесь ссылка не пришла бы владельцу никогда.
+   */
+  it('итог ролика не записался (сбой UPDATE short_video … published) — ссылка владельцу всё равно уходит, сбой — наверх', async () => {
+    const yt = youtube(UPLOAD);
+    yt.upload.mockResolvedValue({ videoId: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk', resumed: false });
+    const db = fakeDb();
+    const real = db.query.getMockImplementation();
+    db.query.mockImplementation(async (sql: string, p: any[] = []) => {
+      if (String(sql).replace(/\s+/g, ' ').trim().startsWith("UPDATE short_video SET status = 'published'")) {
+        throw new Error('Connection terminated unexpectedly');
+      }
+      return real(sql, p);
+    });
+    const { svc } = setup(db, '-1003290853538', ['telegram', 'youtube'], yt);
+    await expect(svc.publish(ID)).rejects.toThrow('Connection terminated unexpectedly');
+    expect(db.pubs.get('youtube')).toMatchObject({ status: 'published', external_id: 'abcdefghijk' });
+    expect(db.v.status).toBe('publishing');
+    expect(yt.notifyUploaded).toHaveBeenCalledWith(ID, 'unlisted');
+  });
+
   it('ролик нашёлся по прошлой сессии — сообщение без доступа (null)', async () => {
     const yt = youtube(UPLOAD);
     yt.upload.mockResolvedValue({ videoId: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk', resumed: true });

@@ -239,6 +239,19 @@ describe('команда /youtube', () => {
     ]);
   });
 
+  /**
+   * M9: режим действует на новые загрузки — доступ уже загруженных роликов YouTube не меняет.
+   * Без оговорки владелец счёл бы, что пробный ролик «по ссылке» стал публичным.
+   */
+  it('«публично» при исправном подключении — с оговоркой: прежние ролики «по ссылке» так и останутся', async () => {
+    const db = fakeDb({ account: { channel_id: 'UCx', channel_title: 'Linkeon', refresh_token_enc: 'e', status: 'connected' } });
+    const { svc, said } = setup(db);
+    await svc.handleCommand(dm('/youtube публично'));
+    expect(said()).toEqual([
+      'Готово: ролики на YouTube — публично. Уже загруженные «по ссылке» так и останутся по ссылке — их доступ меняется в YouTube Studio.',
+    ]);
+  });
+
   it('незнакомый режим — подсказка, настройки не трогаем', async () => {
     const { svc, settings, said } = setup();
     expect(await svc.handleCommand(dm('/youtube громко'))).toBe(true);
@@ -311,7 +324,8 @@ describe('адрес возврата Google', () => {
     expect(db.st.mode).toBe('unlisted');
     expect(said()[0]).toBe(
       'YouTube подключён: канал «Linkeon» (@linkeons). Ролики будут загружаться сами, режим — по ссылке. ' +
-        'Проверьте первый ролик: если открывается по ссылке и не стал приватным — /youtube публично.',
+        'Проверьте первый ролик: если открывается по ссылке и не стал приватным — /youtube публично ' +
+        '(сам он останется по ссылке — доступ меняется в YouTube Studio).',
     );
     // M5: тот же факт — в лог сервера, не только в Telegram владельца.
     expect(log.mock.calls.some(([m]) => String(m).includes('YouTube подключён: канал UCu_Pq4rFXmTT8CDG27O_i2A «Linkeon», режим unlisted'))).toBe(true);
@@ -940,10 +954,13 @@ describe('загрузка ролика', () => {
 describe('сообщение о загрузке', () => {
   const URL = 'https://youtube.com/shorts/abcdefghijk';
 
-  it('«по ссылке» — ссылка и подсказка про «публично»', async () => {
+  it('«по ссылке» — ссылка и подсказка про «публично»; сам ролик останется по ссылке (M9)', async () => {
     const { svc, said } = setup(fakeDb({ mode: 'unlisted', published: URL }));
     await svc.notifyUploaded('v1', 'unlisted');
-    expect(said()).toEqual([`Вышло на YouTube (по ссылке): ${URL}\nЕсли ролик открывается и не стал приватным — /youtube публично.`]);
+    expect(said()).toEqual([
+      `Вышло на YouTube (по ссылке): ${URL}\nЕсли ролик открывается и не стал приватным — /youtube публично. ` +
+        'Сам этот ролик останется по ссылке — его доступ меняется в YouTube Studio.',
+    ]);
   });
 
   it('доступ — тот, с которым грузили, а не текущий режим; набор (строки published нет) — молчим', async () => {
