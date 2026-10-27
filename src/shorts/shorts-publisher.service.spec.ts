@@ -502,6 +502,24 @@ describe('ShortsPublisherService.publish — YouTube загрузкой', () => 
     expect(db.v.last_error).toContain(YOUTUBE_MAY_BE_OUT);
   });
 
+  it('403 без явного лимита на вопросе о сессии, последняя попытка — last_error ролика целиком содержит подсказку выхода (I1) и причину 403', async () => {
+    const yt = youtube(UPLOAD);
+    // Ровно то, что бросил бы checkUpload на 403 {errors:[{reason:'forbidden'}]} (youtube-upload.ts).
+    const cause =
+      'YouTube отказал в ответе о прошлой загрузке (HTTP 403 forbidden: Forbidden) — так бывает, если канал переподключили другим аккаунтом; тогда переподключите прежним';
+    yt.upload.mockRejectedValue(new YoutubeMaybeUploaded(cause, 403));
+    const { svc, tg, db } = setup(fakeDb({ attempts: MAX_PUBLISH_ATTEMPTS - 1 }), '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(tg.sendDocument).not.toHaveBeenCalled();
+    expect(db.v.status).toBe('failed');
+    // Подсказка выхода из затяжного «исход неизвестен» — целиком, не обрезана причиной Google.
+    expect(db.v.last_error).toContain(YOUTUBE_MAY_BE_OUT);
+    expect(db.v.last_error).toContain('/youtube вручную');
+    expect(db.v.last_error).toContain('верните режим');
+    // И причина 403 на месте — короткая причина укладывается в бюджет 500 знаков строки площадки целиком.
+    expect(db.v.last_error).toContain(cause);
+  });
+
   it('доступ пропал при живой сессии — к набору предупреждение проверить канал', async () => {
     const yt = youtube(UPLOAD);
     yt.upload.mockRejectedValue(new YoutubeAuthError('HTTP 400 invalid_grant', true));
