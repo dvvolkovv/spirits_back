@@ -158,3 +158,16 @@ describe('ссылки на разделы в справке', () => {
     expect(all.filter((v) => v.client === 'store' && paid.some((u) => v.text.includes(u))).map(where)).toEqual([]);
   });
 });
+
+describe('где искать «интеграции»', () => {
+  // Человек ищет «интеграции» и «подключения», а раздела с таким именем нет:
+  // справку по этим словам находят описания тем (перечень в описании
+  // инструмента linkeon_help).
+  it('описания тем calendars, meetings и account знают слова «интеграции» и «подключение»', () => {
+    const missing = ['calendars', 'meetings', 'account']
+      .map((id) => KB_ARTICLES.find((a) => a.id === id)!)
+      .filter((a) => !/интеграц/i.test(a.summary) || !/подключ/i.test(a.summary))
+      .map((a) => a.id);
+    expect(missing).toEqual([]);
+  });
+});

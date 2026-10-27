@@ -103,5 +103,6 @@ describe('описание инструмента', () => {
     expect(d).toMatch(/не по памяти/);
     expect(d).toMatch(/предложить функцию/);
     expect(d).toMatch(/userId/);
+    expect(d).toMatch(/Строка «Ссылка…» в разделе «Где» — полный адрес раздела/);
   });
 });
