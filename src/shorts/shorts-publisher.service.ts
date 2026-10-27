@@ -234,10 +234,14 @@ export class ShortsPublisherService implements OnModuleInit {
       if (out === 'unrecorded' || out === 'superseded') return;
       if (out !== 'done') uploaded = null;
     }
-    await this.settle(v, platforms);
-    // Ссылку владельцу — после записи и итога ролика, не задерживая публикацию (notifyUploaded не бросает);
-    // только для загрузки и с тем доступом, с которым грузили. Набор — без сообщения.
-    if (uploaded) void this.youtube?.notifyUploaded(v.id, uploaded.privacy);
+    try {
+      await this.settle(v, platforms);
+    } finally {
+      // Ссылку владельцу — после итога ролика, не задерживая публикацию (notifyUploaded не бросает);
+      // только для загрузки и с тем доступом, с которым грузили. Набор — без сообщения. И при сбое
+      // итога: строка YouTube уже published — повтор её не захватит, не загрузит и не сообщит.
+      if (uploaded) void this.youtube?.notifyUploaded(v.id, uploaded.privacy);
+    }
   }
 
   /**

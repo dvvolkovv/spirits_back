@@ -216,7 +216,10 @@ export class ShortsYoutubeService {
       });
       this.logger.log(`YouTube подключён: канал ${ch.id} «${ch.title}», режим ${mode}`);
       const handle = ch.handle ? ` (${ch.handle})` : '';
-      const check = mode === 'unlisted' ? ' Проверьте первый ролик: если открывается по ссылке и не стал приватным — /youtube публично.' : '';
+      const check =
+        mode === 'unlisted'
+          ? ' Проверьте первый ролик: если открывается по ссылке и не стал приватным — /youtube публично (сам он останется по ссылке — доступ меняется в YouTube Studio).'
+          : '';
       const off = shortsEnabled() ? '' : ' Конвейер роликов на этом сервере пока выключен (SHORTS_ENABLED) — загрузка начнётся, когда его включат.';
       // Страницу не держим ради Telegram: say() не бросает, а ждать его ответа браузеру незачем.
       void this.say(st.chatId, `YouTube подключён: канал «${ch.title}»${handle}. Ролики будут загружаться сами, режим — ${MODE_WORDS[mode]}.${check}${off}`);
@@ -396,7 +399,10 @@ export class ShortsYoutubeService {
     }
   }
 
-  /** После записи published: ссылка владельцу; доступ — тот, с которым грузили; при «по ссылке» — подсказка про «публично». */
+  /**
+   * После записи published: ссылка владельцу; доступ — тот, с которым грузили; при «по ссылке» —
+   * подсказка про «публично» и оговорка, что сам этот ролик так и останется по ссылке.
+   */
   async notifyUploaded(shortId: string, privacy: 'unlisted' | 'public' | null): Promise<void> {
     try {
       const r = await this.pg.query(
@@ -406,7 +412,10 @@ export class ShortsYoutubeService {
       const url = r.rows[0]?.url;
       if (!url) return;
       const word = privacy ? ` (${MODE_WORDS[privacy]})` : '';
-      const hint = privacy === 'unlisted' ? '\nЕсли ролик открывается и не стал приватным — /youtube публично.' : '';
+      const hint =
+        privacy === 'unlisted'
+          ? '\nЕсли ролик открывается и не стал приватным — /youtube публично. Сам этот ролик останется по ссылке — его доступ меняется в YouTube Studio.'
+          : '';
       await this.say(approverChatId(), `Вышло на YouTube${word}: ${url}${hint}`);
     } catch (e: any) {
       this.logger.warn(`ролик ${shortId}: сообщение о YouTube не отправлено: ${e?.message ?? e}`);
@@ -513,7 +522,10 @@ export class ShortsYoutubeService {
     const done = `Готово: ролики на YouTube — ${MODE_WORDS[mode]}.`;
     const acc = await this.account();
     const mismatch = acc?.status === 'connected' ? this.channelMismatch(acc) : null;
-    if (acc?.status === 'connected' && !mismatch) return done;
+    if (acc?.status === 'connected' && !mismatch) {
+      // Режим — для новых загрузок: доступ уже загруженных роликов YouTube сам не меняет.
+      return mode === 'public' ? `${done} Уже загруженные «по ссылке» так и останутся по ссылке — их доступ меняется в YouTube Studio.` : done;
+    }
     const link = this.connectUrl(chatId);
     if (!link) return `${done} Но YouTube не настроен на этом сервере, поэтому пока набор.`;
     const why = mismatch ?? (acc ? 'доступ к каналу пропал' : 'канал не подключён');
