@@ -116,12 +116,25 @@ async function send(page: Page, text: string): Promise<number> {
  * (автопрокрутка ChatInterface), а пузырь длинного вопроса выше — без докрутки
  * он остаётся под полем ввода. Верх ленты на мобильном перекрывает шапка: под
  * неё у ленты верхний отступ, туда пузырь попадать не должен.
+ *
+ * Под пузырём ещё «Думает» и отступ над полем ввода: у длинного вопроса (358
+ * знаков — пузырь 263 px при видимых 348 px) внизу ленты верх уходит под шапку,
+ * и ролик падал question_hidden трижды (стенд, 27.10.2026). Тогда лента
+ * поднимается до верха пузыря; автопрокрутка кабинета вернёт её вниз только с
+ * началом ответа — уже после снимка вопроса.
  */
-async function revealLastUserMessage(page: Page): Promise<boolean> {
-  await page.evaluate(() => {
+export async function revealLastUserMessage(page: Page): Promise<boolean> {
+  await page.evaluate((sel) => {
     const list = document.querySelector('[data-testid="chat-messages-list"]') as HTMLElement | null;
-    if (list) list.scrollTop = list.scrollHeight;
-  });
+    if (!list) return;
+    list.scrollTop = list.scrollHeight;
+    const msgs = Array.from(document.querySelectorAll(sel)) as HTMLElement[];
+    const bubble = msgs[msgs.length - 1];
+    if (!bubble) return;
+    const visibleTop = list.getBoundingClientRect().top + (parseFloat(getComputedStyle(list).paddingTop) || 0);
+    const top = bubble.getBoundingClientRect().top;
+    if (top < visibleTop) list.scrollTop -= visibleTop - top + 8;
+  }, USER_MSG);
   await page.waitForTimeout(800);
   return page.evaluate((sel) => {
     const list = document.querySelector('[data-testid="chat-messages-list"]') as HTMLElement | null;
