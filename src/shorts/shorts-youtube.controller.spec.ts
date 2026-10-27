@@ -45,7 +45,11 @@ describe('ShortsYoutubeController', () => {
 
   it('маршрут с глобальным префиксом — ровно CALLBACK_PATH, зарегистрированный в Google', () => {
     const main = fs.readFileSync(path.join(__dirname, '..', 'main.ts'), 'utf8');
-    const prefix = main.match(/setGlobalPrefix\('([^']+)'/)[1];
+    // \s* и явная ошибка при поломке — как в products.routes.spec.ts: иначе
+    // сломанный main.ts даёт непонятный TypeError на чтении '1' у null.
+    const m = main.match(/setGlobalPrefix\(\s*'([^']*)'/);
+    if (!m) throw new Error('в main.ts не нашёлся setGlobalPrefix — тест потерял источник правды');
+    const prefix = m[1];
     const controller = Reflect.getMetadata(PATH_METADATA, ShortsYoutubeController);
     const method = Reflect.getMetadata(PATH_METADATA, ShortsYoutubeController.prototype.callback);
     expect(`/${prefix}/${controller}/${method}`).toBe(CALLBACK_PATH);

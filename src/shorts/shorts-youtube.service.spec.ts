@@ -342,6 +342,20 @@ describe('адрес возврата Google', () => {
     expect(said()[0]).toMatch(/^YouTube не подключён: выбран канал «Linkeon» \(UCu_Pq4rFXmTT8CDG27O_i2A\), а роликам нужен UCother0000000000000000/);
   });
 
+  it('канал закреплён в YOUTUBE_CHANNEL_ID, а выбран другой — при уже подключённом аккаунте строка и режим не меняются', async () => {
+    process.env.YOUTUBE_CHANNEL_ID = 'UCother0000000000000000';
+    const db = fakeDb({
+      mode: 'manual',
+      account: { channel_id: 'UCold', channel_title: 'Старый', refresh_token_enc: 'old', status: 'connected', connected_at: new Date(Date.now() - 3_600_000).toISOString() },
+    });
+    const { svc } = setup(db, fakeHttp(tokensOk(), channelOk()));
+    const page = await svc.completeConnect({ code: 'c', state: stateFor() });
+    expect(page.status).toBe(502);
+    expect(db.st.account.channel_id).toBe('UCold');
+    expect(db.st.account.refresh_token_enc).toBe('old');
+    expect(db.st.mode).toBe('manual');
+  });
+
   it('закреплённый канал совпал — подключение как обычно', async () => {
     process.env.YOUTUBE_CHANNEL_ID = 'UCu_Pq4rFXmTT8CDG27O_i2A';
     const db = fakeDb();
@@ -374,6 +388,14 @@ describe('загрузка ролика', () => {
     delete process.env.YOUTUBE_OAUTH_CLIENT_ID;
     expect(await setup(fakeDb({ mode: 'public' })).svc.uploadPlan('v1'))
       .toEqual({ kind: 'kit', note: 'YouTube не настроен на сервере — набор вместо загрузки.' });
+  });
+
+  it('план: подключённый канал не совпал с YOUTUBE_CHANNEL_ID — набор с заметкой', async () => {
+    process.env.YOUTUBE_CHANNEL_ID = 'UCu_Pq4rFXmTT8CDG27O_i2A';
+    expect(await setup(fakeDb({ mode: 'public', account: { ...CONNECTED, refresh_token_enc: 'e' } })).svc.uploadPlan('v1')).toEqual({
+      kind: 'kit',
+      note: 'Подключён канал Linkeon, а роликам нужен UCu_Pq4rFXmTT8CDG27O_i2A (YOUTUBE_CHANNEL_ID) — набор вместо загрузки. Переподключить: /youtube',
+    });
   });
 
   it('набор при живой сессии загрузки — с предупреждением проверить канал', async () => {
