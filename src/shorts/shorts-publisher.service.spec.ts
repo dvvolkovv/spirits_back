@@ -2,7 +2,7 @@ import { Logger } from '@nestjs/common';
 import { GrammyError, HttpError, InputFile } from 'grammy';
 import { buildYoutubeKeyboard } from './short-callback';
 import { MAX_PUBLISH_ATTEMPTS, STUCK_PUBLISHING_MINUTES, ShortsPublisherService, YOUTUBE_MAY_BE_OUT } from './shorts-publisher.service';
-import { PENDING_UPLOAD_NOTE } from './shorts-youtube.service';
+import { DOWNLOAD_TIMEOUT_MS, PENDING_UPLOAD_NOTE } from './shorts-youtube.service';
 import { YoutubeAttemptSuperseded, YoutubeAuthError, YoutubeMaybeUploaded, YoutubeNotUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
 import { SEND_TIMEOUT_MS } from './youtube/youtube-upload';
 
@@ -727,5 +727,55 @@ describe('ShortsPublisherService — жетон попытки', () => {
     const { svc } = setup(db, '-1003290853538', ['telegram', 'youtube'], yt);
     await svc.publish(ID);
     expect(alive).toBe(false);
+  });
+});
+
+/**
+ * Скачивание из MinIO — со сроком: зависшее скачивание не должно пережить порог сторожа,
+ * иначе после «Повторить» владельца жетон старой попытки мог бы совпасть с новой.
+ */
+describe('ShortsPublisherService — срок скачивания файлов ролика', () => {
+  /** Хранилище, которое не отвечает: отпускает только по сигналу срока. Без сигнала — отказ сразу. */
+  const hang = ({ abortSignal }: any): Promise<Buffer> => {
+    if (!abortSignal) return Promise.reject(new Error('скачивание без срока'));
+    return new Promise((_, reject) => abortSignal.addEventListener('abort', () => reject(new Error('скачивание прервано по сроку'))));
+  };
+  afterEach(() => jest.useRealTimers());
+
+  it('в хранилище уходит abortSignal — для канала (видео и обложка) и для набора', async () => {
+    const { svc, storage } = setup();
+    await svc.publish(ID);
+    expect(storage.download).toHaveBeenCalledTimes(3);
+    for (const [arg] of storage.download.mock.calls as any[]) expect(arg.abortSignal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('скачивание для канала не уложилось в срок — сигнал прерван, строка telegram в обычном отказе, а не «исход неизвестен»', async () => {
+    jest.useFakeTimers();
+    const { svc, tg, storage, db } = setup();
+    storage.download.mockImplementation(hang);
+    const run = svc.publish(ID);
+    await jest.advanceTimersByTimeAsync(DOWNLOAD_TIMEOUT_MS);
+    await run;
+    const signals = (storage.download.mock.calls as any[]).map(([arg]) => arg.abortSignal);
+    expect(signals).toHaveLength(2);
+    expect(signals.every((s) => s?.aborted)).toBe(true);
+    expect(tg.sendVideo).not.toHaveBeenCalled();
+    expect(db.pubs.get('telegram')).toMatchObject({ status: 'failed', last_error: 'скачивание прервано по сроку' });
+    expect(db.v.status).toBe('approved');
+    expect(db.v.last_error).not.toMatch(/пост мог выйти/);
+  });
+
+  it('скачивание для набора YouTube не уложилось в срок — строка youtube в обычном отказе, набор не ушёл', async () => {
+    jest.useFakeTimers();
+    const db = fakeDb();
+    db.pubs.set('telegram', { short_id: ID, platform: 'telegram', status: 'published', attempts: 1 });
+    const { svc, tg, storage } = setup(db);
+    storage.download.mockImplementation(hang);
+    const run = svc.publish(ID);
+    await jest.advanceTimersByTimeAsync(DOWNLOAD_TIMEOUT_MS);
+    await run;
+    expect(tg.sendDocument).not.toHaveBeenCalled();
+    expect(db.pubs.get('youtube')).toMatchObject({ status: 'failed', last_error: 'скачивание прервано по сроку' });
+    expect(db.v.status).toBe('approved');
   });
 });
