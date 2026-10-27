@@ -2596,6 +2596,145 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.module.spe
 
 Expected: PASS; сюиты `src/tg-bot` — как в базе задачи 0.
 
+
+- [ ] **Step 6: По ревью задачи 7 — заголовки и страховка адреса возврата, закреплённый канал**
+
+`src/shorts/shorts-youtube.controller.spec.ts`:
+- импорты: `import 'reflect-metadata';` (оставить), затем
+
+```ts
+import { Logger, RequestMethod } from '@nestjs/common';
+import { GUARDS_METADATA, METHOD_METADATA, PATH_METADATA } from '@nestjs/common/constants';
+import * as fs from 'fs';
+import * as path from 'path';
+import { ShortsYoutubeController } from './shorts-youtube.controller';
+import { CALLBACK_PATH } from './youtube/youtube-oauth';
+```
+
+- в первом тесте («отдаёт страницу сервиса…») после проверки `Cache-Control` добавить:
+
+```ts
+    expect(r.set).toHaveBeenCalledWith('Referrer-Policy', 'no-referrer');
+    expect(r.set).toHaveBeenCalledWith('Content-Security-Policy', expect.stringContaining("default-src 'none'"));
+```
+
+- тест «маршрут — GET …, без guard» заменить на два:
+
+```ts
+  it('маршрут — GET shorts/youtube/oauth/callback, без guard', () => {
+    expect(Reflect.getMetadata(PATH_METADATA, ShortsYoutubeController)).toBe('shorts/youtube');
+    expect(Reflect.getMetadata(PATH_METADATA, ShortsYoutubeController.prototype.callback)).toBe('oauth/callback');
+    expect(Reflect.getMetadata(METHOD_METADATA, ShortsYoutubeController.prototype.callback)).toBe(RequestMethod.GET);
+    expect(Reflect.getMetadata(GUARDS_METADATA, ShortsYoutubeController.prototype.callback)).toBeUndefined();
+    expect(Reflect.getMetadata(GUARDS_METADATA, ShortsYoutubeController)).toBeUndefined();
+  });
+
+  it('маршрут с глобальным префиксом — ровно CALLBACK_PATH, зарегистрированный в Google', () => {
+    const main = fs.readFileSync(path.join(__dirname, '..', 'main.ts'), 'utf8');
+    const prefix = main.match(/setGlobalPrefix\('([^']+)'/)[1];
+    const controller = Reflect.getMetadata(PATH_METADATA, ShortsYoutubeController);
+    const method = Reflect.getMetadata(PATH_METADATA, ShortsYoutubeController.prototype.callback);
+    expect(`/${prefix}/${controller}/${method}`).toBe(CALLBACK_PATH);
+  });
+```
+
+- добавить:
+
+```ts
+  it('сервис бросил — страница 500 вместо JSON, заголовки на месте', async () => {
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const youtube = { completeConnect: jest.fn(async () => { throw new Error('boom'); }) };
+    const r = res();
+    await new ShortsYoutubeController(youtube as any).callback({ code: 'c', state: 's' }, r);
+    expect(r.status).toHaveBeenCalledWith(500);
+    expect(r.set).toHaveBeenCalledWith('Cache-Control', 'no-store');
+    expect(String(r.send.mock.calls[0][0])).toContain('Не получилось подключить канал');
+  });
+```
+
+`src/shorts/shorts-youtube.service.spec.ts`:
+- в `beforeEach` добавить `delete process.env.YOUTUBE_CHANNEL_ID;`
+- в `describe('адрес возврата Google')` добавить:
+
+```ts
+  it('канал закреплён в YOUTUBE_CHANNEL_ID, а выбран другой — 502, подключения нет', async () => {
+    process.env.YOUTUBE_CHANNEL_ID = 'UCother0000000000000000';
+    const db = fakeDb();
+    const { svc, said } = setup(db, fakeHttp(tokensOk(), channelOk()));
+    const page = await svc.completeConnect({ code: 'c', state: stateFor() });
+    expect(page.status).toBe(502);
+    expect(db.st.account).toBeNull();
+    expect(said()[0]).toMatch(/^YouTube не подключён: выбран канал «Linkeon» \(UCu_Pq4rFXmTT8CDG27O_i2A\), а роликам нужен UCother0000000000000000/);
+  });
+
+  it('закреплённый канал совпал — подключение как обычно', async () => {
+    process.env.YOUTUBE_CHANNEL_ID = 'UCu_Pq4rFXmTT8CDG27O_i2A';
+    const db = fakeDb();
+    const { svc } = setup(db, fakeHttp(tokensOk(), channelOk()));
+    expect((await svc.completeConnect({ code: 'c', state: stateFor() })).status).toBe(200);
+    expect(db.st.account.channel_id).toBe('UCu_Pq4rFXmTT8CDG27O_i2A');
+  });
+```
+
+Красный коммит «test(shorts): YouTube — заголовки и страховка адреса возврата, маршрут = CALLBACK_PATH, закреплённый канал (красный)» и прогон `npx jest src/shorts/shorts-youtube.controller.spec.ts src/shorts/shorts-youtube.service.spec.ts`.
+
+`src/shorts/shorts-youtube.controller.ts` — заменить целиком:
+
+```ts
+import { Controller, Get, Logger, Query, Res } from '@nestjs/common';
+import { Response } from 'express';
+import { ConnectPage, ShortsYoutubeService, connectPage } from './shorts-youtube.service';
+
+const str = (x: unknown): string | undefined => (typeof x === 'string' ? x : undefined);
+
+/** Страница без внешних ресурсов: ничего не грузит и никуда не отправляет — code и state из адреса не утекут. */
+const CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+/**
+ * Адрес возврата Google после входа владельца (спека YouTube, «Сценарий
+ * владельца»). Публичный: браузер приходит без токена кабинета, всё решает
+ * подписанный state. С глобальным префиксом — /webhook/shorts/youtube/oauth/callback,
+ * ровно так он зарегистрирован в Google Cloud.
+ */
+@Controller('shorts/youtube')
+export class ShortsYoutubeController {
+  private readonly logger = new Logger(ShortsYoutubeController.name);
+
+  constructor(private readonly youtube: ShortsYoutubeService) {}
+
+  @Get('oauth/callback')
+  async callback(@Query() q: Record<string, unknown>, @Res() res: Response): Promise<void> {
+    let page: ConnectPage;
+    try {
+      page = await this.youtube.completeConnect({ code: str(q?.code), state: str(q?.state), error: str(q?.error) });
+    } catch (e: any) {
+      // completeConnect задуман без исключений; страховка — страница вместо JSON 500.
+      this.logger.error(`адрес возврата YouTube упал: ${e?.message ?? e}`);
+      page = connectPage(500, 'Не получилось подключить канал', 'Пришлите боту /youtube и попробуйте ещё раз.');
+    }
+    res
+      .status(page.status)
+      .set('Cache-Control', 'no-store')
+      .set('Referrer-Policy', 'no-referrer')
+      .set('Content-Security-Policy', CSP)
+      .type('html')
+      .send(page.html);
+  }
+}
+```
+
+`src/shorts/shorts-youtube.service.ts`, в `completeConnect` сразу после `const ch = await fetchMyChannel(this.http, tokens.accessToken);`:
+
+```ts
+      // Канал роликов закреплён в .env: другой — по ошибке или по чужой ссылке — не подключится.
+      const expected = (process.env.YOUTUBE_CHANNEL_ID || '').trim();
+      if (expected && ch.id !== expected) {
+        throw new Error(`выбран канал «${ch.title}» (${ch.id}), а роликам нужен ${expected} — войдите снова и выберите канал Linkeon`);
+      }
+```
+
+Коммит «fix(shorts): YouTube — Referrer-Policy и CSP на странице возврата, страховка от исключения, закреплённый канал YOUTUBE_CHANNEL_ID», зелёные прогоны `npx jest src/shorts/shorts-youtube.controller.spec.ts src/shorts/shorts-youtube.service.spec.ts` и `npx tsc -p tsconfig.build.json --noEmit`.
+
 ---
 
 ### Task 10: Против живого Postgres
@@ -2795,6 +2934,8 @@ Expected: `MERGE_GATES_OK`.
 ```bash
 ssh dv@85.192.61.231 'cd ~/ci/merge-shorts-youtube && git fetch -q origin main && git merge-base --is-ancestor origin/main HEAD && git push -q origin HEAD:main && git log --oneline -1'
 ```
+
+- [ ] **Step 4b (OK): Закреплённый канал.** В `~/spirits_back/.env` теста и прода дописать `YOUTUBE_CHANNEL_ID=UCu_Pq4rFXmTT8CDG27O_i2A` (канал @Linkeons) — с бэкапом файла, как при записи клиента OAuth. Значение не секретное. Без него подключится любой выбранный канал.
 
 - [ ] **Step 5: Выкат** — `scripts/deploy.sh` без флагов, отвязанно, из того же свежего клона:
 
