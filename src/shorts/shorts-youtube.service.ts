@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { approverChatId } from '../blog/blog-approval.service';
 import { inTransaction } from '../blog/blog-slot-claim';
-import { decryptSecret, encryptSecret } from '../calendar/crypto';
+import { decryptSecret, encryptSecret, hasSecretKey } from '../calendar/crypto';
 import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
@@ -158,9 +158,9 @@ export class ShortsYoutubeService {
       return connectPage(400, 'Ссылка устарела', 'Пришлите боту /youtube и откройте новую ссылку.');
     }
     if (!q.code) return connectPage(400, 'Нет кода от Google', 'Пришлите боту /youtube и попробуйте ещё раз.');
-    if ((process.env.CALENDAR_SECRET_KEY || '').length < 32) {
+    if (!hasSecretKey()) {
       // Код Google одноразовый: потратить его на exchangeCode, не умея сохранить refresh-токен
-      // этим же ключом (accessToken() проверяет его так же при обновлении), — сжечь код впустую.
+      // (правило ключа — общее, hasSecretKey; по нему же accessToken() при обновлении), — сжечь код впустую.
       const reason = 'на сервере нет CALENDAR_SECRET_KEY — канал не подключить';
       this.logger.error(`YouTube: ${reason}`);
       void this.say(st.chatId, `YouTube не подключён: ${reason}`);
@@ -379,7 +379,7 @@ export class ShortsYoutubeService {
 
   /** Свежий access-токен. Доступа нет — это подключение отозвано с причиной и YoutubeAuthError (pending — у ролика жива сессия). */
   private async accessToken(cfg: YoutubeOAuthConfig, acc: YoutubeAccount, pending: boolean): Promise<string> {
-    if ((process.env.CALENDAR_SECRET_KEY || '').length < 32) {
+    if (!hasSecretKey()) {
       // Ошибка настройки сервера, а не отозванный доступ: подключение не трогаем.
       throw new YoutubeNotUploaded('на сервере нет CALENDAR_SECRET_KEY — токен канала не расшифровать');
     }
