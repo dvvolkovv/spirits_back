@@ -20,7 +20,7 @@ export class YoutubeNotUploaded extends Error {
   }
 }
 
-/** Файл ушёл, а ответа нет: ролик мог загрузиться. Новая загрузка — только после вопроса о сессии. */
+/** Файл ушёл, а ответа нет или он неоднозначен: ролик мог загрузиться. Новая загрузка — только после вопроса о сессии. */
 export class YoutubeMaybeUploaded extends Error {
   constructor(message: string, readonly status: number | null = null) {
     super(message);
