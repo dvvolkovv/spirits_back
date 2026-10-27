@@ -69,6 +69,7 @@ ssh_remote() {
     *"seq 1"*) echo "OK 1" ;;
     *"git reset --hard origin/"*) [ -n "$BUILD_FAILS" ] && return 1 ;;
     *"git cat-file -e origin/"*"src/chat/relay-auth.ts"*) [ -n "$NO_RELAY_AUTH" ] && return 1 ;;
+    *"cd studio"*"startOrReload"*) [ -n "$STUDIO_FAILS" ] && return 1 ;;
   esac
   return 0
 }
@@ -103,6 +104,7 @@ function runDeployBackend(streams, env = {}) {
       NO_SHA: '',
       BUILD_FAILS: '',
       NO_RELAY_AUTH: '',
+      STUDIO_FAILS: '',
       ...env,
     },
   });
@@ -187,6 +189,37 @@ describe('deploy.sh: живые ходы проверяются прямо пе�
     const polls = log.slice(indexOf(log, BUILD), restart).filter((l) => POLL.test(l));
     expect(polls[polls.length - 1]).toMatch(STREAMS);
     expect(polls.some((l) => /^CALLS: /.test(l))).toBe(true);
+  });
+
+  it('рабочий процесс студии — отдельным вызовом после проверки здоровья API: не в рестарте и не в сборке', () => {
+    // В одном вызове с рестартом API ожидание задания студии (до 10 минут) держало бы
+    // health-wait и smoke, а повтор ssh после обрыва перезапустил бы API второй раз.
+    const { status, log } = runDeployBackend(['0']);
+    expect(status).toBe(0);
+    const restart = indexOf(log, RESTART);
+    const health = indexOf(log, /^SSH: .*seq 1/, restart);
+    const studio = indexOf(log, /^SSH: .*cd studio\s+pm2 startOrReload ecosystem\.config\.cjs/);
+    expect(log[restart]).not.toMatch(/studio/);
+    expect(health).toBeGreaterThan(restart);
+    expect(studio).toBeGreaterThan(health);
+    expect(log[studio]).not.toMatch(/linkeon-api/);
+    expect(log[indexOf(log, BUILD)]).not.toMatch(/startOrReload/);
+  });
+
+  it('студия не перезапустилась: на стенде — выход 1 (прод не трогается), на проде — предупреждение, выкат идёт дальше', () => {
+    const test = runDeployBackend(['0'], { STUDIO_FAILS: '1', ENV_NAME: 'test' });
+    expect(test.status).toBe(1);
+    expect(test.log.join('\n')).toMatch(/студии не перезапустился — прод не трогаю/);
+    const prod = runDeployBackend(['0'], { STUDIO_FAILS: '1' });
+    expect(prod.status).toBe(0);
+    expect(prod.log.join('\n')).toMatch(/студии не перезапустился — API выкачен, студию смотреть руками/);
+  });
+
+  it('сборка запоминает работающий коммит до git reset — по нему студия решает, нужен ли npm ci', () => {
+    const { log } = runDeployBackend(['0']);
+    const build = log[indexOf(log, BUILD)];
+    expect(build).toMatch(/STUDIO_SAME_AS=\$\(git rev-parse HEAD\)/);
+    expect(build.indexOf('STUDIO_SAME_AS=')).toBeLessThan(build.indexOf('git reset --hard origin/'));
   });
 
   it('голосовой воркер перезапускается в шаге рестарта, а не в сборке', () => {

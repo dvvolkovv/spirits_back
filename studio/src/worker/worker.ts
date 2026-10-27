@@ -9,6 +9,7 @@ import { parseConfig } from '../config';
 import { renderRun } from '../render/run-render';
 import { LEASE_MINUTES, pgQueue } from './db';
 import { pruneOld, runOne, type JobDeps } from './jobs';
+import { watchStop } from './stop';
 import { s3Storage } from './storage';
 
 /**
@@ -18,8 +19,9 @@ import { s3Storage } from './storage';
  * чем ролики, молча падающие на этапе animate.
  *   npm run worker            — цикл; без заданий — пауза IDLE_MS
  *   npm run worker -- --once  — одно задание и выход (стенд в плане 2)
- * SIGTERM/SIGINT — дождаться текущего задания и выйти; брошенное задание
- * вернётся в очередь по истечении аренды.
+ * Остановка (сообщение shutdown от PM2, вручную — SIGTERM/SIGINT; stop.ts) —
+ * дождаться текущего задания и выйти; брошенное задание вернётся в очередь по
+ * истечении аренды.
  */
 const IDLE_MS = 15_000;
 const KEEP_DAYS = 7;
@@ -58,20 +60,14 @@ const deps: JobDeps = {
   log,
 };
 
-let stopping = false;
-for (const sig of ['SIGTERM', 'SIGINT'] as const) {
-  process.on(sig, () => {
-    stopping = true;
-    log(`worker: ${sig} — закончу текущее задание и выйду`);
-  });
-}
+const stopping = watchStop(process, log);
 
 const once = process.argv.includes('--once');
 const pruned = pruneOld(deps.workRoot, KEEP_DAYS);
 if (pruned) log(`worker: удалено старых рабочих папок — ${pruned}`);
 log(`worker: старт${once ? ' (одно задание)' : ''}`);
 try {
-  while (!stopping) {
+  while (!stopping()) {
     const deadline = setTimeout(() => {
       log(`worker: задание не уложилось в ${LEASE_MINUTES - 2} мин — выхожу, задание вернётся в очередь по истечении аренды`);
       process.exit(1);
