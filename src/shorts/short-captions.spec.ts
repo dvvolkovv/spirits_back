@@ -76,6 +76,14 @@ describe('buildCaptions', () => {
     expect(c.vk.endsWith(`${links.vk}\n\n${SYNTH_NOTE}`)).toBe(true);
     expect(hasLoneSurrogate(c.vk)).toBe(false);
   });
+
+  it('заголовок и описание YouTube — через youtubeSafe: карточка проверки показывает владельцу то же, что уйдёт при отправке', () => {
+    const c = buildCaptions({ ...w, youtube: { ...w.youtube, title: 'Залог <по договору>', description: 'Срок < 30 дней' } }, links);
+    expect(c.youtube.title).toBe('Залог ‹по договору›');
+    expect(c.youtube.description.startsWith('Срок ‹ 30 дней')).toBe(true);
+    expect(c.youtube.title).not.toMatch(/[<>]/);
+    expect(c.youtube.description).not.toMatch(/[<>]/);
+  });
 });
 
 describe('tidyTags', () => {
@@ -100,6 +108,19 @@ describe('youtubeSafe', () => {
   it('угловые скобки — на одиночные ёлочки (YouTube отверг бы `<` и `>`); без скобок текст не меняется', () => {
     expect(youtubeSafe('Права <работника> > всего')).toBe('Права ‹работника› › всего');
     expect(youtubeSafe('Залог при аренде')).toBe('Залог при аренде');
+  });
+
+  it('сохраняет смысл операторов и стрелок: <=, >=, ->, <- — свои символы, не ёлочки', () => {
+    expect(youtubeSafe('x <= y')).toBe('x ≤ y');
+    expect(youtubeSafe('x >= y')).toBe('x ≥ y');
+    expect(youtubeSafe('a -> b')).toBe('a → b');
+    expect(youtubeSafe('a <- b')).toBe('a ← b');
+  });
+
+  it('идемпотентна: повторное применение не меняет результат (вызовы при сборке подписи и при отправке не портят друг друга)', () => {
+    const s = 'Права <работника> > всего, x <= y, x >= y, a -> b, a <- b';
+    const once = youtubeSafe(s);
+    expect(youtubeSafe(once)).toBe(once);
   });
 });
 
