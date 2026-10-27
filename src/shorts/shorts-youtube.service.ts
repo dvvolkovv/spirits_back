@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { approverChatId } from '../blog/blog-approval.service';
+import { inTransaction } from '../blog/blog-slot-claim';
 import { decryptSecret, encryptSecret } from '../calendar/crypto';
 import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
@@ -128,6 +129,7 @@ export class ShortsYoutubeService {
         await this.say(chatId, 'Не понял режим. Можно: /youtube публично, /youtube по ссылке, /youtube вручную.');
       } else if (cmd.mode) {
         await this.settings.update({ youtubeMode: cmd.mode });
+        this.logger.log(`YouTube: режим ${cmd.mode} — командой владельца`);
         await this.say(chatId, await this.modeChanged(cmd.mode, chatId));
       } else {
         await this.say(chatId, await this.statusText(chatId));
@@ -144,7 +146,10 @@ export class ShortsYoutubeService {
   async completeConnect(q: { code?: string; state?: string; error?: string }): Promise<ConnectPage> {
     const cfg = youtubeOAuthConfig();
     if (!cfg) return connectPage(503, 'YouTube не настроен', 'На этом сервере не настроен клиент OAuth YouTube: нужны YOUTUBE_OAUTH_CLIENT_ID, YOUTUBE_OAUTH_CLIENT_SECRET и PUBLIC_BASE_URL.');
-    if (q.error) return connectPage(200, 'Подключение отменено', 'Канал не подключён. Чтобы попробовать снова, пришлите боту /youtube.');
+    if (q.error) {
+      this.logger.warn(`YouTube: вход в Google не завершён (error=${clip(q.error, 100)})`);
+      return connectPage(200, 'Подключение отменено', 'Канал не подключён. Чтобы попробовать снова, пришлите боту /youtube.');
+    }
     const st = verifyState(cfg.clientSecret, cfg.redirectUri, q.state);
     const owner = approverChatId();
     if (!st || !owner || st.chatId !== owner) {
@@ -173,26 +178,31 @@ export class ShortsYoutubeService {
       if (expected && ch.id !== expected) {
         throw new Error(`выбран канал «${ch.title}» (${ch.id}), а роликам нужен ${expected} — войдите снова и выберите канал Linkeon`);
       }
-      await this.pg.query(
-        `INSERT INTO short_youtube_account
-                (id, channel_id, channel_title, refresh_token_enc, scopes, status, last_error, connected_at, updated_at)
-         VALUES (1, $1, $2, $3, $4, 'connected', NULL, now(), now())
-         ON CONFLICT (id) DO UPDATE
-            SET channel_id = EXCLUDED.channel_id, channel_title = EXCLUDED.channel_title,
-                refresh_token_enc = EXCLUDED.refresh_token_enc, scopes = EXCLUDED.scopes,
-                status = 'connected', last_error = NULL, connected_at = now(), updated_at = now()`,
-        [ch.id, ch.title, encryptSecret(tokens.refreshToken), tokens.scope],
-      );
-      // Подключение при «вручную» включает «по ссылке»: первый ролик — проверка (спека, «Сценарий владельца»).
-      // Канал хранится только в short_youtube_account; short_settings.youtube_channel_id не трогаем — одна правда.
-      const r = await this.pg.query(
-        `UPDATE short_settings
-            SET youtube_mode = CASE WHEN youtube_mode = 'manual' THEN 'unlisted' ELSE youtube_mode END,
-                updated_at = now()
-          WHERE id = 1
-          RETURNING youtube_mode`,
-      );
-      const mode: YoutubeMode = r.rows[0]?.youtube_mode ?? 'unlisted';
+      // Аккаунт и режим — одной транзакцией: сбой второго запроса откатывает и первый,
+      // а не оставляет канал записанным в базе при странице 502 владельцу.
+      const mode: YoutubeMode = await inTransaction(this.pg, async (tx) => {
+        await tx.query(
+          `INSERT INTO short_youtube_account
+                  (id, channel_id, channel_title, refresh_token_enc, scopes, status, last_error, connected_at, updated_at)
+           VALUES (1, $1, $2, $3, $4, 'connected', NULL, now(), now())
+           ON CONFLICT (id) DO UPDATE
+              SET channel_id = EXCLUDED.channel_id, channel_title = EXCLUDED.channel_title,
+                  refresh_token_enc = EXCLUDED.refresh_token_enc, scopes = EXCLUDED.scopes,
+                  status = 'connected', last_error = NULL, connected_at = now(), updated_at = now()`,
+          [ch.id, ch.title, encryptSecret(tokens.refreshToken), tokens.scope],
+        );
+        // Подключение при «вручную» включает «по ссылке»: первый ролик — проверка (спека, «Сценарий владельца»).
+        // Канал хранится только в short_youtube_account; short_settings.youtube_channel_id не трогаем — одна правда.
+        const r = await tx.query(
+          `UPDATE short_settings
+              SET youtube_mode = CASE WHEN youtube_mode = 'manual' THEN 'unlisted' ELSE youtube_mode END,
+                  updated_at = now()
+            WHERE id = 1
+            RETURNING youtube_mode`,
+        );
+        return r.rows[0]?.youtube_mode ?? 'unlisted';
+      });
+      this.logger.log(`YouTube подключён: канал ${ch.id} «${ch.title}», режим ${mode}`);
       const handle = ch.handle ? ` (${ch.handle})` : '';
       const check = mode === 'unlisted' ? ' Проверьте первый ролик: если открывается по ссылке и не стал приватным — /youtube публично.' : '';
       const off = shortsEnabled() ? '' : ' Конвейер роликов на этом сервере пока выключен (SHORTS_ENABLED) — загрузка начнётся, когда его включат.';
@@ -242,9 +252,15 @@ export class ShortsYoutubeService {
     try {
       pending = !!(await this.session(shortId));
     } catch (e: any) {
-      // Не смогли прочитать адрес — не знаем, была ли загрузка: предупреждаем в безопасную сторону.
-      this.logger.warn(`ролик ${shortId}: адрес сессии YouTube не прочитан: ${e?.message ?? e}`);
-      pending = true;
+      if (e?.code === '42703') {
+        // Нет колонки — миграция 003 не накатилась: загрузок не было, предупреждать не о чем.
+        this.logger.error('YouTube: нет колонки upload_session — миграция 003 не накатилась; набор без предупреждения о прошлой загрузке');
+        pending = false;
+      } else {
+        // Не смогли прочитать адрес — не знаем, была ли загрузка: предупреждаем в безопасную сторону.
+        this.logger.warn(`ролик ${shortId}: адрес сессии YouTube не прочитан: ${e?.message ?? e}`);
+        pending = true;
+      }
     }
     if (pending) note = [note, PENDING_UPLOAD_NOTE].filter(Boolean).join('\n');
     return { kind: 'kit', note };
@@ -300,7 +316,7 @@ export class ShortsYoutubeService {
     if (previous) {
       // Нет ответа — YoutubeMaybeUploaded наверх, адрес остаётся.
       const st = await checkUpload(this.http, previous, accessToken, video.length);
-      if (st.state === 'complete') return this.done(st.videoId, true);
+      if (st.state === 'complete') return this.done(v.id, st.videoId, true);
       // Истекла: адрес не стираем — повтор снова получит 404 и снова пришлёт набор, а не загрузит вслепую.
       if (st.state === 'gone') throw new YoutubeUploadExpired('YouTube уже не помнит прошлую загрузку этого ролика');
       // incomplete или failed — прошлая загрузка не дошла: грузим заново. Строка уже не наша — YoutubeAttemptSuperseded.
@@ -326,7 +342,7 @@ export class ShortsYoutubeService {
       );
     }
     try {
-      return this.done(await sendFile(this.http, sessionUrl, accessToken, video), false);
+      return this.done(v.id, await sendFile(this.http, sessionUrl, accessToken, video), false);
     } catch (e: any) {
       if (e instanceof YoutubeNotUploaded) {
         // Явный отказ — итог сессии: на повторе она повторила бы его, спрашивать незачем.
@@ -336,7 +352,7 @@ export class ShortsYoutubeService {
       if (!(e instanceof YoutubeMaybeUploaded)) throw e;
       // Снова без ответа — YoutubeMaybeUploaded наверх, адрес остаётся.
       const st = await checkUpload(this.http, sessionUrl, accessToken, video.length);
-      if (st.state === 'complete') return this.done(st.videoId, false);
+      if (st.state === 'complete') return this.done(v.id, st.videoId, false);
       if (st.state === 'gone') throw new YoutubeUploadExpired('YouTube уже не помнит загрузку этого ролика');
       await this.clearSession(v.id, sessionUrl, fence);
       if (st.state === 'failed') throw new YoutubeNotUploaded(`отправка файла: ${st.reason}`, st.status);
@@ -389,7 +405,8 @@ export class ShortsYoutubeService {
    * очередь без адреса, и повтор загрузил бы ролик второй раз. resumed — ролик нашёлся по
    * прошлой сессии: его доступ — от прошлой попытки.
    */
-  private done(videoId: string, resumed: boolean): { videoId: string; url: string; resumed: boolean } {
+  private done(shortId: string, videoId: string, resumed: boolean): { videoId: string; url: string; resumed: boolean } {
+    this.logger.log(`ролик ${shortId}: на YouTube ${videoId}${resumed ? ', нашёлся по прошлой сессии' : ''}`);
     return { videoId, url: `https://youtube.com/shorts/${videoId}`, resumed };
   }
 
@@ -444,11 +461,16 @@ export class ShortsYoutubeService {
 
   /** Отозвать — только то подключение, токен которого не сработал: переподключение посреди загрузки не трогаем. */
   private async revoke(reason: string, tokenEnc: string): Promise<void> {
-    await this.pg.query(
+    const r = await this.pg.query(
       `UPDATE short_youtube_account SET status = 'revoked', last_error = $1, updated_at = now()
         WHERE id = 1 AND refresh_token_enc = $2`,
       [clip(reason, 300), tokenEnc],
     );
+    if (r.rowCount) {
+      this.logger.warn(`YouTube: подключение отозвано — ${reason}`);
+    } else {
+      this.logger.warn(`YouTube: токен не сработал (${reason}), но канал уже переподключён — не трогаю`);
+    }
   }
 
   private async statusText(chatId: number): Promise<string> {

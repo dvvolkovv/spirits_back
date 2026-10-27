@@ -1,4 +1,4 @@
-import { Injectable, Logger, Optional } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
 import { GrammyError, InputFile } from 'grammy';
 import { performance } from 'perf_hooks';
 import { approverChatId } from '../blog/blog-approval.service';
@@ -8,7 +8,7 @@ import { StorageService } from '../common/services/storage.service';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { buildYoutubeKeyboard } from './short-callback';
 import { STAND_MARK, clip, youtubeSafe } from './short-captions';
-import { isStand } from './short-env';
+import { isStand, shortsEnabled } from './short-env';
 import { downloadShortFile } from './short-files';
 import { SUPPORTED_PLATFORMS, ShortSettings, ShortsSettingsService } from './shorts-settings.service';
 import { PENDING_UPLOAD_NOTE, ShortsYoutubeService } from './shorts-youtube.service';
@@ -134,7 +134,7 @@ export function isTelegramRefusal(e: unknown): boolean {
 }
 
 @Injectable()
-export class ShortsPublisherService {
+export class ShortsPublisherService implements OnModuleInit {
   private readonly logger = new Logger(ShortsPublisherService.name);
 
   constructor(
@@ -146,6 +146,17 @@ export class ShortsPublisherService {
     // как до автопубликации; что Nest его подставляет, сторожит shorts.module.spec.ts.
     @Optional() private readonly youtube?: ShortsYoutubeService,
   ) {}
+
+  /**
+   * Разрыв связки с YouTube — как у TgBotService (tg-bot.youtube-routing.spec.ts): без сервиса
+   * набор всё равно уходит, но без проверки живой сессии прошлой загрузки и без её
+   * предупреждения (uploadPlan тут вовсе не вызывается) — тихий откат к режиму до автопубликации.
+   */
+  onModuleInit(): void {
+    if (!this.youtube && shortsEnabled()) {
+      this.logger.warn('ролики: ShortsYoutubeService не подставлен — YouTube только набором, без проверки прошлой загрузки');
+    }
+  }
 
   /** Одобренные человеком ролики, чей слот наступил. */
   async publishDue(): Promise<void> {
@@ -572,6 +583,8 @@ export class ShortsPublisherService {
    * тогда граница в 10 минут не гарантирована, но запись набора всё равно идёт под жетоном строки.
    */
   private async youtubeKit(v: ShortVideo, note: string | null, fence: number): Promise<PlatformResult> {
+    // «Вручную» — note пуст (uploadPlan в этом режиме не предупреждает), строки нет.
+    if (note) this.logger.warn(`ролик ${v.id}: YouTube набором — ${clip(note, 300)}`);
     const chatId = approverChatId();
     if (!chatId) throw new Error('BLOG_APPROVER_TG_ID не задан — набор для YouTube отправить некому');
     if (!v.videoKey || !v.captions) throw new Error('у ролика нет файла или подписей');
