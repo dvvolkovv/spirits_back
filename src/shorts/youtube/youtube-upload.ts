@@ -1,5 +1,5 @@
 import { YoutubeMaybeUploaded, YoutubeNotUploaded } from './youtube-errors';
-import { Http, HttpResponse, clip, googleReason } from './youtube-http';
+import { Http, HttpResponse, clip, googleReason, googleReasonCode } from './youtube-http';
 
 const UPLOAD_URL = 'https://www.googleapis.com/upload/youtube/v3/videos';
 /** Файл ролика — 10–50 МБ: выгрузка с запасом укладывается в срок живости публикации (10 мин). */
@@ -80,6 +80,9 @@ function uploadedId(r: HttpResponse): string | null {
 /** «Ролика нет» — только явный отказ 4xx; 408 и 429 — сбой в пути, исход неизвестен. */
 const refused = (status: number): boolean => status >= 400 && status < 500 && status !== 408 && status !== 429;
 
+/** Явные лимиты: единственные причины 403, которые на вопросе о сессии считаем итоговым отказом. */
+const FINAL_403_REASONS = new Set(['quotaExceeded', 'uploadLimitExceeded']);
+
 /**
  * Отправить файл одним запросом. 200/201 с id — загружен. Явный отказ 4xx — ролика нет
  * (YoutubeNotUploaded). Всё остальное — обрыв, 2xx без id, 3xx (в том числе 308), 408,
@@ -114,9 +117,14 @@ export type UploadState =
 /**
  * Спросить YouTube о сессии: PUT без тела, Content-Range со звёздочкой и размером файла.
  * - 200/201 с роликом — загружено (complete);
- * - 308 — не догружено (incomplete); но если Range уже покрывает весь файл, YouTube
- *   собирает ролик — исход неизвестен (YoutubeMaybeUploaded);
- * - 4xx, кроме 401, 404, 408, 410, 429, — завершённая сессия повторяет свой итоговый
+ * - 308 без Range или с Range, не покрывающим файл, — не догружено (incomplete); Range не
+ *   по протоколу (не `bytes=0-N`) или покрывающий файл целиком — исход неизвестен
+ *   (YoutubeMaybeUploaded): непонятному ответу верить нельзя, а полный Range значит, что
+ *   YouTube собирает ролик;
+ * - 403 без причины из FINAL_403_REASONS — тоже исход неизвестен: бывает «сессия не этого
+ *   аккаунта» (канал переподключил другой менеджер бренд-канала), и тогда прошлая загрузка
+ *   могла дойти;
+ * - прочие 4xx, кроме 401, 404, 408, 410, 429, — завершённая сессия повторяет свой итоговый
  *   отказ: загрузка кончилась отказом, ролика нет (failed);
  * - 404/410 — сессии больше нет (истекла): спросить не у кого, дошла ли (gone);
  * - прочее и обрыв — YoutubeMaybeUploaded: ответа нет, решать нельзя.
@@ -138,11 +146,21 @@ export async function checkUpload(http: Http, sessionUrl: string, accessToken: s
   const id = uploadedId(r);
   if (id) return { state: 'complete', videoId: id };
   if (r.status === 308) {
-    const m = /^bytes=0-(\d+)$/.exec(String(r.headers?.range ?? '').trim());
-    if (m && Number(m[1]) + 1 >= size) throw new YoutubeMaybeUploaded('YouTube получил файл целиком, ролика в ответе ещё нет', 308);
+    const range = String(r.headers?.range ?? '').trim();
+    // Байтов не получено — не догружено.
+    if (!range) return { state: 'incomplete' };
+    const m = /^bytes=0-(\d+)$/.exec(range);
+    // Ответ не по протоколу — решать по нему нельзя.
+    if (!m) throw new YoutubeMaybeUploaded(`YouTube ответил о загрузке непонятным Range: ${clip(range, 60)}`, 308);
+    if (Number(m[1]) + 1 >= size) throw new YoutubeMaybeUploaded('YouTube получил файл целиком, ролика в ответе ещё нет', 308);
     return { state: 'incomplete' };
   }
   if (r.status === 404 || r.status === 410) return { state: 'gone' };
+  // 403 бывает и «сессия не этого аккаунта» (канал переподключил другой менеджер бренд-канала):
+  // итоговым отказом считаем только явные лимиты, остальное — исход неизвестен.
+  if (r.status === 403 && !FINAL_403_REASONS.has(googleReasonCode(r) ?? '')) {
+    throw new YoutubeMaybeUploaded(`YouTube не ответил о загрузке: ${googleReason(r)}`, 403);
+  }
   if (refused(r.status) && r.status !== 401) return { state: 'failed', status: r.status, reason: googleReason(r) };
   throw new YoutubeMaybeUploaded(`YouTube не ответил о загрузке: ${googleReason(r)}`, r.status);
 }
