@@ -21,6 +21,7 @@ import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
 import { RunnerGuard } from './runner.guard';
 import { HostGuard } from './host.guard';
+import { SECRET_COUNT_MAX, SECRET_NAME_MAX } from './secret-rules';
 
 /**
  * Регрессия по образцу src/common/guards/admin-routes.spec.ts.
@@ -467,5 +468,29 @@ describe('тело заведения продукта', () => {
     await expect(through(ProductsController, 'create', body())).resolves.toMatchObject({
       name: 'Селянська',
     });
+  });
+});
+
+describe('тело отправки карточки ключей (remove)', () => {
+  // Ревью 15b: remove — массив ИМЁН, не значений — но имя может прийти
+  // числом, слишком длинной строкой или слишком большим списком до того,
+  // как тело дойдёт до ProductKeysService.submit. Труба отбивает это раньше
+  // сервиса, тем же ValidationPipe, что настроен в main.ts.
+  it('элемент remove не строкой — 400 до сервиса', async () => {
+    await expect(through(ProductActionsController, 'submit', { remove: [1] })).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('remove длиннее SECRET_COUNT_MAX — 400', async () => {
+    const remove = Array.from({ length: SECRET_COUNT_MAX + 1 }, (_, i) => `K${i}`);
+    await expect(through(ProductActionsController, 'submit', { remove })).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('имя в remove длиннее SECRET_NAME_MAX — 400', async () => {
+    const remove = ['A'.repeat(SECRET_NAME_MAX + 1)];
+    await expect(through(ProductActionsController, 'submit', { remove })).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('нормальный remove проходит без изменений', async () => {
+    await expect(through(ProductActionsController, 'submit', { remove: ['A', 'B'] })).resolves.toMatchObject({ remove: ['A', 'B'] });
   });
 });
