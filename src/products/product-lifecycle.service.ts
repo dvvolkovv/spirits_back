@@ -535,12 +535,13 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     // архивного продукта не выдаётся никому (claimJob архивному отдаёт только
     // sleep) и вечно загораживает сон: queueSleepForDeleted ждёт пустой
     // очереди. Доснимаем здесь. Возврат снимает архив раньше, чем ставит своё
-    // пробуждение, — его задание сюда не попадает.
+    // пробуждение, — его задание сюда не попадает. Стирание (purge, очередь 2)
+    // — тоже задание архивного продукта, его не снимаем.
     await this.pg.query(
       `UPDATE product_provision_jobs j SET status = 'failed', error = $1::text, finished_at = now()
          FROM products p
         WHERE j.product_id = p.id AND p.archived_at IS NOT NULL
-          AND j.status = 'queued' AND j.kind <> 'sleep'`,
+          AND j.status = 'queued' AND j.kind NOT IN ('sleep','purge')`,
       [JOB_KILLED_BY_DELETE],
     );
     return this.queueSleepForDeleted();
