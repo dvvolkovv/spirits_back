@@ -387,14 +387,22 @@ describe('адрес возврата Google', () => {
     expect(line).toContain('error=access_denied?');
   });
 
-  it('чужой или битый state — 400, без запросов', async () => {
-    const { svc, http } = setup();
+  /**
+   * Порядок «state до ключа»: адрес возврата публичный, и анонимный запрос без верного state не
+   * должен ни узнать о настройке сервера (страница про CALENDAR_SECRET_KEY), ни заставить бота
+   * писать владельцу. Поэтому ключа в окружении нет — ответ всё равно «Ссылка устарела».
+   */
+  it('чужой или битый state — 400, без запросов и сообщений, даже без CALENDAR_SECRET_KEY: state проверяется раньше ключа', async () => {
+    delete process.env.CALENDAR_SECRET_KEY;
+    const { svc, http, tg } = setup();
     for (const state of [undefined, 'x.y', stateFor(OWNER + 1)]) {
       const page = await svc.completeConnect({ code: 'c', state });
       expect(page.status).toBe(400);
       expect(page.html).toContain('Ссылка устарела');
+      expect(page.html).not.toContain('CALENDAR_SECRET_KEY');
     }
     expect(http.http).not.toHaveBeenCalled();
+    expect(tg.sendMessage).not.toHaveBeenCalled();
   });
 
   it('код уже использован, а недавнего подключения нет — 400 «Ссылка устарела», бот молчит', async () => {
@@ -465,6 +473,19 @@ describe('адрес возврата Google', () => {
     const page = await svc.completeConnect({ code: 'c', state: stateFor() });
     expect(page.status).toBe(503);
     expect(page.html).toContain('на сервере нет CALENDAR_SECRET_KEY — канал не подключить');
+    expect(http.http).not.toHaveBeenCalled();
+    expect(said()[0]).toBe('YouTube не подключён: на сервере нет CALENDAR_SECRET_KEY — канал не подключить');
+  });
+
+  /**
+   * Правило «ключ не короче 32 знаков» — одно: hasSecretKey в src/calendar/crypto.ts, по нему же
+   * шифрует crypto.ts. Своя копия проверки в сервисе разошлась бы с ним, поменяйся правило там.
+   */
+  it('ключ — по общему правилу crypto.ts (hasSecretKey): правило говорит «нет» — код Google не трогаем, хотя ключ в окружении есть', async () => {
+    jest.spyOn(require('../calendar/crypto'), 'hasSecretKey').mockReturnValue(false);
+    const { svc, said, http } = setup();
+    const page = await svc.completeConnect({ code: 'c', state: stateFor() });
+    expect(page.status).toBe(503);
     expect(http.http).not.toHaveBeenCalled();
     expect(said()[0]).toBe('YouTube не подключён: на сервере нет CALENDAR_SECRET_KEY — канал не подключить');
   });
@@ -786,6 +807,17 @@ describe('загрузка ролика', () => {
     delete process.env.CALENDAR_SECRET_KEY;
     const e = await caught(setup(db, fakeHttp()).svc.upload(video, 'public', alive(), 1));
     expect(e).toBeInstanceOf(YoutubeNotUploaded);
+    expect(db.st.account.status).toBe('connected');
+  });
+
+  it('ключ — по общему правилу crypto.ts (hasSecretKey): правило говорит «нет» — YoutubeNotUploaded без запросов к Google, подключение не отзываем', async () => {
+    const db = connected();
+    jest.spyOn(require('../calendar/crypto'), 'hasSecretKey').mockReturnValue(false);
+    const { svc, http } = setup(db, fakeHttp());
+    const e = await caught(svc.upload(video, 'public', alive(), 1));
+    expect(e).toBeInstanceOf(YoutubeNotUploaded);
+    expect(e.message).toBe('на сервере нет CALENDAR_SECRET_KEY — токен канала не расшифровать');
+    expect(http.http).not.toHaveBeenCalled();
     expect(db.st.account.status).toBe('connected');
   });
 
