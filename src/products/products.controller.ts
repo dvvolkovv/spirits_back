@@ -22,6 +22,7 @@ import { ProvisioningService } from './provisioning.service';
 import { BlockService } from './block.service';
 import { DomainsService } from './domains.service';
 import { assertUuid, CreateProductDto } from './products.dto';
+import { SECRET_MASK } from './prompt-secrets';
 
 @Controller('')
 @UseGuards(JwtGuard)
@@ -317,8 +318,11 @@ export class ProductsController {
     // узнаёт об этом первым событием потока, до ответа агента: иначе он ждал
     // бы, что ключ доехал до продукта. Кабинет старой сборки неизвестное
     // событие пропускает (ProductChat.tsx разбирает только свои типы).
+    //
+    // mask — тот знак, что стоит теперь в тексте правки и в истории: кабинет
+    // показывает его как есть, а не свою копию строки (одна правда — здесь).
     if (turn.masked) {
-      res.write(JSON.stringify({ type: 'notice', code: 'secrets_masked', count: turn.masked.count, names: turn.masked.names }) + '\n');
+      res.write(JSON.stringify({ type: 'notice', code: 'secrets_masked', count: turn.masked.count, names: turn.masked.names, mask: SECRET_MASK }) + '\n');
     }
 
     // Обрыв клиента прекращает чтение. Без этого генератор крутится до своего

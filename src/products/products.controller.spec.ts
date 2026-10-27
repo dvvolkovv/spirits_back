@@ -115,7 +115,7 @@ describe('ProductsController.chat', () => {
     await ctrl.chat(user, P, { prompt: 'любой' } as any, makeReq() as any, res as any);
 
     const lines = res.chunks.join('').trim().split('\n').map((l) => JSON.parse(l));
-    expect(lines[0]).toEqual({ type: 'notice', code: 'secrets_masked', count: 2, names: ['WEATHER_API_KEY'] });
+    expect(lines[0]).toEqual({ type: 'notice', code: 'secrets_masked', count: 2, names: ['WEATHER_API_KEY'], mask: '[ключ скрыт]' });
     expect(lines.map((l) => l.type)).toEqual(['notice', 'begin', 'end']);
   });
 
