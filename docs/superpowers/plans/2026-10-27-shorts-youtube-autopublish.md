@@ -2957,7 +2957,7 @@ Expected: `GATES_OK`.
 - [ ] **Step 3: Слияние из свежего клона на ноде:**
 
 ```bash
-ssh dv@85.192.61.231 'set -e; rm -rf ~/ci/merge-shorts-youtube; git clone -q --branch main git@github.com:dvvolkovv/spirits_back.git ~/ci/merge-shorts-youtube; cd ~/ci/merge-shorts-youtube; git fetch -q origin feat/shorts-youtube; git merge -q --no-ff FETCH_HEAD -m "Merge feat/shorts-youtube: автопубликация роликов на YouTube"; source ~/.nvm/nvm.sh >/dev/null; npm ci --silent; npx jest src/shorts src/tg-bot 2>&1 | tail -5; npx tsc -p tsconfig.build.json --noEmit && npm run build >/dev/null && echo MERGE_GATES_OK'
+ssh dv@85.192.61.231 'set -e; rm -rf ~/ci/merge-shorts-youtube; git clone -q --branch main git@github.com:dvvolkovv/spirits_back.git ~/ci/merge-shorts-youtube; cd ~/ci/merge-shorts-youtube; git fetch -q origin feat/shorts-youtube; git merge -q --no-ff FETCH_HEAD -m "Merge feat/shorts-youtube: автопубликация роликов на YouTube"; source ~/.nvm/nvm.sh >/dev/null; npm ci --silent && npx jest src/shorts src/tg-bot --silent && npx tsc -p tsconfig.build.json --noEmit && npm run build >/dev/null && SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts --silent && echo MERGE_GATES_OK'
 ```
 
 Expected: `MERGE_GATES_OK`.
@@ -2995,4 +2995,15 @@ ssh dv@85.192.61.231 'cd ~/ci/merge-shorts-youtube && nohup bash scripts/deploy.
 - [ ] **Step 3: Проверка.** Expected: пост в @linkeontest, в боте «Вышло на YouTube (по ссылке): https://youtube.com/shorts/<id>». Ролик не стал приватным: oEmbed отвечает 200 — `https://www.youtube.com/oembed?format=json&url=https://www.youtube.com/watch?v=<id>` (WebFetch или curl с ноды; приватный ролик даёт 401/403/404). Владелец открывает ссылку в окне инкогнито.
 - [ ] **Step 4: Стенд — назад в «вручную».** Владелец пишет тестовому боту `/youtube вручную`, чтобы стенд не грузил пробные ролики на настоящий канал. Пробный ролик владелец удаляет в YouTube Studio.
 - [ ] **Step 5: Прод.** Владелец пишет `/youtube` боту @LinkeonAgentBot и подключает канал. Если на стенде ролик не заперт — `/youtube публично`; иначе остаётся «по ссылке» до решения владельца (запасной путь — аудит YouTube API, тексты заявки готовит исполнитель).
+- [ ] **Заметки к живой проверке (финальное ревью):** после входа в Google браузер спросит Basic Auth стенда — предупредить владельца; после проверки на стенде не только `/youtube вручную`, но и удалить строку `short_youtube_account` стенда (токен настоящего канала не должен лежать в тестовой базе); первую загрузку на проде смотреть по логу API (маршрут прода до googleapis.com стенд не доказывает); `YOUTUBE_CHANNEL_ID` читается при старте — записать до выката.
+
 - [ ] **Step 6: Итоги.** Обновить память (`project_youtube_upload_unverified_not_private.md`: заперт или нет, режим прода) и спеку роликов (`2026-10-24-promo-shorts-design.md`, «Публикация»: YouTube — загрузкой).
+
+
+---
+
+## Итог после всех кругов ревью (27.10)
+
+Заметки «Поправки ревью» у задач описывают историю правок; источник правды о поведении — спека и код ветки. Сверх заметок в код после `9201af3` вошли: закреплённый канал проверяется при подключении, в плане загрузки, в статусе и при смене режима (`channelMismatch`); бот предупреждает в `onModuleInit`, если сервис YouTube не подставлен; страница возврата — `Referrer-Policy`, CSP и страховка от исключения (лог с `clip` и стеком); тест маршрута сверяет `CALLBACK_PATH` с префиксом из `main.ts`; тесты маршрутизации `/youtube` в боте (`src/tg-bot/tg-bot.youtube-routing.spec.ts`); блок `YOUTUBE_*` и `PUBLIC_BASE_URL` в `.env.example`.
+
+Открыто после финального ревью: «жетон попытки» (I1, до подключения канала на проде) и мелочи M1–M11 (лог-строки для разбора сбоев, санитизация `<` `>` в заголовке и описании, атомарное подключение, строже разбор 308 и 403 при вопросе о сессии, предупреждение публикатора без сервиса, подсказка про прежние ролики «по ссылке» при `/youtube публично`, `CALENDAR_SECRET_KEY` в `.env.example`).
