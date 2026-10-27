@@ -2,12 +2,14 @@ import { ChatService } from './chat.service';
 import {
   customAssistantHelpLine,
   INITIATIVE_RULE,
+  linksRule,
   platformGuide,
   platformSections,
   telegramPlatformGuide,
   TOOLS_LIST_NOTE,
 } from './platform-guide';
 import { SUPPORTED_LANGUAGES } from '../common/services/language.service';
+import { PAID_SECTIONS, SECTION_PATHS, sectionUrl, type SectionKey } from '../platform-kb/section-links';
 
 /**
  * Блок «Что есть в Linkeon» в системном промпте ассистента.
@@ -237,5 +239,60 @@ describe('системный промпт релея', () => {
     expect(p).not.toMatch(/Никогда не упоминай, что ты Claude/);
     expect(p).toMatch(/не говори, что ты Claude или другая модель/);
     expect(p).toMatch(/how-it-works/);
+  });
+});
+
+/**
+ * Ссылки на разделы (27.10.2026, находка «Затыков недели» e4f01175): путь
+ * словами не помог человеку найти раздел. Адрес каждого раздела — в перечне
+ * рядом с названием, правило ссылок — по каналу.
+ */
+describe('ссылки на разделы', () => {
+  const KEYS = Object.keys(SECTION_PATHS) as SectionKey[];
+
+  it.each([...SUPPORTED_LANGUAGES])('%s: у каждого раздела таблицы — свой адрес рядом с названием', (lang) => {
+    const s = platformSections(lang);
+    expect(KEYS.filter((k) => !s.includes(`${sectionUrl(k)})`))).toEqual([]);
+  });
+
+  it('стор: без адресов разделов о деньгах, остальные на месте', () => {
+    const s = platformSections('ru', { store: true });
+    for (const k of KEYS) {
+      if (PAID_SECTIONS.includes(k)) expect(s).not.toContain(sectionUrl(k));
+      else expect(s).toContain(`${sectionUrl(k)})`);
+    }
+  });
+
+  it('раздела «Интеграции» нет — перечень говорит, где подключения', () => {
+    const s = flat(platformSections('ru'));
+    expect(s).toMatch(/Отдельного раздела интеграций нет/);
+    expect(s).toContain(sectionUrl('telegram'));
+    for (const label of ['«Zoom»', '«Экосистема Taler ID»', '«Календари»', '«Способы входа»']) {
+      expect(s).toContain(label);
+    }
+  });
+
+  it('веб и приложения: ссылка рядом с названием, можно markdown; путь по меню — в дополнение', () => {
+    const g = platformGuide('ru', { helpTool: HELP, initiative: true });
+    expect(g).toContain(linksRule('markdown'));
+    expect(g).not.toContain(linksRule('plain'));
+    const r = flat(linksRule('markdown'));
+    expect(r).toMatch(/рядом с его названием/);
+    expect(r).toMatch(/markdown-ссылкой \[название\]\(адрес\)/);
+    expect(r).toMatch(/Путь по меню — только в дополнение к ссылке/);
+    expect(r).toMatch(/Других адресов кабинета не придумывай/);
+  });
+
+  it('Telegram: только полный адрес, без markdown', () => {
+    const g = telegramPlatformGuide('ru', { helpTool: HELP });
+    expect(g).toContain(linksRule('plain'));
+    expect(g).not.toContain(linksRule('markdown'));
+    expect(flat(linksRule('plain'))).toMatch(/только сам полный адрес, начиная с https:\/\//);
+    expect(flat(linksRule('plain'))).toMatch(/без markdown/);
+  });
+
+  it('подсказка по Linkeon — со ссылкой на раздел, а не с путём по меню', () => {
+    expect(flat(INITIATIVE_RULE)).toMatch(/одной фразой со ссылкой на её раздел/);
+    expect(INITIATIVE_RULE).not.toMatch(/точным путём по меню/);
   });
 });
