@@ -125,6 +125,17 @@ describe('отказы, после которых продукт точно на
     expect(host.containers.get('bot1')!.env.BOT_TOKEN).toBe('старый');
   });
 
+  it('идёт или оборвалось обновление образа (<слаг>__pre_<12 hex>) — хост не тронут, маркеров нет', async () => {
+    // Повтор после обновления пройдёт: человеку — «попробуйте через несколько
+    // минут» (rekey_failed), а не тревога «продукт может не отвечать».
+    await host.run(['docker', 'run', '-d', '--name', 'bot1__pre_0123456789ab', '--restart', 'unless-stopped', 'linkeon-product:base']);
+    const error = await failureOf(JOB, hostDeps(realRekey));
+    expect(error).toContain('обновление образа');
+    expect(error).toContain('ничего не тронуто');
+    expect(error).not.toMatch(serverUnknownRe());
+    expect(host.containers.get('bot1')!.env.BOT_TOKEN).toBe('старый');
+  });
+
   it('незнакомый вид задания (агент старее сервера) — маркеров нет', async () => {
     const error = await failureOf({ ...JOB, jobKind: 'rekey-v2' }, hostDeps(realRekey));
     expect(error).toContain('неизвестный вид задания');

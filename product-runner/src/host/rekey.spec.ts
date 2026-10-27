@@ -321,6 +321,85 @@ describe('смена ключей: откат и отказы', () => {
   });
 });
 
+describe('смена ключей посреди обновления образа (product-image-roll.sh)', () => {
+  // Обновление образа переименовывает продукт в <слаг>__pre_<12 hex>,
+  // поднимает новый <слаг> и снимает страховку только после успеха, а
+  // занятость продукта спрашивает один раз — до docker stop. Смена ключей,
+  // пришедшая посреди захода, сняла бы настройки со СВЕЖЕГО контейнера, а её
+  // откат полез бы в чужое пересоздание. Пока страховка на хосте — отказ.
+  const mutating = () =>
+    host.calls.filter((c) => c[0] === 'docker' && ['stop', 'rename', 'run', 'rm', 'start'].includes(c[1]));
+  const siteJob = (): RekeyJob => ({ slug: 'shop', kind: 'site', secrets: { API_KEY: 'k2' }, dropNames: [] });
+
+  it('обновление посреди захода: старый под страховкой, под именем продукта свежий — отказ, хост как был', async () => {
+    const PRE = 'bot1__pre_0123456789ab';
+    await seedBot();
+    await host.run(['docker', 'stop', 'bot1']);
+    await host.run(['docker', 'rename', 'bot1', PRE]);
+    await host.run([
+      'docker', 'run', '-d', '--name', 'bot1', '--restart', 'unless-stopped',
+      '-e', 'RUNNER_TOKEN=ткн-раннера', '-e', 'LINKEON_URL=https://my.linkeon.io', '-e', 'BOT_TOKEN=old',
+      'linkeon-product:base',
+    ]);
+    const freshId = host.idOf('bot1');
+    const preId = host.idOf(PRE);
+    host.calls.length = 0;
+
+    const err = await rekeyProduct(botJob(), fast()).catch((e) => e);
+
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toBe(
+      `на хосте есть ${PRE} — идёт или оборвалось обновление образа; сменить ключи после него, ничего не тронуто`,
+    );
+    expect(mutating()).toEqual([]);
+    expect(host.idOf('bot1')).toBe(freshId);
+    expect(host.isRunning('bot1')).toBe(true);
+    expect(host.containers.get('bot1')!.env.BOT_TOKEN).toBe('old');
+    expect(host.idOf(PRE)).toBe(preId);
+    expect(host.isRunning(PRE)).toBe(false);
+    expect(host.containers.has(`bot1${REKEY_BACKUP_SUFFIX}`)).toBe(false);
+  });
+
+  it('оборвавшееся обновление оставило страховку сайта — отказ, сайт на прежних ключах и порту', async () => {
+    const PRE = 'shop__pre_ba9876543210';
+    const port = await seedSite();
+    await host.run(['docker', 'run', '-d', '--name', PRE, '--restart', 'unless-stopped', 'linkeon-product:base']);
+    await host.run(['docker', 'stop', PRE]);
+    host.calls.length = 0;
+
+    await expect(rekeyProduct(siteJob(), siteDeps())).rejects.toThrow(
+      new RegExp(`^на хосте есть ${PRE} — .*обновление образа.*ничего не тронуто$`),
+    );
+    expect(mutating()).toEqual([]);
+    expect(host.containers.get('shop')!.env.API_KEY).toBe('k1');
+    expect(host.isRunning('shop')).toBe(true);
+    expect(host.probePort(port)).toBe(true);
+    expect(host.containers.has(PRE)).toBe(true);
+  });
+
+  // Форма точная, как у стирания (purge.ts): у shop нет права споткнуться о
+  // страховку соседа или о имя, лишь похожее на страховку.
+  it.each([
+    'shop-2__pre_0123456789ab',
+    'shop2__pre_0123456789ab',
+    'xshop__pre_0123456789ab',
+    'shop__pre_xyzxyzxyzxyz',
+    'shop__pre_0123456789a',
+    'shop__pre_0123456789abc',
+    'shop__pre_0123456789AB',
+    'shop__pre_',
+  ])('%s — не страховка обновления shop: ключи меняются как обычно', async (decoy) => {
+    await seedSite();
+    await host.run(['docker', 'run', '-d', '--name', decoy, '--restart', 'unless-stopped', 'linkeon-product:base']);
+    const decoyId = host.idOf(decoy);
+    await rekeyProduct(siteJob(), siteDeps());
+    expect(host.containers.get('shop')!.env.API_KEY).toBe('k2');
+    expect(host.isRunning('shop')).toBe(true);
+    expect(host.idOf(decoy)).toBe(decoyId);
+    expect(host.isRunning(decoy)).toBe(true);
+  });
+});
+
 describe('смена ключей: образ и окружение образа', () => {
   it('переменные образа не уходят флагом -e: новый берёт их из образа, своё поверх образа сохраняется', async () => {
     host.tagImage('linkeon-product:base', 'sha256:v1', ['CHECKOUT_PATH=/product', 'TZ=UTC']);
