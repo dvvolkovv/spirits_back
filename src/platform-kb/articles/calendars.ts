@@ -9,7 +9,7 @@ import type { KbArticle } from '../kb.types';
 export const calendars: KbArticle = {
   id: 'calendars',
   title: 'Календари',
-  summary: 'календари: Яндекс, рабочий Outlook, Google и iCloud по ссылке, Taler ID, карточки событий и дел',
+  summary: 'календари и интеграции: подключить Яндекс, рабочий Outlook, Google и iCloud по ссылке, Taler ID; карточки событий и дел',
   related: ['routines', 'call'],
   render: ({ q, url }) => `
 ## Что это

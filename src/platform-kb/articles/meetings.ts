@@ -10,7 +10,7 @@ import type { KbArticle } from '../kb.types';
 export const meetings: KbArticle = {
   id: 'meetings',
   title: 'Ассистент на встрече',
-  summary: 'ассистент на онлайн-встрече: площадки, подключение Zoom, голосовые комнаты Linkeon',
+  summary: 'ассистент на онлайн-встрече: площадки, интеграция и подключение Zoom, голосовые комнаты Linkeon',
   related: ['call', 'calendars'],
   render: ({ q, paid, url }) => `
 ## Что это

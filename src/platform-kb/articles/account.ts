@@ -12,7 +12,7 @@ import { V } from '../values';
 export const account: KbArticle = {
   id: 'account',
   title: 'Аккаунт и вход',
-  summary: 'аккаунт: способы входа, код из SMS, объединение аккаунтов, язык, выход, удаление',
+  summary: 'аккаунт: способы входа (подключения, интеграции Google и Яндекса), код из SMS, объединение, язык, выход, удаление',
   related: ['profile', 'support', 'apps'],
   render: ({ q, paid, url }) => `
 ## Что это
