@@ -166,6 +166,26 @@ maybe('отвязка способа входа против живого Postgr
     expect(await configOf(priv)).toMatchObject({ status: 'active', archived_at: null });
   });
 
+  // provider_sub у другого провайдера может совпасть с id Telegram цифра в
+  // цифру: UNIQUE(provider, provider_sub) это допускает. Без условия
+  // d.provider = 'telegram' отвязка такой строки снесла бы связку бота и личку.
+  it('другой провайдер с числовым provider_sub, равным id Telegram, — связка бота и личка не тронуты', async () => {
+    await identity(A, 'phone', '70000000000');
+    await identity(A, 'telegram', TG);
+    const yandexId = await identity(A, 'yandex', TG);
+    await tgLink(A, TG);
+    const priv = await config(A, TG);
+
+    expect(await svc.unlinkMethod(A, yandexId)).toEqual({ ok: true });
+
+    expect(await identitiesOf(A)).toEqual([
+      { provider: 'phone', provider_sub: '70000000000' },
+      { provider: 'telegram', provider_sub: TG },
+    ]);
+    expect(await tgRows()).toEqual([{ linkeon_user_id: A, tg: TG }]);
+    expect(await configOf(priv)).toMatchObject({ status: 'active', archived_at: null });
+  });
+
   it('последний способ входа — отказ, ничего не удалено и не архивировано', async () => {
     const tgId = await identity(A, 'telegram', TG);
     await tgLink(A, TG);
