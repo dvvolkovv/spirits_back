@@ -20,7 +20,7 @@ import { jobCostRefunded } from '../video/job-refund';
 import { MailService } from '../common/services/mail.service';
 import { LanguageService } from '../common/services/language.service';
 import { buildOwnerReplyEmail } from './support-mail';
-import { platformSections } from '../chat/platform-guide';
+import { linksRule, platformSections } from '../chat/platform-guide';
 import { executeLinkeonHelp, linkeonHelpTool, LINKEON_HELP_TOOL_NAME } from '../platform-kb/linkeon-help';
 import { labelsFor } from '../platform-kb/labels';
 import type { KbClient } from '../platform-kb/kb.types';
@@ -490,6 +490,9 @@ export class SupportService implements OnModuleInit {
     const kbLabels = labelsFor(lang);
     const supportButtons = [...new Set([kbLabels.support, kbLabels.writeSupport])].map((l) => `«${l}»`).join(' или ');
 
+    // Ссылки на разделы — полным адресом (linksRule('plain')): ответы
+    // поддержки кабинет показывает простым текстом и делает ссылкой только
+    // сам адрес (SupportView); markdown-ссылка осталась бы на экране скобками.
     // Язык ответа больше не зашит. Раньше здесь стояло «отвечай по-русски», и
     // человек, написавший в поддержку по-английски, получал русский ответ —
     // поймано при записи видео для Apple. Директива та же, что у ассистентов
@@ -499,6 +502,7 @@ ${LanguageService.buildDirective(lang)}
 
 ПЛАТФОРМА. LINKEON.IO — AI-ассистенты для бизнеса и личного роста. Разделы и кнопки (называй их так, как они подписаны у пользователя, — в кавычках):
 ${platformSections(lang, { store: opts.storeBuild })}
+${linksRule('plain')}
 
 ТВОЯ РОЛЬ.
 - Помогай юзеру решать вопросы по использованию платформы.
