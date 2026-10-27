@@ -161,6 +161,8 @@ const ru = {
   pa_create_bot_prompt: 'Чтобы создать бота «{name}», введите токен от @BotFather и ключи сервисов в защищённой форме. В переписку их не присылайте.',
   pa_create_bot_btn: 'Ввести ключи',
   pa_open_cabinet_btn: 'Открыть в кабинете',
+  pa_keys_prompt: 'Ключи «{name}»: замените, уберите или добавьте их в защищённой форме — продукт перезапустится с новыми ключами. В переписку ключи не присылайте.',
+  pa_keys_btn: 'Открыть ключи',
 };
 
 export type TgTextKey = keyof typeof ru;
@@ -282,6 +284,8 @@ const en: Catalog = {
   pa_create_bot_prompt: "To create the bot “{name}”, enter the token from @BotFather and your service keys in the secure form. Please don't send them in the chat.",
   pa_create_bot_btn: "Enter keys",
   pa_open_cabinet_btn: "Open in your account",
+  pa_keys_prompt: "Keys for “{name}”: replace, remove or add them in the secure form — the product will restart with the new keys. Please don't send keys in the chat.",
+  pa_keys_btn: "Open keys",
 };
 
 const de: Catalog = {
@@ -400,6 +404,8 @@ const de: Catalog = {
   pa_create_bot_prompt: 'Um den Bot „{name}“ anzulegen, gib das Token von @BotFather und die Schlüssel deiner Dienste im geschützten Formular ein. Schick sie bitte nicht in den Chat.',
   pa_create_bot_btn: 'Schlüssel eingeben',
   pa_open_cabinet_btn: 'Im Konto öffnen',
+  pa_keys_prompt: 'Schlüssel für „{name}“: Ersetze, entferne oder ergänze sie im geschützten Formular – das Produkt startet dann mit den neuen Schlüsseln neu. Schick Schlüssel bitte nicht in den Chat.',
+  pa_keys_btn: 'Schlüssel öffnen',
 };
 
 /**
@@ -535,6 +541,8 @@ const fr: Catalog = frenchTypography({
   pa_create_bot_prompt: 'Pour créer le bot « {name} », saisissez le jeton de @BotFather et les clés de vos services dans le formulaire sécurisé. Ne les envoyez pas dans la discussion.',
   pa_create_bot_btn: 'Saisir les clés',
   pa_open_cabinet_btn: 'Ouvrir dans votre espace',
+  pa_keys_prompt: 'Clés de « {name} » : remplacez, supprimez ou ajoutez-les dans le formulaire sécurisé — le produit redémarrera avec les nouvelles clés. Ne les envoyez pas dans la discussion.',
+  pa_keys_btn: 'Ouvrir les clés',
 });
 
 const es: Catalog = {
@@ -653,6 +661,8 @@ const es: Catalog = {
   pa_create_bot_prompt: 'Para crear el bot «{name}», introduce el token de @BotFather y las claves de tus servicios en el formulario seguro. No las envíes por el chat.',
   pa_create_bot_btn: 'Introducir claves',
   pa_open_cabinet_btn: 'Abrir en tu cuenta',
+  pa_keys_prompt: 'Claves de «{name}»: sustitúyelas, quítalas o añade otras en el formulario seguro; el producto se reiniciará con las claves nuevas. No las envíes por el chat.',
+  pa_keys_btn: 'Abrir claves',
 };
 
 const pt: Catalog = {
@@ -771,6 +781,8 @@ const pt: Catalog = {
   pa_create_bot_prompt: 'Para criar o bot «{name}», introduz o token do @BotFather e as chaves dos teus serviços no formulário seguro. Não as envies pela conversa.',
   pa_create_bot_btn: 'Introduzir chaves',
   pa_open_cabinet_btn: 'Abrir na tua conta',
+  pa_keys_prompt: 'Chaves de «{name}»: substitui, remove ou acrescenta chaves no formulário seguro — o produto reinicia com as chaves novas. Não as envies pela conversa.',
+  pa_keys_btn: 'Abrir chaves',
 };
 
 const zh: Catalog = {
@@ -889,6 +901,8 @@ const zh: Catalog = {
   pa_create_bot_prompt: '要创建机器人「{name}」，请在安全表单中输入 @BotFather 提供的令牌和各项服务的密钥。请不要在聊天中发送。',
   pa_create_bot_btn: '输入密钥',
   pa_open_cabinet_btn: '在个人中心打开',
+  pa_keys_prompt: '「{name}」的密钥：请在安全表单中替换、删除或添加——产品将使用新密钥重新启动。请不要在聊天中发送密钥。',
+  pa_keys_btn: '打开密钥',
 };
 
 export const TG_TEXTS: Record<TgLang, Catalog> = { ru, en, es, de, fr, zh, pt };
