@@ -114,4 +114,13 @@ describe('описание инструмента', () => {
       expect(linkeonHelpTool(c, REG).description).toMatch(/Строка «Ссылка…» в разделе «Где» — полный адрес раздела/);
     }
   });
+
+  // Бот в Telegram шлёт простой текст: markdown-ссылка осталась бы на экране
+  // скобками, нажимается только сам адрес (linksRule('plain')).
+  it('Telegram: адрес из «Ссылки…» — только сам адрес, без markdown; вебу и приложению — без оговорки', () => {
+    expect(linkeonHelpTool('telegram', REG).description).toMatch(
+      /дай его человеку рядом с названием раздела — только сам адрес, без markdown\./,
+    );
+    for (const c of ['web', 'app'] as const) expect(linkeonHelpTool(c, REG).description).not.toMatch(/без markdown/);
+  });
 });

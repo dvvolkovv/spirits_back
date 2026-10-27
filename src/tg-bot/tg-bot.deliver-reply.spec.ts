@@ -24,13 +24,14 @@ function makeService(sendMessage: jest.Mock) {
 }
 
 describe('TgBotService.deliverReplyText', () => {
-  it('успешная отправка — одно сообщение, цитатой на вопрос', async () => {
+  it('успешная отправка — одно сообщение, цитатой на вопрос, без превью ссылок', async () => {
     const send = jest.fn(async () => ({ message_id: 5 }));
     const { svc } = makeService(send);
 
     await svc.deliverReplyText(-100500, 42, 'ответ');
 
-    expect(send.mock.calls).toEqual([[-100500, 'ответ', { reply_to_message_id: 42 }]]);
+    // Превью — см. tg-bot.reply-links.spec.ts: адреса разделов в ответах.
+    expect(send.mock.calls).toEqual([[-100500, 'ответ', { reply_to_message_id: 42, link_preview_options: { is_disabled: true } }]]);
   });
 
   it('провал отправки: юзер получает уведомление вместо молчания', async () => {
