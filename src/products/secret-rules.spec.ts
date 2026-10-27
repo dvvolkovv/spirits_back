@@ -9,7 +9,7 @@ describe('правила ключей владельца — одно место
 
   it('тексты — дословно прежние тексты create()', () => {
     expect(secretsProblem({ 'A B': 'x' })).toEqual({ message: 'имя секрета "A B" не переменная окружения', field: 'A B' });
-    expect(secretsProblem({ ['K'.repeat(65)]: 'x' })).toEqual({ message: 'имя секрета длиннее 64 символов', field: 'K'.repeat(65) });
+    expect(secretsProblem({ ['K'.repeat(65)]: 'x' })).toEqual({ message: 'имя секрета длиннее 64 символов', field: 'KKKKKKKK…' });
     expect(secretsProblem({ PORT: 'x' })).toEqual({ message: 'имя секрета PORT занято платформой — назовите ключ иначе', field: 'PORT' });
     expect(secretsProblem({ A: '' })).toEqual({ message: 'секрет A: значение должно быть непустой строкой', field: 'A' });
     expect(secretsProblem({ A: 'ы'.repeat(SECRET_VALUE_MAX + 1) })).toEqual({ message: 'секрет A: значение длиннее 8192 символов', field: 'A' });
@@ -30,6 +30,40 @@ describe('правила ключей владельца — одно место
 
   it('пустое имя — отказ формы имени с field: "" (вызывающий проверяет field !== undefined, а не истинность)', () => {
     expect(secretsProblem({ '': 'x' })).toEqual({ message: 'имя секрета "" не переменная окружения', field: '' });
+  });
+
+  it('негодное имя — в тексте и field только обрезком: в поле имени вставляют само значение', () => {
+    const pasted = 'sk-live-abcdefghijklmnopqrstuvwxyz0123456789';
+    const p = secretsProblem({ [pasted]: 'x' })!;
+    expect(p).toEqual({ message: 'имя секрета "sk-live-…" не переменная окружения', field: 'sk-live-…' });
+    expect(JSON.stringify(p)).not.toContain('abcdefgh');
+    // Слишком длинное, но годное по форме — тоже обрезком.
+    expect(secretsProblem({ ['A'.repeat(64) + 'SECRETTAIL']: 'x' })!.field).toBe('AAAAAAAA…');
+    // Управляющие и невидимые — «?»: перенос строки в тексте отказа не нужен.
+    expect(secretsProblem({ ['A' + String.fromCharCode(10) + 'B']: 'x' })).toEqual({
+      message: 'имя секрета "A?B" не переменная окружения', field: 'A?B',
+    });
+  });
+
+  it('обрезок не длиннее 40 символов ни в тексте, ни в field — даже из кавычек и обратных косых', () => {
+    const p = secretsProblem({ ['"\\'.repeat(100)]: 'x' })!;
+    expect(p.field.length).toBeLessThanOrEqual(40);
+    expect(p.message.length - 'имя секрета  не переменная окружения'.length).toBeLessThanOrEqual(40);
+    // Суррогатная пара не рвётся пополам.
+    expect(secretsProblem({ ['😀'.repeat(20)]: 'x' })!.field).toBe('😀'.repeat(8) + '…');
+  });
+
+  it('годное по форме, но занятое имя — целиком, как было', () => {
+    expect(secretsProblem({ DOTENV_CONFIG_PATH: 'x' })).toEqual({
+      message: 'имя секрета DOTENV_CONFIG_PATH занято платформой — назовите ключ иначе', field: 'DOTENV_CONFIG_PATH',
+    });
+  });
+
+  it('нулевой байт в значении — отказ: агент машины такое значение отвергает', () => {
+    const NUL = String.fromCharCode(0);
+    expect(secretsProblem({ A: 'a' + NUL + 'b' })).toEqual({ message: 'секрет A: значение содержит недопустимый символ', field: 'A' });
+    // Перенос строки — законен (PEM).
+    expect(secretsProblem({ A: 'a' + String.fromCharCode(10) + 'b' })).toBeNull();
   });
 
   it('не-строка вместо значения — отказ, а не String()', () => {

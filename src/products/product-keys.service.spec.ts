@@ -7,8 +7,18 @@ const PID = 'aaaaaaaa-bbbb-4ccc-8ddd-000000000001';
 const AID = 'aaaaaaaa-bbbb-4ccc-8ddd-0000000000a1';
 const CANARY = 'КАНАРЕЙКА-значение-ключа-7f3e';
 
-function harness(o: { status?: string; kind?: 'site' | 'bot'; block?: string | null; old?: Record<string, string>; turns?: number; jobs?: number; taken?: boolean; queued?: number; tgBotId?: number | null } = {}) {
+function harness(o: {
+  status?: string; kind?: 'site' | 'bot'; block?: string | null; old?: Record<string, string>; turns?: number; jobs?: number;
+  taken?: boolean; queued?: number; tgBotId?: number | null;
+  /** Продукта нет уже к отправке. */
+  gone?: boolean;
+  /** Каким продукт читается ПОСЛЕ записи задания (перечитывание при queued 0). */
+  after?: { status?: string; block?: string | null; gone?: boolean };
+  insertError?: any;
+  busyError?: any;
+} = {}) {
   const calls: Array<{ sql: string; params: any[] }> = [];
+  let inserted = false;
   const product = {
     id: PID, name: 'Бот', slug: 'bot-x', kind: o.kind ?? 'bot', status: o.status ?? 'running',
     block_reason: o.block ?? null, tg_bot_id: o.tgBotId ?? 111,
@@ -20,9 +30,21 @@ function harness(o: { status?: string; kind?: 'site' | 'bot'; block?: string | n
       // Запись задания — ПЕРВОЙ: в её SQL есть и `FROM product_turns t`
       // (условие «нет живой правки»), и ветка проверки занятости ниже
       // перехватила бы её.
-      if (sql.includes('INSERT INTO product_provision_jobs')) return { rows: [{ queued: o.queued ?? 1 }] };
-      if (sql.includes('FROM products') && sql.includes('user_id = $2')) return { rows: [product] };
-      if (sql.includes('FROM product_turns')) return { rows: [{ turns: o.turns ?? 0, jobs: o.jobs ?? 0 }] };
+      if (sql.includes('INSERT INTO product_provision_jobs')) {
+        inserted = true;
+        if (o.insertError) throw o.insertError;
+        return { rows: [{ queued: o.queued ?? 1 }] };
+      }
+      if (sql.includes('FROM products') && sql.includes('user_id = $2')) {
+        if (inserted && o.after) {
+          return o.after.gone ? { rows: [] } : { rows: [{ ...product, status: o.after.status ?? product.status, block_reason: o.after.block ?? product.block_reason }] };
+        }
+        return { rows: o.gone ? [] : [product] };
+      }
+      if (sql.includes('FROM product_turns')) {
+        if (o.busyError) throw o.busyError;
+        return { rows: [{ turns: o.turns ?? 0, jobs: o.jobs ?? 0 }] };
+      }
       if (sql.includes('tg_bot_id = $1')) return { rows: o.taken ? [{ x: 1 }] : [] };
       return { rows: [] };
     }),
@@ -189,12 +211,80 @@ describe('карточка ключей: отправить', () => {
     expect(await send(b, { NEW_KEY: 'n' })).toMatchObject({ ok: false, reason: 'busy' });
   });
 
-  it('новый BOT_TOKEN: getMe; Telegram не принял — поправимо, поле BOT_TOKEN', async () => {
+  it('новый BOT_TOKEN: getMe; Telegram не принял — поправимо, поле BOT_TOKEN, задания нет', async () => {
     const h = harness();
     (h.svc as any).checkBot = jest.fn(async () => ({ ok: false, reason: 'rejected' }));
     const r = await send(h, { BOT_TOKEN: '222222:TEST-new' });
     expect(r).toMatchObject({ ok: false, reason: 'bad_token' });
     expect(h.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ field: 'BOT_TOKEN', reason: 'bad_token' }));
+    expect(h.calls.some((c) => c.sql.includes('INSERT INTO product_provision_jobs'))).toBe(false);
+  });
+
+  it('новый токен ТОГО ЖЕ бота (перевыпуск в @BotFather) — без tgBotId и без проверки занятости', async () => {
+    const h = harness();
+    (h.svc as any).checkBot = jest.fn(async () => ({ ok: true, id: 111, username: 'same_bot' }));
+    expect(await send(h, { BOT_TOKEN: '111111:TEST-reissued' })).toEqual({ ok: true, queued: true });
+    expect(h.calls.some((c) => c.sql.includes('tg_bot_id = $1'))).toBe(false);
+    const ins = h.calls.find((c) => c.sql.includes('INSERT INTO product_provision_jobs'))!;
+    expect(JSON.parse(ins.params[2])).not.toHaveProperty('tgBotId');
+  });
+
+  it('сайт может убрать BOT_TOKEN — Telegram не спрашивается', async () => {
+    const h = harness({ kind: 'site', old: { BOT_TOKEN: '111111:TEST-old', A: 'a' } });
+    expect(await send(h, {}, ['BOT_TOKEN'])).toEqual({ ok: true, queued: true });
+    expect((h.svc as any).checkBot).not.toHaveBeenCalled();
+    const ins = h.calls.find((c) => c.sql.includes('INSERT INTO product_provision_jobs'))!;
+    expect(secrets.decrypt(ins.params[1], PID)).toEqual({ A: 'a' });
+    expect(JSON.parse(ins.params[2])).toMatchObject({ newKeyNames: ['A'], removedNames: ['BOT_TOKEN'] });
+  });
+
+  it('у сайта BOT_TOKEN — обычный ключ: значение не обрезается и Telegram не спрашивается', async () => {
+    const h = harness({ kind: 'site', old: { A: 'a' } });
+    expect(await send(h, { BOT_TOKEN: '  как есть  ' })).toEqual({ ok: true, queued: true });
+    expect((h.svc as any).checkBot).not.toHaveBeenCalled();
+    const ins = h.calls.find((c) => c.sql.includes('INSERT INTO product_provision_jobs'))!;
+    expect(secrets.decrypt(ins.params[1], PID)).toEqual({ A: 'a', BOT_TOKEN: '  как есть  ' });
+  });
+
+  it('пустой итоговый набор — коробка всё равно пишется (от {}), newKeyNames []: NULL в продукте ставит отчёт', async () => {
+    const h = harness({ kind: 'site', old: { A: 'a' } });
+    expect(await send(h, {}, ['A'])).toEqual({ ok: true, queued: true });
+    const ins = h.calls.find((c) => c.sql.includes('INSERT INTO product_provision_jobs'))!;
+    expect(Buffer.isBuffer(ins.params[1])).toBe(true);
+    expect(secrets.decrypt(ins.params[1], PID)).toEqual({});
+    expect(JSON.parse(ins.params[2])).toEqual({ newKeyNames: [], removedNames: ['A'], changedNames: [] });
+  });
+
+  it('отправка без перемены значений не отбивается — пересоздание доставляет OWNER_TG_ID и чистит занятые имена', async () => {
+    const h = harness({ old: { BOT_TOKEN: '111111:TEST-old', OWNER_TG_ID: '42', OLD_KEY: 'o' } });
+    expect(await send(h, { OLD_KEY: 'o' })).toEqual({ ok: true, queued: true });
+    const ins = h.calls.find((c) => c.sql.includes('INSERT INTO product_provision_jobs'))!;
+    expect(JSON.parse(ins.params[2])).toEqual({ newKeyNames: ['BOT_TOKEN', 'OLD_KEY'], removedNames: [], changedNames: [] });
+  });
+
+  it('негодное имя не возвращается целиком ни в error, ни в field — ни в set, ни в remove', async () => {
+    const pasted = 'sk-live-abcdefghijklmnopqrstuvwxyz';
+    const a = harness();
+    expect(await send(a, { [pasted]: 'x' })).toMatchObject({ ok: false, reason: 'bad_input' });
+    expect(a.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ field: 'sk-live-…' }));
+    const b = harness();
+    expect(await send(b, {}, [pasted])).toMatchObject({ ok: false, reason: 'bad_input' });
+    expect(b.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ field: 'sk-live-…' }));
+    const c = harness();
+    expect(await send(c, { [pasted]: 42 })).toMatchObject({ ok: false, reason: 'bad_input' });
+    expect(c.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ field: 'sk-live-…' }));
+    const d = harness();
+    expect(await send(d, { [pasted]: 'x' }, [pasted])).toMatchObject({ ok: false, reason: 'bad_input' });
+    for (const h of [a, b, c, d]) {
+      expect(JSON.stringify(h.actions.release.mock.calls)).not.toContain('abcdefgh');
+    }
+  });
+
+  it('нулевой байт в значении — поправимо (bad_input), задания нет', async () => {
+    const h = harness();
+    expect(await send(h, { NEW_KEY: 'a' + String.fromCharCode(0) + 'b' })).toMatchObject({ ok: false, reason: 'bad_input' });
+    expect(h.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ field: 'NEW_KEY' }));
+    expect(h.calls.some((c) => c.sql.includes('INSERT INTO product_provision_jobs'))).toBe(false);
   });
 
   it('Telegram не ответил — своя причина token_unchecked: «попробуйте через минуту», а не «не принял»', async () => {
@@ -210,9 +300,11 @@ describe('карточка ключей: отправить', () => {
     expect(ins.sql).toMatch(/NOT EXISTS \(SELECT 1 FROM product_turns t/);
   });
 
-  it('новый BOT_TOKEN другого бота, который уже в живом продукте, — поправимо', async () => {
+  it('новый BOT_TOKEN другого бота, который уже в живом продукте, — поправимо, задания нет', async () => {
     const h = harness({ taken: true });
     expect(await send(h, { BOT_TOKEN: '222222:TEST-new' })).toMatchObject({ ok: false, reason: 'bot_in_use' });
+    expect(h.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ field: 'BOT_TOKEN', reason: 'bot_in_use' }));
+    expect(h.calls.some((c) => c.sql.includes('INSERT INTO product_provision_jobs'))).toBe(false);
   });
 
   it('новый BOT_TOKEN свободного бота — tgBotId в payload, токен без пробелов по краям', async () => {
@@ -236,11 +328,40 @@ describe('карточка ключей: отправить', () => {
     expect(h.actions.finish).toHaveBeenCalledWith(AID, 'failed', expect.objectContaining({ error: expect.any(String) }));
   });
 
-  it('продукт сменил состояние между проверкой и записью — failed, коробки нет', async () => {
+  it('задание не встало, а продукт жив — значит, встала правка: поправимо (busy_turn), коробки нет', async () => {
     const h = harness({ queued: 0 });
-    const r = await send(h, { NEW_KEY: 'n' });
-    expect(r).toMatchObject({ ok: false, reason: 'state_changed' });
-    expect(h.actions.finish).toHaveBeenCalledWith(AID, 'failed', expect.any(Object));
+    expect(await send(h, { NEW_KEY: 'n' })).toMatchObject({ ok: false, reason: 'busy_turn' });
+    expect(h.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ reason: 'busy_turn' }));
+    expect(h.actions.finish).not.toHaveBeenCalled();
+    // Перечитан тот же продукт тем же владельцем.
+    const reads = h.calls.filter((c) => c.sql.includes('FROM products') && c.sql.includes('user_id = $2'));
+    expect(reads).toHaveLength(2);
+    expect(reads[1].params).toEqual([PID, 'u1']);
+  });
+
+  it.each([
+    [{ status: 'sleeping' }, 'sleeping'],
+    [{ block: 'нарушение' }, 'blocked'],
+    [{ gone: true }, 'gone'],
+  ])('задание не встало, продукт перечитан как %j — failed своей причиной (%s)', async (after, reason) => {
+    const h = harness({ queued: 0, after });
+    expect(await send(h, { NEW_KEY: 'n' })).toMatchObject({ ok: false, reason });
+    expect(h.actions.finish).toHaveBeenCalledWith(AID, 'failed', expect.objectContaining({ reason }));
+    expect(h.actions.release).not.toHaveBeenCalled();
+  });
+
+  it('задание другого вида встало между проверкой и записью (23505 one_active) — busy, карточка снова ждёт', async () => {
+    const h = harness({ insertError: Object.assign(new Error('duplicate key'), { code: '23505', constraint: 'product_provision_jobs_one_active' }) });
+    expect(await send(h, { NEW_KEY: 'n' })).toMatchObject({ ok: false, reason: 'busy' });
+    expect(h.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ reason: 'busy' }));
+    expect(h.actions.finish).not.toHaveBeenCalled();
+  });
+
+  it('продукта уже нет к отправке — failed (gone), задания нет', async () => {
+    const h = harness({ gone: true });
+    expect(await send(h, { NEW_KEY: 'n' })).toMatchObject({ ok: false, reason: 'gone' });
+    expect(h.actions.finish).toHaveBeenCalledWith(AID, 'failed', expect.objectContaining({ reason: 'gone' }));
+    expect(h.calls.some((c) => c.sql.includes('INSERT INTO product_provision_jobs'))).toBe(false);
   });
 
   it('чужая, закрытая или просроченная карточка — not_pending, база не трогается', async () => {
@@ -250,7 +371,15 @@ describe('карточка ключей: отправить', () => {
     expect(h.calls).toHaveLength(0);
   });
 
-  it('ошибка между claim и исходом — карточка снова ждёт с reason failed; текст SyntaxError в лог не идёт', async () => {
+  it('карточка другого вида — возвращается в ожидание как была, not_pending, база не трогается', async () => {
+    const h = harness();
+    h.actions.claim.mockResolvedValueOnce({ id: AID, user_id: 'u1', product_id: PID, kind: 'delete', status: 'working', channel: 'web', payload: {}, result: { error: 'прежнее' } } as any);
+    expect(await send(h, { NEW_KEY: 'n' })).toMatchObject({ ok: false, reason: 'not_pending' });
+    expect(h.actions.release).toHaveBeenCalledWith(AID, { error: 'прежнее' });
+    expect(h.calls).toHaveLength(0);
+  });
+
+  it('коробка продукта не читается при отправке — failed («напишите в поддержку»), а не повтор; SyntaxError в лог не идёт', async () => {
     const h = harness();
     const logs = captureLogs(h.svc);
     const spy = jest.spyOn(secrets, 'decrypt').mockImplementationOnce(() => {
@@ -261,6 +390,16 @@ describe('карточка ключей: отправить', () => {
     } finally {
       spy.mockRestore();
     }
+    expect(h.actions.finish).toHaveBeenCalledWith(AID, 'failed', expect.objectContaining({ reason: 'failed', error: expect.stringMatching(/поддержку/) }));
+    expect(h.actions.release).not.toHaveBeenCalled();
+    expect(logs.join('\n')).toContain(PID);
+    expect(logs.join('\n')).not.toContain(CANARY);
+  });
+
+  it('ошибка между claim и исходом — карточка снова ждёт с reason failed; текст SyntaxError в лог не идёт', async () => {
+    const h = harness({ busyError: new SyntaxError(`Unexpected token in JSON at position 3: "${CANARY}"`) });
+    const logs = captureLogs(h.svc);
+    expect(await send(h, { NEW_KEY: 'n' })).toMatchObject({ ok: false, reason: 'failed' });
     expect(h.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ error: expect.any(String), reason: 'failed' }));
     expect(logs.join('\n')).not.toContain(CANARY);
   });
