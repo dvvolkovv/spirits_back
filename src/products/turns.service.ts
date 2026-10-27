@@ -123,6 +123,25 @@ export const BLOCKED_REFUSAL =
   'Продукт остановлен администратором — правки не принимаются. ' +
   'Пополнение здесь не поможет: напишите нам, если это ошибка.';
 
+/**
+ * Отказ правке, пока меняются ключи продукта (задание rekey в очереди или
+ * идёт). Смена ключей ПЕРЕСОЗДАЁТ контейнер, а раннер живёт внутри него:
+ * поставленная сейчас правка была бы убита посреди хода молча, а
+ * выдача rekey ждала бы её конца (claimJob) — то есть правка и ключи
+ * загораживали бы друг друга до сборщика. 409, а не 402: деньги тут ни при
+ * чём, кабинет показывает текст сервера (см. BLOCKED_REFUSAL).
+ *
+ * У claimNext (ниже) своя, более узкая страховка от того же сценария: он не
+ * выдаёт ход, пока rekey продукта 'running' (не 'queued' — иначе ход и rekey
+ * ждали бы друг друга, и сборщик снял бы уже идущий rekey как зависший).
+ * Этот отказ сверху не избыточен рядом с ней: без него постановка хода
+ * прошла бы, пока rekey ещё только 'queued', и ход попросту выполнился бы
+ * ПЕРВЫМ — до того, как rekey доберётся до 'running' и claimNext начнёт его
+ * отбивать. REKEY_REFUSAL закрывает это раньше, при самой постановке, а не
+ * надеется, что ход не успеет.
+ */
+export const REKEY_REFUSAL = 'Сейчас меняются ключи продукта — правку можно поставить через пару минут.';
+
 @Injectable()
 export class TurnsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TurnsService.name);
@@ -306,6 +325,16 @@ export class TurnsService implements OnModuleInit, OnModuleDestroy {
       throw new ConflictException('Продукт сейчас недоступен для правок');
     }
 
+    // После статусов (у спящего и погашенного — свои тексты) и ДО баланса:
+    // пополнение смену ключей не ускорит. Отдельным запросом, а не полем
+    // SELECT статуса: тот же запрос читают мок-спеки модуля по подстроке.
+    const rekey = await this.pg.query(
+      `SELECT 1 FROM product_provision_jobs
+        WHERE product_id = $1 AND kind = 'rekey' AND status IN ('queued','running') LIMIT 1`,
+      [input.productId],
+    );
+    if (rekey.rows.length) throw new ConflictException(REKEY_REFUSAL);
+
     // Порог тот же, что в чате с ассистентами: balance <= 0 запрещает ход.
     // Ход — это реальный запуск claude -p на VM, то есть живые деньги; при
     // нехватке deductTokens спишет сколько есть и запишет в лог «не хватило
@@ -395,6 +424,21 @@ export class TurnsService implements OnModuleInit, OnModuleDestroy {
             JOIN products p ON p.id = t.product_id
            WHERE t.product_id = $1 AND t.status = 'queued'
              AND p.status = 'running' AND p.archived_at IS NULL
+             -- Страховка от хода, вставленного в окно между проверкой
+             -- REKEY_REFUSAL в enqueue и его собственным INSERT (TOCTOU —
+             -- там нет лока). Такой ход всё равно попал бы в 'queued' уже
+             -- при активном rekey, и без этого условия его забрал бы СТАРЫЙ
+             -- раннер прямо в момент пересоздания контейнера — ход умер бы
+             -- молча, раннер живёт внутри самого контейнера.
+             --
+             -- Только 'running', не 'queued': rekey, который сам ещё не
+             -- выдан агенту, не должен ждать ход, а ход — его; иначе они
+             -- загораживали бы друг друга, пока сборщик не снимет один из
+             -- двух (а снял бы он скорее всего rekey как зависший).
+             AND NOT EXISTS (
+               SELECT 1 FROM product_provision_jobs j
+                WHERE j.product_id = p.id AND j.kind = 'rekey' AND j.status = 'running'
+             )
            -- ORDER BY здесь страховка, а не работающая логика: частичный
            -- уникальный индекс из Task 1 не допускает больше одной строки в
            -- ('queued','running') на продукт, значит сортировать нечего.

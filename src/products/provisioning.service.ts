@@ -14,7 +14,9 @@ import { AGENT_OUTDATED_MARKER } from './domain-name';
 import { HostsService } from './hosts.service';
 import { LimitsService } from './limits.service';
 import { SecretsService } from './secrets.service';
+import { secretsProblem } from './secret-rules';
 import { FREE_MONTH_PRODUCTS, freeMonthCountedJobSql, RentService } from './rent.service';
+import { PURGE_FAILED_SAY, REKEY_FAILED_SAY, REKEY_UNKNOWN_SAY } from './product-actions.service';
 
 export type ProductKind = 'site' | 'bot';
 
@@ -52,8 +54,10 @@ export interface CreateInput {
  * `product_provision_jobs.kind` (004_rent.sql): разойдутся — сервер начнёт
  * отдавать вид, которого агент не знает, и получит честный отказ на каждом
  * задании.
+ *
+ * rekey и purge — очередь 2, словарь в 004 расширен миграцией очереди 2.
  */
-export type JobKind = 'provision' | 'sleep' | 'wake' | 'domain';
+export type JobKind = 'provision' | 'sleep' | 'wake' | 'domain' | 'rekey' | 'purge';
 
 /**
  * Задание, выданное агенту хоста. Единственное место, где открытый
@@ -123,6 +127,25 @@ export interface ClaimedJob {
    * promoteReady ещё не перевёл) — прокси: его конфиг уже прокси.
    */
   vhostMode: 'proxy' | 'asleep';
+  /**
+   * Смена ключей (rekey): имена старых ключей владельца, которых нет в новом
+   * наборе. Новый набор — в `secrets`, расшифрован из коробки карточки
+   * (product_actions.secrets_box). У прочих видов ключа нет.
+   */
+  dropNames?: string[];
+  /**
+   * Telegram владельца — только боту, только у provision и rekey. Уходит в
+   * окружение `OWNER_TG_ID`. Привязка есть — значение (цифры); привязки нет
+   * ИЛИ чтение привязки отказало — поля нет вовсе, переменная не трогается.
+   *
+   * Пустую строку (снять переменную) сервер НЕ присылает, хотя агент её
+   * понимает (задача 7, не используется отсюда): отвязка Telegram в кабинете
+   * строку tg_user_identities не удаляет, поэтому «привязки нет» почти всегда
+   * означало бы «владелец её вовсе не заводил» — и пустая строка молча
+   * снимала бы OWNER_TG_ID, поставленный руками у продукта, заведённого до
+   * очереди 2 (решение контроллера по ревью задачи 9).
+   */
+  ownerTgId?: string;
 }
 
 // Дефис только внутри. Регексп из плана (/^[a-z0-9-]{2,40}$/) пропускал '-rf'
@@ -136,48 +159,10 @@ export interface ClaimedJob {
 // ошибки).
 export const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
 
-// Имена секретов становятся переменными окружения контейнера. 'A B' и 'A=1'
-// там либо теряются, либо подменяют соседнюю переменную — в зависимости от
-// того, как агент соберёт env-файл.
-const SECRET_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-// Потолки набора секретов. Без них десять мегабайт уезжают в шифротекст, в
-// строку продукта, в тело задания и дальше в env контейнера — ограничение на
-// размер окружения процесса живёт уже в ядре хоста (ARG_MAX), и упрётся в него
-// не наш код, а запуск продукта, то есть отказ будет виден на чужой машине и
-// без объяснения.
-//
-// 8 КиБ на значение — с запасом под приватный ключ в PEM (RSA-4096 около
-// 3.2 КиБ) и JSON сервис-аккаунта; 64 имени — с запасом под всё, что видели у
-// живых продуктов; 64 символа на имя — предел разумного для переменной
-// окружения.
-const SECRET_NAME_MAX = 64;
-const SECRET_VALUE_MAX = 8192;
-const SECRET_COUNT_MAX = 64;
-
-// Занятые имена — копия списка агента хоста (`isReservedEnvName` в
-// product-runner/src/host/provision.ts, там же объяснение каждого имени) и
-// формы кабинета (spirits_front, src/components/products/secretNames.ts).
-// Разъехаться им нельзя. Пока проверка жила только на хосте, имя вроде PORT
-// сервер принимал, продукт записывался, а заведение падало в failed уже на
-// машине продуктов — с текстом, которого человек на своём экране не видит.
-const RESERVED_SECRET_NAMES = [
-  'LINKEON_URL', 'RUNNER_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'PRODUCT_START_SCRIPT',
-  'CHECKOUT_PATH', 'CLAUDE_BIN', 'PORT', 'HOME', 'PATH', 'NODE_OPTIONS',
-  'SHELL', 'USER', 'BASH_ENV', 'ENV', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
-  'POLL_INTERVAL_MS', 'TURN_TIMEOUT_MS', 'POLL_TIMEOUT_MS', 'REQUEST_TIMEOUT_MS',
-];
-const RESERVED_SECRET_PREFIXES = [
-  'ANTHROPIC_', 'CLAUDE_', 'NODE_', 'NPM_CONFIG_', 'LD_', 'GIT_', 'PM2_', 'SSL_', 'DOTENV_',
-];
-const RESERVED_SECRET_EXCEPTIONS = ['NODE_ENV'];
-
-/** Без учёта регистра: `https_proxy` читают так же, как `HTTPS_PROXY`. */
-export function isReservedSecretName(name: string): boolean {
-  const upper = name.toUpperCase();
-  if (RESERVED_SECRET_EXCEPTIONS.includes(upper)) return false;
-  return RESERVED_SECRET_NAMES.includes(upper) || RESERVED_SECRET_PREFIXES.some((p) => upper.startsWith(p));
-}
+// Правила ключей (форма имени, потолки, занятые имена) живут в
+// secret-rules.ts — их зовут и заведение, и смена ключей (очередь 2).
+// Реэкспорт — ради прежних импортов и комментариев, ссылающихся сюда.
+export { isReservedSecretName } from './secret-rules';
 
 // Путь ВНУТРИ контейнера продукта, а не на хосте: раннер живёт внутри
 // контейнера (агент провижининга — снаружи), и чекаут там у всех продуктов
@@ -270,6 +255,41 @@ const HEARTBEAT_FRESH_MS = 2 * 60 * 1000;
  * ложится в карточку продукта со своими ожиданиями длины.
  */
 export const DOMAIN_ERROR_MAX = 1000;
+
+/**
+ * Признаки отказа смены ключей, после которого продукт может не отвечать и
+ * повтор не поможет (rekey_unknown — «напишите в поддержку», logger.error):
+ *   - «НА ХОСТЕ ОСТАЛОСЬ:» — describeFailure агента перед остатками;
+ *   - «НЕИЗВЕСТНО» — срок агента (overdue) и очередь по слагу (notStarted:
+ *     эта смена хост не трогала, но прежняя, брошенная по сроку, ещё идёт);
+ *   - «откат не удался» — откат rekey.ts;
+ *   - «от прерванной смены ключей» — на хосте остался <слаг>__rekey: эта смена
+ *     ничего не тронула, но какой контейнер несёт подтверждённые ключи, по
+ *     хосту не понять, и каждый повтор откажет так же — разбор руками;
+ *   - «не запущен (спит или прервана» — контейнер продукта стоит, хотя база
+ *     считает его работающим: продукт и так не отвечает.
+ * Тексты — дословно из product-runner/src/host/rekey.ts и index.ts; их сверяет
+ * с ЭТОЙ строкой (читая файл) product-runner/src/host/rekey-report-markers.spec.ts,
+ * поэтому форма строки — одна строка «const REKEY_UNKNOWN_RE = /…/;».
+ * Регистр важен и флага i нет: «неизвестный вид задания» старого агента (хост
+ * не тронут, продукт на старых ключах) сюда попадать не должен.
+ */
+const REKEY_UNKNOWN_RE = /НА ХОСТЕ ОСТАЛОСЬ|НЕИЗВЕСТНО|откат не удался|от прерванной смены ключей|не запущен \(спит или прервана/;
+
+/**
+ * Причина отказа задания rekey, когда коробку ключей карточки не удалось
+ * расшифровать при выдаче. Без значений и без текста исключения: машину
+ * никто не трогал, и человеку важно ровно это.
+ */
+const REKEY_BOX_UNREADABLE = 'коробка ключей не читается — ключи не менялись';
+
+/**
+ * Чем стирание заменяет свободный текст продукта, который нельзя обнулить
+ * (product_turns.prompt — NOT NULL) или чьё «было/не было» значимо для
+ * истории (result, error). Числа, статусы и время остаются: по ним считаются
+ * деньги и история машины.
+ */
+export const PURGED_TEXT = '[стёрто]';
 
 /**
  * Подрезка до DOMAIN_ERROR_MAX по КОДОВЫМ ТОЧКАМ, а не по UTF-16: `slice`
@@ -545,29 +565,8 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     // «провижининг сорвался» без причины. Пустая строка доезжает до
     // контейнера переменной без значения: бот читает это как «токена нет» и
     // не стартует, тоже молча.
-    const entries = Object.entries(input.secrets ?? {});
-    if (entries.length > SECRET_COUNT_MAX) {
-      throw new BadRequestException(`секретов больше ${SECRET_COUNT_MAX}`);
-    }
-    for (const [name, value] of entries) {
-      if (!SECRET_NAME_RE.test(name)) {
-        throw new BadRequestException(`имя секрета ${JSON.stringify(name)} не переменная окружения`);
-      }
-      if (name.length > SECRET_NAME_MAX) {
-        throw new BadRequestException(`имя секрета длиннее ${SECRET_NAME_MAX} символов`);
-      }
-      if (isReservedSecretName(name)) {
-        throw new BadRequestException(`имя секрета ${name} занято платформой — назовите ключ иначе`);
-      }
-      if (typeof value !== 'string' || value === '') {
-        throw new BadRequestException(`секрет ${name}: значение должно быть непустой строкой`);
-      }
-      // Длина проверяется ПОСЛЕ типа: у не-строки .length либо отсутствует,
-      // либо означает что-то другое (у массива — число элементов).
-      if (value.length > SECRET_VALUE_MAX) {
-        throw new BadRequestException(`секрет ${name}: значение длиннее ${SECRET_VALUE_MAX} символов`);
-      }
-    }
+    const problem = secretsProblem(input.secrets ?? {});
+    if (problem) throw new BadRequestException(problem.message);
 
     // ТРИ ПРОВЕРКИ ПО БАЗЕ, И ПОРЯДОК МЕЖДУ НИМИ ОСОЗНАННЫЙ: СНАЧАЛА ТО, ЧЕГО
     // НЕ ПОЧИНИТЬ ФОРМОЙ.
@@ -900,6 +899,10 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
    * погашенного. Режим его конфига (прокси или заглушка) и имена считает этот
    * же оператор — см. ClaimedJob.customNames и vhostMode.
    *
+   * Смена ключей (rekey) — работающему, с коробкой ключей в своей карточке
+   * (action_id) и без идущей правки; стирание (purge) — удалённому после
+   * purge_after. Удалённому, кроме сна, выдаётся только стирание.
+   *
    * ## ТОКЕН ПОВОРАЧИВАЕТСЯ ТОЛЬКО НА ЗАВЕДЕНИИ
    *
    * `issued` берёт только `kind = 'provision'`. Раннер живёт ВНУТРИ
@@ -982,7 +985,7 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                             -- SKIP LOCKED и отбор строго по 'queued' ниже не
                             -- меняются (сторож — «очередь читается ТОЛЬКО по
                             -- queued», provisioning.job.spec.ts).
-                            AND (p.archived_at IS NULL OR (j.kind = 'sleep' AND p.purged_at IS NULL))
+                            AND (p.archived_at IS NULL OR (j.kind IN ('sleep','purge') AND p.purged_at IS NULL))
                             -- Метка машины. Условие внутри EXISTS, то есть
                             -- ВНУТРИ отбора, а не поверх него: наложенное
                             -- снаружи (на claimed или на итоговый SELECT), оно
@@ -1024,6 +1027,23 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                                   -- у погашенного можно, выпустить нельзя
                                   -- (это сторожит DomainsService.tryIssue).
                                   WHEN 'domain' THEN p.status IN ('running','degraded','sleeping','blocked')
+                                  -- Смена ключей (очередь 2): только работающему, только с
+                                  -- коробкой ключей в карточке и только без идущей правки —
+                                  -- пересоздание контейнера убило бы ход молча.
+                                  WHEN 'rekey' THEN p.status IN ('running','degraded')
+                                                 -- product_id и kind — не только id: j.action_id
+                                                 -- может указывать на карточку, которую подменили
+                                                 -- (FK допускает это) или чей вид не 'keys' — такую
+                                                 -- коробку расшифровывать и слать агенту нельзя.
+                                                 AND EXISTS (SELECT 1 FROM product_actions ka
+                                                              WHERE ka.id = j.action_id AND ka.product_id = p.id
+                                                                AND ka.kind = 'keys' AND ka.status = 'working'
+                                                                AND ka.secrets_box IS NOT NULL)
+                                                 AND NOT EXISTS (SELECT 1 FROM product_turns t
+                                                                  WHERE t.product_id = p.id AND t.status IN ('queued','running'))
+                                  -- Стирание: удалённому и только после срока возврата —
+                                  -- возврат мог успеть между постановкой и выдачей.
+                                  WHEN 'purge' THEN p.status = 'archived' AND p.purge_after <= now()
                                   ELSE p.status = 'sleeping'
                                 END)
            ORDER BY j.created_at ASC
@@ -1033,7 +1053,7 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
           UPDATE product_provision_jobs
              SET status = 'running', started_at = now()
            WHERE id IN (SELECT id FROM picked)
-          RETURNING id, product_id, kind
+          RETURNING id, product_id, kind, action_id
        ), issued AS (
           UPDATE products
              SET runner_token_hash = $1
@@ -1042,7 +1062,8 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
        )
        SELECT c.id AS job_id, c.kind AS job_kind, p.id AS product_id, p.slug AS slug,
               p.name AS name, p.kind AS kind, p.port AS port, p.secrets_encrypted AS box,
-              (i.id IS NOT NULL) AS token_issued
+              (i.id IS NOT NULL) AS token_issued,
+              p.user_id AS user_id, a.secrets_box AS rekey_box, a.payload AS rekey_payload
               -- Имена — в каждом задании (см. ClaimedJob.customNames), режим —
               -- для задания domain. Само выдаваемое задание domain режим не
               -- сбивает: wokenSql пропускает этот вид, и «проснулся» решает
@@ -1078,7 +1099,8 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                      ELSE 'proxy' END AS vhost_mode
          FROM claimed c
          JOIN products p ON p.id = c.product_id
-         LEFT JOIN issued i ON i.id = c.product_id`,
+         LEFT JOIN issued i ON i.id = c.product_id
+         LEFT JOIN product_actions a ON a.id = c.action_id`,
       [hash, hostId],
     );
     // Пустая очередь — обычное состояние: агент опрашивает нас в цикле.
@@ -1095,6 +1117,66 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     if (!row) return null;
 
     const jobKind = row.job_kind as JobKind;
+
+    // ДВА аргумента: коробка привязана к продукту через AAD. Признак
+    // «секретов нет» — NULL (в secrets_encrypted у заведения, задача 3 кладёт
+    // именно его, а не коробку от {}; в secrets_box у карточки ключей —
+    // когда набор пуст), и читаться он обязан ДО вызова: decrypt на null —
+    // сырой TypeError.
+    //
+    // Сну и пробуждению секреты не нужны вовсе: контейнер уже собран, и
+    // переменные окружения в нём. Расшифровывать их здесь значило бы гонять
+    // секреты клиента по сети на каждое усыпление ни за чем. Заведению —
+    // из продукта, смене ключей — из коробки её карточки (тот же AAD — id
+    // продукта). Прочим видам ключи не нужны и не расшифровываются вовсе.
+    let secrets: Record<string, string> = {};
+    if (jobKind === 'provision' && row.box) secrets = this.secrets.decrypt(row.box, row.product_id);
+    if (jobKind === 'rekey' && row.rekey_box) {
+      try {
+        secrets = this.secrets.decrypt(row.rekey_box, row.product_id);
+      } catch (e: any) {
+        // Испорченная коробка или сменённый ключ шифрования. Задание уже
+        // 'running': брось мы здесь, агент получил бы 500, через десять минут
+        // сборщик снял бы задание, а подметальщик журнала записал бы
+        // rekey_unknown («продукт может не отвечать») — ложная тревога, машину
+        // никто не трогал, и все десять минут правки получали бы 409. Поэтому
+        // задание закрывается отказом тем же путём, что отчёт агента
+        // (карточка — rekey_failed, коробка стёрта), а агенту — «заданий нет».
+        //
+        // Текст исключения — только в лог и только не SyntaxError: сообщение
+        // JSON.parse в новых Node цитирует кусок разбираемого текста, то есть
+        // расшифрованные значения.
+        const why = e instanceof SyntaxError ? 'тело коробки не JSON' : String(e?.message ?? e).slice(0, 200);
+        // Закрытие — лучшим усилием: его отказ (обрыв с базой) не повод
+        // отдавать агенту 500 — задание всё равно не выдаётся, его снимет
+        // сборщик. «Закрыто отказом» — только после того, как закрылось.
+        try {
+          await this.completeRekeyJob(row.job_id, { ok: false, error: REKEY_BOX_UNREADABLE });
+          this.logger.error(`смена ключей ${row.slug}: коробка ключей карточки не расшифровывается (${why}) — задание ${row.job_id} закрыто отказом, ключи не менялись`);
+        } catch (e2: any) {
+          this.logger.error(
+            `смена ключей ${row.slug}: коробка ключей карточки не расшифровывается (${why}), и задание ${row.job_id} ` +
+              `закрыть не удалось (${String(e2?.message ?? e2).slice(0, 200)}) — его снимет сборщик; ключи не менялись`,
+          );
+        }
+        return null;
+      }
+    }
+    const dropNames = jobKind === 'rekey'
+      ? (Array.isArray(row.rekey_payload?.removedNames) ? row.rekey_payload.removedNames.filter((n: unknown) => typeof n === 'string') : [])
+      : undefined;
+    // Отдельным чтением ПОСЛЕ выдачи и лучшим усилием: таблица привязок — из
+    // модуля tg-bot, и её отказ не должен ронять опрос агента (задание уже
+    // забрано, токен выпущен — 500 здесь оставил бы его до сборщика).
+    // Три исхода чтения: id — поставить; null — привязки нет; undefined —
+    // прочитать не удалось. ОБА последних исхода — поле отсутствует, ключ не
+    // трогается: пустая строка (снять переменную) здесь не шлётся вовсе —
+    // см. комментарий у ClaimedJob.ownerTgId про отвязку в кабинете.
+    const owner = row.kind === 'bot' && (jobKind === 'provision' || jobKind === 'rekey')
+      ? await this.ownerTgIdOf(row.user_id)
+      : undefined;
+    const ownerTgId = typeof owner === 'string' ? owner : undefined;
+
     return {
       jobId: row.job_id,
       productId: row.product_id,
@@ -1111,18 +1193,34 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       // виду значило бы обещать токен, которого могло не оказаться: условие
       // выпуска живёт в SQL, и разъехаться эти два места обязаны молча.
       ...(row.token_issued ? { runnerToken } : {}),
-      // ДВА аргумента: коробка привязана к продукту через AAD. Признак
-      // «секретов нет» — NULL в secrets_encrypted (задача 3 кладёт именно
-      // его, а не коробку от {}), и читаться он обязан ДО вызова: decrypt на
-      // null — сырой TypeError.
-      //
-      // Сну и пробуждению секреты не нужны вовсе: контейнер уже собран, и
-      // переменные окружения в нём. Расшифровывать их здесь значило бы гонять
-      // секреты клиента по сети на каждое усыпление ни за чем.
-      secrets: jobKind === 'provision' && row.box ? this.secrets.decrypt(row.box, row.product_id) : {},
+      secrets,
       customNames: Array.isArray(row.custom_names) ? row.custom_names : [],
       vhostMode: row.vhost_mode === 'asleep' ? 'asleep' : 'proxy',
+      ...(dropNames !== undefined ? { dropNames } : {}),
+      ...(ownerTgId !== undefined ? { ownerTgId } : {}),
     };
+  }
+
+  /**
+   * Telegram владельца для OWNER_TG_ID — лучшим усилием. Таблица чужого
+   * модуля (tg-bot/migrations/001_tg_bot_schema.sql): её отказ — строка в лог
+   * и бот без OWNER_TG_ID (каркас тогда сам подскажет chat_id на /start), а
+   * не сорванная выдача. Возвращает id; null — привязки нет; undefined —
+   * прочитать не удалось (тогда ничего не ставится и не снимается).
+   */
+  private async ownerTgIdOf(userId: string): Promise<string | null | undefined> {
+    try {
+      const r = await this.pg.query(
+        `SELECT tg_user_id::text AS id FROM tg_user_identities WHERE linkeon_user_id = $1 LIMIT 1`,
+        [userId],
+      );
+      const id = r.rows?.[0]?.id;
+      if (id === undefined) return null;
+      return typeof id === 'string' && /^\d{1,20}$/.test(id) ? id : undefined;
+    } catch (e: any) {
+      this.logger.warn(`OWNER_TG_ID не прочитан (${e?.message}) — переменная не ставится и не снимается`);
+      return undefined;
+    }
   }
 
   /**
@@ -1168,7 +1266,13 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
     // выглядел бы в карточке как «ошибка заведения». Вид задания неизменен,
     // так что отдельное чтение гонки не открывает.
     const kindRow = await this.pg.query(`SELECT kind FROM product_provision_jobs WHERE id = $1`, [jobId]);
-    if (kindRow.rows[0]?.kind === 'domain') return this.completeDomainJob(jobId, result);
+    const jobKind = kindRow.rows[0]?.kind;
+    if (jobKind === 'domain') return this.completeDomainJob(jobId, result);
+    // Смена ключей и стирание продукт по общему пути НЕ трогают: отказ
+    // смены ключей — не поломка заведения (продукт работает со старыми
+    // ключами), отказ стирания — не повод выводить удалённый из архива.
+    if (jobKind === 'rekey') return this.completeRekeyJob(jobId, result);
+    if (jobKind === 'purge') return this.completePurgeJob(jobId, result);
 
     if (result.ok) {
       // Статус продукта здесь НЕ меняется. Перевод в running делает
@@ -1365,6 +1469,235 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
       [jobId, result.ok, error, outdated, detachError],
     );
     if (!r.rows[0].closed) this.logger.warn(`отчёт по незапущенному заданию domain ${jobId} — домен не тронут`);
+  }
+
+  /**
+   * Отчёт по смене ключей. ОДИН оператор, замок тот же (`status = 'running'`):
+   * закрыть задание, при успехе перенести коробку карточки в продукт, закрыть
+   * карточку и стереть коробку в любом исходе. Двумя операторами смерть
+   * процесса между ними оставила бы ключи в базе одними, а в контейнере —
+   * другими. Порядок блокировок — задание, потом продукт, как у completeJob.
+   *
+   * Коробка переносится КАК ЕСТЬ: она зашифрована тем же SecretsService с тем
+   * же AAD (id продукта), что и products.secrets_encrypted. Явно пустой новый
+   * набор (newKeyNames = []) — NULL, как у заведения без ключей: decrypt на
+   * коробке от {} никто не зовёт, признак «ключей нет» — NULL (см. create()).
+   * Сравнение с '[]', а не длина списка с подстановкой пустого: карточка без
+   * newKeyNames (форма payload разошлась) иначе стёрла бы ключи продукта в
+   * базе при новых в контейнере, а jsonb_array_length на не-списке уронил бы
+   * весь оператор — и задание висело бы до сборщика.
+   *
+   * CTE act читает карточку из снимка ДО этого же оператора, поэтому коробка в
+   * swapped — ещё не стёртая finished. Порядок CTE тут не защита — защита в
+   * снимке, одном на весь оператор.
+   */
+  private async completeRekeyJob(jobId: string, result: { ok: boolean; error?: string }) {
+    const unknown = !result.ok && REKEY_UNKNOWN_RE.test(result.error ?? '');
+    const r = await this.pg.query(
+      `WITH closed AS (
+          UPDATE product_provision_jobs
+             SET status = CASE WHEN $2::boolean THEN 'done' ELSE 'failed' END,
+                 error = CASE WHEN $2::boolean THEN NULL ELSE $3::text END,
+                 finished_at = now()
+           WHERE id = $1 AND status = 'running' AND kind = 'rekey'
+          RETURNING product_id, action_id
+       ), act AS (
+          SELECT a.id, a.secrets_box, a.payload FROM product_actions a JOIN closed c ON a.id = c.action_id
+       ), swapped AS (
+          UPDATE products p
+             SET secrets_encrypted = CASE
+                   WHEN act.payload->'newKeyNames' = '[]'::jsonb THEN NULL
+                   ELSE act.secrets_box END
+            FROM closed, act
+           WHERE $2::boolean AND p.id = closed.product_id AND act.secrets_box IS NOT NULL
+          RETURNING p.id
+       ), finished AS (
+          UPDATE product_actions a
+             SET status = CASE WHEN $2::boolean THEN 'done' ELSE 'failed' END,
+                 secrets_box = NULL,
+                 result = CASE WHEN $2::boolean
+                               THEN jsonb_build_object('keyNames', COALESCE(a.payload->'newKeyNames', '[]'::jsonb))
+                               ELSE jsonb_build_object('error', $4::text, 'reason', $5::text) END,
+                 resolved_at = now()
+            FROM closed WHERE a.id = closed.action_id AND a.status = 'working'
+          RETURNING a.payload->>'tgBotId' AS tg_bot_id
+       )
+       SELECT (SELECT count(*) FROM closed)::int AS closed,
+              (SELECT count(*) FROM swapped)::int AS swapped,
+              (SELECT product_id FROM closed) AS product_id,
+              (SELECT slug FROM products WHERE id = (SELECT product_id FROM closed)) AS slug,
+              (SELECT tg_bot_id FROM finished) AS tg_bot_id`,
+      [jobId, result.ok, result.error ?? 'без причины', unknown ? REKEY_UNKNOWN_SAY : REKEY_FAILED_SAY, unknown ? 'rekey_unknown' : 'rekey_failed'],
+    );
+    const row = r.rows[0];
+    if (!row?.closed) {
+      // Задание уже не 'running'. Кто его закрыл — решает, тревога это или
+      // рутина: сам этот путь (повтор POST-а после обрыва связи — 'done' при
+      // успехе) или кто-то снаружи (блокировка, сборщик по сроку, удаление).
+      const was = await this.pg
+        .query(
+          `SELECT j.status, j.error, p.slug FROM product_provision_jobs j JOIN products p ON p.id = j.product_id WHERE j.id = $1`,
+          [jobId],
+        )
+        .then((q: any) => q.rows[0])
+        .catch(() => undefined);
+      const who = was?.slug ?? '?';
+      // Тот же отказ, которым этот же путь задание и закрыл, — повтор POST-а,
+      // а не новость: тревога о нём уже прозвучала при первом отчёте.
+      const sameFailure = !result.ok && was?.status === 'failed' && was?.error === (result.error ?? 'без причины');
+      if (result.ok) {
+        if (was?.status === 'done') {
+          this.logger.warn(`повторный отчёт об успехе по заданию rekey ${jobId} (${who}) — уже закрыто, ключи не тронуты`);
+        } else {
+          // ПОЗДНИЙ УСПЕХ: задание сняли раньше (блокировка, сборщик по
+          // сроку), а агент дошёл до конца. База не меняется (замок
+          // status='running'), но правда расходится: в контейнере НОВЫЕ ключи,
+          // в базе — прежние. Громко: это разбор руками, а не рутина.
+          this.logger.error(
+            `смена ключей ${who}: агент применил новые ключи после того, как задание ${jobId} сняли — ` +
+              'в контейнере новые ключи, в базе прежние, сверить руками',
+          );
+        }
+      } else if (sameFailure) {
+        this.logger.warn(`повторный отчёт об отказе по заданию rekey ${jobId} (${who}) — уже закрыто им же`);
+      } else if (unknown) {
+        // Поздний отказ с неизвестным исходом: задание сняли снаружи
+        // (сборщик, блокировка, удаление), но продукт после такого отказа
+        // может не отвечать — громко.
+        this.logger.error(
+          `смена ключей ${who}: поздний отчёт по снятому заданию ${jobId} — исход на машине неизвестен, ` +
+            `продукт может не отвечать — ${String(result.error ?? '').slice(0, 300)}`,
+        );
+      } else {
+        this.logger.warn(`отчёт по незапущенному заданию rekey ${jobId} — ключи не тронуты`);
+      }
+      return;
+    }
+    if (unknown) {
+      this.logger.error(`смена ключей ${row.slug}: исход на машине неизвестен, продукт может не отвечать — ${String(result.error ?? '').slice(0, 300)}`);
+    }
+    if (result.ok && !row.swapped) {
+      // Задание закрыто успехом, а коробки нет (карточку удалили — FK
+      // SET NULL — или её коробку стёрли раньше срока): переносить нечего.
+      // Тот же разлад, что у позднего успеха, — громко.
+      this.logger.error(
+        `смена ключей ${row.slug}: агент применил новые ключи, а коробки карточки задания ${jobId} уже нет — ` +
+          'в контейнере новые ключи, в базе прежние, сверить руками',
+      );
+    }
+    // Метка бота — отдельным оператором и лучшим усилием: частичный UNIQUE
+    // products_tg_bot_live мог занять другой живой продукт между проверкой в
+    // карточке и этим отчётом. Отказ уронил бы оператор выше целиком — и с
+    // ним перенос уже применённых в контейнере ключей.
+    if (result.ok && typeof row.tg_bot_id === 'string' && /^\d{1,20}$/.test(row.tg_bot_id)) {
+      try {
+        await this.pg.query(
+          // Без archived_at IS NULL: у удалённого tg_bot_id обязан быть
+          // правдой (в контейнере уже новый токен), иначе возврат продукта
+          // сверял бы занятость бота по прежнему номеру. Частичный UNIQUE
+          // products_tg_bot_live архивных строк не видит — столкнуться тут
+          // может только живой продукт.
+          `UPDATE products SET tg_bot_id = $2, tg_bot_checked_at = now() WHERE id = $1`,
+          [row.product_id, row.tg_bot_id],
+        );
+      } catch (e: any) {
+        if (e?.code === '23505' && e?.constraint === 'products_tg_bot_live') {
+          this.logger.warn(`смена ключей продукта ${row.product_id}: новый бот уже числится за другим живым продуктом — tg_bot_id не обновлён`);
+        } else {
+          this.logger.error(`смена ключей продукта ${row.product_id}: tg_bot_id не записан (${e?.message})`);
+        }
+      }
+    }
+  }
+
+  /**
+   * Отчёт по стиранию. Строка продукта НЕ удаляется (спека, «Открыто на
+   * очередь 2»): задания продукта удалились бы каскадом, и счёт бесплатных
+   * месяцев (freeMonthCountedJobSql) сбросился бы — «удалить, дождаться
+   * стирания, завести снова» снова давало бы бесплатный месяц. Стираются
+   * ключи и первая правка, снимается строка своего домена (освобождает
+   * домен для других: индекс занятости product_domains_occupied), пишется
+   * строка журнала. Резервную копию стирает обход (product-purge.service).
+   *
+   * Свободный текст продукта стирается тем же оператором (решение контролёра
+   * по ревью задачи 10 — «стирается насовсем»): prompt, result и error правок
+   * (product_turns) заменяются меткой PURGED_TEXT, первая правка из payload
+   * карточек продукта (product_actions.payload->'prompt') и коробки ключей
+   * карточек (secrets_box) удаляются. Числа
+   * (tokens_spent), статусы, sha и время остаются: по ним — деньги и история.
+   *
+   * Помечается «стёртым» только удалённый (archived_at не NULL): выдача purge
+   * другим невозможна (claimJob), но отчёт об успехе по живому продукту не
+   * должен стирать его — это тревога, а не стирание, и журнал «стёрт» тогда не
+   * пишется.
+   * tg_bot_id и port не трогаются: не секрет, нужны журналу; частичный
+   * индекс products_tg_bot_live архивных и так не видит.
+   *
+   * Один оператор и тот же замок `status = 'running'`; порядок блокировок —
+   * задание, потом продукт. Журнал в исходе отказа — без сырой причины агента
+   * (она в задании).
+   */
+  private async completePurgeJob(jobId: string, result: { ok: boolean; error?: string }) {
+    const r = await this.pg.query(
+      `WITH closed AS (
+          UPDATE product_provision_jobs
+             SET status = CASE WHEN $2::boolean THEN 'done' ELSE 'failed' END,
+                 error = CASE WHEN $2::boolean THEN NULL ELSE $3::text END,
+                 finished_at = now()
+           WHERE id = $1 AND status = 'running' AND kind = 'purge'
+          RETURNING product_id
+       ), purged AS (
+          UPDATE products p
+             SET purged_at = now(), secrets_encrypted = NULL, first_prompt = NULL, first_prompt_channel = NULL
+            FROM closed
+           WHERE $2::boolean AND p.id = closed.product_id AND p.archived_at IS NOT NULL AND p.purged_at IS NULL
+          RETURNING p.id
+       ), domains AS (
+          DELETE FROM product_domains d USING purged WHERE d.product_id = purged.id
+          RETURNING d.product_id
+       ), turns AS (
+          UPDATE product_turns t
+             SET prompt = $5::text,
+                 result = CASE WHEN t.result IS NULL THEN NULL ELSE $5::text END,
+                 error = CASE WHEN t.error IS NULL THEN NULL ELSE $5::text END
+            FROM purged WHERE t.product_id = purged.id
+          RETURNING t.id
+       ), prompts AS (
+          -- И коробки ключей карточек (secrets_box — тоже ключи): тот же
+          -- набор, что стирает обход после срока (product-purge.service.ts,
+          -- wipeExpired), — стёртый продукт не держит ключей нигде.
+          UPDATE product_actions a
+             SET payload = a.payload - 'prompt', secrets_box = NULL
+            FROM purged WHERE a.product_id = purged.id AND (a.payload ? 'prompt' OR a.secrets_box IS NOT NULL)
+          RETURNING a.id
+       ), logged AS (
+          INSERT INTO product_actions (user_id, product_id, kind, status, channel, payload, result, attached_at, resolved_at)
+          SELECT p.user_id, p.id, 'purge',
+                 CASE WHEN $2::boolean THEN 'done' ELSE 'failed' END, 'system',
+                 jsonb_build_object('name', p.name, 'slug', p.slug),
+                 CASE WHEN $2::boolean THEN '{}'::jsonb ELSE jsonb_build_object('error', $4::text) END,
+                 now(), now()
+            FROM products p JOIN closed c ON c.product_id = p.id
+           -- Успех пишется в журнал, только если продукт правда помечен
+           -- стёртым; отказ — всегда.
+           WHERE NOT $2::boolean OR EXISTS (SELECT 1 FROM purged)
+          RETURNING id
+       )
+       SELECT (SELECT count(*) FROM closed)::int AS closed,
+              (SELECT count(*) FROM purged)::int AS purged,
+              (SELECT slug FROM products WHERE id = (SELECT product_id FROM closed)) AS slug`,
+      [jobId, result.ok, result.error ?? 'без причины', PURGE_FAILED_SAY, PURGED_TEXT],
+    );
+    const row = r.rows[0];
+    if (!row?.closed) {
+      this.logger.warn(`отчёт по незапущенному заданию purge ${jobId} — продукт не тронут`);
+      return;
+    }
+    if (result.ok && !row.purged) {
+      // Агент стёр продукт на машине, а в базе он не удалён (или уже стёрт):
+      // строка не тронута, но машина и база расходятся — разбор руками.
+      this.logger.error(`стирание ${row.slug}: агент отчитался об успехе, но продукт не удалён или уже стёрт — в базе ничего не стёрто, сверить руками`);
+    }
   }
 
   /**
@@ -1800,6 +2133,12 @@ export class ProvisioningService implements OnModuleInit, OnModuleDestroy {
                 -- сохраняют прежний текст.
                 error = CASE kind
                           WHEN 'domain' THEN 'срок задания своего домена истёк (${PROVISION_DEADLINE_MIN} мин)'
+                          -- Карточку зависшей смены ключей закрывает
+                          -- подметальщик журнала: задание failed, исход не
+                          -- записан. Продукт ниже не трогается — он не в
+                          -- provisioning (работающий или удалённый).
+                          WHEN 'rekey' THEN 'срок смены ключей истёк (${PROVISION_DEADLINE_MIN} мин)'
+                          WHEN 'purge' THEN 'срок стирания истёк (${PROVISION_DEADLINE_MIN} мин)'
                           ELSE 'срок заведения истёк (${PROVISION_DEADLINE_MIN} мин)'
                         END,
                 finished_at = now()

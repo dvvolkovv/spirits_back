@@ -64,4 +64,15 @@ maybe('журнал действий против живого Postgres', () => 
     expect((await svc.get('u1', id))!.status).toBe('done');
     expect(await svc.cancel('u1', id)).toBe(false);
   });
+
+  it('release с дополнением payload дописывает поля поверх прежних, без него payload не трогает', async () => {
+    const { id } = await svc.open({ userId: 'u1', productId: null, kind: 'keys', channel: 'web', turn: null, payload: { name: 'Бот', keyNames: ['A', 'B'] } });
+    await svc.claim('u1', id, 'chat');
+    await svc.release(id, { error: 'x', reason: 'bad_input' });
+    expect((await pool.query('SELECT payload FROM product_actions WHERE id = $1', [id])).rows[0].payload).toEqual({ name: 'Бот', keyNames: ['A', 'B'] });
+    await svc.claim('u1', id, 'chat');
+    await svc.release(id, { error: 'x', reason: 'bad_shape' }, { keyNames: ['A'] });
+    expect((await pool.query('SELECT payload FROM product_actions WHERE id = $1', [id])).rows[0].payload).toEqual({ name: 'Бот', keyNames: ['A'] });
+    expect((await svc.get('u1', id))!.status).toBe('pending');
+  });
 });

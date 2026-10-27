@@ -109,7 +109,7 @@
  * Ровно этот случай и разбирает подчистка.
  */
 import { execFile } from 'child_process';
-import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
+import { lstat, mkdir, readFile, realpath, rm, stat, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { promisify } from 'util';
 import { ProductKind, skeletonFor } from './skeleton';
@@ -171,6 +171,11 @@ const RESERVED_ENV = [
   'TURN_TIMEOUT_MS',
   'POLL_TIMEOUT_MS',
   'REQUEST_TIMEOUT_MS',
+  // Владелец бота (очередь 2): Telegram-идентификатор, который кладёт сама
+  // платформа из привязки владельца. Ключ клиента с этим именем подменил бы,
+  // кому бот отвечает данными владельца. Третья копия — secret-rules.ts на
+  // сервере и secretNames.ts в кабинете.
+  'OWNER_TG_ID',
 ];
 
 /**
@@ -193,7 +198,7 @@ const RESERVED_ENV_EXCEPTIONS = ['NODE_ENV'];
  * читают в нижнем регистре так же, как в верхнем.
  *
  * ТРИ КОПИИ ОДНОЙ ПРОВЕРКИ. Эта — последний рубеж перед `docker run -e`.
- * Вторая — `isReservedSecretName` на сервере (`src/products/provisioning.service.ts`):
+ * Вторая — `isReservedSecretName` на сервере (`src/products/secret-rules.ts`):
  * она отвечает 400 до записи продукта. Третья — в форме кабинета
  * (`spirits_front/src/components/products/secretNames.ts`), ради объяснения на
  * месте. Разъехаться им нельзя: имя, которое сервер принял, а хост отверг,
@@ -279,7 +284,17 @@ export interface ProvisionJob {
    * бы домен клиента. Необязательное — сервер старше агента поля не шлёт.
    */
   customNames?: string[];
+  /**
+   * Telegram-идентификатор владельца — только у бота и только при привязанном
+   * Telegram (очередь 2). Уходит в окружение `OWNER_TG_ID`, чтобы бот узнавал
+   * владельца сам, без chat_id в тексте правки. Необязательное: сервер старше
+   * агента поля не шлёт, а у владельца без привязки его нет.
+   */
+  ownerTgId?: string;
 }
+
+/** Что лежит по пути без перехода по ссылке (ProvisionDeps.pathKind). */
+export type PathKind = 'absent' | 'dir' | 'symlink' | 'other';
 
 /** Запуск программы БЕЗ шелла. Возвращает stdout. */
 export type Run = (argv: string[], opts?: { cwd?: string }) => Promise<string>;
@@ -291,9 +306,37 @@ export interface ProvisionDeps {
   /** Есть ли что-то по пути — файл, каталог, что угодно. */
   exists: (path: string) => Promise<boolean>;
   removeDir: (dir: string) => Promise<void>;
+  /**
+   * Настоящий путь, как `fs.realpath`: ссылки раскрыты, `..` снят; нет пути —
+   * отказ с кодом ENOENT. Нужен стиранию (purge.ts): удаляется ровно
+   * `/srv/products/<слаг>`, а не то, куда ведёт ссылка по дороге. Обязательное,
+   * а не с умолчанием на fs: забытое в сборке зависимостей, оно молча шло бы
+   * по настоящей ФС — и из тестов на симуляторе тоже.
+   */
+  realpath: (path: string) => Promise<string>;
+  /**
+   * Что лежит по пути, как `lstat`, — БЕЗ перехода по ссылке: битая ссылка —
+   * это 'symlink', а не «ничего нет». Нет пути — 'absent'; любой другой отказ
+   * (ENOTDIR, EACCES) — исключение. Нужен стиранию (purge.ts): «каталога уже
+   * нет» и «на месте каталога ссылка» обязаны различаться. Обязательное — по
+   * той же причине, что realpath.
+   */
+  pathKind: (path: string) => Promise<PathKind>;
   readHostSecret: (path: string) => Promise<string>;
   /** Отвечает ли порт. Ожидание по факту вместо `sleep 12`. */
   waitPort: (port: number, timeoutMs: number) => Promise<boolean>;
+  /**
+   * Ответил ли продукт на /health ИЗНУТРИ контейнера (бот порта не публикует).
+   * Необязательное: по умолчанию — `docker exec … node -e` через этот же run
+   * (rekey.ts, waitInsideVia), подмена — только для тестов.
+   */
+  waitInside?: (slug: string, timeoutMs: number) => Promise<boolean>;
+  /**
+   * Пауза смены ключей перед повторным взглядом (rekey.ts): второй ответ
+   * /health нового контейнера и состояние старого после отката. По умолчанию
+   * 3 с — как `sleep 3` в do_restore product-image-roll.sh; ноль — в тестах.
+   */
+  settleMs?: number;
 
   productsDir?: string;
   image?: string;
@@ -311,7 +354,8 @@ export interface ProvisionDeps {
 /** Что успели создать — в порядке создания. Подчистка идёт по этому списку назад. */
 type Step = 'dir' | 'container' | 'vhost';
 
-function validateSecrets(raw: Record<string, string> | undefined): Array<[string, string]> {
+// Экспорт — ради rekey.ts и purge.ts: проверка одна на все хостовые шаги.
+export function validateSecrets(raw: Record<string, string> | undefined): Array<[string, string]> {
   const entries = Object.entries(raw ?? {});
   for (const [key, value] of entries) {
     if (!SECRET_KEY_RE.test(key)) {
@@ -334,6 +378,28 @@ function validateSecrets(raw: Record<string, string> | undefined): Array<[string
   return entries;
 }
 
+/** Идентификатор Telegram — целое число; 20 знаков с запасом над bigint. */
+const OWNER_TG_ID_RE = /^\d{1,20}$/;
+
+/**
+ * OWNER_TG_ID для этого задания или undefined. Только боту: сайту владелец
+ * в Telegram ни к чему, а лишняя переменная в общем окружении — лишнее, что
+ * может прочитать код продукта. Не число — отказ: зовётся до первого
+ * изменения на хосте. Экспорт — ради смены ключей (rekey.ts).
+ *
+ * Пустая строка — то же, что нет поля. Ею сервер говорит «привязки нет»:
+ * смена ключей по ней СНИМАЕТ переменную, и эта ветка живёт в rekey.ts
+ * отдельно, до вызова сюда. Заведению снимать нечего, а отказ на '' сорвал
+ * бы заведение каждого бота, стоит серверу прислать её и при заведении.
+ */
+export function ownerTgIdFor(job: { kind: ProductKind; ownerTgId?: string | null }): string | undefined {
+  if (job.kind !== 'bot' || job.ownerTgId === undefined || job.ownerTgId === null || job.ownerTgId === '') return undefined;
+  if (typeof job.ownerTgId !== 'string' || !OWNER_TG_ID_RE.test(job.ownerTgId)) {
+    throw new Error(`OWNER_TG_ID не число: ${JSON.stringify(job.ownerTgId)}`);
+  }
+  return job.ownerTgId;
+}
+
 function dockerRunArgv(
   job: ProvisionJob,
   dir: string,
@@ -341,6 +407,7 @@ function dockerRunArgv(
   oauthToken: string,
   secrets: Array<[string, string]>,
   cfg: { image: string; linkeonUrl: string },
+  ownerTgId?: string,
 ): string[] {
   const argv = [
     'docker',
@@ -363,11 +430,13 @@ function dockerRunArgv(
   argv.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${oauthToken}`);
   argv.push('-e', `PRODUCT_START_SCRIPT=${START_SCRIPT}`);
   argv.push('-e', `PORT=${CONTAINER_PORT}`);
+  if (ownerTgId !== undefined) argv.push('-e', `OWNER_TG_ID=${ownerTgId}`);
   argv.push('--memory=1g', '--cpus=1', cfg.image);
   return argv;
 }
 
-async function containerTaken(deps: ProvisionDeps, slug: string): Promise<boolean> {
+// Экспорт — ради rekey.ts и purge.ts: проверка одна на все хостовые шаги.
+export async function containerTaken(deps: ProvisionDeps, slug: string): Promise<boolean> {
   // `-a`: остановленный контейнер с этим именем так же занимает имя, и
   // `docker run` на него споткнётся.
   const out = await deps.run([
@@ -475,6 +544,7 @@ export async function provision(job: ProvisionJob, deps: ProvisionDeps): Promise
     throw new Error('в задании нет токена раннера — продукт не получит ни одной задачи');
   }
   const secrets = validateSecrets(job.secrets);
+  const ownerTgId = ownerTgIdFor(job);
   // Имена проверяются здесь же, до первого изменения: иначе мусорное имя
   // всплыло бы только на product-vhost — после `docker run`, ценой подчистки
   // исправного контейнера.
@@ -529,7 +599,7 @@ export async function provision(job: ProvisionJob, deps: ProvisionDeps): Promise
     phase(`чекаут ${dir} создан`);
 
     done.push('container');
-    await deps.run(dockerRunArgv(job, dir, port, oauthToken, secrets, cfg));
+    await deps.run(dockerRunArgv(job, dir, port, oauthToken, secrets, cfg, ownerTgId));
     phase(`контейнер ${job.slug} поднят`);
 
     if (port !== undefined) {
@@ -620,7 +690,22 @@ export function hostDeps(overrides: Partial<ProvisionDeps> = {}): ProvisionDeps 
     },
 
     removeDir: async (dir: string) => {
+      // Ссылки внутри каталога (их может завести код продукта — каталог
+      // смонтирован в контейнер на запись) `rm` удаляет как ссылки и по ним не
+      // ходит: проверено на настоящей ФС в purge.spec.ts.
       await rm(dir, { recursive: true, force: true });
+    },
+
+    realpath: (path: string) => realpath(path),
+
+    pathKind: async (path: string) => {
+      try {
+        const st = await lstat(path);
+        return st.isSymbolicLink() ? 'symlink' : st.isDirectory() ? 'dir' : 'other';
+      } catch (e: any) {
+        if (e?.code === 'ENOENT') return 'absent';
+        throw e;
+      }
     },
 
     readHostSecret: async (path: string) => readFile(path, 'utf8'),

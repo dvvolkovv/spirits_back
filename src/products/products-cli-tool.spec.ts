@@ -195,6 +195,23 @@ describe('промпт CLI знает весь жизненный цикл пр�
     expect(PRODUCTS_CLI_PROMPT).toMatch(/Не говори «создал» или «удалил», пока status не вернёт done/);
   });
 
+  it('keys — карточкой; ключи в переписке не просить; удалённое стирается', () => {
+    expect(PRODUCTS_CLI_PROMPT).toContain('action: "keys"');
+    expect(PRODUCTS_CLI_PROMPT).toMatch(/Ключи в переписке не проси никогда/);
+    expect(PRODUCTS_CLI_PROMPT).toMatch(/выпустить новый[^.]*ввести его в карточку keys/);
+    expect(PRODUCTS_CLI_PROMPT).toMatch(/Не говори «ключи обновлены», пока status не вернёт done/);
+    expect(PRODUCTS_CLI_PROMPT).toMatch(/стирается насовсем/);
+  });
+
+  // Добавлено по ревью задачи 8 (27.10): каркас бота на /start без известного
+  // владельца подсказывает человеку его chat_id — ассистент обязан знать, что
+  // делать с этим числом, а не просто перескажет его молча.
+  it('chat_id от пользователя — правкой; после привязки Telegram бот узнаёт владельца сам', () => {
+    expect(PRODUCTS_CLI_PROMPT).toMatch(/владелец — chat_id N/);
+    expect(PRODUCTS_CLI_PROMPT).toMatch(/OWNER_TG_ID/);
+    expect(PRODUCTS_CLI_PROMPT).toMatch(/после следующей смены ключей/);
+  });
+
   it('условия — из констант аренды, предела и срока возврата', () => {
     expect(PRODUCTS_CLI_PROMPT).toContain(String(RENT_TOKENS).replace(/\B(?=(\d{3})+(?!\d))/g, ' '));
     expect(PRODUCTS_CLI_PROMPT).toContain(`не больше ${DEFAULT_MAX_PRODUCTS} продуктов`);

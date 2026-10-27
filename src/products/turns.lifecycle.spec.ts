@@ -80,6 +80,11 @@ describe('TurnsService.claimNext', () => {
     // входит: RunnerController его не читает, а неиспользуемое поле рано или
     // поздно начинают поддерживать просто потому, что оно есть.
     expect(sqlOf(calls)).toContain('RETURNING id, prompt, user_id, revert_to_sha');
+    // Ревью задачи 11: ход, вставленный в окно между проверкой
+    // REKEY_REFUSAL и своим INSERT, не должен забраться старым раннером,
+    // пока rekey продукта уже 'running' (но не 'queued' — см. докблок
+    // REKEY_REFUSAL про взаимное ожидание).
+    expect(sqlOf(calls)).toContain("j.kind = 'rekey' AND j.status = 'running'");
   });
 
   it('отдаёт null, когда очередь пуста', async () => {

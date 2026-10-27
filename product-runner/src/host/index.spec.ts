@@ -1,4 +1,5 @@
 import { createServer, IncomingMessage, ServerResponse } from 'http';
+import { realpath as fsRealpath } from 'fs/promises';
 import { AddressInfo } from 'net';
 import { HostApi, HostJob, JobReport, PollOutcome } from './api';
 import { DEFAULT_POLL_TIMEOUT_MS, HostConfig, loadConfig } from './config';
@@ -11,12 +12,15 @@ import {
   provisionOverrides,
   realDeps,
   redact,
+  runJob,
   tick,
 } from './index';
 import { FakeHost, deps as fakeDeps } from './fake-host';
 import { ProvisionDeps, hostDeps, provision as provisionReal } from './provision';
 import { SleepJob } from './sleep';
 import { DomainJob } from './domain';
+import { RekeyJob } from './rekey';
+import { PurgeJob } from './purge';
 
 const JOB: HostJob = {
   jobId: 'j-1',
@@ -47,6 +51,8 @@ function makeDeps(config: Partial<HostConfig> = {}) {
   // пришлось узнать у контейнера, и `{}` — это «узнавать не пришлось».
   const wakeProduct = jest.fn(async (_job: SleepJob): Promise<{ port?: number }> => ({}));
   const domain = jest.fn(async (_job: DomainJob): Promise<void> => undefined);
+  const rekey = jest.fn(async (_job: RekeyJob): Promise<void> => undefined);
+  const purge = jest.fn(async (_job: PurgeJob): Promise<void> => undefined);
   const sleepFn = jest.fn(async (_ms: number): Promise<unknown> => undefined);
   const logs: string[] = [];
 
@@ -57,12 +63,14 @@ function makeDeps(config: Partial<HostConfig> = {}) {
     sleepProduct,
     wakeProduct,
     domain,
+    rekey,
+    purge,
     sleep: sleepFn,
     log: (message: string) => {
       logs.push(message);
     },
   };
-  return { deps, poll, complete, provision, sleepProduct, wakeProduct, domain, sleep: sleepFn, logs };
+  return { deps, poll, complete, provision, sleepProduct, wakeProduct, domain, rekey, purge, sleep: sleepFn, logs };
 }
 
 /** Последний отчёт, доехавший до `complete`. */
@@ -1309,4 +1317,279 @@ describe('сроки развёртывания', () => {
 
     await expect(deps.run(['sleep', '10'])).rejects.toThrow(/сроку/);
   }, 5000);
+});
+
+// ---------------------------------------------------------------------------
+// Виды rekey и purge (очередь 2).
+// ---------------------------------------------------------------------------
+
+const REKEY_JOB: HostJob = {
+  ...JOB, kind: 'bot', jobKind: 'rekey', runnerToken: '', port: null,
+  secrets: { BOT_TOKEN: 'новый-секрет-бота' }, dropNames: ['OLD_KEY'], ownerTgId: '42',
+};
+const PURGE_JOB: HostJob = { ...JOB, jobKind: 'purge', runnerToken: '', secrets: {}, port: 8003 };
+
+describe('смена ключей и стирание (очередь 2)', () => {
+  it('оба вида агенту знакомы', () => {
+    expect(KNOWN_KINDS).toEqual(expect.arrayContaining(['rekey', 'purge']));
+  });
+
+  it('rekey: шагу уезжает выжимка — ключи, снимаемые имена, владелец; порта в отчёте нет', async () => {
+    const { deps, poll, provision, rekey, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: REKEY_JOB });
+
+    await tick(deps);
+
+    expect(provision).not.toHaveBeenCalled();
+    expect(rekey).toHaveBeenCalledWith({
+      slug: 'shop', kind: 'bot', secrets: { BOT_TOKEN: 'новый-секрет-бота' }, dropNames: ['OLD_KEY'], ownerTgId: '42',
+    });
+    expect(complete).toHaveBeenCalledWith('j-1', { ok: true });
+  });
+
+  it('purge: шагу — только слаг и форма', async () => {
+    const { deps, poll, purge, sleepProduct, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: PURGE_JOB });
+
+    await tick(deps);
+
+    expect(sleepProduct).not.toHaveBeenCalled();
+    expect(purge).toHaveBeenCalledWith({ slug: 'shop', kind: 'site' });
+    expect(complete).toHaveBeenCalledWith('j-1', { ok: true });
+  });
+
+  it('отказ смены ключей уходит на сервер без значений ключей', async () => {
+    const { deps, poll, rekey, complete } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: REKEY_JOB });
+    rekey.mockRejectedValue(new Error('ключи не применены: эхо новый-секрет-бота из docker'));
+
+    await tick(deps);
+
+    const report = lastReport(complete);
+    expect(report.ok).toBe(false);
+    expect(JSON.stringify(report)).not.toContain('новый-секрет-бота');
+    expect(JSON.stringify(report)).toMatch(/ключи не применены/);
+  });
+
+  it('срок смены ключей назван своими словами, а не «провижининг»', async () => {
+    const { deps, poll, rekey, complete } = makeDeps({ provisionTimeoutMs: 5 });
+    poll.mockResolvedValue({ ok: true, job: REKEY_JOB });
+    rekey.mockImplementation(() => new Promise<void>(() => {}));
+
+    await tick(deps);
+
+    const report = lastReport(complete) as { ok: false; error: string };
+    expect(report.error).toMatch(/смена ключей не уложилась/);
+    expect(report.error).toMatch(/__rekey/);
+  });
+
+  it('боевая сборка: фазы смены ключей маскируют её новые значения', async () => {
+    const logs: string[] = [];
+    let captured: ProvisionDeps | undefined;
+    const deps = realDeps(CONFIG, {
+      log: (m) => logs.push(m),
+      buildDeps: (overrides) => overrides as ProvisionDeps,
+      rekey: async (_job, d) => {
+        captured = d;
+      },
+    });
+    await deps.rekey({ slug: 'shop', kind: 'bot', secrets: { BOT_TOKEN: 'новый-секрет-бота' }, dropNames: [] });
+    captured!.onPhase!('docker сказал: новый-секрет-бота');
+    expect(logs.join('\n')).not.toContain('новый-секрет-бота');
+    expect(logs.join('\n')).toContain('***');
+  });
+
+  it('боевая сборка стирания получает настоящий realpath и pathKind, а не заглушку', async () => {
+    // Задача 6: purgeProduct отказывает без ProvisionDeps.realpath/pathKind.
+    // realDeps собирает их через build(provisionOverrides(...)) — по
+    // умолчанию это hostDeps(), где обе функции настоящие (fs/promises). Без
+    // этого стирание на машине отказывало бы на КАЖДОМ задании сразу после
+    // первой проверки пути — живым дефектом, который ничем не красится на
+    // моках, если их подменить заглушкой.
+    let captured: ProvisionDeps | undefined;
+    // buildDeps не переопределён: боевая сборка собирает их через hostDeps() —
+    // именно это и проверяется.
+    const deps = realDeps(CONFIG, {
+      log: () => {},
+      purge: async (_job, d) => {
+        captured = d;
+      },
+    });
+
+    await deps.purge({ slug: 'shop', kind: 'site' });
+
+    expect(captured!.realpath).toBeInstanceOf(Function);
+    expect(captured!.pathKind).toBeInstanceOf(Function);
+    // Сверка с РЕЗУЛЬТАТОМ fs.promises.realpath, а не с __filename буквально:
+    // путь до исходника теста может идти через симлинк (например, /tmp на
+    // macOS — это /private/tmp), и тогда настоящий realpath честно отличался
+    // бы от сырого __filename даже на настоящей ФС — заглушка здесь ни при
+    // чём, а тест был бы хрупким по чужой причине.
+    await expect(captured!.realpath(__filename)).resolves.toBe(await fsRealpath(__filename));
+    await expect(captured!.pathKind(__filename)).resolves.toBe('other');
+  });
+
+  it('работа на том же слаге ждёт брошенную по сроку предыдущую, а не пересекается с ней', async () => {
+    // Добавлено по ревью задачи 5: смена ключей, брошенная агентом по общему
+    // сроку задания, продолжается в том же процессе в фоне (hostDeps.run не
+    // отменяет уже запущенные шаги). Следующая работа агента над тем же
+    // слагом обязана ждать её окончания, а не исполняться поверх неё.
+    const { deps, poll, rekey, complete } = makeDeps({ provisionTimeoutMs: 10 });
+    let firstSettled = false;
+    rekey.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(() => {
+            firstSettled = true;
+            resolve();
+          }, 60);
+        }),
+    );
+    rekey.mockImplementationOnce(async () => {
+      expect(firstSettled).toBe(true);
+    });
+    poll.mockResolvedValueOnce({ ok: true, job: REKEY_JOB });
+    poll.mockResolvedValueOnce({ ok: true, job: { ...REKEY_JOB, jobId: 'j-2' } });
+
+    await tick(deps); // снято по сроку (10 мс): report об отказе, первая работа ещё жива в фоне
+    // Второму заданию хватит бюджета и дождаться первую (60 мс), и отработать
+    // самой: без очереди по слагу оно бы стартовало поверх первой немедленно.
+    deps.config.provisionTimeoutMs = 200;
+    await tick(deps);
+
+    expect(rekey).toHaveBeenCalledTimes(2);
+    expect(complete).toHaveBeenNthCalledWith(1, 'j-1', expect.objectContaining({ ok: false }));
+    expect(complete).toHaveBeenNthCalledWith(2, 'j-2', { ok: true });
+  });
+
+  it(
+    'у второго задания не хватает СВОЕГО бюджета — честный отказ «не началась», '
+      + 'а не поздний тихий запуск поверх первой работы',
+    async () => {
+      // ГЛАВНЫЙ ДЕФЕКТ РЕВЬЮ. Первая версия очереди запускала вторую работу,
+      // как только первая (брошенная по сроку, но живая в фоне) кончалась, —
+      // даже если вторая уже успела отчитаться отказом по СВОЕМУ бюджету. Для
+      // rekey это значило бы: сервер читает «K2 не уложилась, продукт на K0»,
+      // а K2 тем временем реально применяется на хосте — тихо, после отчёта.
+      const { deps, poll, rekey, complete } = makeDeps({ provisionTimeoutMs: 10 });
+      rekey.mockImplementationOnce(() => new Promise<void>((resolve) => setTimeout(resolve, 60)));
+      poll.mockResolvedValueOnce({ ok: true, job: REKEY_JOB });
+      poll.mockResolvedValueOnce({ ok: true, job: { ...REKEY_JOB, jobId: 'j-2' } });
+
+      await tick(deps); // первая: началась, брошена по сроку (10 мс), жива в фоне до 60 мс
+      await tick(deps); // вторая: тот же бюджет (10 мс) — не успевает даже дождаться очереди
+      // Даём первой реально кончиться (60 мс) и очереди слага «рассосаться»:
+      // если бы вторая всё же стартовала поверх отчёта об отказе, это
+      // случилось бы здесь.
+      await new Promise((r) => setTimeout(r, 100));
+
+      expect(rekey).toHaveBeenCalledTimes(1);
+      const second = lastReport(complete) as { ok: false; error: string };
+      expect(second.ok).toBe(false);
+      expect(second.error).toMatch(/не началась/);
+      expect(second.error).toContain('НЕИЗВЕСТНО');
+    },
+  );
+
+  it(
+    'ожидание в очереди ограничено своим сроком, а не общим бюджетом; другой слаг не ждёт вовсе',
+    async () => {
+      // Вторая половина того же дефекта: без отдельного срока ожидание в
+      // очереди наследовало бы общий бюджет СЛЕДУЮЩЕГО задания (в бою — до 8
+      // минут), а тик агента последователен (`loop` ждёт `tick` целиком) —
+      // значит ВСЯ машина продуктов, все слаги на ней, не опрашивались бы
+      // сервером все эти минуты из-за одного зависшего слага.
+      const { deps, poll, rekey, complete } = makeDeps({ provisionTimeoutMs: 10, queueWaitMs: 30 });
+      rekey.mockImplementationOnce(() => new Promise<void>(() => {})); // живёт в фоне бесконечно
+      rekey.mockImplementationOnce(async () => undefined); // для ДРУГОГО слага ниже
+
+      poll.mockResolvedValueOnce({ ok: true, job: REKEY_JOB }); // slug 'shop'
+      await tick(deps); // началась (began=true), брошена по СВОЕМУ бюджету (10 мс), жива в фоне навсегда
+
+      // У второго задания бюджет сделан БОЛЬШИМ нарочно: если бы решал он,
+      // тик пришлось бы ждать 10 секунд. Решает срок ожидания в очереди
+      // (queueWaitMs = 30 мс, не менялся) — оборот обязан кончиться заметно
+      // раньше и без единого реального докер-вызова.
+      deps.config.provisionTimeoutMs = 10_000;
+      poll.mockResolvedValueOnce({ ok: true, job: { ...REKEY_JOB, jobId: 'j-2' } }); // тот же 'shop'
+      const startedAt = Date.now();
+      await tick(deps);
+      expect(Date.now() - startedAt).toBeLessThan(1000);
+
+      expect(rekey).toHaveBeenCalledTimes(1); // вторая так и не началась
+      const second = lastReport(complete) as { ok: false; error: string };
+      expect(second.ok).toBe(false);
+      expect(second.error).toMatch(/не началась/);
+
+      // Третий тик — ДРУГОЙ слаг: очередь «shop» на него не действует вовсе,
+      // и агент не блокирован дольше срока ожидания предыдущего слага.
+      poll.mockResolvedValueOnce({ ok: true, job: { ...REKEY_JOB, jobId: 'j-3', slug: 'other' } });
+      const thirdStartedAt = Date.now();
+      await tick(deps);
+      expect(Date.now() - thirdStartedAt).toBeLessThan(1000);
+      expect(rekey).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it('работа на РАЗНЫХ слагах не ждёт друг друга', async () => {
+    const { deps, rekey } = makeDeps({ provisionTimeoutMs: 10 });
+    rekey.mockImplementationOnce(() => new Promise<void>(() => {})); // брошена по сроку, не отвечает вовсе
+    rekey.mockImplementationOnce(async () => undefined);
+
+    await runJob(REKEY_JOB, deps);
+    const second = await runJob({ ...REKEY_JOB, jobId: 'j-2', slug: 'other' }, deps);
+
+    expect(second.ok).toBe(true);
+    expect(rekey).toHaveBeenCalledTimes(2);
+  });
+
+  it('неизвестный вид проверяется ДО очереди по слагу — не ждёт зависшую работу на том же слаге', async () => {
+    // Иначе отказ «неизвестный вид», которому ничего не грозит (он вообще не
+    // трогает хост), ждал бы чужую, уже идущую работу того же слага — или,
+    // хуже, сам занял бы место в очереди и заставил бы СЛЕДУЮЩУЮ, настоящую
+    // работу этого слага ждать то, что никогда не исполнится.
+    const { deps, rekey } = makeDeps({ provisionTimeoutMs: 10 });
+    rekey.mockImplementation(() => new Promise<void>(() => {})); // навсегда занимает очередь слага 'shop'
+
+    // Ждём ЭТОТ оборот до конца (брошен по своему же сроку — 10 мс, со своим
+    // отчётом), а не навсегда: для теста важна не судьба job1, а то, что
+    // настоящая работа (мок `rekey`) осталась жить в очереди слага «shop» в
+    // фоне — так же, как при брошенной по сроку смене ключей.
+    await runJob(REKEY_JOB, deps);
+
+    const unknown: HostJob = { ...JOB, jobId: 'j-2', jobKind: 'нечто', slug: 'shop' };
+    const outcome = await Promise.race([
+      runJob(unknown, deps).then((r) => ({ settled: 'resolved' as const, r })),
+      new Promise<{ settled: 'timeout' }>((resolve) => setTimeout(() => resolve({ settled: 'timeout' }), 300)),
+    ]);
+
+    expect(outcome.settled).toBe('resolved');
+    if (outcome.settled === 'resolved') expect(outcome.r.ok).toBe(false);
+  });
+
+  it('ownerTgId="" уезжает в rekey как есть — это «снять», а не «не трогать»', async () => {
+    const { deps, poll, rekey } = makeDeps();
+    poll.mockResolvedValue({ ok: true, job: { ...REKEY_JOB, ownerTgId: '' } });
+
+    await tick(deps);
+
+    expect(rekey).toHaveBeenCalledWith(expect.objectContaining({ ownerTgId: '' }));
+  });
+
+  it('rekey без dropNames и secrets в задании — выжимке уезжают пустые значения, а не undefined', async () => {
+    const { deps, poll, rekey } = makeDeps();
+    // Сервер мог не прислать поля вовсе (сервер старше агента, или они
+    // попросту не нужны этой карточке) — симулируем это удалением, а не
+    // `undefined` в литерале: оно всё равно оставило бы ключ в объекте.
+    const bare = { ...REKEY_JOB } as Record<string, unknown>;
+    delete bare.secrets;
+    delete bare.dropNames;
+    poll.mockResolvedValue({ ok: true, job: bare as unknown as HostJob });
+
+    await tick(deps);
+
+    const got = rekey.mock.calls[0][0];
+    expect(got.secrets).toEqual({});
+    expect(got.dropNames).toEqual([]);
+  });
 });

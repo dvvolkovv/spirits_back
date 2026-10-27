@@ -1033,6 +1033,88 @@ describe('skeletonFor', () => {
         expect(ms).toBeLessThan(120000);
       }
     });
+
+    const sent = (run: Booted): string => {
+      const i = run.fetches.findIndex((u) => u.includes('sendMessage'));
+      return JSON.parse(run.fetchInits[i].body).text;
+    };
+    const start = (fromId: number) => ({
+      replies: [
+        {
+          ok: true,
+          result: [
+            { update_id: 1, message: { text: '/start', chat: { id: fromId, type: 'private' }, from: { id: fromId } } },
+          ],
+        },
+        { ok: true, result: [] },
+      ],
+      maxCalls: 6,
+    });
+
+    it('без OWNER_TG_ID /start отвечает chat_id и подсказкой, что с ним делать', async () => {
+      const run = boot(skeletonFor('bot', 'X', SLUG)['server.js'], { ...start(777001), env: { BOT_TOKEN: 'Т', PORT: '3000' } });
+      await drain();
+      expect(sent(run)).toContain('777001');
+      expect(sent(run)).toMatch(/назовите этот номер ассистенту/);
+    });
+
+    it('с OWNER_TG_ID владелец узнан и chat_id не печатается', async () => {
+      const run = boot(skeletonFor('bot', 'X', SLUG)['server.js'], { ...start(777001), env: { BOT_TOKEN: 'Т', PORT: '3000', OWNER_TG_ID: '777001' } });
+      await drain();
+      expect(sent(run)).toMatch(/владелец/);
+      expect(sent(run)).not.toContain('777001');
+    });
+
+    it('с OWNER_TG_ID постороннему — обычный ответ без chat_id и без «владелец»', async () => {
+      const run = boot(skeletonFor('bot', 'X', SLUG)['server.js'], { ...start(555), env: { BOT_TOKEN: 'Т', PORT: '3000', OWNER_TG_ID: '777001' } });
+      await drain();
+      expect(sent(run)).toBe('Бот заведён и ждёт правок.');
+    });
+
+    it('/start@имя_бота в группе — тоже /start, но chat_id группы не выдаётся за «ваш»', async () => {
+      const run = boot(skeletonFor('bot', 'X', SLUG)['server.js'], {
+        replies: [
+          { ok: true, result: [{ update_id: 1, message: { text: '/start@shop_bot', chat: { id: -100 }, from: { id: 9 } } }] },
+          { ok: true, result: [] },
+        ],
+        maxCalls: 6,
+        env: { BOT_TOKEN: 'Т', PORT: '3000' },
+      });
+      await drain();
+      expect(sent(run)).toContain('-100');
+      // Группа — не человек: совет писать /start в личку, а не «назовите этот
+      // номер ассистенту» (это номер чата, а не конкретного человека).
+      expect(sent(run)).toMatch(/в личные сообщения/);
+    });
+
+    it('обычное сообщение без /start и без OWNER_TG_ID chat_id не печатает', async () => {
+      const run = boot(skeletonFor('bot', 'X', SLUG)['server.js'], {
+        replies: [
+          { ok: true, result: [{ update_id: 1, message: { text: 'привет', chat: { id: 777001, type: 'private' }, from: { id: 777001 } } }] },
+          { ok: true, result: [] },
+        ],
+        maxCalls: 6,
+        env: { BOT_TOKEN: 'Т', PORT: '3000' },
+      });
+      await drain();
+      expect(sent(run)).toBe('Бот заведён и ждёт правок.');
+      expect(sent(run)).not.toContain('777001');
+    });
+
+    it('владелец пишет /start в группе с заданным OWNER_TG_ID — узнан, без подсказки про группу', async () => {
+      const run = boot(skeletonFor('bot', 'X', SLUG)['server.js'], {
+        replies: [
+          { ok: true, result: [{ update_id: 1, message: { text: '/start@shop_bot', chat: { id: -100 }, from: { id: 777001 } } }] },
+          { ok: true, result: [] },
+        ],
+        maxCalls: 6,
+        env: { BOT_TOKEN: 'Т', PORT: '3000', OWNER_TG_ID: '777001' },
+      });
+      await drain();
+      expect(sent(run)).toMatch(/владелец/);
+      expect(sent(run)).not.toContain('-100');
+      expect(sent(run)).not.toMatch(/в личные сообщения/);
+    });
   });
 });
 
@@ -1128,5 +1210,44 @@ describe('каркас под ключи, данные и расписание',
     // /start»: имя бота находится поиском, и первым может оказаться чужой.
     expect(md).toMatch(/назвал в тексте правки/);
     expect(md).toMatch(/Не назначать владельцем того, кто первым/);
+  });
+
+  it('ключи можно сменить через ассистента — каркас не обещает «нельзя»', () => {
+    for (const kind of KINDS) {
+      const md = skeletonFor(kind, 'X', SLUG, ['A'])['CLAUDE.md'];
+      expect(md).not.toMatch(/пока нельзя/);
+      expect(md).toMatch(/защищённая карточка/);
+      expect(md).toMatch(/Object\.keys\(process\.env\)/);
+    }
+  });
+
+  it('у бота владелец — OWNER_TG_ID, если он есть; у сайта переменной нет', () => {
+    const md = skeletonFor('bot', 'X', SLUG)['CLAUDE.md'];
+    expect(md).toMatch(/`OWNER_TG_ID`/);
+    expect(md).toMatch(/message\.from\.id/);
+    expect(skeletonFor('site', 'X', SLUG)['CLAUDE.md']).not.toMatch(/OWNER_TG_ID/);
+  });
+
+  it('данные владельца — только в его личку, не в группу, из которой пришла команда', () => {
+    const md = skeletonFor('bot', 'X', SLUG)['CLAUDE.md'];
+    expect(md).toMatch(/ТОЛЬКО в личный чат/);
+    expect(md).toMatch(/никогда в\s*\n?\s*группу/);
+    expect(md).toMatch(/message\.chat\.type === "private"/);
+    expect(md).toMatch(/callback_query\.from\.id/);
+    // Плановый отчёт — в тот же личный чат владельца, и только после его
+    // собственного /start (иначе Telegram отвечает ошибкой).
+    expect(md).toMatch(/Плановый отчёт/);
+    expect(md).toMatch(/хоть раз написал/);
+  });
+
+  it('Object.keys(process.env) показывает и системные переменные — это не ключи владельца', () => {
+    for (const kind of KINDS) {
+      const md = skeletonFor(kind, 'X', SLUG)['CLAUDE.md'];
+      expect(md).toMatch(/системные переменные/);
+      expect(md).toMatch(/это не ключи владельца/);
+    }
+    // У бота OWNER_TG_ID — переменная платформы, но читать её можно (в
+    // отличие от LINKEON_URL/RUNNER_TOKEN/CLAUDE_CODE_OAUTH_TOKEN).
+    expect(skeletonFor('bot', 'X', SLUG)['CLAUDE.md']).toMatch(/OWNER_TG_ID.*читать можно/);
   });
 });

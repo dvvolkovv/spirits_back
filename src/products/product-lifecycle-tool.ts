@@ -1,10 +1,11 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { DELETE_GRACE_DAYS, ProductLifecycleService } from './product-lifecycle.service';
 import { ActionStatus, ProductActionsService, toView } from './product-actions.service';
 import type { ProductMatch } from './product-tool.service';
 import type { ProductToolChannel } from './product-tool.token';
 import { RENT_TOKENS } from './rent.service';
+import { ProductKeysService } from './product-keys.service';
 
 /** «50 000» — как в остальных текстах для людей. Та же форма — для любого
  *  числа токенов (баланс в тексте «не хватает», п.2), не только для RENT_TOKENS. */
@@ -47,6 +48,9 @@ export class ProductLifecycleTool {
     private readonly pg: PgService,
     private readonly lifecycle: ProductLifecycleService,
     private readonly actions: ProductActionsService,
+    // Смена ключей (очередь 2). @Optional и последним — по той же причине,
+    // что lifecycleTool в ProductToolService.
+    @Optional() private readonly keysSvc?: ProductKeysService,
   ) {}
 
   async listDeleted(userId: string): Promise<DeletedProduct[]> {
@@ -71,6 +75,25 @@ export class ProductLifecycleTool {
       [userId, raw, like],
     );
     return r.rows.map((x: any) => ({ ...x, purge_after: new Date(x.purge_after).toISOString() }));
+  }
+
+  /** Удалённые, которые уже не вернуть: стёрты (purged) или срок возврата вышел, а машина ещё не стёрла. */
+  private async resolveGone(userId: string, query: string): Promise<Array<DeletedProduct & { purged: boolean }>> {
+    const raw = String(query ?? '').trim().toLowerCase();
+    if (!raw) return [];
+    const like = `%${raw.replace(/([\\%_])/g, '\\$1')}%`;
+    const r = await this.pg.query(
+      `SELECT id, name, slug, kind, purge_after, purged_at FROM products
+        WHERE user_id = $1 AND archived_at IS NOT NULL AND (purged_at IS NOT NULL OR purge_after <= now())
+          AND (id::text = $2 OR lower(slug) = $2 OR lower(name) LIKE $3)
+        ORDER BY archived_at DESC LIMIT 1`,
+      [userId, raw, like],
+    );
+    return r.rows.map((x: any) => ({
+      id: x.id, name: x.name, slug: x.slug, kind: x.kind,
+      purge_after: x.purge_after ? new Date(x.purge_after).toISOString() : null,
+      purged: x.purged_at !== null && x.purged_at !== undefined,
+    }));
   }
 
   // Без метки хода (загрузка файла, токен старого вида) сервер карточку к
@@ -153,12 +176,44 @@ export class ProductLifecycleTool {
     };
   }
 
+  async keys(userId: string, product: ProductMatch, channel: ProductToolChannel, turn: string | null) {
+    if (!this.keysSvc) return { ok: false, reason: 'unavailable', product, say: 'Смена ключей сейчас недоступна.' };
+    const r = await this.keysSvc.open({ userId, productId: product.id, channel, turn });
+    if (r.ok === false) return { ok: false, reason: r.reason, product, say: r.message };
+    return {
+      ok: true,
+      pending: { actionId: r.actionId, kind: 'keys', expiresAt: r.expiresAt },
+      product,
+      keyNames: r.keyNames,
+      say: (!turn
+        ? 'Защищённая карточка ключей ждёт пользователя в кабинете (Студия → Продукты).'
+        : channel === 'telegram'
+          ? 'Ниже придёт сообщение с кнопкой: пользователь откроет защищённую форму ключей.'
+          : 'Под твоим ответом появится защищённая карточка ключей.') +
+        ` В ней имена текущих ключей (${r.keyNames.length ? r.keyNames.join(', ') : 'ключей пока нет'}): их можно заменить, убрать или добавить новые. ` +
+        'Значения вводит только пользователь — в переписке ключи не проси. Продукт перезапустится с новыми ключами; ' +
+        'не говори «ключи обновлены», пока status с этим actionId не вернёт done.',
+    };
+  }
+
   async restore(userId: string, input: any, channel: ProductToolChannel) {
     const matches = await this.resolveDeleted(userId, String(input?.product ?? ''));
     if (matches.length > 1) {
       return { ok: false, reason: 'ambiguous', matches, say: 'Под описание подходит несколько удалённых продуктов. Спроси, какой вернуть.' };
     }
     if (!matches.length) {
+      const gone = await this.resolveGone(userId, String(input?.product ?? ''));
+      if (gone.length) {
+        const g = gone[0];
+        // «Уже стёрт» — только когда машина правда стёрла (purged_at). Срок
+        // вышел, а стирание ещё в очереди — честное «стирается».
+        return {
+          ok: false, reason: g.purged ? 'purged' : 'expiring', product: g,
+          say: g.purged
+            ? `«${g.name}» уже стёрт: срок возврата (${DELETE_GRACE_DAYS} дней) вышел, вернуть его нельзя. Можно завести новый продукт.`
+            : `Срок возврата «${g.name}» (${DELETE_GRACE_DAYS} дней) вышел — продукт стирается, вернуть его нельзя. Можно завести новый продукт.`,
+        };
+      }
       const deleted = await this.listDeleted(userId);
       return {
         ok: false, reason: 'not_found', deleted,
@@ -167,7 +222,20 @@ export class ProductLifecycleTool {
     }
     const product = matches[0];
     const r = await this.lifecycle.restore({ userId, productId: product.id, channel });
-    if (r.ok === false) return { ok: false, reason: r.reason, product, say: r.message };
+    if (r.ok === false) {
+      // Гонка (ревью 15b): resolveDeleted прочитал продукт ДО дедлайна
+      // возврата, restore() проверил его ПОСЛЕ — срок вышел между двумя
+      // запросами. Тот же reason и текст, что resolveGone отдаёт на
+      // «стирается» (выше): описание действия обещает модели только
+      // purged/expiring, а не сырой reason="expired" сервиса.
+      if (r.reason === 'expired') {
+        return {
+          ok: false, reason: 'expiring', product,
+          say: `Срок возврата «${product.name}» (${DELETE_GRACE_DAYS} дней) вышел — продукт стирается, вернуть его нельзя. Можно завести новый продукт.`,
+        };
+      }
+      return { ok: false, reason: r.reason, product, say: r.message };
+    }
     // I1 (ревью): affordable — ТЕМ ЖЕ способом, что и внутри restore()
     // (`balance >= RENT_TOKENS`), но здесь своя переменная: ответ тула не
     // отдаёт её прямо, только balance, и ветка M7 ниже (waking=false, но
@@ -224,6 +292,8 @@ export class ProductLifecycleTool {
     // продукта ещё нет, и до завершения (completeCreateBot) никто не знает,
     // попал ли он в бесплатный месяц — см. комментарий в completeCreateBot.
     const botDone = action.kind === 'create_bot' && action.status === 'done';
+    const keysDone = action.kind === 'keys' && action.status === 'done';
+    const keysWorking = action.kind === 'keys' && action.status === 'working';
     return {
       ok: !ACTION_NOT_OK.has(action.status),
       action,
@@ -236,7 +306,11 @@ export class ProductLifecycleTool {
               (action.result?.freeMonth === true
                 ? ' Первый месяц аренды бесплатный.'
                 : ` Аренда ${RENT_TOKEN_TEXT} токенов спишется при запуске; не хватит баланса — продукт уснёт до пополнения.`)
-            : ACTION_SAY[action.status],
+            : keysDone
+              ? 'Готово: ключи обновлены, продукт перезапущен с ними.'
+              : keysWorking
+                ? 'Ключи применяются: продукт перезапускается — посмотри через минуту.'
+                : ACTION_SAY[action.status],
     };
   }
 }

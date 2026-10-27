@@ -174,6 +174,19 @@ describe('новые действия инструмента', () => {
     expect(r.say).not.toMatch(/не хватило/);
   });
 
+  // Ревью 15b: resolveDeleted нашёл продукт (срок ещё не вышел на момент
+  // чтения), но restore() под замком увидел, что дедлайн уже прошёл —
+  // сырой reason="expired" сервиса не должен дойти до модели, которой
+  // описание действия обещает только purged/expiring.
+  it('restore — гонка с дедлайном: expired сервиса превращается в expiring, как у resolveGone', async () => {
+    const h = harness();
+    h.lifecycle.restore.mockResolvedValue({ ok: false, reason: 'expired', message: 'Срок возврата вышел' } as any);
+    const r: any = await h.svc.execute('u1', { action: 'restore', product: 'старый' });
+    expect(r).toMatchObject({ ok: false, reason: 'expiring' });
+    expect(r.say).toMatch(/«Старый бот».*стирается/);
+    expect(r.say).not.toMatch(/Срок возврата вышел/);
+  });
+
   it('delete — продукт остановлен администратором: карточка не открывается, отказ доходит до ассистента', async () => {
     const h = harness();
     h.lifecycle.openDelete.mockResolvedValue({ ok: false, reason: 'blocked', message: 'Продукт остановлен администратором — удалить его можно через поддержку' } as any);

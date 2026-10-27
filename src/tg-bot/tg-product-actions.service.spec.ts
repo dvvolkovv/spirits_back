@@ -54,11 +54,36 @@ describe('карточки продуктов в Telegram', () => {
     expect((h.grammy.sendMessage.mock.calls[1] as any[])[2].reply_markup.inline_keyboard[0][0].url).toMatch(new RegExp(`/studio\\?tab=products&action=${ID}$`));
   });
 
-  it('карточка неизвестного вида (keys — очередь 2) — пропускается, сообщение не шлётся', async () => {
+  it('ключи: в личке — кнопка мини-приложения, в группе — ссылка на кабинет; ключи в переписку не просим', async () => {
     const h = harness();
     h.actions.takeForTurn.mockResolvedValue([{ id: ID, kind: 'keys', payload: { name: 'Магазин' } }] as any);
     await h.svc.sendForTurn({ userId: 'u1', turn: 't', since: new Date(), chatId: 100, isPrivate: true, lang: 'ru' });
+    const [, text, opts] = h.grammy.sendMessage.mock.calls[0] as any[];
+    expect(text).toMatch(/Ключи «Магазин»/);
+    expect(text).toMatch(/В переписку ключи не присылайте/);
+    expect(opts.reply_markup.inline_keyboard[0][0].web_app.url).toMatch(new RegExp(`/tma/\\?pa=${ID}$`));
+    await h.svc.sendForTurn({ userId: 'u1', turn: 't', since: new Date(), chatId: -100, isPrivate: false, lang: 'ru' });
+    expect((h.grammy.sendMessage.mock.calls[1] as any[])[2].reply_markup.inline_keyboard[0][0].url)
+      .toMatch(new RegExp(`/studio\\?tab=products&action=${ID}$`));
+  });
+
+  it('карточка неизвестного вида — пропускается, сообщение не шлётся', async () => {
+    const h = harness();
+    h.actions.takeForTurn.mockResolvedValue([{ id: ID, kind: 'zzz', payload: { name: 'Магазин' } }] as any);
+    await h.svc.sendForTurn({ userId: 'u1', turn: 't', since: new Date(), chatId: 100, isPrivate: true, lang: 'ru' });
     expect(h.grammy.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('текст ключей есть на всех семи языках и называет продукт', async () => {
+    for (const lang of ['ru', 'en', 'de', 'fr', 'es', 'pt', 'zh']) {
+      const h = harness();
+      h.actions.takeForTurn.mockResolvedValue([{ id: ID, kind: 'keys', payload: { name: 'Shop' } }] as any);
+      await h.svc.sendForTurn({ userId: 'u1', turn: 't', since: new Date(), chatId: 100, isPrivate: true, lang });
+      const [, text, opts] = h.grammy.sendMessage.mock.calls[0] as any[];
+      expect(text).toContain('Shop');
+      expect(text).not.toMatch(/\{name\}/);
+      expect(opts.reply_markup.inline_keyboard[0][0].text.length).toBeGreaterThan(0);
+    }
   });
 
   it('первая карточка не отправилась — вторая всё равно уходит', async () => {

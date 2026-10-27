@@ -6,6 +6,7 @@ import { HostsService } from './hosts.service';
 import { LimitsService } from './limits.service';
 import { ProductActionsService } from './product-actions.service';
 import { ProductLifecycleService } from './product-lifecycle.service';
+import { ProductPurgeService } from './product-purge.service';
 import { MIGRATIONS } from './products.service';
 import { ProvisioningService } from './provisioning.service';
 import { RENT_TOKENS, RentService, SLEEP_REASON_NO_TOKENS } from './rent.service';
@@ -607,6 +608,60 @@ maybe('жизненный цикл продукта против живого Po
       expect(row.status).toBe('sleeping');
     });
 
+    it('срок вышел, пока возврат шёл: транзакция начата до срока, обход стирания успел стереть ключи — expired, архив не снят (ревью задачи 14)', async () => {
+      // now() в PostgreSQL — время НАЧАЛА транзакции. Сверь возврат срок с
+      // ним, и транзакция, начатая за миг до срока, вернула бы продукт уже
+      // после того, как почасовой обход стёр ему ключи и тексты. Ворота перед
+      // захватом строки продукта ставят обход ровно между BEGIN возврата и
+      // его записью — без гадания с миллисекундами.
+      const userId = 'u-restore-deadline';
+      const deadline = Date.now() + 1500;
+      const productId = await insertProduct({
+        userId, status: 'archived', slug: 'restore-deadline-1',
+        archivedAt: new Date(Date.now() - 30 * 86_400_000), purgeAfter: new Date(deadline),
+      });
+      await pool.query(`UPDATE products SET secrets_encrypted = decode('01', 'hex'), first_prompt = 'п' WHERE id = $1`, [productId]);
+
+      let open!: () => void;
+      const gate = new Promise<void>((res) => (open = res));
+      let reached!: () => void;
+      const atLock = new Promise<void>((res) => (reached = res));
+      const gated = {
+        query: pg.query,
+        getClient: async () => {
+          const c = await pool.connect();
+          return {
+            query: async (sql: string, params?: any[]) => {
+              if (/^\s*SELECT 1 FROM products\b[\s\S]*FOR UPDATE/.test(sql)) {
+                reached();
+                await gate;
+              }
+              return c.query(sql, params);
+            },
+            release: () => c.release(),
+          };
+        },
+      };
+      const s = svc as any;
+      const racer = new ProductLifecycleService(gated as any, s.provisioning, s.limits, s.turns, s.actions, secrets);
+      const restoring = racer.restore({ userId, productId, channel: 'web' });
+      restoring.catch(() => undefined);
+      try {
+        await atLock;
+        // BEGIN возврата уже позади — и он был до срока.
+        expect(Date.now()).toBeLessThan(deadline);
+        await new Promise((res) => setTimeout(res, deadline - Date.now() + 200));
+        expect(await new ProductPurgeService(pg as any).wipeExpired()).toBe(1);
+      } finally {
+        open();
+      }
+
+      expect(await restoring).toEqual({ ok: false, reason: 'expired', message: 'Срок возврата вышел' });
+      const row = (await pool.query('SELECT status, archived_at, secrets_encrypted, first_prompt FROM products WHERE id = $1', [productId])).rows[0];
+      expect(row).toMatchObject({ status: 'archived', secrets_encrypted: null, first_prompt: null });
+      expect(row.archived_at).not.toBeNull();
+    });
+
     it('продукт был сломан (failed) до удаления — возврат отдаёт его обратно failed, без сна и аренды', async () => {
       const userId = 'u-restore-failed';
       const productId = await insertProduct({ userId, status: 'failed', slug: 'restore-failed-1' });
@@ -670,6 +725,54 @@ maybe('жизненный цикл продукта против живого Po
 
       const provRow = (await pool.query('SELECT first_prompt FROM products WHERE id = $1', [provisioning])).rows[0];
       expect(provRow.first_prompt).toBe('Ещё не готов');
+    });
+  });
+
+  describe('claimNext и смена ключей (ревью задачи 11)', () => {
+    it('rekey running — claimNext не выдаёт ход; после завершения rekey — выдаёт', async () => {
+      const userId = 'u-claim-rekey';
+      const productId = await insertProduct({ userId, status: 'running', slug: 'claim-rekey-1' });
+      const turnRow = await pool.query(
+        `INSERT INTO product_turns (product_id, user_id, channel, prompt, status) VALUES ($1, $2, 'web', 'правка', 'queued') RETURNING id`,
+        [productId, userId],
+      );
+      const job = await pool.query(
+        `INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'rekey', 'running') RETURNING id`,
+        [productId],
+      );
+      const turnsLocal = new TurnsService(pg as any, { checkTokenBalance: async () => ({ ok: true }), deductTokens: async () => 0 } as any);
+
+      // Против НАСТОЯЩЕГО Postgres: мок исполнил бы любой SQL одинаково, а
+      // здесь проверяется сам предикат NOT EXISTS из claimNext — ровно та
+      // страховка, которой не было до ревью задачи 11.
+      await expect(turnsLocal.claimNext(productId)).resolves.toBeNull();
+      const stillQueued = (await pool.query('SELECT status FROM product_turns WHERE id = $1', [turnRow.rows[0].id])).rows[0];
+      expect(stillQueued.status).toBe('queued');
+
+      await pool.query(`UPDATE product_provision_jobs SET status = 'done' WHERE id = $1`, [job.rows[0].id]);
+
+      const claimed = await turnsLocal.claimNext(productId);
+      expect(claimed).toMatchObject({ id: turnRow.rows[0].id });
+      const runningNow = (await pool.query('SELECT status FROM product_turns WHERE id = $1', [turnRow.rows[0].id])).rows[0];
+      expect(runningNow.status).toBe('running');
+    });
+
+    it('rekey queued (ещё не running) — claimNext выдаёт ход как обычно', async () => {
+      // Только 'running' в WHERE claimNext: пока rekey сам ещё не выдан
+      // агенту, ход и rekey не должны ждать друг друга (см. докблок
+      // REKEY_REFUSAL) — на практике REKEY_REFUSAL отобьёт постановку ТАКОГО
+      // хода при enqueue, но claimNext проверяется отдельно, своим SQL.
+      const userId = 'u-claim-rekey-queued';
+      const productId = await insertProduct({ userId, status: 'running', slug: 'claim-rekey-2' });
+      const turnRow = await pool.query(
+        `INSERT INTO product_turns (product_id, user_id, channel, prompt, status) VALUES ($1, $2, 'web', 'правка', 'queued') RETURNING id`,
+        [productId, userId],
+      );
+      await pool.query(`INSERT INTO product_provision_jobs (product_id, kind, status) VALUES ($1, 'rekey', 'queued')`, [productId]);
+      const turnsLocal = new TurnsService(pg as any, { checkTokenBalance: async () => ({ ok: true }), deductTokens: async () => 0 } as any);
+
+      const claimed = await turnsLocal.claimNext(productId);
+      expect(claimed).toMatchObject({ id: turnRow.rows[0].id });
     });
   });
 

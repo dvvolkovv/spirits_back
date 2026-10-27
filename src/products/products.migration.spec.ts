@@ -51,18 +51,26 @@ describe('ProductsService.onModuleInit', () => {
   it('не падает, если применение НЕобязательной миграции бросает ошибку', async () => {
     // 001..004 и 007 едут через пул: их отказ по-прежнему только пишется в
     // лог. Схема продуктов не должна ронять чат, оплаты и вход. 005 едет по
-    // выделенному соединению — здесь оно исправно; 006 и 008 обязательные и
-    // тоже исправны здесь — то есть падают ровно необязательные.
+    // выделенному соединению — здесь оно исправно; 006, 008, 009 и 010
+    // обязательные и тоже исправны здесь — то есть падают ровно необязательные.
     const client = { query: jest.fn(async () => ({ rows: [] })), release: jest.fn() };
     const pg = {
       query: jest.fn(async (sql: string) => {
-        // 006 и 008 тоже едут через пул и тоже обязательные, поэтому исправны
-        // здесь ровно как 005: иначе этот сценарий проверял бы не то, что
-        // заявляет — старт падал бы от ОБЯЗАТЕЛЬНОЙ миграции, а читался бы как
-        // «падает от необязательной». Их отказ проверяется своими сценариями
-        // ниже.
+        // 006, 008, 009 и 010 тоже едут через пул и тоже обязательные, поэтому
+        // исправны здесь ровно как 005: иначе этот сценарий проверял бы не
+        // то, что заявляет — старт падал бы от ОБЯЗАТЕЛЬНОЙ миграции, а
+        // читался бы как «падает от необязательной». Их отказ проверяется
+        // своими сценариями ниже.
         if (String(sql).includes('ALTER TABLE product_host_agent')) return { rows: [] };
         if (String(sql).includes('CREATE TABLE IF NOT EXISTS product_domains')) return { rows: [] };
+        // 009 — обязательная задним числом (очередь 2: 010 ссылается на
+        // product_actions внешним ключом), поэтому исправна здесь по той же
+        // причине. Маркер — замок в первой строке файла.
+        if (String(sql).includes("hashtext('products/009_product_actions')")) return { rows: [] };
+        // 010 — тоже обязательная превентивно (очередь 2: с Task 9 её
+        // колонку будет читать каждая выдача задания), поэтому исправна
+        // здесь по той же причине. Маркер — замок в первой строке файла.
+        if (String(sql).includes("hashtext('products/010_rekey_purge')")) return { rows: [] };
         throw new Error('boom');
       }),
       getClient: jest.fn(async () => client),
@@ -125,6 +133,24 @@ describe('ProductsService.onModuleInit', () => {
     };
 
     await expect(new ProductsService(pg as any).onModuleInit()).rejects.toThrow(/008_domains\.sql/);
+  });
+
+  it('отказ 009 РОНЯЕТ старт, а не уходит в лог', async () => {
+    // 009 обязательная задним числом (очередь 2, 010_rekey_purge.sql): та
+    // ссылается на product_actions внешним ключом, и без таблицы 009 010 всё
+    // равно упала бы следующей же — но отказ, уходящий строкой в лог, назвал
+    // бы виновником 010, а не настоящую причину. 009 в FATAL_MIGRATIONS
+    // делает ошибку слышной по имени истинного виновника; «старт падает» и
+    // без этого не менялось бы.
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        if (String(sql).includes("hashtext('products/009_product_actions')")) throw new Error('не взлетело');
+        return { rows: [] };
+      }),
+      getClient: jest.fn(async () => ({ query: jest.fn(async () => ({ rows: [] })), release: jest.fn() })),
+    };
+
+    await expect(new ProductsService(pg as any).onModuleInit()).rejects.toThrow(/009_product_actions\.sql/);
   });
 
   it('006 едет ПОСЛЕ 003 и 005 — она перестраивает их обеих', async () => {
@@ -379,6 +405,7 @@ describe('миграция 002', () => {
       '007_selfservice.sql',
       '008_domains.sql',
       '009_product_actions.sql',
+      '010_rekey_purge.sql',
     ]);
   });
 
@@ -640,14 +667,16 @@ describe('миграция 004 — аренда', () => {
   });
 
   it('словарь видов задания закрыт CHECK', async () => {
-    // 'domain' добавлен для 008_domains.sql (свой домен продукта), но словарь
-    // объявлен ТОЛЬКО здесь: 004 едет раньше 008 при каждом старте API, а
-    // обязательная 008 перевешиваемых словарей не содержит (см. её шапку) —
-    // в отличие от 'sleeping'/'blocked' в products_status_check, 'domain'
-    // дублировать в соседний файл не нужно и было бы неправильно.
+    // 'domain' добавлен для 008_domains.sql (свой домен продукта), 'rekey' и
+    // 'purge' — для 010_rekey_purge.sql (очередь 2, по той же причине
+    // объявлены здесь же), но словарь объявлен ТОЛЬКО здесь: 004 едет раньше
+    // 008 и 010 при каждом старте API, а обязательные 008 и 010
+    // перевешиваемых словарей не содержат (см. их шапки) — в отличие от
+    // 'sleeping'/'blocked' в products_status_check, эти значения дублировать
+    // в соседний файл не нужно и было бы неправильно.
     expect(
       dictionary(await migration004(), 'product_provision_jobs_kind_check', 'kind', '004'),
-    ).toEqual(['domain', 'provision', 'sleep', 'wake']);
+    ).toEqual(['domain', 'provision', 'purge', 'rekey', 'sleep', 'wake']);
   });
 
   it('каждое ограничение навешивается идемпотентно', async () => {
@@ -1173,6 +1202,57 @@ describe('миграция 008 — свой домен продукта: обя�
     }
     expect(sql).not.toMatch(/ADD CONSTRAINT/);
     expect(sql).not.toMatch(/ALTER TABLE/);
+    expect(sql).not.toMatch(/DROP/);
+  });
+});
+
+/**
+ * Текст миграции 010 — отдельно от соседей по той же причине, по какой
+ * отделены 002..008. Якорь — `action_id`: более ранние файлы этого имени
+ * колонки не знают.
+ */
+async function migration010(): Promise<string> {
+  const { svc, queries } = makeService();
+  await svc.onModuleInit();
+  const sql = queries.find((q) => q.includes('action_id'));
+  if (!sql) {
+    throw new Error('миграция 010 не применена: ни один запрос не заводит action_id');
+  }
+  return sql.replace(/\/\*[\s\S]*?\*\//g, '').replace(/--[^\n]*/g, '');
+}
+
+describe('миграция 010 — задание знает карточку: без ADD CONSTRAINT, CREATE INDEX только внутри DO-блока', () => {
+  it('файл — замок, ADD COLUMN IF NOT EXISTS и один DO-блок с CREATE INDEX IF NOT EXISTS', async () => {
+    // Приём 008 (split по ';' и сверка каждого оператора с паттерном) здесь в
+    // чистом виде не работает: DO $$ … $$; несёт СВОИ ';' внутри тела
+    // (вложенный IF и CREATE INDEX), и наивный split разрезал бы один
+    // DO-блок на куски, ни один из которых не совпал бы ни с одним паттерном.
+    // Поэтому DO-блок сначала вырезается целиком одним куском, CREATE INDEX
+    // проверяется внутри него отдельно, а остаток файла (замок и ALTER
+    // TABLE) проверяется split'ом, как у 008.
+    const sql = await migration010();
+
+    const doBlocks = sql.match(/DO \$\$[\s\S]*?\$\$;/g) ?? [];
+    expect(doBlocks.length).toBe(1);
+    expect(doBlocks[0]).toMatch(/CREATE INDEX idx_provision_jobs_action\b/);
+
+    const rest = sql.replace(/DO \$\$[\s\S]*?\$\$;/g, '');
+    const list = rest
+      .split(';')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    expect(list.length).toBeGreaterThan(0);
+    for (const s of list) {
+      expect(s).toMatch(
+        /^SELECT pg_advisory_xact_lock\(hashtext\('products\/010_rekey_purge'\)\)$|^ALTER TABLE product_provision_jobs\s+ADD COLUMN IF NOT EXISTS action_id\b/,
+      );
+    }
+    // CREATE INDEX — ровно один, и только внутри вырезанного DO-блока: за
+    // его пределами ShareLock-ловушка из заметки памяти «CREATE INDEX в
+    // стартовой миграции» не под защитой DO IF NOT EXISTS.
+    expect(rest).not.toMatch(/CREATE INDEX/);
+    expect(rest).not.toMatch(/ADD CONSTRAINT/);
     expect(sql).not.toMatch(/DROP/);
   });
 });

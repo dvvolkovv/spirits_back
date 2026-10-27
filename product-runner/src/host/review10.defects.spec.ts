@@ -115,6 +115,8 @@ describe('ДЕФЕКТ 3: у провижининга нет срока — за
         // здесь узнавать нечего, и `{}` — это «сообщать нечего».
         wakeProduct: async () => ({}),
         domain: async () => undefined,
+        rekey: async () => undefined,
+        purge: async () => undefined,
         log: () => {},
       };
 

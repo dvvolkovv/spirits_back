@@ -1,7 +1,7 @@
 import { HttpException, Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { PRODUCT_TOOL_WAIT_MS } from '../common/relay-budget';
-import { TurnsService, SLEEPING_REFUSAL, BLOCKED_REFUSAL } from './turns.service';
+import { TurnsService, SLEEPING_REFUSAL, BLOCKED_REFUSAL, REKEY_REFUSAL } from './turns.service';
 import { DomainErrorReason, DomainRecordToSet, DomainRefusalCode, DomainStatus, DomainsService, DomainView } from './domains.service';
 import { normalizeDomain, readableDomain } from './domain-name';
 import { ProductToolChannel } from './product-tool.token';
@@ -324,11 +324,12 @@ export class ProductToolService {
     if (this.lifecycleTool) {
       if (action === 'create') return this.lifecycleTool.create(userId, input, channel, turn);
       if (action === 'restore') return this.lifecycleTool.restore(userId, input, channel);
-      if (action === 'delete' || action === 'revert') {
+      if (action === 'delete' || action === 'revert' || action === 'keys') {
         const resolved = await this.resolveOne(userId, input);
         if (resolved.ok === false) return resolved;
         const { product } = resolved;
         if (action === 'delete') return this.lifecycleTool.delete(userId, product, channel, turn);
+        if (action === 'keys') return this.lifecycleTool.keys(userId, product, channel, turn);
         try {
           const r = await this.lifecycleTool.revert(userId, product, input?.turnId, channel);
           if (r.ok === false) return { ok: false, reason: r.reason, product, say: r.message };
@@ -347,7 +348,7 @@ export class ProductToolService {
     return {
       ok: false,
       reason: 'bad_action',
-      say: 'Неизвестное действие. Доступны: list, create, edit, status, revert, delete, restore, domain.',
+      say: 'Неизвестное действие. Доступны: list, create, edit, status, revert, delete, restore, keys, domain.',
     };
   }
 
@@ -504,6 +505,10 @@ export class ProductToolService {
     if (msg === BLOCKED_REFUSAL) {
       return { ok: false, reason: 'blocked', canTopUp: false, product,
         say: BLOCKED_REFUSAL + ' НЕ предлагай пользователю пополнить баланс — это не поможет.' };
+    }
+    if (msg === REKEY_REFUSAL) {
+      return { ok: false, reason: 'rekeying', canTopUp: false, product,
+        say: `${REKEY_REFUSAL} Повтори правку позже (действие status покажет, когда закончится); пополнение не поможет.` };
     }
     if (msg === 'Недостаточно токенов') {
       return { ok: false, reason: 'no_tokens', canTopUp: true, product,
@@ -722,7 +727,10 @@ export const PRODUCT_TOOLS = [
       // Сама карточка (pa_delete_prompt) остаётся безусловной — её текст
       // это общее правило, не состояние конкретного продукта.
       'После удаления его можно вернуть 30 дней, оставшийся оплаченный срок, если он есть, не возвращается. Не говори «удалил», пока status не вернёт done.\n' +
-      '• action="restore" — вернуть удалённый: product. Нужно свободное место в пределе аккаунта.\n' +
+      '• action="restore" — вернуть удалённый: product. Нужно свободное место в пределе аккаунта. ' +
+      'Через 30 дней удалённый стирается насовсем и не возвращается — ответ reason="purged" (стёрт) или "expiring" (срок вышел, стирается).\n' +
+      '• action="keys" — сменить, убрать или добавить ключи продукта (токен бота, ключи сервисов): product. Сервер прикрепит к ответу защищённую карточку с ИМЕНАМИ текущих ключей; значения вводит только пользователь, продукт перезапустится с новыми ключами. ' +
+      'Спящему и остановленному продукту ключи не меняются. Не говори «ключи обновлены», пока status с actionId не вернёт done.\n' +
       '• action="domain" — свой домен сайта: { product, domain } — привязать; { product } — узнать состояние; ' +
       '{ product, check: true } — проверить DNS сейчас; { product, remove: true } — отвязать. Вернутся records — ' +
       'записи для регистратора: называй их ДОСЛОВНО (тип, имя, значение), не пересказывая, и обязательно скажи ' +
@@ -748,20 +756,26 @@ export const PRODUCT_TOOLS = [
       'КАРТОЧКИ: ответ с pending значит, что действие ждёт пользователя. О карточке говори «под ответом карточка» ' +
       '(в Telegram — «ниже сообщение с кнопкой»), не пересказывай её и не выдумывай. ЧЕГО ТЫ НЕ МОЖЕШЬ: загрузить в продукт файлы.\n' +
       'КЛЮЧИ, ТОКЕНЫ И ПАРОЛИ в prompt не вписывай никогда: текст правки хранится в истории и попадает в git продукта. ' +
-      'Ключи в разговоре не проси — их вводят только в защищённую карточку при создании бота. Прислал пользователь ключ в чат — ' +
-      'никуда его не передавай и посоветуй ключи в переписку не присылать. Сменить ключи после создания пока нельзя.\n' +
+      'Ключи в разговоре не проси никогда — их вводят только в защищённую карточку (при создании бота и действием keys). ' +
+      'Прислал пользователь ключ в чат — никуда его не передавай, не вписывай в prompt: посоветуй выпустить новый ' +
+      '(у бота — в @BotFather: /revoke) и ввести его в карточку; если продукта ещё нет — предложи карточку создания ' +
+      'бота, если есть — предложи карточку keys. В переписку значения не присылать.\n' +
+      'CHAT_ID БОТА: пользователь назвал chat_id своего бота (его показывает сам бот на /start) — передай его ' +
+      'правкой: action="edit", prompt: «владелец — chat_id N» (это не секрет, можно в prompt). После привязки ' +
+      'Telegram в профиле Linkeon бот узнаёт владельца сам (OWNER_TG_ID) — для уже заведённых ботов это заработает ' +
+      'после следующей смены ключей.\n' +
       'ПРО ДЕНЬГИ: разговор с тобой и правка продукта тарифицируются ОТДЕЛЬНО. Когда сообщаешь результат правки — ' +
       'назови расход за ход, чтобы два списания за одну просьбу не выглядели ошибкой.',
     input_schema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['list', 'edit', 'status', 'domain', 'create', 'delete', 'restore', 'revert'] },
+        action: { type: 'string', enum: ['list', 'edit', 'status', 'domain', 'create', 'delete', 'restore', 'revert', 'keys'] },
         kind: { type: 'string', enum: ['site', 'bot'], description: 'Для create: "site" — сайт, "bot" — телеграм-бот.' },
         name: { type: 'string', description: 'Для create: название продукта, как его назвал пользователь.' },
         actionId: { type: 'string', description: 'Для status: идентификатор карточки из прошлого ответа (pending.actionId).' },
         product: {
           type: 'string',
-          description: 'Как пользователь назвал продукт: имя («магазин цветов»), слаг или домен. Для edit, delete, restore, revert обязательно.',
+          description: 'Как пользователь назвал продукт: имя («магазин цветов»), слаг или домен. Для edit, delete, restore, revert, keys обязательно.',
         },
         prompt: {
           type: 'string',

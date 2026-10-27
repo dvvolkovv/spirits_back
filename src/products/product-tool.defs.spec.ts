@@ -7,10 +7,10 @@ import { DOMAIN_ERROR_REASONS, DomainView } from './domains.service';
 describe('определение инструмента продуктов', () => {
   const tool = () => PRODUCT_TOOLS.find((t) => t.name === PRODUCT_TOOL_NAME)!;
 
-  it('инструмент ровно один, с восемью действиями', () => {
+  it('инструмент ровно один, с девятью действиями', () => {
     expect(PRODUCT_TOOLS).toHaveLength(1);
     expect((tool().input_schema as any).properties.action.enum.slice().sort())
-      .toEqual(['create', 'delete', 'domain', 'edit', 'list', 'restore', 'revert', 'status']);
+      .toEqual(['create', 'delete', 'domain', 'edit', 'keys', 'list', 'restore', 'revert', 'status']);
     const p = (tool().input_schema as any).properties;
     expect(p.kind.enum).toEqual(['site', 'bot']);
     expect(p.name.type).toBe('string');
@@ -75,7 +75,16 @@ describe('определение инструмента продуктов', () 
     expect(d).toMatch(/КЛЮЧИ, ТОКЕНЫ И ПАРОЛИ в prompt не вписывай/);
     expect(d).toMatch(/Ключи в разговоре не проси/);
     expect(d).toMatch(/защищённую карточку/);
-    expect(d).toMatch(/Сменить ключи после создания пока нельзя/);
+    expect(d).not.toMatch(/пока нельзя/);
+    expect(d).toMatch(/action="keys"/);
+    expect(d).toMatch(/предложи карточку keys/);
+    // 15b (ревью): прислал ключ в чат — не просто молчать про него, а
+    // посоветовать выпустить новый и назвать, в какую карточку его ввести
+    // (создания бота, если продукта ещё нет; иначе — keys).
+    expect(d).toMatch(/выпустить новый/);
+    expect(d).toMatch(/@BotFather.*\/revoke/);
+    expect(d).toMatch(/карточку создания бота/);
+    expect(d).toMatch(/В переписку значения не присылать/);
   });
 
   it('удаление — только по кнопке пользователя, с возвратом', () => {
@@ -102,7 +111,7 @@ describe('определение инструмента продуктов', () 
   });
 
   it('каждое действие названо в описании', () => {
-    for (const a of ['list', 'edit', 'status', 'domain', 'create', 'delete', 'restore', 'revert']) {
+    for (const a of ['list', 'edit', 'status', 'domain', 'create', 'delete', 'restore', 'revert', 'keys']) {
       expect(tool().description).toContain(`action="${a}"`);
     }
   });
@@ -113,6 +122,16 @@ describe('определение инструмента продуктов', () 
   it('описание разводит outcome и reason', () => {
     expect(tool().description).toMatch(/НИКОГДА не приходят вместе/);
     expect(tool().description).toMatch(/Не ищи outcome в отказе/);
+  });
+
+  // Добавлено по ревью задачи 8 (27.10): каркас бота на /start без известного
+  // владельца подсказывает человеку его chat_id — описание инструмента обязано
+  // сказать ассистенту, что с этим числом делать, а не оставлять его молча.
+  it('chat_id от пользователя — правкой; после привязки Telegram бот узнаёт владельца сам', () => {
+    const d = tool().description;
+    expect(d).toMatch(/владелец — chat_id N/);
+    expect(d).toMatch(/OWNER_TG_ID/);
+    expect(d).toMatch(/после следующей смены ключей/);
   });
 });
 

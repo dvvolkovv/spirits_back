@@ -1,14 +1,23 @@
-import { BadRequestException, Body, ConflictException, Controller, Get, HttpCode, NotFoundException, NotImplementedException, Param, Post, UseGuards } from '@nestjs/common';
-import { IsBoolean, IsIn, IsObject, IsOptional } from 'class-validator';
+import { BadRequestException, Body, ConflictException, Controller, Get, HttpCode, NotFoundException, NotImplementedException, Optional, Param, Post, UseGuards } from '@nestjs/common';
+import { ArrayMaxSize, IsArray, IsBoolean, IsIn, IsObject, IsOptional, IsString, MaxLength } from 'class-validator';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { IpRateLimiter } from '../common/guards/ip-rate-limit';
 import { ProductActionsService, toView } from './product-actions.service';
 import { ProductLifecycleService } from './product-lifecycle.service';
+import { ProductKeysService } from './product-keys.service';
+import { SECRET_COUNT_MAX, SECRET_NAME_MAX } from './secret-rules';
 
 export class SubmitActionDto {
   @IsOptional() @IsBoolean() confirm?: boolean;
+  // `set` остаётся без потолка здесь (ревью 15b): его размер — не то же
+  // самое, что размер набора после смены. ProductKeysService.submit мержит
+  // его со старыми ключами (минус remove) и проверяет ИТОГОВЫЙ набор
+  // secretsProblem — тем же SECRET_COUNT_MAX/SECRET_NAME_MAX/SECRET_VALUE_MAX,
+  // что и заведение. Повторять потолок здесь пришлось бы по телу запроса, а
+  // не по тому, что получится после слияния, — лишняя проверка не того числа.
   @IsOptional() @IsObject() set?: Record<string, string>;
+  @IsOptional() @IsArray() @ArrayMaxSize(SECRET_COUNT_MAX) @IsString({ each: true }) @MaxLength(SECRET_NAME_MAX, { each: true }) remove?: string[];
   @IsOptional() @IsIn(['chat', 'cabinet', 'tma']) via?: 'chat' | 'cabinet' | 'tma';
 }
 
@@ -18,6 +27,10 @@ export class SubmitActionDto {
  * `products/:id/...` соседнего контроллера. Чужое действие — 404, а не 403:
  * не выдавать его существование. Значения ключей в ответ не попадают никогда —
  * ответ строится из toView, в котором их нет по построению.
+ *
+ * Ключи (`keys`) — `{set, remove}`: значения уходят в ProductKeysService и
+ * дальше только в коробку карточки; ответ — `toView`, в котором значений нет
+ * по построению.
  */
 @Controller('')
 @UseGuards(JwtGuard)
@@ -26,6 +39,7 @@ export class ProductActionsController {
     private readonly actions: ProductActionsService,
     private readonly lifecycle: ProductLifecycleService,
     private readonly limiter: IpRateLimiter,
+    @Optional() private readonly keys?: ProductKeysService,
   ) {}
 
   @Get('product-actions')
@@ -59,7 +73,8 @@ export class ProductActionsController {
     } else if (row.kind === 'create_bot') {
       await this.lifecycle.completeCreateBot({ userId: user.userId, actionId: id, set: body?.set ?? {}, via });
     } else if (row.kind === 'keys') {
-      throw new NotImplementedException('Это действие появится позже');
+      if (!this.keys) throw new NotImplementedException('Смена ключей сейчас недоступна');
+      await this.keys.complete({ userId: user.userId, actionId: id, set: body?.set ?? {}, remove: body?.remove ?? [], via });
     } else {
       // create_site, restore, revert, purge — журнальные записи итога, не
       // ожидающие карточки (см. CardKind в product-actions.service):

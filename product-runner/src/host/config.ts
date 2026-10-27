@@ -84,6 +84,20 @@ export const DEFAULT_REPORT_RETRY_MS = 10_000;
  */
 export const DEFAULT_PROVISION_TIMEOUT_MS = 8 * 60 * 1000;
 
+/**
+ * Срок ожидания в очереди по слагу (`index.ts`, `queueBySlug`) — ПЕРВАЯ линия
+ * защиты от работы, брошенной по сроку и продолжающейся в фоне: следующее
+ * задание на том же слаге не начинает работу, пока прежняя не кончилась (см.
+ * шапку `queueBySlug`), а этот срок не даёт ждать её дольше разумного.
+ *
+ * Короче `provisionTimeoutMs` не случайно: обороты агента ПОСЛЕДОВАТЕЛЬНЫ
+ * (`loop` ждёт `tick` целиком), и пока одно задание ждёт в очереди по своему
+ * слагу, агент не опрашивает сервер вовсе — то есть ждёт не только оно, а
+ * ВСЯ машина продуктов, все слаги на ней. Полный бюджет провижининга (восемь
+ * минут) тут был бы ценой того же порядка, что и зависший сон раннера.
+ */
+export const DEFAULT_QUEUE_WAIT_MS = 60_000;
+
 export interface HostConfig {
   linkeonUrl: string;
   /** Обязан совпадать с PRODUCT_HOST_TOKEN в окружении бэкенда. */
@@ -100,6 +114,8 @@ export interface HostConfig {
    * действует и тогда, когда поля нет вовсе.
    */
   provisionTimeoutMs?: number;
+  /** Необязательное — та же причина, что у provisionTimeoutMs: умолчание в месте использования. */
+  queueWaitMs?: number;
 }
 
 function required(env: NodeJS.ProcessEnv, key: string): string {
@@ -143,5 +159,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): HostConfig {
     reportAttempts: positiveNumber(env, 'REPORT_ATTEMPTS', DEFAULT_REPORT_ATTEMPTS),
     reportRetryMs: positiveNumber(env, 'REPORT_RETRY_MS', DEFAULT_REPORT_RETRY_MS),
     provisionTimeoutMs: positiveNumber(env, 'PROVISION_TIMEOUT_MS', DEFAULT_PROVISION_TIMEOUT_MS),
+    queueWaitMs: positiveNumber(env, 'QUEUE_WAIT_MS', DEFAULT_QUEUE_WAIT_MS),
   };
 }

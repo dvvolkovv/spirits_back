@@ -17,9 +17,9 @@ export function shouldRouteToProductActions(data: string): boolean {
 /**
  * Карточки продуктов в Telegram. Удаление — кнопками под отдельным
  * сообщением: нажатие засчитывается, только если нажал привязанный Telegram
- * владельца действия. Ключи бота — только формой мини-приложения (в группе
- * кнопка мини-приложения недоступна — там ссылка на кабинет): в переписку
- * ключи не идут никогда.
+ * владельца действия. Ключи бота и смена ключей — только формой
+ * мини-приложения (в группе кнопка мини-приложения недоступна — там ссылка
+ * на кабинет): в переписку ключи не идут никогда.
  */
 @Injectable()
 export class TgProductActionsService {
@@ -54,8 +54,10 @@ export class TgProductActionsService {
             { text: tgText(i.lang, 'pa_delete_btn'), callback_data: `pa:ok:${a.id}` },
             { text: tgText(i.lang, 'pa_cancel_btn'), callback_data: `pa:no:${a.id}` },
           ]] };
-        } else if (a.kind === 'create_bot') {
-          text = tgText(i.lang, 'pa_create_bot_prompt', { name });
+        } else if (a.kind === 'create_bot' || a.kind === 'keys') {
+          text = a.kind === 'keys'
+            ? tgText(i.lang, 'pa_keys_prompt', { name })
+            : tgText(i.lang, 'pa_create_bot_prompt', { name });
           // Строка запроса, а не фрагмент: Telegram дописывает в адрес СВОИ
           // параметры запуска во фрагмент (#tgWebAppData=...), и не каждый
           // клиент гарантированно сохраняет фрагмент, который был в адресе
@@ -65,13 +67,12 @@ export class TgProductActionsService {
           const sep = TMA_URL.includes('?') ? '&' : '?';
           reply_markup = { inline_keyboard: [[
             i.isPrivate
-              ? { text: tgText(i.lang, 'pa_create_bot_btn'), web_app: { url: `${TMA_URL}${sep}pa=${a.id}` } }
+              ? { text: tgText(i.lang, a.kind === 'keys' ? 'pa_keys_btn' : 'pa_create_bot_btn'), web_app: { url: `${TMA_URL}${sep}pa=${a.id}` } }
               : { text: tgText(i.lang, 'pa_open_cabinet_btn'), url: `${CABINET}/studio?tab=products&action=${a.id}` },
           ]] };
         } else {
-          // keys (очередь 2) и прочие виды карточек сюда ещё не доведены —
-          // карточка уже attached_at, молча теряться она не должна, но и
-          // слать по ней нечего.
+          // прочие виды карточек (на будущее) — карточка уже attached_at, молча
+          // теряться ей нельзя, но слать по ней нечего.
           this.logger.warn(`карточка продукта неизвестного вида "${a.kind}" пропущена (action ${a.id})`);
           continue;
         }

@@ -241,6 +241,8 @@ function hostDepsWithRealDomain(): HostDeps {
     sleepProduct: async () => undefined,
     wakeProduct: async () => ({}),
     domain: (j) => applyDomain(j, deps(host)),
+    rekey: async () => undefined,
+    purge: async () => undefined,
     sleep: async () => undefined,
     log: () => {},
   };

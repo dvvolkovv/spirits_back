@@ -1,5 +1,5 @@
 import { ConflictException, HttpException, HttpStatus } from '@nestjs/common';
-import { BLOCKED_REFUSAL, SLEEPING_REFUSAL, TurnsService } from './turns.service';
+import { BLOCKED_REFUSAL, REKEY_REFUSAL, SLEEPING_REFUSAL, TurnsService } from './turns.service';
 
 function makeService(
   opts: {
@@ -7,12 +7,14 @@ function makeService(
     failWithCode?: string;
     productStatus?: string;
     balanceOk?: boolean;
+    rekeying?: boolean;
   } = {},
 ) {
   const calls: { sql: string; params: any[] }[] = [];
   const pg = {
     query: jest.fn(async (sql: string, params: any[] = []) => {
       calls.push({ sql, params });
+      if (sql.includes("kind = 'rekey'")) return { rows: opts.rekeying ? [{ x: 1 }] : [] };
       if (sql.includes('SELECT status FROM products')) {
         return { rows: [{ status: opts.productStatus ?? 'running' }] };
       }
@@ -348,5 +350,30 @@ describe('TurnsService.enqueue — блокированный продукт', (
     ).rejects.toMatchObject({ message: BLOCKED_REFUSAL });
 
     expect(calls.some((c) => c.sql.includes('INSERT INTO product_turns'))).toBe(false);
+  });
+});
+
+describe('правка во время смены ключей', () => {
+  it('пока rekey в очереди или идёт — 409 со своим текстом, ход не ставится', async () => {
+    const { svc, calls } = makeService({ rekeying: true });
+    await expect(svc.enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: 'п' })).rejects.toThrow(ConflictException);
+    await expect(svc.enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: 'п' })).rejects.toThrow(REKEY_REFUSAL);
+    expect(calls.some((c) => c.sql.includes('INSERT INTO product_turns'))).toBe(false);
+    const q = calls.find((c) => c.sql.includes("kind = 'rekey'"))!;
+    expect(q.sql).toMatch(/status IN \('queued','running'\)/);
+  });
+
+  it('спящему по-прежнему свой отказ — проверка ключей стоит после статусов', async () => {
+    const { svc } = makeService({ rekeying: true, productStatus: 'sleeping' });
+    await expect(svc.enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: 'п' })).rejects.toThrow(SLEEPING_REFUSAL);
+  });
+
+  it('пустой баланс не меняет исход — проверка ключей стоит ДО баланса', async () => {
+    // Пополнение смену ключей не ускорит (докблок REKEY_REFUSAL), поэтому
+    // владельцу без денег всё равно нужен именно этот текст, а не
+    // «Недостаточно токенов»: тот подсказал бы пополнить баланс впустую.
+    const { svc, misc } = makeService({ rekeying: true, balanceOk: false });
+    await expect(svc.enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: 'п' })).rejects.toThrow(REKEY_REFUSAL);
+    expect(misc.checkTokenBalance).not.toHaveBeenCalled();
   });
 });

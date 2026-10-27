@@ -507,12 +507,27 @@ describe('claimJob: вид задания', () => {
     // У задания domain (свой домен) ветка своя, и перед ней в SQL стоит
     // комментарий — отсюда допуск строк `--` между ветками. Поведенческий
     // сторож этой ветки — domains.jobs.spec.ts.
+    //
+    // rekey и purge (очередь 2) встают МЕЖДУ domain и ELSE — тот же порядок,
+    // что в файле. Содержимое их условий (EXISTS по карточке и правке у
+    // rekey, purge_after у purge) не пересказывается здесь посимвольно —
+    // поведенческий сторож этих двух веток — provisioning.rekey-purge.spec.ts
+    // против живого Postgres; этот тест остаётся сторожем ТОЛЬКО порядка и
+    // состава веток.
+    //
+    // `(?!WHEN ')` В ТЕЛЕ ВЕТКИ rekey — не косметика: без него ленивый
+    // `[\s\S]*?` перепрыгнул бы через ЛЮБУЮ вставленную между rekey и purge
+    // ветку (скажем, по ошибке слитое copy-paste `WHEN 'wake' …`) и нашёл бы
+    // 'purge' дальше молча зелёным. Запрет остановиться на тексте, который сам
+    // начинается с `WHEN '`, не даёт ленивому квантификатору перешагнуть
+    // через чужую ветку — тест обязан покраснеть, если между rekey и purge
+    // появится третья.
     const { svc, calls } = makeService();
 
     await svc.claimJob('own');
 
     expect(calls[0].sql).toMatch(
-      /CASE j\.kind\s+WHEN 'provision' THEN p\.status = 'provisioning'\s+WHEN 'sleep' THEN p\.status IN \('sleeping','blocked','archived'\)\s+(?:--[^\n]*\n\s*)*WHEN 'domain' THEN p\.status IN \('running','degraded','sleeping','blocked'\)\s+ELSE p\.status = 'sleeping'\s+END/,
+      /CASE j\.kind\s+WHEN 'provision' THEN p\.status = 'provisioning'\s+WHEN 'sleep' THEN p\.status IN \('sleeping','blocked','archived'\)\s+(?:--[^\n]*\n\s*)*WHEN 'domain' THEN p\.status IN \('running','degraded','sleeping','blocked'\)\s+(?:--[^\n]*\n\s*)*WHEN 'rekey' THEN p\.status IN \('running','degraded'\)(?:(?!WHEN ')[\s\S])*?WHEN 'purge' THEN p\.status = 'archived' AND p\.purge_after <= now\(\)\s+ELSE p\.status = 'sleeping'\s+END/,
     );
   });
 

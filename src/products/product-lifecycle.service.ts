@@ -2,9 +2,9 @@ import { HttpException, Injectable, Logger, OnModuleDestroy, OnModuleInit } from
 import { PgService } from '../common/services/pg.service';
 import { ProvisioningService } from './provisioning.service';
 import { LimitsService } from './limits.service';
-import { TurnsService, TURN_SILENCE_SQL } from './turns.service';
+import { REKEY_REFUSAL, TurnsService, TURN_SILENCE_SQL } from './turns.service';
 import { RENT_TOKENS, SLEEP_REASON_NO_TOKENS } from './rent.service';
-import { ActionChannel, ConfirmedVia, DELETE_GRACE_DAYS, ProductActionsService } from './product-actions.service';
+import { ActionChannel, ConfirmedVia, DELETE_GRACE_DAYS, JOB_KILLED_BY_DELETE, ProductActionsService } from './product-actions.service';
 import { BotTokenCheck, checkBotToken } from './bot-token-check';
 import { randomSuffix, siteSlugCandidates, slugWithSuffix } from './product-slug';
 import { SecretsService } from './secrets.service';
@@ -436,9 +436,9 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       // Пробуждение и прочее в очереди архивному не выдаются и заняли бы
       // место единственного активного задания — снимаем.
       await this.pg.query(
-        `UPDATE product_provision_jobs SET status = 'failed', error = 'снято удалением', finished_at = now()
+        `UPDATE product_provision_jobs SET status = 'failed', error = $2::text, finished_at = now()
           WHERE product_id = $1 AND status = 'queued' AND kind <> 'sleep'`,
-        [row.product_id],
+        [row.product_id, JOB_KILLED_BY_DELETE],
       );
       // Правка продукта — туда же, тем же приёмом, что у блокировки
       // администратора (block.service.ts, killed_turns): 'queued' наравне с
@@ -533,14 +533,16 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
   async sleepDeletedTick(): Promise<number> {
     // Снятие заданий в completeDelete могло оборваться. Тогда queued-задание
     // архивного продукта не выдаётся никому (claimJob архивному отдаёт только
-    // sleep) и вечно загораживает сон: queueSleepForDeleted ждёт пустой
+    // sleep и, после срока, purge) и вечно загораживает сон: queueSleepForDeleted ждёт пустой
     // очереди. Доснимаем здесь. Возврат снимает архив раньше, чем ставит своё
-    // пробуждение, — его задание сюда не попадает.
+    // пробуждение, — его задание сюда не попадает. Стирание (purge, очередь 2)
+    // — тоже задание архивного продукта, его не снимаем.
     await this.pg.query(
-      `UPDATE product_provision_jobs j SET status = 'failed', error = 'снято удалением', finished_at = now()
+      `UPDATE product_provision_jobs j SET status = 'failed', error = $1::text, finished_at = now()
          FROM products p
         WHERE j.product_id = p.id AND p.archived_at IS NOT NULL
-          AND j.status = 'queued' AND j.kind <> 'sleep'`,
+          AND j.status = 'queued' AND j.kind NOT IN ('sleep','purge')`,
+      [JOB_KILLED_BY_DELETE],
     );
     return this.queueSleepForDeleted();
   }
@@ -727,7 +729,14 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
                     WHEN block_reason IS NULL AND $4 IS DISTINCT FROM 'failed' AND $5 THEN NULL
                     ELSE sleep_reason
                   END
-            WHERE id = $1 AND user_id = $2 AND archived_at IS NOT NULL AND purged_at IS NULL AND purge_after > now()
+            -- clock_timestamp(), а не now(): now() — время НАЧАЛА этой
+            -- транзакции, и возврат, начатый за миг до срока, прошёл бы уже
+            -- после него — когда почасовой обход стирания
+            -- (product-purge.service.ts, wipeExpired) успел стереть продукту
+            -- ключи и тексты. Часы здесь читаются под замком строки (захват
+            -- в начале транзакции): обход, стёрший ключи, закоммитил до нас,
+            -- а значит, и срок к этому мигу уже вышел.
+            WHERE id = $1 AND user_id = $2 AND archived_at IS NOT NULL AND purged_at IS NULL AND purge_after > clock_timestamp()
             RETURNING status, paid_until > now() AS paid, paid_until`,
           [p.id, i.userId, SLEEP_REASON_NO_TOKENS, prevStatus, affordable],
         );
@@ -752,7 +761,16 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       if (!botInUse) {
         const row = r.rows[0];
         if (!row) {
+          // Строка заперта (захват в начале транзакции) и была архивной и не стёртой —
+          // ноль строк здесь почти всегда значит «срок вышел, пока шёл
+          // возврат». Перечитываем под тем же замком, чтобы ответить правду,
+          // а не «такого продукта нет».
+          const why = await client.query(
+            `SELECT (purge_after IS NOT NULL AND purge_after <= clock_timestamp()) AS expired FROM products WHERE id = $1`,
+            [p.id],
+          );
           await client.query('ROLLBACK');
+          if (why.rows[0]?.expired === true) return { ok: false, reason: 'expired', message: 'Срок возврата вышел' };
           return { ok: false, reason: 'not_found', message: 'Удалённого продукта с таким именем нет' };
         }
         let waking = false;
@@ -850,13 +868,13 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
   /**
    * Откат правки. Отказы очереди правок (сон, блок, баланс) — броском, как у
    * enqueue: `this.turns.revert` внутри зовёт `enqueue`, и его отказы
-   * (SLEEPING_REFUSAL → 402, BLOCKED_REFUSAL → 409, «Агент уже работает над
-   * предыдущим запросом» → 409, «Недостаточно токенов» → 402, «Product not
-   * found» → 404) здесь НЕ перехватываются и НЕ превращаются в LifecycleFail —
-   * этот метод их прокидывает наверх как есть. Разбирает их вызывающий слой
-   * инструмента (product-tool.service.ts, `refusal()`), который сопоставляет
-   * текст с причиной для ассистента; здесь никакого try/catch нет намеренно,
-   * а не по недосмотру.
+   * (SLEEPING_REFUSAL → 402, BLOCKED_REFUSAL → 409, REKEY_REFUSAL → 409,
+   * «Агент уже работает над предыдущим запросом» → 409, «Недостаточно
+   * токенов» → 402, «Product not found» → 404) здесь НЕ перехватываются и НЕ
+   * превращаются в LifecycleFail — этот метод их прокидывает наверх как
+   * есть. Разбирает их вызывающий слой инструмента (product-tool.service.ts,
+   * `refusal()`), который сопоставляет текст с причиной для ассистента;
+   * здесь никакого try/catch нет намеренно, а не по недосмотру.
    */
   async revert(i: { userId: string; productId: string; turnId?: string | null; channel: ActionChannel }):
     Promise<{ ok: true; turnId: string } | LifecycleFail> {
@@ -936,14 +954,17 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
         // (refusal): у HttpException это публичное поле `response`, а не
         // getResponse() — здесь нужен только текст для сравнения, не статус.
         const msg = typeof e?.response === 'string' ? e.response : (e?.response?.message ?? e?.message ?? '');
-        if (msg === 'Агент уже работает над предыдущим запросом') {
+        if (msg === 'Агент уже работает над предыдущим запросом' || msg === REKEY_REFUSAL) {
           // Мьютекс хода занят кем-то другим (например, владелец поставил
           // правку руками до того, как первая правка добралась до своего
-          // тика) — первая правка не потеряна, а отложена: CTE выше уже
-          // обнулил first_prompt этой строки, и без возврата продукт навсегда
-          // остался бы без своей первой правки. `first_prompt IS NULL` —
-          // чтобы не затереть первую правку, которую между CTE и этим UPDATE
-          // поставил кто-то ещё (повторное создание тем же именем).
+          // тика), ИЛИ продукту меняют ключи — оба отказа временные: первая
+          // правка не потеряна, а отложена. CTE выше уже обнулил first_prompt
+          // этой строки, и без возврата продукт навсегда остался бы без своей
+          // первой правки — для rekey тем более: он кончается за секунды, и
+          // следующий тик (через 30 секунд) почти наверняка застанет продукт
+          // уже 'running' с новыми ключами. `first_prompt IS NULL` — чтобы не
+          // затереть первую правку, которую между CTE и этим UPDATE поставил
+          // кто-то ещё (повторное создание тем же именем).
           await this.pg.query(
             `UPDATE products SET first_prompt = $2, first_prompt_channel = $3 WHERE id = $1 AND first_prompt IS NULL`,
             [row.id, row.first_prompt, row.first_prompt_channel],
