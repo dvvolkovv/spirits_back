@@ -368,10 +368,11 @@ export class ShortsPublisherService implements OnModuleInit {
    * новой попытки даёт лишь продление живости или запись итога ролика, но не повторную
    * отправку: отправки охраняет жетон строки, а запись «исход неизвестен» гасит ролик по своей
    * строке, даже если жетон ролика уже совпал у другой попытки (её устаревший finishAttempt мог
-   * вернуть ролик в approved посреди нашей отправки). Зависшая попытка, прошедшая эти проверки по ролику,
-   * может и сама захватить освободившуюся строку площадки (захват смотрит только на статус, не на
-   * то, кто её держал) и отправить свой снимок ролика — это одна отправка, без дубля, но, если
-   * тем временем было leave (пересъёмка), это будет отправка уже прежней версии ролика.
+   * вернуть ролик в approved или перевести в failed посреди нашей отправки). Зависшая попытка,
+   * прошедшая эти проверки по ролику, может и сама захватить освободившуюся строку площадки
+   * (захват смотрит только на статус, не на то, кто её держал) и отправить свой снимок ролика —
+   * это одна отправка, без дубля, но, если тем временем было leave (пересъёмка), это будет
+   * отправка уже прежней версии ролика.
    */
   private async platform(v: ShortVideo, platform: ShortPlatform, send: (fence: number) => Promise<PlatformResult>): Promise<PlatformOutcome> {
     const claim = await this.pg.query(
@@ -413,9 +414,13 @@ export class ShortsPublisherService implements OnModuleInit {
         // (EXISTS pub). Безопасно: строка своя — значит, площадку захватила эта попытка, и в канал,
         // кроме неё, никто не шлёт. Ролик в approved при своей строке в publishing бывает только от
         // устаревшего finishAttempt при обнулённом счётчике (жетон ролика совпал) — без этой записи
-        // следующий тик отправил бы пост снова. Ролик в publishing у другой попытки дальше в канал
-        // не пойдёт: её продление перед отправкой не пройдёт (ролик failed), а её finishAttempt
-        // после нашего failed — пустой. Запрос возвращает оба факта — для точного лога.
+        // следующий тик отправил бы пост снова. Ролик в failed при своей строке в publishing — от
+        // такого же finishAttempt последней попытки (сторож перевёл бы и строку, и тогда pub не
+        // сработал бы): его причину перезаписываем на «пост мог выйти» и сбрасываем
+        // failure_notified — владелец получит повторное уведомление с верной причиной, а не retry
+        // по чужой. Ролик в publishing у другой попытки дальше в канал не пойдёт: её продление перед
+        // отправкой не пройдёт (ролик failed), а её finishAttempt после нашего failed — пустой.
+        // Запрос возвращает оба факта — для точного лога.
         const r = await this.pg.query(
           `WITH pub AS (
              UPDATE short_publication SET status = 'failed', last_error = $3, updated_at = now()
@@ -425,7 +430,7 @@ export class ShortsPublisherService implements OnModuleInit {
            vid AS (
              UPDATE short_video SET status = 'failed', failed_from = 'publishing', last_error = $4,
                     failure_notified = false, updated_at = now()
-              WHERE id = $1 AND status IN ('publishing', 'approved') AND EXISTS (SELECT 1 FROM pub)
+              WHERE id = $1 AND status IN ('publishing', 'approved', 'failed') AND EXISTS (SELECT 1 FROM pub)
               RETURNING 1
            )
            SELECT (SELECT count(*) FROM pub)::int AS pub, (SELECT count(*) FROM vid)::int AS vid`,
