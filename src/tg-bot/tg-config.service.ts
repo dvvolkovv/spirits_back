@@ -348,16 +348,38 @@ export class TgConfigService {
       if (a.rows[0]) agentId = String(a.rows[0].id);
     }
 
+    // ON CONFLICT — от гонки: апдейты одного чата приходят параллельно
+    // (альбом — пачкой), и оба вызова могли прочитать «конфига нет». Раньше
+    // вторая вставка падала 23505 на idx_tg_bot_configs_active_chat, и её
+    // сообщение молча терялось. Теперь проигравший берёт конфиг победителя.
     const created = await this.pg.query(
       `INSERT INTO tg_bot_configs (
          owner_user_id, tg_chat_id, display_name, preset_agent_id,
          addressing_mode, voice_reply_mode, status
        ) VALUES ($1, $2, $3, $4, $5, 'mirror', 'active')
+       ON CONFLICT (tg_chat_id) WHERE status IN ('active','silent') DO NOTHING
        RETURNING *`,
       [ownerId, tgChatId, 'Linkeon', agentId, 'always'],
     );
-    this.logger.log(`создан приватный конфиг для чата ${tgChatId} (владелец ${ownerId})`);
-    return created.rows[0];
+    if (created.rows[0]) {
+      this.logger.log(`создан приватный конфиг для чата ${tgChatId} (владелец ${ownerId})`);
+      return created.rows[0];
+    }
+
+    // Один повтор, без цикла. Победитель свой — его и вернуть. Чужой (Telegram
+    // перепривязали прямо сейчас) или пропал — по кругу не архивируем, а
+    // отказываем громко: молча вести чат через чужой конфиг нельзя.
+    const again = await this.pg.query(
+      `SELECT * FROM tg_bot_configs WHERE tg_chat_id = $1 AND status IN ('active','silent') LIMIT 1`,
+      [tgChatId],
+    );
+    const winner = again.rows[0];
+    if (winner && winner.owner_user_id === ownerId) return winner;
+    this.logger.error(
+      `личка ${tgChatId}: вставка конфига для ${ownerId} уступила параллельной, а живой конфиг ` +
+        (winner ? `${winner.id} принадлежит ${winner.owner_user_id}` : 'не найден'),
+    );
+    throw new Error(`личка ${tgChatId}: нет живого конфига владельца ${ownerId} после параллельной вставки`);
   }
 
   async getMessagesForConfig(configId: string, ownerId: string, limit: number = 50): Promise<any[]> {

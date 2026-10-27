@@ -391,6 +391,10 @@ export class IdentityService implements OnModuleInit {
       this.logger.log(`merge: ${tokens} токенов ${loserUserId} → ${survivorUserId}`);
     }
 
+    // tg_user_identities слияние не переносит. Начнёт переносить — тем же шагом
+    // переносить owner_user_id лички (tg_bot_configs с tg_chat_id = tg_user_id),
+    // иначе сторож в TgConfigService.ensurePrivateConfig заархивирует личку
+    // объединённого человека как чужую.
     await this.pg.query(
       `UPDATE user_identities SET user_id = $1 WHERE user_id = $2`,
       [survivorUserId, loserUserId],
@@ -497,10 +501,10 @@ export class IdentityService implements OnModuleInit {
     // списания — прежнему, его личный профиль — в ответы, чат — в его кабинете.
     // Групповые конфиги не трогаем: группы остаются за владельцем.
     //
-    // Одним запросом: PgService раздаёт соединения из пула, и BEGIN/COMMIT
-    // отдельными query() могли бы уехать на разные соединения (см.
-    // mergeAccounts). Запросы-изменения в WITH выполняются всегда целиком,
-    // даже если основной запрос их вывода не читает.
+    // Атомарно одним оператором, без явной транзакции (getClient + BEGIN/
+    // COMMIT): все три изменения либо случаются вместе, либо ни одно.
+    // Запросы-изменения в WITH выполняются всегда целиком, даже если основной
+    // запрос их вывода не читает.
     await this.pg.query(
       `WITH d AS (
          DELETE FROM user_identities WHERE id = $1 AND user_id = $2
