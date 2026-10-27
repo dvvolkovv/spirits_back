@@ -44,6 +44,8 @@ describe('AdminService.createReferralLeader — телефон лидера', ()
 
   it('user_id почтового или OAuth-пользователя (UUID) не трогает', async () => {
     expect(await savedUserPhone('0b7c2f3e-1a2b-4c5d-8e9f-0a1b2c3d4e5f')).toBe('0b7c2f3e-1a2b-4c5d-8e9f-0a1b2c3d4e5f');
+    // UUID, в котором случайно нет букв, — всё равно UUID, а не телефон.
+    expect(await savedUserPhone('12345678-1234-4234-8234-123456789012')).toBe('12345678-1234-4234-8234-123456789012');
   });
 
   it('пустой телефон остаётся пустым', async () => {
