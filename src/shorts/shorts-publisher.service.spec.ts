@@ -96,10 +96,13 @@ function fakeDb(over: Record<string, any> = {}, opts: FakeOpts = {}) {
       const pubHit = row.status === 'publishing' && fits(fenceArg(s, p, 0), row.attempts);
       if (pubHit) Object.assign(row, { status: 'failed', last_error: p[2] });
       const needsPub = s.includes('EXISTS (SELECT 1 FROM pub)');
-      // Ролик — в статусах из условия (перечень IN или только publishing) и с жетоном, если он там есть.
-      const list = s.match(/WHERE id = \$1 AND status IN \(([^)]*)\)/);
+      // Ролик — в статусах из условия (перечень IN или только publishing; failed — с failed_from, если оно
+      // в условии) и с жетоном, если он там есть.
+      const vidSql = s.slice(s.indexOf('UPDATE short_video'));
+      const list = vidSql.match(/status IN \(([^)]*)\)/);
       const statuses = list ? [...list[1].matchAll(/'(\w+)'/g)].map((x) => x[1]) : ['publishing'];
-      const vidHit = statuses.includes(v.status) && fits(fenceArg(s, p, 1), v.attempts) && (!needsPub || pubHit);
+      const failedOnPublishing = vidSql.includes("(status = 'failed' AND failed_from = 'publishing')") && v.status === 'failed' && v.failed_from === 'publishing';
+      const vidHit = (statuses.includes(v.status) || failedOnPublishing) && fits(fenceArg(s, p, 1), v.attempts) && (!needsPub || pubHit);
       if (vidHit) Object.assign(v, { status: 'failed', failed_from: 'publishing', failure_notified: false, last_error: p[3] });
       // Запрос, который возвращает оба факта: сколько записано строк площадки и роликов.
       if (s.includes('::int AS pub')) return { rows: [{ pub: pubHit ? 1 : 0, vid: vidHit ? 1 : 0 }], rowCount: 1 };
@@ -994,6 +997,21 @@ describe('ShortsPublisherService — жетон попытки', () => {
     expect(db.pubs.get('telegram')).toMatchObject({ status: 'failed', last_error: expect.stringMatching(/^пост мог выйти/) });
     expect(db.v).toMatchObject({ status: 'failed', failed_from: 'publishing', failure_notified: false });
     expect(db.v.last_error).toContain(POST_MAY_BE_OUT);
+  });
+
+  it('исход Telegram неизвестен, строка своя, а ролик упал на другом этапе (пересъёмка после устаревшего возврата) — ролик не трогаем', async () => {
+    const db = fakeDb();
+    const { svc, tg } = setup(db);
+    const failedElsewhere = { status: 'failed', failed_from: 'directing', approved_at: null, last_error: 'режиссёр: релей молчит', failure_notified: true };
+    tg.sendVideo.mockImplementationOnce(async () => {
+      // Устаревший возврат в очередь → «Переснять» (leave) → пересъёмка упала.
+      Object.assign(db.v, failedElsewhere);
+      throw new HttpError("Network request for 'sendVideo' failed!", new Error('socket hang up'));
+    });
+    await svc.publish(ID);
+    expect(db.v).toMatchObject(failedElsewhere);
+    expect(db.pubs.get('telegram')).toMatchObject({ status: 'failed', last_error: expect.stringMatching(/^пост мог выйти/) });
+    expect(logError.mock.calls.some(([m]) => String(m).includes('ролик уже не в публикации — его статус не тронут'))).toBe(true);
   });
 
   it('исход Telegram неизвестен, строка своя, а ролик уже не в публикации — строка в failed, в логе сказано, что ролик не тронут', async () => {
