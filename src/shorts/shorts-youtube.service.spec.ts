@@ -1,6 +1,7 @@
 import { Logger } from '@nestjs/common';
-import { decryptSecret } from '../calendar/crypto';
-import { ShortsYoutubeService, connectPage, parseYoutubeCommand } from './shorts-youtube.service';
+import { decryptSecret, encryptSecret } from '../calendar/crypto';
+import { PENDING_UPLOAD_NOTE, ShortsYoutubeService, connectPage, parseYoutubeCommand } from './shorts-youtube.service';
+import { YoutubeAuthError, YoutubeMaybeUploaded, YoutubeNotUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
 import { HttpRequest, HttpResponse } from './youtube/youtube-http';
 import { verifyState } from './youtube/youtube-state';
 
@@ -264,5 +265,222 @@ describe('адрес возврата Google', () => {
 
   it('текст страницы экранируется', () => {
     expect(connectPage(200, 'Канал <b>', 'a & "b"').html).toContain('Канал &lt;b&gt;</h1><p>a &amp; &quot;b&quot;</p>');
+  });
+});
+
+describe('загрузка ролика', () => {
+  const CONNECTED = { channel_id: 'UCx', channel_title: 'Linkeon', status: 'connected' };
+  const connected = (extra: any = {}) => fakeDb({ mode: 'public', account: { ...CONNECTED, refresh_token_enc: encryptSecret('refresh-xyz') }, ...extra });
+  const video: any = {
+    id: 'v1', videoKey: 'shorts/v1/video.mp4', lang: 'ru', attempts: 1,
+    captions: { youtube: { title: 'Как не потерять залог', description: 'Описание\n\nhttps://my.linkeon.io/?utm_source=youtube', tags: ['аренда', 'залог'] } },
+  };
+  const SESSION = 'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=abc';
+  const TOKEN = reply(200, { access_token: 'access-xyz' });
+  const alive = () => jest.fn(async () => true);
+  const caught = (p: Promise<unknown>): Promise<any> => p.then(() => null, (e) => e);
+
+  it('план: вручную — набор без заметки; нет канала, доступ пропал, нет клиента — набор с заметкой; иначе загрузка', async () => {
+    expect(await setup(fakeDb({ mode: 'manual' })).svc.uploadPlan('v1')).toEqual({ kind: 'kit', note: null });
+    expect(await setup(fakeDb({ mode: 'public' })).svc.uploadPlan('v1'))
+      .toEqual({ kind: 'kit', note: 'Канал YouTube не подключён — набор вместо загрузки. Подключить: /youtube' });
+    expect(await setup(fakeDb({ mode: 'unlisted', account: { ...CONNECTED, refresh_token_enc: 'e', status: 'revoked' } })).svc.uploadPlan('v1'))
+      .toEqual({ kind: 'kit', note: 'Доступ к каналу YouTube пропал — набор вместо загрузки. Переподключить: /youtube' });
+    expect(await setup(fakeDb({ mode: 'unlisted', account: { ...CONNECTED, refresh_token_enc: 'e' } })).svc.uploadPlan('v1'))
+      .toEqual({ kind: 'upload', privacy: 'unlisted' });
+    delete process.env.YOUTUBE_OAUTH_CLIENT_ID;
+    expect(await setup(fakeDb({ mode: 'public' })).svc.uploadPlan('v1'))
+      .toEqual({ kind: 'kit', note: 'YouTube не настроен на сервере — набор вместо загрузки.' });
+  });
+
+  it('набор при живой сессии загрузки — с предупреждением проверить канал', async () => {
+    expect(await setup(fakeDb({ mode: 'manual', session: SESSION })).svc.uploadPlan('v1')).toEqual({ kind: 'kit', note: PENDING_UPLOAD_NOTE });
+    expect(await setup(fakeDb({ mode: 'public', session: SESSION, account: { ...CONNECTED, refresh_token_enc: 'e', status: 'revoked' } })).svc.uploadPlan('v1'))
+      .toEqual({ kind: 'kit', note: `Доступ к каналу YouTube пропал — набор вместо загрузки. Переподключить: /youtube ${PENDING_UPLOAD_NOTE}` });
+  });
+
+  it('загрузка: токен, сессия с метаданными, адрес лёг в базу до файла, файл с токеном, адрес стёрт', async () => {
+    const db = connected();
+    const http = fakeHttp(TOKEN, reply(200, {}, { location: SESSION }), reply(201, { id: 'abcdefghijk' }));
+    const { svc } = setup(db, http);
+    const seen: any[] = [];
+    const keepAlive = jest.fn(async () => {
+      seen.push(db.st.session);
+      return true;
+    });
+    expect(await svc.upload(video, 'public', keepAlive)).toEqual({ videoId: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk' });
+    expect(seen).toEqual([SESSION]);
+    expect(db.st.session).toBeNull();
+    const start = http.calls[1];
+    expect(start.headers?.Authorization).toBe('Bearer access-xyz');
+    expect(start.data.snippet).toEqual({
+      title: 'Как не потерять залог', description: 'Описание\n\nhttps://my.linkeon.io/?utm_source=youtube', tags: ['аренда', 'залог'],
+      categoryId: '27', defaultLanguage: 'ru', defaultAudioLanguage: 'ru',
+    });
+    expect(start.data.status).toEqual({ privacyStatus: 'public', selfDeclaredMadeForKids: false, containsSyntheticMedia: false });
+    expect(http.calls[2]).toMatchObject({ method: 'PUT', url: SESSION });
+    expect(http.calls[2].headers?.Authorization).toBe('Bearer access-xyz');
+    expect(Buffer.isBuffer(http.calls[2].data)).toBe(true);
+  });
+
+  it('прошлая сессия загружена — тот же ролик, без новой загрузки', async () => {
+    const db = connected({ session: SESSION });
+    const http = fakeHttp(TOKEN, reply(200, { id: 'abcdefghijk' }));
+    const { svc } = setup(db, http);
+    expect((await svc.upload(video, 'public', alive())).videoId).toBe('abcdefghijk');
+    expect(http.calls).toHaveLength(2);
+    expect(http.calls[1].headers).toMatchObject({ Authorization: 'Bearer access-xyz', 'Content-Range': 'bytes */11' });
+    expect(db.st.session).toBeNull();
+  });
+
+  it('прошлая сессия не догружена или кончилась отказом — адрес стёрт, новая загрузка', async () => {
+    for (const answer of [reply(308), reply(400, { error: { message: 'bad metadata' } })]) {
+      const db = connected({ session: SESSION });
+      const http = fakeHttp(TOKEN, answer, reply(200, {}, { location: `${SESSION}2` }), reply(200, { id: 'newvideo123' }));
+      const { svc } = setup(db, http);
+      expect((await svc.upload(video, 'public', alive())).videoId).toBe('newvideo123');
+      expect(http.calls).toHaveLength(4);
+      expect(db.st.session).toBeNull();
+    }
+  });
+
+  it('прошлая сессия истекла (404) — YoutubeUploadExpired, адрес остаётся (повтор снова пришлёт набор), новой загрузки нет', async () => {
+    const db = connected({ session: SESSION });
+    const http = fakeHttp(TOKEN, reply(404));
+    const { svc } = setup(db, http);
+    expect(await caught(svc.upload(video, 'public', alive()))).toBeInstanceOf(YoutubeUploadExpired);
+    expect(db.st.session).toBe(SESSION);
+    expect(http.calls).toHaveLength(2);
+  });
+
+  it('при живой сессии сбой токена или хранилища — YoutubeMaybeUploaded: прошлая загрузка не проверена, адрес остаётся', async () => {
+    const a = connected({ session: SESSION });
+    expect(await caught(setup(a, fakeHttp(reply(503, {}))).svc.upload(video, 'public', alive()))).toBeInstanceOf(YoutubeMaybeUploaded);
+    expect(a.st.session).toBe(SESSION);
+    const b = connected({ session: SESSION });
+    const s = setup(b, fakeHttp(TOKEN));
+    s.storage.download.mockRejectedValueOnce(new Error('minio down'));
+    expect(await caught(s.svc.upload(video, 'public', alive()))).toBeInstanceOf(YoutubeMaybeUploaded);
+    expect(b.st.session).toBe(SESSION);
+  });
+
+  it('о прошлой сессии нет ответа — YoutubeMaybeUploaded, адрес остаётся, новой загрузки нет', async () => {
+    const db = connected({ session: SESSION });
+    const http = fakeHttp(TOKEN, new Error('ETIMEDOUT'));
+    const { svc } = setup(db, http);
+    expect(await caught(svc.upload(video, 'public', alive()))).toBeInstanceOf(YoutubeMaybeUploaded);
+    expect(db.st.session).toBe(SESSION);
+    expect(http.calls).toHaveLength(2);
+  });
+
+  it('invalid_grant — YoutubeAuthError, аккаунт отозван с причиной; при живой сессии — pendingUpload', async () => {
+    const a = connected();
+    const ea = await caught(setup(a, fakeHttp(reply(400, { error: 'invalid_grant', error_description: 'Token has been expired or revoked.' }))).svc.upload(video, 'public', alive()));
+    expect(ea).toBeInstanceOf(YoutubeAuthError);
+    expect(ea.pendingUpload).toBe(false);
+    expect(a.st.account).toMatchObject({ status: 'revoked', last_error: 'HTTP 400 invalid_grant: Token has been expired or revoked.' });
+    const b = connected({ session: SESSION });
+    const eb = await caught(setup(b, fakeHttp(reply(400, { error: 'invalid_grant' }))).svc.upload(video, 'public', alive()));
+    expect(eb).toBeInstanceOf(YoutubeAuthError);
+    expect(eb.pendingUpload).toBe(true);
+    expect(b.st.session).toBe(SESSION);
+  });
+
+  it('401 при начале сессии — YoutubeNotUploaded, аккаунт не отзываем', async () => {
+    const db = connected();
+    const { svc } = setup(db, fakeHttp(TOKEN, reply(401, { error: { message: 'Invalid Credentials' } })));
+    const e = await caught(svc.upload(video, 'public', alive()));
+    expect(e).toBeInstanceOf(YoutubeNotUploaded);
+    expect(e).toMatchObject({ status: 401 });
+    expect(db.st.account.status).toBe('connected');
+  });
+
+  it('токен не расшифровался — YoutubeAuthError и отзыв, без запросов к Google', async () => {
+    const db = fakeDb({ mode: 'public', account: { ...CONNECTED, refresh_token_enc: 'битый' } });
+    const { svc, http } = setup(db, fakeHttp());
+    const e = await caught(svc.upload(video, 'public', alive()));
+    expect(e).toBeInstanceOf(YoutubeAuthError);
+    expect(e.message).toMatch(/не расшифровался/);
+    expect(db.st.account.status).toBe('revoked');
+    expect(http.http).not.toHaveBeenCalled();
+  });
+
+  it('файл оборвался, а YouTube говорит «загружено» — успех', async () => {
+    const db = connected();
+    const http = fakeHttp(TOKEN, reply(200, {}, { location: SESSION }), new Error('socket hang up'), reply(201, { id: 'abcdefghijk' }));
+    const { svc } = setup(db, http);
+    expect((await svc.upload(video, 'public', alive())).videoId).toBe('abcdefghijk');
+    expect(db.st.session).toBeNull();
+  });
+
+  it('файл оборвался, YouTube говорит «не догружено» — YoutubeNotUploaded, адрес стёрт', async () => {
+    const db = connected();
+    const http = fakeHttp(TOKEN, reply(200, {}, { location: SESSION }), new Error('socket hang up'), reply(308));
+    const { svc } = setup(db, http);
+    expect(await caught(svc.upload(video, 'public', alive()))).toBeInstanceOf(YoutubeNotUploaded);
+    expect(db.st.session).toBeNull();
+  });
+
+  it('файл оборвался, а сессия кончилась отказом — YoutubeNotUploaded с причиной Google, адрес стёрт', async () => {
+    const db = connected();
+    const http = fakeHttp(
+      TOKEN, reply(200, {}, { location: SESSION }), new Error('socket hang up'),
+      reply(403, { error: { message: 'limit', errors: [{ reason: 'uploadLimitExceeded' }] } }),
+    );
+    const { svc } = setup(db, http);
+    const e = await caught(svc.upload(video, 'public', alive()));
+    expect(e).toBeInstanceOf(YoutubeNotUploaded);
+    expect(e).toMatchObject({ status: 403, message: 'отправка файла: HTTP 403 uploadLimitExceeded: limit' });
+    expect(db.st.session).toBeNull();
+  });
+
+  it('файл оборвался и о сессии нет ответа — YoutubeMaybeUploaded, адрес остаётся', async () => {
+    const db = connected();
+    const http = fakeHttp(TOKEN, reply(200, {}, { location: SESSION }), new Error('socket hang up'), new Error('ECONNRESET'));
+    const { svc } = setup(db, http);
+    expect(await caught(svc.upload(video, 'public', alive()))).toBeInstanceOf(YoutubeMaybeUploaded);
+    expect(db.st.session).toBe(SESSION);
+  });
+
+  it('файл: явный отказ 4xx — YoutubeNotUploaded, адрес стёрт (сессия на повторе повторила бы отказ)', async () => {
+    const db = connected();
+    const http = fakeHttp(TOKEN, reply(200, {}, { location: SESSION }), reply(400, { error: { message: 'bad' } }));
+    const { svc } = setup(db, http);
+    const e = await caught(svc.upload(video, 'public', alive()));
+    expect(e).toBeInstanceOf(YoutubeNotUploaded);
+    expect(e).toMatchObject({ status: 400 });
+    expect(db.st.session).toBeNull();
+  });
+
+  it('ролик ушёл из publishing до файла — YoutubeNotUploaded, файл не отправлен', async () => {
+    const db = connected();
+    const http = fakeHttp(TOKEN, reply(200, {}, { location: SESSION }));
+    const { svc } = setup(db, http);
+    expect(await caught(svc.upload(video, 'public', jest.fn(async () => false)))).toBeInstanceOf(YoutubeNotUploaded);
+    expect(http.calls).toHaveLength(2);
+  });
+
+  it('нет файла или подписей — YoutubeNotUploaded без запросов', async () => {
+    const { svc, http } = setup(connected());
+    expect(await caught(svc.upload({ ...video, videoKey: null }, 'public', alive()))).toBeInstanceOf(YoutubeNotUploaded);
+    expect(await caught(svc.upload({ ...video, captions: null }, 'public', alive()))).toBeInstanceOf(YoutubeNotUploaded);
+    expect(http.http).not.toHaveBeenCalled();
+  });
+});
+
+describe('сообщение о загрузке', () => {
+  it('«по ссылке» — ссылка и подсказка про «публично»', async () => {
+    const { svc, said } = setup(fakeDb({ mode: 'unlisted', published: 'https://youtube.com/shorts/abcdefghijk' }));
+    await svc.notifyUploaded('v1');
+    expect(said()).toEqual(['Вышло на YouTube (по ссылке): https://youtube.com/shorts/abcdefghijk\nЕсли ролик открывается и не стал приватным — /youtube публично.']);
+  });
+
+  it('«публично» — без подсказки; набор (строки published нет) — молчим', async () => {
+    const a = setup(fakeDb({ mode: 'public', published: 'https://youtube.com/shorts/abcdefghijk' }));
+    await a.svc.notifyUploaded('v1');
+    expect(a.said()).toEqual(['Вышло на YouTube (публично): https://youtube.com/shorts/abcdefghijk']);
+    const b = setup(fakeDb({ mode: 'public' }));
+    await b.svc.notifyUploaded('v1');
+    expect(b.tg.sendMessage).not.toHaveBeenCalled();
   });
 });
