@@ -418,9 +418,13 @@ export class ShortsPublisherService implements OnModuleInit {
         // такого же finishAttempt последней попытки (сторож перевёл бы и строку, и тогда pub не
         // сработал бы): его причину перезаписываем на «пост мог выйти» и сбрасываем
         // failure_notified — владелец получит повторное уведомление с верной причиной, а не retry
-        // по чужой. Ролик в publishing у другой попытки дальше в канал не пойдёт: её продление перед
-        // отправкой не пройдёт (ролик failed), а её finishAttempt после нашего failed — пустой.
-        // Запрос возвращает оба факта — для точного лога.
+        // по чужой. Только failed с failed_from = 'publishing': такое бывает лишь у одобренного
+        // ролика (захват публикации требует approved_at) — значит, в том же цикле публикации.
+        // Ролик, упавший на другом этапе (пересъёмка после «Переснять», approved_at уже NULL), не
+        // трогаем: с failed_from = 'publishing' его не повторить и не отметить вышедшим — только
+        // отклонить, пересъёмка была бы потеряна. Ролик в publishing у другой попытки дальше в канал
+        // не пойдёт: её продление перед отправкой не пройдёт (ролик failed), а её finishAttempt после
+        // нашего failed — пустой. Запрос возвращает оба факта — для точного лога.
         const r = await this.pg.query(
           `WITH pub AS (
              UPDATE short_publication SET status = 'failed', last_error = $3, updated_at = now()
@@ -430,7 +434,8 @@ export class ShortsPublisherService implements OnModuleInit {
            vid AS (
              UPDATE short_video SET status = 'failed', failed_from = 'publishing', last_error = $4,
                     failure_notified = false, updated_at = now()
-              WHERE id = $1 AND status IN ('publishing', 'approved', 'failed') AND EXISTS (SELECT 1 FROM pub)
+              WHERE id = $1 AND (status IN ('publishing', 'approved') OR (status = 'failed' AND failed_from = 'publishing'))
+                AND EXISTS (SELECT 1 FROM pub)
               RETURNING 1
            )
            SELECT (SELECT count(*) FROM pub)::int AS pub, (SELECT count(*) FROM vid)::int AS vid`,
