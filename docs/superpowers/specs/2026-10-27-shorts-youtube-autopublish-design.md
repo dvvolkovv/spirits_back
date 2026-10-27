@@ -83,11 +83,13 @@ unverified API projects are not restricted to private viewing mode». Запис
 | `shorts-youtube.controller.ts` | Публичный `GET /webhook/shorts/youtube/oauth/callback`, ответ — HTML-страница |
 | `migrations/003_youtube.sql` | Данные (ниже) |
 
-Правки: `shorts-publisher.service.ts` (ветка youtube), `shorts-approval.service.ts`
-(тонкий `handleYoutubeCommand` — делегирует сервису), `tg-bot.service.ts` (одна
-строка в `handleDmCommand` рядом с `/short`), `shorts-settings.service.ts`
-(`youtubeMode`), `shorts.types.ts` (`uploadSession`), `shorts-schema.service.ts`
-(003), `shorts.module.ts`.
+Правки: `shorts-publisher.service.ts` (ветка youtube; сервис YouTube — последним
+`@Optional`-параметром, без него — набор), `tg-bot.service.ts` (сервис YouTube —
+последним `@Optional`-параметром, как сервис одобрения роликов, и строка в
+`handleDmCommand` рядом с `/short`), `shorts-settings.service.ts` (`youtubeMode`),
+`shorts.types.ts` (`uploadSession`, `YoutubeMode`), `shorts-schema.service.ts`
+(003), `shorts.module.ts` (провайдер, контроллер, экспорт). `ShortsApprovalService`
+не меняется.
 
 Код входа и загрузки берём из `7f99a9a^` (`src/smm/oauth/youtube-oauth.service.ts`,
 `worker/src/publish/publishers/youtube.publisher.ts`), но без `googleapis`:
@@ -142,8 +144,10 @@ Telegram, через `platform()` с захватом строки. Внутри
      набор с причиной.
   7. Состояние сессии неизвестно и это последняя попытка → набора нет:
      ролик мог уже загрузиться, и ручная выкладка дала бы дубль. Ролик уходит
-     в `failed` с причиной «загрузка на YouTube могла пройти — проверьте канал
-     @Linkeons», как неизвестный исход у Telegram.
+     в `failed` с причиной «YouTube не ответил, дошла ли загрузка; retry
+     безопасен в течение недели». Повтор (`retry` в `admin/shorts`) сначала
+     спросит YouTube о сохранённой сессии (п. 1) — дубля не будет, пока сессия
+     жива (неделя).
 
 Метаданные загрузки:
 
@@ -171,13 +175,14 @@ Telegram, через `platform()` с захватом строки. Внутри
 | Что | Итог |
 |---|---|
 | `invalid_grant` при обновлении токена | аккаунт `revoked`, набор, «переподключите: /youtube» |
-| 401 при начале сессии | обновить токен один раз и повторить; снова 401 — отказ попытки |
+| 401 при начале сессии (токен только что обновлён) | как `invalid_grant`: аккаунт `revoked`, набор, «переподключите» |
 | 403 `quotaExceeded` / `uploadLimitExceeded` | отказ попытки; на последней — набор с причиной |
 | 400 (метаданные) | так же |
-| обрыв, таймаут, 5xx при отправке файла | спросить сессию: загружено → `published`; нет → отказ; ответа нет → отказ, адрес сессии остаётся; на последней попытке — `failed` «проверьте канал», без набора |
+| обрыв, таймаут, 5xx при отправке файла | спросить сессию: загружено → `published`; нет → отказ; ответа нет → отказ, адрес сессии остаётся; на последней попытке — `failed` «retry безопасен», без набора |
 | 404/410 при вопросе о сессии | сессии нет — новая загрузка |
 | `error=access_denied` в адресе возврата | страница «Подключение отменено», бот молчит |
 | `state` подделан или просрочен | страница «Ссылка устарела — пришлите /youtube ещё раз» |
+| код уже использован (браузер повторил адрес возврата), а канал подключён меньше 10 минут назад | страница «Канал уже подключён», бот молчит |
 
 ## Безопасность
 
