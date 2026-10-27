@@ -12,6 +12,7 @@ import { SUPPORTED_PLATFORMS, ShortSettings, ShortsSettingsService } from './sho
 import { DOWNLOAD_TIMEOUT_MS, PENDING_UPLOAD_NOTE, ShortsYoutubeService } from './shorts-youtube.service';
 import { ShortPlatform, ShortPublication, ShortVideo, rowToPublication, rowToShort, shortsBucket } from './shorts.types';
 import { YoutubeAttemptSuperseded, YoutubeAuthError, YoutubeMaybeUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
+import { SEND_TIMEOUT_MS } from './youtube/youtube-upload';
 
 /** Сколько раз ролик пробует выйти. Попытку считает захват, счётчик переживает рестарт. */
 export const MAX_PUBLISH_ATTEMPTS = 3;
@@ -22,6 +23,15 @@ export const MAX_PUBLISH_ATTEMPTS = 3;
  * выгрузку файла (таймаут grammy 500 с ≈ 8,3 мин), а не всю публикацию.
  */
 export const STUCK_PUBLISHING_MINUTES = 10;
+
+/**
+ * Предел задержки ответа на продление живости перед отправкой файла YouTube. Порог сторожа
+ * (STUCK_PUBLISHING_MINUTES, 10 мин) минус отправка файла (до 8 мин, SEND_TIMEOUT_MS)
+ * оставляют около 2 мин запаса от продления до конца отправки. Продление, чей ответ шёл
+ * дольше минуты, этот запас съедает: сторож мог бы вернуть ролик в очередь посреди отправки,
+ * и новая попытка начала бы вторую загрузку. Такое продление — без отправки.
+ */
+export const KEEPALIVE_MAX_LAG_MS = 60_000;
 
 /**
  * Причина для владельца, когда исход отправки в канал неизвестен. У Telegram
@@ -66,8 +76,9 @@ interface PlatformResult {
  * - `unknown` — исход отправки в канал неизвестен: строка и ролик уже в `failed`;
  * - `unrecorded` — отправка прошла, а отметка в базу не легла: ролик остаётся
  *   в `publishing`, его разберёт сторож (`rearmStuck`);
- * - `superseded` — попытка уже не владеет строкой или роликом — жетон не совпал:
- *   ничего не записано, выходим молча.
+ * - `superseded` — попытка уже не владеет строкой или роликом (жетон не совпал) или
+ *   продление перед файлом шло слишком долго: ни отправки, ни итога ролика, выходим
+ *   молча; свою строку (жетон ещё совпадает) попытка отдаёт в failed, чужую не трогает.
  */
 type PlatformOutcome = 'done' | 'skipped' | 'refused' | 'unknown' | 'unrecorded' | 'superseded';
 
@@ -269,8 +280,13 @@ export class ShortsPublisherService {
     return false;
   }
 
-  /** Перед отправкой файла: ролик всё ещё у этой попытки и строка площадки — у неё же (оба жетона). */
+  /**
+   * Перед отправкой файла: ролик всё ещё у этой попытки и строка площадки — у неё же (оба
+   * жетона). Продлено, но ответ шёл дольше KEEPALIVE_MAX_LAG_MS, — тоже false: продление
+   * легло в базу в начале этого ожидания, и до порога сторожа не хватит запаса на отправку.
+   */
   private async keepAliveFenced(v: ShortVideo, platform: ShortPlatform, fence: number): Promise<boolean> {
+    const asked = Date.now();
     const r = await this.pg.query(
       `UPDATE short_video SET updated_at = now()
         WHERE id = $1 AND status = 'publishing' AND attempts = $2
@@ -279,9 +295,19 @@ export class ShortsPublisherService {
         RETURNING 1`,
       [v.id, v.attempts, platform, fence],
     );
-    if (r.rows.length) return true;
-    this.logger.warn(`ролик ${v.id}, ${platform}: ролик или строку забрала другая попытка — останавливаюсь`);
-    return false;
+    if (!r.rows.length) {
+      this.logger.warn(`ролик ${v.id}, ${platform}: ролик или строку забрала другая попытка — останавливаюсь`);
+      return false;
+    }
+    const lag = Date.now() - asked;
+    if (lag > KEEPALIVE_MAX_LAG_MS) {
+      this.logger.warn(
+        `ролик ${v.id}, ${platform}: продление живости заняло ${Math.round(lag / 1000)} с — до порога сторожа не хватит ` +
+          `запаса на отправку файла (до ${Math.round(SEND_TIMEOUT_MS / 60_000)} мин), не отправляю`,
+      );
+      return false;
+    }
+    return true;
   }
 
   /**
@@ -291,7 +317,8 @@ export class ShortsPublisherService {
    * attempts ролика из захвата в publish() (v.attempts). Все записи попытки после захвата —
    * отказ, «исход неизвестен», живость, итог ролика — идут с условием на свой жетон: попытка,
    * зависшая дольше порога сторожа, пока ролик и строку взяла новая, ничего в них не пишет
-   * (исход superseded). Отметка вышедшего — recordSent — без жетона, намеренно.
+   * (исход superseded; свою строку, если жетон ещё совпадает, она лишь отдаёт в failed).
+   * Отметка вышедшего — recordSent — без жетона, намеренно.
    *
    * Допущение. Счётчики растут только при захвате; обнуляют их лишь действия владельца после
    * сбоя (retry и mark_published в shorts.controller.ts). После обнуления первая новая попытка
@@ -314,11 +341,23 @@ export class ShortsPublisherService {
     try {
       out = await send(fence);
     } catch (e: any) {
+      const message = String(e?.message ?? e).slice(0, 500);
       if (e instanceof YoutubeAttemptSuperseded) {
-        this.logger.warn(`ролик ${v.id}, ${platform}: попытку сменила новая — ничего не пишу (${e.message})`);
+        // Ни файла, ни набора, ни итога ролика. Но строку, если она всё ещё наша, отдаём в failed:
+        // иначе она застряла бы в publishing — сторож разбирает только ролики в publishing, а retry
+        // владельца сбрасывает только failed. Безопасно: чужую строку (новая попытка, сторож) жетон
+        // не пустит. Адрес сессии не трогаем: своя строка проигрывает только до отправки файла
+        // (продление перед ним), и следующая попытка спросит YouTube об адресе без байтов —
+        // «не догружено», адрес стирается, загрузка заново.
+        const r = await this.pg.query(
+          `UPDATE short_publication SET status = 'failed', last_error = $3, updated_at = now()
+            WHERE short_id = $1 AND platform = $2 AND status = 'publishing' AND attempts = $4`,
+          [v.id, platform, message, fence],
+        );
+        const row = r.rowCount ? 'свою строку отдал в failed' : 'строка уже не моя — ничего не пишу';
+        this.logger.warn(`ролик ${v.id}, ${platform}: попытку сменила новая — ${row} (${e.message})`);
         return 'superseded';
       }
-      const message = String(e?.message ?? e).slice(0, 500);
       if (e instanceof TelegramOutcomeUnknown) {
         this.logger.error(`ролик ${v.id}, ${platform}: исход отправки неизвестен, автоповтора не будет — ${e.causeMessage}`);
         // Строка и ролик — одним запросом: строка failed при ролике в publishing

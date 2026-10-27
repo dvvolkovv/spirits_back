@@ -269,7 +269,8 @@ export class ShortsYoutubeService {
    * этот жетон». Попытка, зависшая дольше порога сторожа, пока строку захватила новая, не
    * берёт чужой адрес, не стирает его, не кладёт свой и не шлёт файл —
    * YoutubeAttemptSuperseded, публикатор выходит молча. keepAlive перед файлом проверяет
-   * и ролик, и строку — false значит то же самое.
+   * и ролик, и строку (и что продление не шло слишком долго) — false значит то же самое:
+   * файл не шлём, свой адрес остаётся для следующей попытки.
    */
   async upload(
     v: ShortVideo,
@@ -327,7 +328,11 @@ export class ShortsYoutubeService {
     // С жетоном адрес в «нашу» строку может положить только эта попытка: провал значит, что строка
     // уже не наша, и её исход — дело новой попытки. Сессия без байтов ролика не создаёт.
     if (!(await this.claimSession(v.id, sessionUrl, fence))) throw new YoutubeAttemptSuperseded('строку YouTube захватила другая попытка — файл не шлю');
-    if (!(await keepAlive())) throw new YoutubeAttemptSuperseded('ролик или строку YouTube забрала другая попытка до отправки файла — не отправляю');
+    if (!(await keepAlive())) {
+      throw new YoutubeAttemptSuperseded(
+        'перед отправкой файла живость не продлена: ролик или строку YouTube забрала другая попытка либо продление шло слишком долго — не отправляю',
+      );
+    }
     try {
       return this.done(await sendFile(this.http, sessionUrl, accessToken, video), false);
     } catch (e: any) {
