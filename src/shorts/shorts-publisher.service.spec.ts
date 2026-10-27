@@ -412,6 +412,9 @@ describe('ShortsPublisherService.publish — YouTube загрузкой', () => 
   });
   const UPLOAD = { kind: 'upload', privacy: 'unlisted' };
   const kitText = (tg: any): string => (tg.sendMessage.mock.calls[0] as any[])[1];
+  // M5: тесты ниже спаивают Logger.prototype.warn напрямую (как в «жетон попытки») — без
+  // восстановления вызов из одного теста остался бы виден в mock.calls следующего.
+  afterEach(() => jest.restoreAllMocks());
 
   it('загрузка: строка youtube published с id и ссылкой, владельцу — сообщение, набора нет', async () => {
     const yt = youtube(UPLOAD);
@@ -439,6 +442,7 @@ describe('ShortsPublisherService.publish — YouTube загрузкой', () => 
   });
 
   it('план — набор: заметка плана первой строкой, загрузки нет', async () => {
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     const yt = youtube({ kind: 'kit', note: 'Канал YouTube не подключён — набор вместо загрузки. Подключить: /youtube' });
     const { svc, tg, db } = setup(fakeDb(), '-1003290853538', ['telegram', 'youtube'], yt);
     await svc.publish(ID);
@@ -447,6 +451,17 @@ describe('ShortsPublisherService.publish — YouTube загрузкой', () => 
     expect(kitText(tg).startsWith('Канал YouTube не подключён — набор вместо загрузки. Подключить: /youtube\n\nYouTube — заголовок:\nYT-заголовок')).toBe(true);
     expect(yt.notifyUploaded).not.toHaveBeenCalled();
     expect(db.pubs.get('youtube')).toMatchObject({ status: 'manual_pending' });
+    // M5: набор вместо загрузки — тоже в лог, с заметкой плана.
+    expect(warn.mock.calls.some(([m]) => String(m).includes(`ролик ${ID}: YouTube набором — Канал YouTube не подключён`))).toBe(true);
+  });
+
+  it('план — набор без заметки (режим «вручную») — строки лога нет', async () => {
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const yt = youtube({ kind: 'kit', note: null });
+    const { svc, tg } = setup(fakeDb(), '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(tg.sendDocument).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls.some(([m]) => String(m).includes('YouTube набором'))).toBe(false);
   });
 
   it('доступ пропал при загрузке — набор с причиной, ролик опубликован', async () => {
@@ -998,5 +1013,43 @@ describe('ShortsPublisherService — срок скачивания файлов 
     expect(tg.sendDocument).not.toHaveBeenCalled();
     expect(db.pubs.get('youtube')).toMatchObject({ status: 'failed', last_error: 'скачивание прервано по сроку' });
     expect(db.v.status).toBe('approved');
+  });
+});
+
+/**
+ * M6: без сервиса YouTube публикатор и раньше молчал (toYoutube уходит в youtubeKit), но
+ * без проверки живой сессии прошлой загрузки и без предупреждения uploadPlan — разрыв
+ * связки был не виден никому. Бот о такой же разорванной связке уже предупреждает
+ * (tg-bot.youtube-routing.spec.ts) — здесь тот же образец для публикатора.
+ */
+describe('ShortsPublisherService.onModuleInit — публикатор без сервиса YouTube', () => {
+  const prevEnabled = process.env.SHORTS_ENABLED;
+  afterEach(() => {
+    if (prevEnabled === undefined) delete process.env.SHORTS_ENABLED;
+    else process.env.SHORTS_ENABLED = prevEnabled;
+  });
+
+  it('SHORTS_ENABLED=true и ShortsYoutubeService не подставлен — предупреждение в лог', () => {
+    process.env.SHORTS_ENABLED = 'true';
+    const { svc } = setup(fakeDb(), null, ['telegram'], undefined);
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+    svc.onModuleInit();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('ShortsYoutubeService не подставлен'));
+  });
+
+  it('ShortsYoutubeService подставлен — предупреждения нет', () => {
+    process.env.SHORTS_ENABLED = 'true';
+    const { svc } = setup(fakeDb(), null, ['telegram'], { uploadPlan: jest.fn() });
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+    svc.onModuleInit();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('конвейер выключен (SHORTS_ENABLED не задан) и сервиса нет — предупреждать не о чем, тишина', () => {
+    delete process.env.SHORTS_ENABLED;
+    const { svc } = setup(fakeDb(), null, ['telegram'], undefined);
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+    svc.onModuleInit();
+    expect(warn).not.toHaveBeenCalled();
   });
 });
