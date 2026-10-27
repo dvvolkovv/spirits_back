@@ -2,12 +2,15 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { BotTokenCheck, checkBotToken } from './bot-token-check';
 import { ActionChannel, ActionRow, ConfirmedVia, ProductActionsService } from './product-actions.service';
-import { isReservedSecretName, secretsProblem } from './secret-rules';
+import { isReservedSecretName, secretsProblem, shownSecretName } from './secret-rules';
 import { SecretsService } from './secrets.service';
 
 export type KeysFail = { ok: false; reason: string; message: string };
 
 const has = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
+
+const BUSY_TURN_SAY = 'Сейчас идёт правка продукта — отправьте карточку, когда она закончится';
+const UNREADABLE_SAY = 'Ключи продукта сейчас не читаются — напишите в поддержку';
 
 /**
  * Отказ по состоянию продукта — один на открытие и на отправку: продукт мог
@@ -95,7 +98,7 @@ export class ProductKeysService {
       keyNames = p.secrets_encrypted ? Object.keys(ownerKeys(this.secrets.decrypt(p.secrets_encrypted, p.id))).sort() : [];
     } catch (e: any) {
       this.logger.error(`ключи продукта ${p.id} не расшифровались: ${safeError(e)}`);
-      return { ok: false, reason: 'failed', message: 'Ключи продукта сейчас не читаются — напишите в поддержку' };
+      return { ok: false, reason: 'failed', message: UNREADABLE_SAY };
     }
     const { id, expiresAt } = await this.actions.open({
       userId: i.userId, productId: p.id, kind: 'keys', channel: i.channel, turn: i.turn,
@@ -140,12 +143,15 @@ export class ProductKeysService {
       return { ok: false, reason, message };
     };
 
-    const r = await this.pg.query(
-      `SELECT id, kind, status, block_reason, secrets_encrypted, tg_bot_id FROM products
-        WHERE id = $1 AND user_id = $2 AND archived_at IS NULL`,
-      [row.product_id, i.userId],
-    );
-    const p = r.rows[0];
+    // Тем же запросом — и при отправке, и при перечитывании, когда задание не
+    // встало (см. конец метода).
+    const readProduct = async () =>
+      (await this.pg.query(
+        `SELECT id, kind, status, block_reason, secrets_encrypted, tg_bot_id FROM products
+          WHERE id = $1 AND user_id = $2 AND archived_at IS NULL`,
+        [row.product_id, i.userId],
+      )).rows[0];
+    const p = await readProduct();
     if (!p) return fail('Продукт удалён — ключи не менялись', 'gone');
     const refusal = statusRefusal(p);
     if (refusal) return fail(refusal.message, refusal.reason);
@@ -155,20 +161,33 @@ export class ProductKeysService {
     if (i.set !== undefined && i.set !== null) {
       if (typeof i.set !== 'object' || Array.isArray(i.set)) return fix('Ключи пришли не в той форме — обновите карточку', 'bad_shape');
       for (const [k, v] of Object.entries(i.set as Record<string, unknown>)) {
-        if (typeof v !== 'string') return fix(`секрет ${k}: значение должно быть непустой строкой`, 'bad_input', k);
+        if (typeof v !== 'string') {
+          const shown = shownSecretName(k);
+          return fix(`секрет ${shown}: значение должно быть непустой строкой`, 'bad_input', shown);
+        }
         // Object.defineProperty, а не присваивание: `__proto__` — годное имя
         // переменной (заведение его принимает), а `obj['__proto__'] = …`
         // своего ключа не создаёт — ключ молча пропал бы из набора.
-        Object.defineProperty(set, k, { value: k === 'BOT_TOKEN' ? v.trim() : v, enumerable: true, writable: true, configurable: true });
+        // Пробелы по краям срезаются только у токена бота (их приносит
+        // копирование из @BotFather); у сайта BOT_TOKEN — обычный ключ.
+        const value = p.kind === 'bot' && k === 'BOT_TOKEN' ? v.trim() : v;
+        Object.defineProperty(set, k, { value, enumerable: true, writable: true, configurable: true });
       }
     }
     if (i.remove !== undefined && i.remove !== null && (!Array.isArray(i.remove) || i.remove.some((n) => typeof n !== 'string'))) {
       return fix('Список удаляемых ключей не в той форме — обновите карточку', 'bad_shape');
     }
     const remove = [...new Set((i.remove as string[] | undefined) ?? [])];
+    // «Ничего» — только пустая отправка. Отправка тех же значений НАРОЧНО не
+    // отбивается: пересоздание контейнера по ней доставляет боту OWNER_TG_ID
+    // (боты, заведённые до очереди 2) и выбрасывает из коробки имена, занятые
+    // платформой позже (ownerKeys).
     if (!Object.keys(set).length && !remove.length) return fix('Ничего не изменено: замените, уберите или добавьте ключ', 'nothing');
     const both = remove.find((n) => has(set, n));
-    if (both !== undefined) return fix(`Ключ ${both} и заменён, и убран — оставьте что-то одно`, 'bad_input', both);
+    if (both !== undefined) {
+      const shown = shownSecretName(both);
+      return fix(`Ключ ${shown} и заменён, и убран — оставьте что-то одно`, 'bad_input', shown);
+    }
     if (p.kind === 'bot' && remove.includes('BOT_TOKEN')) return fix('Токен бота убрать нельзя — его можно только заменить', 'bot_token', 'BOT_TOKEN');
 
     // --- Занятость: правка и задание машины. ---
@@ -177,18 +196,31 @@ export class ProductKeysService {
               (SELECT count(*) FROM product_provision_jobs WHERE product_id = $1 AND status IN ('queued','running'))::int AS jobs`,
       [p.id],
     );
-    if (busy.rows[0]?.turns > 0) return fix('Сейчас идёт правка продукта — отправьте карточку, когда она закончится', 'busy_turn');
+    if (busy.rows[0]?.turns > 0) return fix(BUSY_TURN_SAY, 'busy_turn');
     if (busy.rows[0]?.jobs > 0) return fix('Машина продукта сейчас занята — отправьте карточку через минуту', 'busy');
 
     // --- Новый набор целиком и проверка теми же правилами, что заведение. ---
-    // Нечитаемая коробка бросает — её ловит complete() (карточка снова ждёт).
-    const old = ownerKeys(p.secrets_encrypted ? this.secrets.decrypt(p.secrets_encrypted, p.id) : {});
+    // Нечитаемая коробка продукта (испорчена, сменён ключ шифрования) повтором
+    // не лечится — карточка закрывается тем же текстом, что у open(), а не
+    // возвращается в ожидание.
+    let stored: Record<string, string>;
+    try {
+      stored = p.secrets_encrypted ? this.secrets.decrypt(p.secrets_encrypted, p.id) : {};
+    } catch (e: any) {
+      this.logger.error(`ключи продукта ${p.id} не расшифровались: ${safeError(e)}`);
+      return fail(UNREADABLE_SAY, 'failed');
+    }
+    const old = ownerKeys(stored);
     const reservedDrop = remove.find((n) => isReservedSecretName(n));
     if (reservedDrop !== undefined) {
-      return fix(`Ключ ${reservedDrop} — переменная платформы: карточкой его не убрать`, 'bad_input', reservedDrop);
+      const shown = shownSecretName(reservedDrop);
+      return fix(`Ключ ${shown} — переменная платформы: карточкой его не убрать`, 'bad_input', shown);
     }
     const missing = remove.find((n) => !has(old, n));
-    if (missing !== undefined) return fix(`Ключа ${missing} у продукта нет`, 'bad_input', missing);
+    if (missing !== undefined) {
+      const shown = shownSecretName(missing);
+      return fix(`Ключа ${shown} у продукта нет`, 'bad_input', shown);
+    }
     // Object.fromEntries, а не присваивание: имя `__proto__` форму переменной
     // проходит (как и у заведения), а `obj['__proto__'] = …` своего ключа не
     // создаёт.
@@ -198,6 +230,9 @@ export class ProductKeysService {
     ]);
     const problem = secretsProblem(merged);
     if (problem) return fix(problem.message, problem.field !== undefined ? 'bad_input' : 'too_many', problem.field);
+    // Своей причины «токена нет» (bot_token_missing) в словаре кабинета пока
+    // нет — общая bot_token; сюда доходит только бот, у которого BOT_TOKEN не
+    // было и в старом наборе.
     if (p.kind === 'bot' && !merged.BOT_TOKEN) return fix('У бота должен быть BOT_TOKEN', 'bot_token', 'BOT_TOKEN');
 
     // --- Новый токен бота — в Telegram, до записи чего-либо. ---
@@ -265,7 +300,19 @@ export class ProductKeysService {
       }
       throw e;
     }
-    if (!q.rows[0]?.queued) return fail('Продукт сменил состояние — ключи не меняются, попросите ассистента ещё раз', 'state_changed');
+    if (!q.rows[0]?.queued) {
+      // Ноль строк: продукт удалили, погасили или усыпили между проверкой и
+      // записью — либо встала правка (NOT EXISTS выше). По одному счётчику их
+      // не различить, поэтому продукт перечитывается: непоправимое — failed
+      // своей причиной, живой продукт — значит, встала правка, и это
+      // поправимо: карточка снова ждёт, коробка не записана (upd идёт только
+      // за ins).
+      const now = await readProduct();
+      if (!now) return fail('Продукт удалён — ключи не менялись', 'gone');
+      const late = statusRefusal(now);
+      if (late) return fail(late.message, late.reason);
+      return fix(BUSY_TURN_SAY, 'busy_turn');
+    }
     return { ok: true, queued: true };
   }
 }
