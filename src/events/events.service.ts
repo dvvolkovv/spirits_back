@@ -100,6 +100,24 @@ export class EventsService implements OnModuleInit, OnModuleDestroy {
     } catch (e: any) {
       this.log.warn(`setSignupSourceIfEmpty failed: ${e.message}`);
     }
+    for (const hook of this.attributionHooks) {
+      try {
+        await hook(userId, source);
+      } catch (e: any) {
+        this.log.warn(`attribution hook failed for ${userId}: ${e.message}`);
+      }
+    }
+  }
+
+  // Крючки «источник входа пришёл». Запрос /events/attribute веб шлёт с
+  // keepalive, и он доходит, даже когда страница сразу после входа уходит
+  // дальше, а отдельный запрос привязки к реферальной ссылке в этот момент
+  // обрывается. Через крючок реферальный модуль доводит привязку сам — без
+  // взаимного импорта модулей: ReferralService и так получает EventsService.
+  private readonly attributionHooks: Array<(userId: string, source: string) => Promise<void>> = [];
+
+  onAttribution(hook: (userId: string, source: string) => Promise<void>): void {
+    this.attributionHooks.push(hook);
   }
 
   // Fire-and-forget tracking. Never throws — failure is logged only.

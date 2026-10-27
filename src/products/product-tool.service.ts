@@ -1,7 +1,10 @@
 import { HttpException, Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { PRODUCT_TOOL_WAIT_MS } from '../common/relay-budget';
-import { TurnsService, SLEEPING_REFUSAL, BLOCKED_REFUSAL, REKEY_REFUSAL } from './turns.service';
+import {
+  TurnsService, TurnRow, SLEEPING_REFUSAL, BLOCKED_REFUSAL, REKEY_REFUSAL, PRODUCT_PROMPT_MAX_CHARS, PROMPT_TOO_LONG,
+} from './turns.service';
+import { maskedSecretsSay, maskSecrets } from './prompt-secrets';
 import { DomainErrorReason, DomainRecordToSet, DomainRefusalCode, DomainStatus, DomainsService, DomainView } from './domains.service';
 import { normalizeDomain, readableDomain } from './domain-name';
 import { ProductToolChannel } from './product-tool.token';
@@ -479,15 +482,26 @@ export class ProductToolService {
     }
 
     const product = matches[0];
-    let turnId: string;
+    // Ключи в тексте правки (prompt-secrets.ts): ассистент узнаёт о них и при
+    // отказе — значение уже было в переписке, и совет выпустить новый ключ
+    // нужен независимо от того, поставлена ли правка. Считается здесь, из
+    // того же текста, что уходит в enqueue, — тем же правилом, что маскирует.
+    // Длинный текст не разбираем: его отобьёт enqueue (PROMPT_TOO_LONG).
+    const mask = prompt.length <= PRODUCT_PROMPT_MAX_CHARS ? maskSecrets(prompt) : null;
+    const secrets = mask && mask.count > 0 ? { count: mask.count, names: mask.names } : null;
+    let turn: TurnRow;
     try {
-      const turn = await this.turns.enqueue({ productId: product.id, userId, channel, prompt });
-      turnId = turn.id;
+      turn = await this.turns.enqueue({ productId: product.id, userId, channel, prompt });
     } catch (e: any) {
-      return this.refusal(e, product);
+      const r = this.refusal(e, product);
+      return secrets ? { ...r, secretsMasked: secrets, say: `${r.say} ${maskedSecretsSay(secrets, { stored: false })}` } : r;
     }
 
-    return { ...(await this.waitForOutcome(turnId)), product };
+    const outcome = await this.waitForOutcome(turn.id);
+    // Скрытые ключи — после исхода, а не вместо него: правка поставлена и
+    // идёт как обычно, ассистенту нужно и то, и другое.
+    if (!secrets) return { ...outcome, product };
+    return { ...outcome, product, secretsMasked: secrets, say: `${outcome.say} ${maskedSecretsSay(secrets)}` };
   }
 
   /**
@@ -513,6 +527,10 @@ export class ProductToolService {
     if (msg === 'Недостаточно токенов') {
       return { ok: false, reason: 'no_tokens', canTopUp: true, product,
         say: 'На балансе пользователя нет токенов на ход. Предложи пополнить баланс.' };
+    }
+    if (msg === PROMPT_TOO_LONG) {
+      return { ok: false, reason: 'too_long', canTopUp: false, product,
+        say: `${PROMPT_TOO_LONG} Сократи текст правки и повтори; если правка большая — разбей её на несколько.` };
     }
     if (msg === 'Агент уже работает над предыдущим запросом') {
       return { ok: false, reason: 'busy', canTopUp: false, product,

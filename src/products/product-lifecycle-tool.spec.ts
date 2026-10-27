@@ -336,3 +336,50 @@ describe('новые действия инструмента', () => {
     expect(r.deleted).toEqual([{ id: 'p9', name: 'Старый бот', slug: 'old', kind: 'bot', purge_after: '2026-11-24T10:00:00.000Z' }]);
   });
 });
+
+/**
+ * Задача бэклога 642c5198: что ассистент узнаёт о ключах в описании. Маску
+ * инструмент считает сам из входного текста — поэтому знает о ней и при
+ * отказе заведения. Значение собирается во время прогона (публичный репозиторий).
+ */
+describe('create: ключи в описании', () => {
+  const value = ['Ab', '3k', 'Q9', 'zX', '7mN', 'p2R', 'w8T', 'c5'].join('');
+  const prompt = `лендинг с погодой, WEATHER_API_KEY=${value}`;
+
+  it('сайт — secretsMasked и фраза: значения скрыты; если ключ — выпустить новый и карточка keys', async () => {
+    const h = harness();
+    const r: any = await h.svc.execute('u1', { action: 'create', kind: 'site', name: 'Магазин', prompt }, 'web', 'turn-1');
+    expect(r.secretsMasked).toEqual({ count: 1, names: ['WEATHER_API_KEY'] });
+    expect(r.say).toContain('(WEATHER_API_KEY)');
+    expect(r.say).toContain('«[ключ скрыт]»');
+    expect(r.say).toMatch(/Если это ключ — посоветуй выпустить новый/);
+    expect(r.say).toMatch(/действие keys/);
+    // Основной смысл ответа не потерялся.
+    expect(r.say).toMatch(/Сайт создан/);
+  });
+
+  it('бот — то же в ответе с карточкой', async () => {
+    const h = harness();
+    const r: any = await h.svc.execute('u1', { action: 'create', kind: 'bot', name: 'Бот', prompt }, 'web', 'turn-1');
+    expect(r.secretsMasked).toEqual({ count: 1, names: ['WEATHER_API_KEY'] });
+    expect(r.say).toMatch(/защищённая карточка/);
+    expect(r.say).toContain('«[ключ скрыт]»');
+  });
+
+  it('отказ заведения — о ключе всё равно сказано, без обещания, что значение заменено', async () => {
+    const h = harness();
+    h.lifecycle.openCreateBot.mockResolvedValue({ ok: false, reason: 'limit', message: 'Предел — 2 продукта на один аккаунт' } as any);
+    const r: any = await h.svc.execute('u1', { action: 'create', kind: 'bot', name: 'Бот', prompt }, 'web', 'turn-1');
+    expect(r).toMatchObject({ ok: false, reason: 'limit', secretsMasked: { count: 1, names: ['WEATHER_API_KEY'] } });
+    expect(r.say).toMatch(/^Предел — 2 продукта на один аккаунт /);
+    expect(r.say).toMatch(/правка не поставлена/);
+    expect(r.say).not.toContain('заменила');
+  });
+
+  it('без ключей — ни поля, ни фразы', async () => {
+    const h = harness();
+    const r: any = await h.svc.execute('u1', { action: 'create', kind: 'site', name: 'Магазин', prompt: 'лендинг' }, 'web', 'turn-1');
+    expect('secretsMasked' in r).toBe(false);
+    expect(r.say).not.toContain('[ключ скрыт]');
+  });
+});

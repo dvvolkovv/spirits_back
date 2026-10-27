@@ -6,6 +6,7 @@ import { V } from '../values';
 // источник: откат — spirits_front src/components/products/TurnHistory.tsx:20-84; src/products/turns.service.ts:514-537
 // источник: аренда и сон — src/products/rent.service.ts (RENT_TOKENS, FREE_MONTH_PRODUCTS), migrations/004_rent.sql:8-30; бесплатный месяц — provisioning.service.ts (create, решение владельца 26.10.2026)
 // источник: домен — src/products/domains.service.ts:112-151,359-381,593-668; domain-name.ts:199-207
+// источник: маска ключей в тексте правки — src/products/prompt-secrets.ts, turns.service.ts (enqueue)
 // источник: ключи — src/products/secrets.service.ts:12; spirits_front NewProductForm.tsx:376-460; смена — src/products/product-keys.service.ts, product-runner/src/host/rekey.ts; стирание — src/products/product-purge.service.ts
 // источник: лимит — src/products/limits.service.ts (DEFAULT_MAX_PRODUCTS)
 // источник: опрос Telegram — product-runner/src/host/skeleton.ts:267-300
@@ -28,7 +29,7 @@ ${q('studio')} → ${q('studioProducts')}. Завести продукт мож�
 - Правка: в продукте ${q('prodAsk')} → отправить, или попросить любого ассистента в чате. Одна правка за раз, идёт до двадцати минут и не прерывается, если закрыть вкладку. Итог — в ${q('prodHistory')}.
 - ${q('prodRevert')} откатывает правку: возвращается код, данные остаются. Откатить можно и попросив ассистента.
 - Удалить: попросить ассистента — продукт удалится только кнопкой «Удалить» в карточке (в Telegram — кнопкой в сообщении). Выключается сразу; вернуть можно в течение ${V.deleteGraceDays} дней, если есть свободное место в пределе продуктов. Потом он стирается насовсем.${paid(' Оплаченный период не возвращается.')}
-- ${q('prodSecrets')} — пары «имя — значение» для сторонних сервисов, шифруются. Сменить, убрать или добавить ключ — попросить ассистента. Значения в чат не присылать.
+- ${q('prodSecrets')} — пары «имя — значение» для сторонних сервисов, шифруются. Сменить, убрать или добавить ключ — попросить ассистента. Значения в чат не присылать (в правке скрываются).
 - ${q('prodDomain')} (только у сайта, один${paid(', бесплатно')}): домен → ${q('prodAttach')} → записи DNS дословно из таблицы; у этих имён удалить прочие A и все AAAA.
 
 ## Лимиты и цены
