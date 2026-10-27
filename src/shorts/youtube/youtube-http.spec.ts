@@ -32,6 +32,11 @@ describe('googleReasonCode', () => {
     expect(googleReasonCode({ status: 403, headers: {}, data: undefined })).toBeNull();
     expect(googleReasonCode({ status: 404, headers: {}, data: '<html>/upload?upload_id=SECRET</html>' })).toBeNull();
   });
+
+  it('объект error без errors или с пустым errors — null', () => {
+    expect(googleReasonCode({ status: 403, headers: {}, data: { error: { message: 'x' } } })).toBeNull();
+    expect(googleReasonCode({ status: 403, headers: {}, data: { error: { errors: [] } } })).toBeNull();
+  });
 });
 
 describe('clip', () => {

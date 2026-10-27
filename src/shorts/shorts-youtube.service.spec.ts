@@ -528,13 +528,20 @@ describe('загрузка ролика', () => {
     expect(b.st.session).toBe(SESSION);
   });
 
-  it('о прошлой сессии нет ответа — YoutubeMaybeUploaded, адрес остаётся, новой загрузки нет', async () => {
-    const db = connected({ session: SESSION });
-    const http = fakeHttp(TOKEN, new Error('ETIMEDOUT'));
-    const { svc } = setup(db, http);
-    expect(await caught(svc.upload(video, 'public', alive(), 1))).toBeInstanceOf(YoutubeMaybeUploaded);
-    expect(db.st.session).toBe(SESSION);
-    expect(http.calls).toHaveLength(2);
+  it('о прошлой сессии исход неизвестен (обрыв сети, 403 без явного лимита, 308 с непонятным Range) — YoutubeMaybeUploaded, адрес остаётся, новой загрузки нет', async () => {
+    for (const answer of [
+      new Error('ETIMEDOUT'),
+      reply(403, { error: { message: 'forbidden', errors: [{ reason: 'forbidden' }] } }),
+      reply(308, {}, { range: 'garbage' }),
+    ]) {
+      const db = connected({ session: SESSION });
+      const http = fakeHttp(TOKEN, answer);
+      const { svc } = setup(db, http);
+      expect(await caught(svc.upload(video, 'public', alive(), 1))).toBeInstanceOf(YoutubeMaybeUploaded);
+      expect(db.st.session).toBe(SESSION);
+      // Ровно токен и вопрос о прошлой сессии — новая сессия не начинается.
+      expect(http.calls).toHaveLength(2);
+    }
   });
 
   it('invalid_grant — YoutubeAuthError, аккаунт отозван с причиной; при живой сессии — pendingUpload', async () => {
@@ -600,12 +607,18 @@ describe('загрузка ролика', () => {
     expect(db.st.session).toBeNull();
   });
 
-  it('файл оборвался и о сессии нет ответа — YoutubeMaybeUploaded, адрес остаётся', async () => {
-    const db = connected();
-    const http = fakeHttp(TOKEN, reply(200, {}, { location: SESSION }), new Error('socket hang up'), new Error('ECONNRESET'));
-    const { svc } = setup(db, http);
-    expect(await caught(svc.upload(video, 'public', alive(), 1))).toBeInstanceOf(YoutubeMaybeUploaded);
-    expect(db.st.session).toBe(SESSION);
+  it('файл оборвался, а о сессии исход неизвестен (обрыв сети, 403 без явного лимита, 308 с непонятным Range) — YoutubeMaybeUploaded, адрес остаётся', async () => {
+    for (const answer of [
+      new Error('ECONNRESET'),
+      reply(403, { error: { message: 'forbidden', errors: [{ reason: 'forbidden' }] } }),
+      reply(308, {}, { range: 'garbage' }),
+    ]) {
+      const db = connected();
+      const http = fakeHttp(TOKEN, reply(200, {}, { location: SESSION }), new Error('socket hang up'), answer);
+      const { svc } = setup(db, http);
+      expect(await caught(svc.upload(video, 'public', alive(), 1))).toBeInstanceOf(YoutubeMaybeUploaded);
+      expect(db.st.session).toBe(SESSION);
+    }
   });
 
   it('файл: явный отказ 4xx — YoutubeNotUploaded, адрес стёрт (сессия на повторе повторила бы отказ)', async () => {
