@@ -492,6 +492,50 @@ maybe('ролики против живого Postgres', () => {
         expect(await videoRow(b.id)).toEqual({ status: 'publishing', attempts: 1, last_error: null });
       });
 
+      it('проигравшая попытка отдаёт свою строку: новая захватывает её, спрашивает YouTube о старом адресе (308 без Range), стирает и грузит заново — один PUT с файлом', async () => {
+        await connect();
+        await pool.query(`UPDATE short_settings SET youtube_mode = 'unlisted' WHERE id = 1`);
+        delete process.env.YOUTUBE_CHANNEL_ID;
+        const S_C = 'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=fence-c';
+        const v = await insert({
+          status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() - 60_000),
+          video_key: 'shorts/v/video.mp4', captions: CAPTIONS,
+        });
+        await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'youtube', 'pending')`, [v.id]);
+        const { svc, http, tg } = service([
+          // Попытка A: токен и начало сессии — в этот момент ролик взяла новая попытка B (строку YouTube — нет).
+          reply(200, { access_token: 'a' }),
+          async () => {
+            await pool.query(`UPDATE short_video SET attempts = attempts + 1 WHERE id = $1`, [v.id]);
+            return reply(200, {}, { location: S_A });
+          },
+          // Попытка C: токен, вопрос о сессии A (308 без Range — байтов нет), новая сессия, файл.
+          reply(200, { access_token: 'c' }),
+          reply(308),
+          reply(200, {}, { location: S_C }),
+          reply(201, { id: 'cccccccccc1' }),
+        ]);
+        const settings = { get: async () => ({ platforms: ['youtube'], tgChannelChatId: null }) };
+        const publisher = new ShortsPublisherService(pgLike() as any, {} as any, {} as any, settings as any, svc);
+
+        await publisher.publish(v.id); // A: адрес S_A лёг в строку, продление перед файлом не прошло
+        expect(await ytRow(v.id)).toEqual({ status: 'failed', attempts: 1, upload_session: S_A });
+        expect(await videoRow(v.id)).toMatchObject({ status: 'publishing', attempts: 2 });
+        // B строку YouTube не взяла (её держала A) и вернула ролик в очередь.
+        await pool.query(`UPDATE short_video SET status = 'approved' WHERE id = $1`, [v.id]);
+
+        await publisher.publish(v.id); // C
+        const calls = http.mock.calls.map(([req]) => req);
+        expect(calls.filter((r) => r.method === 'PUT' && Buffer.isBuffer(r.data)).map((r) => r.url)).toEqual([S_C]);
+        expect(calls.filter((r) => r.method === 'PUT' && !Buffer.isBuffer(r.data)).map((r) => [r.url, r.headers['Content-Range']]))
+          .toEqual([[S_A, 'bytes */11']]);
+        expect(await ytRow(v.id)).toEqual({ status: 'published', attempts: 2, upload_session: null });
+        expect(await videoRow(v.id)).toEqual({ status: 'published', attempts: 3, last_error: null });
+        // Сообщение о загрузке уходит без ожидания — ждём его, чтобы запрос не пережил тест.
+        for (let i = 0; i < 100 && !tg.sendMessage.mock.calls.length; i++) await new Promise((r) => setTimeout(r, 20));
+        expect(tg.sendMessage).toHaveBeenCalledWith(OWNER, expect.stringContaining('https://youtube.com/shorts/cccccccccc1'), expect.anything());
+      });
+
       it('сторож вернул зависшую попытку в очередь — новая получает жетон 2, записи с жетоном 1 после этого не проходят', async () => {
         await connect();
         const v = await insert({

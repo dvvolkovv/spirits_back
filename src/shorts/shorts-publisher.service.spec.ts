@@ -1,7 +1,7 @@
 import { Logger } from '@nestjs/common';
 import { GrammyError, HttpError, InputFile } from 'grammy';
 import { buildYoutubeKeyboard } from './short-callback';
-import { MAX_PUBLISH_ATTEMPTS, STUCK_PUBLISHING_MINUTES, ShortsPublisherService, YOUTUBE_MAY_BE_OUT } from './shorts-publisher.service';
+import { KEEPALIVE_MAX_LAG_MS, MAX_PUBLISH_ATTEMPTS, STUCK_PUBLISHING_MINUTES, ShortsPublisherService, YOUTUBE_MAY_BE_OUT } from './shorts-publisher.service';
 import { DOWNLOAD_TIMEOUT_MS, PENDING_UPLOAD_NOTE } from './shorts-youtube.service';
 import { YoutubeAttemptSuperseded, YoutubeAuthError, YoutubeMaybeUploaded, YoutubeNotUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
 import { SEND_TIMEOUT_MS } from './youtube/youtube-upload';
@@ -568,10 +568,14 @@ describe('ShortsPublisherService.publish — YouTube загрузкой', () => 
  * Жетон попытки: attempts из захвата ролика (v.attempts) и строки площадки. Попытка,
  * зависшая дольше порога сторожа, пока ролик и строку взяла новая, не пишет в них ни
  * отказа, ни итога и не шлёт ни файла, ни набора — исход superseded, publish() молча выходит.
+ * Свою строку (жетон ещё совпадает) она отдаёт в failed: иначе строку никто не подберёт.
  */
 describe('ShortsPublisherService — жетон попытки', () => {
   const UPLOAD = { kind: 'upload', privacy: 'unlisted' };
   const OK = { videoId: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk', resumed: false };
+  const SESSION_A = 'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=a';
+  /** Как сервис YouTube отвечает на продление перед файлом, которое не прошло. */
+  const LOST = 'перед отправкой файла живость не продлена: ролик или строку YouTube забрала другая попытка либо продление шло слишком долго — не отправляю';
   const youtube = () => ({
     uploadPlan: jest.fn(async () => UPLOAD),
     upload: jest.fn(),
@@ -584,20 +588,118 @@ describe('ShortsPublisherService — жетон попытки', () => {
     return db;
   };
   const finals = (db: ReturnType<typeof fakeDb>) => sqlOf(db).filter((s) => /^UPDATE short_video SET status = '(approved|failed|published)'/.test(s));
-  const rowFails = (db: ReturnType<typeof fakeDb>) => sqlOf(db).filter((s) => s.startsWith("UPDATE short_publication SET status = 'failed'"));
+  const rowFails = (db: ReturnType<typeof fakeDb>) => callsOf(db).filter((c) => c.s.startsWith("UPDATE short_publication SET status = 'failed'"));
+  /** Загрузка, как её ведёт сервис YouTube: свой адрес сессии в строке, продление перед файлом не прошло — YoutubeAttemptSuperseded. */
+  const uploadLike = (db: ReturnType<typeof fakeDb>, sent: jest.Mock = jest.fn()) =>
+    async (_v: any, _p: any, keepAlive: () => Promise<boolean>) => {
+      db.pubs.get('youtube').upload_session = SESSION_A;
+      if (!(await keepAlive())) throw new YoutubeAttemptSuperseded(LOST);
+      sent();
+      return OK;
+    };
+  afterEach(() => jest.restoreAllMocks());
 
-  it('загрузку сменила новая попытка, и попытка последняя — ни набора, ни отказа в строку, ни итога ролика, ни сообщения', async () => {
+  it('загрузку сменила новая попытка, а строка уже чужая (последняя попытка) — строку не трогаем: ни набора, ни итога ролика, ни сообщения', async () => {
     const yt = youtube();
-    yt.upload.mockRejectedValue(new YoutubeAttemptSuperseded('строку YouTube захватила другая попытка — файл не шлю'));
-    const { svc, tg, db } = setup(fakeDb({ attempts: MAX_PUBLISH_ATTEMPTS - 1 }), '-1003290853538', ['telegram', 'youtube'], yt);
+    const db = fakeDb({ attempts: MAX_PUBLISH_ATTEMPTS - 1 });
+    yt.upload.mockImplementation(async () => {
+      db.pubs.get('youtube').attempts += 1; // строку захватила новая попытка
+      throw new YoutubeAttemptSuperseded('строку YouTube захватила другая попытка — файл не шлю');
+    });
+    const { svc, tg } = setup(db, '-1003290853538', ['telegram', 'youtube'], yt);
     await svc.publish(ID);
     expect(db.v.attempts).toBe(MAX_PUBLISH_ATTEMPTS);
+    // Отдать строку пробовали только со своим жетоном (1) — чужую он не пустил.
+    const release = rowFails(db);
+    expect(release.map((c) => c.p)).toEqual([[ID, 'youtube', 'строку YouTube захватила другая попытка — файл не шлю', 1]]);
+    expect(release[0].s).toContain("WHERE short_id = $1 AND platform = $2 AND status = 'publishing' AND attempts = $4");
+    expect(db.pubs.get('youtube')).toMatchObject({ status: 'publishing', attempts: 2 });
+    expect(db.pubs.get('youtube').last_error).toBeUndefined();
     expect(tg.sendDocument).not.toHaveBeenCalled();
-    expect(rowFails(db)).toEqual([]);
     expect(finals(db)).toEqual([]);
     expect(yt.notifyUploaded).not.toHaveBeenCalled();
     expect(db.v.status).toBe('publishing');
-    expect(db.pubs.get('youtube').status).toBe('publishing');
+  });
+
+  it('ролик взяла новая попытка, а строка ещё своя (продление перед файлом не прошло) — строку отдаём в failed, адрес сессии на месте; ни набора, ни итога ролика', async () => {
+    const yt = youtube();
+    const db = fakeDb({ attempts: MAX_PUBLISH_ATTEMPTS - 1 });
+    const takeVideo = jest.fn(() => {
+      db.v.attempts += 1; // ролик взяла новая попытка, строку YouTube — нет
+    });
+    const upload = uploadLike(db);
+    yt.upload.mockImplementation(async (v: any, p: any, keepAlive: () => Promise<boolean>) => {
+      takeVideo();
+      return upload(v, p, keepAlive);
+    });
+    const { svc, tg } = setup(db, '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(db.pubs.get('youtube')).toMatchObject({ status: 'failed', attempts: 1, upload_session: SESSION_A, last_error: LOST });
+    const [release] = rowFails(db);
+    expect(release.s).not.toContain('upload_session');
+    expect(release.p).toEqual([ID, 'youtube', LOST, 1]);
+    expect(tg.sendDocument).not.toHaveBeenCalled();
+    expect(finals(db)).toEqual([]);
+    expect(yt.notifyUploaded).not.toHaveBeenCalled();
+  });
+
+  /** Часы под контролем теста: продление живости перед файлом (запрос с EXISTS) «длится» lagMs. */
+  const slowBeat = (db: ReturnType<typeof fakeDb>, lagMs: number) => {
+    let now = Date.parse('2026-10-27T12:00:00Z');
+    jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const real = db.query.getMockImplementation();
+    db.query.mockImplementation(async (sql: string, p?: any[]) => {
+      const r = await real(sql, p);
+      if (String(sql).replace(/\s+/g, ' ').includes('EXISTS (SELECT 1 FROM short_publication')) now += lagMs;
+      return r;
+    });
+  };
+
+  it.each([
+    [61_000, false],
+    [59_000, true],
+  ])('ответ на продление живости перед файлом шёл %i мс — продлено: %s', async (lagMs, expected) => {
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const yt = youtube();
+    const db = fakeDb();
+    let alive: boolean | undefined;
+    yt.upload.mockImplementation(async (_v: any, _p: any, keepAlive: () => Promise<boolean>) => {
+      alive = await keepAlive();
+      return OK;
+    });
+    slowBeat(db, lagMs);
+    const { svc } = setup(db, '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(alive).toBe(expected);
+    const slow = warn.mock.calls.map(([m]) => String(m)).filter((m) => m.includes('продление живости заняло'));
+    expect(slow).toEqual(
+      expected
+        ? []
+        : [`ролик ${ID}, youtube: продление живости заняло 61 с — до порога сторожа не хватит запаса на отправку файла (до 8 мин), не отправляю`],
+    );
+  });
+
+  it('продление перед файлом шло дольше минуты — файла нет, свою строку отдаём в failed (адрес на месте), ролик в publishing ждёт сторожа', async () => {
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const yt = youtube();
+    const db = fakeDb();
+    const sent = jest.fn();
+    yt.upload.mockImplementation(uploadLike(db, sent));
+    slowBeat(db, 61_000);
+    const { svc, tg } = setup(db, '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(sent).not.toHaveBeenCalled();
+    expect(db.pubs.get('youtube')).toMatchObject({ status: 'failed', attempts: 1, upload_session: SESSION_A, last_error: LOST });
+    // Живость продлена, итога нет: ролик вернёт в очередь сторож, а следующая попытка спросит YouTube об адресе без байтов.
+    expect(db.v).toMatchObject({ status: 'publishing', attempts: 1 });
+    expect(finals(db)).toEqual([]);
+    expect(tg.sendDocument).not.toHaveBeenCalled();
+    expect(yt.notifyUploaded).not.toHaveBeenCalled();
+  });
+
+  it('запас после продления: отправка файла и предел задержки ответа на продление вместе меньше порога сторожа', () => {
+    expect(KEEPALIVE_MAX_LAG_MS).toBe(60_000);
+    expect(SEND_TIMEOUT_MS + KEEPALIVE_MAX_LAG_MS).toBeLessThan(STUCK_PUBLISHING_MINUTES * 60_000);
   });
 
   it('отказ YouTube не записался — строку держит другая попытка: выходим без итога ролика', async () => {
