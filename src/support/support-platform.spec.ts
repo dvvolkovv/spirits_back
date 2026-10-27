@@ -1,5 +1,5 @@
 import { SupportService } from './support.service';
-import { platformSections } from '../chat/platform-guide';
+import { linksRule, platformSections } from '../chat/platform-guide';
 
 // Для теста учёта вызовов справки — нужен SupportService с events-моком; не
 // используем service()/prompt() ниже, те не передают EventsService совсем.
@@ -37,6 +37,15 @@ describe('ИИ-поддержка знает разделы платформы',
 
   it('не отправляет в поддержку из самой поддержки', () => {
     expect(prompt({ language: 'ru' })).not.toMatch(/предложи «Связаться с поддержкой»/);
+  });
+
+  // Ответы поддержки кабинет показывает простым текстом и делает ссылкой
+  // только сам адрес (SupportView, linkify): markdown остался бы скобками.
+  it('ссылки на разделы — полным адресом, без markdown', () => {
+    const p = prompt({ language: 'ru' });
+    expect(p).toContain(linksRule('plain'));
+    expect(p).not.toContain(linksRule('markdown'));
+    expect(p).toContain('https://my.linkeon.io/profile?open=zoom');
   });
 });
 
