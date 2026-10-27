@@ -492,6 +492,29 @@ maybe('ролики против живого Postgres', () => {
         expect(await videoRow(b.id)).toEqual({ status: 'publishing', attempts: 1, last_error: null });
       });
 
+      it('исход Telegram неизвестен, а ролик посреди отправки вернула в очередь устаревшая попытка — живой SQL: строка своя, ролик гасится в failed, второго поста нет', async () => {
+        const v = await insert({
+          status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() - 60_000),
+          video_key: 'shorts/v/video.mp4', cover_key: 'shorts/v/cover.jpg', captions: CAPTIONS,
+        });
+        const storage = { download: jest.fn(async () => Buffer.from('bytes')) };
+        const settings = { get: async () => ({ platforms: ['telegram'], tgChannelChatId: '-1001000000001' }) };
+        const sendVideo = jest.fn(async () => {
+          // Устаревший finishAttempt с обнулённым и совпавшим жетоном ролика вернул ролик в очередь.
+          await pool.query(`UPDATE short_video SET status = 'approved' WHERE id = $1`, [v.id]);
+          throw new Error('socket hang up');
+        });
+        const publisher = new ShortsPublisherService(pgLike() as any, { sendVideo } as any, storage as any, settings as any);
+        await publisher.publish(v.id);
+        const row = (await pool.query(`SELECT status, last_error FROM short_publication WHERE short_id = $1 AND platform = 'telegram'`, [v.id])).rows[0];
+        expect(row.status).toBe('failed');
+        expect(row.last_error).toMatch(/^пост мог выйти/);
+        expect((await pool.query(`SELECT status, failed_from, failure_notified FROM short_video WHERE id = $1`, [v.id])).rows[0])
+          .toEqual({ status: 'failed', failed_from: 'publishing', failure_notified: false });
+        await publisher.publish(v.id); // следующий тик: ролик не в approved — в канал второй раз не уходит
+        expect(sendVideo).toHaveBeenCalledTimes(1);
+      });
+
       it('набор: запись manual_pending — с жетоном строки; строку, которую тем временем захватила новая попытка, не переписывает (живой SQL)', async () => {
         const mk = (minutesAgo: number) =>
           insert({
