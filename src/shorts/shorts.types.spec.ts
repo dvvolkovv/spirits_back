@@ -135,3 +135,13 @@ describe('shortsBucket', () => {
     expect(shortsBucket({ MINIO_BUCKET_VIDEOS: 'videos-test' })).toBe('videos-test');
   });
 });
+
+import { rowToPublication } from './shorts.types';
+
+describe('rowToPublication: сессия загрузки YouTube', () => {
+  it('upload_session → uploadSession; без колонки — null', () => {
+    expect(rowToPublication({ short_id: 'x', platform: 'youtube', status: 'failed', upload_session: 'https://upload/abc' }).uploadSession)
+      .toBe('https://upload/abc');
+    expect(rowToPublication({ short_id: 'x', platform: 'youtube', status: 'failed' }).uploadSession).toBeNull();
+  });
+});

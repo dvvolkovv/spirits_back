@@ -5,7 +5,7 @@
  * форма не берёт лишних замков и не расходится с типами.
  */
 import { ShortsSchemaService } from './shorts-schema.service';
-import { ALLOWED_TRANSITIONS, SLOT_HOLDING_STATUSES, RUBRICS, ANGLES } from './shorts.types';
+import { ALLOWED_TRANSITIONS, SLOT_HOLDING_STATUSES, RUBRICS, ANGLES, YOUTUBE_MODES } from './shorts.types';
 
 async function applied(): Promise<string[]> {
   const queries: string[] = [];
@@ -26,6 +26,12 @@ async function appliedSkitsSql(): Promise<string> {
   return text;
 }
 
+async function appliedYoutubeSql(): Promise<string> {
+  const text = (await applied()).find((q) => q.includes("hashtext('shorts/003')"));
+  if (!text) throw new Error('миграция 003 не применена');
+  return text;
+}
+
 describe('ShortsSchemaService', () => {
   it('катит 001 при старте модуля', async () => {
     expect(await appliedSql()).toContain('CREATE TABLE short_publication');
@@ -37,6 +43,14 @@ describe('ShortsSchemaService', () => {
     const second = qs.findIndex((q) => q.includes("hashtext('shorts/002')"));
     expect(first).toBeGreaterThanOrEqual(0);
     expect(second).toBeGreaterThan(first);
+  });
+
+  it('катит 003 после 002', async () => {
+    const qs = await applied();
+    const second = qs.findIndex((q) => q.includes("hashtext('shorts/002')"));
+    const third = qs.findIndex((q) => q.includes("hashtext('shorts/003')"));
+    expect(second).toBeGreaterThanOrEqual(0);
+    expect(third).toBeGreaterThan(second);
   });
 
   it('не роняет старт, если база ответила ошибкой', async () => {
@@ -140,5 +154,30 @@ describe('текст 002_skits.sql', () => {
     expect(sql).not.toContain("SET DEFAULT 'skit'");
     expect(sql).toContain("ALTER TABLE short_settings ADD COLUMN format text NOT NULL DEFAULT 'skit'");
     expect(sql).toContain('ADD COLUMN max_omni_seconds int NOT NULL DEFAULT 48');
+  });
+});
+
+describe('текст 003_youtube.sql', () => {
+  it('весь файл — один DO-блок под advisory-локом и lock_timeout', async () => {
+    const sql = (await appliedYoutubeSql()).trim();
+    expect(sql.startsWith('DO $shorts$')).toBe(true);
+    expect(sql).toContain("pg_advisory_xact_lock(hashtext('shorts/003'))");
+    expect(sql).toContain("set_config('lock_timeout', '5s', true)");
+  });
+
+  it('каждый ALTER TABLE — под проверкой information_schema, таблица — под to_regclass', async () => {
+    const sql = await appliedYoutubeSql();
+    const alters = sql.match(/ALTER TABLE/g) ?? [];
+    const guarded = sql.match(/IF NOT EXISTS \(SELECT 1 FROM information_schema\.columns[\s\S]*?\) THEN\s+ALTER TABLE/g) ?? [];
+    expect(alters.length).toBe(2);
+    expect(guarded.length).toBe(alters.length);
+    expect(sql).toMatch(/IF to_regclass\('public\.short_youtube_account'\) IS NULL THEN\s+CREATE TABLE short_youtube_account/);
+    expect(sql).not.toMatch(/ADD COLUMN IF NOT EXISTS/);
+  });
+
+  it('режимы в CHECK — ровно YOUTUBE_MODES, умолчание manual', async () => {
+    const m = (await appliedYoutubeSql()).match(/youtube_mode text NOT NULL DEFAULT 'manual'\s+CHECK \(youtube_mode IN \(([^)]*)\)\)/);
+    const listed = (m?.[1].match(/'([a-z_]+)'/g) ?? []).map((s) => s.slice(1, -1));
+    expect(listed.sort()).toEqual([...YOUTUBE_MODES].sort());
   });
 });
