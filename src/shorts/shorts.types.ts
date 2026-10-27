@@ -3,26 +3,37 @@
  *
  * Спека: docs/superpowers/specs/2026-10-24-promo-shorts-design.md.
  *
- * Поля jsonb (`scene`, `capture`, `script`) пишут две стороны: API — сцену и
- * сценарий, студия (`studio/`) — съёмку. Их форма — зеркало
- * `studio/src/types.ts` и `studio/src/worker/db.ts`. Импортировать оттуда
- * нельзя: студия — отдельный ESM-пакет вне сборки API. Совпадение имён полей
- * сторожит shorts.contract.spec.ts.
+ * Поля jsonb (`scene`, `capture`, `script`, `animation`) пишут две стороны:
+ * API — сцену и сценарий, студия (`studio/`) — съёмку и оживление. Их форма —
+ * зеркало `studio/src/types.ts` и `studio/src/worker/db.ts`. Импортировать
+ * оттуда нельзя: студия — отдельный ESM-пакет вне сборки API. Совпадение имён
+ * полей сторожит shorts.contract.spec.ts.
+ *
+ * Сценки: docs/superpowers/specs/2026-10-26-shorts-skits-design.md.
  */
+import type { Skit, SkitKind, SkitPlan } from './short-skit-prompts';
 
 export type ShortRubric = 'assistant' | 'feature' | 'news' | 'case';
 export type ShortAngle = 'uncomfortable' | 'roast' | 'myth' | 'calm';
 export type ShortSource = 'catalog' | 'git' | 'manual';
 export type ShortStatus =
   | 'idea' | 'directing' | 'capture_queued' | 'capturing' | 'writing'
+  | 'animate_queued' | 'animating'
   | 'render_queued' | 'rendering' | 'pending_review' | 'approved'
   | 'publishing' | 'published' | 'rejected' | 'failed';
+/**
+ * Формат ролика: `skit` — сценки с героями вокруг настоящего ответа, `chat` —
+ * только съёмка чата (запасной, если Google снимет Omni). Ролик запоминает
+ * формат при запуске, чтобы переключение настройки посреди работы его не ломало.
+ */
+export type ShortFormat = 'skit' | 'chat';
 export type ShortPlatform = 'telegram' | 'vk' | 'youtube';
 export type PublicationStatus =
   | 'pending' | 'publishing' | 'published' | 'failed' | 'manual_pending' | 'manual_done';
 
 export const RUBRICS: readonly ShortRubric[] = ['assistant', 'feature', 'news', 'case'];
 export const ANGLES: readonly ShortAngle[] = ['uncomfortable', 'roast', 'myth', 'calm'];
+export const FORMATS: readonly ShortFormat[] = ['skit', 'chat'];
 /** Провокационные подачи: два ролика из трёх в неделю (спека, «Подача»). */
 export const PROVOCATIVE_ANGLES: readonly ShortAngle[] = ['uncomfortable', 'roast', 'myth'];
 
@@ -42,7 +53,7 @@ export const ANGLE_TITLES: Record<ShortAngle, string> = {
 
 /** Ролик в работе: предназначен своему слоту и считается в предел MAX_IN_WORK. */
 export const IN_WORK_STATUSES: readonly ShortStatus[] = [
-  'directing', 'capture_queued', 'capturing', 'writing', 'render_queued', 'rendering', 'pending_review',
+  'directing', 'capture_queued', 'capturing', 'writing', 'animate_queued', 'animating', 'render_queued', 'rendering', 'pending_review',
 ];
 
 /** Слот держат ровно эти статусы — предикат uq_short_video_slot (сверяет shorts-schema.spec.ts). */
@@ -60,7 +71,9 @@ export const MAX_IN_WORK = 2;
  * открыл бы ему канал мимо человека.
  *
  * Возвраты на ту же стадию (`capturing → capture_queued`,
- * `rendering → render_queued`) — повтор задания студии после сбоя.
+ * `animating → animate_queued`, `rendering → render_queued`) — повтор задания
+ * студии после сбоя. Сценарист отдаёт ролик формата `skit` на оживление
+ * (`writing → animate_queued`), формата `chat` — сразу на сборку.
  * `rendering → writing` — озвучка вышла за 30–60 с или реплика ответа короче
  * 1,5 с: сценарий уходит на переписку с пояснением. `writing → directing` —
  * сценарист просит другую сцену.
@@ -70,7 +83,9 @@ export const ALLOWED_TRANSITIONS: Record<ShortStatus, ShortStatus[]> = {
   directing:      ['capture_queued', 'failed'],
   capture_queued: ['capturing'],
   capturing:      ['writing', 'capture_queued', 'failed'],
-  writing:        ['render_queued', 'directing', 'failed'],
+  writing:        ['animate_queued', 'render_queued', 'directing', 'failed'],
+  animate_queued: ['animating'],
+  animating:      ['render_queued', 'animate_queued', 'failed'],
   render_queued:  ['rendering'],
   rendering:      ['pending_review', 'render_queued', 'writing', 'failed'],
   pending_review: ['approved', 'writing', 'directing', 'rejected'],
@@ -78,7 +93,7 @@ export const ALLOWED_TRANSITIONS: Record<ShortStatus, ShortStatus[]> = {
   publishing:     ['published', 'approved', 'failed'],
   published:      [],
   rejected:       [],
-  failed:         ['directing', 'capture_queued', 'writing', 'render_queued', 'approved', 'rejected'],
+  failed:         ['directing', 'capture_queued', 'writing', 'animate_queued', 'render_queued', 'approved', 'rejected'],
 };
 
 export function canTransition(from: ShortStatus, to: ShortStatus): boolean {
@@ -90,6 +105,8 @@ const RESUME_FROM: Partial<Record<ShortStatus, ShortStatus>> = {
   directing: 'directing',
   capturing: 'capture_queued',
   writing: 'writing',
+  // Готовые кадры и клипы задание возьмёт по отпечатку, запущенную генерацию — дождётся.
+  animating: 'animate_queued',
   rendering: 'render_queued',
 };
 
@@ -141,6 +158,8 @@ export interface ShortScene {
   question: string;
   /** Ответы на встречный вопрос ассистента, по порядку; используется не больше двух. */
   followups: string[];
+  /** Сценка 1 (конфликт) от режиссёра — у ролика формата `skit`. Съёмка её не читает. */
+  skit?: Skit;
 }
 
 export interface ShortBox {
@@ -191,6 +210,32 @@ export interface ShortScript {
   speed: number;
   lines: ShortScriptLine[];
   final: { assistantsCount: number; disclaimer?: string };
+  /** Сценки с готовыми промптами и отпечатками — у ролика формата `skit` (planSkits). */
+  skits?: Record<SkitKind, SkitPlan>;
+}
+
+/** Готовая сценка, как её пишет задание animate (зеркало SkitClip в studio/src/types.ts). Пути — относительно `shorts/<id>/`. */
+export interface ShortSkitClip {
+  fingerprint: string;
+  keyframe: string;
+  clip: string;
+  durationMs: number;
+  heard: string;
+  cues: { line: number; startMs: number; endMs: number }[];
+  attempts: number;
+  post: string;
+}
+
+/**
+ * Итог задания animate (зеркало ShortAnimation в studio/src/types.ts): секунды
+ * Omni и кадры — счёт денег ролика со всеми попытками, сценки — частично
+ * заполненные, `pending` — запущенные, но не скачанные генерации.
+ */
+export interface ShortAnimation {
+  omniSeconds: number;
+  keyframes?: number;
+  skits: Partial<Record<SkitKind, ShortSkitClip>>;
+  pending?: Partial<Record<SkitKind, { id: string; fingerprint: string }>>;
 }
 
 /** Подписи площадок — уже со ссылками и пометкой о синтезированном голосе. */
@@ -215,10 +260,12 @@ export interface ShortVideo {
   assistantId: number | null;
   slug: string | null;
   lang: string;
+  format: ShortFormat;
   scene: ShortScene | null;
   capture: ShortCapture | null;
   script: ShortScript | null;
   captions: ShortCaptions | null;
+  animation: ShortAnimation | null;
   videoKey: string | null;
   coverKey: string | null;
   durationMs: number | null;
@@ -274,10 +321,13 @@ export function rowToShort(row: any): ShortVideo {
     assistantId: num(row.assistant_id),
     slug: row.slug ?? null,
     lang: row.lang ?? 'ru',
+    // В базе формат есть у каждой строки (002); без поля — поведение плана 2, chat.
+    format: row.format === 'skit' ? 'skit' : 'chat',
     scene: row.scene ?? null,
     capture: row.capture ?? null,
     script: row.script ?? null,
     captions: row.captions ?? null,
+    animation: row.animation ?? null,
     videoKey: row.video_key ?? null,
     coverKey: row.cover_key ?? null,
     durationMs: num(row.duration_ms),

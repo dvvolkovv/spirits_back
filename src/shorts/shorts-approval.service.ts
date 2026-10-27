@@ -7,7 +7,7 @@ import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { buildReviewKeyboard, parseShortCallback, parseYoutubeUrl, shortCommandText } from './short-callback';
-import { STAND_MARK, buildReviewCaption, clip } from './short-captions';
+import { STAND_MARK, buildReviewCaption, clip, skitCastLine } from './short-captions';
 import { autoTopicsEnabled, isStand, shortsEnabled } from './short-env';
 import { approveShortIntoSlot } from './short-slot-claim';
 import { ShortsSettingsService } from './shorts-settings.service';
@@ -44,6 +44,7 @@ export const RELEASED_SQL =
 
 const RESHOOT = 'Ролик сейчас переснимается — замечание напишите к новому варианту.';
 const REBUILD = 'Ролик сейчас пересобирается — замечание напишите к новому варианту.';
+const REANIMATE = 'Сценки ролика сейчас оживают — замечание напишите к новому варианту.';
 
 /**
  * Что делать с упавшим роликом. Вкладки «Ролики» в кабинете пока нет (план 3) —
@@ -57,6 +58,8 @@ const NOTE_REFUSALS: Partial<Record<ShortStatus, string>> = {
   capture_queued: RESHOOT,
   capturing: RESHOOT,
   writing: 'Ролик сейчас переписывается — замечание напишите к новому варианту.',
+  animate_queued: REANIMATE,
+  animating: REANIMATE,
   render_queued: REBUILD,
   rendering: REBUILD,
   approved: 'Ролик уже одобрен и ждёт слота — замечание не принял. Переснять его можно кнопкой «🔄 Переснять».',
@@ -76,6 +79,8 @@ const BUTTON_REFUSALS: Partial<Record<ShortStatus, string>> = {
   capture_queued: REWORKING,
   capturing: REWORKING,
   writing: REWORKING,
+  animate_queued: REWORKING,
+  animating: REWORKING,
   render_queued: REWORKING,
   rendering: REWORKING,
   approved: 'Ролик уже одобрен',
@@ -235,6 +240,10 @@ export class ShortsApprovalService {
       question: v.scene.question,
       when,
       captions: v.captions,
+      // Сценки: кто играл и во что обошлось оживление (спека сценок, «Одобрение»).
+      ...(v.script?.skits
+        ? { skits: { cast: skitCastLine(v.script.skits), animation: v.animation, maxOmniSeconds: (await this.settings.get()).maxOmniSeconds } }
+        : {}),
     });
     const msg: any = await this.tg.sendVideo(chatId, video, {
       caption,

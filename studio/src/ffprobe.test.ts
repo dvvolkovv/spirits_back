@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseProbe, parseSilences, toDurationMs, verifyVideo } from './ffprobe';
+import { parseProbe, parseSilences, SHORT_LIMITS, SKIT_LIMITS, toDurationMs, verifyVideo } from './ffprobe';
 
 const PROBE = JSON.stringify({
   format: { duration: '41.633333' },
@@ -44,6 +44,26 @@ test('неопределённая длительность — проблема
     JSON.stringify({ format: { duration: 'N/A' }, streams: [{ codec_type: 'video', width: 1080, height: 1920 }, { codec_type: 'audio' }] }),
   );
   assert.deepEqual(verifyVideo(probe, []), ['длина не определена — ffprobe не вернул длительность']);
+});
+
+test('ролик со сценками: 25–45 с, пауза до 3 с — у обычного ролика она была бы провалом', () => {
+  const probe = { durationSec: 27, width: 1080, height: 1920, hasAudio: true };
+  const pause = [{ start: 10, end: 12.5, duration: 2.5 }];
+  assert.deepEqual(verifyVideo(probe, pause, SKIT_LIMITS), []);
+  assert.deepEqual(verifyVideo(probe, pause, SHORT_LIMITS), ['длина 27.0 с вне 30–60 с', 'тишина 2.5 с с 10.0 с']);
+  assert.deepEqual(verifyVideo({ ...probe, durationSec: 45.1 }, [], SKIT_LIMITS), ['длина 45.1 с вне 25–45 с']);
+});
+
+test('длина ролика — по видеодорожке: звук AAC длиннее видео на десятки мс', () => {
+  const p = parseProbe(
+    JSON.stringify({
+      format: { duration: '45.056000' },
+      streams: [{ codec_type: 'video', width: 1080, height: 1920, duration: '45.000000' }, { codec_type: 'audio', duration: '45.056000' }],
+    }),
+  );
+  assert.equal(p.videoSec, 45);
+  assert.deepEqual(verifyVideo(p, [], SKIT_LIMITS), []);
+  assert.deepEqual(verifyVideo({ ...p, videoSec: undefined }, [], SKIT_LIMITS), ['длина 45.1 с вне 25–45 с']);
 });
 
 test('длительность озвучки без числа — ошибка с именем файла', () => {

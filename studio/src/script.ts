@@ -1,17 +1,23 @@
-import type { CaptureResult, Script } from './types';
+import { SKIT_KINDS, type CaptureResult, type Script } from './types';
+
+/** Предел слов зацепки — тот же, что у API (src/shorts/short-rules.ts: MAX_HOOK_WORDS, MAX_SKIT_HOOK_WORDS). */
+export const HOOK_MAX_WORDS = 8;
+export const SKIT_HOOK_MAX_WORDS = 6;
 
 /**
  * То, что студия может проверить сама до озвучки: у каждой реплики ответа
  * есть абзац, и такой абзац снят. Правила текста (цифры, конкуренты,
  * «анонимно»…) проверяет бэкенд во втором плане.
+ * У ролика со сценками — ещё сценки: реплики есть, абзацы существуют, отпечаток задан.
  */
 export function validateScript(script: Script, capture: Pick<CaptureResult, 'boxes'>): string[] {
   const problems: string[] = [];
   const hook = script.hook?.trim() ?? '';
   if (!hook) problems.push('нет зацепки');
   // Словом считаем токен с буквой или цифрой — тем же фильтром, что API (short-rules.ts):
-  // тире и прочие знаки между репликами не слова.
-  if (hook.split(/\s+/).filter((w) => /[\p{L}\p{N}]/u.test(w)).length > 8) problems.push('зацепка длиннее 8 слов');
+  // тире и прочие знаки между репликами не слова. У сценок зацепка — надпись, её читают за 3 с.
+  const maxHookWords = script.skits ? SKIT_HOOK_MAX_WORDS : HOOK_MAX_WORDS;
+  if (hook.split(/\s+/).filter((w) => /[\p{L}\p{N}]/u.test(w)).length > maxHookWords) problems.push(`зацепка длиннее ${maxHookWords} слов`);
   if (!script.voice?.trim()) problems.push('не задан голос');
 
   const ids = new Set<string>();
@@ -30,9 +36,29 @@ export function validateScript(script: Script, capture: Pick<CaptureResult, 'box
   if (script.hookBox != null && !known.has(script.hookBox)) {
     problems.push(`зацепка опирается на абзац ${script.hookBox}, а снято абзацев: ${capture.boxes.length}`);
   }
+  if (script.skits) {
+    if (script.lines.some((l) => l.scene === 'hook')) {
+      problems.push('у ролика со сценками зацепка — надпись поверх сценки, реплики hook быть не должно');
+    }
+    for (const kind of SKIT_KINDS) {
+      const p = script.skits[kind];
+      if (!p) {
+        problems.push(`нет сценки ${kind}`);
+        continue;
+      }
+      if (!p.fingerprint || !p.keyframeFingerprint) problems.push(`у сценки ${kind} нет отпечатка`);
+      if (!p.skit?.lines?.length) problems.push(`в сценке ${kind} нет реплик`);
+      for (const l of p.skit?.lines ?? []) {
+        if (l.box != null && !known.has(l.box)) {
+          problems.push(`реплика сценки ${kind} ссылается на абзац ${l.box}, а снято абзацев: ${capture.boxes.length}`);
+        }
+      }
+    }
+  }
   const count = script.final?.assistantsCount;
   if (!Number.isInteger(count) || count <= 0) problems.push('в финале нет числа ассистентов (final.assistantsCount)');
   const hookLine = script.lines.find((l) => l.scene === 'hook');
-  if (hookLine && hookLine.text.trim() !== hook) problems.push('текст реплики hook должен совпадать с зацепкой');
+  // У ролика со сценками реплика hook уже названа лишней — вторая проблема о том же сбила бы сценариста.
+  if (hookLine && !script.skits && hookLine.text.trim() !== hook) problems.push('текст реплики hook должен совпадать с зацепкой');
   return problems;
 }

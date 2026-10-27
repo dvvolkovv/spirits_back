@@ -1,6 +1,7 @@
 import { finalLine } from './short-numbers';
 import { WriterReply } from './short-parse';
-import { ShortScript, ShortScriptLine } from './shorts.types';
+import { SkitKind, SkitPlan } from './short-skit-prompts';
+import { ShortFormat, ShortScript, ShortScriptLine } from './shorts.types';
 
 /** Темп принятого образца (владелец, 25.10.2026). */
 export const SPEECH_SPEED = 1.1;
@@ -16,12 +17,21 @@ export interface ScriptOptions {
   assistantsCount: number;
   disclaimer?: string;
   badge?: string;
+  /**
+   * Формат ролика; без него — chat. У skit зацепка — немая надпись поверх
+   * конфликта: реплики hook нет, студия рисует hook текстом. Решает формат, а не
+   * сценки: сценарий без сценок (кривые — не спланировались) всё равно уйдёт на
+   * проверку правил ролика со сценками и не должен получить реплику h.
+   */
+  format?: ShortFormat;
+  /** Сценки с готовыми промптами (planSkits) — ролик формата skit. */
+  skits?: Record<SkitKind, SkitPlan>;
 }
 
-/** Ответ сценариста → `Script` студии: id реплик h, q, a1…, f — как у образца. */
+/** Ответ сценариста → `Script` студии: id реплик h, q, a1…, f — как у образца; у сценок — без h. */
 export function buildScript(reply: Pick<WriterReply, 'hook' | 'hookBox' | 'question' | 'lines'>, o: ScriptOptions): ShortScript {
   const lines: ShortScriptLine[] = [
-    { id: 'h', scene: 'hook', text: reply.hook },
+    ...(o.format === 'skit' ? [] : [{ id: 'h', scene: 'hook' as const, text: reply.hook }]),
     { id: 'q', scene: 'question', text: reply.question },
     ...reply.lines.map((l, i): ShortScriptLine => ({ id: `a${i + 1}`, scene: 'answer', box: l.box, text: l.text })),
     { id: 'f', scene: 'final', voice: o.narratorVoice, text: finalLine(o.assistantsCount) },
@@ -34,5 +44,6 @@ export function buildScript(reply: Pick<WriterReply, 'hook' | 'hookBox' | 'quest
     speed: SPEECH_SPEED,
     lines,
     final: { assistantsCount: o.assistantsCount, ...(o.disclaimer ? { disclaimer: o.disclaimer } : {}) },
+    ...(o.skits ? { skits: o.skits } : {}),
   };
 }

@@ -7,18 +7,36 @@
 import { ShortsSchemaService } from './shorts-schema.service';
 import { ALLOWED_TRANSITIONS, SLOT_HOLDING_STATUSES, RUBRICS, ANGLES } from './shorts.types';
 
-async function appliedSql(): Promise<string> {
+async function applied(): Promise<string[]> {
   const queries: string[] = [];
   const pg = { query: jest.fn(async (sql: string) => { queries.push(sql); return { rows: [] }; }) };
   await new ShortsSchemaService(pg as any).onModuleInit();
-  const text = queries.find((q) => q.includes('CREATE TABLE short_video'));
+  return queries.map((q) => q.replace(/--[^\n]*/g, ''));
+}
+
+async function appliedSql(): Promise<string> {
+  const text = (await applied()).find((q) => q.includes('CREATE TABLE short_video'));
   if (!text) throw new Error('миграция 001 не применена');
-  return text.replace(/--[^\n]*/g, '');
+  return text;
+}
+
+async function appliedSkitsSql(): Promise<string> {
+  const text = (await applied()).find((q) => q.includes("hashtext('shorts/002')"));
+  if (!text) throw new Error('миграция 002 не применена');
+  return text;
 }
 
 describe('ShortsSchemaService', () => {
   it('катит 001 при старте модуля', async () => {
     expect(await appliedSql()).toContain('CREATE TABLE short_publication');
+  });
+
+  it('катит 002 после 001', async () => {
+    const qs = await applied();
+    const first = qs.findIndex((q) => q.includes('CREATE TABLE short_video'));
+    const second = qs.findIndex((q) => q.includes("hashtext('shorts/002')"));
+    expect(first).toBeGreaterThanOrEqual(0);
+    expect(second).toBeGreaterThan(first);
   });
 
   it('не роняет старт, если база ответила ошибкой', async () => {
@@ -50,10 +68,11 @@ describe('текст 001_shorts.sql', () => {
     expect(listed.sort()).toEqual([...SLOT_HOLDING_STATUSES].sort());
   });
 
-  it('статусы в CHECK совпадают с машиной состояний', async () => {
+  it('статусы в CHECK 001 — машина состояний без этапа animate', async () => {
     const m = (await appliedSql()).match(/status\s+text NOT NULL DEFAULT 'idea' CHECK \(status IN \(([\s\S]*?)\)\)/);
     const listed = (m?.[1].match(/'([a-z_]+)'/g) ?? []).map((s) => s.slice(1, -1));
-    expect(listed.sort()).toEqual(Object.keys(ALLOWED_TRANSITIONS).sort());
+    const animate = ['animate_queued', 'animating'];
+    expect(listed.sort()).toEqual(Object.keys(ALLOWED_TRANSITIONS).filter((s) => !animate.includes(s)).sort());
   });
 
   it('строка настроек — под IF NOT EXISTS: обычный SELECT не ждёт чужую правку', async () => {
@@ -86,5 +105,40 @@ describe('текст 001_shorts.sql', () => {
     const m = sql.match(/CHECK \(angle IN \(([^)]*)\)\)/);
     const listed = (m?.[1].match(/'([a-z]+)'/g) ?? []).map((s) => s.slice(1, -1));
     expect(listed.sort()).toEqual([...ANGLES].sort());
+  });
+});
+
+describe('текст 002_skits.sql', () => {
+  it('весь файл — один DO-блок под своим advisory-локом и lock_timeout', async () => {
+    const sql = (await appliedSkitsSql()).trim();
+    expect(sql.startsWith('DO $shorts$')).toBe(true);
+    expect(sql).toContain("set_config('lock_timeout', '5s', true)");
+  });
+
+  it('каждый ALTER TABLE — под проверкой каталога, без ADD COLUMN IF NOT EXISTS', async () => {
+    const sql = await appliedSkitsSql();
+    expect(sql).not.toMatch(/ADD COLUMN IF NOT EXISTS/);
+    const adds = [...sql.matchAll(/ALTER TABLE ([a-z_]+) ADD COLUMN ([a-z_]+)/g)];
+    expect(adds.length).toBe(4);
+    // Проверка каталога — той же таблицы и той же колонки, что добавляет ALTER под ней.
+    for (const [, table, column] of adds) {
+      expect(sql).toMatch(new RegExp(`table_name = '${table}' AND column_name = '${column}'\\) THEN\\s+ALTER TABLE ${table} ADD COLUMN ${column}`));
+    }
+    // CHECK статуса — по имени: определение читается под замком на таблицу.
+    expect(sql).toMatch(/IF NOT EXISTS \(SELECT 1 FROM pg_constraint\s+WHERE conrelid = 'public\.short_video'::regclass AND conname = 'short_video_status_002'\) THEN/);
+  });
+
+  it('новый CHECK статуса перечисляет ровно машину состояний', async () => {
+    const m = (await appliedSkitsSql()).match(/ADD CONSTRAINT short_video_status_002 CHECK \(status IN \(([\s\S]*?)\)\)/);
+    const listed = (m?.[1].match(/'([a-z_]+)'/g) ?? []).map((s) => s.slice(1, -1));
+    expect(listed.sort()).toEqual(Object.keys(ALLOWED_TRANSITIONS).sort());
+  });
+
+  it('формат ролика и настройки — только skit и chat; у ролика умолчание chat (формат пишет запуск), у настроек — skit', async () => {
+    const sql = await appliedSkitsSql();
+    expect(sql).toContain("ALTER TABLE short_video ADD COLUMN format text NOT NULL DEFAULT 'chat' CHECK (format IN ('skit', 'chat'));");
+    expect(sql).not.toContain("SET DEFAULT 'skit'");
+    expect(sql).toContain("ALTER TABLE short_settings ADD COLUMN format text NOT NULL DEFAULT 'skit'");
+    expect(sql).toContain('ADD COLUMN max_omni_seconds int NOT NULL DEFAULT 48');
   });
 });

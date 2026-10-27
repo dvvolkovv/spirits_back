@@ -22,12 +22,25 @@ export type StudioErrorCode =
   | 'tts'
   | 'video_invalid'
   | 'no_input'
+  | 'keyframe'
+  | 'omni_rejected'
+  | 'omni_failed'
+  | 'omni_budget'
+  | 'omni_timeout'
+  | 'omni_unreadable'
+  | 'google_quota'
+  | 'google_auth'
+  | 'model_gone'
+  | 'speech_mismatch'
+  | 'clip_invalid'
+  | 'stt'
   | 'unknown';
 
 /**
- * Озвучка вышла за 30–60 с, реплика слишком короткая или студия отвергла сам
- * сценарий (script_invalid) — править сценаристу, а не повторять сборку:
- * сборка с тем же сценарием провалится снова.
+ * Озвучка вышла за 30–60 с (у ролика со сценками — за 25–45 с), реплика
+ * слишком короткая или студия отвергла сам сценарий (script_invalid) —
+ * править сценаристу, а не повторять сборку: сборка с тем же сценарием
+ * провалится снова.
  */
 export const WRITER_FEEDBACK_CODES: ReadonlySet<StudioErrorCode> = new Set<StudioErrorCode>(['too_short', 'too_long', 'line_too_short', 'script_invalid']);
 

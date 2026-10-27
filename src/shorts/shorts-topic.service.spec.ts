@@ -7,7 +7,7 @@ const AGENTS = [
   { id: 4, name: 'Ирина', description: 'Карьера — резюме, собеседования и переговоры' },
   { id: 7, name: 'Полина', description: 'Врач-терапевт — симптомы, анализы и профилактика' },
 ];
-const SETTINGS = { slotDays: [2, 4, 6], slotHourMsk: 18, prepareLeadHours: 24 };
+const SETTINGS = { slotDays: [2, 4, 6], slotHourMsk: 18, prepareLeadHours: 24, format: 'skit' };
 const MON_NOON = new Date('2026-10-26T12:00:00.000Z'); // до вт 18:00 МСК — 27 ч
 const MON_EVENING = new Date('2026-10-26T17:00:00.000Z'); // до вт 18:00 МСК — 22 ч
 const TUE = '2026-10-27T15:00:00.000Z';
@@ -31,10 +31,10 @@ function fakeTx(routes: Array<[string, any]>) {
   return { getClient: async () => client, seen };
 }
 
-function setup(tx: ReturnType<typeof fakeTx>, poolQuery = jest.fn(async () => ({ rows: [] })), agentsList: any[] = AGENTS) {
+function setup(tx: ReturnType<typeof fakeTx>, poolQuery = jest.fn(async () => ({ rows: [] })), agentsList: any[] = AGENTS, settingsOver: Record<string, unknown> = {}) {
   const pg = { query: poolQuery, getClient: tx.getClient };
   const agents = { getAgents: jest.fn(async () => agentsList) };
-  const settings = { get: jest.fn(async () => SETTINGS) };
+  const settings = { get: jest.fn(async () => ({ ...SETTINGS, ...settingsOver })) };
   return new ShortsTopicService(pg as any, agents as any, settings as any);
 }
 
@@ -212,7 +212,15 @@ describe('ShortsTopicService.start', () => {
     const v = await setup(tx).start({ force: false }, () => MON_EVENING);
     expect(v?.status).toBe('directing');
     const update = tx.seen.find((q) => q.sql.includes('UPDATE short_video'));
-    expect(update.params).toEqual(['i1', TUE, 'uncomfortable']);
+    // Формат — из настроек: SETTINGS теста — по умолчанию, сценки.
+    expect(update.params).toEqual(['i1', TUE, 'uncomfortable', 'skit']);
+    expect(update.sql).toContain('format = $4');
+  });
+
+  it('формат «Только чат» в настройках — ролик запускается в нём', async () => {
+    const tx = routes();
+    await setup(tx, undefined, AGENTS, { format: 'chat' }).start({ force: false }, () => MON_EVENING);
+    expect(tx.seen.find((q) => q.sql.includes('UPDATE short_video')).params[3]).toBe('chat');
   });
 
   it('до слота больше суток — крон ждёт, start_now — запускает', async () => {

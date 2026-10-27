@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { isValidVoice } from '../speech/voices';
-import { ShortPlatform } from './shorts.types';
+import { FORMATS, ShortFormat, ShortPlatform } from './shorts.types';
 
 export interface ShortSettings {
   /** ISO-дни: 1 — понедельник … 7 — воскресенье. */
@@ -15,6 +15,10 @@ export interface ShortSettings {
   platforms: ShortPlatform[];
   /** Голос Linkeon в финале. */
   narratorVoice: string;
+  /** Формат новых роликов: «Сценки» или «Только чат» (запасной, если Omni недоступен). */
+  format: ShortFormat;
+  /** Предел секунд Omni на ролик со всеми пересъёмками (спека сценок, «Отказы»). */
+  maxOmniSeconds: number;
 }
 
 export const SETTINGS_DEFAULTS: ShortSettings = {
@@ -25,6 +29,8 @@ export const SETTINGS_DEFAULTS: ShortSettings = {
   tgChannelChatId: null,
   platforms: ['telegram', 'youtube'],
   narratorVoice: 'alena',
+  format: 'skit',
+  maxOmniSeconds: 48,
 };
 
 export type ShortSettingsPatch = Partial<ShortSettings>;
@@ -40,6 +46,8 @@ const COLUMNS: Record<keyof ShortSettings, string> = {
   tgChannelChatId: 'tg_channel_chat_id',
   platforms: 'platforms',
   narratorVoice: 'narrator_voice',
+  format: 'format',
+  maxOmniSeconds: 'max_omni_seconds',
 };
 
 const intIn = (v: any, min: number, max: number): boolean => Number.isInteger(v) && v >= min && v <= max;
@@ -92,6 +100,15 @@ export function validateSettingsPatch(body: any): ShortSettingsPatch {
     if (!isValidVoice(b.narratorVoice, 'yandex')) throw new Error('narratorVoice — голос SpeechKit из каталога voices.ts');
     p.narratorVoice = b.narratorVoice;
   }
+  if (b.format !== undefined) {
+    if (!FORMATS.includes(b.format)) throw new Error('format — skit («Сценки») или chat («Только чат»)');
+    p.format = b.format;
+  }
+  if (b.maxOmniSeconds !== undefined) {
+    // Клип Omni — 8 с: предел меньше одного клипа сценки не снимет ни одной; CHECK базы — 8–400.
+    if (!intIn(b.maxOmniSeconds, 8, 400)) throw new Error('maxOmniSeconds — 8–400 секунд Omni на ролик (клип — 8 с)');
+    p.maxOmniSeconds = b.maxOmniSeconds;
+  }
   return p;
 }
 
@@ -100,11 +117,9 @@ export class ShortsSettingsService {
   constructor(private readonly pg: PgService) {}
 
   async get(): Promise<ShortSettings> {
-    const r = await this.pg.query(
-      `SELECT slot_days, slot_hour_msk, prepare_lead_hours, min_answer_chars,
-              tg_channel_chat_id, platforms, narrator_voice
-         FROM short_settings WHERE id = 1`,
-    );
+    // Все колонки: сорвавшийся накат 002 не должен ронять публикацию и одобрение —
+    // без новых колонок их поля возьмутся по умолчанию.
+    const r = await this.pg.query(`SELECT * FROM short_settings WHERE id = 1`);
     const row = r.rows[0];
     if (!row) return { ...SETTINGS_DEFAULTS };
     return {
@@ -115,6 +130,8 @@ export class ShortsSettingsService {
       tgChannelChatId: row.tg_channel_chat_id ?? null,
       platforms: Array.isArray(row.platforms) && row.platforms.length ? row.platforms : SETTINGS_DEFAULTS.platforms,
       narratorVoice: row.narrator_voice || SETTINGS_DEFAULTS.narratorVoice,
+      format: row.format === 'chat' ? 'chat' : SETTINGS_DEFAULTS.format,
+      maxOmniSeconds: Number(row.max_omni_seconds ?? SETTINGS_DEFAULTS.maxOmniSeconds),
     };
   }
 

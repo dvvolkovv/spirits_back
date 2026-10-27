@@ -5,9 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { StudioError } from '../errors';
 import type { RenderResult } from '../render/run-render';
-import type { CaptureResult, Scene, Script } from '../types';
-import type { FailOutcome, Job, Queue, RenderOutput, StoredCapture } from './db';
-import { coverKey, pruneOld, runOne, shotKey, videoKey, type JobDeps } from './jobs';
+import type { CaptureResult, Scene, Script, ShortAnimation } from '../types';
+import type { FailOutcome, Job, JobKind, Queue, RenderOutput, StoredCapture } from './db';
+import { animationKey, coverKey, pruneOld, runOne, shotKey, videoKey, type JobDeps } from './jobs';
 import type { Storage } from './storage';
 
 const ID = '6f1c2a9e-0d4b-4c3e-9a51-3b2f7c8d9e10';
@@ -15,8 +15,8 @@ const scene: Scene = { kind: 'chat', assistantId: 10, assistantName: 'Алекс
 const script = { hook: 'h', voice: 'madirus', lines: [], final: { assistantsCount: 18 } } as unknown as Script;
 
 /** written — что вернут записи итога; failOutcome — исход сбоя. jobs — задания, с которыми звали очередь. */
-function fakeQueue(jobs: Partial<Record<'capture' | 'render', Job>>, opts: { written?: boolean; failOutcome?: FailOutcome } = {}) {
-  const calls: Record<string, unknown[]> = { capture: [], render: [], fail: [], claim: [], jobs: [] };
+function fakeQueue(jobs: Partial<Record<JobKind, Job>>, opts: { written?: boolean; failOutcome?: FailOutcome; saved?: boolean } = {}) {
+  const calls: Record<string, unknown[]> = { capture: [], render: [], animate: [], save: [], fail: [], claim: [], jobs: [] };
   const queue: Queue = {
     async claim(kind) {
       calls.claim.push(kind);
@@ -34,6 +34,15 @@ function fakeQueue(jobs: Partial<Record<'capture' | 'render', Job>>, opts: { wri
       calls.jobs.push(j);
       return opts.written ?? true;
     },
+    async completeAnimate(j, animation) {
+      calls.animate.push([j.id, animation]);
+      calls.jobs.push(j);
+      return opts.written ?? true;
+    },
+    async saveAnimation(j, animation) {
+      calls.save.push([j.id, animation]);
+      return opts.saved ?? true;
+    },
     async fail(j, err): Promise<FailOutcome> {
       calls.fail.push([j.id, err]);
       calls.jobs.push(j);
@@ -42,21 +51,34 @@ function fakeQueue(jobs: Partial<Record<'capture' | 'render', Job>>, opts: { wri
     async minAnswerChars() {
       return 500;
     },
+    async maxOmniSeconds() {
+      return 48;
+    },
   };
   return { queue, calls };
 }
 
 function fakeStorage() {
   const files = new Map<string, string>();
+  const types = new Map<string, string>();
   const storage: Storage = {
-    async put(key, file) {
+    async put(key, file, contentType) {
       files.set(key, fs.readFileSync(file, 'utf8'));
+      types.set(key, contentType);
     },
     async get(key, dest) {
       fs.writeFileSync(dest, files.get(key) ?? '');
     },
+    async getIfExists(key, dest) {
+      if (!files.has(key)) return false;
+      fs.writeFileSync(dest, files.get(key)!);
+      return true;
+    },
+    async remove(key) {
+      files.delete(key);
+    },
   };
-  return { storage, files };
+  return { storage, files, types };
 }
 
 function deps(over: Partial<JobDeps> & Pick<JobDeps, 'queue' | 'storage'>): JobDeps {
@@ -64,6 +86,9 @@ function deps(over: Partial<JobDeps> & Pick<JobDeps, 'queue' | 'storage'>): JobD
     workRoot: fs.mkdtempSync(path.join(os.tmpdir(), 'studio-jobs-')),
     capture: async () => {
       throw new Error('съёмка не ожидалась');
+    },
+    animate: async () => {
+      throw new Error('оживление не ожидалось');
     },
     render: async () => {
       throw new Error('сборка не ожидалась');
@@ -73,8 +98,8 @@ function deps(over: Partial<JobDeps> & Pick<JobDeps, 'queue' | 'storage'>): JobD
   };
 }
 
-const job = (kind: 'capture' | 'render', over: Partial<Job> = {}): Job => ({
-  id: ID, kind, attempts: 1, writerRounds: 0, scene, capture: null, script: null, ...over,
+const job = (kind: JobKind, over: Partial<Job> = {}): Job => ({
+  id: ID, kind, attempts: 1, writerRounds: 0, scene, capture: null, script: null, animation: null, ...over,
 });
 
 test('съёмка: снимки — в MinIO под ключами попытки, съёмка — в базу без путей', async () => {
@@ -126,10 +151,10 @@ test('сборка: снимки из MinIO, сценарий и съёмка ф
   assert.deepEqual(calls.render[0], [ID, { videoKey: `shorts/${ID}/video.mp4`, coverKey: `shorts/${ID}/cover.jpg`, durationMs: 44200 } satisfies RenderOutput]);
 });
 
-test('сборка — первой: ролик ближе к концу пути', async () => {
-  const { queue, calls } = fakeQueue({ capture: job('capture'), render: job('render') });
+test('сборка — первой, оживление — до съёмки: ролик ближе к концу пути', async () => {
+  const { queue, calls } = fakeQueue({});
   await runOne(deps({ queue, storage: fakeStorage().storage }));
-  assert.equal(calls.claim[0], 'render');
+  assert.deepEqual(calls.claim, ['render', 'animate', 'capture']);
 });
 
 test('проверка файла не прошла — video_invalid с повтором', async () => {
@@ -222,4 +247,115 @@ test('старые рабочие папки удаляются, свежие �
   assert.equal(pruneOld(root, 7), 1);
   assert.deepEqual(fs.readdirSync(root), ['fresh']);
   assert.equal(pruneOld(path.join(root, 'нет такой'), 7), 0);
+});
+
+// ── Оживление сценок и сборка со сценками ──
+
+const skitPlan = (kind: string, box?: number) => ({
+  skit: {
+    cast: [{ hero: 'galina', role: 'хозяйка квартиры' }, { hero: 'kesha', role: 'жилец' }],
+    setting: 's', opening: 'o', action: 'a',
+    lines: [{ hero: 'kesha', text: 'Реплика', ...(box ? { box } : {}) }],
+  },
+  troupeVersion: 'v1', heroes: ['galina', 'kesha'], keyframePrompt: 'k', videoPrompt: 'v',
+  keyframeFingerprint: `kf-${kind}`, fingerprint: `fp-${kind}`,
+});
+const skitScript = {
+  hook: 'Залог за обои?', voice: 'madirus',
+  lines: [{ id: 'q', scene: 'question', text: 'Вопрос' }, { id: 'a1', scene: 'answer', text: 'Ответ', box: 1 }, { id: 'f', scene: 'final', text: 'Финал' }],
+  final: { assistantsCount: 18 },
+  skits: { conflict: skitPlan('c'), punchline: skitPlan('p', 1) },
+} as unknown as Script;
+const skitCapture = { scene, questionShotKey: 'q', answerShotKey: 'a', boxes: [{ n: 1, top: 0, height: 10, text: 'a' }], paragraphs: [] } as unknown as StoredCapture;
+
+test('оживление: счёт денег — из базы, готовое — из MinIO; по ходу — в базу и в MinIO; итог — очереди', async () => {
+  const stored: ShortAnimation = { omniSeconds: 8, keyframes: 1, skits: {}, pending: { conflict: { id: 'gen-1', fingerprint: 'fp-c' } } };
+  const { queue, calls } = fakeQueue({ animate: job('animate', { capture: skitCapture, script: skitScript, animation: stored }) });
+  const { storage, files, types } = fakeStorage();
+  files.set(animationKey(ID, 'keyframes/kf-c.jpg'), 'кадр конфликта');
+  files.set(animationKey(ID, 'skits/fp-c/raw.mp4'), 'оплаченный клип');
+  const final: ShortAnimation = { omniSeconds: 16, keyframes: 2, skits: {}, pending: {} };
+  const d = deps({
+    queue,
+    storage,
+    animate: async (runDir, hooks) => {
+      assert.deepEqual(JSON.parse(fs.readFileSync(path.join(runDir, 'animation.json'), 'utf8')), stored);
+      assert.deepEqual(JSON.parse(fs.readFileSync(path.join(runDir, 'script.json'), 'utf8')), skitScript);
+      assert.equal(fs.readFileSync(path.join(runDir, 'keyframes/kf-c.jpg'), 'utf8'), 'кадр конфликта');
+      assert.equal(fs.readFileSync(path.join(runDir, 'skits/fp-c/raw.mp4'), 'utf8'), 'оплаченный клип');
+      assert.equal(fs.existsSync(path.join(runDir, 'skits/fp-p/raw.mp4')), false);
+      assert.equal(hooks.maxOmniSeconds, 48);
+      await hooks.onSave({ ...stored, omniSeconds: 16 });
+      fs.mkdirSync(path.join(runDir, 'keyframes'), { recursive: true });
+      fs.writeFileSync(path.join(runDir, 'keyframes/kf-p.png'), 'кадр развязки');
+      await hooks.onFile('keyframes/kf-p.png');
+      return final;
+    },
+  });
+  assert.equal(await runOne(d), true);
+  assert.deepEqual(calls.save, [[ID, { ...stored, omniSeconds: 16 }]]);
+  assert.equal(files.get(animationKey(ID, 'keyframes/kf-p.png')), 'кадр развязки');
+  assert.equal(types.get(animationKey(ID, 'keyframes/kf-p.png')), 'image/png');
+  assert.deepEqual(calls.animate, [[ID, final]]);
+  assert.equal(calls.fail.length, 0);
+});
+
+test('оживление: задание уже не наше — сохранение по ходу отказывает, сбой без повтора', async () => {
+  const { queue, calls } = fakeQueue({ animate: job('animate', { capture: skitCapture, script: skitScript }) }, { saved: false });
+  const d = deps({
+    queue,
+    storage: fakeStorage().storage,
+    animate: async (_runDir, hooks) => {
+      await hooks.onSave({ omniSeconds: 0, skits: {} });
+      throw new Error('дальше идти нельзя');
+    },
+  });
+  await runOne(d);
+  const [, err] = calls.fail[0] as [string, StudioError];
+  assert.deepEqual([err.code, err.retryable], ['unknown', false]);
+  assert.match(err.message, /другой процесс/);
+});
+
+test('оживление: нет сценок — no_input; сценарий не прошёл проверку студии — script_invalid; до трат', async () => {
+  const a = fakeQueue({ animate: job('animate', { capture: skitCapture, script }) });
+  await runOne(deps({ queue: a.queue, storage: fakeStorage().storage }));
+  assert.equal((a.calls.fail[0] as [string, StudioError])[1].code, 'no_input');
+
+  const bad = { ...skitScript, hook: 'раз два три четыре пять шесть семь' } as Script;
+  const b = fakeQueue({ animate: job('animate', { capture: skitCapture, script: bad }) });
+  await runOne(deps({ queue: b.queue, storage: fakeStorage().storage }));
+  const [, err] = b.calls.fail[0] as [string, StudioError];
+  assert.deepEqual([err.code, err.retryable], ['script_invalid', false]);
+  assert.match(err.message, /зацепка длиннее 6 слов/);
+});
+
+test('сборка со сценками: клипы — из MinIO по animation, animation.json — в папку сборки', async () => {
+  const clip = (kind: string) => ({ fingerprint: `fp-${kind}`, keyframe: `keyframes/kf-${kind}.jpg`, clip: `skits/fp-${kind}/clip.mp4`, durationMs: 8000, heard: '', cues: [], attempts: 1, post: 'v2' });
+  const animation: ShortAnimation = { omniSeconds: 16, keyframes: 2, skits: { conflict: clip('c'), punchline: clip('p') } };
+  const { queue, calls } = fakeQueue({ render: job('render', { capture: skitCapture, script: skitScript, animation }) });
+  const { storage, files } = fakeStorage();
+  files.set(animationKey(ID, 'skits/fp-c/clip.mp4'), 'клип конфликта');
+  files.set(animationKey(ID, 'skits/fp-p/clip.mp4'), 'клип развязки');
+  const d = deps({
+    queue,
+    storage,
+    render: async (runDir): Promise<RenderResult> => {
+      assert.deepEqual(JSON.parse(fs.readFileSync(path.join(runDir, 'animation.json'), 'utf8')), animation);
+      assert.equal(fs.readFileSync(path.join(runDir, 'skits/fp-c/clip.mp4'), 'utf8'), 'клип конфликта');
+      assert.equal(fs.readFileSync(path.join(runDir, 'skits/fp-p/clip.mp4'), 'utf8'), 'клип развязки');
+      fs.writeFileSync(path.join(runDir, 'video.mp4'), 'видео');
+      fs.writeFileSync(path.join(runDir, 'cover.jpg'), 'обложка');
+      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 33 };
+    },
+  });
+  await runOne(d);
+  assert.equal(calls.fail.length, 0);
+  assert.equal(calls.render.length, 1);
+});
+
+test('сборка со сценками без оживления — no_input без повтора', async () => {
+  const { queue, calls } = fakeQueue({ render: job('render', { capture: skitCapture, script: skitScript }) });
+  await runOne(deps({ queue, storage: fakeStorage().storage }));
+  const [, err] = calls.fail[0] as [string, StudioError];
+  assert.deepEqual([err.code, err.retryable], ['no_input', false]);
 });

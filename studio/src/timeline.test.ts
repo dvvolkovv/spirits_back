@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildTimeline, MIN_ANSWER_LINE_MS } from './timeline';
+import { buildSkitTimeline, buildTimeline, MIN_ANSWER_LINE_MS, SKIT_CLIP_MAX_MS } from './timeline';
+import { CLIP_LIMITS } from './animate/clip-check';
 import { StudioError } from './errors';
 import type { LineScene, VoicedLine } from './types';
 
@@ -75,4 +76,64 @@ test('реплика ответа короче 1,5 с — line_too_short: при
     () => buildTimeline(s),
     (e: unknown) => e instanceof StudioError && e.code === 'line_too_short' && /реплика a1/.test(e.message),
   );
+});
+
+const skitLines = (): VoicedLine[] => [line('q', 'question', 4000), line('a1', 'answer', 8000, 1), line('a2', 'answer', 8000, 2), line('f', 'final', 4000)];
+const clips = { conflict: 8000, punchline: 8000 };
+
+test('сценки: конфликт → вопрос → ответ → развязка → финал', () => {
+  const t = buildSkitTimeline(skitLines(), clips, 30);
+  assert.deepEqual(t.scenes.conflict, { from: 0, duration: 240 });
+  assert.deepEqual(t.scenes.question, { from: 240, duration: 128 });
+  assert.deepEqual(t.scenes.answer, { from: 368, duration: 496 });
+  assert.deepEqual(t.scenes.punchline, { from: 864, duration: 240 });
+  assert.deepEqual(t.scenes.final, { from: 1104, duration: 128 });
+  assert.equal(t.totalFrames, 1232);
+  assert.deepEqual(t.segments.map((s) => [s.lineId, s.from]), [['q', 240], ['a1', 368], ['a2', 616], ['f', 1104]]);
+  assert.deepEqual(t.segments[1], { lineId: 'a1', scene: 'answer', text: 'a1', box: 1, audio: 'voice/a1.mp3', from: 368, duration: 240 });
+});
+
+test('сценки: реплики hook нет — зацепка идёт надписью поверх сценки', () => {
+  assert.throws(
+    () => buildSkitTimeline([line('h', 'hook', 1500), ...skitLines()], clips, 30),
+    (e: unknown) => e instanceof StudioError && e.code === 'script_invalid' && /реплики hook быть не должно/.test(e.message),
+  );
+});
+
+test('сценки: длина клипа из animation.json проверяется — NaN, 0 и клип короче зацепки', () => {
+  for (const bad of [Number.NaN, 0, -5000, 1000, 60_000, '8000' as unknown as number, null as unknown as number, undefined as unknown as number]) {
+    assert.throws(
+      () => buildSkitTimeline(skitLines(), { ...clips, punchline: bad }, 30),
+      (e: unknown) => e instanceof StudioError && e.code === 'no_input' && !e.retryable && /клип сценки punchline/.test(e.message),
+      `длина ${bad}`,
+    );
+  }
+});
+
+test('сценки: верхний предел клипа в таймлайне не уже пределов проверки клипа', () => {
+  assert.ok(CLIP_LIMITS.maxSec * 1000 <= SKIT_CLIP_MAX_MS, `${CLIP_LIMITS.maxSec} с > ${SKIT_CLIP_MAX_MS} мс`);
+  assert.doesNotThrow(() => buildSkitTimeline(skitLines(), { conflict: CLIP_LIMITS.maxSec * 1000, punchline: CLIP_LIMITS.minSec * 1000 }, 30));
+});
+
+test('сценки: на границе 25 с сообщение не противоречит себе и разбивает длину', () => {
+  // 480 кадров клипов + 245 кадров реплик + три паузы по 8 = 749 кадров, 24,97 с.
+  const ls = [line('q', 'question', 2000), line('a1', 'answer', 4167, 1), line('f', 'final', 2000)];
+  assert.throws(
+    () => buildSkitTimeline(ls, clips, 30),
+    (e: unknown) => e instanceof StudioError && e.code === 'too_short' && /ролик 24\.97 с — короче 25 с \(сценки 16\.00 с, озвучка 8\.97 с\)/.test(e.message),
+  );
+});
+
+test('сценки: ролик 25–45 с', () => {
+  const ls = skitLines();
+  const long = [...ls.slice(0, 3), line('a3', 'answer', 8000, 3), ls[3]];
+  assert.throws(() => buildSkitTimeline(long, clips, 30), (e: unknown) => e instanceof StudioError && e.code === 'too_long');
+  const short = [line('q', 'question', 2000), line('a1', 'answer', 2000, 1), line('f', 'final', 2000)];
+  assert.throws(() => buildSkitTimeline(short, { conflict: 6000, punchline: 6000 }, 30), (e: unknown) => e instanceof StudioError && e.code === 'too_short');
+});
+
+test('сценки: короткая реплика ответа — line_too_short, как у обычного ролика', () => {
+  const ls = skitLines();
+  ls[1] = line('a1', 'answer', 1000, 1);
+  assert.throws(() => buildSkitTimeline(ls, clips, 30), (e: unknown) => e instanceof StudioError && e.code === 'line_too_short');
 });

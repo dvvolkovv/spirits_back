@@ -50,3 +50,15 @@ test('рабочему процессу нужны база и MinIO; бакет
   assert.deepEqual(c.minio, { endpoint: 'http://127.0.0.1:9000', accessKey: 'a', secretKey: 's', bucket: 'linkeon-smm-videos' });
   assert.equal(parseConfig({}, none).minio, null);
 });
+
+test('оживлению сценок нужны ключи Google и SpeechKit; без оживления ключ Google не читается', () => {
+  const animate = { capture: false, tts: false, animate: true };
+  const speech = { YANDEX_SPEECHKIT_API_KEY: 'k', YANDEX_TTS_FOLDER_ID: 'f' };
+  assert.throws(() => parseConfig(speech, animate), /GOOGLE_AI_API_KEY/);
+  assert.throws(() => parseConfig({ GOOGLE_AI_API_KEY: 'g' }, animate), /YANDEX_SPEECHKIT_API_KEY/);
+  const c = parseConfig({ GOOGLE_AI_API_KEY: 'g', ...speech }, animate);
+  assert.equal(c.googleKey, 'g');
+  assert.equal(c.speechkitKey, 'k');
+  assert.equal(c.speechkitFolder, 'f');
+  assert.equal(parseConfig({ GOOGLE_AI_API_KEY: 'g' }, none).googleKey, '');
+});

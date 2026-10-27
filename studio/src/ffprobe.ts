@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { FRAME } from './frame';
+import { SKIT_MAX_TOTAL_MS, SKIT_MIN_TOTAL_MS } from './timeline';
 
 const run = promisify(execFile);
 
@@ -9,6 +10,8 @@ export interface ProbeInfo {
   width: number;
   height: number;
   hasAudio: boolean;
+  /** Длина видеодорожки, если ffprobe её знает: звук AAC выходит длиннее видео на десятки мс. */
+  videoSec?: number;
 }
 
 export interface Silence {
@@ -20,14 +23,16 @@ export interface Silence {
 export function parseProbe(json: string): ProbeInfo {
   const data = JSON.parse(json) as {
     format?: { duration?: string };
-    streams?: Array<{ codec_type?: string; width?: number; height?: number }>;
+    streams?: Array<{ codec_type?: string; width?: number; height?: number; duration?: string }>;
   };
   const video = data.streams?.find((s) => s.codec_type === 'video');
+  const videoSec = Number(video?.duration);
   return {
     durationSec: Number(data.format?.duration ?? 0),
     width: video?.width ?? 0,
     height: video?.height ?? 0,
     hasAudio: Boolean(data.streams?.some((s) => s.codec_type === 'audio')),
+    ...(Number.isFinite(videoSec) && videoSec > 0 ? { videoSec } : {}),
   };
 }
 
@@ -62,16 +67,34 @@ export interface VerifyLimits {
 export const SHORT_LIMITS: VerifyLimits = { minSec: 30, maxSec: 60, width: FRAME.width, height: FRAME.height, maxSilenceSec: 2 };
 
 /**
+ * Самая долгая тишина у ролика со сценками и внутри клипа сценки
+ * (CLIP_LIMITS, animate/clip-check.ts): между репликами сценок бывают паузы.
+ * Стартовое значение; сверяется на ролике-образце.
+ */
+export const SKIT_MAX_SILENCE_SEC = 3;
+
+/** Ролик со сценками: 25–45 с (пределы таймлайна), паузы — до SKIT_MAX_SILENCE_SEC. */
+export const SKIT_LIMITS: VerifyLimits = {
+  ...SHORT_LIMITS,
+  minSec: SKIT_MIN_TOTAL_MS / 1000,
+  maxSec: SKIT_MAX_TOTAL_MS / 1000,
+  maxSilenceSec: SKIT_MAX_SILENCE_SEC,
+};
+
+/**
  * Проверка готового ролика. Тишина длиннее предела — значит, реплика не
  * прозвучала: на мультфильме проверка первых секунд пропустила остановку
  * плеера на 0:23, поэтому смотрим звук по всей длине.
  */
 export function verifyVideo(probe: ProbeInfo, silences: Silence[], limits: VerifyLimits = SHORT_LIMITS): string[] {
   const problems: string[] = [];
-  if (!Number.isFinite(probe.durationSec)) {
+  // Длина — по видеодорожке, если она известна: её задал таймлайн, а звук AAC длиннее
+  // на десятки мс, и ролик ровно на пределе, пропущенный таймлайном, падал бы здесь.
+  const len = probe.videoSec ?? probe.durationSec;
+  if (!Number.isFinite(len)) {
     problems.push('длина не определена — ffprobe не вернул длительность');
-  } else if (probe.durationSec < limits.minSec || probe.durationSec > limits.maxSec) {
-    problems.push(`длина ${probe.durationSec.toFixed(1)} с вне ${limits.minSec}–${limits.maxSec} с`);
+  } else if (len < limits.minSec || len > limits.maxSec) {
+    problems.push(`длина ${len.toFixed(1)} с вне ${limits.minSec}–${limits.maxSec} с`);
   }
   if (probe.width !== limits.width || probe.height !== limits.height) {
     problems.push(`кадр ${probe.width}×${probe.height}, нужен ${limits.width}×${limits.height}`);
@@ -88,11 +111,17 @@ export async function probeFile(file: string): Promise<ProbeInfo> {
   return parseProbe(stdout);
 }
 
-export async function detectSilences(file: string, totalSec: number): Promise<Silence[]> {
+/**
+ * Тишина в файле. По умолчанию — провалы звука в готовом ролике (−45 дБ, от
+ * 0,5 с); паузы между репликами сценки ищутся своими порогами (animate/cues.ts).
+ * Порог — число в дБ: строку без «dB» ffmpeg не принимает, и сбой случился бы
+ * уже после оплаченного клипа.
+ */
+export async function detectSilences(file: string, totalSec: number, o: { noiseDb?: number; minSec?: number } = {}): Promise<Silence[]> {
   // silencedetect пишет в stderr, ffmpeg при этом выходит с кодом 0.
   const { stderr } = await run(
     'ffmpeg',
-    ['-hide_banner', '-nostats', '-i', file, '-af', 'silencedetect=noise=-45dB:d=0.5', '-f', 'null', '-'],
+    ['-hide_banner', '-nostats', '-i', file, '-af', `silencedetect=noise=${o.noiseDb ?? -45}dB:d=${o.minSec ?? 0.5}`, '-f', 'null', '-'],
     { maxBuffer: 16 * 1024 * 1024 },
   );
   return parseSilences(stderr, totalSec);

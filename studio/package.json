@@ -5,12 +5,13 @@
   "type": "module",
   "description": "Студия коротких роликов Linkeon: съёмка кабинета, озвучка SpeechKit, сборка в Remotion",
   "scripts": {
-    "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts src/plural.test.ts src/script.test.ts src/answer.test.ts src/ffprobe.test.ts src/config.test.ts src/tts.test.ts src/render/props.test.ts src/errors.test.ts src/frame.test.ts src/answer-motion.test.ts src/capture/run-capture.test.ts src/worker/storage.test.ts src/worker/jobs.test.ts",
-    "test:render": "tsx --test src/render/render.fixture.ts",
+    "test": "tsx --test src/guard.test.ts src/timeline.test.ts src/captions.test.ts src/pan.test.ts src/boxes.test.ts src/plural.test.ts src/script.test.ts src/answer.test.ts src/ffprobe.test.ts src/config.test.ts src/tts.test.ts src/render/props.test.ts src/errors.test.ts src/frame.test.ts src/answer-motion.test.ts src/capture/run-capture.test.ts src/worker/storage.test.ts src/worker/jobs.test.ts src/worker/animate-money.test.ts src/capture/promo.test.ts src/animate/match.test.ts src/animate/cues.test.ts src/animate/google.test.ts src/animate/stt.test.ts src/animate/clip-check.test.ts src/animate/run-animate.test.ts src/render/run-render.test.ts",
+    "test:render": "tsx --test src/render/render.fixture.ts src/render/render-skit.fixture.ts",
     "test:db": "tsx --test src/worker/db.integration.ts",
     "typecheck": "tsc --noEmit",
     "capture": "tsx src/capture/run-capture.ts",
     "render": "tsx src/render/run-render.ts",
+    "animate": "tsx src/animate/run-animate.ts",
     "worker": "tsx src/worker/worker.ts"
   },
   "dependencies": {

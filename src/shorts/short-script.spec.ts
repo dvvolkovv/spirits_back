@@ -1,4 +1,5 @@
 import { CASE_BADGE, SPEECH_SPEED, buildScript } from './short-script';
+import { planSkits } from './short-skit-prompts';
 
 const reply = {
   hook: 'Снимаете квартиру? Как не потерять залог',
@@ -27,5 +28,32 @@ describe('buildScript', () => {
   it('реальный кейс — с подписью в кадре вопроса', () => {
     const s = buildScript(reply, { voice: 'madirus', narratorVoice: 'alena', assistantsCount: 18, badge: CASE_BADGE });
     expect(s.badge).toBe('Реальная история, разговор повторён на демо-аккаунте');
+  });
+});
+
+describe('buildScript — ролик со сценками', () => {
+  const conflict = {
+    cast: [{ hero: 'galina' as const, role: 'хозяйка квартиры' }, { hero: 'kesha' as const, role: 'жилец' }],
+    setting: 'a rented flat hallway', opening: 'The goose blocks the door.', action: 'The goose hisses.',
+    lines: [{ hero: 'galina' as const, text: 'Залог мой!' }],
+  };
+  const punchline = { ...conflict, lines: [{ hero: 'kesha' as const, text: 'Это износ.', box: 11 }] };
+
+  it('без реплики зацепки: она надпись поверх сценки; сценки с промптами — в сценарии', () => {
+    const skits = planSkits({ conflict, punchline });
+    const s = buildScript(reply, { voice: 'madirus', narratorVoice: 'alena', assistantsCount: 18, format: 'skit', skits });
+    expect(s.lines.map((l) => l.id)).toEqual(['q', 'a1', 'a2', 'f']);
+    expect(s.hook).toBe(reply.hook);
+    expect(s.skits).toBe(skits);
+  });
+
+  it('реплику зацепки решает формат: у skit без спланированных сценок её тоже нет', () => {
+    const s = buildScript(reply, { voice: 'madirus', narratorVoice: 'alena', assistantsCount: 18, format: 'skit' });
+    expect(s.lines.map((l) => l.id)).toEqual(['q', 'a1', 'a2', 'f']);
+    expect('skits' in s).toBe(false);
+  });
+
+  it('у chat поля skits нет вовсе', () => {
+    expect('skits' in buildScript(reply, { voice: 'madirus', narratorVoice: 'alena', assistantsCount: 18 })).toBe(false);
   });
 });
