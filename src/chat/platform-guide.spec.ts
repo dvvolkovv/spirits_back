@@ -9,7 +9,7 @@ import {
   TOOLS_LIST_NOTE,
 } from './platform-guide';
 import { SUPPORTED_LANGUAGES } from '../common/services/language.service';
-import { PAID_SECTIONS, SECTION_PATHS, sectionUrl, type SectionKey } from '../platform-kb/section-links';
+import { SECTION_PATHS, sectionUrl, type SectionKey } from '../platform-kb/section-links';
 
 /**
  * Блок «Что есть в Linkeon» в системном промпте ассистента.
@@ -220,10 +220,11 @@ describe('системный промпт релея', () => {
     expect(await prefix('12')).toContain(INITIATIVE_RULE);
   });
 
-  it('стор: карта без партнёрской программы', async () => {
+  it('стор: карта без партнёрской программы и без адресов кабинета', async () => {
     const p = await prefix('12', 'ru', true);
     expect(p).toContain(platformGuide('ru', { ...STAFF, store: true }));
     expect(p).not.toContain('«Партнёры»');
+    expect(p).not.toContain('https://my.linkeon.io/');
   });
 
   it('своему ассистенту — строка про справку, без карты и инициативы', async () => {
@@ -255,12 +256,25 @@ describe('ссылки на разделы', () => {
     expect(KEYS.filter((k) => !s.includes(`${sectionUrl(k)})`))).toEqual([]);
   });
 
-  it('стор: без адресов разделов о деньгах, остальные на месте', () => {
-    const s = platformSections('ru', { store: true });
-    for (const k of KEYS) {
-      if (PAID_SECTIONS.includes(k)) expect(s).not.toContain(sectionUrl(k));
-      else expect(s).toContain(`${sectionUrl(k)})`);
-    }
+  // Сборка из стора — Flutter-приложение: ссылку оно открывает во внешнем
+  // браузере, а на страницах кабинета — баланс, покупка токенов и «Скачать
+  // APK» (правило Apple 3.1.1; решения владельца — у platformSections). Адресов
+  // кабинета там нет вовсе — так же, как нет партнёрской программы.
+  it.each([...SUPPORTED_LANGUAGES])('%s, стор: ни одного адреса кабинета и без правила ссылок', (lang) => {
+    const g = platformGuide(lang, { helpTool: HELP, initiative: true, store: true });
+    expect(g).not.toContain('https://my.linkeon.io/');
+    expect(g).not.toMatch(/https?:\/\//);
+    expect(g).not.toContain(linksRule('markdown'));
+    expect(g).not.toContain(linksRule('plain'));
+  });
+
+  it('стор: разделы те же, что в вебе, кроме партнёрской программы, — названы подписью, без адреса', () => {
+    const labels = (s: string) => [...new Set(s.match(/«[^»]+»/g))];
+    const store = platformSections('ru', { store: true });
+    expect(labels(platformSections('ru')).filter((q) => !store.includes(q))).toEqual(['«Партнёры»', '«Пригласи друга»']);
+    expect(flat(store)).toMatch(/• «Чат с ассистентом» — разговоры с ассистентами/);
+    expect(flat(store)).toMatch(/«Календари» \(Яндекс, рабочий Outlook, Google и iCloud по ссылке\), «Zoom», /);
+    expect(flat(store)).toMatch(/привязка Telegram — карточка в «Мой профиль»\./);
   });
 
   it('раздела «Интеграции» нет — перечень говорит, где подключения', () => {

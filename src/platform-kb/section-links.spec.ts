@@ -1,4 +1,4 @@
-import { CABINET_ORIGIN, PAID_SECTIONS, SECTION_PATHS, sectionUrl, type SectionKey } from './section-links';
+import { CABINET_ORIGIN, SECTION_PATHS, sectionUrl, type SectionKey } from './section-links';
 import { KB_ARTICLES } from './articles';
 import { KB_CLIENTS, type KbClient } from './kb.types';
 import { renderArticle } from './render';
@@ -57,10 +57,6 @@ describe('таблица адресов разделов', () => {
 
   it('ни пополнения, ни оплаты: ссылку на пополнение даёт блок баланса', () => {
     expect(Object.values(SECTION_PATHS).filter((p) => /view=tokens|^\/tokens|payment/.test(p))).toEqual([]);
-  });
-
-  it('разделы о деньгах — из таблицы', () => {
-    expect(PAID_SECTIONS.filter((k) => !SECTION_PATHS[k])).toEqual([]);
   });
 
   it('sectionUrl — домен и путь', () => {
@@ -127,9 +123,10 @@ describe('ссылки на разделы в справке', () => {
     all = variants();
   });
 
-  it('статьи таблицы несут свои ссылки в разделе «Где», отдельной строкой «Ссылка…»', () => {
+  it('статьи таблицы несут свои ссылки в разделе «Где», отдельной строкой «Ссылка…» (кроме сборки из стора)', () => {
     const problems: string[] = [];
     for (const v of all) {
+      if (v.client === 'store') continue;
       for (const key of ARTICLE_LINKS[v.id] ?? []) {
         const line = new RegExp(`^Ссылка[^\\n]*: ${escapeRe(sectionUrl(key))}$`, 'm');
         if (!line.test(whereSection(v.text))) problems.push(`${where(v)}: нет ссылки ${key}`);
@@ -153,9 +150,17 @@ describe('ссылки на разделы в справке', () => {
     expect(problems).toEqual([]);
   });
 
-  it('сборка из стора: ни одной ссылки на раздел о деньгах', () => {
-    const paid = PAID_SECTIONS.map(sectionUrl);
-    expect(all.filter((v) => v.client === 'store' && paid.some((u) => v.text.includes(u))).map(where)).toEqual([]);
+  // Сборка из стора (Flutter) открывает ссылку во внешнем браузере, а в
+  // кабинете — баланс, покупка и «Скачать APK» (Apple 3.1.1; довод — у
+  // platformSections в chat/platform-guide.ts). Раздел «Где» при этом
+  // остаётся — путь по меню в нём есть всегда.
+  it('сборка из стора: ни одной ссылки на кабинет, строки «Ссылка…» нет, раздел «Где» на месте', () => {
+    const store = all.filter((v) => v.client === 'store');
+    expect(store.length).toBeGreaterThan(0);
+    expect(store.filter((v) => v.text.includes(`${CABINET_ORIGIN}/`)).map(where)).toEqual([]);
+    expect(store.filter((v) => /^Ссылка[^\n]*: /m.test(v.text)).map(where)).toEqual([]);
+    const whereBody = (v: Variant) => whereSection(v.text).replace(/^\n## Где\n/, '').trim();
+    expect(store.filter((v) => ARTICLE_LINKS[v.id] && !whereBody(v)).map(where)).toEqual([]);
   });
 });
 

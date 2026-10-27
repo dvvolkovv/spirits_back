@@ -105,4 +105,13 @@ describe('описание инструмента', () => {
     expect(d).toMatch(/userId/);
     expect(d).toMatch(/Строка «Ссылка…» в разделе «Где» — полный адрес раздела/);
   });
+
+  // В сборке из стора строки «Ссылка…» в статьях нет (render.ts) — описание
+  // о ней молчит, иначе модель искала бы адрес, которого ей не дали.
+  it('стор: о строке «Ссылка…» описание молчит; остальным клиентам — говорит', () => {
+    expect(linkeonHelpTool('store', REG).description).not.toMatch(/«Ссылка…»/);
+    for (const c of ['web', 'app', 'telegram'] as const) {
+      expect(linkeonHelpTool(c, REG).description).toMatch(/Строка «Ссылка…» в разделе «Где» — полный адрес раздела/);
+    }
+  });
 });

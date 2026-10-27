@@ -70,6 +70,19 @@ describe('ИИ-поддержка и справка', () => {
     expect(p).not.toContain('«Партнёры»');
   });
 
+  // Сборка из стора открывает ссылку во внешнем браузере, а в кабинете —
+  // баланс, покупка и «Скачать APK» (Apple 3.1.1; довод — у platformSections).
+  it('сборка из стора: ни адресов кабинета, ни правила ссылок', () => {
+    for (const language of ['ru', 'en', 'zh']) {
+      const p = (service() as any).buildSystemPrompt({ language }, undefined, { storeBuild: true });
+      expect(p).not.toContain('https://my.linkeon.io/');
+      expect(p).not.toContain(linksRule('plain'));
+      expect(p).not.toContain(linksRule('markdown'));
+    }
+    // Вне стора — как было: правило ссылок на месте.
+    expect((service() as any).buildSystemPrompt({ language: 'ru' }, undefined, {})).toContain(linksRule('plain'));
+  });
+
   it('у поддержки есть инструмент linkeon_help, и он отвечает на языке пользователя', async () => {
     const defs = (service() as any).supportToolDefs('t-1', 'u-test', { lang: 'en', client: 'web' });
     const help = defs.find((d: any) => d.name === 'linkeon_help');
