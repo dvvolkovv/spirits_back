@@ -266,18 +266,24 @@ export class ProductActionsService {
    * «есть активное задание → всё равно зовут release» не штатный — это
    * именно защита от будущей ошибки вызывающего, а не наблюдаемый сегодня
    * случай.
+   *
+   * payloadPatch — поля, которые дописываются в payload поверх прежних: так
+   * карточка ключей узнаёт текущий набор имён, когда её список устарел (ключ
+   * уже сняла другая карточка) — иначе после перезагрузки она снова покажет
+   * снятый ключ, и человек ходил бы по кругу.
    */
-  async release(id: string, result: Record<string, unknown>): Promise<void> {
+  async release(id: string, result: Record<string, unknown>, payloadPatch?: Record<string, unknown>): Promise<void> {
     if (!UUID_RE.test(String(id))) return;
     await this.pg.query(
-      `UPDATE product_actions SET status = 'pending', confirmed_via = NULL, result = $2::jsonb, secrets_box = NULL
+      `UPDATE product_actions SET status = 'pending', confirmed_via = NULL, result = $2::jsonb, secrets_box = NULL,
+              payload = CASE WHEN $3::jsonb IS NULL THEN payload ELSE COALESCE(payload, '{}'::jsonb) || $3::jsonb END
         WHERE id = $1 AND status = 'working'
           -- $1, а не коррелированный id: сравнение со своим же id внутри
           -- подзапроса было бы неоднозначным — у product_provision_jobs
           -- тоже есть столбец id, и он перекрыл бы внешний (действие на
           -- единственную строку $1 — коррелировать нечем, она и так одна).
           AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j WHERE j.action_id = $1 AND j.status IN ('queued','running'))`,
-      [id, JSON.stringify(result)],
+      [id, JSON.stringify(result), payloadPatch ? JSON.stringify(payloadPatch) : null],
     );
   }
 

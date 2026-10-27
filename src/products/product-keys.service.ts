@@ -134,8 +134,10 @@ export class ProductKeysService {
     // текст на язык человека (products.action.keys.errors.<reason>); русский
     // error — запасной показ. field — `!== undefined`, а не истинность: у
     // ключа с пустым именем отказ формы приходит с field ''.
-    const fix = async (message: string, reason: string, field?: string): Promise<KeysFail> => {
-      await this.actions.release(row.id, field !== undefined ? { error: message, reason, field } : { error: message, reason });
+    const fix = async (message: string, reason: string, field?: string, payloadPatch?: Record<string, unknown>): Promise<KeysFail> => {
+      const result = field !== undefined ? { error: message, reason, field } : { error: message, reason };
+      if (payloadPatch) await this.actions.release(row.id, result, payloadPatch);
+      else await this.actions.release(row.id, result);
       return { ok: false, reason, message };
     };
     const fail = async (message: string, reason: string): Promise<KeysFail> => {
@@ -215,15 +217,18 @@ export class ProductKeysService {
     // в карточке таких имён нет (занятые платформой из keyNames выброшены,
     // а «нет у продукта» — это ключ, который уже сняла другая карточка), и
     // текст кабинета про правила имени ввёл бы человека в заблуждение.
+    // Список имён карточки обновляется текущим набором: «обновите карточку»
+    // иначе вернул бы тот же устаревший список.
+    const freshNames = { keyNames: Object.keys(old).sort() };
     const reservedDrop = remove.find((n) => isReservedSecretName(n));
     if (reservedDrop !== undefined) {
       const shown = shownSecretName(reservedDrop);
-      return fix(`Ключ ${shown} — переменная платформы: карточкой его не убрать`, 'bad_shape', shown);
+      return fix(`Ключ ${shown} — переменная платформы: карточкой его не убрать`, 'bad_shape', shown, freshNames);
     }
     const missing = remove.find((n) => !has(old, n));
     if (missing !== undefined) {
       const shown = shownSecretName(missing);
-      return fix(`Ключа ${shown} у продукта нет`, 'bad_shape', shown);
+      return fix(`Ключа ${shown} у продукта нет`, 'bad_shape', shown, freshNames);
     }
     // Object.fromEntries, а не присваивание: имя `__proto__` форму переменной
     // проходит (как и у заведения), а `obj['__proto__'] = …` своего ключа не

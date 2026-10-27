@@ -168,7 +168,10 @@ describe('карточка ключей: отправить', () => {
     const r = await send(h, set, remove);
     expect(r).toMatchObject({ ok: false, reason });
     // reason — в result карточки: по нему фронт переводит текст.
-    expect(h.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ error: expect.any(String), reason }));
+    expect(h.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ error: expect.any(String), reason }), ...(
+      // Снятие ключа, которого нет, обновляет список имён карточки.
+      Array.isArray(remove) && remove.includes('NO_SUCH') ? [{ keyNames: ['BOT_TOKEN', 'OLD_KEY'] }] : []
+    ));
     expect(h.calls.some((c) => c.sql.includes('INSERT INTO product_provision_jobs'))).toBe(false);
   });
 
@@ -200,7 +203,7 @@ describe('карточка ключей: отправить', () => {
   it('снять старый ключ с занятым именем карточкой нельзя — поправимо («карточка устарела»), поле этого ключа', async () => {
     const h = harness({ old: { BOT_TOKEN: '111111:TEST-old', OWNER_TG_ID: '42' } });
     expect(await send(h, {}, ['OWNER_TG_ID'])).toMatchObject({ ok: false, reason: 'bad_shape' });
-    expect(h.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ reason: 'bad_shape', field: 'OWNER_TG_ID' }));
+    expect(h.actions.release).toHaveBeenCalledWith(AID, expect.objectContaining({ reason: 'bad_shape', field: 'OWNER_TG_ID' }), { keyNames: ['BOT_TOKEN'] });
     expect(h.calls.some((c) => c.sql.includes('INSERT INTO product_provision_jobs'))).toBe(false);
   });
 
@@ -253,6 +256,15 @@ describe('карточка ключей: отправить', () => {
     expect(Buffer.isBuffer(ins.params[1])).toBe(true);
     expect(secrets.decrypt(ins.params[1], PID)).toEqual({});
     expect(JSON.parse(ins.params[2])).toEqual({ newKeyNames: [], removedNames: ['A'], changedNames: [] });
+  });
+
+  it('ключ уже снят другой карточкой — «карточка устарела», и её список имён становится текущим', async () => {
+    const h = harness({ old: { BOT_TOKEN: '111111:TEST-old', NEW_KEY: 'n' } });
+    expect(await send(h, {}, ['OLD_KEY'])).toMatchObject({ ok: false, reason: 'bad_shape' });
+    expect(h.actions.release).toHaveBeenCalledWith(
+      AID, expect.objectContaining({ reason: 'bad_shape', field: 'OLD_KEY' }), { keyNames: ['BOT_TOKEN', 'NEW_KEY'] },
+    );
+    expect(h.calls.some((c) => c.sql.includes('INSERT INTO product_provision_jobs'))).toBe(false);
   });
 
   it('отправка без перемены значений не отбивается — пересоздание доставляет OWNER_TG_ID и чистит занятые имена', async () => {
