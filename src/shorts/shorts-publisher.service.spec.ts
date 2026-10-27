@@ -3,7 +3,7 @@ import { GrammyError, HttpError, InputFile } from 'grammy';
 import { buildYoutubeKeyboard } from './short-callback';
 import { MAX_PUBLISH_ATTEMPTS, STUCK_PUBLISHING_MINUTES, ShortsPublisherService, YOUTUBE_MAY_BE_OUT } from './shorts-publisher.service';
 import { PENDING_UPLOAD_NOTE } from './shorts-youtube.service';
-import { YoutubeAuthError, YoutubeMaybeUploaded, YoutubeNotUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
+import { YoutubeAttemptSuperseded, YoutubeAuthError, YoutubeMaybeUploaded, YoutubeNotUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
 import { SEND_TIMEOUT_MS } from './youtube/youtube-upload';
 
 const ID = '6f1c2a9e-0d4b-4c3e-9a51-3b2f7c8d9e10';
@@ -15,7 +15,17 @@ interface FakeOpts {
   successWrite?: 'throw' | 'none';
 }
 
-/** База в миниатюре: ровно те запросы, что делает публикатор. Условия на статус — как в SQL. */
+/**
+ * Жетон попытки из условия `attempts = $n` в SQL: значение параметра nth-го такого условия
+ * (с нуля); условия нет — undefined, и фейк жетон не проверяет, как не проверила бы база.
+ */
+const fenceArg = (s: string, p: any[], nth = 0): number | undefined => {
+  const m = [...s.matchAll(/\battempts = \$(\d+)/g)][nth];
+  return m ? p[Number(m[1]) - 1] : undefined;
+};
+const fits = (fence: number | undefined, attempts: number): boolean => fence === undefined || fence === attempts;
+
+/** База в миниатюре: ровно те запросы, что делает публикатор. Условия на статус и жетон попытки — как в SQL. */
 function fakeDb(over: Record<string, any> = {}, opts: FakeOpts = {}) {
   const v: any = {
     id: ID, rubric: 'assistant', angle: 'calm', source: 'manual', topic_key: 't', title: 'Залог', slug: 'zalog_ab12',
@@ -38,7 +48,13 @@ function fakeDb(over: Record<string, any> = {}, opts: FakeOpts = {}) {
       return { rows: [{ ...v }] };
     }
     if (s.startsWith('UPDATE short_video SET updated_at = now()')) {
-      return v.status === 'publishing' ? { rows: [{ alive: 1 }], rowCount: 1 } : { rows: [], rowCount: 0 };
+      let alive = v.status === 'publishing' && fits(fenceArg(s, p, 0), v.attempts);
+      if (s.includes('EXISTS')) {
+        // Вместе с роликом — строка площадки: publishing и её жетон.
+        const row = pubs.get(p[Number(s.match(/platform = \$(\d+)/)[1]) - 1]);
+        alive = alive && !!row && row.status === 'publishing' && fits(fenceArg(s, p, 1), row.attempts);
+      }
+      return alive ? { rows: [{ alive: 1 }], rowCount: 1 } : { rows: [], rowCount: 0 };
     }
     if (s.startsWith('INSERT INTO short_publication')) {
       if (!pubs.has(p[1])) pubs.set(p[1], { short_id: p[0], platform: p[1], status: 'pending', attempts: 0 });
@@ -62,22 +78,24 @@ function fakeDb(over: Record<string, any> = {}, opts: FakeOpts = {}) {
     }
     if (s.startsWith("UPDATE short_publication SET status = 'failed'")) {
       const row = pubs.get(p[1]);
-      if (row.status !== 'publishing') return { rows: [], rowCount: 0 };
+      if (row.status !== 'publishing' || !fits(fenceArg(s, p), row.attempts)) return { rows: [], rowCount: 0 };
       Object.assign(row, { status: 'failed', last_error: p[2] });
       return { rows: [], rowCount: 1 };
     }
     // Неизвестный исход: строка площадки и ролик — в failed одним запросом.
     if (s.startsWith("WITH pub AS ( UPDATE short_publication SET status = 'failed'")) {
       const row = pubs.get(p[1]);
-      if (row.status === 'publishing') Object.assign(row, { status: 'failed', last_error: p[2] });
-      if (v.status !== 'publishing') return { rows: [], rowCount: 0 };
+      const pubHit = row.status === 'publishing' && fits(fenceArg(s, p, 0), row.attempts);
+      if (pubHit) Object.assign(row, { status: 'failed', last_error: p[2] });
+      const needsPub = s.includes('EXISTS (SELECT 1 FROM pub)');
+      if (v.status !== 'publishing' || !fits(fenceArg(s, p, 1), v.attempts) || (needsPub && !pubHit)) return { rows: [], rowCount: 0 };
       Object.assign(v, { status: 'failed', failed_from: 'publishing', failure_notified: false, last_error: p[3] });
       return { rows: [], rowCount: 1 };
     }
     if (s.startsWith('SELECT * FROM short_publication')) return { rows: [...pubs.values()].map((r) => ({ ...r })) };
     const m = s.match(/^UPDATE short_video SET status = '(published|approved|failed)'/);
     if (m) {
-      if (v.status !== 'publishing') return { rows: [], rowCount: 0 };
+      if (v.status !== 'publishing' || !fits(fenceArg(s, p), v.attempts)) return { rows: [], rowCount: 0 };
       v.status = m[1];
       if (m[1] !== 'published') v.last_error = p[1];
       if (m[1] === 'failed') Object.assign(v, { failed_from: 'publishing', failure_notified: false });
@@ -103,6 +121,9 @@ function setup(db = fakeDb(), channel: string | null = '-1003290853538', platfor
 }
 
 const sqlOf = (db: { query: jest.Mock }) => db.query.mock.calls.map((c: any[]) => String(c[0]).replace(/\s+/g, ' ').trim());
+/** Запросы с параметрами: s — SQL одной строкой, p — параметры. */
+const callsOf = (db: { query: jest.Mock }) =>
+  db.query.mock.calls.map((c: any[]) => ({ s: String(c[0]).replace(/\s+/g, ' ').trim(), p: (c[1] ?? []) as any[] }));
 
 const env = { ...process.env };
 let logError: jest.SpyInstance;
@@ -308,11 +329,14 @@ describe('ShortsPublisherService.publish', () => {
     expect(db.v.status).toBe('failed');
   });
 
-  it('перед каждой площадкой продлевает живость ролика', async () => {
+  it('перед каждой площадкой продлевает живость ролика — с жетоном ролика (attempts из захвата)', async () => {
     const { svc, db } = setup();
     await svc.publish(ID);
-    const beats = sqlOf(db).filter((s) => s.startsWith("UPDATE short_video SET updated_at = now() WHERE id = $1 AND status = 'publishing' RETURNING 1"));
+    const beats = callsOf(db).filter(
+      (c) => c.s === "UPDATE short_video SET updated_at = now() WHERE id = $1 AND status = 'publishing' AND attempts = $2 RETURNING 1",
+    );
     expect(beats.length).toBeGreaterThanOrEqual(2);
+    for (const b of beats) expect(b.p).toEqual([ID, 1]);
   });
 });
 
@@ -377,7 +401,8 @@ describe('ShortsPublisherService.publish — YouTube загрузкой', () => 
     await svc.publish(ID);
     expect(yt.uploadPlan).toHaveBeenCalledWith(ID);
     expect(yt.notifyUploaded).toHaveBeenCalledWith(ID, 'unlisted');
-    expect(yt.upload).toHaveBeenCalledWith(expect.objectContaining({ id: ID }), 'unlisted', expect.any(Function));
+    // Четвёртым — жетон попытки: attempts из захвата строки YouTube.
+    expect(yt.upload).toHaveBeenCalledWith(expect.objectContaining({ id: ID }), 'unlisted', expect.any(Function), 1);
     expect(db.pubs.get('youtube')).toMatchObject({ status: 'published', external_id: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk' });
     expect(tg.sendDocument).not.toHaveBeenCalled();
     expect(db.v.status).toBe('published');
@@ -536,5 +561,171 @@ describe('ShortsPublisherService.publish — YouTube загрузкой', () => 
     expect(tg.sendVideo).toHaveBeenCalledTimes(1);
     expect(db.v.status).toBe('published');
     expect(yt.notifyUploaded).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * Жетон попытки: attempts из захвата ролика (v.attempts) и строки площадки. Попытка,
+ * зависшая дольше порога сторожа, пока ролик и строку взяла новая, не пишет в них ни
+ * отказа, ни итога и не шлёт ни файла, ни набора — исход superseded, publish() молча выходит.
+ */
+describe('ShortsPublisherService — жетон попытки', () => {
+  const UPLOAD = { kind: 'upload', privacy: 'unlisted' };
+  const OK = { videoId: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk', resumed: false };
+  const youtube = () => ({
+    uploadPlan: jest.fn(async () => UPLOAD),
+    upload: jest.fn(),
+    notifyUploaded: jest.fn(async () => undefined),
+  });
+  /** Telegram уже вышел, YouTube падал раньше: жетон строки после захвата (5) не совпадёт с жетоном ролика (1). */
+  const withRows = (db: ReturnType<typeof fakeDb>) => {
+    db.pubs.set('telegram', { short_id: ID, platform: 'telegram', status: 'published', attempts: 1 });
+    db.pubs.set('youtube', { short_id: ID, platform: 'youtube', status: 'failed', attempts: 4 });
+    return db;
+  };
+  const finals = (db: ReturnType<typeof fakeDb>) => sqlOf(db).filter((s) => /^UPDATE short_video SET status = '(approved|failed|published)'/.test(s));
+  const rowFails = (db: ReturnType<typeof fakeDb>) => sqlOf(db).filter((s) => s.startsWith("UPDATE short_publication SET status = 'failed'"));
+
+  it('загрузку сменила новая попытка, и попытка последняя — ни набора, ни отказа в строку, ни итога ролика, ни сообщения', async () => {
+    const yt = youtube();
+    yt.upload.mockRejectedValue(new YoutubeAttemptSuperseded('строку YouTube захватила другая попытка — файл не шлю'));
+    const { svc, tg, db } = setup(fakeDb({ attempts: MAX_PUBLISH_ATTEMPTS - 1 }), '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(db.v.attempts).toBe(MAX_PUBLISH_ATTEMPTS);
+    expect(tg.sendDocument).not.toHaveBeenCalled();
+    expect(rowFails(db)).toEqual([]);
+    expect(finals(db)).toEqual([]);
+    expect(yt.notifyUploaded).not.toHaveBeenCalled();
+    expect(db.v.status).toBe('publishing');
+    expect(db.pubs.get('youtube').status).toBe('publishing');
+  });
+
+  it('отказ YouTube не записался — строку держит другая попытка: выходим без итога ролика', async () => {
+    const yt = youtube();
+    const db = fakeDb();
+    yt.upload.mockImplementation(async () => {
+      db.pubs.get('youtube').attempts += 1; // пока шла загрузка, строку захватила новая попытка
+      throw new YoutubeNotUploaded('начало загрузки: HTTP 403 quotaExceeded: quota', 403);
+    });
+    const { svc, tg } = setup(db, '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(db.pubs.get('youtube')).toMatchObject({ status: 'publishing', attempts: 2 });
+    expect(finals(db)).toEqual([]);
+    expect(db.v.status).toBe('publishing');
+    expect(tg.sendDocument).not.toHaveBeenCalled();
+  });
+
+  it('отказ Telegram не записался — строку держит другая попытка: к YouTube не идём, итога ролика нет', async () => {
+    const db = fakeDb();
+    const { svc, tg } = setup(db);
+    tg.getBot.mockImplementation(() => {
+      db.pubs.get('telegram').attempts += 1; // строку захватила новая попытка
+      return undefined; // бот не поднят — обычный отказ до отправки
+    });
+    await svc.publish(ID);
+    expect(tg.sendVideo).not.toHaveBeenCalled();
+    expect(db.pubs.get('telegram')).toMatchObject({ status: 'publishing', attempts: 2 });
+    expect(finals(db)).toEqual([]);
+    expect(db.v.status).toBe('publishing');
+    expect(tg.sendDocument).not.toHaveBeenCalled();
+  });
+
+  it('записи попытки — с жетонами: отказ площадки — attempts строки из захвата, возврат ролика в очередь — attempts ролика', async () => {
+    const yt = youtube();
+    yt.upload.mockRejectedValue(new YoutubeNotUploaded('начало загрузки: HTTP 403 quotaExceeded: quota', 403));
+    const { svc, db } = setup(withRows(fakeDb()), '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    const calls = callsOf(db);
+    const fail = calls.find((c) => c.s.startsWith("UPDATE short_publication SET status = 'failed'"));
+    expect(fail.s).toContain("WHERE short_id = $1 AND platform = $2 AND status = 'publishing' AND attempts = $4");
+    expect(fail.p).toEqual([ID, 'youtube', 'начало загрузки: HTTP 403 quotaExceeded: quota', 5]);
+    const back = calls.find((c) => c.s.startsWith("UPDATE short_video SET status = 'approved'"));
+    expect(back.s).toContain("WHERE id = $1 AND status = 'publishing' AND attempts = $3");
+    expect([back.p[0], back.p[2]]).toEqual([ID, 1]);
+    expect([db.pubs.get('youtube').status, db.v.status]).toEqual(['failed', 'approved']);
+  });
+
+  it('итог ролика — с жетоном ролика: published, а на последней попытке — failed', async () => {
+    const ok = youtube();
+    ok.upload.mockResolvedValue(OK);
+    const a = setup(withRows(fakeDb()), '-1003290853538', ['telegram', 'youtube'], ok);
+    await a.svc.publish(ID);
+    const done = callsOf(a.db).find((c) => c.s.startsWith("UPDATE short_video SET status = 'published'"));
+    expect(done.s).toContain("WHERE id = $1 AND status = 'publishing' AND attempts = $2");
+    expect(done.p).toEqual([ID, 1]);
+    expect(a.db.v.status).toBe('published');
+
+    const maybe = youtube();
+    maybe.upload.mockRejectedValue(new YoutubeMaybeUploaded('отправка файла оборвалась: socket hang up'));
+    const b = setup(withRows(fakeDb({ attempts: MAX_PUBLISH_ATTEMPTS - 1 })), '-1003290853538', ['telegram', 'youtube'], maybe);
+    await b.svc.publish(ID);
+    const failed = callsOf(b.db).find((c) => c.s.startsWith("UPDATE short_video SET status = 'failed'"));
+    expect(failed.s).toContain("WHERE id = $1 AND status = 'publishing' AND attempts = $3");
+    expect([failed.p[0], failed.p[2]]).toEqual([ID, MAX_PUBLISH_ATTEMPTS]);
+    expect(b.db.v.status).toBe('failed');
+  });
+
+  it('исход Telegram неизвестен — строка и ролик в failed одним запросом, каждый со своим жетоном', async () => {
+    const db = fakeDb();
+    db.pubs.set('telegram', { short_id: ID, platform: 'telegram', status: 'failed', attempts: 2 }); // после захвата — 3
+    const { svc, tg } = setup(db);
+    tg.sendVideo.mockRejectedValueOnce(new HttpError("Network request for 'sendVideo' failed!", new Error('socket hang up')));
+    await svc.publish(ID);
+    const cte = callsOf(db).find((c) => c.s.startsWith('WITH pub AS'));
+    expect(cte.s).toContain("WHERE short_id = $1 AND platform = $2 AND status = 'publishing' AND attempts = $5 RETURNING 1");
+    expect(cte.s).toContain("WHERE id = $1 AND status = 'publishing' AND attempts = $6 AND EXISTS (SELECT 1 FROM pub)");
+    expect([cte.p[4], cte.p[5]]).toEqual([3, 1]);
+    expect([db.pubs.get('telegram').status, db.v.status]).toEqual(['failed', 'failed']);
+  });
+
+  it('исход Telegram неизвестен, а строку уже держит другая попытка — ни строку, ни ролик не трогаем', async () => {
+    const db = fakeDb();
+    const { svc, tg } = setup(db);
+    tg.sendVideo.mockImplementationOnce(async () => {
+      db.pubs.get('telegram').attempts += 1;
+      throw new HttpError("Network request for 'sendVideo' failed!", new Error('socket hang up'));
+    });
+    await svc.publish(ID);
+    expect(db.pubs.get('telegram')).toMatchObject({ status: 'publishing', attempts: 2 });
+    expect(db.v.status).toBe('publishing');
+    expect(tg.sendDocument).not.toHaveBeenCalled();
+  });
+
+  it('продление живости перед файлом YouTube — оба жетона, ролика и строки; жетон строки — четвёртым аргументом upload', async () => {
+    const yt = youtube();
+    let fence: number | undefined;
+    const alive: boolean[] = [];
+    yt.upload.mockImplementation(async (_v: any, _p: any, keepAlive: () => Promise<boolean>, f: number) => {
+      fence = f;
+      alive.push(await keepAlive());
+      return OK;
+    });
+    const { svc, db } = setup(withRows(fakeDb()), '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(fence).toBe(5);
+    expect(alive).toEqual([true]);
+    const beat = callsOf(db).find((c) => c.s.startsWith('UPDATE short_video SET updated_at = now()') && c.s.includes('EXISTS'));
+    expect(beat.s).toBe(
+      "UPDATE short_video SET updated_at = now() WHERE id = $1 AND status = 'publishing' AND attempts = $2 " +
+        "AND EXISTS (SELECT 1 FROM short_publication WHERE short_id = $1 AND platform = $3 AND status = 'publishing' AND attempts = $4) RETURNING 1",
+    );
+    expect(beat.p).toEqual([ID, 1, 'youtube', 5]);
+  });
+
+  it.each([
+    ['строку YouTube захватила новая попытка', (db: ReturnType<typeof fakeDb>) => { db.pubs.get('youtube').attempts += 1; }],
+    ['ролик взяла новая попытка', (db: ReturnType<typeof fakeDb>) => { db.v.attempts += 1; }],
+  ])('продление живости перед файлом YouTube — false: %s', async (_name, takeOver) => {
+    const yt = youtube();
+    const db = fakeDb();
+    let alive: boolean | undefined;
+    yt.upload.mockImplementation(async (_v: any, _p: any, keepAlive: () => Promise<boolean>) => {
+      takeOver(db);
+      alive = await keepAlive();
+      throw new YoutubeAttemptSuperseded('ролик или строку YouTube забрала другая попытка до отправки файла — не отправляю');
+    });
+    const { svc } = setup(db, '-1003290853538', ['telegram', 'youtube'], yt);
+    await svc.publish(ID);
+    expect(alive).toBe(false);
   });
 });
