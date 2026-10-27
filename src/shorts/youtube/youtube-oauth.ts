@@ -1,5 +1,5 @@
 import { YoutubeAuthError, YoutubeNotUploaded } from './youtube-errors';
-import { Http, HttpResponse, googleReason } from './youtube-http';
+import { Http, HttpResponse, clip, googleReason } from './youtube-http';
 
 /** Загрузка и чтение своего канала: channels.list?mine=true — узнать, какой канал подключил владелец. */
 export const YOUTUBE_SCOPES = [
@@ -62,13 +62,18 @@ export async function exchangeCode(
   if (!r.data.refresh_token) {
     throw new Error('Google не выдал refresh-токен — уберите доступ приложения в настройках аккаунта Google и подключите снова');
   }
-  return { accessToken: r.data.access_token, refreshToken: r.data.refresh_token, scope: String(r.data.scope || '') };
+  // На экране согласия у каждого разрешения своя галочка: без загрузки каждый ролик получал бы 403.
+  const granted = String(r.data.scope || '').split(/\s+/);
+  if (!YOUTUBE_SCOPES.every((s) => granted.includes(s))) {
+    throw new Error('Google не дал доступ на загрузку видео — подключите снова и отметьте все разрешения на экране Google');
+  }
+  return { accessToken: r.data.access_token, refreshToken: r.data.refresh_token, scope: String(r.data.scope) };
 }
 
 /**
- * Свежий access-токен. invalid_grant — доступ отозван или протух: YoutubeAuthError,
- * нужно переподключение. Прочие сбои (сеть, 5xx) — YoutubeNotUploaded: до загрузки
- * не дошло, повтор безопасен.
+ * Свежий access-токен. invalid_grant и unauthorized_client — доступ отозван или протух:
+ * YoutubeAuthError, нужно переподключение. Прочие сбои (сеть, 5xx, invalid_client) —
+ * YoutubeNotUploaded: до загрузки не дошло, повтор безопасен.
  */
 export async function refreshAccessToken(http: Http, cfg: YoutubeOAuthConfig, refreshToken: string): Promise<string> {
   let r: HttpResponse;
@@ -81,7 +86,7 @@ export async function refreshAccessToken(http: Http, cfg: YoutubeOAuthConfig, re
       data: form({ client_id: cfg.clientId, client_secret: cfg.clientSecret, refresh_token: refreshToken, grant_type: 'refresh_token' }),
     });
   } catch (e: any) {
-    throw new YoutubeNotUploaded(`обновление токена: ${String(e?.message ?? e).slice(0, 200)}`);
+    throw new YoutubeNotUploaded(`обновление токена: ${clip(String(e?.message ?? e), 200)}`);
   }
   if (r.status === 200 && r.data?.access_token) return r.data.access_token;
   if (r.data?.error === 'invalid_grant' || r.data?.error === 'unauthorized_client') throw new YoutubeAuthError(googleReason(r));
