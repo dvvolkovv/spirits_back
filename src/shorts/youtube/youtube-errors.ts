@@ -39,6 +39,19 @@ export class YoutubeUploadExpired extends Error {
   }
 }
 
+/**
+ * Попытка публикации уже не владеет строкой YouTube: пока она висела, сторож вернул
+ * ролик в очередь, и строку захватила новая попытка (жетон — attempts захвата — не
+ * совпал), или сторож уже перевёл строку в failed. Такая попытка ничего не пишет и не
+ * шлёт: ни файла, ни отказа, ни набора, ни итога ролика — это теперь дело новой попытки.
+ */
+export class YoutubeAttemptSuperseded extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'YoutubeAttemptSuperseded';
+  }
+}
+
 /** Google отверг код входа (invalid_grant): код одноразовый и короткоживущий — чаще всего браузер повторил адрес возврата. */
 export class YoutubeCodeRejected extends Error {
   constructor(message: string) {
