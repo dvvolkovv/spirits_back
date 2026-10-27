@@ -8,7 +8,9 @@ import { STAND_MARK } from './short-captions';
 import { isStand, shortsEnabled } from './short-env';
 import { ShortsSettingsService } from './shorts-settings.service';
 import { ShortVideo, YoutubeMode, shortsBucket } from './shorts.types';
-import { YoutubeAuthError, YoutubeCodeRejected, YoutubeMaybeUploaded, YoutubeNotUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
+import {
+  YoutubeAttemptSuperseded, YoutubeAuthError, YoutubeCodeRejected, YoutubeMaybeUploaded, YoutubeNotUploaded, YoutubeUploadExpired,
+} from './youtube/youtube-errors';
 import { Http, axiosHttp, clip } from './youtube/youtube-http';
 import { YoutubeOAuthConfig, authorizeUrl, exchangeCode, fetchMyChannel, refreshAccessToken, youtubeOAuthConfig } from './youtube/youtube-oauth';
 import { signState, verifyState } from './youtube/youtube-state';
@@ -261,8 +263,20 @@ export class ShortsYoutubeService {
    * не догружена (incomplete) или кончилась отказом (failed). Истёкшая сессия (gone) —
    * YoutubeUploadExpired: спросить не у кого, вслепую не грузим. Ответа нет —
    * YoutubeMaybeUploaded, адрес сессии остаётся для следующей попытки.
+   *
+   * fence — жетон попытки: attempts, который вернул публикатору захват строки YouTube.
+   * Адрес сессии читается и пишется только с условием «строка в publishing и её attempts —
+   * этот жетон». Попытка, зависшая дольше порога сторожа, пока строку захватила новая, не
+   * берёт чужой адрес, не стирает его, не кладёт свой и не шлёт файл —
+   * YoutubeAttemptSuperseded, публикатор выходит молча. keepAlive перед файлом проверяет
+   * и ролик, и строку — false значит то же самое.
    */
-  async upload(v: ShortVideo, privacy: 'unlisted' | 'public', keepAlive: () => Promise<boolean>): Promise<{ videoId: string; url: string; resumed: boolean }> {
+  async upload(
+    v: ShortVideo,
+    privacy: 'unlisted' | 'public',
+    keepAlive: () => Promise<boolean>,
+    fence: number,
+  ): Promise<{ videoId: string; url: string; resumed: boolean }> {
     const yt = v.captions?.youtube;
     if (!v.videoKey || !yt) throw new YoutubeNotUploaded('у ролика нет файла или подписей YouTube');
     const cfg = youtubeOAuthConfig();
@@ -271,8 +285,9 @@ export class ShortsYoutubeService {
     let previous: string | null;
     try {
       acc = await this.account();
-      previous = await this.session(v.id);
+      previous = await this.ownSession(v.id, fence);
     } catch (e: any) {
+      if (e instanceof YoutubeAttemptSuperseded) throw e;
       // Не знаем, жива ли прошлая загрузка, — «ролика нет» сказать нельзя.
       throw new YoutubeMaybeUploaded(`не прочитал состояние загрузки: ${clip(String(e?.message ?? e), 200)}`);
     }
@@ -296,8 +311,8 @@ export class ShortsYoutubeService {
       if (st.state === 'complete') return this.done(st.videoId, true);
       // Истекла: адрес не стираем — повтор снова получит 404 и снова пришлёт набор, а не загрузит вслепую.
       if (st.state === 'gone') throw new YoutubeUploadExpired('YouTube уже не помнит прошлую загрузку этого ролика');
-      // incomplete или failed — прошлая загрузка не дошла: грузим заново.
-      await this.clearSession(v.id, previous);
+      // incomplete или failed — прошлая загрузка не дошла: грузим заново. Строка уже не наша — YoutubeAttemptSuperseded.
+      await this.clearSession(v.id, previous, fence);
     }
 
     const meta: UploadMeta = {
@@ -309,16 +324,16 @@ export class ShortsYoutubeService {
       privacy,
     };
     const sessionUrl = await startUpload(this.http, accessToken, meta, video.length);
-    // Сессия без байтов ролика не создаёт, но строку держит другая попытка — её исход неизвестен:
-    // «ролика нет» сказать нельзя, иначе на последней попытке ушёл бы набор и ручная выкладка дала бы дубль.
-    if (!(await this.claimSession(v.id, sessionUrl))) throw new YoutubeMaybeUploaded('строку YouTube держит другая попытка — исход её загрузки неизвестен');
-    if (!(await keepAlive())) throw new YoutubeNotUploaded('ролик ушёл из publishing до отправки файла — не отправляю');
+    // С жетоном адрес в «нашу» строку может положить только эта попытка: провал значит, что строка
+    // уже не наша, и её исход — дело новой попытки. Сессия без байтов ролика не создаёт.
+    if (!(await this.claimSession(v.id, sessionUrl, fence))) throw new YoutubeAttemptSuperseded('строку YouTube захватила другая попытка — файл не шлю');
+    if (!(await keepAlive())) throw new YoutubeAttemptSuperseded('ролик или строку YouTube забрала другая попытка до отправки файла — не отправляю');
     try {
       return this.done(await sendFile(this.http, sessionUrl, accessToken, video), false);
     } catch (e: any) {
       if (e instanceof YoutubeNotUploaded) {
         // Явный отказ — итог сессии: на повторе она повторила бы его, спрашивать незачем.
-        await this.clearSession(v.id, sessionUrl);
+        await this.clearSession(v.id, sessionUrl, fence);
         throw e;
       }
       if (!(e instanceof YoutubeMaybeUploaded)) throw e;
@@ -326,7 +341,7 @@ export class ShortsYoutubeService {
       const st = await checkUpload(this.http, sessionUrl, accessToken, video.length);
       if (st.state === 'complete') return this.done(st.videoId, false);
       if (st.state === 'gone') throw new YoutubeUploadExpired('YouTube уже не помнит загрузку этого ролика');
-      await this.clearSession(v.id, sessionUrl);
+      await this.clearSession(v.id, sessionUrl, fence);
       if (st.state === 'failed') throw new YoutubeNotUploaded(`отправка файла: ${st.reason}`, st.status);
       throw new YoutubeNotUploaded(`файл не дошёл до YouTube (${e.message})`);
     }
@@ -392,32 +407,53 @@ export class ShortsYoutubeService {
     }
   }
 
+  /** Адрес сессии ролика — только чтение (план публикации). Загрузка читает его через ownSession, с жетоном. */
   private async session(shortId: string): Promise<string | null> {
     const r = await this.pg.query(`SELECT upload_session FROM short_publication WHERE short_id = $1 AND platform = 'youtube'`, [shortId]);
     return r.rows[0]?.upload_session ?? null;
   }
 
+  /** Адрес сессии ролика — только пока строку YouTube держит эта попытка (жетон); иначе YoutubeAttemptSuperseded. */
+  private async ownSession(shortId: string, fence: number): Promise<string | null> {
+    const r = await this.pg.query(
+      `SELECT upload_session, status, attempts FROM short_publication WHERE short_id = $1 AND platform = 'youtube'`,
+      [shortId],
+    );
+    const row = r.rows[0];
+    if (!row || row.status !== 'publishing' || Number(row.attempts) !== fence) {
+      throw new YoutubeAttemptSuperseded(
+        `строку YouTube держит другая попытка (жетон ${fence}, в строке ${row ? `${row.status}, попытка ${row.attempts}` : 'строки нет'})`,
+      );
+    }
+    return row.upload_session ?? null;
+  }
+
   /**
-   * Адрес новой сессии — в строку площадки, только если строку держит публикация
-   * (publishing) и другой незавершённой загрузки в ней нет. Иначе другая попытка того же
-   * ролика уже грузит (сторож вернул ролик в очередь, пока эта висела): файл не отправляем.
+   * Адрес новой сессии — в строку площадки, только если строку держит эта попытка
+   * (publishing и её жетон) и другой незавершённой загрузки в ней нет. false — строка
+   * уже не наша: сторож вернул ролик в очередь, пока эта попытка висела, и строку
+   * захватила новая. Файл тогда не отправляем.
    */
-  private async claimSession(shortId: string, url: string): Promise<boolean> {
+  private async claimSession(shortId: string, url: string, fence: number): Promise<boolean> {
     const r = await this.pg.query(
       `UPDATE short_publication SET upload_session = $2, updated_at = now()
-        WHERE short_id = $1 AND platform = 'youtube' AND status = 'publishing' AND upload_session IS NULL`,
-      [shortId, url],
+        WHERE short_id = $1 AND platform = 'youtube' AND status = 'publishing' AND attempts = $3 AND upload_session IS NULL`,
+      [shortId, url, fence],
     );
     return r.rowCount === 1;
   }
 
-  /** Стереть адрес — только свой: адрес другой попытки не трогаем. */
-  private async clearSession(shortId: string, url: string): Promise<void> {
-    await this.pg.query(
+  /**
+   * Стереть адрес — только свой и только пока строку держит эта попытка: адрес другой
+   * попытки не трогаем. Ничего не стёрто — строка уже не наша: YoutubeAttemptSuperseded.
+   */
+  private async clearSession(shortId: string, url: string, fence: number): Promise<void> {
+    const r = await this.pg.query(
       `UPDATE short_publication SET upload_session = NULL, updated_at = now()
-        WHERE short_id = $1 AND platform = 'youtube' AND upload_session = $2`,
-      [shortId, url],
+        WHERE short_id = $1 AND platform = 'youtube' AND upload_session = $2 AND status = 'publishing' AND attempts = $3`,
+      [shortId, url, fence],
     );
+    if (r.rowCount === 0) throw new YoutubeAttemptSuperseded('адрес сессии уже не мой — строку держит другая попытка');
   }
 
   /** Отозвать — только то подключение, токен которого не сработал: переподключение посреди загрузки не трогаем. */

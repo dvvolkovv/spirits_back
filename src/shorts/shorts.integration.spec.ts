@@ -311,7 +311,8 @@ maybe('ролики против живого Postgres', () => {
         video_key: 'shorts/v/video.mp4',
         captions: { telegram: 't', vk: 'v', youtube: { title: 'T', description: 'D', tags: [] } },
       });
-      await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'youtube', 'publishing')`, [v.id]);
+      // Строку захватила попытка с жетоном 1 — его и передаём.
+      await pool.query(`INSERT INTO short_publication (short_id, platform, status, attempts) VALUES ($1, 'youtube', 'publishing', 1)`, [v.id]);
       const SESSION = 'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=it1';
       const read = async () =>
         (await pool.query(`SELECT upload_session FROM short_publication WHERE short_id = $1 AND platform = 'youtube'`, [v.id])).rows[0].upload_session;
@@ -320,7 +321,7 @@ maybe('ролики против живого Postgres', () => {
       const out = await svc.upload(v, 'unlisted', async () => {
         seen = await read();
         return true;
-      });
+      }, 1);
       expect(out.videoId).toBe('abcdefghijk');
       expect(seen).toBe(SESSION);
       expect(await read()).toBe(SESSION);
@@ -364,9 +365,9 @@ maybe('ролики против живого Postgres', () => {
         video_key: 'shorts/v/video.mp4',
         captions: { telegram: 't', vk: 'v', youtube: { title: 'T', description: 'D', tags: [] } },
       });
-      await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'youtube', 'publishing')`, [v.id]);
+      await pool.query(`INSERT INTO short_publication (short_id, platform, status, attempts) VALUES ($1, 'youtube', 'publishing', 1)`, [v.id]);
       const a = service([reply(400, { error: 'invalid_grant', error_description: 'revoked' })]);
-      await a.svc.upload(v, 'unlisted', async () => true).catch(() => undefined);
+      await a.svc.upload(v, 'unlisted', async () => true, 1).catch(() => undefined);
       const acc = await pool.query('SELECT status, last_error FROM short_youtube_account');
       expect(acc.rows[0]).toEqual({ status: 'revoked', last_error: 'HTTP 400 invalid_grant: revoked' });
       await pool.query(
