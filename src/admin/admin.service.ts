@@ -55,6 +55,22 @@ export function testUsersFilterSql(col: string, includeTest?: boolean): string {
   return includeTest ? 'true' : excludeTestUsersSql(col);
 }
 
+/**
+ * user_phone реферального лидера в том виде, в каком кабинет его ищет:
+ * ReferralService.getOrCreateLeader сравнивает `user_phone = user_id`, а user_id
+ * телефонного пользователя — голые цифры (79001234567). Телефон, введённый в
+ * админке с «+», пробелами или через 8, не совпадал — и кабинет заводил лидеру
+ * вторую, пустую ссылку. UUID почтовых и OAuth-пользователей не трогаем.
+ */
+function leaderUserId(raw: unknown): string | null {
+  const value = String(raw ?? '').trim();
+  if (!value) return null;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) return value;
+  if (!/^[\d\s()+-]+$/.test(value)) return value;
+  const digits = value.replace(/\D/g, '');
+  return digits.length === 11 && digits.startsWith('8') ? '7' + digits.slice(1) : digits;
+}
+
 @Injectable()
 export class AdminService implements OnModuleInit {
   private readonly logger = new Logger(AdminService.name);
@@ -1027,7 +1043,7 @@ export class AdminService implements OnModuleInit {
       [
         data.name,
         data.slug,
-        data.user_phone || null,
+        leaderUserId(data.user_phone),
         data.level || 1,
         data.commission_pct || 10,
         data.parent_commission_pct || 0,
