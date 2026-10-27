@@ -6,23 +6,29 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const STUDIO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const app = () => createRequire(import.meta.url)(path.join(STUDIO, 'ecosystem.config.cjs')).apps[0];
+const apps = () => createRequire(import.meta.url)(path.join(STUDIO, 'ecosystem.config.cjs')).apps;
 
 test('pm2: linkeon-studio — один рабочий процесс студии с низким приоритетом, циклом', () => {
-  const apps = createRequire(import.meta.url)(path.join(STUDIO, 'ecosystem.config.cjs')).apps;
-  assert.equal(apps.length, 1);
-  const a = app();
+  assert.equal(apps().length, 1);
+  const a = apps()[0];
   assert.deepEqual([a.name, a.cwd, a.exec_mode, a.instances], ['linkeon-studio', STUDIO, 'fork', 1]);
   // nice 19: съёмка и сборка грузят процессор, а API и чат на том же сервере важнее.
+  // node --import tsx, а не обёртка tsx: pm2 меряет и останавливает сам рабочий процесс.
   assert.deepEqual([a.script, a.interpreter], ['/usr/bin/nice', 'none']);
-  assert.deepEqual(a.args, ['-n', '19', 'node_modules/.bin/tsx', 'src/worker/worker.ts']);
+  assert.deepEqual(a.args, ['-n', '19', 'node', '--import', 'tsx', 'src/worker/worker.ts']);
   assert.ok(fs.existsSync(path.join(STUDIO, 'src/worker/worker.ts')));
 });
 
-test('pm2: остановка ждёт текущее задание — рабочий процесс доводит его по SIGINT', () => {
-  const a = app();
+test('pm2: остановка — сообщением shutdown и без рассылки сигналов Chromium и ffmpeg', () => {
+  const a = apps()[0];
+  // SIGINT ловят Playwright и Remotion: убивают браузер и выходят сами — задание брошено.
+  assert.equal(a.shutdown_with_message, true);
+  assert.equal(a.treekill, false);
   assert.ok(a.kill_timeout >= 600_000, `kill_timeout ${a.kill_timeout}`);
   // Падение на старте (нет ключа, нет базы) — не чаще раза в минуту, а не цикл перезапусков.
   assert.ok(a.restart_delay >= 60_000, `restart_delay ${a.restart_delay}`);
-  assert.match(fs.readFileSync(path.join(STUDIO, 'src/worker/worker.ts'), 'utf8'), /\['SIGTERM', 'SIGINT'\] as const/);
+  // Сообщение shutdown разбирает watchStop (stop.ts, свой тест); рабочий процесс на нём и держит цикл.
+  const worker = fs.readFileSync(path.join(STUDIO, 'src/worker/worker.ts'), 'utf8');
+  assert.match(worker, /const stopping = watchStop\(process, log\);/);
+  assert.match(worker, /while \(!stopping\(\)\)/);
 });
