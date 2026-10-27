@@ -99,7 +99,7 @@ export class YoutubeAttemptSuperseded extends Error {
   Зелёный прогон `npx jest src/shorts/shorts-youtube.service.spec.ts`, коммит «fix(shorts): YouTube — жетон попытки: сессию читает и пишет только попытка, захватившая строку».
 
 - [ ] **Step 4: Тесты публикатора (красные)** — `src/shorts/shorts-publisher.service.spec.ts`:
-  1. загрузка бросила `YoutubeAttemptSuperseded` на последней попытке (`attempts` ролика = `MAX_PUBLISH_ATTEMPTS`): набора нет (`sendDocument` не вызван), строку не трогали (нет `UPDATE short_publication … 'failed'`), ролик не трогали (нет `UPDATE short_video … approved/failed/published`), `notifyUploaded` не вызван;
+  1. загрузка бросила `YoutubeAttemptSuperseded` на последней попытке (`attempts` ролика = `MAX_PUBLISH_ATTEMPTS`): набора нет (`sendDocument` не вызван), ролик не трогали (нет `UPDATE short_video … approved/failed/published`), `notifyUploaded` не вызван; строку освобождают только с жетоном: чужая не тронута, своя — в `failed`, адрес сессии на месте (поправка после исполнения, см. ниже);
   2. отказ площадки не записался (фейк отвечает `rowCount: 0` на `UPDATE short_publication SET status = 'failed' …` — жетон строки уже чужой) → `publish()` выходит без `settle` и `finishAttempt`;
   3. SQL продления живости ролика — с `attempts = $2` и `v.attempts`; SQL отказа в `platform()` — с `attempts` строки из захвата; SQL `finishAttempt` и `settle` — с `attempts` ролика (проверять параметры запросов, как соседние тесты);
   4. `keepAlive`, который публикатор передаёт в `upload()`, проверяет и ролик, и строку YouTube: вызвать его из фейкового `upload` и проверить SQL и параметры (`v.id`, `v.attempts`, `'youtube'`, жетон строки); фейковый `upload` получает жетон четвёртым аргументом.
@@ -116,6 +116,8 @@ export class YoutubeAttemptSuperseded extends Error {
         return 'superseded';
       }
 ```
+
+    *Поправка после исполнения:* перед `return 'superseded'` — освобождение строки с жетоном: `UPDATE short_publication SET status = 'failed', last_error = $3, updated_at = now() WHERE short_id = $1 AND platform = $2 AND status = 'publishing' AND attempts = $4`, исход `superseded` при любом `rowCount`, `upload_session` не трогаем. Без этого строка, которую поздний захват A занял в окне между сторожем и захватом B, навсегда осталась бы в `publishing`: сторож смотрит только ролики в `publishing`, `retry` сбрасывает только строки в `failed`. Чужую строку жетон не пустит; своя могла дать Superseded только до отправки файла — адрес без байтов следующая попытка проверит у YouTube.
 
   - запись отказа: `… WHERE short_id = $1 AND platform = $2 AND status = 'publishing' AND attempts = $4` с `fence`; `rowCount === 0` → лог `warn` «отказ не записан — строку держит другая попытка или сторож; выхожу» и `return 'superseded'`;
   - ветка `TelegramOutcomeUnknown`: CTE `pub` — с `AND attempts = $5` (жетон строки) и `RETURNING 1`; `UPDATE short_video … WHERE id = $1 AND status = 'publishing' AND attempts = $6 AND EXISTS (SELECT 1 FROM pub)` (`v.attempts`); исход по-прежнему `'unknown'`;
@@ -138,6 +140,8 @@ export class YoutubeAttemptSuperseded extends Error {
     return false;
   }
 ```
+
+    *Поправка после исполнения:* если строка продлена, но ответ шёл дольше `KEEPALIVE_MAX_LAG_MS` (60 с), `keepAliveFenced` тоже отвечает false (с логом). Порог сторожа 10 мин минус отправка файла до 8 мин (`SEND_TIMEOUT_MS`) оставляют около 2 мин; медленное продление этот запас съедает, и отправка A могла бы пересечься с попыткой B. Дальше — Superseded, строка своя и освобождается, ролик остаётся в `publishing` со свежей живостью, сторож вернёт его в очередь, следующая попытка спросит YouTube об адресе без байтов.
 
   - `toYoutube(v, fence)`: `yt.upload(v, plan.privacy, () => this.keepAliveFenced(v, 'youtube', fence), fence)`; в `catch` первой строкой `if (e instanceof YoutubeAttemptSuperseded) throw e;` — до веток Auth, Expired, Maybe и `last`, иначе на последней попытке ушёл бы набор;
   - `publish()`: после Telegram — `if (out === 'unknown' || out === 'unrecorded' || out === 'superseded') return;`; после YouTube — `if (out === 'unrecorded' || out === 'superseded') return;`; вызов `this.platform(v, 'youtube', async (fence) => { const r = await this.toYoutube(v, fence); … })`; Telegram — `this.platform(v, 'telegram', () => this.toTelegram(v, settings))` (жетон ему не нужен);
