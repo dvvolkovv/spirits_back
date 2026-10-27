@@ -33,11 +33,9 @@ describe('OWNER_TG_ID — лучшим усилием', () => {
   });
 
   it('rekey: отказ чтения привязки — поля нет вовсе, не пустая строка', async () => {
-    // Решение контроллера по ревью задачи 9: пустую строку (снять переменную)
-    // сервер не шлёт ни при отказе чтения, ни при «привязки нет» — отвязка в
-    // кабинете строку tg_user_identities не удаляет, и пустая строка почти
-    // всегда означала бы «владелец её вовсе не заводил», рискуя снести
-    // OWNER_TG_ID, поставленный руками у продукта до очереди 2.
+    // Отказ чтения — не «привязки нет»: привязка, может, и есть. Пустая
+    // строка (снять переменную) здесь снесла бы живой OWNER_TG_ID из-за
+    // мигнувшей базы.
     const pg = {
       query: jest.fn(async (sql: string) => {
         if (sql.includes("SET status = 'running'")) {
@@ -57,6 +55,53 @@ describe('OWNER_TG_ID — лучшим усилием', () => {
     const job = await svc.claimJob('clients');
     expect(job).toMatchObject({ jobId: 'j', jobKind: 'rekey' });
     expect(job).not.toHaveProperty('ownerTgId');
+  });
+});
+
+describe('OWNER_TG_ID — привязки нет', () => {
+  const ROW = {
+    job_id: 'j', product_id: 'p', user_id: 'u', slug: 's', name: 'Б', kind: 'bot', port: null, box: null,
+    rekey_box: null, rekey_payload: {}, custom_names: [], vhost_mode: 'proxy',
+  };
+  function harness(row: Record<string, unknown>, link: { rows: any[] }) {
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        if (sql.includes("SET status = 'running'")) return { rows: [{ ...ROW, ...row }] };
+        if (sql.includes('tg_user_identities')) return link;
+        return { rows: [] };
+      }),
+    };
+    const svc = new ProvisioningService(pg as any, secretsOf(), {} as any, {} as any, {} as any);
+    const asked = () => pg.query.mock.calls.some(([sql]) => String(sql).includes('tg_user_identities'));
+    return { svc, asked };
+  }
+
+  it('rekey бота без привязки — пустая строка: агент снимает OWNER_TG_ID (Telegram отвязан)', async () => {
+    // Отвязка в кабинете удаляет и строку tg_user_identities, поэтому «привязки
+    // нет» теперь значит «владелец Telegram отвязал» — переменную снимаем.
+    const { svc } = harness({ job_kind: 'rekey', token_issued: false }, { rows: [] });
+    expect(await svc.claimJob('clients')).toMatchObject({ jobKind: 'rekey', ownerTgId: '' });
+  });
+
+  it('rekey бота с привязкой — её id', async () => {
+    const { svc } = harness({ job_kind: 'rekey', token_issued: false }, { rows: [{ id: '111111111' }] });
+    expect(await svc.claimJob('clients')).toMatchObject({ jobKind: 'rekey', ownerTgId: '111111111' });
+  });
+
+  it('заведение бота без привязки — поля нет вовсе: снимать нечего', async () => {
+    const { svc, asked } = harness({ job_kind: 'provision', token_issued: true }, { rows: [] });
+    const job = await svc.claimJob('clients');
+    expect(job).toMatchObject({ jobKind: 'provision' });
+    expect(job).not.toHaveProperty('ownerTgId');
+    expect(asked()).toBe(true);
+  });
+
+  it.each(['rekey', 'provision'])('сайт (%s) — привязку не спрашивают, поля нет', async (jobKind) => {
+    const { svc, asked } = harness({ job_kind: jobKind, kind: 'site', token_issued: jobKind === 'provision' }, { rows: [] });
+    const job = await svc.claimJob('clients');
+    expect(job).toMatchObject({ jobKind });
+    expect(job).not.toHaveProperty('ownerTgId');
+    expect(asked()).toBe(false);
   });
 });
 
@@ -181,7 +226,7 @@ maybe('выдача rekey и purge против живого Postgres', () => {
     expect(await svc.claimJob('clients')).toBeNull();
   });
 
-  it('OWNER_TG_ID: бот владельца с привязкой — при заведении и при смене ключей; сайт и бот без привязки — нет', async () => {
+  it('OWNER_TG_ID: бот владельца с привязкой — при заведении и при смене ключей; сайт и заведение без привязки — нет; смена ключей без привязки — пустая строка', async () => {
     await pool.query(`INSERT INTO tg_user_identities (linkeon_user_id, tg_user_id) VALUES ('u1', 777001)`);
     const bot = await product({ status: 'provisioning' });
     await pool.query(`INSERT INTO product_provision_jobs (product_id, status) VALUES ($1, 'queued')`, [bot]);
@@ -197,14 +242,12 @@ maybe('выдача rekey и purge против живого Postgres', () => {
     await pool.query(`INSERT INTO product_provision_jobs (product_id, status) VALUES ($1, 'queued')`, [botNoLink]);
     expect(await svc.claimJob('clients')).not.toHaveProperty('ownerTgId');
 
-    // Смена ключей у владельца без привязки — поля ТОЖЕ нет вовсе (решение
-    // контроллера по ревью задачи 9, не пустая строка): отвязка в кабинете не
-    // чистит tg_user_identities, и «привязки нет» почти всегда значит
-    // «владелец её вовсе не заводил» — пустая строка рисковала бы снести
-    // OWNER_TG_ID, поставленный руками у продукта до очереди 2.
+    // Смена ключей у владельца без привязки — пустая строка: отвязка в
+    // кабинете удаляет и строку tg_user_identities, так что «привязки нет» —
+    // это «Telegram отвязан», и агент снимает OWNER_TG_ID.
     const other = await product({ status: 'running', userId: 'u2' });
     await rekeyJob(other, { BOT_TOKEN: '123456:TEST-new' });
-    expect(await svc.claimJob('clients')).not.toHaveProperty('ownerTgId');
+    expect(await svc.claimJob('clients')).toMatchObject({ jobKind: 'rekey', ownerTgId: '' });
 
     const mine = await product({ status: 'running' });
     await rekeyJob(mine, { BOT_TOKEN: '123456:TEST-new' });

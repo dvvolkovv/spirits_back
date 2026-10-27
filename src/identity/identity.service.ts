@@ -391,6 +391,10 @@ export class IdentityService implements OnModuleInit {
       this.logger.log(`merge: ${tokens} токенов ${loserUserId} → ${survivorUserId}`);
     }
 
+    // tg_user_identities слияние не переносит. Начнёт переносить — тем же шагом
+    // переносить owner_user_id лички (tg_bot_configs с tg_chat_id = tg_user_id),
+    // иначе сторож в TgConfigService.ensurePrivateConfig заархивирует личку
+    // объединённого человека как чужую.
     await this.pg.query(
       `UPDATE user_identities SET user_id = $1 WHERE user_id = $2`,
       [survivorUserId, loserUserId],
@@ -478,8 +482,42 @@ export class IdentityService implements OnModuleInit {
       [userId],
     );
     if (parseInt(cnt.rows[0].count, 10) <= 1) return { ok: false, reason: 'last_method' };
+    // Telegram привязан в ДВУХ местах: user_identities (вход) и
+    // tg_user_identities (по ней бот Linkeon узнаёт человека, Mini App пускает
+    // «старожилов бота», продуктам уходит OWNER_TG_ID). До 27.10.2026 отвязка
+    // снимала только первую: бот продолжал считать этот Telegram аккаунтом
+    // человека, а ветка старожилов в Mini App при следующем открытии молча
+    // возвращала связку входа обратно.
+    //
+    // Строку бота снимаем, только если она того же аккаунта И того же
+    // Telegram: связки расходятся (бот привязан к другому Telegram — upsert по
+    // linkeon_user_id; привязка из кабинета упала посередине; mergeAccounts
+    // строки бота не переносит), и чужую или другую строку трогать нельзя.
+    //
+    // Личку этого Telegram (tg_chat_id = id пользователя Telegram; у групп он
+    // отрицательный) у этого владельца архивируем. Иначе, если Telegram потом
+    // привяжут к другому аккаунту, ensurePrivateConfig нашёл бы по tg_chat_id
+    // живой конфиг прежнего владельца и повёл бы чат нового через него:
+    // списания — прежнему, его личный профиль — в ответы, чат — в его кабинете.
+    // Групповые конфиги не трогаем: группы остаются за владельцем.
+    //
+    // Атомарно одним оператором, без явной транзакции (getClient + BEGIN/
+    // COMMIT): все три изменения либо случаются вместе, либо ни одно.
+    // Запросы-изменения в WITH выполняются всегда целиком, даже если основной
+    // запрос их вывода не читает.
     await this.pg.query(
-      `DELETE FROM user_identities WHERE id = $1 AND user_id = $2`,
+      `WITH d AS (
+         DELETE FROM user_identities WHERE id = $1 AND user_id = $2
+         RETURNING provider, provider_sub
+       ), tg AS (
+         DELETE FROM tg_user_identities t USING d
+          WHERE d.provider = 'telegram' AND t.linkeon_user_id = $2 AND t.tg_user_id::text = d.provider_sub
+         RETURNING t.tg_user_id
+       )
+       UPDATE tg_bot_configs c SET status = 'archived', archived_at = now()
+         FROM d
+        WHERE d.provider = 'telegram' AND c.owner_user_id = $2 AND c.tg_chat_id::text = d.provider_sub
+          AND c.status IN ('active','silent')`,
       [identityId, userId],
     );
     return { ok: true };
