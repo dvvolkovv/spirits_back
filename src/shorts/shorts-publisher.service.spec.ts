@@ -2,7 +2,9 @@ import { Logger } from '@nestjs/common';
 import { GrammyError, HttpError, InputFile } from 'grammy';
 import { performance } from 'perf_hooks';
 import { buildYoutubeKeyboard } from './short-callback';
-import { KEEPALIVE_MAX_LAG_MS, MAX_PUBLISH_ATTEMPTS, STUCK_PUBLISHING_MINUTES, ShortsPublisherService, YOUTUBE_MAY_BE_OUT } from './shorts-publisher.service';
+import {
+  KEEPALIVE_MAX_LAG_MS, MAX_PUBLISH_ATTEMPTS, POST_MAY_BE_OUT, STUCK_PUBLISHING_MINUTES, ShortsPublisherService, YOUTUBE_MAY_BE_OUT,
+} from './shorts-publisher.service';
 import { DOWNLOAD_TIMEOUT_MS } from './short-files';
 import { PENDING_UPLOAD_NOTE } from './shorts-youtube.service';
 import { YoutubeAttemptSuperseded, YoutubeAuthError, YoutubeMaybeUploaded, YoutubeNotUploaded, YoutubeUploadExpired } from './youtube/youtube-errors';
@@ -94,8 +96,9 @@ function fakeDb(over: Record<string, any> = {}, opts: FakeOpts = {}) {
       const pubHit = row.status === 'publishing' && fits(fenceArg(s, p, 0), row.attempts);
       if (pubHit) Object.assign(row, { status: 'failed', last_error: p[2] });
       const needsPub = s.includes('EXISTS (SELECT 1 FROM pub)');
-      // Ролик — в статусах из условия и с жетоном, если он там есть.
-      const statuses = s.includes("status IN ('publishing', 'approved')") ? ['publishing', 'approved'] : ['publishing'];
+      // Ролик — в статусах из условия (перечень IN или только publishing) и с жетоном, если он там есть.
+      const list = s.match(/WHERE id = \$1 AND status IN \(([^)]*)\)/);
+      const statuses = list ? [...list[1].matchAll(/'(\w+)'/g)].map((x) => x[1]) : ['publishing'];
       const vidHit = statuses.includes(v.status) && fits(fenceArg(s, p, 1), v.attempts) && (!needsPub || pubHit);
       if (vidHit) Object.assign(v, { status: 'failed', failed_from: 'publishing', failure_notified: false, last_error: p[3] });
       // Запрос, который возвращает оба факта: сколько записано строк площадки и роликов.
@@ -979,11 +982,25 @@ describe('ShortsPublisherService — жетон попытки', () => {
     expect(tg.sendVideo).toHaveBeenCalledTimes(1);
   });
 
+  it('исход Telegram неизвестен, строка своя, а устаревший итог последней попытки уже перевёл ролик в failed с чужой причиной — причина «пост мог выйти», владельцу — снова', async () => {
+    const db = fakeDb();
+    const { svc, tg } = setup(db);
+    tg.sendVideo.mockImplementationOnce(async () => {
+      // Устаревший finishAttempt последней попытки с совпавшим жетоном; владелец о нём уже уведомлён.
+      Object.assign(db.v, { status: 'failed', failed_from: 'publishing', last_error: 'публикация: telegram: publishing', failure_notified: true });
+      throw new HttpError("Network request for 'sendVideo' failed!", new Error('socket hang up'));
+    });
+    await svc.publish(ID);
+    expect(db.pubs.get('telegram')).toMatchObject({ status: 'failed', last_error: expect.stringMatching(/^пост мог выйти/) });
+    expect(db.v).toMatchObject({ status: 'failed', failed_from: 'publishing', failure_notified: false });
+    expect(db.v.last_error).toContain(POST_MAY_BE_OUT);
+  });
+
   it('исход Telegram неизвестен, строка своя, а ролик уже не в публикации — строка в failed, в логе сказано, что ролик не тронут', async () => {
     const db = fakeDb();
     const { svc, tg } = setup(db);
     tg.sendVideo.mockImplementationOnce(async () => {
-      db.v.status = 'failed'; // итог ролика уже записала другая попытка
+      db.v.status = 'directing'; // ролик ушёл на пересъёмку после устаревшего возврата в очередь
       throw new HttpError("Network request for 'sendVideo' failed!", new Error('socket hang up'));
     });
     await svc.publish(ID);
