@@ -1,5 +1,7 @@
 import { ConflictException, HttpException, HttpStatus } from '@nestjs/common';
-import { BLOCKED_REFUSAL, REKEY_REFUSAL, SLEEPING_REFUSAL, TurnsService } from './turns.service';
+import {
+  BLOCKED_REFUSAL, PRODUCT_PROMPT_MAX_CHARS, PROMPT_NOT_TEXT, PROMPT_TOO_LONG, REKEY_REFUSAL, SLEEPING_REFUSAL, TurnsService,
+} from './turns.service';
 
 function makeService(
   opts: {
@@ -405,6 +407,42 @@ describe('ключи в тексте правки', () => {
     expect(calls.find((c) => c.sql.includes('INSERT INTO product_turns'))!.params[3]).toBe('владелец — chat_id 123456789');
     expect(turn).toEqual({ id: 't-1', status: 'queued' });
     expect('masked' in turn).toBe(false);
+  });
+
+  // Ревью, Minor 7: откат пишет «Откат к <sha>» — шестнадцатеричное маска
+  // не трогает, и признака masked у отката быть не должно.
+  it('откат проходит дословно и без masked', async () => {
+    const { svc, calls } = makeService();
+    const sha = '1fe2732a9c0d4e5b6f7081928374655647382910';
+    calls.length = 0;
+    const svcAny = svc as any;
+    svcAny.pg.query.mockImplementationOnce(async () => ({ rows: [{ id: 't-0', sha_before: sha }] }));
+    const turn = await svc.revert({ productId: 'p-1', turnId: 't-0', userId: 'u-1' });
+    const insert = calls.find((c) => c.sql.includes('INSERT INTO product_turns'))!;
+    expect(insert.params[3]).toBe(`Откат к ${sha}`);
+    expect(insert.params[4]).toBe(sha);
+    expect('masked' in turn).toBe(false);
+  });
+
+  // Ревью, C1: маска разбирает текст синхронно, а API — один процесс. Потолок
+  // проверяется ДО маски и до базы; не-строка — отказ, а не запись мимо маски.
+  it('текст длиннее потолка — 400 до базы; ровно на потолке — проходит', async () => {
+    const { svc, calls } = makeService();
+    await expect(
+      svc.enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: 'а'.repeat(PRODUCT_PROMPT_MAX_CHARS + 1) }),
+    ).rejects.toThrow(PROMPT_TOO_LONG);
+    expect(calls).toHaveLength(0);
+    await expect(
+      svc.enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: 'а'.repeat(PRODUCT_PROMPT_MAX_CHARS) }),
+    ).resolves.toMatchObject({ id: 't-1' });
+  });
+
+  it('не-строка — 400 до базы', async () => {
+    const { svc, calls } = makeService();
+    for (const prompt of [['API_KEY=x'], { a: 1 }, null, undefined, 42]) {
+      await expect(svc.enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: prompt as any })).rejects.toThrow(PROMPT_NOT_TEXT);
+    }
+    expect(calls).toHaveLength(0);
   });
 
   it('отказ до записи (сон) — маска не нужна и не мешает отказу', async () => {

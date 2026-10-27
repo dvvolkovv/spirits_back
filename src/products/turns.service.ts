@@ -11,7 +11,7 @@ import {
 } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { MiscService } from '../misc/misc.service';
-import { maskSecrets } from './prompt-secrets';
+import { maskSecrets, SecretsMasked } from './prompt-secrets';
 
 export interface EnqueueInput {
   productId: string;
@@ -28,9 +28,9 @@ export interface TurnRow {
   /**
    * Сколько значений, похожих на ключи, скрыто в тексте правки перед записью
    * (prompt-secrets.ts) и под какими именами. Есть только если скрыто хоть
-   * одно — по нему кабинет показывает плашку, а ассистент говорит человеку.
+   * одно — по нему кабинет показывает плашку.
    */
-  masked?: { count: number; names: string[] };
+  masked?: SecretsMasked;
 }
 
 export type TurnStatus = 'queued' | 'running' | 'done' | 'failed' | 'reverted';
@@ -148,6 +148,22 @@ export const BLOCKED_REFUSAL =
  * надеется, что ход не успеет.
  */
 export const REKEY_REFUSAL = 'Сейчас меняются ключи продукта — правку можно поставить через пару минут.';
+
+/**
+ * Потолок длины текста правки, в знаках (UTF-16).
+ *
+ * Два довода, и оба про чужую сторону. Агент машины передаёт текст в
+ * `claude -p` ОДНИМ аргументом (product-runner/src/claude.ts), а Linux режет
+ * аргумент на 128 КиБ (MAX_ARG_STRLEN): 32 000 знаков — это не больше 96 КБ
+ * даже по три байта на знак. И маска ключей (prompt-secrets.ts) разбирает
+ * текст синхронно, а API живёт одним процессом: тело запроса без потолка —
+ * это время всего API, которое клиент тратит одним запросом (ревью, C1).
+ * Отсюда же — что проверка стоит ДО маски.
+ */
+export const PRODUCT_PROMPT_MAX_CHARS = 32_000;
+export const PROMPT_TOO_LONG =
+  `Текст правки длиннее ${String(PRODUCT_PROMPT_MAX_CHARS).replace(/\B(?=(\d{3})+(?!\d))/g, ' ')} знаков — сократите его.`;
+export const PROMPT_NOT_TEXT = 'Текст правки должен быть строкой.';
 
 @Injectable()
 export class TurnsService implements OnModuleInit, OnModuleDestroy {
@@ -279,6 +295,13 @@ export class TurnsService implements OnModuleInit, OnModuleDestroy {
   }
 
   async enqueue(input: EnqueueInput): Promise<TurnRow> {
+    // Форма и длина текста — до всего остального и бесплатно: это отказ
+    // самому запросу, а не состоянию продукта. Не-строка — отказ, а не «как
+    // было»: массив или объект node-postgres сериализует в текст и пишет в базу
+    // мимо маски ключей (ревью, Minor 4). Потолок — см. PRODUCT_PROMPT_MAX_CHARS.
+    if (typeof input.prompt !== 'string') throw new BadRequestException(PROMPT_NOT_TEXT);
+    if (input.prompt.length > PRODUCT_PROMPT_MAX_CHARS) throw new BadRequestException(PROMPT_TOO_LONG);
+
     // Предусловия живут здесь, а не в контроллере, сознательно. Шлагбаум по
     // балансу в чате стоял только на одном входе, и второй — загрузка файлов —
     // про него забыл: до 06.09.2026 пользователь с нулём получал там самый
@@ -355,18 +378,18 @@ export class TurnsService implements OnModuleInit, OnModuleDestroy {
     // задача бэклога 642c5198). Здесь, а не на входах, по той же причине, что
     // и предусловия выше: входов три (кабинет, ассистент, первая правка), а
     // через это место проходят все — новый вход не сможет о маске забыть.
-    // Не-строку не трогаем: её судьба (NOT NULL на null) — как была.
-    const masked = typeof input.prompt === 'string' ? maskSecrets(input.prompt) : null;
+    // Форма и длина текста проверены в начале метода.
+    const masked = maskSecrets(input.prompt);
 
     try {
       const r = await this.pg.query(
         `INSERT INTO product_turns (product_id, user_id, channel, prompt, revert_to_sha, status)
          VALUES ($1, $2, $3, $4, $5, 'queued')
          RETURNING id, status`,
-        [input.productId, input.userId, input.channel, masked ? masked.text : input.prompt, input.revertToSha ?? null],
+        [input.productId, input.userId, input.channel, masked.text, input.revertToSha ?? null],
       );
       const row: TurnRow = r.rows[0];
-      return masked && masked.count > 0 ? { ...row, masked: { count: masked.count, names: masked.names } } : row;
+      return masked.count > 0 ? { ...row, masked: { count: masked.count, names: masked.names } } : row;
     } catch (e: any) {
       // Только замок product_turns_one_active. Это не ошибка сервера: клиент
       // отправил второй запрос, пока агент ещё работает над первым.

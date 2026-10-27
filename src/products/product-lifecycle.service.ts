@@ -2,7 +2,7 @@ import { HttpException, Injectable, Logger, OnModuleDestroy, OnModuleInit } from
 import { PgService } from '../common/services/pg.service';
 import { ProvisioningService } from './provisioning.service';
 import { LimitsService } from './limits.service';
-import { REKEY_REFUSAL, TurnsService, TURN_SILENCE_SQL } from './turns.service';
+import { PRODUCT_PROMPT_MAX_CHARS, REKEY_REFUSAL, TurnsService, TURN_SILENCE_SQL } from './turns.service';
 import { RENT_TOKENS, SLEEP_REASON_NO_TOKENS } from './rent.service';
 import { ActionChannel, ConfirmedVia, DELETE_GRACE_DAYS, JOB_KILLED_BY_DELETE, ProductActionsService } from './product-actions.service';
 import { BotTokenCheck, checkBotToken } from './bot-token-check';
@@ -18,8 +18,18 @@ const NAME_MAX = 80;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type LifecycleFail = { ok: false; reason: string; message: string };
-/** Итог маски ключей в тексте для продукта (prompt-secrets.ts) — только если скрыто хоть одно значение. */
-export type SecretsMasked = { count: number; names: string[] };
+
+/**
+ * Описание продукта — его первая правка, и потолок у него тот же, что у правки
+ * (PRODUCT_PROMPT_MAX_CHARS). Проверяется ДО заведения: иначе продукт
+ * создавался бы, а первая правка тихо отбивалась бы уже в тике
+ * firstPromptTick, где сказать человеку некому.
+ */
+function promptTooLong(prompt: unknown): LifecycleFail | null {
+  return String(prompt ?? '').trim().length > PRODUCT_PROMPT_MAX_CHARS
+    ? { ok: false, reason: 'prompt_too_long', message: `Описание длиннее ${PRODUCT_PROMPT_MAX_CHARS} знаков — сократи его и повтори.` }
+    : null;
+}
 
 /**
  * Что записывается в снятую правку при удалении продукта. Видит ВЛАДЕЛЕЦ — в
@@ -160,13 +170,15 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
   }
 
   async createSite(i: { userId: string; name: unknown; prompt?: unknown; channel: ActionChannel }):
-    Promise<{ ok: true; productId: string; slug: string; domain: string | null; freeMonth: boolean; firstPromptSet: boolean; secretsMasked?: SecretsMasked } | LifecycleFail> {
+    Promise<{ ok: true; productId: string; slug: string; domain: string | null; freeMonth: boolean; firstPromptSet: boolean } | LifecycleFail> {
     const name = cleanName(i.name);
-    // Ключи из описания — до записи first_prompt (prompt-secrets.ts). Итог
-    // маски отдаётся наружу и при сорвавшейся постановке: ключ всё равно был
-    // в тексте, который ассистент собрал из разговора, и сказать об этом нужно.
-    const prompt = maskSecrets(String(i.prompt ?? '').trim());
     if (!name) return { ok: false, reason: 'bad_name', message: `Имя продукта — от 1 до ${NAME_MAX} знаков` };
+    const tooLong = promptTooLong(i.prompt);
+    if (tooLong) return tooLong;
+    // Ключи из описания — до записи first_prompt (prompt-secrets.ts). Сказать
+    // о них ассистенту — дело инструмента (product-lifecycle-tool.ts): он
+    // считает маску из того же текста и при отказе заведения тоже.
+    const prompt = maskSecrets(String(i.prompt ?? '').trim());
     const isAdmin = await this.isAdmin(i.userId);
     let lastError: any = null;
     let created: { productId: string; slug: string; freeMonth: boolean } | null = null;
@@ -212,16 +224,15 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     } catch (e: any) {
       this.logger.warn(`сайт ${created.productId} создан, но запись в журнал не прошла: ${e?.stack ?? e?.message ?? e}`);
     }
-    return {
-      ok: true, productId: created.productId, slug: created.slug, domain, freeMonth: created.freeMonth, firstPromptSet,
-      ...(prompt.count > 0 ? { secretsMasked: { count: prompt.count, names: prompt.names } } : {}),
-    };
+    return { ok: true, productId: created.productId, slug: created.slug, domain, freeMonth: created.freeMonth, firstPromptSet };
   }
 
   async openCreateBot(i: { userId: string; name: unknown; prompt?: unknown; channel: ActionChannel; turn: string | null }):
-    Promise<{ ok: true; actionId: string; expiresAt: string; secretsMasked?: SecretsMasked } | LifecycleFail> {
+    Promise<{ ok: true; actionId: string; expiresAt: string } | LifecycleFail> {
     const name = cleanName(i.name);
     if (!name) return { ok: false, reason: 'bad_name', message: `Имя бота — от 1 до ${NAME_MAX} знаков` };
+    const tooLong = promptTooLong(i.prompt);
+    if (tooLong) return tooLong;
     // M8: предел — до открытия карточки, а не после того, как человек введёт
     // в неё токен бота и ключи сервисов (completeCreateBot проверяет его
     // уже постфактум, на create()). Отбитый предел после ввода токена —
@@ -234,16 +245,12 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     }
     // payload.prompt карточки живёт до 30 минут и потом становится
     // first_prompt — ключ не должен лежать открытым ни там, ни там.
-    const masked = maskSecrets(String(i.prompt ?? '').trim());
-    const prompt = masked.text;
+    const prompt = maskSecrets(String(i.prompt ?? '').trim()).text;
     const { id, expiresAt } = await this.actions.open({
       userId: i.userId, productId: null, kind: 'create_bot', channel: i.channel, turn: i.turn,
       payload: { name, ...(prompt ? { prompt } : {}) },
     });
-    return {
-      ok: true, actionId: id, expiresAt,
-      ...(masked.count > 0 ? { secretsMasked: { count: masked.count, names: masked.names } } : {}),
-    };
+    return { ok: true, actionId: id, expiresAt };
   }
 
   /**

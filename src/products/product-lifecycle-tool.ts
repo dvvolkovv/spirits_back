@@ -6,7 +6,8 @@ import type { ProductMatch } from './product-tool.service';
 import type { ProductToolChannel } from './product-tool.token';
 import { RENT_TOKENS } from './rent.service';
 import { ProductKeysService } from './product-keys.service';
-import { maskedSecretsSay } from './prompt-secrets';
+import { maskedSecretsSay, maskSecrets, SecretsMasked } from './prompt-secrets';
+import { PRODUCT_PROMPT_MAX_CHARS } from './turns.service';
 
 /** «50 000» — как в остальных текстах для людей. Та же форма — для любого
  *  числа токенов (баланс в тексте «не хватает», п.2), не только для RENT_TOKENS. */
@@ -102,13 +103,22 @@ export class ProductLifecycleTool {
   // прямо: иначе модель пообещала бы карточку «под ответом», которой не будет.
   async create(userId: string, input: any, channel: ProductToolChannel, turn: string | null) {
     const kind = String(input?.kind ?? '').trim();
+    // Ключи в описании (prompt-secrets.ts): сервис заведения скрывает их до
+    // записи, а сказать ассистенту — здесь, и при отказе тоже: значение уже
+    // было в переписке. Длинное описание не разбираем — его отобьёт сервис.
+    const text = String(input?.prompt ?? '').trim();
+    const mask = text.length <= PRODUCT_PROMPT_MAX_CHARS ? maskSecrets(text) : null;
+    const secrets: SecretsMasked | null = mask && mask.count > 0 ? { count: mask.count, names: mask.names } : null;
+    const failed = (reason: string, message: string) => secrets
+      ? { ok: false, reason, secretsMasked: secrets, say: `${message} ${maskedSecretsSay(secrets, { stored: false })}` }
+      : { ok: false, reason, say: message };
     if (kind === 'site') {
       const r = await this.lifecycle.createSite({ userId, name: input?.name, prompt: input?.prompt, channel });
-      if (r.ok === false) return { ok: false, reason: r.reason, say: r.message };
+      if (r.ok === false) return failed(r.reason, r.message);
       return {
         ok: true,
         created: { kind: 'site', productId: r.productId, slug: r.slug, domain: r.domain, freeMonth: r.freeMonth },
-        ...(r.secretsMasked ? { secretsMasked: r.secretsMasked } : {}),
+        ...(secrets ? { secretsMasked: secrets } : {}),
         // domain бывает null — заведение само отработало (сайт СУЩЕСТВУЕТ),
         // а чтение домена именно этим запросом сорвалось (см. createSite):
         // «https://null» выглядело бы настоящим адресом, а не как отказ
@@ -128,16 +138,16 @@ export class ProductLifecycleTool {
           (r.firstPromptSet
             ? ' Первая правка по описанию поставлена и начнётся, когда сайт поднимется; её исход — действием status по имени продукта.'
             : ' Дальше — правки действием edit.') +
-          (r.secretsMasked ? ` ${maskedSecretsSay(r.secretsMasked)}` : ''),
+          (secrets ? ` ${maskedSecretsSay(secrets)}` : ''),
       };
     }
     if (kind === 'bot') {
       const r = await this.lifecycle.openCreateBot({ userId, name: input?.name, prompt: input?.prompt, channel, turn });
-      if (r.ok === false) return { ok: false, reason: r.reason, say: r.message };
+      if (r.ok === false) return failed(r.reason, r.message);
       return {
         ok: true,
         pending: { actionId: r.actionId, kind: 'create_bot', expiresAt: r.expiresAt },
-        ...(r.secretsMasked ? { secretsMasked: r.secretsMasked } : {}),
+        ...(secrets ? { secretsMasked: secrets } : {}),
         say: (!turn
           ? 'Защищённая карточка ждёт пользователя в кабинете (Студия → Продукты): там он'
           : channel === 'telegram'
@@ -145,7 +155,7 @@ export class ProductLifecycleTool {
             : 'Под твоим ответом появится защищённая карточка: пользователь')
           + ' введёт в неё токен бота от @BotFather и ключи сервисов. Ключи в переписке не проси. ' +
           'Бот создастся, когда он отправит карточку; итог — действием status с этим actionId.' +
-          (r.secretsMasked ? ` ${maskedSecretsSay(r.secretsMasked)}` : ''),
+          (secrets ? ` ${maskedSecretsSay(secrets)}` : ''),
       };
     }
     return { ok: false, reason: 'bad_kind', say: 'Укажи kind: "site" (сайт) или "bot" (телеграм-бот) и name.' };

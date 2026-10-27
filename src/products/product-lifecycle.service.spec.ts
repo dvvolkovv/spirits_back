@@ -728,24 +728,19 @@ describe('бэкафилл tg_bot_id (I2, часть 2)', () => {
  * Задача бэклога 642c5198: описание продукта при заведении становится первой
  * правкой и до неё лежит в products.first_prompt (сайт) или в payload
  * карточки (бот, до 30 минут). Ключ не должен лежать открытым ни там, ни там.
+ * Сказать о нём ассистенту — дело инструмента (product-lifecycle-tool.spec.ts).
  * Значение собирается во время прогона — см. шапку prompt-secrets.spec.ts.
  */
 describe('ключи в описании при заведении', () => {
   const value = ['Ab', '3k', 'Q9', 'zX', '7mN', 'p2R', 'w8T', 'c5'].join('');
 
-  it('сайт: first_prompt пишется со скрытым значением, итог маски — наружу', async () => {
+  it('сайт: first_prompt пишется со скрытым значением', async () => {
     const h = harness();
     const r: any = await h.svc.createSite({ userId: 'u1', name: 'Магазин', prompt: `Погода: WEATHER_API_KEY=${value}`, channel: 'web' });
     const set = h.calls.find((c) => c.sql.includes('SET first_prompt'))!;
     expect(set.params[1]).toBe('Погода: WEATHER_API_KEY=[ключ скрыт]');
     expect(JSON.stringify(h.calls.map((c) => c.params))).not.toContain(value);
-    expect(r).toMatchObject({ ok: true, firstPromptSet: true, secretsMasked: { count: 1, names: ['WEATHER_API_KEY'] } });
-  });
-
-  it('сайт без ключей — без поля secretsMasked', async () => {
-    const h = harness();
-    const r: any = await h.svc.createSite({ userId: 'u1', name: 'Магазин', prompt: 'Лендинг', channel: 'web' });
-    expect('secretsMasked' in r).toBe(false);
+    expect(r).toMatchObject({ ok: true, firstPromptSet: true });
   });
 
   it('бот: payload.prompt карточки — уже со скрытым значением', async () => {
@@ -754,6 +749,19 @@ describe('ключи в описании при заведении', () => {
     expect(h.actions.open).toHaveBeenCalledWith(expect.objectContaining({
       payload: { name: 'Бот', prompt: 'ключ сервиса API_TOKEN: [ключ скрыт]' },
     }));
-    expect(r).toMatchObject({ ok: true, secretsMasked: { count: 1, names: ['API_TOKEN'] } });
+    expect(r).toMatchObject({ ok: true });
+  });
+
+  // Описание — первая правка: потолок тот же, и проверяется ДО заведения —
+  // иначе продукт создался бы, а первая правка тихо отбилась бы в тике.
+  it('описание длиннее потолка правки — отказ до заведения, и у сайта, и у бота', async () => {
+    const long = 'а'.repeat(32_001);
+    const h = harness();
+    expect(await h.svc.createSite({ userId: 'u1', name: 'Магазин', prompt: long, channel: 'web' }))
+      .toMatchObject({ ok: false, reason: 'prompt_too_long' });
+    expect(h.provisioning.create).not.toHaveBeenCalled();
+    expect(await h.svc.openCreateBot({ userId: 'u1', name: 'Бот', prompt: long, channel: 'web', turn: null }))
+      .toMatchObject({ ok: false, reason: 'prompt_too_long' });
+    expect(h.actions.open).not.toHaveBeenCalled();
   });
 });
