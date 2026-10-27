@@ -324,6 +324,17 @@ rollback_backend() {
         || { tail -20 /tmp/vh-pm2.log; echo 'voice-host: pm2 startOrReload FAILED'; exit 1; }
       cd ..
     fi
+    # Студия роликов — как в back_build_cmds и шаге рестарта: прежний код, его браузеры, процесс.
+    if [ -d studio ] && [ -f studio/.env ]; then
+      cd studio
+      npm ci --no-audit --no-fund > /tmp/studio-install.log 2>&1 \
+        || { tail -20 /tmp/studio-install.log; echo 'studio: npm ci FAILED'; exit 1; }
+      npx playwright install chromium > /tmp/studio-browsers.log 2>&1 \
+        || { tail -20 /tmp/studio-browsers.log; echo 'studio: браузеры не установились'; exit 1; }
+      pm2 startOrReload ecosystem.config.cjs > /tmp/studio-pm2.log 2>&1 \
+        || { tail -20 /tmp/studio-pm2.log; echo 'studio: pm2 startOrReload FAILED'; exit 1; }
+      cd ..
+    fi
   " && green "  ↩ backend rolled back ($ENV_NAME)" \
     || { red "  ✗ ROLLBACK BACKEND FAILED — $ENV_NAME needs manual intervention"; return 1; }
 }
@@ -664,6 +675,25 @@ back_build_cmds() {
     elif [ -d voice-host ]; then
       echo 'voice-host: .env отсутствует — LiveKit не настроен, воркер пропущен'
     fi
+    # Студия роликов: свой package.json, сборки нет (tsx), но нужны браузеры —
+    # съёмки (Playwright) и сборки ролика (Remotion). Ставим здесь, а не при первом
+    # ролике: недоехавший браузер должен ронять выкат, а не съёмку на проде.
+    # Признак настроенности — studio/.env: его кладут руками вместе с ключами.
+    if [ -d studio ] && [ -f studio/.env ]; then
+      cd studio
+      if [ -n "${CI_SAME_AS:-}" ] && git diff --quiet "$CI_SAME_AS" HEAD -- package-lock.json; then
+        echo 'studio: npm ci пропущен: package-lock.json тот же'
+      else
+        npm ci --no-audit --no-fund > /tmp/studio-install.log 2>&1 \
+          || { tail -20 /tmp/studio-install.log; echo 'studio: npm ci FAILED'; exit 1; }
+      fi
+      { npx playwright install chromium \
+          && node --input-type=module -e 'import { ensureBrowser } from "@remotion/renderer"; await ensureBrowser();'; } > /tmp/studio-browsers.log 2>&1 \
+        || { tail -20 /tmp/studio-browsers.log; echo 'studio: браузеры не установились'; exit 1; }
+      cd ..
+    elif [ -d studio ]; then
+      echo 'studio: .env отсутствует — студия не настроена, рабочий процесс пропущен'
+    fi
 CMDS
 }
 
@@ -772,6 +802,14 @@ deploy_backend() {
       cd voice-host
       pm2 startOrReload ecosystem.config.cjs > /tmp/vh-pm2.log 2>&1 \
         || { tail -20 /tmp/vh-pm2.log; echo 'voice-host: pm2 startOrReload FAILED'; exit 1; }
+      cd ..
+    fi
+    # Студия: SIGINT — рабочий процесс доводит текущее задание (до kill_timeout,
+    # 10 минут), чат не трогает. Съёмку как живой ход уже дождался wait_for_streams_drain.
+    if [ -d studio ] && [ -f studio/.env ]; then
+      cd studio
+      pm2 startOrReload ecosystem.config.cjs > /tmp/studio-pm2.log 2>&1 \
+        || { tail -20 /tmp/studio-pm2.log; echo 'studio: pm2 startOrReload FAILED'; exit 1; }
       cd ..
     fi
   " || { red "  backend restart failed ($ENV_NAME)"; exit 1; }
