@@ -30,6 +30,9 @@ export type ShortFormat = 'skit' | 'chat';
 export type ShortPlatform = 'telegram' | 'vk' | 'youtube';
 export type PublicationStatus =
   | 'pending' | 'publishing' | 'published' | 'failed' | 'manual_pending' | 'manual_done';
+/** Режим YouTube (003): manual — набор владельцу, unlisted — «по ссылке», public — «публично». */
+export type YoutubeMode = 'manual' | 'unlisted' | 'public';
+export const YOUTUBE_MODES: readonly YoutubeMode[] = ['manual', 'unlisted', 'public'];
 
 export const RUBRICS: readonly ShortRubric[] = ['assistant', 'feature', 'news', 'case'];
 export const ANGLES: readonly ShortAngle[] = ['uncomfortable', 'roast', 'myth', 'calm'];
@@ -298,6 +301,8 @@ export interface ShortPublication {
   url: string | null;
   attempts: number;
   lastError: string | null;
+  /** Адрес resumable-сессии незавершённой загрузки YouTube (003); после успеха — null. */
+  uploadSession: string | null;
   publishedAt: Date | null;
   updatedAt: Date | null;
 }
@@ -361,6 +366,7 @@ export function rowToPublication(row: any): ShortPublication {
     url: row.url ?? null,
     attempts: Number(row.attempts || 0),
     lastError: row.last_error ?? null,
+    uploadSession: row.upload_session ?? null,
     publishedAt: date(row.published_at),
     updatedAt: date(row.updated_at),
   };
