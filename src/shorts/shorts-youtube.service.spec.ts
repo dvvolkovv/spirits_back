@@ -100,6 +100,7 @@ beforeEach(() => {
   process.env.CALENDAR_SECRET_KEY = 'k'.repeat(32);
   process.env.SHORTS_ENABLED = 'true';
   delete process.env.SHORTS_STAND;
+  delete process.env.YOUTUBE_CHANNEL_ID;
   jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
   jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
 });
@@ -329,6 +330,24 @@ describe('адрес возврата Google', () => {
 
   it('текст страницы экранируется', () => {
     expect(connectPage(200, 'Канал <b>', 'a & "b"').html).toContain('Канал &lt;b&gt;</h1><p>a &amp; &quot;b&quot;</p>');
+  });
+
+  it('канал закреплён в YOUTUBE_CHANNEL_ID, а выбран другой — 502, подключения нет', async () => {
+    process.env.YOUTUBE_CHANNEL_ID = 'UCother0000000000000000';
+    const db = fakeDb();
+    const { svc, said } = setup(db, fakeHttp(tokensOk(), channelOk()));
+    const page = await svc.completeConnect({ code: 'c', state: stateFor() });
+    expect(page.status).toBe(502);
+    expect(db.st.account).toBeNull();
+    expect(said()[0]).toMatch(/^YouTube не подключён: выбран канал «Linkeon» \(UCu_Pq4rFXmTT8CDG27O_i2A\), а роликам нужен UCother0000000000000000/);
+  });
+
+  it('закреплённый канал совпал — подключение как обычно', async () => {
+    process.env.YOUTUBE_CHANNEL_ID = 'UCu_Pq4rFXmTT8CDG27O_i2A';
+    const db = fakeDb();
+    const { svc } = setup(db, fakeHttp(tokensOk(), channelOk()));
+    expect((await svc.completeConnect({ code: 'c', state: stateFor() })).status).toBe(200);
+    expect(db.st.account.channel_id).toBe('UCu_Pq4rFXmTT8CDG27O_i2A');
   });
 });
 
