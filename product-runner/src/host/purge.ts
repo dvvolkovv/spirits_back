@@ -77,7 +77,7 @@
 import { dirname, isAbsolute, resolve } from 'path';
 import { DEFAULTS, ProvisionDeps, SLUG_RE } from './provision';
 import { certName, condenseCertbot } from './domain';
-import { REKEY_BACKUP_SUFFIX, reasonOf } from './rekey';
+import { REKEY_BACKUP_SUFFIX, isImageRollBackup, reasonOf } from './rekey';
 import { ProductKind } from './skeleton';
 
 export interface PurgeJob {
@@ -85,9 +85,6 @@ export interface PurgeJob {
   kind: ProductKind;
 }
 
-/** Страховка product-image-roll.sh: `<имя>__pre_<CTX12>`. */
-const IMAGE_ROLL_BACKUP = '__pre_';
-const IMAGE_ROLL_HASH_RE = /^[0-9a-f]{12}$/;
 const FULL_ID_RE = /^[0-9a-f]{64}$/;
 
 /**
@@ -185,11 +182,10 @@ export function certDomainsFrom(out: string, cert: string): string[] | undefined
  * страховки образа.
  */
 function productContainers(slug: string, listing: Array<{ id: string; name: string }>): Array<{ id: string; name: string }> {
-  const prefix = `${slug}${IMAGE_ROLL_BACKUP}`;
   const rank = (name: string): number => {
     if (name === slug) return 0;
     if (name === `${slug}${REKEY_BACKUP_SUFFIX}`) return 1;
-    if (name.startsWith(prefix) && IMAGE_ROLL_HASH_RE.test(name.slice(prefix.length))) return 2;
+    if (isImageRollBackup(slug, name)) return 2;
     return -1;
   };
   return listing

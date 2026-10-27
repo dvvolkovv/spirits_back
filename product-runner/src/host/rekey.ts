@@ -71,6 +71,12 @@
  * пауза и состояние контейнера, как в do_restore. Не удержался — остаток, и
  * сервер узнаёт, что исход неизвестен.
  *
+ * ## Не посреди обновления образа
+ *
+ * Страховка `<слаг>__pre_<12 hex>` на хосте значит, что product-image-roll.sh
+ * пересоздаёт этот продукт прямо сейчас (или оборвался на нём) — отказ до
+ * изменений, см. проверку в rekeyProduct.
+ *
  * ## Чего здесь нет
  *
  * vhost не трогается: порт тот же. Командная строка в причину отказа не идёт:
@@ -107,6 +113,24 @@ export interface RekeyJob {
 
 /** Имя старого контейнера на время смены. Не `__pre_`: то — страховка обновления образа. */
 export const REKEY_BACKUP_SUFFIX = '__rekey';
+
+/** Страховка scripts/product-image-roll.sh: `<слаг>__pre_<CTX12>` (PRE_SUFFIX там — 12 знаков хеша содержимого). */
+const IMAGE_ROLL_BACKUP = '__pre_';
+const IMAGE_ROLL_HASH_RE = /^[0-9a-f]{12}$/;
+
+/**
+ * Страховка ли это обновления образа ЭТОГО продукта. Форма точная, без масок
+ * и префиксов: у `shop` нет права споткнуться о `shop-2__pre_…` или
+ * `shop2__pre_…` (подчёркивания в слаге не бывает) и о `shop__pre_` с хвостом
+ * не из 12 строчных шестнадцатеричных знаков. Спрашивают двое: смена ключей
+ * (не начинать посреди обновления) и стирание (purge.ts — снять страховки
+ * вместе с продуктом). Здесь, а не в purge.ts: тот и так берёт отсюда
+ * REKEY_BACKUP_SUFFIX, а обратный импорт замкнул бы модули в кольцо.
+ */
+export function isImageRollBackup(slug: string, name: string): boolean {
+  const prefix = `${slug}${IMAGE_ROLL_BACKUP}`;
+  return name.startsWith(prefix) && IMAGE_ROLL_HASH_RE.test(name.slice(prefix.length));
+}
 
 /** Пауза перед повторным взглядом — как `sleep 3` в do_restore. См. ProvisionDeps.settleMs. */
 const SETTLE_MS = 3_000;
@@ -210,6 +234,27 @@ async function inspectBefore(deps: ProvisionDeps, argv: string[], what: string):
   } catch (e) {
     throw new Error(`${(e as Error).message} — ничего не тронуто`);
   }
+}
+
+/**
+ * Страховка обновления образа этого продукта на хосте — первая по имени — или
+ * undefined. `-a`: страховка обычно погашена (обновление гасит старый
+ * контейнер и переименовывает его). Хеша смена ключей не знает, поэтому —
+ * перечень имён и сверка каждого (тот же приём, что у стирания, purge.ts).
+ */
+async function imageRollBackupOf(slug: string, deps: ProvisionDeps): Promise<string | undefined> {
+  const ps = ['docker', 'ps', '-a', '--format', '{{.Names}}'];
+  let out: string;
+  try {
+    out = await deps.run(ps);
+  } catch (e) {
+    throw new Error(`перечень контейнеров не прочитан (${reasonOf(e, ps)}) — ничего не тронуто`);
+  }
+  return out
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((name) => isImageRollBackup(slug, name))
+    .sort()[0];
 }
 
 /** Запущен и не в петле перезапусков (у docker Restarting идёт вместе с Running=true). */
@@ -521,6 +566,18 @@ export async function rekeyProduct(job: RekeyJob, deps: ProvisionDeps): Promise<
   const backup = `${job.slug}${REKEY_BACKUP_SUFFIX}`;
   if (await containerTaken(deps, backup)) {
     throw new Error(`на хосте остался ${backup} от прерванной смены ключей — сверить руками, ничего не тронуто`);
+  }
+  // Обновление образа переименовывает продукт в страховку, поднимает новый
+  // <слаг> и снимает страховку только после успеха, а занятость продукта
+  // спрашивает один раз — до `docker stop`. Смена ключей посреди захода
+  // сняла бы настройки со свежего контейнера, а её откат полез бы в чужое
+  // пересоздание. Страховка на хосте — обновление идёт или оборвалось: ждать
+  // его, а не соревноваться. Текст — без признаков REKEY_UNKNOWN_RE сервера:
+  // хост не тронут, продукт на прежних ключах, повтор после обновления
+  // пройдёт (rekey_failed, «попробуйте через несколько минут»).
+  const roll = await imageRollBackupOf(job.slug, deps);
+  if (roll !== undefined) {
+    throw new Error(`на хосте есть ${roll} — идёт или оборвалось обновление образа; сменить ключи после него, ничего не тронуто`);
   }
   const cap = await capture(job, deps);
   if (job.kind === 'site' && cap.port === undefined) {
