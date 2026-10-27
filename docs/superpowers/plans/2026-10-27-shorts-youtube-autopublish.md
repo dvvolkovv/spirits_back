@@ -2513,6 +2513,8 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-publisher.
 
 Expected: PASS, включая прежние тесты набора.
 
+**Поправки ревью задачи 8 (27.10, сделаны отдельными коммитами до задачи 9):** адрес сессии стирает не сервис (`done()` больше не трогает базу), а публикатор — тем же `UPDATE`, что пишет `published` (`recordSent`, только для загрузки YouTube: `, upload_session = NULL`); иначе сбой этой записи вернул бы ролик в очередь без адреса и повтор загрузил бы второй ролик. `upload()` возвращает `resumed` — ролик нашёлся по прошлой сессии, сообщение владельцу тогда без слова доступа (`notifyUploaded(id, null)`). Сбой чтения аккаунта или адреса в начале `upload()` — `YoutubeMaybeUploaded`; в `uploadPlan` нечитаемый адрес — предупреждение. Предупреждения к набору — с новой строки; хвостовая точка причины не задваивается; `toYoutube` проверяет наличие сервиса.
+
 ---
 
 ### Task 9: Модуль и бот
@@ -2824,7 +2826,7 @@ import { ShortsYoutubeService } from './shorts-youtube.service';
       expect(s.rows[0]).toEqual({ youtube_mode: 'unlisted' });
     });
 
-    it('сессия загрузки: адрес в строке youtube до файла, после успеха — стёрт', async () => {
+    it('сессия загрузки: адрес в строке youtube до файла и после загрузки (стирает публикатор вместе с published)', async () => {
       await pool.query(`INSERT INTO short_youtube_account (id, channel_id, refresh_token_enc) VALUES (1, 'UCx', $1)`, [encryptSecret('refresh-xyz')]);
       const v = await insert({
         status: 'publishing',
@@ -2843,7 +2845,38 @@ import { ShortsYoutubeService } from './shorts-youtube.service';
       });
       expect(out.videoId).toBe('abcdefghijk');
       expect(seen).toBe(SESSION);
-      expect(await read()).toBeNull();
+      expect(await read()).toBe(SESSION);
+    });
+
+    it('публикатор пишет published и стирает адрес сессии одним запросом (живой SQL recordSent)', async () => {
+      const v = await insert({
+        status: 'approved',
+        approved_at: new Date(),
+        slot_at: new Date(Date.now() - 60_000),
+        video_key: 'shorts/v/video.mp4',
+        cover_key: 'shorts/v/cover.jpg',
+        captions: { telegram: 't', vk: 'v', youtube: { title: 'T', description: 'D', tags: [] } },
+      });
+      await pool.query(
+        `INSERT INTO short_publication (short_id, platform, status, upload_session)
+         VALUES ($1, 'telegram', 'published', NULL), ($1, 'youtube', 'pending', $2)`,
+        [v.id, 'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=it2'],
+      );
+      const youtube = {
+        uploadPlan: async () => ({ kind: 'upload', privacy: 'unlisted' }),
+        upload: async () => ({ videoId: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk', resumed: true }),
+        notifyUploaded: jest.fn(async () => undefined),
+      };
+      const settings = { get: async () => ({ platforms: ['telegram', 'youtube'], tgChannelChatId: '-1003290853538' }) };
+      const publisher = new ShortsPublisherService(pgLike() as any, {} as any, {} as any, settings as any, youtube as any);
+      await publisher.publish(v.id);
+      const row = (await pool.query(
+        `SELECT status, external_id, upload_session FROM short_publication WHERE short_id = $1 AND platform = 'youtube'`,
+        [v.id],
+      )).rows[0];
+      expect(row).toEqual({ status: 'published', external_id: 'abcdefghijk', upload_session: null });
+      expect((await pool.query('SELECT status FROM short_video WHERE id = $1', [v.id])).rows[0].status).toBe('published');
+      expect(youtube.notifyUploaded).toHaveBeenCalledWith(v.id, null);
     });
 
     it('отзыв доступа и сообщение о загрузке — SQL против живой схемы', async () => {
