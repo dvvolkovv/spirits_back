@@ -152,6 +152,15 @@ describe('команда /youtube', () => {
     expect(said()[0]).toContain('/youtube по ссылке');
   });
 
+  it('подключён, но канал не тот, что в YOUTUBE_CHANNEL_ID — статус о несовпадении, набор', async () => {
+    process.env.YOUTUBE_CHANNEL_ID = 'UCother0000000000000000';
+    const db = fakeDb({ mode: 'public', account: { channel_id: 'UCx', channel_title: 'Linkeon', refresh_token_enc: 'e', status: 'connected' } });
+    const { svc, said } = setup(db);
+    await svc.handleCommand(dm('/youtube'));
+    expect(said()[0]).toMatch(/^YouTube: подключён канал «Linkeon», а роликам нужен UCother0000000000000000 \(YOUTUBE_CHANNEL_ID\)/);
+    expect(said()[0]).toContain('ролики идут набором');
+  });
+
   it('доступ пропал — причина и ссылка на переподключение', async () => {
     const db = fakeDb({
       mode: 'public',
@@ -214,6 +223,16 @@ describe('команда /youtube', () => {
     const { svc, said } = setup(db);
     await svc.handleCommand(dm('/youtube публично'));
     expect(said()[0]).toMatch(/^Готово: ролики на YouTube — публично\. Но доступ к каналу пропал, поэтому пока набор\./);
+  });
+
+  it('режим при чужом канале — несовпадение вместо короткого подтверждения', async () => {
+    process.env.YOUTUBE_CHANNEL_ID = 'UCother0000000000000000';
+    const db = fakeDb({ account: { channel_id: 'UCx', channel_title: 'Linkeon', refresh_token_enc: 'e', status: 'connected' } });
+    const { svc, said } = setup(db);
+    await svc.handleCommand(dm('/youtube публично'));
+    expect(said()[0]).toMatch(
+      /^Готово: ролики на YouTube — публично\. Но подключён канал «Linkeon», а роликам нужен UCother0000000000000000 \(YOUTUBE_CHANNEL_ID\), поэтому пока набор\./,
+    );
   });
 });
 
@@ -394,8 +413,14 @@ describe('загрузка ролика', () => {
     process.env.YOUTUBE_CHANNEL_ID = 'UCu_Pq4rFXmTT8CDG27O_i2A';
     expect(await setup(fakeDb({ mode: 'public', account: { ...CONNECTED, refresh_token_enc: 'e' } })).svc.uploadPlan('v1')).toEqual({
       kind: 'kit',
-      note: 'Подключён канал Linkeon, а роликам нужен UCu_Pq4rFXmTT8CDG27O_i2A (YOUTUBE_CHANNEL_ID) — набор вместо загрузки. Переподключить: /youtube',
+      note: 'Подключён канал «Linkeon», а роликам нужен UCu_Pq4rFXmTT8CDG27O_i2A (YOUTUBE_CHANNEL_ID) — набор вместо загрузки. Переподключить: /youtube',
     });
+  });
+
+  it('план: закреплённый канал совпал — загрузка как обычно', async () => {
+    process.env.YOUTUBE_CHANNEL_ID = 'UCx'; // то же, что CONNECTED.channel_id
+    expect(await setup(fakeDb({ mode: 'public', account: { ...CONNECTED, refresh_token_enc: 'e' } })).svc.uploadPlan('v1'))
+      .toEqual({ kind: 'upload', privacy: 'public' });
   });
 
   it('набор при живой сессии загрузки — с предупреждением проверить канал', async () => {

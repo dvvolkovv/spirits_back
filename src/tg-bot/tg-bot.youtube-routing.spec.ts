@@ -59,3 +59,45 @@ describe('/youtube в живом обработчике', () => {
     expect(grammy.sendMessage).toHaveBeenCalledWith(42, expect.stringContaining('Не знаю такой команды'));
   });
 });
+
+/**
+ * Порванная связка: сервис не подставлен, но ролики включены флагом — тишина
+ * здесь означала бы, что никто не узнает, почему /youtube молчит. Образец —
+ * те же два теста для ShortsApprovalService в tg-bot.shorts-routing.spec.ts.
+ */
+describe('TgBotService.onModuleInit — порванная связка с YouTube', () => {
+  const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+  const prevEnabled = process.env.SHORTS_ENABLED;
+
+  afterEach(() => {
+    if (prevEnabled === undefined) delete process.env.SHORTS_ENABLED;
+    else process.env.SHORTS_ENABLED = prevEnabled;
+  });
+
+  const buildWith = (youtube?: any) =>
+    new TgBotService(
+      pg as any, {} as any, {} as any, {} as any, {} as any, {} as any, {} as any,
+      {} as any, {} as any, {} as any, {} as any, {} as any, {} as any,
+      undefined, undefined, undefined, undefined, youtube,
+    );
+
+  it('SHORTS_ENABLED=true и ShortsYoutubeService не подставлен — предупреждение в лог', async () => {
+    process.env.SHORTS_ENABLED = 'true';
+    const svc = buildWith(undefined);
+    jest.spyOn(svc as any, 'applyMigration').mockResolvedValue(undefined);
+    jest.spyOn(svc as any, 'pruneWorkspaces').mockResolvedValue(undefined);
+    const warn = jest.spyOn((svc as any).logger, 'warn');
+    await svc.onModuleInit();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('ShortsYoutubeService не подставлен'));
+  });
+
+  it('ShortsYoutubeService подставлен — предупреждения нет', async () => {
+    process.env.SHORTS_ENABLED = 'true';
+    const svc = buildWith({ handleCommand: jest.fn() });
+    jest.spyOn(svc as any, 'applyMigration').mockResolvedValue(undefined);
+    jest.spyOn(svc as any, 'pruneWorkspaces').mockResolvedValue(undefined);
+    const warn = jest.spyOn((svc as any).logger, 'warn');
+    await svc.onModuleInit();
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('ShortsYoutubeService не подставлен'));
+  });
+});
