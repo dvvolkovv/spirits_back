@@ -1,5 +1,6 @@
 import { LanguageService } from '../common/services/language.service';
 import { labelsFor } from './labels';
+import { sectionUrl } from './section-links';
 import type { KbLabelKey } from './labels.generated';
 import type { KbArticle, KbClient, KbContext, KbLang } from './kb.types';
 
@@ -30,6 +31,7 @@ export function kbContext(lang: string, client: KbClient): KbContext {
     q: (key: KbLabelKey) => `«${l[key]}»`,
     paid: (text: string) => (client === 'store' ? '' : text),
     nonStore: (text: string) => (client === 'store' ? '' : text),
+    url: sectionUrl,
   };
 }
 

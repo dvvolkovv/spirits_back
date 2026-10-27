@@ -1,5 +1,6 @@
 import { SUPPORTED_LANGUAGES } from '../common/services/language.service';
 import type { KbLabelKey } from './labels.generated';
+import type { SectionKey } from './section-links';
 
 export type KbLang = (typeof SUPPORTED_LANGUAGES)[number];
 
@@ -19,7 +20,7 @@ export type KbClient = (typeof KB_CLIENTS)[number];
 // выходит в сборке для стора (client 'store'), см. render.ts.
 export const KB_PARTS = ['Что это', 'Где', 'Как', 'Лимиты и цены', 'Лимиты', 'Чего нельзя', 'Если не получается', 'Как устроено'] as const;
 
-/** Что получает render статьи. Имена q, paid и nonStore — договорённость: на них опирается тест исходников. */
+/** Что получает render статьи. Имена q, paid, nonStore и url — договорённость: на них опирается тест исходников. */
 export interface KbContext {
   lang: KbLang;
   client: KbClient;
@@ -33,6 +34,12 @@ export interface KbContext {
    * через файл им нельзя. В сборке из стора — пустая.
    */
   nonStore: (text: string) => string;
+  /**
+   * Полный адрес раздела кабинета для строки «Ссылка…» в разделе «Где»:
+   * url('zoom') → https://my.linkeon.io/profile?open=zoom (section-links.ts).
+   * Адрес не зависит ни от языка, ни от клиента: работает он везде.
+   */
+  url: (key: SectionKey) => string;
 }
 
 export interface KbArticle {

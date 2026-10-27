@@ -171,6 +171,7 @@ describe('исходники статей', () => {
         .replace(/^\s*\/\/.*$/gm, '')
         .replace(/^import .*$/gm, '')
         .replace(/\$\{q\('[A-Za-z]+'\)\}/g, '')
+        .replace(/\$\{url\('[A-Za-z]+'\)\}/g, '')
         .replace(/\$\{V\.[A-Za-z0-9_]+\}/g, '')
         .replace(/\$\{paid\(`/g, '')
         .replace(/\$\{nonStore\(`/g, '')
