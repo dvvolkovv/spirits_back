@@ -69,6 +69,7 @@ ssh_remote() {
     *"seq 1"*) echo "OK 1" ;;
     *"git reset --hard origin/"*) [ -n "$BUILD_FAILS" ] && return 1 ;;
     *"git cat-file -e origin/"*"src/chat/relay-auth.ts"*) [ -n "$NO_RELAY_AUTH" ] && return 1 ;;
+    *"cd studio"*"startOrReload"*) [ -n "$STUDIO_FAILS" ] && return 1 ;;
   esac
   return 0
 }
@@ -103,6 +104,7 @@ function runDeployBackend(streams, env = {}) {
       NO_SHA: '',
       BUILD_FAILS: '',
       NO_RELAY_AUTH: '',
+      STUDIO_FAILS: '',
       ...env,
     },
   });
@@ -202,6 +204,15 @@ describe('deploy.sh: живые ходы проверяются прямо пе�
     expect(studio).toBeGreaterThan(health);
     expect(log[studio]).not.toMatch(/linkeon-api/);
     expect(log[indexOf(log, BUILD)]).not.toMatch(/startOrReload/);
+  });
+
+  it('студия не перезапустилась: на стенде — выход 1 (прод не трогается), на проде — предупреждение, выкат идёт дальше', () => {
+    const test = runDeployBackend(['0'], { STUDIO_FAILS: '1', ENV_NAME: 'test' });
+    expect(test.status).toBe(1);
+    expect(test.log.join('\n')).toMatch(/студии не перезапустился — прод не трогаю/);
+    const prod = runDeployBackend(['0'], { STUDIO_FAILS: '1' });
+    expect(prod.status).toBe(0);
+    expect(prod.log.join('\n')).toMatch(/студии не перезапустился — API выкачен, студию смотреть руками/);
   });
 
   it('сборка запоминает работающий коммит до git reset — по нему студия решает, нужен ли npm ci', () => {
