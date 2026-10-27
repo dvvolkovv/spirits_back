@@ -134,3 +134,75 @@ describe('реферальная привязка — только новый а
     expect(await svc.register('u-ref', SLUG)).toMatchObject({ success: false, error: 'Already registered' });
   });
 });
+
+/// Запасная привязка по источнику входа. Отдельный запрос веба на привязку
+/// иногда обрывается (страница уходит сразу после входа), а источник
+/// `referral:<slug>` при этом доходит — с keepalive. Сервис ловит его крючком
+/// аналитики и привязывает тем же register(): все его правила (только новый
+/// аккаунт, без самоприглашения, без второго бонуса) действуют и здесь.
+class FakeEvents {
+  hooks: Array<(userId: string, source: string) => Promise<void>> = [];
+  onAttribution(hook: (userId: string, source: string) => Promise<void>) { this.hooks.push(hook); }
+  track() { /* no-op */ }
+  async fire(userId: string, source: string) { for (const h of this.hooks) await h(userId, source); }
+}
+
+describe('запасная привязка по источнику входа', () => {
+  let db: FakeDb;
+  let events: FakeEvents;
+  let svc: ReferralService;
+  let warn: jest.SpyInstance;
+
+  beforeEach(() => {
+    db = new FakeDb();
+    events = new FakeEvents();
+    svc = new ReferralService(db as any, events as any);
+    warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+  });
+
+  it('новый аккаунт с источником referral:<slug> привязывается и получает бонус', async () => {
+    db.seed('u-new', 60_000);
+
+    await events.fire('u-new', `referral:${SLUG}`);
+
+    expect(db.referees.get('u-new')).toMatchObject({ leader_id: LEADER.id, bonus_tokens: 20_000 });
+    expect(db.credits).toEqual([{ userId: 'u-new', amount: 20_000 }]);
+  });
+
+  it('нереферальный источник — ничего', async () => {
+    db.seed('u-utm', 60_000);
+
+    await events.fire('u-utm', 'utm:yandex/cpc');
+
+    expect(db.referees.has('u-utm')).toBe(false);
+    expect(db.credits).toEqual([]);
+  });
+
+  it('веб уже привязал — второго бонуса нет, в логе тихо', async () => {
+    db.seed('u-web', 60_000);
+    await svc.register('u-web', SLUG);
+
+    await events.fire('u-web', `referral:${SLUG}`);
+
+    expect(db.credits).toHaveLength(1);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('давний аккаунт со старой меткой — без привязки и без шума в логе', async () => {
+    db.seed('u-old', 30 * 24 * 3600_000);
+
+    await events.fire('u-old', `referral:${SLUG}`);
+
+    expect(db.referees.has('u-old')).toBe(false);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('новый аккаунт и мёртвая ссылка — предупреждение в логе', async () => {
+    db.seed('u-dead', 60_000);
+
+    await events.fire('u-dead', 'referral:nosuchslug');
+
+    expect(db.referees.has('u-dead')).toBe(false);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('nosuchslug'));
+  });
+});

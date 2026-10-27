@@ -38,6 +38,15 @@ export const REFEREE_BONUS_TOKENS = 20000;
 // прежнего аккаунта. Нет строки или даты — аккаунт считается давним.
 export const REFERRAL_NEW_ACCOUNT_WINDOW_MS = 60 * 60 * 1000;
 
+// Отказы register(), обычные для запасной привязки по источнику входа: источник
+// приходит на КАЖДОМ входе, и у давнего пользователя со старой меткой они
+// повторялись бы в логе бесконечно. Строки — те же, что возвращает register().
+const EXPECTED_ATTRIBUTION_REFUSALS = new Set([
+  'Already registered',
+  'Referral link works only for new accounts',
+  'Нельзя пригласить самого себя',
+]);
+
 // Курс/порог вывода реферальных комиссий токенами (подтверждено владельцем).
 //
 // 17.08.2026: 600 → 750. Курс сиденья в тот же день поднялся с 3 600 до 4 500
@@ -134,7 +143,28 @@ export class ReferralService implements OnModuleInit {
   constructor(
     private readonly pg: PgService,
     @Optional() private readonly events?: EventsService,
-  ) {}
+  ) {
+    this.events?.onAttribution?.((userId, source) => this.registerFromAttribution(userId, source));
+  }
+
+  // Второй шанс привязки — по источнику входа (крючок EventsService). Отдельный
+  // запрос веба на привязку иногда обрывается, а источник `referral:<slug>`
+  // доходит; так терялись рефералы, пришедшие по ссылке за минуты до
+  // регистрации. Правила те же — это register(). Отказы, обычные на каждом
+  // входе давнего пользователя со старой меткой, в лог не пишем; остальные
+  // пишем: раньше любой сбой привязки пропадал бесследно.
+  async registerFromAttribution(userId: string, source: string): Promise<void> {
+    if (!source.startsWith('referral:')) return;
+    const slug = source.slice('referral:'.length).trim();
+    if (!slug) return;
+    const res: any = await this.register(userId, slug);
+    if (res.success) {
+      if (res.bonus_tokens) this.logger.log(`referral bound via attribution: ${userId} → ${slug}`);
+      return;
+    }
+    if (EXPECTED_ATTRIBUTION_REFUSALS.has(res.error)) return;
+    this.logger.warn(`referral via attribution refused: ${userId} → ${slug}: ${res.error}`);
+  }
 
   async onModuleInit() {
     // Журнал выплат комиссий токенами (аудит + атомарность/идемпотентность).
