@@ -366,6 +366,7 @@ cd ~/Downloads/spirits_back/tests && node runner.js  # api (32) + e2e (18) = 50
 2. подписи — `node scripts/sync-kb-labels.mjs <путь к spirits_front>` и дифф `labels.generated.ts`;
 3. новое число — константой, которую берут и списание, и `values.ts`; цифру в тексте статьи сторож не пропустит;
 4. «Помощь» фронта (`help.guides`, `help.faq` в локалях) — если её это касается.
+5. новый раздел или карточка кабинета, на которую ассистент может дать ссылку, — адрес в `src/platform-kb/section-links.ts` И в `spirits_front/src/utils/cabinetSections.ts`, плюс общая таблица «АДРЕСА РАЗДЕЛОВ» в `section-links.spec.ts` и `cabinetSections.test.ts` — дословно одна и та же (сверка: `diff` блоков между метками, план `2026-10-27-assistant-links-sources-roles`, задача С1). Фронт катится не позже бэка. В сборке из стора адресов кабинета нет (Apple 3.1.1, APK).
 
 Все статьи одним файлом для глаз: `npx ts-node scripts/render-kb.ts ru web` (на ноде). Живая проверка после выката — `tests/platform-help.e2e.mjs` (на проде, тестовым аккаунтом).
 

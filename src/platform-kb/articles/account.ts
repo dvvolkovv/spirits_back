@@ -12,14 +12,15 @@ import { V } from '../values';
 export const account: KbArticle = {
   id: 'account',
   title: 'Аккаунт и вход',
-  summary: 'аккаунт: способы входа, код из SMS, объединение аккаунтов, язык, выход, удаление',
+  summary: 'аккаунт: способы входа (подключения, интеграции Google и Яндекса), SMS-код, объединение аккаунтов, язык, выход, удаление',
   related: ['profile', 'support', 'apps'],
-  render: ({ q, paid }) => `
+  render: ({ q, paid, url }) => `
 ## Что это
 Вход в Linkeon, способы входа, язык, выход и удаление аккаунта.
 
 ## Где
 Вход — на my.linkeon.io. Остальное — в ${q('profile')}: в ${q('settings')} — ${q('loginMethods')} и ${q('language')}; ${q('logout')} и ${q('deleteAccount')} — в блоке ${q('account')}.
+Ссылка на способы входа: ${url('loginMethods')}
 
 ## Как
 - Войти: по почте (ссылка в письме), ${q('loginPhone')} (код из SMS), через Яндекс, Google или Taler ID. В мини-приложении Telegram — через Telegram.

@@ -12,6 +12,7 @@ import { isPrivateConfig } from './tg-chat-kind';
 import { helpCliMcp, LINKEON_HELP_CLI_TOOL_NAME, productsCliMcp, REPORT_PROBLEM_CLI_TOOL_NAME } from '../products/products-cli-tool';
 import { withCrisisRule } from '../chat/crisis-rule';
 import { customAssistantHelpLine, telegramPlatformGuide } from '../chat/platform-guide';
+import { FACT_CHECK_RULE } from '../chat/fact-check-rule';
 import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
 
 /**
@@ -587,7 +588,8 @@ ${workspaceFiles.map(f => `  • ${f}`).join('\n')}
     const ioInstructions = `
 ВОЗМОЖНОСТИ:
 - Ты видишь приложенные пользователем файлы (фото, PDF, txt) если они есть.
-- У тебя есть интернет: WebSearch (поиск) и WebFetch (открыть страницу по URL). Если вопрос про актуальное — курсы, новости, цены, расписания, свежие релизы — проверяй в сети, а не отвечай по памяти. Обычные вопросы, где сеть не нужна, ищи не надо.${sandboxBlock}
+- У тебя есть интернет: WebSearch (поиск) и WebFetch (открыть страницу по URL). Если вопрос про актуальное — курсы, новости, цены, расписания, свежие релизы — проверяй в сети, а не отвечай по памяти. Обычные вопросы, где сеть не нужна, ищи не надо.
+- ${FACT_CHECK_RULE} Ответ уходит простым текстом: ссылку на источник давай полным адресом https://…, без markdown.${sandboxBlock}
 - Медиа-маркеры для прикрепления изображений и файлов к ответу:
   • {{image: КРАТКИЙ_ПРОМПТ}} — сгенерирует и пришлёт новую картинку
   • {{image_edit: source=<url> | prompt=<что изменить>}} — отредактирует существующую (Gemini Nano Banana Pro)

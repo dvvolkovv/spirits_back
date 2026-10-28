@@ -56,6 +56,27 @@ const SANDBOX_OUTPUT_EXTS = new Set([
 const MAX_SANDBOX_OUTPUT_SIZE = 49 * 1024 * 1024; // Telegram document limit 50MB
 
 /**
+ * Ответ ассистента — без превью ссылок. С правилом ссылок (linksRule('plain')
+ * в chat/platform-guide.ts) ассистент даёт адреса разделов кабинета, и под
+ * ответом Telegram разворачивал бы карточку страницы кабинета размером с сам
+ * ответ. link_preview_options — поле Bot API 7.0+; им же глушит превью
+ * shorts/shorts-youtube.service.ts. Нарезка длинного ответа (TgGrammyClient)
+ * передаёт его каждому куску.
+ */
+const NO_LINK_PREVIEW = { link_preview_options: { is_disabled: true } };
+
+/**
+ * Ссылки в тексте для озвучки (TgBotService.speechText). Правила — как у
+ * «Прослушать» в кабинете (spirits_front src/components/chat/listen/speechText.ts):
+ * markdown-ссылка читается надписью, голый адрес не читается вовсе. Хвост
+ * адреса не кончается знаком препинания и скобкой (как в insights/deidentify.ts):
+ * точка в конце фразы остаётся для интонации, китайские 。，：（） — в тексте.
+ * [текст](что угодно) без адреса или пути — не ссылка и остаётся как есть.
+ */
+const SPEECH_MD_LINK_RE = /\[([^\]]+)\]\(\s*(?:https?:\/\/|\/)[^)\s]*\s*\)/g;
+const SPEECH_URL_RE = /\bhttps?:\/\/[^\s<>()«»"（）。，：；！？]*[^\s<>()«»".,;:!?…'（）。，：；！？]/gi;
+
+/**
  * Корень постоянных рабочих папок ботов — по папке на чат.
  *
  * Не os.tmpdir(): systemd-tmpfiles чистит /tmp по своему возрасту, и файл
@@ -1133,11 +1154,14 @@ export class TgBotService implements OnModuleInit {
       const textToSend = cleanText || (markers.length > 0 ? '' : '...');
       // Куда ушёл ответ: группа могла стать супергруппой посреди хода.
       let replyChatId: number = msg.chat.id;
+      // Голосом — без адресов (speechText): адрес видно в подписи и в тексте.
+      // Ответ из одних адресов озвучивать нечем — он уходит текстом.
+      const speech = wantsVoice && textToSend ? TgBotService.speechText(textToSend) : '';
 
-      if (wantsVoice && textToSend) {
+      if (speech) {
         try {
           this.grammy.sendChatAction(msg.chat.id, 'record_voice').catch(() => {});
-          const tts = await this.voice.synthesize(textToSend);
+          const tts = await this.voice.synthesize(speech);
           voiceTtsCostUsd = tts.costUsd;
           const plan = TgBotService.voiceCaptionPlan(textToSend);
           await this.grammy.sendVoice(msg.chat.id, tts.buffer, {
@@ -1262,6 +1286,36 @@ export class TgBotService implements OnModuleInit {
     return text.length <= TgBotService.VOICE_CAPTION_LIMIT
       ? { caption: text, needsSeparateText: false }
       : { needsSeparateText: true };
+  }
+
+  /**
+   * Текст голосового ответа: без адресов. Ассистенты дают ссылки на разделы
+   * кабинета полным адресом (linksRule('plain')), и синтезатор зачитывал бы
+   * их по буквам. Адрес остаётся в подписи к голосовому и в тексте ответа —
+   * там его видно и можно нажать.
+   *
+   * Трогаем только строки со ссылкой: остальное уходит синтезатору как было.
+   * Строка из одного адреса пропадает целиком, от «(адрес)» не остаётся
+   * пустых скобок. Пустой результат — читать нечего: ответ уйдёт текстом.
+   */
+  static speechText(text: string): string {
+    let changed = false;
+    const lines: string[] = [];
+    for (const line of text.split('\n')) {
+      const cut = line.replace(SPEECH_MD_LINK_RE, '$1').replace(SPEECH_URL_RE, ' ');
+      if (cut === line) {
+        lines.push(line);
+        continue;
+      }
+      changed = true;
+      const clean = cut
+        .replace(/\(\s*\)/g, ' ')
+        .replace(/[ \t]{2,}/g, ' ')
+        .replace(/ +([.,!?;:…。，：；！？])/g, '$1')
+        .trim();
+      if (clean) lines.push(clean);
+    }
+    return changed ? lines.join('\n').trim() : text;
   }
 
   /**
@@ -1411,6 +1465,9 @@ export class TgBotService implements OnModuleInit {
    * шлёт ответ туда. Возвращает id чата, куда ушёл ответ, — туда же пойдут
    * картинки и файлы хода. cfg.tg_chat_id меняется, только если конфиг и
    * правда теперь на новом id: по нему пишется история хода.
+   *
+   * Ответ — без превью ссылок (NO_LINK_PREVIEW): в нём бывают адреса разделов
+   * кабинета. Уведомлению о сбое оно не нужно: ссылок в нём нет.
    */
   async deliverReplyText(
     chatId: number,
@@ -1420,7 +1477,7 @@ export class TgBotService implements OnModuleInit {
     cfg?: TgBotConfigRow,
   ): Promise<number> {
     try {
-      await this.grammy.sendMessage(chatId, text, { reply_to_message_id: replyToMessageId });
+      await this.grammy.sendMessage(chatId, text, { reply_to_message_id: replyToMessageId, ...NO_LINK_PREVIEW });
       return chatId;
     } catch (first: any) {
       let e = first;
@@ -1435,7 +1492,7 @@ export class TgBotService implements OnModuleInit {
         target = migratedTo;
         replyTo = undefined;
         try {
-          await this.grammy.sendMessage(target, text, {});
+          await this.grammy.sendMessage(target, text, { ...NO_LINK_PREVIEW });
           return target;
         } catch (again: any) {
           // Не прошло и туда (права, 429, закрытая тема) — дальше общий путь:

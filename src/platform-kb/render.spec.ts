@@ -1,4 +1,4 @@
-import { CLIENT_NOTES, dropEmptySections, renderArticle, renderIndex, topicsFor } from './render';
+import { CLIENT_NOTES, dropEmptySections, kbContext, renderArticle, renderIndex, topicsFor } from './render';
 import type { KbArticle } from './kb.types';
 
 const FAKE: KbArticle = {
@@ -79,5 +79,40 @@ describe('dropEmptySections', () => {
 
   it('последний заголовок без перевода строки — тоже пустой раздел', () => {
     expect(dropEmptySections('## А\nтекст\n\n## Б')).toBe('## А\nтекст\n\n');
+  });
+});
+
+describe('url() — адрес раздела для строки «Ссылка…»', () => {
+  it('полный адрес из таблицы section-links.ts, в любом языке и клиенте', () => {
+    expect(kbContext('ru', 'web').url('zoom')).toBe('https://my.linkeon.io/profile?open=zoom');
+    expect(kbContext('en', 'telegram').url('studioBots')).toBe('https://my.linkeon.io/studio?tab=bots');
+  });
+});
+
+// Сборка из стора открывает ссылку во внешнем браузере, а в кабинете —
+// баланс, покупка и «Скачать APK» (Apple 3.1.1): строку «Ссылка…» ей не отдаём.
+describe('строка «Ссылка…» в сборке из стора', () => {
+  const LINKED: KbArticle = {
+    id: 'linked',
+    title: 'Со ссылкой',
+    summary: 'статья со ссылкой',
+    related: [],
+    render: ({ q, url }) =>
+      `## Что это\nТекст.\n\n## Где\nВ ${q('studio')}.\nСсылка: ${url('studio')}\nСсылка на Zoom: ${url('zoom')}\n\n` +
+      `## Если не получается\n- Ссылка устарела — сгенерировать новую.`,
+  };
+
+  it('веб, приложение и Telegram — строки на месте', () => {
+    for (const c of ['web', 'app', 'telegram'] as const) {
+      const t = renderArticle(LINKED, 'ru', c);
+      expect(t).toContain('\nСсылка: https://my.linkeon.io/studio\n');
+      expect(t).toContain('\nСсылка на Zoom: https://my.linkeon.io/profile?open=zoom\n');
+    }
+  });
+
+  it('стор — строки со ссылкой вырезаны, раздел «Где» и прочий текст на месте', () => {
+    const t = renderArticle(LINKED, 'ru', 'store');
+    expect(t).not.toContain('https://my.linkeon.io/');
+    expect(t).toContain('## Где\nВ «Студия».\n\n## Если не получается\n- Ссылка устарела — сгенерировать новую.');
   });
 });

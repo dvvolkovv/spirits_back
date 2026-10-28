@@ -13,12 +13,14 @@ export const studioBots: KbArticle = {
   title: 'Telegram-боты для групп',
   summary: 'Telegram-боты для групп: привязка Telegram, создание, добавление в группу, когда отвечает, личка',
   related: ['studio-assistants', 'products', 'tokens'],
-  render: ({ q, paid }) => `
+  render: ({ q, paid, url }) => `
 ## Что это
 Бот Linkeon в Telegram-группе пользователя: отвечает выбранным ассистентом прямо в группе. Своего бота в BotFather заводить не нужно — бот общий, у каждой группы своя настройка имени, роли и режима.
 
 ## Где
 ${q('studio')} → ${q('studioBots')}.
+Ссылка: ${url('studioBots')}
+Ссылка на карточку Telegram в профиле (привязан ли Telegram): ${url('telegram')}
 
 ## Как
 - Один раз привязать свой Telegram: ${q('tgGenLink')} → ${q('tgOpen')} → запустить бота → ${q('tgCheckBind')}. Ссылка живёт недолго; один Telegram — к одному аккаунту.
