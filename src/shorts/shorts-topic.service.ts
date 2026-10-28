@@ -14,7 +14,6 @@ import {
   ShortAngle, ShortRubric, ShortSource, ShortVideo, rowToShort,
 } from './shorts.types';
 
-export const WEEKLY_TOPICS = 3;
 export const MIN_ORDER_CHARS = 10;
 export const MAX_ORDER_CHARS = 4000;
 
@@ -119,14 +118,15 @@ export class ShortsTopicService {
 
   /**
    * Каталог недели: доводит число ОТКРЫТЫХ идей каталога (source = 'catalog',
-   * status = 'idea') до WEEKLY_TOPICS, а не добавляет к ним ещё WEEKLY_TOPICS —
-   * иначе повторный вызов в тот же день заводил бы новую тройку поверх старой
-   * (ключ `catalog:assistant:<id>:<день>` от этого не защищал: второй вызов в
-   * тот же день видел уже заведённые A, B, C, пропускал их в pickAssistants и
-   * заводил D, E, F).
+   * status = 'idea') до числа слотов в неделе (`slot_days`: тема на слот; вт, чт,
+   * сб — три, каждый день — семь), а не добавляет их поверх открытых — иначе
+   * повторный вызов в тот же день заводил бы новую порцию поверх старой (ключ
+   * `catalog:assistant:<id>:<день>` от этого не защищал: второй вызов в тот же
+   * день видел уже заведённые A, B, C, пропускал их в pickAssistants и заводил
+   * D, E, F). Зовут его воскресный крон и действие админки `refill_topics`.
    *
    * Ключ идеи — неделя (по МСК, как слоты) и позиция в ней внутри недели,
-   * `catalog:<ISO-неделя>:<1..3>`: повторный или параллельный вызов той же
+   * `catalog:<ISO-неделя>:<1..N>`: повторный или параллельный вызов той же
    * недели целится в те же позиции и упирается в тот же source_ref через
    * uq_short_video_source_ref, даже если выбрал другого ассистента.
    *
@@ -135,10 +135,11 @@ export class ShortsTopicService {
    * возможности, которых у него нет.
    */
   async refillWeek(now: Date = new Date()): Promise<number> {
+    const target = (await this.settings.get()).slotDays.length;
     const openCount = await this.pg.query(
       `SELECT count(*)::int AS n FROM short_video WHERE status = 'idea' AND source = 'catalog'`,
     );
-    const need = WEEKLY_TOPICS - Number(openCount.rows[0]?.n ?? 0);
+    const need = target - Number(openCount.rows[0]?.n ?? 0);
     if (need <= 0) return 0;
 
     const assistants = toAgents(await this.agents.getAgents('ru')).filter((a) => hasClearProfile(a.description));
@@ -157,7 +158,7 @@ export class ShortsTopicService {
     const lastShown = new Map<number, Date>(shown.rows.map((r: any) => [Number(r.assistant_id), new Date(r.last)]));
     const openIds = new Set<number>(open.rows.map((r: any) => Number(r.assistant_id)));
     const week = isoWeekKey(new Date(now.getTime() + MSK_OFFSET_MS));
-    const already = WEEKLY_TOPICS - need;
+    const already = target - need;
     const picks = pickAssistants(assistants, lastShown, openIds, need);
     let added = 0;
     for (let idx = 0; idx < picks.length; idx++) {
