@@ -37,7 +37,7 @@ export const YOUTUBE_MODES: readonly YoutubeMode[] = ['manual', 'unlisted', 'pub
 export const RUBRICS: readonly ShortRubric[] = ['assistant', 'feature', 'news', 'case'];
 export const ANGLES: readonly ShortAngle[] = ['uncomfortable', 'roast', 'myth', 'calm'];
 export const FORMATS: readonly ShortFormat[] = ['skit', 'chat'];
-/** Провокационные подачи: два ролика из трёх в неделю (спека, «Подача»). */
+/** Провокационные подачи: два ролика из любых трёх подряд (спека, «Подача»; ритм — `nextAngle` в short-rhythm.ts). */
 export const PROVOCATIVE_ANGLES: readonly ShortAngle[] = ['uncomfortable', 'roast', 'myth'];
 
 export const RUBRIC_TITLES: Record<ShortRubric, string> = {

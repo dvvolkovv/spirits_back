@@ -125,10 +125,14 @@ export class ShortsTopicService {
    * день видел уже заведённые A, B, C, пропускал их в pickAssistants и заводил
    * D, E, F). Зовут его воскресный крон и действие админки `refill_topics`.
    *
-   * Ключ идеи — неделя (по МСК, как слоты) и позиция в ней внутри недели,
-   * `catalog:<ISO-неделя>:<1..N>`: повторный или параллельный вызов той же
-   * недели целится в те же позиции и упирается в тот же source_ref через
-   * uq_short_video_source_ref, даже если выбрал другого ассистента.
+   * Ключ идеи — неделя (по МСК, как слоты) и позиция в ней,
+   * `catalog:<ISO-неделя>:<n>`; позиция — следующая за темами, уже заведёнными на
+   * эту неделю в любом статусе. Параллельный вызов целится в те же позиции и
+   * упирается в тот же source_ref через uq_short_video_source_ref, даже если выбрал
+   * другого ассистента; второе наполнение в ту же неделю после расхода идей
+   * (`refill_topics` в среду, крон в воскресенье — одна ISO-неделя) встаёт на
+   * следующие позиции, а не упирается в занятые. Сверх цели не заведёт: `need`
+   * считается по открытым идеям.
    *
    * Ассистентов без внятного профиля (как в блоге, `hasClearProfile`) в
    * каталог не ставим: без него редактор/режиссёр сочиняют ассистенту
@@ -141,6 +145,12 @@ export class ShortsTopicService {
     );
     const need = target - Number(openCount.rows[0]?.n ?? 0);
     if (need <= 0) return 0;
+    const week = isoWeekKey(new Date(now.getTime() + MSK_OFFSET_MS));
+    const weekCount = await this.pg.query(
+      `SELECT count(*)::int AS n FROM short_video WHERE source_ref LIKE $1`,
+      [`catalog:${week}:%`],
+    );
+    const already = Number(weekCount.rows[0]?.n ?? 0);
 
     const assistants = toAgents(await this.agents.getAgents('ru')).filter((a) => hasClearProfile(a.description));
     // «Когда показывали» — по слоту, если он был, иначе по созданию: идея может
@@ -157,8 +167,6 @@ export class ShortsTopicService {
     );
     const lastShown = new Map<number, Date>(shown.rows.map((r: any) => [Number(r.assistant_id), new Date(r.last)]));
     const openIds = new Set<number>(open.rows.map((r: any) => Number(r.assistant_id)));
-    const week = isoWeekKey(new Date(now.getTime() + MSK_OFFSET_MS));
-    const already = target - need;
     const picks = pickAssistants(assistants, lastShown, openIds, need);
     let added = 0;
     for (let idx = 0; idx < picks.length; idx++) {

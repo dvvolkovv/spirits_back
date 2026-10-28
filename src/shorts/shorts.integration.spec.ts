@@ -7,6 +7,7 @@ import { approveShortIntoSlot } from './short-slot-claim';
 import { ShortsApprovalService } from './shorts-approval.service';
 import { POST_MAY_BE_OUT, ShortsPublisherService } from './shorts-publisher.service';
 import { ShortsSettingsService } from './shorts-settings.service';
+import { ShortsTopicService } from './shorts-topic.service';
 import { ShortsYoutubeService } from './shorts-youtube.service';
 import { rowToShort } from './shorts.types';
 import { YoutubeAttemptSuperseded, YoutubeNotUploaded } from './youtube/youtube-errors';
@@ -236,6 +237,47 @@ maybe('ролики против живого Postgres', () => {
 
     expect((await video(fresh.id)).status).toBe('publishing');
     expect((await rows(fresh.id))[0].status).toBe('publishing');
+  });
+
+  it('каталог при слотах каждый день: семь тем, второе наполнение в ту же неделю доливает расход на следующие позиции', async () => {
+    const agents = {
+      getAgents: async () => [
+        { id: 1, name: 'Миша', description: 'Коуч — цели, привычки и источники мотивации' },
+        { id: 10, name: 'Алексей', description: 'Юрист — договоры, споры и работа с судами' },
+        { id: 22, name: 'Кира', description: 'Дизайнер — логотипы, фирменный стиль и макеты' },
+        { id: 4, name: 'Ирина', description: 'Карьера — резюме, собеседования и переговоры' },
+        { id: 7, name: 'Полина', description: 'Врач-терапевт — симптомы, анализы и профилактика' },
+        { id: 31, name: 'Ольга', description: 'Психолог — тревога, отношения и самооценка' },
+        { id: 32, name: 'Пётр', description: 'Финансы — бюджет, накопления и кредиты' },
+        { id: 33, name: 'Анна', description: 'Маркетолог — продвижение, контент и реклама' },
+        { id: 34, name: 'Глеб', description: 'Нутрициолог — питание, режим и пищевые привычки' },
+        { id: 35, name: 'Вера', description: 'Педагог — учёба детей, мотивация и домашние задания' },
+        { id: 36, name: 'Марк', description: 'Риелтор — аренда, покупка жилья и сделки' },
+      ],
+    };
+    const settings = { get: async () => ({ slotDays: [1, 2, 3, 4, 5, 6, 7], slotHourMsk: 18, prepareLeadHours: 24, format: 'skit' }) };
+    const topics = new ShortsTopicService(pgLike() as any, agents as any, settings as any);
+    const wed = new Date('2026-10-28T15:00:00.000Z'); // ср 18:00 МСК, неделя 44
+    const sun = new Date('2026-11-01T07:00:00.000Z'); // вс 10:00 МСК — та же неделя 44
+
+    expect(await topics.refillWeek(wed)).toBe(7);
+    // Повтор в тот же день — ничего сверх цели.
+    expect(await topics.refillWeek(wed)).toBe(0);
+    // Четыре темы ушли в работу (слоты чт–вс).
+    await pool.query(
+      `UPDATE short_video SET status = 'directing' WHERE id IN (
+         SELECT id FROM short_video WHERE source = 'catalog' AND status = 'idea' ORDER BY source_ref LIMIT 4)`,
+    );
+    expect(await topics.refillWeek(sun)).toBe(4);
+    const rows = (await pool.query(`SELECT source_ref, status, assistant_id FROM short_video WHERE source = 'catalog' ORDER BY created_at`)).rows;
+    expect(rows.filter((r) => r.status === 'idea')).toHaveLength(7);
+    expect(new Set(rows.map((r) => r.source_ref)).size).toBe(11);
+    expect(rows.slice(7).map((r) => r.source_ref).sort()).toEqual(
+      ['catalog:2026-W44:10', 'catalog:2026-W44:11', 'catalog:2026-W44:8', 'catalog:2026-W44:9'],
+    );
+    // Открытые идеи — у разных ассистентов.
+    const open = rows.filter((r) => r.status === 'idea').map((r) => r.assistant_id);
+    expect(new Set(open).size).toBe(7);
   });
 
   describe('YouTube против живой базы', () => {
