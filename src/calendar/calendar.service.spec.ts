@@ -1,4 +1,4 @@
-import { encryptSecret, decryptSecret } from './crypto';
+import { encryptSecret, decryptSecret, hasSecretKey } from './crypto';
 import { overlaps, CalendarService } from './calendar.service';
 import { YandexCalDavConnector } from './caldav';
 
@@ -25,6 +25,42 @@ describe('secret crypto', () => {
     const enc = encryptSecret('my-app-password');
     expect(enc).not.toContain('my-app-password');
     expect(decryptSecret(enc)).toBe('my-app-password');
+  });
+});
+
+// Правило «ключ не короче 32 знаков» — одно на всех: по нему шифрует crypto.ts, его же заранее
+// спрашивают вызывающие (YouTube роликов — до одноразового кода Google и до обновления токена).
+describe('hasSecretKey', () => {
+  let saved: string | undefined;
+  beforeEach(() => { saved = process.env.CALENDAR_SECRET_KEY; });
+  afterEach(() => {
+    if (saved === undefined) delete process.env.CALENDAR_SECRET_KEY;
+    else process.env.CALENDAR_SECRET_KEY = saved;
+  });
+
+  it('ключ не короче 32 знаков — есть; короче, пустой или не задан — нет', () => {
+    process.env.CALENDAR_SECRET_KEY = 'k'.repeat(32);
+    expect(hasSecretKey()).toBe(true);
+    process.env.CALENDAR_SECRET_KEY = 'k'.repeat(64);
+    expect(hasSecretKey()).toBe(true);
+    process.env.CALENDAR_SECRET_KEY = 'k'.repeat(31);
+    expect(hasSecretKey()).toBe(false);
+    process.env.CALENDAR_SECRET_KEY = '';
+    expect(hasSecretKey()).toBe(false);
+    delete process.env.CALENDAR_SECRET_KEY;
+    expect(hasSecretKey()).toBe(false);
+  });
+
+  it('шифрование — по тому же правилу и с прежней ошибкой: где hasSecretKey «нет», encrypt и decrypt бросают', () => {
+    process.env.CALENDAR_SECRET_KEY = 'k'.repeat(32);
+    const enc = encryptSecret('app-pass');
+    process.env.CALENDAR_SECRET_KEY = 'k'.repeat(31);
+    expect(hasSecretKey()).toBe(false);
+    expect(() => encryptSecret('app-pass')).toThrow('CALENDAR_SECRET_KEY must be >= 32 chars');
+    expect(() => decryptSecret(enc)).toThrow('CALENDAR_SECRET_KEY must be >= 32 chars');
+    process.env.CALENDAR_SECRET_KEY = 'k'.repeat(32);
+    expect(hasSecretKey()).toBe(true);
+    expect(decryptSecret(enc)).toBe('app-pass');
   });
 });
 

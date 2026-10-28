@@ -10,6 +10,7 @@ import {
   omniSpendLine,
   skitCastLine,
   tidyTags,
+  youtubeSafe,
 } from './short-captions';
 import { planSkits } from './short-skit-prompts';
 
@@ -75,6 +76,20 @@ describe('buildCaptions', () => {
     expect(c.vk.endsWith(`${links.vk}\n\n${SYNTH_NOTE}`)).toBe(true);
     expect(hasLoneSurrogate(c.vk)).toBe(false);
   });
+
+  it('заголовок и описание YouTube — через youtubeSafe: карточка проверки показывает владельцу то же, что уйдёт при отправке', () => {
+    const c = buildCaptions({ ...w, youtube: { ...w.youtube, title: 'Залог <по договору>', description: 'Срок < 30 дней' } }, links);
+    expect(c.youtube.title).toBe('Залог ‹по договору›');
+    expect(c.youtube.description.startsWith('Срок ‹ 30 дней')).toBe(true);
+    expect(c.youtube.title).not.toMatch(/[<>]/);
+    expect(c.youtube.description).not.toMatch(/[<>]/);
+  });
+
+  it('telegram и vk с угловыми скобками остаются как есть — youtubeSafe только для заголовка и описания YouTube', () => {
+    const c = buildCaptions({ ...w, telegram: 'Правда < или вправда?', vk: 'x <= y, a -> b' }, links);
+    expect(c.telegram).toContain('Правда < или вправда?');
+    expect(c.vk).toContain('x <= y, a -> b');
+  });
 });
 
 describe('tidyTags', () => {
@@ -92,6 +107,36 @@ describe('tidyTags', () => {
     const result = tidyTags(tags);
     const total = result.reduce((sum, t) => sum + (t.includes(' ') ? t.length + 2 : t.length) + 1, 0);
     expect(total).toBeLessThanOrEqual(YT_TAGS_TOTAL_MAX);
+  });
+});
+
+describe('youtubeSafe', () => {
+  it('угловые скобки — на одиночные ёлочки (YouTube отверг бы `<` и `>`); без скобок текст не меняется', () => {
+    expect(youtubeSafe('Права <работника> > всего')).toBe('Права ‹работника› › всего');
+    expect(youtubeSafe('Залог при аренде')).toBe('Залог при аренде');
+  });
+
+  it('сохраняет смысл операторов и стрелок: <=, >=, ->, <- — свои символы, не ёлочки', () => {
+    expect(youtubeSafe('x <= y')).toBe('x ≤ y');
+    expect(youtubeSafe('x >= y')).toBe('x ≥ y');
+    expect(youtubeSafe('a -> b')).toBe('a → b');
+    expect(youtubeSafe('a <- b')).toBe('a ← b');
+  });
+
+  it('составные операторы и стрелки длиннее двух знаков: =>, <->, <=> — раньше двусимвольных образцов', () => {
+    expect(youtubeSafe('x => y')).toBe('x ⇒ y');
+    expect(youtubeSafe('a <-> b')).toBe('a ↔ b');
+    expect(youtubeSafe('a <=> b')).toBe('a ⇔ b');
+  });
+
+  it('<- перед цифрой — минус у отрицательного числа, не стрелка: не трогаем, одиночная < всё равно уходит в ёлочку', () => {
+    expect(youtubeSafe('t<-10°C')).toBe('t‹-10°C');
+  });
+
+  it('идемпотентна: повторное применение не меняет результат (вызовы при сборке подписи и при отправке не портят друг друга)', () => {
+    const s = 'Права <работника> > всего, x <= y, x >= y, a -> b, a <- b, x => y, a <-> b, a <=> b, t<-10°C';
+    const once = youtubeSafe(s);
+    expect(youtubeSafe(once)).toBe(once);
   });
 });
 

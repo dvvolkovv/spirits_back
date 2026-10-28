@@ -299,6 +299,11 @@ export interface ShortPublication {
   status: PublicationStatus;
   externalId: string | null;
   url: string | null;
+  /**
+   * Монотонный счётчик захватов этой строки площадки и жетон попытки (см. platform() в
+   * shorts-publisher.service.ts). retry его не обнуляет намеренно: обнулённый, он совпал бы
+   * с жетоном зависшей прежней попытки. В выдаче админки — накопительный.
+   */
   attempts: number;
   lastError: string | null;
   publishedAt: Date | null;

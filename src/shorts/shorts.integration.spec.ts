@@ -5,10 +5,11 @@ import { decryptSecret, encryptSecret } from '../calendar/crypto';
 import { claimStage, stageFailed } from './short-jobs';
 import { approveShortIntoSlot } from './short-slot-claim';
 import { ShortsApprovalService } from './shorts-approval.service';
-import { ShortsPublisherService } from './shorts-publisher.service';
+import { POST_MAY_BE_OUT, ShortsPublisherService } from './shorts-publisher.service';
 import { ShortsSettingsService } from './shorts-settings.service';
 import { ShortsYoutubeService } from './shorts-youtube.service';
 import { rowToShort } from './shorts.types';
+import { YoutubeAttemptSuperseded, YoutubeNotUploaded } from './youtube/youtube-errors';
 
 /**
  * Ролики против живого Postgres — то, что решает SQL, а не код вокруг него.
@@ -261,10 +262,12 @@ maybe('ролики против живого Postgres', () => {
       process.env = saved;
     });
 
+    /** Ответы Google по очереди; функция — ответ с побочным действием (чужой захват строки в этот момент). */
     function service(responses: any[]) {
-      const http = jest.fn(async () => {
-        const n = responses.shift();
-        if (!n) throw new Error('лишний запрос');
+      const http = jest.fn(async (req: any) => {
+        const queued = responses.shift();
+        if (!queued) throw new Error('лишний запрос');
+        const n = typeof queued === 'function' ? await queued(req) : queued;
         if (n instanceof Error) throw n;
         return n;
       });
@@ -311,7 +314,8 @@ maybe('ролики против живого Postgres', () => {
         video_key: 'shorts/v/video.mp4',
         captions: { telegram: 't', vk: 'v', youtube: { title: 'T', description: 'D', tags: [] } },
       });
-      await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'youtube', 'publishing')`, [v.id]);
+      // Строку захватила попытка с жетоном 1 — его и передаём.
+      await pool.query(`INSERT INTO short_publication (short_id, platform, status, attempts) VALUES ($1, 'youtube', 'publishing', 1)`, [v.id]);
       const SESSION = 'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=it1';
       const read = async () =>
         (await pool.query(`SELECT upload_session FROM short_publication WHERE short_id = $1 AND platform = 'youtube'`, [v.id])).rows[0].upload_session;
@@ -320,7 +324,7 @@ maybe('ролики против живого Postgres', () => {
       const out = await svc.upload(v, 'unlisted', async () => {
         seen = await read();
         return true;
-      });
+      }, 1);
       expect(out.videoId).toBe('abcdefghijk');
       expect(seen).toBe(SESSION);
       expect(await read()).toBe(SESSION);
@@ -364,9 +368,9 @@ maybe('ролики против живого Postgres', () => {
         video_key: 'shorts/v/video.mp4',
         captions: { telegram: 't', vk: 'v', youtube: { title: 'T', description: 'D', tags: [] } },
       });
-      await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'youtube', 'publishing')`, [v.id]);
+      await pool.query(`INSERT INTO short_publication (short_id, platform, status, attempts) VALUES ($1, 'youtube', 'publishing', 1)`, [v.id]);
       const a = service([reply(400, { error: 'invalid_grant', error_description: 'revoked' })]);
-      await a.svc.upload(v, 'unlisted', async () => true).catch(() => undefined);
+      await a.svc.upload(v, 'unlisted', async () => true, 1).catch(() => undefined);
       const acc = await pool.query('SELECT status, last_error FROM short_youtube_account');
       expect(acc.rows[0]).toEqual({ status: 'revoked', last_error: 'HTTP 400 invalid_grant: revoked' });
       await pool.query(
@@ -376,6 +380,310 @@ maybe('ролики против живого Postgres', () => {
       const b = service([]);
       await b.svc.notifyUploaded(v.id, 'public');
       expect(b.tg.sendMessage).toHaveBeenCalledWith(OWNER, 'Вышло на YouTube (публично): https://youtube.com/shorts/abcdefghijk', expect.anything());
+    });
+
+    /**
+     * Жетон попытки — attempts из захвата строки YouTube и ролика. Попытка A зависла дольше
+     * порога сторожа; ролик и строку взяла B. Записи A с её жетоном не должны проходить.
+     */
+    describe('жетон попытки', () => {
+      const CAPTIONS = { telegram: 't', vk: 'v', youtube: { title: 'T', description: 'D', tags: [] as string[] } };
+      const S_A = 'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=fence-a';
+      const S_B = 'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=fence-b';
+      const connect = () =>
+        pool.query(`INSERT INTO short_youtube_account (id, channel_id, refresh_token_enc) VALUES (1, 'UCx', $1)`, [encryptSecret('refresh-xyz')]);
+      const ytRow = async (id: string) =>
+        (await pool.query(`SELECT status, attempts, upload_session FROM short_publication WHERE short_id = $1 AND platform = 'youtube'`, [id])).rows[0];
+      const videoRow = async (id: string) => (await pool.query(`SELECT status, attempts, last_error FROM short_video WHERE id = $1`, [id])).rows[0];
+      const caught = (p: Promise<unknown>): Promise<any> => p.then(() => 'прошло', (e) => e);
+
+      it('вариант 1: строку держит B (жетон 2, её адрес) — у A YoutubeAttemptSuperseded, к Google ни запроса, строка B цела', async () => {
+        await connect();
+        const v = await insert({ status: 'publishing', attempts: 2, video_key: 'shorts/v/video.mp4', captions: CAPTIONS });
+        await pool.query(
+          `INSERT INTO short_publication (short_id, platform, status, attempts, upload_session) VALUES ($1, 'youtube', 'publishing', 2, $2)`,
+          [v.id, S_B],
+        );
+        const { svc, http } = service([]);
+        expect(await caught(svc.upload({ ...v, attempts: 1 }, 'unlisted', async () => true, 1))).toBeInstanceOf(YoutubeAttemptSuperseded);
+        expect(http).not.toHaveBeenCalled();
+        expect(await ytRow(v.id)).toEqual({ status: 'publishing', attempts: 2, upload_session: S_B });
+      });
+
+      it('захват сессии проигран: пока A начинала сессию, строку захватила B — адрес не записан, файла нет', async () => {
+        await connect();
+        const v = await insert({ status: 'publishing', attempts: 1, video_key: 'shorts/v/video.mp4', captions: CAPTIONS });
+        await pool.query(`INSERT INTO short_publication (short_id, platform, status, attempts) VALUES ($1, 'youtube', 'publishing', 1)`, [v.id]);
+        const { svc, http } = service([
+          reply(200, { access_token: 'a' }),
+          async () => {
+            await pool.query(`UPDATE short_publication SET attempts = 2 WHERE short_id = $1 AND platform = 'youtube'`, [v.id]);
+            return reply(200, {}, { location: S_A });
+          },
+        ]);
+        expect(await caught(svc.upload(v, 'unlisted', async () => true, 1))).toBeInstanceOf(YoutubeAttemptSuperseded);
+        expect(http.mock.calls.map(([req]) => req.method)).toEqual(['POST', 'POST']); // токен и начало сессии, PUT файла нет
+        expect(await ytRow(v.id)).toEqual({ status: 'publishing', attempts: 2, upload_session: null });
+      });
+
+      it('старая попытка не трогает чужое: живость перед файлом — false, отказ не записан, итог ролика не проходит', async () => {
+        const v = await insert({
+          status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() - 60_000),
+          video_key: 'shorts/v/video.mp4', captions: CAPTIONS,
+        });
+        await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'youtube', 'pending')`, [v.id]);
+        const seen: { fence?: number; alive?: boolean } = {};
+        const youtube = {
+          uploadPlan: async () => ({ kind: 'upload', privacy: 'unlisted' }),
+          upload: async (_v: any, _p: any, keepAlive: () => Promise<boolean>, fence: number) => {
+            seen.fence = fence;
+            // Пока A висела, сторож вернул ролик в очередь, и ролик и строку захватила B.
+            await pool.query(`UPDATE short_video SET attempts = 2 WHERE id = $1`, [v.id]);
+            await pool.query(`UPDATE short_publication SET attempts = 2 WHERE short_id = $1 AND platform = 'youtube'`, [v.id]);
+            seen.alive = await keepAlive();
+            throw new YoutubeNotUploaded('начало загрузки: HTTP 403 quotaExceeded: quota', 403);
+          },
+          notifyUploaded: jest.fn(async () => undefined),
+        };
+        const settings = { get: async () => ({ platforms: ['youtube'], tgChannelChatId: null }) };
+        const publisher = new ShortsPublisherService(pgLike() as any, {} as any, {} as any, settings as any, youtube as any);
+        await publisher.publish(v.id);
+        expect(seen).toEqual({ fence: 1, alive: false });
+        const held = { status: 'publishing', attempts: 2, last_error: null };
+        expect(await videoRow(v.id)).toEqual(held);
+        expect(await ytRow(v.id)).toEqual({ status: 'publishing', attempts: 2, upload_session: null });
+        // Итог ролика с жетоном A тоже не проходит.
+        const stale = { ...v, status: 'publishing' as const, attempts: 1 };
+        await (publisher as any).finishAttempt(stale, 'публикация: старая попытка');
+        await (publisher as any).settle(stale, ['youtube']);
+        expect(await videoRow(v.id)).toEqual(held);
+        expect(youtube.notifyUploaded).not.toHaveBeenCalled();
+        // С жетоном B тот же запрос проходит: отказ A — от жетона, а не от сломанного SQL.
+        await (publisher as any).finishAttempt({ ...stale, attempts: 2 }, 'публикация: попытка B');
+        expect(await videoRow(v.id)).toEqual({ status: 'approved', attempts: 2, last_error: 'публикация: попытка B' });
+      });
+
+      it('исход Telegram неизвестен — живой SQL: строка и ролик в failed одним запросом; строку взяла другая попытка — не трогаем ни её, ни ролик', async () => {
+        const mk = (minutesAgo: number) =>
+          insert({
+            status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() - minutesAgo * 60_000),
+            video_key: 'shorts/v/video.mp4', cover_key: 'shorts/v/cover.jpg', captions: CAPTIONS,
+          });
+        const tgRow = async (id: string) =>
+          (await pool.query(`SELECT status, attempts FROM short_publication WHERE short_id = $1 AND platform = 'telegram'`, [id])).rows[0];
+        const storage = { download: jest.fn(async () => Buffer.from('bytes')) };
+        const settings = { get: async () => ({ platforms: ['telegram'], tgChannelChatId: '-1001000000001' }) };
+        const publisherWith = (sendVideo: () => Promise<any>) =>
+          new ShortsPublisherService(pgLike() as any, { sendVideo: jest.fn(sendVideo) } as any, storage as any, settings as any);
+
+        const a = await mk(1);
+        await publisherWith(async () => {
+          throw new Error('socket hang up');
+        }).publish(a.id);
+        expect(await tgRow(a.id)).toEqual({ status: 'failed', attempts: 1 });
+        expect(await videoRow(a.id)).toMatchObject({ status: 'failed', attempts: 1, last_error: expect.stringMatching(/^публикация: telegram: пост мог выйти/) });
+
+        const b = await mk(2);
+        await publisherWith(async () => {
+          await pool.query(`UPDATE short_publication SET attempts = 2 WHERE short_id = $1 AND platform = 'telegram'`, [b.id]);
+          throw new Error('socket hang up');
+        }).publish(b.id);
+        expect(await tgRow(b.id)).toEqual({ status: 'publishing', attempts: 2 });
+        expect(await videoRow(b.id)).toEqual({ status: 'publishing', attempts: 1, last_error: null });
+      });
+
+      it('исход Telegram неизвестен, а ролик посреди отправки вернула в очередь устаревшая попытка — живой SQL: строка своя, ролик гасится в failed, второго поста нет', async () => {
+        const v = await insert({
+          status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() - 60_000),
+          video_key: 'shorts/v/video.mp4', cover_key: 'shorts/v/cover.jpg', captions: CAPTIONS,
+        });
+        const storage = { download: jest.fn(async () => Buffer.from('bytes')) };
+        const settings = { get: async () => ({ platforms: ['telegram'], tgChannelChatId: '-1001000000001' }) };
+        const sendVideo = jest.fn(async () => {
+          // Устаревший finishAttempt с обнулённым и совпавшим жетоном ролика вернул ролик в очередь.
+          await pool.query(`UPDATE short_video SET status = 'approved' WHERE id = $1`, [v.id]);
+          throw new Error('socket hang up');
+        });
+        const publisher = new ShortsPublisherService(pgLike() as any, { sendVideo } as any, storage as any, settings as any);
+        await publisher.publish(v.id);
+        const row = (await pool.query(`SELECT status, last_error FROM short_publication WHERE short_id = $1 AND platform = 'telegram'`, [v.id])).rows[0];
+        expect(row.status).toBe('failed');
+        expect(row.last_error).toMatch(/^пост мог выйти/);
+        expect((await pool.query(`SELECT status, failed_from, failure_notified FROM short_video WHERE id = $1`, [v.id])).rows[0])
+          .toEqual({ status: 'failed', failed_from: 'publishing', failure_notified: false });
+        await publisher.publish(v.id); // следующий тик: ролик не в approved — в канал второй раз не уходит
+        expect(sendVideo).toHaveBeenCalledTimes(1);
+      });
+
+      it('исход Telegram неизвестен, а устаревший итог последней попытки уже перевёл ролик в failed с чужой причиной — живой SQL: причина «пост мог выйти», уведомление снова', async () => {
+        const v = await insert({
+          status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() - 60_000),
+          video_key: 'shorts/v/video.mp4', cover_key: 'shorts/v/cover.jpg', captions: CAPTIONS,
+        });
+        const storage = { download: jest.fn(async () => Buffer.from('bytes')) };
+        const settings = { get: async () => ({ platforms: ['telegram'], tgChannelChatId: '-1001000000001' }) };
+        const sendVideo = jest.fn(async () => {
+          // Устаревший finishAttempt последней попытки с совпавшим жетоном; владелец о нём уже уведомлён.
+          await pool.query(
+            `UPDATE short_video SET status = 'failed', failed_from = 'publishing', last_error = 'публикация: telegram: publishing',
+                    failure_notified = true WHERE id = $1`,
+            [v.id],
+          );
+          throw new Error('socket hang up');
+        });
+        const publisher = new ShortsPublisherService(pgLike() as any, { sendVideo } as any, storage as any, settings as any);
+        await publisher.publish(v.id);
+        const row = (await pool.query(`SELECT status, failed_from, failure_notified, last_error FROM short_video WHERE id = $1`, [v.id])).rows[0];
+        expect(row).toMatchObject({ status: 'failed', failed_from: 'publishing', failure_notified: false });
+        expect(row.last_error).toContain(POST_MAY_BE_OUT);
+        expect((await pool.query(`SELECT status FROM short_publication WHERE short_id = $1 AND platform = 'telegram'`, [v.id])).rows[0].status).toBe('failed');
+      });
+
+      it('исход Telegram неизвестен, а ролик упал на другом этапе (пересъёмка после устаревшего возврата) — живой SQL: ролик не тронут, строка в failed', async () => {
+        const v = await insert({
+          status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() - 60_000),
+          video_key: 'shorts/v/video.mp4', cover_key: 'shorts/v/cover.jpg', captions: CAPTIONS,
+        });
+        const storage = { download: jest.fn(async () => Buffer.from('bytes')) };
+        const settings = { get: async () => ({ platforms: ['telegram'], tgChannelChatId: '-1001000000001' }) };
+        const sendVideo = jest.fn(async () => {
+          // Устаревший возврат в очередь → «Переснять» (leave: approved_at = NULL) → пересъёмка упала.
+          await pool.query(
+            `UPDATE short_video SET status = 'failed', failed_from = 'directing', approved_at = NULL,
+                    last_error = 'режиссёр: релей молчит', failure_notified = true WHERE id = $1`,
+            [v.id],
+          );
+          throw new Error('socket hang up');
+        });
+        const publisher = new ShortsPublisherService(pgLike() as any, { sendVideo } as any, storage as any, settings as any);
+        await publisher.publish(v.id);
+        expect((await pool.query(`SELECT status, failed_from, last_error, failure_notified FROM short_video WHERE id = $1`, [v.id])).rows[0])
+          .toEqual({ status: 'failed', failed_from: 'directing', last_error: 'режиссёр: релей молчит', failure_notified: true });
+        expect((await pool.query(`SELECT status FROM short_publication WHERE short_id = $1 AND platform = 'telegram'`, [v.id])).rows[0].status).toBe('failed');
+      });
+
+      it('набор: запись manual_pending — с жетоном строки; строку, которую тем временем захватила новая попытка, не переписывает (живой SQL)', async () => {
+        const mk = (minutesAgo: number) =>
+          insert({
+            status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() - minutesAgo * 60_000),
+            video_key: 'shorts/v/video.mp4', captions: CAPTIONS,
+          });
+        const kitRow = async (id: string) =>
+          (await pool.query(`SELECT status, attempts, external_id FROM short_publication WHERE short_id = $1 AND platform = 'youtube'`, [id])).rows[0];
+        const storage = { download: jest.fn(async () => Buffer.from('bytes')) };
+        const settings = { get: async () => ({ platforms: ['youtube'], tgChannelChatId: null }) };
+        // Без сервиса YouTube публикатор шлёт набор.
+        const publisherWith = (sendMessage: () => Promise<any>) =>
+          new ShortsPublisherService(
+            pgLike() as any,
+            { sendDocument: jest.fn(async () => ({ message_id: 601 })), sendMessage: jest.fn(sendMessage) } as any,
+            storage as any,
+            settings as any,
+          );
+
+        const a = await mk(1);
+        await publisherWith(async () => ({ message_id: 602 })).publish(a.id);
+        expect(await kitRow(a.id)).toEqual({ status: 'manual_pending', attempts: 1, external_id: '602' });
+        expect((await videoRow(a.id)).status).toBe('published');
+
+        const b = await mk(2);
+        await publisherWith(async () => {
+          await pool.query(`UPDATE short_publication SET attempts = attempts + 1 WHERE short_id = $1 AND platform = 'youtube'`, [b.id]);
+          return { message_id: 603 };
+        }).publish(b.id);
+        expect(await kitRow(b.id)).toEqual({ status: 'publishing', attempts: 2, external_id: null });
+      });
+
+      it('проигравшая попытка отдаёт свою строку: новая захватывает её, спрашивает YouTube о старом адресе (308 без Range), стирает и грузит заново — один PUT с файлом', async () => {
+        await connect();
+        await pool.query(`UPDATE short_settings SET youtube_mode = 'unlisted' WHERE id = 1`);
+        delete process.env.YOUTUBE_CHANNEL_ID;
+        const S_C = 'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=fence-c';
+        const v = await insert({
+          status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() - 60_000),
+          video_key: 'shorts/v/video.mp4', captions: CAPTIONS,
+        });
+        await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'youtube', 'pending')`, [v.id]);
+        const { svc, http, tg } = service([
+          // Попытка A: токен и начало сессии — в этот момент ролик взяла новая попытка B (строку YouTube — нет).
+          reply(200, { access_token: 'a' }),
+          async () => {
+            await pool.query(`UPDATE short_video SET attempts = attempts + 1 WHERE id = $1`, [v.id]);
+            return reply(200, {}, { location: S_A });
+          },
+          // Попытка C: токен, вопрос о сессии A (308 без Range — байтов нет), новая сессия, файл.
+          reply(200, { access_token: 'c' }),
+          reply(308),
+          reply(200, {}, { location: S_C }),
+          reply(201, { id: 'cccccccccc1' }),
+        ]);
+        const settings = { get: async () => ({ platforms: ['youtube'], tgChannelChatId: null }) };
+        const publisher = new ShortsPublisherService(pgLike() as any, {} as any, {} as any, settings as any, svc);
+
+        await publisher.publish(v.id); // A: адрес S_A лёг в строку, продление перед файлом не прошло
+        expect(await ytRow(v.id)).toEqual({ status: 'failed', attempts: 1, upload_session: S_A });
+        expect(await videoRow(v.id)).toMatchObject({ status: 'publishing', attempts: 2 });
+        // B строку YouTube не взяла (её держала A) и вернула ролик в очередь.
+        await pool.query(`UPDATE short_video SET status = 'approved' WHERE id = $1`, [v.id]);
+
+        await publisher.publish(v.id); // C
+        const calls = http.mock.calls.map(([req]) => req);
+        expect(calls.filter((r) => r.method === 'PUT' && Buffer.isBuffer(r.data)).map((r) => r.url)).toEqual([S_C]);
+        expect(calls.filter((r) => r.method === 'PUT' && !Buffer.isBuffer(r.data)).map((r) => [r.url, r.headers['Content-Range']]))
+          .toEqual([[S_A, 'bytes */11']]);
+        expect(await ytRow(v.id)).toEqual({ status: 'published', attempts: 2, upload_session: null });
+        expect(await videoRow(v.id)).toEqual({ status: 'published', attempts: 3, last_error: null });
+        // Сообщение о загрузке уходит без ожидания — ждём его, чтобы запрос не пережил тест.
+        for (let i = 0; i < 100 && !tg.sendMessage.mock.calls.length; i++) await new Promise((r) => setTimeout(r, 20));
+        expect(tg.sendMessage).toHaveBeenCalledWith(OWNER, expect.stringContaining('https://youtube.com/shorts/cccccccccc1'), expect.anything());
+      });
+
+      it('сторож вернул зависшую попытку в очередь — новая получает жетон 2, записи с жетоном 1 после этого не проходят', async () => {
+        await connect();
+        const v = await insert({
+          status: 'publishing', attempts: 1, approved_at: new Date(), slot_at: new Date(Date.now() - 60_000),
+          video_key: 'shorts/v/video.mp4', captions: CAPTIONS,
+        });
+        await pool.query(
+          `INSERT INTO short_publication (short_id, platform, status, attempts, upload_session) VALUES ($1, 'youtube', 'publishing', 1, $2)`,
+          [v.id, S_A],
+        );
+        await pool.query(`UPDATE short_video SET updated_at = now() - interval '11 minutes' WHERE id = $1`, [v.id]);
+        const stale = { ...v }; // попытка A: ролик в publishing, жетон 1
+        const fences: number[] = [];
+        const checks: Record<string, unknown> = {};
+        let publisher: ShortsPublisherService;
+        const youtube = {
+          uploadPlan: async () => ({ kind: 'upload', privacy: 'unlisted' }),
+          upload: async (_v: any, _p: any, keepAlive: () => Promise<boolean>, fence: number) => {
+            fences.push(fence);
+            // Посреди загрузки B просыпается A с жетоном 1.
+            checks.aliveA = await (publisher as any).keepAliveFenced(stale, 'youtube', 1);
+            checks.uploadA = await caught(service([]).svc.upload(stale, 'unlisted', async () => true, 1));
+            await (publisher as any).finishAttempt(stale, 'публикация: старая попытка');
+            checks.videoAfterA = await videoRow(v.id);
+            checks.aliveB = await keepAlive();
+            return { videoId: 'abcdefghijk', url: 'https://youtube.com/shorts/abcdefghijk', resumed: false };
+          },
+          notifyUploaded: jest.fn(async () => undefined),
+        };
+        const settings = { get: async () => ({ platforms: ['youtube'], tgChannelChatId: null }) };
+        publisher = new ShortsPublisherService(pgLike() as any, {} as any, {} as any, settings as any, youtube as any);
+
+        await publisher.rearmStuck();
+        expect((await videoRow(v.id)).status).toBe('approved');
+        expect(await ytRow(v.id)).toEqual({ status: 'failed', attempts: 1, upload_session: S_A });
+
+        await publisher.publish(v.id);
+        expect(fences).toEqual([2]);
+        expect(checks.aliveA).toBe(false);
+        expect(checks.uploadA).toBeInstanceOf(YoutubeAttemptSuperseded);
+        // Возврат в очередь от A не прошёл: у ролика B — причина сторожа, а не «старая попытка».
+        expect(checks.videoAfterA).toEqual({ status: 'publishing', attempts: 2, last_error: expect.stringMatching(/вернулся в очередь/) });
+        expect(checks.aliveB).toBe(true);
+        expect(await videoRow(v.id)).toEqual({ status: 'published', attempts: 2, last_error: null });
+        expect(await ytRow(v.id)).toEqual({ status: 'published', attempts: 2, upload_session: null });
+      });
     });
   });
 });

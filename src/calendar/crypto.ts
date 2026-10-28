@@ -1,9 +1,19 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
 
+const rawKey = (): string => process.env.CALENDAR_SECRET_KEY || '';
+
+/**
+ * Ключ шифрования есть и годится: не короче 32 знаков (AES-256 берёт первые 32). Правило одно
+ * на всех: без такого ключа encryptSecret и decryptSecret бросают, а вызывающие спрашивают его
+ * заранее, когда шаг до шифрования необратим (YouTube роликов — одноразовый код Google).
+ */
+export function hasSecretKey(): boolean {
+  return rawKey().length >= 32;
+}
+
 function key(): Buffer {
-  const k = process.env.CALENDAR_SECRET_KEY || '';
-  if (k.length < 32) throw new Error('CALENDAR_SECRET_KEY must be >= 32 chars');
-  return Buffer.from(k.slice(0, 32));
+  if (!hasSecretKey()) throw new Error('CALENDAR_SECRET_KEY must be >= 32 chars');
+  return Buffer.from(rawKey().slice(0, 32));
 }
 
 export function encryptSecret(plain: string): string {

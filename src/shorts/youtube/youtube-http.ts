@@ -80,3 +80,10 @@ export function googleReason(r: HttpResponse): string {
       : [err?.errors?.[0]?.reason, err?.message].filter(Boolean).join(': ');
   return clip(`HTTP ${r.status}${reason ? ` ${reason}` : ''}`, 300);
 }
+
+/** Код причины из тела ошибки Google (`error.errors[0].reason`), если он есть. */
+export function googleReasonCode(r: HttpResponse): string | null {
+  const err = r.data && typeof r.data === 'object' ? r.data.error : undefined;
+  const reason = err && typeof err === 'object' ? err.errors?.[0]?.reason : undefined;
+  return typeof reason === 'string' && reason ? reason : null;
+}

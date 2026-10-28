@@ -20,7 +20,7 @@ export class YoutubeNotUploaded extends Error {
   }
 }
 
-/** Файл ушёл, а ответа нет: ролик мог загрузиться. Новая загрузка — только после вопроса о сессии. */
+/** Файл ушёл, а ответа нет или он неоднозначен: ролик мог загрузиться. Новая загрузка — только после вопроса о сессии. */
 export class YoutubeMaybeUploaded extends Error {
   constructor(message: string, readonly status: number | null = null) {
     super(message);
@@ -36,6 +36,19 @@ export class YoutubeUploadExpired extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'YoutubeUploadExpired';
+  }
+}
+
+/**
+ * Попытка публикации больше не вправе слать на YouTube — ни файл, ни набор (жетоны — см.
+ * platform() в shorts-publisher.service.ts): строку или ролик взяла новая попытка или сторож,
+ * либо продление живости перед отправкой шло слишком долго. В чужую строку и чужой ролик
+ * такая попытка ничего не пишет; свою строку публикатор освобождает.
+ */
+export class YoutubeAttemptSuperseded extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'YoutubeAttemptSuperseded';
   }
 }
 
