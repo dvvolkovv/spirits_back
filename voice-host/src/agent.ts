@@ -28,6 +28,7 @@ import { ExternalRoomChat, type IncomingChat, type SendResult } from './external
 import { AttendeeAudioHub, AttendeeAudioInput, AttendeeAudioOutput, muteCommand } from './attendee-audio.js';
 import { botFailureReason } from './attendee-reason.js';
 import { OwnChatEcho } from './chat-echo.js';
+import { GUARD_TICK_MS, StuckGenerationGuard, attachResponseLog, realtimeOf } from './stuck-generation.js';
 import { Room as ExternalRoom } from '@livekit/rtc-node';
 import {
   answerTo,
@@ -1621,6 +1622,19 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
         // коду установленного SDK.
         ...(isMeeting ? { inputOptions: meetingInputOptions() } : {}),
       });
+
+      // СТОРОЖ ЗАВИСШЕГО ОТВЕТА (28.10.2026) — подробности в stuck-generation.ts.
+      //
+      // Ответ без response.done запирает плановое переоткрытие сокета плагина,
+      // и на двадцатой минуте ассистент глохнет до конца встречи — так прошли
+      // встречи 20.10 и 27.10. Ставим на ВСЕ сессии, не только встречи: замок
+      // в плагине общий, у звонка просто реже бывает прерванный ответ.
+      const startedRt = realtimeOf(session);
+      if (startedRt) attachResponseLog(startedRt);
+      const stuckGuard = new StuckGenerationGuard(() => realtimeOf(session));
+      // unref — по той же причине, что у всех таймеров здесь: иначе процесс
+      // задания не завершится после закрытия сессии.
+      setInterval(() => stuckGuard.check(Date.now()), GUARD_TICK_MS).unref?.();
 
       // СТОРОЖ ПУСТОГО ЗВОНКА (26.10.2026).
       //
