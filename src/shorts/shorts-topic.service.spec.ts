@@ -127,7 +127,7 @@ describe('ShortsTopicService.addManual', () => {
 
 describe('ShortsTopicService.refillWeek', () => {
   /** routes — доп. ответы по кусочку SQL; INSERT считается отдельно в inserted. */
-  function refillSetup(routes: Array<[string, any]>, agentsList: any[] = AGENTS) {
+  function refillSetup(routes: Array<[string, any]>, agentsList: any[] = AGENTS, settingsOver: Record<string, unknown> = {}) {
     const inserted: any[] = [];
     const query = jest.fn(async (sql: string, params: any[] = []) => {
       const hit = routes.find(([needle]) => sql.includes(needle));
@@ -138,8 +138,37 @@ describe('ShortsTopicService.refillWeek', () => {
       }
       return { rows: [] };
     });
-    return { svc: setup(fakeTx([]), query, agentsList), query, inserted };
+    return { svc: setup(fakeTx([]), query, agentsList, settingsOver), query, inserted };
   }
+
+  const EVERY_DAY = [1, 2, 3, 4, 5, 6, 7];
+  const MORE_AGENTS = [
+    ...AGENTS,
+    { id: 31, name: 'Ольга', description: 'Психолог — тревога, отношения и самооценка' },
+    { id: 32, name: 'Пётр', description: 'Финансы — бюджет, накопления и кредиты' },
+    { id: 33, name: 'Анна', description: 'Маркетолог — продвижение, контент и реклама' },
+  ];
+
+  it('слоты каждый день — доводит до семи тем, ключи недели 1..7, ассистенты разные', async () => {
+    const { svc, inserted } = refillSetup([["status = 'idea' AND source = 'catalog'", { rows: [{ n: 0 }] }]], MORE_AGENTS, { slotDays: EVERY_DAY });
+    // Ср 28.10 18:00 МСК — неделя 44.
+    const added = await svc.refillWeek(new Date('2026-10-28T15:00:00.000Z'));
+    expect(added).toBe(7);
+    expect(inserted.map((p) => p[4])).toEqual(EVERY_DAY.map((n) => `catalog:2026-W44:${n}`));
+    expect(new Set(inserted.map((p) => p[8])).size).toBe(7);
+  });
+
+  it('слоты каждый день, открыто четыре идеи — доводит до семи: позиции 5..7', async () => {
+    const { svc, inserted } = refillSetup([["status = 'idea' AND source = 'catalog'", { rows: [{ n: 4 }] }]], MORE_AGENTS, { slotDays: EVERY_DAY });
+    expect(await svc.refillWeek(new Date('2026-11-01T07:00:00.000Z'))).toBe(3);
+    expect(inserted.map((p) => p[4])).toEqual(['catalog:2026-W44:5', 'catalog:2026-W44:6', 'catalog:2026-W44:7']);
+  });
+
+  it('открытых идей больше, чем слотов в неделе (дни слотов сократили), — ничего не заводит', async () => {
+    const { svc, inserted } = refillSetup([["status = 'idea' AND source = 'catalog'", { rows: [{ n: 5 }] }]], MORE_AGENTS);
+    expect(await svc.refillWeek(new Date('2026-10-25T07:00:00.000Z'))).toBe(0);
+    expect(inserted).toHaveLength(0);
+  });
 
   it('открытых идей каталога уже три — ничего не заводит, до других запросов не доходит', async () => {
     const { svc, query, inserted } = refillSetup([

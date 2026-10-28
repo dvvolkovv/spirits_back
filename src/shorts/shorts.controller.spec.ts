@@ -35,7 +35,11 @@ function setup(answer: (sql: string, params: any[]) => any = () => ({ rows: [], 
     getClient: jest.fn(async () => client),
   };
   const settings = { get: jest.fn(async () => ({ slotDays: [2, 4, 6], format: 'chat' })), update: jest.fn(async (p: any) => p) };
-  const topics = { addManual: jest.fn(async () => ({ id: 'new' })), start: jest.fn(async (): Promise<any> => ({ id: ID, status: 'directing' })) };
+  const topics = {
+    addManual: jest.fn(async () => ({ id: 'new' })),
+    start: jest.fn(async (): Promise<any> => ({ id: ID, status: 'directing' })),
+    refillWeek: jest.fn(async () => 7),
+  };
   const storage = { publicUrl: jest.fn((b: string, k: string) => `https://minio.test/${b}/${k}`) };
   const ctl = new ShortsController(pg as any, settings as any, topics as any, storage as any);
   return { ctl, pg, client, settings, topics, storage };
@@ -84,6 +88,15 @@ describe('POST admin/shorts', () => {
     expect(topics.start).toHaveBeenCalledWith({ id: ID, force: true });
     topics.start.mockResolvedValueOnce(null);
     await expect(ctl.action({ action: 'start_now' }, res())).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('refill_topics — каталог недели сейчас, не дожидаясь воскресенья; ответ — сколько тем заведено', async () => {
+    const { ctl, topics } = setup();
+    const r = res();
+    await ctl.action({ action: 'refill_topics' }, r);
+    expect(topics.refillWeek).toHaveBeenCalledTimes(1);
+    expect(r.status).toHaveBeenCalledWith(200);
+    expect(r.body).toEqual({ added: 7 });
   });
 
   it('publish_now — только одобренный; занятый момент — 409 slot_taken', async () => {
