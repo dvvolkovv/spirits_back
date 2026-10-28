@@ -36,6 +36,8 @@ type RetryFrom = (typeof RETRY_FROM)[number];
  * Админка роликов: действия в одном POST, как admin/blog. Вкладка кабинета
  * появится в плане 3. На стенде это единственный способ запустить ролик
  * (`start_now`) и выпустить одобренный, не дожидаясь слота (`publish_now`).
+ * `refill_topics` — каталог недели сейчас, а не в воскресенье: после того как
+ * слотов в неделе стало больше или автозапуск только что включили.
  *
  * Записи статуса — с условием на статус, как везде в модуле: две вкладки
  * админки и кнопки в личке не перетирают решения друг друга.
@@ -86,6 +88,8 @@ export class ShortsController {
         }
         return res.status(200).json(v);
       }
+      case 'refill_topics':
+        return res.status(200).json({ added: await this.topics.refillWeek() });
       case 'publish_now':
         return res.status(200).json(await this.publishNow(String(data.id ?? '')));
       case 'mark_published':
