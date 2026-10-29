@@ -92,8 +92,18 @@ export const backend = {
     post<AskResult>('ask', { callId, specialist, question }),
   document: (callId: string, title: string, instructions: string, specialist?: string) =>
     post<DocumentResult>('document', { callId, title, instructions, specialist }),
-  complete: (callId: string, transcript: TranscriptEntry[], usage: CallUsage) =>
-    post<{ ok: true }>('complete', { callId, transcript, usage }),
+  /**
+   * Итоги звонка. `ending` — чем он кончился: причина ухода участника от
+   * LiveKit и причина закрытия сессии. Необязательное: бэкенд прежней версии
+   * поле проигнорирует, а разбор на его стороне неизвестное за прощание не
+   * выдаёт (src/voice-call/end-reason.ts).
+   */
+  complete: (
+    callId: string,
+    transcript: TranscriptEntry[],
+    usage: CallUsage,
+    ending?: { disconnect?: string; close?: string },
+  ) => post<{ ok: true }>('complete', { callId, transcript, usage, ending }),
   // Прогресс-флаш транскрипта во время звонка: сбой Realtime API / пересоздание сессии
   // не теряют уже сказанное. Не финализирует — бэкенд стейджит keep-longest (owner 2026-09-01).
   progress: (callId: string, transcript: TranscriptEntry[]) =>
