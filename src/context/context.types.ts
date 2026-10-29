@@ -10,7 +10,7 @@
  */
 
 export type SectionName =
-  | 'identity' | 'now' | 'today' | 'history'
+  | 'identity' | 'now' | 'today' | 'history' | 'continuation'
   | 'cloud_profile' | 'business' | 'device' | 'balance';
 
 export type ConsumerProfile = 'voice-launcher' | 'voice-web' | 'chat' | 'tg';
@@ -45,6 +45,13 @@ export interface BuiltContext {
  * правило приоритета из спеки §2.3: при расхождении верить устройству, а Neo4j
  * считать тем, что человек сам рассказывал в облачных чатах.
  *
+ * `continuation` — хвост разговора, который кончился только что, — стоит почти
+ * на самом верху и вытесняется лишь вместе с `now` и `identity`. Это не
+ * «ещё немного истории»: человек перезванивает после обрыва, продолжая ту же
+ * мысль, и потерять её значит заставить его пересказывать всё заново. Живой
+ * случай 28.10.2026 — разговор оборвался на 4-й минуте, перезвон через 20
+ * секунд, и ассистент не помнил ничего.
+ *
  * ⚠️ У `voice-web` секции `device` нет намеренно: у веба нет устройства, и
  * выжимка с чужого телефона туда попасть не может.
  */
@@ -52,6 +59,7 @@ export const PROFILES: Record<ConsumerProfile, Partial<Record<SectionName, Secti
   'voice-launcher': {
     now:           { rank: 100, budget: 250 },
     identity:      { rank: 90,  budget: 200 },
+    continuation:  { rank: 85,  budget: 1200 },
     today:         { rank: 80,  budget: 1200 },
     device:        { rank: 70,  budget: 1200 },
     cloud_profile: { rank: 60,  budget: 1200 },
@@ -62,6 +70,7 @@ export const PROFILES: Record<ConsumerProfile, Partial<Record<SectionName, Secti
   'voice-web': {
     now:           { rank: 100, budget: 250 },
     identity:      { rank: 90,  budget: 200 },
+    continuation:  { rank: 85,  budget: 1200 },
     today:         { rank: 80,  budget: 1200 },
     cloud_profile: { rank: 60,  budget: 1200 },
     business:      { rank: 50,  budget: 800 },
@@ -78,8 +87,13 @@ export const PROFILES: Record<ConsumerProfile, Partial<Record<SectionName, Secti
  *
  * Realtime платит за преамбулу в КАЖДОМ звонке, и она же растит задержку
  * первого ответа. Поэтому потолок общий, а не только посекционный.
+ *
+ * Поднят с 6000 вместе с появлением `continuation`: подхват занимает до 1200
+ * знаков, и при прежнем потолке он вытеснял бы `history` целиком. Полторы
+ * тысячи знаков — это примерно 375 токенов на звонок; разговор, начатый
+ * заново, стоит дороже.
  */
-export const TOTAL_BUDGET = 6000;
+export const TOTAL_BUDGET = 7500;
 
 /** Пояс по умолчанию, когда клиент свой не прислал. */
 export const FALLBACK_TZ = 'Asia/Yekaterinburg';
