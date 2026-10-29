@@ -28,6 +28,7 @@ import { ExternalRoomChat, type IncomingChat, type SendResult } from './external
 import { AttendeeAudioHub, AttendeeAudioInput, AttendeeAudioOutput, muteCommand } from './attendee-audio.js';
 import { botFailureReason } from './attendee-reason.js';
 import { OwnChatEcho } from './chat-echo.js';
+import { ListenMute } from './listen-mute.js';
 import { GUARD_TICK_MS, StuckGenerationGuard, attachResponseLog, realtimeOf } from './stuck-generation.js';
 import { Room as ExternalRoom } from '@livekit/rtc-node';
 import {
@@ -225,8 +226,14 @@ export default defineAgent({
       // Микрофон бота — следом за режимом, и только на мосту. Своя комната и
       // чужая комната Taler ID идут другим путём (см. спеку, пункт 4): там
       // вебсокета к боту нет вовсе.
-      if (isBridged) attendeeHub?.send(muteCommand(wasListening));
+      //
+      // Гасим не сразу, а после подтверждения вслух — см. listen-mute.ts.
+      if (wasListening) listenMute?.enter();
+      else listenMute?.leave();
     }
+    // attendeeHub заводится ниже по файлу — колбэк читает его в момент
+    // отправки, когда хаб уже есть.
+    const listenMute = isBridged ? new ListenMute((on) => attendeeHub?.send(muteCommand(on))) : null;
 
     await ctx.connect();
 
@@ -1122,6 +1129,8 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
     session.on(AgentSessionEventTypes.AgentStateChanged, (ev: AgentStateChangedEvent) => {
       const free = ev.newState === 'listening' || ev.newState === 'idle';
       pending.setBusy(!free);
+      // Конец подтверждения «слушаю» — момент погасить микрофон.
+      listenMute?.state(ev.newState);
       // Сначала коллеги, потом отложенное обращение: ответа специалиста уже
       // ждут вслух, а отложенный вопрос подождёт ещё один ход. flushDeferred
       // сам увидит занятость, если очередь коллег ход забрала.
