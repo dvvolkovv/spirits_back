@@ -671,3 +671,55 @@ describe('VoiceCallService.scheduleFor', () => {
     await expect(svc.scheduleFor('call-1')).resolves.toBe('');
   });
 });
+
+/**
+ * ⚠️ Чем кончился звонок — в базу, а не в лог.
+ *
+ * Перезвон после обрыва (спека §4.8) должен начинаться иначе, чем звонок
+ * после прощания. Решать это может только бэкенд, и только если причина до
+ * него доехала и сохранилась: следующий звонок — другой процесс, память
+ * воркера к тому времени не существует.
+ */
+describe('VoiceCallService.complete: отчего кончился разговор', () => {
+  const payload = (ending?: any): CompletePayload & { ending?: any } => ({
+    transcript: [{ role: 'user', text: 'привет', ts: 1 }],
+    usage: { audioInputTokens: 10, audioOutputTokens: 20, model: 'gpt-realtime' },
+    ...(ending ? { ending } : {}),
+  });
+  const finalUpdate = (d: any) =>
+    d.pg.query.mock.calls.find(([sql]: any[]) => /UPDATE voice_calls SET status = 'completed'/.test(sql));
+
+  it('⚠️ ГЛАВНОЕ: обрыв связи и положенная трубка различаются в базе', async () => {
+    const lost = makeDeps([]);
+    await new VoiceCallService(lost.pg as any, {} as any, lost.livekit as any)
+      .complete('call-1', payload({ disconnect: 'signal_close', close: 'participant_disconnected' }));
+
+    const hung = makeDeps([]);
+    await new VoiceCallService(hung.pg as any, {} as any, hung.livekit as any)
+      .complete('call-1', payload({ disconnect: 'client_initiated', close: 'participant_disconnected' }));
+
+    expect(finalUpdate(lost)![1]).toContain('lost');
+    expect(finalUpdate(hung)![1]).toContain('hangup');
+  });
+
+  it('сырая причина сохраняется рядом с вердиктом', async () => {
+    // Вердикт — наша догадка о смысле кодов, сырое — то, что сказал LiveKit.
+    // Если догадка окажется неверной, чинить надо отображение, а не ехать за
+    // данными, которых не записали.
+    const d = makeDeps([]);
+    await new VoiceCallService(d.pg as any, {} as any, d.livekit as any)
+      .complete('call-1', payload({ disconnect: 'signal_close', close: 'participant_disconnected' }));
+
+    const params = finalUpdate(d)![1].join(' ');
+    expect(params).toContain('signal_close');
+    expect(params).toContain('participant_disconnected');
+  });
+
+  it('⚠️ воркер прежней версии причины не шлёт — и это «неизвестно», а не «попрощался»', async () => {
+    const d = makeDeps([]);
+    await new VoiceCallService(d.pg as any, {} as any, d.livekit as any).complete('call-1', payload());
+
+    expect(finalUpdate(d)![1]).toContain('unknown');
+    expect(finalUpdate(d)![1]).not.toContain('hangup');
+  });
+});

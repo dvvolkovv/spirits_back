@@ -29,6 +29,7 @@ import { AttendeeAudioHub, AttendeeAudioInput, AttendeeAudioOutput, muteCommand 
 import { botFailureReason } from './attendee-reason.js';
 import { OwnChatEcho } from './chat-echo.js';
 import { ListenMute } from './listen-mute.js';
+import { disconnectName } from './ending.js';
 import { GUARD_TICK_MS, StuckGenerationGuard, attachResponseLog, realtimeOf } from './stuck-generation.js';
 import { Room as ExternalRoom } from '@livekit/rtc-node';
 import {
@@ -1420,6 +1421,29 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
     // может убить процесс раньше, чем колбэк доработает, и тогда транскрипт
     // теряется молча — так пропали разговоры на 11 и 20 минут.
     let sent = false;
+
+    /**
+     * ⚠️ Чем кончился звонок: человек положил трубку или связь порвалась.
+     *
+     * Сама сессия этого не знает — её CloseReason на оба случая отвечает
+     * `participant_disconnected`. Знает LiveKit: у уходящего участника есть
+     * СВОЯ причина, и `client_initiated` там отличается от `signal_close`.
+     * До 29.10.2026 её никто не забирал, и сервер считал обрыв прощанием:
+     * при перезвоне после обрыва Роман здоровался заново вместо «нас
+     * прервало» (разговор владельца 28.10.2026).
+     *
+     * Берём только собеседника — личность вида `user_<id>` выдаёт бэкенд при
+     * создании токена. Уход специалиста или бота встречи к тому, попрощался
+     * ли человек, отношения не имеет.
+     */
+    let userDisconnect: string | undefined;
+    let closeReason: string | undefined;
+    ctx.room.on(RoomEvent.ParticipantDisconnected, (p: any) => {
+      const who = String(p?.identity || '');
+      const why = disconnectName(p?.disconnectReason);
+      console.log(`участник ушёл: ${who || '?'} (${why ?? 'причина не пришла'})`);
+      if (who.startsWith('user_')) userDisconnect = why;
+    });
     // Прогресс-флаш транскрипта раз в 15с ВО ВРЕМЯ звонка: сбой Realtime API / пересоздание
     // сессии больше не теряют разговор — уже сказанное уходит на бэкенд ДО любого обрыва.
     // Бэкенд стейджит keep-longest; финальный complete берёт самый полный (owner 2026-09-01:
@@ -1438,12 +1462,17 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
       clearTimeout(warnAt);
       clearTimeout(hardStop);
       try {
-        await backend.complete(meta.callId, transcript, {
-          audioInputTokens: audioIn,
-          cachedAudioInputTokens: cachedAudioIn,
-          audioOutputTokens: audioOut,
-          model,
-        });
+        await backend.complete(
+          meta.callId,
+          transcript,
+          {
+            audioInputTokens: audioIn,
+            cachedAudioInputTokens: cachedAudioIn,
+            audioOutputTokens: audioOut,
+            model,
+          },
+          { disconnect: userDisconnect, close: closeReason },
+        );
         console.log(`complete отправлен (${why}), реплик: ${transcript.length}`);
       } catch (e) {
         console.error(`complete не отправлен (${why})`, e);
@@ -1531,7 +1560,14 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
 
     // Закрытие сессии — самый ранний надёжный сигнал: он приходит сразу после
     // того, как собеседник отключился, и процесс тогда ещё жив.
-    session.on(AgentSessionEventTypes.Close, () => { sessionClosed = true; void sendComplete('session_closed'); });
+    session.on(AgentSessionEventTypes.Close, (ev?: { reason?: string }) => {
+      sessionClosed = true;
+      // Причина закрытия сама по себе неразличима (`participant_disconnected`
+      // и на отбой, и на обрыв), но отделяет сбой сессии и наш предохранитель
+      // по времени от ухода собеседника. Раньше аргумент события отбрасывался.
+      closeReason = ev?.reason;
+      void sendComplete('session_closed');
+    });
     ctx.addShutdownCallback(async () => {
       await sendComplete('shutdown');
       // Чужую комнату закрываем сами: она не наша, и брошенный участник

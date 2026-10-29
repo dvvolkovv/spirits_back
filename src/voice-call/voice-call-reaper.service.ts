@@ -70,7 +70,8 @@ export class VoiceCallReaperService {
     try {
       const stale = await this.pg.query(
         `UPDATE voice_calls
-            SET status = 'interrupted', ended_at = now()
+            SET status = 'interrupted', ended_at = now(),
+                end_reason = 'reaped', end_raw = 'reaper:stale'
           WHERE status IN ('dialing', 'active')
             AND provider = 'linkeon'
             AND started_at < now() - ($1 || ' milliseconds')::interval
@@ -89,7 +90,8 @@ export class VoiceCallReaperService {
       // у которого просто ещё не было progress-флаша.
       const dead = await this.pg.query(
         `UPDATE voice_calls
-            SET status = 'interrupted', ended_at = now()
+            SET status = 'interrupted', ended_at = now(),
+                end_reason = 'reaped', end_raw = 'reaper:dead'
           WHERE status = 'dialing'
             AND provider = 'linkeon'
             AND started_at < now() - ($1 || ' milliseconds')::interval
@@ -104,7 +106,8 @@ export class VoiceCallReaperService {
 
       const staleMeetings = await this.pg.query(
         `UPDATE voice_calls
-            SET status = 'interrupted', ended_at = now()
+            SET status = 'interrupted', ended_at = now(),
+                end_reason = 'reaped', end_raw = 'reaper:meeting'
           WHERE status IN ('dialing', 'active')
             AND provider <> 'linkeon'
             AND started_at < now() - ($1 || ' milliseconds')::interval

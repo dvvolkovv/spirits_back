@@ -169,7 +169,13 @@ export class VoiceCallInternalController {
     @Req() req: Request,
   ) {
     const body = this.parseSigned<{ callId: string } & CompletePayload>(req, signature);
-    await this.calls.complete(body.callId, { transcript: body.transcript, usage: body.usage });
+    await this.calls.complete(body.callId, {
+      transcript: body.transcript,
+      usage: body.usage,
+      // Чем кончился звонок. Воркер прежней версии поля не пришлёт — тогда
+      // вердикт будет «неизвестно», а не «попрощался».
+      ending: body.ending,
+    });
     return { ok: true };
   }
 
