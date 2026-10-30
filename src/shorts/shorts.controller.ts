@@ -11,7 +11,8 @@ import { approveShortIntoSlot, isShortSlotConflict } from './short-slot-claim';
 import { ShortSettingsPatch, ShortsSettingsService, validateSettingsPatch } from './shorts-settings.service';
 import { ShortOrderError, ShortsTopicService } from './shorts-topic.service';
 import {
-  ShortPublication, ShortStatus, ShortVideo, appendOwnerNote, canTransition, retryTarget, rowToPublication, rowToShort, shortsBucket,
+  MAX_OWNER_NOTE_CHARS, ShortPublication, ShortStatus, ShortVideo, appendOwnerNote, canTransition, retryTarget, rowToPublication, rowToShort,
+  shortsBucket,
 } from './shorts.types';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -53,12 +54,12 @@ function withVersion(url: string, version: string | null): string {
 }
 
 /** Версия ролика из list/get — `updated_at::text` Postgres, например «2026-10-30 12:34:56.123456+00». */
-const VERSION_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d{1,6})?[+-]\d{2}(:\d{2})?$/;
+export const VERSION_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d{1,6})?[+-]\d{2}(:\d{2})?$/;
 const NEED_VERSION = 'нужна версия ролика (поле version из list или get)';
 const STALE_SHORT = 'Ролик изменился, пока был открыт: на экране устаревшая версия';
 const RELEASED_TEXT = 'Ролик уже вышел на площадке — переснять или отклонить нельзя';
 /** Коды Postgres для невозможной даты (месяц 13, 30 февраля, смещение +99): форма версии верна, значение — нет. */
-const BAD_TIMESTAMP_CODES = ['22007', '22008', '22009'];
+export const BAD_TIMESTAMP_CODES = ['22007', '22008', '22009'];
 
 /** Статус ролика словами — для отказов админки, без внутренних имён. */
 const STATUS_WORDS: Record<ShortStatus, string> = {
@@ -146,11 +147,11 @@ export class ShortsController {
       case 'refill_topics':
         return res.status(200).json({ added: await this.topics.refillWeek() });
       case 'approve':
-        return res.status(200).json(await this.versioned(() => this.approve(String(data.id ?? ''), data.version)));
+        return res.status(200).json(await this.versioned(data.version, () => this.approve(String(data.id ?? ''), data.version)));
       case 'redo':
-        return res.status(200).json(await this.versioned(() => this.leave(String(data.id ?? ''), 'directing', data.version)));
+        return res.status(200).json(await this.versioned(data.version, () => this.leave(String(data.id ?? ''), 'directing', data.version)));
       case 'note':
-        return res.status(200).json(await this.versioned(() => this.note(String(data.id ?? ''), data.text, data.version)));
+        return res.status(200).json(await this.versioned(data.version, () => this.note(String(data.id ?? ''), data.text, data.version)));
       case 'publish_now':
         return res.status(200).json(await this.publishNow(String(data.id ?? '')));
       case 'mark_published':
@@ -158,7 +159,7 @@ export class ShortsController {
       case 'retry':
         return res.status(200).json(await this.retry(String(data.id ?? ''), data.from, data.note));
       case 'reject':
-        return res.status(200).json(await this.versioned(() => this.reject(String(data.id ?? ''), data.version)));
+        return res.status(200).json(await this.versioned(data.version, () => this.reject(String(data.id ?? ''), data.version)));
       case 'get_settings':
         return res.status(200).json(await this.settings.get());
       case 'update_settings': {
@@ -368,11 +369,14 @@ export class ShortsController {
    * Регулярка версии проверяет только форму: «2026-13-45 12:34:56+00» она
    * пропустит, а Postgres ответит 22008. Это ошибка запроса (400), а не сервера.
    */
-  private async versioned<T>(work: () => Promise<T>): Promise<T> {
+  private async versioned<T>(rawVersion: unknown, work: () => Promise<T>): Promise<T> {
     try {
       return await work();
     } catch (e: any) {
-      if (BAD_TIMESTAMP_CODES.includes(e?.code)) throw new BadRequestException('version — метка версии из list или get');
+      const hasVersion = rawVersion !== undefined && rawVersion !== null && rawVersion !== '';
+      if (hasVersion && BAD_TIMESTAMP_CODES.includes(e?.code)) {
+        throw new BadRequestException('version — метка версии из list или get');
+      }
       throw e;
     }
   }
@@ -384,8 +388,8 @@ export class ShortsController {
       throw new ConflictException({ statusCode: 409, error: 'version_conflict', message: STALE_SHORT });
     }
     if (out.reason === 'released') {
-      // Одобрение и замечание «вышел» в записи не проверяют — до такого ролика сейчас не дойти,
-      // но и «этот — ждёт решения» в отказе было бы противоречием.
+      // Одобрение и замечание «вышел» в записи не проверяют, но сюда приводит устаревшая
+      // карточка: ролик тем временем одобрили в личке и опубликовали.
       throw new ConflictException(kind === 'leave' ? RELEASED_TEXT : 'Ролик уже вышел на площадке — решение по нему не принять');
     }
     const now = out.status ? STATUS_WORDS[out.status] : 'в неизвестном статусе';
@@ -404,7 +408,7 @@ export class ShortsController {
     try {
       approved = await approveShortIntoSlot(this.pg, v.id, v.slotAt, await this.settings.get(), undefined, version);
     } catch (e: any) {
-      if (e instanceof NoFreeSlotError) throw new ConflictException(`не одобрил: ${e.message}`);
+      if (e instanceof NoFreeSlotError) throw new ConflictException(`Не одобрил: ${e.message}`);
       throw e;
     }
     if (!approved) return this.refused('approve', await explainRefusal(this.pg, v.id, ['pending_review']));
@@ -423,7 +427,8 @@ export class ShortsController {
   /** Замечание к ролику, который ждёт решения: дописывается к прежним, ролик — к сценаристу. */
   private async note(id: string, rawText: unknown, rawVersion: unknown): Promise<ShortVideo> {
     const version = this.version(rawVersion, true);
-    const text = typeof rawText === 'string' ? rawText.trim() : '';
+    // Тело запроса — до 50 МБ: срезаем до разбора на символы; appendOwnerNote всё равно оставит MAX_OWNER_NOTE_CHARS.
+    const text = typeof rawText === 'string' ? rawText.slice(0, MAX_OWNER_NOTE_CHARS * 2).trim() : '';
     if (!text) throw new BadRequestException('text — замечание строкой');
     const v = await this.load(id);
     const out = await noteForReview(this.pg, v, text, version);
@@ -445,7 +450,7 @@ export class ShortsController {
     const version = this.version(rawVersion, false);
     if (v.status !== 'failed' || !canTransition(v.status, 'rejected')) {
       throw new ConflictException(
-        `отклонить можно упавший, ждущий решения или запланированный ролик, а он в статусе ${STATUS_WORDS[v.status] ?? v.status}`,
+        `Отклонить можно упавший, ждущий решения или запланированный ролик; этот — ${STATUS_WORDS[v.status] ?? v.status}. Обновите список.`,
       );
     }
     const params: any[] = [id];
@@ -461,14 +466,14 @@ export class ShortsController {
     // Почему не записалось — тем же чтением, что у решений по готовому ролику.
     const why = await explainRefusal(this.pg, id, ['failed']);
     if (why.reason === 'released') {
-      throw new ConflictException('ролик уже вышел на площадке — отклонить нельзя; оставшиеся площадки повторит «Повторить»');
+      throw new ConflictException('Ролик уже вышел на площадке — отклонить нельзя; оставшиеся площадки повторит «Повторить»');
     }
     if (why.reason === 'not_found') throw new NotFoundException('ролик не найден');
     // «stale» без версии — гонка (ролик ушёл из failed и вернулся), а не устаревшая карточка.
     if (why.reason === 'stale' && version) {
       throw new ConflictException({ statusCode: 409, error: 'version_conflict', message: STALE_SHORT });
     }
-    throw new ConflictException('ролик успел уйти из failed — обновите список');
+    throw new ConflictException('Ролик успел уйти из упавших — обновите список');
   }
 
   /** Ролик и его версия (`updated_at::text`) — для get: ею админка подписывает решения. */

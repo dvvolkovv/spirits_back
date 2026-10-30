@@ -37,6 +37,11 @@ export function chooseApprovalSlot(now: Date, planned: Date | null, schedule: Sc
  * на другой слот. `approved_at` отмечает, что ролик одобрял человек: только
  * такой можно вернуть в `approved` повтором публикации (`retryTarget`).
  *
+ * Счётчик попыток, аренда и ошибка обнуляются: до одобрения их вела отправка
+ * в личку, а дальше по тому же счётчику свой бюджет считает публикатор. Кнопка
+ * лички видит их уже обнулёнными (её показывает только удачная отправка), а
+ * админка может одобрить раньше — посреди отправки или после её сбоев.
+ *
  * `version` — версия ролика из админки (`updated_at::text`, short-review.ts):
  * запись пройдёт, только если ролик с тех пор не менялся. Кнопка лички её не
  * передаёт — её сторожит «кнопка под текущим сообщением», и SQL для неё прежний.
@@ -60,7 +65,8 @@ export async function approveShortIntoSlot(
         const params: any[] = [id, slot.toISOString()];
         const clause = versionClause(params, version);
         const r = await tx.query(
-          `UPDATE short_video SET status = 'approved', slot_at = $2, approved_at = now(), updated_at = now()
+          `UPDATE short_video SET status = 'approved', slot_at = $2, approved_at = now(),
+                  attempts = 0, lease_until = NULL, last_error = NULL, updated_at = now()
             WHERE id = $1 AND status = 'pending_review'${clause}`,
           params,
         );
