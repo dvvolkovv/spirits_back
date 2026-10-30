@@ -1,13 +1,18 @@
 import { clockRedis } from '../auth/fake-redis.forspec';
-import { GUEST_CARRY_MAX_CHARS, guestCarryKey, putGuestCarry, renderGuestCarry, takeGuestCarry } from './guest-carry';
+import { GUEST_CARRY_MAX_CHARS, dropGuestCarry, guestCarryKey, peekGuestCarry, putGuestCarry, renderGuestCarry } from './guest-carry';
 
 describe('приписка о пробе', () => {
-  it('кладётся на сутки и забирается один раз', async () => {
+  it('кладётся на сутки, читается без списания и стирается отдельной командой', async () => {
     const r = clockRedis();
     await putGuestCarry(r, 'u1', '12', 'текст');
     expect(await r.ttl(guestCarryKey('u1', '12'))).toBe(24 * 3600);
-    expect(await takeGuestCarry(r, 'u1', '12')).toBe('текст');
-    expect(await takeGuestCarry(r, 'u1', '12')).toBeNull();
+    // peek — только чтение: повторный вызов видит то же самое, ничего не стирая.
+    expect(await peekGuestCarry(r, 'u1', '12')).toBe('текст');
+    expect(await peekGuestCarry(r, 'u1', '12')).toBe('текст');
+    await dropGuestCarry(r, 'u1', '12');
+    expect(await peekGuestCarry(r, 'u1', '12')).toBeNull();
+    // Стереть несуществующий ключ — не ошибка (как DEL в Redis).
+    await expect(dropGuestCarry(r, 'u1', '12')).resolves.toBeUndefined();
   });
 
   it('пересказ: кто что сказал, без повторного приветствия', () => {

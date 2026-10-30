@@ -43,6 +43,7 @@ const OLD_SECRET = process.env.JWT_SECRET;
 const realSetTimeout = global.setTimeout;
 beforeAll(() => {
   process.env.JWT_SECRET = 'guest-carry-spec';
+  // persistResponse ставит таймер очистки dedup-карты; без unref jest не выходит.
   (global as any).setTimeout = (fn: any, ms?: number, ...a: any[]) => {
     const t: any = (realSetTimeout as any)(fn, ms, ...a);
     if (t && typeof t.unref === 'function') t.unref();
@@ -76,7 +77,7 @@ function harness(withRedis = true) {
     for (let i = 0; i < 30; i++) await new Promise((r) => setImmediate(r));
     return fieldsOf(post.mock.calls[0][1]).message;
   };
-  return { run, redis };
+  return { run, redis, svc };
 }
 
 describe('streamUniversalAgent: приписка о пробе', () => {
@@ -102,6 +103,68 @@ describe('streamUniversalAgent: приписка о пробе', () => {
     const message = await h.run('Привет');
     expect(message.endsWith('Привет')).toBe(true);
     expect(message).not.toContain('Разговор до входа');
+  });
+});
+
+/**
+ * Ревью A9 (I1): приписку нельзя списывать в момент ЧТЕНИЯ. Если списать
+ * сразу (как делал старый takeGuestCarry = get+del), два сценария теряют
+ * пересказ навсегда:
+ *   — наш же тайм-аут сдался, а Redis в итоге ответил ПОСЛЕ него: del всё
+ *     равно улетел бы по зомби-промису, хотя приписка в реплику не попала;
+ *   — приписку успели прочитать, а релей ход не принял (сеть, 5xx, протухшая
+ *     сессия) — пересказ исчез бы, хотя человек его так и не увидел, и это
+ *     ровно первый разговор после регистрации.
+ * Поэтому: читаем (peek) ДО похода к релею, а стираем (drop) только из
+ * успешной ветки persistResponse — и ни разу раньше.
+ */
+describe('streamUniversalAgent: приписка — читаем раньше, стираем после успеха', () => {
+  it('Redis завис на чтении — ход не ждёт дольше тайм-аута и не стирает приписку', async () => {
+    const h = harness();
+    const del = jest.fn(async () => {});
+    // Висит вечно — withTimeout обязан сдаться сам, не дожидаясь ответа.
+    (h.svc as any).redis = { get: jest.fn(() => new Promise(() => {})), set: jest.fn(), del };
+    const t0 = Date.now();
+    const message = await h.run('Привет');
+    expect(Date.now() - t0).toBeLessThan(2500);
+    expect(message).not.toContain('Разговор до входа');
+    expect(del).not.toHaveBeenCalled();
+  }, 4000);
+
+  it('Redis ответил ПОСЛЕ тайм-аута чтения — DEL всё равно не зовётся', async () => {
+    const h = harness();
+    const del = jest.fn(async () => {});
+    let resolveGet: (v: string | null) => void = () => {};
+    const getPromise = new Promise<string | null>((resolve) => { resolveGet = resolve; });
+    (h.svc as any).redis = { get: jest.fn(() => getPromise), set: jest.fn(), del };
+    // К моменту, когда run() вернётся, наш тайм-аут (GUEST_CARRY_READ_TIMEOUT_MS) уже сдался.
+    const message = await h.run('Привет');
+    expect(message).not.toContain('Разговор до входа');
+    // Redis наконец отвечает — зомби-промис не должен запускать del задним числом.
+    resolveGet('--- Разговор до входа ---\nОпоздавший ответ Redis');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(del).not.toHaveBeenCalled();
+  }, 4000);
+
+  it('релей не принял ход — приписка остаётся в Redis для следующей попытки', async () => {
+    const h = harness();
+    const del = jest.spyOn(h.redis, 'del');
+    await h.redis.set(guestCarryKey('u-test', '12'), 'ПРИПИСКА', 3600);
+    (axios.post as jest.Mock).mockRejectedValueOnce(new Error('ECONNREFUSED'));
+    const message = await h.run('Привет');
+    expect(message).toContain('ПРИПИСКА'); // в исходящий запрос попала — его просто не приняли
+    expect(del).not.toHaveBeenCalled();
+    expect(h.redis.peek(guestCarryKey('u-test', '12'))).toBe('ПРИПИСКА');
+  });
+
+  it('успешный ход — приписка стирается после ответа', async () => {
+    const h = harness();
+    const del = jest.spyOn(h.redis, 'del');
+    await h.redis.set(guestCarryKey('u-test', '12'), 'ПРИПИСКА', 3600);
+    const message = await h.run('Привет');
+    expect(message).toContain('ПРИПИСКА');
+    expect(del).toHaveBeenCalledWith(guestCarryKey('u-test', '12'));
+    expect(h.redis.peek(guestCarryKey('u-test', '12'))).toBeNull();
   });
 });
 
