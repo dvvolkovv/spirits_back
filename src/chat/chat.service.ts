@@ -36,6 +36,8 @@ import { RelayOutputFile, collectOutputFiles, outputFileLines, storeRelayLinks }
 import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
+import { UserLlmProviderService } from '../common/services/user-llm-provider.service';
+import { readDoneProvider, relayProviderFields, resolveAnswerProvider } from './answer-provider';
 import axios from 'axios';
 import { Request, Response } from 'express';
 import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
@@ -458,6 +460,9 @@ export class ChatService {
     // @Optional по той же причине, что chatFiles; что модуль подключён,
     // сторожит chat.product-actions-wiring.spec.ts.
     @Optional() private readonly productActions?: ProductActionsService,
+    // Модель ответов человека (админка, spec 2026-10-30-llm-provider-switch).
+    // Последним и @Optional по той же причине, что chatFiles.
+    @Optional() private readonly llmProvider?: UserLlmProviderService,
   ) {}
 
   /**
@@ -1215,6 +1220,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
       }, PING_MS);
 
       try {
+        // Модель ответов человека (админка): 'qwen' — сразу Qwen; проба — только Claude.
+        const mashaProvider = await resolveAnswerProvider(probe, userId, this.llmProvider);
         const r = await this.claudeCli.textWithCost(fullPrompt, {
           // Блок про продукты встаёт ДО волатильной части и хвоста языка:
           // требование языка обязано остаться последней строкой (см.
@@ -1231,6 +1238,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           model: probe ? PROBE_MODEL : CHAT_MODEL,
           // Пинг мониторинга меряет путь Claude — без запасного Qwen.
           noFallback: probe,
+          ...(mashaProvider === 'qwen' ? { provider: 'qwen' as const } : {}),
           // Бюджет хода — общий с релеем. Правка ждёт исхода внутри вызова
           // инструмента до PRODUCT_TOOL_WAIT_MS (2.5 мин) и может позвать его
           // повторно; прежние 90 с убивали бы CLI посреди ожидания — правка уже
@@ -1741,6 +1749,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const agentUsage: SdkUsageTotals = {
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
     };
+    // Модель ответов человека: 'qwen' — релей сразу идёт в Qwen; проба — только Claude.
+    const answerProvider = await resolveAnswerProvider(probe, userId, this.llmProvider);
     // Релей сообщил, что ход закончился БЕЗ финального ответа: упёрлись в потолок
     // шагов, ход прерван новым сообщением пользователя, отказ CLI или сбой связи.
     // Такой ход не тарифицируется — платить за пустоту пользователь не должен.
@@ -1748,6 +1758,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // в chat_quality: рост — это счёт, который мы оплачиваем в одиночку.
     let turnFailed = false;
     let failReason = '';
+    // Чем ответил релей (done.provider/fallback) — в chat_quality.
+    let turnProvider: 'claude' | 'qwen' | undefined;
+    let turnFallback = false;
 
     // Single persistence point — dedupe via `saved` flag so success and error paths
     // both call but only one actually writes.
@@ -1792,6 +1805,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
             lang_mismatch: this.looksLanguageMismatch(fullText, userLanguage, message),
             failed: turnFailed,
             fail_reason: failReason || undefined,
+            provider: turnProvider,
+            fallback: turnFallback || undefined,
           },
         });
       }
@@ -1946,6 +1961,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // 'default'. В обоих случаях ход проходит — просто пин не действует,
         // и узнать об этом можно только по modelUsage, не по ошибке.
         fd.append('model', probe ? PROBE_MODEL : CHAT_MODEL);
+        for (const [k, v] of Object.entries(relayProviderFields(probe, answerProvider))) fd.append(k, v);
 
         // Agent-direct TalerID: when the user connected the TalerID ecosystem, hand
         // the file-agent a full-scope access token + the MCP base URL of the env we
@@ -2023,6 +2039,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
                       safeWrite({ type: 'item', content: ev.text });
                     }
                   } else if (ev.type === 'done') {
+                    ({ provider: turnProvider, fallback: turnFallback } = readDoneProvider(ev));
                     if (ev.failed === true) {
                       turnFailed = true;
                       failReason = typeof ev.failReason === 'string' ? ev.failReason : 'unknown';

@@ -22,6 +22,8 @@ import { isStoreBuild } from './client-kind';
 import { toActivity } from './activity-map';
 import { RelayOutputFile, collectOutputFiles, outputFileLines } from './chat-files/relay-links';
 import { stripProductActionBlocks } from '../products/product-action-tail';
+import { UserLlmProviderService } from '../common/services/user-llm-provider.service';
+import { relayProviderFields, resolveAnswerProvider } from './answer-provider';
 
 // Потолок загрузки и зачем он именно такой — в upload-limits.ts, вместе с
 // самой константой (менять его можно только вместе с ОБОИМИ nginx).
@@ -35,6 +37,9 @@ export class ChatController {
     private readonly jwtSvc: JwtService,
     @Optional() private readonly neo4j: Neo4jService,
     @Optional() private readonly events?: EventsService,
+    // Модель ответов человека (админка, spec 2026-10-30-llm-provider-switch) —
+    // для хода с файлами. Последним и @Optional: спеки собирают контроллер позиционно.
+    @Optional() private readonly llmProvider?: UserLlmProviderService,
   ) {}
 
   /**
@@ -291,6 +296,10 @@ export class ChatController {
 
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
 
+    // Модель ответов человека — тот же выбор, что у текстового хода
+    // (streamUniversalAgent). Проб мониторинга у загрузки нет.
+    const answerProvider = await resolveAnswerProvider(false, userId, this.llmProvider);
+
     // Proxy file + message to remote agent server
     const FormData = require('form-data');
     const axios = require('axios');
@@ -313,6 +322,8 @@ export class ChatController {
     fd.append('products_mcp_url', handoff.products.products_mcp_url);
     // Инструменты Linkeon и папка хода — как у текстового хода (linkeon-relay-fields.ts).
     appendLinkeonFields(fd, handoff.linkeon);
+    // Выбор «Qwen» — релей сразу идёт в Qwen (answer-provider.ts).
+    for (const [k, v] of Object.entries(relayProviderFields(false, answerProvider))) fd.append(k, v);
 
     // Set streaming headers
     res.status(200);

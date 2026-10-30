@@ -125,6 +125,10 @@ export interface ClaudeCliOptions {
    *  с запасным путём они показывали бы «зелёный», когда Claude лежит. Сбой
    *  такого вызова предохранитель не открывает, успех — закрывает. */
   noFallback?: boolean;
+  /** Выбор пользователя в админке (UserLlmProviderService): 'qwen' — вызов
+   *  сразу на Qwen, без попытки Claude. Не авария: окно предохранителя и
+   *  fallbackStats не трогаются. Без ключа и при noFallback — обычный Claude. */
+  provider?: 'qwen';
 }
 
 @Injectable()
@@ -243,7 +247,7 @@ export class ClaudeCliService implements OnModuleInit {
     }
   }
 
-  private trackCallEvent(opts: { costUsd: number; model: string; durationMs: number; ok: boolean; provider: 'claude' | 'qwen' }) {
+  private trackCallEvent(opts: { costUsd: number; model: string; durationMs: number; ok: boolean; provider: 'claude' | 'qwen'; fallback: boolean }) {
     if (!this.pg) return;
     this.pg.query(
       `INSERT INTO events (name, props) VALUES ('claude_cli_call', $1::jsonb)`,
@@ -253,7 +257,7 @@ export class ClaudeCliService implements OnModuleInit {
         duration_ms: opts.durationMs,
         ok: opts.ok,
         provider: opts.provider,
-        fallback: opts.provider === 'qwen',
+        fallback: opts.fallback,
       })],
     ).catch((e: any) => this.logger.warn(`claude_cli_call event insert failed: ${e.message}`));
   }
@@ -311,6 +315,13 @@ export class ClaudeCliService implements OnModuleInit {
    */
   private async runRaw(prompt: string, opts: ClaudeCliOptions): Promise<CliRunResult> {
     const qwen = opts.noFallback ? null : readQwenFallbackConfig();
+    // Выбор пользователя (админка): ответы сразу через Qwen, без попытки Claude.
+    if (opts.provider === 'qwen') {
+      if (qwen) return this.runForcedQwen(prompt, opts, qwen);
+      if (!opts.noFallback) {
+        this.logger.warn('Qwen выбран для пользователя, но ключ QWEN_FALLBACK_API_KEY не задан — вызов идёт на Claude');
+      }
+    }
     if (qwen && Date.now() < this.breakerOpenUntil) {
       return this.runOnQwen(prompt, opts, qwen, null);
     }
@@ -390,6 +401,22 @@ export class ClaudeCliService implements OnModuleInit {
     return true;
   }
 
+  /** Принудительный Qwen (выбор пользователя): окно предохранителя и
+   *  fallbackStats не трогаются — это не авария, а выбор. */
+  private async runForcedQwen(
+    prompt: string,
+    opts: ClaudeCliOptions,
+    qwen: QwenFallbackConfig,
+  ): Promise<CliRunResult> {
+    try {
+      return await this.runOnce(prompt, opts, qwen, false);
+    } catch (qe: any) {
+      const qmsg = String(qe?.message ?? qe);
+      this.logger.error(`Qwen (выбран для пользователя) упал: ${qmsg.slice(0, 200)}`);
+      throw new Error(`claude CLI не вызывался (выбран Qwen) | qwen: ${qmsg}`);
+    }
+  }
+
   private async runOnQwen(
     prompt: string,
     opts: ClaudeCliOptions,
@@ -425,6 +452,7 @@ export class ClaudeCliService implements OnModuleInit {
     prompt: string,
     opts: ClaudeCliOptions,
     qwen: QwenFallbackConfig | null,
+    fallback: boolean = qwen !== null,
   ): Promise<CliRunResult> {
     // Одноразовые каталоги вызова (создаются только когда нужны — см. ниже):
     // копии вложений и конфиг MCP с токенами. Снимаются в finally — и на успехе,
@@ -433,7 +461,7 @@ export class ClaudeCliService implements OnModuleInit {
     // к этому моменту уже сняты.
     const perCallTmpDirs: string[] = [];
     try {
-      return await this.spawnClaude(prompt, opts, (dir) => { perCallTmpDirs.push(dir); }, qwen);
+      return await this.spawnClaude(prompt, opts, (dir) => { perCallTmpDirs.push(dir); }, qwen, fallback);
     } finally {
       for (const dir of perCallTmpDirs) {
         try { fs.rmSync(dir, { recursive: true, force: true }); }
@@ -469,6 +497,7 @@ export class ClaudeCliService implements OnModuleInit {
     opts: ClaudeCliOptions,
     registerTmpDir: (dir: string) => void,
     qwen: QwenFallbackConfig | null,
+    fallback: boolean,
   ): Promise<CliRunResult> {
     const requestedModel = opts.model ?? DEFAULT_MODEL;
     // На запасном пути в --model уходит модель Qwen: полный id Claude Alibaba не знает.
@@ -695,6 +724,7 @@ export class ClaudeCliService implements OnModuleInit {
             durationMs: streamDurationMs,
             ok: true,
             provider,
+            fallback,
           });
           // stripWordJoiner на выходе: U+2060, которым мы обезвреживали
           // @-упоминания во входе, не должен доехать до пользователя.
@@ -735,6 +765,7 @@ export class ClaudeCliService implements OnModuleInit {
             durationMs: Number(json.duration_ms) || 0,
             ok: true,
             provider,
+            fallback,
           });
           // В json-режиме вызов инструмента не виден: toolUsed всегда false,
           // осторожность — в mayRetryOnQwen по набору тулов и MCP.

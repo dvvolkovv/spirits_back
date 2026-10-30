@@ -14,6 +14,8 @@ import { withCrisisRule } from '../chat/crisis-rule';
 import { customAssistantHelpLine, telegramPlatformGuide } from '../chat/platform-guide';
 import { FACT_CHECK_RULE } from '../chat/fact-check-rule';
 import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
+import { UserLlmProviderService } from '../common/services/user-llm-provider.service';
+import { resolveAnswerProvider } from '../chat/answer-provider';
 
 /**
  * Дефолтный ассистент для лички, когда preferred_agent пуст или указывает на
@@ -99,6 +101,9 @@ export class TgRouterService {
     private readonly agents: AgentsService,
     private readonly claudeCli: ClaudeCliService,
     @Optional() private readonly neo4j?: Neo4jService,
+    // Модель ответов владельца (админка, spec 2026-10-30-llm-provider-switch).
+    // Последним и @Optional: спеки собирают роутер позиционно.
+    @Optional() private readonly llmProvider?: UserLlmProviderService,
   ) {}
 
   /**
@@ -691,9 +696,12 @@ ${LanguageService.buildDirective(replyLang)}`;
     // Цена: тяжёлые агентные ходы (сгенерировать договор, собрать финмодель)
     // стоили 30-65k токенов владельца ещё на Sonnet. Опус их умножает, поэтому
     // в tg-bot.service рядом со списанием стоит алерт на дорогой ход.
+    // Модель ответов владельца бота (админка, spec 2026-10-30-llm-provider-switch).
+    const ownerProvider = await resolveAnswerProvider(false, cfg.owner_user_id, this.llmProvider);
     const { text, costUsd } = await this.claudeCli.textWithCost(userPrompt, {
       system: systemWithCtx,
       model: CHAT_MODEL,
+      ...(ownerProvider === 'qwen' ? { provider: 'qwen' as const } : {}),
       timeoutMs: 0,
       attachments: attachmentPaths?.length ? attachmentPaths : undefined,
       onProgress,

@@ -137,6 +137,15 @@ describe('qwenSpawnEnv', () => {
     qwenSpawnEnv(base, cfg);
     expect(base).toEqual({ ANTHROPIC_API_KEY: 'old' });
   });
+
+  // Без этого Bash внутри хода на Qwen видит ANTHROPIC_AUTH_TOKEN (проверено
+  // 30.10 на CLI 2.1.280: `printenv … | wc -c` → 115 без флага, 0 с ним) —
+  // любой пользователь веб-чата может попросить ассистента выполнить env и
+  // унести ключ. Поверх своего значения в base — тоже должно стоять '1'.
+  it('ключ не виден подпроцессам инструментов (CLAUDE_CODE_SUBPROCESS_ENV_SCRUB)', () => {
+    expect(qwenSpawnEnv({}, cfg).CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('1');
+    expect(qwenSpawnEnv({ CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '0' }, cfg).CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('1');
+  });
 });
 
 describe('fallbackTimeoutMs', () => {

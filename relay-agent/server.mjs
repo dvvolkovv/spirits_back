@@ -1,4 +1,5 @@
 import express from "express";
+import * as qwen from "./qwen-provider.mjs";
 import multer from "multer";
 import cors from "cors";
 import { randomUUID } from "crypto";
@@ -310,6 +311,9 @@ function endRun(tag) {
 }
 
 const sweepRuns = () => reap(finishedRun(liveRuns)).then(logReaped, () => {});
+// Окно запасного Qwen и исходы аварийных ходов на нём — на весь процесс
+// (qwen-provider.mjs; spec spirits_back 2026-10-30-llm-provider-switch).
+const qwenBreaker = qwen.createQwenBreaker();
 setInterval(sweepRuns, 5 * 60 * 1000).unref();
 
 // Полные пути конфигов ИДУЩИХ ходов этого процесса — /chat добавляет при
@@ -443,6 +447,20 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   // ~/.local/bin/claude (его находит PATH процесса pm2), а не /usr/bin/claude.
   const MODELS = ["default", "haiku", "sonnet", "opus", "claude-opus-5-5"];
   const reqModel = MODELS.includes(String(req.body.model || "")) ? String(req.body.model) : "default";
+  // Qwen: принудительный (provider=qwen — выбор пользователя в админке бэкенда)
+  // и запасной (сбой доступа к Claude). Ключ — файлом, читается на каждом ходе:
+  // нет файла — Qwen выключен. noFallback=1 — пробы мониторинга, только Claude.
+  const qwenCfg = qwen.readQwenConfig();
+  const qwenForced = String(req.body.provider || "") === "qwen";
+  const reqNoFallback = String(req.body.noFallback || "") === "1";
+  if (qwenForced && !qwenCfg) console.warn("[qwen] provider=qwen, но ключа нет — ход на Claude");
+  let provider = qwen.pickProvider({ forced: qwenForced, cfg: qwenCfg, breakerOpen: qwenBreaker.isOpen(), noFallback: reqNoFallback });
+  // Аварийный ход на Qwen: через открытое окно или после сбоя Claude в этом ходе.
+  let usedFallback = provider === "qwen" && !qwenForced;
+  // Инструмент с последствиями в этом ходе — после него на Qwen не переигрываем.
+  let riskyToolUsed = false;
+  // Ход прерван новым сообщением той же сессии (preempt ниже).
+  let preempted = false;
   // Стабильная часть промпта (identity ассистента, его персона из БД, список
   // коллег) — постоянна для всей сессии: ключ сессии это "<телефон>_<агент>_<язык>",
   // при смене ассистента заводится другая сессия. Раньше бэкенд клеил её к КАЖДОЙ
@@ -756,10 +774,48 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   // одинаково, навсегда. Ловим и переигрываем с чистой сессии.
   const STALE_RESUME_RE = /No conversation found with session ID|session .* not found/i;
 
-  function runOnce(useResume) {
+  // Окно запасного Qwen открывается при сбое доступа к Claude и тогда, когда
+  // сам ход на Qwen не переигрывается (инструмент с последствиями, уже ушёл
+  // текст, ход прерван): следующие ходы пойдут сразу на Qwen. Пробы
+  // (noFallback) окно не трогают.
+  const qwenWindowOnly = (why) => {
+    if (!qwenCfg || reqNoFallback) return;
+    qwenBreaker.open(qwenCfg.breakerMs);
+    console.warn("[qwen] " + sessionId + ": Claude недоступен (" + why + ") — ход не повторяется, окно запасного Qwen открыто");
+  };
+  // Ход на Qwen после сбоя доступа к Claude: окно открывается, тот же ход
+  // (тот же --resume — беседа продолжается между провайдерами) идёт на Qwen.
+  const fallbackToQwen = (useResume, why) => {
+    qwenBreaker.open(qwenCfg.breakerMs);
+    console.warn("[qwen] " + sessionId + ": Claude недоступен (" + why + ") → запасной Qwen " + qwen.qwenModelFor(reqModel, qwenCfg.models));
+    provider = "qwen";
+    usedFallback = true;
+    return runOnce(useResume, "qwen");
+  };
+  // Запуск хода. Без провайдера — текущий провайдер хода: после переключения
+  // на Qwen повтор, перезапуск и продолжение идут на Qwen. Сбой доступа к
+  // Claude (accessFailHit, разбор result ниже) в ЛЮБОМ запуске — первом, после
+  // протухшего resume, повторе после временной ошибки, продолжении после
+  // потолка шагов — переигрывается на Qwen здесь: пропущенный, он дал бы
+  // пустой ход без уведомления. Кроме хода, прерванного новым сообщением или
+  // брошенного бэкендом: запуск на Qwen убил бы уже новый ход этой сессии
+  // (pre-empt ниже) или отвечал бы в закрытый канал.
+  async function runOnce(useResume, runProvider = provider) {
+    const r = await runProcessOnce(useResume, runProvider);
+    if (!r.accessFailHit) return r;
+    if (preempted || clientDisconnected) {
+      qwenWindowOnly("отказ CLI");
+      return r;
+    }
+    return fallbackToQwen(useResume, "отказ CLI");
+  }
+
+  function runProcessOnce(useResume, runProvider) {
     return new Promise((resolve) => {
       const resumeSid = useResume && sessionMap.has(sessionId) ? sessionMap.get(sessionId) : null;
-      const runArgs = resumeSid ? [...args, "--resume", resumeSid] : args;
+      const baseArgs = runProvider === "qwen" ? qwen.withModel(args, qwen.qwenModelFor(reqModel, qwenCfg.models)) : args;
+      const runArgs = resumeSid ? [...baseArgs, "--resume", resumeSid] : baseArgs;
+      const runStartedAt = Date.now();
       // Pre-empt: if a prior claude is still running for this sessionId,
       // kill it first. Two parallel `claude --resume <same>` processes race
       // on the JSONL session lock and neither makes progress.
@@ -784,7 +840,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
         cwd: "/tmp",
         stdio: ["pipe", "pipe", "pipe"],
         env: {
-          ...process.env, MCP_TIMEOUT: "120000", MCP_TOOL_TIMEOUT: "600000", PATH: process.env.PATH + ":/home/dv/agent-env/bin:/home/dv/.bun/bin:/home/dv/file-agent/bin",
+          ...(runProvider === "qwen" ? qwen.qwenSpawnEnv(process.env, qwenCfg) : process.env), MCP_TIMEOUT: "120000", MCP_TOOL_TIMEOUT: "600000", PATH: process.env.PATH + ":/home/dv/agent-env/bin:/home/dv/.bun/bin:/home/dv/file-agent/bin",
           // OpenMP по умолчанию берёт по потоку на ядро. 14.10.2026 модель
           // пустила tesseract в 4 параллельных копии — вышло 16 потоков на 4
           // ядрах, и страница распознавалась 3–9 минут.
@@ -797,16 +853,23 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       child.on("exit", () => endRun(tag));
       activeChildren.set(sessionId, {
         child,
-        preempt: () => notice(
-          "\n\n_(ответ прерван: вы отправили новое сообщение, и ассистент переключился на него. Токены за прерванный ход не списаны.)_",
-          "preempted",
-        ),
+        // preempted — сбой доступа в прерванном ходе на Qwen не переигрывается.
+        preempt: () => {
+          preempted = true;
+          notice(
+            "\n\n_(ответ прерван: вы отправили новое сообщение, и ассистент переключился на него. Токены за прерванный ход не списаны.)_",
+            "preempted",
+          );
+        },
       });
       child.stdin.write(prompt);
       child.stdin.end();
 
       let buf = "";
       let imageLimitHit = false;
+      let accessFailHit = false;
+      let transientAccessLike = false;
+      let sawResult = false;
       let transientHit = false;
       let maxTurnsHit = false;
       let staleResumeHit = false;
@@ -865,6 +928,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
           for (const block of (ev.message.content || [])) {
             if (block.type === "tool_use") {
               if (TALERID_WRITE_RE.test(block.name || "")) taleridWriteUsed = true;
+              if (!qwen.SIDE_EFFECT_FREE_TOOLS.has(block.name || "")) riskyToolUsed = true;
               const inp = typeof block.input === "string" ? block.input : JSON.stringify(block.input);
               if (!clientDisconnected) res.write("data: " + JSON.stringify({ type: "tool", tool: block.name, input: inp.slice(0, 300) }) + "\n\n");
             }
@@ -878,6 +942,22 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
           // Отказ CLI — не показываем сырой английский текст и не берём денег.
           // Проверяем ДО isErrorResult: «You've hit your session limit» приходил
           // и без is_error/api_error_status, обычным успешным result.
+          // Сбой доступа (qwen-provider.mjs): отказ CLI или ошибка, которую прежде
+          // закрывало уведомление cli_fatal (FATAL_RE: повтором не лечится, —
+          // например «API Error: 401 … OAuth token has expired»). У Claude до
+          // первого текста и без инструментов с последствиями ход переигрывается
+          // на Qwen, уведомление не шлём; иначе ход не повторяется, но окно
+          // открывается. Ошибка доступа, которую штатно повторяют (TRANSIENT_RE),
+          // — признак для решения после повтора (transientHit ниже).
+          const accessFailure = qwen.isAccessFailure(ev.result, { isError: isErrorResult, apiStatus: ev.api_error_status });
+          if (runProvider === "claude" && accessFailure && (qwen.looksLikeCliRefusal(ev.result) || FATAL_RE.test(ev.result))) {
+            if (qwen.mayFallback({ provider: runProvider, cfg: qwenCfg, noFallback: reqNoFallback, sentAnyText: streamedAny, riskyToolUsed })) {
+              accessFailHit = true;
+              return;
+            }
+            qwenWindowOnly("отказ CLI");
+          }
+          if (runProvider === "claude" && accessFailure && isErrorResult) transientAccessLike = true;
           if (FATAL_RE.test(ev.result)) {
             notice(fatalHint(ev.result), "cli_fatal");
             return;
@@ -896,6 +976,8 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
             transientHit = true;
             return;
           }
+          // Успех запуска — для окна запасного Qwen: ни ошибки, ни сбоя доступа.
+          if (!isErrorResult && !accessFailure) sawResult = true;
           if (!clientDisconnected) res.write("data: " + JSON.stringify({ type: "result", text: ev.result }) + "\n\n");
         }
       };
@@ -930,7 +1012,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
         }
         const cur = activeChildren.get(sessionId);
         if (cur && cur.child === child) activeChildren.delete(sessionId);
-        resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit });
+        resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, accessFailHit, transientAccessLike, sawResult, startedAt: runStartedAt });
       });
 
       child.on("error", (err) => {
@@ -1020,7 +1102,15 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       r = await runOnce(useResume);
       // If retry also fails transiently, surface a friendly message rather than raw error.
       if (r.transientHit) {
-        notice("_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_", "transient");
+        if (provider === "claude" && r.transientAccessLike) {
+          if (!preempted && !clientDisconnected &&
+              qwen.mayFallback({ provider, cfg: qwenCfg, noFallback: reqNoFallback, sentAnyText: streamedAny, riskyToolUsed })) {
+            r = await fallbackToQwen(useResume, "ошибка доступа после повтора");
+          } else {
+            qwenWindowOnly("ошибка доступа после повтора");
+          }
+        }
+        if (r.transientHit) notice("_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_", "transient");
       }
     }
 
@@ -1045,6 +1135,17 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
         "\n\n_(задача оказалась слишком большой даже для трёх заходов. Напишите «продолжай» — ассистент доведёт её до конца. Токены за незавершённый ход не списаны.)_",
         "max_turns",
       );
+    }
+
+    // Окно запасного Qwen: успех Claude, начатый после открытия окна, его
+    // закрывает; исход аварийного хода на Qwen идёт в статистику (сбой —
+    // закрывает). Не считаются: принудительный Qwen (выбор пользователя) и ходы
+    // с неизвестным исходом — прерванный новым сообщением, брошенный бэкендом,
+    // упёршийся в потолок шагов.
+    if (!preempted && !clientDisconnected && failReason !== "max_turns") {
+      const runOk = !!r.sawResult && !r.accessFailHit && !r.transientHit;
+      if (provider === "qwen" && usedFallback) qwenBreaker.qwenFinished(runOk);
+      else if (provider === "claude" && runOk) qwenBreaker.claudeSucceeded(r.startedAt);
     }
 
     // Ход закончился — смотрим, во что обошёлся его контекст, и решаем судьбу
@@ -1104,6 +1205,8 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
         usage: usageTotals,
         failed: turnFailed,
         failReason,
+        provider,
+        fallback: usedFallback,
       }) + "\n\n");
       res.end();
     } else if (filesOut.length) {
@@ -1143,7 +1246,7 @@ app.get("/session/:sid/files", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", sessions: sessionMap.size, uptime: process.uptime() });
+  res.json({ status: "ok", sessions: sessionMap.size, uptime: process.uptime(), qwen: { enabled: !!qwen.readQwenConfig(), ...qwenBreaker.stats() } });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
