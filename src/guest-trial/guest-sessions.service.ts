@@ -51,6 +51,9 @@ export class GuestSessionsService {
   async recordExchange(sessionId: string, human: string, ai: string, humanAt: Date, costUsd: number): Promise<number> {
     const r = await this.pg.query(
       `WITH ins AS (
+         -- Результат ins не читается — и не должен: модифицирующий CTE
+         -- выполняется как часть одного оператора независимо от того,
+         -- ссылается ли на него внешний запрос. Не удалять как «неиспользуемый».
          INSERT INTO guest_trial_messages (session_id, sender_type, content, created_at)
          VALUES ($1::uuid, 'human', $2, $4), ($1::uuid, 'ai', $3, now())
        )
@@ -94,13 +97,26 @@ export class GuestSessionsService {
     const s = await this.pg.query(
       `SELECT count(*) FILTER (WHERE created_at > now() - interval '1 day')::int AS trials_day,
               count(*) FILTER (WHERE created_at > now() - interval '7 days')::int AS trials_week,
-              coalesce(sum(answers) FILTER (WHERE created_at > now() - interval '1 day'), 0)::int AS answers_day,
-              coalesce(sum(answers) FILTER (WHERE created_at > now() - interval '7 days'), 0)::int AS answers_week,
               count(*) FILTER (WHERE claimed_at > now() - interval '1 day')::int AS claims_day,
-              count(*) FILTER (WHERE claimed_at > now() - interval '7 days')::int AS claims_week,
-              coalesce(sum(cost_usd) FILTER (WHERE created_at > now() - interval '1 day'), 0)::float AS cost_usd_day,
-              coalesce(sum(cost_usd) FILTER (WHERE created_at > now() - interval '7 days'), 0)::float AS cost_usd_week
+              count(*) FILTER (WHERE claimed_at > now() - interval '7 days')::int AS claims_week
          FROM guest_trial_sessions`,
+    );
+    /**
+     * answers_*/cost_usd_* — из событий guest_trial_answer (пишет ход гостя,
+     * задача A7: ts — момент ответа, props.cost_usd — его стоимость), а НЕ из
+     * guest_trial_sessions.answers/cost_usd по created_at пробы: проба может
+     * отвечать до 7 дней после создания, и привязка к created_at отнесла бы
+     * все её ответы на день создания пробы, а не на день самого ответа. Кроме
+     * того, после переноса пробы в аккаунт её сообщения стираются — строка
+     * guest_trial_sessions не остаётся надёжным источником истории ответов.
+     */
+    const a = await this.pg.query(
+      `SELECT count(*) FILTER (WHERE ts > now() - interval '1 day')::int AS answers_day,
+              count(*)::int AS answers_week,
+              coalesce(sum((props->>'cost_usd')::numeric) FILTER (WHERE ts > now() - interval '1 day'), 0)::float AS cost_usd_day,
+              coalesce(sum((props->>'cost_usd')::numeric), 0)::float AS cost_usd_week
+         FROM events
+        WHERE name = 'guest_trial_answer' AND ts > now() - interval '7 days'`,
     );
     const e = await this.pg.query(
       `SELECT name,
@@ -111,7 +127,13 @@ export class GuestSessionsService {
           AND ts > now() - interval '7 days'
         GROUP BY name`,
     );
-    const out: Record<string, number> = { ...s.rows[0] };
+    const out: Record<string, number> = { ...s.rows[0], ...a.rows[0] };
+    // Ключи есть всегда, даже без единого события — иначе админ-ручка то
+    // показывает ноль, то молчит про ключ вовсе, в зависимости от трафика.
+    for (const name of ['guest_trial_view', 'guest_trial_wall', 'guest_trial_closed']) {
+      out[`${name}_day`] = 0;
+      out[`${name}_week`] = 0;
+    }
     for (const row of e.rows) {
       out[`${row.name}_day`] = row.day;
       out[`${row.name}_week`] = row.week;
