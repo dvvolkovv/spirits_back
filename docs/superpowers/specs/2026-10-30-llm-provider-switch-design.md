@@ -190,7 +190,7 @@
 |---|---|
 | бэкенд `.env` | `QWEN_FALLBACK_API_KEY` — уже на проде |
 | релей | файл `/home/dv/file-agent/secrets/qwen.key` (600) или путь в `QWEN_KEY_FILE` |
-| бэкенд + релей, окружение процесса Qwen | `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` — без него ключ Alibaba виден подпроцессам инструментов (Bash: `printenv`/`env`); ставится в обоих `qwenSpawnEnv` (`src/common/services/qwen-fallback.ts`, `relay-agent/qwen-provider.mjs`), не в `.env` |
+| бэкенд + релей, окружение процесса Qwen | `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0` — явно. `=1` прятал бы ключ от подпроцессов инструментов, но на Linux требует bubblewrap: без `bwrap` (нет ни на проде, ни на релее) CLI падает сразу — так 30.10 после выката d4be19f8 сломался весь путь на Qwen. У бэкенда Bash нет; на релее ключ доступен Bash ассистента наравне с прочими секретами на диске — нужна песочница для Bash, отдельная задача |
 | бэкенд `.env` (test) | `RELAY_QWEN_MONITOR=off` — выключает алерт мониторинга релея там, где `AGENT_URL` указывает на боевой релей |
 | релей, `.gitignore` | `secrets/` — каталог с файлом ключа живёт внутри git-дерева релея |
 

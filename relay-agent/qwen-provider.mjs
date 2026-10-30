@@ -69,10 +69,13 @@ export function qwenSpawnEnv(base, cfg) {
     CLAUDE_CODE_MAX_RETRIES: "1",
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     API_TIMEOUT_MS: "300000",
-    // Без этого ключ Alibaba виден подпроцессам инструментов (Bash: printenv,
-    // env и т.п.) — проверено 30.10 на CLI 2.1.280. Любой пользователь
-    // веб-чата мог бы попросить ассистента выполнить env и унести ключ.
-    CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1",
+    // Вычистка ключа из окружения подпроцессов — ВЫКЛЮЧЕНА явно. На Linux
+    // SCRUB=1 требует bubblewrap (bwrap), а на релее его нет: CLI 2.1.280 сразу
+    // падает (exit 1), и ход на Qwen возвращал пустой done (30.10). Ключ Qwen
+    // при этом доступен Bash ассистента так же, как и прочие секреты релея на
+    // диске (файл ключа, креды Claude) — защита одна на всех: песочница для Bash,
+    // отдельная задача. '0' — поверх унаследованного значения.
+    CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "0",
   };
 }
 

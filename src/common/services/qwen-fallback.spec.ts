@@ -138,13 +138,11 @@ describe('qwenSpawnEnv', () => {
     expect(base).toEqual({ ANTHROPIC_API_KEY: 'old' });
   });
 
-  // Без этого Bash внутри хода на Qwen видит ANTHROPIC_AUTH_TOKEN (проверено
-  // 30.10 на CLI 2.1.280: `printenv … | wc -c` → 115 без флага, 0 с ним) —
-  // любой пользователь веб-чата может попросить ассистента выполнить env и
-  // унести ключ. Поверх своего значения в base — тоже должно стоять '1'.
-  it('ключ не виден подпроцессам инструментов (CLAUDE_CODE_SUBPROCESS_ENV_SCRUB)', () => {
-    expect(qwenSpawnEnv({}, cfg).CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('1');
-    expect(qwenSpawnEnv({ CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '0' }, cfg).CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('1');
+  // SCRUB=1 на Linux требует bubblewrap: без него CLI падает сразу (30.10 —
+  // прод и релей без bwrap). Явный '0' — поверх унаследованного '1'.
+  it('вычистка окружения подпроцессов выключена явно (SCRUB=1 без bwrap роняет CLI)', () => {
+    expect(qwenSpawnEnv({}, cfg).CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('0');
+    expect(qwenSpawnEnv({ CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1' }, cfg).CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('0');
   });
 });
 

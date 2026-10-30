@@ -59,10 +59,10 @@ test("qwenSpawnEnv: снимает ANTHROPIC_* и OAuth-токен, ставит
   assert.equal(base.ANTHROPIC_API_KEY, "old");
 });
 
-test("qwenSpawnEnv: ключ не виден подпроцессам инструментов (CLAUDE_CODE_SUBPROCESS_ENV_SCRUB)", () => {
+test("qwenSpawnEnv: вычистка окружения подпроцессов выключена явно (SCRUB=1 без bwrap роняет CLI)", () => {
   const cfg = q.readQwenConfig({}, () => "sk-sp-x");
-  assert.equal(q.qwenSpawnEnv({}, cfg).CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, "1");
-  assert.equal(q.qwenSpawnEnv({ CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "0" }, cfg).CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, "1");
+  assert.equal(q.qwenSpawnEnv({}, cfg).CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, "0");
+  assert.equal(q.qwenSpawnEnv({ CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1" }, cfg).CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, "0");
 });
 
 test("looksLikeCliRefusal", () => {

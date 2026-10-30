@@ -134,9 +134,12 @@ export function qwenSpawnEnv(base: NodeJS.ProcessEnv, cfg: QwenFallbackConfig): 
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     // Таймаут одного запроса к API: без него ход без таймаута (TG, timeoutMs: 0) на зависшем Alibaba висел бы до 2×600 с.
     API_TIMEOUT_MS: '300000',
-    // Без этого ключ Alibaba виден подпроцессам инструментов (Bash: printenv,
-    // env и т.п.) — проверено 30.10 на CLI 2.1.280. Любой пользователь
-    // веб-чата мог бы попросить ассистента выполнить env и унести ключ.
-    CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1',
+    // Вычистка ключа из окружения подпроцессов инструментов — ВЫКЛЮЧЕНА явно.
+    // На Linux SCRUB=1 требует bubblewrap (bwrap); без него CLI 2.1.280 сразу
+    // падает (exit 1, ни одного события) — так 30.10 после выката d4be19f8 на
+    // проде (bwrap нет) перестал работать весь путь на Qwen. Здесь Bash нет ни у
+    // одного вызова (Маша — только MCP, TG — Read/WebSearch/WebFetch), так что
+    // ключу через env утекать некуда. '0' — поверх унаследованного значения.
+    CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '0',
   };
 }
