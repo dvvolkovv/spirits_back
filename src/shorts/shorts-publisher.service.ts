@@ -426,6 +426,12 @@ export class ShortsPublisherService implements OnModuleInit {
         // отклонить, пересъёмка была бы потеряна. Ролик в publishing у другой попытки дальше в канал
         // не пойдёт: её продление перед отправкой не пройдёт (ролик failed), а её finishAttempt после
         // нашего failed — пустой. Запрос возвращает оба факта — для точного лога.
+        //
+        // Блокирует short_publication раньше short_video — наоборот markPublished/retry
+        // (shorts.controller.ts), у которых свой deadlock-порядок (video, потом publications).
+        // Конкурентный «Пост вышел» на том же ролике может столкнуться с deadlock 40P01; это
+        // известно и принято — жертвой уходит этот запрос (мы и так ждём гонку, см. ветку
+        // «строку держит другая попытка» ниже), markPublished/retry фиксируется.
         const r = await this.pg.query(
           `WITH pub AS (
              UPDATE short_publication SET status = 'failed', last_error = $3, updated_at = now()

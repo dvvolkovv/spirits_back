@@ -10,7 +10,7 @@ import { POST_MAY_BE_OUT, ShortsPublisherService } from './shorts-publisher.serv
 import { ShortsSettingsService } from './shorts-settings.service';
 import { ShortsTopicService } from './shorts-topic.service';
 import { ShortsYoutubeService } from './shorts-youtube.service';
-import { ShortsController } from './shorts.controller';
+import { LIST_COLUMNS, ShortsController } from './shorts.controller';
 import { rowToShort } from './shorts.types';
 import { YoutubeAttemptSuperseded, YoutubeNotUploaded } from './youtube/youtube-errors';
 
@@ -312,14 +312,26 @@ maybe('ролики против живого Postgres', () => {
   });
 
   it('list: тонкий SELECT не меняет форму ответа — то же, что раньше давал полный SELECT * (живой SQL)', async () => {
+    // Каждое лёгкое поле — не NULL и не то значение, в которое rowToShort превращает
+    // отсутствующую колонку (?? null, === true, || 0, ids()): иначе забытая в LIST_COLUMNS
+    // колонка совпала бы со своим фолбэком и сверка ничего не поймала бы (так и было —
+    // мутационный прогон ревью это показал).
     const v = await insert({
       status: 'pending_review',
+      rubric: 'feature', angle: 'roast', angle_locked: true, source: 'manual',
+      source_ref: 'test:light-columns-shape', topic_hint: 'подсказка-тест', title: 'Тест списка',
+      assistant_id: 10, slug: 'test_slug_shape', lang: 'en', format: 'skit',
       scene: { kind: 'chat', assistantId: 10, assistantName: 'Алексей', question: 'в', followups: [] },
       capture: { answerText: 'ответ', paragraphs: [] },
       script: { hook: 'h', lines: [] },
       animation: { omniSeconds: 10, skits: {} },
       captions: { telegram: 'TG', vk: 'VK', youtube: { title: 'T', description: 'D', tags: [] } },
-      title: 'Тест списка',
+      video_key: 'shorts/test/video.mp4', cover_key: 'shorts/test/cover.jpg', duration_ms: 44000,
+      slot_at: new Date(Date.now() + 86_400_000), approved_at: new Date(Date.now() - 3_600_000),
+      owner_note: 'замечание-тест', writer_feedback: 'отзыв-тест', writer_rounds: 3,
+      review_chat_id: 777, review_message_id: 12, note_prompt_ids: [101, 102], yt_prompt_ids: [201],
+      lease_until: new Date(Date.now() + 900_000), attempts: 2, last_error: 'ошибка-тест',
+      failed_from: 'writing', failure_notified: true, published_at: new Date(Date.now() - 60_000),
     });
     const full = (await pool.query(`SELECT *, updated_at::text AS version FROM short_video WHERE id = $1`, [v.id])).rows[0];
     // То же, что делает light() в контроллере — не экспортирован, поэтому воспроизводим здесь.
@@ -336,6 +348,18 @@ maybe('ролики против живого Postgres', () => {
     await ctl.action({ action: 'list' }, res);
     const row = res.body.find((r: any) => r.id === v.id);
     expect(row).toEqual(expected);
+  });
+
+  it('LIST_COLUMNS ∪ тяжёлые поля — ровно все колонки short_video (ловит колонку, забытую в LIST_COLUMNS новой миграцией)', async () => {
+    const HEAVY = ['capture', 'script', 'captions', 'animation'];
+    const cols = await pool.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'short_video'`,
+    );
+    const actual = new Set(cols.rows.map((r) => r.column_name as string));
+    const declared = new Set<string>([...LIST_COLUMNS, ...HEAVY]);
+    const missingFromDeclared = [...actual].filter((c) => !declared.has(c)).sort();
+    const extraInDeclared = [...declared].filter((c) => !actual.has(c)).sort();
+    expect({ missingFromDeclared, extraInDeclared }).toEqual({ missingFromDeclared: [], extraInDeclared: [] });
   });
 
   describe('решения из админки — версия и «вышел» на живом SQL', () => {
@@ -442,7 +466,7 @@ maybe('ролики против живого Postgres', () => {
       expect((await pool.query(`SELECT status FROM short_video WHERE id = $1`, [v.id])).rows[0].status).toBe('failed');
     });
 
-    it('retry: ролик увели из failed между чтением и записью — 409, строка площадки не трогается (одна транзакция)', async () => {
+    it('retry: ролик увели из failed между чтением и записью — видео проверяется первым, 409 не трогает строку площадки', async () => {
       const v = await insert({ status: 'failed', failed_from: 'publishing', approved_at: new Date() });
       await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'telegram', 'failed')`, [v.id]);
       let raced = false;

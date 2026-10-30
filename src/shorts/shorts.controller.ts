@@ -87,6 +87,20 @@ const ALLOWED_WORDS = {
 type ReviewKind = keyof typeof ALLOWED_WORDS;
 
 /**
+ * Лёгкие поля short_video для list — все, кроме capture/script/animation/captions
+ * (их всё равно вырезает `light()`). Экспортирован: shorts.integration.spec.ts сверяет
+ * это множество (+ 4 тяжёлых) с information_schema.columns — забытая здесь колонка новой
+ * миграции (или колонка, которую отсюда по ошибке убрали) не пройдёт незамеченной.
+ */
+export const LIST_COLUMNS = [
+  'id', 'rubric', 'angle', 'angle_locked', 'source', 'source_ref', 'topic_key', 'topic_hint', 'title',
+  'assistant_id', 'slug', 'lang', 'format', 'scene', 'video_key', 'cover_key', 'duration_ms', 'status',
+  'slot_at', 'approved_at', 'owner_note', 'writer_feedback', 'writer_rounds', 'review_chat_id',
+  'review_message_id', 'note_prompt_ids', 'yt_prompt_ids', 'lease_until', 'attempts', 'last_error',
+  'failed_from', 'failure_notified', 'published_at', 'created_at', 'updated_at',
+] as const;
+
+/**
  * Админка роликов: действия в одном POST, как admin/blog; экран — «Блог» →
  * «Ролики» в кабинете (AdminShortsView). На стенде это единственный способ запустить ролик
  * (`start_now`) и выпустить одобренный, не дожидаясь слота (`publish_now`).
@@ -96,6 +110,7 @@ type ReviewKind = keyof typeof ALLOWED_WORDS;
  * Записи статуса — с условием на статус, как везде в модуле: две вкладки
  * админки и кнопки в личке не перетирают решения друг друга.
  */
+
 @Controller('')
 export class ShortsController {
   constructor(
@@ -184,19 +199,14 @@ export class ShortsController {
    * ролик пропадал бы с экрана, а бот продолжал бы слать «Упали» на ролик, которого
    * в списке уже нет.
    *
-   * Внутренний SELECT — явный перечень лёгких полей, не SELECT *: capture/script/
-   * animation/captions всё равно вырежет `light()` ниже, а тащить их из Postgres в
-   * Node ради этого — на годе роликов это лишние ~8 МБ на каждый вызов list.
-   * scene остаётся: `light()` его не трогает.
+   * Внутренний SELECT — только LIST_COLUMNS, не SELECT *: тащить capture/script/
+   * animation/captions из Postgres в Node ради того, чтобы тут же выбросить их
+   * light(), — на годе роликов лишние ~8 МБ на каждый вызов.
    */
   private async list() {
     const r = await this.pg.query(
       `SELECT * FROM (
-         SELECT id, rubric, angle, angle_locked, source, source_ref, topic_key, topic_hint, title,
-                assistant_id, slug, lang, format, scene, video_key, cover_key, duration_ms, status,
-                slot_at, approved_at, owner_note, writer_feedback, writer_rounds, review_chat_id,
-                review_message_id, note_prompt_ids, yt_prompt_ids, lease_until, attempts, last_error,
-                failed_from, failure_notified, published_at, created_at, updated_at,
+         SELECT ${LIST_COLUMNS.join(', ')},
                 updated_at::text AS version,
                 ROW_NUMBER() OVER (PARTITION BY status ORDER BY COALESCE(published_at, updated_at) DESC) AS archive_rank
            FROM short_video
@@ -267,6 +277,15 @@ export class ShortsController {
    * потом short_publication — если здесь брать площадку первой, конкурентный
    * вызов на одном ролике (retry ⇄ «Пост вышел») ловит deadlock 40P01 вместо
    * обещанного чистого 409 одной из сторон.
+   *
+   * Известная и принятая редкая пара: TelegramOutcomeUnknown в
+   * shorts-publisher.service.ts блокирует short_publication раньше short_video
+   * (обратный порядок) — конкурентный «Пост вышел» на том же ролике может
+   * столкнуться и с ним, не только с retry. Жертва деадлока — запрос
+   * публикатора (он один CTE-запрос, а не отдельная транзакция, и уже
+   * рассчитан на проигрыш гонки — ветка «строку держит другая попытка»), эта
+   * транзакция фиксируется. Не менять порядок здесь обратно под публикатора —
+   * тогда деадлок случался бы с retry, а не с ним, и чаще.
    */
   private async markPublished(id: string, url: string): Promise<any> {
     const v = await this.load(id);
