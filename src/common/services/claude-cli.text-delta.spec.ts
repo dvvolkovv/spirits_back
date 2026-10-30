@@ -62,6 +62,45 @@ function jsonProc(json: string) {
   return proc;
 }
 
+/** Процесс, который режет Buffer (не JS-строку) ПОСЕРЕДИНЕ многобайтовой
+ *  буквы — воспроизводит границу чтения из pipe внутри UTF-8-символа
+ *  (кириллица — 2 байта): b.toString() на каждом куске ОТДЕЛЬНО превращал бы
+ *  обе половинки в U+FFFD. */
+function streamProcCutBytes(lines: object[]) {
+  const outH: Array<(b: Buffer) => void> = [];
+  const on: Record<string, (...a: any[]) => void> = {};
+  const proc: any = {
+    stdout: { on: (e: string, cb: any) => { if (e === 'data') outH.push(cb); } },
+    stderr: { on: () => {} },
+    on: (e: string, cb: any) => { on[e] = cb; },
+    kill: () => {},
+  };
+  setImmediate(() => {
+    const raw = lines.map((l) => JSON.stringify(l)).join('\n') + '\n';
+    const buf = Buffer.from(raw);
+    const cut = buf.indexOf(Buffer.from('Привет')) + 1;
+    outH.forEach((cb) => cb(buf.subarray(0, cut)));
+    outH.forEach((cb) => cb(buf.subarray(cut)));
+    on['close']?.(0);
+  });
+  return proc;
+}
+
+/** Процесс, который сам никогда не отвечает и не закрывается: данные ему
+ *  присылает тест вручную через emit() — чтобы прислать «опоздавший» кусок
+ *  уже ПОСЛЕ того, как вызов отклонён (например по таймауту). */
+function manualProc() {
+  const outH: Array<(b: Buffer) => void> = [];
+  const proc: any = {
+    stdout: { on: (e: string, cb: any) => { if (e === 'data') outH.push(cb); } },
+    stderr: { on: () => {} },
+    on: () => {},
+    kill: () => {},
+  };
+  const emit = (line: object) => outH.forEach((cb) => cb(Buffer.from(JSON.stringify(line) + '\n')));
+  return { proc, emit };
+}
+
 const lastArgs = (): string[] => spawnMock.mock.calls[spawnMock.mock.calls.length - 1][1];
 
 let savedQwenKey: string | undefined;
@@ -105,5 +144,36 @@ describe('ClaudeCliService: текст по мере генерации', () => 
     spawnMock.mockImplementation(() => streamProc(LINES));
     const r = await new ClaudeCliService().textWithCost('привет', { onTextDelta: () => { throw new Error('клиент ушёл'); } });
     expect(r.text).toBe('Привет, как дела?');
+  });
+
+  it('граница чтения из pipe внутри кириллической буквы — кусок и итог не портятся', async () => {
+    spawnMock.mockImplementation(() => streamProcCutBytes(LINES));
+    const deltas: string[] = [];
+    const r = await new ClaudeCliService().textWithCost('привет', { onTextDelta: (t) => deltas.push(t) });
+    expect(deltas).toEqual(['Привет', ', как дела?']);
+    expect(r.text).toBe('Привет, как дела?');
+  });
+
+  it('после отказа по таймауту опоздавший кусок текста в колбэк не уходит', async () => {
+    const { proc, emit } = manualProc();
+    spawnMock.mockImplementation(() => proc);
+    const deltas: string[] = [];
+    const call = new ClaudeCliService().textWithCost('привет', { onTextDelta: (t) => deltas.push(t), timeoutMs: 5 });
+    await expect(call).rejects.toThrow('timeout');
+    emit({ type: 'stream_event', event: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'опоздал' } } });
+    expect(deltas).toEqual([]);
+  });
+
+  it('кусок текста вложенного суб-агента (parent_tool_use_id) в колбэк не уходит', async () => {
+    const subAgentLines = [
+      { type: 'stream_event', parent_tool_use_id: 'toolu_1', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'служебное' } } },
+      { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Привет' } } },
+      { type: 'result', is_error: false, result: 'Привет', total_cost_usd: 0, duration_ms: 1 },
+    ];
+    spawnMock.mockImplementation(() => streamProc(subAgentLines));
+    const deltas: string[] = [];
+    const r = await new ClaudeCliService().textWithCost('x', { onTextDelta: (t) => deltas.push(t) });
+    expect(deltas).toEqual(['Привет']);
+    expect(r.text).toBe('Привет');
   });
 });
