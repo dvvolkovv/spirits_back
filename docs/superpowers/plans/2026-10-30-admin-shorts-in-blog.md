@@ -3692,13 +3692,16 @@ describe('экран «Ролики»', () => {
     confirm.mockRestore();
   });
 
-  it('«Запустить сейчас» у идеи — прямо в строке', async () => {
+  it('«Запустить сейчас» у идеи — прямо в строке, после подтверждения (сборка тратит секунды Omni)', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
     serve({ list: () => res(200, [item({ status: 'idea', slotAt: null })]), start_now: () => res(200, item({ status: 'directing' })) });
     await open();
     await clickAsync(q('short-start-s1')!);
     await settle();
+    expect(confirm).toHaveBeenCalled();
     expect(sent()).toContainEqual({ action: 'start_now', id: 's1' });
     expect(q('shorts-notice')!.textContent).toContain('Ролик запущен');
+    confirm.mockRestore();
   });
 
   it('замечание уходит с версией и текстом', async () => {
