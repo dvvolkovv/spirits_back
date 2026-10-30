@@ -325,6 +325,17 @@ describe('POST admin/shorts', () => {
     expect(err.getResponse()).toMatchObject({ error: 'slot_taken', message: 'Этот момент уже занят другим роликом — попробуйте через минуту' });
   });
 
+  it('mark_published — пост уже отмечен вышедшим (упал YouTube после поста) — 409, ссылка не перезаписывается', async () => {
+    const failedPub = video({ failed_from: 'publishing', approved_at: '2026-10-25T00:00:00Z' });
+    const { ctl, client } = setup((sql) => {
+      if (sql.includes('INSERT INTO short_publication')) return { rows: [], rowCount: 0 };
+      return { rows: [failedPub], rowCount: 1 };
+    });
+    await expect(ctl.action({ action: 'mark_published', id: ID, url: 'https://t.me/ainomira/91' }, res()))
+      .rejects.toThrow('Пост уже отмечен вышедшим — «Пост вышел» не нужен, нажмите «Повторить»');
+    expect(client.query.mock.calls.some((c: any[]) => String(c[0]).includes("SET status = 'approved'"))).toBe(false);
+  });
+
   it('настройки: чтение, правка с проверкой', async () => {
     const { ctl, settings } = setup();
     const r = res();

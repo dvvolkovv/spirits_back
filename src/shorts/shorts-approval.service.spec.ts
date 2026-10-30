@@ -5,6 +5,7 @@ jest.mock('./short-slot-claim', () => ({
 
 import { InputFile } from 'grammy';
 import { NoFreeSlotError } from '../blog/blog-slots';
+import { RELEASED_SQL } from './short-review';
 import { approveShortIntoSlot } from './short-slot-claim';
 import { REVIEW_LEASE_MINUTES, ShortsApprovalService } from './shorts-approval.service';
 import { planSkits } from './short-skit-prompts';
@@ -270,7 +271,7 @@ describe('ShortsApprovalService', () => {
         ['approved', 'ok', /^Ролик уже одобрен/],
         ['capture_queued', 'ok', /переделывается/],
         ['rendering', 'redo', /переделывается/],
-        ['failed', 'redo', /^Ролик упал — что с ним делать, решите в админке: Блог → Ролики$/],
+        ['failed', 'redo', /^Ролик упал — что с ним делать, решите в админке: Блог → Ролики, раздел «Упали»$/],
         ['failed', 'note', /^Ролик упал — замечание не принял\. Что с ним делать — в админке: Блог → Ролики, раздел «Упали»\.$/],
         ['rejected', 'no', /^Ролик отклонён/],
         ['published', 'no', /^Ролик уже опубликован/],
@@ -384,7 +385,7 @@ describe('ShortsApprovalService', () => {
       expect((tg.sendMessage.mock.calls[0] as any[])[1]).toMatch(/уже одобрен/);
     });
 
-    it('замечание к упавшему ролику — куда его передать: кнопки экрана «Ролики»', async () => {
+    it('замечание к упавшему ролику — куда идти: раздел «Упали» экрана «Ролики», без кнопок', async () => {
       const { svc, tg } = setup(row({ status: 'failed', failed_from: 'writing' }));
       await svc.handleReplyEdit(reply());
       const text = String((tg.sendMessage.mock.calls[0] as any[])[1]);
@@ -527,7 +528,10 @@ describe('ShortsApprovalService', () => {
         return { rows: [] };
       });
       await svc.notifyFailures();
+      const claim = pg.query.mock.calls.find((c: any[]) => String(c[0]).includes('failure_notified = true')) as any[];
+      expect(String(claim[0])).toContain(`${RELEASED_SQL} AS released`);
       const text = (tg.sendMessage.mock.calls[0] as any[])[1];
+      expect(text).toMatch(/Ролик «Залог при аренде» вышел не на все площадки:/);
       expect(text).toContain('«Повторить» (пост в канале уже вышел, отклонить нельзя).');
       expect(text).not.toContain('«Отклонить»');
       expect(text).not.toContain('Пост вышел');
