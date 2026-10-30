@@ -1589,6 +1589,7 @@ smoke_security_headers() {
     'Content-Security-Policy-Report-Only:'; do
     if ! grep -qiF "$expected" <<<"$headers"; then
       red "  ✗ отсутствует security-заголовок '$expected' ($ENV_NAME)"
+      printf '%s\n' "$headers" | head -20
       return 1
     fi
   done
