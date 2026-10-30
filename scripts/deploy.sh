@@ -931,6 +931,7 @@ deploy_frontend() {
   # падение сборки: без него дальнейший smoke_frontend_tma гарантированно
   # красный, а прод-nginx мог остаться жив только случайно.
   ensure_tma_nginx_block || { red "  ✗ TMA nginx setup failed ($ENV_NAME) — деплой остановлен"; exit 1; }
+  ensure_security_headers || { red "  ✗ nginx security headers setup failed ($ENV_NAME) — деплой остановлен"; exit 1; }
 }
 
 # ── PHASE 3: лендинг linkeon.io ───────────────────────────────────────────────
@@ -1357,6 +1358,169 @@ ${indent}}"
   return 1
 }
 
+# Версионированные security-заголовки для SPA и Mini App. Include вставляется
+# только в server текущего домена; API и sandbox для пользовательских файлов
+# не затрагиваются. Изменения применяются атомарно и проверяются nginx -t.
+ensure_security_headers() {
+  local conf="$NGINX_CONF_PATH"
+  local headers="$LOCAL_BACK_DIR/scripts/nginx-security-headers.conf"
+  local installed="/etc/nginx/snippets/linkeon-security-headers.conf"
+  local marker="# --- deploy.sh: security headers — блок управляется автоматически ---"
+
+  bold "[front] проверяю security-заголовки nginx ($ENV_NAME: $conf)"
+  if [[ ! -f "$headers" ]]; then
+    red "  ✗ нет версионированного файла $headers"
+    return 1
+  fi
+
+  local current
+  current=$(ssh_remote "sudo cat $conf" 2>/dev/null)
+  if [[ -z "$current" ]]; then
+    red "  ✗ не удалось прочитать $conf ($ENV_NAME)"
+    return 1
+  fi
+
+  local new_conf="$current"$'\n'
+  if ! grep -qF "$marker" <<<"$current"; then
+    local host_pattern
+    host_pattern=$(sed -E 's#^https?://##' <<<"$BASE_URL")
+    new_conf=""
+    local line in_server=0 is_plain_http=0 is_target=0 inserted=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" =~ ^[[:space:]]*server[[:space:]]*\{ ]]; then
+        in_server=1; is_plain_http=0; is_target=0
+      fi
+      if [[ $in_server -eq 1 && "$line" =~ listen[[:space:]]+80([[:space:]]|\;) ]]; then
+        is_plain_http=1
+      fi
+      if [[ $in_server -eq 1 && $is_plain_http -eq 0 && "$line" == *"server_name"*"$host_pattern"* ]]; then
+        is_target=1
+      fi
+      new_conf+="$line"$'\n'
+      if [[ $is_target -eq 1 && $is_plain_http -eq 0 \
+            && "$line" =~ ^([[:space:]]*)location[[:space:]]+(/tma/|/)[[:space:]]*\{ ]]; then
+        local indent="${BASH_REMATCH[1]}"
+        new_conf+="${indent}${indent}${marker}"$'\n'
+        new_conf+="${indent}${indent}include $installed;"$'\n'
+        inserted=$((inserted + 1))
+      fi
+      if [[ "$line" =~ ^\} ]]; then
+        in_server=0
+      fi
+    done <<<"$current"
+    if [[ $inserted -lt 1 ]]; then
+      red "  ✗ не нашёл SPA location в server-блоке $host_pattern ($ENV_NAME)"
+      return 1
+    fi
+  fi
+
+  local conf_b64 headers_b64 confdir
+  conf_b64=$(printf '%s' "$new_conf" | base64 | tr -d '\r\n')
+  headers_b64=$(base64 < "$headers" | tr -d '\r\n')
+  confdir=$(dirname "$conf")
+
+  local remote_out
+  remote_out=$(ssh_remote "
+    set -Eeo pipefail
+    bdir=/etc/nginx/deploy-backups
+    sudo mkdir -p \$bdir /etc/nginx/snippets
+    bak=\$(sudo mktemp \"\${bdir}/$(basename "$conf").security.\$(date +%Y%m%d%H%M%S).XXXXXX\")
+    headers_bak=''
+    headers_existed=0
+    backed_up=0
+    restored=0
+    conftmp=''
+    headerstmp=''
+    restore_tmp=''
+    trap 'sudo rm -f \"\$conftmp\" \"\$headerstmp\" \"\$restore_tmp\" 2>/dev/null' EXIT
+
+    restore_and_report() {
+      if [[ \$backed_up -eq 1 && \$restored -eq 0 ]]; then
+        restored=1
+        restore_tmp=\$(sudo mktemp \"$confdir/.security-restore-XXXXXX\")
+        sudo cp \"\$bak\" \"\$restore_tmp\"
+        sudo chown \"\$orig_owner\" \"\$restore_tmp\"
+        sudo chmod \"\$orig_mode\" \"\$restore_tmp\"
+        sudo mv \"\$restore_tmp\" $conf
+        if [[ \$headers_existed -eq 1 ]]; then
+          restore_tmp=\$(sudo mktemp /etc/nginx/snippets/.security-restore-XXXXXX)
+          sudo cp \"\$headers_bak\" \"\$restore_tmp\"
+          sudo chown \"\$headers_owner\" \"\$restore_tmp\"
+          sudo chmod \"\$headers_mode\" \"\$restore_tmp\"
+          sudo mv \"\$restore_tmp\" $installed
+        else
+          sudo rm -f $installed
+        fi
+        sudo nginx -t >&2 || true
+      fi
+      echo SECURITY_HEADERS_RESULT:FAIL
+    }
+    trap 'restore_and_report' ERR
+
+    orig_owner=\$(sudo stat -c '%U:%G' $conf)
+    orig_mode=\$(sudo stat -c '%a' $conf)
+    headers_owner=root:root
+    headers_mode=644
+    sudo cp $conf \"\$bak\"
+    if sudo test -f $installed; then
+      headers_existed=1
+      headers_owner=\$(sudo stat -c '%U:%G' $installed)
+      headers_mode=\$(sudo stat -c '%a' $installed)
+      headers_bak=\$(sudo mktemp \"\${bdir}/linkeon-security-headers.conf.\$(date +%Y%m%d%H%M%S).XXXXXX\")
+      sudo cp $installed \"\$headers_bak\"
+    fi
+    backed_up=1
+
+    localtmp=\$(mktemp)
+    conftmp=\$(sudo mktemp \"$confdir/.security-headers-XXXXXX\")
+    printf '%s' '$conf_b64' | base64 -d > \"\$localtmp\"
+    sudo cp \"\$localtmp\" \"\$conftmp\"
+    sudo chown \"\$orig_owner\" \"\$conftmp\"
+    sudo chmod \"\$orig_mode\" \"\$conftmp\"
+    headerstmp=\$(sudo mktemp /etc/nginx/snippets/.security-headers-XXXXXX)
+    printf '%s' '$headers_b64' | base64 -d > \"\$localtmp\"
+    sudo cp \"\$localtmp\" \"\$headerstmp\"
+    sudo chown \"\$headers_owner\" \"\$headerstmp\"
+    sudo chmod \"\$headers_mode\" \"\$headerstmp\"
+    rm -f \"\$localtmp\"
+
+    changed=0
+    if ! sudo cmp -s \"\$conftmp\" $conf; then
+      sudo mv \"\$conftmp\" $conf
+      changed=1
+    else
+      sudo rm -f \"\$conftmp\"
+    fi
+    if ! sudo cmp -s \"\$headerstmp\" $installed; then
+      sudo mv \"\$headerstmp\" $installed
+      changed=1
+    else
+      sudo rm -f \"\$headerstmp\"
+    fi
+
+    if [[ \$changed -eq 0 ]]; then
+      trap - ERR
+      echo SECURITY_HEADERS_RESULT:UNCHANGED
+      exit 0
+    fi
+    if sudo nginx -t >&2; then
+      sudo systemctl reload nginx
+      trap - ERR
+      echo SECURITY_HEADERS_RESULT:OK
+    else
+      trap - ERR
+      restore_and_report
+    fi
+  ")
+  echo "$remote_out" | grep -v '^SECURITY_HEADERS_RESULT:'
+  if grep -q '^SECURITY_HEADERS_RESULT:\(OK\|UNCHANGED\)' <<<"$remote_out"; then
+    green "  ✓ security-заголовки nginx применены ($ENV_NAME)"
+    return 0
+  fi
+  red "  ✗ применение security-заголовков не удалось ($ENV_NAME); конфиг восстановлен из бэкапа"
+  return 1
+}
+
 # Смоук Telegram Mini App (/tma/, отдельная точка входа — vite.config.ts
 # rollupOptions.input.tma). Как и smoke_landing — КОД ОТВЕТА ЗДЕСЬ НИЧЕГО НЕ
 # ЗНАЧИТ: и на test, и на проде nginx отдаёт index.html с кодом 200 на любой
@@ -1407,6 +1571,28 @@ smoke_frontend_tma() {
   fi
   bold "  ⚠ Mini App отдаёт свой бандл ($ENV_NAME), но без сверки со свежим билдом (фронт в этой фазе не деплоился): $tma_bundle"
   return 0
+}
+
+smoke_security_headers() {
+  local base="$1" auth="${2:-}"
+  local headers
+  headers=$(curl -fsSI --max-time 20 ${auth:+-u "$auth"} "$base/") || {
+    red "  ✗ не удалось получить HTTP-заголовки SPA ($ENV_NAME)"
+    return 1
+  }
+  local expected
+  for expected in \
+    'Strict-Transport-Security:' \
+    'X-Content-Type-Options: nosniff' \
+    'X-Frame-Options: DENY' \
+    'Referrer-Policy: strict-origin-when-cross-origin' \
+    'Content-Security-Policy-Report-Only:'; do
+    if ! grep -qiF "$expected" <<<"$headers"; then
+      red "  ✗ отсутствует security-заголовок '$expected' ($ENV_NAME)"
+      return 1
+    fi
+  done
+  green "  ✓ security-заголовки SPA подтверждены ($ENV_NAME)"
 }
 
 run_phase() {
@@ -1547,6 +1733,13 @@ run_phase() {
     # бандла, а не прогретого/холодного бэкенд-пути — флапать ей нечему.
     if ! smoke_frontend_tma "$BASE_URL" "$BASIC_AUTH" "${EXPECTED_TMA_BUNDLE:-}"; then
       red "  ✗ SMOKE FAILED ($ENV_NAME) — Mini App (/tma/) не прошёл проверку"
+      if [[ "$phase" == "prod" && -z "${NO_ROLLBACK:-}" && -z "${SMOKE_ONLY:-}" ]]; then
+        rollback_phase || red "  ✗ rollback had partial failures — check $ENV_NAME manually"
+      fi
+      return 1
+    fi
+    if ! smoke_security_headers "$BASE_URL" "$BASIC_AUTH"; then
+      red "  ✗ SMOKE FAILED ($ENV_NAME) — security-заголовки не прошли проверку"
       if [[ "$phase" == "prod" && -z "${NO_ROLLBACK:-}" && -z "${SMOKE_ONLY:-}" ]]; then
         rollback_phase || red "  ✗ rollback had partial failures — check $ENV_NAME manually"
       fi

@@ -226,6 +226,19 @@ describe('check-code: ответ клиенту', () => {
     expect(res.out.code).toBe(200);
     expect(Object.keys(res.out.body).sort()).toEqual(['access-token', 'is-new-user', 'refresh-token']);
   });
+
+  it('POST принимает телефон и код в теле с тем же ответом', async () => {
+    const { controller, redis } = makeController();
+    await redis.set(smsCodeKey(PHONE), CODE, SMS_CODE_TTL_SECONDS);
+    const res = fakeRes();
+    await controller.checkCodePost(
+      { phone: PHONE, code: CODE, sid: 'session', src: 'test' },
+      { headers: {} } as any,
+      res,
+    );
+    expect(res.out.code).toBe(200);
+    expect(Object.keys(res.out.body).sort()).toEqual(['access-token', 'is-new-user', 'refresh-token']);
+  });
 });
 
 /**

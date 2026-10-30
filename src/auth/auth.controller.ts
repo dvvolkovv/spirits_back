@@ -86,7 +86,17 @@ export class AuthController implements OnModuleInit {
     return res.set(CORS).status(200).send('SMS sent');
   }
 
-  // Check OTP code — UUID hardcoded
+  @Post('a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code')
+  async checkCodePost(
+    @Body() body: { phone?: string; code?: string; sid?: string; src?: string },
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    return this.checkCode(body?.phone ?? '', body?.code ?? '', body?.sid, body?.src, req, res);
+  }
+
+  // Legacy-совместимость для уже выложенных клиентов. Новый клиент использует
+  // POST выше, чтобы одноразовый код не попадал в URL и access-логи.
   @Get('a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/:phone/:code')
   async checkCode(
     @Param('phone') phone: string,
