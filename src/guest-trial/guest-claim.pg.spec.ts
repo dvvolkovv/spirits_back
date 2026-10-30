@@ -51,6 +51,27 @@ maybe('перенос пробы в аккаунт против живого Pos
     const token = newGuestToken();
     const row = await sessions.create({ tokenHash: hashGuestToken(token), assistantId, lang: 'ru', source: null, campaign: null });
     for (let i = 1; i <= pairs; i++) await sessions.recordExchange(row.id, `Вопрос ${i}`, `Ответ ${i}`, new Date(Date.now() - (10 - i) * 1000), 0.01);
+    // recordExchange пишет human.created_at = переданный humanAt, а ai.created_at —
+    // настоящий now() сервера (guest-sessions.service.ts). В цикле по нескольким
+    // парам это укладывается в миллисекунды реального времени: все ai оказываются
+    // почти в одной точке «сейчас», а все human — в прошлом по смещению, независимо
+    // от его величины. При 2+ парах порядок по created_at слипается в
+    // [human1, human2, …, ai1, ai2, …] вместо чередования — не флаки, а гарантированный
+    // эффект устройства recordExchange. claim() намеренно переносит эти метки как есть
+    // (комментарий «исходное время сообщений» в guest-claim.service.ts), поэтому правим
+    // не его, а стенд: расставляем created_at по истинному порядку вставки (id).
+    if (pairs > 0) {
+      await pool.query(
+        `WITH ranked AS (
+           SELECT id, row_number() OVER (ORDER BY id) AS rn
+             FROM guest_trial_messages WHERE session_id = $1::uuid
+         )
+         UPDATE guest_trial_messages m
+            SET created_at = $2::timestamptz + (ranked.rn::text || ' seconds')::interval
+           FROM ranked WHERE m.id = ranked.id`,
+        [row.id, new Date(Date.now() - 100 * 1000)],
+      );
+    }
     return { token, row };
   }
   const history = (sid: string) =>
