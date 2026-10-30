@@ -95,6 +95,12 @@ export interface ClaudeCliOptions {
    *  вызывается на каждое tool_use событие. Подходит для UX-индикации
    *  (например edit-message в Telegram). */
   onProgress?: (event: ClaudeCliProgressEvent) => void;
+  /** Куски текста ответа по мере генерации (проба без входа, src/guest-trial).
+   *  Если задан — CLI идёт в stream-json с --include-partial-messages, и каждый
+   *  text_delta уходит сюда; итоговый текст по-прежнему возвращает textWithCost.
+   *  Такой вызов не повторяется на Qwen: показанный человеку текст повтор не
+   *  заберёт обратно. */
+  onTextDelta?: (text: string) => void;
   /** Рабочая директория Claude. По умолчанию os.tmpdir(). Для агентных
    *  сценариев (Bash/Write/Edit) передавай изолированный sandbox-dir. */
   cwd?: string;
@@ -388,6 +394,8 @@ export class ClaudeCliService implements OnModuleInit {
    *  инструментами с последствиями. */
   private mayRetryOnQwen(e: unknown, opts: ClaudeCliOptions): boolean {
     if (e instanceof ClaudeCliCallError && e.toolUsed) return false;
+    // Человек уже видит куски ответа — второй, другой ответ поверх них хуже ошибки.
+    if (opts.onTextDelta) return false;
     // Без stream-json вызов инструмента не виден: вслепую повторяем, только
     // если последствий быть не может — нет MCP, а встроенные тулы лишь из
     // Read/WebSearch/WebFetch (Bash, Write, Edit, 'default' — нельзя).
@@ -504,7 +512,7 @@ export class ClaudeCliService implements OnModuleInit {
     const model = qwen ? qwenModelFor(requestedModel, qwen.models) : requestedModel;
     const provider: 'claude' | 'qwen' = qwen ? 'qwen' : 'claude';
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const streaming = !!opts.onProgress;
+    const streaming = !!opts.onProgress || !!opts.onTextDelta;
 
     const hasAttachments = (opts.attachments?.length ?? 0) > 0;
     const hasMcp = !!opts.mcpServers && Object.keys(opts.mcpServers).length > 0;
@@ -633,6 +641,8 @@ export class ClaudeCliService implements OnModuleInit {
     args.push('--strict-mcp-config');
     // stream-json требует --verbose, иначе CLI отвергает комбинацию.
     if (streaming) args.push('--verbose');
+    // Куски текста приходят только с этим флагом (stream_event → text_delta).
+    if (opts.onTextDelta) args.push('--include-partial-messages');
 
     return new Promise<CliRunResult>((resolve, reject) => {
       // Обычный запуск наследует process.env как есть; запасной получает своё
@@ -686,6 +696,15 @@ export class ClaudeCliService implements OnModuleInit {
                 }
               }
             }
+          }
+          if (
+            opts.onTextDelta &&
+            ev.type === 'stream_event' &&
+            ev.event?.type === 'content_block_delta' &&
+            ev.event.delta?.type === 'text_delta' &&
+            typeof ev.event.delta.text === 'string'
+          ) {
+            try { opts.onTextDelta(stripWordJoiner(ev.event.delta.text)); } catch { /* user callback safety */ }
           }
           if (ev.type === 'result') {
             streamResultText = typeof ev.result === 'string' ? ev.result : '';
