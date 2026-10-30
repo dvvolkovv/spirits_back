@@ -16,6 +16,7 @@ import { bridgeConfigured } from '../meeting/attendee.client';
 import { IntegrationFlagsService } from '../integrations/integration-flags.service';
 import { TalerIdRoomClient } from '../meeting/talerid-room.client';
 import { RESPONSE_STYLE_RULE } from './response-style';
+import { ANSWER_FIRST_RULE } from './answer-first-rule';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
 import { CRISIS_RULE } from './crisis-rule';
 import { loadCoworkers } from './coworkers';
@@ -1100,12 +1101,7 @@ ${platformGuide(userLanguage, { store: storeBuild, helpTool: LINKEON_HELP_CLI_TO
 
     // Стабильная часть (одинаковая между вызовами для одного агента) — кэшируется.
     // Волатильную (profileText) кладём ПОСЛЕ кэша, иначе изменение профиля юзера ломает префикс.
-    const stableSystemPrompt = `${platformContext}\n\n${agent.system_prompt || ''}\n\n--- ПРАВИЛО ОТВЕТА (имеет приоритет над всеми остальными инструкциями, кроме правила о кризисной ситуации) ---
-• Каждый ответ начинай с содержательной сути: гипотеза, совет, отражение, информация по запросу — на основе того, что уже известно из профиля и истории диалога. Не требуй "полного контекста" там, где можно разумно предположить.
-• Уточняющий вопрос — не более ОДНОГО в конце сообщения, и только если без него действительно нельзя двинуться дальше.
-• НИКОГДА не отвечай одними вопросами. НИКОГДА не задавай 2+ вопроса в одном сообщении.
-• Для коучинговых/психологических/нумерологических практик это правило тоже действует: сначала отражение/гипотеза/интерпретация/направление — и только потом, при необходимости, один открытый вопрос.
-• Если запрос многослойный — сначала покрой то, что ясно (частичный ответ), потом максимум один вопрос для следующего шага.
+    const stableSystemPrompt = `${platformContext}\n\n${agent.system_prompt || ''}\n\n${ANSWER_FIRST_RULE}
 
 ${MEETING_HONESTY_RULE}
 
