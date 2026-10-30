@@ -90,11 +90,13 @@ const tmp = (): string => fs.mkdtempSync(path.join(os.tmpdir(), 'studio-master-'
 
 test('выравнивание, как у роликов, — динамическим режимом: −14 LUFS, пик не выше −1 dBTP; видео — как было, звук не сдвинут, moov в начале', { timeout: 60_000 }, async () => {
   const dir = tmp();
-  // Реплики 1–3 с и 6–7,5 с на −26 дБ с плавными акцентами раз в секунду. Линейный подъём
+  // Реплики 0,5–5 с и 6–7,8 с на −26 дБ с плавными акцентами раз в секунду. Линейный подъём
   // вывел бы пик за потолок, и loudnorm работает в динамическом режиме (буфер 3 с,
   // ограничитель) — как на роликах стенда: им срезать 1,2–5 дБ, здесь ≈ 3,5. Резкие всплески
   // не годятся: на них выброс кодера AAC 0,9–2,6 дБ (см. TP_HEADROOM_DB в loudness.ts).
-  const input = makeVideo(dir, '(0.05*sin(2*PI*300*t)+0.25*sin(2*PI*600*t)*pow(sin(PI*mod(t\\,1)/0.1)\\,2)*lt(mod(t\\,1)\\,0.1))*(between(t\\,1\\,3)+between(t\\,6\\,7.5))');
+  // Пауз мало, как в роликах: на 8 с с половиной тишины динамический режим не успевает
+  // сойтись (−15,0 LUFS); с паузой в секунду и на 20–30 с — −14,5 (ролики стенда — −14,1).
+  const input = makeVideo(dir, '(0.05*sin(2*PI*300*t)+0.25*sin(2*PI*600*t)*pow(sin(PI*mod(t\\,1)/0.1)\\,2)*lt(mod(t\\,1)\\,0.1))*(between(t\\,0.5\\,5)+between(t\\,6\\,7.8))');
   const output = path.join(dir, 'video.mp4');
   const r = await masterLoudness(input, output);
   assert.ok(r.before.i < -25, `до выравнивания ${r.before.i} LUFS`);
@@ -107,7 +109,7 @@ test('выравнивание, как у роликов, — динамичес
   const p = await probeFile(output);
   assert.ok(Math.abs(p.durationSec - 8) < 0.05, `длина ${p.durationSec} с`);
   const silences = await detectSilences(output, p.durationSec);
-  const gap = silences.find((s) => s.start > 2.5 && s.start < 3.5);
+  const gap = silences.find((s) => s.start > 4.5 && s.start < 5.5);
   assert.ok(gap && Math.abs(gap.end - 6) < 0.02, `реплика 2 началась не в 6,0 с: ${JSON.stringify(silences)}`);
   assert.deepEqual(atoms(output).filter((a) => a === 'moov' || a === 'mdat'), ['moov', 'mdat']);
   fs.rmSync(dir, { recursive: true, force: true });

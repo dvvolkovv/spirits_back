@@ -61,3 +61,9 @@ export function toStudioError(e: unknown): StudioError {
   if (e instanceof StudioError) return e;
   return new StudioError('unknown', e instanceof Error ? e.message : String(e), true);
 }
+
+/** Последняя строка stderr ffmpeg — причина; первая строка сообщения execFile — сама команда. */
+export const failText = (e: unknown): string => {
+  const stderr = String((e as { stderr?: unknown })?.stderr ?? '').trim().split('\n').pop();
+  return stderr || (e instanceof Error ? e.message.split('\n')[0] : String(e));
+};
