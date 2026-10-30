@@ -98,6 +98,14 @@ describe('POST admin/shorts', () => {
     expect(r.body[0]).toMatchObject({ id: ID, status: 'pending_review', publications: [] });
   });
 
+  it('list — активная очередь без общего лимита; архив (published/rejected) — по 100 последних на каждый статус', async () => {
+    const { ctl, pg } = setup((sql) => (sql.includes('FROM short_publication') ? { rows: [] } : { rows: [video({ status: 'failed' })] }));
+    await ctl.action({ action: 'list' }, res());
+    const sql = String(pg.query.mock.calls[0][0]);
+    expect(sql).toContain('ROW_NUMBER() OVER (PARTITION BY status ORDER BY COALESCE(published_at, updated_at) DESC)');
+    expect(sql).toContain("status NOT IN ('published', 'rejected') OR archive_rank <= 100");
+  });
+
   it('get — версия и ссылки на файлы с меткой версии', async () => {
     const { ctl, pg } = setup((sql) =>
       sql.includes('FROM short_video') ? { rows: [video({ version: VERSION, cover_key: 'shorts/v/cover.jpg' })] } : { rows: [] });
@@ -157,40 +165,53 @@ describe('POST admin/shorts', () => {
     expect(err.getResponse()).toMatchObject({ error: 'slot_taken', message: 'Этот момент уже занят другим роликом — попробуйте через минуту' });
   });
 
-  it('retry — с этапа, на котором упал; публикация — только одобренного', async () => {
+  it('retry — с этапа, на котором упал; публикация — только одобренного, и только после видео (одна транзакция)', async () => {
     const capture = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'capture_queued' })] } : { rows: [video()] }));
     await capture.ctl.action({ action: 'retry', id: ID }, res());
-    const upd = capture.pg.query.mock.calls.find((c: any[]) => String(c[0]).includes("WHERE id = $1 AND status = 'failed'")) as any[];
+    const upd = capture.client.query.mock.calls.find((c: any[]) => String(c[0]).includes("WHERE id = $1 AND status = 'failed'")) as any[];
     // Без замечания owner_note не трогается (COALESCE с NULL); без from — и формат.
     expect(upd[1]).toEqual([ID, 'capture_queued', 'capturing', null, null]);
 
     const pub = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'approved' })] } : { rows: [video({ failed_from: 'publishing', approved_at: '2026-10-25T00:00:00Z' })] }));
     await pub.ctl.action({ action: 'retry', id: ID }, res());
-    expect(pub.pg.query.mock.calls.some((c: any[]) => String(c[0]).includes("UPDATE short_publication SET status = 'pending'"))).toBe(true);
+    const calls = pub.client.query.mock.calls;
+    const videoIdx = calls.findIndex((c: any[]) => String(c[0]).includes("WHERE id = $1 AND status = 'failed' AND failed_from = $3"));
+    const pubIdx = calls.findIndex((c: any[]) => String(c[0]).includes("UPDATE short_publication SET status = 'pending'"));
+    expect(videoIdx).toBeGreaterThanOrEqual(0);
+    expect(pubIdx).toBeGreaterThan(videoIdx);
 
     const never = setup(() => ({ rows: [video({ failed_from: 'publishing', approved_at: null })] }));
     await expect(never.ctl.action({ action: 'retry', id: ID }, res())).rejects.toBeInstanceOf(ConflictException);
   });
 
+  it('retry — публикации не трогаются, если видео не обновилось: 409 до записи площадок, в одной транзакции', async () => {
+    const pub = setup((sql) => (sql.includes('RETURNING') ? { rows: [] } : { rows: [video({ failed_from: 'publishing', approved_at: '2026-10-25T00:00:00Z' })] }));
+    await expect(pub.ctl.action({ action: 'retry', id: ID }, res())).rejects.toBeInstanceOf(ConflictException);
+    const touchedPublications = (c: any[]) => String(c[0]).includes("UPDATE short_publication SET status = 'pending'");
+    expect(pub.pg.query.mock.calls.some(touchedPublications) || pub.client.query.mock.calls.some(touchedPublications)).toBe(false);
+    expect(pub.pg.getClient).toHaveBeenCalled();
+    expect(pub.client.query.mock.calls.some((c: any[]) => c[0] === 'ROLLBACK')).toBe(true);
+  });
+
   it('retry публикации не обнуляет счётчик строк площадок — это жетон попытки публикатора', async () => {
     const pub = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'approved' })] } : { rows: [video({ failed_from: 'publishing', approved_at: '2026-10-25T00:00:00Z' })] }));
     await pub.ctl.action({ action: 'retry', id: ID }, res());
-    const reset = pub.pg.query.mock.calls
+    const reset = pub.client.query.mock.calls
       .map((c: any[]) => String(c[0]).replace(/\s+/g, ' '))
       .find((s: string) => s.startsWith("UPDATE short_publication SET status = 'pending'"));
     expect(reset).toBeDefined();
     expect(reset).not.toMatch(/attempts/);
   });
 
-  const retryWrite = (pg: any) =>
-    pg.query.mock.calls.find((c: any[]) => String(c[0]).includes("WHERE id = $1 AND status = 'failed' AND failed_from = $3")) as any[];
+  const retryWrite = (client: any) =>
+    client.query.mock.calls.find((c: any[]) => String(c[0]).includes("WHERE id = $1 AND status = 'failed' AND failed_from = $3")) as any[];
 
   it('retry { from: directing, note } — с режиссёра, а не с этапа падения; замечание дописано к прежним', async () => {
     // Сценарист дважды просил другую сцену — повтор с writing упал бы тем же.
     const failed = video({ failed_from: 'writing', owner_note: 'Сценарист: нужен вопрос про субаренду\nСценарист: ответ слишком общий' });
-    const { ctl, pg } = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'directing', failed_from: null })] } : { rows: [failed] }));
+    const { ctl, client } = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'directing', failed_from: null })] } : { rows: [failed] }));
     await ctl.action({ action: 'retry', id: ID, from: 'directing', note: 'Возьми вопрос про возврат залога' }, res());
-    const upd = retryWrite(pg);
+    const upd = retryWrite(client);
     expect(String(upd[0])).toContain('owner_note = COALESCE($4::text, owner_note)');
     expect(String(upd[0])).toContain('writer_rounds = 0');
     expect(String(upd[0])).toContain('format = COALESCE($5::text, format)');
@@ -205,10 +226,10 @@ describe('POST admin/shorts', () => {
 
   it('retry { from: writing } — новый текст по той же съёмке', async () => {
     const failed = video({ failed_from: 'rendering', capture: { answerText: 'ответ', paragraphs: [] } });
-    const { ctl, pg } = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'writing', failed_from: null })] } : { rows: [failed] }));
+    const { ctl, client } = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'writing', failed_from: null })] } : { rows: [failed] }));
     await ctl.action({ action: 'retry', id: ID, from: 'writing' }, res());
     // С from — формат из настроек: «Только чат» после снятой модели Omni.
-    expect(retryWrite(pg)[1]).toEqual([ID, 'writing', 'rendering', null, 'chat']);
+    expect(retryWrite(client)[1]).toEqual([ID, 'writing', 'rendering', null, 'chat']);
   });
 
   it('retry { from } у упавшей публикации — 409: её повторяют только своим путём', async () => {
@@ -287,6 +308,14 @@ describe('POST admin/shorts', () => {
     await ctl.action({ action: 'mark_published', id: ID, url: 'https://t.me/c/1234567890/42' }, res());
     const upsert = client.query.mock.calls.find((c: any[]) => String(c[0]).includes('INSERT INTO short_publication')) as any[];
     expect(upsert[1]).toEqual([ID, 'https://t.me/c/1234567890/42', '42']);
+  });
+
+  it('mark_published — ссылка с пробелами и переносом вокруг — сохраняется обрезанной', async () => {
+    const v = video({ failed_from: 'publishing', approved_at: '2026-10-20T00:00:00Z' });
+    const { ctl, client } = setup((sql) => (sql.includes('FROM short_video') && !sql.includes('UPDATE') ? { rows: [v] } : { rows: [], rowCount: 1 }));
+    await ctl.action({ action: 'mark_published', id: ID, url: '  https://t.me/ainomira/777 \n' }, res());
+    const upsert = client.query.mock.calls.find((c: any[]) => String(c[0]).includes('INSERT INTO short_publication')) as any[];
+    expect(upsert[1]).toEqual([ID, 'https://t.me/ainomira/777', '777']);
   });
 
   it('mark_published — ссылка не похожа на пост Telegram — 400', async () => {
@@ -490,6 +519,15 @@ describe('POST admin/shorts — решение по готовому ролик�
     await expect(ctl.action({ action: 'note', id: ID, version: VERSION, text: '   ' }, res())).rejects.toBeInstanceOf(BadRequestException);
   });
 
+  it('note — 5000 ведущих пробелов перед текстом не превращают замечание в пустое (trim до среза)', async () => {
+    const { ctl, pg } = setup((sql) =>
+      sql.startsWith('UPDATE') ? { rows: [review({ status: 'writing' })] } : { rows: [review()] });
+    const text = `${' '.repeat(5000)}важное замечание`;
+    await ctl.action({ action: 'note', id: ID, version: VERSION, text }, res());
+    const [, params] = pg.query.mock.calls.find((c: any[]) => String(c[0]).startsWith('UPDATE')) as any[];
+    expect(params[1]).toContain('важное замечание');
+  });
+
   it('reject упавшего с версией — версия в условии записи; разошлась — version_conflict', async () => {
     const ok = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'rejected' })] } : { rows: [video()] }));
     await ok.ctl.action({ action: 'reject', id: ID, version: VERSION }, res());
@@ -538,5 +576,21 @@ describe('POST admin/shorts — решение по готовому ролик�
     const err: any = await ctl.action({ action: 'approve', id: ID, version: VERSION }, res()).catch((e) => e);
     expect(err).not.toBeInstanceOf(BadRequestException);
     expect(err.message).toBe('connection terminated');
+  });
+
+  it('версия не передана — код невозможной даты (22008) не превращается в 400, а летит наружу', async () => {
+    const { ctl } = setup((sql) => {
+      if (sql.includes('RETURNING')) throw Object.assign(new Error('date/time field value out of range'), { code: '22008' });
+      return { rows: [video()] }; // video() по умолчанию — status: 'failed'
+    });
+    const err: any = await ctl.action({ action: 'reject', id: ID }, res()).catch((e: any) => e);
+    expect(err).not.toBeInstanceOf(BadRequestException);
+    expect(err.code).toBe('22008');
+  });
+
+  it('reject упавшего с кривой версией — 400, запись не зовётся', async () => {
+    const { ctl, pg } = setup(() => ({ rows: [video()] }));
+    await expect(ctl.action({ action: 'reject', id: ID, version: 'не версия' }, res())).rejects.toBeInstanceOf(BadRequestException);
+    expect(pg.query.mock.calls.some((c: any[]) => String(c[0]).startsWith('UPDATE'))).toBe(false);
   });
 });

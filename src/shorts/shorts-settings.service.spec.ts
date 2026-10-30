@@ -59,6 +59,11 @@ describe('validateSettingsPatch', () => {
     expect([SETTINGS_DEFAULTS.format, SETTINGS_DEFAULTS.maxOmniSeconds]).toEqual(['skit', 48]);
   });
 
+  it('narratorVoice неверный — ошибка перечисляет голоса каталога, а не имя файла', () => {
+    expect(() => validateSettingsPatch({ narratorVoice: 'nova' })).toThrow(/alena/);
+    expect(() => validateSettingsPatch({ narratorVoice: 'nova' })).not.toThrow(/voices\.ts/);
+  });
+
   it.each([
     [{ slotDays: [] }, /slotDays/],
     [{ slotDays: [8] }, /slotDays/],

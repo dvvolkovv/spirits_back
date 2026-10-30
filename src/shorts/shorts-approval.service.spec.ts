@@ -321,6 +321,20 @@ describe('ShortsApprovalService', () => {
       expect(upd[1]).toEqual([ID, 900, 20]);
     });
 
+    it('«Замечание» на одобренном, но уже вышедшем ролике — без обещания работающей кнопки «Переснять»', async () => {
+      // Между попытками публикации released-ролик лежит в approved — старые кнопки под сообщением ещё «свежие».
+      const { svc, tg, pg } = setup(row({ status: 'approved' }));
+      pg.query.mockImplementation(async (sql: string) => {
+        if (sql.includes('SELECT * FROM short_video')) return { rows: [row({ status: 'approved' })] };
+        if (sql.includes('AS released')) return { rows: [{ released: true }] };
+        return { rows: [] };
+      });
+      await svc.handleCallback(cb('note'));
+      const text = String(((tg.answerCallbackQuery.mock.calls[0] as any[])[1] as any).text);
+      expect(text).toContain('вышел на площадке');
+      expect(text).not.toContain('Переснять его можно');
+    });
+
     it('«Переснять» — к режиссёру, «Отклонить» — в отказ, с условием на статус', async () => {
       const { svc, pg } = setup();
       await svc.handleCallback(cb('redo'));
@@ -422,6 +436,25 @@ describe('ShortsApprovalService', () => {
       });
       expect(await svc.handleReplyEdit(reply())).toBe(true);
       expect((tg.sendMessage.mock.calls[0] as any[])[1]).toMatch(/уже одобрен/);
+    });
+
+    it('статус без текста в карте (idea) — отказ человеческими словами, без внутреннего имени статуса', async () => {
+      const { svc, tg } = setup(row({ status: 'idea' }));
+      await svc.handleReplyEdit(reply());
+      expect((tg.sendMessage.mock.calls[0] as any[])[1]).toBe('Замечание не принял: ролик сейчас не на проверке.');
+    });
+
+    it('замечание ответом не записалось из-за «вышел» — без обещания работающей кнопки «Переснять»', async () => {
+      const { svc, tg, pg } = setup();
+      pg.query.mockImplementation(async (sql: string) => {
+        if (sql.includes('SELECT * FROM short_video')) return { rows: [row()] };
+        if (sql.startsWith('UPDATE')) return { rows: [], rowCount: 0 };
+        return { rows: [{ status: 'approved', released: true }] };
+      });
+      expect(await svc.handleReplyEdit(reply())).toBe(true);
+      const text = String((tg.sendMessage.mock.calls[0] as any[])[1]);
+      expect(text).toContain('вышел на площадке');
+      expect(text).not.toContain('Переснять его можно');
     });
   });
 

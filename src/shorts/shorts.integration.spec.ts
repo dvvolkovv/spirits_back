@@ -282,6 +282,19 @@ maybe('ролики против живого Postgres', () => {
     expect(new Set(open).size).toBe(7);
   });
 
+  it('list: активная очередь не режется общим лимитом; архив (published/rejected) — по 100 последних на каждый статус (живой SQL)', async () => {
+    const oldFailed = await insert({ status: 'failed', failed_from: 'capturing' });
+    await Promise.all(
+      Array.from({ length: 105 }, (_, i) => insert({ status: 'published', published_at: new Date(Date.now() + i) })),
+    );
+    const ctl = new ShortsController(pgLike() as any, {} as any, {} as any, { publicUrl: () => 'x' } as any);
+    const res: any = { status: () => res, json: (b: any) => ((res.body = b), res) };
+    await ctl.action({ action: 'list' }, res);
+    expect(res.body).toHaveLength(101);
+    expect(res.body.filter((r: any) => r.status === 'published')).toHaveLength(100);
+    expect(res.body.some((r: any) => r.id === oldFailed.id)).toBe(true);
+  });
+
   describe('решения из админки — версия и «вышел» на живом SQL', () => {
     const VERSION = '2030-01-01 10:00:00.123456+00';
     const daily = { slotDays: [1, 2, 3, 4, 5, 6, 7], slotHourMsk: 18 };
@@ -289,6 +302,8 @@ maybe('ролики против живого Postgres', () => {
     it('версия строкой из базы сверяется с микросекундами; округлённая до миллисекунд — нет', async () => {
       const v = await insert({ status: 'pending_review', updated_at: VERSION });
       const version = (await pool.query(`SELECT updated_at::text AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
+      // VERSION задан с микросекундами .123456 — ::text обязан их сохранить, иначе сверка версии ломается.
+      expect(version).toMatch(/\.123456[+-]/);
       // Через Date JS: …10:00:00.123Z — микросекунды потеряны.
       const rounded = v.updatedAt.toISOString();
       expect(await approveShortIntoSlot(pgLike() as any, v.id, null, daily, undefined, rounded)).toBeNull();
@@ -309,6 +324,24 @@ maybe('ролики против живого Postgres', () => {
       expect((await pool.query(`SELECT status FROM short_video WHERE id = $1`, [v.id])).rows[0].status).toBe('approved');
     });
 
+    it('redo (admin «Переснять») вышедшего ролика — отказ даже с верной версией; после снятия «вышел» тот же вызов проходит', async () => {
+      const v = await insert({ status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() + 86_400_000) });
+      await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'telegram', 'published')`, [v.id]);
+      const version1 = (await pool.query(`SELECT updated_at::text AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
+      const ctl = new ShortsController(pgLike() as any, {} as any, {} as any, {} as any);
+      const res: any = { status: () => res, json: (b: any) => ((res.body = b), res) };
+      await expect(ctl.action({ action: 'redo', id: v.id, version: version1 }, res)).rejects.toThrow(
+        'Ролик уже вышел на площадке — переснять или отклонить нельзя',
+      );
+      expect((await pool.query(`SELECT status FROM short_video WHERE id = $1`, [v.id])).rows[0].status).toBe('approved');
+
+      // Пост сняли с канала — «вышел» больше не числится: прежний отказ был от «вышел», не от версии.
+      await pool.query(`UPDATE short_publication SET status = 'failed' WHERE short_id = $1`, [v.id]);
+      const version2 = (await pool.query(`SELECT updated_at::text AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
+      await ctl.action({ action: 'redo', id: v.id, version: version2 }, res);
+      expect(res.body.status).toBe('directing');
+    });
+
     it('одобрение из админки и кнопка лички одновременно — ролик одобрен один раз', async () => {
       const v = await insert({ status: 'pending_review', updated_at: VERSION });
       const [a, b] = await Promise.all([
@@ -320,7 +353,7 @@ maybe('ролики против живого Postgres', () => {
     });
 
     it('замечание с устаревшей версией не пишется; с верной — дописано к прежним, ролик у сценариста', async () => {
-      const v = await insert({ status: 'pending_review', owner_note: 'короче', updated_at: VERSION });
+      const v = await insert({ status: 'pending_review', owner_note: 'короче', updated_at: VERSION, writer_rounds: 2 });
       expect(await noteForReview(pgLike() as any, v, 'без цифр', '2030-01-01 10:00:00.123+00'))
         .toEqual({ ok: false, reason: 'stale', status: 'pending_review' });
       expect(await noteForReview(pgLike() as any, v, 'без цифр', VERSION))
@@ -363,6 +396,29 @@ maybe('ролики против живого Postgres', () => {
       const pub = (await pool.query(`SELECT url, external_id FROM short_publication WHERE short_id = $1 AND platform = 'telegram'`, [v.id])).rows[0];
       expect(pub).toEqual({ url: 'https://t.me/ainomira/90', external_id: '90' });
       expect((await pool.query(`SELECT status FROM short_video WHERE id = $1`, [v.id])).rows[0].status).toBe('failed');
+    });
+
+    it('retry: ролик увели из failed между чтением и записью — 409, строка площадки не трогается (одна транзакция)', async () => {
+      const v = await insert({ status: 'failed', failed_from: 'publishing', approved_at: new Date() });
+      await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'telegram', 'failed')`, [v.id]);
+      let raced = false;
+      const racing = {
+        query: async (sql: string, params?: any[]) => {
+          const r = await pool.query(sql, params);
+          if (!raced && sql.includes('SELECT * FROM short_video WHERE id = $1')) {
+            raced = true;
+            // Гонка: кто-то другой увёл ролик из failed между чтением retry (load) и его записью.
+            await pool.query(`UPDATE short_video SET status = 'approved' WHERE id = $1`, [v.id]);
+          }
+          return r;
+        },
+        getClient: () => pool.connect(),
+      };
+      const ctl = new ShortsController(racing as any, {} as any, {} as any, {} as any);
+      const res: any = { status: () => res, json: (b: any) => ((res.body = b), res) };
+      await expect(ctl.action({ action: 'retry', id: v.id }, res)).rejects.toThrow('Ролик успел уйти из упавших — обновите список');
+      const pub = (await pool.query(`SELECT status FROM short_publication WHERE short_id = $1 AND platform = 'telegram'`, [v.id])).rows[0];
+      expect(pub.status).toBe('failed');
     });
   });
 
