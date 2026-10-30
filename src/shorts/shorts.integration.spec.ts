@@ -284,15 +284,58 @@ maybe('ролики против живого Postgres', () => {
 
   it('list: активная очередь не режется общим лимитом; архив (published/rejected) — по 100 последних на каждый статус (живой SQL)', async () => {
     const oldFailed = await insert({ status: 'failed', failed_from: 'capturing' });
-    await Promise.all(
+    const publishedRows = await Promise.all(
       Array.from({ length: 105 }, (_, i) => insert({ status: 'published', published_at: new Date(Date.now() + i) })),
+    );
+    await Promise.all(
+      Array.from({ length: 101 }, (_, i) => insert({ status: 'rejected', updated_at: new Date(Date.now() + 10_000 + i) })),
     );
     const ctl = new ShortsController(pgLike() as any, {} as any, {} as any, { publicUrl: () => 'x' } as any);
     const res: any = { status: () => res, json: (b: any) => ((res.body = b), res) };
     await ctl.action({ action: 'list' }, res);
-    expect(res.body).toHaveLength(101);
-    expect(res.body.filter((r: any) => r.status === 'published')).toHaveLength(100);
+
+    expect(res.body).toHaveLength(1 + 100 + 100);
     expect(res.body.some((r: any) => r.id === oldFailed.id)).toBe(true);
+
+    // Не просто count === 100 (это пройдёт и с ASC в окне) — явно проверяем, что остались
+    // САМЫЕ НОВЫЕ: 5 самых старых published должны отсутствовать.
+    const publishedIds = res.body.filter((r: any) => r.status === 'published').map((r: any) => r.id);
+    expect(publishedIds).toHaveLength(100);
+    const oldestFive = [...publishedRows].sort((a, b) => a.publishedAt!.getTime() - b.publishedAt!.getTime()).slice(0, 5);
+    for (const old of oldestFive) expect(publishedIds).not.toContain(old.id);
+
+    // Лимит архива — per-статус, а не общий на весь архив: rejected капается отдельно от published.
+    expect(res.body.filter((r: any) => r.status === 'rejected')).toHaveLength(100);
+
+    // archive_rank — внутренний помощник окна, наружу (в JSON ответа) не должен просочиться.
+    expect(res.body.every((r: any) => !('archive_rank' in r))).toBe(true);
+  });
+
+  it('list: тонкий SELECT не меняет форму ответа — то же, что раньше давал полный SELECT * (живой SQL)', async () => {
+    const v = await insert({
+      status: 'pending_review',
+      scene: { kind: 'chat', assistantId: 10, assistantName: 'Алексей', question: 'в', followups: [] },
+      capture: { answerText: 'ответ', paragraphs: [] },
+      script: { hook: 'h', lines: [] },
+      animation: { omniSeconds: 10, skits: {} },
+      captions: { telegram: 'TG', vk: 'VK', youtube: { title: 'T', description: 'D', tags: [] } },
+      title: 'Тест списка',
+    });
+    const full = (await pool.query(`SELECT *, updated_at::text AS version FROM short_video WHERE id = $1`, [v.id])).rows[0];
+    // То же, что делает light() в контроллере — не экспортирован, поэтому воспроизводим здесь.
+    const expected: any = rowToShort(full);
+    delete expected.capture;
+    delete expected.script;
+    delete expected.animation;
+    delete expected.captions;
+    expected.version = full.version;
+    expected.publications = [];
+
+    const ctl = new ShortsController(pgLike() as any, {} as any, {} as any, { publicUrl: () => 'x' } as any);
+    const res: any = { status: () => res, json: (b: any) => ((res.body = b), res) };
+    await ctl.action({ action: 'list' }, res);
+    const row = res.body.find((r: any) => r.id === v.id);
+    expect(row).toEqual(expected);
   });
 
   describe('решения из админки — версия и «вышел» на живом SQL', () => {
@@ -327,18 +370,19 @@ maybe('ролики против живого Postgres', () => {
     it('redo (admin «Переснять») вышедшего ролика — отказ даже с верной версией; после снятия «вышел» тот же вызов проходит', async () => {
       const v = await insert({ status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() + 86_400_000) });
       await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'telegram', 'published')`, [v.id]);
-      const version1 = (await pool.query(`SELECT updated_at::text AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
+      const version = (await pool.query(`SELECT updated_at::text AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
       const ctl = new ShortsController(pgLike() as any, {} as any, {} as any, {} as any);
       const res: any = { status: () => res, json: (b: any) => ((res.body = b), res) };
-      await expect(ctl.action({ action: 'redo', id: v.id, version: version1 }, res)).rejects.toThrow(
+      await expect(ctl.action({ action: 'redo', id: v.id, version }, res)).rejects.toThrow(
         'Ролик уже вышел на площадке — переснять или отклонить нельзя',
       );
       expect((await pool.query(`SELECT status FROM short_video WHERE id = $1`, [v.id])).rows[0].status).toBe('approved');
 
-      // Пост сняли с канала — «вышел» больше не числится: прежний отказ был от «вышел», не от версии.
+      // Пост сняли с канала — «вышел» больше не числится. Та же version (не перечитанная!):
+      // отклонённый UPDATE не совпал по WHERE и не трогал updated_at, а эта правка меняет только
+      // short_publication — значит, первый отказ был именно от «вышел», а не от устаревшей версии.
       await pool.query(`UPDATE short_publication SET status = 'failed' WHERE short_id = $1`, [v.id]);
-      const version2 = (await pool.query(`SELECT updated_at::text AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
-      await ctl.action({ action: 'redo', id: v.id, version: version2 }, res);
+      await ctl.action({ action: 'redo', id: v.id, version }, res);
       expect(res.body.status).toBe('directing');
     });
 

@@ -106,6 +106,19 @@ describe('POST admin/shorts', () => {
     expect(sql).toContain("status NOT IN ('published', 'rejected') OR archive_rank <= 100");
   });
 
+  it('list — внутренний SELECT перечисляет только лёгкие поля (не SELECT *): scene остаётся, тяжёлые поля не тащит из Postgres', async () => {
+    const { ctl, pg } = setup((sql) => (sql.includes('FROM short_publication') ? { rows: [] } : { rows: [video({ status: 'failed' })] }));
+    await ctl.action({ action: 'list' }, res());
+    const sql = String(pg.query.mock.calls[0][0]);
+    // Явный перечень, а не SELECT * (иначе capture/script/animation/captions снова ехали бы в Node,
+    // чтобы тут же быть выброшенными light() ниже).
+    expect(sql).toMatch(/SELECT id, rubric, angle, angle_locked, source, source_ref, topic_key, topic_hint, title,/);
+    expect(sql).toMatch(/\bscene\b/);
+    for (const heavy of ['capture', 'script', 'animation', 'captions']) {
+      expect(sql).not.toMatch(new RegExp(`\\b${heavy}\\b`));
+    }
+  });
+
   it('get — версия и ссылки на файлы с меткой версии', async () => {
     const { ctl, pg } = setup((sql) =>
       sql.includes('FROM short_video') ? { rows: [video({ version: VERSION, cover_key: 'shorts/v/cover.jpg' })] } : { rows: [] });
@@ -191,6 +204,18 @@ describe('POST admin/shorts', () => {
     expect(pub.pg.query.mock.calls.some(touchedPublications) || pub.client.query.mock.calls.some(touchedPublications)).toBe(false);
     expect(pub.pg.getClient).toHaveBeenCalled();
     expect(pub.client.query.mock.calls.some((c: any[]) => c[0] === 'ROLLBACK')).toBe(true);
+  });
+
+  it('retry — площадки бросили ошибку после успешного видео: ROLLBACK, COMMIT не зовётся', async () => {
+    const pub = setup((sql) => {
+      if (sql.includes("UPDATE short_publication SET status = 'pending'")) throw new Error('connection terminated');
+      if (sql.includes('RETURNING')) return { rows: [video({ status: 'approved' })] };
+      return { rows: [video({ failed_from: 'publishing', approved_at: '2026-10-25T00:00:00Z' })] };
+    });
+    await expect(pub.ctl.action({ action: 'retry', id: ID }, res())).rejects.toThrow('connection terminated');
+    const calls = pub.client.query.mock.calls.map((c: any[]) => c[0]);
+    expect(calls).toContain('ROLLBACK');
+    expect(calls).not.toContain('COMMIT');
   });
 
   it('retry публикации не обнуляет счётчик строк площадок — это жетон попытки публикатора', async () => {
@@ -300,6 +325,16 @@ describe('POST admin/shorts', () => {
     expect(upd[1]).toEqual([ID]);
 
     expect(r.body.videoUrl).toBe('https://minio.test/linkeon-smm-videos/shorts/v/video.mp4');
+  });
+
+  it('mark_published — первый запрос транзакции блокирует short_video (тот же порядок, что у retry — без deadlock 40P01)', async () => {
+    const v = video({ failed_from: 'publishing', approved_at: '2026-10-20T00:00:00Z' });
+    const { ctl, client } = setup((sql) => (sql.includes('FROM short_video') && !sql.includes('UPDATE') ? { rows: [v] } : { rows: [], rowCount: 1 }));
+    await ctl.action({ action: 'mark_published', id: ID, url: 'https://t.me/ainomira/777' }, res());
+    const writes = client.query.mock.calls.filter((c: any[]) => c[0] !== 'BEGIN' && c[0] !== 'COMMIT' && c[0] !== 'ROLLBACK');
+    expect(String(writes[0][0])).toContain('FOR NO KEY UPDATE');
+    expect(String(writes[0][0])).toContain('FROM short_video');
+    expect(writes[0][1]).toEqual([ID]);
   });
 
   it('mark_published — приватный канал t.me/c/<id>/<номер> — тоже принимается', async () => {

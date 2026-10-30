@@ -331,8 +331,10 @@ describe('ShortsApprovalService', () => {
       });
       await svc.handleCallback(cb('note'));
       const text = String(((tg.answerCallbackQuery.mock.calls[0] as any[])[1] as any).text);
-      expect(text).toContain('вышел на площадке');
-      expect(text).not.toContain('Переснять его можно');
+      expect(text).toBe('Ролик уже вышел на площадке — замечание не принял, переснять его тоже нельзя.');
+      // Та же планка, что у таблицы «отказы кнопок» (всплывашка — до 200 знаков и без латиницы).
+      expect(text).not.toMatch(/[a-z]{3,}/);
+      expect(Array.from(text).length).toBeLessThanOrEqual(200);
     });
 
     it('«Переснять» — к режиссёру, «Отклонить» — в отказ, с условием на статус', async () => {
@@ -453,8 +455,8 @@ describe('ShortsApprovalService', () => {
       });
       expect(await svc.handleReplyEdit(reply())).toBe(true);
       const text = String((tg.sendMessage.mock.calls[0] as any[])[1]);
-      expect(text).toContain('вышел на площадке');
-      expect(text).not.toContain('Переснять его можно');
+      // В реплае владелец кнопок не нажимал — текст не должен упоминать «Переснять» как кнопку.
+      expect(text).toBe('Ролик уже вышел на площадке — замечание не принял, переснять его тоже нельзя.');
     });
   });
 
