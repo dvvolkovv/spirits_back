@@ -6,7 +6,9 @@ import { JwtGuard } from '../common/guards/jwt.guard';
 import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { NoFreeSlotError } from '../blog/blog-slots';
-import { LEAVE_FROM, RELEASED_SQL, ReviewRefusal, explainRefusal, leaveReview, noteForReview, versionClause } from './short-review';
+import {
+  BAD_TIMESTAMP_CODES, LEAVE_FROM, RELEASED_SQL, ReviewRefusal, VERSION_RE, explainRefusal, leaveReview, noteForReview, versionClause,
+} from './short-review';
 import { approveShortIntoSlot, isShortSlotConflict } from './short-slot-claim';
 import { ShortSettingsPatch, ShortsSettingsService, validateSettingsPatch } from './shorts-settings.service';
 import { ShortOrderError, ShortsTopicService } from './shorts-topic.service';
@@ -53,13 +55,9 @@ function withVersion(url: string, version: string | null): string {
   return version ? `${url}?v=${encodeURIComponent(version)}` : url;
 }
 
-/** Версия ролика из list/get — `updated_at::text` Postgres, например «2026-10-30 12:34:56.123456+00». */
-export const VERSION_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d{1,6})?[+-]\d{2}(:\d{2})?$/;
 const NEED_VERSION = 'нужна версия ролика (поле version из list или get)';
 const STALE_SHORT = 'Ролик изменился, пока был открыт: на экране устаревшая версия';
 const RELEASED_TEXT = 'Ролик уже вышел на площадке — переснять или отклонить нельзя';
-/** Коды Postgres для невозможной даты (месяц 13, 30 февраля, смещение +99): форма версии верна, значение — нет. */
-export const BAD_TIMESTAMP_CODES = ['22007', '22008', '22009'];
 
 /** Статус ролика словами — для отказов админки, без внутренних имён. */
 const STATUS_WORDS: Record<ShortStatus, string> = {
@@ -179,8 +177,23 @@ export class ShortsController {
     }
   }
 
+  /**
+   * Вся активная очередь (не published/rejected — вкладки «Идеи», «В работе», «Упали» и т.д.)
+   * плюс по 100 последних каждого архивного статуса (COALESCE(published_at, updated_at) DESC):
+   * общий LIMIT 100 на весь список прятал бы старый failed/idea за свежими published —
+   * ролик пропадал бы с экрана, а бот продолжал бы слать «Упали» на ролик, которого
+   * в списке уже нет.
+   */
   private async list() {
-    const r = await this.pg.query(`SELECT *, updated_at::text AS version FROM short_video ORDER BY created_at DESC LIMIT 100`);
+    const r = await this.pg.query(
+      `SELECT * FROM (
+         SELECT *, updated_at::text AS version,
+                ROW_NUMBER() OVER (PARTITION BY status ORDER BY COALESCE(published_at, updated_at) DESC) AS archive_rank
+           FROM short_video
+       ) t
+      WHERE status NOT IN ('published', 'rejected') OR archive_rank <= 100
+      ORDER BY created_at DESC`,
+    );
     const pubs = r.rows.length
       ? await this.pg.query(`SELECT * FROM short_publication WHERE short_id = ANY($1::uuid[])`, [r.rows.map((row: any) => row.id)])
       : { rows: [] };
@@ -243,7 +256,10 @@ export class ShortsController {
    */
   private async markPublished(id: string, url: string): Promise<any> {
     const v = await this.load(id);
-    const externalId = parseTelegramPostUrl(url);
+    // Нормализуем один раз: парсим и храним одну и ту же строку — иначе валидный адрес с
+    // пробелами/переносом (копипаста из Telegram) проходил бы проверку, но лёг бы в базу как есть.
+    const link = String(url ?? '').trim();
+    const externalId = parseTelegramPostUrl(link);
     if (!externalId) {
       throw new BadRequestException(
         'url — ссылка на пост вида https://t.me/<канал>/<номер> (приватный канал — https://t.me/c/<id>/<номер>)',
@@ -264,7 +280,7 @@ export class ShortsController {
                     published_at = COALESCE(short_publication.published_at, now()),
                     last_error = NULL, updated_at = now()
               WHERE short_publication.status <> 'published'`,
-          [id, url, externalId],
+          [id, link, externalId],
         );
         if (!ins.rowCount) {
           throw new ConflictException('Пост уже отмечен вышедшим — «Пост вышел» не нужен, нажмите «Повторить»');
@@ -310,6 +326,11 @@ export class ShortsController {
    * «сейчас») и только по упавшим площадкам: вышедшие не трогаются. Запись — с
    * условием на `failed_from`: цель выбрана по прочитанной неудаче, и путь
    * «failed → approved» не должен открыться ролику, упавшему на другом этапе.
+   *
+   * Обе записи — в одной транзакции (`inTransaction`), видео первым: если
+   * проверяющий UPDATE short_video ничего не нашёл (ролик тем временем ушёл из
+   * failed — гонка с «Пост вышел» или другим «Повторить»), 409 не должен
+   * оставить площадки уже переведёнными в pending.
    */
   private async retry(id: string, from: unknown, note: unknown): Promise<ShortVideo> {
     if (from != null && !RETRY_FROM.includes(from as RetryFrom)) {
@@ -323,28 +344,32 @@ export class ShortsController {
     }
     const ownerNote = typeof note === 'string' && note.trim() ? appendOwnerNote(v.ownerNote, note) : null;
     const format = from != null ? (await this.settings.get()).format : null;
-    if (target === 'approved') {
-      // Счётчик строки не обнуляем: это жетон попытки (platform() публикатора) — обнулённый, он
-      // совпал бы с жетоном зависшей прежней попытки. Бюджет попыток — счётчик ролика.
-      await this.pg.query(
-        `UPDATE short_publication SET status = 'pending', last_error = NULL, updated_at = now()
-          WHERE short_id = $1 AND status = 'failed'`,
-        [id],
+    // Видео — первым и в проверяющем условии: если ролик тем временем ушёл из failed (гонка с
+    // mark_published/другим «Повторить»), 409 должен не записать ничего, включая площадки.
+    return inTransaction(this.pg, async (tx) => {
+      const r = await tx.query(
+        `UPDATE short_video
+            SET status = $2, attempts = 0, lease_until = NULL, last_error = NULL, failed_from = NULL,
+                failure_notified = false, writer_rounds = 0, owner_note = COALESCE($4::text, owner_note),
+                format = COALESCE($5::text, format),
+                writer_feedback = CASE WHEN $4::text IS NULL THEN writer_feedback ELSE NULL END,
+                slot_at = CASE WHEN $2 = 'approved' THEN now() ELSE slot_at END, updated_at = now()
+          WHERE id = $1 AND status = 'failed' AND failed_from = $3
+          RETURNING *`,
+        [id, target, v.failedFrom, ownerNote, format],
       );
-    }
-    const r = await this.pg.query(
-      `UPDATE short_video
-          SET status = $2, attempts = 0, lease_until = NULL, last_error = NULL, failed_from = NULL,
-              failure_notified = false, writer_rounds = 0, owner_note = COALESCE($4::text, owner_note),
-              format = COALESCE($5::text, format),
-              writer_feedback = CASE WHEN $4::text IS NULL THEN writer_feedback ELSE NULL END,
-              slot_at = CASE WHEN $2 = 'approved' THEN now() ELSE slot_at END, updated_at = now()
-        WHERE id = $1 AND status = 'failed' AND failed_from = $3
-        RETURNING *`,
-      [id, target, v.failedFrom, ownerNote, format],
-    );
-    if (!r.rows.length) throw new ConflictException('Ролик успел уйти из упавших — обновите список');
-    return rowToShort(r.rows[0]);
+      if (!r.rows.length) throw new ConflictException('Ролик успел уйти из упавших — обновите список');
+      if (target === 'approved') {
+        // Счётчик строки не обнуляем: это жетон попытки (platform() публикатора) — обнулённый, он
+        // совпал бы с жетоном зависшей прежней попытки. Бюджет попыток — счётчик ролика.
+        await tx.query(
+          `UPDATE short_publication SET status = 'pending', last_error = NULL, updated_at = now()
+            WHERE short_id = $1 AND status = 'failed'`,
+          [id],
+        );
+      }
+      return rowToShort(r.rows[0]);
+    });
   }
 
   /** Цель повтора, выбранная владельцем. null — повторять нечего (ролик не упал). */
@@ -433,8 +458,10 @@ export class ShortsController {
   /** Замечание к ролику, который ждёт решения: дописывается к прежним, ролик — к сценаристу. */
   private async note(id: string, rawText: unknown, rawVersion: unknown): Promise<ShortVideo> {
     const version = this.version(rawVersion, true);
-    // Тело запроса — до 50 МБ: срезаем до разбора на символы; appendOwnerNote всё равно оставит MAX_OWNER_NOTE_CHARS.
-    const text = typeof rawText === 'string' ? rawText.slice(0, MAX_OWNER_NOTE_CHARS * 2).trim() : '';
+    // Тело запроса — до 50 МБ: сначала trim (иначе ведущие пробелы любой длины срезали бы
+    // текст до пустой строки раньше, чем до него дойдёт trim), потом срез до разбора на
+    // символы — appendOwnerNote всё равно оставит MAX_OWNER_NOTE_CHARS.
+    const text = typeof rawText === 'string' ? rawText.trim().slice(0, MAX_OWNER_NOTE_CHARS * 2) : '';
     if (!text) throw new BadRequestException('text — замечание строкой');
     const v = await this.load(id);
     const out = await noteForReview(this.pg, v, text, version);

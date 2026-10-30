@@ -3,14 +3,14 @@ import * as path from 'path';
 import { Pool } from 'pg';
 import { decryptSecret, encryptSecret } from '../calendar/crypto';
 import { claimStage, stageFailed } from './short-jobs';
-import { leaveReview, noteForReview } from './short-review';
+import { BAD_TIMESTAMP_CODES, VERSION_RE, leaveReview, noteForReview } from './short-review';
 import { approveShortIntoSlot } from './short-slot-claim';
 import { ShortsApprovalService } from './shorts-approval.service';
 import { POST_MAY_BE_OUT, ShortsPublisherService } from './shorts-publisher.service';
 import { ShortsSettingsService } from './shorts-settings.service';
 import { ShortsTopicService } from './shorts-topic.service';
 import { ShortsYoutubeService } from './shorts-youtube.service';
-import { BAD_TIMESTAMP_CODES, ShortsController, VERSION_RE } from './shorts.controller';
+import { ShortsController } from './shorts.controller';
 import { rowToShort } from './shorts.types';
 import { YoutubeAttemptSuperseded, YoutubeNotUploaded } from './youtube/youtube-errors';
 

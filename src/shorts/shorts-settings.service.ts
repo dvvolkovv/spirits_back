@@ -1,7 +1,10 @@
 import { Injectable } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
-import { isValidVoice } from '../speech/voices';
+import { VOICE_CATALOG, isValidVoice } from '../speech/voices';
 import { FORMATS, ShortFormat, ShortPlatform, YOUTUBE_MODES, YoutubeMode } from './shorts.types';
+
+/** Голоса SpeechKit, допустимые для narratorVoice — для сообщения об ошибке (не имя файла каталога). */
+const YANDEX_VOICE_IDS = VOICE_CATALOG.filter((v) => v.provider === 'yandex').map((v) => v.id);
 
 export interface ShortSettings {
   /** ISO-дни: 1 — понедельник … 7 — воскресенье. */
@@ -105,7 +108,7 @@ export function validateSettingsPatch(body: any, currentYoutubeMode?: YoutubeMod
     p.platforms = list;
   }
   if (b.narratorVoice !== undefined) {
-    if (!isValidVoice(b.narratorVoice, 'yandex')) throw new Error('narratorVoice — голос SpeechKit из каталога voices.ts');
+    if (!isValidVoice(b.narratorVoice, 'yandex')) throw new Error(`narratorVoice — голос SpeechKit: ${YANDEX_VOICE_IDS.join(', ')}`);
     p.narratorVoice = b.narratorVoice;
   }
   if (b.format !== undefined) {

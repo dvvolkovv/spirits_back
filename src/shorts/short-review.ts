@@ -36,6 +36,11 @@ export type ReviewResult =
   | { ok: true; short: ShortVideo }
   | { ok: false; reason: ReviewRefusal; status: ShortStatus | null };
 
+/** Версия ролика из list/get — `updated_at::text` Postgres, например «2026-10-30 12:34:56.123456+00». */
+export const VERSION_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d{1,6})?[+-]\d{2}(:\d{2})?$/;
+/** Коды Postgres для невозможной даты (месяц 13, 30 февраля, смещение +99): форма версии верна, значение — нет. */
+export const BAD_TIMESTAMP_CODES = ['22007', '22008', '22009'];
+
 /**
  * Условие версии к записи — только если версия передана: без неё SQL и
  * параметры прежние (на этом держатся тесты лички). Параметр дописывается в

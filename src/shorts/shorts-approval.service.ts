@@ -75,7 +75,16 @@ const NOTE_REFUSALS: Partial<Record<ShortStatus, string>> = {
   failed: 'Ролик упал — замечание не принял. Что с ним делать — в админке: Блог → Ролики, раздел «Упали».',
 };
 
-const noteRefusal = (s: ShortStatus): string => NOTE_REFUSALS[s] ?? `Замечание не принял: ролик в статусе ${s}.`;
+const noteRefusal = (s: ShortStatus): string => NOTE_REFUSALS[s] ?? 'Замечание не принял: ролик сейчас не на проверке.';
+
+/**
+ * Одобренный, но уже вышедший хоть где-то (между попытками публикации лежит в approved) —
+ * NOTE_REFUSALS.approved обещал бы кнопку «🔄 Переснять», которую leaveReview тут же откажет
+ * по «вышел». Старые кнопки под сообщением остаются «свежими» и после одобрения и публикации
+ * (review_message_id сбрасывает только новая версия от студии), так что этот текст реально
+ * может увидеть владелец, а не только в теории.
+ */
+const RELEASED_NOTE_REFUSAL = 'Ролик уже вышел на площадке — замечание не принял; «Переснять» теперь откажет тем же.';
 
 const REWORKING = 'Ролик переделывается — пришлю новый вариант';
 
@@ -396,12 +405,24 @@ export class ShortsApprovalService {
 
   private async promptForNote(v: ShortVideo, cb: any, chatId: number): Promise<void> {
     if (v.status !== 'pending_review') {
-      await this.answer(cb, noteRefusal(v.status));
+      await this.answer(cb, await this.noteRefusalFor(v));
       return;
     }
     // Чат уже сверен в handleCallback: приглашение уходит в чат проверки, и ответ на него узнаётся.
     await this.sendPrompt(v, 'note_prompt_ids', chatId, `Что поправить в ролике${quoted(v)}? Напишите ответом на это сообщение.`, v.reviewMessageId, NOTE_PLACEHOLDER);
     await this.answer(cb);
+  }
+
+  /**
+   * Текст отказа замечанию по статусу. Для «одобрен» дополнительно проверяем «вышел» —
+   * лишний запрос только на этом статусе и только на отказе (не на каждом замечании).
+   */
+  private async noteRefusalFor(v: ShortVideo): Promise<string> {
+    if (v.status === 'approved') {
+      const r = await this.pg.query(`SELECT ${RELEASED_SQL} AS released FROM short_video WHERE id = $1`, [v.id]);
+      if (r.rows[0]?.released) return RELEASED_NOTE_REFUSAL;
+    }
+    return noteRefusal(v.status);
   }
 
   private async promptForYoutube(v: ShortVideo, cb: any, chatId: number): Promise<void> {
@@ -473,7 +494,7 @@ export class ShortsApprovalService {
       return true;
     }
     if (v.status !== 'pending_review') {
-      await this.tg.sendMessage(chatId, noteRefusal(v.status));
+      await this.tg.sendMessage(chatId, await this.noteRefusalFor(v));
       return true;
     }
     const text = String(msg?.text || '').trim();
@@ -484,7 +505,8 @@ export class ShortsApprovalService {
     // Запись — общая с админкой (noteForReview, short-review.ts).
     const out = await noteForReview(this.pg, v, text);
     if (out.ok === false) {
-      await this.tg.sendMessage(chatId, noteRefusal(out.status ?? v.status));
+      // «Вышел» уже известен из отказа записи — отдельный запрос не нужен, в отличие от noteRefusalFor.
+      await this.tg.sendMessage(chatId, out.reason === 'released' ? RELEASED_NOTE_REFUSAL : noteRefusal(out.status ?? v.status));
       return true;
     }
     await this.tg.sendMessage(chatId, 'Принял замечание — поправлю ролик и пришлю заново.');
