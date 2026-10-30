@@ -1141,10 +1141,32 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
       }
     });
 
+    // Записи разговора, уже попавшие в транскрипт.
+    //
+    // ⚠️ Разбор расшифровок владельца 30.10.2026: на 424 реплики пришлось 11
+    // дословных повторов реплик Романа, и три из них — в пределах двадцати
+    // секунд от первой, сразу после реплики человека. Повтор через минуту
+    // модель могла допустить и сама, а такой — больше похож на то, что одна и
+    // та же запись доехала сюда дважды. Сверяем по идентификатору записи: если
+    // id тот же, это ТА ЖЕ реплика, а не сказанная повторно.
+    //
+    // Заслон заодно и есть замер: пока в логе нет строки о повторе, двойной
+    // записи не происходит, и причина повторов — в самой модели.
+    const seenItems = new Set<string>();
+
     session.on(AgentSessionEventTypes.ConversationItemAdded, (ev: ConversationItemAddedEvent) => {
       if (ev.item.type !== 'message') return; // пропускаем agent_handoff-записи
       const { role, textContent } = ev.item;
       if (!textContent) return;
+      const itemId = (ev.item as { id?: string }).id;
+      if (itemId) {
+        if (seenItems.has(itemId)) {
+          // Без текста: содержимое разговора в логи не попадает.
+          console.log(`[транскрипт] запись ${itemId} (${role}) уже записана — пропускаю`);
+          return;
+        }
+        seenItems.add(itemId);
+      }
       const normalizedRole: 'user' | 'assistant' = role === 'user' ? 'user' : 'assistant';
       // Наши синтетические generateReply()-вставки заводятся с role:'user' —
       // это не реплики пользователя, в транскрипт звонка их не пускаем.
