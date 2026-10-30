@@ -1,6 +1,9 @@
+import { Logger } from '@nestjs/common';
 import { QuotaReply, QuotaRule, QuotaStore, takeQuota } from '../auth/quota';
+import { withTimeout } from '../common/with-timeout';
 import { GuestLimits } from './guest-trial.types';
-import { withTimeout } from './with-timeout';
+
+const log = new Logger('GuestLimits');
 
 const HOUR = 60 * 60;
 const DAY = 24 * HOUR;
@@ -36,8 +39,10 @@ export interface FullWindow {
 /**
  * counted — учтено во всех окнах; иначе не учтено нигде (quota.ts), и full
  * называет заполненные окна. redisDown — Redis не ответил вовремя или упал:
- * проба закрывается без учёта. Не союз типов: в бэке strictNullChecks
- * выключен, и булев признак союз не сужает.
+ * проба закрывается без учёта. Таймаут не отменяет уже отправленную
+ * команду: если Redis жив, но медленный, учёт в окнах может всё же
+ * пройти — ответ вызывающему при этом всё равно «закрыто». Не союз типов:
+ * в бэке strictNullChecks выключен, и булев признак союз не сужает.
  */
 export interface GuestQuotaReply {
   counted: boolean;
@@ -49,7 +54,8 @@ export async function takeGuestQuota(store: QuotaStore, rules: GuestQuotaRule[],
   let reply: QuotaReply;
   try {
     reply = await withTimeout(takeQuota(store, rules), timeoutMs);
-  } catch {
+  } catch (e) {
+    log.warn(`guest quota: Redis недоступен или ответил не вовремя — ${e?.message}`);
     return { counted: false, redisDown: true, full: [] };
   }
   if (reply.counted) return { counted: true, redisDown: false, full: [] };
