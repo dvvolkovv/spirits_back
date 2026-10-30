@@ -102,7 +102,8 @@ export class GuestSessionsService {
          FROM guest_trial_sessions`,
     );
     /**
-     * answers_*/cost_usd_* — из событий guest_trial_answer (пишет ход гостя,
+     * answers_day/answers_week и cost_usd_day/cost_usd_week — из событий
+     * guest_trial_answer (пишет ход гостя,
      * задача A7: ts — момент ответа, props.cost_usd — его стоимость), а НЕ из
      * guest_trial_sessions.answers/cost_usd по created_at пробы: проба может
      * отвечать до 7 дней после создания, и привязка к created_at отнесла бы
