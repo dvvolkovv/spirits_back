@@ -32,6 +32,25 @@ function parseTelegramPostUrl(url: string): string | null {
 const RETRY_FROM = ['directing', 'writing'] as const;
 type RetryFrom = (typeof RETRY_FROM)[number];
 
+/** Тяжёлые поля ролика (около 35 КБ на собранный): в list не отдаём — они приходят в get. */
+function light(v: ShortVideo): Partial<ShortVideo> {
+  const out: Partial<ShortVideo> = { ...v };
+  delete out.capture;
+  delete out.script;
+  delete out.animation;
+  delete out.captions;
+  return out;
+}
+
+/**
+ * Метка версии в ссылке на файл: пересобранный ролик лежит по тому же адресу
+ * (`shorts/<id>/video.mp4`), и без метки браузер покажет прежнюю версию из кэша.
+ * nginx прода (`/smm-media/`) срезает строку запроса до MinIO.
+ */
+function withVersion(url: string, version: string | null): string {
+  return version ? `${url}?v=${encodeURIComponent(version)}` : url;
+}
+
 /**
  * Админка роликов: действия в одном POST, как admin/blog. Вкладка кабинета
  * появится в плане 3. На стенде это единственный способ запустить ролик
@@ -117,26 +136,31 @@ export class ShortsController {
     }
   }
 
-  private async list(): Promise<Array<ShortVideo & { publications: ShortPublication[] }>> {
-    const r = await this.pg.query(`SELECT * FROM short_video ORDER BY created_at DESC LIMIT 100`);
-    const videos = r.rows.map(rowToShort);
-    const pubs = videos.length
-      ? await this.pg.query(`SELECT * FROM short_publication WHERE short_id = ANY($1::uuid[])`, [videos.map((v) => v.id)])
+  private async list() {
+    const r = await this.pg.query(`SELECT *, updated_at::text AS version FROM short_video ORDER BY created_at DESC LIMIT 100`);
+    const pubs = r.rows.length
+      ? await this.pg.query(`SELECT * FROM short_publication WHERE short_id = ANY($1::uuid[])`, [r.rows.map((row: any) => row.id)])
       : { rows: [] };
     const byVideo = new Map<string, ShortPublication[]>();
     for (const p of pubs.rows.map(rowToPublication)) byVideo.set(p.shortId, [...(byVideo.get(p.shortId) ?? []), p]);
-    return videos.map((v) => ({ ...v, publications: byVideo.get(v.id) ?? [] }));
+    return r.rows.map((row: any) => ({
+      ...light(rowToShort(row)),
+      version: row.version ?? null,
+      publications: byVideo.get(row.id) ?? [],
+    }));
   }
 
   private async getOne(id: string) {
-    const v = await this.load(id);
+    const { short: v, version } = await this.loadVersioned(id);
     const pubs = await this.pg.query(`SELECT * FROM short_publication WHERE short_id = $1`, [id]);
     const bucket = shortsBucket();
+    const url = (key: string | null) => (key ? withVersion(this.storage.publicUrl(bucket, key), version) : null);
     return {
       ...v,
+      version,
       publications: pubs.rows.map(rowToPublication),
-      videoUrl: v.videoKey ? this.storage.publicUrl(bucket, v.videoKey) : null,
-      coverUrl: v.coverKey ? this.storage.publicUrl(bucket, v.coverKey) : null,
+      videoUrl: url(v.videoKey),
+      coverUrl: url(v.coverKey),
     };
   }
 
@@ -311,6 +335,14 @@ export class ShortsController {
       throw new ConflictException('ролик уже вышел на площадке — отклонить нельзя; оставшиеся площадки повторит retry');
     }
     throw new ConflictException('ролик успел уйти из failed — обновите список');
+  }
+
+  /** Ролик и его версия (`updated_at::text`) — для get: ею админка подписывает решения. */
+  private async loadVersioned(id: string): Promise<{ short: ShortVideo; version: string | null }> {
+    if (!UUID.test(id)) throw new BadRequestException('id ролика — uuid');
+    const r = await this.pg.query(`SELECT *, updated_at::text AS version FROM short_video WHERE id = $1`, [id]);
+    if (!r.rows.length) throw new NotFoundException('ролик не найден');
+    return { short: rowToShort(r.rows[0]), version: r.rows[0].version ?? null };
   }
 
   private async load(id: string): Promise<ShortVideo> {
