@@ -111,8 +111,11 @@ export class GuestTurnService {
 
     let session: GuestSessionRow;
     let issued: string | null = null;
+    // Хеш ключа — общий для обеих веток ниже: нужен ещё раз после busy.add (M2).
+    let tokenHash = '';
     if (input.token) {
-      const found = isGuestTokenShape(input.token) ? await this.sessions.findLive(hashGuestToken(input.token)) : null;
+      tokenHash = isGuestTokenShape(input.token) ? hashGuestToken(input.token) : '';
+      const found = tokenHash ? await this.sessions.findLive(tokenHash) : null;
       if (!found) {
         res.status(404).json({ error: 'trial' });
         return;
@@ -129,8 +132,9 @@ export class GuestTurnService {
         return;
       }
       issued = newGuestToken();
+      tokenHash = hashGuestToken(issued);
       session = await this.sessions.create({
-        tokenHash: hashGuestToken(issued),
+        tokenHash,
         assistantId: agent.id,
         lang: input.lang,
         source: input.source,
@@ -138,8 +142,8 @@ export class GuestTurnService {
       });
     }
 
-    const left = Math.max(0, limits.answersPerTrial - session.answers);
-    const guestEvent = { type: 'guest', ...(issued ? { token: issued } : {}), left };
+    let left = Math.max(0, limits.answersPerTrial - session.answers);
+    let guestEvent = { type: 'guest', ...(issued ? { token: issued } : {}), left };
     if (session.claimed_at || left === 0) {
       this.startStream(res);
       this.write(res, { ...guestEvent, left: 0 });
@@ -154,6 +158,23 @@ export class GuestTurnService {
 
     this.busy.add(session.id);
     try {
+      // M2: между первым чтением пробы (выше) и этим локом могла случиться
+      // гонка — перенос пробы в аккаунт с другой вкладки/устройства (его
+      // делает guest-claim.service, этот busy-лок он не видит и не трогает).
+      // Перечитываем свежую строку и пересчитываем left/claimed_at по ней,
+      // прежде чем тратить окно ответов и звать модель.
+      const fresh = await this.sessions.findLive(tokenHash);
+      left = fresh ? Math.max(0, limits.answersPerTrial - fresh.answers) : 0;
+      if (!fresh || fresh.claimed_at || left === 0) {
+        this.startStream(res);
+        this.write(res, { ...guestEvent, left: 0 });
+        this.write(res, { type: 'wall', reason: 'limit' });
+        this.end(res);
+        return;
+      }
+      session = fresh;
+      guestEvent = { type: 'guest', ...(issued ? { token: issued } : {}), left };
+
       // Claude сейчас недоступен (окно запасного пути открыто платными вызовами):
       // гостю — сразу ошибка, а не две минуты ожидания и занятый слот.
       if (this.claudeCli.fallbackStats().breakerOpenUntil > Date.now()) {
@@ -161,28 +182,40 @@ export class GuestTurnService {
         this.write(res, guestEvent);
         this.write(res, { type: 'error', code: 'model' });
         this.end(res);
+        this.events?.track('guest_trial_error', { props: { reason: 'breaker', assistant_id: String(agent.id) } });
         return;
       }
-      const q = await takeGuestQuota(this.redis, answerRules(limits), this.redisTimeoutMs);
-      if (!q.counted) {
-        this.closedStream(res, q, issued);
-        return;
-      }
-      // Проверка и счёт — синхронно, без await между ними: потолок не проскочить вдвоём.
+
+      // M1: занятый слот не должен тратить окно ответов — проверяем ДО
+      // takeGuestQuota(answerRules), а не после. Проверка и инкремент —
+      // синхронно, без await между ними: иначе два параллельных хода могли
+      // бы оба увидеть свободный слот и проскочить потолок вдвоём.
       if (this.inFlight >= limits.concurrentTurns) {
         this.startStream(res);
         this.write(res, guestEvent);
         this.write(res, { type: 'error', code: 'busy' });
         this.end(res);
+        this.events?.track('guest_trial_error', { props: { reason: 'busy', assistant_id: String(agent.id) } });
         return;
       }
       this.inFlight++;
-      this.chat?.beginStream();
       try {
-        await this.runTurn(input, res, session, agent, message, guestEvent, limits.answersPerTrial);
+        const q = await takeGuestQuota(this.redis, answerRules(limits), this.redisTimeoutMs);
+        if (!q.counted) {
+          this.closedStream(res, q, issued);
+          return;
+        }
+        // beginStream — только после успешного окна ответов: endStream ниже
+        // лежит в том же вложенном finally и поэтому вызывается ровно тогда,
+        // когда был вызван beginStream, — счётчики парные без отдельного флага.
+        this.chat?.beginStream();
+        try {
+          await this.runTurn(input, res, session, agent, message, guestEvent, limits.answersPerTrial);
+        } finally {
+          this.chat?.endStream();
+        }
       } finally {
         this.inFlight--;
-        this.chat?.endStream();
       }
     } finally {
       this.busy.delete(session.id);
@@ -310,7 +343,12 @@ export class GuestTurnService {
   }
 
   private closedStream(res: Response, q: GuestQuotaReply | null, token: string | null = null): void {
-    if (q) void this.reportClosed(q);
+    if (q) {
+      // Отчёт о закрытии — fire-and-forget: он не должен задерживать ответ
+      // гостю. Но не void — непойманный отказ внутри (сеть, Redis, Telegram)
+      // ушёл бы необработанным rejection'ом мимо собственных catch() метода.
+      this.reportClosed(q).catch((e: any) => this.log.warn(`reportClosed failed: ${String(e?.message ?? e).slice(0, 200)}`));
+    }
     this.startStream(res);
     this.write(res, { type: 'guest', ...(token ? { token } : {}), left: 0 });
     this.write(res, { type: 'wall', reason: 'closed' });
