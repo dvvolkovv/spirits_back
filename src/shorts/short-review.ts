@@ -36,10 +36,26 @@ export type ReviewResult =
   | { ok: true; short: ShortVideo }
   | { ok: false; reason: ReviewRefusal; status: ShortStatus | null };
 
-/** Версия ролика из list/get — `updated_at::text` Postgres, например «2026-10-30 12:34:56.123456+00». */
+/** Версия ролика из list/get, например «2026-10-30 12:34:56.123456+00» (формат — см. VERSION_SQL). */
 export const VERSION_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d{1,6})?[+-]\d{2}(:\d{2})?$/;
 /** Коды Postgres для невозможной даты (месяц 13, 30 февраля, смещение +99): форма версии верна, значение — нет. */
 export const BAD_TIMESTAMP_CODES = ['22007', '22008', '22009'];
+
+/**
+ * Версия ролика — одно SQL-выражение для list/get (loadVersioned), чтобы обе
+ * выдачи всегда давали одинаковую строку. Не `updated_at::text`: тот зависит от
+ * DateStyle и TimeZone сессии — под другим DateStyle (например, 'SQL, DMY')
+ * вышла бы совсем другая форма, не похожая на VERSION_RE, и всё версионирование
+ * сломалось бы молча на любом сеансе с нестандартными настройками.
+ *
+ * `AT TIME ZONE 'UTC'` — всегда UTC независимо от TimeZone сессии; `to_char(…,
+ * 'YYYY-MM-DD HH24:MI:SS.US')` — свой формат, не зависящий от DateStyle; `US` —
+ * всегда ровно 6 цифр (в отличие от `::text`, который обрезает конечные нули).
+ * `|| '+00'` — тот же хвост, что раньше давал `::text` при TimeZone = UTC;
+ * `AND updated_at = $n::timestamptz` всё равно разбирает года́-вперёд ISO
+ * однозначно при любом DateStyle, так что обратная запись не ломается.
+ */
+export const VERSION_SQL = `to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US') || '+00'`;
 
 /**
  * Условие версии к записи — только если версия передана: без неё SQL и

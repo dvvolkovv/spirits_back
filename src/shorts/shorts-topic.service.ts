@@ -10,7 +10,7 @@ import { toAgents } from './short-prompts';
 import { pickAssistants, planNext } from './short-rhythm';
 import { ShortsSettingsService } from './shorts-settings.service';
 import {
-  ANGLES, IN_WORK_STATUSES, MAX_IN_WORK, PROVOCATIVE_ANGLES, RUBRICS, SLOT_HOLDING_STATUSES,
+  ANGLE_TITLES, ANGLES, IN_WORK_STATUSES, MAX_IN_WORK, PROVOCATIVE_ANGLES, RUBRICS, SLOT_HOLDING_STATUSES,
   ShortAngle, ShortRubric, ShortSource, ShortVideo, rowToShort,
 } from './shorts.types';
 
@@ -88,7 +88,7 @@ export class ShortsTopicService {
       const agent = active.find((a) => a.id === Number(o.assistantId));
       if (!agent) throw new ShortOrderError(`ассистента ${o.assistantId} нет среди активных`);
       if (o.angle != null && isHealthAssistant(agent.name) && PROVOCATIVE_ANGLES.includes(o.angle)) {
-        throw new ShortOrderError(`«${agent.name}» — тема здоровья: только спокойная подача (calm)`);
+        throw new ShortOrderError(`«${agent.name}» — тема здоровья: только подача «${ANGLE_TITLES.calm}»`);
       }
       assistantId = agent.id;
     }

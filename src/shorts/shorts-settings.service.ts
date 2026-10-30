@@ -108,7 +108,7 @@ export function validateSettingsPatch(body: any, currentYoutubeMode?: YoutubeMod
     p.platforms = list;
   }
   if (b.narratorVoice !== undefined) {
-    if (!isValidVoice(b.narratorVoice, 'yandex')) throw new Error(`narratorVoice — голос SpeechKit: ${YANDEX_VOICE_IDS.join(', ')}`);
+    if (!isValidVoice(b.narratorVoice, 'yandex')) throw new Error(`Голос финала — один из голосов SpeechKit: ${YANDEX_VOICE_IDS.join(', ')}`);
     p.narratorVoice = b.narratorVoice;
   }
   if (b.format !== undefined) {

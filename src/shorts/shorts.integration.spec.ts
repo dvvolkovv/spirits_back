@@ -204,9 +204,11 @@ maybe('ролики против живого Postgres', () => {
     await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'telegram', 'published')`, [released.id]);
     const notReleased = await insert({ status: 'failed', failed_from: 'publishing', last_error: 'x' });
     await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'telegram', 'failed')`, [notReleased.id]);
-    // Платформы — только youtube: строки telegram нет вовсе, tg_unsent должен быть false (а не true «по умолчанию»).
+    // Платформы — только youtube, и тоже упал: строки telegram нет вовсе (released — false: 'failed'
+    // у youtube не входит в RELEASED_SQL, в отличие от manual_pending/manual_done), tg_unsent должен
+    // быть false (а не true «по умолчанию»), раз самой строки telegram никогда не было.
     const noTelegram = await insert({ status: 'failed', failed_from: 'publishing', last_error: 'x' });
-    await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'youtube', 'manual_pending')`, [noTelegram.id]);
+    await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'youtube', 'failed')`, [noTelegram.id]);
 
     const tg = { sendMessage: jest.fn(async () => ({ message_id: 1 })) };
     process.env.BLOG_APPROVER_TG_ID = '777';

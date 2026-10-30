@@ -43,20 +43,28 @@ const REANIMATE = 'Сценки ролика сейчас оживают — з�
  * Что дальше с упавшим роликом — кнопками экрана «Ролики» во вкладке «Блог»
  * админки. Набор — тот же, что показывает экран (actionsFor в spirits_front,
  * src/components/admin/shortStatus.ts): «Новый текст» — только при съёмке; у
- * упавшей публикации — «Повторить», «Пост вышел» — пока пост не в канале,
- * «Отклонить» — пока ролик нигде не вышел (YouTube грузится только после
- * вышедшего поста, так что его сбой — всегда «вышел»).
+ * упавшей публикации — «Повторить», «Пост вышел» — пока пост не в канале и
+ * только если в Telegram вообще отправляли (tgUnsent), «Отклонить» — пока
+ * ролик нигде не вышел (YouTube грузится только после вышедшего поста, так
+ * что его сбой — всегда «вышел»).
  */
-function failedHint(v: Pick<ShortVideo, 'failedFrom' | 'capture'>, released: boolean): string {
+function failedHint(v: Pick<ShortVideo, 'failedFrom' | 'capture'>, released: boolean, tgUnsent: boolean): string {
   const where = 'Что дальше — в админке: Блог → Ролики, раздел «Упали»:';
   if (v.failedFrom === 'publishing') {
-    return released
-      ? `${where} «Повторить» (пост в канале уже вышел, отклонить нельзя).`
-      : `${where} «Повторить», «Пост вышел» (если пост всё-таки в канале) или «Отклонить».`;
+    if (released) return `${where} «Повторить» (пост в канале уже вышел, отклонить нельзя).`;
+    // Платформы — только youtube (или вовсе без поддерживаемых) — строки telegram не было и нет,
+    // «Пост вышел» нечего подтверждать: markPublished 409-ит на такой ролик.
+    return tgUnsent
+      ? `${where} «Повторить», «Пост вышел» (если пост всё-таки в канале) или «Отклонить».`
+      : `${where} «Повторить» или «Отклонить».`;
   }
   const buttons = ['«Повторить»', '«Новая сцена»', ...(v.capture ? ['«Новый текст»'] : [])];
   return `${where} ${buttons.join(', ')} (можно с замечанием) или «Отклонить».`;
 }
+
+/** Строка telegram есть, но ещё не published — «Пост вышел» есть что подтверждать (markPublished). Строки нет вовсе (платформы — только youtube) — её и не предлагаем. */
+const TG_UNSENT_SQL =
+  `EXISTS (SELECT 1 FROM short_publication p WHERE p.short_id = short_video.id AND p.platform = 'telegram' AND p.status <> 'published')`;
 
 /** Почему замечание не принять — по статусу. Отказ лучше молчания: ответ наш, и владелец должен знать, куда он делся. */
 const NOTE_REFUSALS: Partial<Record<ShortStatus, string>> = {
@@ -298,7 +306,7 @@ export class ShortsApprovalService {
   private async sendExtraCaptions(v: ShortVideo, chatId: number, extra: string): Promise<void> {
     try {
       const sent: any = await this.tg.sendMessage(chatId, extra);
-      await this.rememberPrompt(v.id, 'note_prompt_ids', Number(sent.message_id));
+      await this.rememberPrompt(v.id, 'note_prompt_ids', Number(sent.message_id), chatId);
     } catch (e: any) {
       this.logger.warn(`ролик ${v.id}: подписи вторым сообщением не ушли: ${e.message}`);
     }
@@ -328,7 +336,15 @@ export class ShortsApprovalService {
     // замечанию узнаётся по паре «чат проверки + id».
     const stale = Number(cb?.message?.message_id) !== v.reviewMessageId || Number(cb?.message?.chat?.id) !== v.reviewChatId;
     if (parsed.action !== 'yt' && stale) {
-      await this.answer(cb, 'Это сообщение устарело — решение под последним сообщением с роликом');
+      // reviewMessageId == null — видео пришло, но записать его не успели (решение из админки
+      // подоспело раньше: sendForReview's WHERE status = 'pending_review' не совпал). Другого,
+      // более нового сообщения с роликом не существует — «устарело» сбило бы владельца с толку;
+      // честнее — отказ по уже решённому статусу, тот же, что получает «Одобрить» дважды подряд.
+      if (v.reviewMessageId == null && v.status !== 'pending_review') {
+        await this.answer(cb, buttonRefusal(v.status));
+      } else {
+        await this.answer(cb, 'Это сообщение устарело — решение под последним сообщением с роликом');
+      }
       return true;
     }
     switch (parsed.action) {
@@ -454,16 +470,23 @@ export class ShortsApprovalService {
       ...(replyTo ? { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } } : {}),
       reply_markup: { force_reply: true, input_field_placeholder: placeholder },
     });
-    await this.rememberPrompt(v.id, column, Number(prompt.message_id));
+    await this.rememberPrompt(v.id, column, Number(prompt.message_id), chatId);
   }
 
-  /** id сообщения — в конец списка ролика, не больше MAX_NOTE_PROMPTS последних. */
-  private async rememberPrompt(id: string, column: 'note_prompt_ids' | 'yt_prompt_ids', messageId: number): Promise<void> {
+  /**
+   * id сообщения — в конец списка ролика, не больше MAX_NOTE_PROMPTS последних.
+   * review_chat_id заполняется, только если он ещё NULL: ролик могли одобрить/отклонить
+   * из админки раньше, чем sendForReview успела записать его (гонка с решением из
+   * админки) — тогда video пришло, а review_chat_id остался NULL, и ответ на это самое
+   * приглашение потом не находился бы (`handleReplyEdit` ищет по review_chat_id).
+   */
+  private async rememberPrompt(id: string, column: 'note_prompt_ids' | 'yt_prompt_ids', messageId: number, chatId: number): Promise<void> {
     await this.pg.query(
       `UPDATE short_video
-          SET ${column} = (${column} || $2::bigint)[greatest(cardinality(${column}) + 2 - $3, 1):]
+          SET ${column} = (${column} || $2::bigint)[greatest(cardinality(${column}) + 2 - $3, 1):],
+              review_chat_id = COALESCE(review_chat_id, $4)
         WHERE id = $1`,
-      [id, messageId, MAX_NOTE_PROMPTS],
+      [id, messageId, MAX_NOTE_PROMPTS, chatId],
     );
   }
 
@@ -587,13 +610,14 @@ export class ShortsApprovalService {
              ORDER BY updated_at
              LIMIT 1
              FOR UPDATE SKIP LOCKED)
-          RETURNING *, ${RELEASED_SQL} AS released`,
+          RETURNING *, ${RELEASED_SQL} AS released, ${TG_UNSENT_SQL} AS tg_unsent`,
       );
       if (!r.rows.length) return;
       const v = rowToShort(r.rows[0]);
       const released = r.rows[0].released === true;
+      const tgUnsent = r.rows[0].tg_unsent === true;
       const what = v.failedFrom === 'publishing' ? (released ? 'вышел не на все площадки' : 'не вышел на площадки') : 'не собрался';
-      const next = failedHint(v, released);
+      const next = failedHint(v, released, tgUnsent);
       const text = `${isStand() ? STAND_MARK : ''}Ролик${quoted(v)} ${what}: ${clip(v.lastError || 'причина не записана', 600)}\n${next}`;
       const owner = approverChatId();
       if (!owner) {

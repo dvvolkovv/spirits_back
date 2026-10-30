@@ -1,4 +1,4 @@
-import { BadRequestException, Body, ConflictException, Controller, NotFoundException, Post, Res, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, Logger, NotFoundException, Post, Res, UseGuards } from '@nestjs/common';
 import { Response } from 'express';
 import { inTransaction } from '../blog/blog-slot-claim';
 import { AdminGuard } from '../common/guards/admin.guard';
@@ -7,7 +7,8 @@ import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { NoFreeSlotError } from '../blog/blog-slots';
 import {
-  BAD_TIMESTAMP_CODES, LEAVE_FROM, RELEASED_SQL, ReviewRefusal, VERSION_RE, explainRefusal, leaveReview, noteForReview, versionClause,
+  BAD_TIMESTAMP_CODES, LEAVE_FROM, RELEASED_SQL, ReviewRefusal, VERSION_RE, VERSION_SQL, explainRefusal, leaveReview, noteForReview,
+  versionClause,
 } from './short-review';
 import { approveShortIntoSlot, isShortSlotConflict } from './short-slot-claim';
 import { ShortSettingsPatch, ShortsSettingsService, validateSettingsPatch } from './shorts-settings.service';
@@ -113,6 +114,8 @@ export const LIST_COLUMNS = [
 
 @Controller('')
 export class ShortsController {
+  private readonly logger = new Logger(ShortsController.name);
+
   constructor(
     private readonly pg: PgService,
     private readonly settings: ShortsSettingsService,
@@ -155,24 +158,46 @@ export class ShortsController {
               : 'Не запустил: в очереди нет идей или запуск идёт параллельно — попробуйте ещё раз',
           );
         }
+        this.logger.log(`admin/shorts start_now ${v.id}: ${v.status}`);
         return res.status(200).json(v);
       }
       case 'refill_topics':
         return res.status(200).json({ added: await this.topics.refillWeek() });
-      case 'approve':
-        return res.status(200).json(await this.versioned(data.version, () => this.approve(String(data.id ?? ''), data.version)));
-      case 'redo':
-        return res.status(200).json(await this.versioned(data.version, () => this.leave(String(data.id ?? ''), 'directing', data.version)));
-      case 'note':
-        return res.status(200).json(await this.versioned(data.version, () => this.note(String(data.id ?? ''), data.text, data.version)));
-      case 'publish_now':
-        return res.status(200).json(await this.publishNow(String(data.id ?? '')));
-      case 'mark_published':
-        return res.status(200).json(await this.markPublished(String(data.id ?? ''), String(data.url ?? '')));
-      case 'retry':
-        return res.status(200).json(await this.retry(String(data.id ?? ''), data.from, data.note));
-      case 'reject':
-        return res.status(200).json(await this.versioned(data.version, () => this.reject(String(data.id ?? ''), data.version)));
+      case 'approve': {
+        const v = await this.versioned(data.version, () => this.approve(String(data.id ?? ''), data.version));
+        this.logger.log(`admin/shorts approve ${v.id}: ${v.status}`);
+        return res.status(200).json(v);
+      }
+      case 'redo': {
+        const v = await this.versioned(data.version, () => this.leave(String(data.id ?? ''), 'directing', data.version));
+        this.logger.log(`admin/shorts redo ${v.id}: ${v.status}`);
+        return res.status(200).json(v);
+      }
+      case 'note': {
+        const v = await this.versioned(data.version, () => this.note(String(data.id ?? ''), data.text, data.version));
+        this.logger.log(`admin/shorts note ${v.id}: ${v.status}`);
+        return res.status(200).json(v);
+      }
+      case 'publish_now': {
+        const v = await this.publishNow(String(data.id ?? ''));
+        this.logger.log(`admin/shorts publish_now ${v.id}: ${v.status}`);
+        return res.status(200).json(v);
+      }
+      case 'mark_published': {
+        const v = await this.markPublished(String(data.id ?? ''), String(data.url ?? ''));
+        this.logger.log(`admin/shorts mark_published ${v.id}: ${v.status}`);
+        return res.status(200).json(v);
+      }
+      case 'retry': {
+        const v = await this.retry(String(data.id ?? ''), data.from, data.note);
+        this.logger.log(`admin/shorts retry ${v.id}: ${v.status}`);
+        return res.status(200).json(v);
+      }
+      case 'reject': {
+        const v = await this.versioned(data.version, () => this.reject(String(data.id ?? ''), data.version));
+        this.logger.log(`admin/shorts reject ${v.id}: ${v.status}`);
+        return res.status(200).json(v);
+      }
       case 'get_settings':
         return res.status(200).json(await this.settings.get());
       case 'update_settings': {
@@ -207,7 +232,7 @@ export class ShortsController {
     const r = await this.pg.query(
       `SELECT * FROM (
          SELECT ${LIST_COLUMNS.join(', ')},
-                updated_at::text AS version,
+                ${VERSION_SQL} AS version,
                 ROW_NUMBER() OVER (PARTITION BY status ORDER BY COALESCE(published_at, updated_at) DESC) AS archive_rank
            FROM short_video
        ) t
@@ -308,18 +333,26 @@ export class ShortsController {
         await tx.query(`SELECT 1 FROM short_video WHERE id = $1 FOR NO KEY UPDATE`, [id]);
         // Строка telegram уже published (например, YouTube упал уже после неё, и админка могла
         // ещё показывать «Пост вышел») — WHERE не даёт переписать вышедший пост чужой ссылкой.
-        const ins = await tx.query(
-          `INSERT INTO short_publication (short_id, platform, status, url, external_id, published_at, last_error, updated_at)
-                VALUES ($1, 'telegram', 'published', $2, $3, now(), NULL, now())
-              ON CONFLICT (short_id, platform) DO UPDATE
-                SET status = 'published', url = $2, external_id = $3,
-                    published_at = COALESCE(short_publication.published_at, now()),
-                    last_error = NULL, updated_at = now()
-              WHERE short_publication.status <> 'published'`,
+        // UPDATE, не INSERT ... ON CONFLICT: строку telegram заводит только publish() (до
+        // отправки, для каждой настроенной площадки) — если её нет, значит, в Telegram этот
+        // ролик не отправляли вовсе (например, платформы — только youtube), и «Пост вышел»
+        // завёл бы фиктивную «вышедшую» площадку для поста, которого никто не публиковал.
+        const upd = await tx.query(
+          `UPDATE short_publication
+              SET status = 'published', url = $2, external_id = $3,
+                  published_at = COALESCE(published_at, now()), last_error = NULL, updated_at = now()
+            WHERE short_id = $1 AND platform = 'telegram' AND status <> 'published'`,
           [id, link, externalId],
         );
-        if (!ins.rowCount) {
-          throw new ConflictException('Пост уже отмечен вышедшим — «Пост вышел» не нужен, нажмите «Повторить»');
+        if (!upd.rowCount) {
+          // Нет строки вовсе — не отправляли; есть, но уже published — WHERE не даёт переписать
+          // вышедший пост чужой ссылкой (например, YouTube упал уже после неё).
+          const exists = await tx.query(`SELECT 1 FROM short_publication WHERE short_id = $1 AND platform = 'telegram'`, [id]);
+          throw new ConflictException(
+            exists.rowCount
+              ? 'Пост уже отмечен вышедшим — «Пост вышел» не нужен, нажмите «Повторить»'
+              : 'В канал этот ролик не отправлялся — «Пост вышел» не нужен, нажмите «Повторить»',
+          );
         }
         const r = await tx.query(
           `UPDATE short_video
@@ -380,7 +413,10 @@ export class ShortsController {
     if (!target) {
       throw new ConflictException(`Повторять нечего: ролик ${STATUS_WORDS[v.status] ?? v.status} — обновите список`);
     }
-    const ownerNote = typeof note === 'string' && note.trim() ? appendOwnerNote(v.ownerNote, note) : null;
+    // Trim перед срезом — как у note(): иначе 5000 ведущих пробелов срезали бы текст в пустую
+    // строку раньше, чем до него дойдёт trim (appendOwnerNote всё равно оставит MAX_OWNER_NOTE_CHARS).
+    const noteText = typeof note === 'string' ? note.trim().slice(0, MAX_OWNER_NOTE_CHARS * 2) : '';
+    const ownerNote = noteText ? appendOwnerNote(v.ownerNote, noteText) : null;
     const format = from != null ? (await this.settings.get()).format : null;
     // Видео — первым и в проверяющем условии: если ролик тем временем ушёл из failed (гонка с
     // mark_published/другим «Повторить»), 409 должен не записать ничего, включая площадки.
@@ -547,10 +583,10 @@ export class ShortsController {
     throw new ConflictException('Ролик успел уйти из упавших — обновите список');
   }
 
-  /** Ролик и его версия (`updated_at::text`) — для get: ею админка подписывает решения. */
+  /** Ролик и его версия (VERSION_SQL) — для get: ею админка подписывает решения. */
   private async loadVersioned(id: string): Promise<{ short: ShortVideo; version: string | null }> {
     if (!UUID.test(id)) throw new BadRequestException('id ролика — uuid');
-    const r = await this.pg.query(`SELECT *, updated_at::text AS version FROM short_video WHERE id = $1`, [id]);
+    const r = await this.pg.query(`SELECT *, ${VERSION_SQL} AS version FROM short_video WHERE id = $1`, [id]);
     if (!r.rows.length) throw new NotFoundException('ролик не найден');
     return { short: rowToShort(r.rows[0]), version: r.rows[0].version ?? null };
   }
