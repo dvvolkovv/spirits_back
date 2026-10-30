@@ -93,13 +93,17 @@ describe('POST admin/shorts', () => {
   });
 
   it('get — версия и ссылки на файлы с меткой версии', async () => {
-    const { ctl } = setup((sql) =>
+    const { ctl, pg } = setup((sql) =>
       sql.includes('FROM short_video') ? { rows: [video({ version: VERSION, cover_key: 'shorts/v/cover.jpg' })] } : { rows: [] });
     const r = res();
     await ctl.action({ action: 'get', id: ID }, r);
     expect(r.body.version).toBe(VERSION);
     expect(r.body.videoUrl).toBe(`https://minio.test/linkeon-smm-videos/shorts/v/video.mp4?v=${encodeURIComponent(VERSION)}`);
     expect(r.body.coverUrl).toBe(`https://minio.test/linkeon-smm-videos/shorts/v/cover.jpg?v=${encodeURIComponent(VERSION)}`);
+    // Версию даёт сам SELECT get: без алиаса заглушка молчала бы, а на стенде каждое решение получало бы 400.
+    expect(String(pg.query.mock.calls[0][0])).toContain('updated_at::text AS version');
+    // Закодированная метка — литералом: пробел, двоеточия и «+» не должны пройти сырыми.
+    expect(r.body.videoUrl).toBe('https://minio.test/linkeon-smm-videos/shorts/v/video.mp4?v=2026-10-30%2012%3A34%3A56.123456%2B00');
   });
 
   it('order — поля заказа; ошибка проверки — 400', async () => {
