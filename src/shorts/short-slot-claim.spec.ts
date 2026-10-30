@@ -64,4 +64,27 @@ describe('approveShortIntoSlot', () => {
     const { pg } = fakePg([], Array.from({ length: 5 }, () => () => { throw conflict(); }));
     await expect(approveShortIntoSlot(pg as any, 'v1', THU, schedule, () => NOW)).rejects.toBeInstanceOf(NoFreeSlotError);
   });
+
+  it('версия из админки — условие в записи одобрения; без версии SQL и параметры прежние', async () => {
+    const VERSION = '2026-10-30 12:34:56.123456+00';
+    const calls: any[][] = [];
+    const client = {
+      query: jest.fn(async (sql: string, params?: any[]) => {
+        calls.push([sql, params]);
+        return sql.trim().startsWith('UPDATE') ? { rowCount: 1 } : { rows: [] };
+      }),
+      release: jest.fn(),
+    };
+    const pg = { getClient: async () => client };
+    const update = () => calls.find(([sql]) => String(sql).trim().startsWith('UPDATE')) as any[];
+
+    await approveShortIntoSlot(pg as any, 'v1', THU, schedule, () => NOW, VERSION);
+    expect(update()[0]).toContain("WHERE id = $1 AND status = 'pending_review' AND updated_at = $3::timestamptz");
+    expect(update()[1]).toEqual(['v1', THU.toISOString(), VERSION]);
+
+    calls.length = 0;
+    await approveShortIntoSlot(pg as any, 'v1', THU, schedule, () => NOW);
+    expect(update()[0]).not.toContain('updated_at = $');
+    expect(update()[1]).toEqual(['v1', THU.toISOString()]);
+  });
 });
