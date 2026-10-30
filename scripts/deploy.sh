@@ -1590,6 +1590,9 @@ smoke_security_headers() {
     if ! grep -qiF "$expected" <<<"$headers"; then
       red "  ✗ отсутствует security-заголовок '$expected' ($ENV_NAME)"
       printf '%s\n' "$headers" | head -20
+      if [[ "$ENV_NAME" == "test" ]]; then
+        ssh_remote "curl -ksSI --max-time 20 ${auth:+-u "$auth"} https://localhost/" | head -20
+      fi
       return 1
     fi
   done
