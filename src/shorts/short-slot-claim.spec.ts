@@ -99,4 +99,17 @@ describe('approveShortIntoSlot', () => {
     expect(ups.map(([, p]) => p)).toEqual([['v1', THU.toISOString(), VERSION], ['v1', TUE.toISOString(), VERSION]]);
     expect(ups.every(([sql]) => String(sql).includes('AND updated_at = $3::timestamptz'))).toBe(true);
   });
+
+  it('одобрение обнуляет счётчик попыток, аренду и ошибку отправки в личку: дальше по счётчику считает публикатор', async () => {
+    const calls: string[] = [];
+    const client = {
+      query: jest.fn(async (sql: string) => {
+        calls.push(sql);
+        return sql.trim().startsWith('UPDATE') ? { rowCount: 1 } : { rows: [] };
+      }),
+      release: jest.fn(),
+    };
+    await approveShortIntoSlot({ getClient: async () => client } as any, 'v1', THU, schedule, () => NOW);
+    expect(calls.find((s) => s.trim().startsWith('UPDATE'))).toContain('attempts = 0, lease_until = NULL, last_error = NULL');
+  });
 });
