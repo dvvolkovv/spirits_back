@@ -1,5 +1,5 @@
 import { LEAVE_FROM, RELEASED_SQL, explainRefusal, leaveReview, noteForReview, versionClause } from './short-review';
-import { rowToShort } from './shorts.types';
+import { canTransition, rowToShort } from './shorts.types';
 
 const ID = '6f1c2a9e-0d4b-4c3e-9a51-3b2f7c8d9e10';
 const VERSION = '2026-10-30 12:34:56.123456+00';
@@ -34,6 +34,7 @@ describe('leaveReview', () => {
     const pg = fakePg({ rows: [row({ status: 'directing' })] });
     const out = await leaveReview(pg as any, ID, 'directing');
     expect(out).toMatchObject({ ok: true, short: { id: ID, status: 'directing' } });
+    expect(pg.query).toHaveBeenCalledTimes(1);
     const [sql, params] = pg.query.mock.calls[0] as any[];
     expect(sql).toContain('SET status = $2');
     expect(sql).toContain(`AND NOT ${RELEASED_SQL}`);
@@ -68,6 +69,7 @@ describe('noteForReview', () => {
     const pg = fakePg({ rows: [row({ status: 'writing' })] });
     const out = await noteForReview(pg as any, rowToShort(row({ owner_note: 'короче' })), 'без цифр');
     expect(out.ok).toBe(true);
+    expect(pg.query).toHaveBeenCalledTimes(1);
     const [sql, params] = pg.query.mock.calls[0] as any[];
     expect(sql).toContain("status = 'writing'");
     expect(sql).toContain("WHERE id = $1 AND status = 'pending_review'");
@@ -82,11 +84,25 @@ describe('noteForReview', () => {
     expect(sql).toContain('AND updated_at = $3::timestamptz');
     expect(params).toEqual([ID, 'без цифр', VERSION]);
   });
+
+  it('ролик уже не ждёт решения — причина «статус», а не «версия»', async () => {
+    const pg = fakePg({ rows: [] }, { status: 'approved', released: false });
+    expect(await noteForReview(pg as any, rowToShort(row()), 'без цифр', VERSION))
+      .toEqual({ ok: false, reason: 'status', status: 'approved' });
+  });
 });
 
 describe('explainRefusal', () => {
   it('«вышел» важнее статуса', async () => {
     const pg = fakePg({ rows: [] }, { status: 'published', released: true });
     expect(await explainRefusal(pg as any, ID, ['pending_review'])).toEqual({ reason: 'released', status: 'published' });
+  });
+});
+
+describe('LEAVE_FROM и таблица переходов', () => {
+  it('«Переснять» и «Отклонить» разрешены из обоих статусов, замечание — из ждущего решения', () => {
+    expect(LEAVE_FROM).toEqual(['pending_review', 'approved']);
+    expect(LEAVE_FROM.every((s) => canTransition(s, 'directing') && canTransition(s, 'rejected'))).toBe(true);
+    expect(canTransition('pending_review', 'writing')).toBe(true);
   });
 });
