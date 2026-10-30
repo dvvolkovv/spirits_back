@@ -125,7 +125,7 @@ describe('ShortsApprovalService', () => {
       const writeAt = pg.query.mock.calls.findIndex((c: any[]) => String(c[0]).includes('review_message_id = $3'));
       expect(pg.query.mock.invocationCallOrder[writeAt]).toBeLessThan(tg.sendMessage.mock.invocationCallOrder[0]);
       const upd = pg.query.mock.calls.find((c: any[]) => String(c[0]).includes('note_prompt_ids =')) as any[];
-      expect(upd[1]).toEqual([ID, 900, 20]);
+      expect(upd[1]).toEqual([ID, 900, 20, OWNER]);
     });
 
     it('подписи вторым сообщением не ушли — видео уже записано, повтора отправки нет', async () => {
@@ -329,7 +329,7 @@ describe('ShortsApprovalService', () => {
       expect(opts.reply_markup.force_reply).toBe(true);
       expect(opts.reply_parameters).toEqual({ message_id: 12, allow_sending_without_reply: true });
       const upd = pg.query.mock.calls.find((c: any[]) => String(c[0]).includes('note_prompt_ids =')) as any[];
-      expect(upd[1]).toEqual([ID, 900, 20]);
+      expect(upd[1]).toEqual([ID, 900, 20, OWNER]);
     });
 
     it('«Замечание» на одобренном, но уже вышедшем ролике — без обещания работающей кнопки «Переснять»', async () => {
