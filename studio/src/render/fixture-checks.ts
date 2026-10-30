@@ -13,6 +13,12 @@ const PLATFORM = { lufs: -14, lufsTol: 1, maxTp: -0.8 } as const;
 /** Нижняя зона интерфейса площадок — подпись, канал, кнопки; у TikTok она выше всех: 22 % высоты кадра. */
 const UI_ZONE = Math.ceil(FRAME.height * 0.22);
 
+/** Правая колонка кнопок площадок; у TikTok она шире всех: 14 % ширины кадра. */
+const UI_RIGHT = Math.ceil(FRAME.width * 0.14);
+
+/** Полоса, где стоит дисклеймер: строки прямо над зоной; выше — строка «Ссылка — в описании…». */
+const DISCLAIMER_BAND = 70;
+
 /** Белый текст финала на зелёном градиенте ярче этого, сам градиент — темнее 130. */
 const TEXT_LUMA = 180;
 
@@ -28,11 +34,11 @@ function ebur128(video: string): { i: number; tp: number } {
   };
 }
 
-/** Самая яркая точка строк y0…y1 последнего кадра, 0–255. */
-function maxLuma(video: string, y0: number, y1: number): number {
+/** Самая яркая точка прямоугольника x0…x1 × y0…y1 последнего кадра, 0–255. */
+function maxLuma(video: string, x0: number, y0: number, x1: number, y1: number): number {
   const raw = execFileSync(
     'ffmpeg',
-    ['-v', 'error', '-sseof', '-0.3', '-i', video, '-frames:v', '1', '-vf', `crop=iw:${y1 - y0}:0:${y0},format=gray`, '-f', 'rawvideo', '-'],
+    ['-v', 'error', '-sseof', '-0.3', '-i', video, '-frames:v', '1', '-vf', `crop=${x1 - x0}:${y1 - y0}:${x0}:${y0},format=gray`, '-f', 'rawvideo', '-'],
     { maxBuffer: 64 * 1024 * 1024 },
   );
   let max = 0;
@@ -42,16 +48,18 @@ function maxLuma(video: string, y0: number, y1: number): number {
 
 /**
  * Что не так с готовым роликом для площадок: громкость не в норме или в финале
- * текст в нижней зоне интерфейса. Дисклеймер финала обязан остаться — прямо
- * над зоной. Пустой список — годен.
+ * текст под интерфейсом — в нижней зоне или под правой колонкой кнопок.
+ * Дисклеймер финала обязан остаться — прямо над нижней зоной. Пустой список — годен.
  */
 export function deliveryProblems(video: string): string[] {
   const problems: string[] = [];
   const l = ebur128(video);
   if (!(Math.abs(l.i - PLATFORM.lufs) <= PLATFORM.lufsTol)) problems.push(`громкость ${l.i} LUFS, нужна ${PLATFORM.lufs} ± ${PLATFORM.lufsTol}`);
   if (!(l.tp <= PLATFORM.maxTp)) problems.push(`пик ${l.tp} dBTP выше ${PLATFORM.maxTp}`);
-  const zone = FRAME.height - UI_ZONE;
-  if (maxLuma(video, zone, FRAME.height) >= TEXT_LUMA) problems.push(`в финале текст в нижних ${UI_ZONE} px — под интерфейсом площадок`);
-  if (maxLuma(video, zone - 100, zone) < TEXT_LUMA) problems.push('в финале нет дисклеймера над зоной интерфейса');
+  const { width: w, height: h } = FRAME;
+  const zone = h - UI_ZONE;
+  if (maxLuma(video, 0, zone, w, h) >= TEXT_LUMA) problems.push(`в финале текст в нижних ${UI_ZONE} px — под интерфейсом площадок`);
+  if (maxLuma(video, w - UI_RIGHT, 0, w, h) >= TEXT_LUMA) problems.push(`в финале текст в правых ${UI_RIGHT} px — под кнопками площадок`);
+  if (maxLuma(video, 0, zone - DISCLAIMER_BAND, w, zone) < TEXT_LUMA) problems.push('в финале нет дисклеймера над зоной интерфейса');
   return problems;
 }

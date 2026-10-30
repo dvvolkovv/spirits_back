@@ -47,9 +47,12 @@ test('норма площадок: −14 LUFS, пик не выше −1 dBTP', 
   assert.deepEqual(MASTER, { lufs: -14, tp: -1, lra: 11 });
 });
 
-test('строка для лога: было → стало; тишина — не выравнивалась', () => {
+test('строка для лога: было → стало; вне нормы — с пометкой для поиска; тишина — не выравнивалась', () => {
   const after: Loudness = { i: -14.02, tp: -1.31, lra: 2.1, thresh: -24.8, offset: 0 };
   assert.equal(describeLoudness({ before: SAMPLE, after }), 'громкость -19.6 → -14.0 LUFS, пик -4.6 → -1.3 dBTP');
+  assert.equal(describeLoudness({ before: SAMPLE, after: { ...after, tp: -0.9 } }), 'громкость -19.6 → -14.0 LUFS, пик -4.6 → -0.9 dBTP');
+  assert.equal(describeLoudness({ before: SAMPLE, after: { ...after, tp: -0.6 } }), 'громкость -19.6 → -14.0 LUFS, пик -4.6 → -0.6 dBTP — вне нормы');
+  assert.equal(describeLoudness({ before: SAMPLE, after: { ...after, i: -15.2 } }), 'громкость -19.6 → -15.2 LUFS, пик -4.6 → -1.3 dBTP — вне нормы');
   const silent: Loudness = { ...SAMPLE, i: -Infinity, tp: -Infinity };
   assert.equal(describeLoudness({ before: silent, after: silent }), 'громкость: тишина, не выравнивалась');
 });
@@ -85,13 +88,17 @@ function atoms(file: string): string[] {
 
 const tmp = (): string => fs.mkdtempSync(path.join(os.tmpdir(), 'studio-master-'));
 
-test('выравнивание: −14 LUFS и пик не выше −1 dBTP; видео — как было, звук не сдвинут, moov в начале', { timeout: 60_000 }, async () => {
+test('выравнивание, как у роликов, — динамическим режимом: −14 LUFS, пик не выше −1 dBTP; видео — как было, звук не сдвинут, moov в начале', { timeout: 60_000 }, async () => {
   const dir = tmp();
-  // Реплики 1–3 с и 6–7,5 с на −26 дБ: сборка тише нормы, как ролики до выравнивания.
-  const input = makeVideo(dir, '0.05*sin(2*PI*300*t)*(between(t\\,1\\,3)+between(t\\,6\\,7.5))');
+  // Реплики 1–3 с и 6–7,5 с на −26 дБ с плавными акцентами раз в секунду. Линейный подъём
+  // вывел бы пик за потолок, и loudnorm работает в динамическом режиме (буфер 3 с,
+  // ограничитель) — как на роликах стенда: им срезать 1,2–5 дБ, здесь ≈ 3,5. Резкие всплески
+  // не годятся: на них выброс кодера AAC 0,9–2,6 дБ (см. TP_HEADROOM_DB в loudness.ts).
+  const input = makeVideo(dir, '(0.05*sin(2*PI*300*t)+0.25*sin(2*PI*600*t)*pow(sin(PI*mod(t\\,1)/0.1)\\,2)*lt(mod(t\\,1)\\,0.1))*(between(t\\,1\\,3)+between(t\\,6\\,7.5))');
   const output = path.join(dir, 'video.mp4');
   const r = await masterLoudness(input, output);
   assert.ok(r.before.i < -25, `до выравнивания ${r.before.i} LUFS`);
+  assert.ok(r.before.tp + (MASTER.lufs - r.before.i) > MASTER.tp - 0.5, `вход не уводит loudnorm в динамический режим: пик ${r.before.tp} dBTP`);
   const after = await measureLoudness(output);
   assert.ok(Math.abs(after.i - MASTER.lufs) <= 1, `после выравнивания ${after.i} LUFS`);
   assert.ok(after.tp <= MASTER.tp + 0.1, `пик ${after.tp} dBTP`);
@@ -106,17 +113,15 @@ test('выравнивание: −14 LUFS и пик не выше −1 dBTP; в
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('громкие акценты: ограничитель срезает пик, громкость всё равно −14, пик не выше −1 dBTP', { timeout: 60_000 }, async () => {
+test('сбой ffmpeg — причина в первой строке сообщения: владельцу уходит только она (errorText)', { timeout: 60_000 }, async () => {
   const dir = tmp();
-  // Речь на −26 дБ и плавные акценты раз в секунду: линейный подъём на 13 дБ вывел бы пик
-  // на +2 dBTP, срезать ≈ 3,5 дБ — как на роликах стенда (1,2–5 дБ). Резкие всплески не
-  // годятся: на них выброс кодера AAC 0,9–2,6 дБ (см. TP_HEADROOM_DB в loudness.ts).
-  const input = makeVideo(dir, '0.05*sin(2*PI*300*t)*between(t\\,0.5\\,7.5)+0.25*sin(2*PI*600*t)*pow(sin(PI*mod(t\\,1)/0.1)\\,2)*lt(mod(t\\,1)\\,0.1)');
-  const output = path.join(dir, 'video.mp4');
-  await masterLoudness(input, output);
-  const after = await measureLoudness(output);
-  assert.ok(Math.abs(after.i - MASTER.lufs) <= 1, `после выравнивания ${after.i} LUFS`);
-  assert.ok(after.tp <= MASTER.tp + 0.1, `пик ${after.tp} dBTP`);
+  const input = path.join(dir, 'render.mp4');
+  fs.writeFileSync(input, 'не видео');
+  await assert.rejects(masterLoudness(input, path.join(dir, 'video.mp4')), (e: unknown) => {
+    const first = (e instanceof Error ? e.message : String(e)).split('\n')[0];
+    assert.match(first, /^громкость: ffmpeg — .*Invalid data found when processing input/);
+    return true;
+  });
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

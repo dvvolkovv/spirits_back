@@ -61,7 +61,8 @@ test('рендер фикстуры: 1080×1920, 30–60 с, звук по вс�
       voice: 'madirus',
       speed: 1,
       lines: lines.map((l) => ({ id: l.id, scene: l.scene, text: l.text, ...('box' in l ? { box: l.box } : {}) })),
-      final: { assistantsCount: 18, disclaimer: 'Ответ ИИ, не заменяет специалиста' },
+      // Самый длинный дисклеймер (src/shorts/short-assistants.ts) — ближе всех к правой колонке кнопок.
+      final: { assistantsCount: 18, disclaimer: 'Ответ ИИ, не заменяет финансового консультанта' },
     }),
   );
 
