@@ -169,28 +169,50 @@ maybe('перенос пробы в аккаунт против живого Pos
    * ловится ДО commit, в середине транзакции: ни запись в custom_chat_history,
    * ни claimed_at/claimed_by_hash, ни удаление сообщений пробы не должны
    * уцелеть.
+   *
+   * Важно: подменяем ТОЛЬКО свою обёртку-прокси, а не client.query на самом
+   * объекте из pool.connect() — node-postgres переиспользует объекты клиентов
+   * между вызовами connect()/release(), и порча метода прямо на нём пережила
+   * бы этот тест и ударила бы по следующему, который её не ждёт (приводило к
+   * зависанию прогона — ROLLBACK/release у чужого claim() молча не проходили).
+   * realClient здесь всегда отдаётся release() без изменений.
    */
   it('сбой посреди переноса — вся транзакция откатывается, данные пробы на месте', async () => {
     const { token, row } = await trial(12, 1);
-    const flakyPg = {
-      query: (s: string, p?: any[]) => pool.query(s, p),
-      getClient: async () => {
-        const client: any = await pool.connect();
-        const realQuery = client.query.bind(client);
-        client.query = (sql: any, params?: any[]) => {
-          const text = typeof sql === 'string' ? sql : '';
-          if (text.includes('DELETE FROM guest_trial_messages')) return Promise.reject(new Error('boom: имитация сбоя'));
-          return realQuery(sql, params);
-        };
-        return client;
+    const realClient = await pool.connect();
+    let released = false;
+    const proxyClient = {
+      query: (sql: any, params?: any[]) => {
+        const text = typeof sql === 'string' ? sql : '';
+        if (text.includes('DELETE FROM guest_trial_messages')) return Promise.reject(new Error('boom: имитация сбоя'));
+        return realClient.query(sql, params);
+      },
+      release: (err?: any) => {
+        released = true;
+        return realClient.release(err);
       },
     };
+    const flakyPg = {
+      query: (s: string, p?: any[]) => pool.query(s, p),
+      getClient: async () => proxyClient,
+    };
     const flakySvc = new GuestClaimService(flakyPg as any, redis as any, neo4j as any, events as any);
-    await expect(flakySvc.claim('u-broken', token)).rejects.toThrow('boom');
-    expect(await sessions.messages(row.id)).toHaveLength(2);
-    expect(await history('u-broken_12')).toEqual([]);
-    const check = await pool.query('SELECT claimed_at FROM guest_trial_sessions WHERE id = $1', [row.id]);
-    expect(check.rows[0].claimed_at).toBeNull();
+    try {
+      await expect(flakySvc.claim('u-broken', token)).rejects.toThrow('boom');
+      expect(await sessions.messages(row.id)).toHaveLength(2);
+      expect(await history('u-broken_12')).toEqual([]);
+      const check = await pool.query('SELECT claimed_at FROM guest_trial_sessions WHERE id = $1', [row.id]);
+      expect(check.rows[0].claimed_at).toBeNull();
+      // Соединение обязано вернуться в пул сразу внутри claim() — иначе
+      // красный тест тихо повиснет, а не упадёт (см. комментарий выше теста).
+      expect(released).toBe(true);
+    } finally {
+      // Страховка прогона, а не замена утверждения выше: если claim() когда-
+      // нибудь перестанет сам освобождать соединение, тест всё равно не
+      // оставит его висеть в пуле (иначе получили бы ровно то же зависание,
+      // которое уже один раз случилось на этом тесте).
+      if (!released) realClient.release(true);
+    }
   });
 
   it('разбор профиля — не больше пяти последних пар', async () => {
