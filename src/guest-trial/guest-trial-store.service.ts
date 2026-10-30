@@ -55,11 +55,13 @@ export class GuestTrialStore implements OnModuleInit {
     const genAtStart = this.generation;
     const r = await this.pg.query(`SELECT key, value FROM guest_trial_settings WHERE key IN ('mode', 'limits')`);
     const byKey = new Map<string, unknown>(r.rows.map((row: any) => [row.key, row.value]));
-    const { limits, ignored } = sanitizeLimits(byKey.get('limits'));
+    const limitsRaw = byKey.get('limits');
+    const { limits, ignored } = sanitizeLimits(limitsRaw);
+    const limitsNotObject = limitsRaw !== undefined && !(limitsRaw && typeof limitsRaw === 'object' && !Array.isArray(limitsRaw));
     const modeRaw = byKey.get('mode');
     const mode = parseMode(modeRaw);
     const modeUnknown = modeRaw !== undefined && modeRaw !== 'off' && mode === 'off';
-    this.warnOnChange(ignored, modeUnknown, modeRaw);
+    this.warnOnChange(ignored, limitsNotObject, modeUnknown, modeRaw);
     const value: GuestSettings = { mode, limits: Object.freeze(limits) };
     Object.freeze(value);
     if (this.generation === genAtStart) this.cache = { at: Date.now(), value };
@@ -83,7 +85,9 @@ export class GuestTrialStore implements OnModuleInit {
     }
     const r = await this.pg.query(
       `INSERT INTO guest_trial_settings (key, value) VALUES ('limits', $1::jsonb)
-       ON CONFLICT (key) DO UPDATE SET value = guest_trial_settings.value || EXCLUDED.value, updated_at = now()
+       ON CONFLICT (key) DO UPDATE SET
+         value = (CASE WHEN jsonb_typeof(guest_trial_settings.value) = 'object' THEN guest_trial_settings.value ELSE '{}'::jsonb END) || EXCLUDED.value,
+         updated_at = now()
        RETURNING value`,
       [JSON.stringify(patch)],
     );
@@ -93,10 +97,11 @@ export class GuestTrialStore implements OnModuleInit {
   }
 
   /** Лог «что не так» только при смене сигнатуры — не на каждый перечит кэша. */
-  private warnOnChange(ignored: string[], modeUnknown: boolean, modeRaw: unknown): void {
-    const signature = `${ignored.join(',')}|${modeUnknown ? String(modeRaw) : ''}`;
+  private warnOnChange(ignored: string[], limitsNotObject: boolean, modeUnknown: boolean, modeRaw: unknown): void {
+    const signature = `${ignored.join(',')}|${limitsNotObject}|${modeUnknown ? String(modeRaw) : ''}`;
     if (signature === this.lastWarnSignature) return;
     this.lastWarnSignature = signature;
+    if (limitsNotObject) this.log.warn('guest_trial_settings.limits: значение не объект, использую умолчания');
     if (ignored.length) this.log.warn(`guest_trial_settings.limits: пропущены ${ignored.join(', ')}`);
     if (modeUnknown) this.log.warn(`guest_trial_settings.mode: неизвестное значение ${String(modeRaw)}`);
   }

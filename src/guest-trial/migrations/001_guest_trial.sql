@@ -5,15 +5,20 @@
 -- таблицу даже при готовом индексе — см. tokens/002).
 --
 -- ОТКАТ:
---   DROP TABLE guest_trial_messages;
---   DROP TABLE guest_trial_sessions;
---   DROP TABLE guest_trial_settings;
+--   Быстрый — режим 'off' (админ-ручка или прямой UPDATE guest_trial_settings
+--   по key='mode'): пробу выключает немедленно, таблицы и данные остаются.
+--   Полный — DROP TABLE, и только ПОСЛЕ того, как GuestTrialModule убран из
+--   app.module.ts: иначе следующий старт API создаст таблицы заново.
+--     DROP TABLE guest_trial_messages;
+--     DROP TABLE guest_trial_sessions;
+--     DROP TABLE guest_trial_settings;
 --
 -- ⚠️ Для будущих 002+: ALTER TABLE … ADD COLUMN IF NOT EXISTS берёт
 -- ACCESS EXCLUSIVE на таблицу на КАЖДОМ старте, даже когда колонка уже есть —
 -- в отличие от CREATE TABLE IF NOT EXISTS это не бесплатный no-op. Добавлять
--- колонку только через проверку каталога (to_regclass / information_schema)
--- внутри DO — так же, как здесь сделаны индексы.
+-- колонку только через проверку каталога (information_schema.columns или
+-- pg_attribute — to_regclass резолвит имя ОТНОШЕНИЯ, для колонки не подходит)
+-- внутри DO.
 DO $guest_trial$
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtext('guest-trial/001'));
@@ -47,7 +52,8 @@ BEGIN
   );
 
   -- Режим и лимиты: в базе, а не в .env — файлы на сервере руками не правим.
-  -- Ключи: 'mode' ("off" | "preview" | "on"), 'limits' (объект GuestLimits).
+  -- Ключи: 'mode' ("off" | "preview" | "on"), 'limits' (только переопределения
+  -- поверх умолчаний кода — DEFAULT_GUEST_LIMITS, а не полный объект GuestLimits).
   CREATE TABLE IF NOT EXISTS guest_trial_settings (
     key        text PRIMARY KEY,
     value      jsonb NOT NULL,

@@ -105,7 +105,7 @@ export function parseLimitsPatch(raw: unknown): { patch: Partial<GuestLimits>; i
   const patch: Partial<GuestLimits> = {};
   const ignored: string[] = [];
   for (const key of Object.keys(src)) {
-    if (!(key in DEFAULT_GUEST_LIMITS)) {
+    if (!Object.prototype.hasOwnProperty.call(DEFAULT_GUEST_LIMITS, key)) {
       ignored.push(`${key}: неизвестный ключ`);
       continue;
     }
