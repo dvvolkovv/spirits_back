@@ -13,6 +13,11 @@ import type { Storage } from './storage';
 const ID = '6f1c2a9e-0d4b-4c3e-9a51-3b2f7c8d9e10';
 const scene: Scene = { kind: 'chat', assistantId: 10, assistantName: 'Алексей', question: 'Вопрос', followups: [] };
 const script = { hook: 'h', voice: 'madirus', lines: [], final: { assistantsCount: 18 } } as unknown as Script;
+/** Громкость сборки: до и после выравнивания (render/run-render.ts). */
+const LOUD = {
+  before: { i: -19.56, tp: -4.63, lra: 2.6, thresh: -30.31, offset: 0.05 },
+  after: { i: -14.02, tp: -1.31, lra: 2.1, thresh: -24.8, offset: 0 },
+};
 
 /** written — что вернут записи итога; failOutcome — исход сбоя. jobs — задания, с которыми звали очередь. */
 function fakeQueue(jobs: Partial<Record<JobKind, Job>>, opts: { written?: boolean; failOutcome?: FailOutcome; saved?: boolean } = {}) {
@@ -142,13 +147,34 @@ test('сборка: снимки из MinIO, сценарий и съёмка ф
       assert.deepEqual(JSON.parse(fs.readFileSync(path.join(runDir, 'script.json'), 'utf8')), script);
       fs.writeFileSync(path.join(runDir, 'video.mp4'), 'видео');
       fs.writeFileSync(path.join(runDir, 'cover.jpg'), 'обложка');
-      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 44.2 };
+      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 44.2, loudness: LOUD };
     },
   });
   assert.equal(await runOne(d), true);
   assert.equal(files.get(videoKey(ID)), 'видео');
   assert.equal(files.get(coverKey(ID)), 'обложка');
   assert.deepEqual(calls.render[0], [ID, { videoKey: `shorts/${ID}/video.mp4`, coverKey: `shorts/${ID}/cover.jpg`, durationMs: 44200 } satisfies RenderOutput]);
+});
+
+test('сборка: громкость до и после выравнивания — в лог', async () => {
+  const capture = { scene, questionShotKey: 'q-key', answerShotKey: 'a-key', boxes: [], paragraphs: [] } as unknown as StoredCapture;
+  const { queue } = fakeQueue({ render: job('render', { capture, script }) });
+  const { storage, files } = fakeStorage();
+  files.set('q-key', 'вопрос');
+  files.set('a-key', 'ответ');
+  const lines: string[] = [];
+  const d = deps({
+    queue,
+    storage,
+    log: (line) => lines.push(line),
+    render: async (runDir): Promise<RenderResult> => {
+      fs.writeFileSync(path.join(runDir, 'video.mp4'), 'видео');
+      fs.writeFileSync(path.join(runDir, 'cover.jpg'), 'обложка');
+      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 40, loudness: LOUD };
+    },
+  });
+  assert.equal(await runOne(d), true);
+  assert.ok(lines.some((l) => l.includes(ID) && l.includes('громкость -19.6 → -14.0 LUFS, пик -4.6 → -1.3 dBTP')), lines.join('\n'));
 });
 
 test('сборка — первой, оживление — до съёмки: ролик ближе к концу пути', async () => {
@@ -163,7 +189,7 @@ test('проверка файла не прошла — video_invalid с пов�
   const d = deps({
     queue,
     storage: fakeStorage().storage,
-    render: async (runDir) => ({ video: path.join(runDir, 'v'), cover: path.join(runDir, 'c'), problems: ['тишина 3.1 с с 23.0 с'], durationSec: 44 }),
+    render: async (runDir) => ({ video: path.join(runDir, 'v'), cover: path.join(runDir, 'c'), problems: ['тишина 3.1 с с 23.0 с'], durationSec: 44, loudness: LOUD }),
   });
   await runOne(d);
   const [, err] = calls.fail[0] as [string, StudioError];
@@ -193,7 +219,7 @@ test('итог и сбой — по захвату: очередь получа�
     render: async (runDir) => {
       fs.writeFileSync(path.join(runDir, 'video.mp4'), 'видео');
       fs.writeFileSync(path.join(runDir, 'cover.jpg'), 'обложка');
-      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 40 };
+      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 40, loudness: LOUD };
     },
   }));
   assert.equal(calls.jobs[0], claimed);
@@ -226,7 +252,7 @@ test('задание забрал другой процесс: сбой — gone
     render: async (runDir) => {
       fs.writeFileSync(path.join(runDir, 'video.mp4'), 'видео');
       fs.writeFileSync(path.join(runDir, 'cover.jpg'), 'обложка');
-      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 40 };
+      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 40, loudness: LOUD };
     },
   }));
   assert.equal(b.calls.fail.length, 0, 'неудавшаяся запись итога — не сбой задания');
@@ -345,7 +371,7 @@ test('сборка со сценками: клипы — из MinIO по animati
       assert.equal(fs.readFileSync(path.join(runDir, 'skits/fp-p/clip.mp4'), 'utf8'), 'клип развязки');
       fs.writeFileSync(path.join(runDir, 'video.mp4'), 'видео');
       fs.writeFileSync(path.join(runDir, 'cover.jpg'), 'обложка');
-      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 33 };
+      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 33, loudness: LOUD };
     },
   });
   await runOne(d);

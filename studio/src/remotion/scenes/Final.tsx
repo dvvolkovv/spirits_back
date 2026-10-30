@@ -1,5 +1,6 @@
 import React from 'react';
 import { AbsoluteFill, Img, spring, staticFile, useCurrentFrame, useVideoConfig } from 'remotion';
+import { UI_BOTTOM } from '../../frame';
 import { assistantsLabel } from '../../plural';
 import { C, fontFamily } from '../theme';
 
@@ -37,8 +38,13 @@ export const Final: React.FC<{ assistantsCount: number; disclaimer?: string }> =
       <div style={{ fontWeight: 800, fontSize: 58, marginTop: 8 }}>{assistantsLabel(assistantsCount)}</div>
       <div style={{ fontWeight: 900, fontSize: 64, marginTop: 72, color: C.forest500 }}>my.linkeon.io</div>
       <div style={{ fontWeight: 700, fontSize: 44, marginTop: 18 }}>Ссылка — в описании и в профиле</div>
+      {/*
+        Над зоной интерфейса площадок: ниже дисклеймер закрыли бы подпись, канал и кнопки.
+        По бокам — 160 px, как у субтитров справа: колонка кнопок у TikTok — 14 % ширины.
+        Самый длинный дисклеймер («…финансового консультанта») встаёт в две строки.
+      */}
       {disclaimer ? (
-        <div style={{ position: 'absolute', bottom: 140, left: 80, right: 80, fontWeight: 700, fontSize: 34, opacity: 0.85 }}>
+        <div style={{ position: 'absolute', bottom: UI_BOTTOM + 20, left: 160, right: 160, fontWeight: 700, fontSize: 34, opacity: 0.85 }}>
           {disclaimer}
         </div>
       ) : null}

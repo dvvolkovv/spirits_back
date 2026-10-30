@@ -7,6 +7,7 @@ import { renderMedia, renderStill, selectComposition } from '@remotion/renderer'
 import { parseConfig } from '../config';
 import { StudioError, toStudioError } from '../errors';
 import { detectSilences, probeFile, SHORT_LIMITS, SKIT_LIMITS, verifyVideo, type VerifyLimits } from '../ffprobe';
+import { describeLoudness, masterLoudness, type Mastered } from '../loudness';
 import { validateScript } from '../script';
 import { synthesizeAll } from '../tts';
 import { SKIT_KINDS, type CaptureResult, type Script, type ShortAnimation, type ShortProps, type SkitShortProps } from '../types';
@@ -19,6 +20,8 @@ export interface RenderResult {
   cover: string;
   problems: string[];
   durationSec: number;
+  /** Громкость до и после выравнивания к норме площадок. */
+  loudness: Mastered;
 }
 
 /** Что собирать: композиция, её пропсы, пропсы обложки и пределы проверки файла. */
@@ -59,7 +62,8 @@ function readAnimation(runDir: string): ShortAnimation {
 
 /**
  * Папка съёмки (capture.json, script.json, скриншоты) → video.mp4 и cover.jpg
- * в той же папке. Папка служит publicDir бандла: staticFile() берёт файлы из неё.
+ * в той же папке; громкость video.mp4 — норма площадок (loudness.ts).
+ * Папка служит publicDir бандла: staticFile() берёт файлы из неё.
  * skipTts — озвучка только из кеша (для фикстуры без сети).
  * Сценарий со сценками собирается композицией SkitShort: нужен animation.json
  * задания animate (npm run animate). Обложка у него — сценка 1 с надписью-зацепкой,
@@ -92,16 +96,21 @@ export async function renderRun(runDir: string, opts: { skipTts?: boolean } = {}
   const serveUrl = await bundle({ entryPoint: path.join(STUDIO_ROOT, 'src', 'remotion', 'index.ts'), publicDir: runDir });
   try {
     const composition = await selectComposition({ serveUrl, id: build.id, inputProps: build.props });
-    const video = path.join(runDir, 'video.mp4');
-    await renderMedia({ composition, serveUrl, codec: 'h264', outputLocation: video, inputProps: build.props, concurrency: 2 });
+    // Сборка Remotion — до выравнивания громкости; в ролик идёт video.mp4.
+    const rendered = path.join(runDir, 'render.mp4');
+    await renderMedia({ composition, serveUrl, codec: 'h264', outputLocation: rendered, inputProps: build.props, concurrency: 2 });
     const cover = path.join(runDir, 'cover.jpg');
     // Remotion рисует пропсы, с которыми выбрана композиция, — у обложки со своими пропсами выбор свой.
     const coverComposition = build.cover === build.props ? composition : await selectComposition({ serveUrl, id: build.id, inputProps: build.cover });
     await renderStill({ composition: coverComposition, serveUrl, output: cover, frame: 20, inputProps: build.cover, imageFormat: 'jpeg' });
 
+    // Тишина — по сборке до выравнивания: пороги detectSilences подобраны на голосе ≈ −19,5 LUFS.
+    const silences = await detectSilences(rendered, (await probeFile(rendered)).durationSec);
+    const video = path.join(runDir, 'video.mp4');
+    const loudness = await masterLoudness(rendered, video);
+    await fs.promises.rm(rendered, { force: true });
     const probe = await probeFile(video);
-    const silences = await detectSilences(video, probe.durationSec);
-    return { video, cover, problems: verifyVideo(probe, silences, build.limits), durationSec: probe.durationSec };
+    return { video, cover, problems: verifyVideo(probe, silences, build.limits), durationSec: probe.durationSec, loudness };
   } finally {
     // bundle() кладёт бандл и копию папки съёмки в новый каталог /tmp на каждый вызов
     // и сам его не удаляет — без этого сотни рендеров на сервере съедают диск.
@@ -121,7 +130,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       console.error(`render: проверка файла не прошла:\n- ${r.problems.join('\n- ')}`);
       process.exit(1);
     }
-    console.log(`render: готово → ${r.video} (обложка ${r.cover})`);
+    console.log(`render: готово → ${r.video} (обложка ${r.cover}); ${describeLoudness(r.loudness)}`);
   } catch (e) {
     const err = toStudioError(e);
     console.error(`render: ${err.code} — ${err.message}`);

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { parseConfig } from '../config';
-import { StudioError, toStudioError, type StudioErrorCode } from '../errors';
+import { failText, StudioError, toStudioError, type StudioErrorCode } from '../errors';
 import { detectSilences, probeFile, type ProbeInfo } from '../ffprobe';
 import { SKIT_KINDS, type Script, type ShortAnimation, type SkitClip, type SkitKind, type SkitPlan } from '../types';
 import { checkClip, CLIP_LUFS, normalizeLoudness } from './clip-check';
@@ -79,12 +79,6 @@ const FINGERPRINT = /^[0-9a-z-]+$/;
  * повтор новых денег не стоит.
  */
 class StorageError extends StudioError {}
-
-/** Последняя строка stderr ffmpeg — причина; первая строка сообщения execFile — сама команда. */
-const failText = (e: unknown): string => {
-  const stderr = String((e as { stderr?: unknown })?.stderr ?? '').trim().split('\n').pop();
-  return stderr || (e instanceof Error ? e.message.split('\n')[0] : String(e));
-};
 
 /** Запись через временный файл: обрыв посреди записи не оставит обрезанный клип, кадр или счёт секунд. */
 function writeAtomic(file: string, data: string | Buffer): void {
