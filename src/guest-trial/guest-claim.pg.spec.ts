@@ -7,6 +7,7 @@ import { GuestSessionsService } from './guest-sessions.service';
 import { GuestClaimService } from './guest-claim.service';
 import { guestCarryKey } from './guest-carry';
 import { hashGuestToken, newGuestToken } from './guest-token';
+import { MASHA_AGENT_ID } from './guest-trial.types';
 
 const PG = process.env.PROVISIONING_PG_URL;
 const maybe = PG ? describe : describe.skip;
@@ -72,13 +73,18 @@ maybe('перенос пробы в аккаунт против живого Pos
         [row.id, new Date(Date.now() - 100 * 1000)],
       );
     }
-    return { token, row };
+    const stamps = pairs > 0
+      ? (await pool.query('SELECT created_at FROM guest_trial_messages WHERE session_id = $1::uuid ORDER BY id', [row.id])).rows.map((x: any) => x.created_at)
+      : [];
+    return { token, row, stamps };
   }
   const history = (sid: string) =>
     pool.query('SELECT sender_type, content, agent FROM custom_chat_history WHERE session_id = $1 ORDER BY created_at, id', [sid]).then((r) => r.rows);
+  const createdAts = (sid: string) =>
+    pool.query('SELECT created_at FROM custom_chat_history WHERE session_id = $1 ORDER BY created_at, id', [sid]).then((r) => r.rows.map((x) => x.created_at));
 
-  it('новый аккаунт: пары в истории по порядку, гостевые сообщения стёрты, приписки нет', async () => {
-    const { token, row } = await trial(12, 2);
+  it('новый аккаунт: пары в истории по порядку, гостевые сообщения стёрты, приписка для релея', async () => {
+    const { token, row, stamps } = await trial(12, 2);
     const r = await svc.claim('u-new', token);
     expect(r).toEqual({ status: 200, body: { assistantId: '12', moved: 4 } });
     expect(await history('u-new_12')).toEqual([
@@ -87,12 +93,28 @@ maybe('перенос пробы в аккаунт против живого Pos
       { sender_type: 'human', content: 'Вопрос 2', agent: 12 },
       { sender_type: 'ai', content: 'Ответ 2', agent: 12 },
     ]);
+    // Перенесённые строки несут исходное время сообщений пробы, не момент переноса.
+    expect(await createdAts('u-new_12')).toEqual(stamps);
     expect(await sessions.messages(row.id)).toEqual([]);
-    expect(redis.peek(guestCarryKey('u-new', '12'))).toBeNull();
+    // Приписка — даже новому аккаунту: claim() не видит сессий релея, только
+    // custom_chat_history. Если этот аккаунт уже вёл сессию с ассистентом 12
+    // на релее, она возобновится по --resume без пробы, если не оставить приписку.
+    expect(redis.peek(guestCarryKey('u-new', '12'))).toContain('Человек: Вопрос 1');
     await new Promise((res) => setImmediate(res));
     await new Promise((res) => setImmediate(res));
-    expect(neo4j.consolidateFromChat).toHaveBeenCalledWith('u-new', '12', 'Вопрос 1', 'Ответ 1');
-    expect(events.track).toHaveBeenCalledWith('guest_trial_claimed', { userId: 'u-new', props: { assistant_id: '12', answers: 2, existing: false } });
+    expect(neo4j.consolidateFromChat).toHaveBeenCalledWith('u-new', '12', 'Вопрос 1', 'Ответ 1', '');
+    expect(neo4j.consolidateFromChat).toHaveBeenCalledWith('u-new', '12', 'Вопрос 2', 'Ответ 2', 'Ответ 1');
+    expect(events.track).toHaveBeenCalledWith('guest_trial_claimed', {
+      userId: 'u-new',
+      props: { assistant_id: '12', answers: 2, existing: false, trial: row.id, source: null },
+    });
+  });
+
+  it('новый аккаунт у Маши — приписки всё равно нет (она не зависит от hadHistory)', async () => {
+    const { token } = await trial(MASHA_AGENT_ID, 1);
+    const r = await svc.claim('u-new-masha', token);
+    expect(r.status).toBe(200);
+    expect(redis.peek(guestCarryKey('u-new-masha', String(MASHA_AGENT_ID)))).toBeNull();
   });
 
   it('повтор тем же — moved 0, другим — 409', async () => {
@@ -114,9 +136,10 @@ maybe('перенос пробы в аккаунт против живого Pos
     expect((await svc.claim('u1', token)).status).toBe(409);
   });
 
-  it('одновременные переносы тем же — история не двоится', async () => {
+  it('одновременные переносы тем же — история не двоится, перенёс только один', async () => {
     const { token } = await trial(12, 2);
-    await Promise.all([svc.claim('u1', token), svc.claim('u1', token), svc.claim('u1', token)]);
+    const results = await Promise.all([svc.claim('u1', token), svc.claim('u1', token), svc.claim('u1', token)]);
+    expect(results.map((r) => r.body.moved).sort((a, b) => Number(a) - Number(b))).toEqual([0, 0, 4]);
     expect(await history('u1_12')).toHaveLength(4);
   });
 
@@ -138,5 +161,55 @@ maybe('перенос пробы в аккаунт против живого Pos
     const masha = await trial(3, 1);
     expect((await svc.claim('u-old', masha.token)).status).toBe(200);
     expect(redis.peek(guestCarryKey('u-old', '3'))).toBeNull();
+  });
+
+  /**
+   * Ревью A8: если ROLLBACK сам прошёл нормально, соединение возвращается в
+   * пул обычным release() (release(false)) — это именно тот случай. Сбой
+   * ловится ДО commit, в середине транзакции: ни запись в custom_chat_history,
+   * ни claimed_at/claimed_by_hash, ни удаление сообщений пробы не должны
+   * уцелеть.
+   */
+  it('сбой посреди переноса — вся транзакция откатывается, данные пробы на месте', async () => {
+    const { token, row } = await trial(12, 1);
+    const flakyPg = {
+      query: (s: string, p?: any[]) => pool.query(s, p),
+      getClient: async () => {
+        const client: any = await pool.connect();
+        const realQuery = client.query.bind(client);
+        client.query = (sql: any, params?: any[]) => {
+          const text = typeof sql === 'string' ? sql : '';
+          if (text.includes('DELETE FROM guest_trial_messages')) return Promise.reject(new Error('boom: имитация сбоя'));
+          return realQuery(sql, params);
+        };
+        return client;
+      },
+    };
+    const flakySvc = new GuestClaimService(flakyPg as any, redis as any, neo4j as any, events as any);
+    await expect(flakySvc.claim('u-broken', token)).rejects.toThrow('boom');
+    expect(await sessions.messages(row.id)).toHaveLength(2);
+    expect(await history('u-broken_12')).toEqual([]);
+    const check = await pool.query('SELECT claimed_at FROM guest_trial_sessions WHERE id = $1', [row.id]);
+    expect(check.rows[0].claimed_at).toBeNull();
+  });
+
+  it('разбор профиля — не больше пяти последних пар', async () => {
+    const { token } = await trial(12, 6);
+    await svc.claim('u-many', token);
+    await new Promise((res) => setImmediate(res));
+    await new Promise((res) => setImmediate(res));
+    expect(neo4j.consolidateFromChat).toHaveBeenCalledTimes(5);
+    expect(neo4j.consolidateFromChat).not.toHaveBeenCalledWith('u-many', '12', 'Вопрос 1', 'Ответ 1', expect.anything());
+    expect(neo4j.consolidateFromChat).toHaveBeenNthCalledWith(1, 'u-many', '12', 'Вопрос 2', 'Ответ 2', '');
+  });
+
+  it('сбой разбора одной пары не останавливает перенос следующей', async () => {
+    const { token } = await trial(12, 2);
+    neo4j.consolidateFromChat.mockRejectedValueOnce(new Error('boom'));
+    await svc.claim('u-partial-fail', token);
+    await new Promise((res) => setImmediate(res));
+    await new Promise((res) => setImmediate(res));
+    expect(neo4j.consolidateFromChat).toHaveBeenCalledTimes(2);
+    expect(neo4j.consolidateFromChat).toHaveBeenNthCalledWith(2, 'u-partial-fail', '12', 'Вопрос 2', 'Ответ 2', 'Ответ 1');
   });
 });

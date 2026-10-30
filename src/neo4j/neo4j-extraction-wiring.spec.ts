@@ -44,4 +44,17 @@ describe('Neo4jService.consolidateFromChat: промпт извлечения', 
     expect(post).toHaveBeenCalled();
     expect((post.mock.calls[0][1] as any).messages[0].content).toBe(buildProfileExtractionPrompt('PREV', 'USER', 'CUR'));
   });
+
+  /**
+   * Перенос пробы в аккаунт (guest-claim.service.ts) вставляет все пары
+   * заранее одним махом, поэтому передаёт предыдущую реплику явно, а не даёт
+   * сервису достать её своим запросом (он отдал бы одну и ту же «PREV» на
+   * каждую пару). Явная пустая строка — валидное значение «начало диалога»,
+   * отличное от «параметр не передан».
+   */
+  it('явная prevAssistantMessage (пятый аргумент), включая пустую строку — без запроса к базе', async () => {
+    const { svc, cli } = makeService('{}');
+    await svc.consolidateFromChat('u', 'a', 'USER2', 'CUR2', '');
+    expect(cli.text).toHaveBeenCalledWith(buildProfileExtractionPrompt('', 'USER2', 'CUR2'), expect.anything());
+  });
 });
