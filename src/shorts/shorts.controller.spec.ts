@@ -7,6 +7,7 @@ import { ShortOrderError } from './shorts-topic.service';
 import { ShortsController } from './shorts.controller';
 
 const ID = '6f1c2a9e-0d4b-4c3e-9a51-3b2f7c8d9e10';
+const VERSION = '2026-10-30 12:34:56.123456+00';
 const video = (over: Record<string, any> = {}) => ({
   id: ID, rubric: 'assistant', angle: 'calm', source: 'manual', topic_key: 't', status: 'failed',
   failed_from: 'capturing', video_key: 'shorts/v/video.mp4', cover_key: null, ...over,
@@ -70,6 +71,35 @@ describe('POST admin/shorts', () => {
     expect(r.body.coverUrl).toBeNull();
     await expect(ctl.action({ action: 'get', id: 'x' }, res())).rejects.toBeInstanceOf(BadRequestException);
     await expect(setup().ctl.action({ action: 'get', id: ID }, res())).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('list — без тяжёлых полей, с версией строкой из базы', async () => {
+    const { ctl, pg } = setup((sql) =>
+      sql.includes('FROM short_publication')
+        ? { rows: [] }
+        : {
+            rows: [video({
+              status: 'pending_review', version: VERSION,
+              capture: { answerText: 'x' }, script: { hook: 'h' }, animation: { omniSeconds: 16 }, captions: { telegram: 'TG' },
+            })],
+          },
+    );
+    const r = res();
+    await ctl.action({ action: 'list' }, r);
+    expect(String(pg.query.mock.calls[0][0])).toContain('updated_at::text AS version');
+    expect(r.body[0].version).toBe(VERSION);
+    for (const heavy of ['capture', 'script', 'animation', 'captions']) expect(r.body[0]).not.toHaveProperty(heavy);
+    expect(r.body[0]).toMatchObject({ id: ID, status: 'pending_review', publications: [] });
+  });
+
+  it('get — версия и ссылки на файлы с меткой версии', async () => {
+    const { ctl } = setup((sql) =>
+      sql.includes('FROM short_video') ? { rows: [video({ version: VERSION, cover_key: 'shorts/v/cover.jpg' })] } : { rows: [] });
+    const r = res();
+    await ctl.action({ action: 'get', id: ID }, r);
+    expect(r.body.version).toBe(VERSION);
+    expect(r.body.videoUrl).toBe(`https://minio.test/linkeon-smm-videos/shorts/v/video.mp4?v=${encodeURIComponent(VERSION)}`);
+    expect(r.body.coverUrl).toBe(`https://minio.test/linkeon-smm-videos/shorts/v/cover.jpg?v=${encodeURIComponent(VERSION)}`);
   });
 
   it('order — поля заказа; ошибка проверки — 400', async () => {
