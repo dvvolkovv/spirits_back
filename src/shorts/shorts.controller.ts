@@ -5,8 +5,9 @@ import { AdminGuard } from '../common/guards/admin.guard';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
-import { isShortSlotConflict } from './short-slot-claim';
-import { RELEASED_SQL } from './short-review';
+import { NoFreeSlotError } from '../blog/blog-slots';
+import { LEAVE_FROM, RELEASED_SQL, ReviewRefusal, explainRefusal, leaveReview, noteForReview, versionClause } from './short-review';
+import { approveShortIntoSlot, isShortSlotConflict } from './short-slot-claim';
 import { ShortSettingsPatch, ShortsSettingsService, validateSettingsPatch } from './shorts-settings.service';
 import { ShortOrderError, ShortsTopicService } from './shorts-topic.service';
 import {
@@ -51,9 +52,44 @@ function withVersion(url: string, version: string | null): string {
   return version ? `${url}?v=${encodeURIComponent(version)}` : url;
 }
 
+/** Версия ролика из list/get — `updated_at::text` Postgres, например «2026-10-30 12:34:56.123456+00». */
+const VERSION_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d{1,6})?[+-]\d{2}(:\d{2})?$/;
+const NEED_VERSION = 'нужна версия ролика (поле version из list или get)';
+const STALE_SHORT = 'Ролик изменился, пока был открыт: на экране устаревшая версия';
+const RELEASED_TEXT = 'Ролик уже вышел на площадке — переснять или отклонить нельзя';
+/** Коды Postgres для невозможной даты (месяц 13, 30 февраля, смещение +99): форма версии верна, значение — нет. */
+const BAD_TIMESTAMP_CODES = ['22007', '22008', '22009'];
+
+/** Статус ролика словами — для отказов админки, без внутренних имён. */
+const STATUS_WORDS: Record<ShortStatus, string> = {
+  idea: 'идея',
+  directing: 'у режиссёра',
+  capture_queued: 'ждёт съёмки',
+  capturing: 'снимается',
+  writing: 'у сценариста',
+  animate_queued: 'ждёт оживления',
+  animating: 'оживляется',
+  render_queued: 'ждёт сборки',
+  rendering: 'собирается',
+  pending_review: 'ждёт решения',
+  approved: 'одобрен',
+  publishing: 'публикуется',
+  published: 'опубликован',
+  rejected: 'отклонён',
+  failed: 'упал',
+};
+
+/** Что разрешено решению — первая половина отказа «не тот статус». */
+const ALLOWED_WORDS = {
+  approve: 'Одобрить можно только ролик, который ждёт решения',
+  note: 'Замечание можно только к ролику, который ждёт решения',
+  leave: 'Переснять или отклонить можно только ролик, который ждёт решения или запланирован',
+} as const;
+type ReviewKind = keyof typeof ALLOWED_WORDS;
+
 /**
- * Админка роликов: действия в одном POST, как admin/blog. Вкладка кабинета
- * появится в плане 3. На стенде это единственный способ запустить ролик
+ * Админка роликов: действия в одном POST, как admin/blog; экран — «Блог» →
+ * «Ролики» в кабинете (AdminShortsView). На стенде это единственный способ запустить ролик
  * (`start_now`) и выпустить одобренный, не дожидаясь слота (`publish_now`).
  * `refill_topics` — каталог недели сейчас, а не в воскресенье: после того как
  * слотов в неделе стало больше или автозапуск только что включили.
@@ -109,6 +145,12 @@ export class ShortsController {
       }
       case 'refill_topics':
         return res.status(200).json({ added: await this.topics.refillWeek() });
+      case 'approve':
+        return res.status(200).json(await this.versioned(() => this.approve(String(data.id ?? ''), data.version)));
+      case 'redo':
+        return res.status(200).json(await this.versioned(() => this.leave(String(data.id ?? ''), 'directing', data.version)));
+      case 'note':
+        return res.status(200).json(await this.versioned(() => this.note(String(data.id ?? ''), data.text, data.version)));
       case 'publish_now':
         return res.status(200).json(await this.publishNow(String(data.id ?? '')));
       case 'mark_published':
@@ -116,7 +158,7 @@ export class ShortsController {
       case 'retry':
         return res.status(200).json(await this.retry(String(data.id ?? ''), data.from, data.note));
       case 'reject':
-        return res.status(200).json(await this.reject(String(data.id ?? '')));
+        return res.status(200).json(await this.versioned(() => this.reject(String(data.id ?? ''), data.version)));
       case 'get_settings':
         return res.status(200).json(await this.settings.get());
       case 'update_settings': {
@@ -310,29 +352,121 @@ export class ShortsController {
     return from;
   }
 
-  /**
-   * «Отклонить» упавший ролик: повтор не поможет или ролик больше не нужен.
-   * Нельзя, если он уже вышел хоть на одной площадке (пост в канале, набор
-   * YouTube у владельца) — как у «Отклонить» в личке, иначе rejected оказался бы
-   * ролик с живым постом. Условие — в самом UPDATE, а не чтением перед ним.
-   */
-  private async reject(id: string): Promise<ShortVideo> {
-    const v = await this.load(id);
-    if (v.status !== 'failed' || !canTransition(v.status, 'rejected')) {
-      throw new ConflictException(`отклонить здесь можно только упавший ролик, а он в статусе ${v.status}`);
+  /** Версия решения: без неё — 400, если она обязательна; кривая — 400, а не 500 от Postgres. */
+  private version(raw: unknown, required: boolean): string | null {
+    if (raw === undefined || raw === null || raw === '') {
+      if (required) throw new BadRequestException(NEED_VERSION);
+      return null;
     }
+    if (typeof raw !== 'string' || !VERSION_RE.test(raw)) {
+      throw new BadRequestException(`version — метка версии из list или get, получено «${String(raw).slice(0, 60)}»`);
+    }
+    return raw;
+  }
+
+  /**
+   * Регулярка версии проверяет только форму: «2026-13-45 12:34:56+00» она
+   * пропустит, а Postgres ответит 22008. Это ошибка запроса (400), а не сервера.
+   */
+  private async versioned<T>(work: () => Promise<T>): Promise<T> {
+    try {
+      return await work();
+    } catch (e: any) {
+      if (BAD_TIMESTAMP_CODES.includes(e?.code)) throw new BadRequestException('version — метка версии из list или get');
+      throw e;
+    }
+  }
+
+  /** Отказ общего модуля решений — 409 со словами для человека (404 — строки нет). */
+  private refused(kind: ReviewKind, out: { reason: ReviewRefusal; status: ShortStatus | null }): never {
+    if (out.reason === 'not_found') throw new NotFoundException('ролик не найден');
+    if (out.reason === 'stale') {
+      throw new ConflictException({ statusCode: 409, error: 'version_conflict', message: STALE_SHORT });
+    }
+    if (out.reason === 'released') {
+      // Одобрение и замечание «вышел» в записи не проверяют — до такого ролика сейчас не дойти,
+      // но и «этот — ждёт решения» в отказе было бы противоречием.
+      throw new ConflictException(kind === 'leave' ? RELEASED_TEXT : 'Ролик уже вышел на площадке — решение по нему не принять');
+    }
+    const now = out.status ? STATUS_WORDS[out.status] : 'в неизвестном статусе';
+    throw new ConflictException(`${ALLOWED_WORDS[kind]}; этот — ${now}. Обновите список.`);
+  }
+
+  /**
+   * «Одобрить» из админки — та же запись, что у кнопки в личке
+   * (approveShortIntoSlot), с версией: файл пересобранного ролика лежит по
+   * тому же адресу, и одобрить можно только ту версию, что владелец видел.
+   */
+  private async approve(id: string, rawVersion: unknown): Promise<ShortVideo> {
+    const version = this.version(rawVersion, true);
+    const v = await this.load(id);
+    let approved: unknown;
+    try {
+      approved = await approveShortIntoSlot(this.pg, v.id, v.slotAt, await this.settings.get(), undefined, version);
+    } catch (e: any) {
+      if (e instanceof NoFreeSlotError) throw new ConflictException(`не одобрил: ${e.message}`);
+      throw e;
+    }
+    if (!approved) return this.refused('approve', await explainRefusal(this.pg, v.id, ['pending_review']));
+    return this.load(v.id);
+  }
+
+  /** «Переснять» и «Отклонить» ждущего решения или запланированного — общей записью, с версией. */
+  private async leave(id: string, target: 'directing' | 'rejected', rawVersion: unknown): Promise<ShortVideo> {
+    const version = this.version(rawVersion, true);
+    if (!UUID.test(id)) throw new BadRequestException('id ролика — uuid');
+    const out = await leaveReview(this.pg, id, target, version);
+    if (out.ok === false) return this.refused('leave', out);
+    return out.short;
+  }
+
+  /** Замечание к ролику, который ждёт решения: дописывается к прежним, ролик — к сценаристу. */
+  private async note(id: string, rawText: unknown, rawVersion: unknown): Promise<ShortVideo> {
+    const version = this.version(rawVersion, true);
+    const text = typeof rawText === 'string' ? rawText.trim() : '';
+    if (!text) throw new BadRequestException('text — замечание строкой');
+    const v = await this.load(id);
+    const out = await noteForReview(this.pg, v, text, version);
+    if (out.ok === false) return this.refused('note', out);
+    return out.short;
+  }
+
+  /**
+   * «Отклонить». Ждущий решения и запланированный — общей записью, как кнопка
+   * в личке, с обязательной версией. Упавший — как раньше: нельзя, если он уже
+   * вышел хоть на одной площадке (пост в канале, набор YouTube у владельца),
+   * иначе rejected оказался бы ролик с живым постом; версия здесь
+   * необязательна, а если пришла — проверяется. Условие — в самом UPDATE, а не
+   * чтением перед ним.
+   */
+  private async reject(id: string, rawVersion: unknown): Promise<ShortVideo> {
+    const v = await this.load(id);
+    if (LEAVE_FROM.includes(v.status)) return this.leave(id, 'rejected', rawVersion);
+    const version = this.version(rawVersion, false);
+    if (v.status !== 'failed' || !canTransition(v.status, 'rejected')) {
+      throw new ConflictException(
+        `отклонить можно упавший, ждущий решения или запланированный ролик, а он в статусе ${STATUS_WORDS[v.status] ?? v.status}`,
+      );
+    }
+    const params: any[] = [id];
+    const clause = versionClause(params, version);
     const r = await this.pg.query(
       `UPDATE short_video SET status = 'rejected', approved_at = NULL, lease_until = NULL, updated_at = now()
         WHERE id = $1 AND status = 'failed'
-          AND NOT ${RELEASED_SQL}
+          AND NOT ${RELEASED_SQL}${clause}
         RETURNING *`,
-      [id],
+      params,
     );
     if (r.rows.length) return rowToShort(r.rows[0]);
-    // Отличаем «уже вышел» от «уже не failed» чтением после неудачной записи.
-    const after = await this.pg.query(`SELECT status, ${RELEASED_SQL} AS released FROM short_video WHERE id = $1`, [id]);
-    if (after.rows[0]?.released) {
-      throw new ConflictException('ролик уже вышел на площадке — отклонить нельзя; оставшиеся площадки повторит retry');
+    // Почему не записалось — тем же чтением, что у решений по готовому ролику.
+    const why = await explainRefusal(this.pg, id, ['failed']);
+    if (why.reason === 'released') {
+      throw new ConflictException('ролик уже вышел на площадке — отклонить нельзя; оставшиеся площадки повторит «Повторить»');
+    }
+    if (why.reason === 'not_found') throw new NotFoundException('ролик не найден');
+    // «stale» без версии — гонка (ролик ушёл из failed и вернулся), а не устаревшая карточка.
+    if (why.reason === 'stale' && version) {
+      throw new ConflictException({ statusCode: 409, error: 'version_conflict', message: STALE_SHORT });
     }
     throw new ConflictException('ролик успел уйти из failed — обновите список');
   }
