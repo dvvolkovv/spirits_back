@@ -170,6 +170,17 @@ describe('ход гостя: поток', () => {
     await h.turn({ token, message: 'А ещё?' });
     expect(h.cli.textWithCost.mock.calls[1][0]).toBe('USER: Привет\n\nASSISTANT: Здравствуйте\n\nUSER: А ещё?');
   });
+
+  it('история в промпте ограничена последними двумя парами (I2)', async () => {
+    const h = harness({ limits: { answersPerTrial: 5 } });
+    const token = (await h.turn()).evs[0].token;
+    await h.turn({ token, message: 'Второй' });
+    await h.turn({ token, message: 'Третий' });
+    await h.turn({ token, message: 'Четвёртый' });
+    const prompt = h.cli.textWithCost.mock.calls[3][0];
+    expect(prompt).toBe('USER: Второй\n\nASSISTANT: Здравствуйте\n\nUSER: Третий\n\nASSISTANT: Здравствуйте\n\nUSER: Четвёртый');
+    expect(prompt).not.toContain('Привет');
+  });
 });
 
 describe('ход гостя: отказы', () => {
