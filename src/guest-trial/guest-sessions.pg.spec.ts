@@ -77,12 +77,45 @@ maybe('пробы и сообщения против живого Postgres', () 
     expect(byId.get(hashExpiredClaim.id)).toBeNull();
   });
 
-  it('статистика считает пробы, ответы, переносы и события', async () => {
+  it('статистика: пробы и переносы — по created_at/claimed_at пробы, ответы и стоимость — по событиям ответа', async () => {
     const { row } = await create();
-    await svc.recordExchange(row.id, 'В', 'О', new Date(), 0.1);
-    await pool.query(`INSERT INTO events (name) VALUES ('guest_trial_wall'), ('guest_trial_view'), ('guest_trial_view')`);
+    // Проба может отвечать до 7 дней после создания — ответ НЕ привязан к
+    // created_at пробы. Сдвигаем created_at в прошлое: если бы answers_day/
+    // cost_usd_day считались по created_at пробы (как раньше), тест бы не
+    // прошёл — сегодняшний ответ «потерялся» бы в дне создания (3 дня назад).
+    await pool.query(`UPDATE guest_trial_sessions SET created_at = now() - interval '3 days' WHERE id = $1`, [row.id]);
+    await pool.query(
+      `INSERT INTO events (name, ts, props) VALUES
+         ('guest_trial_answer', now(), '{"cost_usd":0.1,"n":1}'::jsonb),
+         ('guest_trial_answer', now() - interval '2 days', '{"cost_usd":0.2,"n":1}'::jsonb),
+         ('guest_trial_wall', now(), '{}'::jsonb),
+         ('guest_trial_view', now(), '{}'::jsonb),
+         ('guest_trial_view', now(), '{}'::jsonb)`,
+    );
     const s = await svc.status();
-    expect(s).toMatchObject({ trials_day: 1, answers_day: 1, claims_day: 0, guest_trial_view_day: 2, guest_trial_wall_day: 1 });
+    expect(s).toMatchObject({
+      trials_day: 0,
+      trials_week: 1,
+      claims_day: 0,
+      answers_day: 1,
+      answers_week: 2,
+      guest_trial_view_day: 2,
+      guest_trial_wall_day: 1,
+      guest_trial_closed_day: 0,
+    });
     expect(s.cost_usd_day).toBeCloseTo(0.1, 4);
+    expect(s.cost_usd_week).toBeCloseTo(0.3, 4);
+  });
+
+  it('статистика: ключи событий guest_trial_view|wall|closed есть всегда, даже без единого события', async () => {
+    const s = await svc.status();
+    expect(s).toMatchObject({
+      guest_trial_view_day: 0,
+      guest_trial_view_week: 0,
+      guest_trial_wall_day: 0,
+      guest_trial_wall_week: 0,
+      guest_trial_closed_day: 0,
+      guest_trial_closed_week: 0,
+    });
   });
 });
