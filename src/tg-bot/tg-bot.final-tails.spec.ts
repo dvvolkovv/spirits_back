@@ -167,7 +167,7 @@ describe('ответ пришёлся на переезд группы в суп
     // Возвращает, куда ушёл ответ: туда же пойдут картинки и файлы хода.
     await expect(svc.deliverReplyText(-4001, 10, 'ответ', 'ru', cfg)).resolves.toBe(-1004001);
     expect(configs.moveToChat).toHaveBeenCalledWith(-4001, -1004001);
-    expect(grammy.sendMessage).toHaveBeenLastCalledWith(-1004001, 'ответ', {});
+    expect(grammy.sendMessage).toHaveBeenLastCalledWith(-1004001, 'ответ', { link_preview_options: { is_disabled: true } });
     // История хода пишется дальше по cfg — уже в новый чат.
     expect(cfg.tg_chat_id).toBe('-1004001');
   });
@@ -178,7 +178,7 @@ describe('ответ пришёлся на переезд группы в суп
     grammy.sendMessage.mockRejectedValueOnce(upgraded()).mockResolvedValueOnce({ message_id: 9 });
     const cfg: any = { id: 'c', tg_chat_id: '-4001' };
     await expect(svc.deliverReplyText(-4001, 10, 'ответ', 'ru', cfg)).resolves.toBe(-1004001);
-    expect(grammy.sendMessage).toHaveBeenLastCalledWith(-1004001, 'ответ', {});
+    expect(grammy.sendMessage).toHaveBeenLastCalledWith(-1004001, 'ответ', { link_preview_options: { is_disabled: true } });
     expect(cfg.tg_chat_id).toBe('-4001');
   });
 

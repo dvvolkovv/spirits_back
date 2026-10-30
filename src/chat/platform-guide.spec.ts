@@ -2,12 +2,14 @@ import { ChatService } from './chat.service';
 import {
   customAssistantHelpLine,
   INITIATIVE_RULE,
+  linksRule,
   platformGuide,
   platformSections,
   telegramPlatformGuide,
   TOOLS_LIST_NOTE,
 } from './platform-guide';
 import { SUPPORTED_LANGUAGES } from '../common/services/language.service';
+import { SECTION_PATHS, sectionUrl, type SectionKey } from '../platform-kb/section-links';
 
 /**
  * Блок «Что есть в Linkeon» в системном промпте ассистента.
@@ -218,10 +220,11 @@ describe('системный промпт релея', () => {
     expect(await prefix('12')).toContain(INITIATIVE_RULE);
   });
 
-  it('стор: карта без партнёрской программы', async () => {
+  it('стор: карта без партнёрской программы и без адресов кабинета', async () => {
     const p = await prefix('12', 'ru', true);
     expect(p).toContain(platformGuide('ru', { ...STAFF, store: true }));
     expect(p).not.toContain('«Партнёры»');
+    expect(p).not.toContain('https://my.linkeon.io/');
   });
 
   it('своему ассистенту — строка про справку, без карты и инициативы', async () => {
@@ -237,5 +240,110 @@ describe('системный промпт релея', () => {
     expect(p).not.toMatch(/Никогда не упоминай, что ты Claude/);
     expect(p).toMatch(/не говори, что ты Claude или другая модель/);
     expect(p).toMatch(/how-it-works/);
+  });
+});
+
+/**
+ * Ссылки на разделы (27.10.2026, находка «Затыков недели» e4f01175): путь
+ * словами не помог человеку найти раздел. Адрес каждого раздела — в перечне
+ * рядом с названием, правило ссылок — по каналу.
+ */
+describe('ссылки на разделы', () => {
+  const KEYS = Object.keys(SECTION_PATHS) as SectionKey[];
+
+  it.each([...SUPPORTED_LANGUAGES])('%s: у каждого раздела таблицы — свой адрес рядом с названием', (lang) => {
+    const s = platformSections(lang);
+    expect(KEYS.filter((k) => !s.includes(`${sectionUrl(k)})`))).toEqual([]);
+  });
+
+  // Обратная проверка: адрес в блоке — только из таблицы section-links.ts.
+  // Путь, набранный мимо неё, дал бы ссылку, по которой кабинет откроет не ту
+  // карточку, — а таблицу сверяет с кабинетом общий сторож (section-links.spec.ts).
+  it.each([...SUPPORTED_LANGUAGES])('%s: любой адрес в блоке и в блоке Telegram — из таблицы разделов', (lang) => {
+    const known = new Set(KEYS.map(sectionUrl));
+    const found = [
+      platformGuide(lang, { helpTool: HELP, initiative: true }),
+      platformGuide(lang, { helpTool: HELP, initiative: true, store: true }),
+      telegramPlatformGuide(lang, { helpTool: HELP, initiative: true }),
+    ].flatMap((t) => [...t.matchAll(/https?:\/\/[^\s)»,;]+/g)].map((m) => m[0]));
+    expect(found.length).toBeGreaterThan(0);
+    expect(found.filter((u) => !known.has(u))).toEqual([]);
+  });
+
+  // Сборка из стора — Flutter-приложение: ссылку оно открывает во внешнем
+  // браузере, а на страницах кабинета — баланс, покупка токенов и «Скачать
+  // APK» (правило Apple 3.1.1; решения владельца — у platformSections). Адресов
+  // кабинета там нет вовсе — так же, как нет партнёрской программы.
+  it.each([...SUPPORTED_LANGUAGES])('%s, стор: ни одного адреса кабинета и без правила ссылок', (lang) => {
+    const g = platformGuide(lang, { helpTool: HELP, initiative: true, store: true });
+    expect(g).not.toContain('https://my.linkeon.io/');
+    expect(g).not.toMatch(/https?:\/\//);
+    expect(g).not.toContain(linksRule('markdown'));
+    expect(g).not.toContain(linksRule('plain'));
+  });
+
+  it('стор: разделы те же, что в вебе, кроме партнёрской программы, — названы подписью, без адреса', () => {
+    const labels = (s: string) => [...new Set(s.match(/«[^»]+»/g))];
+    const store = platformSections('ru', { store: true });
+    expect(labels(platformSections('ru')).filter((q) => !store.includes(q))).toEqual(['«Партнёры»', '«Пригласи друга»']);
+    expect(flat(store)).toMatch(/• «Чат с ассистентом» — разговоры с ассистентами/);
+    expect(flat(store)).toMatch(/«Календари» \(Яндекс, рабочий Outlook, Google и iCloud по ссылке\), «Zoom», /);
+    expect(flat(store)).toMatch(/привязка Telegram — карточка в «Мой профиль»\./);
+  });
+
+  it('раздела «Интеграции» нет — перечень говорит, где подключения', () => {
+    const s = flat(platformSections('ru'));
+    expect(s).toMatch(/Отдельного раздела интеграций нет/);
+    expect(s).toContain(sectionUrl('telegram'));
+    for (const label of ['«Zoom»', '«Экосистема Taler ID»', '«Календари»', '«Способы входа»']) {
+      expect(s).toContain(label);
+    }
+  });
+
+  it('веб и приложения: ссылка рядом с названием, можно markdown; путь по меню — в дополнение', () => {
+    const g = platformGuide('ru', { helpTool: HELP, initiative: true });
+    expect(g).toContain(linksRule('markdown'));
+    expect(g).not.toContain(linksRule('plain'));
+    const r = flat(linksRule('markdown'));
+    expect(r).toMatch(/рядом с его названием/);
+    expect(r).toMatch(/markdown-ссылкой \[название\]\(адрес\)/);
+    expect(r).toMatch(/Путь по меню — только в дополнение к ссылке/);
+    expect(r).toMatch(/Других адресов кабинета не придумывай/);
+  });
+
+  it('Telegram: только полный адрес, без markdown', () => {
+    const g = telegramPlatformGuide('ru', { helpTool: HELP });
+    expect(g).toContain(linksRule('plain'));
+    expect(g).not.toContain(linksRule('markdown'));
+    expect(flat(linksRule('plain'))).toMatch(/только сам полный адрес, начиная с https:\/\//);
+    expect(flat(linksRule('plain'))).toMatch(/без markdown/);
+  });
+
+  it('подсказка по Linkeon — со ссылкой на раздел, а не с путём по меню', () => {
+    expect(flat(INITIATIVE_RULE)).toMatch(/одной фразой со ссылкой на её раздел/);
+    expect(INITIATIVE_RULE).not.toMatch(/точным путём по меню/);
+  });
+
+  // У части разделов адреса нет («Позвонить» — кнопка в чате), а сборке из
+  // стора адресов не даём вовсе: тогда подсказка — с путём по меню.
+  it('подсказка по Linkeon: нет адреса — с путём по меню', () => {
+    expect(flat(INITIATIVE_RULE)).toMatch(/со ссылкой на её раздел \(нет адреса — с путём по меню\), после ответа по сути/);
+  });
+
+  // Знак вплотную к голому адресу экраны берут в адрес по-разному:
+  // GFM-автоссылка чата — «;» (решение плана 10), linkify поддержки
+  // (spirits_front src/utils/linkify.ts) не отрезает китайские 。，：（）.
+  // Поэтому адрес — отдельным словом, как в перечне.
+  it.each(['markdown', 'plain'] as const)('%s: голый адрес — отдельным словом, без знаков вплотную', (format) => {
+    const r = flat(linksRule(format));
+    expect(r).toMatch(/отдельным словом/);
+    expect(r).toMatch(/до и после него пробел, перевод строки или обычная скобка, как в перечне/);
+    expect(r).toMatch(/ни точки, ни кавычек-ёлочек, ни китайских знаков 。，：（） вплотную — иначе они войдут в адрес/);
+    expect(r).toMatch(/Путь по меню — только в дополнение к ссылке; у раздела нет адреса — назови путь по меню/);
+  });
+
+  it('markdown: лучше ссылкой с названием, голый адрес — отдельным словом', () => {
+    expect(flat(linksRule('markdown'))).toMatch(/лучше markdown-ссылкой \[название\]\(адрес\); голый адрес — отдельным словом/);
+    expect(flat(linksRule('plain'))).toMatch(/только сам полный адрес, начиная с https:\/\/, без markdown, отдельным словом/);
   });
 });

@@ -91,4 +91,20 @@ describe('youtubeMode в правке настроек', () => {
       expect(() => validateSettingsPatch({ youtubeMode: bad })).toThrow(/youtubeMode/);
     }
   });
+
+  /**
+   * M4: клиент, который шлёт настройки целиком (так устроена вкладка блога), повторяет и режим
+   * YouTube. Неизменённый режим — не попытка включить загрузку: поле в патч не попадает, без
+   * ошибки. Смена на другой режим проверяется как раньше.
+   */
+  it('режим совпал с текущим — поле в патч не попадает, без ошибки; смена — как раньше', () => {
+    expect(validateSettingsPatch({ youtubeMode: 'public', slotHourMsk: 19 }, 'public')).toEqual({ slotHourMsk: 19 });
+    expect(validateSettingsPatch({ youtubeMode: 'unlisted' }, 'unlisted')).toEqual({});
+    expect(validateSettingsPatch({ youtubeMode: 'manual' }, 'manual')).toEqual({});
+    expect(() => validateSettingsPatch({ youtubeMode: 'unlisted' }, 'public')).toThrow(/только владелец/);
+    expect(() => validateSettingsPatch({ youtubeMode: 'public' }, 'unlisted')).toThrow(/только владелец/);
+    expect(validateSettingsPatch({ youtubeMode: 'manual' }, 'public')).toEqual({ youtubeMode: 'manual' });
+    // Кривое значение с текущим режимом не совпадёт — ошибка, как раньше.
+    expect(() => validateSettingsPatch({ youtubeMode: 'PUBLIC' }, 'public')).toThrow(/youtubeMode/);
+  });
 });

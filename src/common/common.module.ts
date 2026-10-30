@@ -7,6 +7,7 @@ import { StorageService } from './services/storage.service';
 import { ClaudeCliService } from './services/claude-cli.service';
 import { LanguageService } from './services/language.service';
 import { MailService } from './services/mail.service';
+import { UserLlmProviderService } from './services/user-llm-provider.service';
 // Инфраструктурный клиент без состояния — читает env и ходит в LiveKit, ровно
 // как PgService в базу. Живёт здесь, чтобы комнаты, звонки и встречи получали
 // его не через импорты друг друга: с ними граф модулей замыкался в кольцо.
@@ -14,7 +15,7 @@ import { LiveKitClient } from '../voice-call/livekit.client';
 
 @Global()
 @Module({
-  providers: [PgService, RedisService, JwtService, IpRateLimiter, StorageService, ClaudeCliService, LanguageService, MailService, LiveKitClient],
-  exports: [PgService, RedisService, JwtService, IpRateLimiter, StorageService, ClaudeCliService, LanguageService, MailService, LiveKitClient],
+  providers: [PgService, RedisService, JwtService, IpRateLimiter, StorageService, ClaudeCliService, LanguageService, MailService, LiveKitClient, UserLlmProviderService],
+  exports: [PgService, RedisService, JwtService, IpRateLimiter, StorageService, ClaudeCliService, LanguageService, MailService, LiveKitClient, UserLlmProviderService],
 })
 export class CommonModule {}

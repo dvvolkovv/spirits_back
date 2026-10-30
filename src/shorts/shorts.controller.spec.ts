@@ -35,7 +35,11 @@ function setup(answer: (sql: string, params: any[]) => any = () => ({ rows: [], 
     getClient: jest.fn(async () => client),
   };
   const settings = { get: jest.fn(async () => ({ slotDays: [2, 4, 6], format: 'chat' })), update: jest.fn(async (p: any) => p) };
-  const topics = { addManual: jest.fn(async () => ({ id: 'new' })), start: jest.fn(async (): Promise<any> => ({ id: ID, status: 'directing' })) };
+  const topics = {
+    addManual: jest.fn(async () => ({ id: 'new' })),
+    start: jest.fn(async (): Promise<any> => ({ id: ID, status: 'directing' })),
+    refillWeek: jest.fn(async () => 7),
+  };
   const storage = { publicUrl: jest.fn((b: string, k: string) => `https://minio.test/${b}/${k}`) };
   const ctl = new ShortsController(pg as any, settings as any, topics as any, storage as any);
   return { ctl, pg, client, settings, topics, storage };
@@ -86,6 +90,15 @@ describe('POST admin/shorts', () => {
     await expect(ctl.action({ action: 'start_now' }, res())).rejects.toBeInstanceOf(ConflictException);
   });
 
+  it('refill_topics — каталог недели сейчас, не дожидаясь воскресенья; ответ — сколько тем заведено', async () => {
+    const { ctl, topics } = setup();
+    const r = res();
+    await ctl.action({ action: 'refill_topics' }, r);
+    expect(topics.refillWeek).toHaveBeenCalledTimes(1);
+    expect(r.status).toHaveBeenCalledWith(200);
+    expect(r.body).toEqual({ added: 7 });
+  });
+
   it('publish_now — только одобренный; занятый момент — 409 slot_taken', async () => {
     const ok = setup((sql) => (sql.startsWith('UPDATE') ? { rows: [video({ status: 'approved' })] } : { rows: [video({ status: 'approved' })] }));
     const r = res();
@@ -115,6 +128,16 @@ describe('POST admin/shorts', () => {
 
     const never = setup(() => ({ rows: [video({ failed_from: 'publishing', approved_at: null })] }));
     await expect(never.ctl.action({ action: 'retry', id: ID }, res())).rejects.toBeInstanceOf(ConflictException);
+  });
+
+  it('retry публикации не обнуляет счётчик строк площадок — это жетон попытки публикатора', async () => {
+    const pub = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'approved' })] } : { rows: [video({ failed_from: 'publishing', approved_at: '2026-10-25T00:00:00Z' })] }));
+    await pub.ctl.action({ action: 'retry', id: ID }, res());
+    const reset = pub.pg.query.mock.calls
+      .map((c: any[]) => String(c[0]).replace(/\s+/g, ' '))
+      .find((s: string) => s.startsWith("UPDATE short_publication SET status = 'pending'"));
+    expect(reset).toBeDefined();
+    expect(reset).not.toMatch(/attempts/);
   });
 
   const retryWrite = (pg: any) =>
@@ -258,6 +281,32 @@ describe('POST admin/shorts', () => {
     await ctl.action({ action: 'update_settings', settings: { slotHourMsk: 19 } }, res());
     expect(settings.update).toHaveBeenCalledWith({ slotHourMsk: 19 });
     await expect(ctl.action({ action: 'update_settings', settings: { slotHourMsk: 99 } }, res())).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  /**
+   * M4: вкладка, которая шлёт настройки целиком, повторяет и режим YouTube. Неизменённый режим —
+   * 200, поле не пишется; включить другой — 400; manual (аварийная остановка) — пишется.
+   */
+  it('update_settings — неизменённый режим YouTube не ошибка; другой не-manual — 400; manual — пишется', async () => {
+    const { ctl, settings } = setup();
+    settings.get.mockResolvedValue({ slotDays: [2, 4, 6], format: 'chat', youtubeMode: 'public' } as any);
+    const r = res();
+    await ctl.action({ action: 'update_settings', settings: { slotHourMsk: 19, youtubeMode: 'public' } }, r);
+    expect(r.status).toHaveBeenCalledWith(200);
+    expect(settings.update).toHaveBeenLastCalledWith({ slotHourMsk: 19 });
+    await expect(ctl.action({ action: 'update_settings', settings: { youtubeMode: 'unlisted' } }, res())).rejects.toBeInstanceOf(BadRequestException);
+    expect(settings.update).toHaveBeenCalledTimes(1);
+    await ctl.action({ action: 'update_settings', settings: { youtubeMode: 'manual' } }, res());
+    expect(settings.update).toHaveBeenLastCalledWith({ youtubeMode: 'manual' });
+  });
+
+  it('update_settings — сбой чтения текущих настроек — не 400: база, а не плохой запрос', async () => {
+    const { ctl, settings } = setup();
+    settings.get.mockRejectedValueOnce(new Error('Connection terminated unexpectedly'));
+    const run = ctl.action({ action: 'update_settings', settings: { slotHourMsk: 19 } }, res());
+    await expect(run).rejects.toThrow('Connection terminated unexpectedly');
+    await expect(run).rejects.not.toBeInstanceOf(BadRequestException);
+    expect(settings.update).not.toHaveBeenCalled();
   });
 
   it('неизвестное действие — 400', async () => {

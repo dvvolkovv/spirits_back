@@ -28,7 +28,9 @@ export class VoiceCallController {
   async end(@CurrentUser() u: any, @Param('id') id: string) {
     const call = await this.calls.load(id);
     if (call.user_id !== u.userId) throw new ForbiddenException('not your call');
-    await this.calls.markInterrupted(id);
+    // Отбой через ручку — поступок человека, в отличие от реапера и
+    // вытеснения старого звонка новым.
+    await this.calls.markInterrupted(id, 'hangup', 'api_end');
     return { ok: true };
   }
 

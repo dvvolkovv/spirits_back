@@ -127,7 +127,7 @@ describe('ShortsTopicService.addManual', () => {
 
 describe('ShortsTopicService.refillWeek', () => {
   /** routes — доп. ответы по кусочку SQL; INSERT считается отдельно в inserted. */
-  function refillSetup(routes: Array<[string, any]>, agentsList: any[] = AGENTS) {
+  function refillSetup(routes: Array<[string, any]>, agentsList: any[] = AGENTS, settingsOver: Record<string, unknown> = {}) {
     const inserted: any[] = [];
     const query = jest.fn(async (sql: string, params: any[] = []) => {
       const hit = routes.find(([needle]) => sql.includes(needle));
@@ -138,8 +138,50 @@ describe('ShortsTopicService.refillWeek', () => {
       }
       return { rows: [] };
     });
-    return { svc: setup(fakeTx([]), query, agentsList), query, inserted };
+    return { svc: setup(fakeTx([]), query, agentsList, settingsOver), query, inserted };
   }
+
+  const EVERY_DAY = [1, 2, 3, 4, 5, 6, 7];
+  const MORE_AGENTS = [
+    ...AGENTS,
+    { id: 31, name: 'Ольга', description: 'Психолог — тревога, отношения и самооценка' },
+    { id: 32, name: 'Пётр', description: 'Финансы — бюджет, накопления и кредиты' },
+    { id: 33, name: 'Анна', description: 'Маркетолог — продвижение, контент и реклама' },
+  ];
+
+  it('слоты каждый день — доводит до семи тем, ключи недели 1..7, ассистенты разные', async () => {
+    const { svc, inserted } = refillSetup([["status = 'idea' AND source = 'catalog'", { rows: [{ n: 0 }] }]], MORE_AGENTS, { slotDays: EVERY_DAY });
+    // Ср 28.10 18:00 МСК — неделя 44.
+    const added = await svc.refillWeek(new Date('2026-10-28T15:00:00.000Z'));
+    expect(added).toBe(7);
+    expect(inserted.map((p) => p[4])).toEqual(EVERY_DAY.map((n) => `catalog:2026-W44:${n}`));
+    expect(new Set(inserted.map((p) => p[8])).size).toBe(7);
+  });
+
+  it('слоты каждый день, открыто четыре идеи, на неделю заведено четыре — доводит до семи: позиции 5..7', async () => {
+    const { svc, inserted } = refillSetup([
+      ["status = 'idea' AND source = 'catalog'", { rows: [{ n: 4 }] }],
+      ['source_ref LIKE', { rows: [{ n: 4 }] }],
+    ], MORE_AGENTS, { slotDays: EVERY_DAY });
+    expect(await svc.refillWeek(new Date('2026-11-01T07:00:00.000Z'))).toBe(3);
+    expect(inserted.map((p) => p[4])).toEqual(['catalog:2026-W44:5', 'catalog:2026-W44:6', 'catalog:2026-W44:7']);
+  });
+
+  it('второе наполнение в ту же неделю после расхода идей — доливает, позиции продолжаются (8..11), а не упираются в занятые', async () => {
+    // Ср: refill_topics завёл W44:1..7; к вс четыре ушли в работу — открыто три. Вс — та же ISO-неделя W44.
+    const { svc, inserted } = refillSetup([
+      ["status = 'idea' AND source = 'catalog'", { rows: [{ n: 3 }] }],
+      ['source_ref LIKE', { rows: [{ n: 7 }] }],
+    ], MORE_AGENTS, { slotDays: EVERY_DAY });
+    expect(await svc.refillWeek(new Date('2026-11-01T07:00:00.000Z'))).toBe(4);
+    expect(inserted.map((p) => p[4])).toEqual(['catalog:2026-W44:8', 'catalog:2026-W44:9', 'catalog:2026-W44:10', 'catalog:2026-W44:11']);
+  });
+
+  it('открытых идей больше, чем слотов в неделе (дни слотов сократили), — ничего не заводит', async () => {
+    const { svc, inserted } = refillSetup([["status = 'idea' AND source = 'catalog'", { rows: [{ n: 5 }] }]], MORE_AGENTS);
+    expect(await svc.refillWeek(new Date('2026-10-25T07:00:00.000Z'))).toBe(0);
+    expect(inserted).toHaveLength(0);
+  });
 
   it('открытых идей каталога уже три — ничего не заводит, до других запросов не доходит', async () => {
     const { svc, query, inserted } = refillSetup([
@@ -154,6 +196,8 @@ describe('ShortsTopicService.refillWeek', () => {
   it('открыта одна идея каталога — доводит до трёх, ключи недели по позиции', async () => {
     const { svc, query, inserted } = refillSetup([
       ["status = 'idea' AND source = 'catalog'", { rows: [{ n: 1 }] }],
+      // На эту неделю уже заведена одна тема — новые встают на позиции 2 и 3.
+      ['source_ref LIKE', { rows: [{ n: 1 }] }],
       ['coalesce(slot_at, created_at)', { rows: [
         { assistant_id: 1, last: '2026-01-01T00:00:00Z' },
         { assistant_id: 22, last: '2026-09-01T00:00:00Z' },
@@ -176,13 +220,16 @@ describe('ShortsTopicService.refillWeek', () => {
   });
 
   it('неделя считается по МСК, не по UTC', async () => {
-    const { svc, inserted } = refillSetup([
+    const { svc, inserted, query } = refillSetup([
       ["status = 'idea' AND source = 'catalog'", { rows: [{ n: 2 }] }],
+      ['source_ref LIKE', { rows: [{ n: 2 }] }],
     ]);
     // 25.10 22:00 UTC = 26.10 01:00 МСК — по МСК уже следующая неделя.
     await svc.refillWeek(new Date('2026-10-25T22:00:00.000Z'));
     expect(inserted).toHaveLength(1);
     expect(inserted[0][4]).toBe('catalog:2026-W44:3');
+    const weekCall = query.mock.calls.find(([sql]: [string]) => sql.includes('source_ref LIKE'));
+    expect(weekCall[1]).toEqual(['catalog:2026-W44:%']);
   });
 
   it('ассистент без внятного профиля в каталог не ставится', async () => {

@@ -71,6 +71,90 @@ describe('микрофон в сценарии Телемоста', () => {
   test('ищется кнопка микрофона, а не камеры', () => {
     assert.match(TELEMOST_PAYLOAD, /aria-label\*=.микрофон/i);
   });
+
+  test('сначала — по data-testid, увиденному на живой встрече', () => {
+    // 27.10.2026 проба отдала настоящую кнопку: data-testid="turn-on-mic-button".
+    assert.match(TELEMOST_PAYLOAD, /turn-on-mic-button/);
+  });
+});
+
+/**
+ * Состояние микрофона в Телемосте — исполнением, как у Meet ниже.
+ *
+ * Разметка с живой встречи 27.10.2026: выключенный микрофон —
+ * data-testid="turn-on-mic-button", aria-label="Включить микрофон". Подпись и
+ * testid называют ДЕЙСТВИЕ. Парная кнопка включённого микрофона не попадала в
+ * пробу ни разу, её testid взят по симметрии — поэтому подпись остаётся
+ * запасным путём.
+ */
+describe('Телемост: кнопка микрофона в деле', () => {
+  function micHook(attrs) {
+    const from = TELEMOST_PAYLOAD.indexOf('const MIC_BTN');
+    const to = TELEMOST_PAYLOAD.indexOf('window.__botMicSample');
+    assert.ok(from > 0 && to > from, 'кусок сценария не вырезался');
+    const btn = attrs && {
+      clicked: false,
+      getAttribute: (k) => (k in attrs ? attrs[k] : null),
+      click() { btn.clicked = true; },
+    };
+    const win = {};
+    new Function('window', 'document', TELEMOST_PAYLOAD.slice(from, to))(win, {
+      // Подставной документ честно отвечает только на те зацепки, под которые
+      // кнопка подходит: по testid — если он есть, по подписи — если есть она.
+      querySelector: (sel) => {
+        if (!btn) return null;
+        const tid = attrs['data-testid'];
+        if (/data-testid/.test(sel) && tid && sel.includes(tid)) return btn;
+        if (/aria-label/.test(sel) && /микрофон/i.test(attrs['aria-label'] || '') && !/data-testid/.test(sel)) return btn;
+        return null;
+      },
+    });
+    return { set: win.__botSetMicMuted, btn };
+  }
+
+  test('живая разметка: выключен, просят включить — жмём', () => {
+    const { set, btn } = micHook({ 'data-testid': 'turn-on-mic-button', 'aria-label': 'Включить микрофон' });
+    assert.deepEqual(set(false), { ok: true, how: 'кнопкой' });
+    assert.equal(btn.clicked, true);
+  });
+
+  test('живая разметка: уже выключен — второй раз не жмём', () => {
+    const { set, btn } = micHook({ 'data-testid': 'turn-on-mic-button', 'aria-label': 'Включить микрофон' });
+    assert.deepEqual(set(true), { ok: true, how: 'уже в нужном состоянии' });
+    assert.equal(btn.clicked, false);
+  });
+
+  test('состояние по testid, даже если подпись непонятная', () => {
+    // Подпись Яндекс может переписать в любой момент, testid — реже.
+    const { set, btn } = micHook({ 'data-testid': 'turn-off-mic-button', 'aria-label': 'Микрофон' });
+    set(true);
+    assert.equal(btn.clicked, true, 'turn-off-mic-button — микрофон включён, выключить надо');
+  });
+
+  test('выключенный по testid включается, даже если подпись непонятная', () => {
+    // Ровно тот случай, когда чтение одной подписи молча отказывало: «Микрофон»
+    // без глагола читалось как «включён», и просьба включить заканчивалась
+    // ответом «уже в нужном состоянии».
+    const { set, btn } = micHook({ 'data-testid': 'turn-on-mic-button', 'aria-label': 'Микрофон' });
+    assert.deepEqual(set(false), { ok: true, how: 'кнопкой' });
+    assert.equal(btn.clicked, true);
+  });
+
+  for (const [label, muted] of [
+    ['Выключить микрофон', false],
+    ['Включить микрофон', true],
+  ]) {
+    test(`без testid состояние читается из «${label}»`, () => {
+      const { set, btn } = micHook({ 'aria-label': label });
+      set(true);
+      assert.equal(btn.clicked, !muted);
+    });
+  }
+
+  test('кнопки нет — честный отказ', () => {
+    const { set } = micHook(null);
+    assert.deepEqual(set(true), { ok: false, reason: 'кнопка микрофона не найдена' });
+  });
 });
 
 /**

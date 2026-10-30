@@ -36,6 +36,8 @@ type RetryFrom = (typeof RETRY_FROM)[number];
  * Админка роликов: действия в одном POST, как admin/blog. Вкладка кабинета
  * появится в плане 3. На стенде это единственный способ запустить ролик
  * (`start_now`) и выпустить одобренный, не дожидаясь слота (`publish_now`).
+ * `refill_topics` — каталог недели сейчас, а не в воскресенье: после того как
+ * слотов в неделе стало больше или автозапуск только что включили.
  *
  * Записи статуса — с условием на статус, как везде в модуле: две вкладки
  * админки и кнопки в личке не перетирают решения друг друга.
@@ -86,6 +88,8 @@ export class ShortsController {
         }
         return res.status(200).json(v);
       }
+      case 'refill_topics':
+        return res.status(200).json({ added: await this.topics.refillWeek() });
       case 'publish_now':
         return res.status(200).json(await this.publishNow(String(data.id ?? '')));
       case 'mark_published':
@@ -97,9 +101,12 @@ export class ShortsController {
       case 'get_settings':
         return res.status(200).json(await this.settings.get());
       case 'update_settings': {
+        // Текущий режим YouTube: клиент, который шлёт настройки целиком, повторяет и его, и
+        // неизменённый режим — не попытка включить загрузку. Читаем вне try: сбой базы — 500, а не 400.
+        const currentYoutubeMode = (await this.settings.get()).youtubeMode;
         let patch: ShortSettingsPatch;
         try {
-          patch = validateSettingsPatch(data.settings);
+          patch = validateSettingsPatch(data.settings, currentYoutubeMode);
         } catch (e: any) {
           throw new BadRequestException(e.message);
         }
@@ -244,8 +251,10 @@ export class ShortsController {
     const ownerNote = typeof note === 'string' && note.trim() ? appendOwnerNote(v.ownerNote, note) : null;
     const format = from != null ? (await this.settings.get()).format : null;
     if (target === 'approved') {
+      // Счётчик строки не обнуляем: это жетон попытки (platform() публикатора) — обнулённый, он
+      // совпал бы с жетоном зависшей прежней попытки. Бюджет попыток — счётчик ролика.
       await this.pg.query(
-        `UPDATE short_publication SET status = 'pending', attempts = 0, last_error = NULL, updated_at = now()
+        `UPDATE short_publication SET status = 'pending', last_error = NULL, updated_at = now()
           WHERE short_id = $1 AND status = 'failed'`,
         [id],
       );

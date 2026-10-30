@@ -401,19 +401,36 @@ export class AttendeeAudioInput extends voice.AudioInput {
   private push: (f: AudioFrame) => void = () => {};
   private framesIn = 0;
   private ticks = 0;
+  /** Сколько тиков сессия реально забрала — см. pipeThrough ниже. */
+  private framesTaken = 0;
+  private queue: ReadableStreamDefaultController<AudioFrame> | null = null;
 
   constructor(private readonly hub: AttendeeAudioHub) {
     super();
 
     const source = new ReadableStream<AudioFrame>({
       start: (controller) => {
+        this.queue = controller;
         this.push = (f) => {
           if (this.closed) return;
           try { controller.enqueue(f); } catch { /* поток закрыт раньше тика */ }
         };
       },
     });
-    this.multiStream.addInputStream(source);
+    // Счётчик на границе «мы отдали — сессия забрала», как у
+    // MixedRoomAudioInput. Без него оглохшая сессия выглядела здоровой:
+    // 27.10.2026 тики и куски от бота росли все 1 ч 40 мин, пока Realtime не
+    // слышал ничего, а память процесса уходила за гигабайт.
+    this.multiStream.addInputStream(
+      source.pipeThrough(
+        new TransformStream<AudioFrame, AudioFrame>({
+          transform: (frame, controller) => {
+            this.framesTaken++;
+            controller.enqueue(frame);
+          },
+        }),
+      ),
+    );
 
     // Через хаб, а не через сокет: сокет меняется при переподключении, и
     // вход не должен об этом знать.
@@ -434,7 +451,13 @@ export class AttendeeAudioInput extends voice.AudioInput {
       // Без этой строки «никто не говорит» и «звук до нас не доходит»
       // выглядят одинаково — тишиной. На своих комнатах я гадал здесь трижды.
       if (++this.ticks % 250 === 0) {
-        console.log(`[вход] тиков: ${this.ticks}, кусков от Attendee: ${this.framesIn}`);
+        // Отставание очереди — в кадрах. Около нуля — сессия забирает звук в
+        // реальном времени; растущее число — оглохла.
+        const behind = this.queue ? Math.max(0, -(this.queue.desiredSize ?? 0)) : 0;
+        console.log(
+          `[вход] тиков: ${this.ticks}, кусков от Attendee: ${this.framesIn}, ` +
+            `забрала сессия: ${this.framesTaken}, очередь к модели: ${behind}`,
+        );
       }
     }, TICK_MS);
     // unref обязателен: иначе таймер держит event loop, задание не

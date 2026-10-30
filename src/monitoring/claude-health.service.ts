@@ -8,25 +8,18 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
-// Классификация ошибки LLM-пробы → тип сбоя + человекочитаемая причина.
-// Вынесено наружу и чисто (без side-effects) для юнит-теста. Главный кейс,
-// который раньше был невидим мониторингу: «недельный лимит» Claude-подписки —
-// весь AI платформы (ассистенты через r.linkeon.io + Юля + Маша + VPM/VMM) сидит
-// на ней, поэтому её исчерпание = полная деградация продукта.
-export type LlmOutageKind = 'weekly_limit' | 'rate_limit' | 'auth' | 'overloaded' | 'timeout' | 'other';
-export function classifyLlmError(msg: string): { kind: LlmOutageKind; human: string } {
-  const m = String(msg || '').toLowerCase();
-  if (/weekly limit|hit your .*limit|usage limit|limit .*reset|limit reached|исчерпан.*лимит|недельн/.test(m))
-    return { kind: 'weekly_limit', human: 'Исчерпан лимит Claude-подписки (недельный/использования)' };
-  if (/rate limit|too many requests|\b429\b/.test(m))
-    return { kind: 'rate_limit', human: 'Rate limit Claude (слишком много запросов)' };
-  if (/unauthorized|\b401\b|invalid api key|authentication|oauth|credential|not logged in|please run .*login/.test(m))
-    return { kind: 'auth', human: 'Сбой авторизации Claude (OAuth/API-ключ)' };
-  if (/overloaded|\b529\b|\b503\b|internal server|try again|temporarily/.test(m))
-    return { kind: 'overloaded', human: 'Claude перегружен/временно недоступен' };
-  if (/timeout|timed out|deadline/.test(m))
-    return { kind: 'timeout', human: 'Таймаут вызова Claude' };
-  return { kind: 'other', human: msg ? String(msg).slice(0, 160) : 'Неизвестная ошибка LLM' };
+// classifyLlmError переехал в common/llm-error.ts — его зовёт и ClaudeCliService
+// (запасной путь на Qwen). Реэкспорт — для прежних импортов (insights.service).
+import { classifyLlmError, LlmOutageKind, looksLikeCliRefusal } from '../common/llm-error';
+export { classifyLlmError };
+export type { LlmOutageKind };
+
+/** Строка про запасной Qwen в алерте «Локальный Claude CLI недоступен»: видно,
+ *  обслуживаются ли люди, пока вход не починен. Без склонений — счётчики
+ *  после двоеточия. */
+export function qwenFallbackAlertLine(s: { enabled: boolean; ok: number; failed: number; windowMs: number }): string {
+  if (!s.enabled) return 'Запасной Qwen: не настроен';
+  return `Запасной Qwen: ответов ${s.ok}, ошибок ${s.failed} за ${Math.round(s.windowMs / 60_000)} мин`;
 }
 
 /**
@@ -180,11 +173,24 @@ export class ClaudeHealthService implements OnModuleInit {
       const text = await this.claudeCli.text('Reply with exactly: ok', {
         model: 'claude-haiku-4-5',
         timeoutMs: 30_000,
+        // Проба меряет сам Claude: с запасным путём она была бы «зелёной», пока
+        // Claude лежит, и никто не узнал бы, что пора перелогиниться.
+        noFallback: true,
       });
       const ok = typeof text === 'string' && text.trim().length > 0;
       this.cache.llmLatencyMs = Date.now() - t0;
       this.cache.llmCheckedAt = new Date().toISOString();
-      if (ok) {
+      if (ok && looksLikeCliRefusal(text)) {
+        // Отказ CLI обычным ответом («You've hit your session limit · …») —
+        // не «Claude жив»: иначе при ключе люди молча сидят на Qwen, проба
+        // зелёная, алерта нет. Разбор — как у ошибки в catch.
+        const { kind, human } = classifyLlmError(text);
+        down = true;
+        this.cache.llmStatus = 'down';
+        this.cache.llmOutageKind = kind;
+        this.cache.llmError = human;
+        this.log.error(`Claude CLI liveness probe DOWN (${kind}): ${human}`);
+      } else if (ok) {
         this.cache.llmStatus = 'ok';
         this.cache.llmOutageKind = null;
         this.cache.llmError = null;
@@ -368,9 +374,10 @@ export class ClaudeHealthService implements OnModuleInit {
         await send(
           `<b>🔴 Локальный Claude CLI недоступен</b>\n` +
           `Причина: <b>${this.cache.llmError || 'неизвестно'}</b> (${this.cache.llmOutageKind})\n` +
-          `Затронуто: <b>Маша, Виртуальный PM, Виртуальный маркетолог</b> (CLI-путь на OAuth-подписке). ` +
+          `Затронуто: <b>Маша, TG-боты, Виртуальный PM, Виртуальный маркетолог, фоновые задачи</b> (CLI-путь на OAuth-подписке). ` +
           `Чат-ассистенты (r.linkeon.io) — отдельный путь, см. synthetic chat_streaming.\n` +
           `Провалов подряд: ${this.cliConsecutiveDown}. Проверка: ${this.cache.llmCheckedAt || '—'}\n` +
+          `${qwenFallbackAlertLine(this.claudeCli.fallbackStats())}\n` +
           `Починка: на проде \`claude\` → /login (обновить OAuth).`,
         );
         this.lastOutageAlertAt = now;

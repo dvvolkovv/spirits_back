@@ -144,20 +144,32 @@ export const TELEMOST_PAYLOAD = `
   // Жмём настоящую кнопку встречи, а не глушим свой аудиограф: граф площадка
   // не видит вовсе, а участникам нужен привычный значок.
   //
-  // Зацепка — догадка по образцу cameraOff из TELEMOST_JOIN: панель
-  // управления живьём никто не разбирал. Не сработает — __botMicSample отдаст
-  // разметку в лог, и вторая редакция будет написана по факту.
+  // Зацепка — вторая редакция, по разметке с живой встречи 27.10.2026:
+  //   <button data-testid="turn-on-mic-button" aria-label="Включить микрофон">
+  // testid, как и подпись, называет ДЕЙСТВИЕ: turn-on висит на выключенном
+  // микрофоне. Парную кнопку включённого микрофона проба не застала ни разу —
+  // turn-off-mic-button взят по симметрии, поэтому поиск по подписи остаётся
+  // запасным путём. Не найдётся ни то ни другое — __botMicSample отдаст
+  // разметку в лог.
   const MIC_BTN = '[role="button"][aria-label*="микрофон" i], button[aria-label*="микрофон" i]';
+  const MIC_TESTID = '[data-testid="turn-on-mic-button"], [data-testid="turn-off-mic-button"]';
 
   window.__botSetMicMuted = (want) => {
     try {
-      const btn = document.querySelector(MIC_BTN);
+      const btn = document.querySelector(MIC_TESTID) || document.querySelector(MIC_BTN);
       if (!btn) return { ok: false, reason: 'кнопка микрофона не найдена' };
-      // Подпись описывает ДЕЙСТВИЕ кнопки, а не состояние: «Выключить
+      // Состояние — сначала по testid: подпись Яндекс может переписать, и
+      // «Микрофон» без глагола читался бы как «включён» — просьба включить
+      // молча заканчивалась бы ответом «уже в нужном состоянии».
+      //
+      // Подпись — запасной путь. Она тоже описывает ДЕЙСТВИЕ: «Выключить
       // микрофон» висит на включённом микрофоне. Поэтому «включить» без
       // «выключить» означает, что микрофон сейчас выключен.
+      const tid = btn.getAttribute('data-testid') || '';
       const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-      const muted = label.indexOf('включить') >= 0 && label.indexOf('выключить') < 0;
+      const muted = tid === 'turn-on-mic-button' ? true
+        : tid === 'turn-off-mic-button' ? false
+        : label.indexOf('включить') >= 0 && label.indexOf('выключить') < 0;
       if (muted === !!want) return { ok: true, how: 'уже в нужном состоянии' };
       btn.click();
       return { ok: true, how: 'кнопкой' };

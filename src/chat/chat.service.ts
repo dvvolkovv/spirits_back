@@ -19,6 +19,7 @@ import { RESPONSE_STYLE_RULE } from './response-style';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
 import { CRISIS_RULE } from './crisis-rule';
 import { loadCoworkers } from './coworkers';
+import { colleaguesRule } from './colleagues-rule';
 import { customAssistantHelpLine, platformGuide, TOOLS_LIST_NOTE } from './platform-guide';
 import { clientKind } from './client-kind';
 import { ClientUi, NO_CLIENT_UI } from './client-ui';
@@ -35,6 +36,8 @@ import { RelayOutputFile, collectOutputFiles, outputFileLines, storeRelayLinks }
 import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
+import { UserLlmProviderService } from '../common/services/user-llm-provider.service';
+import { readDoneProvider, relayProviderFields, resolveAnswerProvider } from './answer-provider';
 import axios from 'axios';
 import { Request, Response } from 'express';
 import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
@@ -457,6 +460,9 @@ export class ChatService {
     // @Optional по той же причине, что chatFiles; что модуль подключён,
     // сторожит chat.product-actions-wiring.spec.ts.
     @Optional() private readonly productActions?: ProductActionsService,
+    // Модель ответов человека (админка, spec 2026-10-30-llm-provider-switch).
+    // Последним и @Optional по той же причине, что chatFiles.
+    @Optional() private readonly llmProvider?: UserLlmProviderService,
   ) {}
 
   /**
@@ -664,7 +670,7 @@ export class ChatService {
     profileText?: string;
     /** Клиент рисует карточки вопросов (см. client-ui.ts, ask-rule.ts). */
     ask?: boolean;
-    /** Сборка из стора: карта без партнёрской программы (см. platform-guide.ts). */
+    /** Сборка из стора: карта без партнёрской программы и без адресов кабинета (см. platform-guide.ts). */
     storeBuild?: boolean;
   }): Promise<string> {
     const { agentId, agentName, userId, userLanguage } = opts;
@@ -713,10 +719,13 @@ export class ChatService {
           const lines = coworkers
             .map((a) => `• ${a.display_name} — ${a.description}`)
             .join('\n');
+          // Что делать с просьбой из чужой области — по категории ассистента:
+          // узким специалистам мягкая переадресация, Роману прежняя строка
+          // (colleagues-rule.ts, решение владельца 27.10.2026).
           stablePrefix +=
             `--- Коллеги-ассистенты в Linkeon ---\n` +
             `${lines}\n\n` +
-            `Если пользователь спрашивает про кого-то из них или просит сделать что-то по их специализации — расскажи про коллегу честно, без выдумок, и предложи переключиться на него.\n\n`;
+            `${colleaguesRule(opts.agentCategory)}\n\n`;
         }
       } catch { /* non-fatal — продолжаем без блока коллег */ }
 
@@ -1073,6 +1082,7 @@ export class ChatService {
     // пользователь может выбрать. Раньше здесь брались ВСЕ строки таблицы, а
     // при первом приветствии Маша перечисляет коллег — в приветствие попадали
     // выключенные ассистенты и служебный «Линкеон».
+    // Что делать с чужой областью — то же правило, что у релея (colleagues-rule.ts).
     const otherAgents = (await loadCoworkers(this.pg, agent.id, userLanguage))
       .map((a) => `${a.display_name} — ${a.description}`)
       .join(', ');
@@ -1082,6 +1092,7 @@ export class ChatService {
 О КОНТЕКСТЕ И ПЛАТФОРМЕ
 Ты работаешь в LINKEON.IO — нейросети для роста и развития бизнеса. Здесь ИИ помогает, люди направляют, а партнёры ускоряют рост бизнеса. Платформа соединяет предпринимателей с ИИ-ассистентами и помогает находить партнёров через Нетворкинг.
 Ты — в чате с ассистентами. Другие ассистенты: ${otherAgents}. Предложи переключиться в левом верхнем углу.
+${colleaguesRule(agent.category)}
 При первом приветствии кратко представься и упомяни других ассистентов. Используй только текст без таблиц.
 Картинки и видео ты в этом чате не генерируешь: таких инструментов у тебя нет (метафорические карты — другое дело, их показывает платформа). Если просят нарисовать или сгенерировать картинку, сделать видео или ролик — честно скажи, что сама этого не сделаешь, и предложи раздел «Генератор изображений» или «Видео» в меню либо переключиться на другого ассистента: у них такие инструменты есть. Никогда не пиши, что картинка или видео готовы или вот-вот будут.
 
@@ -1209,6 +1220,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
       }, PING_MS);
 
       try {
+        // Модель ответов человека (админка): 'qwen' — сразу Qwen; проба — только Claude.
+        const mashaProvider = await resolveAnswerProvider(probe, userId, this.llmProvider);
         const r = await this.claudeCli.textWithCost(fullPrompt, {
           // Блок про продукты встаёт ДО волатильной части и хвоста языка:
           // требование языка обязано остаться последней строкой (см.
@@ -1223,6 +1236,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // Пинг мониторинга уходит на haiku: проверяется живость пути, а не
           // качество ответа, и разница в цене хода — порядок.
           model: probe ? PROBE_MODEL : CHAT_MODEL,
+          // Пинг мониторинга меряет путь Claude — без запасного Qwen.
+          noFallback: probe,
+          ...(mashaProvider === 'qwen' ? { provider: 'qwen' as const } : {}),
           // Бюджет хода — общий с релеем. Правка ждёт исхода внутри вызова
           // инструмента до PRODUCT_TOOL_WAIT_MS (2.5 мин) и может позвать его
           // повторно; прежние 90 с убивали бы CLI посреди ожидания — правка уже
@@ -1733,6 +1749,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const agentUsage: SdkUsageTotals = {
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
     };
+    // Модель ответов человека: 'qwen' — релей сразу идёт в Qwen; проба — только Claude.
+    const answerProvider = await resolveAnswerProvider(probe, userId, this.llmProvider);
     // Релей сообщил, что ход закончился БЕЗ финального ответа: упёрлись в потолок
     // шагов, ход прерван новым сообщением пользователя, отказ CLI или сбой связи.
     // Такой ход не тарифицируется — платить за пустоту пользователь не должен.
@@ -1740,6 +1758,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // в chat_quality: рост — это счёт, который мы оплачиваем в одиночку.
     let turnFailed = false;
     let failReason = '';
+    // Чем ответил релей (done.provider/fallback) — в chat_quality.
+    let turnProvider: 'claude' | 'qwen' | undefined;
+    let turnFallback = false;
 
     // Single persistence point — dedupe via `saved` flag so success and error paths
     // both call but only one actually writes.
@@ -1784,6 +1805,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
             lang_mismatch: this.looksLanguageMismatch(fullText, userLanguage, message),
             failed: turnFailed,
             fail_reason: failReason || undefined,
+            provider: turnProvider,
+            fallback: turnFallback || undefined,
           },
         });
       }
@@ -1938,6 +1961,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // 'default'. В обоих случаях ход проходит — просто пин не действует,
         // и узнать об этом можно только по modelUsage, не по ошибке.
         fd.append('model', probe ? PROBE_MODEL : CHAT_MODEL);
+        for (const [k, v] of Object.entries(relayProviderFields(probe, answerProvider))) fd.append(k, v);
 
         // Agent-direct TalerID: when the user connected the TalerID ecosystem, hand
         // the file-agent a full-scope access token + the MCP base URL of the env we
@@ -2015,6 +2039,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
                       safeWrite({ type: 'item', content: ev.text });
                     }
                   } else if (ev.type === 'done') {
+                    ({ provider: turnProvider, fallback: turnFallback } = readDoneProvider(ev));
                     if (ev.failed === true) {
                       turnFailed = true;
                       failReason = typeof ev.failReason === 'string' ? ev.failReason : 'unknown';

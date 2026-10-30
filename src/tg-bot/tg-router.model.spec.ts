@@ -88,4 +88,18 @@ describe('TgRouterService: выбор модели', () => {
     expect(gated).toBe(true);
     expect(String(claudeCli.text.mock.calls[0][1].model)).toBe('claude-haiku-4-5');
   });
+
+  it('владелец выбрал Qwen — основной ход с provider: qwen', async () => {
+    const { svc, claudeCli } = makeRouter();
+    (svc as any).llmProvider = { get: jest.fn(async () => 'qwen') };
+    await svc.generateReply({ ...cfg, owner_user_id: '79030169187' }, 'Дмитрий');
+    expect(claudeCli.textWithCost.mock.calls[0][1].provider).toBe('qwen');
+  });
+
+  it('без выбора — provider не задан', async () => {
+    const { svc, claudeCli } = makeRouter();
+    (svc as any).llmProvider = { get: jest.fn(async () => 'claude') };
+    await svc.generateReply({ ...cfg, owner_user_id: '79030169187' }, 'Дмитрий');
+    expect(claudeCli.textWithCost.mock.calls[0][1].provider).toBeUndefined();
+  });
 });

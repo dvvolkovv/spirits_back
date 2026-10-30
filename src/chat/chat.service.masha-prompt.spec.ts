@@ -2,6 +2,7 @@ import { ChatService } from './chat.service';
 import { AgentsService } from '../agents/agents.service';
 import { platformGuide, TOOLS_LIST_NOTE } from './platform-guide';
 import { LINKEON_HELP_CLI_TOOL_NAME } from '../products/products-cli-tool';
+import { COLLEAGUES_RULE_GENERAL, COLLEAGUES_RULE_NARROW } from './colleagues-rule';
 
 /**
  * Системный промпт Маши (agent.id === 3, локальный claude CLI, не релей).
@@ -166,5 +167,14 @@ describe('системный промпт Маши', () => {
 
       expect(system).not.toContain(TOOLS_LIST_NOTE);
     });
+  });
+});
+
+describe('системный промпт Маши: чужая область', () => {
+  it('Маше (personal) — мягкая переадресация, сразу после списка коллег', async () => {
+    const { system } = await mashaSystemPrompt();
+    expect(system).toContain(COLLEAGUES_RULE_NARROW);
+    expect(system).not.toContain(COLLEAGUES_RULE_GENERAL);
+    expect(system.indexOf(COLLEAGUES_RULE_NARROW)).toBeGreaterThan(system.indexOf('Другие ассистенты:'));
   });
 });

@@ -11,6 +11,7 @@ import { Neo4jService } from '../neo4j/neo4j.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import { LiveKitClient } from './livekit.client';
 import { AttendeeClient } from '../meeting/attendee.client';
+import { endVerdict, type EndVerdict } from './end-reason';
 import {
   CompletePayload, CONSOLIDATE_SIDE_LIMIT, HOST_AGENT_ID, HOST_CATEGORY,
   SPECIALIST_ROLES, SPECIALISTS,
@@ -100,21 +101,37 @@ export class VoiceCallService implements OnModuleInit {
     @Optional() private readonly context?: ContextService,
   ) {}
 
+  /**
+   * Миграции применяются тем же способом, что в TasksService: путь из dist и
+   * путь из исходников, чтобы работало и в сборке, и в ts-node.
+   *
+   * ⚠️ Список, а не один файл. Раньше здесь стояло имя одной миграции и
+   * `return` после первого успеха: вторая такая же правка молча не доехала бы
+   * до базы, а заметилось бы это уже на проде, по отсутствующей колонке.
+   */
+  private static readonly MIGRATIONS = [
+    '003_voice_call_origin.sql',
+    '004_voice_call_end_reason.sql',
+  ];
+
   async onModuleInit(): Promise<void> {
-    // Миграция применяется тем же способом, что в TasksService: путь из dist
-    // и путь из исходников, чтобы работало и в сборке, и в ts-node.
-    const candidates = [
-      path.join(__dirname, 'migrations', '003_voice_call_origin.sql'),
-      path.join(__dirname, '..', '..', 'src', 'voice-call', 'migrations', '003_voice_call_origin.sql'),
-    ];
-    for (const p of candidates) {
-      try {
-        if (!fs.existsSync(p)) continue;
-        await this.pg.query(fs.readFileSync(p, 'utf8'));
-        return;
-      } catch (e: any) {
-        this.logger.warn(`миграция origin не применилась (${p}): ${e?.message}`);
+    for (const name of VoiceCallService.MIGRATIONS) {
+      const candidates = [
+        path.join(__dirname, 'migrations', name),
+        path.join(__dirname, '..', '..', 'src', 'voice-call', 'migrations', name),
+      ];
+      let applied = false;
+      for (const p of candidates) {
+        try {
+          if (!fs.existsSync(p)) continue;
+          await this.pg.query(fs.readFileSync(p, 'utf8'));
+          applied = true;
+          break;
+        } catch (e: any) {
+          this.logger.warn(`миграция ${name} не применилась (${p}): ${e?.message}`);
+        }
       }
+      if (!applied) this.logger.warn(`миграция ${name} не найдена ни по одному пути`);
     }
   }
 
@@ -282,7 +299,7 @@ export class VoiceCallService implements OnModuleInit {
     );
     if (active.rows[0]) {
       this.logger.warn(`[start] user=${userId}: вытесняю заброшенный звонок ${active.rows[0].id}`);
-      await this.markInterrupted(active.rows[0].id).catch((e) =>
+      await this.markInterrupted(active.rows[0].id, 'reaped', 'superseded').catch((e) =>
         this.logger.error(`[start] не смог закрыть старый звонок ${active.rows[0].id}: ${e?.message}`),
       );
     }
@@ -444,11 +461,20 @@ export class VoiceCallService implements OnModuleInit {
     // в 4.13 доллара принесла 26–55 ₽ против ~330 ₽ расхода.
     const tokens = Math.max(0, Math.ceil(cost * CASH_TOKENS_PER_USD));
 
+    // Чем кончился разговор. Вердикт — для тех, кто принимает решения (подхват
+    // в ContextService), сырое — для разбора: вердикт выведен из кодов
+    // протокола и проверен пока только по его документации.
+    const ending = payload.ending;
+    const verdict = endVerdict(ending?.disconnect, ending?.close);
+    const raw = `${ending?.disconnect || '-'}|${ending?.close || '-'}`;
+
     await this.pg.query(
       `UPDATE voice_calls SET status = 'completed', ended_at = now(), duration_sec = $1,
-         transcript = $2, cost_usd = $3, model = $4, tokens_charged = $5 WHERE id = $6`,
-      [durationSec, JSON.stringify(transcript), cost, payload.usage.model, tokens, callId],
+         transcript = $2, cost_usd = $3, model = $4, tokens_charged = $5,
+         end_reason = $6, end_raw = $7 WHERE id = $8`,
+      [durationSec, JSON.stringify(transcript), cost, payload.usage.model, tokens, verdict, raw, callId],
     );
+    this.logger.log(`[complete] call=${callId} кончился: ${verdict} (${raw})`);
 
     // Бот чужой площадки — сразу, не дожидаясь реапера: он лишний участник в
     // переговорах человека. Не блокирует остальное завершение звонка (резюме,
@@ -552,9 +578,10 @@ export class VoiceCallService implements OnModuleInit {
 
   async fail(callId: string, reason: string): Promise<void> {
     const res = await this.pg.query(
-      `UPDATE voice_calls SET status = 'failed', ended_at = now(), summary = $1, cost_usd = 0
+      `UPDATE voice_calls SET status = 'failed', ended_at = now(), summary = $1, cost_usd = 0,
+              end_reason = 'error', end_raw = $3
         WHERE id = $2 RETURNING external_bot_id, provider, user_id, external_room`,
-      [`Звонок не состоялся: ${reason}`, callId],
+      [`Звонок не состоялся: ${reason}`, callId, `failed:${String(reason).slice(0, 60)}`],
     );
     // Сюда сходятся ВСЕ поздние отказы: занятый порт под звук, не созданный
     // бот, не пущенная площадка, не подключившийся звук. Человек в этот момент
@@ -585,11 +612,17 @@ export class VoiceCallService implements OnModuleInit {
    * комнате один и продолжает жечь Realtime-сессию. Комнату надо закрыть —
    * тогда воркер получит disconnect и отправит complete.
    */
-  async markInterrupted(callId: string): Promise<void> {
+  /**
+   * @param why чем кончился звонок; по умолчанию закрытие нами самими.
+   *   Отбой через ручку `/end` — это поступок человека, а вытеснение старого
+   *   звонка новым или работа реапера — нет, и путать их нельзя.
+   */
+  async markInterrupted(callId: string, why: EndVerdict = 'reaped', raw = 'api'): Promise<void> {
     const res = await this.pg.query(
-      `UPDATE voice_calls SET status = 'interrupted', ended_at = now()
+      `UPDATE voice_calls SET status = 'interrupted', ended_at = now(),
+              end_reason = $2, end_raw = $3
        WHERE id = $1 AND status IN ('dialing','active') RETURNING room_name`,
-      [callId],
+      [callId, why, raw],
     );
     const roomName = res.rows[0]?.room_name;
     if (roomName) await this.livekit.closeRoom(roomName);

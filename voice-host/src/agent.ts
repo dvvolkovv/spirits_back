@@ -28,6 +28,9 @@ import { ExternalRoomChat, type IncomingChat, type SendResult } from './external
 import { AttendeeAudioHub, AttendeeAudioInput, AttendeeAudioOutput, muteCommand } from './attendee-audio.js';
 import { botFailureReason } from './attendee-reason.js';
 import { OwnChatEcho } from './chat-echo.js';
+import { ListenMute } from './listen-mute.js';
+import { disconnectName } from './ending.js';
+import { GUARD_TICK_MS, StuckGenerationGuard, attachResponseLog, realtimeOf } from './stuck-generation.js';
 import { Room as ExternalRoom } from '@livekit/rtc-node';
 import {
   answerTo,
@@ -224,8 +227,14 @@ export default defineAgent({
       // Микрофон бота — следом за режимом, и только на мосту. Своя комната и
       // чужая комната Taler ID идут другим путём (см. спеку, пункт 4): там
       // вебсокета к боту нет вовсе.
-      if (isBridged) attendeeHub?.send(muteCommand(wasListening));
+      //
+      // Гасим не сразу, а после подтверждения вслух — см. listen-mute.ts.
+      if (wasListening) listenMute?.enter();
+      else listenMute?.leave();
     }
+    // attendeeHub заводится ниже по файлу — колбэк читает его в момент
+    // отправки, когда хаб уже есть.
+    const listenMute = isBridged ? new ListenMute((on) => attendeeHub?.send(muteCommand(on))) : null;
 
     await ctx.connect();
 
@@ -1121,6 +1130,8 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
     session.on(AgentSessionEventTypes.AgentStateChanged, (ev: AgentStateChangedEvent) => {
       const free = ev.newState === 'listening' || ev.newState === 'idle';
       pending.setBusy(!free);
+      // Конец подтверждения «слушаю» — момент погасить микрофон.
+      listenMute?.state(ev.newState);
       // Сначала коллеги, потом отложенное обращение: ответа специалиста уже
       // ждут вслух, а отложенный вопрос подождёт ещё один ход. flushDeferred
       // сам увидит занятость, если очередь коллег ход забрала.
@@ -1130,10 +1141,32 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
       }
     });
 
+    // Записи разговора, уже попавшие в транскрипт.
+    //
+    // ⚠️ Разбор расшифровок владельца 30.10.2026: на 424 реплики пришлось 11
+    // дословных повторов реплик Романа, и три из них — в пределах двадцати
+    // секунд от первой, сразу после реплики человека. Повтор через минуту
+    // модель могла допустить и сама, а такой — больше похож на то, что одна и
+    // та же запись доехала сюда дважды. Сверяем по идентификатору записи: если
+    // id тот же, это ТА ЖЕ реплика, а не сказанная повторно.
+    //
+    // Заслон заодно и есть замер: пока в логе нет строки о повторе, двойной
+    // записи не происходит, и причина повторов — в самой модели.
+    const seenItems = new Set<string>();
+
     session.on(AgentSessionEventTypes.ConversationItemAdded, (ev: ConversationItemAddedEvent) => {
       if (ev.item.type !== 'message') return; // пропускаем agent_handoff-записи
       const { role, textContent } = ev.item;
       if (!textContent) return;
+      const itemId = (ev.item as { id?: string }).id;
+      if (itemId) {
+        if (seenItems.has(itemId)) {
+          // Без текста: содержимое разговора в логи не попадает.
+          console.log(`[транскрипт] запись ${itemId} (${role}) уже записана — пропускаю`);
+          return;
+        }
+        seenItems.add(itemId);
+      }
       const normalizedRole: 'user' | 'assistant' = role === 'user' ? 'user' : 'assistant';
       // Наши синтетические generateReply()-вставки заводятся с role:'user' —
       // это не реплики пользователя, в транскрипт звонка их не пускаем.
@@ -1410,6 +1443,29 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
     // может убить процесс раньше, чем колбэк доработает, и тогда транскрипт
     // теряется молча — так пропали разговоры на 11 и 20 минут.
     let sent = false;
+
+    /**
+     * ⚠️ Чем кончился звонок: человек положил трубку или связь порвалась.
+     *
+     * Сама сессия этого не знает — её CloseReason на оба случая отвечает
+     * `participant_disconnected`. Знает LiveKit: у уходящего участника есть
+     * СВОЯ причина, и `client_initiated` там отличается от `signal_close`.
+     * До 29.10.2026 её никто не забирал, и сервер считал обрыв прощанием:
+     * при перезвоне после обрыва Роман здоровался заново вместо «нас
+     * прервало» (разговор владельца 28.10.2026).
+     *
+     * Берём только собеседника — личность вида `user_<id>` выдаёт бэкенд при
+     * создании токена. Уход специалиста или бота встречи к тому, попрощался
+     * ли человек, отношения не имеет.
+     */
+    let userDisconnect: string | undefined;
+    let closeReason: string | undefined;
+    ctx.room.on(RoomEvent.ParticipantDisconnected, (p: any) => {
+      const who = String(p?.identity || '');
+      const why = disconnectName(p?.disconnectReason);
+      console.log(`участник ушёл: ${who || '?'} (${why ?? 'причина не пришла'})`);
+      if (who.startsWith('user_')) userDisconnect = why;
+    });
     // Прогресс-флаш транскрипта раз в 15с ВО ВРЕМЯ звонка: сбой Realtime API / пересоздание
     // сессии больше не теряют разговор — уже сказанное уходит на бэкенд ДО любого обрыва.
     // Бэкенд стейджит keep-longest; финальный complete берёт самый полный (owner 2026-09-01:
@@ -1428,12 +1484,17 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
       clearTimeout(warnAt);
       clearTimeout(hardStop);
       try {
-        await backend.complete(meta.callId, transcript, {
-          audioInputTokens: audioIn,
-          cachedAudioInputTokens: cachedAudioIn,
-          audioOutputTokens: audioOut,
-          model,
-        });
+        await backend.complete(
+          meta.callId,
+          transcript,
+          {
+            audioInputTokens: audioIn,
+            cachedAudioInputTokens: cachedAudioIn,
+            audioOutputTokens: audioOut,
+            model,
+          },
+          { disconnect: userDisconnect, close: closeReason },
+        );
         console.log(`complete отправлен (${why}), реплик: ${transcript.length}`);
       } catch (e) {
         console.error(`complete не отправлен (${why})`, e);
@@ -1521,7 +1582,14 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
 
     // Закрытие сессии — самый ранний надёжный сигнал: он приходит сразу после
     // того, как собеседник отключился, и процесс тогда ещё жив.
-    session.on(AgentSessionEventTypes.Close, () => { sessionClosed = true; void sendComplete('session_closed'); });
+    session.on(AgentSessionEventTypes.Close, (ev?: { reason?: string }) => {
+      sessionClosed = true;
+      // Причина закрытия сама по себе неразличима (`participant_disconnected`
+      // и на отбой, и на обрыв), но отделяет сбой сессии и наш предохранитель
+      // по времени от ухода собеседника. Раньше аргумент события отбрасывался.
+      closeReason = ev?.reason;
+      void sendComplete('session_closed');
+    });
     ctx.addShutdownCallback(async () => {
       await sendComplete('shutdown');
       // Чужую комнату закрываем сами: она не наша, и брошенный участник
@@ -1621,6 +1689,19 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
         // коду установленного SDK.
         ...(isMeeting ? { inputOptions: meetingInputOptions() } : {}),
       });
+
+      // СТОРОЖ ЗАВИСШЕГО ОТВЕТА (28.10.2026) — подробности в stuck-generation.ts.
+      //
+      // Ответ без response.done запирает плановое переоткрытие сокета плагина,
+      // и на двадцатой минуте ассистент глохнет до конца встречи — так прошли
+      // встречи 20.10 и 27.10. Ставим на ВСЕ сессии, не только встречи: замок
+      // в плагине общий, у звонка просто реже бывает прерванный ответ.
+      const startedRt = realtimeOf(session);
+      if (startedRt) attachResponseLog(startedRt);
+      const stuckGuard = new StuckGenerationGuard(() => realtimeOf(session));
+      // unref — по той же причине, что у всех таймеров здесь: иначе процесс
+      // задания не завершится после закрытия сессии.
+      setInterval(() => stuckGuard.check(Date.now()), GUARD_TICK_MS).unref?.();
 
       // СТОРОЖ ПУСТОГО ЗВОНКА (26.10.2026).
       //

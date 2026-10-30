@@ -59,8 +59,12 @@ const intIn = (v: any, min: number, max: number): boolean => Number.isInteger(v)
 /**
  * Правка из админки. Незнакомое и кривое поле — ошибка с понятной причиной, а
  * не тихий пропуск: опечатка в имени поля иначе выглядела бы как «сохранено».
+ *
+ * currentYoutubeMode — режим YouTube сейчас: клиент, который шлёт настройки целиком
+ * (так устроена вкладка блога), повторяет и его. Совпавший режим — не попытка его
+ * сменить: поле в патч не попадает, без ошибки.
  */
-export function validateSettingsPatch(body: any): ShortSettingsPatch {
+export function validateSettingsPatch(body: any, currentYoutubeMode?: YoutubeMode): ShortSettingsPatch {
   const b = body ?? {};
   for (const k of Object.keys(b)) {
     if (!(k in COLUMNS)) throw new Error(`неизвестная настройка: ${k}`);
@@ -113,9 +117,10 @@ export function validateSettingsPatch(body: any): ShortSettingsPatch {
     if (!intIn(b.maxOmniSeconds, 8, 400)) throw new Error('maxOmniSeconds — 8–400 секунд Omni на ролик (клип — 8 с)');
     p.maxOmniSeconds = b.maxOmniSeconds;
   }
-  if (b.youtubeMode !== undefined) {
+  if (b.youtubeMode !== undefined && b.youtubeMode !== currentYoutubeMode) {
     // Включает unlisted/public только владелец командой /youtube в боте (settings.update()
     // напрямую, мимо этой проверки) — здесь, через админку, доступен только аварийный откат на manual.
+    // Неизменённый режим сюда не доходит (см. currentYoutubeMode выше).
     if (b.youtubeMode === 'unlisted' || b.youtubeMode === 'public') {
       throw new Error('youtubeMode: загрузку на YouTube включает только владелец командой /youtube в боте; через админку можно только manual');
     }
