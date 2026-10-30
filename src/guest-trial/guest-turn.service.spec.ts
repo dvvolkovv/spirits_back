@@ -208,6 +208,10 @@ describe('ход гостя: отказы', () => {
       calls++;
       return calls === 1 ? { ...row } : { ...row, claimed_at: new Date() };
     });
+    // Служебный первый ход (выше) уже вызвал textWithCost один раз — чистим
+    // счётчик, иначе not.toHaveBeenCalled() ниже увидит именно его, а не вызов
+    // ЭТОГО хода.
+    h.cli.textWithCost.mockClear();
     const { evs } = await h.turn({ token });
     expect(evs.slice(-1)).toEqual([{ type: 'wall', reason: 'limit' }]);
     expect(h.cli.textWithCost).not.toHaveBeenCalled();
