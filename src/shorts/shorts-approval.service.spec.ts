@@ -270,7 +270,8 @@ describe('ShortsApprovalService', () => {
         ['approved', 'ok', /^Ролик уже одобрен/],
         ['capture_queued', 'ok', /переделывается/],
         ['rendering', 'redo', /переделывается/],
-        ['failed', 'redo', /^Ролик упал — повторить или отклонить его можно в админке: Блог → Ролики$/],
+        ['failed', 'redo', /^Ролик упал — что с ним делать, решите в админке: Блог → Ролики$/],
+        ['failed', 'note', /^Ролик упал — замечание не принял\. Что с ним делать — в админке: Блог → Ролики, раздел «Упали»\.$/],
         ['rejected', 'no', /^Ролик отклонён/],
         ['published', 'no', /^Ролик уже опубликован/],
         ['writing', 'note', /переписывается/],
@@ -283,6 +284,7 @@ describe('ShortsApprovalService', () => {
         const answered = String(((tg.answerCallbackQuery.mock.calls[0] as any[])[1] as any).text);
         expect(answered).toMatch(text);
         expect(answered).not.toMatch(/[a-z]{3,}/);
+        expect(Array.from(answered).length).toBeLessThanOrEqual(200);
         expect(pg.query.mock.calls.some((c: any[]) => String(c[0]).startsWith('UPDATE'))).toBe(false);
       }
     });
@@ -386,7 +388,7 @@ describe('ShortsApprovalService', () => {
       const { svc, tg } = setup(row({ status: 'failed', failed_from: 'writing' }));
       await svc.handleReplyEdit(reply());
       const text = String((tg.sendMessage.mock.calls[0] as any[])[1]);
-      expect(text).toContain('в админке: Блог → Ролики — «Повторить», «Новая сцена» или «Новый текст» (можно с замечанием), либо «Отклонить»');
+      expect(text).toContain('Ролик упал — замечание не принял. Что с ним делать — в админке: Блог → Ролики, раздел «Упали».');
       expect(text).not.toMatch(/retry|reject|from=/);
     });
 
@@ -432,7 +434,11 @@ describe('ShortsApprovalService', () => {
       const { svc, topics, tg } = setup();
       expect(await svc.handleShortCommand(msg())).toBe(true);
       expect(topics.addManual).toHaveBeenCalledWith({ topic: 'Как я спорил с арендодателем о залоге', rubric: 'case', sourceRef: `tg:${OWNER}:33` });
-      expect((tg.sendMessage.mock.calls[0] as any[])[1]).toMatch(/Принял заказ ролика.*Автозапуск выключен/);
+      const text = (tg.sendMessage.mock.calls[0] as any[])[1];
+      expect(text).toMatch(/Принял заказ ролика.*Автозапуск выключен/);
+      expect(text).toContain('«Запустить сейчас»');
+      expect(text).toContain('раздел «Идеи»');
+      expect(text).not.toContain('start_now');
     });
 
     it('не владелец, группа, выключенные ролики — не наша команда', async () => {
@@ -473,7 +479,8 @@ describe('ShortsApprovalService', () => {
       expect(tg.sendMessage).toHaveBeenCalledTimes(1);
       const text = (tg.sendMessage.mock.calls[0] as any[])[1];
       expect(text).toMatch(/Ролик «Залог при аренде» не собрался: съёмка: ответ не годится/);
-      expect(text).toContain('Повторить можно в админке: Блог → Ролики — «Повторить», «Новая сцена» или «Новый текст» (можно с замечанием), либо «Отклонить».');
+      expect(text).toContain('Что дальше — в админке: Блог → Ролики, раздел «Упали»: «Повторить», «Новая сцена» (можно с замечанием) или «Отклонить».');
+      expect(text).not.toContain('Новый текст');
       expect(text).not.toMatch(/retry|reject|from=/);
     });
 
@@ -490,8 +497,40 @@ describe('ShortsApprovalService', () => {
       await svc.notifyFailures();
       const text = (tg.sendMessage.mock.calls[0] as any[])[1];
       expect(text).toMatch(/Ролик «Залог при аренде» не вышел на площадки: публикация: telegram: chat not found/);
-      expect(text).toContain('В админке: Блог → Ролики — «Повторить» или «Отклонить».');
-      expect(text).not.toContain('from=');
+      expect(text).toContain('Что дальше — в админке: Блог → Ролики, раздел «Упали»: «Повторить», «Пост вышел» (если пост всё-таки в канале) или «Отклонить».');
+      expect(text).not.toMatch(/retry|reject|from=|mark_published/);
+    });
+
+    it('упавший ролик со съёмкой — доступен «Новый текст»', async () => {
+      let given = false;
+      const { svc, tg, pg } = setup();
+      pg.query.mockImplementation(async (sql: string) => {
+        if (sql.includes('failure_notified = true') && !given) {
+          given = true;
+          return { rows: [row({ status: 'failed', last_error: 'сборка: упала', failed_from: 'rendering', capture: { answerText: 'x' } })] };
+        }
+        return { rows: [] };
+      });
+      await svc.notifyFailures();
+      const text = (tg.sendMessage.mock.calls[0] as any[])[1];
+      expect(text).toContain('«Повторить», «Новая сцена», «Новый текст» (можно с замечанием) или «Отклонить».');
+    });
+
+    it('упавшая публикация, но пост в канале уже вышел (YouTube упал после Telegram) — только «Повторить»', async () => {
+      let given = false;
+      const { svc, tg, pg } = setup();
+      pg.query.mockImplementation(async (sql: string) => {
+        if (sql.includes('failure_notified = true') && !given) {
+          given = true;
+          return { rows: [row({ status: 'failed', last_error: 'публикация: youtube: не загрузилось', failed_from: 'publishing', released: true })] };
+        }
+        return { rows: [] };
+      });
+      await svc.notifyFailures();
+      const text = (tg.sendMessage.mock.calls[0] as any[])[1];
+      expect(text).toContain('«Повторить» (пост в канале уже вышел, отклонить нельзя).');
+      expect(text).not.toContain('«Отклонить»');
+      expect(text).not.toContain('Пост вышел');
     });
 
     it('Telegram не принял сообщение — флаг возвращается, второй ролик в этом вызове не трогаем', async () => {
