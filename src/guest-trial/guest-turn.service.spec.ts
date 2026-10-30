@@ -184,9 +184,11 @@ describe('ход гостя: поток', () => {
 });
 
 describe('ход гостя: отказы', () => {
-  it('незнакомый ассистент и слишком длинное сообщение — 400', async () => {
+  it('незнакомый ассистент, пустое и слишком длинное сообщение — 400', async () => {
     const h = harness({ limits: { maxChars: 10 } });
     expect((await h.turn({ assistantId: '999' })).res.statusCode).toBe(400);
+    expect((await h.turn({ message: '' })).res.statusCode).toBe(400);
+    expect((await h.turn({ message: '   ' })).res.statusCode).toBe(400);
     expect((await h.turn({ message: 'x'.repeat(11) })).res.statusCode).toBe(400);
     expect(h.cli.textWithCost).not.toHaveBeenCalled();
   });
@@ -215,6 +217,24 @@ describe('ход гостя: отказы', () => {
     const { evs } = await h.turn({ token });
     expect(evs.slice(-1)).toEqual([{ type: 'wall', reason: 'limit' }]);
     expect(h.cli.textWithCost).not.toHaveBeenCalled();
+  });
+
+  it('проба уже перенесена (claimed_at выставлен) — стена limit, модель не зовётся (M7)', async () => {
+    const h = harness();
+    const token = (await h.turn()).evs[0].token;
+    h.sessions.rows.get('s1').claimed_at = new Date();
+    h.cli.textWithCost.mockClear();
+    const { evs } = await h.turn({ token });
+    expect(evs.slice(-1)).toEqual([{ type: 'wall', reason: 'limit' }]);
+    expect(h.cli.textWithCost).not.toHaveBeenCalled();
+  });
+
+  it('ключ приходит в событии guest даже при закрытом окне ответов у новой пробы (M7)', async () => {
+    const h = harness({ limits: { answersPerHour: 0 } });
+    const { evs } = await h.turn();
+    expect(evs[0].type).toBe('guest');
+    expect(evs[0].token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(evs.slice(-1)).toEqual([{ type: 'wall', reason: 'closed' }]);
   });
 
   it('сбой модели и отказ CLI текстом — error, пара не пишется', async () => {
@@ -281,15 +301,24 @@ describe('ход гостя: отказы', () => {
   it('потолок одновременных ходов — error busy; счётчики возвращаются; окно ответов не трогает (M1)', async () => {
     let release: () => void = () => {};
     let calls = 0;
+    // Обещание «вошли в модель» (M7) — вместо setTimeout(20): второй ход
+    // стартует ровно тогда, когда первый уже вызвал CLI и повис там, а не
+    // «предположительно успел» за фиксированное время.
+    let enteredModel: () => void = () => {};
+    const entered = new Promise<void>((resolve) => { enteredModel = resolve; });
     const h = harness({
       limits: { concurrentTurns: 1 },
       // Первый ход висит, пока его не отпустят; следующие отвечают сразу.
-      reply: () => (++calls === 1
-        ? new Promise((resolve) => { release = () => resolve({ text: 'Готово', costUsd: 0 }); })
-        : Promise.resolve({ text: 'Потом', costUsd: 0 })),
+      reply: () => {
+        if (++calls === 1) {
+          enteredModel();
+          return new Promise((resolve) => { release = () => resolve({ text: 'Готово', costUsd: 0 }); });
+        }
+        return Promise.resolve({ text: 'Потом', costUsd: 0 });
+      },
     });
     const first = h.turn();
-    await new Promise((r) => setTimeout(r, 20));
+    await entered;
     const beforeBusy = h.redis.peek('guest-lim:answers:h');
     const second = await h.turn();
     const afterBusy = h.redis.peek('guest-lim:answers:h');
@@ -310,14 +339,19 @@ describe('ход гостя: отказы', () => {
   it('второй ход той же пробы, пока идёт первый, — 409', async () => {
     let release: () => void = () => {};
     let calls = 0;
+    // Обещание «вошли в модель» (M7) — вместо setTimeout(20), см. выше.
+    let enteredModel: () => void = () => {};
+    const entered = new Promise<void>((resolve) => { enteredModel = resolve; });
     const h = harness({
-      reply: () => (++calls === 1
-        ? Promise.resolve({ text: 'Первый', costUsd: 0 })
-        : new Promise((resolve) => { release = () => resolve({ text: 'Второй', costUsd: 0 }); })),
+      reply: () => {
+        if (++calls === 1) return Promise.resolve({ text: 'Первый', costUsd: 0 });
+        enteredModel();
+        return new Promise((resolve) => { release = () => resolve({ text: 'Второй', costUsd: 0 }); });
+      },
     });
     const token = (await h.turn()).evs[0].token;
     const pending = h.turn({ token });
-    await new Promise((r) => setTimeout(r, 20));
+    await entered;
     expect((await h.turn({ token })).res.statusCode).toBe(409);
     release();
     await pending;
