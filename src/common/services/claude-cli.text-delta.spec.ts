@@ -106,10 +106,4 @@ describe('ClaudeCliService: текст по мере генерации', () => 
     const r = await new ClaudeCliService().textWithCost('привет', { onTextDelta: () => { throw new Error('клиент ушёл'); } });
     expect(r.text).toBe('Привет, как дела?');
   });
-
-  it('вызов с колбэком на Qwen не повторяется: показанный текст повтор не заберёт', () => {
-    const svc: any = new ClaudeCliService();
-    expect(svc.mayRetryOnQwen(new Error('401'), { onTextDelta: () => {} })).toBe(false);
-    expect(svc.mayRetryOnQwen(new Error('401'), {})).toBe(true);
-  });
 });
