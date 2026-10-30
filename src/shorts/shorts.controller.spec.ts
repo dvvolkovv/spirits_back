@@ -1,8 +1,14 @@
+jest.mock('./short-slot-claim', () => ({
+  ...jest.requireActual('./short-slot-claim'),
+  approveShortIntoSlot: jest.fn(),
+}));
+
 import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
 import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { AdminGuard } from '../common/guards/admin.guard';
 import { JwtGuard } from '../common/guards/jwt.guard';
-import { SHORT_SLOT_INDEX } from './short-slot-claim';
+import { NoFreeSlotError } from '../blog/blog-slots';
+import { SHORT_SLOT_INDEX, approveShortIntoSlot } from './short-slot-claim';
 import { ShortOrderError } from './shorts-topic.service';
 import { ShortsController } from './shorts.controller';
 
@@ -236,7 +242,7 @@ describe('POST admin/shorts', () => {
     expect(r.body.status).toBe('rejected');
   });
 
-  it('reject — ролик уже вышел на площадке — 409; не упавший — 409', async () => {
+  it('reject — ролик уже вышел на площадке — 409; в работе — 409; ждущий решения без версии — 400', async () => {
     const released = setup((sql) => {
       if (sql.includes('RETURNING')) return { rows: [] };
       if (sql.includes('AS released')) return { rows: [{ status: 'failed', released: true }] };
@@ -244,8 +250,12 @@ describe('POST admin/shorts', () => {
     });
     await expect(released.ctl.action({ action: 'reject', id: ID }, res())).rejects.toThrow(/уже вышел/);
 
+    const writing = setup(() => ({ rows: [video({ status: 'writing', failed_from: null })] }));
+    await expect(writing.ctl.action({ action: 'reject', id: ID }, res())).rejects.toBeInstanceOf(ConflictException);
+    expect(writing.pg.query.mock.calls.some((c: any[]) => String(c[0]).startsWith('UPDATE'))).toBe(false);
+
     const review = setup(() => ({ rows: [video({ status: 'pending_review', failed_from: null })] }));
-    await expect(review.ctl.action({ action: 'reject', id: ID }, res())).rejects.toBeInstanceOf(ConflictException);
+    await expect(review.ctl.action({ action: 'reject', id: ID }, res())).rejects.toBeInstanceOf(BadRequestException);
     expect(review.pg.query.mock.calls.some((c: any[]) => String(c[0]).startsWith('UPDATE'))).toBe(false);
   });
 
@@ -345,5 +355,119 @@ describe('POST admin/shorts', () => {
 
   it('неизвестное действие — 400', async () => {
     await expect(setup().ctl.action({ action: 'boom' }, res())).rejects.toBeInstanceOf(BadRequestException);
+  });
+});
+
+describe('POST admin/shorts — решение по готовому ролику', () => {
+  const review = (over: Record<string, any> = {}) =>
+    video({ status: 'pending_review', failed_from: null, slot_at: '2030-01-03T15:00:00.000Z', ...over });
+  beforeEach(() => (approveShortIntoSlot as jest.Mock).mockReset());
+
+  it('approve — общая запись одобрения со слотом и версией; ответ — перечитанный ролик', async () => {
+    (approveShortIntoSlot as jest.Mock).mockResolvedValue({
+      slot: new Date('2030-01-03T15:00:00.000Z'), now: new Date('2030-01-01T00:00:00.000Z'),
+    });
+    let loads = 0;
+    const { ctl, pg } = setup((sql) =>
+      sql.includes('FROM short_video') ? { rows: [review(loads++ ? { status: 'approved' } : {})] } : { rows: [] });
+    const r = res();
+    await ctl.action({ action: 'approve', id: ID, version: VERSION }, r);
+    expect(approveShortIntoSlot).toHaveBeenCalledWith(
+      pg, ID, new Date('2030-01-03T15:00:00.000Z'), expect.objectContaining({ slotDays: [2, 4, 6] }), undefined, VERSION,
+    );
+    expect(r.body.status).toBe('approved');
+  });
+
+  it('approve — без версии или с кривой — 400, запись не зовётся', async () => {
+    const { ctl } = setup(() => ({ rows: [review()] }));
+    await expect(ctl.action({ action: 'approve', id: ID }, res())).rejects.toBeInstanceOf(BadRequestException);
+    await expect(ctl.action({ action: 'approve', id: ID, version: '2026-10-30' }, res())).rejects.toBeInstanceOf(BadRequestException);
+    expect(approveShortIntoSlot).not.toHaveBeenCalled();
+  });
+
+  it('approve — версия разошлась — 409 version_conflict', async () => {
+    (approveShortIntoSlot as jest.Mock).mockResolvedValue(null);
+    const { ctl } = setup((sql) =>
+      sql.includes('AS released') ? { rows: [{ status: 'pending_review', released: false }] } : { rows: [review()] });
+    const err: any = await ctl.action({ action: 'approve', id: ID, version: VERSION }, res()).catch((e) => e);
+    expect(err).toBeInstanceOf(ConflictException);
+    expect(err.getResponse()).toMatchObject({
+      error: 'version_conflict', message: 'Ролик изменился, пока был открыт: на экране устаревшая версия',
+    });
+  });
+
+  it('approve — ролик уже не ждёт решения — 409 словами, без внутренних статусов', async () => {
+    (approveShortIntoSlot as jest.Mock).mockResolvedValue(null);
+    const { ctl } = setup((sql) =>
+      sql.includes('AS released') ? { rows: [{ status: 'approved', released: false }] } : { rows: [review()] });
+    await expect(ctl.action({ action: 'approve', id: ID, version: VERSION }, res())).rejects.toThrow(
+      'Одобрить можно только ролик, который ждёт решения; этот — одобрен. Обновите список.',
+    );
+  });
+
+  it('версия похожа на дату, но невозможна (месяц 13) — 400, а не 500 от Postgres', async () => {
+    (approveShortIntoSlot as jest.Mock).mockRejectedValue(
+      Object.assign(new Error('date/time field value out of range'), { code: '22008' }),
+    );
+    const { ctl } = setup(() => ({ rows: [review()] }));
+    await expect(ctl.action({ action: 'approve', id: ID, version: '2026-13-45 12:34:56+00' }, res()))
+      .rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('approve — ролик уже вышел (состояние, до которого сейчас не дойти) — свой текст, без «этот — ждёт решения»', async () => {
+    (approveShortIntoSlot as jest.Mock).mockResolvedValue(null);
+    const { ctl } = setup((sql) =>
+      sql.includes('AS released') ? { rows: [{ status: 'pending_review', released: true }] } : { rows: [review()] });
+    await expect(ctl.action({ action: 'approve', id: ID, version: VERSION }, res())).rejects.toThrow(
+      'Ролик уже вышел на площадке — решение по нему не принять',
+    );
+  });
+
+  it('approve — нет свободного слота — 409 с причиной', async () => {
+    (approveShortIntoSlot as jest.Mock).mockRejectedValue(new NoFreeSlotError('все 60 ближайших слотов расписания заняты'));
+    const { ctl } = setup(() => ({ rows: [review()] }));
+    await expect(ctl.action({ action: 'approve', id: ID, version: VERSION }, res())).rejects.toThrow(/не одобрил: все 60/);
+  });
+
+  it('redo — к режиссёру через общую запись, версия — в условии записи', async () => {
+    const { ctl, pg } = setup((sql) => (sql.startsWith('UPDATE') ? { rows: [review({ status: 'directing' })] } : { rows: [review()] }));
+    const r = res();
+    await ctl.action({ action: 'redo', id: ID, version: VERSION }, r);
+    const [sql, params] = pg.query.mock.calls.find((c: any[]) => String(c[0]).startsWith('UPDATE')) as any[];
+    expect(sql).toContain('AND updated_at = $4::timestamptz');
+    expect(params).toEqual([ID, 'directing', ['pending_review', 'approved'], VERSION]);
+    expect(r.body.status).toBe('directing');
+  });
+
+  it('redo — ролик уже вышел — 409 «уже вышел на площадке»', async () => {
+    const { ctl } = setup((sql) => {
+      if (sql.startsWith('UPDATE')) return { rows: [] };
+      if (sql.includes('AS released')) return { rows: [{ status: 'approved', released: true }] };
+      return { rows: [review({ status: 'approved' })] };
+    });
+    await expect(ctl.action({ action: 'redo', id: ID, version: VERSION }, res())).rejects.toThrow(
+      'Ролик уже вышел на площадке — переснять или отклонить нельзя',
+    );
+  });
+
+  it('reject ждущего решения — через общую запись с версией', async () => {
+    const { ctl, pg } = setup((sql) => (sql.startsWith('UPDATE') ? { rows: [review({ status: 'rejected' })] } : { rows: [review()] }));
+    const r = res();
+    await ctl.action({ action: 'reject', id: ID, version: VERSION }, r);
+    const [, params] = pg.query.mock.calls.find((c: any[]) => String(c[0]).startsWith('UPDATE')) as any[];
+    expect(params).toEqual([ID, 'rejected', ['pending_review', 'approved'], VERSION]);
+    expect(r.body.status).toBe('rejected');
+  });
+
+  it('note — замечание дописано к прежним, ролик у сценариста; пустое — 400', async () => {
+    const { ctl, pg } = setup((sql) =>
+      sql.startsWith('UPDATE') ? { rows: [review({ status: 'writing' })] } : { rows: [review({ owner_note: 'короче' })] });
+    const r = res();
+    await ctl.action({ action: 'note', id: ID, version: VERSION, text: '  без цифр  ' }, r);
+    const [sql, params] = pg.query.mock.calls.find((c: any[]) => String(c[0]).startsWith('UPDATE')) as any[];
+    expect(sql).toContain("status = 'writing'");
+    expect(params).toEqual([ID, 'короче\nбез цифр', VERSION]);
+    expect(r.body.status).toBe('writing');
+    await expect(ctl.action({ action: 'note', id: ID, version: VERSION, text: '   ' }, res())).rejects.toBeInstanceOf(BadRequestException);
   });
 });
