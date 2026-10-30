@@ -94,7 +94,7 @@ const BUTTON_REFUSALS: Partial<Record<ShortStatus, string>> = {
   published: 'Ролик уже опубликован',
   rejected: 'Ролик отклонён',
   // Всплывашка — до 200 знаков и без латиницы (сторожит спека); кнопок не обещаем — у вышедшего ролика «Отклонить» нет.
-  failed: 'Ролик упал — что с ним делать, решите в админке: Блог → Ролики',
+  failed: 'Ролик упал — что с ним делать, решите в админке: Блог → Ролики, раздел «Упали»',
 };
 
 const buttonRefusal = (s: ShortStatus | undefined): string => (s && BUTTON_REFUSALS[s]) || 'Ролик уже обработан';
@@ -568,8 +568,9 @@ export class ShortsApprovalService {
       );
       if (!r.rows.length) return;
       const v = rowToShort(r.rows[0]);
-      const what = v.failedFrom === 'publishing' ? 'не вышел на площадки' : 'не собрался';
-      const next = failedHint(v, r.rows[0].released === true);
+      const released = r.rows[0].released === true;
+      const what = v.failedFrom === 'publishing' ? (released ? 'вышел не на все площадки' : 'не вышел на площадки') : 'не собрался';
+      const next = failedHint(v, released);
       const text = `${isStand() ? STAND_MARK : ''}Ролик${quoted(v)} ${what}: ${clip(v.lastError || 'причина не записана', 600)}\n${next}`;
       const owner = approverChatId();
       if (!owner) {

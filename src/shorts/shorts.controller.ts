@@ -254,15 +254,21 @@ export class ShortsController {
     }
     try {
       await inTransaction(this.pg, async (tx) => {
-        await tx.query(
+        // Строка telegram уже published (например, YouTube упал уже после неё, и админка могла
+        // ещё показывать «Пост вышел») — WHERE не даёт переписать вышедший пост чужой ссылкой.
+        const ins = await tx.query(
           `INSERT INTO short_publication (short_id, platform, status, url, external_id, published_at, last_error, updated_at)
                 VALUES ($1, 'telegram', 'published', $2, $3, now(), NULL, now())
               ON CONFLICT (short_id, platform) DO UPDATE
                 SET status = 'published', url = $2, external_id = $3,
                     published_at = COALESCE(short_publication.published_at, now()),
-                    last_error = NULL, updated_at = now()`,
+                    last_error = NULL, updated_at = now()
+              WHERE short_publication.status <> 'published'`,
           [id, url, externalId],
         );
+        if (!ins.rowCount) {
+          throw new ConflictException('Пост уже отмечен вышедшим — «Пост вышел» не нужен, нажмите «Повторить»');
+        }
         const r = await tx.query(
           `UPDATE short_video
               SET status = 'approved', failed_from = NULL, last_error = NULL, failure_notified = false,
