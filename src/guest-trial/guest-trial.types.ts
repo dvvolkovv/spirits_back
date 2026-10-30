@@ -51,9 +51,28 @@ export function parseMode(raw: unknown): GuestMode {
 }
 
 /**
+ * Единственное число лимита: number или строка из цифр (после trim), целое
+ * больше нуля. Строже простого Number(...) — тот молча принимал дробные
+ * строки ('42.0'), экспоненту ('5e2') и т.п. Остальное — null.
+ */
+export function toLimit(raw: unknown): number | null {
+  let n: number;
+  if (typeof raw === 'number') {
+    n = raw;
+  } else if (typeof raw === 'string' && /^\d+$/.test(raw.trim())) {
+    n = Number(raw.trim());
+  } else {
+    return null;
+  }
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+/**
  * Лимиты из базы поверх base. Принимается только целое больше нуля, остальное
  * попадает в ignored — опечатку видно в ответе админ-ручки и в логе, а не по
- * тому, что потолок «не поднялся».
+ * тому, что потолок «не поднялся». Неизвестные ключи строки базы терпим
+ * молча — совместимость со старыми/будущими версиями объекта; за опечатки в
+ * ключах, которые вводит сам админ, отвечает parseLimitsPatch.
  */
 export function sanitizeLimits(
   raw: unknown,
@@ -65,10 +84,34 @@ export function sanitizeLimits(
     const src = raw as Record<string, unknown>;
     for (const key of Object.keys(DEFAULT_GUEST_LIMITS) as Array<keyof GuestLimits>) {
       if (!(key in src)) continue;
-      const n = Number(src[key]);
-      if (Number.isSafeInteger(n) && n > 0) limits[key] = n;
+      const n = toLimit(src[key]);
+      if (n !== null) limits[key] = n;
       else ignored.push(`${key}=${String(src[key])}`);
     }
   }
   return { limits, ignored };
+}
+
+/**
+ * Патч лимитов из админ-ручки. В отличие от sanitizeLimits (терпит чужие
+ * ключи строки базы молча — совместимость), здесь неизвестный ключ — это
+ * опечатка админа и должен быть виден в ответе ручки, а не потеряться молча.
+ */
+export function parseLimitsPatch(raw: unknown): { patch: Partial<GuestLimits>; ignored: string[] } {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { patch: {}, ignored: ['limits: ожидался объект'] };
+  }
+  const src = raw as Record<string, unknown>;
+  const patch: Partial<GuestLimits> = {};
+  const ignored: string[] = [];
+  for (const key of Object.keys(src)) {
+    if (!(key in DEFAULT_GUEST_LIMITS)) {
+      ignored.push(`${key}: неизвестный ключ`);
+      continue;
+    }
+    const n = toLimit(src[key]);
+    if (n !== null) patch[key as keyof GuestLimits] = n;
+    else ignored.push(`${key}=${String(src[key])}`);
+  }
+  return { patch, ignored };
 }

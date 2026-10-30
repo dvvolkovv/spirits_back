@@ -3,6 +3,17 @@
 -- один DO: advisory-лок разводит одновременные старты, индексы создаются только
 -- если их нет (голый CREATE INDEX IF NOT EXISTS на PG 16 берёт ShareLock на
 -- таблицу даже при готовом индексе — см. tokens/002).
+--
+-- ОТКАТ:
+--   DROP TABLE guest_trial_messages;
+--   DROP TABLE guest_trial_sessions;
+--   DROP TABLE guest_trial_settings;
+--
+-- ⚠️ Для будущих 002+: ALTER TABLE … ADD COLUMN IF NOT EXISTS берёт
+-- ACCESS EXCLUSIVE на таблицу на КАЖДОМ старте, даже когда колонка уже есть —
+-- в отличие от CREATE TABLE IF NOT EXISTS это не бесплатный no-op. Добавлять
+-- колонку только через проверку каталога (to_regclass / information_schema)
+-- внутри DO — так же, как здесь сделаны индексы.
 DO $guest_trial$
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtext('guest-trial/001'));
@@ -21,7 +32,8 @@ BEGIN
     cost_usd        numeric(10,4) NOT NULL DEFAULT 0,
     created_at      timestamptz NOT NULL DEFAULT now(),
     last_message_at timestamptz NOT NULL DEFAULT now(),
-    -- sha256 от userId, а не сам userId: у телефонных аккаунтов userId — номер.
+    -- хеш нужен только около входа (повторный перенос тем же человеком);
+    -- уборка обнуляет его через 7 дней после переноса.
     claimed_by_hash text,
     claimed_at      timestamptz
   );
@@ -42,12 +54,9 @@ BEGIN
     updated_at timestamptz NOT NULL DEFAULT now()
   );
 
-  IF to_regclass('public.idx_guest_trial_sessions_created') IS NULL THEN
-    CREATE INDEX idx_guest_trial_sessions_created ON guest_trial_sessions (created_at);
-  END IF;
-  IF to_regclass('public.idx_guest_trial_sessions_open') IS NULL THEN
-    CREATE INDEX idx_guest_trial_sessions_open ON guest_trial_sessions (last_message_at) WHERE claimed_at IS NULL;
-  END IF;
+  -- Только индекс сообщений сессии: статистика по sessions — агрегат без
+  -- WHERE, а уборка открытых проб фильтрует OR по двум колонкам (ни created_at,
+  -- ни last_message_at отдельным индексом её не ускорят).
   IF to_regclass('public.idx_guest_trial_messages_session') IS NULL THEN
     CREATE INDEX idx_guest_trial_messages_session ON guest_trial_messages (session_id, id);
   END IF;
