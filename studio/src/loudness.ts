@@ -3,8 +3,8 @@ import fs from 'node:fs';
 import { promisify } from 'node:util';
 
 /**
- * Громкость готового ролика — к норме площадок. Приём двух проходов loudnorm
- * и повтора при выбросе пика — из ffmpeg-skill (scripts/loudness.py).
+ * Громкость готового ролика — к норме площадок. Приём двух проходов loudnorm —
+ * из ffmpeg-skill (scripts/loudness.py); их повтор по пику не взят — см. TP_HEADROOM_DB.
  */
 const run = promisify(execFile);
 
@@ -19,10 +19,12 @@ export const MASTER = { lufs: -14, tp: -1, lra: 11 } as const;
 
 export type LoudnessTarget = { lufs: number; tp: number; lra: number };
 
-/** Допуск пика: замеры одного файла расходятся на столько. */
-const TP_TOLERANCE_DB = 0.1;
-
-/** Потолок пика для loudnorm ниже нормы: кодер AAC после loudnorm добавляет свой выброс. */
+/**
+ * Потолок пика для loudnorm ниже нормы: кодер AAC после loudnorm добавляет свой
+ * выброс. На пяти роликах стенда (30.10.2026, ffmpeg 6.1) он 0,03–0,19 дБ — итог
+ * −1,31…−1,47 dBTP. Повтора с потолком ниже нет: на резких всплесках выброс AAC
+ * 0,9–2,6 дБ и от потолка зависит немонотонно — повтор выходил и хуже первого.
+ */
 const TP_HEADROOM_DB = 0.5;
 
 export interface Loudness {
@@ -89,37 +91,19 @@ async function applyLoudness(input: string, output: string, m: Loudness, target:
 }
 
 /**
- * Потолок пика для повтора, если пик готового файла вышел за норму (выброс кодера
- * AAC): ниже прежнего на выброс и допуск. null — пик в норме, повтор не нужен.
- */
-export function nextCeiling(ceiling: number, afterTp: number, target: LoudnessTarget = MASTER): number | null {
-  const over = afterTp - target.tp;
-  if (over <= TP_TOLERANCE_DB) return null;
-  return Math.round((ceiling - over - TP_TOLERANCE_DB) * 100) / 100;
-}
-
-/**
- * Готовый ролик → норма площадок: замер, второй проход, замер итога; пик после
- * кодера вышел за норму — один повтор с потолком ниже. Тишина (−inf) — файл
- * копируется как есть: выравнивать нечего, а пустой звук назовёт проверка
- * ролика (verifyVideo).
+ * Готовый ролик → норма площадок: замер, второй проход, замер итога (для лога).
+ * Тишина (−inf) — файл копируется как есть: выравнивать нечего, а пустой звук
+ * назовёт проверка ролика (verifyVideo).
  */
 export async function masterLoudness(input: string, output: string, target: LoudnessTarget = MASTER): Promise<Mastered> {
-  let ceiling = target.tp - TP_HEADROOM_DB;
+  const ceiling = target.tp - TP_HEADROOM_DB;
   const before = await measureLoudness(input, { ...target, tp: ceiling });
   if (!Number.isFinite(before.i)) {
     await fs.promises.copyFile(input, output);
     return { before, after: before };
   }
   await applyLoudness(input, output, before, target, ceiling);
-  let after = await measureLoudness(output, target);
-  const lower = nextCeiling(ceiling, after.tp, target);
-  if (lower !== null) {
-    ceiling = lower;
-    await applyLoudness(input, output, await measureLoudness(input, { ...target, tp: ceiling }), target, ceiling);
-    after = await measureLoudness(output, target);
-  }
-  return { before, after };
+  return { before, after: await measureLoudness(output, target) };
 }
 
 /** Строка для лога: громкость и пик до и после выравнивания. */

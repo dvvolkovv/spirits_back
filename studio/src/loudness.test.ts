@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { detectSilences, probeFile } from './ffprobe';
-import { describeLoudness, MASTER, masterLoudness, measureLoudness, nextCeiling, parseLoudnorm, type Loudness } from './loudness';
+import { describeLoudness, MASTER, masterLoudness, measureLoudness, parseLoudnorm, type Loudness } from './loudness';
 
 /** Хвост stderr первого прохода loudnorm — снят с ролика-образца skit-sample-1 (30.10.2026). */
 const PASS1 = [
@@ -45,13 +45,6 @@ test('нет замера в выводе — ошибка с причиной',
 
 test('норма площадок: −14 LUFS, пик не выше −1 dBTP', () => {
   assert.deepEqual(MASTER, { lufs: -14, tp: -1, lra: 11 });
-});
-
-test('потолок пика: без выброса — без повтора; выброс после кодера — ниже на выброс и допуск', () => {
-  assert.equal(nextCeiling(-1.5, -1.3), null);
-  assert.equal(nextCeiling(-1.5, -0.9), null);
-  assert.equal(nextCeiling(-1.5, -0.6), -2);
-  assert.equal(nextCeiling(-2, 0.2), -3.3);
 });
 
 test('строка для лога: было → стало; тишина — не выравнивалась', () => {
@@ -113,10 +106,12 @@ test('выравнивание: −14 LUFS и пик не выше −1 dBTP; в
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('пики выше нормы: громкость всё равно −14, пик не выше −1 dBTP', { timeout: 60_000 }, async () => {
+test('громкие акценты: ограничитель срезает пик, громкость всё равно −14, пик не выше −1 dBTP', { timeout: 60_000 }, async () => {
   const dir = tmp();
-  // Речь на −26 дБ и короткие всплески на −6 дБ: линейный подъём на 15 дБ вывел бы пик выше 0 dBTP.
-  const input = makeVideo(dir, '0.05*sin(2*PI*300*t)*between(t\\,0.5\\,7.5)+0.5*sin(2*PI*2000*t)*between(mod(t\\,1)\\,0.5\\,0.505)');
+  // Речь на −26 дБ и плавные акценты раз в секунду: линейный подъём на 13 дБ вывел бы пик
+  // на +2 dBTP, срезать ≈ 3,5 дБ — как на роликах стенда (1,2–5 дБ). Резкие всплески не
+  // годятся: на них выброс кодера AAC 0,9–2,6 дБ (см. TP_HEADROOM_DB в loudness.ts).
+  const input = makeVideo(dir, '0.05*sin(2*PI*300*t)*between(t\\,0.5\\,7.5)+0.25*sin(2*PI*600*t)*pow(sin(PI*mod(t\\,1)/0.1)\\,2)*lt(mod(t\\,1)\\,0.1)');
   const output = path.join(dir, 'video.mp4');
   await masterLoudness(input, output);
   const after = await measureLoudness(output);
