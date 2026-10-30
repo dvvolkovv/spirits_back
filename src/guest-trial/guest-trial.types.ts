@@ -44,6 +44,14 @@ export const GUEST_CARRY_TTL_SECONDS = 24 * 60 * 60;
 export const GUEST_CLAIMED_ROW_TTL_DAYS = 90;
 /** Сколько ждём Redis: ioredis при недоступности висит десятки секунд, а не падает. */
 export const GUEST_REDIS_TIMEOUT_MS = 2_000;
+/**
+ * То же ожидание Redis, но для чтения приписки о пробе (guest-carry.ts) в
+ * streamUniversalAgent — горячем пути КАЖДОГО хода чата, а не только
+ * гостевых. Меньше GUEST_REDIS_TIMEOUT_MS сознательно: при лежащем Redis
+ * ioredis висит 23–63 с, и даже разница в полсекунды здесь умножается на
+ * весь трафик чата (все аккаунты), а не только на гостевые ходы.
+ */
+export const GUEST_CARRY_READ_TIMEOUT_MS = 1_500;
 /** Срок одного гостевого хода: инструментов нет, ответ приходит за десятки секунд. */
 export const GUEST_TURN_TIMEOUT_MS = 120_000;
 /** Сколько последних сообщений истории (пар человек/ассистент) класть в промпт гостя —

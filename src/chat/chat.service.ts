@@ -39,7 +39,8 @@ import { BusinessProfileService } from '../business-profile/business-profile.ser
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
 import { UserLlmProviderService } from '../common/services/user-llm-provider.service';
 import { RedisService } from '../common/services/redis.service';
-import { takeGuestCarry } from '../guest-trial/guest-carry';
+import { dropGuestCarry, peekGuestCarry } from '../guest-trial/guest-carry';
+import { GUEST_CARRY_READ_TIMEOUT_MS } from '../guest-trial/guest-trial.types';
 import { withTimeout } from '../common/with-timeout';
 import { readDoneProvider, relayProviderFields, resolveAnswerProvider } from './answer-provider';
 import axios from 'axios';
@@ -468,7 +469,11 @@ export class ChatService {
     // Последним и @Optional по той же причине, что chatFiles.
     @Optional() private readonly llmProvider?: UserLlmProviderService,
     // Приписка пробы без входа (src/guest-trial/guest-carry.ts). Последним и
-    // @Optional по той же причине, что chatFiles: спеки собирают ChatService позиционно.
+    // @Optional по той же причине, что chatFiles: спеки собирают ChatService
+    // позиционно. Тип — именно класс RedisService, а не интерфейс CarryStore:
+    // интерфейс стирается в Object при компиляции в JS, Nest не найдёт
+    // провайдер по типу Object, и @Optional молча подставит undefined.
+    // Сторож — chat.service.guest-carry.spec.ts (design:paramtypes).
     @Optional() private readonly redis?: RedisService,
   ) {}
 
@@ -1631,10 +1636,32 @@ ${LanguageService.buildDirective(userLanguage)}`;
     }
     // Проба без входа (src/guest-trial): с этим ассистентом человек говорил до
     // входа, а сессия релея возобновится без той переписки. Приписка разовая и
-    // в историю не пишется. Redis при недоступности висит — ждём не дольше 1,5 с.
-    if (this.redis && !fresh) {
-      const carry = await withTimeout(takeGuestCarry(this.redis, userId, assistantId), 1500).catch(() => null);
-      if (carry) contextPrefix += carry + '\n\n';
+    // в историю не пишется. Пинги мониторинга (probe) — не настоящий разговор,
+    // не трогаем.
+    //
+    // Читаем (peek), НЕ списываем здесь: списание (dropGuestCarry) — только из
+    // успешной ветки persistResponse, ниже по ходу. Если списать прямо тут,
+    // то и наш же тайм-аут ожидания (зомби-промис дозвонится до Redis позже и
+    // решит, что приписку пора стереть), и сбой похода к релею (сеть, 5xx,
+    // протухшая сессия) — оба варианта потеряли бы пересказ навсегда, хотя
+    // человек его так и не увидел. А это ровно первый разговор после
+    // регистрации. Redis при недоступности висит — ждём не дольше
+    // GUEST_CARRY_READ_TIMEOUT_MS, это горячий путь КАЖДОГО хода, не только
+    // гостевых.
+    let guestCarryConsumed = false;
+    if (this.redis && !fresh && !probe) {
+      const carry = await withTimeout(
+        peekGuestCarry(this.redis, userId, assistantId),
+        GUEST_CARRY_READ_TIMEOUT_MS,
+      ).catch((e: any) => {
+        this.logger.warn(`guest-carry: чтение не удалось (${userId}_${assistantId}): ${e?.message}`);
+        return null;
+      });
+      if (carry) {
+        contextPrefix += carry + '\n\n';
+        guestCarryConsumed = true;
+        this.logger.log(`guest-carry: приписка добавлена в контекст (${userId}_${assistantId}, ${carry.length} симв.)`);
+      }
     }
     // История уходит ОТДЕЛЬНЫМ полем, а не в тело реплики: релей вставит её
     // только когда стартует без --resume. При обычном resume Claude-сессия уже
@@ -1885,6 +1912,14 @@ ${LanguageService.buildDirective(userLanguage)}`;
               { tokens: textCost, usd: charge.usd, note: charge.note },
               { balance: () => this.getTokenBalance(userId) },
             );
+            // Приписка о пробе (см. чтение выше) списывается ТОЛЬКО здесь — в
+            // ветке успешного хода (!turnFailed && fullText.length > 0). Фоном:
+            // ход её не ждёт, а сбой стирания не должен портить сохранённый ответ.
+            if (guestCarryConsumed) {
+              void dropGuestCarry(this.redis, userId, assistantId).catch((e: any) => {
+                this.logger.warn(`guest-carry: стереть не удалось (${userId}_${assistantId}): ${e?.message}`);
+              });
+            }
           }
           // Профиль формируется и в fresh-режиме (чистый лист скрывает контекст,
           // но не отключает обучение профиля).

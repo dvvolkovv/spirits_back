@@ -71,7 +71,7 @@ export function renderGuestCarry(msgs: GuestHistoryMessage[]): string {
   const body = kept.join('\n\n');
   return (
     `--- Разговор до входа ---\n` +
-    `До входа в аккаунт человек говорил с тобой в пробном режиме. Это начало вашего разговора — продолжай его, не здоровайся заново:\n\n` +
+    `До входа в аккаунт человек говорил с тобой в пробном режиме. Вот эта переписка — продолжай с того места, где остановились, не здоровайся заново:\n\n` +
     body
   );
 }
@@ -81,18 +81,32 @@ export async function putGuestCarry(store: CarryStore, userId: string, assistant
 }
 
 /**
- * Забрать приписку: один раз — следующий ход её уже не получит.
+ * Прочитать приписку БЕЗ списания — вызывается ДО похода к релею
+ * (streamUniversalAgent), на горячем пути каждого хода. Раньше чтение и
+ * списание были одним действием (get+del), и это теряло пересказ навсегда в
+ * двух случаях: наш собственный тайм-аут ожидания сдавался раньше, чем
+ * отвечал Redis, — зомби-промис всё равно дозванивался до del, хотя
+ * приписка в реплику не попала; либо приписку успевали прочитать, а релей
+ * ход не принимал (сеть, 5xx, протухшая сессия) — пересказ исчезал, хотя
+ * человек его так и не увидел, а это ровно первый разговор после
+ * регистрации. Поэтому списание (dropGuestCarry) отделено от чтения и
+ * вызывается только из ветки успешного хода.
  *
- * get+del не атомарны (для этого нужен был бы отдельный GETDEL или EVAL), и
- * это осознанно: два одновременных первых хода к одному ассистенту
- * теоретически могут оба успеть прочитать приписку до чьего-то del — тогда
- * оба получат один и тот же пересказ. Не страшно: релей увидит дубль
- * контекста в начале сессии, а не потеряет и не перепутает её. Атомарный
- * GETDEL ради этого не делаем.
+ * Повторное чтение одной и той же приписки — безвредный дубль, не потеря:
+ * два одновременных первых хода к одному ассистенту теоретически могут оба
+ * прочитать её до чьего-то drop — релей увидит дубль контекста в начале
+ * сессии, а не потеряет и не перепутает его.
  */
-export async function takeGuestCarry(store: CarryStore, userId: string, assistantId: string): Promise<string | null> {
-  const key = guestCarryKey(userId, assistantId);
-  const value = await store.get(key);
-  if (value) await store.del(key);
+export async function peekGuestCarry(store: CarryStore, userId: string, assistantId: string): Promise<string | null> {
+  const value = await store.get(guestCarryKey(userId, assistantId));
   return value || null;
+}
+
+/**
+ * Списать прочитанную приписку — звать только после УСПЕШНОГО хода (см.
+ * peekGuestCarry). Стирание несуществующего ключа не ошибка, как DEL в
+ * Redis, — повторный вызов (например, от второго одновременного хода) безвреден.
+ */
+export async function dropGuestCarry(store: CarryStore, userId: string, assistantId: string): Promise<void> {
+  await store.del(guestCarryKey(userId, assistantId));
 }
