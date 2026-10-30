@@ -176,4 +176,33 @@ describe('ClaudeCliService: текст по мере генерации', () => 
     expect(deltas).toEqual(['Привет']);
     expect(r.text).toBe('Привет');
   });
+
+  it('U+2060 (word joiner) вырезается из кусков — как и из итога', async () => {
+    const WJ = String.fromCharCode(0x2060); // word joiner — невидимый, в исходнике не держим буквально
+    const wjLines = [
+      { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: `При${WJ}вет` } } },
+      { type: 'result', is_error: false, result: `При${WJ}вет`, total_cost_usd: 0, duration_ms: 1 },
+    ];
+    spawnMock.mockImplementation(() => streamProc(wjLines));
+    const deltas: string[] = [];
+    const r = await new ClaudeCliService().textWithCost('x', { onTextDelta: (t) => deltas.push(t) });
+    expect(deltas).toEqual(['Привет']);
+    expect(r.text).toBe('Привет');
+  });
+
+  it('только onProgress (без onTextDelta) — stream-json и --verbose, но без --include-partial-messages', async () => {
+    spawnMock.mockImplementation(() => streamProc(LINES));
+    await new ClaudeCliService().textWithCost('привет', { onProgress: () => {} });
+    const a = lastArgs();
+    expect(a[a.indexOf('--output-format') + 1]).toBe('stream-json');
+    expect(a).toContain('--verbose');
+    expect(a).not.toContain('--include-partial-messages');
+  });
+
+  it('без onProgress и onTextDelta — обычный --output-format json', async () => {
+    spawnMock.mockImplementation(() => jsonProc(JSON.stringify({ is_error: false, result: 'ок', total_cost_usd: 0, duration_ms: 1 })));
+    await new ClaudeCliService().text('привет');
+    const a = lastArgs();
+    expect(a[a.indexOf('--output-format') + 1]).toBe('json');
+  });
 });
