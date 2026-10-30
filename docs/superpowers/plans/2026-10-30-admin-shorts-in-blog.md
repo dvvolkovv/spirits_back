@@ -4224,7 +4224,7 @@ ssh dv@85.192.61.231 'ps -eo pid,command | grep -E "^\s*[0-9]+ (bash|/bin/bash) 
 
 - [ ] **Step 5: Проверить, что на стенде именно эта сборка**
 
-Сверить хеш бандла: `curl -s -u "$TEST_BASIC_USER:$TEST_BASIC_PASS" https://test.linkeon.io/ | grep -o 'index-[A-Za-z0-9_-]*\.js'` против сборки из `main`. Логин и пароль Basic Auth лежат в `~/Downloads/spirits_back/scripts/test-server.env.local`: прочитать в переменные (`source`), не печатать и не коммитить. Затем `admin/shorts list` на стенде, админом через debug-OTP. В ответе должно быть поле `version` и не должно быть `capture`.
+Сверить хеш бандла: `curl -s -u "$TEST_BASIC_USER:$TEST_BASIC_PASS" https://test.linkeon.io/ | grep -o 'index-[A-Za-z0-9_-]*\.js'` против сборки из `main`. Логин и пароль Basic Auth лежат в `~/Downloads/spirits_back/scripts/test-server.env.local`: прочитать в переменные (`source`), не печатать и не коммитить. Затем `admin/shorts list` на стенде, админом через debug-OTP. В ответе должно быть поле `version` вида `YYYY-MM-DD HH:MM:SS[.ffffff]±HH` (его ждёт `VERSION_RE` контроллера; вид зависит от `DateStyle` сервера Postgres — на кластере ноды `ISO, MDY`, проверено 30.10) и не должно быть `capture`.
 
 ### Task 21: Живая проверка на стенде с владельцем
 
@@ -4253,6 +4253,7 @@ ssh dv@85.192.61.231 'ps -eo pid,command | grep -E "^\s*[0-9]+ (bash|/bin/bash) 
 - [ ] **Step 3: Проверка прода**
   - хеш бандла `https://my.linkeon.io/` равен сборке `main`;
   - админка прода → «Блог» → «Ролики»: список показывает ролики прода, раскрытие показывает видео;
+  - только чтением: `version` из `admin/shorts list` прода — вида `YYYY-MM-DD HH:MM:SS[.ffffff]±HH`. Другой вид (`DateStyle` прода не ISO) — все решения из админки получат 400: тогда не отдавать экран владельцу, а чинить выдачу версии (`to_char(updated_at AT TIME ZONE 'UTC', …)`);
   - ничего не одобрять за владельца.
 - [ ] **Step 4: Убрать за собой**
   - рабочее дерево ноды: `git -C ~/ci/spirits_front worktree remove ~/ci/wt/admin-shorts-front`;
