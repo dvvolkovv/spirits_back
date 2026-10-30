@@ -270,7 +270,7 @@ describe('ShortsApprovalService', () => {
         ['approved', 'ok', /^Ролик уже одобрен/],
         ['capture_queued', 'ok', /переделывается/],
         ['rendering', 'redo', /переделывается/],
-        ['failed', 'redo', /^Ролик упал — повторить или отклонить его можно из админки роликов$/],
+        ['failed', 'redo', /^Ролик упал — повторить или отклонить его можно в админке: Блог → Ролики$/],
         ['rejected', 'no', /^Ролик отклонён/],
         ['published', 'no', /^Ролик уже опубликован/],
         ['writing', 'note', /переписывается/],
@@ -382,11 +382,12 @@ describe('ShortsApprovalService', () => {
       expect((tg.sendMessage.mock.calls[0] as any[])[1]).toMatch(/уже одобрен/);
     });
 
-    it('замечание к упавшему ролику — куда его передать, без ссылки на несуществующую вкладку', async () => {
+    it('замечание к упавшему ролику — куда его передать: кнопки экрана «Ролики»', async () => {
       const { svc, tg } = setup(row({ status: 'failed', failed_from: 'writing' }));
       await svc.handleReplyEdit(reply());
       const text = String((tg.sendMessage.mock.calls[0] as any[])[1]);
-      expect(text).toContain('из админки роликов: retry (можно с from=directing|writing и замечанием) или reject');
+      expect(text).toContain('в админке: Блог → Ролики — «Повторить», «Новая сцена» или «Новый текст» (можно с замечанием), либо «Отклонить»');
+      expect(text).not.toMatch(/retry|reject|from=/);
     });
 
     it('голосовое вместо текста — просьба написать текстом', async () => {
@@ -472,8 +473,8 @@ describe('ShortsApprovalService', () => {
       expect(tg.sendMessage).toHaveBeenCalledTimes(1);
       const text = (tg.sendMessage.mock.calls[0] as any[])[1];
       expect(text).toMatch(/Ролик «Залог при аренде» не собрался: съёмка: ответ не годится/);
-      expect(text).toContain('Повторить можно из админки роликов: retry (можно с from=directing|writing и замечанием) или reject.');
-      expect(text).not.toMatch(/кнопкой «Повторить»|раздел «Ролики»/);
+      expect(text).toContain('Повторить можно в админке: Блог → Ролики — «Повторить», «Новая сцена» или «Новый текст» (можно с замечанием), либо «Отклонить».');
+      expect(text).not.toMatch(/retry|reject|from=/);
     });
 
     it('упавшая публикация — владельцу без from: с этапа её не переснять', async () => {
@@ -489,7 +490,7 @@ describe('ShortsApprovalService', () => {
       await svc.notifyFailures();
       const text = (tg.sendMessage.mock.calls[0] as any[])[1];
       expect(text).toMatch(/Ролик «Залог при аренде» не вышел на площадки: публикация: telegram: chat not found/);
-      expect(text).toContain('В админке роликов: retry — повторить публикацию, reject — отклонить.');
+      expect(text).toContain('В админке: Блог → Ролики — «Повторить» или «Отклонить».');
       expect(text).not.toContain('from=');
     });
 

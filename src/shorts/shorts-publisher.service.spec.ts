@@ -310,9 +310,11 @@ describe('ShortsPublisherService.publish', () => {
     expect(db.v.attempts).toBe(1);
     expect(db.v).toMatchObject({ status: 'failed', failed_from: 'publishing', failure_notified: false });
     expect(db.v.last_error).toMatch(/^публикация: telegram: пост мог выйти/);
-    // Что делать — тем же текстом, что уйдёт владельцу: действия админки роликов, а не несуществующая кнопка.
-    expect(db.v.last_error).toContain('если пост вышел — mark_published со ссылкой на пост, иначе retry');
-    expect(db.v.last_error).not.toContain('«Повторить»');
+    // Что делать — тем же текстом, что уйдёт владельцу: кнопки экрана «Ролики» во вкладке «Блог».
+    expect(db.v.last_error).toContain('если пост вышел — отметьте «Пост вышел» со ссылкой на пост, иначе «Повторить»');
+    // Старая проверка «не toContain «Повторить»» (ещё не было кнопки) стала противоречить новому тексту —
+    // заменена на проверку отсутствия сырых имён действий API.
+    expect(db.v.last_error).not.toMatch(/mark_published|retry/);
 
     await svc.publish(ID);
     expect(tg.sendVideo).toHaveBeenCalledTimes(1);
