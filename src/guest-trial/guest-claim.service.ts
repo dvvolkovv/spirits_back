@@ -137,7 +137,8 @@ export class GuestClaimService {
     }
     this.events?.track('guest_trial_claimed', {
       userId,
-      props: { assistant_id: String(assistantId), answers, existing: hadHistory, trial: trialId, source },
+      source,
+      props: { assistant_id: String(assistantId), answers, existing: hadHistory, trial: trialId },
     });
     const neo4j = this.neo4j;
     if (!neo4j) return;

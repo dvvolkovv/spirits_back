@@ -106,7 +106,8 @@ maybe('перенос пробы в аккаунт против живого Pos
     expect(neo4j.consolidateFromChat).toHaveBeenCalledWith('u-new', '12', 'Вопрос 2', 'Ответ 2', 'Ответ 1');
     expect(events.track).toHaveBeenCalledWith('guest_trial_claimed', {
       userId: 'u-new',
-      props: { assistant_id: '12', answers: 2, existing: false, trial: row.id, source: null },
+      source: null,
+      props: { assistant_id: '12', answers: 2, existing: false, trial: row.id },
     });
   });
 

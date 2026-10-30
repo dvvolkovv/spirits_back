@@ -30,7 +30,7 @@ export const DEFAULT_GUEST_LIMITS: Readonly<GuestLimits> = {
   concurrentTurns: 4,
 };
 
-/** Сколько живёт неперенесённая проба после последнего сообщения (и приписка о ней). */
+/** Сколько живёт неперенесённая проба после последнего сообщения. */
 export const GUEST_TRIAL_TTL_DAYS = 7;
 /**
  * Срок жизни приписки о пробе (Redis, guest-carry.ts) — сутки, короче
