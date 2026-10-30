@@ -107,6 +107,33 @@ describe('streamUniversalAgent: приписка о пробе', () => {
 });
 
 /**
+ * Ревью A9 (M4): приписка — ПЕР-ХОДОВЫЙ блок контекста, не часть истории.
+ * Порядок важен (комментарий «Требование языка — ПОСЛЕ всех дописанных
+ * блоков» в chat.service.ts): приписка должна стоять раньше блока формы
+ * ответа и языковой директивы, иначе модель читает образец языка/стиля с
+ * устаревшего текста разговора до входа. А персистентность (pg.query) не
+ * должна видеть эту приписку вообще: persistResponse сохраняет message/aiText,
+ * а не contextPrefix/prompt, и это не должно случайно разъехаться.
+ */
+describe('streamUniversalAgent: приписка — порядок в промпте и изоляция от истории', () => {
+  it('приписка стоит ДО блока «форма ответа», и ни один pg.query не получил её текст', async () => {
+    const h = harness();
+    const carrySecret = 'Секретный старый вопрос про цены';
+    await h.redis.set(guestCarryKey('u-test', '12'), `--- Разговор до входа ---\nЧеловек: ${carrySecret}`, 3600);
+    const message = await h.run('Продолжим?');
+    const carryAt = message.indexOf('--- Разговор до входа ---');
+    const formAt = message.indexOf('--- ФОРМА ОТВЕТА ---');
+    expect(carryAt).toBeGreaterThanOrEqual(0);
+    expect(formAt).toBeGreaterThan(carryAt);
+    const pgQuery = (h.svc as any).pg.query as jest.Mock;
+    expect(pgQuery.mock.calls.length).toBeGreaterThan(0);
+    for (const call of pgQuery.mock.calls) {
+      expect(JSON.stringify(call)).not.toContain(carrySecret);
+    }
+  });
+});
+
+/**
  * Ревью A9 (I1): приписку нельзя списывать в момент ЧТЕНИЯ. Если списать
  * сразу (как делал старый takeGuestCarry = get+del), два сценария теряют
  * пересказ навсегда:
