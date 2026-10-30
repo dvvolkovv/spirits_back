@@ -65,4 +65,8 @@ describe('parseLimitsPatch — патч лимитов из админ-ручк�
     expect(r.patch).toEqual({ answersPerDay: 500 });
     expect(r.ignored.sort()).toEqual(['answersPerHour=0', 'fooBar: неизвестный ключ']);
   });
+
+  it('прототипное свойство Object не маскируется под известный ключ', () => {
+    expect(parseLimitsPatch({ toString: 5 })).toEqual({ patch: {}, ignored: ['toString: неизвестный ключ'] });
+  });
 });

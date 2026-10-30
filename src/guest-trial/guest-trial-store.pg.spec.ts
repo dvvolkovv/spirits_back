@@ -56,20 +56,40 @@ maybe('настройки пробы против живого Postgres', () => 
     expect(row.rows[0].value).toEqual({ answersPerDay: 500, answersPerHour: 50 });
   });
 
-  it('повторный старт не ждёт открытую запись в guest_trial_sessions', async () => {
+  it('слияние со строкой-не-объектом в limits не портит новый патч', async () => {
+    // jsonb "a" || "b" между скаляром и объектом даёт МАССИВ [a, b], а не
+    // объект (операнд не-массив Postgres сначала оборачивает в одноэлементный
+    // массив) — без защиты патч молча улетел бы в такой массив.
+    await pool.query(`INSERT INTO guest_trial_settings (key, value) VALUES ('limits', '"мусор"'::jsonb)`);
+    await store.setLimits({ answersPerDay: 500 });
+    const row = await pool.query(`SELECT value FROM guest_trial_settings WHERE key = 'limits'`);
+    expect(row.rows[0].value).toEqual({ answersPerDay: 500 });
+  });
+
+  it('параллельные правки лимитов сливаются обе, а не затирают друг друга', async () => {
+    await Promise.all([store.setLimits({ answersPerDay: 500 }), store.setLimits({ answersPerHour: 50 })]);
+    const row = await pool.query(`SELECT value FROM guest_trial_settings WHERE key = 'limits'`);
+    expect(row.rows[0].value).toEqual({ answersPerDay: 500, answersPerHour: 50 });
+  });
+
+  it('повторный старт не ждёт открытую запись в guest_trial_sessions и guest_trial_messages', async () => {
     // Голый CREATE INDEX IF NOT EXISTS берёт ShareLock на таблицу и держит его
     // до конца транзакции файла — тогда каждый старт API ждал бы любую
-    // открытую вставку пробы, а все вставки после — ждали бы его. Индексов на
-    // guest_trial_sessions уже нет (см. 001_guest_trial.sql), но это свойство
-    // файла стоит проверять явно, а не полагаться, что так вышло случайно.
+    // открытую вставку пробы, а все вставки после — ждали бы его. Открытая
+    // транзакция держит ОБЕ таблицы: guest_trial_sessions (индексов на ней
+    // уже нет) и guest_trial_messages (единственный оставшийся индекс).
     const sql = fs.readFileSync(path.join(__dirname, 'migrations', '001_guest_trial.sql'), 'utf8');
     const writer = await pool.connect();
     let timer: NodeJS.Timeout | undefined;
     try {
       await writer.query('BEGIN');
-      await writer.query(
-        `INSERT INTO guest_trial_sessions (token_hash, assistant_id, lang) VALUES ($1, 1, 'ru')`,
+      const session = await writer.query(
+        `INSERT INTO guest_trial_sessions (token_hash, assistant_id, lang) VALUES ($1, 1, 'ru') RETURNING id`,
         [crypto.randomUUID()],
+      );
+      await writer.query(
+        `INSERT INTO guest_trial_messages (session_id, sender_type, content) VALUES ($1, 'human', 'привет')`,
+        [session.rows[0].id],
       );
       const second = pool.query(sql).then(() => 'done');
       const outcome = await Promise.race([
