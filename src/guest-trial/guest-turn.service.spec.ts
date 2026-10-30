@@ -105,6 +105,9 @@ describe('ход гостя: режимы', () => {
     const h = harness({ mode: 'preview' });
     expect((await h.turn()).evs[1]).toEqual({ type: 'wall', reason: 'closed' });
     expect((await h.turn({ preview: true })).evs.find((e) => e.type === 'end')).toEqual({ type: 'end', content: 'Здравствуйте' });
+    expect(h.events.track).toHaveBeenCalledWith('guest_trial_answer', expect.objectContaining({
+      props: expect.objectContaining({ preview: true }),
+    }));
   });
 });
 
@@ -118,8 +121,21 @@ describe('ход гостя: поток', () => {
     expect(evs.slice(1).map((e) => e.type)).toEqual(['begin', 'item', 'item', 'end']);
     expect(h.sessions.recordExchange).toHaveBeenCalledWith('s1', 'Привет', 'Здравствуйте', expect.any(Date), 0.05);
     expect(h.events.track).toHaveBeenCalledWith('guest_trial_answer', expect.objectContaining({
-      props: expect.objectContaining({ n: 1, trial: 's1', assistant_id: '12', lang: 'ru', cost_usd: 0.05 }),
+      props: expect.objectContaining({ n: 1, trial: 's1', assistant_id: '12', lang: 'ru', cost_usd: 0.05, preview: false }),
     }));
+  });
+
+  it('куски пришли, итог похож на отказ CLI — всё равно ответ (M3)', async () => {
+    const h = harness({
+      reply: async (_p: string, o: any) => {
+        o.onTextDelta?.('Напи');
+        o.onTextDelta?.('шем так:');
+        return { text: "You've hit your limit · resets 10am (UTC)", costUsd: 0.01 };
+      },
+    });
+    const { evs } = await h.turn();
+    expect(evs.find((e) => e.type === 'end')).toEqual({ type: 'end', content: "You've hit your limit · resets 10am (UTC)" });
+    expect(h.sessions.recordExchange).toHaveBeenCalledWith('s1', 'Привет', "You've hit your limit · resets 10am (UTC)", expect.any(Date), 0.01);
   });
 
   it('модель зовётся без инструментов, без запасного Qwen, с персоной и пробным режимом', async () => {
@@ -176,10 +192,33 @@ describe('ход гостя: отказы', () => {
     const failing = harness({ reply: async () => { throw new Error('claude CLI exited with code 1'); } });
     expect((await failing.turn()).evs.slice(-1)).toEqual([{ type: 'error', code: 'model' }]);
     expect(failing.sessions.recordExchange).not.toHaveBeenCalled();
+    expect(failing.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'model', assistant_id: '12' } });
 
     const refusal = harness({ reply: async () => ({ text: "You've hit your weekly limit · resets 10am (UTC)", costUsd: 0 }) });
     expect((await refusal.turn()).evs.slice(-1)).toEqual([{ type: 'error', code: 'model' }]);
     expect(refusal.sessions.recordExchange).not.toHaveBeenCalled();
+  });
+
+  it('проба перенесена посреди хода (recordExchange → null) — error model, без события end (I1)', async () => {
+    const h = harness();
+    const token = (await h.turn()).evs[0].token;
+    h.sessions.recordExchange.mockResolvedValueOnce(null);
+    const { evs } = await h.turn({ token });
+    expect(evs.slice(-1)).toEqual([{ type: 'error', code: 'model' }]);
+    expect(evs.find((e) => e.type === 'end')).toBeUndefined();
+    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'claimed', assistant_id: '12' } });
+  });
+
+  it('сбой после начала ответа (recordExchange бросает) — error, счётчики парные, следующий ход не 409 (I3)', async () => {
+    const h = harness();
+    h.sessions.recordExchange.mockImplementationOnce(() => { throw new Error('db down'); });
+    const first = await h.turn();
+    expect(first.evs.slice(-1)).toEqual([{ type: 'error', code: 'model' }]);
+    expect(first.evs.find((e) => e.type === 'end')).toBeUndefined();
+    expect(h.chat.beginStream).toHaveBeenCalledTimes(1);
+    expect(h.chat.endStream).toHaveBeenCalledTimes(1);
+    const token = first.evs[0].token;
+    expect((await h.turn({ token })).res.statusCode).not.toBe(409);
   });
 
   it('окно запасного пути на Qwen открыто — сразу error model, модель не зовётся', async () => {
