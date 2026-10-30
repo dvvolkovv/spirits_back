@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ttsKey } from '../tts';
+import { deliveryProblems } from './fixture-checks';
 import { renderRun } from './run-render';
 
 /**
@@ -66,5 +67,6 @@ test('рендер фикстуры: 1080×1920, 30–60 с, звук по вс�
 
   const r = await renderRun(dir, { skipTts: true });
   assert.deepEqual(r.problems, []);
+  assert.deepEqual(deliveryProblems(r.video), []);
   assert.ok(fs.statSync(r.cover).size > 10_000, 'обложка подозрительно мала');
 });

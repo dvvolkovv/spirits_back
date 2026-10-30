@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ttsKey } from '../tts';
+import { deliveryProblems } from './fixture-checks';
 import { renderRun } from './run-render';
 
 /**
@@ -93,6 +94,7 @@ test('рендер фикстуры со сценками: 1080×1920, 25–45 �
 
   const r = await renderRun(dir, { skipTts: true });
   assert.deepEqual(r.problems, []);
+  assert.deepEqual(deliveryProblems(r.video), []);
   assert.ok(r.durationSec >= 25 && r.durationSec <= 45, `длина ${r.durationSec}`);
   assert.ok(fs.statSync(r.cover).size > 10_000, 'обложка подозрительно мала');
   // Обложка — сценка 1 с надписью-зацепкой, без субтитров: в центре места плашки субтитра
