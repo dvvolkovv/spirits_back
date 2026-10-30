@@ -38,6 +38,9 @@ export const GUEST_CLAIMED_ROW_TTL_DAYS = 90;
 export const GUEST_REDIS_TIMEOUT_MS = 2_000;
 /** Срок одного гостевого хода: инструментов нет, ответ приходит за десятки секунд. */
 export const GUEST_TURN_TIMEOUT_MS = 120_000;
+/** Сколько последних сообщений истории (пар человек/ассистент) класть в промпт гостя —
+ *  две пары: больше не нужно для короткой пробы, и промпт не растёт неограниченно. */
+export const GUEST_PROMPT_HISTORY_MESSAGES = 4;
 /** Маша идёт мимо релея (chat.service: agent.id === 3) и читает историю из базы сама. */
 export const MASHA_AGENT_ID = 3;
 

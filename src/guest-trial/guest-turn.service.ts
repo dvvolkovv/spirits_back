@@ -17,7 +17,7 @@ import { GuestSessionRow, GuestSessionsService } from './guest-sessions.service'
 import { GuestQuotaReply, answerRules, takeGuestQuota, trialRules } from './guest-limits';
 import { buildGuestPrompt, buildGuestSystemPrompt } from './guest-prompt';
 import { hashGuestToken, isGuestTokenShape, newGuestToken } from './guest-token';
-import { GUEST_REDIS_TIMEOUT_MS, GUEST_TURN_TIMEOUT_MS } from './guest-trial.types';
+import { GUEST_PROMPT_HISTORY_MESSAGES, GUEST_REDIS_TIMEOUT_MS, GUEST_TURN_TIMEOUT_MS } from './guest-trial.types';
 import { withTimeout } from '../common/with-timeout';
 
 export interface GuestTurnInput {
@@ -205,7 +205,7 @@ export class GuestTurnService {
     const ping = setInterval(() => this.write(res, { type: 'ping' }), PING_MS);
     try {
       try {
-        const history = session.answers > 0 ? await this.sessions.messages(session.id) : [];
+        const history = (session.answers > 0 ? await this.sessions.messages(session.id) : []).slice(-GUEST_PROMPT_HISTORY_MESSAGES);
         const system = buildGuestSystemPrompt({
           name: agent.name,
           description: agent.description,
