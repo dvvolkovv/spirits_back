@@ -47,23 +47,40 @@ export class GuestSessionsService {
     return r.rows;
   }
 
-  /** Пара «вопрос — ответ» и счёт пробы одним запросом. Отдаёт новое число ответов. */
-  async recordExchange(sessionId: string, human: string, ai: string, humanAt: Date, costUsd: number): Promise<number> {
+  /**
+   * Пара «вопрос — ответ» и счёт пробы одним запросом. Отдаёт новое число
+   * ответов — или null, если проба уже перенесена в аккаунт (claimed_at не
+   * пуст): перенос мог случиться посреди хода (другая вкладка/устройство),
+   * и дописывать пару в историю, которая уже не принадлежит пробе, нельзя.
+   *
+   * ins_human → ins_ai: вторая вставка читает ИЗ первой (FROM ins_human), а
+   * не только из upd. Это настоящая зависимость данных, а не просто порядок
+   * записи в тексте запроса — Postgres гарантирует её выполнение после
+   * ins_human. Без этого порядок двух INSERT из одного VALUES/SELECT не
+   * гарантирован, а messages() отдаёт пары по ORDER BY id: human обязан
+   * получить id раньше ai, иначе пара перевернётся в истории промпта.
+   */
+  async recordExchange(sessionId: string, human: string, ai: string, humanAt: Date, costUsd: number): Promise<number | null> {
     const r = await this.pg.query(
-      `WITH ins AS (
-         -- Результат ins не читается — и не должен: модифицирующий CTE
-         -- выполняется как часть одного оператора независимо от того,
-         -- ссылается ли на него внешний запрос. Не удалять как «неиспользуемый».
+      `WITH upd AS (
+         UPDATE guest_trial_sessions
+            SET answers = answers + 1, cost_usd = cost_usd + $5, last_message_at = now()
+          WHERE id = $1::uuid AND claimed_at IS NULL
+         RETURNING answers
+       ),
+       ins_human AS (
          INSERT INTO guest_trial_messages (session_id, sender_type, content, created_at)
-         VALUES ($1::uuid, 'human', $2, $4), ($1::uuid, 'ai', $3, now())
+         SELECT $1::uuid, 'human', $2, $4::timestamptz FROM upd
+         RETURNING id
+       ),
+       ins_ai AS (
+         INSERT INTO guest_trial_messages (session_id, sender_type, content, created_at)
+         SELECT $1::uuid, 'ai', $3, now() FROM ins_human
        )
-       UPDATE guest_trial_sessions
-          SET answers = answers + 1, cost_usd = cost_usd + $5, last_message_at = now()
-        WHERE id = $1::uuid
-       RETURNING answers`,
+       SELECT answers FROM upd`,
       [sessionId, human, ai, humanAt, costUsd],
     );
-    return Number(r.rows[0]?.answers ?? 0);
+    return r.rows[0] ? Number(r.rows[0].answers) : null;
   }
 
   /**
