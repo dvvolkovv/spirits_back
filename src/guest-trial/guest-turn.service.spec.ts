@@ -288,11 +288,16 @@ describe('ход гостя: отказы', () => {
     await new Promise((r) => setTimeout(r, 20));
     const beforeBusy = h.redis.peek('guest-lim:answers:h');
     const second = await h.turn();
-    expect(second.evs.slice(-1)).toEqual([{ type: 'error', code: 'busy' }]);
-    expect(h.redis.peek('guest-lim:answers:h')).toBe(beforeBusy);
-    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'busy', assistant_id: '12' } });
+    const afterBusy = h.redis.peek('guest-lim:answers:h');
+    // release()/await first — ДО assert-ов: первый ход до сих пор висит внутри
+    // runTurn (мок CLI не отпущен), и с ним висит его setInterval пинга. Если
+    // здесь упадёт expect раньше освобождения — висящий ход и его таймер
+    // переживут тест и не дадут jest-процессу завершиться.
     release();
     await first;
+    expect(second.evs.slice(-1)).toEqual([{ type: 'error', code: 'busy' }]);
+    expect(afterBusy).toBe(beforeBusy);
+    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'busy', assistant_id: '12' } });
     expect(h.chat.beginStream).toHaveBeenCalledTimes(1);
     expect(h.chat.endStream).toHaveBeenCalledTimes(1);
     expect((await h.turn()).evs.find((e) => e.type === 'end')).toBeTruthy();
@@ -321,5 +326,20 @@ describe('разбор тела хода', () => {
     expect(i).toMatchObject({ lang: 'de', source: 'utm:vk/cpc', sid: 's_ab.c-1', preview: true, token: null });
     const j = parseGuestTurnInput({ source: '<script>', sid: 'a b', preview: 'true' });
     expect(j).toMatchObject({ source: null, sid: null, preview: false });
+  });
+
+  it('управляющие символы вырезаны из message/source/campaign/tz, кроме \\n и \\t (M5)', () => {
+    const i = parseGuestTurnInput({
+      assistantId: '12',
+      message: 'Привет\x00\x01мир\n\tок',
+      lang: 'ru',
+      source: 'utm:vk\x07/cpc',
+      campaign: 'ab\x1fcd',
+      tz: 'Europe\x7f/Moscow',
+    });
+    expect(i.message).toBe('Приветмир\n\tок');
+    expect(i.source).toBe('utm:vk/cpc');
+    expect(i.campaign).toBe('abcd');
+    expect(i.tz).toBe('Europe/Moscow');
   });
 });
