@@ -590,9 +590,10 @@ import { RELEASED_SQL } from './short-review';
 git add src/shorts/shorts-approval.service.ts src/shorts/shorts.controller.ts
 git commit -m "refactor(shorts): кнопки лички — на общем модуле решений; RELEASED_SQL — в short-review"
 NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-approval.service.spec.ts src/shorts/shorts.controller.spec.ts src/shorts/short-review.spec.ts src/shorts/short-slot-claim.spec.ts 2>&1 | tail -15"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "out=\$(mktemp); if npx tsc -p tsconfig.build.json --noEmit >\$out 2>&1; then echo TSC_OK; else echo TSC_FAIL; tail -20 \$out; fi"
 ```
 
-Expected: PASS всех четырёх сюит. Если красные «кнопки» или «ответы реплаем» — рефакторинг поменял поведение: чинить код, а не тест.
+Expected: PASS всех четырёх сюит и `TSC_OK`. У ts-jest включён `isolatedModules`, и типы он не проверяет — поэтому `tsc` отдельно, после каждой правки бэка. Если красные «кнопки» или «ответы реплаем» — рефакторинг поменял поведение: чинить код, а не тест.
 
 ---
 
@@ -729,9 +730,10 @@ function withVersion(url: string, version: string | null): string {
 git add src/shorts/shorts.controller.ts
 git commit -m "feat(shorts): admin list лёгкий и с версией, get — версия и метка версии в ссылках на файлы"
 NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.controller.spec.ts 2>&1 | tail -20"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "out=\$(mktemp); if npx tsc -p tsconfig.build.json --noEmit >\$out 2>&1; then echo TSC_OK; else echo TSC_FAIL; tail -20 \$out; fi"
 ```
 
-Expected: PASS всей сюиты, включая прежние `list` и `get`.
+Expected: PASS всей сюиты, включая прежние `list` и `get`; `TSC_OK`.
 
 ---
 
@@ -831,6 +833,24 @@ describe('POST admin/shorts — решение по готовому ролик�
     );
   });
 
+  it('версия похожа на дату, но невозможна (месяц 13) — 400, а не 500 от Postgres', async () => {
+    (approveShortIntoSlot as jest.Mock).mockRejectedValue(
+      Object.assign(new Error('date/time field value out of range'), { code: '22008' }),
+    );
+    const { ctl } = setup(() => ({ rows: [review()] }));
+    await expect(ctl.action({ action: 'approve', id: ID, version: '2026-13-45 12:34:56+00' }, res()))
+      .rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('approve — ролик уже вышел (состояние, до которого сейчас не дойти) — свой текст, без «этот — ждёт решения»', async () => {
+    (approveShortIntoSlot as jest.Mock).mockResolvedValue(null);
+    const { ctl } = setup((sql) =>
+      sql.includes('AS released') ? { rows: [{ status: 'pending_review', released: true }] } : { rows: [review()] });
+    await expect(ctl.action({ action: 'approve', id: ID, version: VERSION }, res())).rejects.toThrow(
+      'Ролик уже вышел на площадке — решение по нему не принять',
+    );
+  });
+
   it('approve — нет свободного слота — 409 с причиной', async () => {
     (approveShortIntoSlot as jest.Mock).mockRejectedValue(new NoFreeSlotError('все 60 ближайших слотов расписания заняты'));
     const { ctl } = setup(() => ({ rows: [review()] }));
@@ -919,6 +939,8 @@ const VERSION_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d{1,6})?[+-]\d{2}(:\
 const NEED_VERSION = 'нужна версия ролика (поле version из list или get)';
 const STALE_SHORT = 'Ролик изменился, пока был открыт: на экране устаревшая версия';
 const RELEASED_TEXT = 'Ролик уже вышел на площадке — переснять или отклонить нельзя';
+/** Коды Postgres для невозможной даты (месяц 13, 30 февраля, смещение +99): форма версии верна, значение — нет. */
+const BAD_TIMESTAMP_CODES = ['22007', '22008', '22009'];
 
 /** Статус ролика словами — для отказов админки, без внутренних имён. */
 const STATUS_WORDS: Record<ShortStatus, string> = {
@@ -959,17 +981,17 @@ type ReviewKind = keyof typeof ALLOWED_WORDS;
 
 ```ts
       case 'approve':
-        return res.status(200).json(await this.approve(String(data.id ?? ''), data.version));
+        return res.status(200).json(await this.versioned(() => this.approve(String(data.id ?? ''), data.version)));
       case 'redo':
-        return res.status(200).json(await this.leave(String(data.id ?? ''), 'directing', data.version));
+        return res.status(200).json(await this.versioned(() => this.leave(String(data.id ?? ''), 'directing', data.version)));
       case 'note':
-        return res.status(200).json(await this.note(String(data.id ?? ''), data.text, data.version));
+        return res.status(200).json(await this.versioned(() => this.note(String(data.id ?? ''), data.text, data.version)));
 ```
 
 и строку `return res.status(200).json(await this.reject(String(data.id ?? '')));` заменить на
 
 ```ts
-        return res.status(200).json(await this.reject(String(data.id ?? ''), data.version));
+        return res.status(200).json(await this.versioned(() => this.reject(String(data.id ?? ''), data.version)));
 ```
 
 5. Метод `reject` вместе с его комментарием заменить на:
@@ -987,13 +1009,30 @@ type ReviewKind = keyof typeof ALLOWED_WORDS;
     return raw;
   }
 
+  /**
+   * Регулярка версии проверяет только форму: «2026-13-45 12:34:56+00» она
+   * пропустит, а Postgres ответит 22008. Это ошибка запроса (400), а не сервера.
+   */
+  private async versioned<T>(work: () => Promise<T>): Promise<T> {
+    try {
+      return await work();
+    } catch (e: any) {
+      if (BAD_TIMESTAMP_CODES.includes(e?.code)) throw new BadRequestException('version — метка версии из list или get');
+      throw e;
+    }
+  }
+
   /** Отказ общего модуля решений — 409 со словами для человека (404 — строки нет). */
   private refused(kind: ReviewKind, out: { reason: ReviewRefusal; status: ShortStatus | null }): never {
     if (out.reason === 'not_found') throw new NotFoundException('ролик не найден');
     if (out.reason === 'stale') {
       throw new ConflictException({ statusCode: 409, error: 'version_conflict', message: STALE_SHORT });
     }
-    if (out.reason === 'released' && kind === 'leave') throw new ConflictException(RELEASED_TEXT);
+    if (out.reason === 'released') {
+      // Одобрение и замечание «вышел» в записи не проверяют — до такого ролика сейчас не дойти,
+      // но и «этот — ждёт решения» в отказе было бы противоречием.
+      throw new ConflictException(kind === 'leave' ? RELEASED_TEXT : 'Ролик уже вышел на площадке — решение по нему не принять');
+    }
     const now = out.status ? STATUS_WORDS[out.status] : 'в неизвестном статусе';
     throw new ConflictException(`${ALLOWED_WORDS[kind]}; этот — ${now}. Обновите список.`);
   }
@@ -1064,12 +1103,14 @@ type ReviewKind = keyof typeof ALLOWED_WORDS;
       params,
     );
     if (r.rows.length) return rowToShort(r.rows[0]);
-    // Отличаем «уже вышел», «версия разошлась» и «уже не failed» чтением после неудачной записи.
-    const after = await this.pg.query(`SELECT status, ${RELEASED_SQL} AS released FROM short_video WHERE id = $1`, [id]);
-    if (after.rows[0]?.released) {
+    // Почему не записалось — тем же чтением, что у решений по готовому ролику.
+    const why = await explainRefusal(this.pg, id, ['failed']);
+    if (why.reason === 'released') {
       throw new ConflictException('ролик уже вышел на площадке — отклонить нельзя; оставшиеся площадки повторит «Повторить»');
     }
-    if (version && after.rows[0]?.status === 'failed') {
+    if (why.reason === 'not_found') throw new NotFoundException('ролик не найден');
+    // «stale» без версии — гонка (ролик ушёл из failed и вернулся), а не устаревшая карточка.
+    if (why.reason === 'stale' && version) {
       throw new ConflictException({ statusCode: 409, error: 'version_conflict', message: STALE_SHORT });
     }
     throw new ConflictException('ролик успел уйти из failed — обновите список');
@@ -1082,9 +1123,10 @@ type ReviewKind = keyof typeof ALLOWED_WORDS;
 git add src/shorts/shorts.controller.ts
 git commit -m "feat(shorts): решения по ролику из админки — approve, redo, note, reject ждущего решения; версия, отказы словами"
 NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.controller.spec.ts src/shorts/short-review.spec.ts 2>&1 | tail -20"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "out=\$(mktemp); if npx tsc -p tsconfig.build.json --noEmit >\$out 2>&1; then echo TSC_OK; else echo TSC_FAIL; tail -20 \$out; fi"
 ```
 
-Expected: PASS обеих сюит, включая прежние тесты `reject упавшего`, `retry`, `mark_published` и `publish_now`.
+Expected: PASS обеих сюит, включая прежние тесты `reject упавшего`, `retry`, `mark_published` и `publish_now`; `TSC_OK`.
 
 ---
 
@@ -4191,7 +4233,7 @@ ssh dv@85.192.61.231 'ps -eo pid,command | grep -E "^\s*[0-9]+ (bash|/bin/bash) 
 - [ ] **Step 1: Сценарий спеки, вместе с владельцем**
 
 1. Админка стенда → «Блог» → «Ролики». Заказать ролик и нажать «Запустить сейчас» у его идеи.
-2. Дождаться «Ждут решения» (около 9 минут), раскрыть ролик, посмотреть видео и подпись.
+2. Дождаться «Ждут решения» (около 9 минут), раскрыть ролик, посмотреть видео и подпись. Предупредить владельца: в первую минуту-две после появления ролика отправка в личку меняет его версию, и первое решение может получить 409 при том же видео — это ожидаемо (спека, «list и get»): «Загрузить заново», и решение проходит. Чтобы шаг 4 проверял именно новую версию видео, раскрывать карточку после того, как ролик пришёл в личку.
 3. Во второй вкладке админки отправить «Замечание»; первую вкладку не обновлять. Дождаться новой версии — она приходит и в админку, и в личку @LinkeonTestBot.
 4. «Одобрить» в первой, устаревшей вкладке → 409 и жёлтая плашка. «Загрузить заново» → в карточке новое видео, не из кэша: сверить, что это вторая версия.
 5. «Одобрить», затем «Опубликовать сейчас» → пост в @linkeontest.
