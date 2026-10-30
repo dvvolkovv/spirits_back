@@ -1973,11 +1973,12 @@ describe('кнопки по статусу', () => {
     expect(actionsFor(detail({ status: 'failed', failedFrom: null }))).toEqual(['reject']);
   });
 
-  it('упала публикация — «Повторить» и «Пост вышел» только у одобрявшегося; вышел — без «Отклонить»', () => {
+  it('упала публикация — «Повторить» и «Пост вышел» только у одобрявшегося; пост уже в канале — только «Повторить»', () => {
     const approvedAt = '2030-01-01T11:00:00.000Z';
     expect(actionsFor(detail({ status: 'failed', failedFrom: 'publishing', approvedAt }))).toEqual(['retry', 'mark_published', 'reject']);
+    // Упал YouTube после вышедшего поста: «Пост вышел» перезаписал бы ссылку на настоящий пост, а отклонить вышедший нельзя.
     expect(actionsFor(detail({ status: 'failed', failedFrom: 'publishing', approvedAt, publications: [tg('published')] })))
-      .toEqual(['retry', 'mark_published']);
+      .toEqual(['retry']);
     expect(actionsFor(detail({ status: 'failed', failedFrom: 'publishing', approvedAt: null }))).toEqual(['reject']);
   });
 
@@ -2095,7 +2096,9 @@ const RESUMABLE: ShortStatus[] = ['directing', 'capturing', 'writing', 'animatin
 /**
  * Какие кнопки показать — по правилам бэка: «Переснять» и «Отклонить» не у
  * вышедшего хоть где-то; повтор публикации и «Пост вышел» — только у ролика,
- * который владелец одобрял; «Новый текст» — только при съёмке.
+ * который владелец одобрял, а «Пост вышел» — пока пост в канале не вышел
+ * (у упавшего YouTube он уже вышел); «Новый текст» — только при съёмке.
+ * Тот же набор называет бот в сообщении о сбое (failedHint бэка).
  */
 export function actionsFor(
   d: Pick<ShortDetail, 'status' | 'failedFrom' | 'approvedAt' | 'publications' | 'capture'>,
@@ -2111,7 +2114,12 @@ export function actionsFor(
       return ['start_now'];
     case 'failed': {
       const reject: ShortAction[] = released ? [] : ['reject'];
-      if (d.failedFrom === 'publishing') return d.approvedAt ? ['retry', 'mark_published', ...reject] : reject;
+      if (d.failedFrom === 'publishing') {
+        if (!d.approvedAt) return reject;
+        // Пост уже в канале (упал YouTube после него) — «Пост вышел» перезаписал бы ссылку на настоящий пост.
+        const postOut = d.publications.some((p) => p.platform === 'telegram' && p.status === 'published');
+        return postOut ? ['retry', ...reject] : ['retry', 'mark_published', ...reject];
+      }
       if (!d.failedFrom) return reject;
       const out: ShortAction[] = [];
       if (RESUMABLE.includes(d.failedFrom)) out.push('retry');
