@@ -1956,14 +1956,15 @@ Expected: PASS, 7 тестов.
 
 - [ ] **Step 1: Написать падающие тесты**
 
-В `src/components/admin/shortStatus.test.ts` оба импорта заменить на:
+В `src/components/admin/shortStatus.test.ts` импорты дополнить (не заменять: после ревью задачи 10 тест уже берёт `STATUS_TITLES` и типы `PublicationStatus`, `ShortPlatform`, `ShortPublication` — их сохранить). Итог:
 
 ```ts
 import { NOW, detail, item } from './shortFixtures';
 import {
-  GROUP_ORDER, ShortSettings, ShortStatus, actionRequest, actionsFor, archiveOf, draftErrors,
-  draftToPatch, groupOf, isReleased, isTelegramPostUrl, noteChars, orderChars, publicationLabel, queueGroups,
-  screenCounts, screenOf, shortTitle, statusLine, successText, toDraft,
+  GROUP_ORDER, PublicationStatus, STATUS_TITLES, ShortPlatform, ShortPublication, ShortSettings, ShortStatus,
+  actionRequest, actionsFor, archiveOf, draftErrors, draftToPatch, groupOf, isReleased, isTelegramPostUrl,
+  noteChars, orderChars, publicationLabel, queueGroups, screenCounts, screenOf, shortTitle, statusLine,
+  successText, toDraft,
 } from './shortStatus';
 ```
 
