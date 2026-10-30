@@ -1,6 +1,7 @@
 // src/common/services/claude-cli.service.ts
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { spawn } from 'child_process';
+import { StringDecoder } from 'string_decoder';
 import * as os from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -98,8 +99,9 @@ export interface ClaudeCliOptions {
   /** Куски текста ответа по мере генерации (проба без входа, src/guest-trial).
    *  Если задан — CLI идёт в stream-json с --include-partial-messages, и каждый
    *  text_delta уходит сюда; итоговый текст по-прежнему возвращает textWithCost.
-   *  Такой вызов не повторяется на Qwen: показанный человеку текст повтор не
-   *  заберёт обратно. */
+   *  Куски вложенных суб-агентов (у события есть parent_tool_use_id) сюда не
+   *  попадают — только текст основного ответа. Такой вызов не повторяется на
+   *  Qwen: показанный человеку текст повтор не заберёт обратно. */
   onTextDelta?: (text: string) => void;
   /** Рабочая директория Claude. По умолчанию os.tmpdir(). Для агентных
    *  сценариев (Bash/Write/Edit) передавай изолированный sandbox-dir. */
@@ -654,10 +656,24 @@ export class ClaudeCliService implements OnModuleInit {
       });
       let stdout = '';
       let stderr = '';
+      // StringDecoder держит «хвост» незавершённого многобайтового символа
+      // между кусками: граница чтения из pipe может прийтись внутрь буквы
+      // (кириллица — 2 байта), и b.toString() на каждом куске ОТДЕЛЬНО
+      // превращал бы обе половинки в U+FFFD. Один декодер на процесс — до
+      // конца этого вызова, не общий между вызовами.
+      const outDecoder = new StringDecoder('utf8');
+      const errDecoder = new StringDecoder('utf8');
       // Вызвала ли модель инструмент с последствиями (не Read/WebSearch/WebFetch)
       // до сбоя — решает, можно ли повторить на Qwen.
       let sawRiskyToolUse = false;
-      const fail = (message: string) => reject(new ClaudeCliCallError(message, sawRiskyToolUse));
+      // Вызов уже отклонён или разрешён — дальнейшие данные от процесса (он
+      // может ещё писать в stdout после kill('SIGTERM') по таймауту) больше не
+      // должны доходить до колбэков caller-а.
+      let settled = false;
+      const fail = (message: string) => {
+        settled = true;
+        reject(new ClaudeCliCallError(message, sawRiskyToolUse));
+      };
 
       // Stream-mode accumulators (заполняются по мере прихода NDJSON).
       let streamLineBuf = '';
@@ -676,7 +692,7 @@ export class ClaudeCliService implements OnModuleInit {
       }
 
       proc.stdout.on('data', (b) => {
-        const chunk = b.toString();
+        const chunk = outDecoder.write(b);
         stdout += chunk;
         if (!streaming) return;
         streamLineBuf += chunk;
@@ -691,14 +707,18 @@ export class ClaudeCliService implements OnModuleInit {
             for (const c of ev.message.content) {
               if (c?.type === 'tool_use' && typeof c.name === 'string') {
                 if (!SIDE_EFFECT_FREE_TOOLS.has(c.name)) sawRiskyToolUse = true;
-                if (opts.onProgress) {
+                if (opts.onProgress && !settled) {
                   try { opts.onProgress({ kind: 'tool_use', name: c.name }); } catch { /* user callback safety */ }
                 }
               }
             }
           }
           if (
+            !settled &&
             opts.onTextDelta &&
+            // parent_tool_use_id — кусок вложенного суб-агента, а не основного
+            // ответа; у основного это поле null/отсутствует.
+            !ev.parent_tool_use_id &&
             ev.type === 'stream_event' &&
             ev.event?.type === 'content_block_delta' &&
             ev.event.delta?.type === 'text_delta' &&
@@ -717,7 +737,7 @@ export class ClaudeCliService implements OnModuleInit {
           }
         }
       });
-      proc.stderr.on('data', (b) => { stderr += b.toString(); });
+      proc.stderr.on('data', (b) => { stderr += errDecoder.write(b); });
 
       proc.on('close', (code) => {
         if (timer) clearTimeout(timer);
@@ -747,6 +767,7 @@ export class ClaudeCliService implements OnModuleInit {
           });
           // stripWordJoiner на выходе: U+2060, которым мы обезвреживали
           // @-упоминания во входе, не должен доехать до пользователя.
+          settled = true;
           resolve({ text: stripWordJoiner(streamResultText), costUsd: streamCostUsd, toolUsed: sawRiskyToolUse });
           return;
         }
@@ -788,6 +809,7 @@ export class ClaudeCliService implements OnModuleInit {
           });
           // В json-режиме вызов инструмента не виден: toolUsed всегда false,
           // осторожность — в mayRetryOnQwen по набору тулов и MCP.
+          settled = true;
           resolve({ text, costUsd, toolUsed: sawRiskyToolUse });
         } catch (e: any) {
           this.logger.error(`claude CLI parse error: ${e.message}, stdout: ${stdout.slice(0, 200)}`);
