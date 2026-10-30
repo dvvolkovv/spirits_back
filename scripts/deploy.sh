@@ -1076,7 +1076,8 @@ run_landing_phase() {
 # невозможен в принципе.
 #
 # Путь конфига РАЗНЫЙ на test и на проде (см. NGINX_CONF_PATH в run_phase):
-#   test — /etc/nginx/sites-available/test.linkeon.io, sites-enabled — симлинк на него;
+#   test — /etc/nginx/sites-enabled/test.linkeon.io (фактически загружаемый файл,
+#     НЕ symlink на sites-available: копии на стенде различаются);
 #   prod — /etc/nginx/sites-enabled/spirits САМ является живым файлом (не
 #     симлинк, sites-available/spirits — устаревшая недействующая копия).
 #     Отсюда и предостережение в CLAUDE.md: класть бэкап РЯДОМ, в
@@ -1626,8 +1627,8 @@ run_phase() {
       # не передаём — эта копия строки разошлась бы с .env стенда при смене
       # пароля, а в аргументах ssh пароль был виден в ps.
       PG_DSN=
-      # sites-enabled/test.linkeon.io — симлинк НА этот файл (см. ensure_tma_nginx_block).
-      NGINX_CONF_PATH="${TEST_NGINX_CONF:-/etc/nginx/sites-available/test.linkeon.io}"
+      # На стенде sites-enabled — отдельный живой файл, НЕ symlink на sites-available.
+      NGINX_CONF_PATH="${TEST_NGINX_CONF:-/etc/nginx/sites-enabled/test.linkeon.io}"
       ;;
     prod)
       ENV_NAME=prod
