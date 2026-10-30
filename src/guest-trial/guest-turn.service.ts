@@ -37,15 +37,15 @@ export interface GuestTurnInput {
 const SOURCE_RE = /^(utm:|referral:|ref-site:|direct$|organic$)/;
 
 /**
- * Управляющие байты, кроме \n (0A) и \t (09) — перевод строки и табуляция в
- * сообщении гостя — обычный текст. ASCII-escape, а не литеральные байты (M5):
- * 00–08, 0B–0C, 0E–1F, 7F.
+ * Управляющие байты, кроме \n (0A), \r (0D) и \t (09) — перевод строки,
+ * возврат каретки и табуляция в сообщении гостя — обычный текст. ASCII-escape,
+ * а не литеральные байты (M5): 00–08, 0B–0C, 0E–1F, 7F.
  */
 const CONTROL_CHARS_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g;
 
 export function parseGuestTurnInput(body: any): GuestTurnInput {
   const str = (v: unknown, max: number): string => (typeof v === 'string' ? v.slice(0, max) : '');
-  /** Та же str(), но вдобавок вырезает управляющие байты (кроме \n/\t). */
+  /** Та же str(), но вдобавок вырезает управляющие байты (кроме \n/\r/\t). */
   const clean = (v: unknown, max: number): string => str(v, max).replace(CONTROL_CHARS_RE, '');
   const source = clean(body?.source, 120);
   const sid = str(body?.sid, 64);
@@ -103,7 +103,7 @@ export class GuestTurnService {
   async handle(input: GuestTurnInput, res: Response): Promise<void> {
     const { mode, limits } = await this.store.settings();
     if (mode === 'off' || (mode === 'preview' && !input.preview)) {
-      this.closedStream(res, null);
+      this.closedStream(res, null, input.preview);
       return;
     }
 
@@ -137,7 +137,7 @@ export class GuestTurnService {
     } else {
       const q = await takeGuestQuota(this.redis, trialRules(limits), this.redisTimeoutMs);
       if (!q.counted) {
-        this.closedStream(res, q);
+        this.closedStream(res, q, input.preview);
         return;
       }
       issued = newGuestToken();
@@ -165,24 +165,35 @@ export class GuestTurnService {
       return;
     }
 
-    this.busy.add(session.id);
+    // Свой из session.id: ниже session может переехать на fresh (та же
+    // проба, свежая строка) — лок снимается именно по этому id, а не по
+    // session.id в момент finally, который мог бы относиться уже к другой переменной.
+    const lockId = session.id;
+    this.busy.add(lockId);
     try {
-      // M2: между первым чтением пробы (выше) и этим локом могла случиться
-      // гонка — перенос пробы в аккаунт с другой вкладки/устройства (его
-      // делает guest-claim.service, этот busy-лок он не видит и не трогает).
-      // Перечитываем свежую строку и пересчитываем left/claimed_at по ней,
-      // прежде чем тратить окно ответов и звать модель.
-      const fresh = await this.sessions.findLive(tokenHash);
-      left = fresh ? Math.max(0, limits.answersPerTrial - fresh.answers) : 0;
-      if (!fresh || fresh.claimed_at || left === 0) {
-        this.startStream(res);
-        this.write(res, { ...guestEvent, left: 0 });
-        this.write(res, { type: 'wall', reason: 'limit' });
-        this.end(res);
-        return;
+      // M2: только что созданную (issued) пробу перечитывать незачем — с
+      // момента sessions.create() внутри этого же вызова ни перенести, ни
+      // ответить в ней ещё не успели. Для продолжения существующей пробы (по
+      // токену) между первым чтением (выше) и этим локом могла случиться
+      // гонка — ЛИБО перенос в аккаунт с другой вкладки/устройства (его
+      // делает guest-claim.service, этот busy-лок он не видит и не трогает),
+      // ЛИБО соседний параллельный ход той же пробы уже записал свой ответ, и
+      // answers, который мы прочитали выше, устарел. Перечитываем свежую
+      // строку и пересчитываем left/claimed_at по ней, прежде чем тратить
+      // окно ответов и звать модель.
+      if (!issued) {
+        const fresh = await this.sessions.findLive(tokenHash);
+        left = fresh ? Math.max(0, limits.answersPerTrial - fresh.answers) : 0;
+        if (!fresh || fresh.claimed_at || left === 0) {
+          this.startStream(res);
+          this.write(res, { ...guestEvent, left: 0 });
+          this.write(res, { type: 'wall', reason: 'limit' });
+          this.end(res);
+          return;
+        }
+        session = fresh;
+        guestEvent = { type: 'guest', left };
       }
-      session = fresh;
-      guestEvent = { type: 'guest', ...(issued ? { token: issued } : {}), left };
 
       // Claude сейчас недоступен (окно запасного пути открыто платными вызовами):
       // гостю — сразу ошибка, а не две минуты ожидания и занятый слот.
@@ -191,7 +202,7 @@ export class GuestTurnService {
         this.write(res, guestEvent);
         this.write(res, { type: 'error', code: 'model' });
         this.end(res);
-        this.events?.track('guest_trial_error', { props: { reason: 'breaker', assistant_id: String(agent.id) } });
+        this.events?.track('guest_trial_error', { props: { reason: 'breaker', assistant_id: String(agent.id), preview: input.preview } });
         return;
       }
 
@@ -204,14 +215,14 @@ export class GuestTurnService {
         this.write(res, guestEvent);
         this.write(res, { type: 'error', code: 'busy' });
         this.end(res);
-        this.events?.track('guest_trial_error', { props: { reason: 'busy', assistant_id: String(agent.id) } });
+        this.events?.track('guest_trial_error', { props: { reason: 'busy', assistant_id: String(agent.id), preview: input.preview } });
         return;
       }
       this.inFlight++;
       try {
         const q = await takeGuestQuota(this.redis, answerRules(limits), this.redisTimeoutMs);
         if (!q.counted) {
-          this.closedStream(res, q, issued);
+          this.closedStream(res, q, input.preview, issued);
           return;
         }
         // beginStream — только после успешного окна ответов: endStream ниже
@@ -227,7 +238,7 @@ export class GuestTurnService {
         this.inFlight--;
       }
     } finally {
-      this.busy.delete(session.id);
+      this.busy.delete(lockId);
     }
   }
 
@@ -279,7 +290,7 @@ export class GuestTurnService {
         // ролевым текстом). Проверку отказа применяем только когда кусков не было.
         if (!text || (!hadChunks && looksLikeCliRefusal(text))) {
           this.write(res, { type: 'error', code: 'model' });
-          this.events?.track('guest_trial_error', { props: { reason: 'model', assistant_id: String(agent.id) } });
+          this.events?.track('guest_trial_error', { props: { reason: 'model', assistant_id: String(agent.id), preview: input.preview } });
           return;
         }
         const answers = await this.sessions.recordExchange(session.id, message, text, humanAt, costUsd);
@@ -289,7 +300,7 @@ export class GuestTurnService {
           // (guest-sessions.service: recordExchange), answers не растёт.
           this.log.warn(`guest turn: проба перенесена во время хода (${session.id})`);
           this.write(res, { type: 'error', code: 'model' });
-          this.events?.track('guest_trial_error', { props: { reason: 'claimed', assistant_id: String(agent.id) } });
+          this.events?.track('guest_trial_error', { props: { reason: 'claimed', assistant_id: String(agent.id), preview: input.preview } });
           return;
         }
         this.write(res, { type: 'end', content: text });
@@ -304,9 +315,12 @@ export class GuestTurnService {
         // открыт, человек его ждёт): ответ гостю — такая же ошибка в потоке,
         // а не необработанное исключение наружу из handle() (поток к этому
         // моменту уже начат — молчаливо оборванное соединение хуже явного error).
-        this.log.warn(`guest turn: сбой после начала ответа (проба ${session.id}): ${String(e?.message ?? e).slice(0, 200)}`);
+        // Код клиенту остаётся 'model' — внутренние причины ему не нужны; в
+        // событие и лог идёт свой код 'internal' (N3): отличать неожиданный
+        // сбой кода/базы от обычного отказа модели/CLI при разборе причин.
+        this.log.error(`guest turn: сбой после начала ответа (проба ${session.id}): ${String(e?.message ?? e).slice(0, 200)}`);
         this.write(res, { type: 'error', code: 'model' });
-        this.events?.track('guest_trial_error', { props: { reason: 'model', assistant_id: String(agent.id) } });
+        this.events?.track('guest_trial_error', { props: { reason: 'internal', assistant_id: String(agent.id), preview: input.preview } });
       }
     } finally {
       clearInterval(ping);
@@ -351,12 +365,12 @@ export class GuestTurnService {
     try { res.end(); } catch { /* клиент ушёл */ }
   }
 
-  private closedStream(res: Response, q: GuestQuotaReply | null, token: string | null = null): void {
+  private closedStream(res: Response, q: GuestQuotaReply | null, preview: boolean, token: string | null = null): void {
     if (q) {
       // Отчёт о закрытии — fire-and-forget: он не должен задерживать ответ
       // гостю. Но не void — непойманный отказ внутри (сеть, Redis, Telegram)
       // ушёл бы необработанным rejection'ом мимо собственных catch() метода.
-      this.reportClosed(q).catch((e: any) => this.log.warn(`reportClosed failed: ${String(e?.message ?? e).slice(0, 200)}`));
+      this.reportClosed(q, preview).catch((e: any) => this.log.warn(`reportClosed failed: ${String(e?.message ?? e).slice(0, 200)}`));
     }
     this.startStream(res);
     this.write(res, { type: 'guest', ...(token ? { token } : {}), left: 0 });
@@ -365,9 +379,9 @@ export class GuestTurnService {
   }
 
   /** Событие на каждое закрытие; владельцу — раз за окно (как у лимитов SMS). */
-  private async reportClosed(q: GuestQuotaReply): Promise<void> {
+  private async reportClosed(q: GuestQuotaReply, preview: boolean): Promise<void> {
     if (q.redisDown) {
-      this.events?.track('guest_trial_closed', { props: { scope: 'redis' } });
+      this.events?.track('guest_trial_closed', { props: { scope: 'redis', preview } });
       if (Date.now() - this.lastRedisAlertAt < REDIS_ALERT_EVERY_MS) return;
       this.lastRedisAlertAt = Date.now();
       this.log.error('guest trial closed: Redis не ответил');
@@ -378,7 +392,7 @@ export class GuestTurnService {
       return;
     }
     for (const hit of q.full) {
-      this.events?.track('guest_trial_closed', { props: { scope: hit.scope } });
+      this.events?.track('guest_trial_closed', { props: { scope: hit.scope, preview } });
       let first = false;
       try {
         first = await withTimeout(firstInWindow(this.redis, `guest-lim:alerted:${hit.scope}`, hit.leftMs), this.redisTimeoutMs);

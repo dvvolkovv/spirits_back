@@ -14,6 +14,10 @@ export interface GuestSessionRow {
 
 const ROW = `id::text AS id, assistant_id, lang, answers, claimed_by_hash, claimed_at, last_message_at`;
 
+/** Известные причины guest_trial_error (ход гостя, src/guest-trial/guest-turn.service.ts) —
+ *  предзаполняются нулями в status(), чтобы админ-ручка не молчала про причину, которой сегодня не было. */
+const KNOWN_ERROR_REASONS = ['busy', 'model', 'breaker', 'claimed', 'internal'];
+
 @Injectable()
 export class GuestSessionsService {
   constructor(private readonly pg: PgService) {}
@@ -155,6 +159,26 @@ export class GuestSessionsService {
     for (const row of e.rows) {
       out[`${row.name}_day`] = row.day;
       out[`${row.name}_week`] = row.week;
+    }
+    // Отказы хода гостя — отдельной разбивкой по причине (ревью A7, N1):
+    // guest_trial_error_<reason>_day/_week. Известные причины — нулями
+    // заранее, неизвестная (опечатка в коде/новый вид) — как есть, своим ключом.
+    const err = await this.pg.query(
+      `SELECT props->>'reason' AS reason,
+              count(*) FILTER (WHERE ts > now() - interval '1 day')::int AS day,
+              count(*)::int AS week
+         FROM events
+        WHERE name = 'guest_trial_error' AND ts > now() - interval '7 days'
+        GROUP BY 1`,
+    );
+    for (const reason of KNOWN_ERROR_REASONS) {
+      out[`guest_trial_error_${reason}_day`] = 0;
+      out[`guest_trial_error_${reason}_week`] = 0;
+    }
+    for (const row of err.rows) {
+      const reason = row.reason ?? 'unknown';
+      out[`guest_trial_error_${reason}_day`] = row.day;
+      out[`guest_trial_error_${reason}_week`] = row.week;
     }
     return out;
   }
