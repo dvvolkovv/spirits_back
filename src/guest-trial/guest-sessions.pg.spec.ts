@@ -51,6 +51,15 @@ maybe('пробы и сообщения против живого Postgres', () 
     expect(cost.rows[0].c).toBeCloseTo(0.12, 4);
   });
 
+  it('перенесённая проба: recordExchange не пишет пару и не растит счёт (I1)', async () => {
+    const { row } = await create();
+    await pool.query(`UPDATE guest_trial_sessions SET claimed_at = now() WHERE id = $1`, [row.id]);
+    expect(await svc.recordExchange(row.id, 'Вопрос', 'Ответ', new Date(), 0.05)).toBeNull();
+    expect(await svc.messages(row.id)).toEqual([]);
+    const r = await pool.query('SELECT answers, cost_usd::float AS cost_usd FROM guest_trial_sessions WHERE id = $1', [row.id]);
+    expect(r.rows[0]).toMatchObject({ answers: 0, cost_usd: 0 });
+  });
+
   it('неперенесённая проба старше 7 дней не находится', async () => {
     const { row, token } = await create();
     await pool.query(`UPDATE guest_trial_sessions SET last_message_at = now() - interval '8 days' WHERE id = $1`, [row.id]);
