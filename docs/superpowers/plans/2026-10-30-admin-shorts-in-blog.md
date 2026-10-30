@@ -1334,6 +1334,7 @@ ssh dv@85.192.61.231 "sudo -u postgres psql -qc \"CREATE ROLE shortsit LOGIN PAS
 
 ```ts
 import { leaveReview, noteForReview } from './short-review';
+import { BAD_TIMESTAMP_CODES, VERSION_RE } from './shorts.controller';
 ```
 
 Внутрь `maybe('ролики против живого Postgres', …)` перед `describe('YouTube против живой базы', …)`:
@@ -1383,6 +1384,28 @@ import { leaveReview, noteForReview } from './short-review';
       expect(await noteForReview(pgLike() as any, v, 'без цифр', VERSION))
         .toMatchObject({ ok: true, short: { status: 'writing', ownerNote: 'короче\nбез цифр', writerRounds: 0 } });
     });
+
+    it('одобрение обнуляет счётчик, аренду и ошибку отправки в личку — публикатору достаётся полный бюджет', async () => {
+      const v = await insert({
+        status: 'pending_review', updated_at: VERSION, attempts: 2,
+        lease_until: new Date(Date.now() + 600_000), last_error: 'отправка владельцу: Bad Gateway',
+      });
+      expect(await approveShortIntoSlot(pgLike() as any, v.id, null, daily, undefined, VERSION)).not.toBeNull();
+      const row = (await pool.query(`SELECT status, attempts, lease_until, last_error FROM short_video WHERE id = $1`, [v.id])).rows[0];
+      expect(row).toMatchObject({ status: 'approved', attempts: 0, lease_until: null, last_error: null });
+    });
+
+    it('версия из базы подходит под VERSION_RE; невозможные даты правильной формы Postgres отвергает кодами из BAD_TIMESTAMP_CODES', async () => {
+      const v = await insert({ status: 'pending_review' });
+      const version = (await pool.query(`SELECT updated_at::text AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
+      expect(VERSION_RE.test(version)).toBe(true);
+      for (const bad of ['2026-13-45 12:34:56+00', '2026-02-30 12:34:56+00', '2026-10-30 12:34:56+99']) {
+        // Форма верна — регулярка пропустит, и решать будет база.
+        expect(VERSION_RE.test(bad)).toBe(true);
+        const err: any = await pool.query('SELECT $1::timestamptz', [bad]).catch((e) => e);
+        expect(BAD_TIMESTAMP_CODES).toContain(err.code);
+      }
+    });
   });
 ```
 
@@ -1394,7 +1417,7 @@ git commit -m "test(shorts): решения из админки на живом 
 NODE_RUN_DIR=. studio/scripts/node-run.sh "SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts 2>&1 | tail -25"
 ```
 
-Expected: PASS всей сюиты, включая четыре новых теста; skipped быть не должно. Красный новый тест означает, что SQL расходится с ожиданием: разобрать причину, а не ослаблять проверку.
+Expected: PASS всей сюиты, включая шесть новых тестов; skipped быть не должно. Красный новый тест означает, что SQL расходится с ожиданием: разобрать причину, а не ослаблять проверку.
 
 ---
 

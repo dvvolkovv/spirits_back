@@ -44,7 +44,8 @@ export function chooseApprovalSlot(now: Date, planned: Date | null, schedule: Sc
  *
  * `version` — версия ролика из админки (`updated_at::text`, short-review.ts):
  * запись пройдёт, только если ролик с тех пор не менялся. Кнопка лички её не
- * передаёт — её сторожит «кнопка под текущим сообщением», и SQL для неё прежний.
+ * передаёт — её сторожит «кнопка под текущим сообщением», и условие записи для
+ * неё прежнее.
  *
  * @returns слот — или null, если ролик успел уйти из `pending_review` или разошлась версия
  * @throws NoFreeSlotError — слот уводили MAX_SLOT_ATTEMPTS раз подряд
