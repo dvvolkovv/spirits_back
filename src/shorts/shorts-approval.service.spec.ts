@@ -333,6 +333,22 @@ describe('ShortsApprovalService', () => {
       expect((tg.sendMessage.mock.calls[0] as any[])[1]).toContain('Пришлите ссылку на ролик «Залог при аренде» в YouTube');
       expect(pg.query.mock.calls.some((c: any[]) => String(c[0]).includes('yt_prompt_ids ='))).toBe(true);
     });
+
+    it('«Переснять» не записалось не из-за «вышел» — отказ по свежему статусу; строки нет — «уже обработан»', async () => {
+      for (const [after, text] of [
+        [{ status: 'publishing', released: false }, 'Ролик уже уходит на площадки'],
+        [null, 'Ролик уже обработан'],
+      ] as const) {
+        const { svc, tg, pg } = setup();
+        pg.query.mockImplementation(async (sql: string) => {
+          if (sql.includes('SELECT * FROM short_video')) return { rows: [row()] };
+          if (sql.startsWith('UPDATE')) return { rows: [], rowCount: 0 };
+          return { rows: after ? [after] : [] };
+        });
+        await svc.handleCallback(cb('redo'));
+        expect(tg.answerCallbackQuery).toHaveBeenCalledWith('cb', { text });
+      }
+    });
   });
 
   describe('ответы реплаем', () => {
@@ -391,6 +407,17 @@ describe('ShortsApprovalService', () => {
       const { svc, tg } = setup(row({ status: 'published', yt_prompt_ids: ['70'] }));
       await svc.handleReplyEdit(reply({ reply_to_message: { message_id: 70 }, text: 'выложил' }));
       expect((tg.sendMessage.mock.calls[0] as any[])[1]).toMatch(/Не узнал ссылку/);
+    });
+
+    it('замечание не записалось (ролик ушёл с проверки) — отказ по свежему статусу', async () => {
+      const { svc, pg, tg } = setup();
+      pg.query.mockImplementation(async (sql: string) => {
+        if (sql.includes('SELECT * FROM short_video')) return { rows: [row()] };
+        if (sql.startsWith('UPDATE')) return { rows: [], rowCount: 0 };
+        return { rows: [{ status: 'approved', released: false }] };
+      });
+      expect(await svc.handleReplyEdit(reply())).toBe(true);
+      expect((tg.sendMessage.mock.calls[0] as any[])[1]).toMatch(/уже одобрен/);
     });
   });
 
