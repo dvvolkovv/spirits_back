@@ -241,7 +241,7 @@ describe('ход гостя: отказы', () => {
     const failing = harness({ reply: async () => { throw new Error('claude CLI exited with code 1'); } });
     expect((await failing.turn()).evs.slice(-1)).toEqual([{ type: 'error', code: 'model' }]);
     expect(failing.sessions.recordExchange).not.toHaveBeenCalled();
-    expect(failing.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'model', assistant_id: '12' } });
+    expect(failing.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'model', assistant_id: '12', preview: false } });
 
     const refusal = harness({ reply: async () => ({ text: "You've hit your weekly limit · resets 10am (UTC)", costUsd: 0 }) });
     expect((await refusal.turn()).evs.slice(-1)).toEqual([{ type: 'error', code: 'model' }]);
@@ -255,15 +255,18 @@ describe('ход гостя: отказы', () => {
     const { evs } = await h.turn({ token });
     expect(evs.slice(-1)).toEqual([{ type: 'error', code: 'model' }]);
     expect(evs.find((e) => e.type === 'end')).toBeUndefined();
-    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'claimed', assistant_id: '12' } });
+    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'claimed', assistant_id: '12', preview: false } });
   });
 
-  it('сбой после начала ответа (recordExchange бросает) — error, счётчики парные, следующий ход не 409 (I3)', async () => {
+  it('сбой после начала ответа (recordExchange бросает) — error, причина internal, счётчики парные, следующий ход не 409 (I3, N3)', async () => {
     const h = harness();
     h.sessions.recordExchange.mockImplementationOnce(() => { throw new Error('db down'); });
     const first = await h.turn();
     expect(first.evs.slice(-1)).toEqual([{ type: 'error', code: 'model' }]);
     expect(first.evs.find((e) => e.type === 'end')).toBeUndefined();
+    // Клиенту — тот же код 'model' (выше), а причина события — 'internal':
+    // это сбой кода/базы после begin, а не обычный отказ модели/CLI (N3).
+    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'internal', assistant_id: '12', preview: false } });
     expect(h.chat.beginStream).toHaveBeenCalledTimes(1);
     expect(h.chat.endStream).toHaveBeenCalledTimes(1);
     const token = first.evs[0].token;
@@ -276,7 +279,7 @@ describe('ход гостя: отказы', () => {
     expect(evs.slice(-1)).toEqual([{ type: 'error', code: 'model' }]);
     expect(h.cli.textWithCost).not.toHaveBeenCalled();
     expect(h.redis.peek('guest-lim:answers:h')).toBeNull();
-    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'breaker', assistant_id: '12' } });
+    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'breaker', assistant_id: '12', preview: false } });
   });
 
   it('общий потолок ответов — closed и одно сообщение владельцу за окно', async () => {
@@ -287,7 +290,7 @@ describe('ход гостя: отказы', () => {
     await h.turn();
     await new Promise((r) => setImmediate(r));
     expect(sendTelegramAlert).toHaveBeenCalledTimes(1);
-    expect(h.events.track).toHaveBeenCalledWith('guest_trial_closed', { props: { scope: 'answers_hour' } });
+    expect(h.events.track).toHaveBeenCalledWith('guest_trial_closed', { props: { scope: 'answers_hour', preview: false } });
   });
 
   it('Redis висит — closed за срок, модель не зовётся', async () => {
@@ -330,7 +333,7 @@ describe('ход гостя: отказы', () => {
     await first;
     expect(second.evs.slice(-1)).toEqual([{ type: 'error', code: 'busy' }]);
     expect(afterBusy).toBe(beforeBusy);
-    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'busy', assistant_id: '12' } });
+    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'busy', assistant_id: '12', preview: false } });
     expect(h.chat.beginStream).toHaveBeenCalledTimes(1);
     expect(h.chat.endStream).toHaveBeenCalledTimes(1);
     expect((await h.turn()).evs.find((e) => e.type === 'end')).toBeTruthy();

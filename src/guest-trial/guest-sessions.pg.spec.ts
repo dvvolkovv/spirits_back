@@ -127,4 +127,26 @@ maybe('пробы и сообщения против живого Postgres', () 
       guest_trial_closed_week: 0,
     });
   });
+
+  it('статистика: отказы guest_trial_error — разбивка по причине (N1)', async () => {
+    await pool.query(
+      `INSERT INTO events (name, ts, props) VALUES
+         ('guest_trial_error', now(), '{"reason":"model"}'::jsonb),
+         ('guest_trial_error', now(), '{"reason":"model"}'::jsonb),
+         ('guest_trial_error', now(), '{"reason":"busy"}'::jsonb)`,
+    );
+    const s = await svc.status();
+    expect(s).toMatchObject({
+      guest_trial_error_model_day: 2,
+      guest_trial_error_model_week: 2,
+      guest_trial_error_busy_day: 1,
+      guest_trial_error_busy_week: 1,
+      guest_trial_error_breaker_day: 0,
+      guest_trial_error_breaker_week: 0,
+      guest_trial_error_claimed_day: 0,
+      guest_trial_error_claimed_week: 0,
+      guest_trial_error_internal_day: 0,
+      guest_trial_error_internal_week: 0,
+    });
+  });
 });
