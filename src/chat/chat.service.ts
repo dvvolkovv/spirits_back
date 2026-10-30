@@ -38,6 +38,9 @@ import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
 import { UserLlmProviderService } from '../common/services/user-llm-provider.service';
+import { RedisService } from '../common/services/redis.service';
+import { takeGuestCarry } from '../guest-trial/guest-carry';
+import { withTimeout } from '../common/with-timeout';
 import { readDoneProvider, relayProviderFields, resolveAnswerProvider } from './answer-provider';
 import axios from 'axios';
 import { Request, Response } from 'express';
@@ -464,6 +467,9 @@ export class ChatService {
     // Модель ответов человека (админка, spec 2026-10-30-llm-provider-switch).
     // Последним и @Optional по той же причине, что chatFiles.
     @Optional() private readonly llmProvider?: UserLlmProviderService,
+    // Приписка пробы без входа (src/guest-trial/guest-carry.ts). Последним и
+    // @Optional по той же причине, что chatFiles: спеки собирают ChatService позиционно.
+    @Optional() private readonly redis?: RedisService,
   ) {}
 
   /**
@@ -1622,6 +1628,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
     }
     if (balanceBlock) {
       contextPrefix += balanceBlock + '\n';
+    }
+    // Проба без входа (src/guest-trial): с этим ассистентом человек говорил до
+    // входа, а сессия релея возобновится без той переписки. Приписка разовая и
+    // в историю не пишется. Redis при недоступности висит — ждём не дольше 1,5 с.
+    if (this.redis && !fresh) {
+      const carry = await withTimeout(takeGuestCarry(this.redis, userId, assistantId), 1500).catch(() => null);
+      if (carry) contextPrefix += carry + '\n\n';
     }
     // История уходит ОТДЕЛЬНЫМ полем, а не в тело реплики: релей вставит её
     // только когда стартует без --resume. При обычном resume Claude-сессия уже
