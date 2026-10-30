@@ -90,6 +90,18 @@ describe('noteForReview', () => {
     expect(await noteForReview(pg as any, rowToShort(row()), 'без цифр', VERSION))
       .toEqual({ ok: false, reason: 'status', status: 'approved' });
   });
+
+  it('ролик уже вышел — причина «released», важнее статуса', async () => {
+    const pg = fakePg({ rows: [] }, { status: 'approved', released: true });
+    expect(await noteForReview(pg as any, rowToShort(row()), 'без цифр', VERSION))
+      .toEqual({ ok: false, reason: 'released', status: 'approved' });
+  });
+
+  it('строки нет вовсе — причина «not_found»', async () => {
+    const pg = fakePg({ rows: [] }, null);
+    expect(await noteForReview(pg as any, rowToShort(row()), 'без цифр', VERSION))
+      .toEqual({ ok: false, reason: 'not_found', status: null });
+  });
 });
 
 describe('explainRefusal', () => {

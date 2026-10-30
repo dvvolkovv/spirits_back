@@ -3,7 +3,7 @@ import * as path from 'path';
 import { Pool } from 'pg';
 import { decryptSecret, encryptSecret } from '../calendar/crypto';
 import { claimStage, stageFailed } from './short-jobs';
-import { BAD_TIMESTAMP_CODES, VERSION_RE, leaveReview, noteForReview } from './short-review';
+import { BAD_TIMESTAMP_CODES, VERSION_RE, VERSION_SQL, leaveReview, noteForReview } from './short-review';
 import { approveShortIntoSlot } from './short-slot-claim';
 import { ShortsApprovalService } from './shorts-approval.service';
 import { POST_MAY_BE_OUT, ShortsPublisherService } from './shorts-publisher.service';
@@ -182,6 +182,48 @@ maybe('ролики против живого Postgres', () => {
     expect(row).toEqual({ status: 'writing', owner_note: 'короче' });
   });
 
+  it('ссылка YouTube ответом записывается, даже если ролик одобрили в админке, минуя показ в личке (review_chat_id был NULL — rememberPrompt его заполняет)', async () => {
+    const v = await insert({ status: 'published' });
+    await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'youtube', 'manual_pending')`, [v.id]);
+    const tg = { sendMessage: jest.fn(async () => ({ message_id: 42 })) };
+    process.env.BLOG_APPROVER_TG_ID = '777';
+    const svc = new ShortsApprovalService(pgLike() as any, tg as any, {} as any, {} as any, {} as any);
+    // «yt» в сообщении набора: review_chat_id/review_message_id у ролика ещё NULL, но «yt» не
+    // проверяет «устарело» — приглашение уходит и должно заполнить review_chat_id сама.
+    expect(await svc.handleCallback({ id: 'cb', data: `short:yt:${v.id}`, from: { id: 777 }, message: { chat: { id: 777 }, message_id: 999 } }))
+      .toBe(true);
+    expect(await svc.handleReplyEdit({
+      chat: { id: 777 }, reply_to_message: { message_id: 42 }, message_id: 50, text: 'https://youtu.be/AbCdEfGhIjK',
+    })).toBe(true);
+    const row = (await pool.query(`SELECT status, url FROM short_publication WHERE short_id = $1 AND platform = 'youtube'`, [v.id])).rows[0];
+    expect(row).toEqual({ status: 'manual_done', url: 'https://youtube.com/shorts/AbCdEfGhIjK' });
+  });
+
+  it('notifyFailures: claim берёт released и tg_unsent напрямую из Postgres — три разных исхода (живой SQL)', async () => {
+    const released = await insert({ status: 'failed', failed_from: 'publishing', last_error: 'x' });
+    await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'telegram', 'published')`, [released.id]);
+    const notReleased = await insert({ status: 'failed', failed_from: 'publishing', last_error: 'x' });
+    await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'telegram', 'failed')`, [notReleased.id]);
+    // Платформы — только youtube: строки telegram нет вовсе, tg_unsent должен быть false (а не true «по умолчанию»).
+    const noTelegram = await insert({ status: 'failed', failed_from: 'publishing', last_error: 'x' });
+    await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'youtube', 'manual_pending')`, [noTelegram.id]);
+
+    const tg = { sendMessage: jest.fn(async () => ({ message_id: 1 })) };
+    process.env.BLOG_APPROVER_TG_ID = '777';
+    const svc = new ShortsApprovalService(pgLike() as any, tg as any, {} as any, {} as any, {} as any);
+    await svc.notifyFailures(3);
+    // Порядок — ORDER BY updated_at (вставлены по очереди, с ожиданием): released, notReleased, noTelegram.
+    const texts = tg.sendMessage.mock.calls.map((c: any[]) => String(c[1]));
+    expect(texts).toHaveLength(3);
+    expect(texts[0]).toContain('вышел не на все площадки');
+    expect(texts[0]).toContain('«Повторить» (пост в канале уже вышел, отклонить нельзя).');
+    expect(texts[1]).toContain('не вышел на площадки');
+    expect(texts[1]).toContain('«Пост вышел» (если пост всё-таки в канале)');
+    expect(texts[2]).toContain('не вышел на площадки');
+    expect(texts[2]).toContain('«Повторить» или «Отклонить».');
+    expect(texts[2]).not.toContain('Пост вышел');
+  });
+
   it('две публикации одновременно — одна отправка в канал', async () => {
     const v = await insert({
       status: 'approved', slot_at: new Date(Date.now() - 60_000), approved_at: new Date(),
@@ -333,7 +375,7 @@ maybe('ролики против живого Postgres', () => {
       lease_until: new Date(Date.now() + 900_000), attempts: 2, last_error: 'ошибка-тест',
       failed_from: 'writing', failure_notified: true, published_at: new Date(Date.now() - 60_000),
     });
-    const full = (await pool.query(`SELECT *, updated_at::text AS version FROM short_video WHERE id = $1`, [v.id])).rows[0];
+    const full = (await pool.query(`SELECT *, ${VERSION_SQL} AS version FROM short_video WHERE id = $1`, [v.id])).rows[0];
     // То же, что делает light() в контроллере — не экспортирован, поэтому воспроизводим здесь.
     const expected: any = rowToShort(full);
     delete expected.capture;
@@ -368,8 +410,8 @@ maybe('ролики против живого Postgres', () => {
 
     it('версия строкой из базы сверяется с микросекундами; округлённая до миллисекунд — нет', async () => {
       const v = await insert({ status: 'pending_review', updated_at: VERSION });
-      const version = (await pool.query(`SELECT updated_at::text AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
-      // VERSION задан с микросекундами .123456 — ::text обязан их сохранить, иначе сверка версии ломается.
+      const version = (await pool.query(`SELECT ${VERSION_SQL} AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
+      // VERSION задан с микросекундами .123456 — VERSION_SQL обязан их сохранить, иначе сверка версии ломается.
       expect(version).toMatch(/\.123456[+-]/);
       // Через Date JS: …10:00:00.123Z — микросекунды потеряны.
       const rounded = v.updatedAt.toISOString();
@@ -378,6 +420,28 @@ maybe('ролики против живого Postgres', () => {
       const row = (await pool.query(`SELECT status, approved_at FROM short_video WHERE id = $1`, [v.id])).rows[0];
       expect(row.status).toBe('approved');
       expect(row.approved_at).not.toBeNull();
+    });
+
+    it('версия не зависит от DateStyle/TimeZone сессии — то же решение проходит под SQL,DMY и Asia/Kolkata', async () => {
+      const v = await insert({ status: 'pending_review', owner_note: 'короче', updated_at: VERSION });
+      const client = await pool.connect();
+      let broken = false;
+      try {
+        await client.query(`SET DateStyle = 'SQL, DMY'`);
+        await client.query(`SET TimeZone = 'Asia/Kolkata'`);
+        const version = (await client.query(`SELECT ${VERSION_SQL} AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
+        expect(version).toMatch(VERSION_RE);
+        expect(version).toMatch(/\.123456[+-]/);
+        const weirdPg = { query: (sql: string, params?: any[]) => client.query(sql, params) };
+        const result = await noteForReview(weirdPg as any, v, 'без цифр', version);
+        expect(result).toMatchObject({ ok: true, short: { status: 'writing', ownerNote: 'короче\nбез цифр' } });
+      } catch (e) {
+        broken = true;
+        throw e;
+      } finally {
+        await client.query('RESET ALL').catch(() => (broken = true));
+        client.release(broken);
+      }
     });
 
     it('вышедший ролик не переснять и не отклонить — даже с верной версией', async () => {
@@ -394,7 +458,7 @@ maybe('ролики против живого Postgres', () => {
     it('redo (admin «Переснять») вышедшего ролика — отказ даже с верной версией; после снятия «вышел» тот же вызов проходит', async () => {
       const v = await insert({ status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() + 86_400_000) });
       await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'telegram', 'published')`, [v.id]);
-      const version = (await pool.query(`SELECT updated_at::text AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
+      const version = (await pool.query(`SELECT ${VERSION_SQL} AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
       const ctl = new ShortsController(pgLike() as any, {} as any, {} as any, {} as any);
       const res: any = { status: () => res, json: (b: any) => ((res.body = b), res) };
       await expect(ctl.action({ action: 'redo', id: v.id, version }, res)).rejects.toThrow(
@@ -440,7 +504,7 @@ maybe('ролики против живого Postgres', () => {
 
     it('версия из базы подходит под VERSION_RE; невозможные даты правильной формы Postgres отвергает кодами из BAD_TIMESTAMP_CODES', async () => {
       const v = await insert({ status: 'pending_review' });
-      const version = (await pool.query(`SELECT updated_at::text AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
+      const version = (await pool.query(`SELECT ${VERSION_SQL} AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
       expect(VERSION_RE.test(version)).toBe(true);
       for (const bad of ['2026-13-45 12:34:56+00', '2026-02-30 12:34:56+00', '2026-10-30 12:34:56+99']) {
         // Форма верна — регулярка пропустит, и решать будет база.
@@ -463,6 +527,20 @@ maybe('ролики против живого Postgres', () => {
         .rejects.toThrow('Пост уже отмечен вышедшим');
       const pub = (await pool.query(`SELECT url, external_id FROM short_publication WHERE short_id = $1 AND platform = 'telegram'`, [v.id])).rows[0];
       expect(pub).toEqual({ url: 'https://t.me/ainomira/90', external_id: '90' });
+      expect((await pool.query(`SELECT status FROM short_video WHERE id = $1`, [v.id])).rows[0].status).toBe('failed');
+    });
+
+    it('«Пост вышел» на ролике, который в Telegram вовсе не отправляли (платформы — только youtube) — 409, строка не создаётся (живой SQL)', async () => {
+      const v = await insert({ status: 'failed', failed_from: 'publishing', approved_at: new Date() });
+      // Платформы — только youtube: publish() не создал строку telegram вовсе (вставляет её под
+      // each-platform-loop, до отправки) — markPublished не должен завести чужую площадку.
+      await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'youtube', 'manual_pending')`, [v.id]);
+      const ctl = new ShortsController(pgLike() as any, {} as any, {} as any, { publicUrl: () => 'x' } as any);
+      const res: any = { status: () => res, json: (b: any) => ((res.body = b), res) };
+      await expect(ctl.action({ action: 'mark_published', id: v.id, url: 'https://t.me/ainomira/91' }, res))
+        .rejects.toThrow('В канал этот ролик не отправлялся — «Пост вышел» не нужен, нажмите «Повторить»');
+      const pub = await pool.query(`SELECT 1 FROM short_publication WHERE short_id = $1 AND platform = 'telegram'`, [v.id]);
+      expect(pub.rowCount).toBe(0);
       expect((await pool.query(`SELECT status FROM short_video WHERE id = $1`, [v.id])).rows[0].status).toBe('failed');
     });
 

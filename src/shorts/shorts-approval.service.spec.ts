@@ -249,6 +249,17 @@ describe('ShortsApprovalService', () => {
       }
     });
 
+    it('видео пришло после решения в админке (review_message_id не записан, решение уже другое) — отказ по статусу, не «устарело»', async () => {
+      // sendForReview отправила видео, но записать review_message_id не успела (запись совпала с
+      // решением из админки — WHERE status = 'pending_review' не совпал): реального «более нового»
+      // сообщения не существует, и «устарело» сбило бы владельца с толку.
+      const { svc, tg, pg } = setup(row({ status: 'approved', review_message_id: null }));
+      expect(await svc.handleCallback(cb('ok'))).toBe(true);
+      expect(approveShortIntoSlot).not.toHaveBeenCalled();
+      expect(tg.answerCallbackQuery).toHaveBeenCalledWith('cb', { text: 'Ролик уже одобрен' });
+      expect(pg.query.mock.calls.some((c: any[]) => String(c[0]).startsWith('UPDATE'))).toBe(false);
+    });
+
     it('тот же номер сообщения, но из другого чата — тоже устарело', async () => {
       // Номера сообщений уникальны только внутри чата.
       const { svc, tg, pg } = setup();
@@ -351,6 +362,14 @@ describe('ShortsApprovalService', () => {
       await svc.handleCallback(cb('yt'));
       expect((tg.sendMessage.mock.calls[0] as any[])[1]).toContain('Пришлите ссылку на ролик «Залог при аренде» в YouTube');
       expect(pg.query.mock.calls.some((c: any[]) => String(c[0]).includes('yt_prompt_ids ='))).toBe(true);
+    });
+
+    it('«yt»-приглашение заполняет review_chat_id, если он ещё NULL (ролик одобрили в админке, минуя показ в личке)', async () => {
+      const { svc, pg } = setup(row({ status: 'published', review_chat_id: null, review_message_id: null }));
+      await svc.handleCallback(cb('yt'));
+      const upd = pg.query.mock.calls.find((c: any[]) => String(c[0]).includes('yt_prompt_ids =')) as any[];
+      expect(String(upd[0])).toContain('review_chat_id = COALESCE(review_chat_id,');
+      expect(upd[1]).toEqual([ID, 900, 20, OWNER]);
     });
 
     it('«Переснять» не записалось не из-за «вышел» — отказ по свежему статусу; строки нет — «уже обработан»', async () => {
@@ -526,7 +545,9 @@ describe('ShortsApprovalService', () => {
       pg.query.mockImplementation(async (sql: string) => {
         if (sql.includes('failure_notified = true') && !given) {
           given = true;
-          return { rows: [row({ status: 'failed', last_error: 'публикация: telegram: chat not found', failed_from: 'publishing' })] };
+          return { rows: [row({
+            status: 'failed', last_error: 'публикация: telegram: chat not found', failed_from: 'publishing', tg_unsent: true,
+          })] };
         }
         return { rows: [] };
       });
@@ -535,6 +556,26 @@ describe('ShortsApprovalService', () => {
       expect(text).toMatch(/Ролик «Залог при аренде» не вышел на площадки: публикация: telegram: chat not found/);
       expect(text).toContain('Что дальше — в админке: Блог → Ролики, раздел «Упали»: «Повторить», «Пост вышел» (если пост всё-таки в канале) или «Отклонить».');
       expect(text).not.toMatch(/retry|reject|from=|mark_published/);
+    });
+
+    it('упавшая публикация, но в Telegram вовсе не отправляли (платформы — только youtube) — без «Пост вышел»', async () => {
+      let given = false;
+      const { svc, tg, pg } = setup();
+      pg.query.mockImplementation(async (sql: string) => {
+        if (sql.includes('failure_notified = true') && !given) {
+          given = true;
+          return { rows: [row({
+            status: 'failed', last_error: 'публикация: youtube: upload failed', failed_from: 'publishing', tg_unsent: false,
+          })] };
+        }
+        return { rows: [] };
+      });
+      await svc.notifyFailures();
+      const claim = pg.query.mock.calls.find((c: any[]) => String(c[0]).includes('failure_notified = true')) as any[];
+      expect(String(claim[0])).toContain('AS tg_unsent');
+      const text = (tg.sendMessage.mock.calls[0] as any[])[1];
+      expect(text).toContain('Что дальше — в админке: Блог → Ролики, раздел «Упали»: «Повторить» или «Отклонить».');
+      expect(text).not.toContain('Пост вышел');
     });
 
     it('упавший ролик со съёмкой — доступен «Новый текст»', async () => {

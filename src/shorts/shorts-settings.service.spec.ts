@@ -59,9 +59,10 @@ describe('validateSettingsPatch', () => {
     expect([SETTINGS_DEFAULTS.format, SETTINGS_DEFAULTS.maxOmniSeconds]).toEqual(['skit', 48]);
   });
 
-  it('narratorVoice неверный — ошибка перечисляет голоса каталога, а не имя файла', () => {
-    expect(() => validateSettingsPatch({ narratorVoice: 'nova' })).toThrow(/alena/);
+  it('narratorVoice неверный — человеческий текст, перечисляет голоса каталога, а не имя файла или имя поля', () => {
+    expect(() => validateSettingsPatch({ narratorVoice: 'nova' })).toThrow('Голос финала — один из голосов SpeechKit: alena, jane, omazh, marina, zahar, filipp, ermil, madirus');
     expect(() => validateSettingsPatch({ narratorVoice: 'nova' })).not.toThrow(/voices\.ts/);
+    expect(() => validateSettingsPatch({ narratorVoice: 'nova' })).not.toThrow(/narratorVoice/);
   });
 
   it.each([
@@ -74,7 +75,7 @@ describe('validateSettingsPatch', () => {
     [{ tgChannelChatId: '@linkeontest' }, /tgChannelChatId/],
     [{ platforms: ['vk'] }, /VK/],
     [{ platforms: [] }, /platforms/],
-    [{ narratorVoice: 'nova' }, /narratorVoice/],
+    [{ narratorVoice: 'nova' }, /Голос финала/],
     [{ format: 'cartoon' }, /format/],
     [{ maxOmniSeconds: 4 }, /maxOmniSeconds/],
     [{ maxOmniSeconds: 48.5 }, /maxOmniSeconds/],

@@ -3,11 +3,12 @@ jest.mock('./short-slot-claim', () => ({
   approveShortIntoSlot: jest.fn(),
 }));
 
-import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Logger, NotFoundException } from '@nestjs/common';
 import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { AdminGuard } from '../common/guards/admin.guard';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { NoFreeSlotError } from '../blog/blog-slots';
+import { VERSION_SQL } from './short-review';
 import { SHORT_SLOT_INDEX, approveShortIntoSlot } from './short-slot-claim';
 import { ShortOrderError } from './shorts-topic.service';
 import { ShortsController } from './shorts.controller';
@@ -92,7 +93,7 @@ describe('POST admin/shorts', () => {
     );
     const r = res();
     await ctl.action({ action: 'list' }, r);
-    expect(String(pg.query.mock.calls[0][0])).toContain('updated_at::text AS version');
+    expect(String(pg.query.mock.calls[0][0])).toContain(VERSION_SQL);
     expect(r.body[0].version).toBe(VERSION);
     for (const heavy of ['capture', 'script', 'animation', 'captions']) expect(r.body[0]).not.toHaveProperty(heavy);
     expect(r.body[0]).toMatchObject({ id: ID, status: 'pending_review', publications: [] });
@@ -128,7 +129,7 @@ describe('POST admin/shorts', () => {
     expect(r.body.videoUrl).toBe(`https://minio.test/linkeon-smm-videos/shorts/v/video.mp4?v=${encodeURIComponent(VERSION)}`);
     expect(r.body.coverUrl).toBe(`https://minio.test/linkeon-smm-videos/shorts/v/cover.jpg?v=${encodeURIComponent(VERSION)}`);
     // Версию даёт сам SELECT get: без алиаса заглушка молчала бы, а на стенде каждое решение получало бы 400.
-    expect(String(pg.query.mock.calls[0][0])).toContain('updated_at::text AS version');
+    expect(String(pg.query.mock.calls[0][0])).toContain(VERSION_SQL);
     // Закодированная метка — литералом: пробел, двоеточия и «+» не должны пройти сырыми.
     expect(r.body.videoUrl).toBe('https://minio.test/linkeon-smm-videos/shorts/v/video.mp4?v=2026-10-30%2012%3A34%3A56.123456%2B00');
   });
@@ -257,6 +258,14 @@ describe('POST admin/shorts', () => {
     expect(retryWrite(client)[1]).toEqual([ID, 'writing', 'rendering', null, 'chat']);
   });
 
+  it('retry { from, note } — 5000 ведущих пробелов перед текстом не превращают замечание в пустое (trim до среза, как у note)', async () => {
+    const failed = video({ failed_from: 'writing' });
+    const { ctl, client } = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'directing', failed_from: null })] } : { rows: [failed] }));
+    const note = `${' '.repeat(5000)}важное замечание`;
+    await ctl.action({ action: 'retry', id: ID, from: 'directing', note }, res());
+    expect(retryWrite(client)[1][3]).toBe('важное замечание');
+  });
+
   it('retry { from } у упавшей публикации — 409: её повторяют только своим путём', async () => {
     const pub = video({ failed_from: 'publishing', approved_at: '2026-10-25T00:00:00Z', capture: { paragraphs: [] } });
     for (const from of ['directing', 'writing']) {
@@ -317,12 +326,16 @@ describe('POST admin/shorts', () => {
     const r = res();
     await ctl.action({ action: 'mark_published', id: ID, url: 'https://t.me/ainomira/777' }, r);
 
-    const upsert = client.query.mock.calls.find((c: any[]) => String(c[0]).includes('INSERT INTO short_publication')) as any[];
-    expect(upsert[1]).toEqual([ID, 'https://t.me/ainomira/777', '777']);
+    // UPDATE, не INSERT: строку телеграма создаёт только publish() (до отправки) — markPublished
+    // не должен завести площадку, которой на самом деле не отправляли (платформы — только youtube).
+    const upd = client.query.mock.calls.find((c: any[]) => String(c[0]).includes("UPDATE short_publication SET status = 'published'")) as any[];
+    expect(String(upd[0])).toContain("WHERE short_id = $1 AND platform = 'telegram' AND status <> 'published'");
+    expect(upd[1]).toEqual([ID, 'https://t.me/ainomira/777', '777']);
+    expect(client.query.mock.calls.some((c: any[]) => String(c[0]).includes('INSERT INTO short_publication'))).toBe(false);
 
-    const upd = client.query.mock.calls.find((c: any[]) => String(c[0]).includes("SET status = 'approved'")) as any[];
-    expect(String(upd[0])).toContain("WHERE id = $1 AND status = 'failed' AND failed_from = 'publishing'");
-    expect(upd[1]).toEqual([ID]);
+    const updVideo = client.query.mock.calls.find((c: any[]) => String(c[0]).includes("SET status = 'approved'")) as any[];
+    expect(String(updVideo[0])).toContain("WHERE id = $1 AND status = 'failed' AND failed_from = 'publishing'");
+    expect(updVideo[1]).toEqual([ID]);
 
     expect(r.body.videoUrl).toBe('https://minio.test/linkeon-smm-videos/shorts/v/video.mp4');
   });
@@ -341,16 +354,16 @@ describe('POST admin/shorts', () => {
     const v = video({ failed_from: 'publishing', approved_at: '2026-10-20T00:00:00Z' });
     const { ctl, client } = setup((sql) => (sql.includes('FROM short_video') && !sql.includes('UPDATE') ? { rows: [v] } : { rows: [], rowCount: 1 }));
     await ctl.action({ action: 'mark_published', id: ID, url: 'https://t.me/c/1234567890/42' }, res());
-    const upsert = client.query.mock.calls.find((c: any[]) => String(c[0]).includes('INSERT INTO short_publication')) as any[];
-    expect(upsert[1]).toEqual([ID, 'https://t.me/c/1234567890/42', '42']);
+    const upd = client.query.mock.calls.find((c: any[]) => String(c[0]).includes("UPDATE short_publication SET status = 'published'")) as any[];
+    expect(upd[1]).toEqual([ID, 'https://t.me/c/1234567890/42', '42']);
   });
 
   it('mark_published — ссылка с пробелами и переносом вокруг — сохраняется обрезанной', async () => {
     const v = video({ failed_from: 'publishing', approved_at: '2026-10-20T00:00:00Z' });
     const { ctl, client } = setup((sql) => (sql.includes('FROM short_video') && !sql.includes('UPDATE') ? { rows: [v] } : { rows: [], rowCount: 1 }));
     await ctl.action({ action: 'mark_published', id: ID, url: '  https://t.me/ainomira/777 \n' }, res());
-    const upsert = client.query.mock.calls.find((c: any[]) => String(c[0]).includes('INSERT INTO short_publication')) as any[];
-    expect(upsert[1]).toEqual([ID, 'https://t.me/ainomira/777', '777']);
+    const upd = client.query.mock.calls.find((c: any[]) => String(c[0]).includes("UPDATE short_publication SET status = 'published'")) as any[];
+    expect(upd[1]).toEqual([ID, 'https://t.me/ainomira/777', '777']);
   });
 
   it('mark_published — ссылка не похожа на пост Telegram — 400', async () => {
@@ -392,12 +405,36 @@ describe('POST admin/shorts', () => {
   it('mark_published — пост уже отмечен вышедшим (упал YouTube после поста) — 409, ссылка не перезаписывается', async () => {
     const failedPub = video({ failed_from: 'publishing', approved_at: '2026-10-25T00:00:00Z' });
     const { ctl, client } = setup((sql) => {
-      if (sql.includes('INSERT INTO short_publication')) return { rows: [], rowCount: 0 };
+      if (sql.includes("UPDATE short_publication SET status = 'published'")) return { rows: [], rowCount: 0 };
+      if (sql.includes('SELECT 1 FROM short_publication')) return { rows: [{ x: 1 }], rowCount: 1 };
       return { rows: [failedPub], rowCount: 1 };
     });
     await expect(ctl.action({ action: 'mark_published', id: ID, url: 'https://t.me/ainomira/91' }, res()))
       .rejects.toThrow('Пост уже отмечен вышедшим — «Пост вышел» не нужен, нажмите «Повторить»');
     expect(client.query.mock.calls.some((c: any[]) => String(c[0]).includes("SET status = 'approved'"))).toBe(false);
+  });
+
+  it('mark_published — ролик никогда не отправлялся в Telegram (платформы — только youtube) — 409, строка не создаётся', async () => {
+    const v = video({ failed_from: 'publishing', approved_at: '2026-10-20T00:00:00Z' });
+    const { ctl, client } = setup((sql) => {
+      if (sql.includes("UPDATE short_publication SET status = 'published'")) return { rows: [], rowCount: 0 };
+      if (sql.includes('SELECT 1 FROM short_publication')) return { rows: [], rowCount: 0 };
+      return { rows: [v], rowCount: 1 };
+    });
+    await expect(ctl.action({ action: 'mark_published', id: ID, url: 'https://t.me/ainomira/777' }, res()))
+      .rejects.toThrow('В канал этот ролик не отправлялся — «Пост вышел» не нужен, нажмите «Повторить»');
+    expect(client.query.mock.calls.some((c: any[]) => String(c[0]).includes('INSERT INTO short_publication'))).toBe(false);
+    expect(client.query.mock.calls.some((c: any[]) => String(c[0]).includes("SET status = 'approved'"))).toBe(false);
+  });
+
+  it('mark_published — решение логируется без ссылки на пост', async () => {
+    const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    const v = video({ failed_from: 'publishing', approved_at: '2026-10-20T00:00:00Z' });
+    const { ctl } = setup((sql) => (sql.includes('FROM short_video') && !sql.includes('UPDATE') ? { rows: [v] } : { rows: [], rowCount: 1 }));
+    await ctl.action({ action: 'mark_published', id: ID, url: 'https://t.me/ainomira/777' }, res());
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining(`admin/shorts mark_published ${ID}: approved`));
+    expect(logSpy.mock.calls.flat().join(' ')).not.toContain('t.me/ainomira/777');
+    logSpy.mockRestore();
   });
 
   it('настройки: чтение, правка с проверкой', async () => {
@@ -459,6 +496,19 @@ describe('POST admin/shorts — решение по готовому ролик�
       pg, ID, new Date('2030-01-03T15:00:00.000Z'), expect.objectContaining({ slotDays: [2, 4, 6] }), undefined, VERSION,
     );
     expect(r.body.status).toBe('approved');
+  });
+
+  it('approve — решение логируется одной строкой: id и итоговый статус', async () => {
+    const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    (approveShortIntoSlot as jest.Mock).mockResolvedValue({
+      slot: new Date('2030-01-03T15:00:00.000Z'), now: new Date('2030-01-01T00:00:00.000Z'),
+    });
+    let loads = 0;
+    const { ctl } = setup((sql) =>
+      sql.includes('FROM short_video') ? { rows: [review(loads++ ? { status: 'approved' } : {})] } : { rows: [] });
+    await ctl.action({ action: 'approve', id: ID, version: VERSION }, res());
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining(`admin/shorts approve ${ID}: approved`));
+    logSpy.mockRestore();
   });
 
   it('approve — без версии или с кривой — 400, запись не зовётся', async () => {
@@ -561,6 +611,16 @@ describe('POST admin/shorts — решение по готовому ролик�
     await ctl.action({ action: 'note', id: ID, version: VERSION, text }, res());
     const [, params] = pg.query.mock.calls.find((c: any[]) => String(c[0]).startsWith('UPDATE')) as any[];
     expect(params[1]).toContain('важное замечание');
+  });
+
+  it('note — решение логируется без текста замечания', async () => {
+    const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    const { ctl } = setup((sql) =>
+      sql.startsWith('UPDATE') ? { rows: [review({ status: 'writing' })] } : { rows: [review()] });
+    await ctl.action({ action: 'note', id: ID, version: VERSION, text: 'секретный текст замечания' }, res());
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining(`admin/shorts note ${ID}: writing`));
+    expect(logSpy.mock.calls.flat().join(' ')).not.toContain('секретный текст замечания');
+    logSpy.mockRestore();
   });
 
   it('reject упавшего с версией — версия в условии записи; разошлась — version_conflict', async () => {

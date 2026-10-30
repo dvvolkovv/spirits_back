@@ -97,7 +97,7 @@ describe('ShortsTopicService.addManual', () => {
   it('здоровье + провокационная подача — отказ сразу, ассистент базы не трогается', async () => {
     const { svc, query } = insertOnly();
     const order = { topic: 'нормальная тема ролика про бессонницу', assistantId: 7, angle: 'roast' as const };
-    await expect(svc.addManual(order)).rejects.toThrow('«Полина» — тема здоровья: только спокойная подача (calm)');
+    await expect(svc.addManual(order)).rejects.toThrow('«Полина» — тема здоровья: только подача «Как это работает»');
     await expect(svc.addManual(order)).rejects.toBeInstanceOf(ShortOrderError);
     expect(query.mock.calls.some(([sql]: [string]) => sql.startsWith('INSERT'))).toBe(false);
   });
