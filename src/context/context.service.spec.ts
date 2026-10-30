@@ -59,11 +59,15 @@ describe('ContextService', () => {
   it('время берётся из пояса клиента, мусорный пояс не роняет', async () => {
     const svc = new ContextService(pgEmpty());
 
-    const good = await (svc as any).sectionNow('Europe/Lisbon');
-    expect(good).toContain('Europe/Lisbon');
+    const good = await svc.build('u1', 'voice-launcher', { clientTz: 'Europe/Lisbon' });
+    expect(good.text).toContain('Europe/Lisbon');
 
-    const bad = await (svc as any).sectionNow('; DROP TABLE');
-    expect(bad).toContain('Asia/Yekaterinburg');
+    // ⚠️ Имя пояса в промпте должно совпадать с тем, по которому посчитано
+    // время. Пока подмена происходила внутри форматирования, промпт называл
+    // отвергнутый пояс и выдавал под ним чужие часы.
+    const bad = await svc.build('u1', 'voice-launcher', { clientTz: '; DROP TABLE' });
+    expect(bad.text).toContain('Asia/Yekaterinburg');
+    expect(bad.text).not.toContain('DROP TABLE');
   });
 
   it('день собирается из состояния лаунчера и несёт отметку снимка', async () => {
@@ -77,7 +81,7 @@ describe('ContextService', () => {
     } as any;
     const svc = new ContextService(pgEmpty(), trip);
 
-    const text = await (svc as any).sectionToday('u1');
+    const text = await (svc as any).sectionToday('u1', 'Asia/Yekaterinburg');
 
     expect(text).toContain('14:00 — Разбор макетов');
     expect(text).toContain('дело: Оплатить интернет');
@@ -226,5 +230,93 @@ describe('ContextService: подхват недавнего разговора',
 
     expect(out.text.indexOf('последний раз')).toBeLessThan(out.text.indexOf('СТАРАЯ-ПЕРЕПИСКА'));
     expect(out.sections.find((s) => s.name === 'continuation')!.dropped).toBe(false);
+  });
+});
+
+/**
+ * ⚠️ Звонок владельца 29.10.2026: «по расписанию завтра утром у тебя йога в
+ * 3:30, дальше с 6 утра уже рабочие дела».
+ *
+ * Йога стояла на 8:30, рабочие дела — с 11:00. Роман назвал UTC: секция дня
+ * брала отметку события как строку и вырезала из неё знаки 11–16, то есть
+ * часы и минуты ИЗ ISO, а ISO приходит из календаря в UTC
+ * (`new Date(...).toISOString()` в calendar.ts и talerid-calendar.connector.ts).
+ * На экране лаунчера то же событие рисуется через Intl и показывает 8:30 —
+ * расходились не данные, а только то, что видел ассистент.
+ *
+ * Старый тест этого не ловил: в нём отметка была со смещением (+05:00), и
+ * вырезанные знаки случайно совпадали с местным временем.
+ */
+describe('ContextService: день — часами собеседника, а не сервера', () => {
+  const tripWith = (events: any[]) => ({
+    getState: jest.fn().mockResolvedValue({ headline: '', contextLines: [], events, tasks: [] }),
+  }) as any;
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    // 29.10.2026, 22:33 в Екатеринбурге — время того самого звонка.
+    jest.setSystemTime(new Date('2026-10-29T17:33:00.000Z'));
+  });
+  afterEach(() => jest.useRealTimers());
+
+  it('⚠️ ГЛАВНОЕ: отметка в UTC печатается местным временем', async () => {
+    const svc = new ContextService(
+      pgEmpty(),
+      tripWith([{ at: '2026-10-29T03:30:00.000Z', title: 'Йога', conflict: false }]),
+    );
+
+    const text = await (svc as any).sectionToday('u1', 'Asia/Yekaterinburg');
+
+    expect(text).toContain('08:30 — Йога');
+    expect(text).not.toContain('03:30');
+  });
+
+  it('пояс собеседника применяется и ко дню, а не только к «сейчас»', async () => {
+    const svc = new ContextService(
+      pgEmpty(),
+      tripWith([{ at: '2026-10-29T03:30:00.000Z', title: 'Йога', conflict: false }]),
+    );
+
+    const text = await (svc as any).sectionToday('u1', 'Europe/Moscow');
+
+    expect(text).toContain('06:30 — Йога');
+  });
+
+  it('завтрашнее событие помечается днём: горизонт «сегодня» = сегодня + завтра', async () => {
+    const svc = new ContextService(
+      pgEmpty(),
+      tripWith([
+        { at: '2026-10-29T13:00:00.000Z', title: 'Созвон', conflict: false },
+        { at: '2026-10-30T03:30:00.000Z', title: 'Йога', conflict: false },
+      ]),
+    );
+
+    const text = await (svc as any).sectionToday('u1', 'Asia/Yekaterinburg');
+
+    expect(text).toContain('18:00 — Созвон');
+    expect(text).toContain('завтра 08:30 — Йога');
+  });
+
+  it('сборка целиком отдаёт секциям ОДИН пояс: «сейчас» и день не расходятся', async () => {
+    const svc = new ContextService(
+      pgEmpty(),
+      tripWith([{ at: '2026-10-29T03:30:00.000Z', title: 'Йога', conflict: false }]),
+    );
+
+    const out = await svc.build('u1', 'voice-launcher', { clientTz: 'Europe/Moscow' });
+
+    expect(out.text).toContain('Europe/Moscow');
+    expect(out.text).toContain('06:30 — Йога');
+  });
+
+  it('мусорный пояс не роняет день — падает обратно на пояс по умолчанию', async () => {
+    const svc = new ContextService(
+      pgEmpty(),
+      tripWith([{ at: '2026-10-29T03:30:00.000Z', title: 'Йога', conflict: false }]),
+    );
+
+    const out = await svc.build('u1', 'voice-launcher', { clientTz: 'Atlantis/Nowhere' });
+
+    expect(out.text).toContain('08:30 — Йога');
   });
 });

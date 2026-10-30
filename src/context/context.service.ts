@@ -45,6 +45,11 @@ export class ContextService {
     const names = (Object.keys(specs) as SectionName[])
       .sort((a, b) => specs[b]!.rank - specs[a]!.rank);
 
+    // Пояс резолвится ОДИН раз на сборку и уходит во все секции сразу. Пока
+    // каждая секция решала это сама, «Сейчас» шло по поясу клиента, а день —
+    // по UTC, и один контекст нёс два разных времени.
+    const tz = ContextService.safeTz(opts.clientTz);
+
     const rendered: { name: SectionName; text: string }[] = [];
     for (const name of names) {
       let text = '';
@@ -53,7 +58,7 @@ export class ContextService {
         // режет текст с конца, и секции, у которых ценен именно конец
         // (переписка, хвост разговора), теряли самое свежее. Разбор
         // ниже, в sectionHistory.
-        text = (await this.renderSection(name, userId, opts, specs[name]!.budget)) || '';
+        text = (await this.renderSection(name, userId, { ...opts, tz }, specs[name]!.budget)) || '';
       } catch (e: any) {
         this.logger.warn(`секция ${name} для ${userId} не собралась: ${e?.message}`);
         text = '';
@@ -99,9 +104,10 @@ export class ContextService {
    */
   async scheduleText(userId: string, clientTz?: string): Promise<string> {
     const parts: string[] = [];
+    const tz = ContextService.safeTz(clientTz);
     for (const name of ['now', 'today'] as SectionName[]) {
       try {
-        const t = (await this.renderSection(name, userId, { clientTz })) || '';
+        const t = (await this.renderSection(name, userId, { tz })) || '';
         if (t.trim()) parts.push(t.trim());
       } catch (e: any) {
         this.logger.warn(`секция ${name} для ${userId} не собралась: ${e?.message}`);
@@ -113,12 +119,13 @@ export class ContextService {
   private renderSection(
     name: SectionName,
     userId: string,
-    opts: { clientTz?: string; device?: string; agentId?: number },
+    opts: { tz?: string; device?: string; agentId?: number },
     budget = TOTAL_BUDGET,
   ): Promise<string> {
+    const tz = opts.tz || FALLBACK_TZ;
     switch (name) {
-      case 'now':           return this.sectionNow(opts.clientTz);
-      case 'today':         return this.sectionToday(userId);
+      case 'now':           return this.sectionNow(tz);
+      case 'today':         return this.sectionToday(userId, tz);
       case 'identity':      return this.sectionIdentity(userId);
       case 'continuation':  return this.sectionContinuation(userId, budget);
       case 'cloud_profile': return this.sectionCloudProfile(userId);
@@ -137,19 +144,10 @@ export class ContextService {
    * сервера. В текстовом чате такой блок есть с 11.08.2026 — там разница в пять
    * часов однажды разбиралась с пользовательницей вручную посреди разговора.
    */
-  private async sectionNow(clientTz?: string): Promise<string> {
-    const tz = clientTz && /^[A-Za-z]+\/[A-Za-z0-9_+\-/]+$/.test(clientTz) ? clientTz : FALLBACK_TZ;
-    let local: string;
-    try {
-      local = new Intl.DateTimeFormat('ru-RU', {
-        timeZone: tz, dateStyle: 'full', timeStyle: 'short',
-      }).format(new Date());
-    } catch {
-      // Незнакомый Intl-пояс — не повод ронять сборку.
-      local = new Intl.DateTimeFormat('ru-RU', {
-        timeZone: FALLBACK_TZ, dateStyle: 'full', timeStyle: 'short',
-      }).format(new Date());
-    }
+  private async sectionNow(tz: string): Promise<string> {
+    const local = new Intl.DateTimeFormat('ru-RU', {
+      timeZone: tz, dateStyle: 'full', timeStyle: 'short',
+    }).format(new Date());
     return `--- Сейчас ---\nУ пользователя ${local} (пояс ${tz}).\n` +
       'Считай «сегодня», «завтра» и сроки от ЭТОГО времени, а не от своего системного.';
   }
@@ -161,16 +159,15 @@ export class ContextService {
    * честно сказать, на какой момент у него данные, а не спорить с человеком,
    * который смотрит на свой телефон (спека §4.4).
    */
-  private async sectionToday(userId: string): Promise<string> {
+  private async sectionToday(userId: string, tz: string): Promise<string> {
     if (!this.trip) return '';
     const st = await this.trip.getState(userId);
     const lines: string[] = [];
+    const now = new Date();
 
     for (const e of (st.events || []).slice(0, 8)) {
-      const at = String(e.at || '');
-      const time = at.length >= 16 ? at.slice(11, 16) : at;
       const where = e.location ? ` (${e.location})` : '';
-      lines.push(`${time} — ${e.title}${where}`);
+      lines.push(`${ContextService.whenText(String(e.at || ''), tz, now)} — ${e.title}${where}`);
     }
 
     const open = (st.tasks || []).filter((t) => t.status === 'pending');
@@ -180,11 +177,63 @@ export class ContextService {
 
     if (!lines.length) return '';
 
-    const stamp = new Intl.DateTimeFormat('ru-RU', {
-      timeZone: FALLBACK_TZ, timeStyle: 'short',
-    }).format(new Date());
-    return `--- День пользователя (данные на ${stamp}) ---\n${lines.join('\n')}\n` +
+    const stamp = new Intl.DateTimeFormat('ru-RU', { timeZone: tz, timeStyle: 'short' }).format(now);
+    return `--- День пользователя (данные на ${stamp}, время местное) ---\n${lines.join('\n')}\n` +
       'Если человек говорит, что на экране иначе, — верь ему: у него свежее.';
+  }
+
+  /**
+   * Пояс собеседника — один на всю сборку.
+   *
+   * Проверяется не формой строки, а попыткой отформатировать: `Atlantis/Nowhere`
+   * форму проходит, а Intl на нём кидает. Раньше проверка была по форме, а
+   * падение ловилось ниже и подменяло время молча — в промпт уходило местное
+   * время Екатеринбурга под именем чужого пояса.
+   */
+  private static safeTz(clientTz?: string): string {
+    if (!clientTz || !/^[A-Za-z]+\/[A-Za-z0-9_+\-/]+$/.test(clientTz)) return FALLBACK_TZ;
+    try {
+      new Intl.DateTimeFormat('ru-RU', { timeZone: clientTz }).format(new Date());
+      return clientTz;
+    } catch {
+      return FALLBACK_TZ;
+    }
+  }
+
+  /**
+   * Когда событие — часами собеседника, и с днём, если это не сегодня.
+   *
+   * ⚠️ Отметка приходит из календаря в UTC (`toISOString()`), и до 30.10.2026
+   * из неё просто вырезались знаки 11–16. Для 8:30 по Екатеринбургу это «03:30»
+   * — ровно так Роман и сказал владельцу 29.10.2026: «завтра утром у тебя йога
+   * в 3:30, дальше с 6 утра уже рабочие дела». На экране лаунчера то же
+   * событие рисуется через Intl и показывает верное время: расходились не
+   * данные, а только то, что видел ассистент.
+   *
+   * День обязателен: горизонт «твоего сегодня» — сегодня И ЗАВТРА целиком
+   * (trip.service.ts), поэтому голое «08:30» в списке читается как сегодняшнее
+   * даже тогда, когда событие завтрашнее.
+   *
+   * Отметка без пояса (ни Z, ни смещения) печатается как есть: сдвигать её
+   * некуда — такую строку слой дня трактует как местную.
+   */
+  private static whenText(at: string, tz: string, now: Date): string {
+    if (!/[Zz]$|[+\-]\d{2}:?\d{2}$/.test(at)) return at.length >= 16 ? at.slice(11, 16) : at;
+    const when = new Date(at);
+    if (!Number.isFinite(when.getTime())) return at;
+
+    const day = (d: Date) => new Intl.DateTimeFormat('sv-SE', { timeZone: tz }).format(d);
+    const time = new Intl.DateTimeFormat('ru-RU', {
+      timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false,
+    }).format(when);
+
+    const on = day(when);
+    if (on === day(now)) return time;
+    if (on === day(new Date(now.getTime() + 86_400_000))) return `завтра ${time}`;
+    const date = new Intl.DateTimeFormat('ru-RU', {
+      timeZone: tz, day: '2-digit', month: '2-digit',
+    }).format(when);
+    return `${date} ${time}`;
   }
 
   private async sectionIdentity(userId: string): Promise<string> {
