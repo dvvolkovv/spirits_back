@@ -3,12 +3,14 @@ import * as path from 'path';
 import { Pool } from 'pg';
 import { decryptSecret, encryptSecret } from '../calendar/crypto';
 import { claimStage, stageFailed } from './short-jobs';
+import { leaveReview, noteForReview } from './short-review';
 import { approveShortIntoSlot } from './short-slot-claim';
 import { ShortsApprovalService } from './shorts-approval.service';
 import { POST_MAY_BE_OUT, ShortsPublisherService } from './shorts-publisher.service';
 import { ShortsSettingsService } from './shorts-settings.service';
 import { ShortsTopicService } from './shorts-topic.service';
 import { ShortsYoutubeService } from './shorts-youtube.service';
+import { BAD_TIMESTAMP_CODES, ShortsController, VERSION_RE } from './shorts.controller';
 import { rowToShort } from './shorts.types';
 import { YoutubeAttemptSuperseded, YoutubeNotUploaded } from './youtube/youtube-errors';
 
@@ -278,6 +280,90 @@ maybe('ролики против живого Postgres', () => {
     // Открытые идеи — у разных ассистентов.
     const open = rows.filter((r) => r.status === 'idea').map((r) => r.assistant_id);
     expect(new Set(open).size).toBe(7);
+  });
+
+  describe('решения из админки — версия и «вышел» на живом SQL', () => {
+    const VERSION = '2030-01-01 10:00:00.123456+00';
+    const daily = { slotDays: [1, 2, 3, 4, 5, 6, 7], slotHourMsk: 18 };
+
+    it('версия строкой из базы сверяется с микросекундами; округлённая до миллисекунд — нет', async () => {
+      const v = await insert({ status: 'pending_review', updated_at: VERSION });
+      const version = (await pool.query(`SELECT updated_at::text AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
+      // Через Date JS: …10:00:00.123Z — микросекунды потеряны.
+      const rounded = v.updatedAt.toISOString();
+      expect(await approveShortIntoSlot(pgLike() as any, v.id, null, daily, undefined, rounded)).toBeNull();
+      expect(await approveShortIntoSlot(pgLike() as any, v.id, null, daily, undefined, version)).not.toBeNull();
+      const row = (await pool.query(`SELECT status, approved_at FROM short_video WHERE id = $1`, [v.id])).rows[0];
+      expect(row.status).toBe('approved');
+      expect(row.approved_at).not.toBeNull();
+    });
+
+    it('вышедший ролик не переснять и не отклонить — даже с верной версией', async () => {
+      const v = await insert({
+        status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() + 86_400_000), updated_at: VERSION,
+      });
+      await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'telegram', 'published')`, [v.id]);
+      for (const target of ['directing', 'rejected'] as const) {
+        expect(await leaveReview(pgLike() as any, v.id, target, VERSION)).toEqual({ ok: false, reason: 'released', status: 'approved' });
+      }
+      expect((await pool.query(`SELECT status FROM short_video WHERE id = $1`, [v.id])).rows[0].status).toBe('approved');
+    });
+
+    it('одобрение из админки и кнопка лички одновременно — ролик одобрен один раз', async () => {
+      const v = await insert({ status: 'pending_review', updated_at: VERSION });
+      const [a, b] = await Promise.all([
+        approveShortIntoSlot(pgLike() as any, v.id, null, daily, undefined, VERSION),
+        approveShortIntoSlot(pgLike() as any, v.id, null, daily),
+      ]);
+      expect([a, b].filter(Boolean)).toHaveLength(1);
+      expect((await pool.query(`SELECT status FROM short_video WHERE id = $1`, [v.id])).rows[0].status).toBe('approved');
+    });
+
+    it('замечание с устаревшей версией не пишется; с верной — дописано к прежним, ролик у сценариста', async () => {
+      const v = await insert({ status: 'pending_review', owner_note: 'короче', updated_at: VERSION });
+      expect(await noteForReview(pgLike() as any, v, 'без цифр', '2030-01-01 10:00:00.123+00'))
+        .toEqual({ ok: false, reason: 'stale', status: 'pending_review' });
+      expect(await noteForReview(pgLike() as any, v, 'без цифр', VERSION))
+        .toMatchObject({ ok: true, short: { status: 'writing', ownerNote: 'короче\nбез цифр', writerRounds: 0 } });
+    });
+
+    it('одобрение обнуляет счётчик, аренду и ошибку отправки в личку — публикатору достаётся полный бюджет', async () => {
+      const v = await insert({
+        status: 'pending_review', updated_at: VERSION, attempts: 2,
+        lease_until: new Date(Date.now() + 600_000), last_error: 'отправка владельцу: Bad Gateway',
+      });
+      expect(await approveShortIntoSlot(pgLike() as any, v.id, null, daily, undefined, VERSION)).not.toBeNull();
+      const row = (await pool.query(`SELECT status, attempts, lease_until, last_error FROM short_video WHERE id = $1`, [v.id])).rows[0];
+      expect(row).toMatchObject({ status: 'approved', attempts: 0, lease_until: null, last_error: null });
+    });
+
+    it('версия из базы подходит под VERSION_RE; невозможные даты правильной формы Postgres отвергает кодами из BAD_TIMESTAMP_CODES', async () => {
+      const v = await insert({ status: 'pending_review' });
+      const version = (await pool.query(`SELECT updated_at::text AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
+      expect(VERSION_RE.test(version)).toBe(true);
+      for (const bad of ['2026-13-45 12:34:56+00', '2026-02-30 12:34:56+00', '2026-10-30 12:34:56+99']) {
+        // Форма верна — регулярка пропустит, и решать будет база.
+        expect(VERSION_RE.test(bad)).toBe(true);
+        const err: any = await pool.query('SELECT $1::timestamptz', [bad]).catch((e) => e);
+        expect(BAD_TIMESTAMP_CODES).toContain(err.code);
+      }
+    });
+
+    it('«Пост вышел» не перезаписывает уже вышедший пост: ссылка и ролик не меняются (живой SQL ON CONFLICT … WHERE)', async () => {
+      const v = await insert({ status: 'failed', failed_from: 'publishing', approved_at: new Date() });
+      await pool.query(
+        `INSERT INTO short_publication (short_id, platform, status, url, external_id)
+              VALUES ($1, 'telegram', 'published', 'https://t.me/ainomira/90', '90')`,
+        [v.id],
+      );
+      const ctl = new ShortsController(pgLike() as any, {} as any, {} as any, { publicUrl: () => 'x' } as any);
+      const res: any = { status: () => res, json: (b: any) => ((res.body = b), res) };
+      await expect(ctl.action({ action: 'mark_published', id: v.id, url: 'https://t.me/ainomira/91' }, res))
+        .rejects.toThrow('Пост уже отмечен вышедшим');
+      const pub = (await pool.query(`SELECT url, external_id FROM short_publication WHERE short_id = $1 AND platform = 'telegram'`, [v.id])).rows[0];
+      expect(pub).toEqual({ url: 'https://t.me/ainomira/90', external_id: '90' });
+      expect((await pool.query(`SELECT status FROM short_video WHERE id = $1`, [v.id])).rows[0].status).toBe('failed');
+    });
   });
 
   describe('YouTube против живой базы', () => {
