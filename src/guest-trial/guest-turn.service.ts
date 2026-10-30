@@ -204,43 +204,68 @@ export class GuestTurnService {
     this.write(res, { type: 'begin' });
     const ping = setInterval(() => this.write(res, { type: 'ping' }), PING_MS);
     try {
-      const history = session.answers > 0 ? await this.sessions.messages(session.id) : [];
-      const system = buildGuestSystemPrompt({
-        name: agent.name,
-        description: agent.description,
-        persona: agent.persona,
-        lang: input.lang,
-        tz: input.tz,
-      });
-      let text = '';
-      let costUsd = 0;
       try {
-        const r = await this.claudeCli.textWithCost(buildGuestPrompt(history, message), {
-          system,
-          model: CHAT_MODEL,
-          // Запасной Qwen гостям не положен: его квота — для платящих.
-          noFallback: true,
-          timeoutMs: GUEST_TURN_TIMEOUT_MS,
-          onTextDelta: (t) => this.write(res, { type: 'item', content: t }),
+        const history = session.answers > 0 ? await this.sessions.messages(session.id) : [];
+        const system = buildGuestSystemPrompt({
+          name: agent.name,
+          description: agent.description,
+          persona: agent.persona,
+          lang: input.lang,
+          tz: input.tz,
         });
-        text = (r.text || '').trim();
-        costUsd = r.costUsd || 0;
+        let text = '';
+        let costUsd = 0;
+        let hadChunks = false;
+        try {
+          const r = await this.claudeCli.textWithCost(buildGuestPrompt(history, message), {
+            system,
+            model: CHAT_MODEL,
+            // Запасной Qwen гостям не положен: его квота — для платящих.
+            noFallback: true,
+            timeoutMs: GUEST_TURN_TIMEOUT_MS,
+            onTextDelta: (t) => { hadChunks = true; this.write(res, { type: 'item', content: t }); },
+          });
+          text = (r.text || '').trim();
+          costUsd = r.costUsd || 0;
+        } catch (e: any) {
+          this.log.warn(`guest turn failed (assistant ${agent.id}): ${String(e?.message ?? e).slice(0, 200)}`);
+        }
+        // Отказ CLI («лимит», «не вошёл») приходит обычным текстом — это не
+        // ответ ассистента. Но если куски уже шли (onTextDelta) — слова
+        // модели человек уже увидел, и финальный текст — её настоящий ответ,
+        // даже если он похож на фразу отказа по форме (бывает у персон с
+        // ролевым текстом). Проверку отказа применяем только когда кусков не было.
+        if (!text || (!hadChunks && looksLikeCliRefusal(text))) {
+          this.write(res, { type: 'error', code: 'model' });
+          this.events?.track('guest_trial_error', { props: { reason: 'model', assistant_id: String(agent.id) } });
+          return;
+        }
+        const answers = await this.sessions.recordExchange(session.id, message, text, humanAt, costUsd);
+        if (answers === null) {
+          // Перенесена в аккаунт посреди этого самого хода (другая
+          // вкладка/устройство успела войти) — пара не записана в базе
+          // (guest-sessions.service: recordExchange), answers не растёт.
+          this.log.warn(`guest turn: проба перенесена во время хода (${session.id})`);
+          this.write(res, { type: 'error', code: 'model' });
+          this.events?.track('guest_trial_error', { props: { reason: 'claimed', assistant_id: String(agent.id) } });
+          return;
+        }
+        this.write(res, { type: 'end', content: text });
+        this.events?.track('guest_trial_answer', {
+          sessionId: input.sid,
+          source: input.source,
+          props: { n: answers, trial: session.id, assistant_id: String(agent.id), lang: input.lang, cost_usd: Number(costUsd.toFixed(4)), preview: input.preview },
+        });
+        if (answers >= answersPerTrial) this.write(res, { type: 'wall', reason: 'limit' });
       } catch (e: any) {
-        this.log.warn(`guest turn failed (assistant ${agent.id}): ${String(e?.message ?? e).slice(0, 200)}`);
-      }
-      // Отказ CLI («лимит», «не вошёл») приходит обычным текстом — это не ответ ассистента.
-      if (!text || looksLikeCliRefusal(text)) {
+        // Сбой уже ПОСЛЕ begin (messages()/recordExchange() и т.п. — поток уже
+        // открыт, человек его ждёт): ответ гостю — такая же ошибка в потоке,
+        // а не необработанное исключение наружу из handle() (поток к этому
+        // моменту уже начат — молчаливо оборванное соединение хуже явного error).
+        this.log.warn(`guest turn: сбой после начала ответа (проба ${session.id}): ${String(e?.message ?? e).slice(0, 200)}`);
         this.write(res, { type: 'error', code: 'model' });
-        return;
+        this.events?.track('guest_trial_error', { props: { reason: 'model', assistant_id: String(agent.id) } });
       }
-      const answers = await this.sessions.recordExchange(session.id, message, text, humanAt, costUsd);
-      this.write(res, { type: 'end', content: text });
-      this.events?.track('guest_trial_answer', {
-        sessionId: input.sid,
-        source: input.source,
-        props: { n: answers, trial: session.id, assistant_id: String(agent.id), lang: input.lang, cost_usd: Number(costUsd.toFixed(4)) },
-      });
-      if (answers >= answersPerTrial) this.write(res, { type: 'wall', reason: 'limit' });
     } finally {
       clearInterval(ping);
       this.end(res);
