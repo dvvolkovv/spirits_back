@@ -152,7 +152,9 @@ describe('POST admin/shorts', () => {
       if (sql.startsWith('UPDATE')) throw Object.assign(new Error('dup'), { code: '23505', constraint: SHORT_SLOT_INDEX });
       return { rows: [video({ status: 'approved' })] };
     });
-    await expect(conflict.ctl.action({ action: 'publish_now', id: ID }, res())).rejects.toThrow('slot_taken');
+    const err: any = await conflict.ctl.action({ action: 'publish_now', id: ID }, res()).catch((e: any) => e);
+    expect(err).toBeInstanceOf(ConflictException);
+    expect(err.getResponse()).toMatchObject({ error: 'slot_taken', message: 'Этот момент уже занят другим роликом — попробуйте через минуту' });
   });
 
   it('retry — с этапа, на котором упал; публикация — только одобренного', async () => {
@@ -216,11 +218,15 @@ describe('POST admin/shorts', () => {
       await expect(ctl.action({ action: 'retry', id: ID, from }, res())).rejects.toBeInstanceOf(ConflictException);
       expect(pg.query.mock.calls.some((c: any[]) => String(c[0]).startsWith('UPDATE'))).toBe(false);
     }
+    const { ctl } = setup(() => ({ rows: [pub] }));
+    await expect(ctl.action({ action: 'retry', id: ID, from: 'directing' }, res())).rejects.toThrow(
+      'Упавшую публикацию не переснять с этапа: «Повторить» повторит отправку, «Пост вышел» отметит вышедший пост',
+    );
   });
 
   it('retry { from: writing } без съёмки — 409 «нечего писать»', async () => {
     const { ctl, pg } = setup(() => ({ rows: [video({ failed_from: 'capturing', capture: null })] }));
-    await expect(ctl.action({ action: 'retry', id: ID, from: 'writing' }, res())).rejects.toThrow(/нечего писать — нет съёмки/);
+    await expect(ctl.action({ action: 'retry', id: ID, from: 'writing' }, res())).rejects.toThrow('Нового текста не будет: съёмки нет — нажмите «Новая сцена»');
     expect(pg.query.mock.calls.some((c: any[]) => String(c[0]).startsWith('UPDATE'))).toBe(false);
   });
 
@@ -314,7 +320,9 @@ describe('POST admin/shorts', () => {
       }
       return { rows: [], rowCount: 1 };
     });
-    await expect(ctl.action({ action: 'mark_published', id: ID, url: 'https://t.me/ainomira/777' }, res())).rejects.toThrow('slot_taken');
+    const err: any = await ctl.action({ action: 'mark_published', id: ID, url: 'https://t.me/ainomira/777' }, res()).catch((e: any) => e);
+    expect(err).toBeInstanceOf(ConflictException);
+    expect(err.getResponse()).toMatchObject({ error: 'slot_taken', message: 'Этот момент уже занят другим роликом — попробуйте через минуту' });
   });
 
   it('настройки: чтение, правка с проверкой', async () => {
