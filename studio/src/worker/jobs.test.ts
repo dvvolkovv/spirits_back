@@ -147,7 +147,7 @@ test('сборка: снимки из MinIO, сценарий и съёмка ф
       assert.deepEqual(JSON.parse(fs.readFileSync(path.join(runDir, 'script.json'), 'utf8')), script);
       fs.writeFileSync(path.join(runDir, 'video.mp4'), 'видео');
       fs.writeFileSync(path.join(runDir, 'cover.jpg'), 'обложка');
-      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 44.2 };
+      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 44.2, loudness: LOUD };
     },
   });
   assert.equal(await runOne(d), true);
@@ -189,7 +189,7 @@ test('проверка файла не прошла — video_invalid с пов�
   const d = deps({
     queue,
     storage: fakeStorage().storage,
-    render: async (runDir) => ({ video: path.join(runDir, 'v'), cover: path.join(runDir, 'c'), problems: ['тишина 3.1 с с 23.0 с'], durationSec: 44 }),
+    render: async (runDir) => ({ video: path.join(runDir, 'v'), cover: path.join(runDir, 'c'), problems: ['тишина 3.1 с с 23.0 с'], durationSec: 44, loudness: LOUD }),
   });
   await runOne(d);
   const [, err] = calls.fail[0] as [string, StudioError];
@@ -219,7 +219,7 @@ test('итог и сбой — по захвату: очередь получа�
     render: async (runDir) => {
       fs.writeFileSync(path.join(runDir, 'video.mp4'), 'видео');
       fs.writeFileSync(path.join(runDir, 'cover.jpg'), 'обложка');
-      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 40 };
+      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 40, loudness: LOUD };
     },
   }));
   assert.equal(calls.jobs[0], claimed);
@@ -252,7 +252,7 @@ test('задание забрал другой процесс: сбой — gone
     render: async (runDir) => {
       fs.writeFileSync(path.join(runDir, 'video.mp4'), 'видео');
       fs.writeFileSync(path.join(runDir, 'cover.jpg'), 'обложка');
-      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 40 };
+      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 40, loudness: LOUD };
     },
   }));
   assert.equal(b.calls.fail.length, 0, 'неудавшаяся запись итога — не сбой задания');
@@ -371,7 +371,7 @@ test('сборка со сценками: клипы — из MinIO по animati
       assert.equal(fs.readFileSync(path.join(runDir, 'skits/fp-p/clip.mp4'), 'utf8'), 'клип развязки');
       fs.writeFileSync(path.join(runDir, 'video.mp4'), 'видео');
       fs.writeFileSync(path.join(runDir, 'cover.jpg'), 'обложка');
-      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 33 };
+      return { video: path.join(runDir, 'video.mp4'), cover: path.join(runDir, 'cover.jpg'), problems: [], durationSec: 33, loudness: LOUD };
     },
   });
   await runOne(d);

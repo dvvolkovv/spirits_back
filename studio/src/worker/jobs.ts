@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { StudioError, toStudioError } from '../errors';
+import { describeLoudness } from '../loudness';
 import type { RenderResult } from '../render/run-render';
 import { validateScript } from '../script';
 import { SKIT_KINDS, type CaptureResult, type Scene, type ShortAnimation } from '../types';
@@ -88,6 +89,7 @@ export async function runRender(job: Job, d: JobDeps): Promise<boolean> {
   }
 
   const r = await d.render(runDir);
+  d.log(`render ${job.id}: ${describeLoudness(r.loudness)}`);
   if (r.problems.length) throw new StudioError('video_invalid', `проверка файла не прошла: ${r.problems.join('; ')}`, true);
   await d.storage.put(videoKey(job.id), r.video, 'video/mp4');
   await d.storage.put(coverKey(job.id), r.cover, 'image/jpeg');
