@@ -161,6 +161,7 @@ export class ProfileService implements OnModuleInit {
       `DELETE FROM custom_chat_history WHERE session_id LIKE $1 || '\\_%' ESCAPE '\\'`,
       [userId],
     );
+    await this.pg.query('DELETE FROM action_plans WHERE user_id = $1', [userId]);
     await this.pg.query(
       `UPDATE ai_profiles_consolidated
        SET profile_data = '{}', email = NULL, preferred_agent = NULL, isadmin = false,

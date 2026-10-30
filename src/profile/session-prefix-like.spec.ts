@@ -58,6 +58,8 @@ describe('переписка пользователя по префиксу sess
     const del = pg.calls.find((c) => /DELETE FROM custom_chat_history/.test(c.sql));
     expect(del).toBeDefined();
     expectOwnSessionsOnly(del!.sql, del!.params);
+    const plans = pg.calls.find((c) => /DELETE FROM action_plans/.test(c.sql));
+    expect(plans?.params).toEqual([SHORT]);
   });
 
   it('бизнес-история смотрит только свою переписку', async () => {

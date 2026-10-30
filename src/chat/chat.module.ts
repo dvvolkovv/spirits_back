@@ -18,11 +18,13 @@ import { ThumbnailService } from './chat-files/thumbnail.service';
 import { HumanDesignModule } from '../human-design/human-design.module';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
 import { ProductsModule } from '../products/products.module';
+import { ActionPlansController } from './action-plans/action-plans.controller';
+import { ActionPlansService } from './action-plans/action-plans.service';
 
 @Module({
   imports: [MiscModule, CommonModule, RoomModule, VideoModule, CalendarModule, TalerIdModule, SpeechModule, TokensModule, HumanDesignModule, ProductsModule],
-  controllers: [ChatController, ChatFilesController, ChatThumbController],
-  providers: [ChatService, ChatToolsService, ChatFileStore, ChatFilesService, ThumbnailService, CostGrowthService],
+  controllers: [ChatController, ChatFilesController, ChatThumbController, ActionPlansController],
+  providers: [ChatService, ChatToolsService, ChatFileStore, ChatFilesService, ThumbnailService, CostGrowthService, ActionPlansService],
   exports: [ChatToolsService, ChatService, ChatFilesService],
 })
 export class ChatModule {}
