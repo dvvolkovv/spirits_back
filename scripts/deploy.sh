@@ -1380,38 +1380,47 @@ ensure_security_headers() {
     return 1
   fi
 
-  local new_conf="$current"$'\n'
-  if ! grep -qF "$marker" <<<"$current"; then
-    local host_pattern
-    host_pattern=$(sed -E 's#^https?://##' <<<"$BASE_URL")
-    new_conf=""
-    local line in_server=0 is_plain_http=0 is_target=0 inserted=0
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      if [[ "$line" =~ ^[[:space:]]*server[[:space:]]*\{ ]]; then
-        in_server=1; is_plain_http=0; is_target=0
-      fi
-      if [[ $in_server -eq 1 && "$line" =~ listen[[:space:]]+80([[:space:]]|\;) ]]; then
-        is_plain_http=1
-      fi
-      if [[ $in_server -eq 1 && $is_plain_http -eq 0 && "$line" == *"server_name"*"$host_pattern"* ]]; then
-        is_target=1
-      fi
-      new_conf+="$line"$'\n'
-      if [[ $is_target -eq 1 && $is_plain_http -eq 0 \
-            && "$line" =~ ^([[:space:]]*)location[[:space:]]+(/tma/|/)[[:space:]]*\{ ]]; then
-        local indent="${BASH_REMATCH[1]}"
-        new_conf+="${indent}${indent}${marker}"$'\n'
-        new_conf+="${indent}${indent}include $installed;"$'\n'
-        inserted=$((inserted + 1))
-      fi
-      if [[ "$line" =~ ^\} ]]; then
-        in_server=0
-      fi
-    done <<<"$current"
-    if [[ $inserted -lt 1 ]]; then
-      red "  ✗ не нашёл SPA location в server-блоке $host_pattern ($ENV_NAME)"
-      return 1
+  local host_pattern
+  host_pattern=$(sed -E 's#^https?://##' <<<"$BASE_URL")
+  local new_conf=""
+  local line in_server=0 is_plain_http=0 is_target=0 inserted=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == *"$marker"* || "$line" =~ ^[[:space:]]*include[[:space:]]+$installed\; ]]; then
+      continue
     fi
+    if [[ "$line" =~ ^[[:space:]]*server[[:space:]]*\{ ]]; then
+      in_server=1; is_plain_http=0; is_target=0
+    fi
+    if [[ $in_server -eq 1 && "$line" =~ listen[[:space:]]+80([[:space:]]|\;) ]]; then
+      is_plain_http=1
+    fi
+    if [[ $in_server -eq 1 && $is_plain_http -eq 0 && "$line" == *"server_name"*"$host_pattern"* ]]; then
+      is_target=1
+    fi
+    if [[ $is_target -eq 1 && $is_plain_http -eq 0 \
+          && "$line" =~ ^([[:space:]]*)location[[:space:]]+(/tma/|/)[[:space:]]*\{ ]]; then
+      local indent="${BASH_REMATCH[1]}"
+      if [[ "$line" =~ \}[[:space:]]*$ ]]; then
+        new_conf+="${line%%\}*}"$'\n'
+      else
+        new_conf+="$line"$'\n'
+      fi
+      new_conf+="${indent}${indent}${marker}"$'\n'
+      new_conf+="${indent}${indent}include $installed;"$'\n'
+      if [[ "$line" =~ \}[[:space:]]*$ ]]; then
+        new_conf+="${indent}}"$'\n'
+      fi
+      inserted=$((inserted + 1))
+    else
+      new_conf+="$line"$'\n'
+    fi
+    if [[ "$line" =~ ^\} ]]; then
+      in_server=0
+    fi
+  done <<<"$current"
+  if [[ $inserted -lt 1 ]]; then
+    red "  ✗ не нашёл SPA location в server-блоке $host_pattern ($ENV_NAME)"
+    return 1
   fi
 
   local conf_b64 headers_b64 confdir
