@@ -183,11 +183,21 @@ export class ShortsController {
    * общий LIMIT 100 на весь список прятал бы старый failed/idea за свежими published —
    * ролик пропадал бы с экрана, а бот продолжал бы слать «Упали» на ролик, которого
    * в списке уже нет.
+   *
+   * Внутренний SELECT — явный перечень лёгких полей, не SELECT *: capture/script/
+   * animation/captions всё равно вырежет `light()` ниже, а тащить их из Postgres в
+   * Node ради этого — на годе роликов это лишние ~8 МБ на каждый вызов list.
+   * scene остаётся: `light()` его не трогает.
    */
   private async list() {
     const r = await this.pg.query(
       `SELECT * FROM (
-         SELECT *, updated_at::text AS version,
+         SELECT id, rubric, angle, angle_locked, source, source_ref, topic_key, topic_hint, title,
+                assistant_id, slug, lang, format, scene, video_key, cover_key, duration_ms, status,
+                slot_at, approved_at, owner_note, writer_feedback, writer_rounds, review_chat_id,
+                review_message_id, note_prompt_ids, yt_prompt_ids, lease_until, attempts, last_error,
+                failed_from, failure_notified, published_at, created_at, updated_at,
+                updated_at::text AS version,
                 ROW_NUMBER() OVER (PARTITION BY status ORDER BY COALESCE(published_at, updated_at) DESC) AS archive_rank
            FROM short_video
        ) t
@@ -252,7 +262,11 @@ export class ShortsController {
    * когда все площадки отработали — `settle()` ставит `published`.
    *
    * Одна транзакция: строка площадки и статус ролика не разойдутся, если
-   * один из двух запросов упадёт.
+   * один из двух запросов упадёт. Первым запросом блокируем short_video
+   * (`FOR NO KEY UPDATE`), хотя пишем его вторым: `retry` блокирует short_video,
+   * потом short_publication — если здесь брать площадку первой, конкурентный
+   * вызов на одном ролике (retry ⇄ «Пост вышел») ловит deadlock 40P01 вместо
+   * обещанного чистого 409 одной из сторон.
    */
   private async markPublished(id: string, url: string): Promise<any> {
     const v = await this.load(id);
@@ -270,6 +284,9 @@ export class ShortsController {
     }
     try {
       await inTransaction(this.pg, async (tx) => {
+        // Порядок блокировок — как у retry (video, потом publications): без этого конкурентный
+        // retry по тому же ролику ловит deadlock 40P01, а не чистый 409.
+        await tx.query(`SELECT 1 FROM short_video WHERE id = $1 FOR NO KEY UPDATE`, [id]);
         // Строка telegram уже published (например, YouTube упал уже после неё, и админка могла
         // ещё показывать «Пост вышел») — WHERE не даёт переписать вышедший пост чужой ссылкой.
         const ins = await tx.query(
@@ -330,7 +347,9 @@ export class ShortsController {
    * Обе записи — в одной транзакции (`inTransaction`), видео первым: если
    * проверяющий UPDATE short_video ничего не нашёл (ролик тем временем ушёл из
    * failed — гонка с «Пост вышел» или другим «Повторить»), 409 не должен
-   * оставить площадки уже переведёнными в pending.
+   * оставить площадки уже переведёнными в pending. Тот же порядок блокировок
+   * (video, потом publications) держит и markPublished — иначе конкурентный
+   * вызов обоих на одном ролике ловит deadlock 40P01.
    */
   private async retry(id: string, from: unknown, note: unknown): Promise<ShortVideo> {
     if (from != null && !RETRY_FROM.includes(from as RetryFrom)) {
