@@ -2093,10 +2093,10 @@ Expected: FAIL, `actionsFor is not a function` и аналогичные оши�
 
 - [ ] **Step 3: Дописать модуль**
 
-В `src/components/admin/shortStatus.ts` импорт `realCaseChars` заменить на:
+В `src/components/admin/shortStatus.ts` после строки `import { formatSlotAt } from './blogSlotFormat';` добавить (после ревью задачи 10 модуль считает длину заказа сам и `realCaseChars` из блога не импортирует):
 
 ```ts
-import { normalizeSlotDays, realCaseChars } from './blogStatus';
+import { normalizeSlotDays } from './blogStatus';
 ```
 
 В конец файла:
@@ -2324,7 +2324,7 @@ git add src/components/admin/shortStatus.ts src/components/admin/shortStatus.tes
 git commit -m "admin: ролики — кнопки по статусу, запросы решений с версией, итоги, черновик настроек"
 ```
 
-Expected: PASS, 19 тестов.
+Expected: PASS, 21 тест (9 после ревью задачи 10 и 12 новых).
 
 ---
 
