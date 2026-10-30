@@ -1334,7 +1334,7 @@ ssh dv@85.192.61.231 "sudo -u postgres psql -qc \"CREATE ROLE shortsit LOGIN PAS
 
 ```ts
 import { leaveReview, noteForReview } from './short-review';
-import { BAD_TIMESTAMP_CODES, VERSION_RE } from './shorts.controller';
+import { BAD_TIMESTAMP_CODES, ShortsController, VERSION_RE } from './shorts.controller';
 ```
 
 Внутрь `maybe('ролики против живого Postgres', …)` перед `describe('YouTube против живой базы', …)`:
@@ -1406,6 +1406,22 @@ import { BAD_TIMESTAMP_CODES, VERSION_RE } from './shorts.controller';
         expect(BAD_TIMESTAMP_CODES).toContain(err.code);
       }
     });
+
+    it('«Пост вышел» не перезаписывает уже вышедший пост: ссылка и ролик не меняются (живой SQL ON CONFLICT … WHERE)', async () => {
+      const v = await insert({ status: 'failed', failed_from: 'publishing', approved_at: new Date() });
+      await pool.query(
+        `INSERT INTO short_publication (short_id, platform, status, url, external_id)
+              VALUES ($1, 'telegram', 'published', 'https://t.me/ainomira/90', '90')`,
+        [v.id],
+      );
+      const ctl = new ShortsController(pgLike() as any, {} as any, {} as any, { publicUrl: () => 'x' } as any);
+      const res: any = { status: () => res, json: (b: any) => ((res.body = b), res) };
+      await expect(ctl.action({ action: 'mark_published', id: v.id, url: 'https://t.me/ainomira/91' }, res))
+        .rejects.toThrow('Пост уже отмечен вышедшим');
+      const pub = (await pool.query(`SELECT url, external_id FROM short_publication WHERE short_id = $1 AND platform = 'telegram'`, [v.id])).rows[0];
+      expect(pub).toEqual({ url: 'https://t.me/ainomira/90', external_id: '90' });
+      expect((await pool.query(`SELECT status FROM short_video WHERE id = $1`, [v.id])).rows[0].status).toBe('failed');
+    });
   });
 ```
 
@@ -1417,7 +1433,7 @@ git commit -m "test(shorts): решения из админки на живом 
 NODE_RUN_DIR=. studio/scripts/node-run.sh "SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts 2>&1 | tail -25"
 ```
 
-Expected: PASS всей сюиты, включая шесть новых тестов; skipped быть не должно. Красный новый тест означает, что SQL расходится с ожиданием: разобрать причину, а не ослаблять проверку.
+Expected: PASS всей сюиты, включая семь новых тестов; skipped быть не должно. Красный новый тест означает, что SQL расходится с ожиданием: разобрать причину, а не ослаблять проверку.
 
 ---
 
