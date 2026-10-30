@@ -6,7 +6,7 @@ import { JwtGuard } from '../common/guards/jwt.guard';
 import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { isShortSlotConflict } from './short-slot-claim';
-import { RELEASED_SQL } from './shorts-approval.service';
+import { RELEASED_SQL } from './short-review';
 import { ShortSettingsPatch, ShortsSettingsService, validateSettingsPatch } from './shorts-settings.service';
 import { ShortOrderError, ShortsTopicService } from './shorts-topic.service';
 import {

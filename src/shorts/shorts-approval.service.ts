@@ -9,11 +9,12 @@ import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { buildReviewKeyboard, parseShortCallback, parseYoutubeUrl, shortCommandText } from './short-callback';
 import { STAND_MARK, buildReviewCaption, clip, skitCastLine } from './short-captions';
 import { autoTopicsEnabled, isStand, shortsEnabled } from './short-env';
+import { LEAVE_FROM, leaveReview, noteForReview } from './short-review';
 import { approveShortIntoSlot } from './short-slot-claim';
 import { ShortsSettingsService } from './shorts-settings.service';
 import { MIN_ORDER_CHARS, ShortsTopicService } from './shorts-topic.service';
 import {
-  MAX_NOTE_PROMPTS, ShortStatus, ShortVideo, appendOwnerNote, canTransition, rowToShort, shortsBucket,
+  MAX_NOTE_PROMPTS, ShortStatus, ShortVideo, canTransition, rowToShort, shortsBucket,
 } from './shorts.types';
 
 /** Подсказки в поле ответа. Telegram принимает 1–64 символа. */
@@ -33,14 +34,6 @@ export const REVIEW_SEND_ALERT_AFTER = 3;
 export const REVIEW_SEND_PAUSE_MINUTES = 60;
 /** Bot API принимает от бота файлы до 50 МБ; больше — 413 на каждой попытке. */
 export const TG_UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
-
-/**
- * Ролик уже вышел хоть на одной площадке: пост в канале есть или набор YouTube
- * ушёл владельцу. Между попытками публикации такой ролик лежит в approved.
- * Им же сторожит `reject` админки (shorts.controller.ts).
- */
-export const RELEASED_SQL =
-  `EXISTS (SELECT 1 FROM short_publication p WHERE p.short_id = short_video.id AND p.status IN ('published', 'manual_pending', 'manual_done'))`;
 
 const RESHOOT = 'Ролик сейчас переснимается — замечание напишите к новому варианту.';
 const REBUILD = 'Ролик сейчас пересобирается — замечание напишите к новому варианту.';
@@ -361,34 +354,22 @@ export class ShortsApprovalService {
   }
 
   /**
-   * «Переснять» (новая сцена на ту же тему) и «Отклонить». Из pending_review и
-   * из approved: одобренный ролик освобождает слот и теряет одобрение
-   * (`approved_at = NULL`) — новую версию человек ещё не видел. Запись — с
-   * условием на статус: пока сообщение висело, ролик мог уйти в публикацию.
-   *
-   * И с условием, что ролик ещё нигде не вышел: между попытками публикации он
-   * лежит в approved, а пост в канале уже есть. «Переснять» тогда отправил бы
-   * новую версию только в YouTube (в канале осталась бы старая), а «Отклонить»
-   * сделал бы rejected ролик с живым постом. Условие — в самом UPDATE, а не
-   * чтением перед ним: публикация могла выйти между чтением и записью.
+   * «Переснять» (новая сцена на ту же тему) и «Отклонить». Запись — общая с
+   * админкой (leaveReview, short-review.ts): из pending_review и approved,
+   * одобренный теряет одобрение, вышедший хоть где-то не трогается. Здесь —
+   * отказ без записи для заведомо неподходящего статуса и слова владельцу.
    */
   private async leave(v: ShortVideo, cb: any, chatId: number, target: 'directing' | 'rejected'): Promise<void> {
-    const from: ShortStatus[] = ['pending_review', 'approved'];
-    if (!from.includes(v.status) || !canTransition(v.status, target)) {
+    if (!LEAVE_FROM.includes(v.status) || !canTransition(v.status, target)) {
       await this.answer(cb, buttonRefusal(v.status));
       return;
     }
-    const r = await this.pg.query(
-      `UPDATE short_video SET status = $2, approved_at = NULL, attempts = 0, lease_until = NULL, last_error = NULL, updated_at = now()
-        WHERE id = $1 AND status = ANY($3::text[])
-          AND NOT ${RELEASED_SQL}`,
-      [v.id, target, from],
-    );
-    if (r.rowCount === 0) {
-      // Отличаем «уже вышел» от «уже обработан» чтением после неудачной записи.
-      const after = await this.pg.query(`SELECT status, ${RELEASED_SQL} AS released FROM short_video WHERE id = $1`, [v.id]);
-      const row = after.rows[0];
-      await this.answer(cb, row?.released ? 'Ролик уже вышел на площадке — переснять или отклонить нельзя' : buttonRefusal(row?.status));
+    const out = await leaveReview(this.pg, v.id, target);
+    if (out.ok === false) {
+      await this.answer(
+        cb,
+        out.reason === 'released' ? 'Ролик уже вышел на площадке — переснять или отклонить нельзя' : buttonRefusal(out.status ?? undefined),
+      );
       return;
     }
     if (target === 'directing') {
@@ -487,17 +468,10 @@ export class ShortsApprovalService {
       await this.sendPrompt(v, 'note_prompt_ids', chatId, `Замечание к ролику${quoted(v)} принимаю только текстом — напишите его ответом на это сообщение.`, Number(msg?.message_id) || null, NOTE_PLACEHOLDER);
       return true;
     }
-    // writer_rounds = 0: новый круг владельца, счётчик автоматических переписок студии — заново.
-    const w = await this.pg.query(
-      `UPDATE short_video
-          SET owner_note = $2, status = 'writing', writer_rounds = 0, attempts = 0,
-              lease_until = NULL, last_error = NULL, updated_at = now()
-        WHERE id = $1 AND status = 'pending_review'`,
-      [v.id, appendOwnerNote(v.ownerNote, text)],
-    );
-    if (w.rowCount === 0) {
-      const now = await this.load(v.id);
-      await this.tg.sendMessage(chatId, noteRefusal(now?.status ?? v.status));
+    // Запись — общая с админкой (noteForReview, short-review.ts).
+    const out = await noteForReview(this.pg, v, text);
+    if (out.ok === false) {
+      await this.tg.sendMessage(chatId, noteRefusal(out.status ?? v.status));
       return true;
     }
     await this.tg.sendMessage(chatId, 'Принял замечание — поправлю ролик и пришлю заново.');
