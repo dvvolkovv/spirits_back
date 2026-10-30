@@ -199,6 +199,20 @@ describe('ход гостя: отказы', () => {
     expect((await h.turn({ token })).res.statusCode).toBe(409);
   });
 
+  it('перенос пробы между первой проверкой и локом — вторая проверка видит перенос, стена limit (M2)', async () => {
+    const h = harness();
+    const token = (await h.turn()).evs[0].token;
+    const row = { ...h.sessions.rows.get('s1') };
+    let calls = 0;
+    h.sessions.findLive.mockImplementation(async () => {
+      calls++;
+      return calls === 1 ? { ...row } : { ...row, claimed_at: new Date() };
+    });
+    const { evs } = await h.turn({ token });
+    expect(evs.slice(-1)).toEqual([{ type: 'wall', reason: 'limit' }]);
+    expect(h.cli.textWithCost).not.toHaveBeenCalled();
+  });
+
   it('сбой модели и отказ CLI текстом — error, пара не пишется', async () => {
     const failing = harness({ reply: async () => { throw new Error('claude CLI exited with code 1'); } });
     expect((await failing.turn()).evs.slice(-1)).toEqual([{ type: 'error', code: 'model' }]);
@@ -238,6 +252,7 @@ describe('ход гостя: отказы', () => {
     expect(evs.slice(-1)).toEqual([{ type: 'error', code: 'model' }]);
     expect(h.cli.textWithCost).not.toHaveBeenCalled();
     expect(h.redis.peek('guest-lim:answers:h')).toBeNull();
+    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'breaker', assistant_id: '12' } });
   });
 
   it('общий потолок ответов — closed и одно сообщение владельцу за окно', async () => {
@@ -259,7 +274,7 @@ describe('ход гостя: отказы', () => {
     expect(h.cli.textWithCost).not.toHaveBeenCalled();
   });
 
-  it('потолок одновременных ходов — error busy; счётчики возвращаются', async () => {
+  it('потолок одновременных ходов — error busy; счётчики возвращаются; окно ответов не трогает (M1)', async () => {
     let release: () => void = () => {};
     let calls = 0;
     const h = harness({
@@ -271,8 +286,11 @@ describe('ход гостя: отказы', () => {
     });
     const first = h.turn();
     await new Promise((r) => setTimeout(r, 20));
+    const beforeBusy = h.redis.peek('guest-lim:answers:h');
     const second = await h.turn();
     expect(second.evs.slice(-1)).toEqual([{ type: 'error', code: 'busy' }]);
+    expect(h.redis.peek('guest-lim:answers:h')).toBe(beforeBusy);
+    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'busy', assistant_id: '12' } });
     release();
     await first;
     expect(h.chat.beginStream).toHaveBeenCalledTimes(1);
