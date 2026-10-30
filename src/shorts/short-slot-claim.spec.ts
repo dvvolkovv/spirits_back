@@ -35,7 +35,7 @@ function fakePg(selects: Array<{ rows: any[] }>, updates: Array<() => any>) {
     }),
     release: jest.fn(),
   };
-  return { pg: { getClient: async () => client }, log };
+  return { pg: { getClient: async () => client }, log, client };
 }
 
 describe('approveShortIntoSlot', () => {
@@ -86,5 +86,17 @@ describe('approveShortIntoSlot', () => {
     await approveShortIntoSlot(pg as any, 'v1', THU, schedule, () => NOW);
     expect(update()[0]).not.toContain('updated_at = $');
     expect(update()[1]).toEqual(['v1', THU.toISOString()]);
+  });
+
+  it('с версией проигрыш гонки не копит параметры: в каждом круге $3 и три значения', async () => {
+    const VERSION = '2026-10-30 12:34:56.123456+00';
+    const { pg, client } = fakePg(
+      [{ rows: [] }, { rows: [{ slot_at: THU }] }],
+      [() => { throw conflict(); }, () => ({ rowCount: 1 })],
+    );
+    expect(await approveShortIntoSlot(pg as any, 'v1', THU, schedule, () => NOW, VERSION)).toEqual({ slot: TUE, now: NOW });
+    const ups = (client.query.mock.calls as any[][]).filter(([sql]) => String(sql).trim().startsWith('UPDATE'));
+    expect(ups.map(([, p]) => p)).toEqual([['v1', THU.toISOString(), VERSION], ['v1', TUE.toISOString(), VERSION]]);
+    expect(ups.every(([sql]) => String(sql).includes('AND updated_at = $3::timestamptz'))).toBe(true);
   });
 });
