@@ -138,8 +138,8 @@ export class ShortsController {
         if (!v) {
           throw new ConflictException(
             data.id
-              ? 'не запустил: ролик не в статусе idea или запуск идёт параллельно — попробуйте ещё раз'
-              : 'не запустил: в очереди нет идей или запуск идёт параллельно — попробуйте ещё раз',
+              ? 'Не запустил: ролик уже не идея или запуск идёт параллельно — обновите список и попробуйте ещё раз'
+              : 'Не запустил: в очереди нет идей или запуск идёт параллельно — попробуйте ещё раз',
           );
         }
         return res.status(200).json(v);
@@ -217,10 +217,10 @@ export class ShortsController {
         [id],
       );
     } catch (e: any) {
-      if (isShortSlotConflict(e)) throw new ConflictException('slot_taken');
+      if (isShortSlotConflict(e)) throw new ConflictException({ statusCode: 409, error: 'slot_taken', message: 'Этот момент уже занят другим роликом — попробуйте через минуту' });
       throw e;
     }
-    if (!r.rows.length) throw new ConflictException('опубликовать сейчас можно только одобренный ролик');
+    if (!r.rows.length) throw new ConflictException('Опубликовать сейчас можно только запланированный ролик — обновите список');
     return rowToShort(r.rows[0]);
   }
 
@@ -250,7 +250,7 @@ export class ShortsController {
       );
     }
     if (v.status !== 'failed' || v.failedFrom !== 'publishing' || !v.approvedAt) {
-      throw new ConflictException('пометить вышедшим можно только ролик, упавший на публикации');
+      throw new ConflictException('Отметить «Пост вышел» можно только у ролика, упавшего на публикации, — обновите список');
     }
     try {
       await inTransaction(this.pg, async (tx) => {
@@ -270,10 +270,10 @@ export class ShortsController {
             WHERE id = $1 AND status = 'failed' AND failed_from = 'publishing'`,
           [id],
         );
-        if (!r.rowCount) throw new ConflictException('ролик успел уйти из failed — обновите список');
+        if (!r.rowCount) throw new ConflictException('Ролик успел уйти из упавших — обновите список');
       });
     } catch (e: any) {
-      if (isShortSlotConflict(e)) throw new ConflictException('slot_taken');
+      if (isShortSlotConflict(e)) throw new ConflictException({ statusCode: 409, error: 'slot_taken', message: 'Этот момент уже занят другим роликом — попробуйте через минуту' });
       throw e;
     }
     return this.getOne(id);
@@ -313,7 +313,7 @@ export class ShortsController {
     const v = await this.load(id);
     const target = from != null ? this.retryFrom(v, from as RetryFrom) : retryTarget(v);
     if (!target) {
-      throw new ConflictException(`повторять нечего: ролик в статусе ${v.status}${v.failedFrom ? `, упал на этапе ${v.failedFrom}` : ''}`);
+      throw new ConflictException(`Повторять нечего: ролик ${STATUS_WORDS[v.status] ?? v.status} — обновите список`);
     }
     const ownerNote = typeof note === 'string' && note.trim() ? appendOwnerNote(v.ownerNote, note) : null;
     const format = from != null ? (await this.settings.get()).format : null;
@@ -337,7 +337,7 @@ export class ShortsController {
         RETURNING *`,
       [id, target, v.failedFrom, ownerNote, format],
     );
-    if (!r.rows.length) throw new ConflictException('ролик успел уйти из failed — обновите список');
+    if (!r.rows.length) throw new ConflictException('Ролик успел уйти из упавших — обновите список');
     return rowToShort(r.rows[0]);
   }
 
@@ -346,10 +346,10 @@ export class ShortsController {
     if (v.status !== 'failed' || !v.failedFrom || !canTransition(v.status, from)) return null;
     if (v.failedFrom === 'publishing') {
       throw new ConflictException(
-        'упавшую публикацию с этапа не переснять: retry без from повторит отправку, mark_published отметит вышедший пост',
+        'Упавшую публикацию не переснять с этапа: «Повторить» повторит отправку, «Пост вышел» отметит вышедший пост',
       );
     }
-    if (from === 'writing' && !v.capture) throw new ConflictException('нечего писать — нет съёмки');
+    if (from === 'writing' && !v.capture) throw new ConflictException('Нового текста не будет: съёмки нет — нажмите «Новая сцена»');
     return from;
   }
 
