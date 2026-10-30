@@ -36,18 +36,27 @@ export interface GuestTurnInput {
 /** Те же виды меток, что принимает EventsService.setSignupSourceIfEmpty. */
 const SOURCE_RE = /^(utm:|referral:|ref-site:|direct$|organic$)/;
 
+/**
+ * Управляющие байты, кроме \n (0A) и \t (09) — перевод строки и табуляция в
+ * сообщении гостя — обычный текст. ASCII-escape, а не литеральные байты (M5):
+ * 00–08, 0B–0C, 0E–1F, 7F.
+ */
+const CONTROL_CHARS_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g;
+
 export function parseGuestTurnInput(body: any): GuestTurnInput {
   const str = (v: unknown, max: number): string => (typeof v === 'string' ? v.slice(0, max) : '');
-  const source = str(body?.source, 120);
+  /** Та же str(), но вдобавок вырезает управляющие байты (кроме \n/\t). */
+  const clean = (v: unknown, max: number): string => str(v, max).replace(CONTROL_CHARS_RE, '');
+  const source = clean(body?.source, 120);
   const sid = str(body?.sid, 64);
   return {
     token: str(body?.token, 64) || null,
     assistantId: str(body?.assistantId, 16).trim(),
-    message: typeof body?.message === 'string' ? body.message : '',
+    message: typeof body?.message === 'string' ? body.message.replace(CONTROL_CHARS_RE, '') : '',
     lang: LanguageService.normalize(str(body?.lang, 16)),
-    tz: str(body?.tz, 64) || undefined,
+    tz: clean(body?.tz, 64) || undefined,
     source: SOURCE_RE.test(source) ? source : null,
-    campaign: str(body?.campaign, 120) || null,
+    campaign: clean(body?.campaign, 120) || null,
     sid: /^[\w.-]+$/.test(sid) ? sid : null,
     preview: body?.preview === true,
   };
