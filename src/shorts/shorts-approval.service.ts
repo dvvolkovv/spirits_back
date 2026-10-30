@@ -9,7 +9,7 @@ import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { buildReviewKeyboard, parseShortCallback, parseYoutubeUrl, shortCommandText } from './short-callback';
 import { STAND_MARK, buildReviewCaption, clip, skitCastLine } from './short-captions';
 import { autoTopicsEnabled, isStand, shortsEnabled } from './short-env';
-import { LEAVE_FROM, leaveReview, noteForReview } from './short-review';
+import { LEAVE_FROM, RELEASED_SQL, leaveReview, noteForReview } from './short-review';
 import { approveShortIntoSlot } from './short-slot-claim';
 import { ShortsSettingsService } from './shorts-settings.service';
 import { MIN_ORDER_CHARS, ShortsTopicService } from './shorts-topic.service';
@@ -39,8 +39,24 @@ const RESHOOT = 'Ролик сейчас переснимается — заме
 const REBUILD = 'Ролик сейчас пересобирается — замечание напишите к новому варианту.';
 const REANIMATE = 'Сценки ролика сейчас оживают — замечание напишите к новому варианту.';
 
-/** Что делать с упавшим роликом — кнопки экрана «Ролики» во вкладке «Блог» админки (AdminShortsView). */
-const RETRY_HINT = 'в админке: Блог → Ролики — «Повторить», «Новая сцена» или «Новый текст» (можно с замечанием), либо «Отклонить»';
+/**
+ * Что дальше с упавшим роликом — кнопками экрана «Ролики» во вкладке «Блог»
+ * админки. Набор — тот же, что показывает экран (actionsFor в spirits_front,
+ * src/components/admin/shortStatus.ts): «Новый текст» — только при съёмке; у
+ * упавшей публикации — «Повторить», «Пост вышел» — пока пост не в канале,
+ * «Отклонить» — пока ролик нигде не вышел (YouTube грузится только после
+ * вышедшего поста, так что его сбой — всегда «вышел»).
+ */
+function failedHint(v: Pick<ShortVideo, 'failedFrom' | 'capture'>, released: boolean): string {
+  const where = 'Что дальше — в админке: Блог → Ролики, раздел «Упали»:';
+  if (v.failedFrom === 'publishing') {
+    return released
+      ? `${where} «Повторить» (пост в канале уже вышел, отклонить нельзя).`
+      : `${where} «Повторить», «Пост вышел» (если пост всё-таки в канале) или «Отклонить».`;
+  }
+  const buttons = ['«Повторить»', '«Новая сцена»', ...(v.capture ? ['«Новый текст»'] : [])];
+  return `${where} ${buttons.join(', ')} (можно с замечанием) или «Отклонить».`;
+}
 
 /** Почему замечание не принять — по статусу. Отказ лучше молчания: ответ наш, и владелец должен знать, куда он делся. */
 const NOTE_REFUSALS: Partial<Record<ShortStatus, string>> = {
@@ -56,7 +72,7 @@ const NOTE_REFUSALS: Partial<Record<ShortStatus, string>> = {
   publishing: 'Ролик прямо сейчас уходит на площадки — замечание не принял.',
   published: 'Ролик уже опубликован — замечание не принял.',
   rejected: 'Ролик отклонён — замечание не принял.',
-  failed: `Ролик упал — замечание не принял. Повторить можно ${RETRY_HINT}.`,
+  failed: 'Ролик упал — замечание не принял. Что с ним делать — в админке: Блог → Ролики, раздел «Упали».',
 };
 
 const noteRefusal = (s: ShortStatus): string => NOTE_REFUSALS[s] ?? `Замечание не принял: ролик в статусе ${s}.`;
@@ -77,8 +93,8 @@ const BUTTON_REFUSALS: Partial<Record<ShortStatus, string>> = {
   publishing: 'Ролик уже уходит на площадки',
   published: 'Ролик уже опубликован',
   rejected: 'Ролик отклонён',
-  // Всплывашка — до 200 знаков и без латиницы (сторожит спека): кнопки — на экране «Ролики».
-  failed: 'Ролик упал — повторить или отклонить его можно в админке: Блог → Ролики',
+  // Всплывашка — до 200 знаков и без латиницы (сторожит спека); кнопок не обещаем — у вышедшего ролика «Отклонить» нет.
+  failed: 'Ролик упал — что с ним делать, решите в админке: Блог → Ролики',
 };
 
 const buttonRefusal = (s: ShortStatus | undefined): string => (s && BUTTON_REFUSALS[s]) || 'Ролик уже обработан';
@@ -524,7 +540,7 @@ export class ShortsApprovalService {
       }
       const next = autoTopicsEnabled()
         ? 'Пришлю ролик на проверку, когда до него дойдёт очередь.'
-        : 'Автозапуск выключен — запустите ролик кнопкой «Запустить сейчас» в админке: Блог → Ролики.';
+        : 'Автозапуск выключен — запустите ролик кнопкой «Запустить сейчас» в админке: Блог → Ролики, раздел «Идеи».';
       await this.notify(chatId, `Принял заказ ролика: ${Array.from(text).length} знаков, кончается на «${ending(text)}». ${next}`);
     } catch (e: any) {
       await this.notify(chatId, `Не завёл ролик: ${e.message}`);
@@ -548,15 +564,12 @@ export class ShortsApprovalService {
              ORDER BY updated_at
              LIMIT 1
              FOR UPDATE SKIP LOCKED)
-          RETURNING *`,
+          RETURNING *, ${RELEASED_SQL} AS released`,
       );
       if (!r.rows.length) return;
       const v = rowToShort(r.rows[0]);
       const what = v.failedFrom === 'publishing' ? 'не вышел на площадки' : 'не собрался';
-      // Упавшую публикацию с этапа не переснять (from — только до одобрения), поэтому подсказка своя.
-      const next = v.failedFrom === 'publishing'
-        ? 'В админке: Блог → Ролики — «Повторить» или «Отклонить».'
-        : `Повторить можно ${RETRY_HINT}.`;
+      const next = failedHint(v, r.rows[0].released === true);
       const text = `${isStand() ? STAND_MARK : ''}Ролик${quoted(v)} ${what}: ${clip(v.lastError || 'причина не записана', 600)}\n${next}`;
       const owner = approverChatId();
       if (!owner) {
