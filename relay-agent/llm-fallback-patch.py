@@ -183,6 +183,9 @@ rep('      let accessFailHit = false;\n      let transientAccessLike = false;\n 
     '      // в errors[], поля result нет; llm.isErrorWithoutText) — у выбранного тоже\n'
     '      // повод уступить ход (child.on("close", …)).\n'
     '      let errorNoText = false;\n'
+    '      // Её причина (llm.errorsText: errors[] одной строкой) — в switchText: его\n'
+    '      // читают только FATAL_RE и fatalHint в runOnce, человеку уходит готовый текст.\n'
+    '      let errorNoTextWhy = "";\n'
     '      let transientAccessLike = false;\n'
     '      let sawResult = false;\n')
 rep('              if (!qwen.SIDE_EFFECT_FREE_TOOLS.has(block.name || "")) riskyToolUsed = true;\n',
@@ -200,7 +203,10 @@ rep('          usageTotals.webFetch += n(st.web_fetch_requests);\n        }\n',
     '          // выбранного это повод уступить ход в close. Последней в блоке: если\n'
     '          // llm-fallback.mjs окажется другой версии, TypeError (его глотает catch\n'
     '          // вокруг handleEvent) не сорвёт учёт стоимости, потолка шагов и usage.\n'
-    '          if (llm.isErrorWithoutText(ev)) errorNoText = true;\n'
+    '          if (llm.isErrorWithoutText(ev)) {\n'
+    '            errorNoText = true;\n'
+    '            errorNoTextWhy = llm.errorsText(ev);\n'
+    '          }\n'
     '        }\n')
 
 # 7. Разбор result.
@@ -259,7 +265,7 @@ rep('resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, accessF
     '            llm.mayAdvance({ failed: runProvider, selected, accessFailure: false, sentAnyText: streamedAny, riskyToolUsed })) {\n'
     '          switchHit = true;\n'
     '          switchWhy = gotResult ? "ошибка без текста" : "нет ответа";\n'
-    '          switchText = "";\n'
+    '          switchText = gotResult ? errorNoTextWhy : "";\n'
     '        }\n'
     '        resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, switchHit, switchWhy, switchText, transientAccessLike, sawResult, startedAt: runStartedAt });')
 

@@ -903,6 +903,9 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       // в errors[], поля result нет; llm.isErrorWithoutText) — у выбранного тоже
       // повод уступить ход (child.on("close", …)).
       let errorNoText = false;
+      // Её причина (llm.errorsText: errors[] одной строкой) — в switchText: его
+      // читают только FATAL_RE и fatalHint в runOnce, человеку уходит готовый текст.
+      let errorNoTextWhy = "";
       let transientAccessLike = false;
       let sawResult = false;
       let transientHit = false;
@@ -954,7 +957,10 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
           // выбранного это повод уступить ход в close. Последней в блоке: если
           // llm-fallback.mjs окажется другой версии, TypeError (его глотает catch
           // вокруг handleEvent) не сорвёт учёт стоимости, потолка шагов и usage.
-          if (llm.isErrorWithoutText(ev)) errorNoText = true;
+          if (llm.isErrorWithoutText(ev)) {
+            errorNoText = true;
+            errorNoTextWhy = llm.errorsText(ev);
+          }
         }
         if (ev.type === "stream_event" && ev.event) {
           const se = ev.event;
@@ -1088,7 +1094,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
             llm.mayAdvance({ failed: runProvider, selected, accessFailure: false, sentAnyText: streamedAny, riskyToolUsed })) {
           switchHit = true;
           switchWhy = gotResult ? "ошибка без текста" : "нет ответа";
-          switchText = "";
+          switchText = gotResult ? errorNoTextWhy : "";
         }
         resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, switchHit, switchWhy, switchText, transientAccessLike, sawResult, startedAt: runStartedAt });
       });
