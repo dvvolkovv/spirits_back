@@ -236,7 +236,7 @@ export class ClaudeHealthService implements OnModuleInit {
            COALESCE(SUM((props->>'cost_usd')::numeric) FILTER (WHERE ts >= now() - interval '30 days'),  0) AS cost_30d,
            COUNT(*) FILTER (WHERE ts >= now() - interval '24 hours')::int AS calls_24h,
            COUNT(*) FILTER (WHERE ts >= now() - interval '30 days')::int  AS calls_30d
-         FROM events WHERE name = 'claude_cli_call'`,
+         FROM events WHERE name = 'claude_cli_call' AND coalesce(props->>'provider', 'claude') = 'claude'`,
       );
       const r = sums.rows[0] as any;
       const models = await this.pg.query(
@@ -246,6 +246,7 @@ export class ClaudeHealthService implements OnModuleInit {
            COALESCE(SUM((props->>'cost_usd')::numeric), 0)::float AS cost_usd
          FROM events
          WHERE name = 'claude_cli_call' AND ts >= now() - interval '30 days'
+           AND coalesce(props->>'provider', 'claude') = 'claude'
          GROUP BY 1 ORDER BY cost_usd DESC LIMIT 5`,
       );
       return {
