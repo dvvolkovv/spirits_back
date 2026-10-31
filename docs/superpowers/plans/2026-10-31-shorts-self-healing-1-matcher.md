@@ -566,6 +566,7 @@ studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts"
 
 **Files:**
 - Modify: `studio/src/animate/run-animate.ts`
+- Modify: `studio/src/types.ts` (комментарий `SkitClip.attempts`)
 - Test: `studio/src/animate/run-animate.test.ts`
 
 - [ ] **Step 1: Написать падающие тесты**
@@ -608,7 +609,8 @@ test('брак без пометки (до 31.10) перепроверяется
 
 test('брак, который эта сверка уже судила, и плохой файл не перепроверяются — снимается новый клип', { timeout: 120_000 }, async () => {
   for (const meta of [
-    { code: 'speech_mismatch', matcher: MATCHER_VERSION, heard: 'это износ верните залог' },
+    // Услышанное проходит нынешнюю сверку: перепроверку отсекает именно версия, а не сверка по записи.
+    { code: 'speech_mismatch', matcher: MATCHER_VERSION, heard: 'это износ верните залог ладно убедил начинаешь' },
     { code: 'clip_invalid', matcher: 1 },
   ]) {
     const { env, lines, dir } = await withRejected(meta);
@@ -618,6 +620,7 @@ test('брак, который эта сверка уже судила, и пл�
     assert.equal(second.calls.recognize, 1, meta.code);
     assert.equal(anim.omniSeconds, 24, meta.code);
     assert.deepEqual(rejectedClips(dir), ['rejected-2026-10-31T16-29-00-469Z.mp4'], meta.code);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'rejected-2026-10-31T16-29-00-469Z.json'), 'utf8')), meta, meta.code);
   }
 });
 
@@ -661,7 +664,100 @@ test('брак с пустым услышанным (SpeechKit не расслы
   assert.equal(anim.skits.punchline!.heard, heard);
   assert.deepEqual(rejectedClips(dir), []);
 });
+
+test('брак судится не больше раза на версию сверки: второй запуск его не распознаёт', { timeout: 120_000 }, async () => {
+  const { env, dir } = await withRejected();
+  for (const recognized of [1, 0]) {
+    const run = fakes(env, { heard: (kind) => (kind === 'punchline' ? 'совсем другое' : LINES[kind].join(' ')) });
+    await assert.rejects(animateRun(env.runDir, { ...run.deps, maxOmniSeconds: 16 }), isErr('omni_budget', false));
+    assert.equal(run.calls.recognize, recognized);
+    assert.deepEqual(run.calls.start, []);
+    assert.equal(rejectedClips(dir).length, 1);
+  }
+});
+
+test('два брака: первый не прошёл и новую сверку, второй принят — без Omni', { timeout: 120_000 }, async () => {
+  const { env, dir } = await withRejected();
+  fs.writeFileSync(path.join(dir, 'rejected-2026-10-31T16-29-39-703Z.mp4'), env.clip);
+  const heard = 'это износ верните залог ладно убедил начинаешь';
+  const second = fakes(env, { heard: (kind, call) => (kind === 'punchline' ? (call === 1 ? 'совсем другое' : heard) : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, { ...second.deps, maxOmniSeconds: 16 });
+  assert.deepEqual(second.calls.start, []);
+  assert.equal(second.calls.recognize, 2);
+  assert.equal(anim.skits.punchline!.heard, heard);
+  assert.equal(anim.skits.punchline!.attempts, 2);
+  assert.equal(rejectedClips(dir).length, 1, 'первый брак отложен снова, второй стал клипом');
+});
+
+test('запущенная генерация рядом с браком — её дожидаются, брак не трогают', { timeout: 120_000 }, async () => {
+  const { env, lines, dir } = await withRejected();
+  const before = readAnim(env.runDir);
+  fs.writeFileSync(
+    path.join(env.runDir, 'animation.json'),
+    JSON.stringify({ ...before, omniSeconds: 24, pending: { punchline: { id: 'id-paid', fingerprint: 'fp-punchline-2' } } }),
+  );
+  const second = fakes(env, { heard: (kind) => (kind === 'punchline' ? lines.join(' ') : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, second.deps);
+  assert.deepEqual(second.calls.start, []);
+  assert.deepEqual(second.calls.wait, ['id-paid']);
+  assert.equal(second.calls.recognize, 1);
+  assert.equal(anim.omniSeconds, 24);
+  assert.deepEqual(rejectedClips(dir), ['rejected-2026-10-31T16-29-00-469Z.mp4']);
+});
+
+test('сбой выгрузки в перепроверке — повтор задания без Omni, клип из брака принимает следующий запуск', { timeout: 120_000 }, async () => {
+  const { env, dir } = await withRejected();
+  const heard = 'это износ верните залог ладно убедил начинаешь';
+  const first = fakes(env, { heard: (kind) => (kind === 'punchline' ? heard : LINES[kind].join(' ')) });
+  await assert.rejects(
+    animateRun(env.runDir, {
+      ...first.deps,
+      maxOmniSeconds: 16,
+      onFile: async (rel) => {
+        if (rel.endsWith('raw.mp4')) throw new Error('MinIO: 503');
+      },
+    }),
+    isErr('unknown', true),
+  );
+  assert.deepEqual([first.calls.start, first.calls.recognize], [[], 0]);
+  assert.ok(fs.existsSync(path.join(dir, 'raw.mp4')), 'брак стал оплаченным клипом сценки');
+  const second = fakes(env, { heard: (kind) => (kind === 'punchline' ? heard : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, { ...second.deps, maxOmniSeconds: 16 });
+  assert.deepEqual(second.calls.start, []);
+  assert.equal(anim.skits.punchline!.heard, heard);
+  assert.equal(anim.omniSeconds, 16);
+});
+
+test('перепроверка оборвалась на распознавании — следующий запуск доводит этот клип, а за ним судит и остальной брак до оплаты', { timeout: 120_000 }, async () => {
+  const { env, dir } = await withRejected();
+  fs.writeFileSync(path.join(dir, 'rejected-2026-10-31T16-29-39-703Z.mp4'), env.clip);
+  const first = fakes(env, {
+    heard: (kind) => {
+      if (kind === 'punchline') throw new StudioError('stt', 'stt: распознать речь не удалось', false);
+      return LINES[kind].join(' ');
+    },
+  });
+  await assert.rejects(animateRun(env.runDir, { ...first.deps, maxOmniSeconds: 16 }), isErr('stt', false));
+  const heard = 'это износ верните залог ладно убедил начинаешь';
+  const second = fakes(env, { heard: (kind, call) => (kind === 'punchline' ? (call === 1 ? 'совсем другое' : heard) : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, { ...second.deps, maxOmniSeconds: 16 });
+  assert.deepEqual(second.calls.start, []);
+  assert.equal(second.calls.recognize, 2);
+  assert.equal(anim.skits.punchline!.heard, heard);
+  assert.equal(anim.omniSeconds, 16);
+  assert.equal(rejectedClips(dir).length, 1);
+});
 ```
+
+(Последние пять тестов и проверка «пометка не переписана» — по ревью задачи 4: перепроверка должна идти перед каждой оплатой, а не только на входе в сценку; судить брак — не больше раза на версию; переходить ко второму браку; не трогать брак при запущенной генерации; переживать сбой выгрузки без новых денег.)
+
+В тесте задачи 3 `'пометка брака не записалась — брак всё равно отложен и удалён из хранилища, съёмка идёт дальше'` строку `const { deps } = fakes(env, { heard: … });` заменить на `const { deps, calls } = fakes(env, { heard: … });` (тот же `heard`) и последней строкой теста добавить:
+
+```ts
+  assert.equal(calls.recognize, 3, 'брак, отложенный этим запуском, не судится повторно');
+```
+
+(Без `shelvedNow` — шаг 3 — попытка 2 взяла бы брак попытки 1, пометка которого не записалась, и судила бы его заново.)
 
 (Тест «пустое услышанное» — по ревью задачи 3: на тишину SpeechKit отвечает пустой строкой, и сверка «по записи» навсегда закрыла бы клип, который стоит перераспознать за копейки.)
 
@@ -673,13 +769,7 @@ git commit -m "test(studio): перепроверка брака сценки д
 studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts"
 ```
 
-Ожидается: `ℹ fail 4`:
-- «брак без пометки … принят без Omni» — `omni_budget`: перепроверки ещё нет, а предел 16 с выбран;
-- «… не прошедший сверку по записи …» — пометка осталась `matcher: 1`;
-- «… отложен снова с её пометкой …» — два запуска Omni вместо одного (брак не перепроверен, первый новый клип забракован);
-- «брак с пустым услышанным …» — `omni_budget`, как первый.
-
-Тест «уже судила, и плохой файл» проходит и без перепроверки — он держит её от лишней работы.
+Ожидается: 47 тестов, `ℹ fail 8` — все новые, кроме «уже судила, и плохой файл» и «запущенная генерация рядом с браком»: перепроверки ещё нет, поэтому там `omni_budget` при пределе 16 с, пометка с `matcher: 1`, лишний запуск Omni или код ошибки не тот. Эти два проходят и без перепроверки — они держат её от лишней работы.
 
 - [ ] **Step 3: Чтение пометки и функция `reviveRejected`**
 
@@ -696,6 +786,19 @@ function readRejectedMeta(file: string): Partial<RejectedMeta> {
     return {};
   }
 }
+```
+
+В `animateRun`, сразу после определения `writeRejectedMeta` (задача 3), вставить:
+
+```ts
+  /** Брак, отложенный этим запуском: его уже судила нынешняя сверка, даже если пометка не записалась. */
+  const shelvedNow = new Set<string>();
+```
+
+В `finish` → `reject`, сразу после строки ``fs.renameSync(raw, abs(`${base}.mp4`));`` вставить:
+
+```ts
+      shelvedNow.add(`${base}.mp4`);
 ```
 
 В `animateRun`, сразу перед строкой `const assertBudget = (): void => {`, вставить:
@@ -719,12 +822,15 @@ function readRejectedMeta(file: string): Partial<RejectedMeta> {
     const rejected = fs.readdirSync(dir).filter((f) => /^rejected-.*\.mp4$/.test(f)).sort();
     for (let i = 0; i < rejected.length; i++) {
       const name = rejected[i];
+      // Отложен этим же запуском — нынешняя сверка его уже судила, даже если пометка не записалась.
+      if (shelvedNow.has(skitFile(kind, name))) continue;
       const metaFile = path.join(dir, name.replace(/\.mp4$/, '.json'));
       const meta = readRejectedMeta(metaFile);
       // Эта сверка его уже судила; плохой файл сверка не лечит.
       if (meta.matcher === MATCHER_VERSION || meta.code === 'clip_invalid') continue;
-      if (typeof meta.heard === 'string' && meta.heard.trim() && !speechCheck(texts, meta.heard).ok) {
-        writeRejectedMeta(metaFile, { code: 'speech_mismatch', heard: meta.heard, share: meta.share, matcher: MATCHER_VERSION });
+      const byRecord = typeof meta.heard === 'string' && meta.heard.trim() ? speechCheck(texts, meta.heard) : null;
+      if (byRecord && !byRecord.ok) {
+        writeRejectedMeta(metaFile, { code: 'speech_mismatch', heard: meta.heard, share: byRecord.share, matcher: MATCHER_VERSION });
         continue;
       }
       await local('брак не вернулся в работу', () => {
@@ -748,32 +854,41 @@ function readRejectedMeta(file: string): Partial<RejectedMeta> {
 
 ```
 
-- [ ] **Step 4: Вызов перед попытками сценки**
+- [ ] **Step 4: Вызов перед каждой оплатой**
 
-В `animateSkit` заменить
+В цикле попыток `animateSkit` — в ветке, где клип будет оплачен (нет ни `raw.mp4`, ни запущенной генерации), — заменить
 
 ```ts
-    // Запись под другой отпечаток больше не годится: сборка её и так не возьмёт.
-    delete anim.skits[kind];
-    await save();
-
-    let last: StudioError | null = null;
+          } else {
+            // Предел — и до кадра (кадр тоже стоит денег), и после: соседняя сценка могла зарезервировать секунды, пока он рисовался.
+            assertBudget();
 ```
 
 на
 
 ```ts
-    // Запись под другой отпечаток больше не годится: сборка её и так не возьмёт.
-    delete anim.skits[kind];
-    await save();
-    // Оплаченный брак этого текста — до новой оплаты (reviveRejected). Запущенная
-    // генерация или скачанный raw.mp4 важнее: их и так дождутся без новых денег.
-    if (!fs.existsSync(raw) && !hasPending(kind)) {
-      const revived = await reviveRejected(kind);
-      if (revived) return revived;
-    }
+          } else {
+            // Перед каждой оплатой — оплаченный брак этого текста, который нынешняя сверка
+            // ещё не судила (reviveRejected): оборванная прошлая перепроверка или
+            // забракованный клип запущенной генерации не должны вести сразу к оплате.
+            const revived = await reviveRejected(kind);
+            if (revived) return revived;
+            // Предел — и до кадра (кадр тоже стоит денег), и после: соседняя сценка могла зарезервировать секунды, пока он рисовался.
+            assertBudget();
+```
 
-    let last: StudioError | null = null;
+Ошибки перепроверки идут через `catch` цикла как есть: `StorageError` — наружу сразу (повтор задания, клип уже `raw.mp4`), сбой распознавания и локальные сбои — без повтора, секунды не резервировались. Повторный вызов на следующей попытке дёшев: брак, осуждённый этой версией сверки, отсеивается по пометке.
+
+В `studio/src/types.ts`, в `interface SkitClip`, комментарий поля `attempts` заменить
+
+```ts
+  /** Номер попытки, с которой принят клип, в запуске, где его сняли; переобработка из raw.mp4 его не меняет. Оплаченные клипы считает omniSeconds. */
+```
+
+на
+
+```ts
+  /** Номер попытки, с которой принят клип, в запуске, где его сняли (у клипа из брака — его номер среди брака этого текста, reviveRejected); переобработка из raw.mp4 его не меняет. Оплаченные клипы считает omniSeconds. */
 ```
 
 - [ ] **Step 5: Описание `animateRun`**
@@ -800,12 +915,16 @@ function readRejectedMeta(file: string): Partial<RejectedMeta> {
 - [ ] **Step 6: Закоммитить и прогнать**
 
 ```bash
-git add studio/src/animate/run-animate.ts
-git commit -m "feat(studio): перепроверка оплаченного брака сценки до новой оплаты Omni" -m "Брак, который нынешняя сверка ещё не судила, перепроверяется до проверки предела: ролик, упавший на пределе из-за ложных отказов (889b6423), поднимается без Omni." -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git add studio/src/animate/run-animate.ts studio/src/types.ts
+git commit -m "feat(studio): перепроверка оплаченного брака сценки до новой оплаты Omni" -m "Брак, который нынешняя сверка ещё не судила, перепроверяется перед каждой оплатой, до проверки предела: ролик, упавший на пределе из-за ложных отказов (889b6423), поднимается без Omni." -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts"
+studio/scripts/node-run.sh "npx tsx --test src/worker/animate-money.test.ts"
+studio/scripts/node-run.sh "npm run typecheck"
 ```
 
-Ожидается: `ℹ fail 0`.
+Ожидается: 47/47; тест денег рабочего процесса — 0 упавших; `tsc` — пустой вывод.
+
+(При исполнении 31.10 задача шла двумя кругами: сперва вызов стоял на входе в сценку, ревью перенесло его к каждой оплате — коммиты `eda58c27`/`5d2dd3f2` и следующие за ними.)
 
 ---
 
@@ -853,6 +972,8 @@ ssh -o ConnectTimeout=15 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C"
 ### Task 6 (контролёр, с OK владельца): Слияние, выкат, «Повторить» ролика 889b6423
 
 Каждый шаг ниже, который меняет `main`, прод или ролик, — только после явного OK владельца на него.
+
+**Срок: до ≈07.11.2026.** Брак ролика 889b6423 живёт только на диске студии прода (из MinIO он удалён). `pruneOld` удаляет папки заданий старше 7 дней при старте студии, то есть на каждом выкате, а возраст считает по mtime каталога `<workRoot>/<id>` — его последний раз меняли 31.10. После ≈07.11 любой выкат или рестарт `linkeon-studio` сотрёт годные клипы, и «Повторить» снова упрётся в предел.
 
 - [ ] **Step 1: OK владельца на выкат** — коротко: что меняется (сверка, перепроверка брака), что проверено (тесты, учение), что выкат — `deploy.sh` с ноды, `BACK_ONLY=1 SKIP_BOTS=1` (фронт не меняется; машина ботов недоступна с ноды).
 
