@@ -733,10 +733,12 @@ export function planProviders(args: {
   if (args.noFallback) return ['claude'];
   const now = args.now ?? Date.now();
   const normal = (exclude?: FallbackProvider): AnswerProvider[] => {
-    const alts = FALLBACK_ORDER.filter((n) => n !== exclude && args.configs[n] !== null && !args.state.isDown(n, now));
+    const alts = FALLBACK_ORDER.filter((n) => n !== exclude && !!args.configs[n] && !args.state.isDown(n, now));
     return args.state.claudeWindowOpen(now) && alts.length > 0 ? [...alts] : ['claude', ...alts];
   };
-  if (args.selected && args.configs[args.selected] !== null) return [args.selected, ...normal(args.selected)];
+  // Проверка истинностью: незнакомое значение (из БД пришло не то) даёт
+  // undefined и идёт обычным путём, а не первым в план.
+  if (args.selected && args.configs[args.selected]) return [args.selected, ...normal(args.selected)];
   return normal();
 }
 ```
@@ -1310,8 +1312,10 @@ import {
     // Выбор пользователя (админка): сразу выбранный, при его сбое — обычный путь.
     let selected: FallbackProvider | undefined;
     if (opts.provider && !opts.noFallback) {
-      if (configs[opts.provider] !== null) selected = opts.provider;
-      else this.logger.warn(`${PROVIDER_LABELS[opts.provider]} выбран для пользователя, но ключ ${PROVIDER_DEFAULTS[opts.provider].envPrefix}_FALLBACK_API_KEY не задан — обычный путь`);
+      // Проверка истинностью: незнакомое значение (не qwen/kimi) даёт undefined —
+      // обычный путь без предупреждения; так же его отсекает planProviders.
+      if (configs[opts.provider]) selected = opts.provider;
+      else if (opts.provider in PROVIDER_DEFAULTS) this.logger.warn(`${PROVIDER_LABELS[opts.provider]} выбран для пользователя, но ключ ${PROVIDER_DEFAULTS[opts.provider].envPrefix}_FALLBACK_API_KEY не задан — обычный путь`);
     }
     const plan = planProviders({ selected, configs, state: this.fallback, noFallback: opts.noFallback });
     const breakerMs = readBreakerMs();
