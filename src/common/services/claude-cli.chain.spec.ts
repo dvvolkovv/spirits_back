@@ -37,6 +37,23 @@ function hangingProc() {
   return { stdout: { on: () => {} }, stderr: { on: () => {} }, on: () => {}, kill: () => {} } as any;
 }
 
+/** Процесс, который отвечает по команде finish() — для гонки двух вызовов. */
+function deferredProc() {
+  const outH: Array<(b: Buffer) => void> = [];
+  const on: Record<string, (...a: any[]) => void> = {};
+  const proc: any = {
+    stdout: { on: (e: string, cb: any) => { if (e === 'data') outH.push(cb); } },
+    stderr: { on: () => {} },
+    on: (e: string, cb: any) => { on[e] = cb; },
+    kill: () => {},
+  };
+  const finish = (stdout: string, code = 0) => {
+    outH.forEach((cb) => cb(Buffer.from(stdout)));
+    on['close']?.(code);
+  };
+  return { proc, finish };
+}
+
 const OK = (result: string, cost = 0.01) =>
   JSON.stringify({ is_error: false, result, total_cost_usd: cost, duration_ms: 5 });
 const AUTH_FAIL = JSON.stringify({ is_error: true, result: 'Failed to authenticate: OAuth session expired and could not be refreshed' });
@@ -92,11 +109,12 @@ afterEach(() => {
 
 describe('ClaudeCliService — аварийная цепочка Claude → Qwen → Kimi', () => {
   it('Claude и Qwen упали по доступу — отвечает Kimi: его модель, адрес и ключ', async () => {
+    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
     spawnMock
       .mockImplementationOnce(() => fakeProc(AUTH_FAIL, 1))
       .mockImplementationOnce(() => fakeProc(QWEN_401, 1))
       .mockImplementationOnce(() => fakeProc(OK('ок от kimi', 0.02)));
-    const svc = new ClaudeCliService();
+    const svc = new ClaudeCliService(pg as any);
     const r = await svc.textWithCost('привет', { model: 'claude-opus-5-5' });
     expect(r).toEqual({ text: 'ок от kimi', costUsd: 0.02 });
     expect(spawnMock).toHaveBeenCalledTimes(3);
@@ -106,6 +124,11 @@ describe('ClaudeCliService — аварийная цепочка Claude → Qwen
     expect(modelOf(2)).toBe('k3.1-pro');
     expect(spawnMock.mock.calls[2][2].env.ANTHROPIC_BASE_URL).toBe('https://api.kimi.ai/coding');
     expect(svc.fallbackStats().providers).toMatchObject({ qwen: { ok: 0, failed: 1 }, kimi: { ok: 1, failed: 0 } });
+    // Авария без выбора пользователя — событие не содержит selected вовсе
+    // (не undefined: JSON.stringify роняет такие ключи сам, но лучше проверить явно).
+    const event = JSON.parse(pg.query.mock.calls[0][1][0]);
+    expect(event).toMatchObject({ provider: 'kimi', fallback: true });
+    expect(event).not.toHaveProperty('selected');
   });
 
   it('без ключа Qwen — сразу Kimi', async () => {
@@ -124,7 +147,7 @@ describe('ClaudeCliService — аварийная цепочка Claude → Qwen
       .mockImplementationOnce(() => fakeProc(OK('c')));
     const svc = new ClaudeCliService();
     // 200 мс: подставной ответ Claude приходит на следующем тике, задолго до
-    // таймаута; висящий Qwen получает остаток бюджета и упирается в него.
+    // таймаута; висящий Qwen получает весь бюджет (он меньше минуты) и упирается в него.
     const err = await svc.text('x', { timeoutMs: 200 }).catch((e) => e);
     expect(err.message).toMatch(/^claude CLI exited with code 1: Failed to authenticate.* \| qwen fallback: claude CLI timeout/);
     expect(spawnMock).toHaveBeenCalledTimes(2);
@@ -166,6 +189,37 @@ describe('ClaudeCliService — аварийная цепочка Claude → Qwen
     expect(tokenOf(4)).toBe('sk-kimi-test');
     expect(svc.fallbackStats().breakerOpenUntil).toBeGreaterThan(0);
   });
+
+  it('отказ текстом от запасного (Qwen) — отвечает Kimi; Qwen «не отвечает», failed растёт', async () => {
+    spawnMock
+      .mockImplementationOnce(() => fakeProc(AUTH_FAIL, 1))                                        // вызов 1: Claude падает → окно
+      .mockImplementationOnce(() => fakeProc(OK('q1')))                                             // вызов 1: Qwen
+      .mockImplementationOnce(() => fakeProc(OK("You've hit your session limit · resets 3am", 0)))  // вызов 2: Qwen — отказ текстом
+      .mockImplementationOnce(() => fakeProc(OK('k')));                                             // вызов 2: Kimi
+    const svc = new ClaudeCliService();
+    await svc.text('1');
+    expect(await svc.text('2')).toBe('k');
+    const st = svc.fallbackStats();
+    expect(st.providers.qwen.downUntil).toBeGreaterThan(0);
+    expect(st.providers.qwen.failed).toBe(1);
+  });
+
+  it('параллельный вызов уронил Qwen — следующая попытка A идёт в Kimi, а не в Qwen', async () => {
+    const a = deferredProc();
+    spawnMock
+      .mockImplementationOnce(() => a.proc)                 // вызов A: Claude висит
+      .mockImplementationOnce(() => fakeProc(QWEN_401, 1))   // вызов B (provider: qwen): падает
+      .mockImplementationOnce(() => fakeProc(OK('cB')))      // вызов B: Claude
+      .mockImplementationOnce(() => fakeProc(OK('kA')));     // вызов A (после AUTH_FAIL): план знал только про Claude/Qwen/Kimi — но Qwen к этому моменту «не отвечает» (уронил B), поэтому Kimi
+    const svc = new ClaudeCliService();
+    const pA = svc.text('A');
+    expect(spawnMock).toHaveBeenCalledTimes(1); // A висит на Claude
+    expect(await svc.text('B', { provider: 'qwen' })).toBe('cB');
+    expect(svc.fallbackStats().providers.qwen.downUntil).toBeGreaterThan(0); // B уронил Qwen
+    a.finish(AUTH_FAIL, 1);
+    expect(await pA).toBe('kA');
+    expect(tokenOf(3)).toBe('sk-kimi-test');
+  });
 });
 
 describe('ClaudeCliService — выбор пользователя Kimi', () => {
@@ -205,15 +259,26 @@ describe('ClaudeCliService — выбор пользователя Kimi', () => 
     expect(svc.fallbackStats().providers.kimi.downUntil).toBe(0);
   });
 
+  it('отказ текстом от выбранного (Kimi) — отвечает Claude; аварийные счётчики не растут', async () => {
+    spawnMock
+      .mockImplementationOnce(() => fakeProc(OK("You've hit your session limit · resets 3am", 0)))
+      .mockImplementationOnce(() => fakeProc(OK('c')));
+    const svc = new ClaudeCliService();
+    expect(await svc.text('x', { provider: 'kimi' })).toBe('c');
+    expect(svc.fallbackStats()).toMatchObject({ ok: 0, failed: 0, breakerOpenUntil: 0 });
+  });
+
   it('выбранный и Claude упали — Qwen (аварийно): событие fallback true, selected kimi', async () => {
     const pg = pgMock();
     spawnMock
       .mockImplementationOnce(() => fakeProc(KIMI_401, 1))
       .mockImplementationOnce(() => fakeProc(AUTH_FAIL, 1))
       .mockImplementationOnce(() => fakeProc(OK('q')));
-    expect(await new ClaudeCliService(pg as any).text('x', { provider: 'kimi' })).toBe('q');
+    const svc = new ClaudeCliService(pg as any);
+    expect(await svc.text('x', { provider: 'kimi' })).toBe('q');
     expect(tokenOf(2)).toBe('sk-sp-test');
     expect(event(pg)).toMatchObject({ provider: 'qwen', fallback: true, selected: 'kimi' });
+    expect(svc.fallbackStats().breakerOpenUntil).toBeGreaterThan(0);
   });
 
   it('упали все — ошибка начинается с выбранного', async () => {
@@ -221,8 +286,13 @@ describe('ClaudeCliService — выбор пользователя Kimi', () => 
       .mockImplementationOnce(() => fakeProc(KIMI_401, 1))
       .mockImplementationOnce(() => fakeProc(AUTH_FAIL, 1))
       .mockImplementationOnce(() => fakeProc(QWEN_401, 1));
-    const err = await new ClaudeCliService().text('x', { provider: 'kimi' }).catch((e) => e);
+    const svc = new ClaudeCliService();
+    const err = await svc.text('x', { provider: 'kimi' }).catch((e) => e);
     expect(err.message).toMatch(/^kimi \(выбран\): .*401.* \| claude fallback: .*Failed to authenticate.* \| qwen fallback: .*401/);
+    const st = svc.fallbackStats();
+    expect(st.breakerOpenUntil).toBe(0);
+    expect(st.providers.kimi.downUntil).toBeGreaterThan(0);
+    expect(st.providers.qwen.downUntil).toBeGreaterThan(0);
   });
 
   it('выбранный при открытом окне Claude: его сбой — сразу Qwen, без попытки Claude', async () => {

@@ -107,6 +107,9 @@ describe('isFallbackWorthy', () => {
     'claude CLI error: API Error: 429 rate limit',
     'claude CLI error: API Error: 529 Overloaded',
     'claude CLI exited with code 1: Failed to authenticate. API Error: 401 Invalid Authentication',
+    'claude CLI error: API Error: 403 {"code":"AccessDenied.Unpurchased","message":"Access denied"}',
+    'claude CLI error: API Error: 403 Forbidden',
+    'claude CLI error: API Error: 400 Arrearage: your account is overdue',
   ])('переключаемся: %s', (msg) => {
     expect(isFallbackWorthy(msg)).toBe(true);
   });
@@ -299,7 +302,10 @@ describe('planProviders', () => {
   it('незнакомый выбор (из БД пришло не то) — обычный путь', () => {
     expect(planProviders({ selected: 'gpt' as FallbackProvider, configs: both, state: new FallbackState(), now: T })).toEqual(['claude', 'qwen', 'kimi']);
   });
-  it('выбран Kimi, окно Claude открыто, Qwen «не отвечает» — только Kimi', () => {
+  it('выбор — имя из прототипа объекта (constructor) — обычный путь', () => {
+    expect(planProviders({ selected: 'constructor' as FallbackProvider, configs: both, state: new FallbackState(), now: T })).toEqual(['claude', 'qwen', 'kimi']);
+  });
+  it('выбран Kimi, окно Claude открыто, Qwen «не отвечает» — Kimi, затем Claude', () => {
     const s = new FallbackState();
     s.openClaudeWindow(60_000, T);
     s.markDown('qwen', 60_000, T);
