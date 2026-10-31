@@ -11,7 +11,7 @@ describe('ClaudeHealthService — aggregateUsage считает только Cla
   it('оба подзапроса (суммы/счёт и топ моделей) фильтруют provider = claude', async () => {
     const pg = { query: jest.fn().mockResolvedValue({ rows: [{}] }) };
     const claudeCli = { text: jest.fn(), fallbackStats: jest.fn() };
-    const svc = new ClaudeHealthService(pg as any, claudeCli as any);
+    const svc = new ClaudeHealthService(pg as any, claudeCli as any, { get: jest.fn(async () => 'claude') } as any);
 
     await (svc as any).aggregateUsage();
 
