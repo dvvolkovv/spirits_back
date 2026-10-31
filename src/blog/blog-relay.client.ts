@@ -26,10 +26,13 @@ export class BlogRelayClient {
   private readonly logger = new Logger(BlogRelayClient.name);
 
   constructor(
-    // Общий рубильник модели (spec 2026-10-31-global-llm-switch): фоновые
-    // посты автоблога идут через модель рубильника. Без @Optional(): при
-    // поломке DI старт упадёт (поймает smoke), а не автоблог молча останется
-    // на Claude; тесты создают клиент через new без аргумента.
+    // Общий рубильник модели (spec 2026-10-31-global-llm-switch): этот
+    // клиент ОБЩИЙ — фоновые посты автоблога (BlogModule) И сценарист с
+    // режиссёром студии роликов (ShortsWriterService, ShortsDirectorService;
+    // свой экземпляр класса заведён в shorts.module.ts, с блогом не делится)
+    // идут через модель рубильника. Без @Optional(): при поломке DI старт
+    // упадёт (поймает smoke), а не автоблог или студия молча останутся на
+    // Claude; тесты создают клиент через new без аргумента.
     private readonly globalProvider?: GlobalLlmProviderService,
   ) {}
 

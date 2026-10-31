@@ -2695,7 +2695,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
     fd.append('sessionId', relaySid);
     // Модель ответов: личный выбор этого человека или общий рубильник (spec
     // 2026-10-31-global-llm-switch, раздел 4) — рутины, «Путь», план действий,
-    // поездки, итоги и документы звонков, проба качества.
+    // поездки, итоги и документы звонков, проба качества. ЛИЧНЫЙ выбор, а не
+    // только рубильник, — потому что рутины и «Путь» (без своей sessionIdOverride)
+    // пишут в ТУ ЖЕ сессию релея, что и чат человека (relaySessionKey выше —
+    // та же формула, что в основном пути). Разные модели у чата и у этих
+    // фоновых путей заставляли бы одну сессию скакать между провайдерами и
+    // каждый раз оплачивать весь контекст заново, без кэша.
     const route = await resolveAnswerProvider(false, userId, this.llmProvider);
     for (const [k, v] of Object.entries(relayProviderFields(false, route.provider))) fd.append(k, v);
     // Инструменты Linkeon — только когда вызывающий явно сказал linkeonTools:
@@ -2733,6 +2738,21 @@ ${LanguageService.buildDirective(userLanguage)}`;
                 for (const k of Object.keys(usage) as (keyof SdkUsageTotals)[]) {
                   const v = ev.usage[k];
                   if (typeof v === 'number' && v > 0) usage[k] += v;
+                }
+              }
+              // Видимость (ревью 1.11, spec 2026-10-31-global-llm-switch §4):
+              // цепочка релея может тихо ответить не той моделью, что выбрал
+              // route выше (недоступность выбранной). Только лог — НЕ событие
+              // chat_quality: этот путь (рутины, план действий, поездки,
+              // итоги/документы звонков, проба качества) не должен портить
+              // метрики монитора качества своими вызовами. При route.provider
+              // === 'claude' не проверяем: запросу не передан provider, и
+              // релей по тому же соглашению может не прислать его в done —
+              // readDoneProvider() тогда честно вернёт undefined, а не 'claude'.
+              if (route.provider !== 'claude') {
+                const { provider: turnProvider } = readDoneProvider(ev);
+                if (turnProvider && turnProvider !== route.provider) {
+                  this.logger.warn(`agentReply: выбрана ${route.provider} (${route.choice}), ответил ${turnProvider}`);
                 }
               }
             }
