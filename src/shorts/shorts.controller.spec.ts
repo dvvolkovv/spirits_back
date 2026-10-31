@@ -321,9 +321,9 @@ describe('POST admin/shorts', () => {
   });
 
   it('reject идеи — idea → rejected: условие на статус в записи; версия строки, если пришла, — тоже', async () => {
-    const idea = video({ status: 'idea', failed_from: null });
+    const idea = video({ status: 'idea', failed_from: null, video_key: null });
     const answer = (sql: string) =>
-      sql.includes('RETURNING') ? { rows: [video({ status: 'rejected', failed_from: null })] } : { rows: [idea] };
+      sql.includes('RETURNING') ? { rows: [video({ status: 'rejected', failed_from: null, video_key: null })] } : { rows: [idea] };
 
     const plain = setup(answer);
     const r = res();
@@ -347,7 +347,7 @@ describe('POST admin/shorts', () => {
       setup((sql) => {
         if (sql.includes('RETURNING')) return { rows: [] };
         if (sql.includes('AS released')) return { rows: row ? [row] : [] };
-        return { rows: [video({ status: 'idea', failed_from: null })] };
+        return { rows: [video({ status: 'idea', failed_from: null, video_key: null })] };
       });
     await expect(race({ status: 'directing', released: false }).ctl.action({ action: 'reject', id: ID }, res())).rejects.toThrow(
       'Идея уже в работе — отклонить можно будет готовый ролик. Обновите список.',
@@ -368,6 +368,32 @@ describe('POST admin/shorts', () => {
     const bad = race(null);
     await expect(bad.ctl.action({ action: 'reject', id: ID, version: 'не версия' }, res())).rejects.toBeInstanceOf(BadRequestException);
     expect(bad.pg.query.mock.calls.some((c: any[]) => String(c[0]).startsWith('UPDATE'))).toBe(false);
+  });
+
+  it('reject идеи, уже отклонённой при самом чтении (другая вкладка успела раньше), — «Ролик уже отклонён», без записи', async () => {
+    const { ctl, pg } = setup(() => ({ rows: [video({ status: 'rejected', failed_from: null, video_key: null })] }));
+    await expect(ctl.action({ action: 'reject', id: ID }, res())).rejects.toThrow('Ролик уже отклонён. Обновите список.');
+    expect(pg.query.mock.calls.some((c: any[]) => String(c[0]).startsWith('UPDATE'))).toBe(false);
+  });
+
+  it('reject идеи логируется одной строкой: id и итоговый статус', async () => {
+    const logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    const { ctl } = setup((sql) =>
+      sql.includes('RETURNING')
+        ? { rows: [video({ status: 'rejected', failed_from: null, video_key: null })] }
+        : { rows: [video({ status: 'idea', failed_from: null, video_key: null })] });
+    await ctl.action({ action: 'reject', id: ID }, res());
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining(`admin/shorts reject ${ID}: rejected`));
+    logSpy.mockRestore();
+  });
+
+  it('reject идеи с версией — код невозможной даты (22008) на записи превращается в 400', async () => {
+    const { ctl } = setup((sql) => {
+      if (sql.includes('RETURNING')) throw Object.assign(new Error('date/time field value out of range'), { code: '22008' });
+      return { rows: [video({ status: 'idea', failed_from: null, video_key: null })] };
+    });
+    const err: any = await ctl.action({ action: 'reject', id: ID, version: VERSION }, res()).catch((e: any) => e);
+    expect(err).toBeInstanceOf(BadRequestException);
   });
 
   it('mark_published — отмечает telegram вышедшим и возвращает ролик в approved', async () => {
