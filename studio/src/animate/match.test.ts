@@ -77,20 +77,19 @@ test('знак ударения не делит слово', () => {
 });
 
 test('корпус: клипы, принятые на проде и стенде, остаются принятыми', () => {
-  for (const c of ACCEPTED) assert.equal(speechCheck(c.lines, c.heard).ok, true, c.name);
+  const bad = ACCEPTED.map((c) => ({ name: c.name, ...speechCheck(c.lines, c.heard) })).filter((r) => !r.ok);
+  assert.deepEqual(bad, []);
 });
 
 test('корпус: годные клипы, которые прежняя сверка отвергла, — приняты', () => {
-  for (const c of FALSE_REJECTS) {
-    const r = speechCheck(c.lines, c.heard);
-    assert.equal(r.ok, true, `${c.name}: ${JSON.stringify(r)}`);
-  }
+  const bad = FALSE_REJECTS.map((c) => ({ name: c.name, ...speechCheck(c.lines, c.heard) })).filter((r) => !r.ok);
+  assert.deepEqual(bad, []);
 });
 
 test('корпус: настоящий брак отвергнут, непрозвучавшие реплики названы', () => {
-  for (const c of TRUE_REJECTS) {
-    const r = speechCheck(c.lines, c.heard);
-    assert.equal(r.ok, false, c.name);
-    assert.deepEqual(r.silentLines, c.silent, c.name);
-  }
+  const got = TRUE_REJECTS.map((c) => {
+    const { ok, silentLines } = speechCheck(c.lines, c.heard);
+    return { name: c.name, ok, silentLines };
+  });
+  assert.deepEqual(got, TRUE_REJECTS.map((c) => ({ name: c.name, ok: false, silentLines: c.silent })));
 });
