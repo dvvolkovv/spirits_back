@@ -101,7 +101,8 @@ export class TgRouterService {
     private readonly agents: AgentsService,
     private readonly claudeCli: ClaudeCliService,
     @Optional() private readonly neo4j?: Neo4jService,
-    // Модель ответов владельца (админка, spec 2026-10-30-llm-provider-switch).
+    // Модель ответов владельца: личный выбор или общий рубильник (админка,
+    // spec 2026-10-30-llm-provider-switch, 2026-10-31-global-llm-switch).
     // Последним и @Optional: спеки собирают роутер позиционно.
     @Optional() private readonly llmProvider?: UserLlmProviderService,
   ) {}

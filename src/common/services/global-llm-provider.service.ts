@@ -74,6 +74,10 @@ export class GlobalLlmProviderService implements OnModuleInit {
     }
   }
 
+  /** Не бросает: сбой базы — последнее известное значение или Claude.
+   *  UserLlmProviderService.route() держит свой try/catch вокруг этого вызова
+   *  как вторую линию защиты, но прежде всего полагается на этот контракт —
+   *  нарушать его нельзя. */
   async get(now: number = Date.now()): Promise<AnswerProvider> {
     const c = this.cached;
     if (c && now >= c.at && now - c.at < GLOBAL_PROVIDER_CACHE_MS) return c.provider;

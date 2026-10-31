@@ -1,6 +1,6 @@
-import { Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { PgService } from './pg.service';
-import { ANSWER_PROVIDERS, AnswerProvider, isAnswerProvider } from './llm-fallback';
+import { ANSWER_PROVIDERS, AnswerProvider, ProviderChoice, isAnswerProvider } from './llm-fallback';
 import { GlobalLlmProviderService } from './global-llm-provider.service';
 
 /** Модель ответов: 'claude', 'qwen' или 'kimi'. */
@@ -18,7 +18,7 @@ export function isLlmChoice(v: unknown): v is LlmChoice {
 /** Чем отвечать человеку: модель и чей это выбор (null — проба, выбора нет). */
 export interface AnswerRoute {
   provider: AnswerProvider;
-  choice: 'user' | 'global' | null;
+  choice: ProviderChoice | null;
 }
 
 /**
@@ -37,11 +37,24 @@ export class UserLlmProviderService implements OnModuleInit {
 
   constructor(
     private readonly pg: PgService,
-    @Optional() private readonly globalProvider?: GlobalLlmProviderService,
+    // Без @Optional(): рубильник веб-чата не должен молча остаться на Claude,
+    // если граф DI не нашёл GlobalLlmProviderService. Без декоратора Nest
+    // считает зависимость обязательной и валит старт при поломке графа —
+    // поймает smoke на test, а не тишина на проде (spec
+    // 2026-10-31-global-llm-switch). TS-опциональность (?) сохранена ради
+    // юнит-тестов: они создают сервис через `new` без второго аргумента, как
+    // pg? у ClaudeCliService. Сторож типа — design:paramtypes в
+    // user-llm-provider.service.spec.ts.
+    private readonly globalProvider?: GlobalLlmProviderService,
   ) {}
 
   async onModuleInit(): Promise<void> {
     try {
+      // ALTER TABLE ... ADD COLUMN берёт ACCESS EXCLUSIVE lock на всю таблицу,
+      // даже с IF NOT EXISTS, — проверяем через information_schema сначала:
+      // когда колонка уже есть (обычный случай после первого запуска), лок
+      // не берётся вовсе. Без значения по умолчанию и без индекса сам ALTER
+      // (когда он всё же нужен) — мгновенный.
       const exists = await this.pg.query(
         "SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'ai_profiles_consolidated' AND column_name = 'llm_provider'",
       );
@@ -78,11 +91,26 @@ export class UserLlmProviderService implements OnModuleInit {
     return (r.rowCount ?? 0) > 0;
   }
 
-  /** Чем отвечать человеку: личный выбор, иначе общий рубильник. */
-  async route(userId: string): Promise<AnswerRoute> {
+  /**
+   * Чем отвечать человеку: личный выбор, иначе общий рубильник.
+   *
+   * globalProvider.get() не бросает по контракту (см. его JSDoc), но вызов
+   * здесь — вторая линия защиты сверх этого контракта: вызывающий в
+   * chat.service.ts стоит ВНЕ try, уже после снятия in-flight метки дедупа,
+   * и необработанное исключение тут заблокировало бы повтор того же
+   * сообщения пользователем на 10 минут. При сбое — Claude.
+   */
+  async route(userId: string): Promise<{ provider: AnswerProvider; choice: ProviderChoice }> {
     const mine = await this.get(userId);
     if (mine !== 'default') return { provider: mine, choice: 'user' };
-    const provider = this.globalProvider ? await this.globalProvider.get() : 'claude';
+    let provider: AnswerProvider = 'claude';
+    if (this.globalProvider) {
+      try {
+        provider = await this.globalProvider.get();
+      } catch (e: any) {
+        this.logger.warn(`рубильник не прочитан, ответ Claude: ${e?.message}`);
+      }
+    }
     return { provider, choice: 'global' };
   }
 }

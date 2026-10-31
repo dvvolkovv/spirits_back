@@ -465,7 +465,8 @@ export class ChatService {
     // @Optional по той же причине, что chatFiles; что модуль подключён,
     // сторожит chat.product-actions-wiring.spec.ts.
     @Optional() private readonly productActions?: ProductActionsService,
-    // Модель ответов человека (админка, spec 2026-10-30-llm-provider-switch).
+    // Модель ответов человека: личный выбор или общий рубильник (админка,
+    // spec 2026-10-30-llm-provider-switch, 2026-10-31-global-llm-switch).
     // Последним и @Optional по той же причине, что chatFiles.
     @Optional() private readonly llmProvider?: UserLlmProviderService,
     // Приписка пробы без входа (src/guest-trial/guest-carry.ts). Последним и
@@ -1827,6 +1828,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
       if (final) {
         // Quality-телеметрия: пустой ответ / англ-утечка / объём — для агрегатов
         // и алертов регрессии (инициатива «гарантия качества», беклог a867ef3b).
+        // routed — выбор не Claude (личный или рубильник); «выбранный подвёл» — selected ≠ provider.
+        const routed = answerRoute.provider !== 'claude';
         this.events?.track('chat_quality', {
           userId, sessionId: `${userId}_${assistantId}`,
           props: {
@@ -1843,9 +1846,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
             fail_reason: failReason || undefined,
             provider: turnProvider,
             fallback: turnFallback || undefined,
-            // Выбор (не Claude) — личный или рубильник (choice); «выбранный подвёл» — selected ≠ provider.
-            selected: answerRoute.provider === 'claude' ? undefined : answerRoute.provider,
-            choice: answerRoute.provider === 'claude' ? undefined : (answerRoute.choice ?? undefined),
+            selected: routed ? answerRoute.provider : undefined,
+            choice: routed ? answerRoute.choice : undefined,
           },
         });
       }
