@@ -68,6 +68,19 @@ describe('GlobalLlmReminderService', () => {
     );
   });
 
+  // Ревью 01.11 (R2): гостевой internal — сбой базы уже после ответа модели,
+  // а не «без ответа» от неё; в счёт гостей идут только breaker и model.
+  it('гости в счёте — только ошибки о модели (breaker, model), без internal', async () => {
+    process.env.KIMI_FALLBACK_API_KEY = 'sk-kimi-test';
+    const g = { status: jest.fn(async () => ({ provider: 'kimi', since: null, by: null })) };
+    const pg = pgDay();
+    const s = new GlobalLlmReminderService(g as any, health('ok') as any, pg as any);
+    await s.remind();
+    const [sql] = (pg.query as jest.Mock).mock.calls[0];
+    expect(sql).toMatch(/props->>'reason' IN \('breaker', 'model'\)/);
+    expect(sql).not.toMatch(/internal/);
+  });
+
   it('сбой счёта — напоминание уходит без строки «За сутки»', async () => {
     process.env.KIMI_FALLBACK_API_KEY = 'sk-kimi-test';
     const g = { status: jest.fn(async () => ({ provider: 'kimi', since: null, by: null })) };

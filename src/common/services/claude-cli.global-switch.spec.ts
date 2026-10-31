@@ -354,3 +354,53 @@ describe('ClaudeCliService — гонка с сервисом рубильник
     expect(tokenOf(1)).toBe('sk-sp-test');
   });
 });
+
+/**
+ * Суточный счёт без двойного учёта (ревью 01.11, R2): отказ CLI обычным
+ * текстом («You've hit your … limit», «Not logged in») runRaw считает сбоем и
+ * уходит к следующей модели. Событие такого запуска — ok: false, иначе один
+ * вызов попадал бы в напоминании и в «ответила», и в «ответил другой».
+ * Стоимость отказа в событии остаётся: суммы расхода ok не фильтруют.
+ */
+describe('ClaudeCliService — отказ текстом в событии claude_cli_call', () => {
+  const LIMIT = "You've hit your session limit · resets 3am";
+
+  it('json: рубильник Qwen, Qwen отказал текстом, ответил Claude — у Qwen ok:false (со стоимостью), у Claude ok:true', async () => {
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const pg = pgMock();
+    spawnMock
+      .mockImplementationOnce(() => fakeProc(OK(LIMIT, 0.002)))
+      .mockImplementationOnce(() => fakeProc(OK('c')));
+    expect(await svc(pg, sw('qwen')).text('x')).toBe('c');
+    expect(pg.query).toHaveBeenCalledTimes(2);
+    expect(event(pg, 0)).toMatchObject({ provider: 'qwen', ok: false, cost_usd: 0.002, selected: 'qwen', choice: 'global' });
+    expect(event(pg, 1)).toMatchObject({ provider: 'claude', ok: true, selected: 'qwen', choice: 'global' });
+  });
+
+  it('stream-json: то же — у Qwen ok:false, у Claude ok:true', async () => {
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const pg = pgMock();
+    spawnMock
+      .mockImplementationOnce(() => fakeProc(streamOk(LIMIT, 0.002)))
+      .mockImplementationOnce(() => fakeProc(streamOk('готово')));
+    const r = await svc(pg, sw('qwen')).textWithCost('x', { onProgress: () => {} });
+    expect(r.text).toBe('готово');
+    expect(pg.query).toHaveBeenCalledTimes(2);
+    expect(event(pg, 0)).toMatchObject({ provider: 'qwen', ok: false, cost_usd: 0.002, selected: 'qwen', choice: 'global' });
+    expect(event(pg, 1)).toMatchObject({ provider: 'claude', ok: true, selected: 'qwen', choice: 'global' });
+  });
+
+  it('одна попытка (проба мониторинга) — отказ уходит вызывающему как есть, в событии ok:false', async () => {
+    const pg = pgMock();
+    spawnMock.mockImplementationOnce(() => fakeProc(OK(LIMIT, 0)));
+    expect(await svc(pg, sw('claude')).text('probe', { noFallback: true })).toBe(LIMIT);
+    expect(event(pg)).toMatchObject({ provider: 'claude', ok: false });
+  });
+
+  it('обычный ответ — ok:true', async () => {
+    const pg = pgMock();
+    spawnMock.mockImplementationOnce(() => fakeProc(OK('Здравствуйте')));
+    expect(await svc(pg, sw('qwen')).text('x')).toBe('Здравствуйте');
+    expect(event(pg)).toMatchObject({ provider: 'qwen', ok: true });
+  });
+});
