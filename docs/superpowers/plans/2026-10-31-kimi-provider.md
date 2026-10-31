@@ -3432,15 +3432,20 @@ Expected: `CHECK_OK`; `# fail 0` (или базовое число из Task 0).
 W=/private/tmp/claude-501/-Users-dmitry-Downloads-spirits-front/2ee1bf56-31d4-4343-84d9-321f7e3c99d0/scratchpad/relay-live-kimi
 rm -rf "${W}" && mkdir -p "${W}"
 ssh dv@5.101.115.184 'cd ~/file-agent && git rev-parse --short HEAD && git status --short && sha256sum server.mjs'
-ssh dv@5.101.115.184 'cd ~/file-agent && tar czf - --exclude=node_modules --exclude=.git --exclude="sessions.json*" --exclude=secrets .' > "${W}/live.tgz"
+ssh -n dv@5.101.115.184 'cd ~/file-agent && tar czf - --exclude=node_modules --exclude=.git --exclude="sessions.json*" --exclude=secrets \
+  --exclude=.env --exclude="relay-secrets*" --exclude="relay-auth-mode*" --exclude=empty-mcp.json --exclude=uploads --exclude=_old-backups \
+  --exclude="server.mjs.bak*" --exclude="server.mjs.regression-*" --exclude="*.bak-mcp-*" .' > "${W}/live.tgz"
 tar xzf "${W}/live.tgz" -C "${W}" && rm "${W}/live.tgz"
 B=~/Downloads/spirits_back/.worktrees/kimi-provider/relay-agent
-cp "${B}/llm-fallback.mjs" "${B}/llm-fallback.test.mjs" "${B}/llm-fallback-patch.py" "${W}/"
+cp "${B}/llm-fallback.mjs" "${B}/llm-fallback.test.mjs" "${B}/llm-fallback-patch.py" "${B}/empty-mcp.json" "${W}/"
 python3 "${W}/llm-fallback-patch.py" "${W}/server.mjs"
 rm "${W}/qwen-provider.mjs" "${W}/qwen-provider.test.mjs"
+ls -a "${W}" | grep -E '^\.env|relay-secrets|relay-auth-mode|^secrets$' ; echo "секретов в копии: $?"
 ```
 
-Expected: HEAD `e5c2737` (иначе — стоп и доклад: живой релей ушёл вперёд); в `git status` — не больше `?? sessions.json.bak-*`; sha256 живого `server.mjs` — записать в отчёт (Task 13 сверит); `ok: …/server.mjs`.
+Expected: HEAD `e5c2737` (иначе — стоп и доклад: живой релей ушёл вперёд); в `git status` — не больше `?? sessions.json.bak-*`; sha256 живого `server.mjs` — записать в отчёт (Task 13 сверит); `ok: …/server.mjs`; `секретов в копии: 1` (grep ничего не нашёл).
+
+Почему исключения: в каталоге живого релея лежат `.env`, `relay-secrets*`, `relay-auth-mode*` и боевой `empty-mcp.json` с MCP_SECRET прода — ни в scratchpad мака, ни на тест-ноду им нельзя. `empty-mcp.json` берётся шаблоном из репозитория (`{"mcpServers": {}}`). Без `relay-auth-mode` релей стенда работает в режиме `log` и запросы пропускает — так и нужно для сценариев. `ssh -n` — чтобы ssh не съел stdin, если команды идут скриптом через `bash -s`.
 
 - [ ] **Step 2: Стенд на ноде — только 127.0.0.1**
 
@@ -3496,10 +3501,20 @@ Expected:
 - [ ] **Step 5: Уборка стенда (обязательно, даже при провале)**
 
 ```bash
-ssh dv@85.192.61.231 'for p in $(pgrep -u dv -f "node server.mjs"); do [ "$(readlink /proc/$p/cwd)" = "$HOME/relay-kimi-check" ] && kill $p; done; read -t 2 < /dev/zero 2>/dev/null; rm -rf "$(cat ~/relay-kimi-check/cfgdir.txt)" ~/relay-kimi-check /home/dv/file-agent /tmp/agent-uploads /tmp/agent-output; ss -ltn | grep -c ":3033 "'
+ssh dv@85.192.61.231 'bash -s' <<'EOF'
+# Только node-процессы стенда: шаблон «serve[r]» не совпадает с командной строкой
+# самой оболочки, а comm=node и cwd стенда отсекают всё остальное.
+for p in $(pgrep -u dv -f "node serve[r].mjs|node fake-anthropi[c].mjs"); do
+  [ "$(cat /proc/$p/comm 2>/dev/null)" = "node" ] || continue
+  [ "$(readlink /proc/$p/cwd)" = "$HOME/relay-kimi-check" ] && kill "$p"
+done
+read -t 2 < /dev/zero 2>/dev/null
+rm -rf "$(cat ~/relay-kimi-check/cfgdir.txt 2>/dev/null)" ~/relay-kimi-check /home/dv/file-agent /tmp/agent-uploads /tmp/agent-output
+ss -ltn | grep -cE ":3033 |:3399 "
+EOF
 ```
 
-Expected: `0`.
+Expected: `0`. (Прежняя команда — `pgrep -f "node server.mjs"` одной строкой в ssh — находила и саму удалённую оболочку: её командная строка содержит шаблон, а cwd тот же; оболочка убивала себя, ssh выходил с 255, стенд оставался.)
 
 - [ ] **Step 6:** `${W}/server.mjs`, `${W}/llm-fallback.mjs`, `${W}/llm-fallback.test.mjs` остаются в scratchpad до Task 13 (выкат релея). В отчёт — sha256 живого `server.mjs` до патча (Step 1).
 
@@ -3952,4 +3967,4 @@ Expected: `OK {"text":"ок"…}`, `kimi.enabled: true`.
 - **Task 8–9, по ревью:** после штатного повтора ход идёт по плану циклом (раньше — один переход, и при 529 у Claude и 429 у Qwen до Kimi не доходило); `isNonRetryAccess` (403/Forbidden/AccessDenied/Arrearage) в модуле, при невозможности перейти — уведомление вместо сырого текста; выбранный провайдер без единого `result` уступает ход; `region()` сверяет sha256 заменяемых кусков (ручная правка на релее остановит врезку); мелочи (`8e131862`, `d86bbebf`, `d900fa3d`, `4e268b25`).
 - **Task 11, по ревью:** подсказка про ответ Claude — только при выбранном не-Claude; «·» в пометке скрыт от скринридера; pt — «quem responde é o Claude»; комментарий в `UserActivityDrawer.tsx` (фронт `70ceecc`, `7fb8b78`).
 - **Task 13:** `deploy.sh` с ноды — только после `source ~/.nvm/nvm.sh`.
-- **Task 10, на стенде 31.10:** (1) снимок живого релея в плане прихватывал `.env`, `relay-secrets*`, `relay-auth-mode*` и боевой `empty-mcp.json` (MCP_SECRET прода) — исключать их (`--exclude=.env --exclude="relay-secrets*" --exclude="relay-auth-mode*" --exclude=empty-mcp.json --exclude=uploads --exclude=_old-backups --exclude="server.mjs.bak*" --exclude="server.mjs.regression-*" --exclude="*.bak-mcp-*"`), шаблон `empty-mcp.json` брать из репозитория; без `relay-auth-mode` релей в режиме `log` и запросы пропускает. (2) Уборка `pgrep -f "node server.mjs"` + проверка cwd убивала саму удалённую оболочку (её командная строка содержит шаблон, cwd тот же) — шаблон `"node serve[r].mjs"`, проверка `comm=node`, скрипт — через `bash -s`. Кроме пяти сценариев на живых ключах стенд прогнал поддельный API на 127.0.0.1 (Claude 529, Qwen 429 / Arrearage, Kimi настоящий): цепочка доходит до Kimi, следующий ход сразу на Kimi, Arrearage — переход без повтора, без запасных — уведомление без сырого текста. sha256 живого `server.mjs` до выката — `48a16def5b565c9e347deb2f6dd8de6b47ba49e395a4fee2a9af75b99e5c72bb` (HEAD e5c2737).
+- **Task 10, на стенде 31.10** (вписано в Step 1 и Step 5 после итогового ревью): (1) снимок живого релея в плане прихватывал `.env`, `relay-secrets*`, `relay-auth-mode*` и боевой `empty-mcp.json` (MCP_SECRET прода) — исключать их (`--exclude=.env --exclude="relay-secrets*" --exclude="relay-auth-mode*" --exclude=empty-mcp.json --exclude=uploads --exclude=_old-backups --exclude="server.mjs.bak*" --exclude="server.mjs.regression-*" --exclude="*.bak-mcp-*"`), шаблон `empty-mcp.json` брать из репозитория; без `relay-auth-mode` релей в режиме `log` и запросы пропускает. (2) Уборка `pgrep -f "node server.mjs"` + проверка cwd убивала саму удалённую оболочку (её командная строка содержит шаблон, cwd тот же) — шаблон `"node serve[r].mjs"`, проверка `comm=node`, скрипт — через `bash -s`. Кроме пяти сценариев на живых ключах стенд прогнал поддельный API на 127.0.0.1 (Claude 529, Qwen 429 / Arrearage, Kimi настоящий): цепочка доходит до Kimi, следующий ход сразу на Kimi, Arrearage — переход без повтора, без запасных — уведомление без сырого текста. sha256 живого `server.mjs` до выката — `48a16def5b565c9e347deb2f6dd8de6b47ba49e395a4fee2a9af75b99e5c72bb` (HEAD e5c2737).
