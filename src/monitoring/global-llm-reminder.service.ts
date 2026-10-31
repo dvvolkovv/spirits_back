@@ -4,7 +4,7 @@ import { GlobalLlmProviderService } from '../common/services/global-llm-provider
 import { FallbackProvider, readFallbackConfigs } from '../common/services/llm-fallback';
 import { PgService } from '../common/services/pg.service';
 import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert';
-import { GlobalLlmDayCounts, reminderText, standPrefix } from '../common/global-llm-messages';
+import { GlobalLlmDayCounts, reminderText } from '../common/global-llm-messages';
 import { ClaudeHealthOverview, ClaudeHealthService } from './claude-health.service';
 
 /**
@@ -57,12 +57,12 @@ export class GlobalLlmReminderService {
     });
     // Без настроенного Telegram — в лог (как send() у RelayQwenMonitorService):
     // иначе сбой отправки означал бы, что напоминание не оставило никакого
-    // следа вовсе.
+    // следа вовсе. На test нет TELEGRAM_* — сообщения стенда остаются в логе.
     if (!telegramConfigured()) {
       this.logger.warn(`рубильник: напоминание (нет Telegram): ${text.replace(/<[^>]+>/g, '')}`);
       return true;
     }
-    await sendTelegramAlert(standPrefix() + text).catch((e: any) => this.logger.warn(`напоминание о рубильнике не отправлено: ${e?.message}`));
+    await sendTelegramAlert(text).catch((e: any) => this.logger.warn(`напоминание о рубильнике не отправлено: ${e?.message}`));
     return true;
   }
 

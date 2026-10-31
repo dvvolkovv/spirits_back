@@ -21,14 +21,13 @@ const pgDay = (answered = 0, byOther = 0, failed = 0, guests = 0) => ({
 });
 
 describe('GlobalLlmReminderService', () => {
-  const OLD = { kimi: process.env.KIMI_FALLBACK_API_KEY, backend: process.env.BACKEND_URL };
+  const OLD = process.env.KIMI_FALLBACK_API_KEY;
   afterEach(() => {
     (sendTelegramAlert as jest.Mock).mockClear();
     (sendTelegramAlert as jest.Mock).mockImplementation(async () => undefined);
     (telegramConfigured as jest.Mock).mockClear();
     (telegramConfigured as jest.Mock).mockImplementation(() => true);
-    if (OLD.kimi === undefined) delete process.env.KIMI_FALLBACK_API_KEY; else process.env.KIMI_FALLBACK_API_KEY = OLD.kimi;
-    if (OLD.backend === undefined) delete process.env.BACKEND_URL; else process.env.BACKEND_URL = OLD.backend;
+    if (OLD === undefined) delete process.env.KIMI_FALLBACK_API_KEY; else process.env.KIMI_FALLBACK_API_KEY = OLD;
   });
 
   it('рубильник на Claude — молчит', async () => {
@@ -102,14 +101,6 @@ describe('GlobalLlmReminderService', () => {
     expect(sendTelegramAlert).not.toHaveBeenCalled();
     expect(warn.mock.calls.map((c) => String(c[0])).join('\n')).toContain('Все отвечают через Kimi');
     warn.mockRestore();
-  });
-
-  it('стенд (BACKEND_URL test.) — напоминание с пометкой [test]', async () => {
-    process.env.BACKEND_URL = 'https://test.linkeon.io';
-    const g = { status: jest.fn(async () => ({ provider: 'kimi', since: null, by: null })) };
-    const s = new GlobalLlmReminderService(g as any, health('ok') as any, pgDay() as any);
-    await s.remind();
-    expect((sendTelegramAlert as jest.Mock).mock.calls[0][0]).toMatch(/^\[test\] /);
   });
 });
 

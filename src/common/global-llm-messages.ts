@@ -46,18 +46,6 @@ export function maskActor(actor: string): string {
   return actor;
 }
 
-/**
- * «[test] » перед сообщением, когда бэкенд поднят не на проде: иначе
- * сообщения со стенда (test.linkeon.io) в общей группе алертов неотличимы от
- * боевых (ревью 01.11). Общего механизма пометки стенда на момент внедрения
- * нет — есть только SHORTS_STAND у студии роликов (src/shorts/short-env.ts),
- * специфичный для неё, — поэтому здесь отдельная проверка по BACKEND_URL,
- * который уже читает весь остальной бэкенд (default 'https://my.linkeon.io').
- */
-export function standPrefix(env: NodeJS.ProcessEnv = process.env): string {
-  return /test\./i.test(env.BACKEND_URL || '') ? '[test] ' : '';
-}
-
 /** Сообщение в группу алертов при переключении рубильника (spec 2026-10-31-global-llm-switch, раздел 8). */
 export function switchedText(previous: AnswerProvider, next: AnswerProvider, actor: string): string {
   const head = `🔀 <b>Модель ответов для всех: ${PROVIDER_LABELS[next]}</b> (было ${PROVIDER_LABELS[previous]}).`;

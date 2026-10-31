@@ -1,4 +1,4 @@
-import { maskActor, mskStamp, reminderText, standPrefix, switchedText } from './global-llm-messages';
+import { maskActor, mskStamp, reminderText, switchedText } from './global-llm-messages';
 
 describe('тексты рубильника', () => {
   it('mskStamp — дд.мм чч:мм по Москве', () => {
@@ -105,19 +105,5 @@ describe('maskActor', () => {
   it('не похоже ни на телефон, ни на UUID (служебный id) — без изменений', () => {
     expect(maskActor('admin-1')).toBe('admin-1');
     expect(maskActor('unknown')).toBe('unknown');
-  });
-});
-
-describe('standPrefix', () => {
-  it('BACKEND_URL с test. (стенд) — префикс [test]', () => {
-    expect(standPrefix({ BACKEND_URL: 'https://test.linkeon.io' } as any)).toBe('[test] ');
-  });
-
-  it('BACKEND_URL прода — без префикса', () => {
-    expect(standPrefix({ BACKEND_URL: 'https://my.linkeon.io' } as any)).toBe('');
-  });
-
-  it('BACKEND_URL не задан — без префикса', () => {
-    expect(standPrefix({} as any)).toBe('');
   });
 });

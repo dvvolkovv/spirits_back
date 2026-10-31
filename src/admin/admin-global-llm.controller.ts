@@ -6,7 +6,7 @@ import { CurrentUser } from '../common/decorators/user.decorator';
 import { GlobalLlmProviderService, GlobalProviderStatus } from '../common/services/global-llm-provider.service';
 import { ANSWER_PROVIDERS, isAnswerProvider, readFallbackConfigs } from '../common/services/llm-fallback';
 import { sendTelegramAlert } from '../common/telegram-alert';
-import { standPrefix, switchedText } from '../common/global-llm-messages';
+import { switchedText } from '../common/global-llm-messages';
 
 /**
  * Общий рубильник модели ответов (spec 2026-10-31-global-llm-switch, раздел 7).
@@ -45,7 +45,8 @@ export class AdminGlobalLlmController {
       // (sendTelegramPayload гасит сетевые/Telegram-ошибки по каждому чату
       // внутри себя), а ответ админке не должен зависеть от сети до
       // Telegram — повисший запрос туда не должен задержать 200.
-      void sendTelegramAlert(standPrefix() + switchedText(previous, provider, actor));
+      // На test нет TELEGRAM_* — сообщения стенда туда не уходят вовсе.
+      void sendTelegramAlert(switchedText(previous, provider, actor));
     }
     // Запись уже прошла успешно — сбой ЭТОГО (повторного) чтения не повод
     // отвечать 500: в ответе — известные значения (новый provider, актор),

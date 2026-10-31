@@ -14,11 +14,7 @@ const mkRes = () => { const res: any = {}; res.status = jest.fn(() => res); res.
 const status = (provider: string) => ({ provider, since: '2026-10-31T13:40:00.000Z', by: 'admin-1' });
 
 describe('AdminGlobalLlmController', () => {
-  const OLD = {
-    qwen: process.env.QWEN_FALLBACK_API_KEY,
-    kimi: process.env.KIMI_FALLBACK_API_KEY,
-    backend: process.env.BACKEND_URL,
-  };
+  const OLD = { qwen: process.env.QWEN_FALLBACK_API_KEY, kimi: process.env.KIMI_FALLBACK_API_KEY };
   const keys = (qwen: boolean, kimi: boolean) => {
     if (qwen) process.env.QWEN_FALLBACK_API_KEY = 'sk-sp-test'; else delete process.env.QWEN_FALLBACK_API_KEY;
     if (kimi) process.env.KIMI_FALLBACK_API_KEY = 'sk-kimi-test'; else delete process.env.KIMI_FALLBACK_API_KEY;
@@ -26,7 +22,6 @@ describe('AdminGlobalLlmController', () => {
   afterEach(() => {
     if (OLD.qwen === undefined) delete process.env.QWEN_FALLBACK_API_KEY; else process.env.QWEN_FALLBACK_API_KEY = OLD.qwen;
     if (OLD.kimi === undefined) delete process.env.KIMI_FALLBACK_API_KEY; else process.env.KIMI_FALLBACK_API_KEY = OLD.kimi;
-    if (OLD.backend === undefined) delete process.env.BACKEND_URL; else process.env.BACKEND_URL = OLD.backend;
     (sendTelegramAlert as jest.Mock).mockClear();
     (sendTelegramAlert as jest.Mock).mockImplementation(async () => undefined);
     jest.restoreAllMocks();
@@ -128,15 +123,6 @@ describe('AdminGlobalLlmController', () => {
     expect(res.status).toHaveBeenCalledWith(200);
     expect(res.json).toHaveBeenCalledWith({ provider: 'qwen', since: null, by: 'admin-1', configured: { qwen: true, kimi: false } });
     expect(warn.mock.calls.map((c) => String(c[0])).join('\n')).toContain('статус после записи не прочитан');
-  });
-
-  it('стенд (BACKEND_URL test.) — сообщение в группу с пометкой [test]', async () => {
-    keys(true, false);
-    process.env.BACKEND_URL = 'https://test.linkeon.io';
-    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
-    const svc = { status: jest.fn(async () => status('qwen')), set: jest.fn(async () => ({ previous: 'claude' })) };
-    await new AdminGlobalLlmController(svc as any).set({ userId: 'admin-1' }, { provider: 'qwen' }, mkRes());
-    expect((sendTelegramAlert as jest.Mock).mock.calls[0][0]).toMatch(/^\[test\] /);
   });
 });
 
