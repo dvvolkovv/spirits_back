@@ -145,7 +145,8 @@ export interface ClaudeCliOptions {
    *  переданных, серверов нет.
    *  Автоодобрения сервис НЕ добавляет: имена нужных MCP-инструментов caller
    *  кладёт в allowedTools сам — без этого в -p вызов отклоняется
-   *  («...you haven't granted it yet»). */
+   *  («...you haven't granted it yet»). С MCP вызов всегда идёт в stream-json
+   *  (с --verbose). */
   mcpServers?: Record<string, ClaudeCliMcpHttpServer>;
   /** Только Claude: без запасных и без выбора пользователя. Для проверок
    *  живости Claude: с запасными они показывали бы «зелёный», когда Claude
@@ -355,10 +356,12 @@ export class ClaudeCliService implements OnModuleInit {
     // Выбор пользователя (админка): сразу выбранный, при его сбое — обычный путь.
     let selected: FallbackProvider | undefined;
     if (opts.provider && !opts.noFallback) {
-      // Проверка истинностью: незнакомое значение (не qwen/kimi) даёт undefined —
-      // обычный путь без предупреждения; так же его отсекает planProviders.
-      if (configs[opts.provider]) selected = opts.provider;
-      else if (opts.provider in PROVIDER_DEFAULTS) this.logger.warn(`${PROVIDER_LABELS[opts.provider]} выбран для пользователя, но ключ ${PROVIDER_DEFAULTS[opts.provider].envPrefix}_FALLBACK_API_KEY не задан — обычный путь`);
+      // Проверка через FALLBACK_ORDER.includes, не configs[...] и не `in`
+      // впрямую: имя из прототипа объекта (например 'constructor') резолвится
+      // правдой по цепочке прототипов и у configs[opts.provider], и у
+      // `in PROVIDER_DEFAULTS` — тот же случай отсекает planProviders.
+      if (FALLBACK_ORDER.includes(opts.provider) && configs[opts.provider]) selected = opts.provider;
+      else if (FALLBACK_ORDER.includes(opts.provider)) this.logger.warn(`${PROVIDER_LABELS[opts.provider]} выбран для пользователя, но ключ ${PROVIDER_DEFAULTS[opts.provider].envPrefix}_FALLBACK_API_KEY не задан — обычный путь`);
     }
     const plan = planProviders({ selected, configs, state: this.fallback, noFallback: opts.noFallback });
     const breakerMs = readBreakerMs();
@@ -415,7 +418,9 @@ export class ClaudeCliService implements OnModuleInit {
         }
         if (reachedFallback) {
           // Вызов дошёл до запасных, и никто не ответил: Claude мог уже ожить —
-          // следующий вызов снова попробует его.
+          // следующий вызов снова попробует его. Цена осознанная: при шторме 529
+          // у Claude сбой запасного на конкретном запросе (или устаревший сбой
+          // параллельного вызова) вернёт следующие вызовы в попытку Claude.
           this.fallback.closeClaudeWindow();
           this.logger.error(`запасные тоже не ответили: ${parts.join(' | ').slice(0, 300)}`);
         }
@@ -460,6 +465,12 @@ export class ClaudeCliService implements OnModuleInit {
     return !!opts.mcpServers && Object.keys(opts.mcpServers).length > 0;
   }
 
+  /** Признак stream-json — в одном месте: его же читают mayRetry (решает,
+   *  было бы видно использование инструмента) и spawnClaude (--output-format). */
+  private static isStreaming(opts: ClaudeCliOptions): boolean {
+    return !!opts.onProgress || !!opts.onTextDelta || ClaudeCliService.hasMcp(opts);
+  }
+
   /** Можно ли повторить вызов у следующего провайдера: только если модель ещё
    *  ничего не сделала инструментами с последствиями и человек не видел текста. */
   private mayRetry(e: unknown, opts: ClaudeCliOptions): boolean {
@@ -468,8 +479,8 @@ export class ClaudeCliService implements OnModuleInit {
     if (opts.onTextDelta) return false;
     // Без stream-json вызов инструмента не виден: вслепую повторяем, только
     // если встроенные тулы лишь из Read/WebSearch/WebFetch (Bash, Write, Edit,
-    // 'default' — нельзя). Вызовы с MCP всегда идут в stream-json (spawnClaude).
-    if (!opts.onProgress && !ClaudeCliService.hasMcp(opts)) {
+    // 'default' — нельзя). Вызовы с MCP всегда идут в stream-json (isStreaming).
+    if (!ClaudeCliService.isStreaming(opts)) {
       const riskyTools = (opts.tools ?? '')
         .split(/[\s,]+/)
         .some((t) => t !== '' && !SIDE_EFFECT_FREE_TOOLS.has(t));
@@ -538,10 +549,11 @@ export class ClaudeCliService implements OnModuleInit {
 
     const hasAttachments = (opts.attachments?.length ?? 0) > 0;
     const hasMcp = ClaudeCliService.hasMcp(opts);
-    // stream-json — и у вызовов с MCP (Маша): там видно, вызывала ли модель
-    // инструмент, а от этого зависит, можно ли повторить вызов у другого
-    // провайдера (mayRetry). В json-режиме такой вызов не повторялся бы никогда.
-    const streaming = !!opts.onProgress || !!opts.onTextDelta || hasMcp;
+    // stream-json — и у любого вызова с MCP, даже без onProgress: там видно,
+    // вызывала ли модель инструмент, а от этого зависит, можно ли повторить
+    // вызов у другого провайдера (mayRetry). Маша и TG и так идут в stream-json
+    // через onProgress; это страховка для будущих вызовов с MCP.
+    const streaming = ClaudeCliService.isStreaming(opts);
 
     // ── cwd и ссылки на вложения ──────────────────────────────────────────
     // Безопасность (25.09.2026): вложения раньше подставлялись в промпт как

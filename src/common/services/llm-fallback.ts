@@ -131,8 +131,16 @@ const FALLBACK_KINDS: ReadonlySet<LlmOutageKind> = new Set<LlmOutageKind>([
  *  классификатор принял бы за лимит или перегрузку и открыл бы окно для всех. */
 const CONTEXT_LENGTH_RE = /context (window|length|limit)|prompt is too long|output token|max_tokens/i;
 
+/** 403/Forbidden/Access denied/Arrearage — classifyLlmError этого не видит (он
+ *  понимает только формулировки самого Claude), а у запасных это тоже сбой
+ *  доступа: Qwen Token Plan с неоплаченным планом отвечает
+ *  403 AccessDenied.Unpurchased, Alibaba при долге — Arrearage; на релее
+ *  403/Forbidden уже считаются сбоем доступа — здесь та же логика для бэкенда. */
+const ACCESS_EXTRA_RE = /\b403\b|forbidden|access.?denied|arrearage/i;
+
 export function isFallbackWorthy(errorMessage: string): boolean {
   if (CONTEXT_LENGTH_RE.test(errorMessage)) return false;
+  if (ACCESS_EXTRA_RE.test(errorMessage)) return true;
   return FALLBACK_KINDS.has(classifyLlmError(errorMessage).kind);
 }
 
@@ -288,7 +296,12 @@ export function planProviders(args: {
   };
   // Истинностью, не !== null: незнакомое значение selected (например, мусор из
   // БД) даёт configs[selected] === undefined, а undefined !== null — истина,
-  // и мусор встал бы первым в план.
-  if (args.selected && args.configs[args.selected]) return [args.selected, ...normal(args.selected)];
+  // и мусор встал бы первым в план. FALLBACK_ORDER.includes — отдельная защита:
+  // имя из прототипа объекта (например 'constructor') даёт configs[selected]
+  // правду через цепочку прототипов, а не null/undefined, и первую проверку
+  // не ловит вовсе.
+  if (args.selected && FALLBACK_ORDER.includes(args.selected) && args.configs[args.selected]) {
+    return [args.selected, ...normal(args.selected)];
+  }
   return normal();
 }
