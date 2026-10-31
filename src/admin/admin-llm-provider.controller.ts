@@ -3,7 +3,7 @@ import { Response } from 'express';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
-import { LLM_PROVIDERS, LlmProvider, UserLlmProviderService } from '../common/services/user-llm-provider.service';
+import { LLM_PROVIDERS, LlmChoice, LlmProvider, UserLlmProviderService } from '../common/services/user-llm-provider.service';
 import { readFallbackConfigs } from '../common/services/llm-fallback';
 
 /**
@@ -47,7 +47,7 @@ export class AdminLlmProviderController {
     return res.status(200).json(this.body(userId, provider));
   }
 
-  private body(userId: string, provider: LlmProvider) {
+  private body(userId: string, provider: LlmChoice) {
     const configs = readFallbackConfigs();
     const configured = { qwen: configs.qwen !== null, kimi: configs.kimi !== null };
     return { userId, provider, qwenConfigured: configured.qwen, configured };
