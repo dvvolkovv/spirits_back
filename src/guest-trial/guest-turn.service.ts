@@ -208,19 +208,28 @@ export class GuestTurnService {
 
       // Модель гостя — рубильник, без цепочки (решение 31.10). Она сейчас
       // недоступна (у Claude открыто его окно, у запасного нет ключа или он
-      // «не отвечает») — гостю сразу ошибка, а не две минуты ожидания и
-      // занятый слот.
+      // «не отвечает») — гостю сразу стена «войдите», а не две минуты
+      // ожидания и занятый слот. Решение владельца 31.10 (ревью 1.11,
+      // раздел 6 спеки): это не отказ самой модели (у неё и шанса не было
+      // ответить) — та же стена, что у прочих закрытий пробы, а не
+      // error: model, который обещал бы, что повтор прямо сейчас поможет.
+      // get() не бросает (контракт GlobalLlmProviderService.get).
       const trialProvider: AnswerProvider = this.globalProvider ? await this.globalProvider.get() : 'claude';
+      // Один раз на ход: добавляется и в событие ниже, и в вызов модели (в
+      // runTurn — передаём параметром), когда рубильник увёл с Claude —
+      // иначе сбои модели рубильника у гостей не отличить от сбоев Claude.
+      const providerProp: { provider?: AnswerProvider } = trialProvider === 'claude' ? {} : { provider: trialProvider };
       if (this.providerUnavailable(trialProvider)) {
+        // guestEvent — без переопределения left: недоступность модели это не
+        // потраченный ответ. closedStream() здесь не подходит — он пишет
+        // left: 0 и ведёт свою отчётность по лимитам (reportClosed), которая
+        // этому случаю не нужна.
         this.startStream(res);
         this.write(res, guestEvent);
-        this.write(res, { type: 'error', code: 'model' });
+        this.write(res, { type: 'wall', reason: 'closed' });
         this.end(res);
         this.events?.track('guest_trial_error', {
-          props: {
-            reason: 'breaker', assistant_id: String(agent.id), preview: input.preview,
-            ...(trialProvider === 'claude' ? {} : { provider: trialProvider }),
-          },
+          props: { reason: 'breaker', assistant_id: String(agent.id), preview: input.preview, ...providerProp },
         });
         return;
       }
@@ -249,7 +258,7 @@ export class GuestTurnService {
         // когда был вызван beginStream, — счётчики парные без отдельного флага.
         this.chat?.beginStream();
         try {
-          await this.runTurn(input, res, session, agent, message, guestEvent, limits.answersPerTrial, trialProvider);
+          await this.runTurn(input, res, session, agent, message, guestEvent, limits.answersPerTrial, trialProvider, providerProp);
         } finally {
           this.chat?.endStream();
         }
@@ -270,6 +279,7 @@ export class GuestTurnService {
     guestEvent: object,
     answersPerTrial: number,
     trialProvider: AnswerProvider,
+    providerProp: { provider?: AnswerProvider },
   ): Promise<void> {
     const humanAt = new Date();
     this.startStream(res);
@@ -298,7 +308,8 @@ export class GuestTurnService {
             noFallback: true,
             // providerChoice 'global': ответ гостя — по рубильнику (событие
             // claude_cli_call с choice=global, суточный счёт).
-            ...(trialProvider === 'claude' ? {} : { provider: trialProvider, providerChoice: 'global' as const }),
+            ...providerProp,
+            ...(trialProvider === 'claude' ? {} : { providerChoice: 'global' as const }),
             timeoutMs: GUEST_TURN_TIMEOUT_MS,
             // Приватность (F1, ревью 31.10): транскрипт CLI не должен жить
             // дольше, чем обещает политика пробы (7 дней).
@@ -320,7 +331,7 @@ export class GuestTurnService {
         // ролевым текстом). Проверку отказа применяем только когда кусков не было.
         if (!text || (!hadChunks && looksLikeCliRefusal(text))) {
           this.write(res, { type: 'error', code: 'model' });
-          this.events?.track('guest_trial_error', { props: { reason: 'model', assistant_id: String(agent.id), preview: input.preview } });
+          this.events?.track('guest_trial_error', { props: { reason: 'model', assistant_id: String(agent.id), preview: input.preview, ...providerProp } });
           return;
         }
         const answers = await this.sessions.recordExchange(session.id, message, text, humanAt, costUsd);
@@ -337,7 +348,7 @@ export class GuestTurnService {
         this.events?.track('guest_trial_answer', {
           sessionId: input.sid,
           source: input.source,
-          props: { n: answers, trial: session.id, assistant_id: String(agent.id), lang: input.lang, cost_usd: Number(costUsd.toFixed(4)), preview: input.preview },
+          props: { n: answers, trial: session.id, assistant_id: String(agent.id), lang: input.lang, cost_usd: Number(costUsd.toFixed(4)), preview: input.preview, ...providerProp },
         });
         if (answers >= answersPerTrial) this.write(res, { type: 'wall', reason: 'limit' });
       } catch (e: any) {
@@ -350,7 +361,7 @@ export class GuestTurnService {
         // сбой кода/базы от обычного отказа модели/CLI при разборе причин.
         this.log.error(`guest turn: сбой после начала ответа (проба ${session.id}): ${String(e?.message ?? e).slice(0, 200)}`);
         this.write(res, { type: 'error', code: 'model' });
-        this.events?.track('guest_trial_error', { props: { reason: 'internal', assistant_id: String(agent.id), preview: input.preview } });
+        this.events?.track('guest_trial_error', { props: { reason: 'internal', assistant_id: String(agent.id), preview: input.preview, ...providerProp } });
       }
     } finally {
       clearInterval(ping);
