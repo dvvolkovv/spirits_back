@@ -7,6 +7,7 @@ import path from 'node:path';
 import { StudioError } from '../errors';
 import type { Script, ShortAnimation, SkitKind, SkitPlan } from '../types';
 import { animateRun, type AnimateDeps } from './run-animate';
+import { MATCHER_VERSION } from './match';
 
 const ff = (...args: string[]) => execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...args]);
 
@@ -218,8 +219,34 @@ test('речь не сошлась — пересъёмка без нового 
   assert.equal(anim.skits.conflict!.attempts, 2);
   assert.equal(calls.keyframe.length, 2);
   assert.equal(anim.omniSeconds, 24);
-  const rejected = fs.readdirSync(path.join(env.runDir, 'skits', 'fp-conflict')).filter((f) => f.startsWith('rejected-'));
+  const rejected = fs.readdirSync(path.join(env.runDir, 'skits', 'fp-conflict')).filter((f) => f.startsWith('rejected-') && f.endsWith('.mp4'));
   assert.equal(rejected.length, 1);
+});
+
+test('брак откладывается с пометкой: код, версия сверки, услышанное и доля', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const { deps } = fakes(env, { heard: (kind, call) => (kind === 'conflict' && call === 1 ? 'совсем другое' : LINES[kind].join(' ')) });
+  await animateRun(env.runDir, deps);
+  const dir = path.join(env.runDir, 'skits', 'fp-conflict');
+  const metas = fs.readdirSync(dir).filter((f) => /^rejected-.*\.json$/.test(f));
+  assert.equal(metas.length, 1);
+  assert.ok(fs.existsSync(path.join(dir, metas[0].replace(/\.json$/, '.mp4'))), 'пометка без клипа');
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, metas[0]), 'utf8')), {
+    code: 'speech_mismatch',
+    matcher: MATCHER_VERSION,
+    heard: 'совсем другое',
+    share: 0,
+  });
+});
+
+test('битый файл от Omni — брак с пометкой clip_invalid, без услышанного', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const { deps } = fakes(env, { wait: (kind, n) => (kind === 'conflict' && n === 1 ? Buffer.from('not a video') : env.clip) });
+  await animateRun(env.runDir, deps);
+  const dir = path.join(env.runDir, 'skits', 'fp-conflict');
+  const metas = fs.readdirSync(dir).filter((f) => /^rejected-.*\.json$/.test(f));
+  assert.equal(metas.length, 1);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, metas[0]), 'utf8')), { code: 'clip_invalid', matcher: MATCHER_VERSION });
 });
 
 test('пустое распознавание — SpeechKit спрашивается ещё раз, клип не переснимается', { timeout: 120_000 }, async () => {
