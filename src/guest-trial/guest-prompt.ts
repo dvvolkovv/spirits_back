@@ -1,7 +1,8 @@
 import { LanguageService } from '../common/services/language.service';
 import { ANSWER_FIRST_RULE } from '../chat/answer-first-rule';
 import { RESPONSE_STYLE_RULE } from '../chat/response-style';
-import { GuestHistoryMessage } from './guest-trial.types';
+import { CRISIS_HOTLINES, CRISIS_RULE } from '../chat/crisis-rule';
+import { GUEST_PROMPT_HISTORY_ITEM_MAX, GuestHistoryMessage } from './guest-trial.types';
 
 /**
  * Что ассистенту нужно знать о пробе. Профиля, баланса и адресов кабинета в
@@ -70,6 +71,13 @@ export function buildGuestSystemPrompt(p: GuestPromptInput): string {
   ];
   const persona = (p.persona || '').trim();
   if (persona) parts.push(`--- Персона и инструкции ассистента ${p.name} ---\n${persona}`);
+  // Кризисное правило гарантированно (ревью A-final/F3): persona приходит из
+  // agents.system_prompt, и правило есть не у всех штатных ассистентов в
+  // базе. Место — как у withCrisisRule (src/chat/crisis-rule.ts): сразу после
+  // персоны, до гостевого блока. Признак «уже есть» — первый номер из
+  // CRISIS_HOTLINES: штатным, кому правило дописано в БД, оно идёт тем же
+  // текстом целиком, так что номер в персоне точно встретится.
+  if (!persona.includes(CRISIS_HOTLINES[0])) parts.push(CRISIS_RULE);
   parts.push(ANSWER_FIRST_RULE, RESPONSE_STYLE_RULE, GUEST_MODE_BLOCK);
   const time = localTimeLine(p.tz, p.now ?? new Date());
   if (time) parts.push(time);
@@ -78,10 +86,21 @@ export function buildGuestSystemPrompt(p: GuestPromptInput): string {
   return parts.join('\n\n');
 }
 
+/**
+ * Обрезает реплику истории до GUEST_PROMPT_HISTORY_ITEM_MAX знаков — предел
+ * на СКЛЕЕННЫЙ промпт (аргумент `claude -p`, 128 КБ), а не на одну реплику
+ * саму по себе, но ограничить заранее каждую проще, чем мерить сумму.
+ * Конец сохраняется (там обычно вывод ответа, а не вступление), начало
+ * режется и заменяется на «…».
+ */
+export function truncateHistoryItem(s: string): string {
+  return s.length > GUEST_PROMPT_HISTORY_ITEM_MAX ? `…${s.slice(-GUEST_PROMPT_HISTORY_ITEM_MAX)}` : s;
+}
+
 /** Тело промпта: прошлые пары пробы и новая реплика — тем же форматом, что у Маши. */
 export function buildGuestPrompt(history: GuestHistoryMessage[], message: string): string {
   const prior = history
-    .map((m) => `${m.sender_type === 'human' ? 'USER' : 'ASSISTANT'}: ${neutralizeRoleMarkers(m.content)}`)
+    .map((m) => `${m.sender_type === 'human' ? 'USER' : 'ASSISTANT'}: ${neutralizeRoleMarkers(truncateHistoryItem(m.content))}`)
     .join('\n\n');
   const safeMessage = neutralizeRoleMarkers(message);
   return prior ? `${prior}\n\nUSER: ${safeMessage}` : `USER: ${safeMessage}`;
