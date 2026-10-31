@@ -246,6 +246,17 @@ describe('ClaudeCliService — запасной путь на Qwen', () => {
     expect(spawnMock).toHaveBeenCalledTimes(1);
   });
 
+  it('onTextDelta: колбэк уже показал кусок текста — вызов на Qwen не повторяется', async () => {
+    const deltas: string[] = [];
+    spawnMock.mockImplementationOnce(() => fakeProc(lines(
+      { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Привет' } } },
+      { type: 'result', is_error: true, result: 'API Error: 529 Overloaded' },
+    ), 1));
+    await expect(new ClaudeCliService().textWithCost('x', { onTextDelta: (t) => deltas.push(t) })).rejects.toThrow('529');
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(deltas).toEqual(['Привет']);
+  });
+
   it('stream-json: до сбоя был только WebSearch (без последствий) — переключает; onProgress видит его', async () => {
     const seen: string[] = [];
     spawnMock

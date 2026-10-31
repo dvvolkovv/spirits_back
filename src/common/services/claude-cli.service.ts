@@ -1,6 +1,7 @@
 // src/common/services/claude-cli.service.ts
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { spawn } from 'child_process';
+import { StringDecoder } from 'string_decoder';
 import * as os from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -35,10 +36,12 @@ export interface ClaudeCliMcpHttpServer {
 const MCP_CONFIG_DIR_PREFIX = 'claude-mcp-';
 
 /**
- * Постоянный пустой cwd вызовов с MCP без своего cwd (Маша). Один на все
- * вызовы: CLI заводит в ~/.claude/projects папку проекта на каждый новый cwd,
- * и одноразовый каталог на ход давал бы тысячи папок в сутки. Мы в него не
- * пишем и не удаляем его; уборка брошенных конфигов его не трогает.
+ * Постоянный пустой cwd для вызовов без своего cwd, которым он нужен
+ * нейтральным: с MCP (Маша) и, с F2 (31.10), с opts.isolatedCwd (проба без
+ * входа, src/guest-trial). Один на все такие вызовы: CLI заводит в
+ * ~/.claude/projects папку проекта на каждый новый cwd, и одноразовый
+ * каталог на ход давал бы тысячи папок в сутки. Мы в него не пишем и не
+ * удаляем его; уборка брошенных конфигов его не трогает.
  */
 const EMPTY_CWD_NAME = 'linkeon-claude-empty';
 
@@ -95,9 +98,24 @@ export interface ClaudeCliOptions {
    *  вызывается на каждое tool_use событие. Подходит для UX-индикации
    *  (например edit-message в Telegram). */
   onProgress?: (event: ClaudeCliProgressEvent) => void;
+  /** Куски текста ответа по мере генерации (проба без входа, src/guest-trial).
+   *  Если задан — CLI идёт в stream-json с --include-partial-messages, и каждый
+   *  text_delta уходит сюда; итоговый текст по-прежнему возвращает textWithCost.
+   *  Куски вложенных суб-агентов (у события есть parent_tool_use_id) сюда не
+   *  попадают — только текст основного ответа. Такой вызов не повторяется на
+   *  Qwen: показанный человеку текст повтор не заберёт обратно. */
+  onTextDelta?: (text: string) => void;
   /** Рабочая директория Claude. По умолчанию os.tmpdir(). Для агентных
    *  сценариев (Bash/Write/Edit) передавай изолированный sandbox-dir. */
   cwd?: string;
+  /** Нейтральный ПОСТОЯННЫЙ пустой cwd вместо общего os.tmpdir(), когда caller
+   *  сам не задал cwd — тот же каталог, что и у вызовов с MCP (см.
+   *  neutralEmptyCwd). Общий tmp один на все процессы машины, а из cwd CLI
+   *  сам подхватывает CLAUDE.md/.claude/settings.json (в них бывают хуки);
+   *  проба без входа (src/guest-trial) не должна зависеть от того, что чужой
+   *  процесс в этот момент оставил в общем tmp. Без MCP и без этой опции —
+   *  прежнее поведение (tmpdir()). */
+  isolatedCwd?: boolean;
   /** Полностью переопределяет --allowedTools (это АВТО-ОДОБРЕНИЕ, а не набор
    *  доступного). По умолчанию: '' ВСЕГДА — в т.ч. при attachments. Голое 'Read'
    *  в allowedTools одобряет чтение ЛЮБОГО пути, а не только внутри cwd; Read
@@ -129,6 +147,14 @@ export interface ClaudeCliOptions {
    *  сразу на Qwen, без попытки Claude. Не авария: окно предохранителя и
    *  fallbackStats не трогаются. Без ключа и при noFallback — обычный Claude. */
   provider?: 'qwen';
+  /** Без флага CLI пишет весь промпт (систему, реплики, ответ) в
+   *  ~/.claude/projects/<cwd>/<uuid>.jsonl и хранит cleanupPeriodDays
+   *  (по умолчанию 30 дней). При true добавляет --no-session-persistence —
+   *  флаг действует только с --print/-p (у нас он всегда есть, см. '-p' в
+   *  начале args). Проба без входа (src/guest-trial) обещает в политике 7
+   *  дней — транскрипт CLI с чужим (дольшим) сроком хранения это обещание
+   *  нарушает. */
+  noSessionPersistence?: boolean;
 }
 
 @Injectable()
@@ -203,15 +229,18 @@ export class ClaudeCliService implements OnModuleInit {
   }
 
   /**
-   * cwd вызова с MCP, когда caller не дал своего (Маша): постоянный пустой
-   * <tmpdir>/linkeon-claude-empty. Каталог конфига с токеном — отдельный,
-   * на вызов (writeMcpConfig), и лежит рядом, а не внутри.
+   * Постоянный пустой cwd, когда caller не дал своего: <tmpdir>/linkeon-claude-empty.
+   * Раньше — только для вызовов с MCP (Маша); с F2 (31.10) — и для любого
+   * вызова с opts.isolatedCwd (проба без входа): тот же каталог, та же
+   * защита от чужого CLAUDE.md/.claude/settings.json в общем tmp. Каталог
+   * конфига MCP с токеном — отдельный, на вызов (writeMcpConfig), и лежит
+   * рядом, а не внутри.
    *
    * Не годится (см. emptyCwdProblem) — вызов идёт в одноразовый claude-cwd-*,
    * который снимается после вызова, а в лог уходит причина: ход не должен
    * зависеть от чужого каталога в общем tmp.
    */
-  private mcpNeutralCwd(registerTmpDir: (dir: string) => void): string {
+  private neutralEmptyCwd(registerTmpDir: (dir: string) => void): string {
     const dir = path.join(this.tmpRoot(), EMPTY_CWD_NAME);
     const problem = ClaudeCliService.emptyCwdProblem(dir);
     if (!problem) return dir;
@@ -388,6 +417,8 @@ export class ClaudeCliService implements OnModuleInit {
    *  инструментами с последствиями. */
   private mayRetryOnQwen(e: unknown, opts: ClaudeCliOptions): boolean {
     if (e instanceof ClaudeCliCallError && e.toolUsed) return false;
+    // Человек уже видит куски ответа — второй, другой ответ поверх них хуже ошибки.
+    if (opts.onTextDelta) return false;
     // Без stream-json вызов инструмента не виден: вслепую повторяем, только
     // если последствий быть не может — нет MCP, а встроенные тулы лишь из
     // Read/WebSearch/WebFetch (Bash, Write, Edit, 'default' — нельзя).
@@ -479,7 +510,7 @@ export class ClaudeCliService implements OnModuleInit {
    * читает файлы cwd тулом Read, а в одноразовом каталоге вложений — тоже.
    * Отдельный каталог лежит рядом с ними, а не внутри. Нейтральным cwd вызову
    * с MCP служит не сам os.tmpdir() (каталог конфига оказался бы внутри), а
-   * постоянный пустой linkeon-claude-empty — см. mcpNeutralCwd.
+   * постоянный пустой linkeon-claude-empty — см. neutralEmptyCwd.
    */
   private writeMcpConfig(
     servers: Record<string, ClaudeCliMcpHttpServer>,
@@ -504,7 +535,7 @@ export class ClaudeCliService implements OnModuleInit {
     const model = qwen ? qwenModelFor(requestedModel, qwen.models) : requestedModel;
     const provider: 'claude' | 'qwen' = qwen ? 'qwen' : 'claude';
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const streaming = !!opts.onProgress;
+    const streaming = !!opts.onProgress || !!opts.onTextDelta;
 
     const hasAttachments = (opts.attachments?.length ?? 0) > 0;
     const hasMcp = !!opts.mcpServers && Object.keys(opts.mcpServers).length > 0;
@@ -547,13 +578,15 @@ export class ClaudeCliService implements OnModuleInit {
       // prompt — irrelevant context that inflated input and tripled VPM latency.
       // Caller may override cwd для агентного sandbox-режима.
       //
-      // Вызов с MCP (Маша) получает не сам os.tmpdir(), а постоянный пустой
-      // каталог (mcpNeutralCwd): каталог конфига с токеном лежит рядом, а не
-      // внутри cwd, при любом наборе тулов.
+      // Вызов с MCP (Маша) или с isolatedCwd (проба без входа, F2) получает
+      // не сам os.tmpdir(), а постоянный пустой каталог (neutralEmptyCwd):
+      // у MCP каталог конфига с токеном лежит рядом, а не внутри cwd, при
+      // любом наборе тулов; у пробы — просто чтобы не достался чужой
+      // CLAUDE.md из общего tmp (см. emptyCwdProblem).
       if (opts.cwd) {
         spawnCwd = opts.cwd;
-      } else if (hasMcp) {
-        spawnCwd = this.mcpNeutralCwd(registerTmpDir);
+      } else if (hasMcp || opts.isolatedCwd) {
+        spawnCwd = this.neutralEmptyCwd(registerTmpDir);
       } else {
         spawnCwd = this.tmpRoot();
       }
@@ -633,6 +666,14 @@ export class ClaudeCliService implements OnModuleInit {
     args.push('--strict-mcp-config');
     // stream-json требует --verbose, иначе CLI отвергает комбинацию.
     if (streaming) args.push('--verbose');
+    // Куски текста приходят только с этим флагом (stream_event → text_delta).
+    if (opts.onTextDelta) args.push('--include-partial-messages');
+    // Приватность пробы без входа (F1, ревью 31.10): без флага CLI пишет весь
+    // промпт (персону, реплики гостя, ответ) в
+    // ~/.claude/projects/<cwd>/<uuid>.jsonl и хранит cleanupPeriodDays (30
+    // дней) — дольше, чем обещает политика пробы (7 дней). Флаг работает
+    // только с --print/-p — он у нас есть всегда (см. '-p' в начале args).
+    if (opts.noSessionPersistence) args.push('--no-session-persistence');
 
     return new Promise<CliRunResult>((resolve, reject) => {
       // Обычный запуск наследует process.env как есть; запасной получает своё
@@ -644,10 +685,24 @@ export class ClaudeCliService implements OnModuleInit {
       });
       let stdout = '';
       let stderr = '';
+      // StringDecoder держит «хвост» незавершённого многобайтового символа
+      // между кусками: граница чтения из pipe может прийтись внутрь буквы
+      // (кириллица — 2 байта), и b.toString() на каждом куске ОТДЕЛЬНО
+      // превращал бы обе половинки в U+FFFD. Один декодер на процесс — до
+      // конца этого вызова, не общий между вызовами.
+      const outDecoder = new StringDecoder('utf8');
+      const errDecoder = new StringDecoder('utf8');
       // Вызвала ли модель инструмент с последствиями (не Read/WebSearch/WebFetch)
       // до сбоя — решает, можно ли повторить на Qwen.
       let sawRiskyToolUse = false;
-      const fail = (message: string) => reject(new ClaudeCliCallError(message, sawRiskyToolUse));
+      // Вызов уже отклонён или разрешён — дальнейшие данные от процесса (он
+      // может ещё писать в stdout после kill('SIGTERM') по таймауту) больше не
+      // должны доходить до колбэков caller-а.
+      let settled = false;
+      const fail = (message: string) => {
+        settled = true;
+        reject(new ClaudeCliCallError(message, sawRiskyToolUse));
+      };
 
       // Stream-mode accumulators (заполняются по мере прихода NDJSON).
       let streamLineBuf = '';
@@ -666,7 +721,7 @@ export class ClaudeCliService implements OnModuleInit {
       }
 
       proc.stdout.on('data', (b) => {
-        const chunk = b.toString();
+        const chunk = outDecoder.write(b);
         stdout += chunk;
         if (!streaming) return;
         streamLineBuf += chunk;
@@ -681,11 +736,24 @@ export class ClaudeCliService implements OnModuleInit {
             for (const c of ev.message.content) {
               if (c?.type === 'tool_use' && typeof c.name === 'string') {
                 if (!SIDE_EFFECT_FREE_TOOLS.has(c.name)) sawRiskyToolUse = true;
-                if (opts.onProgress) {
+                if (opts.onProgress && !settled) {
                   try { opts.onProgress({ kind: 'tool_use', name: c.name }); } catch { /* user callback safety */ }
                 }
               }
             }
+          }
+          if (
+            !settled &&
+            opts.onTextDelta &&
+            // parent_tool_use_id — кусок вложенного суб-агента, а не основного
+            // ответа; у основного это поле null/отсутствует.
+            !ev.parent_tool_use_id &&
+            ev.type === 'stream_event' &&
+            ev.event?.type === 'content_block_delta' &&
+            ev.event.delta?.type === 'text_delta' &&
+            typeof ev.event.delta.text === 'string'
+          ) {
+            try { opts.onTextDelta(stripWordJoiner(ev.event.delta.text)); } catch { /* user callback safety */ }
           }
           if (ev.type === 'result') {
             streamResultText = typeof ev.result === 'string' ? ev.result : '';
@@ -698,7 +766,7 @@ export class ClaudeCliService implements OnModuleInit {
           }
         }
       });
-      proc.stderr.on('data', (b) => { stderr += b.toString(); });
+      proc.stderr.on('data', (b) => { stderr += errDecoder.write(b); });
 
       proc.on('close', (code) => {
         if (timer) clearTimeout(timer);
@@ -728,6 +796,7 @@ export class ClaudeCliService implements OnModuleInit {
           });
           // stripWordJoiner на выходе: U+2060, которым мы обезвреживали
           // @-упоминания во входе, не должен доехать до пользователя.
+          settled = true;
           resolve({ text: stripWordJoiner(streamResultText), costUsd: streamCostUsd, toolUsed: sawRiskyToolUse });
           return;
         }
@@ -769,6 +838,7 @@ export class ClaudeCliService implements OnModuleInit {
           });
           // В json-режиме вызов инструмента не виден: toolUsed всегда false,
           // осторожность — в mayRetryOnQwen по набору тулов и MCP.
+          settled = true;
           resolve({ text, costUsd, toolUsed: sawRiskyToolUse });
         } catch (e: any) {
           this.logger.error(`claude CLI parse error: ${e.message}, stdout: ${stdout.slice(0, 200)}`);

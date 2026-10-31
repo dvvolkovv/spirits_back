@@ -512,14 +512,22 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     agentId: string,
     userMessage: string,
     assistantResponse: string,
+    prevAssistantMessage?: string,
   ): Promise<void> {
     const apiKey = process.env.OPENROUTER_API_KEY;
     if (!this.driver) return;
 
     try {
-      // Получаем предыдущую реплику ассистента — нужна чтобы понять, с чем
-      // именно соглашается пользователь, если в его текущей реплике есть «да/точно/верно».
-      const prevAssistant = await this.fetchPrevAssistantMessage(userId, agentId);
+      // Предыдущая реплика ассистента — нужна чтобы понять, с чем именно
+      // соглашается пользователь, если в его текущей реплике есть «да/точно/
+      // верно». По умолчанию достаём её сами (обычный ход: в базе уже лежит
+      // только одна свежая пара). Перенос пробы в аккаунт
+      // (guest-trial/guest-claim.service.ts) вставляет все пары одним махом
+      // ДО разбора — наш запрос отдал бы одну и ту же (чужую) реплику каждой
+      // паре, поэтому он передаёт её явно пятым аргументом. '' — тоже
+      // валидное явное значение («начало диалога»), поэтому проверяем
+      // undefined, а не истинность строки.
+      const prevAssistant = prevAssistantMessage !== undefined ? prevAssistantMessage : await this.fetchPrevAssistantMessage(userId, agentId);
 
       const prompt = buildProfileExtractionPrompt(prevAssistant, userMessage, assistantResponse);
 

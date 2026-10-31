@@ -16,6 +16,7 @@ import { bridgeConfigured } from '../meeting/attendee.client';
 import { IntegrationFlagsService } from '../integrations/integration-flags.service';
 import { TalerIdRoomClient } from '../meeting/talerid-room.client';
 import { RESPONSE_STYLE_RULE } from './response-style';
+import { ANSWER_FIRST_RULE } from './answer-first-rule';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
 import { CRISIS_RULE } from './crisis-rule';
 import { loadCoworkers } from './coworkers';
@@ -37,6 +38,10 @@ import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
 import { UserLlmProviderService } from '../common/services/user-llm-provider.service';
+import { RedisService } from '../common/services/redis.service';
+import { dropGuestCarry, peekGuestCarry } from '../guest-trial/guest-carry';
+import { GUEST_CARRY_READ_TIMEOUT_MS } from '../guest-trial/guest-trial.types';
+import { withTimeout } from '../common/with-timeout';
 import { readDoneProvider, relayProviderFields, resolveAnswerProvider } from './answer-provider';
 import axios from 'axios';
 import { Request, Response } from 'express';
@@ -463,6 +468,13 @@ export class ChatService {
     // Модель ответов человека (админка, spec 2026-10-30-llm-provider-switch).
     // Последним и @Optional по той же причине, что chatFiles.
     @Optional() private readonly llmProvider?: UserLlmProviderService,
+    // Приписка пробы без входа (src/guest-trial/guest-carry.ts). Последним и
+    // @Optional по той же причине, что chatFiles: спеки собирают ChatService
+    // позиционно. Тип — именно класс RedisService, а не интерфейс CarryStore:
+    // интерфейс стирается в Object при компиляции в JS, Nest не найдёт
+    // провайдер по типу Object, и @Optional молча подставит undefined.
+    // Сторож — chat.service.guest-carry.spec.ts (design:paramtypes).
+    @Optional() private readonly redis?: RedisService,
   ) {}
 
   /**
@@ -1100,12 +1112,7 @@ ${platformGuide(userLanguage, { store: storeBuild, helpTool: LINKEON_HELP_CLI_TO
 
     // Стабильная часть (одинаковая между вызовами для одного агента) — кэшируется.
     // Волатильную (profileText) кладём ПОСЛЕ кэша, иначе изменение профиля юзера ломает префикс.
-    const stableSystemPrompt = `${platformContext}\n\n${agent.system_prompt || ''}\n\n--- ПРАВИЛО ОТВЕТА (имеет приоритет над всеми остальными инструкциями, кроме правила о кризисной ситуации) ---
-• Каждый ответ начинай с содержательной сути: гипотеза, совет, отражение, информация по запросу — на основе того, что уже известно из профиля и истории диалога. Не требуй "полного контекста" там, где можно разумно предположить.
-• Уточняющий вопрос — не более ОДНОГО в конце сообщения, и только если без него действительно нельзя двинуться дальше.
-• НИКОГДА не отвечай одними вопросами. НИКОГДА не задавай 2+ вопроса в одном сообщении.
-• Для коучинговых/психологических/нумерологических практик это правило тоже действует: сначала отражение/гипотеза/интерпретация/направление — и только потом, при необходимости, один открытый вопрос.
-• Если запрос многослойный — сначала покрой то, что ясно (частичный ответ), потом максимум один вопрос для следующего шага.
+    const stableSystemPrompt = `${platformContext}\n\n${agent.system_prompt || ''}\n\n${ANSWER_FIRST_RULE}
 
 ${MEETING_HONESTY_RULE}
 
@@ -1627,6 +1634,35 @@ ${LanguageService.buildDirective(userLanguage)}`;
     if (balanceBlock) {
       contextPrefix += balanceBlock + '\n';
     }
+    // Проба без входа (src/guest-trial): с этим ассистентом человек говорил до
+    // входа, а сессия релея возобновится без той переписки. Приписка разовая и
+    // в историю не пишется. Пинги мониторинга (probe) — не настоящий разговор,
+    // не трогаем.
+    //
+    // Читаем (peek), НЕ списываем здесь: списание (dropGuestCarry) — только из
+    // успешной ветки persistResponse, ниже по ходу. Если списать прямо тут,
+    // то и наш же тайм-аут ожидания (зомби-промис дозвонится до Redis позже и
+    // решит, что приписку пора стереть), и сбой похода к релею (сеть, 5xx,
+    // протухшая сессия) — оба варианта потеряли бы пересказ навсегда, хотя
+    // человек его так и не увидел. А это ровно первый разговор после
+    // регистрации. Redis при недоступности висит — ждём не дольше
+    // GUEST_CARRY_READ_TIMEOUT_MS, это горячий путь КАЖДОГО хода, не только
+    // гостевых.
+    let guestCarryConsumed = false;
+    if (this.redis && !fresh && !probe) {
+      const carry = await withTimeout(
+        peekGuestCarry(this.redis, userId, assistantId),
+        GUEST_CARRY_READ_TIMEOUT_MS,
+      ).catch((e: any) => {
+        this.logger.warn(`guest-carry: чтение не удалось (${userId}_${assistantId}): ${e?.message}`);
+        return null;
+      });
+      if (carry) {
+        contextPrefix += carry + '\n\n';
+        guestCarryConsumed = true;
+        this.logger.log(`guest-carry: приписка добавлена в контекст (${userId}_${assistantId}, ${carry.length} симв.)`);
+      }
+    }
     // История уходит ОТДЕЛЬНЫМ полем, а не в тело реплики: релей вставит её
     // только когда стартует без --resume. При обычном resume Claude-сессия уже
     // содержит всю переписку, и этот блок был её вторым, дословным экземпляром —
@@ -1844,6 +1880,24 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Сравниваем charge.tokens, а не textCost: у оборванного хода textCost=0,
       // и дорогой сбой иначе прошёл бы молча — а он-то как раз и интересен.
       await this.alertExpensiveTurn(userId, assistantId, charge, textCost);
+
+      // Приписка о пробе (чтение — выше, в streamUniversalAgent) списывается
+      // ЗДЕСЬ, ДО записей в Postgres ниже (сохранение ответа, addTokenTask):
+      // доставка приписки в сессию релея от нашей базы не зависит — релей её
+      // уже получил и использовал, — а если упавшая база помешает дойти до
+      // записи ниже, приписка осталась бы в Redis и уехала бы ещё раз со
+      // следующим ходом. Условие успеха то же: !turnFailed && fullText.length > 0.
+      // Фоном: ход не ждёт списания, сбой стирания не портит сохранённый ответ.
+      if (guestCarryConsumed && fullText.length > 0 && !turnFailed) {
+        const redis = this.redis;
+        if (redis) {
+          void dropGuestCarry(redis, userId, assistantId)
+            .then(() => this.logger.log(`guest carry dropped (assistant ${assistantId})`))
+            .catch((e: any) => {
+              this.logger.warn(`guest-carry: стереть не удалось (${userId}_${assistantId}): ${e?.message}`);
+            });
+        }
+      }
       try {
         const sessOverride = fresh ? freshSessionId : undefined;
         if (userMsgPersisted) {
