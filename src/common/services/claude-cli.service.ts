@@ -372,7 +372,15 @@ export class ClaudeCliService implements OnModuleInit {
     // это не проба — общий рубильник; проба мониторинга (noFallback без
     // provider) — Claude.
     const fromSwitch = opts.provider === undefined && !opts.noFallback;
-    const requested: AnswerProvider = fromSwitch ? await this.switchProvider() : (opts.provider ?? 'claude');
+    // Без this.globalProvider — 'claude' без await на switchProvider(): await
+    // чужого async-метода стоит минимум один тик микрозадачи, даже когда внутри
+    // нет ни одного своего await (он просто возвращает строку) — это ломает
+    // тесты параллельных вызовов, где после text() без await сразу проверяется
+    // spawnMock (счёт идёт на синхронность до самого spawn()). С сервисом тик
+    // оправдан — там настоящий (хоть и кэшируемый) запрос к базе.
+    const requested: AnswerProvider = fromSwitch
+      ? (this.globalProvider ? await this.switchProvider() : 'claude')
+      : (opts.provider ?? 'claude');
     const all = readFallbackConfigs();
     // Проверка через FALLBACK_ORDER.includes, не all[...] и не `in`: имя из
     // прототипа объекта (например 'constructor') резолвится правдой по цепочке
