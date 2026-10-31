@@ -3887,10 +3887,10 @@ HEAD `e5c2737` и sha256 = записанному в Task 10 Step 1 — инач
 ```bash
 for f in llm-fallback.mjs llm-fallback.test.mjs; do ssh dv@5.101.115.184 "cat > ~/file-agent/${f}" < "${W}/${f}"; done
 ssh dv@5.101.115.184 'cat > ~/file-agent/server.next.mjs' < "${W}/server.mjs"
-ssh dv@5.101.115.184 'cd ~/file-agent && node --check server.next.mjs && echo CHECK_OK && node --test --test-reporter=tap llm-fallback.test.mjs 2>&1 | grep -aE "^# (pass|fail)"'
+ssh dv@5.101.115.184 'cd ~/file-agent && node --check server.next.mjs && echo CHECK_OK && timeout 120 node --test --test-reporter=tap llm-fallback.test.mjs 2>&1 | grep -aE "^# (pass|fail)"'
 ```
 
-Expected: `CHECK_OK`, `# fail 0`. Затем — проверка, что `server.next.mjs` и `llm-fallback.mjs` одной версии: релей зовёт модуль как `llm.*` (namespace-импорт), и отсутствующая функция не роняет запуск, а даёт `TypeError`, который молча глотает `try { handleEvent } catch {}` вокруг разбора событий — ход за ходом без учёта стоимости и разбора `result` (итоговое ревью 31.10). Скрипт — `check-llm-exports.mjs` в scratchpad рядом с `${W}` (текст ниже):
+Expected: `CHECK_OK`, `# pass 36`, `# fail 0` (`timeout 120`: у `node:test` по умолчанию нет тайм-аута, а синхронный цикл таймер теста не прервёт — зависший тест не должен вешать выкат; на релее `/usr/bin/timeout` есть). Затем — проверка, что `server.next.mjs` и `llm-fallback.mjs` одной версии: релей зовёт модуль как `llm.*` (namespace-импорт), и отсутствующая функция не роняет запуск, а даёт `TypeError`, который молча глотает `try { handleEvent } catch {}` вокруг разбора событий — ход за ходом без учёта стоимости и разбора `result` (итоговое ревью 31.10). Скрипт — `check-llm-exports.mjs` в scratchpad рядом с `${W}` (текст ниже):
 
 ```js
 // Все llm.* из server.next.mjs (или файла из аргумента) есть среди экспортов llm-fallback.mjs
