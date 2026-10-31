@@ -115,3 +115,53 @@ test('в звонке ждём дольше, чем на встрече: чел�
   );
   assert.ok(call.silence_duration_ms >= 1500, 'паузы в полторы секунды — ещё середина мысли');
 });
+
+/**
+ * `turnHandling.interruption` на звонке не работает — и это надо видеть.
+ *
+ * В `agent.ts` стоит `{ minDuration: 800, minWords: 2 }` с разбором живого
+ * звонка 26.08.2026 («реагирует на каждый чих»). Разбор верный, настройка
+ * мёртвая: `interruptByAudioActivity` в SDK выходит раньше, чем доберётся до
+ * слов, если LLM — RealtimeModel с серверной разметкой, а это ровно наш
+ * случай (`capabilities.turnDetection = options.turnDetection !== null`, а мы
+ * всегда передаём объект). Второй заслон SDK — пересчёт слов постфактум —
+ * требует отдельного `stt`, которого у RealtimeModel нет.
+ *
+ * То есть перебивает Романа ТОЛЬКО серверный VAD OpenAI, и единственный живой
+ * рычаг — `threshold` в `realtimeTurnDetection`.
+ *
+ * Чем оплачено: звонок 30.10.2026, 851-я секунда. Посторонний звук прошёл
+ * порог, Роман оборвался на «Версия для» — обрывок так и лежит в расшифровке,
+ * — а распознавание вернуло из того же звука нашу же подсказку. Заслон эха её
+ * из расшифровки убрал, но реплику уже обрезало: заслон стоит ниже по течению.
+ *
+ * ⚠️ Если тест покраснел — у SDK изменился порядок проверок, и настройка
+ * могла ОЖИТЬ. Тогда её надо не чинить, а заново замерить: 800 мс и два слова
+ * выбирались против другого поведения.
+ */
+test('SDK: minWords/minDuration не доживают до проверки при серверной разметке', () => {
+  const src = sdk('agent_activity.js');
+  const start = src.indexOf('interruptByAudioActivity(');
+  assert.notEqual(start, -1, 'метод исчез — заслон перебивания переехал, перечитать докстринг');
+  const body = src.slice(start, start + 1200);
+  const realtimeGuard = body.search(
+    /if \(this\.llm instanceof RealtimeModel && this\.llm\.capabilities\.turnDetection\) \{\s*return;/,
+  );
+  const wordsCheck = body.indexOf('minWords');
+  assert.notEqual(realtimeGuard, -1, 'ранний выход по RealtimeModel исчез — настройка могла ожить');
+  assert.notEqual(wordsCheck, -1);
+  assert.ok(
+    realtimeGuard < wordsCheck,
+    'проверка слов стала раньше выхода по RealtimeModel — заслон ожил, нужен новый замер',
+  );
+});
+
+test('SDK: второй заслон по словам требует отдельного stt, которого у нас нет', () => {
+  const src = sdk('agent_activity.js');
+  // Пересчёт слов постфактум (отмена ложного перебивания) весь под `this.stt`.
+  assert.match(
+    src,
+    /if \(this\.stt && this\.turnDetection !== "manual"/,
+    'пересчёт слов перестал требовать stt — проверить, не ожил ли minWords',
+  );
+});
