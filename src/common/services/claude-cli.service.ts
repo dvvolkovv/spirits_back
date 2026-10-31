@@ -835,24 +835,33 @@ export class ClaudeCliService implements OnModuleInit {
         if (code !== 0) {
           // Причина — сначала из JSON в stdout, но ТОЛЬКО если это
           // действительно ошибка (is_error или текст похож на отказ CLI) и
-          // result — строка: иначе кодом ≠0 мог выйти обычный ответ, и его
-          // текст («429», «try again») классифицировался бы как лимит и
-          // открыл бы окно Claude для всех, а j.error-объект (не строка) дал
-          // бы "[object Object]". Дальше — stderr (без безобидных
+          // result/error — непустая строка после .trim() (иначе строка из
+          // пробелов заслонила бы stderr). Если stdout — валидный JSON, но ни
+          // result, ни error не дали причину (обычный ответ с ненулевым
+          // кодом) — сырой stdout в причину НЕ берём: в нём тот же текст
+          // («429», «try again»), и он классифицировался бы как лимит и
+          // открыл бы окно Claude для всех. Сырой stdout — только когда
+          // stdout НЕ JSON вовсе. Дальше — stderr (без безобидных
           // предупреждений о модели — stderrDetail; живая проверка на Linux,
           // 31.10, битый ключ Qwen: `[claude-code:unrecognized_model] {...}`
-          // заслоняло настоящую причину 401), затем — сырой stdout.
+          // заслоняло настоящую причину 401), а если и там пусто —
+          // нейтральная причина.
           let detail = '';
           try {
             const j = JSON.parse(stdout);
-            if (typeof j.result === 'string' && (j.is_error === true || looksLikeCliRefusal(j.result))) {
-              detail = j.result;
-            } else if (typeof j.error === 'string') {
-              detail = j.error;
+            if (typeof j.result === 'string') {
+              const r = j.result.trim();
+              if (r && (j.is_error === true || looksLikeCliRefusal(j.result))) detail = r;
             }
-          } catch { /* не JSON — возьмём stderr или сырой stdout ниже */ }
-          if (!detail) detail = ClaudeCliService.stderrDetail(stderr);
-          if (!detail) detail = stdout.trim().slice(0, 400);
+            if (!detail && typeof j.error === 'string') {
+              const e = j.error.trim();
+              if (e) detail = e;
+            }
+            if (!detail) detail = ClaudeCliService.stderrDetail(stderr);
+            if (!detail) detail = 'ненулевой код после обычного ответа (без is_error)';
+          } catch {
+            detail = ClaudeCliService.stderrDetail(stderr) || stdout.trim().slice(0, 400);
+          }
           this.logger.error(`claude CLI exit ${code}: stderr=${stderr.slice(0, 300)} stdout=${stdout.slice(0, 300)}`);
           fail(`claude CLI exited with code ${code}: ${detail.slice(0, 200) || '(no output)'}`);
           return;
