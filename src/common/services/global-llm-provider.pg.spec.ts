@@ -1,5 +1,5 @@
 import { Pool } from 'pg';
-import { GLOBAL_PROVIDER_CACHE_MS, GlobalLlmProviderService, LLM_SETTINGS_DDL } from './global-llm-provider.service';
+import { GlobalLlmProviderService, LLM_SETTINGS_DDL } from './global-llm-provider.service';
 
 const PG = process.env.PROVISIONING_PG_URL;
 const maybe = PG ? describe : describe.skip;
@@ -19,10 +19,9 @@ maybe('общий рубильник модели против живого Post
     svc = new GlobalLlmProviderService({ query: (s: string, p?: any[]) => pool.query(s, p) } as any);
   });
   afterAll(async () => {
-    // Таблицу создали мы сами (DDL в beforeAll) — убираем за собой, чтобы в
-    // общей для нескольких задач gls_test не копились чужие для них объекты.
-    // Саму базу gls_test не трогаем — её удаление не входит в эту задачу.
-    await pool.query('DROP TABLE IF EXISTS llm_settings');
+    // База общая для разных прогонов этого и будущих тестов — только чистим
+    // данные за собой, таблицу не роняем.
+    await pool.query('TRUNCATE llm_settings');
     await pool.end();
   });
 
@@ -38,13 +37,18 @@ maybe('общий рубильник модели против живого Post
     expect(afterFirst.since).not.toBeNull();
     expect(afterFirst.by).toBe('admin-1');
 
+    // Новый экземпляр с пустым кэшем на том же пуле — значение идёт только из
+    // SELECT, а не из кэша того же svc, который сам его туда только что положил.
+    const fresh = new GlobalLlmProviderService({ query: (s: string, p?: any[]) => pool.query(s, p) } as any);
+    expect(await fresh.get()).toBe('qwen');
+
     const r = await svc.set('kimi', 'admin-1');
     expect(r).toEqual({ previous: 'qwen' });
   });
 
-  it('мусор в значении, вставленный напрямую SQL, — claude после истечения кэша', async () => {
+  it('мусор в значении, вставленный напрямую SQL, — claude', async () => {
     await pool.query(`INSERT INTO llm_settings (key, value) VALUES ('global_provider', '{"provider":"gpt"}'::jsonb)`);
-    const t0 = Date.now();
-    expect(await svc.get(t0 + GLOBAL_PROVIDER_CACHE_MS)).toBe('claude');
+    expect(await svc.get()).toBe('claude');
+    expect((await svc.status()).provider).toBe('claude');
   });
 });

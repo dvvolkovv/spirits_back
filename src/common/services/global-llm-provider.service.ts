@@ -22,9 +22,8 @@ export const GLOBAL_PROVIDER_CACHE_MS = 15_000;
  * ALTER TABLE ... ADD COLUMN IF NOT EXISTS — он берёт ACCESS EXCLUSIVE lock на
  * всю таблицу при КАЖДОМ старте API, даже когда колонка уже есть, а
  * llm_settings читается на каждом вызове CLI (ClaudeCliService) — конкурентные
- * чтения встанут на время лока. Проверять наличие колонки через каталог
- * (information_schema.columns) внутри DO и делать ALTER только когда её
- * действительно нет — как в UserLlmProviderService.onModuleInit().
+ * чтения встанут на время лока. Добавлять такую колонку — проверкой каталога
+ * (information_schema.columns) перед ALTER, внутри того же DO.
  */
 export const LLM_SETTINGS_DDL = `DO $llm_settings$
 BEGIN
@@ -99,8 +98,9 @@ export class GlobalLlmProviderService implements OnModuleInit {
   }
 
   /**
-   * Бросает при сбое базы — не подставляет Claude молча: вызывающий (карточка
-   * в админке) должен показать «не удалось прочитать», а не ошибочно
+   * Бросает при сбое базы — не подставляет Claude молча: вызывающий (блок
+   * «Модель ответов для всех» в админке, плашка на вкладках, суточное
+   * напоминание) должен показать «не удалось прочитать», а не ошибочно
    * убедить, что рубильник стоит на Claude, когда это на самом деле неизвестно.
    */
   async status(): Promise<GlobalProviderStatus> {
@@ -120,11 +120,10 @@ export class GlobalLlmProviderService implements OnModuleInit {
   /**
    * Записывает выбор и сразу обновляет кэш; отдаёт прежнее значение.
    *
-   * Прежнее значение читается ОТДЕЛЬНЫМ запросом до записи, а не из того же
-   * upsert (RETURNING старой строки): при двух одновременных переключениях
-   * «было» в сообщении админу может оказаться неточным (оба читают один и тот
-   * же момент «до») — для текста алерта это приемлемо, линеаризация здесь не
-   * нужна.
+   * Прежнее значение читается ОТДЕЛЬНЫМ запросом до записи: при двух
+   * одновременных переключениях «было» в сообщении админу может оказаться
+   * неточным (оба читают один и тот же момент «до») — для текста алерта это
+   * приемлемо, линеаризация здесь не нужна.
    */
   async set(provider: AnswerProvider, by: string, now: number = Date.now()): Promise<{ previous: AnswerProvider }> {
     if (!isAnswerProvider(provider)) throw new Error(`llm_settings: недопустимая модель ${String(provider)}`);

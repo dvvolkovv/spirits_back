@@ -297,6 +297,7 @@ export function planProviders(args: {
   // правду через цепочку прототипов, а не null/undefined, и первую проверку
   // не ловит вовсе.
   const usable = (s?: FallbackProvider): s is FallbackProvider => !!s && FALLBACK_ORDER.includes(s) && !!args.configs[s];
+  const s = args.selected;
   // noFallback — без цепочки (spec 2026-10-31-global-llm-switch, раздел 3):
   // проба мониторинга (без выбора) — только Claude; ход гостя — только модель
   // рубильника, если у неё есть ключ, иначе Claude. Окно isDown здесь не
@@ -307,7 +308,6 @@ export function planProviders(args: {
   // provider — к релею с noFallback ходят только пробы. Расхождение
   // намеренное, не выравнивать.
   if (args.noFallback) {
-    const s = args.selected;
     return usable(s) ? [s] : ['claude'];
   }
   const now = args.now ?? Date.now();
@@ -315,7 +315,6 @@ export function planProviders(args: {
     const alts = FALLBACK_ORDER.filter((n) => n !== exclude && !!args.configs[n] && !args.state.isDown(n, now));
     return args.state.claudeWindowOpen(now) && alts.length > 0 ? [...alts] : ['claude', ...alts];
   };
-  const s = args.selected;
   if (usable(s)) {
     return [s, ...normal(s)];
   }

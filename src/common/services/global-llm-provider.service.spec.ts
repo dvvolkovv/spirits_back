@@ -102,7 +102,7 @@ describe('GlobalLlmProviderService', () => {
     expect(query).not.toHaveBeenCalled();
   });
 
-  it('status: сбой базы — бросает (не подставляем Claude молча в карточке)', async () => {
+  it('status: сбой базы — бросает (не подставляем Claude молча в блоке «Модель ответов для всех», плашке или напоминании)', async () => {
     const { svc } = mk(() => { throw new Error('db down'); });
     await expect(svc.status()).rejects.toThrow('db down');
   });
