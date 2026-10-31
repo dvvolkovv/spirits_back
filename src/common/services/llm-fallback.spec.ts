@@ -266,6 +266,11 @@ describe('planProviders', () => {
   it('noFallback с именем из прототипа — Claude', () => {
     expect(planProviders({ selected: 'constructor' as any, configs: both, state: new FallbackState(), noFallback: true, now: T })).toEqual(['claude']);
   });
+  it('noFallback с выбором, модель помечена не отвечающей — план всё равно эта модель (окно проверяет вызывающий)', () => {
+    const s = new FallbackState();
+    s.markDown('kimi', 60_000, T);
+    expect(planProviders({ selected: 'kimi', configs: both, state: s, noFallback: true, now: T + 1 })).toEqual(['kimi']);
+  });
   it('окно Claude закрыто — Claude, Qwen, Kimi', () => {
     expect(planProviders({ configs: both, state: new FallbackState(), now: T })).toEqual(['claude', 'qwen', 'kimi']);
   });
