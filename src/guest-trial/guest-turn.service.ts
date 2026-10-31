@@ -281,6 +281,12 @@ export class GuestTurnService {
             // Запасной Qwen гостям не положен: его квота — для платящих.
             noFallback: true,
             timeoutMs: GUEST_TURN_TIMEOUT_MS,
+            // Приватность (F1, ревью 31.10): транскрипт CLI не должен жить
+            // дольше, чем обещает политика пробы (7 дней).
+            noSessionPersistence: true,
+            // Изоляция (F2, ревью 31.10): свой постоянный пустой cwd вместо
+            // общего os.tmpdir() — та же защита, что у вызовов с MCP.
+            isolatedCwd: true,
             onTextDelta: (t) => { hadChunks = true; this.write(res, { type: 'item', content: t }); },
           });
           text = (r.text || '').trim();

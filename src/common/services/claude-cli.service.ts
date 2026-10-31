@@ -36,10 +36,12 @@ export interface ClaudeCliMcpHttpServer {
 const MCP_CONFIG_DIR_PREFIX = 'claude-mcp-';
 
 /**
- * Постоянный пустой cwd вызовов с MCP без своего cwd (Маша). Один на все
- * вызовы: CLI заводит в ~/.claude/projects папку проекта на каждый новый cwd,
- * и одноразовый каталог на ход давал бы тысячи папок в сутки. Мы в него не
- * пишем и не удаляем его; уборка брошенных конфигов его не трогает.
+ * Постоянный пустой cwd для вызовов без своего cwd, которым он нужен
+ * нейтральным: с MCP (Маша) и, с F2 (31.10), с opts.isolatedCwd (проба без
+ * входа, src/guest-trial). Один на все такие вызовы: CLI заводит в
+ * ~/.claude/projects папку проекта на каждый новый cwd, и одноразовый
+ * каталог на ход давал бы тысячи папок в сутки. Мы в него не пишем и не
+ * удаляем его; уборка брошенных конфигов его не трогает.
  */
 const EMPTY_CWD_NAME = 'linkeon-claude-empty';
 
@@ -106,6 +108,14 @@ export interface ClaudeCliOptions {
   /** Рабочая директория Claude. По умолчанию os.tmpdir(). Для агентных
    *  сценариев (Bash/Write/Edit) передавай изолированный sandbox-dir. */
   cwd?: string;
+  /** Нейтральный ПОСТОЯННЫЙ пустой cwd вместо общего os.tmpdir(), когда caller
+   *  сам не задал cwd — тот же каталог, что и у вызовов с MCP (см.
+   *  neutralEmptyCwd). Общий tmp один на все процессы машины, а из cwd CLI
+   *  сам подхватывает CLAUDE.md/.claude/settings.json (в них бывают хуки);
+   *  проба без входа (src/guest-trial) не должна зависеть от того, что чужой
+   *  процесс в этот момент оставил в общем tmp. Без MCP и без этой опции —
+   *  прежнее поведение (tmpdir()). */
+  isolatedCwd?: boolean;
   /** Полностью переопределяет --allowedTools (это АВТО-ОДОБРЕНИЕ, а не набор
    *  доступного). По умолчанию: '' ВСЕГДА — в т.ч. при attachments. Голое 'Read'
    *  в allowedTools одобряет чтение ЛЮБОГО пути, а не только внутри cwd; Read
@@ -137,6 +147,14 @@ export interface ClaudeCliOptions {
    *  сразу на Qwen, без попытки Claude. Не авария: окно предохранителя и
    *  fallbackStats не трогаются. Без ключа и при noFallback — обычный Claude. */
   provider?: 'qwen';
+  /** Без флага CLI пишет весь промпт (систему, реплики, ответ) в
+   *  ~/.claude/projects/<cwd>/<uuid>.jsonl и хранит cleanupPeriodDays
+   *  (по умолчанию 30 дней). При true добавляет --no-session-persistence —
+   *  флаг действует только с --print/-p (у нас он всегда есть, см. '-p' в
+   *  начале args). Проба без входа (src/guest-trial) обещает в политике 7
+   *  дней — транскрипт CLI с чужим (дольшим) сроком хранения это обещание
+   *  нарушает. */
+  noSessionPersistence?: boolean;
 }
 
 @Injectable()
@@ -211,15 +229,18 @@ export class ClaudeCliService implements OnModuleInit {
   }
 
   /**
-   * cwd вызова с MCP, когда caller не дал своего (Маша): постоянный пустой
-   * <tmpdir>/linkeon-claude-empty. Каталог конфига с токеном — отдельный,
-   * на вызов (writeMcpConfig), и лежит рядом, а не внутри.
+   * Постоянный пустой cwd, когда caller не дал своего: <tmpdir>/linkeon-claude-empty.
+   * Раньше — только для вызовов с MCP (Маша); с F2 (31.10) — и для любого
+   * вызова с opts.isolatedCwd (проба без входа): тот же каталог, та же
+   * защита от чужого CLAUDE.md/.claude/settings.json в общем tmp. Каталог
+   * конфига MCP с токеном — отдельный, на вызов (writeMcpConfig), и лежит
+   * рядом, а не внутри.
    *
    * Не годится (см. emptyCwdProblem) — вызов идёт в одноразовый claude-cwd-*,
    * который снимается после вызова, а в лог уходит причина: ход не должен
    * зависеть от чужого каталога в общем tmp.
    */
-  private mcpNeutralCwd(registerTmpDir: (dir: string) => void): string {
+  private neutralEmptyCwd(registerTmpDir: (dir: string) => void): string {
     const dir = path.join(this.tmpRoot(), EMPTY_CWD_NAME);
     const problem = ClaudeCliService.emptyCwdProblem(dir);
     if (!problem) return dir;
@@ -489,7 +510,7 @@ export class ClaudeCliService implements OnModuleInit {
    * читает файлы cwd тулом Read, а в одноразовом каталоге вложений — тоже.
    * Отдельный каталог лежит рядом с ними, а не внутри. Нейтральным cwd вызову
    * с MCP служит не сам os.tmpdir() (каталог конфига оказался бы внутри), а
-   * постоянный пустой linkeon-claude-empty — см. mcpNeutralCwd.
+   * постоянный пустой linkeon-claude-empty — см. neutralEmptyCwd.
    */
   private writeMcpConfig(
     servers: Record<string, ClaudeCliMcpHttpServer>,
@@ -557,13 +578,15 @@ export class ClaudeCliService implements OnModuleInit {
       // prompt — irrelevant context that inflated input and tripled VPM latency.
       // Caller may override cwd для агентного sandbox-режима.
       //
-      // Вызов с MCP (Маша) получает не сам os.tmpdir(), а постоянный пустой
-      // каталог (mcpNeutralCwd): каталог конфига с токеном лежит рядом, а не
-      // внутри cwd, при любом наборе тулов.
+      // Вызов с MCP (Маша) или с isolatedCwd (проба без входа, F2) получает
+      // не сам os.tmpdir(), а постоянный пустой каталог (neutralEmptyCwd):
+      // у MCP каталог конфига с токеном лежит рядом, а не внутри cwd, при
+      // любом наборе тулов; у пробы — просто чтобы не достался чужой
+      // CLAUDE.md из общего tmp (см. emptyCwdProblem).
       if (opts.cwd) {
         spawnCwd = opts.cwd;
-      } else if (hasMcp) {
-        spawnCwd = this.mcpNeutralCwd(registerTmpDir);
+      } else if (hasMcp || opts.isolatedCwd) {
+        spawnCwd = this.neutralEmptyCwd(registerTmpDir);
       } else {
         spawnCwd = this.tmpRoot();
       }
@@ -645,6 +668,12 @@ export class ClaudeCliService implements OnModuleInit {
     if (streaming) args.push('--verbose');
     // Куски текста приходят только с этим флагом (stream_event → text_delta).
     if (opts.onTextDelta) args.push('--include-partial-messages');
+    // Приватность пробы без входа (F1, ревью 31.10): без флага CLI пишет весь
+    // промпт (персону, реплики гостя, ответ) в
+    // ~/.claude/projects/<cwd>/<uuid>.jsonl и хранит cleanupPeriodDays (30
+    // дней) — дольше, чем обещает политика пробы (7 дней). Флаг работает
+    // только с --print/-p — он у нас есть всегда (см. '-p' в начале args).
+    if (opts.noSessionPersistence) args.push('--no-session-persistence');
 
     return new Promise<CliRunResult>((resolve, reject) => {
       // Обычный запуск наследует process.env как есть; запасной получает своё
