@@ -564,6 +564,23 @@ describe('ClaudeCliService — общий рубильник', () => {
   });
 ```
 
+В `src/common/services/claude-cli.forced-qwen.spec.ts` тест `'noFallback побеждает: проба — только Claude'` заменить двумя:
+
+```ts
+  it('noFallback с provider — только эта модель (ход гостя), без цепочки', async () => {
+    spawnMock.mockImplementationOnce(() => fakeProc(OK('q')));
+    expect(await new ClaudeCliService().text('x', { provider: 'qwen', noFallback: true })).toBe('q');
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(hasEnv(0)).toBe(true);
+  });
+
+  it('noFallback без provider (проба мониторинга) — только Claude', async () => {
+    spawnMock.mockImplementationOnce(() => fakeProc(OK('claude')));
+    await new ClaudeCliService().text('x', { noFallback: true });
+    expect(hasEnv(0)).toBe(false);
+  });
+```
+
 - [ ] **Шаг 2: красный прогон.** Коммит `test(llm): ClaudeCliService и рубильник (красный)`.
 Run: `bash .superpowers/node-run.sh 'timeout 240 npx jest --testPathPattern="src/common/services/claude-cli" 2>&1 | tail -40'`
 Expected: FAIL — рубильник не применяется (`tokenOf(0)` undefined в первом тесте), `noFallback с provider kimi` получает Claude.
@@ -660,7 +677,7 @@ Expected: FAIL — рубильник не применяется (`tokenOf(0)` 
 ```
 
 - [ ] **Шаг 4: зелёный прогон** — та же команда + `timeout 200 npx tsc --noEmit -p tsconfig.build.json; echo tsc_build=$?`. Expected: все наборы `claude-cli*` PASS, `tsc_build=0`.
-- [ ] **Шаг 5: коммит** `feat(llm): ClaudeCliService подставляет общий рубильник вызовам без выбора` — `git add src/common/services/claude-cli.service.ts src/common/services/claude-cli.global-switch.spec.ts src/common/services/claude-cli.chain.spec.ts`.
+- [ ] **Шаг 5: коммит** `feat(llm): ClaudeCliService подставляет общий рубильник вызовам без выбора` — `git add src/common/services/claude-cli.service.ts src/common/services/claude-cli.global-switch.spec.ts src/common/services/claude-cli.chain.spec.ts src/common/services/claude-cli.forced-qwen.spec.ts`.
 
 ---
 
@@ -1452,6 +1469,19 @@ describe('тексты рубильника', () => {
     const t = reminderText({ provider: 'qwen', since: null, now: new Date(), claudeStatus: null, claudeCheckedAt: null, keyMissing: false });
     expect(t).toContain('Claude по последней пробе: нет данных');
   });
+
+  it('напоминание: счёт за сутки — ответов через модель рубильника и сколько раз она не ответила', () => {
+    const t = reminderText({
+      provider: 'qwen', since: null, now: new Date(), claudeStatus: 'ok', claudeCheckedAt: null, keyMissing: false,
+      day: { ok: 120, other: 3 },
+    });
+    expect(t).toContain('За сутки через Qwen: 120 ответов; не ответила (ответил другой) — 3');
+  });
+
+  it('напоминание: счёта нет (сбой запроса) — строки нет', () => {
+    const t = reminderText({ provider: 'qwen', since: null, now: new Date(), claudeStatus: 'ok', claudeCheckedAt: null, keyMissing: false, day: null });
+    expect(t).not.toContain('За сутки');
+  });
 });
 ```
 
@@ -1613,6 +1643,12 @@ export function reminderText(a: {
   claudeStatus: 'ok' | 'down' | null;
   claudeCheckedAt: string | null;
   keyMissing: boolean;
+  /** Ответы за сутки по выбору рубильника (события chat_quality и claude_cli_call
+   *  с choice=global): ok — ответила модель рубильника, other — она не ответила
+   *  и ответил другой. Релей такие ходы в /health.fallback не считает (они «по
+   *  выбору», не авария), поэтому без этой строки сбои модели рубильника не
+   *  видны. null/нет — строки нет. */
+  day?: { ok: number; other: number } | null;
 }): string {
   const label = PROVIDER_LABELS[a.provider];
   const since = a.since
@@ -1624,6 +1660,7 @@ export function reminderText(a: {
     `⏰ <b>Все отвечают через ${label}</b>${since}.`,
     `Claude по последней пробе: ${claude}${checked}.`,
   ];
+  if (a.day) lines.push(`За сутки через ${label}: ${a.day.ok} ответов; не ответила (ответил другой) — ${a.day.other}.`);
   if (a.keyMissing) lines.push(`Ключа ${label} на сервере нет — фактически отвечает Claude.`);
   lines.push('Вернуть — Админка → Ассистенты.');
   return lines.join('\n');
@@ -1790,6 +1827,8 @@ import { GlobalLlmReminderService } from './global-llm-reminder.service';
 const health = (llmStatus: 'ok' | 'down' | null) => ({
   getOverview: jest.fn(async () => ({ usage: { llmStatus, llmCheckedAt: '2026-10-31T06:45:00Z' } })),
 });
+/** pg с суточным счётом ответов по выбору рубильника. */
+const pgDay = (ok = 0, other = 0) => ({ query: jest.fn(async () => ({ rows: [{ ok, other }] })) });
 
 describe('GlobalLlmReminderService', () => {
   const OLD = process.env.KIMI_FALLBACK_API_KEY;
@@ -1800,15 +1839,17 @@ describe('GlobalLlmReminderService', () => {
 
   it('рубильник на Claude — молчит', async () => {
     const g = { status: jest.fn(async () => ({ provider: 'claude', since: null, by: null })) };
-    const s = new GlobalLlmReminderService(g as any, health('ok') as any);
+    const pg = pgDay();
+    const s = new GlobalLlmReminderService(g as any, health('ok') as any, pg as any);
     expect(await s.remind(new Date('2026-10-31T07:00:00Z'))).toBe(false);
     expect(sendTelegramAlert).not.toHaveBeenCalled();
+    expect(pg.query).not.toHaveBeenCalled();
   });
 
   it('рубильник на Kimi без ключа — напоминание с пометкой «фактически Claude»', async () => {
     delete process.env.KIMI_FALLBACK_API_KEY;
     const g = { status: jest.fn(async () => ({ provider: 'kimi', since: '2026-10-30T07:00:00Z', by: 'admin-1' })) };
-    const s = new GlobalLlmReminderService(g as any, health('down') as any);
+    const s = new GlobalLlmReminderService(g as any, health('down') as any, pgDay() as any);
     expect(await s.remind(new Date('2026-10-31T07:00:00Z'))).toBe(true);
     const text = (sendTelegramAlert as jest.Mock).mock.calls[0][0];
     expect(text).toContain('Все отвечают через Kimi');
@@ -1816,9 +1857,31 @@ describe('GlobalLlmReminderService', () => {
     expect(text).toContain('фактически отвечает Claude');
   });
 
+  it('счёт за сутки — по событиям с choice=global и selected модели рубильника', async () => {
+    process.env.KIMI_FALLBACK_API_KEY = 'sk-kimi-test';
+    const g = { status: jest.fn(async () => ({ provider: 'kimi', since: null, by: null })) };
+    const pg = pgDay(57, 2);
+    const s = new GlobalLlmReminderService(g as any, health('ok') as any, pg as any);
+    await s.remind();
+    const [sql, params] = (pg.query as jest.Mock).mock.calls[0];
+    expect(sql).toMatch(/props->>'choice' = 'global'/);
+    expect(sql).toMatch(/name IN \('chat_quality', 'claude_cli_call'\)/);
+    expect(params).toEqual(['kimi']);
+    expect((sendTelegramAlert as jest.Mock).mock.calls[0][0]).toContain('За сутки через Kimi: 57 ответов; не ответила (ответил другой) — 2');
+  });
+
+  it('сбой счёта — напоминание уходит без строки «За сутки»', async () => {
+    process.env.KIMI_FALLBACK_API_KEY = 'sk-kimi-test';
+    const g = { status: jest.fn(async () => ({ provider: 'kimi', since: null, by: null })) };
+    const pg = { query: jest.fn(async () => { throw new Error('db down'); }) };
+    const s = new GlobalLlmReminderService(g as any, health('ok') as any, pg as any);
+    expect(await s.remind()).toBe(true);
+    expect((sendTelegramAlert as jest.Mock).mock.calls[0][0]).not.toContain('За сутки');
+  });
+
   it('сбой статуса — молчит, не бросает', async () => {
     const g = { status: jest.fn(async () => { throw new Error('db down'); }) };
-    const s = new GlobalLlmReminderService(g as any, health('ok') as any);
+    const s = new GlobalLlmReminderService(g as any, health('ok') as any, pgDay() as any);
     await expect(s.remind()).resolves.toBe(false);
   });
 
@@ -1826,7 +1889,7 @@ describe('GlobalLlmReminderService', () => {
     process.env.KIMI_FALLBACK_API_KEY = 'sk-kimi-test';
     const g = { status: jest.fn(async () => ({ provider: 'kimi', since: null, by: null })) };
     const h = { getOverview: jest.fn(async () => { throw new Error('boom'); }) };
-    const s = new GlobalLlmReminderService(g as any, h as any);
+    const s = new GlobalLlmReminderService(g as any, h as any, pgDay() as any);
     expect(await s.remind()).toBe(true);
     expect((sendTelegramAlert as jest.Mock).mock.calls[0][0]).toContain('нет данных');
   });
@@ -1844,6 +1907,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
 import { FallbackProvider, readFallbackConfigs } from '../common/services/llm-fallback';
+import { PgService } from '../common/services/pg.service';
 import { sendTelegramAlert } from '../common/telegram-alert';
 import { reminderText } from '../common/global-llm-messages';
 import { ClaudeHealthService } from './claude-health.service';
@@ -1852,7 +1916,9 @@ import { ClaudeHealthService } from './claude-health.service';
  * Раз в сутки, пока общий рубильник не на Claude, — напоминание в группу
  * алертов (spec 2026-10-31-global-llm-switch, раздел 8): возврат только
  * вручную, и про него легко забыть после аварии. Состояние Claude — по
- * последней пробе живости (ClaudeHealthService, раз в 15 минут).
+ * последней пробе живости (ClaudeHealthService, раз в 15 минут). Счёт за
+ * сутки — по событиям: релей ходы «по выбору» в /health.fallback не считает,
+ * и сбои модели рубильника иначе не видны.
  */
 @Injectable()
 export class GlobalLlmReminderService {
@@ -1861,6 +1927,7 @@ export class GlobalLlmReminderService {
   constructor(
     private readonly global: GlobalLlmProviderService,
     private readonly health: ClaudeHealthService,
+    private readonly pg: PgService,
   ) {}
 
   @Cron('0 0 10 * * *', { name: 'global-llm-reminder', timeZone: 'Europe/Moscow' })
@@ -1877,6 +1944,10 @@ export class GlobalLlmReminderService {
     if (!s || s.provider === 'claude') return false;
     const provider = s.provider as FallbackProvider;
     const overview: any = await this.health.getOverview().catch(() => null);
+    const day = await this.dayCounts(provider).catch((e: any) => {
+      this.logger.warn(`рубильник: счёт за сутки не прочитан: ${e?.message}`);
+      return null;
+    });
     const text = reminderText({
       provider,
       since: s.since,
@@ -1884,9 +1955,26 @@ export class GlobalLlmReminderService {
       claudeStatus: overview?.usage?.llmStatus ?? null,
       claudeCheckedAt: overview?.usage?.llmCheckedAt ?? null,
       keyMissing: readFallbackConfigs()[provider] === null,
+      day,
     });
     await sendTelegramAlert(text).catch((e: any) => this.logger.warn(`напоминание о рубильнике не отправлено: ${e?.message}`));
     return true;
+  }
+
+  /** Ответы за сутки по выбору рубильника: ok — ответила его модель, other —
+   *  ответил другой (она не ответила; у chat_quality — и неудачные ходы). */
+  private async dayCounts(provider: FallbackProvider): Promise<{ ok: number; other: number }> {
+    const r = await this.pg.query(
+      `SELECT count(*) FILTER (WHERE props->>'provider' = $1)::int AS ok,
+              count(*) FILTER (WHERE props->>'provider' IS DISTINCT FROM $1)::int AS other
+         FROM events
+        WHERE ts > now() - interval '1 day'
+          AND name IN ('chat_quality', 'claude_cli_call')
+          AND props->>'choice' = 'global'
+          AND props->>'selected' = $1`,
+      [provider],
+    );
+    return { ok: Number(r.rows[0]?.ok ?? 0), other: Number(r.rows[0]?.other ?? 0) };
   }
 }
 ```
