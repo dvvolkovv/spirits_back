@@ -1,8 +1,8 @@
 import { UserLlmProviderService } from './user-llm-provider.service';
 
-const mk = (impl: (sql: string, params?: any[]) => any) => {
+const mk = (impl: (sql: string, params?: any[]) => any, global?: any) => {
   const query = jest.fn(async (sql: string, params?: any[]) => impl(sql, params));
-  return { svc: new UserLlmProviderService({ query } as any), query };
+  return { svc: new UserLlmProviderService({ query } as any, global), query };
 };
 
 describe('UserLlmProviderService', () => {
@@ -11,24 +11,24 @@ describe('UserLlmProviderService', () => {
     expect(await svc.get('79030169187')).toBe('qwen');
   });
 
-  it('get: NULL — claude', async () => {
+  it('get: NULL — default', async () => {
     const { svc } = mk(() => ({ rows: [{ llm_provider: null }] }));
-    expect(await svc.get('79030169187')).toBe('claude');
+    expect(await svc.get('79030169187')).toBe('default');
   });
 
-  it('get: нет пользователя — claude', async () => {
+  it('get: нет пользователя — default', async () => {
     const { svc } = mk(() => ({ rows: [] }));
-    expect(await svc.get('nobody')).toBe('claude');
+    expect(await svc.get('nobody')).toBe('default');
   });
 
-  it('get: сбой БД — claude, без исключения', async () => {
+  it('get: сбой БД — default, без исключения', async () => {
     const { svc } = mk(() => { throw new Error('db down'); });
-    expect(await svc.get('79030169187')).toBe('claude');
+    expect(await svc.get('79030169187')).toBe('default');
   });
 
-  it('get: пустой userId — claude без запроса', async () => {
+  it('get: пустой userId — default без запроса', async () => {
     const { svc, query } = mk(() => ({ rows: [] }));
-    expect(await svc.get('')).toBe('claude');
+    expect(await svc.get('')).toBe('default');
     expect(query).not.toHaveBeenCalled();
   });
 
@@ -39,10 +39,39 @@ describe('UserLlmProviderService', () => {
     expect(query.mock.calls[0][1]).toEqual(['79030169187', 'qwen']);
   });
 
-  it('set claude — пишет NULL', async () => {
+  it('set claude — пишет claude (явный выбор)', async () => {
     const { svc, query } = mk(() => ({ rows: [], rowCount: 1 }));
-    await svc.set('79030169187', 'claude');
-    expect(query.mock.calls[0][1]).toEqual(['79030169187', null]);
+    await svc.set('u-1', 'claude');
+    expect(query.mock.calls[0][1]).toEqual(['u-1', 'claude']);
+  });
+
+  it('set default — пишет NULL («Как у всех»)', async () => {
+    const { svc, query } = mk(() => ({ rows: [], rowCount: 1 }));
+    await svc.set('u-1', 'default');
+    expect(query.mock.calls[0][1]).toEqual(['u-1', null]);
+  });
+
+  it('get: claude в базе — claude', async () => {
+    const { svc } = mk(() => ({ rows: [{ llm_provider: 'claude' }] }));
+    expect(await svc.get('u-1')).toBe('claude');
+  });
+
+  it('route: личный выбор — он, choice user; рубильник не читается', async () => {
+    const global = { get: jest.fn(async () => 'qwen') };
+    const { svc } = mk(() => ({ rows: [{ llm_provider: 'claude' }] }), global);
+    expect(await svc.route('u-1')).toEqual({ provider: 'claude', choice: 'user' });
+    expect(global.get).not.toHaveBeenCalled();
+  });
+
+  it('route: «Как у всех» — модель рубильника, choice global', async () => {
+    const global = { get: jest.fn(async () => 'qwen') };
+    const { svc } = mk(() => ({ rows: [{ llm_provider: null }] }), global);
+    expect(await svc.route('u-1')).toEqual({ provider: 'qwen', choice: 'global' });
+  });
+
+  it('route: «Как у всех» без сервиса рубильника — claude, choice global', async () => {
+    const { svc } = mk(() => ({ rows: [] }));
+    expect(await svc.route('u-1')).toEqual({ provider: 'claude', choice: 'global' });
   });
 
   it('set: нет пользователя — false', async () => {
@@ -80,9 +109,9 @@ describe('UserLlmProviderService', () => {
     expect(await svc.get('u-1')).toBe('kimi');
   });
 
-  it('get: незнакомое значение — claude', async () => {
+  it('get: незнакомое значение — default', async () => {
     const { svc } = mk(() => ({ rows: [{ llm_provider: 'gpt' }] }));
-    expect(await svc.get('u-1')).toBe('claude');
+    expect(await svc.get('u-1')).toBe('default');
   });
 
   it('set kimi — пишет kimi', async () => {
