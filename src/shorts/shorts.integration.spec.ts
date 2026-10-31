@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { ConflictException } from '@nestjs/common';
 import { Pool } from 'pg';
 import { decryptSecret, encryptSecret } from '../calendar/crypto';
 import { claimStage, stageFailed } from './short-jobs';
@@ -632,6 +633,31 @@ maybe('ролики против живого Postgres', () => {
       const again = await topics.addManual(order);
       expect(again).not.toBeNull();
       expect(again!.id).not.toBe(first!.id);
+    });
+
+    it('гонка «Отклонить» с автозапуском той же идеи — ровно одна сторона побеждает, статус и slot_at согласованы', async () => {
+      const ctl = new ShortsController(pgLike() as any, settings as any, {} as any, { publicUrl: () => 'x' } as any);
+      const topics = new ShortsTopicService(pgLike() as any, agents as any, settings as any);
+      // TRUNCATE в beforeEach — между it, не между итерациями одного теста: у каждой гонки своя идея.
+      for (let i = 0; i < 10; i++) {
+        const idea = await insert({ status: 'idea', topic_key: `manual:гонка-${i}`, topic_hint: `Гонка ${i}` });
+        const [rejectOutcome, started] = await Promise.all([
+          ctl.action({ action: 'reject', id: idea.id }, reply()).then(() => 'rejected', (e) => e),
+          topics.start({ id: idea.id, force: true }),
+        ]);
+        const row = (await pool.query(`SELECT status, slot_at FROM short_video WHERE id = $1`, [idea.id])).rows[0];
+        if (started) {
+          // Автозапуск успел первым: «Отклонить» не нашёл идею (условие на статус не совпало) — отказ.
+          expect(rejectOutcome).toBeInstanceOf(ConflictException);
+          expect(row.status).toBe('directing');
+          expect(row.slot_at).not.toBeNull();
+        } else {
+          // «Отклонить» успел первым: автозапуск не нашёл idea — null, строка осталась отклонённой.
+          expect(rejectOutcome).toBe('rejected');
+          expect(row.status).toBe('rejected');
+          expect(row.slot_at).toBeNull();
+        }
+      }
     });
   });
 
