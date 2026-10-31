@@ -18,6 +18,11 @@ const ROW = `id::text AS id, assistant_id, lang, answers, claimed_by_hash, claim
  *  предзаполняются нулями в status(), чтобы админ-ручка не молчала про причину, которой сегодня не было. */
 const KNOWN_ERROR_REASONS = ['busy', 'model', 'breaker', 'claimed', 'internal'];
 
+/** numeric из pg (строка или число) → число, округлённое до цента. */
+function toMoney(v: unknown): number {
+  return Math.round(Number(v) * 100) / 100;
+}
+
 @Injectable()
 export class GuestSessionsService {
   constructor(private readonly pg: PgService) {}
@@ -131,12 +136,19 @@ export class GuestSessionsService {
      * все её ответы на день создания пробы, а не на день самого ответа. Кроме
      * того, после переноса пробы в аккаунт её сообщения стираются — строка
      * guest_trial_sessions не остаётся надёжным источником истории ответов.
+     *
+     * Ревью A10: events/track открыта без JWT — props приходит от кого
+     * угодно. jsonb_typeof-проверка не даёт нечисловому cost_usd (строка "x",
+     * "1e400" и т.п.) дойти до ::numeric — такой cast бросает ошибку и роняет
+     * ВЕСЬ status() на 7 дней, пока мусорная строка не устареет из окна. Сумму
+     * не кастуем в ::float здесь — переполнение double на честном, но огромном
+     * numeric тоже кидает ошибку; округление до цента — уже в JS (toMoney).
      */
     const a = await this.pg.query(
       `SELECT count(*) FILTER (WHERE ts > now() - interval '1 day')::int AS answers_day,
               count(*)::int AS answers_week,
-              coalesce(sum((props->>'cost_usd')::numeric) FILTER (WHERE ts > now() - interval '1 day'), 0)::float AS cost_usd_day,
-              coalesce(sum((props->>'cost_usd')::numeric), 0)::float AS cost_usd_week
+              coalesce(sum(CASE WHEN jsonb_typeof(props->'cost_usd') = 'number' THEN (props->'cost_usd')::numeric END) FILTER (WHERE ts > now() - interval '1 day'), 0) AS cost_usd_day,
+              coalesce(sum(CASE WHEN jsonb_typeof(props->'cost_usd') = 'number' THEN (props->'cost_usd')::numeric END), 0) AS cost_usd_week
          FROM events
         WHERE name = 'guest_trial_answer' AND ts > now() - interval '7 days'`,
     );
@@ -150,6 +162,11 @@ export class GuestSessionsService {
         GROUP BY name`,
     );
     const out: Record<string, number> = { ...s.rows[0], ...a.rows[0] };
+    // cost_usd_* пришли из pg как numeric (строка или число — зависит от
+    // парсера типов) — округляем до цента в JS, а не ::float в SQL (ревью A10,
+    // см. комментарий у запроса выше).
+    out.cost_usd_day = toMoney(a.rows[0].cost_usd_day);
+    out.cost_usd_week = toMoney(a.rows[0].cost_usd_week);
     // Ключи есть всегда, даже без единого события — иначе админ-ручка то
     // показывает ноль, то молчит про ключ вовсе, в зависимости от трафика.
     for (const name of ['guest_trial_view', 'guest_trial_wall', 'guest_trial_closed']) {
@@ -162,7 +179,7 @@ export class GuestSessionsService {
     }
     // Отказы хода гостя — отдельной разбивкой по причине (ревью A7, N1):
     // guest_trial_error_<reason>_day/_week. Известные причины — нулями
-    // заранее, неизвестная (опечатка в коде/новый вид) — как есть, своим ключом.
+    // заранее.
     const err = await this.pg.query(
       `SELECT props->>'reason' AS reason,
               count(*) FILTER (WHERE ts > now() - interval '1 day')::int AS day,
@@ -176,10 +193,21 @@ export class GuestSessionsService {
       out[`guest_trial_error_${reason}_week`] = 0;
     }
     for (const row of err.rows) {
-      const reason = row.reason ?? 'unknown';
-      out[`guest_trial_error_${reason}_day`] = row.day;
-      out[`guest_trial_error_${reason}_week`] = row.week;
+      // Ревью A10: events/track открыта, reason — из props, чужой ввод.
+      // Опечатка/подделка не должна заводить новый ключ статистики — цифры
+      // воронки не должно быть видно отличить от «такого отказа не было».
+      if (!KNOWN_ERROR_REASONS.includes(row.reason)) continue;
+      out[`guest_trial_error_${row.reason}_day`] = row.day;
+      out[`guest_trial_error_${row.reason}_week`] = row.week;
     }
+    // Возраст самой старой неперенесённой пробы — 0, если таких нет. Если
+    // уборка (guest-trial.cron.ts) сломана, число растёт без остановки —
+    // сигнал виден прямо в админ-ручке, без отдельного алерта (ревью A10).
+    const oldest = await this.pg.query(
+      `SELECT COALESCE(FLOOR(EXTRACT(EPOCH FROM (now() - min(last_message_at))) / 86400), 0)::int AS days
+         FROM guest_trial_sessions WHERE claimed_at IS NULL`,
+    );
+    out.oldest_unclaimed_days = oldest.rows[0]?.days ?? 0;
     return out;
   }
 }
