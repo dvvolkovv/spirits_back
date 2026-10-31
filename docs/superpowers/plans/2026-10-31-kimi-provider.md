@@ -3846,7 +3846,7 @@ git checkout -q feat/kimi-provider
 
 ### Task 13: выкат — ТОЛЬКО С OK ВЛАДЕЛЬЦА НА КАЖДЫЙ ШАГ
 
-Порядок по spec: релей **без ключа Kimi** первым (Kimi выключен; Qwen работает как прежде, кроме одного — сбой выбранного Qwen теперь переигрывается на Claude) → ключ Kimi в `.env` прода (до выката бэкенда: старый его не читает, новый стартует уже с ним) → бэкенд и фронт → ключ Kimi на релей → проверки.
+Порядок по spec: релей **без ключа Kimi** первым (Kimi выключен; Qwen работает как прежде, кроме одного — сбой выбранного Qwen теперь переигрывается на Claude) → бэкенд и фронт (ключа Kimi нет — Kimi выключен) → **только после письменного подтверждения отказа Kimi от обучения** (решение владельца 31.10, spec «Соответствие концепции»; владелец пишет на support@moonshot.cn) — ключ Kimi в `.env` прода с перезапуском API и ключ на релей → проверки. Пришло подтверждение раньше Step 2 — Step 3 делается до Step 2, и отдельный перезапуск не нужен.
 
 - [ ] **Step 1: Релей без ключа Kimi (OK)**
 
@@ -3877,18 +3877,18 @@ ssh dv@5.101.115.184 'curl -s 127.0.0.1:3033/health'
 
 Expected: `fallback.providers.qwen.enabled: true`, `fallback.providers.kimi.enabled: false`, рядом прежнее поле `qwen`.
 
-- [ ] **Step 2: Ключ Kimi в `.env` прода (OK)** — через stdin; дописывается, только если его ещё нет:
+- [ ] **Step 2: Бэкенд и фронт — `deploy.sh` (OK)** — с ноды из свежих клонов main, `SKIP_BOTS=1 SKIP_PRODUCTS_HOST=1`, отвязанно (`setsid -f`), слежение по логу; порядок и ловушки — память «Выкат: правила» и «deploy.sh: ловушки». После — сверить, что на проде `origin/main` с коммитом из Task 12 (бэк) и новый бандл фронта (память «Проверка выката»).
+
+- [ ] **Step 3: Ключ Kimi в `.env` прода — ТОЛЬКО после подтверждения отказа Kimi от обучения (OK)** — через stdin; дописывается, только если его ещё нет:
 
 ```bash
 python3 -c 'import os;print(open(os.path.expanduser("~/.linkeon/kimi.key")).read().strip())' \
  | ssh dvolkov@212.113.106.202 'cd ~/spirits_back && read -r K && if grep -q "^KIMI_FALLBACK_API_KEY=" .env; then echo "уже есть — стоп"; else [ -n "$(tail -c1 .env)" ] && echo >> .env; printf "KIMI_FALLBACK_API_KEY=%s\n" "$K" >> .env && grep -c "^KIMI_FALLBACK_API_KEY=" .env; fi'
 ```
 
-Expected: `1`. На test ключ не кладётся (CLI там мёртв — всё ушло бы в цепочку).
+Expected: `1`. На test ключ не кладётся (CLI там мёртв — всё ушло бы в цепочку). Если Step 2 уже прошёл — перезапуск API выкатом `deploy.sh` с `BACK_ONLY=1` (OK), иначе ключ подхватит выкат Step 2.
 
-- [ ] **Step 3: Бэкенд и фронт — `deploy.sh` (OK)** — с ноды из свежих клонов main, `SKIP_BOTS=1 SKIP_PRODUCTS_HOST=1`, отвязанно (`setsid -f`), слежение по логу; порядок и ловушки — память «Выкат: правила» и «deploy.sh: ловушки». После — сверить, что на проде `origin/main` с коммитом из Task 12 (бэк) и новый бандл фронта (память «Проверка выката»).
-
-- [ ] **Step 4: Ключ Kimi на релей (OK)**
+- [ ] **Step 4: Ключ Kimi на релей — ТОЛЬКО после подтверждения отказа Kimi от обучения (OK)**
 
 ```bash
 python3 -c 'import os;print(open(os.path.expanduser("~/.linkeon/kimi.key")).read().strip())' \
