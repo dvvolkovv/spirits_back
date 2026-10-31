@@ -353,16 +353,21 @@ export class ClaudeCliService implements OnModuleInit {
    */
   private async runRaw(prompt: string, opts: ClaudeCliOptions): Promise<CliRunResult> {
     const configs = opts.noFallback ? NO_FALLBACK_CONFIGS : readFallbackConfigs();
-    // Выбор пользователя (админка): сразу выбранный, при его сбое — обычный путь.
+    // Выбор пользователя (админка) как есть, без учёта ключа, — для события
+    // claude_cli_call (spec, раздел 4: selected — выбор пользователя, если он
+    // не Claude; веб-путь в chat_quality пишет его так же). Пробы (noFallback)
+    // выбору не следуют. Проверка через FALLBACK_ORDER.includes, не configs[...]
+    // и не `in` впрямую: имя из прототипа объекта (например 'constructor')
+    // резолвится правдой по цепочке прототипов и у configs[opts.provider], и у
+    // `in PROVIDER_DEFAULTS` — тот же случай отсекает planProviders.
+    const chosen: FallbackProvider | undefined =
+      !opts.noFallback && opts.provider && FALLBACK_ORDER.includes(opts.provider) ? opts.provider : undefined;
+    // Выбор, по которому идёт вызов, — только с ключом: сразу выбранный, при его
+    // сбое — обычный путь. По нему же — аварийность попытки, текст ошибки и
+    // метки логов.
     let selected: FallbackProvider | undefined;
-    if (opts.provider && !opts.noFallback) {
-      // Проверка через FALLBACK_ORDER.includes, не configs[...] и не `in`
-      // впрямую: имя из прототипа объекта (например 'constructor') резолвится
-      // правдой по цепочке прототипов и у configs[opts.provider], и у
-      // `in PROVIDER_DEFAULTS` — тот же случай отсекает planProviders.
-      if (FALLBACK_ORDER.includes(opts.provider) && configs[opts.provider]) selected = opts.provider;
-      else if (FALLBACK_ORDER.includes(opts.provider)) this.logger.warn(`${PROVIDER_LABELS[opts.provider]} выбран для пользователя, но ключ ${PROVIDER_DEFAULTS[opts.provider].envPrefix}_FALLBACK_API_KEY не задан — обычный путь`);
-    }
+    if (chosen && configs[chosen]) selected = chosen;
+    else if (chosen) this.logger.warn(`${PROVIDER_LABELS[chosen]} выбран для пользователя, но ключ ${PROVIDER_DEFAULTS[chosen].envPrefix}_FALLBACK_API_KEY не задан — обычный путь`);
     const plan = planProviders({ selected, configs, state: this.fallback, noFallback: opts.noFallback });
     const breakerMs = readBreakerMs();
     const startedAt = Date.now();
@@ -380,7 +385,8 @@ export class ClaudeCliService implements OnModuleInit {
       let res: CliRunResult | null = null;
       let err: unknown = null;
       try {
-        res = await this.runOnce(prompt, attemptOpts, p === 'claude' ? null : configs[p], { fallback: emergency, selected });
+        // В событие — выбор пользователя (chosen), даже без ключа у выбранного.
+        res = await this.runOnce(prompt, attemptOpts, p === 'claude' ? null : configs[p], { fallback: emergency, selected: chosen });
       } catch (e) {
         err = e;
       }
