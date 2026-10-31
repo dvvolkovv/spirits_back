@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { MATCH_THRESHOLD, speechCheck, speechWords } from './match';
+import { ACCEPTED, FALSE_REJECTS, TRUE_REJECTS } from './match-corpus';
 
 test('слова — без регистра, знаков и с «е» вместо «ё»; дефис делит слово; NFD приводится к NFC', () => {
   assert.deepEqual(speechWords('Обои потёрли! Залог — мой.'), ['обои', 'потерли', 'залог', 'мой']);
@@ -73,4 +74,23 @@ test('повтор слога через тире или неразрывный 
 
 test('знак ударения не делит слово', () => {
   assert.deepEqual(speechWords('за' + String.fromCharCode(0x301) + 'лог'), ['залог']);
+});
+
+test('корпус: клипы, принятые на проде и стенде, остаются принятыми', () => {
+  for (const c of ACCEPTED) assert.equal(speechCheck(c.lines, c.heard).ok, true, c.name);
+});
+
+test('корпус: годные клипы, которые прежняя сверка отвергла, — приняты', () => {
+  for (const c of FALSE_REJECTS) {
+    const r = speechCheck(c.lines, c.heard);
+    assert.equal(r.ok, true, `${c.name}: ${JSON.stringify(r)}`);
+  }
+});
+
+test('корпус: настоящий брак отвергнут, непрозвучавшие реплики названы', () => {
+  for (const c of TRUE_REJECTS) {
+    const r = speechCheck(c.lines, c.heard);
+    assert.equal(r.ok, false, c.name);
+    assert.deepEqual(r.silentLines, c.silent, c.name);
+  }
 });
