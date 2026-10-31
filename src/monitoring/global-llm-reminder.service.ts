@@ -9,7 +9,7 @@ import { ClaudeHealthOverview, ClaudeHealthService } from './claude-health.servi
 
 /**
  * Раз в сутки в 10:01 МСК (не 10:00 — совпадало бы с тиком пробы живости
- * Claude, ClaudeHealthService.livenessTick: '0 */15 * * * *'), пока общий
+ * Claude каждые 15 минут, ClaudeHealthService.livenessTick), пока общий
  * рубильник не на Claude, — напоминание в группу алертов (spec
  * 2026-10-31-global-llm-switch, раздел 8): возврат только вручную, и про
  * него легко забыть после аварии. Состояние Claude — по последней пробе

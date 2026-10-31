@@ -120,9 +120,9 @@ describe('GlobalLlmReminderService: регистрация', () => {
 });
 
 /**
- * Раз в сутки в 10:01 МСК — не в 10:00: тик пробы живости Claude
- * (ClaudeHealthService.livenessTick, '0 */15 * * * *') уже занимает этот
- * момент, совпадение затрудняло бы читать логи (ревью 01.11).
+ * Раз в сутки в 10:01 МСК — не в 10:00: тик пробы живости Claude каждые
+ * 15 минут (ClaudeHealthService.livenessTick) уже занимает этот момент,
+ * совпадение затрудняло бы читать логи (ревью 01.11).
  */
 describe('GlobalLlmReminderService: расписание', () => {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
