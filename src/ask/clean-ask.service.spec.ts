@@ -98,6 +98,12 @@ describe('CleanAskService: модель общего рубильника в з�
     await (svc as any).callRelay('вопрос');
     expect(fieldsOf(post.mock.calls[0][1]).provider).toBeUndefined();
   });
+
+  it('без сервиса рубильника — без provider', async () => {
+    const svc = new CleanAskService({} as any);
+    await (svc as any).callRelay('вопрос');
+    expect(fieldsOf(post.mock.calls[0][1]).provider).toBeUndefined();
+  });
 });
 
 /**
