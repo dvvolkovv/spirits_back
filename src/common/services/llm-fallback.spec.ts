@@ -254,8 +254,17 @@ describe('planProviders', () => {
   const both = { qwen: cfg('qwen'), kimi: cfg('kimi') };
   const T = 10_000;
 
-  it('noFallback — только Claude, выбор не действует', () => {
-    expect(planProviders({ selected: 'kimi', configs: both, state: new FallbackState(), noFallback: true, now: T })).toEqual(['claude']);
+  it('noFallback с выбором (ход гостя) — только выбранная модель', () => {
+    expect(planProviders({ selected: 'kimi', configs: both, state: new FallbackState(), noFallback: true, now: T })).toEqual(['kimi']);
+  });
+  it('noFallback с выбором без ключа — Claude', () => {
+    expect(planProviders({ selected: 'qwen', configs: { qwen: null, kimi: cfg('kimi') }, state: new FallbackState(), noFallback: true, now: T })).toEqual(['claude']);
+  });
+  it('noFallback без выбора (проба мониторинга) — Claude', () => {
+    expect(planProviders({ configs: both, state: new FallbackState(), noFallback: true, now: T })).toEqual(['claude']);
+  });
+  it('noFallback с именем из прототипа — Claude', () => {
+    expect(planProviders({ selected: 'constructor' as any, configs: both, state: new FallbackState(), noFallback: true, now: T })).toEqual(['claude']);
   });
   it('окно Claude закрыто — Claude, Qwen, Kimi', () => {
     expect(planProviders({ configs: both, state: new FallbackState(), now: T })).toEqual(['claude', 'qwen', 'kimi']);
