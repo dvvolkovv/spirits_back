@@ -701,7 +701,7 @@ test('брак, который эта сверка уже судила, и пл�
 });
 
 test('брак прежней сверки, не прошедший сверку по записи, — без распознавания; пометка — этой сверки', { timeout: 120_000 }, async () => {
-  const { env, lines, dir } = await withRejected({ code: 'speech_mismatch', matcher: 1, heard: 'это износ верните залог', share: 0.5 });
+  const { env, lines, dir } = await withRejected({ code: 'speech_mismatch', matcher: 1, heard: 'это износ верните залог', share: 0.4 });
   const second = fakes(env, { heard: (kind) => (kind === 'punchline' ? lines.join(' ') : LINES[kind].join(' ')) });
   await animateRun(env.runDir, second.deps);
   assert.deepEqual(second.calls.start, ['punchline']);
