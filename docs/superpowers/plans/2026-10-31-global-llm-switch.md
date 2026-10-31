@@ -1214,19 +1214,23 @@ describe('agentReply: модель в запросе к релею', () => {
 
 Если `generateAgentReplyWithCharge` в этом окружении требует ещё зависимостей (списание) и падает до запроса — в тесте про Kimi использовать `generateAgentReply`: суть теста — поле `provider`.
 
+Сторож DI (зависимость не помечена `@Optional()` — при поломке DI старт упадёт, а тест ловит подмену класса на Object): в `blog-relay.client.spec.ts` — `expect(Reflect.getMetadata('design:paramtypes', BlogRelayClient)).toEqual([GlobalLlmProviderService]);`, в `clean-ask.service.spec.ts` — `expect(Reflect.getMetadata('design:paramtypes', CleanAskService)).toEqual([AgentsService, GlobalLlmProviderService]);` (импорты `reflect-metadata`, классов `GlobalLlmProviderService` и `AgentsService`).
+
 - [ ] **Шаг 2: красный прогон.** Коммит `test(llm): автоблог, clean-ask и agentReply — модель в запросе к релею (красный)`.
 Run: `bash .superpowers/node-run.sh 'timeout 240 npx jest --testPathPattern="src/(blog/blog-relay.client|ask/clean-ask|chat/chat.service.agent-reply-provider)" 2>&1 | tail -30'`
 Expected: FAIL — поля `provider` нет.
 
 - [ ] **Шаг 3: реализация.**
 
-`src/blog/blog-relay.client.ts`: импорты `import { Injectable, Logger, Optional } from '@nestjs/common';`, `import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';`, `import { relayProviderFields } from '../chat/answer-provider';`. В класс:
+`src/blog/blog-relay.client.ts`: импорты `import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';`, `import { relayProviderFields } from '../chat/answer-provider';`. В класс:
 
 ```ts
   constructor(
     // Общий рубильник модели (spec 2026-10-31-global-llm-switch): фоновые
-    // посты автоблога идут через модель рубильника. Optional — для тестов.
-    @Optional() private readonly globalProvider?: GlobalLlmProviderService,
+    // посты автоблога идут через модель рубильника. Без @Optional(): при
+    // поломке DI старт упадёт (поймает smoke), а не автоблог молча останется
+    // на Claude; тесты создают клиент через new без аргумента.
+    private readonly globalProvider?: GlobalLlmProviderService,
   ) {}
 ```
 
@@ -1242,12 +1246,13 @@ Expected: FAIL — поля `provider` нет.
 ```ts
   constructor(
     private readonly agents: AgentsService,
-    // Общий рубильник модели (spec 2026-10-31-global-llm-switch). Optional — для тестов.
-    @Optional() private readonly globalProvider?: GlobalLlmProviderService,
+    // Общий рубильник модели (spec 2026-10-31-global-llm-switch). Без
+    // @Optional(): поломка DI роняет старт, а не оставляет молча Claude.
+    private readonly globalProvider?: GlobalLlmProviderService,
   ) {}
 ```
 
-(импорт `Optional` из `@nestjs/common`, `GlobalLlmProviderService` из `../common/services/global-llm-provider.service`, `relayProviderFields` из `../chat/answer-provider`); в `callRelay` сразу после `fd.append('sessionId', \`anon_${randomUUID()}\`);`:
+(импорт `GlobalLlmProviderService` из `../common/services/global-llm-provider.service`, `relayProviderFields` из `../chat/answer-provider`); в `callRelay` сразу после `fd.append('sessionId', \`anon_${randomUUID()}\`);`:
 
 ```ts
     const provider = this.globalProvider ? await this.globalProvider.get() : 'claude';
@@ -1348,7 +1353,9 @@ Expected: FAIL — `provider` нет в опциях, проверка ключ�
 
 ```ts
     // Общий рубильник модели (spec 2026-10-31-global-llm-switch, раздел 6).
-    @Optional() private readonly globalProvider?: GlobalLlmProviderService,
+    // Без @Optional(): поломка DI роняет старт (поймает smoke), а не оставляет
+    // гостей молча на Claude; тесты создают сервис через new.
+    private readonly globalProvider?: GlobalLlmProviderService,
 ```
 
 3. Проверку окна (блок `if (this.claudeCli.fallbackStats().breakerOpenUntil > Date.now()) { … }`) заменить на:
@@ -1477,7 +1484,7 @@ describe('тексты рубильника', () => {
       provider: 'qwen', since: null, now: new Date(), claudeStatus: 'ok', claudeCheckedAt: null, keyMissing: false,
       day: { ok: 120, other: 3 },
     });
-    expect(t).toContain('За сутки через Qwen: 120 ответов; не ответила (ответил другой) — 3');
+    expect(t).toContain('За сутки через Qwen: 120 вызовов (ответы людям и фоновые задачи); не ответила, ответил другой — 3');
   });
 
   it('напоминание: счёта нет (сбой запроса) — строки нет', () => {
@@ -1662,7 +1669,7 @@ export function reminderText(a: {
     `⏰ <b>Все отвечают через ${label}</b>${since}.`,
     `Claude по последней пробе: ${claude}${checked}.`,
   ];
-  if (a.day) lines.push(`За сутки через ${label}: ${a.day.ok} ответов; не ответила (ответил другой) — ${a.day.other}.`);
+  if (a.day) lines.push(`За сутки через ${label}: ${a.day.ok} вызовов (ответы людям и фоновые задачи); не ответила, ответил другой — ${a.day.other}.`);
   if (a.keyMissing) lines.push(`Ключа ${label} на сервере нет — фактически отвечает Claude.`);
   lines.push('Вернуть — Админка → Ассистенты.');
   return lines.join('\n');
@@ -1869,7 +1876,7 @@ describe('GlobalLlmReminderService', () => {
     expect(sql).toMatch(/props->>'choice' = 'global'/);
     expect(sql).toMatch(/name IN \('chat_quality', 'claude_cli_call'\)/);
     expect(params).toEqual(['kimi']);
-    expect((sendTelegramAlert as jest.Mock).mock.calls[0][0]).toContain('За сутки через Kimi: 57 ответов; не ответила (ответил другой) — 2');
+    expect((sendTelegramAlert as jest.Mock).mock.calls[0][0]).toContain('За сутки через Kimi: 57 вызовов (ответы людям и фоновые задачи); не ответила, ответил другой — 2');
   });
 
   it('сбой счёта — напоминание уходит без строки «За сутки»', async () => {
