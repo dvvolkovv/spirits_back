@@ -294,6 +294,41 @@ describe('ClaudeCliService — предупреждение о модели в s
   });
 });
 
+/**
+ * Причина из JSON в stdout — только когда это действительно ошибка. Иначе
+ * кодом ≠0 мог выйти обычный ответ (is_error: false), и его текст («429» в
+ * нём) классифицировался бы как лимит — окно Claude открылось бы для всех.
+ */
+describe('ClaudeCliService — причина из JSON в stdout только когда это ошибка', () => {
+  it('stdout пуст, причина только в stderr — текст ошибки её содержит', async () => {
+    spawnMock.mockImplementationOnce(() => fakeProcWithStderr('', 'Error: boom\n', 1));
+    const err = await new ClaudeCliService().text('x', { noFallback: true }).catch((e) => e);
+    expect(err.message).toContain('boom');
+  });
+
+  it('is_error: true, но result — пустая строка — причина из stderr', async () => {
+    spawnMock.mockImplementationOnce(() => fakeProcWithStderr('{"is_error":true,"result":""}', 'real reason\n', 1));
+    const err = await new ClaudeCliService().text('x', { noFallback: true }).catch((e) => e);
+    expect(err.message).toContain('real reason');
+  });
+
+  it('is_error: false, текст обычного ответа упоминает 429 — не читается как причина; окно не открывается', async () => {
+    spawnMock.mockImplementationOnce(() => fakeProcWithStderr(
+      '{"is_error":false,"result":"API Error: 429 — это просто слова в ответе"}',
+      '',
+      1,
+    ));
+    const svc = new ClaudeCliService();
+    const err = await svc.text('x', { noFallback: true }).catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    // Текст обычного ответа — не причина сбоя: взят сырой JSON stdout целиком
+    // (видна обёртка "result":), а не голый j.result — иначе «429» в нём
+    // классифицировался бы как рейт-лимит.
+    expect(err.message).toContain('"result"');
+    expect(svc.fallbackStats().breakerOpenUntil).toBe(0);
+  });
+});
+
 describe('ClaudeCliService — выбор пользователя Kimi', () => {
   const pgMock = () => ({ query: jest.fn().mockResolvedValue({ rows: [] }) });
   const event = (pg: any, i = 0) => JSON.parse(pg.query.mock.calls[i][1][0]);
