@@ -4,7 +4,7 @@
 
 **Goal:** студия перестаёт браковать годные клипы сценок из-за окончаний, перепутанных SpeechKit, и до новой оплаты Omni перепроверяет уже оплаченный брак — ролик `889b6423` (Лиана) поднимается без новых трат.
 
-**Architecture:** только студия (`studio/` в `spirits_back`). `match.ts` сравнивает слова с точностью до окончания (`sameWord`) и получает версию сверки `MATCHER_VERSION = 2`; корпус настоящих пар «реплики → услышано» прода и стенда держит сверку от регрессий. `run-animate.ts` кладёт рядом с каждым браком пометку `rejected-*.json` (код, услышанное, доля, версия сверки) и перед новой оплатой сценки перепроверяет её брак, который нынешняя сверка ещё не судила, — без проверки предела секунд. Спека: `docs/superpowers/specs/2026-10-31-shorts-self-healing-design.md`, раздел «Очередь 1».
+**Architecture:** только студия (`studio/` в `spirits_back`). `match.ts` сравнивает слова с точностью до окончания (`sameWord`) и получает версию сверки `MATCHER_VERSION = 2`; корпус настоящих пар «реплики → услышано» прода и стенда держит её от ложных отказов на настоящих клипах, а от ослабления — отрицательные пары `sameWord`. `run-animate.ts` кладёт рядом с каждым браком пометку `rejected-*.json` (код, услышанное, доля, версия сверки) и перед новой оплатой сценки перепроверяет её брак, который нынешняя сверка ещё не судила, — без проверки предела секунд. Спека: `docs/superpowers/specs/2026-10-31-shorts-self-healing-design.md`, раздел «Очередь 1».
 
 **Tech Stack:** TypeScript ESM, `tsx --test` (node:test), ffmpeg в тестах оживления; прогоны — на тестовой ноде через `studio/scripts/node-run.sh`.
 
@@ -41,7 +41,9 @@
  *   не должна браковать ни один.
  * - FALSE_REJECTS — годные клипы, которые прежняя сверка отвергла: ролик 889b6423
  *   (Лиана, 31.10.2026) — SpeechKit слил «начинай уж» в «начинаешь».
- * - TRUE_REJECTS — настоящий брак: реплика не прозвучала или клип оборван.
+ * - TRUE_REJECTS — настоящий брак: реплика не прозвучала или клип оборван. Первый —
+ *   отказ из журнала; два других — принятые пары с вручную обрезанным услышанным:
+ *   настоящих отказов такого вида в журналах пока нет.
  *
  * Только реплики героев — личных данных нет. Новый ложный отказ или пропуск —
  * дописать сюда вместе с правкой сверки.
@@ -97,24 +99,25 @@ import { ACCEPTED, FALSE_REJECTS, TRUE_REJECTS } from './match-corpus';
 
 В конец файла:
 
+Каждый тест сравнивает все случаи разом: при падении на удалённой ноде видны все провалы с долей и `silentLines`, а не только первый.
+
 ```ts
 test('корпус: клипы, принятые на проде и стенде, остаются принятыми', () => {
-  for (const c of ACCEPTED) assert.equal(speechCheck(c.lines, c.heard).ok, true, c.name);
+  const bad = ACCEPTED.map((c) => ({ name: c.name, ...speechCheck(c.lines, c.heard) })).filter((r) => !r.ok);
+  assert.deepEqual(bad, []);
 });
 
 test('корпус: годные клипы, которые прежняя сверка отвергла, — приняты', () => {
-  for (const c of FALSE_REJECTS) {
-    const r = speechCheck(c.lines, c.heard);
-    assert.equal(r.ok, true, `${c.name}: ${JSON.stringify(r)}`);
-  }
+  const bad = FALSE_REJECTS.map((c) => ({ name: c.name, ...speechCheck(c.lines, c.heard) })).filter((r) => !r.ok);
+  assert.deepEqual(bad, []);
 });
 
 test('корпус: настоящий брак отвергнут, непрозвучавшие реплики названы', () => {
-  for (const c of TRUE_REJECTS) {
-    const r = speechCheck(c.lines, c.heard);
-    assert.equal(r.ok, false, c.name);
-    assert.deepEqual(r.silentLines, c.silent, c.name);
-  }
+  const got = TRUE_REJECTS.map((c) => {
+    const { ok, silentLines } = speechCheck(c.lines, c.heard);
+    return { name: c.name, ok, silentLines };
+  });
+  assert.deepEqual(got, TRUE_REJECTS.map((c) => ({ name: c.name, ok: false, silentLines: c.silent })));
 });
 ```
 
@@ -126,7 +129,7 @@ git commit -m "test(studio): корпус сверки речи — настоя
 studio/scripts/node-run.sh "npx tsx --test src/animate/match.test.ts"
 ```
 
-Ожидается: `ℹ fail 1` — падает «корпус: годные клипы, которые прежняя сверка отвергла, — приняты» на первом случае (`silentLines: [1]`, доля ≈ 0,82). Остальные 15 тестов зелёные (13 прежних + 2 корпуса).
+Ожидается: `fail 1` (`ℹ` или `#` — репортер node:test по ssh выбирает tap) — падает «корпус: годные клипы, которые прежняя сверка отвергла, — приняты»; в диффе `deepEqual` оба случая FALSE_REJECTS (`ok: false`, `silentLines: [1]`, доля ≈ 0,82). Остальные 15 тестов зелёные (13 прежних + 2 корпуса).
 
 ---
 
@@ -158,7 +161,10 @@ test('одно слово с точностью до окончания: общ�
     assert.equal(sameWord(a, b), true, `${a} ≈ ${b}`);
     assert.equal(sameWord(b, a), true, `${b} ≈ ${a}`);
   }
-  for (const [a, b] of [['начинай', 'начальник'], ['спрошу', 'спокойно'], ['отказаться', 'отказник'], ['мой', 'мою']]) {
+  // Корпус ловит ложные отказы, а не ослабление сверки: порог держат эти пары.
+  // «день»/«деньги» — общее начало 4 буквы: сломается, если STEM_MIN опустить до 4;
+  // «отказаться»/«отказник» — сломается, если STEM_SLACK поднять до 3.
+  for (const [a, b] of [['начинай', 'начальник'], ['спрошу', 'спокойно'], ['отказаться', 'отказник'], ['день', 'деньги'], ['мой', 'мою']]) {
     assert.equal(sameWord(a, b), false, `${a} ≠ ${b}`);
   }
 });
