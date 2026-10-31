@@ -77,6 +77,10 @@ test("withModel: меняет только значение --model, исход�
   assert.equal(args[2], "default");
 });
 
+test("withModel: без --model в аргументах — массив не меняется", () => {
+  assert.deepEqual(l.withModel(["--print", "--max-turns", "40"], "k3.1-pro"), ["--print", "--max-turns", "40"]);
+});
+
 test("providerSpawnEnv: снимает ANTHROPIC_* и OAuth-токен, ставит адрес и ключ провайдера, SCRUB=0", () => {
   const cfg = l.readProviderConfig("kimi", {}, () => "sk-kimi-x");
   const base = { PATH: "/usr/bin", ANTHROPIC_API_KEY: "old", CLAUDE_CODE_OAUTH_TOKEN: "o", CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1" };
@@ -127,6 +131,15 @@ test("isAccessFailure: статус 429/529/401/403 — раньше призн�
   assert.equal(l.isAccessFailure(perMinute, { isError: false, apiStatus: 429 }), false);
 });
 
+test("isNonRetryAccess: 403/Forbidden/Arrearage — true; 429/529/длина контекста — false", () => {
+  for (const t of ['API Error: 403 {"code":"AccessDenied.Unpurchased"}', "Forbidden", "400 Arrearage: account overdue"]) {
+    assert.equal(l.isNonRetryAccess(t), true, t);
+  }
+  for (const t of ["API Error: 429 Too Many Requests", "overloaded: 529", "Context window exceeded · try again"]) {
+    assert.equal(l.isNonRetryAccess(t), false, t);
+  }
+});
+
 test("planProviders", () => {
   const cfg = (name) => ({ name, apiKey: "k", baseUrl: "u", models: KIMI_MODELS });
   const both = { qwen: cfg("qwen"), kimi: cfg("kimi") };
@@ -152,6 +165,28 @@ test("planProviders", () => {
   kDown.markDown("kimi", 60_000, T);
   assert.deepEqual(l.planProviders({ selected: "kimi", cfgs: both, state: kDown, now: T + 1 }), ["kimi", "claude", "qwen"]);
   assert.deepEqual(l.planProviders({ selected: "kimi", cfgs: { qwen: cfg("qwen"), kimi: null }, state: fresh(), now: T }), ["claude", "qwen"]);
+});
+
+test("planProviders: выбранное имя — только известный провайдер (constructor — не провайдер, защита от прототипа)", () => {
+  const cfg = (name) => ({ name, apiKey: "k", baseUrl: "u", models: KIMI_MODELS });
+  const both = { qwen: cfg("qwen"), kimi: cfg("kimi") };
+  assert.deepEqual(l.planProviders({ selected: "constructor", cfgs: both, state: l.createFallbackState(), now: 10_000 }), ["claude", "qwen", "kimi"]);
+});
+
+test("planProviders: выбран Qwen", () => {
+  const cfg = (name) => ({ name, apiKey: "k", baseUrl: "u", models: KIMI_MODELS });
+  const both = { qwen: cfg("qwen"), kimi: cfg("kimi") };
+  assert.deepEqual(l.planProviders({ selected: "qwen", cfgs: both, state: l.createFallbackState(), now: 10_000 }), ["qwen", "claude", "kimi"]);
+});
+
+test("planProviders: выбран Kimi, окно Claude открыто, Qwen «не отвечает» — [kimi, claude]", () => {
+  const cfg = (name) => ({ name, apiKey: "k", baseUrl: "u", models: KIMI_MODELS });
+  const both = { qwen: cfg("qwen"), kimi: cfg("kimi") };
+  const T = 10_000;
+  const s = l.createFallbackState();
+  s.openClaudeWindow(60_000, T);
+  s.markDown("qwen", 60_000, T);
+  assert.deepEqual(l.planProviders({ selected: "kimi", cfgs: both, state: s, now: T + 1 }), ["kimi", "claude"]);
 });
 
 test("nextStep: следующий в плане; запасной, ставший «не отвечает», пропускается; Claude — нет", () => {
@@ -224,4 +259,13 @@ test("createFallbackState: «не отвечает» и исходы по про
   s.markUp("qwen");
   assert.equal(s.isDown("qwen", 3000), false);
   assert.deepEqual(s.stats(cfgs, 2000 + l.STATS_WINDOW_MS + 1).providers.kimi, { enabled: false, ok: 0, failed: 0, downUntil: 0 });
+});
+
+test("createFallbackState: markDown(…, 0) — сразу «отвечает»; downUntil истекает ровно по границе", () => {
+  const s = l.createFallbackState();
+  s.markDown("qwen", 0, 1000);
+  assert.equal(s.isDown("qwen", 1000), false);
+  s.markDown("kimi", 1000, 1000);
+  assert.equal(s.isDown("kimi", 1999), true);
+  assert.equal(s.isDown("kimi", 2000), false);
 });
