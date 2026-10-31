@@ -920,9 +920,6 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
         if (callCtx !== null && callCtx > maxTurnContext) maxTurnContext = callCtx;
         if (ev.type === "result") {
           gotResult = true;
-          // Ошибку без текста ветка `result && ev.result` ниже не видит — у
-          // выбранного это повод уступить ход в close.
-          if (llm.isErrorWithoutText(ev)) errorNoText = true;
           // Потолок шагов. Проверяем ЗДЕСЬ, а не в ветке `result && ev.result`
           // ниже: при error_max_turns CLI не кладёт в result никакого текста,
           // та ветка не срабатывала — и клиент не получал вообще ничего.
@@ -953,6 +950,11 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
           }
           usageTotals.webSearch += n(st.web_search_requests);
           usageTotals.webFetch += n(st.web_fetch_requests);
+          // Ошибку без текста ветка `result && ev.result` ниже не видит — у
+          // выбранного это повод уступить ход в close. Последней в блоке: если
+          // llm-fallback.mjs окажется другой версии, TypeError (его глотает catch
+          // вокруг handleEvent) не сорвёт учёт стоимости, потолка шагов и usage.
+          if (llm.isErrorWithoutText(ev)) errorNoText = true;
         }
         if (ev.type === "stream_event" && ev.event) {
           const se = ev.event;

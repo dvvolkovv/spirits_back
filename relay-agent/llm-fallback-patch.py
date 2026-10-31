@@ -190,10 +190,18 @@ rep('              if (!qwen.SIDE_EFFECT_FREE_TOOLS.has(block.name || "")) risky
 rep('        if (ev.type === "result") {\n          // Потолок шагов.',
     '        if (ev.type === "result") {\n'
     '          gotResult = true;\n'
-    '          // Ошибку без текста ветка `result && ev.result` ниже не видит — у\n'
-    '          // выбранного это повод уступить ход в close.\n'
-    '          if (llm.isErrorWithoutText(ev)) errorNoText = true;\n'
     '          // Потолок шагов.')
+# Проверка ошибки без текста — в конце того же блока, после учёта стоимости,
+# потолка шагов и usage: окажутся на релее server.mjs и llm-fallback.mjs разных
+# версий — TypeError (его молча глотает catch вокруг handleEvent) не сорвёт учёт.
+rep('          usageTotals.webFetch += n(st.web_fetch_requests);\n        }\n',
+    '          usageTotals.webFetch += n(st.web_fetch_requests);\n'
+    '          // Ошибку без текста ветка `result && ev.result` ниже не видит — у\n'
+    '          // выбранного это повод уступить ход в close. Последней в блоке: если\n'
+    '          // llm-fallback.mjs окажется другой версии, TypeError (его глотает catch\n'
+    '          // вокруг handleEvent) не сорвёт учёт стоимости, потолка шагов и usage.\n'
+    '          if (llm.isErrorWithoutText(ev)) errorNoText = true;\n'
+    '        }\n')
 
 # 7. Разбор result.
 region('          // Сбой доступа (qwen-provider.mjs): отказ CLI или ошибка, которую прежде\n',
