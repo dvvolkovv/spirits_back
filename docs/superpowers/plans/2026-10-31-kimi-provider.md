@@ -891,7 +891,9 @@ describe('ClaudeCliService — аварийная цепочка Claude → Qwen
       .mockImplementationOnce(() => hangingProc())
       .mockImplementationOnce(() => fakeProc(OK('c')));
     const svc = new ClaudeCliService();
-    const err = await svc.text('x', { timeoutMs: 5 }).catch((e) => e);
+    // 200 мс: подставной ответ Claude приходит на следующем тике, задолго до
+    // таймаута; висящий Qwen получает остаток бюджета и упирается в него.
+    const err = await svc.text('x', { timeoutMs: 200 }).catch((e) => e);
     expect(err.message).toMatch(/^claude CLI exited with code 1: Failed to authenticate.* \| qwen fallback: claude CLI timeout/);
     expect(spawnMock).toHaveBeenCalledTimes(2);
     expect(svc.fallbackStats().breakerOpenUntil).toBe(0);
