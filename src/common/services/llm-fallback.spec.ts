@@ -2,6 +2,7 @@ import {
   DEFAULT_BREAKER_MS,
   FALLBACK_ORDER,
   FallbackConfig,
+  FallbackProvider,
   FallbackState,
   PROVIDER_DEFAULTS,
   STATS_WINDOW_MS,
@@ -294,5 +295,14 @@ describe('planProviders', () => {
   });
   it('выбран без ключа — обычный путь', () => {
     expect(planProviders({ selected: 'kimi', configs: { qwen: cfg('qwen'), kimi: null }, state: new FallbackState(), now: T })).toEqual(['claude', 'qwen']);
+  });
+  it('незнакомый выбор (из БД пришло не то) — обычный путь', () => {
+    expect(planProviders({ selected: 'gpt' as FallbackProvider, configs: both, state: new FallbackState(), now: T })).toEqual(['claude', 'qwen', 'kimi']);
+  });
+  it('выбран Kimi, окно Claude открыто, Qwen «не отвечает» — только Kimi', () => {
+    const s = new FallbackState();
+    s.openClaudeWindow(60_000, T);
+    s.markDown('qwen', 60_000, T);
+    expect(planProviders({ selected: 'kimi', configs: both, state: s, now: T + 1 })).toEqual(['kimi', 'claude']);
   });
 });
