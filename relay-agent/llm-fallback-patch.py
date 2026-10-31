@@ -126,8 +126,9 @@ region('  // Окно запасного Qwen открывается при сб
        '  // Переход к следующему в плане: тот же ход (тот же --resume — беседа\n'
        '  // продолжается между провайдерами) у следующего провайдера; null — некуда.\n'
        '  // Аварийный исход упавшего запасного — в статистику здесь, финальный — по\n'
-       '  // итогам хода.\n'
-       '  const switchProvider = (useResume, why) => {\n'
+       '  // итогам хода. detail — в журнал рядом с причиной; только безопасное\n'
+       '  // (llm.safeErrorDetail: статус и строка диагностики CLI), не текст ошибки.\n'
+       '  const switchProvider = (useResume, why, detail = "") => {\n'
        '    const i = llm.nextStep(plan, planStep, fallbackState);\n'
        '    if (i < 0) return null;\n'
        '    const from = provider;\n'
@@ -137,7 +138,7 @@ region('  // Окно запасного Qwen открывается при сб
        '    usedFallback = llm.isEmergency(provider, selected);\n'
        '    if (usedFallback) reachedFallback = true;\n'
        '    const model = provider === "claude" ? reqModel : llm.modelFor(reqModel, llmCfgs[provider].models);\n'
-       '    console.warn("[llm] " + sessionId + ": " + llm.PROVIDER_LABELS[from] + " (" + why + ") → " + llm.PROVIDER_LABELS[provider] + " " + model);\n'
+       '    console.warn("[llm] " + sessionId + ": " + llm.PROVIDER_LABELS[from] + " (" + why + (detail ? ": " + detail : "") + ") → " + llm.PROVIDER_LABELS[provider] + " " + model);\n'
        '    return runOnce(useResume, provider);\n'
        '  };\n'
        '  // Запуск хода. Без провайдера — текущий провайдер хода: после переключения\n'
@@ -152,7 +153,7 @@ region('  // Окно запасного Qwen открывается при сб
        '  async function runOnce(useResume, runProvider = provider) {\n'
        '    const r = await runProcessOnce(useResume, runProvider);\n'
        '    if (!r.switchHit || preempted || clientDisconnected) return r;\n'
-       '    const next = switchProvider(useResume, r.switchWhy);\n'
+       '    const next = switchProvider(useResume, r.switchWhy, r.switchDetail);\n'
        '    if (next) return next;\n'
        '    const fatal = FATAL_RE.test(r.switchText);\n'
        '    notice(fatal ? fatalHint(r.switchText) : "_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_", fatal ? "cli_fatal" : "transient");\n'
@@ -173,7 +174,10 @@ rep('      let accessFailHit = false;\n      let transientAccessLike = false;\n 
     '      // Сбой, после которого ход переходит к следующему в плане (runOnce выше).\n'
     '      let switchHit = false;\n'
     '      let switchWhy = "";\n'
+    '      // Текст сбоя — только для FATAL_RE/fatalHint в runOnce, в журнал не идёт.\n'
     '      let switchText = "";\n'
+    '      // Для журнала перехода — только безопасное (llm.safeErrorDetail).\n'
+    '      let switchDetail = "";\n'
     '      // Пришло хоть одно событие type:"result" от этого запуска (gotResult ниже,\n'
     '      // child.on("close", …)) — даже без текста: выбранный пользователем\n'
     '      // провайдер, вышедший без единого result (ненулевой код, кривой адрес),\n'
@@ -186,6 +190,8 @@ rep('      let accessFailHit = false;\n      let transientAccessLike = false;\n 
     '      // Её причина (llm.errorsText: errors[] одной строкой) — в switchText: его\n'
     '      // читают только FATAL_RE и fatalHint в runOnce, человеку уходит готовый текст.\n'
     '      let errorNoTextWhy = "";\n'
+    '      // А в журнал — только безопасное (llm.safeErrorDetail), в switchDetail.\n'
+    '      let errorNoTextDetail = "";\n'
     '      let transientAccessLike = false;\n'
     '      let sawResult = false;\n')
 rep('              if (!qwen.SIDE_EFFECT_FREE_TOOLS.has(block.name || "")) riskyToolUsed = true;\n',
@@ -206,6 +212,7 @@ rep('          usageTotals.webFetch += n(st.web_fetch_requests);\n        }\n',
     '          if (llm.isErrorWithoutText(ev)) {\n'
     '            errorNoText = true;\n'
     '            errorNoTextWhy = llm.errorsText(ev);\n'
+    '            errorNoTextDetail = llm.safeErrorDetail(ev);\n'
     '          }\n'
     '        }\n')
 
@@ -239,6 +246,7 @@ region('          // Сбой доступа (qwen-provider.mjs): отказ CLI
        '              switchHit = true;\n'
        '              switchWhy = fatalAccess ? "отказ CLI" : "ошибка";\n'
        '              switchText = String(ev.result);\n'
+       '              switchDetail = llm.safeErrorDetail(ev);\n'
        '              return;\n'
        '            }\n'
        '            // Перейти некуда или переигровка запрещена (текст уже шёл, инструмент с\n'
@@ -266,8 +274,9 @@ rep('resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, accessF
     '          switchHit = true;\n'
     '          switchWhy = gotResult ? "ошибка без текста" : "нет ответа";\n'
     '          switchText = gotResult ? errorNoTextWhy : "";\n'
+    '          switchDetail = gotResult ? errorNoTextDetail : "";\n'
     '        }\n'
-    '        resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, switchHit, switchWhy, switchText, transientAccessLike, sawResult, startedAt: runStartedAt });')
+    '        resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, switchHit, switchWhy, switchText, switchDetail, transientAccessLike, sawResult, startedAt: runStartedAt });')
 
 # 7b. Комментарий sawResult остался про Qwen — запасных теперь два.
 rep('          // Успех запуска — для окна запасного Qwen: ни ошибки, ни сбоя доступа.\n',

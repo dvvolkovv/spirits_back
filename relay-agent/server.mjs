@@ -800,8 +800,9 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   // Переход к следующему в плане: тот же ход (тот же --resume — беседа
   // продолжается между провайдерами) у следующего провайдера; null — некуда.
   // Аварийный исход упавшего запасного — в статистику здесь, финальный — по
-  // итогам хода.
-  const switchProvider = (useResume, why) => {
+  // итогам хода. detail — в журнал рядом с причиной; только безопасное
+  // (llm.safeErrorDetail: статус и строка диагностики CLI), не текст ошибки.
+  const switchProvider = (useResume, why, detail = "") => {
     const i = llm.nextStep(plan, planStep, fallbackState);
     if (i < 0) return null;
     const from = provider;
@@ -811,7 +812,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
     usedFallback = llm.isEmergency(provider, selected);
     if (usedFallback) reachedFallback = true;
     const model = provider === "claude" ? reqModel : llm.modelFor(reqModel, llmCfgs[provider].models);
-    console.warn("[llm] " + sessionId + ": " + llm.PROVIDER_LABELS[from] + " (" + why + ") → " + llm.PROVIDER_LABELS[provider] + " " + model);
+    console.warn("[llm] " + sessionId + ": " + llm.PROVIDER_LABELS[from] + " (" + why + (detail ? ": " + detail : "") + ") → " + llm.PROVIDER_LABELS[provider] + " " + model);
     return runOnce(useResume, provider);
   };
   // Запуск хода. Без провайдера — текущий провайдер хода: после переключения
@@ -826,7 +827,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   async function runOnce(useResume, runProvider = provider) {
     const r = await runProcessOnce(useResume, runProvider);
     if (!r.switchHit || preempted || clientDisconnected) return r;
-    const next = switchProvider(useResume, r.switchWhy);
+    const next = switchProvider(useResume, r.switchWhy, r.switchDetail);
     if (next) return next;
     const fatal = FATAL_RE.test(r.switchText);
     notice(fatal ? fatalHint(r.switchText) : "_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_", fatal ? "cli_fatal" : "transient");
@@ -893,7 +894,10 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       // Сбой, после которого ход переходит к следующему в плане (runOnce выше).
       let switchHit = false;
       let switchWhy = "";
+      // Текст сбоя — только для FATAL_RE/fatalHint в runOnce, в журнал не идёт.
       let switchText = "";
+      // Для журнала перехода — только безопасное (llm.safeErrorDetail).
+      let switchDetail = "";
       // Пришло хоть одно событие type:"result" от этого запуска (gotResult ниже,
       // child.on("close", …)) — даже без текста: выбранный пользователем
       // провайдер, вышедший без единого result (ненулевой код, кривой адрес),
@@ -906,6 +910,8 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       // Её причина (llm.errorsText: errors[] одной строкой) — в switchText: его
       // читают только FATAL_RE и fatalHint в runOnce, человеку уходит готовый текст.
       let errorNoTextWhy = "";
+      // А в журнал — только безопасное (llm.safeErrorDetail), в switchDetail.
+      let errorNoTextDetail = "";
       let transientAccessLike = false;
       let sawResult = false;
       let transientHit = false;
@@ -960,6 +966,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
           if (llm.isErrorWithoutText(ev)) {
             errorNoText = true;
             errorNoTextWhy = llm.errorsText(ev);
+            errorNoTextDetail = llm.safeErrorDetail(ev);
           }
         }
         if (ev.type === "stream_event" && ev.event) {
@@ -1016,6 +1023,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
               switchHit = true;
               switchWhy = fatalAccess ? "отказ CLI" : "ошибка";
               switchText = String(ev.result);
+              switchDetail = llm.safeErrorDetail(ev);
               return;
             }
             // Перейти некуда или переигровка запрещена (текст уже шёл, инструмент с
@@ -1095,8 +1103,9 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
           switchHit = true;
           switchWhy = gotResult ? "ошибка без текста" : "нет ответа";
           switchText = gotResult ? errorNoTextWhy : "";
+          switchDetail = gotResult ? errorNoTextDetail : "";
         }
-        resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, switchHit, switchWhy, switchText, transientAccessLike, sawResult, startedAt: runStartedAt });
+        resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, switchHit, switchWhy, switchText, switchDetail, transientAccessLike, sawResult, startedAt: runStartedAt });
       });
 
       child.on("error", (err) => {

@@ -165,7 +165,8 @@ export function isErrorWithoutText(ev) {
 /** Причина ошибки без текста — errors[] события result одной строкой: элементы
  *  через "; " (не строки — JSON), переводы строк — пробелами, не длиннее 300
  *  символов; нет массива — "". В CLI 2.1.x там диагностика хода и ошибки хода
- *  (error.stack || error.message) — сырым текстом человеку не отдавать. */
+ *  (error.stack || error.message) — сырым текстом человеку не отдавать и в
+ *  журнал не писать (для журнала — safeErrorDetail). */
 export function errorsText(ev) {
   if (!ev || !Array.isArray(ev.errors)) return "";
   return ev.errors
@@ -174,6 +175,29 @@ export function errorsText(ev) {
     .filter(Boolean)
     .join("; ")
     .slice(0, 300);
+}
+
+// Строка диагностики CLI в errors[] — целиком «ключ=значение» с enum-подобными
+// значениями: без пробелов, кавычек и переводов строк внутри значения.
+const EDE_DIAGNOSTIC_RE = /^\[ede_diagnostic\](?: [a-z_]+=[A-Za-z0-9_.:-]*)*$/;
+
+/** Что можно писать в серверный журнал о сбое запуска: без текста запроса
+ *  пользователя. Части через ", ": «status N» — если api_error_status целое
+ *  100…599; строка «[ede_diagnostic] …» — первая такая в errors[], только если
+ *  целиком проходит EDE_DIAGNOSTIC_RE, не длиннее 160 символов (не прошла —
+ *  части нет вовсе). Ни result, ни остальных errors[]: там текст ошибки API и
+ *  ошибки хода (error.stack || error.message — пути, адреса, цитаты входа).
+ *  Нечего писать — "". */
+export function safeErrorDetail(ev) {
+  if (!ev) return "";
+  const parts = [];
+  const st = ev.api_error_status;
+  if (Number.isInteger(st) && st >= 100 && st <= 599) parts.push("status " + st);
+  if (Array.isArray(ev.errors)) {
+    const diag = ev.errors.find((e) => typeof e === "string" && e.startsWith("[ede_diagnostic]"));
+    if (diag && EDE_DIAGNOSTIC_RE.test(diag)) parts.push(diag.slice(0, 160));
+  }
+  return parts.join(", ");
 }
 
 // План хода (spec, раздел 3) — как planProviders бэкенда.
