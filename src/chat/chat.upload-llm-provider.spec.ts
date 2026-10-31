@@ -69,7 +69,7 @@ function makeRes() {
 }
 
 /** Прогоняет upload-and-chat с выбором человека и отдаёт поля, ушедшие на релей. */
-async function upload(choice: 'claude' | 'qwen') {
+async function upload(choice: 'claude' | 'qwen' | 'kimi') {
   const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
   const svc = new ChatService(
     makePg() as any, null as any, null as any,
@@ -107,6 +107,12 @@ describe('uploadAndChat: модель ответов человека', () => {
   it('выбран Claude — ни provider, ни noFallback', async () => {
     const { fields } = await upload('claude');
     expect(fields.provider).toBeUndefined();
+    expect(fields.noFallback).toBeUndefined();
+  });
+
+  it('выбран Kimi — provider=kimi, без noFallback', async () => {
+    const { fields } = await upload('kimi');
+    expect(fields.provider).toBe('kimi');
     expect(fields.noFallback).toBeUndefined();
   });
 });

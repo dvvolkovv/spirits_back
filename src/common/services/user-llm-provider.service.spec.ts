@@ -74,4 +74,26 @@ describe('UserLlmProviderService', () => {
     const bad = mk(() => { throw new Error('lock timeout'); });
     await expect(bad.svc.onModuleInit()).resolves.toBeUndefined();
   });
+
+  it('get: kimi', async () => {
+    const { svc } = mk(() => ({ rows: [{ llm_provider: 'kimi' }] }));
+    expect(await svc.get('u-1')).toBe('kimi');
+  });
+
+  it('get: незнакомое значение — claude', async () => {
+    const { svc } = mk(() => ({ rows: [{ llm_provider: 'gpt' }] }));
+    expect(await svc.get('u-1')).toBe('claude');
+  });
+
+  it('set kimi — пишет kimi', async () => {
+    const { svc, query } = mk(() => ({ rows: [], rowCount: 1 }));
+    expect(await svc.set('u-1', 'kimi')).toBe(true);
+    expect(query.mock.calls[0][1]).toEqual(['u-1', 'kimi']);
+  });
+
+  it('set: незнакомое значение — пишет NULL, как Claude (валидирует сам, не только контроллер)', async () => {
+    const { svc, query } = mk(() => ({ rows: [], rowCount: 1 }));
+    await svc.set('u-1', 'gpt' as any);
+    expect(query.mock.calls[0][1]).toEqual(['u-1', null]);
+  });
 });

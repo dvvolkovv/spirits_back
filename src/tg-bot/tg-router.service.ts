@@ -15,7 +15,7 @@ import { customAssistantHelpLine, telegramPlatformGuide } from '../chat/platform
 import { FACT_CHECK_RULE } from '../chat/fact-check-rule';
 import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
 import { UserLlmProviderService } from '../common/services/user-llm-provider.service';
-import { resolveAnswerProvider } from '../chat/answer-provider';
+import { cliProviderOption, resolveAnswerProvider } from '../chat/answer-provider';
 
 /**
  * Дефолтный ассистент для лички, когда preferred_agent пуст или указывает на
@@ -701,7 +701,7 @@ ${LanguageService.buildDirective(replyLang)}`;
     const { text, costUsd } = await this.claudeCli.textWithCost(userPrompt, {
       system: systemWithCtx,
       model: CHAT_MODEL,
-      ...(ownerProvider === 'qwen' ? { provider: 'qwen' as const } : {}),
+      ...cliProviderOption(ownerProvider),
       timeoutMs: 0,
       attachments: attachmentPaths?.length ? attachmentPaths : undefined,
       onProgress,

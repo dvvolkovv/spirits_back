@@ -56,14 +56,19 @@ function lastOpts(): any {
 // Здесь проверяется только обычный запуск: ключ запасного пути из окружения CI
 // включил бы Qwen и в этих тестах (claude-cli.fallback.spec.ts — отдельно).
 let savedQwenKey: string | undefined;
+let savedKimiKey: string | undefined;
 beforeEach(() => {
   spawnMock.mockReset();
   savedQwenKey = process.env.QWEN_FALLBACK_API_KEY;
+  savedKimiKey = process.env.KIMI_FALLBACK_API_KEY;
   delete process.env.QWEN_FALLBACK_API_KEY;
+  delete process.env.KIMI_FALLBACK_API_KEY;
 });
 afterEach(() => {
   if (savedQwenKey === undefined) delete process.env.QWEN_FALLBACK_API_KEY;
   else process.env.QWEN_FALLBACK_API_KEY = savedQwenKey;
+  if (savedKimiKey === undefined) delete process.env.KIMI_FALLBACK_API_KEY;
+  else process.env.KIMI_FALLBACK_API_KEY = savedKimiKey;
 });
 
 describe('ClaudeCliService argv: набор тулов', () => {

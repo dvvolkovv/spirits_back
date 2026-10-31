@@ -322,7 +322,7 @@ export class ChatController {
     fd.append('products_mcp_url', handoff.products.products_mcp_url);
     // Инструменты Linkeon и папка хода — как у текстового хода (linkeon-relay-fields.ts).
     appendLinkeonFields(fd, handoff.linkeon);
-    // Выбор «Qwen» — релей сразу идёт в Qwen (answer-provider.ts).
+    // Выбор Qwen/Kimi — релей сразу идёт к выбранному (answer-provider.ts).
     for (const [k, v] of Object.entries(relayProviderFields(false, answerProvider))) fd.append(k, v);
 
     // Set streaming headers

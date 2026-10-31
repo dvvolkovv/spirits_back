@@ -37,12 +37,12 @@ import { RelayOutputFile, collectOutputFiles, outputFileLines, storeRelayLinks }
 import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
-import { UserLlmProviderService } from '../common/services/user-llm-provider.service';
+import { LlmProvider, UserLlmProviderService } from '../common/services/user-llm-provider.service';
 import { RedisService } from '../common/services/redis.service';
 import { dropGuestCarry, peekGuestCarry } from '../guest-trial/guest-carry';
 import { GUEST_CARRY_READ_TIMEOUT_MS } from '../guest-trial/guest-trial.types';
 import { withTimeout } from '../common/with-timeout';
-import { readDoneProvider, relayProviderFields, resolveAnswerProvider } from './answer-provider';
+import { cliProviderOption, readDoneProvider, relayProviderFields, resolveAnswerProvider } from './answer-provider';
 import axios from 'axios';
 import { Request, Response } from 'express';
 import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
@@ -1227,7 +1227,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       }, PING_MS);
 
       try {
-        // Модель ответов человека (админка): 'qwen' — сразу Qwen; проба — только Claude.
+        // Модель ответов человека (админка): Qwen/Kimi — сразу выбранный, при его сбое — обычный путь; проба — только Claude.
         const mashaProvider = await resolveAnswerProvider(probe, userId, this.llmProvider);
         const r = await this.claudeCli.textWithCost(fullPrompt, {
           // Блок про продукты встаёт ДО волатильной части и хвоста языка:
@@ -1243,9 +1243,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // Пинг мониторинга уходит на haiku: проверяется живость пути, а не
           // качество ответа, и разница в цене хода — порядок.
           model: probe ? PROBE_MODEL : CHAT_MODEL,
-          // Пинг мониторинга меряет путь Claude — без запасного Qwen.
+          // Пинг мониторинга меряет путь Claude — без запасных.
           noFallback: probe,
-          ...(mashaProvider === 'qwen' ? { provider: 'qwen' as const } : {}),
+          ...cliProviderOption(mashaProvider),
           // Бюджет хода — общий с релеем. Правка ждёт исхода внутри вызова
           // инструмента до PRODUCT_TOOL_WAIT_MS (2.5 мин) и может позвать его
           // повторно; прежние 90 с убивали бы CLI посреди ожидания — правка уже
@@ -1785,7 +1785,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const agentUsage: SdkUsageTotals = {
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
     };
-    // Модель ответов человека: 'qwen' — релей сразу идёт в Qwen; проба — только Claude.
+    // Модель ответов человека: Qwen/Kimi — релей сразу идёт к выбранному; проба — только Claude.
     const answerProvider = await resolveAnswerProvider(probe, userId, this.llmProvider);
     // Релей сообщил, что ход закончился БЕЗ финального ответа: упёрлись в потолок
     // шагов, ход прерван новым сообщением пользователя, отказ CLI или сбой связи.
@@ -1795,7 +1795,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     let turnFailed = false;
     let failReason = '';
     // Чем ответил релей (done.provider/fallback) — в chat_quality.
-    let turnProvider: 'claude' | 'qwen' | undefined;
+    let turnProvider: LlmProvider | undefined;
     let turnFallback = false;
 
     // Single persistence point — dedupe via `saved` flag so success and error paths
@@ -1843,6 +1843,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
             fail_reason: failReason || undefined,
             provider: turnProvider,
             fallback: turnFallback || undefined,
+            // Выбор человека (не Claude): «выбранный подвёл» — selected ≠ provider.
+            selected: answerProvider === 'claude' ? undefined : answerProvider,
           },
         });
       }

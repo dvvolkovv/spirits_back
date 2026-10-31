@@ -1,13 +1,16 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { PgService } from './pg.service';
+import { ANSWER_PROVIDERS, AnswerProvider, isAnswerProvider } from './llm-fallback';
 
-export type LlmProvider = 'claude' | 'qwen';
-export const LLM_PROVIDERS: readonly LlmProvider[] = ['claude', 'qwen'];
+/** Модель ответов человека: 'claude' (по умолчанию), 'qwen' или 'kimi'. */
+export type LlmProvider = AnswerProvider;
+export const LLM_PROVIDERS: readonly LlmProvider[] = ANSWER_PROVIDERS;
 
 /**
  * Модель ответов ассистентов для конкретного человека (spec
  * docs/superpowers/specs/2026-10-30-llm-provider-switch-design.md).
- * NULL — Claude (по умолчанию), 'qwen' — ответы сразу через Qwen.
+ * NULL — Claude (по умолчанию), 'qwen' или 'kimi' — ответы сразу через
+ * выбранного (spec 2026-10-30-llm-provider-switch, 2026-10-31-kimi-provider-design).
  *
  * Отдельная колонка, а не ключ profile_data: profile_data пишет сам
  * пользователь через обновление профиля, а этот выбор тратит квоту владельца —
@@ -41,18 +44,26 @@ export class UserLlmProviderService implements OnModuleInit {
     if (!userId) return 'claude';
     try {
       const r = await this.pg.query('SELECT llm_provider FROM ai_profiles_consolidated WHERE user_id = $1', [userId]);
-      return r.rows[0]?.llm_provider === 'qwen' ? 'qwen' : 'claude';
+      const v = r.rows[0]?.llm_provider;
+      // NULL и незнакомое значение — Claude.
+      return isAnswerProvider(v) ? v : 'claude';
     } catch (e: any) {
       this.logger.warn(`llm_provider: не прочитан для ${userId}: ${e?.message}`);
       return 'claude';
     }
   }
 
-  /** false — такого пользователя нет. */
+  /**
+   * false — такого пользователя нет. Валидирует сам, а не только вызывающий
+   * (AdminLlmProviderController): незнакомое значение пишется как NULL
+   * (Claude) — симметрично с get(), и колонку не засоряет мусором ни один
+   * будущий вызывающий код.
+   */
   async set(userId: string, provider: LlmProvider): Promise<boolean> {
+    const value = isAnswerProvider(provider) && provider !== 'claude' ? provider : null;
     const r = await this.pg.query(
       'UPDATE ai_profiles_consolidated SET llm_provider = $2 WHERE user_id = $1',
-      [userId, provider === 'qwen' ? 'qwen' : null],
+      [userId, value],
     );
     return (r.rowCount ?? 0) > 0;
   }

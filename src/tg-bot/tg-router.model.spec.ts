@@ -102,4 +102,11 @@ describe('TgRouterService: выбор модели', () => {
     await svc.generateReply({ ...cfg, owner_user_id: '79030169187' }, 'Дмитрий');
     expect(claudeCli.textWithCost.mock.calls[0][1].provider).toBeUndefined();
   });
+
+  it('владелец выбрал Kimi — основной ход с provider: kimi', async () => {
+    const { svc, claudeCli } = makeRouter();
+    (svc as any).llmProvider = { get: jest.fn(async () => 'kimi') };
+    await svc.generateReply({ ...cfg, owner_user_id: 'u-owner' }, 'Дмитрий');
+    expect(claudeCli.textWithCost.mock.calls[0][1].provider).toBe('kimi');
+  });
 });

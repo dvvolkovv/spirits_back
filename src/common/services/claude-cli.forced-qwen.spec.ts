@@ -4,9 +4,10 @@ import { Logger } from '@nestjs/common';
 import { ClaudeCliService } from './claude-cli.service';
 
 /**
- * Выбор пользователя «Qwen» (админка, spec 2026-10-30-llm-provider-switch):
- * вызов сразу на Qwen, без попытки Claude. Это не авария — окно
- * предохранителя и fallbackStats не трогаются, событие помечено fallback: false.
+ * Выбор пользователя «Qwen» (админка, spec 2026-10-30-llm-provider-switch и
+ * 2026-10-31-kimi-provider-design): вызов сразу на Qwen, при его сбое — обычный
+ * путь (Claude, затем запасные без него). Это не авария — окно Claude и
+ * аварийные счётчики не трогаются, событие помечено fallback: false, selected.
  */
 
 const spawnMock = spawn as unknown as jest.Mock;
@@ -31,9 +32,15 @@ const envOf = (i: number) => spawnMock.mock.calls[i][2]?.env as NodeJS.ProcessEn
 const modelOf = (i: number) => { const a: string[] = spawnMock.mock.calls[i][1]; return a[a.indexOf('--model') + 1]; };
 
 const OLD = process.env.QWEN_FALLBACK_API_KEY;
-beforeEach(() => { spawnMock.mockReset(); process.env.QWEN_FALLBACK_API_KEY = 'sk-sp-test'; });
+const OLD_KIMI = process.env.KIMI_FALLBACK_API_KEY;
+beforeEach(() => {
+  spawnMock.mockReset();
+  process.env.QWEN_FALLBACK_API_KEY = 'sk-sp-test';
+  delete process.env.KIMI_FALLBACK_API_KEY; // цепочка с Kimi — claude-cli.chain.spec.ts
+});
 afterEach(() => {
   if (OLD === undefined) delete process.env.QWEN_FALLBACK_API_KEY; else process.env.QWEN_FALLBACK_API_KEY = OLD;
+  if (OLD_KIMI === undefined) delete process.env.KIMI_FALLBACK_API_KEY; else process.env.KIMI_FALLBACK_API_KEY = OLD_KIMI;
   jest.restoreAllMocks();
 });
 
@@ -71,20 +78,18 @@ describe('ClaudeCliService — provider: qwen', () => {
     expect(hasEnv(1)).toBe(false);
   });
 
-  it('сбой принудительного Qwen — понятная ошибка, окно не открыто', async () => {
+  it('сбой выбранного Qwen — ответ через Claude; окно Claude не открыто, аварийные счётчики не растут', async () => {
     spawnMock.mockImplementationOnce(() => fakeProc(QWEN_401, 1)).mockImplementationOnce(() => fakeProc(OK('c')));
     const svc = new ClaudeCliService();
-    const err = await svc.text('x', { provider: 'qwen' }).catch((e) => e);
-    expect(err.message).toMatch(/^claude CLI не вызывался \(выбран Qwen\) \| qwen: .*401/);
-    expect(svc.fallbackStats().failed).toBe(0);
-    await svc.text('y');
+    expect(await svc.text('x', { provider: 'qwen' })).toBe('c');
     expect(hasEnv(1)).toBe(false);
+    expect(svc.fallbackStats()).toMatchObject({ ok: 0, failed: 0, breakerOpenUntil: 0 });
   });
 
   it('событие: provider qwen, fallback false', async () => {
     const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
     spawnMock.mockImplementationOnce(() => fakeProc(OK('q')));
     await new ClaudeCliService(pg as any).text('x', { model: 'claude-opus-5-5', provider: 'qwen' });
-    expect(JSON.parse(pg.query.mock.calls[0][1][0])).toMatchObject({ provider: 'qwen', fallback: false, model: 'qwen3.8-max' });
+    expect(JSON.parse(pg.query.mock.calls[0][1][0])).toMatchObject({ provider: 'qwen', fallback: false, selected: 'qwen', model: 'qwen3.8-max' });
   });
 });
