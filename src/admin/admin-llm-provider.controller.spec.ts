@@ -12,10 +12,15 @@ const mkRes = () => {
 };
 
 describe('AdminLlmProviderController', () => {
-  const OLD = process.env.QWEN_FALLBACK_API_KEY;
+  const OLD = { qwen: process.env.QWEN_FALLBACK_API_KEY, kimi: process.env.KIMI_FALLBACK_API_KEY };
+  /** Какие ключи запасных заданы на бэкенде. */
+  const keys = (qwen: boolean, kimi: boolean) => {
+    if (qwen) process.env.QWEN_FALLBACK_API_KEY = 'sk-sp-test'; else delete process.env.QWEN_FALLBACK_API_KEY;
+    if (kimi) process.env.KIMI_FALLBACK_API_KEY = 'sk-kimi-test'; else delete process.env.KIMI_FALLBACK_API_KEY;
+  };
   afterEach(() => {
-    if (OLD === undefined) delete process.env.QWEN_FALLBACK_API_KEY;
-    else process.env.QWEN_FALLBACK_API_KEY = OLD;
+    if (OLD.qwen === undefined) delete process.env.QWEN_FALLBACK_API_KEY; else process.env.QWEN_FALLBACK_API_KEY = OLD.qwen;
+    if (OLD.kimi === undefined) delete process.env.KIMI_FALLBACK_API_KEY; else process.env.KIMI_FALLBACK_API_KEY = OLD.kimi;
   });
 
   it('закрыт JwtGuard + AdminGuard', () => {
@@ -23,39 +28,46 @@ describe('AdminLlmProviderController', () => {
     expect(guards).toEqual(expect.arrayContaining([JwtGuard, AdminGuard]));
   });
 
-  it('GET: выбор и наличие ключа', async () => {
-    process.env.QWEN_FALLBACK_API_KEY = 'sk-sp-test';
-    const svc = { get: jest.fn(async () => 'qwen'), set: jest.fn() };
+  it('GET: выбор и ключи по каждому запасному (+ прежнее qwenConfigured)', async () => {
+    keys(true, false);
+    const svc = { get: jest.fn(async () => 'kimi'), set: jest.fn() };
     const res = mkRes();
-    await new AdminLlmProviderController(svc as any).get('79030169187', res);
-    expect(svc.get).toHaveBeenCalledWith('79030169187');
+    await new AdminLlmProviderController(svc as any).get('u-1', res);
+    expect(svc.get).toHaveBeenCalledWith('u-1');
     expect(res.status).toHaveBeenCalledWith(200);
-    expect(res.json).toHaveBeenCalledWith({ userId: '79030169187', provider: 'qwen', qwenConfigured: true });
+    expect(res.json).toHaveBeenCalledWith({
+      userId: 'u-1', provider: 'kimi', qwenConfigured: true, configured: { qwen: true, kimi: false },
+    });
   });
 
-  it('GET без ключа — qwenConfigured: false', async () => {
-    delete process.env.QWEN_FALLBACK_API_KEY;
+  it('GET без ключей — всё false', async () => {
+    keys(false, false);
     const svc = { get: jest.fn(async () => 'claude'), set: jest.fn() };
     const res = mkRes();
-    await new AdminLlmProviderController(svc as any).get('u1', res);
-    expect(res.json).toHaveBeenCalledWith({ userId: 'u1', provider: 'claude', qwenConfigured: false });
+    await new AdminLlmProviderController(svc as any).get('u-1', res);
+    expect(res.json).toHaveBeenCalledWith({
+      userId: 'u-1', provider: 'claude', qwenConfigured: false, configured: { qwen: false, kimi: false },
+    });
   });
 
-  it('POST: сохраняет и отдаёт новое значение', async () => {
-    delete process.env.QWEN_FALLBACK_API_KEY;
+  it('POST kimi: сохраняет и отдаёт новое значение', async () => {
+    keys(false, true);
     const svc = { get: jest.fn(), set: jest.fn(async () => true) };
     const res = mkRes();
-    await new AdminLlmProviderController(svc as any).set('79030169187', { userId: 'admin-1' }, { provider: 'qwen' }, res);
-    expect(svc.set).toHaveBeenCalledWith('79030169187', 'qwen');
+    await new AdminLlmProviderController(svc as any).set('u-1', { userId: 'admin-1' }, { provider: 'kimi' }, res);
+    expect(svc.set).toHaveBeenCalledWith('u-1', 'kimi');
     expect(res.status).toHaveBeenCalledWith(200);
-    expect(res.json).toHaveBeenCalledWith({ userId: '79030169187', provider: 'qwen', qwenConfigured: false });
+    expect(res.json).toHaveBeenCalledWith({
+      userId: 'u-1', provider: 'kimi', qwenConfigured: false, configured: { qwen: false, kimi: true },
+    });
   });
 
-  it('POST: чужое значение — 400, ничего не пишет', async () => {
+  it('POST: чужое значение — 400 со списком допустимых, ничего не пишет', async () => {
     const svc = { get: jest.fn(), set: jest.fn() };
     const res = mkRes();
-    await new AdminLlmProviderController(svc as any).set('u1', { userId: 'admin-1' }, { provider: 'gpt' }, res);
+    await new AdminLlmProviderController(svc as any).set('u-1', { userId: 'admin-1' }, { provider: 'gpt' }, res);
     expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({ error: "provider: 'claude' | 'qwen' | 'kimi'" });
     expect(svc.set).not.toHaveBeenCalled();
   });
 
@@ -66,33 +78,28 @@ describe('AdminLlmProviderController', () => {
     expect(res.status).toHaveBeenCalledWith(404);
   });
 
-  // Раньше смена модели ответов по аккаунту не оставляла следа — кто и когда
-  // переключил пользователя на Qwen (тратит квоту владельца), было не выяснить.
   it('POST: успешная смена — лог с актором, пользователем и значением', async () => {
-    delete process.env.QWEN_FALLBACK_API_KEY;
+    keys(false, false);
     const log = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
     const svc = { get: jest.fn(), set: jest.fn(async () => true) };
-    const res = mkRes();
-    await new AdminLlmProviderController(svc as any).set('79030169187', { userId: 'admin-1' }, { provider: 'qwen' }, res);
-    expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toContain('admin-1 → 79030169187 = qwen');
+    await new AdminLlmProviderController(svc as any).set('u-1', { userId: 'admin-1' }, { provider: 'kimi' }, mkRes());
+    expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toContain('admin-1 → u-1 = kimi');
     log.mockRestore();
   });
 
   it('POST: без user (@CurrentUser не отдал) — актор unknown, лог всё равно пишется', async () => {
-    delete process.env.QWEN_FALLBACK_API_KEY;
+    keys(false, false);
     const log = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
     const svc = { get: jest.fn(), set: jest.fn(async () => true) };
-    const res = mkRes();
-    await new AdminLlmProviderController(svc as any).set('79030169187', undefined, { provider: 'claude' }, res);
-    expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toContain('unknown → 79030169187 = claude');
+    await new AdminLlmProviderController(svc as any).set('u-1', undefined, { provider: 'claude' }, mkRes());
+    expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toContain('unknown → u-1 = claude');
     log.mockRestore();
   });
 
   it('POST: отказ (400/404) — лог не пишется', async () => {
     const log = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
     const svc = { get: jest.fn(), set: jest.fn(async () => false) };
-    const res = mkRes();
-    await new AdminLlmProviderController(svc as any).set('nobody', { userId: 'admin-1' }, { provider: 'claude' }, res);
+    await new AdminLlmProviderController(svc as any).set('nobody', { userId: 'admin-1' }, { provider: 'claude' }, mkRes());
     expect(log).not.toHaveBeenCalled();
     log.mockRestore();
   });
