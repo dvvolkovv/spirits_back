@@ -140,6 +140,23 @@ test("isNonRetryAccess: 403/Forbidden/Arrearage — true; 429/529/длина к�
   }
 });
 
+test("isErrorWithoutText: ошибка без текста — error_during_execution с errors[], api_error_status, пустой result", () => {
+  assert.equal(l.isErrorWithoutText({ type: "result", subtype: "error_during_execution", is_error: true, errors: ["API Error: 500 Internal server error"] }), true);
+  assert.equal(l.isErrorWithoutText({ type: "result", api_error_status: 500 }), true);
+  assert.equal(l.isErrorWithoutText({ type: "result", is_error: true, result: "" }), true);
+});
+
+test("isErrorWithoutText: текст в result, успех, потолок шагов, не result, null/undefined — нет", () => {
+  // С текстом — дело ветки `result && ev.result` в server.mjs, не этой проверки.
+  assert.equal(l.isErrorWithoutText({ type: "result", is_error: true, result: "API Error: 500" }), false);
+  assert.equal(l.isErrorWithoutText({ type: "result", subtype: "success", is_error: false }), false);
+  // Потолок шагов — не сбой: ход продолжается тем же --resume.
+  assert.equal(l.isErrorWithoutText({ type: "result", subtype: "error_max_turns", is_error: true }), false);
+  assert.equal(l.isErrorWithoutText({ type: "assistant", is_error: true }), false);
+  assert.equal(l.isErrorWithoutText(null), false);
+  assert.equal(l.isErrorWithoutText(undefined), false);
+});
+
 test("planProviders", () => {
   const cfg = (name) => ({ name, apiKey: "k", baseUrl: "u", models: KIMI_MODELS });
   const both = { qwen: cfg("qwen"), kimi: cfg("kimi") };
