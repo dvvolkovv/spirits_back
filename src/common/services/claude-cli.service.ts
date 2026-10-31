@@ -9,13 +9,23 @@ import { PgService } from './pg.service';
 import { neutralizeAtMentions, stripWordJoiner } from '../agent-guards';
 import { classifyLlmError, looksLikeCliRefusal } from '../llm-error';
 import {
-  QwenFallbackConfig,
+  AnswerProvider,
+  FALLBACK_ORDER,
+  FallbackConfig,
+  FallbackProvider,
+  FallbackState,
+  NO_FALLBACK_CONFIGS,
+  PROVIDER_DEFAULTS,
+  PROVIDER_LABELS,
+  STATS_WINDOW_MS,
+  fallbackModelFor,
+  fallbackSpawnEnv,
   fallbackTimeoutMs,
   isFallbackWorthy,
-  qwenModelFor,
-  qwenSpawnEnv,
-  readQwenFallbackConfig,
-} from './qwen-fallback';
+  planProviders,
+  readBreakerMs,
+  readFallbackConfigs,
+} from './llm-fallback';
 
 export interface ClaudeCliProgressEvent {
   kind: 'tool_use';
@@ -57,11 +67,8 @@ const MCP_CONFIG_STALE_MS = 60 * 60 * 1000;
 const DEFAULT_MODEL = 'claude-haiku-4-5';
 const DEFAULT_TIMEOUT_MS = 60_000;
 
-/** За какое окно fallbackStats() считает исходы запасного пути (для алерта). */
-const FALLBACK_STATS_WINDOW_MS = 15 * 60_000;
-
-/** Встроенные тулы без последствий: их вызов повтор на Qwen не запрещает —
- *  ни в stream-json (где вызов виден), ни вслепую в json-режиме. */
+/** Встроенные тулы без последствий: их вызов повтор у другого провайдера не
+ *  запрещает — ни в stream-json (где вызов виден), ни вслепую в json-режиме. */
 const SIDE_EFFECT_FREE_TOOLS: ReadonlySet<string> = new Set(['Read', 'WebSearch', 'WebFetch']);
 
 /** Результат одного запуска CLI (внутренний): toolUsed — как у ClaudeCliCallError. */
@@ -74,8 +81,8 @@ interface CliRunResult {
 /**
  * Ошибка вызова CLI. toolUsed — модель успела вызвать инструмент с
  * последствиями (не Read/WebSearch/WebFetch) до сбоя; виден только в
- * stream-json. Такой вызов на Qwen не повторяется: инструмент с последствиями
- * (правка продукта, жалоба в поддержку) сработал бы дважды.
+ * stream-json. Такой вызов у другого провайдера не повторяется: инструмент с
+ * последствиями (правка продукта, жалоба в поддержку) сработал бы дважды.
  */
 export class ClaudeCliCallError extends Error {
   constructor(message: string, readonly toolUsed: boolean) {
@@ -102,8 +109,9 @@ export interface ClaudeCliOptions {
    *  Если задан — CLI идёт в stream-json с --include-partial-messages, и каждый
    *  text_delta уходит сюда; итоговый текст по-прежнему возвращает textWithCost.
    *  Куски вложенных суб-агентов (у события есть parent_tool_use_id) сюда не
-   *  попадают — только текст основного ответа. Такой вызов не повторяется на
-   *  Qwen: показанный человеку текст повтор не заберёт обратно. */
+   *  попадают — только текст основного ответа. Такой вызов у другого
+   *  провайдера не повторяется: показанный человеку текст повтор не заберёт
+   *  обратно. */
   onTextDelta?: (text: string) => void;
   /** Рабочая директория Claude. По умолчанию os.tmpdir(). Для агентных
    *  сценариев (Bash/Write/Edit) передавай изолированный sandbox-dir. */
@@ -139,14 +147,15 @@ export interface ClaudeCliOptions {
    *  кладёт в allowedTools сам — без этого в -p вызов отклоняется
    *  («...you haven't granted it yet»). */
   mcpServers?: Record<string, ClaudeCliMcpHttpServer>;
-  /** Только Claude, без запасного пути на Qwen. Для проверок живости Claude:
-   *  с запасным путём они показывали бы «зелёный», когда Claude лежит. Сбой
-   *  такого вызова предохранитель не открывает, успех — закрывает. */
+  /** Только Claude: без запасных и без выбора пользователя. Для проверок
+   *  живости Claude: с запасными они показывали бы «зелёный», когда Claude
+   *  лежит. Сбой такого вызова окно Claude не открывает, успех — закрывает. */
   noFallback?: boolean;
-  /** Выбор пользователя в админке (UserLlmProviderService): 'qwen' — вызов
-   *  сразу на Qwen, без попытки Claude. Не авария: окно предохранителя и
-   *  fallbackStats не трогаются. Без ключа и при noFallback — обычный Claude. */
-  provider?: 'qwen';
+  /** Выбор пользователя в админке (UserLlmProviderService): вызов сразу у
+   *  выбранного запасного, при его сбое — обычный путь (Claude, затем запасные
+   *  без него; spec 2026-10-31-kimi-provider-design.md). Не авария: окно Claude
+   *  и аварийные счётчики он не трогает. Без ключа и при noFallback — обычный путь. */
+  provider?: FallbackProvider;
   /** Без флага CLI пишет весь промпт (систему, реплики, ответ) в
    *  ~/.claude/projects/<cwd>/<uuid>.jsonl и хранит cleanupPeriodDays
    *  (по умолчанию 30 дней). При true добавляет --no-session-persistence —
@@ -161,15 +170,9 @@ export interface ClaudeCliOptions {
 export class ClaudeCliService implements OnModuleInit {
   private readonly logger = new Logger(ClaudeCliService.name);
   private readonly claudeBin = process.env.CLAUDE_BIN ?? '/usr/bin/claude';
-  /** До какого момента (Date.now()) вызовы идут сразу на Qwen, не пробуя
-   *  Claude: на 429/529 CLI сам долго повторяет запрос, и без окна каждый ход
-   *  ждал бы этого заново. 0 — окно закрыто. */
-  private breakerOpenUntil = 0;
-  /** Когда окно открыли в последний раз. Успех вызова Claude, начатого раньше,
-   *  окно не закрывает: он не говорит, что Claude ожил после того сбоя. */
-  private breakerOpenedAt = 0;
-  /** Исходы запасных вызовов за последние FALLBACK_STATS_WINDOW_MS. */
-  private fallbackOutcomes: Array<{ at: number; ok: boolean }> = [];
+  /** Окна запасного пути (окно Claude и «не отвечает» у каждого запасного) и
+   *  исходы аварийных вызовов — llm-fallback.ts. */
+  private readonly fallback = new FallbackState();
 
   // Direct PG insert (not EventsService) because ClaudeCliService lives in
   // CommonModule and EventsService lives in EventsModule which imports
@@ -276,7 +279,10 @@ export class ClaudeCliService implements OnModuleInit {
     }
   }
 
-  private trackCallEvent(opts: { costUsd: number; model: string; durationMs: number; ok: boolean; provider: 'claude' | 'qwen'; fallback: boolean }) {
+  private trackCallEvent(opts: {
+    costUsd: number; model: string; durationMs: number; ok: boolean;
+    provider: AnswerProvider; fallback: boolean; selected?: FallbackProvider;
+  }) {
     if (!this.pg) return;
     this.pg.query(
       `INSERT INTO events (name, props) VALUES ('claude_cli_call', $1::jsonb)`,
@@ -287,40 +293,42 @@ export class ClaudeCliService implements OnModuleInit {
         ok: opts.ok,
         provider: opts.provider,
         fallback: opts.fallback,
+        // Выбор пользователя (не Claude); «выбранный подвёл» — selected ≠ provider.
+        selected: opts.selected,
       })],
     ).catch((e: any) => this.logger.warn(`claude_cli_call event insert failed: ${e.message}`));
   }
 
-  /** Состояние запасного пути — для алерта мониторинга. */
+  /** Состояние запасного пути — для алертов мониторинга и пробы без входа.
+   *  enabled/ok/failed — по всем запасным вместе (прежняя форма),
+   *  breakerOpenUntil — окно Claude, providers — по каждому. */
   fallbackStats(now: number = Date.now()): {
     enabled: boolean; ok: number; failed: number; breakerOpenUntil: number; windowMs: number;
+    providers: Record<FallbackProvider, { enabled: boolean; ok: number; failed: number; downUntil: number }>;
   } {
-    this.pruneFallbackOutcomes(now);
-    const ok = this.fallbackOutcomes.filter((o) => o.ok).length;
+    const configs = readFallbackConfigs();
+    const providers = {} as Record<FallbackProvider, { enabled: boolean; ok: number; failed: number; downUntil: number }>;
+    let ok = 0;
+    let failed = 0;
+    for (const name of FALLBACK_ORDER) {
+      const c = this.fallback.counts(name, now);
+      providers[name] = { enabled: configs[name] !== null, ok: c.ok, failed: c.failed, downUntil: this.fallback.downUntilOf(name, now) };
+      ok += c.ok;
+      failed += c.failed;
+    }
     return {
-      enabled: !!readQwenFallbackConfig(),
+      enabled: FALLBACK_ORDER.some((n) => configs[n] !== null),
       ok,
-      failed: this.fallbackOutcomes.length - ok,
-      windowMs: FALLBACK_STATS_WINDOW_MS, // за какое окно посчитаны ok/failed
-      // Истёкшее окно — закрытое: 0, а не момент в прошлом.
-      breakerOpenUntil: this.breakerOpenUntil > now ? this.breakerOpenUntil : 0,
+      failed,
+      windowMs: STATS_WINDOW_MS,
+      breakerOpenUntil: this.fallback.claudeWindowUntil(now),
+      providers,
     };
-  }
-
-  private noteFallbackOutcome(ok: boolean): void {
-    const now = Date.now();
-    this.fallbackOutcomes.push({ at: now, ok });
-    this.pruneFallbackOutcomes(now);
-  }
-
-  private pruneFallbackOutcomes(now: number): void {
-    const from = now - FALLBACK_STATS_WINDOW_MS;
-    this.fallbackOutcomes = this.fallbackOutcomes.filter((o) => o.at >= from);
   }
 
   /**
    * Разовый запрос к Claude CLI: текст ответа и стоимость. При сбое доступа к
-   * Claude ответ может дать запасной Qwen (см. runRaw).
+   * Claude ответ может дать запасной провайдер (см. runRaw).
    */
   async textWithCost(prompt: string, opts: ClaudeCliOptions = {}): Promise<{ text: string; costUsd: number }> {
     const res = await this.runRaw(prompt, opts);
@@ -329,7 +337,7 @@ export class ClaudeCliService implements OnModuleInit {
 
   /**
    * Разовый запрос к Claude CLI: текст ответа. При сбое доступа к Claude ответ
-   * может дать запасной Qwen (см. runRaw).
+   * может дать запасной провайдер (см. runRaw).
    * Бросает при падении процесса или ненулевом коде выхода.
    */
   async text(prompt: string, opts: ClaudeCliOptions = {}): Promise<string> {
@@ -338,161 +346,153 @@ export class ClaudeCliService implements OnModuleInit {
   }
 
   /**
-   * Claude, при сбое доступа — тот же вызов на Qwen (spec
-   * 2026-10-29-qwen-fallback-design.md). Без ключа QWEN_FALLBACK_API_KEY и с
-   * noFallback — ровно прежнее поведение.
+   * План попыток (spec 2026-10-31-kimi-provider-design.md, раздел 3): выбор
+   * пользователя, Claude, запасные Qwen → Kimi в порядке цепочки. Без ключей
+   * запасных и с noFallback — ровно один вызов Claude, как раньше.
    */
   private async runRaw(prompt: string, opts: ClaudeCliOptions): Promise<CliRunResult> {
-    const qwen = opts.noFallback ? null : readQwenFallbackConfig();
-    // Выбор пользователя (админка): ответы сразу через Qwen, без попытки Claude.
-    if (opts.provider === 'qwen') {
-      if (qwen) return this.runForcedQwen(prompt, opts, qwen);
-      if (!opts.noFallback) {
-        this.logger.warn('Qwen выбран для пользователя, но ключ QWEN_FALLBACK_API_KEY не задан — вызов идёт на Claude');
-      }
+    const configs = opts.noFallback ? NO_FALLBACK_CONFIGS : readFallbackConfigs();
+    // Выбор пользователя (админка): сразу выбранный, при его сбое — обычный путь.
+    let selected: FallbackProvider | undefined;
+    if (opts.provider && !opts.noFallback) {
+      // Проверка истинностью: незнакомое значение (не qwen/kimi) даёт undefined —
+      // обычный путь без предупреждения; так же его отсекает planProviders.
+      if (configs[opts.provider]) selected = opts.provider;
+      else if (opts.provider in PROVIDER_DEFAULTS) this.logger.warn(`${PROVIDER_LABELS[opts.provider]} выбран для пользователя, но ключ ${PROVIDER_DEFAULTS[opts.provider].envPrefix}_FALLBACK_API_KEY не задан — обычный путь`);
     }
-    if (qwen && Date.now() < this.breakerOpenUntil) {
-      return this.runOnQwen(prompt, opts, qwen, null);
-    }
+    const plan = planProviders({ selected, configs, state: this.fallback, noFallback: opts.noFallback });
+    const breakerMs = readBreakerMs();
     const startedAt = Date.now();
-    let res: CliRunResult;
-    try {
-      res = await this.runOnce(prompt, opts, null);
-    } catch (e: any) {
-      if (!qwen) throw e;
-      const retryOpts = this.planQwenRetry(e, opts, qwen, startedAt);
-      if (!retryOpts) throw e;
-      return this.runOnQwen(prompt, retryOpts, qwen, e);
-    }
-    // Отказ CLI, пришедший обычным ответом (без is_error): с ключом — такой же
-    // сбой доступа, как ошибка. Если ключа нет или повторить нельзя —
-    // вызывающий получает тот же текст, что и раньше. Окно такой «успех» не
-    // закрывает никогда (и у пробы с noFallback): Claude на деле не ответил.
-    if (looksLikeCliRefusal(res.text)) {
-      if (qwen) {
-        const refusal = new ClaudeCliCallError(`claude CLI error: ${res.text.trim()}`, res.toolUsed);
-        const retryOpts = this.planQwenRetry(refusal, opts, qwen, startedAt);
-        if (retryOpts) return this.runOnQwen(prompt, retryOpts, qwen, refusal);
+    // Причины по попыткам — для текста ошибки, если не ответит никто.
+    const parts: string[] = plan[0] !== 'claude' && plan[0] !== selected
+      ? ['claude CLI пропущен (окно запасного пути)']
+      : [];
+    let reachedFallback = false;
+    let attemptOpts = opts;
+    for (let i = 0; i < plan.length; ) {
+      const p = plan[i];
+      const emergency = p !== 'claude' && p !== selected;
+      if (emergency) reachedFallback = true;
+      const attemptStartedAt = Date.now();
+      let res: CliRunResult | null = null;
+      let err: unknown = null;
+      try {
+        res = await this.runOnce(prompt, attemptOpts, p === 'claude' ? null : configs[p], { fallback: emergency, selected });
+      } catch (e) {
+        err = e;
       }
-      return res;
+      // Отказ CLI, пришедший обычным ответом (без is_error), — сбой того
+      // провайдера, что его дал; окно Claude такой «успех» не закрывает.
+      const refusal = res !== null && looksLikeCliRefusal(res.text);
+      if (res !== null && !refusal) {
+        if (p === 'claude') this.fallback.claudeSucceeded(attemptStartedAt);
+        else {
+          this.fallback.markUp(p);
+          if (emergency) this.fallback.recordOutcome(p, true);
+        }
+        return res;
+      }
+      if (refusal) err = new ClaudeCliCallError(`claude CLI error: ${res!.text.trim()}`, res!.toolUsed);
+      const msg = String((err as any)?.message ?? err);
+      const access = isFallbackWorthy(msg);
+      const kind = classifyLlmError(msg).kind;
+      // Сбой доступа — свидетельство для следующих вызовов, даже если этот
+      // повторять нельзя: у Claude — окно Claude (если есть на кого
+      // переключаться), у запасного — его окно «не отвечает».
+      if (access) {
+        if (p !== 'claude') this.fallback.markDown(p, breakerMs);
+        else if (FALLBACK_ORDER.some((n) => configs[n] !== null)) this.fallback.openClaudeWindow(breakerMs);
+      }
+      if (emergency) this.fallback.recordOutcome(p, false);
+      parts.push(parts.length === 0 ? (p === selected ? `${p} (выбран): ${msg}` : msg) : `${p} fallback: ${msg}`);
+      const next = this.nextAttempt(plan, i);
+      // Выбранный — при любом сбое (решение владельца), остальные — только при
+      // сбое доступа; и только если повтор ничего не задвоит.
+      const allowed = (p === selected || access) && this.mayRetry(err, opts);
+      if (next < 0 || !allowed) {
+        if (access && next >= 0) {
+          this.logger.warn(`${this.attemptLabel(p, selected)}: сбой доступа (${kind}), вызов не повторяется (инструмент с последствиями или показанный текст): ${msg.slice(0, 200)}`);
+        }
+        if (reachedFallback) {
+          // Вызов дошёл до запасных, и никто не ответил: Claude мог уже ожить —
+          // следующий вызов снова попробует его.
+          this.fallback.closeClaudeWindow();
+          this.logger.error(`запасные тоже не ответили: ${parts.join(' | ').slice(0, 300)}`);
+        }
+        if (parts.length === 1) {
+          // Одна попытка — как раньше: отказ текстом вызывающий получает как
+          // есть, ошибку Claude — исходным объектом.
+          if (refusal) return res!;
+          if (p === 'claude') throw err;
+        }
+        throw new Error(parts.join(' | '));
+      }
+      const target = plan[next];
+      const toLabel = target === 'claude'
+        ? 'Claude'
+        : `запасной ${PROVIDER_LABELS[target]} ${fallbackModelFor(opts.model ?? DEFAULT_MODEL, configs[target]!.models)}`;
+      this.logger.warn(`${this.attemptLabel(p, selected)} → ${toLabel} (${kind}): ${msg.slice(0, 200)}`);
+      // Следующая попытка укладывается в остаток бюджета вызова, а не в полный.
+      attemptOpts = { ...opts, timeoutMs: fallbackTimeoutMs(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, Date.now() - startedAt) };
+      i = next;
     }
-    // Claude ответил (в том числе проба с noFallback) — окно закрыто. Кроме
-    // успеха вызова, начатого до открытия окна: о Claude после того сбоя он
-    // ничего не говорит.
-    if (startedAt >= this.breakerOpenedAt) this.breakerOpenUntil = 0;
-    return res;
+    throw new Error(parts.join(' | ') || 'claude CLI: пустой план попыток');
   }
 
-  /**
-   * Сбой попытки Claude — ошибка или отказ, пришедший ответом. Подходящий вид
-   * (вход, лимит, перегрузка) открывает окно, даже если сам вызов повторять
-   * нельзя: это свидетельство «Claude сейчас недоступен», следующие вызовы
-   * пойдут сразу на Qwen. Отдаёт опции запасного вызова, если его можно
-   * повторить, иначе null.
-   */
-  private planQwenRetry(
-    e: unknown,
-    opts: ClaudeCliOptions,
-    qwen: QwenFallbackConfig,
-    startedAt: number,
-  ): ClaudeCliOptions | null {
-    const msg = String((e as any)?.message ?? e);
-    if (!isFallbackWorthy(msg)) return null;
-    const kind = classifyLlmError(msg).kind;
-    this.breakerOpenedAt = Date.now();
-    this.breakerOpenUntil = this.breakerOpenedAt + qwen.breakerMs;
-    if (!this.mayRetryOnQwen(e, opts)) {
-      this.logger.warn(`claude CLI: сбой доступа (${kind}) — окно запасного пути открыто, сам вызов не повторяется (инструменты): ${msg.slice(0, 200)}`);
-      return null;
-    }
-    const qwenModel = qwenModelFor(opts.model ?? DEFAULT_MODEL, qwen.models);
-    this.logger.warn(`claude CLI → запасной Qwen ${qwenModel} (${kind}): ${msg.slice(0, 200)}`);
-    // Запасной вызов укладывается в остаток бюджета вызова, а не в полный.
-    const timeoutMs = fallbackTimeoutMs(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, Date.now() - startedAt);
-    return { ...opts, timeoutMs };
+  /** Подпись попытки в логе: «claude CLI», «Kimi (выбран)», «Qwen». */
+  private attemptLabel(p: AnswerProvider, selected?: FallbackProvider): string {
+    if (p === 'claude') return 'claude CLI';
+    return p === selected ? `${PROVIDER_LABELS[p]} (выбран)` : PROVIDER_LABELS[p];
   }
 
-  /** Можно ли повторить на Qwen вызов, упавший по сбою доступа (вид сбоя
-   *  planQwenRetry уже проверил): только если модель ещё ничего не сделала
-   *  инструментами с последствиями. */
-  private mayRetryOnQwen(e: unknown, opts: ClaudeCliOptions): boolean {
+  /** Следующий в плане после i: запасной, который за время вызова стал «не
+   *  отвечает» (его уронил параллельный вызов), пропускается. -1 — некуда. */
+  private nextAttempt(plan: AnswerProvider[], i: number): number {
+    for (let j = i + 1; j < plan.length; j++) {
+      const p = plan[j];
+      if (p !== 'claude' && this.fallback.isDown(p)) continue;
+      return j;
+    }
+    return -1;
+  }
+
+  private static hasMcp(opts: ClaudeCliOptions): boolean {
+    return !!opts.mcpServers && Object.keys(opts.mcpServers).length > 0;
+  }
+
+  /** Можно ли повторить вызов у следующего провайдера: только если модель ещё
+   *  ничего не сделала инструментами с последствиями и человек не видел текста. */
+  private mayRetry(e: unknown, opts: ClaudeCliOptions): boolean {
     if (e instanceof ClaudeCliCallError && e.toolUsed) return false;
     // Человек уже видит куски ответа — второй, другой ответ поверх них хуже ошибки.
     if (opts.onTextDelta) return false;
     // Без stream-json вызов инструмента не виден: вслепую повторяем, только
-    // если последствий быть не может — нет MCP, а встроенные тулы лишь из
-    // Read/WebSearch/WebFetch (Bash, Write, Edit, 'default' — нельзя).
-    if (!opts.onProgress) {
-      const hasMcp = !!opts.mcpServers && Object.keys(opts.mcpServers).length > 0;
+    // если встроенные тулы лишь из Read/WebSearch/WebFetch (Bash, Write, Edit,
+    // 'default' — нельзя). Вызовы с MCP всегда идут в stream-json (spawnClaude).
+    if (!opts.onProgress && !ClaudeCliService.hasMcp(opts)) {
       const riskyTools = (opts.tools ?? '')
         .split(/[\s,]+/)
         .some((t) => t !== '' && !SIDE_EFFECT_FREE_TOOLS.has(t));
-      if (hasMcp || riskyTools) return false;
+      if (riskyTools) return false;
     }
     return true;
   }
 
-  /** Принудительный Qwen (выбор пользователя): окно предохранителя и
-   *  fallbackStats не трогаются — это не авария, а выбор. */
-  private async runForcedQwen(
-    prompt: string,
-    opts: ClaudeCliOptions,
-    qwen: QwenFallbackConfig,
-  ): Promise<CliRunResult> {
-    try {
-      return await this.runOnce(prompt, opts, qwen, false);
-    } catch (qe: any) {
-      const qmsg = String(qe?.message ?? qe);
-      this.logger.error(`Qwen (выбран для пользователя) упал: ${qmsg.slice(0, 200)}`);
-      throw new Error(`claude CLI не вызывался (выбран Qwen) | qwen: ${qmsg}`);
-    }
-  }
-
-  private async runOnQwen(
-    prompt: string,
-    opts: ClaudeCliOptions,
-    qwen: QwenFallbackConfig,
-    claudeError: unknown | null,
-  ): Promise<CliRunResult> {
-    try {
-      const res = await this.runOnce(prompt, opts, qwen);
-      this.noteFallbackOutcome(true);
-      return res;
-    } catch (qe: any) {
-      this.noteFallbackOutcome(false);
-      // Любой сбой Qwen окно закрывает — не только «Qwen лежит» (ключ отозван,
-      // кредиты кончились, 429 от Alibaba), но и таймаут длинного хода, отказ
-      // на вложении и т.п.: держать окно на неработающем Qwen хуже, Claude мог
-      // уже ожить. Цена осознанная: при шторме 529 у Claude сбой Qwen на
-      // конкретном запросе вернёт следующие вызовы в долгие повторы CLI на Claude.
-      this.breakerOpenUntil = 0;
-      const qmsg = String(qe?.message ?? qe);
-      this.logger.error(`запасной Qwen тоже упал: ${qmsg.slice(0, 200)}`);
-      // Причина Claude — первой, чтобы её было видно в логе и тексте ошибки;
-      // вид по classifyLlmError считается по всей строке (приоритет
-      // weekly_limit → rate_limit → auth → …).
-      const head = claudeError
-        ? String((claudeError as any)?.message ?? claudeError)
-        : 'claude CLI пропущен (окно запасного пути)';
-      throw new Error(`${head} | qwen fallback: ${qmsg}`);
-    }
-  }
-
-  /** Один запуск CLI: qwen = null — Claude, иначе — модель и окружение Alibaba. */
+  /** Один запуск CLI: cfg = null — Claude, иначе — модель и окружение запасного. */
   private async runOnce(
     prompt: string,
     opts: ClaudeCliOptions,
-    qwen: QwenFallbackConfig | null,
-    fallback: boolean = qwen !== null,
+    cfg: FallbackConfig | null,
+    meta: { fallback: boolean; selected?: FallbackProvider },
   ): Promise<CliRunResult> {
     // Одноразовые каталоги вызова (создаются только когда нужны — см. ниже):
     // копии вложений и конфиг MCP с токенами. Снимаются в finally — и на успехе,
     // и на падении, и по таймауту, — чтобы не копить в tmp ни чужих файлов, ни
-    // живых токенов. У запасного запуска — свои: каталоги упавшей попытки
-    // к этому моменту уже сняты.
+    // живых токенов. У следующей попытки — свои: каталоги упавшей к этому
+    // моменту уже сняты.
     const perCallTmpDirs: string[] = [];
     try {
-      return await this.spawnClaude(prompt, opts, (dir) => { perCallTmpDirs.push(dir); }, qwen, fallback);
+      return await this.spawnClaude(prompt, opts, (dir) => { perCallTmpDirs.push(dir); }, cfg, meta);
     } finally {
       for (const dir of perCallTmpDirs) {
         try { fs.rmSync(dir, { recursive: true, force: true }); }
@@ -527,18 +527,21 @@ export class ClaudeCliService implements OnModuleInit {
     prompt: string,
     opts: ClaudeCliOptions,
     registerTmpDir: (dir: string) => void,
-    qwen: QwenFallbackConfig | null,
-    fallback: boolean,
+    cfg: FallbackConfig | null,
+    meta: { fallback: boolean; selected?: FallbackProvider },
   ): Promise<CliRunResult> {
     const requestedModel = opts.model ?? DEFAULT_MODEL;
-    // На запасном пути в --model уходит модель Qwen: полный id Claude Alibaba не знает.
-    const model = qwen ? qwenModelFor(requestedModel, qwen.models) : requestedModel;
-    const provider: 'claude' | 'qwen' = qwen ? 'qwen' : 'claude';
+    // У запасного в --model уходит его модель: полный id Claude он не знает.
+    const model = cfg ? fallbackModelFor(requestedModel, cfg.models) : requestedModel;
+    const provider: AnswerProvider = cfg ? cfg.name : 'claude';
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const streaming = !!opts.onProgress || !!opts.onTextDelta;
 
     const hasAttachments = (opts.attachments?.length ?? 0) > 0;
-    const hasMcp = !!opts.mcpServers && Object.keys(opts.mcpServers).length > 0;
+    const hasMcp = ClaudeCliService.hasMcp(opts);
+    // stream-json — и у вызовов с MCP (Маша): там видно, вызывала ли модель
+    // инструмент, а от этого зависит, можно ли повторить вызов у другого
+    // провайдера (mayRetry). В json-режиме такой вызов не повторялся бы никогда.
+    const streaming = !!opts.onProgress || !!opts.onTextDelta || hasMcp;
 
     // ── cwd и ссылки на вложения ──────────────────────────────────────────
     // Безопасность (25.09.2026): вложения раньше подставлялись в промпт как
@@ -677,11 +680,11 @@ export class ClaudeCliService implements OnModuleInit {
 
     return new Promise<CliRunResult>((resolve, reject) => {
       // Обычный запуск наследует process.env как есть; запасной получает своё
-      // окружение (адрес и ключ Alibaba) — и только он.
+      // окружение (адрес и ключ провайдера) — и только он.
       const proc = spawn(this.claudeBin, args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         cwd: spawnCwd,
-        ...(qwen ? { env: qwenSpawnEnv(process.env, qwen) } : {}),
+        ...(cfg ? { env: fallbackSpawnEnv(process.env, cfg) } : {}),
       });
       let stdout = '';
       let stderr = '';
@@ -693,7 +696,7 @@ export class ClaudeCliService implements OnModuleInit {
       const outDecoder = new StringDecoder('utf8');
       const errDecoder = new StringDecoder('utf8');
       // Вызвала ли модель инструмент с последствиями (не Read/WebSearch/WebFetch)
-      // до сбоя — решает, можно ли повторить на Qwen.
+      // до сбоя — решает, можно ли повторить у другого провайдера.
       let sawRiskyToolUse = false;
       // Вызов уже отклонён или разрешён — дальнейшие данные от процесса (он
       // может ещё писать в stdout после kill('SIGTERM') по таймауту) больше не
@@ -784,7 +787,7 @@ export class ClaudeCliService implements OnModuleInit {
             return;
           }
           if (streamCostUsd) {
-            this.logger.debug(`claude CLI cost${qwen ? ' (qwen)' : ''}: $${streamCostUsd.toFixed(4)}, ${streamDurationMs}ms (stream)`);
+            this.logger.debug(`claude CLI cost${cfg ? ` (${cfg.name})` : ''}: $${streamCostUsd.toFixed(4)}, ${streamDurationMs}ms (stream)`);
           }
           this.trackCallEvent({
             costUsd: streamCostUsd,
@@ -792,7 +795,8 @@ export class ClaudeCliService implements OnModuleInit {
             durationMs: streamDurationMs,
             ok: true,
             provider,
-            fallback,
+            fallback: meta.fallback,
+            selected: meta.selected,
           });
           // stripWordJoiner на выходе: U+2060, которым мы обезвреживали
           // @-упоминания во входе, не должен доехать до пользователя.
@@ -826,7 +830,7 @@ export class ClaudeCliService implements OnModuleInit {
           const text: string = stripWordJoiner(json.result ?? '');
           const costUsd: number = typeof json.total_cost_usd === 'number' ? json.total_cost_usd : 0;
           if (costUsd) {
-            this.logger.debug(`claude CLI cost${qwen ? ' (qwen)' : ''}: $${costUsd.toFixed(4)}, ${json.duration_ms}ms`);
+            this.logger.debug(`claude CLI cost${cfg ? ` (${cfg.name})` : ''}: $${costUsd.toFixed(4)}, ${json.duration_ms}ms`);
           }
           this.trackCallEvent({
             costUsd,
@@ -834,10 +838,11 @@ export class ClaudeCliService implements OnModuleInit {
             durationMs: Number(json.duration_ms) || 0,
             ok: true,
             provider,
-            fallback,
+            fallback: meta.fallback,
+            selected: meta.selected,
           });
           // В json-режиме вызов инструмента не виден: toolUsed всегда false,
-          // осторожность — в mayRetryOnQwen по набору тулов и MCP.
+          // осторожность — в mayRetry по набору тулов.
           settled = true;
           resolve({ text, costUsd, toolUsed: sawRiskyToolUse });
         } catch (e: any) {
