@@ -188,17 +188,21 @@ export class GuestSessionsService {
         WHERE name = 'guest_trial_error' AND ts > now() - interval '7 days'
         GROUP BY 1`,
     );
-    for (const reason of KNOWN_ERROR_REASONS) {
+    for (const reason of [...KNOWN_ERROR_REASONS, 'other']) {
       out[`guest_trial_error_${reason}_day`] = 0;
       out[`guest_trial_error_${reason}_week`] = 0;
     }
     for (const row of err.rows) {
-      // Ревью A10: events/track открыта, reason — из props, чужой ввод.
-      // Опечатка/подделка не должна заводить новый ключ статистики — цифры
-      // воронки не должно быть видно отличить от «такого отказа не было».
-      if (!KNOWN_ERROR_REASONS.includes(row.reason)) continue;
-      out[`guest_trial_error_${row.reason}_day`] = row.day;
-      out[`guest_trial_error_${row.reason}_week`] = row.week;
+      // Подделку (чужой props.reason через events/track) отсекает сама
+      // events.controller — guest_trial_error входит в GUEST_SERVER_EVENTS и
+      // пишется только сервером. Незнакомая причина здесь — новый вид отказа
+      // в коде, которого ещё нет в KNOWN_ERROR_REASONS: копим её в общий
+      // guest_trial_error_other, а не роняем молча — иначе появление новой
+      // причины осталось бы незаметным. += (не =): несколько разных
+      // незнакомых причин суммируются в один и тот же ключ other.
+      const key = KNOWN_ERROR_REASONS.includes(row.reason) ? row.reason : 'other';
+      out[`guest_trial_error_${key}_day`] += row.day;
+      out[`guest_trial_error_${key}_week`] += row.week;
     }
     // Возраст самой старой неперенесённой пробы — 0, если таких нет. Если
     // уборка (guest-trial.cron.ts) сломана, число растёт без остановки —

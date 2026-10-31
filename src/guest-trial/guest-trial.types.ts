@@ -9,7 +9,13 @@ export type GuestMode = 'off' | 'preview' | 'on';
 export interface GuestLimits {
   /** Ответов ассистента до просьбы войти. */
   answersPerTrial: number;
-  /** Длина одного сообщения гостя, знаков. */
+  /**
+   * Длина одного сообщения гостя, знаков. Фактический потолок сверху —
+   * срез slice(0, 20000) в parseGuestTurnInput (guest-turn.service.ts) и
+   * тело запроса ≤ 64 КБ на /webhook/guest (main.ts): ставить maxChars
+   * больше этого бессмысленно — более длинное сообщение обрежется молча,
+   * без ошибки клиенту.
+   */
   maxChars: number;
   trialsPerHour: number;
   trialsPerDay: number;

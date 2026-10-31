@@ -168,13 +168,19 @@ maybe('пробы и сообщения против живого Postgres', () 
     expect(s.cost_usd_week).toBeCloseTo(0.1, 4);
   });
 
-  it('статистика: чужая/опечатанная причина отказа не заводит новый ключ', async () => {
+  // Подделку (чужой reason через events/track) отсекает events.controller —
+  // guest_trial_error пишет только сервер. Незнакомая причина здесь — новый
+  // вид отказа в коде, которого ещё нет в KNOWN_ERROR_REASONS: должна быть
+  // видна в общем guest_trial_error_other, а не теряться молча.
+  it('статистика: незнакомая причина отказа копится в guest_trial_error_other, не заводит свой ключ', async () => {
     await pool.query(
       `INSERT INTO events (name, ts, props) VALUES ('guest_trial_error', now(), '{"reason":"evil"}'::jsonb)`,
     );
     const s = await svc.status();
     expect(s).not.toHaveProperty('guest_trial_error_evil_day');
     expect(s).not.toHaveProperty('guest_trial_error_evil_week');
+    expect(s.guest_trial_error_other_day).toBe(1);
+    expect(s.guest_trial_error_other_week).toBe(1);
   });
 
   it('статистика: возраст самой старой неперенесённой пробы — 0 без проб, иначе дни с последнего сообщения', async () => {
