@@ -22,7 +22,7 @@ import {
   type GoogleDeps,
   type ImageInput,
 } from './google';
-import { speechCheck } from './match';
+import { MATCHER_VERSION, speechCheck } from './match';
 import { recognize, speechAudio } from './stt';
 
 const run = promisify(execFile);
@@ -79,6 +79,20 @@ const FINGERPRINT = /^[0-9a-z-]+$/;
  * повтор новых денег не стоит.
  */
 class StorageError extends StudioError {}
+
+/**
+ * Пометка брака рядом с skits/<отпечаток>/rejected-*.mp4. По ней студия решает,
+ * перепроверять ли брак до новой оплаты (reviveRejected): сверка поменялась
+ * (matcher меньше MATCHER_VERSION) — да, плохой файл (clip_invalid) — нет.
+ */
+export interface RejectedMeta {
+  code: 'clip_invalid' | 'speech_mismatch';
+  /** Версия сверки, которая забраковала клип или последней его перепроверила. */
+  matcher: number;
+  /** Что распознал SpeechKit — у speech_mismatch. */
+  heard?: string;
+  share?: number;
+}
 
 /** Запись через временный файл: обрыв посреди записи не оставит обрезанный клип, кадр или счёт секунд. */
 function writeAtomic(file: string, data: string | Buffer): void {
@@ -227,6 +241,15 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     }
   };
 
+  /** Пометка брака — подсказка перепроверке, не счёт денег: не записалась — брак перепроверится полной проверкой. */
+  const writeRejectedMeta = (file: string, meta: RejectedMeta): void => {
+    try {
+      writeAtomic(file, JSON.stringify(meta, null, 2));
+    } catch (e) {
+      log(`animate: пометка брака ${path.basename(file)} не записалась — ${failText(e)}`);
+    }
+  };
+
   const reusable = (kind: SkitKind): boolean => {
     const prev = anim.skits[kind];
     return !!prev && prev.fingerprint === plans[kind].fingerprint && prev.post === post && fs.existsSync(abs(prev.clip));
@@ -302,7 +325,7 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     const raw = abs(skitFile(kind, 'raw.mp4'));
     const clip = skitFile(kind, 'clip.mp4');
     const next = abs(skitFile(kind, 'clip.next.mp4'));
-    const reject = async (code: 'clip_invalid' | 'speech_mismatch', msg: string): Promise<never> => {
+    const reject = async (code: RejectedMeta['code'], msg: string, speech?: { heard: string; share: number }): Promise<never> => {
       fs.rmSync(next, { force: true });
       if (accepted) {
         // Принятый клип не бракуется молча: владелец его уже видел, а пересъёмка стоит денег.
@@ -313,8 +336,10 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
           false,
         );
       }
-      // Брак откладывается, а не удаляется: после подстройки порогов его можно перепроверить.
-      fs.renameSync(raw, abs(skitFile(kind, `rejected-${new Date().toISOString().replace(/[:.]/g, '-')}.mp4`)));
+      // Брак откладывается, а не удаляется: после правки сверки студия перепроверит его до новой оплаты (reviveRejected).
+      const base = skitFile(kind, `rejected-${new Date().toISOString().replace(/[:.]/g, '-')}`);
+      fs.renameSync(raw, abs(`${base}.mp4`));
+      writeRejectedMeta(abs(`${base}.json`), { code, matcher: MATCHER_VERSION, ...speech });
       fs.rmSync(abs(clip), { force: true });
       // И из хранилища: брак, восстановленный следующим захватом, снова прошёл бы
       // сверку — или сошёл бы за клип запущенной генерации.
@@ -346,7 +371,7 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
         const why = check.silentLines.length
           ? `не услышаны реплики ${check.silentLines.map((i) => i + 1).join(', ')}`
           : `речь не сошлась с репликами (${Math.round(check.share * 100)}%)`;
-        await reject('speech_mismatch', `${why}, услышано: «${heard.slice(0, 200)}»`);
+        await reject('speech_mismatch', `${why}, услышано: «${heard.slice(0, 200)}»`, { heard, share: check.share });
       }
       share = check.share;
     }
