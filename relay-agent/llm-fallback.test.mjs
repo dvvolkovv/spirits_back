@@ -180,6 +180,56 @@ test("errorsText: нет массива errors — пустая строка", (
   }
 });
 
+const DIAG = "[ede_diagnostic] result_type=user last_content_type=tool_result stop_reason=null";
+
+test("safeErrorDetail: status N — только целое 100…599", () => {
+  assert.equal(l.safeErrorDetail({ type: "result", is_error: true, api_error_status: 500 }), "status 500");
+  for (const st of ["500", "abc", 99, 600, 500.5, NaN, null, true, {}]) {
+    assert.equal(l.safeErrorDetail({ type: "result", is_error: true, api_error_status: st }), "", String(st));
+  }
+});
+
+test("safeErrorDetail: строка [ede_diagnostic] из errors[] — проходит; со статусом — через «, »", () => {
+  const ev = { type: "result", subtype: "error_during_execution", is_error: true, errors: [DIAG, "Error: Request was aborted."] };
+  assert.equal(l.safeErrorDetail(ev), DIAG);
+  assert.equal(l.safeErrorDetail({ ...ev, api_error_status: 529 }), "status 529, " + DIAG);
+  // Не первым элементом — тоже находится.
+  assert.equal(l.safeErrorDetail({ errors: ["Error: x", DIAG] }), DIAG);
+  // Длинная — не длиннее 160.
+  const long = "[ede_diagnostic]" + " k=v".repeat(100);
+  assert.equal(l.safeErrorDetail({ errors: [long] }), long.slice(0, 160));
+});
+
+test("safeErrorDetail: диагностика с пробелом, кавычкой или переводом строки в значении — не пишется вовсе", () => {
+  for (const bad of [
+    "[ede_diagnostic] result_type=user stop_reason=end turn",
+    '[ede_diagnostic] result_type="user" stop_reason=null',
+    "[ede_diagnostic] result_type=it's stop_reason=null",
+    "[ede_diagnostic] result_type=user\nstop_reason=null",
+    "[ede_diagnostic] result_type=user stop_reason=null ",
+  ]) {
+    assert.equal(l.safeErrorDetail({ errors: [bad] }), "", JSON.stringify(bad));
+    assert.equal(l.safeErrorDetail({ errors: [bad], api_error_status: 500 }), "status 500", JSON.stringify(bad));
+  }
+  // Берётся первая строка с [ede_diagnostic]; не прошла проверку — не ищем дальше.
+  assert.equal(l.safeErrorDetail({ errors: ['[ede_diagnostic] a="x"', DIAG] }), "");
+});
+
+test("safeErrorDetail: ни result, ни обычные строки errors[] (стек с путём файла) в журнал не попадают", () => {
+  assert.equal(l.safeErrorDetail({ type: "result", is_error: true, result: 'API Error: 400 {"message":"bad input: привет"}' }), "");
+  assert.equal(l.safeErrorDetail({
+    type: "result", subtype: "error_during_execution", is_error: true,
+    errors: ["Error: ENOENT: no such file or directory, open '/home/dv/file-agent/uploads/u-1/doc.pdf'\n    at open (/x.js:1:1)"],
+  }), "");
+  assert.equal(l.safeErrorDetail({ type: "result", is_error: true, api_error_status: 400, result: "API Error: 400 bad input" }), "status 400");
+});
+
+test("safeErrorDetail: null, undefined, событие без полей, errors не массив — пустая строка", () => {
+  for (const ev of [null, undefined, {}, { type: "result" }, { errors: DIAG }, { errors: null }]) {
+    assert.equal(l.safeErrorDetail(ev), "", JSON.stringify(ev));
+  }
+});
+
 test("planProviders", () => {
   const cfg = (name) => ({ name, apiKey: "k", baseUrl: "u", models: KIMI_MODELS });
   const both = { qwen: cfg("qwen"), kimi: cfg("kimi") };
