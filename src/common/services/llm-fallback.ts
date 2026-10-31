@@ -203,7 +203,8 @@ export function fallbackSpawnEnv(base: NodeJS.ProcessEnv, cfg: FallbackConfig): 
 export const STATS_WINDOW_MS = 15 * 60_000;
 
 /**
- * Окна запасного пути — на процесс (spec 2026-10-31, раздел 2).
+ * Окна запасного пути — на процесс (spec 2026-10-31-kimi-provider-design,
+ * раздел 2).
  * Окно Claude: после сбоя доступа к Claude вызовы идут сразу к запасным.
  * Окно «не отвечает» у каждого запасного: после его сбоя доступа аварийная
  * цепочка его пропускает. Исходы аварийных вызовов — по провайдеру, за 15 мин.
@@ -275,10 +276,11 @@ export class FallbackState {
 }
 
 /**
- * План вызова — кого пробовать по порядку (spec 2026-10-31, раздел 3).
- * noFallback — одна модель: выбранная (ход гостя) или Claude (проба). Обычный путь: окно Claude закрыто — Claude, затем
- * включённые и отвечающие запасные; открыто — только они (если таких нет — как
- * при закрытом). Выбранный пользователем (с ключом) — первым, даже если он
+ * План вызова — кого пробовать по порядку (spec 2026-10-31-kimi-provider-design,
+ * раздел 3). noFallback — одна модель: выбранная (ход гостя) или Claude
+ * (проба). Обычный путь: окно Claude закрыто — Claude, затем включённые и
+ * отвечающие запасные; открыто — только они (если таких нет — как при
+ * закрытом). Выбранный пользователем (с ключом) — первым, даже если он
  * «не отвечает», затем обычный путь без него.
  */
 export function planProviders(args: {
@@ -288,26 +290,34 @@ export function planProviders(args: {
   noFallback?: boolean;
   now?: number;
 }): AnswerProvider[] {
-  // noFallback — без цепочки (spec 2026-10-31-global-llm-switch, раздел 3):
-  // проба мониторинга (без выбора) — только Claude; ход гостя — только модель
-  // рубильника, если у неё есть ключ, иначе Claude.
-  if (args.noFallback) {
-    const s = args.selected;
-    return s && FALLBACK_ORDER.includes(s) && args.configs[s] ? [s] : ['claude'];
-  }
-  const now = args.now ?? Date.now();
-  const normal = (exclude?: FallbackProvider): AnswerProvider[] => {
-    const alts = FALLBACK_ORDER.filter((n) => n !== exclude && !!args.configs[n] && !args.state.isDown(n, now));
-    return args.state.claudeWindowOpen(now) && alts.length > 0 ? [...alts] : ['claude', ...alts];
-  };
   // Истинностью, не !== null: незнакомое значение selected (например, мусор из
   // БД) даёт configs[selected] === undefined, а undefined !== null — истина,
   // и мусор встал бы первым в план. FALLBACK_ORDER.includes — отдельная защита:
   // имя из прототипа объекта (например 'constructor') даёт configs[selected]
   // правду через цепочку прототипов, а не null/undefined, и первую проверку
   // не ловит вовсе.
-  if (args.selected && FALLBACK_ORDER.includes(args.selected) && args.configs[args.selected]) {
-    return [args.selected, ...normal(args.selected)];
+  const usable = (s?: FallbackProvider): s is FallbackProvider => !!s && FALLBACK_ORDER.includes(s) && !!args.configs[s];
+  // noFallback — без цепочки (spec 2026-10-31-global-llm-switch, раздел 3):
+  // проба мониторинга (без выбора) — только Claude; ход гостя — только модель
+  // рубильника, если у неё есть ключ, иначе Claude. Окно isDown здесь не
+  // проверяется намеренно: при noFallback цепочки нет, переключаться не на
+  // кого, так что помеченность «не отвечает» ничего не меняет — окно
+  // проверяет вызывающий. На релее noFallback — по-прежнему только Claude
+  // (relay-agent/llm-fallback.mjs): бэкенд не шлёт релею noFallback вместе с
+  // provider — к релею с noFallback ходят только пробы. Расхождение
+  // намеренное, не выравнивать.
+  if (args.noFallback) {
+    const s = args.selected;
+    return usable(s) ? [s] : ['claude'];
+  }
+  const now = args.now ?? Date.now();
+  const normal = (exclude?: FallbackProvider): AnswerProvider[] => {
+    const alts = FALLBACK_ORDER.filter((n) => n !== exclude && !!args.configs[n] && !args.state.isDown(n, now));
+    return args.state.claudeWindowOpen(now) && alts.length > 0 ? [...alts] : ['claude', ...alts];
+  };
+  const s = args.selected;
+  if (usable(s)) {
+    return [s, ...normal(s)];
   }
   return normal();
 }
