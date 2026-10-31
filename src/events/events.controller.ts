@@ -3,6 +3,7 @@ import { Request, Response } from 'express';
 import { EventsService } from './events.service';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
+import { GUEST_SERVER_EVENTS } from '../guest-trial/guest-trial.types';
 
 interface TrackBody {
   name?: string;
@@ -23,6 +24,13 @@ export class EventsController {
   track(@Body() body: TrackBody, @Req() req: Request, @Res() res: Response) {
     if (!body?.name) {
       return res.status(400).json({ error: 'name required' });
+    }
+    // Эти имена пишет только сервер (проба без регистрации — ход, перенос,
+    // закрытие по лимиту, отказ; см. GUEST_SERVER_EVENTS). Открытая ручка
+    // принимает чьё угодно имя — молча отбрасываем подделку (204, не 400):
+    // не подсказываем нападающему, что это имя «интересное» (ревью A10).
+    if (GUEST_SERVER_EVENTS.includes(body.name)) {
+      return res.status(204).end();
     }
     const userId =
       body.userId ||

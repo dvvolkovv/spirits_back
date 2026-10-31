@@ -60,6 +60,24 @@ export const GUEST_PROMPT_HISTORY_MESSAGES = 4;
 /** Маша идёт мимо релея (chat.service: agent.id === 3) и читает историю из базы сама. */
 export const MASHA_AGENT_ID = 3;
 
+/**
+ * Имена событий, которые пишет только сервер (ход гостя — цена и итог,
+ * перенос в аккаунт, закрытие пробы по лимиту, причина отказа хода; см.
+ * guest-turn.service.ts и guest-claim.service.ts). events/track
+ * (src/events/events.controller.ts) открыта без JWT и принимает любое имя —
+ * подделанный guest_trial_answer с мусорным cost_usd рушит статистику
+ * admin/guest-trial на дни вперёд, а guest_trial_error с произвольным reason
+ * заводит фальшивый ключ воронки (разбор ревью A10). Клиентские
+ * guest_trial_view/guest_trial_wall в этот список не входят — их и шлёт
+ * фронт через ту же открытую ручку.
+ */
+export const GUEST_SERVER_EVENTS: readonly string[] = [
+  'guest_trial_answer',
+  'guest_trial_claimed',
+  'guest_trial_closed',
+  'guest_trial_error',
+];
+
 export interface GuestHistoryMessage {
   sender_type: 'human' | 'ai';
   content: string;
