@@ -168,8 +168,8 @@ export interface ClaudeCliOptions {
    *  2026-10-31-kimi-provider-design.md), если только это не рубильник и модель
    *  уже «не отвечает» (см. providerChoice и respectDown в planProviders) — тогда
    *  обычный путь сразу, без неё. Не авария: окно Claude и аварийные счётчики
-   *  он не трогает (кроме noFallback — см. его комментарий). Без ключа —
-   *  обычный путь. */
+   *  он не трогает; под noFallback и своё окно сбоем не помечает (см.
+   *  комментарий noFallback). Без ключа — обычный путь. */
   provider?: AnswerProvider;
   /** Чей это provider, когда он задан явно (spec 2026-10-31-global-llm-switch,
    *  «Уточнения по ревью 31.10»): 'user' (по умолчанию) — личный выбор
@@ -419,9 +419,11 @@ export class ClaudeCliService implements OnModuleInit {
     // throttle предупреждения о ключе и для respectDown. Рубильник — всегда
     // 'global'; явный provider — 'user', если вызывающий не сказал иначе через
     // providerChoice (ход гостя сам читает рубильник и передаёт её модель явно,
-    // потому что noFallback не даёт прочитать рубильник здесь самому).
+    // потому что noFallback не даёт прочитать рубильник здесь самому). Только
+    // литерал 'global' считается — мусор в providerChoice не должен уйти в
+    // событие как есть.
     const choice: ProviderChoice | undefined =
-      chosen ? (fromSwitch ? 'global' : (opts.providerChoice ?? 'user')) : undefined;
+      chosen ? (fromSwitch ? 'global' : (opts.providerChoice === 'global' ? 'global' : 'user')) : undefined;
     // Выбор, по которому идёт вызов, — только с ключом: сразу выбранный, при его
     // сбое — обычный путь (у noFallback — ошибка). По нему же — аварийность
     // попытки, текст ошибки и метки логов.
@@ -437,8 +439,7 @@ export class ClaudeCliService implements OnModuleInit {
           this.logger.warn(`${PROVIDER_LABELS[chosen]} выбран для всех (рубильник), но ключ ${PROVIDER_DEFAULTS[chosen].envPrefix}_FALLBACK_API_KEY не задан — ${where}`);
         }
       } else {
-        // Личный выбор — без ограничения: он редкий (ручная правка карточки),
-        // и на то, что предупреждение срабатывает каждый раз, смотрят тесты.
+        // Личный выбор — без ограничения: он редкий (ручная правка карточки).
         this.logger.warn(`${PROVIDER_LABELS[chosen]} выбран для пользователя, но ключ ${PROVIDER_DEFAULTS[chosen].envPrefix}_FALLBACK_API_KEY не задан — ${where}`);
       }
     }
@@ -454,10 +455,15 @@ export class ClaudeCliService implements OnModuleInit {
     const plan = planProviders({ selected, configs, state: this.fallback, noFallback: opts.noFallback, respectDown: choice === 'global' });
     const breakerMs = readBreakerMs();
     const startedAt = Date.now();
-    // Причины по попыткам — для текста ошибки, если не ответит никто.
-    const parts: string[] = plan[0] !== 'claude' && plan[0] !== selected
-      ? ['claude CLI пропущен (окно запасного пути)']
-      : [];
+    // Причины по попыткам — для текста ошибки, если не ответит никто. Пропуск
+    // виден с первой строки: respectDown убрал выбранную рубильником модель из
+    // плана (единственная ветка planProviders, где usable(selected) истинно, а
+    // plan[0] всё равно не selected) — или, как раньше, Claude пропущен из-за
+    // своего открытого окна.
+    const skippedBySwitch = choice === 'global' && !!selected && plan[0] !== selected;
+    const parts: string[] = skippedBySwitch
+      ? [`${selected} (для всех) пропущен: не отвечает`]
+      : (plan[0] !== 'claude' && plan[0] !== selected ? ['claude CLI пропущен (окно запасного пути)'] : []);
     let reachedFallback = false;
     let attemptOpts = opts;
     for (let i = 0; i < plan.length; ) {
@@ -563,11 +569,13 @@ export class ClaudeCliService implements OnModuleInit {
   /** Не чаще, чем раз в минуту на модель, — true (и отмечает момент).
    *  Рубильник читается на каждом вызове без явного provider: без этого
    *  ограничения лог быстро тонет в повторах. Личный выбор — без ограничения
-   *  (см. runRaw): он редкий (ручная правка карточки), и на то, что
-   *  предупреждение срабатывает каждый раз, смотрят тесты. */
+   *  (см. runRaw): он редкий (ручная правка карточки). */
   private shouldWarnGlobalKeyMissing(p: FallbackProvider, now: number = Date.now()): boolean {
-    const last = this.globalKeyWarnAt[p] ?? 0;
-    if (now - last < ClaudeCliService.GLOBAL_KEY_WARN_THROTTLE_MS) return false;
+    const last = this.globalKeyWarnAt[p];
+    // undefined, не ?? 0: ещё не предупреждали вовсе — не «предупреждали в
+    // момент 0», иначе крошечный now (в тестах с управляемым временем) ошибочно
+    // читался бы как «недавно».
+    if (last !== undefined && now - last < ClaudeCliService.GLOBAL_KEY_WARN_THROTTLE_MS) return false;
     this.globalKeyWarnAt[p] = now;
     return true;
   }
