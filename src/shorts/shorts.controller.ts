@@ -549,15 +549,16 @@ export class ShortsController {
    * вышел хоть на одной площадке (пост в канале, набор YouTube у владельца),
    * иначе rejected оказался бы ролик с живым постом; версия здесь
    * необязательна, а если пришла — проверяется. Условие — в самом UPDATE, а не
-   * чтением перед ним.
+   * чтением перед ним. Идея — своей записью (rejectIdea).
    */
   private async reject(id: string, rawVersion: unknown): Promise<ShortVideo> {
     const v = await this.load(id);
     if (LEAVE_FROM.includes(v.status)) return this.leave(id, 'rejected', rawVersion);
+    if (v.status === 'idea') return this.rejectIdea(id, rawVersion);
     const version = this.version(rawVersion, false);
     if (v.status !== 'failed' || !canTransition(v.status, 'rejected')) {
       throw new ConflictException(
-        `Отклонить можно упавший, ждущий решения или запланированный ролик; этот — ${STATUS_WORDS[v.status] ?? v.status}. Обновите список.`,
+        `Отклонить можно идею, упавший, ждущий решения или запланированный ролик; этот — ${STATUS_WORDS[v.status] ?? v.status}. Обновите список.`,
       );
     }
     const params: any[] = [id];
@@ -581,6 +582,41 @@ export class ShortsController {
       throw new ConflictException({ statusCode: 409, error: 'version_conflict', message: STALE_SHORT });
     }
     throw new ConflictException('Ролик успел уйти из упавших — обновите список');
+  }
+
+  /**
+   * «Отклонить» идеи — темы каталога, новости из git или заказа владельца:
+   * idea → rejected, в архив «Отклонены». Идея действует из строки списка, так
+   * что версия необязательна: от гонки защищает условие на статус в самой
+   * записи. Автозапуск (`ShortsTopicService.start`) пишет с тем же условием
+   * `status = 'idea'` — из двух одновременных решений пройдёт одно. Пришедшая
+   * версия проверяется, как везде.
+   *
+   * Вместо отклонённой темы каталога пополнение недели (`refillWeek`) заведёт
+   * другую: оно доводит число открытых идей каталога до числа слотов. Повтор
+   * ручного заказа ищется только среди открытых идей — отклонённый заказ можно
+   * заказать заново.
+   */
+  private async rejectIdea(id: string, rawVersion: unknown): Promise<ShortVideo> {
+    const version = this.version(rawVersion, false);
+    const params: any[] = [id];
+    const clause = versionClause(params, version);
+    const r = await this.pg.query(
+      `UPDATE short_video SET status = 'rejected', updated_at = now()
+        WHERE id = $1 AND status = 'idea'${clause}
+        RETURNING *`,
+      params,
+    );
+    if (r.rows.length) return rowToShort(r.rows[0]);
+    // Не записалось — гонка между чтением и записью: причина чтением, как у решений по готовому ролику.
+    const why = await explainRefusal(this.pg, id, ['idea']);
+    if (why.reason === 'not_found') throw new NotFoundException('ролик не найден');
+    if (why.reason === 'stale') {
+      if (version) throw new ConflictException({ statusCode: 409, error: 'version_conflict', message: STALE_SHORT });
+      throw new ConflictException('Идея успела измениться — обновите список.');
+    }
+    if (why.status === 'rejected') throw new ConflictException('Идея уже отклонена. Обновите список.');
+    throw new ConflictException('Идея уже в работе — отклонить можно будет готовый ролик. Обновите список.');
   }
 
   /** Ролик и его версия (VERSION_SQL) — для get: ею админка подписывает решения. */
