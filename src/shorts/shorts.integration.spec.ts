@@ -614,11 +614,16 @@ maybe('ролики против живого Postgres', () => {
 
       expect(await topics.refillWeek(wed)).toBe(1);
       const rows = (await pool.query(
-        `SELECT source_ref, status FROM short_video WHERE source = 'catalog' ORDER BY source_ref`,
+        `SELECT source_ref, status, assistant_id FROM short_video WHERE source = 'catalog' ORDER BY source_ref`,
       )).rows;
       expect(rows.filter((x) => x.status === 'idea')).toHaveLength(3);
       expect(rows.filter((x) => x.status === 'rejected')).toHaveLength(1);
       expect(rows.map((x) => x.source_ref)).toContain('catalog:2026-W44:4');
+      // Отклонённая тема каталога считается «показанной» (shown исключает только failed) —
+      // новая позиция уходит ассистенту, которого каталог никогда не показывал (22, Кира),
+      // а не повторно тому же (1, Миша), чья идея только что отклонена: иначе «отклонено
+      // считается показанным» молча перестало бы работать, а разница видна только по assistant_id.
+      expect(rows.find((x) => x.source_ref === 'catalog:2026-W44:4')?.assistant_id).toBe(22);
     });
 
     it('отклонённый заказ можно заказать снова; открытый — дубль (null)', async () => {
@@ -633,9 +638,25 @@ maybe('ролики против живого Postgres', () => {
       const again = await topics.addManual(order);
       expect(again).not.toBeNull();
       expect(again!.id).not.toBe(first!.id);
+
+      // sourceRef — как у /short (повтор доставки того же сообщения Telegram): дедуп держит
+      // уникальный индекс независимо от статуса, отказ его не освобождает — в отличие от
+      // обычного ручного заказа без sourceRef, который выше заказался снова после отказа.
+      const viaTg = { topic: 'Жалоба на отказ страховой в выплате по ОСАГО', rubric: 'assistant' as const, sourceRef: 'tg:1:2' };
+      const delivered = await topics.addManual(viaTg);
+      expect(delivered).not.toBeNull();
+      await ctl.action({ action: 'reject', id: delivered!.id }, reply());
+      expect(await topics.addManual(viaTg)).toBeNull();
+      // Новый заказ без sourceRef, по другой теме, — проходит как обычно.
+      const fresh = await topics.addManual({ topic: 'Совсем другой вопрос про расторжение договора аренды', rubric: 'assistant' as const });
+      expect(fresh).not.toBeNull();
     });
 
     it('гонка «Отклонить» с автозапуском той же идеи — ровно одна сторона побеждает, статус и slot_at согласованы', async () => {
+      // Случайная гонка через Promise.all: «Отклонить» (2 запроса) почти всегда опережает
+      // «Запустить» (settings/agents + транзакция из нескольких запросов), так что ветка
+      // started здесь почти не проверяется на практике — обе стороны детерминированно
+      // проверены ниже, держащими транзакцию (гонка, детерминированная: …).
       const ctl = new ShortsController(pgLike() as any, settings as any, {} as any, { publicUrl: () => 'x' } as any);
       const topics = new ShortsTopicService(pgLike() as any, agents as any, settings as any);
       // TRUNCATE в beforeEach — между it, не между итерациями одного теста: у каждой гонки своя идея.
@@ -658,6 +679,74 @@ maybe('ролики против живого Postgres', () => {
           expect(row.slot_at).toBeNull();
         }
       }
+    });
+
+    /**
+     * Ждём, пока вторая сторона гонки застынет на блокировке строки (а не просто
+     * выполняется): без этого COMMIT ниже мог бы уйти раньше, чем держащийся UPDATE
+     * вообще попытался записать, и тест ничего не доказал бы. До ~5 с.
+     */
+    async function waitForLockWaiter(): Promise<void> {
+      for (let i = 0; i < 50; i++) {
+        const { rows } = await pool.query(`SELECT count(*)::int AS n FROM pg_locks WHERE NOT granted`);
+        if (rows[0].n > 0) return;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      throw new Error('гонка не дошла до блокировки строки за ~5 с — тест не доказывает то, что должен');
+    }
+
+    it('гонка, детерминированная: автозапуск (условно) успел первым — «Отклонить» читает idea, но запись блокирована и отказывает по месту', async () => {
+      const idea = await insert({ status: 'idea', topic_key: 'manual:гонка-a', topic_hint: 'Гонка A' });
+      const ctl = new ShortsController(pgLike() as any, settings as any, {} as any, { publicUrl: () => 'x' } as any);
+      const holder = await pool.connect();
+      let broken = false;
+      try {
+        await holder.query('BEGIN');
+        // Имитация записи start() — тем же условием WHERE status = 'idea', что в реальном коде.
+        await holder.query(
+          `UPDATE short_video SET status = 'directing', slot_at = now() + interval '1 day', updated_at = now()
+            WHERE id = $1 AND status = 'idea'`,
+          [idea.id],
+        );
+        const p = ctl.action({ action: 'reject', id: idea.id }, reply());
+        // reject.load() читает ещё committed 'idea' (holder не закоммичен) и идёт в
+        // rejectIdea — её UPDATE требует ту же строку и застывает на блокировке holder'а.
+        await waitForLockWaiter();
+        await holder.query('COMMIT');
+        await expect(p).rejects.toThrow('Идея уже в работе — отклонить можно будет готовый ролик. Обновите список.');
+      } catch (e) {
+        broken = await holder.query('ROLLBACK').then(() => false, () => true);
+        throw e;
+      } finally {
+        holder.release(broken);
+      }
+      const row = (await pool.query(`SELECT status, slot_at FROM short_video WHERE id = $1`, [idea.id])).rows[0];
+      expect(row.status).toBe('directing');
+      expect(row.slot_at).not.toBeNull();
+    });
+
+    it('гонка, детерминированная: «Отклонить» (условно) успел первым — автозапуск читает idea, но запись блокирована и возвращает null', async () => {
+      const idea = await insert({ status: 'idea', topic_key: 'manual:гонка-b', topic_hint: 'Гонка B' });
+      const topics = new ShortsTopicService(pgLike() as any, agents as any, settings as any);
+      const holder = await pool.connect();
+      let broken = false;
+      try {
+        await holder.query('BEGIN');
+        await holder.query(`UPDATE short_video SET status = 'rejected', updated_at = now() WHERE id = $1 AND status = 'idea'`, [idea.id]);
+        const p = topics.start({ id: idea.id, force: true });
+        // start() находит idea своим чтением (holder не закоммичен), планирует и натыкается
+        // на ту же блокировку строки в собственном UPDATE — тот же механизм, что у reject.
+        await waitForLockWaiter();
+        await holder.query('COMMIT');
+        expect(await p).toBeNull();
+      } catch (e) {
+        broken = await holder.query('ROLLBACK').then(() => false, () => true);
+        throw e;
+      } finally {
+        holder.release(broken);
+      }
+      const row = (await pool.query(`SELECT status, slot_at FROM short_video WHERE id = $1`, [idea.id])).rows[0];
+      expect(row).toEqual({ status: 'rejected', slot_at: null });
     });
   });
 

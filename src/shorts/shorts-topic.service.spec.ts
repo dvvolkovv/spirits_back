@@ -254,6 +254,17 @@ describe('ShortsTopicService.start', () => {
     ['SELECT rubric, angle', { rows: [] }],
   ]);
 
+  it('UPDATE запуска условится на status = \'idea\' в самой записи, не только в чтении идей выше', async () => {
+    // Это единственное, что останавливает отклонённую (или уже забранную) идею от
+    // ухода в работу при гонке с «Отклонить» (shorts.integration.spec.ts — «гонка,
+    // детерминированная»): чтение идей читает committed-снимок раньше записи и само
+    // по себе гонку не закрывает.
+    const tx = routes();
+    await setup(tx).start({ force: false }, () => MON_EVENING);
+    const update = tx.seen.find((q) => q.sql.includes('UPDATE short_video'));
+    expect(update.sql.replace(/\s+/g, ' ')).toContain("WHERE id = $1 AND status = 'idea'");
+  });
+
   it('до свободного слота меньше суток — запуск в этот слот с подачей по ритму', async () => {
     const tx = routes();
     const v = await setup(tx).start({ force: false }, () => MON_EVENING);
