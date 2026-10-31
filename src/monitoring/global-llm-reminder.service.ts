@@ -70,12 +70,15 @@ export class GlobalLlmReminderService {
    * Суточный счёт по вызовам рубильника (choice='global', selected=эта
    * модель): answered — она ответила (chat_quality/claude_cli_call,
    * provider = эта модель, ok не false); byOther — ответил другой (provider
-   * — другой, не NULL, ok не false); failed — ВСЕГО без ответа: неудачные
-   * ходы веб-чата (chat_quality: ok='false' или без provider) ПЛЮС отдельным
+   * — другой, не NULL, ok не false). Отказ CLI текстом claude_cli_call пишет
+   * с ok: false (ревью 01.11) — запуск, после которого ответил другой, не
+   * попадает и в answered. failed — ВСЕГО без ответа: неудачные ходы
+   * веб-чата (chat_quality: ok='false' или без provider) ПЛЮС отдельным
    * подзапросом ошибки гостей о модели (guest_trial_error, provider = эта
-   * модель, reason breaker/model/internal) за те же сутки — гости своих
-   * ходов в chat_quality/claude_cli_call не пишут при стене до вызова CLI;
-   * guests — только гостевая часть failed (для строки «из них гостям»).
+   * модель, reason breaker или model) за те же сутки — гости своих ходов в
+   * chat_quality/claude_cli_call не пишут при стене до вызова CLI. reason
+   * internal не считается: это сбой базы уже после ответа модели. guests —
+   * только гостевая часть failed (для строки «из них гостям»).
    */
   private async dayCounts(provider: FallbackProvider): Promise<GlobalLlmDayCounts> {
     const r = await this.pg.query(
@@ -94,7 +97,7 @@ export class GlobalLlmReminderService {
             WHERE ts > now() - interval '1 day'
               AND name = 'guest_trial_error'
               AND props->>'provider' = $1
-              AND props->>'reason' IN ('breaker', 'model', 'internal'))::int AS guests
+              AND props->>'reason' IN ('breaker', 'model'))::int AS guests
        FROM events
       WHERE ts > now() - interval '1 day'
         AND name IN ('chat_quality', 'claude_cli_call')

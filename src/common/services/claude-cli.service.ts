@@ -945,20 +945,24 @@ export class ClaudeCliService implements OnModuleInit {
           if (streamCostUsd) {
             this.logger.debug(`claude CLI cost${cfg ? ` (${cfg.name})` : ''}: $${streamCostUsd.toFixed(4)}, ${streamDurationMs}ms (stream)`);
           }
+          // stripWordJoiner на выходе: U+2060, которым мы обезвреживали
+          // @-упоминания во входе, не должен доехать до пользователя.
+          const streamText = stripWordJoiner(streamResultText);
           this.trackCallEvent({
             costUsd: streamCostUsd,
             model,
             durationMs: streamDurationMs,
-            ok: true,
+            // Отказ CLI текстом — не ответ: runRaw уйдёт к следующей модели
+            // (ревью 01.11, суточный счёт без двойного учёта). Стоимость в
+            // событии остаётся — суммы расхода ok не фильтруют.
+            ok: !looksLikeCliRefusal(streamText),
             provider,
             fallback: meta.fallback,
             selected: meta.selected,
             choice: meta.choice,
           });
-          // stripWordJoiner на выходе: U+2060, которым мы обезвреживали
-          // @-упоминания во входе, не должен доехать до пользователя.
           settled = true;
-          resolve({ text: stripWordJoiner(streamResultText), costUsd: streamCostUsd, toolUsed: sawRiskyToolUse });
+          resolve({ text: streamText, costUsd: streamCostUsd, toolUsed: sawRiskyToolUse });
           return;
         }
 
@@ -1012,7 +1016,8 @@ export class ClaudeCliService implements OnModuleInit {
             costUsd,
             model,
             durationMs: Number(json.duration_ms) || 0,
-            ok: true,
+            // Отказ CLI текстом — не ответ (см. потоковую ветку выше).
+            ok: !looksLikeCliRefusal(text),
             provider,
             fallback: meta.fallback,
             selected: meta.selected,
