@@ -4,8 +4,10 @@ import { ChatService } from './chat.service';
  * Путь Маши (agent.id === 3, локальный CLI, минуя релей) следует выбору
  * модели ответов человека так же, как путь релея (chat.service.llm-provider.spec.ts)
  * и TG-ботов (tg-router.model.spec.ts): kimi/qwen уходят в ClaudeCliService
- * полем provider через cliProviderOption (answer-provider.ts), Claude — без
- * поля. Проба мониторинга выбор вообще не читает (resolveAnswerProvider).
+ * полем provider через cliProviderOption (answer-provider.ts); личный
+ * Claude — явно тем же полем (рубильник к нему не применяется), «Как у
+ * всех» — без поля (рубильник применит сам ClaudeCliService). Проба
+ * мониторинга выбор вообще не читает (resolveAnswerProvider).
  *
  * Харнес — минимальная версия той же сборки, что в chat.service.masha-prompt.spec.ts
  * и chat.service.masha-cost.spec.ts: ChatService собирается позиционно (первые

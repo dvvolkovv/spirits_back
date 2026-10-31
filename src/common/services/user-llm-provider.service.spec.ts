@@ -1,4 +1,7 @@
+import 'reflect-metadata';
 import { UserLlmProviderService } from './user-llm-provider.service';
+import { PgService } from './pg.service';
+import { GlobalLlmProviderService } from './global-llm-provider.service';
 
 const mk = (impl: (sql: string, params?: any[]) => any, global?: any) => {
   const query = jest.fn(async (sql: string, params?: any[]) => impl(sql, params));
@@ -8,12 +11,12 @@ const mk = (impl: (sql: string, params?: any[]) => any, global?: any) => {
 describe('UserLlmProviderService', () => {
   it('get: qwen', async () => {
     const { svc } = mk(() => ({ rows: [{ llm_provider: 'qwen' }] }));
-    expect(await svc.get('79030169187')).toBe('qwen');
+    expect(await svc.get('u-1')).toBe('qwen');
   });
 
   it('get: NULL — default', async () => {
     const { svc } = mk(() => ({ rows: [{ llm_provider: null }] }));
-    expect(await svc.get('79030169187')).toBe('default');
+    expect(await svc.get('u-1')).toBe('default');
   });
 
   it('get: нет пользователя — default', async () => {
@@ -23,7 +26,7 @@ describe('UserLlmProviderService', () => {
 
   it('get: сбой БД — default, без исключения', async () => {
     const { svc } = mk(() => { throw new Error('db down'); });
-    expect(await svc.get('79030169187')).toBe('default');
+    expect(await svc.get('u-1')).toBe('default');
   });
 
   it('get: пустой userId — default без запроса', async () => {
@@ -34,9 +37,9 @@ describe('UserLlmProviderService', () => {
 
   it('set qwen — пишет qwen, true', async () => {
     const { svc, query } = mk(() => ({ rows: [], rowCount: 1 }));
-    expect(await svc.set('79030169187', 'qwen')).toBe(true);
+    expect(await svc.set('u-1', 'qwen')).toBe(true);
     expect(query.mock.calls[0][0]).toMatch(/UPDATE ai_profiles_consolidated SET llm_provider = \$2 WHERE user_id = \$1/);
-    expect(query.mock.calls[0][1]).toEqual(['79030169187', 'qwen']);
+    expect(query.mock.calls[0][1]).toEqual(['u-1', 'qwen']);
   });
 
   it('set claude — пишет claude (явный выбор)', async () => {
@@ -72,6 +75,12 @@ describe('UserLlmProviderService', () => {
   it('route: «Как у всех» без сервиса рубильника — claude, choice global', async () => {
     const { svc } = mk(() => ({ rows: [] }));
     expect(await svc.route('u-1')).toEqual({ provider: 'claude', choice: 'global' });
+  });
+
+  it('route: рубильник бросил исключение — claude, без исключения (вторая линия защиты сверх контракта GlobalLlmProviderService)', async () => {
+    const global = { get: jest.fn(async () => { throw new Error('unexpected'); }) };
+    const { svc } = mk(() => ({ rows: [{ llm_provider: null }] }), global);
+    await expect(svc.route('u-1')).resolves.toEqual({ provider: 'claude', choice: 'global' });
   });
 
   it('set: нет пользователя — false', async () => {
@@ -120,9 +129,25 @@ describe('UserLlmProviderService', () => {
     expect(query.mock.calls[0][1]).toEqual(['u-1', 'kimi']);
   });
 
-  it('set: незнакомое значение — пишет NULL, как Claude (валидирует сам, не только контроллер)', async () => {
+  it('set: незнакомое значение — пишет NULL, как «Как у всех» (валидирует сам, не только контроллер)', async () => {
     const { svc, query } = mk(() => ({ rows: [], rowCount: 1 }));
     await svc.set('u-1', 'gpt' as any);
     expect(query.mock.calls[0][1]).toEqual(['u-1', null]);
+  });
+});
+
+/**
+ * Рубильник веб-чата не должен молча остаться на Claude, если граф DI не
+ * нашёл GlobalLlmProviderService: конструктор объявляет его БЕЗ @Optional(),
+ * чтобы Nest считал зависимость обязательной и валил старт при поломке графа
+ * (ловит smoke на test, а не тишина на проде). design:paramtypes при этом не
+ * видит сам декоратор @Optional() — он сторожит только то, что параметр
+ * объявлен КЛАССОМ GlobalLlmProviderService, а не интерфейсом/Object (та же
+ * ловушка, что в chat.service.guest-carry.spec.ts с RedisService) — это
+ * необходимое условие, чтобы Nest вообще мог найти провайдер по типу.
+ */
+describe('UserLlmProviderService: DI-тип рубильника', () => {
+  it('конструктор объявляет зависимости классами PgService и GlobalLlmProviderService', () => {
+    expect(Reflect.getMetadata('design:paramtypes', UserLlmProviderService)).toEqual([PgService, GlobalLlmProviderService]);
   });
 });

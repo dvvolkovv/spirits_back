@@ -69,14 +69,14 @@ function makeRes() {
 }
 
 /** Прогоняет upload-and-chat с выбором человека и отдаёт поля, ушедшие на релей. */
-async function upload(choice: 'claude' | 'qwen' | 'kimi') {
+async function upload(choice: 'claude' | 'qwen' | 'kimi', routeChoice: 'user' | 'global' = 'user') {
   const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
   const svc = new ChatService(
     makePg() as any, null as any, null as any,
     null as any, language as any, undefined, undefined, undefined, undefined,
   );
   const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
-  const llmProvider = { route: jest.fn(async () => ({ provider: choice, choice: 'user' })) };
+  const llmProvider = { route: jest.fn(async () => ({ provider: choice, choice: routeChoice })) };
   const ctrl = new ChatController(svc, jwtSvc as any, null as any, undefined, llmProvider as any);
   const post = jest.fn(async () => ({ data: sseStream([{ type: 'delta', text: 'Готово.' }, { type: 'done' }]) }));
   (axios as any).default = { post };
@@ -114,5 +114,10 @@ describe('uploadAndChat: модель ответов человека', () => {
     const { fields } = await upload('kimi');
     expect(fields.provider).toBe('kimi');
     expect(fields.noFallback).toBeUndefined();
+  });
+
+  it('«Как у всех» при рубильнике Qwen — provider=qwen', async () => {
+    const { fields } = await upload('qwen', 'global');
+    expect(fields.provider).toBe('qwen');
   });
 });

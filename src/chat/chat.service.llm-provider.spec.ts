@@ -147,10 +147,10 @@ describe('streamUniversalAgent: чем ответил релей — в chat_qua
     expect(q.fallback).toBeUndefined();
   });
 
-  it('выбран Kimi и ответил он — provider и selected kimi', async () => {
+  it('выбран Kimi и ответил он — provider и selected kimi, choice user (личный выбор)', async () => {
     const h = harness('kimi', [{ type: 'delta', text: 'ок' }, { type: 'done', provider: 'kimi', fallback: false }]);
     await h.run();
-    expect(h.quality()).toMatchObject({ provider: 'kimi', selected: 'kimi' });
+    expect(h.quality()).toMatchObject({ provider: 'kimi', selected: 'kimi', choice: 'user' });
     expect(h.quality().fallback).toBeUndefined();
   });
 
@@ -160,9 +160,10 @@ describe('streamUniversalAgent: чем ответил релей — в chat_qua
     expect(h.quality()).toMatchObject({ provider: 'claude', selected: 'kimi' });
   });
 
-  it('выбран Claude — selected не пишется', async () => {
+  it('выбран Claude — ни selected, ни choice не пишутся', async () => {
     const h = harness('claude', [{ type: 'delta', text: 'ок' }, { type: 'done', provider: 'claude', fallback: false }]);
     await h.run();
     expect(h.quality().selected).toBeUndefined();
+    expect(h.quality().choice).toBeUndefined();
   });
 });
