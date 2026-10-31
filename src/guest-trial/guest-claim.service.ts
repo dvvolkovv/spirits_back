@@ -1,7 +1,6 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { RedisService } from '../common/services/redis.service';
-import { Neo4jService } from '../neo4j/neo4j.service';
 import { EventsService } from '../events/events.service';
 import { putGuestCarry, renderGuestCarry } from './guest-carry';
 import { hashClaimer, hashGuestToken, isGuestTokenShape } from './guest-token';
@@ -13,9 +12,6 @@ export interface ClaimResult {
   body: Record<string, unknown>;
 }
 
-/** Сколько последних пар разбирает профиль после переноса — не весь разговор. */
-const CONSOLIDATE_LAST_PAIRS = 5;
-
 @Injectable()
 export class GuestClaimService {
   private readonly log = new Logger('GuestClaim');
@@ -23,7 +19,6 @@ export class GuestClaimService {
   constructor(
     private readonly pg: PgService,
     private readonly redis: RedisService,
-    @Optional() private readonly neo4j?: Neo4jService,
     @Optional() private readonly events?: EventsService,
   ) {}
 
@@ -140,36 +135,12 @@ export class GuestClaimService {
       source,
       props: { assistant_id: String(assistantId), answers, existing: hadHistory, trial: trialId },
     });
-    const neo4j = this.neo4j;
-    if (!neo4j) return;
-    // Профиль — тем же разбором, что после обычных ходов; сбоку, ответ ручки
-    // не ждёт. Не больше CONSOLIDATE_LAST_PAIRS последних пар — длинную пробу
-    // не разбираем целиком.
-    const pairs: Array<[string, string]> = [];
-    for (let i = 0; i + 1 < moved.length; i++) {
-      if (moved[i].sender_type === 'human' && moved[i + 1].sender_type === 'ai') pairs.push([moved[i].content, moved[i + 1].content]);
-    }
-    const recent = pairs.slice(-CONSOLIDATE_LAST_PAIRS);
-    setImmediate(async () => {
-      // «Предыдущая реплика ассистента» нужна consolidateFromChat, чтобы
-      // понять согласие («да»/«точно») в вопросе пары. По умолчанию сервис
-      // сам достаёт её запросом к custom_chat_history — это верно для
-      // обычного хода, но здесь все пары уже вставлены одним махом ДО этого
-      // цикла, и такой запрос отдал бы одну и ту же (последнюю) реплику
-      // каждой паре. Передаём её явно, по ходу перебора: для первой пары —
-      // '' («начало диалога», в т.ч. если это не истинное начало — более
-      // старые пары мы не разбираем), для следующих — ответ предыдущей.
-      // Сбой на одной паре не останавливает следующие: try/catch — внутри
-      // цикла, а не вокруг него.
-      let prevAssistantMessage = '';
-      for (const [q, a] of recent) {
-        try {
-          await neo4j.consolidateFromChat(userId, String(assistantId), q, a, prevAssistantMessage);
-        } catch (e: any) {
-          this.log.warn(`guest claim consolidate failed: ${e?.message}`);
-        }
-        prevAssistantMessage = a;
-      }
-    });
+    // Решение владельца 31.10.2026: перенос НЕ дополняет профиль ценностей
+    // (раньше — neo4j.consolidateFromChat по последним парам пробы, как
+    // после обычного хода). Проба идёт на общем устройстве: человек A мог
+    // попробовать чат, а перенос сделал человек B — тогда разбор пары лёг бы
+    // в профиль B, которым пользуются поиск и совместимость, и откатить его
+    // было бы нельзя. Профиль вошедшего заполнится как обычно — его
+    // собственными ходами после входа, без разбора чужой (или ничьей) пробы.
   }
 }

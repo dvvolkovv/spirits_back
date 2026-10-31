@@ -16,7 +16,6 @@ maybe('перенос пробы в аккаунт против живого Pos
   let pool: Pool;
   let sessions: GuestSessionsService;
   let redis: ReturnType<typeof clockRedis>;
-  let neo4j: { consolidateFromChat: jest.Mock };
   let events: { track: jest.Mock };
   let svc: GuestClaimService;
   const pgShim = () => ({
@@ -42,9 +41,8 @@ maybe('перенос пробы в аккаунт против живого Pos
   beforeEach(async () => {
     await pool.query('TRUNCATE guest_trial_sessions CASCADE; TRUNCATE custom_chat_history');
     redis = clockRedis();
-    neo4j = { consolidateFromChat: jest.fn(async () => {}) };
     events = { track: jest.fn() };
-    svc = new GuestClaimService(pgShim() as any, redis as any, neo4j as any, events as any);
+    svc = new GuestClaimService(pgShim() as any, redis as any, events as any);
   });
   afterAll(async () => { await pool.end(); });
 
@@ -100,13 +98,11 @@ maybe('перенос пробы в аккаунт против живого Pos
     // custom_chat_history. Если этот аккаунт уже вёл сессию с ассистентом 12
     // на релее, она возобновится по --resume без пробы, если не оставить приписку.
     expect(redis.peek(guestCarryKey('u-new', '12'))).toContain('Человек: Вопрос 1');
-    // Решение владельца 31.10.2026: общий компьютер — перенос больше НЕ
-    // разбирает профиль пробы (neo4j.consolidateFromChat). setImmediate всё
-    // равно отыгрываем — чтобы ловить именно «не вызвался», а не «ещё не
-    // успел».
-    await new Promise((res) => setImmediate(res));
-    await new Promise((res) => setImmediate(res));
-    expect(neo4j.consolidateFromChat).not.toHaveBeenCalled();
+    // Решение владельца 31.10.2026: общий компьютер — перенос больше не
+    // дополняет профиль ценностей (не зовёт neo4j.consolidateFromChat).
+    // Сервис с 31.10 не принимает Neo4jService вовсе (сторож —
+    // guest-trial.module.spec.ts), поэтому здесь это больше не отдельный
+    // вызов на моке, а структурное свойство конструктора.
     expect(events.track).toHaveBeenCalledWith('guest_trial_claimed', {
       userId: 'u-new',
       source: null,
@@ -200,7 +196,7 @@ maybe('перенос пробы в аккаунт против живого Pos
       query: (s: string, p?: any[]) => pool.query(s, p),
       getClient: async () => proxyClient,
     };
-    const flakySvc = new GuestClaimService(flakyPg as any, redis as any, neo4j as any, events as any);
+    const flakySvc = new GuestClaimService(flakyPg as any, redis as any, events as any);
     try {
       await expect(flakySvc.claim('u-broken', token)).rejects.toThrow('boom');
       expect(await sessions.messages(row.id)).toHaveLength(2);
