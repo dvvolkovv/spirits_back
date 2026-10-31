@@ -1,10 +1,13 @@
 import { cliProviderOption, readDoneProvider, relayProviderFields, resolveAnswerProvider } from './answer-provider';
 
 describe('resolveAnswerProvider', () => {
-  const svc = (p: 'claude' | 'qwen') => ({ get: jest.fn(async () => p) });
+  const svc = (p: 'claude' | 'qwen' | 'kimi') => ({ get: jest.fn(async () => p) });
 
   it('выбор пользователя', async () => {
     expect(await resolveAnswerProvider(false, 'u1', svc('qwen') as any)).toBe('qwen');
+  });
+  it('выбор пользователя — kimi', async () => {
+    expect(await resolveAnswerProvider(false, 'u1', svc('kimi') as any)).toBe('kimi');
   });
   it('проба — всегда claude, настройку не читает', async () => {
     const s = svc('qwen');

@@ -90,4 +90,10 @@ describe('UserLlmProviderService', () => {
     expect(await svc.set('u-1', 'kimi')).toBe(true);
     expect(query.mock.calls[0][1]).toEqual(['u-1', 'kimi']);
   });
+
+  it('set: незнакомое значение — пишет NULL, как Claude (валидирует сам, не только контроллер)', async () => {
+    const { svc, query } = mk(() => ({ rows: [], rowCount: 1 }));
+    await svc.set('u-1', 'gpt' as any);
+    expect(query.mock.calls[0][1]).toEqual(['u-1', null]);
+  });
 });
