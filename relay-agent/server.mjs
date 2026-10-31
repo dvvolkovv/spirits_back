@@ -1032,7 +1032,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
             transientHit = true;
             return;
           }
-          // Успех запуска — для окна запасного Qwen: ни ошибки, ни сбоя доступа.
+          // Успех запуска — для окон запасного пути: ни ошибки, ни сбоя доступа.
           if (!isErrorResult && !accessFailure) sawResult = true;
           if (!clientDisconnected) res.write("data: " + JSON.stringify({ type: "result", text: ev.result }) + "\n\n");
         }

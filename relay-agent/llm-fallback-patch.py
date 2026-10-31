@@ -244,6 +244,10 @@ rep('resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, accessF
     '        }\n'
     '        resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, switchHit, switchWhy, switchText, transientAccessLike, sawResult, startedAt: runStartedAt });')
 
+# 7b. Комментарий sawResult остался про Qwen — запасных теперь два.
+rep('          // Успех запуска — для окна запасного Qwen: ни ошибки, ни сбоя доступа.\n',
+    '          // Успех запуска — для окон запасного пути: ни ошибки, ни сбоя доступа.\n')
+
 # 8. Штатный повтор после временной ошибки тоже упал — цепочка идёт до конца
 # плана, а не только на один шаг (529×2 у Claude → переход на Qwen → у Qwen
 # кончилась квота — тоже transient — должен дойти до Kimi, а не замолчать на Qwen).
