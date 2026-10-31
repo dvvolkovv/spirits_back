@@ -29,6 +29,7 @@ import { TgHealthService } from './tg-health.service';
 import { PaymentsHealthService } from './payments-health.service';
 import { AlertDeliveryService } from './alert-delivery.service';
 import { RelayQwenMonitorService } from './relay-qwen-monitor.service';
+import { GlobalLlmReminderService } from './global-llm-reminder.service';
 import { CommonModule } from '../common/common.module';
 import { Neo4jModule } from '../neo4j/neo4j.module';
 import { ChatModule } from '../chat/chat.module';
@@ -36,6 +37,6 @@ import { ChatModule } from '../chat/chat.module';
 @Module({
   imports: [CommonModule, Neo4jModule, ChatModule],
   controllers: [MonitoringController],
-  providers: [MonitoringService, LogsService, SyntheticService, FunnelService, EconomyService, QualityService, ProfileDepthService, SummaryService, NetworkingService, ChurnService, SupportService, ContentService, PersonasService, AttributionService, SmsHealthService, ClaudeHealthService, BackupHealthService, ModelsRegistryService, JobsMonitorService, QualityMonitorService, ReplicationHealthService, NeoSnapshotHealthService, MinioMirrorHealthService, GeoAvailabilityService, NanoBananaHealthService, TgHealthService, PaymentsHealthService, AlertDeliveryService, RelayQwenMonitorService],
+  providers: [MonitoringService, LogsService, SyntheticService, FunnelService, EconomyService, QualityService, ProfileDepthService, SummaryService, NetworkingService, ChurnService, SupportService, ContentService, PersonasService, AttributionService, SmsHealthService, ClaudeHealthService, BackupHealthService, ModelsRegistryService, JobsMonitorService, QualityMonitorService, ReplicationHealthService, NeoSnapshotHealthService, MinioMirrorHealthService, GeoAvailabilityService, NanoBananaHealthService, TgHealthService, PaymentsHealthService, AlertDeliveryService, RelayQwenMonitorService, GlobalLlmReminderService],
 })
 export class MonitoringModule {}
