@@ -276,7 +276,7 @@ export class FallbackState {
 
 /**
  * План вызова — кого пробовать по порядку (spec 2026-10-31, раздел 3).
- * noFallback — только Claude. Обычный путь: окно Claude закрыто — Claude, затем
+ * noFallback — одна модель: выбранная (ход гостя) или Claude (проба). Обычный путь: окно Claude закрыто — Claude, затем
  * включённые и отвечающие запасные; открыто — только они (если таких нет — как
  * при закрытом). Выбранный пользователем (с ключом) — первым, даже если он
  * «не отвечает», затем обычный путь без него.
@@ -288,7 +288,13 @@ export function planProviders(args: {
   noFallback?: boolean;
   now?: number;
 }): AnswerProvider[] {
-  if (args.noFallback) return ['claude'];
+  // noFallback — без цепочки (spec 2026-10-31-global-llm-switch, раздел 3):
+  // проба мониторинга (без выбора) — только Claude; ход гостя — только модель
+  // рубильника, если у неё есть ключ, иначе Claude.
+  if (args.noFallback) {
+    const s = args.selected;
+    return s && FALLBACK_ORDER.includes(s) && args.configs[s] ? [s] : ['claude'];
+  }
   const now = args.now ?? Date.now();
   const normal = (exclude?: FallbackProvider): AnswerProvider[] => {
     const alts = FALLBACK_ORDER.filter((n) => n !== exclude && !!args.configs[n] && !args.state.isDown(n, now));
