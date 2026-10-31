@@ -53,11 +53,17 @@ export class UserLlmProviderService implements OnModuleInit {
     }
   }
 
-  /** false — такого пользователя нет. */
+  /**
+   * false — такого пользователя нет. Валидирует сам, а не только вызывающий
+   * (AdminLlmProviderController): незнакомое значение пишется как NULL
+   * (Claude) — симметрично с get(), и колонку не засоряет мусором ни один
+   * будущий вызывающий код.
+   */
   async set(userId: string, provider: LlmProvider): Promise<boolean> {
+    const value = isAnswerProvider(provider) && provider !== 'claude' ? provider : null;
     const r = await this.pg.query(
       'UPDATE ai_profiles_consolidated SET llm_provider = $2 WHERE user_id = $1',
-      [userId, provider === 'claude' ? null : provider],
+      [userId, value],
     );
     return (r.rowCount ?? 0) > 0;
   }
