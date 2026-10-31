@@ -407,6 +407,14 @@ cd ~/Downloads/spirits_back/tests && node runner.js  # api (32) + e2e (18) = 50
   ssh dvolkov@212.113.106.202 'cd ~/spirits_back && umask 077 && node -e "require(\"dotenv\").config(); const t = require(\"./dist/mcp/linkeon-tool.token\").signLinkeonToolToken(\"70000000000\"); process.stdout.write(\"Authorization: Bearer \" + t + \"\\n\")" > /tmp/lt.hdr && curl -s -m 20 -X POST http://127.0.0.1:3001/webhook/mcp/linkeon -H @/tmp/lt.hdr -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}" | grep -o "\"name\":\"[a-z_]*\"" | head -3; rm -f /tmp/lt.hdr'
   ```
 
+### Проба без входа (`src/guest-trial`, на проде с 31.10.2026)
+Новое устройство на `/` или `/chat` веб-кабинета получает несколько ответов ассистента до входа; после входа разговор переезжает в аккаунт. Спека — `docs/superpowers/specs/2026-10-30-guest-trial-design.md`. Кому проба, решает кабинет (`spirits_front/src/components/guest/decideUnauthEntry.ts`): в Capacitor, на других адресах и на устройстве, где уже входили, — экран входа.
+- `GET /webhook/guest/config` — `{mode, answersPerTrial, maxChars}`; `POST /webhook/guest/chat` — ход гостя (NDJSON, как чат; та же `CHAT_MODEL`, без инструментов и без запасного Qwen, `--no-session-persistence`, пустой cwd `/tmp/linkeon-claude-empty`); `POST /webhook/guest/session` `{token}` — разговор пробы после перезагрузки. Все три — без входа: чужой `Origin` (не my/test.linkeon.io и не localhost) → 403, тело больше 64 КБ → 413
+- `POST /webhook/guest/claim` (JWT) `{token}` — перенос пробы в историю того же ассистента + приписка для первого хода после входа (Redis, сутки, `guest-carry.ts`). Профиль ценностей из пробы НЕ дополняется — решение 31.10: общий компьютер
+- `POST /webhook/admin/guest-trial` (админ) — `{action: status|enable|preview|disable|set}`, для `set` — `{limits: {…}}`
+- **Выключатель** — таблица `guest_trial_settings` (`key`, `value jsonb`), кэш 15 с: `mode` — `"off"` / `"preview"` (проба только во вкладке с `?trial=1`) / `"on"`; `limits` — только переопределения поверх `DEFAULT_GUEST_LIMITS` (`guest-trial.types.ts`). Откат без выката — `UPDATE guest_trial_settings SET value = '"off"', updated_at = now() WHERE key = 'mode'`
+- Общие окна лимитов — Redis `guest-lim:*`; хранение — неперенесённая проба 7 дней после последнего сообщения, перенесённая строка 90 дней без текста (cron `guest-trial-purge`); воронка — события `guest_trial_*` в `events` и `guest_trial_sessions` (`answers`, `cost_usd`, `claimed_at`)
+
 ### Tokens & Payments
 - `GET /webhook/user/tokens/` — баланс токенов
 - `POST /webhook/yookassa/create-payment` — создание платежа YooKassa
