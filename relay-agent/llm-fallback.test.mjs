@@ -194,6 +194,37 @@ test("safeErrorDetail: диагностика с пробелом, кавычк�
   assert.equal(l.safeErrorDetail({ errors: ['[ede_diagnostic] a="x"', DIAG] }), "");
 });
 
+test("safeErrorDetail: в значении путь, адрес, «=», кириллица; ключ не из [a-z_] — диагностика не пишется", () => {
+  for (const bad of [
+    "[ede_diagnostic] a=/home/u/doc.pdf",
+    "[ede_diagnostic] a=x@y.ru",
+    "[ede_diagnostic] a=b=c",
+    "[ede_diagnostic] a=привет",
+    "[ede_diagnostic] любой текст=x",
+    "[ede_diagnostic] A=1",
+  ]) {
+    assert.equal(l.safeErrorDetail({ errors: [bad] }), "", bad);
+  }
+});
+
+test("safeErrorDetail: длинные строки без перевода строки — без зависания (сторож на время)", () => {
+  const valid = "[ede_diagnostic]" + " a=b".repeat(25_000);
+  for (const [s, want] of [
+    [" ".repeat(1e5), ""],
+    ["[ede_diagnostic]" + " ".repeat(1e5) + "x", ""],
+    ["[ede_diagnostic]" + " a=b".repeat(25_000) + "!", ""],
+    ["[ede_diagnostic] a=" + "b".repeat(1e5) + " ", ""],
+    [valid, valid.slice(0, 160)],
+  ]) {
+    const t0 = performance.now();
+    const got = l.safeErrorDetail({ errors: [s] });
+    const ms = performance.now() - t0;
+    assert.equal(got, want, JSON.stringify(s.slice(0, 40)));
+    // Квадратичная регулярка тратила бы здесь секунды: 4e4 пробелов — 1,9 с.
+    assert.ok(ms < 50, `${ms.toFixed(1)} мс на строке длиной ${s.length}`);
+  }
+});
+
 test("safeErrorDetail: ни result, ни обычные строки errors[] (стек с путём файла) в журнал не попадают", () => {
   assert.equal(l.safeErrorDetail({ type: "result", is_error: true, result: 'API Error: 400 {"message":"bad input: привет"}' }), "");
   assert.equal(l.safeErrorDetail({
