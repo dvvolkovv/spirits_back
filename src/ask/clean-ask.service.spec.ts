@@ -1,4 +1,11 @@
+import 'reflect-metadata';
+import axios from 'axios';
+import { Readable } from 'stream';
 import { CleanAskService } from './clean-ask.service';
+import { AgentsService } from '../agents/agents.service';
+import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
+
+jest.mock('axios');
 
 /**
  * firstContact() — the engine of the first-contact момент-отклик (spec
@@ -56,5 +63,55 @@ describe('CleanAskService.firstContact', () => {
     await svc.firstContact([{ from: 'user', text: '  ' }, { from: 'user', text: 'реальный ответ' }], false);
     const msg = relay.mock.calls[0][0] as string;
     expect(msg).toContain('реальный ответ');
+  });
+});
+
+/** Поля multipart-запроса к релею — то, что реально уехало. */
+function fieldsOf(fd: any): Record<string, string> {
+  const boundary = fd.getBoundary();
+  const raw = fd.getBuffer().toString('utf8');
+  const out: Record<string, string> = {};
+  for (const part of raw.split(`--${boundary}`)) {
+    const name = /name="([^"]+)"/.exec(part);
+    const head = part.indexOf('\r\n\r\n');
+    if (!name || head < 0) continue;
+    out[name[1]] = part.slice(head + 4).replace(/\r\n$/, '');
+  }
+  return out;
+}
+
+describe('CleanAskService: модель общего рубильника в запросе к релею', () => {
+  const post = axios.post as jest.Mock;
+  beforeEach(() => {
+    post.mockReset();
+    post.mockImplementation(async () => ({ data: Readable.from(['data: {"type":"delta","text":"ок"}\n']) }));
+  });
+
+  it('рубильник Kimi — provider=kimi', async () => {
+    const svc = new CleanAskService({} as any, { get: jest.fn(async () => 'kimi') } as any);
+    expect(await (svc as any).callRelay('вопрос')).toBe('ок');
+    expect(fieldsOf(post.mock.calls[0][1]).provider).toBe('kimi');
+  });
+
+  it('рубильник Claude — без provider', async () => {
+    const svc = new CleanAskService({} as any, { get: jest.fn(async () => 'claude') } as any);
+    await (svc as any).callRelay('вопрос');
+    expect(fieldsOf(post.mock.calls[0][1]).provider).toBeUndefined();
+  });
+});
+
+/**
+ * Эфемерный путь «поговорить начисто» не должен молча застыть на Claude при
+ * поломке графа DI: конструктор объявляет globalProvider БЕЗ @Optional()
+ * (параметр остаётся TS-опциональным — тесты выше и в describe
+ * CleanAskService.firstContact создают сервис через `new` с одним
+ * аргументом). design:paramtypes не видит сам декоратор @Optional() — он
+ * сторожит только то, что параметры объявлены КЛАССАМИ AgentsService и
+ * GlobalLlmProviderService, а не интерфейсом/Object (та же ловушка, что в
+ * user-llm-provider.service.spec.ts).
+ */
+describe('CleanAskService: DI-тип рубильника', () => {
+  it('конструктор объявляет зависимости классами AgentsService и GlobalLlmProviderService', () => {
+    expect(Reflect.getMetadata('design:paramtypes', CleanAskService)).toEqual([AgentsService, GlobalLlmProviderService]);
   });
 });
