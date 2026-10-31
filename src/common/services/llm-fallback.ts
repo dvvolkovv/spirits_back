@@ -190,3 +190,102 @@ export function fallbackSpawnEnv(base: NodeJS.ProcessEnv, cfg: FallbackConfig): 
     CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '0',
   };
 }
+
+/** За какое окно считаются исходы аварийных вызовов (для алерта). */
+export const STATS_WINDOW_MS = 15 * 60_000;
+
+/**
+ * Окна запасного пути — на процесс (spec 2026-10-31, раздел 2).
+ * Окно Claude: после сбоя доступа к Claude вызовы идут сразу к запасным.
+ * Окно «не отвечает» у каждого запасного: после его сбоя доступа аварийная
+ * цепочка его пропускает. Исходы аварийных вызовов — по провайдеру, за 15 мин.
+ */
+export class FallbackState {
+  private claudeOpenUntil = 0;
+  /** Когда окно Claude открыли в последний раз: успех Claude, начатый раньше,
+   *  окно не закрывает — о Claude после того сбоя он ничего не говорит. */
+  private claudeOpenedAt = 0;
+  private readonly downUntil: Partial<Record<FallbackProvider, number>> = {};
+  private outcomes: Array<{ at: number; name: FallbackProvider; ok: boolean }> = [];
+
+  claudeWindowOpen(now: number = Date.now()): boolean {
+    return now < this.claudeOpenUntil;
+  }
+
+  /** Момент закрытия окна Claude; 0 — закрыто (в том числе истекло). */
+  claudeWindowUntil(now: number = Date.now()): number {
+    return this.claudeOpenUntil > now ? this.claudeOpenUntil : 0;
+  }
+
+  openClaudeWindow(ms: number, now: number = Date.now()): void {
+    this.claudeOpenedAt = now;
+    this.claudeOpenUntil = now + ms;
+  }
+
+  closeClaudeWindow(): void {
+    this.claudeOpenUntil = 0;
+  }
+
+  claudeSucceeded(startedAt: number): void {
+    if (startedAt >= this.claudeOpenedAt) this.claudeOpenUntil = 0;
+  }
+
+  isDown(name: FallbackProvider, now: number = Date.now()): boolean {
+    return now < (this.downUntil[name] ?? 0);
+  }
+
+  /** Момент снятия «не отвечает»; 0 — отвечает. */
+  downUntilOf(name: FallbackProvider, now: number = Date.now()): number {
+    const t = this.downUntil[name] ?? 0;
+    return t > now ? t : 0;
+  }
+
+  markDown(name: FallbackProvider, ms: number, now: number = Date.now()): void {
+    this.downUntil[name] = now + ms;
+  }
+
+  markUp(name: FallbackProvider): void {
+    this.downUntil[name] = 0;
+  }
+
+  recordOutcome(name: FallbackProvider, ok: boolean, now: number = Date.now()): void {
+    this.outcomes.push({ at: now, name, ok });
+    this.prune(now);
+  }
+
+  counts(name: FallbackProvider, now: number = Date.now()): { ok: number; failed: number } {
+    this.prune(now);
+    const mine = this.outcomes.filter((o) => o.name === name);
+    const ok = mine.filter((o) => o.ok).length;
+    return { ok, failed: mine.length - ok };
+  }
+
+  private prune(now: number): void {
+    const from = now - STATS_WINDOW_MS;
+    this.outcomes = this.outcomes.filter((o) => o.at >= from);
+  }
+}
+
+/**
+ * План вызова — кого пробовать по порядку (spec 2026-10-31, раздел 3).
+ * noFallback — только Claude. Обычный путь: окно Claude закрыто — Claude, затем
+ * включённые и отвечающие запасные; открыто — только они (если таких нет — как
+ * при закрытом). Выбранный пользователем (с ключом) — первым, даже если он
+ * «не отвечает», затем обычный путь без него.
+ */
+export function planProviders(args: {
+  selected?: FallbackProvider;
+  configs: FallbackConfigs;
+  state: FallbackState;
+  noFallback?: boolean;
+  now?: number;
+}): AnswerProvider[] {
+  if (args.noFallback) return ['claude'];
+  const now = args.now ?? Date.now();
+  const normal = (exclude?: FallbackProvider): AnswerProvider[] => {
+    const alts = FALLBACK_ORDER.filter((n) => n !== exclude && args.configs[n] !== null && !args.state.isDown(n, now));
+    return args.state.claudeWindowOpen(now) && alts.length > 0 ? [...alts] : ['claude', ...alts];
+  };
+  if (args.selected && args.configs[args.selected] !== null) return [args.selected, ...normal(args.selected)];
+  return normal();
+}

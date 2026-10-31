@@ -1,12 +1,16 @@
 import {
   DEFAULT_BREAKER_MS,
   FALLBACK_ORDER,
+  FallbackConfig,
+  FallbackState,
   PROVIDER_DEFAULTS,
+  STATS_WINDOW_MS,
   fallbackModelFor,
   fallbackSpawnEnv,
   fallbackTimeoutMs,
   isAnswerProvider,
   isFallbackWorthy,
+  planProviders,
   readBreakerMs,
   readFallbackConfig,
   readFallbackConfigs,
@@ -198,4 +202,97 @@ describe('fallbackTimeoutMs', () => {
 describe('isAnswerProvider', () => {
   it.each(['claude', 'qwen', 'kimi'])('%s — да', (v) => expect(isAnswerProvider(v)).toBe(true));
   it.each(['gpt', '', 'Qwen', null, undefined, 1])('%p — нет', (v) => expect(isAnswerProvider(v)).toBe(false));
+});
+
+describe('FallbackState', () => {
+  it('окно Claude: открытие, истечение, закрытие успехом, начатым после открытия', () => {
+    const s = new FallbackState();
+    expect(s.claudeWindowOpen(1000)).toBe(false);
+    s.openClaudeWindow(60_000, 1000);
+    expect(s.claudeWindowOpen(2000)).toBe(true);
+    expect(s.claudeWindowUntil(2000)).toBe(61_000);
+    s.claudeSucceeded(500); // начат до открытия — окно не закрывает
+    expect(s.claudeWindowOpen(2000)).toBe(true);
+    s.claudeSucceeded(1500); // начат после — закрывает
+    expect(s.claudeWindowOpen(2000)).toBe(false);
+    expect(s.claudeWindowUntil(2000)).toBe(0);
+    s.openClaudeWindow(60_000, 3000);
+    expect(s.claudeWindowUntil(70_000)).toBe(0); // истекло — 0, а не момент в прошлом
+    s.openClaudeWindow(60_000, 80_000);
+    s.closeClaudeWindow();
+    expect(s.claudeWindowOpen(80_001)).toBe(false);
+  });
+
+  it('«не отвечает» — своё у каждого запасного', () => {
+    const s = new FallbackState();
+    s.markDown('qwen', 60_000, 1000);
+    expect(s.isDown('qwen', 2000)).toBe(true);
+    expect(s.isDown('kimi', 2000)).toBe(false);
+    expect(s.downUntilOf('qwen', 2000)).toBe(61_000);
+    expect(s.downUntilOf('qwen', 61_000)).toBe(0);
+    s.markUp('qwen');
+    expect(s.isDown('qwen', 2000)).toBe(false);
+  });
+
+  it('исходы — по провайдеру, за 15 минут', () => {
+    const s = new FallbackState();
+    s.recordOutcome('qwen', true, 1000);
+    s.recordOutcome('qwen', false, 2000);
+    s.recordOutcome('kimi', true, 3000);
+    expect(s.counts('qwen', 4000)).toEqual({ ok: 1, failed: 1 });
+    expect(s.counts('kimi', 4000)).toEqual({ ok: 1, failed: 0 });
+    expect(s.counts('qwen', 2000 + STATS_WINDOW_MS + 1)).toEqual({ ok: 0, failed: 0 });
+  });
+});
+
+describe('planProviders', () => {
+  const cfg = (name: 'qwen' | 'kimi'): FallbackConfig => ({ name, apiKey: 'k', baseUrl: 'u', models: { opus: 'o', sonnet: 's', haiku: 'h' } });
+  const both = { qwen: cfg('qwen'), kimi: cfg('kimi') };
+  const T = 10_000;
+
+  it('noFallback — только Claude, выбор не действует', () => {
+    expect(planProviders({ selected: 'kimi', configs: both, state: new FallbackState(), noFallback: true, now: T })).toEqual(['claude']);
+  });
+  it('окно Claude закрыто — Claude, Qwen, Kimi', () => {
+    expect(planProviders({ configs: both, state: new FallbackState(), now: T })).toEqual(['claude', 'qwen', 'kimi']);
+  });
+  it('без ключа Qwen — Claude, Kimi', () => {
+    expect(planProviders({ configs: { qwen: null, kimi: cfg('kimi') }, state: new FallbackState(), now: T })).toEqual(['claude', 'kimi']);
+  });
+  it('без ключей — только Claude', () => {
+    expect(planProviders({ configs: { qwen: null, kimi: null }, state: new FallbackState(), now: T })).toEqual(['claude']);
+  });
+  it('окно Claude открыто — только запасные', () => {
+    const s = new FallbackState();
+    s.openClaudeWindow(60_000, T);
+    expect(planProviders({ configs: both, state: s, now: T + 1 })).toEqual(['qwen', 'kimi']);
+  });
+  it('запасной «не отвечает» — пропускается', () => {
+    const s = new FallbackState();
+    s.markDown('qwen', 60_000, T);
+    expect(planProviders({ configs: both, state: s, now: T + 1 })).toEqual(['claude', 'kimi']);
+  });
+  it('окно открыто, а все запасные «не отвечают» — Claude', () => {
+    const s = new FallbackState();
+    s.openClaudeWindow(60_000, T);
+    s.markDown('qwen', 60_000, T);
+    s.markDown('kimi', 60_000, T);
+    expect(planProviders({ configs: both, state: s, now: T + 1 })).toEqual(['claude']);
+  });
+  it('выбран Kimi — сначала он, затем обычный путь без него', () => {
+    expect(planProviders({ selected: 'kimi', configs: both, state: new FallbackState(), now: T })).toEqual(['kimi', 'claude', 'qwen']);
+  });
+  it('выбран Kimi при открытом окне — Kimi, затем Qwen', () => {
+    const s = new FallbackState();
+    s.openClaudeWindow(60_000, T);
+    expect(planProviders({ selected: 'kimi', configs: both, state: s, now: T + 1 })).toEqual(['kimi', 'qwen']);
+  });
+  it('выбранный пробуется первым, даже когда он «не отвечает»', () => {
+    const s = new FallbackState();
+    s.markDown('kimi', 60_000, T);
+    expect(planProviders({ selected: 'kimi', configs: both, state: s, now: T + 1 })).toEqual(['kimi', 'claude', 'qwen']);
+  });
+  it('выбран без ключа — обычный путь', () => {
+    expect(planProviders({ selected: 'kimi', configs: { qwen: cfg('qwen'), kimi: null }, state: new FallbackState(), now: T })).toEqual(['claude', 'qwen']);
+  });
 });
