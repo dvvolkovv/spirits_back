@@ -64,7 +64,8 @@ def need(snippet):
 # ломал бы каждый ход. Поэтому — проверка до записи.
 for decl in ('const sessionId = ', 'const args = [', 'const reqModel = ', 'let streamedAny = ',
              'let clientDisconnected = ', 'const notice = ', 'const FATAL_RE = ', 'const fatalHint = ',
-             'const TRANSIENT_RE = ', 'const IMG_LIMIT_RE = ', 'const NO_RESP_PLACEHOLDER = '):
+             'const TRANSIENT_RE = ', 'const IMG_LIMIT_RE = ', 'const NO_RESP_PLACEHOLDER = ',
+             'let taleridWriteUsed = '):
     need(decl)
 
 # 1. Модуль.
@@ -224,8 +225,10 @@ region('          // Сбой доступа (qwen-provider.mjs): отказ CLI
        '            // (403/Arrearage и т.п. не обязаны совпасть с FATAL_RE или TRANSIENT_RE —\n'
        '            // без этого возврата ушли бы прямиком к записи result ниже).\n'
        '            if (fatalAccess) {\n'
-       '              notice(FATAL_RE.test(ev.result) ? fatalHint(ev.result) : "_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_",\n'
-       '                FATAL_RE.test(ev.result) ? "cli_fatal" : "transient");\n'
+       '              if (FATAL_RE.test(ev.result)) notice(fatalHint(ev.result), "cli_fatal");\n'
+       '              else if (taleridWriteUsed) notice("_(связь с моделью прервалась после действия — проверьте результат, возможно всё прошло; при необходимости повторите)_", "transient_after_write");\n'
+       '              else if (streamedAny) notice("\\n\\n_(связь с моделью прервалась, ответ оборван. Токены за этот ход не списаны — повторите вопрос.)_", "transient_after_partial");\n'
+       '              else notice("_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_", "transient");\n'
        '              return;\n'
        '            }\n'
        '          }\n'

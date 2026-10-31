@@ -1008,8 +1008,10 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
             // (403/Arrearage и т.п. не обязаны совпасть с FATAL_RE или TRANSIENT_RE —
             // без этого возврата ушли бы прямиком к записи result ниже).
             if (fatalAccess) {
-              notice(FATAL_RE.test(ev.result) ? fatalHint(ev.result) : "_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_",
-                FATAL_RE.test(ev.result) ? "cli_fatal" : "transient");
+              if (FATAL_RE.test(ev.result)) notice(fatalHint(ev.result), "cli_fatal");
+              else if (taleridWriteUsed) notice("_(связь с моделью прервалась после действия — проверьте результат, возможно всё прошло; при необходимости повторите)_", "transient_after_write");
+              else if (streamedAny) notice("\n\n_(связь с моделью прервалась, ответ оборван. Токены за этот ход не списаны — повторите вопрос.)_", "transient_after_partial");
+              else notice("_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_", "transient");
               return;
             }
           }
