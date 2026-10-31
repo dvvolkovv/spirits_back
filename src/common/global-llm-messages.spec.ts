@@ -1,4 +1,4 @@
-import { mskStamp, reminderText, switchedText } from './global-llm-messages';
+import { maskActor, mskStamp, reminderText, standPrefix, switchedText } from './global-llm-messages';
 
 describe('тексты рубильника', () => {
   it('mskStamp — дд.мм чч:мм по Москве', () => {
@@ -19,6 +19,12 @@ describe('тексты рубильника', () => {
 
   it('актор экранируется для HTML', () => {
     expect(switchedText('claude', 'qwen', '<b>x</b>')).toContain('&lt;b&gt;x&lt;/b&gt;');
+  });
+
+  it('переключение — актор-телефон маскируется в сообщении для группы', () => {
+    const t = switchedText('claude', 'qwen', '79030169187');
+    expect(t).toContain('Переключил: …9187');
+    expect(t).not.toContain('79030169187');
   });
 
   it('напоминание: модель, с какого момента, дни, состояние Claude', () => {
@@ -47,16 +53,71 @@ describe('тексты рубильника', () => {
     expect(t).toContain('Claude по последней пробе: нет данных');
   });
 
-  it('напоминание: счёт за сутки — ответов через модель рубильника и сколько раз она не ответила', () => {
+  it('напоминание: счёт за сутки — три числа, без гостей — без скобки', () => {
     const t = reminderText({
       provider: 'qwen', since: null, now: new Date(), claudeStatus: 'ok', claudeCheckedAt: null, keyMissing: false,
-      day: { ok: 120, other: 3 },
+      day: { answered: 120, byOther: 3, failed: 5, guests: 0 },
     });
-    expect(t).toContain('За сутки через Qwen: 120 вызовов (ответы людям и фоновые задачи); не ответила, ответил другой — 3');
+    expect(t).toContain('За сутки через Qwen: ответила — 120; ответил другой — 3; без ответа — 5.');
+    expect(t).not.toContain('из них гостям');
+  });
+
+  it('напоминание: счёт за сутки — гости в скобке', () => {
+    const t = reminderText({
+      provider: 'qwen', since: null, now: new Date(), claudeStatus: 'ok', claudeCheckedAt: null, keyMissing: false,
+      day: { answered: 120, byOther: 3, failed: 5, guests: 2 },
+    });
+    expect(t).toContain('За сутки через Qwen: ответила — 120; ответил другой — 3; без ответа — 5 (из них гостям — 2).');
   });
 
   it('напоминание: счёта нет (сбой запроса) — строки нет', () => {
     const t = reminderText({ provider: 'qwen', since: null, now: new Date(), claudeStatus: 'ok', claudeCheckedAt: null, keyMissing: false, day: null });
     expect(t).not.toContain('За сутки');
+  });
+
+  it('напоминание: меньше суток — в часах, не днях', () => {
+    const t = reminderText({
+      provider: 'qwen', since: '2026-11-01T05:00:00Z', now: new Date('2026-11-01T10:00:00Z'),
+      claudeStatus: 'ok', claudeCheckedAt: null, keyMissing: false,
+    });
+    expect(t).toContain('(5 ч)');
+    expect(t).not.toContain('дн.');
+  });
+
+  it('напоминание: since в будущем (рассинхрон часов) — не уходит в минус', () => {
+    const t = reminderText({
+      provider: 'qwen', since: '2026-11-01T10:00:00Z', now: new Date('2026-11-01T09:00:00Z'),
+      claudeStatus: 'ok', claudeCheckedAt: null, keyMissing: false,
+    });
+    expect(t).toContain('(0 ч)');
+  });
+});
+
+describe('maskActor', () => {
+  it('телефон — … и последние 4 цифры', () => {
+    expect(maskActor('79030169187')).toBe('…9187');
+  });
+
+  it('UUID (вход по почте/OAuth) — первые 8 символов', () => {
+    expect(maskActor('3f2b9c1e-8a4d-4e6f-9b0a-1c2d3e4f5a6b')).toBe('3f2b9c1e');
+  });
+
+  it('не похоже ни на телефон, ни на UUID (служебный id) — без изменений', () => {
+    expect(maskActor('admin-1')).toBe('admin-1');
+    expect(maskActor('unknown')).toBe('unknown');
+  });
+});
+
+describe('standPrefix', () => {
+  it('BACKEND_URL с test. (стенд) — префикс [test]', () => {
+    expect(standPrefix({ BACKEND_URL: 'https://test.linkeon.io' } as any)).toBe('[test] ');
+  });
+
+  it('BACKEND_URL прода — без префикса', () => {
+    expect(standPrefix({ BACKEND_URL: 'https://my.linkeon.io' } as any)).toBe('');
+  });
+
+  it('BACKEND_URL не задан — без префикса', () => {
+    expect(standPrefix({} as any)).toBe('');
   });
 });

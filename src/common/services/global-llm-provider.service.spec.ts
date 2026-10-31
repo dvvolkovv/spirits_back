@@ -75,6 +75,9 @@ describe('GlobalLlmProviderService', () => {
     expect(r).toEqual({ previous: 'qwen' });
     const upsert = query.mock.calls.find((c) => /INSERT INTO llm_settings/.test(c[0]))!;
     expect(upsert[0]).toMatch(/ON CONFLICT \(key\) DO UPDATE/);
+    // Повторная запись ТОГО ЖЕ значения не должна трогать updated_at/updated_by
+    // (ревью 01.11) — реальный прогон на живой базе в global-llm-provider.pg.spec.ts.
+    expect(upsert[0]).toMatch(/WHERE llm_settings\.value IS DISTINCT FROM EXCLUDED\.value/);
     expect(upsert[1]).toEqual(['global_provider', JSON.stringify({ provider: 'kimi' }), 'admin-1']);
     query.mockClear();
     expect(await svc.get()).toBe('kimi');

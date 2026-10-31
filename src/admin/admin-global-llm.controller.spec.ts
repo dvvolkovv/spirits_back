@@ -1,6 +1,8 @@
 import 'reflect-metadata';
 import { Logger } from '@nestjs/common';
+import { MODULE_METADATA, OPTIONAL_DEPS_METADATA, PATH_METADATA } from '@nestjs/common/constants';
 import { AdminGlobalLlmController } from './admin-global-llm.controller';
+import { AdminModule } from './admin.module';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
 import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
@@ -12,7 +14,11 @@ const mkRes = () => { const res: any = {}; res.status = jest.fn(() => res); res.
 const status = (provider: string) => ({ provider, since: '2026-10-31T13:40:00.000Z', by: 'admin-1' });
 
 describe('AdminGlobalLlmController', () => {
-  const OLD = { qwen: process.env.QWEN_FALLBACK_API_KEY, kimi: process.env.KIMI_FALLBACK_API_KEY };
+  const OLD = {
+    qwen: process.env.QWEN_FALLBACK_API_KEY,
+    kimi: process.env.KIMI_FALLBACK_API_KEY,
+    backend: process.env.BACKEND_URL,
+  };
   const keys = (qwen: boolean, kimi: boolean) => {
     if (qwen) process.env.QWEN_FALLBACK_API_KEY = 'sk-sp-test'; else delete process.env.QWEN_FALLBACK_API_KEY;
     if (kimi) process.env.KIMI_FALLBACK_API_KEY = 'sk-kimi-test'; else delete process.env.KIMI_FALLBACK_API_KEY;
@@ -20,7 +26,9 @@ describe('AdminGlobalLlmController', () => {
   afterEach(() => {
     if (OLD.qwen === undefined) delete process.env.QWEN_FALLBACK_API_KEY; else process.env.QWEN_FALLBACK_API_KEY = OLD.qwen;
     if (OLD.kimi === undefined) delete process.env.KIMI_FALLBACK_API_KEY; else process.env.KIMI_FALLBACK_API_KEY = OLD.kimi;
+    if (OLD.backend === undefined) delete process.env.BACKEND_URL; else process.env.BACKEND_URL = OLD.backend;
     (sendTelegramAlert as jest.Mock).mockClear();
+    (sendTelegramAlert as jest.Mock).mockImplementation(async () => undefined);
     jest.restoreAllMocks();
   });
 
@@ -38,7 +46,7 @@ describe('AdminGlobalLlmController', () => {
     expect(res.json).toHaveBeenCalledWith({ ...status('qwen'), configured: { qwen: true, kimi: false } });
   });
 
-  it('POST qwen: пишет с актором, лог, сообщение в группу, отдаёт новый статус', async () => {
+  it('POST qwen: пишет с актором, лог, сообщение в группу, отдаёт новый статус целиком', async () => {
     keys(true, false);
     const log = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
     const svc = { status: jest.fn(async () => status('qwen')), set: jest.fn(async () => ({ previous: 'claude' })) };
@@ -46,6 +54,9 @@ describe('AdminGlobalLlmController', () => {
     await new AdminGlobalLlmController(svc as any).set({ userId: 'admin-1' }, { provider: 'qwen' }, res);
     expect(svc.set).toHaveBeenCalledWith('qwen', 'admin-1');
     expect(res.status).toHaveBeenCalledWith(200);
+    // Тело ответа целиком — не только статус-код (ревью 01.11): провайдер,
+    // since, by и ключи должны дойти до клиента, а не только HTTP 200.
+    expect(res.json).toHaveBeenCalledWith({ ...status('qwen'), configured: { qwen: true, kimi: false } });
     expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toContain('admin-1: claude → qwen');
     expect(sendTelegramAlert).toHaveBeenCalledTimes(1);
     expect((sendTelegramAlert as jest.Mock).mock.calls[0][0]).toContain('Модель ответов для всех: Qwen');
@@ -86,6 +97,63 @@ describe('AdminGlobalLlmController', () => {
     await new AdminGlobalLlmController(svc as any).set({ userId: 'admin-1' }, { provider: 'claude' }, res);
     expect(res.status).toHaveBeenCalledWith(200);
   });
+
+  it('запись упала — сообщения нет', async () => {
+    keys(true, false);
+    const svc = { status: jest.fn(), set: jest.fn(async () => { throw new Error('db down'); }) };
+    const res = mkRes();
+    await expect(
+      new AdminGlobalLlmController(svc as any).set({ userId: 'admin-1' }, { provider: 'qwen' }, res),
+    ).rejects.toThrow('db down');
+    expect(sendTelegramAlert).not.toHaveBeenCalled();
+  });
+
+  it('Telegram завис — ответ 200 сразу, set() не ждёт отправку', async () => {
+    keys(true, false);
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    (sendTelegramAlert as jest.Mock).mockImplementationOnce(() => new Promise(() => { /* никогда не разрешается */ }));
+    const svc = { status: jest.fn(async () => status('qwen')), set: jest.fn(async () => ({ previous: 'claude' })) };
+    const res = mkRes();
+    await new AdminGlobalLlmController(svc as any).set({ userId: 'admin-1' }, { provider: 'qwen' }, res);
+    expect(res.status).toHaveBeenCalledWith(200);
+  });
+
+  it('сбой статуса после успешной записи — не 500, отвечает известными значениями', async () => {
+    keys(true, false);
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const svc = { status: jest.fn(async () => { throw new Error('db down'); }), set: jest.fn(async () => ({ previous: 'claude' })) };
+    const res = mkRes();
+    await new AdminGlobalLlmController(svc as any).set({ userId: 'admin-1' }, { provider: 'qwen' }, res);
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith({ provider: 'qwen', since: null, by: 'admin-1', configured: { qwen: true, kimi: false } });
+    expect(warn.mock.calls.map((c) => String(c[0])).join('\n')).toContain('статус после записи не прочитан');
+  });
+
+  it('стенд (BACKEND_URL test.) — сообщение в группу с пометкой [test]', async () => {
+    keys(true, false);
+    process.env.BACKEND_URL = 'https://test.linkeon.io';
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    const svc = { status: jest.fn(async () => status('qwen')), set: jest.fn(async () => ({ previous: 'claude' })) };
+    await new AdminGlobalLlmController(svc as any).set({ userId: 'admin-1' }, { provider: 'qwen' }, mkRes());
+    expect((sendTelegramAlert as jest.Mock).mock.calls[0][0]).toMatch(/^\[test\] /);
+  });
+});
+
+/**
+ * Незарегистрированный контроллер отдаёт 404 при зелёных юнит-тестах (как в
+ * admin-products.controller.spec.ts) — метаданные гвардов и DI-тип этого не
+ * видят.
+ */
+describe('AdminGlobalLlmController: регистрация и путь', () => {
+  it('зарегистрирован в AdminModule', () => {
+    expect(Reflect.getMetadata(MODULE_METADATA.CONTROLLERS, AdminModule)).toContain(AdminGlobalLlmController);
+  });
+
+  it('путь — GET/POST admin/llm-provider', () => {
+    expect(Reflect.getMetadata(PATH_METADATA, AdminGlobalLlmController.prototype.get)).toBe('admin/llm-provider');
+    expect(Reflect.getMetadata(PATH_METADATA, AdminGlobalLlmController.prototype.set)).toBe('admin/llm-provider');
+  });
 });
 
 /**
@@ -100,5 +168,9 @@ describe('AdminGlobalLlmController', () => {
 describe('AdminGlobalLlmController: DI-тип рубильника', () => {
   it('конструктор объявляет зависимость классом GlobalLlmProviderService', () => {
     expect(Reflect.getMetadata('design:paramtypes', AdminGlobalLlmController)).toEqual([GlobalLlmProviderService]);
+  });
+
+  it('без @Optional() — ни один параметр не помечен необязательным', () => {
+    expect(Reflect.getMetadata(OPTIONAL_DEPS_METADATA, AdminGlobalLlmController)).toBeUndefined();
   });
 });

@@ -1,5 +1,6 @@
 import 'reflect-metadata';
 import { Logger } from '@nestjs/common';
+import { OPTIONAL_DEPS_METADATA } from '@nestjs/common/constants';
 import { AdminLlmProviderController } from './admin-llm-provider.controller';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
@@ -34,7 +35,7 @@ describe('AdminLlmProviderController', () => {
 
   it('GET: выбор и ключи по каждому запасному (+ прежнее qwenConfigured)', async () => {
     keys(true, false);
-    const svc = { get: jest.fn(async () => 'kimi'), set: jest.fn(), route: jest.fn(async () => ({ provider: 'kimi', choice: 'user' })) };
+    const svc = { get: jest.fn(async () => 'kimi'), set: jest.fn() };
     const res = mkRes();
     await new AdminLlmProviderController(svc as any, global as any).get('u-1', res);
     expect(svc.get).toHaveBeenCalledWith('u-1');
@@ -46,7 +47,7 @@ describe('AdminLlmProviderController', () => {
 
   it('GET без ключей — всё false', async () => {
     keys(false, false);
-    const svc = { get: jest.fn(async () => 'claude'), set: jest.fn(), route: jest.fn(async () => ({ provider: 'claude', choice: 'global' })) };
+    const svc = { get: jest.fn(async () => 'claude'), set: jest.fn() };
     const res = mkRes();
     await new AdminLlmProviderController(svc as any, global as any).get('u-1', res);
     expect(res.json).toHaveBeenCalledWith({
@@ -56,7 +57,7 @@ describe('AdminLlmProviderController', () => {
 
   it('POST kimi: сохраняет и отдаёт новое значение', async () => {
     keys(false, true);
-    const svc = { get: jest.fn(), set: jest.fn(async () => true), route: jest.fn(async () => ({ provider: 'kimi', choice: 'user' })) };
+    const svc = { get: jest.fn(), set: jest.fn(async () => true) };
     const res = mkRes();
     await new AdminLlmProviderController(svc as any, global as any).set('u-1', { userId: 'admin-1' }, { provider: 'kimi' }, res);
     expect(svc.set).toHaveBeenCalledWith('u-1', 'kimi');
@@ -67,7 +68,7 @@ describe('AdminLlmProviderController', () => {
   });
 
   it('POST: чужое значение — 400 со списком допустимых, ничего не пишет', async () => {
-    const svc = { get: jest.fn(), set: jest.fn(), route: jest.fn(async () => ({ provider: 'claude', choice: 'global' })) };
+    const svc = { get: jest.fn(), set: jest.fn() };
     const res = mkRes();
     await new AdminLlmProviderController(svc as any, global as any).set('u-1', { userId: 'admin-1' }, { provider: 'gpt' }, res);
     expect(res.status).toHaveBeenCalledWith(400);
@@ -76,7 +77,7 @@ describe('AdminLlmProviderController', () => {
   });
 
   it('POST: нет пользователя — 404', async () => {
-    const svc = { get: jest.fn(), set: jest.fn(async () => false), route: jest.fn(async () => ({ provider: 'claude', choice: 'global' })) };
+    const svc = { get: jest.fn(), set: jest.fn(async () => false) };
     const res = mkRes();
     await new AdminLlmProviderController(svc as any, global as any).set('nobody', { userId: 'admin-1' }, { provider: 'claude' }, res);
     expect(res.status).toHaveBeenCalledWith(404);
@@ -85,7 +86,7 @@ describe('AdminLlmProviderController', () => {
   it('POST: успешная смена — лог с актором, пользователем и значением', async () => {
     keys(false, false);
     const log = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
-    const svc = { get: jest.fn(), set: jest.fn(async () => true), route: jest.fn(async () => ({ provider: 'kimi', choice: 'user' })) };
+    const svc = { get: jest.fn(), set: jest.fn(async () => true) };
     await new AdminLlmProviderController(svc as any, global as any).set('u-1', { userId: 'admin-1' }, { provider: 'kimi' }, mkRes());
     expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toContain('admin-1 → u-1 = kimi');
     log.mockRestore();
@@ -94,7 +95,7 @@ describe('AdminLlmProviderController', () => {
   it('POST: без user (@CurrentUser не отдал) — актор unknown, лог всё равно пишется', async () => {
     keys(false, false);
     const log = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
-    const svc = { get: jest.fn(), set: jest.fn(async () => true), route: jest.fn(async () => ({ provider: 'claude', choice: 'global' })) };
+    const svc = { get: jest.fn(), set: jest.fn(async () => true) };
     await new AdminLlmProviderController(svc as any, global as any).set('u-1', undefined, { provider: 'claude' }, mkRes());
     expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toContain('unknown → u-1 = claude');
     log.mockRestore();
@@ -102,7 +103,7 @@ describe('AdminLlmProviderController', () => {
 
   it('POST: отказ (400/404) — лог не пишется', async () => {
     const log = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
-    const svc = { get: jest.fn(), set: jest.fn(async () => false), route: jest.fn(async () => ({ provider: 'claude', choice: 'global' })) };
+    const svc = { get: jest.fn(), set: jest.fn(async () => false) };
     await new AdminLlmProviderController(svc as any, global as any).set('nobody', { userId: 'admin-1' }, { provider: 'claude' }, mkRes());
     expect(log).not.toHaveBeenCalled();
     log.mockRestore();
@@ -110,7 +111,7 @@ describe('AdminLlmProviderController', () => {
 
   it('GET: «Как у всех» при рубильнике Qwen — provider default, effective qwen, global qwen', async () => {
     keys(true, false);
-    const svc = { get: jest.fn(async () => 'default'), set: jest.fn(), route: jest.fn(async () => ({ provider: 'qwen', choice: 'global' })) };
+    const svc = { get: jest.fn(async () => 'default'), set: jest.fn() };
     const g = { get: jest.fn(async () => 'qwen') };
     const res = mkRes();
     await new AdminLlmProviderController(svc as any, g as any).get('u-1', res);
@@ -119,9 +120,20 @@ describe('AdminLlmProviderController', () => {
     });
   });
 
+  it('GET: «Как у всех» при рубильнике на модели без ключа — effective claude, а global — как есть', async () => {
+    keys(false, false);
+    const svc = { get: jest.fn(async () => 'default'), set: jest.fn() };
+    const g = { get: jest.fn(async () => 'kimi') };
+    const res = mkRes();
+    await new AdminLlmProviderController(svc as any, g as any).get('u-1', res);
+    expect(res.json).toHaveBeenCalledWith({
+      userId: 'u-1', provider: 'default', effective: 'claude', global: 'kimi', qwenConfigured: false, configured: { qwen: false, kimi: false },
+    });
+  });
+
   it('POST default — пишет «Как у всех»', async () => {
     keys(false, false);
-    const svc = { get: jest.fn(), set: jest.fn(async () => true), route: jest.fn(async () => ({ provider: 'claude', choice: 'global' })) };
+    const svc = { get: jest.fn(), set: jest.fn(async () => true) };
     const res = mkRes();
     await new AdminLlmProviderController(svc as any, { get: jest.fn(async () => 'claude') } as any).set('u-1', { userId: 'admin-1' }, { provider: 'default' }, res);
     expect(svc.set).toHaveBeenCalledWith('u-1', 'default');
@@ -131,16 +143,18 @@ describe('AdminLlmProviderController', () => {
 
 /**
  * Карточка пользователя не должна молча остаться без effective/global, если
- * граф DI не нашёл GlobalLlmProviderService: второй параметр объявлен без
- * @Optional() (TS-опциональность «?» сохранена ради юнит-тестов, которые
- * создают контроллер через `new` с одним аргументом). design:paramtypes не
- * видит сам декоратор @Optional() и не видит «?» — он фиксирует только тип
- * параметра, поэтому должен быть классом GlobalLlmProviderService, а не
- * интерфейсом/Object (тот же приём, что в src/chat/llm-provider-di.spec.ts и
- * user-llm-provider.service.spec.ts).
+ * граф DI не нашёл GlobalLlmProviderService: второй параметр — классом, без
+ * @Optional() (обязательная зависимость — поломка DI валит старт, ревью
+ * 01.11). Сторож типа — design:paramtypes (та же ловушка, что в
+ * src/chat/llm-provider-di.spec.ts: интерфейс/type alias стирается в Object,
+ * и Nest не найдёт провайдер по типу).
  */
 describe('AdminLlmProviderController: DI-тип', () => {
   it('конструктор объявляет зависимости классами UserLlmProviderService и GlobalLlmProviderService', () => {
     expect(Reflect.getMetadata('design:paramtypes', AdminLlmProviderController)).toEqual([UserLlmProviderService, GlobalLlmProviderService]);
+  });
+
+  it('без @Optional() — ни один параметр не помечен необязательным', () => {
+    expect(Reflect.getMetadata(OPTIONAL_DEPS_METADATA, AdminLlmProviderController)).toBeUndefined();
   });
 });

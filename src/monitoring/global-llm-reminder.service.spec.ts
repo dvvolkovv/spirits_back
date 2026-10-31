@@ -1,22 +1,34 @@
 import 'reflect-metadata';
-jest.mock('../common/telegram-alert', () => ({ sendTelegramAlert: jest.fn(async () => undefined) }));
-import { sendTelegramAlert } from '../common/telegram-alert';
+import { Logger } from '@nestjs/common';
+import { MODULE_METADATA, OPTIONAL_DEPS_METADATA } from '@nestjs/common/constants';
+jest.mock('../common/telegram-alert', () => ({
+  sendTelegramAlert: jest.fn(async () => undefined),
+  telegramConfigured: jest.fn(() => true),
+}));
+import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert';
 import { GlobalLlmReminderService } from './global-llm-reminder.service';
 import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
 import { ClaudeHealthService } from './claude-health.service';
 import { PgService } from '../common/services/pg.service';
+import { MonitoringModule } from './monitoring.module';
 
 const health = (llmStatus: 'ok' | 'down' | null) => ({
   getOverview: jest.fn(async () => ({ usage: { llmStatus, llmCheckedAt: '2026-10-31T06:45:00Z' } })),
 });
-/** pg с суточным счётом ответов по выбору рубильника. */
-const pgDay = (ok = 0, other = 0) => ({ query: jest.fn(async () => ({ rows: [{ ok, other }] })) });
+/** pg с суточным счётом по вызовам рубильника: четыре числа (новая форма, ревью 01.11). */
+const pgDay = (answered = 0, byOther = 0, failed = 0, guests = 0) => ({
+  query: jest.fn(async () => ({ rows: [{ answered, by_other: byOther, failed, guests }] })),
+});
 
 describe('GlobalLlmReminderService', () => {
-  const OLD = process.env.KIMI_FALLBACK_API_KEY;
+  const OLD = { kimi: process.env.KIMI_FALLBACK_API_KEY, backend: process.env.BACKEND_URL };
   afterEach(() => {
     (sendTelegramAlert as jest.Mock).mockClear();
-    if (OLD === undefined) delete process.env.KIMI_FALLBACK_API_KEY; else process.env.KIMI_FALLBACK_API_KEY = OLD;
+    (sendTelegramAlert as jest.Mock).mockImplementation(async () => undefined);
+    (telegramConfigured as jest.Mock).mockClear();
+    (telegramConfigured as jest.Mock).mockImplementation(() => true);
+    if (OLD.kimi === undefined) delete process.env.KIMI_FALLBACK_API_KEY; else process.env.KIMI_FALLBACK_API_KEY = OLD.kimi;
+    if (OLD.backend === undefined) delete process.env.BACKEND_URL; else process.env.BACKEND_URL = OLD.backend;
   });
 
   it('рубильник на Claude — молчит', async () => {
@@ -39,17 +51,22 @@ describe('GlobalLlmReminderService', () => {
     expect(text).toContain('фактически отвечает Claude');
   });
 
-  it('счёт за сутки — по событиям с choice=global и selected модели рубильника', async () => {
+  it('счёт за сутки — три числа (ответила/ответил другой/без ответа) и гости', async () => {
     process.env.KIMI_FALLBACK_API_KEY = 'sk-kimi-test';
     const g = { status: jest.fn(async () => ({ provider: 'kimi', since: null, by: null })) };
-    const pg = pgDay(57, 2);
+    const pg = pgDay(50, 3, 2, 1);
     const s = new GlobalLlmReminderService(g as any, health('ok') as any, pg as any);
     await s.remind();
     const [sql, params] = (pg.query as jest.Mock).mock.calls[0];
     expect(sql).toMatch(/props->>'choice' = 'global'/);
-    expect(sql).toMatch(/name IN \('chat_quality', 'claude_cli_call'\)/);
+    expect(sql).toMatch(/props->>'selected' = \$1/);
+    expect(sql).toMatch(/props->>'ok'/);
+    expect(sql).toMatch(/guest_trial_error/);
     expect(params).toEqual(['kimi']);
-    expect((sendTelegramAlert as jest.Mock).mock.calls[0][0]).toContain('За сутки через Kimi: 57 вызовов (ответы людям и фоновые задачи); не ответила, ответил другой — 2');
+    // без ответа — 2 (из chat_quality) + 1 (гость) = 3; из них гостям — 1.
+    expect((sendTelegramAlert as jest.Mock).mock.calls[0][0]).toContain(
+      'За сутки через Kimi: ответила — 50; ответил другой — 3; без ответа — 3 (из них гостям — 1).',
+    );
   });
 
   it('сбой счёта — напоминание уходит без строки «За сутки»', async () => {
@@ -75,10 +92,50 @@ describe('GlobalLlmReminderService', () => {
     expect(await s.remind()).toBe(true);
     expect((sendTelegramAlert as jest.Mock).mock.calls[0][0]).toContain('нет данных');
   });
+
+  it('Telegram не настроен — пишет текст напоминания в лог, не бросает', async () => {
+    (telegramConfigured as jest.Mock).mockImplementation(() => false);
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const g = { status: jest.fn(async () => ({ provider: 'kimi', since: null, by: null })) };
+    const s = new GlobalLlmReminderService(g as any, health('ok') as any, pgDay() as any);
+    expect(await s.remind()).toBe(true);
+    expect(sendTelegramAlert).not.toHaveBeenCalled();
+    expect(warn.mock.calls.map((c) => String(c[0])).join('\n')).toContain('Все отвечают через Kimi');
+    warn.mockRestore();
+  });
+
+  it('стенд (BACKEND_URL test.) — напоминание с пометкой [test]', async () => {
+    process.env.BACKEND_URL = 'https://test.linkeon.io';
+    const g = { status: jest.fn(async () => ({ provider: 'kimi', since: null, by: null })) };
+    const s = new GlobalLlmReminderService(g as any, health('ok') as any, pgDay() as any);
+    await s.remind();
+    expect((sendTelegramAlert as jest.Mock).mock.calls[0][0]).toMatch(/^\[test\] /);
+  });
+});
+
+describe('GlobalLlmReminderService: регистрация', () => {
+  it('зарегистрирован в MonitoringModule', () => {
+    expect(Reflect.getMetadata(MODULE_METADATA.PROVIDERS, MonitoringModule)).toContain(GlobalLlmReminderService);
+  });
 });
 
 /**
- * Суточное напоминание падает молча без effective-данных, если граф DI не
+ * Раз в сутки в 10:01 МСК — не в 10:00: тик пробы живости Claude
+ * (ClaudeHealthService.livenessTick, '0 */15 * * * *') уже занимает этот
+ * момент, совпадение затрудняло бы читать логи (ревью 01.11).
+ */
+describe('GlobalLlmReminderService: расписание', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { SCHEDULE_CRON_OPTIONS } = require('@nestjs/schedule/dist/schedule.constants');
+  it('раз в сутки в 10:01 МСК', () => {
+    const meta = Reflect.getMetadata(SCHEDULE_CRON_OPTIONS, GlobalLlmReminderService.prototype.daily);
+    expect(meta?.cronTime).toBe('0 1 10 * * *');
+    expect(meta?.timeZone).toBe('Europe/Moscow');
+  });
+});
+
+/**
+ * Суточное напоминание не должно молча перестать напоминать, если граф DI не
  * нашёл один из сервисов: все три зависимости — обязательные, без
  * @Optional(). design:paramtypes не видит сам декоратор, но фиксирует, что
  * параметры объявлены классами (а не интерфейсом/Object) — необходимое
@@ -88,5 +145,9 @@ describe('GlobalLlmReminderService', () => {
 describe('GlobalLlmReminderService: DI-тип', () => {
   it('конструктор объявляет зависимости классами GlobalLlmProviderService, ClaudeHealthService, PgService', () => {
     expect(Reflect.getMetadata('design:paramtypes', GlobalLlmReminderService)).toEqual([GlobalLlmProviderService, ClaudeHealthService, PgService]);
+  });
+
+  it('без @Optional() — ни один параметр не помечен необязательным', () => {
+    expect(Reflect.getMetadata(OPTIONAL_DEPS_METADATA, GlobalLlmReminderService)).toBeUndefined();
   });
 });

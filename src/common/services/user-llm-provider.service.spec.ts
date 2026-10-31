@@ -150,4 +150,12 @@ describe('UserLlmProviderService: DI-тип рубильника', () => {
   it('конструктор объявляет зависимости классами PgService и GlobalLlmProviderService', () => {
     expect(Reflect.getMetadata('design:paramtypes', UserLlmProviderService)).toEqual([PgService, GlobalLlmProviderService]);
   });
+
+  // Ревью 01.11: design:paramtypes выше фиксирует только ТИП параметра, не
+  // его обязательность — этот тест проверяет, что сам декоратор @Optional()
+  // (который и делает зависимость необязательной для Nest) здесь не стоит.
+  it('без @Optional() — ни один параметр не помечен необязательным', () => {
+    const { OPTIONAL_DEPS_METADATA } = require('@nestjs/common/constants');
+    expect(Reflect.getMetadata(OPTIONAL_DEPS_METADATA, UserLlmProviderService)).toBeUndefined();
+  });
 });

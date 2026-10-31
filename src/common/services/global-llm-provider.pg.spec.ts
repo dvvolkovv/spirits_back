@@ -51,4 +51,21 @@ maybe('общий рубильник модели против живого Post
     expect(await svc.get()).toBe('claude');
     expect((await svc.status()).provider).toBe('claude');
   });
+
+  // Ревью 01.11: повторный клик по уже текущей модели в админке не должен
+  // сбрасывать «с …» в подсказке под блоком и в суточном напоминании — WHERE
+  // IS DISTINCT FROM в UPDATE должен молча не задеть строку, когда значение
+  // не изменилось.
+  it('повторный set того же значения — since/by не меняются (идемпотентная запись)', async () => {
+    await svc.set('qwen', 'admin-1');
+    const first = await svc.status();
+    expect(first.since).not.toBeNull();
+
+    const r = await svc.set('qwen', 'admin-2');
+    expect(r).toEqual({ previous: 'qwen' });
+    const second = await svc.status();
+    expect(second.provider).toBe('qwen');
+    expect(second.since).toBe(first.since);
+    expect(second.by).toBe('admin-1'); // не затёрто новым актором admin-2
+  });
 });
