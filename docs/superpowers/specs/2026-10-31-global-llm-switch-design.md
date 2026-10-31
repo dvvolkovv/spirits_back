@@ -94,6 +94,7 @@ API — один процесс pm2, так что переключение де
 |---|---|
 | ходы чата — `chat/chat.service.ts` | личный, иначе рубильник |
 | ходы с файлами — `chat/chat.controller.ts` | личный, иначе рубильник |
+| `agentReply` в `chat/chat.service.ts` (через `generateAgentReply*`): рутины, «Путь», план действий, поездки, итоги и документы звонков, задания специалистам | личный, иначе рубильник |
 | автоблог — `blog/blog-relay.client.ts` | рубильник |
 | clean-ask — `ask/clean-ask.service.ts` | рубильник |
 | проба качества — `monitoring/quality-monitor.service.ts` (через `generateAgentReply`) | тестовый аккаунт «Как у всех» — рубильник |
