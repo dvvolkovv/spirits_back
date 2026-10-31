@@ -82,15 +82,17 @@ class StorageError extends StudioError {}
 
 /**
  * Пометка брака рядом с skits/<отпечаток>/rejected-*.mp4. По ней студия решает,
- * перепроверять ли брак до новой оплаты (reviveRejected): сверка поменялась
- * (matcher меньше MATCHER_VERSION) — да, плохой файл (clip_invalid) — нет.
+ * перепроверять ли брак до новой оплаты (reviveRejected): пометка не нынешней
+ * сверки (другая версия или пометки нет) — да; clip_invalid — нет: его отвергла
+ * проверка файла, а не сверка речи.
  */
 export interface RejectedMeta {
   code: 'clip_invalid' | 'speech_mismatch';
-  /** Версия сверки, которая забраковала клип или последней его перепроверила. */
+  /** Версия сверки на момент отказа или последней перепроверки брака. */
   matcher: number;
-  /** Что распознал SpeechKit — у speech_mismatch. */
+  /** Что распознал SpeechKit — у speech_mismatch, целиком. */
   heard?: string;
+  /** Доля услышанных слов реплик — у speech_mismatch. */
   share?: number;
 }
 
@@ -246,7 +248,7 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     try {
       writeAtomic(file, JSON.stringify(meta, null, 2));
     } catch (e) {
-      log(`animate: пометка брака ${path.basename(file)} не записалась — ${failText(e)}`);
+      log(`animate: пометка брака ${path.relative(runDir, file)} не записалась — ${failText(e)}`);
     }
   };
 
@@ -325,7 +327,7 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     const raw = abs(skitFile(kind, 'raw.mp4'));
     const clip = skitFile(kind, 'clip.mp4');
     const next = abs(skitFile(kind, 'clip.next.mp4'));
-    const reject = async (code: RejectedMeta['code'], msg: string, speech?: { heard: string; share: number }): Promise<never> => {
+    const reject = async (code: RejectedMeta['code'], msg: string, speech?: Required<Pick<RejectedMeta, 'heard' | 'share'>>): Promise<never> => {
       fs.rmSync(next, { force: true });
       if (accepted) {
         // Принятый клип не бракуется молча: владелец его уже видел, а пересъёмка стоит денег.
