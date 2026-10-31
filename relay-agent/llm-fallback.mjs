@@ -144,6 +144,14 @@ export function isAccessFailure(text, { isError = false, apiStatus } = {}) {
   return ACCESS_TEXT_RE.test(t);
 }
 
+// Сбой доступа, который штатно НЕ повторяют (в отличие от 401/429/5xx/network —
+// те TRANSIENT_RE в server.mjs гоняет на повтор): 403 (в т.ч. Qwen Token Plan
+// AccessDenied.Unpurchased), Forbidden, Arrearage (долг у Alibaba). Повторный
+// запуск того же провайдера тут бессмыслен — переходить к следующему в плане
+// сразу, не дожидаясь штатного повтора.
+export const NON_RETRY_ACCESS_RE = /\b403\b|forbidden|access.?denied|arrearage/i;
+export const isNonRetryAccess = (text) => NON_RETRY_ACCESS_RE.test(trimmed(text));
+
 // План хода (spec, раздел 3) — как planProviders бэкенда.
 export function planProviders({ selected = "", cfgs, state, noFallback = false, now = Date.now() }) {
   if (noFallback) return ["claude"];
@@ -151,7 +159,10 @@ export function planProviders({ selected = "", cfgs, state, noFallback = false, 
     const alts = FALLBACK_ORDER.filter((n) => n !== exclude && !!cfgs[n] && !state.isDown(n, now));
     return state.claudeWindowOpen(now) && alts.length > 0 ? [...alts] : ["claude", ...alts];
   };
-  if (selected && cfgs[selected]) return [selected, ...normal(selected)];
+  // FALLBACK_ORDER.includes — раньше, чем обращение к cfgs[selected]: иначе
+  // "constructor"/"__proto__" читают прототип Object, а не отсутствие ключа
+  // (паритет с бэкендом, src/common/services/llm-fallback.ts).
+  if (FALLBACK_ORDER.includes(selected) && cfgs[selected]) return [selected, ...normal(selected)];
   return normal("");
 }
 
