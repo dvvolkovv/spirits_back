@@ -696,12 +696,12 @@ ${LanguageService.buildDirective(replyLang)}`;
     // Цена: тяжёлые агентные ходы (сгенерировать договор, собрать финмодель)
     // стоили 30-65k токенов владельца ещё на Sonnet. Опус их умножает, поэтому
     // в tg-bot.service рядом со списанием стоит алерт на дорогой ход.
-    // Модель ответов владельца бота (админка, spec 2026-10-30-llm-provider-switch).
-    const ownerProvider = await resolveAnswerProvider(false, cfg.owner_user_id, this.llmProvider);
+    // Модель ответов владельца бота: личный выбор или общий рубильник (spec 2026-10-31-global-llm-switch).
+    const ownerRoute = await resolveAnswerProvider(false, cfg.owner_user_id, this.llmProvider);
     const { text, costUsd } = await this.claudeCli.textWithCost(userPrompt, {
       system: systemWithCtx,
       model: CHAT_MODEL,
-      ...cliProviderOption(ownerProvider),
+      ...cliProviderOption(ownerRoute),
       timeoutMs: 0,
       attachments: attachmentPaths?.length ? attachmentPaths : undefined,
       onProgress,

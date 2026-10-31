@@ -298,7 +298,7 @@ export class ChatController {
 
     // Модель ответов человека — тот же выбор, что у текстового хода
     // (streamUniversalAgent). Проб мониторинга у загрузки нет.
-    const answerProvider = await resolveAnswerProvider(false, userId, this.llmProvider);
+    const answerRoute = await resolveAnswerProvider(false, userId, this.llmProvider);
 
     // Proxy file + message to remote agent server
     const FormData = require('form-data');
@@ -323,7 +323,7 @@ export class ChatController {
     // Инструменты Linkeon и папка хода — как у текстового хода (linkeon-relay-fields.ts).
     appendLinkeonFields(fd, handoff.linkeon);
     // Выбор Qwen/Kimi — релей сразу идёт к выбранному (answer-provider.ts).
-    for (const [k, v] of Object.entries(relayProviderFields(false, answerProvider))) fd.append(k, v);
+    for (const [k, v] of Object.entries(relayProviderFields(false, answerRoute.provider))) fd.append(k, v);
 
     // Set streaming headers
     res.status(200);

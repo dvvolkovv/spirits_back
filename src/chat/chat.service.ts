@@ -1227,8 +1227,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
       }, PING_MS);
 
       try {
-        // Модель ответов человека (админка): Qwen/Kimi — сразу выбранный, при его сбое — обычный путь; проба — только Claude.
-        const mashaProvider = await resolveAnswerProvider(probe, userId, this.llmProvider);
+        // Модель ответов: личный выбор (админка) или общий рубильник; проба — только Claude.
+        const mashaRoute = await resolveAnswerProvider(probe, userId, this.llmProvider);
         const r = await this.claudeCli.textWithCost(fullPrompt, {
           // Блок про продукты встаёт ДО волатильной части и хвоста языка:
           // требование языка обязано остаться последней строкой (см.
@@ -1245,7 +1245,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           model: probe ? PROBE_MODEL : CHAT_MODEL,
           // Пинг мониторинга меряет путь Claude — без запасных.
           noFallback: probe,
-          ...cliProviderOption(mashaProvider),
+          ...cliProviderOption(mashaRoute),
           // Бюджет хода — общий с релеем. Правка ждёт исхода внутри вызова
           // инструмента до PRODUCT_TOOL_WAIT_MS (2.5 мин) и может позвать его
           // повторно; прежние 90 с убивали бы CLI посреди ожидания — правка уже
@@ -1785,8 +1785,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const agentUsage: SdkUsageTotals = {
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
     };
-    // Модель ответов человека: Qwen/Kimi — релей сразу идёт к выбранному; проба — только Claude.
-    const answerProvider = await resolveAnswerProvider(probe, userId, this.llmProvider);
+    // Модель ответов: личный выбор или общий рубильник — релей сразу идёт к ней; проба — только Claude.
+    const answerRoute = await resolveAnswerProvider(probe, userId, this.llmProvider);
     // Релей сообщил, что ход закончился БЕЗ финального ответа: упёрлись в потолок
     // шагов, ход прерван новым сообщением пользователя, отказ CLI или сбой связи.
     // Такой ход не тарифицируется — платить за пустоту пользователь не должен.
@@ -1843,8 +1843,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
             fail_reason: failReason || undefined,
             provider: turnProvider,
             fallback: turnFallback || undefined,
-            // Выбор человека (не Claude): «выбранный подвёл» — selected ≠ provider.
-            selected: answerProvider === 'claude' ? undefined : answerProvider,
+            // Выбор (не Claude) — личный или рубильник (choice); «выбранный подвёл» — selected ≠ provider.
+            selected: answerRoute.provider === 'claude' ? undefined : answerRoute.provider,
+            choice: answerRoute.provider === 'claude' ? undefined : (answerRoute.choice ?? undefined),
           },
         });
       }
@@ -2017,7 +2018,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // 'default'. В обоих случаях ход проходит — просто пин не действует,
         // и узнать об этом можно только по modelUsage, не по ошибке.
         fd.append('model', probe ? PROBE_MODEL : CHAT_MODEL);
-        for (const [k, v] of Object.entries(relayProviderFields(probe, answerProvider))) fd.append(k, v);
+        for (const [k, v] of Object.entries(relayProviderFields(probe, answerRoute.provider))) fd.append(k, v);
 
         // Agent-direct TalerID: when the user connected the TalerID ecosystem, hand
         // the file-agent a full-scope access token + the MCP base URL of the env we
