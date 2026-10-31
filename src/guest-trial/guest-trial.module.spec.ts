@@ -5,6 +5,7 @@ import { GuestTrialModule } from './guest-trial.module';
 import { ChatModule } from '../chat/chat.module';
 import { ChatService } from '../chat/chat.service';
 import { EventsService } from '../events/events.service';
+import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { GuestTrialController } from './guest-trial.controller';
 import { GuestTrialStore } from './guest-trial-store.service';
@@ -59,11 +60,12 @@ describe('GuestTrialModule: граф зависимостей не оторва�
     expect(Reflect.getMetadata(MODULE_METADATA.CONTROLLERS, GuestTrialModule)).toContain(GuestTrialController);
   });
 
-  it('GuestTurnService объявляет ChatService и EventsService классами, не Object', () => {
+  it('GuestTurnService объявляет ChatService, EventsService и GlobalLlmProviderService классами, не Object', () => {
     const deps = Reflect.getMetadata('design:paramtypes', GuestTurnService);
     expect(Array.isArray(deps)).toBe(true);
     expect(deps).toContain(ChatService);
     expect(deps).toContain(EventsService);
+    expect(deps).toContain(GlobalLlmProviderService);
   });
 
   it('GuestClaimService объявляет EventsService классом, не Object, и больше не зависит от Neo4jService', () => {

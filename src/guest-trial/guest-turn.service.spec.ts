@@ -67,7 +67,11 @@ function harness(opts: {
   limits?: Partial<GuestLimits>;
   reply?: (p: string, o: any) => Promise<{ text: string; costUsd: number }>;
   /** Состояние окна запасного пути на Qwen (дополнение по ревью A1) — по умолчанию закрыто. */
-  fallbackStats?: () => { breakerOpenUntil: number };
+  fallbackStats?: () => any;
+  /** Рубильник (Задача 7, spec 2026-10-31-global-llm-switch, раздел 6) — не
+   *  задан: GlobalLlmProviderService не передаётся совсем, как в проде без
+   *  него не бывает, но так тестируются места, где он не участвует. */
+  global?: 'claude' | 'qwen' | 'kimi';
 } = {}) {
   const limits = { ...DEFAULT_GUEST_LIMITS, ...opts.limits };
   const store = { settings: jest.fn(async () => ({ mode: opts.mode ?? 'on', limits })) };
@@ -80,7 +84,8 @@ function harness(opts: {
   const sessions = memorySessions();
   const chat = { beginStream: jest.fn(), endStream: jest.fn() };
   const events = { track: jest.fn() };
-  const svc = new GuestTurnService(pg as any, redis as any, cli as any, store as any, sessions as any, chat as any, events as any);
+  const global = opts.global ? { get: jest.fn(async () => opts.global) } : undefined;
+  const svc = new GuestTurnService(pg as any, redis as any, cli as any, store as any, sessions as any, chat as any, events as any, global as any);
   svc.redisTimeoutMs = 50;
   const turn = async (body: any = {}) => {
     const { res, events: evs } = makeRes();
@@ -281,6 +286,54 @@ describe('ход гостя: отказы', () => {
     expect(h.cli.textWithCost).not.toHaveBeenCalled();
     expect(h.redis.peek('guest-lim:answers:h')).toBeNull();
     expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'breaker', assistant_id: '12', preview: false } });
+  });
+
+  it('рубильник Qwen — гость идёт в Qwen без цепочки (provider qwen, noFallback)', async () => {
+    const h = harness({
+      global: 'qwen',
+      fallbackStats: () => ({ breakerOpenUntil: 0, providers: { qwen: { enabled: true, downUntil: 0 }, kimi: { enabled: false, downUntil: 0 } } }),
+    });
+    await h.turn();
+    expect(h.cli.textWithCost).toHaveBeenCalledTimes(1);
+    expect(h.cli.textWithCost.mock.calls[0][1]).toMatchObject({ provider: 'qwen', providerChoice: 'global', noFallback: true });
+  });
+
+  it('рубильник Kimi без ключа — сразу error model, модель не зовётся', async () => {
+    const h = harness({
+      global: 'kimi',
+      fallbackStats: () => ({ breakerOpenUntil: 0, providers: { qwen: { enabled: true, downUntil: 0 }, kimi: { enabled: false, downUntil: 0 } } }),
+    });
+    const { evs } = await h.turn();
+    expect(evs.slice(-1)).toEqual([{ type: 'error', code: 'model' }]);
+    expect(h.cli.textWithCost).not.toHaveBeenCalled();
+    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'breaker', assistant_id: '12', preview: false, provider: 'kimi' } });
+  });
+
+  it('рубильник Qwen «не отвечает» — сразу error model', async () => {
+    const h = harness({
+      global: 'qwen',
+      fallbackStats: () => ({ breakerOpenUntil: 0, providers: { qwen: { enabled: true, downUntil: Date.now() + 60_000 }, kimi: { enabled: false, downUntil: 0 } } }),
+    });
+    const { evs } = await h.turn();
+    expect(evs.slice(-1)).toEqual([{ type: 'error', code: 'model' }]);
+    expect(h.cli.textWithCost).not.toHaveBeenCalled();
+  });
+
+  it('рубильник Qwen при открытом окне Claude — гость всё равно идёт в Qwen', async () => {
+    const h = harness({
+      global: 'qwen',
+      fallbackStats: () => ({ breakerOpenUntil: Date.now() + 60_000, providers: { qwen: { enabled: true, downUntil: 0 }, kimi: { enabled: false, downUntil: 0 } } }),
+    });
+    await h.turn();
+    expect(h.cli.textWithCost).toHaveBeenCalledTimes(1);
+  });
+
+  it('рубильник Claude — как раньше: без provider, noFallback', async () => {
+    const h = harness({ global: 'claude' });
+    await h.turn();
+    const o = h.cli.textWithCost.mock.calls[0][1];
+    expect(o.noFallback).toBe(true);
+    expect(o).not.toHaveProperty('provider');
   });
 
   it('общий потолок ответов — closed и одно сообщение владельцу за окно', async () => {
