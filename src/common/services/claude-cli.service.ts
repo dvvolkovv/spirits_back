@@ -1,17 +1,19 @@
 // src/common/services/claude-cli.service.ts
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
 import { spawn } from 'child_process';
 import { StringDecoder } from 'string_decoder';
 import * as os from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PgService } from './pg.service';
+import { GlobalLlmProviderService } from './global-llm-provider.service';
 import { neutralizeAtMentions, stripWordJoiner } from '../agent-guards';
 import { classifyLlmError, looksLikeCliRefusal } from '../llm-error';
 import {
   AnswerProvider,
   FALLBACK_ORDER,
   FallbackConfig,
+  FallbackConfigs,
   FallbackProvider,
   FallbackState,
   NO_FALLBACK_CONFIGS,
@@ -148,15 +150,19 @@ export interface ClaudeCliOptions {
    *  («...you haven't granted it yet»). С MCP вызов всегда идёт в stream-json
    *  (с --verbose). */
   mcpServers?: Record<string, ClaudeCliMcpHttpServer>;
-  /** Только Claude: без запасных и без выбора пользователя. Для проверок
-   *  живости Claude: с запасными они показывали бы «зелёный», когда Claude
-   *  лежит. Сбой такого вызова окно Claude не открывает, успех — закрывает. */
+  /** Без цепочки (spec 2026-10-31-global-llm-switch, раздел 3): без provider —
+   *  только Claude (проверки живости Claude: с запасными они показывали бы
+   *  «зелёный», когда Claude лежит; общий рубильник к ним не применяется); с
+   *  provider — только эта модель (ход гостя пробы). Сбой такого вызова окно
+   *  Claude не открывает, успех — закрывает. */
   noFallback?: boolean;
-  /** Выбор пользователя в админке (UserLlmProviderService): вызов сразу у
-   *  выбранного запасного, при его сбое — обычный путь (Claude, затем запасные
+  /** Чья модель: личный выбор пользователя (админка, UserLlmProviderService) —
+   *  в том числе явный 'claude', к нему общий рубильник не применяется. Не
+   *  задан — модель общего рубильника (GlobalLlmProviderService). Выбранный
+   *  запасной — сразу он, при его сбое — обычный путь (Claude, затем запасные
    *  без него; spec 2026-10-31-kimi-provider-design.md). Не авария: окно Claude
-   *  и аварийные счётчики он не трогает. Без ключа и при noFallback — обычный путь. */
-  provider?: FallbackProvider;
+   *  и аварийные счётчики он не трогает. Без ключа — обычный путь. */
+  provider?: AnswerProvider;
   /** Без флага CLI пишет весь промпт (систему, реплики, ответ) в
    *  ~/.claude/projects/<cwd>/<uuid>.jsonl и хранит cleanupPeriodDays
    *  (по умолчанию 30 дней). При true добавляет --no-session-persistence —
@@ -179,7 +185,12 @@ export class ClaudeCliService implements OnModuleInit {
   // CommonModule and EventsService lives in EventsModule which imports
   // CommonModule — injecting EventsService here creates a module cycle.
   // The DB schema is identical (events table), so direct insert is equivalent.
-  constructor(private readonly pg?: PgService) {}
+  constructor(
+    private readonly pg?: PgService,
+    // Общий рубильник модели (spec 2026-10-31-global-llm-switch). Optional:
+    // тесты и сборки без него работают как раньше — Claude.
+    @Optional() private readonly globalProvider?: GlobalLlmProviderService,
+  ) {}
 
   /**
    * Конфиг вызова с токеном снимается в finally, но процесс, убитый посреди
@@ -283,6 +294,7 @@ export class ClaudeCliService implements OnModuleInit {
   private trackCallEvent(opts: {
     costUsd: number; model: string; durationMs: number; ok: boolean;
     provider: AnswerProvider; fallback: boolean; selected?: FallbackProvider;
+    choice?: 'user' | 'global';
   }) {
     if (!this.pg) return;
     this.pg.query(
@@ -296,6 +308,9 @@ export class ClaudeCliService implements OnModuleInit {
         fallback: opts.fallback,
         // Выбор пользователя (не Claude); «выбранный подвёл» — selected ≠ provider.
         selected: opts.selected,
+        // Чей выбор (spec 2026-10-31-global-llm-switch, раздел 3): рядом с
+        // selected — личный выбор вызывающего или общий рубильник.
+        choice: opts.choice,
       })],
     ).catch((e: any) => this.logger.warn(`claude_cli_call event insert failed: ${e.message}`));
   }
@@ -352,22 +367,36 @@ export class ClaudeCliService implements OnModuleInit {
    * запасных и с noFallback — ровно один вызов Claude, как раньше.
    */
   private async runRaw(prompt: string, opts: ClaudeCliOptions): Promise<CliRunResult> {
-    const configs = opts.noFallback ? NO_FALLBACK_CONFIGS : readFallbackConfigs();
-    // Выбор пользователя (админка) как есть, без учёта ключа, — для события
-    // claude_cli_call (spec, раздел 4: selected — выбор пользователя, если он
-    // не Claude; веб-путь в chat_quality пишет его так же). Пробы (noFallback)
-    // выбору не следуют. Проверка через FALLBACK_ORDER.includes, не configs[...]
-    // и не `in` впрямую: имя из прототипа объекта (например 'constructor')
-    // резолвится правдой по цепочке прототипов и у configs[opts.provider], и у
-    // `in PROVIDER_DEFAULTS` — тот же случай отсекает planProviders.
+    // Чья модель (spec 2026-10-31-global-llm-switch, разделы 1 и 3): вызывающий
+    // выбрал сам (provider, в том числе явный 'claude') — его выбор; не выбрал и
+    // это не проба — общий рубильник; проба мониторинга (noFallback без
+    // provider) — Claude.
+    const fromSwitch = opts.provider === undefined && !opts.noFallback;
+    const requested: AnswerProvider = fromSwitch ? await this.switchProvider() : (opts.provider ?? 'claude');
+    const all = readFallbackConfigs();
+    // Проверка через FALLBACK_ORDER.includes, не all[...] и не `in`: имя из
+    // прототипа объекта (например 'constructor') резолвится правдой по цепочке
+    // прототипов — тот же случай отсекает planProviders.
     const chosen: FallbackProvider | undefined =
-      !opts.noFallback && opts.provider && FALLBACK_ORDER.includes(opts.provider) ? opts.provider : undefined;
+      requested !== 'claude' && FALLBACK_ORDER.includes(requested as FallbackProvider)
+        ? (requested as FallbackProvider)
+        : undefined;
+    // Для события claude_cli_call: чей это выбор — только рядом с selected.
+    const choice: 'user' | 'global' | undefined = chosen ? (fromSwitch ? 'global' : 'user') : undefined;
     // Выбор, по которому идёт вызов, — только с ключом: сразу выбранный, при его
-    // сбое — обычный путь. По нему же — аварийность попытки, текст ошибки и
-    // метки логов.
+    // сбое — обычный путь (у noFallback — ошибка). По нему же — аварийность
+    // попытки, текст ошибки и метки логов.
     let selected: FallbackProvider | undefined;
-    if (chosen && configs[chosen]) selected = chosen;
-    else if (chosen) this.logger.warn(`${PROVIDER_LABELS[chosen]} выбран для пользователя, но ключ ${PROVIDER_DEFAULTS[chosen].envPrefix}_FALLBACK_API_KEY не задан — обычный путь`);
+    if (chosen && all[chosen]) selected = chosen;
+    else if (chosen) {
+      const who = choice === 'global' ? 'для всех (рубильник)' : 'для пользователя';
+      this.logger.warn(`${PROVIDER_LABELS[chosen]} выбран ${who}, но ключ ${PROVIDER_DEFAULTS[chosen].envPrefix}_FALLBACK_API_KEY не задан — обычный путь`);
+    }
+    // noFallback — ни аварийной цепочки, ни окна Claude: в конфигах только
+    // выбранная модель (ход гостя) или никого (проба).
+    const configs: FallbackConfigs = opts.noFallback
+      ? (selected ? { ...NO_FALLBACK_CONFIGS, [selected]: all[selected] } : NO_FALLBACK_CONFIGS)
+      : all;
     const plan = planProviders({ selected, configs, state: this.fallback, noFallback: opts.noFallback });
     const breakerMs = readBreakerMs();
     const startedAt = Date.now();
@@ -386,7 +415,7 @@ export class ClaudeCliService implements OnModuleInit {
       let err: unknown = null;
       try {
         // В событие — выбор пользователя (chosen), даже без ключа у выбранного.
-        res = await this.runOnce(prompt, attemptOpts, p === 'claude' ? null : configs[p], { fallback: emergency, selected: chosen });
+        res = await this.runOnce(prompt, attemptOpts, p === 'claude' ? null : configs[p], { fallback: emergency, selected: chosen, choice });
       } catch (e) {
         err = e;
       }
@@ -456,6 +485,17 @@ export class ClaudeCliService implements OnModuleInit {
     return p === selected ? `${PROVIDER_LABELS[p]} (выбран)` : PROVIDER_LABELS[p];
   }
 
+  /** Модель общего рубильника; без сервиса и при его сбое — Claude. */
+  private async switchProvider(): Promise<AnswerProvider> {
+    if (!this.globalProvider) return 'claude';
+    try {
+      return await this.globalProvider.get();
+    } catch (e: any) {
+      this.logger.warn(`рубильник модели не прочитан: ${e?.message}`);
+      return 'claude';
+    }
+  }
+
   /** Следующий в плане после i: запасной, который за время вызова стал «не
    *  отвечает» (его уронил параллельный вызов), пропускается. -1 — некуда. */
   private nextAttempt(plan: AnswerProvider[], i: number): number {
@@ -514,7 +554,7 @@ export class ClaudeCliService implements OnModuleInit {
     prompt: string,
     opts: ClaudeCliOptions,
     cfg: FallbackConfig | null,
-    meta: { fallback: boolean; selected?: FallbackProvider },
+    meta: { fallback: boolean; selected?: FallbackProvider; choice?: 'user' | 'global' },
   ): Promise<CliRunResult> {
     // Одноразовые каталоги вызова (создаются только когда нужны — см. ниже):
     // копии вложений и конфиг MCP с токенами. Снимаются в finally — и на успехе,
@@ -559,7 +599,7 @@ export class ClaudeCliService implements OnModuleInit {
     opts: ClaudeCliOptions,
     registerTmpDir: (dir: string) => void,
     cfg: FallbackConfig | null,
-    meta: { fallback: boolean; selected?: FallbackProvider },
+    meta: { fallback: boolean; selected?: FallbackProvider; choice?: 'user' | 'global' },
   ): Promise<CliRunResult> {
     const requestedModel = opts.model ?? DEFAULT_MODEL;
     // У запасного в --model уходит его модель: полный id Claude он не знает.
@@ -829,6 +869,7 @@ export class ClaudeCliService implements OnModuleInit {
             provider,
             fallback: meta.fallback,
             selected: meta.selected,
+            choice: meta.choice,
           });
           // stripWordJoiner на выходе: U+2060, которым мы обезвреживали
           // @-упоминания во входе, не должен доехать до пользователя.
@@ -891,6 +932,7 @@ export class ClaudeCliService implements OnModuleInit {
             provider,
             fallback: meta.fallback,
             selected: meta.selected,
+            choice: meta.choice,
           });
           // В json-режиме вызов инструмента не виден: toolUsed всегда false,
           // осторожность — в mayRetry по набору тулов.
