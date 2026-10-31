@@ -4,6 +4,8 @@ import type { Response } from 'express';
 import { PgService } from '../common/services/pg.service';
 import { RedisService } from '../common/services/redis.service';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
+import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
+import { AnswerProvider } from '../common/services/llm-fallback';
 import { LanguageService } from '../common/services/language.service';
 import { looksLikeCliRefusal } from '../common/llm-error';
 import { CHAT_MODEL } from '../common/chat-model';
@@ -103,6 +105,10 @@ export class GuestTurnService {
     private readonly sessions: GuestSessionsService,
     @Optional() private readonly chat?: ChatService,
     @Optional() private readonly events?: EventsService,
+    // Общий рубильник модели (spec 2026-10-31-global-llm-switch, раздел 6).
+    // Без @Optional(): поломка DI роняет старт (поймает smoke), а не оставляет
+    // гостей молча на Claude; тесты создают сервис через new.
+    private readonly globalProvider?: GlobalLlmProviderService,
   ) {}
 
   async handle(input: GuestTurnInput, res: Response): Promise<void> {
@@ -200,14 +206,22 @@ export class GuestTurnService {
         guestEvent = { type: 'guest', left };
       }
 
-      // Claude сейчас недоступен (окно запасного пути открыто платными вызовами):
-      // гостю — сразу ошибка, а не две минуты ожидания и занятый слот.
-      if (this.claudeCli.fallbackStats().breakerOpenUntil > Date.now()) {
+      // Модель гостя — рубильник, без цепочки (решение 31.10). Она сейчас
+      // недоступна (у Claude открыто его окно, у запасного нет ключа или он
+      // «не отвечает») — гостю сразу ошибка, а не две минуты ожидания и
+      // занятый слот.
+      const trialProvider: AnswerProvider = this.globalProvider ? await this.globalProvider.get() : 'claude';
+      if (this.providerUnavailable(trialProvider)) {
         this.startStream(res);
         this.write(res, guestEvent);
         this.write(res, { type: 'error', code: 'model' });
         this.end(res);
-        this.events?.track('guest_trial_error', { props: { reason: 'breaker', assistant_id: String(agent.id), preview: input.preview } });
+        this.events?.track('guest_trial_error', {
+          props: {
+            reason: 'breaker', assistant_id: String(agent.id), preview: input.preview,
+            ...(trialProvider === 'claude' ? {} : { provider: trialProvider }),
+          },
+        });
         return;
       }
 
@@ -235,7 +249,7 @@ export class GuestTurnService {
         // когда был вызван beginStream, — счётчики парные без отдельного флага.
         this.chat?.beginStream();
         try {
-          await this.runTurn(input, res, session, agent, message, guestEvent, limits.answersPerTrial);
+          await this.runTurn(input, res, session, agent, message, guestEvent, limits.answersPerTrial, trialProvider);
         } finally {
           this.chat?.endStream();
         }
@@ -255,6 +269,7 @@ export class GuestTurnService {
     message: string,
     guestEvent: object,
     answersPerTrial: number,
+    trialProvider: AnswerProvider,
   ): Promise<void> {
     const humanAt = new Date();
     this.startStream(res);
@@ -278,8 +293,12 @@ export class GuestTurnService {
           const r = await this.claudeCli.textWithCost(buildGuestPrompt(history, message), {
             system,
             model: CHAT_MODEL,
-            // Запасной Qwen гостям не положен: его квота — для платящих.
+            // Без цепочки: только модель рубильника (решение 31.10); у Claude —
+            // без provider, как раньше.
             noFallback: true,
+            // providerChoice 'global': ответ гостя — по рубильнику (событие
+            // claude_cli_call с choice=global, суточный счёт).
+            ...(trialProvider === 'claude' ? {} : { provider: trialProvider, providerChoice: 'global' as const }),
             timeoutMs: GUEST_TURN_TIMEOUT_MS,
             // Приватность (F1, ревью 31.10): транскрипт CLI не должен жить
             // дольше, чем обещает политика пробы (7 дней).
@@ -337,6 +356,15 @@ export class GuestTurnService {
       clearInterval(ping);
       this.end(res);
     }
+  }
+
+  /** Модель рубильника сейчас недоступна гостю: у Claude — открыто его окно,
+   *  у запасного — нет ключа или он «не отвечает». */
+  private providerUnavailable(p: AnswerProvider, now: number = Date.now()): boolean {
+    const s = this.claudeCli.fallbackStats(now);
+    if (p === 'claude') return s.breakerOpenUntil > now;
+    const st = s.providers?.[p];
+    return !st?.enabled || st.downUntil > now;
   }
 
   /** Ассистент для пробы: тот же набор, что видит экран выбора (AgentsService.getAgents). */
