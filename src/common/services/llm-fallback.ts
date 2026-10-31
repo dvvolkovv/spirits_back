@@ -254,7 +254,7 @@ export class FallbackState {
   }
 
   counts(name: FallbackProvider, now: number = Date.now()): { ok: number; failed: number } {
-    this.prune(now);
+    this.prune(now); // попутно чистит исходы старше окна статистики — намеренно
     const mine = this.outcomes.filter((o) => o.name === name);
     const ok = mine.filter((o) => o.ok).length;
     return { ok, failed: mine.length - ok };
@@ -283,9 +283,12 @@ export function planProviders(args: {
   if (args.noFallback) return ['claude'];
   const now = args.now ?? Date.now();
   const normal = (exclude?: FallbackProvider): AnswerProvider[] => {
-    const alts = FALLBACK_ORDER.filter((n) => n !== exclude && args.configs[n] !== null && !args.state.isDown(n, now));
+    const alts = FALLBACK_ORDER.filter((n) => n !== exclude && !!args.configs[n] && !args.state.isDown(n, now));
     return args.state.claudeWindowOpen(now) && alts.length > 0 ? [...alts] : ['claude', ...alts];
   };
-  if (args.selected && args.configs[args.selected] !== null) return [args.selected, ...normal(args.selected)];
+  // Истинностью, не !== null: незнакомое значение selected (например, мусор из
+  // БД) даёт configs[selected] === undefined, а undefined !== null — истина,
+  // и мусор встал бы первым в план.
+  if (args.selected && args.configs[args.selected]) return [args.selected, ...normal(args.selected)];
   return normal();
 }
