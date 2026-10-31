@@ -894,9 +894,11 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       // Сбой, после которого ход переходит к следующему в плане (runOnce выше).
       let switchHit = false;
       let switchWhy = "";
-      // Текст сбоя — только для FATAL_RE/fatalHint в runOnce, в журнал не идёт.
+      // Текст сбоя (ev.result) — только для FATAL_RE/fatalHint в runOnce, в журнал
+      // не идёт; у ошибки без текста и у «нет ответа» — пустой.
       let switchText = "";
-      // Для журнала перехода — только безопасное (llm.safeErrorDetail).
+      // В журнал перехода — только безопасное (llm.safeErrorDetail: статус и
+      // строка диагностики CLI).
       let switchDetail = "";
       // Пришло хоть одно событие type:"result" от этого запуска (gotResult ниже,
       // child.on("close", …)) — даже без текста: выбранный пользователем
@@ -907,10 +909,8 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       // в errors[], поля result нет; llm.isErrorWithoutText) — у выбранного тоже
       // повод уступить ход (child.on("close", …)).
       let errorNoText = false;
-      // Её причина (llm.errorsText: errors[] одной строкой) — в switchText: его
-      // читают только FATAL_RE и fatalHint в runOnce, человеку уходит готовый текст.
-      let errorNoTextWhy = "";
-      // А в журнал — только безопасное (llm.safeErrorDetail), в switchDetail.
+      // Её причина — только безопасное (llm.safeErrorDetail); в close уходит в
+      // switchDetail, в журнал перехода.
       let errorNoTextDetail = "";
       let transientAccessLike = false;
       let sawResult = false;
@@ -965,7 +965,6 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
           // вокруг handleEvent) не сорвёт учёт стоимости, потолка шагов и usage.
           if (llm.isErrorWithoutText(ev)) {
             errorNoText = true;
-            errorNoTextWhy = llm.errorsText(ev);
             errorNoTextDetail = llm.safeErrorDetail(ev);
           }
         }
@@ -1102,7 +1101,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
             llm.mayAdvance({ failed: runProvider, selected, accessFailure: false, sentAnyText: streamedAny, riskyToolUsed })) {
           switchHit = true;
           switchWhy = gotResult ? "ошибка без текста" : "нет ответа";
-          switchText = gotResult ? errorNoTextWhy : "";
+          switchText = "";
           switchDetail = gotResult ? errorNoTextDetail : "";
         }
         resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, switchHit, switchWhy, switchText, switchDetail, transientAccessLike, sawResult, startedAt: runStartedAt });

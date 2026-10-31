@@ -157,29 +157,8 @@ test("isErrorWithoutText: текст в result, успех, потолок ша�
   assert.equal(l.isErrorWithoutText(undefined), false);
 });
 
-test("errorsText: errors[] — через «; », переводы строк — пробелами", () => {
-  // Так errors[] собирает CLI 2.1.x: первой — диагностика, дальше — ошибки хода
-  // (error.stack || error.message, со строками стека).
-  const ev = {
-    type: "result", subtype: "error_during_execution", is_error: true,
-    errors: ["[ede_diagnostic] result_type=user last_content_type=tool_result stop_reason=null", "Error: Request was aborted.\r\n    at run (/x.js:1:1)\n\n    at main (/x.js:2:2)"],
-  };
-  assert.equal(l.errorsText(ev),
-    "[ede_diagnostic] result_type=user last_content_type=tool_result stop_reason=null; Error: Request was aborted. at run (/x.js:1:1) at main (/x.js:2:2)");
-});
-
-test("errorsText: не длиннее 300; пустые элементы пропускаются; не строки — JSON", () => {
-  assert.equal(l.errorsText({ errors: ["x".repeat(500)] }), "x".repeat(300));
-  assert.equal(l.errorsText({ errors: ["", "  ", "a", null] }), "a");
-  assert.equal(l.errorsText({ errors: [{ code: "E1" }, 42] }), '{"code":"E1"}; 42');
-});
-
-test("errorsText: нет массива errors — пустая строка", () => {
-  for (const ev of [{ type: "result" }, { errors: "API Error: 500" }, { errors: null }, {}, null, undefined]) {
-    assert.equal(l.errorsText(ev), "", JSON.stringify(ev));
-  }
-});
-
+// Так errors[] собирает CLI 2.1.x: первой — диагностика, дальше — ошибки хода
+// (error.stack || error.message, со строками стека).
 const DIAG = "[ede_diagnostic] result_type=user last_content_type=tool_result stop_reason=null";
 
 test("safeErrorDetail: status N — только целое 100…599", () => {

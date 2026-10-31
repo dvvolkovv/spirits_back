@@ -162,21 +162,6 @@ export function isErrorWithoutText(ev) {
   return ev.is_error === true || (typeof ev.subtype === "string" && ev.subtype !== "success") || !!ev.api_error_status;
 }
 
-/** Причина ошибки без текста — errors[] события result одной строкой: элементы
- *  через "; " (не строки — JSON), переводы строк — пробелами, не длиннее 300
- *  символов; нет массива — "". В CLI 2.1.x там диагностика хода и ошибки хода
- *  (error.stack || error.message) — сырым текстом человеку не отдавать и в
- *  журнал не писать (для журнала — safeErrorDetail). */
-export function errorsText(ev) {
-  if (!ev || !Array.isArray(ev.errors)) return "";
-  return ev.errors
-    .map((e) => (typeof e === "string" ? e : e == null ? "" : JSON.stringify(e)))
-    .map((t) => t.replace(/\s*[\r\n]+\s*/g, " ").trim())
-    .filter(Boolean)
-    .join("; ")
-    .slice(0, 300);
-}
-
 // Строка диагностики CLI в errors[] — целиком «ключ=значение» с enum-подобными
 // значениями: без пробелов, кавычек и переводов строк внутри значения.
 const EDE_DIAGNOSTIC_RE = /^\[ede_diagnostic\](?: [a-z_]+=[A-Za-z0-9_.:-]*)*$/;
