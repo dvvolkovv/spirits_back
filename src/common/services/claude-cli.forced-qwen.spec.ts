@@ -63,9 +63,16 @@ describe('ClaudeCliService — provider: qwen', () => {
     expect(warn.mock.calls.map((c) => String(c[0])).join('\n')).toMatch(/Qwen выбран.*ключ/);
   });
 
-  it('noFallback побеждает: проба — только Claude', async () => {
+  it('noFallback с provider — только эта модель (ход гостя), без цепочки', async () => {
+    spawnMock.mockImplementationOnce(() => fakeProc(OK('q')));
+    expect(await new ClaudeCliService().text('x', { provider: 'qwen', noFallback: true })).toBe('q');
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(hasEnv(0)).toBe(true);
+  });
+
+  it('noFallback без provider (проба мониторинга) — только Claude', async () => {
     spawnMock.mockImplementationOnce(() => fakeProc(OK('claude')));
-    await new ClaudeCliService().text('x', { provider: 'qwen', noFallback: true });
+    await new ClaudeCliService().text('x', { noFallback: true });
     expect(hasEnv(0)).toBe(false);
   });
 
