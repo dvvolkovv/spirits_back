@@ -157,11 +157,13 @@ import { MATCH_THRESHOLD, sameWord, speechCheck, speechWords } from './match';
 и добавить в конец файла:
 
 ```ts
-test('одно слово с точностью до окончания: общее начало от 5 букв, меньшему до него не хватает не больше 2', () => {
-  for (const [a, b] of [['начинай', 'начинаешь'], ['убедил', 'убедила'], ['период', 'периода'], ['ладно', 'ладно']]) {
+test('одно слово с точностью до окончания: общее начало от 5 букв, у меньшего за ним — не больше 2', () => {
+  // «спокойно»/«спокоен», «подпишу»/«подписывай» — на границе: общее начало ровно 5, у меньшего за ним ровно 2.
+  for (const [a, b] of [['начинай', 'начинаешь'], ['убедил', 'убедила'], ['период', 'периода'], ['ладно', 'ладно'], ['спокойно', 'спокоен'], ['подпишу', 'подписывай']]) {
     assert.equal(sameWord(a, b), true, `${a} ≈ ${b}`);
     assert.equal(sameWord(b, a), true, `${b} ≈ ${a}`);
   }
+  // Меняешь пороги или эти пары — подними MATCHER_VERSION (match.ts): по нему перепроверяется брак.
   // Корпус ловит ложные отказы, а не ослабление сверки: порог держат эти пары.
   // «день»/«деньги» — общее начало 4 буквы: сломается, если STEM_MIN опустить до 4;
   // «отказаться»/«отказник» — сломается, если STEM_SLACK поднять до 3.
@@ -174,7 +176,20 @@ test('доля: сначала точные пары, потом по оконч
   // Жадный один проход отдал бы «начинаешь» слову «начинай», и «начинаешь» остался бы без пары.
   assert.equal(speechCheck(['Начинай, начинаешь.'], 'начинаешь начинайте').share, 1);
 });
+
+test('эхо другой реплики в иной форме не скрывает обрыв', () => {
+  const lines = ['Ничего не начинай, сиди тихо!', 'Ладно. Начинаю.'];
+  assert.deepEqual(speechCheck(lines, 'ничего не начинай сиди тихо ладно').silentLines, [1]);
+  // Обе реплики сказаны, SpeechKit записал «начинаю» как «начинай» — клип годен.
+  assert.equal(speechCheck(lines, 'ничего не начинай сиди тихо ладно начинай').ok, true);
+});
+
+test('одно услышанное слово засчитывается за одно слово реплики — и по окончанию тоже', () => {
+  assert.equal(speechCheck(['Начинай, начинаю, начинать.'], 'начинаешь').share, 1 / 3);
+});
 ```
+
+(Тесты «эхо» и «одно услышанное слово» добавлены по ревью задачи 2: сравнение по окончанию через весь услышанный текст давало слову другой реплики скрыть оборванную; пограничные пары держат пороги с обеих сторон.)
 
 - [ ] **Step 2: Закоммитить красное и убедиться, что падает**
 
@@ -229,17 +244,17 @@ const STEM_SLACK = 2;
 ```ts
 /**
  * Одно ли это слово с точностью до окончания: равны или у них общее начало от
- * STEM_MIN букв, а меньшему слову до него не хватает не больше STEM_SLACK букв.
+ * STEM_MIN букв, а у меньшего слова за ним — не больше STEM_SLACK букв.
  * «начинай» ≈ «начинаешь» (SpeechKit слил «начинай уж», ролик 889b6423),
  * «убедил» ≈ «убедила»; «начинай» ≠ «начальник», «отказаться» ≠ «отказник».
  * Короткие слова — только точно.
  */
 export function sameWord(a: string, b: string): boolean {
   if (a === b) return true;
-  const max = Math.min(a.length, b.length);
+  const shorter = Math.min(a.length, b.length);
   let n = 0;
-  while (n < max && a[n] === b[n]) n++;
-  return n >= STEM_MIN && n >= max - STEM_SLACK;
+  while (n < shorter && a[n] === b[n]) n++;
+  return n >= STEM_MIN && n >= shorter - STEM_SLACK;
 }
 ```
 
@@ -253,6 +268,18 @@ export function sameWord(a: string, b: string): boolean {
 
 ```ts
   /** Доля сверяемых слов реплик (с повторами), найденных в распознанном с точностью до окончания. */
+```
+
+и комментарий поля `silentLines`
+
+```ts
+  /** Номера реплик (с 0), от которых — или от их последнего предложения — не услышано ни одного слова от трёх букв. */
+```
+
+на
+
+```ts
+  /** Номера реплик (с 0), от которых — или от их последнего предложения — не услышано ни одного слова от трёх букв (в последнем предложении — от четырёх): дословно — где угодно в услышанном, по окончанию — только своей парой из доли. */
 ```
 
 - [ ] **Step 5: Подсчёт в `speechCheck`**
@@ -288,6 +315,10 @@ export function sameWord(a: string, b: string): boolean {
 ```ts
   const heardWords = [...pool.keys()];
   const expected = perLine.flat();
+  /** Номер реплики у каждого слова expected. */
+  const lineOf = perLine.flatMap((ws, li) => ws.map(() => li));
+  /** Слова каждой реплики, засчитанные по окончанию, — каждое своей парой из услышанного. */
+  const byStem = perLine.map(() => new Set<string>());
   // Сначала точные пары, потом с точностью до окончания: иначе неточное слово
   // могло бы забрать пару, которая точно подходит другому.
   const matched = expected.map(() => false);
@@ -301,12 +332,17 @@ export function sameWord(a: string, b: string): boolean {
   expected.forEach((w, i) => {
     if (matched[i]) return;
     const h = heardWords.find((x) => (pool.get(x) ?? 0) > 0 && sameWord(w, x));
-    if (h !== undefined) take(i, h);
+    if (h === undefined) return;
+    take(i, h);
+    byStem[lineOf[i]].add(w);
   });
   const hit = matched.filter(Boolean).length;
   const share = expected.length ? hit / expected.length : 1;
   const long = (s: string, min = MIN_LINE_WORD): string[] => words(s).filter((w) => w.length >= min && !shout(w));
-  const heardAny = (w: string): boolean => heardWords.some((h) => sameWord(w, h));
+  // Прозвучало ли слово реплики li: дословно — где угодно в услышанном, как прежде
+  // (ключи pool — все услышанные слова); по окончанию — только своей парой из доли:
+  // иначе «начинай» другой реплики скрыл бы оборванное «Начинаю.».
+  const heardIn = (li: number) => (w: string): boolean => pool.has(w) || byStem[li].has(w);
   // Реплика проглочена, если от неё не услышано ни одного слова; при нескольких
   // предложениях — и если не услышано ни одного слова последнего (обрыв клипа).
   const silentLines = lines
@@ -314,7 +350,7 @@ export function sameWord(a: string, b: string): boolean {
       const s = sentences(l);
       return { i, parts: s.length > 1 ? [long(l), long(s.at(-1) ?? '', MIN_LAST_WORD)] : [long(l)] };
     })
-    .filter(({ parts }) => parts.some((p) => p.length > 0 && !p.some(heardAny)))
+    .filter(({ i, parts }) => parts.some((p) => p.length > 0 && !p.some(heardIn(i))))
     .map(({ i }) => i);
 ```
 
@@ -328,7 +364,7 @@ git commit -m "feat(studio): сверка речи с точностью до о
 studio/scripts/node-run.sh "npx tsx --test src/animate/match.test.ts"
 ```
 
-Ожидается: `ℹ tests 18`, `ℹ fail 0`.
+Ожидается: `ℹ tests 20`, `ℹ fail 0`.
 
 ---
 
