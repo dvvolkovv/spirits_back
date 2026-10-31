@@ -30,6 +30,14 @@ describe('GuestTrialModule: граф зависимостей не оторва�
     expect(Reflect.getMetadata(MODULE_METADATA.IMPORTS, GuestTrialModule)).toContain(ChatModule);
   });
 
+  // Ревью A10: дополняет проверку выше с другой стороны графа — ChatModule
+  // должен ПРОДОЛЖАТЬ экспортировать ChatService. Забытое экспортирование
+  // (например, при рефакторинге ChatModule) не роняет старт — @Optional() в
+  // GuestTurnService молча подставит undefined, ровно как и забытый импорт.
+  it('ChatModule экспортирует ChatService', () => {
+    expect(Reflect.getMetadata(MODULE_METADATA.EXPORTS, ChatModule)).toContain(ChatService);
+  });
+
   it('регистрирует все пять провайдеров', () => {
     const providers = Reflect.getMetadata(MODULE_METADATA.PROVIDERS, GuestTrialModule);
     expect(providers).toContain(GuestTrialStore);

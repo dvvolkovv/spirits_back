@@ -383,4 +383,13 @@ describe('разбор тела хода', () => {
     expect(i.campaign).toBe('abcd');
     expect(i.tz).toBe('Europe/Moscow');
   });
+
+  // Ревью A10: открытая guest/chat не защищена JWT — без потолка огромное
+  // message гоняло бы CONTROL_CHARS_RE (глобальную регулярку) по всей длине
+  // на каждый запрос. Обрезаем ДО регулярки, а не после (проверка maxChars
+  // в GuestTurnService.handle — отдельно, это не её замена).
+  it('message длиннее 20000 знаков обрезан до фиксированного потолка, до вырезания управляющих символов', () => {
+    const i = parseGuestTurnInput({ message: 'а'.repeat(25_000) });
+    expect(i.message.length).toBe(20_000);
+  });
 });

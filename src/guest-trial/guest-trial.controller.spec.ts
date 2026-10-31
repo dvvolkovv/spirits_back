@@ -7,8 +7,17 @@ import { AdminGuard } from '../common/guards/admin.guard';
 import { DEFAULT_GUEST_LIMITS } from './guest-trial.types';
 import { hashGuestToken, newGuestToken } from './guest-token';
 
+const ADMIN_USER = { userId: 'admin-1' };
+
 function makeRes() {
-  const res: any = { statusCode: 0, body: undefined, status(c: number) { this.statusCode = c; return this; }, json(b: any) { this.body = b; return this; } };
+  const res: any = {
+    statusCode: 0,
+    body: undefined,
+    headers: {} as Record<string, string>,
+    status(c: number) { this.statusCode = c; return this; },
+    json(b: any) { this.body = b; return this; },
+    setHeader(k: string, v: string) { this.headers[k] = v; return this; },
+  };
   return res;
 }
 
@@ -36,10 +45,11 @@ function harness() {
 }
 
 describe('ручки пробы', () => {
-  it('config — режим и два числа, без остальных лимитов', async () => {
+  it('config без Origin — 200, режим и два числа, без остальных лимитов', async () => {
     const h = harness();
     const res = makeRes();
     await h.c.config(makeReq(), res);
+    expect(res.statusCode).toBe(200);
     expect(res.body).toEqual({ mode: 'on', answersPerTrial: 3, maxChars: 2000 });
   });
 
@@ -48,6 +58,7 @@ describe('ручки пробы', () => {
     let res = makeRes();
     await h.c.session(makeReq(), { token: 'x' }, res);
     expect(res.statusCode).toBe(404);
+    expect(res.body).toEqual({ error: 'trial' });
     expect(h.sessions.findLive).not.toHaveBeenCalled();
 
     const token = newGuestToken();
@@ -58,12 +69,16 @@ describe('ручки пробы', () => {
     expect(res.body).toEqual({ assistantId: '14', messages: [{ role: 'user', content: 'В' }, { role: 'assistant', content: 'О' }], left: 2 });
   });
 
-  it('session: перенесённая — 404', async () => {
+  // Ревью A10: оба 404 пробы (кривой ключ выше, перенесённая проба здесь) должны
+  // отдавать одинаковое тело — иначе форма ответа молча отличает «нет такой пробы»
+  // от «эта проба чужая/перенесена», раскрывая больше, чем нужно анониму.
+  it('session: перенесённая — 404, то же тело, что и у кривого ключа', async () => {
     const h = harness();
     h.sessions.findLive.mockImplementation(async () => ({ id: 's1', assistant_id: 14, answers: 1, claimed_at: new Date() }));
     const res = makeRes();
     await h.c.session(makeReq(), { token: newGuestToken() }, res);
     expect(res.statusCode).toBe(404);
+    expect(res.body).toEqual({ error: 'trial' });
   });
 
   it('claim — userId из JWT, ответ как есть', async () => {
@@ -75,19 +90,19 @@ describe('ручки пробы', () => {
     expect(res.body).toEqual({ assistantId: '12', moved: 4 });
   });
 
-  it('админ: режимы, статус, незнакомое действие', async () => {
+  it('админ: режимы логируются с userId, статус, незнакомое действие', async () => {
     const h = harness();
     for (const [action, mode] of [['enable', 'on'], ['preview', 'preview'], ['disable', 'off']] as const) {
       const res = makeRes();
-      await h.c.admin({ action }, res);
+      await h.c.admin(ADMIN_USER, { action }, res);
       expect(h.store.setMode).toHaveBeenLastCalledWith(mode);
       expect(res.body).toEqual({ mode });
     }
     let res = makeRes();
-    await h.c.admin({ action: 'status' }, res);
+    await h.c.admin(ADMIN_USER, { action: 'status' }, res);
     expect(res.body).toMatchObject({ mode: 'on', counts: { trials_day: 1 }, windows: { 'guest-lim:answers:d': 5 } });
     res = makeRes();
-    await h.c.admin({ action: 'nope' }, res);
+    await h.c.admin(ADMIN_USER, { action: 'nope' }, res);
     expect(res.statusCode).toBe(400);
   });
 
@@ -95,13 +110,15 @@ describe('ручки пробы', () => {
   it('админ: set — лимиты применены (changed:true) — 200', async () => {
     const h = harness();
     const res = makeRes();
-    await h.c.admin({ action: 'set', limits: { answersPerDay: 500 } }, res);
+    await h.c.admin(ADMIN_USER, { action: 'set', limits: { answersPerDay: 500 } }, res);
     expect(h.store.setLimits).toHaveBeenCalledWith({ answersPerDay: 500 });
     expect(res.statusCode).toBe(200);
     expect(res.body).toEqual({ limits: DEFAULT_GUEST_LIMITS, ignored: [], changed: true });
   });
 
-  it('админ: set — ни один ключ не применился (changed:false) — 400 с ignored', async () => {
+  // Ревью A10: 400 несёт error:'limits' — как у остальной админки (код ответа
+  // без узнаваемого поля error раньше ничем не отличался от обычного 400 ручки).
+  it('админ: set — ни один ключ не применился (changed:false) — 400, error:"limits" + ignored', async () => {
     const h = harness();
     h.store.setLimits.mockResolvedValueOnce({
       limits: DEFAULT_GUEST_LIMITS,
@@ -109,9 +126,23 @@ describe('ручки пробы', () => {
       changed: false,
     });
     const res = makeRes();
-    await h.c.admin({ action: 'set', limits: { answerPerDay: 500 } }, res);
+    await h.c.admin(ADMIN_USER, { action: 'set', limits: { answerPerDay: 500 } }, res);
     expect(res.statusCode).toBe(400);
-    expect(res.body).toEqual({ limits: DEFAULT_GUEST_LIMITS, ignored: ['answerPerDay: неизвестный ключ'], changed: false });
+    expect(res.body).toEqual({ error: 'limits', limits: DEFAULT_GUEST_LIMITS, ignored: ['answerPerDay: неизвестный ключ'], changed: false });
+  });
+
+  // Ревью A10 (1в): sessions.status() может упасть по причине, не связанной с
+  // режимом/лимитами (БД моргнула) — админ-ручка не должна молчать про mode/
+  // limits/windows только потому, что подсчёт счётчиков не задался.
+  it('админ: status — сбой sessions.status() не роняет ручку, counts — null', async () => {
+    const h = harness();
+    h.sessions.status.mockRejectedValueOnce(new Error('нет базы'));
+    const res = makeRes();
+    await h.c.admin(ADMIN_USER, { action: 'status' }, res);
+    expect(res.statusCode).toBe(200);
+    expect(res.body.counts).toBeNull();
+    expect(res.body.mode).toBe('on');
+    expect(res.body.windows).toMatchObject({ 'guest-lim:answers:d': 5 });
   });
 });
 
@@ -150,27 +181,53 @@ describe('проверка Origin на открытых ручках пробы'
     await h.c.chat(makeReq(), { assistantId: '1', message: 'привет' }, res);
     expect(h.turns.handle).toHaveBeenCalledTimes(2);
   });
+
+  // Ревью A10 (мелочи): ответ открытых ручек зависит от Origin (200 или 403) —
+  // промежуточный кеш не должен запомнить один ответ за всех посетителей.
+  it('открытые ручки ставят Cache-Control: no-store — и при разрешённом, и при чужом Origin', async () => {
+    const h = harness();
+
+    let res = makeRes();
+    await h.c.config(makeReq(), res);
+    expect(res.headers['Cache-Control']).toBe('no-store');
+
+    res = makeRes();
+    await h.c.config(makeReq('https://evil.com'), res);
+    expect(res.headers['Cache-Control']).toBe('no-store');
+  });
 });
 
 // Та же дыра, которую admin-routes.spec.ts исторически находил в других
 // контроллерах (AdminGuard забыт рядом с JwtGuard) — но этот контроллер родился
-// позже и в тот сторож не попадает (там жёсткий список контроллеров). Проверяем
-// сами, в своём файле, не трогая общий guard-сторож.
-describe('гарды ручек пробы', () => {
+// позже и в тот общий сторож не попадает (там жёсткий список контроллеров).
+// Проверяем сами, в своём файле, не трогая общий guard-сторож. guardsFor — тот
+// же приём, что в src/common/guards/admin-routes.spec.ts: гарды с класса и с
+// метода вместе — если кто-то повесит @UseGuards(JwtGuard) на сам класс,
+// открытые ручки пробы (config/chat/session) умрут без единого Important-теста
+// на одном только методе.
+function guardsFor(controller: Function, method: string): unknown[] {
+  const own = Reflect.getMetadata(
+    GUARDS_METADATA,
+    (controller.prototype as Record<string, unknown>)[method] as object,
+  );
+  const fromClass = Reflect.getMetadata(GUARDS_METADATA, controller);
+  return [...(fromClass ?? []), ...(own ?? [])];
+}
+
+describe('гарды ручек пробы (класс + метод)', () => {
   it('admin/guest-trial закрыт JwtGuard и AdminGuard', () => {
-    const guards = Reflect.getMetadata(GUARDS_METADATA, GuestTrialController.prototype.admin);
+    const guards = guardsFor(GuestTrialController, 'admin');
     expect(guards).toContain(JwtGuard);
     expect(guards).toContain(AdminGuard);
   });
 
   it('guest/claim закрыт JwtGuard', () => {
-    const guards = Reflect.getMetadata(GUARDS_METADATA, GuestTrialController.prototype.claim);
-    expect(guards).toContain(JwtGuard);
+    expect(guardsFor(GuestTrialController, 'claim')).toContain(JwtGuard);
   });
 
-  it('открытые ручки (config/chat/session) — без гардов', () => {
+  it('открытые ручки (config/chat/session) — без гардов даже с учётом класса', () => {
     for (const m of ['config', 'chat', 'session'] as const) {
-      expect(Reflect.getMetadata(GUARDS_METADATA, (GuestTrialController.prototype as any)[m])).toBeUndefined();
+      expect(guardsFor(GuestTrialController, m)).toEqual([]);
     }
   });
 });
