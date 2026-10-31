@@ -3890,7 +3890,29 @@ ssh dv@5.101.115.184 'cat > ~/file-agent/server.next.mjs' < "${W}/server.mjs"
 ssh dv@5.101.115.184 'cd ~/file-agent && node --check server.next.mjs && echo CHECK_OK && node --test --test-reporter=tap llm-fallback.test.mjs 2>&1 | grep -aE "^# (pass|fail)"'
 ```
 
-Expected: `CHECK_OK`, `# fail 0`. Затем:
+Expected: `CHECK_OK`, `# fail 0`. Затем — проверка, что `server.next.mjs` и `llm-fallback.mjs` одной версии: релей зовёт модуль как `llm.*` (namespace-импорт), и отсутствующая функция не роняет запуск, а даёт `TypeError`, который молча глотает `try { handleEvent } catch {}` вокруг разбора событий — ход за ходом без учёта стоимости и разбора `result` (итоговое ревью 31.10). Скрипт — `check-llm-exports.mjs` в scratchpad рядом с `${W}` (текст ниже):
+
+```js
+// Все llm.* из server.next.mjs (или файла из аргумента) есть среди экспортов llm-fallback.mjs
+// рядом: оба файла одной версии. Иначе TypeError молча глотает catch вокруг handleEvent.
+// Запуск в каталоге релея: node --input-type=module - [server.next.mjs] < check-llm-exports.mjs
+import fs from "node:fs";
+import { pathToFileURL } from "node:url";
+const dir = process.cwd();
+const llm = await import(pathToFileURL(dir + "/llm-fallback.mjs").href);
+const file = process.argv[2] || "server.next.mjs";
+const src = fs.readFileSync(dir + "/" + file, "utf8");
+const used = [...new Set([...src.matchAll(/\bllm\.([A-Za-z_]+)/g)].map((m) => m[1]))];
+const missing = used.filter((n) => !(n in llm));
+console.log(missing.length ? "MISSING " + missing.join(",") : "EXPORTS_OK " + used.length + " (" + file + ")");
+process.exit(missing.length ? 1 : 0);
+```
+
+```bash
+ssh dv@5.101.115.184 'cd ~/file-agent && node --input-type=module -' < "/private/tmp/claude-501/-Users-dmitry-Downloads-spirits-front/2ee1bf56-31d4-4343-84d9-321f7e3c99d0/scratchpad/check-llm-exports.mjs"
+```
+
+Expected: `EXPORTS_OK 22 (server.next.mjs)` (31.10: 22 обращения `llm.*`). `MISSING …` — стоп: файлы из разных версий ветки. Затем:
 
 ```bash
 ssh dv@5.101.115.184 'cd ~/file-agent && mv server.next.mjs server.mjs && git rm -q qwen-provider.mjs qwen-provider.test.mjs && git add server.mjs llm-fallback.mjs llm-fallback.test.mjs && git commit -q -m "релей: запасные Qwen → Kimi и выбор Kimi (provider=kimi); /health.fallback" && git log --oneline -1'
@@ -3968,3 +3990,4 @@ Expected: `OK {"text":"ок"…}`, `kimi.enabled: true`.
 - **Task 11, по ревью:** подсказка про ответ Claude — только при выбранном не-Claude; «·» в пометке скрыт от скринридера; pt — «quem responde é o Claude»; комментарий в `UserActivityDrawer.tsx` (фронт `70ceecc`, `7fb8b78`).
 - **Task 13:** `deploy.sh` с ноды — только после `source ~/.nvm/nvm.sh`.
 - **Task 10, на стенде 31.10** (вписано в Step 1 и Step 5 после итогового ревью): (1) снимок живого релея в плане прихватывал `.env`, `relay-secrets*`, `relay-auth-mode*` и боевой `empty-mcp.json` (MCP_SECRET прода) — исключать их (`--exclude=.env --exclude="relay-secrets*" --exclude="relay-auth-mode*" --exclude=empty-mcp.json --exclude=uploads --exclude=_old-backups --exclude="server.mjs.bak*" --exclude="server.mjs.regression-*" --exclude="*.bak-mcp-*"`), шаблон `empty-mcp.json` брать из репозитория; без `relay-auth-mode` релей в режиме `log` и запросы пропускает. (2) Уборка `pgrep -f "node server.mjs"` + проверка cwd убивала саму удалённую оболочку (её командная строка содержит шаблон, cwd тот же) — шаблон `"node serve[r].mjs"`, проверка `comm=node`, скрипт — через `bash -s`. Кроме пяти сценариев на живых ключах стенд прогнал поддельный API на 127.0.0.1 (Claude 529, Qwen 429 / Arrearage, Kimi настоящий): цепочка доходит до Kimi, следующий ход сразу на Kimi, Arrearage — переход без повтора, без запасных — уведомление без сырого текста. sha256 живого `server.mjs` до выката — `48a16def5b565c9e347deb2f6dd8de6b47ba49e395a4fee2a9af75b99e5c72bb` (HEAD e5c2737).
+- **Итоговое ревью (31.10), правки в коде** (`d34fb348..1594eec8`): релей — выбранный провайдер, упавший ошибкой без текста (`error_during_execution`: причина в `errors[]`, поля `result` нет), уступает обычному пути (`llm.isErrorWithoutText`, флаг `errorNoText`; проверка — последней в блоке `result`, после учёта стоимости); причина из `errors[]` — в `switchText` (только для `FATAL_RE`/`fatalHint`); журнал перехода — с безопасной деталью (`llm.safeErrorDetail`: `status N` и строка `[ede_diagnostic]` из строгих токенов, без текста ошибки и остальных `errors[]` — там стеки с путями файлов пользователя); монитор релея — строка запасных из общего `fallbackAlertLine` (`src/monitoring/fallback-alert-line.ts`); `selected` в `claude_cli_call` — выбор пользователя и без ключа у выбранного (как в `chat_quality`; план и `emergency` — по-прежнему только с ключом). Стенды D и E на ноде (127.0.0.1, поддельный `claude` первым в PATH, без настоящих ключей): до правки — пустой ход `provider:"kimi"` без уведомления, после — ответ Claude; журнал «Kimi (ошибка без текста: [ede_diagnostic] …) → Claude», «Kimi (ошибка: status 400) → Claude»; путь файла и цитата запроса в журнал не попали. Перед рестартом релея — проверка экспортов (Task 13 Step 1).
