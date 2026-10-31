@@ -254,12 +254,13 @@ test('пометка брака не записалась — брак всё р
   fs.mkdirSync(path.join(dir, 'rejected-2026-10-31T00-00-00-000Z.json'), { recursive: true });
   const discarded: string[] = [];
   const logs: string[] = [];
-  const { deps } = fakes(env, { heard: (kind, call) => (kind === 'conflict' && call === 1 ? 'совсем другое' : LINES[kind].join(' ')) });
+  const { deps, calls } = fakes(env, { heard: (kind, call) => (kind === 'conflict' && call === 1 ? 'совсем другое' : LINES[kind].join(' ')) });
   const anim = await animateRun(env.runDir, { ...deps, onDiscard: async (rel) => { discarded.push(rel); }, log: (m) => logs.push(m) });
   assert.deepEqual(discarded, ['skits/fp-conflict/raw.mp4']);
   assert.equal(anim.skits.conflict!.attempts, 2);
   assert.ok(fs.existsSync(path.join(dir, 'rejected-2026-10-31T00-00-00-000Z.mp4')), 'брак на месте');
   assert.ok(logs.some((m) => m.includes('пометка брака') && m.includes('не записалась')), logs.join('\n'));
+  assert.equal(calls.recognize, 3, 'брак, отложенный этим запуском, не судится повторно');
 });
 
 test('пустое распознавание — SpeechKit спрашивается ещё раз, клип не переснимается', { timeout: 120_000 }, async () => {
