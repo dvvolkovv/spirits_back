@@ -105,9 +105,12 @@ function svcIn(pg?: any): { svc: ClaudeCliService; root: string } {
   return { svc, root };
 }
 
+// Ключ Kimi из окружения CI добавил бы в этих тестах третью попытку — снимаем
+// и его (цепочка с Kimi — claude-cli.chain.spec.ts).
 const VARS = [
   'QWEN_FALLBACK_API_KEY', 'QWEN_FALLBACK_BASE_URL', 'QWEN_FALLBACK_BREAKER_MS',
   'QWEN_FALLBACK_MODEL_OPUS', 'QWEN_FALLBACK_MODEL_SONNET', 'QWEN_FALLBACK_MODEL_HAIKU',
+  'KIMI_FALLBACK_API_KEY', 'LLM_FALLBACK_BREAKER_MS',
 ];
 let saved: Record<string, string | undefined>;
 
@@ -274,10 +277,13 @@ describe('ClaudeCliService — запасной путь на Qwen', () => {
     expect(seen).toEqual(['WebSearch']);
   });
 
-  it('вызов с MCP без stream-json — не переключает (вызов инструмента не виден)', async () => {
-    spawnMock.mockImplementationOnce(() => fakeProc(AUTH_FAIL, 1));
-    await expect(svcIn().svc.text('x', { mcpServers: MCP })).rejects.toThrow('Failed to authenticate');
-    expect(spawnMock).toHaveBeenCalledTimes(1);
+  it('вызов с MCP идёт в stream-json: сбой входа до инструментов → Qwen (spec 2026-10-31)', async () => {
+    spawnMock
+      .mockImplementationOnce(() => fakeProc(lines({ type: 'result', is_error: true, result: 'Failed to authenticate: OAuth session expired' }), 1))
+      .mockImplementationOnce(() => fakeProc(lines({ type: 'result', is_error: false, result: 'q', total_cost_usd: 0.01, duration_ms: 1 })));
+    await expect(svcIn().svc.text('x', { mcpServers: MCP })).resolves.toBe('q');
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    expect(spawnEnv(1)?.ANTHROPIC_AUTH_TOKEN).toBe('sk-sp-test');
   });
 
   it.each(['Read,Bash', 'default', 'Bash(git:*)'])(
@@ -573,12 +579,12 @@ describe('ClaudeCliService — предохранитель', () => {
     expect(spawnEnv(1)?.ANTHROPIC_AUTH_TOKEN).toBe('sk-sp-test');
   });
 
-  it('через открытое окно вызов с MCP в json-режиме идёт на Qwen (попытки Claude нет — двойного срабатывания нет)', async () => {
+  it('через открытое окно вызов с MCP идёт на Qwen (попытки Claude нет — двойного срабатывания нет)', async () => {
     const { svc } = svcIn();
     spawnMock
       .mockImplementationOnce(() => fakeProc(AUTH_FAIL, 1))
       .mockImplementationOnce(() => fakeProc(OK('q1')))
-      .mockImplementationOnce(() => fakeProc(OK('q2')));
+      .mockImplementationOnce(() => fakeProc(lines({ type: 'result', is_error: false, result: 'q2', total_cost_usd: 0.01, duration_ms: 1 })));
     await svc.text('1');
     await expect(svc.text('2', { mcpServers: MCP })).resolves.toBe('q2');
     expect(spawnMock).toHaveBeenCalledTimes(3);
