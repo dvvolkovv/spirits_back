@@ -9,17 +9,24 @@ import * as path from 'path';
 import * as os from 'os';
 
 // classifyLlmError переехал в common/llm-error.ts — его зовёт и ClaudeCliService
-// (запасной путь на Qwen). Реэкспорт — для прежних импортов (insights.service).
+// (запасной путь). Реэкспорт — для прежних импортов (insights.service).
 import { classifyLlmError, LlmOutageKind, looksLikeCliRefusal } from '../common/llm-error';
+import { FALLBACK_ORDER, FallbackProvider, PROVIDER_LABELS } from '../common/services/llm-fallback';
 export { classifyLlmError };
 export type { LlmOutageKind };
 
-/** Строка про запасной Qwen в алерте «Локальный Claude CLI недоступен»: видно,
- *  обслуживаются ли люди, пока вход не починен. Без склонений — счётчики
- *  после двоеточия. */
-export function qwenFallbackAlertLine(s: { enabled: boolean; ok: number; failed: number; windowMs: number }): string {
-  if (!s.enabled) return 'Запасной Qwen: не настроен';
-  return `Запасной Qwen: ответов ${s.ok}, ошибок ${s.failed} за ${Math.round(s.windowMs / 60_000)} мин`;
+/** Строка про запасных в алерте «Локальный Claude CLI недоступен»: видно,
+ *  обслуживаются ли люди, пока вход не починен, и не лежат ли сами запасные.
+ *  Без склонений — счётчики после тире. */
+export function fallbackAlertLine(s: {
+  windowMs: number;
+  providers?: Partial<Record<FallbackProvider, { enabled: boolean; ok: number; failed: number }>>;
+}): string {
+  const parts = FALLBACK_ORDER.map((n) => {
+    const p = s.providers?.[n];
+    return p?.enabled ? `${PROVIDER_LABELS[n]} — ответов ${p.ok}, ошибок ${p.failed}` : `${PROVIDER_LABELS[n]} — не настроен`;
+  });
+  return `Запасные за ${Math.round(s.windowMs / 60_000)} мин: ${parts.join('; ')}`;
 }
 
 /**
@@ -377,7 +384,7 @@ export class ClaudeHealthService implements OnModuleInit {
           `Затронуто: <b>Маша, TG-боты, Виртуальный PM, Виртуальный маркетолог, фоновые задачи</b> (CLI-путь на OAuth-подписке). ` +
           `Чат-ассистенты (r.linkeon.io) — отдельный путь, см. synthetic chat_streaming.\n` +
           `Провалов подряд: ${this.cliConsecutiveDown}. Проверка: ${this.cache.llmCheckedAt || '—'}\n` +
-          `${qwenFallbackAlertLine(this.claudeCli.fallbackStats())}\n` +
+          `${fallbackAlertLine(this.claudeCli.fallbackStats())}\n` +
           `Починка: на проде \`claude\` → /login (обновить OAuth).`,
         );
         this.lastOutageAlertAt = now;
