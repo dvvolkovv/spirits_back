@@ -1,6 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
 import { relayAuthHeaders } from '../chat/relay-auth';
+import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
+import { relayProviderFields } from '../chat/answer-provider';
 
 /**
  * Разбор SSE-потока релея. Вынесен отдельной чистой функцией, чтобы
@@ -23,6 +25,14 @@ export function collectRelayText(raw: string): string {
 export class BlogRelayClient {
   private readonly logger = new Logger(BlogRelayClient.name);
 
+  constructor(
+    // Общий рубильник модели (spec 2026-10-31-global-llm-switch): фоновые
+    // посты автоблога идут через модель рубильника. Без @Optional(): при
+    // поломке DI старт упадёт (поймает smoke), а не автоблог молча останется
+    // на Claude; тесты создают клиент через new без аргумента.
+    private readonly globalProvider?: GlobalLlmProviderService,
+  ) {}
+
   /**
    * Один вызов релея. sessionId — новый на каждый пост: длинные сессии
    * у нас глючат посторонним текстом в ответе, а память здесь не нужна —
@@ -35,6 +45,8 @@ export class BlogRelayClient {
     fd.append('message', message);
     fd.append('systemPrompt', systemPrompt);
     fd.append('sessionId', sessionId);
+    const provider = this.globalProvider ? await this.globalProvider.get() : 'claude';
+    for (const [k, v] of Object.entries(relayProviderFields(false, provider))) fd.append(k, v);
 
     const resp = await axios.post(`${agentUrl}/chat`, fd, {
       headers: { ...fd.getHeaders(), ...relayAuthHeaders() },

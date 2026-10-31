@@ -2693,6 +2693,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const relaySid = sessionIdOverride ||
       relaySessionKey(userId, assistantId, await this.language.resolveUserLanguage(userId));
     fd.append('sessionId', relaySid);
+    // Модель ответов: личный выбор этого человека или общий рубильник (spec
+    // 2026-10-31-global-llm-switch, раздел 4) — рутины, «Путь», план действий,
+    // поездки, итоги и документы звонков, проба качества.
+    const route = await resolveAnswerProvider(false, userId, this.llmProvider);
+    for (const [k, v] of Object.entries(relayProviderFields(false, route.provider))) fd.append(k, v);
     // Инструменты Linkeon — только когда вызывающий явно сказал linkeonTools:
     // true (см. AgentReplyOpts); по умолчанию — нет.
     if (opts.linkeonTools === true) appendLinkeonFields(fd, linkeonRelayFields(userId, relaySid));
