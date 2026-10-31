@@ -465,6 +465,20 @@ export class ClaudeCliService implements OnModuleInit {
     return !!opts.mcpServers && Object.keys(opts.mcpServers).length > 0;
   }
 
+  /** stderr без строк с безобидным предупреждением о незнакомой модели
+   *  запасного (`[claude-code:unrecognized_model] {...}`): живая проверка на
+   *  Linux (31.10, битый ключ Qwen) показала, что оно заслоняет настоящую
+   *  причину сбоя (401), если брать stderr как есть. Остаток — склеен и
+   *  обрезан. */
+  private static stderrDetail(stderr: string): string {
+    return stderr
+      .split('\n')
+      .filter((line) => !line.includes('[claude-code:unrecognized_model]'))
+      .join('\n')
+      .trim()
+      .slice(0, 400);
+  }
+
   /** Признак stream-json — в одном месте: его же читают mayRetry (решает,
    *  было бы видно использование инструмента) и spawnClaude (--output-format). */
   private static isStreaming(opts: ClaudeCliOptions): boolean {
@@ -790,7 +804,7 @@ export class ClaudeCliService implements OnModuleInit {
         if (streaming) {
           if (code !== 0) {
             this.logger.error(`claude CLI exit ${code}: stderr=${stderr.slice(0, 300)} stdout=${stdout.slice(0, 300)}`);
-            const detail = streamErrorDetail || stderr.trim() || stdout.trim().slice(0, 400);
+            const detail = streamErrorDetail || ClaudeCliService.stderrDetail(stderr) || stdout.trim().slice(0, 400);
             fail(`claude CLI exited with code ${code}: ${detail.slice(0, 200) || '(no output)'}`);
             return;
           }
@@ -819,16 +833,23 @@ export class ClaudeCliService implements OnModuleInit {
 
         // Non-streaming path: одноразовый JSON parse на выходе.
         if (code !== 0) {
-          // Реальная причина часто уходит в stdout (CLI с --output-format json
-          // печатает {is_error, result} и при ненулевом коде, либо текстовую
-          // ошибку авторизации). stderr нередко пуст — поэтому подмешиваем stdout.
-          let detail = stderr.trim();
-          if (!detail && stdout.trim()) {
-            try {
-              const j = JSON.parse(stdout);
-              detail = String(j.result ?? j.error ?? stdout).slice(0, 400);
-            } catch { detail = stdout.trim().slice(0, 400); }
-          }
+          // Причина — сначала из JSON в stdout (CLI печатает {is_error, result}
+          // и при ненулевом коде), затем из stderr (без безобидных
+          // предупреждений о модели — stderrDetail), затем — сырой stdout.
+          // Живая проверка на Linux (31.10, битый ключ Qwen): CLI пишет в
+          // stderr `[claude-code:unrecognized_model] {"model":"qwen3.6-flash",
+          // ...}` — предупреждение про модель запасного, а настоящая причина
+          // (401) — в JSON stdout. Старый порядок (stderr первым, как есть)
+          // брал это предупреждение за причину сбоя: isFallbackWorthy
+          // классифицировал её как other, и цепочка на запасного не
+          // переключалась (а провайдер не помечался «не отвечает»).
+          let detail = '';
+          try {
+            const j = JSON.parse(stdout);
+            detail = String(j.result ?? j.error ?? '').trim();
+          } catch { /* не JSON — возьмём stderr или сырой stdout ниже */ }
+          if (!detail) detail = ClaudeCliService.stderrDetail(stderr);
+          if (!detail) detail = stdout.trim().slice(0, 400);
           this.logger.error(`claude CLI exit ${code}: stderr=${stderr.slice(0, 300)} stdout=${stdout.slice(0, 300)}`);
           fail(`claude CLI exited with code ${code}: ${detail.slice(0, 200) || '(no output)'}`);
           return;
