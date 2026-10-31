@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { MATCH_THRESHOLD, speechCheck, speechWords } from './match';
+import { MATCH_THRESHOLD, sameWord, speechCheck, speechWords } from './match';
 import { ACCEPTED, FALSE_REJECTS, TRUE_REJECTS } from './match-corpus';
 
 test('слова — без регистра, знаков и с «е» вместо «ё»; дефис делит слово; NFD приводится к NFC', () => {
@@ -92,4 +92,22 @@ test('корпус: настоящий брак отвергнут, непроз
     return { name: c.name, ok, silentLines };
   });
   assert.deepEqual(got, TRUE_REJECTS.map((c) => ({ name: c.name, ok: false, silentLines: c.silent })));
+});
+
+test('одно слово с точностью до окончания: общее начало от 5 букв, меньшему до него не хватает не больше 2', () => {
+  for (const [a, b] of [['начинай', 'начинаешь'], ['убедил', 'убедила'], ['период', 'периода'], ['ладно', 'ладно']]) {
+    assert.equal(sameWord(a, b), true, `${a} ≈ ${b}`);
+    assert.equal(sameWord(b, a), true, `${b} ≈ ${a}`);
+  }
+  // Корпус ловит ложные отказы, а не ослабление сверки: порог держат эти пары.
+  // «день»/«деньги» — общее начало 4 буквы: сломается, если STEM_MIN опустить до 4;
+  // «отказаться»/«отказник» — сломается, если STEM_SLACK поднять до 3.
+  for (const [a, b] of [['начинай', 'начальник'], ['спрошу', 'спокойно'], ['отказаться', 'отказник'], ['день', 'деньги'], ['мой', 'мою']]) {
+    assert.equal(sameWord(a, b), false, `${a} ≠ ${b}`);
+  }
+});
+
+test('доля: сначала точные пары, потом по окончанию — точное слово не отдаёт свою пару неточному', () => {
+  // Жадный один проход отдал бы «начинаешь» слову «начинай», и «начинаешь» остался бы без пары.
+  assert.equal(speechCheck(['Начинай, начинаешь.'], 'начинаешь начинайте').share, 1);
 });
