@@ -286,13 +286,18 @@ describe('ход гостя: отказы', () => {
     expect((await h.turn({ token })).res.statusCode).not.toBe(409);
   });
 
-  it('окно Claude открыто (рубильник не передан — Claude) — стена closed, модель не зовётся', async () => {
+  // Новый гость при недоступной модели (ревью 01.11): стена ДО квоты проб —
+  // тот же поток, что при выключенной пробе (guest без ключа с left 0 и стена
+  // closed), без строки пробы; в событии — cause.
+  it('окно Claude открыто (рубильник не передан — Claude) — стена closed до квоты проб, cause claude_window', async () => {
     const h = harness({ fallbackStats: () => ({ breakerOpenUntil: Date.now() + 60_000 }) });
     const { evs } = await h.turn();
-    expect(evs.slice(-1)).toEqual([{ type: 'wall', reason: 'closed' }]);
+    expect(evs).toEqual([{ type: 'guest', left: 0 }, { type: 'wall', reason: 'closed' }]);
     expect(h.cli.textWithCost).not.toHaveBeenCalled();
+    expect(h.sessions.create).not.toHaveBeenCalled();
+    expect(h.redis.peek('guest-lim:trials:h')).toBeNull();
     expect(h.redis.peek('guest-lim:answers:h')).toBeNull();
-    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'breaker', assistant_id: '12', preview: false } });
+    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'breaker', cause: 'claude_window', assistant_id: '12', preview: false } });
   });
 
   it('рубильник Qwen — гость идёт в Qwen без цепочки (provider qwen, noFallback)', async () => {
@@ -327,28 +332,89 @@ describe('ход гостя: отказы', () => {
     expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'model', assistant_id: '12', preview: false, provider: 'qwen' } });
   });
 
-  it('рубильник Kimi без ключа — стена closed, модель не зовётся, окно ответов не тронуто', async () => {
+  it('рубильник Kimi без ключа — стена closed до квоты проб, модель не зовётся, cause no_key', async () => {
     const h = harness({
       global: 'kimi',
       fallbackStats: () => ({ breakerOpenUntil: 0, providers: { qwen: { enabled: true, downUntil: 0 }, kimi: { enabled: false, downUntil: 0 } } }),
     });
     const { evs } = await h.turn();
-    expect(evs.slice(-1)).toEqual([{ type: 'wall', reason: 'closed' }]);
+    expect(evs).toEqual([{ type: 'guest', left: 0 }, { type: 'wall', reason: 'closed' }]);
     expect(h.cli.textWithCost).not.toHaveBeenCalled();
+    expect(h.sessions.create).not.toHaveBeenCalled();
+    expect(h.redis.peek('guest-lim:trials:h')).toBeNull();
     expect(h.redis.peek('guest-lim:answers:h')).toBeNull();
-    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'breaker', assistant_id: '12', preview: false, provider: 'kimi' } });
+    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'breaker', cause: 'no_key', assistant_id: '12', preview: false, provider: 'kimi' } });
   });
 
-  it('рубильник Qwen «не отвечает» — стена closed, модель не зовётся, окно ответов не тронуто', async () => {
+  it('рубильник Qwen «не отвечает», новый гость — стена до квоты проб: без ключа и строки пробы, Redis не тронут, cause down', async () => {
     const h = harness({
       global: 'qwen',
       fallbackStats: () => ({ breakerOpenUntil: 0, providers: { qwen: { enabled: true, downUntil: Date.now() + 60_000 }, kimi: { enabled: false, downUntil: 0 } } }),
     });
+    const evalSpy = jest.spyOn(h.redis, 'eval');
     const { evs } = await h.turn();
-    expect(evs.slice(-1)).toEqual([{ type: 'wall', reason: 'closed' }]);
+    expect(evs).toEqual([{ type: 'guest', left: 0 }, { type: 'wall', reason: 'closed' }]);
     expect(h.cli.textWithCost).not.toHaveBeenCalled();
+    expect(h.sessions.create).not.toHaveBeenCalled();
+    // Ни квоты проб (trialRules), ни окна ответов: Redis не тронут вовсе.
+    expect(evalSpy).not.toHaveBeenCalled();
+    expect(h.redis.peek('guest-lim:trials:h')).toBeNull();
+    expect(h.redis.peek('guest-lim:trials:d')).toBeNull();
     expect(h.redis.peek('guest-lim:answers:h')).toBeNull();
-    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'breaker', assistant_id: '12', preview: false, provider: 'qwen' } });
+    expect(h.global?.get).toHaveBeenCalledTimes(1);
+    expect(h.events.track).toHaveBeenCalledTimes(1);
+    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'breaker', cause: 'down', assistant_id: '12', preview: false, provider: 'qwen' } });
+  });
+
+  it('долгий простой модели не съедает потолок новых проб: ожила — новый гость получает пробу', async () => {
+    let down = true;
+    const h = harness({
+      global: 'qwen',
+      limits: { trialsPerHour: 2, trialsPerDay: 2 },
+      fallbackStats: () => ({ breakerOpenUntil: 0, providers: { qwen: { enabled: true, downUntil: down ? Date.now() + 60_000 : 0 }, kimi: { enabled: false, downUntil: 0 } } }),
+    });
+    for (let i = 0; i < 5; i++) {
+      expect((await h.turn()).evs).toEqual([{ type: 'guest', left: 0 }, { type: 'wall', reason: 'closed' }]);
+    }
+    down = false;
+    const { evs } = await h.turn();
+    expect(evs[0].token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(evs.find((e) => e.type === 'end')).toEqual({ type: 'end', content: 'Здравствуйте' });
+    expect(h.sessions.create).toHaveBeenCalledTimes(1);
+    expect(h.redis.peek('guest-lim:trials:d')).toBe('1');
+  });
+
+  it('ход по ключу при недоступной модели — как раньше: проверка после лока, ответ не тратится, cause в событии', async () => {
+    let down = false;
+    const h = harness({
+      global: 'qwen',
+      fallbackStats: () => ({ breakerOpenUntil: 0, providers: { qwen: { enabled: true, downUntil: down ? Date.now() + 60_000 : 0 }, kimi: { enabled: false, downUntil: 0 } } }),
+    });
+    const token = (await h.turn()).evs[0].token;
+    const answersBefore = h.redis.peek('guest-lim:answers:h');
+    h.sessions.findLive.mockClear();
+    h.events.track.mockClear();
+    down = true;
+    const { evs } = await h.turn({ token });
+    // Остаток — настоящий (ответ не потрачен), без нового ключа; стена closed.
+    expect(evs).toEqual([{ type: 'guest', left: 2 }, { type: 'wall', reason: 'closed' }]);
+    // Проверка — после лока: проба перечитана второй раз (свежая строка).
+    expect(h.sessions.findLive).toHaveBeenCalledTimes(2);
+    expect(h.redis.peek('guest-lim:answers:h')).toBe(answersBefore);
+    expect(h.cli.textWithCost).toHaveBeenCalledTimes(1); // только первый ход
+    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'breaker', cause: 'down', assistant_id: '12', preview: false, provider: 'qwen' } });
+  });
+
+  it('ход по ключу — рубильник читается один раз за ход', async () => {
+    const h = harness({
+      globalSequence: ['qwen', 'qwen', 'claude'],
+      fallbackStats: () => ({ breakerOpenUntil: 0, providers: { qwen: { enabled: true, downUntil: 0 }, kimi: { enabled: false, downUntil: 0 } } }),
+    });
+    const token = (await h.turn()).evs[0].token;
+    expect(h.global?.get).toHaveBeenCalledTimes(1);
+    await h.turn({ token });
+    expect(h.global?.get).toHaveBeenCalledTimes(2);
+    expect(h.cli.textWithCost.mock.calls[1][1]).toMatchObject({ provider: 'qwen', providerChoice: 'global' });
   });
 
   it('рубильник Qwen при открытом окне Claude — гость всё равно идёт в Qwen', async () => {
