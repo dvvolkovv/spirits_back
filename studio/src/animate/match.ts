@@ -66,17 +66,17 @@ function unglue(w: string, vocab: Set<string>): string[] {
 
 /**
  * Одно ли это слово с точностью до окончания: равны или у них общее начало от
- * STEM_MIN букв, а меньшему слову до него не хватает не больше STEM_SLACK букв.
+ * STEM_MIN букв, а у меньшего слова за ним — не больше STEM_SLACK букв.
  * «начинай» ≈ «начинаешь» (SpeechKit слил «начинай уж», ролик 889b6423),
  * «убедил» ≈ «убедила»; «начинай» ≠ «начальник», «отказаться» ≠ «отказник».
  * Короткие слова — только точно.
  */
 export function sameWord(a: string, b: string): boolean {
   if (a === b) return true;
-  const max = Math.min(a.length, b.length);
+  const shorter = Math.min(a.length, b.length);
   let n = 0;
-  while (n < max && a[n] === b[n]) n++;
-  return n >= STEM_MIN && n >= max - STEM_SLACK;
+  while (n < shorter && a[n] === b[n]) n++;
+  return n >= STEM_MIN && n >= shorter - STEM_SLACK;
 }
 
 export interface SpeechCheck {
@@ -84,7 +84,7 @@ export interface SpeechCheck {
   ok: boolean;
   /** Доля сверяемых слов реплик (с повторами), найденных в распознанном с точностью до окончания. */
   share: number;
-  /** Номера реплик (с 0), от которых — или от их последнего предложения — не услышано ни одного слова от трёх букв. */
+  /** Номера реплик (с 0), от которых — или от их последнего предложения — не услышано ни одного слова от трёх букв (в последнем предложении — от четырёх): дословно — где угодно в услышанном, по окончанию — только своей парой из доли. */
   silentLines: number[];
 }
 
@@ -96,6 +96,10 @@ export function speechCheck(lines: string[], heard: string): SpeechCheck {
   for (const w of speechWords(heard).flatMap((x) => unglue(x, vocab))) pool.set(w, (pool.get(w) ?? 0) + 1);
   const heardWords = [...pool.keys()];
   const expected = perLine.flat();
+  /** Номер реплики у каждого слова expected. */
+  const lineOf = perLine.flatMap((ws, li) => ws.map(() => li));
+  /** Слова каждой реплики, засчитанные по окончанию, — каждое своей парой из услышанного. */
+  const byStem = perLine.map(() => new Set<string>());
   // Сначала точные пары, потом с точностью до окончания: иначе неточное слово
   // могло бы забрать пару, которая точно подходит другому.
   const matched = expected.map(() => false);
@@ -109,12 +113,17 @@ export function speechCheck(lines: string[], heard: string): SpeechCheck {
   expected.forEach((w, i) => {
     if (matched[i]) return;
     const h = heardWords.find((x) => (pool.get(x) ?? 0) > 0 && sameWord(w, x));
-    if (h !== undefined) take(i, h);
+    if (h === undefined) return;
+    take(i, h);
+    byStem[lineOf[i]].add(w);
   });
   const hit = matched.filter(Boolean).length;
   const share = expected.length ? hit / expected.length : 1;
   const long = (s: string, min = MIN_LINE_WORD): string[] => words(s).filter((w) => w.length >= min && !shout(w));
-  const heardAny = (w: string): boolean => heardWords.some((h) => sameWord(w, h));
+  // Прозвучало ли слово реплики li: дословно — где угодно в услышанном, как прежде
+  // (ключи pool — все услышанные слова); по окончанию — только своей парой из доли:
+  // иначе «начинай» другой реплики скрыл бы оборванное «Начинаю.».
+  const heardIn = (li: number) => (w: string): boolean => pool.has(w) || byStem[li].has(w);
   // Реплика проглочена, если от неё не услышано ни одного слова; при нескольких
   // предложениях — и если не услышано ни одного слова последнего (обрыв клипа).
   const silentLines = lines
@@ -122,7 +131,7 @@ export function speechCheck(lines: string[], heard: string): SpeechCheck {
       const s = sentences(l);
       return { i, parts: s.length > 1 ? [long(l), long(s.at(-1) ?? '', MIN_LAST_WORD)] : [long(l)] };
     })
-    .filter(({ parts }) => parts.some((p) => p.length > 0 && !p.some(heardAny)))
+    .filter(({ i, parts }) => parts.some((p) => p.length > 0 && !p.some(heardIn(i))))
     .map(({ i }) => i);
   return { ok: share >= MATCH_THRESHOLD && silentLines.length === 0, share, silentLines };
 }
