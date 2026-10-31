@@ -312,19 +312,29 @@ describe('ClaudeCliService — причина из JSON в stdout только �
     expect(err.message).toContain('real reason');
   });
 
-  it('is_error: false, текст обычного ответа упоминает 429 — не читается как причина; окно не открывается', async () => {
+  it('is_error: true, но result — из одних пробелов — причина из stderr (пробелы не маскируют)', async () => {
+    spawnMock.mockImplementationOnce(() => fakeProcWithStderr('{"is_error":true,"result":"   "}', 'real reason\n', 1));
+    const err = await new ClaudeCliService().text('x', { noFallback: true }).catch((e) => e);
+    expect(err.message).toContain('real reason');
+  });
+
+  it('is_error: false, текст обычного ответа упоминает 429 — не читается как причина даже из сырого stdout; окно не открывается, к запасным не переходит', async () => {
     spawnMock.mockImplementationOnce(() => fakeProcWithStderr(
       '{"is_error":false,"result":"API Error: 429 — это просто слова в ответе"}',
       '',
       1,
     ));
+    // С ключами запасных, как и в остальных тестах файла (beforeEach) — без
+    // noFallback: у NO_FALLBACK_CONFIGS окно и так никогда не откроется, и
+    // проверка ничего не доказывала бы.
     const svc = new ClaudeCliService();
-    const err = await svc.text('x', { noFallback: true }).catch((e) => e);
+    const err = await svc.text('x').catch((e) => e);
     expect(err).toBeInstanceOf(Error);
-    // Текст обычного ответа — не причина сбоя: взят сырой JSON stdout целиком
-    // (видна обёртка "result":), а не голый j.result — иначе «429» в нём
+    // Ни j.result (is_error: false, не похоже на отказ CLI), ни сырой stdout
+    // (в нём тот же текст) не становятся причиной — иначе «429» в нём
     // классифицировался бы как рейт-лимит.
-    expect(err.message).toContain('"result"');
+    expect(err.message).not.toContain('429');
+    expect(spawnMock).toHaveBeenCalledTimes(1); // перехода к запасным не было
     expect(svc.fallbackStats().breakerOpenUntil).toBe(0);
   });
 });
