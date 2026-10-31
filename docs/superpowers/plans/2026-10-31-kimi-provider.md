@@ -2761,6 +2761,8 @@ test("isAccessFailure", () => {
   assert.equal(l.isAccessFailure("Prompt is too long: 250000 tokens", { isError: true, apiStatus: 400 }), false);
   assert.equal(l.isAccessFailure("Context window exceeded · try again", { isError: true }), false);
   assert.equal(l.isAccessFailure("обычный ответ ассистента"), false);
+  assert.equal(l.isAccessFailure('API Error: 403 {"code":"AccessDenied.Unpurchased"}', { isError: true }), true);
+  assert.equal(l.isAccessFailure("API Error: 400 Arrearage: account overdue", { isError: true }), true);
 });
 
 test("isAccessFailure: статус 429/529/401/403 — раньше признаков длины контекста", () => {
@@ -3001,7 +3003,9 @@ export function providerSpawnEnv(base, cfg) {
 const CLI_REFUSAL_RE = /^(?:Not logged in|Please run \/login|(?:You['’]ve |You have )?hit your (?:\w+ )?limit|Invalid API key|Credit balance is too low|OAuth token (?:has )?expired|Claude AI usage limit reached)/i;
 const CONTEXT_LENGTH_RE = /context (window|length|limit)|prompt is too long|output token|max_tokens/i;
 const ACCESS_STATUS = new Set([401, 403, 429, 529]);
-const ACCESS_TEXT_RE = /\b(401|403|429|529)\b|Unauthorized|Forbidden|rate.?limit|overloaded/i;
+// AccessDenied (Qwen с неоплаченным планом — 403 AccessDenied.Unpurchased) и
+// Arrearage (долг у Alibaba) — тоже сбой доступа, как у бэкенда (isFallbackWorthy).
+const ACCESS_TEXT_RE = /\b(401|403|429|529)\b|Unauthorized|Forbidden|access.?denied|arrearage|rate.?limit|overloaded/i;
 
 export function looksLikeCliRefusal(text) {
   const t = trimmed(text);
@@ -3315,7 +3319,10 @@ region('          // Сбой доступа (qwen-provider.mjs): отказ CLI
        '          // штатно повторяют (TRANSIENT_RE), — признак для решения после повтора\n'
        '          // (transientHit ниже).\n'
        '          const accessFailure = llm.isAccessFailure(ev.result, { isError: isErrorResult, apiStatus: ev.api_error_status });\n'
-       '          const fatalAccess = accessFailure && (llm.looksLikeCliRefusal(ev.result) || FATAL_RE.test(ev.result));\n'
+       '          // Сбой доступа, который штатно не повторяют (не TRANSIENT_RE: например\n'
+       '          // 400 Arrearage), — тоже повод перейти сразу: иначе человеку ушёл бы сырой текст ошибки.\n'
+       '          const fatalAccess = accessFailure && (llm.looksLikeCliRefusal(ev.result) || FATAL_RE.test(ev.result) ||\n'
+       '            (isErrorResult && !TRANSIENT_RE.test(ev.result)));\n'
        '          const selectedFail = !!selected && runProvider === selected && isErrorResult &&\n'
        '            !TRANSIENT_RE.test(ev.result) && !(IMG_LIMIT_RE.test(ev.result) && useResume) &&\n'
        '            ev.result.trim() !== NO_RESP_PLACEHOLDER;\n'
@@ -3931,3 +3938,12 @@ Expected: `OK {"text":"ок"…}`, `kimi.enabled: true`.
   - синтетика `chat_streaming` зелёная; в течение часа нет алерта «Релей: Claude недоступен».
 
 - [ ] **Step 6: Память и уборка** — обновить `project_kimi_k3_via_claude_code.md` и `project_qwen_fallback_for_claude.md` (что на проде, где ключи, как проверять, итог проверки картинок из Task 7); снять воркдеревья на маке (`git worktree remove`) и ноде (`~/ci/wt/kimi-back`, `~/ci/wt/kimi-front`), scratchpad-копию релея `${W}`.
+
+---
+
+## Поправки по ревью (31.10) — код в ветке отличается от текста задач выше
+
+- **Task 1–2 (`llm-fallback.ts`):** выбор провайдера принимается, только если это известный запасной с ключом — `FALLBACK_ORDER.includes(selected) && configs[selected]` (незнакомое значение из БД и имена из прототипа объекта идут обычным путём; `4a790fea`, `0b49b183`). `isFallbackWorthy`: 403 / Forbidden / Access denied / Arrearage — сбой доступа (Qwen с неоплаченным планом отдаёт `403 AccessDenied.Unpurchased`; `0b49b183`).
+- **Task 3 (`claude-cli.service.ts`):** то же правило выбора в `runRaw`; признак stream-json — один `static isStreaming(opts)` для `spawnClaude` и `mayRetry`; комментарии: Маша и TG и так в stream-json через `onProgress`, MCP → stream-json — страховка; пояснение «цена осознанная» у закрытия окна Claude. Тесты: отказ текстом у запасного и у выбранного, параллельный вызов уронил запасного, проверки окна; тест таймаута — бюджет 200 мс (`063befa7`, `0b49b183`).
+- **Task 8–9 (релей):** `ACCESS_TEXT_RE` — плюс `access.?denied|arrearage`; во врезке сбой доступа, который штатно не повторяют (не `TRANSIENT_RE`, например `400 Arrearage`), переводит ход к следующему сразу (тексты задач выше уже исправлены).
+- **Task 13:** ключ Kimi на прод и релей — только после письменного подтверждения отказа Kimi от обучения (решение владельца 31.10, spec «Соответствие концепции»).
