@@ -149,4 +149,38 @@ maybe('пробы и сообщения против живого Postgres', () 
       guest_trial_error_internal_week: 0,
     });
   });
+
+  // Ревью A10: events/track открыта без JWT (src/events/events.controller.ts) —
+  // props и reason в events — не доверенные данные, а чей угодно ввод.
+  it('статистика: мусор в cost_usd (строка, псевдо-переполнение) не считается и не роняет status()', async () => {
+    await pool.query(
+      `INSERT INTO events (name, ts, props) VALUES
+         ('guest_trial_answer', now(), '{"cost_usd":0.1,"n":1}'::jsonb),
+         ('guest_trial_answer', now(), '{"cost_usd":"x","n":1}'::jsonb),
+         ('guest_trial_answer', now(), '{"cost_usd":"1e400","n":1}'::jsonb)`,
+    );
+    const s = await svc.status();
+    // Счёт ответов считает все три строки — мусор в cost_usd не мешает счёту.
+    expect(s.answers_day).toBe(3);
+    expect(s.answers_week).toBe(3);
+    // Сумма стоимости — только настоящее число 0.1, строки проигнорированы.
+    expect(s.cost_usd_day).toBeCloseTo(0.1, 4);
+    expect(s.cost_usd_week).toBeCloseTo(0.1, 4);
+  });
+
+  it('статистика: чужая/опечатанная причина отказа не заводит новый ключ', async () => {
+    await pool.query(
+      `INSERT INTO events (name, ts, props) VALUES ('guest_trial_error', now(), '{"reason":"evil"}'::jsonb)`,
+    );
+    const s = await svc.status();
+    expect(s).not.toHaveProperty('guest_trial_error_evil_day');
+    expect(s).not.toHaveProperty('guest_trial_error_evil_week');
+  });
+
+  it('статистика: возраст самой старой неперенесённой пробы — 0 без проб, иначе дни с последнего сообщения', async () => {
+    expect((await svc.status()).oldest_unclaimed_days).toBe(0);
+    const { row } = await create();
+    await pool.query(`UPDATE guest_trial_sessions SET last_message_at = now() - interval '5 days' WHERE id = $1`, [row.id]);
+    expect((await svc.status()).oldest_unclaimed_days).toBe(5);
+  });
 });
