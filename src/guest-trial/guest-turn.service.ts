@@ -83,6 +83,14 @@ const SCOPE_TEXT: Record<string, string> = {
   answers_day: 'гостевых ответов в сутки',
 };
 
+/**
+ * Почему модель рубильника недоступна гостю — поле cause события
+ * guest_trial_error с reason 'breaker' (ревью 01.11): claude_window — у
+ * Claude открыто его окно; no_key — у запасной модели нет ключа на сервере
+ * (или она выключена); down — запасная «не отвечает».
+ */
+export type GuestBreakerCause = 'claude_window' | 'no_key' | 'down';
+
 /** О лежащем Redis — не чаще раза в 10 минут: отметку «уже сообщили» без него не поставить. */
 const REDIS_ALERT_EVERY_MS = 10 * 60_000;
 const PING_MS = 20_000;
@@ -129,6 +137,16 @@ export class GuestTurnService {
       return;
     }
 
+    // Модель гостя — рубильник, без цепочки (решение 31.10). Читается ОДИН раз
+    // за ход и здесь, до ветвления «ключ / новая проба» (ревью 01.11): её
+    // видят ранняя стена новой пробы, поздняя проверка после лока, события и
+    // вызов модели (в runTurn — параметром). get() не бросает (контракт
+    // GlobalLlmProviderService.get).
+    const trialProvider: AnswerProvider = this.globalProvider ? await this.globalProvider.get() : 'claude';
+    // provider в событиях гостя о модели — когда рубильник увёл с Claude:
+    // иначе сбои модели рубильника у гостей не отличить от сбоев Claude.
+    const providerProp: { provider?: AnswerProvider } = trialProvider === 'claude' ? {} : { provider: trialProvider };
+
     let session: GuestSessionRow;
     let issued: string | null = null;
     // Хеш ключа — общий для обеих веток ниже: нужен ещё раз после busy.add (M2).
@@ -146,6 +164,19 @@ export class GuestTurnService {
       }
       session = found;
     } else {
+      // Новый гость, а модель уже недоступна — стена ДО квоты проб (ревью
+      // 01.11). Простой бывает долгим (кончилась квота Qwen — окно «не
+      // отвечает» держится часами): иначе каждый посетитель брал бы место в
+      // trials_hour/trials_day и оставлял пустую строку пробы — суточный
+      // потолок кончился бы раньше, чем модель оживёт, а воронка завысилась
+      // бы. Поток — тот же, что при выключенной пробе: без ключа, без строки
+      // пробы, без отчёта о потолках (q = null).
+      const cause = this.unavailableCause(trialProvider);
+      if (cause) {
+        this.closedStream(res, null, input.preview);
+        this.trackBreaker(agent.id, input.preview, cause, providerProp);
+        return;
+      }
       const q = await takeGuestQuota(this.redis, trialRules(limits), this.redisTimeoutMs);
       if (!q.counted) {
         this.closedStream(res, q, input.preview);
@@ -206,20 +237,17 @@ export class GuestTurnService {
         guestEvent = { type: 'guest', left };
       }
 
-      // Модель гостя — рубильник, без цепочки (решение 31.10). Она сейчас
-      // недоступна (у Claude открыто его окно, у запасного нет ключа или он
-      // «не отвечает») — гостю сразу стена «войдите», а не две минуты
-      // ожидания и занятый слот. Решение владельца 31.10 (ревью 1.11,
-      // раздел 6 спеки): это не отказ самой модели (у неё и шанса не было
-      // ответить) — та же стена, что у прочих закрытий пробы, а не
-      // error: model, который обещал бы, что повтор прямо сейчас поможет.
-      // get() не бросает (контракт GlobalLlmProviderService.get).
-      const trialProvider: AnswerProvider = this.globalProvider ? await this.globalProvider.get() : 'claude';
-      // Один раз на ход: добавляется и в событие ниже, и в вызов модели (в
-      // runTurn — передаём параметром), когда рубильник увёл с Claude —
-      // иначе сбои модели рубильника у гостей не отличить от сбоев Claude.
-      const providerProp: { provider?: AnswerProvider } = trialProvider === 'claude' ? {} : { provider: trialProvider };
-      if (this.providerUnavailable(trialProvider)) {
+      // Модель рубильника (прочитана в начале хода) сейчас недоступна — у
+      // Claude открыто его окно, у запасного нет ключа или он «не отвечает»:
+      // гостю сразу стена «войдите», а не две минуты ожидания и занятый слот.
+      // Решение владельца 31.10 (ревью 1.11, раздел 6 спеки): это не отказ
+      // самой модели (у неё и шанса не было ответить) — та же стена, что у
+      // прочих закрытий пробы, а не error: model, который обещал бы, что
+      // повтор прямо сейчас поможет. Ход по ключу проверяется только здесь,
+      // после лока; новую пробу ранняя стена (до квоты проб) уже пропустила —
+      // здесь ловится лишь модель, упавшая за время квоты и создания строки.
+      const cause = this.unavailableCause(trialProvider);
+      if (cause) {
         // guestEvent — без переопределения left: недоступность модели это не
         // потраченный ответ. closedStream() здесь не подходит — он пишет
         // left: 0 и ведёт свою отчётность по лимитам (reportClosed), которая
@@ -228,9 +256,7 @@ export class GuestTurnService {
         this.write(res, guestEvent);
         this.write(res, { type: 'wall', reason: 'closed' });
         this.end(res);
-        this.events?.track('guest_trial_error', {
-          props: { reason: 'breaker', assistant_id: String(agent.id), preview: input.preview, ...providerProp },
-        });
+        this.trackBreaker(agent.id, input.preview, cause, providerProp);
         return;
       }
 
@@ -369,13 +395,23 @@ export class GuestTurnService {
     }
   }
 
-  /** Модель рубильника сейчас недоступна гостю: у Claude — открыто его окно,
-   *  у запасного — нет ключа или он «не отвечает». */
-  private providerUnavailable(p: AnswerProvider, now: number = Date.now()): boolean {
+  /** Почему модель рубильника сейчас недоступна гостю; null — доступна. У
+   *  Claude — открыто его окно; у запасного — нет ключа (выключен) или он
+   *  «не отвечает». */
+  private unavailableCause(p: AnswerProvider, now: number = Date.now()): GuestBreakerCause | null {
     const s = this.claudeCli.fallbackStats(now);
-    if (p === 'claude') return s.breakerOpenUntil > now;
+    if (p === 'claude') return s.breakerOpenUntil > now ? 'claude_window' : null;
     const st = s.providers?.[p];
-    return !st?.enabled || st.downUntil > now;
+    if (!st?.enabled) return 'no_key';
+    return st.downUntil > now ? 'down' : null;
+  }
+
+  /** Событие стены «модель недоступна» — одно на обе проверки (раннюю у
+   *  новой пробы и позднюю после лока), чтобы поля не разошлись. */
+  private trackBreaker(assistantId: number, preview: boolean, cause: GuestBreakerCause, providerProp: { provider?: AnswerProvider }): void {
+    this.events?.track('guest_trial_error', {
+      props: { reason: 'breaker', cause, assistant_id: String(assistantId), preview, ...providerProp },
+    });
   }
 
   /** Ассистент для пробы: тот же набор, что видит экран выбора (AgentsService.getAgents). */
