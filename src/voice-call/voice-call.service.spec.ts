@@ -1,4 +1,4 @@
-import { SUMMARY_FIDELITY_RULES, VoiceCallService } from './voice-call.service';
+import { SUMMARY_CHAR_LIMIT, SUMMARY_FIDELITY_RULES, VoiceCallService } from './voice-call.service';
 import { CASH_MARKUP, CASH_TOKENS_PER_USD, RUB_PER_TOKEN, RUB_PER_USD } from '../common/billing-rates';
 import type { CompletePayload } from './voice-call.types';
 
@@ -470,6 +470,39 @@ describe('разговор наполняет профиль', () => {
     // И сами правила говорят именно про усиление и про людей.
     expect(SUMMARY_FIDELITY_RULES.join(' ')).toMatch(/НЕ решение против/);
     expect(SUMMARY_FIDELITY_RULES.join(' ')).toMatch(/НЕ ВЫВОДИ из него родственную роль/);
+  });
+
+  /**
+   * Объявленный потолок резюме обязан совпадать с константой.
+   *
+   * Замер 01.11.2026: в промпте полгода стояло «До 800 символов», а живые
+   * резюме превышали его в шести случаях из одиннадцати — двадцатиминутный
+   * разговор дал 1245. Число в тексте промпта разошлось с жизнью, и заметить
+   * это можно было только замером. Теперь оно одно и названо.
+   */
+  it('complete: объявленный в промпте потолок резюме — из константы', async () => {
+    const d = completeDeps([{ role: 'user', text: 'привет', ts: 1 }]);
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+    await svc.complete('call-1', { transcript: [], usage });
+
+    const prompt = (d.chat.generateAgentReply as jest.Mock).mock.calls[0][2] as string;
+    expect(prompt).toContain(`До ${SUMMARY_CHAR_LIMIT} символов`);
+    // И никакого прежнего числа рядом: иначе модель получит два потолка.
+    expect(prompt).not.toContain('До 800 символов');
+  });
+
+  /**
+   * ⚠️ Потолок не опускать ниже измеренного максимума.
+   *
+   * 1245 знаков — самое длинное живое резюме на 01.11.2026, и оно ХОРОШЕЕ:
+   * сверено с расшифровкой по утверждениям, включая отказы человека. Потолок
+   * ниже этого снова сделает объявленное число неправдой — ровно та ошибка,
+   * ради которой его и поднимали. Если тест покраснел, потому что число
+   * урезали, — сначала покажите замер, который это оправдывает.
+   */
+  it('потолок резюме выше самого длинного измеренного', () => {
+    const MEASURED_LONGEST = 1245;
+    expect(SUMMARY_CHAR_LIMIT).toBeGreaterThan(MEASURED_LONGEST);
   });
 
   // Ревью 26.10.2026: linkeonTools — явное включение (AgentReplyOpts),
