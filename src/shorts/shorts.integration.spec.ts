@@ -570,6 +570,71 @@ maybe('ролики против живого Postgres', () => {
     });
   });
 
+  describe('«Отклонить» у идеи на живом SQL', () => {
+    const settings = {
+      get: async () => ({ slotDays: [2, 4, 6], slotHourMsk: 18, prepareLeadHours: 24, format: 'skit' }),
+    };
+    const agents = {
+      getAgents: async () => [
+        { id: 1, name: 'Миша', description: 'Коуч — цели, привычки и источники мотивации' },
+        { id: 10, name: 'Алексей', description: 'Юрист — договоры, споры и работа с судами' },
+        { id: 22, name: 'Кира', description: 'Дизайнер — логотипы, фирменный стиль и макеты' },
+        { id: 4, name: 'Ирина', description: 'Карьера — резюме, собеседования и переговоры' },
+      ],
+    };
+    const reply = () => {
+      const r: any = { status: () => r, json: (b: any) => ((r.body = b), r) };
+      return r;
+    };
+
+    it('отклонённую идею не берёт ни автозапуск, ни «Запустить сейчас» по её id', async () => {
+      const idea = await insert({ status: 'idea', topic_key: 'manual:залог', topic_hint: 'Залог при аренде квартиры' });
+      const ctl = new ShortsController(pgLike() as any, settings as any, {} as any, { publicUrl: () => 'x' } as any);
+      const r = reply();
+      await ctl.action({ action: 'reject', id: idea.id }, r);
+      expect(r.body.status).toBe('rejected');
+
+      const topics = new ShortsTopicService(pgLike() as any, agents as any, settings as any);
+      expect(await topics.start({ force: true })).toBeNull();
+      expect(await topics.start({ id: idea.id, force: true })).toBeNull();
+      const row = (await pool.query(`SELECT status, slot_at FROM short_video WHERE id = $1`, [idea.id])).rows[0];
+      expect(row).toEqual({ status: 'rejected', slot_at: null });
+    });
+
+    it('вместо отклонённой темы каталога пополнение недели заводит другую, на следующей позиции', async () => {
+      const topics = new ShortsTopicService(pgLike() as any, agents as any, settings as any);
+      const wed = new Date('2026-10-28T15:00:00.000Z'); // ср 18:00 МСК, неделя 44
+      expect(await topics.refillWeek(wed)).toBe(3);
+      const first = (await pool.query(
+        `SELECT id FROM short_video WHERE source = 'catalog' AND status = 'idea' ORDER BY source_ref LIMIT 1`,
+      )).rows[0];
+      const ctl = new ShortsController(pgLike() as any, settings as any, {} as any, { publicUrl: () => 'x' } as any);
+      await ctl.action({ action: 'reject', id: first.id }, reply());
+
+      expect(await topics.refillWeek(wed)).toBe(1);
+      const rows = (await pool.query(
+        `SELECT source_ref, status FROM short_video WHERE source = 'catalog' ORDER BY source_ref`,
+      )).rows;
+      expect(rows.filter((x) => x.status === 'idea')).toHaveLength(3);
+      expect(rows.filter((x) => x.status === 'rejected')).toHaveLength(1);
+      expect(rows.map((x) => x.source_ref)).toContain('catalog:2026-W44:4');
+    });
+
+    it('отклонённый заказ можно заказать снова; открытый — дубль (null)', async () => {
+      const topics = new ShortsTopicService(pgLike() as any, agents as any, settings as any);
+      const order = { topic: 'Разнос плохого договора аренды квартиры', rubric: 'assistant' as const };
+      const first = await topics.addManual(order);
+      expect(first).not.toBeNull();
+      expect(await topics.addManual(order)).toBeNull();
+
+      const ctl = new ShortsController(pgLike() as any, settings as any, {} as any, { publicUrl: () => 'x' } as any);
+      await ctl.action({ action: 'reject', id: first!.id }, reply());
+      const again = await topics.addManual(order);
+      expect(again).not.toBeNull();
+      expect(again!.id).not.toBe(first!.id);
+    });
+  });
+
   describe('YouTube против живой базы', () => {
     const OWNER = 37948399;
     const saved = { ...process.env };
