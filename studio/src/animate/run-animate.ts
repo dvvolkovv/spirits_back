@@ -429,8 +429,9 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
       const meta = readRejectedMeta(metaFile);
       // Эта сверка его уже судила; плохой файл сверка не лечит.
       if (meta.matcher === MATCHER_VERSION || meta.code === 'clip_invalid') continue;
-      if (typeof meta.heard === 'string' && meta.heard.trim() && !speechCheck(texts, meta.heard).ok) {
-        writeRejectedMeta(metaFile, { code: 'speech_mismatch', heard: meta.heard, share: meta.share, matcher: MATCHER_VERSION });
+      const byRecord = typeof meta.heard === 'string' && meta.heard.trim() ? speechCheck(texts, meta.heard) : null;
+      if (byRecord && !byRecord.ok) {
+        writeRejectedMeta(metaFile, { code: 'speech_mismatch', heard: meta.heard, share: byRecord.share, matcher: MATCHER_VERSION });
         continue;
       }
       await local('брак не вернулся в работу', () => {
@@ -485,12 +486,6 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     // Запись под другой отпечаток больше не годится: сборка её и так не возьмёт.
     delete anim.skits[kind];
     await save();
-    // Оплаченный брак этого текста — до новой оплаты (reviveRejected). Запущенная
-    // генерация или скачанный raw.mp4 важнее: их и так дождутся без новых денег.
-    if (!fs.existsSync(raw) && !hasPending(kind)) {
-      const revived = await reviveRejected(kind);
-      if (revived) return revived;
-    }
 
     let last: StudioError | null = null;
     const codes: string[] = [];
@@ -504,6 +499,11 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
             id = anim.pending![kind]!.id;
             log(`animate ${kind}: дожидаюсь уже запущенного клипа ${id}`);
           } else {
+            // Перед каждой оплатой — оплаченный брак этого текста, который нынешняя сверка
+            // ещё не судила (reviveRejected): оборванная прошлая перепроверка или
+            // забракованный клип запущенной генерации не должны вести сразу к оплате.
+            const revived = await reviveRejected(kind);
+            if (revived) return revived;
             // Предел — и до кадра (кадр тоже стоит денег), и после: соседняя сценка могла зарезервировать секунды, пока он рисовался.
             assertBudget();
             const image = readImage(abs(await ensureKeyframe(kind)));
