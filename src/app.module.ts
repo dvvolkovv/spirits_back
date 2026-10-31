@@ -54,6 +54,7 @@ import { TmaModule } from './tma/tma.module';
 import { VoiceCallModule } from './voice-call/voice-call.module';
 import { MeetingModule } from './meeting/meeting.module';
 import { IntegrationsModule } from './integrations/integrations.module';
+import { GuestTrialModule } from './guest-trial/guest-trial.module';
 
 @Module({
   imports: [
@@ -112,6 +113,7 @@ import { IntegrationsModule } from './integrations/integrations.module';
     VoiceCallModule,
     MeetingModule,
     IntegrationsModule,
+    GuestTrialModule,
   ],
 })
 export class AppModule {}
