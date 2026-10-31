@@ -33,6 +33,26 @@ function fakeProc(stdout: string, code = 0) {
   return proc;
 }
 
+/** Как fakeProc, но и stderr получает данные — для проверки, что безобидное
+ *  предупреждение о модели там не заслоняет настоящую причину сбоя в stdout. */
+function fakeProcWithStderr(stdout: string, stderr: string, code = 0) {
+  const outH: Array<(b: Buffer) => void> = [];
+  const errH: Array<(b: Buffer) => void> = [];
+  const on: Record<string, (...a: any[]) => void> = {};
+  const proc: any = {
+    stdout: { on: (e: string, cb: any) => { if (e === 'data') outH.push(cb); } },
+    stderr: { on: (e: string, cb: any) => { if (e === 'data') errH.push(cb); } },
+    on: (e: string, cb: any) => { on[e] = cb; },
+    kill: () => {},
+  };
+  setImmediate(() => {
+    outH.forEach((cb) => cb(Buffer.from(stdout)));
+    errH.forEach((cb) => cb(Buffer.from(stderr)));
+    on['close']?.(code);
+  });
+  return proc;
+}
+
 function hangingProc() {
   return { stdout: { on: () => {} }, stderr: { on: () => {} }, on: () => {}, kill: () => {} } as any;
 }
@@ -219,6 +239,58 @@ describe('ClaudeCliService — аварийная цепочка Claude → Qwen
     a.finish(AUTH_FAIL, 1);
     expect(await pA).toBe('kA');
     expect(tokenOf(3)).toBe('sk-kimi-test');
+  });
+});
+
+/**
+ * Живая проверка на Linux (31.10, scripts/llm-fallback-check.js, битый ключ
+ * Qwen): CLI пишет в stderr безобидное предупреждение
+ * `[claude-code:unrecognized_model] {"model":"qwen3.6-flash",...}` про
+ * незнакомую запасному модель, а настоящая причина (401) — в JSON в stdout.
+ * json-режим брал stderr первым и терял причину — isFallbackWorthy давал
+ * false (вид other), цепочка не переключалась, провайдер не помечался
+ * «не отвечает».
+ */
+describe('ClaudeCliService — предупреждение о модели в stderr не заслоняет причину сбоя', () => {
+  it('json: Claude упал, Qwen падает с предупреждением в stderr и 401 в stdout — переходит на Kimi, Qwen «не отвечает»', async () => {
+    spawnMock
+      .mockImplementationOnce(() => fakeProc(AUTH_FAIL, 1))
+      .mockImplementationOnce(() => fakeProcWithStderr(
+        QWEN_401,
+        '[claude-code:unrecognized_model] {"model":"qwen3.6-flash","query_source":"sdk"}\n',
+        1,
+      ))
+      .mockImplementationOnce(() => fakeProc(OK('k')));
+    const svc = new ClaudeCliService();
+    expect(await svc.text('x')).toBe('k');
+    expect(svc.fallbackStats().providers.qwen.downUntil).toBeGreaterThan(0);
+  });
+
+  it('json: выбран Kimi, падает с предупреждением в stderr и 401 в stdout — отвечает Claude, Kimi «не отвечает»', async () => {
+    spawnMock
+      .mockImplementationOnce(() => fakeProcWithStderr(
+        KIMI_401,
+        '[claude-code:unrecognized_model] {"model":"k3.1-pro","query_source":"sdk"}\n',
+        1,
+      ))
+      .mockImplementationOnce(() => fakeProc(OK('c')));
+    const svc = new ClaudeCliService();
+    expect(await svc.text('x', { provider: 'kimi' })).toBe('c');
+    expect(svc.fallbackStats().providers.kimi.downUntil).toBeGreaterThan(0);
+  });
+
+  it('stream: Claude упал, Qwen падает с предупреждением в stderr и 401 в NDJSON result — переходит на Kimi', async () => {
+    spawnMock
+      .mockImplementationOnce(() => fakeProc(lines({ type: 'result', is_error: true, result: 'Failed to authenticate: OAuth session expired' }), 1))
+      .mockImplementationOnce(() => fakeProcWithStderr(
+        '{"type":"result","is_error":true,"result":"Failed to authenticate. API Error: 401"}\n',
+        '[claude-code:unrecognized_model] {"model":"qwen3.6-flash","query_source":"sdk"}\n',
+        1,
+      ))
+      .mockImplementationOnce(() => fakeProc(streamOk('k')));
+    const svc = new ClaudeCliService();
+    expect(await svc.text('x', { onProgress: () => {} })).toBe('k');
+    expect(svc.fallbackStats().providers.qwen.downUntil).toBeGreaterThan(0);
   });
 });
 
