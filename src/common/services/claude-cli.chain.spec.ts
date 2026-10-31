@@ -446,6 +446,37 @@ describe('ClaudeCliService — выбор пользователя Kimi', () => 
     expect(warn.mock.calls.map((c) => String(c[0])).join('\n')).toMatch(/Kimi выбран.*KIMI_FALLBACK_API_KEY/);
   });
 
+  // spec, раздел 4: selected — выбор пользователя, если он не Claude; ключ тут ни
+  // при чём (веб-путь, chat_quality, пишет выбор всегда).
+  it('без ключа Kimi — событие всё равно несёт выбор: provider claude, selected kimi', async () => {
+    delete process.env.KIMI_FALLBACK_API_KEY;
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const pg = pgMock();
+    spawnMock.mockImplementationOnce(() => fakeProc(OK('c')));
+    expect(await new ClaudeCliService(pg as any).text('x', { provider: 'kimi' })).toBe('c');
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(tokenOf(0)).toBeUndefined();
+    expect(event(pg)).toMatchObject({ provider: 'claude', fallback: false, selected: 'kimi' });
+  });
+
+  it('noFallback с provider kimi — только Claude, selected в событии нет (пробы выбору не следуют)', async () => {
+    const pg = pgMock();
+    spawnMock.mockImplementationOnce(() => fakeProc(OK('c')));
+    expect(await new ClaudeCliService(pg as any).text('x', { provider: 'kimi', noFallback: true })).toBe('c');
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(tokenOf(0)).toBeUndefined();
+    expect(event(pg)).toMatchObject({ provider: 'claude', fallback: false });
+    expect(event(pg)).not.toHaveProperty('selected');
+  });
+
+  it('имя из прототипа (constructor) — не выбор: обычный путь, selected в событии нет', async () => {
+    const pg = pgMock();
+    spawnMock.mockImplementationOnce(() => fakeProc(OK('c')));
+    expect(await new ClaudeCliService(pg as any).text('x', { provider: 'constructor' as any })).toBe('c');
+    expect(tokenOf(0)).toBeUndefined();
+    expect(event(pg)).not.toHaveProperty('selected');
+  });
+
   it('выбранный успел вызвать инструмент с последствиями — не повторяем', async () => {
     spawnMock.mockImplementationOnce(() => fakeProc(lines(
       { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'mcp__products__manage_product', input: {} }] } },
