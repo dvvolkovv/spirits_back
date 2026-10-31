@@ -2,6 +2,8 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
+import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
+import { PROVIDER_LABELS, readFallbackConfigs } from '../common/services/llm-fallback';
 import axios from 'axios';
 import { sendTelegramPayload } from '../common/telegram-alert';
 import * as fs from 'fs';
@@ -105,6 +107,11 @@ export class ClaudeHealthService implements OnModuleInit {
   constructor(
     private readonly pg: PgService,
     private readonly claudeCli: ClaudeCliService,
+    // Общий рубильник модели (ревью 01.11): алерт о падении CLI называет, кого
+    // оно задевает на самом деле. Без @Optional(): CommonModule глобальный,
+    // поломка DI должна уронить старт (поймает smoke), а не молча вернуть
+    // прежний текст. Сторож — claude-health.outage-alert.spec.ts.
+    private readonly globalProvider: GlobalLlmProviderService,
   ) {}
 
   async onModuleInit() {
@@ -366,10 +373,22 @@ export class ClaudeHealthService implements OnModuleInit {
       const cooled = !this.lastOutageAlertAt ||
         (now.getTime() - this.lastOutageAlertAt.getTime()) >= OUTAGE_REALERT_HOURS * 3600_000;
       if (!alreadyAlerted || cooled) {
+        // Кого задевает падение Claude — зависит от общего рубильника (ревью
+        // 01.11): не на Claude — Маша, TG-боты и фоновые задачи отвечают через
+        // его модель, на Claude остаются пробы мониторинга (они всегда Claude),
+        // личный выбор Claude и запасной путь. Нет ключа у модели рубильника —
+        // она фактически не действует, все на Claude: текст прежний (как
+        // «фактически отвечает Claude» в суточном напоминании). get() не
+        // бросает (контракт GlobalLlmProviderService.get).
+        const sw = await this.globalProvider.get();
+        const viaSwitch = sw !== 'claude' && readFallbackConfigs()[sw] !== null;
+        const affected = viaSwitch
+          ? `Затронуто: пробы мониторинга, личный выбор Claude и запасной путь — рубильник сейчас на <b>${PROVIDER_LABELS[sw]}</b>: Маша, TG-боты и фоновые задачи отвечают через эту модель. `
+          : `Затронуто: <b>Маша, TG-боты, Виртуальный PM, Виртуальный маркетолог, фоновые задачи</b> (CLI-путь на OAuth-подписке). `;
         await send(
           `<b>🔴 Локальный Claude CLI недоступен</b>\n` +
           `Причина: <b>${this.cache.llmError || 'неизвестно'}</b> (${this.cache.llmOutageKind})\n` +
-          `Затронуто: <b>Маша, TG-боты, Виртуальный PM, Виртуальный маркетолог, фоновые задачи</b> (CLI-путь на OAuth-подписке). ` +
+          affected +
           `Чат-ассистенты (r.linkeon.io) — отдельный путь, см. synthetic chat_streaming.\n` +
           `Провалов подряд: ${this.cliConsecutiveDown}. Проверка: ${this.cache.llmCheckedAt || '—'}\n` +
           `${fallbackAlertLine(this.claudeCli.fallbackStats())}\n` +
