@@ -3,7 +3,8 @@ import { Cron } from '@nestjs/schedule';
 import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
 import { sendTelegramPayload } from '../common/telegram-alert';
-import { FALLBACK_ORDER, FallbackProvider, PROVIDER_LABELS } from '../common/services/llm-fallback';
+import { FALLBACK_ORDER, FallbackProvider } from '../common/services/llm-fallback';
+import { fallbackAlertLine } from './fallback-alert-line';
 
 /** Запасной провайдер в /health релея. */
 export interface RelayProviderHealth {
@@ -98,14 +99,6 @@ export function relayFallbackVerdict(health: any, _now: number = Date.now()): 'a
   return 'idle';
 }
 
-/** «Qwen: ответов N, ошибок M · Kimi: не настроен». */
-function providersLine(fb: RelayFallbackHealth): string {
-  return FALLBACK_ORDER.map((n) => {
-    const p = fb.providers[n];
-    return p?.enabled ? `${PROVIDER_LABELS[n]}: ответов ${p.ok}, ошибок ${p.failed}` : `${PROVIDER_LABELS[n]}: не настроен`;
-  }).join(' · ');
-}
-
 export function relayFallbackAlertText(fb: RelayFallbackHealth): string {
   const mins = Math.round(fb.windowMs / 60_000);
   // <code>, не обратные кавычки: Telegram в parse_mode: 'HTML' их не раскрывает.
@@ -121,7 +114,9 @@ export function relayFallbackAlertText(fb: RelayFallbackHealth): string {
   const title = allDown
     ? '🔴 Релей: Claude недоступен, запасные тоже не отвечают'
     : '🟠 Релей: Claude недоступен — ассистенты отвечают через запасные';
-  return `<b>${title}</b>\n${providersLine(fb)} за ${mins} мин.\n${fixLine}`;
+  // Строка запасных — та же, что в алерте CLI: «Запасные за 15 мин: Qwen — …;
+  // Kimi — не настроен» (окно впереди, а не хвостом к последнему провайдеру).
+  return `<b>${title}</b>\n${fallbackAlertLine(fb)}.\n${fixLine}`;
 }
 
 const COMPONENT = 'relay_qwen_fallback';

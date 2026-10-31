@@ -1,4 +1,4 @@
-import { fallbackAlertLine } from './claude-health.service';
+import { fallbackAlertLine } from './fallback-alert-line';
 
 describe('fallbackAlertLine — строка про запасных в алерте «Claude CLI недоступен»', () => {
   const p = (enabled: boolean, ok = 0, failed = 0) => ({ enabled, ok, failed, downUntil: 0 });
