@@ -459,6 +459,21 @@ describe('ClaudeCliService — выбор пользователя Kimi', () => 
     expect(event(pg)).toMatchObject({ provider: 'claude', fallback: false, selected: 'kimi' });
   });
 
+  it('без ключа Kimi, Claude упал по доступу — аварийный Qwen: одно событие provider qwen, fallback true, selected kimi', async () => {
+    delete process.env.KIMI_FALLBACK_API_KEY;
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const pg = pgMock();
+    spawnMock
+      .mockImplementationOnce(() => fakeProc(AUTH_FAIL, 1))
+      .mockImplementationOnce(() => fakeProc(OK('q')));
+    expect(await new ClaudeCliService(pg as any).text('x', { provider: 'kimi' })).toBe('q');
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    expect(tokenOf(0)).toBeUndefined();
+    expect(tokenOf(1)).toBe('sk-sp-test');
+    expect(pg.query).toHaveBeenCalledTimes(1);
+    expect(event(pg)).toMatchObject({ provider: 'qwen', fallback: true, selected: 'kimi' });
+  });
+
   it('noFallback с provider kimi — только Claude, selected в событии нет (пробы выбору не следуют)', async () => {
     const pg = pgMock();
     spawnMock.mockImplementationOnce(() => fakeProc(OK('c')));
