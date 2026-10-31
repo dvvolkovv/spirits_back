@@ -193,6 +193,21 @@ describe('streamUniversalAgent: приписка — читаем раньше, 
     expect(del).toHaveBeenCalledWith(guestCarryKey('u-test', '12'));
     expect(h.redis.peek(guestCarryKey('u-test', '12'))).toBeNull();
   });
+
+  it('запись ответа в Postgres упала — приписка всё равно стирается (доставка в релей от нашей БД не зависит)', async () => {
+    const h = harness();
+    const del = jest.spyOn(h.redis, 'del');
+    await h.redis.set(guestCarryKey('u-test', '12'), 'ПРИПИСКА', 3600);
+    // Та же заготовка, что в harness, но INSERT ответа ассистента (sender_type='ai') падает.
+    (h.svc as any).pg.query = jest.fn(async (sql: string) => {
+      if (sql.includes("'ai'")) throw new Error('db down');
+      return /AS spent/.test(sql) ? { rows: [{ spent: 0 }] } : { rows: [] };
+    });
+    const message = await h.run('Привет');
+    expect(message).toContain('ПРИПИСКА');
+    expect(del).toHaveBeenCalledWith(guestCarryKey('u-test', '12'));
+    expect(h.redis.peek(guestCarryKey('u-test', '12'))).toBeNull();
+  });
 });
 
 /**

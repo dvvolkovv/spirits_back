@@ -1880,6 +1880,24 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Сравниваем charge.tokens, а не textCost: у оборванного хода textCost=0,
       // и дорогой сбой иначе прошёл бы молча — а он-то как раз и интересен.
       await this.alertExpensiveTurn(userId, assistantId, charge, textCost);
+
+      // Приписка о пробе (чтение — выше, в streamUniversalAgent) списывается
+      // ЗДЕСЬ, ДО записей в Postgres ниже (сохранение ответа, addTokenTask):
+      // доставка приписки в сессию релея от нашей базы не зависит — релей её
+      // уже получил и использовал, — а если упавшая база помешает дойти до
+      // записи ниже, приписка осталась бы в Redis и уехала бы ещё раз со
+      // следующим ходом. Условие успеха то же: !turnFailed && fullText.length > 0.
+      // Фоном: ход не ждёт списания, сбой стирания не портит сохранённый ответ.
+      if (guestCarryConsumed && fullText.length > 0 && !turnFailed) {
+        const redis = this.redis;
+        if (redis) {
+          void dropGuestCarry(redis, userId, assistantId)
+            .then(() => this.logger.log(`guest carry dropped (assistant ${assistantId})`))
+            .catch((e: any) => {
+              this.logger.warn(`guest-carry: стереть не удалось (${userId}_${assistantId}): ${e?.message}`);
+            });
+        }
+      }
       try {
         const sessOverride = fresh ? freshSessionId : undefined;
         if (userMsgPersisted) {
@@ -1912,14 +1930,6 @@ ${LanguageService.buildDirective(userLanguage)}`;
               { tokens: textCost, usd: charge.usd, note: charge.note },
               { balance: () => this.getTokenBalance(userId) },
             );
-            // Приписка о пробе (см. чтение выше) списывается ТОЛЬКО здесь — в
-            // ветке успешного хода (!turnFailed && fullText.length > 0). Фоном:
-            // ход её не ждёт, а сбой стирания не должен портить сохранённый ответ.
-            if (guestCarryConsumed) {
-              void dropGuestCarry(this.redis, userId, assistantId).catch((e: any) => {
-                this.logger.warn(`guest-carry: стереть не удалось (${userId}_${assistantId}): ${e?.message}`);
-              });
-            }
           }
           // Профиль формируется и в fresh-режиме (чистый лист скрывает контекст,
           // но не отключает обучение профиля).
