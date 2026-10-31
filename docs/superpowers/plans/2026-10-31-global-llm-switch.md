@@ -1293,7 +1293,7 @@ Expected: FAIL — поля `provider` нет.
     });
     await h.turn();
     expect(h.cli.textWithCost).toHaveBeenCalledTimes(1);
-    expect(h.cli.textWithCost.mock.calls[0][1]).toMatchObject({ provider: 'qwen', noFallback: true });
+    expect(h.cli.textWithCost.mock.calls[0][1]).toMatchObject({ provider: 'qwen', providerChoice: 'global', noFallback: true });
   });
 
   it('рубильник Kimi без ключа — сразу error model, модель не зовётся', async () => {
@@ -1387,7 +1387,9 @@ Expected: FAIL — `provider` нет в опциях, проверка ключ�
             // Без цепочки: только модель рубильника (решение 31.10); у Claude —
             // без provider, как раньше.
             noFallback: true,
-            ...(trialProvider === 'claude' ? {} : { provider: trialProvider }),
+            // providerChoice 'global': ответ гостя — по рубильнику (событие
+            // claude_cli_call с choice=global, суточный счёт).
+            ...(trialProvider === 'claude' ? {} : { provider: trialProvider, providerChoice: 'global' as const }),
 ```
 
 5. Новый приватный метод класса:
