@@ -88,6 +88,9 @@ async function openLogin(page) {
     localStorage.clear();
     sessionStorage.clear();
     localStorage.setItem('i18nextLng', 'ru');
+    // Экран входа видит устройство, где уже входили: новому при включённой
+    // пробе без входа (spec 2026-10-30-guest-trial) кабинет откроет чат.
+    localStorage.setItem('linkeon_has_account', '1');
   });
   await page.goto('/', { waitUntil: 'domcontentloaded' });
   await expect(page.getByTestId('onboarding-root')).toBeVisible({ timeout: 20000 });
