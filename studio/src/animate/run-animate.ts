@@ -254,7 +254,7 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     }
   };
 
-  /** Пометка брака — подсказка перепроверке, не счёт денег: не записалась — брак перепроверится полной проверкой. */
+  /** Пометка брака — подсказка перепроверке, не счёт денег: не записалась — брак осудят заново при следующем запуске. */
   const writeRejectedMeta = (file: string, meta: RejectedMeta): void => {
     try {
       writeAtomic(file, JSON.stringify(meta, null, 2));
@@ -438,12 +438,16 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
       const byRecord = typeof meta.heard === 'string' && meta.heard.trim() ? speechCheck(texts, meta.heard) : null;
       if (byRecord && !byRecord.ok) {
         writeRejectedMeta(metaFile, { code: 'speech_mismatch', heard: meta.heard, share: byRecord.share, matcher: MATCHER_VERSION });
+        log(`animate ${kind}: брак ${name} не прошёл сверку v${MATCHER_VERSION} и по записи (речь ${Math.round(byRecord.share * 100)}%) — без распознавания`);
         continue;
       }
-      await local('брак не вернулся в работу', () => {
-        fs.renameSync(path.join(dir, name), abs(skitFile(kind, 'raw.mp4')));
+      await local('брак не вернулся в работу', () => fs.renameSync(path.join(dir, name), abs(skitFile(kind, 'raw.mp4'))));
+      // Пометка — подсказка, не счёт денег: не удалилась — останется сиротой без клипа, перепроверка её не читает.
+      try {
         fs.rmSync(metaFile, { force: true });
-      });
+      } catch (e) {
+        log(`animate: пометка брака ${path.relative(runDir, metaFile)} не удалилась — ${failText(e)}`);
+      }
       // Оплаченный клип — и в хранилище, как после скачивания: другой сервер его не потеряет.
       await upload(skitFile(kind, 'raw.mp4'));
       try {
