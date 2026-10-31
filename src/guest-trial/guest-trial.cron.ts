@@ -10,7 +10,7 @@ export class GuestTrialCron {
 
   constructor(private readonly sessions: GuestSessionsService) {}
 
-  @Cron('0 17 * * * *')
+  @Cron('0 17 * * * *', { name: 'guest-trial-purge' })
   async purge(): Promise<void> {
     try {
       const n = await this.sessions.purge();

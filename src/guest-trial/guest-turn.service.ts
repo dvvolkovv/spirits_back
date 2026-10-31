@@ -52,7 +52,12 @@ export function parseGuestTurnInput(body: any): GuestTurnInput {
   return {
     token: str(body?.token, 64) || null,
     assistantId: str(body?.assistantId, 16).trim(),
-    message: typeof body?.message === 'string' ? body.message.replace(CONTROL_CHARS_RE, '') : '',
+    // Ревью A10: открытая guest/chat не защищена JWT. Обрезаем ДО регулярки,
+    // а не после — иначе огромное message гоняло бы глобальный replace по
+    // всей своей длине на каждый запрос. Потолок (20000) — заведомо больше
+    // maxChars (по умолчанию 2000); проверка maxChars в handle() остаётся —
+    // это независимый, более тесный бизнес-лимит, а не замена этому срезу.
+    message: typeof body?.message === 'string' ? body.message.slice(0, 20_000).replace(CONTROL_CHARS_RE, '') : '',
     lang: LanguageService.normalize(str(body?.lang, 16)),
     tz: clean(body?.tz, 64) || undefined,
     source: SOURCE_RE.test(source) ? source : null,

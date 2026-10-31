@@ -19,6 +19,11 @@ async function bootstrap() {
   // HMAC считается по пришедшим байтам, пересобранный JSON подпись не пройдёт.
   app.use('/webhook/voice-call/internal', bodyParser.raw({ type: '*/*', limit: '1mb' }));
 
+  // Проба без регистрации — свой, тесный потолок тела (ревью A10): открытые
+  // ручки guest/* не защищены JWT, а общий лимит 50mb ниже рассчитан на
+  // другие ручки (аватары, документы) и неуместен для анонимного входа.
+  app.use('/webhook/guest', bodyParser.json({ limit: '64kb', type: ['application/json', 'text/*'] }));
+
   app.use(bodyParser.json({ limit: '50mb', type: ['application/json', 'text/*'] }));
   app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
