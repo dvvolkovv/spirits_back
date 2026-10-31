@@ -397,23 +397,20 @@ import { MATCHER_VERSION } from './match';
   const rejected = fs.readdirSync(path.join(env.runDir, 'skits', 'fp-conflict')).filter((f) => f.startsWith('rejected-') && f.endsWith('.mp4'));
 ```
 
-Сразу после этого теста добавить два новых:
+Сразу после этого теста добавить три новых:
 
 ```ts
-test('брак откладывается с пометкой: код, версия сверки, услышанное и доля', { timeout: 120_000 }, async () => {
+test('брак откладывается с пометкой: код, версия сверки, услышанное целиком и доля', { timeout: 120_000 }, async () => {
   const env = setup();
-  const { deps } = fakes(env, { heard: (kind, call) => (kind === 'conflict' && call === 1 ? 'совсем другое' : LINES[kind].join(' ')) });
+  // Длиннее 200 знаков: в пометку — целиком, а не обрезок из сообщения. Половина слов реплик — услышана.
+  const heard = `обои потерли залог мой ${'шум '.repeat(60)}`.trim();
+  const { deps } = fakes(env, { heard: (kind, call) => (kind === 'conflict' && call === 1 ? heard : LINES[kind].join(' ')) });
   await animateRun(env.runDir, deps);
   const dir = path.join(env.runDir, 'skits', 'fp-conflict');
   const metas = fs.readdirSync(dir).filter((f) => /^rejected-.*\.json$/.test(f));
   assert.equal(metas.length, 1);
   assert.ok(fs.existsSync(path.join(dir, metas[0].replace(/\.json$/, '.mp4'))), 'пометка без клипа');
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, metas[0]), 'utf8')), {
-    code: 'speech_mismatch',
-    matcher: MATCHER_VERSION,
-    heard: 'совсем другое',
-    share: 0,
-  });
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, metas[0]), 'utf8')), { code: 'speech_mismatch', matcher: MATCHER_VERSION, heard, share: 0.5 });
 });
 
 test('битый файл от Omni — брак с пометкой clip_invalid, без услышанного', { timeout: 120_000 }, async () => {
@@ -425,7 +422,31 @@ test('битый файл от Omni — брак с пометкой clip_invali
   assert.equal(metas.length, 1);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, metas[0]), 'utf8')), { code: 'clip_invalid', matcher: MATCHER_VERSION });
 });
+
+test('пометка брака не записалась — брак всё равно отложен и удалён из хранилища, съёмка идёт дальше', { timeout: 120_000 }, async (t) => {
+  t.mock.method(Date.prototype, 'toISOString', () => '2026-10-31T00:00:00.000Z');
+  const env = setup();
+  const dir = path.join(env.runDir, 'skits', 'fp-conflict');
+  // На месте пометки — каталог: запись упадёт (EISDIR), как при сбое диска.
+  fs.mkdirSync(path.join(dir, 'rejected-2026-10-31T00-00-00-000Z.json'), { recursive: true });
+  const discarded: string[] = [];
+  const logs: string[] = [];
+  const { deps } = fakes(env, { heard: (kind, call) => (kind === 'conflict' && call === 1 ? 'совсем другое' : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, { ...deps, onDiscard: async (rel) => { discarded.push(rel); }, log: (m) => logs.push(m) });
+  assert.deepEqual(discarded, ['skits/fp-conflict/raw.mp4']);
+  assert.equal(anim.skits.conflict!.attempts, 2);
+  assert.ok(fs.existsSync(path.join(dir, 'rejected-2026-10-31T00-00-00-000Z.mp4')), 'брак на месте');
+  assert.ok(logs.some((m) => m.includes('пометка брака') && m.includes('не записалась')), logs.join('\n'));
+});
 ```
+
+В тесте `'переобработка принятого клипа не прошла — запись и clip.mp4 прежние, повтор ничего не тратит'` внутри цикла `for (let run = 0; run < 2; run++)`, сразу после строки `assert.deepEqual(fs.readFileSync(clipFile), before);`, добавить:
+
+```ts
+    assert.deepEqual(fs.readdirSync(path.join(env.runDir, 'skits', 'fp-conflict')).filter((name) => name.startsWith('rejected-')), [], 'принятый клип не уходит в брак');
+```
+
+(Тест «не записалась» и строка про принятый клип добавлены по ревью задачи 3: если бы сбой пометки прерывал отказ, брак остался бы в MinIO, а следующая попытка заплатила бы за новый клип.)
 
 - [ ] **Step 2: Закоммитить красное и убедиться, что падают ровно новые**
 
@@ -435,7 +456,7 @@ git commit -m "test(studio): пометка брака сценки (красн�
 studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts"
 ```
 
-Ожидается: `ℹ fail 2` — оба новых теста (`metas.length` 0 вместо 1).
+Ожидается: `ℹ fail 2` — «…услышанное целиком и доля» и «…clip_invalid…» (`metas.length` 0 вместо 1); тест «не записалась» проходит (пометок ещё нет — отказ и так не прерывается), строка про принятый клип — тоже.
 
 - [ ] **Step 3: Тип пометки**
 
@@ -457,15 +478,17 @@ import { MATCHER_VERSION, speechCheck } from './match';
 
 /**
  * Пометка брака рядом с skits/<отпечаток>/rejected-*.mp4. По ней студия решает,
- * перепроверять ли брак до новой оплаты (reviveRejected): сверка поменялась
- * (matcher меньше MATCHER_VERSION) — да, плохой файл (clip_invalid) — нет.
+ * перепроверять ли брак до новой оплаты (reviveRejected): пометка не нынешней
+ * сверки (другая версия или пометки нет) — да; clip_invalid — нет: его отвергла
+ * проверка файла, а не сверка речи.
  */
 export interface RejectedMeta {
   code: 'clip_invalid' | 'speech_mismatch';
-  /** Версия сверки, которая забраковала клип или последней его перепроверила. */
+  /** Версия сверки на момент отказа или последней перепроверки брака. */
   matcher: number;
-  /** Что распознал SpeechKit — у speech_mismatch. */
+  /** Что распознал SpeechKit — у speech_mismatch, целиком. */
   heard?: string;
+  /** Доля услышанных слов реплик — у speech_mismatch. */
   share?: number;
 }
 ```
@@ -482,7 +505,7 @@ export interface RejectedMeta {
     try {
       writeAtomic(file, JSON.stringify(meta, null, 2));
     } catch (e) {
-      log(`animate: пометка брака ${path.basename(file)} не записалась — ${failText(e)}`);
+      log(`animate: пометка брака ${path.relative(runDir, file)} не записалась — ${failText(e)}`);
     }
   };
 ```
@@ -496,7 +519,7 @@ export interface RejectedMeta {
 на
 
 ```ts
-    const reject = async (code: RejectedMeta['code'], msg: string, speech?: { heard: string; share: number }): Promise<never> => {
+    const reject = async (code: RejectedMeta['code'], msg: string, speech?: Required<Pick<RejectedMeta, 'heard' | 'share'>>): Promise<never> => {
 ```
 
 и в нём же заменить
@@ -627,7 +650,20 @@ test('брак без пометки, не прошедший и новую св
   const meta = JSON.parse(fs.readFileSync(path.join(dir, left[0].replace(/\.mp4$/, '.json')), 'utf8'));
   assert.deepEqual([meta.code, meta.matcher, meta.heard], ['speech_mismatch', MATCHER_VERSION, 'совсем другое']);
 });
+
+test('брак с пустым услышанным (SpeechKit не расслышал) судится заново распознаванием, а не по записи', { timeout: 120_000 }, async () => {
+  const { env, dir } = await withRejected({ code: 'speech_mismatch', matcher: 1, heard: '', share: 0 });
+  const heard = 'это износ верните залог ладно убедил начинаешь';
+  const second = fakes(env, { heard: (kind) => (kind === 'punchline' ? heard : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, { ...second.deps, maxOmniSeconds: 16 });
+  assert.deepEqual(second.calls.start, []);
+  assert.equal(second.calls.recognize, 1);
+  assert.equal(anim.skits.punchline!.heard, heard);
+  assert.deepEqual(rejectedClips(dir), []);
+});
 ```
+
+(Тест «пустое услышанное» — по ревью задачи 3: на тишину SpeechKit отвечает пустой строкой, и сверка «по записи» навсегда закрыла бы клип, который стоит перераспознать за копейки.)
 
 - [ ] **Step 2: Закоммитить красное и убедиться, что падают ровно новые**
 
@@ -637,10 +673,11 @@ git commit -m "test(studio): перепроверка брака сценки д
 studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts"
 ```
 
-Ожидается: `ℹ fail 3`:
+Ожидается: `ℹ fail 4`:
 - «брак без пометки … принят без Omni» — `omni_budget`: перепроверки ещё нет, а предел 16 с выбран;
 - «… не прошедший сверку по записи …» — пометка осталась `matcher: 1`;
-- «… отложен снова с её пометкой …» — два запуска Omni вместо одного (брак не перепроверен, первый новый клип забракован).
+- «… отложен снова с её пометкой …» — два запуска Omni вместо одного (брак не перепроверен, первый новый клип забракован);
+- «брак с пустым услышанным …» — `omni_budget`, как первый.
 
 Тест «уже судила, и плохой файл» проходит и без перепроверки — он держит её от лишней работы.
 
@@ -666,8 +703,9 @@ function readRejectedMeta(file: string): Partial<RejectedMeta> {
 ```ts
   /**
    * Брак этого текста сценки, который нынешняя сверка ещё не судила, — до новой
-   * оплаты, по одному, от старых к новым. С записанным услышанным он сначала
-   * сверяется по записи (бесплатно); прошедший и брак без пометки (до 31.10.2026)
+   * оплаты, по одному, от старых к новым. С записанным непустым услышанным он
+   * сначала сверяется по записи (бесплатно); прошедший, брак без пометки (до
+   * 31.10.2026) и брак с пустым услышанным (SpeechKit не расслышал — не приговор)
    * становятся оплаченным клипом сценки и проходят обычную проверку (finish:
    * громкость, тишина, распознавание, сверка). Не прошёл — finish отложит его
    * снова, уже с пометкой этой сверки. Предел секунд здесь не проверяется: Omni
@@ -685,7 +723,7 @@ function readRejectedMeta(file: string): Partial<RejectedMeta> {
       const meta = readRejectedMeta(metaFile);
       // Эта сверка его уже судила; плохой файл сверка не лечит.
       if (meta.matcher === MATCHER_VERSION || meta.code === 'clip_invalid') continue;
-      if (typeof meta.heard === 'string' && !speechCheck(texts, meta.heard).ok) {
+      if (typeof meta.heard === 'string' && meta.heard.trim() && !speechCheck(texts, meta.heard).ok) {
         writeRejectedMeta(metaFile, { code: 'speech_mismatch', heard: meta.heard, share: meta.share, matcher: MATCHER_VERSION });
         continue;
       }
