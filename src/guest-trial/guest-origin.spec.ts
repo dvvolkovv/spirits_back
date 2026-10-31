@@ -2,13 +2,24 @@
 import { isAllowedGuestOrigin } from './guest-origin';
 
 describe('isAllowedGuestOrigin', () => {
-  it('без заголовка Origin — разрешено (запрос не из браузера)', () => {
+  // Ревью A10: браузер НЕ шлёт Origin и на простом same-origin GET/HEAD —
+  // значит отсутствие заголовка само по себе не означает «не браузер», это
+  // в т.ч. свой же кабинет, открывающий guest/config с my.linkeon.io.
+  it('без заголовка Origin — разрешено (в т.ч. свой same-origin GET, не только curl/сервер)', () => {
     expect(isAllowedGuestOrigin(undefined)).toBe(true);
   });
 
   it('свои адреса — разрешены', () => {
     expect(isAllowedGuestOrigin('https://my.linkeon.io')).toBe(true);
     expect(isAllowedGuestOrigin('https://test.linkeon.io')).toBe(true);
+  });
+
+  it('origin "null" (опак — sandboxed iframe, file://, редирект) — запрещён', () => {
+    expect(isAllowedGuestOrigin('null')).toBe(false);
+  });
+
+  it('пустая строка — запрещена', () => {
+    expect(isAllowedGuestOrigin('')).toBe(false);
   });
 
   it('локальная разработка — localhost и 127.0.0.1, порт любой', () => {
