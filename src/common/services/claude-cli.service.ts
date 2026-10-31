@@ -833,20 +833,23 @@ export class ClaudeCliService implements OnModuleInit {
 
         // Non-streaming path: одноразовый JSON parse на выходе.
         if (code !== 0) {
-          // Причина — сначала из JSON в stdout (CLI печатает {is_error, result}
-          // и при ненулевом коде), затем из stderr (без безобидных
-          // предупреждений о модели — stderrDetail), затем — сырой stdout.
-          // Живая проверка на Linux (31.10, битый ключ Qwen): CLI пишет в
-          // stderr `[claude-code:unrecognized_model] {"model":"qwen3.6-flash",
-          // ...}` — предупреждение про модель запасного, а настоящая причина
-          // (401) — в JSON stdout. Старый порядок (stderr первым, как есть)
-          // брал это предупреждение за причину сбоя: isFallbackWorthy
-          // классифицировал её как other, и цепочка на запасного не
-          // переключалась (а провайдер не помечался «не отвечает»).
+          // Причина — сначала из JSON в stdout, но ТОЛЬКО если это
+          // действительно ошибка (is_error или текст похож на отказ CLI) и
+          // result — строка: иначе кодом ≠0 мог выйти обычный ответ, и его
+          // текст («429», «try again») классифицировался бы как лимит и
+          // открыл бы окно Claude для всех, а j.error-объект (не строка) дал
+          // бы "[object Object]". Дальше — stderr (без безобидных
+          // предупреждений о модели — stderrDetail; живая проверка на Linux,
+          // 31.10, битый ключ Qwen: `[claude-code:unrecognized_model] {...}`
+          // заслоняло настоящую причину 401), затем — сырой stdout.
           let detail = '';
           try {
             const j = JSON.parse(stdout);
-            detail = String(j.result ?? j.error ?? '').trim();
+            if (typeof j.result === 'string' && (j.is_error === true || looksLikeCliRefusal(j.result))) {
+              detail = j.result;
+            } else if (typeof j.error === 'string') {
+              detail = j.error;
+            }
           } catch { /* не JSON — возьмём stderr или сырой stdout ниже */ }
           if (!detail) detail = ClaudeCliService.stderrDetail(stderr);
           if (!detail) detail = stdout.trim().slice(0, 400);
