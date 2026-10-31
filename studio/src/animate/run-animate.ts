@@ -96,6 +96,16 @@ export interface RejectedMeta {
   share?: number;
 }
 
+/** Пометка брака; нет файла или он битый — брак до пометок (до 31.10.2026): причина и сверка неизвестны. */
+function readRejectedMeta(file: string): Partial<RejectedMeta> {
+  try {
+    const m = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<RejectedMeta> | null;
+    return m && typeof m === 'object' ? m : {};
+  } catch {
+    return {};
+  }
+}
+
 /** Запись через временный файл: обрыв посреди записи не оставит обрезанный клип, кадр или счёт секунд. */
 function writeAtomic(file: string, data: string | Buffer): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -143,8 +153,9 @@ function loadAnimation(file: string): ShortAnimation {
  * клип (raw.mp4) лежит, пока его не забраковали: сбой распознавания или ffmpeg
  * не стоит пересъёмки. Принятый клип при смене громкости или порогов пауз
  * переобрабатывается без Omni и без распознавания. Забракованный клип не
- * удаляется, а откладывается в skits/<отпечаток>/rejected-*.mp4 — его можно
- * разобрать и перепроверить.
+ * удаляется, а откладывается в skits/<отпечаток>/rejected-*.mp4 с пометкой
+ * rejected-*.json (код, услышанное, версия сверки); брак, который нынешняя
+ * сверка ещё не судила, перепроверяется до новой оплаты (reviveRejected).
  */
 export async function animateRun(runDir: string, deps: AnimateDeps): Promise<ShortAnimation> {
   const script = JSON.parse(fs.readFileSync(path.join(runDir, 'script.json'), 'utf8')) as Script;
@@ -396,6 +407,51 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     };
   };
 
+  /**
+   * Брак этого текста сценки, который нынешняя сверка ещё не судила, — до новой
+   * оплаты, по одному, от старых к новым. С записанным непустым услышанным он
+   * сначала сверяется по записи (бесплатно); прошедший, брак без пометки (до
+   * 31.10.2026) и брак с пустым услышанным (SpeechKit не расслышал — не приговор)
+   * становятся оплаченным клипом сценки и проходят обычную проверку (finish:
+   * громкость, тишина, распознавание, сверка). Не прошёл — finish отложит его
+   * снова, уже с пометкой этой сверки. Предел секунд здесь не проверяется: Omni
+   * не нужен, и ролик, упавший на пределе из-за ложных отказов, поднимается.
+   * @returns принятый клип или null — снимать новый
+   */
+  const reviveRejected = async (kind: SkitKind): Promise<SkitClip | null> => {
+    const dir = abs(path.posix.join('skits', plans[kind].fingerprint));
+    if (!fs.existsSync(dir)) return null;
+    const texts = plans[kind].skit.lines.map((l) => l.text);
+    const rejected = fs.readdirSync(dir).filter((f) => /^rejected-.*\.mp4$/.test(f)).sort();
+    for (let i = 0; i < rejected.length; i++) {
+      const name = rejected[i];
+      const metaFile = path.join(dir, name.replace(/\.mp4$/, '.json'));
+      const meta = readRejectedMeta(metaFile);
+      // Эта сверка его уже судила; плохой файл сверка не лечит.
+      if (meta.matcher === MATCHER_VERSION || meta.code === 'clip_invalid') continue;
+      if (typeof meta.heard === 'string' && meta.heard.trim() && !speechCheck(texts, meta.heard).ok) {
+        writeRejectedMeta(metaFile, { code: 'speech_mismatch', heard: meta.heard, share: meta.share, matcher: MATCHER_VERSION });
+        continue;
+      }
+      await local('брак не вернулся в работу', () => {
+        fs.renameSync(path.join(dir, name), abs(skitFile(kind, 'raw.mp4')));
+        fs.rmSync(metaFile, { force: true });
+      });
+      // Оплаченный клип — и в хранилище, как после скачивания: другой сервер его не потеряет.
+      await upload(skitFile(kind, 'raw.mp4'));
+      try {
+        const clip = await finish(kind, i + 1, null);
+        log(`animate ${kind}: принят клип из брака ${name} — сверка v${MATCHER_VERSION}, без Omni`);
+        return clip;
+      } catch (e) {
+        const err = toStudioError(e);
+        if (e instanceof StorageError || (err.code !== 'speech_mismatch' && err.code !== 'clip_invalid')) throw e;
+        log(`animate ${kind}: брак ${name} не прошёл и сверку v${MATCHER_VERSION} — ${err.message}`);
+      }
+    }
+    return null;
+  };
+
   const assertBudget = (): void => {
     if (anim.omniSeconds + CLIP_SEC > budget) {
       throw new StudioError(
@@ -429,6 +485,12 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     // Запись под другой отпечаток больше не годится: сборка её и так не возьмёт.
     delete anim.skits[kind];
     await save();
+    // Оплаченный брак этого текста — до новой оплаты (reviveRejected). Запущенная
+    // генерация или скачанный raw.mp4 важнее: их и так дождутся без новых денег.
+    if (!fs.existsSync(raw) && !hasPending(kind)) {
+      const revived = await reviveRejected(kind);
+      if (revived) return revived;
+    }
 
     let last: StudioError | null = null;
     const codes: string[] = [];
