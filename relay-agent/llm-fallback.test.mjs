@@ -201,12 +201,21 @@ test("safeErrorDetail: в значении путь, адрес, «=», кири
     "[ede_diagnostic] a=b=c",
     "[ede_diagnostic] a=привет",
     "[ede_diagnostic] любой текст=x",
+    // Ключ с пробелом — латиницей: кириллица выше отсекается на первой букве и
+    // до пробела не доходит.
+    "[ede_diagnostic] any text=x",
     "[ede_diagnostic] A=1",
   ]) {
     assert.equal(l.safeErrorDetail({ errors: [bad] }), "", bad);
   }
 });
 
+// Сторож на время. Шаблон вида \s*[\r\n]+\s* на полосе пробелов без перевода
+// строки квадратичен: 4e4 пробелов — 1,9 с, 1e5 — секунды. Случай " ".repeat(1e5)
+// без префикса сторожит нормализацию всех errors[] до поиска диагностики, случаи
+// с префиксом [ede_diagnostic] — саму EDE_DIAGNOSTIC_RE. Время — процессорное, не
+// настенное: тест идёт и на живом релее перед рестартом, где вытеснение процесса
+// и steal у VPS дали бы ложный красный и остановили выкат. Обычно — единицы мс.
 test("safeErrorDetail: длинные строки без перевода строки — без зависания (сторож на время)", () => {
   const valid = "[ede_diagnostic]" + " a=b".repeat(25_000);
   for (const [s, want] of [
@@ -216,13 +225,17 @@ test("safeErrorDetail: длинные строки без перевода ст�
     ["[ede_diagnostic] a=" + "b".repeat(1e5) + " ", ""],
     [valid, valid.slice(0, 160)],
   ]) {
-    const t0 = performance.now();
+    const c0 = process.cpuUsage();
     const got = l.safeErrorDetail({ errors: [s] });
-    const ms = performance.now() - t0;
+    const { user, system } = process.cpuUsage(c0);
+    const ms = (user + system) / 1000;
     assert.equal(got, want, JSON.stringify(s.slice(0, 40)));
-    // Квадратичная регулярка тратила бы здесь секунды: 4e4 пробелов — 1,9 с.
-    assert.ok(ms < 50, `${ms.toFixed(1)} мс на строке длиной ${s.length}`);
+    assert.ok(ms < 200, `${ms.toFixed(1)} мс процессора на строке длиной ${s.length}`);
   }
+});
+
+test("safeErrorDetail: не строки в errors[] (null, число, объект) пропускаются, диагностика за ними находится", () => {
+  assert.equal(l.safeErrorDetail({ type: "result", subtype: "error_during_execution", is_error: true, errors: [null, 42, { code: "E1" }, DIAG] }), DIAG);
 });
 
 test("safeErrorDetail: ни result, ни обычные строки errors[] (стек с путём файла) в журнал не попадают", () => {
