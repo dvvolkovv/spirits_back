@@ -320,6 +320,56 @@ describe('POST admin/shorts', () => {
     expect(review.pg.query.mock.calls.some((c: any[]) => String(c[0]).startsWith('UPDATE'))).toBe(false);
   });
 
+  it('reject идеи — idea → rejected: условие на статус в записи; версия строки, если пришла, — тоже', async () => {
+    const idea = video({ status: 'idea', failed_from: null });
+    const answer = (sql: string) =>
+      sql.includes('RETURNING') ? { rows: [video({ status: 'rejected', failed_from: null })] } : { rows: [idea] };
+
+    const plain = setup(answer);
+    const r = res();
+    await plain.ctl.action({ action: 'reject', id: ID }, r);
+    const upd = plain.pg.query.mock.calls.find((c: any[]) => String(c[0]).includes("SET status = 'rejected'")) as any[];
+    const sql = String(upd[0]).replace(/\s+/g, ' ');
+    expect(sql).toContain("WHERE id = $1 AND status = 'idea'");
+    expect(sql).not.toContain('short_publication');
+    expect(upd[1]).toEqual([ID]);
+    expect(r.body.status).toBe('rejected');
+
+    const withVersion = setup(answer);
+    await withVersion.ctl.action({ action: 'reject', id: ID, version: VERSION }, res());
+    const upd2 = withVersion.pg.query.mock.calls.find((c: any[]) => String(c[0]).includes("SET status = 'rejected'")) as any[];
+    expect(String(upd2[0])).toContain('AND updated_at = $2::timestamptz');
+    expect(upd2[1]).toEqual([ID, VERSION]);
+  });
+
+  it('reject идеи — не записалось: в работе, уже отклонена, версия разошлась, ролика нет; кривая версия — 400', async () => {
+    const race = (row: Record<string, any> | null) =>
+      setup((sql) => {
+        if (sql.includes('RETURNING')) return { rows: [] };
+        if (sql.includes('AS released')) return { rows: row ? [row] : [] };
+        return { rows: [video({ status: 'idea', failed_from: null })] };
+      });
+    await expect(race({ status: 'directing', released: false }).ctl.action({ action: 'reject', id: ID }, res())).rejects.toThrow(
+      'Идея уже в работе — отклонить можно будет готовый ролик. Обновите список.',
+    );
+    await expect(race({ status: 'rejected', released: false }).ctl.action({ action: 'reject', id: ID }, res())).rejects.toThrow(
+      'Идея уже отклонена. Обновите список.',
+    );
+    const stale: any = await race({ status: 'idea', released: false })
+      .ctl.action({ action: 'reject', id: ID, version: VERSION }, res())
+      .catch((e: any) => e);
+    expect(stale).toBeInstanceOf(ConflictException);
+    expect(stale.getResponse()).toMatchObject({ error: 'version_conflict' });
+    await expect(race({ status: 'idea', released: false }).ctl.action({ action: 'reject', id: ID }, res())).rejects.toThrow(
+      'Идея успела измениться — обновите список.',
+    );
+    await expect(race(null).ctl.action({ action: 'reject', id: ID }, res())).rejects.toBeInstanceOf(NotFoundException);
+
+    const bad = race(null);
+    await expect(bad.ctl.action({ action: 'reject', id: ID, version: 'не версия' }, res())).rejects.toBeInstanceOf(BadRequestException);
+    expect(bad.pg.query.mock.calls.some((c: any[]) => String(c[0]).startsWith('UPDATE'))).toBe(false);
+  });
+
   it('mark_published — отмечает telegram вышедшим и возвращает ролик в approved', async () => {
     const v = video({ failed_from: 'publishing', approved_at: '2026-10-20T00:00:00Z' });
     const { ctl, client } = setup((sql) => (sql.includes('FROM short_video') && !sql.includes('UPDATE') ? { rows: [v] } : { rows: [], rowCount: 1 }));
@@ -645,7 +695,7 @@ describe('POST admin/shorts — решение по готовому ролик�
   it('reject в работе — отказ словами, без внутренних имён статусов', async () => {
     const { ctl } = setup(() => ({ rows: [video({ status: 'writing', failed_from: null })] }));
     await expect(ctl.action({ action: 'reject', id: ID }, res())).rejects.toThrow(
-      'Отклонить можно упавший, ждущий решения или запланированный ролик; этот — у сценариста. Обновите список.',
+      'Отклонить можно идею, упавший, ждущий решения или запланированный ролик; этот — у сценариста. Обновите список.',
     );
   });
 
