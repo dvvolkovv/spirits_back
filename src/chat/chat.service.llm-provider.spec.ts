@@ -56,7 +56,7 @@ afterAll(() => {
 });
 beforeEach(() => jest.clearAllMocks());
 
-function harness(choice: 'claude' | 'qwen', events: any[] = [{ type: 'delta', text: 'ок' }, { type: 'done' }]) {
+function harness(choice: 'claude' | 'qwen' | 'kimi', events: any[] = [{ type: 'delta', text: 'ок' }, { type: 'done' }]) {
   const pg = { query: jest.fn(async (sql: string) => (/AS spent/.test(sql) ? { rows: [{ spent: 0 }] } : { rows: [] })) };
   const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
   const tracked: { name: string; props: any }[] = [];
@@ -110,6 +110,13 @@ describe('streamUniversalAgent: модель ответов человека —
     expect(f.provider).toBeUndefined();
     expect(h.llmProvider.get).not.toHaveBeenCalled();
   });
+
+  it('выбран Kimi — provider=kimi, без noFallback', async () => {
+    const h = harness('kimi');
+    await h.run();
+    expect(h.fields().provider).toBe('kimi');
+    expect(h.fields().noFallback).toBeUndefined();
+  });
 });
 
 describe('streamUniversalAgent: чем ответил релей — в chat_quality', () => {
@@ -126,5 +133,24 @@ describe('streamUniversalAgent: чем ответил релей — в chat_qua
     expect(q).toBeDefined();
     expect(q.provider).toBeUndefined();
     expect(q.fallback).toBeUndefined();
+  });
+
+  it('выбран Kimi и ответил он — provider и selected kimi', async () => {
+    const h = harness('kimi', [{ type: 'delta', text: 'ок' }, { type: 'done', provider: 'kimi', fallback: false }]);
+    await h.run();
+    expect(h.quality()).toMatchObject({ provider: 'kimi', selected: 'kimi' });
+    expect(h.quality().fallback).toBeUndefined();
+  });
+
+  it('выбранный подвёл — ответил Claude: selected kimi, provider claude', async () => {
+    const h = harness('kimi', [{ type: 'delta', text: 'ок' }, { type: 'done', provider: 'claude', fallback: false }]);
+    await h.run();
+    expect(h.quality()).toMatchObject({ provider: 'claude', selected: 'kimi' });
+  });
+
+  it('выбран Claude — selected не пишется', async () => {
+    const h = harness('claude', [{ type: 'delta', text: 'ок' }, { type: 'done', provider: 'claude', fallback: false }]);
+    await h.run();
+    expect(h.quality().selected).toBeUndefined();
   });
 });
