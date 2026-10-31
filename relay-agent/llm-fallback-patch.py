@@ -6,9 +6,13 @@ docs/superpowers/specs/2026-10-31-kimi-provider-design.md.
 врезки Qwen, одинаковый в обоих. Каждый якорь обязан встретиться ровно один
 раз, иначе — выход без записи.
 Запуск: python3 llm-fallback-patch.py <путь к server.mjs>"""
+import hashlib
+import os
 import re
 import sys
 
+if len(sys.argv) != 2:
+    sys.exit("usage: python3 llm-fallback-patch.py <путь к server.mjs>")
 path = sys.argv[1]
 s = open(path, encoding="utf-8").read()
 if "llm-fallback.mjs" in s:
@@ -25,8 +29,12 @@ def rep(old, new):
     s = s.replace(old, new)
 
 
-def region(start, end, new):
-    """Заменить кусок от начала start до конца end; оба — ровно по разу."""
+def region(start, end, new, sha):
+    """Заменить кусок от начала start до конца end; оба — ровно по разу.
+    sha — ожидаемый sha256 (hex) заменяемого куска s[i:j+len(end)] (utf-8):
+    якоря могли совпасть, а текст МЕЖДУ ними на живом релее мог быть правлен
+    руками (там git без remote — такую правку не увидит ни один diff).
+    Несовпадение — выход без записи, скрипт не трогает файл."""
     global s
     for a in (start, end):
         n = s.count(a)
@@ -36,6 +44,13 @@ def region(start, end, new):
     j = s.index(end)
     if j < i:
         sys.exit(f"конец раньше начала: {end[:90]!r}")
+    chunk = s[i:j + len(end)]
+    got = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
+    if got != sha:
+        sys.exit(
+            "кусок между якорями отличается от ожидаемого — ручная правка на "
+            f"релее? сверь и обнови скрипт: start={start[:60]!r}, sha256={got}"
+        )
     s = s[:i] + new + s[j + len(end):]
 
 
@@ -62,7 +77,8 @@ region('// Окно запасного Qwen и исходы аварийных �
        '// Окна запасного пути (окно Claude и «не отвечает» у каждого запасного) и\n'
        '// исходы аварийных ходов — на весь процесс (llm-fallback.mjs; spec\n'
        '// spirits_back 2026-10-31-kimi-provider-design).\n'
-       'const fallbackState = llm.createFallbackState();\n')
+       'const fallbackState = llm.createFallbackState();\n',
+       "a0518d363e9130dff104ea2cfaee3126554a0433c42ed50c5c52b069b75b46ae")
 
 # 3. План хода.
 region('  // Qwen: принудительный (provider=qwen — выбор пользователя в админке бэкенда)\n',
@@ -86,7 +102,8 @@ region('  // Qwen: принудительный (provider=qwen — выбор п
        '  // Ход дошёл до запасных аварийно — для окна Claude по итогам хода.\n'
        '  let reachedFallback = usedFallback;\n'
        '  // Инструмент с последствиями в этом ходе — после него у другого провайдера не переигрываем.\n'
-       '  let riskyToolUsed = false;\n')
+       '  let riskyToolUsed = false;\n',
+       "5d611b4f2dfec1790462eccba349913a2d2e2ab28ef9e83d8d4bad22eb4d12e8")
 
 # 4. runOnce: переход к следующему в плане.
 region('  // Окно запасного Qwen открывается при сбое доступа к Claude и тогда, когда\n',
@@ -139,7 +156,8 @@ region('  // Окно запасного Qwen открывается при сб
        '    const fatal = FATAL_RE.test(r.switchText);\n'
        '    notice(fatal ? fatalHint(r.switchText) : "_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_", fatal ? "cli_fatal" : "transient");\n'
        '    return r;\n'
-       '  }\n')
+       '  }\n',
+       "08d1fdc148f1a81f363c2f41d65b104fbf48fb98256878bed4f0f1dd6f7865c0")
 
 # 5. Модель и окружение запуска; комментарий у preempt.
 rep('      const baseArgs = runProvider === "qwen" ? qwen.withModel(args, qwen.qwenModelFor(reqModel, qwenCfg.models)) : args;\n',
@@ -155,10 +173,19 @@ rep('      let accessFailHit = false;\n      let transientAccessLike = false;\n 
     '      let switchHit = false;\n'
     '      let switchWhy = "";\n'
     '      let switchText = "";\n'
+    '      // Пришло хоть одно событие type:"result" от этого запуска (gotResult ниже,\n'
+    '      // child.on("close", …)) — даже без текста: выбранный пользователем\n'
+    '      // провайдер, вышедший без единого result (ненулевой код, кривой адрес),\n'
+    '      // уступает обычному пути так же, как при любом другом его сбое.\n'
+    '      let gotResult = false;\n'
     '      let transientAccessLike = false;\n'
     '      let sawResult = false;\n')
 rep('              if (!qwen.SIDE_EFFECT_FREE_TOOLS.has(block.name || "")) riskyToolUsed = true;\n',
     '              if (!llm.SIDE_EFFECT_FREE_TOOLS.has(block.name || "")) riskyToolUsed = true;\n')
+rep('        if (ev.type === "result") {\n          // Потолок шагов.',
+    '        if (ev.type === "result") {\n'
+    '          gotResult = true;\n'
+    '          // Потолок шагов.')
 
 # 7. Разбор result.
 region('          // Сбой доступа (qwen-provider.mjs): отказ CLI или ошибка, которую прежде\n',
@@ -174,11 +201,13 @@ region('          // Сбой доступа (qwen-provider.mjs): отказ CLI
        '          // штатно повторяют (TRANSIENT_RE), — признак для решения после повтора\n'
        '          // (transientHit ниже).\n'
        '          const accessFailure = llm.isAccessFailure(ev.result, { isError: isErrorResult, apiStatus: ev.api_error_status });\n'
-       '          // Сбой доступа, который штатно не повторяют (не TRANSIENT_RE: например\n'
-       '          // 400 Arrearage), — тоже повод перейти сразу: иначе человеку ушёл бы сырой текст ошибки.\n'
+       '          // Сбой доступа, который штатно не повторяют (403/Forbidden/Access denied/\n'
+       '          // Arrearage — llm.isNonRetryAccess), — тоже повод перейти сразу: иначе\n'
+       '          // человеку ушёл бы сырой текст ошибки вместо вежливого уведомления.\n'
        '          const fatalAccess = accessFailure && (llm.looksLikeCliRefusal(ev.result) || FATAL_RE.test(ev.result) ||\n'
-       '            (isErrorResult && !TRANSIENT_RE.test(ev.result)));\n'
-       '          const selectedFail = !!selected && runProvider === selected && isErrorResult &&\n'
+       '            llm.isNonRetryAccess(ev.result));\n'
+       '          // max_turns — потолок шагов, а не сбой выбранного провайдера.\n'
+       '          const selectedFail = !!selected && runProvider === selected && isErrorResult && !maxTurnsHit &&\n'
        '            !TRANSIENT_RE.test(ev.result) && !(IMG_LIMIT_RE.test(ev.result) && useResume) &&\n'
        '            ev.result.trim() !== NO_RESP_PLACEHOLDER;\n'
        '          if (fatalAccess || selectedFail) {\n'
@@ -190,24 +219,49 @@ region('          // Сбой доступа (qwen-provider.mjs): отказ CLI
        '              switchText = String(ev.result);\n'
        '              return;\n'
        '            }\n'
+       '            // Перейти некуда или переигровка запрещена (текст уже шёл, инструмент с\n'
+       '            // последствиями) — fatalAccess всё равно нельзя отдавать сырым текстом\n'
+       '            // (403/Arrearage и т.п. не обязаны совпасть с FATAL_RE или TRANSIENT_RE —\n'
+       '            // без этого возврата ушли бы прямиком к записи result ниже).\n'
+       '            if (fatalAccess) {\n'
+       '              notice(FATAL_RE.test(ev.result) ? fatalHint(ev.result) : "_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_",\n'
+       '                FATAL_RE.test(ev.result) ? "cli_fatal" : "transient");\n'
+       '              return;\n'
+       '            }\n'
        '          }\n'
-       '          if (accessFailure && isErrorResult) transientAccessLike = true;\n')
+       '          if (accessFailure && isErrorResult) transientAccessLike = true;\n',
+       "198af2cc3fa956b658e321da7f6d00e892076da4ed4cd2c1d8e1e7d71a354efa")
 rep('resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, accessFailHit, transientAccessLike, sawResult, startedAt: runStartedAt });',
-    'resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, switchHit, switchWhy, switchText, transientAccessLike, sawResult, startedAt: runStartedAt });')
+    '// Выбранный пользователем вышел без единого result (ненулевой код, кривой\n'
+    '        // адрес) — уступает обычному пути, как и любой другой его сбой; staleResumeHit\n'
+    '        // и прерванный/брошенный ход — свои ветки, здесь не дублируем.\n'
+    '        if (runProvider === selected && selected && !gotResult && !staleResumeHit && !preempted && !clientDisconnected &&\n'
+    '            llm.nextStep(plan, planStep, fallbackState) >= 0 &&\n'
+    '            llm.mayAdvance({ failed: runProvider, selected, accessFailure: false, sentAnyText: streamedAny, riskyToolUsed })) {\n'
+    '          switchHit = true;\n'
+    '          switchWhy = "нет ответа";\n'
+    '          switchText = "";\n'
+    '        }\n'
+    '        resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, switchHit, switchWhy, switchText, transientAccessLike, sawResult, startedAt: runStartedAt });')
 
-# 8. Штатный повтор после временной ошибки тоже упал.
+# 8. Штатный повтор после временной ошибки тоже упал — цепочка идёт до конца
+# плана, а не только на один шаг (529×2 у Claude → переход на Qwen → у Qwen
+# кончилась квота — тоже transient — должен дойти до Kimi, а не замолчать на Qwen).
 region('        if (provider === "claude" && r.transientAccessLike) {\n',
        '        if (r.transientHit) notice("_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_", "transient");\n',
-       '        // Повтор тоже упал. Сбой доступа открывает окно (у Claude) или «не\n'
-       '        // отвечает» (у запасного); ход переходит к следующему в плане — при сбое\n'
-       '        // доступа или если упал выбранный пользователем провайдер.\n'
-       '        if (r.transientAccessLike) noteAccessFailure(provider, "ошибка доступа после повтора");\n'
-       '        if (!preempted && !clientDisconnected &&\n'
-       '            llm.mayAdvance({ failed: provider, selected, accessFailure: !!r.transientAccessLike, sentAnyText: streamedAny, riskyToolUsed })) {\n'
+       '        // Повтор тоже упал. Сбой доступа открывает окно (у Claude) или «не отвечает»\n'
+       '        // (у запасного); ход идёт к следующему в плане — при сбое доступа или если\n'
+       '        // упал выбранный пользователем провайдер — пока план не кончится.\n'
+       '        while (r.transientHit) {\n'
+       '          if (r.transientAccessLike) noteAccessFailure(provider, "ошибка доступа после повтора");\n'
+       '          if (preempted || clientDisconnected ||\n'
+       '              !llm.mayAdvance({ failed: provider, selected, accessFailure: !!r.transientAccessLike, sentAnyText: streamedAny, riskyToolUsed })) break;\n'
        '          const next = switchProvider(useResume, r.transientAccessLike ? "ошибка доступа после повтора" : "ошибка после повтора");\n'
-       '          if (next) r = await next;\n'
+       '          if (!next) break;\n'
+       '          r = await next;\n'
        '        }\n'
-       '        if (r.transientHit) notice("_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_", "transient");\n')
+       '        if (r.transientHit) notice("_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_", "transient");\n',
+       "d942a7bf211684be91933f35165a678ec06b198ecb3f8a2a07a15d394dfd6b96")
 
 # 9. Окна по итогам хода.
 region('    // Окно запасного Qwen: успех Claude, начатый после открытия окна, его\n',
@@ -227,7 +281,8 @@ region('    // Окно запасного Qwen: успех Claude, начаты
        '        if (usedFallback) fallbackState.recordOutcome(provider, runOk);\n'
        '      }\n'
        '      if (!runOk && reachedFallback) fallbackState.closeClaudeWindow();\n'
-       '    }\n')
+       '    }\n',
+       "d0e56846f200ea038d79ff93fe2ed4551d6d6d308a4ee25bdc39c78890ca8e98")
 
 # 10. /health.
 rep('  res.json({ status: "ok", sessions: sessionMap.size, uptime: process.uptime(), qwen: { enabled: !!qwen.readQwenConfig(), ...qwenBreaker.stats() } });\n',
@@ -243,5 +298,10 @@ for leftover in ("qwenBreaker", "qwenCfg", "qwenForced", "accessFailHit", "fallb
 if re.search(r"\bqwen\.[A-Za-z]", s):
     sys.exit("остались вызовы qwen.* — врезка неполна, ничего не записано")
 
-open(path, "w", encoding="utf-8").write(s)
+# Запись атомарно: временный файл рядом + os.replace (на одном ФС — атомарная
+# подмена, не оставит обрезанный server.mjs, если процесс прервут посередине).
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write(s)
+os.replace(tmp, path)
 print("ok:", path)

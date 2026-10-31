@@ -894,6 +894,11 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       let switchHit = false;
       let switchWhy = "";
       let switchText = "";
+      // Пришло хоть одно событие type:"result" от этого запуска (gotResult ниже,
+      // child.on("close", …)) — даже без текста: выбранный пользователем
+      // провайдер, вышедший без единого result (ненулевой код, кривой адрес),
+      // уступает обычному пути так же, как при любом другом его сбое.
+      let gotResult = false;
       let transientAccessLike = false;
       let sawResult = false;
       let transientHit = false;
@@ -910,6 +915,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
         const callCtx = eventCallContext(ev);
         if (callCtx !== null && callCtx > maxTurnContext) maxTurnContext = callCtx;
         if (ev.type === "result") {
+          gotResult = true;
           // Потолок шагов. Проверяем ЗДЕСЬ, а не в ветке `result && ev.result`
           // ниже: при error_max_turns CLI не кладёт в result никакого текста,
           // та ветка не срабатывала — и клиент не получал вообще ничего.
@@ -979,11 +985,13 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
           // штатно повторяют (TRANSIENT_RE), — признак для решения после повтора
           // (transientHit ниже).
           const accessFailure = llm.isAccessFailure(ev.result, { isError: isErrorResult, apiStatus: ev.api_error_status });
-          // Сбой доступа, который штатно не повторяют (не TRANSIENT_RE: например
-          // 400 Arrearage), — тоже повод перейти сразу: иначе человеку ушёл бы сырой текст ошибки.
+          // Сбой доступа, который штатно не повторяют (403/Forbidden/Access denied/
+          // Arrearage — llm.isNonRetryAccess), — тоже повод перейти сразу: иначе
+          // человеку ушёл бы сырой текст ошибки вместо вежливого уведомления.
           const fatalAccess = accessFailure && (llm.looksLikeCliRefusal(ev.result) || FATAL_RE.test(ev.result) ||
-            (isErrorResult && !TRANSIENT_RE.test(ev.result)));
-          const selectedFail = !!selected && runProvider === selected && isErrorResult &&
+            llm.isNonRetryAccess(ev.result));
+          // max_turns — потолок шагов, а не сбой выбранного провайдера.
+          const selectedFail = !!selected && runProvider === selected && isErrorResult && !maxTurnsHit &&
             !TRANSIENT_RE.test(ev.result) && !(IMG_LIMIT_RE.test(ev.result) && useResume) &&
             ev.result.trim() !== NO_RESP_PLACEHOLDER;
           if (fatalAccess || selectedFail) {
@@ -993,6 +1001,15 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
               switchHit = true;
               switchWhy = fatalAccess ? "отказ CLI" : "ошибка";
               switchText = String(ev.result);
+              return;
+            }
+            // Перейти некуда или переигровка запрещена (текст уже шёл, инструмент с
+            // последствиями) — fatalAccess всё равно нельзя отдавать сырым текстом
+            // (403/Arrearage и т.п. не обязаны совпасть с FATAL_RE или TRANSIENT_RE —
+            // без этого возврата ушли бы прямиком к записи result ниже).
+            if (fatalAccess) {
+              notice(FATAL_RE.test(ev.result) ? fatalHint(ev.result) : "_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_",
+                FATAL_RE.test(ev.result) ? "cli_fatal" : "transient");
               return;
             }
           }
@@ -1051,6 +1068,16 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
         }
         const cur = activeChildren.get(sessionId);
         if (cur && cur.child === child) activeChildren.delete(sessionId);
+        // Выбранный пользователем вышел без единого result (ненулевой код, кривой
+        // адрес) — уступает обычному пути, как и любой другой его сбой; staleResumeHit
+        // и прерванный/брошенный ход — свои ветки, здесь не дублируем.
+        if (runProvider === selected && selected && !gotResult && !staleResumeHit && !preempted && !clientDisconnected &&
+            llm.nextStep(plan, planStep, fallbackState) >= 0 &&
+            llm.mayAdvance({ failed: runProvider, selected, accessFailure: false, sentAnyText: streamedAny, riskyToolUsed })) {
+          switchHit = true;
+          switchWhy = "нет ответа";
+          switchText = "";
+        }
         resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, switchHit, switchWhy, switchText, transientAccessLike, sawResult, startedAt: runStartedAt });
       });
 
@@ -1141,14 +1168,16 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       r = await runOnce(useResume);
       // If retry also fails transiently, surface a friendly message rather than raw error.
       if (r.transientHit) {
-        // Повтор тоже упал. Сбой доступа открывает окно (у Claude) или «не
-        // отвечает» (у запасного); ход переходит к следующему в плане — при сбое
-        // доступа или если упал выбранный пользователем провайдер.
-        if (r.transientAccessLike) noteAccessFailure(provider, "ошибка доступа после повтора");
-        if (!preempted && !clientDisconnected &&
-            llm.mayAdvance({ failed: provider, selected, accessFailure: !!r.transientAccessLike, sentAnyText: streamedAny, riskyToolUsed })) {
+        // Повтор тоже упал. Сбой доступа открывает окно (у Claude) или «не отвечает»
+        // (у запасного); ход идёт к следующему в плане — при сбое доступа или если
+        // упал выбранный пользователем провайдер — пока план не кончится.
+        while (r.transientHit) {
+          if (r.transientAccessLike) noteAccessFailure(provider, "ошибка доступа после повтора");
+          if (preempted || clientDisconnected ||
+              !llm.mayAdvance({ failed: provider, selected, accessFailure: !!r.transientAccessLike, sentAnyText: streamedAny, riskyToolUsed })) break;
           const next = switchProvider(useResume, r.transientAccessLike ? "ошибка доступа после повтора" : "ошибка после повтора");
-          if (next) r = await next;
+          if (!next) break;
+          r = await next;
         }
         if (r.transientHit) notice("_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_", "transient");
       }
