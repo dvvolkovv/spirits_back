@@ -14,16 +14,24 @@ import { GuestClaimService } from './guest-claim.service';
 import { GuestTrialCron } from './guest-trial.cron';
 
 /**
- * GuestTurnService и GuestClaimService принимают ChatService/EventsService и
- * Neo4jService/EventsService как @Optional() — это нужно их позиционным
- * спекам (A8/A9: `new GuestTurnService(pg, redis, cli, store, sessions)` без
- * хвоста). Обратная сторона (дополнение к A10, перед её стартом): забытый
- * импорт модуля или подмена типа параметра на интерфейс в конструкторе не
- * роняет старт — DI молча подставит undefined. deploy.sh перестанет видеть
- * гостевые ходы (ChatService.beginStream/endStream), события и статистика
- * пробы опустеют без единой ошибки в логе. Сторож — по образцу
- * chat.module.chat-files.spec.ts (состав модуля) и
+ * GuestTurnService принимает ChatService/EventsService, а GuestClaimService —
+ * EventsService, оба как @Optional() — это нужно их позиционным спекам
+ * (A8/A9: `new GuestTurnService(pg, redis, cli, store, sessions)` без
+ * хвоста; аналогично часть вызовов `new GuestClaimService(pg, redis)` в
+ * guest-claim.pg.spec.ts). Обратная сторона (дополнение к A10, перед её
+ * стартом): забытый импорт модуля или подмена типа параметра на интерфейс в
+ * конструкторе не роняет старт — DI молча подставит undefined. deploy.sh
+ * перестанет видеть гостевые ходы (ChatService.beginStream/endStream),
+ * события и статистика пробы опустеют без единой ошибки в логе. Сторож — по
+ * образцу chat.module.chat-files.spec.ts (состав модуля) и
  * chat.service.guest-carry.spec.ts (design:paramtypes самого сервиса).
+ *
+ * Решение владельца 31.10.2026: GuestClaimService больше НЕ принимает
+ * Neo4jService — перенос пробы в аккаунт не дополняет профиль ценностей
+ * (общий компьютер, см. комментарий в guest-claim.service.ts). Проверяем это
+ * явно (deps не должен содержать Neo4jService), а не только то, что сервис
+ * собирается, — случайный возврат зависимости (например, копипастой из
+ * GuestTurnService) иначе прошёл бы незамеченным.
  */
 describe('GuestTrialModule: граф зависимостей не оторван', () => {
   it('импортирует ChatModule (иначе ChatService придёт как undefined)', () => {
@@ -58,10 +66,10 @@ describe('GuestTrialModule: граф зависимостей не оторва�
     expect(deps).toContain(EventsService);
   });
 
-  it('GuestClaimService объявляет Neo4jService и EventsService классами, не Object', () => {
+  it('GuestClaimService объявляет EventsService классом, не Object, и больше не зависит от Neo4jService', () => {
     const deps = Reflect.getMetadata('design:paramtypes', GuestClaimService);
     expect(Array.isArray(deps)).toBe(true);
-    expect(deps).toContain(Neo4jService);
     expect(deps).toContain(EventsService);
+    expect(deps).not.toContain(Neo4jService);
   });
 });

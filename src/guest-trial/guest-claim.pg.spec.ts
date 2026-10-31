@@ -100,10 +100,13 @@ maybe('перенос пробы в аккаунт против живого Pos
     // custom_chat_history. Если этот аккаунт уже вёл сессию с ассистентом 12
     // на релее, она возобновится по --resume без пробы, если не оставить приписку.
     expect(redis.peek(guestCarryKey('u-new', '12'))).toContain('Человек: Вопрос 1');
+    // Решение владельца 31.10.2026: общий компьютер — перенос больше НЕ
+    // разбирает профиль пробы (neo4j.consolidateFromChat). setImmediate всё
+    // равно отыгрываем — чтобы ловить именно «не вызвался», а не «ещё не
+    // успел».
     await new Promise((res) => setImmediate(res));
     await new Promise((res) => setImmediate(res));
-    expect(neo4j.consolidateFromChat).toHaveBeenCalledWith('u-new', '12', 'Вопрос 1', 'Ответ 1', '');
-    expect(neo4j.consolidateFromChat).toHaveBeenCalledWith('u-new', '12', 'Вопрос 2', 'Ответ 2', 'Ответ 1');
+    expect(neo4j.consolidateFromChat).not.toHaveBeenCalled();
     expect(events.track).toHaveBeenCalledWith('guest_trial_claimed', {
       userId: 'u-new',
       source: null,
@@ -214,25 +217,5 @@ maybe('перенос пробы в аккаунт против живого Pos
       // которое уже один раз случилось на этом тесте).
       if (!released) realClient.release(true);
     }
-  });
-
-  it('разбор профиля — не больше пяти последних пар', async () => {
-    const { token } = await trial(12, 6);
-    await svc.claim('u-many', token);
-    await new Promise((res) => setImmediate(res));
-    await new Promise((res) => setImmediate(res));
-    expect(neo4j.consolidateFromChat).toHaveBeenCalledTimes(5);
-    expect(neo4j.consolidateFromChat).not.toHaveBeenCalledWith('u-many', '12', 'Вопрос 1', 'Ответ 1', expect.anything());
-    expect(neo4j.consolidateFromChat).toHaveBeenNthCalledWith(1, 'u-many', '12', 'Вопрос 2', 'Ответ 2', '');
-  });
-
-  it('сбой разбора одной пары не останавливает перенос следующей', async () => {
-    const { token } = await trial(12, 2);
-    neo4j.consolidateFromChat.mockRejectedValueOnce(new Error('boom'));
-    await svc.claim('u-partial-fail', token);
-    await new Promise((res) => setImmediate(res));
-    await new Promise((res) => setImmediate(res));
-    expect(neo4j.consolidateFromChat).toHaveBeenCalledTimes(2);
-    expect(neo4j.consolidateFromChat).toHaveBeenNthCalledWith(2, 'u-partial-fail', '12', 'Вопрос 2', 'Ответ 2', 'Ответ 1');
   });
 });
