@@ -79,12 +79,15 @@ describe('relayFallbackAlertText', () => {
   it('счётчики по провайдерам и минуты окна; без обратных кавычек в HTML', () => {
     const t = text(fb({ breakerOpenUntil: NOW + 1 }, { failed: 2 }, { ok: 4 }));
     expect(t).toContain('ассистенты отвечают через запасные');
-    expect(t).toContain('Qwen: ответов 0, ошибок 2 · Kimi: ответов 4, ошибок 0 за 15 мин');
+    // Та же строка, что в алерте CLI (fallbackAlertLine): окно — в начале, а не хвостом.
+    expect(t).toContain('\nЗапасные за 15 мин: Qwen — ответов 0, ошибок 2; Kimi — ответов 4, ошибок 0.\n');
     expect(t).toContain('<code>claude</code>');
     expect(t).not.toContain('`');
   });
-  it('без ключа Kimi — «не настроен»', () => {
-    expect(text(fb({}, { ok: 1 }, { enabled: false }))).toContain('Kimi: не настроен');
+  it('без ключа Kimi — «не настроен», и «за 15 мин» к нему не цепляется', () => {
+    const t = text(fb({}, { ok: 1 }, { enabled: false }));
+    expect(t).toContain('Запасные за 15 мин: Qwen — ответов 1, ошибок 0; Kimi — не настроен.');
+    expect(t).not.toContain('не настроен за');
   });
   it('ответов ноль, ошибки есть — запасные тоже не отвечают', () => {
     const t = text(fb({}, { failed: 1 }, { failed: 2 }));
@@ -93,8 +96,7 @@ describe('relayFallbackAlertText', () => {
   });
   it('старый релей — строка Qwen', () => {
     const t = text(q({ ok: 5, failed: 1 }));
-    expect(t).toContain('Qwen: ответов 5, ошибок 1');
-    expect(t).toContain('за 15 мин');
+    expect(t).toContain('Запасные за 15 мин: Qwen — ответов 5, ошибок 1; Kimi — не настроен.');
   });
   it('активность только по «Claude не отвечал с момента сбоя» — отдельный текст без счётчиков', () => {
     const t = text(q({ ok: 0, failed: 0, breakerOpenUntil: 0, lastOpenedAt: NOW - 600_000, lastClaudeOkAt: 0 }));
@@ -131,7 +133,7 @@ describe('RelayQwenMonitorService.check', () => {
   it('новый релей: active через Kimi — в алерте его счётчики', async () => {
     get.mockResolvedValue({ data: fb({}, {}, { ok: 3 }) });
     expect(await new RelayQwenMonitorService(pg as any).check(NOW)).toBe('active');
-    expect(send.mock.calls[0][0].text).toContain('Kimi: ответов 3, ошибок 0');
+    expect(send.mock.calls[0][0].text).toContain('Kimi — ответов 3, ошибок 0');
   });
   it('active повторно — без повтора алерта', async () => {
     alerted = true;
