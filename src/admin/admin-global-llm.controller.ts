@@ -3,10 +3,10 @@ import { Response } from 'express';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
-import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
+import { GlobalLlmProviderService, GlobalProviderStatus } from '../common/services/global-llm-provider.service';
 import { ANSWER_PROVIDERS, isAnswerProvider, readFallbackConfigs } from '../common/services/llm-fallback';
 import { sendTelegramAlert } from '../common/telegram-alert';
-import { switchedText } from '../common/global-llm-messages';
+import { standPrefix, switchedText } from '../common/global-llm-messages';
 
 /**
  * Общий рубильник модели ответов (spec 2026-10-31-global-llm-switch, раздел 7).
@@ -41,11 +41,22 @@ export class AdminGlobalLlmController {
     const { previous } = await this.global.set(provider, actor);
     this.logger.log(`llm_provider (все): ${actor}: ${previous} → ${provider}`);
     if (previous !== provider) {
-      await sendTelegramAlert(switchedText(previous, provider, actor)).catch((e: any) =>
-        this.logger.warn(`сообщение о рубильнике не отправлено: ${e?.message}`),
-      );
+      // Fire-and-forget (ревью 01.11): sendTelegramAlert сама не бросает
+      // (sendTelegramPayload гасит сетевые/Telegram-ошибки по каждому чату
+      // внутри себя), а ответ админке не должен зависеть от сети до
+      // Telegram — повисший запрос туда не должен задержать 200.
+      void sendTelegramAlert(standPrefix() + switchedText(previous, provider, actor));
     }
-    const s = await this.global.status();
+    // Запись уже прошла успешно — сбой ЭТОГО (повторного) чтения не повод
+    // отвечать 500: в ответе — известные значения (новый provider, актор),
+    // а не последнее прочитанное ДО записи (ревью 01.11).
+    let s: GlobalProviderStatus;
+    try {
+      s = await this.global.status();
+    } catch (e: any) {
+      this.logger.warn(`рубильник: статус после записи не прочитан: ${e?.message}`);
+      s = { provider, since: null, by: actor };
+    }
     return res.status(200).json({ ...s, configured: cfg });
   }
 }

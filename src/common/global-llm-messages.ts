@@ -30,11 +30,53 @@ export function mskStamp(at: string | Date): string {
 
 const escapeHtml = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+const PHONE_RE = /^\+?\d{7,15}$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * userId в сообщении для группы алертов — не светить целиком (ревью 01.11):
+ * телефон — только последние 4 цифры («…9187»), UUID (вход по почте/OAuth —
+ * userId для таких аккаунтов это UUID) — только первые 8 символов. Что не
+ * похоже ни на одно (служебные/тестовые id вида 'admin-1', 'unknown') — без
+ * изменений: это не пользовательский идентификатор, скрывать нечего.
+ */
+export function maskActor(actor: string): string {
+  if (PHONE_RE.test(actor)) return `…${actor.replace(/\D/g, '').slice(-4)}`;
+  if (UUID_RE.test(actor)) return actor.slice(0, 8);
+  return actor;
+}
+
+/**
+ * «[test] » перед сообщением, когда бэкенд поднят не на проде: иначе
+ * сообщения со стенда (test.linkeon.io) в общей группе алертов неотличимы от
+ * боевых (ревью 01.11). Общего механизма пометки стенда на момент внедрения
+ * нет — есть только SHORTS_STAND у студии роликов (src/shorts/short-env.ts),
+ * специфичный для неё, — поэтому здесь отдельная проверка по BACKEND_URL,
+ * который уже читает весь остальной бэкенд (default 'https://my.linkeon.io').
+ */
+export function standPrefix(env: NodeJS.ProcessEnv = process.env): string {
+  return /test\./i.test(env.BACKEND_URL || '') ? '[test] ' : '';
+}
+
 /** Сообщение в группу алертов при переключении рубильника (spec 2026-10-31-global-llm-switch, раздел 8). */
 export function switchedText(previous: AnswerProvider, next: AnswerProvider, actor: string): string {
   const head = `🔀 <b>Модель ответов для всех: ${PROVIDER_LABELS[next]}</b> (было ${PROVIDER_LABELS[previous]}).`;
   const tail = next === 'claude' ? 'Все снова отвечают через Claude.' : 'Вернуть — Админка → Ассистенты.';
-  return `${head}\nПереключил: ${escapeHtml(actor)}. ${tail}`;
+  return `${head}\nПереключил: ${escapeHtml(maskActor(actor))}. ${tail}`;
+}
+
+/**
+ * Суточный счёт по вызовам рубильника (choice='global', selected=эта
+ * модель): answered — она ответила; byOther — ответил другой (аварийная
+ * цепочка); failed — ВСЕГО без ответа (неудачные ходы веб-чата + ошибки
+ * гостей о модели); guests — подмножество failed, сколько из них гостям (для
+ * строки «из них гостям»).
+ */
+export interface GlobalLlmDayCounts {
+  answered: number;
+  byOther: number;
+  failed: number;
+  guests: number;
 }
 
 /** Суточное напоминание, пока рубильник не на Claude. */
@@ -45,24 +87,33 @@ export function reminderText(a: {
   claudeStatus: 'ok' | 'down' | null;
   claudeCheckedAt: string | null;
   keyMissing: boolean;
-  /** Ответы за сутки по выбору рубильника (события chat_quality и claude_cli_call
-   *  с choice=global): ok — ответила модель рубильника, other — она не ответила
-   *  и ответил другой. Релей такие ходы в /health.fallback не считает (они «по
-   *  выбору», не авария), поэтому без этой строки сбои модели рубильника не
-   *  видны. null/нет — строки нет. */
-  day?: { ok: number; other: number } | null;
+  day?: GlobalLlmDayCounts | null;
 }): string {
   const label = PROVIDER_LABELS[a.provider];
-  const since = a.since
-    ? ` с ${mskStamp(a.since)} (${Math.floor((a.now.getTime() - new Date(a.since).getTime()) / 86_400_000)} дн.)`
-    : '';
+  let since = '';
+  if (a.since) {
+    // Math.max(0, …): рассинхрон часов (или вызов до фактической записи в
+    // тесте) не должен уйти в отрицательные дни/часы (ревью 01.11).
+    const diffMs = Math.max(0, a.now.getTime() - new Date(a.since).getTime());
+    const days = Math.floor(diffMs / 86_400_000);
+    // Меньше суток — в часах («5 ч»), а не «0 дн.»: «0 дн.» ничего не
+    // говорит о том, сколько именно времени прошло в первые сутки после
+    // переключения.
+    const period = days > 0 ? `${days} дн.` : `${Math.floor(diffMs / 3_600_000)} ч`;
+    since = ` с ${mskStamp(a.since)} (${period})`;
+  }
   const claude = a.claudeStatus === 'ok' ? 'отвечает' : a.claudeStatus === 'down' ? 'не отвечает' : 'нет данных';
   const checked = a.claudeCheckedAt ? ` (${mskStamp(a.claudeCheckedAt)})` : '';
   const lines = [
     `⏰ <b>Все отвечают через ${label}</b>${since}.`,
     `Claude по последней пробе: ${claude}${checked}.`,
   ];
-  if (a.day) lines.push(`За сутки через ${label}: ${a.day.ok} вызовов (ответы людям и фоновые задачи); не ответила, ответил другой — ${a.day.other}.`);
+  if (a.day) {
+    const guestsNote = a.day.guests > 0 ? ` (из них гостям — ${a.day.guests})` : '';
+    lines.push(
+      `За сутки через ${label}: ответила — ${a.day.answered}; ответил другой — ${a.day.byOther}; без ответа — ${a.day.failed}${guestsNote}.`,
+    );
+  }
   if (a.keyMissing) lines.push(`Ключа ${label} на сервере нет — фактически отвечает Claude, гостям пробы — экран входа.`);
   lines.push('Вернуть — Админка → Ассистенты.');
   return lines.join('\n');

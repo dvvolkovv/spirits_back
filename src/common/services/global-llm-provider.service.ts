@@ -128,13 +128,19 @@ export class GlobalLlmProviderService implements OnModuleInit {
    * одновременных переключениях «было» в сообщении админу может оказаться
    * неточным (оба читают один и тот же момент «до») — для текста алерта это
    * приемлемо, линеаризация здесь не нужна.
+   *
+   * Повторная запись ТОГО ЖЕ значения не трогает updated_at/updated_by
+   * (WHERE … IS DISTINCT FROM в UPDATE, ревью 01.11): иначе повторный клик по
+   * уже текущей модели в админке сбрасывал бы «с …» в подсказке под блоком и
+   * в суточном напоминании на текущий момент, хотя переключения не было.
    */
   async set(provider: AnswerProvider, by: string, now: number = Date.now()): Promise<{ previous: AnswerProvider }> {
     if (!isAnswerProvider(provider)) throw new Error(`llm_settings: недопустимая модель ${String(provider)}`);
     const before = await this.status();
     await this.pg.query(
       `INSERT INTO llm_settings (key, value, updated_at, updated_by) VALUES ($1, $2::jsonb, now(), $3)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now(), updated_by = EXCLUDED.updated_by`,
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now(), updated_by = EXCLUDED.updated_by
+       WHERE llm_settings.value IS DISTINCT FROM EXCLUDED.value`,
       [GLOBAL_PROVIDER_KEY, JSON.stringify({ provider }), by],
     );
     this.generation++;
