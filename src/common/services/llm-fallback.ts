@@ -13,6 +13,11 @@ import { classifyLlmError, LlmOutageKind } from '../llm-error';
 
 export type FallbackProvider = 'qwen' | 'kimi';
 export type AnswerProvider = 'claude' | FallbackProvider;
+/** Чей это выбор (spec 2026-10-31-global-llm-switch, «Уточнения по ревью
+ *  31.10»): личный выбор человека (карточка пользователя) или общий
+ *  рубильник. Рядом с `selected` в событии claude_cli_call; у
+ *  ClaudeCliOptions — поля provider и providerChoice. */
+export type ProviderChoice = 'user' | 'global';
 
 /** Порядок аварийной цепочки после Claude. */
 export const FALLBACK_ORDER: readonly FallbackProvider[] = ['qwen', 'kimi'];
@@ -280,14 +285,20 @@ export class FallbackState {
  * раздел 3). noFallback — одна модель: выбранная (ход гостя) или Claude
  * (проба). Обычный путь: окно Claude закрыто — Claude, затем включённые и
  * отвечающие запасные; открыто — только они (если таких нет — как при
- * закрытом). Выбранный пользователем (с ключом) — первым, даже если он
- * «не отвечает», затем обычный путь без него.
+ * закрытом). Выбранный (с ключом) — первым, даже если он «не отвечает»,
+ * затем обычный путь без него — КРОМЕ respectDown (spec
+ * 2026-10-31-global-llm-switch, «Уточнения по ревью 31.10»): рубильник
+ * (choice: 'global' у вызывающего) такую модель пропускает и сразу идёт
+ * обычным путём без неё, не тратя попытку; личный выбор респектDown не
+ * передаёт — пробуется первым всегда, это осознанная проверка одного
+ * человека, и её сбой должен быть виден.
  */
 export function planProviders(args: {
   selected?: FallbackProvider;
   configs: FallbackConfigs;
   state: FallbackState;
   noFallback?: boolean;
+  respectDown?: boolean;
   now?: number;
 }): AnswerProvider[] {
   // Истинностью, не !== null: незнакомое значение selected (например, мусор из
@@ -301,12 +312,12 @@ export function planProviders(args: {
   // noFallback — без цепочки (spec 2026-10-31-global-llm-switch, раздел 3):
   // проба мониторинга (без выбора) — только Claude; ход гостя — только модель
   // рубильника, если у неё есть ключ, иначе Claude. Окно isDown здесь не
-  // проверяется намеренно: при noFallback цепочки нет, переключаться не на
-  // кого, так что помеченность «не отвечает» ничего не меняет — окно
-  // проверяет вызывающий. На релее noFallback — по-прежнему только Claude
-  // (relay-agent/llm-fallback.mjs): бэкенд не шлёт релею noFallback вместе с
-  // provider — к релею с noFallback ходят только пробы. Расхождение
-  // намеренное, не выравнивать.
+  // проверяется намеренно (respectDown в этой ветке тоже не действует): при
+  // noFallback цепочки нет, переключаться не на кого, так что помеченность
+  // «не отвечает» ничего не меняет — окно проверяет вызывающий. На релее
+  // noFallback — по-прежнему только Claude (relay-agent/llm-fallback.mjs):
+  // бэкенд не шлёт релею noFallback вместе с provider — к релею с noFallback
+  // ходят только пробы. Расхождение намеренное, не выравнивать.
   if (args.noFallback) {
     return usable(s) ? [s] : ['claude'];
   }
@@ -316,6 +327,10 @@ export function planProviders(args: {
     return args.state.claudeWindowOpen(now) && alts.length > 0 ? [...alts] : ['claude', ...alts];
   };
   if (usable(s)) {
+    // Рубильник уважает окно «не отвечает»: не тратить попытку на модель,
+    // которую уже недавно уронили — сразу обычный путь без неё (она и так
+    // отсеется из normal() фильтром isDown).
+    if (args.respectDown && args.state.isDown(s, now)) return normal();
     return [s, ...normal(s)];
   }
   return normal();
