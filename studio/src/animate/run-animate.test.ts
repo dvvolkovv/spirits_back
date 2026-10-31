@@ -223,20 +223,17 @@ test('речь не сошлась — пересъёмка без нового 
   assert.equal(rejected.length, 1);
 });
 
-test('брак откладывается с пометкой: код, версия сверки, услышанное и доля', { timeout: 120_000 }, async () => {
+test('брак откладывается с пометкой: код, версия сверки, услышанное целиком и доля', { timeout: 120_000 }, async () => {
   const env = setup();
-  const { deps } = fakes(env, { heard: (kind, call) => (kind === 'conflict' && call === 1 ? 'совсем другое' : LINES[kind].join(' ')) });
+  // Длиннее 200 знаков: в пометку — целиком, а не обрезок из сообщения. Половина слов реплик — услышана.
+  const heard = `обои потерли залог мой ${'шум '.repeat(60)}`.trim();
+  const { deps } = fakes(env, { heard: (kind, call) => (kind === 'conflict' && call === 1 ? heard : LINES[kind].join(' ')) });
   await animateRun(env.runDir, deps);
   const dir = path.join(env.runDir, 'skits', 'fp-conflict');
   const metas = fs.readdirSync(dir).filter((f) => /^rejected-.*\.json$/.test(f));
   assert.equal(metas.length, 1);
   assert.ok(fs.existsSync(path.join(dir, metas[0].replace(/\.json$/, '.mp4'))), 'пометка без клипа');
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, metas[0]), 'utf8')), {
-    code: 'speech_mismatch',
-    matcher: MATCHER_VERSION,
-    heard: 'совсем другое',
-    share: 0,
-  });
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, metas[0]), 'utf8')), { code: 'speech_mismatch', matcher: MATCHER_VERSION, heard, share: 0.5 });
 });
 
 test('битый файл от Omni — брак с пометкой clip_invalid, без услышанного', { timeout: 120_000 }, async () => {
@@ -247,6 +244,22 @@ test('битый файл от Omni — брак с пометкой clip_invali
   const metas = fs.readdirSync(dir).filter((f) => /^rejected-.*\.json$/.test(f));
   assert.equal(metas.length, 1);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, metas[0]), 'utf8')), { code: 'clip_invalid', matcher: MATCHER_VERSION });
+});
+
+test('пометка брака не записалась — брак всё равно отложен и удалён из хранилища, съёмка идёт дальше', { timeout: 120_000 }, async (t) => {
+  t.mock.method(Date.prototype, 'toISOString', () => '2026-10-31T00:00:00.000Z');
+  const env = setup();
+  const dir = path.join(env.runDir, 'skits', 'fp-conflict');
+  // На месте пометки — каталог: запись упадёт (EISDIR), как при сбое диска.
+  fs.mkdirSync(path.join(dir, 'rejected-2026-10-31T00-00-00-000Z.json'), { recursive: true });
+  const discarded: string[] = [];
+  const logs: string[] = [];
+  const { deps } = fakes(env, { heard: (kind, call) => (kind === 'conflict' && call === 1 ? 'совсем другое' : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, { ...deps, onDiscard: async (rel) => { discarded.push(rel); }, log: (m) => logs.push(m) });
+  assert.deepEqual(discarded, ['skits/fp-conflict/raw.mp4']);
+  assert.equal(anim.skits.conflict!.attempts, 2);
+  assert.ok(fs.existsSync(path.join(dir, 'rejected-2026-10-31T00-00-00-000Z.mp4')), 'брак на месте');
+  assert.ok(logs.some((m) => m.includes('пометка брака') && m.includes('не записалась')), logs.join('\n'));
 });
 
 test('пустое распознавание — SpeechKit спрашивается ещё раз, клип не переснимается', { timeout: 120_000 }, async () => {
@@ -509,6 +522,7 @@ test('переобработка принятого клипа не прошла
     assert.equal(anim.omniSeconds, 16);
     assert.ok(fs.existsSync(path.join(env.runDir, 'skits', 'fp-conflict', 'raw.mp4')));
     assert.deepEqual(fs.readFileSync(clipFile), before);
+    assert.deepEqual(fs.readdirSync(path.join(env.runDir, 'skits', 'fp-conflict')).filter((name) => name.startsWith('rejected-')), [], 'принятый клип не уходит в брак');
   }
   const back = fakes(env);
   await animateRun(env.runDir, back.deps);
