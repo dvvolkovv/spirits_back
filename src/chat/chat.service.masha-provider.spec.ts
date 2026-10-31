@@ -15,7 +15,7 @@ import { ChatService } from './chat.service';
 
 const USER = 'u-1';
 
-function makeService(choice: 'claude' | 'qwen' | 'kimi' = 'claude') {
+function makeService(choice: 'claude' | 'qwen' | 'kimi' = 'claude', routeChoice: 'user' | 'global' = 'user') {
   const pg = {
     query: jest.fn(async (sql: string) => {
       if (sql.includes('SELECT tokens FROM ai_profiles_consolidated')) return { rows: [{ tokens: 100_000 }] };
@@ -35,7 +35,7 @@ function makeService(choice: 'claude' | 'qwen' | 'kimi' = 'claude') {
   });
   jest.spyOn(svc as any, 'saveChatHistory').mockResolvedValue(undefined);
   jest.spyOn(svc as any, 'addTokenTask').mockResolvedValue(undefined);
-  const llmProvider = { get: jest.fn(async () => choice) };
+  const llmProvider = { route: jest.fn(async () => ({ provider: choice, choice: routeChoice })) };
   (svc as any).llmProvider = llmProvider;
   return { svc, claudeCli, llmProvider };
 }
@@ -67,11 +67,17 @@ describe('Маша (локальный CLI): выбор модели ответ�
     const { svc, claudeCli, llmProvider } = makeService('kimi');
     await runMasha(svc);
     expect(claudeCli.textWithCost.mock.calls[0][1].provider).toBe('kimi');
-    expect(llmProvider.get).toHaveBeenCalledWith(USER);
+    expect(llmProvider.route).toHaveBeenCalledWith(USER);
   });
 
-  it('выбран Claude — provider не задан', async () => {
+  it('личный Claude — provider claude явно (рубильник к нему не применяется)', async () => {
     const { svc, claudeCli } = makeService('claude');
+    await runMasha(svc);
+    expect(claudeCli.textWithCost.mock.calls[0][1].provider).toBe('claude');
+  });
+
+  it('«Как у всех» — provider не задан (рубильник применит ClaudeCliService)', async () => {
+    const { svc, claudeCli } = makeService('qwen', 'global');
     await runMasha(svc);
     expect(claudeCli.textWithCost.mock.calls[0][1].provider).toBeUndefined();
   });
@@ -80,6 +86,6 @@ describe('Маша (локальный CLI): выбор модели ответ�
     const { svc, claudeCli, llmProvider } = makeService('kimi');
     await runMasha(svc, true);
     expect(claudeCli.textWithCost.mock.calls[0][1].provider).toBeUndefined();
-    expect(llmProvider.get).not.toHaveBeenCalled();
+    expect(llmProvider.route).not.toHaveBeenCalled();
   });
 });

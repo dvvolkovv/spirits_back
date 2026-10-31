@@ -91,21 +91,28 @@ describe('TgRouterService: выбор модели', () => {
 
   it('владелец выбрал Qwen — основной ход с provider: qwen', async () => {
     const { svc, claudeCli } = makeRouter();
-    (svc as any).llmProvider = { get: jest.fn(async () => 'qwen') };
-    await svc.generateReply({ ...cfg, owner_user_id: '79030169187' }, 'Дмитрий');
+    (svc as any).llmProvider = { route: jest.fn(async () => ({ provider: 'qwen', choice: 'user' })) };
+    await svc.generateReply({ ...cfg, owner_user_id: 'u-owner' }, 'Дмитрий');
     expect(claudeCli.textWithCost.mock.calls[0][1].provider).toBe('qwen');
   });
 
-  it('без выбора — provider не задан', async () => {
+  it('владелец «Как у всех» — provider не задан (рубильник применит ClaudeCliService)', async () => {
     const { svc, claudeCli } = makeRouter();
-    (svc as any).llmProvider = { get: jest.fn(async () => 'claude') };
-    await svc.generateReply({ ...cfg, owner_user_id: '79030169187' }, 'Дмитрий');
+    (svc as any).llmProvider = { route: jest.fn(async () => ({ provider: 'qwen', choice: 'global' })) };
+    await svc.generateReply({ ...cfg, owner_user_id: 'u-owner' }, 'Дмитрий');
     expect(claudeCli.textWithCost.mock.calls[0][1].provider).toBeUndefined();
+  });
+
+  it('владелец выбрал Claude явно — provider claude', async () => {
+    const { svc, claudeCli } = makeRouter();
+    (svc as any).llmProvider = { route: jest.fn(async () => ({ provider: 'claude', choice: 'user' })) };
+    await svc.generateReply({ ...cfg, owner_user_id: 'u-owner' }, 'Дмитрий');
+    expect(claudeCli.textWithCost.mock.calls[0][1].provider).toBe('claude');
   });
 
   it('владелец выбрал Kimi — основной ход с provider: kimi', async () => {
     const { svc, claudeCli } = makeRouter();
-    (svc as any).llmProvider = { get: jest.fn(async () => 'kimi') };
+    (svc as any).llmProvider = { route: jest.fn(async () => ({ provider: 'kimi', choice: 'user' })) };
     await svc.generateReply({ ...cfg, owner_user_id: 'u-owner' }, 'Дмитрий');
     expect(claudeCli.textWithCost.mock.calls[0][1].provider).toBe('kimi');
   });
