@@ -190,7 +190,16 @@ test('эхо другой реплики в иной форме не скрыв�
 test('одно услышанное слово засчитывается за одно слово реплики — и по окончанию тоже', () => {
   assert.equal(speechCheck(['Начинай, начинаю, начинать.'], 'начинаешь').share, 1 / 3);
 });
+
+test('обрыв на полуслове не засчитывается по окончанию: услышанное слово короче ожидаемого не закрывает реплику', () => {
+  const lines = ['Спокойно. Сейчас спрошу у нумеролога.', 'Ладно. Начинаю.'];
+  assert.deepEqual(speechCheck(lines, 'спокойно сейчас спрошу у нумеролога ладно начин').silentLines, [1]);
+  // Длиннее ожидаемого — окончание, а не обрыв: «начинай» ≈ «начинаешь» (889b6423).
+  assert.equal(speechCheck(['Ладно, убедил. Начинай уж.'], 'ладно убедил начинаешь').ok, true);
+});
 ```
+
+(Тест «обрыв на полуслове» — по финальному ревью ветки: `sameWord` засчитывает обрезанное начало слова, «начин» за «Начинаю».)
 
 (Тесты «эхо» и «одно услышанное слово» добавлены по ревью задачи 2: сравнение по окончанию через весь услышанный текст давало слову другой реплики скрыть оборванную; пограничные пары держат пороги с обеих сторон.)
 
@@ -282,7 +291,7 @@ export function sameWord(a: string, b: string): boolean {
 на
 
 ```ts
-  /** Номера реплик (с 0), от которых — или от их последнего предложения — не услышано ни одного слова от трёх букв (в последнем предложении — от четырёх): дословно — где угодно в услышанном, по окончанию — только своей парой из доли. */
+  /** Номера реплик (с 0), от которых — или от их последнего предложения — не услышано ни одного слова от трёх букв (в последнем предложении — от четырёх): дословно — где угодно в услышанном, по окончанию — только своей парой из доли, не короче слова (обрыв на полуслове не засчитывается). */
 ```
 
 - [ ] **Step 5: Подсчёт в `speechCheck`**
@@ -320,7 +329,7 @@ export function sameWord(a: string, b: string): boolean {
   const expected = perLine.flat();
   /** Номер реплики у каждого слова expected. */
   const lineOf = perLine.flatMap((ws, li) => ws.map(() => li));
-  /** Слова каждой реплики, засчитанные по окончанию, — каждое своей парой из услышанного. */
+  /** Слова каждой реплики, засчитанные по окончанию своей парой из услышанного не короче себя, — для правила «реплика не прозвучала». */
   const byStem = perLine.map(() => new Set<string>());
   // Сначала точные пары, потом с точностью до окончания: иначе неточное слово
   // могло бы забрать пару, которая точно подходит другому.
@@ -337,7 +346,9 @@ export function sameWord(a: string, b: string): boolean {
     const h = heardWords.find((x) => (pool.get(x) ?? 0) > 0 && sameWord(w, x));
     if (h === undefined) return;
     take(i, h);
-    byStem[lineOf[i]].add(w);
+    // В правило «реплика не прозвучала» — только пара не короче слова: короче может
+    // быть обрыв клипа на полуслове («Начинаю.» → «начин»), а не окончание.
+    if (h.length >= w.length) byStem[lineOf[i]].add(w);
   });
   const hit = matched.filter(Boolean).length;
   const share = expected.length ? hit / expected.length : 1;
@@ -367,7 +378,7 @@ git commit -m "feat(studio): сверка речи с точностью до о
 studio/scripts/node-run.sh "npx tsx --test src/animate/match.test.ts"
 ```
 
-Ожидается: `ℹ tests 20`, `ℹ fail 0`.
+Ожидается: `ℹ tests 21`, `ℹ fail 0`.
 
 ---
 
@@ -500,7 +511,7 @@ export interface RejectedMeta {
 Внутри `animateRun`, сразу после определения `local` (функция, которая заканчивается строкой `throw new StudioError('unknown', \`${what} — ${failText(e)}\`, false);` и закрывающими `}` / `};`), вставить:
 
 ```ts
-  /** Пометка брака — подсказка перепроверке, не счёт денег: не записалась — брак перепроверится полной проверкой. */
+  /** Пометка брака — подсказка перепроверке, не счёт денег: не записалась — брак осудят заново при следующем запуске. */
   const writeRejectedMeta = (file: string, meta: RejectedMeta): void => {
     try {
       writeAtomic(file, JSON.stringify(meta, null, 2));
@@ -596,7 +607,8 @@ test('брак без пометки (до 31.10) перепроверяется
   const { env, dir } = await withRejected();
   const heard = 'это износ верните залог ладно убедил начинаешь';
   const second = fakes(env, { heard: (kind) => (kind === 'punchline' ? heard : LINES[kind].join(' ')) });
-  const anim = await animateRun(env.runDir, { ...second.deps, maxOmniSeconds: 16 });
+  const files: string[] = [];
+  const anim = await animateRun(env.runDir, { ...second.deps, maxOmniSeconds: 16, onFile: async (rel) => { files.push(rel); } });
   assert.deepEqual(second.calls.start, []);
   assert.deepEqual(second.calls.keyframe, []);
   assert.equal(second.calls.recognize, 1);
@@ -605,6 +617,7 @@ test('брак без пометки (до 31.10) перепроверяется
   assert.equal(anim.skits.punchline!.heard, heard);
   assert.deepEqual(rejectedClips(dir), []);
   assert.ok(fs.existsSync(path.join(dir, 'raw.mp4')), 'принятый брак — оплаченный клип сценки');
+  assert.deepEqual(files, ['skits/fp-punchline-2/raw.mp4', 'skits/fp-punchline-2/clip.mp4'], 'клип из брака — в хранилище, как скачанный');
 });
 
 test('брак, который эта сверка уже судила, и плохой файл не перепроверяются — снимается новый клип', { timeout: 120_000 }, async () => {
@@ -644,10 +657,12 @@ test('брак без пометки, не прошедший и новую св
   const second = fakes(env, {
     heard: (kind, call) => (kind === 'punchline' ? (call === 1 ? 'совсем другое' : lines.join(' ')) : LINES[kind].join(' ')),
   });
-  const anim = await animateRun(env.runDir, second.deps);
+  const discarded: string[] = [];
+  const anim = await animateRun(env.runDir, { ...second.deps, onDiscard: async (rel) => { discarded.push(rel); } });
   assert.deepEqual(second.calls.start, ['punchline']);
   assert.equal(second.calls.recognize, 2);
   assert.equal(anim.omniSeconds, 24);
+  assert.deepEqual(discarded, ['skits/fp-punchline-2/raw.mp4'], 'брак из перепроверки удалён из хранилища');
   const left = rejectedClips(dir);
   assert.equal(left.length, 1);
   assert.notEqual(left[0], 'rejected-2026-10-31T16-29-00-469Z.mp4', 'брак лёг под новым именем, без дубля');
@@ -664,6 +679,18 @@ test('брак с пустым услышанным (SpeechKit не расслы
   assert.equal(second.calls.recognize, 1);
   assert.equal(anim.skits.punchline!.heard, heard);
   assert.deepEqual(rejectedClips(dir), []);
+});
+
+test('брак прежней сверки, прошедший сверку по записи, проходит полную проверку и принимается — без Omni', { timeout: 120_000 }, async () => {
+  const heard = 'это износ верните залог ладно убедил начинаешь';
+  const { env, dir } = await withRejected({ code: 'speech_mismatch', matcher: 1, heard, share: 0.8 });
+  const second = fakes(env, { heard: (kind) => (kind === 'punchline' ? heard : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, { ...second.deps, maxOmniSeconds: 16 });
+  assert.deepEqual(second.calls.start, []);
+  assert.equal(second.calls.recognize, 1);
+  assert.equal(anim.skits.punchline!.heard, heard);
+  assert.deepEqual(rejectedClips(dir), []);
+  assert.equal(fs.existsSync(path.join(dir, 'rejected-2026-10-31T16-29-00-469Z.json')), false, 'пометка ушла вместе с браком');
 });
 
 test('брак судится не больше раза на версию сверки: второй запуск его не распознаёт', { timeout: 120_000 }, async () => {
@@ -770,7 +797,7 @@ git commit -m "test(studio): перепроверка брака сценки д
 studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts"
 ```
 
-Ожидается: 47 тестов, `ℹ fail 8` — все новые, кроме «уже судила, и плохой файл» и «запущенная генерация рядом с браком»: перепроверки ещё нет, поэтому там `omni_budget` при пределе 16 с, пометка с `matcher: 1`, лишний запуск Omni или код ошибки не тот. Эти два проходят и без перепроверки — они держат её от лишней работы.
+Ожидается: 48 тестов, `ℹ fail 9` — все новые, кроме «уже судила, и плохой файл» и «запущенная генерация рядом с браком»: перепроверки ещё нет, поэтому там `omni_budget` при пределе 16 с, пометка с `matcher: 1`, лишний запуск Omni или код ошибки не тот. Эти два проходят и без перепроверки — они держат её от лишней работы.
 
 - [ ] **Step 3: Чтение пометки и функция `reviveRejected`**
 
@@ -832,12 +859,16 @@ function readRejectedMeta(file: string): Partial<RejectedMeta> {
       const byRecord = typeof meta.heard === 'string' && meta.heard.trim() ? speechCheck(texts, meta.heard) : null;
       if (byRecord && !byRecord.ok) {
         writeRejectedMeta(metaFile, { code: 'speech_mismatch', heard: meta.heard, share: byRecord.share, matcher: MATCHER_VERSION });
+        log(`animate ${kind}: брак ${name} не прошёл сверку v${MATCHER_VERSION} и по записи (речь ${Math.round(byRecord.share * 100)}%) — без распознавания`);
         continue;
       }
-      await local('брак не вернулся в работу', () => {
-        fs.renameSync(path.join(dir, name), abs(skitFile(kind, 'raw.mp4')));
+      await local('брак не вернулся в работу', () => fs.renameSync(path.join(dir, name), abs(skitFile(kind, 'raw.mp4'))));
+      // Пометка — подсказка, не счёт денег: не удалилась — останется сиротой без клипа, перепроверка её не читает.
+      try {
         fs.rmSync(metaFile, { force: true });
-      });
+      } catch (e) {
+        log(`animate: пометка брака ${path.relative(runDir, metaFile)} не удалилась — ${failText(e)}`);
+      }
       // Оплаченный клип — и в хранилище, как после скачивания: другой сервер его не потеряет.
       await upload(skitFile(kind, 'raw.mp4'));
       try {
@@ -923,7 +954,7 @@ studio/scripts/node-run.sh "npx tsx --test src/worker/animate-money.test.ts"
 studio/scripts/node-run.sh "npm run typecheck"
 ```
 
-Ожидается: 47/47; тест денег рабочего процесса — 0 упавших; `tsc` — пустой вывод.
+Ожидается: 48/48; тест денег рабочего процесса — 0 упавших; `tsc` — пустой вывод.
 
 (При исполнении 31.10 задача шла двумя кругами: сперва вызов стоял на входе в сценку, ревью перенесло его к каждой оплате — коммиты `eda58c27`/`5d2dd3f2` и следующие за ними.)
 
