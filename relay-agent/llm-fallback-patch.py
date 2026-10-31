@@ -179,6 +179,10 @@ rep('      let accessFailHit = false;\n      let transientAccessLike = false;\n 
     '      // провайдер, вышедший без единого result (ненулевой код, кривой адрес),\n'
     '      // уступает обычному пути так же, как при любом другом его сбое.\n'
     '      let gotResult = false;\n'
+    '      // Пришёл result с ошибкой, но без текста (error_during_execution: причина —\n'
+    '      // в errors[], поля result нет; llm.isErrorWithoutText) — у выбранного тоже\n'
+    '      // повод уступить ход (child.on("close", …)).\n'
+    '      let errorNoText = false;\n'
     '      let transientAccessLike = false;\n'
     '      let sawResult = false;\n')
 rep('              if (!qwen.SIDE_EFFECT_FREE_TOOLS.has(block.name || "")) riskyToolUsed = true;\n',
@@ -186,6 +190,9 @@ rep('              if (!qwen.SIDE_EFFECT_FREE_TOOLS.has(block.name || "")) risky
 rep('        if (ev.type === "result") {\n          // Потолок шагов.',
     '        if (ev.type === "result") {\n'
     '          gotResult = true;\n'
+    '          // Ошибку без текста ветка `result && ev.result` ниже не видит — у\n'
+    '          // выбранного это повод уступить ход в close.\n'
+    '          if (llm.isErrorWithoutText(ev)) errorNoText = true;\n'
     '          // Потолок шагов.')
 
 # 7. Разбор result.
@@ -235,14 +242,15 @@ region('          // Сбой доступа (qwen-provider.mjs): отказ CLI
        '          if (accessFailure && isErrorResult) transientAccessLike = true;\n',
        "198af2cc3fa956b658e321da7f6d00e892076da4ed4cd2c1d8e1e7d71a354efa")
 rep('resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, accessFailHit, transientAccessLike, sawResult, startedAt: runStartedAt });',
-    '// Выбранный пользователем вышел без единого result (ненулевой код, кривой\n'
-    '        // адрес) — уступает обычному пути, как и любой другой его сбой; staleResumeHit\n'
-    '        // и прерванный/брошенный ход — свои ветки, здесь не дублируем.\n'
-    '        if (runProvider === selected && selected && !gotResult && !staleResumeHit && !preempted && !clientDisconnected &&\n'
+    '// Выбранный пользователем вышел без result (ненулевой код, кривой адрес) или\n'
+    '        // с ошибкой без текста (error_during_execution) — уступает обычному пути, как\n'
+    '        // и любой другой его сбой; staleResumeHit и прерванный/брошенный ход — свои\n'
+    '        // ветки, здесь не дублируем.\n'
+    '        if (runProvider === selected && selected && (!gotResult || errorNoText) && !staleResumeHit && !preempted && !clientDisconnected &&\n'
     '            llm.nextStep(plan, planStep, fallbackState) >= 0 &&\n'
     '            llm.mayAdvance({ failed: runProvider, selected, accessFailure: false, sentAnyText: streamedAny, riskyToolUsed })) {\n'
     '          switchHit = true;\n'
-    '          switchWhy = "нет ответа";\n'
+    '          switchWhy = gotResult ? "ошибка без текста" : "нет ответа";\n'
     '          switchText = "";\n'
     '        }\n'
     '        resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, switchHit, switchWhy, switchText, transientAccessLike, sawResult, startedAt: runStartedAt });')

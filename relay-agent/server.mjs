@@ -899,6 +899,10 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
       // провайдер, вышедший без единого result (ненулевой код, кривой адрес),
       // уступает обычному пути так же, как при любом другом его сбое.
       let gotResult = false;
+      // Пришёл result с ошибкой, но без текста (error_during_execution: причина —
+      // в errors[], поля result нет; llm.isErrorWithoutText) — у выбранного тоже
+      // повод уступить ход (child.on("close", …)).
+      let errorNoText = false;
       let transientAccessLike = false;
       let sawResult = false;
       let transientHit = false;
@@ -916,6 +920,9 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
         if (callCtx !== null && callCtx > maxTurnContext) maxTurnContext = callCtx;
         if (ev.type === "result") {
           gotResult = true;
+          // Ошибку без текста ветка `result && ev.result` ниже не видит — у
+          // выбранного это повод уступить ход в close.
+          if (llm.isErrorWithoutText(ev)) errorNoText = true;
           // Потолок шагов. Проверяем ЗДЕСЬ, а не в ветке `result && ev.result`
           // ниже: при error_max_turns CLI не кладёт в result никакого текста,
           // та ветка не срабатывала — и клиент не получал вообще ничего.
@@ -1070,14 +1077,15 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
         }
         const cur = activeChildren.get(sessionId);
         if (cur && cur.child === child) activeChildren.delete(sessionId);
-        // Выбранный пользователем вышел без единого result (ненулевой код, кривой
-        // адрес) — уступает обычному пути, как и любой другой его сбой; staleResumeHit
-        // и прерванный/брошенный ход — свои ветки, здесь не дублируем.
-        if (runProvider === selected && selected && !gotResult && !staleResumeHit && !preempted && !clientDisconnected &&
+        // Выбранный пользователем вышел без result (ненулевой код, кривой адрес) или
+        // с ошибкой без текста (error_during_execution) — уступает обычному пути, как
+        // и любой другой его сбой; staleResumeHit и прерванный/брошенный ход — свои
+        // ветки, здесь не дублируем.
+        if (runProvider === selected && selected && (!gotResult || errorNoText) && !staleResumeHit && !preempted && !clientDisconnected &&
             llm.nextStep(plan, planStep, fallbackState) >= 0 &&
             llm.mayAdvance({ failed: runProvider, selected, accessFailure: false, sentAnyText: streamedAny, riskyToolUsed })) {
           switchHit = true;
-          switchWhy = "нет ответа";
+          switchWhy = gotResult ? "ошибка без текста" : "нет ответа";
           switchText = "";
         }
         resolve({ imageLimitHit, transientHit, maxTurnsHit, staleResumeHit, switchHit, switchWhy, switchText, transientAccessLike, sawResult, startedAt: runStartedAt });

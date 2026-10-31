@@ -152,6 +152,16 @@ export function isAccessFailure(text, { isError = false, apiStatus } = {}) {
 export const NON_RETRY_ACCESS_RE = /\b403\b|forbidden|access.?denied|arrearage/i;
 export const isNonRetryAccess = (text) => NON_RETRY_ACCESS_RE.test(trimmed(text));
 
+/** Событие result с ошибкой, но без текста (например subtype "error_during_execution":
+ *  причина — в errors[], поля result нет). Потолок шагов (error_max_turns) — не сбой.
+ *  Условие `ev.result` (истинность) — то же, что у ветки `ev.type === "result" && ev.result`
+ *  в server.mjs: случаи взаимоисключающие, событие с текстом разбирает та ветка. */
+export function isErrorWithoutText(ev) {
+  if (!ev || ev.type !== "result" || ev.result) return false;
+  if (ev.subtype === "error_max_turns") return false;
+  return ev.is_error === true || (typeof ev.subtype === "string" && ev.subtype !== "success") || !!ev.api_error_status;
+}
+
 // План хода (spec, раздел 3) — как planProviders бэкенда.
 export function planProviders({ selected = "", cfgs, state, noFallback = false, now = Date.now() }) {
   if (noFallback) return ["claude"];
