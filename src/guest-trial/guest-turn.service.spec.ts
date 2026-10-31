@@ -143,7 +143,8 @@ describe('ход гостя: поток', () => {
     await h.turn();
     const [prompt, o] = h.cli.textWithCost.mock.calls[0];
     expect(prompt).toBe('USER: Привет');
-    expect(o).toMatchObject({ model: CHAT_MODEL, noFallback: true });
+    // F1 (приватность транскрипта) и F2 (изолированный cwd) — ревью 31.10.
+    expect(o).toMatchObject({ model: CHAT_MODEL, noFallback: true, noSessionPersistence: true, isolatedCwd: true });
     expect(o.tools).toBeUndefined();
     expect(o.mcpServers).toBeUndefined();
     expect(o.allowedTools).toBeUndefined();

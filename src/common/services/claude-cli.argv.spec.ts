@@ -111,6 +111,28 @@ describe('ClaudeCliService argv: набор тулов', () => {
   });
 });
 
+/**
+ * ПРИВАТНОСТЬ ТРАНСКРИПТА ПРОБЫ БЕЗ ВХОДА (F1, ревью 31.10).
+ *
+ * Без флага claude CLI пишет весь промпт (персона, реплики гостя, ответ) в
+ * ~/.claude/projects/<cwd>/<uuid>.jsonl и хранит cleanupPeriodDays (30 дней
+ * по умолчанию) — дольше, чем обещает политика пробы (7 дней). Флаг работает
+ * только с --print/-p — здесь он есть всегда, поэтому опция ничем не рискует.
+ */
+describe('ClaudeCliService argv: --no-session-persistence (F1)', () => {
+  it('opts.noSessionPersistence — флаг уходит в argv', async () => {
+    spawnMock.mockImplementation(() => fakeProc(OK_JSON));
+    await new ClaudeCliService().text('привет', { noSessionPersistence: true });
+    expect(lastArgs()).toContain('--no-session-persistence');
+  });
+
+  it('без опции флага в argv нет', async () => {
+    spawnMock.mockImplementation(() => fakeProc(OK_JSON));
+    await new ClaudeCliService().text('привет');
+    expect(lastArgs()).not.toContain('--no-session-persistence');
+  });
+});
+
 describe('ClaudeCliService argv: вложения', () => {
   let srcDir: string;
   let attach: string;
@@ -609,5 +631,62 @@ describe('ClaudeCliService: постоянный пустой cwd для выз�
     await svcIn().text('привет');
     expect(seen[0].cwd).toBe(root);
     expect(fs.existsSync(EMPTY())).toBe(false);
+  });
+});
+
+/**
+ * isolatedCwd (F2, ревью 31.10): свой пустой cwd для пробы без входа.
+ *
+ * Гость раньше получал тот же общий os.tmpdir(), что и любой обычный разовый
+ * вызов без MCP — а из cwd CLI сам подхватывает CLAUDE.md и
+ * .claude/settings.json, если их туда положит чужой процесс на той же машине
+ * (ровно то, от чего mcpNeutralCwd/emptyCwdProblem защищает Машу). Опция
+ * переводит такой вызов на тот же проверенный постоянный пустой каталог —
+ * без MCP и без одноразового каталога на каждый ход. Свой корень (tmpRoot),
+ * чтобы не трогать настоящий <tmpdir>/linkeon-claude-empty живого сервиса —
+ * как и в describe выше про постоянный пустой cwd.
+ */
+describe('ClaudeCliService: isolatedCwd (проба без входа, F2)', () => {
+  let root: string;
+  beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'cwd-spec-root-')); });
+  afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
+
+  const svcIn = () => {
+    const svc = new ClaudeCliService();
+    (svc as any).tmpRoot = () => root;
+    return svc;
+  };
+  const EMPTY = () => path.join(root, 'linkeon-claude-empty');
+
+  it('isolatedCwd: true и без cwd — тот же постоянный пустой каталог, что и у MCP', async () => {
+    let cwdAtSpawn = '';
+    spawnMock.mockImplementation((_bin: string, _args: string[], opts: any) => {
+      cwdAtSpawn = opts.cwd;
+      return fakeProc(OK_JSON);
+    });
+    await svcIn().text('привет', { isolatedCwd: true });
+    expect(cwdAtSpawn).toBe(EMPTY());
+  });
+
+  it('без isolatedCwd (обычный разовый вызов) — по-прежнему tmpRoot, постоянный каталог не заводится', async () => {
+    let cwdAtSpawn = '';
+    spawnMock.mockImplementation((_bin: string, _args: string[], opts: any) => {
+      cwdAtSpawn = opts.cwd;
+      return fakeProc(OK_JSON);
+    });
+    await svcIn().text('привет');
+    expect(cwdAtSpawn).toBe(root);
+    expect(fs.existsSync(EMPTY())).toBe(false);
+  });
+
+  it('явный cwd caller-а перекрывает isolatedCwd', async () => {
+    const own = fs.mkdtempSync(path.join(root, 'own-'));
+    let cwdAtSpawn = '';
+    spawnMock.mockImplementation((_bin: string, _args: string[], opts: any) => {
+      cwdAtSpawn = opts.cwd;
+      return fakeProc(OK_JSON);
+    });
+    await svcIn().text('привет', { isolatedCwd: true, cwd: own });
+    expect(cwdAtSpawn).toBe(own);
   });
 });

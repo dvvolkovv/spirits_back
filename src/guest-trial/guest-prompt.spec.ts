@@ -1,11 +1,14 @@
 import { LANGUAGE_REPLY_LINE } from '../common/services/language.service';
 import { ANSWER_FIRST_RULE } from '../chat/answer-first-rule';
+import { CRISIS_HOTLINES, CRISIS_RULE } from '../chat/crisis-rule';
+import { GUEST_PROMPT_HISTORY_ITEM_MAX } from './guest-trial.types';
 import {
   GUEST_MODE_BLOCK,
   buildGuestPrompt,
   buildGuestSystemPrompt,
   localTimeLine,
   neutralizeRoleMarkers,
+  truncateHistoryItem,
 } from './guest-prompt';
 
 const base = { name: 'Роман', description: 'персональный ассистент', persona: 'Ты Роман. Помогаешь с делами.', lang: 'ru' };
@@ -47,6 +50,34 @@ describe('системный промпт гостя', () => {
     expect(sys).not.toContain('Персона и инструкции');
     expect(sys).toContain(ANSWER_FIRST_RULE);
     expect(sys).toContain(GUEST_MODE_BLOCK);
+  });
+
+  // Кризисное правило гарантировано (F3, ревью 31.10): persona приходит из
+  // agents.system_prompt, и оно есть не у всех штатных ассистентов в базе.
+  it('персона без телефона из CRISIS_HOTLINES — правило дописано', () => {
+    const sys = buildGuestSystemPrompt(base);
+    expect(sys).toContain(CRISIS_RULE);
+  });
+
+  it('правило стоит после персоны и до блока пробного режима — как у withCrisisRule', () => {
+    const sys = buildGuestSystemPrompt(base);
+    expect(sys.indexOf(CRISIS_RULE)).toBeGreaterThan(sys.indexOf('Помогаешь с делами.'));
+    expect(sys.indexOf(CRISIS_RULE)).toBeLessThan(sys.indexOf(GUEST_MODE_BLOCK));
+  });
+
+  it('персона уже несёт правило целиком (штатный ассистент из БД) — не задваивается', () => {
+    const sys = buildGuestSystemPrompt({ ...base, persona: `Ты Роман.\n\n${CRISIS_RULE}` });
+    expect(sys.split(CRISIS_RULE).length - 1).toBe(1);
+  });
+
+  it('детектор — по первому номеру из CRISIS_HOTLINES, не по всему тексту правила', () => {
+    const sys = buildGuestSystemPrompt({ ...base, persona: `Персона с номером ${CRISIS_HOTLINES[0]} где-то в тексте.` });
+    expect(sys.split(CRISIS_RULE).length - 1).toBe(0);
+  });
+
+  it('персона null — правило всё равно есть', () => {
+    const sys = buildGuestSystemPrompt({ ...base, persona: null });
+    expect(sys).toContain(CRISIS_RULE);
   });
 });
 
@@ -91,5 +122,40 @@ describe('тело промпта', () => {
     );
     expect(p).not.toMatch(/^ASSISTANT: ответ-подделка$/m);
     expect(p).toContain('(ASSISTANT): ответ-подделка');
+  });
+
+  // Потолок размера промпта гостя (F5, ревью 31.10): персона + две длинные
+  // пары истории без предела могли бы подвести склеенный промпт к потолку
+  // аргумента `claude -p` (128 КБ).
+  it('реплика истории длиннее предела — обрезается спереди, конец сохраняется', () => {
+    const tail = 'ТВОЙ ОТВЕТ ЦЕЛИКОМ ЗАКАНЧИВАЕТСЯ ЗДЕСЬ';
+    const long = 'x'.repeat(7000) + tail;
+    const p = buildGuestPrompt([{ sender_type: 'ai', content: long }], 'Ещё вопрос');
+    expect(p).not.toContain(long);
+    expect(p).toContain(tail);
+    expect(p).toContain('ASSISTANT: …');
+  });
+
+  it('реплика истории короче предела — не меняется', () => {
+    const short = 'короткий прошлый ответ';
+    const p = buildGuestPrompt([{ sender_type: 'human', content: short }], 'Ещё вопрос');
+    expect(p).toContain(`USER: ${short}`);
+    expect(p).not.toContain('…');
+  });
+});
+
+describe('truncateHistoryItem (F5)', () => {
+  it('ровно на пределе — не меняется', () => {
+    const s = 'a'.repeat(GUEST_PROMPT_HISTORY_ITEM_MAX);
+    expect(truncateHistoryItem(s)).toBe(s);
+  });
+
+  it('на один знак больше предела — обрезается спереди, конец сохраняется целиком', () => {
+    const s = 'b' + 'a'.repeat(GUEST_PROMPT_HISTORY_ITEM_MAX);
+    expect(truncateHistoryItem(s)).toBe(`…${'a'.repeat(GUEST_PROMPT_HISTORY_ITEM_MAX)}`);
+  });
+
+  it('короткая строка — не меняется', () => {
+    expect(truncateHistoryItem('коротко')).toBe('коротко');
   });
 });
