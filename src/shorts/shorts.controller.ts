@@ -549,7 +549,10 @@ export class ShortsController {
    * вышел хоть на одной площадке (пост в канале, набор YouTube у владельца),
    * иначе rejected оказался бы ролик с живым постом; версия здесь
    * необязательна, а если пришла — проверяется. Условие — в самом UPDATE, а не
-   * чтением перед ним. Идея — своей записью (rejectIdea).
+   * чтением перед ним. Идея — своей записью (rejectIdea). Типичный случай
+   * устаревшего списка — уже отклонённый при самом чтении (другая вкладка
+   * успела раньше) — отдельным текстом, а не общим перечнем разрешённых
+   * статусов.
    */
   private async reject(id: string, rawVersion: unknown): Promise<ShortVideo> {
     const v = await this.load(id);
@@ -557,6 +560,7 @@ export class ShortsController {
     if (v.status === 'idea') return this.rejectIdea(id, rawVersion);
     const version = this.version(rawVersion, false);
     if (v.status !== 'failed' || !canTransition(v.status, 'rejected')) {
+      if (v.status === 'rejected') throw new ConflictException('Ролик уже отклонён. Обновите список.');
       throw new ConflictException(
         `Отклонить можно идею, упавший, ждущий решения или запланированный ролик; этот — ${STATUS_WORDS[v.status] ?? v.status}. Обновите список.`,
       );
