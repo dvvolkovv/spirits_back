@@ -263,6 +263,9 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     }
   };
 
+  /** Брак, отложенный этим запуском: его уже судила нынешняя сверка, даже если пометка не записалась. */
+  const shelvedNow = new Set<string>();
+
   const reusable = (kind: SkitKind): boolean => {
     const prev = anim.skits[kind];
     return !!prev && prev.fingerprint === plans[kind].fingerprint && prev.post === post && fs.existsSync(abs(prev.clip));
@@ -352,6 +355,7 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
       // Брак откладывается, а не удаляется: после правки сверки студия перепроверит его до новой оплаты (reviveRejected).
       const base = skitFile(kind, `rejected-${new Date().toISOString().replace(/[:.]/g, '-')}`);
       fs.renameSync(raw, abs(`${base}.mp4`));
+      shelvedNow.add(`${base}.mp4`);
       writeRejectedMeta(abs(`${base}.json`), { code, matcher: MATCHER_VERSION, ...speech });
       fs.rmSync(abs(clip), { force: true });
       // И из хранилища: брак, восстановленный следующим захватом, снова прошёл бы
@@ -425,6 +429,8 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     const rejected = fs.readdirSync(dir).filter((f) => /^rejected-.*\.mp4$/.test(f)).sort();
     for (let i = 0; i < rejected.length; i++) {
       const name = rejected[i];
+      // Отложен этим же запуском — нынешняя сверка его уже судила, даже если пометка не записалась.
+      if (shelvedNow.has(skitFile(kind, name))) continue;
       const metaFile = path.join(dir, name.replace(/\.mp4$/, '.json'));
       const meta = readRejectedMeta(metaFile);
       // Эта сверка его уже судила; плохой файл сверка не лечит.
