@@ -36,6 +36,7 @@ const streamAuthFail = lines({ type: 'result', is_error: true, result: 'Failed t
 
 const OK = (result: string, cost = 0.01) => JSON.stringify({ is_error: false, result, total_cost_usd: cost, duration_ms: 5 });
 const QWEN_401 = JSON.stringify({ is_error: true, result: 'Failed to authenticate. API Error: 401 Invalid API-key provided.' });
+const AUTH_FAIL = JSON.stringify({ is_error: true, result: 'Failed to authenticate: OAuth session expired and could not be refreshed' });
 /** Ключ i-го запуска; undefined — запуск Claude. */
 const tokenOf = (i: number) => spawnMock.mock.calls[i][2]?.env?.ANTHROPIC_AUTH_TOKEN as string | undefined;
 const pgMock = () => ({ query: jest.fn().mockResolvedValue({ rows: [] }) });
@@ -134,6 +135,30 @@ describe('ClaudeCliService — общий рубильник', () => {
     expect(s.fallbackStats().providers.qwen).toMatchObject({ ok: 0, failed: 0, downUntil: 0 });
   });
 
+  it('noFallback с provider успешно отвечает — всё равно снимает «не отвечает» у модели (успех закрывает, как и обычный путь)', async () => {
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    spawnMock
+      .mockImplementationOnce(() => fakeProc(QWEN_401, 1)) // 1: личный выбор валит Qwen → «не отвечает»
+      .mockImplementationOnce(() => fakeProc(OK('c1')))     // 1: обычный путь — Claude
+      .mockImplementationOnce(() => fakeProc(OK('q2')));    // 2: ход гостя (noFallback) — Qwen отвечает
+    const s = svc();
+    await s.text('1', { provider: 'qwen' });
+    expect(s.fallbackStats().providers.qwen.downUntil).toBeGreaterThan(0);
+    expect(await s.text('2', { provider: 'qwen', noFallback: true })).toBe('q2');
+    expect(s.fallbackStats().providers.qwen.downUntil).toBe(0);
+  });
+
+  it('noFallback с provider — отказ текстом («Not logged in») не трогает окно модели, downUntil остаётся 0', async () => {
+    spawnMock.mockImplementationOnce(() => fakeProc(OK('Not logged in')));
+    const s = svc();
+    // Отказ CLI, пришедший обычным ответом (без is_error), при одной попытке в
+    // плане возвращается как есть — тот же текст, что получал бы вызывающий и
+    // раньше (claude-cli.fallback.spec.ts, «без ключа — вызывающий получает
+    // тот же текст»); decision B здесь — именно про downUntil, не про throw.
+    expect(await s.text('x', { provider: 'qwen', noFallback: true })).toBe('Not logged in');
+    expect(s.fallbackStats().providers.qwen.downUntil).toBe(0);
+  });
+
   it('noFallback с provider kimi без ключа — Claude, один запуск', async () => {
     delete process.env.KIMI_FALLBACK_API_KEY;
     jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
@@ -179,7 +204,7 @@ describe('ClaudeCliService — общий рубильник', () => {
     expect(keyWarnings.length).toBe(1);
   });
 
-  it('личный выбор Kimi без ключа — предупреждение НЕ ограничено по частоте (на него смотрят другие тесты)', async () => {
+  it('личный выбор Kimi без ключа — предупреждение не ограничено по частоте: он редкий (ручная правка карточки)', async () => {
     delete process.env.KIMI_FALLBACK_API_KEY;
     const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     spawnMock.mockImplementationOnce(() => fakeProc(OK('c1'))).mockImplementationOnce(() => fakeProc(OK('c2')));
@@ -241,6 +266,13 @@ describe('ClaudeCliService — providerChoice', () => {
     const err = await new ClaudeCliService().text('x', { provider: 'qwen', providerChoice: 'global', noFallback: true }).catch((e) => e);
     expect(err.message).toMatch(/^qwen \(для всех\): .*401/);
   });
+
+  it("providerChoice мусор — трактуется как 'user', в событие как есть не уходит", async () => {
+    const pg = pgMock();
+    spawnMock.mockImplementationOnce(() => fakeProc(OK('q')));
+    expect(await new ClaudeCliService(pg as any).text('x', { provider: 'qwen', providerChoice: 'garbage' as any, noFallback: true })).toBe('q');
+    expect(event(pg)).toMatchObject({ provider: 'qwen', selected: 'qwen', choice: 'user' });
+  });
 });
 
 describe('ClaudeCliService — рубильник уважает окно «не отвечает» (respectDown)', () => {
@@ -256,6 +288,19 @@ describe('ClaudeCliService — рубильник уважает окно «не
     expect(await s.text('2')).toBe('c2');
     expect(spawnMock).toHaveBeenCalledTimes(3); // не 4 — рубильник не тронул Qwen повторно
     expect(tokenOf(2)).toBeUndefined();
+  });
+
+  it('пропуск виден в тексте ошибки, если дальше тоже никто не ответил', async () => {
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    delete process.env.KIMI_FALLBACK_API_KEY; // без Kimi: после пропуска Qwen в плане только Claude
+    spawnMock
+      .mockImplementationOnce(() => fakeProc(QWEN_401, 1)) // 1: личный выбор qwen падает
+      .mockImplementationOnce(() => fakeProc(OK('c1')))     // 1: обычный путь — Claude
+      .mockImplementationOnce(() => fakeProc(AUTH_FAIL, 1)); // 2: рубильник пропускает Qwen, Claude тоже падает
+    const s = svc(undefined, sw('qwen'));
+    await s.text('1', { provider: 'qwen' });
+    const err = await s.text('2').catch((e) => e);
+    expect(err.message).toMatch(/^qwen \(для всех\) пропущен: не отвечает \| claude fallback: /);
   });
 });
 
@@ -286,13 +331,13 @@ describe('ClaudeCliService — DI рубильника', () => {
 });
 
 describe('ClaudeCliService — гонка с сервисом рубильника', () => {
-  it('A ждёт ответ рубильника; параллельный B (provider claude) валит Claude и открывает окно; рубильник отвечает qwen — A идёт прямо в Qwen', async () => {
+  it('A ждёт ответ рубильника (claude); параллельный B (provider claude) валит Claude и открывает окно; план A строится ПОСЛЕ ответа — Qwen первым, не Claude (устаревший план запустил бы Claude)', async () => {
     jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
-    let resolveSwitch: ((p: 'qwen') => void) | undefined;
-    const global = { get: jest.fn(() => new Promise<'qwen'>((res) => { resolveSwitch = res; })) };
+    let resolveSwitch: ((p: 'claude') => void) | undefined;
+    const global = { get: jest.fn(() => new Promise<'claude'>((res) => { resolveSwitch = res; })) };
     spawnMock
       .mockImplementationOnce(() => fakeProc(streamAuthFail, 1)) // B: Claude падает → окно
-      .mockImplementationOnce(() => fakeProc(OK('qA')));          // A: рубильник ответил qwen
+      .mockImplementationOnce(() => fakeProc(OK('qA')));          // A: план [qwen, kimi] — Qwen первый
     const s = svc(undefined, global);
     const pA = s.text('A');
     expect(spawnMock).toHaveBeenCalledTimes(0); // A висит на get() рубильника, ничего не спавнило
@@ -300,8 +345,12 @@ describe('ClaudeCliService — гонка с сервисом рубильник
     // сам (mayRetry запрещает повтор) и не забрал мок, предназначенный A.
     await expect(s.text('B', { provider: 'claude', onTextDelta: () => {} })).rejects.toThrow(/Failed to authenticate/);
     expect(s.fallbackStats().breakerOpenUntil).toBeGreaterThan(0); // B открыл окно Claude
-    resolveSwitch!('qwen');
+    resolveSwitch!('claude');
     expect(await pA).toBe('qA');
+    // Рубильник ответил 'claude' — без выбора план целиком строится через
+    // normal(), которая смотрит на claudeWindowOpen() В МОМЕНТ построения, а
+    // не до await: план, собранный по состоянию ДО открытия окна B, начался
+    // бы с Claude (без env) — tokenOf(1) было бы undefined.
     expect(tokenOf(1)).toBe('sk-sp-test');
   });
 });
