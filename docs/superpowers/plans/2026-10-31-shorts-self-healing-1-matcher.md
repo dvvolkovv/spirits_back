@@ -159,7 +159,8 @@ import { MATCH_THRESHOLD, sameWord, speechCheck, speechWords } from './match';
 ```ts
 test('одно слово с точностью до окончания: общее начало от 5 букв, у меньшего за ним — не больше 2', () => {
   // «спокойно»/«спокоен», «подпишу»/«подписывай» — на границе: общее начало ровно 5, у меньшего за ним ровно 2.
-  for (const [a, b] of [['начинай', 'начинаешь'], ['убедил', 'убедила'], ['период', 'периода'], ['ладно', 'ладно'], ['спокойно', 'спокоен'], ['подпишу', 'подписывай']]) {
+  // «мой»/«мой» — короткие слова сходятся только точно.
+  for (const [a, b] of [['начинай', 'начинаешь'], ['убедил', 'убедила'], ['период', 'периода'], ['ладно', 'ладно'], ['спокойно', 'спокоен'], ['подпишу', 'подписывай'], ['мой', 'мой']]) {
     assert.equal(sameWord(a, b), true, `${a} ≈ ${b}`);
     assert.equal(sameWord(b, a), true, `${b} ≈ ${a}`);
   }
@@ -182,6 +183,8 @@ test('эхо другой реплики в иной форме не скрыв�
   assert.deepEqual(speechCheck(lines, 'ничего не начинай сиди тихо ладно').silentLines, [1]);
   // Обе реплики сказаны, SpeechKit записал «начинаю» как «начинай» — клип годен.
   assert.equal(speechCheck(lines, 'ничего не начинай сиди тихо ладно начинай').ok, true);
+  // Пара по окончанию — своя у каждой реплики: «начинаешь» засчитан первой, вторую не закрывает.
+  assert.deepEqual(speechCheck(['Ничего не начинай!', 'Ладно. Начинай.'], 'ничего не начинаешь ладно').silentLines, [1]);
 });
 
 test('одно услышанное слово засчитывается за одно слово реплики — и по окончанию тоже', () => {
@@ -434,7 +437,7 @@ studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts"
 
 Ожидается: `ℹ fail 2` — оба новых теста (`metas.length` 0 вместо 1).
 
-- [ ] **Step 3: Тип пометки и чтение**
+- [ ] **Step 3: Тип пометки**
 
 В `studio/src/animate/run-animate.ts` заменить импорт
 
@@ -465,17 +468,9 @@ export interface RejectedMeta {
   heard?: string;
   share?: number;
 }
-
-/** Пометка брака; нет файла или он битый — брак до пометок (до 31.10.2026): причина и сверка неизвестны. */
-function readRejectedMeta(file: string): Partial<RejectedMeta> {
-  try {
-    const m = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<RejectedMeta> | null;
-    return m && typeof m === 'object' ? m : {};
-  } catch {
-    return {};
-  }
-}
 ```
+
+(Чтение пометки — `readRejectedMeta` — появляется в задаче 4 вместе с её единственным потребителем.)
 
 - [ ] **Step 4: Запись пометки**
 
@@ -649,7 +644,22 @@ studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts"
 
 Тест «уже судила, и плохой файл» проходит и без перепроверки — он держит её от лишней работы.
 
-- [ ] **Step 3: Функция `reviveRejected`**
+- [ ] **Step 3: Чтение пометки и функция `reviveRejected`**
+
+В `studio/src/animate/run-animate.ts` сразу после `interface RejectedMeta { … }` (задача 3) вставить:
+
+```ts
+
+/** Пометка брака; нет файла или он битый — брак до пометок (до 31.10.2026): причина и сверка неизвестны. */
+function readRejectedMeta(file: string): Partial<RejectedMeta> {
+  try {
+    const m = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<RejectedMeta> | null;
+    return m && typeof m === 'object' ? m : {};
+  } catch {
+    return {};
+  }
+}
+```
 
 В `animateRun`, сразу перед строкой `const assertBudget = (): void => {`, вставить:
 
