@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { VideoService } from './video.service';
-import { computeVeoQuote, computeVeoConcatQuote, needsVeoConcat } from './video.dto';
+import { computeVeoQuote, computeVeoConcatQuote, needsVeoConcat, buildsVeoByConcat } from './video.dto';
 
 /**
  * Конвейер видео на Gemini Omni (Veo 3.1 Google закрыл 22.10.2026).
@@ -11,6 +11,12 @@ import { computeVeoQuote, computeVeoConcatQuote, needsVeoConcat } from './video.
  * готовый шаг приходит прямо в ответе опроса, а цепочка ограничена 40 с.
  * Решения владельца от 24.10.2026: тариф Standard слит с Fast; горизонталь,
  * которой не хватает 40 с, собирается склейкой по цене N × база.
+ *
+ * 01.11.2026 Google сломал продление: любой шаг с previous_interaction_id
+ * сразу падает INVALID_ARGUMENT («Missing/unsupported mime_type in video
+ * content» в синхронном вызове) — на любом ролике, из DE и из FI. Пока так,
+ * горизонталь длиннее 8 с тоже собирается склейкой, но по прежней цене цепочки
+ * и в 720p, как цепочка: цена для человека не меняется.
  */
 
 describe('тарифы и выбор склейки', () => {
@@ -33,6 +39,18 @@ describe('тарифы и выбор склейки', () => {
     ['16:9', 60, true],
   ] as const)('%s, %i с → склейка: %s', (aspect, sec, expected) => {
     expect(needsVeoConcat(aspect, sec)).toBe(expected);
+  });
+
+  it.each([
+    ['9:16', 8, false],
+    ['9:16', 9, true],
+    ['16:9', 8, false],
+    ['16:9', 9, true],     // продление Omni сломано — склейка, а не цепочка
+    ['16:9', 20, true],
+    ['16:9', 36, true],
+    ['16:9', 48, true],
+  ] as const)('сборка: %s, %i с → склейка: %s', (aspect, sec, expected) => {
+    expect(buildsVeoByConcat(aspect, sec)).toBe(expected);
   });
 });
 
@@ -81,18 +99,44 @@ describe('createJob на Omni', () => {
     expect(startGenerate).toHaveBeenCalledWith(expect.objectContaining({ durationSeconds: 8, aspectRatio: '16:9', resolution: '1080p' }));
   });
 
-  it('горизонталь 16 с — цепочка: база 8 с в 720p, id шага уходит в задачу', async () => {
-    const startGenerate = jest.fn(async () => 'v1_base');
+  it('горизонталь 16 с — склейка двух клипов по 8 с в 720p по цене цепочки', async () => {
+    const startGenerate = jest.fn(async () => 'v1_clip0');
     const { svc, queries } = makeService({ startGenerate });
-    await svc.createJob('u1', { mode: 'text2video', prompt: 'Видео: офис, человек говорит в камеру', aspectRatio: '16:9', targetDurationSec: 16 });
+    await svc.createJob('u1', { mode: 'text2video', prompt: 'Видео: офис, человек говорит в камеру', aspectRatio: '16:9', targetDurationSec: 16, resolution: '1080p' });
 
     const plan = insertedPlan(queries);
-    expect(plan.veo_concat).toBe(false);
-    expect(plan.segments_total).toBe(3);   // 8 + 7 = 15 < 16 → два продления
-    expect(plan.veo_last_interaction_id).toBeNull();
+    expect(plan.veo_concat).toBe(true);
+    expect(plan.segments_total).toBe(2);
+    expect(plan.veo_resolution).toBe('720p');
+    expect(charged(queries)).toBe(computeVeoQuote('veo-3.1-fast', 16).totalCost);
     expect(startGenerate).toHaveBeenCalledWith(expect.objectContaining({ durationSeconds: 8, aspectRatio: '16:9', resolution: '720p' }));
     const started = queries.find((q) => /SET kling_task_id=\$1, status='processing'/.test(q.sql));
-    expect(started?.params).toEqual(['v1_base', 'job-1']);
+    expect(started?.params).toEqual(['v1_clip0', 'job-1']);
+  });
+
+  it('горизонталь 20 с (жалоба 01.11) — три клипа, цена прежняя: 216 000', async () => {
+    const startGenerate = jest.fn(async () => 'v1_clip0');
+    const { svc, queries } = makeService({ startGenerate });
+    await svc.createJob('u1', { mode: 'text2video', prompt: 'Видео: первобытный человек высекает искру в пещере', aspectRatio: '16:9', targetDurationSec: 20 });
+
+    const plan = insertedPlan(queries);
+    expect(plan.veo_concat).toBe(true);
+    expect(plan.segments_total).toBe(3);
+    expect(charged(queries)).toBe(216_000);
+  });
+
+  it.each([
+    ['16:9', 20],
+    ['9:16', 16],
+  ] as const)('склейка %s, %i с без реплики в кавычках — описание сцены в каждом клипе', async (aspectRatio, targetDurationSec) => {
+    const startGenerate = jest.fn(async () => 'v1_clip0');
+    const { svc, queries } = makeService({ startGenerate });
+    const scene = 'Видео: первобытный человек высекает искру кремнём в тёмной пещере, крупный план';
+    await svc.createJob('u1', { mode: 'text2video', prompt: scene, aspectRatio, targetDurationSec });
+
+    const prompts: string[] = insertedPlan(queries).veo_segment_prompts;
+    expect(prompts.length).toBeGreaterThan(1);
+    for (const p of prompts) expect(p).toContain('первобытный человек высекает искру');
   });
 });
 
@@ -145,6 +189,30 @@ describe('опрос цепочки продлений', () => {
     await svc.pollVeoJob(chainJob({ segments_done: 1, veo_last_interaction_id: 'v1_base' }, 'v1_ext'));
 
     expect(svc.storeVeoFinal).toHaveBeenCalledWith('job-1', mp4, 15);
+  });
+
+  it('отказ продления (INVALID_ARGUMENT) — сбой продления у Google, а не «фильтр контента»', async () => {
+    const getOperation = jest.fn(async () => ({
+      done: true, video: null, code: 'INVALID_ARGUMENT',
+      error: 'Omni отклонил запрос — чаще всего это фильтр контента (узнаваемые люди, дети на фото, запрещённые темы); переформулируйте описание. There was a problem processing your request.',
+    }));
+    const { svc } = makeService({ getOperation });
+    svc.failAndRefund = jest.fn(async () => undefined);
+    await svc.pollVeoJob(chainJob({ segments_done: 1, veo_last_interaction_id: 'v1_base' }, 'v1_ext'));
+
+    const reason = String((svc.failAndRefund as jest.Mock).mock.calls[0][3]);
+    expect(reason).not.toMatch(/фильтр/);
+    expect(reason).toMatch(/продлить/);
+  });
+
+  it('отказ первого шага (INVALID_ARGUMENT) — подсказка про фильтр остаётся', async () => {
+    const error = 'Omni отклонил запрос — чаще всего это фильтр контента; переформулируйте описание. There was a problem processing your request.';
+    const getOperation = jest.fn(async () => ({ done: true, video: null, code: 'INVALID_ARGUMENT', error }));
+    const { svc } = makeService({ getOperation });
+    svc.failAndRefund = jest.fn(async () => undefined);
+    await svc.pollVeoJob(chainJob({}, 'v1_base'));
+
+    expect(String((svc.failAndRefund as jest.Mock).mock.calls[0][3])).toContain('фильтр контента');
   });
 
   it('внутренняя ошибка Omni — повтор шага, а не провал задачи', async () => {
