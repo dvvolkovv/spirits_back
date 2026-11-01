@@ -49,6 +49,7 @@ import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
 import { CHAT_MODEL, PROBE_MODEL } from '../common/chat-model';
 import { sendTelegramAlert } from '../common/telegram-alert';
 import { RELAY_TURN_BUDGET_MS } from '../common/relay-budget';
+import { neutralizeAtMentions } from '../common/agent-guards';
 // Agent server at r.linkeon.io (remote Claude Code)
 
 /** Файл в папке сессии, как его отдаёт relay (`GET /session/:sid/files`). */
@@ -2725,8 +2726,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
     const FormData = require('form-data');
     const fd = new FormData();
-    fd.append('message', prompt);
-    if (stablePrefix) fd.append('systemPrompt', stablePrefix);
+    const outboundPrompt = opts.testMode === true ? neutralizeAtMentions(prompt) : prompt;
+    const outboundStablePrefix = opts.testMode === true ? neutralizeAtMentions(stablePrefix) : stablePrefix;
+    fd.append('message', outboundPrompt);
+    if (outboundStablePrefix) fd.append('systemPrompt', outboundStablePrefix);
     // sessionIdOverride — для синтетических проб: изолированная сессия, чтобы не
     // коллидить с реальной сессией юзера/другими пробами (r.linkeon отдаёт пустой
     // поток при конкурентном обращении к ЗАНЯТОЙ сессии — инцидент 2026-07-12).

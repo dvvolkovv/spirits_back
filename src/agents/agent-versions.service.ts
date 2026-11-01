@@ -164,6 +164,9 @@ export class AgentVersionsService implements OnModuleInit {
     message: string,
     sessionId?: string,
   ): Promise<{ text: string; session_id: string; tokens: number }> {
+    if (sessionId !== undefined && typeof sessionId !== 'string') {
+      throw new BadRequestException('Invalid agent test session');
+    }
     const version = await this.getVersion(agentId, versionId);
     const text = typeof message === 'string' ? message.trim() : '';
     if (!text) {
