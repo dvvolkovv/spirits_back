@@ -861,8 +861,13 @@ export const MAX_SPEECH_MISSES = 2;
 
 /** Клип забракован сверкой речи: что услышано и какие реплики молчат — для отзыва сценаристу. */
 class SpeechMismatchError extends StudioError {
-  constructor(message: string, readonly heard: string, readonly silentLines: number[]) {
+  readonly heard: string;
+  readonly silentLines: number[];
+
+  constructor(message: string, heard: string, silentLines: number[]) {
     super('speech_mismatch', message, true);
+    this.heard = heard;
+    this.silentLines = silentLines;
   }
 }
 ```
