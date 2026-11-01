@@ -1,4 +1,4 @@
-const { spawnSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -17,7 +17,7 @@ function executable(file, content) {
   write(file, content, 0o755);
 }
 
-function runRollout(health) {
+function runRollout(health, options = {}) {
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'deploy-relay-drain-'));
   const home = path.join(work, 'home');
   const live = path.join(home, 'file-agent');
@@ -25,6 +25,7 @@ function runRollout(health) {
   const base = path.join(home, 'base');
   const bin = path.join(work, 'bin');
   const drainFile = path.join(work, 'drain.marker');
+  const lockFile = options.lockFile || path.join(work, 'deployment.lock');
   const baseServer = 'import "./helper.mjs";\nconsole.log("base");\n';
   const targetServer = 'import "./helper.mjs";\nconsole.log("target");\n';
   const helper = 'export const ok = true;\n';
@@ -58,55 +59,92 @@ if [[ "$1" == log ]]; then echo rollout-commit; exit 0; fi
 exit 0
 `);
   executable(path.join(bin, 'curl'), `#!/usr/bin/env bash
+if [[ -n "$PAUSE_FILE" && ! -e "$WORK/health.started" ]]; then
+  touch "$WORK/health.started"
+  while [[ ! -e "$PAUSE_FILE" ]]; do /bin/sleep 0.05; done
+fi
 restarts=$(wc -l < "$WORK/restarts.log" 2>/dev/null || echo 0)
 if [[ -e "$DRAIN_FILE" ]]; then gate=yes; else gate=no; fi
 echo "curl restart=$restarts gate=$gate" >> "$WORK/curl.log"
 case "${health}" in
-  target-fails) [[ "$restarts" -ge 2 ]] && { echo '{"status":"ok"}'; exit 0; }; exit 1 ;;
+  inflight-then-zero)
+    calls=$(cat "$WORK/inflight-calls" 2>/dev/null || echo 0)
+    calls=$((calls + 1))
+    echo "$calls" > "$WORK/inflight-calls"
+    if [[ "$calls" -eq 1 ]]; then echo '{"status":"ok","inflight":1}'; else echo '{"status":"ok","inflight":0}'; fi
+    exit 0 ;;
+  target-fails) [[ "$restarts" -ge 2 ]] && { echo '{"status":"ok","inflight":0}'; exit 0; }; exit 1 ;;
   all-fail) exit 1 ;;
-  *) echo '{"status":"ok"}'; exit 0 ;;
+  *) echo '{"status":"ok","inflight":0}'; exit 0 ;;
 esac
 `);
   executable(path.join(bin, 'sleep'), '#!/usr/bin/env bash\nexit 0\n');
 
   const harness = path.join(work, 'remote.sh');
   write(harness, remote[1]);
-  const result = spawnSync('bash', [...(process.env.DEBUG_ROLLOUT ? ['-x'] : []), harness], {
-    encoding: 'utf8',
-    env: {
-      ...process.env,
-      HOME: home,
-      WORK: work,
-      PATH: `${bin}:${process.env.PATH}`,
-      STAGE: 'stage',
-      BASE_DIR: 'base',
-      TARGET_SHORT: 'target123',
-      FILES_CSV: 'server.mjs',
-      PUT_CSV: 'server.mjs',
-      DEL_CSV: '',
-      ADD_CSV: '',
-      DRAIN_FILE: drainFile,
-      DRAIN_WAIT_SECONDS: '1',
-    },
-  });
-  if (process.env.DEBUG_ROLLOUT) {
-    console.error({
-      stdout: result.stdout,
-      stderr: result.stderr,
+  const env = {
+    ...process.env,
+    HOME: home,
+    WORK: work,
+    PATH: `${bin}:${process.env.PATH}`,
+    STAGE: 'stage',
+    BASE_DIR: 'base',
+    TARGET_SHORT: 'target123',
+    FILES_CSV: 'server.mjs',
+    PUT_CSV: 'server.mjs',
+    DEL_CSV: '',
+    ADD_CSV: '',
+    DRAIN_FILE: drainFile,
+    DRAIN_WAIT_SECONDS: '1',
+    LOCK_FILE: lockFile,
+    PAUSE_FILE: options.pauseFile || '',
+  };
+  const finish = (result) => {
+    if (process.env.DEBUG_ROLLOUT) {
+      console.error({
+        stdout: result.stdout,
+        stderr: result.stderr,
+        restarts: fs.existsSync(path.join(work, 'restarts.log')) ? fs.readFileSync(path.join(work, 'restarts.log'), 'utf8') : '',
+        curls: fs.existsSync(path.join(work, 'curl.log')) ? fs.readFileSync(path.join(work, 'curl.log'), 'utf8') : '',
+      });
+    }
+    return {
+      ...result,
+      work,
+      lockFile,
+      drainFile,
+      liveServer: fs.readFileSync(path.join(live, 'server.mjs'), 'utf8'),
       restarts: fs.existsSync(path.join(work, 'restarts.log')) ? fs.readFileSync(path.join(work, 'restarts.log'), 'utf8') : '',
       curls: fs.existsSync(path.join(work, 'curl.log')) ? fs.readFileSync(path.join(work, 'curl.log'), 'utf8') : '',
-    });
-  }
-  return {
-    ...result,
-    work,
-    drainFile,
-    liveServer: fs.readFileSync(path.join(live, 'server.mjs'), 'utf8'),
-    restarts: fs.existsSync(path.join(work, 'restarts.log')) ? fs.readFileSync(path.join(work, 'restarts.log'), 'utf8') : '',
-    curls: fs.existsSync(path.join(work, 'curl.log')) ? fs.readFileSync(path.join(work, 'curl.log'), 'utf8') : '',
-    drainExists: fs.existsSync(drainFile),
-    cleanup: () => fs.rmSync(work, { recursive: true, force: true }),
+      drainExists: fs.existsSync(drainFile),
+      cleanup: () => fs.rmSync(work, { recursive: true, force: true }),
+    };
   };
+  const args = [...(process.env.DEBUG_ROLLOUT ? ['-x'] : []), harness];
+  if (options.async) {
+    const child = spawn('bash', args, { env });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    return {
+      work,
+      lockFile,
+      done: new Promise((resolve, reject) => {
+        child.on('error', reject);
+        child.on('close', (status) => resolve(finish({ status, stdout, stderr })));
+      }),
+    };
+  }
+  return finish(spawnSync('bash', args, { encoding: 'utf8', env }));
+}
+
+async function waitFor(predicate, timeoutMs = 5000) {
+  const started = Date.now();
+  while (!predicate()) {
+    if (Date.now() - started > timeoutMs) throw new Error('timed out waiting for rollout');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
 }
 
 describe('deploy-relay drain/admission gate', () => {
@@ -147,5 +185,44 @@ describe('deploy-relay drain/admission gate', () => {
     } finally {
       r.cleanup();
     }
+  });
+
+  it('ждёт и in-flight counter, и PM2 children до replacement/restart', () => {
+    const r = runRollout('inflight-then-zero');
+    try {
+      expect(r.status).toBe(0);
+      expect(r.curls.trim().split('\n')).toHaveLength(2);
+      expect(r.curls).toContain('restart=0 gate=yes');
+      expect(r.liveServer).toContain('target');
+      expect(r.drainExists).toBe(false);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it('второй overlapping rollout не меняет marker/files и ждёт первый flock', async () => {
+    const sharedLock = path.join(os.tmpdir(), `relay-lock-${process.pid}-${Date.now()}`);
+    const release = path.join(os.tmpdir(), `relay-release-${process.pid}-${Date.now()}`);
+    const first = runRollout('ok', { async: true, pauseFile: release, lockFile: sharedLock });
+    let second;
+    let firstResult;
+    try {
+      await waitFor(() => fs.existsSync(path.join(first.work, 'health.started')));
+      second = runRollout('ok', { lockFile: sharedLock });
+      expect(second.status).not.toBe(0);
+      expect(second.liveServer).toContain('base');
+      expect(second.liveServer).not.toContain('target');
+      expect(second.drainExists).toBe(false);
+    } finally {
+      write(release, 'release\n');
+      firstResult = await first.done;
+      firstResult.cleanup();
+      second?.cleanup();
+      fs.rmSync(sharedLock, { force: true });
+      fs.rmSync(release, { force: true });
+    }
+    expect(firstResult.status).toBe(0);
+    expect(firstResult.liveServer).toContain('target');
+    expect(firstResult.drainExists).toBe(false);
   });
 });
