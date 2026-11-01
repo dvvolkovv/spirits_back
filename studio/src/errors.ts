@@ -26,6 +26,7 @@ export type StudioErrorCode =
   | 'no_input'
   | 'keyframe'
   | 'omni_rejected'
+  | 'omni_bad_request'
   | 'omni_failed'
   | 'omni_budget'
   | 'omni_timeout'

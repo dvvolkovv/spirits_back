@@ -48,7 +48,7 @@ export interface ImageInput {
  * запущен — секунды Omni можно вернуть. После прочих сбоев запуска (5xx,
  * потерянный ответ) генерация могла начаться и будет оплачена.
  */
-export const CLEAR_REFUSALS: ReadonlySet<StudioErrorCode> = new Set<StudioErrorCode>(['google_quota', 'google_auth', 'model_gone', 'omni_rejected']);
+export const CLEAR_REFUSALS: ReadonlySet<StudioErrorCode> = new Set<StudioErrorCode>(['google_quota', 'google_auth', 'model_gone', 'omni_rejected', 'omni_bad_request']);
 
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const headers = (d: GoogleDeps) => ({ 'x-goog-api-key': d.apiKey, 'Content-Type': 'application/json' });
@@ -226,8 +226,9 @@ export async function startClip(d: GoogleDeps, prompt: string, image: ImageInput
   }
   if (!r.ok) {
     const err = googleHttpError('omni', r.status, r.raw, d.apiKey);
-    // Прочие 4xx при запуске (413, 400 не про фильтр) — тоже явный отказ: генерация не начиналась, секунды вернутся.
-    if (err.code === 'omni_failed' && r.status >= 400 && r.status < 500 && r.status !== 408) throw new StudioError('omni_rejected', err.message, true);
+    // Прочие 4xx при запуске (413, 409, 422, 400 не про фильтр) — тоже явный отказ: генерация не начиналась, секунды вернутся.
+    // Свой код, не omni_rejected: это ошибка запроса, а не текста сценки, — сценаристу её не отдают (run-animate.ts, toWriter).
+    if (err.code === 'omni_failed' && r.status >= 400 && r.status < 500 && r.status !== 408) throw new StudioError('omni_bad_request', err.message, true);
     throw err;
   }
   let id: unknown;

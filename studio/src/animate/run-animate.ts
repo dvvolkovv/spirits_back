@@ -489,25 +489,31 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
 
   /** Пояснение сценаристу (writer_feedback): какая сценка, что не так, что переписать. */
   const writerText = (kind: SkitKind, fb: Omit<SkitFeedback, 'kind'>): string => {
+    const keep = 'место, начало и героев не меняй.';
+    if (fb.code === 'omni_rejected') {
+      return `${SCENE[kind]}: фильтр Google не пропускает клип (${fb.reason ?? 'причина не названа'}). Перепиши реплики и действие этой сценки — без того, что фильтр мог принять за насилие, оружие, травму или непристойность; ${keep}`;
+    }
     const lines = plans[kind].skit.lines;
-    const what =
-      fb.code === 'speech_mismatch'
-        ? `${MAX_SPEECH_MISSES} клипа с этими репликами не прошли сверку речи; в последнем ${
-            fb.lines.length
-              ? `не услышаны: ${fb.lines.map((n) => `реплика ${n} (${lines[n - 1]?.hero ?? '?'}) «${lines[n - 1]?.text ?? ''}»`).join(', ')}`
-              : 'речь не сошлась с репликами'
-          }, услышано: «${(fb.heard ?? '').slice(0, 200)}»`
-        : `фильтр Google ${MAX_SKIT_ATTEMPTS} раза не пропустил клип (${fb.reason ?? 'причина не названа'})`;
-    return `${SCENE[kind]}: ${what}. Перепиши реплики и действие этой сценки — короче и проще, обычными словами; пока герой говорит, ничто не закрывает ему рот; место, начало и героев не меняй.`;
+    const silent = fb.lines.length
+      ? `не услышаны: ${fb.lines.map((n) => `реплика ${n} (${lines[n - 1]?.hero ?? '?'}) «${lines[n - 1]?.text ?? ''}»`).join(', ')}`
+      : 'речь не сошлась с репликами';
+    const heard = fb.heard?.trim() ? `услышано: «${fb.heard.slice(0, 200)}»` : 'речь не распознана';
+    return `${SCENE[kind]}: ${MAX_SPEECH_MISSES} клипа с этими репликами не прошли сверку речи; в последнем ${silent}, ${heard}. Перепиши реплики и действие этой сценки — короче и проще, обычными словами; пока герой говорит, ничто не закрывает ему рот; ${keep}`;
   };
 
   /**
    * Сценку не снять с этими репликами — сценаристу. Переписанную сценку снимут заново:
-   * нужен хотя бы один клип в пределе секунд; места нет — omni_budget (assertBudget),
-   * без круга сценариста.
+   * нужен хотя бы один клип в пределе секунд; места нет — omni_budget с причиной
+   * пересъёмки, без круга сценариста.
    */
   const toWriter = (kind: SkitKind, fb: Omit<SkitFeedback, 'kind'>, message: string): SkitFeedbackError => {
-    assertBudget();
+    try {
+      assertBudget();
+    } catch (e) {
+      // Не только «предел»: владелец должен видеть, почему понадобилась пересъёмка.
+      const err = toStudioError(e);
+      throw new StudioError(err.code, `${message}; переписанную сценку снять не на что — ${err.message}`, err.retryable);
+    }
     return new SkitFeedbackError({ kind, ...fb }, writerText(kind, fb), message);
   };
 
@@ -603,9 +609,11 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
         codes.push(err.code);
         if (!err.retryable) throw err;
         // Два клипа с этим текстом не прошли сверку речи — промахи на одном тексте повторяются:
-        // сценаристу, а не третий клип (брак из перепроверки сюда не попадает — он судится в reviveRejected).
+        // сценаристу, а не третий клип. Брак из перепроверки судится в reviveRejected и сюда не
+        // попадает — разве что его выгрузка сорвалась: тогда следующий запуск судит его здесь,
+        // как клип этого текста.
         if (e instanceof SpeechMismatchError && ++speechMisses >= MAX_SPEECH_MISSES) {
-          throw toWriter(kind, { code: 'speech_mismatch', lines: e.silentLines.map((i) => i + 1), heard: e.heard, reason: null }, `${err.message} — ${MAX_SPEECH_MISSES} клипа с этим текстом не прошли сверку`);
+          throw toWriter(kind, { code: 'speech_mismatch', lines: e.silentLines.map((i) => i + 1), heard: e.heard, reason: null }, `${err.message} — ${MAX_SPEECH_MISSES} клипа с этим текстом не прошли сверку (${codes.join(', ')})`);
         }
         // Кадр не перерисовывается и после отказа фильтра: по кадру конфликта уже
         // могла быть нарисована развязка, и новый кадр развёл бы место и костюмы сценок.
@@ -614,6 +622,7 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     }
     const summary = `${last!.message} — после ${MAX_SKIT_ATTEMPTS} попыток (${codes.join(', ')})`;
     // Фильтр Google так и не пропустил клип — причина в тексте сценки, а не в удаче: сценаристу.
+    // Отказ запроса (omni_bad_request: 413, 422…) сценарист не исправит — это обычный сбой.
     if (last!.code === 'omni_rejected') throw toWriter(kind, { code: 'omni_rejected', lines: [], heard: null, reason: last!.message }, summary);
     throw new StudioError(last!.code, summary, false);
   };
