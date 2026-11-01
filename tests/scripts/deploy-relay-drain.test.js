@@ -73,8 +73,12 @@ case "${health}" in
     echo "$calls" > "$WORK/inflight-calls"
     if [[ "$calls" -eq 1 ]]; then echo '{"status":"ok","inflight":1}'; else echo '{"status":"ok","inflight":0}'; fi
     exit 0 ;;
-  target-fails) [[ "$restarts" -ge 2 ]] && { echo '{"status":"ok","inflight":0}'; exit 0; }; exit 1 ;;
-  all-fail) exit 1 ;;
+  target-fails)
+    if [[ "$restarts" -eq 0 || "$restarts" -ge 2 ]]; then echo '{"status":"ok","inflight":0}'; exit 0; fi
+    exit 1 ;;
+  all-fail)
+    if [[ "$restarts" -eq 0 ]]; then echo '{"status":"ok","inflight":0}'; exit 0; fi
+    exit 1 ;;
   *) echo '{"status":"ok","inflight":0}'; exit 0 ;;
 esac
 `);
