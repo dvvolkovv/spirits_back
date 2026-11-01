@@ -12,9 +12,13 @@ maybe('legacy agent upsert against real PostgreSQL', () => {
   let admin: Pool;
   let pool: Pool;
 
-  function makeService() {
+  function makeService(afterQuery?: (sql: string) => Promise<void>) {
     const pg = {
-      query: (sql: string, params?: any[]) => pool.query(sql, params),
+      query: async (sql: string, params?: any[]) => {
+        const result = await pool.query(sql, params);
+        if (afterQuery) await afterQuery(sql);
+        return result;
+      },
       getClient: () => pool.connect(),
     };
     const versions = new AgentVersionsService(pg as any, {} as any);
@@ -101,8 +105,17 @@ maybe('legacy agent upsert against real PostgreSQL', () => {
   });
 
   it('serializes concurrent creates of the same new name without unique errors', async () => {
-    const first = makeService().agents;
-    const second = makeService().agents;
+    let lookups = 0;
+    let releaseLookups!: () => void;
+    const bothLookedUp = new Promise<void>((resolve) => (releaseLookups = resolve));
+    const afterQuery = async (sql: string) => {
+      if (!/FROM agents WHERE name = \$1/i.test(sql)) return;
+      lookups += 1;
+      if (lookups === 2) releaseLookups();
+      await bothLookedUp;
+    };
+    const first = makeService(afterQuery).agents;
+    const second = makeService(afterQuery).agents;
 
     const results = await Promise.all([
       first.upsertAgent({ name: 'shared-agent', system_prompt: 'first', description: 'first' }, 'first-admin'),
