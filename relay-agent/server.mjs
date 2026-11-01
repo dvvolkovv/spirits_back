@@ -13,8 +13,12 @@ import { RUN_ENV, runTag, finishedRun, reap } from "./proc-reaper.mjs";
 import { costBaseline, runCost } from "./turn-cost.mjs";
 import { createUndelivered, withCarried } from "./undelivered-files.mjs";
 import { createRelayAuth } from "./relay-auth.mjs";
+import { agentTestMode, cliToolArgs } from "./agent-test-mode.mjs";
+import { createDrainGate } from "./drain-gate.mjs";
+import { createInflight } from "./inflight.mjs";
 
 const app = express();
+const chatInflight = createInflight();
 const PORT = 3033;
 const UPLOAD_DIR = "/tmp/agent-uploads";
 const OUTPUT_DIR = "/tmp/agent-output";
@@ -385,8 +389,9 @@ const PRODUCTS_PROMPT = `
 Когда его звать, сказано в инструкциях ассистента ниже. НЕ передавай в него userId/телефон.
 `;
 
-app.post("/chat", upload.array("files", 10), (req, res) => {
+app.post("/chat", chatInflight.middleware, createDrainGate(), upload.array("files", 10), (req, res) => {
   const { message, sessionId: reqSessionId } = req.body;
+  const reqTestMode = agentTestMode(req.body);
   // Модель хода. По умолчанию "default" (рекомендуемая CLI — сейчас Opus 5).
   // Бэкенд просит "haiku" для пингов мониторинга: smoke и synthetic-runner
   // проверяют живость пути, а не качество ответа, а обвязка Claude Code
@@ -552,7 +557,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
   // пользователя). Временный файл убирается по завершении запроса (см. finally
   // ниже). Любая осечка — безопасный откат к базовому конфигу.
   let mcpConfigPath = BASE_MCP_PATH;
-  let allowedTools = "Bash(*),Read(*),Write(*),Edit(*),Glob(*),Grep(*),WebSearch(*),WebFetch(*),mcp__linkeon__generate_image,mcp__linkeon__edit_image,mcp__linkeon__compose_image,mcp__linkeon__upscale_image,mcp__linkeon__generate_video,mcp__linkeon__generate_banner,mcp__linkeon__manage_routine,mcp__linkeon__propose_calendar_event,mcp__linkeon__generate_speech,mcp__linkeon__read_calendar,mcp__linkeon__calculate_human_design";
+  let allowedTools = reqTestMode ? "" : "Bash(*),Read(*),Write(*),Edit(*),Glob(*),Grep(*),WebSearch(*),WebFetch(*),mcp__linkeon__generate_image,mcp__linkeon__edit_image,mcp__linkeon__compose_image,mcp__linkeon__upscale_image,mcp__linkeon__generate_video,mcp__linkeon__generate_banner,mcp__linkeon__manage_routine,mcp__linkeon__propose_calendar_event,mcp__linkeon__generate_speech,mcp__linkeon__read_calendar,mcp__linkeon__calculate_human_design";
   let systemPrompt = SYSTEM_PROMPT;
   let sessionMcpPath = null;
   // Set when the agent uses a TalerID *write* tool this request. The transient
@@ -612,7 +617,7 @@ app.post("/chat", upload.array("files", 10), (req, res) => {
     "--verbose",
     "--include-partial-messages",
     "--max-turns", "40",
-    "--allowedTools", allowedTools,
+    ...cliToolArgs(reqTestMode, allowedTools),
     "--disallowedTools", "mcp__plugin_telegram_telegram__reply,mcp__plugin_telegram_telegram__react,mcp__plugin_telegram_telegram__edit_message,mcp__plugin_telegram_telegram__download_attachment,ToolSearch",
     "--mcp-config", mcpConfigPath,
     "--strict-mcp-config",
@@ -1288,7 +1293,7 @@ app.get("/health", (req, res) => {
   // fallback — окна и исходы по всем запасным; qwen — прежнее поле для монитора
   // бэкенда, пока не выкачен новый (llm-fallback.mjs, legacyQwenHealth).
   const fb = fallbackState.stats(llm.readProviderConfigs());
-  res.json({ status: "ok", sessions: sessionMap.size, uptime: process.uptime(), fallback: fb, qwen: llm.legacyQwenHealth(fb) });
+  res.json({ status: "ok", sessions: sessionMap.size, inflight: chatInflight.count(), uptime: process.uptime(), fallback: fb, qwen: llm.legacyQwenHealth(fb) });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
