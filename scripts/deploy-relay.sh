@@ -111,9 +111,9 @@ restore_previous() {
       mv ".$file.rollback.tmp" "$file"
     done
   fi
-  grep -ohE 'from "\./[^"]+"' *.mjs | cut -d'"' -f2 | sort -u | while read -r module; do
+  while read -r module; do
     [[ -f "$module" ]] || { echo "При откате нет локального импорта $module" >&2; exit 1; }
-  done
+  done < <(grep -ohE 'from "\./[^"]+"' *.mjs | cut -d'"' -f2 | sort -u)
   git add -A -- "${FILES[@]}"
   git commit -q -m "rollback relay-agent к $BASE_DIR"
   pm2 restart file-agent >/dev/null
@@ -208,9 +208,9 @@ if [[ -n "$DEL_CSV" ]]; then
   done
 fi
 
-grep -ohE 'from "\./[^"]+"' *.mjs | cut -d'"' -f2 | sort -u | while read -r module; do
+while read -r module; do
   [[ -f "$module" ]] || { echo "После замены нет локального импорта $module" >&2; exit 1; }
-done
+done < <(grep -ohE 'from "\./[^"]+"' *.mjs | cut -d'"' -f2 | sort -u)
 
 git add -A -- "${FILES[@]}"
 git commit -q -m "relay-agent из spirits_back $TARGET_SHORT"
