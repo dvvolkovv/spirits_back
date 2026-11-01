@@ -97,6 +97,7 @@ export async function explainRefusal(
  * пока решали, ролик мог уйти в публикацию. «Переснять» вышедшего отправил бы
  * новую версию только в YouTube, «Отклонить» — сделал бы rejected ролик с
  * живым постом.
+ * Новый круг: самопочинки доктора считаются заново (auto_recoveries = 0).
  */
 export async function leaveReview(
   pg: SlotQueryable,
@@ -107,7 +108,7 @@ export async function leaveReview(
   const params: any[] = [id, target, LEAVE_FROM];
   const clause = versionClause(params, version);
   const r = await pg.query(
-    `UPDATE short_video SET status = $2, approved_at = NULL, attempts = 0, lease_until = NULL, last_error = NULL, updated_at = now()
+    `UPDATE short_video SET status = $2, approved_at = NULL, attempts = 0, lease_until = NULL, last_error = NULL, auto_recoveries = 0, updated_at = now()
       WHERE id = $1 AND status = ANY($3::text[])
         AND NOT ${RELEASED_SQL}${clause}
       RETURNING *`,
@@ -120,7 +121,7 @@ export async function leaveReview(
 /**
  * Замечание к ролику на проверке: дописывается к прежним (appendOwnerNote) и
  * уводит ролик к сценаристу. writer_rounds = 0 — новый круг владельца, счётчик
- * автоматических переписок студии заново.
+ * автоматических переписок студии заново. Самопочинки доктора — тоже (auto_recoveries = 0).
  */
 export async function noteForReview(
   pg: SlotQueryable,
@@ -132,7 +133,7 @@ export async function noteForReview(
   const clause = versionClause(params, version);
   const r = await pg.query(
     `UPDATE short_video
-        SET owner_note = $2, status = 'writing', writer_rounds = 0, attempts = 0,
+        SET owner_note = $2, status = 'writing', writer_rounds = 0, attempts = 0, auto_recoveries = 0,
             lease_until = NULL, last_error = NULL, updated_at = now()
       WHERE id = $1 AND status = 'pending_review'${clause}
       RETURNING *`,

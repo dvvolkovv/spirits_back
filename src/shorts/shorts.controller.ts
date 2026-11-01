@@ -393,6 +393,9 @@ export class ShortsController {
    * владелец переключает формат на «Только чат» и повторяет с писателя — ролик
    * собирается без сценок. Без `from` формат прежний: этап повторяется как был.
    *
+   * Кнопка владельца начинает новый круг: самопочинки доктора считаются заново
+   * (auto_recoveries = 0), история (recoveries) остаётся.
+   *
    * Повтор публикации — только у ролика, который владелец одобрял, сразу (слот —
    * «сейчас») и только по упавшим площадкам: вышедшие не трогаются. Запись — с
    * условием на `failed_from`: цель выбрана по прочитанной неудаче, и путь
@@ -425,8 +428,8 @@ export class ShortsController {
     return inTransaction(this.pg, async (tx) => {
       const r = await tx.query(
         `UPDATE short_video
-            SET status = $2, attempts = 0, lease_until = NULL, last_error = NULL, failed_from = NULL,
-                failure_notified = false, writer_rounds = 0, owner_note = COALESCE($4::text, owner_note),
+            SET status = $2, attempts = 0, lease_until = NULL, last_error = NULL, failed_from = NULL, failed_code = NULL,
+                failure_notified = false, writer_rounds = 0, auto_recoveries = 0, owner_note = COALESCE($4::text, owner_note),
                 format = COALESCE($5::text, format),
                 writer_feedback = CASE WHEN $4::text IS NULL THEN writer_feedback ELSE NULL END,
                 skit_feedback = CASE WHEN $4::text IS NULL THEN skit_feedback ELSE NULL END,
