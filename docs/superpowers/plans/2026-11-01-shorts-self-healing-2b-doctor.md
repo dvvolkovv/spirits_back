@@ -2245,6 +2245,77 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts src/tg-bot 2>&1 |
 
 Ожидается: `Tests:` без `failed`, `TSC_OK`.
 
+- [ ] **Step 5 (попутно): подпись — только текущий круг; шапка в пределе Telegram; журнал доктора со счётчиком (ревью задачи 9)**
+
+Ревью задач 8 и 9: тест подписи не отличал текущий круг от всей истории — а после «Переснять» старая запись «без сценок» остаётся в истории, и подпись ролика со сценками сказала бы «Собран без сценок». Шапка подписи (уходит одна, если подписи не помещаются) больше не в пределе по построению: строке «Сам восстанавливался» хватит 150 знаков (реальный максимум — около 104). Строка журнала «не берётся» потеряла счётчик круга (источник правды о круге). Живой redo не проверял записанный формат.
+
+`src/shorts/shorts-approval.service.spec.ts`, в `describe('отправка владельцу', …)`:
+
+```ts
+    it('подпись — только текущий круг: прошлый «без сценок» (до «Переснять») не попадает', async () => {
+      const recoveries = [
+        { at: '2030-01-01T06:00:00.000Z', from: 'animating', code: 'omni_budget', action: 'no_skits', reason: 'прошлый круг' },
+        { at: '2030-01-01T08:00:00.000Z', from: 'animating', code: 'google_quota', action: 'later', delayMin: 30, reason: 'оживление: лимит' },
+      ];
+      const v = fresh({ auto_recoveries: 1, recoveries });
+      const { svc, tg } = setup(v);
+      await svc.sendForReview(rowToShort(v), LEASE);
+      const caption = (tg.sendVideo.mock.calls[0] as any[])[2].caption;
+      expect(caption).toContain('Сам восстанавливался: повтор через 30 мин (google_quota)');
+      expect(caption).not.toContain('Собран без сценок');
+      expect(caption).not.toContain('прошлый круг');
+      const none = fresh({ auto_recoveries: 0, recoveries });
+      const s0 = setup(none);
+      await s0.svc.sendForReview(rowToShort(none), LEASE);
+      expect((s0.tg.sendVideo.mock.calls[0] as any[])[2].caption).not.toMatch(/Сам восстанавливался|Собран без сценок/);
+    });
+```
+
+`src/shorts/short-captions.spec.ts`: импорт `TG_CAPTION_MAX` (в существующий импорт из `./short-captions`); после теста `'самопочинки круга и «без сценок» — строками шапки перед «Выйдет»; …'`:
+
+```ts
+  it('шапка со всеми строками на пределах обрезки — в пределе подписи Telegram, «Выйдет» на месте', () => {
+    const long = (n: number) => 'я'.repeat(n);
+    const captions = { telegram: long(2000), vk: 'VK', youtube: { title: 'T', description: 'D', tags: [] } };
+    // Сценки и «без сценок» вместе не бывают: у формата chat сценарий без сценок.
+    const withSkits = buildReviewCaption({
+      ...base, question: long(400), captions, selfHealed: long(500),
+      skits: { cast: long(300), animation: { omniSeconds: 48, keyframes: 2, skits: {} }, maxOmniSeconds: 48 },
+    });
+    const noSkits = buildReviewCaption({ ...base, question: long(400), captions, selfHealed: long(500), noSkitsReason: long(500) });
+    for (const { caption, extra } of [withSkits, noSkits]) {
+      expect(extra).not.toBeNull();
+      expect(caption.length).toBeLessThanOrEqual(TG_CAPTION_MAX);
+      expect(caption).toContain('Выйдет: завтра в 18:00 МСК');
+    }
+  });
+```
+
+`src/shorts/shorts.integration.spec.ts`, в тесте `'redo (admin «Переснять») вышедшего ролика — отказ даже с верной версией; …'` после последней строки `expect(res.body.status).toBe('directing');` добавить `expect(res.body.format).toBe('skit');` (формат — из настроек заглушки, на настоящем Postgres).
+
+```bash
+git add src/shorts/shorts-approval.service.spec.ts src/shorts/short-captions.spec.ts src/shorts/shorts.integration.spec.ts
+git commit -m "test(shorts): подпись — только текущий круг; шапка в пределе Telegram; живой «Переснять» пишет формат (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-captions.spec.ts src/shorts/shorts-approval.service.spec.ts 2>&1 | grep -E '✕|Tests:'"
+```
+
+Ожидается: `Tests: 1 failed` — тест длины шапки (сейчас `clip(…, 300)`: со сценками шапка ≈ 1037 знаков); тест текущего круга и живой формат — сторожа, зелёные.
+
+`src/shorts/short-captions.ts`: `` ...(i.selfHealed ? [`Сам восстанавливался: ${clip(i.selfHealed, 300)}`] : []), `` → `` ...(i.selfHealed ? [`Сам восстанавливался: ${clip(i.selfHealed, 150)}`] : []), `` (в круге не больше трёх записей — около 104 знаков; запас держит шапку в пределе подписи).
+
+`src/shorts/shorts-doctor.service.ts`:
+
+- в строке «не берётся» `круг: ${recoveryWords(currentCircle(v)) || 'пусто'}` → `круг ${v.autoRecoveries}: ${recoveryWords(currentCircle(v)) || 'пусто'}` (счётчик — источник правды о круге: при расхождении с историей «исчерпан» не прочитается как «пусто»);
+- строку `` this.logger.log(`ролик ${v.id}: сам — ${recoveryWords([rec])} (${v.failedFrom})`); `` → `` this.logger.log(`ролик ${v.id}: сам — ${recoveryWords([rec])}, этап ${v.failedFrom}`); ``.
+
+```bash
+git add src/shorts/short-captions.ts src/shorts/shorts-doctor.service.ts
+git commit -m "fix(shorts): «Сам восстанавливался» — до 150 знаков, шапка в пределе подписи; журнал доктора со счётчиком круга" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts 2>&1 | grep -E '✕|^Tests:'; SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts 2>&1 | grep -E '✕|^Tests:'"
+```
+
+Ожидается: оба `Tests:` без `failed`.
+
 ---
 
 ### Task 10: Кабинет — история самопочинок в карточке ролика
