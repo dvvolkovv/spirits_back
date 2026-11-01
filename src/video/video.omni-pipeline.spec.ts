@@ -138,6 +138,20 @@ describe('createJob на Omni', () => {
     expect(prompts.length).toBeGreaterThan(1);
     for (const p of prompts) expect(p).toContain('первобытный человек высекает искру');
   });
+
+  it('склейка: реплика без кавычек звучит один раз — со второго клипа речь запрещена', async () => {
+    const startGenerate = jest.fn(async () => 'v1_clip0');
+    const { svc, queries } = makeService({ startGenerate });
+    await svc.createJob('u1', {
+      mode: 'text2video', aspectRatio: '16:9', targetDurationSec: 20,
+      prompt: 'Девушка в офисе говорит в камеру: Привет, я Аня, расскажу о Linkeon',
+    });
+
+    const [first, ...rest] = insertedPlan(queries).veo_segment_prompts as string[];
+    expect(first).not.toMatch(/no new dialogue/);
+    expect(rest.length).toBe(2);
+    for (const p of rest) expect(p).toMatch(/no new dialogue, and do not repeat any earlier spoken words/);
+  });
 });
 
 function chainJob(plan: any, klingTaskId: string | null) {
@@ -238,6 +252,16 @@ describe('опрос склейки', () => {
   afterEach(() => {
     if (savedPublic === undefined) delete process.env.PUBLIC_DIR; else process.env.PUBLIC_DIR = savedPublic;
     fs.rmSync(publicRoot, { recursive: true, force: true });
+  });
+
+  it('провал склейки — уже готовые клипы убираются с диска', async () => {
+    const { svc } = makeService({});
+    const dir = path.join(publicRoot, 'videos', '_veoconcat', 'job-1');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'seg_00.mp4'), 'clip-0');
+    await svc.failAndRefund('job-1', 'u1', 216_000, 'veo: Omni отклонил запрос');
+
+    expect(fs.existsSync(dir)).toBe(false);
   });
 
   it('готовый клип ложится в part-файл байтами из ответа', async () => {
