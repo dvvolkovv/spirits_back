@@ -230,11 +230,6 @@ export interface ShortSkitClip {
 }
 
 /**
- * Итог задания animate (зеркало ShortAnimation в studio/src/types.ts): секунды
- * Omni и кадры — счёт денег ролика со всеми попытками, сценки — частично
- * заполненные, `pending` — запущенные, но не скачанные генерации.
- */
-/**
  * Отзыв студии о сценке, которую Omni не снять с этими репликами (skit_feedback):
  * одну и ту же реплику дважды не услышали или фильтр Google трижды отказал.
  * Сценарист переписывает реплики и действие только этой сценки. Зеркало SkitFeedback
@@ -251,6 +246,11 @@ export interface ShortSkitFeedback {
   reason: string | null;
 }
 
+/**
+ * Итог задания animate (зеркало ShortAnimation в studio/src/types.ts): секунды
+ * Omni и кадры — счёт денег ролика со всеми попытками, сценки — частично
+ * заполненные, `pending` — запущенные, но не скачанные генерации.
+ */
 export interface ShortAnimation {
   omniSeconds: number;
   keyframes?: number;
