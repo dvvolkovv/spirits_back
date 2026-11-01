@@ -128,23 +128,26 @@ export class AgentVersionsService implements OnModuleInit {
     published: AgentVersion | null;
     draft: AgentVersion | null;
   }> {
-    const publishedResult = await this.pg.query(
-      `SELECT * FROM agent_versions
-       WHERE agent_id = $1 AND status = 'published'`,
+    const result = await this.pg.query(
+      `SELECT
+         (SELECT row_to_json(published)
+          FROM (
+            SELECT * FROM agent_versions
+            WHERE agent_id = $1 AND status = 'published'
+          ) published) AS published,
+         (SELECT row_to_json(draft)
+          FROM (
+            SELECT * FROM agent_versions
+            WHERE agent_id = $1 AND status = 'draft'
+            ORDER BY version DESC
+            LIMIT 1
+          ) draft) AS draft`,
       [agentId],
     );
-    const draftResult = await this.pg.query(
-      `SELECT * FROM agent_versions
-       WHERE agent_id = $1 AND status = 'draft'
-       ORDER BY version DESC
-       LIMIT 1`,
-      [agentId],
-    );
+    const state = result.rows[0];
     return {
-      published: publishedResult.rows[0]
-        ? toAgentVersion(publishedResult.rows[0])
-        : null,
-      draft: draftResult.rows[0] ? toAgentVersion(draftResult.rows[0]) : null,
+      published: state.published ? toAgentVersion(state.published) : null,
+      draft: state.draft ? toAgentVersion(state.draft) : null,
     };
   }
 
@@ -161,8 +164,16 @@ export class AgentVersionsService implements OnModuleInit {
 
     const client = await this.pg.getClient();
     let committed = false;
+    let destroyClient = false;
     try {
       await client.query('BEGIN');
+      const agentResult = await client.query(
+        'SELECT id FROM agents WHERE id = $1 FOR UPDATE',
+        [agentId],
+      );
+      if (!agentResult.rows[0]) {
+        throw new NotFoundException('Agent not found');
+      }
       const currentResult = await client.query(
         `SELECT * FROM agent_versions
          WHERE agent_id = $1 AND status = 'published'
@@ -200,11 +211,16 @@ export class AgentVersionsService implements OnModuleInit {
       return toAgentVersion(publishedResult.rows[0]);
     } catch (e) {
       if (!committed) {
-        await client.query('ROLLBACK').catch(() => undefined);
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          destroyClient = true;
+        }
       }
       throw e;
     } finally {
-      client.release();
+      if (destroyClient) client.release(true);
+      else client.release();
     }
   }
 
