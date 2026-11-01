@@ -46,13 +46,14 @@ type Rule = HealAction | 'later_then_no_skits' | 'never';
 function ruleFor(from: ShortStatus | null, code: string | null): Rule {
   // Публикация — никогда: риск двойного поста, у неё свой разбор. no_input — настройка или данные, нужен человек.
   if (!from || from === 'publishing' || code === 'no_input') return 'never';
+  // Этап, с которого «Повторить» не продолжит (RESUME_FROM), — к владельцу при любом коде.
+  if (!retryTarget({ status: 'failed', failedFrom: from, approvedAt: null })) return 'never';
   if (from === 'directing' && code === 'no_assistant') return 'never';
   if (code && NEW_SCENE[from]?.includes(code)) return 'new_scene';
   if (code && NO_SKITS[from]?.includes(code)) return 'no_skits';
   if (code && LATER.includes(code)) return from === 'animating' ? 'later_then_no_skits' : 'later';
   // Сбои Omni, Google и распознавания — повтор, а исчерпан — без сценок. Незнакомый код — тоже «позже».
-  if (from === 'animating') return 'later_then_no_skits';
-  return retryTarget({ status: 'failed', failedFrom: from, approvedAt: null }) ? 'later' : 'never';
+  return from === 'animating' ? 'later_then_no_skits' : 'later';
 }
 
 /** Текущий круг — последние autoRecoveries записей истории; не записи (ручной SQL, мусор) отбрасываются. */
@@ -87,6 +88,8 @@ export function prescribe(
       // (решение владельца: сценки не удались — собрать без сценок).
       return total === MAX_AUTO_RECOVERIES - 1 ? noSkits() : later() ?? noSkits();
     case 'new_scene':
+      // Оживление на последнем действии круга — без сценок: новой сцене (пять этапов) круга уже не хватит.
+      if (animating && total === MAX_AUTO_RECOVERIES - 1) return noSkits();
       if (allowed('new_scene')) return { action: 'new_scene' };
       // Новая сцена круга израсходована: у оживления — без сценок, у прочих этапов — к владельцу.
       return animating ? noSkits() : { action: 'never' };
