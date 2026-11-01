@@ -79,6 +79,7 @@ case "${health}" in
   all-fail)
     if [[ "$restarts" -eq 0 ]]; then echo '{"status":"ok","inflight":0}'; exit 0; fi
     exit 1 ;;
+  legacy) echo '{"status":"ok"}'; exit 0 ;;
   *) echo '{"status":"ok","inflight":0}'; exit 0 ;;
 esac
 `);
@@ -197,6 +198,17 @@ describe('deploy-relay drain/admission gate', () => {
       expect(r.status).toBe(0);
       expect(r.curls.trim().split('\n')).toHaveLength(3);
       expect(r.curls.match(/restart=0 gate=yes/g) || []).toHaveLength(2);
+      expect(r.liveServer).toContain('target');
+      expect(r.drainExists).toBe(false);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it('принимает legacy health без inflight при первом обновлении релея', () => {
+    const r = runRollout('legacy');
+    try {
+      expect(r.status).toBe(0);
       expect(r.liveServer).toContain('target');
       expect(r.drainExists).toBe(false);
     } finally {
