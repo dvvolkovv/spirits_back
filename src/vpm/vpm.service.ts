@@ -447,10 +447,14 @@ export class VpmService implements OnModuleInit {
         // фоном и редко, поэтому автодаунгрейд на Sonnet при упоре в недельный
         // лимит лучше, чем упавший прогон.
         model: 'default',
-        // Occasional reasoning run, not a hot path. Headroom over observed
-        // latency (now much lower once the CLI stopped auto-loading the 40KB
-        // project CLAUDE.md — see ClaudeCliService — but keep margin).
-        timeoutMs: 360_000,
+        // Редкий фоновый прогон, не горячий путь — запас по времени дешевле
+        // упавшего прогона. 600 с, а не 360: проверка 01.11.2026 через общий
+        // рубильник модели — на Qwen ответ пришёл за 253 с из 360, а у
+        // симметричного маркетолога (vmm.service) на том же Qwen — за 359 с из
+        // 360. Запуск ручной, из админки, синхронным HTTP-запросом: nginx прода
+        // держит /webhook/ 900 с, и 600 с плюс по минуте на повтор у запасных
+        // (fallbackTimeoutMs) в него укладываются. Крона у ВПМ нет.
+        timeoutMs: 600_000,
       });
       text = r.text;
       costUsd = r.costUsd;

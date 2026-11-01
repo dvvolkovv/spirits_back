@@ -172,6 +172,30 @@ export function needsVeoConcat(aspectRatio: '16:9' | '9:16', targetDurationSec: 
   const extendCount = Math.ceil(Math.max(0, targetDurationSec - VEO_BASE_SEC) / VEO_EXTEND_SEC);
   return VEO_BASE_SEC + extendCount * VEO_EXTEND_SEC > OMNI_MAX_CHAIN_SEC;
 }
+
+/**
+ * Работает ли у Omni продление (previous_interaction_id).
+ *
+ * 01.11.2026 Google его сломал: шаг продления сразу падает INVALID_ARGUMENT
+ * «There was a problem processing your request», синхронный вызов называет
+ * причину — «Missing/unsupported mime_type in video content» (у сохранённого
+ * Google ролика нет mime_type). Проверено на нейтральном ролике без людей, с
+ * прода (DE) и с тест-ноды (FI), при любом формате и длине шага; 24.10 та же
+ * цепочка работала. Обход «передать ролик явно + task 'extend'» в ЕЭЗ режется
+ * как content_blocked. Включать обратно — после пробы с ключа прода: база 4 с
+ * и продление 4 с (отказ Google не тарифицирует, база ~$0,4).
+ */
+export const OMNI_EXTEND_WORKS = false;
+
+/**
+ * Собирать ли ролик склейкой — способ сборки, а не цена: цену задаёт
+ * needsVeoConcat. Пока продление сломано, горизонталь длиннее 8 с тоже
+ * собирается из независимых 8с-клипов, а платит человек прежнюю цену цепочки.
+ */
+export function buildsVeoByConcat(aspectRatio: '16:9' | '9:16', targetDurationSec: number): boolean {
+  return needsVeoConcat(aspectRatio, targetDurationSec)
+    || (!OMNI_EXTEND_WORKS && targetDurationSec > VEO_BASE_SEC);
+}
 export interface VeoQuote {
   tier: 'fast' | 'standard';
   segments: number;        // 1 base + N extends

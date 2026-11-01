@@ -3,7 +3,7 @@
  *
  * Раньше там был общий список последних 20 транзакций. У активного человека
  * это 20 списаний за ответы ассистента подряд, и пополнения в него просто не
- * попадают: у 79035281880 их 13 против 912 списаний. Вопрос «когда и на что
+ * попадают: у 70005550001 их 13 против 912 списаний. Вопрос «когда и на что
  * пополнялся» из админки не решался вообще — я отвечал на него запросами в
  * psql.
  *
@@ -26,7 +26,7 @@ function makePg(topupRows: any[], totalsRows: any[]) {
       seen.push(flat);
 
       if (/FROM ai_profiles_consolidated a/i.test(flat)) {
-        return { rows: [{ phone: '79035281880', balance: 865046, registered_at: new Date(), profile_data: {} }] };
+        return { rows: [{ phone: '70005550001', balance: 865046, registered_at: new Date(), profile_data: {} }] };
       }
       if (/FROM token_transactions t/i.test(flat) && /LIMIT 100/.test(flat)) {
         return { rows: topupRows };
@@ -69,7 +69,7 @@ describe('AdminService.getUserActivity — блок пополнений', () =>
 
   it('отдаёт пополнения отдельным списком, без списаний', async () => {
     const pg = makePg(rows, totals);
-    const data: any = await service(pg).getUserActivity('79035281880', {});
+    const data: any = await service(pg).getUserActivity('70005550001', {});
 
     expect(data.topups).toHaveLength(3);
     const creditsQuery = pg.seen.find((s: string) => /FROM token_transactions t/i.test(s) && /LIMIT 100/.test(s));
@@ -77,20 +77,20 @@ describe('AdminService.getUserActivity — блок пополнений', () =>
   });
 
   it('купон показывает кодом, а удалённый — честно без кода', async () => {
-    const data: any = await service(makePg(rows, totals)).getUserActivity('79035281880', {});
+    const data: any = await service(makePg(rows, totals)).getUserActivity('70005550001', {});
 
     expect(data.topups[1]).toMatchObject({ type: 'coupon', couponCode: 'MARKETAUGUST26' });
     expect(data.topups[2]).toMatchObject({ type: 'coupon', couponCode: null, couponId: 4 });
   });
 
   it('у покупки видна рублёвая сумма и провайдер', async () => {
-    const data: any = await service(makePg(rows, totals)).getUserActivity('79035281880', {});
+    const data: any = await service(makePg(rows, totals)).getUserActivity('70005550001', {});
 
     expect(data.topups[0]).toMatchObject({ type: 'purchase', rub: 1990, provider: 'yookassa', packageId: 'premium' });
   });
 
   it('остаток у восстановленных строк — null, а не ноль из базы', async () => {
-    const data: any = await service(makePg(rows, totals)).getUserActivity('79035281880', {});
+    const data: any = await service(makePg(rows, totals)).getUserActivity('70005550001', {});
 
     expect(data.topups[0].balanceAfter).toBeNull();
     expect(data.topups[2].balanceAfter).toBeNull();
@@ -98,7 +98,7 @@ describe('AdminService.getUserActivity — блок пополнений', () =>
   });
 
   it('считает итоги по видам пополнений', async () => {
-    const data: any = await service(makePg(rows, totals)).getUserActivity('79035281880', {});
+    const data: any = await service(makePg(rows, totals)).getUserActivity('70005550001', {});
 
     expect(data.topupTotals).toEqual(
       expect.arrayContaining([
@@ -109,7 +109,7 @@ describe('AdminService.getUserActivity — блок пополнений', () =>
   });
 
   it('пустая история не роняет карточку', async () => {
-    const data: any = await service(makePg([], [])).getUserActivity('79035281880', {});
+    const data: any = await service(makePg([], [])).getUserActivity('70005550001', {});
 
     expect(data.topups).toEqual([]);
     expect(data.topupTotals).toEqual([]);

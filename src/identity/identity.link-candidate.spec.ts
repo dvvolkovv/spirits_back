@@ -6,7 +6,7 @@ import { IdentityService } from './identity.service';
  * Вход по почте/OAuth не должен молча заводить второй аккаунт человеку,
  * который уже зарегистрирован по телефону.
  *
- * Инцидент 19.09.2026: victoria-337@mail.ru вписала почту в профиль
+ * Инцидент 19.09.2026: maria.testova@example.org вписала почту в профиль
  * (ai_profiles_consolidated.email), вошла по magic link — и получила новый
  * UUID-аккаунт с отдельным приветственным бонусом. resolveOrCreate искал
  * совпадение только в user_identities, куда профильная почта не попадает.
@@ -30,7 +30,7 @@ class FakePg {
 
 /**
  * Пустая база + один телефонный аккаунт, у которого в профиле указана почта.
- * Ровно конфигурация Victoria на утро 19.09.2026.
+ * Ровно конфигурация Марии Тестовой на утро 19.09.2026.
  */
 function pgWithProfileEmailOwner(opts: { loginable?: boolean } = {}) {
   const { loginable = true } = opts;
@@ -41,7 +41,7 @@ function pgWithProfileEmailOwner(opts: { loginable?: boolean } = {}) {
     // поиск кандидата по профильной почте
     if (/JOIN ai_profiles_consolidated/i.test(sql)) {
       return loginable
-        ? { rows: [{ internal_id: '79275527425', primary_phone: '79275527425' }] }
+        ? { rows: [{ internal_id: '70005550009', primary_phone: '70005550009' }] }
         : { rows: [] };
     }
     if (/INSERT INTO user_id\b/i.test(sql)) return { rows: [{ internal_id: 'new-uuid' }] };
@@ -54,10 +54,10 @@ describe('resolveOrCreate — кандидат на привязку вмест�
     const pg = pgWithProfileEmailOwner();
     const svc = new IdentityService(pg as any);
 
-    const r = await svc.resolveOrCreate('email', { email: 'victoria-337@mail.ru' });
+    const r = await svc.resolveOrCreate('email', { email: 'maria.testova@example.org' });
 
     expect(r.status).toBe('link_required');
-    expect(r).toMatchObject({ candidateUserId: '79275527425' });
+    expect(r).toMatchObject({ candidateUserId: '70005550009' });
     // Главное утверждение теста: второй аккаунт НЕ заведён.
     expect(pg.createdUser).toBe(false);
   });
@@ -66,13 +66,13 @@ describe('resolveOrCreate — кандидат на привязку вмест�
     const pg = pgWithProfileEmailOwner();
     const svc = new IdentityService(pg as any);
 
-    const r: any = await svc.resolveOrCreate('email', { email: 'victoria-337@mail.ru' });
+    const r: any = await svc.resolveOrCreate('email', { email: 'maria.testova@example.org' });
 
-    expect(r.phoneHint).toContain('7425');
+    expect(r.phoneHint).toContain('0009');
     // Ложно-зелёный здесь стоил бы утечки: проверяем, что середина номера
     // действительно не видна, а не только что хвост на месте.
-    expect(r.phoneHint).not.toContain('9275');
-    expect(r.phoneHint).not.toContain('552');
+    expect(r.phoneHint).not.toContain('0005');
+    expect(r.phoneHint).not.toContain('555');
   });
 
   it('то же самое для google — дыра не в почтовом контроллере, а в резолвере', async () => {
@@ -80,8 +80,8 @@ describe('resolveOrCreate — кандидат на привязку вмест�
     const svc = new IdentityService(pg as any);
 
     const r = await svc.resolveOrCreate('google', {
-      sub: 'g-115495847139483989335',
-      email: 'victoria-337@mail.ru',
+      sub: 'g-000000000000000000001',
+      email: 'maria.testova@example.org',
       emailVerified: true,
     });
 
@@ -96,7 +96,7 @@ describe('resolveOrCreate — кандидат на привязку вмест�
     const pg = pgWithProfileEmailOwner({ loginable: false });
     const svc = new IdentityService(pg as any);
 
-    const r = await svc.resolveOrCreate('email', { email: 'victoria-337@mail.ru' });
+    const r = await svc.resolveOrCreate('email', { email: 'maria.testova@example.org' });
 
     expect(r.status).toBe('ok');
     expect(pg.createdUser).toBe(true);
@@ -107,7 +107,7 @@ describe('resolveOrCreate — кандидат на привязку вмест�
     const pg = pgWithProfileEmailOwner();
     const svc = new IdentityService(pg as any);
 
-    const r = await svc.resolveOrCreate('email', { email: 'victoria-337@mail.ru' }, { forceNew: true });
+    const r = await svc.resolveOrCreate('email', { email: 'maria.testova@example.org' }, { forceNew: true });
 
     expect(r.status).toBe('ok');
     expect(pg.createdUser).toBe(true);
@@ -120,7 +120,7 @@ describe('resolveOrCreate — кандидат на привязку вмест�
     });
     const svc = new IdentityService(pg as any);
 
-    const r = await svc.resolveOrCreate('email', { email: 'victoria-337@mail.ru' });
+    const r = await svc.resolveOrCreate('email', { email: 'maria.testova@example.org' });
 
     expect(r).toMatchObject({ status: 'ok', userId: 'u-1', isNew: false });
     // Кандидата даже не искали — вход состоялся на первом шаге.
@@ -155,7 +155,7 @@ describe('resolveOrCreate — кандидат на привязку вмест�
 
     const r = await svc.resolveOrCreate('apple', {
       sub: 'a-1',
-      email: 'victoria-337@mail.ru',
+      email: 'maria.testova@example.org',
       emailVerified: false,
     });
 

@@ -18,7 +18,7 @@ import * as alert from '../common/telegram-alert';
  */
 
 describe('TgBillingService.alertIfExpensiveTurn', () => {
-  const cfg: any = { id: 'cfg-1', display_name: 'Роман', owner_user_id: '79235216999' };
+  const cfg: any = { id: 'cfg-1', display_name: 'Роман', owner_user_id: '70005550007' };
   let sent: string[];
 
   beforeEach(() => {
@@ -64,7 +64,7 @@ describe('TgBillingService.alertIfExpensiveTurn', () => {
   it('в алерте видно, чей это баланс и сколько осталось', async () => {
     await svc().alertIfExpensiveTurn(cfg, 9, 32_400, 1_000);
 
-    expect(sent[0]).toContain('79235216999');
+    expect(sent[0]).toContain('70005550007');
     expect(sent[0]).toContain('1 000'.replace(' ', ' '));
   });
 

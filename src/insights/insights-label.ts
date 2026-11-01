@@ -5,6 +5,15 @@ import { MAX_PROMPT_BYTES, promptBytes } from './prompt-size';
 
 export const LABEL_MODEL = 'claude-haiku-4-5';
 export const LABEL_BATCH = 8;
+/**
+ * Таймаут разметки одной пачки (на каждую из двух попыток callModel).
+ * 240 с, а не 120: проверка 01.11.2026 через общий рубильник модели — на Kimi
+ * пачка размечалась 117 с при потолке 120 с. Прогон идёт под advisory-локом,
+ * пачки — по одной; при ~10 пачках в неделю даже худший случай (обе попытки
+ * каждой пачки до упора плюс по минуте на запасных) укладывается в 3 часа,
+ * после которых reapStale считает прогон оборванным.
+ */
+export const LABEL_TIMEOUT_MS = 240_000;
 export const MAX_CONVERSATION_CHARS = 12_000;
 const ASSISTANT_HEAD = 400;
 const ASSISTANT_TAIL = 200;

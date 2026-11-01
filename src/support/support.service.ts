@@ -9,8 +9,9 @@ import { neutralizeAtMentions, stripWordJoiner } from '../common/agent-guards';
 import { z } from 'zod';
 import { PgService } from '../common/services/pg.service';
 import {
-  SupportTicketRow, SupportMessageRow, PostUserMessageDto, LIMITS, SenderType,
+  SupportTicketRow, SupportMessageRow, PostUserMessageDto, LIMITS, SenderType, SUPPORT_MODEL,
 } from './support.dto';
+import { supportReplyText } from './support-reply-text';
 import { TelegramNotifierService } from './telegram-notifier.service';
 import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert';
 import { clip, escapeHtml } from '../problem-report/problem-format';
@@ -312,7 +313,7 @@ export class SupportService implements OnModuleInit {
 
     const lang = LanguageService.normalize(profile?.language);
     const mcp = this.buildSupportMcp(ticketId, userId, { lang, client: opts.storeBuild ? 'store' : 'web' });
-    let finalText = '';
+    const assistantMessages: any[][] = [];
     let escalated = false;
     const toolInvocations: any[] = [];
 
@@ -324,7 +325,7 @@ export class SupportService implements OnModuleInit {
         // ввода, поэтому ведущий `/` как slash-команда здесь не грозит.
         prompt: neutralizeAtMentions(prompt),
         options: {
-          model: 'claude-haiku-4-5',
+          model: SUPPORT_MODEL,
           systemPrompt: neutralizeAtMentions(systemPrompt),
           mcpServers: { 'support-tools': mcp },
           // Безопасность (25.09.2026). Тикет-агенту нужны ТОЛЬКО MCP-тулы
@@ -351,10 +352,9 @@ export class SupportService implements OnModuleInit {
         } as any,
       })) {
         if (event.type === 'assistant') {
-          for (const block of ((event as any).message?.content || []) as any[]) {
-            if (block.type === 'text' && typeof block.text === 'string') {
-              finalText += block.text;
-            }
+          const content = ((event as any).message?.content || []) as any[];
+          assistantMessages.push(content);
+          for (const block of content) {
             if (block.type === 'tool_use') {
               // Сохраняем имя без mcp__ префикса для удобства чтения в БД.
               const name = String(block.name || '').replace(/^mcp__[^_]+__/, '');
@@ -373,7 +373,7 @@ export class SupportService implements OnModuleInit {
     }
 
     // Снимаем U+2060 из ответа модели, чтобы joiner не доехал до пользователя.
-    finalText = stripWordJoiner(finalText).trim();
+    let finalText = stripWordJoiner(supportReplyText(assistantMessages)).trim();
     if (!finalText) {
       finalText = escalated
         ? 'Передал вопрос команде. С вами свяжутся отсюда в этом же чате, как только разберутся.'
@@ -515,6 +515,10 @@ ${platform}
 ТВОЯ РОЛЬ.
 - Помогай юзеру решать вопросы по использованию платформы.
 - На вопрос «как сделать», «сколько стоит» или «как устроено» — сначала возьми статью инструментом linkeon_help и отвечай по ней.
+- Раздел, кнопку, настройку, цену или возможность Linkeon (и его ассистентов: кто есть, что умеет) называй только по статье linkeon_help, взятой для этого ответа, — и на уточняющий вопрос тоже: статьи из прошлых ответов в разговор не попадают. Чего нет в статье, не угадывай: скажи, что уточнишь у команды, и вызови escalate_to_owner.
+- Вопрос о том, насколько точны, актуальны или надёжны ответы ассистентов (юриста, бухгалтера и других) и откуда они берут сведения, — вопрос о платформе, а не вне её темы. Возьми статьи linkeon_help «start», «how-it-works» и «chat» и ответь по ним; чего в них нет — скажи честно и вызови escalate_to_owner.
+- Никогда не проси прислать в чат ключ, токен, пароль или код — ни сюда, ни ассистенту. Ключи продукта вводятся только в защищённую карточку, которую присылает ассистент.
+- Ошибка с текстом вроде «You've hit your session limit», «usage limit», «weekly limit» или «resets …» — это лимит поставщика модели на стороне Linkeon, а не проблема у человека. Не советуй закрывать вкладки, чистить кэш или перезаходить: извинись, скажи, что это временный сбой на нашей стороне, и вызови escalate_to_owner с urgency high.
 - Ты и есть поддержка Linkeon: не советуй написать в поддержку и не отсылай к кнопкам ${supportButtons}, даже если так сказано в статье. Нужен человек — вызови escalate_to_owner.
 - При сбое или упавшей генерации — сначала get_recent_jobs и check_service_health, потом сообщи честно; к linkeon_help за справкой обращайся отдельно, если нужно.
 - Если речь о конкретной генерации — вызови get_recent_jobs, чтобы увидеть статус.
@@ -533,7 +537,9 @@ ${healthSummary}
 
 Если пользователь жалуется на конкретный сервис — ссылайся на статус выше. Не вызывай повторно check_service_health, если ответ уже виден. Если сервис degraded/down и жалоба совпадает — извинись, подтверди факт сбоя и предложи подождать или повторить позже (если это решит проблему); в остальных случаях эскалируй команде.
 
-Отвечай только текстом в финальном турне. Никогда не ставь tool-use и финальный ответ одновременно — сначала вызови нужные тулы, потом дай финальный ответ.`;
+Отвечай только текстом в финальном турне. Никогда не ставь tool-use и финальный ответ одновременно — сначала вызови нужные тулы, потом дай финальный ответ.
+
+ЯЗЫК ОТВЕТА. Язык последнего сообщения пользователя важнее языка профиля: написал по-английски — отвечай по-английски, даже если профиль русский. Считается язык, на котором человек пишет сам; процитированный текст ошибки, ссылки и названия — не в счёт.`;
   }
 
   private async executeTool(

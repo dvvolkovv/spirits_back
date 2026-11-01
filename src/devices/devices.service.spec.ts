@@ -16,13 +16,13 @@ describe('запись устройства', () => {
   it('пишет разобранные поля и подпись', async () => {
     const pg = fakePg();
     await new DevicesService(pg as any).record(
-      '79088644408',
+      '70005550003',
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
     );
 
     expect(pg.calls).toHaveLength(1);
     expect(pg.calls[0].sql).toContain('user_devices');
-    expect(pg.calls[0].params[0]).toBe('79088644408');
+    expect(pg.calls[0].params[0]).toBe('70005550003');
     expect(pg.calls[0].params).toContain('desktop');
     expect(pg.calls[0].params).toContain('Windows');
     expect(pg.calls[0].params).toContain('Chrome');
