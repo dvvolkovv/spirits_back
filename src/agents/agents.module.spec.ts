@@ -5,7 +5,7 @@ import { AgentVersionsService } from './agent-versions.service';
 
 describe('AgentsModule', () => {
   it('provides AgentVersionsService with ChatService in the real module graph', async () => {
-    const moduleRef = await NestFactory.create(AgentsModule, { logger: false });
+    const moduleRef = await NestFactory.create(AgentsModule, { logger: ['error'] });
 
     expect(moduleRef.get(ChatService)).toBeInstanceOf(ChatService);
     expect(moduleRef.get(AgentVersionsService)).toBeInstanceOf(AgentVersionsService);
