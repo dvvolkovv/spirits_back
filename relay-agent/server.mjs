@@ -18,8 +18,10 @@ import { sessionMcpConfigName, sweepStaleSessionMcpConfigs, ensureMcpConfigDir, 
 import { snapshotDir, changedFiles } from "./turn-files.mjs";
 import { agentTestMode, cliToolArgs } from "./agent-test-mode.mjs";
 import { createDrainGate } from "./drain-gate.mjs";
+import { createInflight } from "./inflight.mjs";
 
 const app = express();
+const chatInflight = createInflight();
 const PORT = 3033;
 const UPLOAD_DIR = "/tmp/agent-uploads";
 const OUTPUT_DIR = "/tmp/agent-output";
@@ -430,7 +432,7 @@ const PRODUCTS_PROMPT = `
 Когда его звать, сказано в инструкциях ассистента ниже. НЕ передавай в него userId/телефон.
 `;
 
-app.post("/chat", createDrainGate(), upload.array("files", 10), (req, res) => {
+app.post("/chat", chatInflight.middleware, createDrainGate(), upload.array("files", 10), (req, res) => {
   const { message, sessionId: reqSessionId } = req.body;
   const reqTestMode = agentTestMode(req.body);
   // Модель хода. По умолчанию "default" (рекомендуемая CLI — сейчас Opus 5).
@@ -1353,7 +1355,7 @@ app.get("/health", (req, res) => {
   // fallback — окна и исходы по всем запасным; qwen — прежнее поле для монитора
   // бэкенда, пока не выкачен новый (llm-fallback.mjs, legacyQwenHealth).
   const fb = fallbackState.stats(llm.readProviderConfigs());
-  res.json({ status: "ok", sessions: sessionMap.size, uptime: process.uptime(), fallback: fb, qwen: llm.legacyQwenHealth(fb) });
+  res.json({ status: "ok", sessions: sessionMap.size, inflight: chatInflight.count(), uptime: process.uptime(), fallback: fb, qwen: llm.legacyQwenHealth(fb) });
 });
 
 app.listen(PORT, "0.0.0.0", () => {

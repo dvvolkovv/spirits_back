@@ -13,6 +13,7 @@ BASE_SHA=$1
 TARGET_SHA=$2
 RELAY_HOST=${RELAY_HOST:-dv@5.101.115.184}
 DRAIN_FILE=${RELAY_DRAIN_FILE:-/tmp/linkeon-relay-drain}
+LOCK_FILE=${RELAY_DEPLOY_LOCK_FILE:-/tmp/linkeon-relay-deploy.lock}
 DRAIN_WAIT_SECONDS=${DRAIN_WAIT_SECONDS:-1800}
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
@@ -66,17 +67,36 @@ ssh -o BatchMode=yes "$RELAY_HOST" "rm -rf ~/$STAGE ~/$BASE_DIR && mkdir ~/$STAG
 git archive "$TARGET_SHA" relay-agent | ssh -o BatchMode=yes "$RELAY_HOST" "tar -x -C ~/$STAGE --strip-components=1"
 git archive "$BASE_SHA" relay-agent | ssh -o BatchMode=yes "$RELAY_HOST" "tar -x -C ~/$BASE_DIR --strip-components=1"
 
-ssh -o BatchMode=yes "$RELAY_HOST" "STAGE=$STAGE BASE_DIR=$BASE_DIR TARGET_SHORT=$TARGET_SHORT FILES_CSV=$FILES_CSV PUT_CSV=$PUT_CSV DEL_CSV=$DEL_CSV ADD_CSV=$ADD_CSV DRAIN_FILE=$DRAIN_FILE DRAIN_WAIT_SECONDS=$DRAIN_WAIT_SECONDS bash -s" <<'REMOTE'
+ssh -o BatchMode=yes "$RELAY_HOST" "STAGE=$STAGE BASE_DIR=$BASE_DIR TARGET_SHORT=$TARGET_SHORT FILES_CSV=$FILES_CSV PUT_CSV=$PUT_CSV DEL_CSV=$DEL_CSV ADD_CSV=$ADD_CSV DRAIN_FILE=$DRAIN_FILE LOCK_FILE=$LOCK_FILE DRAIN_WAIT_SECONDS=$DRAIN_WAIT_SECONDS bash -s" <<'REMOTE'
 set -euo pipefail
 DRAIN_FILE=${DRAIN_FILE:-/tmp/linkeon-relay-drain}
+LOCK_FILE=${LOCK_FILE:-/tmp/linkeon-relay-deploy.lock}
 DRAIN_WAIT_SECONDS=${DRAIN_WAIT_SECONDS:-1800}
 GATE_CREATED=0
 REPLACED=0
+
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "Другой rollout держит $LOCK_FILE — marker и файлы не изменены" >&2
+  exit 1
+fi
 
 if [[ -e "$DRAIN_FILE" ]]; then
   echo "Drain marker уже существует — другой выкат или аварийный drain ещё активен" >&2
   exit 1
 fi
+
+inflight_count() {
+  curl -fsS --max-time 5 http://127.0.0.1:3033/health | node -e '
+    let raw = "";
+    process.stdin.on("data", (chunk) => { raw += chunk; });
+    process.stdin.on("end", () => {
+      const health = JSON.parse(raw);
+      if (!Number.isInteger(health.inflight) || health.inflight < 0) process.exit(1);
+      console.log(health.inflight);
+    });
+  '
+}
 
 health_and_release() {
   for attempt in $(seq 1 20); do
@@ -184,11 +204,12 @@ fi
 DRAIN_STARTED=$SECONDS
 while true; do
   CHILDREN=$(ps --ppid "$PID" -o pid=)
-  if ! grep -q . <<< "$CHILDREN"; then
+  INFLIGHT=$(inflight_count)
+  if ! grep -q . <<< "$CHILDREN" && [[ "$INFLIGHT" -eq 0 ]]; then
     break
   fi
   if (( SECONDS - DRAIN_STARTED >= DRAIN_WAIT_SECONDS )); then
-    echo "Живые ходы не завершились за $DRAIN_WAIT_SECONDS с — замена отменена" >&2
+    echo "Ходы или принятые запросы не завершились за $DRAIN_WAIT_SECONDS с — замена отменена" >&2
     exit 1
   fi
   sleep 5
