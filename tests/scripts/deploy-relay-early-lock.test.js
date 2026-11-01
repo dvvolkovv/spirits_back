@@ -20,7 +20,7 @@ function makeBin(work, home) {
 while [[ $# -gt 0 ]]; do
   if [[ "$1" == -o ]]; then shift 2; else shift; break; fi
 done
-if [[ -n "$DEBUG_ROLLOUT" ]]; then exec bash -x -c "$1"; fi
+if [[ -n "$DEBUG_ROLLOUT" ]]; then exec bash -x -c "${1//bash /bash -x }"; fi
 exec bash -c "$1"
 `);
   executable(path.join(bin, 'rm'), `#!/usr/bin/env bash
