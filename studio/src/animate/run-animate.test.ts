@@ -7,6 +7,7 @@ import path from 'node:path';
 import { StudioError } from '../errors';
 import type { Script, ShortAnimation, SkitKind, SkitPlan } from '../types';
 import { animateRun, type AnimateDeps } from './run-animate';
+import { MATCHER_VERSION } from './match';
 
 const ff = (...args: string[]) => execFileSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...args]);
 
@@ -218,8 +219,48 @@ test('речь не сошлась — пересъёмка без нового 
   assert.equal(anim.skits.conflict!.attempts, 2);
   assert.equal(calls.keyframe.length, 2);
   assert.equal(anim.omniSeconds, 24);
-  const rejected = fs.readdirSync(path.join(env.runDir, 'skits', 'fp-conflict')).filter((f) => f.startsWith('rejected-'));
+  const rejected = fs.readdirSync(path.join(env.runDir, 'skits', 'fp-conflict')).filter((f) => f.startsWith('rejected-') && f.endsWith('.mp4'));
   assert.equal(rejected.length, 1);
+});
+
+test('брак откладывается с пометкой: код, версия сверки, услышанное целиком и доля', { timeout: 120_000 }, async () => {
+  const env = setup();
+  // Длиннее 200 знаков: в пометку — целиком, а не обрезок из сообщения. Половина слов реплик — услышана.
+  const heard = `обои потерли залог мой ${'шум '.repeat(60)}`.trim();
+  const { deps } = fakes(env, { heard: (kind, call) => (kind === 'conflict' && call === 1 ? heard : LINES[kind].join(' ')) });
+  await animateRun(env.runDir, deps);
+  const dir = path.join(env.runDir, 'skits', 'fp-conflict');
+  const metas = fs.readdirSync(dir).filter((f) => /^rejected-.*\.json$/.test(f));
+  assert.equal(metas.length, 1);
+  assert.ok(fs.existsSync(path.join(dir, metas[0].replace(/\.json$/, '.mp4'))), 'пометка без клипа');
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, metas[0]), 'utf8')), { code: 'speech_mismatch', matcher: MATCHER_VERSION, heard, share: 0.5 });
+});
+
+test('битый файл от Omni — брак с пометкой clip_invalid, без услышанного', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const { deps } = fakes(env, { wait: (kind, n) => (kind === 'conflict' && n === 1 ? Buffer.from('not a video') : env.clip) });
+  await animateRun(env.runDir, deps);
+  const dir = path.join(env.runDir, 'skits', 'fp-conflict');
+  const metas = fs.readdirSync(dir).filter((f) => /^rejected-.*\.json$/.test(f));
+  assert.equal(metas.length, 1);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, metas[0]), 'utf8')), { code: 'clip_invalid', matcher: MATCHER_VERSION });
+});
+
+test('пометка брака не записалась — брак всё равно отложен и удалён из хранилища, съёмка идёт дальше', { timeout: 120_000 }, async (t) => {
+  t.mock.method(Date.prototype, 'toISOString', () => '2026-10-31T00:00:00.000Z');
+  const env = setup();
+  const dir = path.join(env.runDir, 'skits', 'fp-conflict');
+  // На месте пометки — каталог: запись упадёт (EISDIR), как при сбое диска.
+  fs.mkdirSync(path.join(dir, 'rejected-2026-10-31T00-00-00-000Z.json'), { recursive: true });
+  const discarded: string[] = [];
+  const logs: string[] = [];
+  const { deps, calls } = fakes(env, { heard: (kind, call) => (kind === 'conflict' && call === 1 ? 'совсем другое' : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, { ...deps, onDiscard: async (rel) => { discarded.push(rel); }, log: (m) => logs.push(m) });
+  assert.deepEqual(discarded, ['skits/fp-conflict/raw.mp4']);
+  assert.equal(anim.skits.conflict!.attempts, 2);
+  assert.ok(fs.existsSync(path.join(dir, 'rejected-2026-10-31T00-00-00-000Z.mp4')), 'брак на месте');
+  assert.ok(logs.some((m) => m.includes('пометка брака') && m.includes('не записалась')), logs.join('\n'));
+  assert.equal(calls.recognize, 3, 'брак, отложенный этим запуском, не судится повторно');
 });
 
 test('пустое распознавание — SpeechKit спрашивается ещё раз, клип не переснимается', { timeout: 120_000 }, async () => {
@@ -482,6 +523,7 @@ test('переобработка принятого клипа не прошла
     assert.equal(anim.omniSeconds, 16);
     assert.ok(fs.existsSync(path.join(env.runDir, 'skits', 'fp-conflict', 'raw.mp4')));
     assert.deepEqual(fs.readFileSync(clipFile), before);
+    assert.deepEqual(fs.readdirSync(path.join(env.runDir, 'skits', 'fp-conflict')).filter((name) => name.startsWith('rejected-')), [], 'принятый клип не уходит в брак');
   }
   const back = fakes(env);
   await animateRun(env.runDir, back.deps);
@@ -606,4 +648,195 @@ test('файл не выгрузился — повторяемая ошибка
   const anim = await animateRun(env.runDir, { ...second.deps, onFile: async () => {} });
   assert.deepEqual(second.calls.start, []);
   assert.equal(anim.omniSeconds, 16);
+});
+
+/**
+ * Как у ролика 889b6423: обе сценки приняты (16 с), затем новый текст развязки
+ * (fp-punchline-2, кадр прежний), и рядом — отложенный брак этого текста.
+ */
+async function withRejected(meta?: object) {
+  const env = setup();
+  await animateRun(env.runDir, fakes(env).deps);
+  const lines = ['Это износ, верните залог.', 'Ладно, убедил. Начинай уж.'];
+  writeScript(env.runDir, { conflict: plan('conflict'), punchline: plan('punchline', lines, 'fp-punchline-2') });
+  const dir = path.join(env.runDir, 'skits', 'fp-punchline-2');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'rejected-2026-10-31T16-29-00-469Z.mp4'), env.clip);
+  if (meta) fs.writeFileSync(path.join(dir, 'rejected-2026-10-31T16-29-00-469Z.json'), JSON.stringify(meta));
+  return { env, lines, dir };
+}
+
+const rejectedClips = (dir: string): string[] => fs.readdirSync(dir).filter((f) => /^rejected-.*\.mp4$/.test(f));
+
+test('брак без пометки (до 31.10) перепроверяется до новой оплаты — принят без Omni, даже когда предел выбран', { timeout: 120_000 }, async () => {
+  const { env, dir } = await withRejected();
+  const heard = 'это износ верните залог ладно убедил начинаешь';
+  const second = fakes(env, { heard: (kind) => (kind === 'punchline' ? heard : LINES[kind].join(' ')) });
+  const files: string[] = [];
+  const anim = await animateRun(env.runDir, { ...second.deps, maxOmniSeconds: 16, onFile: async (rel) => { files.push(rel); } });
+  assert.deepEqual(second.calls.start, []);
+  assert.deepEqual(second.calls.keyframe, []);
+  assert.equal(second.calls.recognize, 1);
+  assert.equal(anim.omniSeconds, 16);
+  assert.equal(anim.skits.punchline!.fingerprint, 'fp-punchline-2');
+  assert.equal(anim.skits.punchline!.heard, heard);
+  assert.deepEqual(rejectedClips(dir), []);
+  assert.ok(fs.existsSync(path.join(dir, 'raw.mp4')), 'принятый брак — оплаченный клип сценки');
+  assert.deepEqual(files, ['skits/fp-punchline-2/raw.mp4', 'skits/fp-punchline-2/clip.mp4'], 'клип из брака — в хранилище, как скачанный');
+});
+
+test('брак, который эта сверка уже судила, и плохой файл не перепроверяются — снимается новый клип', { timeout: 120_000 }, async () => {
+  for (const meta of [
+    // Услышанное проходит нынешнюю сверку: перепроверку отсекает именно версия, а не сверка по записи.
+    { code: 'speech_mismatch', matcher: MATCHER_VERSION, heard: 'это износ верните залог ладно убедил начинаешь' },
+    { code: 'clip_invalid', matcher: 1 },
+  ]) {
+    const { env, lines, dir } = await withRejected(meta);
+    const second = fakes(env, { heard: (kind) => (kind === 'punchline' ? lines.join(' ') : LINES[kind].join(' ')) });
+    const anim = await animateRun(env.runDir, second.deps);
+    assert.deepEqual(second.calls.start, ['punchline'], meta.code);
+    assert.equal(second.calls.recognize, 1, meta.code);
+    assert.equal(anim.omniSeconds, 24, meta.code);
+    assert.deepEqual(rejectedClips(dir), ['rejected-2026-10-31T16-29-00-469Z.mp4'], meta.code);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'rejected-2026-10-31T16-29-00-469Z.json'), 'utf8')), meta, meta.code);
+  }
+});
+
+test('брак прежней сверки, не прошедший сверку по записи, — без распознавания; пометка — этой сверки', { timeout: 120_000 }, async () => {
+  // Доля прежней сверки — 0.4; в обновлённой пометке — пересчёт нынешней (0.5).
+  const { env, lines, dir } = await withRejected({ code: 'speech_mismatch', matcher: 1, heard: 'это износ верните залог', share: 0.4 });
+  const second = fakes(env, { heard: (kind) => (kind === 'punchline' ? lines.join(' ') : LINES[kind].join(' ')) });
+  await animateRun(env.runDir, second.deps);
+  assert.deepEqual(second.calls.start, ['punchline']);
+  assert.equal(second.calls.recognize, 1);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'rejected-2026-10-31T16-29-00-469Z.json'), 'utf8')), {
+    code: 'speech_mismatch',
+    matcher: MATCHER_VERSION,
+    heard: 'это износ верните залог',
+    share: 0.5,
+  });
+});
+
+test('брак без пометки, не прошедший и новую сверку, — отложен снова с её пометкой, дальше обычная съёмка', { timeout: 120_000 }, async () => {
+  const { env, lines, dir } = await withRejected();
+  const second = fakes(env, {
+    heard: (kind, call) => (kind === 'punchline' ? (call === 1 ? 'совсем другое' : lines.join(' ')) : LINES[kind].join(' ')),
+  });
+  const discarded: string[] = [];
+  const anim = await animateRun(env.runDir, { ...second.deps, onDiscard: async (rel) => { discarded.push(rel); } });
+  assert.deepEqual(second.calls.start, ['punchline']);
+  assert.equal(second.calls.recognize, 2);
+  assert.equal(anim.omniSeconds, 24);
+  assert.deepEqual(discarded, ['skits/fp-punchline-2/raw.mp4'], 'брак из перепроверки удалён из хранилища');
+  const left = rejectedClips(dir);
+  assert.equal(left.length, 1);
+  assert.notEqual(left[0], 'rejected-2026-10-31T16-29-00-469Z.mp4', 'брак лёг под новым именем, без дубля');
+  const meta = JSON.parse(fs.readFileSync(path.join(dir, left[0].replace(/\.mp4$/, '.json')), 'utf8'));
+  assert.deepEqual([meta.code, meta.matcher, meta.heard], ['speech_mismatch', MATCHER_VERSION, 'совсем другое']);
+});
+
+test('брак с пустым услышанным (SpeechKit не расслышал) судится заново распознаванием, а не по записи', { timeout: 120_000 }, async () => {
+  const { env, dir } = await withRejected({ code: 'speech_mismatch', matcher: 1, heard: '', share: 0 });
+  const heard = 'это износ верните залог ладно убедил начинаешь';
+  const second = fakes(env, { heard: (kind) => (kind === 'punchline' ? heard : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, { ...second.deps, maxOmniSeconds: 16 });
+  assert.deepEqual(second.calls.start, []);
+  assert.equal(second.calls.recognize, 1);
+  assert.equal(anim.skits.punchline!.heard, heard);
+  assert.deepEqual(rejectedClips(dir), []);
+});
+
+test('брак прежней сверки, прошедший сверку по записи, проходит полную проверку и принимается — без Omni', { timeout: 120_000 }, async () => {
+  const heard = 'это износ верните залог ладно убедил начинаешь';
+  const { env, dir } = await withRejected({ code: 'speech_mismatch', matcher: 1, heard, share: 0.8 });
+  const second = fakes(env, { heard: (kind) => (kind === 'punchline' ? heard : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, { ...second.deps, maxOmniSeconds: 16 });
+  assert.deepEqual(second.calls.start, []);
+  assert.equal(second.calls.recognize, 1);
+  assert.equal(anim.skits.punchline!.heard, heard);
+  assert.deepEqual(rejectedClips(dir), []);
+  assert.equal(fs.existsSync(path.join(dir, 'rejected-2026-10-31T16-29-00-469Z.json')), false, 'пометка ушла вместе с браком');
+});
+
+test('брак судится не больше раза на версию сверки: второй запуск его не распознаёт', { timeout: 120_000 }, async () => {
+  const { env, dir } = await withRejected();
+  for (const recognized of [1, 0]) {
+    const run = fakes(env, { heard: (kind) => (kind === 'punchline' ? 'совсем другое' : LINES[kind].join(' ')) });
+    await assert.rejects(animateRun(env.runDir, { ...run.deps, maxOmniSeconds: 16 }), isErr('omni_budget', false));
+    assert.equal(run.calls.recognize, recognized);
+    assert.deepEqual(run.calls.start, []);
+    assert.equal(rejectedClips(dir).length, 1);
+  }
+});
+
+test('два брака: первый не прошёл и новую сверку, второй принят — без Omni', { timeout: 120_000 }, async () => {
+  const { env, dir } = await withRejected();
+  fs.writeFileSync(path.join(dir, 'rejected-2026-10-31T16-29-39-703Z.mp4'), env.clip);
+  const heard = 'это износ верните залог ладно убедил начинаешь';
+  const second = fakes(env, { heard: (kind, call) => (kind === 'punchline' ? (call === 1 ? 'совсем другое' : heard) : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, { ...second.deps, maxOmniSeconds: 16 });
+  assert.deepEqual(second.calls.start, []);
+  assert.equal(second.calls.recognize, 2);
+  assert.equal(anim.skits.punchline!.heard, heard);
+  assert.equal(anim.skits.punchline!.attempts, 2);
+  assert.equal(rejectedClips(dir).length, 1, 'первый брак отложен снова, второй стал клипом');
+});
+
+test('запущенная генерация рядом с браком — её дожидаются, брак не трогают', { timeout: 120_000 }, async () => {
+  const { env, lines, dir } = await withRejected();
+  const before = readAnim(env.runDir);
+  fs.writeFileSync(
+    path.join(env.runDir, 'animation.json'),
+    JSON.stringify({ ...before, omniSeconds: 24, pending: { punchline: { id: 'id-paid', fingerprint: 'fp-punchline-2' } } }),
+  );
+  const second = fakes(env, { heard: (kind) => (kind === 'punchline' ? lines.join(' ') : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, second.deps);
+  assert.deepEqual(second.calls.start, []);
+  assert.deepEqual(second.calls.wait, ['id-paid']);
+  assert.equal(second.calls.recognize, 1);
+  assert.equal(anim.omniSeconds, 24);
+  assert.deepEqual(rejectedClips(dir), ['rejected-2026-10-31T16-29-00-469Z.mp4']);
+});
+
+test('сбой выгрузки в перепроверке — повтор задания без Omni, клип из брака принимает следующий запуск', { timeout: 120_000 }, async () => {
+  const { env, dir } = await withRejected();
+  const heard = 'это износ верните залог ладно убедил начинаешь';
+  const first = fakes(env, { heard: (kind) => (kind === 'punchline' ? heard : LINES[kind].join(' ')) });
+  await assert.rejects(
+    animateRun(env.runDir, {
+      ...first.deps,
+      maxOmniSeconds: 16,
+      onFile: async (rel) => {
+        if (rel.endsWith('raw.mp4')) throw new Error('MinIO: 503');
+      },
+    }),
+    isErr('unknown', true),
+  );
+  assert.deepEqual([first.calls.start, first.calls.recognize], [[], 0]);
+  assert.ok(fs.existsSync(path.join(dir, 'raw.mp4')), 'брак стал оплаченным клипом сценки');
+  const second = fakes(env, { heard: (kind) => (kind === 'punchline' ? heard : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, { ...second.deps, maxOmniSeconds: 16 });
+  assert.deepEqual(second.calls.start, []);
+  assert.equal(anim.skits.punchline!.heard, heard);
+  assert.equal(anim.omniSeconds, 16);
+});
+
+test('перепроверка оборвалась на распознавании — следующий запуск доводит этот клип, а за ним судит и остальной брак до оплаты', { timeout: 120_000 }, async () => {
+  const { env, dir } = await withRejected();
+  fs.writeFileSync(path.join(dir, 'rejected-2026-10-31T16-29-39-703Z.mp4'), env.clip);
+  const first = fakes(env, {
+    heard: (kind) => {
+      if (kind === 'punchline') throw new StudioError('stt', 'stt: распознать речь не удалось', false);
+      return LINES[kind].join(' ');
+    },
+  });
+  await assert.rejects(animateRun(env.runDir, { ...first.deps, maxOmniSeconds: 16 }), isErr('stt', false));
+  const heard = 'это износ верните залог ладно убедил начинаешь';
+  const second = fakes(env, { heard: (kind, call) => (kind === 'punchline' ? (call === 1 ? 'совсем другое' : heard) : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, { ...second.deps, maxOmniSeconds: 16 });
+  assert.deepEqual(second.calls.start, []);
+  assert.equal(second.calls.recognize, 2);
+  assert.equal(anim.skits.punchline!.heard, heard);
+  assert.equal(anim.omniSeconds, 16);
+  assert.equal(rejectedClips(dir).length, 1);
 });
