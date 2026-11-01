@@ -234,6 +234,23 @@ export interface ShortSkitClip {
  * Omni и кадры — счёт денег ролика со всеми попытками, сценки — частично
  * заполненные, `pending` — запущенные, но не скачанные генерации.
  */
+/**
+ * Отзыв студии о сценке, которую Omni не снять с этими репликами (skit_feedback):
+ * одну и ту же реплику дважды не услышали или фильтр Google трижды отказал.
+ * Сценарист переписывает реплики и действие только этой сценки. Зеркало SkitFeedback
+ * студии (studio/src/types.ts), пояснение для сценариста — в writer_feedback.
+ */
+export interface ShortSkitFeedback {
+  kind: SkitKind;
+  code: 'speech_mismatch' | 'omni_rejected';
+  /** Номера реплик (с 1), которых не услышали в последнем клипе, — у speech_mismatch. */
+  lines: number[];
+  /** Что распознал SpeechKit в последнем клипе — у speech_mismatch. */
+  heard: string | null;
+  /** Причина отказа фильтра Google — у omni_rejected. */
+  reason: string | null;
+}
+
 export interface ShortAnimation {
   omniSeconds: number;
   keyframes?: number;
@@ -278,6 +295,8 @@ export interface ShortVideo {
   approvedAt: Date | null;
   ownerNote: string | null;
   writerFeedback: string | null;
+  /** Отзыв студии о сценке — какую переписать; пояснение — в writerFeedback. */
+  skitFeedback: ShortSkitFeedback | null;
   writerRounds: number;
   reviewChatId: number | null;
   reviewMessageId: number | null;
@@ -344,6 +363,7 @@ export function rowToShort(row: any): ShortVideo {
     approvedAt: date(row.approved_at),
     ownerNote: row.owner_note ?? null,
     writerFeedback: row.writer_feedback ?? null,
+    skitFeedback: row.skit_feedback ?? null,
     writerRounds: Number(row.writer_rounds || 0),
     reviewChatId: num(row.review_chat_id),
     reviewMessageId: num(row.review_message_id),
