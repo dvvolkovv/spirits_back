@@ -203,7 +203,12 @@ health_and_release() {
   return 1
 }
 
+rollout_step() {
+  printf 'ROLLOUT_STEP %s\n' "$1"
+}
+
 restore_previous() {
+  rollout_step "rollback: begin"
   cd ~/file-agent
   IFS=',' read -ra PUT <<< "$PUT_CSV"
   for file in "${PUT[@]+"${PUT[@]}"}"; do
@@ -222,12 +227,18 @@ restore_previous() {
       mv ".$file.rollback.tmp" "$file"
     done
   fi
+  rollout_step "rollback: files restored"
   while read -r module; do
     [[ -f "$module" ]] || { echo "При откате нет локального импорта $module" >&2; exit 1; }
   done < <(grep -ohE 'from "\./[^"]+"' *.mjs | cut -d'"' -f2 | sort -u)
+  rollout_step "rollback: imports ok"
+  rollout_step "rollback: git add"
   git add -A -- "${FILES[@]+"${FILES[@]}"}"
+  rollout_step "rollback: git commit"
   git commit -q -m "rollback relay-agent к $BASE_DIR"
+  rollout_step "rollback: pm2 restart"
   pm2 restart file-agent >/dev/null
+  rollout_step "rollback: pm2 restart ok"
 }
 
 finish_rollout() {
@@ -318,6 +329,7 @@ while true; do
 done
 
 REPLACED=1
+rollout_step "replace: begin"
 IFS=',' read -ra PUT <<< "$PUT_CSV"
 for file in "${PUT[@]+"${PUT[@]}"}"; do
   [[ -n "$file" ]] || continue
@@ -330,15 +342,23 @@ if [[ -n "$DEL_CSV" ]]; then
     rm -f -- "$file"
   done
 fi
+rollout_step "replace: files done"
 
+rollout_step "imports: begin"
 while read -r module; do
   [[ -f "$module" ]] || { echo "После замены нет локального импорта $module" >&2; exit 1; }
 done < <(grep -ohE 'from "\./[^"]+"' *.mjs | cut -d'"' -f2 | sort -u)
+rollout_step "imports: ok"
 
+rollout_step "git: add"
 git add -A -- "${FILES[@]+"${FILES[@]}"}"
+rollout_step "git: commit"
 git commit -q -m "relay-agent из spirits_back $TARGET_SHORT"
+rollout_step "git: log"
 git log --oneline -1
+rollout_step "pm2: restart"
 pm2 restart file-agent >/dev/null
+rollout_step "pm2: restart ok"
 REMOTE
 
 tar -cf - -C "$LOCAL_BUNDLE" . | ssh -o BatchMode=yes "$RELAY_HOST" "set -euo pipefail; exec 9>\"$LOCK_FILE\"; if ! flock -n 9; then echo 'Другой rollout держит $LOCK_FILE — staging, marker и файлы не изменены' >&2; exit 1; fi; rm -rf ~/$STAGE ~/$BASE_DIR; mkdir ~/$STAGE ~/$BASE_DIR; tar -xf - -C ~; STAGE=$STAGE BASE_DIR=$BASE_DIR TARGET_SHORT=$TARGET_SHORT FILES_CSV=$FILES_CSV PUT_CSV=$PUT_CSV DEL_CSV=$DEL_CSV ADD_CSV=$ADD_CSV DRAIN_FILE=$DRAIN_FILE LOCK_FILE=$LOCK_FILE NGINX_CONF=$NGINX_CONF DRAIN_WAIT_SECONDS=$DRAIN_WAIT_SECONDS bash ~/$STAGE/deploy-relay-remote.sh"

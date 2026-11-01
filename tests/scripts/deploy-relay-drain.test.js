@@ -94,6 +94,12 @@ exit 1
   executable(path.join(bin, 'git'), `#!/usr/bin/env bash
 if [[ "$1" == diff ]]; then exit 0; fi
 if [[ "$1" == log ]]; then echo rollout-commit; exit 0; fi
+if [[ "$1" == commit ]]; then
+  count=$(cat "$WORK/commit-count" 2>/dev/null || echo 0)
+  count=$((count + 1))
+  echo "$count" > "$WORK/commit-count"
+  if [[ "$count" -eq 1 && "$FAIL_AT" == git-commit ]]; then exit 1; fi
+fi
 exit 0
 `);
   executable(path.join(bin, 'curl'), `#!/usr/bin/env bash
@@ -157,6 +163,7 @@ exit 0
     LOCK_FILE: lockFile,
     NGINX_CONF: nginxConf,
     PAUSE_FILE: options.pauseFile || '',
+    FAIL_AT: options.failAt || '',
   };
   const finish = (result) => {
     if (process.env.DEBUG_ROLLOUT) {
@@ -293,6 +300,25 @@ describe('deploy-relay drain/admission gate', () => {
       expect(r.curls).toContain('chat restart=0 code=503');
       expect(r.curls).toContain('chat restart=1 code=403');
       expect(r.liveServer).toContain('target');
+      expect(r.drainExists).toBe(false);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it('показывает точную команду сбоя до target restart и завершает rollback', () => {
+    const r = runRollout('ok', { failAt: 'git-commit' });
+    const output = `${r.stdout}\n${r.stderr}`;
+    try {
+      expect(r.status).not.toBe(0);
+      expect(output).toContain('ROLLOUT_STEP replace: files done');
+      expect(output).toContain('ROLLOUT_STEP imports: ok');
+      expect(output).toContain('ROLLOUT_STEP git: add');
+      expect(output).toContain('ROLLOUT_STEP git: commit');
+      expect(output).not.toContain('ROLLOUT_STEP git: log');
+      expect(output).not.toContain('ROLLOUT_STEP pm2: restart\n');
+      expect(output).toContain('ROLLOUT_STEP rollback: pm2 restart ok');
+      expect(r.liveServer).toContain('base');
       expect(r.drainExists).toBe(false);
     } finally {
       r.cleanup();
