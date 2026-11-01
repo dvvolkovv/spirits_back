@@ -89,6 +89,14 @@ esac
       DRAIN_WAIT_SECONDS: '1',
     },
   });
+  if (process.env.DEBUG_ROLLOUT) {
+    console.error({
+      stdout: result.stdout,
+      stderr: result.stderr,
+      restarts: fs.existsSync(path.join(work, 'restarts.log')) ? fs.readFileSync(path.join(work, 'restarts.log'), 'utf8') : '',
+      curls: fs.existsSync(path.join(work, 'curl.log')) ? fs.readFileSync(path.join(work, 'curl.log'), 'utf8') : '',
+    });
+  }
   return {
     ...result,
     work,
