@@ -26,6 +26,7 @@ function runRollout(health, options = {}) {
   const bin = path.join(work, 'bin');
   const drainFile = path.join(work, 'drain.marker');
   const lockFile = options.lockFile || path.join(work, 'deployment.lock');
+  const nginxConf = path.join(work, 'parking.conf');
   const baseServer = 'import "./helper.mjs";\nconsole.log("base");\n';
   const targetServer = 'import "./helper.mjs";\nconsole.log("target");\n';
   const helper = 'export const ok = true;\n';
@@ -38,6 +39,23 @@ function runRollout(health, options = {}) {
   write(path.join(base, 'server.mjs'), baseServer);
   write(path.join(stage, 'server.mjs'), targetServer);
   fs.mkdirSync(path.join(live, 'node_modules'));
+  write(nginxConf, 'server {\n  location /chat { proxy_pass http://127.0.0.1:3033/chat; }\n  location /health { proxy_pass http://127.0.0.1:3033/health; }\n}\n');
+
+  executable(path.join(bin, 'sudo'), '#!/usr/bin/env bash\nexec "$@"\n');
+  executable(path.join(bin, 'nginx'), `#!/usr/bin/env bash
+if [[ "$1" == -t ]]; then exit 0; fi
+if [[ "$1" == -s && "$2" == reload ]]; then
+  if grep -q LINKEON-RELAY-DRAIN "$NGINX_CONF"; then
+    touch "$WORK/nginx-gate-on"
+    echo "reload gate=on" >> "$WORK/nginx.log"
+  else
+    rm -f "$WORK/nginx-gate-on"
+    echo "reload gate=off" >> "$WORK/nginx.log"
+  fi
+  exit 0
+fi
+exit 2
+`);
 
   executable(path.join(bin, 'pm2'), `#!/usr/bin/env bash
 if [[ "$1" == pid ]]; then echo 4242; exit 0; fi
@@ -64,6 +82,13 @@ if [[ -n "$PAUSE_FILE" && ! -e "$WORK/health.started" ]]; then
   while [[ ! -e "$PAUSE_FILE" ]]; do /bin/sleep 0.05; done
 fi
 if [[ -f "$WORK/restarts.log" ]]; then restarts=$(wc -l < "$WORK/restarts.log"); else restarts=0; fi
+url="$*"
+if [[ "$url" == */chat ]]; then
+  if [[ -e "$WORK/nginx-gate-on" ]]; then code=503; else code=403; fi
+  echo "chat restart=$restarts code=$code" >> "$WORK/curl.log"
+  printf '%s' "$code"
+  exit 0
+fi
 if [[ -e "$DRAIN_FILE" ]]; then gate=yes; else gate=no; fi
 echo "curl restart=$restarts gate=$gate" >> "$WORK/curl.log"
 case "${health}" in
@@ -74,7 +99,7 @@ case "${health}" in
     if [[ "$calls" -eq 1 ]]; then echo '{"status":"ok","inflight":1}'; else echo '{"status":"ok","inflight":0}'; fi
     exit 0 ;;
   target-fails)
-    if [[ "$restarts" -eq 0 || "$restarts" -ge 2 ]]; then echo '{"status":"ok","inflight":0}'; exit 0; fi
+    if [[ "$restarts" -eq 0 || "$restarts" -ge 2 ]]; then echo '{"status":"ok"}'; exit 0; fi
     exit 1 ;;
   all-fail)
     if [[ "$restarts" -eq 0 ]]; then echo '{"status":"ok","inflight":0}'; exit 0; fi
@@ -102,6 +127,7 @@ esac
     DRAIN_FILE: drainFile,
     DRAIN_WAIT_SECONDS: '10',
     LOCK_FILE: lockFile,
+    NGINX_CONF: nginxConf,
     PAUSE_FILE: options.pauseFile || '',
   };
   const finish = (result) => {
@@ -121,6 +147,7 @@ esac
       liveServer: fs.readFileSync(path.join(live, 'server.mjs'), 'utf8'),
       restarts: fs.existsSync(path.join(work, 'restarts.log')) ? fs.readFileSync(path.join(work, 'restarts.log'), 'utf8') : '',
       curls: fs.existsSync(path.join(work, 'curl.log')) ? fs.readFileSync(path.join(work, 'curl.log'), 'utf8') : '',
+      nginx: fs.existsSync(path.join(work, 'nginx.log')) ? fs.readFileSync(path.join(work, 'nginx.log'), 'utf8') : '',
       drainExists: fs.existsSync(drainFile),
       cleanup: () => fs.rmSync(work, { recursive: true, force: true }),
     };
@@ -174,6 +201,10 @@ describe('deploy-relay drain/admission gate', () => {
       expect(r.liveServer).not.toContain('target');
       expect(r.restarts.match(/restart gate=yes/g) || []).toHaveLength(2);
       expect(r.curls).toContain('restart=2 gate=yes');
+      expect(r.curls).toContain('chat restart=0 code=503');
+      expect(r.curls).toContain('chat restart=2 code=503');
+      expect(r.nginx).toContain('reload gate=on');
+      expect(r.nginx).toContain('reload gate=off');
       expect(r.drainExists).toBe(false);
     } finally {
       r.cleanup();
@@ -205,10 +236,13 @@ describe('deploy-relay drain/admission gate', () => {
     }
   });
 
-  it('принимает legacy health без inflight при первом обновлении релея', () => {
+  it('legacy upgrade блокирует /chat через Nginx ещё до replacement', () => {
     const r = runRollout('legacy');
     try {
       expect(r.status).toBe(0);
+      expect(r.curls).toContain('chat restart=0 code=503');
+      expect(r.nginx).toContain('reload gate=on');
+      expect(r.nginx).toContain('reload gate=off');
       expect(r.liveServer).toContain('target');
       expect(r.drainExists).toBe(false);
     } finally {
