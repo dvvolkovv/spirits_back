@@ -9,6 +9,7 @@ import { RELEASED_SQL } from './short-review';
 import { approveShortIntoSlot } from './short-slot-claim';
 import { REVIEW_LEASE_MINUTES, ShortsApprovalService } from './shorts-approval.service';
 import { planSkits } from './short-skit-prompts';
+import { rowToShort } from './shorts.types';
 
 const ID = '6f1c2a9e-0d4b-4c3e-9a51-3b2f7c8d9e10';
 const OWNER = 777;
@@ -199,6 +200,19 @@ describe('ShortsApprovalService', () => {
       const { svc, tg } = setup(null);
       await svc.sendPendingReviews();
       expect(tg.sendVideo).not.toHaveBeenCalled();
+    });
+
+    it('самопочинки текущего круга — в подписи: «Сам восстанавливался» и «Собран без сценок» с причиной', async () => {
+      const recoveries = [
+        { at: '2030-01-01T08:00:00.000Z', from: 'animating', code: 'google_quota', action: 'later', delayMin: 30, reason: 'оживление: лимит' },
+        { at: '2030-01-01T08:40:00.000Z', from: 'animating', code: 'omni_budget', action: 'no_skits', reason: 'оживление: предел секунд' },
+      ];
+      const v = fresh({ format: 'chat', auto_recoveries: 2, recoveries });
+      const { svc, tg } = setup(v);
+      await svc.sendForReview(rowToShort(v), LEASE);
+      const caption = (tg.sendVideo.mock.calls[0] as any[])[2].caption;
+      expect(caption).toContain('Сам восстанавливался: повтор через 30 мин (google_quota), без сценок (omni_budget)');
+      expect(caption).toContain('Собран без сценок: оживление: предел секунд');
     });
   });
 

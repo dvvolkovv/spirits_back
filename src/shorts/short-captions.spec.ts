@@ -186,6 +186,12 @@ describe('buildReviewCaption', () => {
     expect(r.caption.length).toBeLessThanOrEqual(TG_CAPTION_MAX);
     expect(hasLoneSurrogate(r.caption)).toBe(false);
   });
+
+  it('самопочинки круга и «без сценок» — строками шапки перед «Выйдет»; без них строк нет', () => {
+    const { caption } = buildReviewCaption({ ...base, selfHealed: 'повтор через 30 мин (google_quota), без сценок (omni_budget)', noSkitsReason: 'оживление: предел секунд' });
+    expect(caption).toContain('Сам восстанавливался: повтор через 30 мин (google_quota), без сценок (omni_budget)\nСобран без сценок: оживление: предел секунд\nВыйдет: завтра в 18:00 МСК');
+    expect(buildReviewCaption(base).caption).not.toMatch(/Сам восстанавливался|Собран без сценок/);
+  });
 });
 
 describe('skitCastLine и omniSpendLine', () => {
