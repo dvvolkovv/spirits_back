@@ -31,6 +31,7 @@
 - Create: `src/shorts/migrations/004_skit_feedback.sql`
 - Modify: `src/shorts/shorts-schema.service.ts` (`onModuleInit`)
 - Modify: `src/shorts/shorts.controller.ts` (`LIST_COLUMNS`)
+- Modify: `src/shorts/shorts.integration.spec.ts` (`MIGRATIONS` — живой прогон катит миграции своим списком, не сервисом)
 - Test: `src/shorts/shorts-schema.spec.ts`
 
 - [ ] **Step 1: Написать падающие тесты**
@@ -151,15 +152,17 @@ $shorts$;
 
 В `src/shorts/shorts.controller.ts`, в `LIST_COLUMNS`, заменить `'slot_at', 'approved_at', 'owner_note', 'writer_feedback', 'writer_rounds', 'review_chat_id',` на `'slot_at', 'approved_at', 'owner_note', 'writer_feedback', 'skit_feedback', 'writer_rounds', 'review_chat_id',` (интеграционный тест сверяет `LIST_COLUMNS` с колонками таблицы — забытая колонка его роняет).
 
+В `src/shorts/shorts.integration.spec.ts` заменить `const MIGRATIONS = ['001_shorts.sql', '002_skits.sql', '003_youtube.sql'].map(` на `const MIGRATIONS = ['001_shorts.sql', '002_skits.sql', '003_youtube.sql', '004_skit_feedback.sql'].map(` — живая база теста катит миграции этим списком, а не `ShortsSchemaService` (при исполнении 01.11 это всплыло на прогоне: без 004 падали `LIST_COLUMNS ∪ тяжёлые поля` и оба `list:`).
+
 - [ ] **Step 5: Закоммитить и прогнать**
 
 ```bash
-git add src/shorts/migrations/004_skit_feedback.sql src/shorts/shorts-schema.service.ts src/shorts/shorts.controller.ts
+git add src/shorts/migrations/004_skit_feedback.sql src/shorts/shorts-schema.service.ts src/shorts/shorts.controller.ts src/shorts/shorts.integration.spec.ts
 git commit -m "feat(shorts): миграция 004 — skit_feedback, отзыв студии о сценке" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-schema.spec.ts 2>&1 | tail -6; SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts 2>&1 | grep -E '^Tests:'"
 ```
 
-Ожидается: оба `Tests:` без `failed`; в интеграционном — тест «LIST_COLUMNS ∪ тяжёлые поля — ровно все колонки short_video» зелёный (миграция 004 накатана на `shorts_it` сервисом).
+Ожидается: оба `Tests:` без `failed`; в интеграционном — тест «LIST_COLUMNS ∪ тяжёлые поля — ровно все колонки short_video» зелёный (миграция 004 накатана на `shorts_it` списком `MIGRATIONS`).
 
 ---
 
