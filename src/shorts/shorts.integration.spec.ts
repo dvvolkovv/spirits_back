@@ -7,6 +7,7 @@ import { claimStage, stageFailed } from './short-jobs';
 import { BAD_TIMESTAMP_CODES, VERSION_RE, VERSION_SQL, leaveReview, noteForReview } from './short-review';
 import { approveShortIntoSlot } from './short-slot-claim';
 import { ShortsApprovalService } from './shorts-approval.service';
+import { ShortsDoctorService } from './shorts-doctor.service';
 import { POST_MAY_BE_OUT, ShortsPublisherService } from './shorts-publisher.service';
 import { ShortsSettingsService } from './shorts-settings.service';
 import { ShortsTopicService } from './shorts-topic.service';
@@ -225,6 +226,26 @@ maybe('ролики против живого Postgres', () => {
     expect(texts[2]).toContain('не вышел на площадки');
     expect(texts[2]).toContain('«Повторить» или «Отклонить».');
     expect(texts[2]).not.toContain('Пост вышел');
+  });
+
+  it('доктор на живом SQL: «позже» уводит упавший ролик в очередь этапа с паузой и историей', async () => {
+    const v = await insert({
+      status: 'failed', failed_from: 'animating', failed_code: 'google_quota', last_error: 'оживление: лимит',
+      failure_notified: true, format: 'skit', capture: { answerText: 'a', paragraphs: [] },
+    });
+    const row = (await pool.query('SELECT * FROM short_video WHERE id = $1', [v.id])).rows[0];
+    expect(await new ShortsDoctorService(pgLike() as any).treat(rowToShort(row))).toBe('took');
+    const r = (
+      await pool.query(
+        `SELECT status, attempts, failed_from, failed_code, failure_notified, auto_recoveries, recoveries,
+                lease_until > now() + interval '29 minutes' AS paused
+           FROM short_video WHERE id = $1`,
+        [v.id],
+      )
+    ).rows[0];
+    expect(r).toMatchObject({ status: 'animate_queued', attempts: 0, failed_from: null, failed_code: null, failure_notified: false, auto_recoveries: 1, paused: true });
+    expect(r.recoveries).toHaveLength(1);
+    expect(r.recoveries[0]).toMatchObject({ from: 'animating', code: 'google_quota', action: 'later', delayMin: 30 });
   });
 
   it('две публикации одновременно — одна отправка в канал', async () => {

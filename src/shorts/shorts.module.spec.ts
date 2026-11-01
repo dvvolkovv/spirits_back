@@ -13,6 +13,7 @@ import { MetadataScanner } from '@nestjs/core/metadata-scanner';
 import { TgBotService } from '../tg-bot/tg-bot.service';
 import { ShortsApprovalService } from './shorts-approval.service';
 import { ShortsDirectorService } from './shorts-director.service';
+import { ShortsDoctorService } from './shorts-doctor.service';
 import { ShortsModule } from './shorts.module';
 import { ShortsPublisherService } from './shorts-publisher.service';
 import { ShortsSchemaService } from './shorts-schema.service';
@@ -50,11 +51,14 @@ describe('DI-граф роликов', () => {
     const container = await buildGraph(AppModule);
     for (const cls of [
       ShortsSchemaService, ShortsSettingsService, ShortsTopicService, ShortsDirectorService, ShortsWriterService,
+      ShortsDoctorService,
       ShortsApprovalService, ShortsPublisherService, ShortsCron, ShortsController,
       ShortsYoutubeService, ShortsYoutubeController,
     ]) {
       expect(find(container, cls)).toBeInstanceOf(cls as any);
     }
+    // Доктор — последним @Optional() разбора упавших: проверяем, что Nest его подставил, а не оставил undefined.
+    expect((find(container, ShortsApprovalService) as any).doctor).toBeInstanceOf(ShortsDoctorService);
   });
 
   it('бот получает сервис роликов — @Optional не прячет разрыв графа', async () => {
