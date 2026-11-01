@@ -946,6 +946,219 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-doctor.spec
 
 Ожидается: `Tests:` без `failed`, `TSC_OK`. (`clip` меряет длину в единицах UTF-16 и режет по целым символам — тест длины причины проходит.)
 
+- [ ] **Step 5: Второй заход по ревью качества**
+
+Ревью задачи 5: таблица и пределы верны, критичного нет. Правки: круг считается надёжно и при расхождении счётчика с историей; число «позже» связано с числом пауз; «без сценок» требует и сцены, и съёмки; префикс «Сам:» — одна константа для доктора и сценариста; паузы словами без «1.5 ч»; «позже» — размеченное объединение с обязательной паузой; каждый код студии явно разнесён по таблице (сторож в контракте). И решение по вопросу ревью S1 в духе решения владельца «сценки не удались — собрать без сценок»: у оживления последнее действие круга — сразу «без сценок» (а не «позже», после которого ролика не будет), и при израсходованной новой сцене круга оживление тоже идёт «без сценок», а не к владельцу.
+
+`src/shorts/short-doctor.spec.ts`:
+
+1. Импорт — `import { DOCTOR_NOTE_PREFIX, LATER_DELAYS_MIN, MAX_AUTO_RECOVERIES, currentCircle, newSceneNote, prescribe, recoveryEntry, recoveryWords } from './short-doctor';`; в помощнике `v` после `capture: { answerText: 'ответ' } as any,` добавить `scene: { kind: 'chat' } as any,`.
+
+2. В таблицу `it.each` (перед строкой `['capturing', 'no_input', 'never'], …`) добавить строки — коды, которые спека называет, а решает умолчание:
+
+```ts
+    ['capturing', 'answer_timeout', 'later'], ['capturing', 'empty_frame', 'later'],
+    ['animating', 'omni_unreadable', 'later'], ['animating', 'unknown', 'later'], ['rendering', 'unknown', 'later'],
+```
+
+3. В `describe('prescribe — пределы на круг', …)` добавить:
+
+```ts
+  it('«позже» считается на весь круг: после паузы на съёмке первый повтор оживления — уже через 2 ч', () => {
+    const once = [rec('later', { from: 'capturing', code: 'login', delayMin: 30 })];
+    expect(prescribe(v({ recoveries: once, autoRecoveries: 1 }))).toEqual({ action: 'later', delayMin: LATER_DELAYS_MIN[1] });
+  });
+
+  it('оживление, последнее действие круга — без сценок, а не «позже»: ролик выйдет наверняка', () => {
+    const two = [rec('new_scene', { from: 'capturing', code: 'answer_rejected' }), rec('later', { delayMin: 30 })];
+    expect(prescribe(v({ recoveries: two, autoRecoveries: 2 })).action).toBe('no_skits');
+    // У других этапов «без сценок» не лечит — там последнее действие прежнее.
+    expect(prescribe(v({ failedFrom: 'capturing', failedCode: 'login', recoveries: two, autoRecoveries: 2 }))).toEqual({ action: 'later', delayMin: LATER_DELAYS_MIN[1] });
+  });
+
+  it('оживление: новая сцена круга израсходована — без сценок; у сценариста — никак', () => {
+    const once = [rec('new_scene', { code: 'keyframe_blocked' })];
+    expect(prescribe(v({ failedCode: 'keyframe_blocked', recoveries: once, autoRecoveries: 1 })).action).toBe('no_skits');
+    expect(prescribe(v({ failedFrom: 'writing', failedCode: 'rules', recoveries: once, autoRecoveries: 1 })).action).toBe('never');
+  });
+
+  it('счётчик — источник правды о круге: история короче счётчика или с мусором не ломает предел', () => {
+    expect(prescribe(v({ recoveries: [], autoRecoveries: MAX_AUTO_RECOVERIES })).action).toBe('never');
+    const junk = [null, rec('later', { delayMin: 30 }), 'x'] as unknown as ShortRecovery[];
+    expect(currentCircle({ recoveries: junk, autoRecoveries: 3 })).toEqual([junk[1]]);
+    expect(() => recoveryWords(currentCircle({ recoveries: junk, autoRecoveries: 3 }))).not.toThrow();
+  });
+
+  it('без сцены «без сценок» нельзя: сценарист пишет текст по сцене и съёмке', () => {
+    expect(prescribe(v({ failedCode: 'omni_budget', scene: null })).action).toBe('never');
+  });
+```
+
+4. В `describe('слова и записи', …)` добавить:
+
+```ts
+  it('паузы словами: «1 ч 30 мин», без паузы — «позже»; незнакомое действие — как есть', () => {
+    expect(recoveryWords([rec('later', { delayMin: 90 }), rec('later', { delayMin: undefined })])).toBe('повтор через 1 ч 30 мин (google_quota), повтор позже (google_quota)');
+    expect(recoveryWords([rec('teleport' as any)])).toBe('teleport (google_quota)');
+  });
+
+  it('recoveryEntry без ошибки — пустая причина; строка доктора — с общим префиксом', () => {
+    expect(recoveryEntry(v({ lastError: null }), { action: 'no_skits' }, new Date(0)).reason).toBe('');
+    expect(newSceneNote(v()).startsWith(`${DOCTOR_NOTE_PREFIX} `)).toBe(true);
+  });
+```
+
+`src/shorts/shorts.contract.spec.ts`, в `describe('контракт API и студии', …)`:
+
+```ts
+  it('каждый код сбоя студии осознанно разнесён в таблице доктора (short-doctor.ts)', () => {
+    const union = studio('errors.ts').match(/export type StudioErrorCode =([^;]+);/)?.[1] ?? '';
+    const codes = [...union.matchAll(/'([a-z_]+)'/g)].map((m) => m[1]);
+    expect(codes.length).toBeGreaterThan(20);
+    const doctor = fs.readFileSync(path.join(__dirname, 'short-doctor.ts'), 'utf8');
+    expect(codes.filter((c) => !doctor.includes(`'${c}'`))).toEqual([]);
+  });
+```
+
+```bash
+git add src/shorts/short-doctor.spec.ts src/shorts/shorts.contract.spec.ts
+git commit -m "test(shorts): доктор — круг по счётчику, последнее действие оживления, паузы словами, сторож кодов студии (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-doctor.spec.ts src/shorts/shorts.contract.spec.ts 2>&1 | grep -E '✕|Tests:|Test Suites:'"
+```
+
+Ожидается: красные — «последнее действие круга», «новая сцена израсходована», «счётчик — источник правды» (`null` в истории роняет `recoveryWords`), «без сцены», «паузы словами», «префикс» (импорт `DOCTOR_NOTE_PREFIX` — `undefined`, `startsWith('undefined ')` ложно) и сторож кодов студии (в `short-doctor.ts` нет явных `'login'`, `'blocked'` и других кодов «позже»). Новые строки таблицы и «позже на весь круг» — зелёные и сейчас.
+
+`src/shorts/short-doctor.ts`:
+
+1. Константы
+
+```ts
+/** Самопочинок на круг — всего и по видам (спека, «Пределы на ролик»). */
+export const MAX_AUTO_RECOVERIES = 3;
+export const MAX_PER_ACTION: Record<HealAction, number> = { later: 2, new_scene: 1, no_skits: 1 };
+/** «Позже»: первый повтор через 30 минут, второй — через 2 часа. */
+export const LATER_DELAYS_MIN = [30, 120];
+```
+
+заменить на
+
+```ts
+/** «Позже»: первый повтор круга через 30 минут, второй — через 2 часа (паузы считаются на весь круг, а не на этап). */
+export const LATER_DELAYS_MIN = [30, 120];
+/** Самопочинок на круг — всего и по видам (спека, «Пределы на ролик»); «позже» — сколько пауз. */
+export const MAX_AUTO_RECOVERIES = 3;
+export const MAX_PER_ACTION: Record<HealAction, number> = { later: LATER_DELAYS_MIN.length, new_scene: 1, no_skits: 1 };
+/** Начало строки доктора в замечаниях: по нему сценарист отличает её от замечаний владельца (shorts-writer.service.ts). */
+export const DOCTOR_NOTE_PREFIX = 'Сам:';
+```
+
+2. После `NO_SKITS` добавить явный список «позже» (логика та же — умолчание, — но каждый код студии теперь разнесён осознанно, сторож — `shorts.contract.spec.ts`):
+
+```ts
+/** Сбои сети, Google, распознавания, стенда — «позже» (у оживления исчерпано — без сценок). Новый код студии — сюда или в таблицы выше. */
+const LATER: readonly string[] = [
+  'relay', 'lease', 'login', 'blocked', 'idle_timeout', 'answer_timeout', 'empty_frame', 'unknown',
+  'omni_failed', 'omni_timeout', 'google_quota', 'keyframe', 'clip_invalid', 'stt', 'omni_unreadable', 'tts', 'video_invalid',
+];
+```
+
+и в `ruleFor` перед комментарием `// Сбои Omni, Google и распознавания — …` — `if (code && LATER.includes(code)) return from === 'animating' ? 'later_then_no_skits' : 'later';` (незнакомый код дальше по-прежнему — «позже»).
+
+3. `currentCircle` заменить на:
+
+```ts
+/** Текущий круг — последние autoRecoveries записей истории; не записи (ручной SQL, мусор) отбрасываются. */
+export function currentCircle(v: Pick<ShortVideo, 'recoveries' | 'autoRecoveries'>): ShortRecovery[] {
+  const all = (Array.isArray(v.recoveries) ? v.recoveries : []).filter((r): r is ShortRecovery => !!r && typeof r === 'object');
+  return v.autoRecoveries > 0 ? all.slice(-v.autoRecoveries) : [];
+}
+```
+
+4. Тип и `prescribe`:
+
+```ts
+export type Prescription = { action: HealAction; delayMin?: number } | { action: 'never' };
+```
+
+→
+
+```ts
+export type Prescription = { action: 'later'; delayMin: number } | { action: 'new_scene' } | { action: 'no_skits' } | { action: 'never' };
+```
+
+а функцию `prescribe` целиком заменить на:
+
+```ts
+/** Что делать с упавшим роликом. «Никак» — и когда пределы круга кончились. */
+export function prescribe(
+  v: Pick<ShortVideo, 'failedFrom' | 'failedCode' | 'format' | 'scene' | 'capture' | 'recoveries' | 'autoRecoveries'>,
+): Prescription {
+  const circle = currentCircle(v);
+  // Источник правды о круге — счётчик: история могла разойтись с ним (ручной SQL).
+  const total = Math.max(circle.length, v.autoRecoveries);
+  if (total >= MAX_AUTO_RECOVERIES) return { action: 'never' };
+  const used = (a: HealAction): number => circle.filter((r) => r.action === a).length;
+  const allowed = (a: HealAction): boolean => used(a) < MAX_PER_ACTION[a];
+  // Без сценок — только ролику со сценками, сценой и съёмкой: сценарист пишет текст по ним.
+  const noSkits = (): Prescription =>
+    allowed('no_skits') && v.format === 'skit' && v.scene && v.capture ? { action: 'no_skits' } : { action: 'never' };
+  const later = (): Prescription | null => (allowed('later') ? { action: 'later', delayMin: LATER_DELAYS_MIN[used('later')] } : null);
+  const animating = v.failedFrom === 'animating';
+  switch (ruleFor(v.failedFrom, v.failedCode)) {
+    case 'later':
+      return later() ?? { action: 'never' };
+    case 'later_then_no_skits':
+      // Последнее действие круга у оживления — без сценок: после неудачного «позже» ролика не было бы
+      // (решение владельца: сценки не удались — собрать без сценок).
+      return total === MAX_AUTO_RECOVERIES - 1 ? noSkits() : later() ?? noSkits();
+    case 'new_scene':
+      if (allowed('new_scene')) return { action: 'new_scene' };
+      // Новая сцена круга израсходована: у оживления — без сценок, у прочих этапов — к владельцу.
+      return animating ? noSkits() : { action: 'never' };
+    case 'no_skits':
+      return noSkits();
+    default:
+      return { action: 'never' };
+  }
+}
+```
+
+5. Слова: `ACTION_WORDS.later` —
+
+```ts
+  later: (r) => `повтор через ${r.delayMin && r.delayMin >= 60 ? `${r.delayMin / 60} ч` : `${r.delayMin ?? LATER_DELAYS_MIN[0]} мин`}`,
+```
+
+→
+
+```ts
+  later: (r) => `повтор ${delayWords(r.delayMin)}`,
+```
+
+и перед `ACTION_WORDS` добавить:
+
+```ts
+/** Пауза словами: «через 30 мин», «через 2 ч», «через 1 ч 30 мин»; без паузы — «позже». */
+function delayWords(min: number | undefined): string {
+  if (!min || min <= 0) return 'позже';
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return `через ${[h ? `${h} ч` : '', m ? `${m} мин` : ''].filter(Boolean).join(' ')}`;
+}
+```
+
+6. `newSceneNote`: `` `Сам: прошлая сцена не удалась — …` `` → `` `${DOCTOR_NOTE_PREFIX} прошлая сцена не удалась — ${clip(oneLine(v.lastError || v.failedCode || 'причина не записана'), 300)}` ``.
+
+7. Тип `Heal` (`Exclude<Prescription, { action: 'never' }>`) остаётся; в `recoveryEntry` строка `...(p.action === 'later' ? { delayMin: p.delayMin } : {}),` работает с новым объединением без правок.
+
+```bash
+git add src/shorts/short-doctor.ts
+git commit -m "fix(shorts): доктор — круг по счётчику, без сценок как последнее действие оживления, префикс «Сам:» общий" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-doctor.spec.ts src/shorts/shorts.contract.spec.ts 2>&1 | grep -E '✕|Tests:'; out=\$(mktemp); npx tsc -p tsconfig.build.json --noEmit >\$out 2>&1 && echo TSC_OK || { echo TSC_FAIL; tail -20 \$out; }"
+```
+
+Ожидается: оба набора без `failed`, `TSC_OK`.
+
 ---
 
 ### Task 6: Доктор — записи в базу и выключатель
@@ -1209,12 +1422,13 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts 2>&1 | grep -E '�
 
 Строка доктора «Сам: прошлая сцена не удалась — …» (`newSceneNote`) дописывается в замечания перед новой сценой. Сценарист считает свои просьбы о новой сцене хвостом строк «Сценарист: …» (`recapturesInRow`), и чужая строка этот хвост обрывала бы: после новой сцены доктора сценарист мог бы попросить ещё две — до трёх новых сцен вместо одной. Строка доктора — не замечание владельца: счёт она не обнуляет и сама в него не входит. Плюс сторожа из ревью задачи 3.
 
-`src/shorts/shorts-writer.service.spec.ts`, после теста `'новое замечание владельца после просьб сценариста — счёт просьб заново'`:
+`src/shorts/shorts-writer.service.spec.ts` — импорт `import { newSceneNote } from './short-doctor';` и после теста `'новое замечание владельца после просьб сценариста — счёт просьб заново'`:
 
 ```ts
   it('строка доктора «Сам: …» — не замечание владельца: счёт просьб сценариста не обнуляет', async () => {
     const { svc, pg } = setup([{ needsRecapture: true, reason: 'нужен вопрос про субаренду' }]);
-    const note = 'про субаренду\nСценарист: нужен вопрос про субаренду\nСценарист: всё ещё не про субаренду\nСам: прошлая сцена не удалась — съёмка: ответ не годится';
+    // Строка — как её пишет доктор (newSceneNote): тест не разойдётся с префиксом.
+    const note = `про субаренду\nСценарист: нужен вопрос про субаренду\nСценарист: всё ещё не про субаренду\n${newSceneNote({ lastError: 'съёмка: ответ не годится', failedCode: 'answer_rejected' })}`;
     const err = await svc.write(video({ owner_note: note })).catch((e) => e);
     expect(err).toMatchObject({ name: 'StageFatalError', code: 'recapture' });
     expect(pg.query).not.toHaveBeenCalled();
@@ -1257,12 +1471,10 @@ function recapturesInRow(ownerNote: string | null): number {
 }
 ```
 
-заменить на
+заменить на (и импорт `import { DOCTOR_NOTE_PREFIX } from './short-doctor';` — общий префикс строки доктора, задача 5, шаг 5)
 
 ```ts
 const RECAPTURE_NOTE = 'Сценарист:';
-/** Строка доктора упавших (newSceneNote, short-doctor.ts) — не замечание владельца: счёт просьб она не обнуляет. */
-const DOCTOR_NOTE = 'Сам:';
 
 /**
  * Просьбы «Сценарист: …» в хвосте замечаний — после последнего замечания
@@ -1273,7 +1485,7 @@ function recapturesInRow(ownerNote: string | null): number {
   const lines = String(ownerNote ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
   let n = 0;
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i].startsWith(DOCTOR_NOTE)) continue;
+    if (lines[i].startsWith(DOCTOR_NOTE_PREFIX)) continue;
     if (!lines[i].startsWith(RECAPTURE_NOTE)) break;
     n++;
   }
