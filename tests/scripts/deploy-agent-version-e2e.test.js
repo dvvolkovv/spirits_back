@@ -36,12 +36,12 @@ rollback_phase() { echo rollback >> "$LOG"; }
 bash() {
   if [[ "$1" == smoke/run.sh ]]; then
     echo standard-smoke >> "$LOG"
-    return "\${SMOKE_STATUS:-0}"
+    return "$SMOKE_STATUS"
   fi
   if [[ "$1" == agent-versions.e2e.mjs ]]; then
     printf 'agent-e2e BASE_URL=%s BASIC_AUTH=%s SSH_TARGET=%s BACK_PATH=%s DEBUG_SECRET=%s RELAY_SSH_TARGET=%s\n' \
       "$BASE_URL" "$BASIC_AUTH" "$SSH_TARGET" "$BACK_PATH" "$DEBUG_SECRET" "$RELAY_SSH_TARGET" >> "$LOG"
-    return "\${AGENT_E2E_STATUS:-0}"
+    return "$AGENT_E2E_STATUS"
   fi
   echo "unexpected-bash $*" >> "$LOG"
   return 99
@@ -70,7 +70,10 @@ function runPhase(phase, env = {}) {
       SSH_TARGET: 'test-ssh',
       TEST_HOST: 'test-ssh',
       PROD_HOST: 'prod-ssh',
+      TEST_BACK_PATH: '/srv/back',
       DEBUG_SECRET: 'dummy-debug-secret',
+      SMOKE_STATUS: '0',
+      AGENT_E2E_STATUS: '0',
       SMOKE_ATTEMPTS: '1',
       NO_ROLLBACK: '',
       SMOKE_ONLY: '',
