@@ -14,12 +14,13 @@ export class ShortsSchemaService implements OnModuleInit {
 
   constructor(private readonly pg: PgService) {}
 
-  /** По порядку: 002–004 правят таблицы, которые создаёт 001. */
+  /** По порядку: 002–005 правят таблицы, которые создаёт 001. */
   async onModuleInit() {
     await this.applyMigration('001_shorts.sql');
     await this.applyMigration('002_skits.sql');
     await this.applyMigration('003_youtube.sql');
     await this.applyMigration('004_skit_feedback.sql');
+    await this.applyMigration('005_doctor.sql');
   }
 
   /**
