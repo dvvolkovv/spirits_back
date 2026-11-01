@@ -280,10 +280,10 @@ describe('очередь студии против живого Postgres', { ski
     );
   });
 
-  it('код отзыва без SkitFeedbackError (смесь попыток, нехватка секунд) — обычный failed с оживления, сценаристу не уходит', async () => {
+  it('код отзыва без SkitFeedbackError (попытки кончились, а промах речи был один) — обычный failed с оживления, сценаристу не уходит', async () => {
     const id = await insert('animate_queued', { writer_rounds: 1 });
     const job = await claimJob(pool, 'animate');
-    assert.equal(await failJob(pool, job!, new StudioError('omni_rejected', 'omni: отказ фильтра — после 3 попыток', false)), 'failed');
+    assert.equal(await failJob(pool, job!, new StudioError('speech_mismatch', 'не услышаны реплики 2, услышано: «это износ» — после 3 попыток (clip_invalid, omni_timeout, speech_mismatch)', false)), 'failed');
     const r = await row(id);
     assert.deepEqual([r.status, r.failed_from, r.writer_feedback, r.skit_feedback], ['failed', 'animating', null, null]);
   });
