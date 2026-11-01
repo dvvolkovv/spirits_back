@@ -255,9 +255,12 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
   const log = deps.log ?? (() => {});
   // Начало круга — не больше счёта ролика: omni_base выше счёта (правка animation в базе
   // руками, опоздавший процесс) увёл бы «потрачено в круге» в минус и дал бы кругу лишние
-  // секунды. Круг — от счёта: строже, а не щедрее.
+  // секунды. Прижимается в пределах запуска, по его стартовому счёту: круг из нескольких
+  // запусков (повторы студии, сценарист по отзыву, «позже» доктора) после такой правки
+  // наберёт до omni_base − счёт сверх предела. Правите animation руками — ставьте и
+  // omni_base (= новый счёт) или жмите кнопку владельца.
   const circleBase = Math.min(omniBase, anim.omniSeconds);
-  if (circleBase < omniBase) log(`animate: начало круга ${omniBase} с больше счёта ролика ${anim.omniSeconds} с — круг считается от ${circleBase} с`);
+  if (circleBase < omniBase) log(`animate: начало круга ${omniBase} с больше счёта ролика ${anim.omniSeconds} с — круг считается от ${circleBase} с; правили animation руками — поставьте omni_base или нажмите кнопку владельца`);
   const abs = (file: string) => path.join(runDir, file);
   const skitFile = (kind: SkitKind, name: string) => path.posix.join('skits', plans[kind].fingerprint, name);
   const keyframeBase = (kind: SkitKind) => path.posix.join('keyframes', plans[kind].keyframeFingerprint);
@@ -497,9 +500,12 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     if (anim.omniSeconds - circleBase + CLIP_SEC > budget) {
       // Круг владельца начат (omni_base) — предел на круг; общий счёт ролика — рядом, для владельца.
       const circle = circleBase > 0 ? `, в этом круге — ${anim.omniSeconds - circleBase} с` : '';
+      // Выход владельца — только из рабочего процесса (omniBase передан): в CLI кнопок нет.
+      // «Замечание» не названо: у ролика, собранного без сценок, формат chat — сценки вернёт «Переснять».
+      const exit = deps.omniBase !== undefined ? '; новый круг со сценками — «Повторить» или «Переснять»' : '';
       throw new StudioError(
         'omni_budget',
-        `на ролик ушло ${anim.omniSeconds} с Omni вместе с запущенными${circle}, предел — ${budget} с${circleBase > 0 ? ' на круг' : ''}: лимит пересъёмок сценок; новый круг — любой кнопкой владельца; поднять предел — настройка «Предел секунд Omni» (update_settings maxOmniSeconds; в CLI — MAX_OMNI_SECONDS=<секунды> npm run animate)`,
+        `на ролик ушло ${anim.omniSeconds} с Omni вместе с запущенными${circle}, предел — ${budget} с${circleBase > 0 ? ' на круг' : ''}: лимит пересъёмок сценок${exit}; поднять предел — настройка «Предел секунд Omni» (update_settings maxOmniSeconds; в CLI — MAX_OMNI_SECONDS=<секунды> npm run animate)`,
         false,
       );
     }

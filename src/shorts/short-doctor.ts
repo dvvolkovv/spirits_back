@@ -119,6 +119,20 @@ export function recoveryWords(entries: ShortRecovery[]): string {
   return entries.map((r) => `${ACTION_WORDS[r.action]?.(r) ?? r.action} (${r.code ?? 'без кода'})`).join(', ');
 }
 
+/** Причина «без сценок» на пределе секунд Omni — владельцу на проверке: выход, а не текст студии. */
+export const OMNI_BUDGET_NO_SKITS = 'исчерпан предел секунд Omni на круг — сценки вернёт «Переснять» (новый круг)';
+
+/**
+ * Почему ролик собран без сценок — строкой подписи на проверку. У omni_budget —
+ * постоянная строка: текст студии длинный (обёртки промахов речи), подсказка в нём
+ * за обрезкой подписи, а «Замечание» сценок не вернёт — формат уже chat; вернёт
+ * «Переснять» (формат из настроек). У остального — причина из истории.
+ */
+export function noSkitsWords(r: ShortRecovery): string {
+  if (r.code === 'omni_budget') return OMNI_BUDGET_NO_SKITS;
+  return r.reason || r.code || 'причина не записана';
+}
+
 /** Ошибка одной строкой: замечания построчные (appendOwnerNote), а ошибки студии бывают многострочными. */
 const oneLine = (text: string): string => text.replace(/\s+/g, ' ').trim();
 

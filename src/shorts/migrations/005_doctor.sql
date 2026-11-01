@@ -19,6 +19,7 @@
 -- начинал круг по секундам (omni_base остался бы от давнего круга — предел строже решённого):
 --   UPDATE short_video SET failed_code = NULL, auto_recoveries = 0, omni_base = COALESCE(floor((animation->>'omniSeconds')::numeric)::int, 0)
 --    WHERE failed_code IS NOT NULL OR auto_recoveries <> 0;
+-- (строкам без хвостов доктора omni_base не переставляется: до первой кнопки владельца их предел строже решённого — безопасно).
 -- Снимать колонки — только после отката кода: убрать 005 из ShortsSchemaService, затем
 --   SET lock_timeout = '5s';
 --   ALTER TABLE short_video DROP COLUMN failed_code, DROP COLUMN auto_recoveries, DROP COLUMN recoveries, DROP COLUMN omni_base;

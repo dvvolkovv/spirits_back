@@ -8,7 +8,7 @@ import { StorageService } from '../common/services/storage.service';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { buildReviewKeyboard, parseShortCallback, parseYoutubeUrl, shortCommandText } from './short-callback';
 import { STAND_MARK, buildReviewCaption, clip, skitCastLine } from './short-captions';
-import { currentCircle, recoveryWords } from './short-doctor';
+import { currentCircle, noSkitsWords, recoveryWords } from './short-doctor';
 import { autoTopicsEnabled, isStand, shortsEnabled } from './short-env';
 import { LEAVE_FROM, RELEASED_SQL, leaveReview, noteForReview } from './short-review';
 import { approveShortIntoSlot } from './short-slot-claim';
@@ -281,7 +281,7 @@ export class ShortsApprovalService {
           }
         : {}),
       ...(circle.length ? { selfHealed: recoveryWords(circle) } : {}),
-      ...(noSkits ? { noSkitsReason: noSkits.reason || noSkits.code || 'причина не записана' } : {}),
+      ...(noSkits ? { noSkitsReason: noSkitsWords(noSkits) } : {}),
     });
     const msg: any = await this.tg.sendVideo(chatId, video, {
       caption,

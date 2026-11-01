@@ -144,7 +144,7 @@ export function omniSpendLine(a: ShortAnimation | null, maxOmniSeconds?: number,
   const usd = (seconds * OMNI_USD_PER_SEC + frames * KEYFRAME_USD).toFixed(2).replace('.', ',');
   // Предел — рядом: владелец видит, сколько пересъёмок ещё осталось в этом круге.
   const of = Number.isInteger(maxOmniSeconds) ? ` из ${maxOmniSeconds}` : '';
-  // Начало круга — не больше счёта, как в студии (circleBase в run-animate.ts): без «в этом круге -48 с».
+  // Начало круга — не больше счёта, как студия в пределах запуска (circleBase в run-animate.ts): без «в этом круге -48 с».
   const base = Math.min(omniBase, seconds);
   if (base <= 0) return `Omni: ${seconds}${of} с, кадров ${frames} ≈ $${usd}`;
   return `Omni: ${seconds} с, кадров ${frames} ≈ $${usd}; в этом круге ${seconds - base}${of} с`;
