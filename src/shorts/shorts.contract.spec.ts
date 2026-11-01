@@ -37,7 +37,7 @@ describe('контракт API и студии', () => {
     const db = studio('worker/db.ts');
     for (const s of [
       "'capture_queued'", "'capturing'", "'render_queued'", "'rendering'", "status = 'writing'", "status = 'pending_review'",
-      'writer_feedback', 'failed_from', 'failure_notified = false', 'questionShotKey', 'answerShotKey', 'review_message_id = NULL',
+      'writer_feedback', 'skit_feedback', 'failed_from', 'failure_notified = false', 'questionShotKey', 'answerShotKey', 'review_message_id = NULL',
       "'animate_queued'", "'animating'", "status = 'render_queued'", 'animation', 'max_omni_seconds',
     ]) {
       expect(db).toContain(s);

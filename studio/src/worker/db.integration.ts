@@ -15,14 +15,14 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
-import { StudioError } from '../errors';
+import { SkitFeedbackError, StudioError } from '../errors';
 import {
   LEASE_MINUTES, MAX_JOB_ATTEMPTS, claimJob, completeAnimate, completeCapture, completeRender, failJob, maxOmniSeconds, minAnswerChars,
   saveAnimation, type StoredCapture,
 } from './db';
 
 const DB_URL = process.env.STUDIO_PG_URL;
-const MIGRATIONS = ['001_shorts.sql', '002_skits.sql'].map((f) => fileURLToPath(new URL(`../../../src/shorts/migrations/${f}`, import.meta.url)));
+const MIGRATIONS = ['001_shorts.sql', '002_skits.sql', '004_skit_feedback.sql'].map((f) => fileURLToPath(new URL(`../../../src/shorts/migrations/${f}`, import.meta.url)));
 const skip = DB_URL ? false : 'нет STUDIO_PG_URL — нужна одноразовая база (рецепт в шапке файла)';
 
 describe('очередь студии против живого Postgres', { skip }, () => {
@@ -255,6 +255,29 @@ describe('очередь студии против живого Postgres', { ski
     assert.equal(await failJob(pool, last!, new StudioError('script_invalid', message, false)), 'failed');
     const f = await row(id);
     assert.deepEqual([f.status, f.failed_from, f.writer_feedback, f.failure_notified, f.lease_until], ['failed', 'writing', message, false, null]);
+  });
+
+  it('сценку не снять с этими репликами — сценаристу с разбором; после третьего круга — failed с этапа сценариста', async () => {
+    const id = await insert('animate_queued', { writer_rounds: 2 });
+    const job = await claimJob(pool, 'animate');
+    const feedback = { kind: 'punchline', code: 'speech_mismatch', lines: [2], heard: 'это только символика периода', reason: null } as const;
+    const err = new SkitFeedbackError({ ...feedback, lines: [...feedback.lines] }, 'сценка 2 (развязка): 2 клипа с этими репликами не прошли сверку речи', 'сценка 2 (развязка): не услышаны реплики 2 — 2 клипа с этим текстом не прошли сверку');
+    assert.equal(await failJob(pool, job!, err), 'writer');
+    const r = await row(id);
+    assert.deepEqual(
+      [r.status, r.writer_feedback, r.skit_feedback, r.attempts, r.lease_until, r.last_error],
+      ['writing', err.writerText, feedback, 0, null, `оживление: ${err.message}`],
+    );
+
+    // Сценарист сдал третий вариант: writer_rounds + 1, отзывы студии стёрты (shorts-writer.service.ts).
+    await pool.query(`UPDATE short_video SET status = 'animate_queued', writer_rounds = 3, writer_feedback = NULL, skit_feedback = NULL WHERE id = $1`, [id]);
+    const last = await claimJob(pool, 'animate');
+    assert.equal(await failJob(pool, last!, err), 'failed');
+    const f = await row(id);
+    assert.deepEqual(
+      [f.status, f.failed_from, f.writer_feedback, f.skit_feedback, f.failure_notified, f.lease_until],
+      ['failed', 'writing', err.writerText, feedback, false, null],
+    );
   });
 
   it('last_error: у незнакомой ошибки — только первая строка; предел 1000 — по символам', async () => {
