@@ -1,5 +1,5 @@
 import type { SlotQueryable } from '../blog/blog-slot-claim';
-import { ShortStatus, ShortVideo, appendOwnerNote, rowToShort } from './shorts.types';
+import { ShortFormat, ShortStatus, ShortVideo, appendOwnerNote, rowToShort } from './shorts.types';
 
 /**
  * Решения по готовому ролику — общие для кнопок в личке (ShortsApprovalService)
@@ -97,18 +97,23 @@ export async function explainRefusal(
  * пока решали, ролик мог уйти в публикацию. «Переснять» вышедшего отправил бы
  * новую версию только в YouTube, «Отклонить» — сделал бы rejected ролик с
  * живым постом.
- * Новый круг: самопочинки доктора считаются заново (auto_recoveries = 0).
+ * «Переснять» — новый круг: самопочинки доктора заново (auto_recoveries = 0),
+ * формат — из настроек (`format`), как у «Новой сцены»: ролик, который доктор
+ * собрал без сценок, снова пробует сценки. У «Отклонить» обнуление ни на что не
+ * влияет, формат не трогается.
  */
 export async function leaveReview(
   pg: SlotQueryable,
   id: string,
   target: 'directing' | 'rejected',
   version?: string | null,
+  format?: ShortFormat | null,
 ): Promise<ReviewResult> {
   const params: any[] = [id, target, LEAVE_FROM];
+  const formatSet = target === 'directing' && format ? `, format = $${params.push(format)}` : '';
   const clause = versionClause(params, version);
   const r = await pg.query(
-    `UPDATE short_video SET status = $2, approved_at = NULL, attempts = 0, lease_until = NULL, last_error = NULL, auto_recoveries = 0, updated_at = now()
+    `UPDATE short_video SET status = $2, approved_at = NULL, attempts = 0, lease_until = NULL, last_error = NULL, auto_recoveries = 0${formatSet}, updated_at = now()
       WHERE id = $1 AND status = ANY($3::text[])
         AND NOT ${RELEASED_SQL}${clause}
       RETURNING *`,

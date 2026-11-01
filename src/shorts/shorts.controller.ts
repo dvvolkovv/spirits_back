@@ -394,7 +394,9 @@ export class ShortsController {
    * собирается без сценок. Без `from` формат прежний: этап повторяется как был.
    *
    * Кнопка владельца начинает новый круг: самопочинки доктора считаются заново
-   * (auto_recoveries = 0), история (recoveries) остаётся.
+   * (auto_recoveries = 0), история (recoveries) остаётся. Кроме повтора упавшей
+   * публикации (approved): ролик уже собран, круг не начинается — пометка
+   * «без сценок — сам» в карточке остаётся.
    *
    * Повтор публикации — только у ролика, который владелец одобрял, сразу (слот —
    * «сейчас») и только по упавшим площадкам: вышедшие не трогаются. Запись — с
@@ -429,7 +431,7 @@ export class ShortsController {
       const r = await tx.query(
         `UPDATE short_video
             SET status = $2, attempts = 0, lease_until = NULL, last_error = NULL, failed_from = NULL, failed_code = NULL,
-                failure_notified = false, writer_rounds = 0, auto_recoveries = 0, owner_note = COALESCE($4::text, owner_note),
+                failure_notified = false, writer_rounds = 0, auto_recoveries = CASE WHEN $2 = 'approved' THEN auto_recoveries ELSE 0 END, owner_note = COALESCE($4::text, owner_note),
                 format = COALESCE($5::text, format),
                 writer_feedback = CASE WHEN $4::text IS NULL THEN writer_feedback ELSE NULL END,
                 skit_feedback = CASE WHEN $4::text IS NULL THEN skit_feedback ELSE NULL END,
@@ -530,7 +532,9 @@ export class ShortsController {
   private async leave(id: string, target: 'directing' | 'rejected', rawVersion: unknown): Promise<ShortVideo> {
     const version = this.version(rawVersion, true);
     if (!UUID.test(id)) throw new BadRequestException('id ролика — uuid');
-    const out = await leaveReview(this.pg, id, target, version);
+    // «Переснять» — формат из настроек, как «Новая сцена» (retry с from): у нового круга свои секунды Omni.
+    const format = target === 'directing' ? (await this.settings.get()).format : null;
+    const out = await leaveReview(this.pg, id, target, version, format);
     if (out.ok === false) return this.refused('leave', out);
     return out.short;
   }

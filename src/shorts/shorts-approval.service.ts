@@ -407,7 +407,9 @@ export class ShortsApprovalService {
       await this.answer(cb, buttonRefusal(v.status));
       return;
     }
-    const out = await leaveReview(this.pg, v.id, target);
+    // «Переснять» — формат из настроек, как в админке (short-review.ts, leaveReview).
+    const format = target === 'directing' ? (await this.settings.get()).format : null;
+    const out = await leaveReview(this.pg, v.id, target, undefined, format);
     if (out.ok === false) {
       await this.answer(
         cb,

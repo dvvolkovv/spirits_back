@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
-import { newSceneNote, prescribe, recoveryEntry } from './short-doctor';
+import { currentCircle, newSceneNote, prescribe, recoveryEntry, recoveryWords } from './short-doctor';
 import { autoHealEnabled } from './short-env';
 import { ShortVideo, appendOwnerNote, retryTarget } from './shorts.types';
 
@@ -35,10 +35,11 @@ export class ShortsDoctorService {
     const p = prescribe(v);
     if (p.action === 'never') {
       // Почему не взялся — в журнал: «никак по таблице» и «круг исчерпан» иначе неотличимы.
-      this.logger.log(`ролик ${v.id}: доктор не берётся (${v.failedFrom}, ${v.failedCode ?? 'без кода'}, самопочинок в круге — ${v.autoRecoveries}) — к владельцу`);
+      this.logger.log(`ролик ${v.id}: доктор не берётся (${v.failedFrom}, ${v.failedCode ?? 'без кода'}, формат ${v.format}, круг: ${recoveryWords(currentCircle(v)) || 'пусто'}) — к владельцу`);
       return 'gave_up';
     }
-    const entry = JSON.stringify([recoveryEntry(v, p, now)]);
+    const rec = recoveryEntry(v, p, now);
+    const entry = JSON.stringify([rec]);
     const done = `attempts = 0, last_error = NULL, failed_from = NULL, failed_code = NULL, failure_notified = false,
             auto_recoveries = auto_recoveries + 1, recoveries = recoveries || $3::jsonb, updated_at = now()`;
     const where = `WHERE id = $1 AND status = 'failed' AND failed_from = $2 AND failure_notified`;
@@ -69,8 +70,7 @@ export class ShortsDoctorService {
       this.logger.log(`ролик ${v.id}: доктор опоздал — ролик уже не в захваченном сбое`);
       return 'gone';
     }
-    const pause = p.action === 'later' ? ` через ${p.delayMin} мин` : '';
-    this.logger.log(`ролик ${v.id}: сам — ${p.action}${pause} (${v.failedFrom}, ${v.failedCode ?? 'без кода'})`);
+    this.logger.log(`ролик ${v.id}: сам — ${recoveryWords([rec])} (${v.failedFrom})`);
     return 'took';
   }
 }
