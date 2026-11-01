@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  NotFoundException,
   OnModuleInit,
 } from '@nestjs/common';
 import * as fs from 'fs';
@@ -95,6 +96,116 @@ export class AgentVersionsService implements OnModuleInit {
       [agentId],
     );
     return result.rows[0] ? toAgentVersion(result.rows[0]) : null;
+  }
+
+  async getVersion(agentId: number, versionId: string): Promise<AgentVersion> {
+    const result = await this.pg.query(
+      `SELECT * FROM agent_versions
+       WHERE id = $1 AND agent_id = $2`,
+      [versionId, agentId],
+    );
+    if (!result.rows[0]) {
+      throw new NotFoundException('Agent version not found');
+    }
+    return toAgentVersion(result.rows[0]);
+  }
+
+  async listVersions(agentId: number, limit = 50): Promise<AgentVersion[]> {
+    const boundedLimit = Number.isFinite(limit)
+      ? Math.min(50, Math.max(1, Math.trunc(limit)))
+      : 50;
+    const result = await this.pg.query(
+      `SELECT * FROM agent_versions
+       WHERE agent_id = $1
+       ORDER BY version DESC
+       LIMIT $2`,
+      [agentId, boundedLimit],
+    );
+    return result.rows.map(toAgentVersion);
+  }
+
+  async getState(agentId: number): Promise<{
+    published: AgentVersion | null;
+    draft: AgentVersion | null;
+  }> {
+    const publishedResult = await this.pg.query(
+      `SELECT * FROM agent_versions
+       WHERE agent_id = $1 AND status = 'published'`,
+      [agentId],
+    );
+    const draftResult = await this.pg.query(
+      `SELECT * FROM agent_versions
+       WHERE agent_id = $1 AND status = 'draft'
+       ORDER BY version DESC
+       LIMIT 1`,
+      [agentId],
+    );
+    return {
+      published: publishedResult.rows[0]
+        ? toAgentVersion(publishedResult.rows[0])
+        : null,
+      draft: draftResult.rows[0] ? toAgentVersion(draftResult.rows[0]) : null,
+    };
+  }
+
+  async publish(
+    actor: string,
+    agentId: number,
+    versionId: string,
+    expectedPublishedId: string | null,
+  ): Promise<AgentVersion> {
+    const draft = await this.getVersion(agentId, versionId);
+    if (draft.status !== 'draft') {
+      throw new ConflictException('Only draft versions can be published');
+    }
+
+    const client = await this.pg.getClient();
+    let committed = false;
+    try {
+      await client.query('BEGIN');
+      const currentResult = await client.query(
+        `SELECT * FROM agent_versions
+         WHERE agent_id = $1 AND status = 'published'
+         FOR UPDATE`,
+        [agentId],
+      );
+      const currentPublished = currentResult.rows[0];
+      if ((currentPublished?.id ?? null) !== expectedPublishedId) {
+        throw new ConflictException('Published version is stale');
+      }
+
+      if (currentPublished) {
+        await client.query(
+          `UPDATE agent_versions
+           SET status = 'superseded'
+           WHERE id = $1 AND agent_id = $2`,
+          [currentPublished.id, agentId],
+        );
+      }
+      const publishedResult = await client.query(
+        `UPDATE agent_versions
+         SET status = 'published', published_at = now(), published_by = $1
+         WHERE id = $2 AND agent_id = $3
+         RETURNING *`,
+        [actor, versionId, agentId],
+      );
+      await client.query(
+        `UPDATE agents
+         SET description = $1, system_prompt = $2
+         WHERE id = $3`,
+        [draft.description, draft.system_prompt, agentId],
+      );
+      await client.query('COMMIT');
+      committed = true;
+      return toAgentVersion(publishedResult.rows[0]);
+    } catch (e) {
+      if (!committed) {
+        await client.query('ROLLBACK').catch(() => undefined);
+      }
+      throw e;
+    } finally {
+      client.release();
+    }
   }
 
   async createDraft(
