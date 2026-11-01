@@ -492,6 +492,9 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         );
       }
       await client.query('COMMIT');
+      // Готовые клипы упавшей склейки лежат под /static/videos — задача мертва,
+      // доклеивать их некому.
+      this.cleanupVeoParts(jobId);
       // Метка «сломано деньгами» — по ней потом подтвердится починка.
       // Сообщение о самом провале шлёт QualityMonitorService, здесь молчим.
       await this.noteProviderOutOfMoney(reason);
@@ -676,11 +679,13 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     if (quotes.length === 0) {
       // В склейке клип — независимая генерация, предыдущего кадра у неё нет:
       // голое «продолжи сцену» дало бы клип про что угодно. Каждый клип несёт
-      // всё описание и номер своей части.
+      // всё описание и номер своей части. Реплика без кавычек сидит в самом
+      // описании — со второго клипа речь запрещена, как у продлений цепочки,
+      // иначе она звучала бы в каждом клипе.
       if (concat) {
         return Array.from({ length: segments }, (_, i) => (i === 0
           ? clean
-          : `${clean}\n\nPart ${i + 1} of ${segments} of one continuous scene: continue the same action from where the previous part ended — the same characters, the same setting and lighting; do not restart the action.`));
+          : `${clean}\n\nPart ${i + 1} of ${segments} of one continuous scene: continue the same action from where the previous part ended — the same characters, the same setting and lighting; do not restart the action. Nobody speaks in this part: no new dialogue, and do not repeat any earlier spoken words.`));
       }
       // Нет реплики в кавычках — база несёт всё, хвосты продолжают без речи.
       const out = [clean];
