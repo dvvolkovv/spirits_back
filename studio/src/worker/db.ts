@@ -106,7 +106,7 @@ export async function claimJob(db: Queryable, kind: JobKind): Promise<Job | null
   await db.query(
     `UPDATE short_video
         SET status = 'failed', failed_from = status, lease_until = NULL, failure_notified = false,
-            last_error = $3, updated_at = now()
+            last_error = $3, failed_code = 'lease', updated_at = now()
       WHERE status = $1 AND attempts >= $2 AND (lease_until IS NULL OR lease_until < now())`,
     [q.running, MAX_JOB_ATTEMPTS, `${q.label}: задание не завершилось за ${LEASE_MINUTES} мин — рабочий процесс студии упал или завис`],
   );
@@ -234,6 +234,8 @@ function errorText(label: string, err: StudioError): string {
  *   (skit_feedback), пока кругов меньше MAX_WRITER_ROUNDS; круги кончились — failed с этапа сценариста;
  * - повторяемый сбой, попытки есть — обратно в очередь с паузой;
  * - иначе failed: failed_from — с чего продолжит «Повторить», владельцу напишет API.
+ * У каждого failed — код сбоя (err.code) в failed_code: по нему доктор API
+ * выбирает самопочинку; у истёкшей аренды (claimJob) — lease.
  * Каждая запись — по номеру захвата; не нашла его — 'gone', ничего не записано.
  */
 export async function failJob(db: Queryable, job: Job, err: StudioError): Promise<FailOutcome> {
@@ -261,9 +263,9 @@ export async function failJob(db: Queryable, job: Job, err: StudioError): Promis
     return write(
       `UPDATE short_video
           SET status = 'failed', failed_from = 'writing', writer_feedback = $4, skit_feedback = $5::jsonb,
-              lease_until = NULL, last_error = $6, failure_notified = false, updated_at = now()
+              lease_until = NULL, last_error = $6, failed_code = $7, failure_notified = false, updated_at = now()
         WHERE id = $1 AND status = $2 AND attempts = $3`,
-      params,
+      [...params, err.code],
       'failed',
     );
   }
@@ -282,9 +284,9 @@ export async function failJob(db: Queryable, job: Job, err: StudioError): Promis
     return write(
       `UPDATE short_video
           SET status = 'failed', failed_from = 'writing', writer_feedback = $4, lease_until = NULL, last_error = $5,
-              failure_notified = false, updated_at = now()
+              failed_code = $6, failure_notified = false, updated_at = now()
         WHERE id = $1 AND status = $2 AND attempts = $3`,
-      [feedback, message],
+      [feedback, message, err.code],
       'failed',
     );
   }
@@ -299,9 +301,10 @@ export async function failJob(db: Queryable, job: Job, err: StudioError): Promis
   }
   return write(
     `UPDATE short_video
-        SET status = 'failed', failed_from = $2, lease_until = NULL, last_error = $4, failure_notified = false, updated_at = now()
+        SET status = 'failed', failed_from = $2, lease_until = NULL, last_error = $4, failed_code = $5,
+            failure_notified = false, updated_at = now()
       WHERE id = $1 AND status = $2 AND attempts = $3`,
-    [message],
+    [message, err.code],
     'failed',
   );
 }

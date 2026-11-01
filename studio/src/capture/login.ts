@@ -17,7 +17,8 @@ export interface Session {
 async function fetchCode(cfg: StudioConfig): Promise<string> {
   for (let attempt = 0; attempt < 10; attempt++) {
     const r = await fetch(`${cfg.apiUrl}/webhook/debug/sms-code/${cfg.demoPhone}`, { headers: { 'X-Debug-Secret': cfg.debugSecret } });
-    if (r.status === 404) throw new StudioError('login', 'login: debug-ручка ответила 404 — неверный DEBUG_SECRET или ручки в этой среде выключены', false);
+    // 404 — настройка среды (секрет или выключенные ручки), а не сбой входа: no_input, доктор его не лечит.
+    if (r.status === 404) throw new StudioError('no_input', 'login: debug-ручка ответила 404 — неверный DEBUG_SECRET или ручки в этой среде выключены', false);
     if (r.ok) {
       const body = (await r.json()) as { code?: string };
       if (body.code) return body.code;

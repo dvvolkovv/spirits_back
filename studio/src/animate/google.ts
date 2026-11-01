@@ -197,9 +197,10 @@ export async function generateKeyframe(d: GoogleDeps, prompt: string, refs: Imag
   } catch {
     throw new StudioError('keyframe', `keyframe: ответ не JSON: ${redact(r.raw, d.apiKey).slice(0, 200)}`, true);
   }
-  // Заблокированный промпт не пройдёт и со второго раза — не тратим попытки.
+  // Заблокированный промпт не пройдёт и со второго раза — не тратим попытки. Свой
+  // код: доктор API ведёт его к новой сцене, а не к повтору, как сбой кадра.
   const blocked = reply.promptFeedback?.blockReason;
-  if (blocked) throw new StudioError('keyframe', `keyframe: Nano Banana заблокировал промпт (${blocked})`, false);
+  if (blocked) throw new StudioError('keyframe_blocked', `keyframe: Nano Banana заблокировал промпт (${blocked})`, false);
   const cand = arr<NonNullable<KeyframeReply['candidates']>[number]>(reply.candidates)[0];
   const part = arr<{ inlineData?: { mimeType?: string; data?: string } }>(cand?.content?.parts).find((p) => typeof p?.inlineData?.data === 'string' && p.inlineData.data);
   // RECITATION и прочие отказы приходят без ошибки HTTP — просто без картинки.
