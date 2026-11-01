@@ -87,8 +87,8 @@ describe('agentReply: isolated agent version test', () => {
     const h = replyHarness();
     const log = jest.spyOn((h.service as any).logger, 'log').mockImplementation(() => {});
     const now = jest.spyOn(Date, 'now')
-      .mockReturnValueOnce(1000)
-      .mockReturnValueOnce(1650);
+      .mockReturnValue(1650)
+      .mockReturnValueOnce(1000);
     let result: any;
     try {
       result = await h.service.generateAgentReplyWithCharge(
