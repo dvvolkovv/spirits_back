@@ -16,6 +16,10 @@ function text(command, args, options = {}) { return execFileSync(command, args, 
 
 function makeBin(work, home) {
   const bin = path.join(work, 'bin');
+  executable(path.join(bin, 'node'), `#!/usr/bin/env bash
+if [[ "$1" == --test ]]; then echo '# fail 0'; exit 0; fi
+exec ${process.execPath} "$@"
+`);
   executable(path.join(bin, 'ssh'), `#!/usr/bin/env bash
 while [[ $# -gt 0 ]]; do
   if [[ "$1" == -o ]]; then shift 2; else shift; break; fi
