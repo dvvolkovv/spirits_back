@@ -18,6 +18,6 @@ CREATE INDEX IF NOT EXISTS agent_versions_recent
   ON agent_versions(agent_id, version DESC);
 INSERT INTO agent_versions
   (agent_id, version, description, system_prompt, status, created_by, published_at, published_by)
-SELECT id, 1, description, system_prompt, 'published', 'migration-008', now(), 'migration-008'
+SELECT id, 1, COALESCE(description, ''), COALESCE(system_prompt, ''), 'published', 'migration-008', now(), 'migration-008'
 FROM agents
 WHERE NOT EXISTS (SELECT 1 FROM agent_versions WHERE agent_id = agents.id);
