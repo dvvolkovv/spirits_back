@@ -89,7 +89,7 @@ if [[ "$1" == -eo ]]; then
 fi
 if [[ -e "$DRAIN_FILE" ]]; then gate=yes; else gate=no; fi
 echo "ps gate=$gate" >> "$WORK/ps.log"
-exit 0
+exit 1
 `);
   executable(path.join(bin, 'git'), `#!/usr/bin/env bash
 if [[ "$1" == diff ]]; then exit 0; fi
