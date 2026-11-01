@@ -118,7 +118,7 @@
   озвучки);
 - до предела осталось хотя бы на один клип (8 с).
 
-Иначе — `failed` с `failed_from = 'animating'` и кодом, дальше решает доктор.
+Иначе: круги сценариста кончились — `failed` с `failed_from = 'writing'` и тем же отзывом, как у отзыва о длине озвучки («Повторить» вернёт ролик сценаристу); на пересъёмку нет секунд — `omni_budget` с `failed_from = 'animating'`. Дальше решает доктор (план 2а, 01.11).
 
 Отзыв — структурой в новом поле `skit_feedback`: сценка (`conflict` |
 `punchline`), код, номера непрозвучавших реплик, услышанное, причина отказа
@@ -173,7 +173,8 @@
 | съёмка | `wrong_assistant`, `question_hidden`, `answer_rejected`, `no_paragraphs`, `frame_size` | новая сцена |
 | сценарист (круги отзыва сборки кончились) | `too_long`, `too_short`, `line_too_short`, `script_invalid` | новая сцена |
 | оживление | `omni_failed`, `omni_timeout`, `google_quota`, `keyframe`, `clip_invalid`, `stt`, `omni_unreadable`, `unknown` | позже; «позже» исчерпано — без сценок |
-| оживление | `omni_budget`, `model_gone`, `google_auth`, `speech_mismatch`, `omni_rejected` | без сценок |
+| оживление | `omni_budget`, `model_gone`, `google_auth` | без сценок |
+| сценарист (круги отзыва о сценке кончились) | `speech_mismatch`, `omni_rejected` | без сценок |
 | оживление | `keyframe_blocked` | новая сцена |
 | сборка | `tts`, `video_invalid`, `stt`, `unknown` | позже |
 | любой | `no_input` | никак |
