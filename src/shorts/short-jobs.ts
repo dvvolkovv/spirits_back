@@ -32,7 +32,7 @@ export const MAX_STAGE_ATTEMPTS = 3;
 export const STAGE_RETRY_DELAYS_SEC = [60, 600];
 
 /**
- * Код детерминированного сбоя этапа API — по нему доктор (short-doctor.ts)
+ * Код сбоя этапа API, который повтором не лечится, — по нему доктор (short-doctor.ts)
  * выбирает самопочинку: rules, recapture, no_scene, no_conflict — новая
  * сцена; no_assistant — сообщение владельцу.
  */
@@ -111,7 +111,7 @@ export type StageOutcome = 'retry' | 'failed' | 'gone';
  * `failed`, `failed_from` (с чего продолжит «Повторить»), и
  * `failure_notified = false`: владельцу напишет следующий тик.
  * Код сбоя — в failed_code: у StageFatalError — его, у исчерпанных повторов —
- * relay (истёкшая аренда — lease, claimStage).
+ * relay — любой не фатальный сбой после исчерпанных попыток: релей, разбор ответа, срок этапа, база (истёкшая аренда — lease, claimStage).
  *
  * Обе записи — по статусу и номеру захвата (attempts растёт на каждом захвате).
  * Из directing и writing ролик не отклонить, условие страхует от второго

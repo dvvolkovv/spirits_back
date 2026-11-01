@@ -5,6 +5,7 @@ import { BlogRelayClient } from '../blog/blog-relay.client';
 import { PgService } from '../common/services/pg.service';
 import { assistantVoice, disclaimerFor } from './short-assistants';
 import { buildCaptions } from './short-captions';
+import { DOCTOR_NOTE_PREFIX } from './short-doctor';
 import { StageFatalError } from './short-jobs';
 import { linkBase, shortLinks, shortTarget } from './short-links';
 import { parseWriterReply } from './short-parse';
@@ -27,11 +28,19 @@ export const MAX_REWRITES = 2;
 export const MAX_RECAPTURES = 2;
 const RECAPTURE_NOTE = 'Сценарист:';
 
-/** Просьбы «Сценарист: …» в хвосте замечаний — после последнего замечания владельца. */
+/**
+ * Просьбы «Сценарист: …» в хвосте замечаний — после последнего замечания
+ * владельца. Строки доктора «Сам: …» не в счёт и счёт не рвут: иначе после
+ * новой сцены доктора сценарист попросил бы ещё две.
+ */
 function recapturesInRow(ownerNote: string | null): number {
   const lines = String(ownerNote ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
   let n = 0;
-  while (n < lines.length && lines[lines.length - 1 - n].startsWith(RECAPTURE_NOTE)) n++;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].startsWith(DOCTOR_NOTE_PREFIX)) continue;
+    if (!lines[i].startsWith(RECAPTURE_NOTE)) break;
+    n++;
+  }
   return n;
 }
 
