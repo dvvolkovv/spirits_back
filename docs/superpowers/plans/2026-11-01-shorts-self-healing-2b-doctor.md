@@ -612,6 +612,83 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.contract.s
 
 Ожидается: студия и живая база `# fail 0`, `tsc` пуст, контракт без `failed`.
 
+- [ ] **Step 5: 404 «No code» — ждать код, а не no_input (ревью задачи 4)**
+
+Debug-ручка отвечает 404 в двух случаях (`src/auth/auth.controller.ts`, `debugSmsCode`): доступа нет (секрет, выключенные ручки) — и секрет верный, но кода в Redis нет (`{ error: 'No code' }`: параллельный вход погасил код, код истёк). Второй — гонка, а не настройка: с `no_input` доктор не стал бы чинить, а владельцу пришло бы «неверный DEBUG_SECRET». Плюс два сторожа из ревью.
+
+`studio/src/capture/login.test.ts`, в конец файла:
+
+```ts
+test('404 «No code» — секрет верный, кода ещё (или уже) нет: ждёт, как пустой ответ, а не no_input', async () => {
+  const real = globalThis.fetch;
+  let codeCalls = 0;
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    if (String(url).includes('/webhook/debug/sms-code/')) {
+      codeCalls++;
+      return codeCalls === 1
+        ? new Response(JSON.stringify({ error: 'No code' }), { status: 404 })
+        : new Response(JSON.stringify({ code: '1234' }), { status: 200 });
+    }
+    return new Response('{}', { status: 200 });
+  }) as typeof fetch;
+  try {
+    // Код — со второго раза; дальше подделка не отдаёт токенов: вход падает на check-code, но уже не как настройка среды.
+    await assert.rejects(loginDemo(cfg), (e: unknown) => e instanceof StudioError && e.code === 'login' && e.retryable === true && /нет токенов/.test(e.message));
+    assert.equal(codeCalls, 2);
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+```
+
+`studio/src/animate/run-animate.test.ts`, тест `'кадр: пустой ответ — ещё попытка; заблокированный промпт — ни одного запуска Omni'`: после `assert.deepEqual(blocked.calls.start, []);` добавить `assert.equal(blocked.calls.keyframe.filter((k) => k.kind === 'conflict').length, 1);` (заблокированный промпт — без повторов кадра).
+
+`src/shorts/shorts.contract.spec.ts`, тест `'очередь студии — те же статусы и колонки'`: строку списка `'failed_code',` заменить на `"failed_code = 'lease'", 'failed_code = $',` (комментарий в `db.ts` один закрыл бы прежнюю проверку).
+
+```bash
+git add studio/src/capture/login.test.ts studio/src/animate/run-animate.test.ts src/shorts/shorts.contract.spec.ts
+git commit -m "test(studio): 404 «No code» — ждать, а не no_input; сторожа блока кадра и failed_code (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+studio/scripts/node-run.sh "npx tsx --test src/capture/login.test.ts src/animate/run-animate.test.ts 2>&1 | grep -E '^not ok|^# (tests|pass|fail)'"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.contract.spec.ts 2>&1 | grep -E '✕|Tests:'"
+```
+
+Ожидается: красный один — новый тест `login.test.ts` (сейчас `no_input`); сторож кадра и контракт — зелёные.
+
+`studio/src/capture/login.ts`, в `fetchCode` строки
+
+```ts
+    // 404 — настройка среды (секрет или выключенные ручки), а не сбой входа: no_input, доктор его не лечит.
+    if (r.status === 404) throw new StudioError('no_input', 'login: debug-ручка ответила 404 — неверный DEBUG_SECRET или ручки в этой среде выключены', false);
+    if (r.ok) {
+      const body = (await r.json()) as { code?: string };
+      if (body.code) return body.code;
+    }
+```
+
+заменить на
+
+```ts
+    if (r.status === 404) {
+      // «No code» — секрет верный, кода в Redis нет (параллельный вход погасил, истёк): ждём, как пустой ответ.
+      // Прочий 404 — настройка среды (секрет или выключенные ручки), а не сбой входа: no_input, доктор его не лечит.
+      const body = (await r.json().catch(() => null)) as { error?: string } | null;
+      if (body?.error !== 'No code') {
+        throw new StudioError('no_input', 'login: debug-ручка ответила 404 — неверный DEBUG_SECRET или ручки в этой среде выключены', false);
+      }
+    } else if (r.ok) {
+      const body = (await r.json()) as { code?: string };
+      if (body.code) return body.code;
+    }
+```
+
+```bash
+git add studio/src/capture/login.ts
+git commit -m "fix(studio): 404 «No code» от debug-ручки — ждать код, а не no_input" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+studio/scripts/node-run.sh "npm test 2>&1 | grep -E '^not ok|^# (tests|pass|fail)'; npm run typecheck"
+```
+
+Ожидается: студия `# fail 0`, `tsc` пуст.
+
 ---
 
 ### Task 5: Доктор — решение без базы
