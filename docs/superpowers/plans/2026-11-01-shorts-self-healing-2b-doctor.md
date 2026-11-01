@@ -2015,6 +2015,131 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts 2>&1 | grep -E '�
 
 Ожидается: оба `Tests:` без `failed`.
 
+- [ ] **Step 5: «Переснять» — формат из настроек; повтор публикации круг не начинает; журнал доктора словами (ревью задачи 8)**
+
+Решения по ревью задачи 8: «Переснять» (новая сцена на ту же тему) берёт формат из настроек, как «Новая сцена» в админке, — иначе ролик, который доктор собрал без сценок, молча переснимется снова без сценок, хотя у нового круга свои секунды Omni. «Повторить» упавшей публикации (цель `approved`) круг не начинает: ролик уже собран, пометка «без сценок — сам» в карточке должна остаться. Журнал доктора — словами, с кругом и форматом. Сторожа: история (`recoveries`) кнопками не стирается; доктора при неожиданном ответе спросили ровно раз.
+
+`src/shorts/short-review.spec.ts`:
+
+- в тестах `'без версии — SQL и параметры кнопок лички: статус, откуда, «не вышел»'` и `'замечание дописано к прежним, ролик — к сценаристу; без версии параметры прежние'` после проверки `auto_recoveries = 0` добавить `expect(sql).not.toMatch(/\brecoveries\s*=/);` (история не стирается);
+- в `describe('leaveReview', …)` добавить:
+
+```ts
+  it('«Переснять» с форматом — формат из настроек, как «Новая сцена»; «Отклонить» формат не трогает', async () => {
+    const pg = fakePg({ rows: [row({ status: 'directing' })] });
+    await leaveReview(pg as any, ID, 'directing', VERSION, 'skit');
+    const [sql, params] = pg.query.mock.calls[0] as any[];
+    expect(sql).toContain('format = $4');
+    expect(sql).toContain('AND updated_at = $5::timestamptz');
+    expect(params).toEqual([ID, 'directing', LEAVE_FROM, 'skit', VERSION]);
+    const rej = fakePg({ rows: [row({ status: 'rejected' })] });
+    await leaveReview(rej as any, ID, 'rejected', VERSION, 'skit');
+    expect((rej.query.mock.calls[0] as any[])[0]).not.toMatch(/format =/);
+  });
+```
+
+`src/shorts/shorts.controller.spec.ts`:
+
+- в тесте `'retry { from: directing, note } — …'` проверку `expect(String(upd[0])).toMatch(/auto_recoveries = 0/);` заменить на `expect(String(upd[0])).toMatch(/auto_recoveries = CASE WHEN \$2 = 'approved' THEN auto_recoveries ELSE 0 END/);` и добавить `expect(String(upd[0])).not.toMatch(/\brecoveries\s*=/);`;
+- в тесте `'redo — к режиссёру через общую запись, версия — в условии записи'` две проверки заменить: `expect(sql).toContain('AND updated_at = $4::timestamptz');` → `expect(sql).toContain('format = $4');` и `expect(sql).toContain('AND updated_at = $5::timestamptz');`; `expect(params).toEqual([ID, 'directing', ['pending_review', 'approved'], VERSION]);` → `expect(params).toEqual([ID, 'directing', ['pending_review', 'approved'], 'chat', VERSION]);` (настройки контроллера в тестах — формат `chat`).
+
+`src/shorts/shorts-approval.service.spec.ts`:
+
+- в `setup` настройки — `const settings = { get: jest.fn(async () => ({ slotDays: [2, 4, 6], slotHourMsk: 18, maxOmniSeconds: 48, format: 'skit' })) };`;
+- в тесте `'«Переснять» — к режиссёру, «Отклонить» — в отказ, с условием на статус'` в конец:
+
+```ts
+    // «Переснять» — формат из настроек (как «Новая сцена»), «Отклонить» формат не трогает.
+    expect(writes[0][0]).toContain('format = $4');
+    expect(writes[0][1][3]).toBe('skit');
+    expect(writes[1][0]).not.toMatch(/format =/);
+```
+
+- в тесте `'неожиданный ответ доктора — сообщение уходит: …'` добавить `expect(doctor.treat).toHaveBeenCalledTimes(1);`.
+
+```bash
+git add src/shorts/short-review.spec.ts src/shorts/shorts.controller.spec.ts src/shorts/shorts-approval.service.spec.ts
+git commit -m "test(shorts): «Переснять» — формат из настроек; повтор публикации круг не начинает; история не стирается (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-review.spec.ts src/shorts/shorts.controller.spec.ts src/shorts/shorts-approval.service.spec.ts 2>&1 | grep -E '✕|Tests:'"
+```
+
+Ожидается: `Tests: 4 failed` — новый тест `leaveReview` с форматом, `redo` контроллера (параметры), `retry` (`CASE`), «Переснять» в личке (формата нет); сторожа истории и «спросили ровно раз» — зелёные.
+
+`src/shorts/short-review.ts`:
+
+- импорт `import { ShortFormat, ShortStatus, ShortVideo, appendOwnerNote, rowToShort } from './shorts.types';`;
+- `leaveReview` целиком (вместе с описанием) заменить на:
+
+```ts
+/**
+ * «Переснять» (`directing`) или «Отклонить» (`rejected`) готового ролика — из
+ * pending_review или approved, если он нигде не вышел. Одобренный теряет
+ * одобрение (`approved_at = NULL`): новую версию человек ещё не видел.
+ * Условие на статус и «не вышел» — в самой записи, а не чтением перед ней:
+ * пока решали, ролик мог уйти в публикацию. «Переснять» вышедшего отправил бы
+ * новую версию только в YouTube, «Отклонить» — сделал бы rejected ролик с
+ * живым постом.
+ * «Переснять» — новый круг: самопочинки доктора заново (auto_recoveries = 0),
+ * формат — из настроек (`format`), как у «Новой сцены»: ролик, который доктор
+ * собрал без сценок, снова пробует сценки. У «Отклонить» обнуление ни на что не
+ * влияет, формат не трогается.
+ */
+export async function leaveReview(
+  pg: SlotQueryable,
+  id: string,
+  target: 'directing' | 'rejected',
+  version?: string | null,
+  format?: ShortFormat | null,
+): Promise<ReviewResult> {
+  const params: any[] = [id, target, LEAVE_FROM];
+  const formatSet = target === 'directing' && format ? `, format = $${params.push(format)}` : '';
+  const clause = versionClause(params, version);
+  const r = await pg.query(
+    `UPDATE short_video SET status = $2, approved_at = NULL, attempts = 0, lease_until = NULL, last_error = NULL, auto_recoveries = 0${formatSet}, updated_at = now()
+      WHERE id = $1 AND status = ANY($3::text[])
+        AND NOT ${RELEASED_SQL}${clause}
+      RETURNING *`,
+    params,
+  );
+  if (r.rows.length) return { ok: true, short: rowToShort(r.rows[0]) };
+  return { ok: false, ...(await explainRefusal(pg, id, LEAVE_FROM)) };
+}
+```
+
+`src/shorts/shorts.controller.ts`:
+
+- в `leave` строку `const out = await leaveReview(this.pg, id, target, version);` заменить на
+
+```ts
+    // «Переснять» — формат из настроек, как «Новая сцена» (retry с from): у нового круга свои секунды Omni.
+    const format = target === 'directing' ? (await this.settings.get()).format : null;
+    const out = await leaveReview(this.pg, id, target, version, format);
+```
+
+- в `retry` `failure_notified = false, writer_rounds = 0, auto_recoveries = 0, owner_note = COALESCE($4::text, owner_note),` → `failure_notified = false, writer_rounds = 0, auto_recoveries = CASE WHEN $2 = 'approved' THEN auto_recoveries ELSE 0 END, owner_note = COALESCE($4::text, owner_note),`; в описании `retry` абзац «Кнопка владельца начинает новый круг: …» дополнить: ` Кроме повтора упавшей публикации (approved): ролик уже собран, круг не начинается — пометка «без сценок — сам» остаётся.`
+
+`src/shorts/shorts-approval.service.ts`, в `leave` строку `const out = await leaveReview(this.pg, v.id, target);` заменить на
+
+```ts
+    // «Переснять» — формат из настроек, как в админке (short-review.ts, leaveReview).
+    const format = target === 'directing' ? (await this.settings.get()).format : null;
+    const out = await leaveReview(this.pg, v.id, target, undefined, format);
+```
+
+`src/shorts/shorts-doctor.service.ts`:
+
+- импорт из `./short-doctor` дополнить `currentCircle, recoveryWords`;
+- строку `this.logger.log(\`ролик ${v.id}: доктор не берётся (…) — к владельцу\`);` заменить на `this.logger.log(\`ролик ${v.id}: доктор не берётся (${v.failedFrom}, ${v.failedCode ?? 'без кода'}, формат ${v.format}, круг: ${recoveryWords(currentCircle(v)) || 'пусто'}) — к владельцу\`);`;
+- `const entry = JSON.stringify([recoveryEntry(v, p, now)]);` → `const rec = recoveryEntry(v, p, now);` и `const entry = JSON.stringify([rec]);`; строку журнала после записи (`ролик ${v.id}: сам — ${p.action}…`) — на `this.logger.log(\`ролик ${v.id}: сам — ${recoveryWords([rec])} (${v.failedFrom})\`);` (а строку `const pause = …` — убрать, если она больше не нужна).
+
+```bash
+git add src/shorts/short-review.ts src/shorts/shorts.controller.ts src/shorts/shorts-approval.service.ts src/shorts/shorts-doctor.service.ts
+git commit -m "feat(shorts): «Переснять» — формат из настроек; повтор публикации круг не начинает; журнал доктора словами" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts 2>&1 | grep -E '✕|^Tests:'; SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts 2>&1 | grep -E '✕|^Tests:'; out=\$(mktemp); npx tsc -p tsconfig.build.json --noEmit >\$out 2>&1 && echo TSC_OK || { echo TSC_FAIL; tail -20 \$out; }"
+```
+
+Ожидается: оба `Tests:` без `failed`, `TSC_OK`. (Живой тест «Переснять» из админки `redo` прогоняет новый SQL с форматом на настоящем Postgres.)
+
 ---
 
 ### Task 9: «Сам восстанавливался» и «Собран без сценок» в подписи на проверку
@@ -2484,9 +2609,9 @@ studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts src/w
 export const NEW_OMNI_CIRCLE_SQL = "omni_base = COALESCE((animation->>'omniSeconds')::int, 0)";
 ```
 
-и в записях: `leaveReview` — `…, last_error = NULL, auto_recoveries = 0, updated_at = now()` → `…, last_error = NULL, auto_recoveries = 0, ${NEW_OMNI_CIRCLE_SQL}, updated_at = now()`; `noteForReview` — `SET owner_note = $2, status = 'writing', writer_rounds = 0, attempts = 0, auto_recoveries = 0,` → `SET owner_note = $2, status = 'writing', writer_rounds = 0, attempts = 0, auto_recoveries = 0, ${NEW_OMNI_CIRCLE_SQL},`.
+и в записях: `leaveReview` — `…, last_error = NULL, auto_recoveries = 0${formatSet}, updated_at = now()` → `…, last_error = NULL, auto_recoveries = 0, ${NEW_OMNI_CIRCLE_SQL}${formatSet}, updated_at = now()` (у «Отклонить» новый круг по секундам ни на что не влияет); `noteForReview` — `SET owner_note = $2, status = 'writing', writer_rounds = 0, attempts = 0, auto_recoveries = 0,` → `SET owner_note = $2, status = 'writing', writer_rounds = 0, attempts = 0, auto_recoveries = 0, ${NEW_OMNI_CIRCLE_SQL},`.
 
-`src/shorts/shorts.controller.ts`: в импорт из `./short-review` добавить `NEW_OMNI_CIRCLE_SQL`; в `retry` `failure_notified = false, writer_rounds = 0, auto_recoveries = 0, owner_note = COALESCE($4::text, owner_note),` → `failure_notified = false, writer_rounds = 0, auto_recoveries = 0, ${NEW_OMNI_CIRCLE_SQL}, owner_note = COALESCE($4::text, owner_note),`; в описании `retry` абзац задачи 8 («Кнопка владельца начинает новый круг: …») дополнить: ` Новый круг — и для секунд Omni: предел считается от omni_base.`; в `LIST_COLUMNS` — `'failed_code', 'auto_recoveries', 'recoveries', 'omni_base', 'published_at', …`.
+`src/shorts/shorts.controller.ts`: в импорт из `./short-review` добавить `NEW_OMNI_CIRCLE_SQL`; в `retry` `failure_notified = false, writer_rounds = 0, auto_recoveries = CASE WHEN $2 = 'approved' THEN auto_recoveries ELSE 0 END, owner_note = COALESCE($4::text, owner_note),` → `failure_notified = false, writer_rounds = 0, auto_recoveries = CASE WHEN $2 = 'approved' THEN auto_recoveries ELSE 0 END, ${NEW_OMNI_CIRCLE_SQL}, owner_note = COALESCE($4::text, owner_note),`; в описании `retry` абзац задачи 8 («Кнопка владельца начинает новый круг: …») дополнить: ` Новый круг — и для секунд Omni: предел считается от omni_base.`; в `LIST_COLUMNS` — `'failed_code', 'auto_recoveries', 'recoveries', 'omni_base', 'published_at', …`.
 
 `src/shorts/shorts.types.ts`: в `ShortVideo` после `recoveries: ShortRecovery[];` —
 
@@ -2640,6 +2765,6 @@ SELECT pid, application_name, state, now() - xact_start AS age, left(query, 80)
   FROM pg_stat_activity WHERE xact_start < now() - interval '5 seconds' AND pid <> pg_backend_pid();
 ```
 
-Сразу после — колонки 005 на месте (`SELECT column_name FROM information_schema.columns WHERE table_name = 'short_video' AND column_name IN ('failed_code','auto_recoveries','recoveries','omni_base')` — четыре строки; `deploy.sh` после рестарта ждёт только `/webhook/agents`, smoke ролики не трогает — сорванный накат выкат не покажет), `linkeon-studio` перезапущена, хеш бандла кабинета — новый. Колонок нет — первый накат не дождался замка (`lock_timeout` 5 с, в журнале API `shorts migration 005_doctor.sql failed … lock timeout`): без них встаёт весь конвейер — первые запросы `claimStage` (режиссёр, сценарист) и `claimJob` студии пишут `failed_code` и падают на каждом тике; падают и разбор упавших, список «Ролики», «Повторить» и `failJob`. Порядок, каждое действие на проде — с OK владельца: `pm2 stop linkeon-studio` → блокирующая сессия в `pg_stat_activity` → рестарт API без живых ходов → колонки появились → `pm2 start linkeon-studio`.
+Сразу после — колонки 005 на месте (`SELECT column_name FROM information_schema.columns WHERE table_name = 'short_video' AND column_name IN ('failed_code','auto_recoveries','recoveries','omni_base')` — четыре строки; `deploy.sh` после рестарта ждёт только `/webhook/agents`, smoke ролики не трогает — сорванный накат выкат не покажет), `linkeon-studio` перезапущена, хеш бандла кабинета — новый. Колонок нет — первый накат не дождался замка (`lock_timeout` 5 с, в журнале API `shorts migration 005_doctor.sql failed … lock timeout`): без них встаёт весь конвейер — первые запросы `claimStage` (режиссёр, сценарист) и `claimJob` студии пишут `failed_code` и падают на каждом тике; падают и разбор упавших, список «Ролики», `failJob` и все кнопки владельца, пишущие счётчик круга: «Повторить», «Замечание», «Переснять»/«Отклонить» в админке и в личке (там кнопка повиснет без ответа — исключение раньше `answerCallbackQuery`). Порядок, каждое действие на проде — с OK владельца: `pm2 stop linkeon-studio` → блокирующая сессия в `pg_stat_activity` → рестарт API без живых ходов → колонки появились → `pm2 start linkeon-studio`.
 
 - [ ] **Step 4: Заметка памяти и рабочее состояние** — очередь 2б на проде (sha бэка и кабинета), итог учений, выключатель `SHORTS_AUTO_HEAL`.
