@@ -1128,6 +1128,92 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts 2>&1 | grep -E '�
 
 Ожидается: оба `Tests:` без `failed`, `TSC_OK`.
 
+- [ ] **Step 5 (попутно): «Сам:» в счёте просьб сценариста и хвосты ревью задачи 3**
+
+Строка доктора «Сам: прошлая сцена не удалась — …» (`newSceneNote`) дописывается в замечания перед новой сценой. Сценарист считает свои просьбы о новой сцене хвостом строк «Сценарист: …» (`recapturesInRow`), и чужая строка этот хвост обрывала бы: после новой сцены доктора сценарист мог бы попросить ещё две — до трёх новых сцен вместо одной. Строка доктора — не замечание владельца: счёт она не обнуляет и сама в него не входит. Плюс сторожа из ревью задачи 3.
+
+`src/shorts/shorts-writer.service.spec.ts`, после теста `'новое замечание владельца после просьб сценариста — счёт просьб заново'`:
+
+```ts
+  it('строка доктора «Сам: …» — не замечание владельца: счёт просьб сценариста не обнуляет', async () => {
+    const { svc, pg } = setup([{ needsRecapture: true, reason: 'нужен вопрос про субаренду' }]);
+    const note = 'про субаренду\nСценарист: нужен вопрос про субаренду\nСценарист: всё ещё не про субаренду\nСам: прошлая сцена не удалась — съёмка: ответ не годится';
+    const err = await svc.write(video({ owner_note: note })).catch((e) => e);
+    expect(err).toMatchObject({ name: 'StageFatalError', code: 'recapture' });
+    expect(pg.query).not.toHaveBeenCalled();
+  });
+```
+
+`src/shorts/shorts-director.service.spec.ts` — импорт `StageFatalError` снова в деле: в тесте `'кривой ответ режиссёра — обычная ошибка: этап повторится'` после ожидания `rejects.toThrow(/режиссёр: не нашёл JSON/)` добавить `expect(await svc.direct(video()).catch((e) => e)).not.toBeInstanceOf(StageFatalError);`, в тесте `'провокационная подача, ассистент не задан, режиссёр выбрал ассистента здоровья — отклоняем'` после ожидания `rejects.toThrow(…)` — `expect(await svc.direct(video({ angle: 'roast', assistant_id: null })).catch((e) => e)).not.toBeInstanceOf(StageFatalError);` (обычная ошибка — этап повторится, фатальная — сразу к доктору: это решает его действие).
+
+`src/shorts/short-jobs.spec.ts`, в `describe('stageFailed', …)`:
+
+```ts
+  it('ошибка со своим code (сеть, pg) — в failed_code всё равно relay: код берётся только у StageFatalError', async () => {
+    const p = pg();
+    await stageFailed(p, video(3), 'режиссёр', Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }));
+    expect(p.calls[0].params[4]).toBe('relay');
+  });
+```
+
+`src/shorts/shorts.integration.spec.ts`: в тесте этапа, где третья неудача даёт `failed` (последняя проверка — `expect([row.status, row.failed_from, row.failure_notified, row.last_error]).toEqual(['failed', 'directing', false, 'режиссёр: релей молчит']);`), добавить `expect(row.failed_code).toBe('relay');`; в тесте `'аренда истекла посреди работы: …'` последний запрос `SELECT status, failed_from, failure_notified FROM short_video WHERE id = $1` → `SELECT status, failed_from, failure_notified, failed_code FROM short_video WHERE id = $1`, ожидание → `{ status: 'failed', failed_from: 'directing', failure_notified: false, failed_code: 'lease' }`.
+
+```bash
+git add src/shorts/shorts-writer.service.spec.ts src/shorts/shorts-director.service.spec.ts src/shorts/short-jobs.spec.ts src/shorts/shorts.integration.spec.ts
+git commit -m "test(shorts): «Сам:» не обнуляет счёт просьб сценариста; сторожа кодов этапов (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-writer.service.spec.ts src/shorts/shorts-director.service.spec.ts src/shorts/short-jobs.spec.ts 2>&1 | grep -E '✕|Tests:'"
+```
+
+Ожидается: `Tests: 1 failed` — тест «Сам:» (хвост оборван строкой доктора → ролик ушёл к режиссёру, `pg.query` вызван). Остальные новые проверки — сторожа, зелёные сразу.
+
+`src/shorts/shorts-writer.service.ts`, строки
+
+```ts
+const RECAPTURE_NOTE = 'Сценарист:';
+
+/** Просьбы «Сценарист: …» в хвосте замечаний — после последнего замечания владельца. */
+function recapturesInRow(ownerNote: string | null): number {
+  const lines = String(ownerNote ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
+  let n = 0;
+  while (n < lines.length && lines[lines.length - 1 - n].startsWith(RECAPTURE_NOTE)) n++;
+  return n;
+}
+```
+
+заменить на
+
+```ts
+const RECAPTURE_NOTE = 'Сценарист:';
+/** Строка доктора упавших (newSceneNote, short-doctor.ts) — не замечание владельца: счёт просьб она не обнуляет. */
+const DOCTOR_NOTE = 'Сам:';
+
+/**
+ * Просьбы «Сценарист: …» в хвосте замечаний — после последнего замечания
+ * владельца. Строки доктора «Сам: …» не в счёт и счёт не рвут: иначе после
+ * новой сцены доктора сценарист попросил бы ещё две.
+ */
+function recapturesInRow(ownerNote: string | null): number {
+  const lines = String(ownerNote ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
+  let n = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].startsWith(DOCTOR_NOTE)) continue;
+    if (!lines[i].startsWith(RECAPTURE_NOTE)) break;
+    n++;
+  }
+  return n;
+}
+```
+
+`src/shorts/short-jobs.ts`: в комментарии над `StageFatalCode` `* Код детерминированного сбоя этапа API — по нему доктор (short-doctor.ts)` → `* Код сбоя этапа API, который повтором не лечится, — по нему доктор (short-doctor.ts)`; в описании `stageFailed` строку `* relay (истёкшая аренда — lease, claimStage).` → `* relay — любой не фатальный сбой после исчерпанных попыток: релей, разбор ответа, срок этапа, база (истёкшая аренда — lease, claimStage).`
+
+```bash
+git add src/shorts/shorts-writer.service.ts src/shorts/short-jobs.ts
+git commit -m "fix(shorts): строка доктора «Сам:» не обнуляет счёт просьб сценариста; точнее комментарии кодов этапов" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts 2>&1 | grep -E '✕|^Tests:'; SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts 2>&1 | grep -E '✕|^Tests:'"
+```
+
+Ожидается: оба `Tests:` без `failed`.
+
 ---
 
 ### Task 7: Доктор в разборе упавших; «Сам пробовал»
