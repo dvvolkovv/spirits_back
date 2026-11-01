@@ -1407,6 +1407,114 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.contract.s
 
 Ожидается: `# fail 0` у живой базы студии; контракт — `Tests:` без `failed`.
 
+- [ ] **Step 5: Правки по ревью качества (второй заход)**
+
+Ревью качества (01.11): критичного нет; тест не доказывал `failure_notified = false` (колонка и так `DEFAULT false`) и не проверял `last_error` у `failed`; нет сторожей «выбор ветки — по классу ошибки, а не по коду», «опоздавший захват оживления — gone» и «отзыв о сценке доходит до очереди тем же экземпляром»; описания говорили «три отказа фильтра», хотя к сценаристу ведут и попытки, кончившиеся отказом фильтра; описание `MAX_WRITER_ROUNDS` и шапка живых тестов устарели. Все новые тесты — сторожа: проходят сразу.
+
+`studio/src/worker/db.integration.ts`:
+
+1. Шапку файла
+
+```ts
+ * Очередь студии против живого Postgres — той же миграцией, что катит API
+ * (src/shorts/migrations/001_shorts.sql): так контракт колонок проверяется на
+ * настоящей схеме.
+```
+
+заменить на
+
+```ts
+ * Очередь студии против живого Postgres — теми же миграциями, что катит API
+ * (src/shorts/migrations: 001, 002, 004; 003 — колонки YouTube, студии не нужны):
+ * так контракт колонок проверяется на настоящей схеме.
+```
+
+2. В тесте `'сценку не снять с этими репликами — сценаристу с разбором; после третьего круга — failed с этапа сценариста'` строку `const id = await insert('animate_queued', { writer_rounds: 2 });` заменить на `const id = await insert('animate_queued', { writer_rounds: 2, failure_notified: true });`, а последнюю проверку
+
+```ts
+    assert.deepEqual(
+      [f.status, f.failed_from, f.writer_feedback, f.skit_feedback, f.failure_notified, f.lease_until],
+      ['failed', 'writing', err.writerText, feedback, false, null],
+    );
+```
+
+на
+
+```ts
+    assert.deepEqual(
+      [f.status, f.failed_from, f.writer_feedback, f.skit_feedback, f.failure_notified, f.lease_until, f.last_error],
+      ['failed', 'writing', err.writerText, feedback, false, null, `оживление: ${err.message}`],
+    );
+```
+
+3. Сразу после этого теста добавить:
+
+```ts
+  it('код отзыва без SkitFeedbackError (смесь попыток, нехватка секунд) — обычный failed с оживления, сценаристу не уходит', async () => {
+    const id = await insert('animate_queued', { writer_rounds: 1 });
+    const job = await claimJob(pool, 'animate');
+    assert.equal(await failJob(pool, job!, new StudioError('omni_rejected', 'omni: отказ фильтра — после 3 попыток', false)), 'failed');
+    const r = await row(id);
+    assert.deepEqual([r.status, r.failed_from, r.writer_feedback, r.skit_feedback], ['failed', 'animating', null, null]);
+  });
+
+  it('опоздавшее оживление с отзывом о сценке — gone, строка не тронута', async () => {
+    const id = await insert('animate_queued');
+    const late = await claimJob(pool, 'animate');
+    await pool.query(`UPDATE short_video SET lease_until = now() - interval '1 second' WHERE id = $1`, [id]);
+    const current = await claimJob(pool, 'animate');
+    assert.deepEqual([late?.attempts, current?.attempts], [1, 2]);
+    const before = await row(id);
+    const err = new SkitFeedbackError(
+      { kind: 'conflict', code: 'omni_rejected', lines: [], heard: null, reason: 'omni: отказ фильтра — violence' },
+      'сценка 1 (конфликт): фильтр Google не пропускает клип',
+      'сценка 1 (конфликт): omni: отказ фильтра — violence — после 3 попыток',
+    );
+    assert.equal(await failJob(pool, { ...late!, writerRounds: 1 }, err), 'gone');
+    assert.equal(await failJob(pool, { ...late!, writerRounds: 3 }, err), 'gone');
+    assert.deepEqual(await row(id), before);
+  });
+```
+
+`studio/src/worker/jobs.test.ts`: импорт `import { StudioError } from '../errors';` заменить на `import { SkitFeedbackError, StudioError } from '../errors';`; после теста `'оживление: задание уже не наше — сохранение по ходу отказывает, сбой без повтора'` добавить:
+
+```ts
+test('оживление: отзыв о сценке доходит до очереди тем же экземпляром — по нему failJob вернёт ролик сценаристу', async () => {
+  const { queue, calls } = fakeQueue({ animate: job('animate', { capture: skitCapture, script: skitScript }) }, { failOutcome: 'writer' });
+  const thrown = new SkitFeedbackError(
+    { kind: 'punchline', code: 'speech_mismatch', lines: [1], heard: 'другое', reason: null },
+    'сценка 2 (развязка): 2 клипа с этими репликами не прошли сверку речи',
+    'сценка 2 (развязка): не услышаны реплики 1',
+  );
+  const d = deps({
+    queue,
+    storage: fakeStorage().storage,
+    animate: async () => {
+      throw thrown;
+    },
+  });
+  await runOne(d);
+  assert.equal(calls.fail.length, 1);
+  assert.equal((calls.fail[0] as [string, StudioError])[1], thrown);
+});
+```
+
+Описания (только комментарии):
+
+- `studio/src/worker/db.ts`, описание `MAX_WRITER_ROUNDS`: `прибавляет writer_rounds, когда сценарист сдаёт сценарий, и сборка с` / `writer_rounds = 3 уже не возвращает, а сдаётся (failJob).` → `прибавляет writer_rounds, когда сценарист сдаёт сценарий, и сборка или оживление с` / `writer_rounds = 3 уже не возвращают, а сдаются (failJob).`
+- `studio/src/worker/db.ts`, пункт в описании `failJob`: `не прошли сверку речи или три отказа фильтра)` → `не прошли сверку речи или попытки кончились отказом фильтра)`.
+- `studio/src/errors.ts`, описание `SkitFeedbackError`: `речи или фильтр Google трижды отказал.` → `речи или попытки кончились отказом фильтра Google.`
+- `studio/src/types.ts` и `src/shorts/shorts.types.ts`, описания `SkitFeedback` / `ShortSkitFeedback`: `не прошли сверку речи или фильтр Google трижды` / `отказал.` → `не прошли сверку речи или попытки кончились` / `отказом фильтра Google.` (перенос строк — как удобно, в пределах прежней ширины).
+
+```bash
+git add studio/src/worker/db.integration.ts studio/src/worker/jobs.test.ts studio/src/worker/db.ts studio/src/errors.ts studio/src/types.ts src/shorts/shorts.types.ts
+git commit -m "test(studio): отзыв о сценке в очереди — уведомление, выбор по классу, опоздавший захват; точнее описания" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+studio/scripts/node-run.sh "STUDIO_PG_URL=postgresql://studioit:studioit@127.0.0.1:5432/studio_it npm run test:db 2>&1 | grep -E '^not ok|^# (tests|pass|fail)'; npx tsx --test src/worker/jobs.test.ts 2>&1 | grep -E '^not ok|^# (tests|pass|fail)'; npm run typecheck"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.contract.spec.ts src/shorts/shorts.types.spec.ts 2>&1 | grep -E '✕|Tests:'"
+```
+
+Ожидается: живая база — `# tests 18`, `# fail 0`; `jobs.test.ts` — `# fail 0`; `tsc` пуст; jest — `Tests:` без `failed`.
+
 ---
 
 ### Task 7: Полный прогон, учения на стенде, выкат
