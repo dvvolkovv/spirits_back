@@ -171,10 +171,10 @@ function loadAnimation(file: string): ShortAnimation {
  * rejected-*.json (код, услышанное, версия сверки); брак, который нынешняя
  * сверка ещё не судила, перепроверяется до новой оплаты (reviveRejected).
  *
- * Два клипа одного текста сценки не прошли сверку речи или попытки кончились
- * отказом фильтра — третий клип не снимается: SkitFeedbackError, ролик уходит
- * сценаристу с отзывом о сценке (worker/db.ts, failJob), если на пересъёмку
- * остался хотя бы клип; иначе omni_budget с причиной.
+ * Два клипа одного текста сценки не прошли сверку речи (третий не снимается) или
+ * попытки кончились отказом фильтра — SkitFeedbackError: ролик уходит сценаристу
+ * с отзывом о сценке (worker/db.ts, failJob), если на пересъёмку остался хотя бы
+ * клип; иначе omni_budget с причиной.
  */
 export async function animateRun(runDir: string, deps: AnimateDeps): Promise<ShortAnimation> {
   const script = JSON.parse(fs.readFileSync(path.join(runDir, 'script.json'), 'utf8')) as Script;
