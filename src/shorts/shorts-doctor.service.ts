@@ -35,7 +35,7 @@ export class ShortsDoctorService {
     const p = prescribe(v);
     if (p.action === 'never') {
       // Почему не взялся — в журнал: «никак по таблице» и «круг исчерпан» иначе неотличимы.
-      this.logger.log(`ролик ${v.id}: доктор не берётся (${v.failedFrom}, ${v.failedCode ?? 'без кода'}, формат ${v.format}, круг: ${recoveryWords(currentCircle(v)) || 'пусто'}) — к владельцу`);
+      this.logger.log(`ролик ${v.id}: доктор не берётся (${v.failedFrom}, ${v.failedCode ?? 'без кода'}, формат ${v.format}, круг ${v.autoRecoveries}: ${recoveryWords(currentCircle(v)) || 'пусто'}) — к владельцу`);
       return 'gave_up';
     }
     const rec = recoveryEntry(v, p, now);
@@ -70,7 +70,7 @@ export class ShortsDoctorService {
       this.logger.log(`ролик ${v.id}: доктор опоздал — ролик уже не в захваченном сбое`);
       return 'gone';
     }
-    this.logger.log(`ролик ${v.id}: сам — ${recoveryWords([rec])} (${v.failedFrom})`);
+    this.logger.log(`ролик ${v.id}: сам — ${recoveryWords([rec])}, этап ${v.failedFrom}`);
     return 'took';
   }
 }

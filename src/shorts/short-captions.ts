@@ -154,7 +154,7 @@ export function buildReviewCaption(i: ReviewCaptionInput): { caption: string; ex
     `Ассистент: ${i.assistantName}`,
     `Вопрос: «${clip(i.question, 300)}»`,
     ...(i.skits ? [`Сценки: ${clip(i.skits.cast, 200)}`, omniSpendLine(i.skits.animation, i.skits.maxOmniSeconds)] : []),
-    ...(i.selfHealed ? [`Сам восстанавливался: ${clip(i.selfHealed, 300)}`] : []),
+    ...(i.selfHealed ? [`Сам восстанавливался: ${clip(i.selfHealed, 150)}`] : []),
     ...(i.noSkitsReason ? [`Собран без сценок: ${clip(i.noSkitsReason, 200)}`] : []),
     `Выйдет: ${i.when}`,
   ].join('\n');
