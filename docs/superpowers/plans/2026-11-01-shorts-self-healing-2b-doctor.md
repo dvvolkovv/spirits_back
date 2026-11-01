@@ -1841,6 +1841,105 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts 2>&1 | grep -E '�
 
 Ожидается: оба `Tests:` без `failed` (живые тесты `notifyFailures` строят сервис без доктора — поведение прежнее).
 
+- [ ] **Step 5 (попутно): молчать только на took и gone; сторожа разбора; журнал доктора (ревью задачи 7)**
+
+Ревью задачи 7: `!== 'gave_up' → continue` молча спрятал бы сбой при любом неожиданном ответе доктора — молчим только на `took` и `gone`. Не закреплены: строка «Сам пробовал» не печатается у публикации и при наличии круга; после `took` разбор продолжает со следующим упавшим (`continue`, а не `return`). В журнале нет стека ошибки доктора и причины его отказа.
+
+`src/shorts/shorts-approval.service.spec.ts`, в `describe('сообщения о сбоях', …)`:
+
+1. В тесте `'упавшая публикация — доктора не спрашивают'` в объект `failedOnce(pg, { … })` добавить круг: `auto_recoveries: 1, recoveries: [{ at: '2030-01-01T08:00:00.000Z', from: 'animating', code: 'omni_budget', action: 'no_skits', reason: 'r' }],` — а в конец теста `expect((tg.sendMessage.mock.calls[0] as any[])[1]).not.toContain('Сам пробовал');`.
+
+2. Новые тесты:
+
+```ts
+    it('два упавших за один разбор: первый взял доктор, второй — сообщение; оба спрошены', async () => {
+      const doctor = { treat: jest.fn().mockResolvedValueOnce('took').mockResolvedValueOnce('gave_up') };
+      const { svc, tg, pg } = setup(row(), doctor);
+      let n = 0;
+      pg.query.mockImplementation(async (sql: string) => {
+        if (sql.includes('failure_notified = true') && n < 2) {
+          n++;
+          return { rows: [row({ status: 'failed', last_error: `оживление: сбой ${n}`, failed_from: 'animating', failed_code: 'google_quota' })] };
+        }
+        return { rows: [] };
+      });
+      await svc.notifyFailures();
+      expect(doctor.treat).toHaveBeenCalledTimes(2);
+      expect(tg.sendMessage).toHaveBeenCalledTimes(1);
+      expect((tg.sendMessage.mock.calls[0] as any[])[1]).toContain('оживление: сбой 2');
+    });
+
+    it('неожиданный ответ доктора — сообщение уходит: молчим только на took и gone', async () => {
+      const doctor = { treat: jest.fn(async () => undefined) };
+      const { svc, tg, pg } = setup(row(), doctor);
+      failedOnce(pg, { last_error: 'оживление: лимит', failed_from: 'animating', failed_code: 'google_quota' });
+      await svc.notifyFailures();
+      expect(tg.sendMessage).toHaveBeenCalledTimes(1);
+    });
+```
+
+```bash
+git add src/shorts/shorts-approval.service.spec.ts
+git commit -m "test(shorts): разбор упавших — молчать только на took и gone; сторожа публикации и продолжения (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-approval.service.spec.ts 2>&1 | grep -E '✕|Tests:'"
+```
+
+Ожидается: `Tests: 1 failed` — «неожиданный ответ доктора» (сейчас `undefined !== 'gave_up'` → тишина); остальные — сторожа, зелёные.
+
+`src/shorts/shorts-approval.service.ts`, в `notifyFailures` строки
+
+```ts
+        try {
+          if ((await this.doctor.treat(v)) !== 'gave_up') continue;
+        } catch (e: any) {
+          this.logger.error(`доктор: ролик ${v.id} — ${e?.message ?? e}`);
+        }
+```
+
+заменить на
+
+```ts
+        try {
+          // Молчим только когда доктор взялся или владелец успел сам; любой другой ответ — сообщение: сбой не прячется.
+          const outcome = await this.doctor.treat(v);
+          if (outcome === 'took' || outcome === 'gone') continue;
+        } catch (e: any) {
+          this.logger.error(`доктор: ролик ${v.id} — ${e?.message ?? e}`, e?.stack);
+        }
+```
+
+`src/shorts/shorts-doctor.service.ts`, в `treat` строки
+
+```ts
+    if (!autoHealEnabled() || v.status !== 'failed') return 'gave_up';
+    const p = prescribe(v);
+    if (p.action === 'never') return 'gave_up';
+```
+
+заменить на
+
+```ts
+    if (!autoHealEnabled()) {
+      this.logger.log(`ролик ${v.id}: доктор выключен (SHORTS_AUTO_HEAL=false) — к владельцу`);
+      return 'gave_up';
+    }
+    if (v.status !== 'failed') return 'gave_up';
+    const p = prescribe(v);
+    if (p.action === 'never') {
+      // Почему не взялся — в журнал: «никак по таблице» и «круг исчерпан» иначе неотличимы.
+      this.logger.log(`ролик ${v.id}: доктор не берётся (${v.failedFrom}, ${v.failedCode ?? 'без кода'}, самопочинок в круге — ${v.autoRecoveries}) — к владельцу`);
+      return 'gave_up';
+    }
+```
+
+```bash
+git add src/shorts/shorts-approval.service.ts src/shorts/shorts-doctor.service.ts
+git commit -m "fix(shorts): разбор упавших молчит только на took и gone; журнал доктора — стек и причина отказа" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-approval.service.spec.ts src/shorts/shorts-doctor.service.spec.ts 2>&1 | grep -E '✕|Tests:'"
+```
+
+Ожидается: без `failed`.
+
 ---
 
 ### Task 8: Кнопки владельца начинают новый круг
