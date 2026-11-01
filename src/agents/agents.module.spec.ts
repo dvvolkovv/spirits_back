@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import { ChatService } from '../chat/chat.service';
 import { VoiceAvatarModule } from '../voice-avatar/voice-avatar.module';
@@ -6,7 +7,7 @@ import { AgentsModule } from './agents.module';
 import { AgentVersionsService } from './agent-versions.service';
 
 @Module({
-  imports: [AgentsModule, VoiceAvatarModule],
+  imports: [ConfigModule.forRoot({ isGlobal: true }), AgentsModule, VoiceAvatarModule],
 })
 class AgentsModuleTestModule {}
 
