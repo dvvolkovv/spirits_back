@@ -36,7 +36,7 @@ const finalWrites = (pg: any) => pg.query.mock.calls.filter((c: any[]) => String
 const pauses = (pg: any) =>
   pg.query.mock.calls.filter((c: any[]) => String(c[0]).includes('lease_until = now() + make_interval') && (c[1] || []).includes(LEASE));
 
-function setup(dbRow: any = row()) {
+function setup(dbRow: any = row(), doctor?: any) {
   const pg = {
     query: jest.fn(async (sql: string) => {
       if (sql.includes('SELECT * FROM short_video')) return { rows: dbRow ? [dbRow] : [] };
@@ -53,7 +53,7 @@ function setup(dbRow: any = row()) {
   const storage = { download: jest.fn(async () => Buffer.from('bytes')) };
   const settings = { get: jest.fn(async () => ({ slotDays: [2, 4, 6], slotHourMsk: 18, maxOmniSeconds: 48 })) };
   const topics = { addManual: jest.fn(async (): Promise<any> => ({ id: 'new' })) };
-  const svc = new ShortsApprovalService(pg as any, tg as any, storage as any, settings as any, topics as any);
+  const svc = new ShortsApprovalService(pg as any, tg as any, storage as any, settings as any, topics as any, doctor);
   return { svc, pg, tg, storage, topics };
 }
 
@@ -641,6 +641,78 @@ describe('ShortsApprovalService', () => {
       await svc.notifyFailures();
       expect(tg.sendMessage).not.toHaveBeenCalled();
       expect(pg.query.mock.calls.some((c: any[]) => String(c[0]).includes('failure_notified = false'))).toBe(false);
+    });
+
+    /** Разбор захватит один упавший ролик — этот. */
+    const failedOnce = (pg: any, over: Record<string, any>) => {
+      let given = false;
+      pg.query.mockImplementation(async (sql: string) => {
+        if (sql.includes('failure_notified = true') && !given) {
+          given = true;
+          return { rows: [row({ status: 'failed', ...over })] };
+        }
+        return { rows: [] };
+      });
+    };
+
+    it('доктор взялся — сообщения нет; ролик доктору — захваченный, с кодом сбоя', async () => {
+      const doctor = { treat: jest.fn(async () => 'took') };
+      const { svc, tg, pg } = setup(row(), doctor);
+      failedOnce(pg, { last_error: 'оживление: лимит', failed_from: 'animating', failed_code: 'google_quota' });
+      await svc.notifyFailures();
+      expect(doctor.treat).toHaveBeenCalledTimes(1);
+      expect((doctor.treat.mock.calls[0] as any[])[0]).toMatchObject({ id: ID, failedFrom: 'animating', failedCode: 'google_quota' });
+      expect(tg.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('владелец успел нажать кнопку (gone) — сообщения нет', async () => {
+      const doctor = { treat: jest.fn(async () => 'gone') };
+      const { svc, tg, pg } = setup(row(), doctor);
+      failedOnce(pg, { last_error: 'оживление: лимит', failed_from: 'animating', failed_code: 'google_quota' });
+      await svc.notifyFailures();
+      expect(tg.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('доктор не взялся — сообщение и строка «Сам пробовал» по текущему кругу, прошлые круги не в счёт', async () => {
+      const doctor = { treat: jest.fn(async () => 'gave_up') };
+      const { svc, tg, pg } = setup(row(), doctor);
+      failedOnce(pg, {
+        last_error: 'оживление: лимит', failed_from: 'animating', failed_code: 'google_quota', auto_recoveries: 2,
+        recoveries: [
+          { at: '2030-01-01T07:00:00.000Z', from: 'capturing', code: 'answer_rejected', action: 'new_scene', reason: 'прошлый круг' },
+          { at: '2030-01-01T08:00:00.000Z', from: 'animating', code: 'google_quota', action: 'later', delayMin: 30, reason: 'r' },
+          { at: '2030-01-01T08:30:00.000Z', from: 'animating', code: 'google_quota', action: 'later', delayMin: 120, reason: 'r' },
+        ],
+      });
+      await svc.notifyFailures();
+      const text = (tg.sendMessage.mock.calls[0] as any[])[1];
+      expect(text).toContain('не собрался: оживление: лимит\nСам пробовал: повтор через 30 мин (google_quota), повтор через 2 ч (google_quota).\nЧто дальше');
+      expect(text).not.toContain('answer_rejected');
+    });
+
+    it('без самопочинок в круге — строки «Сам пробовал» нет', async () => {
+      const doctor = { treat: jest.fn(async () => 'gave_up') };
+      const { svc, tg, pg } = setup(row(), doctor);
+      failedOnce(pg, { last_error: 'режиссёр: ассистента нет', failed_from: 'directing', failed_code: 'no_assistant' });
+      await svc.notifyFailures();
+      expect((tg.sendMessage.mock.calls[0] as any[])[1]).not.toContain('Сам пробовал');
+    });
+
+    it('доктор упал — сообщение уходит, как без него: сбой не прячется', async () => {
+      const doctor = { treat: jest.fn(async () => { throw new Error('база недоступна'); }) };
+      const { svc, tg, pg } = setup(row(), doctor);
+      failedOnce(pg, { last_error: 'оживление: лимит', failed_from: 'animating', failed_code: 'google_quota' });
+      await svc.notifyFailures();
+      expect(tg.sendMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('упавшая публикация — доктора не спрашивают', async () => {
+      const doctor = { treat: jest.fn(async () => 'took') };
+      const { svc, tg, pg } = setup(row(), doctor);
+      failedOnce(pg, { last_error: 'публикация: telegram: chat not found', failed_from: 'publishing', tg_unsent: true });
+      await svc.notifyFailures();
+      expect(doctor.treat).not.toHaveBeenCalled();
+      expect(tg.sendMessage).toHaveBeenCalledTimes(1);
     });
   });
 });
