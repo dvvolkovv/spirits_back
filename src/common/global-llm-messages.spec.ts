@@ -111,21 +111,23 @@ describe('maskActor', () => {
 /**
  * Строка «Затронуто» в алерте «Локальный Claude CLI недоступен» (повторное
  * ревью 01.11, I1). Три состояния модели рубильника: на Claude или без ключа —
- * прежний текст; с ключом и отвечает — через неё идут Маша, TG-боты и
- * фоновые; с ключом, но «не отвечает» — выбор рубильника её пропускает
- * (planProviders с respectDown), и они идут обычным путём, то есть через
- * упавший Claude.
+ * прежний список и проба без входа; с ключом и отвечает — через неё идут Маша,
+ * TG-боты и фоновые; с ключом, но «не отвечает» — выбор рубильника её
+ * пропускает (planProviders с respectDown), и они идут обычным путём (Claude,
+ * затем запасные).
  */
 describe('cliOutageAffectedText', () => {
-  const OLD = 'Затронуто: <b>Маша, TG-боты, Виртуальный PM, Виртуальный маркетолог, фоновые задачи</b> (CLI-путь на OAuth-подписке).';
+  const ON_CLAUDE =
+    'Затронуто: <b>Маша, TG-боты, Виртуальный PM, Виртуальный маркетолог, фоновые задачи</b> (CLI-путь на OAuth-подписке) ' +
+    'и <b>проба без входа</b> (новым гостям — стена «войдите»).';
 
-  it('рубильник на Claude — прежний текст', () => {
-    expect(cliOutageAffectedText({ switchProvider: 'claude', enabled: false, down: false })).toBe(OLD);
+  it('рубильник на Claude — прежний список и проба без входа', () => {
+    expect(cliOutageAffectedText({ switchProvider: 'claude', enabled: false, down: false })).toBe(ON_CLAUDE);
   });
 
-  it('модель рубильника без ключа — прежний текст (фактически все на Claude), даже с пометкой «не отвечает»', () => {
-    expect(cliOutageAffectedText({ switchProvider: 'kimi', enabled: false, down: false })).toBe(OLD);
-    expect(cliOutageAffectedText({ switchProvider: 'kimi', enabled: false, down: true })).toBe(OLD);
+  it('модель рубильника без ключа — тот же текст (вошедшие фактически на Claude, гостям пробы — стена), даже с пометкой «не отвечает»', () => {
+    expect(cliOutageAffectedText({ switchProvider: 'kimi', enabled: false, down: false })).toBe(ON_CLAUDE);
+    expect(cliOutageAffectedText({ switchProvider: 'kimi', enabled: false, down: true })).toBe(ON_CLAUDE);
   });
 
   it('модель рубильника с ключом и отвечает — затронуты пробы, личный выбор Claude и запасной путь', () => {
@@ -135,7 +137,7 @@ describe('cliOutageAffectedText', () => {
     );
   });
 
-  it('модель рубильника с ключом, но «не отвечает» — Маша и остальные идут обычным путём, через Claude', () => {
+  it('модель рубильника с ключом, но «не отвечает» — Маша и остальные идут обычным путём (Claude, затем запасные)', () => {
     expect(cliOutageAffectedText({ switchProvider: 'qwen', enabled: true, down: true })).toBe(
       'Затронуто: <b>Маша, TG-боты, Виртуальный PM, Виртуальный маркетолог, фоновые задачи</b> (CLI-путь на OAuth-подписке) — ' +
         'рубильник на <b>Qwen</b>, но Qwen сейчас «не отвечает», поэтому они идут обычным путём (Claude, затем запасные).',
@@ -157,11 +159,12 @@ describe('cliRecoveredText', () => {
   const at = '2026-11-01T07:15:00.000Z';
   const OLD = `<b>🟢 Локальный Claude CLI восстановлен</b>\nМаша/VPM/маркетолог снова работают (проверка: ${at}, 812мс).`;
 
-  it('рубильник на живой модели с ключом — Claude снова отвечает, Маша и остальные по-прежнему через рубильник', () => {
+  it('рубильник на живой модели с ключом — Claude снова отвечает, Маша и остальные сейчас через рубильник, как вернуть', () => {
     expect(cliRecoveredText({ switchProvider: 'qwen', enabled: true, down: false, checkedAt: at, latencyMs: 812 })).toBe(
       '<b>🟢 Локальный Claude CLI восстановлен</b>\n' +
         `Claude снова отвечает (проверка: ${at}, 812мс): пробы мониторинга, личный выбор Claude, запасной путь. ` +
-        'Маша, TG-боты и фоновые задачи по-прежнему идут через Qwen (рубильник).',
+        'Маша, TG-боты и фоновые задачи сейчас идут через Qwen (рубильник).\n' +
+        'Вернуть рубильник на Claude: Админка → Ассистенты.',
     );
   });
 
