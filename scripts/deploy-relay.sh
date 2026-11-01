@@ -58,10 +58,10 @@ join_csv() {
   local IFS=,
   echo "$*"
 }
-FILES_CSV=$(join_csv "${FILES[@]}")
-PUT_CSV=$(join_csv "${PUT[@]}")
-DEL_CSV=$(join_csv "${DEL[@]}")
-ADD_CSV=$(join_csv "${ADD[@]}")
+FILES_CSV=$(join_csv "${FILES[@]+"${FILES[@]}"}")
+PUT_CSV=$(join_csv "${PUT[@]+"${PUT[@]}"}")
+DEL_CSV=$(join_csv "${DEL[@]+"${DEL[@]}"}")
+ADD_CSV=$(join_csv "${ADD[@]+"${ADD[@]}"}")
 
 printf 'Изменённые файлы relay-agent: %s\n' "$FILES_CSV"
 LOCAL_BUNDLE=$(mktemp -d)
@@ -206,7 +206,7 @@ health_and_release() {
 restore_previous() {
   cd ~/file-agent
   IFS=',' read -ra PUT <<< "$PUT_CSV"
-  for file in "${PUT[@]}"; do
+  for file in "${PUT[@]+"${PUT[@]}"}"; do
     [[ -n "$file" ]] || continue
     if [[ ",$ADD_CSV," == *",$file,"* ]]; then
       rm -f -- "$file"
@@ -217,7 +217,7 @@ restore_previous() {
   done
   if [[ -n "$DEL_CSV" ]]; then
     IFS=',' read -ra DEL <<< "$DEL_CSV"
-    for file in "${DEL[@]}"; do
+    for file in "${DEL[@]+"${DEL[@]}"}"; do
       cp ~/"$BASE_DIR"/"$file" ".$file.rollback.tmp"
       mv ".$file.rollback.tmp" "$file"
     done
@@ -225,7 +225,7 @@ restore_previous() {
   while read -r module; do
     [[ -f "$module" ]] || { echo "При откате нет локального импорта $module" >&2; exit 1; }
   done < <(grep -ohE 'from "\./[^"]+"' *.mjs | cut -d'"' -f2 | sort -u)
-  git add -A -- "${FILES[@]}"
+  git add -A -- "${FILES[@]+"${FILES[@]}"}"
   git commit -q -m "rollback relay-agent к $BASE_DIR"
   pm2 restart file-agent >/dev/null
 }
@@ -272,7 +272,7 @@ if ! git diff --cached --quiet; then
   exit 1
 fi
 IFS=',' read -ra FILES <<< "$FILES_CSV"
-for file in "${FILES[@]}"; do
+for file in "${FILES[@]+"${FILES[@]}"}"; do
   if [[ ",$ADD_CSV," == *",$file,"* ]]; then
     if [[ -e "$file" ]]; then
       echo "Новый $file уже существует на релее — есть несогласованная правка, ничего не заменено" >&2
@@ -319,14 +319,14 @@ done
 
 REPLACED=1
 IFS=',' read -ra PUT <<< "$PUT_CSV"
-for file in "${PUT[@]}"; do
+for file in "${PUT[@]+"${PUT[@]}"}"; do
   [[ -n "$file" ]] || continue
   cp ~/"$STAGE"/"$file" ".$file.tmp"
   mv ".$file.tmp" "$file"
 done
 if [[ -n "$DEL_CSV" ]]; then
   IFS=',' read -ra DEL <<< "$DEL_CSV"
-  for file in "${DEL[@]}"; do
+  for file in "${DEL[@]+"${DEL[@]}"}"; do
     rm -f -- "$file"
   done
 fi
@@ -335,7 +335,7 @@ while read -r module; do
   [[ -f "$module" ]] || { echo "После замены нет локального импорта $module" >&2; exit 1; }
 done < <(grep -ohE 'from "\./[^"]+"' *.mjs | cut -d'"' -f2 | sort -u)
 
-git add -A -- "${FILES[@]}"
+git add -A -- "${FILES[@]+"${FILES[@]}"}"
 git commit -q -m "relay-agent из spirits_back $TARGET_SHORT"
 git log --oneline -1
 pm2 restart file-agent >/dev/null
