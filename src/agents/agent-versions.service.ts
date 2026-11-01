@@ -4,6 +4,8 @@ import {
   HttpException,
   HttpStatus,
   Injectable,
+  forwardRef,
+  Inject,
   NotFoundException,
   OnModuleInit,
 } from '@nestjs/common';
@@ -52,7 +54,7 @@ function toAgentVersion(row: any): AgentVersion {
 export class AgentVersionsService implements OnModuleInit {
   constructor(
     private readonly pg: PgService,
-    private readonly chat: ChatService,
+    @Inject(forwardRef(() => ChatService)) private readonly chat: ChatService,
   ) {}
 
   async onModuleInit(): Promise<void> {
