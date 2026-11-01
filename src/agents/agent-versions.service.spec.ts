@@ -134,4 +134,15 @@ describe('AgentVersionsService', () => {
       'CREATE TABLE IF NOT EXISTS agent_versions',
     );
   });
+
+  it('coalesces nullable agent fields during backfill', async () => {
+    const { service, query } = makeService();
+    query.mockResolvedValueOnce({ rows: [] });
+
+    await service.onModuleInit();
+
+    const sql = query.mock.calls[0][0];
+    expect(sql).toContain("COALESCE(description, '')");
+    expect(sql).toContain("COALESCE(system_prompt, '')");
+  });
 });
