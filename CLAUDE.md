@@ -107,6 +107,18 @@ ssh dv@85.192.61.231 'cd ~/ci/spirits_back && source ~/.nvm/nvm.sh && npm ci && 
 
 Подключаться через unix-сокет: `new Client({ database: '...', host: '/var/run/postgresql' })` — по TCP роль `dv` попросит пароль.
 
+Suites `*.pg.spec.ts` без `PROVISIONING_PG_URL` **пропускаются**, поэтому для agents/chat полный прогон выглядит так (одноразовая база удаляется всегда):
+
+```bash
+cd ~/ci/spirits_back && source ~/.nvm/nvm.sh
+DB=agent_versions_ci_$(date +%s)_$$
+createdb -h /var/run/postgresql "$DB"
+trap 'dropdb -h /var/run/postgresql --if-exists "$DB"' EXIT
+PROVISIONING_PG_URL="postgres:///$DB?host=/var/run/postgresql" npx jest src/agents src/chat --maxWorkers=2
+```
+
+Проверить в итоге, что `agent-versions.pg.spec.ts` и `agents.upsert.pg.spec.ts` — PASS, а не skipped.
+
 ### Ловушки, на которые уже наступали
 
 - **`source ~/.nvm/nvm.sh` обязателен** в каждой ssh-команде: вне nvm на ноде node не найдётся.
@@ -135,6 +147,16 @@ bash ~/Downloads/spirits_back/scripts/deploy.sh
 - `~/spirits_front/` — nginx-served `dist/`
 
 Полезные флаги: `TEST_ONLY=1`, `PROD_ONLY=1` (hotfix), `FRONT_ONLY=1`, `BACK_ONLY=1`, `SKIP_SMOKE=1`, `SKIP_TEST_SMOKE=1`, `SKIP_PROD_SMOKE=1`, `SMOKE_ONLY=1`. Полный список — в шапке `scripts/deploy.sh`.
+
+### Релей `r.linkeon.io`
+
+`deploy.sh` **не выкатывает** `relay-agent/`: он работает на `dv@5.101.115.184:/home/dv/file-agent` под PM2 `file-agent`. Если diff затрагивает этот каталог, после проверок и до живого backend E2E обязателен отдельный официальный выкат:
+
+```bash
+bash scripts/deploy-relay.sh <BASE_SHA> <TARGET_SHA>
+```
+
+Скрипт следует существующему relay-раннбуку: staging из точных SHA, syntax-check и все relay-тесты, запрет перезаписи несогласованных живых правок, рестарт без `--update-env`, затем `/health`. `flock` на `/tmp/linkeon-relay-deploy.lock` берётся до первого remote rm/mkdir/archive и держится весь streamed critical rollout; второй процесс останавливается до изменений. Отсутствие `health.inflight` означает legacy, не ноль: до marker скрипт включает `return 503` в `location /chat` `/etc/nginx/conf.d/parking.conf`, делает graceful Nginx reload и проверяет 503 при доступном health. PID старых Nginx workers записываются до reload и drain ждёт их выхода вместе с PM2 children, включая legacy uploads. В новом релее `/tmp/linkeon-relay-drain` отклоняет `/chat`, а health отдаёт `inflight`. После upgraded/rollback health сначала удаляется application marker, затем снимается Nginx gate и проверяются `/chat` + `/health`. При сбое прежнее дерево восстанавливается и проходит rollback health до снятия gates. Если rollback не удался, admission остаётся закрытым. Подробности — `relay-agent/README.md`. Нельзя считать выкат завершённым по одному backend smoke: старый релей останется незамеченным без отдельной фазы.
 
 ### Тестовый сервер
 
