@@ -1313,8 +1313,8 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts 2>&1 | grep -E '�
 
 `src/shorts/short-review.spec.ts`:
 
-- в тесте `'без версии — SQL и параметры кнопок лички: статус, откуда, «не вышел»'` (`leaveReview`) — проверку `toMatch(/auto_recoveries = 0/)` по SQL первого вызова `pg.query` (как там проверяются прочие части SQL);
-- в тесте `'замечание дописано к прежним, ролик — к сценаристу; без версии параметры прежние'` (`noteForReview`) — то же.
+- в тесте `'без версии — SQL и параметры кнопок лички: статус, откуда, «не вышел»'` (`leaveReview`) после `expect(sql).toContain('SET status = $2');` добавить `expect(sql).toContain('auto_recoveries = 0');`;
+- в тесте `'замечание дописано к прежним, ролик — к сценаристу; без версии параметры прежние'` (`noteForReview`) после `expect(sql).toContain("status = 'writing'");` добавить `expect(sql).toContain('auto_recoveries = 0');`.
 
 - [ ] **Step 2: Закоммитить красное и убедиться, что падает**
 
@@ -1491,12 +1491,13 @@ ssh -o ConnectTimeout=15 dv@85.192.61.231 "set -e; cd ~/ci/spirits_front && git 
 
 - [ ] **Step 1: Падающие тесты**
 
-`src/components/admin/shortStatus.test.ts` — импорт `currentRecoveries, recoveryText` из `./shortStatus` и:
+`src/components/admin/shortStatus.test.ts` — в импорт из `./shortStatus` добавить `ShortRecovery, currentRecoveries, recoveryText` (тесты кабинета проходят и через `tsc -p tsconfig.app.json`: `include: ["src"]`, поэтому помощник типизирован) и в конец файла:
 
 ```ts
 describe('самопочинки', () => {
-  const r = (action: 'later' | 'new_scene' | 'no_skits', over = {}) =>
-    ({ at: '2030-01-01T08:00:00.000Z', from: 'animating' as const, code: 'google_quota', action, reason: 'r', ...over });
+  const r = (action: ShortRecovery['action'], over: Partial<ShortRecovery> = {}): ShortRecovery => ({
+    at: '2030-01-01T08:00:00.000Z', from: 'animating', code: 'google_quota', action, reason: 'r', ...over,
+  });
 
   it('текущий круг — последние autoRecoveries записей; полей нет — пусто', () => {
     const all = [r('later', { delayMin: 30 }), r('no_skits')];
