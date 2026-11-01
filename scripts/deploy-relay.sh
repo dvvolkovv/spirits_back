@@ -14,6 +14,7 @@ TARGET_SHA=$2
 RELAY_HOST=${RELAY_HOST:-dv@5.101.115.184}
 DRAIN_FILE=${RELAY_DRAIN_FILE:-/tmp/linkeon-relay-drain}
 LOCK_FILE=${RELAY_DEPLOY_LOCK_FILE:-/tmp/linkeon-relay-deploy.lock}
+NGINX_CONF=${RELAY_NGINX_CONF:-/etc/nginx/conf.d/parking.conf}
 DRAIN_WAIT_SECONDS=${DRAIN_WAIT_SECONDS:-1800}
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
@@ -63,23 +64,21 @@ DEL_CSV=$(join_csv "${DEL[@]}")
 ADD_CSV=$(join_csv "${ADD[@]}")
 
 printf 'Изменённые файлы relay-agent: %s\n' "$FILES_CSV"
-ssh -o BatchMode=yes "$RELAY_HOST" "rm -rf ~/$STAGE ~/$BASE_DIR && mkdir ~/$STAGE ~/$BASE_DIR"
-git archive "$TARGET_SHA" relay-agent | ssh -o BatchMode=yes "$RELAY_HOST" "tar -x -C ~/$STAGE --strip-components=1"
-git archive "$BASE_SHA" relay-agent | ssh -o BatchMode=yes "$RELAY_HOST" "tar -x -C ~/$BASE_DIR --strip-components=1"
+LOCAL_BUNDLE=$(mktemp -d)
+trap 'rm -rf "$LOCAL_BUNDLE"' EXIT
+mkdir "$LOCAL_BUNDLE/$STAGE" "$LOCAL_BUNDLE/$BASE_DIR"
+git archive "$TARGET_SHA" relay-agent | tar -x -C "$LOCAL_BUNDLE/$STAGE" --strip-components=1
+git archive "$BASE_SHA" relay-agent | tar -x -C "$LOCAL_BUNDLE/$BASE_DIR" --strip-components=1
 
-ssh -o BatchMode=yes "$RELAY_HOST" "STAGE=$STAGE BASE_DIR=$BASE_DIR TARGET_SHORT=$TARGET_SHORT FILES_CSV=$FILES_CSV PUT_CSV=$PUT_CSV DEL_CSV=$DEL_CSV ADD_CSV=$ADD_CSV DRAIN_FILE=$DRAIN_FILE LOCK_FILE=$LOCK_FILE DRAIN_WAIT_SECONDS=$DRAIN_WAIT_SECONDS bash -s" <<'REMOTE'
+cat > "$LOCAL_BUNDLE/$STAGE/deploy-relay-remote.sh" <<'REMOTE'
 set -euo pipefail
 DRAIN_FILE=${DRAIN_FILE:-/tmp/linkeon-relay-drain}
-LOCK_FILE=${LOCK_FILE:-/tmp/linkeon-relay-deploy.lock}
+NGINX_CONF=${NGINX_CONF:-/etc/nginx/conf.d/parking.conf}
 DRAIN_WAIT_SECONDS=${DRAIN_WAIT_SECONDS:-1800}
+SUDO=${SUDO:-sudo}
 GATE_CREATED=0
+NGINX_DRAIN=0
 REPLACED=0
-
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-  echo "Другой rollout держит $LOCK_FILE — marker и файлы не изменены" >&2
-  exit 1
-fi
 
 if [[ -e "$DRAIN_FILE" ]]; then
   echo "Drain marker уже существует — другой выкат или аварийный drain ещё активен" >&2
@@ -92,16 +91,90 @@ inflight_count() {
     process.stdin.on("data", (chunk) => { raw += chunk; });
     process.stdin.on("end", () => {
       const health = JSON.parse(raw);
-      const inflight = health.inflight === undefined ? 0 : health.inflight;
-      if (!Number.isInteger(inflight) || inflight < 0) process.exit(1);
+      const inflight = health.inflight === undefined ? "legacy" : health.inflight;
+      if (inflight !== "legacy" && (!Number.isInteger(inflight) || inflight < 0)) process.exit(1);
       console.log(inflight);
     });
   '
 }
 
+nginx_drain_on() {
+  $SUDO python3 - "$NGINX_CONF" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as source:
+    text = source.read()
+marker = "# LINKEON-RELAY-DRAIN"
+if marker in text:
+    raise SystemExit("Nginx drain marker already exists")
+needle = "location /chat {"
+position = text.index(needle) + len(needle)
+text = text[:position] + "\n        # LINKEON-RELAY-DRAIN\n        return 503;" + text[position:]
+temporary = path + ".relay-drain.tmp"
+with open(temporary, "w", encoding="utf-8") as output:
+    output.write(text)
+os.chmod(temporary, stat.S_IMODE(os.stat(path).st_mode))
+os.replace(temporary, path)
+PY
+  $SUDO nginx -t
+  $SUDO nginx -s reload
+  NGINX_DRAIN=1
+  for attempt in $(seq 1 20); do
+    CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X POST https://r.linkeon.io/chat)
+    if [[ "$CODE" == 503 ]] && curl -fsS --max-time 5 http://127.0.0.1:3033/health >/dev/null; then
+      echo "legacy Nginx drain: /chat=503, /health доступен"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "Не удалось подтвердить legacy Nginx drain" >&2
+  return 1
+}
+
+nginx_drain_off() {
+  $SUDO python3 - "$NGINX_CONF" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as source:
+    text = source.read()
+block = "        # LINKEON-RELAY-DRAIN\n        return 503;"
+if block not in text:
+    raise SystemExit("Nginx drain block not found")
+text = text.replace(block, "", 1)
+temporary = path + ".relay-drain.tmp"
+with open(temporary, "w", encoding="utf-8") as output:
+    output.write(text)
+os.chmod(temporary, stat.S_IMODE(os.stat(path).st_mode))
+os.replace(temporary, path)
+PY
+  $SUDO nginx -t
+  $SUDO nginx -s reload
+  for attempt in $(seq 1 20); do
+    CODE=$(curl -sS -o /dev/null -w '%{http_code}' -X POST https://r.linkeon.io/chat)
+    if [[ "$CODE" != 503 ]] && curl -fsS --max-time 5 http://127.0.0.1:3033/health >/dev/null; then
+      NGINX_DRAIN=0
+      echo "legacy Nginx drain снят после health"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "Не удалось снять legacy Nginx drain" >&2
+  return 1
+}
+
 health_and_release() {
   for attempt in $(seq 1 20); do
     if curl -fsS --max-time 5 http://127.0.0.1:3033/health; then
+      if [[ "$NGINX_DRAIN" -eq 1 ]] && ! nginx_drain_off; then
+        echo "Health есть, но legacy Nginx drain не снят — admission остаётся закрытым" >&2
+        return 1
+      fi
       rm -f -- "$DRAIN_FILE"
       GATE_CREATED=0
       printf '\nhealth OK, drain снят\n'
@@ -194,6 +267,11 @@ for file in "${FILES[@]}"; do
   fi
 done
 
+INITIAL_INFLIGHT=$(inflight_count)
+if [[ "$INITIAL_INFLIGHT" == legacy ]]; then
+  nginx_drain_on
+fi
+
 ( umask 077; printf '%s\n' "$TARGET_SHORT" > "$DRAIN_FILE.tmp.$$" && mv "$DRAIN_FILE.tmp.$$" "$DRAIN_FILE" )
 GATE_CREATED=1
 
@@ -206,6 +284,7 @@ DRAIN_STARTED=$SECONDS
 while true; do
   CHILDREN=$(ps --ppid "$PID" -o pid=)
   INFLIGHT=$(inflight_count)
+  if [[ "$INFLIGHT" == legacy ]]; then INFLIGHT=0; fi
   if ! grep -q . <<< "$CHILDREN" && [[ "$INFLIGHT" -eq 0 ]]; then
     break
   fi
@@ -239,3 +318,5 @@ git commit -q -m "relay-agent из spirits_back $TARGET_SHORT"
 git log --oneline -1
 pm2 restart file-agent >/dev/null
 REMOTE
+
+tar -cf - -C "$LOCAL_BUNDLE" . | ssh -o BatchMode=yes "$RELAY_HOST" "set -euo pipefail; exec 9>\"$LOCK_FILE\"; if ! flock -n 9; then echo 'Другой rollout держит $LOCK_FILE — staging, marker и файлы не изменены' >&2; exit 1; fi; rm -rf ~/$STAGE ~/$BASE_DIR; mkdir ~/$STAGE ~/$BASE_DIR; tar -xf - -C ~; STAGE=$STAGE BASE_DIR=$BASE_DIR TARGET_SHORT=$TARGET_SHORT FILES_CSV=$FILES_CSV PUT_CSV=$PUT_CSV DEL_CSV=$DEL_CSV ADD_CSV=$ADD_CSV DRAIN_FILE=$DRAIN_FILE LOCK_FILE=$LOCK_FILE NGINX_CONF=$NGINX_CONF DRAIN_WAIT_SECONDS=$DRAIN_WAIT_SECONDS bash ~/$STAGE/deploy-relay-remote.sh"

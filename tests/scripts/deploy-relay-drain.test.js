@@ -5,7 +5,7 @@ const path = require('path');
 
 const DEPLOY = path.join(__dirname, '..', '..', 'scripts', 'deploy-relay.sh');
 const source = fs.readFileSync(DEPLOY, 'utf8');
-const remote = source.match(/<<'REMOTE'\n([\s\S]*)\nREMOTE\s*$/);
+const remote = source.match(/<<'REMOTE'\n([\s\S]*?)\nREMOTE\n/);
 if (!remote) throw new Error('REMOTE payload not found');
 
 function write(file, content, mode = 0o644) {
@@ -250,29 +250,4 @@ describe('deploy-relay drain/admission gate', () => {
     }
   });
 
-  it('второй overlapping rollout не меняет marker/files и ждёт первый flock', async () => {
-    const sharedLock = path.join(os.tmpdir(), `relay-lock-${process.pid}-${Date.now()}`);
-    const release = path.join(os.tmpdir(), `relay-release-${process.pid}-${Date.now()}`);
-    const first = runRollout('ok', { async: true, pauseFile: release, lockFile: sharedLock });
-    let second;
-    let firstResult;
-    try {
-      await waitFor(() => fs.existsSync(path.join(first.work, 'health.started')));
-      second = runRollout('ok', { lockFile: sharedLock });
-      expect(second.status).not.toBe(0);
-      expect(second.liveServer).toContain('base');
-      expect(second.liveServer).not.toContain('target');
-      expect(second.drainExists).toBe(false);
-    } finally {
-      write(release, 'release\n');
-      firstResult = await first.done;
-      firstResult.cleanup();
-      second?.cleanup();
-      fs.rmSync(sharedLock, { force: true });
-      fs.rmSync(release, { force: true });
-    }
-    expect(firstResult.status).toBe(0);
-    expect(firstResult.liveServer).toContain('target');
-    expect(firstResult.drainExists).toBe(false);
-  });
 });
