@@ -1,4 +1,4 @@
-import { WRITER_FEEDBACK_CODES, type StudioError, type StudioErrorCode } from '../errors';
+import { SkitFeedbackError, WRITER_FEEDBACK_CODES, type StudioError, type StudioErrorCode } from '../errors';
 import type { CaptureResult, Scene, Script, ShortAnimation } from '../types';
 
 /** То, что нужно от pg.Pool, — чтобы в тестах рабочего процесса его можно было заменить. */
@@ -32,8 +32,8 @@ export const MAX_JOB_ATTEMPTS = 3;
 /** Пауза перед повтором: стенд или кабинет могли моргнуть. */
 export const RETRY_DELAY_SEC = 120;
 /**
- * Сколько кругов сценариста выдерживает ролик из-за длины озвучки: первый
- * вариант и две переписки. Возвратов студии — на один меньше (два): API
+ * Сколько кругов сценариста выдерживает ролик из-за отзывов студии (длина озвучки, сценка,
+ * которую не снять): первый вариант и две переписки. Возвратов студии — на один меньше (два): API
  * прибавляет writer_rounds, когда сценарист сдаёт сценарий, и сборка с
  * writer_rounds = 3 уже не возвращает, а сдаётся (failJob).
  */
@@ -229,6 +229,9 @@ function errorText(label: string, err: StudioError): string {
  *   кончились — failed с failed_from = 'writing' и тем же пояснением: «Повторить»
  *   вернёт ролик сценаристу с отзывом студии, а не пересоберёт заведомо
  *   неподходящий сценарий;
+ * - сценку не снять с этими репликами (SkitFeedbackError: два клипа одного текста
+ *   не прошли сверку речи или три отказа фильтра) — сценаристу с пояснением и разбором (skit_feedback), пока
+ *   кругов меньше MAX_WRITER_ROUNDS; круги кончились — failed с этапа сценариста;
  * - повторяемый сбой, попытки есть — обратно в очередь с паузой;
  * - иначе failed: failed_from — с чего продолжит «Повторить», владельцу напишет API.
  * Каждая запись — по номеру захвата; не нашла его — 'gone', ничего не записано.
@@ -240,6 +243,30 @@ export async function failJob(db: Queryable, job: Job, err: StudioError): Promis
     const r = await db.query(sql, [job.id, q.running, job.attempts, ...params]);
     return (r.rowCount ?? 0) > 0 ? outcome : 'gone';
   };
+  // Сценку не снять с этими репликами (run-animate.ts, toWriter): сценаристу — пояснение
+  // в writer_feedback и разбор в skit_feedback, пока круги есть; кончились — failed с этапа
+  // сценариста с тем же отзывом: «Повторить» вернёт ролик ему же.
+  if (job.kind === 'animate' && err instanceof SkitFeedbackError) {
+    const params = [err.writerText, JSON.stringify(err.feedback), message];
+    if (job.writerRounds < MAX_WRITER_ROUNDS) {
+      return write(
+        `UPDATE short_video
+            SET status = 'writing', writer_feedback = $4, skit_feedback = $5::jsonb, last_error = $6,
+                attempts = 0, lease_until = NULL, updated_at = now()
+          WHERE id = $1 AND status = $2 AND attempts = $3`,
+        params,
+        'writer',
+      );
+    }
+    return write(
+      `UPDATE short_video
+          SET status = 'failed', failed_from = 'writing', writer_feedback = $4, skit_feedback = $5::jsonb,
+              lease_until = NULL, last_error = $6, failure_notified = false, updated_at = now()
+        WHERE id = $1 AND status = $2 AND attempts = $3`,
+      params,
+      'failed',
+    );
+  }
   if (job.kind === 'render' && WRITER_FEEDBACK_CODES.has(err.code)) {
     const label = WRITER_FEEDBACK_LABEL[err.code];
     const feedback = label ? `${label}: ${err.message}` : err.message;
