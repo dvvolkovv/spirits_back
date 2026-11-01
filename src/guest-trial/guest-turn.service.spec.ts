@@ -405,6 +405,31 @@ describe('ход гостя: отказы', () => {
     expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'breaker', cause: 'down', assistant_id: '12', preview: false, provider: 'qwen' } });
   });
 
+  // Поздняя стена новой пробы достижима только гонкой: модель упала между
+  // ранней проверкой (до квоты проб) и поздней (после лока) — пока брались
+  // квота и строка пробы. Ключ к этому моменту уже выдан и проба посчитана;
+  // окно ответов не тронуто (ревью 01.11, M2).
+  it('поздняя стена новой пробы (модель упала за время квоты и создания строки) — ключ выдан, проба посчитана, ответы не тронуты', async () => {
+    let calls = 0;
+    const h = harness({
+      global: 'qwen',
+      // Первая проверка (ранняя) — модель доступна, вторая (поздняя) — «не отвечает».
+      fallbackStats: () => ({ breakerOpenUntil: 0, providers: { qwen: { enabled: true, downUntil: ++calls >= 2 ? Date.now() + 60_000 : 0 }, kimi: { enabled: false, downUntil: 0 } } }),
+    });
+    const { evs } = await h.turn();
+    expect(calls).toBe(2);
+    expect(evs).toEqual([
+      { type: 'guest', token: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/), left: 3 },
+      { type: 'wall', reason: 'closed' },
+    ]);
+    expect(h.sessions.create).toHaveBeenCalledTimes(1);
+    expect(h.redis.peek('guest-lim:trials:d')).toBe('1');
+    expect(h.redis.peek('guest-lim:answers:h')).toBeNull();
+    expect(h.redis.peek('guest-lim:answers:d')).toBeNull();
+    expect(h.cli.textWithCost).not.toHaveBeenCalled();
+    expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'breaker', cause: 'down', assistant_id: '12', preview: false, provider: 'qwen' } });
+  });
+
   it('ход по ключу — рубильник читается один раз за ход', async () => {
     const h = harness({
       globalSequence: ['qwen', 'qwen', 'claude'],
