@@ -34,6 +34,30 @@ export function sessionFsKey(sessionId, fallback) {
   return safe;
 }
 
+// fs_key от бэка (spirits_back src/chat/linkeon-relay-fields.ts): первые 32
+// hex от HMAC ключа сессии. Им называются папка хода и загрузки вместо ключа
+// сессии, в котором у телефонных пользователей номер. Строго этот алфавит и
+// длина: значение уходит в пути на диске. Сторож согласия с бэком —
+// src/chat/relay-linkeon-guard.spec.ts.
+const FS_KEY_RE = /^[0-9a-f]{32}$/;
+
+// Ключ папки хода: fs_key, если бэк его прислал и он корректен, иначе —
+// прежний, из sessionId (старый бэк, анонимные и служебные ходы).
+export function turnFsKey(fsKeyFromBackend, sessionId, fallback) {
+  if (typeof fsKeyFromBackend === "string" && FS_KEY_RE.test(fsKeyFromBackend)) return fsKeyFromBackend;
+  return sessionFsKey(sessionId, fallback);
+}
+
+// Ключ ПРЕЖНЕЙ папки хода — той, что была у сессии до перехода на fs_key
+// (26.10.2026), или null, если отдельной прежней папки нет (fs_key не
+// прислан — ход и так пишет в прежнюю). Модель может помнить путь к файлу
+// оттуда из истории разговора, поэтому server.mjs снимает и диффит обе папки.
+export function legacyTurnFsKey(fsKeyFromBackend, sessionId) {
+  if (typeof fsKeyFromBackend !== "string" || !FS_KEY_RE.test(fsKeyFromBackend)) return null;
+  const legacy = sessionFsKey(sessionId, null);
+  return legacy && legacy !== fsKeyFromBackend ? legacy : null;
+}
+
 // Имя для загруженного файла: <ключ сессии>_<база><расширение>.
 //
 // Расширение тоже режется. path.extname() отдаёт всё после последней точки,

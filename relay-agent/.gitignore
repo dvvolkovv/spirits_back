@@ -1,17 +1,28 @@
-sessions.json
-server.mjs.bak*
-server.mjs.regression-*
-uploads/
-node_modules/
+# Секрет: GEMINI_API_KEY. Живёт только на сервере.
 .env
+
+# 69 МБ, ставятся из package-lock.json.
+node_modules/
+
+# Ручные бэкапы: их заменяет история git.
+*.bak
+*.bak.*
+*.bak-*
 _old-backups/
-# Боевой MCP-конфиг: в нём MCP_SECRET прода. Не в git — при переносе релея в
-# общий репозиторий он утёк (06.08–07.10.2026). Шаблон — spirits_back/relay-agent.
-empty-mcp.json
-*.bak-mcp-*
-# Секреты бэков и режим проверки — только на сервере
+
+# Рабочие каталоги агента на сервере.
+sessions/
+uploads/
+*.log
+
+# Секреты бэков и режим проверки (relay-auth.mjs). Живут только на сервере,
+# права 600. Звёздочка — из-за атомической записи (временный файл рядом,
+# потом mv): relay-secrets.tmp-* тоже не должен попасть в git.
 relay-secrets*
 relay-auth-mode*
 
-# Ключи релея (qwen.key) — не в git
+# Ключи запасных (llm-fallback.mjs, QWEN_KEY_FILE/KIMI_KEY_FILE): /home/dv/
+# file-agent/secrets/{qwen,kimi}.key, права 600. Каталог — внутри git-дерева
+# релея, поэтому без этой строки ключи ушли бы в git первым же коммитом после
+# Task 11 Step 1.
 secrets/
