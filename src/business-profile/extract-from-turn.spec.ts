@@ -35,6 +35,16 @@ describe('extractFromTurn', () => {
     expect(state.business.tax_mode.value).toBe('usn_d');
   });
 
+  // Проверка 01.11.2026 через общий рубильник модели: на Kimi извлечение
+  // заняло 43 с из 60 по умолчанию ClaudeCliService.
+  it('ждёт модель до 120 с, а не 60 с по умолчанию', async () => {
+    const { svc, claudeCli } = make();
+
+    await svc.extractFromTurn('u1', '10', 'у меня ИП на УСН доходы', 'Понял, тогда...');
+
+    expect(claudeCli.text).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ timeoutMs: 120_000 }));
+  });
+
   it('не зовёт LLM, когда префильтр срезал реплику', async () => {
     const { svc, claudeCli } = make();
 

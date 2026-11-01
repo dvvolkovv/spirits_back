@@ -112,6 +112,18 @@ describe('InsightsService.execute', () => {
     expect(all).not.toMatch(/Владимир|vova@mail\.ru|903|79990000001/);
   });
 
+  // Проверка 01.11.2026 через общий рубильник модели: на Kimi пачка
+  // размечалась 117 с при потолке 120 с. Сводка — отдельный потолок, 300 с.
+  it('разметке пачки — 240 с, сводке — 300 с', async () => {
+    const h = harness({ conversations: 9 });
+    await h.svc.execute('run-1', week);
+    const label = h.calls.filter((c) => c.opts.model === 'claude-haiku-4-5');
+    const synth = h.calls.filter((c) => c.opts.model !== 'claude-haiku-4-5');
+    expect(label.length).toBeGreaterThan(1);
+    expect(label.map((c) => c.opts.timeoutMs)).toEqual(label.map(() => 240_000));
+    expect(synth.map((c) => c.opts.timeoutMs)).toEqual([300_000]);
+  });
+
   it('повтор той же недели сначала сбрасывает её итоги, потом читает прошлые находки', async () => {
     const h = harness({ rerun: true });
     await h.svc.execute('run-2', week);

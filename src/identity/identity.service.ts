@@ -171,7 +171,7 @@ export class IdentityService implements OnModuleInit {
     //
     // Шаг 2 смотрит только в user_identities. Почта, вписанная человеком в
     // профиль (profile.setEmail → ai_profiles_consolidated.email), туда не
-    // попадает — и 19.09.2026 вход по magic link завёл victoria-337@mail.ru
+    // попадает — и 19.09.2026 вход по magic link завёл maria.testova@example.org
     // второй аккаунт с отдельным приветственным бонусом, при живом первом.
     //
     // Склеивать автоматически нельзя: профильный адрес никем не проверен.

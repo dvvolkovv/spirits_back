@@ -210,7 +210,7 @@ describe('getUserCalls', () => {
       ],
     });
 
-    const r = await svc.getUserCalls('79236230446');
+    const r = await svc.getUserCalls('70005550008');
 
     expect(r.calls).toHaveLength(2);
     expect(r.calls[0].flags).toContain('silent');
@@ -354,7 +354,7 @@ ssh dvolkov@212.113.106.202 'B=http://127.0.0.1:3001; P=79030169187; \
   curl -s "$B/webhook/898c938d-f094-455c-86af-969617e62f7a/sms/$P" >/dev/null; \
   C=$(curl -s "$B/webhook/debug/sms-code/$P" | grep -oE "[0-9]{4,6}" | head -1); \
   T=$(curl -s "$B/webhook/a376a8ed-3bf7-4f23-aaa5-236eea72871b/check-code/$P/$C" | python3 -c "import sys,json;print(json.load(sys.stdin)[\"access-token\"])"); \
-  curl -s -H "Authorization: Bearer $T" "$B/webhook/admin/calls/user/79236230446" | head -c 400'
+  curl -s -H "Authorization: Bearer $T" "$B/webhook/admin/calls/user/70005550008" | head -c 400'
 ```
 
 Expected: JSON со звонком, у которого есть `flags` и нет `transcript`.
@@ -788,8 +788,9 @@ bash ~/Downloads/spirits_back/scripts/deploy.sh
 
 - [ ] **Step 3: Живая проверка на проде**
 
-Открыть админку → «Звонки» → кликнуть по пользователю `79236230446` → в его
-карточке должна быть секция «Звонки» с одним звонком, у которого есть саммари;
-раскрыть — увидеть диалог репликами. Отдельно проверить, что на страницах
+Открыть админку → «Звонки» → кликнуть по пользователю `70005550008` (номер
+вымышленный — взять любого со звонком с саммари) → в его карточке должна быть
+секция «Звонки» с одним звонком, у которого есть саммари; раскрыть — увидеть
+диалог репликами. Отдельно проверить, что на страницах
 `/profile` и `/search` плавающей кнопки больше нет, а в списке ассистентов она
 есть и перетаскивается.

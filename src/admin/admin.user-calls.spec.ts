@@ -23,7 +23,7 @@ describe('getUserCalls', () => {
       ],
     });
 
-    const r = await svc.getUserCalls('79236230446');
+    const r = await svc.getUserCalls('70005550008');
 
     expect(r.calls).toHaveLength(2);
     expect(r.calls[0].flags).toContain('silent');

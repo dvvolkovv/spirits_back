@@ -35,7 +35,7 @@ function makePg(rows: any[], total: number) {
 const service = (pg: any) => new (AdminService as any)(pg);
 
 const ZOOM_OK = {
-  id: 'c-1', user_id: '79236230446', provider: 'zoom', agent_name: 'Роман',
+  id: 'c-1', user_id: '70005550008', provider: 'zoom', agent_name: 'Роман',
   started_at: '2026-09-16T09:46:31Z', duration_sec: 117, status: 'completed',
   model: 'gpt-realtime-2.1', summary: 'Обсуждали погоду',
   transcript: [
@@ -129,7 +129,7 @@ describe('AdminService.getCallSessions', () => {
     // адреса встречи (у Zoom в нём хеш пароля), tokens_charged под старым именем.
     const row = { ...ZOOM_OK, agent_name: undefined };
     const feed = (await service(makePg([row], 1)).getCallSessions({})).sessions[0];
-    const card = (await service({ query: async () => ({ rows: [row] }) }).getUserCalls('79236230446')).calls[0];
+    const card = (await service({ query: async () => ({ rows: [row] }) }).getUserCalls('70005550008')).calls[0];
 
     expect(card).toEqual(feed);
     expect(Object.keys(feed).sort()).toEqual([

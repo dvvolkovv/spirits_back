@@ -169,7 +169,18 @@ export class BusinessProfileService {
       const missing = await this.missingFields(userId);
       if (missing.length === 0) return;
 
-      const raw = await this.claudeCli.text(this.buildExtractPrompt(missing, userMessage, assistantMessage));
+      const raw = await this.claudeCli.text(
+        this.buildExtractPrompt(missing, userMessage, assistantMessage),
+        // 120 с явно, а не 60 с по умолчанию ClaudeCliService: проверка
+        // 01.11.2026 через общий рубильник модели — на Kimi извлечение заняло
+        // 43 с из 60, запаса почти нет. Ответ пользователю этого не ждёт: в
+        // чате и загрузке файла вызов идёт в setImmediate после res.end(), по
+        // итогам звонка — без await; поля, которые человек за это время
+        // заполнил сам, merge не затирает. Дольше на минуту в худшем случае
+        // держится только счётчик хода в загрузке файла (closeStream после
+        // consolidateAfterChatPublic) — deploy.sh ждёт живые ходы до 30 минут.
+        { timeoutMs: 120_000 },
+      );
       const parsed = this.parseJson(raw);
       const fields = parsed?.fields;
       if (!fields || typeof fields !== 'object') return;

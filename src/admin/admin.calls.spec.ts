@@ -51,7 +51,7 @@ function makePg(rows: any[], totals: any, byProvider: any[] = []) {
 const service = (pg: any) => new (AdminService as any)(pg);
 
 const ROW = {
-  user_id: '79035281880',
+  user_id: '70005550001',
   calls: 4,
   duration_sec: '930',
   tokens_call: '12000',

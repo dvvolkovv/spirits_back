@@ -3,13 +3,13 @@ import { AdminService } from './admin.service';
 /**
  * Активность пользователей, живущих в Telegram-боте.
  *
- * Заведено по факту: у 79235216999 (arm_g42) две оплаты premium по 1990 ₽ и
+ * Заведено по факту: у 70005550007 (test_user_7) две оплаты premium по 1990 ₽ и
  * 155 сообщений в `tg_bot_messages` — а карточка активности в админке была
  * пустой, потому что каждый «сообщенческий» блок читал только
  * `custom_chat_history`. Выглядело как «человек заплатил и не пользуется»,
  * хотя он выговорил 1 032 363 токена.
  *
- * Тот же слепой источник в сегментах обзвона: 22.06 Арман получил
+ * Тот же слепой источник в сегментах обзвона: 22.06 Иван Тестов получил
  * активационный нудж «зарегистрировался и не начал» — через два дня после
  * того, как привязал бота и написал в него девять сообщений.
  *
@@ -44,10 +44,10 @@ function serviceWith(pg: any): AdminService {
 
 /** Карточка отдаёт нули и пустые списки, если профиля нет — нужен хотя бы он. */
 const PROFILE_ROW = [{
-  phone: '79235216999',
+  phone: '70005550007',
   registered_at: '2026-06-10T14:17:31Z',
   balance: '1000000',
-  email: 'armangalduryan@gmail.com',
+  email: 'ivan.testov@example.com',
   isadmin: false,
   preferred_agent: null,
   paid_count: 2,
@@ -66,7 +66,7 @@ function sqlWith(pg: ReturnType<typeof fakePg>, needle: string): string | undefi
 describe('AdminService.getUserActivity — пользователь из Telegram-бота', () => {
   it('«Последние сообщения» собираются из веба и из бота', async () => {
     const pg = fakePg({ 'FROM ai_profiles_consolidated a': PROFILE_ROW });
-    await serviceWith(pg).getUserActivity('79235216999');
+    await serviceWith(pg).getUserActivity('70005550007');
 
     const sql = sqlWith(pg, 'SUBSTRING');
     expect(sql).toBeDefined();
@@ -90,7 +90,7 @@ describe('AdminService.getUserActivity — пользователь из Telegra
         channel_title: 'ИИ агент',
       }],
     });
-    const res = await serviceWith(pg).getUserActivity('79235216999');
+    const res = await serviceWith(pg).getUserActivity('70005550007');
 
     expect(res.recentMessages[0]).toMatchObject({
       source: 'telegram',
@@ -113,7 +113,7 @@ describe('AdminService.getUserActivity — пользователь из Telegra
         channel_title: null,
       }],
     });
-    const res = await serviceWith(pg).getUserActivity('79235216999');
+    const res = await serviceWith(pg).getUserActivity('70005550007');
 
     expect(res.recentMessages[0].source).toBe('web');
     expect(res.recentMessages[0].channel_title).toBeNull();
@@ -121,7 +121,7 @@ describe('AdminService.getUserActivity — пользователь из Telegra
 
   it('«По ассистентам» учитывает пресет-агента TG-бота', async () => {
     const pg = fakePg({ 'FROM ai_profiles_consolidated a': PROFILE_ROW });
-    await serviceWith(pg).getUserActivity('79235216999');
+    await serviceWith(pg).getUserActivity('70005550007');
 
     const sql = sqlWith(pg, 'ORDER BY queries DESC');
     expect(sql).toBeDefined();
@@ -134,7 +134,7 @@ describe('AdminService.getUserActivity — пользователь из Telegra
 
   it('счётчик запросов не теряет сообщения из бота', async () => {
     const pg = fakePg({ 'FROM ai_profiles_consolidated a': PROFILE_ROW });
-    await serviceWith(pg).getUserActivity('79235216999');
+    await serviceWith(pg).getUserActivity('70005550007');
 
     const sql = sqlWith(pg, 'token_consumption_tasks');
     expect(sql).toContain('tg_bot_messages');
@@ -142,7 +142,7 @@ describe('AdminService.getUserActivity — пользователь из Telegra
 
   it('в дневном ряду запросы из бота попадают в свой день', async () => {
     const pg = fakePg({ 'FROM ai_profiles_consolidated a': PROFILE_ROW });
-    await serviceWith(pg).getUserActivity('79235216999');
+    await serviceWith(pg).getUserActivity('70005550007');
 
     const sql = sqlWith(pg, 'generate_series');
     expect(sql).toContain('tg_bot_messages');
@@ -154,7 +154,7 @@ describe('AdminService.getUserActivity — пользователь из Telegra
 
   it('в счёт идут реплики человека, а не ответы ассистента', async () => {
     const pg = fakePg({ 'FROM ai_profiles_consolidated a': PROFILE_ROW });
-    await serviceWith(pg).getUserActivity('79235216999');
+    await serviceWith(pg).getUserActivity('70005550007');
 
     const series = sqlWith(pg, 'generate_series')!;
     expect(series).toContain("m.role = 'user'");
@@ -175,7 +175,7 @@ describe('AdminService.getUsersTokensList — колонка активност�
   it('строка таблицы отдаёт счётчик TG-сообщений и время последнего', async () => {
     const pg = fakePg({
       'FROM ai_profiles_consolidated a': [{
-        phone: '79235216999',
+        phone: '70005550007',
         registered_at: '2026-06-10T14:17:31Z',
         balance: '1000000',
         spent_total: '0',
@@ -201,7 +201,7 @@ describe('AdminService.getUsersTokensList — колонка активност�
   it('last_active подхватывается из бота, если списаний в окне нет', async () => {
     const pg = fakePg({
       'FROM ai_profiles_consolidated a': [{
-        phone: '79235216999',
+        phone: '70005550007',
         balance: '0',
         spent_total: '0',
         spent_period: '0',
@@ -221,7 +221,7 @@ describe('AdminService.getUsersTokensList — колонка активност�
   it('пользователь без бота остаётся с нулём и без отметки', async () => {
     const pg = fakePg({
       'FROM ai_profiles_consolidated a': [{
-        phone: '79088644408',
+        phone: '70005550003',
         balance: '876937',
         spent_total: '100',
         spent_period: '100',

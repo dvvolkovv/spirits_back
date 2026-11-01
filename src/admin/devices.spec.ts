@@ -18,12 +18,12 @@ describe('устройства в админке', () => {
   describe('разрез по пользователю', () => {
     it('отдаёт устройства одного человека, свежие первыми', async () => {
       const pg = fakePg();
-      await new AdminService(pg as any).getUserDevices('79088644408');
+      await new AdminService(pg as any).getUserDevices('70005550003');
 
       const call = pg.calls[0];
       expect(call.sql).toContain('user_devices');
       expect(call.sql).toContain('ORDER BY last_seen DESC');
-      expect(call.params).toContain('79088644408');
+      expect(call.params).toContain('70005550003');
     });
   });
 

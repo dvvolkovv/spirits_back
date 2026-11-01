@@ -540,11 +540,11 @@ describe('MeetingService', () => {
   });
 
   describe('встреча Microsoft Teams', () => {
-    const URL = 'https://teams.live.com/meet/9334354666557?p=lBZ4sXKpUY7bT0GzzM';
+    const URL = 'https://teams.live.com/meet/0000000000001?p=EXAMPLEpwd00000000';
 
     it('идёт тем же мостом и передаёт настоящего провайдера', async () => {
       withAgent();
-      const res = await svc.join('u1', 7, '9334354666557', 'teams', URL);
+      const res = await svc.join('u1', 7, '0000000000001', 'teams', URL);
       expect(livekit.dispatchAgent).toHaveBeenCalledWith(
         `teams_${res.callId}`,
         expect.objectContaining({ mode: 'meeting', provider: 'teams' }),
@@ -555,7 +555,7 @@ describe('MeetingService', () => {
       // У Teams он нужен даже больше, чем у Zoom: у корпоративной ссылки весь
       // опознаватель — это адрес целиком.
       withAgent();
-      await svc.join('u1', 7, '9334354666557', 'teams', URL);
+      await svc.join('u1', 7, '0000000000001', 'teams', URL);
       const insert = pg.query.mock.calls.find(([sql]: any) => /INSERT INTO voice_calls/.test(sql));
       expect(insert[1]).toContain('teams');
       expect(insert[1]).toContain(URL);
@@ -563,7 +563,7 @@ describe('MeetingService', () => {
 
     it('без адреса входа отказ ДО создания записи', async () => {
       withAgent();
-      await expect(svc.join('u1', 7, '9334354666557', 'teams')).rejects.toMatchObject({
+      await expect(svc.join('u1', 7, '0000000000001', 'teams')).rejects.toMatchObject({
         response: expect.objectContaining({ reason: 'teams_url_required' }),
       });
       const insert = pg.query.mock.calls.find(([sql]: any) => /INSERT INTO voice_calls/.test(sql));
@@ -582,7 +582,7 @@ describe('MeetingService', () => {
         if (sql.includes('ai_profiles_consolidated')) return { rows: [{ name: 'Дмитрий' }] };
         return { rows: [], rowCount: 0 };
       });
-      await expect(svc.join('u1', 7, '9334354666557', 'teams', URL)).rejects.toMatchObject({
+      await expect(svc.join('u1', 7, '0000000000001', 'teams', URL)).rejects.toMatchObject({
         response: expect.objectContaining({ reason: 'meet_busy' }),
       });
     });
@@ -590,7 +590,7 @@ describe('MeetingService', () => {
     it('выключенная интеграция не пускает', async () => {
       withAgent();
       flags.enabled.mockResolvedValue(false);
-      await expect(svc.join('u1', 7, '9334354666557', 'teams', URL)).rejects.toMatchObject({
+      await expect(svc.join('u1', 7, '0000000000001', 'teams', URL)).rejects.toMatchObject({
         response: expect.objectContaining({ reason: 'provider_disabled' }),
       });
       expect(flags.enabled).toHaveBeenCalledWith('meeting:teams');

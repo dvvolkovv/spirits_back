@@ -5,7 +5,7 @@ import { classifyLlmError } from '../monitoring/claude-health.service';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { InsightsCollectService } from './insights-collect.service';
 import { buildDigest, buildKeyboard, insightsChatId, type DigestInput } from './insights-digest';
-import { LABEL_MODEL, LABEL_SYSTEM, labelBatches, parseLabels, type LabelInput } from './insights-label';
+import { LABEL_MODEL, LABEL_SYSTEM, LABEL_TIMEOUT_MS, labelBatches, parseLabels, type LabelInput } from './insights-label';
 import { InsightsStore, type RunRow } from './insights-store.service';
 import { fitSynthPrompt, parseFindings, SYNTH_SYSTEM, synthModel } from './insights-synth';
 import { weekLabel, weekOf, type Week } from './insights-week';
@@ -80,7 +80,7 @@ export class InsightsService {
       const batches = labelBatches(inputs, (u) => collected.names.get(u) ?? []);
       let failed = 0;
       for (const [i, batch] of batches.entries()) {
-        const r = await this.callModel(batch.prompt, LABEL_SYSTEM, LABEL_MODEL, 120_000, (t) => parseLabels(t, batch.inputs));
+        const r = await this.callModel(batch.prompt, LABEL_SYSTEM, LABEL_MODEL, LABEL_TIMEOUT_MS, (t) => parseLabels(t, batch.inputs));
         cost += r.cost;
         if (r.value) labels.push(...r.value);
         else {

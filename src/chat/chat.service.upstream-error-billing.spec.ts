@@ -6,7 +6,7 @@ import { ChatService, isUpstreamErrorReply } from './chat.service';
  * Ход, где расход неизвестен, а вместо ответа приехала ошибка апстрима.
  *
  * 11.08.2026 с 05:00 до 05:15 четырём пользователям (включая 79030169187 и
- * 79236230446) в чат уехало «Your organization has disabled Claude subscription
+ * 70005550008) в чат уехало «Your organization has disabled Claude subscription
  * access for Claude Code · Use an Anthropic API key instead» — текст ошибки
  * Claude CLI, отданный как ответ ассистента. Ровно 144 символа, и с каждого
  * списали 288 токенов: ни usage, ни costUsd релей не прислал, сработал откат
