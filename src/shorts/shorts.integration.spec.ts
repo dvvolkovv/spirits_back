@@ -545,6 +545,7 @@ maybe('ролики против живого Postgres', () => {
       await pool.query(`UPDATE short_publication SET status = 'failed' WHERE short_id = $1`, [v.id]);
       await ctl.action({ action: 'redo', id: v.id, version }, res);
       expect(res.body.status).toBe('directing');
+      expect(res.body.format).toBe('skit');
     });
 
     it('одобрение из админки и кнопка лички одновременно — ролик одобрен один раз', async () => {

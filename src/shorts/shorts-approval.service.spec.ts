@@ -214,6 +214,24 @@ describe('ShortsApprovalService', () => {
       expect(caption).toContain('Сам восстанавливался: повтор через 30 мин (google_quota), без сценок (omni_budget)');
       expect(caption).toContain('Собран без сценок: оживление: предел секунд');
     });
+
+    it('подпись — только текущий круг: прошлый «без сценок» (до «Переснять») не попадает', async () => {
+      const recoveries = [
+        { at: '2030-01-01T06:00:00.000Z', from: 'animating', code: 'omni_budget', action: 'no_skits', reason: 'прошлый круг' },
+        { at: '2030-01-01T08:00:00.000Z', from: 'animating', code: 'google_quota', action: 'later', delayMin: 30, reason: 'оживление: лимит' },
+      ];
+      const v = fresh({ auto_recoveries: 1, recoveries });
+      const { svc, tg } = setup(v);
+      await svc.sendForReview(rowToShort(v), LEASE);
+      const caption = (tg.sendVideo.mock.calls[0] as any[])[2].caption;
+      expect(caption).toContain('Сам восстанавливался: повтор через 30 мин (google_quota)');
+      expect(caption).not.toContain('Собран без сценок');
+      expect(caption).not.toContain('прошлый круг');
+      const none = fresh({ auto_recoveries: 0, recoveries });
+      const s0 = setup(none);
+      await s0.svc.sendForReview(rowToShort(none), LEASE);
+      expect((s0.tg.sendVideo.mock.calls[0] as any[])[2].caption).not.toMatch(/Сам восстанавливался|Собран без сценок/);
+    });
   });
 
   describe('кнопки', () => {

@@ -192,6 +192,22 @@ describe('buildReviewCaption', () => {
     expect(caption).toContain('Сам восстанавливался: повтор через 30 мин (google_quota), без сценок (omni_budget)\nСобран без сценок: оживление: предел секунд\nВыйдет: завтра в 18:00 МСК');
     expect(buildReviewCaption(base).caption).not.toMatch(/Сам восстанавливался|Собран без сценок/);
   });
+
+  it('шапка со всеми строками на пределах обрезки — в пределе подписи Telegram, «Выйдет» на месте', () => {
+    const long = (n: number) => 'я'.repeat(n);
+    const captions = { telegram: long(2000), vk: 'VK', youtube: { title: 'T', description: 'D', tags: [] } };
+    // Сценки и «без сценок» вместе не бывают: у формата chat сценарий без сценок.
+    const withSkits = buildReviewCaption({
+      ...base, question: long(400), captions, selfHealed: long(500),
+      skits: { cast: long(300), animation: { omniSeconds: 48, keyframes: 2, skits: {} }, maxOmniSeconds: 48 },
+    });
+    const noSkits = buildReviewCaption({ ...base, question: long(400), captions, selfHealed: long(500), noSkitsReason: long(500) });
+    for (const { caption, extra } of [withSkits, noSkits]) {
+      expect(extra).not.toBeNull();
+      expect(caption.length).toBeLessThanOrEqual(TG_CAPTION_MAX);
+      expect(caption).toContain('Выйдет: завтра в 18:00 МСК');
+    }
+  });
 });
 
 describe('skitCastLine и omniSpendLine', () => {
