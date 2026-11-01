@@ -1009,3 +1009,18 @@ test('предел — на круг владельца: круг исчерпа
   );
   assert.deepEqual(next.calls.start, []);
 });
+
+test('предел — на круг владельца: начало круга выше счёта ролика — круг от счёта, а не щедрее', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const logs: string[] = [];
+  const { deps, calls } = fakes(env, { keyframeDelayMs: { punchline: 50 } });
+  await assert.rejects(
+    animateRun(env.runDir, { ...deps, maxOmniSeconds: 8, omniBase: 48, log: (m) => logs.push(m) }),
+    (e: unknown) =>
+      isErr('omni_budget', false)(e) &&
+      /предел — 8 с: лимит пересъёмок сценок; новый круг — любой кнопкой владельца; поднять предел — настройка «Предел секунд Omni»/.test((e as Error).message),
+  );
+  assert.deepEqual(calls.start, ['conflict']);
+  assert.equal(readAnim(env.runDir).omniSeconds, 8);
+  assert.ok(logs.some((m) => m.includes('начало круга 48 с больше счёта ролика 0 с — круг считается от 0 с')), logs.join('\n'));
+});

@@ -36,6 +36,7 @@ describe('ShortsDoctorService', () => {
     expect(await svc.treat(failed(), NOW)).toBe('took');
     expect(calls).toHaveLength(1);
     const [w] = calls;
+    expect(w.sql).not.toMatch(/omni_base/);
     expect(w.sql).toMatch(/SET status = \$4, lease_until = now\(\) \+ make_interval\(mins => \$5\)/);
     expect(w.sql).toMatch(/attempts = 0, last_error = NULL, failed_from = NULL, failed_code = NULL, failure_notified = false/);
     expect(w.sql).toMatch(/auto_recoveries = auto_recoveries \+ 1, recoveries = recoveries \|\| \$3::jsonb/);
@@ -52,6 +53,7 @@ describe('ShortsDoctorService', () => {
     const v = failed({ failed_from: 'capturing', failed_code: 'answer_rejected', last_error: 'съёмка: ответ не годится', owner_note: 'Короче.' });
     expect(await svc.treat(v, NOW)).toBe('took');
     const [w] = calls;
+    expect(w.sql).not.toMatch(/omni_base/);
     expect(w.sql).toMatch(/SET status = 'directing', lease_until = NULL, writer_rounds = 0, owner_note = \$4, writer_feedback = NULL, skit_feedback = NULL/);
     expect(w.sql).not.toMatch(/format/);
     expect(w.params[3]).toBe('Короче.\nСам: прошлая сцена не удалась — съёмка: ответ не годится');
@@ -62,6 +64,7 @@ describe('ShortsDoctorService', () => {
     const { svc, calls } = setup();
     expect(await svc.treat(failed({ failed_code: 'omni_budget' }), NOW)).toBe('took');
     const [w] = calls;
+    expect(w.sql).not.toMatch(/omni_base/);
     expect(w.sql).toMatch(/SET status = 'writing', format = 'chat', lease_until = NULL, writer_rounds = 0, writer_feedback = NULL, skit_feedback = NULL/);
     expect(w.sql).not.toMatch(/animation/);
     expect(JSON.parse(w.params[2])[0].action).toBe('no_skits');

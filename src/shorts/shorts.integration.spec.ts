@@ -4,7 +4,7 @@ import { ConflictException } from '@nestjs/common';
 import { Pool } from 'pg';
 import { decryptSecret, encryptSecret } from '../calendar/crypto';
 import { claimStage, stageFailed } from './short-jobs';
-import { BAD_TIMESTAMP_CODES, VERSION_RE, VERSION_SQL, leaveReview, noteForReview } from './short-review';
+import { BAD_TIMESTAMP_CODES, NEW_OMNI_CIRCLE_SQL, VERSION_RE, VERSION_SQL, leaveReview, noteForReview } from './short-review';
 import { approveShortIntoSlot } from './short-slot-claim';
 import { ShortsApprovalService } from './shorts-approval.service';
 import { ShortsDoctorService } from './shorts-doctor.service';
@@ -256,13 +256,20 @@ maybe('ролики против живого Postgres', () => {
       status: 'failed', failed_from: 'animating', failed_code: 'omni_budget', last_error: 'оживление: предел',
       failure_notified: true, format: 'skit', capture: { answerText: 'a', paragraphs: [] },
       scene: { kind: 'chat', assistantId: 10, assistantName: 'Алексей', question: 'в', followups: [] },
-      animation: { omniSeconds: 48, skits: {} },
+      animation: { omniSeconds: 48, skits: {} }, omni_base: 16,
     });
     const row = (await pool.query('SELECT * FROM short_video WHERE id = $1', [v.id])).rows[0];
     expect(await new ShortsDoctorService(pgLike() as any).treat(rowToShort(row))).toBe('took');
-    const r = (await pool.query('SELECT status, format, animation, auto_recoveries, recoveries FROM short_video WHERE id = $1', [v.id])).rows[0];
-    expect(r).toMatchObject({ status: 'writing', format: 'chat', animation: { omniSeconds: 48, skits: {} }, auto_recoveries: 1 });
+    const r = (await pool.query('SELECT status, format, animation, auto_recoveries, recoveries, omni_base FROM short_video WHERE id = $1', [v.id])).rows[0];
+    expect(r).toMatchObject({ status: 'writing', format: 'chat', animation: { omniSeconds: 48, skits: {} }, auto_recoveries: 1, omni_base: 16 });
     expect(r.recoveries[0]).toMatchObject({ action: 'no_skits', code: 'omni_budget' });
+  });
+
+  it('новый круг по секундам на живом SQL: счёт с дробной записью (16.0 — ручная правка jsonb) — omni_base 16, а не ошибка кнопки', async () => {
+    const v = await insert({ status: 'pending_review' });
+    await pool.query(`UPDATE short_video SET animation = '{"omniSeconds": 16.0, "skits": {}}'::jsonb WHERE id = $1`, [v.id]);
+    const r = await pool.query(`UPDATE short_video SET ${NEW_OMNI_CIRCLE_SQL} WHERE id = $1 RETURNING omni_base`, [v.id]);
+    expect(r.rows[0].omni_base).toBe(16);
   });
 
   it('доктор на живом SQL: «новая сцена» — режиссёр без паузы, строка «Сам:» к замечаниям', async () => {
@@ -537,7 +544,10 @@ maybe('ролики против живого Postgres', () => {
     });
 
     it('redo (admin «Переснять») вышедшего ролика — отказ даже с верной версией; после снятия «вышел» тот же вызов проходит', async () => {
-      const v = await insert({ status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() + 86_400_000) });
+      const v = await insert({
+        status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() + 86_400_000),
+        animation: { omniSeconds: 56, skits: {} },
+      });
       await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'telegram', 'published')`, [v.id]);
       const version = (await pool.query(`SELECT ${VERSION_SQL} AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
       const ctl = new ShortsController(pgLike() as any, { get: async () => ({ format: 'skit' }) } as any, {} as any, {} as any);
@@ -554,6 +564,7 @@ maybe('ролики против живого Postgres', () => {
       await ctl.action({ action: 'redo', id: v.id, version }, res);
       expect(res.body.status).toBe('directing');
       expect(res.body.format).toBe('skit');
+      expect(res.body.omniBase).toBe(56);
     });
 
     it('одобрение из админки и кнопка лички одновременно — ролик одобрен один раз', async () => {

@@ -37,11 +37,15 @@ describe('контракт API и студии', () => {
     const db = studio('worker/db.ts');
     for (const s of [
       "'capture_queued'", "'capturing'", "'render_queued'", "'rendering'", "status = 'writing'", "status = 'pending_review'",
-      'writer_feedback', 'skit_feedback', "failed_code = 'lease'", 'failed_code = $', 'omni_base', 'failed_from', 'failure_notified = false', 'questionShotKey', 'answerShotKey', 'review_message_id = NULL',
+      'writer_feedback', 'skit_feedback', "failed_code = 'lease'", 'failed_code = $', 'failed_from', 'failure_notified = false', 'questionShotKey', 'answerShotKey', 'review_message_id = NULL',
       "'animate_queued'", "'animating'", "status = 'render_queued'", 'animation', 'max_omni_seconds',
     ]) {
       expect(db).toContain(s);
     }
+    // omni_base — в RETURNING захвата: без неё omniBase — undefined, и предел снова на весь ролик.
+    // Писать её студия не должна: круг начинает только кнопка владельца.
+    expect(db).toMatch(/RETURNING[^`]*\bomni_base\b/);
+    expect(db).not.toMatch(/omni_base\s*=/);
   });
 
   it('ключи видео и обложки — те, что API шлёт в Telegram', () => {

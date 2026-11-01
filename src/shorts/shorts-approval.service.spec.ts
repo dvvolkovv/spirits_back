@@ -805,11 +805,11 @@ describe('ShortsApprovalService — ролик со сценками', () => {
     const { svc, tg } = setup(fresh({
       format: 'skit',
       script: { hook: 'h', voice: 'madirus', speed: 1.1, lines: [], final: { assistantsCount: 18 }, skits },
-      animation: { omniSeconds: 16, keyframes: 2, skits: {} },
+      animation: { omniSeconds: 16, keyframes: 2, skits: {} }, omni_base: 8,
     }));
     await svc.sendPendingReviews();
     const caption = (tg.sendVideo.mock.calls[0] as any[])[2].caption as string;
     expect(caption).toContain('Сценки: Гусыня Галина Петровна — хозяйка квартиры, Капибара Кеша — жилец');
-    expect(caption).toContain('Omni: 16 из 48 с, кадров 2 ≈ $1,86');
+    expect(caption).toContain('Omni: 16 с, кадров 2 ≈ $1,86; в этом круге 8 из 48 с');
   });
 });

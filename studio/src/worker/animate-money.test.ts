@@ -105,15 +105,19 @@ class FakeS3 {
 }
 
 /** Строка short_video в памяти; запись — по номеру захвата, как в db.ts. */
-function fakeDb(o: { animation?: ShortAnimation | null; saveThrow?: (a: ShortAnimation) => boolean } = {}) {
-  const row = { status: 'animate_queued', attempts: 0, animation: (o.animation ?? null) as ShortAnimation | null };
+function fakeDb(o: { animation?: ShortAnimation | null; saveThrow?: (a: ShortAnimation) => boolean; maxOmniSeconds?: number } = {}) {
+  const row = { status: 'animate_queued', attempts: 0, animation: (o.animation ?? null) as ShortAnimation | null, omniBase: 0 };
   const fails: Array<{ err: StudioError; outcome: FailOutcome }> = [];
   const queue: Queue = {
     async claim(kind) {
       if (kind !== 'animate' || row.status !== 'animate_queued') return null;
       row.status = 'animating';
       row.attempts += 1;
-      return { id: ID, kind, attempts: row.attempts, writerRounds: 0, scene, capture, script, animation: row.animation ? structuredClone(row.animation) : null } as Job;
+      const job: Job = {
+        id: ID, kind, attempts: row.attempts, writerRounds: 0, omniBase: row.omniBase,
+        scene, capture, script, animation: row.animation ? structuredClone(row.animation) : null,
+      };
+      return job;
     },
     async saveAnimation(job, a) {
       if (row.status !== 'animating' || row.attempts !== job.attempts) return false;
@@ -135,10 +139,10 @@ function fakeDb(o: { animation?: ShortAnimation | null; saveThrow?: (a: ShortAni
     async completeCapture() { throw new Error('нет'); },
     async completeRender() { throw new Error('нет'); },
     async minAnswerChars() { return 400; },
-    async maxOmniSeconds() { return 48; },
+    async maxOmniSeconds() { return o.maxOmniSeconds ?? 48; },
   };
-  /** «Повторить» из failed (shorts.controller.ts retry): animate_queued, attempts = 0. */
-  const retry = () => { assert.equal(row.status, 'failed'); row.status = 'animate_queued'; row.attempts = 0; };
+  /** «Повторить» из failed (shorts.controller.ts retry): animate_queued, attempts = 0, новый круг по секундам — omni_base = потраченное. */
+  const retry = () => { assert.equal(row.status, 'failed'); row.status = 'animate_queued'; row.attempts = 0; row.omniBase = row.animation?.omniSeconds ?? 0; };
   return { queue, row, fails, retry };
 }
 
@@ -369,4 +373,25 @@ test('брак удаляется и из MinIO — «Повторить» до�
   assert.ok(waited.includes('id-conflict-2'));
   assert.deepEqual(g2.calls.start, []);
   assert.equal([...g1.calls.start, ...g2.calls.start].filter((k) => k === 'conflict').length, 2);
+});
+
+test('«Повторить» после omni_budget — новый круг: снимается недостающая сценка, оплаченная не переснимается', { timeout: 120_000 }, async () => {
+  const e = env();
+  const s3 = new FakeS3();
+  const db = fakeDb({ maxOmniSeconds: 8 });
+  const workRoot = path.join(e.root, 'jobs');
+  const g1 = google(e);
+  await runOne(worker(workRoot, db, s3, g1));
+  assert.deepEqual(db.fails.map((f) => [f.err.code, f.outcome]), [['omni_budget', 'failed']]);
+  assert.equal(g1.calls.start.length, 1);
+  assert.equal(db.row.animation?.omniSeconds, 8);
+
+  db.retry();
+  assert.equal(db.row.omniBase, 8);
+  const g2 = google(e);
+  await runOne(worker(workRoot, db, s3, g2));
+  assert.equal(db.row.status, 'render_queued');
+  assert.equal(g2.calls.start.length, 1);
+  assert.deepEqual([...g1.calls.start, ...g2.calls.start].sort(), ['conflict', 'punchline']);
+  assert.equal(db.row.animation?.omniSeconds, 16);
 });

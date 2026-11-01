@@ -197,15 +197,16 @@ describe('buildReviewCaption', () => {
     const long = (n: number) => 'я'.repeat(n);
     const captions = { telegram: long(2000), vk: 'VK', youtube: { title: 'T', description: 'D', tags: [] } };
     // Сценки и «без сценок» вместе не бывают: у формата chat сценарий без сценок.
+    const worst = { stand: true, angle: 'calm' as const, when: 'в ближайший свободный слот после одобрения' };
     const withSkits = buildReviewCaption({
-      ...base, question: long(400), captions, selfHealed: long(500),
-      skits: { cast: long(300), animation: { omniSeconds: 48, keyframes: 2, skits: {} }, maxOmniSeconds: 48 },
+      ...base, ...worst, question: long(400), captions, selfHealed: long(500),
+      skits: { cast: long(300), animation: { omniSeconds: 400, keyframes: 12, skits: {} }, maxOmniSeconds: 400, omniBase: 352 },
     });
-    const noSkits = buildReviewCaption({ ...base, question: long(400), captions, selfHealed: long(500), noSkitsReason: long(500) });
+    const noSkits = buildReviewCaption({ ...base, ...worst, question: long(400), captions, selfHealed: long(500), noSkitsReason: long(500) });
     for (const { caption, extra } of [withSkits, noSkits]) {
       expect(extra).not.toBeNull();
       expect(caption.length).toBeLessThanOrEqual(TG_CAPTION_MAX);
-      expect(caption).toContain('Выйдет: завтра в 18:00 МСК');
+      expect(caption).toContain('Выйдет: в ближайший свободный слот после одобрения');
     }
   });
 });
@@ -229,8 +230,10 @@ describe('skitCastLine и omniSpendLine', () => {
     expect(omniSpendLine(null)).toBe('Omni: 0 с, кадров 0 ≈ $0,00');
   });
 
-  it('omniSpendLine: начат круг владельца — всего и в этом круге', () => {
-    expect(omniSpendLine({ omniSeconds: 56, keyframes: 3, skits: {} }, 48, 48)).toBe('Omni: 56 с, в этом круге 8 из 48 с, кадров 3 ≈ $5,99');
+  it('omniSpendLine: начат круг владельца — всего, кадры и доллары за ролик, в конце — этот круг', () => {
+    expect(omniSpendLine({ omniSeconds: 56, keyframes: 3, skits: {} }, 48, 48)).toBe('Omni: 56 с, кадров 3 ≈ $5,99; в этом круге 8 из 48 с');
     expect(omniSpendLine({ omniSeconds: 16, keyframes: 2, skits: {} }, 48, 0)).toBe('Omni: 16 из 48 с, кадров 2 ≈ $1,86');
+    // Начало круга выше счёта (ручная правка animation) — круг от счёта, как в студии, без минуса.
+    expect(omniSpendLine({ omniSeconds: 16, keyframes: 2, skits: {} }, 48, 48)).toBe('Omni: 16 с, кадров 2 ≈ $1,86; в этом круге 0 из 48 с');
   });
 });

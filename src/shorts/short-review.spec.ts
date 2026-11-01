@@ -38,7 +38,7 @@ describe('leaveReview', () => {
     const [sql, params] = pg.query.mock.calls[0] as any[];
     expect(sql).toContain('SET status = $2');
     expect(sql).toContain('auto_recoveries = 0');
-    expect(sql).toContain("omni_base = COALESCE((animation->>'omniSeconds')::int, 0)");
+    expect(sql).toContain("omni_base = COALESCE(floor((animation->>'omniSeconds')::numeric)::int, 0)");
     expect(sql).not.toMatch(/\brecoveries\s*=/);
     expect(sql).toContain(`AND NOT ${RELEASED_SQL}`);
     expect(sql).not.toContain('updated_at = $');
@@ -88,7 +88,7 @@ describe('noteForReview', () => {
     const [sql, params] = pg.query.mock.calls[0] as any[];
     expect(sql).toContain("status = 'writing'");
     expect(sql).toContain('auto_recoveries = 0');
-    expect(sql).toContain("omni_base = COALESCE((animation->>'omniSeconds')::int, 0)");
+    expect(sql).toContain("omni_base = COALESCE(floor((animation->>'omniSeconds')::numeric)::int, 0)");
     expect(sql).not.toMatch(/\brecoveries\s*=/);
     expect(sql).toContain("WHERE id = $1 AND status = 'pending_review'");
     expect(params).toEqual([ID, 'короче\nбез цифр']);
