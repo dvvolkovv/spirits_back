@@ -4,7 +4,7 @@
 
 **Goal:** упавший ролик сам выбирает самопочинку по коду сбоя — повтор позже, новая сцена или сборка без сценок — и пишет владельцу, только когда не справился.
 
-**Architecture:** студия и API пишут код сбоя в новую колонку `failed_code`; разбор упавших (`ShortsApprovalService.notifyFailures`) до сообщения спрашивает `ShortsDoctorService`. Решение — чистая функция `prescribe` (`src/shorts/short-doctor.ts`) по таблице «этап + код → действие» с пределами на круг; запись — по захваченному сбою, так что «Повторить» владельца не перебить. История самопочинок — `recoveries` (jsonb), счётчик круга — `auto_recoveries`, обнуляют кнопки владельца. Строки «Сам пробовал» (сбой) и «Сам восстанавливался» / «Собран без сценок» (проверка); в админке кабинета — история в карточке ролика.
+**Architecture:** студия и API пишут код сбоя в новую колонку `failed_code`; разбор упавших (`ShortsApprovalService.notifyFailures`) до сообщения спрашивает `ShortsDoctorService`. Решение — чистая функция `prescribe` (`src/shorts/short-doctor.ts`) по таблице «этап + код → действие» с пределами на круг; запись — по захваченному сбою, так что «Повторить» владельца не перебить. История самопочинок — `recoveries` (jsonb), счётчик круга — `auto_recoveries`, обнуляют кнопки владельца. Предел секунд Omni — тоже на круг владельца (`omni_base`, решение 01.11). Строки «Сам пробовал» (сбой) и «Сам восстанавливался» / «Собран без сценок» (проверка); в админке кабинета — история в карточке ролика.
 
 **Tech Stack:** NestJS 10 + node-pg + jest (API, `src/shorts/`); ESM TypeScript + node:test через tsx (студия, `studio/`); React 18 + vitest (кабинет, `spirits_front`); Postgres.
 
@@ -37,6 +37,7 @@
 | `src/shorts/short-review.ts` (+ спека) | «Замечание» и «Переснять» обнуляют круг |
 | `src/shorts/short-captions.ts` (+ спека) | строки в подписи на проверку |
 | `spirits_front/src/components/admin/shortStatus.ts`, `ShortCard.tsx` (+ тесты) | история самопочинок, пометка «без сценок — сам» |
+| `005_doctor.sql`, `short-review.ts`, `short-captions.ts`, студия `worker/*`, `animate/run-animate.ts` (+ тесты) | предел Omni — на круг владельца (`omni_base`, задача 11) |
 
 ---
 
@@ -1662,7 +1663,233 @@ SHA=$(git rev-parse HEAD) && test -n "$SHA" && git push -q origin feat/shorts-do
 
 ---
 
-### Task 11: Полный прогон, учения на стенде, выкат
+### Task 11: Предел секунд Omni — 48 с на круг владельца
+
+**Решение владельца (01.11, после сбоя ролика 889b6423):** предел «Предел секунд Omni» считается на круг владельца, а не на ролик за всё время. Кнопка владельца («Повторить», «Новая сцена», «Новый текст», «Замечание», «Переснять») начинает новый круг и для секунд: `omni_base` = потраченное на этот момент. Внутри круга предел держит повторы студии и доктора, вместе с его новыми сценами. Общий счёт секунд ролика (`animation.omniSeconds`) не трогается — он в подписи на проверку. Причина: 31.10 ложные отказы сверки съели весь предел ролика, и 01.11 доработка по замечанию владельца («сделать плавно» — новое действие развязки, новый клип) упала на пределе, не потратив ни секунды.
+
+**Files:**
+- Modify: `src/shorts/migrations/005_doctor.sql` (четвёртая колонка `omni_base`), `src/shorts/shorts.controller.ts` (`LIST_COLUMNS`, `retry`), `src/shorts/short-review.ts`, `src/shorts/shorts.types.ts`, `src/shorts/short-captions.ts`, `src/shorts/shorts-approval.service.ts`, `studio/src/worker/db.ts`, `studio/src/worker/jobs.ts`, `studio/src/worker/worker.ts`, `studio/src/animate/run-animate.ts`
+- Test: `src/shorts/shorts-schema.spec.ts`, `src/shorts/shorts.types.spec.ts`, `src/shorts/shorts.controller.spec.ts`, `src/shorts/short-review.spec.ts`, `src/shorts/short-captions.spec.ts`, `src/shorts/shorts.integration.spec.ts`, `src/shorts/shorts.contract.spec.ts`, `studio/src/animate/run-animate.test.ts`, `studio/src/worker/jobs.test.ts`, `studio/src/worker/db.integration.ts`
+
+Миграция 005 ещё нигде не выкачена, поэтому колонка дописывается в неё, а не в новую 006.
+
+- [ ] **Step 1: Падающие тесты**
+
+`src/shorts/shorts-schema.spec.ts`, тест `'три колонки — каждая под проверкой information_schema, умолчания — константы'`: название — `'четыре колонки — …'` (дальше как было), ожидаемый список —
+
+```ts
+    expect(adds.map(([, t, c]) => `${t}.${c}`).sort()).toEqual([
+      'short_video.auto_recoveries', 'short_video.failed_code', 'short_video.omni_base', 'short_video.recoveries',
+    ]);
+```
+
+и после проверки `recoveries jsonb …` добавить `expect(sql).toContain('ADD COLUMN omni_base integer NOT NULL DEFAULT 0;');`.
+
+`src/shorts/shorts.types.spec.ts`, рядом с тестом самопочинок:
+
+```ts
+  it('начало круга владельца по секундам Omni — omni_base; без колонки — 0', () => {
+    expect(rowToShort({ id: 'x', omni_base: 48 }).omniBase).toBe(48);
+    expect(rowToShort({ id: 'y' }).omniBase).toBe(0);
+  });
+```
+
+`src/shorts/shorts.controller.spec.ts`, в тесте `'retry { from: directing, note } — …'` после проверок задачи 8 (`auto_recoveries = 0`):
+
+```ts
+    expect(String(upd[0])).toMatch(/omni_base = COALESCE\(\(animation->>'omniSeconds'\)::int, 0\)/);
+```
+
+`src/shorts/short-review.spec.ts`: в тестах `leaveReview` (`'без версии — SQL и параметры кнопок лички: …'`) и `noteForReview` (`'замечание дописано к прежним, …'`) после проверки `auto_recoveries = 0` (задача 8) добавить `expect(sql).toContain("omni_base = COALESCE((animation->>'omniSeconds')::int, 0)");`.
+
+`src/shorts/short-captions.spec.ts`, в `describe('skitCastLine и omniSpendLine', …)`:
+
+```ts
+  it('omniSpendLine: начат круг владельца — всего и в этом круге', () => {
+    expect(omniSpendLine({ omniSeconds: 56, keyframes: 3, skits: {} }, 48, 48)).toBe('Omni: 56 с, в этом круге 8 из 48 с, кадров 3 ≈ $5,99');
+    expect(omniSpendLine({ omniSeconds: 16, keyframes: 2, skits: {} }, 48, 0)).toBe('Omni: 16 из 48 с, кадров 2 ≈ $1,86');
+  });
+```
+
+`src/shorts/shorts.integration.spec.ts`, тест `'list: тонкий SELECT …'`: в `insert({…})` после строки `recoveries: JSON.stringify(…),` (задача 2) добавить `omni_base: 16,`.
+
+`src/shorts/shorts.contract.spec.ts`, тест `'очередь студии — те же статусы и колонки'`: после `'failed_code',` (задача 4) добавить `'omni_base',`.
+
+`studio/src/animate/run-animate.test.ts`, в конец файла:
+
+```ts
+test('предел — на круг владельца: секунды до начала круга не в счёт', { timeout: 120_000 }, async () => {
+  const env = setup();
+  await animateRun(env.runDir, fakes(env).deps);
+  const lines = ['Это износ, верните залог.', 'Га-га… ладно.'];
+  writeScript(env.runDir, { conflict: plan('conflict'), punchline: plan('punchline', lines, 'fp-punchline-2') });
+  const next = fakes(env, { heard: (kind) => (kind === 'punchline' ? lines.join(' ') : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, { ...next.deps, maxOmniSeconds: 8, omniBase: 16 });
+  assert.deepEqual(next.calls.start, ['punchline']);
+  assert.equal(anim.omniSeconds, 24);
+});
+
+test('предел — на круг владельца: круг исчерпан — omni_budget со счётом круга', { timeout: 120_000 }, async () => {
+  const env = setup();
+  await animateRun(env.runDir, fakes(env).deps);
+  const lines = ['Это износ, верните залог.', 'Га-га… ладно.'];
+  writeScript(env.runDir, { conflict: plan('conflict'), punchline: plan('punchline', lines, 'fp-punchline-2') });
+  const next = fakes(env);
+  await assert.rejects(
+    animateRun(env.runDir, { ...next.deps, maxOmniSeconds: 8, omniBase: 8 }),
+    (e: unknown) => isErr('omni_budget', false)(e) && /на ролик ушло 16 с Omni вместе с запущенными, в этом круге — 8 с, предел — 8 с на круг/.test((e as Error).message),
+  );
+  assert.deepEqual(next.calls.start, []);
+});
+```
+
+`studio/src/worker/jobs.test.ts`: в помощнике `job` строку `id: ID, kind, attempts: 1, writerRounds: 0, scene, capture: null, script: null, animation: null, ...over,` заменить на `id: ID, kind, attempts: 1, writerRounds: 0, omniBase: 0, scene, capture: null, script: null, animation: null, ...over,`; в тесте `'оживление: счёт денег — из базы, готовое — из MinIO; …'` задание — `job('animate', { capture: skitCapture, script: skitScript, animation: stored, omniBase: 16 })`, а после `assert.equal(hooks.maxOmniSeconds, 48);` — `assert.equal(hooks.omniBase, 16);`.
+
+`studio/src/worker/db.integration.ts`, рядом с тестами захвата:
+
+```ts
+  it('задание оживления несёт начало круга владельца по секундам Omni (omni_base)', async () => {
+    await insert('animate_queued', { omni_base: 16 });
+    const job = await claimJob(pool, 'animate');
+    assert.equal(job!.omniBase, 16);
+  });
+```
+
+- [ ] **Step 2: Закоммитить красное и убедиться, что падает**
+
+```bash
+git add src/shorts/shorts-schema.spec.ts src/shorts/shorts.types.spec.ts src/shorts/shorts.controller.spec.ts src/shorts/short-review.spec.ts src/shorts/short-captions.spec.ts src/shorts/shorts.integration.spec.ts src/shorts/shorts.contract.spec.ts studio/src/animate/run-animate.test.ts studio/src/worker/jobs.test.ts studio/src/worker/db.integration.ts
+git commit -m "test(shorts): предел Omni — на круг владельца (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-schema.spec.ts src/shorts/shorts.types.spec.ts src/shorts/shorts.controller.spec.ts src/shorts/short-review.spec.ts src/shorts/short-captions.spec.ts src/shorts/shorts.contract.spec.ts 2>&1 | grep -E '✕|Tests:'"
+studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts src/worker/jobs.test.ts 2>&1 | grep -E '^not ok|^# (tests|pass|fail)'; STUDIO_PG_URL=postgresql://studioit:studioit@127.0.0.1:5432/studio_it npm run test:db 2>&1 | grep -E '^not ok|^# (tests|pass|fail)'"
+```
+
+Ожидается: красные — тест колонок 005, `omniBase` в типах, три проверки SQL кнопок (контроллер, `leaveReview`, `noteForReview`), строка подписи, контракт (`omni_base` нет в `db.ts`); в студии — оба теста предела на круг (`omniBase` пока не читается: 16 + 8 > 8; в сообщении нет «в этом круге»), `hooks.omniBase` в `jobs.test.ts` и захват в живой базе (`omniBase` — `undefined`). Живой тест списка (`omni_base: 16`) проходит: `rowToShort` колонку пока не читает ни там, ни там.
+
+- [ ] **Step 3: Код**
+
+`src/shorts/migrations/005_doctor.sql`:
+
+- первая строка шапки — `-- 005_doctor.sql — самопочинка упавших роликов: код сбоя, счётчик круга и история; начало круга владельца по секундам Omni.`;
+- строку `--   ALTER TABLE short_video DROP COLUMN failed_code, DROP COLUMN auto_recoveries, DROP COLUMN recoveries;` заменить на `--   ALTER TABLE short_video DROP COLUMN failed_code, DROP COLUMN auto_recoveries, DROP COLUMN recoveries, DROP COLUMN omni_base;`;
+- перед `END` (после блока `recoveries`) добавить:
+
+```sql
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public' AND table_name = 'short_video' AND column_name = 'omni_base') THEN
+        ALTER TABLE short_video ADD COLUMN omni_base integer NOT NULL DEFAULT 0;
+    END IF;
+```
+
+`src/shorts/short-review.ts`, после `export const RELEASED_SQL …` (или рядом с другими экспортами SQL этого файла):
+
+```ts
+/**
+ * Кнопка владельца начинает новый круг и для секунд Omni: предел («Предел
+ * секунд Omni») — на круг, студия считает его от omni_base. Общий счёт ролика
+ * (animation.omniSeconds) не трогается — он в подписи на проверку.
+ */
+export const NEW_OMNI_CIRCLE_SQL = "omni_base = COALESCE((animation->>'omniSeconds')::int, 0)";
+```
+
+и в записях: `leaveReview` — `…, last_error = NULL, auto_recoveries = 0, updated_at = now()` → `…, last_error = NULL, auto_recoveries = 0, ${NEW_OMNI_CIRCLE_SQL}, updated_at = now()`; `noteForReview` — `SET owner_note = $2, status = 'writing', writer_rounds = 0, attempts = 0, auto_recoveries = 0,` → `SET owner_note = $2, status = 'writing', writer_rounds = 0, attempts = 0, auto_recoveries = 0, ${NEW_OMNI_CIRCLE_SQL},`.
+
+`src/shorts/shorts.controller.ts`: в импорт из `./short-review` добавить `NEW_OMNI_CIRCLE_SQL`; в `retry` `failure_notified = false, writer_rounds = 0, auto_recoveries = 0, owner_note = COALESCE($4::text, owner_note),` → `failure_notified = false, writer_rounds = 0, auto_recoveries = 0, ${NEW_OMNI_CIRCLE_SQL}, owner_note = COALESCE($4::text, owner_note),`; в описании `retry` абзац задачи 8 («Кнопка владельца начинает новый круг: …») дополнить: ` Новый круг — и для секунд Omni: предел считается от omni_base.`; в `LIST_COLUMNS` — `'failed_code', 'auto_recoveries', 'recoveries', 'omni_base', 'published_at', …`.
+
+`src/shorts/shorts.types.ts`: в `ShortVideo` после `recoveries: ShortRecovery[];` —
+
+```ts
+  /** Секунды Omni на начало круга владельца: предел оживления — на круг (кнопка владельца переставляет). */
+  omniBase: number;
+```
+
+в `rowToShort` после `recoveries: …,` — `omniBase: Number(row.omni_base || 0),`.
+
+`src/shorts/short-captions.ts`: в `ReviewCaptionInput.skits` добавить `omniBase?: number` (`skits?: { cast: string; animation: ShortAnimation | null; maxOmniSeconds?: number; omniBase?: number };`); функцию `omniSpendLine` с её описанием заменить на:
+
+```ts
+/**
+ * Траты на оживление: «Omni: 16 из 48 с, кадров 2 ≈ $1,86» — с пределом, если он
+ * передан; начат круг владельца (omni_base) — «Omni: 56 с, в этом круге 8 из 48 с, …».
+ */
+export function omniSpendLine(a: ShortAnimation | null, maxOmniSeconds?: number, omniBase = 0): string {
+  const seconds = a?.omniSeconds ?? 0;
+  const frames = a?.keyframes ?? 0;
+  const usd = (seconds * OMNI_USD_PER_SEC + frames * KEYFRAME_USD).toFixed(2).replace('.', ',');
+  // Предел — рядом: владелец видит, сколько пересъёмок ещё осталось в этом круге.
+  const of = Number.isInteger(maxOmniSeconds) ? ` из ${maxOmniSeconds}` : '';
+  const spent = omniBase > 0 ? `${seconds} с, в этом круге ${seconds - omniBase}${of} с` : `${seconds}${of} с`;
+  return `Omni: ${spent}, кадров ${frames} ≈ $${usd}`;
+}
+```
+
+в `buildReviewCaption` — `omniSpendLine(i.skits.animation, i.skits.maxOmniSeconds, i.skits.omniBase)`.
+
+`src/shorts/shorts-approval.service.ts`, в `sendForReview` объект `skits` — `{ cast: skitCastLine(v.script.skits), animation: v.animation, maxOmniSeconds: (await this.settings.get()).maxOmniSeconds, omniBase: v.omniBase }`.
+
+`studio/src/worker/db.ts`: в `Job` после `writerRounds: number;` —
+
+```ts
+  /** Секунды Omni на начало круга владельца (omni_base): предел оживления — на круг. */
+  omniBase: number;
+```
+
+в `claimJob` (возврат задания) после `writerRounds: Number(row.writer_rounds ?? 0),` — `omniBase: Number(row.omni_base ?? 0),`.
+
+`studio/src/worker/jobs.ts`: в `AnimateHooks` после `maxOmniSeconds: number;` — `/** Секунды Omni на начало круга владельца: предел — на круг. */` и `omniBase: number;`; в вызове `d.animate(runDir, {` после `maxOmniSeconds: await d.queue.maxOmniSeconds(),` — `omniBase: job.omniBase,`.
+
+`studio/src/worker/worker.ts`: после `maxOmniSeconds: hooks.maxOmniSeconds,` — `omniBase: hooks.omniBase,`.
+
+`studio/src/animate/run-animate.ts`:
+
+- в `AnimateDeps` после `maxOmniSeconds?: number;` —
+
+```ts
+  /** Секунды Omni на начало круга владельца: предел — на круг, считается от них (0 — с начала ролика, как в CLI). */
+  omniBase?: number;
+```
+
+- после проверки `budget` (блок с `предел секунд Omni — «${budget}»`) —
+
+```ts
+  const base = deps.omniBase ?? 0;
+  if (typeof base !== 'number' || !Number.isFinite(base) || base < 0) {
+    throw new StudioError('no_input', `animate: начало круга по секундам Omni — «${base}», нужно неотрицательное число`, false);
+  }
+```
+
+- `assertBudget` целиком заменить на:
+
+```ts
+  const assertBudget = (): void => {
+    if (anim.omniSeconds - base + CLIP_SEC > budget) {
+      // Круг владельца начат (omni_base) — предел на круг; общий счёт ролика — рядом, для владельца.
+      const circle = base > 0 ? `, в этом круге — ${anim.omniSeconds - base} с` : '';
+      throw new StudioError(
+        'omni_budget',
+        `на ролик ушло ${anim.omniSeconds} с Omni вместе с запущенными${circle}, предел — ${budget} с${base > 0 ? ' на круг' : ''}: лимит пересъёмок сценок; поднять — настройка «Предел секунд Omni» (update_settings maxOmniSeconds; в CLI — MAX_OMNI_SECONDS=<секунды> npm run animate)`,
+        false,
+      );
+    }
+  };
+```
+
+(При `base = 0` текст прежний: тесты с `/предел — 8 с/` и `/на ролик ушло 24 с Omni/` не меняются.)
+
+- [ ] **Step 4: Закоммитить и прогнать**
+
+```bash
+git add src/shorts/migrations/005_doctor.sql src/shorts/short-review.ts src/shorts/shorts.controller.ts src/shorts/shorts.types.ts src/shorts/short-captions.ts src/shorts/shorts-approval.service.ts studio/src/worker/db.ts studio/src/worker/jobs.ts studio/src/worker/worker.ts studio/src/animate/run-animate.ts
+git commit -m "feat(shorts): предел Omni — на круг владельца (omni_base)" -m "Кнопка владельца начинает новый круг и для секунд; общий счёт ролика — в подписи." -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+studio/scripts/node-run.sh "npm test 2>&1 | grep -E '^not ok|^# (tests|pass|fail)'; npm run typecheck; STUDIO_PG_URL=postgresql://studioit:studioit@127.0.0.1:5432/studio_it npm run test:db 2>&1 | grep -E '^not ok|^# (tests|pass|fail)'"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts src/tg-bot 2>&1 | grep -E '✕|^Tests:'; SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts 2>&1 | grep -E '✕|^Tests:'; out=\$(mktemp); npx tsc -p tsconfig.build.json --noEmit >\$out 2>&1 && echo TSC_OK || { echo TSC_FAIL; tail -20 \$out; }"
+```
+
+Ожидается: студия и живая база `# fail 0`, `tsc` студии пуст; бэк — оба `Tests:` без `failed`, `TSC_OK`.
+
+---
+
+### Task 12: Полный прогон, учения на стенде, выкат
 
 **Files:** нет правок кода.
 
