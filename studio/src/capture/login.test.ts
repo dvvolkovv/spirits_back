@@ -19,3 +19,24 @@ test('debug-ручка ответила 404 — no_input без повтора: 
     globalThis.fetch = real;
   }
 });
+
+test('404 «No code» — секрет верный, кода ещё (или уже) нет: ждёт, как пустой ответ, а не no_input', async () => {
+  const real = globalThis.fetch;
+  let codeCalls = 0;
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    if (String(url).includes('/webhook/debug/sms-code/')) {
+      codeCalls++;
+      return codeCalls === 1
+        ? new Response(JSON.stringify({ error: 'No code' }), { status: 404 })
+        : new Response(JSON.stringify({ code: '1234' }), { status: 200 });
+    }
+    return new Response('{}', { status: 200 });
+  }) as typeof fetch;
+  try {
+    // Код — со второго раза; дальше подделка не отдаёт токенов: вход падает на check-code, но уже не как настройка среды.
+    await assert.rejects(loginDemo(cfg), (e: unknown) => e instanceof StudioError && e.code === 'login' && e.retryable === true && /нет токенов/.test(e.message));
+    assert.equal(codeCalls, 2);
+  } finally {
+    globalThis.fetch = real;
+  }
+});

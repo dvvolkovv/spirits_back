@@ -385,6 +385,7 @@ test('кадр: пустой ответ — ещё попытка; заблок�
   });
   await assert.rejects(animateRun(b.runDir, blocked.deps), (e: unknown) => isErr('keyframe_blocked', false)(e) && /сценка 1 \(конфликт\)/.test((e as Error).message));
   assert.deepEqual(blocked.calls.start, []);
+  assert.equal(blocked.calls.keyframe.filter((k) => k.kind === 'conflict').length, 1);
 });
 
 test('квота — сразу ошибка без повтора и с именем сценки, секунды не списаны, готовая сценка сохранена', { timeout: 120_000 }, async () => {
