@@ -1042,7 +1042,7 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.contract.s
 
 **8.1. Красные тесты.**
 
-`studio/src/animate/google.test.ts`: в тесте `'биллинг или регион (FAILED_PRECONDITION) — ключ, без повтора; прочие 4xx при запуске — явный отказ'` заменить `assert.ok(isErr('omni_rejected', true)(e));` на `assert.ok(isErr('omni_bad_request', true)(e));`; после строки `assert.equal(CLEAR_REFUSALS.has('omni_rejected'), true);` добавить `assert.equal(CLEAR_REFUSALS.has('omni_bad_request'), true);`.
+`studio/src/animate/google.test.ts`: в тесте `'биллинг или регион (FAILED_PRECONDITION) — ключ, без повтора; прочие 4xx при запуске — явный отказ'` заменить `assert.ok(isErr('omni_rejected', true)(e));` на `assert.ok(isErr('omni_bad_request', true)(e));`; в тесте `'запуск: ответ потерян или без id — …'` после строки `assert.equal(CLEAR_REFUSALS.has('omni_rejected'), true);` добавить `assert.equal(CLEAR_REFUSALS.has('omni_bad_request'), true);`.
 
 `studio/src/animate/run-animate.test.ts`:
 
@@ -1181,7 +1181,7 @@ studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts src/a
 NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.contract.spec.ts 2>&1 | grep -E '✕|Tests:'"
 ```
 
-Ожидается красное ровно у шести: в run-animate — «два несовпадения речи на одном тексте…» (нет сводки кодов), «…нет секунд — omni_budget с причиной…» (нет причины), «фильтр Google трижды отказал…» (текст), «речь не распознана…» (текст); в google — тест 413 и тест `CLEAR_REFUSALS`. Остальные новые — сторожа и проходят уже сейчас. Контракт — `Tests: 10 passed`.
+Ожидается красное ровно у семи: в run-animate — «два несовпадения речи на одном тексте…» (нет сводки кодов), «…нет секунд — omni_budget с причиной…» (нет причины), «фильтр Google трижды отказал…» (текст), «отказ Google не про текст (omni_bad_request)…» (кода нет в `CLEAR_REFUSALS` — секунды не возвращаются, 32 вместо 8), «речь не распознана…» (текст); в google — тест 413 и тест `CLEAR_REFUSALS` («запуск: ответ потерян…»). Остальные новые — сторожа и проходят уже сейчас. Контракт — `Tests: 10 passed`.
 
 **8.2. Код.**
 
