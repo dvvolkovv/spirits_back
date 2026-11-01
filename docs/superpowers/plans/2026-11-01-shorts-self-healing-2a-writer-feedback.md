@@ -208,7 +208,7 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.types.spec
 
 - [ ] **Step 3: Тип и поле**
 
-В `src/shorts/shorts.types.ts` сразу перед `export interface ShortAnimation {` вставить:
+В `src/shorts/shorts.types.ts` сразу перед JSDoc-комментарием `ShortAnimation` (блок «Итог задания animate (зеркало ShortAnimation в studio/src/types.ts): …» над `export interface ShortAnimation {`) вставить — не между этим комментарием и интерфейсом:
 
 ```ts
 /**
