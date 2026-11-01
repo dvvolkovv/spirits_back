@@ -27,9 +27,17 @@ export class ShortsDoctorService {
   constructor(private readonly pg: PgService) {}
 
   async treat(v: ShortVideo, now: Date = new Date()): Promise<TreatOutcome> {
-    if (!autoHealEnabled() || v.status !== 'failed') return 'gave_up';
+    if (!autoHealEnabled()) {
+      this.logger.log(`ролик ${v.id}: доктор выключен (SHORTS_AUTO_HEAL=false) — к владельцу`);
+      return 'gave_up';
+    }
+    if (v.status !== 'failed') return 'gave_up';
     const p = prescribe(v);
-    if (p.action === 'never') return 'gave_up';
+    if (p.action === 'never') {
+      // Почему не взялся — в журнал: «никак по таблице» и «круг исчерпан» иначе неотличимы.
+      this.logger.log(`ролик ${v.id}: доктор не берётся (${v.failedFrom}, ${v.failedCode ?? 'без кода'}, самопочинок в круге — ${v.autoRecoveries}) — к владельцу`);
+      return 'gave_up';
+    }
     const entry = JSON.stringify([recoveryEntry(v, p, now)]);
     const done = `attempts = 0, last_error = NULL, failed_from = NULL, failed_code = NULL, failure_notified = false,
             auto_recoveries = auto_recoveries + 1, recoveries = recoveries || $3::jsonb, updated_at = now()`;

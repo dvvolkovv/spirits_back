@@ -625,9 +625,11 @@ export class ShortsApprovalService {
       const v = rowToShort(r.rows[0]);
       if (this.doctor && v.failedFrom !== 'publishing') {
         try {
-          if ((await this.doctor.treat(v)) !== 'gave_up') continue;
+          // Молчим только когда доктор взялся или владелец успел сам; любой другой ответ — сообщение: сбой не прячется.
+          const outcome = await this.doctor.treat(v);
+          if (outcome === 'took' || outcome === 'gone') continue;
         } catch (e: any) {
-          this.logger.error(`доктор: ролик ${v.id} — ${e?.message ?? e}`);
+          this.logger.error(`доктор: ролик ${v.id} — ${e?.message ?? e}`, e?.stack);
         }
       }
       const released = r.rows[0].released === true;
