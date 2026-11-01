@@ -63,7 +63,7 @@ if [[ -n "$PAUSE_FILE" && ! -e "$WORK/health.started" ]]; then
   touch "$WORK/health.started"
   while [[ ! -e "$PAUSE_FILE" ]]; do /bin/sleep 0.05; done
 fi
-restarts=$(wc -l < "$WORK/restarts.log" 2>/dev/null || echo 0)
+if [[ -f "$WORK/restarts.log" ]]; then restarts=$(wc -l < "$WORK/restarts.log"); else restarts=0; fi
 if [[ -e "$DRAIN_FILE" ]]; then gate=yes; else gate=no; fi
 echo "curl restart=$restarts gate=$gate" >> "$WORK/curl.log"
 case "${health}" in
@@ -191,8 +191,8 @@ describe('deploy-relay drain/admission gate', () => {
     const r = runRollout('inflight-then-zero');
     try {
       expect(r.status).toBe(0);
-      expect(r.curls.trim().split('\n')).toHaveLength(2);
-      expect(r.curls).toContain('restart=0 gate=yes');
+      expect(r.curls.trim().split('\n')).toHaveLength(3);
+      expect(r.curls.match(/restart=0 gate=yes/g) || []).toHaveLength(2);
       expect(r.liveServer).toContain('target');
       expect(r.drainExists).toBe(false);
     } finally {
