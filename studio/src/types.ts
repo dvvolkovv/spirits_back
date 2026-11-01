@@ -120,6 +120,23 @@ export type SkitKind = 'conflict' | 'punchline';
 /** Сценки по порядку в ролике: конфликт открывает ролик, развязка идёт после ответа. */
 export const SKIT_KINDS: readonly SkitKind[] = ['conflict', 'punchline'];
 
+/**
+ * Отзыв студии о сценке, которую Omni не снять с этими репликами (skit_feedback):
+ * два клипа с одним текстом сценки не прошли сверку речи или фильтр Google трижды
+ * отказал. Сценарист переписывает реплики и действие только этой сценки. Зеркало
+ * ShortSkitFeedback бэкенда; пояснение для сценариста — в writer_feedback.
+ */
+export interface SkitFeedback {
+  kind: SkitKind;
+  code: 'speech_mismatch' | 'omni_rejected';
+  /** Номера реплик (с 1), которых не услышали в последнем клипе, — у speech_mismatch; пусто, если речь не сошлась по доле слов, а не по репликам. */
+  lines: number[];
+  /** Что распознал SpeechKit в последнем клипе — у speech_mismatch. */
+  heard: string | null;
+  /** Причина отказа фильтра Google — у omni_rejected. */
+  reason: string | null;
+}
+
 export interface SkitLine {
   /** id героя труппы (src/shorts/short-troupe.ts бэкенда). */
   hero: string;
