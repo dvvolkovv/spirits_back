@@ -1,11 +1,13 @@
 import {
   BadRequestException,
   ConflictException,
+  HttpException,
+  HttpStatus,
   Injectable,
   NotFoundException,
   OnModuleInit,
 } from '@nestjs/common';
-import { createHash, randomBytes } from 'crypto';
+import { createHmac, randomBytes, timingSafeEqual } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { ChatService } from '../chat/chat.service';
@@ -111,6 +113,50 @@ export class AgentVersionsService implements OnModuleInit {
     return toAgentVersion(result.rows[0]);
   }
 
+  private issueAgentTestSession(actor: string, agentId: number, versionId: string): string {
+    const secret = process.env.JWT_SECRET;
+    if (!secret) throw new Error('JWT_SECRET is required for agent test sessions');
+    const payload = Buffer.from(JSON.stringify({
+      a: actor,
+      g: agentId,
+      v: versionId,
+      n: randomBytes(12).toString('base64url'),
+    })).toString('base64url');
+    const signature = createHmac('sha256', secret).update(payload).digest('base64url');
+    return `agent_test_${payload}.${signature}`;
+  }
+
+  private validateAgentTestSession(
+    sessionId: string,
+    actor: string,
+    agentId: number,
+    versionId: string,
+  ): void {
+    const invalid = () => new BadRequestException('Invalid agent test session');
+    if (sessionId.length > 512 || !sessionId.startsWith('agent_test_')) throw invalid();
+    const parts = sessionId.slice('agent_test_'.length).split('.');
+    if (parts.length !== 2 || !/^[A-Za-z0-9_-]+$/.test(parts[0]) || !/^[A-Za-z0-9_-]{43}$/.test(parts[1])) {
+      throw invalid();
+    }
+    const secret = process.env.JWT_SECRET;
+    if (!secret) throw new Error('JWT_SECRET is required for agent test sessions');
+    const expected = createHmac('sha256', secret).update(parts[0]).digest('base64url');
+    const actualBuffer = Buffer.from(parts[1]);
+    const expectedBuffer = Buffer.from(expected);
+    if (actualBuffer.length !== expectedBuffer.length || !timingSafeEqual(actualBuffer, expectedBuffer)) {
+      throw invalid();
+    }
+    try {
+      const payload = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+      if (payload.a !== actor || payload.g !== agentId || payload.v !== versionId || typeof payload.n !== 'string') {
+        throw invalid();
+      }
+    } catch (e) {
+      if (e instanceof BadRequestException) throw e;
+      throw invalid();
+    }
+  }
+
   async testVersion(
     actor: string,
     agentId: number,
@@ -127,17 +173,15 @@ export class AgentVersionsService implements OnModuleInit {
       throw new BadRequestException('message must not exceed 12000 characters');
     }
 
-    let testSession = sessionId;
-    if (testSession !== undefined) {
-      if (!/^agent_test_[A-Za-z0-9_-]{1,80}$/.test(testSession)) {
-        throw new BadRequestException('Invalid agent test session');
-      }
-    } else {
-      const hash = createHash('sha256')
-        .update(`${agentId}:${versionId}:${Date.now()}:${randomBytes(16).toString('hex')}`)
-        .digest('hex')
-        .slice(0, 32);
-      testSession = `agent_test_${actor}_${hash}`;
+    const testSession = sessionId === undefined
+      ? this.issueAgentTestSession(actor, agentId, versionId)
+      : sessionId;
+    if (sessionId !== undefined) {
+      this.validateAgentTestSession(testSession, actor, agentId, versionId);
+    }
+    const balance = await this.chat.getTokenBalance(actor).catch(() => 0);
+    if (balance <= 0) {
+      throw new HttpException('Недостаточно токенов', HttpStatus.PAYMENT_REQUIRED);
     }
 
     const result = await this.chat.generateAgentReplyWithCharge(
@@ -149,12 +193,24 @@ export class AgentVersionsService implements OnModuleInit {
         systemPromptOverride: version.system_prompt,
         includeUserContext: false,
         linkeonTools: false,
+        testMode: true,
+        billingContext: 'agent_version_test',
       },
     );
+    if (!result.text || result.tokens <= 0) {
+      throw new Error('Agent version test failed: empty or non-billable reply');
+    }
     await this.chat.recordAgentVersionTestCharge(
       actor,
       String(agentId),
-      { tokens: result.tokens, costUsd: result.costUsd },
+      {
+        tokens: result.tokens,
+        costUsd: result.charge.usd,
+        turnCostUsd: result.charge.turnUsd ?? null,
+        source: result.charge.source,
+        taken: result.charge.taken,
+        durationMs: result.durationMs,
+      },
       result.text.length,
     );
     return { text: result.text, session_id: testSession, tokens: result.tokens };

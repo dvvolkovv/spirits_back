@@ -280,6 +280,16 @@ export interface AgentReplyOpts {
   linkeonTools?: boolean;
   systemPromptOverride?: string;
   includeUserContext?: boolean;
+  testMode?: boolean;
+  billingContext?: string;
+}
+
+export interface ChargedAgentReply {
+  text: string;
+  tokens: number;
+  costUsd: number;
+  charge: SdkCharge;
+  durationMs: number;
 }
 
 @Injectable()
@@ -2616,34 +2626,48 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * ассистентам. Замечено владельцем 26.08.2026, когда он попросил показывать
    * расход на экране.
    *
-   * Возвращённое списывают голосовые консультации (voice-call), поэтому здесь
-   * же печатается billing[voice:…] с раскладом и алертит сработавшая страховка
-   * — как в двух других путях.
+   * По умолчанию списание относится к голосовым консультациям (voice-call) и
+   * печатается как billing[voice:…]; opts.billingContext меняет только метку.
+   * Алерт страховки работает как в двух других путях.
    */
   async generateAgentReplyWithCharge(
     userId: string, assistantId: string, message: string, sessionIdOverride?: string, opts: AgentReplyOpts = {},
-  ): Promise<{ text: string; tokens: number; costUsd: number }> {
+  ): Promise<ChargedAgentReply> {
     return this.agentReply(userId, assistantId, message, sessionIdOverride, true, opts);
   }
 
   async recordAgentVersionTestCharge(
     userId: string,
     assistantId: string,
-    charge: { tokens: number; costUsd: number },
+    charge: {
+      tokens: number;
+      costUsd: number;
+      turnCostUsd?: number | null;
+      source?: ChargeFacts['source'];
+      taken?: ChargeTaken;
+      durationMs?: number;
+    },
     replyChars: number,
   ): Promise<void> {
-    await this.addTokenTask(userId, 0, charge.tokens, assistantId, {
+    if (charge.tokens <= 0) return;
+    const facts: ChargeFacts = {
       costUsd: Number(charge.costUsd.toFixed(4)),
-      source: 'cost',
-      durationMs: 0,
+      source: charge.source || 'cost',
+      durationMs: charge.durationMs ?? 0,
       replyChars,
-    });
+    };
+    if (charge.turnCostUsd !== undefined) {
+      facts.turnCostUsd = charge.turnCostUsd === null ? null : Number(charge.turnCostUsd.toFixed(4));
+    }
+    if (charge.taken) facts.taken = charge.taken;
+    await this.addTokenTask(userId, 0, charge.tokens, assistantId, facts);
   }
 
   private async agentReply(
     userId: string, assistantId: string, message: string, sessionIdOverride: string | undefined, billed: boolean,
     opts: AgentReplyOpts = {},
-  ): Promise<{ text: string; tokens: number; costUsd: number }> {
+  ): Promise<ChargedAgentReply> {
+    const startedAt = Date.now();
     const isNumeric = /^\d+$/.test(assistantId);
     const agentRes = isNumeric
       ? await this.pg.query('SELECT * FROM agents WHERE id = $1 LIMIT 1', [parseInt(assistantId, 10)])
@@ -2711,6 +2735,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const relaySid = sessionIdOverride ||
       relaySessionKey(userId, assistantId, await this.language.resolveUserLanguage(userId));
     fd.append('sessionId', relaySid);
+    if (opts.testMode === true) fd.append('testMode', 'true');
     // Инструменты Linkeon — только когда вызывающий явно сказал linkeonTools:
     // true (см. AgentReplyOpts); по умолчанию — нет.
     if (opts.linkeonTools === true) appendLinkeonFields(fd, linkeonRelayFields(userId, relaySid));
@@ -2719,6 +2744,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
     };
     let costUsd = 0;
+    let turnFailed = false;
     const turnCost = new RelayTurnCost();
     const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
       headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
@@ -2740,6 +2766,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
             else if (ev.type === 'result' && ev.text && chunks.length === 0) chunks.push(ev.text);
             else if (ev.type === 'done') {
               // Стоимость и расход — здесь же, где их берёт основной путь.
+              if (ev.failed === true) turnFailed = true;
               if (typeof ev.costUsd === 'number' && ev.costUsd > 0) costUsd += ev.costUsd;
               turnCost.add(ev);
               if (ev.usage && typeof ev.usage === 'object') {
@@ -2757,13 +2784,25 @@ ${LanguageService.buildDirective(userLanguage)}`;
     });
     const text = this.stripToolTags(chunks.join('')).trim();
     const charge = this.computeSdkCharge(usage, costUsd, text, turnCost.usd);
+    if (opts.testMode === true) {
+      const failure = turnFailed
+        ? 'relay reported failure'
+        : !text
+        ? 'empty reply'
+        : this.looksCliFailure(text)
+        ? 'CLI failure reply'
+        : charge.tokens <= 0
+        ? 'non-billable upstream reply'
+        : '';
+      if (failure) throw new Error(`Agent version test failed: ${failure}`);
+    }
     if (billed) {
-      const logLine = `billing[voice:${charge.source}]: tokens=${charge.tokens} ${charge.note}`;
+      const logLine = `billing[${opts.billingContext || 'voice'}:${charge.source}]: tokens=${charge.tokens} ${charge.note}`;
       if (charge.source === 'length') this.logger.warn(logLine);
       else this.logger.log(logLine);
       this.alertTurnCostFloor(userId, assistantId, charge, charge.tokens);
     }
-    return { text, tokens: charge.tokens, costUsd };
+    return { text, tokens: charge.tokens, costUsd, charge, durationMs: Date.now() - startedAt };
   }
 
   /** Public wrapper для chat.controller — после upload-and-chat обогащаем профиль + tasks. */
