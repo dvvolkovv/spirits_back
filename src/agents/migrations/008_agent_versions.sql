@@ -1,3 +1,5 @@
+CREATE UNIQUE INDEX IF NOT EXISTS agents_id_unique ON agents(id);
+
 CREATE TABLE IF NOT EXISTS agent_versions (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   agent_id integer NOT NULL REFERENCES agents(id),
