@@ -491,3 +491,131 @@ describe('AgentVersionsService', () => {
     expect(getClient).not.toHaveBeenCalled();
   });
 });
+
+describe('AgentVersionsService.testVersion', () => {
+  const draft = {
+    ...live,
+    id: '22222222-2222-2222-2222-222222222222',
+    version: 2,
+    system_prompt: 'DRAFT SYSTEM PROMPT',
+    status: 'draft',
+    published_at: null,
+    published_by: null,
+  };
+
+  function makeTestService() {
+    const query = jest.fn().mockResolvedValue({ rows: [draft] });
+    const generateAgentReplyWithCharge = jest.fn().mockResolvedValue({
+      text: 'draft answer',
+      tokens: 321,
+      costUsd: 0.123456,
+    });
+    const recordAgentVersionTestCharge = jest.fn().mockResolvedValue(undefined);
+    const streamChat = jest.fn();
+    const service = new AgentVersionsService(
+      { query, getClient: jest.fn() } as any,
+      {
+        generateAgentReplyWithCharge,
+        recordAgentVersionTestCharge,
+        streamChat,
+      } as any,
+    );
+    return {
+      service,
+      query,
+      generateAgentReplyWithCharge,
+      recordAgentVersionTestCharge,
+      streamChat,
+    };
+  }
+
+  it('reuses a supplied isolated session, returns the reply, and records its charge', async () => {
+    const h = makeTestService();
+    const sessionId = 'agent_test_admin_supplied-1';
+
+    const result = await h.service.testVersion(
+      'admin',
+      12,
+      draft.id,
+      '  check the draft  ',
+      sessionId,
+    );
+
+    expect(result).toEqual({
+      text: 'draft answer',
+      session_id: sessionId,
+      tokens: 321,
+    });
+    expect(h.generateAgentReplyWithCharge).toHaveBeenCalledWith(
+      'admin',
+      12,
+      'check the draft',
+      sessionId,
+      {
+        systemPromptOverride: 'DRAFT SYSTEM PROMPT',
+        includeUserContext: false,
+        linkeonTools: false,
+      },
+    );
+    expect(h.recordAgentVersionTestCharge).toHaveBeenCalledWith(
+      'admin',
+      12,
+      { tokens: 321, costUsd: 0.123456 },
+      'draft answer'.length,
+    );
+    expect(h.streamChat).not.toHaveBeenCalled();
+    expect(
+      h.query.mock.calls.some(([sql]) => /INSERT INTO custom_chat_history/i.test(sql)),
+    ).toBe(false);
+  });
+
+  it('generates an actor-scoped session with a 32-character hash when absent', async () => {
+    const h = makeTestService();
+
+    const result = await h.service.testVersion('admin', 12, draft.id, 'check');
+
+    expect(result.session_id).toMatch(/^agent_test_admin_[a-f0-9]{32}$/);
+    expect(h.generateAgentReplyWithCharge).toHaveBeenCalledWith(
+      'admin',
+      12,
+      'check',
+      result.session_id,
+      expect.any(Object),
+    );
+  });
+
+  it.each([
+    'ordinary_session',
+    'agent_test_',
+    'agent_test_bad!',
+    `agent_test_${'a'.repeat(81)}`,
+  ])('rejects invalid session %s with 400 without calling AI', async (sessionId) => {
+    const h = makeTestService();
+
+    const error = await h.service
+      .testVersion('admin', 12, draft.id, 'check', sessionId)
+      .catch((e) => e);
+
+    expect(error).toBeInstanceOf(BadRequestException);
+    expect(error.getStatus()).toBe(400);
+    expect(h.generateAgentReplyWithCharge).not.toHaveBeenCalled();
+    expect(h.recordAgentVersionTestCharge).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { case: 'empty', message: '' },
+    { case: 'whitespace-only', message: '   ' },
+    { case: 'over 12000 characters', message: 'x'.repeat(12001) },
+  ])('rejects a $case message with 400 without calling AI', async ({ message }) => {
+    const h = makeTestService();
+
+    const error = await h.service
+      .testVersion('admin', 12, draft.id, message)
+      .catch((e) => e);
+
+    expect(error).toBeInstanceOf(BadRequestException);
+    expect(error.getStatus()).toBe(400);
+    expect(h.generateAgentReplyWithCharge).not.toHaveBeenCalled();
+    expect(h.recordAgentVersionTestCharge).not.toHaveBeenCalled();
+  });
+});
