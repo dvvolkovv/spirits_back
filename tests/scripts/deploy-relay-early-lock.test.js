@@ -70,7 +70,7 @@ function runFull(home, work, lockFile, pauseFile, async) {
     LOCK_FILE: lockFile,
     NGINX_CONF: nginxConf,
   };
-  const args = [DEPLOY, BASE_SHA, 'HEAD'];
+  const args = [...(process.env.DEBUG_ROLLOUT ? ['-x'] : []), DEPLOY, BASE_SHA, 'HEAD'];
   if (async) {
     const child = spawn('bash', args, { cwd: ROOT, env });
     let stdout = '';
