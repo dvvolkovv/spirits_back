@@ -39,6 +39,12 @@ async function appliedSkitFeedbackSql(): Promise<string> {
   return text;
 }
 
+async function appliedDoctorSql(): Promise<string> {
+  const text = (await applied()).find((q) => q.includes("hashtext('shorts/005')"));
+  if (!text) throw new Error('миграция 005 не применена');
+  return text;
+}
+
 describe('ShortsSchemaService', () => {
   it('катит 001 при старте модуля', async () => {
     expect(await appliedSql()).toContain('CREATE TABLE short_publication');
@@ -66,6 +72,14 @@ describe('ShortsSchemaService', () => {
     const fourth = qs.findIndex((q) => q.includes("hashtext('shorts/004')"));
     expect(third).toBeGreaterThanOrEqual(0);
     expect(fourth).toBeGreaterThan(third);
+  });
+
+  it('катит 005 после 004', async () => {
+    const qs = await applied();
+    const fourth = qs.findIndex((q) => q.includes("hashtext('shorts/004')"));
+    const fifth = qs.findIndex((q) => q.includes("hashtext('shorts/005')"));
+    expect(fourth).toBeGreaterThanOrEqual(0);
+    expect(fifth).toBeGreaterThan(fourth);
   });
 
   it('не роняет старт, если база ответила ошибкой', async () => {
@@ -219,6 +233,34 @@ describe('текст 004_skit_feedback.sql', () => {
     expect(sql).toMatch(
       /IF NOT EXISTS \(SELECT 1 FROM information_schema\.columns\s+WHERE table_schema = 'public' AND table_name = 'short_video' AND column_name = 'skit_feedback'\) THEN\s+ALTER TABLE short_video ADD COLUMN skit_feedback jsonb;/,
     );
+    expect(sql).not.toMatch(/ADD COLUMN IF NOT EXISTS/);
+  });
+});
+
+describe('текст 005_doctor.sql', () => {
+  it('весь файл — один DO-блок под advisory-локом и lock_timeout', async () => {
+    const sql = (await appliedDoctorSql()).trim();
+    expect(sql.startsWith('DO $shorts$')).toBe(true);
+    expect(sql.endsWith('$shorts$;')).toBe(true);
+    expect(sql).toContain("pg_advisory_xact_lock(hashtext('shorts/005'))");
+    expect(sql).toContain("set_config('lock_timeout', '5s', true)");
+  });
+
+  it('три колонки — каждая под проверкой information_schema, умолчания — константы', async () => {
+    const sql = await appliedDoctorSql();
+    const adds = [...sql.matchAll(/ALTER TABLE ([a-z_]+) ADD COLUMN ([a-z_]+)/g)];
+    expect(adds.map(([, t, c]) => `${t}.${c}`).sort()).toEqual(['short_video.auto_recoveries', 'short_video.failed_code', 'short_video.recoveries']);
+    expect((sql.match(/ALTER TABLE/g) ?? []).length).toBe(adds.length);
+    for (const [, table, column] of adds) {
+      expect(sql).toMatch(
+        new RegExp(
+          `IF NOT EXISTS \\(SELECT 1 FROM information_schema\\.columns\\s+WHERE table_schema = 'public' AND table_name = '${table}' AND column_name = '${column}'\\) THEN\\s+ALTER TABLE ${table} ADD COLUMN ${column}`,
+        ),
+      );
+    }
+    expect(sql).toContain('ADD COLUMN failed_code text;');
+    expect(sql).toContain('ADD COLUMN auto_recoveries integer NOT NULL DEFAULT 0;');
+    expect(sql).toContain("ADD COLUMN recoveries jsonb NOT NULL DEFAULT '[]'::jsonb;");
     expect(sql).not.toMatch(/ADD COLUMN IF NOT EXISTS/);
   });
 });
