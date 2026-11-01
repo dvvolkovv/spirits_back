@@ -642,7 +642,7 @@ wait_for_streams_drain() {
 # процессом (Agent SDK бэкенда запускается оттуда).
 back_build_cmds() {
   cat <<'CMDS'
-    if [ -n "${CI_SAME_AS:-}" ] && git diff --quiet "$CI_SAME_AS" HEAD -- package-lock.json; then
+    if [ -n "${CI_SAME_AS:-}" ] && git diff --quiet "$CI_SAME_AS" HEAD -- package-lock.json && [ -x node_modules/.bin/nest ]; then
       echo 'npm ci пропущен: package-lock.json тот же'
     else
       npm ci --no-audit --no-fund 2>&1 | tail -3
