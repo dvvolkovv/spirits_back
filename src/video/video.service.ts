@@ -1013,7 +1013,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         // любое продление с 01.11.2026 (см. OMNI_EXTEND_WORKS), и совет
         // переформулировать описание человека только путает.
         if (st.code === 'INVALID_ARGUMENT' && !plan.veo_concat && plan.segments_done > 0) {
-          err = 'Omni не смог продлить ролик — это сбой продления на стороне Google, а не фильтр: описание менять не нужно, токены возвращены.';
+          err = 'Omni не смог продлить ролик — это сбой продления на стороне Google: описание менять не нужно, токены возвращены.';
         }
         // Транзиентная ошибка рендеринга Google: операция принята (generate/
         // extend вернули ok), но рендер упал с "internal server issue"/5xx и
