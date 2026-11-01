@@ -1,3 +1,4 @@
+import { newSceneNote } from './short-doctor';
 import { MAX_RECAPTURES, ShortsWriterService } from './shorts-writer.service';
 import { StageFatalError } from './short-jobs';
 import { WRITER_SKIT_SYSTEM, WRITER_SYSTEM } from './short-prompts';
@@ -137,6 +138,15 @@ describe('ShortsWriterService.write', () => {
     const note = 'Сценарист: нужен вопрос про субаренду\nСценарист: всё ещё не про субаренду\nсделайте про субаренду с животными';
     await svc.write(video({ owner_note: note }));
     expect((pg.query.mock.calls[0] as any[])[0]).toMatch(/SET status = 'directing'/);
+  });
+
+  it('строка доктора «Сам: …» — не замечание владельца: счёт просьб сценариста не обнуляет', async () => {
+    const { svc, pg } = setup([{ needsRecapture: true, reason: 'нужен вопрос про субаренду' }]);
+    // Строка — как её пишет доктор (newSceneNote): тест не разойдётся с префиксом.
+    const note = `про субаренду\nСценарист: нужен вопрос про субаренду\nСценарист: всё ещё не про субаренду\n${newSceneNote({ lastError: 'съёмка: ответ не годится', failedCode: 'answer_rejected' })}`;
+    const err = await svc.write(video({ owner_note: note })).catch((e) => e);
+    expect(err).toMatchObject({ name: 'StageFatalError', code: 'recapture' });
+    expect(pg.query).not.toHaveBeenCalled();
   });
 
   it('реальный кейс — с подписью в кадре вопроса', async () => {

@@ -156,6 +156,7 @@ maybe('ролики против живого Postgres', () => {
     expect(await stageFailed(pool, third, 'режиссёр', new Error('релей молчит'))).toBe('failed');
     const row = (await pool.query(`SELECT * FROM short_video WHERE id = $1`, [v.id])).rows[0];
     expect([row.status, row.failed_from, row.failure_notified, row.last_error]).toEqual(['failed', 'directing', false, 'режиссёр: релей молчит']);
+    expect(row.failed_code).toBe('relay');
   });
 
   it('аренда истекла посреди работы: опоздавший процесс не трогает чужой захват; зависшая последняя попытка — failed', async () => {
@@ -170,8 +171,8 @@ maybe('ролики против живого Postgres', () => {
 
     await pool.query(`UPDATE short_video SET attempts = 3, lease_until = now() - interval '1 second' WHERE id = $1`, [v.id]);
     expect(await claimStage(pool, 'directing')).toBeNull();
-    const row = (await pool.query(`SELECT status, failed_from, failure_notified FROM short_video WHERE id = $1`, [v.id])).rows[0];
-    expect(row).toEqual({ status: 'failed', failed_from: 'directing', failure_notified: false });
+    const row = (await pool.query(`SELECT status, failed_from, failure_notified, failed_code FROM short_video WHERE id = $1`, [v.id])).rows[0];
+    expect(row).toEqual({ status: 'failed', failed_from: 'directing', failure_notified: false, failed_code: 'lease' });
   });
 
   it('ответ на приглашение узнаётся по большому id сообщения, замечание уводит ролик на переписку', async () => {

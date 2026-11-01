@@ -102,6 +102,7 @@ describe('ShortsDirectorService.direct', () => {
   it('кривой ответ режиссёра — обычная ошибка: этап повторится', async () => {
     const { svc } = setup('Извините, не могу');
     await expect(svc.direct(video())).rejects.toThrow(/режиссёр: не нашёл JSON/);
+    expect(await svc.direct(video()).catch((e) => e)).not.toBeInstanceOf(StageFatalError);
   });
 
   it('ролик ушёл из directing, пока думал режиссёр — без ошибки', async () => {
@@ -116,6 +117,7 @@ describe('ShortsDirectorService.direct', () => {
       'режиссёр: выбрал ассистента здоровья «Полина» для провокационной подачи — здоровье только в calm',
     );
     expect(pg.query.mock.calls.some((call: any[]) => String(call[0]).includes('capture_queued'))).toBe(false);
+    expect(await svc.direct(video({ angle: 'roast', assistant_id: null })).catch((e) => e)).not.toBeInstanceOf(StageFatalError);
   });
 
   it('та же ситуация в спокойной подаче — проходит', async () => {

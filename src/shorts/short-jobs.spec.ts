@@ -86,6 +86,12 @@ describe('stageFailed', () => {
     expect(p.calls[0].params[4]).toBe('rules');
   });
 
+  it('ошибка со своим code (сеть, pg) — в failed_code всё равно relay: код берётся только у StageFatalError', async () => {
+    const p = pg();
+    await stageFailed(p, video(3), 'режиссёр', Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }));
+    expect(p.calls[0].params[4]).toBe('relay');
+  });
+
   it('ролик ушёл с этапа или его забрал другой процесс — gone, больше ничего не пишется', async () => {
     const retry = pg([], 0);
     expect(await stageFailed(retry, video(1), 'режиссёр', new Error('поздно'))).toBe('gone');
