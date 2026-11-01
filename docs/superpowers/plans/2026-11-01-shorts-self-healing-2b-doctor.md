@@ -1159,6 +1159,90 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-doctor.spec
 
 Ожидается: оба набора без `failed`, `TSC_OK`.
 
+- [ ] **Step 6: Третий заход — последнее действие оживления и при кодах новой сцены, этап без продолжения, сторож кодов API**
+
+Перепроверка второго захода: правило «последнее действие круга у оживления — без сценок» заменяло только «позже», а при кодах новой сцены (`keyframe_blocked`, `script_invalid`) на последнем шаге круга доктор выбирал новую сцену — пять этапов, которым круга уже не хватит. Ветка `LATER` отвечала «позже», не проверив, продолжит ли «Повторить» с этого этапа. Коды фатальных сбоев API — без сторожа.
+
+`src/shorts/short-doctor.spec.ts`, в `describe('prescribe — пределы на круг', …)`:
+
+```ts
+  it('оживление, последнее действие круга и код новой сцены — тоже без сценок: новой сцене круга не хватит', () => {
+    const two = [rec('later', { from: 'capturing', code: 'login', delayMin: 30 }), rec('later', { delayMin: 120 })];
+    expect(prescribe(v({ failedCode: 'keyframe_blocked', recoveries: two, autoRecoveries: 2 })).action).toBe('no_skits');
+    expect(prescribe(v({ failedCode: 'keyframe_blocked' })).action).toBe('new_scene');
+  });
+
+  it('этап, с которого «Повторить» не продолжит, — никак при любом коде', () => {
+    expect(prescribe(v({ failedFrom: 'pending_review' as ShortStatus, failedCode: 'login' })).action).toBe('never');
+  });
+```
+
+`src/shorts/shorts.contract.spec.ts`, после теста `'каждый код сбоя студии осознанно разнесён в таблице доктора (short-doctor.ts)'`:
+
+```ts
+  it('каждый код фатального сбоя этапа API (StageFatalCode) осознанно разнесён в таблице доктора', () => {
+    const union = fs.readFileSync(path.join(__dirname, 'short-jobs.ts'), 'utf8').match(/export type StageFatalCode =([^;]+);/)?.[1] ?? '';
+    const codes = [...union.matchAll(/'([a-z_]+)'/g)].map((m) => m[1]);
+    expect(codes.length).toBeGreaterThan(3);
+    const doctor = fs.readFileSync(path.join(__dirname, 'short-doctor.ts'), 'utf8');
+    expect(codes.filter((c) => !doctor.includes(`'${c}'`))).toEqual([]);
+  });
+```
+
+```bash
+git add src/shorts/short-doctor.spec.ts src/shorts/shorts.contract.spec.ts
+git commit -m "test(shorts): доктор — последнее действие оживления и при кодах новой сцены, этап без продолжения, сторож кодов API (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-doctor.spec.ts src/shorts/shorts.contract.spec.ts 2>&1 | grep -E '✕|Tests:'"
+```
+
+Ожидается: красные два — «код новой сцены на последнем действии» (сейчас `new_scene`) и «этап без продолжения» (сейчас `later` из ветки `LATER`); сторож кодов API зелёный сразу.
+
+`src/shorts/short-doctor.ts`:
+
+1. В `ruleFor` строку `if (!from || from === 'publishing' || code === 'no_input') return 'never';` дополнить следующей:
+
+```ts
+  // Этап, с которого «Повторить» не продолжит (RESUME_FROM), — к владельцу при любом коде.
+  if (!retryTarget({ status: 'failed', failedFrom: from, approvedAt: null })) return 'never';
+```
+
+а последние две строки функции
+
+```ts
+  if (from === 'animating') return 'later_then_no_skits';
+  return retryTarget({ status: 'failed', failedFrom: from, approvedAt: null }) ? 'later' : 'never';
+```
+
+заменить на
+
+```ts
+  return from === 'animating' ? 'later_then_no_skits' : 'later';
+```
+
+2. В `prescribe` строки
+
+```ts
+    case 'new_scene':
+      if (allowed('new_scene')) return { action: 'new_scene' };
+```
+
+заменить на
+
+```ts
+    case 'new_scene':
+      // Оживление на последнем действии круга — без сценок: новой сцене (пять этапов) круга уже не хватит.
+      if (animating && total === MAX_AUTO_RECOVERIES - 1) return noSkits();
+      if (allowed('new_scene')) return { action: 'new_scene' };
+```
+
+```bash
+git add src/shorts/short-doctor.ts
+git commit -m "fix(shorts): доктор — оживление на последнем действии круга без сценок и при кодах новой сцены; этап без продолжения — никак" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-doctor.spec.ts src/shorts/shorts.contract.spec.ts 2>&1 | grep -E '✕|Tests:'; out=\$(mktemp); npx tsc -p tsconfig.build.json --noEmit >\$out 2>&1 && echo TSC_OK || { echo TSC_FAIL; tail -20 \$out; }"
+```
+
+Ожидается: без `failed`, `TSC_OK`.
+
 ---
 
 ### Task 6: Доктор — записи в базу и выключатель
@@ -1181,7 +1265,9 @@ const failed = (over: Record<string, any> = {}) =>
   rowToShort({
     id: 'v1', rubric: 'assistant', angle: 'calm', source: 'manual', topic_key: 't', status: 'failed', format: 'skit',
     failed_from: 'animating', failed_code: 'google_quota', last_error: 'оживление: лимит Google исчерпан', failure_notified: true,
-    capture: { answerText: 'ответ', paragraphs: [] }, owner_note: null, recoveries: [], auto_recoveries: 0, ...over,
+    capture: { answerText: 'ответ', paragraphs: [] }, owner_note: null, recoveries: [], auto_recoveries: 0,
+    // Сцена нужна «без сценок» (prescribe, задача 5, шаг 5): сценарист пишет текст по сцене и съёмке.
+    scene: { kind: 'chat', assistantId: 1, assistantName: 'Алексей', question: 'Вопрос', followups: [] }, ...over,
   });
 
 function setup(rowCount = 1) {
@@ -1890,6 +1976,8 @@ describe('самопочинки', () => {
   it('запись словами: этап, действие, код', () => {
     expect(recoveryText(r('later', { delayMin: 30 }))).toBe('оживление: повтор через 30 мин (google_quota)');
     expect(recoveryText(r('later', { delayMin: 120 }))).toBe('оживление: повтор через 2 ч (google_quota)');
+    expect(recoveryText(r('later', { delayMin: 90 }))).toBe('оживление: повтор через 1 ч 30 мин (google_quota)');
+    expect(recoveryText(r('later', { delayMin: undefined }))).toBe('оживление: повтор позже (google_quota)');
     expect(recoveryText(r('new_scene', { from: 'capturing', code: 'answer_rejected' }))).toBe('съёмка: новая сцена (answer_rejected)');
     expect(recoveryText(r('no_skits', { code: null }))).toBe('оживление: без сценок (без кода)');
   });
@@ -1973,8 +2061,16 @@ export interface ShortRecovery {
 
 ```ts
 
+/** Пауза словами — как у бота (delayWords, spirits_back src/shorts/short-doctor.ts): «через 1 ч 30 мин», без паузы — «позже». */
+function delayWords(min: number | undefined): string {
+  if (!min || min <= 0) return 'позже';
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return `через ${[h ? `${h} ч` : '', m ? `${m} мин` : ''].filter(Boolean).join(' ')}`;
+}
+
 const RECOVERY_WORDS: Record<ShortRecovery['action'], (r: ShortRecovery) => string> = {
-  later: (r) => `повтор через ${r.delayMin && r.delayMin >= 60 ? `${r.delayMin / 60} ч` : `${r.delayMin ?? 30} мин`}`,
+  later: (r) => `повтор ${delayWords(r.delayMin)}`,
   new_scene: () => 'новая сцена',
   no_skits: () => 'без сценок',
 };
