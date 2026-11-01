@@ -3,8 +3,8 @@
  *
  * Спека: docs/superpowers/specs/2026-10-24-promo-shorts-design.md.
  *
- * Поля jsonb (`scene`, `capture`, `script`, `animation`) пишут две стороны:
- * API — сцену и сценарий, студия (`studio/`) — съёмку и оживление. Их форма —
+ * Поля jsonb (`scene`, `capture`, `script`, `animation`, `skit_feedback`) пишут две стороны:
+ * API — сцену и сценарий, студия (`studio/`) — съёмку, оживление и отзыв о сценке. Их форма —
  * зеркало `studio/src/types.ts` и `studio/src/worker/db.ts`. Импортировать
  * оттуда нельзя: студия — отдельный ESM-пакет вне сборки API. Совпадение имён
  * полей сторожит shorts.contract.spec.ts.
@@ -230,6 +230,23 @@ export interface ShortSkitClip {
 }
 
 /**
+ * Отзыв студии о сценке, которую Omni не снять с этими репликами (skit_feedback):
+ * два клипа с одним текстом сценки не прошли сверку речи или попытки кончились
+ * отказом фильтра Google. Сценарист переписывает реплики и действие только этой
+ * сценки. Зеркало SkitFeedback студии (studio/src/types.ts), пояснение для сценариста — в writer_feedback.
+ */
+export interface ShortSkitFeedback {
+  kind: SkitKind;
+  code: 'speech_mismatch' | 'omni_rejected';
+  /** Номера реплик (с 1), которых не услышали в последнем клипе, — у speech_mismatch; пусто, если речь не сошлась по доле слов, а не по репликам. */
+  lines: number[];
+  /** Что распознал SpeechKit в последнем клипе — у speech_mismatch. */
+  heard: string | null;
+  /** Причина отказа фильтра Google — у omni_rejected. */
+  reason: string | null;
+}
+
+/**
  * Итог задания animate (зеркало ShortAnimation в studio/src/types.ts): секунды
  * Omni и кадры — счёт денег ролика со всеми попытками, сценки — частично
  * заполненные, `pending` — запущенные, но не скачанные генерации.
@@ -278,6 +295,8 @@ export interface ShortVideo {
   approvedAt: Date | null;
   ownerNote: string | null;
   writerFeedback: string | null;
+  /** Отзыв студии о сценке — какую переписать; пояснение — в writerFeedback. */
+  skitFeedback: ShortSkitFeedback | null;
   writerRounds: number;
   reviewChatId: number | null;
   reviewMessageId: number | null;
@@ -344,6 +363,7 @@ export function rowToShort(row: any): ShortVideo {
     approvedAt: date(row.approved_at),
     ownerNote: row.owner_note ?? null,
     writerFeedback: row.writer_feedback ?? null,
+    skitFeedback: row.skit_feedback ?? null,
     writerRounds: Number(row.writer_rounds || 0),
     reviewChatId: num(row.review_chat_id),
     reviewMessageId: num(row.review_message_id),

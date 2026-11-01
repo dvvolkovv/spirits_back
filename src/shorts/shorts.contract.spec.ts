@@ -37,7 +37,7 @@ describe('контракт API и студии', () => {
     const db = studio('worker/db.ts');
     for (const s of [
       "'capture_queued'", "'capturing'", "'render_queued'", "'rendering'", "status = 'writing'", "status = 'pending_review'",
-      'writer_feedback', 'failed_from', 'failure_notified = false', 'questionShotKey', 'answerShotKey', 'review_message_id = NULL',
+      'writer_feedback', 'skit_feedback', 'failed_from', 'failure_notified = false', 'questionShotKey', 'answerShotKey', 'review_message_id = NULL',
       "'animate_queued'", "'animating'", "status = 'render_queued'", 'animation', 'max_omni_seconds',
     ]) {
       expect(db).toContain(s);
@@ -69,6 +69,22 @@ describe('контракт API и студии', () => {
     const kind = /export type SkitKind = ([^;]+);/;
     expect(types.match(kind)?.[1]).toBeDefined();
     expect(types.match(kind)?.[1]).toBe(back.match(kind)?.[1]);
+  });
+
+  it('отзыв студии о сценке: SkitFeedback студии и ShortSkitFeedback API — одни и те же поля', () => {
+    const types = studio('types.ts');
+    const back = fs.readFileSync(path.join(__dirname, 'shorts.types.ts'), 'utf8');
+    expect(fields(types, 'studio/src/types.ts', 'SkitFeedback')).toEqual(fields(back, 'shorts.types.ts', 'ShortSkitFeedback'));
+    // Совпадают и коды: по союзу API разбирает отзыв.
+    const code = (src: string, name: string) => src.match(new RegExp(`interface ${name} \\{[^}]*?\\bcode: ([^;]+);`))?.[1];
+    expect(code(types, 'SkitFeedback')).toBeDefined();
+    expect(code(types, 'SkitFeedback')).toBe(code(back, 'ShortSkitFeedback'));
+  });
+
+  it('подписи сценок студии (SCENE) и API (SKIT_LABELS) совпадают: на них опирается отзыв «Студия: сценка N …»', () => {
+    const scene = studio('animate/run-animate.ts').match(/SCENE: Record<SkitKind, string> = (\{[^}]+\});/)?.[1];
+    expect(scene).toBeDefined();
+    expect(scene).toBe(fs.readFileSync(path.join(__dirname, 'short-rules.ts'), 'utf8').match(/SKIT_LABELS: Record<SkitKind, string> = (\{[^}]+\});/)?.[1]);
   });
 });
 

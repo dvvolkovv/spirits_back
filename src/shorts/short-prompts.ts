@@ -1,6 +1,6 @@
 import { isHealthAssistant } from './short-assistants';
 import { MAX_SKIT_HOOK_WORDS, WriterCaptions } from './short-rules';
-import { Skit } from './short-skit-prompts';
+import { Skit, SkitKind } from './short-skit-prompts';
 import { TROUPE } from './short-troupe';
 import { ANGLE_TITLES, PROVOCATIVE_ANGLES, RUBRIC_TITLES, ShortAngle, ShortParagraph, ShortRubric, ShortScript } from './shorts.types';
 
@@ -299,8 +299,9 @@ export const WRITER_SKIT_SYSTEM = [
   WRITER_QUESTION,
   '- lines — 1–2 реплики голосом ассистента. Каждая пересказывает ОДИН абзац ответа близко к тексту и указывает его номер в box. Ничего сверх абзаца не добавляй. В каждой — хотя бы одно полное предложение, от ~25 знаков.',
   '- punchline — сценка 2, развязка: Кеша возвращается с ответом и побеждает спокойствием, противник сдаётся коронной фразой. Место и герои — как в сценке 1. Утверждение по существу — в одной реплике, близко к тексту абзаца, с его номером в box (правило 18); остальное — шутка.',
-  '  Если в сообщении есть принятая сценка 2, пиши punchline, только если её касаются замечания или нарушения либо ты переписал конфликт: её клип, возможно, уже снят за деньги. Замечание, которое принятая сценка 2 уже учла, — не повод её переписывать. Отзыв студии — о длине озвучки: из-за него сценки не трогай.',
-  '- conflict — только если замечания или нарушения касаются сценки 1; иначе поле не пиши. Замечание, которое сценка 1 уже учла, — не повод её переписывать.',
+  '  Если в сообщении есть принятая сценка 2, пиши punchline, только если её касаются замечания, нарушения или отзыв студии о сценке либо ты переписал конфликт (кроме отзыва студии о сценке 1 — тогда развязку не пиши): её клип, возможно, уже снят за деньги. Замечание, которое принятая сценка 2 уже учла, — не повод её переписывать. Отзыв студии о длине озвучки — не повод трогать сценки.',
+  '- conflict — только если замечания, нарушения или отзыв студии касаются сценки 1; иначе поле не пиши. Замечание, которое сценка 1 уже учла, — не повод её переписывать.',
+  '- Отзыв студии о сценке («Студия: сценка 1 …» или «Студия: сценка 2 …»): Omni не озвучил её реплики или фильтр Google не пропустил клип. Перепиши реплики и действие ЭТОЙ сценки (поле conflict или punchline) — короче и проще, обычными словами; пока герой говорит, ничто не закрывает ему рот. Место, начало, героев и роли оставь прежними: их всё равно возьмут из принятой сценки. У развязки утверждение по существу — по-прежнему в реплике с box, у конфликта в конце Кеша по-прежнему обещает спросить ассистента. Вторую сценку не пиши — останется принятая.',
   WRITER_CAPTIONS,
   '',
   'Длина: вопрос и реплики ответа вместе — 100–280 знаков; со сценками по 8 секунд и финалом (~70 знаков, добавит код) это 25–45 секунд.',
@@ -333,7 +334,13 @@ export interface WriterInput {
    * Ролик со сценками: конфликт, который открывает ролик; принятая развязка из
    * прошлого сценария (её клип мог быть уже снят) и отвергнутая в этом круге.
    */
-  skit?: { conflict: Skit; acceptedPunchline: Skit | null; rejectedPunchline: Skit | null };
+  skit?: {
+    conflict: Skit;
+    acceptedPunchline: Skit | null;
+    rejectedPunchline: Skit | null;
+    /** Отзыв студии о сценке: какую переписать и прошлый вариант круга, если был. */
+    fix?: { kind: SkitKind; rejected: Skit | null };
+  };
 }
 
 /**
@@ -368,14 +375,23 @@ export function buildWriterMessage(i: WriterInput): string {
     `Спросили:\n${fenced('ВОПРОС', i.question)}`,
     `Ответ по абзацам:\n${fenced('ОТВЕТ АССИСТЕНТА', i.paragraphs.map((p) => `[${p.n}] ${oneLine(p.text)}`).join('\n'))}`,
   ];
-  if (i.skit) parts.push(`Сценка 1 (конфликт) — открывает ролик:\n${fenced('СЦЕНКА 1', describeSkit(i.skit.conflict))}`);
+  if (i.skit) {
+    const fixConflict = i.skit.fix?.kind === 'conflict' ? '; её Omni не снял — перепиши реплики и действие' : '';
+    parts.push(`Сценка 1 (конфликт) — открывает ролик${fixConflict}:\n${fenced('СЦЕНКА 1', describeSkit(i.skit.conflict))}`);
+  }
   if (i.previousScript) parts.push(previousVariant(i.previousScript, i.previousCaptions ?? null));
   if (i.skit?.acceptedPunchline) {
     parts.push(
-      `Принятая сценка 2 (развязка) — не пиши punchline, если замечания и нарушения её не касаются:\n${fenced('ПРИНЯТАЯ СЦЕНКА 2', describeSkit(i.skit.acceptedPunchline))}`,
+      i.skit.fix?.kind === 'punchline'
+        ? `Сценка 2 (развязка), которую Omni не снял, — перепиши её реплики и действие:\n${fenced('СЦЕНКА 2', describeSkit(i.skit.acceptedPunchline))}`
+        : `Принятая сценка 2 (развязка) — не пиши punchline, если замечания и нарушения её не касаются:\n${fenced('ПРИНЯТАЯ СЦЕНКА 2', describeSkit(i.skit.acceptedPunchline))}`,
     );
   }
   if (i.skit?.rejectedPunchline) parts.push(`Прошлый вариант сценки 2:\n${fenced('СЦЕНКА 2', describeSkit(i.skit.rejectedPunchline))}`);
+  if (i.skit?.fix?.rejected) {
+    const n = i.skit.fix.kind === 'conflict' ? 1 : 2;
+    parts.push(`Твой прошлый вариант сценки ${n} — исправь по нарушениям:\n${fenced(`ПРОШЛАЯ СЦЕНКА ${n}`, describeSkit(i.skit.fix.rejected))}`);
+  }
   // Не «владельца»: здесь и прошлые замечания, и просьбы сценариста, которые новая сцена уже учла.
   if (i.ownerNote) parts.push(`Замечания (в том числе прошлые, уже учтённые сценой):\n${fenced('ЗАМЕЧАНИЯ', i.ownerNote)}`);
   if (i.writerFeedback) parts.push(`Студия: ${i.writerFeedback}`);

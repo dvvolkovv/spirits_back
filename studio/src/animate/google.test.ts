@@ -158,7 +158,7 @@ test('биллинг или регион (FAILED_PRECONDITION) — ключ, б�
   assert.ok(isErr('google_auth', false)(googleHttpError('omni', 400, pre)));
   const big = fake([{ status: 413, body: 'too large' }]);
   await assert.rejects(startClip(big.deps, 'p', { data: JPEG, mime: 'image/jpeg' }), (e: unknown) => {
-    assert.ok(isErr('omni_rejected', true)(e));
+    assert.ok(isErr('omni_bad_request', true)(e));
     assert.ok(CLEAR_REFUSALS.has((e as StudioError).code));
     return true;
   });
@@ -187,6 +187,7 @@ test('запуск: ответ потерян или без id — повтор�
   await assert.rejects(startClip(b.deps, 'p', { data: JPEG, mime: 'image/jpeg' }), isErr('omni_failed', true));
   assert.equal(CLEAR_REFUSALS.has('omni_failed'), false);
   assert.equal(CLEAR_REFUSALS.has('omni_rejected'), true);
+  assert.equal(CLEAR_REFUSALS.has('omni_bad_request'), true);
   assert.equal(CLEAR_REFUSALS.has('google_quota'), true);
 });
 

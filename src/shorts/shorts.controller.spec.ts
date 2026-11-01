@@ -243,6 +243,7 @@ describe('POST admin/shorts', () => {
     expect(String(upd[0])).toContain('format = COALESCE($5::text, format)');
     // Замечание — новый круг: отзыв студии о прошлой озвучке сбрасывается, без замечания — остаётся.
     expect(String(upd[0])).toContain('writer_feedback = CASE WHEN $4::text IS NULL THEN writer_feedback ELSE NULL END');
+    expect(String(upd[0])).toContain('skit_feedback = CASE WHEN $4::text IS NULL THEN skit_feedback ELSE NULL END');
     expect(upd[1]).toEqual([
       ID, 'directing', 'writing',
       'Сценарист: нужен вопрос про субаренду\nСценарист: ответ слишком общий\nВозьми вопрос про возврат залога',

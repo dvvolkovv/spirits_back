@@ -9,9 +9,9 @@ import { StageFatalError } from './short-jobs';
 import { linkBase, shortLinks, shortTarget } from './short-links';
 import { parseWriterReply } from './short-parse';
 import { WRITER_SKIT_SYSTEM, WRITER_SYSTEM, buildWriterMessage, toAgents } from './short-prompts';
-import { WriterCaptions, checkScriptRules, checkSkitRules } from './short-rules';
+import { SKIT_LABELS, WriterCaptions, checkScriptRules, checkSkitRules } from './short-rules';
 import { CASE_BADGE, buildScript } from './short-script';
-import { Skit, SkitKind, SkitPlan, planSkits } from './short-skit-prompts';
+import { SKIT_KINDS, Skit, SkitKind, SkitPlan, planSkits } from './short-skit-prompts';
 import { shortSlug } from './short-slug';
 import { ShortsSettingsService } from './shorts-settings.service';
 import { ShortScript, ShortVideo, appendOwnerNote } from './shorts.types';
@@ -35,6 +35,27 @@ function recapturesInRow(ownerNote: string | null): number {
   return n;
 }
 
+/**
+ * Принятые сценки с новыми репликами и действием одной из них — по отзыву студии.
+ * Место, начало, герои и роли — принятые: отпечаток кадра сценки не меняется, кадр
+ * не перерисуется. В ответе сценки нет — принятые как есть (нарушение назовёт
+ * studioRewriteViolation).
+ */
+function withNewLines(accepted: Record<SkitKind, Skit>, kind: SkitKind, fresh: Skit | null): Record<SkitKind, Skit> {
+  if (!fresh) return accepted;
+  return { ...accepted, [kind]: { ...accepted[kind], action: fresh.action, lines: fresh.lines } };
+}
+
+/**
+ * Сценка по отзыву студии не переписана: её нет в ответе, или клип вышел бы тем же —
+ * отпечаток клипа совпал с тем, что студия не смогла снять (пробел или точка в конце
+ * действия отпечаток не меняют, а лишний клип Omni стоит денег).
+ */
+function studioRewriteViolation(kind: SkitKind, fresh: Skit | null, sameClip: boolean): string | null {
+  if (fresh && !sameClip) return null;
+  return `${SKIT_LABELS[kind]}: отзыв студии — перепиши реплики и действие этой сценки (${fresh ? 'клип вышел бы тем же, что студия не смогла снять' : 'в ответе её нет'})`;
+}
+
 @Injectable()
 export class ShortsWriterService {
   private readonly logger = new Logger(ShortsWriterService.name);
@@ -54,6 +75,9 @@ export class ShortsWriterService {
    * Ролик со сценками: сценарист пишет ещё развязку и, по замечанию, переписывает
    * конфликт; код собирает промпты обеих сценок (planSkits) и отдаёт ролик на
    * оживление, а не на сборку. Сценка с прежним отпечатком не переснимется.
+   *
+   * Отзыв студии о сценке (skitFeedback) — переписываются реплики и действие только
+   * названной сценки (withNewLines), остальное — принятое.
    */
   async write(v: ShortVideo): Promise<void> {
     if (!v.scene || !v.capture) throw new StageFatalError('сценарист: у ролика нет сцены или съёмки');
@@ -68,11 +92,24 @@ export class ShortsWriterService {
     // при каждом «Замечании» или отзыве студии о длине озвучки.
     const acceptedPunchline: Skit | null = skitFormat ? v.script?.skits?.punchline?.skit ?? null : null;
     let rejectedPunchline: Skit | null = null;
+    // По отзыву студии — прошлый вариант названной сценки (круг с нарушениями): модель видит, что исправлять.
+    let rejectedFix: Skit | null = null;
     // Круг по отзыву студии — о длине озвучки: принятые сценки остаются, даже если
     // модель их вернула, — эхо с правкой одной буквы сменило бы отпечаток и стоило
     // бы клипа Omni. writer_feedback пишет только студия; новое замечание владельца
     // начинает круг без него (ответ сценариста, «Повторить» с замечанием).
-    const keepSkits = skitFormat && !!v.writerFeedback && !!v.script?.skits?.conflict && !!acceptedPunchline;
+    const keepSkits = skitFormat && !!v.writerFeedback && !v.skitFeedback && !!v.script?.skits?.conflict && !!acceptedPunchline;
+    // Отзыв студии о сценке: Omni её не снять с этими репликами. Переписываются только
+    // реплики и действие названной сценки, база — принятые сценки, а не варианты кругов
+    // переписки: сравнивать «то же или нет» надо с тем, что Omni не озвучил.
+    // Вид сценки из базы проверяется: испорченное значение — обычная переписка, а не TypeError.
+    const fixKind: SkitKind | null =
+      skitFormat && v.skitFeedback && SKIT_KINDS.includes(v.skitFeedback.kind) && v.script?.skits?.[v.skitFeedback.kind] && conflict && acceptedPunchline
+        ? v.skitFeedback.kind
+        : null;
+    const fixBase: Record<SkitKind, Skit> | null = fixKind ? { conflict: conflict!, punchline: acceptedPunchline! } : null;
+    if (fixKind) this.logger.log(`ролик ${v.id}: отзыв студии о сценке ${fixKind} — переписываю её реплики и действие`);
+    else if (skitFormat && v.skitFeedback) this.logger.warn(`ролик ${v.id}: отзыв студии о сценке не применить (${JSON.stringify(v.skitFeedback).slice(0, 200)}) — обычная переписка`);
     const [rows, settings] = await Promise.all([this.agents.getAgents('ru'), this.settings.get()]);
     const assistants = toAgents(rows);
     const name = v.scene.assistantName;
@@ -103,11 +140,14 @@ export class ShortsWriterService {
         question: v.scene.question,
         paragraphs: v.capture.paragraphs ?? [],
         ownerNote: v.ownerNote,
-        writerFeedback: v.writerFeedback,
+        // Отзыв студии о сценке в формате «Только чат» не к месту: сценок нет, а «перепиши реплики» урезал бы озвучку.
+        writerFeedback: !skitFormat && v.skitFeedback ? null : v.writerFeedback,
         previousScript: previous,
         previousCaptions,
         violations,
-        ...(skitFormat ? { skit: { conflict, acceptedPunchline, rejectedPunchline } } : {}),
+        ...(skitFormat
+          ? { skit: { conflict, acceptedPunchline, rejectedPunchline, ...(fixKind ? { fix: { kind: fixKind, rejected: rejectedFix } } : {}) } }
+          : {}),
       });
       const raw = await this.relay.ask(skitFormat ? WRITER_SKIT_SYSTEM : WRITER_SYSTEM, message, `short-write-${v.id}-${randomUUID()}`);
       const reply = parseWriterReply(raw, { skit: skitFormat, acceptedPunchline: !!acceptedPunchline });
@@ -121,9 +161,11 @@ export class ShortsWriterService {
       const paragraphs = v.capture.paragraphs ?? [];
       const skits = !skitFormat
         ? null
-        : keepSkits
-          ? { conflict, punchline: acceptedPunchline }
-          : { conflict: reply.skits.conflict ?? conflict, punchline: reply.skits.punchline ?? acceptedPunchline };
+        : fixKind
+          ? withNewLines(fixBase!, fixKind, reply.skits[fixKind])
+          : keepSkits
+            ? { conflict, punchline: acceptedPunchline }
+            : { conflict: reply.skits.conflict ?? conflict, punchline: reply.skits.punchline ?? acceptedPunchline };
       // Промпты сценок — только из сценок без нарушений: planSkits на кривой
       // сценке бросает первую же ошибку, а правила называют все разом.
       let planned: Record<SkitKind, SkitPlan> | undefined;
@@ -149,20 +191,27 @@ export class ShortsWriterService {
         ...(skits ? { skits } : {}),
       });
       if (planError) violations.push(planError);
+      if (fixKind) {
+        const sameClip = !!planned && planned[fixKind].fingerprint === v.script?.skits?.[fixKind]?.fingerprint;
+        const notRewritten = studioRewriteViolation(fixKind, reply.skits[fixKind], sameClip);
+        if (notRewritten) violations.push(notRewritten);
+      }
       if (violations.length) {
         this.logger.warn(`ролик ${v.id}: сценарий не прошёл правила (круг ${round + 1}): ${violations.join('; ')}`);
         previous = script;
         previousCaptions = reply.captions;
-        if (skits) {
+        // По отзыву студии база — принятые сценки: следующий круг снова видит то, что Omni не озвучил.
+        if (skits && !fixKind) {
           conflict = skits.conflict;
           rejectedPunchline = reply.skits.punchline;
         }
+        if (skits && fixKind && reply.skits[fixKind]) rejectedFix = skits[fixKind];
         continue;
       }
       const r = await this.pg.query(
         `UPDATE short_video
             SET status = $6, script = $2::jsonb, captions = $3::jsonb, slug = $4,
-                writer_feedback = NULL, writer_rounds = writer_rounds + 1,
+                writer_feedback = NULL, skit_feedback = NULL, writer_rounds = writer_rounds + 1,
                 attempts = 0, lease_until = NULL, last_error = NULL, updated_at = now()
           WHERE id = $1 AND status = 'writing' AND attempts = $5`,
         [v.id, JSON.stringify(script), JSON.stringify(buildCaptions(reply.captions, links)), slug, v.attempts, skitFormat ? 'animate_queued' : 'render_queued'],
@@ -176,13 +225,13 @@ export class ShortsWriterService {
 
   /**
    * Нужна другая сцена: причина ложится к замечаниям — их прочтёт режиссёр.
-   * Новая съёмка — новый круг: отзыв студии о прошлой озвучке и счёт её
+   * Новая съёмка — новый круг: отзыв студии о прошлой озвучке и сценке и счёт их
    * переписок обнуляются, как при замечании владельца и повторе из failed.
    */
   private async backToDirector(v: ShortVideo, reason: string): Promise<void> {
     const r = await this.pg.query(
       `UPDATE short_video
-          SET status = 'directing', owner_note = $2, writer_feedback = NULL, writer_rounds = 0,
+          SET status = 'directing', owner_note = $2, writer_feedback = NULL, skit_feedback = NULL, writer_rounds = 0,
               attempts = 0, lease_until = NULL, last_error = NULL, updated_at = now()
         WHERE id = $1 AND status = 'writing' AND attempts = $3`,
       [v.id, appendOwnerNote(v.ownerNote, `${RECAPTURE_NOTE} ${reason}`), v.attempts],

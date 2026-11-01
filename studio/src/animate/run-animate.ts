@@ -5,9 +5,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { parseConfig } from '../config';
-import { failText, StudioError, toStudioError, type StudioErrorCode } from '../errors';
+import { failText, SkitFeedbackError, StudioError, toStudioError, type StudioErrorCode } from '../errors';
 import { detectSilences, probeFile, type ProbeInfo } from '../ffprobe';
-import { SKIT_KINDS, type Script, type ShortAnimation, type SkitClip, type SkitKind, type SkitPlan } from '../types';
+import { SKIT_KINDS, type Script, type ShortAnimation, type SkitClip, type SkitFeedback, type SkitKind, type SkitPlan } from '../types';
 import { checkClip, CLIP_LUFS, normalizeLoudness } from './clip-check';
 import { lineCues, PAUSE_DETECT, voicedSpans } from './cues';
 import {
@@ -29,6 +29,8 @@ const run = promisify(execFile);
 const STUDIO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 /** Клипов Omni на сценку — не больше (спека, «Отказы»). */
 export const MAX_SKIT_ATTEMPTS = 3;
+/** Столько клипов одного текста сценки не прошли сверку речи — дальше клипы не снимаются, сценка уходит сценаристу. */
+export const MAX_SPEECH_MISSES = 2;
 /** Предел секунд Omni на ролик: шесть клипов, ≈ $4,8 (спека, «Отказы»). */
 export const DEFAULT_MAX_OMNI_SECONDS = 48;
 /** Версия бесплатной обработки клипа (громкость, субтитры): поднять, когда меняется их логика, — готовые сценки переобработаются без Omni. */
@@ -79,6 +81,18 @@ const FINGERPRINT = /^[0-9a-z-]+$/;
  * повтор новых денег не стоит.
  */
 class StorageError extends StudioError {}
+
+/** Клип забракован сверкой речи: что услышано и какие реплики молчат — для отзыва сценаристу. */
+class SpeechMismatchError extends StudioError {
+  readonly heard: string;
+  readonly silentLines: number[];
+
+  constructor(message: string, heard: string, silentLines: number[]) {
+    super('speech_mismatch', message, true);
+    this.heard = heard;
+    this.silentLines = silentLines;
+  }
+}
 
 /**
  * Пометка брака рядом с skits/<отпечаток>/rejected-*.mp4. По ней студия решает,
@@ -156,6 +170,11 @@ function loadAnimation(file: string): ShortAnimation {
  * удаляется, а откладывается в skits/<отпечаток>/rejected-*.mp4 с пометкой
  * rejected-*.json (код, услышанное, версия сверки); брак, который нынешняя
  * сверка ещё не судила, перепроверяется до новой оплаты (reviveRejected).
+ *
+ * Два клипа одного текста сценки не прошли сверку речи (третий не снимается) или
+ * попытки кончились отказом фильтра — SkitFeedbackError: ролик уходит сценаристу
+ * с отзывом о сценке (worker/db.ts, failJob), если на пересъёмку остался хотя бы
+ * клип; иначе omni_budget с причиной.
  */
 export async function animateRun(runDir: string, deps: AnimateDeps): Promise<ShortAnimation> {
   const script = JSON.parse(fs.readFileSync(path.join(runDir, 'script.json'), 'utf8')) as Script;
@@ -341,7 +360,7 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     const raw = abs(skitFile(kind, 'raw.mp4'));
     const clip = skitFile(kind, 'clip.mp4');
     const next = abs(skitFile(kind, 'clip.next.mp4'));
-    const reject = async (code: RejectedMeta['code'], msg: string, speech?: Required<Pick<RejectedMeta, 'heard' | 'share'>>): Promise<never> => {
+    const reject = async (code: RejectedMeta['code'], msg: string, speech?: { heard: string; share: number; silentLines: number[] }): Promise<never> => {
       fs.rmSync(next, { force: true });
       if (accepted) {
         // Принятый клип не бракуется молча: владелец его уже видел, а пересъёмка стоит денег.
@@ -356,12 +375,12 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
       const base = skitFile(kind, `rejected-${new Date().toISOString().replace(/[:.]/g, '-')}`);
       fs.renameSync(raw, abs(`${base}.mp4`));
       shelvedNow.add(`${base}.mp4`);
-      writeRejectedMeta(abs(`${base}.json`), { code, matcher: MATCHER_VERSION, ...speech });
+      writeRejectedMeta(abs(`${base}.json`), speech ? { code, matcher: MATCHER_VERSION, heard: speech.heard, share: speech.share } : { code, matcher: MATCHER_VERSION });
       fs.rmSync(abs(clip), { force: true });
       // И из хранилища: брак, восстановленный следующим захватом, снова прошёл бы
       // сверку — или сошёл бы за клип запущенной генерации.
       await discard(skitFile(kind, 'raw.mp4'));
-      throw new StudioError(code, msg, true);
+      throw speech ? new SpeechMismatchError(msg, speech.heard, speech.silentLines) : new StudioError(code, msg, true);
     };
     const rawProbe: ProbeInfo = await probeFile(raw).catch((e: unknown) => reject('clip_invalid', `файл от Omni не читается — ${failText(e)}`));
     const early = checkClip(rawProbe, []);
@@ -388,7 +407,7 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
         const why = check.silentLines.length
           ? `не услышаны реплики ${check.silentLines.map((i) => i + 1).join(', ')}`
           : `речь не сошлась с репликами (${Math.round(check.share * 100)}%)`;
-        await reject('speech_mismatch', `${why}, услышано: «${heard.slice(0, 200)}»`, { heard, share: check.share });
+        await reject('speech_mismatch', `${why}, услышано: «${heard.slice(0, 200)}»`, { heard, share: check.share, silentLines: check.silentLines });
       }
       share = check.share;
     }
@@ -473,6 +492,36 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
     }
   };
 
+  /** Пояснение сценаристу (writer_feedback): какая сценка, что не так, что переписать. */
+  const writerText = (kind: SkitKind, fb: Omit<SkitFeedback, 'kind'>): string => {
+    const keep = 'место, начало и героев не меняй.';
+    if (fb.code === 'omni_rejected') {
+      return `${SCENE[kind]}: фильтр Google не пропускает клип (${fb.reason ?? 'причина не названа'}). Перепиши реплики и действие этой сценки — без того, что фильтр мог принять за насилие, оружие, травму или непристойность; ${keep}`;
+    }
+    const lines = plans[kind].skit.lines;
+    const silent = fb.lines.length
+      ? `не услышаны: ${fb.lines.map((n) => `реплика ${n} (${lines[n - 1]?.hero ?? '?'}) «${lines[n - 1]?.text ?? ''}»`).join(', ')}`
+      : 'речь не сошлась с репликами';
+    const heard = fb.heard?.trim() ? `услышано: «${fb.heard.slice(0, 200)}»` : 'речь не распознана';
+    return `${SCENE[kind]}: ${MAX_SPEECH_MISSES} клипа с этими репликами не прошли сверку речи; в последнем ${silent}, ${heard}. Перепиши реплики и действие этой сценки — короче и проще, обычными словами; пока герой говорит, ничто не закрывает ему рот; ${keep}`;
+  };
+
+  /**
+   * Сценку не снять с этими репликами — сценаристу. Переписанную сценку снимут заново:
+   * нужен хотя бы один клип в пределе секунд; места нет — omni_budget с причиной
+   * пересъёмки, без круга сценариста.
+   */
+  const toWriter = (kind: SkitKind, fb: Omit<SkitFeedback, 'kind'>, message: string): SkitFeedbackError => {
+    try {
+      assertBudget();
+    } catch (e) {
+      // Не только «предел»: владелец должен видеть, почему понадобилась пересъёмка.
+      const err = toStudioError(e);
+      throw new StudioError(err.code, `${message}; переписанную сценку снять не на что — ${err.message}`, err.retryable);
+    }
+    return new SkitFeedbackError({ kind, ...fb }, writerText(kind, fb), message);
+  };
+
   const animateSkit = async (kind: SkitKind): Promise<SkitClip> => {
     const plan = plans[kind];
     const raw = abs(skitFile(kind, 'raw.mp4'));
@@ -499,6 +548,7 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
 
     let last: StudioError | null = null;
     const codes: string[] = [];
+    let speechMisses = 0;
     for (let attempt = 1; attempt <= MAX_SKIT_ATTEMPTS; attempt++) {
       let reserved = false;
       let started = false;
@@ -560,15 +610,31 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
           anim.omniSeconds -= CLIP_SEC;
           await save();
         }
+        const prev = last;
         last = err;
         codes.push(err.code);
-        if (!err.retryable) throw err;
+        if (!err.retryable) {
+          // Секунд на следующий клип нет после промаха — владелец должен видеть, почему понадобилась пересъёмка.
+          if (err.code === 'omni_budget' && prev) throw new StudioError('omni_budget', `${prev.message}; переснять не на что — ${err.message}`, false);
+          throw err;
+        }
+        // Два клипа с этим текстом не прошли сверку речи — промахи на одном тексте повторяются:
+        // сценаристу, а не третий клип. Брак из перепроверки судится в reviveRejected и сюда не
+        // попадает — разве что его выгрузка сорвалась: тогда следующий запуск судит его здесь,
+        // как клип этого текста.
+        if (e instanceof SpeechMismatchError && ++speechMisses >= MAX_SPEECH_MISSES) {
+          throw toWriter(kind, { code: 'speech_mismatch', lines: e.silentLines.map((i) => i + 1), heard: e.heard, reason: null }, `${err.message} — ${MAX_SPEECH_MISSES} клипа с этим текстом не прошли сверку (${codes.join(', ')})`);
+        }
         // Кадр не перерисовывается и после отказа фильтра: по кадру конфликта уже
         // могла быть нарисована развязка, и новый кадр развёл бы место и костюмы сценок.
         log(`animate ${kind}: попытка ${attempt} — ${err.message}`);
       }
     }
-    throw new StudioError(last!.code, `${last!.message} — после ${MAX_SKIT_ATTEMPTS} попыток (${codes.join(', ')})`, false);
+    const summary = `${last!.message} — после ${MAX_SKIT_ATTEMPTS} попыток (${codes.join(', ')})`;
+    // Фильтр Google так и не пропустил клип — причина в тексте сценки, а не в удаче: сценаристу.
+    // Отказ запроса (omni_bad_request: 413, 422…) сценарист не исправит — это обычный сбой.
+    if (last!.code === 'omni_rejected') throw toWriter(kind, { code: 'omni_rejected', lines: [], heard: null, reason: last!.message }, summary);
+    throw new StudioError(last!.code, summary, false);
   };
 
   // Первое сохранение — до любых трат: задание, которое уже не наше (onSave отказал), не нарисует ни кадра.
@@ -609,9 +675,14 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
         return { kind, err };
       });
     if (failures.length) {
-      // Если упали обе сценки, код и признак повтора — у той, что без повтора.
-      const main = failures.find((f) => !f.err.retryable) ?? failures[0];
-      throw new StudioError(main.err.code, failures.map((f) => `${SCENE[f.kind]}: ${f.err.message}`).join('; '), main.err.retryable);
+      // Если упали обе сценки, код и признак повтора — у той, что без повтора. Отзыв
+      // сценаристу — только если другая сценка не упала намертво: переписка ту не вылечит.
+      const hard = failures.find((f) => !f.err.retryable && !(f.err instanceof SkitFeedbackError));
+      const toWriterFailure = failures.find((f) => f.err instanceof SkitFeedbackError);
+      const main = hard ?? toWriterFailure ?? failures[0];
+      const message = failures.map((f) => `${SCENE[f.kind]}: ${f.err.message}`).join('; ');
+      if (main.err instanceof SkitFeedbackError) throw new SkitFeedbackError(main.err.feedback, main.err.writerText, message);
+      throw new StudioError(main.err.code, message, main.err.retryable);
     }
   }
   await save();

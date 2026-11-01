@@ -1,3 +1,5 @@
+import type { SkitFeedback } from './types';
+
 /**
  * Ошибки студии с кодом и признаком повтора. По ним рабочий процесс решает,
  * что делать с заданием: повторить, вернуть сценарий сценаристу или сдаться
@@ -24,6 +26,7 @@ export type StudioErrorCode =
   | 'no_input'
   | 'keyframe'
   | 'omni_rejected'
+  | 'omni_bad_request'
   | 'omni_failed'
   | 'omni_budget'
   | 'omni_timeout'
@@ -53,6 +56,24 @@ export class StudioError extends Error {
     this.name = 'StudioError';
     this.code = code;
     this.retryable = retryable;
+  }
+}
+
+/**
+ * Сценку не снять с этими репликами: два клипа с одним текстом не прошли сверку
+ * речи или попытки кончились отказом фильтра Google. Без повтора: рабочий
+ * процесс (db.ts, failJob) возвращает ролик сценаристу — пояснение `writerText`
+ * в writer_feedback, разбор `feedback` в skit_feedback.
+ */
+export class SkitFeedbackError extends StudioError {
+  readonly feedback: SkitFeedback;
+  readonly writerText: string;
+
+  constructor(feedback: SkitFeedback, writerText: string, message: string) {
+    super(feedback.code, message, false);
+    this.name = 'SkitFeedbackError';
+    this.feedback = feedback;
+    this.writerText = writerText;
   }
 }
 
