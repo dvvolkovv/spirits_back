@@ -22,9 +22,9 @@ describe('тексты рубильника', () => {
   });
 
   it('переключение — актор-телефон маскируется в сообщении для группы', () => {
-    const t = switchedText('claude', 'qwen', '79030169187');
-    expect(t).toContain('Переключил: …9187');
-    expect(t).not.toContain('79030169187');
+    const t = switchedText('claude', 'qwen', '70001112233');
+    expect(t).toContain('Переключил: …2233');
+    expect(t).not.toContain('70001112233');
   });
 
   it('напоминание: модель, с какого момента, дни, состояние Claude', () => {
@@ -95,7 +95,7 @@ describe('тексты рубильника', () => {
 
 describe('maskActor', () => {
   it('телефон — … и последние 4 цифры', () => {
-    expect(maskActor('79030169187')).toBe('…9187');
+    expect(maskActor('70001112233')).toBe('…2233');
   });
 
   it('UUID (вход по почте/OAuth) — первые 8 символов', () => {
