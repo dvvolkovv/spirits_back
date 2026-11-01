@@ -242,6 +242,7 @@ describe('POST admin/shorts', () => {
     expect(String(upd[0])).toMatch(/failed_code = NULL/);
     expect(String(upd[0])).toMatch(/auto_recoveries = CASE WHEN \$2 = 'approved' THEN auto_recoveries ELSE 0 END/);
     expect(String(upd[0])).not.toMatch(/\brecoveries\s*=/);
+    expect(String(upd[0])).toMatch(/omni_base = COALESCE\(\(animation->>'omniSeconds'\)::int, 0\)/);
     expect(String(upd[0])).toContain('owner_note = COALESCE($4::text, owner_note)');
     expect(String(upd[0])).toContain('writer_rounds = 0');
     expect(String(upd[0])).toContain('format = COALESCE($5::text, format)');

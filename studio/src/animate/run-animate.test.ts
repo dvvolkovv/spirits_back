@@ -985,3 +985,27 @@ test('промах, а на следующий клип секунд нет — 
   assert.deepEqual(second.calls.start, ['punchline']);
   assert.equal(readAnim(env.runDir).omniSeconds, 24);
 });
+
+test('предел — на круг владельца: секунды до начала круга не в счёт', { timeout: 120_000 }, async () => {
+  const env = setup();
+  await animateRun(env.runDir, fakes(env).deps);
+  const lines = ['Это износ, верните залог.', 'Га-га… ладно.'];
+  writeScript(env.runDir, { conflict: plan('conflict'), punchline: plan('punchline', lines, 'fp-punchline-2') });
+  const next = fakes(env, { heard: (kind) => (kind === 'punchline' ? lines.join(' ') : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, { ...next.deps, maxOmniSeconds: 8, omniBase: 16 });
+  assert.deepEqual(next.calls.start, ['punchline']);
+  assert.equal(anim.omniSeconds, 24);
+});
+
+test('предел — на круг владельца: круг исчерпан — omni_budget со счётом круга', { timeout: 120_000 }, async () => {
+  const env = setup();
+  await animateRun(env.runDir, fakes(env).deps);
+  const lines = ['Это износ, верните залог.', 'Га-га… ладно.'];
+  writeScript(env.runDir, { conflict: plan('conflict'), punchline: plan('punchline', lines, 'fp-punchline-2') });
+  const next = fakes(env);
+  await assert.rejects(
+    animateRun(env.runDir, { ...next.deps, maxOmniSeconds: 8, omniBase: 8 }),
+    (e: unknown) => isErr('omni_budget', false)(e) && /на ролик ушло 16 с Omni вместе с запущенными, в этом круге — 8 с, предел — 8 с на круг/.test((e as Error).message),
+  );
+  assert.deepEqual(next.calls.start, []);
+});

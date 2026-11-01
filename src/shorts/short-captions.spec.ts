@@ -228,4 +228,9 @@ describe('skitCastLine и omniSpendLine', () => {
     expect(omniSpendLine({ omniSeconds: 16, keyframes: 2, skits: {} }, 48)).toBe('Omni: 16 из 48 с, кадров 2 ≈ $1,86');
     expect(omniSpendLine(null)).toBe('Omni: 0 с, кадров 0 ≈ $0,00');
   });
+
+  it('omniSpendLine: начат круг владельца — всего и в этом круге', () => {
+    expect(omniSpendLine({ omniSeconds: 56, keyframes: 3, skits: {} }, 48, 48)).toBe('Omni: 56 с, в этом круге 8 из 48 с, кадров 3 ≈ $5,99');
+    expect(omniSpendLine({ omniSeconds: 16, keyframes: 2, skits: {} }, 48, 0)).toBe('Omni: 16 из 48 с, кадров 2 ≈ $1,86');
+  });
 });

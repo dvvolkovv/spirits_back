@@ -122,6 +122,11 @@ describe('rowToShort', () => {
     const empty = rowToShort({ id: 'y' });
     expect([empty.failedCode, empty.autoRecoveries, empty.recoveries]).toEqual([null, 0, []]);
   });
+
+  it('начало круга владельца по секундам Omni — omni_base; без колонки — 0', () => {
+    expect(rowToShort({ id: 'x', omni_base: 48 }).omniBase).toBe(48);
+    expect(rowToShort({ id: 'y' }).omniBase).toBe(0);
+  });
 });
 
 describe('appendOwnerNote', () => {

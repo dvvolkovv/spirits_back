@@ -80,6 +80,12 @@ describe('очередь студии против живого Postgres', { ski
     assert.deepEqual([again?.id, again?.attempts], [id, 2]);
   });
 
+  it('задание оживления несёт начало круга владельца по секундам Omni (omni_base)', async () => {
+    await insert('animate_queued', { omni_base: 16 });
+    const job = await claimJob(pool, 'animate');
+    assert.equal(job!.omniBase, 16);
+  });
+
   it('брошенное задание на последней попытке не забирается; аренда ещё идёт — не трогается', async () => {
     const past = new Date(Date.now() - 60_000);
     const swept = await insert('rendering', { attempts: MAX_JOB_ATTEMPTS, lease_until: past });

@@ -244,12 +244,20 @@ describe('текст 005_doctor.sql', () => {
     expect(sql.endsWith('$shorts$;')).toBe(true);
     expect(sql).toContain("pg_advisory_xact_lock(hashtext('shorts/005'))");
     expect(sql).toContain("set_config('lock_timeout', '5s', true)");
+    const lock = sql.indexOf("pg_advisory_xact_lock(hashtext('shorts/005'))");
+    const timeout = sql.indexOf("set_config('lock_timeout', '5s', true)");
+    expect(lock).toBeGreaterThan(0);
+    expect(timeout).toBeGreaterThan(lock);
+    expect(sql.indexOf('ALTER TABLE')).toBeGreaterThan(timeout);
+    expect(sql.match(/\$shorts\$/g)).toHaveLength(2);
   });
 
-  it('три колонки — каждая под проверкой information_schema, умолчания — константы', async () => {
+  it('четыре колонки — каждая под проверкой information_schema, умолчания — константы', async () => {
     const sql = await appliedDoctorSql();
     const adds = [...sql.matchAll(/ALTER TABLE ([a-z_]+) ADD COLUMN ([a-z_]+)/g)];
-    expect(adds.map(([, t, c]) => `${t}.${c}`).sort()).toEqual(['short_video.auto_recoveries', 'short_video.failed_code', 'short_video.recoveries']);
+    expect(adds.map(([, t, c]) => `${t}.${c}`).sort()).toEqual([
+      'short_video.auto_recoveries', 'short_video.failed_code', 'short_video.omni_base', 'short_video.recoveries',
+    ]);
     expect((sql.match(/ALTER TABLE/g) ?? []).length).toBe(adds.length);
     for (const [, table, column] of adds) {
       expect(sql).toMatch(
@@ -261,6 +269,7 @@ describe('текст 005_doctor.sql', () => {
     expect(sql).toContain('ADD COLUMN failed_code text;');
     expect(sql).toContain('ADD COLUMN auto_recoveries integer NOT NULL DEFAULT 0;');
     expect(sql).toContain("ADD COLUMN recoveries jsonb NOT NULL DEFAULT '[]'::jsonb;");
+    expect(sql).toContain('ADD COLUMN omni_base integer NOT NULL DEFAULT 0;');
     expect(sql).not.toMatch(/ADD COLUMN IF NOT EXISTS/);
   });
 });

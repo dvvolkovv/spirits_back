@@ -103,6 +103,8 @@ maybe('ролики против живого Postgres', () => {
       'approved', 'publishing', 'published', 'rejected', 'failed'];
     for (const status of OLD) await insert({ status });
     await migrate(pool);
+    expect((await pool.query('SELECT DISTINCT failed_code, auto_recoveries, recoveries, omni_base FROM short_video')).rows)
+      .toEqual([{ failed_code: null, auto_recoveries: 0, recoveries: [], omni_base: 0 }]);
     const statusChecks = `SELECT conname, oid FROM pg_constraint
       WHERE conrelid = 'public.short_video'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%''render_queued''%'`;
     const first = (await pool.query(statusChecks)).rows;
@@ -445,8 +447,10 @@ maybe('ролики против живого Postgres', () => {
       review_chat_id: 777, review_message_id: 12, note_prompt_ids: [101, 102], yt_prompt_ids: [201],
       lease_until: new Date(Date.now() + 900_000), attempts: 2, last_error: 'ошибка-тест',
       failed_from: 'writing', failure_notified: true, published_at: new Date(Date.now() - 60_000),
+      // jsonb-массив — строкой (JSON.stringify): помощник отдаёт массивы как есть, node-pg сделал бы из них массив Postgres.
       failed_code: 'код-тест', auto_recoveries: 2,
       recoveries: JSON.stringify([{ at: '2030-01-01T10:00:00.000Z', from: 'animating', code: 'google_quota', action: 'later', delayMin: 30, reason: 'причина-тест' }]),
+      omni_base: 16,
     });
     const full = (await pool.query(`SELECT *, ${VERSION_SQL} AS version FROM short_video WHERE id = $1`, [v.id])).rows[0];
     // То же, что делает light() в контроллере — не экспортирован, поэтому воспроизводим здесь.
@@ -457,6 +461,10 @@ maybe('ролики против живого Postgres', () => {
     delete expected.captions;
     expected.version = full.version;
     expected.publications = [];
+    // Самопроверка фикстуры: тест сравнивает rowToShort с rowToShort — если обе стороны
+    // скатятся в запасные значения (колонку забыли в INSERT или в LIST_COLUMNS), поля
+    // совпадут вхолостую, и сверка ничего не поймает.
+    expect([expected.failedCode, expected.autoRecoveries, expected.recoveries.length, expected.omniBase]).toEqual(['код-тест', 2, 1, 16]);
 
     const ctl = new ShortsController(pgLike() as any, {} as any, {} as any, { publicUrl: () => 'x' } as any);
     const res: any = { status: () => res, json: (b: any) => ((res.body = b), res) };
