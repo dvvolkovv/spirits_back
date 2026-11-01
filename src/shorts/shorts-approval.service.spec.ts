@@ -709,9 +709,38 @@ describe('ShortsApprovalService', () => {
     it('упавшая публикация — доктора не спрашивают', async () => {
       const doctor = { treat: jest.fn(async () => 'took') };
       const { svc, tg, pg } = setup(row(), doctor);
-      failedOnce(pg, { last_error: 'публикация: telegram: chat not found', failed_from: 'publishing', tg_unsent: true });
+      failedOnce(pg, {
+        last_error: 'публикация: telegram: chat not found', failed_from: 'publishing', tg_unsent: true,
+        auto_recoveries: 1, recoveries: [{ at: '2030-01-01T08:00:00.000Z', from: 'animating', code: 'omni_budget', action: 'no_skits', reason: 'r' }],
+      });
       await svc.notifyFailures();
       expect(doctor.treat).not.toHaveBeenCalled();
+      expect(tg.sendMessage).toHaveBeenCalledTimes(1);
+      expect((tg.sendMessage.mock.calls[0] as any[])[1]).not.toContain('Сам пробовал');
+    });
+
+    it('два упавших за один разбор: первый взял доктор, второй — сообщение; оба спрошены', async () => {
+      const doctor = { treat: jest.fn().mockResolvedValueOnce('took').mockResolvedValueOnce('gave_up') };
+      const { svc, tg, pg } = setup(row(), doctor);
+      let n = 0;
+      pg.query.mockImplementation(async (sql: string) => {
+        if (sql.includes('failure_notified = true') && n < 2) {
+          n++;
+          return { rows: [row({ status: 'failed', last_error: `оживление: сбой ${n}`, failed_from: 'animating', failed_code: 'google_quota' })] };
+        }
+        return { rows: [] };
+      });
+      await svc.notifyFailures();
+      expect(doctor.treat).toHaveBeenCalledTimes(2);
+      expect(tg.sendMessage).toHaveBeenCalledTimes(1);
+      expect((tg.sendMessage.mock.calls[0] as any[])[1]).toContain('оживление: сбой 2');
+    });
+
+    it('неожиданный ответ доктора — сообщение уходит: молчим только на took и gone', async () => {
+      const doctor = { treat: jest.fn(async () => undefined) };
+      const { svc, tg, pg } = setup(row(), doctor);
+      failedOnce(pg, { last_error: 'оживление: лимит', failed_from: 'animating', failed_code: 'google_quota' });
+      await svc.notifyFailures();
       expect(tg.sendMessage).toHaveBeenCalledTimes(1);
     });
   });
