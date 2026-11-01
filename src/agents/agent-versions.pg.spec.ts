@@ -45,6 +45,23 @@ maybe('agent versions bootstrap against real PostgreSQL', () => {
     await admin?.end();
   });
 
+  it('bootstraps when legacy agents has no unique constraint', async () => {
+    await pool.query('DROP TABLE agents');
+    await pool.query(
+      'CREATE TABLE agents (id integer, description text, system_prompt text)',
+    );
+    await pool.query(
+      "INSERT INTO agents (id, description, system_prompt) VALUES (12, 'old', 'live')",
+    );
+
+    await makeService().onModuleInit();
+
+    const result = await pool.query(
+      'SELECT agent_id, version, status FROM agent_versions',
+    );
+    expect(result.rows).toEqual([{ agent_id: 12, version: 1, status: 'published' }]);
+  });
+
   it('backfills NULL fields and supports repeat execution', async () => {
     await pool.query(
       'INSERT INTO agents (id, description, system_prompt) VALUES (12, NULL, NULL)',
