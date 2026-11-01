@@ -69,6 +69,24 @@ describe('BlogRelayClient: модель общего рубильника (spec 
     await new BlogRelayClient().ask('sys', 'msg', 's-1');
     expect(fieldsOf(post.mock.calls[0][1]).provider).toBeUndefined();
   });
+
+  // Задача 14 (проверка фоновых задач на проде 01.11): автоблогу — путь Claude.
+  it('followSwitch: false — рубильник не читается, полей модели нет (путь Claude, как до рубильника)', async () => {
+    const get = jest.fn(async () => 'qwen');
+    const c = new BlogRelayClient({ get } as any);
+    expect(await c.ask('sys', 'msg', 's-1', { followSwitch: false })).toBe('пост');
+    const f = fieldsOf(post.mock.calls[0][1]);
+    expect(f.provider).toBeUndefined();
+    expect(f.noFallback).toBeUndefined();
+    expect(Object.keys(f).sort()).toEqual(['message', 'sessionId', 'systemPrompt']);
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it('followSwitch: true — как по умолчанию, provider рубильника', async () => {
+    const c = new BlogRelayClient({ get: jest.fn(async () => 'qwen') } as any);
+    await c.ask('sys', 'msg', 's-1', { followSwitch: true });
+    expect(fieldsOf(post.mock.calls[0][1]).provider).toBe('qwen');
+  });
 });
 
 /**
