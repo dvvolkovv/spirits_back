@@ -501,8 +501,10 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
       // Круг владельца начат (omni_base) — предел на круг; общий счёт ролика — рядом, для владельца.
       const circle = circleBase > 0 ? `, в этом круге — ${anim.omniSeconds - circleBase} с` : '';
       // Выход владельца — только из рабочего процесса (omniBase передан): в CLI кнопок нет.
-      // «Замечание» не названо: у ролика, собранного без сценок, формат chat — сценки вернёт «Переснять».
-      const exit = deps.omniBase !== undefined ? '; новый круг со сценками — «Повторить» или «Переснять»' : '';
+      // Текст уходит в last_error упавшего ролика — там «Повторить», «Новая сцена», «Новый текст»
+      // (failedHint); «Новая сцена» берёт формат из настроек. Собранному доктором без сценок выход
+      // даёт подпись на проверку (OMNI_BUDGET_NO_SKITS — «Переснять»).
+      const exit = deps.omniBase !== undefined ? '; новый круг со сценками — «Повторить» или «Новая сцена»' : '';
       throw new StudioError(
         'omni_budget',
         `на ролик ушло ${anim.omniSeconds} с Omni вместе с запущенными${circle}, предел — ${budget} с${circleBase > 0 ? ' на круг' : ''}: лимит пересъёмок сценок${exit}; поднять предел — настройка «Предел секунд Omni» (update_settings maxOmniSeconds; в CLI — MAX_OMNI_SECONDS=<секунды> npm run animate)`,

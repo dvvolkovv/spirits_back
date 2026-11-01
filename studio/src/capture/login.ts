@@ -17,6 +17,11 @@ export interface Session {
 async function fetchCode(cfg: StudioConfig): Promise<string> {
   for (let attempt = 0; attempt < 10; attempt++) {
     const r = await fetch(`${cfg.apiUrl}/webhook/debug/sms-code/${cfg.demoPhone}`, { headers: { 'X-Debug-Secret': cfg.debugSecret } });
+    if (r.status === 403) {
+      // «Phone not in whitelist» — номер демо-аккаунта не в белом списке debug-кодов этой среды:
+      // настройка, как неверный секрет. Повтор не поможет, а доктор держал бы ролик «позже» часами.
+      throw new StudioError('no_input', `login: debug-ручка ответила 403 — номер демо-аккаунта (DEMO_PHONE) не в белом списке debug-кодов этой среды`, false);
+    }
     if (r.status === 404) {
       // «No code» — секрет верный, кода в Redis нет (параллельный вход погасил, истёк): ждём, как пустой ответ.
       // Прочий 404 — настройка среды (секрет или выключенные ручки), а не сбой входа: no_input, доктор его не лечит.

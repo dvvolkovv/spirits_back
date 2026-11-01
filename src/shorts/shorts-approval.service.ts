@@ -262,7 +262,8 @@ export class ShortsApprovalService {
       : 'в ближайший свободный слот после одобрения';
     // Самопочинки текущего круга — владельцу на проверке: что ролик пережил и почему он без сценок.
     const circle = currentCircle(v);
-    const noSkits = circle.find((r) => r.action === 'no_skits');
+    // «Собран без сценок» — только у chat, как пометка в кабинете: запись no_skits у ролика со сценками (ручной SQL) — не про него.
+    const noSkits = v.format === 'chat' ? circle.find((r) => r.action === 'no_skits') : undefined;
     const { caption, extra } = buildReviewCaption({
       stand: isStand(),
       rubric: v.rubric,
