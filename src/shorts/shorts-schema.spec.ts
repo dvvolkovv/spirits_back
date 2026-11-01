@@ -33,6 +33,12 @@ async function appliedYoutubeSql(): Promise<string> {
   return text;
 }
 
+async function appliedSkitFeedbackSql(): Promise<string> {
+  const text = (await applied()).find((q) => q.includes("hashtext('shorts/004')"));
+  if (!text) throw new Error('миграция 004 не применена');
+  return text;
+}
+
 describe('ShortsSchemaService', () => {
   it('катит 001 при старте модуля', async () => {
     expect(await appliedSql()).toContain('CREATE TABLE short_publication');
@@ -52,6 +58,14 @@ describe('ShortsSchemaService', () => {
     const third = qs.findIndex((q) => q.includes("hashtext('shorts/003')"));
     expect(second).toBeGreaterThanOrEqual(0);
     expect(third).toBeGreaterThan(second);
+  });
+
+  it('катит 004 после 003', async () => {
+    const qs = await applied();
+    const third = qs.findIndex((q) => q.includes("hashtext('shorts/003')"));
+    const fourth = qs.findIndex((q) => q.includes("hashtext('shorts/004')"));
+    expect(third).toBeGreaterThanOrEqual(0);
+    expect(fourth).toBeGreaterThan(third);
   });
 
   it('не роняет старт, если база ответила ошибкой', async () => {
@@ -187,5 +201,24 @@ describe('текст 003_youtube.sql', () => {
     const m = (await appliedYoutubeSql()).match(new RegExp(`youtube_mode text NOT NULL DEFAULT '${SETTINGS_DEFAULTS.youtubeMode}'\\s+CHECK \\(youtube_mode IN \\(([^)]*)\\)\\)`));
     const listed = (m?.[1].match(/'([a-z_]+)'/g) ?? []).map((s) => s.slice(1, -1));
     expect(listed.sort()).toEqual([...YOUTUBE_MODES].sort());
+  });
+});
+
+describe('текст 004_skit_feedback.sql', () => {
+  it('весь файл — один DO-блок под advisory-локом и lock_timeout', async () => {
+    const sql = (await appliedSkitFeedbackSql()).trim();
+    expect(sql.startsWith('DO $shorts$')).toBe(true);
+    expect(sql.endsWith('$shorts$;')).toBe(true);
+    expect(sql).toContain("pg_advisory_xact_lock(hashtext('shorts/004'))");
+    expect(sql).toContain("set_config('lock_timeout', '5s', true)");
+  });
+
+  it('колонка skit_feedback jsonb — под проверкой information_schema, без ADD COLUMN IF NOT EXISTS', async () => {
+    const sql = await appliedSkitFeedbackSql();
+    expect((sql.match(/ALTER TABLE/g) ?? []).length).toBe(1);
+    expect(sql).toMatch(
+      /IF NOT EXISTS \(SELECT 1 FROM information_schema\.columns\s+WHERE table_schema = 'public' AND table_name = 'short_video' AND column_name = 'skit_feedback'\) THEN\s+ALTER TABLE short_video ADD COLUMN skit_feedback jsonb;/,
+    );
+    expect(sql).not.toMatch(/ADD COLUMN IF NOT EXISTS/);
   });
 });
