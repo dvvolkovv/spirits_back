@@ -240,7 +240,8 @@ describe('POST admin/shorts', () => {
     const upd = retryWrite(client);
     // Кнопка владельца — новый круг: самопочинки доктора считаются заново, код сбоя стирается вместе с ошибкой.
     expect(String(upd[0])).toMatch(/failed_code = NULL/);
-    expect(String(upd[0])).toMatch(/auto_recoveries = 0/);
+    expect(String(upd[0])).toMatch(/auto_recoveries = CASE WHEN \$2 = 'approved' THEN auto_recoveries ELSE 0 END/);
+    expect(String(upd[0])).not.toMatch(/\brecoveries\s*=/);
     expect(String(upd[0])).toContain('owner_note = COALESCE($4::text, owner_note)');
     expect(String(upd[0])).toContain('writer_rounds = 0');
     expect(String(upd[0])).toContain('format = COALESCE($5::text, format)');
@@ -649,8 +650,9 @@ describe('POST admin/shorts — решение по готовому ролик�
     const r = res();
     await ctl.action({ action: 'redo', id: ID, version: VERSION }, r);
     const [sql, params] = pg.query.mock.calls.find((c: any[]) => String(c[0]).startsWith('UPDATE')) as any[];
-    expect(sql).toContain('AND updated_at = $4::timestamptz');
-    expect(params).toEqual([ID, 'directing', ['pending_review', 'approved'], VERSION]);
+    expect(sql).toContain('format = $4');
+    expect(sql).toContain('AND updated_at = $5::timestamptz');
+    expect(params).toEqual([ID, 'directing', ['pending_review', 'approved'], 'chat', VERSION]);
     expect(r.body.status).toBe('directing');
   });
 

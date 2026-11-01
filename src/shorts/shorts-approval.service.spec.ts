@@ -51,7 +51,7 @@ function setup(dbRow: any = row(), doctor?: any) {
     answerCallbackQuery: jest.fn(async () => true),
   };
   const storage = { download: jest.fn(async () => Buffer.from('bytes')) };
-  const settings = { get: jest.fn(async () => ({ slotDays: [2, 4, 6], slotHourMsk: 18, maxOmniSeconds: 48 })) };
+  const settings = { get: jest.fn(async () => ({ slotDays: [2, 4, 6], slotHourMsk: 18, maxOmniSeconds: 48, format: 'skit' })) };
   const topics = { addManual: jest.fn(async (): Promise<any> => ({ id: 'new' })) };
   const svc = new ShortsApprovalService(pg as any, tg as any, storage as any, settings as any, topics as any, doctor);
   return { svc, pg, tg, storage, topics };
@@ -355,6 +355,10 @@ describe('ShortsApprovalService', () => {
       const writes = pg.query.mock.calls.filter((c: any[]) => String(c[0]).includes('SET status = $2')) as any[];
       expect(writes.map((c) => c[1][1])).toEqual(['directing', 'rejected']);
       expect(writes[0][1][2]).toEqual(['pending_review', 'approved']);
+      // «Переснять» — формат из настроек (как «Новая сцена»), «Отклонить» формат не трогает.
+      expect(writes[0][0]).toContain('format = $4');
+      expect(writes[0][1][3]).toBe('skit');
+      expect(writes[1][0]).not.toMatch(/format =/);
     });
 
     it('«Выложил на YouTube» — приглашение прислать ссылку', async () => {
@@ -742,6 +746,7 @@ describe('ShortsApprovalService', () => {
       failedOnce(pg, { last_error: 'оживление: лимит', failed_from: 'animating', failed_code: 'google_quota' });
       await svc.notifyFailures();
       expect(tg.sendMessage).toHaveBeenCalledTimes(1);
+      expect(doctor.treat).toHaveBeenCalledTimes(1);
     });
   });
 });
