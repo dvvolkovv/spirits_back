@@ -8,26 +8,28 @@ jest.mock('../common/telegram-alert', () => ({
 import { sendTelegramPayload } from '../common/telegram-alert';
 import { ClaudeHealthService } from './claude-health.service';
 import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
+import { AnswerProvider, FallbackProvider } from '../common/services/llm-fallback';
+import { CliSwitchState, cliOutageAffectedText, cliRecoveredText } from '../common/global-llm-messages';
 
 /**
- * Алерт «Локальный Claude CLI недоступен» знает об общем рубильнике (ревью
- * 01.11, R3). Пока рубильник не на Claude, Маша, TG-боты и фоновые задачи
- * отвечают через его модель — падение Claude задевает только пробы
- * мониторинга (они всегда на Claude), личный выбор Claude и запасной путь.
- * Без ключа модель рубильника фактически не действует (все на Claude) — текст
- * прежний, как «фактически отвечает Claude» в суточном напоминании.
+ * Алерт «Локальный Claude CLI недоступен» и его отбой знают об общем
+ * рубильнике (ревью 01.11, R3; повторное ревью — I1, M4). Тексты по
+ * состояниям проверяет global-llm-messages.spec.ts; здесь — что сервис берёт
+ * их из cliOutageAffectedText/cliRecoveredText и правильно выводит состояние
+ * модели рубильника из get() и fallbackStats(): enabled — ключ есть
+ * (providers[x].enabled), down — она «не отвечает» (downUntil > now), и
+ * тогда выбор рубильника её пропускает.
  */
 describe('ClaudeHealthService — алерт о падении CLI и рубильник', () => {
-  const ENV = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'QWEN_FALLBACK_API_KEY', 'KIMI_FALLBACK_API_KEY'];
+  const ENV = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'];
   let saved: Record<string, string | undefined>;
   beforeEach(() => {
     saved = Object.fromEntries(ENV.map((k) => [k, process.env[k]]));
     process.env.TELEGRAM_BOT_TOKEN = 'tg-test';
     process.env.TELEGRAM_CHAT_ID = 'chat-test';
-    process.env.QWEN_FALLBACK_API_KEY = 'sk-sp-test';
-    process.env.KIMI_FALLBACK_API_KEY = 'sk-kimi-test';
     (sendTelegramPayload as jest.Mock).mockClear();
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
   });
   afterEach(() => {
     for (const k of ENV) {
@@ -37,51 +39,55 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     jest.restoreAllMocks();
   });
 
-  /** Текст алерта о падении при рубильнике на switchTo. */
-  const alertText = async (switchTo: 'claude' | 'qwen' | 'kimi'): Promise<string> => {
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
-    const claudeCli = { text: jest.fn(), fallbackStats: jest.fn(() => ({ windowMs: 900_000 })) };
+  type Prov = { enabled: boolean; downUntil: number };
+  type Provs = Record<FallbackProvider, Prov>;
+  const up: Prov = { enabled: true, downUntil: 0 };
+  const noKey: Prov = { enabled: false, downUntil: 0 };
+  /** «Не отвечает» ещё минуту — считается в момент теста, не при сборе таблицы. */
+  const downNow = (): Prov => ({ enabled: true, downUntil: Date.now() + 60_000 });
+
+  /** Сервис с рубильником switchTo и состоянием запасных; alerted — о простое уже сообщали. */
+  const make = (switchTo: AnswerProvider, providers: Provs, alerted = false): any => {
+    const pg = { query: jest.fn(async (sql: string) => (/SELECT alerted/.test(sql) ? { rows: [{ alerted }] } : { rows: [] })) };
+    const claudeCli = { text: jest.fn(), fallbackStats: jest.fn(() => ({ windowMs: 900_000, providers })) };
     const global = { get: jest.fn(async () => switchTo) };
-    const svc: any = new ClaudeHealthService(pg as any, claudeCli as any, global as any);
+    return new ClaudeHealthService(pg as any, claudeCli as any, global as any);
+  };
+  const sent = (): string[] => (sendTelegramPayload as jest.Mock).mock.calls.map((c) => c[0].text);
+
+  const OUTAGE: Array<[string, AnswerProvider, () => Provs, CliSwitchState]> = [
+    ['рубильник на Claude', 'claude', () => ({ qwen: up, kimi: up }), { switchProvider: 'claude', enabled: false, down: false }],
+    ['Kimi без ключа', 'kimi', () => ({ qwen: up, kimi: noKey }), { switchProvider: 'kimi', enabled: false, down: false }],
+    ['Qwen с ключом отвечает', 'qwen', () => ({ qwen: up, kimi: noKey }), { switchProvider: 'qwen', enabled: true, down: false }],
+    ['Qwen с ключом «не отвечает»', 'qwen', () => ({ qwen: downNow(), kimi: noKey }), { switchProvider: 'qwen', enabled: true, down: true }],
+  ];
+
+  it.each(OUTAGE)('падение, %s — строка «Затронуто» из cliOutageAffectedText', async (_name, sw, providers, state) => {
+    const svc = make(sw, providers());
     svc.cache.llmStatus = 'down';
     svc.cache.llmOutageKind = 'auth';
     svc.cache.llmError = 'не вошёл';
     // С запасом выше порога подряд-провалов (CLAUDE_OUTAGE_FAILS из окружения).
     svc.cliConsecutiveDown = 99;
     await svc.maybeAlertOutage();
-    expect(sendTelegramPayload).toHaveBeenCalledTimes(1);
-    return (sendTelegramPayload as jest.Mock).mock.calls[0][0].text;
-  };
-
-  it('рубильник на Claude — прежний текст «Затронуто»', async () => {
-    const text = await alertText('claude');
-    expect(text).toContain(
-      'Затронуто: <b>Маша, TG-боты, Виртуальный PM, Виртуальный маркетолог, фоновые задачи</b> (CLI-путь на OAuth-подписке).',
-    );
-    expect(text).not.toContain('рубильник');
+    expect(sent()).toHaveLength(1);
+    expect(sent()[0]).toContain('<b>🔴 Локальный Claude CLI недоступен</b>');
+    expect(sent()[0]).toContain(`\n${cliOutageAffectedText(state)} Чат-ассистенты (r.linkeon.io) — отдельный путь`);
   });
 
-  it('рубильник на Qwen — затронуты пробы мониторинга, личный выбор Claude и запасной путь', async () => {
-    const text = await alertText('qwen');
-    expect(text).toContain(
-      'Затронуто: пробы мониторинга, личный выбор Claude и запасной путь — рубильник сейчас на <b>Qwen</b>: ' +
-        'Маша, TG-боты и фоновые задачи отвечают через эту модель.',
-    );
-    expect(text).not.toContain('Виртуальный маркетолог');
-    // Остальное в алерте — как было.
-    expect(text).toContain('Локальный Claude CLI недоступен');
-    expect(text).toContain('Чат-ассистенты (r.linkeon.io) — отдельный путь');
-  });
+  const RECOVERY: Array<[string, AnswerProvider, () => Provs, CliSwitchState]> = [
+    ['рубильник на Qwen, Qwen отвечает', 'qwen', () => ({ qwen: up, kimi: noKey }), { switchProvider: 'qwen', enabled: true, down: false }],
+    ['рубильник на Qwen, Qwen «не отвечает»', 'qwen', () => ({ qwen: downNow(), kimi: noKey }), { switchProvider: 'qwen', enabled: true, down: true }],
+    ['рубильник на Claude', 'claude', () => ({ qwen: up, kimi: up }), { switchProvider: 'claude', enabled: false, down: false }],
+  ];
 
-  it('рубильник на Kimi — подпись Kimi', async () => {
-    expect(await alertText('kimi')).toContain('рубильник сейчас на <b>Kimi</b>');
-  });
-
-  it('рубильник на Kimi без ключа на сервере — фактически все на Claude, текст прежний', async () => {
-    delete process.env.KIMI_FALLBACK_API_KEY;
-    const text = await alertText('kimi');
-    expect(text).toContain('Затронуто: <b>Маша, TG-боты, Виртуальный PM, Виртуальный маркетолог, фоновые задачи</b>');
-    expect(text).not.toContain('рубильник');
+  it.each(RECOVERY)('отбой, %s — текст из cliRecoveredText', async (_name, sw, providers, state) => {
+    const svc = make(sw, providers(), true);
+    svc.cache.llmStatus = 'ok';
+    svc.cache.llmCheckedAt = '2026-11-01T07:15:00.000Z';
+    svc.cache.llmLatencyMs = 812;
+    await svc.maybeAlertOutage();
+    expect(sent()).toEqual([cliRecoveredText({ ...state, checkedAt: '2026-11-01T07:15:00.000Z', latencyMs: 812 })]);
   });
 });
 

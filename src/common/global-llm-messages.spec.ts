@@ -1,4 +1,4 @@
-import { maskActor, mskStamp, reminderText, switchedText } from './global-llm-messages';
+import { cliOutageAffectedText, cliRecoveredText, maskActor, mskStamp, reminderText, switchedText } from './global-llm-messages';
 
 describe('тексты рубильника', () => {
   it('mskStamp — дд.мм чч:мм по Москве', () => {
@@ -105,5 +105,81 @@ describe('maskActor', () => {
   it('не похоже ни на телефон, ни на UUID (служебный id) — без изменений', () => {
     expect(maskActor('admin-1')).toBe('admin-1');
     expect(maskActor('unknown')).toBe('unknown');
+  });
+});
+
+/**
+ * Строка «Затронуто» в алерте «Локальный Claude CLI недоступен» (повторное
+ * ревью 01.11, I1). Три состояния модели рубильника: на Claude или без ключа —
+ * прежний текст; с ключом и отвечает — через неё идут Маша, TG-боты и
+ * фоновые; с ключом, но «не отвечает» — выбор рубильника её пропускает
+ * (planProviders с respectDown), и они идут обычным путём, то есть через
+ * упавший Claude.
+ */
+describe('cliOutageAffectedText', () => {
+  const OLD = 'Затронуто: <b>Маша, TG-боты, Виртуальный PM, Виртуальный маркетолог, фоновые задачи</b> (CLI-путь на OAuth-подписке).';
+
+  it('рубильник на Claude — прежний текст', () => {
+    expect(cliOutageAffectedText({ switchProvider: 'claude', enabled: false, down: false })).toBe(OLD);
+  });
+
+  it('модель рубильника без ключа — прежний текст (фактически все на Claude), даже с пометкой «не отвечает»', () => {
+    expect(cliOutageAffectedText({ switchProvider: 'kimi', enabled: false, down: false })).toBe(OLD);
+    expect(cliOutageAffectedText({ switchProvider: 'kimi', enabled: false, down: true })).toBe(OLD);
+  });
+
+  it('модель рубильника с ключом и отвечает — затронуты пробы, личный выбор Claude и запасной путь', () => {
+    expect(cliOutageAffectedText({ switchProvider: 'qwen', enabled: true, down: false })).toBe(
+      'Затронуто: пробы мониторинга, личный выбор Claude и запасной путь — рубильник сейчас на <b>Qwen</b>: ' +
+        'Маша, TG-боты и фоновые задачи отвечают через эту модель.',
+    );
+  });
+
+  it('модель рубильника с ключом, но «не отвечает» — Маша и остальные идут обычным путём, через Claude', () => {
+    expect(cliOutageAffectedText({ switchProvider: 'qwen', enabled: true, down: true })).toBe(
+      'Затронуто: <b>Маша, TG-боты, Виртуальный PM, Виртуальный маркетолог, фоновые задачи</b> (CLI-путь на OAuth-подписке) — ' +
+        'рубильник на <b>Qwen</b>, но Qwen сейчас «не отвечает», поэтому они идут обычным путём (Claude, затем запасные).',
+    );
+  });
+
+  it('подпись — по модели рубильника', () => {
+    expect(cliOutageAffectedText({ switchProvider: 'kimi', enabled: true, down: false })).toContain('рубильник сейчас на <b>Kimi</b>');
+    expect(cliOutageAffectedText({ switchProvider: 'kimi', enabled: true, down: true })).toContain('но Kimi сейчас «не отвечает»');
+  });
+});
+
+/**
+ * Отбой «Локальный Claude CLI восстановлен» (повторное ревью 01.11, M4): при
+ * рубильнике на живой модели с ключом Маша, TG-боты и фоновые всё время
+ * работали через неё — «снова работают» было бы неправдой.
+ */
+describe('cliRecoveredText', () => {
+  const at = '2026-11-01T07:15:00.000Z';
+  const OLD = `<b>🟢 Локальный Claude CLI восстановлен</b>\nМаша/VPM/маркетолог снова работают (проверка: ${at}, 812мс).`;
+
+  it('рубильник на живой модели с ключом — Claude снова отвечает, Маша и остальные по-прежнему через рубильник', () => {
+    expect(cliRecoveredText({ switchProvider: 'qwen', enabled: true, down: false, checkedAt: at, latencyMs: 812 })).toBe(
+      '<b>🟢 Локальный Claude CLI восстановлен</b>\n' +
+        `Claude снова отвечает (проверка: ${at}, 812мс): пробы мониторинга, личный выбор Claude, запасной путь. ` +
+        'Маша, TG-боты и фоновые задачи по-прежнему идут через Qwen (рубильник).',
+    );
+  });
+
+  it('рубильник на Claude — прежний текст', () => {
+    expect(cliRecoveredText({ switchProvider: 'claude', enabled: false, down: false, checkedAt: at, latencyMs: 812 })).toBe(OLD);
+  });
+
+  it('модель рубильника без ключа — прежний текст', () => {
+    expect(cliRecoveredText({ switchProvider: 'kimi', enabled: false, down: false, checkedAt: at, latencyMs: 812 })).toBe(OLD);
+  });
+
+  it('модель рубильника «не отвечает» — прежний текст: Маша и остальные шли через Claude и были задеты', () => {
+    expect(cliRecoveredText({ switchProvider: 'qwen', enabled: true, down: true, checkedAt: at, latencyMs: 812 })).toBe(OLD);
+  });
+
+  it('нет данных проверки — прочерки, как раньше', () => {
+    expect(cliRecoveredText({ switchProvider: 'claude', enabled: false, down: false, checkedAt: null, latencyMs: null })).toBe(
+      '<b>🟢 Локальный Claude CLI восстановлен</b>\nМаша/VPM/маркетолог снова работают (проверка: —, —мс).',
+    );
   });
 });
