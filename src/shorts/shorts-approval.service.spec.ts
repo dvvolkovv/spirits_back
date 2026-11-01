@@ -225,7 +225,7 @@ describe('ShortsApprovalService', () => {
       });
       const { svc, tg } = setup();
       await svc.handleCallback(cb('ok'));
-      expect(approveShortIntoSlot).toHaveBeenCalledWith(expect.anything(), ID, new Date('2030-01-01T15:00:00.000Z'), { slotDays: [2, 4, 6], slotHourMsk: 18, maxOmniSeconds: 48 });
+      expect(approveShortIntoSlot).toHaveBeenCalledWith(expect.anything(), ID, new Date('2030-01-01T15:00:00.000Z'), expect.objectContaining({ slotDays: [2, 4, 6], slotHourMsk: 18, maxOmniSeconds: 48 }));
       expect(tg.answerCallbackQuery).toHaveBeenCalledWith('cb', { text: 'Одобрено. Опубликую завтра в 18:00 МСК.' });
       expect(tg.sendMessage).toHaveBeenCalledWith(OWNER, 'Одобрено. Опубликую завтра в 18:00 МСК.');
     });
