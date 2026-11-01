@@ -98,7 +98,24 @@ inflight_count() {
   '
 }
 
+nginx_worker_pids() {
+  local master
+  master=$(cat /var/run/nginx.pid)
+  ps -eo pid=,ppid=,comm= | awk -v master="$master" '$2 == master && $3 == "nginx" { print $1 }'
+}
+
+legacy_workers_drained() {
+  local pid
+  for pid in $LEGACY_NGINX_WORKERS; do
+    if ps -p "$pid" -o pid= >/dev/null 2>&1; then
+      return 1
+    fi
+  done
+  return 0
+}
+
 nginx_drain_on() {
+  LEGACY_NGINX_WORKERS=$(nginx_worker_pids)
   $SUDO python3 - "$NGINX_CONF" <<'PY'
 import os
 import stat
@@ -171,12 +188,12 @@ PY
 health_and_release() {
   for attempt in $(seq 1 20); do
     if curl -fsS --max-time 5 http://127.0.0.1:3033/health; then
+      rm -f -- "$DRAIN_FILE"
+      GATE_CREATED=0
       if [[ "$NGINX_DRAIN" -eq 1 ]] && ! nginx_drain_off; then
         echo "Health есть, но legacy Nginx drain не снят — admission остаётся закрытым" >&2
         return 1
       fi
-      rm -f -- "$DRAIN_FILE"
-      GATE_CREATED=0
       printf '\nhealth OK, drain снят\n'
       return 0
     fi
@@ -283,13 +300,18 @@ fi
 DRAIN_STARTED=$SECONDS
 while true; do
   CHILDREN=$(ps --ppid "$PID" -o pid=)
-  INFLIGHT=$(inflight_count)
-  if [[ "$INFLIGHT" == legacy ]]; then INFLIGHT=0; fi
-  if ! grep -q . <<< "$CHILDREN" && [[ "$INFLIGHT" -eq 0 ]]; then
-    break
+  if [[ "$INITIAL_INFLIGHT" == legacy ]]; then
+    if ! grep -q . <<< "$CHILDREN" && legacy_workers_drained; then
+      break
+    fi
+  else
+    INFLIGHT=$(inflight_count)
+    if ! grep -q . <<< "$CHILDREN" && [[ "$INFLIGHT" -eq 0 ]]; then
+      break
+    fi
   fi
   if (( SECONDS - DRAIN_STARTED >= DRAIN_WAIT_SECONDS )); then
-    echo "Ходы или принятые запросы не завершились за $DRAIN_WAIT_SECONDS с — замена отменена" >&2
+    echo "Ходы, принятые запросы или старые Nginx workers не завершились за $DRAIN_WAIT_SECONDS с — замена отменена" >&2
     exit 1
   fi
   sleep 5
