@@ -673,6 +673,26 @@ describe('AgentVersionsService.testVersion', () => {
     );
   });
 
+  it('uses the existing JWT fallback when the environment secret is unset', async () => {
+    const configuredSecret = process.env.JWT_SECRET;
+    delete process.env.JWT_SECRET;
+    try {
+      const h = makeTestService();
+      const first = await h.service.testVersion('admin', 12, draft.id, 'first');
+      const continued = await h.service.testVersion(
+        'admin',
+        12,
+        draft.id,
+        'check',
+        first.session_id,
+      );
+
+      expect(continued.session_id).toBe(first.session_id);
+    } finally {
+      process.env.JWT_SECRET = configuredSecret;
+    }
+  });
+
   it('rejects cross-actor, cross-agent, cross-version, and tampered continuations', async () => {
     const h = makeTestService();
     const issued = await h.service.testVersion('admin', 12, draft.id, 'first');
