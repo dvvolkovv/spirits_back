@@ -54,7 +54,7 @@ describe('AgentsService.upsertAgent', () => {
     expect(pg.query.mock.calls.some(([sql]) => /UPDATE\s+agents/i.test(sql))).toBe(false);
   });
 
-  it('uses the published version as the draft base when no draft exists', async () => {
+  it('updates an existing id without requiring name and uses the published base', async () => {
     const { service, pg, versions } = makeService();
     pg.query
       .mockResolvedValueOnce({ rows: [{ id: 12, name: 'roman' }] })
@@ -64,7 +64,7 @@ describe('AgentsService.upsertAgent', () => {
     versions.publish.mockResolvedValue({});
 
     await service.upsertAgent(
-      { id: 12, name: 'roman', system_prompt: 'new', description: 'description' },
+      { id: 12, system_prompt: 'new', description: 'description' },
       'admin-1',
     );
 
@@ -149,6 +149,41 @@ describe('AgentsService.upsertAgent', () => {
     expect(versions.createDraft).not.toHaveBeenCalled();
     expect(versions.publish).not.toHaveBeenCalled();
     expect(clientQuery.mock.calls.some(([sql]) => /UPDATE\s+agents/i.test(sql))).toBe(false);
+  });
+
+  it('allows exact prompt and description limits for direct v1 creation', async () => {
+    const { service, pg, clientQuery } = makeService();
+    const systemPrompt = 'p'.repeat(200000);
+    const description = 'd'.repeat(5000);
+    const agent = { id: 43, name: 'bounded-agent', system_prompt: systemPrompt, description };
+    pg.query
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
+    clientQuery.mockImplementation(async (sql: string) => ({
+      rows: /INSERT INTO agents/i.test(sql) ? [agent] : [],
+    }));
+
+    await expect(service.upsertAgent({
+      name: 'bounded-agent',
+      system_prompt: systemPrompt,
+      description,
+    }, 'admin-1')).resolves.toEqual(agent);
+
+    const versionInsert = clientQuery.mock.calls.find(([sql]) => /INSERT INTO agent_versions/i.test(sql));
+    expect(versionInsert[1]).toEqual([43, description, systemPrompt, 'admin-1']);
+  });
+
+  it.each([
+    { case: 'prompt above 200000', data: { name: 'agent', system_prompt: 'p'.repeat(200001) } },
+    { case: 'description above 5000', data: { name: 'agent', system_prompt: 'prompt', description: 'd'.repeat(5001) } },
+  ])('rejects $case with 400 before touching PostgreSQL', async ({ data }) => {
+    const { service, pg } = makeService();
+
+    const error = await service.upsertAgent(data, 'admin-1').catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(BadRequestException);
+    expect((error as BadRequestException).getStatus()).toBe(400);
+    expect(pg.query).not.toHaveBeenCalled();
   });
 
   it.each([

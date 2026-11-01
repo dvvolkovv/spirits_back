@@ -12,6 +12,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ChatService } from '../chat/chat.service';
 import { PgService } from '../common/services/pg.service';
+import { normalizeAgentVersionFields } from './agent-version-validation';
 
 export type AgentVersionStatus = 'draft' | 'published' | 'superseded';
 
@@ -342,19 +343,10 @@ export class AgentVersionsService implements OnModuleInit {
       base_version_id: string;
     },
   ): Promise<AgentVersion> {
-    const description =
-      typeof data.description === 'string' ? data.description.trim() : '';
-    const systemPrompt =
-      typeof data.system_prompt === 'string' ? data.system_prompt.trim() : '';
-    if (!systemPrompt) {
-      throw new BadRequestException('system_prompt must not be empty');
-    }
-    if (systemPrompt.length > 200000) {
-      throw new BadRequestException('system_prompt must not exceed 200000 characters');
-    }
-    if (description.length > 5000) {
-      throw new BadRequestException('description must not exceed 5000 characters');
-    }
+    const { description, systemPrompt } = normalizeAgentVersionFields(
+      data.description,
+      data.system_prompt,
+    );
 
     const base = await this.latest(agentId);
     if (!base || base.id !== data.base_version_id) {

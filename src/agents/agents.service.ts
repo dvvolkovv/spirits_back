@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { LanguageService } from '../common/services/language.service';
+import { normalizeAgentVersionFields } from './agent-version-validation';
 import { AgentVersionsService } from './agent-versions.service';
 
 @Injectable()
@@ -88,15 +89,17 @@ export class AgentsService {
     }
     const agentId = data['agent-id'] || data.id;
     const name = typeof data.name === 'string' ? data.name.trim() : '';
-    const systemPrompt = typeof data.system_prompt === 'string'
-      ? data.system_prompt.trim()
-      : '';
-    const description = typeof data.description === 'string' ? data.description : '';
-    if (!name) throw new BadRequestException('name must not be empty');
-    if (!systemPrompt) throw new BadRequestException('system_prompt must not be empty');
+    const { description, systemPrompt } = normalizeAgentVersionFields(
+      data.description,
+      data.system_prompt,
+    );
 
     let existing = agentId ? await this.getAgentById(agentId) : null;
-    if (!existing) existing = await this.getAgentByName(name);
+    if (existing) {
+      return this.publishExistingAgent(existing, actor, systemPrompt, description);
+    }
+    if (!name) throw new BadRequestException('name must not be empty');
+    existing = await this.getAgentByName(name);
     if (existing) {
       return this.publishExistingAgent(existing, actor, systemPrompt, description);
     }
