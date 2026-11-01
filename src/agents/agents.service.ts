@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { LanguageService } from '../common/services/language.service';
 import { AgentVersionsService } from './agent-versions.service';
@@ -83,34 +83,97 @@ export class AgentsService {
   }
 
   async upsertAgent(data: any, actor: string) {
+    if (!data || typeof data !== 'object') {
+      throw new BadRequestException('Agent payload must be an object');
+    }
     const agentId = data['agent-id'] || data.id;
-    const { name, system_prompt, description } = data;
+    const name = typeof data.name === 'string' ? data.name.trim() : '';
+    const systemPrompt = typeof data.system_prompt === 'string'
+      ? data.system_prompt.trim()
+      : '';
+    const description = typeof data.description === 'string' ? data.description : '';
+    if (!name) throw new BadRequestException('name must not be empty');
+    if (!systemPrompt) throw new BadRequestException('system_prompt must not be empty');
+
     let existing = agentId ? await this.getAgentById(agentId) : null;
     if (!existing) existing = await this.getAgentByName(name);
-
-    if (!existing) {
-      const res = await this.pg.query(
-        `INSERT INTO agents (id, name, system_prompt, description)
-         VALUES (COALESCE($4, nextval('agents_id_seq')), $1, $2, $3)
-         RETURNING *`,
-        [name, system_prompt, description, agentId],
-      );
-      const agent = res.rows[0];
-      await this.pg.query(
-        `INSERT INTO agent_versions
-           (agent_id, version, description, system_prompt, status, created_by, published_at, published_by)
-         VALUES ($1, 1, $2, $3, 'published', $4, now(), $4)`,
-        [agent.id, description, system_prompt, actor],
-      );
-      return agent;
+    if (existing) {
+      return this.publishExistingAgent(existing, actor, systemPrompt, description);
     }
 
+    const client = await this.pg.getClient();
+    let committed = false;
+    let destroyClient = false;
+    let created = false;
+    let agent: any = null;
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+        `legacy-agent-upsert:${name}`,
+      ]);
+      const current = await client.query(
+        'SELECT * FROM agents WHERE name = $1 LIMIT 1',
+        [name],
+      );
+      agent = current.rows[0] || null;
+      if (!agent) {
+        const res = await client.query(
+          `INSERT INTO agents (id, name, system_prompt, description)
+           VALUES (COALESCE($4, nextval('agents_id_seq')), $1, $2, $3)
+           RETURNING *`,
+          [name, systemPrompt, description, agentId],
+        );
+        agent = res.rows[0];
+        await client.query(
+          `SELECT setval(
+             'agents_id_seq',
+             GREATEST(
+               (SELECT COALESCE(MAX(id), 0) FROM agents),
+               (SELECT last_value FROM agents_id_seq)
+             ),
+             true
+           )`,
+        );
+        await client.query(
+          `INSERT INTO agent_versions
+             (agent_id, version, description, system_prompt, status, created_by, published_at, published_by)
+           VALUES ($1, 1, $2, $3, 'published', $4, now(), $4)`,
+          [agent.id, description, systemPrompt, actor],
+        );
+        created = true;
+      }
+      await client.query('COMMIT');
+      committed = true;
+    } catch (e) {
+      if (!committed) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          destroyClient = true;
+        }
+      }
+      throw e;
+    } finally {
+      if (destroyClient) client.release(true);
+      else client.release();
+    }
+
+    if (created) return agent;
+    return this.publishExistingAgent(agent, actor, systemPrompt, description);
+  }
+
+  private async publishExistingAgent(
+    existing: any,
+    actor: string,
+    systemPrompt: string,
+    description: string,
+  ) {
     const state = await this.versions.getState(existing.id);
     const base = state.draft || state.published;
     if (!base) throw new Error('Agent has no versions');
     const draft = await this.versions.createDraft(actor, existing.id, {
       description,
-      system_prompt,
+      system_prompt: systemPrompt,
       base_version_id: base.id,
     });
     await this.versions.publish(

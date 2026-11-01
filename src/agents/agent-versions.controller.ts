@@ -4,6 +4,7 @@ import {
   Get,
   Param,
   ParseIntPipe,
+  ParseUUIDPipe,
   Post,
   Query,
   UseGuards,
@@ -11,6 +12,11 @@ import {
 import { AdminGuard } from '../common/guards/admin.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { JwtGuard } from '../common/guards/jwt.guard';
+import {
+  CreateAgentDraftDto,
+  PublishAgentVersionDto,
+  TestAgentVersionDto,
+} from './agent-versions.dto';
 import { AgentVersionsService } from './agent-versions.service';
 
 @Controller('admin/agents')
@@ -28,13 +34,13 @@ export class AgentVersionsController {
     @Param('id', ParseIntPipe) id: number,
     @Query('limit') limit?: string,
   ) {
-    return this.versions.listVersions(id, Number(limit) || 50);
+    return this.versions.listVersions(id, limit === undefined ? 50 : Number(limit));
   }
 
   @Get(':id/versions/:versionId')
   getVersion(
     @Param('id', ParseIntPipe) id: number,
-    @Param('versionId') versionId: string,
+    @Param('versionId', ParseUUIDPipe) versionId: string,
   ) {
     return this.versions.getVersion(id, versionId);
   }
@@ -43,7 +49,7 @@ export class AgentVersionsController {
   createDraft(
     @CurrentUser() user: any,
     @Param('id', ParseIntPipe) id: number,
-    @Body() body: any,
+    @Body() body: CreateAgentDraftDto,
   ) {
     return this.versions.createDraft(user.userId, id, body);
   }
@@ -52,8 +58,8 @@ export class AgentVersionsController {
   publish(
     @CurrentUser() user: any,
     @Param('id', ParseIntPipe) id: number,
-    @Param('versionId') versionId: string,
-    @Body() body: any,
+    @Param('versionId', ParseUUIDPipe) versionId: string,
+    @Body() body: PublishAgentVersionDto,
   ) {
     return this.versions.publish(
       user.userId,
@@ -67,7 +73,7 @@ export class AgentVersionsController {
   test(
     @CurrentUser() user: any,
     @Param('id', ParseIntPipe) id: number,
-    @Body() body: any,
+    @Body() body: TestAgentVersionDto,
   ) {
     return this.versions.testVersion(
       user.userId,

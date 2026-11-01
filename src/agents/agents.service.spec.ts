@@ -3,14 +3,19 @@ import { AgentsController } from './agents.controller';
 import { AgentsService } from './agents.service';
 
 function makeService() {
-  const pg = { query: jest.fn() };
+  const clientQuery = jest.fn();
+  const release = jest.fn();
+  const pg = {
+    query: jest.fn(),
+    getClient: jest.fn().mockResolvedValue({ query: clientQuery, release }),
+  };
   const versions = {
     getState: jest.fn(),
     createDraft: jest.fn(),
     publish: jest.fn(),
   };
   const service = new (AgentsService as any)(pg, versions);
-  return { service, pg, versions };
+  return { service, pg, versions, clientQuery, release };
 }
 
 describe('AgentsService.upsertAgent', () => {
@@ -59,7 +64,7 @@ describe('AgentsService.upsertAgent', () => {
     versions.publish.mockResolvedValue({});
 
     await service.upsertAgent(
-      { id: 12, system_prompt: 'new', description: 'description' },
+      { id: 12, name: 'roman', system_prompt: 'new', description: 'description' },
       'admin-1',
     );
 
@@ -109,38 +114,41 @@ describe('AgentsService.upsertAgent', () => {
     expect(versions.createDraft).toHaveBeenCalledWith('admin-1', 12, expect.any(Object));
   });
 
-  it('inserts a new agent and its published v1 without draft or publish calls', async () => {
-    const { service, pg, versions } = makeService();
-    const agent = { id: 42, name: 'new-agent', system_prompt: 'prompt', description: 'description' };
+  it('inserts a new agent and its published v1 on one transactional client', async () => {
+    const { service, pg, versions, clientQuery, release } = makeService();
+    const agent = { id: 42, name: 'new-agent', system_prompt: 'prompt', description: '' };
     pg.query
       .mockResolvedValueOnce({ rows: [] })
-      .mockResolvedValueOnce({ rows: [] })
-      .mockResolvedValueOnce({ rows: [agent] })
       .mockResolvedValueOnce({ rows: [] });
+    clientQuery.mockImplementation(async (sql: string) => ({
+      rows: /INSERT INTO agents/i.test(sql) ? [agent] : [],
+    }));
 
     await expect(service.upsertAgent({
       'agent-id': 42,
       name: 'new-agent',
       system_prompt: 'prompt',
-      description: 'description',
     }, 'admin-1')).resolves.toEqual(agent);
 
-    expect(pg.query).toHaveBeenCalledTimes(4);
-    const agentInsert = pg.query.mock.calls[2];
-    expect(agentInsert[0]).toMatch(/INSERT INTO agents/i);
+    expect(pg.query).toHaveBeenCalledTimes(2);
+    expect(pg.getClient).toHaveBeenCalledTimes(1);
+    expect(clientQuery.mock.calls[0][0]).toBe('BEGIN');
+    expect(clientQuery.mock.calls.at(-1)[0]).toBe('COMMIT');
+    expect(release).toHaveBeenCalledWith();
+    const agentInsert = clientQuery.mock.calls.find(([sql]) => /INSERT INTO agents/i.test(sql));
     expect(agentInsert[0]).toContain("COALESCE($4, nextval('agents_id_seq'))");
     expect(agentInsert[0]).toMatch(/RETURNING \*/i);
-    expect(agentInsert[1]).toEqual(['new-agent', 'prompt', 'description', 42]);
-    const versionInsert = pg.query.mock.calls[3];
-    expect(versionInsert[0]).toMatch(/INSERT INTO agent_versions/i);
+    expect(agentInsert[1]).toEqual(['new-agent', 'prompt', '', 42]);
+    expect(clientQuery.mock.calls.some(([sql]) => /SELECT setval\(/i.test(sql))).toBe(true);
+    const versionInsert = clientQuery.mock.calls.find(([sql]) => /INSERT INTO agent_versions/i.test(sql));
     expect(versionInsert[0]).toMatch(/'published'/i);
     expect(versionInsert[0]).toMatch(/published_at/i);
     expect(versionInsert[0]).toMatch(/published_by/i);
-    expect(versionInsert[1]).toEqual([42, 'description', 'prompt', 'admin-1']);
+    expect(versionInsert[1]).toEqual([42, '', 'prompt', 'admin-1']);
     expect(versions.getState).not.toHaveBeenCalled();
     expect(versions.createDraft).not.toHaveBeenCalled();
     expect(versions.publish).not.toHaveBeenCalled();
-    expect(pg.query.mock.calls.some(([sql]) => /UPDATE\s+agents/i.test(sql))).toBe(false);
+    expect(clientQuery.mock.calls.some(([sql]) => /UPDATE\s+agents/i.test(sql))).toBe(false);
   });
 
   it.each([
