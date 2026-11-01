@@ -1729,7 +1729,11 @@ SHA=$(git rev-parse HEAD) && test -n "$SHA" && git push -q origin feat/shorts-do
   });
 ```
 
-`src/shorts/shorts.integration.spec.ts`, тест `'list: тонкий SELECT …'`: в `insert({…})` после строки `recoveries: JSON.stringify(…),` (задача 2) добавить `omni_base: 16,`.
+`src/shorts/shorts.integration.spec.ts`, тест `'list: тонкий SELECT …'`: в `insert({…})` после строки `recoveries: JSON.stringify(…),` (задача 2) добавить `omni_base: 16,`; над строкой `failed_code: 'код-тест', …` — комментарий `// jsonb-массив — строкой (JSON.stringify): помощник отдаёт массивы как есть, node-pg сделал бы из них массив Postgres.`; после строки `expected.publications = [];` — самопроверку фикстуры (тест сравнивает `rowToShort` с `rowToShort`: если обе стороны скатятся в запасные значения, поля совпадут вхолостую):
+
+```ts
+    expect([expected.failedCode, expected.autoRecoveries, expected.recoveries.length, expected.omniBase]).toEqual(['код-тест', 2, 1, 16]);
+```
 
 `src/shorts/shorts.contract.spec.ts`, тест `'очередь студии — те же статусы и колонки'`: после `'failed_code',` (задача 4) добавить `'omni_base',`.
 

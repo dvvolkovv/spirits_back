@@ -281,7 +281,9 @@
   - `failed_code text` — код последнего сбоя;
   - `auto_recoveries int not null default 0` — самопочинки текущего круга;
   - `recoveries jsonb not null default '[]'` — история:
-    `[{at, from, code, action}]`, не обнуляется.
+    `[{at, from, code, action, delayMin?, reason}]`, не обнуляется;
+  - `omni_base int not null default 0` — секунды Omni на начало круга владельца
+    (решение 01.11, «Предел Omni — на круг владельца»).
 
 ### Админка
 
