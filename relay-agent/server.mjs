@@ -17,6 +17,7 @@ import { LINKEON_TOOLS, linkeonServer, bearerServer } from "./linkeon-mcp.mjs";
 import { sessionMcpConfigName, sweepStaleSessionMcpConfigs, ensureMcpConfigDir, removeLiveConfigs } from "./session-mcp-config.mjs";
 import { snapshotDir, changedFiles } from "./turn-files.mjs";
 import { agentTestMode, cliToolArgs } from "./agent-test-mode.mjs";
+import { createDrainGate } from "./drain-gate.mjs";
 
 const app = express();
 const PORT = 3033;
@@ -429,7 +430,7 @@ const PRODUCTS_PROMPT = `
 Когда его звать, сказано в инструкциях ассистента ниже. НЕ передавай в него userId/телефон.
 `;
 
-app.post("/chat", upload.array("files", 10), (req, res) => {
+app.post("/chat", createDrainGate(), upload.array("files", 10), (req, res) => {
   const { message, sessionId: reqSessionId } = req.body;
   const reqTestMode = agentTestMode(req.body);
   // Модель хода. По умолчанию "default" (рекомендуемая CLI — сейчас Opus 5).

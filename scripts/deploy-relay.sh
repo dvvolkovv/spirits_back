@@ -12,6 +12,8 @@ fi
 BASE_SHA=$1
 TARGET_SHA=$2
 RELAY_HOST=${RELAY_HOST:-dv@5.101.115.184}
+DRAIN_FILE=${RELAY_DRAIN_FILE:-/tmp/linkeon-relay-drain}
+DRAIN_WAIT_SECONDS=${DRAIN_WAIT_SECONDS:-1800}
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
@@ -64,8 +66,88 @@ ssh -o BatchMode=yes "$RELAY_HOST" "rm -rf ~/$STAGE ~/$BASE_DIR && mkdir ~/$STAG
 git archive "$TARGET_SHA" relay-agent | ssh -o BatchMode=yes "$RELAY_HOST" "tar -x -C ~/$STAGE --strip-components=1"
 git archive "$BASE_SHA" relay-agent | ssh -o BatchMode=yes "$RELAY_HOST" "tar -x -C ~/$BASE_DIR --strip-components=1"
 
-ssh -o BatchMode=yes "$RELAY_HOST" "STAGE=$STAGE BASE_DIR=$BASE_DIR TARGET_SHORT=$TARGET_SHORT FILES_CSV=$FILES_CSV PUT_CSV=$PUT_CSV DEL_CSV=$DEL_CSV ADD_CSV=$ADD_CSV bash -s" <<'REMOTE'
+ssh -o BatchMode=yes "$RELAY_HOST" "STAGE=$STAGE BASE_DIR=$BASE_DIR TARGET_SHORT=$TARGET_SHORT FILES_CSV=$FILES_CSV PUT_CSV=$PUT_CSV DEL_CSV=$DEL_CSV ADD_CSV=$ADD_CSV DRAIN_FILE=$DRAIN_FILE DRAIN_WAIT_SECONDS=$DRAIN_WAIT_SECONDS bash -s" <<'REMOTE'
 set -euo pipefail
+DRAIN_FILE=${DRAIN_FILE:-/tmp/linkeon-relay-drain}
+DRAIN_WAIT_SECONDS=${DRAIN_WAIT_SECONDS:-1800}
+GATE_CREATED=0
+REPLACED=0
+
+if [[ -e "$DRAIN_FILE" ]]; then
+  echo "Drain marker уже существует — другой выкат или аварийный drain ещё активен" >&2
+  exit 1
+fi
+
+health_and_release() {
+  for attempt in $(seq 1 20); do
+    if curl -fsS --max-time 5 http://127.0.0.1:3033/health; then
+      rm -f -- "$DRAIN_FILE"
+      GATE_CREATED=0
+      printf '\nhealth OK, drain снят\n'
+      return 0
+    fi
+    sleep 1
+  done
+  echo "health не прошёл, drain marker сохранён" >&2
+  return 1
+}
+
+restore_previous() {
+  cd ~/file-agent
+  IFS=',' read -ra PUT <<< "$PUT_CSV"
+  for file in "${PUT[@]}"; do
+    [[ -n "$file" ]] || continue
+    if [[ ",$ADD_CSV," == *",$file,"* ]]; then
+      rm -f -- "$file"
+    else
+      cp ~/"$BASE_DIR"/"$file" ".$file.rollback.tmp"
+      mv ".$file.rollback.tmp" "$file"
+    fi
+  done
+  if [[ -n "$DEL_CSV" ]]; then
+    IFS=',' read -ra DEL <<< "$DEL_CSV"
+    for file in "${DEL[@]}"; do
+      cp ~/"$BASE_DIR"/"$file" ".$file.rollback.tmp"
+      mv ".$file.rollback.tmp" "$file"
+    done
+  fi
+  grep -ohE 'from "\./[^"]+"' *.mjs | cut -d'"' -f2 | sort -u | while read -r module; do
+    [[ -f "$module" ]] || { echo "При откате нет локального импорта $module" >&2; exit 1; }
+  done
+  git add -A -- "${FILES[@]}"
+  git commit -q -m "rollback relay-agent к $BASE_DIR"
+  pm2 restart file-agent >/dev/null
+}
+
+finish_rollout() {
+  local status=$?
+  trap - EXIT
+  if [[ "$GATE_CREATED" -eq 0 ]]; then
+    exit "$status"
+  fi
+
+  if [[ "$status" -eq 0 ]] && health_and_release; then
+    echo "relay-agent $TARGET_SHORT выкачен, admission открыт"
+    exit 0
+  fi
+
+  if [[ "$REPLACED" -eq 1 ]]; then
+    echo "Откат прежнего дерева при закрытом admission" >&2
+    restore_previous
+  fi
+
+  if health_and_release; then
+    echo "Прежнее дерево работает, admission открыт" >&2
+  else
+    echo "КРИТИЧНО: rollback health не прошёл, admission остаётся закрытым" >&2
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    exit 1
+  fi
+  exit "$status"
+}
+trap finish_rollout EXIT
+
 cd ~/"$STAGE"
 ln -s ~/file-agent/node_modules node_modules
 for file in *.mjs; do
@@ -91,16 +173,28 @@ for file in "${FILES[@]}"; do
   fi
 done
 
+( umask 077; printf '%s\n' "$TARGET_SHORT" > "$DRAIN_FILE.tmp.$$" && mv "$DRAIN_FILE.tmp.$$" "$DRAIN_FILE" )
+GATE_CREATED=1
+
 PID=$(pm2 pid file-agent)
 if [[ ! "$PID" =~ ^[1-9][0-9]*$ ]]; then
   echo "PM2 file-agent не запущен (pid=$PID) — рестарт невозможен" >&2
   exit 1
 fi
-if ps --ppid "$PID" -o pid= | grep -q .; then
-  echo "У file-agent есть живые ходы — ничего не заменено, повторить после их завершения" >&2
-  exit 1
-fi
+DRAIN_STARTED=$SECONDS
+while true; do
+  CHILDREN=$(ps --ppid "$PID" -o pid=)
+  if ! grep -q . <<< "$CHILDREN"; then
+    break
+  fi
+  if (( SECONDS - DRAIN_STARTED >= DRAIN_WAIT_SECONDS )); then
+    echo "Живые ходы не завершились за $DRAIN_WAIT_SECONDS с — замена отменена" >&2
+    exit 1
+  fi
+  sleep 5
+done
 
+REPLACED=1
 IFS=',' read -ra PUT <<< "$PUT_CSV"
 for file in "${PUT[@]}"; do
   [[ -n "$file" ]] || continue
@@ -122,15 +216,4 @@ git add -A -- "${FILES[@]}"
 git commit -q -m "relay-agent из spirits_back $TARGET_SHORT"
 git log --oneline -1
 pm2 restart file-agent >/dev/null
-
-for attempt in $(seq 1 20); do
-  if curl -fsS --max-time 5 http://127.0.0.1:3033/health; then
-    printf '\nrelay-agent %s: health OK\n' "$TARGET_SHORT"
-    exit 0
-  fi
-  sleep 1
-done
-
-echo "relay-agent не прошёл /health после рестарта" >&2
-exit 1
 REMOTE
