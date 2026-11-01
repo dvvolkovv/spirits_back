@@ -97,7 +97,7 @@ async function request(method, path, { token, body, headers = {}, timeout = CALL
     try {
       payload = JSON.parse(text);
     } catch {
-      if (response.ok) throw new Error(`${method} ${path}: ответ не JSON`);
+      payload = text;
     }
   }
   return { status: response.status, body: payload };
