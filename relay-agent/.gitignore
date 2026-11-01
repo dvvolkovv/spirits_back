@@ -4,6 +4,11 @@
 # 69 МБ, ставятся из package-lock.json.
 node_modules/
 
+sessions.json
+server.mjs.regression-*
+empty-mcp.json
+*.bak-mcp-*
+
 # Ручные бэкапы: их заменяет история git.
 *.bak
 *.bak.*
