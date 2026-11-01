@@ -104,7 +104,9 @@ export class ShortsWriterService {
     // переписки: сравнивать «то же или нет» надо с тем, что Omni не озвучил.
     // Вид сценки из базы проверяется: испорченное значение — обычная переписка, а не TypeError.
     const fixKind: SkitKind | null =
-      skitFormat && v.skitFeedback && SKIT_KINDS.includes(v.skitFeedback.kind) && conflict && acceptedPunchline ? v.skitFeedback.kind : null;
+      skitFormat && v.skitFeedback && SKIT_KINDS.includes(v.skitFeedback.kind) && v.script?.skits?.[v.skitFeedback.kind] && conflict && acceptedPunchline
+        ? v.skitFeedback.kind
+        : null;
     const fixBase: Record<SkitKind, Skit> | null = fixKind ? { conflict: conflict!, punchline: acceptedPunchline! } : null;
     if (fixKind) this.logger.log(`ролик ${v.id}: отзыв студии о сценке ${fixKind} — переписываю её реплики и действие`);
     else if (skitFormat && v.skitFeedback) this.logger.warn(`ролик ${v.id}: отзыв студии о сценке не применить (${JSON.stringify(v.skitFeedback).slice(0, 200)}) — обычная переписка`);
