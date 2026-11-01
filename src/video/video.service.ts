@@ -11,7 +11,7 @@ import { VeoService } from '../misc/veo.service';
 import {
   CreateVideoJobDto, VideoJobRow, ComposedPlan, VideoModel,
   isVeoModel, computeVeoQuote, computeVeoConcatQuote, computeOwnVoiceSurcharge,
-  needsVeoConcat, VEO_BASE_SEC, VEO_EXTEND_SEC,
+  needsVeoConcat, buildsVeoByConcat, VEO_BASE_SEC, VEO_EXTEND_SEC,
 } from './video.dto';
 import { VoiceAvatarService } from '../voice-avatar/voice-avatar.service';
 import { jobCostRefunded } from './job-refund';
@@ -661,7 +661,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  private buildVeoSegmentPrompts(prompt: string, segments: number): string[] {
+  private buildVeoSegmentPrompts(prompt: string, segments: number, concat = false): string[] {
     const clean = String(prompt || '').trim();
     if (segments <= 1) return [clean];
 
@@ -674,6 +674,14 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       if (q) quotes.push(q);
     }
     if (quotes.length === 0) {
+      // В склейке клип — независимая генерация, предыдущего кадра у неё нет:
+      // голое «продолжи сцену» дало бы клип про что угодно. Каждый клип несёт
+      // всё описание и номер своей части.
+      if (concat) {
+        return Array.from({ length: segments }, (_, i) => (i === 0
+          ? clean
+          : `${clean}\n\nPart ${i + 1} of ${segments} of one continuous scene: continue the same action from where the previous part ended — the same characters, the same setting and lighting; do not restart the action.`));
+      }
       // Нет реплики в кавычках — база несёт всё, хвосты продолжают без речи.
       const out = [clean];
       for (let i = 1; i < segments; i++) out.push(this.veoContinuationPrompt());
@@ -778,8 +786,13 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     // ручной склейки — фидбэк katya): вертикаль длиннее 8с и горизонталь, чья
     // цепочка не помещается в 40с Omni, см. needsVeoConcat. Каждый клип —
     // полная база (цена N×base). Остальное идёт прежним путём (база + extend).
-    const veoConcat = needsVeoConcat(aspectRatio, target);
-    const quote = veoConcat ? computeVeoConcatQuote(model, target) : computeVeoQuote(model, target);
+    // Цена и способ сборки разведены: пока продление Omni сломано Google
+    // (OMNI_EXTEND_WORKS, 01.11.2026), горизонталь длиннее 8с собирается
+    // склейкой, но человек платит прежнюю цену цепочки.
+    const priceByConcat = needsVeoConcat(aspectRatio, target);
+    const veoConcat = buildsVeoByConcat(aspectRatio, target);
+    const quote = priceByConcat ? computeVeoConcatQuote(model, target) : computeVeoQuote(model, target);
+    const segments = veoConcat ? computeVeoConcatQuote(model, target).segments : quote.segments;
     let cost = quote.totalCost;
 
     // «Голосом оригинала» (96cba3f7): только при готовом клоне у юзера; добавляем
@@ -805,10 +818,11 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     // поэтому 1080p в ней возможен ТОЛЬКО для односегментных роликов (≤8с). В
     // concat-режиме каждый клип — независимая база (extend нет), значит 1080p
     // доступен на любой длине — что ещё и помогает с «пластиковой» текстурой
-    // (фидбэк katya #4).
-    const effectiveResolution: '720p' | '1080p' = veoConcat
+    // (фидбэк katya #4). Склейка по цене цепочки (продление сломано) — в 720p,
+    // как была бы цепочка: при той же цене та же себестоимость.
+    const effectiveResolution: '720p' | '1080p' = priceByConcat
       ? resolution
-      : (quote.segments > 1 ? '720p' : resolution);
+      : (segments > 1 ? '720p' : resolution);
 
     // До 3 референс-фото (Veo Ingredients) — сходство лица сильно лучше с
     // несколькими ракурсами (фидбэк katya: «нужно минимум 3 фото»).
@@ -858,10 +872,10 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       prompt = `${prompt} VOICE DIRECTION (the narrator must speak in this voice): ${voiceDirection}`;
     }
 
-    const segmentPrompts = this.buildVeoSegmentPrompts(prompt, quote.segments);
+    const segmentPrompts = this.buildVeoSegmentPrompts(prompt, segments, veoConcat);
     const plan: ComposedPlan = {
       target_duration_sec: target,
-      segments_total: quote.segments,
+      segments_total: segments,
       segments_done: 0,
       segment_kling_video_ids: [],
       segment_video_urls: [],
@@ -994,7 +1008,13 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       const st = await this.veo.getOperation(job.kling_task_id);
       if (!st.done) return;
       if (st.error || !st.video) {
-        const err = st.error ?? 'no video';
+        let err = st.error ?? 'no video';
+        // У шага продления INVALID_ARGUMENT — не фильтр: так Google отвечает на
+        // любое продление с 01.11.2026 (см. OMNI_EXTEND_WORKS), и совет
+        // переформулировать описание человека только путает.
+        if (st.code === 'INVALID_ARGUMENT' && !plan.veo_concat && plan.segments_done > 0) {
+          err = 'Omni не смог продлить ролик — это сбой продления на стороне Google, а не фильтр: описание менять не нужно, токены возвращены.';
+        }
         // Транзиентная ошибка рендеринга Google: операция принята (generate/
         // extend вернули ok), но рендер упал с "internal server issue"/5xx и
         // Google просит повторить. Переотправляем ТОТ ЖЕ сегмент, а не валим всю
@@ -1114,7 +1134,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
           [url, thumbUrl, job.id],
         );
         this.cleanupVeoParts(job.id);
-        this.logger.log(`Veo job ${job.id} ready (concat ${plan.segments_total}×8s vertical, ${plan.target_duration_sec}s): ${url}`);
+        this.logger.log(`Veo job ${job.id} ready (concat ${plan.segments_total}×8s ${plan.veo_aspect_ratio ?? '9:16'}, ${plan.target_duration_sec}s): ${url}`);
       } catch (e: any) {
         this.logger.error(`Veo job ${job.id} concat failed: ${e.message}`);
         await this.failAndRefund(job.id, job.user_id, Number(job.tokens_spent), `veo_concat: ${String(e.message).slice(0, 200)}`);

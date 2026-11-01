@@ -131,7 +131,7 @@ describe('createJob на Omni', () => {
   ] as const)('склейка %s, %i с без реплики в кавычках — описание сцены в каждом клипе', async (aspectRatio, targetDurationSec) => {
     const startGenerate = jest.fn(async () => 'v1_clip0');
     const { svc, queries } = makeService({ startGenerate });
-    const scene = 'Видео: первобытный человек высекает искру кремнём в тёмной пещере, крупный план';
+    const scene = 'Сцена: первобытный человек высекает искру кремнём в тёмной пещере, камера медленно приближается';
     await svc.createJob('u1', { mode: 'text2video', prompt: scene, aspectRatio, targetDurationSec });
 
     const prompts: string[] = insertedPlan(queries).veo_segment_prompts;
