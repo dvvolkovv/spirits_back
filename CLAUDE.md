@@ -156,7 +156,7 @@ bash ~/Downloads/spirits_back/scripts/deploy.sh
 bash scripts/deploy-relay.sh <BASE_SHA> <TARGET_SHA>
 ```
 
-Скрипт следует существующему relay-раннбуку: staging из точных SHA, syntax-check и все relay-тесты, запрет перезаписи несогласованных живых правок, рестарт без `--update-env`, затем `/health`. Перед drain он создаёт `/tmp/linkeon-relay-drain`; relay проверяет его на каждом `/chat` и отклоняет новые ходы, а `/health` продолжает работать. Marker держится до успешного health; при сбое прежнее дерево восстанавливается и проходит rollback health до снятия marker. Если rollback не удался, admission остаётся закрытым. Подробности — `relay-agent/README.md`. Нельзя считать выкат завершённым по одному backend smoke: старый релей останется незамеченным без отдельной фазы.
+Скрипт следует существующему relay-раннбуку: staging из точных SHA, syntax-check и все relay-тесты, запрет перезаписи несогласованных живых правок, рестарт без `--update-env`, затем `/health`. Весь rollout сериализуется `flock` на `/tmp/linkeon-relay-deploy.lock`; второй процесс останавливается до изменений. Перед drain создаётся `/tmp/linkeon-relay-drain`; relay отклоняет новые `/chat`, а `/health` продолжает работать и отдаёт `inflight` — счётчик принятых запросов до response `finish`/`close`. До замены ждут нуля и этот счётчик (включая multer upload без child), и PM2 children. Marker держится до успешного health; при сбое прежнее дерево восстанавливается и проходит rollback health до снятия marker. Если rollback не удался, admission остаётся закрытым. Подробности — `relay-agent/README.md`. Нельзя считать выкат завершённым по одному backend smoke: старый релей останется незамеченным без отдельной фазы.
 
 ### Тестовый сервер
 
