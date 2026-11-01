@@ -498,6 +498,7 @@ describe('AgentVersionsService.testVersion', () => {
     ...live,
     id: '22222222-2222-2222-2222-222222222222',
     version: 2,
+    description: 'DRAFT DESCRIPTION',
     system_prompt: 'DRAFT SYSTEM PROMPT',
     status: 'draft',
     published_at: null,
@@ -570,6 +571,7 @@ describe('AgentVersionsService.testVersion', () => {
       'check the draft',
       first.session_id,
       {
+        descriptionOverride: 'DRAFT DESCRIPTION',
         systemPromptOverride: 'DRAFT SYSTEM PROMPT',
         includeUserContext: false,
         linkeonTools: false,

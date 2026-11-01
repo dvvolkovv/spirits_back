@@ -12,7 +12,7 @@ const LIVE_AGENT = {
   id: 12,
   name: 'Роман',
   display_name: 'Роман',
-  description: '',
+  description: 'LIVE DESCRIPTION',
   system_prompt: 'LIVE SYSTEM PROMPT',
   category: 'business',
 };
@@ -69,7 +69,7 @@ function replyHarness(events: any[] = [
   const post = axios.post as jest.Mock;
   post.mockImplementation(async () => ({ data: sseStream(events) }));
   const lastFields = () => fieldsOf(post.mock.calls[post.mock.calls.length - 1][1]);
-  return { service, pg, neo4j, businessProfile, post, lastFields };
+  return { service, pg, neo4j, businessProfile, language, post, lastFields };
 }
 
 beforeEach(() => jest.clearAllMocks());
@@ -131,6 +131,43 @@ describe('agentReply: isolated agent version test', () => {
     expect(log.mock.calls.map(([line]) => String(line)).join('\n')).not.toContain('billing[voice]');
   });
 
+  it('uses the requested test language without reading language or profile data', async () => {
+    const h = replyHarness();
+
+    await h.service.generateAgentReplyWithCharge(
+      'admin',
+      '12',
+      'check in English',
+      'agent_test_signed_session',
+      { ...testOpts, testLanguage: 'en-US' },
+    );
+
+    const fields = h.lastFields();
+    expect(fields.systemPrompt).toContain('English (английском)');
+    expect(fields.systemPrompt).toContain('Reply in English.');
+    expect(fields.message).toContain('Reply in English.');
+    expect(h.language.resolveUserLanguage).not.toHaveBeenCalled();
+    expect(
+      h.pg.query.mock.calls.some(([sql]) => /profile_data/i.test(sql)),
+    ).toBe(false);
+  });
+
+  it('uses the draft description instead of the live agent description', async () => {
+    const h = replyHarness();
+
+    await h.service.generateAgentReplyWithCharge(
+      'admin',
+      '12',
+      'check the draft',
+      'agent_test_signed_session',
+      { ...testOpts, descriptionOverride: 'DRAFT DESCRIPTION' },
+    );
+
+    const fields = h.lastFields();
+    expect(fields.systemPrompt).toContain('— DRAFT DESCRIPTION');
+    expect(fields.systemPrompt).not.toContain('— LIVE DESCRIPTION');
+  });
+
   it('neutralizes @path expansion in both complete prompt fields only in strict test mode', async () => {
     const h = replyHarness();
 
@@ -168,6 +205,8 @@ describe('agentReply: isolated agent version test', () => {
     expect(fields.systemPrompt).toContain('LIVE BUSINESS PROFILE');
     expect(h.neo4j.getProfileDescription).toHaveBeenCalledWith('user');
     expect(h.businessProfile.renderForPrompt).toHaveBeenCalledWith('user', 'business');
+    expect(h.language.resolveUserLanguage).toHaveBeenCalledTimes(1);
+    expect(h.language.resolveUserLanguage).toHaveBeenCalledWith('user');
   });
 
   it.each([
