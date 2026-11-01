@@ -71,7 +71,7 @@ esac
 
   const harness = path.join(work, 'remote.sh');
   write(harness, remote[1]);
-  const result = spawnSync('bash', [harness], {
+  const result = spawnSync('bash', [...(process.env.DEBUG_ROLLOUT ? ['-x'] : []), harness], {
     encoding: 'utf8',
     env: {
       ...process.env,
