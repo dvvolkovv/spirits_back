@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** сценку, которую Omni не может снять с этими репликами (одну и ту же реплику дважды не услышали, или фильтр Google трижды отказал), студия не роняет в «Упал», а возвращает сценаристу с разбором — тот переписывает реплики и действие только этой сценки, кадр и вторая сценка остаются.
+**Goal:** сценку, которую Omni не может снять с этими репликами (два клипа с одним текстом сценки не прошли сверку речи, или фильтр Google трижды отказал), студия не роняет в «Упал», а возвращает сценаристу с разбором — тот переписывает реплики и действие только этой сценки, кадр и вторая сценка остаются.
 
-**Architecture:** студия (`studio/`) после второго промаха речи на одном тексте (или трёх отказов фильтра) бросает `SkitFeedbackError` с разбором (`SkitFeedback`: сценка, код, номера реплик, услышанное, причина) и пояснением для сценариста; места на пересъёмку нет — `omni_budget`, как раньше. `failJob` пишет ролик в `writing` с `writer_feedback` (текст) и новой колонкой `skit_feedback` (разбор), пока кругов сценариста меньше `MAX_WRITER_ROUNDS`. Сценарист (`shorts-writer.service.ts`) при `skitFeedback` берёт из ответа только `lines` и `action` названной сценки, остальное — из принятой (отпечаток кадра не меняется). Спека: `docs/superpowers/specs/2026-10-31-shorts-self-healing-design.md`, «Очередь 2 → Студия: два промаха — сценаристу», «Сценарист по отзыву студии о сценке», «Данные». Доктор упавших — план 2б.
+**Architecture:** студия (`studio/`) после второго клипа с одним текстом сценки, не прошедшего сверку речи (или трёх отказов фильтра), бросает `SkitFeedbackError` с разбором (`SkitFeedback`: сценка, код, номера реплик, услышанное, причина) и пояснением для сценариста; места на пересъёмку нет — `omni_budget`, как раньше. `failJob` пишет ролик в `writing` с `writer_feedback` (текст) и новой колонкой `skit_feedback` (разбор), пока кругов сценариста меньше `MAX_WRITER_ROUNDS`. Сценарист (`shorts-writer.service.ts`) при `skitFeedback` берёт из ответа только `lines` и `action` названной сценки, остальное — из принятой (отпечаток кадра не меняется). Спека: `docs/superpowers/specs/2026-10-31-shorts-self-healing-design.md`, «Очередь 2 → Студия: два промаха — сценаристу», «Сценарист по отзыву студии о сценке», «Данные». Доктор упавших — план 2б.
 
 **Tech Stack:** NestJS 10 + Postgres (jest, ts-jest `isolatedModules`, `strictNullChecks: false`); студия — TypeScript ESM, `tsx --test`, ffmpeg в тестах оживления; прогоны — на тестовой ноде через `studio/scripts/node-run.sh`.
 
@@ -213,14 +213,14 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.types.spec
 ```ts
 /**
  * Отзыв студии о сценке, которую Omni не снять с этими репликами (skit_feedback):
- * одну и ту же реплику дважды не услышали или фильтр Google трижды отказал.
- * Сценарист переписывает реплики и действие только этой сценки. Зеркало SkitFeedback
- * студии (studio/src/types.ts), пояснение для сценариста — в writer_feedback.
+ * два клипа с одним текстом сценки не прошли сверку речи или фильтр Google трижды
+ * отказал. Сценарист переписывает реплики и действие только этой сценки. Зеркало
+ * SkitFeedback студии (studio/src/types.ts), пояснение для сценариста — в writer_feedback.
  */
 export interface ShortSkitFeedback {
   kind: SkitKind;
   code: 'speech_mismatch' | 'omni_rejected';
-  /** Номера реплик (с 1), которых не услышали в последнем клипе, — у speech_mismatch. */
+  /** Номера реплик (с 1), которых не услышали в последнем клипе, — у speech_mismatch; пусто, если речь не сошлась по доле слов, а не по репликам. */
   lines: number[];
   /** Что распознал SpeechKit в последнем клипе — у speech_mismatch. */
   heard: string | null;
@@ -257,6 +257,8 @@ export interface ShortSkitFeedback {
     skitFeedback: row.skit_feedback ?? null,
 ```
 
+В шапке файла заменить ` * Поля jsonb (`scene`, `capture`, `script`, `animation`) пишут две стороны:` на ` * Поля jsonb (`scene`, `capture`, `script`, `animation`, `skit_feedback`) пишут две стороны:` и ` * API — сцену и сценарий, студия (`studio/`) — съёмку и оживление. Их форма —` на ` * API — сцену и сценарий, студия (`studio/`) — съёмку, оживление и отзыв о сценке. Их форма —`.
+
 - [ ] **Step 4: Закоммитить и прогнать**
 
 ```bash
@@ -282,7 +284,7 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.types.spec
 
 ```ts
   const STUDIO_ABOUT_PUNCHLINE = {
-    writer_feedback: 'сценка 2 (развязка): Omni дважды не озвучил реплику 2 (galina): «Га-га… ладно.», услышано: «нормальный износ не повреждение залог верните». Перепиши реплики и действие этой сценки.',
+    writer_feedback: 'сценка 2 (развязка): 2 клипа с этими репликами не прошли сверку речи; в последнем не услышаны: реплика 2 (galina) «Га-га… ладно.», услышано: «нормальный износ не повреждение залог верните». Перепиши реплики и действие этой сценки.',
     skit_feedback: { kind: 'punchline', code: 'speech_mismatch', lines: [2], heard: 'нормальный износ не повреждение залог верните', reason: null },
   };
 
@@ -297,7 +299,7 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.types.spec
     };
     const { svc, pg, relay } = setup([{ ...SKIT_GOOD, punchline: fresh }]);
     await svc.write(skitVideo({ ...STUDIO_ABOUT_PUNCHLINE, script: { hook: 'Старая', voice: 'madirus', speed: 1.1, lines: [], final: { assistantsCount: 18 }, skits: accepted } }));
-    expect(relay.ask.mock.calls[0][1]).toContain('Студия: сценка 2 (развязка): Omni дважды не озвучил реплику 2');
+    expect(relay.ask.mock.calls[0][1]).toContain('Студия: сценка 2 (развязка): 2 клипа с этими репликами не прошли сверку речи');
     const [sql, params] = pg.query.mock.calls[0] as any[];
     expect(sql).toMatch(/skit_feedback = NULL/);
     const script = JSON.parse(params[1]);
@@ -388,7 +390,7 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-writer.ser
 
 В `src/shorts/shorts-writer.service.ts`:
 
-1. Импорт правил — заменить строку
+1. Импорты — заменить строку
 
 ```ts
 import { WriterCaptions, checkScriptRules, checkSkitRules } from './short-rules';
@@ -398,6 +400,18 @@ import { WriterCaptions, checkScriptRules, checkSkitRules } from './short-rules'
 
 ```ts
 import { SKIT_LABELS, WriterCaptions, checkScriptRules, checkSkitRules } from './short-rules';
+```
+
+и строку
+
+```ts
+import { Skit, SkitKind, SkitPlan, planSkits } from './short-skit-prompts';
+```
+
+на
+
+```ts
+import { SKIT_KINDS, Skit, SkitKind, SkitPlan, planSkits } from './short-skit-prompts';
 ```
 
 2. Сразу после функции `recapturesInRow` (перед `@Injectable()`) вставить:
@@ -436,7 +450,9 @@ function studioRewriteViolation(kind: SkitKind, accepted: Skit, fresh: Skit | nu
     // Отзыв студии о сценке: Omni её не снять с этими репликами. Переписываются только
     // реплики и действие названной сценки, база — принятые сценки, а не варианты кругов
     // переписки: сравнивать «то же или нет» надо с тем, что Omni не озвучил.
-    const fixKind: SkitKind | null = skitFormat && v.skitFeedback && conflict && acceptedPunchline ? v.skitFeedback.kind : null;
+    // Вид сценки из базы проверяется: испорченное значение — обычная переписка, а не TypeError.
+    const fixKind: SkitKind | null =
+      skitFormat && v.skitFeedback && SKIT_KINDS.includes(v.skitFeedback.kind) && conflict && acceptedPunchline ? v.skitFeedback.kind : null;
     const fixBase: Record<SkitKind, Skit> | null = fixKind ? { conflict: conflict!, punchline: acceptedPunchline! } : null;
 ```
 
@@ -665,7 +681,7 @@ test('два несовпадения речи на одном тексте — 
 В конец файла:
 
 ```ts
-test('реплику дважды не услышали — сценаристу: отзыв с номером реплики и услышанным, третий клип не снимается', { timeout: 120_000 }, async () => {
+test('два клипа с одним текстом не прошли сверку речи — сценаристу: отзыв с номером реплики и услышанным, третий клип не снимается', { timeout: 120_000 }, async () => {
   const env = setup();
   const heard = 'три года нормальный износ';
   const { deps, calls } = fakes(env, { heard: (kind) => (kind === 'punchline' ? heard : LINES[kind].join(' ')) });
@@ -674,7 +690,7 @@ test('реплику дважды не услышали — сценаристу
     assert.equal(e.code, 'speech_mismatch');
     assert.equal(e.retryable, false);
     assert.deepEqual(e.feedback, { kind: 'punchline', code: 'speech_mismatch', lines: [2], heard, reason: null });
-    assert.match(e.writerText, /^сценка 2 \(развязка\): Omni дважды не озвучил реплику 2 \(kesha\): «Га-га… ладно\.», услышано: «три года нормальный износ»\./);
+    assert.match(e.writerText, /^сценка 2 \(развязка\): 2 клипа с этими репликами не прошли сверку речи; в последнем не услышаны: реплика 2 \(kesha\) «Га-га… ладно\.», услышано: «три года нормальный износ»\./);
     assert.match(e.writerText, /место, начало и героев не меняй/);
     return true;
   });
@@ -742,14 +758,14 @@ studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts"
 
 /**
  * Отзыв студии о сценке, которую Omni не снять с этими репликами (skit_feedback):
- * одну и ту же реплику дважды не услышали или фильтр Google трижды отказал.
- * Сценарист переписывает реплики и действие только этой сценки. Зеркало
+ * два клипа с одним текстом сценки не прошли сверку речи или фильтр Google трижды
+ * отказал. Сценарист переписывает реплики и действие только этой сценки. Зеркало
  * ShortSkitFeedback бэкенда; пояснение для сценариста — в writer_feedback.
  */
 export interface SkitFeedback {
   kind: SkitKind;
   code: 'speech_mismatch' | 'omni_rejected';
-  /** Номера реплик (с 1), которых не услышали в последнем клипе, — у speech_mismatch. */
+  /** Номера реплик (с 1), которых не услышали в последнем клипе, — у speech_mismatch; пусто, если речь не сошлась по доле слов, а не по репликам. */
   lines: number[];
   /** Что распознал SpeechKit в последнем клипе — у speech_mismatch. */
   heard: string | null;
@@ -771,8 +787,8 @@ import type { SkitFeedback } from './types';
 ```ts
 
 /**
- * Сценку не снять с этими репликами: одну и ту же реплику дважды не услышали
- * или фильтр Google трижды отказал. Без повтора: рабочий процесс (db.ts, failJob)
+ * Сценку не снять с этими репликами: два клипа с одним текстом не прошли сверку
+ * речи или фильтр Google трижды отказал. Без повтора: рабочий процесс (db.ts, failJob)
  * возвращает ролик сценаристу — пояснение `writerText` в writer_feedback, разбор
  * `feedback` в skit_feedback.
  */
@@ -810,7 +826,7 @@ import { failText, SkitFeedbackError, StudioError, toStudioError, type StudioErr
 2. После строки `export const MAX_SKIT_ATTEMPTS = 3;` вставить:
 
 ```ts
-/** Столько раз не услышали реплики одного текста сценки — дальше клипы не снимаются, сценка уходит сценаристу. */
+/** Столько клипов одного текста сценки не прошли сверку речи — дальше клипы не снимаются, сценка уходит сценаристу. */
 export const MAX_SPEECH_MISSES = 2;
 ```
 
@@ -882,10 +898,10 @@ class SpeechMismatchError extends StudioError {
     const lines = plans[kind].skit.lines;
     const what =
       fb.code === 'speech_mismatch'
-        ? `Omni дважды не озвучил ${
+        ? `${MAX_SPEECH_MISSES} клипа с этими репликами не прошли сверку речи; в последнем ${
             fb.lines.length
-              ? fb.lines.map((n) => `реплику ${n} (${lines[n - 1]?.hero ?? '?'}): «${lines[n - 1]?.text ?? ''}»`).join(', ')
-              : 'реплики так, чтобы их узнало распознавание'
+              ? `не услышаны: ${fb.lines.map((n) => `реплика ${n} (${lines[n - 1]?.hero ?? '?'}) «${lines[n - 1]?.text ?? ''}»`).join(', ')}`
+              : 'речь не сошлась с репликами'
           }, услышано: «${(fb.heard ?? '').slice(0, 200)}»`
         : `фильтр Google ${MAX_SKIT_ATTEMPTS} раза не пропустил клип (${fb.reason ?? 'причина не названа'})`;
     return `${SCENE[kind]}: ${what}. Перепиши реплики и действие этой сценки — короче и проще, обычными словами; пока герой говорит, ничто не закрывает ему рот; место, начало и героев не меняй.`;
@@ -932,10 +948,10 @@ class SpeechMismatchError extends StudioError {
         last = err;
         codes.push(err.code);
         if (!err.retryable) throw err;
-        // Реплики этого текста дважды не услышали — промахи на одном тексте повторяются:
+        // Два клипа с этим текстом не прошли сверку речи — промахи на одном тексте повторяются:
         // сценаристу, а не третий клип (брак из перепроверки сюда не попадает — он судится в reviveRejected).
         if (e instanceof SpeechMismatchError && ++speechMisses >= MAX_SPEECH_MISSES) {
-          throw toWriter(kind, { code: 'speech_mismatch', lines: e.silentLines.map((i) => i + 1), heard: e.heard, reason: null }, `${err.message} — ${MAX_SPEECH_MISSES} раза на одном тексте`);
+          throw toWriter(kind, { code: 'speech_mismatch', lines: e.silentLines.map((i) => i + 1), heard: e.heard, reason: null }, `${err.message} — ${MAX_SPEECH_MISSES} клипа с этим текстом не прошли сверку`);
         }
 ```
 
@@ -1013,7 +1029,7 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.contract.s
     const id = await insert('animate_queued', { writer_rounds: 2 });
     const job = await claimJob(pool, 'animate');
     const feedback = { kind: 'punchline', code: 'speech_mismatch', lines: [2], heard: 'это только символика периода', reason: null } as const;
-    const err = new SkitFeedbackError({ ...feedback, lines: [...feedback.lines] }, 'сценка 2 (развязка): Omni дважды не озвучил реплику 2', 'сценка 2 (развязка): не услышаны реплики 2 — 2 раза на одном тексте');
+    const err = new SkitFeedbackError({ ...feedback, lines: [...feedback.lines] }, 'сценка 2 (развязка): 2 клипа с этими репликами не прошли сверку речи', 'сценка 2 (развязка): не услышаны реплики 2 — 2 клипа с этим текстом не прошли сверку');
     assert.equal(await failJob(pool, job!, err), 'writer');
     const r = await row(id);
     assert.deepEqual(
@@ -1093,8 +1109,8 @@ import { SkitFeedbackError, WRITER_FEEDBACK_CODES, type StudioError, type Studio
 4. В описании `failJob` после пункта про озвучку вставить пункт:
 
 ```ts
- * - сценку не снять с этими репликами (SkitFeedbackError: два промаха речи или
- *   три отказа фильтра) — сценаристу с пояснением и разбором (skit_feedback), пока
+ * - сценку не снять с этими репликами (SkitFeedbackError: два клипа одного текста
+ *   не прошли сверку речи или три отказа фильтра) — сценаристу с пояснением и разбором (skit_feedback), пока
  *   кругов меньше MAX_WRITER_ROUNDS; круги кончились — failed с этапа сценариста;
 ```
 
@@ -1135,7 +1151,7 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts src/tg-bot 2>&1 |
 ```sql
 UPDATE short_video
    SET status = 'writing', attempts = 0, lease_until = NULL,
-       writer_feedback = 'сценка 2 (развязка): Omni дважды не озвучил реплику 2 — учение. Перепиши реплики и действие этой сценки — короче и проще, обычными словами; место, начало и героев не меняй.',
+       writer_feedback = 'сценка 2 (развязка): 2 клипа с этими репликами не прошли сверку речи — учение. Перепиши реплики и действие этой сценки — короче и проще, обычными словами; место, начало и героев не меняй.',
        skit_feedback = '{"kind":"punchline","code":"speech_mismatch","lines":[2],"heard":"учение","reason":null}'::jsonb
  WHERE id = '<id>';
 ```
