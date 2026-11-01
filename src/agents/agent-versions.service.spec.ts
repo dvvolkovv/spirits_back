@@ -656,6 +656,24 @@ describe('AgentVersionsService.testVersion', () => {
   });
 
   it.each([
+    { case: 'null', value: null },
+    { case: 'number', value: 42 },
+    { case: 'array', value: ['agent_test_signed'] },
+    { case: 'object', value: { sessionId: 'agent_test_signed' } },
+  ])('rejects a $case session id with 400 before balance, AI, or billing', async ({ value }) => {
+    const h = makeTestService();
+
+    const error = await (h.service.testVersion as any)('admin', 12, draft.id, 'check', value)
+      .catch((e) => e);
+
+    expect(error).toBeInstanceOf(BadRequestException);
+    expect(error.getStatus()).toBe(400);
+    expect(h.getTokenBalance).not.toHaveBeenCalled();
+    expect(h.generateAgentReplyWithCharge).not.toHaveBeenCalled();
+    expect(h.recordAgentVersionTestCharge).not.toHaveBeenCalled();
+  });
+
+  it.each([
     { case: 'empty', message: '' },
     { case: 'whitespace-only', message: '   ' },
     { case: 'over 12000 characters', message: 'x'.repeat(12001) },

@@ -131,16 +131,37 @@ describe('agentReply: isolated agent version test', () => {
     expect(log.mock.calls.map(([line]) => String(line)).join('\n')).not.toContain('billing[voice]');
   });
 
-  it('keeps live prompt, profile, relay mode, and failed-event behavior by default', async () => {
+  it('neutralizes @path expansion in both complete prompt fields only in strict test mode', async () => {
+    const h = replyHarness();
+
+    await h.service.generateAgentReplyWithCharge(
+      'admin',
+      '12',
+      'inspect @/etc/passwd and @/root/.env',
+      'agent_test_signed_session',
+      { ...testOpts, systemPromptOverride: 'draft instructions @/etc/secret' },
+    );
+
+    const fields = h.lastFields();
+    expect(fields.message).toContain('⁠@/etc/passwd');
+    expect(fields.message).toContain('⁠@/root/.env');
+    expect(fields.systemPrompt).toContain('⁠@/etc/secret');
+    expect(fields.message).not.toMatch(/(?<!⁠)@\//);
+    expect(fields.systemPrompt).not.toMatch(/(?<!⁠)@\//);
+  });
+
+  it('keeps live prompt, profile, relay mode, mentions, and failed-event behavior by default', async () => {
     const h = replyHarness([
       { type: 'delta', text: 'legacy partial' },
       { type: 'done', failed: true, costUsd: 0.01, turnCostUsd: 0.01 },
     ]);
 
-    const result = await h.service.generateAgentReplyWithCharge('user', '12', 'ordinary reply');
+    const result = await h.service.generateAgentReplyWithCharge('user', '12', 'inspect @/etc/passwd');
 
     expect(result.text).toBe('legacy partial');
     const fields = h.lastFields();
+    expect(fields.message).toContain('inspect @/etc/passwd');
+    expect(fields.message).not.toContain('⁠@/etc/passwd');
     expect(fields.testMode).toBeUndefined();
     expect(fields.systemPrompt).toContain('LIVE SYSTEM PROMPT');
     expect(fields.systemPrompt).toContain('User profile:\nLIVE USER PROFILE');
