@@ -2400,7 +2400,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
           `SELECT
              COALESCE((SELECT SUM(tokens_spent) FROM generated_images WHERE user_id = $1 AND created_at >= $2::timestamptz), 0)::bigint
              +
-             COALESCE((SELECT SUM(tokens_spent) FROM video_jobs WHERE user_id = $1 AND created_at >= $2::timestamptz), 0)::bigint
+             -- Упавшее видео уже возвращено (failAndRefund: 'failed' и 'refund'
+             -- одной транзакцией) — в число под ответом его не включаем.
+             COALESCE((SELECT SUM(tokens_spent) FROM video_jobs WHERE user_id = $1 AND created_at >= $2::timestamptz AND status <> 'failed'), 0)::bigint
              AS spent`,
           [userId, startIso],
         );

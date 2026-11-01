@@ -46,6 +46,8 @@ export interface VeoOperationStatus {
   /** Готовый mp4 — целиком, у продления это весь ролик с начала. */
   video: Buffer | null;
   error: string | null;
+  /** Код Google у провала (INVALID_ARGUMENT, INTERNAL…) — шаг цепочки решает по нему. */
+  code?: string;
 }
 
 type Aspect = '16:9' | '9:16';
@@ -202,7 +204,7 @@ export class VeoService {
       if (first?.code === 'INVALID_ARGUMENT') {
         reason = `Omni отклонил запрос — чаще всего это фильтр контента (узнаваемые люди, дети на фото, запрещённые темы); переформулируйте описание. ${reason}`;
       }
-      return { done: true, video: null, error: reason };
+      return { done: true, video: null, error: reason, code: first?.code ? String(first.code) : undefined };
     }
 
     const outputs = (Array.isArray(d.steps) ? d.steps : []).filter((s: any) => s?.type === 'model_output');

@@ -197,7 +197,7 @@ describe('VeoService.getOperation', () => {
     } });
     const st = await makeService().getOperation('v1_x');
 
-    expect(st).toEqual({ done: true, video: null, error: 'Internal error encountered. Please retry.' });
+    expect(st).toEqual({ done: true, video: null, error: 'Internal error encountered. Please retry.', code: 'INTERNAL' });
   });
 
   it('отказ фильтра (INVALID_ARGUMENT) — с подсказкой, что переформулировать', async () => {
@@ -214,6 +214,8 @@ describe('VeoService.getOperation', () => {
     expect(st.done).toBe(true);
     expect(st.error).toMatch(/фильтр контента/);
     expect(st.error).toContain('There was a problem processing your request.');
+    // Код — вызывающему: у продления тот же INVALID_ARGUMENT значит сбой Google (01.11.2026).
+    expect(st.code).toBe('INVALID_ARGUMENT');
   });
 
   it('failed с одиночным error тоже читается', async () => {
