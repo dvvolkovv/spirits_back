@@ -106,6 +106,16 @@ describe('prescribe — пределы на круг', () => {
   it('без сцены «без сценок» нельзя: сценарист пишет текст по сцене и съёмке', () => {
     expect(prescribe(v({ failedCode: 'omni_budget', scene: null })).action).toBe('never');
   });
+
+  it('оживление, последнее действие круга и код новой сцены — тоже без сценок: новой сцене круга не хватит', () => {
+    const two = [rec('later', { from: 'capturing', code: 'login', delayMin: 30 }), rec('later', { delayMin: 120 })];
+    expect(prescribe(v({ failedCode: 'keyframe_blocked', recoveries: two, autoRecoveries: 2 })).action).toBe('no_skits');
+    expect(prescribe(v({ failedCode: 'keyframe_blocked' })).action).toBe('new_scene');
+  });
+
+  it('этап, с которого «Повторить» не продолжит, — никак при любом коде', () => {
+    expect(prescribe(v({ failedFrom: 'pending_review' as ShortStatus, failedCode: 'login' })).action).toBe('never');
+  });
 });
 
 describe('слова и записи', () => {

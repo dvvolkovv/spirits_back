@@ -94,6 +94,14 @@ describe('контракт API и студии', () => {
     const doctor = fs.readFileSync(path.join(__dirname, 'short-doctor.ts'), 'utf8');
     expect(codes.filter((c) => !doctor.includes(`'${c}'`))).toEqual([]);
   });
+
+  it('каждый код фатального сбоя этапа API (StageFatalCode) осознанно разнесён в таблице доктора', () => {
+    const union = fs.readFileSync(path.join(__dirname, 'short-jobs.ts'), 'utf8').match(/export type StageFatalCode =([^;]+);/)?.[1] ?? '';
+    const codes = [...union.matchAll(/'([a-z_]+)'/g)].map((m) => m[1]);
+    expect(codes.length).toBeGreaterThan(3);
+    const doctor = fs.readFileSync(path.join(__dirname, 'short-doctor.ts'), 'utf8');
+    expect(codes.filter((c) => !doctor.includes(`'${c}'`))).toEqual([]);
+  });
 });
 
 describe('контракт API и студии — оживление', () => {
