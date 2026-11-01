@@ -29,7 +29,7 @@ import { YoutubeAttemptSuperseded, YoutubeNotUploaded } from './youtube/youtube-
  */
 const PG = process.env.SHORTS_PG_URL;
 const maybe = PG ? describe : describe.skip;
-const MIGRATIONS = ['001_shorts.sql', '002_skits.sql', '003_youtube.sql'].map((f) => path.join(__dirname, 'migrations', f));
+const MIGRATIONS = ['001_shorts.sql', '002_skits.sql', '003_youtube.sql', '004_skit_feedback.sql'].map((f) => path.join(__dirname, 'migrations', f));
 const migrate = async (pool: Pool) => {
   for (const f of MIGRATIONS) await pool.query(fs.readFileSync(f, 'utf8'));
 };
