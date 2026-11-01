@@ -317,7 +317,7 @@ export async function minAnswerChars(db: Queryable): Promise<number> {
   return Number(r.rows[0]?.min_answer_chars ?? 400);
 }
 
-/** Предел секунд Omni на ролик — из настроек админки (спека сценок, «Отказы»). */
+/** Предел секунд Omni на круг владельца — из настроек админки (спека сценок, «Отказы»; круг — от omni_base). */
 export async function maxOmniSeconds(db: Queryable): Promise<number> {
   const r = await db.query('SELECT max_omni_seconds FROM short_settings WHERE id = 1');
   return Number(r.rows[0]?.max_omni_seconds ?? 48);

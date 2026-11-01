@@ -20,7 +20,7 @@ export interface ShortSettings {
   narratorVoice: string;
   /** Формат новых роликов: «Сценки» или «Только чат» (запасной, если Omni недоступен). */
   format: ShortFormat;
-  /** Предел секунд Omni на ролик со всеми пересъёмками (спека сценок, «Отказы»). */
+  /** Предел секунд Omni на круг владельца: повторы студии и самопочинки доктора — внутри круга, кнопка владельца начинает новый (omni_base; спека сценок, «Отказы»; решение владельца 01.11). */
   maxOmniSeconds: number;
   /** YouTube: manual — набор владельцу, unlisted («по ссылке») / public («публично») — загрузка с этим доступом (спека YouTube). */
   youtubeMode: YoutubeMode;
@@ -117,7 +117,7 @@ export function validateSettingsPatch(body: any, currentYoutubeMode?: YoutubeMod
   }
   if (b.maxOmniSeconds !== undefined) {
     // Клип Omni — 8 с: предел меньше одного клипа сценки не снимет ни одной; CHECK базы — 8–400.
-    if (!intIn(b.maxOmniSeconds, 8, 400)) throw new Error('maxOmniSeconds — 8–400 секунд Omni на ролик (клип — 8 с)');
+    if (!intIn(b.maxOmniSeconds, 8, 400)) throw new Error('maxOmniSeconds — 8–400 секунд Omni на круг (клип — 8 с)');
     p.maxOmniSeconds = b.maxOmniSeconds;
   }
   if (b.youtubeMode !== undefined && b.youtubeMode !== currentYoutubeMode) {

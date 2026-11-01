@@ -15,8 +15,9 @@
 -- «Ролики». Порядок: весь код очереди 2б — API и студия — на старый (кабинету откат
 -- не нужен: новые поля он читает как необязательные); колонки можно оставить — старый
 -- код их не видит. Колонки оставлены и 2б выкатывается снова — сначала стереть хвосты:
--- старый код не обнулял счётчик круга и код сбоя, доктор принял бы их за свежие:
---   UPDATE short_video SET failed_code = NULL, auto_recoveries = 0, omni_base = COALESCE((animation->>'omniSeconds')::int, 0)
+-- старый код не обнулял счётчик круга и код сбоя (доктор принял бы их за свежие) и не
+-- начинал круг по секундам (omni_base остался бы от давнего круга — предел строже решённого):
+--   UPDATE short_video SET failed_code = NULL, auto_recoveries = 0, omni_base = COALESCE(floor((animation->>'omniSeconds')::numeric)::int, 0)
 --    WHERE failed_code IS NOT NULL OR auto_recoveries <> 0;
 -- Снимать колонки — только после отката кода: убрать 005 из ShortsSchemaService, затем
 --   SET lock_timeout = '5s';

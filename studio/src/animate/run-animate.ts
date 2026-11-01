@@ -31,7 +31,7 @@ const STUDIO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 export const MAX_SKIT_ATTEMPTS = 3;
 /** Столько клипов одного текста сценки не прошли сверку речи — дальше клипы не снимаются, сценка уходит сценаристу. */
 export const MAX_SPEECH_MISSES = 2;
-/** Предел секунд Omni на ролик: шесть клипов, ≈ $4,8 (спека, «Отказы»). */
+/** Предел секунд Omni на круг владельца (omni_base): шесть клипов, ≈ $4,8 (спека, «Отказы»; решение владельца 01.11 — круг начинает его кнопка). */
 export const DEFAULT_MAX_OMNI_SECONDS = 48;
 /** Версия бесплатной обработки клипа (громкость, субтитры): поднять, когда меняется их логика, — готовые сценки переобработаются без Omni. */
 export const PROCESSING_VERSION = 2;
@@ -197,9 +197,9 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
   if (typeof budget !== 'number' || !Number.isFinite(budget) || budget < 0) {
     throw new StudioError('no_input', `animate: предел секунд Omni — «${budget}», нужно неотрицательное число`, false);
   }
-  const base = deps.omniBase ?? 0;
-  if (typeof base !== 'number' || !Number.isFinite(base) || base < 0) {
-    throw new StudioError('no_input', `animate: начало круга по секундам Omni — «${base}», нужно неотрицательное число`, false);
+  const omniBase = deps.omniBase ?? 0;
+  if (typeof omniBase !== 'number' || !Number.isFinite(omniBase) || omniBase < 0) {
+    throw new StudioError('no_input', `animate: начало круга по секундам Omni — «${omniBase}», нужно неотрицательное число`, false);
   }
   try {
     await run('ffmpeg', ['-version']);
@@ -253,6 +253,11 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
   const post = `v${PROCESSING_VERSION};lufs=${lufs};pause=${PAUSE_DETECT.noiseDb}dB/${PAUSE_DETECT.minSec}s`;
   const troupeDir = deps.troupeDir ?? path.join(STUDIO_ROOT, 'assets', 'troupe');
   const log = deps.log ?? (() => {});
+  // Начало круга — не больше счёта ролика: omni_base выше счёта (правка animation в базе
+  // руками, опоздавший процесс) увёл бы «потрачено в круге» в минус и дал бы кругу лишние
+  // секунды. Круг — от счёта: строже, а не щедрее.
+  const circleBase = Math.min(omniBase, anim.omniSeconds);
+  if (circleBase < omniBase) log(`animate: начало круга ${omniBase} с больше счёта ролика ${anim.omniSeconds} с — круг считается от ${circleBase} с`);
   const abs = (file: string) => path.join(runDir, file);
   const skitFile = (kind: SkitKind, name: string) => path.posix.join('skits', plans[kind].fingerprint, name);
   const keyframeBase = (kind: SkitKind) => path.posix.join('keyframes', plans[kind].keyframeFingerprint);
@@ -489,12 +494,12 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
   };
 
   const assertBudget = (): void => {
-    if (anim.omniSeconds - base + CLIP_SEC > budget) {
+    if (anim.omniSeconds - circleBase + CLIP_SEC > budget) {
       // Круг владельца начат (omni_base) — предел на круг; общий счёт ролика — рядом, для владельца.
-      const circle = base > 0 ? `, в этом круге — ${anim.omniSeconds - base} с` : '';
+      const circle = circleBase > 0 ? `, в этом круге — ${anim.omniSeconds - circleBase} с` : '';
       throw new StudioError(
         'omni_budget',
-        `на ролик ушло ${anim.omniSeconds} с Omni вместе с запущенными${circle}, предел — ${budget} с${base > 0 ? ' на круг' : ''}: лимит пересъёмок сценок; поднять — настройка «Предел секунд Omni» (update_settings maxOmniSeconds; в CLI — MAX_OMNI_SECONDS=<секунды> npm run animate)`,
+        `на ролик ушло ${anim.omniSeconds} с Omni вместе с запущенными${circle}, предел — ${budget} с${circleBase > 0 ? ' на круг' : ''}: лимит пересъёмок сценок; новый круг — любой кнопкой владельца; поднять предел — настройка «Предел секунд Omni» (update_settings maxOmniSeconds; в CLI — MAX_OMNI_SECONDS=<секунды> npm run animate)`,
         false,
       );
     }

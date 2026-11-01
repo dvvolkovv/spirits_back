@@ -30,9 +30,11 @@ export const RELEASED_SQL =
 /**
  * Кнопка владельца начинает новый круг и для секунд Omni: предел («Предел
  * секунд Omni») — на круг, студия считает его от omni_base. Общий счёт ролика
- * (animation.omniSeconds) не трогается — он в подписи на проверку.
+ * (animation.omniSeconds) не трогается — он в подписи на проверку. Через numeric:
+ * счёт с дробной записью («16.0» — ручная правка jsonb) ронял бы `::int`, а с ним
+ * и кнопку; floor — в строгую сторону (выше счёта начало круга студия всё равно не поднимет).
  */
-export const NEW_OMNI_CIRCLE_SQL = "omni_base = COALESCE((animation->>'omniSeconds')::int, 0)";
+export const NEW_OMNI_CIRCLE_SQL = "omni_base = COALESCE(floor((animation->>'omniSeconds')::numeric)::int, 0)";
 
 /** Откуда готовый ролик можно «Переснять» и «Отклонить». */
 export const LEAVE_FROM: readonly ShortStatus[] = ['pending_review', 'approved'];
@@ -108,6 +110,7 @@ export async function explainRefusal(
  * формат — из настроек (`format`), как у «Новой сцены»: ролик, который доктор
  * собрал без сценок, снова пробует сценки. У «Отклонить» обнуление ни на что не
  * влияет, формат не трогается.
+ * Новый круг — и для секунд Omni (NEW_OMNI_CIRCLE_SQL): предел оживления — от потраченного на момент кнопки.
  */
 export async function leaveReview(
   pg: SlotQueryable,
@@ -134,6 +137,7 @@ export async function leaveReview(
  * Замечание к ролику на проверке: дописывается к прежним (appendOwnerNote) и
  * уводит ролик к сценаристу. writer_rounds = 0 — новый круг владельца, счётчик
  * автоматических переписок студии заново. Самопочинки доктора — тоже (auto_recoveries = 0).
+ * И секунды Omni (NEW_OMNI_CIRCLE_SQL): предел оживления — от потраченного на момент замечания.
  */
 export async function noteForReview(
   pg: SlotQueryable,

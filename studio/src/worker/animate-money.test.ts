@@ -179,7 +179,7 @@ function worker(workRoot: string, db: ReturnType<typeof fakeDb>, s3: FakeS3, g: 
     capture: async () => { throw new Error('нет'); },
     render: async () => { throw new Error('нет'); },
     animate: (runDir, hooks) =>
-      animateRun(runDir, { ...g.deps, maxOmniSeconds: hooks.maxOmniSeconds, onSave: hooks.onSave, onFile: hooks.onFile, onDiscard: hooks.onDiscard }),
+      animateRun(runDir, { ...g.deps, maxOmniSeconds: hooks.maxOmniSeconds, omniBase: hooks.omniBase, onSave: hooks.onSave, onFile: hooks.onFile, onDiscard: hooks.onDiscard }),
     log: () => {},
     saveRetryDelaysMs: [1, 1],
   };

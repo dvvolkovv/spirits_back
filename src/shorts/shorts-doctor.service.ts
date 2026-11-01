@@ -35,7 +35,7 @@ export class ShortsDoctorService {
     const p = prescribe(v);
     if (p.action === 'never') {
       // Почему не взялся — в журнал: «никак по таблице» и «круг исчерпан» иначе неотличимы.
-      this.logger.log(`ролик ${v.id}: доктор не берётся (${v.failedFrom}, ${v.failedCode ?? 'без кода'}, формат ${v.format}, круг ${v.autoRecoveries}: ${recoveryWords(currentCircle(v)) || 'пусто'}) — к владельцу`);
+      this.logger.log(`ролик ${v.id}: доктор не берётся (${v.failedFrom}, ${v.failedCode ?? 'без кода'}, формат ${v.format}, самопочинок в круге ${v.autoRecoveries}: ${recoveryWords(currentCircle(v)) || 'пусто'}) — к владельцу`);
       return 'gave_up';
     }
     const rec = recoveryEntry(v, p, now);
@@ -58,7 +58,7 @@ export class ShortsDoctorService {
         [v.id, v.failedFrom, entry, appendOwnerNote(v.ownerNote, newSceneNote(v))],
       );
     } else {
-      // Оживление (animation, счёт секунд Omni) не трогается: деньги ролика считаются за всё время.
+      // Оживление (animation, счёт секунд Omni) и начало круга (omni_base) не трогаются: доктор — внутри круга владельца, его попытки тратят секунды того же круга.
       r = await this.pg.query(
         `UPDATE short_video SET status = 'writing', format = 'chat', lease_until = NULL, writer_rounds = 0,
                 writer_feedback = NULL, skit_feedback = NULL, ${done} ${where}`,
