@@ -49,6 +49,7 @@ import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
 import { CHAT_MODEL, PROBE_MODEL } from '../common/chat-model';
 import { sendTelegramAlert } from '../common/telegram-alert';
 import { RELAY_TURN_BUDGET_MS } from '../common/relay-budget';
+import { neutralizeAtMentions } from '../common/agent-guards';
 // Agent server at r.linkeon.io (remote Claude Code)
 
 /** Файл в папке сессии, как его отдаёт relay (`GET /session/:sid/files`). */
@@ -278,6 +279,20 @@ export interface AgentReplyOpts {
    * консультация специалиста в звонке (не её сжатие, voice_condense).
    */
   linkeonTools?: boolean;
+  descriptionOverride?: string;
+  systemPromptOverride?: string;
+  testLanguage?: string;
+  includeUserContext?: boolean;
+  testMode?: boolean;
+  billingContext?: string;
+}
+
+export interface ChargedAgentReply {
+  text: string;
+  tokens: number;
+  costUsd: number;
+  charge: SdkCharge;
+  durationMs: number;
 }
 
 @Injectable()
@@ -2619,20 +2634,48 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * ассистентам. Замечено владельцем 26.08.2026, когда он попросил показывать
    * расход на экране.
    *
-   * Возвращённое списывают голосовые консультации (voice-call), поэтому здесь
-   * же печатается billing[voice:…] с раскладом и алертит сработавшая страховка
-   * — как в двух других путях.
+   * По умолчанию списание относится к голосовым консультациям (voice-call) и
+   * печатается как billing[voice:…]; opts.billingContext меняет только метку.
+   * Алерт страховки работает как в двух других путях.
    */
   async generateAgentReplyWithCharge(
     userId: string, assistantId: string, message: string, sessionIdOverride?: string, opts: AgentReplyOpts = {},
-  ): Promise<{ text: string; tokens: number; costUsd: number }> {
+  ): Promise<ChargedAgentReply> {
     return this.agentReply(userId, assistantId, message, sessionIdOverride, true, opts);
+  }
+
+  async recordAgentVersionTestCharge(
+    userId: string,
+    assistantId: string,
+    charge: {
+      tokens: number;
+      costUsd: number;
+      turnCostUsd?: number | null;
+      source?: ChargeFacts['source'];
+      taken?: ChargeTaken;
+      durationMs?: number;
+    },
+    replyChars: number,
+  ): Promise<void> {
+    if (charge.tokens <= 0) return;
+    const facts: ChargeFacts = {
+      costUsd: Number(charge.costUsd.toFixed(4)),
+      source: charge.source || 'cost',
+      durationMs: charge.durationMs ?? 0,
+      replyChars,
+    };
+    if (charge.turnCostUsd !== undefined) {
+      facts.turnCostUsd = charge.turnCostUsd === null ? null : Number(charge.turnCostUsd.toFixed(4));
+    }
+    if (charge.taken) facts.taken = charge.taken;
+    await this.addTokenTask(userId, 0, charge.tokens, assistantId, facts);
   }
 
   private async agentReply(
     userId: string, assistantId: string, message: string, sessionIdOverride: string | undefined, billed: boolean,
     opts: AgentReplyOpts = {},
-  ): Promise<{ text: string; tokens: number; costUsd: number }> {
+  ): Promise<ChargedAgentReply> {
+    const startedAt = Date.now();
     const isNumeric = /^\d+$/.test(assistantId);
     const agentRes = isNumeric
       ? await this.pg.query('SELECT * FROM agents WHERE id = $1 LIMIT 1', [parseInt(assistantId, 10)])
@@ -2640,9 +2683,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const agent = agentRes.rows[0];
     if (!agent) throw new Error(`generateAgentReply: agent not found: ${assistantId}`);
     const agentName = agent.display_name || agent.name;
+    const userLanguage = opts.testMode === true
+      ? LanguageService.normalize(opts.testLanguage)
+      : await this.language.resolveUserLanguage(userId);
+    const agentDescription = opts.descriptionOverride !== undefined
+      ? opts.descriptionOverride
+      : agent.description;
 
     let profileText = '';
-    if (this.neo4j) { try { profileText = await this.neo4j.getProfileDescription(userId); } catch {} }
+    if (opts.includeUserContext !== false && this.neo4j) {
+      try { profileText = await this.neo4j.getProfileDescription(userId); } catch {}
+    }
 
     // Деление то же, что в основном пути чата: постоянное для сессии —
     // отдельным полем в --system-prompt релея, пер-ходовое остаётся в теле.
@@ -2651,16 +2702,19 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // qprobe_* это было видно замером даже после починки основного пути.
     let stablePrefix =
       `СИСТЕМНАЯ ИНСТРУКЦИЯ (имеет приоритет над всеми остальными). ` +
-      `Ты ассистент по имени **${agentName}**${agent.description ? ` — ${agent.description}` : ''} на платформе LINKEON.IO. ` +
+      `Ты ассистент по имени **${agentName}**${agentDescription ? ` — ${agentDescription}` : ''} на платформе LINKEON.IO. ` +
       `Всегда представляйся именно как ${agentName}. Никогда не упоминай, что ты Claude или другая AI-система помимо ${agentName}. ` +
-      LanguageService.buildDirective(await this.language.resolveUserLanguage(userId)) + `\n`;
-    if (agent.system_prompt && agent.system_prompt.trim()) {
-      stablePrefix += `--- Персона и инструкции ассистента ${agentName} ---\n${agent.system_prompt.trim()}\n\n`;
+      LanguageService.buildDirective(userLanguage) + `\n`;
+    const systemPrompt = opts.systemPromptOverride !== undefined
+      ? opts.systemPromptOverride
+      : agent.system_prompt;
+    if (systemPrompt && systemPrompt.trim()) {
+      stablePrefix += `--- Персона и инструкции ассистента ${agentName} ---\n${systemPrompt.trim()}\n\n`;
     }
     if (profileText && profileText.trim()) {
       stablePrefix += `User profile:\n${profileText}\n\n`;
     }
-    if (this.businessProfile) {
+    if (opts.includeUserContext !== false && this.businessProfile) {
       try {
         const biz = await this.businessProfile.renderForPrompt(userId, agent.category);
         if (biz) stablePrefix += biz + '\n\n';
@@ -2678,22 +2732,24 @@ ${LanguageService.buildDirective(userLanguage)}`;
     prefix += `${MEETING_HONESTY_RULE}\n\n`;
     prefix += `${RESPONSE_STYLE_RULE}\n\n`;
     prefix +=
-      `${LANGUAGE_REPLY_LINE[await this.language.resolveUserLanguage(userId)] || LANGUAGE_REPLY_LINE[DEFAULT_LANGUAGE]}\n\n`;
+      `${LANGUAGE_REPLY_LINE[userLanguage] || LANGUAGE_REPLY_LINE[DEFAULT_LANGUAGE]}\n\n`;
 
     const prompt = prefix + message;
 
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
     const FormData = require('form-data');
     const fd = new FormData();
-    fd.append('message', prompt);
-    if (stablePrefix) fd.append('systemPrompt', stablePrefix);
+    const outboundPrompt = opts.testMode === true ? neutralizeAtMentions(prompt) : prompt;
+    const outboundStablePrefix = opts.testMode === true ? neutralizeAtMentions(stablePrefix) : stablePrefix;
+    fd.append('message', outboundPrompt);
+    if (outboundStablePrefix) fd.append('systemPrompt', outboundStablePrefix);
     // sessionIdOverride — для синтетических проб: изолированная сессия, чтобы не
     // коллидить с реальной сессией юзера/другими пробами (r.linkeon отдаёт пустой
     // поток при конкурентном обращении к ЗАНЯТОЙ сессии — инцидент 2026-07-12).
     // Язык в ключе сессии — по той же причине, что в основном пути: релей
     // резюмит прежний разговор, и накопленный русский перевешивает промпт.
     const relaySid = sessionIdOverride ||
-      relaySessionKey(userId, assistantId, await this.language.resolveUserLanguage(userId));
+      relaySessionKey(userId, assistantId, userLanguage);
     fd.append('sessionId', relaySid);
     // Модель ответов: личный выбор этого человека или общий рубильник (spec
     // 2026-10-31-global-llm-switch, раздел 4) — рутины, «Путь», план действий,
@@ -2705,6 +2761,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // каждый раз оплачивать весь контекст заново, без кэша.
     const route = await resolveAnswerProvider(false, userId, this.llmProvider);
     for (const [k, v] of Object.entries(relayProviderFields(false, route.provider))) fd.append(k, v);
+    if (opts.testMode === true) fd.append('testMode', 'true');
     // Инструменты Linkeon — только когда вызывающий явно сказал linkeonTools:
     // true (см. AgentReplyOpts); по умолчанию — нет.
     if (opts.linkeonTools === true) appendLinkeonFields(fd, linkeonRelayFields(userId, relaySid));
@@ -2713,6 +2770,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
     };
     let costUsd = 0;
+    let turnFailed = false;
     const turnCost = new RelayTurnCost();
     const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
       headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
@@ -2734,6 +2792,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
             else if (ev.type === 'result' && ev.text && chunks.length === 0) chunks.push(ev.text);
             else if (ev.type === 'done') {
               // Стоимость и расход — здесь же, где их берёт основной путь.
+              if (ev.failed === true) turnFailed = true;
               if (typeof ev.costUsd === 'number' && ev.costUsd > 0) costUsd += ev.costUsd;
               turnCost.add(ev);
               if (ev.usage && typeof ev.usage === 'object') {
@@ -2766,13 +2825,25 @@ ${LanguageService.buildDirective(userLanguage)}`;
     });
     const text = this.stripToolTags(chunks.join('')).trim();
     const charge = this.computeSdkCharge(usage, costUsd, text, turnCost.usd);
+    if (opts.testMode === true) {
+      const failure = turnFailed
+        ? 'relay reported failure'
+        : !text
+        ? 'empty reply'
+        : this.looksCliFailure(text)
+        ? 'CLI failure reply'
+        : charge.tokens <= 0
+        ? 'non-billable upstream reply'
+        : '';
+      if (failure) throw new Error(`Agent version test failed: ${failure}`);
+    }
     if (billed) {
-      const logLine = `billing[voice:${charge.source}]: tokens=${charge.tokens} ${charge.note}`;
+      const logLine = `billing[${opts.billingContext || 'voice'}:${charge.source}]: tokens=${charge.tokens} ${charge.note}`;
       if (charge.source === 'length') this.logger.warn(logLine);
       else this.logger.log(logLine);
       this.alertTurnCostFloor(userId, assistantId, charge, charge.tokens);
     }
-    return { text, tokens: charge.tokens, costUsd };
+    return { text, tokens: charge.tokens, costUsd, charge, durationMs: Date.now() - startedAt };
   }
 
   /** Public wrapper для chat.controller — после upload-and-chat обогащаем профиль + tasks. */
@@ -2909,6 +2980,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       return {
         tokens: Math.ceil(turnCostUsd * this.TOKENS_PER_USD),
         usd: turnCostUsd,
+        turnUsd: turnCostUsd,
         source: 'cost',
         note: `usage не пришёл, считаю по стоимости хода=$${turnCostUsd.toFixed(4)}`,
       };

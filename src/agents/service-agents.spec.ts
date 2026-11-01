@@ -10,7 +10,7 @@ import { AgentsService } from './agents.service';
  */
 function makeService(rows: any[]) {
   const query = jest.fn(async () => ({ rows }));
-  const svc = new AgentsService({ query } as any);
+  const svc = new AgentsService({ query } as any, {} as any);
   return { svc, query };
 }
 

@@ -10,26 +10,26 @@ describe('AgentsService.getAgents с локалью', () => {
 
   it('передаёт локаль параметром запроса', async () => {
     const pg = makePg();
-    await new AgentsService(pg).getAgents('es');
+    await new AgentsService(pg, {} as any).getAgents('es');
     expect(pg.query).toHaveBeenCalledWith(expect.stringContaining('agent_translations'), expect.any(Array));
     expect(langParam(pg)).toBe('es');
   });
 
   it('нормализует региональный вариант локали', async () => {
     const pg = makePg();
-    await new AgentsService(pg).getAgents('es-MX');
+    await new AgentsService(pg, {} as any).getAgents('es-MX');
     expect(langParam(pg)).toBe('es');
   });
 
   it('без локали берёт русский', async () => {
     const pg = makePg();
-    await new AgentsService(pg).getAgents();
+    await new AgentsService(pg, {} as any).getAgents();
     expect(langParam(pg)).toBe('ru');
   });
 
   it('запрос деградирует в русские колонки через COALESCE', async () => {
     const pg = makePg();
-    await new AgentsService(pg).getAgents('de');
+    await new AgentsService(pg, {} as any).getAgents('de');
     const sql = pg.query.mock.calls[0][0];
     expect(sql).toContain('COALESCE');
     expect(sql).toContain('LEFT JOIN');
