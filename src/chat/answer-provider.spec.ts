@@ -1,22 +1,27 @@
 import { cliProviderOption, readDoneProvider, relayProviderFields, resolveAnswerProvider } from './answer-provider';
 
 describe('resolveAnswerProvider', () => {
-  const svc = (p: 'claude' | 'qwen' | 'kimi') => ({ get: jest.fn(async () => p) });
+  const svc = (provider: 'claude' | 'qwen' | 'kimi', choice: 'user' | 'global' = 'user') =>
+    ({ route: jest.fn(async () => ({ provider, choice })) });
 
-  it('выбор пользователя', async () => {
-    expect(await resolveAnswerProvider(false, 'u1', svc('qwen') as any)).toBe('qwen');
+  it('маршрут из сервиса: личный выбор', async () => {
+    expect(await resolveAnswerProvider(false, 'u1', svc('qwen') as any)).toEqual({ provider: 'qwen', choice: 'user' });
   });
-  it('выбор пользователя — kimi', async () => {
-    expect(await resolveAnswerProvider(false, 'u1', svc('kimi') as any)).toBe('kimi');
+  it('маршрут из сервиса: рубильник', async () => {
+    expect(await resolveAnswerProvider(false, 'u1', svc('kimi', 'global') as any)).toEqual({ provider: 'kimi', choice: 'global' });
   });
-  it('проба — всегда claude, настройку не читает', async () => {
+  it('проба — всегда claude, choice null, настройку не читает', async () => {
     const s = svc('qwen');
-    expect(await resolveAnswerProvider(true, 'u1', s as any)).toBe('claude');
-    expect(s.get).not.toHaveBeenCalled();
+    expect(await resolveAnswerProvider(true, 'u1', s as any)).toEqual({ provider: 'claude', choice: null });
+    expect(s.route).not.toHaveBeenCalled();
   });
-  it('нет сервиса или userId — claude', async () => {
-    expect(await resolveAnswerProvider(false, 'u1', undefined)).toBe('claude');
-    expect(await resolveAnswerProvider(false, '', svc('qwen') as any)).toBe('claude');
+  it('нет сервиса — claude, choice null', async () => {
+    expect(await resolveAnswerProvider(false, 'u1', undefined)).toEqual({ provider: 'claude', choice: null });
+  });
+  it('нет userId — маршрут для пустого id (рубильник)', async () => {
+    const s = svc('qwen', 'global');
+    expect(await resolveAnswerProvider(false, '', s as any)).toEqual({ provider: 'qwen', choice: 'global' });
+    expect(s.route).toHaveBeenCalledWith('');
   });
 });
 
@@ -44,7 +49,10 @@ describe('readDoneProvider', () => {
 });
 
 describe('cliProviderOption', () => {
-  it('claude — без поля', () => expect(cliProviderOption('claude')).toEqual({}));
-  it('qwen', () => expect(cliProviderOption('qwen')).toEqual({ provider: 'qwen' }));
-  it('kimi', () => expect(cliProviderOption('kimi')).toEqual({ provider: 'kimi' }));
+  it('личный Claude — явно claude (рубильник не применится)', () =>
+    expect(cliProviderOption({ provider: 'claude', choice: 'user' })).toEqual({ provider: 'claude' }));
+  it('личный kimi', () => expect(cliProviderOption({ provider: 'kimi', choice: 'user' })).toEqual({ provider: 'kimi' }));
+  it('рубильник — без поля (ClaudeCliService применит его сам)', () =>
+    expect(cliProviderOption({ provider: 'qwen', choice: 'global' })).toEqual({}));
+  it('проба — без поля', () => expect(cliProviderOption({ provider: 'claude', choice: null })).toEqual({}));
 });

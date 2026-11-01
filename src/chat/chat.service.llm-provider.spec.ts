@@ -10,8 +10,9 @@ jest.mock('../common/telegram-alert', () => ({
 
 /**
  * Модель ответов человека на пути релея (spec 2026-10-30-llm-provider-switch,
- * раздел 6): выбор «Qwen» уезжает к релею полем provider, проба — noFallback,
- * а чем релей ответил (done.provider/fallback) — в chat_quality.
+ * раздел 6, 2026-10-31-global-llm-switch): выбор «Qwen» уезжает к релею полем
+ * provider, проба — noFallback, а чем релей ответил (done.provider/fallback) —
+ * в chat_quality.
  * Гоняется НАСТОЯЩИЙ streamUniversalAgent с замоканными axios/pg/res — как в
  * chat.service.linkeon-fields.spec.ts и chat.service.failed-turn.spec.ts.
  */
@@ -56,7 +57,11 @@ afterAll(() => {
 });
 beforeEach(() => jest.clearAllMocks());
 
-function harness(choice: 'claude' | 'qwen' | 'kimi', events: any[] = [{ type: 'delta', text: 'ок' }, { type: 'done' }]) {
+function harness(
+  choice: 'claude' | 'qwen' | 'kimi',
+  events: any[] = [{ type: 'delta', text: 'ок' }, { type: 'done' }],
+  routeChoice: 'user' | 'global' = 'user',
+) {
   const pg = { query: jest.fn(async (sql: string) => (/AS spent/.test(sql) ? { rows: [{ spent: 0 }] } : { rows: [] })) };
   const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
   const tracked: { name: string; props: any }[] = [];
@@ -66,7 +71,7 @@ function harness(choice: 'claude' | 'qwen' | 'kimi', events: any[] = [{ type: 'd
     undefined, ev as any, undefined,
   );
   // Позиционная сборка до последнего параметра не доходит — подставляем полем.
-  const llmProvider = { get: jest.fn(async () => choice) };
+  const llmProvider = { route: jest.fn(async () => ({ provider: choice, choice: routeChoice })) };
   (svc as any).llmProvider = llmProvider;
   const post = axios.post as jest.Mock;
   post.mockImplementation(async () => ({ data: sseStream(events) }));
@@ -91,7 +96,7 @@ describe('streamUniversalAgent: модель ответов человека —
     const f = h.fields();
     expect(f.provider).toBe('qwen');
     expect(f.noFallback).toBeUndefined();
-    expect(h.llmProvider.get).toHaveBeenCalledWith('u-test');
+    expect(h.llmProvider.route).toHaveBeenCalledWith('u-test');
   });
 
   it('выбран Claude — ни provider, ни noFallback', async () => {
@@ -108,7 +113,7 @@ describe('streamUniversalAgent: модель ответов человека —
     const f = h.fields();
     expect(f.noFallback).toBe('1');
     expect(f.provider).toBeUndefined();
-    expect(h.llmProvider.get).not.toHaveBeenCalled();
+    expect(h.llmProvider.route).not.toHaveBeenCalled();
   });
 
   it('выбран Kimi — provider=kimi, без noFallback', async () => {
@@ -116,6 +121,13 @@ describe('streamUniversalAgent: модель ответов человека —
     await h.run();
     expect(h.fields().provider).toBe('kimi');
     expect(h.fields().noFallback).toBeUndefined();
+  });
+
+  it('«Как у всех» при рубильнике Qwen — provider=qwen; в chat_quality selected qwen и choice global', async () => {
+    const h = harness('qwen', undefined, 'global');
+    await h.run();
+    expect(h.fields().provider).toBe('qwen');
+    expect(h.quality()).toMatchObject({ selected: 'qwen', choice: 'global' });
   });
 });
 
@@ -135,10 +147,10 @@ describe('streamUniversalAgent: чем ответил релей — в chat_qua
     expect(q.fallback).toBeUndefined();
   });
 
-  it('выбран Kimi и ответил он — provider и selected kimi', async () => {
+  it('выбран Kimi и ответил он — provider и selected kimi, choice user (личный выбор)', async () => {
     const h = harness('kimi', [{ type: 'delta', text: 'ок' }, { type: 'done', provider: 'kimi', fallback: false }]);
     await h.run();
-    expect(h.quality()).toMatchObject({ provider: 'kimi', selected: 'kimi' });
+    expect(h.quality()).toMatchObject({ provider: 'kimi', selected: 'kimi', choice: 'user' });
     expect(h.quality().fallback).toBeUndefined();
   });
 
@@ -148,9 +160,10 @@ describe('streamUniversalAgent: чем ответил релей — в chat_qua
     expect(h.quality()).toMatchObject({ provider: 'claude', selected: 'kimi' });
   });
 
-  it('выбран Claude — selected не пишется', async () => {
+  it('выбран Claude — ни selected, ни choice не пишутся', async () => {
     const h = harness('claude', [{ type: 'delta', text: 'ок' }, { type: 'done', provider: 'claude', fallback: false }]);
     await h.run();
     expect(h.quality().selected).toBeUndefined();
+    expect(h.quality().choice).toBeUndefined();
   });
 });

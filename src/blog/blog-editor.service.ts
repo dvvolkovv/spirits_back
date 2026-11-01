@@ -28,7 +28,13 @@ export class BlogEditorService {
     const message = buildEditorMessage(post.topicKey, post.topicHint, post.editorNotes, kind);
 
     // Сессия привязана к id поста: изолированная и одноразовая.
-    const raw = await this.relay.ask(systemPrompt, message, `blog-${post.id}`);
+    //
+    // Всегда Claude, не по общему рубильнику (followSwitch: false): проверка
+    // фоновых задач на проде 01.11 — Qwen на релее вместо JSON сохранял пост в
+    // файл (/tmp/agent-output/…) инструментами Bash/Write и отвечал «Готово,
+    // сохранено», разбор падал («blog: не нашёл JSON в ответе»), хотя промпт
+    // требует ответа строго одним JSON-объектом.
+    const raw = await this.relay.ask(systemPrompt, message, `blog-${post.id}`, { followSwitch: false });
     return parseEditorReply(raw);
   }
 }

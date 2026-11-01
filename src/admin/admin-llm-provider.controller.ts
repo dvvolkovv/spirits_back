@@ -3,27 +3,40 @@ import { Response } from 'express';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
-import { LLM_PROVIDERS, LlmProvider, UserLlmProviderService } from '../common/services/user-llm-provider.service';
-import { readFallbackConfigs } from '../common/services/llm-fallback';
+import { LLM_CHOICES, LlmChoice, UserLlmProviderService, isLlmChoice } from '../common/services/user-llm-provider.service';
+import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
+import { AnswerProvider, readFallbackConfigs } from '../common/services/llm-fallback';
 
 /**
  * Модель ответов ассистентов по аккаунту (spec 2026-10-30-llm-provider-switch,
- * 2026-10-31-kimi-provider-design). :userId — тот же идентификатор, что у
+ * 2026-10-31-global-llm-switch). :userId — тот же идентификатор, что у
  * /webhook/admin/users/:phone/activity (телефон или UUID входа по почте).
- * configured — задан ли ключ запасного на бэкенде, по каждому: без него выбор
- * молча работает как Claude. qwenConfigured — прежнее поле для фронта до выката.
+ * provider — личный выбор ('default' — «Как у всех»); effective — чем человек
+ * отвечает сейчас с учётом рубильника и ключей; global — модель рубильника
+ * (для подписи «Как у всех (сейчас: …)»). qwenConfigured — прежнее поле.
  */
 @Controller('')
 @UseGuards(JwtGuard, AdminGuard)
 export class AdminLlmProviderController {
   private readonly logger = new Logger(AdminLlmProviderController.name);
 
-  constructor(private readonly providers: UserLlmProviderService) {}
+  constructor(
+    private readonly providers: UserLlmProviderService,
+    // Без @Optional() и без TS-«?» (ревью 01.11): карточка не должна молча
+    // остаться без effective/global, если граф DI не нашёл
+    // GlobalLlmProviderService — Nest считает зависимость обязательной и
+    // валит старт при поломке графа, та же логика, что у
+    // UserLlmProviderService.globalProvider. У карточки нет пути без этого
+    // сервиса — и юнит-тесты, и DI всегда дают оба аргумента конструктору,
+    // поэтому параметр обязателен и в TS. Сторож типа — design:paramtypes в
+    // admin-llm-provider.controller.spec.ts.
+    private readonly global: GlobalLlmProviderService,
+  ) {}
 
   @Get('admin/users/:userId/llm-provider')
   async get(@Param('userId') userId: string, @Res() res: Response) {
-    const provider = await this.providers.get(userId);
-    return res.status(200).json(this.body(userId, provider));
+    const choice = await this.providers.get(userId);
+    return res.status(200).json(await this.body(userId, choice));
   }
 
   @Post('admin/users/:userId/llm-provider')
@@ -33,23 +46,40 @@ export class AdminLlmProviderController {
     @Body() body: any,
     @Res() res: Response,
   ) {
-    const provider = String(body?.provider ?? '') as LlmProvider;
-    if (!LLM_PROVIDERS.includes(provider)) {
-      return res.status(400).json({ error: `provider: ${LLM_PROVIDERS.map((p) => `'${p}'`).join(' | ')}` });
+    const choice = String(body?.provider ?? '');
+    if (!isLlmChoice(choice)) {
+      return res.status(400).json({ error: `provider: ${LLM_CHOICES.map((p) => `'${p}'`).join(' | ')}` });
     }
-    if (!(await this.providers.set(userId, provider))) {
+    if (!(await this.providers.set(userId, choice))) {
       return res.status(404).json({ error: 'user not found' });
     }
     // Смена модели ответов тратит квоту владельца — оставляем след: кто и
     // кого переключил.
     const actor = user?.userId ?? 'unknown';
-    this.logger.log(`llm_provider: ${actor} → ${userId} = ${provider}`);
-    return res.status(200).json(this.body(userId, provider));
+    this.logger.log(`llm_provider: ${actor} → ${userId} = ${choice}`);
+    return res.status(200).json(await this.body(userId, choice));
   }
 
-  private body(userId: string, provider: LlmProvider) {
+  /**
+   * Маршрут — из уже прочитанных choice (личный выбор) и global (рубильник),
+   * БЕЗ повторного providers.route(userId) (ревью 01.11): route() сам внутри
+   * себя снова читает choice через providers.get() — второй тот же SELECT к
+   * базе на один HTTP-запрос, хотя choice уже на руках у вызывающего.
+   * 'default' («Как у всех») → модель рубильника, иначе — явный личный выбор.
+   */
+  private async body(userId: string, choice: LlmChoice) {
     const configs = readFallbackConfigs();
     const configured = { qwen: configs.qwen !== null, kimi: configs.kimi !== null };
-    return { userId, provider, qwenConfigured: configured.qwen, configured };
+    const usable = (p: AnswerProvider) => p === 'claude' || configured[p];
+    const global: AnswerProvider = await this.global.get();
+    const routeProvider: AnswerProvider = choice === 'default' ? global : choice;
+    return {
+      userId,
+      provider: choice,
+      effective: usable(routeProvider) ? routeProvider : 'claude',
+      global,
+      qwenConfigured: configured.qwen,
+      configured,
+    };
   }
 }

@@ -1,6 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
 import { relayAuthHeaders } from '../chat/relay-auth';
+import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
+import { relayProviderFields } from '../chat/answer-provider';
 
 /**
  * Разбор SSE-потока релея. Вынесен отдельной чистой функцией, чтобы
@@ -23,18 +25,39 @@ export function collectRelayText(raw: string): string {
 export class BlogRelayClient {
   private readonly logger = new Logger(BlogRelayClient.name);
 
+  constructor(
+    // Общий рубильник модели (spec 2026-10-31-global-llm-switch): этот
+    // клиент ОБЩИЙ — автоблог (BlogModule) и сценарист с режиссёром студии
+    // роликов (ShortsWriterService, ShortsDirectorService; свой экземпляр
+    // класса заведён в shorts.module.ts, с блогом не делится). Ролики идут
+    // через модель рубильника; автоблог (редактор, отбор новостей) — всегда
+    // Claude, ask(..., { followSwitch: false }). Без @Optional(): при поломке
+    // DI старт упадёт (поймает smoke), а не студия молча останется на Claude;
+    // тесты создают клиент через new без аргумента.
+    private readonly globalProvider?: GlobalLlmProviderService,
+  ) {}
+
   /**
    * Один вызов релея. sessionId — новый на каждый пост: длинные сессии
    * у нас глючат посторонним текстом в ответе, а память здесь не нужна —
    * прошлые заголовки передаются прямо в промпте.
+   *
+   * opts.followSwitch — по умолчанию модель общего рубильника (поле provider
+   * через relayProviderFields). false — рубильник не читается и полей модели
+   * нет: релей идёт обычным путём (Claude, при его сбое — запасные), как до
+   * рубильника.
    */
-  async ask(systemPrompt: string, message: string, sessionId: string): Promise<string> {
+  async ask(systemPrompt: string, message: string, sessionId: string, opts: { followSwitch?: boolean } = {}): Promise<string> {
     const agentUrl = process.env.AGENT_URL || 'https://r.linkeon.io';
     const FormData = require('form-data');
     const fd = new FormData();
     fd.append('message', message);
     fd.append('systemPrompt', systemPrompt);
     fd.append('sessionId', sessionId);
+    if (opts.followSwitch !== false) {
+      const provider = this.globalProvider ? await this.globalProvider.get() : 'claude';
+      for (const [k, v] of Object.entries(relayProviderFields(false, provider))) fd.append(k, v);
+    }
 
     const resp = await axios.post(`${agentUrl}/chat`, fd, {
       headers: { ...fd.getHeaders(), ...relayAuthHeaders() },

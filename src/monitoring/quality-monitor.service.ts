@@ -66,6 +66,13 @@ export class QualityMonitorService {
       // Без инструментов Linkeon: проба проверяет текст ответа, а ход идёт от
       // тестового аккаунта (спека 2026-10-26-mcp-turn-token, «Кто не получает»).
       // linkeonTools по умолчанию false (ревью 26.10.2026) — отдельный флаг не нужен.
+      // Проба идёт по маршруту тестового аккаунта (личный выбор или
+      // рубильник, spec 2026-10-31-global-llm-switch §4): меряет то, что
+      // получают люди; цепочка релея маскирует недоступность выбранной
+      // модели. generateAgentReply решает маршрут сам (chat.service.ts,
+      // agentReply) — этот сервис его не видит, поэтому текст алерта ниже
+      // не называет, какую модель мерили (нужна была бы отдельная
+      // зависимость UserLlmProviderService прямо здесь).
       text = await this.chat!.generateAgentReply(probeUser, assistantId, prompt, probeSession);
     } catch (e: any) {
       hardFail = `generate failed: ${e?.message || 'unknown'}`;

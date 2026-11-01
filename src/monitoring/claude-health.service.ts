@@ -2,6 +2,8 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
+import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
+import { CliSwitchState, cliOutageAffectedText, cliRecoveredText } from '../common/global-llm-messages';
 import axios from 'axios';
 import { sendTelegramPayload } from '../common/telegram-alert';
 import * as fs from 'fs';
@@ -105,6 +107,11 @@ export class ClaudeHealthService implements OnModuleInit {
   constructor(
     private readonly pg: PgService,
     private readonly claudeCli: ClaudeCliService,
+    // Общий рубильник модели (ревью 01.11): алерт о падении CLI называет, кого
+    // оно задевает на самом деле. Без @Optional(): CommonModule глобальный,
+    // поломка DI должна уронить старт (поймает smoke), а не молча вернуть
+    // прежний текст. Сторож — claude-health.outage-alert.spec.ts.
+    private readonly globalProvider: GlobalLlmProviderService,
   ) {}
 
   async onModuleInit() {
@@ -236,7 +243,7 @@ export class ClaudeHealthService implements OnModuleInit {
            COALESCE(SUM((props->>'cost_usd')::numeric) FILTER (WHERE ts >= now() - interval '30 days'),  0) AS cost_30d,
            COUNT(*) FILTER (WHERE ts >= now() - interval '24 hours')::int AS calls_24h,
            COUNT(*) FILTER (WHERE ts >= now() - interval '30 days')::int  AS calls_30d
-         FROM events WHERE name = 'claude_cli_call'`,
+         FROM events WHERE name = 'claude_cli_call' AND coalesce(props->>'provider', 'claude') = 'claude'`,
       );
       const r = sums.rows[0] as any;
       const models = await this.pg.query(
@@ -246,6 +253,7 @@ export class ClaudeHealthService implements OnModuleInit {
            COALESCE(SUM((props->>'cost_usd')::numeric), 0)::float AS cost_usd
          FROM events
          WHERE name = 'claude_cli_call' AND ts >= now() - interval '30 days'
+           AND coalesce(props->>'provider', 'claude') = 'claude'
          GROUP BY 1 ORDER BY cost_usd DESC LIMIT 5`,
       );
       return {
@@ -365,13 +373,18 @@ export class ClaudeHealthService implements OnModuleInit {
       const cooled = !this.lastOutageAlertAt ||
         (now.getTime() - this.lastOutageAlertAt.getTime()) >= OUTAGE_REALERT_HOURS * 3600_000;
       if (!alreadyAlerted || cooled) {
+        // Кого задевает падение Claude — зависит от общего рубильника и
+        // состояния его модели (ревью 01.11): строка «Затронуто» —
+        // cliOutageAffectedText, три состояния там.
+        const stats = this.claudeCli.fallbackStats(now.getTime());
+        const sw = await this.switchState(stats, now.getTime());
         await send(
           `<b>🔴 Локальный Claude CLI недоступен</b>\n` +
           `Причина: <b>${this.cache.llmError || 'неизвестно'}</b> (${this.cache.llmOutageKind})\n` +
-          `Затронуто: <b>Маша, TG-боты, Виртуальный PM, Виртуальный маркетолог, фоновые задачи</b> (CLI-путь на OAuth-подписке). ` +
+          `${cliOutageAffectedText(sw)} ` +
           `Чат-ассистенты (r.linkeon.io) — отдельный путь, см. synthetic chat_streaming.\n` +
           `Провалов подряд: ${this.cliConsecutiveDown}. Проверка: ${this.cache.llmCheckedAt || '—'}\n` +
-          `${fallbackAlertLine(this.claudeCli.fallbackStats())}\n` +
+          `${fallbackAlertLine(stats)}\n` +
           `Починка: на проде \`claude\` → /login (обновить OAuth).`,
         );
         this.lastOutageAlertAt = now;
@@ -379,11 +392,27 @@ export class ClaudeHealthService implements OnModuleInit {
         this.log.error(`Claude CLI outage alert sent (${this.cache.llmOutageKind}, ${this.cliConsecutiveDown} fails)`);
       }
     } else if (status === 'ok' && alreadyAlerted) {
-      await send(`<b>🟢 Локальный Claude CLI восстановлен</b>\nМаша/VPM/маркетолог снова работают (проверка: ${this.cache.llmCheckedAt || '—'}, ${this.cache.llmLatencyMs ?? '—'}мс).`);
+      // Пока модель рубильника с ключом отвечает, Маша, TG-боты и фоновые всё
+      // время шли через неё — отбой говорит другое (cliRecoveredText).
+      const sw = await this.switchState(this.claudeCli.fallbackStats(now.getTime()), now.getTime());
+      await send(cliRecoveredText({ ...sw, checkedAt: this.cache.llmCheckedAt, latencyMs: this.cache.llmLatencyMs }));
       this.lastOutageAlertAt = null;
       await this.setAlerted(COMPONENT, false);
       this.log.warn('Claude CLI recovery alert sent');
     }
+  }
+
+  /**
+   * Модель общего рубильника и её состояние — для алерта о падении и отбоя
+   * (ревью 01.11). enabled — ключ есть (providers[x].enabled: тот же
+   * признак, что configs[x] !== null); down — она «не отвечает», и выбор
+   * рубильника её пропускает (planProviders с respectDown). get() не бросает
+   * (контракт GlobalLlmProviderService.get).
+   */
+  private async switchState(stats: ReturnType<ClaudeCliService['fallbackStats']>, now: number): Promise<CliSwitchState> {
+    const switchProvider = await this.globalProvider.get();
+    const st = switchProvider === 'claude' ? undefined : stats.providers?.[switchProvider];
+    return { switchProvider, enabled: !!st?.enabled, down: !!st && st.downUntil > now };
   }
 
   async getOverview(): Promise<ClaudeHealthOverview> {

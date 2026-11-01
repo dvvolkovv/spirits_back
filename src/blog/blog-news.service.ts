@@ -56,10 +56,15 @@ export class BlogNewsService {
     // лог именно его (`[notice] <sessionId> preempted`), поэтому он — в логе.
     const sessionId = `blog-news-${weekKey}-${randomUUID()}`;
     this.logger.log(`${weekKey}: отбор новостей, sessionId ${sessionId}`);
+    // Всегда Claude, не по общему рубильнику (followSwitch: false): проверка
+    // фоновых задач на проде 01.11 — Qwen на релее вместо JSON сохранял
+    // дайджест в файл инструментами Bash/Write и отвечал «Готово, сохранено»,
+    // разбор падал. Так же у редактора (blog-editor.service.ts).
     const raw = await this.relay.ask(
       buildNewsSelectionPrompt(),
       buildNewsSelectionMessage(weekKey, themes),
       sessionId,
+      { followSwitch: false },
     );
 
     const byTheme = new Map(themes.map((t) => [t.theme, t]));

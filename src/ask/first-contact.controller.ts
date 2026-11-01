@@ -8,7 +8,8 @@ import { IpRateLimiter } from '../common/guards/ip-rate-limit';
  *
  * ⚠️ ПУБЛИЧНЫЙ (без JwtGuard) — знакомство и момент-отклик даются ДО входа (payoff-before-login),
  * поэтому токена нет. Ничего не сохраняется (эфемерно, как /webhook/ask). Против злоупотребления
- * (эндпоинт зовёт общий Claude-аккаунт): IP-rate-limit + кап на число реплик и длину.
+ * (эндпоинт зовёт модель общего рубильника Linkeon, spec 2026-10-31-global-llm-switch §4, — не
+ * аккаунт конкретного человека): IP-rate-limit + кап на число реплик и длину.
  */
 @Controller('first-contact')
 export class FirstContactController {

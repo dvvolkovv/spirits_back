@@ -465,7 +465,8 @@ export class ChatService {
     // @Optional по той же причине, что chatFiles; что модуль подключён,
     // сторожит chat.product-actions-wiring.spec.ts.
     @Optional() private readonly productActions?: ProductActionsService,
-    // Модель ответов человека (админка, spec 2026-10-30-llm-provider-switch).
+    // Модель ответов человека: личный выбор или общий рубильник (админка,
+    // spec 2026-10-30-llm-provider-switch, 2026-10-31-global-llm-switch).
     // Последним и @Optional по той же причине, что chatFiles.
     @Optional() private readonly llmProvider?: UserLlmProviderService,
     // Приписка пробы без входа (src/guest-trial/guest-carry.ts). Последним и
@@ -1227,8 +1228,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
       }, PING_MS);
 
       try {
-        // Модель ответов человека (админка): Qwen/Kimi — сразу выбранный, при его сбое — обычный путь; проба — только Claude.
-        const mashaProvider = await resolveAnswerProvider(probe, userId, this.llmProvider);
+        // Модель ответов: личный выбор (админка) или общий рубильник; проба — только Claude.
+        const mashaRoute = await resolveAnswerProvider(probe, userId, this.llmProvider);
         const r = await this.claudeCli.textWithCost(fullPrompt, {
           // Блок про продукты встаёт ДО волатильной части и хвоста языка:
           // требование языка обязано остаться последней строкой (см.
@@ -1245,7 +1246,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           model: probe ? PROBE_MODEL : CHAT_MODEL,
           // Пинг мониторинга меряет путь Claude — без запасных.
           noFallback: probe,
-          ...cliProviderOption(mashaProvider),
+          ...cliProviderOption(mashaRoute),
           // Бюджет хода — общий с релеем. Правка ждёт исхода внутри вызова
           // инструмента до PRODUCT_TOOL_WAIT_MS (2.5 мин) и может позвать его
           // повторно; прежние 90 с убивали бы CLI посреди ожидания — правка уже
@@ -1785,8 +1786,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const agentUsage: SdkUsageTotals = {
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
     };
-    // Модель ответов человека: Qwen/Kimi — релей сразу идёт к выбранному; проба — только Claude.
-    const answerProvider = await resolveAnswerProvider(probe, userId, this.llmProvider);
+    // Модель ответов: личный выбор или общий рубильник — релей сразу идёт к ней; проба — только Claude.
+    const answerRoute = await resolveAnswerProvider(probe, userId, this.llmProvider);
     // Релей сообщил, что ход закончился БЕЗ финального ответа: упёрлись в потолок
     // шагов, ход прерван новым сообщением пользователя, отказ CLI или сбой связи.
     // Такой ход не тарифицируется — платить за пустоту пользователь не должен.
@@ -1827,6 +1828,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
       if (final) {
         // Quality-телеметрия: пустой ответ / англ-утечка / объём — для агрегатов
         // и алертов регрессии (инициатива «гарантия качества», беклог a867ef3b).
+        // routed — выбор не Claude (личный или рубильник); «выбранный подвёл» — selected ≠ provider.
+        const routed = answerRoute.provider !== 'claude';
         this.events?.track('chat_quality', {
           userId, sessionId: `${userId}_${assistantId}`,
           props: {
@@ -1843,8 +1846,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
             fail_reason: failReason || undefined,
             provider: turnProvider,
             fallback: turnFallback || undefined,
-            // Выбор человека (не Claude): «выбранный подвёл» — selected ≠ provider.
-            selected: answerProvider === 'claude' ? undefined : answerProvider,
+            selected: routed ? answerRoute.provider : undefined,
+            choice: routed ? answerRoute.choice : undefined,
           },
         });
       }
@@ -2017,7 +2020,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // 'default'. В обоих случаях ход проходит — просто пин не действует,
         // и узнать об этом можно только по modelUsage, не по ошибке.
         fd.append('model', probe ? PROBE_MODEL : CHAT_MODEL);
-        for (const [k, v] of Object.entries(relayProviderFields(probe, answerProvider))) fd.append(k, v);
+        for (const [k, v] of Object.entries(relayProviderFields(probe, answerRoute.provider))) fd.append(k, v);
 
         // Agent-direct TalerID: when the user connected the TalerID ecosystem, hand
         // the file-agent a full-scope access token + the MCP base URL of the env we
@@ -2690,6 +2693,16 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const relaySid = sessionIdOverride ||
       relaySessionKey(userId, assistantId, await this.language.resolveUserLanguage(userId));
     fd.append('sessionId', relaySid);
+    // Модель ответов: личный выбор этого человека или общий рубильник (spec
+    // 2026-10-31-global-llm-switch, раздел 4) — рутины, «Путь», план действий,
+    // поездки, итоги и документы звонков, проба качества. ЛИЧНЫЙ выбор, а не
+    // только рубильник, — потому что рутины и «Путь» (без своей sessionIdOverride)
+    // пишут в ТУ ЖЕ сессию релея, что и чат человека (relaySessionKey выше —
+    // та же формула, что в основном пути). Разные модели у чата и у этих
+    // фоновых путей заставляли бы одну сессию скакать между провайдерами и
+    // каждый раз оплачивать весь контекст заново, без кэша.
+    const route = await resolveAnswerProvider(false, userId, this.llmProvider);
+    for (const [k, v] of Object.entries(relayProviderFields(false, route.provider))) fd.append(k, v);
     // Инструменты Linkeon — только когда вызывающий явно сказал linkeonTools:
     // true (см. AgentReplyOpts); по умолчанию — нет.
     if (opts.linkeonTools === true) appendLinkeonFields(fd, linkeonRelayFields(userId, relaySid));
@@ -2725,6 +2738,21 @@ ${LanguageService.buildDirective(userLanguage)}`;
                 for (const k of Object.keys(usage) as (keyof SdkUsageTotals)[]) {
                   const v = ev.usage[k];
                   if (typeof v === 'number' && v > 0) usage[k] += v;
+                }
+              }
+              // Видимость (ревью 1.11, spec 2026-10-31-global-llm-switch §4):
+              // цепочка релея может тихо ответить не той моделью, что выбрал
+              // route выше (недоступность выбранной). Только лог — НЕ событие
+              // chat_quality: этот путь (рутины, план действий, поездки,
+              // итоги/документы звонков, проба качества) не должен портить
+              // метрики монитора качества своими вызовами. При route.provider
+              // === 'claude' не проверяем: запросу не передан provider, и
+              // релей по тому же соглашению может не прислать его в done —
+              // readDoneProvider() тогда честно вернёт undefined, а не 'claude'.
+              if (route.provider !== 'claude') {
+                const { provider: turnProvider } = readDoneProvider(ev);
+                if (turnProvider && turnProvider !== route.provider) {
+                  this.logger.warn(`agentReply: выбрана ${route.provider} (${route.choice}), ответил ${turnProvider}`);
                 }
               }
             }

@@ -254,8 +254,22 @@ describe('planProviders', () => {
   const both = { qwen: cfg('qwen'), kimi: cfg('kimi') };
   const T = 10_000;
 
-  it('noFallback — только Claude, выбор не действует', () => {
-    expect(planProviders({ selected: 'kimi', configs: both, state: new FallbackState(), noFallback: true, now: T })).toEqual(['claude']);
+  it('noFallback с выбором (ход гостя) — только выбранная модель', () => {
+    expect(planProviders({ selected: 'kimi', configs: both, state: new FallbackState(), noFallback: true, now: T })).toEqual(['kimi']);
+  });
+  it('noFallback с выбором без ключа — Claude', () => {
+    expect(planProviders({ selected: 'qwen', configs: { qwen: null, kimi: cfg('kimi') }, state: new FallbackState(), noFallback: true, now: T })).toEqual(['claude']);
+  });
+  it('noFallback без выбора (проба мониторинга) — Claude', () => {
+    expect(planProviders({ configs: both, state: new FallbackState(), noFallback: true, now: T })).toEqual(['claude']);
+  });
+  it('noFallback с именем из прототипа — Claude', () => {
+    expect(planProviders({ selected: 'constructor' as any, configs: both, state: new FallbackState(), noFallback: true, now: T })).toEqual(['claude']);
+  });
+  it('noFallback с выбором, модель помечена не отвечающей — план всё равно эта модель (окно проверяет вызывающий)', () => {
+    const s = new FallbackState();
+    s.markDown('kimi', 60_000, T);
+    expect(planProviders({ selected: 'kimi', configs: both, state: s, noFallback: true, now: T + 1 })).toEqual(['kimi']);
   });
   it('окно Claude закрыто — Claude, Qwen, Kimi', () => {
     expect(planProviders({ configs: both, state: new FallbackState(), now: T })).toEqual(['claude', 'qwen', 'kimi']);
@@ -295,6 +309,22 @@ describe('planProviders', () => {
     const s = new FallbackState();
     s.markDown('kimi', 60_000, T);
     expect(planProviders({ selected: 'kimi', configs: both, state: s, now: T + 1 })).toEqual(['kimi', 'claude', 'qwen']);
+  });
+  // Уточнения по ревью 31.10: рубильник (respectDown) уважает окно «не
+  // отвечает» и не тратит на такую модель попытку; личный выбор (без
+  // respectDown, тест выше) — пробуется первым всегда.
+  it('respectDown: выбранная «не отвечает» — обычный путь без неё, попытку не тратим', () => {
+    const s = new FallbackState();
+    s.markDown('kimi', 60_000, T);
+    expect(planProviders({ selected: 'kimi', configs: both, state: s, now: T + 1, respectDown: true })).toEqual(['claude', 'qwen']);
+  });
+  it('respectDown, но выбранная отвечает — всё равно первой', () => {
+    expect(planProviders({ selected: 'kimi', configs: both, state: new FallbackState(), now: T, respectDown: true })).toEqual(['kimi', 'claude', 'qwen']);
+  });
+  it('noFallback — respectDown не действует (цепочки и так нет)', () => {
+    const s = new FallbackState();
+    s.markDown('kimi', 60_000, T);
+    expect(planProviders({ selected: 'kimi', configs: both, state: s, noFallback: true, now: T + 1, respectDown: true })).toEqual(['kimi']);
   });
   it('выбран без ключа — обычный путь', () => {
     expect(planProviders({ selected: 'kimi', configs: { qwen: cfg('qwen'), kimi: null }, state: new FallbackState(), now: T })).toEqual(['claude', 'qwen']);

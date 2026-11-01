@@ -11,7 +11,7 @@ describe('ClaudeHealthService — проба живости', () => {
   const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
   const probeWith = async (reply: string) => {
     const claudeCli = { text: jest.fn().mockResolvedValue(reply), fallbackStats: jest.fn() };
-    const svc = new ClaudeHealthService(pg as any, claudeCli as any);
+    const svc = new ClaudeHealthService(pg as any, claudeCli as any, { get: jest.fn(async () => 'claude') } as any);
     await (svc as any).probeLiveness();
     return { svc: svc as any, claudeCli };
   };

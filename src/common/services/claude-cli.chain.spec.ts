@@ -474,14 +474,13 @@ describe('ClaudeCliService — выбор пользователя Kimi', () => 
     expect(event(pg)).toMatchObject({ provider: 'qwen', fallback: true, selected: 'kimi' });
   });
 
-  it('noFallback с provider kimi — только Claude, selected в событии нет (пробы выбору не следуют)', async () => {
+  it('noFallback с provider kimi — только Kimi (ход гостя): один запуск, selected kimi', async () => {
     const pg = pgMock();
-    spawnMock.mockImplementationOnce(() => fakeProc(OK('c')));
-    expect(await new ClaudeCliService(pg as any).text('x', { provider: 'kimi', noFallback: true })).toBe('c');
+    spawnMock.mockImplementationOnce(() => fakeProc(OK('k')));
+    expect(await new ClaudeCliService(pg as any).text('x', { provider: 'kimi', noFallback: true })).toBe('k');
     expect(spawnMock).toHaveBeenCalledTimes(1);
-    expect(tokenOf(0)).toBeUndefined();
-    expect(event(pg)).toMatchObject({ provider: 'claude', fallback: false });
-    expect(event(pg)).not.toHaveProperty('selected');
+    expect(tokenOf(0)).toBe('sk-kimi-test');
+    expect(event(pg)).toMatchObject({ provider: 'kimi', fallback: false, selected: 'kimi', choice: 'user' });
   });
 
   it('имя из прототипа (constructor) — не выбор: обычный путь, selected в событии нет', async () => {

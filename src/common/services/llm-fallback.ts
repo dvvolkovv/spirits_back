@@ -13,6 +13,11 @@ import { classifyLlmError, LlmOutageKind } from '../llm-error';
 
 export type FallbackProvider = 'qwen' | 'kimi';
 export type AnswerProvider = 'claude' | FallbackProvider;
+/** Чей это выбор (spec 2026-10-31-global-llm-switch, «Уточнения по ревью
+ *  31.10»): личный выбор человека (карточка пользователя) или общий
+ *  рубильник. Рядом с `selected` в событии claude_cli_call; у
+ *  ClaudeCliOptions — поля provider и providerChoice. */
+export type ProviderChoice = 'user' | 'global';
 
 /** Порядок аварийной цепочки после Claude. */
 export const FALLBACK_ORDER: readonly FallbackProvider[] = ['qwen', 'kimi'];
@@ -203,7 +208,8 @@ export function fallbackSpawnEnv(base: NodeJS.ProcessEnv, cfg: FallbackConfig): 
 export const STATS_WINDOW_MS = 15 * 60_000;
 
 /**
- * Окна запасного пути — на процесс (spec 2026-10-31, раздел 2).
+ * Окна запасного пути — на процесс (spec 2026-10-31-kimi-provider-design,
+ * раздел 2).
  * Окно Claude: после сбоя доступа к Claude вызовы идут сразу к запасным.
  * Окно «не отвечает» у каждого запасного: после его сбоя доступа аварийная
  * цепочка его пропускает. Исходы аварийных вызовов — по провайдеру, за 15 мин.
@@ -275,33 +281,63 @@ export class FallbackState {
 }
 
 /**
- * План вызова — кого пробовать по порядку (spec 2026-10-31, раздел 3).
- * noFallback — только Claude. Обычный путь: окно Claude закрыто — Claude, затем
- * включённые и отвечающие запасные; открыто — только они (если таких нет — как
- * при закрытом). Выбранный пользователем (с ключом) — первым, даже если он
- * «не отвечает», затем обычный путь без него.
+ * План вызова — кого пробовать по порядку (spec 2026-10-31-kimi-provider-design,
+ * раздел 3). noFallback — одна модель: выбранная (ход гостя) или Claude
+ * (проба). Обычный путь: окно Claude закрыто — Claude, затем включённые и
+ * отвечающие запасные; открыто — только они (если таких нет — как при
+ * закрытом). Выбранный (с ключом) — первым, даже если он «не отвечает»,
+ * затем обычный путь без него — КРОМЕ respectDown (spec
+ * 2026-10-31-global-llm-switch, «Уточнения по ревью 31.10»): рубильник
+ * (choice: 'global' у вызывающего) такую модель пропускает и сразу идёт
+ * обычным путём без неё, не тратя попытку; личный выбор respectDown не
+ * передаёт — пробуется первым всегда, это осознанная проверка одного
+ * человека, и её сбой должен быть виден.
  */
 export function planProviders(args: {
   selected?: FallbackProvider;
   configs: FallbackConfigs;
   state: FallbackState;
   noFallback?: boolean;
+  respectDown?: boolean;
   now?: number;
 }): AnswerProvider[] {
-  if (args.noFallback) return ['claude'];
-  const now = args.now ?? Date.now();
-  const normal = (exclude?: FallbackProvider): AnswerProvider[] => {
-    const alts = FALLBACK_ORDER.filter((n) => n !== exclude && !!args.configs[n] && !args.state.isDown(n, now));
-    return args.state.claudeWindowOpen(now) && alts.length > 0 ? [...alts] : ['claude', ...alts];
-  };
   // Истинностью, не !== null: незнакомое значение selected (например, мусор из
   // БД) даёт configs[selected] === undefined, а undefined !== null — истина,
   // и мусор встал бы первым в план. FALLBACK_ORDER.includes — отдельная защита:
   // имя из прототипа объекта (например 'constructor') даёт configs[selected]
   // правду через цепочку прототипов, а не null/undefined, и первую проверку
   // не ловит вовсе.
-  if (args.selected && FALLBACK_ORDER.includes(args.selected) && args.configs[args.selected]) {
-    return [args.selected, ...normal(args.selected)];
+  const usable = (s?: FallbackProvider): s is FallbackProvider => !!s && FALLBACK_ORDER.includes(s) && !!args.configs[s];
+  const s = args.selected;
+  // noFallback — без цепочки (spec 2026-10-31-global-llm-switch, раздел 3):
+  // проба мониторинга (без выбора) — только Claude; ход гостя — только модель
+  // рубильника, если у неё есть ключ, иначе Claude. Окно isDown здесь не
+  // проверяется намеренно (respectDown в этой ветке тоже не действует): при
+  // noFallback цепочки нет, переключаться не на кого, так что помеченность
+  // «не отвечает» ничего не меняет — окно проверяет вызывающий. На релее
+  // noFallback — по-прежнему только Claude (relay-agent/llm-fallback.mjs):
+  // бэкенд не шлёт релею noFallback вместе с provider — к релею с noFallback
+  // ходят только пробы. Расхождение намеренное, не выравнивать.
+  if (args.noFallback) {
+    return usable(s) ? [s] : ['claude'];
+  }
+  const now = args.now ?? Date.now();
+  const normal = (exclude?: FallbackProvider): AnswerProvider[] => {
+    const alts = FALLBACK_ORDER.filter((n) => n !== exclude && !!args.configs[n] && !args.state.isDown(n, now));
+    return args.state.claudeWindowOpen(now) && alts.length > 0 ? [...alts] : ['claude', ...alts];
+  };
+  if (usable(s)) {
+    // Рубильник уважает окно «не отвечает»: не тратить попытку на модель,
+    // которую уже недавно уронили — сразу обычный путь без неё (она и так
+    // отсеется из normal() фильтром isDown).
+    //
+    // На релее respectDown нет: выбранная модель всегда первой
+    // (relay-agent/llm-fallback.mjs) — релей не знает, чей это выбор, и
+    // веб-чат при лежащей модели рубильника тратит на неё попытку каждый
+    // ход. Расхождение намеренное до отдельного решения о релее (спека
+    // 2026-10-31-global-llm-switch, раздел 4) — не выравнивать молча.
+    if (args.respectDown && args.state.isDown(s, now)) return normal();
+    return [s, ...normal(s)];
   }
   return normal();
 }

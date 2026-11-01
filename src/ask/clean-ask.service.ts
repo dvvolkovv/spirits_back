@@ -3,6 +3,8 @@ import axios from 'axios';
 import { randomUUID } from 'crypto';
 import { AgentsService } from '../agents/agents.service';
 import { relayAuthHeaders } from '../chat/relay-auth';
+import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
+import { relayProviderFields } from '../chat/answer-provider';
 
 /**
  * «Поговорить начисто» [owner 2026-08-24] — запрос в облачный LLM, НЕ связанный с пользователем.
@@ -13,7 +15,9 @@ import { relayAuthHeaders } from '../chat/relay-auth';
  *   • sessionId — ЭФЕМЕРНЫЙ, случайный на каждый запрос (`anon_<uuid>`), НЕ `<userId>_...`: релей
  *     (r.linkeon.io) не склеивает вопрос с личными чатами и не переиспользует память по пользователю.
  *   • ничего не сохраняем: ни custom_chat_history, ни профиль. Ответ отдаём и забываем.
- *   • всё идёт через ОБЩИЙ Claude-аккаунт Linkeon → провайдер видит «Linkeon», не человека.
+ *   • всё идёт через модель общего рубильника Linkeon (spec 2026-10-31-global-llm-switch,
+ *     §4: Claude, Qwen или Kimi — по общей настройке, не по аккаунту конкретного человека) →
+ *     провайдер видит «Linkeon», не человека.
  *
  * Что это НЕ прячет (честно): если сам текст вопроса самоидентифицирующий, архитектура тут бессильна —
  * это на стороне формулировки пользователя.
@@ -26,7 +30,12 @@ export class CleanAskService {
   // персонажа) — это НЕ данные пользователя, а определение персонажа; профиль остаётся строго
   // телефон-де-ид (context приходит уже обезличенным). Грузим system_prompt персонажа из БД, как
   // это делает полный чат, и накладываем на телефон-подготовленный контекст.
-  constructor(private readonly agents: AgentsService) {}
+  constructor(
+    private readonly agents: AgentsService,
+    // Общий рубильник модели (spec 2026-10-31-global-llm-switch). Без
+    // @Optional(): поломка DI роняет старт, а не оставляет молча Claude.
+    private readonly globalProvider?: GlobalLlmProviderService,
+  ) {}
 
   private static readonly SYSTEM =
     'Ты — живой, тактичный собеседник в приватном чате. Это ДИАЛОГ, а не справка: отвечай КОРОТКО и ' +
@@ -100,6 +109,13 @@ export class CleanAskService {
     fd.append('message', message);
     // Эфемерная, ни к кому не привязанная сессия — новая на каждый запрос.
     fd.append('sessionId', `anon_${randomUUID()}`);
+    const provider = this.globalProvider ? await this.globalProvider.get() : 'claude';
+    // probe=false — цепочка релея (Claude → Qwen → Kimi) сохранена намеренно
+    // (spec 2026-10-31-global-llm-switch §4), в отличие от гостей пробы
+    // (§6, guest-turn.service.ts — без цепочки): у первого контакта и
+    // «поговорить начисто» нет экрана «войдите» как запасного варианта,
+    // если выбранная модель недоступна.
+    for (const [k, v] of Object.entries(relayProviderFields(false, provider))) fd.append(k, v);
 
     const chunks: string[] = [];
     const resp = await axios.post(`${AGENT_URL}/chat`, fd, {

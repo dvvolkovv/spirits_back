@@ -37,7 +37,8 @@ export class ChatController {
     private readonly jwtSvc: JwtService,
     @Optional() private readonly neo4j: Neo4jService,
     @Optional() private readonly events?: EventsService,
-    // Модель ответов человека (админка, spec 2026-10-30-llm-provider-switch) —
+    // Модель ответов человека: личный выбор или общий рубильник (админка,
+    // spec 2026-10-30-llm-provider-switch, 2026-10-31-global-llm-switch) —
     // для хода с файлами. Последним и @Optional: спеки собирают контроллер позиционно.
     @Optional() private readonly llmProvider?: UserLlmProviderService,
   ) {}
@@ -298,7 +299,7 @@ export class ChatController {
 
     // Модель ответов человека — тот же выбор, что у текстового хода
     // (streamUniversalAgent). Проб мониторинга у загрузки нет.
-    const answerProvider = await resolveAnswerProvider(false, userId, this.llmProvider);
+    const answerRoute = await resolveAnswerProvider(false, userId, this.llmProvider);
 
     // Proxy file + message to remote agent server
     const FormData = require('form-data');
@@ -322,8 +323,8 @@ export class ChatController {
     fd.append('products_mcp_url', handoff.products.products_mcp_url);
     // Инструменты Linkeon и папка хода — как у текстового хода (linkeon-relay-fields.ts).
     appendLinkeonFields(fd, handoff.linkeon);
-    // Выбор Qwen/Kimi — релей сразу идёт к выбранному (answer-provider.ts).
-    for (const [k, v] of Object.entries(relayProviderFields(false, answerProvider))) fd.append(k, v);
+    // Модель (личный выбор или рубильник) — релей сразу идёт к ней (answer-provider.ts).
+    for (const [k, v] of Object.entries(relayProviderFields(false, answerRoute.provider))) fd.append(k, v);
 
     // Set streaming headers
     res.status(200);
