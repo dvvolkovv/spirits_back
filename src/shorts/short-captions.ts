@@ -116,6 +116,10 @@ export interface ReviewCaptionInput {
   captions: ShortCaptions;
   /** Ролик со сценками: состав (skitCastLine) и траты на оживление. */
   skits?: { cast: string; animation: ShortAnimation | null; maxOmniSeconds?: number };
+  /** Самопочинки текущего круга словами (recoveryWords, short-doctor.ts). */
+  selfHealed?: string;
+  /** Доктор собрал ролик без сценок — почему: причина сбоя из истории. */
+  noSkitsReason?: string;
 }
 
 /** Состав сценок одной строкой: герой — роль, по первому появлению («Гусыня Галина Петровна — хозяйка квартиры, Капибара Кеша — жилец»). */
@@ -150,6 +154,8 @@ export function buildReviewCaption(i: ReviewCaptionInput): { caption: string; ex
     `Ассистент: ${i.assistantName}`,
     `Вопрос: «${clip(i.question, 300)}»`,
     ...(i.skits ? [`Сценки: ${clip(i.skits.cast, 200)}`, omniSpendLine(i.skits.animation, i.skits.maxOmniSeconds)] : []),
+    ...(i.selfHealed ? [`Сам восстанавливался: ${clip(i.selfHealed, 300)}`] : []),
+    ...(i.noSkitsReason ? [`Собран без сценок: ${clip(i.noSkitsReason, 200)}`] : []),
     `Выйдет: ${i.when}`,
   ].join('\n');
   const texts = [

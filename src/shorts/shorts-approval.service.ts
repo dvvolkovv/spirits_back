@@ -260,6 +260,9 @@ export class ShortsApprovalService {
     const when = v.slotAt && v.slotAt.getTime() > now.getTime()
       ? formatSlotWhen(v.slotAt, now)
       : 'в ближайший свободный слот после одобрения';
+    // Самопочинки текущего круга — владельцу на проверке: что ролик пережил и почему он без сценок.
+    const circle = currentCircle(v);
+    const noSkits = circle.find((r) => r.action === 'no_skits');
     const { caption, extra } = buildReviewCaption({
       stand: isStand(),
       rubric: v.rubric,
@@ -272,6 +275,8 @@ export class ShortsApprovalService {
       ...(v.script?.skits
         ? { skits: { cast: skitCastLine(v.script.skits), animation: v.animation, maxOmniSeconds: (await this.settings.get()).maxOmniSeconds } }
         : {}),
+      ...(circle.length ? { selfHealed: recoveryWords(circle) } : {}),
+      ...(noSkits ? { noSkitsReason: noSkits.reason || noSkits.code || 'причина не записана' } : {}),
     });
     const msg: any = await this.tg.sendVideo(chatId, video, {
       caption,
