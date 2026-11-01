@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException } from '@nestjs/common';
+import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
 import { AgentVersionsService } from './agent-versions.service';
 
 const live = {
@@ -100,6 +100,7 @@ describe('AgentVersionsService', () => {
   ])('rejects a stale base with 409 when $case and does not insert', async ({ rows }) => {
     const { service, query } = makeService();
     query.mockResolvedValueOnce({ rows });
+    if (rows.length === 0) query.mockResolvedValueOnce({ rows: [{ id: 12 }] });
 
     const error = await service
       .createDraft('admin', 12, draftInput)
@@ -107,7 +108,22 @@ describe('AgentVersionsService', () => {
 
     expect(error).toBeInstanceOf(ConflictException);
     expect(error.getStatus()).toBe(409);
-    expect(query).toHaveBeenCalledTimes(1);
+    expect(query).toHaveBeenCalledTimes(rows.length === 0 ? 2 : 1);
+  });
+
+  it('returns 404 instead of stale-base 409 when creating a draft for an unknown agent', async () => {
+    const { service, query } = makeService();
+    query
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const error = await service.createDraft('admin', 999, draftInput).catch((e) => e);
+
+    expect(error).toBeInstanceOf(NotFoundException);
+    expect(error.getStatus()).toBe(404);
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(query.mock.calls[1][0]).toMatch(/FROM agents WHERE id = \$1/i);
+    expect(query.mock.calls[1][1]).toEqual([999]);
   });
 
   it.each([
@@ -265,12 +281,53 @@ describe('AgentVersionsService', () => {
 
   it('returns 404 when the version does not belong to the agent', async () => {
     const { service, query } = makeService();
-    query.mockResolvedValueOnce({ rows: [] });
+    query
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ id: 12 }] });
 
     const error = await service.getVersion(12, live.id).catch((e) => e);
 
     expect(error.getStatus()).toBe(404);
     expect(query.mock.calls[0][1]).toEqual([live.id, 12]);
+  });
+
+  it('returns 404 for a version of an unknown agent', async () => {
+    const { service, query } = makeService();
+    query
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const error = await service.getVersion(999, live.id).catch((e) => e);
+
+    expect(error).toBeInstanceOf(NotFoundException);
+    expect(error.getStatus()).toBe(404);
+    expect(query.mock.calls[1][0]).toMatch(/FROM agents WHERE id = \$1/i);
+  });
+
+  it('returns 404 for version history of an unknown agent', async () => {
+    const { service, query } = makeService();
+    query
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const error = await service.listVersions(999).catch((e) => e);
+
+    expect(error).toBeInstanceOf(NotFoundException);
+    expect(error.getStatus()).toBe(404);
+    expect(query.mock.calls[1][0]).toMatch(/FROM agents WHERE id = \$1/i);
+  });
+
+  it('returns 404 for state of an unknown agent', async () => {
+    const { service, query } = makeService();
+    query
+      .mockResolvedValueOnce({ rows: [{ published: null, draft: null }] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const error = await service.getState(999).catch((e) => e);
+
+    expect(error).toBeInstanceOf(NotFoundException);
+    expect(error.getStatus()).toBe(404);
+    expect(query.mock.calls[1][0]).toMatch(/FROM agents WHERE id = \$1/i);
   });
 
   it.each([

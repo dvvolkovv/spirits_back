@@ -102,6 +102,14 @@ export class AgentVersionsService implements OnModuleInit {
     return result.rows[0] ? toAgentVersion(result.rows[0]) : null;
   }
 
+  private async requireAgent(agentId: number): Promise<void> {
+    const result = await this.pg.query(
+      'SELECT id FROM agents WHERE id = $1',
+      [agentId],
+    );
+    if (!result.rows[0]) throw new NotFoundException('Agent not found');
+  }
+
   async getVersion(agentId: number, versionId: string): Promise<AgentVersion> {
     const result = await this.pg.query(
       `SELECT * FROM agent_versions
@@ -109,6 +117,7 @@ export class AgentVersionsService implements OnModuleInit {
       [versionId, agentId],
     );
     if (!result.rows[0]) {
+      await this.requireAgent(agentId);
       throw new NotFoundException('Agent version not found');
     }
     return toAgentVersion(result.rows[0]);
@@ -232,6 +241,7 @@ export class AgentVersionsService implements OnModuleInit {
        LIMIT $2`,
       [agentId, boundedLimit],
     );
+    if (result.rows.length === 0) await this.requireAgent(agentId);
     return result.rows.map(toAgentVersion);
   }
 
@@ -256,6 +266,7 @@ export class AgentVersionsService implements OnModuleInit {
       [agentId],
     );
     const state = result.rows[0];
+    if (!state.published && !state.draft) await this.requireAgent(agentId);
     return {
       published: state.published ? toAgentVersion(state.published) : null,
       draft: state.draft ? toAgentVersion(state.draft) : null,
@@ -350,6 +361,7 @@ export class AgentVersionsService implements OnModuleInit {
     );
 
     const base = await this.latest(agentId);
+    if (!base) await this.requireAgent(agentId);
     if (!base || base.id !== data.base_version_id) {
       throw new ConflictException('Base version is stale');
     }

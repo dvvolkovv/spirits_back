@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import * as http from 'http';
-import { INestApplication, Module, ValidationPipe } from '@nestjs/common';
+import { INestApplication, Module, NotFoundException, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AgentVersionsController } from './agent-versions.controller';
 import { AgentVersionsService } from './agent-versions.service';
@@ -40,6 +40,24 @@ function post(
   });
 }
 
+function get(url: string, token: string): Promise<{ status: number; body: any }> {
+  return new Promise((resolve, reject) => {
+    const req = http.get(url, {
+      agent: false,
+      headers: { authorization: `Bearer ${token}` },
+    }, (res) => {
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => resolve({
+        status: res.statusCode || 0,
+        body: data ? JSON.parse(data) : null,
+      }));
+    });
+    req.on('error', reject);
+  });
+}
+
 describe('AgentVersionsController HTTP validation', () => {
   let app: INestApplication;
   let base: string;
@@ -49,6 +67,8 @@ describe('AgentVersionsController HTTP validation', () => {
     publish: jest.fn(),
     testVersion: jest.fn(),
     getVersion: jest.fn(),
+    getState: jest.fn(),
+    listVersions: jest.fn(),
   };
 
   beforeAll(async () => {
@@ -80,6 +100,36 @@ describe('AgentVersionsController HTTP validation', () => {
     service.publish.mockReset().mockResolvedValue({ id: VERSION_ID });
     service.testVersion.mockReset().mockResolvedValue({ text: 'ok' });
     service.getVersion.mockReset().mockResolvedValue({ id: VERSION_ID });
+    service.getState.mockReset().mockResolvedValue({ published: null, draft: null });
+    service.listVersions.mockReset().mockResolvedValue([]);
+  });
+
+  it('maps an unknown agent state to HTTP 404', async () => {
+    service.getState.mockRejectedValueOnce(new NotFoundException('Agent not found'));
+
+    const response = await get(`${base}/state`, token);
+
+    expect(response.status).toBe(404);
+    expect(service.getState).toHaveBeenCalledWith(7);
+  });
+
+  it('maps unknown agent version history to HTTP 404', async () => {
+    service.listVersions.mockRejectedValueOnce(new NotFoundException('Agent not found'));
+
+    const response = await get(`${base}/versions`, token);
+
+    expect(response.status).toBe(404);
+    expect(service.listVersions).toHaveBeenCalledWith(7, 50);
+  });
+
+  it('maps draft creation for an unknown agent to HTTP 404', async () => {
+    service.createDraft.mockRejectedValueOnce(new NotFoundException('Agent not found'));
+    const body = { system_prompt: 'prompt', base_version_id: PUBLISHED_ID };
+
+    const response = await post(`${base}/drafts`, token, body);
+
+    expect(response.status).toBe(404);
+    expect(service.createDraft).toHaveBeenCalledWith('admin-1', 7, body);
   });
 
   it.each([
