@@ -42,10 +42,10 @@ describe('контракт API и студии', () => {
     ]) {
       expect(db).toContain(s);
     }
-    // omni_base — в RETURNING захвата: без неё omniBase — undefined, и предел снова на весь ролик.
+    // omni_base — в RETURNING захвата: без неё row.omni_base — undefined, начало круга — 0, и предел снова на весь ролик.
     // Писать её студия не должна: круг начинает только кнопка владельца.
     expect(db).toMatch(/RETURNING[^`]*\bomni_base\b/);
-    expect(db).not.toMatch(/omni_base\s*=/);
+    expect(db).not.toMatch(/SET[^`]*\bomni_base\s*=(?!=)/);
   });
 
   it('ключи видео и обложки — те, что API шлёт в Telegram', () => {

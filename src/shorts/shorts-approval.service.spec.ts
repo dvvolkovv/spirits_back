@@ -212,7 +212,11 @@ describe('ShortsApprovalService', () => {
       await svc.sendForReview(rowToShort(v), LEASE);
       const caption = (tg.sendVideo.mock.calls[0] as any[])[2].caption;
       expect(caption).toContain('Сам восстанавливался: повтор через 30 мин (google_quota), без сценок (omni_budget)');
-      expect(caption).toContain('Собран без сценок: оживление: предел секунд');
+      expect(caption).toContain('Собран без сценок: исчерпан предел секунд Omni на круг — сценки вернёт «Переснять» (новый круг)');
+      const other = fresh({ format: 'chat', auto_recoveries: 1, recoveries: [{ ...recoveries[1], code: 'omni_bad_request', reason: 'оживление: Omni отклонил запрос' }] });
+      const s1 = setup(other);
+      await s1.svc.sendForReview(rowToShort(other), LEASE);
+      expect((s1.tg.sendVideo.mock.calls[0] as any[])[2].caption).toContain('Собран без сценок: оживление: Omni отклонил запрос');
     });
 
     it('подпись — только текущий круг: прошлый «без сценок» (до «Переснять») не попадает', async () => {

@@ -1,4 +1,4 @@
-import { DOCTOR_NOTE_PREFIX, LATER_DELAYS_MIN, MAX_AUTO_RECOVERIES, currentCircle, newSceneNote, prescribe, recoveryEntry, recoveryWords } from './short-doctor';
+import { DOCTOR_NOTE_PREFIX, LATER_DELAYS_MIN, MAX_AUTO_RECOVERIES, OMNI_BUDGET_NO_SKITS, currentCircle, newSceneNote, noSkitsWords, prescribe, recoveryEntry, recoveryWords } from './short-doctor';
 import type { ShortRecovery, ShortStatus } from './shorts.types';
 
 const rec = (action: ShortRecovery['action'], over: Partial<ShortRecovery> = {}): ShortRecovery => ({
@@ -124,6 +124,17 @@ describe('слова и записи', () => {
       rec('later', { delayMin: 30 }), rec('later', { delayMin: 120 }),
       rec('new_scene', { code: 'answer_rejected' }), rec('no_skits', { code: null }),
     ])).toBe('повтор через 30 мин (google_quota), повтор через 2 ч (google_quota), новая сцена (answer_rejected), без сценок (без кода)');
+  });
+
+  it('noSkitsWords: предел секунд Omni — постоянной строкой с выходом, остальное — причина из истории', () => {
+    const r = (over: Partial<ShortRecovery>): ShortRecovery => ({
+      at: '2030-01-01T08:00:00.000Z', from: 'animating', code: 'omni_bad_request', action: 'no_skits', reason: 'оживление: Omni отклонил запрос', ...over,
+    });
+    expect(OMNI_BUDGET_NO_SKITS).toBe('исчерпан предел секунд Omni на круг — сценки вернёт «Переснять» (новый круг)');
+    expect(noSkitsWords(r({ code: 'omni_budget', reason: 'оживление: не услышаны реплики 2 …; переснять не на что — на ролик ушло 48 с Omni …' }))).toBe(OMNI_BUDGET_NO_SKITS);
+    expect(noSkitsWords(r({}))).toBe('оживление: Omni отклонил запрос');
+    expect(noSkitsWords(r({ reason: '' }))).toBe('omni_bad_request');
+    expect(noSkitsWords(r({ reason: '', code: null }))).toBe('причина не записана');
   });
 
   it('recoveryEntry: этап, код, действие; пауза — только у «позже»; причина — до 300 знаков', () => {
