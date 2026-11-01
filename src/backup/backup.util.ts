@@ -20,11 +20,32 @@ export interface ParsedUpload {
 
 export class BackupValidationError extends Error {}
 
+// Самая длинная строка base64, которая может уложиться в MAX_BACKUP_BYTES байт.
+const MAX_BACKUP_BASE64_CHARS = Math.ceil(MAX_BACKUP_BYTES / 3) * 4;
+
+// Алфавит проверяется поиском одного чужого символа — без якорей и квантификаторов.
+// Прежняя регулярка ^[A-Za-z0-9+/]+={0,2}$ на строке в миллионы символов копила точку
+// отката на каждый символ и падала RangeError «Maximum call stack size exceeded»:
+// в ручке это 500 вместо отказа (флак выката 01.11.2026). Правила те же: хотя бы один
+// символ алфавита, «=» — только в конце и не больше двух.
+const NON_BASE64_CHAR = /[^A-Za-z0-9+/]/;
+
+function isStandardBase64(s: string): boolean {
+  const eq = s.indexOf('=');
+  const data = eq === -1 ? s : s.slice(0, eq);
+  const padding = eq === -1 ? '' : s.slice(eq);
+  return data.length > 0 && (padding === '' || padding === '=' || padding === '==') && !NON_BASE64_CHAR.test(data);
+}
+
 export function parseBackupUpload(body: any): ParsedUpload {
   if (!body || typeof body.blob !== 'string' || body.blob.length === 0) {
     throw new BackupValidationError('blob (base64) required');
   }
-  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(body.blob)) {
+  // Заведомо длинный блоб — отказ по размеру ещё до прохода по символам.
+  if (body.blob.length > MAX_BACKUP_BASE64_CHARS) {
+    throw new BackupValidationError('blob exceeds size limit');
+  }
+  if (!isStandardBase64(body.blob)) {
     throw new BackupValidationError('blob must be standard base64');
   }
   const bytes = Buffer.from(body.blob, 'base64');
