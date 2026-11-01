@@ -107,8 +107,11 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-schema.spe
 -- ALTER TABLE берёт ACCESS EXCLUSIVE даже с IF NOT EXISTS и на каждом старте
 -- ждал бы открытые записи (шапка 001).
 --
--- ОТКАТ (код без очереди 2а колонку не читает): убрать 004 из ShortsSchemaService, затем
---   ALTER TABLE short_video DROP COLUMN skit_feedback;
+-- ОТКАТ: сначала весь код очереди 2а — API и студия (linkeon-studio перезапущена на
+-- старом коде): LIST_COLUMNS, сценарист, «Повторить» и failJob студии читают и пишут
+-- колонку. Колонку можно и оставить — старый код её не видит. Снять: убрать 004 из
+-- ShortsSchemaService, затем
+--   SET lock_timeout = '5s'; ALTER TABLE short_video DROP COLUMN skit_feedback;
 DO $shorts$
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('shorts/004'));
@@ -170,7 +173,7 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-schema.spe
 
 **Files:**
 - Modify: `src/shorts/shorts.types.ts`
-- Test: `src/shorts/shorts.types.spec.ts`
+- Test: `src/shorts/shorts.types.spec.ts`, `src/shorts/shorts.integration.spec.ts` (фикстура «тонкого SELECT»)
 
 - [ ] **Step 1: Написать падающий тест**
 
@@ -184,10 +187,19 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-schema.spe
   });
 ```
 
+В `src/shorts/shorts.integration.spec.ts`, в фикстуре теста про тонкий SELECT списка (вставка с `owner_note: 'замечание-тест', writer_feedback: 'отзыв-тест', writer_rounds: 3,`), заменить эту строку на
+
+```ts
+      owner_note: 'замечание-тест', writer_feedback: 'отзыв-тест', writer_rounds: 3,
+      skit_feedback: { kind: 'punchline', code: 'speech_mismatch', lines: [2], heard: 'услышано-тест', reason: null },
+```
+
+— правило теста: каждое лёгкое поле не NULL и не умолчание `rowToShort`, иначе тонкий SELECT без колонки прошёл бы незамеченным.
+
 - [ ] **Step 2: Закоммитить красное и убедиться, что падает**
 
 ```bash
-git add src/shorts/shorts.types.spec.ts
+git add src/shorts/shorts.types.spec.ts src/shorts/shorts.integration.spec.ts
 git commit -m "test(shorts): ролик несёт отзыв студии о сценке (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.types.spec.ts 2>&1 | tail -12"
 ```
@@ -250,10 +262,10 @@ export interface ShortSkitFeedback {
 ```bash
 git add src/shorts/shorts.types.ts
 git commit -m "feat(shorts): ShortSkitFeedback — отзыв студии о сценке в ролике" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
-NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.types.spec.ts src/shorts/shorts.controller.spec.ts 2>&1 | grep -E '^Tests:'"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.types.spec.ts src/shorts/shorts.controller.spec.ts 2>&1 | grep -E '^Tests:'; SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts 2>&1 | grep -E '^Tests:'"
 ```
 
-Ожидается: `Tests:` без `failed`.
+Ожидается: обе строки `Tests:` без `failed`.
 
 ---
 
@@ -1130,6 +1142,6 @@ UPDATE short_video
 
 4. Следить за роликом (раз в 30 с): `writing` → `animate_queued` → `render_queued` → `pending_review`. Проверить: `script->'skits'->'punchline'->>'keyframeFingerprint'` = прежний `kf`, `fingerprint` ≠ прежний `fp`, `animation->>'omniSeconds'` вырос на 8, в журнале студии стенда — один `startClip` развязки и «готово с попытки 1» только у `punchline`; `skit_feedback` и `writer_feedback` — `NULL`.
 
-- [ ] **Step 3 (контролёр, OK владельца): слияние и выкат** — как задача 6 плана очереди 1: `merge --no-ff` в свежий `origin/main`, `deploy.sh` с ноды `BACK_ONLY=1 SKIP_BOTS=1` из свежих клонов, проверка прода (`MAX_SPEECH_MISSES` в `studio/src/animate/run-animate.ts`, колонка `skit_feedback` в `short_video`, `linkeon-studio` перезапущена).
+- [ ] **Step 3 (контролёр, OK владельца): слияние и выкат** — как задача 6 плана очереди 1: `merge --no-ff` в свежий `origin/main`, `deploy.sh` с ноды `BACK_ONLY=1 SKIP_BOTS=1` из свежих клонов, проверка прода (`MAX_SPEECH_MISSES` в `studio/src/animate/run-animate.ts`, колонка `skit_feedback` в `short_video`, `linkeon-studio` перезапущена). Колонки нет — первый накат не дождался замка (`lock_timeout` 5 с): в журнале API `shorts migration 004_skit_feedback.sql failed … lock timeout`, блокирующую сессию — в `pg_stat_activity`, затем рестарт API (проверив, что нет живых ходов); без колонки список «Ролики» в админке отвечает 500.
 
 - [ ] **Step 4: Заметка памяти и рабочее состояние** — очередь 2а на проде (sha), дальше — план 2б (доктор упавших).
