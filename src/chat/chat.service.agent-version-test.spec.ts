@@ -39,7 +39,10 @@ function fieldsOf(form: any): Record<string, string> {
   return fields;
 }
 
-function replyHarness() {
+function replyHarness(events: any[] = [
+  { type: 'delta', text: 'draft answer' },
+  { type: 'done', costUsd: 8.5, turnCostUsd: 0.01 },
+]) {
   const pg = {
     query: jest.fn(async (sql: string) =>
       /FROM agents WHERE id/.test(sql) ? { rows: [LIVE_AGENT] } : { rows: [] }),
@@ -64,12 +67,7 @@ function replyHarness() {
     businessProfile as any,
   );
   const post = axios.post as jest.Mock;
-  post.mockImplementation(async () => ({
-    data: sseStream([
-      { type: 'delta', text: 'draft answer' },
-      { type: 'done', costUsd: 0.01, turnCostUsd: 0.01 },
-    ]),
-  }));
+  post.mockImplementation(async () => ({ data: sseStream(events) }));
   const lastFields = () => fieldsOf(post.mock.calls[post.mock.calls.length - 1][1]);
   return { service, pg, neo4j, businessProfile, post, lastFields };
 }
@@ -77,23 +75,43 @@ function replyHarness() {
 beforeEach(() => jest.clearAllMocks());
 
 describe('agentReply: isolated agent version test', () => {
-  it('uses the draft prompt without user context, Linkeon tools, or chat history', async () => {
-    const h = replyHarness();
+  const testOpts = {
+    systemPromptOverride: 'DRAFT SYSTEM PROMPT',
+    includeUserContext: false,
+    linkeonTools: false,
+    testMode: true,
+    billingContext: 'agent_version_test',
+  };
 
-    const result = await h.service.generateAgentReplyWithCharge(
-      'admin',
-      '12',
-      'check the draft',
-      'agent_test_admin_0123456789abcdef0123456789abcdef',
-      {
-        systemPromptOverride: 'DRAFT SYSTEM PROMPT',
-        includeUserContext: false,
-        linkeonTools: false,
-      },
-    );
+  it('uses read-only multipart mode and returns per-turn charge facts and elapsed time', async () => {
+    const h = replyHarness();
+    const log = jest.spyOn((h.service as any).logger, 'log').mockImplementation(() => {});
+    const now = jest.spyOn(Date, 'now')
+      .mockReturnValueOnce(1000)
+      .mockReturnValueOnce(1650);
+    let result: any;
+    try {
+      result = await h.service.generateAgentReplyWithCharge(
+        'admin',
+        '12',
+        'check the draft',
+        'agent_test_signed_session',
+        testOpts,
+      );
+    } finally {
+      now.mockRestore();
+    }
 
     expect(result.text).toBe('draft answer');
+    expect(result.durationMs).toBe(650);
+    expect(result.charge).toMatchObject({
+      tokens: 72,
+      usd: 0.01,
+      source: 'cost',
+      turnUsd: 0.01,
+    });
     const fields = h.lastFields();
+    expect(fields.testMode).toBe('true');
     expect(fields.systemPrompt).toContain('DRAFT SYSTEM PROMPT');
     expect(fields.systemPrompt).not.toContain('LIVE SYSTEM PROMPT');
     expect(fields.systemPrompt).not.toContain('User profile');
@@ -107,14 +125,23 @@ describe('agentReply: isolated agent version test', () => {
     expect(
       h.pg.query.mock.calls.some(([sql]) => /INSERT INTO custom_chat_history/i.test(sql)),
     ).toBe(false);
+    expect(log.mock.calls.map(([line]) => String(line))).toContainEqual(
+      expect.stringContaining('billing[agent_version_test:cost]'),
+    );
+    expect(log.mock.calls.map(([line]) => String(line)).join('\n')).not.toContain('billing[voice]');
   });
 
-  it('keeps the live prompt and existing profile behavior by default', async () => {
-    const h = replyHarness();
+  it('keeps live prompt, profile, relay mode, and failed-event behavior by default', async () => {
+    const h = replyHarness([
+      { type: 'delta', text: 'legacy partial' },
+      { type: 'done', failed: true, costUsd: 0.01, turnCostUsd: 0.01 },
+    ]);
 
-    await h.service.generateAgentReply('user', '12', 'ordinary reply');
+    const result = await h.service.generateAgentReplyWithCharge('user', '12', 'ordinary reply');
 
+    expect(result.text).toBe('legacy partial');
     const fields = h.lastFields();
+    expect(fields.testMode).toBeUndefined();
     expect(fields.systemPrompt).toContain('LIVE SYSTEM PROMPT');
     expect(fields.systemPrompt).toContain('User profile:\nLIVE USER PROFILE');
     expect(fields.systemPrompt).toContain('LIVE BUSINESS PROFILE');
@@ -122,7 +149,37 @@ describe('agentReply: isolated agent version test', () => {
     expect(h.businessProfile.renderForPrompt).toHaveBeenCalledWith('user', 'business');
   });
 
-  it('records a version test charge through the existing token task writer', async () => {
+  it.each([
+    {
+      case: 'done.failed',
+      events: [{ type: 'delta', text: 'partial' }, { type: 'done', failed: true }],
+    },
+    { case: 'an empty stream', events: [] },
+    {
+      case: 'raw CLI failure text',
+      events: [{ type: 'delta', text: 'Not logged in · Please run /login' }, { type: 'done' }],
+    },
+    {
+      case: 'a zero-token upstream error',
+      events: [{ type: 'delta', text: 'disabled claude subscription access' }, { type: 'done' }],
+    },
+  ])('rejects $case in strict test mode', async ({ events }) => {
+    const h = replyHarness(events);
+    const addTokenTask = jest.spyOn(h.service as any, 'addTokenTask');
+
+    await expect(
+      h.service.generateAgentReplyWithCharge(
+        'admin',
+        '12',
+        'check',
+        'agent_test_signed_session',
+        { testMode: true },
+      ),
+    ).rejects.toThrow(/Agent version test failed/);
+    expect(addTokenTask).not.toHaveBeenCalled();
+  });
+
+  it('records accurate per-turn facts through the existing token task writer', async () => {
     const h = replyHarness();
     const addTokenTask = jest
       .spyOn(h.service as any, 'addTokenTask')
@@ -131,15 +188,38 @@ describe('agentReply: isolated agent version test', () => {
     await h.service.recordAgentVersionTestCharge(
       'admin',
       '12',
-      { tokens: 321, costUsd: 0.123456 },
+      {
+        tokens: 321,
+        costUsd: 0.123456,
+        turnCostUsd: 0.111111,
+        source: 'usage',
+        taken: 'turn',
+        durationMs: 650,
+      },
       12,
     );
 
     expect(addTokenTask).toHaveBeenCalledWith('admin', 0, 321, '12', {
       costUsd: 0.1235,
-      source: 'cost',
-      durationMs: 0,
+      turnCostUsd: 0.1111,
+      source: 'usage',
+      taken: 'turn',
+      durationMs: 650,
       replyChars: 12,
     });
+  });
+
+  it('never enqueues a zero-token version test charge', async () => {
+    const h = replyHarness();
+    const addTokenTask = jest.spyOn(h.service as any, 'addTokenTask');
+
+    await h.service.recordAgentVersionTestCharge(
+      'admin',
+      '12',
+      { tokens: 0, costUsd: 0 },
+      0,
+    );
+
+    expect(addTokenTask).not.toHaveBeenCalled();
   });
 });

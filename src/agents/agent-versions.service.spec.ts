@@ -502,21 +502,37 @@ describe('AgentVersionsService.testVersion', () => {
     published_at: null,
     published_by: null,
   };
+  const oldSecret = process.env.JWT_SECRET;
+  beforeAll(() => { process.env.JWT_SECRET = 'agent-version-session-test-secret'; });
+  afterAll(() => {
+    if (oldSecret === undefined) delete process.env.JWT_SECRET;
+    else process.env.JWT_SECRET = oldSecret;
+  });
 
   function makeTestService() {
     const query = jest.fn().mockResolvedValue({ rows: [draft] });
     const generateAgentReplyWithCharge = jest.fn().mockResolvedValue({
       text: 'draft answer',
       tokens: 321,
-      costUsd: 0.123456,
+      costUsd: 9.99,
+      durationMs: 650,
+      charge: {
+        tokens: 321,
+        usd: 0.012345,
+        source: 'usage',
+        taken: 'turn',
+        turnUsd: 0.011111,
+      },
     });
     const recordAgentVersionTestCharge = jest.fn().mockResolvedValue(undefined);
+    const getTokenBalance = jest.fn().mockResolvedValue(100);
     const streamChat = jest.fn();
     const service = new AgentVersionsService(
       { query, getClient: jest.fn() } as any,
       {
         generateAgentReplyWithCharge,
         recordAgentVersionTestCharge,
+        getTokenBalance,
         streamChat,
       } as any,
     );
@@ -525,56 +541,69 @@ describe('AgentVersionsService.testVersion', () => {
       query,
       generateAgentReplyWithCharge,
       recordAgentVersionTestCharge,
+      getTokenBalance,
       streamChat,
     };
   }
 
-  it('reuses a supplied isolated session, returns the reply, and records its charge', async () => {
+  it('reuses only its server-issued session and records accurate per-turn facts', async () => {
     const h = makeTestService();
-    const sessionId = 'agent_test_admin_supplied-1';
+    const first = await h.service.testVersion('admin', 12, draft.id, 'first');
 
     const result = await h.service.testVersion(
       'admin',
       12,
       draft.id,
       '  check the draft  ',
-      sessionId,
+      first.session_id,
     );
 
     expect(result).toEqual({
       text: 'draft answer',
-      session_id: sessionId,
+      session_id: first.session_id,
       tokens: 321,
     });
-    expect(h.generateAgentReplyWithCharge).toHaveBeenCalledWith(
+    expect(h.generateAgentReplyWithCharge).toHaveBeenLastCalledWith(
       'admin',
       '12',
       'check the draft',
-      sessionId,
+      first.session_id,
       {
         systemPromptOverride: 'DRAFT SYSTEM PROMPT',
         includeUserContext: false,
         linkeonTools: false,
+        testMode: true,
+        billingContext: 'agent_version_test',
       },
     );
-    expect(h.recordAgentVersionTestCharge).toHaveBeenCalledWith(
+    expect(h.recordAgentVersionTestCharge).toHaveBeenLastCalledWith(
       'admin',
       '12',
-      { tokens: 321, costUsd: 0.123456 },
+      {
+        tokens: 321,
+        costUsd: 0.012345,
+        turnCostUsd: 0.011111,
+        source: 'usage',
+        taken: 'turn',
+        durationMs: 650,
+      },
       'draft answer'.length,
     );
+    expect(h.getTokenBalance).toHaveBeenCalledWith('admin');
     expect(h.streamChat).not.toHaveBeenCalled();
     expect(
       h.query.mock.calls.some(([sql]) => /INSERT INTO custom_chat_history/i.test(sql)),
     ).toBe(false);
   });
 
-  it('generates an actor-scoped session with a 32-character hash when absent', async () => {
+  it('generates an opaque relay-safe signed session of reasonable length', async () => {
     const h = makeTestService();
 
     const result = await h.service.testVersion('admin', 12, draft.id, 'check');
 
-    expect(result.session_id).toMatch(/^agent_test_admin_[a-f0-9]{32}$/);
+    expect(result.session_id).toMatch(/^agent_test_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/);
+    expect(result.session_id.length).toBeLessThan(256);
+    expect(result.session_id).not.toContain('admin');
     expect(h.generateAgentReplyWithCharge).toHaveBeenCalledWith(
       'admin',
       '12',
@@ -584,12 +613,36 @@ describe('AgentVersionsService.testVersion', () => {
     );
   });
 
+  it('rejects cross-actor, cross-agent, cross-version, and tampered continuations', async () => {
+    const h = makeTestService();
+    const issued = await h.service.testVersion('admin', 12, draft.id, 'first');
+    h.generateAgentReplyWithCharge.mockClear();
+    h.recordAgentVersionTestCharge.mockClear();
+    const tampered = `${issued.session_id.slice(0, -1)}${issued.session_id.endsWith('a') ? 'b' : 'a'}`;
+
+    for (const [actor, agentId, versionId, sessionId] of [
+      ['other-admin', 12, draft.id, issued.session_id],
+      ['admin', 13, draft.id, issued.session_id],
+      ['admin', 12, live.id, issued.session_id],
+      ['admin', 12, draft.id, tampered],
+    ] as const) {
+      const error = await h.service
+        .testVersion(actor, agentId, versionId, 'check', sessionId)
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(BadRequestException);
+      expect(error.getStatus()).toBe(400);
+    }
+    expect(h.generateAgentReplyWithCharge).not.toHaveBeenCalled();
+    expect(h.recordAgentVersionTestCharge).not.toHaveBeenCalled();
+  });
+
   it.each([
     'ordinary_session',
     'agent_test_',
     'agent_test_bad!',
-    `agent_test_${'a'.repeat(81)}`,
-  ])('rejects invalid session %s with 400 without calling AI', async (sessionId) => {
+    'agent_test_admin_0123456789abcdef0123456789abcdef',
+    `agent_test_${'a'.repeat(256)}`,
+  ])('rejects legacy or invalid session %s without calling AI', async (sessionId) => {
     const h = makeTestService();
 
     const error = await h.service
@@ -616,6 +669,34 @@ describe('AgentVersionsService.testVersion', () => {
     expect(error).toBeInstanceOf(BadRequestException);
     expect(error.getStatus()).toBe(400);
     expect(h.generateAgentReplyWithCharge).not.toHaveBeenCalled();
+    expect(h.recordAgentVersionTestCharge).not.toHaveBeenCalled();
+  });
+
+  it('rejects zero balance with the insufficient-tokens error before AI or charging', async () => {
+    const h = makeTestService();
+    h.getTokenBalance.mockResolvedValue(0);
+
+    const error = await h.service
+      .testVersion('admin', 12, draft.id, 'check')
+      .catch((e) => e);
+
+    expect(error.getStatus()).toBe(402);
+    expect(error.message).toContain('Недостаточно токенов');
+    expect(h.generateAgentReplyWithCharge).not.toHaveBeenCalled();
+    expect(h.recordAgentVersionTestCharge).not.toHaveBeenCalled();
+  });
+
+  it('does not return or charge a zero-token reply', async () => {
+    const h = makeTestService();
+    h.generateAgentReplyWithCharge.mockResolvedValue({
+      text: '',
+      tokens: 0,
+      costUsd: 0,
+      durationMs: 10,
+      charge: { tokens: 0, usd: 0, source: 'length' },
+    });
+
+    await expect(h.service.testVersion('admin', 12, draft.id, 'check')).rejects.toThrow();
     expect(h.recordAgentVersionTestCharge).not.toHaveBeenCalled();
   });
 });
