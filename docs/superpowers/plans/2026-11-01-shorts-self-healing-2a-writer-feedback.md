@@ -1036,6 +1036,258 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.contract.s
 
 Ожидается: `# fail 0` у студии (тестов оживления — 52), пустой `tsc`; контракт — `Tests:` без `failed`.
 
+- [ ] **Step 8: Правки по ревью качества (второй заход)**
+
+Ревью качества (01.11): владелец при `omni_budget` из `toWriter` не видел причины пересъёмки; любой прочий 4xx при запуске (413, 409, 422, 400 не про фильтр) шёл как `omni_rejected` и теперь ушёл бы сценаристу, хотя это ошибка запроса, а не текста; нет тестов «не подряд» и «брак из перепроверки не считается»; текст сценаристу про фильтр называл «3 раза» при любой смеси кодов и советовал «короче и проще», пустое услышанное давало «услышано: «»»; тест «нет секунд» зависел от порядка параллельных сценок.
+
+**8.1. Красные тесты.**
+
+`studio/src/animate/google.test.ts`: в тесте `'биллинг или регион (FAILED_PRECONDITION) — ключ, без повтора; прочие 4xx при запуске — явный отказ'` заменить `assert.ok(isErr('omni_rejected', true)(e));` на `assert.ok(isErr('omni_bad_request', true)(e));`; после строки `assert.equal(CLEAR_REFUSALS.has('omni_rejected'), true);` добавить `assert.equal(CLEAR_REFUSALS.has('omni_bad_request'), true);`.
+
+`studio/src/animate/run-animate.test.ts`:
+
+Тест `'два несовпадения речи на одном тексте — сценаристу, а не третий клип'` заменить целиком на:
+
+```ts
+test('два несовпадения речи на одном тексте — сценаристу, а не третий клип', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const { deps } = fakes(env, { heard: (kind) => (kind === 'conflict' ? 'совсем другое' : LINES[kind].join(' ')) });
+  await assert.rejects(animateRun(env.runDir, deps), (e: unknown) => {
+    assert.ok(e instanceof SkitFeedbackError, String(e));
+    assert.equal(e.feedback.kind, 'conflict');
+    assert.deepEqual(e.feedback.lines, [1, 2]);
+    assert.match(e.message, /не услышаны реплики 1, 2.* — 2 клипа с этим текстом не прошли сверку \(speech_mismatch, speech_mismatch\)/);
+    return true;
+  });
+  assert.equal(readAnim(env.runDir).omniSeconds, 24);
+});
+```
+
+Тест `'на пересъёмку переписанной сценки нет секунд — omni_budget, а не сценаристу'` заменить целиком на (помощник и два теста; оживляется одна развязка, параллели сценок нет):
+
+```ts
+/** Обе сценки приняты (16 с), развязку переписали; новый текст дважды не озвучен. Оживляется одна развязка — без гонки сценок. */
+async function rewrittenPunchlineMissesTwice(maxOmniSeconds: number): Promise<unknown> {
+  const env = setup();
+  await animateRun(env.runDir, fakes(env).deps);
+  const lines = ['Это износ, верните залог.', 'Га-га… ладно.'];
+  writeScript(env.runDir, { conflict: plan('conflict'), punchline: plan('punchline', lines, 'fp-punchline-2') });
+  const second = fakes(env, { heard: (kind) => (kind === 'punchline' ? 'это износ верните залог' : LINES[kind].join(' ')) });
+  const err = await animateRun(env.runDir, { ...second.deps, maxOmniSeconds }).then(
+    () => assert.fail('оживление должно было упасть'),
+    (e: unknown) => e,
+  );
+  assert.deepEqual(second.calls.start, ['punchline', 'punchline']);
+  assert.equal(readAnim(env.runDir).omniSeconds, 32);
+  return err;
+}
+
+test('на пересъёмку переписанной сценки нет секунд — omni_budget с причиной, а не сценаристу', { timeout: 120_000 }, async () => {
+  const err = await rewrittenPunchlineMissesTwice(32);
+  assert.ok(isErr('omni_budget', false)(err) && !(err instanceof SkitFeedbackError), String(err));
+  assert.match((err as Error).message, /не услышаны реплики 2.*переписанную сценку снять не на что — на ролик ушло 32 с Omni/);
+});
+
+test('на пересъёмку переписанной сценки секунды есть — сценаристу', { timeout: 120_000 }, async () => {
+  const err = await rewrittenPunchlineMissesTwice(40);
+  assert.ok(err instanceof SkitFeedbackError, String(err));
+  assert.deepEqual(err.feedback, { kind: 'punchline', code: 'speech_mismatch', lines: [2], heard: 'это износ верните залог', reason: null });
+});
+```
+
+В тесте `'фильтр Google трижды отказал — сценаристу с причиной; секунды возвращены'` строку с `assert.match(e.writerText, …)` заменить на:
+
+```ts
+    assert.match(e.writerText, /^сценка 2 \(развязка\): фильтр Google не пропускает клип \(omni: отказ фильтра — violence\)\. Перепиши реплики и действие этой сценки — без того, что фильтр мог принять за насилие/);
+```
+
+В конец файла:
+
+```ts
+test('промахи речи не подряд (между ними битый клип) — сценаристу на третьем клипе, разбор по последнему промаху', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const { deps, calls } = fakes(env, {
+    wait: (kind, n) => (kind === 'punchline' && n === 2 ? Buffer.from('not a video') : env.clip),
+    heard: (kind, call) => (kind === 'punchline' ? (call === 1 ? 'совсем другое' : 'три года нормальный износ') : LINES[kind].join(' ')),
+  });
+  await assert.rejects(animateRun(env.runDir, deps), (e: unknown) => {
+    assert.ok(e instanceof SkitFeedbackError, String(e));
+    assert.deepEqual(e.feedback, { kind: 'punchline', code: 'speech_mismatch', lines: [2], heard: 'три года нормальный износ', reason: null });
+    return true;
+  });
+  assert.equal(calls.start.filter((k) => k === 'punchline').length, 3);
+  assert.equal(readAnim(env.runDir).omniSeconds, 32);
+});
+
+test('брак из перепроверки не считается промахом: он не прошёл, новый клип промахнулся — снимается ещё один', { timeout: 120_000 }, async () => {
+  const { env, lines } = await withRejected();
+  const second = fakes(env, { heard: (kind, call) => (kind === 'punchline' ? (call <= 2 ? 'совсем другое' : lines.join(' ')) : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, second.deps);
+  assert.deepEqual(second.calls.start, ['punchline', 'punchline']);
+  assert.equal(anim.skits.punchline!.attempts, 2);
+  assert.equal(anim.omniSeconds, 32);
+});
+
+test('отказ Google не про текст (omni_bad_request) — три попытки и сбой, не сценаристу; секунды возвращены', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const { deps, calls } = fakes(env, {
+    start: (kind) => {
+      if (kind === 'punchline') throw new StudioError('omni_bad_request', 'omni: Google ответил HTTP 413: too large', true);
+    },
+  });
+  await assert.rejects(
+    animateRun(env.runDir, deps),
+    (e: unknown) => isErr('omni_bad_request', false)(e) && !(e instanceof SkitFeedbackError) && /после 3 попыток/.test((e as Error).message),
+  );
+  assert.equal(calls.start.filter((k) => k === 'punchline').length, 3);
+  assert.equal(readAnim(env.runDir).omniSeconds, 8);
+});
+
+test('речь не распознана в обоих клипах — сценаристу «речь не распознана», а не пустые кавычки', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const { deps } = fakes(env, { heard: (kind) => (kind === 'punchline' ? '' : LINES[kind].join(' ')) });
+  await assert.rejects(animateRun(env.runDir, deps), (e: unknown) => {
+    assert.ok(e instanceof SkitFeedbackError, String(e));
+    assert.deepEqual(e.feedback, { kind: 'punchline', code: 'speech_mismatch', lines: [1, 2], heard: '', reason: null });
+    assert.match(e.writerText, /в последнем не услышаны: реплика 1 \(galina\) «Три года — нормальный износ\.», реплика 2 \(kesha\) «Га-га… ладно\.», речь не распознана\./);
+    return true;
+  });
+});
+```
+
+`src/shorts/shorts.contract.spec.ts`: в тест `'отзыв студии о сценке: SkitFeedback студии и ShortSkitFeedback API — одни и те же поля'` после строки с `expect(fields(…'SkitFeedback'))…` добавить:
+
+```ts
+    // Совпадают и коды: по союзу API разбирает отзыв.
+    const code = (src: string, name: string) => src.match(new RegExp(`interface ${name} \\{[^}]*?\\bcode: ([^;]+);`))?.[1];
+    expect(code(types, 'SkitFeedback')).toBeDefined();
+    expect(code(types, 'SkitFeedback')).toBe(code(back, 'ShortSkitFeedback'));
+```
+
+и после этого теста, внутри того же `describe`:
+
+```ts
+  it('подписи сценок студии (SCENE) и API (SKIT_LABELS) совпадают: на них опирается отзыв «Студия: сценка N …»', () => {
+    const scene = studio('animate/run-animate.ts').match(/SCENE: Record<SkitKind, string> = (\{[^}]+\});/)?.[1];
+    expect(scene).toBeDefined();
+    expect(scene).toBe(fs.readFileSync(path.join(__dirname, 'short-rules.ts'), 'utf8').match(/SKIT_LABELS: Record<SkitKind, string> = (\{[^}]+\});/)?.[1]);
+  });
+```
+
+```bash
+git add studio/src/animate/google.test.ts studio/src/animate/run-animate.test.ts src/shorts/shorts.contract.spec.ts
+git commit -m "test(studio): отзыв о сценке — причина при нехватке секунд, отказ запроса, промахи не подряд (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts src/animate/google.test.ts 2>&1 | grep -E '^not ok|^# (tests|pass|fail)'"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.contract.spec.ts 2>&1 | grep -E '✕|Tests:'"
+```
+
+Ожидается красное ровно у шести: в run-animate — «два несовпадения речи на одном тексте…» (нет сводки кодов), «…нет секунд — omni_budget с причиной…» (нет причины), «фильтр Google трижды отказал…» (текст), «речь не распознана…» (текст); в google — тест 413 и тест `CLEAR_REFUSALS`. Остальные новые — сторожа и проходят уже сейчас. Контракт — `Tests: 10 passed`.
+
+**8.2. Код.**
+
+`studio/src/errors.ts`: в `StudioErrorCode` после `| 'omni_rejected'` добавить `| 'omni_bad_request'`.
+
+`studio/src/animate/google.ts`:
+- в `CLEAR_REFUSALS` добавить `'omni_bad_request'` (после `'omni_rejected'`);
+- в `startClip` строки
+
+```ts
+    // Прочие 4xx при запуске (413, 400 не про фильтр) — тоже явный отказ: генерация не начиналась, секунды вернутся.
+    if (err.code === 'omni_failed' && r.status >= 400 && r.status < 500 && r.status !== 408) throw new StudioError('omni_rejected', err.message, true);
+```
+
+заменить на
+
+```ts
+    // Прочие 4xx при запуске (413, 409, 422, 400 не про фильтр) — тоже явный отказ: генерация не начиналась, секунды вернутся.
+    // Свой код, не omni_rejected: это ошибка запроса, а не текста сценки, — сценаристу её не отдают (run-animate.ts, toWriter).
+    if (err.code === 'omni_failed' && r.status >= 400 && r.status < 500 && r.status !== 408) throw new StudioError('omni_bad_request', err.message, true);
+```
+
+`studio/src/animate/run-animate.ts`:
+
+1. `writerText` заменить целиком на:
+
+```ts
+  /** Пояснение сценаристу (writer_feedback): какая сценка, что не так, что переписать. */
+  const writerText = (kind: SkitKind, fb: Omit<SkitFeedback, 'kind'>): string => {
+    const keep = 'место, начало и героев не меняй.';
+    if (fb.code === 'omni_rejected') {
+      return `${SCENE[kind]}: фильтр Google не пропускает клип (${fb.reason ?? 'причина не названа'}). Перепиши реплики и действие этой сценки — без того, что фильтр мог принять за насилие, оружие, травму или непристойность; ${keep}`;
+    }
+    const lines = plans[kind].skit.lines;
+    const silent = fb.lines.length
+      ? `не услышаны: ${fb.lines.map((n) => `реплика ${n} (${lines[n - 1]?.hero ?? '?'}) «${lines[n - 1]?.text ?? ''}»`).join(', ')}`
+      : 'речь не сошлась с репликами';
+    const heard = fb.heard?.trim() ? `услышано: «${fb.heard.slice(0, 200)}»` : 'речь не распознана';
+    return `${SCENE[kind]}: ${MAX_SPEECH_MISSES} клипа с этими репликами не прошли сверку речи; в последнем ${silent}, ${heard}. Перепиши реплики и действие этой сценки — короче и проще, обычными словами; пока герой говорит, ничто не закрывает ему рот; ${keep}`;
+  };
+```
+
+2. `toWriter` с его JSDoc заменить на:
+
+```ts
+  /**
+   * Сценку не снять с этими репликами — сценаристу. Переписанную сценку снимут заново:
+   * нужен хотя бы один клип в пределе секунд; места нет — omni_budget с причиной
+   * пересъёмки, без круга сценариста.
+   */
+  const toWriter = (kind: SkitKind, fb: Omit<SkitFeedback, 'kind'>, message: string): SkitFeedbackError => {
+    try {
+      assertBudget();
+    } catch (e) {
+      // Не только «предел»: владелец должен видеть, почему понадобилась пересъёмка.
+      const err = toStudioError(e);
+      throw new StudioError(err.code, `${message}; переписанную сценку снять не на что — ${err.message}`, err.retryable);
+    }
+    return new SkitFeedbackError({ kind, ...fb }, writerText(kind, fb), message);
+  };
+```
+
+3. В `catch` цикла `animateSkit` блок
+
+```ts
+        // Два клипа с этим текстом не прошли сверку речи — промахи на одном тексте повторяются:
+        // сценаристу, а не третий клип (брак из перепроверки сюда не попадает — он судится в reviveRejected).
+        if (e instanceof SpeechMismatchError && ++speechMisses >= MAX_SPEECH_MISSES) {
+          throw toWriter(kind, { code: 'speech_mismatch', lines: e.silentLines.map((i) => i + 1), heard: e.heard, reason: null }, `${err.message} — ${MAX_SPEECH_MISSES} клипа с этим текстом не прошли сверку`);
+        }
+```
+
+заменить на
+
+```ts
+        // Два клипа с этим текстом не прошли сверку речи — промахи на одном тексте повторяются:
+        // сценаристу, а не третий клип. Брак из перепроверки судится в reviveRejected и сюда не
+        // попадает — разве что его выгрузка сорвалась: тогда следующий запуск судит его здесь,
+        // как клип этого текста.
+        if (e instanceof SpeechMismatchError && ++speechMisses >= MAX_SPEECH_MISSES) {
+          throw toWriter(kind, { code: 'speech_mismatch', lines: e.silentLines.map((i) => i + 1), heard: e.heard, reason: null }, `${err.message} — ${MAX_SPEECH_MISSES} клипа с этим текстом не прошли сверку (${codes.join(', ')})`);
+        }
+```
+
+4. Комментарий после цикла
+
+```ts
+    // Фильтр Google так и не пропустил клип — причина в тексте сценки, а не в удаче: сценаристу.
+```
+
+заменить на
+
+```ts
+    // Фильтр Google так и не пропустил клип — причина в тексте сценки, а не в удаче: сценаристу.
+    // Отказ запроса (omni_bad_request: 413, 422…) сценарист не исправит — это обычный сбой.
+```
+
+```bash
+git add studio/src/errors.ts studio/src/animate/google.ts studio/src/animate/run-animate.ts
+git commit -m "fix(studio): отзыв о сценке — причина при нехватке секунд, свой код для отказов запроса" -m "omni_bad_request: прочие 4xx при запуске сценаристу не уходят; пояснение про фильтр — без числа попыток и с советом по фильтру; пустое услышанное — «речь не распознана»." -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts src/animate/google.test.ts src/worker/animate-money.test.ts 2>&1 | grep -E '^not ok|^# (tests|pass|fail)' && npm run typecheck && npm test 2>&1 | grep -E '^not ok|^# (tests|pass|fail)'"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts.contract.spec.ts 2>&1 | grep -E '✕|Tests:'"
+```
+
+Ожидается: `# fail 0` в обоих прогонах студии (в run-animate — 57 тестов), пустой `tsc`; контракт — `Tests: 10 passed`.
+
 ---
 
 ### Task 6: Студия — ролик сценаристу с разбором
