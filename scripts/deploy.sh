@@ -23,6 +23,11 @@
 #   SKIP_PROD_SMOKE=1  — на проде задеплоить без smoke
 #   SMOKE_ONLY=1       — пропустить деплой, гонять только smoke текущей фазы
 #                        (работает и для PHASE 3 — проверить лендинг, не катая)
+#   AGENT_VERSION_E2E=1 — после зелёного основного smoke запустить
+#                        tests/agent-versions.e2e.mjs с BASIC_AUTH/DEBUG_SECRET
+#                        и явным RELAY_SSH_TARGET (default dv@5.101.115.184).
+#                        Отказ считается smoke failure с обычным rollback;
+#                        на проде запускается только при том же явном флаге.
 #   WITH_LANDING=1     — добавить PHASE 3: лендинг linkeon.io (land_linkeon)
 #   LANDING_ONLY=1     — ТОЛЬКО лендинг, без backend/frontend и без my.linkeon.io
 #
@@ -1739,6 +1744,22 @@ run_phase() {
         rollback_phase || red "  ✗ rollback had partial failures — check $ENV_NAME manually"
       fi
       return 1
+    fi
+
+    if [[ "${AGENT_VERSION_E2E:-0}" == "1" ]]; then
+      bold "[agent-version-e2e] running tests/agent-versions.e2e.mjs ($ENV_NAME)"
+      if ! (
+        cd "$LOCAL_BACK_DIR/tests" && \
+        BASE_URL="$BASE_URL" BASIC_AUTH="$BASIC_AUTH" SSH_TARGET="$SSH_TARGET" BACK_PATH="$BACK_PATH" \
+        DEBUG_SECRET="${DEBUG_SECRET:-}" RELAY_SSH_TARGET="${RELAY_SSH_TARGET:-dv@5.101.115.184}" \
+        node agent-versions.e2e.mjs
+      ); then
+        red "  ✗ SMOKE FAILED ($ENV_NAME) — agent versions E2E"
+        if [[ "$phase" == "prod" && -z "${NO_ROLLBACK:-}" && -z "${SMOKE_ONLY:-}" ]]; then
+          rollback_phase || red "  ✗ rollback had partial failures — check $ENV_NAME manually"
+        fi
+        return 1
+      fi
     fi
 
     # Mini App — отдельная проверка содержимого (см. комментарий у
