@@ -100,7 +100,7 @@ esac
     DEL_CSV: '',
     ADD_CSV: '',
     DRAIN_FILE: drainFile,
-    DRAIN_WAIT_SECONDS: '1',
+    DRAIN_WAIT_SECONDS: '10',
     LOCK_FILE: lockFile,
     PAUSE_FILE: options.pauseFile || '',
   };
