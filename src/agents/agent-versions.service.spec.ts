@@ -248,4 +248,206 @@ describe('AgentVersionsService', () => {
     ).toBe(false);
     expect(release).toHaveBeenCalledTimes(1);
   });
+
+  it('gets a version by both id and agent id', async () => {
+    const { service, query } = makeService();
+    query.mockResolvedValueOnce({ rows: [live] });
+
+    const result = await service.getVersion(12, live.id);
+
+    expect(result.id).toBe(live.id);
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(query.mock.calls[0][0]).toMatch(
+      /WHERE id = \$1 AND agent_id = \$2/i,
+    );
+    expect(query.mock.calls[0][1]).toEqual([live.id, 12]);
+  });
+
+  it('returns 404 when the version does not belong to the agent', async () => {
+    const { service, query } = makeService();
+    query.mockResolvedValueOnce({ rows: [] });
+
+    const error = await service.getVersion(12, live.id).catch((e) => e);
+
+    expect(error.getStatus()).toBe(404);
+    expect(query.mock.calls[0][1]).toEqual([live.id, 12]);
+  });
+
+  it.each([
+    { limit: undefined, expected: 50 },
+    { limit: 0, expected: 1 },
+    { limit: 500, expected: 50 },
+  ])('lists newest versions with limit $limit clamped to $expected', async ({
+    limit,
+    expected,
+  }) => {
+    const { service, query } = makeService();
+    query.mockResolvedValueOnce({
+      rows: [{ ...live, version: 3 }, { ...live, version: 2 }],
+    });
+
+    const result = await service.listVersions(12, limit);
+
+    expect(result.map((version) => version.version)).toEqual([3, 2]);
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(query.mock.calls[0][0]).toMatch(/ORDER BY version DESC/i);
+    expect(query.mock.calls[0][0]).toMatch(/LIMIT \$2/i);
+    expect(query.mock.calls[0][1]).toEqual([12, expected]);
+  });
+
+  it('gets published state independently of more than 50 newer drafts', async () => {
+    const { service, query } = makeService();
+    const newestDraft = {
+      ...live,
+      id: '22222222-2222-2222-2222-222222222222',
+      version: 60,
+      status: 'draft',
+      published_at: null,
+    };
+    query
+      .mockResolvedValueOnce({ rows: [live] })
+      .mockResolvedValueOnce({ rows: [newestDraft] });
+
+    const state = await service.getState(12);
+
+    expect(state.published).toMatchObject({ id: live.id, status: 'published' });
+    expect(state.draft).toMatchObject({ id: newestDraft.id, version: 60 });
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(query.mock.calls[0][0]).toMatch(/status = 'published'/i);
+    expect(query.mock.calls[0][1]).toEqual([12]);
+    expect(query.mock.calls[1][0]).toMatch(/status = 'draft'/i);
+    expect(query.mock.calls[1][0]).toMatch(/ORDER BY version DESC/i);
+    expect(query.mock.calls[1][0]).toMatch(/LIMIT 1/i);
+    expect(query.mock.calls[1][1]).toEqual([12]);
+  });
+
+  it('publishes a draft atomically and updates the live agent', async () => {
+    const { service, query, clientQuery, getClient, release } = makeService();
+    const draft = {
+      ...live,
+      id: '22222222-2222-2222-2222-222222222222',
+      version: 2,
+      description: 'new description',
+      system_prompt: 'new prompt',
+      status: 'draft',
+      base_version_id: live.id,
+      published_at: null,
+      published_by: null,
+    };
+    const published = {
+      ...draft,
+      status: 'published',
+      published_at: new Date('2026-11-01T12:00:00.000Z'),
+      published_by: 'editor',
+    };
+    query.mockResolvedValueOnce({ rows: [draft] });
+    clientQuery
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [live] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [published] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const result = await service.publish('editor', 12, draft.id, live.id);
+
+    expect(result).toMatchObject({
+      id: draft.id,
+      status: 'published',
+      published_at: '2026-11-01T12:00:00.000Z',
+      published_by: 'editor',
+    });
+    expect(getClient).toHaveBeenCalledTimes(1);
+    expect(clientQuery).toHaveBeenCalledTimes(6);
+    expect(clientQuery.mock.calls[0][0]).toBe('BEGIN');
+    expect(clientQuery.mock.calls[1][0]).toMatch(/status = 'published'/i);
+    expect(clientQuery.mock.calls[1][0]).toMatch(/FOR UPDATE/i);
+    expect(clientQuery.mock.calls[1][1]).toEqual([12]);
+    expect(clientQuery.mock.calls[2][0]).toMatch(/status = 'superseded'/i);
+    expect(clientQuery.mock.calls[2][1]).toEqual([live.id, 12]);
+    expect(clientQuery.mock.calls[3][0]).toMatch(/status = 'published'/i);
+    expect(clientQuery.mock.calls[3][0]).toMatch(/published_at = now\(\)/i);
+    expect(clientQuery.mock.calls[3][0]).toMatch(/published_by = \$1/i);
+    expect(clientQuery.mock.calls[3][1]).toEqual(['editor', draft.id, 12]);
+    expect(clientQuery.mock.calls[4][0]).toMatch(/UPDATE agents/i);
+    expect(clientQuery.mock.calls[4][1]).toEqual([
+      'new description',
+      'new prompt',
+      12,
+    ]);
+    expect(clientQuery.mock.calls[5][0]).toBe('COMMIT');
+    expect(
+      clientQuery.mock.calls.some(([sql]) => sql === 'ROLLBACK'),
+    ).toBe(false);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a stale expected published id without updating rows', async () => {
+    const { service, query, clientQuery, release } = makeService();
+    const draft = { ...live, id: '22222222-2222-2222-2222-222222222222', status: 'draft' };
+    query.mockResolvedValueOnce({ rows: [draft] });
+    clientQuery
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [live] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    const error = await service
+      .publish('editor', 12, draft.id, 'stale-live-id')
+      .catch((e) => e);
+
+    expect(error).toBeInstanceOf(ConflictException);
+    expect(error.getStatus()).toBe(409);
+    expect(clientQuery).toHaveBeenCalledTimes(3);
+    expect(clientQuery.mock.calls[0][0]).toBe('BEGIN');
+    expect(clientQuery.mock.calls[2][0]).toBe('ROLLBACK');
+    expect(
+      clientQuery.mock.calls.some(([sql]) => /^UPDATE/i.test(sql)),
+    ).toBe(false);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it('rolls back without masking an SQL failure and releases the client', async () => {
+    const { service, query, clientQuery, release } = makeService();
+    const draft = {
+      ...live,
+      id: '22222222-2222-2222-2222-222222222222',
+      status: 'draft',
+      description: 'new description',
+      system_prompt: 'new prompt',
+    };
+    const failure = new Error('agent update failed');
+    query.mockResolvedValueOnce({ rows: [draft] });
+    clientQuery
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [live] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ ...draft, status: 'published' }] })
+      .mockRejectedValueOnce(failure)
+      .mockRejectedValueOnce(new Error('rollback failed'));
+
+    await expect(
+      service.publish('editor', 12, draft.id, live.id),
+    ).rejects.toBe(failure);
+
+    expect(clientQuery).toHaveBeenCalledTimes(6);
+    expect(clientQuery.mock.calls[5][0]).toBe('ROLLBACK');
+    expect(
+      clientQuery.mock.calls.some(([sql]) => sql === 'COMMIT'),
+    ).toBe(false);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a non-draft publish before opening a client', async () => {
+    const { service, query, getClient } = makeService();
+    query.mockResolvedValueOnce({ rows: [live] });
+
+    const error = await service
+      .publish('editor', 12, live.id, live.id)
+      .catch((e) => e);
+
+    expect(error).toBeInstanceOf(ConflictException);
+    expect(error.getStatus()).toBe(409);
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(getClient).not.toHaveBeenCalled();
+  });
 });
