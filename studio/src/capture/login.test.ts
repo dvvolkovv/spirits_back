@@ -20,6 +20,27 @@ test('debug-ручка ответила 404 — no_input без повтора: 
   }
 });
 
+test('debug-ручка ответила 403 «Phone not in whitelist» — no_input без повтора: номер демо-аккаунта не в белом списке среды', async () => {
+  const real = globalThis.fetch;
+  let codeCalls = 0;
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    if (String(url).includes('/webhook/debug/sms-code/')) {
+      codeCalls++;
+      return new Response(JSON.stringify({ error: 'Phone not in whitelist' }), { status: 403 });
+    }
+    return new Response('{}', { status: 200 });
+  }) as typeof fetch;
+  try {
+    await assert.rejects(
+      loginDemo(cfg),
+      (e: unknown) => e instanceof StudioError && e.code === 'no_input' && e.retryable === false && /debug-ручка ответила 403/.test(e.message),
+    );
+    assert.equal(codeCalls, 1);
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+
 test('404 «No code» — секрет верный, кода ещё (или уже) нет: ждёт, как пустой ответ, а не no_input', async () => {
   const real = globalThis.fetch;
   let codeCalls = 0;

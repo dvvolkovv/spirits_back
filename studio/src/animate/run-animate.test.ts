@@ -1018,7 +1018,7 @@ test('предел — на круг владельца: начало круга
     animateRun(env.runDir, { ...deps, maxOmniSeconds: 8, omniBase: 48, log: (m) => logs.push(m) }),
     (e: unknown) =>
       isErr('omni_budget', false)(e) &&
-      /предел — 8 с: лимит пересъёмок сценок; новый круг со сценками — «Повторить» или «Переснять»; поднять предел — настройка «Предел секунд Omni»/.test((e as Error).message),
+      /предел — 8 с: лимит пересъёмок сценок; новый круг со сценками — «Повторить» или «Новая сцена»; поднять предел — настройка «Предел секунд Omni»/.test((e as Error).message),
   );
   assert.deepEqual(calls.start, ['conflict']);
   assert.equal(readAnim(env.runDir).omniSeconds, 8);

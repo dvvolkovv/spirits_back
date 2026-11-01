@@ -236,6 +236,16 @@ describe('ShortsApprovalService', () => {
       await s0.svc.sendForReview(rowToShort(none), LEASE);
       expect((s0.tg.sendVideo.mock.calls[0] as any[])[2].caption).not.toMatch(/Сам восстанавливался|Собран без сценок/);
     });
+
+    it('«Собран без сценок» — только у формата chat: запись no_skits у ролика со сценками (ручной SQL) в подпись не идёт', async () => {
+      const recoveries = [{ at: '2030-01-01T08:40:00.000Z', from: 'animating', code: 'omni_budget', action: 'no_skits', reason: 'оживление: предел секунд' }];
+      const v = fresh({ format: 'skit', auto_recoveries: 1, recoveries });
+      const { svc, tg } = setup(v);
+      await svc.sendForReview(rowToShort(v), LEASE);
+      const caption = (tg.sendVideo.mock.calls[0] as any[])[2].caption;
+      expect(caption).toContain('Сам восстанавливался: без сценок (omni_budget)');
+      expect(caption).not.toContain('Собран без сценок');
+    });
   });
 
   describe('кнопки', () => {
