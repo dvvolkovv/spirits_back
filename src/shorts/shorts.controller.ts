@@ -7,8 +7,8 @@ import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { NoFreeSlotError } from '../blog/blog-slots';
 import {
-  BAD_TIMESTAMP_CODES, LEAVE_FROM, RELEASED_SQL, ReviewRefusal, VERSION_RE, VERSION_SQL, explainRefusal, leaveReview, noteForReview,
-  versionClause,
+  BAD_TIMESTAMP_CODES, LEAVE_FROM, NEW_OMNI_CIRCLE_SQL, RELEASED_SQL, ReviewRefusal, VERSION_RE, VERSION_SQL, explainRefusal, leaveReview,
+  noteForReview, versionClause,
 } from './short-review';
 import { approveShortIntoSlot, isShortSlotConflict } from './short-slot-claim';
 import { ShortSettingsPatch, ShortsSettingsService, validateSettingsPatch } from './shorts-settings.service';
@@ -98,7 +98,7 @@ export const LIST_COLUMNS = [
   'assistant_id', 'slug', 'lang', 'format', 'scene', 'video_key', 'cover_key', 'duration_ms', 'status',
   'slot_at', 'approved_at', 'owner_note', 'writer_feedback', 'skit_feedback', 'writer_rounds', 'review_chat_id',
   'review_message_id', 'note_prompt_ids', 'yt_prompt_ids', 'lease_until', 'attempts', 'last_error',
-  'failed_from', 'failure_notified', 'failed_code', 'auto_recoveries', 'recoveries', 'published_at', 'created_at', 'updated_at',
+  'failed_from', 'failure_notified', 'failed_code', 'auto_recoveries', 'recoveries', 'omni_base', 'published_at', 'created_at', 'updated_at',
 ] as const;
 
 /**
@@ -396,7 +396,8 @@ export class ShortsController {
    * Кнопка владельца начинает новый круг: самопочинки доктора считаются заново
    * (auto_recoveries = 0), история (recoveries) остаётся. Кроме повтора упавшей
    * публикации (approved): ролик уже собран, круг не начинается — пометка
-   * «без сценок — сам» в карточке остаётся.
+   * «без сценок — сам» в карточке остаётся. Новый круг — и для секунд Omni:
+   * предел считается от omni_base.
    *
    * Повтор публикации — только у ролика, который владелец одобрял, сразу (слот —
    * «сейчас») и только по упавшим площадкам: вышедшие не трогаются. Запись — с
@@ -431,7 +432,7 @@ export class ShortsController {
       const r = await tx.query(
         `UPDATE short_video
             SET status = $2, attempts = 0, lease_until = NULL, last_error = NULL, failed_from = NULL, failed_code = NULL,
-                failure_notified = false, writer_rounds = 0, auto_recoveries = CASE WHEN $2 = 'approved' THEN auto_recoveries ELSE 0 END, owner_note = COALESCE($4::text, owner_note),
+                failure_notified = false, writer_rounds = 0, auto_recoveries = CASE WHEN $2 = 'approved' THEN auto_recoveries ELSE 0 END, ${NEW_OMNI_CIRCLE_SQL}, owner_note = COALESCE($4::text, owner_note),
                 format = COALESCE($5::text, format),
                 writer_feedback = CASE WHEN $4::text IS NULL THEN writer_feedback ELSE NULL END,
                 skit_feedback = CASE WHEN $4::text IS NULL THEN skit_feedback ELSE NULL END,

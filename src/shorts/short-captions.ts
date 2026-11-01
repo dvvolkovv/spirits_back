@@ -115,7 +115,7 @@ export interface ReviewCaptionInput {
   when: string;
   captions: ShortCaptions;
   /** Ролик со сценками: состав (skitCastLine) и траты на оживление. */
-  skits?: { cast: string; animation: ShortAnimation | null; maxOmniSeconds?: number };
+  skits?: { cast: string; animation: ShortAnimation | null; maxOmniSeconds?: number; omniBase?: number };
   /** Самопочинки текущего круга словами (recoveryWords, short-doctor.ts). */
   selfHealed?: string;
   /** Доктор собрал ролик без сценок — почему: причина сбоя из истории. */
@@ -133,14 +133,18 @@ export function skitCastLine(skits: Partial<Record<SkitKind, SkitPlan>>): string
   return [...seen.values()].join(', ');
 }
 
-/** Траты на оживление: «Omni: 16 из 48 с, кадров 2 ≈ $1,86» — с пределом, если он передан. */
-export function omniSpendLine(a: ShortAnimation | null, maxOmniSeconds?: number): string {
+/**
+ * Траты на оживление: «Omni: 16 из 48 с, кадров 2 ≈ $1,86» — с пределом, если он
+ * передан; начат круг владельца (omni_base) — «Omni: 56 с, в этом круге 8 из 48 с, …».
+ */
+export function omniSpendLine(a: ShortAnimation | null, maxOmniSeconds?: number, omniBase = 0): string {
   const seconds = a?.omniSeconds ?? 0;
   const frames = a?.keyframes ?? 0;
   const usd = (seconds * OMNI_USD_PER_SEC + frames * KEYFRAME_USD).toFixed(2).replace('.', ',');
-  // Предел — рядом: владелец видит, сколько пересъёмок ещё осталось у ролика.
+  // Предел — рядом: владелец видит, сколько пересъёмок ещё осталось в этом круге.
   const of = Number.isInteger(maxOmniSeconds) ? ` из ${maxOmniSeconds}` : '';
-  return `Omni: ${seconds}${of} с, кадров ${frames} ≈ $${usd}`;
+  const spent = omniBase > 0 ? `${seconds} с, в этом круге ${seconds - omniBase}${of} с` : `${seconds}${of} с`;
+  return `Omni: ${spent}, кадров ${frames} ≈ $${usd}`;
 }
 
 /**
@@ -153,7 +157,7 @@ export function buildReviewCaption(i: ReviewCaptionInput): { caption: string; ex
     `Рубрика: ${RUBRIC_TITLES[i.rubric]} · подача: ${ANGLE_TITLES[i.angle].toLowerCase()}`,
     `Ассистент: ${i.assistantName}`,
     `Вопрос: «${clip(i.question, 300)}»`,
-    ...(i.skits ? [`Сценки: ${clip(i.skits.cast, 200)}`, omniSpendLine(i.skits.animation, i.skits.maxOmniSeconds)] : []),
+    ...(i.skits ? [`Сценки: ${clip(i.skits.cast, 200)}`, omniSpendLine(i.skits.animation, i.skits.maxOmniSeconds, i.skits.omniBase)] : []),
     ...(i.selfHealed ? [`Сам восстанавливался: ${clip(i.selfHealed, 150)}`] : []),
     ...(i.noSkitsReason ? [`Собран без сценок: ${clip(i.noSkitsReason, 200)}`] : []),
     `Выйдет: ${i.when}`,

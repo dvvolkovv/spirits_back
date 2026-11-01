@@ -332,6 +332,8 @@ export interface ShortVideo {
   autoRecoveries: number;
   /** Вся история самопочинок; текущий круг — последние autoRecoveries. */
   recoveries: ShortRecovery[];
+  /** Секунды Omni на начало круга владельца: предел оживления — на круг (кнопка владельца переставляет). */
+  omniBase: number;
   publishedAt: Date | null;
   createdAt: Date | null;
   updatedAt: Date | null;
@@ -402,6 +404,7 @@ export function rowToShort(row: any): ShortVideo {
     failedCode: row.failed_code ?? null,
     autoRecoveries: Number(row.auto_recoveries || 0),
     recoveries: Array.isArray(row.recoveries) ? row.recoveries : [],
+    omniBase: Number(row.omni_base || 0),
     publishedAt: date(row.published_at),
     createdAt: date(row.created_at),
     updatedAt: date(row.updated_at),

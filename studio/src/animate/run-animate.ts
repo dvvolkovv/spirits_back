@@ -46,6 +46,8 @@ export interface AnimateDeps {
   /** Громкость клипов, LUFS; по умолчанию CLIP_LUFS. */
   lufs?: number;
   maxOmniSeconds?: number;
+  /** Секунды Omni на начало круга владельца: предел — на круг, считается от них (0 — с начала ролика, как в CLI). */
+  omniBase?: number;
   log?(msg: string): void;
   /**
    * Каждое сохранение animation.json — наружу: рабочий процесс пишет его в базу,
@@ -194,6 +196,10 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
   const budget = deps.maxOmniSeconds ?? DEFAULT_MAX_OMNI_SECONDS;
   if (typeof budget !== 'number' || !Number.isFinite(budget) || budget < 0) {
     throw new StudioError('no_input', `animate: предел секунд Omni — «${budget}», нужно неотрицательное число`, false);
+  }
+  const base = deps.omniBase ?? 0;
+  if (typeof base !== 'number' || !Number.isFinite(base) || base < 0) {
+    throw new StudioError('no_input', `animate: начало круга по секундам Omni — «${base}», нужно неотрицательное число`, false);
   }
   try {
     await run('ffmpeg', ['-version']);
@@ -483,10 +489,12 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
   };
 
   const assertBudget = (): void => {
-    if (anim.omniSeconds + CLIP_SEC > budget) {
+    if (anim.omniSeconds - base + CLIP_SEC > budget) {
+      // Круг владельца начат (omni_base) — предел на круг; общий счёт ролика — рядом, для владельца.
+      const circle = base > 0 ? `, в этом круге — ${anim.omniSeconds - base} с` : '';
       throw new StudioError(
         'omni_budget',
-        `на ролик ушло ${anim.omniSeconds} с Omni вместе с запущенными, предел — ${budget} с: лимит пересъёмок сценок; поднять — настройка «Предел секунд Omni» (update_settings maxOmniSeconds; в CLI — MAX_OMNI_SECONDS=<секунды> npm run animate)`,
+        `на ролик ушло ${anim.omniSeconds} с Omni вместе с запущенными${circle}, предел — ${budget} с${base > 0 ? ' на круг' : ''}: лимит пересъёмок сценок; поднять — настройка «Предел секунд Omni» (update_settings maxOmniSeconds; в CLI — MAX_OMNI_SECONDS=<секунды> npm run animate)`,
         false,
       );
     }

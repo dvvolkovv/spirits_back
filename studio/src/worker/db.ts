@@ -50,6 +50,8 @@ export interface Job {
   kind: JobKind;
   attempts: number;
   writerRounds: number;
+  /** Секунды Omni на начало круга владельца (omni_base): предел оживления — на круг. */
+  omniBase: number;
   scene: Scene | null;
   capture: StoredCapture | null;
   script: Script | null;
@@ -120,7 +122,7 @@ export async function claimJob(db: Queryable, kind: JobKind): Promise<Job | null
          ORDER BY slot_at NULLS LAST, created_at
          LIMIT 1
          FOR UPDATE SKIP LOCKED)
-      RETURNING id, attempts, writer_rounds, scene, capture, script, animation`,
+      RETURNING id, attempts, writer_rounds, omni_base, scene, capture, script, animation`,
     [q.queued, q.running, LEASE_MINUTES, MAX_JOB_ATTEMPTS],
   );
   const row = r.rows[0];
@@ -130,6 +132,7 @@ export async function claimJob(db: Queryable, kind: JobKind): Promise<Job | null
     kind,
     attempts: Number(row.attempts),
     writerRounds: Number(row.writer_rounds ?? 0),
+    omniBase: Number(row.omni_base ?? 0),
     scene: row.scene ?? null,
     capture: row.capture ?? null,
     script: row.script ?? null,

@@ -11,6 +11,8 @@ import type { Storage } from './storage';
 /** Что задание animate получает от рабочего процесса: предел секунд Omni и куда сохранять по ходу. */
 export interface AnimateHooks {
   maxOmniSeconds: number;
+  /** Секунды Omni на начало круга владельца: предел — на круг. */
+  omniBase: number;
   onSave(anim: ShortAnimation): Promise<void>;
   onFile(rel: string): Promise<void>;
   onDiscard(rel: string): Promise<void>;
@@ -164,6 +166,7 @@ export async function runAnimate(job: Job, d: JobDeps): Promise<boolean> {
   const delays = d.saveRetryDelaysMs ?? SAVE_RETRY_DELAYS_MS;
   const animation = await d.animate(runDir, {
     maxOmniSeconds: await d.queue.maxOmniSeconds(),
+    omniBase: job.omniBase,
     // false — задание не наше, без повтора; брошенная ошибка — сбой базы, повтор с паузой.
     onSave: async (a) => {
       for (let i = 0; ; i++) {

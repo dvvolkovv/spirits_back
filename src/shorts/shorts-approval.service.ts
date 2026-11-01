@@ -273,7 +273,12 @@ export class ShortsApprovalService {
       captions: v.captions,
       // Сценки: кто играл и во что обошлось оживление (спека сценок, «Одобрение»).
       ...(v.script?.skits
-        ? { skits: { cast: skitCastLine(v.script.skits), animation: v.animation, maxOmniSeconds: (await this.settings.get()).maxOmniSeconds } }
+        ? {
+            skits: {
+              cast: skitCastLine(v.script.skits), animation: v.animation,
+              maxOmniSeconds: (await this.settings.get()).maxOmniSeconds, omniBase: v.omniBase,
+            },
+          }
         : {}),
       ...(circle.length ? { selfHealed: recoveryWords(circle) } : {}),
       ...(noSkits ? { noSkitsReason: noSkits.reason || noSkits.code || 'причина не записана' } : {}),

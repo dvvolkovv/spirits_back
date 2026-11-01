@@ -27,6 +27,13 @@ import { ShortFormat, ShortStatus, ShortVideo, appendOwnerNote, rowToShort } fro
 export const RELEASED_SQL =
   `EXISTS (SELECT 1 FROM short_publication p WHERE p.short_id = short_video.id AND p.status IN ('published', 'manual_pending', 'manual_done'))`;
 
+/**
+ * Кнопка владельца начинает новый круг и для секунд Omni: предел («Предел
+ * секунд Omni») — на круг, студия считает его от omni_base. Общий счёт ролика
+ * (animation.omniSeconds) не трогается — он в подписи на проверку.
+ */
+export const NEW_OMNI_CIRCLE_SQL = "omni_base = COALESCE((animation->>'omniSeconds')::int, 0)";
+
 /** Откуда готовый ролик можно «Переснять» и «Отклонить». */
 export const LEAVE_FROM: readonly ShortStatus[] = ['pending_review', 'approved'];
 
@@ -113,7 +120,7 @@ export async function leaveReview(
   const formatSet = target === 'directing' && format ? `, format = $${params.push(format)}` : '';
   const clause = versionClause(params, version);
   const r = await pg.query(
-    `UPDATE short_video SET status = $2, approved_at = NULL, attempts = 0, lease_until = NULL, last_error = NULL, auto_recoveries = 0${formatSet}, updated_at = now()
+    `UPDATE short_video SET status = $2, approved_at = NULL, attempts = 0, lease_until = NULL, last_error = NULL, auto_recoveries = 0, ${NEW_OMNI_CIRCLE_SQL}${formatSet}, updated_at = now()
       WHERE id = $1 AND status = ANY($3::text[])
         AND NOT ${RELEASED_SQL}${clause}
       RETURNING *`,
@@ -138,7 +145,7 @@ export async function noteForReview(
   const clause = versionClause(params, version);
   const r = await pg.query(
     `UPDATE short_video
-        SET owner_note = $2, status = 'writing', writer_rounds = 0, attempts = 0, auto_recoveries = 0,
+        SET owner_note = $2, status = 'writing', writer_rounds = 0, attempts = 0, auto_recoveries = 0, ${NEW_OMNI_CIRCLE_SQL},
             lease_until = NULL, last_error = NULL, updated_at = now()
       WHERE id = $1 AND status = 'pending_review'${clause}
       RETURNING *`,
