@@ -37,6 +37,7 @@ describe('leaveReview', () => {
     expect(pg.query).toHaveBeenCalledTimes(1);
     const [sql, params] = pg.query.mock.calls[0] as any[];
     expect(sql).toContain('SET status = $2');
+    expect(sql).toContain('auto_recoveries = 0');
     expect(sql).toContain(`AND NOT ${RELEASED_SQL}`);
     expect(sql).not.toContain('updated_at = $');
     expect(params).toEqual([ID, 'directing', LEAVE_FROM]);
@@ -72,6 +73,7 @@ describe('noteForReview', () => {
     expect(pg.query).toHaveBeenCalledTimes(1);
     const [sql, params] = pg.query.mock.calls[0] as any[];
     expect(sql).toContain("status = 'writing'");
+    expect(sql).toContain('auto_recoveries = 0');
     expect(sql).toContain("WHERE id = $1 AND status = 'pending_review'");
     expect(params).toEqual([ID, 'короче\nбез цифр']);
   });

@@ -238,6 +238,9 @@ describe('POST admin/shorts', () => {
     const { ctl, client } = setup((sql) => (sql.includes('RETURNING') ? { rows: [video({ status: 'directing', failed_from: null })] } : { rows: [failed] }));
     await ctl.action({ action: 'retry', id: ID, from: 'directing', note: 'Возьми вопрос про возврат залога' }, res());
     const upd = retryWrite(client);
+    // Кнопка владельца — новый круг: самопочинки доктора считаются заново, код сбоя стирается вместе с ошибкой.
+    expect(String(upd[0])).toMatch(/failed_code = NULL/);
+    expect(String(upd[0])).toMatch(/auto_recoveries = 0/);
     expect(String(upd[0])).toContain('owner_note = COALESCE($4::text, owner_note)');
     expect(String(upd[0])).toContain('writer_rounds = 0');
     expect(String(upd[0])).toContain('format = COALESCE($5::text, format)');
