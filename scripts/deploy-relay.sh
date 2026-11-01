@@ -92,8 +92,9 @@ inflight_count() {
     process.stdin.on("data", (chunk) => { raw += chunk; });
     process.stdin.on("end", () => {
       const health = JSON.parse(raw);
-      if (!Number.isInteger(health.inflight) || health.inflight < 0) process.exit(1);
-      console.log(health.inflight);
+      const inflight = health.inflight === undefined ? 0 : health.inflight;
+      if (!Number.isInteger(inflight) || inflight < 0) process.exit(1);
+      console.log(inflight);
     });
   '
 }
