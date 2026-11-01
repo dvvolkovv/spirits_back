@@ -54,6 +54,62 @@ export function switchedText(previous: AnswerProvider, next: AnswerProvider, act
 }
 
 /**
+ * Состояние модели общего рубильника для алерта о падении Claude CLI и его
+ * отбоя (повторное ревью 01.11). enabled — у модели есть ключ на сервере
+ * (fallbackStats().providers[x].enabled — тот же признак, что
+ * configs[x] !== null); down — она «не отвечает», и выбор рубильника её
+ * пропускает (planProviders с respectDown). У Claude оба поля не значат ничего.
+ */
+export interface CliSwitchState {
+  switchProvider: AnswerProvider;
+  enabled: boolean;
+  down: boolean;
+}
+
+/** Маша, TG-боты и фоновые задачи сейчас отвечают через модель рубильника, а не через Claude CLI. */
+const switchCarriesCliPath = (s: CliSwitchState): boolean => s.switchProvider !== 'claude' && s.enabled && !s.down;
+
+const CLI_PATH_USERS = 'Маша, TG-боты, Виртуальный PM, Виртуальный маркетолог, фоновые задачи';
+
+/**
+ * Строка «Затронуто» алерта «Локальный Claude CLI недоступен». Рубильник на
+ * Claude или у его модели нет ключа (фактически все на Claude) — прежний
+ * текст. Модель с ключом отвечает — через неё идут Маша, TG-боты и фоновые, а
+ * падение Claude задевает пробы мониторинга (они всегда Claude), личный выбор
+ * Claude и запасной путь. Модель с ключом, но «не отвечает» — они идут
+ * обычным путём, то есть через упавший Claude: ровно сценарий «Claude упёрся в
+ * недельный лимит → рубильник на Qwen → у Qwen кончились кредиты».
+ */
+export function cliOutageAffectedText(s: CliSwitchState): string {
+  const label = PROVIDER_LABELS[s.switchProvider];
+  if (switchCarriesCliPath(s)) {
+    return `Затронуто: пробы мониторинга, личный выбор Claude и запасной путь — рубильник сейчас на <b>${label}</b>: Маша, TG-боты и фоновые задачи отвечают через эту модель.`;
+  }
+  if (s.switchProvider !== 'claude' && s.enabled) {
+    return `Затронуто: <b>${CLI_PATH_USERS}</b> (CLI-путь на OAuth-подписке) — рубильник на <b>${label}</b>, но ${label} сейчас «не отвечает», поэтому они идут обычным путём (Claude, затем запасные).`;
+  }
+  return `Затронуто: <b>${CLI_PATH_USERS}</b> (CLI-путь на OAuth-подписке).`;
+}
+
+/**
+ * Отбой «Локальный Claude CLI восстановлен». Пока модель рубильника с ключом
+ * отвечает, Маша, TG-боты и фоновые всё время шли через неё — «снова
+ * работают» было бы неправдой: ожил Claude для проб мониторинга, личного
+ * выбора Claude и запасного пути. Иначе (рубильник на Claude, без ключа или
+ * его модель «не отвечает» — они шли через Claude и были задеты) — прежний
+ * текст.
+ */
+export function cliRecoveredText(a: CliSwitchState & { checkedAt: string | null; latencyMs: number | null }): string {
+  const head = '<b>🟢 Локальный Claude CLI восстановлен</b>\n';
+  const check = `проверка: ${a.checkedAt || '—'}, ${a.latencyMs ?? '—'}мс`;
+  if (switchCarriesCliPath(a)) {
+    const label = PROVIDER_LABELS[a.switchProvider];
+    return `${head}Claude снова отвечает (${check}): пробы мониторинга, личный выбор Claude, запасной путь. Маша, TG-боты и фоновые задачи по-прежнему идут через ${label} (рубильник).`;
+  }
+  return `${head}Маша/VPM/маркетолог снова работают (${check}).`;
+}
+
+/**
  * Суточный счёт по вызовам рубильника (choice='global', selected=эта
  * модель): answered — она ответила; byOther — ответил другой (аварийная
  * цепочка); failed — ВСЕГО без ответа (неудачные ходы веб-чата + ошибки
