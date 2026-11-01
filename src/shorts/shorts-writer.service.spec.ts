@@ -116,6 +116,7 @@ describe('ShortsWriterService.write', () => {
     expect(sql).toMatch(/SET status = 'directing'/);
     // Новая сцена — новый круг: отзыв студии о прошлой озвучке и счёт её переписок — заново.
     expect(sql).toMatch(/writer_feedback = NULL/);
+    expect(sql).toMatch(/skit_feedback = NULL/);
     expect(sql).toMatch(/writer_rounds = 0/);
     expect(params[1]).toBe('про субаренду\nСценарист: нужен вопрос про субаренду');
   });
@@ -274,6 +275,62 @@ describe('ShortsWriterService.write — ролик со сценками', () =>
     expect(relay.ask).toHaveBeenCalledTimes(2);
     expect(relay.ask.mock.calls[1][1]).toContain('сценка 2 (развязка): правило 18');
     expect((pg.query.mock.calls[0] as any[])[1][5]).toBe('animate_queued');
+  });
+
+  const STUDIO_ABOUT_PUNCHLINE = {
+    writer_feedback: 'сценка 2 (развязка): 2 клипа с этими репликами не прошли сверку речи; в последнем не услышаны: реплика 2 (galina) «Га-га… ладно.», услышано: «нормальный износ не повреждение залог верните». Перепиши реплики и действие этой сценки.',
+    skit_feedback: { kind: 'punchline', code: 'speech_mismatch', lines: [2], heard: 'нормальный износ не повреждение залог верните', reason: null },
+  };
+
+  it('отзыв студии о развязке: из ответа — только реплики и действие развязки; место, начало, герои — принятые, кадр не перерисуется, конфликт не переснимется', async () => {
+    const accepted = planSkits({ conflict: CONFLICT as any, punchline: PUNCHLINE as any });
+    const fresh = {
+      ...PUNCHLINE,
+      setting: 'a completely different kitchen',
+      opening: 'Everyone sits at a table.',
+      action: 'The capybara speaks calmly, the goose nods and puts the keys on the table.',
+      lines: [PUNCHLINE.lines[0], { hero: 'galina', text: 'Ладно, убедил. Забирай залог.' }],
+    };
+    const { svc, pg, relay } = setup([{ ...SKIT_GOOD, punchline: fresh }]);
+    await svc.write(skitVideo({ ...STUDIO_ABOUT_PUNCHLINE, script: { hook: 'Старая', voice: 'madirus', speed: 1.1, lines: [], final: { assistantsCount: 18 }, skits: accepted } }));
+    expect(relay.ask.mock.calls[0][1]).toContain('Студия: сценка 2 (развязка): 2 клипа с этими репликами не прошли сверку речи');
+    const [sql, params] = pg.query.mock.calls[0] as any[];
+    expect(sql).toMatch(/skit_feedback = NULL/);
+    const script = JSON.parse(params[1]);
+    expect(script.skits.punchline.skit).toEqual({ ...PUNCHLINE, action: fresh.action, lines: fresh.lines });
+    expect(script.skits.punchline.keyframeFingerprint).toBe(accepted.punchline.keyframeFingerprint);
+    expect(script.skits.punchline.fingerprint).not.toBe(accepted.punchline.fingerprint);
+    expect(script.skits.conflict.fingerprint).toBe(accepted.conflict.fingerprint);
+  });
+
+  it('отзыв студии о конфликте: переписываются реплики и действие конфликта; кадры обеих сценок и развязка — прежние', async () => {
+    const accepted = planSkits({ conflict: CONFLICT as any, punchline: PUNCHLINE as any });
+    const fresh = { ...CONFLICT, setting: 'a garage', action: 'The goose taps the scuff and frowns.', lines: [{ hero: 'galina', text: 'Обои испорчены! Залог не верну!' }, CONFLICT.lines[1]] };
+    const { svc, pg } = setup([{ ...SKIT_GOOD, conflict: fresh }]);
+    await svc.write(skitVideo({
+      writer_feedback: 'сценка 1 (конфликт): фильтр Google 3 раза не пропустил клип (omni: отказ фильтра). Перепиши реплики и действие этой сценки.',
+      skit_feedback: { kind: 'conflict', code: 'omni_rejected', lines: [], heard: null, reason: 'omni: отказ фильтра' },
+      script: { hook: 'Старая', voice: 'madirus', speed: 1.1, lines: [], final: { assistantsCount: 18 }, skits: accepted },
+    }));
+    const script = JSON.parse((pg.query.mock.calls[0] as any[])[1][1]);
+    expect(script.skits.conflict.skit).toEqual({ ...CONFLICT, action: fresh.action, lines: fresh.lines });
+    expect(script.skits.conflict.keyframeFingerprint).toBe(accepted.conflict.keyframeFingerprint);
+    expect(script.skits.conflict.fingerprint).not.toBe(accepted.conflict.fingerprint);
+    expect(script.skits.punchline.keyframeFingerprint).toBe(accepted.punchline.keyframeFingerprint);
+    expect(script.skits.punchline.fingerprint).toBe(accepted.punchline.fingerprint);
+  });
+
+  it('отзыв студии о сценке, а сценарист её не переписал (нет в ответе или те же реплики и действие) — переписка с нарушением', async () => {
+    const accepted = planSkits({ conflict: CONFLICT as any, punchline: PUNCHLINE as any });
+    const { punchline, ...noPunchline } = SKIT_GOOD;
+    const fixed = { ...SKIT_GOOD, punchline: { ...PUNCHLINE, lines: [PUNCHLINE.lines[0], { hero: 'galina', text: 'Ладно, убедил.' }] } };
+    const { svc, pg, relay } = setup([noPunchline, { ...SKIT_GOOD, punchline: PUNCHLINE }, fixed]);
+    await svc.write(skitVideo({ ...STUDIO_ABOUT_PUNCHLINE, script: { hook: 'Старая', voice: 'madirus', speed: 1.1, lines: [], final: { assistantsCount: 18 }, skits: accepted } }));
+    expect(relay.ask).toHaveBeenCalledTimes(3);
+    expect(relay.ask.mock.calls[1][1]).toContain('сценка 2 (развязка): отзыв студии — перепиши реплики и действие этой сценки (в ответе её нет)');
+    expect(relay.ask.mock.calls[2][1]).toContain('сценка 2 (развязка): отзыв студии — перепиши реплики и действие этой сценки (они те же, что Omni не озвучил)');
+    const script = JSON.parse((pg.query.mock.calls[0] as any[])[1][1]);
+    expect(script.skits.punchline.skit.lines[1].text).toBe('Ладно, убедил.');
   });
 
   it('у ролика со сценками нет сценки 1 — StageFatalError: нужен режиссёр', async () => {
