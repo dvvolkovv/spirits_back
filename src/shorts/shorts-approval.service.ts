@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { InputFile } from 'grammy';
 import { approverChatId } from '../blog/blog-approval.service';
 import { formatSlotWhen } from '../blog/blog-slot-format';
@@ -11,6 +11,7 @@ import { STAND_MARK, buildReviewCaption, clip, skitCastLine } from './short-capt
 import { autoTopicsEnabled, isStand, shortsEnabled } from './short-env';
 import { LEAVE_FROM, RELEASED_SQL, leaveReview, noteForReview } from './short-review';
 import { approveShortIntoSlot } from './short-slot-claim';
+import { ShortsDoctorService } from './shorts-doctor.service';
 import { ShortsSettingsService } from './shorts-settings.service';
 import { MIN_ORDER_CHARS, ShortsTopicService } from './shorts-topic.service';
 import {
@@ -140,6 +141,8 @@ export class ShortsApprovalService {
     private readonly storage: StorageService,
     private readonly settings: ShortsSettingsService,
     private readonly topics: ShortsTopicService,
+    // Последним и @Optional(): прежние тесты строят сервис без доктора. Что Nest его подставляет — сторожит shorts.module.spec.ts.
+    @Optional() private readonly doctor?: ShortsDoctorService,
   ) {}
 
   /** Служебное сообщение владельцу. Сбой отправки глотаем: он не повод ронять тик. */

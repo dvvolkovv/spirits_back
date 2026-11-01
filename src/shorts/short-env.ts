@@ -6,3 +6,9 @@ export const shortsEnabled = (): boolean => flag('SHORTS_ENABLED');
 export const autoTopicsEnabled = (): boolean => flag('SHORTS_AUTO_TOPICS');
 /** Стенд: пометка «СТЕНД» в сообщениях владельцу. */
 export const isStand = (): boolean => flag('SHORTS_STAND');
+
+/**
+ * Доктор упавших роликов (самопочинка, ShortsDoctorService). В отличие от
+ * флагов выше включён по умолчанию: выключает только SHORTS_AUTO_HEAL=false.
+ */
+export const autoHealEnabled = (): boolean => String(process.env.SHORTS_AUTO_HEAL ?? '').trim().toLowerCase() !== 'false';

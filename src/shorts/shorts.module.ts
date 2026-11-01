@@ -5,6 +5,7 @@ import { CommonModule } from '../common/common.module';
 import { TgBotModule } from '../tg-bot/tg-bot.module';
 import { ShortsApprovalService } from './shorts-approval.service';
 import { ShortsDirectorService } from './shorts-director.service';
+import { ShortsDoctorService } from './shorts-doctor.service';
 import { ShortsPublisherService } from './shorts-publisher.service';
 import { ShortsSchemaService } from './shorts-schema.service';
 import { ShortsSettingsService } from './shorts-settings.service';
@@ -35,6 +36,7 @@ import { ShortsYoutubeService } from './shorts-youtube.service';
     BlogRelayClient,
     ShortsDirectorService,
     ShortsWriterService,
+    ShortsDoctorService,
     ShortsApprovalService,
     ShortsYoutubeService,
     ShortsPublisherService,
