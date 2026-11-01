@@ -969,3 +969,18 @@ test('речь не распознана в обоих клипах — сцен
     return true;
   });
 });
+
+test('промах, а на следующий клип секунд нет — omni_budget с причиной промаха', { timeout: 120_000 }, async () => {
+  const env = setup();
+  await animateRun(env.runDir, fakes(env).deps);
+  const lines = ['Это износ, верните залог.', 'Га-га… ладно.'];
+  writeScript(env.runDir, { conflict: plan('conflict'), punchline: plan('punchline', lines, 'fp-punchline-2') });
+  const second = fakes(env, { heard: (kind) => (kind === 'punchline' ? 'это износ верните залог' : LINES[kind].join(' ')) });
+  await assert.rejects(animateRun(env.runDir, { ...second.deps, maxOmniSeconds: 24 }), (e: unknown) => {
+    assert.ok(isErr('omni_budget', false)(e) && !(e instanceof SkitFeedbackError), String(e));
+    assert.match((e as Error).message, /не услышаны реплики 2.*; переснять не на что — на ролик ушло 24 с Omni/);
+    return true;
+  });
+  assert.deepEqual(second.calls.start, ['punchline']);
+  assert.equal(readAnim(env.runDir).omniSeconds, 24);
+});
