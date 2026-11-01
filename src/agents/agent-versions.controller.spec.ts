@@ -39,8 +39,9 @@ describe('AgentVersionsController', () => {
     await controller.listVersions(7, '2' as any);
     await controller.listVersions(7, undefined as any);
     await controller.listVersions(7, 'invalid' as any);
+    await controller.listVersions(7, '0' as any);
 
-    expect(service.listVersions.mock.calls).toEqual([[7, 2], [7, 50], [7, 50]]);
+    expect(service.listVersions.mock.calls).toEqual([[7, 2], [7, 50], [7, NaN], [7, 0]]);
   });
 
   it('returns one version by agent and version ids', async () => {

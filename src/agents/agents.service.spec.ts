@@ -1,3 +1,4 @@
+import { BadRequestException } from '@nestjs/common';
 import { AgentsController } from './agents.controller';
 import { AgentsService } from './agents.service';
 
@@ -140,6 +141,23 @@ describe('AgentsService.upsertAgent', () => {
     expect(versions.createDraft).not.toHaveBeenCalled();
     expect(versions.publish).not.toHaveBeenCalled();
     expect(pg.query.mock.calls.some(([sql]) => /UPDATE\s+agents/i.test(sql))).toBe(false);
+  });
+
+  it.each([
+    { case: 'missing name', data: { system_prompt: 'prompt' } },
+    { case: 'non-string name', data: { name: 42, system_prompt: 'prompt' } },
+    { case: 'empty name', data: { name: '   ', system_prompt: 'prompt' } },
+    { case: 'missing prompt', data: { name: 'agent' } },
+    { case: 'non-string prompt', data: { name: 'agent', system_prompt: null } },
+    { case: 'empty prompt', data: { name: 'agent', system_prompt: '   ' } },
+  ])('rejects $case with 400 before touching PostgreSQL', async ({ data }) => {
+    const { service, pg } = makeService();
+
+    const error = await service.upsertAgent(data, 'admin-1').catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(BadRequestException);
+    expect((error as BadRequestException).getStatus()).toBe(400);
+    expect(pg.query).not.toHaveBeenCalled();
   });
 });
 

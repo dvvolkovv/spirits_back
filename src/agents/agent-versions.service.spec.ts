@@ -276,6 +276,7 @@ describe('AgentVersionsService', () => {
   it.each([
     { limit: undefined, expected: 50 },
     { limit: 0, expected: 1 },
+    { limit: NaN, expected: 50 },
     { limit: 500, expected: 50 },
   ])('lists newest versions with limit $limit clamped to $expected', async ({
     limit,
