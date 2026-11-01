@@ -46,11 +46,14 @@ function withNewLines(accepted: Record<SkitKind, Skit>, kind: SkitKind, fresh: S
   return { ...accepted, [kind]: { ...accepted[kind], action: fresh.action, lines: fresh.lines } };
 }
 
-/** Сценка по отзыву студии не переписана: её нет в ответе или реплики и действие те же — Omni не снимет и их. */
-function studioRewriteViolation(kind: SkitKind, accepted: Skit, fresh: Skit | null): string | null {
-  const same = (s: Skit) => JSON.stringify([s.action, s.lines.map((l) => [l.hero, l.text])]);
-  if (fresh && same(fresh) !== same(accepted)) return null;
-  return `${SKIT_LABELS[kind]}: отзыв студии — перепиши реплики и действие этой сценки (${fresh ? 'они те же, что Omni не озвучил' : 'в ответе её нет'})`;
+/**
+ * Сценка по отзыву студии не переписана: её нет в ответе, или клип вышел бы тем же —
+ * отпечаток клипа совпал с тем, что студия не смогла снять (пробел или точка в конце
+ * действия отпечаток не меняют, а лишний клип Omni стоит денег).
+ */
+function studioRewriteViolation(kind: SkitKind, fresh: Skit | null, sameClip: boolean): string | null {
+  if (fresh && !sameClip) return null;
+  return `${SKIT_LABELS[kind]}: отзыв студии — перепиши реплики и действие этой сценки (${fresh ? 'клип вышел бы тем же, что студия не смогла снять' : 'в ответе её нет'})`;
 }
 
 @Injectable()
@@ -89,6 +92,8 @@ export class ShortsWriterService {
     // при каждом «Замечании» или отзыве студии о длине озвучки.
     const acceptedPunchline: Skit | null = skitFormat ? v.script?.skits?.punchline?.skit ?? null : null;
     let rejectedPunchline: Skit | null = null;
+    // По отзыву студии — прошлый вариант названной сценки (круг с нарушениями): модель видит, что исправлять.
+    let rejectedFix: Skit | null = null;
     // Круг по отзыву студии — о длине озвучки: принятые сценки остаются, даже если
     // модель их вернула, — эхо с правкой одной буквы сменило бы отпечаток и стоило
     // бы клипа Omni. writer_feedback пишет только студия; новое замечание владельца
@@ -101,6 +106,8 @@ export class ShortsWriterService {
     const fixKind: SkitKind | null =
       skitFormat && v.skitFeedback && SKIT_KINDS.includes(v.skitFeedback.kind) && conflict && acceptedPunchline ? v.skitFeedback.kind : null;
     const fixBase: Record<SkitKind, Skit> | null = fixKind ? { conflict: conflict!, punchline: acceptedPunchline! } : null;
+    if (fixKind) this.logger.log(`ролик ${v.id}: отзыв студии о сценке ${fixKind} — переписываю её реплики и действие`);
+    else if (skitFormat && v.skitFeedback) this.logger.warn(`ролик ${v.id}: отзыв студии о сценке не применить (${JSON.stringify(v.skitFeedback).slice(0, 200)}) — обычная переписка`);
     const [rows, settings] = await Promise.all([this.agents.getAgents('ru'), this.settings.get()]);
     const assistants = toAgents(rows);
     const name = v.scene.assistantName;
@@ -131,11 +138,14 @@ export class ShortsWriterService {
         question: v.scene.question,
         paragraphs: v.capture.paragraphs ?? [],
         ownerNote: v.ownerNote,
-        writerFeedback: v.writerFeedback,
+        // Отзыв студии о сценке в формате «Только чат» не к месту: сценок нет, а «перепиши реплики» урезал бы озвучку.
+        writerFeedback: !skitFormat && v.skitFeedback ? null : v.writerFeedback,
         previousScript: previous,
         previousCaptions,
         violations,
-        ...(skitFormat ? { skit: { conflict, acceptedPunchline, rejectedPunchline } } : {}),
+        ...(skitFormat
+          ? { skit: { conflict, acceptedPunchline, rejectedPunchline, ...(fixKind ? { fix: { kind: fixKind, rejected: rejectedFix } } : {}) } }
+          : {}),
       });
       const raw = await this.relay.ask(skitFormat ? WRITER_SKIT_SYSTEM : WRITER_SYSTEM, message, `short-write-${v.id}-${randomUUID()}`);
       const reply = parseWriterReply(raw, { skit: skitFormat, acceptedPunchline: !!acceptedPunchline });
@@ -180,7 +190,8 @@ export class ShortsWriterService {
       });
       if (planError) violations.push(planError);
       if (fixKind) {
-        const notRewritten = studioRewriteViolation(fixKind, fixBase![fixKind], reply.skits[fixKind]);
+        const sameClip = !!planned && planned[fixKind].fingerprint === v.script?.skits?.[fixKind]?.fingerprint;
+        const notRewritten = studioRewriteViolation(fixKind, reply.skits[fixKind], sameClip);
         if (notRewritten) violations.push(notRewritten);
       }
       if (violations.length) {
@@ -192,6 +203,7 @@ export class ShortsWriterService {
           conflict = skits.conflict;
           rejectedPunchline = reply.skits.punchline;
         }
+        if (skits && fixKind && reply.skits[fixKind]) rejectedFix = skits[fixKind];
         continue;
       }
       const r = await this.pg.query(

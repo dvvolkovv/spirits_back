@@ -1,6 +1,6 @@
 import { isHealthAssistant } from './short-assistants';
 import { MAX_SKIT_HOOK_WORDS, WriterCaptions } from './short-rules';
-import { Skit } from './short-skit-prompts';
+import { Skit, SkitKind } from './short-skit-prompts';
 import { TROUPE } from './short-troupe';
 import { ANGLE_TITLES, PROVOCATIVE_ANGLES, RUBRIC_TITLES, ShortAngle, ShortParagraph, ShortRubric, ShortScript } from './shorts.types';
 
@@ -334,7 +334,13 @@ export interface WriterInput {
    * Ролик со сценками: конфликт, который открывает ролик; принятая развязка из
    * прошлого сценария (её клип мог быть уже снят) и отвергнутая в этом круге.
    */
-  skit?: { conflict: Skit; acceptedPunchline: Skit | null; rejectedPunchline: Skit | null };
+  skit?: {
+    conflict: Skit;
+    acceptedPunchline: Skit | null;
+    rejectedPunchline: Skit | null;
+    /** Отзыв студии о сценке: какую переписать и прошлый вариант круга, если был. */
+    fix?: { kind: SkitKind; rejected: Skit | null };
+  };
 }
 
 /**
@@ -369,14 +375,23 @@ export function buildWriterMessage(i: WriterInput): string {
     `Спросили:\n${fenced('ВОПРОС', i.question)}`,
     `Ответ по абзацам:\n${fenced('ОТВЕТ АССИСТЕНТА', i.paragraphs.map((p) => `[${p.n}] ${oneLine(p.text)}`).join('\n'))}`,
   ];
-  if (i.skit) parts.push(`Сценка 1 (конфликт) — открывает ролик:\n${fenced('СЦЕНКА 1', describeSkit(i.skit.conflict))}`);
+  if (i.skit) {
+    const fixConflict = i.skit.fix?.kind === 'conflict' ? '; её Omni не снял — перепиши реплики и действие' : '';
+    parts.push(`Сценка 1 (конфликт) — открывает ролик${fixConflict}:\n${fenced('СЦЕНКА 1', describeSkit(i.skit.conflict))}`);
+  }
   if (i.previousScript) parts.push(previousVariant(i.previousScript, i.previousCaptions ?? null));
   if (i.skit?.acceptedPunchline) {
     parts.push(
-      `Принятая сценка 2 (развязка) — не пиши punchline, если замечания и нарушения её не касаются:\n${fenced('ПРИНЯТАЯ СЦЕНКА 2', describeSkit(i.skit.acceptedPunchline))}`,
+      i.skit.fix?.kind === 'punchline'
+        ? `Сценка 2 (развязка), которую Omni не снял, — перепиши её реплики и действие:\n${fenced('СЦЕНКА 2', describeSkit(i.skit.acceptedPunchline))}`
+        : `Принятая сценка 2 (развязка) — не пиши punchline, если замечания и нарушения её не касаются:\n${fenced('ПРИНЯТАЯ СЦЕНКА 2', describeSkit(i.skit.acceptedPunchline))}`,
     );
   }
   if (i.skit?.rejectedPunchline) parts.push(`Прошлый вариант сценки 2:\n${fenced('СЦЕНКА 2', describeSkit(i.skit.rejectedPunchline))}`);
+  if (i.skit?.fix?.rejected) {
+    const n = i.skit.fix.kind === 'conflict' ? 1 : 2;
+    parts.push(`Твой прошлый вариант сценки ${n} — исправь по нарушениям:\n${fenced(`ПРОШЛАЯ СЦЕНКА ${n}`, describeSkit(i.skit.fix.rejected))}`);
+  }
   // Не «владельца»: здесь и прошлые замечания, и просьбы сценариста, которые новая сцена уже учла.
   if (i.ownerNote) parts.push(`Замечания (в том числе прошлые, уже учтённые сценой):\n${fenced('ЗАМЕЧАНИЯ', i.ownerNote)}`);
   if (i.writerFeedback) parts.push(`Студия: ${i.writerFeedback}`);
