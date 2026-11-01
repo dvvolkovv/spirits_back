@@ -532,7 +532,7 @@ maybe('ролики против живого Postgres', () => {
       const v = await insert({ status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() + 86_400_000) });
       await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'telegram', 'published')`, [v.id]);
       const version = (await pool.query(`SELECT ${VERSION_SQL} AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
-      const ctl = new ShortsController(pgLike() as any, {} as any, {} as any, {} as any);
+      const ctl = new ShortsController(pgLike() as any, { get: async () => ({ format: 'skit' }) } as any, {} as any, {} as any);
       const res: any = { status: () => res, json: (b: any) => ((res.body = b), res) };
       await expect(ctl.action({ action: 'redo', id: v.id, version }, res)).rejects.toThrow(
         'Ролик уже вышел на площадке — переснять или отклонить нельзя',
