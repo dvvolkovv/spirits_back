@@ -1530,24 +1530,144 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts src/tg-bot 2>&1 |
 
 Ожидается: студия `# fail 0`, `tsc` пусто, живая база `# fail 0`; бэкенд — `Tests:` без `failed`, `TSC_OK`, `BUILD_OK`. Красное — разобрать, не двигаться дальше.
 
+- [ ] **Step 1a: Правки по итоговому ревью (до стенда)**
+
+Итоговое ревью ветки (01.11): блокеров в коде нет. В коде — две мелочи. Первая: типичный финал новой петли — переписанная сценка получила последний клип и промахнулась, а следующей попытке не хватает секунд — уходит голым `omni_budget` без причины пересъёмки. Вторая: шапка «ОТКАТ» в 004 неполна — колонку пишет и режиссёр, а старый код не стирает `skit_feedback` и проведёт ролики в `writing` с отзывом о сценке через `keepSkits`.
+
+`studio/src/animate/run-animate.test.ts`, в конец файла:
+
+```ts
+test('промах, а на следующий клип секунд нет — omni_budget с причиной промаха', { timeout: 120_000 }, async () => {
+  const env = setup();
+  await animateRun(env.runDir, fakes(env).deps);
+  const lines = ['Это износ, верните залог.', 'Га-га… ладно.'];
+  writeScript(env.runDir, { conflict: plan('conflict'), punchline: plan('punchline', lines, 'fp-punchline-2') });
+  const second = fakes(env, { heard: (kind) => (kind === 'punchline' ? 'это износ верните залог' : LINES[kind].join(' ')) });
+  await assert.rejects(animateRun(env.runDir, { ...second.deps, maxOmniSeconds: 24 }), (e: unknown) => {
+    assert.ok(isErr('omni_budget', false)(e) && !(e instanceof SkitFeedbackError), String(e));
+    assert.match((e as Error).message, /не услышаны реплики 2.*; переснять не на что — на ролик ушло 24 с Omni/);
+    return true;
+  });
+  assert.deepEqual(second.calls.start, ['punchline']);
+  assert.equal(readAnim(env.runDir).omniSeconds, 24);
+});
+```
+
+```bash
+git add studio/src/animate/run-animate.test.ts
+git commit -m "test(studio): промах и нет секунд на следующий клип — omni_budget с причиной (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts 2>&1 | grep -E '^not ok|^# (tests|pass|fail)'"
+```
+
+Ожидается: падает ровно новый тест (в сообщении нет «переснять не на что»), `# tests 58`, `# fail 1`.
+
+`studio/src/animate/run-animate.ts`, в `catch` цикла `animateSkit` строки
+
+```ts
+        last = err;
+        codes.push(err.code);
+        if (!err.retryable) throw err;
+```
+
+заменить на
+
+```ts
+        const prev = last;
+        last = err;
+        codes.push(err.code);
+        if (!err.retryable) {
+          // Секунд на следующий клип нет после промаха — владелец должен видеть, почему понадобилась пересъёмка.
+          if (err.code === 'omni_budget' && prev) throw new StudioError('omni_budget', `${prev.message}; переснять не на что — ${err.message}`, false);
+          throw err;
+        }
+```
+
+В описании `animateRun` после фразы `брак, который нынешняя` / `сверка ещё не судила, перепроверяется до новой оплаты (reviveRejected).` дописать абзац:
+
+```ts
+ *
+ * Два клипа одного текста сценки не прошли сверку речи или попытки кончились
+ * отказом фильтра — третий клип не снимается: SkitFeedbackError, ролик уходит
+ * сценаристу с отзывом о сценке (worker/db.ts, failJob), если на пересъёмку
+ * остался хотя бы клип; иначе omni_budget с причиной.
+```
+
+`src/shorts/migrations/004_skit_feedback.sql`, шапку «ОТКАТ» заменить на (только комментарии; файл по-прежнему один DO-блок):
+
+```sql
+-- ОТКАТ: сначала весь код очереди 2а — API и студия (linkeon-studio перезапущена на
+-- старом коде): LIST_COLUMNS, сценарист, режиссёр, «Повторить» и failJob студии
+-- читают и пишут колонку. До старта старого кода — два шага, иначе старый сценарист
+-- проведёт ролик с отзывом о сценке через keepSkits (тот же текст — до трёх клипов),
+-- а после нового выката 2а отзыв, который старый код не стёр, сработает в чужом круге:
+--   UPDATE short_video SET status = 'failed', failed_from = 'writing', lease_until = NULL,
+--          failure_notified = false WHERE status = 'writing' AND skit_feedback IS NOT NULL;
+--   UPDATE short_video SET skit_feedback = NULL WHERE skit_feedback IS NOT NULL;
+-- Колонку можно и оставить — старый код её не видит. Снять: убрать 004 из
+-- ShortsSchemaService, затем
+--   SET lock_timeout = '5s'; ALTER TABLE short_video DROP COLUMN skit_feedback;
+```
+
+```bash
+git add studio/src/animate/run-animate.ts src/shorts/migrations/004_skit_feedback.sql
+git commit -m "fix(studio): omni_budget после промаха — с причиной пересъёмки; 004 — полный порядок отката" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts src/worker/animate-money.test.ts 2>&1 | grep -E '^not ok|^# (tests|pass|fail)'; npm run typecheck; STUDIO_PG_URL=postgresql://studioit:studioit@127.0.0.1:5432/studio_it npm run test:db 2>&1 | grep -E '^not ok|^# (tests|pass|fail)'"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-schema.spec.ts 2>&1 | grep -E '✕|Tests:'; SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts 2>&1 | grep -E '✕|^Tests:'"
+```
+
+Ожидается: студия `# fail 0` (run-animate — 58), `tsc` пуст, живая база `# fail 0`; jest — `Tests:` без `failed`.
+
 - [ ] **Step 2 (контролёр, OK владельца на выкат на стенд): отзыв о сценке на стенде**
 
-Учение без подделки распознавания: ролик стенда со снятыми сценками переводится в `writing` с отзывом студии о развязке — как будто студия его прислала. Ожидается: сценарист переписал только реплики и действие развязки (отпечаток кадра развязки прежний), оживление переснимает только развязку (одна генерация Omni ≈ $0,8 на ключе стенда), конфликт берётся готовым, ролик приходит на проверку в канал стенда.
+Учение проверяет половину петли: сценарист по отзыву о сценке переписывает только её реплики и действие, студия берёт готовое (кадры, конфликт) и переснимает одну сценку. Передачу «студия → `failJob` → `writing`» вживую оно не проходит — её держат `db.integration.ts` и `run-animate.test.ts`. Одна-две генерации Omni ≈ $0,8–1,6 на ключе стенда.
 
-1. Выкатить ветку на стенд: `TEST_ONLY=1 BACK_ONLY=1 SKIP_BOTS=1` с ноды из свежих клонов ветки (рецепт — как в задаче 6 плана очереди 1, клоны `--branch feat/shorts-self-healing-2`).
-2. Выбрать на стенде ролик со сценками в `pending_review`, `approved` или `published` (psql стенда на ноде): `SELECT id, status, script->'skits'->'punchline'->>'keyframeFingerprint' AS kf, script->'skits'->'punchline'->>'fingerprint' AS fp FROM short_video WHERE format = 'skit' AND script->'skits' IS NOT NULL ORDER BY updated_at DESC LIMIT 3;`
-3. Перевести (только стенд!):
+1. Выкатить ветку на стенд: `TEST_ONLY=1 BACK_ONLY=1 SKIP_BOTS=1` с ноды из свежих клонов ветки (рецепт — как в задаче 6 плана очереди 1, клон бэка `--branch feat/shorts-self-healing-2`; в ветку уже влит свежий `origin/main`).
+2. Кандидат — только в `pending_review`: не `published` (после одобрения вышел бы повторный пост) и не в работе студии (psql стенда на ноде, только чтение):
+
+```sql
+SELECT id, writer_rounds,
+       script->'skits'->'conflict'->>'fingerprint' AS c_fp,
+       script->'skits'->'punchline'->>'keyframeFingerprint' AS p_kf,
+       script->'skits'->'punchline'->>'fingerprint' AS p_fp,
+       animation->'skits'->'conflict'->>'attempts' AS c_att,
+       animation->>'omniSeconds' AS omni, animation->>'keyframes' AS keyframes,
+       (SELECT max_omni_seconds FROM short_settings WHERE id = 1) AS max_omni
+  FROM short_video
+ WHERE format = 'skit' AND script->'skits' IS NOT NULL AND status = 'pending_review'
+ ORDER BY updated_at DESC LIMIT 3;
+```
+
+Запас `max_omni − omni` — не меньше 16 с (две попытки развязки). Записать все поля.
+
+3. Перевести (только стенд!) — с условием на статус и `writer_rounds = 1`, чтобы прошлые отзывы о длине озвучки не уронили ролик после учения:
 
 ```sql
 UPDATE short_video
-   SET status = 'writing', attempts = 0, lease_until = NULL,
-       writer_feedback = 'сценка 2 (развязка): 2 клипа с этими репликами не прошли сверку речи — учение. Перепиши реплики и действие этой сценки — короче и проще, обычными словами; место, начало и героев не меняй.',
+   SET status = 'writing', attempts = 0, lease_until = NULL, writer_rounds = 1,
+       writer_feedback = 'сценка 2 (развязка): 2 клипа с этими репликами не прошли сверку речи; в последнем не услышаны: реплика 2, услышано: «учение». Перепиши реплики и действие этой сценки — короче и проще, обычными словами; пока герой говорит, ничто не закрывает ему рот; место, начало и героев не меняй.',
        skit_feedback = '{"kind":"punchline","code":"speech_mismatch","lines":[2],"heard":"учение","reason":null}'::jsonb
- WHERE id = '<id>';
+ WHERE id = '<id>' AND status = 'pending_review';
 ```
 
-4. Следить за роликом (раз в 30 с): `writing` → `animate_queued` → `render_queued` → `pending_review`. Проверить: `script->'skits'->'punchline'->>'keyframeFingerprint'` = прежний `kf`, `fingerprint` ≠ прежний `fp`, `animation->>'omniSeconds'` вырос на 8, в журнале студии стенда — один `startClip` развязки и «готово с попытки 1» только у `punchline`; `skit_feedback` и `writer_feedback` — `NULL`.
+Ожидается `UPDATE 1`.
 
-- [ ] **Step 3 (контролёр, OK владельца): слияние и выкат** — как задача 6 плана очереди 1: `merge --no-ff` в свежий `origin/main`, `deploy.sh` с ноды `BACK_ONLY=1 SKIP_BOTS=1` из свежих клонов, проверка прода (`MAX_SPEECH_MISSES` в `studio/src/animate/run-animate.ts`, колонка `skit_feedback` в `short_video`, `linkeon-studio` перезапущена). Колонки нет — первый накат не дождался замка (`lock_timeout` 5 с): в журнале API `shorts migration 004_skit_feedback.sql failed … lock timeout`, блокирующую сессию — в `pg_stat_activity`, затем рестарт API (проверив, что нет живых ходов); без колонки список «Ролики» в админке отвечает 500, а каждый этап сценариста падает на записи сценария и возврате к режиссёру (обе ссылаются на `skit_feedback`).
+4. Следить в фоне (раз в 30 с): `writing` → `animate_queued` → `render_queued` → `pending_review`. Проверить:
+   - `p_kf` прежний, `p_fp` новый;
+   - `c_fp` и `animation->'skits'->'conflict'` прежние;
+   - `animation->>'keyframes'` прежний — кадр не перерисован, за кадр не платили;
+   - `omniSeconds` вырос на 8 (лучший исход) или на 16 (развязку сняли со второй попытки) — оба успех. Два промаха подряд и второй круг сценариста (`writing` снова, `writer_rounds` = 2) — тоже полный цикл петли, не провал: досмотреть до `pending_review` или `failed` и записать;
+   - `skit_feedback` и `writer_feedback` — `NULL`;
+   - в журнале студии стенда «готово с попытки N» — только у `punchline` (строку о запуске клипа студия не пишет: деньги видны по `omniSeconds`).
+5. Итог учения — в заметку памяти: исход, секунды, чего учение не проверяло.
+
+- [ ] **Step 3 (контролёр, OK владельца): слияние и выкат** — как задача 6 плана очереди 1: `merge --no-ff` в свежий `origin/main`, `deploy.sh` с ноды `BACK_ONLY=1 SKIP_BOTS=1` из свежих клонов.
+
+Перед запуском — на проде нет ролика в `capturing`, `animating`, `rendering` (только чтение): `deploy.sh` перезапускает студию, и задание в работе дождётся конца аренды.
+
+Сразу после `deploy.sh` — проверить колонку (`SELECT 1 FROM information_schema.columns WHERE table_name = 'short_video' AND column_name = 'skit_feedback'`), `MAX_SPEECH_MISSES` в `studio/src/animate/run-animate.ts` на проде и перезапуск `linkeon-studio`. Колонки нет — первый накат не дождался замка (`lock_timeout` 5 с; в журнале API `shorts migration 004_skit_feedback.sql failed … lock timeout`). Без неё сломаны: список «Ролики» (500), сценарист и режиссёр (запись сценария и сцены), «Повторить» (500) и студия — `failJob` падает на первом отзыве о сценке, процесс перезапускается, задание висит до конца аренды (30 мин) и переснимается. Порядок, каждое действие на проде — с OK владельца:
+   1. `pm2 stop linkeon-studio` — остановить падения и траты;
+   2. блокирующая сессия — в `pg_stat_activity`;
+   3. рестарт API, проверив, что нет живых ходов;
+   4. колонка появилась — `pm2 start linkeon-studio`.
 
 - [ ] **Step 4: Заметка памяти и рабочее состояние** — очередь 2а на проде (sha), дальше — план 2б (доктор упавших).
