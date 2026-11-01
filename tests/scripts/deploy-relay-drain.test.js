@@ -81,7 +81,10 @@ if [[ "$1" == -p ]]; then
   exit 1
 fi
 if [[ "$1" == -eo ]]; then
-  if [[ -e "$WORK/old-worker-alive" ]]; then echo "4243 820 nginx"; fi
+  if [[ -e "$WORK/old-worker-alive" ]]; then
+    master=$(cat /var/run/nginx.pid)
+    echo "4243 $master nginx"
+  fi
   exit 0
 fi
 if [[ -e "$DRAIN_FILE" ]]; then gate=yes; else gate=no; fi
