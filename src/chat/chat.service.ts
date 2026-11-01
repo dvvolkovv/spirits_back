@@ -279,7 +279,9 @@ export interface AgentReplyOpts {
    * консультация специалиста в звонке (не её сжатие, voice_condense).
    */
   linkeonTools?: boolean;
+  descriptionOverride?: string;
   systemPromptOverride?: string;
+  testLanguage?: string;
   includeUserContext?: boolean;
   testMode?: boolean;
   billingContext?: string;
@@ -2676,6 +2678,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const agent = agentRes.rows[0];
     if (!agent) throw new Error(`generateAgentReply: agent not found: ${assistantId}`);
     const agentName = agent.display_name || agent.name;
+    const userLanguage = opts.testMode === true
+      ? LanguageService.normalize(opts.testLanguage)
+      : await this.language.resolveUserLanguage(userId);
+    const agentDescription = opts.descriptionOverride !== undefined
+      ? opts.descriptionOverride
+      : agent.description;
 
     let profileText = '';
     if (opts.includeUserContext !== false && this.neo4j) {
@@ -2689,9 +2697,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // qprobe_* это было видно замером даже после починки основного пути.
     let stablePrefix =
       `СИСТЕМНАЯ ИНСТРУКЦИЯ (имеет приоритет над всеми остальными). ` +
-      `Ты ассистент по имени **${agentName}**${agent.description ? ` — ${agent.description}` : ''} на платформе LINKEON.IO. ` +
+      `Ты ассистент по имени **${agentName}**${agentDescription ? ` — ${agentDescription}` : ''} на платформе LINKEON.IO. ` +
       `Всегда представляйся именно как ${agentName}. Никогда не упоминай, что ты Claude или другая AI-система помимо ${agentName}. ` +
-      LanguageService.buildDirective(await this.language.resolveUserLanguage(userId)) + `\n`;
+      LanguageService.buildDirective(userLanguage) + `\n`;
     const systemPrompt = opts.systemPromptOverride !== undefined
       ? opts.systemPromptOverride
       : agent.system_prompt;
@@ -2719,7 +2727,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     prefix += `${MEETING_HONESTY_RULE}\n\n`;
     prefix += `${RESPONSE_STYLE_RULE}\n\n`;
     prefix +=
-      `${LANGUAGE_REPLY_LINE[await this.language.resolveUserLanguage(userId)] || LANGUAGE_REPLY_LINE[DEFAULT_LANGUAGE]}\n\n`;
+      `${LANGUAGE_REPLY_LINE[userLanguage] || LANGUAGE_REPLY_LINE[DEFAULT_LANGUAGE]}\n\n`;
 
     const prompt = prefix + message;
 
@@ -2736,7 +2744,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // Язык в ключе сессии — по той же причине, что в основном пути: релей
     // резюмит прежний разговор, и накопленный русский перевешивает промпт.
     const relaySid = sessionIdOverride ||
-      relaySessionKey(userId, assistantId, await this.language.resolveUserLanguage(userId));
+      relaySessionKey(userId, assistantId, userLanguage);
     fd.append('sessionId', relaySid);
     if (opts.testMode === true) fd.append('testMode', 'true');
     // Инструменты Linkeon — только когда вызывающий явно сказал linkeonTools:

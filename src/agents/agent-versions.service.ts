@@ -194,6 +194,7 @@ export class AgentVersionsService implements OnModuleInit {
       text,
       testSession,
       {
+        descriptionOverride: version.description,
         systemPromptOverride: version.system_prompt,
         includeUserContext: false,
         linkeonTools: false,
