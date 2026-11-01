@@ -374,6 +374,7 @@ maybe('ролики против живого Postgres', () => {
       video_key: 'shorts/test/video.mp4', cover_key: 'shorts/test/cover.jpg', duration_ms: 44000,
       slot_at: new Date(Date.now() + 86_400_000), approved_at: new Date(Date.now() - 3_600_000),
       owner_note: 'замечание-тест', writer_feedback: 'отзыв-тест', writer_rounds: 3,
+      skit_feedback: { kind: 'punchline', code: 'speech_mismatch', lines: [2], heard: 'услышано-тест', reason: null },
       review_chat_id: 777, review_message_id: 12, note_prompt_ids: [101, 102], yt_prompt_ids: [201],
       lease_until: new Date(Date.now() + 900_000), attempts: 2, last_error: 'ошибка-тест',
       failed_from: 'writing', failure_notified: true, published_at: new Date(Date.now() - 60_000),

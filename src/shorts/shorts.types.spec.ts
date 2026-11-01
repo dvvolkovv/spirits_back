@@ -108,6 +108,12 @@ describe('rowToShort', () => {
     expect(rowToShort({ format: 'chat' }).format).toBe('chat');
     expect(rowToShort({}).format).toBe('chat');
   });
+
+  it('отзыв студии о сценке — как в базе; нет — null', () => {
+    const feedback = { kind: 'punchline', code: 'speech_mismatch', lines: [2], heard: 'это только символика', reason: null };
+    expect(rowToShort({ skit_feedback: feedback }).skitFeedback).toEqual(feedback);
+    expect(rowToShort({}).skitFeedback).toBeNull();
+  });
 });
 
 describe('appendOwnerNote', () => {
