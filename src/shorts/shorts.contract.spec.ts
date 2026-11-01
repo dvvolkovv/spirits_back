@@ -70,6 +70,12 @@ describe('контракт API и студии', () => {
     expect(types.match(kind)?.[1]).toBeDefined();
     expect(types.match(kind)?.[1]).toBe(back.match(kind)?.[1]);
   });
+
+  it('отзыв студии о сценке: SkitFeedback студии и ShortSkitFeedback API — одни и те же поля', () => {
+    const types = studio('types.ts');
+    const back = fs.readFileSync(path.join(__dirname, 'shorts.types.ts'), 'utf8');
+    expect(fields(types, 'studio/src/types.ts', 'SkitFeedback')).toEqual(fields(back, 'shorts.types.ts', 'ShortSkitFeedback'));
+  });
 });
 
 describe('контракт API и студии — оживление', () => {

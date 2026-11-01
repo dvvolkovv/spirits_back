@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { StudioError } from '../errors';
+import { SkitFeedbackError, StudioError } from '../errors';
 import type { Script, ShortAnimation, SkitKind, SkitPlan } from '../types';
 import { animateRun, type AnimateDeps } from './run-animate';
 import { MATCHER_VERSION } from './match';
@@ -423,14 +423,18 @@ test('предел — не число или испорченный animation.j
   assert.deepEqual([a.calls.keyframe.length, a.calls.start.length], [0, 0]);
 });
 
-test('три несовпадения речи — сдаётся с причиной и сводкой попыток', { timeout: 120_000 }, async () => {
+test('два несовпадения речи на одном тексте — сценаристу, а не третий клип', { timeout: 120_000 }, async () => {
   const env = setup();
   const { deps } = fakes(env, { heard: (kind) => (kind === 'conflict' ? 'совсем другое' : LINES[kind].join(' ')) });
   await assert.rejects(
     animateRun(env.runDir, deps),
-    (e: unknown) => isErr('speech_mismatch', false)(e) && /после 3 попыток \(speech_mismatch, speech_mismatch, speech_mismatch\)/.test((e as Error).message),
+    (e: unknown) =>
+      e instanceof SkitFeedbackError &&
+      e.feedback.kind === 'conflict' &&
+      JSON.stringify(e.feedback.lines) === '[1,2]' &&
+      /не услышаны реплики 1, 2/.test(e.message),
   );
-  assert.equal(readAnim(env.runDir).omniSeconds, 32);
+  assert.equal(readAnim(env.runDir).omniSeconds, 24);
 });
 
 test('брак — и из хранилища: onDiscard получает raw.mp4 сценки; сбой удаления — повтор задания без нового клипа', { timeout: 120_000 }, async () => {
@@ -839,4 +843,62 @@ test('перепроверка оборвалась на распознаван�
   assert.equal(anim.skits.punchline!.heard, heard);
   assert.equal(anim.omniSeconds, 16);
   assert.equal(rejectedClips(dir).length, 1);
+});
+
+test('два клипа с одним текстом не прошли сверку речи — сценаристу: отзыв с номером реплики и услышанным, третий клип не снимается', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const heard = 'три года нормальный износ';
+  const { deps, calls } = fakes(env, { heard: (kind) => (kind === 'punchline' ? heard : LINES[kind].join(' ')) });
+  await assert.rejects(animateRun(env.runDir, deps), (e: unknown) => {
+    assert.ok(e instanceof SkitFeedbackError, String(e));
+    assert.equal(e.code, 'speech_mismatch');
+    assert.equal(e.retryable, false);
+    assert.deepEqual(e.feedback, { kind: 'punchline', code: 'speech_mismatch', lines: [2], heard, reason: null });
+    assert.match(e.writerText, /^сценка 2 \(развязка\): 2 клипа с этими репликами не прошли сверку речи; в последнем не услышаны: реплика 2 \(kesha\) «Га-га… ладно\.», услышано: «три года нормальный износ»\./);
+    assert.match(e.writerText, /место, начало и героев не меняй/);
+    return true;
+  });
+  assert.equal(calls.start.filter((k) => k === 'punchline').length, 2);
+  assert.equal(readAnim(env.runDir).omniSeconds, 24);
+});
+
+test('на пересъёмку переписанной сценки нет секунд — omni_budget, а не сценаристу', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const { deps } = fakes(env, { heard: (kind) => (kind === 'punchline' ? 'три года нормальный износ' : LINES[kind].join(' ')) });
+  await assert.rejects(
+    animateRun(env.runDir, { ...deps, maxOmniSeconds: 24 }),
+    (e: unknown) => isErr('omni_budget', false)(e) && !(e instanceof SkitFeedbackError),
+  );
+  assert.equal(readAnim(env.runDir).omniSeconds, 24);
+});
+
+test('фильтр Google трижды отказал — сценаристу с причиной; секунды возвращены', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const { deps, calls } = fakes(env, {
+    start: (kind) => {
+      if (kind === 'punchline') throw new StudioError('omni_rejected', 'omni: отказ фильтра — violence', true);
+    },
+  });
+  await assert.rejects(animateRun(env.runDir, deps), (e: unknown) => {
+    assert.ok(e instanceof SkitFeedbackError, String(e));
+    assert.deepEqual(e.feedback, { kind: 'punchline', code: 'omni_rejected', lines: [], heard: null, reason: 'omni: отказ фильтра — violence' });
+    assert.match(e.writerText, /^сценка 2 \(развязка\): фильтр Google 3 раза не пропустил клип \(omni: отказ фильтра — violence\)\./);
+    return true;
+  });
+  assert.equal(calls.start.filter((k) => k === 'punchline').length, 3);
+  assert.equal(readAnim(env.runDir).omniSeconds, 8);
+});
+
+test('обе сценки упали: намертво упавшая важнее отзыва сценаристу', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const { deps } = fakes(env, {
+    heard: (kind) => (kind === 'punchline' ? 'три года нормальный износ' : LINES[kind].join(' ')),
+    start: (kind) => {
+      if (kind === 'conflict') throw new StudioError('google_quota', 'omni: лимит Google исчерпан', false);
+    },
+  });
+  await assert.rejects(
+    animateRun(env.runDir, deps),
+    (e: unknown) => isErr('google_quota', false)(e) && !(e instanceof SkitFeedbackError) && /сценка 2 \(развязка\)/.test((e as Error).message),
+  );
 });
