@@ -105,7 +105,7 @@ describe('ShortsWriterService.write', () => {
   it('три варианта подряд с нарушениями — фатально, без записи', async () => {
     const bad = { ...GOOD, captions: { ...GOOD.captions, telegram: 'Попробуйте бесплатно!' } };
     const { svc, pg } = setup([bad, bad, bad]);
-    await expect(svc.write(video())).rejects.toBeInstanceOf(StageFatalError);
+    await expect(svc.write(video())).rejects.toMatchObject({ name: 'StageFatalError', code: 'rules' });
     expect(pg.query).not.toHaveBeenCalled();
   });
 
@@ -127,6 +127,7 @@ describe('ShortsWriterService.write', () => {
     const note = 'про субаренду\nСценарист: нужен вопрос про субаренду\nСценарист: всё ещё не про субаренду';
     const err = await svc.write(video({ owner_note: note })).catch((e) => e);
     expect(err).toBeInstanceOf(StageFatalError);
+    expect(err).toMatchObject({ code: 'recapture' });
     expect(err.message).toBe('сценарист: уже дважды просил другую сцену — нужен взгляд владельца; последняя причина: нужен вопрос про субаренду');
     expect(pg.query).not.toHaveBeenCalled();
   });
@@ -146,7 +147,7 @@ describe('ShortsWriterService.write', () => {
 
   it('нет съёмки — фатально', async () => {
     const { svc } = setup([GOOD]);
-    await expect(svc.write(video({ capture: null }))).rejects.toBeInstanceOf(StageFatalError);
+    await expect(svc.write(video({ capture: null }))).rejects.toMatchObject({ name: 'StageFatalError', code: 'no_scene' });
   });
 
   it('формат «Только чат» после отзыва о сценке: отзыв студии о сценке сценаристу чата не уходит', async () => {
@@ -407,6 +408,7 @@ describe('ShortsWriterService.write — ролик со сценками', () =>
   it('у ролика со сценками нет сценки 1 — StageFatalError: нужен режиссёр', async () => {
     const { svc, relay } = setup([SKIT_GOOD]);
     await expect(svc.write(video({ format: 'skit' }))).rejects.toThrow(/нет сценки 1/);
+    await expect(svc.write(video({ format: 'skit' }))).rejects.toMatchObject({ code: 'no_conflict' });
     expect(relay.ask).not.toHaveBeenCalled();
   });
 });
