@@ -40,6 +40,9 @@ function runRollout(health, options = {}) {
   write(path.join(stage, 'server.mjs'), targetServer);
   fs.mkdirSync(path.join(live, 'node_modules'));
   write(nginxConf, 'server {\n  location /chat { proxy_pass http://127.0.0.1:3033/chat; }\n  location /health { proxy_pass http://127.0.0.1:3033/health; }\n}\n');
+  if (['legacy', 'legacy-upload', 'target-fails'].includes(health)) {
+    write(path.join(work, 'old-worker-alive'), '4243\n');
+  }
 
   executable(path.join(bin, 'sudo'), '#!/usr/bin/env bash\nexec "$@"\n');
   executable(path.join(bin, 'nginx'), `#!/usr/bin/env bash
@@ -48,6 +51,7 @@ if [[ "$1" == -s && "$2" == reload ]]; then
   if grep -q LINKEON-RELAY-DRAIN "$NGINX_CONF"; then
     touch "$WORK/nginx-gate-on"
     echo "reload gate=on" >> "$WORK/nginx.log"
+    if [[ "${health}" != legacy-upload ]]; then rm -f "$WORK/old-worker-alive"; fi
   else
     rm -f "$WORK/nginx-gate-on"
     echo "reload gate=off" >> "$WORK/nginx.log"
@@ -67,6 +71,19 @@ fi
 exit 2
 `);
   executable(path.join(bin, 'ps'), `#!/usr/bin/env bash
+if [[ "$1" == -p ]]; then
+  if [[ -e "$WORK/old-worker-alive" ]]; then
+    echo "worker-check alive" >> "$WORK/worker.log"
+    echo "$2"
+    exit 0
+  fi
+  echo "worker-check exited" >> "$WORK/worker.log"
+  exit 1
+fi
+if [[ "$1" == -eo ]]; then
+  if [[ -e "$WORK/old-worker-alive" ]]; then echo "4243 820 nginx"; fi
+  exit 0
+fi
 if [[ -e "$DRAIN_FILE" ]]; then gate=yes; else gate=no; fi
 echo "ps gate=$gate" >> "$WORK/ps.log"
 exit 0
@@ -84,7 +101,7 @@ fi
 if [[ -f "$WORK/restarts.log" ]]; then restarts=$(wc -l < "$WORK/restarts.log"); else restarts=0; fi
 url="$*"
 if [[ "$url" == */chat ]]; then
-  if [[ -e "$WORK/nginx-gate-on" ]]; then code=503; else code=403; fi
+  if [[ -e "$WORK/nginx-gate-on" || -e "$DRAIN_FILE" ]]; then code=503; else code=403; fi
   echo "chat restart=$restarts code=$code" >> "$WORK/curl.log"
   printf '%s' "$code"
   exit 0
@@ -106,10 +123,17 @@ case "${health}" in
     if [[ "$restarts" -eq 0 ]]; then echo '{"status":"ok","inflight":0}'; exit 0; fi
     exit 1 ;;
   legacy) echo '{"status":"ok"}'; exit 0 ;;
+  legacy-upload) echo '{"status":"ok"}'; exit 0 ;;
   *) echo '{"status":"ok","inflight":0}'; exit 0 ;;
 esac
 `);
-  executable(path.join(bin, 'sleep'), '#!/usr/bin/env bash\nexit 0\n');
+  executable(path.join(bin, 'sleep'), `#!/usr/bin/env bash
+if [[ "${health}" == legacy-upload && -e "$WORK/old-worker-alive" ]]; then
+  rm -f "$WORK/old-worker-alive"
+  echo "upload-finished" >> "$WORK/worker.log"
+fi
+exit 0
+`);
 
   const harness = path.join(work, 'remote.sh');
   write(harness, remote[1]);
@@ -149,6 +173,8 @@ esac
       restarts: fs.existsSync(path.join(work, 'restarts.log')) ? fs.readFileSync(path.join(work, 'restarts.log'), 'utf8') : '',
       curls: fs.existsSync(path.join(work, 'curl.log')) ? fs.readFileSync(path.join(work, 'curl.log'), 'utf8') : '',
       nginx: fs.existsSync(path.join(work, 'nginx.log')) ? fs.readFileSync(path.join(work, 'nginx.log'), 'utf8') : '',
+      worker: fs.existsSync(path.join(work, 'worker.log')) ? fs.readFileSync(path.join(work, 'worker.log'), 'utf8') : '',
+      oldWorkerAlive: fs.existsSync(path.join(work, 'old-worker-alive')),
       drainExists: fs.existsSync(drainFile),
       cleanup: () => fs.rmSync(work, { recursive: true, force: true }),
     };
@@ -243,8 +269,26 @@ describe('deploy-relay drain/admission gate', () => {
     try {
       expect(r.status).toBe(0);
       expect(r.curls).toContain('chat restart=0 code=503');
+      expect(r.curls).toContain('chat restart=1 code=403');
       expect(r.nginx).toContain('reload gate=on');
       expect(r.nginx).toContain('reload gate=off');
+      expect(r.liveServer).toContain('target');
+      expect(r.drainExists).toBe(false);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it('legacy upload до drain завершается старым Nginx worker до replacement', () => {
+    const r = runRollout('legacy-upload');
+    try {
+      expect(r.status).toBe(0);
+      expect(r.worker.match(/worker-check alive/g) || []).toHaveLength(1);
+      expect(r.worker).toContain('upload-finished');
+      expect(r.worker).toContain('worker-check exited');
+      expect(r.oldWorkerAlive).toBe(false);
+      expect(r.curls).toContain('chat restart=0 code=503');
+      expect(r.curls).toContain('chat restart=1 code=403');
       expect(r.liveServer).toContain('target');
       expect(r.drainExists).toBe(false);
     } finally {
