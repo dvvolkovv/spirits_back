@@ -380,10 +380,10 @@ test('кадр: пустой ответ — ещё попытка; заблок�
   const b = setup();
   const blocked = fakes(b, {
     keyframe: (kind) => {
-      if (kind === 'conflict') throw new StudioError('keyframe', 'keyframe: Nano Banana заблокировал промпт (PROHIBITED_CONTENT)', false);
+      if (kind === 'conflict') throw new StudioError('keyframe_blocked', 'keyframe: Nano Banana заблокировал промпт (PROHIBITED_CONTENT)', false);
     },
   });
-  await assert.rejects(animateRun(b.runDir, blocked.deps), (e: unknown) => isErr('keyframe', false)(e) && /сценка 1 \(конфликт\)/.test((e as Error).message));
+  await assert.rejects(animateRun(b.runDir, blocked.deps), (e: unknown) => isErr('keyframe_blocked', false)(e) && /сценка 1 \(конфликт\)/.test((e as Error).message));
   assert.deepEqual(blocked.calls.start, []);
 });
 

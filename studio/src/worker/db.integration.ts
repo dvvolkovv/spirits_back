@@ -1,6 +1,6 @@
 /**
  * Очередь студии против живого Postgres — теми же миграциями, что катит API
- * (src/shorts/migrations: 001, 002, 004; 003 — колонки YouTube, студии не нужны):
+ * (src/shorts/migrations: 001, 002, 004, 005; 003 — колонки YouTube, студии не нужны):
  * так контракт колонок проверяется на настоящей схеме.
  *
  * База ОДНОРАЗОВАЯ: перед каждым тестом TRUNCATE. Гард отказывается работать с
@@ -22,7 +22,7 @@ import {
 } from './db';
 
 const DB_URL = process.env.STUDIO_PG_URL;
-const MIGRATIONS = ['001_shorts.sql', '002_skits.sql', '004_skit_feedback.sql'].map((f) => fileURLToPath(new URL(`../../../src/shorts/migrations/${f}`, import.meta.url)));
+const MIGRATIONS = ['001_shorts.sql', '002_skits.sql', '004_skit_feedback.sql', '005_doctor.sql'].map((f) => fileURLToPath(new URL(`../../../src/shorts/migrations/${f}`, import.meta.url)));
 const skip = DB_URL ? false : 'нет STUDIO_PG_URL — нужна одноразовая база (рецепт в шапке файла)';
 
 describe('очередь студии против живого Postgres', { skip }, () => {
@@ -103,6 +103,7 @@ describe('очередь студии против живого Postgres', { ski
       [r.status, r.failed_from, r.failure_notified, r.lease_until, r.last_error],
       ['failed', 'rendering', false, null, `сборка: задание не завершилось за ${LEASE_MINUTES} мин — рабочий процесс студии упал или завис`],
     );
+    assert.equal((await row(render)).failed_code, 'lease');
     assert.equal((await row(capture)).status, 'capturing', 'захват сборки чужую очередь не трогает');
 
     assert.equal(await claimJob(pool, 'capture'), null);
@@ -111,6 +112,7 @@ describe('очередь студии против живого Postgres', { ski
       [c.status, c.failed_from, c.failure_notified, c.last_error],
       ['failed', 'capturing', false, `съёмка: задание не завершилось за ${LEASE_MINUTES} мин — рабочий процесс студии упал или завис`],
     );
+    assert.equal((await row(capture)).failed_code, 'lease');
   });
 
   it('оживление: захват отдаёт итог прошлых попыток; по ходу и итог — только своим захватом; готово — render_queued', async () => {
@@ -138,6 +140,7 @@ describe('очередь студии против живого Postgres', { ski
     assert.equal(await failJob(pool, ja!, new StudioError('omni_budget', 'лимит пересъёмок сценок', false)), 'failed');
     const ra = await row(a);
     assert.deepEqual([ra.status, ra.failed_from, ra.last_error], ['failed', 'animating', 'оживление: лимит пересъёмок сценок']);
+    assert.equal(ra.failed_code, 'omni_budget');
 
     const b = await insert('animate_queued');
     const jb = await claimJob(pool, 'animate');
@@ -218,6 +221,7 @@ describe('очередь студии против живого Postgres', { ski
     assert.equal(await failJob(pool, second!, new StudioError('wrong_assistant', 'не тот ассистент', false)), 'failed');
     const f = await row(id);
     assert.deepEqual([f.status, f.failed_from, f.failure_notified], ['failed', 'capturing', false]);
+    assert.equal(f.failed_code, 'wrong_assistant');
   });
 
   it('озвучка длиннее 60 с — сценарий назад сценаристу; после третьего круга — failed с этапа сценариста', async () => {
@@ -239,6 +243,7 @@ describe('очередь студии против живого Postgres', { ski
       [f.status, f.failed_from, f.writer_feedback, f.failure_notified, f.lease_until, f.last_error],
       ['failed', 'writing', 'озвучка: timeline: ролик 61.0 с — длиннее 60 с', false, null, 'сборка: timeline: ролик 61.0 с — длиннее 60 с'],
     );
+    assert.equal(f.failed_code, 'too_long');
   });
 
   it('сценарий, отвергнутый студией (script_invalid), — назад сценаристу; после третьего круга — failed с этапа сценариста', async () => {
@@ -255,6 +260,7 @@ describe('очередь студии против живого Postgres', { ski
     assert.equal(await failJob(pool, last!, new StudioError('script_invalid', message, false)), 'failed');
     const f = await row(id);
     assert.deepEqual([f.status, f.failed_from, f.writer_feedback, f.failure_notified, f.lease_until], ['failed', 'writing', message, false, null]);
+    assert.equal(f.failed_code, 'script_invalid');
   });
 
   it('сценку не снять с этими репликами — сценаристу с разбором; после третьего круга — failed с этапа сценариста', async () => {
@@ -278,6 +284,7 @@ describe('очередь студии против живого Postgres', { ski
       [f.status, f.failed_from, f.writer_feedback, f.skit_feedback, f.failure_notified, f.lease_until, f.last_error],
       ['failed', 'writing', err.writerText, feedback, false, null, `оживление: ${err.message}`],
     );
+    assert.equal(f.failed_code, 'speech_mismatch');
   });
 
   it('код отзыва без SkitFeedbackError (попытки кончились, а промах речи был один) — обычный failed с оживления, сценаристу не уходит', async () => {
@@ -286,6 +293,7 @@ describe('очередь студии против живого Postgres', { ski
     assert.equal(await failJob(pool, job!, new StudioError('speech_mismatch', 'не услышаны реплики 2, услышано: «это износ» — после 3 попыток (clip_invalid, omni_timeout, speech_mismatch)', false)), 'failed');
     const r = await row(id);
     assert.deepEqual([r.status, r.failed_from, r.writer_feedback, r.skit_feedback], ['failed', 'animating', null, null]);
+    assert.equal(r.failed_code, 'speech_mismatch');
   });
 
   it('опоздавшее оживление с отзывом о сценке — gone, строка не тронута', async () => {
