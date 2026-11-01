@@ -28,4 +28,3 @@ try {
 } finally {
   fs.rmSync(work, { recursive: true, force: true });
 }
-
