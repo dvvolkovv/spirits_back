@@ -548,7 +548,7 @@ describe('AgentVersionsService.testVersion', () => {
     });
     expect(h.generateAgentReplyWithCharge).toHaveBeenCalledWith(
       'admin',
-      12,
+      '12',
       'check the draft',
       sessionId,
       {
@@ -559,7 +559,7 @@ describe('AgentVersionsService.testVersion', () => {
     );
     expect(h.recordAgentVersionTestCharge).toHaveBeenCalledWith(
       'admin',
-      12,
+      '12',
       { tokens: 321, costUsd: 0.123456 },
       'draft answer'.length,
     );
@@ -577,7 +577,7 @@ describe('AgentVersionsService.testVersion', () => {
     expect(result.session_id).toMatch(/^agent_test_admin_[a-f0-9]{32}$/);
     expect(h.generateAgentReplyWithCharge).toHaveBeenCalledWith(
       'admin',
-      12,
+      '12',
       'check',
       result.session_id,
       expect.any(Object),

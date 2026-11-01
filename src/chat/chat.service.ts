@@ -278,6 +278,8 @@ export interface AgentReplyOpts {
    * консультация специалиста в звонке (не её сжатие, voice_condense).
    */
   linkeonTools?: boolean;
+  systemPromptOverride?: string;
+  includeUserContext?: boolean;
 }
 
 @Injectable()
@@ -2624,6 +2626,20 @@ ${LanguageService.buildDirective(userLanguage)}`;
     return this.agentReply(userId, assistantId, message, sessionIdOverride, true, opts);
   }
 
+  async recordAgentVersionTestCharge(
+    userId: string,
+    assistantId: string,
+    charge: { tokens: number; costUsd: number },
+    replyChars: number,
+  ): Promise<void> {
+    await this.addTokenTask(userId, 0, charge.tokens, assistantId, {
+      costUsd: Number(charge.costUsd.toFixed(4)),
+      source: 'cost',
+      durationMs: 0,
+      replyChars,
+    });
+  }
+
   private async agentReply(
     userId: string, assistantId: string, message: string, sessionIdOverride: string | undefined, billed: boolean,
     opts: AgentReplyOpts = {},
@@ -2637,7 +2653,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const agentName = agent.display_name || agent.name;
 
     let profileText = '';
-    if (this.neo4j) { try { profileText = await this.neo4j.getProfileDescription(userId); } catch {} }
+    if (opts.includeUserContext !== false && this.neo4j) {
+      try { profileText = await this.neo4j.getProfileDescription(userId); } catch {}
+    }
 
     // Деление то же, что в основном пути чата: постоянное для сессии —
     // отдельным полем в --system-prompt релея, пер-ходовое остаётся в теле.
@@ -2649,13 +2667,16 @@ ${LanguageService.buildDirective(userLanguage)}`;
       `Ты ассистент по имени **${agentName}**${agent.description ? ` — ${agent.description}` : ''} на платформе LINKEON.IO. ` +
       `Всегда представляйся именно как ${agentName}. Никогда не упоминай, что ты Claude или другая AI-система помимо ${agentName}. ` +
       LanguageService.buildDirective(await this.language.resolveUserLanguage(userId)) + `\n`;
-    if (agent.system_prompt && agent.system_prompt.trim()) {
-      stablePrefix += `--- Персона и инструкции ассистента ${agentName} ---\n${agent.system_prompt.trim()}\n\n`;
+    const systemPrompt = opts.systemPromptOverride !== undefined
+      ? opts.systemPromptOverride
+      : agent.system_prompt;
+    if (systemPrompt && systemPrompt.trim()) {
+      stablePrefix += `--- Персона и инструкции ассистента ${agentName} ---\n${systemPrompt.trim()}\n\n`;
     }
     if (profileText && profileText.trim()) {
       stablePrefix += `User profile:\n${profileText}\n\n`;
     }
-    if (this.businessProfile) {
+    if (opts.includeUserContext !== false && this.businessProfile) {
       try {
         const biz = await this.businessProfile.renderForPrompt(userId, agent.category);
         if (biz) stablePrefix += biz + '\n\n';

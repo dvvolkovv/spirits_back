@@ -5,6 +5,7 @@ import {
   NotFoundException,
   OnModuleInit,
 } from '@nestjs/common';
+import { createHash, randomBytes } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { ChatService } from '../chat/chat.service';
@@ -108,6 +109,55 @@ export class AgentVersionsService implements OnModuleInit {
       throw new NotFoundException('Agent version not found');
     }
     return toAgentVersion(result.rows[0]);
+  }
+
+  async testVersion(
+    actor: string,
+    agentId: number,
+    versionId: string,
+    message: string,
+    sessionId?: string,
+  ): Promise<{ text: string; session_id: string; tokens: number }> {
+    const version = await this.getVersion(agentId, versionId);
+    const text = typeof message === 'string' ? message.trim() : '';
+    if (!text) {
+      throw new BadRequestException('message must not be empty');
+    }
+    if (text.length > 12000) {
+      throw new BadRequestException('message must not exceed 12000 characters');
+    }
+
+    let testSession = sessionId;
+    if (testSession !== undefined) {
+      if (!/^agent_test_[A-Za-z0-9_-]{1,80}$/.test(testSession)) {
+        throw new BadRequestException('Invalid agent test session');
+      }
+    } else {
+      const hash = createHash('sha256')
+        .update(`${agentId}:${versionId}:${Date.now()}:${randomBytes(16).toString('hex')}`)
+        .digest('hex')
+        .slice(0, 32);
+      testSession = `agent_test_${actor}_${hash}`;
+    }
+
+    const result = await this.chat.generateAgentReplyWithCharge(
+      actor,
+      String(agentId),
+      text,
+      testSession,
+      {
+        systemPromptOverride: version.system_prompt,
+        includeUserContext: false,
+        linkeonTools: false,
+      },
+    );
+    await this.chat.recordAgentVersionTestCharge(
+      actor,
+      String(agentId),
+      { tokens: result.tokens, costUsd: result.costUsd },
+      result.text.length,
+    );
+    return { text: result.text, session_id: testSession, tokens: result.tokens };
   }
 
   async listVersions(agentId: number, limit = 50): Promise<AgentVersion[]> {
