@@ -9,8 +9,11 @@
 -- ALTER TABLE берёт ACCESS EXCLUSIVE даже с IF NOT EXISTS и на каждом старте
 -- ждал бы открытые записи (шапка 001).
 --
--- ОТКАТ (код без очереди 2а колонку не читает): убрать 004 из ShortsSchemaService, затем
---   ALTER TABLE short_video DROP COLUMN skit_feedback;
+-- ОТКАТ: сначала весь код очереди 2а — API и студия (linkeon-studio перезапущена на
+-- старом коде): LIST_COLUMNS, сценарист, «Повторить» и failJob студии читают и пишут
+-- колонку. Колонку можно и оставить — старый код её не видит. Снять: убрать 004 из
+-- ShortsSchemaService, затем
+--   SET lock_timeout = '5s'; ALTER TABLE short_video DROP COLUMN skit_feedback;
 DO $shorts$
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('shorts/004'));
