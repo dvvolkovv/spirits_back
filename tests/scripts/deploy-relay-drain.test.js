@@ -105,7 +105,7 @@ describe('deploy-relay drain/admission gate', () => {
   it('держит gate до успешного health и снимает его только после него', () => {
     const r = runRollout('ok');
     try {
-      expect(r.status).toBe(0);
+      expect({ status: r.status, stderr: r.stderr }).toEqual({ status: 0, stderr: '' });
       expect(r.restarts).toContain('restart gate=yes');
       expect(r.curls).toContain('gate=yes');
       expect(r.liveServer).toContain('target');
