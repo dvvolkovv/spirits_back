@@ -3278,6 +3278,129 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts src/tg-bot 2>&1 |
 
 Ожидается: студия `# fail 0`, `TYPECHECK_OK`, живая база `# fail 0`; бэк — оба `Tests:` без `failed`, `TSC_OK`, `BUILD_OK`.
 
+- [ ] **Step 7: Правки итогового ревью — подсказка упавшего, «без сценок» только у chat, 403 входа, `at` в карточке**
+
+Итоговое ревью очереди 2б — критичных находок нет. Четыре мелочи кода закрываем до учений, чтобы на стенде и на проде был один sha:
+
+- **M1.** Подсказка студии `omni_budget` живёт в `last_error` упавшего ролика — в сообщении «не собрался» и в карточке «Упали». Там кнопки «Повторить», «Новая сцена», «Новый текст», а «Переснять» нет: строкой ниже `failedHint` перечисляет именно их. Правильно: «Повторить» или «Новая сцена» — «Новая сцена» тоже берёт формат из настроек и начинает новый круг. Ролику, собранному доктором без сценок, выход в подписи даёт `OMNI_BUDGET_NO_SKITS` (шаг 6) — там «Переснять» верно.
+- **M2.** Строка «Собран без сценок» на бэке не смотрит на формат, а кабинет ставит пометку только у `chat`. Путём кода расхождения нет. Но после ручного SQL ролик со сценками получил бы в подписи и «Сценки: …», и «Собран без сценок».
+- **M6.** 403 «Phone not in whitelist» от debug-ручки (`src/auth/auth.controller.ts`, `debugSmsCode`: номер демо-аккаунта не в белом списке этой среды) — настройка среды, как неверный секрет. Сейчас он идёт как `login`: три попытки по 10 с, затем доктор ставит «позже» на 30 мин и на 2 ч, и владелец узнаёт через ≈ 2,5 ч. До 2б узнавал сразу. Правильно — `no_input` без повтора: доктор его не лечит («никак»).
+- **M7.** Кабинет: `formatSlotAt` неразборчивое значение возвращает как есть. Объект в `at` записи истории (ручной SQL) уходит детищем React — карточка падает («Objects are not valid as a React child»).
+
+**Тесты (сначала):**
+
+`studio/src/animate/run-animate.test.ts`, тест `'предел — на круг владельца: начало круга выше счёта ролика — круг от счёта, а не щедрее'`: в регулярке сообщения `новый круг со сценками — «Повторить» или «Переснять»` → `новый круг со сценками — «Повторить» или «Новая сцена»`.
+
+`studio/src/capture/login.test.ts`, после теста `'debug-ручка ответила 404 — …'`:
+
+```ts
+test('debug-ручка ответила 403 «Phone not in whitelist» — no_input без повтора: номер демо-аккаунта не в белом списке среды', async () => {
+  const real = globalThis.fetch;
+  let codeCalls = 0;
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    if (String(url).includes('/webhook/debug/sms-code/')) {
+      codeCalls++;
+      return new Response(JSON.stringify({ error: 'Phone not in whitelist' }), { status: 403 });
+    }
+    return new Response('{}', { status: 200 });
+  }) as typeof fetch;
+  try {
+    await assert.rejects(
+      loginDemo(cfg),
+      (e: unknown) => e instanceof StudioError && e.code === 'no_input' && e.retryable === false && /debug-ручка ответила 403/.test(e.message),
+    );
+    assert.equal(codeCalls, 1);
+  } finally {
+    globalThis.fetch = real;
+  }
+});
+```
+
+`src/shorts/shorts-approval.service.spec.ts`, после теста `'подпись — только текущий круг: …'`:
+
+```ts
+    it('«Собран без сценок» — только у формата chat: запись no_skits у ролика со сценками (ручной SQL) в подпись не идёт', async () => {
+      const recoveries = [{ at: '2030-01-01T08:40:00.000Z', from: 'animating', code: 'omni_budget', action: 'no_skits', reason: 'оживление: предел секунд' }];
+      const v = fresh({ format: 'skit', auto_recoveries: 1, recoveries });
+      const { svc, tg } = setup(v);
+      await svc.sendForReview(rowToShort(v), LEASE);
+      const caption = (tg.sendVideo.mock.calls[0] as any[])[2].caption;
+      expect(caption).toContain('Сам восстанавливался: без сценок (omni_budget)');
+      expect(caption).not.toContain('Собран без сценок');
+    });
+```
+
+Кабинет, `src/components/admin/ShortCard.test.tsx`, после теста `'история с мусором (ручной SQL) — карточка рисуется, видна одна настоящая запись'`:
+
+```ts
+  it('объект в «at» записи истории (ручной SQL) — карточка рисуется, запись видна', () => {
+    const odd = [{ at: { v: 1 }, from: 'animating', code: 'google_quota', action: 'later', delayMin: 30, reason: 'r' }] as unknown as ShortRecovery[];
+    render({ item: item({ format: 'skit', autoRecoveries: 1, recoveries: odd }), open: true, detail: detail({ format: 'skit', autoRecoveries: 1, recoveries: odd }) });
+    expect(q('short-recoveries-s1')!.querySelectorAll('li')).toHaveLength(1);
+  });
+```
+
+**Закоммитить красное и убедиться, что падает:**
+
+```bash
+git add studio/src/animate/run-animate.test.ts studio/src/capture/login.test.ts src/shorts/shorts-approval.service.spec.ts
+git commit -m "test(shorts): подсказка упавшего — «Новая сцена»; «без сценок» только у chat; 403 входа — no_input (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts src/capture/login.test.ts 2>&1 | grep -E '^not ok|^# (tests|pass|fail)'"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-approval.service.spec.ts 2>&1 | grep -E '✕|^Tests:'"
+git -C /Users/dmitry/Downloads/spirits_front/.worktrees/shorts-doctor-card add src/components/admin/ShortCard.test.tsx
+git -C /Users/dmitry/Downloads/spirits_front/.worktrees/shorts-doctor-card commit -m "test(admin): ролики — объект в «at» истории самопочинок не роняет карточку (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git -C /Users/dmitry/Downloads/spirits_front/.worktrees/shorts-doctor-card push -q origin feat/shorts-doctor-card
+SHA=$(git -C /Users/dmitry/Downloads/spirits_front/.worktrees/shorts-doctor-card rev-parse HEAD); ssh -o ConnectTimeout=15 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 "set -e; cd ~/ci/wt/sh2b-front; timeout 120 git fetch -q origin refs/heads/feat/shorts-doctor-card; test -z \"\$(git status --porcelain --untracked-files=no)\"; git checkout -q --detach ${SHA}; source ~/.nvm/nvm.sh >/dev/null; npx vitest run src/components/admin/ShortCard.test.tsx 2>&1 | grep -E 'Test Files|Tests  |FAIL|✗|×' | head -8"
+```
+
+Ожидается. Студия: красные тест подсказки (`run-animate`) и новый тест 403 (`login`: сейчас 403 — десять ожиданий по секунде и `login`, `codeCalls` = 10). Бэк: `Tests: 1 failed` — новый тест «только у chat». Кабинет: `Tests  1 failed` — новый тест карточки, ошибка React «Objects are not valid as a React child».
+
+**Код:**
+
+`studio/src/animate/run-animate.ts`, в `assertBudget` — комментарий и `exit`:
+
+```ts
+      // Выход владельца — только из рабочего процесса (omniBase передан): в CLI кнопок нет.
+      // Текст уходит в last_error упавшего ролика — там «Повторить», «Новая сцена», «Новый текст»
+      // (failedHint); «Новая сцена» берёт формат из настроек. Собранному доктором без сценок выход
+      // даёт подпись на проверку (OMNI_BUDGET_NO_SKITS — «Переснять»).
+      const exit = deps.omniBase !== undefined ? '; новый круг со сценками — «Повторить» или «Новая сцена»' : '';
+```
+
+`studio/src/capture/login.ts`, в `fetchCode` — перед `if (r.status === 404) {`:
+
+```ts
+    if (r.status === 403) {
+      // «Phone not in whitelist» — номер демо-аккаунта не в белом списке debug-кодов этой среды:
+      // настройка, как неверный секрет. Повтор не поможет, а доктор держал бы ролик «позже» часами.
+      throw new StudioError('no_input', `login: debug-ручка ответила 403 — номер демо-аккаунта (DEMO_PHONE) не в белом списке debug-кодов этой среды`, false);
+    }
+```
+
+`src/shorts/shorts-approval.service.ts`, в `sendForReview`: `const noSkits = circle.find((r) => r.action === 'no_skits');` →
+
+```ts
+    // «Собран без сценок» — только у chat, как пометка в кабинете: запись no_skits у ролика со сценками (ручной SQL) — не про него.
+    const noSkits = v.format === 'chat' ? circle.find((r) => r.action === 'no_skits') : undefined;
+```
+
+Кабинет, `src/components/admin/ShortCard.tsx`, в истории самопочинок: `{formatSlotAt(r.at, now)} — {recoveryText(r)}…` → `{formatSlotAt(String(r.at ?? ''), now)} — {recoveryText(r)}…` (объект в `at` от ручного SQL уходил бы детищем React).
+
+**Закоммитить и прогнать:**
+
+```bash
+git add studio/src/animate/run-animate.ts studio/src/capture/login.ts src/shorts/shorts-approval.service.ts
+git commit -m "fix(shorts): подсказка упавшего — «Повторить» или «Новая сцена»; «без сценок» только у chat; 403 входа — no_input" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+studio/scripts/node-run.sh "npm test 2>&1 | grep -E '^not ok|^# (tests|pass|fail)'; npm run typecheck >/dev/null 2>&1 && echo TYPECHECK_OK || echo TYPECHECK_FAIL; STUDIO_PG_URL=postgresql://studioit:studioit@127.0.0.1:5432/studio_it npm run test:db 2>&1 | grep -E '^not ok|^# (tests|pass|fail)'"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts src/tg-bot 2>&1 | grep -E '✕|^Tests:'; SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts 2>&1 | grep -E '✕|^Tests:'; out=\$(mktemp); npx tsc -p tsconfig.build.json --noEmit >\$out 2>&1 && echo TSC_OK || { echo TSC_FAIL; tail -20 \$out; }; npm run build >\$out 2>&1 && echo BUILD_OK || { echo BUILD_FAIL; tail -20 \$out; }"
+git -C /Users/dmitry/Downloads/spirits_front/.worktrees/shorts-doctor-card add src/components/admin/ShortCard.tsx
+git -C /Users/dmitry/Downloads/spirits_front/.worktrees/shorts-doctor-card commit -m "admin: ролики — объект в «at» истории самопочинок не роняет карточку" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+git -C /Users/dmitry/Downloads/spirits_front/.worktrees/shorts-doctor-card push -q origin feat/shorts-doctor-card
+SHA=$(git -C /Users/dmitry/Downloads/spirits_front/.worktrees/shorts-doctor-card rev-parse HEAD); ssh -o ConnectTimeout=15 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 "set -e; cd ~/ci/wt/sh2b-front; timeout 120 git fetch -q origin refs/heads/feat/shorts-doctor-card; test -z \"\$(git status --porcelain --untracked-files=no)\"; git checkout -q --detach ${SHA}; echo \"front at \$(git rev-parse --short HEAD)\"; source ~/.nvm/nvm.sh >/dev/null; set +e; pnpm install --frozen-lockfile >/tmp/sh2b-front-install.log 2>&1 && echo INSTALL_OK || { echo INSTALL_FAIL; tail -15 /tmp/sh2b-front-install.log; }; pnpm test 2>&1 | grep -E 'Test Files|Tests  |FAIL' | head -15; n=\$(pnpm typecheck 2>&1 | grep -c 'error TS'); echo \"TSC_ERRORS=\$n\"; pnpm build >/tmp/sh2b-front-build.log 2>&1 && echo BUILD_OK || { echo BUILD_FAIL; tail -20 /tmp/sh2b-front-build.log; }; node scripts/check-no-hardcoded.mjs >/tmp/sh2b-front-hc.log 2>&1 && echo HARDCODED_OK || { echo HARDCODED_FAIL; tail -8 /tmp/sh2b-front-hc.log; }"
+```
+
+Ожидается: студия `# fail 0`, `TYPECHECK_OK`, живая база `# fail 0`; бэк — оба `Tests:` без `failed`, `TSC_OK`, `BUILD_OK`; кабинет — `INSTALL_OK`, `Tests  2498 passed`, `TSC_ERRORS=42` (база `main`), `BUILD_OK`, `HARDCODED_OK`.
+
 ---
 
 ### Task 12: Полный прогон, учения на стенде, выкат
@@ -3295,9 +3418,45 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts src/tg-bot 2>&1 |
 
 Ожидается: студия `# fail 0`, `TYPECHECK_OK`, живая база `# fail 0`; бэк — `Tests:` без `failed`, `TSC_OK`, `BUILD_OK`. Перед этим — `git merge origin/main` в ветку, если `main` ушёл (2а к этому времени должна быть в `main`).
 
-- [ ] **Step 2 (контролёр, OK владельца на выкат на стенд): учения** — выкатить обе ветки на стенд (`BRANCH=feat/shorts-self-healing-2b TEST_ONLY=1 SKIP_BOTS=1` с ноды из свежих клонов веток: бэк `--branch feat/shorts-self-healing-2b`, кабинет `--branch feat/shorts-doctor-card`). `deploy.sh` берёт одно имя `BRANCH` для обоих репозиториев (`push_local_repo` пушит `$BRANCH` из клона кабинета, стенд ставит кабинет на `origin/$BRANCH`), поэтому в клоне кабинета — `git switch -c feat/shorts-self-healing-2b`: выкат создаст в GitHub кабинета ветку с именем бэка на том же коммите (убрать после слияния — с OK). Перед запуском — нет ли живого `deploy.sh` на маке и на ноде, и списаться с хозяином ветки, что сейчас на стенде. Без Omni: «без сценок» — сборка чатом.
+- [ ] **Step 2 (контролёр, OK владельца на выкат на стенд): учения** — обе ветки на стенд, без Omni («без сценок» — сборка чатом).
 
-1. **Без сценок по коду** — ролик стенда со сценками в `pending_review` (как в учении 2а: `SELECT … WHERE format = 'skit' AND status = 'pending_review'`), записать `writer_rounds`, `omniSeconds`, затем (только стенд!):
+Перед запуском: нет живого `deploy.sh` ни на маке (`ps -axo command | grep deploy.sh`), ни на ноде; списаться с хозяином ветки, которая сейчас на стенде. Выкат — с ноды, из свежих клонов, отвязанно:
+
+```bash
+N=sh2b-stand-1101; ssh -o ConnectTimeout=15 -o ControlMaster=auto -o "ControlPath=$HOME/.ssh/cm-%C" -o ControlPersist=30m dv@85.192.61.231 "N=$N bash -s" <<'EOF'
+set -e
+[ "$(ps -eo command | grep -c '^bash scripts/deploy.sh')" = 0 ] || { echo 'идёт другой выкат — ждать'; exit 1; }
+test ! -e ~/deploy-clones/$N
+mkdir -p ~/deploy-clones/$N ~/deploy-logs
+cd ~/deploy-clones/$N
+git clone -q --branch feat/shorts-self-healing-2b git@github.com:dvvolkovv/spirits_back.git spirits_back
+git clone -q --branch feat/shorts-doctor-card git@github.com:dvvolkovv/spirits.git spirits_front
+git -C spirits_front switch -q -c feat/shorts-self-healing-2b
+install -m 600 ~/dev/spirits_back/scripts/test-server.env.local spirits_back/scripts/
+ln -s ~/dev/spirits_back/tests/node_modules spirits_back/tests/node_modules
+git -C spirits_back log --oneline -1; git -C spirits_front log --oneline -1
+cd spirits_back
+source ~/.nvm/nvm.sh >/dev/null
+BRANCH=feat/shorts-self-healing-2b TEST_ONLY=1 SKIP_BOTS=1 LOCAL_BACK_DIR=$PWD LOCAL_FRONT_DIR=$HOME/deploy-clones/$N/spirits_front \
+  setsid -f bash -c 'echo $$ > ~/deploy-logs/'"$N"'.pid; exec bash scripts/deploy.sh' > ~/deploy-logs/$N.log 2>&1 < /dev/null
+sleep 3; echo "pid=$(cat ~/deploy-logs/$N.pid)"
+EOF
+```
+
+- `deploy.sh` берёт одно имя `BRANCH` для обоих репозиториев: `push_local_repo` пушит `$BRANCH` из клона кабинета, стенд ставит кабинет на `origin/$BRANCH`. Поэтому в клоне кабинета — локальная ветка с именем бэка, и выкат создаст в GitHub кабинета ветку-двойник `feat/shorts-self-healing-2b` на том же коммите (убрать после слияния — с OK).
+- Клоны — соседями: `LOCAL_FRONT_DIR` по умолчанию — `spirits_front` рядом с клоном бэка. `source ~/.nvm/nvm.sh` — до `deploy.sh`: без него браузерный smoke падает на «npx: command not found».
+- Ждать конца — циклом «жив/мёртв» по pid (`kill -0` в ssh; таймаут ssh — не «мёртв», повторить). Итог — `ALL PHASES GREEN` в `~/deploy-logs/$N.log`.
+- `deploy_frontend` (`scripts/deploy.sh`, сборка кабинета) работает под `set -e` без `pipefail` через `pnpm build | tail`: упавшая сборка молча оставит старый `dist/`. Свежесть кабинета на стенде проверить по строке ветки в бандле, иначе отсутствие истории в учении 1 примете за баг:
+
+```bash
+ssh dv@85.192.61.231 '( . ~/dev/spirits_back/scripts/test-server.env.local; grep -o "assets/index-[^\"]*\.js" "$TEST_FRONT_SERVED/index.html" | head -1; grep -l "Сам восстанавливался" "$TEST_FRONT_SERVED"/assets/*.js | head -1 )'
+```
+
+(Строки «Сам восстанавливался» до этой ветки в кабинете не было: нашлась — кабинет свежий.)
+
+SQL учений — на стенде, реквизиты API стенда: `psql "$(sed -n "s/^DATABASE_URL=//p" ~/spirits_back/.env | tail -n 1)"` на ноде (только чтение файла; живой чекаут `~/spirits_back` не трогать). Кандидаты: `SELECT left(id::text,8), status, format, writer_rounds, animation->>'omniSeconds' FROM short_video WHERE status = 'pending_review' ORDER BY updated_at DESC`. Подпись на проверку и сообщения о сбое уходят в личку стенда — их видит владелец; проверка с нашей стороны — по базе (`status`, `format`, `auto_recoveries`, `recoveries`, `failure_notified`, `review_message_id`) и журналу API стенда.
+
+1. **Без сценок по коду** — ролик стенда со сценками в `pending_review`; записать `writer_rounds`, `omniSeconds`, затем (только стенд!):
 
 ```sql
 UPDATE short_video
@@ -3306,9 +3465,9 @@ UPDATE short_video
  WHERE id = '<id>' AND status = 'pending_review';
 ```
 
-Ожидается в течение пары минут (крон работы — раз в минуту): сообщения о сбое в личке стенда нет; ролик — `writing`, `format = 'chat'`, `auto_recoveries = 1`, `recoveries` — одна запись `no_skits`; дальше `render_queued` → `pending_review`; в подписи на проверку — «Сам восстанавливался: без сценок (omni_budget)» и «Собран без сценок: исчерпан предел секунд Omni на круг — сценки вернёт «Переснять» (новый круг)» (шаг 6 задачи 11: у `omni_budget` — выход, а не текст студии); `omniSeconds` прежний; в карточке админки стенда — история и «без сценок — сам».
+Ожидается за пару минут (крон — раз в минуту): сообщения о сбое нет; ролик — `writing`, `format = 'chat'`, `auto_recoveries = 1`, в `recoveries` — одна запись `no_skits`; дальше `render_queued` → `pending_review` с новым `review_message_id`; в подписи — «Сам восстанавливался: без сценок (omni_budget)» и «Собран без сценок: исчерпан предел секунд Omni на круг — сценки вернёт «Переснять» (новый круг)»; `omniSeconds` прежний; в карточке админки стенда — история и «без сценок — сам». Возможная ветка — норма: сценарист в формате chat не прошёл правила → `rules` → доктор берёт новую сцену, в подписи «…без сценок (omni_budget), новая сцена (rules)».
 
-2. **Позже** — другой ролик стенда в `pending_review` (или тот же после шага 1):
+2. **Позже** — ролик стенда «чатом» в `pending_review`:
 
 ```sql
 UPDATE short_video
@@ -3317,9 +3476,20 @@ UPDATE short_video
  WHERE id = '<id>' AND status = 'pending_review';
 ```
 
-Ожидается: сообщения нет; ролик — `render_queued`, `lease_until` ≈ сейчас + 30 мин, запись `later` с `delayMin = 30`. Ждать не нужно: вернуть `lease_until = now()` и убедиться, что сборка забрала ролик и он снова в `pending_review`.
+Ожидается: сообщения нет; ролик — `render_queued`, `lease_until` ≈ сейчас + 30 мин, запись `later` с `delayMin = 30`. Ждать не нужно: `UPDATE short_video SET lease_until = now() WHERE id = '<id>' AND status = 'render_queued'` — сборка забирает ролик, он снова в `pending_review`. В подписи — «Сам восстанавливался: повтор через 30 мин (tts)» без «Собран без сценок»; в админке — «только чат»: это норма (SQL обнулил счётчик, формат и был chat).
 
-3. **Никак** — ролик стенда в `pending_review` (можно тот же; `auto_recoveries = 0` обязателен, иначе строка «Сам пробовал» появится по прошлым учениям):
+3. **«Сам пробовал»** — сразу после учения 2, тот же ролик, **без** `auto_recoveries = 0` (в круге одна запись `later`):
+
+```sql
+UPDATE short_video
+   SET status = 'failed', failed_from = 'directing', failed_code = 'no_assistant', attempts = 1, lease_until = NULL,
+       last_error = 'режиссёр: учение — ассистента нет среди активных', failure_notified = false
+ WHERE id = '<id>' AND status = 'pending_review';
+```
+
+Ожидается: сообщение о сбое в личке стенда со строкой «Сам пробовал: повтор через 30 мин (tts).» — единственная живая проверка этой строки; `failure_notified = true`, `auto_recoveries` по-прежнему 1, ролик остаётся `failed`.
+
+4. **Никак** — другой ролик стенда **«чатом»** в `pending_review` (не со сценками: «Повторить» с режиссёра у ролика со сценками снимет новые сценки — до 48 с Omni на настоящем ключе стенда), с `auto_recoveries = 0`:
 
 ```sql
 UPDATE short_video
@@ -3328,17 +3498,53 @@ UPDATE short_video
  WHERE id = '<id>' AND status = 'pending_review';
 ```
 
-Ожидается: сообщение о сбое в личке стенда, без строки «Сам пробовал»; ролик остаётся `failed`. Вернуть ролик кнопкой «Повторить» (или «Отклонить») в админке стенда.
+Ожидается: сообщение о сбое без строки «Сам пробовал»; ролик остаётся `failed`.
+
+Вернуть ролики учений 3 и 4: один — «Повторить» в админке стенда (ролик «чатом»: формат прежний, режиссёр → съёмка → сценарист → сборка без Omni; заодно живая проверка нового круга — `auto_recoveries = 0`, `failed_code = NULL`), другой — SQL: `UPDATE short_video SET status = 'pending_review', failed_from = NULL, failed_code = NULL, last_error = NULL WHERE id = '<id>' AND status = 'failed'` (`review_message_id` прежний — нового сообщения нет, старые кнопки снова работают).
 
 Итог учений — в заметку памяти: что проверено, что нет (выключатель, пределы круга вживую — только тестами).
 
-- [ ] **Step 3 (контролёр, OK владельца): слияние и выкат** — 2б сливается после 2а. Бэк: `merge --no-ff feat/shorts-self-healing-2b` в свежий `origin/main`; кабинет: `merge --no-ff feat/shorts-doctor-card` в свежий `origin/main` кабинета. `deploy.sh` с ноды из свежих клонов обоих `main`, `SKIP_BOTS=1` (фронт меняется — без `BACK_ONLY`). Перед запуском (только чтение): на проде нет ролика в `capturing`, `animating`, `rendering`; не окно ночного бэкапа (pg_dump в 03:00 UTC держит замок на чтение `short_video` всё время дампа — первый накат 005 его не дождётся); нет транзакций старше 5 с:
+- [ ] **Step 3 (контролёр, OK владельца): слияние и выкат** — 2б сливается после 2а. Бэк: `merge --no-ff feat/shorts-self-healing-2b` в свежий `origin/main`; кабинет: `merge --no-ff feat/shorts-doctor-card` в свежий `origin/main` кабинета. `deploy.sh` с ноды из свежих клонов обоих `main` (соседями, `source ~/.nvm/nvm.sh`), `SKIP_BOTS=1` (фронт меняется — без `BACK_ONLY`).
+
+Перед запуском (только чтение, база прода):
+
+- нет ролика в `capturing`, `animating`, `rendering`;
+- не окно ночного бэкапа: pg_dump в 03:00 UTC держит замок на чтение `short_video` всё время дампа, и первый накат 005 его не дождётся;
+- нет неотправленных сбоев — ожидается 0 строк:
 
 ```sql
-SELECT pid, application_name, state, now() - xact_start AS age, left(query, 80)
-  FROM pg_stat_activity WHERE xact_start < now() - interval '5 seconds' AND pid <> pg_backend_pid();
+SELECT id, failed_from, updated_at FROM short_video WHERE status = 'failed' AND NOT failure_notified;
 ```
 
-Сразу после — колонки 005 на месте (`SELECT column_name FROM information_schema.columns WHERE table_name = 'short_video' AND column_name IN ('failed_code','auto_recoveries','recoveries','omni_base')` — четыре строки; `deploy.sh` после рестарта ждёт только `/webhook/agents`, smoke ролики не трогает — сорванный накат выкат не покажет), `linkeon-studio` перезапущена, хеш бандла кабинета — новый. Колонок нет — первый накат не дождался замка (`lock_timeout` 5 с, в журнале API `shorts migration 005_doctor.sql failed … lock timeout`): без них встаёт весь конвейер — первые запросы `claimStage` (режиссёр, сценарист) и `claimJob` студии пишут `failed_code` и падают на каждом тике; падают и разбор упавших, список «Ролики», `failJob` и все кнопки владельца, пишущие счётчик круга: «Повторить», «Замечание», «Переснять»/«Отклонить» в админке и в личке (там кнопка повиснет без ответа — исключение раньше `answerCallbackQuery`). Порядок, каждое действие на проде — с OK владельца: `pm2 stop linkeon-studio` → блокирующая сессия в `pg_stat_activity` → рестарт API без живых ходов → колонки появились → `pm2 start linkeon-studio`. После выката у существующих роликов `omni_base = 0`: до первой кнопки владельца предел прежний — на весь ролик; кнопка, нажатая до выката, нового круга по секундам не дала (старый код `omni_base` не пишет). Ролику, упавшему на пределе, — «Повторить» после выката.
+  Иначе доктор возьмёт их на первом тике: `failed_code` у старых строк NULL → «позже», и давний ролик сам вернётся в конвейер;
+- никто не держит `short_video` и нет долгих транзакций клиентов:
 
-- [ ] **Step 4: Заметка памяти и рабочее состояние** — очередь 2б на проде (sha бэка и кабинета), итог учений, выключатель `SHORTS_AUTO_HEAL`; правило: `animation` в базе руками — только вместе с `omni_base` (= новый счёт) или кнопкой владельца (студия прижимает начало круга к счёту лишь в пределах запуска); старые ролики — `omni_base = 0` до первой кнопки.
+```sql
+SELECT a.pid, a.backend_type, a.application_name, a.state, now() - a.xact_start AS age, l.mode, l.granted
+  FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+ WHERE l.relation = 'short_video'::regclass AND a.pid <> pg_backend_pid();
+SELECT pid, application_name, state, now() - xact_start AS age, left(query, 80)
+  FROM pg_stat_activity
+ WHERE backend_type = 'client backend' AND xact_start < now() - interval '5 seconds' AND pid <> pg_backend_pid();
+```
+
+Сразу после выката:
+
+- колонки 005 на месте — четыре строки: `SELECT column_name FROM information_schema.columns WHERE table_name = 'short_video' AND column_name IN ('failed_code','auto_recoveries','recoveries','omni_base')`;
+- в журнале API — `shorts migration 005_doctor.sql applied`. `deploy.sh` после рестарта ждёт только `/webhook/agents`, smoke ролики не трогает — сорванный накат выкат не покажет;
+- `linkeon-studio` перезапущена;
+- бандл кабинета новый, со строкой «Сам восстанавливался»: проверка как в шаге 2, по `/home/dvolkov/spirits_front`.
+
+**Колонок нет** — первый накат не дождался замка (`lock_timeout` 5 с; в журнале API `shorts migration 005_doctor.sql failed … lock timeout`; старт API это не роняет). Встаёт производство новых роликов, готовые выходят:
+
+- падают на каждом тике `claimStage` (режиссёр, сценарист) и `claimJob` студии; падают `failJob`, список «Ролики» и кнопки, пишущие счётчик круга: «Повторить», «Замечание», «Переснять» и «Отклонить» в админке и в личке. Кнопка в личке отвечает пустым `answerCallbackQuery` и молча ничего не делает;
+- ответ-замечание в личке: `noteForReview` падает, бот считает сообщение «не нашим» и отдаёт его ассистенту владельца обычным чатом — владельцу в это окно замечаний в личке не писать;
+- работают «Одобрить», публикация, «Отклонить» упавшего; разбор упавших шлёт обычное сообщение (исключение доктора ловится).
+
+Починка, каждое действие на проде — с OK владельца: дождаться ухода блокирующей сессии (запрос замков выше) → накатить 005 psql с реквизитами API (`DATABASE_URL` из `.env` прода — владелец таблицы; 005 идемпотентна): `psql "$DB" -X -v ON_ERROR_STOP=1 -f ~/spirits_back/src/shorts/migrations/005_doctor.sql` → колонки появились. Рестарт API не нужен: node-pg схему не кэширует, следующие запросы увидят колонки. Студия поднимается сама (pm2, `restart_delay` ≥ 60 с) или `pm2 restart linkeon-studio`. Рестарт API без живых ходов — запасной путь.
+
+**Выключатель** `SHORTS_AUTO_HEAL=false` снимает только доктора. Предел Omni остаётся на круг: `omni_base` пишут кнопки, подсказка студии о новом круге тоже остаётся. Переключение — правка `.env` прода и рестарт API по правилу живых ходов. Это первая линия отката, до отката кода по шапке 005. При выключенном докторе владелец видит сообщения как до 2б; строки «Сам пробовал» и «Сам восстанавливался» — только если круг успел набрать записи до выключения.
+
+После выката у существующих роликов `omni_base = 0`: до первой кнопки владельца предел прежний — на весь ролик; кнопка, нажатая до выката, нового круга по секундам не дала (старый код `omni_base` не пишет). Ролику, упавшему на пределе, — «Повторить» после выката.
+
+- [ ] **Step 4: Заметка памяти и рабочее состояние** — очередь 2б на проде (sha бэка и кабинета), итог учений, выключатель `SHORTS_AUTO_HEAL` (что он снимает и чего нет — шаг 3), ветка-двойник `feat/shorts-self-healing-2b` в GitHub кабинета (убрать с OK); правило: `animation` в базе руками — только вместе с `omni_base` (= новый счёт) или кнопкой владельца (студия прижимает начало круга к счёту лишь в пределах запуска); старые ролики — `omni_base = 0` до первой кнопки.
