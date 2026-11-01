@@ -2939,6 +2939,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       return {
         tokens: Math.ceil(turnCostUsd * this.TOKENS_PER_USD),
         usd: turnCostUsd,
+        turnUsd: turnCostUsd,
         source: 'cost',
         note: `usage не пришёл, считаю по стоимости хода=$${turnCostUsd.toFixed(4)}`,
       };
