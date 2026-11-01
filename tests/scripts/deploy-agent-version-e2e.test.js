@@ -46,6 +46,14 @@ bash() {
   echo "unexpected-bash $*" >> "$LOG"
   return 99
 }
+node() {
+  if [[ "$1" == agent-versions.e2e.mjs ]]; then
+    printf 'agent-e2e BASE_URL=%s BASIC_AUTH=%s SSH_TARGET=%s BACK_PATH=%s DEBUG_SECRET=%s RELAY_SSH_TARGET=%s\n' \
+      "$BASE_URL" "$BASIC_AUTH" "$SSH_TARGET" "$BACK_PATH" "$DEBUG_SECRET" "$RELAY_SSH_TARGET" >> "$LOG"
+    return "$AGENT_E2E_STATUS"
+  fi
+  /usr/bin/env node "$@"
+}
 `;
 
 function runPhase(phase, env = {}) {
@@ -71,6 +79,10 @@ function runPhase(phase, env = {}) {
       TEST_HOST: 'test-ssh',
       PROD_HOST: 'prod-ssh',
       TEST_BACK_PATH: '/srv/back',
+      TEST_FRONT_SRC: '/srv/front',
+      TEST_FRONT_SERVED: '/srv/served',
+      TEST_BASE_URL: 'https://test.example',
+      TEST_BASIC_AUTH: 'test-user:test-pass',
       DEBUG_SECRET: 'dummy-debug-secret',
       SMOKE_STATUS: '0',
       AGENT_E2E_STATUS: '0',
