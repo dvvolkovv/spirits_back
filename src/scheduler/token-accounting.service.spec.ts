@@ -37,7 +37,7 @@ describe('TokenAccountingService: списание объясняет себя',
   /** Ход из разбора 2026-08-10: 24 минуты работы юриста, $239.63 расхода. */
   const longTurn = {
     id: 't-long',
-    user_id: '79088644408',
+    user_id: '70005550003',
     input_tokens: 0,
     output_tokens: 862673,
     tokens_to_consume: '862673',
@@ -97,6 +97,6 @@ describe('TokenAccountingService: списание объясняет себя',
     const h = harness(longTurn);
     await h.run();
 
-    expect(consumeCall(h.calls)!.params.slice(0, 2)).toEqual(['79088644408', 862673]);
+    expect(consumeCall(h.calls)!.params.slice(0, 2)).toEqual(['70005550003', 862673]);
   });
 });

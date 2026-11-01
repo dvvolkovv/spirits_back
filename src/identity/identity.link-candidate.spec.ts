@@ -41,7 +41,7 @@ function pgWithProfileEmailOwner(opts: { loginable?: boolean } = {}) {
     // поиск кандидата по профильной почте
     if (/JOIN ai_profiles_consolidated/i.test(sql)) {
       return loginable
-        ? { rows: [{ internal_id: '79275527425', primary_phone: '79275527425' }] }
+        ? { rows: [{ internal_id: '70005550009', primary_phone: '70005550009' }] }
         : { rows: [] };
     }
     if (/INSERT INTO user_id\b/i.test(sql)) return { rows: [{ internal_id: 'new-uuid' }] };
@@ -57,7 +57,7 @@ describe('resolveOrCreate — кандидат на привязку вмест�
     const r = await svc.resolveOrCreate('email', { email: 'victoria-337@mail.ru' });
 
     expect(r.status).toBe('link_required');
-    expect(r).toMatchObject({ candidateUserId: '79275527425' });
+    expect(r).toMatchObject({ candidateUserId: '70005550009' });
     // Главное утверждение теста: второй аккаунт НЕ заведён.
     expect(pg.createdUser).toBe(false);
   });
@@ -68,11 +68,11 @@ describe('resolveOrCreate — кандидат на привязку вмест�
 
     const r: any = await svc.resolveOrCreate('email', { email: 'victoria-337@mail.ru' });
 
-    expect(r.phoneHint).toContain('7425');
+    expect(r.phoneHint).toContain('0009');
     // Ложно-зелёный здесь стоил бы утечки: проверяем, что середина номера
     // действительно не видна, а не только что хвост на месте.
-    expect(r.phoneHint).not.toContain('9275');
-    expect(r.phoneHint).not.toContain('552');
+    expect(r.phoneHint).not.toContain('0005');
+    expect(r.phoneHint).not.toContain('555');
   });
 
   it('то же самое для google — дыра не в почтовом контроллере, а в резолвере', async () => {

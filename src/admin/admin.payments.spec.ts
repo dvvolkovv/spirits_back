@@ -71,7 +71,7 @@ describe('AdminService — платежи', () => {
       const pg = fakePg({
         'FROM payments p': [
           { id: '1', phone: '79030169187', amount: '25.00', tokens: '1000000', status: 'succeeded', provider: 'priem', currency: 'USD' },
-          { id: '2', phone: '79088644408', amount: '1990.00', tokens: '1000000', status: 'succeeded', provider: 'yookassa', currency: 'RUB' },
+          { id: '2', phone: '70005550003', amount: '1990.00', tokens: '1000000', status: 'succeeded', provider: 'yookassa', currency: 'RUB' },
           { id: '3', phone: '79030001234', amount: '1990.00', tokens: '1000000', status: 'succeeded', provider: 'yookassa', currency: 'RUB' },
         ],
       });
@@ -85,7 +85,7 @@ describe('AdminService — платежи', () => {
     it('старым строкам без provider/currency подставляет рублёвую YooKassa', async () => {
       const pg = fakePg({
         'FROM payments p': [
-          { id: '1', phone: '79088644408', amount: '1990.00', tokens: '1000000', status: 'succeeded', provider: null, currency: null },
+          { id: '1', phone: '70005550003', amount: '1990.00', tokens: '1000000', status: 'succeeded', provider: null, currency: null },
         ],
       });
       const rows = await serviceWith(pg).listPayments();

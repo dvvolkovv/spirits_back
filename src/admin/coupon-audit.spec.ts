@@ -104,7 +104,7 @@ describe('AdminService — аудит купонов', () => {
   it('история удалённого купона доступна — по снимку в аудите', async () => {
     const pg = makePg({
       coupon: [],
-      redemptions: [{ user_id: '79035281880', redeemed_at: '2026-03-05T08:00:09Z', tokens_granted: '1000000', email: null }],
+      redemptions: [{ user_id: '70005550001', redeemed_at: '2026-03-05T08:00:09Z', tokens_granted: '1000000', email: null }],
       audit: [{ action: 'delete', actor: 'unknown', created_at: '2026-03-06T00:00:00Z', code: 'OLD4', details: { usage_count: 3 } }],
     });
     const data: any = await svc(pg).couponHistory(4);

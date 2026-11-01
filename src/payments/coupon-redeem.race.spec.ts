@@ -1,7 +1,7 @@
 /**
  * Применение промокода не должно начисляться дважды.
  *
- * Инцидент: 05.03.2026 пользователь 79035281880 получил 3 000 000 токенов
+ * Инцидент: 05.03.2026 пользователь 70005550001 получил 3 000 000 токенов
  * вместо 1 000 000 — в coupon_redemptions легли три строки с одинаковым
  * coupon_id и совпадающим ДО МИКРОСЕКУНДЫ временем. То есть это не три
  * применения, а один клик, разошедшийся в три параллельных запроса. Всего по
@@ -117,19 +117,19 @@ describe('PaymentsService.redeemCoupon — параллельное примен
     const svc = makeService(pg);
 
     const results = await Promise.all([
-      svc.redeemCoupon('79035281880', 'MARKET2026'),
-      svc.redeemCoupon('79035281880', 'MARKET2026'),
-      svc.redeemCoupon('79035281880', 'MARKET2026'),
+      svc.redeemCoupon('70005550001', 'MARKET2026'),
+      svc.redeemCoupon('70005550001', 'MARKET2026'),
+      svc.redeemCoupon('70005550001', 'MARKET2026'),
     ]);
 
     expect(results.filter((r: any) => r.success)).toHaveLength(1);
     expect(pg.redemptions).toHaveLength(1);
-    expect(pg.credits).toEqual([{ user_id: '79035281880', amount: 1_000_000 }]);
+    expect(pg.credits).toEqual([{ user_id: '70005550001', amount: 1_000_000 }]);
   });
 
   it('строку купона берёт под блокировку внутри транзакции', async () => {
     const pg = makeFakePg(coupon);
-    await makeService(pg).redeemCoupon('79035281880', 'MARKET2026');
+    await makeService(pg).redeemCoupon('70005550001', 'MARKET2026');
 
     expect(pg.log[0]).toMatch(/BEGIN/i);
     expect(pg.log.find((q: string) => /FROM coupons/i.test(q))).toMatch(/FOR UPDATE/i);
@@ -138,7 +138,7 @@ describe('PaymentsService.redeemCoupon — параллельное примен
 
   it('успешное применение начисляет токены и отпускает соединение', async () => {
     const pg = makeFakePg(coupon);
-    const res: any = await makeService(pg).redeemCoupon('79035281880', 'MARKET2026');
+    const res: any = await makeService(pg).redeemCoupon('70005550001', 'MARKET2026');
 
     expect(res).toMatchObject({ success: true, tokens_added: 1_000_000 });
     expect(pg.clients.every((c: any) => c.released)).toBe(true);
@@ -148,8 +148,8 @@ describe('PaymentsService.redeemCoupon — параллельное примен
     const pg = makeFakePg(coupon);
     const svc = makeService(pg);
 
-    await svc.redeemCoupon('79035281880', 'MARKET2026');
-    const second: any = await svc.redeemCoupon('79035281880', 'MARKET2026');
+    await svc.redeemCoupon('70005550001', 'MARKET2026');
+    const second: any = await svc.redeemCoupon('70005550001', 'MARKET2026');
 
     expect(second.success).toBe(false);
     expect(pg.credits).toHaveLength(1);
@@ -172,7 +172,7 @@ describe('PaymentsService.redeemCoupon — параллельное примен
 
   it('неизвестный код не начисляет и отпускает соединение', async () => {
     const pg = makeFakePg(coupon);
-    const res: any = await makeService(pg).redeemCoupon('79035281880', 'НЕТ-ТАКОГО');
+    const res: any = await makeService(pg).redeemCoupon('70005550001', 'НЕТ-ТАКОГО');
 
     expect(res.success).toBe(false);
     expect(pg.credits).toHaveLength(0);

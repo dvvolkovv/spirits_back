@@ -2107,7 +2107,7 @@ test("с fs_key в путях нет номера: загрузка, папка 
   assert.equal(tryCreate(upload), null);
   const out = sessionOutputDir("/tmp/agent-output", key);
   assert.equal(out, path.join("/tmp/agent-output", FS_KEY));
-  for (const p of [upload, out]) assert.ok(!p.includes("79093464922"), p);
+  for (const p of [upload, out]) assert.ok(!p.includes("70005550004"), p);
 });
 ```
 
