@@ -71,6 +71,7 @@ describe('ShortsDirectorService.direct', () => {
     expect(sql).toMatch(/SET status = 'capture_queued'/);
     expect(sql).toMatch(/writer_rounds = 0/);
     expect(sql).toMatch(/writer_feedback = NULL/);
+    expect(sql).toMatch(/skit_feedback = NULL/);
     expect(sql).toMatch(/script = NULL/);
     expect(sql).toMatch(/captions = NULL/);
     expect(sql).toMatch(/capture = NULL/);
