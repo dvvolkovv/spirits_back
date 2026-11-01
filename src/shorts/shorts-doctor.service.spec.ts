@@ -87,6 +87,9 @@ describe('ShortsDoctorService', () => {
     expect(off.calls).toHaveLength(0);
     process.env.SHORTS_AUTO_HEAL = 'true';
     expect(await setup().svc.treat(failed(), NOW)).toBe('took');
+    // Только false выключает: «0» и «off» — включён (ловушка — прочие флаги роликов понимают только true).
+    process.env.SHORTS_AUTO_HEAL = '0';
+    expect(await setup().svc.treat(failed(), NOW)).toBe('took');
     delete process.env.SHORTS_AUTO_HEAL;
     expect(await setup().svc.treat(failed(), NOW)).toBe('took');
   });

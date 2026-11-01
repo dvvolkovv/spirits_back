@@ -56,7 +56,11 @@ export class ShortsDoctorService {
         [v.id, v.failedFrom, entry],
       );
     }
-    if (!r.rowCount) return 'gone';
+    if (!r.rowCount) {
+      // Владелец успел нажать кнопку (или сбой забрал другой экземпляр) — разбор промолчит; след — здесь.
+      this.logger.log(`ролик ${v.id}: доктор опоздал — ролик уже не в захваченном сбое`);
+      return 'gone';
+    }
     const pause = p.action === 'later' ? ` через ${p.delayMin} мин` : '';
     this.logger.log(`ролик ${v.id}: сам — ${p.action}${pause} (${v.failedFrom}, ${v.failedCode ?? 'без кода'})`);
     return 'took';
