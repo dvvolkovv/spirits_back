@@ -10,8 +10,14 @@
 -- ждал бы открытые записи (шапка 001).
 --
 -- ОТКАТ: сначала весь код очереди 2а — API и студия (linkeon-studio перезапущена на
--- старом коде): LIST_COLUMNS, сценарист, «Повторить» и failJob студии читают и пишут
--- колонку. Колонку можно и оставить — старый код её не видит. Снять: убрать 004 из
+-- старом коде): LIST_COLUMNS, сценарист, режиссёр, «Повторить» и failJob студии
+-- читают и пишут колонку. До старта старого кода — два шага, иначе старый сценарист
+-- проведёт ролик с отзывом о сценке через keepSkits (тот же текст — до трёх клипов),
+-- а после нового выката 2а отзыв, который старый код не стёр, сработает в чужом круге:
+--   UPDATE short_video SET status = 'failed', failed_from = 'writing', lease_until = NULL,
+--          failure_notified = false WHERE status = 'writing' AND skit_feedback IS NOT NULL;
+--   UPDATE short_video SET skit_feedback = NULL WHERE skit_feedback IS NOT NULL;
+-- Колонку можно и оставить — старый код её не видит. Снять: убрать 004 из
 -- ShortsSchemaService, затем
 --   SET lock_timeout = '5s'; ALTER TABLE short_video DROP COLUMN skit_feedback;
 DO $shorts$

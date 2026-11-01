@@ -170,6 +170,11 @@ function loadAnimation(file: string): ShortAnimation {
  * удаляется, а откладывается в skits/<отпечаток>/rejected-*.mp4 с пометкой
  * rejected-*.json (код, услышанное, версия сверки); брак, который нынешняя
  * сверка ещё не судила, перепроверяется до новой оплаты (reviveRejected).
+ *
+ * Два клипа одного текста сценки не прошли сверку речи или попытки кончились
+ * отказом фильтра — третий клип не снимается: SkitFeedbackError, ролик уходит
+ * сценаристу с отзывом о сценке (worker/db.ts, failJob), если на пересъёмку
+ * остался хотя бы клип; иначе omni_budget с причиной.
  */
 export async function animateRun(runDir: string, deps: AnimateDeps): Promise<ShortAnimation> {
   const script = JSON.parse(fs.readFileSync(path.join(runDir, 'script.json'), 'utf8')) as Script;
@@ -605,9 +610,14 @@ export async function animateRun(runDir: string, deps: AnimateDeps): Promise<Sho
           anim.omniSeconds -= CLIP_SEC;
           await save();
         }
+        const prev = last;
         last = err;
         codes.push(err.code);
-        if (!err.retryable) throw err;
+        if (!err.retryable) {
+          // Секунд на следующий клип нет после промаха — владелец должен видеть, почему понадобилась пересъёмка.
+          if (err.code === 'omni_budget' && prev) throw new StudioError('omni_budget', `${prev.message}; переснять не на что — ${err.message}`, false);
+          throw err;
+        }
         // Два клипа с этим текстом не прошли сверку речи — промахи на одном тексте повторяются:
         // сценаристу, а не третий клип. Брак из перепроверки судится в reviveRejected и сюда не
         // попадает — разве что его выгрузка сорвалась: тогда следующий запуск судит его здесь,
