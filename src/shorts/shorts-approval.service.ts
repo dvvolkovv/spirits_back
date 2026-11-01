@@ -8,6 +8,7 @@ import { StorageService } from '../common/services/storage.service';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { buildReviewKeyboard, parseShortCallback, parseYoutubeUrl, shortCommandText } from './short-callback';
 import { STAND_MARK, buildReviewCaption, clip, skitCastLine } from './short-captions';
+import { currentCircle, recoveryWords } from './short-doctor';
 import { autoTopicsEnabled, isStand, shortsEnabled } from './short-env';
 import { LEAVE_FROM, RELEASED_SQL, leaveReview, noteForReview } from './short-review';
 import { approveShortIntoSlot } from './short-slot-claim';
@@ -599,6 +600,11 @@ export class ShortsApprovalService {
 
   /**
    * Упавшие ролики — владельцу, каждый один раз (захват по failure_notified).
+   * Сначала — доктор (ShortsDoctorService): взялся — ролик ушёл из failed,
+   * сообщения нет; владелец успел нажать кнопку — тоже молчим. Не взялся —
+   * сообщение и строка «Сам пробовал», если в круге были самопочинки. Доктор
+   * упал — сообщение уходит, как без него: сбой не прячется. Публикацию доктор
+   * не лечит.
    * Telegram сообщение не принял — флаг назад, и из цикла вон: иначе тот же
    * ролик забрался бы снова в этом же вызове. Повторит следующий тик.
    * BLOG_APPROVER_TG_ID не задан — флаг остаётся: писать некому.
@@ -617,11 +623,20 @@ export class ShortsApprovalService {
       );
       if (!r.rows.length) return;
       const v = rowToShort(r.rows[0]);
+      if (this.doctor && v.failedFrom !== 'publishing') {
+        try {
+          if ((await this.doctor.treat(v)) !== 'gave_up') continue;
+        } catch (e: any) {
+          this.logger.error(`доктор: ролик ${v.id} — ${e?.message ?? e}`);
+        }
+      }
       const released = r.rows[0].released === true;
       const tgUnsent = r.rows[0].tg_unsent === true;
       const what = v.failedFrom === 'publishing' ? (released ? 'вышел не на все площадки' : 'не вышел на площадки') : 'не собрался';
       const next = failedHint(v, released, tgUnsent);
-      const text = `${isStand() ? STAND_MARK : ''}Ролик${quoted(v)} ${what}: ${clip(v.lastError || 'причина не записана', 600)}\n${next}`;
+      // Публикацию доктор не лечит — его прошлые самопочинки этого круга к её сбою не относятся.
+      const tried = v.failedFrom === 'publishing' ? '' : recoveryWords(currentCircle(v));
+      const text = `${isStand() ? STAND_MARK : ''}Ролик${quoted(v)} ${what}: ${clip(v.lastError || 'причина не записана', 600)}\n${tried ? `Сам пробовал: ${tried}.\n` : ''}${next}`;
       const owner = approverChatId();
       if (!owner) {
         await this.notify(null, text);
