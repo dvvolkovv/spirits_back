@@ -119,7 +119,7 @@ git commit -m "test(shorts): миграция 005 — код сбоя и сам�
 NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-schema.spec.ts 2>&1 | grep -E '✕|Tests:'"
 ```
 
-Ожидается: падают три новых теста (`миграция 005 не применена`), `Tests: 3 failed`.
+Ожидается: `Tests: 3 failed` — два теста текста 005 падают на `миграция 005 не применена`, «катит 005 после 004» — на `expect(fifth).toBeGreaterThan(fourth)` (индекс −1).
 
 - [ ] **Step 3: Миграция**
 
@@ -209,7 +209,7 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-schema.spe
   });
 ```
 
-В `src/shorts/shorts.integration.spec.ts`, в тесте `'list: тонкий SELECT не меняет форму ответа — …'`, в объект `insert({…})` после `failed_from: 'writing', failure_notified: true,` добавить (массив jsonb — строкой: node-pg превратил бы JS-массив в массив Postgres):
+В `src/shorts/shorts.integration.spec.ts`, в тесте `'list: тонкий SELECT не меняет форму ответа — …'`, в объект `insert({…})` новой строкой после строки `      failed_from: 'writing', failure_notified: true, published_at: new Date(Date.now() - 60_000),` добавить (массив jsonb — строкой: node-pg превратил бы JS-массив в массив Postgres):
 
 ```ts
       failed_code: 'код-тест', auto_recoveries: 2,
@@ -337,7 +337,7 @@ git commit -m "test(shorts): коды сбоев этапов API (красны�
 NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-jobs.spec.ts src/shorts/shorts-director.service.spec.ts src/shorts/shorts-writer.service.spec.ts 2>&1 | grep -E '✕|Tests:'"
 ```
 
-Ожидается: красные — тесты с кодами (у `StageFatalError` нет `code`, у SQL нет `failed_code`); jest без проверки типов, поэтому `new StageFatalError('rules', …)` пока кладёт код в сообщение — это тоже красное.
+Ожидается: `Tests: 10 failed` — short-jobs 4, режиссёр 2, сценарист 4 (у `StageFatalError` нет `code`, у SQL нет `failed_code`; jest без проверки типов, поэтому `new StageFatalError('rules', …)` пока кладёт код в сообщение).
 
 - [ ] **Step 3: Код**
 
@@ -720,9 +720,12 @@ describe('слова и записи', () => {
     expect(Array.from(long.reason).length).toBeLessThanOrEqual(300);
   });
 
-  it('newSceneNote: «Сам: прошлая сцена не удалась — <причина>»; без причины — код', () => {
+  it('newSceneNote: «Сам: прошлая сцена не удалась — <причина>»; без причины — код; переводы строк склеены', () => {
     expect(newSceneNote(v({ lastError: 'съёмка: ответ не годится' }))).toBe('Сам: прошлая сцена не удалась — съёмка: ответ не годится');
     expect(newSceneNote(v({ lastError: null, failedCode: 'answer_rejected' }))).toBe('Сам: прошлая сцена не удалась — answer_rejected');
+    // Замечания — построчные (appendOwnerNote): многострочная ошибка студии разорвала бы строку «Сам: …».
+    expect(newSceneNote(v({ lastError: 'сборка: сценарий не прошёл\n- строка 1\n- строка 2' }))).toBe('Сам: прошлая сцена не удалась — сборка: сценарий не прошёл - строка 1 - строка 2');
+    expect(recoveryEntry(v({ lastError: 'a\n  b' }), { action: 'no_skits' }, new Date(0)).reason).toBe('a b');
   });
 });
 ```
@@ -834,7 +837,10 @@ export function recoveryWords(entries: ShortRecovery[]): string {
   return entries.map((r) => `${ACTION_WORDS[r.action]?.(r) ?? r.action} (${r.code ?? 'без кода'})`).join(', ');
 }
 
-/** Запись истории: этап и код сбоя, действие, пауза «позже», причина — last_error до 300 знаков. */
+/** Ошибка одной строкой: замечания построчные (appendOwnerNote), а ошибки студии бывают многострочными. */
+const oneLine = (text: string): string => text.replace(/\s+/g, ' ').trim();
+
+/** Запись истории: этап и код сбоя, действие, пауза «позже», причина — last_error одной строкой до 300 знаков. */
 export function recoveryEntry(v: Pick<ShortVideo, 'failedFrom' | 'failedCode' | 'lastError'>, p: Heal, now: Date): ShortRecovery {
   return {
     at: now.toISOString(),
@@ -842,13 +848,13 @@ export function recoveryEntry(v: Pick<ShortVideo, 'failedFrom' | 'failedCode' | 
     code: v.failedCode,
     action: p.action,
     ...(p.action === 'later' ? { delayMin: p.delayMin } : {}),
-    reason: clip(v.lastError ?? '', 300),
+    reason: clip(oneLine(v.lastError ?? ''), 300),
   };
 }
 
 /** Строка в замечания перед новой сценой: режиссёр и сценарист увидят, что прошлая не удалась. */
 export function newSceneNote(v: Pick<ShortVideo, 'lastError' | 'failedCode'>): string {
-  return `Сам: прошлая сцена не удалась — ${clip(v.lastError || v.failedCode || 'причина не записана', 300)}`;
+  return `Сам: прошлая сцена не удалась — ${clip(oneLine(v.lastError || v.failedCode || 'причина не записана'), 300)}`;
 }
 ```
 
@@ -860,7 +866,7 @@ git commit -m "feat(shorts): доктор — таблица самопочин�
 NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-doctor.spec.ts 2>&1 | grep -E '✕|Tests:'; out=\$(mktemp); npx tsc -p tsconfig.build.json --noEmit >\$out 2>&1 && echo TSC_OK || { echo TSC_FAIL; tail -20 \$out; }"
 ```
 
-Ожидается: `Tests:` без `failed`, `TSC_OK`. Проверить: `clip` режет по символам, а не по UTF-16 (`short-captions.ts`); если по UTF-16 — тест длины причины всё равно проходит, но доложить.
+Ожидается: `Tests:` без `failed`, `TSC_OK`. (`clip` меряет длину в единицах UTF-16 и режет по целым символам — тест длины причины проходит.)
 
 ---
 
@@ -1223,7 +1229,7 @@ git commit -m "test(shorts): доктор в разборе упавших, «С
 NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-approval.service.spec.ts 2>&1 | grep -E '✕|Tests:'"
 ```
 
-Ожидается: красные — «доктор взялся», «gone», «Сам пробовал», «упавшая публикация» (доктора ещё не зовут); «без самопочинок» и «доктор упал» проходят уже сейчас (сообщение уходит и без доктора).
+Ожидается: `Tests: 3 failed` — красные «доктор взялся», «gone» и «Сам пробовал». Тесты «без самопочинок», «доктор упал» и «упавшая публикация» проходят и сейчас: доктора пока не зовут ни для кого, а последний тест сторожит, что публикацию и потом не позовут.
 
 - [ ] **Step 3: Код**
 
@@ -1256,7 +1262,7 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-approval.s
    */
 ```
 
-В теле после `const v = rowToShort(r.rows[0]);` вставить:
+В теле `notifyFailures` (не `sendPendingReviews` и не `handleReplyEdit` — там та же строка) после `      const v = rowToShort(r.rows[0]);` вставить:
 
 ```ts
       if (this.doctor && v.failedFrom !== 'publishing') {
@@ -1277,7 +1283,8 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-approval.s
 заменить на
 
 ```ts
-      const tried = recoveryWords(currentCircle(v));
+      // Публикацию доктор не лечит — его прошлые самопочинки этого круга к её сбою не относятся.
+      const tried = v.failedFrom === 'publishing' ? '' : recoveryWords(currentCircle(v));
       const text = `${isStand() ? STAND_MARK : ''}Ролик${quoted(v)} ${what}: ${clip(v.lastError || 'причина не записана', 600)}\n${tried ? `Сам пробовал: ${tried}.\n` : ''}${next}`;
 ```
 
@@ -1481,12 +1488,10 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts src/tg-bot 2>&1 |
 
 Тексты админки — по-русски прямо в коде (админку проверки переводов не трогают: `check-no-hardcoded.mjs`, `check-locales.mjs`, `check-no-hardcoded-locale.mjs`). Новые поля — необязательные: кабинет может выехать раньше бэка.
 
-Прогоны кабинета — на ноде, в отдельном воркдереве CI-клона на точном sha (`SHA=$(git rev-parse HEAD)` после пуша ветки):
+Прогоны кабинета — на ноде, в отдельном воркдереве CI-клона на точном sha. Каждая команда — целиком одним вызовом: переменные оболочки между вызовами не живут, а пустой `$SHA` молча оставил бы прогон на старом коммите (`test -n` это ловит):
 
 ```bash
-git push -u origin feat/shorts-doctor-card
-SHA=$(git rev-parse HEAD)
-ssh -o ConnectTimeout=15 dv@85.192.61.231 "set -e; cd ~/ci/spirits_front && git fetch -q origin && { [ -d ~/ci/wt/sh2b-front ] || git worktree add -q --detach ~/ci/wt/sh2b-front $SHA; } && cd ~/ci/wt/sh2b-front && git checkout -q --detach $SHA && source ~/.nvm/nvm.sh >/dev/null && pnpm install --frozen-lockfile >/dev/null 2>&1 && npx vitest run src/components/admin/ShortCard.test.tsx src/components/admin/shortStatus.test.ts 2>&1 | tail -8"
+SHA=$(git rev-parse HEAD) && test -n "$SHA" && git push -q -u origin feat/shorts-doctor-card && ssh -o ConnectTimeout=15 dv@85.192.61.231 "set -e; cd ~/ci/spirits_front && git fetch -q origin && { [ -d ~/ci/wt/sh2b-front ] || git worktree add -q --detach ~/ci/wt/sh2b-front $SHA; } && cd ~/ci/wt/sh2b-front && git checkout -q --detach $SHA && source ~/.nvm/nvm.sh >/dev/null && pnpm install --frozen-lockfile >/dev/null 2>&1 && npx vitest run src/components/admin/ShortCard.test.tsx src/components/admin/shortStatus.test.ts 2>&1 | tail -8"
 ```
 
 - [ ] **Step 1: Падающие тесты**
@@ -1552,7 +1557,7 @@ git add src/components/admin/shortStatus.test.ts src/components/admin/ShortCard.
 git commit -m "test(admin): ролики — история самопочинок в карточке (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
 ```
 
-и прогон (команда выше). Ожидается: `shortStatus.test.ts` не грузится или падает (`currentRecoveries` не экспортирован), в `ShortCard.test.tsx` красные — история, пометка и отзыв.
+и прогон (команда выше). Ожидается: `shortStatus.test.ts` падает (`currentRecoveries` не экспортирован); в `ShortCard.test.tsx` красных два — «самопочинки — история…» и «отзыв студии…»; «без самопочинок…» зелёный и до кода.
 
 - [ ] **Step 2: Код**
 
@@ -1647,10 +1652,10 @@ git commit -m "admin: ролики — история самопочинок и 
 
 - [ ] **Step 3: Прогоны кабинета на ноде**
 
-Тесты карточки (команда выше), затем полные — в том же воркдереве ноды на новом sha:
+Тесты карточки (команда выше), затем полные — в том же воркдереве ноды на новом sha, тоже одним вызовом:
 
 ```bash
-ssh -o ConnectTimeout=15 dv@85.192.61.231 "set -e; cd ~/ci/wt/sh2b-front && git fetch -q origin && git checkout -q --detach $SHA && source ~/.nvm/nvm.sh >/dev/null && npx vitest run 2>&1 | grep -E 'Test Files|Tests ' ; npx tsc --noEmit -p tsconfig.app.json 2>&1 | grep -c 'error TS'; node scripts/check-locales.mjs >/dev/null && echo LOCALES_OK; pnpm build >/dev/null 2>&1 && echo BUILD_OK"
+SHA=$(git rev-parse HEAD) && test -n "$SHA" && git push -q origin feat/shorts-doctor-card && ssh -o ConnectTimeout=15 dv@85.192.61.231 "set -e; cd ~/ci/wt/sh2b-front && git fetch -q origin && git checkout -q --detach $SHA && source ~/.nvm/nvm.sh >/dev/null && pnpm install --frozen-lockfile >/dev/null 2>&1 && npx vitest run 2>&1 | grep -E 'Test Files|Tests ' ; npx tsc --noEmit -p tsconfig.app.json 2>&1 | grep -c 'error TS'; node scripts/check-locales.mjs >/dev/null && echo LOCALES_OK; pnpm build >/dev/null 2>&1 && echo BUILD_OK"
 ```
 
 Ожидается: vitest без падений, ошибок `tsc` не больше базы `origin/main` (сверить тем же счётом на `origin/main`), `LOCALES_OK`, `BUILD_OK`.
@@ -1696,10 +1701,19 @@ UPDATE short_video
 
 Ожидается: сообщения нет; ролик — `render_queued`, `lease_until` ≈ сейчас + 30 мин, запись `later` с `delayMin = 30`. Ждать не нужно: вернуть `lease_until = now()` и убедиться, что сборка забрала ролик и он снова в `pending_review`.
 
-3. **Никак** — `failed_from = 'directing', failed_code = 'no_assistant'`: сообщение о сбое в личке стенда, без строки «Сам пробовал»; ролик остаётся `failed`. Вернуть ролик кнопкой «Отклонить» или «Повторить» в админке стенда.
+3. **Никак** — ролик стенда в `pending_review` (можно тот же; `auto_recoveries = 0` обязателен, иначе строка «Сам пробовал» появится по прошлым учениям):
+
+```sql
+UPDATE short_video
+   SET status = 'failed', failed_from = 'directing', failed_code = 'no_assistant', attempts = 1, lease_until = NULL,
+       last_error = 'режиссёр: учение — ассистента нет среди активных', failure_notified = false, auto_recoveries = 0
+ WHERE id = '<id>' AND status = 'pending_review';
+```
+
+Ожидается: сообщение о сбое в личке стенда, без строки «Сам пробовал»; ролик остаётся `failed`. Вернуть ролик кнопкой «Повторить» (или «Отклонить») в админке стенда.
 
 Итог учений — в заметку памяти: что проверено, что нет (выключатель, пределы круга вживую — только тестами).
 
-- [ ] **Step 3 (контролёр, OK владельца): слияние и выкат** — 2б сливается после 2а. Бэк: `merge --no-ff feat/shorts-self-healing-2b` в свежий `origin/main`; кабинет: `merge --no-ff feat/shorts-doctor-card` в свежий `origin/main` кабинета. `deploy.sh` с ноды из свежих клонов обоих `main`, `SKIP_BOTS=1` (фронт меняется — без `BACK_ONLY`). Перед запуском — на проде нет ролика в `capturing`, `animating`, `rendering` (только чтение). Сразу после — колонки 005 на месте (`SELECT column_name FROM information_schema.columns WHERE table_name = 'short_video' AND column_name IN ('failed_code','auto_recoveries','recoveries')` — три строки), `linkeon-studio` перезапущена, хеш бандла кабинета — новый. Колонок нет — первый накат не дождался замка (`lock_timeout` 5 с, в журнале API `shorts migration 005_doctor.sql failed … lock timeout`): без них падают разбор упавших, список «Ролики» и `failJob` студии на каждом сбое. Порядок, каждое действие на проде — с OK владельца: `pm2 stop linkeon-studio` → блокирующая сессия в `pg_stat_activity` → рестарт API без живых ходов → колонки появились → `pm2 start linkeon-studio`.
+- [ ] **Step 3 (контролёр, OK владельца): слияние и выкат** — 2б сливается после 2а. Бэк: `merge --no-ff feat/shorts-self-healing-2b` в свежий `origin/main`; кабинет: `merge --no-ff feat/shorts-doctor-card` в свежий `origin/main` кабинета. `deploy.sh` с ноды из свежих клонов обоих `main`, `SKIP_BOTS=1` (фронт меняется — без `BACK_ONLY`). Перед запуском — на проде нет ролика в `capturing`, `animating`, `rendering` (только чтение). Сразу после — колонки 005 на месте (`SELECT column_name FROM information_schema.columns WHERE table_name = 'short_video' AND column_name IN ('failed_code','auto_recoveries','recoveries')` — три строки), `linkeon-studio` перезапущена, хеш бандла кабинета — новый. Колонок нет — первый накат не дождался замка (`lock_timeout` 5 с, в журнале API `shorts migration 005_doctor.sql failed … lock timeout`): без них встаёт весь конвейер — первые запросы `claimStage` (режиссёр, сценарист) и `claimJob` студии пишут `failed_code` и падают на каждом тике; падают и разбор упавших, список «Ролики», «Повторить» и `failJob`. Порядок, каждое действие на проде — с OK владельца: `pm2 stop linkeon-studio` → блокирующая сессия в `pg_stat_activity` → рестарт API без живых ходов → колонки появились → `pm2 start linkeon-studio`.
 
 - [ ] **Step 4: Заметка памяти и рабочее состояние** — очередь 2б на проде (sha бэка и кабинета), итог учений, выключатель `SHORTS_AUTO_HEAL`.
