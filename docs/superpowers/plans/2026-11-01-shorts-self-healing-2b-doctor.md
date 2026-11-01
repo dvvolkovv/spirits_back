@@ -2065,6 +2065,8 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/short-review.spec
 
 Ожидается: `Tests: 4 failed` — новый тест `leaveReview` с форматом, `redo` контроллера (параметры), `retry` (`CASE`), «Переснять» в личке (формата нет); сторожа истории и «спросили ровно раз» — зелёные.
 
+(При исполнении 01.11 нашлись ещё два потребителя макета настроек — поправлены отдельными коммитами тестов: «Одобрить» в `shorts-approval.service.spec.ts` сверял настройки строгим литералом → `expect.objectContaining(…)`; живой `redo` в `shorts.integration.spec.ts` строил контроллер с пустой заглушкой настроек → `{ get: async () => ({ format: 'skit' }) }`.)
+
 `src/shorts/short-review.ts`:
 
 - импорт `import { ShortFormat, ShortStatus, ShortVideo, appendOwnerNote, rowToShort } from './shorts.types';`;
@@ -2436,6 +2438,96 @@ SHA=$(git rev-parse HEAD) && test -n "$SHA" && git push -q origin feat/shorts-do
 ```
 
 Ожидается: vitest без падений, ошибок `tsc` не больше базы `origin/main` (сверить тем же счётом на `origin/main`), `LOCALES_OK`, `BUILD_OK`.
+
+- [ ] **Step 4: Мусор в истории — как на бэке; пометка только у «только чат» (ревью задачи 10)**
+
+Бэк отбрасывает не-записи в истории (`currentCircle`, ручной SQL), а кабинет — нет: `null` в `recoveries` уронил бы отрисовку строки каждой карточки (`.some((r) => r.action …)`), и `ErrorBoundary` заменил бы весь `/admin` панелью ошибки. Пометка «без сценок — сам» — только у ролика в формате «только чат»: история может разойтись со счётчиком, и у ролика со сценками пометка была бы ложной. Ключ записи — с индексом.
+
+`src/components/admin/shortStatus.test.ts`: в импорт из `./shortStatus` добавить `recoveryHistory`; в `describe('самопочинки', …)`:
+
+```ts
+  it('мусор в истории (ручной SQL) отбрасывается, как на бэке; история — новые сверху', () => {
+    const junk = [null, r('later', { delayMin: 30 }), 'x', r('no_skits')] as unknown as ShortRecovery[];
+    expect(currentRecoveries({ recoveries: junk, autoRecoveries: 4 })).toEqual([junk[1], junk[3]]);
+    expect(recoveryHistory({ recoveries: junk })).toEqual([junk[3], junk[1]]);
+    expect(recoveryHistory({})).toEqual([]);
+  });
+```
+
+`src/components/admin/ShortCard.test.tsx`: импорт типа `ShortRecovery` из `./shortStatus` (в существующий импорт); в `describe('строка ролика', …)`:
+
+```ts
+  it('«без сценок — сам» — в свёрнутой строке вместо «только чат», только в текущем круге и только у «только чат»', () => {
+    const rec: ShortRecovery = { at: '2030-01-01T08:00:00.000Z', from: 'animating', code: 'omni_budget', action: 'no_skits', reason: 'r' };
+    render({ item: item({ format: 'chat', autoRecoveries: 1, recoveries: [rec] }) });
+    expect(q('short-toggle-s1')!.textContent).toContain('без сценок — сам');
+    expect(q('short-toggle-s1')!.textContent).not.toContain('только чат');
+    m.unmount();
+    render({ item: item({ format: 'chat', autoRecoveries: 0, recoveries: [rec] }) });
+    expect(q('short-toggle-s1')!.textContent).toContain('только чат');
+    m.unmount();
+    // История разошлась со счётчиком (ручной SQL) — у ролика со сценками пометки нет.
+    render({ item: item({ format: 'skit', autoRecoveries: 1, recoveries: [rec] }) });
+    expect(q('short-toggle-s1')!.textContent).not.toContain('без сценок — сам');
+  });
+```
+
+в `describe('раскрытая карточка', …)`:
+
+```ts
+  it('история с мусором (ручной SQL) — карточка рисуется, видна одна настоящая запись', () => {
+    const junk = [null, { at: '2030-01-01T08:00:00.000Z', from: 'animating', code: 'omni_budget', action: 'no_skits', reason: 'r' }, 'x'] as unknown as ShortRecovery[];
+    render({ item: item({ format: 'chat', autoRecoveries: 3, recoveries: junk }), open: true, detail: detail({ format: 'chat', autoRecoveries: 3, recoveries: junk }) });
+    expect(q('short-recoveries-s1')!.querySelectorAll('li')).toHaveLength(1);
+  });
+```
+
+Красный коммит и прогон (команда шага 1, одним вызовом):
+
+```bash
+git add src/components/admin/shortStatus.test.ts src/components/admin/ShortCard.test.tsx
+git commit -m "test(admin): ролики — мусор в истории самопочинок, пометка только у «только чат» (красный)" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+
+Ожидается: красные — тест мусора в `shortStatus.test.ts` (`recoveryHistory` не экспортирован), тест строки (третья часть: у `skit` пометка есть) и тест карточки с мусором (`TypeError` на `null`).
+
+`src/components/admin/shortStatus.ts`:
+
+- `currentRecoveries` целиком заменить на:
+
+```ts
+/** Запись, а не мусор (ручной SQL) — как фильтр currentCircle бэка (spirits_back src/shorts/short-doctor.ts). */
+const isRecovery = (r: unknown): r is ShortRecovery => !!r && typeof r === 'object';
+
+/** Самопочинки текущего круга — последние autoRecoveries записей истории (копия currentCircle бэка). */
+export function currentRecoveries(i: Pick<ShortItem, 'recoveries' | 'autoRecoveries'>): ShortRecovery[] {
+  const all = (Array.isArray(i.recoveries) ? i.recoveries : []).filter(isRecovery);
+  const n = i.autoRecoveries ?? 0;
+  return n > 0 ? all.slice(-n) : [];
+}
+
+/** Вся история без мусора, новые сверху — для раскрытой карточки. */
+export function recoveryHistory(i: Pick<ShortItem, 'recoveries'>): ShortRecovery[] {
+  return (Array.isArray(i.recoveries) ? i.recoveries : []).filter(isRecovery).reverse();
+}
+```
+
+- комментарий у `autoRecoveries` в `ShortItem` — `/** Самопочинки текущего круга; кнопка владельца обнуляет (кроме повтора упавшей публикации). */`;
+- над `RECOVERY_WORDS` — `/** Слова действий — как ACTION_WORDS бэка (spirits_back src/shorts/short-doctor.ts). */`.
+
+`src/components/admin/ShortCard.tsx`:
+
+- импорт из `./shortStatus` дополнить `recoveryHistory`;
+- `const selfNoSkits = currentRecoveries(item).some((r) => r.action === 'no_skits');` → `const selfNoSkits = item.format === 'chat' && currentRecoveries(item).some((r) => r.action === 'no_skits');`;
+- рядом с `stats` — `const history = detail ? recoveryHistory(detail) : [];`;
+- блок истории: `{(detail.recoveries?.length ?? 0) > 0 && (` → `{history.length > 0 && (`, `{[...(detail.recoveries ?? [])].reverse().map((r) => (` → `{history.map((r, i) => (`, `key={\`${r.at}-${r.action}\`}` → `key={\`${i}-${r.at}-${r.action}\`}`.
+
+```bash
+git add src/components/admin/shortStatus.ts src/components/admin/ShortCard.tsx
+git commit -m "admin: ролики — мусор в истории самопочинок не роняет экран; пометка «без сценок — сам» только у «только чат»" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+```
+
+Прогоны — команды шага 3 (точечные, затем полные), каждая одним вызовом на новом sha. Ожидается: vitest без падений, `tsc` — не больше базы `origin/main`, `LOCALES_OK`, `BUILD_OK`.
 
 ---
 
