@@ -1,10 +1,14 @@
 import { Injectable } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { LanguageService } from '../common/services/language.service';
+import { AgentVersionsService } from './agent-versions.service';
 
 @Injectable()
 export class AgentsService {
-  constructor(private readonly pg: PgService) {}
+  constructor(
+    private readonly pg: PgService,
+    private readonly versions: AgentVersionsService,
+  ) {}
 
   async getAgentDetails(): Promise<any[]> {
     const res = await this.pg.query(
@@ -78,29 +82,43 @@ export class AgentsService {
     return { success: true };
   }
 
-  async upsertAgent(data: any) {
+  async upsertAgent(data: any, actor: string) {
     const agentId = data['agent-id'] || data.id;
     const { name, system_prompt, description } = data;
+    let existing = agentId ? await this.getAgentById(agentId) : null;
+    if (!existing) existing = await this.getAgentByName(name);
 
-    // If we have an ID, update by ID
-    if (agentId) {
+    if (!existing) {
       const res = await this.pg.query(
-        `UPDATE agents SET system_prompt = $1, description = $2 WHERE id = $3 RETURNING *`,
-        [system_prompt, description, agentId],
+        `INSERT INTO agents (id, name, system_prompt, description)
+         VALUES (COALESCE($4, nextval('agents_id_seq')), $1, $2, $3)
+         RETURNING *`,
+        [name, system_prompt, description, agentId],
       );
-      if (res.rows.length) return res.rows[0];
+      const agent = res.rows[0];
+      await this.pg.query(
+        `INSERT INTO agent_versions
+           (agent_id, version, description, system_prompt, status, created_by, published_at, published_by)
+         VALUES ($1, 1, $2, $3, 'published', $4, now(), $4)`,
+        [agent.id, description, system_prompt, actor],
+      );
+      return agent;
     }
 
-    // Otherwise insert/upsert by name
-    const res = await this.pg.query(
-      `INSERT INTO agents (name, system_prompt, description)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (name) DO UPDATE SET
-         system_prompt = EXCLUDED.system_prompt,
-         description = EXCLUDED.description
-       RETURNING *`,
-      [name, system_prompt, description],
+    const state = await this.versions.getState(existing.id);
+    const base = state.draft || state.published;
+    if (!base) throw new Error('Agent has no versions');
+    const draft = await this.versions.createDraft(actor, existing.id, {
+      description,
+      system_prompt,
+      base_version_id: base.id,
+    });
+    await this.versions.publish(
+      actor,
+      existing.id,
+      draft.id,
+      state.published?.id ?? null,
     );
-    return res.rows[0];
+    return this.getAgentById(existing.id);
   }
 }

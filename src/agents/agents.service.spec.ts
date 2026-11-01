@@ -88,10 +88,31 @@ describe('AgentsService.upsertAgent', () => {
     expect(versions.createDraft).toHaveBeenCalledWith('admin-1', 12, expect.any(Object));
   });
 
+  it('falls back to the existing name when the supplied id does not exist', async () => {
+    const { service, pg, versions } = makeService();
+    pg.query
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ id: 12, name: 'roman' }] })
+      .mockResolvedValueOnce({ rows: [{ id: 12, name: 'roman', system_prompt: 'new' }] });
+    versions.getState.mockResolvedValue({ published: { id: 'published-1' }, draft: null });
+    versions.createDraft.mockResolvedValue({ id: 'draft-new' });
+    versions.publish.mockResolvedValue({});
+
+    await service.upsertAgent(
+      { id: 999, name: 'roman', system_prompt: 'new', description: 'description' },
+      'admin-1',
+    );
+
+    expect(pg.query.mock.calls[1][0]).toMatch(/FROM agents WHERE name = \$1/i);
+    expect(pg.query.mock.calls[1][1]).toEqual(['roman']);
+    expect(versions.createDraft).toHaveBeenCalledWith('admin-1', 12, expect.any(Object));
+  });
+
   it('inserts a new agent and its published v1 without draft or publish calls', async () => {
     const { service, pg, versions } = makeService();
     const agent = { id: 42, name: 'new-agent', system_prompt: 'prompt', description: 'description' };
     pg.query
+      .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [] })
       .mockResolvedValueOnce({ rows: [agent] })
       .mockResolvedValueOnce({ rows: [] });
@@ -103,13 +124,13 @@ describe('AgentsService.upsertAgent', () => {
       description: 'description',
     }, 'admin-1')).resolves.toEqual(agent);
 
-    expect(pg.query).toHaveBeenCalledTimes(3);
-    const agentInsert = pg.query.mock.calls[1];
+    expect(pg.query).toHaveBeenCalledTimes(4);
+    const agentInsert = pg.query.mock.calls[2];
     expect(agentInsert[0]).toMatch(/INSERT INTO agents/i);
     expect(agentInsert[0]).toContain("COALESCE($4, nextval('agents_id_seq'))");
     expect(agentInsert[0]).toMatch(/RETURNING \*/i);
     expect(agentInsert[1]).toEqual(['new-agent', 'prompt', 'description', 42]);
-    const versionInsert = pg.query.mock.calls[2];
+    const versionInsert = pg.query.mock.calls[3];
     expect(versionInsert[0]).toMatch(/INSERT INTO agent_versions/i);
     expect(versionInsert[0]).toMatch(/'published'/i);
     expect(versionInsert[0]).toMatch(/published_at/i);
