@@ -137,6 +137,6 @@ describe('deploy-relay early staging lock', () => {
       fs.rmSync(firstWork, { recursive: true, force: true });
       fs.rmSync(secondWork, { recursive: true, force: true });
     }
-    expect(firstResult.status).toBe(0);
+    expect({ status: firstResult.status, stderr: firstResult.stderr }).toEqual({ status: 0, stderr: '' });
   }, 60000);
 });

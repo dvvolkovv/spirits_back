@@ -90,7 +90,8 @@ if [[ "$url" == */chat ]]; then
   exit 0
 fi
 if [[ -e "$DRAIN_FILE" ]]; then gate=yes; else gate=no; fi
-echo "curl restart=$restarts gate=$gate" >> "$WORK/curl.log"
+if [[ -e "$WORK/nginx-gate-on" ]]; then nginx=on; else nginx=off; fi
+echo "curl restart=$restarts gate=$gate nginx=$nginx" >> "$WORK/curl.log"
 case "${health}" in
   inflight-then-zero)
     calls=$(cat "$WORK/inflight-calls" 2>/dev/null || echo 0)
@@ -202,7 +203,7 @@ describe('deploy-relay drain/admission gate', () => {
       expect(r.restarts.match(/restart gate=yes/g) || []).toHaveLength(2);
       expect(r.curls).toContain('restart=2 gate=yes');
       expect(r.curls).toContain('chat restart=0 code=503');
-      expect(r.curls).toContain('chat restart=2 code=503');
+      expect(r.curls).toContain('restart=2 gate=yes nginx=on');
       expect(r.nginx).toContain('reload gate=on');
       expect(r.nginx).toContain('reload gate=off');
       expect(r.drainExists).toBe(false);
@@ -228,7 +229,8 @@ describe('deploy-relay drain/admission gate', () => {
     try {
       expect(r.status).toBe(0);
       expect(r.curls.trim().split('\n')).toHaveLength(3);
-      expect(r.curls.match(/restart=0 gate=yes/g) || []).toHaveLength(2);
+      expect(r.curls.match(/restart=0 gate=yes/g) || []).toHaveLength(1);
+      expect(r.curls).toContain('restart=0 gate=no');
       expect(r.liveServer).toContain('target');
       expect(r.drainExists).toBe(false);
     } finally {
