@@ -378,6 +378,8 @@ maybe('ролики против живого Postgres', () => {
       review_chat_id: 777, review_message_id: 12, note_prompt_ids: [101, 102], yt_prompt_ids: [201],
       lease_until: new Date(Date.now() + 900_000), attempts: 2, last_error: 'ошибка-тест',
       failed_from: 'writing', failure_notified: true, published_at: new Date(Date.now() - 60_000),
+      failed_code: 'код-тест', auto_recoveries: 2,
+      recoveries: JSON.stringify([{ at: '2030-01-01T10:00:00.000Z', from: 'animating', code: 'google_quota', action: 'later', delayMin: 30, reason: 'причина-тест' }]),
     });
     const full = (await pool.query(`SELECT *, ${VERSION_SQL} AS version FROM short_video WHERE id = $1`, [v.id])).rows[0];
     // То же, что делает light() в контроллере — не экспортирован, поэтому воспроизводим здесь.
