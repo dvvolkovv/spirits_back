@@ -68,6 +68,8 @@ function runPhase(phase, env = {}) {
       BASIC_AUTH: 'test-user:test-pass',
       BACK_PATH: '/srv/back',
       SSH_TARGET: 'test-ssh',
+      TEST_HOST: 'test-ssh',
+      PROD_HOST: 'prod-ssh',
       DEBUG_SECRET: 'dummy-debug-secret',
       SMOKE_ATTEMPTS: '1',
       NO_ROLLBACK: '',
