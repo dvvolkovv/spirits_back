@@ -1685,6 +1685,24 @@ SHA=$(git rev-parse HEAD) && test -n "$SHA" && git push -q origin feat/shorts-do
 
 и после проверки `recoveries jsonb …` добавить `expect(sql).toContain('ADD COLUMN omni_base integer NOT NULL DEFAULT 0;');`.
 
+Там же, в тесте `'весь файл — один DO-блок под advisory-локом и lock_timeout'` (005), — порядок «замок → lock_timeout → ALTER» и единственный DO-блок (ревью задачи 1: `toContain` пропустил бы `set_config` после ALTER — первый накат ждал бы замок без предела):
+
+```ts
+    const lock = sql.indexOf("pg_advisory_xact_lock(hashtext('shorts/005'))");
+    const timeout = sql.indexOf("set_config('lock_timeout', '5s', true)");
+    expect(lock).toBeGreaterThan(0);
+    expect(timeout).toBeGreaterThan(lock);
+    expect(sql.indexOf('ALTER TABLE')).toBeGreaterThan(timeout);
+    expect(sql.match(/\$shorts\$/g)).toHaveLength(2);
+```
+
+`src/shorts/shorts.integration.spec.ts`, в тесте `'002 поверх базы после 001…'` (накат поверх существующих строк) сразу после `await migrate(pool)` — умолчания 005 на старых строках:
+
+```ts
+    expect((await pool.query('SELECT DISTINCT failed_code, auto_recoveries, recoveries, omni_base FROM short_video')).rows)
+      .toEqual([{ failed_code: null, auto_recoveries: 0, recoveries: [], omni_base: 0 }]);
+```
+
 `src/shorts/shorts.types.spec.ts`, рядом с тестом самопочинок:
 
 ```ts
@@ -1771,7 +1789,26 @@ studio/scripts/node-run.sh "npx tsx --test src/animate/run-animate.test.ts src/w
 `src/shorts/migrations/005_doctor.sql`:
 
 - первая строка шапки — `-- 005_doctor.sql — самопочинка упавших роликов: код сбоя, счётчик круга и история; начало круга владельца по секундам Omni.`;
-- строку `--   ALTER TABLE short_video DROP COLUMN failed_code, DROP COLUMN auto_recoveries, DROP COLUMN recoveries;` заменить на `--   ALTER TABLE short_video DROP COLUMN failed_code, DROP COLUMN auto_recoveries, DROP COLUMN recoveries, DROP COLUMN omni_base;`;
+- блок `-- ОТКАТ: …` (до строки `--   ALTER TABLE short_video DROP COLUMN …` включительно) заменить на:
+
+```sql
+-- ОТКАТ: колонки читают и пишут claimStage API и claimJob студии (failed_code — на
+-- каждом такте), разбор упавших и доктор, кнопки владельца, LIST_COLUMNS вкладки
+-- «Ролики». Порядок: весь код очереди 2б — API и студия — на старый (кабинету откат
+-- не нужен: новые поля он читает как необязательные); колонки можно оставить — старый
+-- код их не видит. Колонки оставлены и 2б выкатывается снова — сначала стереть хвосты:
+-- старый код не обнулял счётчик круга и код сбоя, доктор принял бы их за свежие:
+--   UPDATE short_video SET failed_code = NULL, auto_recoveries = 0, omni_base = COALESCE((animation->>'omniSeconds')::int, 0)
+--    WHERE failed_code IS NOT NULL OR auto_recoveries <> 0;
+-- Снимать колонки — только после отката кода: убрать 005 из ShortsSchemaService, затем
+--   SET lock_timeout = '5s';
+--   ALTER TABLE short_video DROP COLUMN failed_code, DROP COLUMN auto_recoveries, DROP COLUMN recoveries, DROP COLUMN omni_base;
+--
+-- У failed_code нет CHECK — нарочно: набор кодов открытый (незнакомый код — «позже»),
+-- CHECK уронил бы запись сбоя студии на первом же новом коде, и сбой потерялся бы.
+-- Дописывать колонки в 005 можно, пока она не выкачена; после — только 006: проверка
+-- по имени колонки молча пропустит правку уже существующей.
+```
 - перед `END` (после блока `recoveries`) добавить:
 
 ```sql
@@ -1941,6 +1978,13 @@ UPDATE short_video
 
 Итог учений — в заметку памяти: что проверено, что нет (выключатель, пределы круга вживую — только тестами).
 
-- [ ] **Step 3 (контролёр, OK владельца): слияние и выкат** — 2б сливается после 2а. Бэк: `merge --no-ff feat/shorts-self-healing-2b` в свежий `origin/main`; кабинет: `merge --no-ff feat/shorts-doctor-card` в свежий `origin/main` кабинета. `deploy.sh` с ноды из свежих клонов обоих `main`, `SKIP_BOTS=1` (фронт меняется — без `BACK_ONLY`). Перед запуском — на проде нет ролика в `capturing`, `animating`, `rendering` (только чтение). Сразу после — колонки 005 на месте (`SELECT column_name FROM information_schema.columns WHERE table_name = 'short_video' AND column_name IN ('failed_code','auto_recoveries','recoveries')` — три строки), `linkeon-studio` перезапущена, хеш бандла кабинета — новый. Колонок нет — первый накат не дождался замка (`lock_timeout` 5 с, в журнале API `shorts migration 005_doctor.sql failed … lock timeout`): без них встаёт весь конвейер — первые запросы `claimStage` (режиссёр, сценарист) и `claimJob` студии пишут `failed_code` и падают на каждом тике; падают и разбор упавших, список «Ролики», «Повторить» и `failJob`. Порядок, каждое действие на проде — с OK владельца: `pm2 stop linkeon-studio` → блокирующая сессия в `pg_stat_activity` → рестарт API без живых ходов → колонки появились → `pm2 start linkeon-studio`.
+- [ ] **Step 3 (контролёр, OK владельца): слияние и выкат** — 2б сливается после 2а. Бэк: `merge --no-ff feat/shorts-self-healing-2b` в свежий `origin/main`; кабинет: `merge --no-ff feat/shorts-doctor-card` в свежий `origin/main` кабинета. `deploy.sh` с ноды из свежих клонов обоих `main`, `SKIP_BOTS=1` (фронт меняется — без `BACK_ONLY`). Перед запуском (только чтение): на проде нет ролика в `capturing`, `animating`, `rendering`; не окно ночного бэкапа (pg_dump в 03:00 UTC держит замок на чтение `short_video` всё время дампа — первый накат 005 его не дождётся); нет транзакций старше 5 с:
+
+```sql
+SELECT pid, application_name, state, now() - xact_start AS age, left(query, 80)
+  FROM pg_stat_activity WHERE xact_start < now() - interval '5 seconds' AND pid <> pg_backend_pid();
+```
+
+Сразу после — колонки 005 на месте (`SELECT column_name FROM information_schema.columns WHERE table_name = 'short_video' AND column_name IN ('failed_code','auto_recoveries','recoveries','omni_base')` — четыре строки; `deploy.sh` после рестарта ждёт только `/webhook/agents`, smoke ролики не трогает — сорванный накат выкат не покажет), `linkeon-studio` перезапущена, хеш бандла кабинета — новый. Колонок нет — первый накат не дождался замка (`lock_timeout` 5 с, в журнале API `shorts migration 005_doctor.sql failed … lock timeout`): без них встаёт весь конвейер — первые запросы `claimStage` (режиссёр, сценарист) и `claimJob` студии пишут `failed_code` и падают на каждом тике; падают и разбор упавших, список «Ролики», «Повторить» и `failJob`. Порядок, каждое действие на проде — с OK владельца: `pm2 stop linkeon-studio` → блокирующая сессия в `pg_stat_activity` → рестарт API без живых ходов → колонки появились → `pm2 start linkeon-studio`.
 
 - [ ] **Step 4: Заметка памяти и рабочее состояние** — очередь 2б на проде (sha бэка и кабинета), итог учений, выключатель `SHORTS_AUTO_HEAL`.
