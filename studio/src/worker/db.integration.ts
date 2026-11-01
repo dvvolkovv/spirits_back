@@ -1,7 +1,7 @@
 /**
- * Очередь студии против живого Postgres — той же миграцией, что катит API
- * (src/shorts/migrations/001_shorts.sql): так контракт колонок проверяется на
- * настоящей схеме.
+ * Очередь студии против живого Postgres — теми же миграциями, что катит API
+ * (src/shorts/migrations: 001, 002, 004; 003 — колонки YouTube, студии не нужны):
+ * так контракт колонок проверяется на настоящей схеме.
  *
  * База ОДНОРАЗОВАЯ: перед каждым тестом TRUNCATE. Гард отказывается работать с
  * базой приложения и с непустой short_video — до наката миграции.
@@ -258,7 +258,7 @@ describe('очередь студии против живого Postgres', { ski
   });
 
   it('сценку не снять с этими репликами — сценаристу с разбором; после третьего круга — failed с этапа сценариста', async () => {
-    const id = await insert('animate_queued', { writer_rounds: 2 });
+    const id = await insert('animate_queued', { writer_rounds: 2, failure_notified: true });
     const job = await claimJob(pool, 'animate');
     const feedback = { kind: 'punchline', code: 'speech_mismatch', lines: [2], heard: 'это только символика периода', reason: null } as const;
     const err = new SkitFeedbackError({ ...feedback, lines: [...feedback.lines] }, 'сценка 2 (развязка): 2 клипа с этими репликами не прошли сверку речи', 'сценка 2 (развязка): не услышаны реплики 2 — 2 клипа с этим текстом не прошли сверку');
@@ -275,9 +275,34 @@ describe('очередь студии против живого Postgres', { ski
     assert.equal(await failJob(pool, last!, err), 'failed');
     const f = await row(id);
     assert.deepEqual(
-      [f.status, f.failed_from, f.writer_feedback, f.skit_feedback, f.failure_notified, f.lease_until],
-      ['failed', 'writing', err.writerText, feedback, false, null],
+      [f.status, f.failed_from, f.writer_feedback, f.skit_feedback, f.failure_notified, f.lease_until, f.last_error],
+      ['failed', 'writing', err.writerText, feedback, false, null, `оживление: ${err.message}`],
     );
+  });
+
+  it('код отзыва без SkitFeedbackError (смесь попыток, нехватка секунд) — обычный failed с оживления, сценаристу не уходит', async () => {
+    const id = await insert('animate_queued', { writer_rounds: 1 });
+    const job = await claimJob(pool, 'animate');
+    assert.equal(await failJob(pool, job!, new StudioError('omni_rejected', 'omni: отказ фильтра — после 3 попыток', false)), 'failed');
+    const r = await row(id);
+    assert.deepEqual([r.status, r.failed_from, r.writer_feedback, r.skit_feedback], ['failed', 'animating', null, null]);
+  });
+
+  it('опоздавшее оживление с отзывом о сценке — gone, строка не тронута', async () => {
+    const id = await insert('animate_queued');
+    const late = await claimJob(pool, 'animate');
+    await pool.query(`UPDATE short_video SET lease_until = now() - interval '1 second' WHERE id = $1`, [id]);
+    const current = await claimJob(pool, 'animate');
+    assert.deepEqual([late?.attempts, current?.attempts], [1, 2]);
+    const before = await row(id);
+    const err = new SkitFeedbackError(
+      { kind: 'conflict', code: 'omni_rejected', lines: [], heard: null, reason: 'omni: отказ фильтра — violence' },
+      'сценка 1 (конфликт): фильтр Google не пропускает клип',
+      'сценка 1 (конфликт): omni: отказ фильтра — violence — после 3 попыток',
+    );
+    assert.equal(await failJob(pool, { ...late!, writerRounds: 1 }, err), 'gone');
+    assert.equal(await failJob(pool, { ...late!, writerRounds: 3 }, err), 'gone');
+    assert.deepEqual(await row(id), before);
   });
 
   it('last_error: у незнакомой ошибки — только первая строка; предел 1000 — по символам', async () => {

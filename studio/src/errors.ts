@@ -61,9 +61,9 @@ export class StudioError extends Error {
 
 /**
  * Сценку не снять с этими репликами: два клипа с одним текстом не прошли сверку
- * речи или фильтр Google трижды отказал. Без повтора: рабочий процесс (db.ts, failJob)
- * возвращает ролик сценаристу — пояснение `writerText` в writer_feedback, разбор
- * `feedback` в skit_feedback.
+ * речи или попытки кончились отказом фильтра Google. Без повтора: рабочий
+ * процесс (db.ts, failJob) возвращает ролик сценаристу — пояснение `writerText`
+ * в writer_feedback, разбор `feedback` в skit_feedback.
  */
 export class SkitFeedbackError extends StudioError {
   readonly feedback: SkitFeedback;

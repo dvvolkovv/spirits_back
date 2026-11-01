@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { StudioError } from '../errors';
+import { SkitFeedbackError, StudioError } from '../errors';
 import type { RenderResult } from '../render/run-render';
 import type { CaptureResult, Scene, Script, ShortAnimation } from '../types';
 import type { FailOutcome, Job, JobKind, Queue, RenderOutput, StoredCapture } from './db';
@@ -340,6 +340,25 @@ test('оживление: задание уже не наше — сохране
   const [, err] = calls.fail[0] as [string, StudioError];
   assert.deepEqual([err.code, err.retryable], ['unknown', false]);
   assert.match(err.message, /другой процесс/);
+});
+
+test('оживление: отзыв о сценке доходит до очереди тем же экземпляром — по нему failJob вернёт ролик сценаристу', async () => {
+  const { queue, calls } = fakeQueue({ animate: job('animate', { capture: skitCapture, script: skitScript }) }, { failOutcome: 'writer' });
+  const thrown = new SkitFeedbackError(
+    { kind: 'punchline', code: 'speech_mismatch', lines: [1], heard: 'другое', reason: null },
+    'сценка 2 (развязка): 2 клипа с этими репликами не прошли сверку речи',
+    'сценка 2 (развязка): не услышаны реплики 1',
+  );
+  const d = deps({
+    queue,
+    storage: fakeStorage().storage,
+    animate: async () => {
+      throw thrown;
+    },
+  });
+  await runOne(d);
+  assert.equal(calls.fail.length, 1);
+  assert.equal((calls.fail[0] as [string, StudioError])[1], thrown);
 });
 
 test('оживление: нет сценок — no_input; сценарий не прошёл проверку студии — script_invalid; до трат', async () => {
