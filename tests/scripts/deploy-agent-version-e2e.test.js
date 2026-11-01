@@ -80,6 +80,7 @@ function runPhase(phase, env = {}) {
       ...env,
     },
   });
+  if (result.status !== 0) console.error(result.stderr);
   const log = fs.existsSync(path.join(work, 'log'))
     ? fs.readFileSync(path.join(work, 'log'), 'utf8')
     : '';
