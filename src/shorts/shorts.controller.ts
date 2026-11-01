@@ -96,7 +96,7 @@ type ReviewKind = keyof typeof ALLOWED_WORDS;
 export const LIST_COLUMNS = [
   'id', 'rubric', 'angle', 'angle_locked', 'source', 'source_ref', 'topic_key', 'topic_hint', 'title',
   'assistant_id', 'slug', 'lang', 'format', 'scene', 'video_key', 'cover_key', 'duration_ms', 'status',
-  'slot_at', 'approved_at', 'owner_note', 'writer_feedback', 'writer_rounds', 'review_chat_id',
+  'slot_at', 'approved_at', 'owner_note', 'writer_feedback', 'skit_feedback', 'writer_rounds', 'review_chat_id',
   'review_message_id', 'note_prompt_ids', 'yt_prompt_ids', 'lease_until', 'attempts', 'last_error',
   'failed_from', 'failure_notified', 'published_at', 'created_at', 'updated_at',
 ] as const;
