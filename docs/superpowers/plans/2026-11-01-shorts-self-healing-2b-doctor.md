@@ -1589,6 +1589,87 @@ NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts 2>&1 | grep -E '�
 
 Ожидается: оба `Tests:` без `failed`.
 
+- [ ] **Step 6 (попутно): живые записи доктора, выключатель «0», строка об опоздании (ревью задачи 6)**
+
+Живой SQL проверял только «позже»: опечатка в колонке у «новой сцены» или «без сценок» всплыла бы на проде. Выключатель понимает только `false` — ловушка для `0`/`off` должна быть закреплена тестом. Исход `gone` (владелец успел сам) не оставлял следа в журнале.
+
+`src/shorts/shorts.integration.spec.ts`, рядом с тестом `'доктор на живом SQL: «позже» …'` (импорт `claimStage` из `./short-jobs`, если его ещё нет):
+
+```ts
+  it('доктор на живом SQL: «без сценок» — сценарист в формате chat, оживление (счёт денег) не тронуто', async () => {
+    const v = await insert({
+      status: 'failed', failed_from: 'animating', failed_code: 'omni_budget', last_error: 'оживление: предел',
+      failure_notified: true, format: 'skit', capture: { answerText: 'a', paragraphs: [] },
+      scene: { kind: 'chat', assistantId: 10, assistantName: 'Алексей', question: 'в', followups: [] },
+      animation: { omniSeconds: 48, skits: {} },
+    });
+    const row = (await pool.query('SELECT * FROM short_video WHERE id = $1', [v.id])).rows[0];
+    expect(await new ShortsDoctorService(pgLike() as any).treat(rowToShort(row))).toBe('took');
+    const r = (await pool.query('SELECT status, format, animation, auto_recoveries, recoveries FROM short_video WHERE id = $1', [v.id])).rows[0];
+    expect(r).toMatchObject({ status: 'writing', format: 'chat', animation: { omniSeconds: 48, skits: {} }, auto_recoveries: 1 });
+    expect(r.recoveries[0]).toMatchObject({ action: 'no_skits', code: 'omni_budget' });
+  });
+
+  it('доктор на живом SQL: «новая сцена» — режиссёр без паузы, строка «Сам:» к замечаниям', async () => {
+    const v = await insert({
+      status: 'failed', failed_from: 'capturing', failed_code: 'answer_rejected', last_error: 'съёмка: ответ не годится',
+      failure_notified: true, owner_note: 'Короче.',
+    });
+    const row = (await pool.query('SELECT * FROM short_video WHERE id = $1', [v.id])).rows[0];
+    expect(await new ShortsDoctorService(pgLike() as any).treat(rowToShort(row))).toBe('took');
+    const r = (await pool.query('SELECT status, lease_until, owner_note, auto_recoveries FROM short_video WHERE id = $1', [v.id])).rows[0];
+    expect(r).toMatchObject({ status: 'directing', lease_until: null, auto_recoveries: 1 });
+    expect(r.owner_note).toBe('Короче.\nСам: прошлая сцена не удалась — съёмка: ответ не годится');
+  });
+
+  it('доктор на живом SQL: сбой не захвачен разбором (failure_notified = false) — gone, строка не тронута', async () => {
+    const v = await insert({ status: 'failed', failed_from: 'animating', failed_code: 'google_quota', last_error: 'x', failure_notified: false });
+    const before = (await pool.query('SELECT * FROM short_video WHERE id = $1', [v.id])).rows[0];
+    expect(await new ShortsDoctorService(pgLike() as any).treat(rowToShort(before))).toBe('gone');
+    expect((await pool.query('SELECT * FROM short_video WHERE id = $1', [v.id])).rows[0]).toEqual(before);
+  });
+
+  it('«позже» у режиссёра: до конца паузы claimStage ролик не берёт, после — с первой попытки', async () => {
+    const v = await insert({
+      status: 'failed', failed_from: 'directing', failed_code: 'relay', last_error: 'режиссёр: релей молчит', failure_notified: true, attempts: 3,
+    });
+    const row = (await pool.query('SELECT * FROM short_video WHERE id = $1', [v.id])).rows[0];
+    expect(await new ShortsDoctorService(pgLike() as any).treat(rowToShort(row))).toBe('took');
+    expect(await claimStage(pool, 'directing')).toBeNull();
+    await pool.query(`UPDATE short_video SET lease_until = now() - interval '1 second' WHERE id = $1`, [v.id]);
+    const claimed = await claimStage(pool, 'directing');
+    expect([claimed?.id, claimed?.attempts]).toEqual([v.id, 1]);
+  });
+```
+
+(Поля, которых `insert` не знает, и способ вызова `claimStage` — как в соседних живых тестах этого файла.)
+
+`src/shorts/shorts-doctor.service.spec.ts`, в тесте `'SHORTS_AUTO_HEAL=false — выключен: …'` перед `delete process.env.SHORTS_AUTO_HEAL;` добавить:
+
+```ts
+    // Только false выключает: «0» и «off» — включён (ловушка — прочие флаги роликов понимают только true).
+    process.env.SHORTS_AUTO_HEAL = '0';
+    expect(await setup().svc.treat(failed(), NOW)).toBe('took');
+```
+
+`src/shorts/shorts-doctor.service.ts`: строку `    if (!r.rowCount) return 'gone';` заменить на
+
+```ts
+    if (!r.rowCount) {
+      // Владелец успел нажать кнопку (или сбой забрал другой экземпляр) — разбор промолчит; след — здесь.
+      this.logger.log(`ролик ${v.id}: доктор опоздал — ролик уже не в захваченном сбое`);
+      return 'gone';
+    }
+```
+
+```bash
+git add src/shorts/shorts.integration.spec.ts src/shorts/shorts-doctor.service.spec.ts src/shorts/shorts-doctor.service.ts
+git commit -m "test(shorts): доктор на живом SQL — новая сцена, без сценок, gone, пауза «позже»; выключатель «0»; след опоздания" -m "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>"
+NODE_RUN_DIR=. studio/scripts/node-run.sh "npx jest src/shorts/shorts-doctor.service.spec.ts 2>&1 | grep -E '✕|Tests:'; SHORTS_PG_URL=postgresql://shortsit:shortsit@127.0.0.1:5432/shorts_it npx jest src/shorts/shorts.integration.spec.ts 2>&1 | grep -E '✕|^Tests:'"
+```
+
+Ожидается: сторожа — зелёные сразу (записи доктора уже верны); если какой-то живой тест красный — это настоящая ошибка записи доктора: остановиться и доложить.
+
 ---
 
 ### Task 7: Доктор в разборе упавших; «Сам пробовал»
