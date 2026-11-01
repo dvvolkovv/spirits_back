@@ -384,7 +384,7 @@ export class ShortsController {
    * сцене: тот считает только хвост «Сценарист: …» после последнего замечания
    * владельца (shorts-writer.service.ts).
    *
-   * Замечание сбрасывает и отзыв студии о прошлой озвучке: новый круг идёт по
+   * Замечание сбрасывает и отзыв студии о прошлой озвучке и сценке: новый круг идёт по
    * замечанию, а сценарист в круге по отзыву студии сценок не меняет.
    *
    * С `from` ролик берёт и формат из настроек: после «модель Omni недоступна»
@@ -427,6 +427,7 @@ export class ShortsController {
                 failure_notified = false, writer_rounds = 0, owner_note = COALESCE($4::text, owner_note),
                 format = COALESCE($5::text, format),
                 writer_feedback = CASE WHEN $4::text IS NULL THEN writer_feedback ELSE NULL END,
+                skit_feedback = CASE WHEN $4::text IS NULL THEN skit_feedback ELSE NULL END,
                 slot_at = CASE WHEN $2 = 'approved' THEN now() ELSE slot_at END, updated_at = now()
           WHERE id = $1 AND status = 'failed' AND failed_from = $3
           RETURNING *`,
