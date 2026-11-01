@@ -287,7 +287,7 @@ describe('ход гостя: отказы', () => {
   });
 
   // Новый гость при недоступной модели (ревью 01.11): стена ДО квоты проб —
-  // тот же поток, что при выключенной пробе (guest без ключа с left 0 и стена
+  // тот же поток, что при выключенной пробе (guest без ключа пробы с left 0 и стена
   // closed), без строки пробы; в событии — cause.
   it('окно Claude открыто (рубильник не передан — Claude) — стена closed до квоты проб, cause claude_window', async () => {
     const h = harness({ fallbackStats: () => ({ breakerOpenUntil: Date.now() + 60_000 }) });
@@ -346,7 +346,7 @@ describe('ход гостя: отказы', () => {
     expect(h.events.track).toHaveBeenCalledWith('guest_trial_error', { props: { reason: 'breaker', cause: 'no_key', assistant_id: '12', preview: false, provider: 'kimi' } });
   });
 
-  it('рубильник Qwen «не отвечает», новый гость — стена до квоты проб: без ключа и строки пробы, Redis не тронут, cause down', async () => {
+  it('рубильник Qwen «не отвечает», новый гость — стена до квоты проб: без ключа пробы и строки пробы, Redis не тронут, cause down', async () => {
     const h = harness({
       global: 'qwen',
       fallbackStats: () => ({ breakerOpenUntil: 0, providers: { qwen: { enabled: true, downUntil: Date.now() + 60_000 }, kimi: { enabled: false, downUntil: 0 } } }),

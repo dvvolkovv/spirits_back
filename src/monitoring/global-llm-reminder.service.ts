@@ -77,8 +77,9 @@ export class GlobalLlmReminderService {
    * подзапросом ошибки гостей о модели (guest_trial_error, provider = эта
    * модель, reason breaker или model) за те же сутки — гости своих ходов в
    * chat_quality/claude_cli_call не пишут при стене до вызова CLI. reason
-   * internal не считается: это сбой базы уже после ответа модели. guests —
-   * только гостевая часть failed (для строки «из них гостям»).
+   * internal не считается: это сбой кода или базы вокруг вызова (история до
+   * него, запись пары после), не отказ модели. guests — только гостевая часть
+   * failed (для строки «из них гостям»); считает попытки, а не людей.
    */
   private async dayCounts(provider: FallbackProvider): Promise<GlobalLlmDayCounts> {
     const r = await this.pg.query(
