@@ -86,6 +86,14 @@ describe('контракт API и студии', () => {
     expect(scene).toBeDefined();
     expect(scene).toBe(fs.readFileSync(path.join(__dirname, 'short-rules.ts'), 'utf8').match(/SKIT_LABELS: Record<SkitKind, string> = (\{[^}]+\});/)?.[1]);
   });
+
+  it('каждый код сбоя студии осознанно разнесён в таблице доктора (short-doctor.ts)', () => {
+    const union = studio('errors.ts').match(/export type StudioErrorCode =([^;]+);/)?.[1] ?? '';
+    const codes = [...union.matchAll(/'([a-z_]+)'/g)].map((m) => m[1]);
+    expect(codes.length).toBeGreaterThan(20);
+    const doctor = fs.readFileSync(path.join(__dirname, 'short-doctor.ts'), 'utf8');
+    expect(codes.filter((c) => !doctor.includes(`'${c}'`))).toEqual([]);
+  });
 });
 
 describe('контракт API и студии — оживление', () => {

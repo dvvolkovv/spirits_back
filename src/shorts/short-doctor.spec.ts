@@ -1,4 +1,4 @@
-import { LATER_DELAYS_MIN, MAX_AUTO_RECOVERIES, currentCircle, newSceneNote, prescribe, recoveryEntry, recoveryWords } from './short-doctor';
+import { DOCTOR_NOTE_PREFIX, LATER_DELAYS_MIN, MAX_AUTO_RECOVERIES, currentCircle, newSceneNote, prescribe, recoveryEntry, recoveryWords } from './short-doctor';
 import type { ShortRecovery, ShortStatus } from './shorts.types';
 
 const rec = (action: ShortRecovery['action'], over: Partial<ShortRecovery> = {}): ShortRecovery => ({
@@ -6,7 +6,7 @@ const rec = (action: ShortRecovery['action'], over: Partial<ShortRecovery> = {})
 });
 const v = (over: Record<string, unknown> = {}) => ({
   failedFrom: 'animating' as ShortStatus | null, failedCode: 'google_quota' as string | null, format: 'skit' as const,
-  capture: { answerText: 'ответ' } as any, recoveries: [] as ShortRecovery[], autoRecoveries: 0, lastError: 'оживление: лимит Google исчерпан',
+  capture: { answerText: 'ответ' } as any, scene: { kind: 'chat' } as any, recoveries: [] as ShortRecovery[], autoRecoveries: 0, lastError: 'оживление: лимит Google исчерпан',
   ...over,
 });
 
@@ -26,6 +26,8 @@ describe('prescribe — таблица «этап + код → самопочи�
     ['animating', 'omni_bad_request', 'no_skits'], ['animating', 'speech_mismatch', 'no_skits'], ['animating', 'omni_rejected', 'no_skits'],
     ['animating', 'keyframe_blocked', 'new_scene'], ['animating', 'script_invalid', 'new_scene'],
     ['rendering', 'tts', 'later'], ['rendering', 'video_invalid', 'later'], ['rendering', 'lease', 'later'], ['rendering', 'frame_size', 'new_scene'],
+    ['capturing', 'answer_timeout', 'later'], ['capturing', 'empty_frame', 'later'],
+    ['animating', 'omni_unreadable', 'later'], ['animating', 'unknown', 'later'], ['rendering', 'unknown', 'later'],
     ['capturing', 'no_input', 'never'], ['animating', 'no_input', 'never'], ['rendering', 'no_input', 'never'],
     ['publishing', 'telegram', 'never'], ['publishing', null, 'never'],
     ['capturing', 'код-из-будущего', 'later'], ['animating', null, 'later'],
@@ -75,6 +77,35 @@ describe('prescribe — пределы на круг', () => {
     expect(currentCircle({ recoveries: old, autoRecoveries: 1 })).toEqual([old[2]]);
     expect(prescribe(v({ recoveries: old, autoRecoveries: 0 }))).toEqual({ action: 'later', delayMin: 30 });
   });
+
+  it('«позже» считается на весь круг: после паузы на съёмке первый повтор оживления — уже через 2 ч', () => {
+    const once = [rec('later', { from: 'capturing', code: 'login', delayMin: 30 })];
+    expect(prescribe(v({ recoveries: once, autoRecoveries: 1 }))).toEqual({ action: 'later', delayMin: LATER_DELAYS_MIN[1] });
+  });
+
+  it('оживление, последнее действие круга — без сценок, а не «позже»: ролик выйдет наверняка', () => {
+    const two = [rec('new_scene', { from: 'capturing', code: 'answer_rejected' }), rec('later', { delayMin: 30 })];
+    expect(prescribe(v({ recoveries: two, autoRecoveries: 2 })).action).toBe('no_skits');
+    // У других этапов «без сценок» не лечит — там последнее действие прежнее.
+    expect(prescribe(v({ failedFrom: 'capturing', failedCode: 'login', recoveries: two, autoRecoveries: 2 }))).toEqual({ action: 'later', delayMin: LATER_DELAYS_MIN[1] });
+  });
+
+  it('оживление: новая сцена круга израсходована — без сценок; у сценариста — никак', () => {
+    const once = [rec('new_scene', { code: 'keyframe_blocked' })];
+    expect(prescribe(v({ failedCode: 'keyframe_blocked', recoveries: once, autoRecoveries: 1 })).action).toBe('no_skits');
+    expect(prescribe(v({ failedFrom: 'writing', failedCode: 'rules', recoveries: once, autoRecoveries: 1 }))).toEqual({ action: 'never' });
+  });
+
+  it('счётчик — источник правды о круге: история короче счётчика или с мусором не ломает предел', () => {
+    expect(prescribe(v({ recoveries: [], autoRecoveries: MAX_AUTO_RECOVERIES })).action).toBe('never');
+    const junk = [null, rec('later', { delayMin: 30 }), 'x'] as unknown as ShortRecovery[];
+    expect(currentCircle({ recoveries: junk, autoRecoveries: 3 })).toEqual([junk[1]]);
+    expect(() => recoveryWords(currentCircle({ recoveries: junk, autoRecoveries: 3 }))).not.toThrow();
+  });
+
+  it('без сцены «без сценок» нельзя: сценарист пишет текст по сцене и съёмке', () => {
+    expect(prescribe(v({ failedCode: 'omni_budget', scene: null })).action).toBe('never');
+  });
 });
 
 describe('слова и записи', () => {
@@ -101,5 +132,15 @@ describe('слова и записи', () => {
     // Замечания — построчные (appendOwnerNote): многострочная ошибка студии разорвала бы строку «Сам: …».
     expect(newSceneNote(v({ lastError: 'сборка: сценарий не прошёл\n- строка 1\n- строка 2' }))).toBe('Сам: прошлая сцена не удалась — сборка: сценарий не прошёл - строка 1 - строка 2');
     expect(recoveryEntry(v({ lastError: 'a\n  b' }), { action: 'no_skits' }, new Date(0)).reason).toBe('a b');
+  });
+
+  it('паузы словами: «1 ч 30 мин», без паузы — «позже»; незнакомое действие — как есть', () => {
+    expect(recoveryWords([rec('later', { delayMin: 90 }), rec('later', { delayMin: undefined })])).toBe('повтор через 1 ч 30 мин (google_quota), повтор позже (google_quota)');
+    expect(recoveryWords([rec('teleport' as any)])).toBe('teleport (google_quota)');
+  });
+
+  it('recoveryEntry без ошибки — пустая причина; строка доктора — с общим префиксом', () => {
+    expect(recoveryEntry(v({ lastError: null }), { action: 'no_skits' }, new Date(0)).reason).toBe('');
+    expect(newSceneNote(v()).startsWith(`${DOCTOR_NOTE_PREFIX} `)).toBe(true);
   });
 });
