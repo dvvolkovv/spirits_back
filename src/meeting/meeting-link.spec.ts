@@ -238,22 +238,22 @@ describe('parseMeetingLink', () => {
   describe('Яндекс Телемост', () => {
     it('код — номер встречи, адрес — канонический', () => {
       // Параметры отбрасываем: мост всё равно приводит адрес к этой форме.
-      expect(parseMeetingLink('зайди на новую встречу https://telemost.yandex.ru/j/90382708766203')).toEqual({
+      expect(parseMeetingLink('зайди на новую встречу https://telemost.yandex.ru/j/00000000000001')).toEqual({
         provider: 'telemost',
-        code: '90382708766203',
-        url: 'https://telemost.yandex.ru/j/90382708766203',
+        code: '00000000000001',
+        url: 'https://telemost.yandex.ru/j/00000000000001',
       });
     });
 
     it('параметры ссылки не уезжают в базу', () => {
-      expect(parseMeetingLink('https://telemost.yandex.ru/j/90382708766203?from=mail&utm_source=x')?.url)
-        .toBe('https://telemost.yandex.ru/j/90382708766203');
+      expect(parseMeetingLink('https://telemost.yandex.ru/j/00000000000001?from=mail&utm_source=x')?.url)
+        .toBe('https://telemost.yandex.ru/j/00000000000001');
     });
 
     it('чужой домен с telemost.yandex.ru внутри не проходит', () => {
       // Тот же класс защиты, что у notmeet.google.com и notzoom.us.
-      expect(parseMeetingLink('https://nottelemost.yandex.ru/j/90382708766203')).toBeNull();
-      expect(parseMeetingLink('https://telemost.yandex.ru.evil.ru/j/90382708766203')).toBeNull();
+      expect(parseMeetingLink('https://nottelemost.yandex.ru/j/00000000000001')).toBeNull();
+      expect(parseMeetingLink('https://telemost.yandex.ru.evil.ru/j/00000000000001')).toBeNull();
     });
 
     it('прочие страницы Телемоста встречей не считаются', () => {
@@ -267,7 +267,7 @@ describe('parseMeetingLink', () => {
   });
 
   describe('Microsoft Teams', () => {
-    const LIVE = 'https://teams.live.com/meet/9334354666557?p=lBZ4sXKpUY7bT0GzzM';
+    const LIVE = 'https://teams.live.com/meet/0000000000001?p=EXAMPLEpwd00000000';
     const CORP =
       'https://teams.microsoft.com/l/meetup-join/19%3ameeting_NzQ3Yzk%40thread.v2/0' +
       '?context=%7B%22Tid%22%3A%22a1b2%22%2C%22Oid%22%3A%22c3d4%22%7D';
@@ -277,7 +277,7 @@ describe('parseMeetingLink', () => {
       // адрес не нормализуется вовсе.
       expect(parseMeetingLink(`присоединяйся ${LIVE}`)).toEqual({
         provider: 'teams',
-        code: '9334354666557',
+        code: '0000000000001',
         url: LIVE,
       });
     });
@@ -305,8 +305,8 @@ describe('parseMeetingLink', () => {
 
     it('чужой домен с teams.live.com внутри не проходит', () => {
       // Тот же класс защиты, что у notmeet.google.com и notzoom.us.
-      expect(parseMeetingLink('https://notteams.live.com/meet/9334354666557')).toBeNull();
-      expect(parseMeetingLink('https://teams.live.com.evil.ru/meet/9334354666557')).toBeNull();
+      expect(parseMeetingLink('https://notteams.live.com/meet/0000000000001')).toBeNull();
+      expect(parseMeetingLink('https://teams.live.com.evil.ru/meet/0000000000001')).toBeNull();
       expect(parseMeetingLink('https://teams.microsoft.com.evil.ru/l/meetup-join/19%3ax')).toBeNull();
     });
 
@@ -327,7 +327,7 @@ describe('parseMeetingLink', () => {
   });
 
   describe('Zoom', () => {
-    const LINK = 'https://us04web.zoom.us/j/71077562785?pwd=Y5JwbnVqjs11slpbCOzBOI54zw8bAd.1';
+    const LINK = 'https://us04web.zoom.us/j/00000000000?pwd=EXAMPLEpwd00000000000000000000.1';
 
     it('код — числовой id, адрес — нормализованная ссылка', () => {
       // Разделение принципиальное: код опознаёт встречу для человека и для
@@ -335,7 +335,7 @@ describe('parseMeetingLink', () => {
       // аккаунта и хеш пароля.
       expect(parseMeetingLink(`зайди сюда ${LINK}`)).toEqual({
         provider: 'zoom',
-        code: '71077562785',
+        code: '00000000000',
         url: LINK,
       });
     });

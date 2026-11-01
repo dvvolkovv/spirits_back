@@ -8,13 +8,13 @@ describe('алерт о несостоявшемся входе', () => {
       reason: 'порт 8140 занят — Meet уже держит одну встречу',
       callId: '38da3f84',
       userId: '79030169187',
-      room: '65470621881811',
+      room: '00000000000003',
     });
     expect(text).toContain('Ассистент не зашёл на встречу');
     expect(text).toContain('площадка: telemost');
     expect(text).toContain('этап: встреча');
     expect(text).toContain('порт 8140 занят');
-    expect(text).toContain('встреча: 65470621881811');
+    expect(text).toContain('встреча: 00000000000003');
     expect(text).toContain('звонок: 38da3f84');
   });
 

@@ -83,7 +83,7 @@ describe('TgRouterService: выбор модели', () => {
   it('smart-гейт остаётся на Haiku — он бесплатный для владельца и гоняется на каждое сообщение', async () => {
     const { svc, claudeCli } = makeRouter();
 
-    const gated = await (svc as any).smartGate(cfg, { text: 'а что там по деньгам?', fromTgUserName: 'Арман' });
+    const gated = await (svc as any).smartGate(cfg, { text: 'а что там по деньгам?', fromTgUserName: 'Иван' });
 
     expect(gated).toBe(true);
     expect(String(claudeCli.text.mock.calls[0][1].model)).toBe('claude-haiku-4-5');

@@ -11,14 +11,14 @@ import { platformFor } from '../src/platform-url.mjs';
  */
 
 test('наши площадки узнаются', () => {
-  assert.equal(platformFor('https://telemost.yandex.ru/j/60786470391331'), 'telemost');
+  assert.equal(platformFor('https://telemost.yandex.ru/j/00000000000002'), 'telemost');
   assert.equal(platformFor('https://us04web.zoom.us/j/75281580798?pwd=abc.1'), 'zoom');
-  assert.equal(platformFor('https://meet.google.com/ypj-ixta-fjs'), 'meet');
+  assert.equal(platformFor('https://meet.google.com/abc-defg-hij'), 'meet');
 });
 
 test('похожие чужие хосты не проходят', () => {
   assert.equal(platformFor('https://notzoom.us/j/123456789'), null);
-  assert.equal(platformFor('https://notmeet.google.com/ypj-ixta-fjs'), null);
+  assert.equal(platformFor('https://notmeet.google.com/abc-defg-hij'), null);
   assert.equal(platformFor('https://telemost.yandex.ru.evil.com/j/123456'), null);
 });
 
