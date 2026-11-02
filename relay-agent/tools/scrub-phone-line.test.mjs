@@ -15,7 +15,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { scrubContent, readSnapshot, commitFile, scrubTree } from "./scrub-phone-line.mjs";
 
@@ -540,8 +540,8 @@ test(
 
 // ---------------------------------------------------------------- объём
 
-test("200 файлов по 1 МБ: меньше минуты, в памяти — текущий файл, после прохода ничего не копится", (t) => {
-  const root = tmpRoot(t);
+// Транскрипт около 1 МБ: каждая четвёртая строка — реплика с фразой.
+function bigTranscript() {
   const rows = [];
   let size = 0;
   for (let i = 0; size < 1024 * 1024; i++) {
@@ -549,10 +549,19 @@ test("200 файлов по 1 МБ: меньше минуты, в памяти �
     rows.push(row);
     size += Buffer.byteLength(row) + 1;
   }
-  const content = rows.join("\n") + "\n";
-  const perFile = content.split(OLD()).length - 1;
+  return Buffer.from(rows.join("\n") + "\n");
+}
+
+function putMany(root, count, content) {
   const old = hourAgo();
-  for (let i = 0; i < 200; i++) put(root, "-tmp/s" + String(i).padStart(3, "0") + ".jsonl", content, { mtime: old });
+  for (let i = 0; i < count; i++) put(root, "-tmp/s" + String(i).padStart(3, "0") + ".jsonl", content, { mtime: old });
+}
+
+test("200 файлов по 1 МБ: меньше минуты, в памяти — текущий файл, после прохода ничего не копится", (t) => {
+  const root = tmpRoot(t);
+  const content = bigTranscript();
+  const perFile = content.toString("utf8").split(OLD()).length - 1;
+  putMany(root, 200, content);
   const journalPath = path.join(tmpRoot(t), "j.jsonl");
 
   // Отдельный процесс с --expose-gc: память меряется после сборки мусора —
@@ -577,7 +586,7 @@ test("200 файлов по 1 МБ: меньше минуты, в памяти �
   assert.equal(r.status, 0, r.stderr);
   const m = JSON.parse(r.stdout);
   t.diagnostic(
-    `200 × ${(Buffer.byteLength(content) / 2 ** 20).toFixed(2)} МБ, ${perFile} фраз в файле: ` +
+    `200 × ${(content.length / 2 ** 20).toFixed(2)} МБ, ${perFile} фраз в файле: ` +
       `${(m.ms / 1000).toFixed(1)} с; удержано в пике ${m.peakMb.toFixed(1)} МБ, после прохода ${m.leakMb.toFixed(1)} МБ`,
   );
   assert.equal(m.summary.written, 200);
@@ -587,4 +596,39 @@ test("200 файлов по 1 МБ: меньше минуты, в памяти �
   assert.ok(m.peakMb < 64, "в пике удержано " + m.peakMb.toFixed(1) + " МБ — файлы копятся в памяти");
   assert.ok(m.leakMb < 16, "после прохода удержано " + m.leakMb.toFixed(1) + " МБ");
   assert.ok(!fs.readFileSync(path.join(root, "-tmp", "s123.jsonl")).includes(PHONE));
+});
+
+test("CLI: Ctrl+C — текущий файл доделывается и прогон останавливается; временных файлов нет, код 130", async (t) => {
+  const root = tmpRoot(t);
+  const content = bigTranscript();
+  putMany(root, 150, content);
+  const journalPath = path.join(tmpRoot(t), "j.jsonl");
+
+  const child = spawn(process.execPath, [SCRIPT, "--root", root, "--apply", "--journal", journalPath], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  child.stdout.on("data", (d) => (stdout += d));
+  const closed = new Promise((resolve) => child.on("close", (code, signal) => resolve({ code, signal })));
+  // Сигнал — когда в журнале появилась первая запись: проход точно идёт.
+  const deadline = Date.now() + 30_000;
+  while (!(fs.existsSync(journalPath) && fs.statSync(journalPath).size > 0)) {
+    assert.ok(Date.now() < deadline, "журнал не появился");
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  child.kill("SIGINT");
+  const { code, signal } = await closed;
+
+  assert.equal(signal, null, "процесс не убит сигналом, а завершился сам");
+  assert.equal(code, 130);
+  assert.match(stdout, /ПРЕРВАНО/);
+  const written = new Set(fs.readFileSync(journalPath, "utf8").trim().split("\n").map((l) => JSON.parse(l).file));
+  assert.ok(written.size >= 1 && written.size < 150, "записано " + written.size);
+  const names = fs.readdirSync(path.join(root, "-tmp"));
+  assert.equal(names.length, 150, "временных файлов нет: " + names.filter((n) => n.startsWith(".")).join(", "));
+  for (const n of names) {
+    const buf = fs.readFileSync(path.join(root, "-tmp", n));
+    if (written.has(path.join("-tmp", n))) assert.ok(!buf.includes(PHONE), n + " в журнале, но номер остался");
+    else assert.ok(buf.equals(content), n + " не в журнале, но изменён");
+  }
 });
