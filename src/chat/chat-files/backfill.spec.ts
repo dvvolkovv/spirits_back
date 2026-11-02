@@ -12,6 +12,7 @@ import {
   maskRelayUrl,
   revertBackfill,
   runBackfill,
+  saveDryRunList,
   saveMissingList,
 } from './backfill';
 
@@ -131,40 +132,74 @@ describe('maskRelayPaths', () => {
 });
 
 // Ссылки /files/<id>_ под чужим хостом или без хоста: копировать неоткуда, и
-// релей их не отдаст — заведомо мёртвые. Ревью ветки (I3): номер в них — на
-// тот же солёный хэш, без проверки у релея.
+// наш релей их не отдаёт. Ревью ветки (I3): номер в них — на солёный хэш,
+// без проверки у релея. Повторное ревью: только если id в ссылке — владелец
+// строки (из session_id): сторонние живые адреса бывают того же вида
+// (метка времени в имени, бакет files у хранилищ, ссылки из веб-поиска).
+const UUID_USER = 'aaaaaaaa-0000-4000-8000-000000000001';
 describe('maskForeignFilesLinks', () => {
-  it('чужой хост: номер — на солёный хэш, хост и хвост как были', () => {
-    expect(maskForeignFilesLinks(`старый адрес http://r.linkeon.io/files/70000000000_12_ru/old.pdf.`, AGENT, fsKey)).toEqual({
-      text: `старый адрес http://r.linkeon.io/files/${FK}_12_ru/old.pdf.`,
-      swaps: [{ linkFrom: 'http://r.linkeon.io/files/70000000000', linkTo: `http://r.linkeon.io/files/${FK}` }],
+  it('чужой хост, id владельца строки: номер — на солёный хэш, хост и хвост как были', () => {
+    expect(maskForeignFilesLinks('старый адрес http://old.example/files/70000000000_12_ru/old.pdf.', AGENT, fsKey, '70000000000')).toEqual({
+      text: `старый адрес http://old.example/files/${FK}_12_ru/old.pdf.`,
+      swaps: [{ linkFrom: 'http://old.example/files/70000000000', linkTo: `http://old.example/files/${FK}` }],
+      skipped: 0,
     });
   });
 
-  it('без хоста — тоже', () => {
-    expect(maskForeignFilesLinks('см. /files/70000000000_12/rel.pdf', AGENT, fsKey)).toEqual({
+  it('без хоста, id владельца — тоже', () => {
+    expect(maskForeignFilesLinks('см. /files/70000000000_12/rel.pdf', AGENT, fsKey, '70000000000')).toEqual({
       text: `см. /files/${FK}_12/rel.pdf`,
       swaps: [{ linkFrom: '/files/70000000000', linkTo: `/files/${FK}` }],
+      skipped: 0,
     });
   });
 
-  it('uuid пользователя почты и адрес в скобках ссылки', () => {
-    const uuid = 'aaaaaaaa-0000-4000-8000-000000000001';
-    expect(maskForeignFilesLinks(`[файл](https://example.com/files/${uuid}_17_en/a.pdf)`, AGENT, fsKey).text).toBe(
+  it('сторонний адрес с id не владельца строки — не трогается, только счёт', () => {
+    const t = `[файл](https://example.com/files/${UUID_USER}_17_en/a.pdf)`;
+    expect(maskForeignFilesLinks(t, AGENT, fsKey, '70000000000')).toEqual({ text: t, swaps: [], skipped: 1 });
+  });
+
+  it('тот же адрес, если id — владелец строки (пользователь почты), — маскируется', () => {
+    expect(maskForeignFilesLinks(`[файл](https://example.com/files/${UUID_USER}_17_en/a.pdf)`, AGENT, fsKey, UUID_USER).text).toBe(
       `[файл](https://example.com/files/${FK}_17_en/a.pdf)`,
     );
   });
 
-  it('адрес под префиксом релея — не её дело (его решает ответ релея)', () => {
-    const t = `${P}/a.pdf`;
-    expect(maskForeignFilesLinks(t, AGENT, fsKey)).toEqual({ text: t, swaps: [] });
+  it('сторонний адрес с меткой времени в имени — не трогается', () => {
+    const t = 'отчёт: https://cdn.example.com/files/1698765432_report.pdf';
+    expect(maskForeignFilesLinks(t, AGENT, fsKey, '70000000000')).toEqual({ text: t, swaps: [], skipped: 1 });
+  });
+
+  it('адрес релея — в любом написании (схема, регистр, порт) — не её дело: его решает ответ релея', () => {
+    for (const t of [
+      `${P}/a.pdf`,
+      'HTTP://R.LINKEON.IO:443/files/70000000000_12_ru/a.pdf',
+      'http://r.linkeon.io/files/70000000000_12_ru/a.pdf',
+    ]) {
+      expect(maskForeignFilesLinks(t, AGENT, fsKey, '70000000000')).toEqual({ text: t, swaps: [], skipped: 0 });
+    }
   });
 
   it('папка без идентификатора и без соли — без изменений', () => {
-    const t1 = `http://r.linkeon.io/files/${'cd'.repeat(16)}/x.pdf`;
-    expect(maskForeignFilesLinks(t1, AGENT, fsKey)).toEqual({ text: t1, swaps: [] });
+    const t1 = `http://old.example/files/${'cd'.repeat(16)}/x.pdf`;
+    expect(maskForeignFilesLinks(t1, AGENT, fsKey, '70000000000')).toEqual({ text: t1, swaps: [], skipped: 0 });
     const t2 = '/files/70000000000_12/rel.pdf';
-    expect(maskForeignFilesLinks(t2, AGENT, () => undefined)).toEqual({ text: t2, swaps: [] });
+    expect(maskForeignFilesLinks(t2, AGENT, () => undefined, '70000000000')).toEqual({ text: t2, swaps: [], skipped: 0 });
+  });
+});
+
+describe('maskRelayUrl — наш релей в другом написании', () => {
+  it('схема, регистр и порт — тот же релей: номер на хэш, написание адреса как было', () => {
+    expect(maskRelayUrl('HTTP://R.LINKEON.IO:443/files/70000000000_12_ru/a.pdf', AGENT, fsKey)).toBe(
+      `HTTP://R.LINKEON.IO:443/files/${FK}_12_ru/a.pdf`,
+    );
+    expect(maskRelayUrl('http://r.linkeon.io/files/70000000000_12_ru/a.pdf', AGENT, fsKey)).toBe(
+      `http://r.linkeon.io/files/${FK}_12_ru/a.pdf`,
+    );
+  });
+
+  it('путь перед /files/ — не адрес файла релея', () => {
+    expect(maskRelayUrl(`${AGENT}/x/files/70000000000_12_ru/a.pdf`, AGENT, fsKey)).toBeNull();
   });
 });
 
@@ -322,6 +357,35 @@ describe('saveMissingList', () => {
     } finally {
       process.umask(old);
     }
+  });
+});
+
+// Повторное ревью: кандидаты в маску (мёртвые 404 и чужие ссылки владельца) —
+// в сухом прогоне, уже с хэшем вместо id, чтобы ложные 404 просмотреть до
+// --apply. Файл — 600; при --apply его нет.
+describe('saveDryRunList', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'backfill-dry-'));
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it('сухой прогон — список рядом с журналом, права 600', () => {
+    const old = process.umask(0o022);
+    try {
+      const lines = [`404\t${AGENT}/files/${FK}_12_ru/gone.pdf`, `чужой\t/files/${FK}_12/rel.pdf`];
+      const file = saveDryRunList(false, path.join(dir, 'backfill-chat-files-x.jsonl'), lines);
+      expect(file).toBe(path.join(dir, 'backfill-chat-files-x.dry-run.txt'));
+      expect(fs.statSync(file!).mode & 0o777).toBe(0o600);
+      expect(fs.readFileSync(file!, 'utf8')).toBe(lines.join('\n') + '\n');
+    } finally {
+      process.umask(old);
+    }
+  });
+
+  it('--apply — файла нет', () => {
+    expect(saveDryRunList(true, path.join(dir, 'backfill-chat-files-x.jsonl'), ['404\tx'])).toBeNull();
+    expect(fs.readdirSync(dir)).toEqual([]);
   });
 });
 

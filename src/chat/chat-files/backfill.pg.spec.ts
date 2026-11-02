@@ -1,6 +1,9 @@
 import { Pool } from 'pg';
 import { relayFsKey } from '../linkeon-relay-fields';
-import { JournalEntry, ProbeResult, revertBackfill, runBackfill } from './backfill';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { JournalEntry, ProbeResult, revertBackfill, runBackfill, saveDryRunList } from './backfill';
 
 /**
  * Перенос ссылок релея — против живого Postgres (спека
@@ -33,7 +36,7 @@ const RELAY: Record<string, ProbeResult> = {
   'fresh.pdf': 'missing',
   'silent.pdf': 'unknown',
 };
-const probe = async (u: string): Promise<ProbeResult> => RELAY[u.slice(u.lastIndexOf('/') + 1)] ?? 'missing';
+const probe = jest.fn(async (u: string): Promise<ProbeResult> => RELAY[u.slice(u.lastIndexOf('/') + 1)] ?? 'missing');
 const store = () => ({
   persist: jest.fn(async (urls: string[]) => new Map(urls.map((u) => [u, `${STORED}/${u.slice(u.lastIndexOf('/') + 1)}`]))),
 });
@@ -46,11 +49,12 @@ maybe('перенос ссылок релея против живого Postgres
   const OLD_SALT = process.env.RELAY_FS_SALT;
   const masked = (id: string, rest: string) => `${AGENT}/files/${relayFsKey(id)}${rest}`;
 
-  async function row(content: string, sender = 'ai', age = '2 hours'): Promise<number> {
+  /** Строка истории; владелец — первая часть session_id, как у всех писателей истории. */
+  async function row(content: string, sender = 'ai', age = '2 hours', session = `${PHONE}_12`): Promise<number> {
     const r = await pool.query(
       `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, created_at)
        VALUES ($1, $2, 12, $3, now() - $4::interval) RETURNING id`,
-      [`${PHONE}_12`, sender, content, age],
+      [session, sender, content, age],
     );
     return r.rows[0].id;
   }
@@ -92,6 +96,7 @@ maybe('перенос ссылок релея против живого Postgres
   });
   beforeEach(async () => {
     process.env.RELAY_FS_SALT = 'chat-files-backfill-spec';
+    probe.mockClear();
     await pool.query('TRUNCATE custom_chat_history RESTART IDENTITY');
   });
   afterAll(async () => {
@@ -114,36 +119,41 @@ maybe('перенос ссылок релея против живого Postgres
     expect(r).toMatchObject({
       rows: 5, // mixed, uuid, human, silent, noId — молодая и «другой адрес» не входят
       humanRows: 1,
-      urls: 5, // alive, gone (дважды), gone2, silent, gone в папке fs_key
+      // alive, gone (дважды), gone2, silent, gone в папке fs_key и old.pdf —
+      // наш релей, записанный через http://: проба по каноническому адресу
+      urls: 6,
+      variantUrls: 1,
       alive: 1,
-      missing: 3,
+      missing: 4,
       unknown: 1,
-      maskable: 2, // gone и gone2; в папке fs_key маскировать нечего
-      otherRows: 1,
+      maskable: 3, // gone, gone2 и old.pdf; в папке fs_key маскировать нечего
+      otherRows: 1, // /files/<номер>_ без хоста
+      otherForeignSkipped: 0,
       updatedRows: 0,
       copied: 0,
       masked: 0,
       maskedOtherRows: 0,
     });
-    expect(r.otherOrigins).toEqual(['(без хоста)', 'http://r.linkeon.io']);
+    expect(r.otherOrigins).toEqual(['(без хоста)']);
     expect(s.persist).not.toHaveBeenCalled();
     expect(await all()).toEqual(before);
   });
 
-  it('--apply: живые — в хранилище, мёртвые — номер на солёный хэш; чужой адрес и без хоста — тоже; молодые и «не ответил» не тронуты', async () => {
+  it('--apply: живые — в хранилище, мёртвые — номер на солёный хэш; релей через http:// — по пробе, без хоста — по владельцу; молодые и «не ответил» не тронуты', async () => {
     const ids = await seed();
     const before = new Map((await all()).map((x) => [x.id, x.content]));
     const journal: JournalEntry[] = [];
 
     const r = await run(true, (e) => journal.push(e));
 
-    expect(r).toMatchObject({ copied: 1, masked: 2, maskedOtherRows: 1, updatedRows: 4, skippedRows: 0 });
+    expect(r).toMatchObject({ copied: 1, masked: 3, maskedOtherRows: 1, updatedRows: 4, skippedRows: 0 });
     expect(await contentOf(ids.mixed)).toBe(
       `[Скачать alive.pdf](${STORED}/alive.pdf)\n[Скачать gone.pdf](${masked(PHONE, '_12_ru/gone.pdf')})`,
     );
     expect(await contentOf(ids.uuid)).toBe(`[Скачать gone2.docx](${masked(UUID_USER, '_17_ru/sub/gone2.docx')})`);
     expect(await contentOf(ids.human)).toBe(`ссылка ${masked(PHONE, '_12_ru/gone.pdf')} не открывается`);
-    // Чужой хост и адрес без хоста — заведомо мёртвые: номер на тот же хэш, без вопроса релею.
+    // Наш релей через http:// — по пробе (нет файла → номер на хэш); адрес
+    // без хоста с id владельца строки — заведомо мёртвый, номер на хэш.
     expect(await contentOf(ids.other)).toBe(
       `старый адрес http://r.linkeon.io/files/${relayFsKey(PHONE)}_12_ru/old.pdf и /files/${relayFsKey(PHONE)}_12/rel.pdf`,
     );
@@ -163,7 +173,11 @@ maybe('перенос ссылок релея против живого Postgres
         { rowId: ids.mixed, relayUrl: `${P}/gone.pdf`, maskedUrl: masked(PHONE, '_12_ru/gone.pdf') },
         { rowId: ids.uuid, relayUrl: `${U}/sub/gone2.docx`, maskedUrl: masked(UUID_USER, '_17_ru/sub/gone2.docx') },
         { rowId: ids.human, relayUrl: `${P}/gone.pdf`, maskedUrl: masked(PHONE, '_12_ru/gone.pdf') },
-        { rowId: ids.other, linkFrom: `http://r.linkeon.io/files/${PHONE}`, linkTo: `http://r.linkeon.io/files/${relayFsKey(PHONE)}` },
+        {
+          rowId: ids.other,
+          relayUrl: `http://r.linkeon.io/files/${PHONE}_12_ru/old.pdf`,
+          maskedUrl: `http://r.linkeon.io/files/${relayFsKey(PHONE)}_12_ru/old.pdf`,
+        },
         { rowId: ids.other, linkFrom: `/files/${PHONE}`, linkTo: `/files/${relayFsKey(PHONE)}` },
       ]),
     );
@@ -193,6 +207,62 @@ maybe('перенос ссылок релея против живого Postgres
     expect(second).toMatchObject({ updatedRows: 0, copied: 0, masked: 0, maskable: 0, otherRows: 0, maskedOtherRows: 0 });
     expect(journal).toEqual([]);
     expect(await all()).toEqual(after);
+  });
+
+  // Повторное ревью: сторонние живые адреса того же вида — метка времени в
+  // имени, бакет files у хранилищ, ссылки из веб-поиска — не наши. Ссылка под
+  // чужим хостом маскируется, только если id в ней — владелец строки.
+  it('чужой хост: сторонний адрес с чужим id не тронут, с id владельца строки — замаскирован', async () => {
+    const foreignOnly = await row(
+      `[отчёт](https://example.com/files/${UUID_USER}_17_en/a.pdf) и https://cdn.example.com/files/1698765432_report.pdf`,
+    );
+    const owned = await row(`[файл](https://example.com/files/${UUID_USER}_17_en/b.pdf)`, 'ai', '2 hours', `${UUID_USER}_17`);
+    const before = await contentOf(foreignOnly);
+
+    const dry = await run(false);
+    const r = await run(true);
+
+    expect(dry).toMatchObject({ otherRows: 2, otherForeignSkipped: 1 });
+    expect(r).toMatchObject({ maskedOtherRows: 1, updatedRows: 1 });
+    expect(await contentOf(foreignOnly)).toBe(before);
+    expect(await contentOf(owned)).toBe(`[файл](https://example.com/files/${relayFsKey(UUID_USER)}_17_en/b.pdf)`);
+  });
+
+  it('наш релей в другом написании (схема, регистр, порт) — проба у релея по каноническому адресу, не маска', async () => {
+    const id = await row(
+      `HTTP://R.LINKEON.IO:443/files/${PHONE}_12_ru/silent.pdf и https://R.linkeon.io/files/${PHONE}_12_ru/alive.pdf`,
+    );
+
+    const r = await run(true);
+
+    expect(probe.mock.calls.map((c) => c[0]).sort()).toEqual([`${P}/alive.pdf`, `${P}/silent.pdf`]);
+    expect(r).toMatchObject({ variantUrls: 2, copied: 1, masked: 0, maskedOtherRows: 0 });
+    // «Не ответил» — как было; живой — в хранилище.
+    expect(await contentOf(id)).toBe(`HTTP://R.LINKEON.IO:443/files/${PHONE}_12_ru/silent.pdf и ${STORED}/alive.pdf`);
+  });
+
+  it('сухой прогон: список кандидатов в маску — с хэшем вместо id, без номеров; в файл с правами 600', async () => {
+    await seed();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'backfill-pg-dry-'));
+    try {
+      const r = await run(false);
+
+      expect(r.maskCandidates.sort()).toEqual(
+        [
+          `404\t${masked(PHONE, '_12_ru/gone.pdf')}`,
+          `404\t${masked(UUID_USER, '_17_ru/sub/gone2.docx')}`,
+          `404\thttp://r.linkeon.io/files/${relayFsKey(PHONE)}_12_ru/old.pdf`,
+          `чужой\t/files/${relayFsKey(PHONE)}_12/rel.pdf`,
+        ].sort(),
+      );
+      const file = saveDryRunList(false, path.join(dir, 'backfill-chat-files-x.jsonl'), r.maskCandidates)!;
+      const text = fs.readFileSync(file, 'utf8');
+      expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+      expect(text).not.toContain(PHONE);
+      expect(text).not.toContain(UUID_USER);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   // Пути на диске релея: до 26.10.2026 папка хода называлась ключом сессии с
