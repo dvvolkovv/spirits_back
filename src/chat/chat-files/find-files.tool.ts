@@ -2,7 +2,7 @@
  * Инструмент find_files — для модели. Живёт на защищённой точке
  * /webhook/mcp/products (products-mcp.controller.ts): владелец берётся из
  * подписи токена сессии, поэтому аргумента userId здесь нет и быть не должно.
- * На общую точку /mcp этот инструмент не добавляется.
+ * На точку инструментов linkeon (/webhook/mcp/linkeon) он не добавляется.
  *
  * Полное имя у модели — mcp__products__find_files: ключ сервера `products`
  * общий с manage_product (relay-agent/server.mjs: PRODUCTS_TOOLS;

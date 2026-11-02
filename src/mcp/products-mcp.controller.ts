@@ -36,17 +36,20 @@ import { ProblemReportService } from '../problem-report/problem-report.service';
 import { REPORT_PROBLEM_TOOL, REPORT_PROBLEM_TOOL_NAME } from '../problem-report/report-problem.tool';
 
 /**
- * Отдельная точка, а не ветка в /mcp, СОЗНАТЕЛЬНО.
+ * Отдельная точка, а не ветка в точке инструментов linkeon (mcp.controller.ts),
+ * СОЗНАТЕЛЬНО. Пользователь и там и здесь — из подписи, но токены разные: у
+ * токена хода linkeon (linkeon-tool.token.ts) внутри только userId, а у токена
+ * продуктов (product-tool.token.ts) свой тип и ещё канал (он же
+ * product_turns.channel), метка хода (по ней чат забирает карточки продуктов)
+ * и область help (в Telegram-группе с посторонними — только справка). И сюда
+ * же по loopback ходит локальный CLI — Маша и Telegram-бот
+ * (products-cli-tool.ts), а точку linkeon зовёт только релей.
  *
  * РЕАЛЬНЫЙ АДРЕС — `/webhook/mcp/products`, а не `/mcp/products`: исключение в
  * main.ts выводит из-под глобального префикса ровно путь `mcp`, но не его
  * подпути. Так и оставлено: на тестовом стенде блока `location /mcp` в nginx
  * нет вовсе, и `/mcp/products` вернул бы там 200 с HTML вместо ответа.
  * Сторож адреса — в products-mcp.controller.spec.ts.
- *
- * На общей точке (mcp.controller.ts) пользователь определяется подписью
- * токена хода, как здесь; на переходном пути по общему секрету — полем
- * запроса, которое пишет модель.
  *
  * Здесь Bearer — подписанный нами токен сессии с userId внутри, поэтому
  * принадлежность закрыта ПОДПИСЬЮ, а не проверкой: аргумента userId у

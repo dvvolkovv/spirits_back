@@ -59,8 +59,9 @@ function envNumber(name: string, fallback: number): number {
 
 /**
  * Короткая КОПИЯ чужой строки: одна строка, не длиннее max. Не .slice: в V8
- * (Node 20/22) срез держит в памяти всю исходную строку, а tool и userId на
- * /mcp пишет вызывающий — до 50 МБ на запрос.
+ * (Node 20/22) срез держит в памяти всю исходную строку, а имя инструмента на
+ * /webhook/mcp/linkeon пишет вызывающий — до 50 МБ на запрос. userId там
+ * теперь из подписи токена хода, но режется тем же путём.
  */
 function short(s: unknown, max: number): string {
   return clip(oneLine(head(String(s ?? ''), max)), max);
@@ -78,7 +79,8 @@ function incidentKey(tool: string, error: string): string {
  * Состояние (склейка, счётчики, лимиты) — в памяти процесса: linkeon-api —
  * один экземпляр, так же живут QualityMonitorService и activeTurns. Рестарт
  * его обнуляет; худшее последствие — одно лишнее сообщение после выката.
- * Всё, что хранится, ограничено по числу и длине: вход /mcp пишет вызывающий.
+ * Всё, что хранится, ограничено по числу и длине: имя инструмента на точке
+ * инструментов linkeon и текст report_problem пишет вызывающий.
  *
  * Отправка никогда не задерживает и не роняет ответ инструмента: решение
  * синхронное, имя ассистента и Telegram — без ожидания.
@@ -122,8 +124,9 @@ export class ProblemReportService {
       const userId = short(p.userId, MAX_ID);
       const error = clip(head(String(p.error ?? ''), MAX_ERROR), MAX_ERROR);
       // Незнакомые имена инструментов — один сбой: модель зовёт только то, что
-      // есть в списке /mcp, а поток случайных имён (прямые вызовы /mcp) не
-      // должен занимать все слоты потолка и прятать настоящие сбои.
+      // есть в tools/list точки инструментов linkeon, а поток случайных имён
+      // (прямые вызовы /webhook/mcp/linkeon) не должен занимать все слоты
+      // потолка и прятать настоящие сбои.
       const key = isKnownTool(tool) ? incidentKey(tool, p.error) : incidentKey('<unknown>', 'unknown tool');
       this.forgetOld(now);
       const inc = this.incidents.get(key);

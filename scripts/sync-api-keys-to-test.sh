@@ -37,9 +37,8 @@ BACK_KEYS=(
   PERPLEXITY_API_KEY
   YOOKASSA_SHOP_ID
   YOOKASSA_SECRET_KEY
-  # MCP_SECRET не копируется: у test свой с 07.10.2026. Общий секрет
-  # превращал утечку .env стенда в ключ от /mcp прода (календари, рутины,
-  # генерация за чужие токены).
+  # MCP_SECRET снят вместе с точкой /mcp (2026-11): инструменты ассистентов
+  # ходят по токену хода. Не возвращать.
   # RELAY_SECRET не копируется: у стенда свой (relay-secret, docs/superpowers/specs/2026-10-26-relay-secret-design.md).
   TELEGRAM_BOT_TOKEN
   TELEGRAM_WEBHOOK_SECRET

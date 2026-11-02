@@ -10,7 +10,6 @@ import {
   Logger,
 } from '@nestjs/common';
 import { Request, Response } from 'express';
-import { createHash, timingSafeEqual } from 'crypto';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
@@ -22,44 +21,23 @@ import { ChatService } from '../chat/chat.service';
 import { ProblemReportService, SUPPORT_NOTE } from '../problem-report/problem-report.service';
 import { verifyLinkeonToolToken } from './linkeon-tool.token';
 
-/**
- * Кто зовёт инструмент — по Bearer.
- *   token  — релей с токеном хода (linkeon-tool.token.ts): пользователь из подписи;
- *   shared — переходный путь: общий MCP_SECRET, пользователь из args.userId,
- *            как до 26.10.2026. Снимается шагом 4 выката (спека
- *            docs/superpowers/specs/2026-10-26-mcp-turn-token-design.md).
- */
-export type McpCaller = { kind: 'token'; userId: string } | { kind: 'shared' };
-
-/** Поле userId — только в схеме переходного пути и без примера номера. */
-const LEGACY_USER_ID_DESCRIPTION =
-  'Current user id from the system context. Required on the transitional shared-secret path — the server uses it to bill tokens and attribute history.';
-
-/**
- * Сравнение без утечки через тайминг. SHA-256 обеих строк — fixed-length
- * вход для timingSafeEqual: сами буферы `a`/`b` сравнивать нельзя, у
- * node:crypto timingSafeEqual буферы разной длины бросают RangeError, а не
- * честно отвечают «не равны».
- */
-function safeEqual(a: string, b: string): boolean {
-  const ha = createHash('sha256').update(a).digest();
-  const hb = createHash('sha256').update(b).digest();
-  return timingSafeEqual(ha, hb);
-}
+/** Кто зовёт инструмент: релей с токеном хода (linkeon-tool.token.ts), пользователь из подписи. */
+export type McpCaller = { userId: string };
 
 /**
  * Инструменты Linkeon для ассистентов релея (mcp__linkeon__*). Спека:
  * docs/superpowers/specs/2026-10-26-mcp-turn-token-design.md.
  *
- * Два адреса одной логики:
- *   • /webhook/mcp/linkeon — основной. Подпуть остаётся под глобальным
+ * Адрес:
+ *   • /webhook/mcp/linkeon — единственный адрес. Подпуть остаётся под глобальным
  *     префиксом: исключение в main.ts — ровно путь `mcp` (тот же разбор, что
  *     у /webhook/mcp/products). Доступен и на стенде, где nginx пропускает
  *     только /webhook/*.
- *   • /mcp — прежний, до снятия переходного пути (шаг 4 выката).
+ * Прежний адрес /mcp и вход по общему секрету сняты (шаг 4 выката, спека
+ * docs/superpowers/specs/2026-10-26-mcp-turn-token-design.md).
  * Сторож адресов — mcp.controller.routes.spec.ts (живое приложение Nest).
  */
-@Controller(['mcp', 'mcp/linkeon'])
+@Controller('mcp/linkeon')
 export class McpController {
   private readonly logger = new Logger(McpController.name);
 
@@ -74,51 +52,37 @@ export class McpController {
 
   /** Кто зовёт. Бросает 401 — значит звать инструмент нечем. */
   private caller(authHeader?: string): McpCaller {
-    const header = authHeader || '';
-    const shared = process.env.MCP_SECRET || '';
-    if (shared && safeEqual(header, `Bearer ${shared}`)) return { kind: 'shared' };
-    const raw = header.replace(/^Bearer\s+/i, '').trim();
+    const raw = (authHeader || '').replace(/^Bearer\s+/i, '').trim();
     if (!raw) throw new UnauthorizedException('Нет токена');
     try {
-      return { kind: 'token', userId: verifyLinkeonToolToken(raw).userId };
+      return { userId: verifyLinkeonToolToken(raw).userId };
     } catch (e: any) {
       throw new UnauthorizedException(`Токен не принят: ${e?.message}`);
     }
   }
 
   /**
-   * tools/list. По токену — схемы инструментов как есть: пользователь в
-   * подписи, аргумента userId нет. По общему секрету — прежняя схема с
-   * обязательным userId: прежний релей пишет его в аргумент.
-   * Вынесено из makeServer ради проверяемости.
+   * tools/list: схемы инструментов как есть — пользователь в подписи токена,
+   * аргумента userId нет. Вынесено из makeServer ради проверяемости.
    */
-  listTools(caller: McpCaller) {
+  listTools() {
     return CHAT_TOOLS.map((t) => {
       const schema: any = t.input_schema ?? {};
       const properties: Record<string, any> = { ...(schema.properties ?? {}) };
       const required: string[] = [...(schema.required ?? [])];
-      if (caller.kind === 'shared') {
-        return {
-          name: t.name,
-          description: t.description,
-          inputSchema: {
-            type: 'object' as const,
-            properties: { ...properties, userId: { type: 'string', description: LEGACY_USER_ID_DESCRIPTION } },
-            required: ['userId', ...required],
-          },
-        };
-      }
       return { name: t.name, description: t.description, inputSchema: { type: 'object' as const, properties, required } };
     });
   }
 
   private makeServer(authHeader?: string): Server {
-    const caller = this.caller(authHeader);
+    // Только проверка токена: без него — 401 до того, как поднимется сервер.
+    // Пользователь отсюда не нужен — callTool разбирает токен на каждый вызов.
+    this.caller(authHeader);
     const server = new Server(
       { name: 'linkeon-mcp', version: '1.0.0' },
       { capabilities: { tools: {} } },
     );
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: this.listTools(caller) }));
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: this.listTools() }));
     server.setRequestHandler(CallToolRequestSchema, async (req: any) => {
       const { name, arguments: args } = req.params ?? {};
       return this.callTool(authHeader, name, args);
@@ -131,29 +95,14 @@ export class McpController {
    * Вынесено из makeServer ради проверяемости — как в products-mcp.controller.ts.
    */
   async callTool(authHeader: string | undefined, name: string, args: any) {
-    const caller = this.caller(authHeader);
+    const { userId } = this.caller(authHeader);
     // userId из аргументов выбрасывается ЯВНО (как в products-mcp.controller.ts):
-    // по токену пользователь — только из подписи, поле модели не значит ничего.
+    // пользователь — только из подписи, поле модели не значит ничего.
     const { userId: argUserId, ...toolArgs } = args ?? {};
-    let userId: string;
-    if (caller.kind === 'token') {
-      userId = caller.userId;
-      // Строка-счётчик, без значений: видно, что релей (или старая его копия)
-      // ещё пишет userId в аргумент, но какой именно — не нужно и незачем
-      // печатать (ни пользователя из подписи, ни чужого userId из аргумента).
-      if (argUserId) this.logger.warn(`mcp: userId в аргументах проигнорирован, tool=${String(name).slice(0, 64)}`);
-    } else {
-      // Без пользователя и аргументов: по этой строке видно, что переходный
-      // путь ещё кто-то зовёт (шаг 3 выката).
-      this.logger.warn(`mcp: вызов по общему секрету (переходный путь), tool=${String(name).slice(0, 64)}`);
-      if (!argUserId) {
-        return {
-          content: [{ type: 'text' as const, text: JSON.stringify({ ok: false, error: 'userId argument required' }) }],
-          isError: true,
-        };
-      }
-      userId = String(argUserId);
-    }
+    // Строка-счётчик, без значений: видно, что релей (или старая его копия)
+    // ещё пишет userId в аргумент, но какой именно — не нужно и незачем
+    // печатать (ни пользователя из подписи, ни чужого userId из аргумента).
+    if (argUserId) this.logger.warn(`mcp: userId в аргументах проигнорирован, tool=${String(name).slice(0, 64)}`);
     this.logger.log(`tools/call ${name} userId=${userId}`);
     const result: any = await this.tools.executeTool(userId, name, toolArgs);
     const notified = !!result && result.ok === false && this.reportFailure(userId, String(name), result);

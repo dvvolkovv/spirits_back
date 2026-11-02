@@ -115,9 +115,9 @@ export function formatToolFailure(p: {
   repeats?: Repeats | null;
 }): string {
   // Имя ассистента и (для незнакомого инструмента) его имя — чужой текст:
-  // custom_agents.name пишет пользователь, а незнакомый tool на /mcp — тот,
-  // кто зовёт точку. В <b> Telegram оживляет ссылки и @упоминания, в <code> —
-  // нет, поэтому оба идут туда, а не в <b>.
+  // custom_agents.name пишет пользователь, а незнакомый tool на
+  // /webhook/mcp/linkeon — тот, кто зовёт точку. В <b> Telegram оживляет
+  // ссылки и @упоминания, в <code> — нет, поэтому оба идут туда, а не в <b>.
   const action = isKnownTool(p.tool)
     ? escapeHtml(toolAction(p.tool))
     : `выполнить <code>${escapeHtml(clip(oneLine(head(p.tool, MAX_ID)), MAX_ID))}</code>`;
