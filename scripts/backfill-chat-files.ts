@@ -2,15 +2,18 @@
 /**
  * Разовый перенос ссылок релея в истории чатов (chat-files).
  *
- * Для каждой ссылки на релей спрашивается сам релей (HEAD):
+ * Для каждой ссылки на наш релей — в любом написании адреса (схема, регистр,
+ * порт) — спрашивается сам релей (HEAD по каноническому адресу AGENT_URL):
  *   - файл жив (200) — копия в MinIO, в тексте меняется адрес (как раньше);
  *   - файла нет (404) — номер (или uuid) пользователя в папке адреса меняется
  *     на солёный хэш пользователя: ссылка остаётся мёртвой, но без номера
  *     (спека docs/superpowers/specs/2026-11-02-pii-out-of-prompts-design.md, п. 6);
  *   - релей не ответил толком — ссылка не трогается.
- * Ссылки /files/<номер>_… под чужим хостом или без хоста заведомо мёртвые —
- * номер в них на тот же солёный хэш без вопроса релею; счётчики otherRows /
- * otherOrigins / maskedOtherRows.
+ * Ссылки /files/<номер>_… под чужим хостом или без хоста наш релей не отдаёт,
+ * но того же вида бывают и живые сторонние адреса — номер в них меняется на
+ * тот же солёный хэш, только если id — владелец строки (session_id), иначе
+ * не трогаются; счётчики otherRows / otherOrigins / otherForeignSkipped /
+ * maskedOtherRows.
  * Пути на диске релея с номером (/tmp/agent-output/<номер>_…,
  * /tmp/agent-uploads/<номер>_…), которые модель повторяла в ответах, — номер
  * на тот же солёный хэш; счётчики outputPathRows / uploadPathRows /
@@ -19,7 +22,7 @@
  * живом SQL).
  *
  * Запуск — на сервере, из ~/spirits_back:
- *   npx ts-node scripts/backfill-chat-files.ts              # сухой прогон: разбивка по причинам, ничего не пишет
+ *   npx ts-node scripts/backfill-chat-files.ts              # сухой прогон: разбивка по причинам и список кандидатов в маску
  *   npx ts-node scripts/backfill-chat-files.ts --apply      # копирует живые, маскирует номер в мёртвых
  *   npx ts-node scripts/backfill-chat-files.ts --revert <журнал.jsonl>
  *
@@ -33,10 +36,12 @@
  * storedUrl, адрес без номера — maskedUrl), на чужую ссылку в строке
  * (linkFrom → linkTo) и на путь релея в строке (pathFrom → pathTo). Он же —
  * вход для --revert. Каталог
- * можно сменить через BACKFILL_JOURNAL_DIR. Список мёртвых адресов — рядом,
- * в .missing.txt, только при --apply: в нём номера, в консоль он не
- * печатается. Журнал и список — с правами 600 (umask 077); удалить их после
- * окна отката.
+ * можно сменить через BACKFILL_JOURNAL_DIR. Сухой прогон в базу не пишет, а
+ * кандидатов в маску (мёртвые 404 и чужие ссылки владельца) кладёт рядом, в
+ * .dry-run.txt, — уже с хэшем вместо id, без номеров: ложные 404 видно до
+ * --apply. Список мёртвых адресов с номерами — в .missing.txt, только при
+ * --apply; в консоль он не печатается. Все файлы — с правами 600 (umask
+ * 077); удалить их после окна отката.
  */
 import 'dotenv/config';
 import * as fs from 'fs';
@@ -48,7 +53,14 @@ import { StorageService } from '../src/common/services/storage.service';
 import { ChatFileStore } from '../src/chat/chat-files/chat-file-store';
 import { relayRequestUrl } from '../src/chat/chat-files/file-meta';
 import { relayFsKey } from '../src/chat/linkeon-relay-fields';
-import { JournalEntry, ProbeResult, revertBackfill, runBackfill, saveMissingList } from '../src/chat/chat-files/backfill';
+import {
+  JournalEntry,
+  ProbeResult,
+  revertBackfill,
+  runBackfill,
+  saveDryRunList,
+  saveMissingList,
+} from '../src/chat/chat-files/backfill';
 import { appendPrivateLine, requireRelayFsSalt, scriptErrorText } from '../src/common/one-off-script';
 
 // Журнал и список мёртвых адресов — с номерами: всё, что создаёт скрипт, —
@@ -109,10 +121,13 @@ async function main() {
       journal: (e) => appendPrivateLine(journalPath, JSON.stringify(e)),
       log: (m) => console.log(m),
     });
-    // Список пропавших — в файл, а не в консоль: там могут быть тысячи адресов,
-    // и в них номера. Только при --apply; в сухом прогоне — только счётчики.
-    const { missingUrls, ...summary } = r;
+    // Списки — в файлы, а не в консоль: там могут быть тысячи адресов. Сухой
+    // прогон — кандидаты в маску без номеров (.dry-run.txt); --apply — мёртвые
+    // адреса с номерами (.missing.txt).
+    const { missingUrls, maskCandidates, ...summary } = r;
     console.log(JSON.stringify(summary));
+    const dryRunPath = saveDryRunList(apply, journalPath, maskCandidates);
+    if (dryRunPath) console.log(`кандидатов в маску: ${maskCandidates.length}, список (без номеров): ${dryRunPath}`);
     const missingPath = saveMissingList(apply, journalPath, missingUrls);
     console.log(`не нашлось на релее: ${missingUrls.length}${missingPath ? `, список: ${missingPath}` : ''}`);
     if (apply) console.log(`журнал: ${fs.existsSync(journalPath) ? journalPath : 'пуст — менять было нечего'}`);
