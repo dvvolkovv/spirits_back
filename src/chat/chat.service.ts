@@ -465,11 +465,10 @@ export class ChatService {
 
   /**
    * Ассистент самого свежего хода этого пользователя — для подписи сообщений
-   * в поддержку (src/problem-report). Ход открыт и в пути релея, и у Маши;
-   * ключ activeTurns — `${userId}_${assistantId}`, а в userId подчёркиваний не
-   * бывает (телефон или UUID). Хода нет — null. Ход с вложениями
-   * (uploadAndChat) сюда не попадает: для него вернётся ассистент другого
-   * идущего хода этого пользователя, если такой есть, иначе null.
+   * в поддержку (src/problem-report). Ход открыт в пути релея, у Маши и у
+   * хода с вложениями (ChatController.uploadAndChat, beginUploadTurn) — все
+   * три пишут в тот же activeTurns. Ключ — `${userId}_${assistantId}`, а в
+   * userId подчёркиваний не бывает (телефон или UUID). Хода нет — null.
    */
   activeAssistantFor(userId: string): string | null {
     const prefix = `${userId}_`;
@@ -1732,6 +1731,15 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // 309k символов из 813k в замеренной сессии.
     const historyBlock = this.renderHistoryBlock(recentHistory);
 
+    // Сообщение посреди идущего хода той же пары пре-эмптит его на релее —
+    // скажем модели, что прошлая работа прервана и что с ней делать
+    // (interrupted-turn.ts). Проверка — до того, как этот ход поставит свою
+    // отметку (openTurn ниже). Пинги мониторинга и «чистый лист» — мимо: у
+    // fresh-сессии на релее свой ключ, и чужой ход она не прерывает.
+    if (!probe && !fresh && this.activeTurns.has(`${userId}_${assistantId}`)) {
+      contextPrefix += `${INTERRUPTED_TURN_NOTE}\n\n`;
+    }
+
     // Требование языка — ПОСЛЕ всех дописанных блоков, перед самой репликой.
     //
     // Директива есть и в stablePrefix (то есть в системном промпте), но за ней
@@ -1745,15 +1753,6 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // stablePrefix вместе с персоной: перенос в системный промпт вернёт их в
     // НАЧАЛО контекста, то есть ровно туда, откуда их пришлось убирать. Весят
     // они при этом гроши — 1847 символов на 44 хода в замеренной сессии.
-    //
-    // Сообщение посреди идущего хода той же пары пре-эмптит его на релее —
-    // скажем модели, что прошлая работа прервана и что с ней делать
-    // (interrupted-turn.ts). Проверка — до того, как этот ход поставит свою
-    // отметку (openTurn ниже). Пинги мониторинга и «чистый лист» — мимо: у
-    // fresh-сессии на релее свой ключ, и чужой ход она не прерывает.
-    if (!probe && !fresh && this.activeTurns.has(`${userId}_${assistantId}`)) {
-      contextPrefix += `${INTERRUPTED_TURN_NOTE}\n\n`;
-    }
     contextPrefix += `${MEETING_HONESTY_RULE}\n\n`;
     contextPrefix += `${RESPONSE_STYLE_RULE}\n\n`;
 
