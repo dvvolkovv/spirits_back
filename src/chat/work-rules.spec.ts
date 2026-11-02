@@ -93,3 +93,60 @@ describe('WORK_RULES в стабильной части промпта реле�
     expect(prefix.indexOf(WORK_RULES)).toBeLessThan(prefix.indexOf('ПРОФИЛЬ-МАРКЕР'));
   });
 });
+
+describe('buildRelayStablePrefix — сторож размера (ревью)', () => {
+  // WORK_RULES держит СВОЙ бюджет (≤ 6 КБ, тест выше), но весь stablePrefix —
+  // это ещё и персона ассистента, коллеги, профиль, бизнес-карточка: по
+  // кускам они могут раздуть префикс незаметно, а он уходит релею ОДНИМ
+  // аргументом CLI (предел 128 КБ). 100 000 байт — заранее, с запасом.
+  function makeSvc() {
+    const pg = { query: jest.fn(async () => ({ rows: [] })) };
+    const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
+    return new ChatService(pg as any, null as any, null as any, null as any, language as any, undefined as any);
+  }
+
+  it('выше 100 000 байт — предупреждение в лог: длина, agentId, признак custom — без текста промпта', async () => {
+    const svc = makeSvc();
+    const warn = jest.spyOn((svc as any).logger, 'warn');
+    // Огромный system_prompt ассистента — самый простой способ раздуть
+    // префикс без похода в профиль или бизнес-карточку.
+    const hugePrompt = 'x'.repeat(110_000);
+    const prefix: string = await (svc as any).buildRelayStablePrefix({
+      agentId: '12', agentName: 'Роман', agentDescription: '', agentSystemPrompt: hugePrompt,
+      userId: 'u1', userLanguage: 'ru',
+    });
+    expect(Buffer.byteLength(prefix, 'utf8')).toBeGreaterThan(100_000);
+
+    const call = warn.mock.calls.find((c) => /buildRelayStablePrefix/.test(String(c[0])));
+    expect(call).toBeDefined();
+    const logged = String(call![0]);
+    expect(logged).toContain('12');
+    // Длина — числом в сообщении, а не содержимое самого промпта (личные
+    // данные профиля и бизнес-карточки в нём тоже могут быть).
+    expect(logged).not.toContain(hugePrompt);
+  });
+
+  it('пользовательский ассистент, выше предела — отметка custom в предупреждении', async () => {
+    const svc = makeSvc();
+    const warn = jest.spyOn((svc as any).logger, 'warn');
+    const hugePrompt = 'x'.repeat(110_000);
+    await (svc as any).buildRelayStablePrefix({
+      agentId: 'custom:6f1c2b9e-0000-4000-8000-000000000000', agentName: 'Мой помощник',
+      agentDescription: '', agentSystemPrompt: hugePrompt, userId: 'u1', userLanguage: 'ru',
+    });
+    const call = warn.mock.calls.find((c) => /buildRelayStablePrefix/.test(String(c[0])));
+    expect(call).toBeDefined();
+    expect(String(call![0])).toContain('custom');
+  });
+
+  it('ниже предела (обычный ассистент) — предупреждения нет', async () => {
+    const svc = makeSvc();
+    const warn = jest.spyOn((svc as any).logger, 'warn');
+    await (svc as any).buildRelayStablePrefix({
+      agentId: '12', agentName: 'Роман', agentDescription: '', agentSystemPrompt: 'Ты ассистент.',
+      userId: 'u1', userLanguage: 'ru',
+    });
+    const call = warn.mock.calls.find((c) => /buildRelayStablePrefix/.test(String(c[0])));
+    expect(call).toBeUndefined();
+  });
+});
