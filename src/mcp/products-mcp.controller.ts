@@ -36,7 +36,7 @@ import { ProblemReportService } from '../problem-report/problem-report.service';
 import { REPORT_PROBLEM_TOOL, REPORT_PROBLEM_TOOL_NAME } from '../problem-report/report-problem.tool';
 
 /**
- * Отдельная точка, а не ветка в /mcp, СОЗНАТЕЛЬНО.
+ * Отдельная точка, а не ветка в общей (mcp.controller.ts), СОЗНАТЕЛЬНО.
  *
  * РЕАЛЬНЫЙ АДРЕС — `/webhook/mcp/products`, а не `/mcp/products`: исключение в
  * main.ts выводит из-под глобального префикса ровно путь `mcp`, но не его
@@ -45,8 +45,7 @@ import { REPORT_PROBLEM_TOOL, REPORT_PROBLEM_TOOL_NAME } from '../problem-report
  * Сторож адреса — в products-mcp.controller.spec.ts.
  *
  * На общей точке (mcp.controller.ts) пользователь определяется подписью
- * токена хода, как здесь; на переходном пути по общему секрету — полем
- * запроса, которое пишет модель.
+ * токена хода (src/mcp/linkeon-tool.token.ts), как здесь, а общий секрет снят.
  *
  * Здесь Bearer — подписанный нами токен сессии с userId внутри, поэтому
  * принадлежность закрыта ПОДПИСЬЮ, а не проверкой: аргумента userId у
