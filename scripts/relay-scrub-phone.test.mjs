@@ -725,3 +725,238 @@ test("прерывание: при поднятом сигнале ничего 
   assert.equal(s.written, 0);
   assert.deepEqual(state(w.base), before);
 });
+
+// ---------------------------------------------------------------- запуск
+
+const SCRIPT = fileURLToPath(new URL("./relay-scrub-phone.mjs", import.meta.url));
+const cliArgs = (w, extra = []) => [
+  "--root", w.root, "--sessions", w.sessionsPath, "--outputs", w.out, "--uploads", w.up,
+  "--fs-key-map", w.mapPath, "--state", w.statePath, ...extra,
+];
+const cli = (args, env = {}) =>
+  spawnSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8", env: { ...process.env, ...env } });
+// На релей скрипт едет через stdin: ssh … 'node --input-type=module - <флаги>' < scripts/relay-scrub-phone.mjs.
+// Тогда argv[1] — "-", а import.meta.url — не путь к файлу.
+const viaStdin = (args, { input = fs.readFileSync(SCRIPT), env = {} } = {}) =>
+  spawnSync(process.execPath, ["--input-type=module", "-", ...args], { input, encoding: "utf8", env: { ...process.env, ...env } });
+const noPhones = (text) => !text.includes(PHONE) && !text.includes(OTHER);
+
+test("CLI: без --apply — сухой прогон: все счётчики, ни одного номера в выводе, на диске ничего не меняется", (t) => {
+  const { w } = fullWorld(t);
+  const before = state(w.base);
+
+  const r = cli(cliArgs(w));
+  assert.equal(r.status, 0, r.stderr);
+  for (const re of [
+    /сухой прогон/,
+    /^номеров: 2$/m,
+    /^сессий: 7 \(без номера: 1\)$/m,
+    /^fs_key: из карты 3, из транскрипта 1 \(совпало с картой 1\), без fs_key 1, расхождений 1$/m,
+    /^свежих: 1\b/m,
+    /^без транскрипта: 0$/m,
+    /^папок к переносу: 3, записей в них: 5, загрузок: 4, конфликтов имён: 3$/m,
+    /^замен в транскриптах: фраза 4, пути папок 7, пути загрузок 3, прочие 1; транскриптов к записи: 4$/m,
+    /^транскриптов с номерами других пользователей: 1$/m,
+    /^сирот: 2, из них с номером: 1; папок без сессии: 1; загрузок без сессии: 1$/m,
+    /^карта fs_key: .+, строк с ошибкой: 1$/m,
+    /^ошибок: 0$/m,
+  ]) assert.match(r.stdout, re);
+  assert.doesNotMatch(r.stdout, /переписано/);
+  assert.ok(noPhones(r.stdout + r.stderr));
+  assert.deepEqual(state(w.base), before);
+
+  const all = cli(cliArgs(w, ["--min-age-min", "0"]));
+  assert.match(all.stdout, /^свежих: 0$/m, "порог свежести задаётся флагом");
+});
+
+test("CLI через stdin (так скрипт едет на релей): --apply, журнал в домашнем каталоге 600, повторный сухой прогон — ноль", (t) => {
+  const { w } = fullWorld(t);
+
+  const r = viaStdin(cliArgs(w, ["--apply"]), { env: { HOME: w.home } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^переписано транскриптов: 4; перенесено записей: 5, загрузок: 4; удалено старых папок: 3, осталось непустых: 0$/m);
+  const journals = fs.readdirSync(w.home).filter((n) => /^relay-scrub-phone-.+\.jsonl$/.test(n));
+  assert.equal(journals.length, 1);
+  const journalPath = path.join(w.home, journals[0]);
+  assert.ok(r.stdout.includes("журнал: " + journalPath), r.stdout);
+  assert.equal(fs.statSync(journalPath).mode & 0o777, 0o600);
+  assert.ok(noPhones(r.stdout + r.stderr + fs.readFileSync(journalPath, "utf8")));
+
+  const again = viaStdin(cliArgs(w));
+  assert.equal(again.status, 0, again.stderr);
+  assert.match(again.stdout, /^папок к переносу: 0, записей в них: 0, загрузок: 0, конфликтов имён: 0$/m);
+  assert.match(again.stdout, /транскриптов к записи: 0$/m);
+});
+
+test("импорт модуля из кода, пришедшего через stdin, сам проход не запускает", () => {
+  const r = viaStdin(["--root", "/нет/такого/каталога"], {
+    input: "await import(" + JSON.stringify(pathToFileURL(SCRIPT).href) + "); console.log('импортирован');",
+  });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout.trim(), "импортирован");
+});
+
+test("CLI --finish: пока есть работа — код 1 и всё на месте; после прохода — удаляет таблицу и карту, код 0", (t) => {
+  const w = relayWorld(t);
+  sessionA(w);
+
+  const early = cli(cliArgs(w, ["--finish"]));
+  assert.equal(early.status, 1, early.stdout + early.stderr);
+  assert.match(early.stdout, /не всё сделано/);
+  assert.ok(fs.existsSync(w.mapPath));
+
+  assert.equal(cli(cliArgs(w, ["--apply", "--journal", w.journalPath])).status, 0);
+  const done = cli(cliArgs(w, ["--finish"]));
+  assert.equal(done.status, 0, done.stdout + done.stderr);
+  assert.match(done.stdout, /делать больше нечего/);
+  assert.ok(!fs.existsSync(w.mapPath) && !fs.existsSync(w.statePath));
+  assert.ok(noPhones(early.stdout + early.stderr + done.stdout + done.stderr));
+});
+
+test("CLI: ошибки запуска — код 2 и ничего не тронуто; --help — код 0", (t) => {
+  const { w } = fullWorld(t);
+  const before = state(w.base);
+  const cases = [
+    cliArgs(w, ["--bogus"]),
+    cliArgs(w, ["лишний-аргумент"]),
+    cliArgs(w, ["--min-age-min", "abc"]),
+    cliArgs(w, ["--min-age-min", "-1"]),
+    cliArgs(w, ["--finish", "--apply"]),
+    cliArgs(w, ["--apply", "--journal", path.join(w.base, "нет-каталога", "j.jsonl")]),
+    ["--root", w.root, "--sessions", path.join(w.base, "нет.json"), "--outputs", w.out, "--uploads", w.up, "--state", w.statePath],
+  ];
+  for (const args of cases) {
+    const r = cli(args);
+    assert.equal(r.status, 2, args.join(" ") + "\n" + r.stdout + r.stderr);
+    assert.ok(r.stderr.length > 0);
+  }
+  fs.chmodSync(w.mapPath, 0o640); // карту с номерами видит группа — не работаем
+  const open = cli(cliArgs(w));
+  assert.equal(open.status, 2);
+  assert.match(open.stderr, /chmod 600/);
+  fs.chmodSync(w.mapPath, 0o600);
+  assert.deepEqual(state(w.base), before);
+
+  const help = cli(["--help"]);
+  assert.equal(help.status, 0);
+  assert.match(help.stdout, /--fs-key-map/);
+});
+
+test(
+  "CLI: ошибка на сессии — код 1, в stderr файл транскрипта и код ошибки, без номера",
+  { skip: process.getuid?.() === 0 && "root читает и файл с правами 000" },
+  (t) => {
+    const w = relayWorld(t);
+    sessionA(w);
+    const key = PHONE + "_21_ru";
+    const bad = addSession(w, key, [preTurn(w, key, "Ход")]);
+    fs.chmodSync(bad.file, 0o000);
+
+    const r = cli(cliArgs(w));
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stdout, /^ошибок: 1$/m);
+    assert.ok(r.stderr.includes("ошибка: " + bad.rel + ": EACCES"), r.stderr);
+    assert.ok(noPhones(r.stdout + r.stderr));
+  },
+);
+
+test("CLI: Ctrl+C — текущая сессия доделывается, проход останавливается; полусделанных сессий нет, код 130", async (t) => {
+  const w = relayWorld(t);
+  const filler = assistant("ответ ".repeat(300));
+  const list = [];
+  for (let i = 0; i < 150; i++) {
+    const key = PHONE + "_" + (100 + i) + "_ru";
+    put(w.out, key + "/f.txt", "f" + i);
+    list.push(addSession(w, key, [preTurn(w, key, "Ход " + i), ...Array(100).fill(filler)]));
+  }
+
+  const child = spawn(process.execPath, [SCRIPT, ...cliArgs(w, ["--apply", "--journal", w.journalPath])], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  child.stdout.on("data", (d) => (stdout += d));
+  const closed = new Promise((resolve) => child.on("close", (code, signal) => resolve({ code, signal })));
+  // Сигнал — когда в журнале появилась первая запись: проход точно идёт.
+  const deadline = Date.now() + 30_000;
+  while (!(fs.existsSync(w.journalPath) && fs.statSync(w.journalPath).size > 0)) {
+    assert.ok(Date.now() < deadline, "журнал не появился");
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  child.kill("SIGINT");
+  const { code, signal } = await closed;
+
+  assert.equal(signal, null, "процесс не убит сигналом, а завершился сам");
+  assert.equal(code, 130);
+  assert.match(stdout, /ПРЕРВАНО/);
+  const done = new Set(fs.readFileSync(w.journalPath, "utf8").trim().split("\n").map((l) => JSON.parse(l).transcript));
+  assert.ok(done.size >= 1 && done.size < list.length, "сделано " + done.size);
+  for (const x of list) {
+    const moved = !exists(w.out, x.key);
+    const clean = !fs.readFileSync(x.file, "utf8").includes(PHONE);
+    assert.equal(moved, clean, x.rel + ": папка и транскрипт — вместе");
+    assert.equal(done.has(x.rel), clean, x.rel + ": журнал совпадает с диском");
+  }
+  assert.deepEqual(fs.readdirSync(path.join(w.root, "-tmp")).filter((n) => n.startsWith(".")), [], "временных файлов нет");
+});
+
+// ---------------------------------------------------------------- объём
+
+// Транскрипт около 1 МБ: каждая четвёртая строка — реплика с фразой.
+function bigTranscript() {
+  const rows = [];
+  let size = 0;
+  for (let i = 0; size < 1024 * 1024; i++) {
+    const row = JSON.stringify(i % 4 === 0 ? user(turn("вопрос " + i)) : assistant("ответ ".repeat(200) + i));
+    rows.push(row);
+    size += Buffer.byteLength(row) + 1;
+  }
+  return Buffer.from(rows.join("\n") + "\n");
+}
+
+test("200 сессий по 1 МБ транскрипта: меньше минуты, в памяти — текущая сессия, после прохода ничего не копится", (t) => {
+  const w = relayWorld(t);
+  const content = bigTranscript();
+  const perFile = content.toString("utf8").split(OLD()).length - 1;
+  for (let i = 0; i < 200; i++) {
+    const key = PHONE + "_" + (300 + i) + "_ru";
+    put(w.out, key + "/f.txt", "f");
+    put(w.up, key + "_u.pdf", "u");
+    const cliId = randomUUID();
+    w.sessions[key] = cliId;
+    w.map.set(key, fsKeyOf(key));
+    put(w.root, "-tmp/" + cliId + ".jsonl", content);
+  }
+  saveWorld(w);
+
+  // Отдельный процесс с --expose-gc: память меряется после сборки мусора —
+  // то, что удержано, а не то, что ещё не собрано.
+  const driver = [
+    "const { runScrub } = await import(process.env.SCRUB_MODULE);",
+    "const mem = () => { const u = process.memoryUsage(); return u.heapUsed + u.arrayBuffers; };",
+    "gc(); const base = mem(); let peak = base;",
+    "const timer = setInterval(() => { gc(); peak = Math.max(peak, mem()); }, 20);",
+    "const t0 = performance.now();",
+    "const summary = await runScrub(JSON.parse(process.env.SCRUB_OPTS));",
+    "const ms = performance.now() - t0;",
+    "clearInterval(timer); gc(); const after = mem();",
+    "const MB = 2 ** 20;",
+    "process.stdout.write(JSON.stringify({ ms, peakMb: (peak - base) / MB, leakMb: (after - base) / MB, summary }));",
+  ].join("\n");
+  const r = spawnSync(process.execPath, ["--expose-gc", "--input-type=module", "-e", driver], {
+    encoding: "utf8",
+    timeout: 180_000,
+    env: { ...process.env, SCRUB_MODULE: pathToFileURL(SCRIPT).href, SCRUB_OPTS: JSON.stringify(runOpts(w, { apply: true })) },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const m = JSON.parse(r.stdout);
+  t.diagnostic(
+    `200 × ${(content.length / 2 ** 20).toFixed(2)} МБ, ${perFile} фраз в транскрипте: ` +
+      `${(m.ms / 1000).toFixed(1)} с; удержано в пике ${m.peakMb.toFixed(1)} МБ, после прохода ${m.leakMb.toFixed(1)} МБ`,
+  );
+  assert.deepEqual(pick(m.summary, "written", "moved", "movedUploads", "errors", "nonCanonicalLines"),
+    { written: 200, moved: 200, movedUploads: 200, errors: 0, nonCanonicalLines: 0 });
+  assert.equal(m.summary.repl.phrase, 200 * perFile);
+  assert.ok(m.ms < 60_000, "проход занял " + Math.round(m.ms) + " мс");
+  assert.ok(m.peakMb < 64, "в пике удержано " + m.peakMb.toFixed(1) + " МБ — транскрипты копятся в памяти");
+  assert.ok(m.leakMb < 16, "после прохода удержано " + m.leakMb.toFixed(1) + " МБ");
+});
