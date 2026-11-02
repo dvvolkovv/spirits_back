@@ -119,6 +119,11 @@ function scrubLine(lineBuf) {
   return res;
 }
 
+// Правила транскрипта одной сессии — заготовка интерфейса.
+export function sessionRules() {
+  throw new Error("не реализовано");
+}
+
 // Содержимое файла целиком. out === null — замен нет, файл писать не нужно.
 // Строки без замены попадают в out исходными байтами.
 export function scrubContent(buf) {
