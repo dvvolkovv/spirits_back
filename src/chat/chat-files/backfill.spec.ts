@@ -1,18 +1,37 @@
 // src/chat/chat-files/backfill.spec.ts
-import { BACKFILL_FILE_TIMEOUT_MS, JournalEntry, SELECT_BACKFILL_ROWS_SQL, revertBackfill, runBackfill } from './backfill';
+import {
+  BACKFILL_FILE_TIMEOUT_MS,
+  JournalEntry,
+  ProbeResult,
+  SELECT_BACKFILL_ROWS_SQL,
+  maskRelayUrl,
+  revertBackfill,
+  runBackfill,
+} from './backfill';
 
 const AGENT = 'https://r.linkeon.io';
+/** Папка без идентификатора пользователя — маскировать нечего. */
 const R = `${AGENT}/files/u1_12_ru`;
+/** Папка релея до 26.10.2026: ключ сессии, у телефонных — с номером. */
+const P = `${AGENT}/files/70000000000_12_ru`;
+/** Солёный хэш пользователя — в тестах постоянный. */
+const FK = 'ab'.repeat(16);
+const fsKey = (id: string) => (id ? FK : undefined);
 
 /** Таблица в памяти: SELECT по шаблону, UPDATE с проверкой прежнего текста. */
-function makePg(rows: { id: number; content: string }[]) {
+function makePg(rows: { id: number; content: string; sender_type?: string }[]) {
   const table = new Map(rows.map((r) => [r.id, r.content]));
+  const sender = new Map(rows.map((r) => [r.id, r.sender_type ?? 'ai']));
   const calls: { sql: string; params: any[] }[] = [];
   const query = jest.fn(async (sql: string, params: any[] = []) => {
     calls.push({ sql, params });
     if (sql === SELECT_BACKFILL_ROWS_SQL) {
       const like = String(params[0]).replace(/%/g, '');
-      return { rows: [...table].filter(([, c]) => c.includes(like)).map(([id, content]) => ({ id, content })) };
+      return {
+        rows: [...table]
+          .filter(([, c]) => c.includes(like))
+          .map(([id, content]) => ({ id, content, sender_type: sender.get(id) })),
+      };
     }
     if (/^UPDATE custom_chat_history/.test(sql)) {
       const [next, id, prev] = params;
@@ -29,42 +48,134 @@ function makePg(rows: { id: number; content: string }[]) {
   return { query, calls, table };
 }
 
-const stored = (u: string) => u.replace(R, 'https://pub/linkeon-chat-files/id');
+const stored = (u: string) => u.replace(/^https:\/\/r\.linkeon\.io\/files\/[^/]+/, 'https://pub/linkeon-chat-files/id');
+const probeBy = (map: Record<string, ProbeResult>) => async (u: string): Promise<ProbeResult> =>
+  map[u.slice(u.lastIndexOf('/') + 1)] ?? 'unknown';
+const updates = (pg: ReturnType<typeof makePg>) => pg.calls.filter((c) => /^UPDATE/.test(c.sql));
+
+describe('maskRelayUrl', () => {
+  it('номер в папке — на солёный хэш пользователя, остальное как было', () => {
+    expect(maskRelayUrl(`${P}/a.pdf`, AGENT, fsKey)).toBe(`${AGENT}/files/${FK}_12_ru/a.pdf`);
+  });
+
+  it('идентификатор пользователя почты (uuid) — тоже', () => {
+    const uuid = 'aaaaaaaa-0000-4000-8000-000000000001';
+    expect(maskRelayUrl(`${AGENT}/files/${uuid}_17_en/x/b.docx`, AGENT, fsKey)).toBe(`${AGENT}/files/${FK}_17_en/x/b.docx`);
+  });
+
+  it('папка без идентификатора (fs_key, служебная сессия) — null', () => {
+    expect(maskRelayUrl(`${AGENT}/files/${'cd'.repeat(16)}/a.pdf`, AGENT, fsKey)).toBeNull();
+    expect(maskRelayUrl(`${R}/a.pdf`, AGENT, fsKey)).toBeNull();
+    expect(maskRelayUrl(`${AGENT}/files/voice_12_1/a.pdf`, AGENT, fsKey)).toBeNull();
+  });
+
+  it('чужой адрес и номер не в начале папки — null', () => {
+    expect(maskRelayUrl('https://example.com/files/70000000000_12_ru/a.pdf', AGENT, fsKey)).toBeNull();
+    expect(maskRelayUrl(`${AGENT}/files/x70000000000_12_ru/a.pdf`, AGENT, fsKey)).toBeNull();
+  });
+
+  it('без соли (fsKey ничего не дал) — null', () => {
+    expect(maskRelayUrl(`${P}/a.pdf`, AGENT, () => undefined)).toBeNull();
+  });
+});
 
 describe('runBackfill', () => {
-  it('выборка: только ответы ассистента старше часа', () => {
-    expect(SELECT_BACKFILL_ROWS_SQL).toMatch(/sender_type = 'ai'/);
+  it('выборка: ответы ассистента и реплики человека старше часа', () => {
+    expect(SELECT_BACKFILL_ROWS_SQL).not.toMatch(/sender_type = 'ai'/);
+    expect(SELECT_BACKFILL_ROWS_SQL).toMatch(/sender_type/);
     expect(SELECT_BACKFILL_ROWS_SQL).toMatch(/created_at < now\(\) - interval '1 hour'/);
   });
 
-  it('сухой прогон ничего не пишет и считает живые по probe', async () => {
-    const pg = makePg([{ id: 1, content: `[Скачать a.pdf](${R}/a.pdf)\n[Скачать b.pdf](${R}/b.pdf)` }]);
+  it('сухой прогон ничего не пишет и раскладывает адреса по ответу релея', async () => {
+    const pg = makePg([
+      { id: 1, content: `[Скачать a.pdf](${P}/a.pdf)\n[Скачать b.pdf](${P}/b.pdf)\n[Скачать c.pdf](${P}/c.pdf)` },
+      { id: 2, content: `не открывается ${P}/b.pdf`, sender_type: 'human' },
+      { id: 3, content: `[Скачать d.pdf](${R}/d.pdf)` },
+    ]);
     const store = { persist: jest.fn() };
+
     const r = await runBackfill({
-      pg, store, agentUrl: AGENT, apply: false,
-      probe: async (u) => u.endsWith('a.pdf'), journal: jest.fn(), log: jest.fn(),
+      pg, store, agentUrl: AGENT, apply: false, fsKey,
+      probe: probeBy({ 'a.pdf': 'alive', 'b.pdf': 'missing', 'c.pdf': 'unknown', 'd.pdf': 'missing' }),
+      journal: jest.fn(), log: jest.fn(),
     });
 
-    expect(r).toMatchObject({ rows: 1, urls: 2, alive: 1, missing: 1, updatedRows: 0, missingUrls: [`${R}/b.pdf`] });
+    expect(r).toMatchObject({
+      rows: 3, humanRows: 1, urls: 4, alive: 1, missing: 2, unknown: 1, maskable: 1,
+      updatedRows: 0, copied: 0, masked: 0,
+    });
+    expect(r.missingUrls.sort()).toEqual([`${P}/b.pdf`, `${R}/d.pdf`]);
     expect(store.persist).not.toHaveBeenCalled();
-    expect(pg.calls.some((c) => /^UPDATE/.test(c.sql))).toBe(false);
+    expect(updates(pg)).toEqual([]);
   });
 
-  it('--apply меняет только скопированные адреса и пишет журнал', async () => {
-    const pg = makePg([{ id: 1, content: `[Скачать a.pdf](${R}/a.pdf) и [Скачать gone.pdf](${R}/gone.pdf)` }]);
-    const store = { persist: jest.fn(async (urls: string[]) => new Map(urls.filter((u) => !u.endsWith('gone.pdf')).map((u) => [u, stored(u)]))) };
+  it('--apply: живые — в хранилище, как раньше; файла нет — номер в адресе на fsKey; журнал на обе замены', async () => {
+    const pg = makePg([{ id: 1, content: `[Скачать a.pdf](${P}/a.pdf) и [Скачать gone.pdf](${P}/gone.pdf)` }]);
+    const store = { persist: jest.fn(async (urls: string[]) => new Map(urls.map((u) => [u, stored(u)]))) };
     const journal: JournalEntry[] = [];
 
-    const r = await runBackfill({ pg, store, agentUrl: AGENT, apply: true, probe: jest.fn(), journal: (e) => journal.push(e), log: jest.fn() });
+    const r = await runBackfill({
+      pg, store, agentUrl: AGENT, apply: true, fsKey,
+      probe: probeBy({ 'a.pdf': 'alive', 'gone.pdf': 'missing' }),
+      journal: (e) => journal.push(e), log: jest.fn(),
+    });
 
-    expect(store.persist).toHaveBeenCalledWith([`${R}/a.pdf`, `${R}/gone.pdf`], { budgetMs: Infinity, fileTimeoutMs: BACKFILL_FILE_TIMEOUT_MS });
-    expect(pg.table.get(1)).toBe(`[Скачать a.pdf](https://pub/linkeon-chat-files/id/a.pdf) и [Скачать gone.pdf](${R}/gone.pdf)`);
-    expect(journal).toEqual([{ rowId: 1, relayUrl: `${R}/a.pdf`, storedUrl: 'https://pub/linkeon-chat-files/id/a.pdf' }]);
-    expect(r).toMatchObject({ updatedRows: 1, skippedRows: 0, alive: 1, missing: 1, missingUrls: [`${R}/gone.pdf`] });
+    // Копируются только живые.
+    expect(store.persist).toHaveBeenCalledWith([`${P}/a.pdf`], { budgetMs: Infinity, fileTimeoutMs: BACKFILL_FILE_TIMEOUT_MS });
+    expect(pg.table.get(1)).toBe(
+      `[Скачать a.pdf](https://pub/linkeon-chat-files/id/a.pdf) и [Скачать gone.pdf](${AGENT}/files/${FK}_12_ru/gone.pdf)`,
+    );
+    expect(pg.table.get(1)).not.toContain('70000000000');
+    expect(journal).toEqual([
+      { rowId: 1, relayUrl: `${P}/a.pdf`, storedUrl: 'https://pub/linkeon-chat-files/id/a.pdf' },
+      { rowId: 1, relayUrl: `${P}/gone.pdf`, maskedUrl: `${AGENT}/files/${FK}_12_ru/gone.pdf` },
+    ]);
+    expect(r).toMatchObject({ updatedRows: 1, skippedRows: 0, alive: 1, missing: 1, copied: 1, masked: 1 });
+  });
+
+  it('релей не ответил или копия не удалась — ссылка остаётся как была', async () => {
+    const content = `[Скачать a.pdf](${P}/a.pdf)\n[Скачать c.pdf](${P}/c.pdf)`;
+    const pg = makePg([{ id: 1, content }]);
+    const store = { persist: jest.fn(async () => new Map<string, string>()) };
+
+    const r = await runBackfill({
+      pg, store, agentUrl: AGENT, apply: true, fsKey,
+      probe: probeBy({ 'a.pdf': 'alive', 'c.pdf': 'unknown' }),
+      journal: jest.fn(), log: jest.fn(),
+    });
+
+    expect(pg.table.get(1)).toBe(content);
+    expect(r).toMatchObject({ updatedRows: 0, copied: 0, masked: 0, unknown: 1 });
+  });
+
+  it('файла нет, но в папке нет идентификатора — ссылка остаётся', async () => {
+    const content = `[Скачать d.pdf](${R}/d.pdf)`;
+    const pg = makePg([{ id: 1, content }]);
+
+    const r = await runBackfill({
+      pg, store: { persist: jest.fn(async () => new Map()) }, agentUrl: AGENT, apply: true, fsKey,
+      probe: probeBy({ 'd.pdf': 'missing' }), journal: jest.fn(), log: jest.fn(),
+    });
+
+    expect(pg.table.get(1)).toBe(content);
+    expect(r).toMatchObject({ missing: 1, maskable: 0, masked: 0, updatedRows: 0 });
+  });
+
+  it('без fsKey номер не маскируется — только копии, как раньше', async () => {
+    const content = `[Скачать gone.pdf](${P}/gone.pdf)`;
+    const pg = makePg([{ id: 1, content }]);
+
+    const r = await runBackfill({
+      pg, store: { persist: jest.fn(async () => new Map()) }, agentUrl: AGENT, apply: true,
+      probe: probeBy({ 'gone.pdf': 'missing' }), journal: jest.fn(), log: jest.fn(),
+    });
+
+    expect(pg.table.get(1)).toBe(content);
+    expect(r).toMatchObject({ missing: 1, maskable: 0, masked: 0 });
   });
 
   it('строку изменили во время переноса — она пропускается, журнала нет', async () => {
-    const pg = makePg([{ id: 1, content: `[Скачать a.pdf](${R}/a.pdf)` }]);
+    const pg = makePg([{ id: 1, content: `[Скачать a.pdf](${P}/a.pdf)` }]);
     const store = {
       persist: jest.fn(async (urls: string[]) => {
         pg.table.set(1, 'переписано пользователем');
@@ -73,7 +184,9 @@ describe('runBackfill', () => {
     };
     const journal = jest.fn();
 
-    const r = await runBackfill({ pg, store, agentUrl: AGENT, apply: true, probe: jest.fn(), journal, log: jest.fn() });
+    const r = await runBackfill({
+      pg, store, agentUrl: AGENT, apply: true, fsKey, probe: probeBy({ 'a.pdf': 'alive' }), journal, log: jest.fn(),
+    });
 
     expect(r).toMatchObject({ updatedRows: 0, skippedRows: 1 });
     expect(journal).not.toHaveBeenCalled();
@@ -81,27 +194,36 @@ describe('runBackfill', () => {
   });
 
   it('повторный запуск — ноль замен', async () => {
-    const pg = makePg([{ id: 1, content: `[Скачать a.pdf](${R}/a.pdf)` }]);
+    const pg = makePg([{ id: 1, content: `[Скачать a.pdf](${P}/a.pdf) [Скачать gone.pdf](${P}/gone.pdf)` }]);
     const store = { persist: jest.fn(async (urls: string[]) => new Map(urls.map((u) => [u, stored(u)]))) };
-    const args = { pg, store, agentUrl: AGENT, apply: true, probe: jest.fn(), journal: jest.fn(), log: jest.fn() };
+    // Замаскированный адрес релей тоже не знает — для него тот же ответ «нет файла».
+    const probe = async (u: string): Promise<ProbeResult> => (u.endsWith('a.pdf') ? 'alive' : 'missing');
+    const args = { pg, store, agentUrl: AGENT, apply: true, fsKey, probe, journal: jest.fn(), log: jest.fn() };
 
     await runBackfill(args);
+    const first = pg.table.get(1);
     const second = await runBackfill(args);
 
-    expect(second).toMatchObject({ rows: 0, urls: 0, updatedRows: 0 });
+    expect(second).toMatchObject({ updatedRows: 0, copied: 0, masked: 0 });
+    expect(pg.table.get(1)).toBe(first);
   });
 });
 
 describe('revertBackfill', () => {
-  it('возвращает адреса релея по журналу', async () => {
-    const pg = makePg([{ id: 1, content: '[Скачать a.pdf](https://pub/linkeon-chat-files/id/a.pdf)' }]);
+  it('возвращает адреса релея по журналу — и копии, и замены номера', async () => {
+    const pg = makePg([
+      { id: 1, content: `[Скачать a.pdf](https://pub/linkeon-chat-files/id/a.pdf) [Скачать gone.pdf](${AGENT}/files/${FK}_12_ru/gone.pdf)` },
+    ]);
     const r = await revertBackfill({
       pg,
-      entries: [{ rowId: 1, relayUrl: `${R}/a.pdf`, storedUrl: 'https://pub/linkeon-chat-files/id/a.pdf' }],
+      entries: [
+        { rowId: 1, relayUrl: `${P}/a.pdf`, storedUrl: 'https://pub/linkeon-chat-files/id/a.pdf' },
+        { rowId: 1, relayUrl: `${P}/gone.pdf`, maskedUrl: `${AGENT}/files/${FK}_12_ru/gone.pdf` },
+      ],
       log: jest.fn(),
     });
 
     expect(r).toEqual({ reverted: 1, skipped: 0 });
-    expect(pg.table.get(1)).toBe(`[Скачать a.pdf](${R}/a.pdf)`);
+    expect(pg.table.get(1)).toBe(`[Скачать a.pdf](${P}/a.pdf) [Скачать gone.pdf](${P}/gone.pdf)`);
   });
 });
