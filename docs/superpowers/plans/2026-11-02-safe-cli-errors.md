@@ -95,6 +95,8 @@ ssh -n dv@85.192.61.231 "cd ~/ci/wt/sce-back && git fetch -q origin && git check
 
 ---
 
-## База (Task 0)
+## База (Task 0, снята 02.11 на 0b5cf878 + спека)
 
-(заполняется)
+- `npx jest src/common src/insights src/monitoring src/tg-bot src/chat src/guest-trial`: Test Suites 186 passed, 10 skipped; Tests 2479 passed, 71 skipped.
+- `npx tsc -p tsconfig.build.json --noEmit`: TSC_OK.
+- Воркдерево на ноде `~/ci/wt/sce-back` создано (npm ci, tests/npm ci).
