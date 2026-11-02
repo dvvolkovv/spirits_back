@@ -1155,7 +1155,7 @@ export class ChatService {
         const noTokensMsg = await this.noTokensReply(userId, requestLang, { storeBuild });
         res.write(JSON.stringify({ type: 'begin' }) + '\n');
         res.write(JSON.stringify({ type: 'item', content: noTokensMsg }) + '\n');
-        // reason: 'no_tokens' — старые клиенты лишнее поле в event molчa
+        // reason: 'no_tokens' — старые клиенты лишнее поле в событии молча
         // игнорируют; новым и e2e/мониторингу есть за что зацепиться без
         // разбора текста (находка ревью качества 02.11, S1).
         res.write(JSON.stringify({ type: 'end', content: noTokensMsg, reason: 'no_tokens', usage: { input: 0, output: 0, total: 0 } }) + '\n');
