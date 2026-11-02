@@ -46,17 +46,22 @@ const TG_PHOTO_MAX_BYTES = 10 * 1024 * 1024;
 const sharp = require('sharp') as unknown as typeof import('sharp/lib/index');
 
 /**
- * Ответ на {{file: url=…}} — текст (HTML-страница), а не файл? Относительный
- * путь со страницы own-media.ts достраивает НАШИМ доменом (toAbsoluteUrl), и
- * SPA на любой несуществующий путь отвечает 200 text/html; ссылка на страницу
+ * Ответ на {{file: url=…}} — HTML-страница, а не файл? Относительный путь со
+ * страницы own-media.ts достраивает НАШИМ доменом (toAbsoluteUrl), и SPA на
+ * любой несуществующий путь отвечает 200 text/html; ссылка на страницу
  * картинки (например, карточка файла на Викискладе) — тоже HTML, а не сама
  * картинка. Без проверки такая страница тихо уходила бы в чат документом с
  * бессмысленным именем. Явно попросили именно HTML-файл (имя маркера кончается
  * на .html/.htm) — не тот случай, пропускаем.
+ *
+ * Проверяем конкретно HTML (text/html и его XML-вариант application/xhtml+xml),
+ * а не весь text/*: {{file:}} с публичным .csv/.txt (text/csv, text/plain) —
+ * законное вложение, а не подмена картинки веб-страницей (ревью качества
+ * 02.11 — первая редакция отбивала весь text/* и ломала такие вложения).
  */
 export function isUnexpectedTextResponse(contentType: string | undefined, name: string): boolean {
   const mime = (contentType || '').split(';')[0].trim().toLowerCase();
-  if (!mime.startsWith('text/')) return false;
+  if (mime !== 'text/html' && mime !== 'application/xhtml+xml') return false;
   return !/\.html?$/i.test(name);
 }
 
