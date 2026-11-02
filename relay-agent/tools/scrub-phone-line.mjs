@@ -118,3 +118,15 @@ export function scrubContent(buf) {
   }
   return sum;
 }
+
+export async function readSnapshot() {
+  throw new Error("не реализовано");
+}
+
+export async function commitFile() {
+  throw new Error("не реализовано");
+}
+
+export async function scrubTree() {
+  throw new Error("не реализовано");
+}

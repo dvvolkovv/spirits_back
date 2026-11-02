@@ -12,7 +12,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { scrubContent } from "./scrub-phone-line.mjs";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { scrubContent, readSnapshot, commitFile, scrubTree } from "./scrub-phone-line.mjs";
 
 const PHONE = "70000000000";
 const NEW = "Current user: identifier omitted.";
@@ -212,4 +215,220 @@ test("пустые строки и файл без фразы: ничего не
   assert.equal(r.replacements, 0);
   assert.equal(r.brokenLines, 0);
   assert.equal(r.out, null);
+});
+
+// ---------------------------------------------------------------- файлы
+
+const MIN15 = 15 * 60_000;
+const hourAgo = () => new Date(Date.now() - 3_600_000);
+const pick = (o, ...keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
+
+function tmpRoot(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "scrub-phone-line-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+// Транскрипт на диске; по умолчанию — давний (час назад), с правами CLI.
+function put(root, rel, content, { mode = 0o600, mtime = hourAgo() } = {}) {
+  const p = path.join(root, rel);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, content);
+  fs.chmodSync(p, mode);
+  fs.utimesSync(p, mtime, mtime);
+  return p;
+}
+
+// Состояние дерева без разыменования симлинков: изменённое, новое или
+// пропавшее — видно (содержимое, inode, mtime, права).
+function state(root) {
+  const out = {};
+  const walk = (dir) => {
+    for (const name of fs.readdirSync(dir).sort()) {
+      const p = path.join(dir, name);
+      const rel = path.relative(root, p);
+      const st = fs.lstatSync(p, { bigint: true });
+      if (st.isSymbolicLink()) out[rel] = "-> " + fs.readlinkSync(p);
+      else if (st.isDirectory()) {
+        out[rel] = "dir";
+        walk(p);
+      } else out[rel] = [sha(fs.readFileSync(p)), st.ino, st.mtimeNs, st.mode].join(" ");
+    }
+  };
+  walk(root);
+  return out;
+}
+
+test("сухой прогон: счётчики есть, на диске ничего не меняется, журнала нет", async (t) => {
+  const root = tmpRoot(t);
+  put(root, "-tmp/a.jsonl", jsonl(user(turn()), assistant("ок"), user(turn("ещё"))));
+  put(root, "-tmp/b.jsonl", jsonl(assistant("без фразы"), "{битая"));
+  const journalPath = path.join(root, "journal.jsonl");
+  const before = state(root);
+
+  const s = await scrubTree({ root, apply: false, minAgeMs: MIN15, journalPath });
+  assert.deepEqual(
+    pick(s, "found", "scanned", "withPhrase", "replacements", "written", "fresh", "brokenLines", "errors"),
+    { found: 2, scanned: 2, withPhrase: 1, replacements: 2, written: 0, fresh: 0, brokenLines: 1, errors: 0 },
+  );
+  assert.deepEqual(state(root), before);
+  assert.equal(s.journal, null);
+});
+
+test("применение: замена на диске; права, владелец, группа и mtime — прежние; временных файлов нет", async (t) => {
+  const root = tmpRoot(t);
+  const mtime = hourAgo();
+  const src = jsonl(user(turn()), assistant("ок"));
+  const file = put(root, "-tmp/a.jsonl", src, { mode: 0o640, mtime });
+  // Группа — не основная: временный файл получает основную, и без явного
+  // chown проверка это бы поймала.
+  const alt = process.getgroups().find((g) => g !== process.getgid());
+  if (alt !== undefined) fs.chownSync(file, process.getuid(), alt);
+  else t.diagnostic("дополнительных групп нет — группа проверена только основная");
+  const st0 = fs.statSync(file, { bigint: true });
+
+  const s = await scrubTree({ root, apply: true, minAgeMs: MIN15, journalPath: path.join(root, "j.jsonl") });
+  assert.equal(s.written, 1);
+  assert.equal(fs.readFileSync(file, "utf8"), src.toString("utf8").replace(OLD(), NEW));
+  const st1 = fs.statSync(file, { bigint: true });
+  assert.notEqual(st1.ino, st0.ino, "файл заменён через rename, а не переписан на месте");
+  assert.equal(st1.mode, st0.mode);
+  assert.equal(st1.uid, st0.uid);
+  assert.equal(st1.gid, st0.gid);
+  assert.ok(Math.abs(Number(st1.mtimeMs) - mtime.getTime()) <= 1, "mtime прежний");
+  assert.deepEqual(fs.readdirSync(path.join(root, "-tmp")), ["a.jsonl"]);
+});
+
+test("свежий файл (менялся меньше --min-age-min назад) пропускается и считается отдельно", async (t) => {
+  const root = tmpRoot(t);
+  put(root, "-tmp/live.jsonl", jsonl(user(turn())), { mtime: new Date(Date.now() - 60_000) });
+  put(root, "-tmp/old.jsonl", jsonl(user(turn())));
+  const liveBefore = state(root)["-tmp/live.jsonl"];
+
+  const s = await scrubTree({ root, apply: true, minAgeMs: MIN15, journalPath: path.join(root, "j.jsonl") });
+  assert.deepEqual(pick(s, "found", "fresh", "scanned", "written"), { found: 2, fresh: 1, scanned: 1, written: 1 });
+  assert.equal(state(root)["-tmp/live.jsonl"], liveBefore);
+});
+
+test("файл изменился между чтением и записью (подменён mtime) — не перезаписан, временного файла нет", async (t) => {
+  const root = tmpRoot(t);
+  const file = put(root, "-tmp/a.jsonl", jsonl(user(turn())));
+  const snap = await readSnapshot(file);
+  const r = scrubContent(snap.buf);
+  const touched = new Date(Date.now() - 1000);
+  fs.utimesSync(file, touched, touched); // будто CLI тронул файл
+  const before = state(root);
+
+  assert.equal(await commitFile(file, snap.stat, r.out), "changed");
+  assert.deepEqual(state(root), before);
+});
+
+test("CLI дописал файл во время прохода: файл идёт как свежий, дописанное цело, в журнале его нет", async (t) => {
+  const root = tmpRoot(t);
+  const file = put(root, "-tmp/a.jsonl", jsonl(user(turn())));
+  const journalPath = path.join(root, "j.jsonl");
+
+  const s = await scrubTree({ root, apply: true, minAgeMs: MIN15, journalPath }, {
+    commit: (f, stat, out) => {
+      fs.appendFileSync(f, JSON.stringify(assistant("дописано CLI")) + "\n");
+      return commitFile(f, stat, out);
+    },
+  });
+  assert.deepEqual(pick(s, "fresh", "scanned", "withPhrase", "written"), { fresh: 1, scanned: 0, withPhrase: 0, written: 0 });
+  const text = fs.readFileSync(file, "utf8");
+  assert.ok(text.includes(PHONE), "файл не тронут");
+  assert.ok(text.includes("дописано CLI"), "дописанное не потеряно");
+  assert.deepEqual(fs.readdirSync(path.join(root, "-tmp")), ["a.jsonl"]);
+  assert.equal(s.journal, null);
+  assert.ok(!fs.existsSync(journalPath));
+});
+
+test("журнал: имя файла, число замен и время — без номеров и текста; права 600", async (t) => {
+  const root = tmpRoot(t);
+  put(root, "-tmp/a.jsonl", jsonl(user(turn()), user(turn("ещё", "+" + PHONE))));
+  put(root, "-tmp/b.jsonl", jsonl(assistant("без фразы")));
+  const journalPath = path.join(root, "journal.jsonl");
+
+  const s = await scrubTree({ root, apply: true, minAgeMs: MIN15, journalPath });
+  assert.equal(s.journal, journalPath);
+  const text = fs.readFileSync(journalPath, "utf8");
+  assert.doesNotMatch(text, /\d{10}/, "в журнале нет номеров");
+  assert.ok(!text.includes("Привет") && !text.includes("Current user"), "в журнале нет текста");
+  const rows = text.trim().split("\n").map((l) => JSON.parse(l));
+  assert.equal(rows.length, 1);
+  assert.deepEqual(Object.keys(rows[0]).sort(), ["at", "file", "replacements"]);
+  assert.equal(rows[0].file, path.join("-tmp", "a.jsonl"));
+  assert.equal(rows[0].replacements, 2);
+  assert.ok(Math.abs(Date.parse(rows[0].at) - Date.now()) < 60_000);
+  assert.equal(fs.statSync(journalPath).mode & 0o777, 0o600);
+});
+
+test("повторный прогон ничего не находит и ничего не пишет", async (t) => {
+  const root = tmpRoot(t);
+  put(root, "-tmp/a.jsonl", jsonl(user(turn()), assistant("ок")));
+  put(root, "-tmp/b.jsonl", jsonl(assistant("без фразы")));
+  const first = await scrubTree({ root, apply: true, minAgeMs: MIN15, journalPath: path.join(root, "j1.jsonl") });
+  assert.equal(first.written, 1);
+  const before = state(root);
+  const journal2 = path.join(root, "j2.jsonl");
+
+  const second = await scrubTree({ root, apply: true, minAgeMs: MIN15, journalPath: journal2 });
+  // scanned: 2 — переписанный файл сохранил mtime и не выглядит свежим.
+  assert.deepEqual(
+    pick(second, "scanned", "fresh", "withPhrase", "replacements", "written"),
+    { scanned: 2, fresh: 0, withPhrase: 0, replacements: 0, written: 0 },
+  );
+  assert.deepEqual(state(root), before);
+  assert.ok(!fs.existsSync(journal2), "пустой журнал не остаётся");
+});
+
+test("симлинки не обходятся; трогаются только обычные <root>/*/*.jsonl", async (t) => {
+  const root = tmpRoot(t);
+  const outside = tmpRoot(t);
+  const elsewhere = tmpRoot(t);
+  const target = put(outside, "proj/target.jsonl", jsonl(user(turn())));
+  put(root, "-tmp/real.jsonl", jsonl(user(turn())));
+  fs.symlinkSync(target, path.join(root, "-tmp", "link.jsonl")); // файл-симлинк
+  fs.symlinkSync(path.join(outside, "proj"), path.join(root, "linked-proj")); // каталог-симлинк
+  put(root, "top.jsonl", jsonl(user(turn()))); // в самом корне
+  put(root, "-tmp/sub/deep.jsonl", jsonl(user(turn()))); // глубже одного уровня
+  put(root, "-tmp/notes.txt", jsonl(user(turn()))); // не .jsonl
+  put(root, "-tmp/a.jsonl.bak", jsonl(user(turn())));
+  const rootBefore = state(root);
+  const outsideBefore = state(outside);
+
+  const s = await scrubTree({ root, apply: true, minAgeMs: MIN15, journalPath: path.join(elsewhere, "j.jsonl") });
+  assert.deepEqual(pick(s, "found", "written"), { found: 1, written: 1 });
+  const rootAfter = state(root);
+  assert.deepEqual(Object.keys(rootAfter), Object.keys(rootBefore));
+  assert.deepEqual(Object.keys(rootBefore).filter((k) => rootBefore[k] !== rootAfter[k]), ["-tmp/real.jsonl"]);
+  assert.deepEqual(state(outside), outsideBefore);
+});
+
+test(
+  "ошибка на одном файле не останавливает проход; в списке ошибок — имя и код, без текста",
+  { skip: process.getuid?.() === 0 && "root читает и файл с правами 000" },
+  async (t) => {
+    const root = tmpRoot(t);
+    put(root, "-tmp/bad.jsonl", jsonl(user(turn())), { mode: 0o000 });
+    put(root, "-tmp/good.jsonl", jsonl(user(turn())));
+
+    const s = await scrubTree({ root, apply: true, minAgeMs: MIN15, journalPath: path.join(root, "j.jsonl") });
+    assert.equal(s.errors, 1);
+    assert.deepEqual(s.errorList, [{ file: path.join("-tmp", "bad.jsonl"), code: "EACCES" }]);
+    assert.equal(s.written, 1);
+  },
+);
+
+test("прерывание: при поднятом сигнале файлы не трогаются, итог помечен", async (t) => {
+  const root = tmpRoot(t);
+  put(root, "-tmp/a.jsonl", jsonl(user(turn())));
+  const before = state(root);
+  const ac = new AbortController();
+  ac.abort();
+
+  const s = await scrubTree({ root, apply: true, minAgeMs: MIN15, journalPath: path.join(root, "j.jsonl"), signal: ac.signal });
+  assert.equal(s.interrupted, true);
+  assert.equal(s.scanned, 0);
+  assert.deepEqual(state(root), before);
 });
