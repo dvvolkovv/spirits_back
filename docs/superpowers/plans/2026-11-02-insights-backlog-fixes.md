@@ -537,6 +537,8 @@ describe('INTERRUPTED_TURN_NOTE', () => {
 
 Если в спеках контроллера (`chat.upload-*.spec.ts`) `chatService` подменён объектом без этих методов — добавить в подмену `beginUploadTurn: jest.fn(() => 1), endUploadTurn: jest.fn()`.
 
+**Поправка по ревью (выполнено, 94386ddc):** `closeStream` зовётся из `setImmediate` уже после `persistUploadTurn` и `consolidateAfterChatPublic` (до 120 с) — метка висела после доставки ответа. Основное снятие — сразу после `res.end()` в общем `finally` потока; вызов в `closeStream` остаётся страховкой (повторный `endUploadTurn` с той же меткой — no-op). Тест в `chat.upload-chat-files.spec.ts`: во время потока метка есть, после `end` при подвешенном `persistUploadTurn` — уже нет.
+
 - [ ] **Step 6: прогон бэка: `src/chat/chat.service.turn-marks.spec.ts src/chat/interrupted-turn.spec.ts src/chat/chat.service.active-streams.spec.ts src/chat/chat.service.failed-turn.spec.ts src/chat/chat.service.masha-products.spec.ts src/chat/chat.service.active-assistant.spec.ts src/chat/chat.upload-billing.spec.ts src/chat/chat.upload-chat-files.spec.ts src/chat/chat.upload-session.spec.ts src/chat/chat.upload-llm-provider.spec.ts`** — PASS. tsc бэка — `TSC_OK`.
 
 - [ ] **Step 7: коммит** `fix(chat): метка хода вместо безусловного удаления, upload в учёте, строка о прерывании` + пуш.
@@ -770,12 +772,12 @@ const TEXTS: Record<string, { title: string; body: string; cta: string }> = {
   },
   fr: {
     title: 'Plus de jetons',
-    body: "L'assistant ne peut pas répondre pour le moment. La conversation est enregistrée : rechargez votre solde pour reprendre là où vous vous êtes arrêté.",
+    body: "L'assistant ne peut pas répondre pour le moment. La conversation est enregistrée : recharge ton solde pour reprendre là où tu t'es arrêté.",
     cta: 'Recharger le solde',
   },
   pt: {
     title: 'Sem tokens',
-    body: 'O assistente não consegue responder agora. A conversa ficou guardada — carrega o saldo para continuares exatamente onde paraste.',
+    body: 'O assistente não consegue responder agora. A conversa ficou guardada — carregue o saldo para continuar exatamente onde parou.',
     cta: 'Carregar saldo',
   },
   zh: {
@@ -790,6 +792,8 @@ export function noTokensMessage(lang: string): string {
   return `⚠️ **${t.title}**\n\n${t.body}\n\n👉 [${t.cta}](/chat?view=tokens)`;
 }
 ```
+
+Обращение — как в чате кабинета: fr — «tu», pt — европейский вежливый («carregue», «parou»), de — «du», es — «tú».
 
 `src/chat/chat.service.ts`: импорт `import { noTokensMessage } from './no-tokens-message';`. Публичный метод рядом с `getTokenBalance`:
 
@@ -1036,6 +1040,17 @@ describe('TgRouterService.generateReply: картинка из сети (нах�
 ```
 
 В комментарии-источнике `// источник: низкий баланс и ноль — …` добавить `src/tokens/balance-context.service.ts (NEAR_EMPTY_ANSWERS); src/chat/no-tokens-message.ts`.
+
+- [ ] **Step 1b: подписи кнопок для справки.** Фронт переименовал `chat.send_anyway` («Прервать и отправить», ветка фронта `feat/insights-fixes-1102`). Справка берёт подписи по ключам (`src/platform-kb/label-keys.json` → `labels.generated.ts`), CLAUDE.md требует перегенерировать в том же изменении:
+
+```bash
+cd ~/Downloads/spirits_back/.worktrees/insights-fixes && node scripts/sync-kb-labels.mjs ~/Downloads/spirits_front/.worktrees/insights-fixes
+git diff --stat src/platform-kb
+```
+
+Путь к фронту — явно (из воркдерева путь по умолчанию неверный). В diff — только подписи `sendAnyway` на 7 языках (и, если скрипт так устроен, сопутствующие поля); посторонние подписи не должны меняться — если меняются, значит фронт-воркдерево отстало от main: остановиться и сообщить.
+
+В `src/platform-kb/articles/chat.ts`, где упоминается `${q('sendAnyway')}` (≈ строка 41), дописать, что кнопка прерывает текущую работу ассистента и он возьмётся за новое сообщение.
 
 - [ ] **Step 2: прогон бэка: `src/platform-kb`** — PASS (если `values.spec`/`kb.spec` сверяет длину или фразы — привести к новому тексту).
 
