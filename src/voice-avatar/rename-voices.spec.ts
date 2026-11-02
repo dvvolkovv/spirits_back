@@ -72,10 +72,44 @@ describe('renameVoices', () => {
     for (const secret of ['user_70000000000', UUID_USER, 'Rachel', 'linkeon-0a0b0c0d', KEY]) expect(out).not.toContain(secret);
   });
 
+  // Ревью ветки: сирота — только клон (category=cloned) с именем строго
+  // user_<номер> или user_<uuid>, — иначе под переименование попал бы чужой
+  // голос аккаунта, названный похоже.
+  it('сироты — только клоны с именем строго user_<номер|uuid>', async () => {
+    get.mockResolvedValue({
+      data: {
+        voices: [
+          { voice_id: 'ok-phone', name: 'user_70000000000', category: 'cloned' },
+          { voice_id: 'ok-uuid', name: `user_${UUID_USER}`, category: 'cloned' },
+          { voice_id: 'premade', name: 'user_70000000000', category: 'premade' },
+          { voice_id: 'generated', name: 'user_70000000000', category: 'generated' },
+          { voice_id: 'word', name: 'user_test', category: 'cloned' },
+          { voice_id: 'tail', name: 'user_70000000000 copy', category: 'cloned' },
+          { voice_id: 'short', name: 'user_123', category: 'cloned' },
+          { voice_id: 'upper', name: 'USER_70000000000', category: 'cloned' },
+        ],
+        has_more: false,
+      },
+    });
+    const lines: string[] = [];
+
+    const r = await renameVoices({ voiceIds: [], apply: false, apiKey: KEY, log: (m) => lines.push(m) });
+
+    expect(r).toMatchObject({ accountUserVoices: 2, orphans: 2 });
+    const out = lines.join('\n');
+    expect(out).toContain('voice_id: ok-phone');
+    expect(out).toContain('voice_id: ok-uuid');
+    for (const id of ['premade', 'generated', 'word', 'tail', 'short', 'upper']) expect(out).not.toContain(`voice_id: ${id}`);
+  });
+
   it('перечень аккаунта — постранично, по has_more и next_page_token', async () => {
     get
-      .mockResolvedValueOnce({ data: { voices: [{ voice_id: 'v1', name: 'user_1' }], has_more: true, next_page_token: 't2' } })
-      .mockResolvedValueOnce({ data: { voices: [{ voice_id: 'v7', name: 'user_7' }], has_more: false, next_page_token: null } });
+      .mockResolvedValueOnce({
+        data: { voices: [{ voice_id: 'v1', name: 'user_70000000000', category: 'cloned' }], has_more: true, next_page_token: 't2' },
+      })
+      .mockResolvedValueOnce({
+        data: { voices: [{ voice_id: 'v7', name: 'user_70000000007', category: 'cloned' }], has_more: false, next_page_token: null },
+      });
 
     const r = await renameVoices({ voiceIds: ['v1'], apply: false, apiKey: KEY, log: () => {} });
 
