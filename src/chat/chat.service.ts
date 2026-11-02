@@ -19,7 +19,7 @@ import { RESPONSE_STYLE_RULE } from './response-style';
 import { ANSWER_FIRST_RULE } from './answer-first-rule';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
 import { INTERRUPTED_TURN_NOTE } from './interrupted-turn';
-import { noTokensMessage } from './no-tokens-message';
+import { noTokensMessage, NoTokensOpts } from './no-tokens-message';
 import { CRISIS_RULE } from './crisis-rule';
 import { loadCoworkers } from './coworkers';
 import { colleaguesRule } from './colleagues-rule';
@@ -1152,10 +1152,13 @@ export class ChatService {
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('X-Accel-Buffering', 'no');
         res.setHeader('Access-Control-Allow-Origin', '*');
-        const noTokensMsg = await this.noTokensReply(userId, requestLang);
+        const noTokensMsg = await this.noTokensReply(userId, requestLang, { storeBuild });
         res.write(JSON.stringify({ type: 'begin' }) + '\n');
         res.write(JSON.stringify({ type: 'item', content: noTokensMsg }) + '\n');
-        res.write(JSON.stringify({ type: 'end', content: noTokensMsg, usage: { input: 0, output: 0, total: 0 } }) + '\n');
+        // reason: 'no_tokens' — старые клиенты лишнее поле в event molчa
+        // игнорируют; новым и e2e/мониторингу есть за что зацепиться без
+        // разбора текста (находка ревью качества 02.11, S1).
+        res.write(JSON.stringify({ type: 'end', content: noTokensMsg, reason: 'no_tokens', usage: { input: 0, output: 0, total: 0 } }) + '\n');
         res.end();
         return;
       }
@@ -3230,10 +3233,16 @@ ${LanguageService.buildDirective(userLanguage)}`;
     return Number(r.rows[0]?.tokens || 0);
   }
 
-  /** Текст остановки на нуле — на языке пользователя (no-tokens-message.ts). */
-  async noTokensReply(userId: string, requestLang?: string): Promise<string> {
-    const lang = await this.language.resolveUserLanguage(userId, requestLang).catch(() => DEFAULT_LANGUAGE);
-    return noTokensMessage(lang);
+  /**
+   * Текст остановки на нуле — на языке пользователя (no-tokens-message.ts).
+   *
+   * Без .catch(): resolveUserLanguage сам ловит свои ошибки и отдаёт
+   * DEFAULT_LANGUAGE (см. LanguageService.resolveUserLanguage) — вторая
+   * защита здесь была мёртвым кодом (ревью качества 02.11, M7).
+   */
+  async noTokensReply(userId: string, requestLang?: string, opts: NoTokensOpts = {}): Promise<string> {
+    const lang = await this.language.resolveUserLanguage(userId, requestLang);
+    return noTokensMessage(lang, opts);
   }
 
   /**

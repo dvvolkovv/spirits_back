@@ -238,6 +238,13 @@ export class ChatController {
       });
     }
 
+    // Канал распространения — до шлагбаума (ревью качества 02.11, I5): в
+    // магазинной сборке текст остановки не должен упоминать токены/баланс
+    // вовсе (правило Apple 3.1.1), и noTokensReply ниже должен это знать.
+    // Переиспользуется дальше, в buildUploadHandoff — раньше вычислялся там
+    // второй раз тем же вызовом.
+    const storeBuild = isStoreBuild(req.headers['x-linkeon-distribution']);
+
     // Шлагбаум по балансу — тот же, что на обычном ходе чата (chat.service.ts,
     // «Check token balance»). До 06.09.2026 его здесь не было вовсе: загрузка
     // файлов не только не тарифицировалась, но и не спрашивала баланс, то есть
@@ -255,10 +262,13 @@ export class ChatController {
       const noTokensMsg = await this.chatService.noTokensReply(
         userId,
         typeof body.lang === 'string' ? body.lang : undefined,
+        // upload: файлы этого запроса тоже выброшены — текст должен попросить
+        // прикрепить их заново, а не только переслать сообщение (I4).
+        { upload: true, storeBuild },
       );
       res.write(JSON.stringify({ type: 'begin' }) + '\n');
       res.write(JSON.stringify({ type: 'item', content: noTokensMsg }) + '\n');
-      res.write(JSON.stringify({ type: 'end', content: noTokensMsg, usage: { input: 0, output: 0, total: 0 } }) + '\n');
+      res.write(JSON.stringify({ type: 'end', content: noTokensMsg, reason: 'no_tokens', usage: { input: 0, output: 0, total: 0 } }) + '\n');
       res.end();
       return;
     }
@@ -290,7 +300,7 @@ export class ChatController {
       freshSessionId,
       requestLang: typeof body.lang === 'string' ? body.lang : undefined,
       ask: ui.ask,
-      storeBuild: isStoreBuild(req.headers['x-linkeon-distribution']),
+      storeBuild,
       ui,
     });
 

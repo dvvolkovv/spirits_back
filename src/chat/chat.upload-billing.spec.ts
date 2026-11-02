@@ -64,7 +64,11 @@ function makePg(balance = 1_000_000): Pg {
 }
 
 function makeService(pg: Pg): ChatService {
-  const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
+  // Подсказка из тела запроса (body.lang) — как в реальном LanguageService:
+  // при пустом профиле именно она решает язык. Нужна тесту «шлагбаум отдаёт
+  // текст на языке запроса» (ревью качества 02.11, M4) — иначе носителя
+  // языка здесь взять неоткуда, профиля с ним в этих тестах нет.
+  const language = { resolveUserLanguage: jest.fn(async (_u: string, hint?: string) => hint || 'ru') };
   return new ChatService(
     pg as any, null as any, null as any,
     null as any, language as any, undefined, undefined, undefined, undefined,
@@ -274,5 +278,48 @@ describe('uploadAndChat: usage из события done доезжает до с
     // Текст — через noTokensMessage() (no-tokens-message.ts), находка a3da5a2b:
     // мягкая формулировка на языке пользователя вместо «Недостаточно токенов».
     expect(end.content).toMatch(/Токены закончились/);
+    // reason: 'no_tokens' — для e2e/мониторинга, без разбора текста (ревью качества 02.11, S1).
+    expect(end.reason).toBe('no_tokens');
+    // upload-вариант (I4): файлы этого запроса тоже выброшены — текст должен
+    // попросить прикрепить их заново, а не только переслать сообщение.
+    expect(end.content).toContain('прикрепите файлы заново');
+  });
+
+  it('язык из тела запроса — шлагбаум отдаёт текст на нём, не на русском (ревью качества 02.11, M4)', async () => {
+    const pg = makePg(0);
+    const res = makeRes();
+    const ctrl = makeController(pg);
+    const post = jest.fn();
+    (axios as any).default = { post };
+    (axios as any).post = post;
+
+    await ctrl.uploadAndChat(makeReq({ lang: 'en' }), res);
+
+    const end = res.written.find((w: any) => w.type === 'end');
+    expect(end.content).toMatch(/Out of tokens/);
+    expect(end.content).not.toMatch(/[а-яё]/i);
+  });
+});
+
+/**
+ * ChatService.noTokensReply напрямую — это та же точка, которую зовёт
+ * шлагбаум streamChat (chat.service.ts, «Check token balance»): полный
+ * streamChat здесь не поднять (агент, БД, живой стрим), а noTokensReply —
+ * публичный метод и обычный юнит (ревью качества 02.11, M4: обе точки
+ * шлагбаума — на языке запроса, не только контроллерная).
+ */
+describe('ChatService.noTokensReply — точка шлагбаума streamChat', () => {
+  it('отдаёт текст на языке запроса, не на русском', async () => {
+    const svc = makeService(makePg());
+    const msg = await svc.noTokensReply('u1', 'en');
+    expect(msg).toMatch(/Out of tokens/);
+    expect(msg).not.toMatch(/[а-яё]/i);
+  });
+
+  it('магазинная сборка — без слов о токенах/балансе и без ссылки', async () => {
+    const svc = makeService(makePg());
+    const msg = await svc.noTokensReply('u1', 'ru', { storeBuild: true });
+    expect(msg).not.toContain('](');
+    expect(msg.toLowerCase()).not.toMatch(/token|балан|пополн/i);
   });
 });
