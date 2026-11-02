@@ -353,3 +353,11 @@ async function openJournal(journalPath) {
   };
 }
 
+
+export async function runScrub() {
+  throw new Error("не реализовано");
+}
+
+export async function finishScrub() {
+  throw new Error("не реализовано");
+}

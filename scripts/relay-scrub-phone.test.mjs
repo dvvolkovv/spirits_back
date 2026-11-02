@@ -20,7 +20,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { scrubContent, sessionRules, readSnapshot, commitFile } from "./relay-scrub-phone.mjs";
+import { scrubContent, sessionRules, readSnapshot, commitFile, runScrub, finishScrub } from "./relay-scrub-phone.mjs";
 
 const PHONE = "70000000000";
 const OTHER = "70000000001"; // другой пользователь релея (есть в sessions.json)
@@ -381,4 +381,322 @@ test("транскрипт изменился между чтением и за�
 
   assert.equal(await commitFile(file, snap.stat, r.out), "changed");
   assert.deepEqual(state(root), before);
+});
+
+// ---------------------------------------------------------------- проход по сессиям
+
+const SALT = "тестовая соль";
+// fs_key, как его считает бэк (src/chat/linkeon-relay-fields.ts, relayFsKey).
+const fsKeyOf = (key) => createHmac("sha256", SALT).update(key).digest("hex").slice(0, 32);
+const MIN15 = 15 * 60_000;
+const read = (...p) => fs.readFileSync(path.join(...p), "utf8");
+const exists = (...p) => fs.existsSync(path.join(...p));
+const pick = (o, ...keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
+
+// Релей в миниатюре: проекты claude, папки хода и загрузки, sessions.json,
+// карта fs_key (TSV, 600), домашний каталог под таблицу и журнал.
+function relayWorld(t) {
+  const base = tmpRoot(t);
+  const home = path.join(base, "home");
+  const w = {
+    base, home,
+    root: path.join(base, "projects"),
+    out: path.join(base, "agent-output"),
+    up: path.join(base, "agent-uploads"),
+    sessionsPath: path.join(base, "sessions.json"),
+    mapPath: path.join(home, "fs-key-map.tsv"),
+    statePath: path.join(home, ".relay-scrub-map.jsonl"),
+    journalPath: path.join(home, "journal.jsonl"),
+    sessions: {}, map: new Map(), mapExtra: "",
+  };
+  for (const d of [path.join(w.root, "-tmp"), w.out, path.join(w.up, "mcp"), home]) fs.mkdirSync(d, { recursive: true });
+  saveWorld(w);
+  return w;
+}
+function saveWorld(w) {
+  fs.writeFileSync(w.sessionsPath, JSON.stringify(w.sessions));
+  fs.writeFileSync(w.mapPath, [...w.map].map(([k, v]) => k + "\t" + v + "\n").join("") + w.mapExtra);
+  fs.chmodSync(w.mapPath, 0o600);
+}
+// Сессия релея: запись в sessions.json, транскрипт (если строки даны), строка карты.
+function addSession(w, key, rows, { inMap = true, mtime } = {}) {
+  const cliId = randomUUID();
+  w.sessions[key] = cliId;
+  if (inMap) w.map.set(key, fsKeyOf(key));
+  saveWorld(w);
+  const file = rows ? put(w.root, "-tmp/" + cliId + ".jsonl", jsonl(...rows), mtime ? { mtime } : {}) : null;
+  return { key, cliId, file, fk: fsKeyOf(key), rel: path.join("-tmp", cliId + ".jsonl") };
+}
+const runOpts = (w, extra = {}) => ({
+  root: w.root, sessionsPath: w.sessionsPath, outputs: w.out, uploads: w.up,
+  fsKeyMapPath: w.mapPath, statePath: w.statePath, journalPath: w.journalPath, minAgeMs: MIN15, ...extra,
+});
+// Ход до части Б: загрузки и папка по ключу сессии, строка с номером.
+const preTurn = (w, key, text, files = []) =>
+  user(
+    (files.length
+      ? "User uploaded files:\n" + files.map((n) => "- " + path.join(w.up, key + "_" + n) + " (name: " + n + ", 10 bytes)\n").join("") + "\n"
+      : "") +
+      "Output directory for created files: " + path.join(w.out, key) + "\n\n" + OLD(key.split("_")[0]) +
+      "\n\nОтвечай по-русски.\n\n" + text,
+  );
+// Ход после части Б: папка по fs_key, номера нет.
+const postTurn = (w, fk, text) =>
+  user("Output directory for created files: " + path.join(w.out, fk) + "\n\nОтвечай по-русски.\n\n" + text);
+
+// A — основная: конфликты файла, папки и загрузки; пути в вызовах; userId.
+function sessionA(w) {
+  const key = PHONE + "_14_ru";
+  const fk = fsKeyOf(key);
+  put(w.out, key + "/report.pdf", "старый отчёт");
+  put(w.out, key + "/notes.txt", "заметки");
+  put(w.out, key + "/sub/x.txt", "x");
+  put(w.out, fk + "/report.pdf", "новый отчёт");
+  put(w.out, fk + "/sub/y.txt", "y");
+  put(w.up, key + "_doc.pdf", "doc");
+  put(w.up, key + "_scan.png", "старый скан");
+  put(w.up, fk + "_scan.png", "новый скан");
+  put(w.up, key + "_z.pdf", "z"); // и префикс двухчастного ключа B подходит — берётся самый длинный
+  return addSession(w, key, [
+    preTurn(w, key, "Сделай отчёт по выписке", ["doc.pdf", "scan.png"]),
+    toolUse("Write", { file_path: path.join(w.out, key, "report.pdf"), content: "…" }),
+    toolUse("Bash", { command: "mkdir -p " + path.join(w.out, key, "sub") + " && cp a " + path.join(w.out, key, "sub/x.txt") }),
+    toolUse("mcp__linkeon__generate_image", { userId: PHONE, prompt: "кот" }),
+    assistant("Готово. Контакт юриста " + OTHER + " записал."),
+    postTurn(w, fk, "Ещё вопрос"),
+    assistant("Отвечаю."),
+  ]);
+}
+// B — двухчастный ключ (до 18.08, загрузки — до 09.09): своя папка и загрузка;
+// у старой папки права 750 — новая получает такие же.
+function sessionB(w) {
+  const key = PHONE + "_14";
+  put(w.out, key + "/old.txt", "старое");
+  fs.chmodSync(path.join(w.out, key), 0o750);
+  put(w.up, key + "_y.pdf", "y");
+  return addSession(w, key, [preTurn(w, key, "Посмотри файл", ["y.pdf"])]);
+}
+// C — другой пользователь: в его транскрипте уходит его номер.
+const sessionC = (w) => addSession(w, OTHER + "_12_en", [preTurn(w, OTHER + "_12_en", "Hello")]);
+// D — нет в карте; fs_key — из строки «Output directory» хода после части Б.
+function sessionD(w) {
+  const key = PHONE + "_15_ru";
+  put(w.out, key + "/f.txt", "f");
+  return addSession(w, key, [preTurn(w, key, "Старый ход"), postTurn(w, fsKeyOf(key), "Новый ход")], { inMap: false });
+}
+// E — fs_key нет ни в карте, ни в транскрипте: не трогается.
+function sessionE(w) {
+  const key = PHONE + "_16_ru";
+  put(w.out, key + "/e.txt", "e");
+  return addSession(w, key, [preTurn(w, key, "Ход")], { inMap: false });
+}
+// F — карта и транскрипт расходятся (карта посчитана не с той солью?): не трогается.
+function sessionF(w) {
+  const key = PHONE + "_17_ru";
+  put(w.out, key + "/f.txt", "f");
+  return addSession(w, key, [preTurn(w, key, "Ход"), postTurn(w, "f".repeat(32), "Ход")]);
+}
+// G — свежая: в ней, вероятно, идёт ход.
+function sessionG(w) {
+  const key = PHONE + "_18_ru";
+  put(w.out, key + "/g.txt", "g");
+  return addSession(w, key, [preTurn(w, key, "Ход")], { mtime: new Date() });
+}
+function fullWorld(t) {
+  const w = relayWorld(t);
+  const s = { A: sessionA(w), B: sessionB(w), C: sessionC(w), D: sessionD(w), E: sessionE(w), F: sessionF(w), G: sessionG(w) };
+  addSession(w, randomUUID() + "_14_ru", [assistant("почтовый пользователь")]);
+  s.orphanWith = put(w.root, "-tmp/" + randomUUID() + ".jsonl", jsonl(user(turn())));
+  s.orphanWithout = put(w.root, "-tmp/" + randomUUID() + ".jsonl", jsonl(assistant("сирота без номера")));
+  put(w.out, PHONE + "_99_ru/q.txt", "q"); // папка без сессии
+  put(w.up, PHONE + "_98_w.pdf", "w"); // загрузка без сессии
+  w.mapExtra = "сломанная строка\n";
+  saveWorld(w);
+  return { w, s };
+}
+
+test("сухой прогон: все счётчики по сессиям; на диске ничего не меняется, ни журнала, ни таблицы", async (t) => {
+  const { w } = fullWorld(t);
+  const before = state(w.base);
+
+  const s = await runScrub(runOpts(w));
+  assert.deepEqual(
+    pick(s, "phones", "sessions", "nonPhoneSessions", "withMap", "withTranscriptKey", "keyAgree", "withoutKey", "keyMismatch", "noTranscript", "fresh"),
+    { phones: 2, sessions: 7, nonPhoneSessions: 1, withMap: 3, withTranscriptKey: 1, keyAgree: 1, withoutKey: 1, keyMismatch: 1, noTranscript: 0, fresh: 1 },
+  );
+  assert.deepEqual(pick(s, "dirs", "entries", "uploads", "conflicts", "transcripts", "otherPhones"),
+    { dirs: 3, entries: 5, uploads: 4, conflicts: 3, transcripts: 4, otherPhones: 1 });
+  assert.deepEqual(s.repl, { phrase: 4, dirs: 7, uploads: 3, other: 1 });
+  assert.deepEqual(pick(s, "orphans", "orphansWithPhone", "orphanDirs", "orphanUploads", "mapBadLines", "errors", "written"),
+    { orphans: 2, orphansWithPhone: 1, orphanDirs: 1, orphanUploads: 1, mapBadLines: 1, errors: 0, written: 0 });
+  assert.deepEqual(state(w.base), before);
+  assert.equal(s.journal, null);
+});
+
+test("применение, сессия A: конфликты получают «(прежний)», пути в транскрипте — на итоговые имена; метаданные транскрипта прежние", async (t) => {
+  const w = relayWorld(t);
+  const a = sessionA(w);
+  sessionB(w); // ради загрузки с префиксом двухчастного ключа
+  const st0 = fs.statSync(a.file, { bigint: true });
+
+  const s = await runScrub(runOpts(w, { apply: true }));
+  assert.equal(s.errors, 0, JSON.stringify(s.errorList));
+  // Папка: старая удалена, всё в папке fs_key; совпавшие имена не перезаписаны.
+  assert.ok(!exists(w.out, a.key));
+  assert.equal(read(w.out, a.fk, "report.pdf"), "новый отчёт");
+  assert.equal(read(w.out, a.fk, "report (прежний).pdf"), "старый отчёт");
+  assert.equal(read(w.out, a.fk, "notes.txt"), "заметки");
+  assert.equal(read(w.out, a.fk, "sub", "y.txt"), "y");
+  assert.equal(read(w.out, a.fk, "sub (прежний)", "x.txt"), "x");
+  // Загрузки: <fs_key>_<имя>, конфликт — с суффиксом.
+  assert.equal(read(w.up, a.fk + "_doc.pdf"), "doc");
+  assert.equal(read(w.up, a.fk + "_scan.png"), "новый скан");
+  assert.equal(read(w.up, a.fk + "_scan (прежний).png"), "старый скан");
+  assert.equal(read(w.up, a.fk + "_z.pdf"), "z");
+  // Транскрипт: номера нет, пути — на итоговые имена.
+  const text = fs.readFileSync(a.file, "utf8");
+  assert.ok(!text.includes(PHONE));
+  const rows = parsed(Buffer.from(text));
+  const msg = rows[0].message.content;
+  assert.ok(msg.includes("- " + path.join(w.up, a.fk + "_doc.pdf") + " (name: doc.pdf"));
+  assert.ok(msg.includes("- " + path.join(w.up, a.fk + "_scan (прежний).png") + " (name: scan.png"));
+  assert.ok(msg.includes("Output directory for created files: " + path.join(w.out, a.fk) + "\n\n" + NEW));
+  assert.equal(rows[1].message.content[0].input.file_path, path.join(w.out, a.fk, "report (прежний).pdf"));
+  assert.equal(
+    rows[2].message.content[0].input.command,
+    "mkdir -p " + path.join(w.out, a.fk, "sub (прежний)") + " && cp a " + path.join(w.out, a.fk, "sub (прежний)/x.txt"),
+  );
+  assert.equal(rows[3].message.content[0].input.userId, a.fk);
+  assert.ok(rows[4].message.content[0].text.includes(OTHER), "номер другого пользователя не тронут");
+  // Метаданные транскрипта: тот же владелец, права и mtime, новый inode.
+  const st1 = fs.statSync(a.file, { bigint: true });
+  assert.notEqual(st1.ino, st0.ino);
+  assert.deepEqual([st1.mode, st1.uid, st1.gid], [st0.mode, st0.uid, st0.gid]);
+  assert.ok(Math.abs(Number(st1.mtimeMs) - Number(st0.mtimeMs)) <= 1);
+  // Таблица переименований — 600; журнал — без номеров.
+  assert.equal(fs.statSync(w.statePath).mode & 0o777, 0o600);
+  const journal = fs.readFileSync(w.journalPath, "utf8");
+  assert.ok(!journal.includes(PHONE) && !journal.includes(OTHER));
+  assert.ok(journal.includes(a.rel));
+});
+
+test("применение, весь релей: двухчастный ключ, права новой папки, запасной fs_key; без fs_key, расхождение, свежие и сироты не тронуты", async (t) => {
+  const { w, s: S } = fullWorld(t);
+  const untouched = [S.E, S.F, S.G].map((x) => [x.file, fs.readFileSync(x.file)]);
+  const orphansBefore = [S.orphanWith, S.orphanWithout].map((f) => [f, fs.readFileSync(f)]);
+
+  const s = await runScrub(runOpts(w, { apply: true }));
+  assert.deepEqual(pick(s, "written", "moved", "movedUploads", "dirsRemoved", "dirsLeft", "errors"),
+    { written: 4, moved: 5, movedUploads: 4, dirsRemoved: 3, dirsLeft: 0, errors: 0 });
+  // B: своя папка fs_key с правами старой, своя загрузка; z.pdf ушла к A.
+  assert.ok(!exists(w.out, S.B.key));
+  assert.equal(read(w.out, S.B.fk, "old.txt"), "старое");
+  assert.equal(fs.statSync(path.join(w.out, S.B.fk)).mode & 0o777, 0o750);
+  assert.equal(read(w.up, S.B.fk + "_y.pdf"), "y");
+  assert.ok(exists(w.up, S.A.fk + "_z.pdf"));
+  // C: номер другого пользователя ушёл из его собственного транскрипта.
+  assert.ok(!fs.readFileSync(S.C.file, "utf8").includes(OTHER));
+  // D: fs_key взят из транскрипта.
+  assert.equal(read(w.out, S.D.fk, "f.txt"), "f");
+  assert.ok(!fs.readFileSync(S.D.file, "utf8").includes(PHONE));
+  // E, F, G и сироты — байт в байт; их папки и чужие файлы — на месте.
+  for (const [f, buf] of [...untouched, ...orphansBefore]) assert.ok(fs.readFileSync(f).equals(buf), f);
+  for (const k of [S.E.key, S.F.key, S.G.key, PHONE + "_99_ru"]) assert.ok(exists(w.out, k), k);
+  assert.ok(exists(w.up, PHONE + "_98_w.pdf"));
+  for (const row of fs.readFileSync(w.journalPath, "utf8").trim().split("\n")) {
+    assert.deepEqual(Object.keys(JSON.parse(row)).sort(), ["at", "conflicts", "fsKey", "moved", "replacements", "transcript", "transcriptWritten", "uploads"]);
+  }
+});
+
+test("второй заход: транскрипт, изменённый во время записи, доделывается теми же итоговыми именами", async (t) => {
+  const w = relayWorld(t);
+  const a = sessionA(w);
+
+  const s1 = await runScrub(runOpts(w, { apply: true }), {
+    commit: (file, stat, out) => {
+      fs.appendFileSync(file, JSON.stringify(assistant("дописано CLI")) + "\n"); // начался ход
+      return commitFile(file, stat, out);
+    },
+  });
+  assert.deepEqual(pick(s1, "written", "fresh"), { written: 0, fresh: 1 });
+  assert.ok(!exists(w.out, a.key), "папка уже перенесена");
+  assert.ok(fs.readFileSync(a.file, "utf8").includes(PHONE), "транскрипт ещё прежний");
+
+  const s2 = await runScrub(runOpts(w, { apply: true, minAgeMs: 0 }));
+  assert.equal(s2.written, 1);
+  const rows = parsed(fs.readFileSync(a.file));
+  assert.equal(rows[1].message.content[0].input.file_path, path.join(w.out, a.fk, "report (прежний).pdf"));
+  assert.ok(rows[0].message.content.includes(path.join(w.up, a.fk + "_scan (прежний).png")));
+  assert.equal(rows.at(-1).message.content[0].text, "дописано CLI");
+  assert.ok(!fs.readFileSync(a.file, "utf8").includes(PHONE));
+});
+
+test("повторный прогон ничего не находит и ничего не пишет", async (t) => {
+  const { w } = fullWorld(t);
+  await runScrub(runOpts(w, { apply: true }));
+  const before = state(w.base);
+
+  const s = await runScrub(runOpts(w, { apply: true }));
+  assert.deepEqual(pick(s, "written", "dirs", "entries", "uploads", "transcripts"), { written: 0, dirs: 0, entries: 0, uploads: 0, transcripts: 0 });
+  assert.deepEqual(state(w.base), before);
+});
+
+test("--finish: пока есть работа — отказ и всё на месте; после прохода — удаляет таблицу и карту", async (t) => {
+  const w = relayWorld(t);
+  sessionA(w);
+
+  const early = await finishScrub(runOpts(w));
+  assert.ok(early.pending > 0);
+  assert.deepEqual(early.removed, []);
+  assert.ok(fs.existsSync(w.mapPath));
+
+  await runScrub(runOpts(w, { apply: true }));
+  assert.ok(fs.existsSync(w.statePath));
+  const done = await finishScrub(runOpts(w));
+  assert.equal(done.pending, 0);
+  assert.deepEqual(done.removed.sort(), [w.mapPath, w.statePath].sort());
+  assert.ok(!fs.existsSync(w.mapPath) && !fs.existsSync(w.statePath));
+});
+
+test("сессия без транскрипта: папка переносится по карте", async (t) => {
+  const w = relayWorld(t);
+  const key = PHONE + "_19_ru";
+  put(w.out, key + "/h.txt", "h");
+  const x = addSession(w, key, null);
+
+  const s = await runScrub(runOpts(w, { apply: true }));
+  assert.deepEqual(pick(s, "noTranscript", "moved", "written"), { noTranscript: 1, moved: 1, written: 0 });
+  assert.equal(read(w.out, x.fk, "h.txt"), "h");
+  assert.ok(!exists(w.out, key));
+});
+
+test("старая папка-симлинк не обходится: ошибка сессии без номера в тексте, остальные сессии идут дальше", async (t) => {
+  const w = relayWorld(t);
+  sessionA(w);
+  const elsewhere = tmpRoot(t);
+  put(elsewhere, "real/x.txt", "x");
+  const key = PHONE + "_20_ru";
+  fs.symlinkSync(path.join(elsewhere, "real"), path.join(w.out, key));
+  const x = addSession(w, key, [preTurn(w, key, "Ход")]);
+  const elsewhereBefore = state(elsewhere);
+  const transcriptBefore = fs.readFileSync(x.file);
+
+  const s = await runScrub(runOpts(w, { apply: true }));
+  assert.deepEqual(s.errorList, [{ file: x.rel, code: "ESYMLINK" }]);
+  assert.equal(s.written, 1);
+  assert.ok(fs.lstatSync(path.join(w.out, key)).isSymbolicLink());
+  assert.deepEqual(state(elsewhere), elsewhereBefore);
+  assert.ok(fs.readFileSync(x.file).equals(transcriptBefore));
+});
+
+test("прерывание: при поднятом сигнале ничего не трогается, итог помечен", async (t) => {
+  const { w } = fullWorld(t);
+  const before = state(w.base);
+  const ac = new AbortController();
+  ac.abort();
+
+  const s = await runScrub(runOpts(w, { apply: true, signal: ac.signal }));
+  assert.equal(s.interrupted, true);
+  assert.equal(s.written, 0);
+  assert.deepEqual(state(w.base), before);
 });
