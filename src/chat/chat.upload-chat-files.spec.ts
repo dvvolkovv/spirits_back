@@ -253,6 +253,73 @@ describe('uploadAndChat — activeStreams (beginStream/endStream)', () => {
 });
 
 /**
+ * Ревью Б2 Step 5 (insights-backlog-fixes, 02.11.2026): endUploadTurn стоял
+ * только в closeStream, а closeStream зовётся из setImmediate-колбэка ПОСЛЕ
+ * persistUploadTurn и consolidateAfterChatPublic (три LLM-вызова подряд,
+ * карточка бизнеса — таймаут 120 с). Метка хода висела секунды-десятки секунд
+ * после того, как ответ уже доставлен клиенту: кабинет решал, что ассистент
+ * ещё работает, копил следующее сообщение, а когда всё же отправлял —
+ * получал в ответ ложную INTERRUPTED_TURN_NOTE (прошлый ход на самом деле уже
+ * закончился). У текстового хода (streamUniversalAgent) метка снимается в
+ * finally сразу после `end`/res.end() — у хода с вложениями должно быть так
+ * же.
+ */
+describe('uploadAndChat — метка хода (active-turn)', () => {
+  beforeEach(() => { jest.clearAllMocks(); delete process.env.AGENT_URL; });
+
+  it('метка хода снимается сразу после ответа клиенту, не дожидаясь сохранения истории', async () => {
+    const pg = makePg();
+    const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
+    const svc = new ChatService(
+      pg as any, null as any, null as any, null as any, language as any,
+      undefined, undefined, undefined, undefined,
+    );
+    // persistUploadTurn — запись истории ПОСЛЕ ответа; подвешиваем её, чтобы
+    // отличить «ответ ушёл» от «история сохранена» — это два разных момента.
+    let resolvePersist!: (v: number) => void;
+    jest.spyOn(svc, 'persistUploadTurn').mockImplementation(
+      () => new Promise<number>((resolve) => { resolvePersist = resolve; }),
+    );
+    const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+    const ctrl = new ChatController(svc, jwtSvc as any, null as any, undefined);
+    // Апстрим — управляемый Readable (не sseStream-хелпер): нужно самому
+    // решать, когда поток заканчивается, чтобы поймать окно «поток ещё
+    // идёт».
+    const upstream = new Readable({ read() {} });
+    const post = jest.fn(async () => ({ data: upstream }));
+    (axios as any).default = { post };
+    (axios as any).post = post;
+    const req = {
+      headers: { authorization: 'Bearer token' },
+      files: [{ originalname: 'scan.jpg', buffer: Buffer.from('x'), mimetype: 'image/jpeg', size: 1 }],
+      body: { message: 'переведи', assistantId: '12' },
+    } as any;
+    const res = makeRes();
+
+    const done = ctrl.uploadAndChat(req, res);
+    for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+    // Поток ещё не закончился (ни delta, ни done не присылали) — ход обязан
+    // быть виден в учёте.
+    expect(svc.getActiveTurn('u1', '12').active).toBe(true);
+
+    upstream.push('data: ' + JSON.stringify({ type: 'delta', text: 'Перевёл.' }) + '\n');
+    upstream.push('data: ' + JSON.stringify({ type: 'done' }) + '\n');
+    upstream.push(null);
+    await done;
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+
+    // Ответ клиенту уже ушёл...
+    expect(res.end).toHaveBeenCalled();
+    // ...а persistUploadTurn всё ещё висит — но метка хода должна быть уже
+    // снята.
+    expect(svc.getActiveTurn('u1', '12').active).toBe(false);
+
+    resolvePersist(0);
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+  });
+});
+
+/**
  * M5: этот путь (upload-and-chat) ни разу не вызывает stripProductActionBlocks
  * — модельный ```product-action``` блок, скопированный из истории разговора
  * (та же модель видит actionId старых, уже решённых действий, что и в
