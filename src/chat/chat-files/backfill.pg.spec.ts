@@ -123,30 +123,35 @@ maybe('перенос ссылок релея против живого Postgres
       updatedRows: 0,
       copied: 0,
       masked: 0,
+      maskedOtherRows: 0,
     });
     expect(r.otherOrigins).toEqual(['(без хоста)', 'http://r.linkeon.io']);
     expect(s.persist).not.toHaveBeenCalled();
     expect(await all()).toEqual(before);
   });
 
-  it('--apply: живые — в хранилище, мёртвые — номер на солёный хэш; молодые, «не ответил» и чужой адрес не тронуты', async () => {
+  it('--apply: живые — в хранилище, мёртвые — номер на солёный хэш; чужой адрес и без хоста — тоже; молодые и «не ответил» не тронуты', async () => {
     const ids = await seed();
     const before = new Map((await all()).map((x) => [x.id, x.content]));
     const journal: JournalEntry[] = [];
 
     const r = await run(true, (e) => journal.push(e));
 
-    expect(r).toMatchObject({ copied: 1, masked: 2, updatedRows: 3, skippedRows: 0 });
+    expect(r).toMatchObject({ copied: 1, masked: 2, maskedOtherRows: 1, updatedRows: 4, skippedRows: 0 });
     expect(await contentOf(ids.mixed)).toBe(
       `[Скачать alive.pdf](${STORED}/alive.pdf)\n[Скачать gone.pdf](${masked(PHONE, '_12_ru/gone.pdf')})`,
     );
     expect(await contentOf(ids.uuid)).toBe(`[Скачать gone2.docx](${masked(UUID_USER, '_17_ru/sub/gone2.docx')})`);
     expect(await contentOf(ids.human)).toBe(`ссылка ${masked(PHONE, '_12_ru/gone.pdf')} не открывается`);
-    for (const k of ['silent', 'noId', 'young', 'other', 'plain'] as const) {
+    // Чужой хост и адрес без хоста — заведомо мёртвые: номер на тот же хэш, без вопроса релею.
+    expect(await contentOf(ids.other)).toBe(
+      `старый адрес http://r.linkeon.io/files/${relayFsKey(PHONE)}_12_ru/old.pdf и /files/${relayFsKey(PHONE)}_12/rel.pdf`,
+    );
+    for (const k of ['silent', 'noId', 'young', 'plain'] as const) {
       expect(await contentOf(ids[k])).toBe(before.get(ids[k]));
     }
     // В обработанных строках номера и uuid больше нет.
-    for (const k of ['mixed', 'uuid', 'human'] as const) {
+    for (const k of ['mixed', 'uuid', 'human', 'other'] as const) {
       const c = await contentOf(ids[k]);
       expect(c).not.toContain(PHONE);
       expect(c).not.toContain(UUID_USER);
@@ -158,9 +163,11 @@ maybe('перенос ссылок релея против живого Postgres
         { rowId: ids.mixed, relayUrl: `${P}/gone.pdf`, maskedUrl: masked(PHONE, '_12_ru/gone.pdf') },
         { rowId: ids.uuid, relayUrl: `${U}/sub/gone2.docx`, maskedUrl: masked(UUID_USER, '_17_ru/sub/gone2.docx') },
         { rowId: ids.human, relayUrl: `${P}/gone.pdf`, maskedUrl: masked(PHONE, '_12_ru/gone.pdf') },
+        { rowId: ids.other, linkFrom: `http://r.linkeon.io/files/${PHONE}`, linkTo: `http://r.linkeon.io/files/${relayFsKey(PHONE)}` },
+        { rowId: ids.other, linkFrom: `/files/${PHONE}`, linkTo: `/files/${relayFsKey(PHONE)}` },
       ]),
     );
-    expect(journal).toHaveLength(4);
+    expect(journal).toHaveLength(6);
   });
 
   it('откат по журналу возвращает строки слово в слово', async () => {
@@ -171,7 +178,7 @@ maybe('перенос ссылок релея против живого Postgres
 
     const r = await revertBackfill({ pg: pool, entries: journal, log: () => {} });
 
-    expect(r).toEqual({ reverted: 3, skipped: 0 });
+    expect(r).toEqual({ reverted: 4, skipped: 0 });
     expect(await all()).toEqual(before);
   });
 
@@ -183,7 +190,7 @@ maybe('перенос ссылок релея против живого Postgres
 
     const second = await run(true, (e) => journal.push(e));
 
-    expect(second).toMatchObject({ updatedRows: 0, copied: 0, masked: 0, maskable: 0 });
+    expect(second).toMatchObject({ updatedRows: 0, copied: 0, masked: 0, maskable: 0, otherRows: 0, maskedOtherRows: 0 });
     expect(journal).toEqual([]);
     expect(await all()).toEqual(after);
   });

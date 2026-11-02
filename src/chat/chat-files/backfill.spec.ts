@@ -7,6 +7,7 @@ import {
   JournalEntry,
   ProbeResult,
   SELECT_BACKFILL_ROWS_SQL,
+  maskForeignFilesLinks,
   maskRelayPaths,
   maskRelayUrl,
   revertBackfill,
@@ -126,6 +127,44 @@ describe('maskRelayPaths', () => {
   it('без соли — без изменений', () => {
     const t = '/tmp/agent-output/70000000000_12_ru/x.pdf';
     expect(maskRelayPaths(t, () => undefined)).toEqual({ text: t, swaps: [] });
+  });
+});
+
+// Ссылки /files/<id>_ под чужим хостом или без хоста: копировать неоткуда, и
+// релей их не отдаст — заведомо мёртвые. Ревью ветки (I3): номер в них — на
+// тот же солёный хэш, без проверки у релея.
+describe('maskForeignFilesLinks', () => {
+  it('чужой хост: номер — на солёный хэш, хост и хвост как были', () => {
+    expect(maskForeignFilesLinks(`старый адрес http://r.linkeon.io/files/70000000000_12_ru/old.pdf.`, AGENT, fsKey)).toEqual({
+      text: `старый адрес http://r.linkeon.io/files/${FK}_12_ru/old.pdf.`,
+      swaps: [{ linkFrom: 'http://r.linkeon.io/files/70000000000', linkTo: `http://r.linkeon.io/files/${FK}` }],
+    });
+  });
+
+  it('без хоста — тоже', () => {
+    expect(maskForeignFilesLinks('см. /files/70000000000_12/rel.pdf', AGENT, fsKey)).toEqual({
+      text: `см. /files/${FK}_12/rel.pdf`,
+      swaps: [{ linkFrom: '/files/70000000000', linkTo: `/files/${FK}` }],
+    });
+  });
+
+  it('uuid пользователя почты и адрес в скобках ссылки', () => {
+    const uuid = 'aaaaaaaa-0000-4000-8000-000000000001';
+    expect(maskForeignFilesLinks(`[файл](https://example.com/files/${uuid}_17_en/a.pdf)`, AGENT, fsKey).text).toBe(
+      `[файл](https://example.com/files/${FK}_17_en/a.pdf)`,
+    );
+  });
+
+  it('адрес под префиксом релея — не её дело (его решает ответ релея)', () => {
+    const t = `${P}/a.pdf`;
+    expect(maskForeignFilesLinks(t, AGENT, fsKey)).toEqual({ text: t, swaps: [] });
+  });
+
+  it('папка без идентификатора и без соли — без изменений', () => {
+    const t1 = `http://r.linkeon.io/files/${'cd'.repeat(16)}/x.pdf`;
+    expect(maskForeignFilesLinks(t1, AGENT, fsKey)).toEqual({ text: t1, swaps: [] });
+    const t2 = '/files/70000000000_12/rel.pdf';
+    expect(maskForeignFilesLinks(t2, AGENT, () => undefined)).toEqual({ text: t2, swaps: [] });
   });
 });
 
@@ -302,6 +341,26 @@ describe('revertBackfill', () => {
 
     expect(r).toEqual({ reverted: 1, skipped: 0 });
     expect(pg.table.get(1)).toBe(`[Скачать a.pdf](${P}/a.pdf) [Скачать gone.pdf](${P}/gone.pdf)`);
+  });
+
+  it('возвращает номер в чужих и безхостовых ссылках — и не трогает адрес релея с тем же хэшем', async () => {
+    const pg = makePg([
+      { id: 1, content: `${AGENT}/files/${FK}_12_ru/a.pdf и /files/${FK}_12/rel.pdf и http://r.linkeon.io/files/${FK}_12_ru/old.pdf` },
+    ]);
+
+    const r = await revertBackfill({
+      pg,
+      entries: [
+        { rowId: 1, linkFrom: '/files/70000000000', linkTo: `/files/${FK}` },
+        { rowId: 1, linkFrom: 'http://r.linkeon.io/files/70000000000', linkTo: `http://r.linkeon.io/files/${FK}` },
+      ],
+      log: jest.fn(),
+    });
+
+    expect(r).toEqual({ reverted: 1, skipped: 0 });
+    expect(pg.table.get(1)).toBe(
+      `${AGENT}/files/${FK}_12_ru/a.pdf и /files/70000000000_12/rel.pdf и http://r.linkeon.io/files/70000000000_12_ru/old.pdf`,
+    );
   });
 
   it('возвращает номер в путях релея по журналу', async () => {
