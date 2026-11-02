@@ -9,10 +9,16 @@
  *   npx ts-node scripts/rename-elevenlabs-voices.ts           # сухой прогон: число голосов и их voice_id
  *   npx ts-node scripts/rename-elevenlabs-voices.ts --apply   # переименовать у ElevenLabs
  *
- * Требует в окружении (берутся из .env, как у приложения): DATABASE_URL и,
- * для --apply, ELEVENLABS_API_KEY. Ключ не печатается. База не меняется:
- * voice_id после переименования тот же. Повторный --apply безвреден — даст
- * голосам новые случайные имена.
+ * Голоса — из user_voice и сироты: голоса аккаунта с именем user_*, которых в
+ * user_voice нет (перечень аккаунта — GET /v2/voices, нужен ключ и в сухом
+ * прогоне). В выводе — только число и voice_id, имён целиком нет.
+ *
+ * Требует в окружении (берутся из .env, как у приложения): DATABASE_URL и
+ * ELEVENLABS_API_KEY (без него сухой прогон покажет только user_voice). Ключ
+ * не печатается. База не меняется: voice_id после переименования тот же.
+ * Повторный --apply безвреден — даст голосам новые случайные имена. Код
+ * выхода 1 — если какой-то голос не переименован или при --apply не получен
+ * перечень аккаунта (сироты остались).
  */
 import 'dotenv/config';
 import { Client } from 'pg';
@@ -37,6 +43,10 @@ async function main() {
     });
     console.log(JSON.stringify(r));
     if (r.failed.length > 0) process.exitCode = 1;
+    if (apply && r.accountUserVoices === null) {
+      console.log('перечень голосов аккаунта не получен — сироты не переименованы');
+      process.exitCode = 1;
+    }
   } finally {
     await pg.end();
   }
