@@ -2299,7 +2299,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
             props: { assistant_id: assistantId, self_heal_retry: true },
           });
           await new Promise((r) => setTimeout(r, 800));
-          try { await callUpstreamOnce(); } catch (e: any) { this.logger.warn(`self-heal retry failed: ${e.message}`); }
+          // За пустой прогон и эту паузу в ТУ ЖЕ relaySid мог успеть прийти
+          // настоящий новый ход (его beginRelayRun переписал relayRunning
+          // поверх нашей метки — см. openMark). Повтор всё равно уйдёт в ту
+          // же сессию на релее и будет конкурировать с ним за неё, вплоть до
+          // того, что убьёт уже чужой, живой процесс. В этом случае повтор не
+          // запускаем — уступаем сессию новому ходу.
+          if (this.relayRunning.get(relaySid) !== relayMark) {
+            this.logger.warn(`self-heal retry skipped for ${relaySid} — a newer turn took over the session`);
+          } else {
+            try { await callUpstreamOnce(); } catch (e: any) { this.logger.warn(`self-heal retry failed: ${e.message}`); }
+          }
         }
       } finally {
         this.endRelayRun(relaySid, relayMark);
