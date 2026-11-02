@@ -463,6 +463,36 @@ test("CLI: без --apply — сухой прогон: счётчики на м�
   assert.deepEqual(state(root), before);
 });
 
+// На релей скрипт едет через stdin: ssh … 'node --input-type=module - <флаги>' < scripts/relay-scrub-phone.mjs.
+// Тогда argv[1] — "-", а import.meta.url — не путь к файлу.
+const viaStdin = (args, input = fs.readFileSync(SCRIPT)) =>
+  spawnSync(process.execPath, ["--input-type=module", "-", ...args], { input, encoding: "utf8" });
+
+test("CLI через stdin (так скрипт едет на релей): сухой прогон и --apply работают", (t) => {
+  const root = tmpRoot(t);
+  const file = put(root, "-tmp/a.jsonl", jsonl(user(turn())));
+  const journalPath = path.join(tmpRoot(t), "j.jsonl");
+
+  const dry = viaStdin(["--root", root]);
+  assert.equal(dry.status, 0, dry.stderr);
+  assert.match(dry.stdout, /^файлов со строкой: 1$/m);
+  assert.ok(fs.readFileSync(file).includes(PHONE), "сухой прогон файл не меняет");
+
+  const r = viaStdin(["--root", root, "--apply", "--journal", journalPath]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^записано файлов: 1$/m);
+  assert.ok(!fs.readFileSync(file).includes(PHONE));
+});
+
+test("импорт модуля из кода, пришедшего через stdin, сам проход не запускает", () => {
+  const r = viaStdin(
+    ["--root", "/нет/такого/каталога"],
+    "await import(" + JSON.stringify(pathToFileURL(SCRIPT).href) + "); console.log('импортирован');",
+  );
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout.trim(), "импортирован");
+});
+
 test("CLI: --apply меняет файлы и пишет журнал в домашний каталог с правами 600", (t) => {
   const root = tmpRoot(t);
   const home = tmpRoot(t);
