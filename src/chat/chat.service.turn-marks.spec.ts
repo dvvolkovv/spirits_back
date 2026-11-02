@@ -39,6 +39,31 @@ function startTurn(svc: ChatService, userId: string, message = 'привет') {
   return { upstream, done };
 }
 
+/**
+ * Как startTurn, но с доступом к fresh/probe — позиции 12/13/18 в сигнатуре
+ * streamUniversalAgent (userId, message, assistantId, agentId, history,
+ * profileText, res, agentName, agentDescription, agentSystemPrompt, req,
+ * fresh, freshSessionId, requestLang, clientTz, balanceBlock, agentCategory,
+ * probe, ui, storeBuild). Та же пара '7'/'7', что и у startTurn — ключ
+ * activeTurns совпадает.
+ */
+function startTurnOpts(
+  svc: ChatService,
+  userId: string,
+  message: string,
+  opts: { fresh?: boolean; freshSessionId?: string; probe?: boolean } = {},
+) {
+  const upstream = new Readable({ read() {} });
+  (axios.post as jest.Mock).mockResolvedValueOnce({ data: upstream });
+  const res: any = { status: jest.fn(), setHeader: jest.fn(), write: jest.fn(() => true), end: jest.fn() };
+  const done = (svc as any).streamUniversalAgent(
+    userId, message, '7', '7', [], '', res, 'Роман', '', '', undefined,
+    opts.fresh ?? false, opts.freshSessionId, undefined, undefined, undefined, undefined,
+    opts.probe ?? false,
+  );
+  return { upstream, done };
+}
+
 async function settle() {
   for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
 }
@@ -153,5 +178,46 @@ describe('строка о прерывании в реплике релея', ()
     t.upstream.push(DONE);
     t.upstream.push(null);
     await t.done;
+  });
+
+  it('чистый лист (fresh) не получает строку, даже если по паре уже идёт обычный ход', async () => {
+    const svc = makeService();
+    const first = startTurn(svc, 'u1');
+    first.upstream.push(DELTA);
+    await settle();
+    expect(svc.getActiveTurn('u1', '7').active).toBe(true);
+
+    const second = startTurnOpts(svc, 'u1', 'привет', {
+      fresh: true,
+      freshSessionId: 'u1_7_fresh_1730000000000',
+    });
+    second.upstream.push(DELTA);
+    await settle();
+
+    expect(lastRelayMessage()).not.toContain('тот ход прерван');
+
+    first.upstream.push(null);
+    second.upstream.push(DONE);
+    second.upstream.push(null);
+    await Promise.all([first.done, second.done]);
+  });
+
+  it('пинг мониторинга (probe) не получает строку, даже если по паре уже идёт ход', async () => {
+    const svc = makeService();
+    const first = startTurn(svc, 'u1');
+    first.upstream.push(DELTA);
+    await settle();
+    expect(svc.getActiveTurn('u1', '7').active).toBe(true);
+
+    const second = startTurnOpts(svc, 'u1', 'привет', { probe: true });
+    second.upstream.push(DELTA);
+    await settle();
+
+    expect(lastRelayMessage()).not.toContain('тот ход прерван');
+
+    first.upstream.push(null);
+    second.upstream.push(DONE);
+    second.upstream.push(null);
+    await Promise.all([first.done, second.done]);
   });
 });

@@ -385,3 +385,42 @@ describe('Маша: карточка продукта приписывается
     expect(savedText).not.toContain(FAKE_ID);
   });
 });
+
+/**
+ * Ревью Б2 Step 5 (insights-backlog-fixes, 02.11.2026): та же гонка меток
+ * идущих ходов, что у пути релея (chat.service.turn-marks.spec.ts), но у
+ * Маши — прерванный ход не должен снимать отметку нового хода по той же
+ * паре (находка «Затыков недели» 2ff1a026).
+ */
+describe('Маша в вебе: гонка меток хода', () => {
+  it('второй ход стартовал, первый дошёл до finally — отметка второго на месте', async () => {
+    const { svc, claudeCli } = makeService();
+    let resolveFirst!: (v: { text: string; costUsd: number }) => void;
+    let resolveSecond!: (v: { text: string; costUsd: number }) => void;
+    (claudeCli.textWithCost as jest.Mock)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveSecond = resolve; }));
+
+    const { res: res1 } = makeRes();
+    const { res: res2 } = makeRes();
+
+    const first = svc.streamChat(USER, 'Покажи мои продукты', '3', `${USER}_3`, 'Имя: Дмитрий', res1);
+    for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+    expect(svc.getActiveTurn(USER, '3').active).toBe(true);
+
+    const second = svc.streamChat(USER, 'ещё раз покажи', '3', `${USER}_3`, 'Имя: Дмитрий', res2);
+    for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+
+    // Первый ход «дозвонился» до CLI и дошёл до finally — отметка нового
+    // (второго) хода по той же паре не должна слететь вместе с его чужой.
+    resolveFirst({ text: 'Первый ответ.', costUsd: 0.01 });
+    await first;
+    for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+    expect(svc.getActiveTurn(USER, '3').active).toBe(true);
+
+    resolveSecond({ text: 'Второй ответ.', costUsd: 0.01 });
+    await second;
+    for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+    expect(svc.getActiveTurn(USER, '3').active).toBe(false);
+  });
+});
