@@ -133,9 +133,12 @@ export class BalanceContextService {
         // обычное предупреждение поверх завершения.
         await this.grantWarning(userId, balance, opts.isGreeting);
 
+        // Число сообщений (forecast) уже названо строкой выше, в постоянной
+        // части блока («примерно на N сообщений при его обычном расходе») —
+        // здесь его не повторяем, только ссылаемся на него (находка ревью).
         const left = forecast == null
           ? `Баланс почти закончился — меньше ${NEAR_EMPTY_FALLBACK_TOKENS} токенов.`
-          : `Баланса хватит примерно на ${forecast} ${messagesWord(forecast)}.`;
+          : `Баланс почти закончился — прогноз выше.`;
 
         // «Сказано один раз» решает СЕРВЕР через отдельную отметку
         // (near_empty_told), а не модель по истории разговора: окно
@@ -213,8 +216,15 @@ export class BalanceContextService {
     let pairMedian: number | null = null;
     const agentId = assistantId && /^\d+$/.test(assistantId) ? parseInt(assistantId, 10) : null;
     if (agentId != null) {
-      // Таблица без индекса по user_id (~50 тыс. строк) — запрос делаем
-      // только в этой ветке, где баланс и так уже ниже потолка прогноза.
+      // Таблица без индекса по (user_id, agent_id) — seq scan по ~50 тыс.
+      // строк, ~9 мс и растёт. Ветка НЕ редкая: приветственный бонус новым
+      // пользователям — 25 000 токенов, это МЕНЬШЕ FORECAST_BALANCE_CEILING
+      // (30 000) — так что у заметной доли пользователей запрос уходит почти
+      // на каждом ходе, а не только «когда баланс уже низкий». Нужен индекс
+      // token_consumption_tasks (user_id, agent_id, created_at DESC); в
+      // стартовую миграцию его не класть — у проекта CREATE INDEX в
+      // стартовой миграции держит ShareLock на таблице при каждом старте
+      // приложения. Заводится отдельно, вручную, CREATE INDEX CONCURRENTLY.
       const pairRes = await this.pg.query(
         `SELECT tokens_to_consume AS amount FROM token_consumption_tasks
           WHERE user_id = $1 AND agent_id = $2

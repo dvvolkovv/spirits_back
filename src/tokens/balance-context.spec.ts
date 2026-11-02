@@ -199,9 +199,16 @@ describe('BalanceContextService — когда предупреждать (на�
 describe('BalanceContextService — бережное завершение на остатке', () => {
   it('прогноз ≤ 2 ответов — инструкция завершить смысловой блок', async () => {
     const block = await svc(fakePg({ spends: [400, 400, 400, 400, 400] })).buildContextForPrompt('u1', 800);
-    expect(block).toContain('хватит примерно на 2');
+    expect(block).toContain('примерно на 2 сообщения при его обычном расходе');
     expect(block).toContain('бережно завершить текущий смысловой блок');
     expect(block).toContain('Пополнить баланс');
+  });
+
+  it('число сообщений из прогноза не повторяется дважды — завершение ссылается на него, не повторяет', async () => {
+    const block = await svc(fakePg({ spends: [400, 400, 400, 400, 400] })).buildContextForPrompt('u1', 800);
+    const count = (hay: string, needle: string) => hay.split(needle).length - 1;
+    expect(count(block, '2 сообщения')).toBe(1);
+    expect(block).toContain('прогноз выше');
   });
 
   it('на остатке отдельного предупреждения нет — одна инструкция, не две', async () => {
