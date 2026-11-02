@@ -15,10 +15,14 @@ import { signLinkeonToolToken } from '../mcp/linkeon-tool.token';
  * Чистые функции по той же причине, что products-relay-fields.ts: конструктор
  * ChatService и так на 26 зависимостей.
  *
- * Шлются только на путях с известным пользователем: ход веб-ассистента, ход с
- * вложениями, agentReply с пользователем. Анонимным и служебным ходам
- * (clean-ask, первый контакт, автоблог, проба качества) — нет; сторож —
- * linkeon-fields-anonymous.spec.ts.
+ * Токен и адрес точки шлются только на путях с известным пользователем: ход
+ * веб-ассистента, ход с вложениями, agentReply с явным linkeonTools.
+ * Анонимным и служебным ходам (clean-ask, первый контакт, автоблог) — ни
+ * одного поля; сторож — linkeon-fields-anonymous.spec.ts.
+ *
+ * fs_key — у любого agentReply, и без инструментов тоже (проба качества,
+ * итоги звонка, проверка версии ассистента): это имя папки хода, а не
+ * инструмент. Спека 2026-11-02-pii-out-of-prompts-design.md, п. 3.
  */
 export interface LinkeonRelayFields {
   linkeon_token: string;
