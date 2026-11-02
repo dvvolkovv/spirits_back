@@ -294,3 +294,135 @@ describe('ClaudeCliService — признаки сбоя (kind, access, status, 
     expect(full).toMatchObject({ toolUsed: true, kind: 'auth', access: true, status: 401, refusal: true });
   });
 });
+
+/**
+ * Цепочка Claude → Qwen → Kimi при сырых текстах с маркером: переход идёт по
+ * признакам попытки (текст ошибки безопасен и для классификации не годится),
+ * журналы и итоговая ошибка — из безопасных текстов, у итоговой — сводные
+ * признаки: вид — сильнейший по попыткам, доступ — хоть одна попытка с ним.
+ */
+describe('ClaudeCliService — цепочка при сырых текстах с маркером', () => {
+  const RAW_401 = (who: string) =>
+    JSON.stringify({ is_error: true, api_error_status: 401, result: `Failed to authenticate. API Error: 401 ${who} ${SECRET}` });
+  /** Ключ i-го запуска; undefined — запуск Claude (своего окружения нет). */
+  const tokenOf = (i: number) => spawnMock.mock.calls[i][2]?.env?.ANTHROPIC_AUTH_TOKEN as string | undefined;
+
+  beforeEach(() => {
+    process.env.QWEN_FALLBACK_API_KEY = 'sk-sp-test';
+    process.env.KIMI_FALLBACK_API_KEY = 'sk-kimi-test';
+  });
+
+  it('Claude 401 → Qwen 401 → отвечает Kimi; окна по признаку доступа; в журналах — безопасный текст', async () => {
+    spawnMock
+      .mockImplementationOnce(() => fakeProc(RAW_401('claude'), 1, `Error: ${SECRET}`))
+      .mockImplementationOnce(() => fakeProc(RAW_401('qwen'), 1))
+      .mockImplementationOnce(() => fakeProc(OK('ок от kimi')));
+    const svc = new ClaudeCliService();
+    expect(await svc.text('x')).toBe('ок от kimi');
+    expect(spawnMock).toHaveBeenCalledTimes(3);
+    expect(tokenOf(0)).toBeUndefined();
+    expect(tokenOf(1)).toBe('sk-sp-test');
+    expect(tokenOf(2)).toBe('sk-kimi-test');
+    const st = svc.fallbackStats();
+    expect(st.breakerOpenUntil).toBeGreaterThan(0);
+    expect(st.providers.qwen.downUntil).toBeGreaterThan(0);
+    expect(st.providers).toMatchObject({ qwen: { ok: 0, failed: 1 }, kimi: { ok: 1, failed: 0 } });
+    const log = logged();
+    expect(log).toContain('claude CLI → запасной Qwen qwen3.6-flash (auth): claude CLI код выхода 1: auth, status 401');
+    expect(log).toContain('Qwen → запасной Kimi k3.1-pro (auth): claude CLI код выхода 1: auth, status 401');
+    expect(log.join('\n')).not.toMatch(LEAK);
+  });
+
+  it('упали все — итоговая ошибка: склейка безопасных текстов, сводные признаки, маркера нет', async () => {
+    spawnMock
+      .mockImplementationOnce(() => fakeProc(RAW_401('claude'), 1))
+      .mockImplementationOnce(() => fakeProc(RAW_401('qwen'), 1, `Error: ${SECRET}`))
+      .mockImplementationOnce(() => fakeProc(RAW_401('kimi'), 1));
+    const err = await new ClaudeCliService().text('x').catch((e) => e);
+    expect(err).toBeInstanceOf(ClaudeCliCallError);
+    expect(err.message).toBe([
+      'claude CLI код выхода 1: auth, status 401',
+      'qwen fallback: claude CLI код выхода 1: auth, status 401',
+      'kimi fallback: claude CLI код выхода 1: auth, status 401',
+    ].join(' | '));
+    expect(err).toMatchObject({ kind: 'auth', access: true, toolUsed: false });
+    expect(String(err.stack)).not.toMatch(LEAK);
+    const log = logged();
+    expect(log).toContain(`запасные тоже не ответили: ${err.message}`);
+    expect(log.join('\n')).not.toMatch(LEAK);
+  });
+
+  it('сводный вид — сильнейший: лимит Claude, таймаут Qwen → weekly_limit, доступ есть', async () => {
+    spawnMock
+      .mockImplementationOnce(() => fakeProc(JSON.stringify({ is_error: true, result: "You've hit your weekly limit · resets Nov 3" }), 0))
+      .mockImplementationOnce(() => hangingProc());
+    const err = await new ClaudeCliService().text('x', { timeoutMs: 50 }).catch((e) => e);
+    expect(err).toBeInstanceOf(ClaudeCliCallError);
+    expect(err.message).toMatch(
+      /^claude CLI ошибка: weekly_limit, You've hit your weekly limit · resets Nov 3 \| qwen fallback: claude CLI timeout after \d+ms$/,
+    );
+    expect(err).toMatchObject({ kind: 'weekly_limit', access: true });
+    expect(spawnMock).toHaveBeenCalledTimes(2); // таймаут Qwen — не сбой доступа, Kimi не пробуется
+  });
+
+  it('ни одной попытки со сбоем доступа — access false: выбранный Kimi с неверным JSON, Claude по таймауту', async () => {
+    spawnMock
+      .mockImplementationOnce(() => fakeProc(`${SECRET} не JSON`, 0))
+      .mockImplementationOnce(() => hangingProc());
+    const err = await new ClaudeCliService().text('x', { provider: 'kimi', timeoutMs: 50 }).catch((e) => e);
+    expect(err).toBeInstanceOf(ClaudeCliCallError);
+    expect(err.message).toMatch(
+      /^kimi \(выбран\): claude CLI неверный JSON \(stdout \d+ байт\): other \| claude fallback: claude CLI timeout after \d+ms$/,
+    );
+    expect(err).toMatchObject({ kind: 'timeout', access: false });
+    expect(tokenOf(0)).toBe('sk-kimi-test');
+    expect(tokenOf(1)).toBeUndefined();
+    expect(logged().join('\n')).not.toMatch(LEAK);
+  });
+
+  it('модель рубильника под noFallback (ход гостя) — одна попытка: «для всех», безопасный текст, признаки', async () => {
+    spawnMock.mockImplementationOnce(() => fakeProc(RAW_401('qwen'), 1));
+    const err = await new ClaudeCliService()
+      .text('x', { provider: 'qwen', providerChoice: 'global', noFallback: true })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(ClaudeCliCallError);
+    expect(err.message).toBe('qwen (для всех): claude CLI код выхода 1: auth, status 401');
+    expect(err).toMatchObject({ kind: 'auth', access: true });
+  });
+
+  it('отказ текстом последней попыткой — его текст в склейке, вид в сводке', async () => {
+    delete process.env.KIMI_FALLBACK_API_KEY;
+    spawnMock
+      .mockImplementationOnce(() => fakeProc(RAW_401('claude'), 1))
+      .mockImplementationOnce(() => fakeProc(OK("You've hit your limit · resets 3pm", 0)));
+    const err = await new ClaudeCliService().text('x').catch((e) => e);
+    expect(err).toBeInstanceOf(ClaudeCliCallError);
+    expect(err.message).toBe(
+      "claude CLI код выхода 1: auth, status 401 | qwen fallback: claude CLI отказ: weekly_limit, You've hit your limit · resets 3pm",
+    );
+    expect(err).toMatchObject({ kind: 'weekly_limit', access: true });
+  });
+
+  it('сбой доступа без повтора (инструмент с последствиями) — журнал с безопасным текстом', async () => {
+    spawnMock.mockImplementationOnce(() => fakeProc(lines(
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'mcp__products__manage_product', input: {} }] } },
+      { type: 'result', is_error: true, api_error_status: 529, result: `API Error: 529 Overloaded ${SECRET}` },
+    ), 1));
+    const err = await new ClaudeCliService().text('x', STREAM).catch((e) => e);
+    expect(err).toMatchObject({ kind: 'overloaded', access: true, toolUsed: true });
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(logged()).toContain(
+      'claude CLI: сбой доступа (overloaded), вызов не повторяется (инструмент с последствиями или показанный текст): claude CLI код выхода 1: overloaded, status 529',
+    );
+    expect(logged().join('\n')).not.toMatch(LEAK);
+  });
+
+  it('ошибка без признаков (не от CLI) — по тексту, как раньше', async () => {
+    delete process.env.KIMI_FALLBACK_API_KEY;
+    spawnMock
+      .mockImplementationOnce(() => { throw new Error('API Error: 429 Too Many Requests'); })
+      .mockImplementationOnce(() => fakeProc(OK('q')));
+    expect(await new ClaudeCliService().text('x')).toBe('q');
+    expect(tokenOf(1)).toBe('sk-sp-test');
+  });
+});
