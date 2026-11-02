@@ -1953,6 +1953,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
     let turnProvider: LlmProvider | undefined;
     let turnFallback = false;
 
+    // Self-heal ниже может пропустить повтор, потому что за пустой прогон и
+    // паузу сессию перехватил настоящий новый ход (relayRunning.get(relaySid)
+    // !== relayMark) — тогда ЭТОТ ход завершается пустым не по вине модели:
+    // ответ на самом деле уже готовит другой, более новый ход той же сессии.
+    // persistResponse ниже из-за этого флага не подставляет заглушку «Ответ
+    // не пришёл, попробуйте ещё раз» в историю: совет пробовать снова был бы
+    // ложным, пробовать уже не нужно. В поток клиенту заглушка и без этого
+    // флага не попадает — здесь, в обычном завершении, туда уходит fullText
+    // (пустая строка), заглушка живёт только в этом aiText для истории.
+    let selfHealSkippedForTakeover = false;
+
     // Single persistence point — dedupe via `saved` flag so success and error paths
     // both call but only one actually writes.
     let saved = false;
@@ -2015,7 +2026,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // If empty on final: don't pollute history with a stub AI row; save user message + a brief retry-hint.
       // (Frontend will reload history; user can simply resend.)
       const aiText = fullText
-        || (final ? '_Ответ не пришёл. Попробуйте отправить сообщение ещё раз._' : '');
+        || (final && !selfHealSkippedForTakeover ? '_Ответ не пришёл. Попробуйте отправить сообщение ещё раз._' : '');
       if (!aiText) return; // skip empty intermediate persists
       // ЭТО реальная точка списания (ниже addTokenTask). Логируем только здесь:
       // путь показа считает то же самое, дублировать в лог незачем.
@@ -2324,6 +2335,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // запускаем — уступаем сессию новому ходу.
           if (this.relayRunning.get(relaySid) !== relayMark) {
             this.logger.warn(`self-heal retry skipped for ${relaySid} — a newer turn took over the session`);
+            selfHealSkippedForTakeover = true;
           } else {
             try { await callUpstreamOnce(); } catch (e: any) { this.logger.warn(`self-heal retry failed: ${e.message}`); }
           }
