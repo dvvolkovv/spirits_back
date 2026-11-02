@@ -48,40 +48,146 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 // иногда с «+».
 const PHRASE_RE = /Current user phone \(use as the `userId` argument for any mcp__linkeon__\* tool call\): \+?\d{10,15}/g;
 const REPLACEMENT = "Current user: identifier omitted.";
-// Дешёвая проверка до регулярки: в подавляющем большинстве строк фразы нет.
 const MARKER = "Current user phone (";
+// Быстрая проверка до регулярок: без десяти цифр подряд номера в строке нет.
+const LONG_DIGITS = /[0-9]{10}/;
+// Номер как целое число: не часть более длинной цифровой последовательности.
+const ANY_PHONE_RE = /(?<![0-9])\+?([0-9]{10,15})(?![0-9])/g;
 
 const NL = 0x0a;
 const isJsonSpace = (c) => c === 0x20 || c === 0x09 || c === 0x0d || c === 0x0a;
+// Символы имён папок и загрузок релея (paths.mjs: всё прочее он заменял на "_").
+const isNameCh = (c) => c !== undefined && /[A-Za-z0-9._-]/.test(c);
+// Имя записи в тексте кончилось: дальше разделитель пути, пробел, кавычка,
+// скобка, знак препинания — или точка в конце предложения.
+function endsName(s, i) {
+  const c = s[i];
+  if (c === undefined || /[\s/"'`)\]}>,;:|*?<&]/.test(c)) return true;
+  return c === "." && (s[i + 1] === undefined || /\s/.test(s[i + 1]));
+}
+
+// Правила транскрипта одной телефонной сессии:
+// 1) строка «Current user phone …» → нейтральная;
+// 2) старая папка хода <oldDir> (имя целиком) → <fsKey>; запись, переименованная
+//    при конфликте, — на итоговое имя;
+// 3) загрузка <oldDir>_<имя> (имя — из загрузок этой сессии) → <fsKey>_<итоговое имя>;
+// 4) остальные вхождения номера владельца как целого числа → <fsKey>.
+// Номера других пользователей не трогаются; otherPhones говорит, есть ли в
+// строке номер из таблицы — для счётчика.
+export function sessionRules({
+  phone, oldDir, fsKey,
+  outNames = [], outRenames = new Map(), upRests = [], upRenames = new Map(),
+  tablePhones = new Set(),
+}) {
+  // Длинные имена первыми: «a b.txt» не должен стать «a» + « b.txt».
+  const byLength = (list) => [...new Set(list)].sort((a, b) => b.length - a.length);
+  const names = byLength(outNames);
+  const rests = byLength(upRests);
+  const ownPhoneRe = new RegExp("(?<![0-9])\\+?" + phone + "(?![0-9])", "g");
+  const upPrefix = oldDir + "_";
+
+  function dirs(s, counts) {
+    let out = "";
+    let from = 0;
+    let changed = false;
+    let i = s.indexOf(oldDir);
+    while (i !== -1) {
+      const end = i + oldDir.length;
+      if (isNameCh(s[i - 1]) || isNameCh(s[end])) {
+        i = s.indexOf(oldDir, i + 1);
+        continue;
+      }
+      let repl = fsKey;
+      let next = end;
+      if (s[end] === "/") {
+        const name = names.find((n) => s.startsWith(n, end + 1) && endsName(s, end + 1 + n.length));
+        if (name !== undefined && outRenames.has(name)) {
+          repl = fsKey + "/" + outRenames.get(name);
+          next = end + 1 + name.length;
+        }
+      }
+      out += s.slice(from, i) + repl;
+      from = next;
+      changed = true;
+      counts.dirs++;
+      i = s.indexOf(oldDir, next);
+    }
+    return changed ? out + s.slice(from) : s;
+  }
+
+  function uploads(s, counts) {
+    let out = "";
+    let from = 0;
+    let changed = false;
+    let i = s.indexOf(upPrefix);
+    while (i !== -1) {
+      const at = i + upPrefix.length;
+      const rest = isNameCh(s[i - 1]) ? undefined : rests.find((r) => s.startsWith(r, at) && endsName(s, at + r.length));
+      if (rest === undefined) {
+        i = s.indexOf(upPrefix, i + 1);
+        continue;
+      }
+      out += s.slice(from, i) + fsKey + "_" + (upRenames.get(rest) ?? rest);
+      from = at + rest.length;
+      changed = true;
+      counts.uploads++;
+      i = s.indexOf(upPrefix, from);
+    }
+    return changed ? out + s.slice(from) : s;
+  }
+
+  return {
+    transform(s, counts) {
+      if (!s.includes(MARKER) && !LONG_DIGITS.test(s)) return s;
+      let x = s.replace(PHRASE_RE, () => {
+        counts.phrase++;
+        return REPLACEMENT;
+      });
+      if (x.includes(oldDir)) x = uploads(dirs(x, counts), counts);
+      return x.replace(ownPhoneRe, () => {
+        counts.other++;
+        return fsKey;
+      });
+    },
+    otherPhones(s) {
+      if (!LONG_DIGITS.test(s)) return false;
+      for (const m of s.matchAll(ANY_PHONE_RE)) if (m[1] !== phone && tablePhones.has(m[1])) return true;
+      return false;
+    },
+    // Битая строка: есть ли в ней то, что правила заменили бы.
+    touches(s) {
+      return s.includes(MARKER) || s.search(ownPhoneRe) !== -1;
+    },
+  };
+}
 
 // Замены во всех строковых значениях разобранного JSON. Объект правится на
 // месте: присваивание существующему ключу его места в порядке ключей не меняет.
-function scrubValue(v, count) {
+function scrubValue(v, ctx) {
   if (typeof v === "string") {
-    if (!v.includes(MARKER)) return v;
-    return v.replace(PHRASE_RE, () => {
-      count.n++;
-      return REPLACEMENT;
-    });
+    const x = ctx.rules.transform(v, ctx.counts);
+    if (x !== v) ctx.changed = true;
+    if (!ctx.otherPhones && ctx.rules.otherPhones(x)) ctx.otherPhones = true;
+    return x;
   }
   if (v === null || typeof v !== "object") return v;
   if (Array.isArray(v)) {
     for (let i = 0; i < v.length; i++) {
-      const x = scrubValue(v[i], count);
+      const x = scrubValue(v[i], ctx);
       if (x !== v[i]) v[i] = x;
     }
     return v;
   }
   for (const k of Object.keys(v)) {
-    const x = scrubValue(v[k], count);
+    const x = scrubValue(v[k], ctx);
     if (x !== v[k]) v[k] = x;
   }
   return v;
 }
 
 // Одна строка файла (без "\n"). text === null — строка остаётся прежними байтами.
-function scrubLine(lineBuf) {
-  const res = { text: null, replacements: 0, broken: false, brokenWithPhrase: false, nonCanonical: false };
+function scrubLine(lineBuf, rules, counts) {
+  const res = { text: null, broken: false, brokenWithPhone: false, otherPhones: false, nonCanonical: false };
   if (lineBuf.length === 0) return res;
   const s = lineBuf.toString("utf8");
   // Как CLI при чтении: ведущие NUL пропускаются (остаются от оборванной
@@ -94,52 +200,51 @@ function scrubLine(lineBuf) {
   while (start < end && isJsonSpace(s.charCodeAt(start))) start++;
   if (start === end) return res; // пустая строка или одни пробелы
 
+  const core = s.slice(start, end);
   let value;
   try {
-    value = JSON.parse(s.slice(start, end));
+    value = JSON.parse(core);
   } catch {
-    // Битая строка остаётся как есть. Если в ней фраза — номер в ней остаётся,
+    // Битая строка остаётся как есть. Если в ней номер — он в ней остаётся,
     // и это должно быть видно в счётчиках.
     res.broken = true;
-    res.brokenWithPhrase = s.search(PHRASE_RE) !== -1;
+    res.brokenWithPhone = rules.touches(s);
     return res;
   }
-  const count = { n: 0 };
-  value = scrubValue(value, count);
-  if (count.n === 0) return res;
+  const ctx = { rules, counts, changed: false, otherPhones: false };
+  value = scrubValue(value, ctx);
+  res.otherPhones = ctx.otherPhones;
+  if (!ctx.changed) return res;
 
-  res.replacements = count.n;
   res.text = s.slice(0, start) + JSON.stringify(value) + s.slice(end);
   // CLI пишет строку как JSON.stringify(запись), поэтому повторный
-  // JSON.stringify совпадает с исходником везде, кроме фразы. Не совпал —
+  // JSON.stringify совпадает с исходником везде, кроме замен. Не совпал —
   // строку писал не CLI (или в ней не UTF-8): запись поменяет и форму JSON.
   // Смысл тот же, но это стоит видеть до применения.
-  res.nonCanonical =
-    res.text !== s.replace(PHRASE_RE, REPLACEMENT) || !Buffer.from(s, "utf8").equals(lineBuf);
+  res.nonCanonical = JSON.stringify(JSON.parse(core)) !== core || !Buffer.from(s, "utf8").equals(lineBuf);
   return res;
 }
 
-// Правила транскрипта одной сессии — заготовка интерфейса.
-export function sessionRules() {
-  throw new Error("не реализовано");
-}
-
-// Содержимое файла целиком. out === null — замен нет, файл писать не нужно.
-// Строки без замены попадают в out исходными байтами.
-export function scrubContent(buf) {
-  const sum = { out: null, replacements: 0, brokenLines: 0, brokenWithPhrase: 0, nonCanonicalLines: 0 };
+// Содержимое транскрипта целиком. out === null — замен нет, файл писать не
+// нужно. Строки без замены попадают в out исходными байтами.
+export function scrubContent(buf, rules) {
+  const sum = {
+    out: null,
+    counts: { phrase: 0, dirs: 0, uploads: 0, other: 0 },
+    otherPhones: 0, brokenLines: 0, brokenWithPhone: 0, nonCanonicalLines: 0,
+  };
   const changed = []; // [начало, конец, новые байты]
   let pos = 0;
   while (pos < buf.length) {
     let end = buf.indexOf(NL, pos);
     if (end === -1) end = buf.length;
-    const r = scrubLine(buf.subarray(pos, end));
+    const r = scrubLine(buf.subarray(pos, end), rules, sum.counts);
     if (r.broken) {
       sum.brokenLines++;
-      if (r.brokenWithPhrase) sum.brokenWithPhrase++;
+      if (r.brokenWithPhone) sum.brokenWithPhone++;
     }
+    if (r.otherPhones) sum.otherPhones++;
     if (r.text !== null) {
-      sum.replacements += r.replacements;
       if (r.nonCanonical) sum.nonCanonicalLines++;
       changed.push([pos, end, Buffer.from(r.text, "utf8")]);
     }
@@ -218,29 +323,6 @@ export async function commitFile(file, stat, out) {
   }
 }
 
-// Кандидаты: <root>/*/*.jsonl — только обычные файлы и каталоги. Dirent
-// симлинка — не файл и не каталог, так что симлинки не обходятся.
-async function listTranscripts(root) {
-  const files = [];
-  const errors = [];
-  const byName = (a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
-  for (const d of (await fsp.readdir(root, { withFileTypes: true })).sort(byName)) {
-    if (!d.isDirectory()) continue;
-    const dir = path.join(root, d.name);
-    let entries;
-    try {
-      entries = await fsp.readdir(dir, { withFileTypes: true });
-    } catch (e) {
-      errors.push({ file: d.name, code: e.code || e.name });
-      continue;
-    }
-    for (const f of entries.sort(byName)) {
-      if (f.isFile() && f.name.endsWith(".jsonl")) files.push(path.join(dir, f.name));
-    }
-  }
-  return { files, errors };
-}
-
 // Журнал применения: строка JSON на переписанный файл — имя, число замен,
 // время. Права 600. Если записей не было, а файл создан этим прогоном, он
 // удаляется: повторный прогон не оставляет после себя ничего.
@@ -271,188 +353,3 @@ async function openJournal(journalPath) {
   };
 }
 
-// Весь проход. Файлы — по одному: в памяти только текущий.
-// found = scanned + fresh + errors (+ непройденные при прерывании).
-export async function scrubTree(
-  { root, apply = false, minAgeMs = 15 * 60_000, journalPath = null, signal } = {},
-  { commit = commitFile } = {},
-) {
-  const s = {
-    found: 0, scanned: 0, withPhrase: 0, replacements: 0, written: 0, fresh: 0,
-    brokenLines: 0, brokenWithPhrase: 0, nonCanonicalLines: 0,
-    errors: 0, errorList: [], interrupted: false, journal: null,
-  };
-  const fail = (file, e) => {
-    s.errors++;
-    // Только код: в сообщениях бывает кусок содержимого.
-    s.errorList.push({ file, code: e.code || e.name || "Error" });
-  };
-
-  const { files, errors } = await listTranscripts(root);
-  s.found = files.length;
-  for (const { file, code } of errors) fail(file, { code });
-
-  const journal = apply ? await openJournal(journalPath) : null;
-  try {
-    for (const file of files) {
-      if (signal?.aborted) {
-        s.interrupted = true;
-        break;
-      }
-      const rel = path.relative(root, file);
-      try {
-        const snap = await readSnapshot(file, { minAgeMs });
-        if (snap.fresh) {
-          s.fresh++;
-          continue;
-        }
-        const r = scrubContent(snap.buf);
-        if (r.out && apply && (await commit(file, snap.stat, r.out)) === "changed") {
-          s.fresh++; // CLI дописал, пока мы читали: второй заход
-          continue;
-        }
-        s.scanned++;
-        s.brokenLines += r.brokenLines;
-        s.brokenWithPhrase += r.brokenWithPhrase;
-        if (!r.out) continue;
-        s.withPhrase++;
-        s.replacements += r.replacements;
-        s.nonCanonicalLines += r.nonCanonicalLines;
-        if (!apply) continue;
-        s.written++;
-        await journal.add({ file: rel, replacements: r.replacements, at: new Date().toISOString() });
-      } catch (e) {
-        fail(rel, e);
-      }
-    }
-  } finally {
-    if (journal) s.journal = await journal.close();
-  }
-  return s;
-}
-
-// ---------------------------------------------------------------- запуск
-
-const USAGE = `Использование: node --input-type=module - [--root <каталог>] [--apply] [--min-age-min <минуты>] [--journal <файл>] < relay-scrub-phone.mjs
-               (или node relay-scrub-phone.mjs с теми же флагами)
-  --root         каталог проектов claude, по умолчанию ~/.claude/projects; смотрятся <root>/*/*.jsonl
-  --apply        заменить; без него — сухой прогон, только счётчики
-  --min-age-min  не трогать файлы, менявшиеся за последние N минут; по умолчанию 15
-  --journal      журнал применения; по умолчанию ~/scrub-phone-line-<метка>.jsonl, права 600
-`;
-
-function parseCli(argv) {
-  const { values } = parseArgs({
-    args: argv,
-    strict: true,
-    allowPositionals: false,
-    options: {
-      root: { type: "string" },
-      apply: { type: "boolean" },
-      "min-age-min": { type: "string" },
-      journal: { type: "string" },
-      help: { type: "boolean", short: "h" },
-    },
-  });
-  const rawAge = values["min-age-min"] ?? "15";
-  const minutes = rawAge.trim() === "" ? NaN : Number(rawAge);
-  if (!Number.isFinite(minutes) || minutes < 0) throw new Error("--min-age-min: нужно число минут, не меньше 0");
-  const home = os.homedir();
-  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z"); // 20261102T153000Z
-  return {
-    help: !!values.help,
-    apply: !!values.apply,
-    root: path.resolve(values.root ?? path.join(home, ".claude", "projects")),
-    minAgeMs: minutes * 60_000,
-    journalPath: path.resolve(values.journal ?? path.join(home, "scrub-phone-line-" + stamp + ".jsonl")),
-  };
-}
-
-function report(s, { root, apply }) {
-  const lines = [
-    "scrub-phone-line: " + (apply ? "применение" : "сухой прогон — файлы не меняются (замена — с --apply)"),
-    "каталог: " + root,
-    "найдено транскриптов: " + s.found,
-    "файлов просмотрено: " + s.scanned,
-    "пропущено свежих: " + s.fresh + (s.fresh ? " — пройти вторым заходом позже" : ""),
-    "файлов со строкой: " + s.withPhrase,
-    "замен: " + s.replacements,
-  ];
-  if (apply) lines.push("записано файлов: " + s.written);
-  lines.push(
-    "битых строк: " + s.brokenLines + ", из них с фразой (номер в них остался): " + s.brokenWithPhrase,
-    "строк, где JSON.stringify меняет не только фразу: " + s.nonCanonicalLines,
-    "ошибок: " + s.errors,
-  );
-  if (apply) lines.push("журнал: " + (s.journal ?? "не создан — записывать нечего"));
-  if (s.interrupted) lines.push("ПРЕРВАНО: пройдены не все файлы, итог неполный");
-  return lines.join("\n") + "\n";
-}
-
-export async function main(argv = process.argv.slice(2), out = process.stdout, err = process.stderr) {
-  let opts;
-  try {
-    opts = parseCli(argv);
-  } catch (e) {
-    err.write("scrub-phone-line: " + e.message + "\n\n" + USAGE);
-    return 2;
-  }
-  if (opts.help) {
-    out.write(USAGE);
-    return 0;
-  }
-  try {
-    if (!(await fsp.stat(opts.root)).isDirectory()) throw withCode("ENOTDIR");
-  } catch (e) {
-    err.write("scrub-phone-line: нет каталога " + opts.root + " (" + (e.code || e.name) + ")\n");
-    return 2;
-  }
-
-  // Ctrl+C и SIGTERM дают доделать текущий файл: временный файл не остаётся.
-  const ac = new AbortController();
-  const stop = () => ac.abort();
-  process.once("SIGINT", stop);
-  process.once("SIGTERM", stop);
-  let s;
-  try {
-    s = await scrubTree({
-      root: opts.root,
-      apply: opts.apply,
-      minAgeMs: opts.minAgeMs,
-      journalPath: opts.journalPath,
-      signal: ac.signal,
-    });
-  } catch (e) {
-    // Сюда доходят ошибки вне прохода по файлам — каталог, журнал. Если не
-    // открылся журнал, ни один файл ещё не тронут. В сообщении — путь, не
-    // содержимое.
-    err.write("scrub-phone-line: " + (e.code || e.name) + (e.path ? " " + e.path : "") + "\n");
-    return 2;
-  } finally {
-    process.off("SIGINT", stop);
-    process.off("SIGTERM", stop);
-  }
-  out.write(report(s, opts));
-  for (const { file, code } of s.errorList) err.write("ошибка: " + file + ": " + code + "\n");
-  return s.interrupted ? 130 : s.errors ? 1 : 0;
-}
-
-// Запущен как скрипт, а не импортирован (тесты).
-// - Через stdin (node - < relay-scrub-phone.mjs, так он едет на релей):
-//   argv[1] — "-", а import.meta.url — не путь к файлу ("<cwd>/[eval1]").
-//   Если же через stdin пришёл другой код и импортировал этот модуль, у
-//   модуля настоящий файл — тогда прогон не запускается.
-// - Файлом: сравнение с realpath — на случай запуска через симлинк,
-//   import.meta.url у Node — настоящий путь.
-function invokedDirectly() {
-  const entry = process.argv[1];
-  if (!entry) return false;
-  if (entry === "-") return !fs.existsSync(fileURLToPath(import.meta.url));
-  try {
-    return import.meta.url === pathToFileURL(fs.realpathSync(entry)).href;
-  } catch {
-    return false;
-  }
-}
-
-if (invokedDirectly()) process.exitCode = await main();
