@@ -219,4 +219,38 @@ describe('relayRunning на настоящей проводке (upload-конт
     t.up.push(DONE); t.up.push(null);
     await Promise.all([first, t.done]);
   });
+
+  it('T3: во время паузы self-heal сессию перехватил настоящий новый ход — повтор не запускается', async () => {
+    // Иначе повтор A, уйдя в ту же relaySid, конкурировал бы на релее с
+    // процессом B и мог бы убить именно его (находка: self-heal должен
+    // уступать живому ходу, а не бодаться с ним за сессию).
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] });
+
+    const svc = makeService();
+    const empty = new Readable({ read() {} });
+    queue.push(empty);
+    const res: any = { status: jest.fn(), setHeader: jest.fn(), write: jest.fn(() => true), end: jest.fn() };
+    const first = (svc as any).streamUniversalAgent(
+      'u1', 'привет', '7', '7', [], '', res, 'Роман', '', '', undefined, false, undefined,
+    );
+    await settle();
+    empty.push(null); // пустой поток — A готовится повторить через 800мс
+    await settle();
+
+    // Пока A ждёт паузу, по той же сессии реально стартует B — его
+    // beginRelayRun (внутри своего streamUniversalAgent) переписывает
+    // relayRunning поверх метки A.
+    const second = textTurn(svc, 'новый ход');
+    second.up.push(DELTA);
+    await settle();
+    expect(post).toHaveBeenCalledTimes(2);
+
+    // A просыпается от паузы — сессия уже не его, повтора быть не должно.
+    jest.advanceTimersByTime(800);
+    await settle();
+    expect(post).toHaveBeenCalledTimes(2);
+
+    second.up.push(DONE); second.up.push(null);
+    await Promise.all([first, second.done]);
+  });
 });
