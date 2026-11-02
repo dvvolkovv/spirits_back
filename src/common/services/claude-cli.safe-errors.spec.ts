@@ -202,7 +202,7 @@ describe('ClaudeCliService — сырой текст сбоя не выходи�
   });
 });
 
-describe('ClaudeCliService — признаки сбоя (kind, access, status, refusal)', () => {
+describe('ClaudeCliService — признаки сбоя (kind, access, status)', () => {
   it('401 в stream-json с api_error_status — auth, доступ, status 401', async () => {
     const err = await failOnce(() => fakeProc(lines({
       type: 'result', is_error: true, api_error_status: 401,
@@ -305,8 +305,9 @@ describe('ClaudeCliService — признаки сбоя (kind, access, status, 
 
   it.each([
     ["You've hit your limit · resets 3pm (Europe/Moscow)", 'weekly_limit', "You've hit your limit · resets 3pm (Europe/Moscow)"],
-    // Дата сброса в белый список не входит — только фраза.
-    ["You've hit your weekly limit · resets Nov 3", 'weekly_limit', "You've hit your weekly limit"],
+    // Дата сброса — в белом списке; текст после неё — нет.
+    ["You've hit your weekly limit · resets Nov 3", 'weekly_limit', "You've hit your weekly limit · resets Nov 3"],
+    [`You've hit your weekly limit · resets Nov 3 ${LATIN}`, 'weekly_limit', "You've hit your weekly limit"],
     [REFUSAL_WITH_ANSWER, 'auth', 'Invalid API key'],
   ])('отказ CLI в is_error — в message только фраза и хвост из белого списка: %p', async (result, kind, detail) => {
     const err = await failOnce(() => fakeProc(JSON.stringify({ is_error: true, result }), 0));
@@ -339,9 +340,13 @@ describe('ClaudeCliService — признаки сбоя (kind, access, status, 
     expect(bare.kind).toBeUndefined();
     expect(bare.access).toBeUndefined();
     expect(bare.status).toBeUndefined();
-    expect(bare.refusal).toBeUndefined();
-    const full = new ClaudeCliCallError('m', true, { kind: 'auth', access: true, status: 401, refusal: true });
-    expect(full).toMatchObject({ toolUsed: true, kind: 'auth', access: true, status: 401, refusal: true });
+    const full = new ClaudeCliCallError('m', true, { kind: 'auth', access: true, status: 401 });
+    expect(full).toMatchObject({ toolUsed: true, kind: 'auth', access: true, status: 401 });
+  });
+
+  it('признака refusal у ошибки нет: его никто не читает', () => {
+    const err = new ClaudeCliCallError('m', false, { kind: 'weekly_limit', access: true, refusal: true } as any);
+    expect('refusal' in err).toBe(false);
   });
 });
 
@@ -409,7 +414,7 @@ describe('ClaudeCliService — цепочка при сырых текстах �
     const err = await new ClaudeCliService().text('x', { timeoutMs: 50 }).catch((e) => e);
     expect(err).toBeInstanceOf(ClaudeCliCallError);
     expect(err.message).toMatch(
-      /^claude CLI ошибка: weekly_limit, You've hit your weekly limit \| qwen fallback: claude CLI timeout after \d+ms$/,
+      /^claude CLI ошибка: weekly_limit, You've hit your weekly limit · resets Nov 3 \| qwen fallback: claude CLI timeout after \d+ms$/,
     );
     expect(err).toMatchObject({ kind: 'weekly_limit', access: true });
     expect(spawnMock).toHaveBeenCalledTimes(2); // таймаут Qwen — не сбой доступа, Kimi не пробуется

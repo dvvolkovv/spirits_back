@@ -216,6 +216,13 @@ describe('refusalDetail', () => {
     'You’ve hit your weekly limit · resets 11:30am',
     "You've hit your limit · resets 15:00",
     "You've hit your limit · resets 9:05pm (America/New_York)",
+    // Дата сброса: месяц — три буквы с заглавной, день — одна-две цифры; дальше
+    // время через пробел или «, » и зона — как у одного времени.
+    "You've hit your weekly limit · resets Nov 3",
+    "You've hit your weekly limit · resets Nov 3, 11am (Europe/Moscow)",
+    "You've hit your weekly limit · resets Nov 3 11am",
+    "You've hit your weekly limit · resets Nov 3 (UTC)",
+    'You’ve hit your weekly limit · resets Dec 15, 3:30pm',
     'Not logged in · Please run /login',
     'Invalid API key · Please run /login',
     'Please run /login',
@@ -235,8 +242,16 @@ describe('refusalDetail', () => {
     ["You've hit your limit · resets soon, SECRET-FROM-ANSWER", "You've hit your limit"],
     ['Not logged in · Please run /login SECRET-FROM-ANSWER', 'Not logged in'],
     ['Not logged in SECRET-FROM-ANSWER · Please run /login', 'Not logged in'],
-    // Дата сброса в белый список не входит — только время.
-    ["You've hit your weekly limit · resets Nov 3", "You've hit your weekly limit"],
+    // После даты — только время и зона; латинский текст ответа — нет.
+    ["You've hit your weekly limit · resets Nov 3 SECRET-FROM-ANSWER", "You've hit your weekly limit"],
+    ["You've hit your weekly limit · resets Nov 3, SECRET-FROM-ANSWER", "You've hit your weekly limit"],
+    ["You've hit your weekly limit · resets Nov 3, 11am SECRET-FROM-ANSWER", "You've hit your weekly limit"],
+    // Строгий формат даты: запятая — только с пробелом, месяц — ровно три
+    // буквы с заглавной, год — не время.
+    ["You've hit your weekly limit · resets Nov 3,11am", "You've hit your weekly limit"],
+    ["You've hit your weekly limit · resets November 3", "You've hit your weekly limit"],
+    ["You've hit your weekly limit · resets nov 3", "You've hit your weekly limit"],
+    ["You've hit your weekly limit · resets Nov 3, 2026", "You've hit your weekly limit"],
     // Зона — только буквы и _/+-; цифры (UTC+3) — уже не зона.
     ["You've hit your limit · resets 3pm (UTC+3)", "You've hit your limit"],
     // Время — с am/pm или с минутами; голое число — нет.
