@@ -810,9 +810,10 @@ test("повторный прогон ничего не находит и нич
   assert.deepEqual(state(w.base), before);
 });
 
-test("--finish: пока есть работа — отказ и всё на месте; после прохода — удаляет таблицу и карту", async (t) => {
+test("--finish: пока есть работа — отказ и всё на месте; после прохода — удаляет таблицу и обе карты", async (t) => {
   const w = relayWorld(t);
   sessionA(w);
+  saveStandMap(w);
 
   const early = await finishScrub(runOpts(w));
   assert.equal(early.ok, false);
@@ -824,8 +825,8 @@ test("--finish: пока есть работа — отказ и всё на м�
   assert.ok(fs.existsSync(w.statePath));
   const done = await finishScrub(runOpts(w));
   assert.equal(done.ok, true, done.reasons.join("; "));
-  assert.deepEqual(done.removed.sort(), [w.mapPath, w.statePath].sort());
-  assert.ok(!fs.existsSync(w.mapPath) && !fs.existsSync(w.statePath));
+  assert.deepEqual(done.removed.sort(), [w.mapPath, w.statePath, w.standMapPath].sort());
+  assert.ok(!fs.existsSync(w.mapPath) && !fs.existsSync(w.statePath) && !fs.existsSync(w.standMapPath));
 });
 
 test("--finish отказывает, пока у сессии без fs_key номер в транскрипте: причина названа", async (t) => {
