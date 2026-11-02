@@ -894,6 +894,9 @@ function parseCli(argv) {
     },
   });
   if (values.apply && values.finish) throw new Error("--finish — отдельным запуском, без --apply");
+  // --finish проверяет по карте и её же удаляет: без карты недоделанные сессии
+  // выглядели бы как «без fs_key», и таблица ушла бы раньше времени.
+  if (values.finish && !values["fs-key-map"]) throw new Error("--finish — только с --fs-key-map");
   const rawAge = values["min-age-min"] ?? "15";
   const minutes = rawAge.trim() === "" ? NaN : Number(rawAge);
   if (!Number.isFinite(minutes) || minutes < 0) throw new Error("--min-age-min: нужно число минут, не меньше 0");
