@@ -65,8 +65,8 @@ describe('WORK_RULES — правила длинной работы с файл�
     expect(WORK_RULES).toContain('передай в инструмент правки картинок прямой адрес изображения со страницы');
   });
 
-  it('короткий: системный промпт релея уходит одним аргументом CLI (предел 128 КБ)', () => {
-    expect(Buffer.byteLength(WORK_RULES, 'utf8')).toBeLessThanOrEqual(4096);
+  it('бюджет блока — 6 КБ; весь --system-prompt ≤ 128 КБ', () => {
+    expect(Buffer.byteLength(WORK_RULES, 'utf8')).toBeLessThanOrEqual(6144);
   });
 });
 

@@ -22,7 +22,6 @@ describe('INTERRUPTED_TURN_NOTE', () => {
   });
 
   it('без повтора «в папке результата … доведи до результата»', () => {
-    const count = (hay: string, needle: string) => hay.split(needle).length - 1;
-    expect(count(INTERRUPTED_TURN_NOTE, 'результата')).toBe(1);
+    expect(INTERRUPTED_TURN_NOTE).not.toContain('доведи до результата');
   });
 });

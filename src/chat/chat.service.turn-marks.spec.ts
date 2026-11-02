@@ -200,7 +200,7 @@ describe('строка о прерывании в реплике релея', ()
 
   it('другая сессия релея (другой ассистент) строку не включает', async () => {
     const svc = makeService();
-    // Имитирует идущий процесс релея ДРУГОГО ассистента той же пары —
+    // Имитирует идущий процесс релея другого ассистента ТОГО ЖЕ пользователя —
     // beginRelayRun, а не beginUploadTurn: тут проверяется изоляция по
     // relaySid (ключ интересующей нас карты relayRunning), а не activeTurns.
     const otherSid = relaySessionKey('u1', '12', 'ru');
@@ -240,6 +240,10 @@ describe('строка о прерывании в реплике релея', ()
     await settle();
     // Поток first уже закончился (его relaySid снят из relayRunning), но
     // first.done ещё не резолвился — копия файла висит на storeRelayLinks.
+    // activeTurns (в отличие от relayRunning) занят весь ход, включая эту
+    // копию, — кабинету ход всё ещё виден как идущий.
+    expect(svc.getActiveTurn('u1', '7').active).toBe(true);
+    expect(typeof resolveCopy).toBe('function');
 
     const second = startTurn(svc, 'u1', 'ещё раз');
     second.upstream.push(DELTA);

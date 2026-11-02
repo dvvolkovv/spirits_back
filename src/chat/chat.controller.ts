@@ -401,7 +401,7 @@ export class ChatController {
     // Живой процесс релея этой сессии (relayRunning, ChatService.
     // beginRelayRun/endRelayRun) — тот же ключ relaySid, что и у текстового
     // хода (handoff.sessionId строится relaySessionKey, см. buildUploadHandoff):
-    // если текстовое сообщение той же пары придёт, пока этот процесс ещё жив,
+    // если текстовое сообщение той же сессии придёт, пока этот процесс ещё жив,
     // оно корректно увидит «тот ход прерван» (interrupted-turn.ts). Открыт
     // вокруг самого вызова релея, закрыт в finally ДО копирования файлов —
     // см. комментарий у объявления relayRunning в chat.service.ts.
