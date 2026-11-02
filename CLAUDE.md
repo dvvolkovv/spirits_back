@@ -424,7 +424,7 @@ cd ~/Downloads/spirits_back/tests && node runner.js  # api (32) + e2e (18) = 50
 - `POST /webhook/soulmate/chat` — стриминг чат (NDJSON: begin/item/end). Body: `{chatInput, assistant}` или `{message, assistantId}`
 - `GET /webhook/chat/history?assistantId=` — история чата
 - `DELETE /webhook/chat/history?assistantId=` — очистка истории
-- `POST /webhook/mcp/linkeon` — инструменты ассистентов релея (`mcp__linkeon__*`); Bearer — токен хода (`src/mcp/linkeon-tool.token.ts`), пользователь из подписи, аргумента `userId` нет. Ручная проверка — токен выпускается на самом сервере и не печатается:
+- `POST /webhook/mcp/linkeon` — инструменты ассистентов релея (`mcp__linkeon__*`); Bearer — токен хода (`src/mcp/linkeon-tool.token.ts`), пользователь из подписи, аргумента `userId` нет. Прежние `/mcp` и вход по общему секрету `MCP_SECRET` сняты (2026-11, спека `docs/superpowers/specs/2026-10-26-mcp-turn-token-design.md`). Ручная проверка — токен выпускается на самом сервере и не печатается:
   ```bash
   ssh dvolkov@212.113.106.202 'cd ~/spirits_back && umask 077 && node -e "require(\"dotenv\").config(); const t = require(\"./dist/mcp/linkeon-tool.token\").signLinkeonToolToken(\"70000000000\"); process.stdout.write(\"Authorization: Bearer \" + t + \"\\n\")" > /tmp/lt.hdr && curl -s -m 20 -X POST http://127.0.0.1:3001/webhook/mcp/linkeon -H @/tmp/lt.hdr -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}" | grep -o "\"name\":\"[a-z_]*\"" | head -3; rm -f /tmp/lt.hdr'
   ```
