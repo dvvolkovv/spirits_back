@@ -187,7 +187,11 @@ describe('строка о прерывании в реплике релея', ()
     await settle();
     expect(svc.getActiveTurn('u1', '7').active).toBe(true);
 
-    const second = startTurnOpts(svc, 'u1', 'привет', {
+    // Сообщение другое, не 'привет': совпадающий с first текст попал бы под
+    // dupKey-дедуп (userId+assistantId+message) и короткий путь «отвечаю на
+    // дубликат» молча вернул бы заготовленный текст без единого вызова
+    // axios.post — проверка стала бы пустой.
+    const second = startTurnOpts(svc, 'u1', 'начни заново', {
       fresh: true,
       freshSessionId: 'u1_7_fresh_1730000000000',
     });
@@ -209,7 +213,9 @@ describe('строка о прерывании в реплике релея', ()
     await settle();
     expect(svc.getActiveTurn('u1', '7').active).toBe(true);
 
-    const second = startTurnOpts(svc, 'u1', 'привет', { probe: true });
+    // Сообщение другое, не 'привет' (см. комментарий в тесте про fresh выше) —
+    // иначе dupKey-дедуп вернул бы заготовленный текст без вызова axios.post.
+    const second = startTurnOpts(svc, 'u1', 'пинг', { probe: true });
     second.upstream.push(DELTA);
     await settle();
 
