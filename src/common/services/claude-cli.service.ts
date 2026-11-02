@@ -9,6 +9,7 @@ import { PgService } from './pg.service';
 import { GlobalLlmProviderService } from './global-llm-provider.service';
 import { neutralizeAtMentions, stripWordJoiner } from '../agent-guards';
 import {
+  aggregateKind,
   apiErrorStatus,
   classifyLlmError,
   cliDiagnostic,
@@ -503,6 +504,11 @@ export class ClaudeCliService implements OnModuleInit {
     const parts: string[] = skippedBySwitch
       ? [`${selected} (для всех) пропущен: не отвечает`]
       : (plan[0] !== 'claude' && plan[0] !== selected ? ['claude CLI пропущен (окно запасного пути)'] : []);
+    // Признаки попыток — для итоговой ошибки, если не ответит никто (spec
+    // 2026-11-02-safe-cli-errors): сводный вид — сильнейший по попыткам
+    // (aggregateKind), доступ — хоть одна попытка со сбоем доступа.
+    const kinds: LlmOutageKind[] = [];
+    let anyAccess = false;
     let reachedFallback = false;
     let attemptOpts = opts;
     for (let i = 0; i < plan.length; ) {
@@ -544,6 +550,8 @@ export class ClaudeCliService implements OnModuleInit {
       const signs = err instanceof ClaudeCliCallError ? err : null;
       const access = signs?.access ?? isFallbackWorthy(msg);
       const kind = signs?.kind ?? classifyLlmError(msg).kind;
+      kinds.push(kind);
+      if (access) anyAccess = true;
       // Сбой доступа — свидетельство для следующих вызовов, даже если этот
       // повторять нельзя: у Claude — окно Claude (если есть на кого
       // переключаться), у запасного — его окно «не отвечает». Под noFallback —
@@ -556,6 +564,7 @@ export class ClaudeCliService implements OnModuleInit {
       }
       if (emergency) this.fallback.recordOutcome(p, false);
       // «для всех» — у выбора рубильника; «выбран» — у личного, как раньше.
+      // msg — безопасный текст (у ошибок сервиса), склейка — из них же.
       const chosenTag = choice === 'global' ? 'для всех' : 'выбран';
       parts.push(parts.length === 0 ? (p === selected ? `${p} (${chosenTag}): ${msg}` : msg) : `${p} fallback: ${msg}`);
       const next = this.nextAttempt(plan, i);
@@ -580,7 +589,7 @@ export class ClaudeCliService implements OnModuleInit {
           if (refusal) return res!;
           if (p === 'claude') throw err;
         }
-        throw new Error(parts.join(' | '));
+        throw new ClaudeCliCallError(parts.join(' | '), false, { kind: aggregateKind(kinds), access: anyAccess });
       }
       const target = plan[next];
       const toLabel = target === 'claude'
@@ -591,7 +600,10 @@ export class ClaudeCliService implements OnModuleInit {
       attemptOpts = { ...opts, timeoutMs: fallbackTimeoutMs(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, Date.now() - startedAt) };
       i = next;
     }
-    throw new Error(parts.join(' | ') || 'claude CLI: пустой план попыток');
+    throw new ClaudeCliCallError(parts.join(' | ') || 'claude CLI: пустой план попыток', false, {
+      kind: aggregateKind(kinds),
+      access: anyAccess,
+    });
   }
 
   /** Подпись попытки в логе: «claude CLI», «Kimi (выбран)» (личный выбор),
