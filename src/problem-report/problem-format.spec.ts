@@ -49,8 +49,9 @@ describe('тексты в группу «Поддержка linkeon»', () => {
   });
 
   // Имя ассистента и незнакомый инструмент пишет не команда (custom_agents.name —
-  // пользователь, имя незнакомого tool на /mcp — вызывающий): в заголовке оба
-  // должны попасть в <code>, а не в <b>, иначе Telegram оживит ссылку/@упоминание.
+  // пользователь, имя незнакомого tool на /webhook/mcp/linkeon — вызывающий):
+  // в заголовке оба должны попасть в <code>, а не в <b>, иначе Telegram оживит
+  // ссылку/@упоминание.
   it('имя с @упоминанием и незнакомый инструмент — оба в заголовке внутри <code>', () => {
     const t = formatToolFailure({ assistant: '@admin evil.example', tool: 'evil.example', error: 'x', userId: 'u1' });
     expect(t.split('\n')[0]).toBe('🛠 <code>@admin evil.example</code>: не получилось выполнить <code>evil.example</code>');

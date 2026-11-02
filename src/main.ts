@@ -40,9 +40,11 @@ async function bootstrap() {
 
   // /webhook is the global prefix for backwards-compat with n8n routes.
   // Исключение `mcp` осталось от прежней точки /mcp (снята, спека
-  // docs/superpowers/specs/2026-10-26-mcp-turn-token-design.md). Оно
-  // покрывает ровно путь `mcp`: /webhook/mcp/linkeon и /webhook/mcp/products
-  // живут под префиксом — сторож в products-mcp.controller.spec.ts.
+  // docs/superpowers/specs/2026-10-26-mcp-turn-token-design.md). Маршрута
+  // `mcp` больше нет, и исключение ни на что не влияет: оно покрывает ровно
+  // путь `mcp`, а /webhook/mcp/linkeon и /webhook/mcp/products живут под
+  // префиксом. Снимать только вместе с обоими сторожами, которые держатся за
+  // эту строку: products-mcp.controller.spec.ts и mcp.controller.routes.spec.ts.
   app.setGlobalPrefix('webhook', {
     exclude: [{ path: 'mcp', method: RequestMethod.ALL }],
   });

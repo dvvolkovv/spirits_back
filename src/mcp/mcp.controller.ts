@@ -22,7 +22,7 @@ import { ProblemReportService, SUPPORT_NOTE } from '../problem-report/problem-re
 import { verifyLinkeonToolToken } from './linkeon-tool.token';
 
 /** Кто зовёт инструмент: релей с токеном хода (linkeon-tool.token.ts), пользователь из подписи. */
-export type McpCaller = { kind: 'token'; userId: string };
+export type McpCaller = { userId: string };
 
 /**
  * Инструменты Linkeon для ассистентов релея (mcp__linkeon__*). Спека:
@@ -55,7 +55,7 @@ export class McpController {
     const raw = (authHeader || '').replace(/^Bearer\s+/i, '').trim();
     if (!raw) throw new UnauthorizedException('Нет токена');
     try {
-      return { kind: 'token', userId: verifyLinkeonToolToken(raw).userId };
+      return { userId: verifyLinkeonToolToken(raw).userId };
     } catch (e: any) {
       throw new UnauthorizedException(`Токен не принят: ${e?.message}`);
     }
@@ -75,6 +75,8 @@ export class McpController {
   }
 
   private makeServer(authHeader?: string): Server {
+    // Только проверка токена: без него — 401 до того, как поднимется сервер.
+    // Пользователь отсюда не нужен — callTool разбирает токен на каждый вызов.
     this.caller(authHeader);
     const server = new Server(
       { name: 'linkeon-mcp', version: '1.0.0' },

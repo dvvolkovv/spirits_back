@@ -485,7 +485,7 @@ export class ChatToolsService {
     try {
       if (name === 'calculate_human_design') {
         // Бесплатный расчёт: токены не списываются, userId нужен только
-        // контроллеру /mcp для журнала вызовов.
+        // точке инструментов linkeon (mcp.controller.ts) для журнала вызовов.
         return await this.humanDesign.calculate(input);
       }
       if (name === 'manage_routine') {
