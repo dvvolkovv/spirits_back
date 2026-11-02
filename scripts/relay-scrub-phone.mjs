@@ -1,38 +1,40 @@
-// Разовая чистка транскриптов релея от строки «Current user phone …: <номер>».
+// Разовая чистка номера телефона на релее (r.linkeon.io). Спека: spirits_back
+// docs/superpowers/specs/2026-11-02-pii-out-of-prompts-design.md, п. 5,
+// вариант «слить старую папку в папку fs_key».
 //
-// До 01.11.2026 релей вклеивал в каждую реплику пользователя строку
+// До части Б (26.10–01.11.2026) релей называл папку хода и загрузки ключом
+// сессии — <номер>_<ассистент>[_<язык>] — и вклеивал в каждую реплику строку
 //   Current user phone (use as the `userId` argument for any mcp__linkeon__* tool call): <номер>
-// Из кода её убрали, но в транскриптах claude-сессий (~/.claude/projects/*/*.jsonl)
-// она осталась и уходит модели при каждом --resume, пока сессия не повернётся
-// по размеру. Скрипт заменяет её нейтральной «Current user: identifier omitted.»
-// прямо в транскриптах. Спека: spirits_back
-// docs/superpowers/specs/2026-11-02-pii-out-of-prompts-design.md, п. 5.
+// Всё это лежит в транскриптах claude-сессий и уходит модели при каждом
+// --resume. Теперь папка хода — fs_key (32 hex от HMAC ключа сессии; соль
+// только на проде), и скрипт приводит старое к тому же виду, по каждой
+// телефонной сессии из sessions.json:
+// - содержимое /tmp/agent-output/<старый ключ> переезжает в /tmp/agent-output/<fs_key>
+//   (папка создаётся с правами старой); занятое имя не перезаписывается —
+//   старая запись получает « (прежний)»; пустая старая папка удаляется;
+// - загрузки /tmp/agent-uploads/<старый ключ>_<имя> → <fs_key>_<имя>, так же;
+// - сразу за ними транскрипт: строка с номером → «Current user: identifier
+//   omitted.», пути старой папки и загрузок → новые (с итоговыми именами),
+//   остальные вхождения номера владельца → fs_key. Номера других
+//   пользователей не трогаются, только считаются.
+// fs_key — из карты прода (--fs-key-map), запасной — из строки «Output
+// directory … /<32 hex>» хода после части Б. Расходятся или нет ни того, ни
+// другого — сессия не трогается. Сироты (транскрипты не из sessions.json),
+// папки и загрузки без сессии — только счёт.
 //
-// Запуск — на релее, от dv (владельца транскриптов). Скрипт разовый и в
-// дерево релея не кладётся: едет через stdin.
-//   ssh <релей> 'node --input-type=module -' < scripts/relay-scrub-phone.mjs
-//       сухой прогон: только счётчики
-//   ssh <релей> 'node --input-type=module - --apply' < scripts/relay-scrub-phone.mjs
-//       замена + журнал
-// Флаги: --root <каталог> (по умолчанию ~/.claude/projects; смотрятся
-// <root>/*/*.jsonl), --min-age-min <минуты> (по умолчанию 15),
-// --journal <файл> (по умолчанию ~/scrub-phone-line-<метка>.jsonl).
-// Коды выхода: 0 — без ошибок, 1 — были ошибки на файлах, 2 — ошибка
-// запуска (ничего не тронуто), 130 — прерван сигналом.
+// Порядок и защита: сессии со свежим транскриптом (моложе --min-age-min) не
+// трогаются — второй заход; решения об именах при конфликте пишутся в
+// таблицу (--state, 600) до переноса — второй заход берёт те же имена;
+// перенос без перезаписи (жёсткая ссылка, затем удаление старого имени);
+// транскрипт — временный файл рядом, сверка с чтением, rename, права,
+// владелец и mtime прежние; Ctrl+C доделывает текущую сессию. Журнал и вывод
+// — без номеров и содержимого. --finish удаляет таблицу и карту, только
+// когда делать больше нечего.
 //
-// Как устроено:
-// - строка файла разбирается как JSON, фраза ищется во всех строковых
-//   значениях. Строка без замены остаётся прежними байтами, с заменой —
-//   JSON.stringify: CLI сам пишет строку как JSON.stringify(запись), поэтому
-//   вне фразы байты те же (счётчик «меняет не только фразу» это проверяет);
-// - битая строка остаётся как есть и считается; с фразой — отдельно: номер
-//   в ней остался;
-// - запись атомарная: временный файл рядом (.<имя>.scrub-<pid>-<hex>.tmp) с
-//   правами, владельцем и временем исходного → сверка, что исходный не
-//   менялся с чтения → rename. Копий исходника не остаётся;
-// - свежие файлы (mtime моложе --min-age-min) и изменённые во время прохода
-//   пропускаются — их проходят вторым заходом;
-// - журнал и вывод — без номеров и без содержимого.
+// Запуск — на релее, от dv, через stdin (в дерево релея скрипт не кладётся):
+//   ssh <релей> 'node --input-type=module - --fs-key-map <карта>' < scripts/relay-scrub-phone.mjs
+// Флаги — USAGE ниже. Коды выхода: 0 — без ошибок, 1 — ошибки на сессиях или
+// --finish отказал, 2 — ошибка запуска (ничего не тронуто), 130 — прерван.
 //
 // Node 22, ESM, без зависимостей: на релее системный Node, без nvm и npm.
 
@@ -853,3 +855,176 @@ export async function finishScrub(opts) {
   }
   return { pending, removed, summary: s };
 }
+
+// ---------------------------------------------------------------- запуск
+
+const USAGE = `Использование (на релее, от dv; скрипт едет через stdin):
+  ssh <релей> 'node --input-type=module - [флаги]' < scripts/relay-scrub-phone.mjs
+  (или node relay-scrub-phone.mjs [флаги])
+Флаги:
+  --fs-key-map <файл>  карта «ключ сессии<TAB>fs_key» от прода, права 600
+  --apply              перенести и переписать; без него — сухой прогон, только счётчики
+  --finish             проверить, что делать больше нечего, и удалить таблицу и карту
+  --min-age-min <N>    не трогать сессии, чей транскрипт менялся за N минут; по умолчанию 15
+  --root <каталог>     проекты claude; по умолчанию ~/.claude/projects
+  --sessions <файл>    sessions.json релея; по умолчанию ~/file-agent/sessions.json
+  --outputs <каталог>  папки хода; по умолчанию /tmp/agent-output
+  --uploads <каталог>  загрузки; по умолчанию /tmp/agent-uploads
+  --state <файл>       таблица переименований; по умолчанию ~/.relay-scrub-map.jsonl
+  --journal <файл>     журнал; по умолчанию ~/relay-scrub-phone-<метка>.jsonl, права 600
+`;
+
+function parseCli(argv) {
+  const { values } = parseArgs({
+    args: argv,
+    strict: true,
+    allowPositionals: false,
+    options: {
+      "fs-key-map": { type: "string" },
+      apply: { type: "boolean" },
+      finish: { type: "boolean" },
+      "min-age-min": { type: "string" },
+      root: { type: "string" },
+      sessions: { type: "string" },
+      outputs: { type: "string" },
+      uploads: { type: "string" },
+      state: { type: "string" },
+      journal: { type: "string" },
+      help: { type: "boolean", short: "h" },
+    },
+  });
+  if (values.apply && values.finish) throw new Error("--finish — отдельным запуском, без --apply");
+  const rawAge = values["min-age-min"] ?? "15";
+  const minutes = rawAge.trim() === "" ? NaN : Number(rawAge);
+  if (!Number.isFinite(minutes) || minutes < 0) throw new Error("--min-age-min: нужно число минут, не меньше 0");
+  const home = os.homedir();
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z"); // 20261102T153000Z
+  const abs = (v) => (v === undefined ? undefined : path.resolve(v));
+  return {
+    help: !!values.help,
+    apply: !!values.apply,
+    finish: !!values.finish,
+    minAgeMs: minutes * 60_000,
+    fsKeyMapPath: abs(values["fs-key-map"]) ?? null,
+    root: abs(values.root) ?? path.join(home, ".claude", "projects"),
+    sessionsPath: abs(values.sessions) ?? path.join(home, "file-agent", "sessions.json"),
+    outputs: abs(values.outputs) ?? "/tmp/agent-output",
+    uploads: abs(values.uploads) ?? "/tmp/agent-uploads",
+    statePath: abs(values.state) ?? path.join(home, ".relay-scrub-map.jsonl"),
+    journalPath: abs(values.journal) ?? path.join(home, "relay-scrub-phone-" + stamp + ".jsonl"),
+  };
+}
+
+function report(s, o) {
+  const r = s.repl;
+  const lines = [
+    "relay-scrub-phone: " + (o.apply ? "применение" : "сухой прогон — ничего не меняется (применение — с --apply)"),
+    "транскрипты: " + o.root + "; sessions.json: " + o.sessionsPath,
+    "папки хода: " + o.outputs + "; загрузки: " + o.uploads,
+    "карта fs_key: " + (o.fsKeyMapPath ?? "не задана") + ", строк с ошибкой: " + s.mapBadLines,
+    "номеров: " + s.phones,
+    "сессий: " + s.sessions + " (без номера: " + s.nonPhoneSessions + ")",
+    "fs_key: из карты " + s.withMap + ", из транскрипта " + s.withTranscriptKey +
+      " (совпало с картой " + s.keyAgree + "), без fs_key " + s.withoutKey + ", расхождений " + s.keyMismatch,
+    "свежих: " + s.fresh + (s.fresh ? " — пройти вторым заходом позже" : ""),
+    "без транскрипта: " + s.noTranscript,
+    "папок к переносу: " + s.dirs + ", записей в них: " + s.entries + ", загрузок: " + s.uploads +
+      ", конфликтов имён: " + s.conflicts,
+    "замен в транскриптах: фраза " + r.phrase + ", пути папок " + r.dirs + ", пути загрузок " + r.uploads +
+      ", прочие " + r.other + "; транскриптов к записи: " + s.transcripts,
+    "транскриптов с номерами других пользователей: " + s.otherPhones,
+    "сирот: " + s.orphans + ", из них с номером: " + s.orphansWithPhone + "; папок без сессии: " + s.orphanDirs +
+      "; загрузок без сессии: " + s.orphanUploads,
+    "битых строк: " + s.brokenLines + ", из них с номером: " + s.brokenWithPhone,
+    "строк, где JSON.stringify меняет не только замены: " + s.nonCanonicalLines,
+  ];
+  if (o.apply) {
+    lines.push(
+      "переписано транскриптов: " + s.written + "; перенесено записей: " + s.moved + ", загрузок: " + s.movedUploads +
+        "; удалено старых папок: " + s.dirsRemoved + ", осталось непустых: " + s.dirsLeft,
+      "журнал: " + (s.journal ?? "не создан — записывать нечего"),
+      "таблица переименований: " + o.statePath + " (удалить — --finish после последнего захода)",
+    );
+  }
+  lines.push("ошибок: " + s.errors);
+  if (s.interrupted) lines.push("ПРЕРВАНО: пройдены не все сессии, итог неполный");
+  return lines.join("\n") + "\n";
+}
+
+// Ошибка до прохода: путь можно, содержимое и номера — нет.
+function startError(e, o) {
+  if (e.code === "EMAPMODE") return "карта fs_key доступна не только владельцу — chmod 600 " + o.fsKeyMapPath;
+  if (e.code === "EBADSESSIONS" || e.name === "SyntaxError") return "sessions.json не разобрался: " + o.sessionsPath;
+  return (e.code || e.name) + (e.path ? " " + e.path : "");
+}
+
+export async function main(argv = process.argv.slice(2), out = process.stdout, err = process.stderr) {
+  let o;
+  try {
+    o = parseCli(argv);
+  } catch (e) {
+    err.write("relay-scrub-phone: " + e.message + "\n\n" + USAGE);
+    return 2;
+  }
+  if (o.help) {
+    out.write(USAGE);
+    return 0;
+  }
+  try {
+    if (!(await fsp.stat(o.root)).isDirectory()) throw withCode("ENOTDIR");
+  } catch (e) {
+    err.write("relay-scrub-phone: нет каталога " + o.root + " (" + (e.code || e.name) + ")\n");
+    return 2;
+  }
+
+  // Ctrl+C и SIGTERM дают доделать текущую сессию: папка и транскрипт — вместе.
+  const ac = new AbortController();
+  const stop = () => ac.abort();
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  try {
+    if (o.finish) {
+      const f = await finishScrub({ ...o, signal: ac.signal });
+      if (f.pending === 0 && f.summary.errors === 0 && !f.summary.interrupted) {
+        out.write("relay-scrub-phone --finish: делать больше нечего; удалено: " + (f.removed.join(", ") || "нечего удалять") + "\n");
+        return 0;
+      }
+      const s = f.summary;
+      out.write(
+        "relay-scrub-phone --finish: не всё сделано — папок " + s.dirs + ", загрузок " + s.uploads + ", транскриптов " +
+          s.transcripts + ", ошибок " + s.errors + (s.interrupted ? ", прервано" : "") + ". Таблица и карта оставлены.\n",
+      );
+      return 1;
+    }
+    const s = await runScrub({ ...o, signal: ac.signal });
+    out.write(report(s, o));
+    for (const { file, code } of s.errorList) err.write("ошибка: " + file + ": " + code + "\n");
+    return s.interrupted ? 130 : s.errors ? 1 : 0;
+  } catch (e) {
+    err.write("relay-scrub-phone: " + startError(e, o) + "\n");
+    return 2;
+  } finally {
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+  }
+}
+
+// Запущен как скрипт, а не импортирован (тесты).
+// - Через stdin (node - < relay-scrub-phone.mjs, так он едет на релей):
+//   argv[1] — "-", а import.meta.url — не путь к файлу ("<cwd>/[eval1]").
+//   Если же через stdin пришёл другой код и импортировал этот модуль, у
+//   модуля настоящий файл — тогда прогон не запускается.
+// - Файлом: сравнение с realpath — на случай запуска через симлинк,
+//   import.meta.url у Node — настоящий путь.
+function invokedDirectly() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  if (entry === "-") return !fs.existsSync(fileURLToPath(import.meta.url));
+  try {
+    return import.meta.url === pathToFileURL(fs.realpathSync(entry)).href;
+  } catch {
+    return false;
+  }
+}
+
+if (invokedDirectly()) process.exitCode = await main();
