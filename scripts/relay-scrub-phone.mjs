@@ -54,15 +54,53 @@
 // после чистки остаётся (рассуждения, пути непереносимых папок, без fs_key…).
 // --finish удаляет таблицу и карты, только когда делать больше нечего.
 //
-// Запуск — на релее, от dv; скрипт разовый и в дерево релея не кладётся.
-// Сухой прогон — прямо через stdin:
-//   ssh <релей> 'node --input-type=module - --fs-key-map <карта>' < scripts/relay-scrub-phone.mjs
-// Долгое применение — отвязанно, с логом (обрыв ssh его не прервёт):
-//   ssh <релей> 'umask 077 && cat > ~/relay-scrub-phone.mjs' < scripts/relay-scrub-phone.mjs
-//   ssh <релей> 'setsid nohup node ~/relay-scrub-phone.mjs --fs-key-map <карта> --apply > ~/relay-scrub-1.log 2>&1 < /dev/null &'
-// Флаги — USAGE ниже. Коды выхода: 0 — без ошибок, 1 — ошибки на сессиях или
-// --finish отказал, 2 — ошибка запуска или отказ сверки карты (ничего не
-// тронуто), 130 — прерван сигналом.
+// RUNBOOK (каждый шаг — с OK владельца; на релее — от dv; скрипт в дерево релея
+// не кладётся). Во ВСЕ запуски — обе карты:
+//   F='--fs-key-map ~/.relay-fs-key-map.tsv --stand-map ~/.relay-fs-key-map-stand.tsv'
+//  0. Слить ветку, deploy.sh. На проде есть ts-node и RELAY_FS_SALT в .env; на
+//     ноде — соль стенда в ~/spirits_back/.env, CI-клон на sha слияния.
+//  1. Прод: п. 6 бэка (ссылки /files/<номер>_… → MinIO) — сухой, apply. ДО шага 6:
+//     ему нужны файлы по старым путям; после переноса старые /files/<номер>_…
+//     — 404 (и в кэшах браузеров и Telegram), это принято.
+//  2. Релей: файлы не от dv — sudo find /tmp/agent-output /tmp/agent-uploads ! -user dv | wc -l;
+//     не 0 — то же с -exec chown -h dv:dv {} + (имена не печатаются).
+//  3. Карты трубой, на мак не пишутся (set -o pipefail; TS_NODE_TRANSPILE_ONLY=1):
+//     ключи sessions.json релея → scripts/relay-fs-key-map.ts на проде →
+//     ~/.relay-fs-key-map.tsv; те же ключи → помощник на ноде с
+//     DOTENV_CONFIG_PATH=$HOME/spirits_back/.env → ~/.relay-fs-key-map-stand.tsv
+//     (umask 077). В stderr каждого — «соль — RELAY_FS_SALT»; пустая карта — стоп.
+//  4. Скрипт: umask 077, cat > ~/relay-scrub-phone.mjs. Сухой прогон:
+//     node ~/relay-scrub-phone.mjs $F. Стоп, если совпало 0, расхождений больше 0,
+//     есть «--apply откажет», «(не пишутся)» больше 0 или ошибки.
+//  5. Канарейка: ВСЕ ключи тестового номера → ~/relay-scrub-canary.keys (600);
+//     $F --sessions-file ~/relay-scrub-canary.keys — сухой (все пропуски 0), затем
+//     --apply. Приёмка: живой ход на проде через --resume в её сессии (ответ
+//     пришёл, нет «Invalid signature»), старый файл открывается по новому пути и
+//     по /files/<fs_key>/….
+//  6. Всё: setsid nohup nice -n 10 node ~/relay-scrub-phone.mjs $F --apply
+//     > ~/relay-scrub-1.log 2>&1 < /dev/null & — стоп: pkill -INT -f
+//     relay-scrub-phone.mjs (текущий номер доделывается). --only-phones N — только
+//     поэтапно после канарейки: сортировка по цифрам может дать живого пользователя.
+//  7. Через 15+ минут — второй заход (то же, лог -2).
+//  8. Сухой «0»: к переносу 0, к записи 0, отложено 0, ошибок 0.
+//  9. Остаток — решает владелец. $F --list-residual ~/relay-scrub-residual.txt —
+//     список id и причины; mkdir -m 700 ~/relay-residual-transcripts;
+//     $F --retire-residual ~/relay-residual-transcripts — сухой, затем --apply.
+//     Условия: каталог в домашнем, вне ~/.claude/projects, на той же файловой
+//     системе, 700; переносятся только окончательные причины (рассуждения, пути
+//     непереносимых папок, без fs_key, неоднозначные, битые и неканоничные
+//     строки с номером); живой «claude --resume <id>» и транскрипт моложе часа —
+//     пропуск; «появились снова через 5 с» — не трогать, разобраться. После:
+//     следующий ход такой сессии — «stale resume … — сброс и переигрыш с чистой
+//     сессии» и обычный ответ (при рестарте — «dropped (нет транскрипта)»). Срок
+//     хранения каталога — решает владелец, по умолчанию удалить через 30 дней.
+// 10. $F --finish: код 0 — карты и таблица удалены. Отказ, когда к переносу и к
+//     записи 0 и ошибок 0 (держит принятый остаток), — удалить вручную с OK
+//     владельца, записав вывод --finish со счётчиками.
+// 11. Уборка: ~/relay-scrub-phone.mjs, ~/relay-scrub-canary.keys,
+//     ~/relay-scrub-*.log, ~/relay-scrub-residual.txt.
+// Коды выхода: 0 — без ошибок, 1 — ошибки на сессиях или --finish отказал,
+// 2 — ошибка запуска или отказ сверки карт (ничего не тронуто), 130 — прерван.
 //
 // Node 22, ESM, без зависимостей: на релее системный Node, без nvm и npm.
 
@@ -364,7 +402,7 @@ export function scrubContent(buf, rules) {
 
 // ---------------------------------------------------------------- файлы
 
-const { O_RDONLY, O_WRONLY, O_CREAT, O_EXCL, O_APPEND, O_TRUNC, O_NOFOLLOW } = fs.constants;
+const { O_RDONLY, O_WRONLY, O_CREAT, O_EXCL, O_APPEND, O_NOFOLLOW } = fs.constants;
 // O_NONBLOCK: если вместо файла окажется FIFO, open не повиснет.
 const READ_FLAGS = O_RDONLY | O_NOFOLLOW | (fs.constants.O_NONBLOCK ?? 0);
 
@@ -423,17 +461,16 @@ export async function commitFile(file, stat, out) {
 }
 
 // Журнал применения: строка JSON на переписанный файл — имя, число замен,
-// время. Права 600. Если записей не было, а файл создан этим прогоном, он
+// время. Права 600. Файл всегда новый (O_EXCL): путь, совпавший с чьим-то
+// файлом, — ошибка, а не дописывание в чужое. Если записей не было, файл
 // удаляется: повторный прогон не оставляет после себя ничего.
 async function openJournal(journalPath) {
-  let existed = true;
+  let fh;
   try {
-    await fsp.lstat(journalPath);
+    fh = await fsp.open(journalPath, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
   } catch (e) {
-    if (e.code !== "ENOENT") throw e;
-    existed = false;
+    throw Object.assign(withCode("EJOURNAL"), { path: journalPath, cause: e });
   }
-  const fh = await fsp.open(journalPath, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0o600);
   await fh.chmod(0o600);
   let rows = 0;
   return {
@@ -443,7 +480,7 @@ async function openJournal(journalPath) {
     },
     async close() {
       await fh.close();
-      if (rows === 0 && !existed) {
+      if (rows === 0) {
         await fsp.unlink(journalPath).catch(() => {});
         return null;
       }
@@ -451,7 +488,6 @@ async function openJournal(journalPath) {
     },
   };
 }
-
 
 // ---------------------------------------------------------------- сессии релея
 
@@ -626,11 +662,11 @@ function mentionsPhone(buf, phones) {
 
 // Процессы «claude --resume <id>» по /proc/*/cmdline: в такой сессии идёт ход.
 // Снимок живёт секунду — /proc не читается на каждую сессию.
-function liveResumes() {
+function liveResumes(ttlMs = 1000) {
   let at = 0;
   let ids = new Set();
   return async () => {
-    if (Date.now() - at < 1000) return ids;
+    if (ttlMs > 0 && Date.now() - at < ttlMs) return ids;
     const next = new Set();
     let pids = [];
     try {
@@ -968,8 +1004,13 @@ export async function runScrub(opts, { commit = commitFile } = {}) {
     }
     if (!x.transcript) s.noTranscript++;
   }
-  s.mapRefused = !!fsKeyMapPath && (s.keyMismatch > 0 || s.keyAgree === 0);
-  if (apply && s.mapRefused) throw Object.assign(withCode("EMAPCHECK"), { agree: s.keyAgree, mismatch: s.keyMismatch });
+  // Отказ: незнакомый fs_key, сверить нечем — или ходов «стенда» больше, чем
+  // подтверждённых картой прода: так выглядят перепутанные карты (прод в
+  // --stand-map, стенд в --fs-key-map), и папки ушли бы под fs_key стенда.
+  s.mapRefused = !!fsKeyMapPath && (s.keyMismatch > 0 || s.keyAgree === 0 || s.keyStand > s.keyAgree);
+  if ((apply || residual) && s.mapRefused) {
+    throw Object.assign(withCode("EMAPCHECK"), { agree: s.keyAgree, mismatch: s.keyMismatch, stand: s.keyStand });
+  }
   // Сессии, которые не обрабатываются: есть ли в их транскрипте номер владельца.
   for (const x of sessions) {
     if (!x.reason || !x.transcript) continue;
@@ -1122,7 +1163,7 @@ export async function runScrub(opts, { commit = commitFile } = {}) {
 
   function addResidual(x, reasons) {
     if (!reasons.length) return;
-    s.residual.list.push({ id: x.cliId, reasons });
+    s.residual.list.push({ id: x.cliId, reasons, file: x.transcript });
     for (const r of reasons) s.residual.counts[r]++;
   }
 
@@ -1203,6 +1244,86 @@ export async function finishScrub(opts) {
   return { ok: true, reasons, removed, summary: s };
 }
 
+// ---------------------------------------------------------------- перенос остатка
+
+// Окончательные причины: такие сессии этот скрипт не дочистит никогда. Не
+// «ждёт прохода» (дочистит следующий заход) и не «ошибка» (непонятно, что там).
+const RETIRE_FINAL = new Set(["рассуждения", "пути", "без fs_key", "неоднозначная", "битые строки", "неканоничные строки"]);
+const RETIRE_MIN_AGE_MS = 60 * 60_000;
+
+// --retire-residual <каталог>: транскрипты с окончательным остатком номера —
+// вон из папки CLI (следующий ход такой сессии — свежая сессия по штатному пути
+// релея «транскрипта нет»). Каталог — в домашнем, вне проектов claude, 700, на
+// той же файловой системе, что транскрипты (rename атомарен только в её
+// пределах; /tmp — tmpfs — не годится). Прямо перед каждым переносом — нет
+// живого «claude --resume <id>» и транскрипт не менялся больше часа. Через ~5 с
+// — проверка, что на старом месте файл не появился снова (такой — отдельным
+// счётчиком, не трогаем). Без apply — только счётчики. Журнал — id и причины.
+export async function retireResidual(opts, { sleep = (ms) => new Promise((r) => setTimeout(r, ms)), recheckMs = 5000 } = {}) {
+  const { retireDir, home = os.homedir(), apply = false, root, journalPath = null } = opts;
+  const dir = path.resolve(retireDir);
+  const st = await lstatOrNull(dir);
+  if (!st || !st.isDirectory()) throw Object.assign(withCode("ERETIREDIR"), { path: dir });
+  const realDir = await fsp.realpath(dir);
+  const realHome = await fsp.realpath(home);
+  const realRoot = await fsp.realpath(root);
+  if (!realDir.startsWith(realHome + path.sep)) throw Object.assign(withCode("ERETIREHOME"), { path: dir });
+  if (realDir === realRoot || realDir.startsWith(realRoot + path.sep)) throw Object.assign(withCode("ERETIREPROJECTS"), { path: dir });
+  if ((Number(st.mode) & 0o777) !== 0o700) throw Object.assign(withCode("ERETIREMODE"), { path: dir });
+  if ((await fsp.stat(realRoot, { bigint: true })).dev !== st.dev) throw Object.assign(withCode("ERETIREFS"), { path: dir });
+
+  const analysis = await runScrub({ ...opts, apply: false, residual: true, journalPath: null });
+  const candidates = analysis.residual.list.filter((x) => x.file && x.reasons.every((r) => RETIRE_FINAL.has(r)));
+  const r = {
+    candidates: candidates.length, willMove: 0, moved: 0,
+    skippedLive: 0, skippedFresh: 0, skippedGone: 0, reappeared: 0,
+    errors: 0, errorList: [], byReason: {}, journal: null, analysis,
+  };
+  for (const c of candidates) for (const reason of c.reasons) r.byReason[reason] = (r.byReason[reason] ?? 0) + 1;
+  const live = liveResumes(0); // свежий снимок /proc на каждый файл
+  const journal = apply ? await openJournal(journalPath) : null;
+  const moved = [];
+  try {
+    for (const c of candidates) {
+      if ((await live()).has(c.id)) {
+        r.skippedLive++;
+        continue;
+      }
+      const fst = await lstatOrNull(c.file);
+      if (!fst || !fst.isFile()) {
+        r.skippedGone++;
+        continue;
+      }
+      if (Date.now() - Number(fst.mtimeMs) < RETIRE_MIN_AGE_MS) {
+        r.skippedFresh++;
+        continue;
+      }
+      if (!apply) {
+        r.willMove++;
+        continue;
+      }
+      try {
+        const dst = path.join(realDir, path.basename(c.file));
+        if (await lstatOrNull(dst)) throw withCode("EEXIST");
+        await fsp.rename(c.file, dst);
+        moved.push(c);
+        r.moved++;
+        await journal.add({ id: c.id, reasons: c.reasons, at: new Date().toISOString() });
+      } catch (e) {
+        r.errors++;
+        r.errorList.push({ file: c.id, code: e.code || e.name || "Error" });
+      }
+    }
+    if (moved.length) {
+      await sleep(recheckMs);
+      for (const c of moved) if (await lstatOrNull(c.file)) r.reappeared++;
+    }
+  } finally {
+    if (journal) r.journal = await journal.close();
+  }
+  return r;
+}
+
 // ---------------------------------------------------------------- запуск
 
 const USAGE = `Использование (на релее, от dv):
@@ -1216,6 +1337,9 @@ const USAGE = `Использование (на релее, от dv):
   --only-phones <N>      поэтапно, после канарейки: первые N номеров по сортировке цифр
                          (могут оказаться живыми пользователями), все их сессии
   --list-residual <файл> только чтение: id сессий CLI, где номер владельца остаётся, с причинами (600)
+  --retire-residual <каталог>
+                         транскрипты с окончательным остатком — в каталог (в домашнем, 700, та же
+                         файловая система); без --apply — только счётчики
   --finish               проверить, что делать больше нечего, и удалить таблицу и карты
   --min-age-min <N>      номер, в сессии которого транскрипт менялся за N минут, — позже; по умолчанию 15
   --root <каталог>       проекты claude; по умолчанию ~/.claude/projects
@@ -1235,6 +1359,7 @@ function parseCli(argv) {
       "fs-key-map": { type: "string" },
       "stand-map": { type: "string" },
       "list-residual": { type: "string" },
+      "retire-residual": { type: "string" },
       apply: { type: "boolean" },
       finish: { type: "boolean" },
       "only-phones": { type: "string" },
@@ -1250,8 +1375,13 @@ function parseCli(argv) {
     },
   });
   if (values.apply && values.finish) throw new Error("--finish — отдельным запуском, без --apply");
-  if (values["list-residual"] !== undefined && (values.apply || values.finish)) {
-    throw new Error("--list-residual — только чтение, без --apply и --finish");
+  if (values["list-residual"] !== undefined && (values.apply || values.finish || values["retire-residual"] !== undefined)) {
+    throw new Error("--list-residual — только чтение, отдельным запуском");
+  }
+  if (values["retire-residual"] !== undefined && values.finish) throw new Error("--retire-residual — отдельным запуском, без --finish");
+  // Без карты почти все сессии выглядели бы «без fs_key» — и попали бы в остаток.
+  for (const flag of ["list-residual", "retire-residual"]) {
+    if (values[flag] !== undefined && !values["fs-key-map"]) throw new Error("--" + flag + " — только с --fs-key-map");
   }
   // --finish проверяет по карте и её же удаляет: без карты недоделанные сессии
   // выглядели бы как «без fs_key», и таблица ушла бы раньше времени.
@@ -1266,7 +1396,8 @@ function parseCli(argv) {
   const minutes = rawAge.trim() === "" ? NaN : Number(rawAge);
   if (!Number.isFinite(minutes) || minutes < 0) throw new Error("--min-age-min: нужно число минут, не меньше 0");
   const home = os.homedir();
-  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z"); // 20261102T153000Z
+  // 20261102T153000.123Z-<pid>: журнал создаётся с O_EXCL, два запуска в одну секунду не столкнутся.
+  const stamp = new Date().toISOString().replace(/[-:]/g, "") + "-" + process.pid;
   const abs = (v) => (v === undefined ? undefined : path.resolve(v));
   return {
     help: !!values.help,
@@ -1278,6 +1409,7 @@ function parseCli(argv) {
     fsKeyMapPath: abs(values["fs-key-map"]) ?? null,
     standMapPath: abs(values["stand-map"]) ?? null,
     listResidual: abs(values["list-residual"]) ?? null,
+    retireDir: abs(values["retire-residual"]) ?? null,
     root: abs(values.root) ?? path.join(home, ".claude", "projects"),
     sessionsPath: abs(values.sessions) ?? path.join(home, "file-agent", "sessions.json"),
     outputs: abs(values.outputs) ?? "/tmp/agent-output",
@@ -1298,9 +1430,7 @@ function report(s, o) {
     "сверка карты с транскриптами: совпало " + s.keyAgree + ", расхождений " + s.keyMismatch +
       ", неоднозначных " + s.keyAmbiguous + ", ходы стенда " + s.keyStand + ", смешанных " + s.keyMixed,
   ];
-  if (s.mapRefused) {
-    lines.push("--apply откажет: " + (s.keyMismatch ? "карта не сходится с транскриптами" : "карту нечем сверить — ни одного хода после части Б"));
-  }
+  if (s.mapRefused) lines.push("--apply откажет: " + mapRefusal(s.keyAgree, s.keyMismatch, s.keyStand));
   lines.push(
     "номеров: " + s.phones + "; сессий: " + s.sessions + " (без номера: " + s.nonPhoneSessions + "); выбрано: " + s.selected,
     "выбранные сессии: обработано " + s.sel.processed + "; пропущено: без fs_key " + s.sel.nokey +
@@ -1339,11 +1469,12 @@ function report(s, o) {
   return lines.join("\n") + "\n";
 }
 
-// Файл только для владельца (список остатка): без перехода по симлинку.
+// Файл только для владельца (список остатка): новый (O_EXCL — чужой файл с тем
+// же именем не перезаписывается), без перехода по симлинку.
 async function writePrivate(file, text) {
   let fh;
   try {
-    fh = await fsp.open(file, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0o600);
+    fh = await fsp.open(file, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
   } catch (e) {
     throw Object.assign(withCode("ERESIDUALOUT"), { cause: e });
   }
@@ -1355,6 +1486,12 @@ async function writePrivate(file, text) {
   }
 }
 
+function mapRefusal(agree, mismatch, stand) {
+  if (mismatch) return "карта fs_key не сходится с транскриптами: совпало " + agree + ", расхождений " + mismatch;
+  if (stand > agree) return "ходов стенда (" + stand + ") больше, чем совпавших с картой прода (" + agree + "), — карты перепутаны?";
+  return "карту fs_key нечем сверить — ни одного хода после части Б";
+}
+
 // Ошибка до прохода: путь можно, содержимое и номера — нет.
 function startError(e, o) {
   if (e.code === "EMAPMODE") return "карта fs_key доступна не только владельцу — chmod 600 " + o.fsKeyMapPath;
@@ -1362,12 +1499,14 @@ function startError(e, o) {
   if (e.code === "ESTANDMODE") return "карта стенда доступна не только владельцу — chmod 600 " + o.standMapPath;
   if (e.code === "EPARTIAL") return "в --sessions-file не все сессии номера (номеров: " + e.count + ") — канарейка берёт номер целиком";
   if (e.code === "EKEYSUNKNOWN") return "в --sessions-file ключей нет в sessions.json: " + e.count;
-  if (e.code === "ERESIDUALOUT") return "список остатка не записать: " + o.listResidual;
-  if (e.code === "EMAPCHECK") {
-    return e.mismatch
-      ? "карта fs_key не сходится с транскриптами: совпало " + e.agree + ", расхождений " + e.mismatch + " — ничего не тронуто"
-      : "карту fs_key нечем сверить — ни одного хода после части Б; ничего не тронуто";
-  }
+  if (e.code === "ERESIDUALOUT") return "список остатка уже есть или не создаётся — не перезаписываю: " + o.listResidual;
+  if (e.code === "EMAPCHECK") return mapRefusal(e.agree, e.mismatch, e.stand) + " — ничего не тронуто";
+  if (e.code === "EJOURNAL") return "журнал уже есть или не создаётся — не перезаписываю: " + e.path;
+  if (e.code === "ERETIREDIR") return "нет каталога для остатка: " + e.path;
+  if (e.code === "ERETIREHOME") return "каталог для остатка — только в домашнем каталоге: " + e.path;
+  if (e.code === "ERETIREPROJECTS") return "каталог для остатка — вне проектов claude: " + e.path;
+  if (e.code === "ERETIREMODE") return "каталог для остатка — с правами 700: " + e.path;
+  if (e.code === "ERETIREFS") return "каталог для остатка — на той же файловой системе, что транскрипты: " + e.path;
   if (e.code === "EBADSESSIONS" || e.name === "SyntaxError") return "sessions.json не разобрался: " + o.sessionsPath;
   return (e.code || e.name) + (e.path ? " " + e.path : "");
 }
@@ -1407,6 +1546,20 @@ export async function main(argv = process.argv.slice(2), out = process.stdout, e
       }
       out.write("relay-scrub-phone --finish: не всё сделано — " + f.reasons.join(", ") + ". Таблица и карта оставлены.\n");
       return 1;
+    }
+    if (o.retireDir) {
+      const r = await retireResidual({ ...o, sessionsFilter, signal: ac.signal });
+      const reasons = Object.entries(r.byReason).map(([k, n]) => k + " " + n).join(", ");
+      const skipped = "пропущено: живых " + r.skippedLive + ", свежее часа " + r.skippedFresh + ", нет файла " + r.skippedGone;
+      out.write("остаток к переносу: кандидатов " + r.candidates + (reasons ? " (" + reasons + ")" : "") +
+        (o.apply ? "" : "; будет перенесено: " + r.willMove + "; " + skipped) + "\n");
+      if (o.apply) {
+        out.write("перенесено: " + r.moved + "; " + skipped + "; появились снова через 5 с: " + r.reappeared + "\n" +
+          "каталог: " + o.retireDir + "; журнал: " + (r.journal ?? "не создан — переносить было нечего") + "\n");
+      }
+      out.write("ошибок: " + r.errors + "\n");
+      for (const { file, code } of r.errorList) err.write("ошибка: " + file + ": " + code + "\n");
+      return r.errors ? 1 : 0;
     }
     if (o.listResidual) {
       const s = await runScrub({ ...o, sessionsFilter, residual: true, apply: false, signal: ac.signal });
