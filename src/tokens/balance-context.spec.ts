@@ -6,10 +6,17 @@ import { BalanceContextService } from './balance-context.service';
  * `rowCount` у UPDATE моделируется намеренно: настоящий Postgres на
  * несуществующем user_id отрабатывает без ошибки и трогает НОЛЬ строк, а
  * фейк, всегда возвращавший успех, это скрывал.
+ *
+ * `warned` и `nearEmptyTold` — ДВЕ независимые отметки в profile_data
+ * (low_balance_warned и near_empty_told, ревью качества 02.11): у каждой свой
+ * цикл, поэтому проверяем SQL на конкретное имя поля, а не общее «profile_data».
  */
 function fakePg(opts: {
   warned?: { at: string; atBalance: number } | null;
+  nearEmptyTold?: { at: string; atBalance: number } | null;
   spends?: number[];
+  /** Медиана по паре пользователь+ассистент (token_consumption_tasks). */
+  pairSpends?: number[];
   /** Сколько строк тронул UPDATE. 0 = такого пользователя в таблице нет. */
   updateRowCount?: number;
 } = {}) {
@@ -18,8 +25,14 @@ function fakePg(opts: {
     calls,
     query: async (sql: string, params: any[] = []) => {
       calls.push({ sql, params });
-      if (/low_balance_warned|profile_data/.test(sql) && /SELECT/i.test(sql)) {
+      if (/near_empty_told/.test(sql) && /SELECT/i.test(sql)) {
+        return { rows: [{ told: opts.nearEmptyTold ?? null }] };
+      }
+      if (/low_balance_warned/.test(sql) && /SELECT/i.test(sql)) {
         return { rows: [{ warned: opts.warned ?? null }] };
+      }
+      if (/token_consumption_tasks/.test(sql)) {
+        return { rows: (opts.pairSpends ?? []).map((a) => ({ amount: a })) };
       }
       if (/token_transactions/.test(sql)) {
         return { rows: (opts.spends ?? []).map((a) => ({ amount: a })) };
@@ -68,12 +81,12 @@ describe('BalanceContextService — прогноз остатка', () => {
   });
 
   it('статистики не хватает — прогноза нет, цифра остаётся', async () => {
-    // Баланс выше порога предупреждения (10 000) — иначе с находки a3da5a2b
-    // блок несёт и собственную инструкцию про «примерно ответов», и проверка
-    // путала бы отсутствие статистики с отсутствием предупреждения.
-    const block = await svc(fakePg({ spends: [300, 400] })).buildContextForPrompt('u1', 20000);
-    expect(block).toContain('20000');
-    expect(block).not.toContain('примерно');
+    const block = await svc(fakePg({ spends: [300, 400] })).buildContextForPrompt('u1', 8000);
+    expect(block).toContain('8000');
+    // Без прогноза (ревью качества 02.11, I1) обычное предупреждение тоже не
+    // называет число — проверяем именно шаблон «примерно на N», а не слово
+    // «примерно» вообще: оно легитимно встречается в других сценариях.
+    expect(block).not.toMatch(/примерно на \d+/);
   });
 
   it('берёт из БД величины, а не знаковые суммы — иначе прогноз молча пропадёт', async () => {
@@ -174,6 +187,13 @@ describe('BalanceContextService — когда предупреждать (на�
     expect(block).toContain('не вставляй это посреди');
     expect(block).toContain('Никогда не прерывай упражнение');
   });
+
+  it('без прогноза предупреждение не просит называть число — иначе модель его выдумает (ревью качества 02.11, I1)', async () => {
+    // fakePg() по умолчанию — без spends, статистики нет: forecast === null.
+    const block = await svc(fakePg()).buildContextForPrompt('u1', 8000);
+    expect(block).toContain('токенов мало');
+    expect(block).not.toContain('примерно');
+  });
 });
 
 describe('BalanceContextService — бережное завершение на остатке', () => {
@@ -189,15 +209,19 @@ describe('BalanceContextService — бережное завершение на �
     expect(block).not.toContain('Баланс на исходе');
   });
 
-  it('на остатке разрешение предупредить всё равно расходуется — отметка ставится', async () => {
+  it('на остатке разрешение низкого баланса всё равно расходуется — отметка low_balance_warned ставится', async () => {
+    // Иначе следующим ходом (баланс всё ещё низкий, но уже не near-empty,
+    // например после небольшой покупки) пришло бы ещё и обычное предупреждение.
     const pg = fakePg({ spends: [400, 400, 400, 400, 400] });
     await svc(pg).buildContextForPrompt('u1', 800);
-    expect(pg.calls.some((c: any) => /^\s*UPDATE/i.test(c.sql))).toBe(true);
+    const write = pg.calls.find((c: any) => /UPDATE/i.test(c.sql) && /low_balance_warned/.test(c.sql));
+    expect(write).toBeDefined();
   });
 
-  it('прогноз 3 ответа и больше — обычный блок, без завершения', async () => {
+  it('прогноз 3 ответа и больше — обычное предупреждение, без завершения', async () => {
     const block = await svc(fakePg({ spends: [400, 400, 400, 400, 400] })).buildContextForPrompt('u1', 1200);
     expect(block).not.toContain('бережно завершить');
+    expect(block).toContain('Баланс на исходе');
   });
 
   it('прогноза нет, но баланс ниже 2000 — завершение по запасному порогу', async () => {
@@ -206,14 +230,99 @@ describe('BalanceContextService — бережное завершение на �
     expect(block).toContain('почти закончился');
   });
 
+  it('запасной порог — ровно 2000 ещё обычное предупреждение, 1999 — уже завершение', async () => {
+    const at2000 = await svc(fakePg({ spends: [300] })).buildContextForPrompt('u1', 2000);
+    expect(at2000).toContain('Баланс на исходе');
+    expect(at2000).not.toContain('бережно завершить');
+
+    const at1999 = await svc(fakePg({ spends: [300] })).buildContextForPrompt('u1', 1999);
+    expect(at1999).toContain('бережно завершить');
+  });
+
   it('приветствие — без инструкции завершения', async () => {
     const block = await svc(fakePg({ spends: [400, 400, 400, 400, 400] }))
       .buildContextForPrompt('u1', 800, { isGreeting: true });
     expect(block).not.toContain('бережно завершить');
   });
 
-  it('если уже говорил — не повторять', async () => {
-    const block = await svc(fakePg({ spends: [400, 400, 400, 400, 400] })).buildContextForPrompt('u1', 800);
-    expect(block).toContain('не повторяй');
+  it('низкобалансовая отметка недавняя — завершение всё равно показывается, обычного предупреждения нет', async () => {
+    // low_balance_warned и near_empty_told — разные циклы (ревью качества
+    // 02.11, I2): свежая отметка одного не должна гасить завершение другого.
+    const at = new Date(Date.now() - 3600_000).toISOString();
+    const pg = fakePg({ warned: { at, atBalance: 9000 }, spends: [400, 400, 400, 400, 400] });
+    const block = await svc(pg).buildContextForPrompt('u1', 800);
+    expect(block).toContain('бережно завершить текущий смысловой блок');
+    expect(block).not.toContain('Баланс на исходе');
+  });
+
+  it('первый ход в цикле — полная инструкция со ссылкой, и ставит отметку near_empty_told', async () => {
+    const pg = fakePg({ spends: [400, 400, 400, 400, 400] });
+    const block = await svc(pg).buildContextForPrompt('u1', 800);
+    expect(block).toContain('Пополнить баланс');
+    const write = pg.calls.find((c: any) => /UPDATE/i.test(c.sql) && /near_empty_told/.test(c.sql));
+    expect(write).toBeDefined();
+  });
+
+  it('near_empty_told уже стоит в этом цикле — короткое напоминание, ссылку не повторяем (ревью качества 02.11, I2)', async () => {
+    const toldAt = new Date(Date.now() - 60_000).toISOString();
+    const pg = fakePg({
+      spends: [400, 400, 400, 400, 400],
+      nearEmptyTold: { at: toldAt, atBalance: 800 },
+    });
+    const block = await svc(pg).buildContextForPrompt('u1', 800);
+    expect(block).toContain('уже сказал');
+    expect(block).toContain('бережно закрывай смысловой блок');
+    expect(block).not.toContain('Пополнить баланс');
+  });
+
+  it('near_empty_told за сутки — новый цикл, инструкция снова полная', async () => {
+    const toldAt = new Date(Date.now() - 25 * 3600_000).toISOString();
+    const pg = fakePg({
+      spends: [400, 400, 400, 400, 400],
+      nearEmptyTold: { at: toldAt, atBalance: 800 },
+    });
+    const block = await svc(pg).buildContextForPrompt('u1', 800);
+    expect(block).toContain('Пополнить баланс');
+  });
+
+  it('отметку near_empty_told не удалось записать (строки нет) — короткий вариант, без ссылки', async () => {
+    const block = await svc(fakePg({ spends: [400, 400, 400, 400, 400], updateRowCount: 0 }))
+      .buildContextForPrompt('u1', 800);
+    expect(block).toContain('бережно закрывай смысловой блок');
+    expect(block).not.toContain('Пополнить баланс');
+  });
+});
+
+describe('BalanceContextService — медиана дорогого ассистента (находка a3da5a2b, ревью качества 02.11, I3)', () => {
+  it('пара пользователь+ассистент дороже общей медианы — прогноз считаем по паре', async () => {
+    const pg = fakePg({
+      spends: [300, 400, 400, 400, 500],          // медиана пользователя 400
+      pairSpends: [4000, 5000, 5000, 5000, 6000],  // медиана пары 5000 — дороже
+    });
+    const block = await svc(pg).buildContextForPrompt('u1', 20000, { assistantId: '12' });
+    // 20000 / 5000 (медиана пары, она больше медианы пользователя) = 4
+    expect(block).toContain('4 сообщения');
+  });
+
+  it('у пары меньше MIN_SAMPLES замеров — считаем по пользователю, пару не берём', async () => {
+    const pg = fakePg({
+      spends: [300, 400, 400, 400, 500],  // медиана пользователя 400
+      pairSpends: [9000, 9500],           // только 2 замера — недостоверно
+    });
+    const block = await svc(pg).buildContextForPrompt('u1', 8000, { assistantId: '12' });
+    // Статистики пары не хватает — медиана пользователя (400): 8000/400=20
+    expect(block).toContain('20 сообщений');
+  });
+
+  it('кастомный ассистент (custom:…) — медиану пары не запрашиваем вовсе', async () => {
+    const pg = fakePg({ spends: [300, 400, 400, 400, 500] });
+    await svc(pg).buildContextForPrompt('u1', 8000, { assistantId: 'custom:abc123' });
+    expect(pg.calls.some((c: any) => /token_consumption_tasks/.test(c.sql))).toBe(false);
+  });
+
+  it('assistantId не передан — медиану пары не запрашиваем', async () => {
+    const pg = fakePg({ spends: [300, 400, 400, 400, 500] });
+    await svc(pg).buildContextForPrompt('u1', 8000);
+    expect(pg.calls.some((c: any) => /token_consumption_tasks/.test(c.sql))).toBe(false);
   });
 });

@@ -1,4 +1,4 @@
-import { medianSpend, MIN_SAMPLES, shouldWarn, LOW_BALANCE_THRESHOLD, WARN_COOLDOWN_MS } from './consumption-rate';
+import { medianSpend, MIN_SAMPLES, shouldWarn, warnCycleExpired, LOW_BALANCE_THRESHOLD, WARN_COOLDOWN_MS } from './consumption-rate';
 
 describe('medianSpend', () => {
   it('меньше MIN_SAMPLES замеров — null, а не выдуманная цифра', () => {
@@ -109,5 +109,38 @@ describe('константы правила', () => {
 
   it('окно молчания — сутки', () => {
     expect(WARN_COOLDOWN_MS).toBe(24 * 60 * 60 * 1000);
+  });
+});
+
+describe('warnCycleExpired — общий цикл для low_balance_warned и near_empty_told (ревью качества 02.11)', () => {
+  const now = new Date('2026-08-15T12:00:00Z').getTime();
+  const hoursAgo = (h: number) => new Date(now - h * 3600_000).toISOString();
+
+  it('отметки не было — цикл истёк', () => {
+    expect(warnCycleExpired(null, 8000, now)).toBe(true);
+  });
+
+  it('отметка недавняя, баланс не рос — цикл не истёк', () => {
+    expect(warnCycleExpired({ at: hoursAgo(1), atBalance: 9000 }, 8000, now)).toBe(false);
+  });
+
+  it('прошли сутки — цикл истёк', () => {
+    expect(warnCycleExpired({ at: hoursAgo(25), atBalance: 9000 }, 8000, now)).toBe(true);
+  });
+
+  it('баланс вырос относительно отметки (было пополнение) — новый цикл', () => {
+    expect(warnCycleExpired({ at: hoursAgo(1), atBalance: 3000 }, 8000, now)).toBe(true);
+  });
+
+  it('битая отметка не блокирует цикл', () => {
+    expect(warnCycleExpired({ at: 'не-дата', atBalance: 9000 } as any, 8000, now)).toBe(true);
+  });
+
+  it('не зависит от LOW_BALANCE_THRESHOLD — near_empty_told у дорогого ассистента живёт и выше 10 000', () => {
+    // shouldWarn на балансе 20-25 тыс. молча откажет (balance >= LOW_BALANCE_THRESHOLD),
+    // а near_empty_told обязан работать: дорогой ассистент может увести ход
+    // «на 1-2 ответа» и при балансе заметно выше порога обычного предупреждения.
+    expect(warnCycleExpired(null, 25000, now)).toBe(true);
+    expect(warnCycleExpired({ at: hoursAgo(1), atBalance: 25000 }, 20000, now)).toBe(false);
   });
 });
