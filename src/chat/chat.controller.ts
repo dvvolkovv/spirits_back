@@ -499,6 +499,17 @@ export class ChatController {
         safeWrite({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } });
       }
       try { res.end(); } catch {}
+      // Ответ клиенту уже доставлен — метка хода снимается здесь, а не после
+      // persistUploadTurn/consolidateAfterChatPublic ниже (три LLM-вызова
+      // подряд, карточка бизнеса — таймаут 120 с): иначе метка висела бы
+      // секунды-десятки секунд после ответа, кабинет решал бы, что ассистент
+      // ещё работает, и следующее сообщение получало бы ложную
+      // INTERRUPTED_TURN_NOTE (ревью Б2 Step 5). У текстового хода
+      // (streamUniversalAgent) метка снимается в finally сразу после end —
+      // здесь то же самое, только раньше closeStream. Вызов в closeStream
+      // остаётся страховкой на случай исключения до этой строки: повторный
+      // endUploadTurn с той же меткой — no-op (closeTurn сверяет метку).
+      this.chatService.endUploadTurn(userId, String(assistantId), turnMark);
 
       // Save history — гарантированно, даже если клиент дисконнектился
       // на любом этапе. Запускаем после res.end чтобы не блокировать ответ.
