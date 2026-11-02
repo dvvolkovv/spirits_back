@@ -317,10 +317,12 @@ export async function runDocumentMigration(p: {
 
 /**
  * --delete-old: удалить старые объекты, записанные в журнале --apply как
- * «replaced», — и только их. Перед удалением: новая копия на месте и того же
- * размера, а в базе на старый ключ нет ни одной ссылки (по всем местам, без
- * отбора по возрасту). Иначе объект остаётся. Повторный запуск ничего не
- * делает: удалённого уже нет.
+ * «replaced» или «copied», — и только их. «copied» тоже: документ,
+ * скопированный при пропущенной строке, доводит следующий --apply, и удалить
+ * его старый объект можно и по первому журналу. Перед удалением: новая копия
+ * на месте и того же размера, а в базе на старый ключ нет ни одной ссылки
+ * (по всем местам, без отбора по возрасту). Иначе объект остаётся. Повторный
+ * запуск ничего не делает: удалённого уже нет.
  */
 export async function deleteOldDocuments(p: {
   pg: MigrationPg;
@@ -331,7 +333,7 @@ export async function deleteOldDocuments(p: {
 }): Promise<{ deleted: number; alreadyGone: number; kept: number }> {
   // Снимок до работы: журнал удалений могут дописывать в тот же массив.
   const ready = new Map<string, string>();
-  for (const e of [...p.entries]) if (e.kind === 'replaced') ready.set(e.from, e.to);
+  for (const e of [...p.entries]) if (e.kind === 'replaced' || e.kind === 'copied') ready.set(e.from, e.to);
   let alreadyGone = 0;
   let kept = 0;
   let deleted = 0;
