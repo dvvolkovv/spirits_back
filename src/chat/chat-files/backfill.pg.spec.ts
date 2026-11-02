@@ -187,4 +187,74 @@ maybe('перенос ссылок релея против живого Postgres
     expect(journal).toEqual([]);
     expect(await all()).toEqual(after);
   });
+
+  // Пути на диске релея: до 26.10.2026 папка хода называлась ключом сессии с
+  // номером, и модель повторяла пути в ответах (контролёр 02.11: 76 сообщений
+  // с /tmp/agent-output/<номер>_…, последнее 12.10). Путь заведомо мёртвый —
+  // номер в нём меняется на тот же солёный хэш пользователя.
+  const hashed = (dir: 'output' | 'uploads', id: string) => `/tmp/agent-${dir}/${relayFsKey(id)}`;
+
+  async function seedPaths() {
+    return {
+      output: await row(`Сохранил отчёт: /tmp/agent-output/${PHONE}_12_ru/report.pdf`),
+      upload: await row(`прочитал /tmp/agent-uploads/${PHONE}_12_ru_scan.pdf`, 'human'),
+      uuid: await row(`файл в /tmp/agent-output/${UUID_USER}_17_ru/plan.docx`),
+      both: await row(`[Скачать gone.pdf](${P}/gone.pdf)\nпуть: /tmp/agent-output/${PHONE}_12_ru/gone.pdf`),
+      fsKeyPath: await row(`/tmp/agent-output/${'cd'.repeat(16)}/x.pdf`),
+      young: await row(`/tmp/agent-output/${PHONE}_12_ru/new.pdf`, 'ai', '5 minutes'),
+    };
+  }
+
+  it('пути релея с номером: сухой прогон — отдельные счётчики, база не меняется', async () => {
+    await seedPaths();
+    const before = await all();
+
+    const r = await run(false);
+
+    // output, uuid и both; молодая не входит, в папке fs_key номера нет.
+    expect(r).toMatchObject({ outputPathRows: 3, uploadPathRows: 1, maskedPathRows: 0, updatedRows: 0 });
+    expect(await all()).toEqual(before);
+  });
+
+  it('пути релея с номером: --apply — номер на солёный хэш, журнал; повтор — ноль; откат — слово в слово', async () => {
+    const ids = await seedPaths();
+    const before = await all();
+    const was = new Map(before.map((x) => [x.id, x.content]));
+    const journal: JournalEntry[] = [];
+
+    const r = await run(true, (e) => journal.push(e));
+
+    expect(r).toMatchObject({ maskedPathRows: 4, updatedRows: 4, skippedRows: 0 });
+    expect(await contentOf(ids.output)).toBe(`Сохранил отчёт: ${hashed('output', PHONE)}_12_ru/report.pdf`);
+    expect(await contentOf(ids.upload)).toBe(`прочитал ${hashed('uploads', PHONE)}_12_ru_scan.pdf`);
+    expect(await contentOf(ids.uuid)).toBe(`файл в ${hashed('output', UUID_USER)}_17_ru/plan.docx`);
+    // Мёртвая ссылка и путь в одной строке — одной заменой.
+    expect(await contentOf(ids.both)).toBe(
+      `[Скачать gone.pdf](${masked(PHONE, '_12_ru/gone.pdf')})\nпуть: ${hashed('output', PHONE)}_12_ru/gone.pdf`,
+    );
+    expect(await contentOf(ids.fsKeyPath)).toBe(was.get(ids.fsKeyPath));
+    expect(await contentOf(ids.young)).toBe(was.get(ids.young));
+    for (const k of ['output', 'upload', 'uuid', 'both'] as const) {
+      const c = await contentOf(ids[k]);
+      expect(c).not.toContain(PHONE);
+      expect(c).not.toContain(UUID_USER);
+    }
+    expect(journal).toEqual(
+      expect.arrayContaining([
+        { rowId: ids.output, pathFrom: `/tmp/agent-output/${PHONE}`, pathTo: hashed('output', PHONE) },
+        { rowId: ids.upload, pathFrom: `/tmp/agent-uploads/${PHONE}`, pathTo: hashed('uploads', PHONE) },
+        { rowId: ids.uuid, pathFrom: `/tmp/agent-output/${UUID_USER}`, pathTo: hashed('output', UUID_USER) },
+        { rowId: ids.both, relayUrl: `${P}/gone.pdf`, maskedUrl: masked(PHONE, '_12_ru/gone.pdf') },
+        { rowId: ids.both, pathFrom: `/tmp/agent-output/${PHONE}`, pathTo: hashed('output', PHONE) },
+      ]),
+    );
+    expect(journal).toHaveLength(5);
+
+    const second = await run(true);
+    expect(second).toMatchObject({ outputPathRows: 0, uploadPathRows: 0, maskedPathRows: 0, updatedRows: 0 });
+
+    const back = await revertBackfill({ pg: pool, entries: journal, log: () => {} });
+    expect(back).toEqual({ reverted: 4, skipped: 0 });
+    expect(await all()).toEqual(before);
+  });
 });

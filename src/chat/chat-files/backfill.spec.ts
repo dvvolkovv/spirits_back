@@ -4,6 +4,7 @@ import {
   JournalEntry,
   ProbeResult,
   SELECT_BACKFILL_ROWS_SQL,
+  maskRelayPaths,
   maskRelayUrl,
   revertBackfill,
   runBackfill,
@@ -76,6 +77,51 @@ describe('maskRelayUrl', () => {
 
   it('без соли (fsKey ничего не дал) — null', () => {
     expect(maskRelayUrl(`${P}/a.pdf`, AGENT, () => undefined)).toBeNull();
+  });
+});
+
+// Пути на диске релея: модель повторяла их в ответах до 26.10.2026, когда
+// папка хода называлась ключом сессии с номером (контролёр 02.11: 76 сообщений
+// с /tmp/agent-output/<номер>_…). В хвосте истории они уходят модели.
+describe('maskRelayPaths', () => {
+  it('номер в пути папки вывода — на солёный хэш пользователя, остальное как было', () => {
+    expect(maskRelayPaths('сохранил /tmp/agent-output/70000000000_12_ru/report.pdf', fsKey)).toEqual({
+      text: `сохранил /tmp/agent-output/${FK}_12_ru/report.pdf`,
+      swaps: [{ pathFrom: '/tmp/agent-output/70000000000', pathTo: `/tmp/agent-output/${FK}` }],
+    });
+  });
+
+  it('номер в имени загрузки — тоже', () => {
+    expect(maskRelayPaths('прочитал /tmp/agent-uploads/70000000000_12_ru_scan.pdf', fsKey).text).toBe(
+      `прочитал /tmp/agent-uploads/${FK}_12_ru_scan.pdf`,
+    );
+  });
+
+  it('uuid пользователя почты — тоже', () => {
+    const uuid = 'aaaaaaaa-0000-4000-8000-000000000001';
+    expect(maskRelayPaths(`/tmp/agent-output/${uuid}/a.md`, fsKey).text).toBe(`/tmp/agent-output/${FK}/a.md`);
+  });
+
+  it('один путь много раз — одна запись замены', () => {
+    const r = maskRelayPaths('/tmp/agent-output/70000000000_12_ru/a.pdf и /tmp/agent-output/70000000000_12_ru/b.pdf', fsKey);
+    expect(r.text).toBe(`/tmp/agent-output/${FK}_12_ru/a.pdf и /tmp/agent-output/${FK}_12_ru/b.pdf`);
+    expect(r.swaps).toHaveLength(1);
+  });
+
+  it('папка fs_key, служебная сессия, чужой каталог, не номер — без изменений', () => {
+    for (const t of [
+      `/tmp/agent-output/${'cd'.repeat(16)}/x.pdf`,
+      '/tmp/agent-output/voice_12_1/x.pdf',
+      '/home/dv/agent-output/70000000000_12_ru/x.pdf',
+      '/tmp/agent-output/1234567890123456789_12_ru/x.pdf',
+    ]) {
+      expect(maskRelayPaths(t, fsKey)).toEqual({ text: t, swaps: [] });
+    }
+  });
+
+  it('без соли — без изменений', () => {
+    const t = '/tmp/agent-output/70000000000_12_ru/x.pdf';
+    expect(maskRelayPaths(t, () => undefined)).toEqual({ text: t, swaps: [] });
   });
 });
 
@@ -225,5 +271,18 @@ describe('revertBackfill', () => {
 
     expect(r).toEqual({ reverted: 1, skipped: 0 });
     expect(pg.table.get(1)).toBe(`[Скачать a.pdf](${P}/a.pdf) [Скачать gone.pdf](${P}/gone.pdf)`);
+  });
+
+  it('возвращает номер в путях релея по журналу', async () => {
+    const pg = makePg([{ id: 1, content: `путь /tmp/agent-output/${FK}_12_ru/a.pdf и /tmp/agent-output/${FK}_12_ru/b.pdf` }]);
+
+    const r = await revertBackfill({
+      pg,
+      entries: [{ rowId: 1, pathFrom: '/tmp/agent-output/70000000000', pathTo: `/tmp/agent-output/${FK}` }],
+      log: jest.fn(),
+    });
+
+    expect(r).toEqual({ reverted: 1, skipped: 0 });
+    expect(pg.table.get(1)).toBe('путь /tmp/agent-output/70000000000_12_ru/a.pdf и /tmp/agent-output/70000000000_12_ru/b.pdf');
   });
 });
