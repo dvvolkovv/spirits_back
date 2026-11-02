@@ -48,6 +48,25 @@ function makeService() {
   );
 }
 
+/** Как makeService, но отдаёт и pg — чтобы проверить, что реально ушло в историю (T4). */
+function makeServiceWithPgCalls() {
+  const calls: { sql: string; params: any[] }[] = [];
+  const pg = {
+    query: jest.fn(async (sql: string, params: any[] = []) => {
+      calls.push({ sql, params });
+      if (/SELECT tokens FROM ai_profiles_consolidated/.test(sql)) return { rows: [{ tokens: 1_000_000 }] };
+      if (/AS spent/.test(sql)) return { rows: [{ spent: 0 }] };
+      return { rows: [] };
+    }),
+  };
+  const language = { resolveUserLanguage: jest.fn(async (_uid: string, hint?: string) => hint || 'ru') };
+  const svc = new ChatService(
+    pg as any, null as any, null as any, null as any, language as any,
+    undefined, undefined, undefined, undefined,
+  );
+  return { svc, calls };
+}
+
 const queue: (Readable | Error)[] = [];
 const post = jest.fn(async (..._args: any[]) => {
   const next = queue.shift();
@@ -252,5 +271,41 @@ describe('relayRunning на настоящей проводке (upload-конт
 
     second.up.push(DONE); second.up.push(null);
     await Promise.all([first, second.done]);
+  });
+
+  it('T4: повтор self-heal пропущен из-за перехвата — заглушка «Ответ не пришёл» в историю не уходит', async () => {
+    // Иначе в истории у A осталась бы ложная подсказка «попробуйте отправить
+    // ещё раз», хотя пробовать уже не нужно — на это же сообщение (B) уже
+    // отвечает другой, более новый ход той же сессии.
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] });
+
+    const { svc, calls } = makeServiceWithPgCalls();
+    const empty = new Readable({ read() {} });
+    queue.push(empty);
+    const res: any = { status: jest.fn(), setHeader: jest.fn(), write: jest.fn(() => true), end: jest.fn() };
+    const first = (svc as any).streamUniversalAgent(
+      'u1', 'привет', '7', '7', [], '', res, 'Роман', '', '', undefined, false, undefined,
+    );
+    await settle();
+    empty.push(null); // пустой поток — A готовится повторить через 800мс
+    await settle();
+
+    // B перехватывает сессию во время паузы — ровно как в T3.
+    const second = textTurn(svc, 'новый ход');
+    second.up.push(DELTA);
+    await settle();
+
+    jest.advanceTimersByTime(800);
+    await settle();
+
+    second.up.push(DONE); second.up.push(null);
+    await Promise.all([first, second.done]);
+    // persistResponse(true) для A уходит через setImmediate уже после того,
+    // как сам стрим A завершился — даём ему время дойти до записи в pg.
+    await settle();
+
+    const stubSaved = calls.some((c) =>
+      c.params.some((p: any) => typeof p === 'string' && p.includes('Ответ не пришёл')));
+    expect(stubSaved).toBe(false);
   });
 });
