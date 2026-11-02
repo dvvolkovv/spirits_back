@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
-import { ClaudeCliService } from '../common/services/claude-cli.service';
+import { ClaudeCliCallError, ClaudeCliService } from '../common/services/claude-cli.service';
 import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
 import { CliSwitchState, cliOutageAffectedText, cliRecoveredText } from '../common/global-llm-messages';
 import axios from 'axios';
@@ -11,8 +11,8 @@ import * as path from 'path';
 import * as os from 'os';
 
 // classifyLlmError переехал в common/llm-error.ts — его зовёт и ClaudeCliService
-// (запасной путь). Реэкспорт — для прежних импортов (insights.service).
-import { classifyLlmError, LlmOutageKind, looksLikeCliRefusal } from '../common/llm-error';
+// (запасной путь). Реэкспорт — для прежних импортов.
+import { classifyLlmError, LlmOutageKind, looksLikeCliRefusal, safeCliText, safeKindPhrase } from '../common/llm-error';
 // Строка про запасных — общая с алертом релея (relay-qwen-monitor.service.ts).
 import { fallbackAlertLine } from './fallback-alert-line';
 export { classifyLlmError };
@@ -74,6 +74,20 @@ const OUTAGE_ALERT_AFTER_FAILS = Number(process.env.CLAUDE_OUTAGE_FAILS || 2);
 // NOTE: Telegram creds are read at call time inside maybeAlertOutage(), not here —
 // module-level process.env reads run before ConfigModule loads .env, so a
 // const here would always be '' and silently disable alerts.
+
+/**
+ * Причина сбоя пробы — для админки (llmError) и алерта «Причина: …» — без
+ * сырого текста CLI (spec 2026-11-02-safe-cli-errors): фиксированная фраза
+ * вида; у other — с безопасным текстом ошибки (вид, код ответа, код выхода,
+ * диагностика CLI) одной строкой до 160 знаков. classifyLlmError(...).human
+ * для other — сырой текст, отсюда его больше не берём.
+ */
+function outageReason(kind: LlmOutageKind, safeText: string): string {
+  const phrase = safeKindPhrase(kind);
+  if (kind !== 'other') return phrase;
+  const detail = String(safeText ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, 160);
+  return detail ? `${phrase}: ${detail}` : phrase;
+}
 
 export interface ClaudeHealthOverview {
   generatedAt: string;
@@ -184,8 +198,11 @@ export class ClaudeHealthService implements OnModuleInit {
       if (ok && looksLikeCliRefusal(text)) {
         // Отказ CLI обычным ответом («You've hit your session limit · …») —
         // не «Claude жив»: иначе при ключе люди молча сидят на Qwen, проба
-        // зелёная, алерта нет. Разбор — как у ошибки в catch.
-        const { kind, human } = classifyLlmError(text);
+        // зелёная, алерта нет. Разбор — как у ошибки в catch: вид по тексту
+        // отказа (его пишет CLI), причина — фраза вида, у other — с
+        // безопасным текстом отказа, как у ClaudeCliService.
+        const kind = classifyLlmError(text).kind;
+        const human = outageReason(kind, safeCliText({ what: 'отказ', kind, detail: text }));
         down = true;
         this.cache.llmStatus = 'down';
         this.cache.llmOutageKind = kind;
@@ -202,7 +219,12 @@ export class ClaudeHealthService implements OnModuleInit {
         this.cache.llmError = 'пустой ответ CLI';
       }
     } catch (e: any) {
-      const { kind, human } = classifyLlmError(e?.message || String(e));
+      // Вид — признак ошибки CLI (классифицирована по сырому тексту внутри
+      // ClaudeCliService); по тексту — только у ошибок без признака. Текст
+      // ошибки CLI безопасен — он идёт в причину только у other.
+      const message = String(e?.message || e);
+      const kind: LlmOutageKind = e instanceof ClaudeCliCallError && e.kind ? e.kind : classifyLlmError(message).kind;
+      const human = outageReason(kind, message);
       down = true;
       this.cache.llmStatus = 'down';
       this.cache.llmOutageKind = kind;

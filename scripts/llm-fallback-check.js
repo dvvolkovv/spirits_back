@@ -37,7 +37,14 @@ if (!distPath) {
   console.error('нет собранного сервиса — сначала npm run build');
   process.exit(2);
 }
-const { ClaudeCliService } = require(distPath);
+const { ClaudeCliService, ClaudeCliCallError } = require(distPath);
+
+// Ошибка CLI несёт только безопасный текст (spec 2026-11-02-safe-cli-errors):
+// попытка — «claude CLI <что>: <вид>[, status N][, деталь]», склейка — через
+// « | <провайдер> fallback: ». Сырого текста сбоя (ответ API, stderr, stdout) в
+// нём быть не должно; текст отказа самого CLI («Not logged in · Please run
+// /login») — допустим, поэтому его фраз здесь нет.
+const RAW_CLI_TEXT = /Failed to authenticate|API Error|stderr=|stdout=|exited with code/;
 
 /** Ключи на время одной проверки: undefined — снять. */
 async function withKeys(keys, fn) {
@@ -182,8 +189,16 @@ async function main() {
           text = await svc.text(ASK, { model: 'claude-haiku-4-5', provider: 'kimi', timeoutMs: 120000 });
         } catch (e) {
           const m = String(e.message);
-          if (!/^kimi \(выбран\): .* \| claude fallback: /.test(m)) throw new Error(`не та ошибка: ${m.slice(0, 200)}`);
-          return 'ошибка начинается с выбранного, Claude пробовался';
+          if (!/^kimi \(выбран\): claude CLI [^|]+: auth\b[^|]* \| claude fallback: claude CLI [^|]+: auth\b/.test(m)) {
+            throw new Error(`не та ошибка: ${m.slice(0, 200)}`);
+          }
+          if (RAW_CLI_TEXT.test(m)) throw new Error(`в ошибке сырой текст CLI: ${m.slice(0, 200)}`);
+          // Итоговая ошибка цепочки — со сводными признаками: вид — сильнейший
+          // по попыткам, доступ — хоть одна попытка со сбоем доступа.
+          if (!(e instanceof ClaudeCliCallError) || e.kind !== 'auth' || e.access !== true) {
+            throw new Error(`не те признаки: ${e && e.name} kind=${e && e.kind} access=${e && e.access}`);
+          }
+          return `ошибка начинается с выбранного, Claude пробовался: ${m.slice(0, 200)}`;
         }
         throw new Error(`ответ пришёл, а не должен был: ${String(text).slice(0, 80)}`);
       }));
@@ -207,7 +222,10 @@ async function main() {
       try {
         text = await svc.text('Reply with exactly: ok', { model: 'claude-haiku-4-5', timeoutMs: 60000, noFallback: true });
       } catch (e) {
-        return `упала, как и должна: ${String(e.message).slice(0, 100)}`;
+        const m = String(e.message);
+        if (!/^claude CLI /.test(m) || RAW_CLI_TEXT.test(m)) throw new Error(`не тот текст ошибки пробы: ${m.slice(0, 200)}`);
+        if (!(e instanceof ClaudeCliCallError) || !e.kind) throw new Error(`у ошибки пробы нет признаков: ${e && e.name}`);
+        return `упала, как и должна (${e.kind}): ${m.slice(0, 100)}`;
       }
       throw new Error(`проба прошла — значит, пошла мимо Claude: ${String(text).slice(0, 100)}`);
     });

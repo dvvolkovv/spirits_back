@@ -1,7 +1,7 @@
 import { Injectable, Logger, forwardRef, Inject } from '@nestjs/common';
-import { ClaudeCliService } from '../common/services/claude-cli.service';
+import { ClaudeCliCallError, ClaudeCliService } from '../common/services/claude-cli.service';
 import { PgService } from '../common/services/pg.service';
-import { classifyLlmError } from '../monitoring/claude-health.service';
+import { classifyLlmError, LlmOutageKind, looksLikeCliRefusal, safeCliText } from '../common/llm-error';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { InsightsCollectService } from './insights-collect.service';
 import { buildDigest, buildKeyboard, insightsChatId, type DigestInput } from './insights-digest';
@@ -15,12 +15,26 @@ import type { Label, SynthFinding } from './insights.types';
 export const INSIGHTS_LOCK_KEY = 7_361_001;
 export const MAX_POSTPONES = 3;
 
-/** Недельный лимит или rate limit подписки: прогон откладывается, а не падает. */
+/** Недельный лимит или rate limit подписки: прогон откладывается, а не падает.
+ *  Текст — безопасный (spec 2026-11-02-safe-cli-errors): он уходит в
+ *  insights_runs.error и в сообщение владельцу. */
 export class PostponeError extends Error {}
 
-function isLimit(msg: string): boolean {
-  const kind = classifyLlmError(msg).kind;
-  return kind === 'weekly_limit' || kind === 'rate_limit';
+const LIMIT_KINDS: ReadonlySet<LlmOutageKind> = new Set<LlmOutageKind>(['weekly_limit', 'rate_limit']);
+
+/** Вид сбоя. У ошибки CLI — её признак kind: она классифицирована по сырому
+ *  тексту внутри ClaudeCliService, а её текст безопасен и для классификации не
+ *  годится (spec 2026-11-02-safe-cli-errors). У прочих ошибок и у текста
+ *  ответа (отказ CLI под видом ответа) — по тексту, как раньше. */
+function kindOf(source: unknown): LlmOutageKind {
+  if (source instanceof ClaudeCliCallError && source.kind) return source.kind;
+  const text = typeof source === 'string' ? source : String((source as any)?.message ?? source);
+  return classifyLlmError(text).kind;
+}
+
+/** Недельный лимит или rate limit подписки — ошибка вызова или текст ответа. */
+function isLimit(source: unknown): boolean {
+  return LIMIT_KINDS.has(kindOf(source));
 }
 
 @Injectable()
@@ -144,12 +158,18 @@ export class InsightsService {
         cost += r.costUsd || 0;
         const value = parse(r.text);
         if (value !== null) return { value, cost };
-        // Отказ CLI иногда приходит под видом ответа — короткой строкой.
-        if (r.text.length <= 300 && isLimit(r.text)) throw new PostponeError(r.text);
+        // Отказ CLI иногда приходит под видом ответа — короткой строкой. В
+        // причину — безопасный текст: сам ответ — текст модели; только отказ
+        // самого CLI (его пишет CLI, в нём время сброса) идёт как есть.
+        if (r.text.length <= 300 && isLimit(r.text)) {
+          const detail = looksLikeCliRefusal(r.text) ? r.text : '';
+          throw new PostponeError(safeCliText({ what: 'отказ', kind: kindOf(r.text), detail }));
+        }
         this.log.warn(`ответ модели не по форме (попытка ${attempt})`);
       } catch (e: any) {
         if (e instanceof PostponeError) throw e;
-        if (isLimit(String(e?.message))) throw new PostponeError(String(e?.message));
+        // Текст ошибки CLI безопасен — в причину как есть.
+        if (isLimit(e)) throw new PostponeError(String(e?.message));
         this.log.warn(`модель не ответила (попытка ${attempt}): ${e?.message}`);
       }
     }
