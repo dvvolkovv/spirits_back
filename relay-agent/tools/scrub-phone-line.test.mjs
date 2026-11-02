@@ -15,6 +15,8 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { scrubContent, readSnapshot, commitFile, scrubTree } from "./scrub-phone-line.mjs";
 
 const PHONE = "70000000000";
@@ -431,4 +433,158 @@ test("прерывание: при поднятом сигнале файлы н
   assert.equal(s.interrupted, true);
   assert.equal(s.scanned, 0);
   assert.deepEqual(state(root), before);
+});
+
+// ---------------------------------------------------------------- запуск
+
+const SCRIPT = fileURLToPath(new URL("./scrub-phone-line.mjs", import.meta.url));
+const cli = (args, env = {}) =>
+  spawnSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8", env: { ...process.env, ...env } });
+
+test("CLI: без --apply — сухой прогон: счётчики на месте, номер не печатается, файлы не меняются", (t) => {
+  const root = tmpRoot(t);
+  put(root, "-tmp/a.jsonl", jsonl(user(turn()), user(turn("ещё"))));
+  put(root, "-tmp/b.jsonl", jsonl(assistant("без фразы")));
+  put(root, "-tmp/live.jsonl", jsonl(user(turn())), { mtime: new Date() });
+  const before = state(root);
+
+  const r = cli(["--root", root]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /сухой прогон/);
+  for (const re of [
+    /^файлов просмотрено: 2$/m,
+    /^файлов со строкой: 1$/m,
+    /^замен: 2$/m,
+    /^пропущено свежих: 1\b/m,
+    /^ошибок: 0$/m,
+  ]) assert.match(r.stdout, re);
+  assert.doesNotMatch(r.stdout, /записано файлов/);
+  assert.ok(!(r.stdout + r.stderr).includes(PHONE));
+  assert.deepEqual(state(root), before);
+});
+
+test("CLI: --apply меняет файлы и пишет журнал в домашний каталог с правами 600", (t) => {
+  const root = tmpRoot(t);
+  const home = tmpRoot(t);
+  const file = put(root, "-tmp/a.jsonl", jsonl(user(turn())));
+
+  const r = cli(["--root", root, "--apply"], { HOME: home });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^записано файлов: 1$/m);
+  assert.ok(!fs.readFileSync(file).includes(PHONE));
+  const journals = fs.readdirSync(home).filter((n) => /^scrub-phone-line-.+\.jsonl$/.test(n));
+  assert.equal(journals.length, 1);
+  const journalPath = path.join(home, journals[0]);
+  assert.ok(r.stdout.includes("журнал: " + journalPath), r.stdout);
+  assert.equal(fs.statSync(journalPath).mode & 0o777, 0o600);
+  assert.ok(!(r.stdout + r.stderr + fs.readFileSync(journalPath, "utf8")).includes(PHONE));
+});
+
+test("CLI: --min-age-min задаёт порог свежести, --journal — путь журнала", (t) => {
+  const root = tmpRoot(t);
+  const file = put(root, "-tmp/a.jsonl", jsonl(user(turn())), { mtime: new Date(Date.now() - 5 * 60_000) });
+  const journalPath = path.join(tmpRoot(t), "j.jsonl");
+
+  const byDefault = cli(["--root", root, "--apply", "--journal", journalPath]);
+  assert.equal(byDefault.status, 0, byDefault.stderr);
+  assert.match(byDefault.stdout, /^пропущено свежих: 1\b/m);
+  assert.ok(fs.readFileSync(file).includes(PHONE), "пять минут — свежий при пороге по умолчанию 15");
+
+  const r = cli(["--root", root, "--apply", "--min-age-min", "1", "--journal", journalPath]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^записано файлов: 1$/m);
+  assert.ok(!fs.readFileSync(file).includes(PHONE));
+  assert.equal(fs.readFileSync(journalPath, "utf8").trim().split("\n").length, 1);
+});
+
+test("CLI: ошибки запуска — код 2 и ничего не тронуто; --help — код 0", (t) => {
+  const root = tmpRoot(t);
+  put(root, "-tmp/a.jsonl", jsonl(user(turn())));
+  const before = state(root);
+  const cases = [
+    ["--root", root, "--bogus"],
+    ["--root", root, "лишний-аргумент"],
+    ["--root", root, "--min-age-min", "abc"],
+    ["--root", root, "--min-age-min", "-1"],
+    ["--root", root, "--min-age-min", ""],
+    ["--root", path.join(root, "нет-такого")],
+    // журнал не открылся — замен не было ни одной
+    ["--root", root, "--apply", "--journal", path.join(root, "нет-каталога", "j.jsonl")],
+  ];
+  for (const args of cases) {
+    const r = cli(args);
+    assert.equal(r.status, 2, args.join(" ") + "\n" + r.stdout + r.stderr);
+    assert.ok(r.stderr.length > 0, args.join(" "));
+  }
+  assert.deepEqual(state(root), before);
+
+  const help = cli(["--help"]);
+  assert.equal(help.status, 0);
+  assert.match(help.stdout, /--apply/);
+});
+
+test(
+  "CLI: ошибка на файле — код 1, в stderr имя файла и код ошибки, без номера",
+  { skip: process.getuid?.() === 0 && "root читает и файл с правами 000" },
+  (t) => {
+    const root = tmpRoot(t);
+    put(root, "-tmp/bad.jsonl", jsonl(user(turn())), { mode: 0o000 });
+
+    const r = cli(["--root", root]);
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stdout, /^ошибок: 1$/m);
+    assert.match(r.stderr, /-tmp\/bad\.jsonl: EACCES/);
+    assert.ok(!(r.stdout + r.stderr).includes(PHONE));
+  },
+);
+
+// ---------------------------------------------------------------- объём
+
+test("200 файлов по 1 МБ: меньше минуты, в памяти — текущий файл, после прохода ничего не копится", (t) => {
+  const root = tmpRoot(t);
+  const rows = [];
+  let size = 0;
+  for (let i = 0; size < 1024 * 1024; i++) {
+    const row = JSON.stringify(i % 4 === 0 ? user(turn("вопрос " + i)) : assistant("ответ ".repeat(200) + i));
+    rows.push(row);
+    size += Buffer.byteLength(row) + 1;
+  }
+  const content = rows.join("\n") + "\n";
+  const perFile = content.split(OLD()).length - 1;
+  const old = hourAgo();
+  for (let i = 0; i < 200; i++) put(root, "-tmp/s" + String(i).padStart(3, "0") + ".jsonl", content, { mtime: old });
+  const journalPath = path.join(tmpRoot(t), "j.jsonl");
+
+  // Отдельный процесс с --expose-gc: память меряется после сборки мусора —
+  // то, что удержано, а не то, что ещё не собрано.
+  const driver = [
+    "const { scrubTree } = await import(process.env.SCRUB_MODULE);",
+    "const mem = () => { const u = process.memoryUsage(); return u.heapUsed + u.arrayBuffers; };",
+    "gc(); const base = mem(); let peak = base;",
+    "const timer = setInterval(() => { gc(); peak = Math.max(peak, mem()); }, 20);",
+    "const t0 = performance.now();",
+    "const summary = await scrubTree({ root: process.env.SCRUB_ROOT, apply: true, minAgeMs: 15 * 60000, journalPath: process.env.SCRUB_JOURNAL });",
+    "const ms = performance.now() - t0;",
+    "clearInterval(timer); gc(); const after = mem();",
+    "const MB = 2 ** 20;",
+    "process.stdout.write(JSON.stringify({ ms, peakMb: (peak - base) / MB, leakMb: (after - base) / MB, summary }));",
+  ].join("\n");
+  const r = spawnSync(process.execPath, ["--expose-gc", "--input-type=module", "-e", driver], {
+    encoding: "utf8",
+    timeout: 180_000,
+    env: { ...process.env, SCRUB_MODULE: pathToFileURL(SCRIPT).href, SCRUB_ROOT: root, SCRUB_JOURNAL: journalPath },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const m = JSON.parse(r.stdout);
+  t.diagnostic(
+    `200 × ${(Buffer.byteLength(content) / 2 ** 20).toFixed(2)} МБ, ${perFile} фраз в файле: ` +
+      `${(m.ms / 1000).toFixed(1)} с; удержано в пике ${m.peakMb.toFixed(1)} МБ, после прохода ${m.leakMb.toFixed(1)} МБ`,
+  );
+  assert.equal(m.summary.written, 200);
+  assert.equal(m.summary.replacements, 200 * perFile);
+  assert.equal(m.summary.nonCanonicalLines, 0);
+  assert.ok(m.ms < 60_000, "проход занял " + Math.round(m.ms) + " мс");
+  assert.ok(m.peakMb < 64, "в пике удержано " + m.peakMb.toFixed(1) + " МБ — файлы копятся в памяти");
+  assert.ok(m.leakMb < 16, "после прохода удержано " + m.leakMb.toFixed(1) + " МБ");
+  assert.ok(!fs.readFileSync(path.join(root, "-tmp", "s123.jsonl")).includes(PHONE));
 });
