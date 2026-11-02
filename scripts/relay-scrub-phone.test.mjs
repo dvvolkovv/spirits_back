@@ -20,7 +20,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { scrubContent, sessionRules, readSnapshot, commitFile, runScrub, finishScrub } from "./relay-scrub-phone.mjs";
+import { scrubContent, sessionRules, readSnapshot, commitFile, runScrub, finishScrub, moveEntry } from "./relay-scrub-phone.mjs";
 
 const PHONE = "70000000000";
 const OTHER = "70000000001"; // другой пользователь релея (есть в sessions.json)
@@ -204,6 +204,7 @@ test("переименованные при конфликте записи: п�
     jsonl(
       assistant(OUT + KEY + "/report.pdf"),
       assistant(OUT + KEY + "/report.pdf.bak"),
+      assistant(OUT + KEY + "/report.pdf.old"), // такой записи нет — только смена папки
       assistant(OUT + KEY + "/sub/x.txt"),
       assistant("'" + OUT + KEY + "/a b.txt'"),
       assistant(OUT + KEY + "/a\n"),
@@ -217,6 +218,7 @@ test("переименованные при конфликте записи: п�
   assert.deepEqual(parsed(r.out).map((e) => e.message.content[0].text), [
     OUT + FSKEY + "/report (прежний).pdf",
     OUT + FSKEY + "/report.pdf.bak",
+    OUT + FSKEY + "/report.pdf.old",
     OUT + FSKEY + "/sub (прежний)/x.txt",
     "'" + OUT + FSKEY + "/a b.txt'",
     OUT + FSKEY + "/a (прежний)\n",
@@ -535,8 +537,9 @@ test("сухой прогон: все счётчики по сессиям; на
 
 test("применение, сессия A: конфликты получают «(прежний)», пути в транскрипте — на итоговые имена; метаданные транскрипта прежние", async (t) => {
   const w = relayWorld(t);
+  // B раньше A в sessions.json: «первая подходящая» сессия забрала бы z.pdf у A.
+  sessionB(w);
   const a = sessionA(w);
-  sessionB(w); // ради загрузки с префиксом двухчастного ключа
   const st0 = fs.statSync(a.file, { bigint: true });
 
   const s = await runScrub(runOpts(w, { apply: true }));
@@ -656,6 +659,28 @@ test("--finish: пока есть работа — отказ и всё на м�
   assert.equal(done.pending, 0);
   assert.deepEqual(done.removed.sort(), [w.mapPath, w.statePath].sort());
   assert.ok(!fs.existsSync(w.mapPath) && !fs.existsSync(w.statePath));
+});
+
+test("перенос не перезаписывает имя, занятое после плана; своя жёсткая ссылка прерванного захода доделывается", async (t) => {
+  const dir = tmpRoot(t);
+  const src = put(dir, "old/a.txt", "старый");
+  const dst = put(dir, "new/a.txt", "чужой, появился после плана");
+  await assert.rejects(moveEntry({ src, dst, file: true }), { code: "EEXIST" });
+  assert.equal(read(dst), "чужой, появился после плана");
+  assert.equal(read(src), "старый");
+
+  fs.rmSync(dst);
+  fs.linkSync(src, dst); // прерванный заход успел сделать ссылку, но не убрал старое имя
+  await moveEntry({ src, dst, file: true });
+  assert.ok(!fs.existsSync(src));
+  assert.equal(read(dst), "старый");
+
+  const subSrc = path.join(dir, "old", "sub");
+  const subDst = path.join(dir, "new", "sub");
+  fs.mkdirSync(subSrc);
+  fs.mkdirSync(subDst);
+  await assert.rejects(moveEntry({ src: subSrc, dst: subDst, file: false }), { code: "EEXIST" });
+  assert.ok(fs.existsSync(subSrc));
 });
 
 test("сессия без транскрипта: папка переносится по карте", async (t) => {

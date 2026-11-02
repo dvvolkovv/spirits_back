@@ -585,7 +585,7 @@ async function planSession(sess, fsKey, prev, ctx) {
 // занято) и удалением старого имени; папка — rename после проверки. Если
 // жёсткие ссылки запрещены (protected_hardlinks, файловая система), — так же,
 // как папка.
-async function moveEntry({ src, dst, file }) {
+export async function moveEntry({ src, dst, file }) {
   if (file) {
     try {
       await fsp.link(src, dst);
