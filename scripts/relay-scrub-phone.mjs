@@ -158,7 +158,8 @@ export function sessionRules({ phone, fsKey, dirs = new Map(), keep = new Set(),
     }
     if (d) {
       const rest = token.slice(dir.length + 1);
-      if (d.rests.has(rest) || (upPrefix && x.slice(0, start).endsWith(upPrefix))) {
+      const inUploads = upPrefix && start >= upPrefix.length && x.startsWith(upPrefix, start - upPrefix.length);
+      if (d.rests.has(rest) || inUploads) {
         if (rest.includes(phone)) counts.kept++;
         counts.uploads++;
         return { repl: d.fsKey + "_" + (d.upRenames.get(rest) ?? rest), consumed: end };
@@ -355,7 +356,7 @@ export function scrubContent(buf, rules) {
 
 // ---------------------------------------------------------------- файлы
 
-const { O_RDONLY, O_WRONLY, O_CREAT, O_EXCL, O_APPEND, O_NOFOLLOW } = fs.constants;
+const { O_RDONLY, O_WRONLY, O_CREAT, O_EXCL, O_APPEND, O_TRUNC, O_NOFOLLOW } = fs.constants;
 // O_NONBLOCK: если вместо файла окажется FIFO, open не повиснет.
 const READ_FLAGS = O_RDONLY | O_NOFOLLOW | (fs.constants.O_NONBLOCK ?? 0);
 
@@ -501,13 +502,14 @@ async function readPrivate(file, code) {
   return fsp.readFile(file, "utf8");
 }
 
-// Карта «ключ сессии → fs_key» (TSV) — её считает прод, у которого соль.
-// Ключ с двумя разными fs_key — не ключ, а ошибка: такой выбрасывается и считается.
-async function loadFsKeyMap(file) {
+// Карта «ключ сессии → fs_key» (TSV) — её считает прод, у которого соль; карта
+// стенда — тот же помощник с .env стенда. Ключ с двумя разными fs_key — не
+// ключ, а ошибка: такой выбрасывается и считается.
+async function loadFsKeyMap(file, code = "EMAPMODE") {
   const map = new Map();
   const doubtful = new Set();
   let bad = 0;
-  for (const line of (await readPrivate(file, "EMAPMODE")).split("\n")) {
+  for (const line of (await readPrivate(file, code)).split("\n")) {
     if (!line.trim()) continue;
     const tab = line.indexOf("\t");
     const key = tab > 0 ? line.slice(0, tab) : "";
@@ -591,9 +593,10 @@ async function indexTranscripts(root) {
   return byId;
 }
 
-// fs_key из самого транскрипта: строка «Output directory for created files:
-// <outputs>/<32 hex>» у ходов после части Б. Нет — undefined, разные — null.
-function transcriptFsKey(buf, outputs) {
+// fs_key из самого транскрипта: строки «Output directory for created files:
+// <outputs>/<32 hex>» у ходов после части Б — все разные, какие есть (ходы
+// прода и стенда дают разные: соль у стендов своя).
+function transcriptFsKeys(buf, outputs) {
   const marker = Buffer.from("Output directory for created files: " + path.resolve(outputs) + "/");
   const found = new Set();
   for (let i = buf.indexOf(marker); i !== -1; i = buf.indexOf(marker, i + 1)) {
@@ -603,8 +606,7 @@ function transcriptFsKey(buf, outputs) {
       found.add(candidate);
     }
   }
-  if (found.size === 0) return undefined;
-  return found.size === 1 ? [...found][0] : null;
+  return [...found];
 }
 
 function mentionsPhone(buf, phones) {
@@ -763,7 +765,7 @@ async function executePlan(plan, s) {
 function newSummary() {
   return {
     phones: 0, sessions: 0, nonPhoneSessions: 0, selected: 0,
-    keyAgree: 0, keyMismatch: 0, keyAmbiguous: 0, mapRefused: false,
+    keyAgree: 0, keyMismatch: 0, keyAmbiguous: 0, keyStand: 0, keyMixed: 0, mapRefused: false, standBadLines: 0,
     withMap: 0, withTranscriptKey: 0, withoutKey: 0, withoutKeyWithPhone: 0, noTranscript: 0,
     fresh: 0, live: 0, deferred: 0, shared: 0, sharedSessions: 0,
     dirs: 0, entries: 0, uploads: 0, conflicts: 0,
@@ -772,9 +774,16 @@ function newSummary() {
     orphans: 0, orphansWithPhone: 0, orphanDirs: 0, orphanUploads: 0, mapBadLines: 0,
     brokenLines: 0, brokenWithPhone: 0, nonCanonicalLines: 0,
     written: 0, changedDuringWrite: 0, moved: 0, movedUploads: 0, dirsRemoved: 0, dirsLeft: 0,
+    sel: { processed: 0, nokey: 0, ambiguous: 0, mismatch: 0, fresh: 0, live: 0, busy: 0, shared: 0, error: 0 },
+    residual: null,
     errors: 0, errorList: [], interrupted: false, journal: null,
   };
 }
+
+const RESIDUAL_REASONS = [
+  "рассуждения", "пути", "без fs_key", "неоднозначная", "расхождение",
+  "битые строки", "неканоничные строки", "ждёт прохода", "ошибка",
+];
 
 // Весь проход. Единица работы — номер: все его сессии вместе (пути в
 // транскриптах ссылаются и на папки соседних сессий того же номера). Если в
@@ -788,9 +797,11 @@ export async function runScrub(opts, { commit = commitFile } = {}) {
   const {
     root, sessionsPath, outputs, uploads, fsKeyMapPath = null, statePath,
     journalPath = null, apply = false, minAgeMs = 15 * 60_000, signal,
-    onlyPhones = null, sessionsFilter = null,
-    inspectAll = false, // --finish: смотреть и свежие, и занятые живым процессом
+    onlyPhones = null, sessionsFilter = null, standMapPath = null,
+    residual = false, // --list-residual: где номер владельца остался — только чтение
   } = opts;
+  // --finish и --list-residual: смотреть и свежие, и занятые живым процессом.
+  const inspectAll = opts.inspectAll || residual;
   const s = newSummary();
   // Только код: в сообщениях бывает кусок содержимого. Имя — файл транскрипта,
   // не ключ сессии: в ключе номер.
@@ -802,6 +813,10 @@ export async function runScrub(opts, { commit = commitFile } = {}) {
   const entries = await loadSessions(sessionsPath);
   const { map: fsMap, bad } = fsKeyMapPath ? await loadFsKeyMap(fsKeyMapPath) : { map: new Map(), bad: 0 };
   s.mapBadLines = bad;
+  const stand = standMapPath ? await loadFsKeyMap(standMapPath, "ESTANDMODE") : { map: new Map(), bad: 0 };
+  const standMap = stand.map;
+  s.standBadLines = stand.bad;
+  if (residual) s.residual = { list: [], counts: Object.fromEntries(RESIDUAL_REASONS.map((r) => [r, 0])) };
   const table = await loadTable(statePath);
   const transcripts = await indexTranscripts(root);
 
@@ -832,7 +847,22 @@ export async function runScrub(opts, { commit = commitFile } = {}) {
   for (const n of perDir.values()) if (n > 1) s.shared++;
   const isShared = (x) => perDir.get(x.oldDir) > 1;
 
-  // Канарейка: первые N номеров (со всеми их сессиями) или список ключей.
+  // Канарейка — номер целиком: список ключей обязан содержать ВСЕ сессии
+  // выбранного номера (иначе соседние сессии остались бы со старыми путями) и
+  // только ключи из sessions.json (опечатка не должна дать «выбрано 0»).
+  if (sessionsFilter) {
+    const known = new Set(entries.map(([k]) => k));
+    const unknownKeys = [...sessionsFilter].filter((k) => !known.has(k)).length;
+    if (unknownKeys) throw Object.assign(withCode("EKEYSUNKNOWN"), { count: unknownKeys });
+    let partial = 0;
+    for (const list of byPhone.values()) {
+      const n = list.filter((x) => sessionsFilter.has(x.key)).length;
+      if (n && n < list.length) partial++;
+    }
+    if (partial) throw Object.assign(withCode("EPARTIAL"), { count: partial });
+  }
+
+  // Поэтапно: первые N номеров (со всеми их сессиями) или список ключей.
   const phonesSorted = [...byPhone.keys()].sort(byName);
   const chosen = onlyPhones ? new Set(phonesSorted.slice(0, onlyPhones)) : null;
   const isSelected = (x) => (!chosen || chosen.has(x.phone)) && (!sessionsFilter || sessionsFilter.has(x.key));
@@ -875,7 +905,7 @@ export async function runScrub(opts, { commit = commitFile } = {}) {
     if (signal?.aborted) break;
     if (!x.transcript) continue;
     try {
-      x.fromTranscript = transcriptFsKey((await readSnapshot(x.transcript)).buf, outputs);
+      x.found = transcriptFsKeys((await readSnapshot(x.transcript)).buf, outputs);
     } catch (e) {
       x.failed = true;
       fail(x, e);
@@ -885,21 +915,45 @@ export async function runScrub(opts, { commit = commitFile } = {}) {
     s.interrupted = true;
     return s;
   }
+  // fs_key транскрипта сверяется с картой прода и картой стенда (стенд ходит в
+  // тот же релей с теми же ключами, но со своей солью). Ход стенда — не
+  // расхождение; сессия с ходами прода и стенда решается в пользу прода.
+  // Незнакомый fs_key рядом с подтверждённым продовым — неоднозначно (сессию не
+  // трогаем); незнакомый без продового — расхождение (с картой — отказ).
   for (const x of sessions) {
     if (x.failed) continue;
-    const fromMap = fsMap.get(x.key);
-    if (x.fromTranscript === null) {
-      s.keyAmbiguous++;
-      x.reason = "ambiguous";
-    } else if (fromMap && x.fromTranscript && fromMap !== x.fromTranscript) {
-      s.keyMismatch++;
-      x.reason = "mismatch";
+    const found = x.found ?? [];
+    const prodKey = fsMap.get(x.key);
+    const standKey = standMap.get(x.key);
+    const hasStand = !!standKey && found.includes(standKey);
+    if (prodKey) {
+      const hasProd = found.includes(prodKey);
+      const unknown = found.filter((k) => k !== prodKey && k !== standKey);
+      if (unknown.length && hasProd) {
+        s.keyAmbiguous++;
+        x.reason = "ambiguous";
+      } else if (unknown.length) {
+        s.keyMismatch++;
+        x.reason = "mismatch";
+      } else {
+        if (hasProd) s.keyAgree++;
+        if (hasProd && hasStand) s.keyMixed++;
+        else if (hasStand) s.keyStand++;
+        x.fsKey = prodKey;
+        s.withMap++;
+      }
     } else {
-      if (fromMap && x.fromTranscript) s.keyAgree++;
-      x.fsKey = fromMap ?? x.fromTranscript;
-      if (fromMap) s.withMap++;
-      else if (x.fsKey) s.withTranscriptKey++;
-      else {
+      // Карты прода для ключа нет: запасной fs_key — из транскрипта, но не стендовый.
+      const candidates = found.filter((k) => k !== standKey);
+      if (candidates.length > 1) {
+        s.keyAmbiguous++;
+        x.reason = "ambiguous";
+      } else if (candidates.length === 1) {
+        x.fsKey = candidates[0];
+        s.withTranscriptKey++;
+        if (hasStand) s.keyMixed++;
+      } else {
+        if (hasStand) s.keyStand++;
         s.withoutKey++;
         x.reason = "nokey";
       }
@@ -908,11 +962,14 @@ export async function runScrub(opts, { commit = commitFile } = {}) {
   }
   s.mapRefused = !!fsKeyMapPath && (s.keyMismatch > 0 || s.keyAgree === 0);
   if (apply && s.mapRefused) throw Object.assign(withCode("EMAPCHECK"), { agree: s.keyAgree, mismatch: s.keyMismatch });
+  // Сессии, которые не обрабатываются: есть ли в их транскрипте номер владельца.
   for (const x of sessions) {
-    if (x.reason !== "nokey" || !x.transcript) continue;
+    if (!x.reason || !x.transcript) continue;
     try {
-      if (mentionsPhone((await readSnapshot(x.transcript)).buf, new Set([x.phone]))) s.withoutKeyWithPhone++;
+      x.mentions = mentionsPhone((await readSnapshot(x.transcript)).buf, new Set([x.phone]));
+      if (x.mentions && x.reason === "nokey") s.withoutKeyWithPhone++;
     } catch (e) {
+      x.failed = true;
       fail(x, e);
     }
   }
@@ -931,16 +988,22 @@ export async function runScrub(opts, { commit = commitFile } = {}) {
       let fresh = 0;
       let busy = 0;
       for (const x of work) {
-        if (ids.has(x.cliId)) busy++;
-        else if (x.transcript) {
+        if (ids.has(x.cliId)) {
+          busy++;
+          x.outcome = "live";
+        } else if (x.transcript) {
           const st = await lstatOrNull(x.transcript);
-          if (st && Date.now() - Number(st.mtimeMs) < minAgeMs) fresh++;
+          if (st && Date.now() - Number(st.mtimeMs) < minAgeMs) {
+            fresh++;
+            x.outcome = "fresh";
+          }
         }
       }
       if (fresh || busy) {
         s.fresh += fresh;
         s.live += busy;
         s.deferred += work.length;
+        for (const x of work) x.outcome ??= "busy"; // номер занят соседней сессией
         return;
       }
     }
@@ -1010,6 +1073,15 @@ export async function runScrub(opts, { commit = commitFile } = {}) {
           s.brokenLines += r.brokenLines;
           s.brokenWithPhone += r.brokenWithPhone;
           s.nonCanonicalLines += r.nonCanonicalLines;
+          if (s.residual) {
+            const reasons = [];
+            if (r.thinkingWithPhone) reasons.push("рассуждения");
+            if (r.counts.kept) reasons.push("пути");
+            if (r.brokenWithPhone) reasons.push("битые строки");
+            if (r.nonCanonicalLines) reasons.push("неканоничные строки");
+            if (r.out) reasons.push("ждёт прохода");
+            addResidual(x, reasons);
+          }
           if (apply && r.out) {
             // CLI дописал транскрипт, пока шёл перенос: файлы уже на новом
             // месте, транскрипт перепишет следующий заход — по таблице.
@@ -1033,9 +1105,17 @@ export async function runScrub(opts, { commit = commitFile } = {}) {
           });
         }
       } catch (e) {
+        x.failed = true;
         fail(x, e);
       }
     }
+    for (const x of work) if (!x.outcome) x.outcome = x.failed ? "error" : isShared(x) ? "shared" : "processed";
+  }
+
+  function addResidual(x, reasons) {
+    if (!reasons.length) return;
+    s.residual.list.push({ id: x.cliId, reasons });
+    for (const r of reasons) s.residual.counts[r]++;
   }
 
   journal = apply ? await openJournal(journalPath) : null;
@@ -1066,12 +1146,23 @@ export async function runScrub(opts, { commit = commitFile } = {}) {
   } finally {
     if (journal) s.journal = await journal.close();
   }
+  const REASON_OUTCOME = { nokey: "nokey", ambiguous: "ambiguous", mismatch: "mismatch" };
+  const RESIDUAL_OF = { nokey: "без fs_key", ambiguous: "неоднозначная", mismatch: "расхождение" };
+  for (const x of sessions) {
+    if (!isSelected(x)) continue;
+    const outcome = x.failed && !x.outcome ? "error" : REASON_OUTCOME[x.reason] ?? x.outcome;
+    if (outcome) s.sel[outcome]++;
+    if (!s.residual || !x.transcript) continue;
+    // Сессия с ошибкой не обработана — номер в ней мог остаться.
+    if (x.failed) addResidual(x, ["ошибка"]);
+    else if (x.reason && x.mentions) addResidual(x, [RESIDUAL_OF[x.reason]]);
+  }
   return s;
 }
 
 // --finish: проверка только чтением (свежие и занятые — тоже), что делать
 // больше нечего и не осталось того, из-за чего номер остался бы в сессии,
-// которую можно было обработать; потом удаление таблицы и карты.
+// которую можно было обработать; потом удаление таблицы и карт (прода и стенда).
 export async function finishScrub(opts) {
   const s = await runScrub({
     ...opts, apply: false, minAgeMs: 0, journalPath: null, inspectAll: true, onlyPhones: null, sessionsFilter: null,
@@ -1092,7 +1183,7 @@ export async function finishScrub(opts) {
   if (s.interrupted) reasons.push("прервано");
   if (reasons.length) return { ok: false, reasons, removed: [], summary: s };
   const removed = [];
-  for (const p of [opts.statePath, opts.fsKeyMapPath]) {
+  for (const p of [opts.statePath, opts.fsKeyMapPath, opts.standMapPath]) {
     if (!p) continue;
     try {
       await fsp.unlink(p);
@@ -1111,10 +1202,13 @@ const USAGE = `Использование (на релее, от dv):
   (или node relay-scrub-phone.mjs [флаги])
 Флаги:
   --fs-key-map <файл>    карта «ключ сессии<TAB>fs_key» от прода, права 600
+  --stand-map <файл>     такая же карта по соли тестового стенда (ходит в тот же релей), права 600
   --apply                перенести и переписать; без него — сухой прогон, только счётчики
-  --only-phones <N>      канарейка: только первые N номеров (по сортировке), все их сессии
-  --sessions-file <файл> канарейка: только сессии из списка ключей (по строке), права 600
-  --finish               проверить, что делать больше нечего, и удалить таблицу и карту
+  --sessions-file <файл> канарейка: только сессии из списка ключей (по строке, ВСЕ ключи номера), права 600
+  --only-phones <N>      поэтапно, после канарейки: первые N номеров по сортировке цифр
+                         (могут оказаться живыми пользователями), все их сессии
+  --list-residual <файл> только чтение: id сессий CLI, где номер владельца остаётся, с причинами (600)
+  --finish               проверить, что делать больше нечего, и удалить таблицу и карты
   --min-age-min <N>      номер, в сессии которого транскрипт менялся за N минут, — позже; по умолчанию 15
   --root <каталог>       проекты claude; по умолчанию ~/.claude/projects
   --sessions <файл>      sessions.json релея; по умолчанию ~/file-agent/sessions.json
@@ -1131,6 +1225,8 @@ function parseCli(argv) {
     allowPositionals: false,
     options: {
       "fs-key-map": { type: "string" },
+      "stand-map": { type: "string" },
+      "list-residual": { type: "string" },
       apply: { type: "boolean" },
       finish: { type: "boolean" },
       "only-phones": { type: "string" },
@@ -1146,6 +1242,9 @@ function parseCli(argv) {
     },
   });
   if (values.apply && values.finish) throw new Error("--finish — отдельным запуском, без --apply");
+  if (values["list-residual"] !== undefined && (values.apply || values.finish)) {
+    throw new Error("--list-residual — только чтение, без --apply и --finish");
+  }
   // --finish проверяет по карте и её же удаляет: без карты недоделанные сессии
   // выглядели бы как «без fs_key», и таблица ушла бы раньше времени.
   if (values.finish && !values["fs-key-map"]) throw new Error("--finish — только с --fs-key-map");
@@ -1169,6 +1268,8 @@ function parseCli(argv) {
     onlyPhones: values["only-phones"] === undefined ? null : Number(values["only-phones"]),
     sessionsFile: abs(values["sessions-file"]) ?? null,
     fsKeyMapPath: abs(values["fs-key-map"]) ?? null,
+    standMapPath: abs(values["stand-map"]) ?? null,
+    listResidual: abs(values["list-residual"]) ?? null,
     root: abs(values.root) ?? path.join(home, ".claude", "projects"),
     sessionsPath: abs(values.sessions) ?? path.join(home, "file-agent", "sessions.json"),
     outputs: abs(values.outputs) ?? "/tmp/agent-output",
@@ -1185,13 +1286,19 @@ function report(s, o) {
     "транскрипты: " + o.root + "; sessions.json: " + o.sessionsPath,
     "папки хода: " + o.outputs + "; загрузки: " + o.uploads,
     "карта fs_key: " + (o.fsKeyMapPath ?? "не задана") + ", строк с ошибкой: " + s.mapBadLines,
-    "сверка карты с транскриптами: совпало " + s.keyAgree + ", расхождений " + s.keyMismatch + ", неоднозначных " + s.keyAmbiguous,
+    "карта стенда: " + (o.standMapPath ? o.standMapPath + ", строк с ошибкой: " + s.standBadLines : "не задана"),
+    "сверка карты с транскриптами: совпало " + s.keyAgree + ", расхождений " + s.keyMismatch +
+      ", неоднозначных " + s.keyAmbiguous + ", ходы стенда " + s.keyStand + ", смешанных " + s.keyMixed,
   ];
   if (s.mapRefused) {
     lines.push("--apply откажет: " + (s.keyMismatch ? "карта не сходится с транскриптами" : "карту нечем сверить — ни одного хода после части Б"));
   }
   lines.push(
     "номеров: " + s.phones + "; сессий: " + s.sessions + " (без номера: " + s.nonPhoneSessions + "); выбрано: " + s.selected,
+    "выбранные сессии: обработано " + s.sel.processed + "; пропущено: без fs_key " + s.sel.nokey +
+      ", неоднозначных " + s.sel.ambiguous + ", расхождений " + s.sel.mismatch + ", свежих " + s.sel.fresh +
+      ", с живым процессом " + s.sel.live + ", номер занят " + s.sel.busy + ", общая папка " + s.sel.shared +
+      ", с ошибкой " + s.sel.error,
     "fs_key: из карты " + s.withMap + ", из транскрипта " + s.withTranscriptKey + ", без fs_key " + s.withoutKey +
       " (из них с номером: " + s.withoutKeyWithPhone + ")",
     "свежих: " + s.fresh + ", с живым процессом CLI: " + s.live + "; отложено сессий (весь номер): " + s.deferred +
@@ -1224,10 +1331,30 @@ function report(s, o) {
   return lines.join("\n") + "\n";
 }
 
+// Файл только для владельца (список остатка): без перехода по симлинку.
+async function writePrivate(file, text) {
+  let fh;
+  try {
+    fh = await fsp.open(file, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0o600);
+  } catch (e) {
+    throw Object.assign(withCode("ERESIDUALOUT"), { cause: e });
+  }
+  try {
+    await fh.chmod(0o600);
+    await fh.writeFile(text);
+  } finally {
+    await fh.close();
+  }
+}
+
 // Ошибка до прохода: путь можно, содержимое и номера — нет.
 function startError(e, o) {
   if (e.code === "EMAPMODE") return "карта fs_key доступна не только владельцу — chmod 600 " + o.fsKeyMapPath;
   if (e.code === "EKEYSMODE") return "список ключей доступен не только владельцу — chmod 600 " + o.sessionsFile;
+  if (e.code === "ESTANDMODE") return "карта стенда доступна не только владельцу — chmod 600 " + o.standMapPath;
+  if (e.code === "EPARTIAL") return "в --sessions-file не все сессии номера (номеров: " + e.count + ") — канарейка берёт номер целиком";
+  if (e.code === "EKEYSUNKNOWN") return "в --sessions-file ключей нет в sessions.json: " + e.count;
+  if (e.code === "ERESIDUALOUT") return "список остатка не записать: " + o.listResidual;
   if (e.code === "EMAPCHECK") {
     return e.mismatch
       ? "карта fs_key не сходится с транскриптами: совпало " + e.agree + ", расхождений " + e.mismatch + " — ничего не тронуто"
@@ -1272,6 +1399,17 @@ export async function main(argv = process.argv.slice(2), out = process.stdout, e
       }
       out.write("relay-scrub-phone --finish: не всё сделано — " + f.reasons.join(", ") + ". Таблица и карта оставлены.\n");
       return 1;
+    }
+    if (o.listResidual) {
+      const s = await runScrub({ ...o, sessionsFilter, residual: true, apply: false, signal: ac.signal });
+      await writePrivate(o.listResidual, s.residual.list.map((x) => x.id + "\t" + x.reasons.join(",") + "\n").join(""));
+      out.write(
+        "сессий с остатком номера: " + s.residual.list.length + " — " +
+          RESIDUAL_REASONS.map((r) => r + " " + s.residual.counts[r]).join(", ") + "; список: " + o.listResidual + "\n" +
+          "ошибок: " + s.errors + "\n",
+      );
+      for (const { file, code } of s.errorList) err.write("ошибка: " + file + ": " + code + "\n");
+      return s.errors ? 1 : 0;
     }
     const s = await runScrub({ ...o, sessionsFilter, signal: ac.signal });
     out.write(report(s, o));

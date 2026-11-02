@@ -1110,7 +1110,7 @@ test("--list-residual: id сессий CLI, где номер владельца
   const r = await runScrub(runOpts(w, { residual: true }));
   assert.deepEqual(r.residual.counts, {
     "рассуждения": 1, "пути": 2, "без fs_key": 1, "неоднозначная": 0, "расхождение": 0,
-    "битые строки": 0, "неканоничные строки": 0, "ждёт прохода": 0, "ошибка чтения": 0,
+    "битые строки": 0, "неканоничные строки": 0, "ждёт прохода": 0, "ошибка": 0,
   });
   const rows = new Map(r.residual.list.map((x) => [x.id, x.reasons]));
   assert.deepEqual([...rows.keys()].sort(), [tr.cliId, ru.cliId, en.cliId, e.cliId].sort());
