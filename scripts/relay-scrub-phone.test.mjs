@@ -1,4 +1,4 @@
-// node --test relay-agent/tools/scrub-phone-line.test.mjs
+// node --test scripts/relay-scrub-phone.test.mjs
 //
 // Разовая чистка транскриптов релея (спека
 // docs/superpowers/specs/2026-11-02-pii-out-of-prompts-design.md, п. 5): строку
@@ -17,7 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { scrubContent, readSnapshot, commitFile, scrubTree } from "./scrub-phone-line.mjs";
+import { scrubContent, readSnapshot, commitFile, scrubTree } from "./relay-scrub-phone.mjs";
 
 const PHONE = "70000000000";
 const NEW = "Current user: identifier omitted.";
@@ -437,7 +437,7 @@ test("прерывание: при поднятом сигнале файлы н
 
 // ---------------------------------------------------------------- запуск
 
-const SCRIPT = fileURLToPath(new URL("./scrub-phone-line.mjs", import.meta.url));
+const SCRIPT = fileURLToPath(new URL("./relay-scrub-phone.mjs", import.meta.url));
 const cli = (args, env = {}) =>
   spawnSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8", env: { ...process.env, ...env } });
 
