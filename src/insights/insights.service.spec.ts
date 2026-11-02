@@ -1,3 +1,4 @@
+import { ClaudeCliCallError } from '../common/services/claude-cli.service';
 import { InsightsService, MAX_POSTPONES } from './insights.service';
 import { weekOf } from './insights-week';
 import { emptySignals } from './insights.types';
@@ -20,6 +21,8 @@ function harness(
     labelText?: string[];
     synthText?: string[];
     claudeError?: string;
+    /** Ошибка вызова модели как есть (например, ClaudeCliCallError с признаками). */
+    claudeThrow?: unknown;
     lock?: boolean;
     attempts?: number;
     rerun?: boolean;
@@ -40,6 +43,7 @@ function harness(
   const claude = {
     textWithCost: jest.fn(async (prompt: string, opts: any) => {
       calls.push({ prompt, opts });
+      if (over.claudeThrow) throw over.claudeThrow;
       if (over.claudeError) throw new Error(over.claudeError);
       const queue = opts.model === 'claude-haiku-4-5' ? labelQueue : synthQueue;
       return { text: queue.length > 1 ? queue.shift()! : queue[0], costUsd: 0.01 };
@@ -180,5 +184,36 @@ describe('InsightsService.execute', () => {
     await last.svc.execute('run-1', week);
     expect(last.store.failRun).toHaveBeenCalledWith('run-1', expect.stringContaining('лимит подписки'));
     expect(last.tg.sendMessage).toHaveBeenCalledWith(42, expect.stringContaining('сводка не собралась'));
+  });
+
+  // Текст ошибки CLI безопасен и для классификации не годится (spec
+  // 2026-11-02-safe-cli-errors): лимит — по признаку kind.
+  it.each(['weekly_limit', 'rate_limit'] as const)('лимит из признака ошибки CLI (%s), в тексте ни слова о лимите — отложить', async (kind) => {
+    const h = harness({ claudeThrow: new ClaudeCliCallError('claude CLI код выхода 1', false, { kind, access: true }), attempts: 1 });
+    await h.svc.execute('run-1', week);
+    expect(h.store.postponeRun).toHaveBeenCalledWith('run-1', 'claude CLI код выхода 1');
+    expect(h.store.failRun).not.toHaveBeenCalled();
+    expect(h.tg.sendMessage).not.toHaveBeenCalled();
+    // Отложен с первой попытки: второй вызов модели не тратится.
+    expect(h.claude.textWithCost).toHaveBeenCalledTimes(1);
+  });
+
+  it('признак есть и это не лимит — не откладывать, даже если текст похож на лимит', async () => {
+    const h = harness({ claudeThrow: new ClaudeCliCallError("You've hit your usage limit", false, { kind: 'auth', access: true }) });
+    await h.svc.execute('run-1', week);
+    expect(h.store.postponeRun).not.toHaveBeenCalled();
+    expect(h.store.failRun).toHaveBeenCalledWith('run-1', expect.stringContaining('разметка не удалась'));
+  });
+
+  it('отказ под видом ответа — отложить; в причине безопасный текст, а не ответ модели', async () => {
+    const h = harness({ labelText: ['Упёрлись в rate limit, а вот кусок разговора: СЕКРЕТ-ИЗ-ОТВЕТА'], attempts: 1 });
+    await h.svc.execute('run-1', week);
+    expect(h.store.postponeRun).toHaveBeenCalledWith('run-1', 'claude CLI отказ: rate_limit');
+  });
+
+  it('отказ самого CLI под видом ответа — в причине его текст (его пишет CLI, в нём время сброса)', async () => {
+    const h = harness({ labelText: ["You've hit your usage limit · resets 3pm"], attempts: 1 });
+    await h.svc.execute('run-1', week);
+    expect(h.store.postponeRun).toHaveBeenCalledWith('run-1', "claude CLI отказ: weekly_limit, You've hit your usage limit · resets 3pm");
   });
 });
