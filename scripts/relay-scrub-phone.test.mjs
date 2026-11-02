@@ -824,6 +824,9 @@ test("CLI: ошибки запуска — код 2 и ничего не тро�
     cliArgs(w, ["--finish", "--apply"]),
     cliArgs(w, ["--apply", "--journal", path.join(w.base, "нет-каталога", "j.jsonl")]),
     ["--root", w.root, "--sessions", path.join(w.base, "нет.json"), "--outputs", w.out, "--uploads", w.up, "--state", w.statePath],
+    // --finish проверяет по карте и её же удаляет — без карты недоделанные
+    // сессии выглядели бы как «без fs_key», и таблица ушла бы раньше времени.
+    ["--root", w.root, "--sessions", w.sessionsPath, "--outputs", w.out, "--uploads", w.up, "--state", w.statePath, "--finish"],
   ];
   for (const args of cases) {
     const r = cli(args);
