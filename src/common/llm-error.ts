@@ -48,14 +48,21 @@ export function looksLikeCliRefusal(text: string): boolean {
   return !!t && t.length <= 300 && !/[а-яё]/i.test(t) && CLI_REFUSAL_RE.test(t);
 }
 
-// Хвосты отказа CLI, которые можно показать, — белый список: время сброса
-// лимита (3pm, 11:30am, 15:00, зона в скобках — только буквы и _/+-) и
-// подсказка про вход. Регулярка привязана к обоим концам хвоста.
-const REFUSAL_TAIL_RE = /^ · (?:resets (?:\d{1,2}(?::\d{2})?[ap]m|\d{1,2}:\d{2})(?: \([A-Za-z_/+-]+\))?|Please run \/login)$/;
+// Хвосты отказа CLI, которые можно показать, — белый список: сброс лимита
+// « · resets <время>» или « · resets <дата>[ <время>]» (через пробел или «, »)
+// с зоной в скобках или без, и подсказка про вход. Время — 3pm, 11:30am,
+// 15:00; дата — Nov 3 (месяц — три буквы с заглавной); зона — только буквы и
+// _/+-. Регулярка привязана к обоим концам хвоста.
+const RESET_TIME = String.raw`\d{1,2}(?::\d{2})?[ap]m|\d{1,2}:\d{2}`;
+const RESET_DATE = String.raw`[A-Z][a-z]{2} \d{1,2}`;
+const RESET_ZONE = String.raw`\([A-Za-z_/+-]+\)`;
+const REFUSAL_TAIL_RE = new RegExp(
+  String.raw`^ · (?:resets (?:${RESET_TIME}|${RESET_DATE}(?:,? (?:${RESET_TIME}))?)(?: ${RESET_ZONE})?|Please run \/login)$`,
+);
 
 /** Деталь отказа CLI для безопасного текста (spec 2026-11-02-safe-cli-errors):
- *  фраза отказа (CLI_REFUSAL_RE) и хвост из белого списка — « · resets
- *  <время>[ (<зона>)]» или « · Please run /login». looksLikeCliRefusal привязан
+ *  фраза отказа (CLI_REFUSAL_RE) и хвост из белого списка (REFUSAL_TAIL_RE) —
+ *  сброс лимита или « · Please run /login». looksLikeCliRefusal привязан
  *  только к началу: дальше до 300 знаков может идти ответ модели, поэтому
  *  любой другой хвост отбрасывается — остаётся только фраза. Не отказ — ''. */
 export function refusalDetail(text: string): string {

@@ -106,8 +106,6 @@ export interface ClaudeCliErrorInfo {
   access?: boolean;
   /** Код ответа API (api_error_status CLI, целое 100–599), если CLI его дал. */
   status?: number;
-  /** Отказ CLI, пришедший обычным ответом (без is_error). */
-  refusal?: boolean;
 }
 
 /**
@@ -115,7 +113,7 @@ export interface ClaudeCliErrorInfo {
  * ответа API, код выхода, диагностика CLI, текст отказа самого CLI. Сырой
  * текст (result, stdout, stderr, сообщение JSON.parse) несёт фрагменты
  * разговоров и наружу не уходит: message пишут в журналы, базу и алерты.
- * Решения по сбою — по признакам kind/access/status/refusal, не по тексту.
+ * Решения по сбою — по признакам kind/access/status, не по тексту.
  *
  * toolUsed — модель успела вызвать инструмент с последствиями (не
  * Read/WebSearch/WebFetch) до сбоя; виден только в stream-json. Такой вызов у
@@ -126,7 +124,6 @@ export class ClaudeCliCallError extends Error {
   readonly kind?: LlmOutageKind;
   readonly access?: boolean;
   readonly status?: number;
-  readonly refusal?: boolean;
 
   constructor(message: string, readonly toolUsed: boolean, info: ClaudeCliErrorInfo = {}) {
     // Безопасный текст — сразу в super: stack (его пишут tg-bot.service и Nest
@@ -136,7 +133,6 @@ export class ClaudeCliCallError extends Error {
     this.kind = info.kind;
     this.access = info.access;
     this.status = info.status;
-    this.refusal = info.refusal;
   }
 }
 
@@ -550,7 +546,7 @@ export class ClaudeCliService implements OnModuleInit {
         // Отказ пишет CLI, а не модель: в безопасном тексте — его фраза и
         // хвост из белого списка (refusalDetail), в нём время сброса лимита.
         const text = res!.text.trim();
-        const f = ClaudeCliService.safeFailure('отказ', `claude CLI error: ${text}`, { cause: text, refusal: true });
+        const f = ClaudeCliService.safeFailure('отказ', `claude CLI error: ${text}`, { cause: text });
         failure = new ClaudeCliCallError(f.message, res!.toolUsed, f.info);
       } else if (err instanceof ClaudeCliCallError) {
         failure = err;
@@ -700,14 +696,12 @@ export class ClaudeCliService implements OnModuleInit {
   private static safeFailure(
     what: string,
     raw: string,
-    src: { status?: unknown; errors?: unknown; cause?: string; refusal?: boolean } = {},
+    src: { status?: unknown; errors?: unknown; cause?: string } = {},
   ): { message: string; info: ClaudeCliErrorInfo } {
     const kind = classifyLlmError(raw).kind;
     const status = apiErrorStatus(src.status);
     const detail = cliDiagnostic(src.errors) || refusalDetail(src.cause ?? '');
-    const info: ClaudeCliErrorInfo = { kind, access: isFallbackWorthy(raw), status };
-    if (src.refusal) info.refusal = true;
-    return { message: safeCliText({ what, kind, status, detail }), info };
+    return { message: safeCliText({ what, kind, status, detail }), info: { kind, access: isFallbackWorthy(raw), status } };
   }
 
   /** «Не запустился» — по коду ошибки spawn, без её сообщения: оно цитирует
