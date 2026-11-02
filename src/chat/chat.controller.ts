@@ -388,6 +388,14 @@ export class ChatController {
       this.chatService.endUploadTurn(userId, String(assistantId), turnMark);
     };
     let persistDispatched = false;
+    // Живой процесс релея этой сессии (relayRunning, ChatService.
+    // beginRelayRun/endRelayRun) — тот же ключ relaySid, что и у текстового
+    // хода (handoff.sessionId строится relaySessionKey, см. buildUploadHandoff):
+    // если текстовое сообщение той же пары придёт, пока этот процесс ещё жив,
+    // оно корректно увидит «тот ход прерван» (interrupted-turn.ts). Открыт
+    // вокруг самого вызова релея, закрыт в finally ДО копирования файлов —
+    // см. комментарий у объявления relayRunning в chat.service.ts.
+    const relayMark = this.chatService.beginRelayRun(handoff.sessionId);
     try {
     try {
       const agentRes = await axios.default.post(`${AGENT_URL}/chat`, fd, {
@@ -449,6 +457,10 @@ export class ChatController {
     } catch (err: any) {
       upstreamError = err;
     } finally {
+      // Процесс релея этой сессии закончился (поток дочитан или упал) —
+      // снимаем метку ДО копирования файлов ниже (до ~60 с): см. комментарий
+      // у beginRelayRun выше.
+      this.chatService.endRelayRun(handoff.sessionId, relayMark);
       // Ссылки на файлы хода — уже на наше хранилище, до `end` и до истории:
       // одна строка в обоих местах (historyMerge.ts сверяет посимвольно).
       // Здесь, в отличие от текстового хода, они дописываются всегда — так было

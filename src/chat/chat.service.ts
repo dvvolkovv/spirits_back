@@ -381,7 +381,10 @@ export class ChatService {
   private activeStreams = 0;
 
   /**
-   * Живые ходы поимённо: `${userId}_${assistantId}` → когда начался.
+   * Живые ходы поимённо: `${userId}_${assistantId}` → метка хода (время
+   * начала; при коллизии в ту же мс — время +1, см. openTurn). Только для
+   * кабинета (GET /chat/active-turn, getActiveTurn/activeAssistantFor) — НЕ
+   * для решения «пре-эмптит ли реплика ход на релее» (см. relayRunning ниже).
    *
    * Счётчика выше не хватает: он отвечает деплою на вопрос «можно ли сейчас
    * рестартовать», а фронту нужен другой — «идёт ли ход ИМЕННО у меня». Без
@@ -391,6 +394,23 @@ export class ChatService {
    * убивал собственный ход (релей пре-эмптит предыдущий процесс сессии).
    */
   private readonly activeTurns = new Map<string, number>();
+
+  /**
+   * Живой ПРОЦЕСС релея по ключу сессии (relaySid = relaySessionKey(...)) —
+   * метка хода того же устройства, что у activeTurns (openTurn/closeTurn),
+   * но другой ключ и другое назначение: по этой карте решается, пре-эмптит
+   * ли входящая реплика чужой ход на релее (interrupted-turn.ts), а не «идёт
+   * ли ход у пары» для кабинета.
+   *
+   * activeTurns занят весь ход, включая копирование файлов и персист ПОСЛЕ
+   * ответа (до ~60 с) — релея там уже нет, убивать нечего. relayRunning занят
+   * только пока жив сам процесс на релее: открывается вокруг callUpstreamOnce
+   * (и self-heal повтора), закрывается в finally ДО копирования. Ключ — сам
+   * relaySid, а не userId_assistantId: у «чистого листа» и у обычного хода
+   * той же пары разные relaySid (freshSessionId входит в ключ), и прерывание
+   * одного не задевает другой (находки ревью Б2 Step 6).
+   */
+  private readonly relayRunning = new Map<string, number>();
 
   /** Ходов в полёте. 0 — можно перезапускать, не порвав ничей ответ. */
   getActiveStreamCount(): number {
@@ -419,8 +439,9 @@ export class ChatService {
   }
 
   /**
-   * Отметка «ход идёт» для пары пользователь+ассистент. Возвращает метку хода:
-   * снять отметку может только её хозяин (closeTurn).
+   * Ставит метку в `map` под ключом `key`. Возвращает метку: снять её может
+   * только хозяин (closeMark с той же меткой) — общий механизм для двух
+   * разных карт (activeTurns, relayRunning), у каждой свой ключ и смысл.
    *
    * Метка обязана отличаться от прежней: прерванный ход (релей пре-эмптит
    * процесс сессии, когда приходит новое сообщение) доходит до finally ПОЗЖЕ,
@@ -428,16 +449,39 @@ export class ChatService {
    * Кабинет после этого считал, что хода нет, слал следующее «?» сразу — и
    * релей пре-эмптил уже новый ход (находка 2ff1a026).
    */
-  private openTurn(key: string, startedAt: number = Date.now()): number {
-    const prev = this.activeTurns.get(key);
+  private openMark(map: Map<string, number>, key: string, startedAt: number = Date.now()): number {
+    const prev = map.get(key);
     const mark = prev !== undefined && startedAt <= prev ? prev + 1 : startedAt;
-    this.activeTurns.set(key, mark);
+    map.set(key, mark);
     return mark;
+  }
+
+  /** Снимает метку из `map`, только если она этого хозяина: кто-то мог её уже переписать. */
+  private closeMark(map: Map<string, number>, key: string, mark: number): void {
+    if (map.get(key) === mark) map.delete(key);
+  }
+
+  private openTurn(key: string, startedAt: number = Date.now()): number {
+    return this.openMark(this.activeTurns, key, startedAt);
   }
 
   /** Снимает отметку, только если она этого хода: новый ход мог её уже переписать. */
   private closeTurn(key: string, mark: number): void {
-    if (this.activeTurns.get(key) === mark) this.activeTurns.delete(key);
+    this.closeMark(this.activeTurns, key, mark);
+  }
+
+  /**
+   * Живой процесс релея данной сессии (relayRunning, ключ relaySid) — учёт
+   * ОТДЕЛЬНЫЙ от activeTurns, см. комментарий у объявления relayRunning.
+   * Публичные: нужны и ChatController.uploadAndChat (свой relaySid —
+   * handoff.sessionId), и streamUniversalAgent.
+   */
+  beginRelayRun(relaySid: string): number {
+    return this.openMark(this.relayRunning, relaySid);
+  }
+
+  endRelayRun(relaySid: string, mark: number): void {
+    this.closeMark(this.relayRunning, relaySid, mark);
   }
 
   /**
@@ -1732,12 +1776,27 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // 309k символов из 813k в замеренной сессии.
     const historyBlock = this.renderHistoryBlock(recentHistory);
 
+    // Ключ сессии релея — чистая функция от уже известных
+    // userId/assistantId/userLanguage/fresh. Поднят сюда (выше проверки ниже
+    // и выше своего прежнего места у callUpstreamOnce), чтобы проверка строки
+    // о прерывании и реальный вызов релея дальше сверялись по ОДНОМУ и тому
+    // же значению, а не считали его дважды.
+    const relaySid = relaySessionKey(userId, assistantId, userLanguage, fresh ? freshSessionId : undefined);
+
     // Сообщение посреди идущего хода той же пары пре-эмптит его на релее —
     // скажем модели, что прошлая работа прервана и что с ней делать
-    // (interrupted-turn.ts). Проверка — до того, как этот ход поставит свою
-    // отметку (openTurn ниже). Пинги мониторинга и «чистый лист» — мимо: у
-    // fresh-сессии на релее свой ключ, и чужой ход она не прерывает.
-    if (!probe && !fresh && this.activeTurns.has(`${userId}_${assistantId}`)) {
+    // (interrupted-turn.ts). Проверяем по ЖИВОМУ ПРОЦЕССУ релея этой самой
+    // сессии (relayRunning, ключ relaySid) — НЕ по activeTurns (учёт кабинета
+    // по паре пользователь+ассистент, GET /chat/active-turn): activeTurns
+    // остаётся занятым всё время копирования файлов и персиста ПОСЛЕ того,
+    // как релей уже прислал `done` и его процесс закончился — иначе человек
+    // получал бы «тот ход прерван» про ход, который на самом деле уже
+    // доставлен (до ~60 с на копию). Чистый лист и обычный ход одной пары —
+    // РАЗНЫЕ relaySid (freshSessionId входит в ключ), поэтому отдельная
+    // проверка !fresh не нужна — эту роль уже играет сравнение по relaySid;
+    // старая проверка по activeTurns + !fresh путала оба случая (находки
+    // ревью Б2 Step 6: копия файлов, чистый лист, разные языковые сессии).
+    if (!probe && this.relayRunning.has(relaySid)) {
       contextPrefix += `${INTERRUPTED_TURN_NOTE}\n\n`;
     }
 
@@ -2047,9 +2106,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
       turnMark = this.openTurn(`${userId}_${assistantId}`, streamStartTime);
       // Один вызов upstream r.linkeon: парсит SSE, пушит в chunks и стримит
       // 'item' клиенту. Вынесено в замыкание ради self-heal ретрая пустого потока.
-      // Ключ сессии релея: и в запросе, и для шагов работы — релей кладёт
-      // загрузки под именем «<ключ>_<файл>», и префикс надо срезать.
-      const relaySid = relaySessionKey(userId, assistantId, userLanguage, fresh ? freshSessionId : undefined);
+      // relaySid уже посчитан выше (до проверки строки о прерывании) — тот же
+      // ключ сессии, без повторного вычисления.
       // Инструменты Linkeon и папка хода на релее — токеном хода и ключом без
       // номера телефона (linkeon-relay-fields.ts). Один раз на ход: повтор
       // self-heal идёт с теми же полями и в ту же папку.
@@ -2204,29 +2262,40 @@ ${LanguageService.buildDirective(userLanguage)}`;
         });
       };
 
-      await callUpstreamOnce();
+      // Метка «процесс релея этой сессии идёт» (relayRunning, ключ relaySid) —
+      // отдельный учёт от activeTurns: ровно тот промежуток, пока на релее
+      // реально может существовать убиваемый процесс. Открыта вокруг ОБОИХ
+      // возможных вызовов callUpstreamOnce (включая self-heal), закрыта в
+      // finally ДО копирования файлов (flushFileLinks ниже) — та часть хода
+      // уже не прерываема сообщением на релее, процесс там не живёт.
+      const relayMark = this.beginRelayRun(relaySid);
+      try {
+        await callUpstreamOnce();
 
-      // SELF-HEAL: r.linkeon иногда отдаёт ПУСТОЙ поток (0 delta-событий, ~сотни
-      // мс) — корень жалоб «постоянно выдаёт ошибку». Если ничего не пришло и
-      // клиент ещё на связи — тихо повторяем upstream ОДИН раз, прежде чем отдать
-      // юзеру пустоту. Безопасно: при пустом chunks клиенту ещё не ушло ни одного
-      // 'item' (дублей не будет). Инцидент/находка 2026-07-12.
-      //
-      // Шаги работы (activity) под эту гарантию не подпадают: неудавшийся
-      // прогон мог успеть прислать свои шаги ДО того, как понял, что поток
-      // пуст, а повтор пришлёт свои — итог видимый, но не ломающий: веб
-      // покажет повтор счётчиком («×2») или второй строкой, ответ не страдает.
-      // Ход из одних файлов — не пустой: раньше их ссылки уже лежали в chunks к
-      // этому месту, и повтора не было. Без этой проверки релей гонялся бы
-      // второй раз — двойная оплата и дубли файлов.
-      if (chunks.length === 0 && pendingFiles.length === 0 && !clientDisconnected) {
-        this.logger.warn(`empty stream from r.linkeon for ${userId}_${assistantId} — self-heal retry`);
-        this.events?.track('chat_quality', {
-          userId, sessionId: `${userId}_${assistantId}`,
-          props: { assistant_id: assistantId, self_heal_retry: true },
-        });
-        await new Promise((r) => setTimeout(r, 800));
-        try { await callUpstreamOnce(); } catch (e: any) { this.logger.warn(`self-heal retry failed: ${e.message}`); }
+        // SELF-HEAL: r.linkeon иногда отдаёт ПУСТОЙ поток (0 delta-событий, ~сотни
+        // мс) — корень жалоб «постоянно выдаёт ошибку». Если ничего не пришло и
+        // клиент ещё на связи — тихо повторяем upstream ОДИН раз, прежде чем отдать
+        // юзеру пустоту. Безопасно: при пустом chunks клиенту ещё не ушло ни одного
+        // 'item' (дублей не будет). Инцидент/находка 2026-07-12.
+        //
+        // Шаги работы (activity) под эту гарантию не подпадают: неудавшийся
+        // прогон мог успеть прислать свои шаги ДО того, как понял, что поток
+        // пуст, а повтор пришлёт свои — итог видимый, но не ломающий: веб
+        // покажет повтор счётчиком («×2») или второй строкой, ответ не страдает.
+        // Ход из одних файлов — не пустой: раньше их ссылки уже лежали в chunks к
+        // этому месту, и повтора не было. Без этой проверки релей гонялся бы
+        // второй раз — двойная оплата и дубли файлов.
+        if (chunks.length === 0 && pendingFiles.length === 0 && !clientDisconnected) {
+          this.logger.warn(`empty stream from r.linkeon for ${userId}_${assistantId} — self-heal retry`);
+          this.events?.track('chat_quality', {
+            userId, sessionId: `${userId}_${assistantId}`,
+            props: { assistant_id: assistantId, self_heal_retry: true },
+          });
+          await new Promise((r) => setTimeout(r, 800));
+          try { await callUpstreamOnce(); } catch (e: any) { this.logger.warn(`self-heal retry failed: ${e.message}`); }
+        }
+      } finally {
+        this.endRelayRun(relaySid, relayMark);
       }
 
       // Ссылки на файлы хода из done.outputFiles — см. flushFileLinks выше.
