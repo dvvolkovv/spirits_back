@@ -26,8 +26,9 @@ import { writePrivateFile } from '../../common/one-off-script';
  * адреса скопированных файлов, а 16.09.2026 релей перезагрузился и потерял
  * почти всё (к 08.10 мёртвыми были 8795 адресов). Кроме того он брал лишь
  * ответы ассистента и лишь адреса с хостом AGENT_URL. Реплики человека теперь
- * тоже берутся; ссылки с номером под другим хостом или без хоста не
- * меняются, но считаются — сухой прогон показывает, откуда они.
+ * тоже берутся; ссылки /files/<номер>_… под другим хостом или без хоста
+ * заведомо мёртвые — номер в них меняется на тот же солёный хэш без вопроса
+ * релею (maskForeignFilesLinks), сухой прогон показывает, сколько их и откуда.
  *
  * Сообщения моложе часа не трогаются: их может держать открытыми живая вкладка,
  * а фронт сверяет ленту с историей посимвольно (historyMerge.ts). UPDATE идёт с
@@ -47,7 +48,8 @@ export interface BackfillStore {
 export type JournalEntry =
   | { rowId: number; relayUrl: string; storedUrl: string }
   | { rowId: number; relayUrl: string; maskedUrl: string }
-  | { rowId: number; pathFrom: string; pathTo: string };
+  | { rowId: number; pathFrom: string; pathTo: string }
+  | { rowId: number; linkFrom: string; linkTo: string };
 
 /** Ответ релея на HEAD: 200 — жив, 404 — файла нет, прочее и сбой — не ответил. */
 export type ProbeResult = 'alive' | 'missing' | 'unknown';
@@ -62,10 +64,11 @@ const UPDATE_SQL = `UPDATE custom_chat_history SET content = $1 WHERE id = $2 AN
 const USER_ID = '\\d{10,15}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 /** В начале папки релея: `<id>_<ассистент>_<язык>` (или `<id>/` — папка из одного id). */
 const FOLDER_ID_RE = new RegExp(`^(${USER_ID})(?=[_/]|$)`, 'i');
-/** `/files/<id>_` в любом адресе — для счёта ссылок вне префикса релея. */
-const FILES_ID_RE = new RegExp(`/files/(?:${USER_ID})(?=[_/])`, 'gi');
-const FILES_ID_SQL = `SELECT id, content FROM custom_chat_history
+/** `/files/<id>` в любом адресе (id — в группе 1): для ссылок под чужим хостом и без хоста. */
+const FILES_ID_RE = new RegExp(`/files/(${USER_ID})(?=[_/])`, 'gi');
+const FILES_ID_SQL = `SELECT id, sender_type, content FROM custom_chat_history
  WHERE content ~* '/files/([0-9]{10,15}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[_/]'
+   AND created_at < now() - interval '1 hour'
  ORDER BY id`;
 
 /**
@@ -174,17 +177,45 @@ async function classify(
 /** Длиннее начало адреса не бывает: дальше назад текст не просматривается. */
 const MAX_ORIGIN_CHARS = 200;
 const ORIGIN_STOP_RE = /[\s(<"'`[]/;
+/** Начало токена — начало текста или разделитель, как у ORIGIN_STOP_RE. */
+const TOKEN_START = `(?<=^|[\\s(<"'\`\\[])`;
+
+interface ForeignLink {
+  /** Где в тексте `/files/`. */
+  at: number;
+  /** Начало адреса до разделителя: хост, `''` у адреса без хоста. */
+  head: string;
+  id: string;
+  /** Начало найдено — не дальше MAX_ORIGIN_CHARS. */
+  bounded: boolean;
+}
 
 /**
- * Начало адреса перед `/files/`: схема и хост, как написаны в тексте, —
- * «(без хоста)», если адрес относительный, «(иное)», если это не схема с
- * хостом. Только хост: ни пути, ни учётных данных, а значит, ни номера.
+ * `/files/<id>` не под префиксом релея — под чужим хостом или без хоста.
+ * Префикс сравнивается буквально, как его ищет LIKE выборки: всё, что под
+ * ним, решает ответ релея.
  */
-function originBefore(text: string, at: number): string {
-  let start = at;
-  const floor = Math.max(0, at - MAX_ORIGIN_CHARS);
-  while (start > floor && !ORIGIN_STOP_RE.test(text[start - 1])) start--;
-  const head = text.slice(start, at);
+function foreignFilesLinks(text: string, prefix: string): ForeignLink[] {
+  const out: ForeignLink[] = [];
+  const originLen = prefix.length - '/files/'.length;
+  for (const m of text.matchAll(FILES_ID_RE)) {
+    const at = m.index ?? 0;
+    if (text.slice(Math.max(0, at - originLen), at) + '/files/' === prefix) continue;
+    let start = at;
+    const floor = Math.max(0, at - MAX_ORIGIN_CHARS);
+    while (start > floor && !ORIGIN_STOP_RE.test(text[start - 1])) start--;
+    const bounded = start === 0 || ORIGIN_STOP_RE.test(text[start - 1]);
+    out.push({ at, head: text.slice(start, at), id: m[1], bounded });
+  }
+  return out;
+}
+
+/**
+ * Хост ссылки для счётчиков, как написан в тексте, — «(без хоста)» у
+ * относительного адреса, «(иное)», если это не схема с хостом. Только хост:
+ * ни пути, ни учётных данных, а значит, ни номера.
+ */
+function originLabel(head: string): string {
   if (head === '') return '(без хоста)';
   try {
     const u = new URL(head);
@@ -196,26 +227,36 @@ function originBefore(text: string, at: number): string {
 }
 
 /**
- * Строки с `/files/<id>_` под другим хостом или без хоста — их прогон не
- * меняет (копировать неоткуда, а чужой адрес — не наш), но показывает: сколько
- * и откуда. Префикс сравнивается буквально, как его ищет LIKE выборки.
+ * Номер (или uuid) в ссылках `/files/<id>_` под чужим хостом или без хоста —
+ * на fsKey(id). Такие ссылки заведомо мёртвые (копировать неоткуда, наш релей
+ * их не отдаёт), поэтому без вопроса релею (ревью ветки, I3). Ссылка, начало
+ * которой не найти (длиннее MAX_ORIGIN_CHARS), не меняется: откат ищет замену
+ * с начала токена. swaps — по одной записи на «начало адреса + id».
  */
-async function countOtherTemplates(pg: BackfillPg, prefix: string): Promise<{ rows: number; origins: string[] }> {
-  const { rows } = await pg.query(FILES_ID_SQL);
-  const origins = new Set<string>();
-  let n = 0;
-  for (const r of rows) {
-    const text = String(r.content);
-    let other = false;
-    for (const m of text.matchAll(FILES_ID_RE)) {
-      const at = m.index ?? 0;
-      if (text.slice(Math.max(0, at - prefix.length + '/files/'.length), at) + '/files/' === prefix) continue;
-      origins.add(originBefore(text, at));
-      other = true;
-    }
-    if (other) n++;
+export function maskForeignFilesLinks(
+  text: string,
+  agentUrl: string,
+  fsKey: (id: string) => string | undefined,
+): { text: string; swaps: { linkFrom: string; linkTo: string }[] } {
+  const swaps = new Map<string, string>();
+  let out = '';
+  let last = 0;
+  for (const l of foreignFilesLinks(text, relayFilesPrefix(agentUrl))) {
+    if (!l.bounded) continue;
+    const key = fsKey(l.id);
+    if (!key) continue;
+    const idAt = l.at + '/files/'.length;
+    out += text.slice(last, idAt) + key;
+    last = idAt + l.id.length;
+    swaps.set(`${l.head}/files/${l.id}`, `${l.head}/files/${key}`);
   }
-  return { rows: n, origins: [...origins].sort() };
+  out += text.slice(last);
+  return { text: out, swaps: [...swaps].map(([linkFrom, linkTo]) => ({ linkFrom, linkTo })) };
+}
+
+/** Откат замены в чужой ссылке: с начала токена и до `_` или `/`, как при замене. */
+function unmaskForeignLink(text: string, linkTo: string, linkFrom: string): string {
+  return text.replace(new RegExp(`${TOKEN_START}${escapeRe(linkTo)}(?=[_/])`, 'g'), () => linkFrom);
 }
 
 export async function runBackfill(p: {
@@ -242,9 +283,11 @@ export async function runBackfill(p: {
   masked: number;
   updatedRows: number;
   skippedRows: number;
-  /** Строки с `/files/<id>_` не под AGENT_URL — не меняются. */
+  /** Строки с `/files/<id>_` под чужим хостом или без хоста (старше часа) и их хосты. */
   otherRows: number;
   otherOrigins: string[];
+  /** Строки, где номер в таких ссылках заменён (--apply). */
+  maskedOtherRows: number;
   /** Строки с путём /tmp/agent-output/<id>… и /tmp/agent-uploads/<id>… (старше часа, любой sender_type). */
   outputPathRows: number;
   uploadPathRows: number;
@@ -256,12 +299,13 @@ export async function runBackfill(p: {
   const prefix = relayFilesPrefix(p.agentUrl);
   const { rows } = await p.pg.query(SELECT_BACKFILL_ROWS_SQL, [`%${prefix}%`]);
   const { rows: pathRows } = await p.pg.query(SELECT_PATH_ROWS_SQL);
-  // Строка бывает в обеих выборках — одна запись, одна замена.
+  const { rows: idRows } = await p.pg.query(FILES_ID_SQL);
+  // Строка бывает в нескольких выборках — одна запись, одна замена.
   const byId = new Map<number, { id: number; human: boolean; content: string; withLinks: boolean }>();
   for (const r of rows) {
     byId.set(Number(r.id), { id: Number(r.id), human: r.sender_type === 'human', content: String(r.content), withLinks: true });
   }
-  for (const r of pathRows) {
+  for (const r of [...pathRows, ...idRows]) {
     if (!byId.has(Number(r.id))) {
       byId.set(Number(r.id), { id: Number(r.id), human: r.sender_type === 'human', content: String(r.content), withLinks: false });
     }
@@ -271,6 +315,7 @@ export async function runBackfill(p: {
     .map((r) => ({
       ...r,
       urls: r.withLinks ? collectRelayUrls(r.content, p.agentUrl) : [],
+      foreign: foreignFilesLinks(r.content, prefix),
       outputPath: hasRelayPath(r.content, 'output'),
       uploadPath: hasRelayPath(r.content, 'uploads'),
     }));
@@ -296,7 +341,7 @@ export async function runBackfill(p: {
       if (to) masks.set(u, to);
     }
   }
-  const other = await countOtherTemplates(p.pg, prefix);
+  const otherRows = perRow.filter((r) => r.foreign.length > 0);
   const summary = {
     rows: linkRows.length,
     humanRows: linkRows.filter((r) => r.human).length,
@@ -309,13 +354,15 @@ export async function runBackfill(p: {
     masked: 0,
     updatedRows: 0,
     skippedRows: 0,
-    otherRows: other.rows,
-    otherOrigins: other.origins,
+    otherRows: otherRows.length,
+    otherOrigins: [...new Set(otherRows.flatMap((r) => r.foreign.map((l) => originLabel(l.head))))].sort(),
+    maskedOtherRows: 0,
     outputPathRows: perRow.filter((r) => r.outputPath).length,
     uploadPathRows: perRow.filter((r) => r.uploadPath).length,
     maskedPathRows: 0,
     missingUrls,
   };
+  p.log(`строк со ссылками под чужим хостом или без хоста: ${summary.otherRows}`);
   p.log(`строк с путями релея: ${summary.outputPathRows} (папка вывода), ${summary.uploadPathRows} (загрузки)`);
   if (!p.apply) return summary;
 
@@ -337,18 +384,22 @@ export async function runBackfill(p: {
       else if (masks.has(u)) map.set(u, { to: masks.get(u)!, masked: true });
     }
     let next = map.size > 0 ? replaceUrls(r.content, new Map([...map].map(([from, x]) => [from, x.to]))) : r.content;
-    // Пути на диске релея — в той же строке, той же заменой (одна проверка
-    // прежнего текста на строку).
+    // Ссылки под чужим хостом и без хоста и пути на диске релея — в той же
+    // строке, той же заменой (одна проверка прежнего текста на строку).
+    const links = p.fsKey && r.foreign.length > 0 ? maskForeignFilesLinks(next, p.agentUrl, fsKey) : { text: next, swaps: [] };
+    next = links.text;
     const paths = p.fsKey && (r.outputPath || r.uploadPath) ? maskRelayPaths(next, fsKey) : { text: next, swaps: [] };
     next = paths.text;
     if (next === r.content) continue;
     const res = await p.pg.query(UPDATE_SQL, [next, r.id, r.content]);
     if ((res.rowCount ?? 0) === 1) {
       summary.updatedRows++;
+      if (links.swaps.length > 0) summary.maskedOtherRows++;
       if (paths.swaps.length > 0) summary.maskedPathRows++;
       for (const [relayUrl, x] of map) {
         p.journal(x.masked ? { rowId: r.id, relayUrl, maskedUrl: x.to } : { rowId: r.id, relayUrl, storedUrl: x.to });
       }
+      for (const sw of links.swaps) p.journal({ rowId: r.id, ...sw });
       for (const sw of paths.swaps) p.journal({ rowId: r.id, ...sw });
     } else {
       summary.skippedRows++;
@@ -359,19 +410,24 @@ export async function runBackfill(p: {
 }
 
 /**
- * Откат по журналу: наш адрес или адрес без номера → адрес релея, путь с
- * солёным хэшем → путь с номером; с той же проверкой прежнего текста.
+ * Откат по журналу: наш адрес или адрес без номера → адрес релея; ссылка под
+ * чужим хостом или без хоста и путь на диске релея — с солёным хэшем → с
+ * номером; с той же проверкой прежнего текста.
  */
 export async function revertBackfill(p: {
   pg: BackfillPg;
   entries: JournalEntry[];
   log: (m: string) => void;
 }): Promise<{ reverted: number; skipped: number }> {
-  const byRow = new Map<number, { urls: Map<string, string>; paths: { pathFrom: string; pathTo: string }[] }>();
+  const byRow = new Map<
+    number,
+    { urls: Map<string, string>; links: { linkFrom: string; linkTo: string }[]; paths: { pathFrom: string; pathTo: string }[] }
+  >();
   for (const e of p.entries) {
-    if (!byRow.has(e.rowId)) byRow.set(e.rowId, { urls: new Map(), paths: [] });
+    if (!byRow.has(e.rowId)) byRow.set(e.rowId, { urls: new Map(), links: [], paths: [] });
     const row = byRow.get(e.rowId)!;
     if ('pathFrom' in e) row.paths.push({ pathFrom: e.pathFrom, pathTo: e.pathTo });
+    else if ('linkFrom' in e) row.links.push({ linkFrom: e.linkFrom, linkTo: e.linkTo });
     else row.urls.set('storedUrl' in e ? e.storedUrl : e.maskedUrl, e.relayUrl);
   }
   let reverted = 0;
@@ -384,6 +440,7 @@ export async function revertBackfill(p: {
     }
     const cur = String(rows[0].content);
     let next = back.urls.size > 0 ? replaceUrls(cur, back.urls) : cur;
+    for (const sw of back.links) next = unmaskForeignLink(next, sw.linkTo, sw.linkFrom);
     for (const sw of back.paths) next = unmaskRelayPath(next, sw.pathTo, sw.pathFrom);
     if (next === cur) {
       skipped++;
