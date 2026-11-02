@@ -77,13 +77,19 @@ describe('scripts/relay-fs-key-map.ts', () => {
     }
   }, 60_000);
 
-  it('без соли — код 2 и ни строки в stdout', () => {
+  it.each([
+    ['без .env вовсе', ''],
+    // Отката на JWT_SECRET нет: карта на другой соли разложила бы файлы по
+    // чужим папкам — релей её отвергнет сверкой, но лучше не считать вовсе.
+    ['только JWT_SECRET', 'JWT_SECRET=jwt-тест\n'],
+  ])('без RELAY_FS_SALT (%s) — код 2 и ни строки в stdout', (_name, env) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-fs-key-map-'));
     try {
+      if (env) fs.writeFileSync(path.join(dir, '.env'), env);
       const r = run(dir, KEYS.join('\n') + '\n');
       expect(r.status).toBe(2);
       expect(r.stdout).toBe('');
-      expect(r.stderr).toMatch(/нет ни RELAY_FS_SALT, ни JWT_SECRET/);
+      expect(r.stderr).toMatch(/нет RELAY_FS_SALT/);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
