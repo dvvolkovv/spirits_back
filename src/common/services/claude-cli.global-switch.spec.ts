@@ -6,7 +6,7 @@ import { Logger } from '@nestjs/common';
 
 jest.mock('child_process', () => ({ spawn: jest.fn() }));
 import { spawn } from 'child_process';
-import { ClaudeCliService } from './claude-cli.service';
+import { ClaudeCliCallError, ClaudeCliService } from './claude-cli.service';
 import { PgService } from './pg.service';
 import { GlobalLlmProviderService } from './global-llm-provider.service';
 
@@ -37,6 +37,9 @@ const streamAuthFail = lines({ type: 'result', is_error: true, result: 'Failed t
 const OK = (result: string, cost = 0.01) => JSON.stringify({ is_error: false, result, total_cost_usd: cost, duration_ms: 5 });
 const QWEN_401 = JSON.stringify({ is_error: true, result: 'Failed to authenticate. API Error: 401 Invalid API-key provided.' });
 const AUTH_FAIL = JSON.stringify({ is_error: true, result: 'Failed to authenticate: OAuth session expired and could not be refreshed' });
+// Безопасный текст сбоя входа при коде 1 (spec 2026-11-02-safe-cli-errors):
+// сырой result («Failed to authenticate…», «401…») — только для вида и доступа.
+const AUTH_SAFE = 'claude CLI код выхода 1: auth';
 /** Ключ i-го запуска; undefined — запуск Claude. */
 const tokenOf = (i: number) => spawnMock.mock.calls[i][2]?.env?.ANTHROPIC_AUTH_TOKEN as string | undefined;
 const pgMock = () => ({ query: jest.fn().mockResolvedValue({ rows: [] }) });
@@ -125,7 +128,9 @@ describe('ClaudeCliService — общий рубильник', () => {
     jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     spawnMock.mockImplementationOnce(() => fakeProc(QWEN_401, 1));
     const s = svc(undefined, sw('claude'));
-    await expect(s.text('x', { provider: 'qwen', noFallback: true })).rejects.toThrow(/401/);
+    await expect(s.text('x', { provider: 'qwen', noFallback: true })).rejects.toMatchObject({
+      message: `qwen (выбран): ${AUTH_SAFE}`, kind: 'auth', access: true,
+    });
     expect(spawnMock).toHaveBeenCalledTimes(1);
     expect(tokenOf(0)).toBe('sk-sp-test');
     // Решение по ревью 31.10: сбой доступа выбранного под noFallback не трогает
@@ -264,7 +269,9 @@ describe('ClaudeCliService — providerChoice', () => {
   it('ход гостя (providerChoice global), Qwen падает — текст ошибки «для всех», не «выбран»', async () => {
     spawnMock.mockImplementationOnce(() => fakeProc(QWEN_401, 1));
     const err = await new ClaudeCliService().text('x', { provider: 'qwen', providerChoice: 'global', noFallback: true }).catch((e) => e);
-    expect(err.message).toMatch(/^qwen \(для всех\): .*401/);
+    expect(err).toBeInstanceOf(ClaudeCliCallError);
+    expect(err.message).toBe(`qwen (для всех): ${AUTH_SAFE}`);
+    expect(err).toMatchObject({ kind: 'auth', access: true });
   });
 
   it("providerChoice мусор — трактуется как 'user', в событие как есть не уходит", async () => {
@@ -343,7 +350,7 @@ describe('ClaudeCliService — гонка с сервисом рубильник
     expect(spawnMock).toHaveBeenCalledTimes(0); // A висит на get() рубильника, ничего не спавнило
     // onTextDelta у B — чтобы после первого сбоя Claude не пробовал Qwen/Kimi
     // сам (mayRetry запрещает повтор) и не забрал мок, предназначенный A.
-    await expect(s.text('B', { provider: 'claude', onTextDelta: () => {} })).rejects.toThrow(/Failed to authenticate/);
+    await expect(s.text('B', { provider: 'claude', onTextDelta: () => {} })).rejects.toMatchObject({ kind: 'auth', access: true });
     expect(s.fallbackStats().breakerOpenUntil).toBeGreaterThan(0); // B открыл окно Claude
     resolveSwitch!('claude');
     expect(await pA).toBe('qA');

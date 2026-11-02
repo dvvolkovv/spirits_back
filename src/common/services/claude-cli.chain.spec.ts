@@ -7,7 +7,7 @@ import { Logger } from '@nestjs/common';
 // уровне модуля.
 jest.mock('child_process', () => ({ spawn: jest.fn() }));
 import { spawn } from 'child_process';
-import { ClaudeCliService } from './claude-cli.service';
+import { ClaudeCliCallError, ClaudeCliService } from './claude-cli.service';
 
 /**
  * Цепочка запасных и выбор пользователя (spec 2026-10-31-kimi-provider-design.md):
@@ -81,6 +81,9 @@ const QWEN_401 = JSON.stringify({ is_error: true, result: 'Failed to authenticat
 const KIMI_401 = JSON.stringify({ is_error: true, result: 'Failed to authenticate. API Error: 401 Invalid Authentication' });
 const lines = (...evs: object[]) => evs.map((e) => JSON.stringify(e)).join('\n') + '\n';
 const streamOk = (result: string) => lines({ type: 'result', is_error: false, result, total_cost_usd: 0.01, duration_ms: 1 });
+// Безопасный текст сбоя входа при коде 1 (spec 2026-11-02-safe-cli-errors):
+// сырой result («Failed to authenticate…», «401…») — только для вида и доступа.
+const AUTH_SAFE = 'claude CLI код выхода 1: auth';
 
 /** Ключ i-го запуска; undefined — запуск Claude (своего окружения нет). */
 const tokenOf = (i: number) => spawnMock.mock.calls[i][2]?.env?.ANTHROPIC_AUTH_TOKEN as string | undefined;
@@ -169,7 +172,10 @@ describe('ClaudeCliService — аварийная цепочка Claude → Qwen
     // 200 мс: подставной ответ Claude приходит на следующем тике, задолго до
     // таймаута; висящий Qwen получает весь бюджет (он меньше минуты) и упирается в него.
     const err = await svc.text('x', { timeoutMs: 200 }).catch((e) => e);
-    expect(err.message).toMatch(/^claude CLI exited with code 1: Failed to authenticate.* \| qwen fallback: claude CLI timeout/);
+    expect(err).toBeInstanceOf(ClaudeCliCallError);
+    expect(err.message).toMatch(/^claude CLI код выхода 1: auth \| qwen fallback: claude CLI timeout after \d+ms$/);
+    // Сводка попыток: сильнейший вид — auth; сбой доступа был (у Claude).
+    expect(err).toMatchObject({ kind: 'auth', access: true });
     expect(spawnMock).toHaveBeenCalledTimes(2);
     expect(svc.fallbackStats().breakerOpenUntil).toBe(0);
     expect(svc.fallbackStats().providers.qwen.downUntil).toBe(0);
@@ -185,7 +191,9 @@ describe('ClaudeCliService — аварийная цепочка Claude → Qwen
       .mockImplementationOnce(() => fakeProc(OK('c')));
     const svc = new ClaudeCliService();
     const err = await svc.text('x').catch((e) => e);
-    expect(err.message).toMatch(/^claude CLI exited with code 1: Failed to authenticate.* \| qwen fallback: .*401.* \| kimi fallback: .*401/);
+    expect(err).toBeInstanceOf(ClaudeCliCallError);
+    expect(err.message).toBe(`${AUTH_SAFE} | qwen fallback: ${AUTH_SAFE} | kimi fallback: ${AUTH_SAFE}`);
+    expect(err).toMatchObject({ kind: 'auth', access: true });
     const st = svc.fallbackStats();
     expect(st).toMatchObject({ ok: 0, failed: 2, breakerOpenUntil: 0 });
     expect(st.providers.qwen.downUntil).toBeGreaterThan(0);
@@ -298,24 +306,31 @@ describe('ClaudeCliService — предупреждение о модели в s
  * Причина из JSON в stdout — только когда это действительно ошибка. Иначе
  * кодом ≠0 мог выйти обычный ответ (is_error: false), и его текст («429» в
  * нём) классифицировался бы как лимит — окно Claude открылось бы для всех.
+ *
+ * Причина (сырой текст) в ошибку не попадает (spec 2026-11-02-safe-cli-errors):
+ * откуда она взята, видно по виду сбоя — у причины в stderr он свой.
  */
 describe('ClaudeCliService — причина из JSON в stdout только когда это ошибка', () => {
-  it('stdout пуст, причина только в stderr — текст ошибки её содержит', async () => {
-    spawnMock.mockImplementationOnce(() => fakeProcWithStderr('', 'Error: boom\n', 1));
+  it('stdout пуст, причина только в stderr — по ней вид сбоя, сам текст в ошибку не попадает', async () => {
+    spawnMock.mockImplementationOnce(() => fakeProcWithStderr('', 'Error: API Error: 401 boom\n', 1));
     const err = await new ClaudeCliService().text('x', { noFallback: true }).catch((e) => e);
-    expect(err.message).toContain('boom');
+    expect(err).toMatchObject({ kind: 'auth', access: true });
+    expect(err.message).toBe(AUTH_SAFE);
+    expect(err.message).not.toContain('boom');
   });
 
   it('is_error: true, но result — пустая строка — причина из stderr', async () => {
-    spawnMock.mockImplementationOnce(() => fakeProcWithStderr('{"is_error":true,"result":""}', 'real reason\n', 1));
+    spawnMock.mockImplementationOnce(() => fakeProcWithStderr('{"is_error":true,"result":""}', 'API Error: 529 real reason\n', 1));
     const err = await new ClaudeCliService().text('x', { noFallback: true }).catch((e) => e);
-    expect(err.message).toContain('real reason');
+    expect(err).toMatchObject({ kind: 'overloaded', access: true });
+    expect(err.message).not.toContain('real reason');
   });
 
   it('is_error: true, но result — из одних пробелов — причина из stderr (пробелы не маскируют)', async () => {
-    spawnMock.mockImplementationOnce(() => fakeProcWithStderr('{"is_error":true,"result":"   "}', 'real reason\n', 1));
+    spawnMock.mockImplementationOnce(() => fakeProcWithStderr('{"is_error":true,"result":"   "}', 'API Error: 529 real reason\n', 1));
     const err = await new ClaudeCliService().text('x', { noFallback: true }).catch((e) => e);
-    expect(err.message).toContain('real reason');
+    expect(err).toMatchObject({ kind: 'overloaded', access: true });
+    expect(err.message).not.toContain('real reason');
   });
 
   it('is_error: false, текст обычного ответа упоминает 429 — не читается как причина даже из сырого stdout; окно не открывается, к запасным не переходит', async () => {
@@ -334,6 +349,7 @@ describe('ClaudeCliService — причина из JSON в stdout только �
     // (в нём тот же текст) не становятся причиной — иначе «429» в нём
     // классифицировался бы как рейт-лимит.
     expect(err.message).not.toContain('429');
+    expect(err).toMatchObject({ kind: 'other', access: false });
     expect(spawnMock).toHaveBeenCalledTimes(1); // перехода к запасным не было
     expect(svc.fallbackStats().breakerOpenUntil).toBe(0);
   });
@@ -405,7 +421,9 @@ describe('ClaudeCliService — выбор пользователя Kimi', () => 
       .mockImplementationOnce(() => fakeProc(QWEN_401, 1));
     const svc = new ClaudeCliService();
     const err = await svc.text('x', { provider: 'kimi' }).catch((e) => e);
-    expect(err.message).toMatch(/^kimi \(выбран\): .*401.* \| claude fallback: .*Failed to authenticate.* \| qwen fallback: .*401/);
+    expect(err).toBeInstanceOf(ClaudeCliCallError);
+    expect(err.message).toBe(`kimi (выбран): ${AUTH_SAFE} | claude fallback: ${AUTH_SAFE} | qwen fallback: ${AUTH_SAFE}`);
+    expect(err).toMatchObject({ kind: 'auth', access: true });
     const st = svc.fallbackStats();
     expect(st.breakerOpenUntil).toBe(0);
     expect(st.providers.kimi.downUntil).toBeGreaterThan(0);
@@ -534,7 +552,7 @@ describe('ClaudeCliService — вызовы с MCP идут в stream-json', () 
       { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'mcp__products__manage_product', input: {} }] } },
       { type: 'result', is_error: true, result: 'API Error: 529 Overloaded' },
     ), 1));
-    await expect(svcIn().text('x', { mcpServers: MCP })).rejects.toThrow('529');
+    await expect(svcIn().text('x', { mcpServers: MCP })).rejects.toMatchObject({ kind: 'overloaded', access: true, toolUsed: true });
     expect(spawnMock).toHaveBeenCalledTimes(1);
   });
 });

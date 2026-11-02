@@ -7,7 +7,7 @@ import { Logger } from '@nestjs/common';
 // уровне модуля.
 jest.mock('child_process', () => ({ spawn: jest.fn() }));
 import { spawn } from 'child_process';
-import { ClaudeCliService } from './claude-cli.service';
+import { ClaudeCliCallError, ClaudeCliService } from './claude-cli.service';
 
 /**
  * Запасной путь на Qwen (spec 2026-10-29-qwen-fallback-design.md): когда вызов
@@ -69,6 +69,9 @@ const AUTH_FAIL = JSON.stringify({ is_error: true, result: 'Failed to authentica
 const LIMIT_FAIL = JSON.stringify({ is_error: true, result: "You've hit your weekly limit · resets Nov 3" });
 const QWEN_401 = JSON.stringify({ is_error: true, result: 'Failed to authenticate. API Error: 401 Invalid API-key provided.' });
 const lines = (...evs: object[]) => evs.map((e) => JSON.stringify(e)).join('\n') + '\n';
+// Безопасный текст сбоя входа в json-режиме (spec 2026-11-02-safe-cli-errors):
+// сырой result («Failed to authenticate…») — только для вида и доступа.
+const AUTH_SAFE = 'claude CLI код выхода 1: auth';
 
 /** env и --model i-го вызова spawn. */
 const spawnEnv = (i: number) => spawnMock.mock.calls[i][2]?.env as NodeJS.ProcessEnv | undefined;
@@ -171,7 +174,9 @@ describe('ClaudeCliService — запасной путь на Qwen', () => {
   it('без ключа — запасного пути нет, ошибка исходная', async () => {
     delete process.env.QWEN_FALLBACK_API_KEY;
     spawnMock.mockImplementationOnce(() => fakeProc(AUTH_FAIL, 1));
-    await expect(new ClaudeCliService().text('x')).rejects.toThrow('Failed to authenticate: OAuth');
+    const err = await new ClaudeCliService().text('x').catch((e) => e);
+    expect(err).toBeInstanceOf(ClaudeCliCallError);
+    expect(err).toMatchObject({ message: AUTH_SAFE, kind: 'auth', access: true });
     expect(spawnMock).toHaveBeenCalledTimes(1);
   });
 
@@ -198,7 +203,9 @@ describe('ClaudeCliService — запасной путь на Qwen', () => {
   it('прочая ошибка (кривой JSON) — не переключает и окна не открывает', async () => {
     spawnMock.mockImplementationOnce(() => fakeProc('not json', 0));
     const svc = new ClaudeCliService();
-    await expect(svc.text('x')).rejects.toThrow('invalid JSON');
+    await expect(svc.text('x')).rejects.toMatchObject({
+      message: 'claude CLI неверный JSON (stdout 8 байт): other', kind: 'other', access: false,
+    });
     expect(spawnMock).toHaveBeenCalledTimes(1);
     expect(svc.fallbackStats().breakerOpenUntil).toBe(0);
   });
@@ -209,9 +216,7 @@ describe('ClaudeCliService — запасной путь на Qwen', () => {
       .mockImplementationOnce(() => fakeProc(AUTH_FAIL, 1))
       .mockImplementationOnce(() => fakeProc(OK('q')));
     await new ClaudeCliService().text('x', { model: 'claude-sonnet-4-6' });
-    expect(warn).toHaveBeenCalledWith(expect.stringMatching(
-      /^claude CLI → запасной Qwen qwen3\.8-flash \(auth\): claude CLI exited with code 1: Failed to authenticate/,
-    ));
+    expect(warn).toHaveBeenCalledWith(`claude CLI → запасной Qwen qwen3.8-flash (auth): ${AUTH_SAFE}`);
   });
 
   it('запасной вызов получает остаток бюджета timeoutMs, а не полный', async () => {
@@ -233,7 +238,7 @@ describe('ClaudeCliService — запасной путь на Qwen', () => {
       .mockImplementationOnce(() => fakeProc(AUTH_FAIL, 1))
       .mockImplementationOnce(() => fakeProc(OK('claude')));
     const svc = new ClaudeCliService();
-    await expect(svc.text('probe', { noFallback: true })).rejects.toThrow('Failed to authenticate');
+    await expect(svc.text('probe', { noFallback: true })).rejects.toMatchObject({ message: AUTH_SAFE, kind: 'auth', access: true });
     expect(spawnMock).toHaveBeenCalledTimes(1);
     // следующий обычный вызов пробует Claude, а не идёт сразу на Qwen
     await expect(svc.text('y')).resolves.toBe('claude');
@@ -245,7 +250,8 @@ describe('ClaudeCliService — запасной путь на Qwen', () => {
       { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'mcp__products__manage_product', input: {} }] } },
       { type: 'result', is_error: true, result: 'API Error: 529 Overloaded' },
     ), 1));
-    await expect(new ClaudeCliService().textWithCost('x', { onProgress: () => {} })).rejects.toThrow('529');
+    await expect(new ClaudeCliService().textWithCost('x', { onProgress: () => {} }))
+      .rejects.toMatchObject({ kind: 'overloaded', access: true, toolUsed: true });
     expect(spawnMock).toHaveBeenCalledTimes(1);
   });
 
@@ -255,7 +261,8 @@ describe('ClaudeCliService — запасной путь на Qwen', () => {
       { type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Привет' } } },
       { type: 'result', is_error: true, result: 'API Error: 529 Overloaded' },
     ), 1));
-    await expect(new ClaudeCliService().textWithCost('x', { onTextDelta: (t) => deltas.push(t) })).rejects.toThrow('529');
+    await expect(new ClaudeCliService().textWithCost('x', { onTextDelta: (t) => deltas.push(t) }))
+      .rejects.toMatchObject({ kind: 'overloaded', access: true });
     expect(spawnMock).toHaveBeenCalledTimes(1);
     expect(deltas).toEqual(['Привет']);
   });
@@ -290,7 +297,7 @@ describe('ClaudeCliService — запасной путь на Qwen', () => {
     'json-режим с tools %p (не только Read/WebSearch/WebFetch) — не переключает (вызов тула не виден)',
     async (tools) => {
       spawnMock.mockImplementationOnce(() => fakeProc(AUTH_FAIL, 1));
-      await expect(new ClaudeCliService().text('x', { tools })).rejects.toThrow('Failed to authenticate');
+      await expect(new ClaudeCliService().text('x', { tools })).rejects.toMatchObject({ message: AUTH_SAFE, kind: 'auth', access: true });
       expect(spawnMock).toHaveBeenCalledTimes(1);
     },
   );
@@ -354,9 +361,9 @@ describe('ClaudeCliService — запасной путь на Qwen', () => {
       .mockImplementationOnce(() => fakeProc(AUTH_FAIL, 1))
       .mockImplementationOnce(() => fakeProc(QWEN_401, 1));
     const err = await new ClaudeCliService().text('x').catch((e) => e);
-    expect(err.message).toMatch(
-      /^claude CLI exited with code 1: Failed to authenticate: OAuth.* \| qwen fallback: claude CLI exited with code 1: Failed to authenticate\. API Error: 401/,
-    );
+    expect(err).toBeInstanceOf(ClaudeCliCallError);
+    expect(err.message).toBe(`${AUTH_SAFE} | qwen fallback: ${AUTH_SAFE}`);
+    expect(err).toMatchObject({ kind: 'auth', access: true });
   });
 
   it('упали оба — окно закрыто: следующий вызов снова пробует Claude', async () => {
@@ -534,7 +541,8 @@ describe('ClaudeCliService — предохранитель', () => {
     const svc = new ClaudeCliService();
     await svc.text('1');
     const err = await svc.text('2').catch((e) => e);
-    expect(err.message).toMatch(/^claude CLI пропущен \(окно запасного пути\) \| qwen fallback: .*401/);
+    expect(err.message).toBe(`claude CLI пропущен (окно запасного пути) | qwen fallback: ${AUTH_SAFE}`);
+    expect(err).toMatchObject({ kind: 'auth', access: true });
     // Qwen сам лежит — молчать до конца окна незачем: Claude мог уже ожить.
     expect(await svc.text('3')).toBe('c3');
     expect(hasEnv(3)).toBe(false);
@@ -571,7 +579,7 @@ describe('ClaudeCliService — предохранитель', () => {
       ), 1))
       .mockImplementationOnce(() => fakeProc(OK('q')));
     const svc = new ClaudeCliService();
-    await expect(svc.textWithCost('x', { onProgress: () => {} })).rejects.toThrow('529');
+    await expect(svc.textWithCost('x', { onProgress: () => {} })).rejects.toMatchObject({ kind: 'overloaded', access: true });
     expect(spawnMock).toHaveBeenCalledTimes(1);
     // Claude сейчас недоступен — следующий обычный вызов идёт сразу на Qwen.
     expect(await svc.text('y')).toBe('q');

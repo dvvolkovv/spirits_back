@@ -8,7 +8,17 @@ import * as path from 'path';
 import { PgService } from './pg.service';
 import { GlobalLlmProviderService } from './global-llm-provider.service';
 import { neutralizeAtMentions, stripWordJoiner } from '../agent-guards';
-import { classifyLlmError, looksLikeCliRefusal } from '../llm-error';
+import {
+  aggregateKind,
+  apiErrorStatus,
+  classifyLlmError,
+  cliDiagnostic,
+  LlmOutageKind,
+  looksLikeCliRefusal,
+  refusalDetail,
+  safeCliText,
+  safeErrorCode,
+} from '../llm-error';
 import {
   AnswerProvider,
   FALLBACK_ORDER,
@@ -67,6 +77,9 @@ const EMPTY_CWD_NAME = 'linkeon-claude-empty';
  */
 const MCP_CONFIG_STALE_MS = 60 * 60 * 1000;
 
+/** NUL: spawn не принимает его в аргументах (ERR_INVALID_ARG_VALUE). */
+const NUL = String.fromCharCode(0);
+
 /** Модель и таймаут вызова, когда caller их не задал. */
 const DEFAULT_MODEL = 'claude-haiku-4-5';
 const DEFAULT_TIMEOUT_MS = 60_000;
@@ -82,16 +95,44 @@ interface CliRunResult {
   toolUsed: boolean;
 }
 
+/** Признаки сбоя вызова CLI (spec 2026-11-02-safe-cli-errors) — по сырому
+ *  тексту сбоя, который внутри сервиса и остаётся. */
+export interface ClaudeCliErrorInfo {
+  /** Вид сбоя: classifyLlmError по сырому тексту. */
+  kind?: LlmOutageKind;
+  /** Сбой доступа (вход, лимит, перегрузка, 403/Arrearage) — isFallbackWorthy
+   *  по сырому тексту. От kind не зависит: переполнение контекста с «limit
+   *  reached» — weekly_limit без доступа, 403 — other с доступом. */
+  access?: boolean;
+  /** Код ответа API (api_error_status CLI, целое 100–599), если CLI его дал. */
+  status?: number;
+}
+
 /**
- * Ошибка вызова CLI. toolUsed — модель успела вызвать инструмент с
- * последствиями (не Read/WebSearch/WebFetch) до сбоя; виден только в
- * stream-json. Такой вызов у другого провайдера не повторяется: инструмент с
- * последствиями (правка продукта, жалоба в поддержку) сработал бы дважды.
+ * Ошибка вызова CLI. message — безопасный текст (safeCliText): вид сбоя, код
+ * ответа API, код выхода, диагностика CLI, текст отказа самого CLI. Сырой
+ * текст (result, stdout, stderr, сообщение JSON.parse) несёт фрагменты
+ * разговоров и наружу не уходит: message пишут в журналы, базу и алерты.
+ * Решения по сбою — по признакам kind/access/status, не по тексту.
+ *
+ * toolUsed — модель успела вызвать инструмент с последствиями (не
+ * Read/WebSearch/WebFetch) до сбоя; виден только в stream-json. Такой вызов у
+ * другого провайдера не повторяется: инструмент с последствиями (правка
+ * продукта, жалоба в поддержку) сработал бы дважды.
  */
 export class ClaudeCliCallError extends Error {
-  constructor(message: string, readonly toolUsed: boolean) {
+  readonly kind?: LlmOutageKind;
+  readonly access?: boolean;
+  readonly status?: number;
+
+  constructor(message: string, readonly toolUsed: boolean, info: ClaudeCliErrorInfo = {}) {
+    // Безопасный текст — сразу в super: stack (его пишут tg-bot.service и Nest
+    // ExceptionsHandler) начинается с message.
     super(message);
     this.name = 'ClaudeCliCallError';
+    this.kind = info.kind;
+    this.access = info.access;
+    this.status = info.status;
   }
 }
 
@@ -464,6 +505,13 @@ export class ClaudeCliService implements OnModuleInit {
     const parts: string[] = skippedBySwitch
       ? [`${selected} (для всех) пропущен: не отвечает`]
       : (plan[0] !== 'claude' && plan[0] !== selected ? ['claude CLI пропущен (окно запасного пути)'] : []);
+    // Признаки попыток — для итоговой ошибки, если не ответит никто (spec
+    // 2026-11-02-safe-cli-errors): сводный вид — сильнейший по попыткам
+    // (aggregateKind), доступ — хоть одна попытка со сбоем доступа, toolUsed —
+    // хоть одна попытка с инструментом с последствиями.
+    const kinds: LlmOutageKind[] = [];
+    let anyAccess = false;
+    let anyToolUsed = false;
     let reachedFallback = false;
     let attemptOpts = opts;
     for (let i = 0; i < plan.length; ) {
@@ -490,10 +538,33 @@ export class ClaudeCliService implements OnModuleInit {
         }
         return res;
       }
-      if (refusal) err = new ClaudeCliCallError(`claude CLI error: ${res!.text.trim()}`, res!.toolUsed);
-      const msg = String((err as any)?.message ?? err);
-      const access = isFallbackWorthy(msg);
-      const kind = classifyLlmError(msg).kind;
+      // Сбой попытки — всегда ClaudeCliCallError с безопасным текстом и
+      // признаками (spec 2026-11-02-safe-cli-errors, п. 4): решения дальше —
+      // только по признакам, текст — только в склейку и журналы.
+      let failure: ClaudeCliCallError;
+      if (refusal) {
+        // Отказ пишет CLI, а не модель: в безопасном тексте — его фраза и
+        // хвост из белого списка (refusalDetail), в нём время сброса лимита.
+        const text = res!.text.trim();
+        const f = ClaudeCliService.safeFailure('отказ', `claude CLI error: ${text}`, { cause: text });
+        failure = new ClaudeCliCallError(f.message, res!.toolUsed, f.info);
+      } else if (err instanceof ClaudeCliCallError) {
+        failure = err;
+      } else {
+        // Ошибка без признаков — не от CLI (сбой подготовки вызова: tmp,
+        // копии вложений). Её сообщение бывает сырым (пути, цитаты
+        // аргументов): other без доступа, текст — по коду ошибки.
+        failure = new ClaudeCliCallError(safeCliText({ what: `сбой (${safeErrorCode(err)})`, kind: 'other' }), false, {
+          kind: 'other',
+          access: false,
+        });
+      }
+      const msg = failure.message;
+      const access = failure.access ?? false;
+      const kind = failure.kind ?? 'other';
+      kinds.push(kind);
+      if (access) anyAccess = true;
+      if (failure.toolUsed) anyToolUsed = true;
       // Сбой доступа — свидетельство для следующих вызовов, даже если этот
       // повторять нельзя: у Claude — окно Claude (если есть на кого
       // переключаться), у запасного — его окно «не отвечает». Под noFallback —
@@ -506,12 +577,13 @@ export class ClaudeCliService implements OnModuleInit {
       }
       if (emergency) this.fallback.recordOutcome(p, false);
       // «для всех» — у выбора рубильника; «выбран» — у личного, как раньше.
+      // msg — безопасный текст (у ошибок сервиса), склейка — из них же.
       const chosenTag = choice === 'global' ? 'для всех' : 'выбран';
       parts.push(parts.length === 0 ? (p === selected ? `${p} (${chosenTag}): ${msg}` : msg) : `${p} fallback: ${msg}`);
       const next = this.nextAttempt(plan, i);
       // Выбранный — при любом сбое (решение владельца), остальные — только при
       // сбое доступа; и только если повтор ничего не задвоит.
-      const allowed = (p === selected || access) && this.mayRetry(err, opts);
+      const allowed = (p === selected || access) && this.mayRetry(failure, opts);
       if (next < 0 || !allowed) {
         if (access && next >= 0) {
           this.logger.warn(`${this.attemptLabel(p, selected, choice)}: сбой доступа (${kind}), вызов не повторяется (инструмент с последствиями или показанный текст): ${msg.slice(0, 200)}`);
@@ -526,11 +598,12 @@ export class ClaudeCliService implements OnModuleInit {
         }
         if (parts.length === 1) {
           // Одна попытка — как раньше: отказ текстом вызывающий получает как
-          // есть, ошибку Claude — исходным объектом.
+          // есть, ошибку Claude — её объектом (у ошибки не от CLI — с
+          // безопасным текстом по коду).
           if (refusal) return res!;
-          if (p === 'claude') throw err;
+          if (p === 'claude') throw failure;
         }
-        throw new Error(parts.join(' | '));
+        throw new ClaudeCliCallError(parts.join(' | '), anyToolUsed, { kind: aggregateKind(kinds), access: anyAccess });
       }
       const target = plan[next];
       const toLabel = target === 'claude'
@@ -541,7 +614,10 @@ export class ClaudeCliService implements OnModuleInit {
       attemptOpts = { ...opts, timeoutMs: fallbackTimeoutMs(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, Date.now() - startedAt) };
       i = next;
     }
-    throw new Error(parts.join(' | ') || 'claude CLI: пустой план попыток');
+    throw new ClaudeCliCallError(parts.join(' | ') || 'claude CLI: пустой план попыток', anyToolUsed, {
+      kind: aggregateKind(kinds),
+      access: anyAccess,
+    });
   }
 
   /** Подпись попытки в логе: «claude CLI», «Kimi (выбран)» (личный выбор),
@@ -607,6 +683,36 @@ export class ClaudeCliService implements OnModuleInit {
       .join('\n')
       .trim()
       .slice(0, 400);
+  }
+
+  /**
+   * Безопасный текст и признаки сбоя (spec 2026-11-02-safe-cli-errors). raw —
+   * прежний текст ошибки (с result, stderr или stdout — фрагментами
+   * разговоров): по нему только вид и доступ, те же, что runRaw раньше брал из
+   * текста ошибки, — наружу он не уходит. В деталь — только диагностика CLI из
+   * errors[] (cliDiagnostic) или отказ самого CLI (cause — refusalDetail:
+   * фраза отказа и хвост из белого списка; ответ модели после фразы — нет).
+   */
+  private static safeFailure(
+    what: string,
+    raw: string,
+    src: { status?: unknown; errors?: unknown; cause?: string } = {},
+  ): { message: string; info: ClaudeCliErrorInfo } {
+    const kind = classifyLlmError(raw).kind;
+    const status = apiErrorStatus(src.status);
+    const detail = cliDiagnostic(src.errors) || refusalDetail(src.cause ?? '');
+    return { message: safeCliText({ what, kind, status, detail }), info: { kind, access: isFallbackWorthy(raw), status } };
+  }
+
+  /** «Не запустился» — по коду ошибки spawn, без её сообщения: оно цитирует
+   *  аргументы (начало промпта, значение env с ключом провайдера). */
+  private static notStartedText(e: unknown): string {
+    return safeCliText({ what: `не запустился (${safeErrorCode(e)})`, kind: 'other' });
+  }
+
+  /** Размеры вывода для журнала — вместо самого вывода. */
+  private static outputSizes(stdout: string, stderr: string): string {
+    return `stdout ${Buffer.byteLength(stdout, 'utf8')} байт, stderr ${Buffer.byteLength(stderr, 'utf8')} байт`;
   }
 
   /** Признак stream-json — в одном месте: его же читают mayRetry (решает,
@@ -676,6 +782,26 @@ export class ClaudeCliService implements OnModuleInit {
     const file = path.join(dir, 'mcp.json');
     fs.writeFileSync(file, JSON.stringify({ mcpServers: servers }), { mode: 0o600 });
     return file;
+  }
+
+  /**
+   * spawn процесса CLI. Синхронный отказ spawn (ERR_INVALID_ARG_VALUE при NUL
+   * в аргументе или в env и т. п.) цитирует значение — начало промпта или ключ
+   * провайдера из env; наружу — только код ошибки (spec
+   * 2026-11-02-safe-cli-errors).
+   */
+  private startProcess(argv: string[], cwd: string, cfg: FallbackConfig | null) {
+    try {
+      // Обычный запуск наследует process.env как есть; запасной получает своё
+      // окружение (адрес и ключ провайдера) — и только он.
+      return spawn(this.claudeBin, argv, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        cwd,
+        ...(cfg ? { env: fallbackSpawnEnv(process.env, cfg) } : {}),
+      });
+    } catch (e) {
+      throw new ClaudeCliCallError(ClaudeCliService.notStartedText(e), false, { kind: 'other', access: false });
+    }
   }
 
   private spawnClaude(
@@ -833,15 +959,15 @@ export class ClaudeCliService implements OnModuleInit {
     // дней) — дольше, чем обещает политика пробы (7 дней). Флаг работает
     // только с --print/-p — он у нас есть всегда (см. '-p' в начале args).
     if (opts.noSessionPersistence) args.push('--no-session-persistence');
+    // NUL в аргументе spawn не принимает: синхронный ERR_INVALID_ARG_VALUE, и
+    // его сообщение цитирует начало аргумента — промпта (ревью 02.11, I2).
+    // Промпту и флагам NUL ни к чему — вычищаем из всех аргументов.
+    const argv = args.map((a) => a.replaceAll(NUL, ''));
 
     return new Promise<CliRunResult>((resolve, reject) => {
-      // Обычный запуск наследует process.env как есть; запасной получает своё
-      // окружение (адрес и ключ провайдера) — и только он.
-      const proc = spawn(this.claudeBin, args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        cwd: spawnCwd,
-        ...(cfg ? { env: fallbackSpawnEnv(process.env, cfg) } : {}),
-      });
+      // Синхронный отказ spawn — ClaudeCliCallError из startProcess: исключение
+      // в теле промиса отклоняет его.
+      const proc = this.startProcess(argv, spawnCwd, cfg);
       let stdout = '';
       let stderr = '';
       // StringDecoder держит «хвост» незавершённого многобайтового символа
@@ -858,9 +984,10 @@ export class ClaudeCliService implements OnModuleInit {
       // может ещё писать в stdout после kill('SIGTERM') по таймауту) больше не
       // должны доходить до колбэков caller-а.
       let settled = false;
-      const fail = (message: string) => {
+      // message — только безопасный текст; признаки — по сырому (safeFailure).
+      const fail = (message: string, info: ClaudeCliErrorInfo) => {
         settled = true;
-        reject(new ClaudeCliCallError(message, sawRiskyToolUse));
+        reject(new ClaudeCliCallError(message, sawRiskyToolUse, info));
       };
 
       // Stream-mode accumulators (заполняются по мере прихода NDJSON).
@@ -870,12 +997,17 @@ export class ClaudeCliService implements OnModuleInit {
       let streamDurationMs = 0;
       let streamIsError = false;
       let streamErrorDetail = '';
+      // Из события result — для безопасного текста сбоя: код ответа API и
+      // errors[] (оттуда берётся только строка [ede_diagnostic]).
+      let streamApiStatus: unknown;
+      let streamErrors: unknown;
 
       let timer: NodeJS.Timeout | null = null;
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
           proc.kill('SIGTERM');
-          fail(`claude CLI timeout after ${timeoutMs}ms`);
+          // Текст прежний и безопасный: на слове timeout держится вид timeout.
+          fail(`claude CLI timeout after ${timeoutMs}ms`, { kind: 'timeout', access: false });
         }, timeoutMs);
       }
 
@@ -918,6 +1050,8 @@ export class ClaudeCliService implements OnModuleInit {
             streamResultText = typeof ev.result === 'string' ? ev.result : '';
             streamCostUsd = typeof ev.total_cost_usd === 'number' ? ev.total_cost_usd : 0;
             streamDurationMs = Number(ev.duration_ms) || 0;
+            streamApiStatus = ev.api_error_status;
+            streamErrors = ev.errors;
             if (ev.is_error) {
               streamIsError = true;
               streamErrorDetail = String(ev.result ?? ev.error ?? 'unknown');
@@ -927,19 +1061,39 @@ export class ClaudeCliService implements OnModuleInit {
       });
       proc.stderr.on('data', (b) => { stderr += errDecoder.write(b); });
 
-      proc.on('close', (code) => {
+      proc.on('close', (code, signal) => {
+        // Вызов уже отклонён (таймаут, ошибка запуска): процесс, убитый по
+        // таймауту, закрывается следом — ни разбора вывода, ни второй записи
+        // в журнал не нужно.
+        if (settled) return;
         if (timer) clearTimeout(timer);
+        // Убит сигналом извне (OOM, kill) — в тексте имя сигнала, а не «код null».
+        const exitWhat = code === null && typeof signal === 'string' && /^SIG[A-Z0-9]+$/.test(signal)
+          ? `сигнал ${signal}`
+          : `код выхода ${code}`;
 
         // Stream mode: всё уже распарсено по ходу, просто возвращаем накопленное.
         if (streaming) {
           if (code !== 0) {
-            this.logger.error(`claude CLI exit ${code}: stderr=${stderr.slice(0, 300)} stdout=${stdout.slice(0, 300)}`);
+            // Причина (сырой текст: result, stderr или NDJSON хода) — только
+            // для вида и доступа; в журнал и ошибку — безопасный текст.
             const detail = streamErrorDetail || ClaudeCliService.stderrDetail(stderr) || stdout.trim().slice(0, 400);
-            fail(`claude CLI exited with code ${code}: ${detail.slice(0, 200) || '(no output)'}`);
+            const f = ClaudeCliService.safeFailure(
+              exitWhat,
+              `claude CLI exited with code ${code}: ${detail.slice(0, 200) || '(no output)'}`,
+              { status: streamApiStatus, errors: streamErrors, cause: detail },
+            );
+            this.logger.error(`${f.message} (${ClaudeCliService.outputSizes(stdout, stderr)})`);
+            fail(f.message, f.info);
             return;
           }
           if (streamIsError) {
-            fail(`claude CLI error: ${streamErrorDetail}`);
+            const f = ClaudeCliService.safeFailure('ошибка', `claude CLI error: ${streamErrorDetail}`, {
+              status: streamApiStatus,
+              errors: streamErrors,
+              cause: streamErrorDetail,
+            });
+            fail(f.message, f.info);
             return;
           }
           if (streamCostUsd) {
@@ -981,9 +1135,17 @@ export class ClaudeCliService implements OnModuleInit {
           // 31.10, битый ключ Qwen: `[claude-code:unrecognized_model] {...}`
           // заслоняло настоящую причину 401), а если и там пусто —
           // нейтральная причина.
+          //
+          // Причина — сырой текст (spec 2026-11-02-safe-cli-errors): по ней
+          // только вид и доступ; в журнал и ошибку — безопасный текст.
           let detail = '';
+          // Код ответа API и errors[] итогового JSON — для безопасного текста.
+          let status: unknown;
+          let errors: unknown;
           try {
             const j = JSON.parse(stdout);
+            status = j?.api_error_status;
+            errors = j?.errors;
             if (typeof j.result === 'string') {
               const r = j.result.trim();
               if (r && (j.is_error === true || looksLikeCliRefusal(j.result))) detail = r;
@@ -997,14 +1159,24 @@ export class ClaudeCliService implements OnModuleInit {
           } catch {
             detail = ClaudeCliService.stderrDetail(stderr) || stdout.trim().slice(0, 400);
           }
-          this.logger.error(`claude CLI exit ${code}: stderr=${stderr.slice(0, 300)} stdout=${stdout.slice(0, 300)}`);
-          fail(`claude CLI exited with code ${code}: ${detail.slice(0, 200) || '(no output)'}`);
+          const f = ClaudeCliService.safeFailure(
+            exitWhat,
+            `claude CLI exited with code ${code}: ${detail.slice(0, 200) || '(no output)'}`,
+            { status, errors, cause: detail },
+          );
+          this.logger.error(`${f.message} (${ClaudeCliService.outputSizes(stdout, stderr)})`);
+          fail(f.message, f.info);
           return;
         }
         try {
           const json = JSON.parse(stdout);
           if (json.is_error) {
-            fail(`claude CLI error: ${json.result ?? 'unknown'}`);
+            const f = ClaudeCliService.safeFailure('ошибка', `claude CLI error: ${json.result ?? 'unknown'}`, {
+              status: json.api_error_status,
+              errors: json.errors,
+              cause: typeof json.result === 'string' ? json.result : '',
+            });
+            fail(f.message, f.info);
             return;
           }
           const text: string = stripWordJoiner(json.result ?? '');
@@ -1027,15 +1199,22 @@ export class ClaudeCliService implements OnModuleInit {
           // осторожность — в mayRetry по набору тулов.
           settled = true;
           resolve({ text, costUsd, toolUsed: sawRiskyToolUse });
-        } catch (e: any) {
-          this.logger.error(`claude CLI parse error: ${e.message}, stdout: ${stdout.slice(0, 200)}`);
-          fail(`claude CLI returned invalid JSON: ${e.message}`);
+        } catch {
+          // Ни сообщения JSON.parse (оно цитирует начало stdout), ни самого
+          // stdout — только размеры. Вид всегда other, без перехода на
+          // запасных: кусок вывода в сообщении JSON.parse раньше мог случайно
+          // дать rate_limit/auth и переключение.
+          const message = safeCliText({ what: `неверный JSON (stdout ${Buffer.byteLength(stdout, 'utf8')} байт)`, kind: 'other' });
+          this.logger.error(`${message} (stderr ${Buffer.byteLength(stderr, 'utf8')} байт)`);
+          fail(message, { kind: 'other', access: false });
         }
       });
 
       proc.on('error', (err) => {
         if (timer) clearTimeout(timer);
-        fail(`claude CLI spawn error: ${err.message}`);
+        // Только код (ENOENT, EACCES и т. п.), без сообщения — как у
+        // синхронного отказа spawn (startProcess).
+        fail(ClaudeCliService.notStartedText(err), { kind: 'other', access: false });
       });
     });
   }
