@@ -9,9 +9,10 @@
  *
  * Запуск — на проде, из ~/spirits_back (соль — из .env рабочего каталога, как
  * у приложения). Ключи и карта несут номера: только трубой, на диск мака не
- * пишутся.
+ * пишутся; pipefail — чтобы отказ на проде не дал пустую карту молча.
+ *   set -o pipefail
  *   ssh <релей> '<ключи sessions.json по строке>' \
- *     | ssh <прод> 'cd ~/spirits_back && npx ts-node scripts/relay-fs-key-map.ts' \
+ *     | ssh <прод> 'cd ~/spirits_back && TS_NODE_TRANSPILE_ONLY=1 npx ts-node scripts/relay-fs-key-map.ts' \
  *     | ssh <релей> 'umask 077 && cat > ~/.relay-fs-key-map.tsv'
  * stdout — «ключ<TAB>fs_key» на строку; stderr — одна строка счётчиков,
  * в ней «соль — RELAY_FS_SALT».
