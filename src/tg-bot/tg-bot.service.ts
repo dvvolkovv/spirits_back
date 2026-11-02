@@ -34,6 +34,19 @@ import { stripProductActionBlocks } from '../products/product-action-tail';
 // Telegram сам отдаёт через Bot API до 20 МБ; больше — нужен MTProto, не наш кейс.
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 
+/** Предел sendPhoto у Telegram: больше — только документом. */
+const TG_PHOTO_MAX_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Скачанное по {{file:}} — фотография для Telegram? JPEG/PNG/WEBP до 10 МБ.
+ * GIF — нет: sendPhoto сделал бы из анимации стоп-кадр.
+ */
+export function isTelegramPhoto(contentType: string | undefined, bytes: number): boolean {
+  const mime = (contentType || '').split(';')[0].trim().toLowerCase();
+  return (mime === 'image/jpeg' || mime === 'image/png' || mime === 'image/webp')
+    && bytes > 0 && bytes <= TG_PHOTO_MAX_BYTES;
+}
+
 type OutgoingMarker =
   | { kind: 'image'; prompt: string }
   | { kind: 'image_edit'; source: string; prompt: string }
@@ -1872,8 +1885,11 @@ export class TgBotService implements OnModuleInit {
       );
       return;
     }
-    // file: качаем сами и шлём как document, чтобы Telegram не ограничивал
-    // по размеру изображения (для картинок лучше отдельный {{image:…}}).
+    // file: качаем сами. Картинку (JPEG/PNG/WEBP, до 10 МБ) шлём фотографией —
+    // видно сразу в чате, без открытия документа (находка «Затыков недели»
+    // bfc4c3ad: на просьбу показать схему зала модель дала только ссылки).
+    // Остальное, включая GIF и картинки большего размера, — как раньше,
+    // document: так Telegram не ограничивает по размеру.
     //
     // Ссылку пишет МОДЕЛЬ, а её можно уговорить текстом из чата — и скачанные
     // байты уходят прямо в чат. Поэтому только fetchMediaBytes: внутренние
@@ -1884,6 +1900,19 @@ export class TgBotService implements OnModuleInit {
     const media = await fetchMediaBytes(m.url, { maxBytes: MAX_ATTACHMENT_BYTES, timeoutMs: 30_000, allowHttp: true });
     const buf = media.data;
     const name = m.name || m.url.split('/').pop() || 'file.bin';
+    // Не принял Telegram (размеры, формат) — тот же файл уходит документом,
+    // как раньше: человек в любом случае получает файл, просто без превью.
+    if (isTelegramPhoto(media.contentType, buf.length)) {
+      try {
+        await this.grammy.sendPhoto(msg.chat.id, buf, {
+          reply_to_message_id: msg.message_id,
+          caption: m.caption?.slice(0, 1024),
+        });
+        return;
+      } catch (e: any) {
+        this.logger.warn(`file-маркер: sendPhoto не принял картинку (${e?.message}) — отправляю документом`);
+      }
+    }
     await this.grammy.sendDocument(msg.chat.id, buf, name, {
       reply_to_message_id: msg.message_id,
       caption: m.caption?.slice(0, 1024),
