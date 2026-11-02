@@ -162,3 +162,55 @@ describe('BalanceContextService — устойчивость', () => {
     await expect(svc(pg).buildContextForPrompt('u1', 8000)).resolves.toBe('');
   });
 });
+
+describe('BalanceContextService — когда предупреждать (находка a3da5a2b)', () => {
+  it('предупреждение не посреди практики: до начала или в конце мысли', async () => {
+    const block = await svc(fakePg()).buildContextForPrompt('u1', 8000);
+    expect(block).toContain('Баланс на исходе');
+    expect(block).toContain('до её начала');
+    expect(block).toContain('не вставляй это посреди');
+    expect(block).toContain('Никогда не прерывай упражнение');
+  });
+});
+
+describe('BalanceContextService — бережное завершение на остатке', () => {
+  it('прогноз ≤ 2 ответов — инструкция завершить смысловой блок', async () => {
+    const block = await svc(fakePg({ spends: [400, 400, 400, 400, 400] })).buildContextForPrompt('u1', 800);
+    expect(block).toContain('хватит примерно на 2');
+    expect(block).toContain('бережно завершить текущий смысловой блок');
+    expect(block).toContain('Пополнить баланс');
+  });
+
+  it('на остатке отдельного предупреждения нет — одна инструкция, не две', async () => {
+    const block = await svc(fakePg({ spends: [400, 400, 400, 400, 400] })).buildContextForPrompt('u1', 800);
+    expect(block).not.toContain('Баланс на исходе');
+  });
+
+  it('на остатке разрешение предупредить всё равно расходуется — отметка ставится', async () => {
+    const pg = fakePg({ spends: [400, 400, 400, 400, 400] });
+    await svc(pg).buildContextForPrompt('u1', 800);
+    expect(pg.calls.some((c: any) => /^\s*UPDATE/i.test(c.sql))).toBe(true);
+  });
+
+  it('прогноз 3 ответа и больше — обычный блок, без завершения', async () => {
+    const block = await svc(fakePg({ spends: [400, 400, 400, 400, 400] })).buildContextForPrompt('u1', 1200);
+    expect(block).not.toContain('бережно завершить');
+  });
+
+  it('прогноза нет, но баланс ниже 2000 — завершение по запасному порогу', async () => {
+    const block = await svc(fakePg({ spends: [300] })).buildContextForPrompt('u1', 1500);
+    expect(block).toContain('бережно завершить текущий смысловой блок');
+    expect(block).toContain('почти закончился');
+  });
+
+  it('приветствие — без инструкции завершения', async () => {
+    const block = await svc(fakePg({ spends: [400, 400, 400, 400, 400] }))
+      .buildContextForPrompt('u1', 800, { isGreeting: true });
+    expect(block).not.toContain('бережно завершить');
+  });
+
+  it('если уже говорил — не повторять', async () => {
+    const block = await svc(fakePg({ spends: [400, 400, 400, 400, 400] })).buildContextForPrompt('u1', 800);
+    expect(block).toContain('не повторяй');
+  });
+});
