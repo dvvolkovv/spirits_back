@@ -1,4 +1,7 @@
 // src/chat/chat-files/backfill.spec.ts
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import {
   BACKFILL_FILE_TIMEOUT_MS,
   JournalEntry,
@@ -8,6 +11,7 @@ import {
   maskRelayUrl,
   revertBackfill,
   runBackfill,
+  saveMissingList,
 } from './backfill';
 
 const AGENT = 'https://r.linkeon.io';
@@ -252,6 +256,33 @@ describe('runBackfill', () => {
 
     expect(second).toMatchObject({ updatedRows: 0, copied: 0, masked: 0 });
     expect(pg.table.get(1)).toBe(first);
+  });
+});
+
+// Список мёртвых адресов — с номерами: в сухом прогоне его нет вовсе (только
+// счётчики, как обещает шапка скрипта), при --apply — рядом с журналом, 600.
+describe('saveMissingList', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'backfill-missing-'));
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it('сухой прогон — файла нет', () => {
+    expect(saveMissingList(false, path.join(dir, 'backfill-chat-files-x.jsonl'), [`${P}/gone.pdf`])).toBeNull();
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
+
+  it('--apply — список рядом с журналом, права 600', () => {
+    const old = process.umask(0o022);
+    try {
+      const file = saveMissingList(true, path.join(dir, 'backfill-chat-files-x.jsonl'), [`${P}/gone.pdf`]);
+      expect(file).toBe(path.join(dir, 'backfill-chat-files-x.missing.txt'));
+      expect(fs.statSync(file!).mode & 0o777).toBe(0o600);
+      expect(fs.readFileSync(file!, 'utf8')).toBe(`${P}/gone.pdf\n`);
+    } finally {
+      process.umask(old);
+    }
   });
 });
 
