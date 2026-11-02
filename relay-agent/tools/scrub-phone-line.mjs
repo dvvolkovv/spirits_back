@@ -133,17 +133,16 @@ const READ_FLAGS = O_RDONLY | O_NOFOLLOW | (fs.constants.O_NONBLOCK ?? 0);
 const withCode = (code) => Object.assign(new Error(code), { code });
 
 // Прочитать транскрипт, не переходя по симлинку. { fresh: true } — файл
-// менялся меньше minAgeMs назад или рос, пока его читали: в нём, вероятно,
-// идёт ход. Иначе { buf, stat } — stat (bigint) того самого чтения.
+// менялся меньше minAgeMs назад: в нём, вероятно, идёт ход. Иначе
+// { buf, stat }, где stat (bigint) снят до чтения. Если CLI допишет файл во
+// время чтения, это поймает сверка в commitFile: размер и mtime разойдутся.
 export async function readSnapshot(file, { minAgeMs = 0 } = {}) {
   const fh = await fsp.open(file, READ_FLAGS);
   try {
     const stat = await fh.stat({ bigint: true });
     if (!stat.isFile()) throw withCode("ENOTREG");
     if (Date.now() - Number(stat.mtimeMs) < minAgeMs) return { fresh: true };
-    const buf = await fh.readFile();
-    if (BigInt(buf.length) !== stat.size) return { fresh: true };
-    return { buf, stat };
+    return { buf: await fh.readFile(), stat };
   } finally {
     await fh.close();
   }
