@@ -1099,6 +1099,9 @@ describe('imageAttachmentPreview', () => {
     ['битая кодировка', 'https://my.linkeon.io/smm-media/linkeon-chat-files/k/%E0%A4%A.jpg'],
     ['выход из каталога', 'https://my.linkeon.io/smm-media/linkeon-chat-files/k/../../x.jpg'],
     ['не веб-схема', 'javascript:alert(1)//linkeon-chat-files/a.jpg'],
+    ['протокол-относительный чужой хост', '//evil.example/smm-media/linkeon-chat-files/k/a.jpg'],
+    ['обратная косая к чужому хосту', '/\\evil.example/smm-media/linkeon-chat-files/k/a.jpg'],
+    ['закодированный слэш в имени', 'https://my.linkeon.io/smm-media/linkeon-chat-files/k%2F..%2F..%2Fx.jpg'],
     ['пусто', ''],
   ])('%s → null', (_name, href) => {
     expect(imageAttachmentPreview(href)).toBeNull();
@@ -1144,8 +1147,9 @@ export function imageAttachmentPreview(href: string): ImageAttachmentPreview | n
     return null;
   }
   if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
-  const relative = href.startsWith('/');
-  if (!relative && !OUR_HOSTS.has(url.hostname)) return null;
+  // Хост проверяется всегда: относительный путь разрешается от базы выше, а
+  // «//чужой-хост/…» и «/\\чужой-хост/…» тоже начинаются с «/», но ведут наружу.
+  if (!OUR_HOSTS.has(url.hostname)) return null;
   if (!url.pathname.startsWith(PREFIX)) return null;
 
   const rawKey = url.pathname.slice(PREFIX.length);
@@ -1155,7 +1159,8 @@ export function imageAttachmentPreview(href: string): ImageAttachmentPreview | n
   } catch {
     return null;
   }
-  if (segments.some((s) => s === '' || s === '.' || s === '..')) return null;
+  // Сегмент с «/» или «\\» после раскодирования (%2F) — попытка выйти из каталога.
+  if (segments.some((s) => s === '' || s === '.' || s === '..' || /[\\/]/.test(s))) return null;
   const key = segments.join('/');
   if (!IMAGE_RE.test(key)) return null;
   const src = `linkeon-chat-files/${key}`;
