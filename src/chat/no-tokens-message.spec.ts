@@ -21,9 +21,9 @@ describe('noTokensMessage — остановка на нулевом балан�
   });
 
   it('русский: явно сказано, что САМО сообщение не получено — отправить ещё раз (ревью качества 02.11, I4)', () => {
-    const msg = noTokensMessage('ru');
-    expect(msg).toContain('это сообщение ассистент не получил'.toLowerCase());
-    expect(msg.toLowerCase()).toContain('отправьте его ещё раз');
+    const msg = noTokensMessage('ru').toLowerCase();
+    expect(msg).toContain('это сообщение ассистент не получил');
+    expect(msg).toContain('отправьте его ещё раз');
   });
 
   it('upload-вариант: просит и прикрепить файлы заново', () => {
