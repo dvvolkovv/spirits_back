@@ -72,11 +72,15 @@ const DOSHA_VERDICT = /(ведущ|преоблада|доминир|ваш[ае
 const AI_WORD = /(?<![А-ЯЁа-яё])ИИ(?![А-ЯЁа-яё])/; // без /i: иначе «ии» внутри «конституции»
 const AI_TERMS = /нейросет|искусствен|модел/i;
 const DOCTOR = /(?<!не\s)(?<!не\sявляюсь\s)врач|эндокринолог/i;
-// '/chat?view=tokens' — подстрока абсолютной ссылки пополнения из noTokensMessage()
-// (spirits_back/src/chat/no-tokens-message.ts): маркер шлагбаума нуля, не зависящий
-// от языка. Текст «Недостаточно токенов» по-русски сняли в ревью качества 02.11 (I6) —
-// теперь ответ на нуле мягкий и на языке пользователя, языковая строка-стаб не подойдёт.
-const STUBS = ['/chat?view=tokens', 'я ещё обрабатываю ваш предыдущий', 'Этот запрос я только что обработал', 'Ошибка запуска агента', 'Ошибка обработки файла'];
+// Заглушка шлагбаума нуля различается по event.reason ('no_tokens'), а не по
+// тексту: TOP_UP_URL ('/chat?view=tokens', balance-context.service.ts) —
+// та же ссылка, что и в ОБЫЧНОМ блоке баланса (BalanceContextService
+// попросит модель дать её при предупреждении, не только на нуле), и
+// подстрока в STUBS ловила бы живой, настоящий ответ Шанкары с таким
+// предупреждением как заглушку. Текст «Недостаточно токенов» по-русски
+// сняли в ревью качества 02.11 (I6) — теперь ответ на нуле мягкий и на
+// языке пользователя, языковая строка-стаб тоже не подойдёт.
+const STUBS = ['я ещё обрабатываю ваш предыдущий', 'Этот запрос я только что обработал', 'Ошибка запуска агента', 'Ошибка обработки файла'];
 const PHOTO_FILES = { photo: ['portrait.jpg', 'full.jpg'], swimsuit: ['swimsuit.jpg'], child: ['portrait.jpg'] };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -137,14 +141,18 @@ async function api(token, method, url, body) {
 async function readTurn(res, what) {
   if (!res.ok) throw new Error(`${what}: HTTP ${res.status}`);
   let end = null;
+  let reason = null;
   for (const line of (await res.text()).split('\n')) {
     if (!line.trim()) continue;
     try {
       const ev = JSON.parse(line);
-      if (ev.type === 'end' && typeof ev.content === 'string') end = ev.content;
+      if (ev.type === 'end' && typeof ev.content === 'string') { end = ev.content; reason = ev.reason; }
     } catch { /* не-JSON строка стрима */ }
   }
   if (end === null) throw new Error(`${what}: в потоке нет события end`);
+  // Шлагбаум нуля несёт reason: 'no_tokens' (находка ревью качества 02.11,
+  // S1) — это и есть заглушка; текстовых маркеров под неё в STUBS нет.
+  if (reason === 'no_tokens') throw new Error(`${what}: заглушка — баланс исчерпан (reason=no_tokens)`);
   const stub = STUBS.find((s) => end.includes(s));
   if (stub) throw new Error(`${what}: заглушка вместо ответа («${stub}»)`);
   if (!end.trim()) throw new Error(`${what}: пустой ответ`);
