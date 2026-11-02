@@ -1,5 +1,5 @@
 // src/chat/chat-files/backfill.ts
-import { collectRelayUrls, replaceUrls } from './relay-links';
+import { collectRelayUrls, escapeRe, replaceUrls } from './relay-links';
 import { relayFilesPrefix } from './file-meta';
 
 /**
@@ -15,6 +15,11 @@ import { relayFilesPrefix } from './file-meta';
  *    солёный хэш пользователя (fsKey — relayFsKey): ссылка остаётся мёртвой,
  *    но без номера. Спека 2026-11-02-pii-out-of-prompts-design.md, п. 6;
  *  - релей не ответил толком — ссылка не трогается до следующего прогона.
+ *
+ * Пути на диске релея — /tmp/agent-output/<номер>_… и
+ * /tmp/agent-uploads/<номер>_…, которые модель повторяла в ответах до
+ * 26.10.2026, — заведомо мёртвые: номер в них меняется на тот же солёный хэш
+ * (maskRelayPaths), во всех репликах, с теми же журналом и откатом.
  *
  * Почему прежний прогон оставил тысячи ссылок с номером: он менял только
  * адреса скопированных файлов, а 16.09.2026 релей перезагрузился и потерял
@@ -34,10 +39,14 @@ export interface BackfillPg {
 export interface BackfillStore {
   persist: (urls: string[], opts?: { budgetMs?: number; fileTimeoutMs?: number }) => Promise<Map<string, string>>;
 }
-/** Строка журнала: адрес релея и то, чем он заменён, — копией или адресом без номера. */
+/**
+ * Строка журнала: адрес релея и то, чем он заменён, — копией или адресом без
+ * номера; либо начало пути на диске релея с номером и оно же с солёным хэшем.
+ */
 export type JournalEntry =
   | { rowId: number; relayUrl: string; storedUrl: string }
-  | { rowId: number; relayUrl: string; maskedUrl: string };
+  | { rowId: number; relayUrl: string; maskedUrl: string }
+  | { rowId: number; pathFrom: string; pathTo: string };
 
 /** Ответ релея на HEAD: 200 — жив, 404 — файла нет, прочее и сбой — не ответил. */
 export type ProbeResult = 'alive' | 'missing' | 'unknown';
@@ -57,6 +66,52 @@ const FILES_ID_RE = new RegExp(`/files/(?:${USER_ID})(?=[_/])`, 'gi');
 const FILES_ID_SQL = `SELECT id, content FROM custom_chat_history
  WHERE content ~* '/files/([0-9]{10,15}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[_/]'
  ORDER BY id`;
+
+/**
+ * Пути на диске релея (relay-agent/server.mjs: OUTPUT_DIR, UPLOAD_DIR). До
+ * 26.10.2026 папка хода и имя загрузки начинались с ключа сессии —
+ * `<номер>_<ассистент>_<язык>`, — и модель повторяла эти пути в ответах.
+ * Путь заведомо мёртвый: номер в нём меняется на солёный хэш пользователя,
+ * тот же, что у мёртвых ссылок /files/.
+ */
+const RELAY_PATH_RE = new RegExp(`/tmp/agent-(output|uploads)/(${USER_ID})(?=[_/])`, 'gi');
+export const SELECT_PATH_ROWS_SQL = `SELECT id, sender_type, content FROM custom_chat_history
+ WHERE content ~* '/tmp/agent-(output|uploads)/([0-9]{10,15}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})[_/]'
+   AND created_at < now() - interval '1 hour'
+ ORDER BY id`;
+
+/**
+ * Номер (или uuid) в путях релея — на fsKey(id). swaps — по одной записи на
+ * путь «каталог + id», для журнала и отката. Без соли (fsKey ничего не дал)
+ * путь не меняется.
+ */
+export function maskRelayPaths(
+  text: string,
+  fsKey: (id: string) => string | undefined,
+): { text: string; swaps: { pathFrom: string; pathTo: string }[] } {
+  const swaps = new Map<string, string>();
+  const out = text.replace(RELAY_PATH_RE, (whole: string, _dir: string, id: string) => {
+    const key = fsKey(id);
+    if (!key) return whole;
+    const to = whole.slice(0, whole.length - id.length) + key;
+    swaps.set(whole, to);
+    return to;
+  });
+  return { text: out, swaps: [...swaps].map(([pathFrom, pathTo]) => ({ pathFrom, pathTo })) };
+}
+
+const HAS_RELAY_PATH = {
+  output: new RegExp(`/tmp/agent-output/(?:${USER_ID})(?=[_/])`, 'i'),
+  uploads: new RegExp(`/tmp/agent-uploads/(?:${USER_ID})(?=[_/])`, 'i'),
+};
+function hasRelayPath(text: string, dir: 'output' | 'uploads'): boolean {
+  return HAS_RELAY_PATH[dir].test(text);
+}
+
+/** Откат одной замены пути: только там, где за ним идёт `_` или `/`, как при замене. */
+function unmaskRelayPath(text: string, pathTo: string, pathFrom: string): string {
+  return text.replace(new RegExp(`${escapeRe(pathTo)}(?=[_/])`, 'g'), () => pathFrom);
+}
 
 /** Срок на один файл при переносе — 5 минут на всё скачивание. */
 export const BACKFILL_FILE_TIMEOUT_MS = 300_000;
@@ -177,19 +232,38 @@ export async function runBackfill(p: {
   /** Строки с `/files/<id>_` не под AGENT_URL — не меняются. */
   otherRows: number;
   otherOrigins: string[];
+  /** Строки с путём /tmp/agent-output/<id>… и /tmp/agent-uploads/<id>… (старше часа, любой sender_type). */
+  outputPathRows: number;
+  uploadPathRows: number;
+  /** Строки, где номер в путях релея заменён (--apply). */
+  maskedPathRows: number;
   /** Что не нашлось на релее: видно глазами, нет ли ложных пропаж (например, обрезанных адресов). */
   missingUrls: string[];
 }> {
   const prefix = relayFilesPrefix(p.agentUrl);
   const { rows } = await p.pg.query(SELECT_BACKFILL_ROWS_SQL, [`%${prefix}%`]);
-  const perRow = rows.map((r: any) => ({
-    id: Number(r.id),
-    human: r.sender_type === 'human',
-    content: String(r.content),
-    urls: collectRelayUrls(String(r.content), p.agentUrl),
-  }));
+  const { rows: pathRows } = await p.pg.query(SELECT_PATH_ROWS_SQL);
+  // Строка бывает в обеих выборках — одна запись, одна замена.
+  const byId = new Map<number, { id: number; human: boolean; content: string; withLinks: boolean }>();
+  for (const r of rows) {
+    byId.set(Number(r.id), { id: Number(r.id), human: r.sender_type === 'human', content: String(r.content), withLinks: true });
+  }
+  for (const r of pathRows) {
+    if (!byId.has(Number(r.id))) {
+      byId.set(Number(r.id), { id: Number(r.id), human: r.sender_type === 'human', content: String(r.content), withLinks: false });
+    }
+  }
+  const perRow = [...byId.values()]
+    .sort((a, b) => a.id - b.id)
+    .map((r) => ({
+      ...r,
+      urls: r.withLinks ? collectRelayUrls(r.content, p.agentUrl) : [],
+      outputPath: hasRelayPath(r.content, 'output'),
+      uploadPath: hasRelayPath(r.content, 'uploads'),
+    }));
+  const linkRows = perRow.filter((r) => r.withLinks);
   const unique = [...new Set(perRow.flatMap((r) => r.urls))];
-  p.log(`строк со ссылками на релей: ${perRow.length}, уникальных адресов: ${unique.length}`);
+  p.log(`строк со ссылками на релей: ${linkRows.length}, уникальных адресов: ${unique.length}`);
 
   const verdict = await classify(unique, p.probe);
   const by = (v: ProbeResult) => unique.filter((u) => verdict.get(u) === v);
@@ -211,8 +285,8 @@ export async function runBackfill(p: {
   }
   const other = await countOtherTemplates(p.pg, prefix);
   const summary = {
-    rows: perRow.length,
-    humanRows: perRow.filter((r) => r.human).length,
+    rows: linkRows.length,
+    humanRows: linkRows.filter((r) => r.human).length,
     urls: unique.length,
     alive: alive.length,
     missing: missingUrls.length,
@@ -224,8 +298,12 @@ export async function runBackfill(p: {
     skippedRows: 0,
     otherRows: other.rows,
     otherOrigins: other.origins,
+    outputPathRows: perRow.filter((r) => r.outputPath).length,
+    uploadPathRows: perRow.filter((r) => r.uploadPath).length,
+    maskedPathRows: 0,
     missingUrls,
   };
+  p.log(`строк с путями релея: ${summary.outputPathRows} (папка вывода), ${summary.uploadPathRows} (загрузки)`);
   if (!p.apply) return summary;
 
   // Бюджета хода у переноса нет, а срок на файл длиннее, чем в живом ходе:
@@ -245,15 +323,20 @@ export async function runBackfill(p: {
       if (to) map.set(u, { to, masked: false });
       else if (masks.has(u)) map.set(u, { to: masks.get(u)!, masked: true });
     }
-    if (map.size === 0) continue;
-    const next = replaceUrls(r.content, new Map([...map].map(([from, x]) => [from, x.to])));
+    let next = map.size > 0 ? replaceUrls(r.content, new Map([...map].map(([from, x]) => [from, x.to]))) : r.content;
+    // Пути на диске релея — в той же строке, той же заменой (одна проверка
+    // прежнего текста на строку).
+    const paths = p.fsKey && (r.outputPath || r.uploadPath) ? maskRelayPaths(next, fsKey) : { text: next, swaps: [] };
+    next = paths.text;
     if (next === r.content) continue;
     const res = await p.pg.query(UPDATE_SQL, [next, r.id, r.content]);
     if ((res.rowCount ?? 0) === 1) {
       summary.updatedRows++;
+      if (paths.swaps.length > 0) summary.maskedPathRows++;
       for (const [relayUrl, x] of map) {
         p.journal(x.masked ? { rowId: r.id, relayUrl, maskedUrl: x.to } : { rowId: r.id, relayUrl, storedUrl: x.to });
       }
+      for (const sw of paths.swaps) p.journal({ rowId: r.id, ...sw });
     } else {
       summary.skippedRows++;
       p.log(`строка ${r.id} изменилась во время переноса — пропущена`);
@@ -262,27 +345,33 @@ export async function runBackfill(p: {
   return summary;
 }
 
-/** Откат по журналу: наш адрес или адрес без номера → адрес релея, с той же проверкой прежнего текста. */
+/**
+ * Откат по журналу: наш адрес или адрес без номера → адрес релея, путь с
+ * солёным хэшем → путь с номером; с той же проверкой прежнего текста.
+ */
 export async function revertBackfill(p: {
   pg: BackfillPg;
   entries: JournalEntry[];
   log: (m: string) => void;
 }): Promise<{ reverted: number; skipped: number }> {
-  const byRow = new Map<number, Map<string, string>>();
+  const byRow = new Map<number, { urls: Map<string, string>; paths: { pathFrom: string; pathTo: string }[] }>();
   for (const e of p.entries) {
-    if (!byRow.has(e.rowId)) byRow.set(e.rowId, new Map());
-    byRow.get(e.rowId)!.set('storedUrl' in e ? e.storedUrl : e.maskedUrl, e.relayUrl);
+    if (!byRow.has(e.rowId)) byRow.set(e.rowId, { urls: new Map(), paths: [] });
+    const row = byRow.get(e.rowId)!;
+    if ('pathFrom' in e) row.paths.push({ pathFrom: e.pathFrom, pathTo: e.pathTo });
+    else row.urls.set('storedUrl' in e ? e.storedUrl : e.maskedUrl, e.relayUrl);
   }
   let reverted = 0;
   let skipped = 0;
-  for (const [id, map] of byRow) {
+  for (const [id, back] of byRow) {
     const { rows } = await p.pg.query(`SELECT content FROM custom_chat_history WHERE id = $1`, [id]);
     if (!rows[0]) {
       skipped++;
       continue;
     }
     const cur = String(rows[0].content);
-    const next = replaceUrls(cur, map);
+    let next = back.urls.size > 0 ? replaceUrls(cur, back.urls) : cur;
+    for (const sw of back.paths) next = unmaskRelayPath(next, sw.pathTo, sw.pathFrom);
     if (next === cur) {
       skipped++;
       continue;

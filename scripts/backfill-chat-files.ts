@@ -8,6 +8,10 @@
  *     на солёный хэш пользователя: ссылка остаётся мёртвой, но без номера
  *     (спека docs/superpowers/specs/2026-11-02-pii-out-of-prompts-design.md, п. 6);
  *   - релей не ответил толком — ссылка не трогается.
+ * Пути на диске релея с номером (/tmp/agent-output/<номер>_…,
+ * /tmp/agent-uploads/<номер>_…), которые модель повторяла в ответах, — номер
+ * на тот же солёный хэш; счётчики outputPathRows / uploadPathRows /
+ * maskedPathRows.
  * Логика и тесты — src/chat/chat-files/backfill.ts (backfill.pg.spec.ts — на
  * живом SQL).
  *
@@ -23,7 +27,8 @@
  *
  * Журнал --apply пишется в домашний каталог, а не в рабочее дерево репо:
  * ~/backfill-chat-files-<метка>.jsonl, по строке на заменённый адрес (копия —
- * storedUrl, адрес без номера — maskedUrl). Он же — вход для --revert. Каталог
+ * storedUrl, адрес без номера — maskedUrl) и на путь релея в строке
+ * (pathFrom → pathTo). Он же — вход для --revert. Каталог
  * можно сменить через BACKFILL_JOURNAL_DIR. Список мёртвых адресов — рядом,
  * в .missing.txt: в нём номера, в консоль он не печатается.
  */
