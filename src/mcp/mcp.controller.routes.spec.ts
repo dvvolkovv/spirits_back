@@ -78,10 +78,15 @@ describe('адреса точки инструментов Linkeon', () => {
     expect(await status('/webhook/mcp/linkeon')).toBe(401);
   });
 
-  it('прежний /mcp на переходный период: общий секрет и токен хода доходят до обработчика', async () => {
-    expect(await status('/mcp', 'Bearer mcp-routes-shared')).toBe(405);
-    expect(await status('/mcp', token())).toBe(405);
-    expect(await status('/mcp')).toBe(401);
+  // MCP_SECRET задан в beforeAll: заданный общий секрет не открывает и
+  // оставшийся адрес — только токен хода.
+  it('основной адрес с общим секретом — 401', async () => {
+    expect(await status('/webhook/mcp/linkeon', 'Bearer mcp-routes-shared')).toBe(401);
+  });
+
+  it('прежнего /mcp больше нет — ни с общим секретом, ни с токеном хода', async () => {
+    expect(await status('/mcp', 'Bearer mcp-routes-shared')).toBe(404);
+    expect(await status('/mcp', token())).toBe(404);
   });
 
   it('других адресов у точки нет', async () => {

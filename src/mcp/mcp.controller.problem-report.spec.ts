@@ -79,20 +79,4 @@ describe('точка инструментов Linkeon: сбой инструме
     expect(payload(r)).toEqual({ ok: false, error: KIRA_ERROR });
     expect(r.isError).toBe(true);
   });
-
-  it('общий секрет без userId — отказ; инструмент и поддержка не зовутся', async () => {
-    process.env.MCP_SECRET = 'shared-problem-spec';
-    try {
-      const { ctrl, tools, problems } = make({ ok: true });
-      jest.spyOn((ctrl as any).logger, 'warn').mockImplementation(() => undefined);
-      const r = await ctrl.callTool('Bearer shared-problem-spec', 'generate_video', { prompt: 'x' });
-      expect(r.isError).toBe(true);
-      expect(payload(r)).toEqual({ ok: false, error: 'userId argument required' });
-      expect(tools.executeTool).not.toHaveBeenCalled();
-      expect(problems.reportToolFailure).not.toHaveBeenCalled();
-    } finally {
-      delete process.env.MCP_SECRET;
-      jest.restoreAllMocks();
-    }
-  });
 });

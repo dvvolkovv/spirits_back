@@ -79,7 +79,7 @@ describe('точка инструментов Linkeon: пользователь 
   });
 
   it('tools/list по токену: все инструменты CHAT_TOOLS, ни в одном нет userId и номера-примера', () => {
-    const list = make().ctrl.listTools({ kind: 'token', userId: 'u-1' });
+    const list = make().ctrl.listTools();
     expect(list.map((t) => t.name)).toEqual(CHAT_TOOLS.map((t) => t.name));
     for (const t of list) {
       expect(Object.keys(t.inputSchema.properties)).not.toContain('userId');
@@ -123,19 +123,10 @@ describe('точка инструментов Linkeon: пользователь 
     expect(warn).not.toHaveBeenCalled();
   });
 
-  // Ревью 26.10.2026: путь по токену не зовёт тот же logger.warn, что
-  // переходный путь по общему секрету — иначе по логу нельзя будет отличить,
-  // кто ещё зовёт точку общим секретом (шаг 3 выката).
-  it('путь по токену не пишет строку «вызов по общему секрету»', async () => {
-    const { ctrl } = make();
-    const warn = jest.spyOn((ctrl as any).logger, 'warn').mockImplementation(() => undefined);
-    await ctrl.callTool(bearer('u-owner'), 'generate_image', { prompt: 'x' });
-    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('общему секрету'));
-  });
-
-  // Ревью 26.10.2026: «смешивание» — MCP_SECRET задан (переходный путь ещё не
-  // снят), но в заголовке — токен хода, а не общий секрет. Пользователь — из
-  // подписи, чужой args.userId игнорируется, как и без MCP_SECRET.
+  // Ревью 26.10.2026: «смешивание» — MCP_SECRET задан, но в заголовке — токен
+  // хода. После снятия общего секрета переменная ещё сутки лежит в .env (её
+  // удаляют после выката), код её не читает: пользователь — из подписи, чужой
+  // args.userId игнорируется, как и без MCP_SECRET.
   it('смешивание: MCP_SECRET задан, но в заголовке — токен хода; args.userId — чужой', async () => {
     process.env.MCP_SECRET = 'shared-spec';
     try {
@@ -147,61 +138,15 @@ describe('точка инструментов Linkeon: пользователь 
     }
   });
 
-  describe('переходный путь: общий MCP_SECRET', () => {
-    const SHARED = 'Bearer shared-spec';
-    beforeEach(() => { process.env.MCP_SECRET = 'shared-spec'; });
-
-    it('пользователь — из args.userId; в лог — строка без пользователя и аргументов', async () => {
+  describe('общий секрет снят', () => {
+    it('Bearer, равный MCP_SECRET, больше не принимается', async () => {
+      process.env.MCP_SECRET = 'shared-spec';
       const { ctrl, tools } = make();
-      const warn = jest.spyOn((ctrl as any).logger, 'warn').mockImplementation(() => undefined);
-      await ctrl.callTool(SHARED, 'generate_image', { userId: '70000000000', prompt: 'тайный промпт' });
-      expect(tools.executeTool).toHaveBeenCalledWith('70000000000', 'generate_image', { prompt: 'тайный промпт' });
-      expect(warn).toHaveBeenCalledWith('mcp: вызов по общему секрету (переходный путь), tool=generate_image');
-      const logged = JSON.stringify(warn.mock.calls);
-      expect(logged).not.toContain('70000000000');
-      expect(logged).not.toContain('тайный промпт');
-    });
-
-    it('без args.userId — отказ, инструмент не зовётся', async () => {
-      const { ctrl, tools } = make();
-      jest.spyOn((ctrl as any).logger, 'warn').mockImplementation(() => undefined);
-      const r: any = await ctrl.callTool(SHARED, 'generate_image', { prompt: 'x' });
-      expect(r.isError).toBe(true);
-      expect(JSON.parse(r.content[0].text)).toEqual({ ok: false, error: 'userId argument required' });
+      await expect(ctrl.callTool('Bearer shared-spec', 'generate_image', { userId: '70000000000', prompt: 'x' })).rejects.toThrow(UnauthorizedException);
       expect(tools.executeTool).not.toHaveBeenCalled();
     });
 
-    // Прежний релей пишет пользователя в аргумент по схеме: без поля в схеме
-    // между выкатом бэка и выкатом релея модель могла бы перестать его слать.
-    it('tools/list по общему секрету — прежняя схема с обязательным userId, но без номера-примера', () => {
-      const list = make().ctrl.listTools({ kind: 'shared' });
-      for (const t of list) {
-        expect(t.inputSchema.required[0]).toBe('userId');
-        expect(t.inputSchema.properties).toHaveProperty('userId');
-      }
-      expect(JSON.stringify(list)).not.toContain('79030169187');
-    });
-
-    it('неверный секрет — 401', async () => {
-      const { ctrl, tools } = make();
-      await expect(ctrl.callTool('Bearer not-the-secret', 'generate_image', { userId: 'u-1' })).rejects.toThrow(UnauthorizedException);
-      expect(tools.executeTool).not.toHaveBeenCalled();
-    });
-
-    // Ревью 26.10.2026: сравнение — timingSafeEqual над SHA-256 обеих строк,
-    // а не над самими строками: у node:crypto timingSafeEqual буферы разной
-    // длины роняют сравнение исключением (RangeError), а не честным «не равны».
-    it('секрет неправильной длины — тоже 401, а не исключение', async () => {
-      const { ctrl, tools } = make();
-      await expect(ctrl.callTool('Bearer x', 'generate_image', { userId: 'u-1' })).rejects.toThrow(UnauthorizedException);
-      await expect(
-        ctrl.callTool(`Bearer ${'shared-spec'.repeat(5)}`, 'generate_image', { userId: 'u-1' }),
-      ).rejects.toThrow(UnauthorizedException);
-      expect(tools.executeTool).not.toHaveBeenCalled();
-    });
-
-    it('MCP_SECRET не задан — пустой Bearer не проходит', async () => {
-      delete process.env.MCP_SECRET;
+    it('пустой Bearer — 401', async () => {
       const { ctrl, tools } = make();
       await expect(ctrl.callTool('Bearer ', 'generate_image', { userId: 'u-1' })).rejects.toThrow(UnauthorizedException);
       expect(tools.executeTool).not.toHaveBeenCalled();
