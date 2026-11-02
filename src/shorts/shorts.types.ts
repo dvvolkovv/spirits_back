@@ -265,6 +265,25 @@ export interface ShortCaptions {
   youtube: { title: string; description: string; tags: string[] };
 }
 
+/**
+ * Самопочинка упавшего ролика (доктор, short-doctor.ts): что сделал и почему.
+ * Пишет только API; история не обнуляется, текущий круг — последние
+ * auto_recoveries записей (кнопка владельца начинает новый).
+ */
+export interface ShortRecovery {
+  /** Когда — время записи доктора (ISO). */
+  at: string;
+  /** С какого этапа упал (failed_from). */
+  from: ShortStatus;
+  /** Код сбоя (failed_code); null — сбой без кода. */
+  code: string | null;
+  action: 'later' | 'new_scene' | 'no_skits';
+  /** «Позже» — через сколько минут повтор. */
+  delayMin?: number;
+  /** Причина сбоя (last_error), до 300 знаков. */
+  reason: string;
+}
+
 // ── Строки таблиц ──────────────────────────────────────────────────────────
 
 export interface ShortVideo {
@@ -307,6 +326,14 @@ export interface ShortVideo {
   lastError: string | null;
   failedFrom: ShortStatus | null;
   failureNotified: boolean;
+  /** Код последнего сбоя: StudioError студии или сбой этапа API (relay, lease, rules…). */
+  failedCode: string | null;
+  /** Самопочинки текущего круга — кнопка владельца обнуляет. */
+  autoRecoveries: number;
+  /** Вся история самопочинок; текущий круг — последние autoRecoveries. */
+  recoveries: ShortRecovery[];
+  /** Секунды Omni на начало круга владельца: предел оживления — на круг (кнопка владельца переставляет). */
+  omniBase: number;
   publishedAt: Date | null;
   createdAt: Date | null;
   updatedAt: Date | null;
@@ -374,6 +401,10 @@ export function rowToShort(row: any): ShortVideo {
     lastError: row.last_error ?? null,
     failedFrom: row.failed_from ?? null,
     failureNotified: row.failure_notified === true,
+    failedCode: row.failed_code ?? null,
+    autoRecoveries: Number(row.auto_recoveries || 0),
+    recoveries: Array.isArray(row.recoveries) ? row.recoveries : [],
+    omniBase: Number(row.omni_base || 0),
     publishedAt: date(row.published_at),
     createdAt: date(row.created_at),
     updatedAt: date(row.updated_at),

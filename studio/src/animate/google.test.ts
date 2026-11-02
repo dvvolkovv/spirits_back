@@ -90,7 +90,7 @@ test('кадр без картинки: RECITATION — повторяемая о
   const a = fake([{ body: { candidates: [{ finishReason: 'RECITATION', content: { parts: [] } }] } }]);
   await assert.rejects(generateKeyframe(a.deps, 'p', []), (e: unknown) => isErr('keyframe', true)(e) && /RECITATION/.test((e as Error).message));
   const b = fake([{ body: { promptFeedback: { blockReason: 'PROHIBITED_CONTENT' } } }]);
-  await assert.rejects(generateKeyframe(b.deps, 'p', []), (e: unknown) => isErr('keyframe', false)(e) && /PROHIBITED_CONTENT/.test((e as Error).message));
+  await assert.rejects(generateKeyframe(b.deps, 'p', []), (e: unknown) => isErr('keyframe_blocked', false)(e) && /PROHIBITED_CONTENT/.test((e as Error).message));
 });
 
 test('HTTP-ошибки Google: квота, ключ и снятая модель не повторяются', () => {

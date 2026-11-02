@@ -1,5 +1,5 @@
 import type { SlotQueryable } from '../blog/blog-slot-claim';
-import { ShortStatus, ShortVideo, appendOwnerNote, rowToShort } from './shorts.types';
+import { ShortFormat, ShortStatus, ShortVideo, appendOwnerNote, rowToShort } from './shorts.types';
 
 /**
  * Решения по готовому ролику — общие для кнопок в личке (ShortsApprovalService)
@@ -26,6 +26,15 @@ import { ShortStatus, ShortVideo, appendOwnerNote, rowToShort } from './shorts.t
  */
 export const RELEASED_SQL =
   `EXISTS (SELECT 1 FROM short_publication p WHERE p.short_id = short_video.id AND p.status IN ('published', 'manual_pending', 'manual_done'))`;
+
+/**
+ * Кнопка владельца начинает новый круг и для секунд Omni: предел («Предел
+ * секунд Omni») — на круг, студия считает его от omni_base. Общий счёт ролика
+ * (animation.omniSeconds) не трогается — он в подписи на проверку. Через numeric:
+ * счёт с дробной записью («16.0» — ручная правка jsonb) ронял бы `::int`, а с ним
+ * и кнопку; floor — в строгую сторону (выше счёта начало круга студия всё равно не поднимет).
+ */
+export const NEW_OMNI_CIRCLE_SQL = "omni_base = COALESCE(floor((animation->>'omniSeconds')::numeric)::int, 0)";
 
 /** Откуда готовый ролик можно «Переснять» и «Отклонить». */
 export const LEAVE_FROM: readonly ShortStatus[] = ['pending_review', 'approved'];
@@ -97,17 +106,24 @@ export async function explainRefusal(
  * пока решали, ролик мог уйти в публикацию. «Переснять» вышедшего отправил бы
  * новую версию только в YouTube, «Отклонить» — сделал бы rejected ролик с
  * живым постом.
+ * «Переснять» — новый круг: самопочинки доктора заново (auto_recoveries = 0),
+ * формат — из настроек (`format`), как у «Новой сцены»: ролик, который доктор
+ * собрал без сценок, снова пробует сценки. У «Отклонить» обнуление ни на что не
+ * влияет, формат не трогается.
+ * Новый круг — и для секунд Omni (NEW_OMNI_CIRCLE_SQL): предел оживления — от потраченного на момент кнопки.
  */
 export async function leaveReview(
   pg: SlotQueryable,
   id: string,
   target: 'directing' | 'rejected',
   version?: string | null,
+  format?: ShortFormat | null,
 ): Promise<ReviewResult> {
   const params: any[] = [id, target, LEAVE_FROM];
+  const formatSet = target === 'directing' && format ? `, format = $${params.push(format)}` : '';
   const clause = versionClause(params, version);
   const r = await pg.query(
-    `UPDATE short_video SET status = $2, approved_at = NULL, attempts = 0, lease_until = NULL, last_error = NULL, updated_at = now()
+    `UPDATE short_video SET status = $2, approved_at = NULL, attempts = 0, lease_until = NULL, last_error = NULL, auto_recoveries = 0, ${NEW_OMNI_CIRCLE_SQL}${formatSet}, updated_at = now()
       WHERE id = $1 AND status = ANY($3::text[])
         AND NOT ${RELEASED_SQL}${clause}
       RETURNING *`,
@@ -120,7 +136,8 @@ export async function leaveReview(
 /**
  * Замечание к ролику на проверке: дописывается к прежним (appendOwnerNote) и
  * уводит ролик к сценаристу. writer_rounds = 0 — новый круг владельца, счётчик
- * автоматических переписок студии заново.
+ * автоматических переписок студии заново. Самопочинки доктора — тоже (auto_recoveries = 0).
+ * И секунды Omni (NEW_OMNI_CIRCLE_SQL): предел оживления — от потраченного на момент замечания.
  */
 export async function noteForReview(
   pg: SlotQueryable,
@@ -132,7 +149,7 @@ export async function noteForReview(
   const clause = versionClause(params, version);
   const r = await pg.query(
     `UPDATE short_video
-        SET owner_note = $2, status = 'writing', writer_rounds = 0, attempts = 0,
+        SET owner_note = $2, status = 'writing', writer_rounds = 0, attempts = 0, auto_recoveries = 0, ${NEW_OMNI_CIRCLE_SQL},
             lease_until = NULL, last_error = NULL, updated_at = now()
       WHERE id = $1 AND status = 'pending_review'${clause}
       RETURNING *`,

@@ -31,11 +31,21 @@ export const MAX_STAGE_ATTEMPTS = 3;
 /** Паузы перед повторами: 1 и 10 минут (спека, «Обработка отказов»). */
 export const STAGE_RETRY_DELAYS_SEC = [60, 600];
 
+/**
+ * Код сбоя этапа API, который повтором не лечится, — по нему доктор (short-doctor.ts)
+ * выбирает самопочинку: rules, recapture, no_scene, no_conflict — новая
+ * сцена; no_assistant — сообщение владельцу.
+ */
+export type StageFatalCode = 'rules' | 'recapture' | 'no_assistant' | 'no_scene' | 'no_conflict';
+
 /** Сбой, который повтором не лечится: ролик сразу уходит в failed. */
 export class StageFatalError extends Error {
-  constructor(message: string) {
+  readonly code: StageFatalCode;
+
+  constructor(code: StageFatalCode, message: string) {
     super(message);
     this.name = 'StageFatalError';
+    this.code = code;
   }
 }
 
@@ -73,7 +83,7 @@ export async function claimStage(pg: Queryable, status: ApiStage): Promise<Stage
   await pg.query(
     `UPDATE short_video
         SET status = 'failed', failed_from = status, lease_until = NULL, failure_notified = false,
-            last_error = $3, updated_at = now()
+            last_error = $3, failed_code = 'lease', updated_at = now()
       WHERE status = $1 AND attempts >= $2 AND (lease_until IS NULL OR lease_until < now())`,
     [status, MAX_STAGE_ATTEMPTS, `${STAGE_LABELS[status]}: этап не завершился за аренду — процесс упал или релей завис`],
   );
@@ -100,6 +110,8 @@ export type StageOutcome = 'retry' | 'failed' | 'gone';
  * становится паузой до повтора. Попытки кончились или сбой фатальный —
  * `failed`, `failed_from` (с чего продолжит «Повторить»), и
  * `failure_notified = false`: владельцу напишет следующий тик.
+ * Код сбоя — в failed_code: у StageFatalError — его, у исчерпанных повторов —
+ * relay — любой не фатальный сбой после исчерпанных попыток: релей, разбор ответа, срок этапа, база (истёкшая аренда — lease, claimStage).
  *
  * Обе записи — по статусу и номеру захвата (attempts растёт на каждом захвате).
  * Из directing и writing ролик не отклонить, условие страхует от второго
@@ -119,11 +131,13 @@ export async function stageFailed(pg: Queryable, v: StageVideo, label: string, e
     );
     return r.rowCount === 0 ? 'gone' : 'retry';
   }
+  // Код сбоя — доктору: у фатального свой, у исчерпанных повторов — relay.
+  const code = e instanceof StageFatalError ? e.code : 'relay';
   const r = await pg.query(
     `UPDATE short_video SET status = 'failed', failed_from = $2, lease_until = NULL, last_error = $3,
-            failure_notified = false, updated_at = now()
+            failed_code = $5, failure_notified = false, updated_at = now()
       WHERE id = $1 AND status = $2 AND attempts = $4`,
-    [v.id, v.status, message, v.attempts],
+    [v.id, v.status, message, v.attempts, code],
   );
   return r.rowCount === 0 ? 'gone' : 'failed';
 }

@@ -186,6 +186,29 @@ describe('buildReviewCaption', () => {
     expect(r.caption.length).toBeLessThanOrEqual(TG_CAPTION_MAX);
     expect(hasLoneSurrogate(r.caption)).toBe(false);
   });
+
+  it('самопочинки круга и «без сценок» — строками шапки перед «Выйдет»; без них строк нет', () => {
+    const { caption } = buildReviewCaption({ ...base, selfHealed: 'повтор через 30 мин (google_quota), без сценок (omni_budget)', noSkitsReason: 'оживление: предел секунд' });
+    expect(caption).toContain('Сам восстанавливался: повтор через 30 мин (google_quota), без сценок (omni_budget)\nСобран без сценок: оживление: предел секунд\nВыйдет: завтра в 18:00 МСК');
+    expect(buildReviewCaption(base).caption).not.toMatch(/Сам восстанавливался|Собран без сценок/);
+  });
+
+  it('шапка со всеми строками на пределах обрезки — в пределе подписи Telegram, «Выйдет» на месте', () => {
+    const long = (n: number) => 'я'.repeat(n);
+    const captions = { telegram: long(2000), vk: 'VK', youtube: { title: 'T', description: 'D', tags: [] } };
+    // Сценки и «без сценок» вместе не бывают: у формата chat сценарий без сценок.
+    const worst = { stand: true, angle: 'calm' as const, when: 'в ближайший свободный слот после одобрения' };
+    const withSkits = buildReviewCaption({
+      ...base, ...worst, question: long(400), captions, selfHealed: long(500),
+      skits: { cast: long(300), animation: { omniSeconds: 400, keyframes: 12, skits: {} }, maxOmniSeconds: 400, omniBase: 352 },
+    });
+    const noSkits = buildReviewCaption({ ...base, ...worst, question: long(400), captions, selfHealed: long(500), noSkitsReason: long(500) });
+    for (const { caption, extra } of [withSkits, noSkits]) {
+      expect(extra).not.toBeNull();
+      expect(caption.length).toBeLessThanOrEqual(TG_CAPTION_MAX);
+      expect(caption).toContain('Выйдет: в ближайший свободный слот после одобрения');
+    }
+  });
 });
 
 describe('skitCastLine и omniSpendLine', () => {
@@ -205,5 +228,12 @@ describe('skitCastLine и omniSpendLine', () => {
     expect(omniSpendLine({ omniSeconds: 24, keyframes: 3, skits: {} })).toBe('Omni: 24 с, кадров 3 ≈ $2,79');
     expect(omniSpendLine({ omniSeconds: 16, keyframes: 2, skits: {} }, 48)).toBe('Omni: 16 из 48 с, кадров 2 ≈ $1,86');
     expect(omniSpendLine(null)).toBe('Omni: 0 с, кадров 0 ≈ $0,00');
+  });
+
+  it('omniSpendLine: начат круг владельца — всего, кадры и доллары за ролик, в конце — этот круг', () => {
+    expect(omniSpendLine({ omniSeconds: 56, keyframes: 3, skits: {} }, 48, 48)).toBe('Omni: 56 с, кадров 3 ≈ $5,99; в этом круге 8 из 48 с');
+    expect(omniSpendLine({ omniSeconds: 16, keyframes: 2, skits: {} }, 48, 0)).toBe('Omni: 16 из 48 с, кадров 2 ≈ $1,86');
+    // Начало круга выше счёта (ручная правка animation) — круг от счёта, как в студии, без минуса.
+    expect(omniSpendLine({ omniSeconds: 16, keyframes: 2, skits: {} }, 48, 48)).toBe('Omni: 16 с, кадров 2 ≈ $1,86; в этом круге 0 из 48 с');
   });
 });

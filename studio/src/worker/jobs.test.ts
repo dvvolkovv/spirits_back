@@ -104,7 +104,7 @@ function deps(over: Partial<JobDeps> & Pick<JobDeps, 'queue' | 'storage'>): JobD
 }
 
 const job = (kind: JobKind, over: Partial<Job> = {}): Job => ({
-  id: ID, kind, attempts: 1, writerRounds: 0, scene, capture: null, script: null, animation: null, ...over,
+  id: ID, kind, attempts: 1, writerRounds: 0, omniBase: 0, scene, capture: null, script: null, animation: null, ...over,
 });
 
 test('съёмка: снимки — в MinIO под ключами попытки, съёмка — в базу без путей', async () => {
@@ -296,7 +296,7 @@ const skitCapture = { scene, questionShotKey: 'q', answerShotKey: 'a', boxes: [{
 
 test('оживление: счёт денег — из базы, готовое — из MinIO; по ходу — в базу и в MinIO; итог — очереди', async () => {
   const stored: ShortAnimation = { omniSeconds: 8, keyframes: 1, skits: {}, pending: { conflict: { id: 'gen-1', fingerprint: 'fp-c' } } };
-  const { queue, calls } = fakeQueue({ animate: job('animate', { capture: skitCapture, script: skitScript, animation: stored }) });
+  const { queue, calls } = fakeQueue({ animate: job('animate', { capture: skitCapture, script: skitScript, animation: stored, omniBase: 16 }) });
   const { storage, files, types } = fakeStorage();
   files.set(animationKey(ID, 'keyframes/kf-c.jpg'), 'кадр конфликта');
   files.set(animationKey(ID, 'skits/fp-c/raw.mp4'), 'оплаченный клип');
@@ -311,6 +311,7 @@ test('оживление: счёт денег — из базы, готовое 
       assert.equal(fs.readFileSync(path.join(runDir, 'skits/fp-c/raw.mp4'), 'utf8'), 'оплаченный клип');
       assert.equal(fs.existsSync(path.join(runDir, 'skits/fp-p/raw.mp4')), false);
       assert.equal(hooks.maxOmniSeconds, 48);
+      assert.equal(hooks.omniBase, 16);
       await hooks.onSave({ ...stored, omniSeconds: 16 });
       fs.mkdirSync(path.join(runDir, 'keyframes'), { recursive: true });
       fs.writeFileSync(path.join(runDir, 'keyframes/kf-p.png'), 'кадр развязки');

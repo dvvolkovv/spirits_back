@@ -114,6 +114,19 @@ describe('rowToShort', () => {
     expect(rowToShort({ skit_feedback: feedback }).skitFeedback).toEqual(feedback);
     expect(rowToShort({}).skitFeedback).toBeNull();
   });
+
+  it('самопочинки: код сбоя, счётчик круга и история; без колонок — пусто', () => {
+    const rec = { at: '2030-01-01T10:00:00.000Z', from: 'animating', code: 'google_quota', action: 'later', delayMin: 30, reason: 'оживление: лимит' };
+    const v = rowToShort({ id: 'x', failed_code: 'google_quota', auto_recoveries: 1, recoveries: [rec] });
+    expect([v.failedCode, v.autoRecoveries, v.recoveries]).toEqual(['google_quota', 1, [rec]]);
+    const empty = rowToShort({ id: 'y' });
+    expect([empty.failedCode, empty.autoRecoveries, empty.recoveries]).toEqual([null, 0, []]);
+  });
+
+  it('начало круга владельца по секундам Omni — omni_base; без колонки — 0', () => {
+    expect(rowToShort({ id: 'x', omni_base: 48 }).omniBase).toBe(48);
+    expect(rowToShort({ id: 'y' }).omniBase).toBe(0);
+  });
 });
 
 describe('appendOwnerNote', () => {

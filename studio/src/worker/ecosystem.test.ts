@@ -32,3 +32,9 @@ test('pm2: остановка — сообщением shutdown и без рас
   assert.match(worker, /const stopping = watchStop\(process, log\);/);
   assert.match(worker, /while \(!stopping\(\)\)/);
 });
+
+test('рабочий процесс передаёт оживлению начало круга владельца (omni_base)', () => {
+  // Поле в AnimateDeps необязательное — typecheck пропажу не заметит, а предел молча снова станет на весь ролик.
+  const worker = fs.readFileSync(path.join(STUDIO, 'src/worker/worker.ts'), 'utf8');
+  assert.match(worker, /omniBase: hooks\.omniBase,/);
+});

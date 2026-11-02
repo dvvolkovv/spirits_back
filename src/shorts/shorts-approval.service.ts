@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { InputFile } from 'grammy';
 import { approverChatId } from '../blog/blog-approval.service';
 import { formatSlotWhen } from '../blog/blog-slot-format';
@@ -8,9 +8,11 @@ import { StorageService } from '../common/services/storage.service';
 import { TgGrammyClient } from '../tg-bot/tg-grammy.client';
 import { buildReviewKeyboard, parseShortCallback, parseYoutubeUrl, shortCommandText } from './short-callback';
 import { STAND_MARK, buildReviewCaption, clip, skitCastLine } from './short-captions';
+import { currentCircle, noSkitsWords, recoveryWords } from './short-doctor';
 import { autoTopicsEnabled, isStand, shortsEnabled } from './short-env';
 import { LEAVE_FROM, RELEASED_SQL, leaveReview, noteForReview } from './short-review';
 import { approveShortIntoSlot } from './short-slot-claim';
+import { ShortsDoctorService } from './shorts-doctor.service';
 import { ShortsSettingsService } from './shorts-settings.service';
 import { MIN_ORDER_CHARS, ShortsTopicService } from './shorts-topic.service';
 import {
@@ -140,6 +142,8 @@ export class ShortsApprovalService {
     private readonly storage: StorageService,
     private readonly settings: ShortsSettingsService,
     private readonly topics: ShortsTopicService,
+    // Последним и @Optional(): прежние тесты строят сервис без доктора. Что Nest его подставляет — сторожит shorts.module.spec.ts.
+    @Optional() private readonly doctor?: ShortsDoctorService,
   ) {}
 
   /** Служебное сообщение владельцу. Сбой отправки глотаем: он не повод ронять тик. */
@@ -256,6 +260,10 @@ export class ShortsApprovalService {
     const when = v.slotAt && v.slotAt.getTime() > now.getTime()
       ? formatSlotWhen(v.slotAt, now)
       : 'в ближайший свободный слот после одобрения';
+    // Самопочинки текущего круга — владельцу на проверке: что ролик пережил и почему он без сценок.
+    const circle = currentCircle(v);
+    // «Собран без сценок» — только у chat, как пометка в кабинете: запись no_skits у ролика со сценками (ручной SQL) — не про него.
+    const noSkits = v.format === 'chat' ? circle.find((r) => r.action === 'no_skits') : undefined;
     const { caption, extra } = buildReviewCaption({
       stand: isStand(),
       rubric: v.rubric,
@@ -266,8 +274,15 @@ export class ShortsApprovalService {
       captions: v.captions,
       // Сценки: кто играл и во что обошлось оживление (спека сценок, «Одобрение»).
       ...(v.script?.skits
-        ? { skits: { cast: skitCastLine(v.script.skits), animation: v.animation, maxOmniSeconds: (await this.settings.get()).maxOmniSeconds } }
+        ? {
+            skits: {
+              cast: skitCastLine(v.script.skits), animation: v.animation,
+              maxOmniSeconds: (await this.settings.get()).maxOmniSeconds, omniBase: v.omniBase,
+            },
+          }
         : {}),
+      ...(circle.length ? { selfHealed: recoveryWords(circle) } : {}),
+      ...(noSkits ? { noSkitsReason: noSkitsWords(noSkits) } : {}),
     });
     const msg: any = await this.tg.sendVideo(chatId, video, {
       caption,
@@ -403,7 +418,9 @@ export class ShortsApprovalService {
       await this.answer(cb, buttonRefusal(v.status));
       return;
     }
-    const out = await leaveReview(this.pg, v.id, target);
+    // «Переснять» — формат из настроек, как в админке (short-review.ts, leaveReview).
+    const format = target === 'directing' ? (await this.settings.get()).format : null;
+    const out = await leaveReview(this.pg, v.id, target, undefined, format);
     if (out.ok === false) {
       await this.answer(
         cb,
@@ -596,6 +613,11 @@ export class ShortsApprovalService {
 
   /**
    * Упавшие ролики — владельцу, каждый один раз (захват по failure_notified).
+   * Сначала — доктор (ShortsDoctorService): взялся — ролик ушёл из failed,
+   * сообщения нет; владелец успел нажать кнопку — тоже молчим. Не взялся —
+   * сообщение и строка «Сам пробовал», если в круге были самопочинки. Доктор
+   * упал — сообщение уходит, как без него: сбой не прячется. Публикацию доктор
+   * не лечит.
    * Telegram сообщение не принял — флаг назад, и из цикла вон: иначе тот же
    * ролик забрался бы снова в этом же вызове. Повторит следующий тик.
    * BLOG_APPROVER_TG_ID не задан — флаг остаётся: писать некому.
@@ -614,11 +636,22 @@ export class ShortsApprovalService {
       );
       if (!r.rows.length) return;
       const v = rowToShort(r.rows[0]);
+      if (this.doctor && v.failedFrom !== 'publishing') {
+        try {
+          // Молчим только когда доктор взялся или владелец успел сам; любой другой ответ — сообщение: сбой не прячется.
+          const outcome = await this.doctor.treat(v);
+          if (outcome === 'took' || outcome === 'gone') continue;
+        } catch (e: any) {
+          this.logger.error(`доктор: ролик ${v.id} — ${e?.message ?? e}`, e?.stack);
+        }
+      }
       const released = r.rows[0].released === true;
       const tgUnsent = r.rows[0].tg_unsent === true;
       const what = v.failedFrom === 'publishing' ? (released ? 'вышел не на все площадки' : 'не вышел на площадки') : 'не собрался';
       const next = failedHint(v, released, tgUnsent);
-      const text = `${isStand() ? STAND_MARK : ''}Ролик${quoted(v)} ${what}: ${clip(v.lastError || 'причина не записана', 600)}\n${next}`;
+      // Публикацию доктор не лечит — его прошлые самопочинки этого круга к её сбою не относятся.
+      const tried = v.failedFrom === 'publishing' ? '' : recoveryWords(currentCircle(v));
+      const text = `${isStand() ? STAND_MARK : ''}Ролик${quoted(v)} ${what}: ${clip(v.lastError || 'причина не записана', 600)}\n${tried ? `Сам пробовал: ${tried}.\n` : ''}${next}`;
       const owner = approverChatId();
       if (!owner) {
         await this.notify(null, text);

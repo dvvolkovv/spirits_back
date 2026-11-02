@@ -9,6 +9,7 @@ import { RELEASED_SQL } from './short-review';
 import { approveShortIntoSlot } from './short-slot-claim';
 import { REVIEW_LEASE_MINUTES, ShortsApprovalService } from './shorts-approval.service';
 import { planSkits } from './short-skit-prompts';
+import { rowToShort } from './shorts.types';
 
 const ID = '6f1c2a9e-0d4b-4c3e-9a51-3b2f7c8d9e10';
 const OWNER = 777;
@@ -36,7 +37,7 @@ const finalWrites = (pg: any) => pg.query.mock.calls.filter((c: any[]) => String
 const pauses = (pg: any) =>
   pg.query.mock.calls.filter((c: any[]) => String(c[0]).includes('lease_until = now() + make_interval') && (c[1] || []).includes(LEASE));
 
-function setup(dbRow: any = row()) {
+function setup(dbRow: any = row(), doctor?: any) {
   const pg = {
     query: jest.fn(async (sql: string) => {
       if (sql.includes('SELECT * FROM short_video')) return { rows: dbRow ? [dbRow] : [] };
@@ -51,9 +52,9 @@ function setup(dbRow: any = row()) {
     answerCallbackQuery: jest.fn(async () => true),
   };
   const storage = { download: jest.fn(async () => Buffer.from('bytes')) };
-  const settings = { get: jest.fn(async () => ({ slotDays: [2, 4, 6], slotHourMsk: 18, maxOmniSeconds: 48 })) };
+  const settings = { get: jest.fn(async () => ({ slotDays: [2, 4, 6], slotHourMsk: 18, maxOmniSeconds: 48, format: 'skit' })) };
   const topics = { addManual: jest.fn(async (): Promise<any> => ({ id: 'new' })) };
-  const svc = new ShortsApprovalService(pg as any, tg as any, storage as any, settings as any, topics as any);
+  const svc = new ShortsApprovalService(pg as any, tg as any, storage as any, settings as any, topics as any, doctor);
   return { svc, pg, tg, storage, topics };
 }
 
@@ -200,6 +201,51 @@ describe('ShortsApprovalService', () => {
       await svc.sendPendingReviews();
       expect(tg.sendVideo).not.toHaveBeenCalled();
     });
+
+    it('самопочинки текущего круга — в подписи: «Сам восстанавливался» и «Собран без сценок» с причиной', async () => {
+      const recoveries = [
+        { at: '2030-01-01T08:00:00.000Z', from: 'animating', code: 'google_quota', action: 'later', delayMin: 30, reason: 'оживление: лимит' },
+        { at: '2030-01-01T08:40:00.000Z', from: 'animating', code: 'omni_budget', action: 'no_skits', reason: 'оживление: предел секунд' },
+      ];
+      const v = fresh({ format: 'chat', auto_recoveries: 2, recoveries });
+      const { svc, tg } = setup(v);
+      await svc.sendForReview(rowToShort(v), LEASE);
+      const caption = (tg.sendVideo.mock.calls[0] as any[])[2].caption;
+      expect(caption).toContain('Сам восстанавливался: повтор через 30 мин (google_quota), без сценок (omni_budget)');
+      expect(caption).toContain('Собран без сценок: исчерпан предел секунд Omni на круг — сценки вернёт «Переснять» (новый круг)');
+      const other = fresh({ format: 'chat', auto_recoveries: 1, recoveries: [{ ...recoveries[1], code: 'omni_bad_request', reason: 'оживление: Omni отклонил запрос' }] });
+      const s1 = setup(other);
+      await s1.svc.sendForReview(rowToShort(other), LEASE);
+      expect((s1.tg.sendVideo.mock.calls[0] as any[])[2].caption).toContain('Собран без сценок: оживление: Omni отклонил запрос');
+    });
+
+    it('подпись — только текущий круг: прошлый «без сценок» (до «Переснять») не попадает', async () => {
+      const recoveries = [
+        { at: '2030-01-01T06:00:00.000Z', from: 'animating', code: 'omni_budget', action: 'no_skits', reason: 'прошлый круг' },
+        { at: '2030-01-01T08:00:00.000Z', from: 'animating', code: 'google_quota', action: 'later', delayMin: 30, reason: 'оживление: лимит' },
+      ];
+      const v = fresh({ auto_recoveries: 1, recoveries });
+      const { svc, tg } = setup(v);
+      await svc.sendForReview(rowToShort(v), LEASE);
+      const caption = (tg.sendVideo.mock.calls[0] as any[])[2].caption;
+      expect(caption).toContain('Сам восстанавливался: повтор через 30 мин (google_quota)');
+      expect(caption).not.toContain('Собран без сценок');
+      expect(caption).not.toContain('прошлый круг');
+      const none = fresh({ auto_recoveries: 0, recoveries });
+      const s0 = setup(none);
+      await s0.svc.sendForReview(rowToShort(none), LEASE);
+      expect((s0.tg.sendVideo.mock.calls[0] as any[])[2].caption).not.toMatch(/Сам восстанавливался|Собран без сценок/);
+    });
+
+    it('«Собран без сценок» — только у формата chat: запись no_skits у ролика со сценками (ручной SQL) в подпись не идёт', async () => {
+      const recoveries = [{ at: '2030-01-01T08:40:00.000Z', from: 'animating', code: 'omni_budget', action: 'no_skits', reason: 'оживление: предел секунд' }];
+      const v = fresh({ format: 'skit', auto_recoveries: 1, recoveries });
+      const { svc, tg } = setup(v);
+      await svc.sendForReview(rowToShort(v), LEASE);
+      const caption = (tg.sendVideo.mock.calls[0] as any[])[2].caption;
+      expect(caption).toContain('Сам восстанавливался: без сценок (omni_budget)');
+      expect(caption).not.toContain('Собран без сценок');
+    });
   });
 
   describe('кнопки', () => {
@@ -225,7 +271,7 @@ describe('ShortsApprovalService', () => {
       });
       const { svc, tg } = setup();
       await svc.handleCallback(cb('ok'));
-      expect(approveShortIntoSlot).toHaveBeenCalledWith(expect.anything(), ID, new Date('2030-01-01T15:00:00.000Z'), { slotDays: [2, 4, 6], slotHourMsk: 18, maxOmniSeconds: 48 });
+      expect(approveShortIntoSlot).toHaveBeenCalledWith(expect.anything(), ID, new Date('2030-01-01T15:00:00.000Z'), expect.objectContaining({ slotDays: [2, 4, 6], slotHourMsk: 18, maxOmniSeconds: 48 }));
       expect(tg.answerCallbackQuery).toHaveBeenCalledWith('cb', { text: 'Одобрено. Опубликую завтра в 18:00 МСК.' });
       expect(tg.sendMessage).toHaveBeenCalledWith(OWNER, 'Одобрено. Опубликую завтра в 18:00 МСК.');
     });
@@ -355,6 +401,10 @@ describe('ShortsApprovalService', () => {
       const writes = pg.query.mock.calls.filter((c: any[]) => String(c[0]).includes('SET status = $2')) as any[];
       expect(writes.map((c) => c[1][1])).toEqual(['directing', 'rejected']);
       expect(writes[0][1][2]).toEqual(['pending_review', 'approved']);
+      // «Переснять» — формат из настроек (как «Новая сцена»), «Отклонить» формат не трогает.
+      expect(writes[0][0]).toContain('format = $4');
+      expect(writes[0][1][3]).toBe('skit');
+      expect(writes[1][0]).not.toMatch(/format =/);
     });
 
     it('«Выложил на YouTube» — приглашение прислать ссылку', async () => {
@@ -642,6 +692,108 @@ describe('ShortsApprovalService', () => {
       expect(tg.sendMessage).not.toHaveBeenCalled();
       expect(pg.query.mock.calls.some((c: any[]) => String(c[0]).includes('failure_notified = false'))).toBe(false);
     });
+
+    /** Разбор захватит один упавший ролик — этот. */
+    const failedOnce = (pg: any, over: Record<string, any>) => {
+      let given = false;
+      pg.query.mockImplementation(async (sql: string) => {
+        if (sql.includes('failure_notified = true') && !given) {
+          given = true;
+          return { rows: [row({ status: 'failed', ...over })] };
+        }
+        return { rows: [] };
+      });
+    };
+
+    it('доктор взялся — сообщения нет; ролик доктору — захваченный, с кодом сбоя', async () => {
+      const doctor = { treat: jest.fn(async () => 'took') };
+      const { svc, tg, pg } = setup(row(), doctor);
+      failedOnce(pg, { last_error: 'оживление: лимит', failed_from: 'animating', failed_code: 'google_quota' });
+      await svc.notifyFailures();
+      expect(doctor.treat).toHaveBeenCalledTimes(1);
+      expect((doctor.treat.mock.calls[0] as any[])[0]).toMatchObject({ id: ID, failedFrom: 'animating', failedCode: 'google_quota' });
+      expect(tg.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('владелец успел нажать кнопку (gone) — сообщения нет', async () => {
+      const doctor = { treat: jest.fn(async () => 'gone') };
+      const { svc, tg, pg } = setup(row(), doctor);
+      failedOnce(pg, { last_error: 'оживление: лимит', failed_from: 'animating', failed_code: 'google_quota' });
+      await svc.notifyFailures();
+      expect(tg.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('доктор не взялся — сообщение и строка «Сам пробовал» по текущему кругу, прошлые круги не в счёт', async () => {
+      const doctor = { treat: jest.fn(async () => 'gave_up') };
+      const { svc, tg, pg } = setup(row(), doctor);
+      failedOnce(pg, {
+        last_error: 'оживление: лимит', failed_from: 'animating', failed_code: 'google_quota', auto_recoveries: 2,
+        recoveries: [
+          { at: '2030-01-01T07:00:00.000Z', from: 'capturing', code: 'answer_rejected', action: 'new_scene', reason: 'прошлый круг' },
+          { at: '2030-01-01T08:00:00.000Z', from: 'animating', code: 'google_quota', action: 'later', delayMin: 30, reason: 'r' },
+          { at: '2030-01-01T08:30:00.000Z', from: 'animating', code: 'google_quota', action: 'later', delayMin: 120, reason: 'r' },
+        ],
+      });
+      await svc.notifyFailures();
+      const text = (tg.sendMessage.mock.calls[0] as any[])[1];
+      expect(text).toContain('не собрался: оживление: лимит\nСам пробовал: повтор через 30 мин (google_quota), повтор через 2 ч (google_quota).\nЧто дальше');
+      expect(text).not.toContain('answer_rejected');
+    });
+
+    it('без самопочинок в круге — строки «Сам пробовал» нет', async () => {
+      const doctor = { treat: jest.fn(async () => 'gave_up') };
+      const { svc, tg, pg } = setup(row(), doctor);
+      failedOnce(pg, { last_error: 'режиссёр: ассистента нет', failed_from: 'directing', failed_code: 'no_assistant' });
+      await svc.notifyFailures();
+      expect((tg.sendMessage.mock.calls[0] as any[])[1]).not.toContain('Сам пробовал');
+    });
+
+    it('доктор упал — сообщение уходит, как без него: сбой не прячется', async () => {
+      const doctor = { treat: jest.fn(async () => { throw new Error('база недоступна'); }) };
+      const { svc, tg, pg } = setup(row(), doctor);
+      failedOnce(pg, { last_error: 'оживление: лимит', failed_from: 'animating', failed_code: 'google_quota' });
+      await svc.notifyFailures();
+      expect(tg.sendMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('упавшая публикация — доктора не спрашивают', async () => {
+      const doctor = { treat: jest.fn(async () => 'took') };
+      const { svc, tg, pg } = setup(row(), doctor);
+      failedOnce(pg, {
+        last_error: 'публикация: telegram: chat not found', failed_from: 'publishing', tg_unsent: true,
+        auto_recoveries: 1, recoveries: [{ at: '2030-01-01T08:00:00.000Z', from: 'animating', code: 'omni_budget', action: 'no_skits', reason: 'r' }],
+      });
+      await svc.notifyFailures();
+      expect(doctor.treat).not.toHaveBeenCalled();
+      expect(tg.sendMessage).toHaveBeenCalledTimes(1);
+      expect((tg.sendMessage.mock.calls[0] as any[])[1]).not.toContain('Сам пробовал');
+    });
+
+    it('два упавших за один разбор: первый взял доктор, второй — сообщение; оба спрошены', async () => {
+      const doctor = { treat: jest.fn().mockResolvedValueOnce('took').mockResolvedValueOnce('gave_up') };
+      const { svc, tg, pg } = setup(row(), doctor);
+      let n = 0;
+      pg.query.mockImplementation(async (sql: string) => {
+        if (sql.includes('failure_notified = true') && n < 2) {
+          n++;
+          return { rows: [row({ status: 'failed', last_error: `оживление: сбой ${n}`, failed_from: 'animating', failed_code: 'google_quota' })] };
+        }
+        return { rows: [] };
+      });
+      await svc.notifyFailures();
+      expect(doctor.treat).toHaveBeenCalledTimes(2);
+      expect(tg.sendMessage).toHaveBeenCalledTimes(1);
+      expect((tg.sendMessage.mock.calls[0] as any[])[1]).toContain('оживление: сбой 2');
+    });
+
+    it('неожиданный ответ доктора — сообщение уходит: молчим только на took и gone', async () => {
+      const doctor = { treat: jest.fn(async () => undefined) };
+      const { svc, tg, pg } = setup(row(), doctor);
+      failedOnce(pg, { last_error: 'оживление: лимит', failed_from: 'animating', failed_code: 'google_quota' });
+      await svc.notifyFailures();
+      expect(tg.sendMessage).toHaveBeenCalledTimes(1);
+      expect(doctor.treat).toHaveBeenCalledTimes(1);
+    });
   });
 });
 
@@ -667,11 +819,11 @@ describe('ShortsApprovalService — ролик со сценками', () => {
     const { svc, tg } = setup(fresh({
       format: 'skit',
       script: { hook: 'h', voice: 'madirus', speed: 1.1, lines: [], final: { assistantsCount: 18 }, skits },
-      animation: { omniSeconds: 16, keyframes: 2, skits: {} },
+      animation: { omniSeconds: 16, keyframes: 2, skits: {} }, omni_base: 8,
     }));
     await svc.sendPendingReviews();
     const caption = (tg.sendVideo.mock.calls[0] as any[])[2].caption as string;
     expect(caption).toContain('Сценки: Гусыня Галина Петровна — хозяйка квартиры, Капибара Кеша — жилец');
-    expect(caption).toContain('Omni: 16 из 48 с, кадров 2 ≈ $1,86');
+    expect(caption).toContain('Omni: 16 с, кадров 2 ≈ $1,86; в этом круге 8 из 48 с');
   });
 });

@@ -43,6 +43,7 @@ describe('claimStage', () => {
     const [stuck, claim] = p.calls;
     expect(stuck.sql).toMatch(/status = 'failed', failed_from = status/);
     expect(stuck.sql).toMatch(/failure_notified = false/);
+    expect(stuck.sql).toMatch(/failed_code = 'lease'/);
     expect(stuck.sql).toMatch(/attempts >= \$2/);
     expect(stuck.sql).toMatch(/lease_until < now\(\)/);
     expect(stuck.params).toEqual([
@@ -75,12 +76,20 @@ describe('stageFailed', () => {
     expect(p.calls[0].sql).toMatch(/status = 'failed', failed_from = \$2/);
     expect(p.calls[0].sql).toMatch(/failure_notified = false/);
     expect(p.calls[0].sql).toMatch(/AND attempts = \$4/);
-    expect(p.calls[0].params).toEqual(['v1', 'directing', 'режиссёр: релей молчит', 3]);
+    expect(p.calls[0].sql).toMatch(/failed_code = \$5/);
+    expect(p.calls[0].params).toEqual(['v1', 'directing', 'режиссёр: релей молчит', 3, 'relay']);
   });
 
-  it('StageFatalError — сразу failed, без повторов', async () => {
+  it('StageFatalError — сразу failed, без повторов, с его кодом', async () => {
     const p = pg();
-    expect(await stageFailed(p, video(1), 'сценарист', new StageFatalError('правила не прошли'))).toBe('failed');
+    expect(await stageFailed(p, video(1), 'сценарист', new StageFatalError('rules', 'правила не прошли'))).toBe('failed');
+    expect(p.calls[0].params[4]).toBe('rules');
+  });
+
+  it('ошибка со своим code (сеть, pg) — в failed_code всё равно relay: код берётся только у StageFatalError', async () => {
+    const p = pg();
+    await stageFailed(p, video(3), 'режиссёр', Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }));
+    expect(p.calls[0].params[4]).toBe('relay');
   });
 
   it('ролик ушёл с этапа или его забрал другой процесс — gone, больше ничего не пишется', async () => {
@@ -94,7 +103,7 @@ describe('stageFailed', () => {
 
   it('подпись этапа, уже стоящая в ошибке, не дублируется', async () => {
     const p = pg();
-    await stageFailed(p, video(1), 'режиссёр', new StageFatalError('режиссёр: нет ассистента'));
+    await stageFailed(p, video(1), 'режиссёр', new StageFatalError('no_assistant', 'режиссёр: нет ассистента'));
     expect(p.calls[0].params[2]).toBe('режиссёр: нет ассистента');
   });
 

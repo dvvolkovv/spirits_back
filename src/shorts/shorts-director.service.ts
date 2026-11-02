@@ -38,7 +38,7 @@ export class ShortsDirectorService {
   async direct(v: ShortVideo): Promise<void> {
     const assistants = toAgents(await this.agents.getAgents('ru'));
     const fixed = v.assistantId ? assistants.find((a) => a.id === v.assistantId) ?? null : null;
-    if (v.assistantId && !fixed) throw new StageFatalError(`режиссёр: ассистента ${v.assistantId} нет среди активных`);
+    if (v.assistantId && !fixed) throw new StageFatalError('no_assistant', `режиссёр: ассистента ${v.assistantId} нет среди активных`);
     // Ролик со сценками: режиссёр пишет ещё и сценку 1 — она зависит только от вопроса (спека сценок).
     const skitFormat = v.format === 'skit';
 
@@ -106,7 +106,7 @@ export class ShortsDirectorService {
       await this.save(v, assistants, reply);
       return;
     }
-    throw new StageFatalError(`режиссёр: сценка 1 не прошла правила и после ${MAX_SKIT_REWRITES} переписок — ${violations.join('; ')}`);
+    throw new StageFatalError('rules', `режиссёр: сценка 1 не прошла правила и после ${MAX_SKIT_REWRITES} переписок — ${violations.join('; ')}`);
   }
 
   private async save(v: ShortVideo, assistants: AgentLite[], reply: DirectorReply): Promise<void> {

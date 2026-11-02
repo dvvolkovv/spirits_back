@@ -25,6 +25,7 @@ export type StudioErrorCode =
   | 'video_invalid'
   | 'no_input'
   | 'keyframe'
+  | 'keyframe_blocked'
   | 'omni_rejected'
   | 'omni_bad_request'
   | 'omni_failed'

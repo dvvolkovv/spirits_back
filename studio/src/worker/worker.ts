@@ -51,6 +51,7 @@ const deps: JobDeps = {
       waitClip: (id) => waitClip(google, id),
       recognize: (ogg) => recognize(ogg, stt),
       maxOmniSeconds: hooks.maxOmniSeconds,
+      omniBase: hooks.omniBase,
       onSave: hooks.onSave,
       onFile: hooks.onFile,
       onDiscard: hooks.onDiscard,

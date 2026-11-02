@@ -4,9 +4,10 @@ import { ConflictException } from '@nestjs/common';
 import { Pool } from 'pg';
 import { decryptSecret, encryptSecret } from '../calendar/crypto';
 import { claimStage, stageFailed } from './short-jobs';
-import { BAD_TIMESTAMP_CODES, VERSION_RE, VERSION_SQL, leaveReview, noteForReview } from './short-review';
+import { BAD_TIMESTAMP_CODES, NEW_OMNI_CIRCLE_SQL, VERSION_RE, VERSION_SQL, leaveReview, noteForReview } from './short-review';
 import { approveShortIntoSlot } from './short-slot-claim';
 import { ShortsApprovalService } from './shorts-approval.service';
+import { ShortsDoctorService } from './shorts-doctor.service';
 import { POST_MAY_BE_OUT, ShortsPublisherService } from './shorts-publisher.service';
 import { ShortsSettingsService } from './shorts-settings.service';
 import { ShortsTopicService } from './shorts-topic.service';
@@ -29,7 +30,7 @@ import { YoutubeAttemptSuperseded, YoutubeNotUploaded } from './youtube/youtube-
  */
 const PG = process.env.SHORTS_PG_URL;
 const maybe = PG ? describe : describe.skip;
-const MIGRATIONS = ['001_shorts.sql', '002_skits.sql', '003_youtube.sql', '004_skit_feedback.sql'].map((f) => path.join(__dirname, 'migrations', f));
+const MIGRATIONS = ['001_shorts.sql', '002_skits.sql', '003_youtube.sql', '004_skit_feedback.sql', '005_doctor.sql'].map((f) => path.join(__dirname, 'migrations', f));
 const migrate = async (pool: Pool) => {
   for (const f of MIGRATIONS) await pool.query(fs.readFileSync(f, 'utf8'));
 };
@@ -102,6 +103,8 @@ maybe('ролики против живого Postgres', () => {
       'approved', 'publishing', 'published', 'rejected', 'failed'];
     for (const status of OLD) await insert({ status });
     await migrate(pool);
+    expect((await pool.query('SELECT DISTINCT failed_code, auto_recoveries, recoveries, omni_base FROM short_video')).rows)
+      .toEqual([{ failed_code: null, auto_recoveries: 0, recoveries: [], omni_base: 0 }]);
     const statusChecks = `SELECT conname, oid FROM pg_constraint
       WHERE conrelid = 'public.short_video'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%''render_queued''%'`;
     const first = (await pool.query(statusChecks)).rows;
@@ -155,6 +158,7 @@ maybe('ролики против живого Postgres', () => {
     expect(await stageFailed(pool, third, 'режиссёр', new Error('релей молчит'))).toBe('failed');
     const row = (await pool.query(`SELECT * FROM short_video WHERE id = $1`, [v.id])).rows[0];
     expect([row.status, row.failed_from, row.failure_notified, row.last_error]).toEqual(['failed', 'directing', false, 'режиссёр: релей молчит']);
+    expect(row.failed_code).toBe('relay');
   });
 
   it('аренда истекла посреди работы: опоздавший процесс не трогает чужой захват; зависшая последняя попытка — failed', async () => {
@@ -169,8 +173,8 @@ maybe('ролики против живого Postgres', () => {
 
     await pool.query(`UPDATE short_video SET attempts = 3, lease_until = now() - interval '1 second' WHERE id = $1`, [v.id]);
     expect(await claimStage(pool, 'directing')).toBeNull();
-    const row = (await pool.query(`SELECT status, failed_from, failure_notified FROM short_video WHERE id = $1`, [v.id])).rows[0];
-    expect(row).toEqual({ status: 'failed', failed_from: 'directing', failure_notified: false });
+    const row = (await pool.query(`SELECT status, failed_from, failure_notified, failed_code FROM short_video WHERE id = $1`, [v.id])).rows[0];
+    expect(row).toEqual({ status: 'failed', failed_from: 'directing', failure_notified: false, failed_code: 'lease' });
   });
 
   it('ответ на приглашение узнаётся по большому id сообщения, замечание уводит ролик на переписку', async () => {
@@ -225,6 +229,78 @@ maybe('ролики против живого Postgres', () => {
     expect(texts[2]).toContain('не вышел на площадки');
     expect(texts[2]).toContain('«Повторить» или «Отклонить».');
     expect(texts[2]).not.toContain('Пост вышел');
+  });
+
+  it('доктор на живом SQL: «позже» уводит упавший ролик в очередь этапа с паузой и историей', async () => {
+    const v = await insert({
+      status: 'failed', failed_from: 'animating', failed_code: 'google_quota', last_error: 'оживление: лимит',
+      failure_notified: true, format: 'skit', capture: { answerText: 'a', paragraphs: [] },
+    });
+    const row = (await pool.query('SELECT * FROM short_video WHERE id = $1', [v.id])).rows[0];
+    expect(await new ShortsDoctorService(pgLike() as any).treat(rowToShort(row))).toBe('took');
+    const r = (
+      await pool.query(
+        `SELECT status, attempts, failed_from, failed_code, failure_notified, auto_recoveries, recoveries,
+                lease_until > now() + interval '29 minutes' AS paused
+           FROM short_video WHERE id = $1`,
+        [v.id],
+      )
+    ).rows[0];
+    expect(r).toMatchObject({ status: 'animate_queued', attempts: 0, failed_from: null, failed_code: null, failure_notified: false, auto_recoveries: 1, paused: true });
+    expect(r.recoveries).toHaveLength(1);
+    expect(r.recoveries[0]).toMatchObject({ from: 'animating', code: 'google_quota', action: 'later', delayMin: 30 });
+  });
+
+  it('доктор на живом SQL: «без сценок» — сценарист в формате chat, оживление (счёт денег) не тронуто', async () => {
+    const v = await insert({
+      status: 'failed', failed_from: 'animating', failed_code: 'omni_budget', last_error: 'оживление: предел',
+      failure_notified: true, format: 'skit', capture: { answerText: 'a', paragraphs: [] },
+      scene: { kind: 'chat', assistantId: 10, assistantName: 'Алексей', question: 'в', followups: [] },
+      animation: { omniSeconds: 48, skits: {} }, omni_base: 16,
+    });
+    const row = (await pool.query('SELECT * FROM short_video WHERE id = $1', [v.id])).rows[0];
+    expect(await new ShortsDoctorService(pgLike() as any).treat(rowToShort(row))).toBe('took');
+    const r = (await pool.query('SELECT status, format, animation, auto_recoveries, recoveries, omni_base FROM short_video WHERE id = $1', [v.id])).rows[0];
+    expect(r).toMatchObject({ status: 'writing', format: 'chat', animation: { omniSeconds: 48, skits: {} }, auto_recoveries: 1, omni_base: 16 });
+    expect(r.recoveries[0]).toMatchObject({ action: 'no_skits', code: 'omni_budget' });
+  });
+
+  it('новый круг по секундам на живом SQL: счёт с дробной записью (16.0 — ручная правка jsonb) — omni_base 16, а не ошибка кнопки', async () => {
+    const v = await insert({ status: 'pending_review' });
+    await pool.query(`UPDATE short_video SET animation = '{"omniSeconds": 16.0, "skits": {}}'::jsonb WHERE id = $1`, [v.id]);
+    const r = await pool.query(`UPDATE short_video SET ${NEW_OMNI_CIRCLE_SQL} WHERE id = $1 RETURNING omni_base`, [v.id]);
+    expect(r.rows[0].omni_base).toBe(16);
+  });
+
+  it('доктор на живом SQL: «новая сцена» — режиссёр без паузы, строка «Сам:» к замечаниям', async () => {
+    const v = await insert({
+      status: 'failed', failed_from: 'capturing', failed_code: 'answer_rejected', last_error: 'съёмка: ответ не годится',
+      failure_notified: true, owner_note: 'Короче.',
+    });
+    const row = (await pool.query('SELECT * FROM short_video WHERE id = $1', [v.id])).rows[0];
+    expect(await new ShortsDoctorService(pgLike() as any).treat(rowToShort(row))).toBe('took');
+    const r = (await pool.query('SELECT status, lease_until, owner_note, auto_recoveries FROM short_video WHERE id = $1', [v.id])).rows[0];
+    expect(r).toMatchObject({ status: 'directing', lease_until: null, auto_recoveries: 1 });
+    expect(r.owner_note).toBe('Короче.\nСам: прошлая сцена не удалась — съёмка: ответ не годится');
+  });
+
+  it('доктор на живом SQL: сбой не захвачен разбором (failure_notified = false) — gone, строка не тронута', async () => {
+    const v = await insert({ status: 'failed', failed_from: 'animating', failed_code: 'google_quota', last_error: 'x', failure_notified: false });
+    const before = (await pool.query('SELECT * FROM short_video WHERE id = $1', [v.id])).rows[0];
+    expect(await new ShortsDoctorService(pgLike() as any).treat(rowToShort(before))).toBe('gone');
+    expect((await pool.query('SELECT * FROM short_video WHERE id = $1', [v.id])).rows[0]).toEqual(before);
+  });
+
+  it('«позже» у режиссёра: до конца паузы claimStage ролик не берёт, после — с первой попытки', async () => {
+    const v = await insert({
+      status: 'failed', failed_from: 'directing', failed_code: 'relay', last_error: 'режиссёр: релей молчит', failure_notified: true, attempts: 3,
+    });
+    const row = (await pool.query('SELECT * FROM short_video WHERE id = $1', [v.id])).rows[0];
+    expect(await new ShortsDoctorService(pgLike() as any).treat(rowToShort(row))).toBe('took');
+    expect(await claimStage(pool, 'directing')).toBeNull();
+    await pool.query(`UPDATE short_video SET lease_until = now() - interval '1 second' WHERE id = $1`, [v.id]);
+    const claimed = await claimStage(pool, 'directing');
+    expect([claimed?.id, claimed?.attempts]).toEqual([v.id, 1]);
   });
 
   it('две публикации одновременно — одна отправка в канал', async () => {
@@ -378,6 +454,10 @@ maybe('ролики против живого Postgres', () => {
       review_chat_id: 777, review_message_id: 12, note_prompt_ids: [101, 102], yt_prompt_ids: [201],
       lease_until: new Date(Date.now() + 900_000), attempts: 2, last_error: 'ошибка-тест',
       failed_from: 'writing', failure_notified: true, published_at: new Date(Date.now() - 60_000),
+      // jsonb-массив — строкой (JSON.stringify): помощник отдаёт массивы как есть, node-pg сделал бы из них массив Postgres.
+      failed_code: 'код-тест', auto_recoveries: 2,
+      recoveries: JSON.stringify([{ at: '2030-01-01T10:00:00.000Z', from: 'animating', code: 'google_quota', action: 'later', delayMin: 30, reason: 'причина-тест' }]),
+      omni_base: 16,
     });
     const full = (await pool.query(`SELECT *, ${VERSION_SQL} AS version FROM short_video WHERE id = $1`, [v.id])).rows[0];
     // То же, что делает light() в контроллере — не экспортирован, поэтому воспроизводим здесь.
@@ -388,6 +468,10 @@ maybe('ролики против живого Postgres', () => {
     delete expected.captions;
     expected.version = full.version;
     expected.publications = [];
+    // Самопроверка фикстуры: тест сравнивает rowToShort с rowToShort — если обе стороны
+    // скатятся в запасные значения (колонку забыли в INSERT или в LIST_COLUMNS), поля
+    // совпадут вхолостую, и сверка ничего не поймает.
+    expect([expected.failedCode, expected.autoRecoveries, expected.recoveries.length, expected.omniBase]).toEqual(['код-тест', 2, 1, 16]);
 
     const ctl = new ShortsController(pgLike() as any, {} as any, {} as any, { publicUrl: () => 'x' } as any);
     const res: any = { status: () => res, json: (b: any) => ((res.body = b), res) };
@@ -460,10 +544,13 @@ maybe('ролики против живого Postgres', () => {
     });
 
     it('redo (admin «Переснять») вышедшего ролика — отказ даже с верной версией; после снятия «вышел» тот же вызов проходит', async () => {
-      const v = await insert({ status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() + 86_400_000) });
+      const v = await insert({
+        status: 'approved', approved_at: new Date(), slot_at: new Date(Date.now() + 86_400_000),
+        animation: { omniSeconds: 56, skits: {} },
+      });
       await pool.query(`INSERT INTO short_publication (short_id, platform, status) VALUES ($1, 'telegram', 'published')`, [v.id]);
       const version = (await pool.query(`SELECT ${VERSION_SQL} AS version FROM short_video WHERE id = $1`, [v.id])).rows[0].version;
-      const ctl = new ShortsController(pgLike() as any, {} as any, {} as any, {} as any);
+      const ctl = new ShortsController(pgLike() as any, { get: async () => ({ format: 'skit' }) } as any, {} as any, {} as any);
       const res: any = { status: () => res, json: (b: any) => ((res.body = b), res) };
       await expect(ctl.action({ action: 'redo', id: v.id, version }, res)).rejects.toThrow(
         'Ролик уже вышел на площадке — переснять или отклонить нельзя',
@@ -476,6 +563,8 @@ maybe('ролики против живого Postgres', () => {
       await pool.query(`UPDATE short_publication SET status = 'failed' WHERE short_id = $1`, [v.id]);
       await ctl.action({ action: 'redo', id: v.id, version }, res);
       expect(res.body.status).toBe('directing');
+      expect(res.body.format).toBe('skit');
+      expect(res.body.omniBase).toBe(56);
     });
 
     it('одобрение из админки и кнопка лички одновременно — ролик одобрен один раз', async () => {

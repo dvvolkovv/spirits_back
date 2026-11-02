@@ -380,11 +380,12 @@ test('кадр: пустой ответ — ещё попытка; заблок�
   const b = setup();
   const blocked = fakes(b, {
     keyframe: (kind) => {
-      if (kind === 'conflict') throw new StudioError('keyframe', 'keyframe: Nano Banana заблокировал промпт (PROHIBITED_CONTENT)', false);
+      if (kind === 'conflict') throw new StudioError('keyframe_blocked', 'keyframe: Nano Banana заблокировал промпт (PROHIBITED_CONTENT)', false);
     },
   });
-  await assert.rejects(animateRun(b.runDir, blocked.deps), (e: unknown) => isErr('keyframe', false)(e) && /сценка 1 \(конфликт\)/.test((e as Error).message));
+  await assert.rejects(animateRun(b.runDir, blocked.deps), (e: unknown) => isErr('keyframe_blocked', false)(e) && /сценка 1 \(конфликт\)/.test((e as Error).message));
   assert.deepEqual(blocked.calls.start, []);
+  assert.equal(blocked.calls.keyframe.filter((k) => k.kind === 'conflict').length, 1);
 });
 
 test('квота — сразу ошибка без повтора и с именем сценки, секунды не списаны, готовая сценка сохранена', { timeout: 120_000 }, async () => {
@@ -407,7 +408,7 @@ test('предел секунд Omni на ролик', { timeout: 120_000 }, asy
   const { deps } = fakes(env, { keyframeDelayMs: { punchline: 50 } });
   await assert.rejects(
     animateRun(env.runDir, { ...deps, maxOmniSeconds: 8 }),
-    (e: unknown) => isErr('omni_budget', false)(e) && /предел — 8 с/.test((e as Error).message),
+    (e: unknown) => isErr('omni_budget', false)(e) && /предел — 8 с/.test((e as Error).message) && !/новый круг/.test((e as Error).message),
   );
   const anim = readAnim(env.runDir);
   assert.equal(anim.omniSeconds, 8);
@@ -983,4 +984,43 @@ test('промах, а на следующий клип секунд нет — 
   });
   assert.deepEqual(second.calls.start, ['punchline']);
   assert.equal(readAnim(env.runDir).omniSeconds, 24);
+});
+
+test('предел — на круг владельца: секунды до начала круга не в счёт', { timeout: 120_000 }, async () => {
+  const env = setup();
+  await animateRun(env.runDir, fakes(env).deps);
+  const lines = ['Это износ, верните залог.', 'Га-га… ладно.'];
+  writeScript(env.runDir, { conflict: plan('conflict'), punchline: plan('punchline', lines, 'fp-punchline-2') });
+  const next = fakes(env, { heard: (kind) => (kind === 'punchline' ? lines.join(' ') : LINES[kind].join(' ')) });
+  const anim = await animateRun(env.runDir, { ...next.deps, maxOmniSeconds: 8, omniBase: 16 });
+  assert.deepEqual(next.calls.start, ['punchline']);
+  assert.equal(anim.omniSeconds, 24);
+});
+
+test('предел — на круг владельца: круг исчерпан — omni_budget со счётом круга', { timeout: 120_000 }, async () => {
+  const env = setup();
+  await animateRun(env.runDir, fakes(env).deps);
+  const lines = ['Это износ, верните залог.', 'Га-га… ладно.'];
+  writeScript(env.runDir, { conflict: plan('conflict'), punchline: plan('punchline', lines, 'fp-punchline-2') });
+  const next = fakes(env);
+  await assert.rejects(
+    animateRun(env.runDir, { ...next.deps, maxOmniSeconds: 8, omniBase: 8 }),
+    (e: unknown) => isErr('omni_budget', false)(e) && /на ролик ушло 16 с Omni вместе с запущенными, в этом круге — 8 с, предел — 8 с на круг/.test((e as Error).message),
+  );
+  assert.deepEqual(next.calls.start, []);
+});
+
+test('предел — на круг владельца: начало круга выше счёта ролика — круг от счёта, а не щедрее', { timeout: 120_000 }, async () => {
+  const env = setup();
+  const logs: string[] = [];
+  const { deps, calls } = fakes(env, { keyframeDelayMs: { punchline: 50 } });
+  await assert.rejects(
+    animateRun(env.runDir, { ...deps, maxOmniSeconds: 8, omniBase: 48, log: (m) => logs.push(m) }),
+    (e: unknown) =>
+      isErr('omni_budget', false)(e) &&
+      /предел — 8 с: лимит пересъёмок сценок; новый круг со сценками — «Повторить» или «Новая сцена»; поднять предел — настройка «Предел секунд Omni»/.test((e as Error).message),
+  );
+  assert.deepEqual(calls.start, ['conflict']);
+  assert.equal(readAnim(env.runDir).omniSeconds, 8);
+  assert.ok(logs.some((m) => m.includes('начало круга 48 с больше счёта ролика 0 с — круг считается от 0 с; правили animation руками — поставьте omni_base или нажмите кнопку владельца')), logs.join('\n'));
 });

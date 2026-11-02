@@ -37,6 +37,9 @@ describe('leaveReview', () => {
     expect(pg.query).toHaveBeenCalledTimes(1);
     const [sql, params] = pg.query.mock.calls[0] as any[];
     expect(sql).toContain('SET status = $2');
+    expect(sql).toContain('auto_recoveries = 0');
+    expect(sql).toContain("omni_base = COALESCE(floor((animation->>'omniSeconds')::numeric)::int, 0)");
+    expect(sql).not.toMatch(/\brecoveries\s*=/);
     expect(sql).toContain(`AND NOT ${RELEASED_SQL}`);
     expect(sql).not.toContain('updated_at = $');
     expect(params).toEqual([ID, 'directing', LEAVE_FROM]);
@@ -62,6 +65,18 @@ describe('leaveReview', () => {
       expect(await leaveReview(pg as any, ID, 'rejected', VERSION)).toEqual({ ok: false, reason, status });
     }
   });
+
+  it('«Переснять» с форматом — формат из настроек, как «Новая сцена»; «Отклонить» формат не трогает', async () => {
+    const pg = fakePg({ rows: [row({ status: 'directing' })] });
+    await leaveReview(pg as any, ID, 'directing', VERSION, 'skit');
+    const [sql, params] = pg.query.mock.calls[0] as any[];
+    expect(sql).toContain('format = $4');
+    expect(sql).toContain('AND updated_at = $5::timestamptz');
+    expect(params).toEqual([ID, 'directing', LEAVE_FROM, 'skit', VERSION]);
+    const rej = fakePg({ rows: [row({ status: 'rejected' })] });
+    await leaveReview(rej as any, ID, 'rejected', VERSION, 'skit');
+    expect((rej.query.mock.calls[0] as any[])[0]).not.toMatch(/format =/);
+  });
 });
 
 describe('noteForReview', () => {
@@ -72,6 +87,9 @@ describe('noteForReview', () => {
     expect(pg.query).toHaveBeenCalledTimes(1);
     const [sql, params] = pg.query.mock.calls[0] as any[];
     expect(sql).toContain("status = 'writing'");
+    expect(sql).toContain('auto_recoveries = 0');
+    expect(sql).toContain("omni_base = COALESCE(floor((animation->>'omniSeconds')::numeric)::int, 0)");
+    expect(sql).not.toMatch(/\brecoveries\s*=/);
     expect(sql).toContain("WHERE id = $1 AND status = 'pending_review'");
     expect(params).toEqual([ID, 'короче\nбез цифр']);
   });

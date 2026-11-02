@@ -5,6 +5,7 @@ import { BlogRelayClient } from '../blog/blog-relay.client';
 import { PgService } from '../common/services/pg.service';
 import { assistantVoice, disclaimerFor } from './short-assistants';
 import { buildCaptions } from './short-captions';
+import { DOCTOR_NOTE_PREFIX } from './short-doctor';
 import { StageFatalError } from './short-jobs';
 import { linkBase, shortLinks, shortTarget } from './short-links';
 import { parseWriterReply } from './short-parse';
@@ -27,11 +28,19 @@ export const MAX_REWRITES = 2;
 export const MAX_RECAPTURES = 2;
 const RECAPTURE_NOTE = 'Сценарист:';
 
-/** Просьбы «Сценарист: …» в хвосте замечаний — после последнего замечания владельца. */
+/**
+ * Просьбы «Сценарист: …» в хвосте замечаний — после последнего замечания
+ * владельца. Строки доктора «Сам: …» не в счёт и счёт не рвут: иначе после
+ * новой сцены доктора сценарист попросил бы ещё две.
+ */
 function recapturesInRow(ownerNote: string | null): number {
   const lines = String(ownerNote ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
   let n = 0;
-  while (n < lines.length && lines[lines.length - 1 - n].startsWith(RECAPTURE_NOTE)) n++;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].startsWith(DOCTOR_NOTE_PREFIX)) continue;
+    if (!lines[i].startsWith(RECAPTURE_NOTE)) break;
+    n++;
+  }
   return n;
 }
 
@@ -80,12 +89,12 @@ export class ShortsWriterService {
    * названной сценки (withNewLines), остальное — принятое.
    */
   async write(v: ShortVideo): Promise<void> {
-    if (!v.scene || !v.capture) throw new StageFatalError('сценарист: у ролика нет сцены или съёмки');
+    if (!v.scene || !v.capture) throw new StageFatalError('no_scene', 'сценарист: у ролика нет сцены или съёмки');
     const skitFormat = v.format === 'skit';
     // Конфликт — последний принятый: переписанный по замечанию лежит в сценарии, исходный — в сцене режиссёра.
     let conflict: Skit | null = skitFormat ? v.script?.skits?.conflict?.skit ?? v.scene.skit ?? null : null;
     if (skitFormat && !conflict) {
-      throw new StageFatalError('сценарист: у ролика со сценками нет сценки 1 — повторите с этапа режиссёра');
+      throw new StageFatalError('no_conflict', 'сценарист: у ролика со сценками нет сценки 1 — повторите с этапа режиссёра');
     }
     // Принятая развязка — из прошлого сценария: её клип мог быть уже снят. Сценарист
     // её не повторяет, пока замечания её не касаются, — и она не переснимается
@@ -153,7 +162,7 @@ export class ShortsWriterService {
       const reply = parseWriterReply(raw, { skit: skitFormat, acceptedPunchline: !!acceptedPunchline });
       if (reply.needsRecapture) {
         if (recapturesInRow(v.ownerNote) >= MAX_RECAPTURES) {
-          throw new StageFatalError(`сценарист: уже дважды просил другую сцену — нужен взгляд владельца; последняя причина: ${reply.reason}`);
+          throw new StageFatalError('recapture', `сценарист: уже дважды просил другую сцену — нужен взгляд владельца; последняя причина: ${reply.reason}`);
         }
         await this.backToDirector(v, reply.reason);
         return;
@@ -220,7 +229,7 @@ export class ShortsWriterService {
       if (r.rowCount === 0) this.logger.warn(`ролик ${v.id} ушёл из writing или его забрал другой процесс — сценарий не записал`);
       return;
     }
-    throw new StageFatalError(`сценарист: правила текста не прошли и после ${MAX_REWRITES} переписок — ${violations.join('; ')}`);
+    throw new StageFatalError('rules', `сценарист: правила текста не прошли и после ${MAX_REWRITES} переписок — ${violations.join('; ')}`);
   }
 
   /**

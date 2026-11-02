@@ -96,12 +96,13 @@ describe('ShortsDirectorService.direct', () => {
 
   it('ассистент темы больше не активен — фатально, повтор не поможет', async () => {
     const { svc } = setup();
-    await expect(svc.direct(video({ assistant_id: 99 }))).rejects.toBeInstanceOf(StageFatalError);
+    await expect(svc.direct(video({ assistant_id: 99 }))).rejects.toMatchObject({ name: 'StageFatalError', code: 'no_assistant' });
   });
 
   it('кривой ответ режиссёра — обычная ошибка: этап повторится', async () => {
     const { svc } = setup('Извините, не могу');
     await expect(svc.direct(video())).rejects.toThrow(/режиссёр: не нашёл JSON/);
+    expect(await svc.direct(video()).catch((e) => e)).not.toBeInstanceOf(StageFatalError);
   });
 
   it('ролик ушёл из directing, пока думал режиссёр — без ошибки', async () => {
@@ -116,6 +117,7 @@ describe('ShortsDirectorService.direct', () => {
       'режиссёр: выбрал ассистента здоровья «Полина» для провокационной подачи — здоровье только в calm',
     );
     expect(pg.query.mock.calls.some((call: any[]) => String(call[0]).includes('capture_queued'))).toBe(false);
+    expect(await svc.direct(video({ angle: 'roast', assistant_id: null })).catch((e) => e)).not.toBeInstanceOf(StageFatalError);
   });
 
   it('та же ситуация в спокойной подаче — проходит', async () => {
@@ -206,7 +208,7 @@ describe('ShortsDirectorService.direct — ролик со сценками', ()
 
   it(`нарушения и после ${MAX_SKIT_REWRITES} переписок — StageFatalError, ролик не записан`, async () => {
     const { svc, pg, relay } = skitSetup(Array.from({ length: MAX_SKIT_REWRITES + 1 }, () => ({ ...REPLY, skit: LONG })));
-    await expect(svc.direct(video({ format: 'skit' }))).rejects.toThrow(StageFatalError);
+    await expect(svc.direct(video({ format: 'skit' }))).rejects.toMatchObject({ name: 'StageFatalError', code: 'rules' });
     expect(relay.ask).toHaveBeenCalledTimes(MAX_SKIT_REWRITES + 1);
     expect(pg.query.mock.calls.some(([sql]: [string]) => sql.includes("SET status = 'capture_queued'"))).toBe(false);
   });
