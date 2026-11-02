@@ -81,14 +81,21 @@ const parsed = (buf) => lines(buf).filter((l) => l.length).map((l) => JSON.parse
 const sha = (b) => createHash("sha256").update(b).digest("hex");
 const ch = (...codes) => String.fromCharCode(...codes);
 
-// Правила сессии KEY → FSKEY; по умолчанию без переименований.
-const rules = (over = {}) =>
+const KEY2 = PHONE + "_12_en"; // другая сессия того же номера
+const FSKEY2 = "9e8d7f6a5b4c3d2e1f0a9b8c7d6e5f4a";
+// Правила сессии KEY → FSKEY. own — имена и переименования её папки и
+// загрузок; dirs — папки других сессий того же номера: [старое имя, { fsKey | null, … }];
+// keep — имена на диске, которые не переносятся (сироты).
+const rules = ({ own = {}, dirs = [], keep = [] } = {}) =>
   sessionRules({
-    phone: PHONE, oldDir: KEY, fsKey: FSKEY,
-    outNames: [], outRenames: new Map(), upRests: [], upRenames: new Map(),
+    phone: PHONE, fsKey: FSKEY,
+    dirs: new Map([[KEY, { fsKey: FSKEY, outNames: [], outRenames: new Map(), upRests: [], upRenames: new Map(), ...own }], ...dirs]),
+    keep: new Set(keep),
+    uploadsRoot: UP.slice(0, -1),
     tablePhones: new Set([PHONE, OTHER]),
-    ...over,
   });
+const ZERO = { phrase: 0, dirs: 0, uploads: 0, other: 0, kept: 0 };
+const texts = (r) => parsed(r.out).map((e) => (typeof e.message.content === "string" ? e.message.content : e.message.content[0].text));
 
 // ---------------------------------------------------------------- строки транскрипта
 
@@ -171,7 +178,7 @@ test("номер внутри более длинного числа не тро
   const text = "Заказ 1" + PHONE + ", счёт " + PHONE + "1, код 9" + PHONE + "9; номер " + PHONE + ".";
   const r = scrubContent(jsonl(assistant(text)), rules());
   assert.equal(r.counts.other, 1);
-  assert.equal(parsed(r.out)[0].message.content[0].text, text.replace("номер " + PHONE, "номер " + FSKEY));
+  assert.equal(texts(r)[0], text.replace("номер " + PHONE, "номер " + FSKEY));
 });
 
 test("номера других пользователей не трогаются, но строка с номером из таблицы считается", () => {
@@ -211,11 +218,13 @@ test("переименованные при конфликте записи: п�
       assistant("Файл " + OUT + KEY + "/report.pdf. Готово"),
     ),
     rules({
-      outNames: ["report.pdf", "report.pdf.bak", "sub", "a", "a b.txt"],
-      outRenames: new Map([["report.pdf", "report (прежний).pdf"], ["sub", "sub (прежний)"], ["a", "a (прежний)"]]),
+      own: {
+        outNames: ["report.pdf", "report.pdf.bak", "sub", "a", "a b.txt"],
+        outRenames: new Map([["report.pdf", "report (прежний).pdf"], ["sub", "sub (прежний)"], ["a", "a (прежний)"]]),
+      },
     }),
   );
-  assert.deepEqual(parsed(r.out).map((e) => e.message.content[0].text), [
+  assert.deepEqual(texts(r), [
     OUT + FSKEY + "/report (прежний).pdf",
     OUT + FSKEY + "/report.pdf.bak",
     OUT + FSKEY + "/report.pdf.old",
@@ -226,33 +235,121 @@ test("переименованные при конфликте записи: п�
   ]);
 });
 
-test("пути загрузок → <fs_key>_<имя>, переименованная при конфликте — на итоговое имя", () => {
+test("граница имени: » ! ” … и точка в конце фразы после папки — не продолжение имени", () => {
+  const r = scrubContent(
+    jsonl(
+      assistant("Папка " + OUT + KEY + "."),
+      assistant("Файл «" + OUT + KEY + "/report.pdf»"),
+      assistant(OUT + KEY + "/report.pdf!"),
+      assistant("“" + OUT + KEY + "/report.pdf”"),
+      assistant(OUT + KEY + "/report.pdf…"),
+    ),
+    rules({ own: { outNames: ["report.pdf"], outRenames: new Map([["report.pdf", "report (прежний).pdf"]]) } }),
+  );
+  assert.deepEqual(texts(r), [
+    "Папка " + OUT + FSKEY + ".",
+    "Файл «" + OUT + FSKEY + "/report (прежний).pdf»",
+    OUT + FSKEY + "/report (прежний).pdf!",
+    "“" + OUT + FSKEY + "/report (прежний).pdf”",
+    OUT + FSKEY + "/report (прежний).pdf…",
+  ]);
+  assert.equal(r.counts.other, 0);
+});
+
+test("пути загрузок → <fs_key>_<имя>; переименованная — на итоговое; незнакомая в корне загрузок — тоже под fs_key", () => {
   const listing =
     "User uploaded files:\n- " + UP + KEY + "_doc.pdf (name: doc.pdf, 10 bytes)\n" +
     "- " + UP + KEY + "_scan.png (name: scan.png, 5 bytes)\n\n" + turn("Посмотри");
   const r = scrubContent(
-    jsonl(user(listing), toolUse("Read", { file_path: UP + KEY + "_scan.png" })),
-    rules({ upRests: ["doc.pdf", "scan.png"], upRenames: new Map([["scan.png", "scan (прежний).png"]]) }),
+    jsonl(user(listing), toolUse("Read", { file_path: UP + KEY + "_scan.png" }), assistant(UP + KEY + "_old.pdf")),
+    rules({ own: { upRests: ["doc.pdf", "scan.png"], upRenames: new Map([["scan.png", "scan (прежний).png"]]) } }),
   );
-  assert.equal(r.counts.uploads, 3);
+  assert.equal(r.counts.uploads, 4);
   assert.equal(r.counts.phrase, 1);
-  const [a, b] = parsed(r.out);
+  const [a, b, c] = parsed(r.out);
   assert.ok(a.message.content.includes("- " + UP + FSKEY + "_doc.pdf (name: doc.pdf, 10 bytes)\n"));
   assert.ok(a.message.content.includes("- " + UP + FSKEY + "_scan (прежний).png (name: scan.png, 5 bytes)\n"));
   assert.equal(b.message.content[0].input.file_path, UP + FSKEY + "_scan (прежний).png");
+  assert.equal(c.message.content[0].text, UP + FSKEY + "_old.pdf");
   assert.ok(!r.out.includes(PHONE));
 });
 
-test("старая папка двухчастного ключа не захватывает имена трёхчастного", () => {
-  const key2 = PHONE + "_14";
+test("папки и загрузки других сессий того же номера → их fs_key, с их переименованиями", () => {
   const r = scrubContent(
-    jsonl(assistant(OUT + key2 + "/a.txt"), assistant(OUT + key2 + "_ru/b.txt")),
-    rules({ oldDir: key2 }),
+    jsonl(assistant(OUT + KEY2 + "/x.pdf"), assistant(UP + KEY2 + "_doc.pdf"), assistant(OUT + KEY + "/y.pdf")),
+    rules({ dirs: [[KEY2, { fsKey: FSKEY2, outNames: ["x.pdf"], outRenames: new Map([["x.pdf", "x (прежний).pdf"]]), upRests: [], upRenames: new Map() }]] }),
   );
-  const [a, b] = parsed(r.out).map((e) => e.message.content[0].text);
-  assert.equal(a, OUT + FSKEY + "/a.txt");
-  assert.ok(!b.startsWith(OUT + FSKEY + "/"), "чужая папка не стала папкой этой сессии");
-  assert.ok(!b.includes(PHONE));
+  assert.deepEqual(texts(r), [OUT + FSKEY2 + "/x (прежний).pdf", UP + FSKEY2 + "_doc.pdf", OUT + FSKEY + "/y.pdf"]);
+});
+
+test("старая папка двухчастного ключа не съедает имена трёхчастного; незнакомое имя теряет только номер", () => {
+  const key14 = PHONE + "_14";
+  const r = scrubContent(
+    jsonl(assistant(OUT + key14 + "/a.txt"), assistant(OUT + KEY + "/b.txt"), assistant(OUT + PHONE + "_14_xx/c.txt")),
+    sessionRules({
+      phone: PHONE, fsKey: FSKEY2,
+      dirs: new Map([[key14, { fsKey: FSKEY2 }], [KEY, { fsKey: FSKEY }]]),
+      uploadsRoot: UP.slice(0, -1), tablePhones: new Set([PHONE]),
+    }),
+  );
+  const [a, b, c] = texts(r);
+  assert.equal(a, OUT + FSKEY2 + "/a.txt");
+  assert.equal(b, OUT + FSKEY + "/b.txt");
+  assert.ok(!c.startsWith(OUT + FSKEY2 + "/") && !c.includes(PHONE), c);
+});
+
+test("папка, которая не переносится (общая, без fs_key), и сирота на диске — пути как есть; строка и userId меняются", () => {
+  const sharedKey = PHONE + "_custom_0b7c9d1e-5a2f-4c3b-9e8d-7f6a5b"; // 48 знаков — общая для _ru и _en
+  const r = scrubContent(
+    jsonl(
+      user("Output directory for created files: " + OUT + sharedKey + "\n\n" + OLD() + "\n\nОтвечай по-русски.\n\nТекст"),
+      toolUse("mcp__linkeon__read_calendar", { userId: PHONE }),
+      assistant(UP + sharedKey + "_doc.pdf и " + OUT + PHONE + "_99_ru/q.txt"),
+    ),
+    sessionRules({
+      phone: PHONE, fsKey: FSKEY,
+      dirs: new Map([[sharedKey, { fsKey: null }]]),
+      keep: new Set([PHONE + "_99_ru"]),
+      uploadsRoot: UP.slice(0, -1), tablePhones: new Set([PHONE]),
+    }),
+  );
+  assert.deepEqual(r.counts, { phrase: 1, dirs: 0, uploads: 0, other: 1, kept: 3 });
+  const [a, b, c] = parsed(r.out);
+  assert.ok(a.message.content.startsWith("Output directory for created files: " + OUT + sharedKey + "\n\n" + NEW));
+  assert.equal(b.message.content[0].input.userId, FSKEY);
+  assert.equal(c.message.content[0].text, UP + sharedKey + "_doc.pdf и " + OUT + PHONE + "_99_ru/q.txt");
+});
+
+test("номер в имени файла внутри переносимой папки остаётся: имя на диске то же", () => {
+  const name = "dogovor_" + PHONE + ".pdf";
+  const r = scrubContent(jsonl(assistant(OUT + KEY + "/" + name)), rules({ own: { outNames: [name] } }));
+  assert.equal(texts(r)[0], OUT + FSKEY + "/" + name);
+  assert.deepEqual(r.counts, { ...ZERO, dirs: 1, kept: 1 });
+});
+
+test("блоки рассуждений не трогаются (подпись сверяется с текстом); блок с номером считается", () => {
+  const thinking = { type: "thinking", thinking: "Номер " + PHONE + ", папка " + OUT + KEY, signature: "EqQBCkYIBRgCKkB" };
+  const redacted = { type: "redacted_thinking", data: "c2VjcmV0" };
+  const ev = assistant("");
+  ev.message.content = [thinking, redacted, { type: "text", text: "Номер " + PHONE }];
+  const line = JSON.stringify(ev);
+  const r = scrubContent(Buffer.from(line + "\n"), rules());
+  assert.equal(r.thinkingWithPhone, 1);
+  assert.deepEqual(r.counts, { ...ZERO, other: 1 });
+  const out = r.out.toString("utf8");
+  assert.ok(out.includes(JSON.stringify(thinking)), "блок рассуждений — байт в байт");
+  assert.ok(out.includes(JSON.stringify(redacted)));
+  assert.equal(JSON.parse(out).message.content[2].text, "Номер " + FSKEY);
+});
+
+test("ключи JSON с номером (trackedFileBackups) не меняются — считаются", () => {
+  const snapshot = {
+    type: "file-history-snapshot", messageId: "m1",
+    snapshot: { trackedFileBackups: { [OUT + KEY + "/report.pdf"]: { backupFileName: "a1b2@v1", version: 1 } } },
+  };
+  const r = scrubContent(jsonl(snapshot), rules());
+  assert.equal(r.out, null);
+  assert.equal(r.keysWithPhone, 1);
 });
 
 test("строка в виде JSON.stringify меняется только в заменах: порядок ключей, U+2028, суррогаты, числа — те же байты", () => {
@@ -287,18 +384,18 @@ test("строка в виде JSON.stringify меняется только в �
   assert.ok(line.startsWith('{"2":'));
 
   const r = scrubContent(Buffer.from(line + "\n"), rules());
-  assert.deepEqual(r.counts, { phrase: 1, dirs: 1, uploads: 0, other: 1 });
+  assert.deepEqual(r.counts, { ...ZERO, phrase: 1, dirs: 1, other: 1 });
   assert.equal(r.nonCanonicalLines, 0);
   const expected = line.replace(OLD(), NEW).replace(OUT + KEY, OUT + FSKEY).replace("userId=" + PHONE, "userId=" + FSKEY);
   assert.equal(r.out.toString("utf8"), expected + "\n");
 });
 
-test("строка не в виде JSON.stringify: замена есть, JSON валиден, строка посчитана отдельно", () => {
+test("строка не в виде JSON.stringify не пишется: остаётся как была, считается, замены в ней не засчитаны", () => {
   const line = '{"type": "user", "message": {"role": "user", "content": "' + OLD() + '"}}';
-  const r = scrubContent(Buffer.from(line + "\n"), rules());
-  assert.equal(r.counts.phrase, 1);
+  const r = scrubContent(Buffer.from(line + "\n" + JSON.stringify(assistant("номер " + PHONE)) + "\n"), rules());
   assert.equal(r.nonCanonicalLines, 1);
-  assert.deepEqual(JSON.parse(lines(r.out)[0]), { type: "user", message: { role: "user", content: NEW } });
+  assert.deepEqual(r.counts, { ...ZERO, other: 1 });
+  assert.equal(lines(r.out)[0].toString("utf8"), line);
 });
 
 test("битая строка остаётся как есть и считается, с номером — отдельно; остальной файл обрабатывается", () => {
@@ -327,7 +424,7 @@ test("ведущие NUL (CLI их пропускает при чтении) и 
 
 test("пустые строки и транскрипт без номера: ничего не считается битым, писать нечего", () => {
   const r = scrubContent(Buffer.from("\n" + JSON.stringify(assistant("ок")) + "\n\n   \n"), rules());
-  assert.deepEqual(r.counts, { phrase: 0, dirs: 0, uploads: 0, other: 0 });
+  assert.deepEqual(r.counts, ZERO);
   assert.equal(r.brokenLines, 0);
   assert.equal(r.out, null);
 });
