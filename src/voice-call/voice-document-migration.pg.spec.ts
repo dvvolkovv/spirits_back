@@ -327,6 +327,48 @@ maybe('перенос голосовых документов против жи�
     expect(store.has(oldKey(UUID_USER, DOC_B))).toBe(true);
   });
 
+  // Повторное ревью: кандидаты — и из «copied», не только из «replaced»:
+  // документ, скопированный при пропущенной строке, доводит следующий
+  // --apply, и удалить его старый объект можно по первому журналу. Проверки
+  // перед удалением те же.
+  it('--delete-old берёт кандидатов и из «copied»: после доводки — удаляет по первому журналу', async () => {
+    const events: string[] = [];
+    const store = memStore(events);
+    await seed(store);
+    let touched = false;
+    const racing = pgOf(events, async (sql, params) => {
+      if (!touched && /UPDATE custom_chat_history/.test(sql)) {
+        touched = true;
+        await pool.query(`UPDATE custom_chat_history SET content = content || ' (правка)' WHERE id = $1`, [params[1]]);
+      }
+    });
+    const first: DocJournalEntry[] = [];
+    await runDocumentMigration({ pg: racing, store, apply: true, journal: (e) => first.push(e), log: () => {} });
+    expect(first.filter((e) => e.kind === 'replaced').map((e) => e.from)).toEqual([oldKey(UUID_USER, DOC_B)]);
+    await apply(events, store);
+
+    const r = await deleteOldDocuments({ pg: pgOf(events), store, entries: first, journal: () => {}, log: () => {} });
+
+    expect(r).toEqual({ deleted: 2, alreadyGone: 0, kept: 0 });
+    expect(store.has(oldKey(PHONE, DOC_A))).toBe(false);
+    expect(store.has(oldKey(UUID_USER, DOC_B))).toBe(false);
+  });
+
+  it('--delete-old: кандидат из «copied», на который ещё есть ссылка, — остаётся', async () => {
+    const events: string[] = [];
+    const store = memStore(events);
+    await seed(store);
+    await chat(`${UUID_USER}_17`, `свежая ссылка ${urlOf(oldKey(UUID_USER, DOC_B))}`, '5 minutes');
+    const journal: DocJournalEntry[] = [];
+    await apply(events, store, journal);
+
+    const r = await deleteOldDocuments({ pg: pgOf(events), store, entries: journal, journal: () => {}, log: () => {} });
+
+    expect(r).toEqual({ deleted: 1, alreadyGone: 0, kept: 1 });
+    expect(store.has(oldKey(PHONE, DOC_A))).toBe(false);
+    expect(store.has(oldKey(UUID_USER, DOC_B))).toBe(true);
+  });
+
   // Ревью ветки, m6: фронт сверяет ленту с историей посимвольно, и свежую
   // строку держит открытая вкладка — как у переноса ссылок релея.
   it('строки истории моложе часа не трогаются, и их документ не попадает в «можно удалять»', async () => {
