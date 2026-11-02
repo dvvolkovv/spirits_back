@@ -100,3 +100,9 @@ ssh -n dv@85.192.61.231 "cd ~/ci/wt/sce-back && git fetch -q origin && git check
 - `npx jest src/common src/insights src/monitoring src/tg-bot src/chat src/guest-trial`: Test Suites 186 passed, 10 skipped; Tests 2479 passed, 71 skipped.
 - `npx tsc -p tsconfig.build.json --noEmit`: TSC_OK.
 - Воркдерево на ноде `~/ci/wt/sce-back` создано (npm ci, tests/npm ci).
+
+## Task 5 — прогоны (02.11, ветка 1c2c2fde против main 0b5cf878)
+
+- Полный `npx jest src/`: main 501/536 наборов, 7799 тестов; ветка 503/538, 7902 теста; падений 0 и там и там. `tests/unit` (после `npm run build`): 108/108 обе. tsc и сборка — OK обе.
+- Живая проверка `scripts/llm-fallback-check.js` на сборке ветки, ключи Kimi и Qwen через stdin: 8/8 OK (Qwen выключен → Kimi json/stream+Read/картинка; выбран Kimi; выбран Kimi с битым ключом → Claude, ошибка цепочки безопасна; Claude → Qwen; Claude → Qwen (битый) → Kimi; noFallback → Claude). В журнале — `claude CLI код выхода 1: auth, status 401 (stdout 1319 байт, stderr 75 байт)`, переходы `… (auth): claude CLI код выхода 1: auth, …`; сырого текста API нет; текст отказа CLI «Not logged in · Please run /login» — в детали, как задумано.
+
