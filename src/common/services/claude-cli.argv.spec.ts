@@ -413,7 +413,7 @@ describe('ClaudeCliService argv: MCP-серверы на вызов', () => {
       setImmediate(() => on['error']?.(new Error('spawn ENOENT')));
       return proc;
     });
-    await expect(new ClaudeCliService().text('x', { mcpServers: servers() })).rejects.toThrow(/spawn error/);
+    await expect(new ClaudeCliService().text('x', { mcpServers: servers() })).rejects.toThrow(/^claude CLI не запустился/);
     expect(seen.cfgPath).toBeTruthy();
     expect(fs.existsSync(seen.cfgPath)).toBe(false);
   });

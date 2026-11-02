@@ -1,3 +1,5 @@
+import * as os from 'os';
+import * as path from 'path';
 import { Logger } from '@nestjs/common';
 
 // Мокаем spawn ДО импорта сервиса: сервис берёт spawn из 'child_process' на
@@ -12,7 +14,8 @@ import { ClaudeCliCallError, ClaudeCliService } from './claude-cli.service';
  * сообщение JSON.parse (оно цитирует начало stdout) — несёт фрагменты
  * разговоров. Он только классифицируется внутри сервиса; наружу — в message,
  * stack и журналы — уходят вид сбоя, код ответа API, код выхода, диагностика
- * CLI и текст отказа самого CLI.
+ * CLI и отказ самого CLI (фраза и хвост из белого списка, refusalDetail).
+ * Ошибка без признаков (не от CLI) — other без доступа, текст по её коду.
  */
 
 const spawnMock = spawn as unknown as jest.Mock;
@@ -20,7 +23,12 @@ const spawnMock = spawn as unknown as jest.Mock;
 /** Маркер «фрагмента разговора» в сыром выводе CLI. Проверка — по первому
  *  слову: сообщение JSON.parse цитирует начало вывода и может его обрезать. */
 const SECRET = 'СЕКРЕТ-ИЗ-ОТВЕТА';
-const LEAK = /СЕКРЕТ/;
+/** Латинский маркер — для хвоста после фразы отказа: текст с кириллицей
+ *  looksLikeCliRefusal отказом не считает, и до детали он не дошёл бы. */
+const LATIN = 'SECRET-FROM-ANSWER';
+const LEAK = /СЕКРЕТ|SECRET/;
+/** Фраза отказа CLI с начала, дальше — ответ модели (ревью 02.11, I1). */
+const REFUSAL_WITH_ANSWER = `Invalid API key means the token ${LATIN} is wrong`;
 
 /** Фейковый процесс: на следующем тике отдаёт stdout и stderr и закрывается с кодом code. */
 function fakeProc(stdout: string, code = 0, stderr = '') {
@@ -45,6 +53,37 @@ function fakeProc(stdout: string, code = 0, stderr = '') {
 function hangingProc() {
   return { stdout: { on: () => {} }, stderr: { on: () => {} }, on: () => {}, kill: () => {} } as any;
 }
+
+/** Висит до kill(); после kill закрывается сигналом, как настоящий процесс. */
+function killableProc() {
+  const on: Record<string, (...a: any[]) => void> = {};
+  return {
+    stdout: { on: () => {} },
+    stderr: { on: () => {} },
+    on: (e: string, cb: any) => { on[e] = cb; },
+    kill: (sig?: string) => { setImmediate(() => on['close']?.(null, sig ?? 'SIGTERM')); },
+  } as any;
+}
+
+/** Процесс, убитый сигналом извне (OOM, kill): close(null, сигнал) без вывода. */
+function signalProc(signal: string) {
+  const on: Record<string, (...a: any[]) => void> = {};
+  const proc: any = {
+    stdout: { on: () => {} },
+    stderr: { on: () => {} },
+    on: (e: string, cb: any) => { on[e] = cb; },
+    kill: () => {},
+  };
+  setImmediate(() => on['close']?.(null, signal));
+  return proc;
+}
+
+/** Синхронный отказ spawn, как у Node 22 при NUL в аргументе: сообщение
+ *  цитирует начало аргумента — у нас это промпт. */
+const argNulError = (quoted: string) =>
+  Object.assign(new TypeError(`The argument 'args[1]' must be a string without null bytes. Received '${quoted}'`), {
+    code: 'ERR_INVALID_ARG_VALUE',
+  });
 
 /** Процесс, который не запустился (событие error, как у spawn без бинаря). */
 function spawnErrorProc(code: string) {
@@ -124,6 +163,14 @@ describe('ClaudeCliService — сырой текст сбоя не выходи�
     ['stream: ответ модели в NDJSON хода, код 1 без result', STREAM, () => fakeProc(lines({ type: 'assistant', message: { content: [{ type: 'text', text: SECRET }] } }), 1)],
     ['stream: errors[] (error_during_execution, код 1)', STREAM, () => fakeProc(lines({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: [DIAG, `Error: ${SECRET}`] }), 1)],
     ['stream: диагностика с маркером не проходит строгую проверку', STREAM, () => fakeProc(lines({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: [`[ede_diagnostic] a=${SECRET}`] }), 0)],
+    // Ревью 02.11, I1: фраза отказа CLI с начала, дальше — латинский текст ответа.
+    ['json: отказ CLI с хвостом ответа модели (is_error, код 0)', {}, () => fakeProc(JSON.stringify({ is_error: true, result: REFUSAL_WITH_ANSWER }), 0)],
+    ['json: отказ CLI с хвостом ответа модели (is_error, код 1)', {}, () => fakeProc(JSON.stringify({ is_error: true, result: REFUSAL_WITH_ANSWER }), 1)],
+    ['json: отказ CLI с хвостом в stderr (код 1)', {}, () => fakeProc('', 1, `Not logged in ${LATIN}`)],
+    ['stream: отказ CLI с хвостом ответа модели (is_error, код 0)', STREAM, () => fakeProc(lines({ type: 'result', is_error: true, result: REFUSAL_WITH_ANSWER }), 0)],
+    ['stream: отказ CLI с хвостом ответа модели (is_error, код 1)', STREAM, () => fakeProc(lines({ type: 'result', is_error: true, result: REFUSAL_WITH_ANSWER }), 1)],
+    // Ревью 02.11, I2: синхронный отказ spawn цитирует начало промпта.
+    ['spawn: синхронный отказ (NUL в аргументе)', {}, () => { throw argNulError(`${SECRET} ${LATIN}`); }],
   ];
 
   it.each(LEAKS)('%s — маркера нет ни в message, ни в stack, ни в журнале', async (_name, opts, make) => {
@@ -228,11 +275,11 @@ describe('ClaudeCliService — признаки сбоя (kind, access, status, 
     expect(err.message).toBe('claude CLI timeout after 5ms');
   });
 
-  it('процесс не запустился — other, без доступа; текст прежний', async () => {
+  it('процесс не запустился (событие error) — other, без доступа; в тексте только код', async () => {
     const err = await failOnce(() => spawnErrorProc('ENOENT'));
     expect(err).toBeInstanceOf(ClaudeCliCallError);
     expect(err).toMatchObject({ kind: 'other', access: false });
-    expect(err.message).toBe('claude CLI spawn error: spawn /usr/bin/claude ENOENT');
+    expect(err.message).toBe('claude CLI не запустился (ENOENT): other');
   });
 
   it('неверный JSON — other, без доступа, даже если в выводе «401»', async () => {
@@ -256,10 +303,15 @@ describe('ClaudeCliService — признаки сбоя (kind, access, status, 
     expect(err.message).toBe(`claude CLI ошибка: other, status 500, ${DIAG}`);
   });
 
-  it('отказ CLI в is_error — текст отказа в message (его пишет CLI, в нём время сброса)', async () => {
-    const err = await failOnce(() => fakeProc(JSON.stringify({ is_error: true, result: "You've hit your weekly limit · resets Nov 3" }), 0));
-    expect(err).toMatchObject({ kind: 'weekly_limit', access: true });
-    expect(err.message).toBe("claude CLI ошибка: weekly_limit, You've hit your weekly limit · resets Nov 3");
+  it.each([
+    ["You've hit your limit · resets 3pm (Europe/Moscow)", 'weekly_limit', "You've hit your limit · resets 3pm (Europe/Moscow)"],
+    // Дата сброса в белый список не входит — только фраза.
+    ["You've hit your weekly limit · resets Nov 3", 'weekly_limit', "You've hit your weekly limit"],
+    [REFUSAL_WITH_ANSWER, 'auth', 'Invalid API key'],
+  ])('отказ CLI в is_error — в message только фраза и хвост из белого списка: %p', async (result, kind, detail) => {
+    const err = await failOnce(() => fakeProc(JSON.stringify({ is_error: true, result }), 0));
+    expect(err).toMatchObject({ kind, access: true });
+    expect(err.message).toBe(`claude CLI ошибка: ${kind}, ${detail}`);
   });
 
   it('отказ CLI при коде 1 (stream) — текст отказа в message', async () => {
@@ -268,19 +320,17 @@ describe('ClaudeCliService — признаки сбоя (kind, access, status, 
     expect(err.message).toBe('claude CLI код выхода 1: auth, Not logged in · Please run /login');
   });
 
-  it('отказ CLI обычным ответом — weekly_limit, доступ, refusal; текст отказа в message', async () => {
+  it('отказ CLI обычным ответом — сбой доступа: переход на запасного, окно Claude; в журнале вид и фраза', async () => {
     process.env.QWEN_FALLBACK_API_KEY = 'sk-sp-test';
-    // Ошибку попытки видит только сам сервис: при ответе следующей модели
-    // наружу она не выходит. Решение о повторе (mayRetry) получает её первой.
-    const attempt = jest.spyOn(ClaudeCliService.prototype as any, 'mayRetry');
     spawnMock
       .mockImplementationOnce(() => fakeProc(OK("You've hit your limit · resets 3pm", 0)))
       .mockImplementationOnce(() => fakeProc(OK('q')));
-    expect(await new ClaudeCliService().text('x')).toBe('q');
-    const err = attempt.mock.calls[0][0] as ClaudeCliCallError;
-    expect(err).toBeInstanceOf(ClaudeCliCallError);
-    expect(err).toMatchObject({ kind: 'weekly_limit', access: true, refusal: true });
-    expect(err.message).toBe("claude CLI отказ: weekly_limit, You've hit your limit · resets 3pm");
+    const svc = new ClaudeCliService();
+    expect(await svc.text('x')).toBe('q');
+    expect(svc.fallbackStats().breakerOpenUntil).toBeGreaterThan(0);
+    expect(logged()).toContain(
+      "claude CLI → запасной Qwen qwen3.6-flash (weekly_limit): claude CLI отказ: weekly_limit, You've hit your limit · resets 3pm",
+    );
   });
 
   it('ClaudeCliCallError без признаков — поля не заданы; с признаками — читаются', () => {
@@ -359,7 +409,7 @@ describe('ClaudeCliService — цепочка при сырых текстах �
     const err = await new ClaudeCliService().text('x', { timeoutMs: 50 }).catch((e) => e);
     expect(err).toBeInstanceOf(ClaudeCliCallError);
     expect(err.message).toMatch(
-      /^claude CLI ошибка: weekly_limit, You've hit your weekly limit · resets Nov 3 \| qwen fallback: claude CLI timeout after \d+ms$/,
+      /^claude CLI ошибка: weekly_limit, You've hit your weekly limit \| qwen fallback: claude CLI timeout after \d+ms$/,
     );
     expect(err).toMatchObject({ kind: 'weekly_limit', access: true });
     expect(spawnMock).toHaveBeenCalledTimes(2); // таймаут Qwen — не сбой доступа, Kimi не пробуется
@@ -417,12 +467,92 @@ describe('ClaudeCliService — цепочка при сырых текстах �
     expect(logged().join('\n')).not.toMatch(LEAK);
   });
 
-  it('ошибка без признаков (не от CLI) — по тексту, как раньше', async () => {
+  it('синхронный отказ spawn (NUL в аргументе) — «не запустился» по коду, без перехода; цитата промпта не выходит', async () => {
     delete process.env.KIMI_FALLBACK_API_KEY;
     spawnMock
-      .mockImplementationOnce(() => { throw new Error('API Error: 429 Too Many Requests'); })
+      .mockImplementationOnce(() => { throw argNulError(`API Error: 429 Too Many Requests ${SECRET}`); })
       .mockImplementationOnce(() => fakeProc(OK('q')));
-    expect(await new ClaudeCliService().text('x')).toBe('q');
-    expect(tokenOf(1)).toBe('sk-sp-test');
+    const err = await new ClaudeCliService().text('x').catch((e) => e);
+    expect(err).toBeInstanceOf(ClaudeCliCallError);
+    expect(err).toMatchObject({ message: 'claude CLI не запустился (ERR_INVALID_ARG_VALUE): other', kind: 'other', access: false });
+    // «429» в цитате аргумента — не сбой доступа: на запасного не переходим.
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(String(err.stack)).not.toMatch(LEAK);
+    expect(logged().join('\n')).not.toMatch(LEAK);
   });
+
+  it('ошибка без признаков (подготовка вызова, не CLI) — other без доступа, текст по коду, без перехода', async () => {
+    delete process.env.KIMI_FALLBACK_API_KEY;
+    const svc = new ClaudeCliService();
+    // Каталога нет: mkdtemp для копий вложений падает с ENOENT, а его
+    // сообщение цитирует путь — здесь в пути маркер.
+    (svc as any).tmpRoot = () => path.join(os.tmpdir(), `нет-такого-каталога-${SECRET}`);
+    const err = await svc.text('x', { attachments: [__filename] }).catch((e) => e);
+    expect(err).toBeInstanceOf(ClaudeCliCallError);
+    expect(err).toMatchObject({ message: 'claude CLI сбой (ENOENT): other', kind: 'other', access: false });
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(String(err.stack)).not.toMatch(LEAK);
+    expect(logged().join('\n')).not.toMatch(LEAK);
+  });
+
+  it('отказ обычным ответом с хвостом ответа модели — в склейке и журнале только фраза', async () => {
+    delete process.env.KIMI_FALLBACK_API_KEY;
+    spawnMock
+      .mockImplementationOnce(() => fakeProc(OK(REFUSAL_WITH_ANSWER, 0)))
+      .mockImplementationOnce(() => fakeProc(RAW_401('qwen'), 1));
+    const err = await new ClaudeCliService().text('x').catch((e) => e);
+    expect(err).toBeInstanceOf(ClaudeCliCallError);
+    expect(err.message).toBe('claude CLI отказ: auth, Invalid API key | qwen fallback: claude CLI код выхода 1: auth, status 401');
+    expect(err).toMatchObject({ kind: 'auth', access: true });
+    expect(String(err.stack)).not.toMatch(LEAK);
+    const log = logged();
+    expect(log).toContain('claude CLI → запасной Qwen qwen3.6-flash (auth): claude CLI отказ: auth, Invalid API key');
+    expect(log.join('\n')).not.toMatch(LEAK);
+  });
+
+  it('итоговая ошибка: toolUsed — хоть одна попытка с инструментом с последствиями', async () => {
+    spawnMock.mockImplementationOnce(() => fakeProc(lines(
+      { type: 'assistant', message: { content: [{ type: 'tool_use', name: 'mcp__products__manage_product', input: {} }] } },
+      { type: 'result', is_error: true, result: `API Error: 500 ${SECRET}` },
+    ), 1));
+    const err = await new ClaudeCliService().text('x', { ...STREAM, provider: 'kimi' }).catch((e) => e);
+    expect(err).toBeInstanceOf(ClaudeCliCallError);
+    expect(err.message).toBe('kimi (выбран): claude CLI код выхода 1: other');
+    expect(err).toMatchObject({ toolUsed: true, kind: 'other', access: false });
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('ClaudeCliService — запуск процесса: NUL, сигналы, закрытие после таймаута', () => {
+  it('NUL в промпте и системе вычищается до spawn', async () => {
+    const NUL = String.fromCharCode(0);
+    spawnMock.mockImplementationOnce(() => fakeProc(OK('ок')));
+    expect(await new ClaudeCliService().text(`при${NUL}вет`, { system: `сис${NUL}тема`, noFallback: true })).toBe('ок');
+    const args: string[] = spawnMock.mock.calls[0][1];
+    expect(args.some((a) => a.includes(NUL))).toBe(false);
+    const prompt = args[args.indexOf('-p') + 1];
+    expect(prompt).toContain('привет');
+    expect(prompt).toContain('система');
+  });
+
+  it.each([['json', {}], ['stream', STREAM]] as Array<[string, object]>)(
+    '%s: процесс убит сигналом — в тексте имя сигнала, а не «код null»',
+    async (_mode, opts) => {
+      const err = await failOnce(() => signalProc('SIGKILL'), opts);
+      expect(err).toMatchObject({ message: 'claude CLI сигнал SIGKILL: other', kind: 'other', access: false });
+      expect(logged()).toContain('claude CLI сигнал SIGKILL: other (stdout 0 байт, stderr 0 байт)');
+    },
+  );
+
+  it.each([['json', {}], ['stream', STREAM]] as Array<[string, object]>)(
+    '%s: после таймаута закрытие процесса второй записи в журнал не делает',
+    async (_mode, opts) => {
+      const err = await failOnce(() => killableProc(), { ...opts, timeoutMs: 5 });
+      expect(err.message).toBe('claude CLI timeout after 5ms');
+      // close приходит после kill — на следующем обороте цикла событий.
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+      expect(logged()).toEqual([]);
+    },
+  );
 });
