@@ -17,6 +17,11 @@
 import 'dotenv/config';
 import { Client } from 'pg';
 import { listVoiceIds, renameVoices } from '../src/voice-avatar/rename-voices';
+import { scriptErrorText } from '../src/common/one-off-script';
+
+// Файлов скрипт не пишет, но правило для разовых скриптов спеки одно: всё,
+// что они создают, — только владельцу.
+process.umask(0o077);
 
 async function main() {
   const apply = process.argv.slice(2).includes('--apply');
@@ -37,8 +42,8 @@ async function main() {
   }
 }
 
-// Только сообщение: у ошибки axios в config лежат заголовки запроса с ключом.
+// Только сообщение и код: у ошибки axios в config лежат заголовки запроса с ключом.
 main().catch((e) => {
-  console.error(String(e?.message || e));
+  console.error(scriptErrorText(e));
   process.exit(1);
 });

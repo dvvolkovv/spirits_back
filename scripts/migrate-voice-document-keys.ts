@@ -21,7 +21,8 @@
  * ~/voice-document-keys-<метка>.jsonl, по строке на копию, замену в строке
  * базы и удаление объекта; только места и ключи, без текстов. Он же — вход
  * для --revert: откат возвращает удалённые объекты копией с нового ключа и
- * прежние адреса.
+ * прежние адреса. Журнал — с правами 600 (umask 077); удалить его после окна
+ * отката.
  */
 import 'dotenv/config';
 import * as fs from 'fs';
@@ -34,6 +35,10 @@ import {
   revertDocumentMigration,
   runDocumentMigration,
 } from '../src/voice-call/voice-document-migration';
+import { appendPrivateLine, requireRelayFsSalt, scriptErrorText } from '../src/common/one-off-script';
+
+// В журнале — ключи с номерами: всё, что создаёт скрипт, — только владельцу.
+process.umask(0o077);
 
 async function main() {
   const args = process.argv.slice(2);
@@ -60,6 +65,8 @@ async function main() {
     }
 
     const apply = args.includes('--apply');
+    // Солёный хэш — только на RELAY_FS_SALT, как у приложения; без неё — отказ.
+    requireRelayFsSalt();
     const journalPath = path.join(
       process.env.BACKFILL_JOURNAL_DIR || os.homedir(),
       `voice-document-keys-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`,
@@ -68,7 +75,7 @@ async function main() {
       pg,
       store: storage,
       apply,
-      journal: (e) => fs.appendFileSync(journalPath, JSON.stringify(e) + '\n'),
+      journal: (e) => appendPrivateLine(journalPath, JSON.stringify(e)),
       log: (m) => console.log(m),
     });
     console.log(JSON.stringify(r));
@@ -78,7 +85,8 @@ async function main() {
   }
 }
 
+// Только сообщение и код: у ошибок S3 в объекте метаданные запроса.
 main().catch((e) => {
-  console.error(e);
+  console.error(scriptErrorText(e));
   process.exit(1);
 });

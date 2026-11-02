@@ -1,6 +1,7 @@
 // src/chat/chat-files/backfill.ts
 import { collectRelayUrls, escapeRe, replaceUrls } from './relay-links';
 import { relayFilesPrefix } from './file-meta';
+import { writePrivateFile } from '../../common/one-off-script';
 
 /**
  * Разовый перенос ссылок релея в истории (custom_chat_history).
@@ -115,6 +116,18 @@ function unmaskRelayPath(text: string, pathTo: string, pathFrom: string): string
 
 /** Срок на один файл при переносе — 5 минут на всё скачивание. */
 export const BACKFILL_FILE_TIMEOUT_MS = 300_000;
+
+/**
+ * Список мёртвых адресов — рядом с журналом (`.missing.txt`), только при
+ * --apply и с правами 600: в адресах номера. Сухой прогон — только счётчики.
+ * null — файла нет.
+ */
+export function saveMissingList(apply: boolean, journalPath: string, missingUrls: string[]): string | null {
+  if (!apply) return null;
+  const file = journalPath.replace(/\.jsonl$/, '.missing.txt');
+  writePrivateFile(file, missingUrls.length > 0 ? missingUrls.join('\n') + '\n' : '');
+  return file;
+}
 
 /**
  * Адрес файла релея без идентификатора пользователя: номер (или uuid) в

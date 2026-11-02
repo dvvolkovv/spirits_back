@@ -30,7 +30,9 @@
  * storedUrl, адрес без номера — maskedUrl) и на путь релея в строке
  * (pathFrom → pathTo). Он же — вход для --revert. Каталог
  * можно сменить через BACKFILL_JOURNAL_DIR. Список мёртвых адресов — рядом,
- * в .missing.txt: в нём номера, в консоль он не печатается.
+ * в .missing.txt, только при --apply: в нём номера, в консоль он не
+ * печатается. Журнал и список — с правами 600 (umask 077); удалить их после
+ * окна отката.
  */
 import 'dotenv/config';
 import * as fs from 'fs';
@@ -42,7 +44,12 @@ import { StorageService } from '../src/common/services/storage.service';
 import { ChatFileStore } from '../src/chat/chat-files/chat-file-store';
 import { relayRequestUrl } from '../src/chat/chat-files/file-meta';
 import { relayFsKey } from '../src/chat/linkeon-relay-fields';
-import { JournalEntry, ProbeResult, revertBackfill, runBackfill } from '../src/chat/chat-files/backfill';
+import { JournalEntry, ProbeResult, revertBackfill, runBackfill, saveMissingList } from '../src/chat/chat-files/backfill';
+import { appendPrivateLine, requireRelayFsSalt, scriptErrorText } from '../src/common/one-off-script';
+
+// Журнал и список мёртвых адресов — с номерами: всё, что создаёт скрипт, —
+// только владельцу.
+process.umask(0o077);
 
 async function main() {
   const args = process.argv.slice(2);
@@ -64,11 +71,9 @@ async function main() {
     }
 
     const apply = args.includes('--apply');
-    // Солёный хэш — той же функцией и с тем же .env, что у приложения (папки
-    // релея, голосовые документы). Без секретов его нет — отказ до первого запроса.
-    if (!relayFsKey('-')) {
-      throw new Error('нет RELAY_FS_SALT (и JWT_SECRET) — номер в мёртвых ссылках не на что заменить');
-    }
+    // Солёный хэш — той же функцией и с той же солью, что у приложения (папки
+    // релея, голосовые документы); только RELAY_FS_SALT — отказ до первого запроса.
+    requireRelayFsSalt();
     // StorageService — обычный Nest-провайдер; без DI-контейнера ему нужен
     // ручной onModuleInit (так же в generate-voice-samples.ts).
     const storage = new StorageService();
@@ -97,23 +102,23 @@ async function main() {
       apply,
       probe,
       fsKey: (id) => relayFsKey(id),
-      journal: (e) => fs.appendFileSync(journalPath, JSON.stringify(e) + '\n'),
+      journal: (e) => appendPrivateLine(journalPath, JSON.stringify(e)),
       log: (m) => console.log(m),
     });
     // Список пропавших — в файл, а не в консоль: там могут быть тысячи адресов,
-    // и в них номера.
+    // и в них номера. Только при --apply; в сухом прогоне — только счётчики.
     const { missingUrls, ...summary } = r;
     console.log(JSON.stringify(summary));
-    const missingPath = journalPath.replace(/\.jsonl$/, '.missing.txt');
-    fs.writeFileSync(missingPath, missingUrls.length > 0 ? missingUrls.join('\n') + '\n' : '');
-    console.log(`не нашлось на релее: ${missingUrls.length}, список: ${missingPath}`);
+    const missingPath = saveMissingList(apply, journalPath, missingUrls);
+    console.log(`не нашлось на релее: ${missingUrls.length}${missingPath ? `, список: ${missingPath}` : ''}`);
     if (apply) console.log(`журнал: ${fs.existsSync(journalPath) ? journalPath : 'пуст — менять было нечего'}`);
   } finally {
     await pg.end();
   }
 }
 
+// Только сообщение и код: у ошибок S3 и axios в объекте метаданные и заголовки.
 main().catch((e) => {
-  console.error(e);
+  console.error(scriptErrorText(e));
   process.exit(1);
 });
