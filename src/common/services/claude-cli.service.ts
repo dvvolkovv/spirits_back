@@ -15,7 +15,9 @@ import {
   cliDiagnostic,
   LlmOutageKind,
   looksLikeCliRefusal,
+  refusalDetail,
   safeCliText,
+  safeErrorCode,
 } from '../llm-error';
 import {
   AnswerProvider,
@@ -74,6 +76,9 @@ const EMPTY_CWD_NAME = 'linkeon-claude-empty';
  * файл ему уже не нужен.
  */
 const MCP_CONFIG_STALE_MS = 60 * 60 * 1000;
+
+/** NUL: spawn не принимает его в аргументах (ERR_INVALID_ARG_VALUE). */
+const NUL = String.fromCharCode(0);
 
 /** Модель и таймаут вызова, когда caller их не задал. */
 const DEFAULT_MODEL = 'claude-haiku-4-5';
@@ -506,9 +511,11 @@ export class ClaudeCliService implements OnModuleInit {
       : (plan[0] !== 'claude' && plan[0] !== selected ? ['claude CLI пропущен (окно запасного пути)'] : []);
     // Признаки попыток — для итоговой ошибки, если не ответит никто (spec
     // 2026-11-02-safe-cli-errors): сводный вид — сильнейший по попыткам
-    // (aggregateKind), доступ — хоть одна попытка со сбоем доступа.
+    // (aggregateKind), доступ — хоть одна попытка со сбоем доступа, toolUsed —
+    // хоть одна попытка с инструментом с последствиями.
     const kinds: LlmOutageKind[] = [];
     let anyAccess = false;
+    let anyToolUsed = false;
     let reachedFallback = false;
     let attemptOpts = opts;
     for (let i = 0; i < plan.length; ) {
@@ -535,23 +542,33 @@ export class ClaudeCliService implements OnModuleInit {
         }
         return res;
       }
+      // Сбой попытки — всегда ClaudeCliCallError с безопасным текстом и
+      // признаками (spec 2026-11-02-safe-cli-errors, п. 4): решения дальше —
+      // только по признакам, текст — только в склейку и журналы.
+      let failure: ClaudeCliCallError;
       if (refusal) {
-        // Отказ пишет CLI, а не модель: в безопасном тексте он сам (одной
-        // строкой, до 160 знаков) — в нём время сброса лимита.
+        // Отказ пишет CLI, а не модель: в безопасном тексте — его фраза и
+        // хвост из белого списка (refusalDetail), в нём время сброса лимита.
         const text = res!.text.trim();
         const f = ClaudeCliService.safeFailure('отказ', `claude CLI error: ${text}`, { cause: text, refusal: true });
-        err = new ClaudeCliCallError(f.message, res!.toolUsed, f.info);
+        failure = new ClaudeCliCallError(f.message, res!.toolUsed, f.info);
+      } else if (err instanceof ClaudeCliCallError) {
+        failure = err;
+      } else {
+        // Ошибка без признаков — не от CLI (сбой подготовки вызова: tmp,
+        // копии вложений). Её сообщение бывает сырым (пути, цитаты
+        // аргументов): other без доступа, текст — по коду ошибки.
+        failure = new ClaudeCliCallError(safeCliText({ what: `сбой (${safeErrorCode(err)})`, kind: 'other' }), false, {
+          kind: 'other',
+          access: false,
+        });
       }
-      const msg = String((err as any)?.message ?? err);
-      // Признаки — с ошибки сервиса: она классифицирована по сырому тексту ещё
-      // в spawnClaude, а её message безопасен и для классификации не годится
-      // (spec 2026-11-02-safe-cli-errors). По тексту — только ошибки без
-      // признаков (не от CLI: сбой подготовки вызова и т. п.).
-      const signs = err instanceof ClaudeCliCallError ? err : null;
-      const access = signs?.access ?? isFallbackWorthy(msg);
-      const kind = signs?.kind ?? classifyLlmError(msg).kind;
+      const msg = failure.message;
+      const access = failure.access ?? false;
+      const kind = failure.kind ?? 'other';
       kinds.push(kind);
       if (access) anyAccess = true;
+      if (failure.toolUsed) anyToolUsed = true;
       // Сбой доступа — свидетельство для следующих вызовов, даже если этот
       // повторять нельзя: у Claude — окно Claude (если есть на кого
       // переключаться), у запасного — его окно «не отвечает». Под noFallback —
@@ -570,7 +587,7 @@ export class ClaudeCliService implements OnModuleInit {
       const next = this.nextAttempt(plan, i);
       // Выбранный — при любом сбое (решение владельца), остальные — только при
       // сбое доступа; и только если повтор ничего не задвоит.
-      const allowed = (p === selected || access) && this.mayRetry(err, opts);
+      const allowed = (p === selected || access) && this.mayRetry(failure, opts);
       if (next < 0 || !allowed) {
         if (access && next >= 0) {
           this.logger.warn(`${this.attemptLabel(p, selected, choice)}: сбой доступа (${kind}), вызов не повторяется (инструмент с последствиями или показанный текст): ${msg.slice(0, 200)}`);
@@ -585,11 +602,12 @@ export class ClaudeCliService implements OnModuleInit {
         }
         if (parts.length === 1) {
           // Одна попытка — как раньше: отказ текстом вызывающий получает как
-          // есть, ошибку Claude — исходным объектом.
+          // есть, ошибку Claude — её объектом (у ошибки не от CLI — с
+          // безопасным текстом по коду).
           if (refusal) return res!;
-          if (p === 'claude') throw err;
+          if (p === 'claude') throw failure;
         }
-        throw new ClaudeCliCallError(parts.join(' | '), false, { kind: aggregateKind(kinds), access: anyAccess });
+        throw new ClaudeCliCallError(parts.join(' | '), anyToolUsed, { kind: aggregateKind(kinds), access: anyAccess });
       }
       const target = plan[next];
       const toLabel = target === 'claude'
@@ -600,7 +618,7 @@ export class ClaudeCliService implements OnModuleInit {
       attemptOpts = { ...opts, timeoutMs: fallbackTimeoutMs(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, Date.now() - startedAt) };
       i = next;
     }
-    throw new ClaudeCliCallError(parts.join(' | ') || 'claude CLI: пустой план попыток', false, {
+    throw new ClaudeCliCallError(parts.join(' | ') || 'claude CLI: пустой план попыток', anyToolUsed, {
       kind: aggregateKind(kinds),
       access: anyAccess,
     });
@@ -676,8 +694,8 @@ export class ClaudeCliService implements OnModuleInit {
    * прежний текст ошибки (с result, stderr или stdout — фрагментами
    * разговоров): по нему только вид и доступ, те же, что runRaw раньше брал из
    * текста ошибки, — наружу он не уходит. В деталь — только диагностика CLI из
-   * errors[] (cliDiagnostic) или отказ самого CLI (cause, если это фраза
-   * отказа с начала — looksLikeCliRefusal): его пишет CLI, а не модель.
+   * errors[] (cliDiagnostic) или отказ самого CLI (cause — refusalDetail:
+   * фраза отказа и хвост из белого списка; ответ модели после фразы — нет).
    */
   private static safeFailure(
     what: string,
@@ -686,11 +704,16 @@ export class ClaudeCliService implements OnModuleInit {
   ): { message: string; info: ClaudeCliErrorInfo } {
     const kind = classifyLlmError(raw).kind;
     const status = apiErrorStatus(src.status);
-    const refusalText = typeof src.cause === 'string' && looksLikeCliRefusal(src.cause) ? src.cause : '';
-    const detail = cliDiagnostic(src.errors) || refusalText;
+    const detail = cliDiagnostic(src.errors) || refusalDetail(src.cause ?? '');
     const info: ClaudeCliErrorInfo = { kind, access: isFallbackWorthy(raw), status };
     if (src.refusal) info.refusal = true;
     return { message: safeCliText({ what, kind, status, detail }), info };
+  }
+
+  /** «Не запустился» — по коду ошибки spawn, без её сообщения: оно цитирует
+   *  аргументы (начало промпта, значение env с ключом провайдера). */
+  private static notStartedText(e: unknown): string {
+    return safeCliText({ what: `не запустился (${safeErrorCode(e)})`, kind: 'other' });
   }
 
   /** Размеры вывода для журнала — вместо самого вывода. */
@@ -765,6 +788,26 @@ export class ClaudeCliService implements OnModuleInit {
     const file = path.join(dir, 'mcp.json');
     fs.writeFileSync(file, JSON.stringify({ mcpServers: servers }), { mode: 0o600 });
     return file;
+  }
+
+  /**
+   * spawn процесса CLI. Синхронный отказ spawn (ERR_INVALID_ARG_VALUE при NUL
+   * в аргументе или в env и т. п.) цитирует значение — начало промпта или ключ
+   * провайдера из env; наружу — только код ошибки (spec
+   * 2026-11-02-safe-cli-errors).
+   */
+  private startProcess(argv: string[], cwd: string, cfg: FallbackConfig | null) {
+    try {
+      // Обычный запуск наследует process.env как есть; запасной получает своё
+      // окружение (адрес и ключ провайдера) — и только он.
+      return spawn(this.claudeBin, argv, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        cwd,
+        ...(cfg ? { env: fallbackSpawnEnv(process.env, cfg) } : {}),
+      });
+    } catch (e) {
+      throw new ClaudeCliCallError(ClaudeCliService.notStartedText(e), false, { kind: 'other', access: false });
+    }
   }
 
   private spawnClaude(
@@ -922,15 +965,15 @@ export class ClaudeCliService implements OnModuleInit {
     // дней) — дольше, чем обещает политика пробы (7 дней). Флаг работает
     // только с --print/-p — он у нас есть всегда (см. '-p' в начале args).
     if (opts.noSessionPersistence) args.push('--no-session-persistence');
+    // NUL в аргументе spawn не принимает: синхронный ERR_INVALID_ARG_VALUE, и
+    // его сообщение цитирует начало аргумента — промпта (ревью 02.11, I2).
+    // Промпту и флагам NUL ни к чему — вычищаем из всех аргументов.
+    const argv = args.map((a) => a.replaceAll(NUL, ''));
 
     return new Promise<CliRunResult>((resolve, reject) => {
-      // Обычный запуск наследует process.env как есть; запасной получает своё
-      // окружение (адрес и ключ провайдера) — и только он.
-      const proc = spawn(this.claudeBin, args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        cwd: spawnCwd,
-        ...(cfg ? { env: fallbackSpawnEnv(process.env, cfg) } : {}),
-      });
+      // Синхронный отказ spawn — ClaudeCliCallError из startProcess: исключение
+      // в теле промиса отклоняет его.
+      const proc = this.startProcess(argv, spawnCwd, cfg);
       let stdout = '';
       let stderr = '';
       // StringDecoder держит «хвост» незавершённого многобайтового символа
@@ -1024,8 +1067,16 @@ export class ClaudeCliService implements OnModuleInit {
       });
       proc.stderr.on('data', (b) => { stderr += errDecoder.write(b); });
 
-      proc.on('close', (code) => {
+      proc.on('close', (code, signal) => {
+        // Вызов уже отклонён (таймаут, ошибка запуска): процесс, убитый по
+        // таймауту, закрывается следом — ни разбора вывода, ни второй записи
+        // в журнал не нужно.
+        if (settled) return;
         if (timer) clearTimeout(timer);
+        // Убит сигналом извне (OOM, kill) — в тексте имя сигнала, а не «код null».
+        const exitWhat = code === null && typeof signal === 'string' && /^SIG[A-Z0-9]+$/.test(signal)
+          ? `сигнал ${signal}`
+          : `код выхода ${code}`;
 
         // Stream mode: всё уже распарсено по ходу, просто возвращаем накопленное.
         if (streaming) {
@@ -1034,7 +1085,7 @@ export class ClaudeCliService implements OnModuleInit {
             // для вида и доступа; в журнал и ошибку — безопасный текст.
             const detail = streamErrorDetail || ClaudeCliService.stderrDetail(stderr) || stdout.trim().slice(0, 400);
             const f = ClaudeCliService.safeFailure(
-              `код выхода ${code}`,
+              exitWhat,
               `claude CLI exited with code ${code}: ${detail.slice(0, 200) || '(no output)'}`,
               { status: streamApiStatus, errors: streamErrors, cause: detail },
             );
@@ -1115,7 +1166,7 @@ export class ClaudeCliService implements OnModuleInit {
             detail = ClaudeCliService.stderrDetail(stderr) || stdout.trim().slice(0, 400);
           }
           const f = ClaudeCliService.safeFailure(
-            `код выхода ${code}`,
+            exitWhat,
             `claude CLI exited with code ${code}: ${detail.slice(0, 200) || '(no output)'}`,
             { status, errors, cause: detail },
           );
@@ -1167,9 +1218,9 @@ export class ClaudeCliService implements OnModuleInit {
 
       proc.on('error', (err) => {
         if (timer) clearTimeout(timer);
-        // Текст прежний и безопасный: сообщение spawn — путь бинаря и код
-        // (ENOENT, EACCES и т. п.), аргументов вызова (промпта) в нём нет.
-        fail(`claude CLI spawn error: ${err.message}`, { kind: 'other', access: false });
+        // Только код (ENOENT, EACCES и т. п.), без сообщения — как у
+        // синхронного отказа spawn (startProcess).
+        fail(ClaudeCliService.notStartedText(err), { kind: 'other', access: false });
       });
     });
   }
