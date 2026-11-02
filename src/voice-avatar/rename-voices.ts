@@ -9,8 +9,8 @@ import { cloneVoiceName } from './voice-name';
  * user_voice трогать не нужно.
  *
  * Голоса — из user_voice (клоны делает только voice-avatar, и каждый готовый
- * клон записан там своим voice_id) и сироты: голоса аккаунта с именем user_*,
- * которых в user_voice нет (удаление строки дошло, а удаление у ElevenLabs —
+ * клон записан там своим voice_id) и сироты: клоны аккаунта (category=cloned)
+ * с именем строго user_<номер|uuid>, которых в user_voice нет (удаление строки дошло, а удаление у ElevenLabs —
  * нет: deleteClone только пишет предупреждение). Сирот видно только в
  * перечне голосов аккаунта — GET /v2/voices, постранично (page_size до 100,
  * has_more и next_page_token; v1 в документации ElevenLabs больше не
@@ -26,8 +26,11 @@ import { cloneVoiceName } from './voice-name';
  */
 const EL_BASE = 'https://api.elevenlabs.io/v1';
 const EL_BASE_V2 = 'https://api.elevenlabs.io/v2';
-/** Прежнее имя клона — `user_<id>`. */
-const LEGACY_NAME_PREFIX = 'user_';
+/**
+ * Прежнее имя клона — строго `user_<id>`, где id — номер или uuid. Похожие
+ * имена (`user_test`, `user_<номер> copy`) — не наши клоны.
+ */
+const LEGACY_NAME_RE = /^user_(\d{10,15}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
 /** Потолок страниц перечня: 100 × 100 голосов — с запасом, а зациклиться нельзя. */
 const MAX_PAGES = 100;
 
@@ -44,7 +47,10 @@ export async function listVoiceIds(pg: VoicesPg): Promise<string[]> {
   return rows.map((r: any) => String(r.elevenlabs_voice_id));
 }
 
-/** voice_id голосов аккаунта с прежним именем user_*. Сами имена не возвращаются. */
+/**
+ * voice_id клонов аккаунта (category=cloned) с прежним именем user_<id>. Сами
+ * имена не возвращаются.
+ */
 async function listAccountLegacyVoiceIds(apiKey: string): Promise<string[]> {
   const ids = new Set<string>();
   let token: string | undefined;
@@ -55,7 +61,9 @@ async function listAccountLegacyVoiceIds(apiKey: string): Promise<string[]> {
       timeout: 30_000,
     });
     for (const v of data?.voices ?? []) {
-      if (typeof v?.name === 'string' && v.name.startsWith(LEGACY_NAME_PREFIX) && v?.voice_id) ids.add(String(v.voice_id));
+      if (v?.category === 'cloned' && typeof v?.name === 'string' && LEGACY_NAME_RE.test(v.name) && v?.voice_id) {
+        ids.add(String(v.voice_id));
+      }
     }
     if (!data?.has_more || !data?.next_page_token) break;
     token = String(data.next_page_token);
@@ -109,7 +117,7 @@ export async function renameVoices(p: {
   const inDb = new Set(p.voiceIds);
   const orphans = account ? account.filter((id) => !inDb.has(id)) : [];
   if (account) {
-    p.log(`голосов у ElevenLabs с именем user_*: ${account.length}`);
+    p.log(`клонов у ElevenLabs с именем user_<номер|uuid>: ${account.length}`);
     if (!p.apply) for (const id of account) p.log(`voice_id: ${id}`);
     p.log(`из них нет в user_voice (сироты): ${orphans.length}`);
   }

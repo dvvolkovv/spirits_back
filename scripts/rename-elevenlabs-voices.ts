@@ -9,9 +9,10 @@
  *   npx ts-node scripts/rename-elevenlabs-voices.ts           # сухой прогон: число голосов и их voice_id
  *   npx ts-node scripts/rename-elevenlabs-voices.ts --apply   # переименовать у ElevenLabs
  *
- * Голоса — из user_voice и сироты: голоса аккаунта с именем user_*, которых в
- * user_voice нет (перечень аккаунта — GET /v2/voices, нужен ключ и в сухом
- * прогоне). В выводе — только число и voice_id, имён целиком нет.
+ * Голоса — из user_voice и сироты: клоны аккаунта (category=cloned) с именем
+ * строго user_<номер|uuid>, которых в user_voice нет (перечень аккаунта — GET
+ * /v2/voices, нужен ключ и в сухом прогоне). В выводе — только число и
+ * voice_id, имён целиком нет.
  *
  * Требует в окружении (берутся из .env, как у приложения): DATABASE_URL и
  * ELEVENLABS_API_KEY (без него сухой прогон покажет только user_voice). Ключ
