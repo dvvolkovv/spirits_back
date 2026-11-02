@@ -116,6 +116,14 @@ describe('TgRouterService.generateReply: системный промпт без 
     await svc.generateReply(cfg, 'Дмитрий');
     expect(systemFrom(claudeCli)).not.toMatch(/Imagen/i);
   });
+
+  it('запрет генерации — только про НОВЫЕ файлы: приложить готовую картинку/файл по адресу можно {{file:}} (ревью качества 02.11)', async () => {
+    const { svc, claudeCli } = makeRouter();
+    jest.spyOn(svc as any, 'listWorkspace').mockReturnValue([]);
+    await svc.generateReply(cfg, 'Дмитрий', undefined, undefined, '/tmp/sandbox-markers-2');
+    const system = systemFrom(claudeCli);
+    expect(system).toContain('можно приложить маркером {{file:');
+  });
 });
 
 describe('TgRouterService.generateReply: картинка из сети (находка bfc4c3ad)', () => {
@@ -126,14 +134,37 @@ describe('TgRouterService.generateReply: картинка из сети (нах�
     expect(system).toContain('ПОКАЗАТЬ КАРТИНКУ ИЗ СЕТИ');
     expect(system).toContain('{{file: url=<прямой адрес изображения>');
     expect(system).toContain('не одни ссылки');
+    // Схема мест в зале — это план помещения, не любой «план» вообще.
+    expect(system).toContain('план помещения или этажа');
   });
 
-  it('перевод надписей — image_edit, только по просьбе и с оговоркой', async () => {
+  it('адрес — полный https://, относительный путь со страницы — доменом ЭТОЙ страницы (ревью качества 02.11)', async () => {
+    // own-media.ts toAbsoluteUrl достраивает относительный путь НАШИМ доменом —
+    // соблазн модели дать относительный путь со страницы-источника бил бы по
+    // нашему же SPA, а не по странице с картинкой.
+    const { svc, claudeCli } = makeRouter();
+    await svc.generateReply(cfg, 'Дмитрий');
+    const system = systemFrom(claudeCli);
+    expect(system).toContain('Адрес — полный, начиная с https://');
+    expect(system).toContain('дополни ДОМЕНОМ ЭТОЙ СТРАНИЦЫ');
+  });
+
+  it('ссылка на страницу картинки (Викисклад File:…) — не адрес самой картинки; не нашёл — не угадывать', async () => {
+    const { svc, claudeCli } = makeRouter();
+    await svc.generateReply(cfg, 'Дмитрий');
+    const system = systemFrom(claudeCli);
+    expect(system).toContain('это не адрес самой картинки');
+    expect(system).toContain('адрес не угадывай');
+    expect(system).toContain('ссылка на страницу-источник');
+  });
+
+  it('перевод надписей — image_edit, только по просьбе, с оговоркой и предупреждением про платность', async () => {
     const { svc, claudeCli } = makeRouter();
     await svc.generateReply(cfg, 'Дмитрий');
     const system = systemFrom(claudeCli);
     expect(system).toContain('только по просьбе');
     expect(system).toContain('перерисованы нейросетью');
+    expect(system).toContain('правка картинки платная');
   });
 
   it('source у image_edit — и адрес картинки из сети', async () => {
