@@ -770,17 +770,25 @@ test("второй заход у сессии БЕЗ конфликтов: та�
   assert.ok(!fs.readFileSync(n.file, "utf8").includes(PHONE));
 });
 
-test("путь на папку соседней сессии того же номера переписывается на её fs_key", async (t) => {
+test("путь на папку соседней сессии номера — на её fs_key; на непереносимую (без fs_key) — как есть", async (t) => {
   const w = relayWorld(t);
   const b = sessionB(w);
+  const e = sessionE(w);
   const a = sessionA(w);
-  fs.appendFileSync(a.file, JSON.stringify(toolUse("Read", { file_path: path.join(w.out, b.key, "old.txt") })) + "\n");
+  fs.appendFileSync(
+    a.file,
+    JSON.stringify(toolUse("Read", { file_path: path.join(w.out, b.key, "old.txt") })) + "\n" +
+      JSON.stringify(toolUse("Read", { file_path: path.join(w.out, e.key, "e.txt") })) + "\n",
+  );
   fs.utimesSync(a.file, hourAgo(), hourAgo());
 
-  await runScrub(runOpts(w, { apply: true }));
+  const s = await runScrub(runOpts(w, { apply: true }));
   const rows = parsed(fs.readFileSync(a.file));
-  assert.equal(rows.at(-1).message.content[0].input.file_path, path.join(w.out, b.fk, "old.txt"));
+  assert.equal(rows.at(-2).message.content[0].input.file_path, path.join(w.out, b.fk, "old.txt"));
   assert.equal(read(w.out, b.fk, "old.txt"), "старое");
+  assert.equal(rows.at(-1).message.content[0].input.file_path, path.join(w.out, e.key, "e.txt"), "папка E не переносится — путь живой");
+  assert.equal(read(w.out, e.key, "e.txt"), "e");
+  assert.equal(s.repl.kept, 1);
 });
 
 test("повторный прогон ничего не находит и ничего не пишет", async (t) => {
