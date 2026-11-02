@@ -4,7 +4,9 @@ import {
   cliDiagnostic,
   LlmOutageKind,
   looksLikeCliRefusal,
+  refusalDetail,
   safeCliText,
+  safeErrorCode,
   safeKindPhrase,
 } from './llm-error';
 
@@ -169,9 +171,9 @@ describe('safeCliText', () => {
     expect(safeCliText({ what: 'ошибка', kind: 'other' })).toBe('claude CLI ошибка: other');
   });
 
-  it('вид, статус, код выхода, деталь — по порядку через «, »', () => {
-    expect(safeCliText({ what: 'ошибка', kind: 'auth', status: 401, exit: 1, detail: '[ede_diagnostic] a=b' }))
-      .toBe('claude CLI ошибка: auth, status 401, exit 1, [ede_diagnostic] a=b');
+  it('вид, статус, деталь — по порядку через «, »', () => {
+    expect(safeCliText({ what: 'ошибка', kind: 'auth', status: 401, detail: '[ede_diagnostic] a=b' }))
+      .toBe('claude CLI ошибка: auth, status 401, [ede_diagnostic] a=b');
     expect(safeCliText({ what: 'код выхода 1', kind: 'overloaded', status: 529 }))
       .toBe('claude CLI код выхода 1: overloaded, status 529');
   });
@@ -181,14 +183,6 @@ describe('safeCliText', () => {
     expect(safeCliText({ what: 'ошибка', kind: 'other', status: 599 })).toBe('claude CLI ошибка: other, status 599');
     for (const st of [99, 600, 500.5, NaN, Infinity, -401, '500', null, undefined, true, {}] as any[]) {
       expect(safeCliText({ what: 'ошибка', kind: 'other', status: st })).toBe('claude CLI ошибка: other');
-    }
-  });
-
-  it('exit — только целое число', () => {
-    expect(safeCliText({ what: 'ошибка', kind: 'other', exit: 0 })).toBe('claude CLI ошибка: other, exit 0');
-    expect(safeCliText({ what: 'ошибка', kind: 'other', exit: 143 })).toBe('claude CLI ошибка: other, exit 143');
-    for (const ex of [null, undefined, 1.5, NaN, '1', 'СЕКРЕТ-ИЗ-ОТВЕТА'] as any[]) {
-      expect(safeCliText({ what: 'ошибка', kind: 'other', exit: ex })).toBe('claude CLI ошибка: other');
     }
   });
 
@@ -206,5 +200,89 @@ describe('safeCliText', () => {
     for (const d of ['', '   ', '\n\r\n', undefined, null] as any[]) {
       expect(safeCliText({ what: 'ошибка', kind: 'auth', status: 401, detail: d })).toBe('claude CLI ошибка: auth, status 401');
     }
+  });
+});
+
+/**
+ * Деталь отказа CLI (ревью 02.11, I1): looksLikeCliRefusal привязан только к
+ * началу текста, дальше до 300 знаков может идти ответ модели. В безопасный
+ * текст — только фраза отказа и хвост из белого списка (время сброса лимита,
+ * подсказка про вход); любой другой хвост отбрасывается.
+ */
+describe('refusalDetail', () => {
+  it.each([
+    "You've hit your limit · resets 3pm (Europe/Moscow)",
+    "You've hit your session limit · resets 3am (UTC)",
+    'You’ve hit your weekly limit · resets 11:30am',
+    "You've hit your limit · resets 15:00",
+    "You've hit your limit · resets 9:05pm (America/New_York)",
+    'Not logged in · Please run /login',
+    'Invalid API key · Please run /login',
+    'Please run /login',
+    'Credit balance is too low',
+    "You've hit your Opus limit",
+  ])('фраза отказа и хвост из белого списка — целиком: %p', (t) => {
+    expect(refusalDetail(t)).toBe(t);
+  });
+
+  it('пробелы и переводы строк по краям не мешают', () => {
+    expect(refusalDetail('  Not logged in · Please run /login\n')).toBe('Not logged in · Please run /login');
+  });
+
+  it.each([
+    ['Invalid API key means the token SECRET-FROM-ANSWER is wrong', 'Invalid API key'],
+    ["You've hit your limit · resets 3pm (Europe/Moscow) SECRET-FROM-ANSWER", "You've hit your limit"],
+    ["You've hit your limit · resets soon, SECRET-FROM-ANSWER", "You've hit your limit"],
+    ['Not logged in · Please run /login SECRET-FROM-ANSWER', 'Not logged in'],
+    ['Not logged in SECRET-FROM-ANSWER · Please run /login', 'Not logged in'],
+    // Дата сброса в белый список не входит — только время.
+    ["You've hit your weekly limit · resets Nov 3", "You've hit your weekly limit"],
+    // Зона — только буквы и _/+-; цифры (UTC+3) — уже не зона.
+    ["You've hit your limit · resets 3pm (UTC+3)", "You've hit your limit"],
+    // Время — с am/pm или с минутами; голое число — нет.
+    ["You've hit your limit · resets 3 (UTC)", "You've hit your limit"],
+    ['Claude AI usage limit reached|1730000000', 'Claude AI usage limit reached'],
+    ['OAuth token has expired. Please obtain a new token or refresh your existing token.', 'OAuth token has expired'],
+  ])('иной хвост отбрасывается — только фраза: %p', (t, want) => {
+    expect(refusalDetail(t)).toBe(want);
+  });
+
+  it.each([
+    '',
+    'обычный ответ модели',
+    'Это значит, что ключ неверный: сервис ответил Invalid API key.',
+    'Invalid API key — так ответил сервис, проверьте ключ',
+    'Not logged in · Please run /login ' + 'x'.repeat(300),
+  ])('не отказ CLI — пусто: %p', (t) => {
+    expect(refusalDetail(t)).toBe('');
+  });
+});
+
+/**
+ * Код ошибки для безопасного текста (ревью 02.11, I2): сообщения системных
+ * ошибок цитируют аргументы — у spawn с NUL в аргументе это начало промпта
+ * или значение env с ключом. Наружу — только код (ENOENT,
+ * ERR_INVALID_ARG_VALUE) или имя класса ошибки.
+ */
+describe('safeErrorCode', () => {
+  it('код системной ошибки', () => {
+    expect(safeErrorCode(Object.assign(new Error('spawn /usr/bin/claude ENOENT'), { code: 'ENOENT' }))).toBe('ENOENT');
+    expect(safeErrorCode(Object.assign(new TypeError("Received 'СЕКРЕТ-ИЗ-ОТВЕТА'"), { code: 'ERR_INVALID_ARG_VALUE' })))
+      .toBe('ERR_INVALID_ARG_VALUE');
+  });
+
+  it('без кода — имя класса ошибки', () => {
+    expect(safeErrorCode(new TypeError('СЕКРЕТ-ИЗ-ОТВЕТА'))).toBe('TypeError');
+    expect(safeErrorCode(new Error('СЕКРЕТ-ИЗ-ОТВЕТА'))).toBe('Error');
+  });
+
+  it('код или имя не похожи на код — Error', () => {
+    expect(safeErrorCode(Object.assign(new Error('x'), { code: 'not a code СЕКРЕТ' }))).toBe('Error');
+    expect(safeErrorCode({ name: 'SECRET FROM ANSWER', message: 'x' })).toBe('Error');
+    expect(safeErrorCode({ code: 42, name: 'x'.repeat(100) })).toBe('Error');
+  });
+
+  it.each([undefined, null, 'СЕКРЕТ-ИЗ-ОТВЕТА', 42])('не ошибка — Error: %p', (v) => {
+    expect(safeErrorCode(v)).toBe('Error');
   });
 });
