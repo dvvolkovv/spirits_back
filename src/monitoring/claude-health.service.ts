@@ -10,13 +10,18 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
-// classifyLlmError переехал в common/llm-error.ts — его зовёт и ClaudeCliService
-// (запасной путь). Реэкспорт — для прежних импортов.
-import { classifyLlmError, LlmOutageKind, looksLikeCliRefusal, safeCliText, safeKindPhrase } from '../common/llm-error';
+// Классификатор ошибок LLM — в common/llm-error.ts: его зовёт и ClaudeCliService
+// (запасной путь).
+import {
+  classifyLlmError,
+  LlmOutageKind,
+  looksLikeCliRefusal,
+  refusalDetail,
+  safeCliText,
+  safeKindPhrase,
+} from '../common/llm-error';
 // Строка про запасных — общая с алертом релея (relay-qwen-monitor.service.ts).
 import { fallbackAlertLine } from './fallback-alert-line';
-export { classifyLlmError };
-export type { LlmOutageKind };
 
 /**
  * Claude health/usage monitoring.
@@ -199,10 +204,11 @@ export class ClaudeHealthService implements OnModuleInit {
         // Отказ CLI обычным ответом («You've hit your session limit · …») —
         // не «Claude жив»: иначе при ключе люди молча сидят на Qwen, проба
         // зелёная, алерта нет. Разбор — как у ошибки в catch: вид по тексту
-        // отказа (его пишет CLI), причина — фраза вида, у other — с
-        // безопасным текстом отказа, как у ClaudeCliService.
+        // отказа, причина — фраза вида, у other — с безопасным текстом отказа
+        // (фраза CLI и хвост из белого списка, refusalDetail), как у
+        // ClaudeCliService.
         const kind = classifyLlmError(text).kind;
-        const human = outageReason(kind, safeCliText({ what: 'отказ', kind, detail: text }));
+        const human = outageReason(kind, safeCliText({ what: 'отказ', kind, detail: refusalDetail(text) }));
         down = true;
         this.cache.llmStatus = 'down';
         this.cache.llmOutageKind = kind;
