@@ -117,3 +117,28 @@ describe('TgRouterService.generateReply: системный промпт без 
     expect(systemFrom(claudeCli)).not.toMatch(/Imagen/i);
   });
 });
+
+describe('TgRouterService.generateReply: картинка из сети (находка bfc4c3ad)', () => {
+  it('правило: прислать саму картинку маркером file, а не одни ссылки', async () => {
+    const { svc, claudeCli } = makeRouter();
+    await svc.generateReply(cfg, 'Дмитрий');
+    const system = systemFrom(claudeCli);
+    expect(system).toContain('ПОКАЗАТЬ КАРТИНКУ ИЗ СЕТИ');
+    expect(system).toContain('{{file: url=<прямой адрес изображения>');
+    expect(system).toContain('не одни ссылки');
+  });
+
+  it('перевод надписей — image_edit, только по просьбе и с оговоркой', async () => {
+    const { svc, claudeCli } = makeRouter();
+    await svc.generateReply(cfg, 'Дмитрий');
+    const system = systemFrom(claudeCli);
+    expect(system).toContain('только по просьбе');
+    expect(system).toContain('перерисованы нейросетью');
+  });
+
+  it('source у image_edit — и адрес картинки из сети', async () => {
+    const { svc, claudeCli } = makeRouter();
+    await svc.generateReply(cfg, 'Дмитрий');
+    expect(systemFrom(claudeCli)).toContain('или адрес изображения, найденного в сети');
+  });
+});
