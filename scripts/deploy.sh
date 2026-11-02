@@ -28,6 +28,11 @@
 #                        и явным RELAY_SSH_TARGET (default dv@5.101.115.184).
 #                        Отказ считается smoke failure с обычным rollback;
 #                        на проде запускается только при том же явном флаге.
+#   AGENT_VERSION_UX=1  — после зелёного основного smoke запустить opt-in
+#                        Playwright UX версий ассистентов со скриншотами.
+#                        В обычный browser smoke этот сценарий не входит.
+#   AGENT_VERSION_UX_ONLY=1 — только этот UX, без остальных smoke-слоёв;
+#                        для ручной проверки, обычно вместе с SMOKE_ONLY=1.
 #   WITH_LANDING=1     — добавить PHASE 3: лендинг linkeon.io (land_linkeon)
 #   LANDING_ONLY=1     — ТОЛЬКО лендинг, без backend/frontend и без my.linkeon.io
 #
@@ -1687,6 +1692,7 @@ run_phase() {
   phase_upper="$(echo "$phase" | tr '[:lower:]' '[:upper:]')"
   local skip_var="SKIP_${phase_upper}_SMOKE"  # SKIP_TEST_SMOKE / SKIP_PROD_SMOKE
   if [[ -z "${SKIP_SMOKE:-}" && -z "${!skip_var:-}" ]]; then
+    if [[ "${AGENT_VERSION_UX_ONLY:-0}" != "1" ]]; then
     sync_test_basic_auth
     bold "=== SMOKE ($ENV_NAME) ==="
     # Прогрев chat-пути ПОСЛЕ рестарта и ДО smoke: связь с r.linkeon.io холодная
@@ -1745,6 +1751,7 @@ run_phase() {
       fi
       return 1
     fi
+    fi
 
     if [[ "${AGENT_VERSION_E2E:-0}" == "1" ]]; then
       bold "[agent-version-e2e] running tests/agent-versions.e2e.mjs ($ENV_NAME)"
@@ -1755,6 +1762,24 @@ run_phase() {
         node agent-versions.e2e.mjs
       ); then
         red "  ✗ SMOKE FAILED ($ENV_NAME) — agent versions E2E"
+        if [[ "$phase" == "prod" && -z "${NO_ROLLBACK:-}" && -z "${SMOKE_ONLY:-}" ]]; then
+          rollback_phase || red "  ✗ rollback had partial failures — check $ENV_NAME manually"
+        fi
+        return 1
+      fi
+    fi
+
+    if [[ "${AGENT_VERSION_UX:-0}" == "1" || "${AGENT_VERSION_UX_ONLY:-0}" == "1" ]]; then
+      bold "[agent-version-ux] running tests/playwright/agent-versions-ui.spec.js ($ENV_NAME)"
+      if ! (
+        cd "$LOCAL_BACK_DIR/tests" && \
+        AGENT_VERSION_UX=1 BASE_URL="$BASE_URL" BASIC_AUTH="$BASIC_AUTH" \
+        ADMIN_PHONE="${ADMIN_PHONE:-79030169187}" SSH_TARGET="$SSH_TARGET" BACK_PATH="$BACK_PATH" \
+        DEBUG_SECRET="${DEBUG_SECRET:-}" \
+        AGENT_VERSION_UX_SCREENSHOTS="${AGENT_VERSION_UX_SCREENSHOTS:-$LOCAL_BACK_DIR/test-results/agent-version-ux}" \
+        npx playwright test --config=playwright/playwright.config.js playwright/agent-versions-ui.spec.js --reporter=list
+      ); then
+        red "  ✗ SMOKE FAILED ($ENV_NAME) — agent versions browser UX"
         if [[ "$phase" == "prod" && -z "${NO_ROLLBACK:-}" && -z "${SMOKE_ONLY:-}" ]]; then
           rollback_phase || red "  ✗ rollback had partial failures — check $ENV_NAME manually"
         fi
