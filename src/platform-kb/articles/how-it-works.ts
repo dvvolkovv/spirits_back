@@ -9,6 +9,8 @@ import type { KbArticle } from '../kb.types';
 // источник: третьи лица — spirits_front src/components/onboarding/LegalModal.tsx:580-771 (политика конфиденциальности)
 // источник: вспомогательные тексты OpenAI — src/voice/voice-improve.service.ts; src/calendar/calendar.service.ts:~724; src/app-widget/energy-focus.service.ts
 // источник: голос в Telegram — src/tg-bot/tg-voice.service.ts:34-58; расшифровки — voice_calls.transcript, src/admin/admin.service.ts:1866-1877; ключи Zoom/Taler ID — src/calendar/crypto.ts
+// источник: запасные модели Qwen и Kimi — src/common/services/llm-fallback.ts, relay-agent/llm-fallback.mjs; OpenRouter — src/neo4j/neo4j.service.ts (consolidateFromChat), src/scheduler/profile-compaction.service.ts, src/voice/voice-improve.service.ts
+// источник: обучение у Moonshot AI — политика конфиденциальности на лендинге (land_linkeon src/content/legal/ru.tsx, раздел 3)
 export const howItWorks: KbArticle = {
   id: 'how-it-works',
   title: 'Как устроен Linkeon',
@@ -37,7 +39,7 @@ export const howItWorks: KbArticle = {
 ## Кто видит
 - Другие пользователи Linkeon видят профиль — имя, ценности, интересы, навыки: он нужен поиску и нетворкингу. Телефон и почту — только если это разрешено в ${q('contactVisibility')} или принят запрос на контакт.
 - Команда Linkeon — обращения в поддержку, жалобы и, для разбора сбоев, расшифровки звонков и встреч.
-- Поставщикам нейросетей уходит то, что нужно для ответа: сообщения, переписка, профиль и файлы. Это Anthropic, OpenAI, Google, ElevenLabs и Яндекс, в том числе за пределами страны пользователя. Данные не продаются.
+- Поставщикам нейросетей уходит то, что нужно для ответа: сообщения, переписка, профиль и файлы. Это Anthropic, OpenAI, Google, ElevenLabs и Яндекс, запасные модели — Alibaba Cloud (Qwen) и Moonshot AI (Kimi), запасной путь фоновых задач — OpenRouter; в том числе за пределами страны пользователя. По условиям Moonshot AI присланное ей она вправе после обезличивания использовать для обучения своих моделей. Данные не продаются.
 - На сайте стоят счётчики Яндекс Метрики (с записью сеансов — Вебвизором; личные данные на экранах от записи скрыты) и VK Ads.
 
 ## Удаление
