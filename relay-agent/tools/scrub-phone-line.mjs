@@ -8,12 +8,38 @@
 // прямо в транскриптах. Спека: spirits_back
 // docs/superpowers/specs/2026-11-02-pii-out-of-prompts-design.md, п. 5.
 //
+// Запуск — на релее, от dv (владельца транскриптов):
+//   node scrub-phone-line.mjs            сухой прогон: только счётчики
+//   node scrub-phone-line.mjs --apply    замена + журнал
+// Флаги: --root <каталог> (по умолчанию ~/.claude/projects; смотрятся
+// <root>/*/*.jsonl), --min-age-min <минуты> (по умолчанию 15),
+// --journal <файл> (по умолчанию ~/scrub-phone-line-<метка>.jsonl).
+// Коды выхода: 0 — без ошибок, 1 — были ошибки на файлах, 2 — ошибка
+// запуска (ничего не тронуто), 130 — прерван сигналом.
+//
+// Как устроено:
+// - строка файла разбирается как JSON, фраза ищется во всех строковых
+//   значениях. Строка без замены остаётся прежними байтами, с заменой —
+//   JSON.stringify: CLI сам пишет строку как JSON.stringify(запись), поэтому
+//   вне фразы байты те же (счётчик «меняет не только фразу» это проверяет);
+// - битая строка остаётся как есть и считается; с фразой — отдельно: номер
+//   в ней остался;
+// - запись атомарная: временный файл рядом (.<имя>.scrub-<pid>-<hex>.tmp) с
+//   правами, владельцем и временем исходного → сверка, что исходный не
+//   менялся с чтения → rename. Копий исходника не остаётся;
+// - свежие файлы (mtime моложе --min-age-min) и изменённые во время прохода
+//   пропускаются — их проходят вторым заходом;
+// - журнал и вывод — без номеров и без содержимого.
+//
 // Node 22, ESM, без зависимостей: на релее системный Node, без nvm и npm.
 
 import fs from "node:fs";
 import fsp from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
+import { parseArgs } from "node:util";
+import { pathToFileURL } from "node:url";
 
 // Строгая форма строки — ровно та, что собирал релей. Номер — 10–15 цифр,
 // иногда с «+».
@@ -296,3 +322,121 @@ export async function scrubTree(
   }
   return s;
 }
+
+// ---------------------------------------------------------------- запуск
+
+const USAGE = `Использование: node scrub-phone-line.mjs [--root <каталог>] [--apply] [--min-age-min <минуты>] [--journal <файл>]
+  --root         каталог проектов claude, по умолчанию ~/.claude/projects; смотрятся <root>/*/*.jsonl
+  --apply        заменить; без него — сухой прогон, только счётчики
+  --min-age-min  не трогать файлы, менявшиеся за последние N минут; по умолчанию 15
+  --journal      журнал применения; по умолчанию ~/scrub-phone-line-<метка>.jsonl, права 600
+`;
+
+function parseCli(argv) {
+  const { values } = parseArgs({
+    args: argv,
+    strict: true,
+    allowPositionals: false,
+    options: {
+      root: { type: "string" },
+      apply: { type: "boolean" },
+      "min-age-min": { type: "string" },
+      journal: { type: "string" },
+      help: { type: "boolean", short: "h" },
+    },
+  });
+  const rawAge = values["min-age-min"] ?? "15";
+  const minutes = rawAge.trim() === "" ? NaN : Number(rawAge);
+  if (!Number.isFinite(minutes) || minutes < 0) throw new Error("--min-age-min: нужно число минут, не меньше 0");
+  const home = os.homedir();
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z"); // 20261102T153000Z
+  return {
+    help: !!values.help,
+    apply: !!values.apply,
+    root: path.resolve(values.root ?? path.join(home, ".claude", "projects")),
+    minAgeMs: minutes * 60_000,
+    journalPath: path.resolve(values.journal ?? path.join(home, "scrub-phone-line-" + stamp + ".jsonl")),
+  };
+}
+
+function report(s, { root, apply }) {
+  const lines = [
+    "scrub-phone-line: " + (apply ? "применение" : "сухой прогон — файлы не меняются (замена — с --apply)"),
+    "каталог: " + root,
+    "найдено транскриптов: " + s.found,
+    "файлов просмотрено: " + s.scanned,
+    "пропущено свежих: " + s.fresh + (s.fresh ? " — пройти вторым заходом позже" : ""),
+    "файлов со строкой: " + s.withPhrase,
+    "замен: " + s.replacements,
+  ];
+  if (apply) lines.push("записано файлов: " + s.written);
+  lines.push(
+    "битых строк: " + s.brokenLines + ", из них с фразой (номер в них остался): " + s.brokenWithPhrase,
+    "строк, где JSON.stringify меняет не только фразу: " + s.nonCanonicalLines,
+    "ошибок: " + s.errors,
+  );
+  if (apply) lines.push("журнал: " + (s.journal ?? "не создан — записывать нечего"));
+  if (s.interrupted) lines.push("ПРЕРВАНО: пройдены не все файлы, итог неполный");
+  return lines.join("\n") + "\n";
+}
+
+export async function main(argv = process.argv.slice(2), out = process.stdout, err = process.stderr) {
+  let opts;
+  try {
+    opts = parseCli(argv);
+  } catch (e) {
+    err.write("scrub-phone-line: " + e.message + "\n\n" + USAGE);
+    return 2;
+  }
+  if (opts.help) {
+    out.write(USAGE);
+    return 0;
+  }
+  try {
+    if (!(await fsp.stat(opts.root)).isDirectory()) throw withCode("ENOTDIR");
+  } catch (e) {
+    err.write("scrub-phone-line: нет каталога " + opts.root + " (" + (e.code || e.name) + ")\n");
+    return 2;
+  }
+
+  // Ctrl+C и SIGTERM дают доделать текущий файл: временный файл не остаётся.
+  const ac = new AbortController();
+  const stop = () => ac.abort();
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  let s;
+  try {
+    s = await scrubTree({
+      root: opts.root,
+      apply: opts.apply,
+      minAgeMs: opts.minAgeMs,
+      journalPath: opts.journalPath,
+      signal: ac.signal,
+    });
+  } catch (e) {
+    // Сюда доходят ошибки вне прохода по файлам — каталог, журнал. Если не
+    // открылся журнал, ни один файл ещё не тронут. В сообщении — путь, не
+    // содержимое.
+    err.write("scrub-phone-line: " + (e.code || e.name) + (e.path ? " " + e.path : "") + "\n");
+    return 2;
+  } finally {
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+  }
+  out.write(report(s, opts));
+  for (const { file, code } of s.errorList) err.write("ошибка: " + file + ": " + code + "\n");
+  return s.interrupted ? 130 : s.errors ? 1 : 0;
+}
+
+// Запущен как скрипт, а не импортирован (тесты). realpath — на случай запуска
+// через симлинк: import.meta.url у Node — настоящий путь.
+function invokedDirectly() {
+  if (!process.argv[1]) return false;
+  try {
+    return import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href;
+  } catch {
+    return false;
+  }
+}
+
+if (invokedDirectly()) process.exitCode = await main();
