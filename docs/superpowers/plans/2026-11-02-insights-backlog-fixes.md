@@ -1069,6 +1069,8 @@ git diff --stat src/platform-kb
 
 ### Task Ф1: ссылка на картинку файла чата
 
+> **Поправка по ревью качества (02.11, контролёр).** Код Ф1/Ф2 ниже — первая редакция. После ревью: принимаются оба префикса (`/smm-media/` на проде, `/minio/` на test-стенде); `fullUrl` нормализуется (только https, без userinfo/порта/query; относительный — только с одного `/`, от `VITE_BACKEND_URL`); возвращается `name`; `thumbUrl` убран — в ленте сама картинка без обрезки (миниатюра ручки — квадрат 384×384 с обрезкой), клик открывает `MediaViewer` порталом в body (файлы чата отдаются с `Content-Disposition: attachment`, `window.open` скачивал бы); обёртка `not-prose ym-hide-content`; `key={fullUrl}`; у кнопки предохранителя `aria-describedby` вместо `title`. Актуальный код — в ветке фронта.
+
 **Files:**
 - Create: `src/components/chat/attachmentPreview.ts`, `src/components/chat/attachmentPreview.test.ts`
 
