@@ -48,6 +48,24 @@ export function looksLikeCliRefusal(text: string): boolean {
   return !!t && t.length <= 300 && !/[а-яё]/i.test(t) && CLI_REFUSAL_RE.test(t);
 }
 
+// Хвосты отказа CLI, которые можно показать, — белый список: время сброса
+// лимита (3pm, 11:30am, 15:00, зона в скобках — только буквы и _/+-) и
+// подсказка про вход. Регулярка привязана к обоим концам хвоста.
+const REFUSAL_TAIL_RE = /^ · (?:resets (?:\d{1,2}(?::\d{2})?[ap]m|\d{1,2}:\d{2})(?: \([A-Za-z_/+-]+\))?|Please run \/login)$/;
+
+/** Деталь отказа CLI для безопасного текста (spec 2026-11-02-safe-cli-errors):
+ *  фраза отказа (CLI_REFUSAL_RE) и хвост из белого списка — « · resets
+ *  <время>[ (<зона>)]» или « · Please run /login». looksLikeCliRefusal привязан
+ *  только к началу: дальше до 300 знаков может идти ответ модели, поэтому
+ *  любой другой хвост отбрасывается — остаётся только фраза. Не отказ — ''. */
+export function refusalDetail(text: string): string {
+  if (!looksLikeCliRefusal(text)) return '';
+  const t = String(text).trim();
+  const phrase = CLI_REFUSAL_RE.exec(t)?.[0] ?? '';
+  const tail = t.slice(phrase.length);
+  return REFUSAL_TAIL_RE.test(tail) ? phrase + tail : phrase;
+}
+
 // ── Безопасный текст ошибки CLI (spec 2026-11-02-safe-cli-errors) ──────────
 // Сырой текст сбоя CLI (result, stdout, stderr, сообщение JSON.parse) несёт
 // фрагменты разговоров: он только классифицируется внутри ClaudeCliService.
@@ -93,25 +111,37 @@ export function apiErrorStatus(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isInteger(v) && v >= 100 && v <= 599 ? v : undefined;
 }
 
+const ERROR_CODE_RE = /^[A-Za-z0-9_]{1,40}$/;
+
+/** Код ошибки для безопасного текста: код системной ошибки (ENOENT,
+ *  ERR_INVALID_ARG_VALUE) или имя её класса (TypeError); не похоже на код —
+ *  'Error'. Сообщение таких ошибок наружу не идёт: оно цитирует аргументы — у
+ *  spawn с NUL в аргументе это начало промпта или значение env с ключом. */
+export function safeErrorCode(e: unknown): string {
+  const code = (e as any)?.code;
+  if (typeof code === 'string' && ERROR_CODE_RE.test(code)) return code;
+  const name = (e as any)?.name;
+  if (typeof name === 'string' && ERROR_CODE_RE.test(name)) return name;
+  return 'Error';
+}
+
 /**
- * Безопасный текст ошибки CLI:
- * `claude CLI <what>: <kind>[, status N][, exit N][, <detail>]`.
+ * Безопасный текст ошибки CLI: `claude CLI <what>: <kind>[, status N][, <detail>]`.
  * what — из фиксированного словаря вызывающего («ошибка», «код выхода N»,
- * «отказ», «неверный JSON (stdout N байт)»); status — только целое 100–599;
- * exit — только целое; detail — диагностика CLI (cliDiagnostic) или текст
- * отказа самого CLI (looksLikeCliRefusal), одной строкой и не длиннее 160.
+ * «сигнал SIGxxx», «отказ», «неверный JSON (stdout N байт)», «не запустился
+ * (<код>)», «сбой (<код>)»); status — только целое 100–599; detail —
+ * диагностика CLI (cliDiagnostic) или отказ самого CLI (refusalDetail), одной
+ * строкой и не длиннее 160.
  */
 export function safeCliText(p: {
   what: string;
   kind: LlmOutageKind;
   status?: number;
-  exit?: number | null;
   detail?: string;
 }): string {
   const parts: string[] = [p.kind];
   const status = apiErrorStatus(p.status);
   if (status !== undefined) parts.push(`status ${status}`);
-  if (typeof p.exit === 'number' && Number.isInteger(p.exit)) parts.push(`exit ${p.exit}`);
   const detail = String(p.detail ?? '').replace(/[\r\n]+/g, ' ').trim().slice(0, SAFE_DETAIL_MAX);
   if (detail) parts.push(detail);
   return `claude CLI ${p.what}: ${parts.join(', ')}`;
