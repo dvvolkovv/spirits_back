@@ -13,8 +13,11 @@
  *   ssh <релей> '<ключи sessions.json по строке>' \
  *     | ssh <прод> 'cd ~/spirits_back && npx ts-node scripts/relay-fs-key-map.ts' \
  *     | ssh <релей> 'umask 077 && cat > ~/.relay-fs-key-map.tsv'
- * stdout — «ключ<TAB>fs_key» на строку; stderr — одна строка счётчиков.
- * Коды выхода: 0 — готово, 2 — нет ни RELAY_FS_SALT, ни JWT_SECRET.
+ * stdout — «ключ<TAB>fs_key» на строку; stderr — одна строка счётчиков,
+ * в ней «соль — RELAY_FS_SALT».
+ * Коды выхода: 0 — готово, 2 — нет RELAY_FS_SALT. Отката на JWT_SECRET (как у
+ * relayFsKey) здесь нет: карта на другой соли разложила бы файлы по чужим
+ * папкам — пусть лучше не будет карты.
  */
 import 'dotenv/config';
 import { relayFsKeyMap } from '../src/chat/relay-fs-key-map';
@@ -29,26 +32,13 @@ function readStdin(): Promise<string> {
 }
 
 async function main(): Promise<number> {
-  const salt = (process.env.RELAY_FS_SALT || '').trim();
-  if (!salt && !process.env.JWT_SECRET) {
-    process.stderr.write('relay-fs-key-map: нет ни RELAY_FS_SALT, ни JWT_SECRET — fs_key не посчитать\n');
+  if (!(process.env.RELAY_FS_SALT || '').trim()) {
+    process.stderr.write('relay-fs-key-map: нет RELAY_FS_SALT — fs_key не посчитать (откат на JWT_SECRET не делаем)\n');
     return 2;
   }
-  const input = await readStdin();
-  // relayFsKey на JWT_SECRET предупреждает в stderr на каждый ключ — здесь
-  // одна строка итога вместо тысяч одинаковых.
-  const warn = console.warn;
-  console.warn = () => undefined;
-  let r;
-  try {
-    r = relayFsKeyMap(input);
-  } finally {
-    console.warn = warn;
-  }
+  const r = relayFsKeyMap(await readStdin());
   process.stdout.write(r.lines.map((l) => l + '\n').join(''));
-  process.stderr.write(
-    `relay-fs-key-map: ключей ${r.keys}, пропущено ${r.skipped}; соль — ${salt ? 'RELAY_FS_SALT' : 'JWT_SECRET (RELAY_FS_SALT не задан)'}\n`,
-  );
+  process.stderr.write(`relay-fs-key-map: ключей ${r.keys}, пропущено ${r.skipped}; соль — RELAY_FS_SALT\n`);
   return 0;
 }
 
