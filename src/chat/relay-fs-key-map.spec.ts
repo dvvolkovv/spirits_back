@@ -56,12 +56,12 @@ describe('relayFsKeyMap', () => {
 
 describe('scripts/relay-fs-key-map.ts', () => {
   const repo = path.resolve(__dirname, '../..');
-  const run = (cwd: string, input: string) =>
+  const run = (cwd: string, input: string, extraEnv: Record<string, string> = {}) =>
     spawnSync(
       process.execPath,
       [require.resolve('ts-node/dist/bin'), '-P', path.join(repo, 'tsconfig.json'), path.join(repo, 'scripts/relay-fs-key-map.ts')],
-      // Соль — только из .env рабочего каталога, не из окружения теста.
-      { cwd, input, encoding: 'utf8', env: { PATH: process.env.PATH, TS_NODE_TRANSPILE_ONLY: '1' } },
+      // Соль — только из .env (рабочего каталога или DOTENV_CONFIG_PATH), не из окружения теста.
+      { cwd, input, encoding: 'utf8', env: { PATH: process.env.PATH, TS_NODE_TRANSPILE_ONLY: '1', ...extraEnv } },
     );
 
   it('stdin → stdout «ключ<TAB>fs_key», соль из .env; в stderr одна строка счётчиков', () => {
@@ -72,6 +72,21 @@ describe('scripts/relay-fs-key-map.ts', () => {
       expect(r.status).toBe(0);
       expect(r.stdout).toBe(KEYS.map((k) => `${k}\t${hmac(k)}\n`).join(''));
       expect(r.stderr.trim().split('\n')).toEqual([expect.stringMatching(/ключей 3, пропущено 0; соль — RELAY_FS_SALT$/)]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it('карта стенда: DOTENV_CONFIG_PATH — соль из .env стенда, .env рабочего каталога не читается', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-fs-key-map-'));
+    try {
+      fs.writeFileSync(path.join(dir, '.env'), `RELAY_FS_SALT=${SALT}\n`);
+      const standEnv = path.join(dir, 'stand.env');
+      fs.writeFileSync(standEnv, 'RELAY_FS_SALT=соль стенда\n');
+      const r = run(dir, KEYS.join('\n') + '\n', { DOTENV_CONFIG_PATH: standEnv });
+      expect(r.status).toBe(0);
+      const stand = (k: string) => createHmac('sha256', 'соль стенда').update(k).digest('hex').slice(0, 32);
+      expect(r.stdout).toBe(KEYS.map((k) => `${k}\t${stand(k)}\n`).join(''));
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

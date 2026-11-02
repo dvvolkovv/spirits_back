@@ -509,6 +509,7 @@ function relayWorld(t) {
     mapPath: path.join(home, "fs-key-map.tsv"),
     statePath: path.join(home, ".relay-scrub-map.jsonl"),
     journalPath: path.join(home, "journal.jsonl"),
+    standMapPath: null,
     sessions: {}, map: new Map(), mapExtra: "",
   };
   for (const d of [path.join(w.root, "-tmp"), w.out, path.join(w.up, "mcp"), home]) fs.mkdirSync(d, { recursive: true });
@@ -531,8 +532,16 @@ function addSession(w, key, rows, { inMap = true, mtime, save = true } = {}) {
 }
 const runOpts = (w, extra = {}) => ({
   root: w.root, sessionsPath: w.sessionsPath, outputs: w.out, uploads: w.up,
-  fsKeyMapPath: w.mapPath, statePath: w.statePath, journalPath: w.journalPath, minAgeMs: MIN15, ...extra,
+  fsKeyMapPath: w.mapPath, standMapPath: w.standMapPath, statePath: w.statePath, journalPath: w.journalPath,
+  minAgeMs: MIN15, ...extra,
 });
+// Тестовый стенд ходит в тот же релей с теми же ключами, но со своей солью.
+const STAND = "соль стенда";
+function saveStandMap(w) {
+  w.standMapPath = path.join(w.home, "fs-key-map-stand.tsv");
+  fs.writeFileSync(w.standMapPath, Object.keys(w.sessions).map((k) => k + "\t" + fsKeyOf(k, STAND) + "\n").join(""));
+  fs.chmodSync(w.standMapPath, 0o600);
+}
 // Ход до части Б: загрузки и папка по ключу сессии, строка с номером.
 const preTurn = (w, key, text, files = [], dir = key) =>
   user(
@@ -999,12 +1008,126 @@ test("канарейка: --only-phones берёт первые N номеров
   assert.ok(fs.readFileSync(two.s.A.file).equals(aBefore));
 });
 
+// S — ходы после части Б только со стенда (его соль), M — с прода и со стенда.
+function sessionS(w) {
+  const key = PHONE + "_24_ru";
+  put(w.out, key + "/s.txt", "s");
+  return addSession(w, key, [preTurn(w, key, "Ход"), postTurn(w, fsKeyOf(key, STAND), "Ход стенда")]);
+}
+function sessionM(w) {
+  const key = PHONE + "_26_ru";
+  put(w.out, key + "/m.txt", "m");
+  return addSession(w, key, [preTurn(w, key, "Ход"), postTurn(w, fsKeyOf(key), "Ход прода"), postTurn(w, fsKeyOf(key, STAND), "Ход стенда")]);
+}
+
+test("карта стенда: ходы стенда — не расхождение; смешанная сессия — в пользу прода; папки — под fs_key прода", async (t) => {
+  const w = relayWorld(t);
+  sessionA(w);
+  const st = sessionS(w);
+  const mx = sessionM(w);
+
+  // Без карты стенда его ходы выглядят расхождением — --apply отказал бы целиком.
+  const blind = await runScrub(runOpts(w));
+  assert.deepEqual(pick(blind, "keyMismatch", "mapRefused"), { keyMismatch: 1, mapRefused: true });
+
+  saveStandMap(w);
+  const dry = await runScrub(runOpts(w));
+  assert.deepEqual(
+    pick(dry, "keyAgree", "keyMismatch", "keyAmbiguous", "keyStand", "keyMixed", "mapRefused"),
+    { keyAgree: 2, keyMismatch: 0, keyAmbiguous: 0, keyStand: 1, keyMixed: 1, mapRefused: false },
+  );
+  const s = await runScrub(runOpts(w, { apply: true }));
+  assert.equal(s.errors, 0, JSON.stringify(s.errorList));
+  assert.equal(read(w.out, st.fk, "s.txt"), "s");
+  assert.equal(read(w.out, mx.fk, "m.txt"), "m");
+  for (const x of [st, mx]) {
+    const text = fs.readFileSync(x.file, "utf8");
+    assert.ok(!text.includes(PHONE), x.rel);
+    assert.ok(text.includes(path.join(w.out, fsKeyOf(x.key, STAND))), "пути стенда не тронуты");
+    assert.ok(parsed(Buffer.from(text))[0].message.content.includes("Output directory for created files: " + path.join(w.out, x.fk) + "\n\n" + NEW));
+  }
+});
+
+test("карта стенда не спасает чужую соль: ход ни прода, ни стенда — расхождение, --apply отказывает", async (t) => {
+  const w = relayWorld(t);
+  sessionA(w);
+  const key = PHONE + "_27_ru";
+  put(w.out, key + "/q.txt", "q");
+  addSession(w, key, [preTurn(w, key, "Ход"), postTurn(w, fsKeyOf(key, "третья соль"), "Ход")]);
+  saveStandMap(w);
+  const before = state(w.base);
+
+  const dry = await runScrub(runOpts(w));
+  assert.deepEqual(pick(dry, "keyMismatch", "mapRefused"), { keyMismatch: 1, mapRefused: true });
+  await assert.rejects(runScrub(runOpts(w, { apply: true })), { code: "EMAPCHECK" });
+  assert.deepEqual(state(w.base), before);
+});
+
+test("канарейка: в списке ключей должны быть ВСЕ сессии номера и только существующие ключи", async (t) => {
+  const { w, s } = fullWorld(t);
+  const before = state(w.base);
+  await assert.rejects(runScrub(runOpts(w, { apply: true, sessionsFilter: new Set([s.A.key]) })), { code: "EPARTIAL" });
+  await assert.rejects(
+    runScrub(runOpts(w, { apply: true, sessionsFilter: new Set([s.C.key, phoneN(999) + "_1_ru"]) })),
+    { code: "EKEYSUNKNOWN" },
+  );
+  assert.deepEqual(state(w.base), before);
+
+  const all = await runScrub(runOpts(w, { apply: true, sessionsFilter: new Set([s.A.key, s.B.key, s.D.key, s.E.key]) }));
+  assert.equal(all.selected, 4);
+  assert.ok(!fs.readFileSync(s.A.file, "utf8").includes(PHONE));
+});
+
+test("причины пропуска выбранных сессий считаются отдельно: «к записи 0» не путается с успехом", async (t) => {
+  const { w, s } = fullWorld(t);
+  addSession(w, THIRD + "_19_ru", [preTurn(w, THIRD + "_19_ru", "Ход")]); // номер G занят свежей сессией
+  const r = await runScrub(runOpts(w));
+  assert.deepEqual(r.sel, { processed: 4, nokey: 1, ambiguous: 0, mismatch: 0, fresh: 1, live: 0, busy: 1, shared: 0, error: 0 });
+  void s;
+});
+
+test("--list-residual: id сессий CLI, где номер владельца остаётся после чистки, с причинами; ничего не меняет", async (t) => {
+  const w = relayWorld(t);
+  sessionA(w);
+  const c = sessionC(w);
+  const e = sessionE(w);
+  // T — номер в блоке рассуждений: его не трогаем.
+  const keyT = PHONE + "_25_ru";
+  const think = assistant("");
+  think.message.content = [{ type: "thinking", thinking: "Номер " + PHONE, signature: "EqQBCkYI" }, { type: "text", text: "ок" }];
+  const tr = addSession(w, keyT, [preTurn(w, keyT, "Ход"), think, postTurn(w, fsKeyOf(keyT), "Ход")]);
+  // Общая папка: пути в её транскриптах остаются с номером.
+  const keyRu = PHONE + "_custom:0b7c9d1e-5a2f-4c3b-9e8d-7f6a5b4c3d2e_ru";
+  const keyEn = PHONE + "_custom:0b7c9d1e-5a2f-4c3b-9e8d-7f6a5b4c3d2e_en";
+  const shared = keyRu.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 48);
+  put(w.out, shared + "/c.txt", "c");
+  const ru = addSession(w, keyRu, [preTurn(w, keyRu, "Ход", [], shared)]);
+  const en = addSession(w, keyEn, [preTurn(w, keyEn, "Ход", [], shared)]);
+  await runScrub(runOpts(w, { apply: true }));
+  const before = state(w.base);
+
+  const listPath = path.join(w.base, "residual.txt");
+  const r = await runScrub(runOpts(w, { residual: true }));
+  assert.deepEqual(r.residual.counts, {
+    "рассуждения": 1, "пути": 2, "без fs_key": 1, "неоднозначная": 0, "расхождение": 0,
+    "битые строки": 0, "неканоничные строки": 0, "ждёт прохода": 0, "ошибка чтения": 0,
+  });
+  const rows = new Map(r.residual.list.map((x) => [x.id, x.reasons]));
+  assert.deepEqual([...rows.keys()].sort(), [tr.cliId, ru.cliId, en.cliId, e.cliId].sort());
+  assert.deepEqual(rows.get(tr.cliId), ["рассуждения"]);
+  assert.deepEqual(rows.get(e.cliId), ["без fs_key"]);
+  assert.ok(!rows.has(c.cliId), "чистая сессия не в списке");
+  assert.deepEqual(state(w.base), before);
+  void listPath;
+});
+
 // ---------------------------------------------------------------- запуск
 
 const SCRIPT = fileURLToPath(new URL("./relay-scrub-phone.mjs", import.meta.url));
 const cliArgs = (w, extra = []) => [
   "--root", w.root, "--sessions", w.sessionsPath, "--outputs", w.out, "--uploads", w.up,
-  "--fs-key-map", w.mapPath, "--state", w.statePath, ...extra,
+  "--fs-key-map", w.mapPath, "--state", w.statePath,
+  ...(w.standMapPath ? ["--stand-map", w.standMapPath] : []), ...extra,
 ];
 const cli = (args, env = {}) =>
   spawnSync(process.execPath, [SCRIPT, ...args], { encoding: "utf8", env: { ...process.env, ...env } });
@@ -1023,8 +1146,10 @@ test("CLI: без --apply — сухой прогон: все счётчики, 
   for (const re of [
     /сухой прогон/,
     /^карта fs_key: .+, строк с ошибкой: 1$/m,
-    /^сверка карты с транскриптами: совпало 1, расхождений 0, неоднозначных 0$/m,
+    /^карта стенда: не задана$/m,
+    /^сверка карты с транскриптами: совпало 1, расхождений 0, неоднозначных 0, ходы стенда 0, смешанных 0$/m,
     /^номеров: 3; сессий: 6 \(без номера: 1\); выбрано: 6$/m,
+    /^выбранные сессии: обработано 4; пропущено: без fs_key 1, неоднозначных 0, расхождений 0, свежих 1, с живым процессом 0, номер занят 0, общая папка 0, с ошибкой 0$/m,
     /^fs_key: из карты 4, из транскрипта 1, без fs_key 1 \(из них с номером: 1\)$/m,
     /^свежих: 1, с живым процессом CLI: 0; отложено сессий \(весь номер\): 1\b/m,
     /^без транскрипта: 0$/m,
@@ -1158,6 +1283,54 @@ test("CLI: канарейка по списку ключей (--sessions-file, 6
   assert.match(r.stdout, /выбрано: 1$/m);
   assert.ok(!fs.readFileSync(s.C.file, "utf8").includes(OTHER));
   assert.ok(fs.readFileSync(s.A.file).equals(aBefore));
+});
+
+test("CLI: --stand-map (600) снимает отказ из-за ходов стенда; неполный список номера — код 2", (t) => {
+  const w = relayWorld(t);
+  sessionA(w);
+  const st = sessionS(w);
+  const blind = cli(cliArgs(w, ["--apply", "--journal", w.journalPath]));
+  assert.equal(blind.status, 2);
+  assert.match(blind.stderr, /не сходится с транскриптами/);
+
+  saveStandMap(w);
+  fs.chmodSync(w.standMapPath, 0o640);
+  const open = cli(cliArgs(w));
+  assert.equal(open.status, 2);
+  assert.match(open.stderr, /карта стенда доступна не только владельцу — chmod 600/);
+  fs.chmodSync(w.standMapPath, 0o600);
+
+  const keys = path.join(w.home, "canary.keys");
+  fs.writeFileSync(keys, st.key + "\n", { mode: 0o600 }); // у номера ещё A
+  const partial = cli(cliArgs(w, ["--sessions-file", keys]));
+  assert.equal(partial.status, 2);
+  assert.match(partial.stderr, /не все сессии номера/);
+
+  const r = cli(cliArgs(w, ["--apply", "--journal", w.journalPath]));
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^карта стенда: .+, строк с ошибкой: 0$/m);
+  assert.match(r.stdout, /ходы стенда 1, смешанных 0$/m);
+  assert.equal(read(w.out, st.fk, "s.txt"), "s");
+  assert.ok(noPhones(r.stdout + r.stderr));
+});
+
+test("CLI --list-residual: файл 600 с id сессий и причинами, без ключей и номеров; ничего не меняет", (t) => {
+  const w = relayWorld(t);
+  sessionA(w);
+  const e = sessionE(w);
+  assert.equal(cli(cliArgs(w, ["--apply", "--journal", w.journalPath])).status, 0);
+  const before = state(w.base);
+  const listPath = path.join(tmpRoot(t), "residual.txt");
+
+  const r = cli(cliArgs(w, ["--list-residual", listPath]));
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^сессий с остатком номера: 1 — .*без fs_key 1/m);
+  assert.equal(fs.statSync(listPath).mode & 0o777, 0o600);
+  const text = fs.readFileSync(listPath, "utf8");
+  assert.equal(text, e.cliId + "\tбез fs_key\n");
+  assert.ok(noPhones(r.stdout + r.stderr + text));
+  assert.deepEqual(state(w.base), before);
+  assert.equal(cli(cliArgs(w, ["--list-residual", listPath, "--apply"])).status, 2, "только чтение — без --apply");
 });
 
 test(
