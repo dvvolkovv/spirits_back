@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger, OnModuleInit, Optional, forwardRef } from '@nestjs/common';
+import { GrammyError } from 'grammy';
 import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -38,13 +39,101 @@ const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const TG_PHOTO_MAX_BYTES = 10 * 1024 * 1024;
 
 /**
- * Скачанное по {{file:}} — фотография для Telegram? JPEG/PNG/WEBP до 10 МБ.
- * GIF — нет: sendPhoto сделал бы из анимации стоп-кадр.
+ * export = sharp: без esModuleInterop только так (default-импорт дал бы
+ * undefined) — тот же приём и тот же повод, что у require('sharp') в
+ * chat/chat-files/thumbnails.ts (там подробный комментарий про типы sharp 0.35).
  */
-export function isTelegramPhoto(contentType: string | undefined, bytes: number): boolean {
+const sharp = require('sharp') as unknown as typeof import('sharp/lib/index');
+
+/**
+ * Ответ на {{file: url=…}} — текст (HTML-страница), а не файл? Относительный
+ * путь со страницы own-media.ts достраивает НАШИМ доменом (toAbsoluteUrl), и
+ * SPA на любой несуществующий путь отвечает 200 text/html; ссылка на страницу
+ * картинки (например, карточка файла на Викискладе) — тоже HTML, а не сама
+ * картинка. Без проверки такая страница тихо уходила бы в чат документом с
+ * бессмысленным именем. Явно попросили именно HTML-файл (имя маркера кончается
+ * на .html/.htm) — не тот случай, пропускаем.
+ */
+export function isUnexpectedTextResponse(contentType: string | undefined, name: string): boolean {
   const mime = (contentType || '').split(';')[0].trim().toLowerCase();
-  return (mime === 'image/jpeg' || mime === 'image/png' || mime === 'image/webp')
-    && bytes > 0 && bytes <= TG_PHOTO_MAX_BYTES;
+  if (!mime.startsWith('text/')) return false;
+  return !/\.html?$/i.test(name);
+}
+
+interface ProbedImage {
+  format: string;
+  width: number;
+  height: number;
+  /** Число кадров: >1 — анимация (у нас это только анимированный webp). */
+  pages?: number;
+}
+
+/**
+ * Формат и размер — по самим байтам (sharp), а не по Content-Type заголовка:
+ * его легко не угадать или подделать (image/jpg, application/octet-stream на
+ * самодельных раздачах — встречается на практике). Не картинка или формат,
+ * который sharp не разбирает, — null, вызывающий код шлёт как есть документом.
+ */
+async function probeImage(buf: Buffer): Promise<ProbedImage | null> {
+  try {
+    const meta = await sharp(buf, { limitInputPixels: 50_000_000 }).metadata();
+    if (!meta.format || !meta.width || !meta.height) return null;
+    return { format: meta.format, width: meta.width, height: meta.height, pages: meta.pages };
+  } catch {
+    return null;
+  }
+}
+
+/** Форматы, которые отдаём в sendPhoto; GIF — нет: фото сделало бы из анимации стоп-кадр. */
+const TG_PHOTO_FORMATS = new Set(['jpeg', 'png', 'webp']);
+
+/**
+ * План отправки картинки по её метаданным (чистая функция — проверяется
+ * обычными объектами, без генерации картинки на каждую ветку):
+ *  - 'none' — Telegram заведомо не примет фото (формат, анимация, пропорции)
+ *    или оно не нужно — шлём как документ;
+ *  - 'photo' — только фото;
+ *  - 'photo+original' — Telegram пережимает фото по длинной стороне до
+ *    ~2560px, и мелкий текст на схеме/карте станет нечитаемым — следом за
+ *    фото шлём оригинал документом.
+ */
+export function classifyTelegramPhoto(meta: ProbedImage): 'none' | 'photo' | 'photo+original' {
+  if (!TG_PHOTO_FORMATS.has(meta.format)) return 'none';
+  if ((meta.pages ?? 1) > 1) return 'none'; // анимированный webp
+  const { width, height } = meta;
+  if (width <= 0 || height <= 0) return 'none';
+  if (width + height > 10_000) return 'none'; // такую сумму сторон sendPhoto не примет
+  if (Math.max(width, height) / Math.min(width, height) > 20) return 'none'; // слишком вытянутое
+  return Math.max(width, height) > 2560 ? 'photo+original' : 'photo';
+}
+
+/**
+ * Итоговый план с учётом размера файла: больше предела sendPhoto (10 МБ) —
+ * сразу документом, даже если по формату и пропорциям картинка подошла бы
+ * (бессмысленно пробовать — Telegram откажет).
+ */
+async function planTelegramPhoto(buf: Buffer): Promise<'none' | 'photo' | 'photo+original'> {
+  if (buf.length === 0 || buf.length > TG_PHOTO_MAX_BYTES) return 'none';
+  const meta = await probeImage(buf);
+  return meta ? classifyTelegramPhoto(meta) : 'none';
+}
+
+/**
+ * Telegram ТОЧНО отказался принять фото — не обрыв, не таймаут grammy, не 5xx
+ * и не 429. GrammyError бросается только когда Bot API ответил валидным JSON
+ * ok:false; сетевой сбой, таймаут, не-JSON ответ (например, HTML от прокси)
+ * grammy заворачивает в HttpError — исход неизвестен, фото могло дойти, и
+ * слать тот же файл документом означало бы дубль (а под замком хода — ещё и
+ * лишний таймаут). 429 — отдельно: лимит частоты не значит, что именно эта
+ * попытка не дошла.
+ *
+ * Условие строже, чем у одноимённого по смыслу isTelegramRefusal в
+ * shorts-publisher.service.ts (там 429 в отказ попадает — retry безопасен,
+ * решает сторож). Копия, не импорт: shorts уже импортирует TgGrammyClient из
+ * tg-bot, обратный импорт замкнул бы модули в кольцо.
+ */
+export function isTelegramPhotoRefusal(e: unknown): boolean {
+  return e instanceof GrammyError && Number(e.error_code) < 500 && Number(e.error_code) !== 429;
 }
 
 type OutgoingMarker =
@@ -1885,38 +1974,76 @@ export class TgBotService implements OnModuleInit {
       );
       return;
     }
-    // file: качаем сами. Картинку (JPEG/PNG/WEBP, до 10 МБ) шлём фотографией —
-    // видно сразу в чате, без открытия документа (находка «Затыков недели»
-    // bfc4c3ad: на просьбу показать схему зала модель дала только ссылки).
-    // Остальное, включая GIF и картинки большего размера, — как раньше,
-    // document: так Telegram не ограничивает по размеру.
+    // file: качаем сами. Картинку шлём фотографией — видно сразу в чате, без
+    // открытия документа (находка «Затыков недели» bfc4c3ad: на просьбу
+    // показать схему зала модель дала только ссылки). Крупную картинку
+    // Telegram сам пережимает по длинной стороне — следом шлём и оригинал
+    // документом, иначе мелкий текст на схеме/карте теряется (classifyTelegramPhoto).
+    // GIF, непригодные пропорции и всё, что не картинка, — как раньше, document.
     //
     // Ссылку пишет МОДЕЛЬ, а её можно уговорить текстом из чата — и скачанные
     // байты уходят прямо в чат. Поэтому только fetchMediaBytes: внутренние
     // адреса (Redis, MinIO, сам API, метаданные облака) и редиректы на них
     // отбиваются до запроса. Отказ бросается как обычная ошибка, и цикл
     // маркеров выше коротко пишет в чат, что файл не приложен.
-    this.grammy.sendChatAction(msg.chat.id, 'upload_document').catch(() => {});
     const media = await fetchMediaBytes(m.url, { maxBytes: MAX_ATTACHMENT_BYTES, timeoutMs: 30_000, allowHttp: true });
     const buf = media.data;
     const name = m.name || m.url.split('/').pop() || 'file.bin';
-    // Не принял Telegram (размеры, формат) — тот же файл уходит документом,
-    // как раньше: человек в любом случае получает файл, просто без превью.
-    if (isTelegramPhoto(media.contentType, buf.length)) {
+
+    // Относительный путь со страницы own-media.ts достраивает НАШИМ доменом, и
+    // SPA на несуществующий путь отвечает 200 text/html; ссылка на страницу
+    // картинки — тоже HTML, а не сама картинка. Молча слать такое документом
+    // бессмысленно — явный отказ допишет цикл маркеров выше.
+    if (isUnexpectedTextResponse(media.contentType, name)) {
+      throw new Error('ссылка ведёт на веб-страницу, а не на файл');
+    }
+
+    const photoPlan = await planTelegramPhoto(buf);
+    if (photoPlan === 'none') {
+      this.grammy.sendChatAction(msg.chat.id, 'upload_document').catch(() => {});
+      await this.grammy.sendDocument(msg.chat.id, buf, name, {
+        reply_to_message_id: msg.message_id,
+        caption: m.caption?.slice(0, 1024),
+      });
+      return;
+    }
+
+    this.grammy.sendChatAction(msg.chat.id, 'upload_photo').catch(() => {});
+    try {
+      await this.grammy.sendPhoto(msg.chat.id, buf, {
+        reply_to_message_id: msg.message_id,
+        caption: m.caption?.slice(0, 1024),
+      });
+    } catch (e: any) {
+      // Настоящий отказ Telegram (размеры, формат, политика) — тот же файл
+      // уходит документом, как раньше: человек в любом случае получает файл,
+      // просто без превью. Сеть/таймаут/5xx/429 — исход неизвестен, фото
+      // могло дойти: отказ уходит наверх, а не дублируется документом.
+      if (!isTelegramPhotoRefusal(e)) throw e;
+      this.logger.warn(`file-маркер: sendPhoto не принял картинку в чате ${msg.chat.id} (${e?.message}) — отправляю документом`);
+      this.grammy.sendChatAction(msg.chat.id, 'upload_document').catch(() => {});
+      await this.grammy.sendDocument(msg.chat.id, buf, name, {
+        reply_to_message_id: msg.message_id,
+        caption: m.caption?.slice(0, 1024),
+      });
+      return;
+    }
+
+    if (photoPlan === 'photo+original') {
+      // Фото уже доставлено — досылаем оригинал документом, чтобы не терять то,
+      // что Telegram срезал пережатием. Сбой этой второй, необязательной
+      // отправки — не повод писать «файл не приложен»: картинку человек уже
+      // увидел, здесь только предупреждение в лог.
       try {
-        await this.grammy.sendPhoto(msg.chat.id, buf, {
+        this.grammy.sendChatAction(msg.chat.id, 'upload_document').catch(() => {});
+        await this.grammy.sendDocument(msg.chat.id, buf, name, {
           reply_to_message_id: msg.message_id,
-          caption: m.caption?.slice(0, 1024),
+          caption: tgText(lang, 'file_original_caption'),
         });
-        return;
       } catch (e: any) {
-        this.logger.warn(`file-маркер: sendPhoto не принял картинку (${e?.message}) — отправляю документом`);
+        this.logger.warn(`file-маркер: оригинал документом не ушёл в чат ${msg.chat.id} (${e?.message})`);
       }
     }
-    await this.grammy.sendDocument(msg.chat.id, buf, name, {
-      reply_to_message_id: msg.message_id,
-      caption: m.caption?.slice(0, 1024),
-    });
   }
 
   /**
