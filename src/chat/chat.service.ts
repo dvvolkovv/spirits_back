@@ -26,6 +26,7 @@ import { clientKind } from './client-kind';
 import { ClientUi, NO_CLIENT_UI } from './client-ui';
 import { toActivity } from './activity-map';
 import { ASK_RULE } from './ask-rule';
+import { WORK_RULES } from './work-rules';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
 import { LinkeonRelayFields, appendLinkeonFields, linkeonRelayFields } from './linkeon-relay-fields';
@@ -763,6 +764,12 @@ export class ChatService {
       // одного хода по холодному кэшу, как у правила карточек.
       stablePrefix += `${platformGuide(userLanguage, { helpTool: LINKEON_HELP_CLI_TOOL_NAME, store: opts.storeBuild, initiative: true })}\n\n${TOOLS_LIST_NOTE}\n\n`;
     }
+
+    // Правила длинной работы с файлами — всем ассистентам релея, и штатным, и
+    // пользовательским (work-rules.ts; находки «Затыков недели» 02.11.2026).
+    // До профиля: профиль меняется от консолидации, правила — нет, и начало
+    // префикса остаётся кэшируемым.
+    stablePrefix += `${WORK_RULES}\n\n`;
 
     // Профиль и бизнес-карточка — в СТАБИЛЬНУЮ часть, к персоне.
     //
