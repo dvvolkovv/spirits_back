@@ -911,6 +911,21 @@ export class ChatService {
     // размен: платим кэшем ровно за переключение, а не постоянно.
     if (opts.ask) stablePrefix += `${ASK_RULE}\n\n`;
 
+    // Сторож размера: stablePrefix уходит релею ОДНИМ аргументом CLI (предел
+    // 128 КБ на аргумент) — WORK_RULES держит свой бюджет (≤ 6 КБ,
+    // work-rules.spec.ts), но персона ассистента, коллеги, профиль и
+    // бизнес-карточка вместе могут раздуть префикс незаметно, по кускам.
+    // 100 000 — заранее, с запасом до предела. В лог — только метрика (длина,
+    // agentId, признак custom), без текста самого промпта: в нём профиль и
+    // бизнес-карточка пользователя.
+    const prefixBytes = Buffer.byteLength(stablePrefix, 'utf8');
+    if (prefixBytes > 100_000) {
+      this.logger.warn(
+        `buildRelayStablePrefix: ${prefixBytes} байт для agentId=${agentId}` +
+        `${isCustom ? ' (custom)' : ''} — близко к пределу аргумента CLI (128 КБ)`,
+      );
+    }
+
     return stablePrefix;
   }
 
