@@ -271,6 +271,8 @@ describe('uploadAndChat: usage из события done доезжает до с
     expect(post).not.toHaveBeenCalled();
     expect(chargedTokens(pg.calls)).toBeUndefined();
     const end = res.written.find((w: any) => w.type === 'end');
-    expect(end.content).toMatch(/Недостаточно токенов/);
+    // Текст — через noTokensMessage() (no-tokens-message.ts), находка a3da5a2b:
+    // мягкая формулировка на языке пользователя вместо «Недостаточно токенов».
+    expect(end.content).toMatch(/Токены закончились/);
   });
 });

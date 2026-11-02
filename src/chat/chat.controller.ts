@@ -252,7 +252,10 @@ export class ChatController {
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('X-Accel-Buffering', 'no');
       res.setHeader('Access-Control-Allow-Origin', '*');
-      const noTokensMsg = '⚠️ **Недостаточно токенов**\n\nВаш баланс исчерпан. Пополните баланс, чтобы продолжить общение с ассистентами.\n\n👉 [Пополнить баланс](/chat?view=tokens)';
+      const noTokensMsg = await this.chatService.noTokensReply(
+        userId,
+        typeof body.lang === 'string' ? body.lang : undefined,
+      );
       res.write(JSON.stringify({ type: 'begin' }) + '\n');
       res.write(JSON.stringify({ type: 'item', content: noTokensMsg }) + '\n');
       res.write(JSON.stringify({ type: 'end', content: noTokensMsg, usage: { input: 0, output: 0, total: 0 } }) + '\n');

@@ -19,6 +19,7 @@ import { RESPONSE_STYLE_RULE } from './response-style';
 import { ANSWER_FIRST_RULE } from './answer-first-rule';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
 import { INTERRUPTED_TURN_NOTE } from './interrupted-turn';
+import { noTokensMessage } from './no-tokens-message';
 import { CRISIS_RULE } from './crisis-rule';
 import { loadCoworkers } from './coworkers';
 import { colleaguesRule } from './colleagues-rule';
@@ -1107,7 +1108,7 @@ export class ChatService {
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('X-Accel-Buffering', 'no');
         res.setHeader('Access-Control-Allow-Origin', '*');
-        const noTokensMsg = '⚠️ **Недостаточно токенов**\n\nВаш баланс исчерпан. Пополните баланс, чтобы продолжить общение с ассистентами.\n\n👉 [Пополнить баланс](/chat?view=tokens)';
+        const noTokensMsg = await this.noTokensReply(userId, requestLang);
         res.write(JSON.stringify({ type: 'begin' }) + '\n');
         res.write(JSON.stringify({ type: 'item', content: noTokensMsg }) + '\n');
         res.write(JSON.stringify({ type: 'end', content: noTokensMsg, usage: { input: 0, output: 0, total: 0 } }) + '\n');
@@ -3154,6 +3155,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
   async getTokenBalance(userId: string): Promise<number> {
     const r = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1', [userId]);
     return Number(r.rows[0]?.tokens || 0);
+  }
+
+  /** Текст остановки на нуле — на языке пользователя (no-tokens-message.ts). */
+  async noTokensReply(userId: string, requestLang?: string): Promise<string> {
+    const lang = await this.language.resolveUserLanguage(userId, requestLang).catch(() => DEFAULT_LANGUAGE);
+    return noTokensMessage(lang);
   }
 
   /**
