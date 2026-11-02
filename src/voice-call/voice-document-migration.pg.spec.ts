@@ -5,6 +5,7 @@ import { relayFsKey } from '../chat/linkeon-relay-fields';
 import {
   DOC_PLACES,
   DocJournalEntry,
+  deleteOldDocuments,
   revertDocumentMigration,
   runDocumentMigration,
 } from './voice-document-migration';
@@ -15,6 +16,9 @@ import {
  * Postgres. Таблицы мест — настоящими файлами миграций (voice_calls и
  * voice_call_jobs, action_plans, tasks и task_events), custom_chat_history —
  * копией из 001_core_schema.sql. Хранилище — в памяти.
+ *
+ * --apply копирует и меняет адреса, старые объекты не трогает; удаляет их
+ * отдельный --delete-old по журналу (ревью ветки, I2), когда решит владелец.
  *
  * Без PROVISIONING_PG_URL набор пропускается (как остальные *.pg.spec.ts).
  */
@@ -30,6 +34,7 @@ const DOC_A = '0a0a0a0a-1111-4111-8111-111111111111'; // номер, файл н
 const DOC_B = '0b0b0b0b-2222-4222-8222-222222222222'; // uuid почты, файл на месте
 const DOC_GONE = '0c0c0c0c-3333-4333-8333-333333333333'; // номер, файла нет
 const DOC_NEW = '0d0d0d0d-4444-4444-8444-444444444444'; // уже в новой папке
+const DOC_STRAY = '0e0e0e0e-5555-4555-8555-555555555555'; // старый объект без ссылок и без журнала
 
 const oldKey = (folder: string, doc: string) => `documents/${folder}/${doc}.md`;
 const urlOf = (key: string) => `${PUB}/${key}`;
@@ -44,6 +49,7 @@ function memStore(events: string[]) {
     put,
     has: (key: string) => objects.has(`${BUCKET}/${key}`),
     body: (key: string) => objects.get(`${BUCKET}/${key}`)?.body.toString(),
+    drop: (key: string) => objects.delete(`${BUCKET}/${key}`),
     head: jest.fn(async (bucket: string, key: string) => {
       const o = objects.get(`${bucket}/${key}`);
       return o ? { size: o.body.length, contentType: o.contentType } : null;
@@ -73,7 +79,7 @@ maybe('перенос голосовых документов против жи�
   const OLD_SALT = process.env.RELAY_FS_SALT;
   const OLD_JWT = process.env.JWT_SECRET;
 
-  /** pg с журналом UPDATE — чтобы видеть порядок «замена → удаление». */
+  /** pg с журналом UPDATE — чтобы видеть, что и когда меняется. */
   const pgOf = (events: string[], before?: (sql: string, params: any[]) => Promise<void>) => ({
     query: async (sql: string, params: any[] = []) => {
       if (/^\s*UPDATE/i.test(sql)) {
@@ -96,15 +102,18 @@ maybe('перенос голосовых документов против жи�
     return out;
   }
 
+  const chat = (session: string, content: string, age = '2 hours') =>
+    pool.query(
+      `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, created_at)
+       VALUES ($1, 'ai', 12, $2, now() - $3::interval) RETURNING id`,
+      [session, content, age],
+    );
+
   async function seed(store: ReturnType<typeof memStore>) {
     store.put(oldKey(PHONE, DOC_A), '# План\n\nтекст А');
     store.put(oldKey(UUID_USER, DOC_B), '# Письмо\n\nтекст Б');
     store.put(`documents/${relayFsKey(PHONE)}/${DOC_NEW}.md`, '# Новый\n\nтекст');
-    const chat = (session: string, content: string) =>
-      pool.query(
-        `INSERT INTO custom_chat_history (session_id, sender_type, agent, content) VALUES ($1, 'ai', 12, $2)`,
-        [session, content],
-      );
+    store.put(oldKey(PHONE, DOC_STRAY), '# Ничей\n\nтекст');
     await chat(`${PHONE}_12`, `## План\n\nвступление\n\n[Открыть документ полностью](${urlOf(oldKey(PHONE, DOC_A))})`);
     await chat(`${UUID_USER}_17`, `## Письмо\n\nвступление\n\n[Открыть документ полностью](${urlOf(oldKey(UUID_USER, DOC_B))})`);
     await chat(`${PHONE}_12`, `## Старое\n\n[Открыть документ полностью](${urlOf(oldKey(PHONE, DOC_GONE))})`);
@@ -142,6 +151,9 @@ maybe('перенос голосовых документов против жи�
     ]);
   }
 
+  const apply = (events: string[], store: ReturnType<typeof memStore>, journal: DocJournalEntry[] = []) =>
+    runDocumentMigration({ pg: pgOf(events), store, apply: true, journal: (e) => journal.push(e), log: () => {} });
+
   beforeAll(async () => {
     process.env.RELAY_FS_SALT = 'voice-doc-migration-spec';
     admin = new Pool({ connectionString: PG, max: 1 });
@@ -168,6 +180,7 @@ maybe('перенос голосовых документов против жи�
   });
   beforeEach(async () => {
     process.env.RELAY_FS_SALT = 'voice-doc-migration-spec';
+    if (OLD_JWT === undefined) delete process.env.JWT_SECRET; else process.env.JWT_SECRET = OLD_JWT;
     await pool.query('TRUNCATE custom_chat_history, voice_calls, voice_call_jobs, action_plans, tasks, task_events CASCADE');
   });
   afterAll(async () => {
@@ -189,7 +202,7 @@ maybe('перенос голосовых документов против жи�
       pg: pgOf(events), store, apply: false, journal: (e) => journal.push(e), log: () => {},
     });
 
-    expect(r).toMatchObject({ docs: 3, present: 2, alreadyCopied: 0, missing: 1, copied: 0, updatedRows: 0, deleted: 0 });
+    expect(r).toMatchObject({ docs: 3, present: 2, alreadyCopied: 0, missing: 1, copied: 0, updatedRows: 0, readyToDelete: 0 });
     expect(r.rowsByPlace).toEqual({
       'custom_chat_history.content': 3,
       'voice_calls.transcript': 1,
@@ -204,27 +217,24 @@ maybe('перенос голосовых документов против жи�
     expect(journal).toEqual([]);
   });
 
-  it('--apply: копия под новым ключом, адреса заменены во всех местах, старый объект удалён после замены', async () => {
+  it('--apply: копия под новым ключом, адреса заменены во всех местах; старые объекты НЕ удаляются', async () => {
     const events: string[] = [];
     const store = memStore(events);
     await seed(store);
     const journal: DocJournalEntry[] = [];
 
-    const r = await runDocumentMigration({
-      pg: pgOf(events), store, apply: true, journal: (e) => journal.push(e), log: () => {},
-    });
+    const r = await apply(events, store, journal);
 
-    expect(r).toMatchObject({ docs: 3, copied: 2, missing: 1, copyFailed: 0, updatedRows: 9, skippedRows: 0, deleted: 2, keptOld: 0 });
-    // Объекты: новые — с тем же телом, старые — удалены; мёртвой ссылке объекта не создано.
+    expect(r).toMatchObject({
+      docs: 3, copied: 2, missing: 1, copyFailed: 0, updatedRows: 9, skippedRows: 0, readyToDelete: 2, stillReferenced: 0,
+    });
+    // Новые — с тем же телом; старые — на месте до --delete-old; мёртвой ссылке объекта не создано.
     expect(store.body(newKey(PHONE, DOC_A))).toBe('# План\n\nтекст А');
     expect(store.body(newKey(UUID_USER, DOC_B))).toBe('# Письмо\n\nтекст Б');
-    expect(store.has(oldKey(PHONE, DOC_A))).toBe(false);
-    expect(store.has(oldKey(UUID_USER, DOC_B))).toBe(false);
+    expect(store.has(oldKey(PHONE, DOC_A))).toBe(true);
+    expect(store.has(oldKey(UUID_USER, DOC_B))).toBe(true);
     expect(store.has(newKey(PHONE, DOC_GONE))).toBe(false);
-    // Удаление — только после всех замен.
-    const lastUpdate = events.map((e) => e.startsWith('update')).lastIndexOf(true);
-    const firstDelete = events.findIndex((e) => e.startsWith('delete'));
-    expect(firstDelete).toBeGreaterThan(lastUpdate);
+    expect(events.filter((e) => e.startsWith('delete'))).toEqual([]);
 
     // Ни номера, ни uuid пользователя в адресах документов больше нет.
     const after = await snapshot();
@@ -243,14 +253,14 @@ maybe('перенос голосовых документов против жи�
       `## Новый\n\n[Открыть документ полностью](${urlOf(`documents/${relayFsKey(PHONE)}/${DOC_NEW}.md`)})`,
     );
 
-    // Журнал — только ключи и места, без текстов.
-    const rows = journal.filter((e) => e.kind === 'row');
-    expect(rows).toHaveLength(9);
+    // Журнал: копии, замены, «можно удалять» — только места и ключи, без текстов.
+    expect(journal.filter((e) => e.kind === 'row')).toHaveLength(9);
     expect(journal.filter((e) => e.kind === 'copied')).toHaveLength(2);
-    expect(journal.filter((e) => e.kind === 'deleted')).toEqual([
-      { kind: 'deleted', from: oldKey(PHONE, DOC_A), to: newKey(PHONE, DOC_A) },
-      { kind: 'deleted', from: oldKey(UUID_USER, DOC_B), to: newKey(UUID_USER, DOC_B) },
+    expect(journal.filter((e) => e.kind === 'replaced')).toEqual([
+      { kind: 'replaced', from: oldKey(PHONE, DOC_A), to: newKey(PHONE, DOC_A) },
+      { kind: 'replaced', from: oldKey(UUID_USER, DOC_B), to: newKey(UUID_USER, DOC_B) },
     ]);
+    expect(journal.filter((e) => e.kind === 'deleted')).toEqual([]);
     for (const e of journal) {
       expect(Object.keys(e).sort()).toEqual(
         e.kind === 'row' ? ['column', 'from', 'id', 'kind', 'table', 'to'] : ['from', 'kind', 'to'],
@@ -262,31 +272,118 @@ maybe('перенос голосовых документов против жи�
     }
   });
 
+  it('--delete-old удаляет ровно записанные в журнале; повторный — ничего', async () => {
+    const events: string[] = [];
+    const store = memStore(events);
+    await seed(store);
+    const journal: DocJournalEntry[] = [];
+    await apply(events, store, journal);
+    events.length = 0;
+    const deletions: DocJournalEntry[] = [];
+
+    const r = await deleteOldDocuments({
+      pg: pgOf(events), store, entries: journal, journal: (e) => deletions.push(e), log: () => {},
+    });
+
+    expect(r).toEqual({ deleted: 2, alreadyGone: 0, kept: 0 });
+    expect(store.has(oldKey(PHONE, DOC_A))).toBe(false);
+    expect(store.has(oldKey(UUID_USER, DOC_B))).toBe(false);
+    expect(store.has(newKey(PHONE, DOC_A))).toBe(true);
+    expect(store.has(newKey(UUID_USER, DOC_B))).toBe(true);
+    // Объект без записи в журнале не трогается, даже если он прежнего вида.
+    expect(store.has(oldKey(PHONE, DOC_STRAY))).toBe(true);
+    expect(deletions).toEqual([
+      { kind: 'deleted', from: oldKey(PHONE, DOC_A), to: newKey(PHONE, DOC_A) },
+      { kind: 'deleted', from: oldKey(UUID_USER, DOC_B), to: newKey(UUID_USER, DOC_B) },
+    ]);
+    expect(events.filter((e) => e.startsWith('update'))).toEqual([]);
+
+    events.length = 0;
+    const again: DocJournalEntry[] = [];
+    const second = await deleteOldDocuments({
+      pg: pgOf(events), store, entries: journal, journal: (e) => again.push(e), log: () => {},
+    });
+
+    expect(second).toEqual({ deleted: 0, alreadyGone: 2, kept: 0 });
+    expect(again).toEqual([]);
+    expect(events).toEqual([]);
+  });
+
+  it('--delete-old не удаляет, если на старый ключ снова есть ссылка или новой копии нет', async () => {
+    const events: string[] = [];
+    const store = memStore(events);
+    await seed(store);
+    const journal: DocJournalEntry[] = [];
+    await apply(events, store, journal);
+    // Ссылка на старый адрес A появилась снова (например, свежая строка), а
+    // новой копии B в хранилище нет.
+    await chat(`${PHONE}_12`, `повтор: ${urlOf(oldKey(PHONE, DOC_A))}`, '1 minute');
+    store.drop(newKey(UUID_USER, DOC_B));
+
+    const r = await deleteOldDocuments({ pg: pgOf(events), store, entries: journal, journal: () => {}, log: () => {} });
+
+    expect(r).toEqual({ deleted: 0, alreadyGone: 0, kept: 2 });
+    expect(store.has(oldKey(PHONE, DOC_A))).toBe(true);
+    expect(store.has(oldKey(UUID_USER, DOC_B))).toBe(true);
+  });
+
+  // Ревью ветки, m6: фронт сверяет ленту с историей посимвольно, и свежую
+  // строку держит открытая вкладка — как у переноса ссылок релея.
+  it('строки истории моложе часа не трогаются, и их документ не попадает в «можно удалять»', async () => {
+    const events: string[] = [];
+    const store = memStore(events);
+    await seed(store);
+    const young = await chat(`${UUID_USER}_17`, `свежая ссылка ${urlOf(oldKey(UUID_USER, DOC_B))}`, '5 minutes');
+    const journal: DocJournalEntry[] = [];
+
+    const r = await apply(events, store, journal);
+
+    expect(r.rowsByPlace['custom_chat_history.content']).toBe(3);
+    expect(r).toMatchObject({ readyToDelete: 1, stillReferenced: 1 });
+    const kept = await pool.query(`SELECT content FROM custom_chat_history WHERE id = $1`, [young.rows[0].id]);
+    expect(kept.rows[0].content).toBe(`свежая ссылка ${urlOf(oldKey(UUID_USER, DOC_B))}`);
+    expect(journal.filter((e) => e.kind === 'replaced').map((e) => e.from)).toEqual([oldKey(PHONE, DOC_A)]);
+  });
+
   it('повторный прогон ничего не делает', async () => {
     const events: string[] = [];
     const store = memStore(events);
     await seed(store);
-    const args = { pg: pgOf(events), store, apply: true, journal: () => {}, log: () => {} };
-    await runDocumentMigration(args);
+    await apply(events, store);
     const after = await snapshot();
     events.length = 0;
     const journal: DocJournalEntry[] = [];
 
-    const second = await runDocumentMigration({ ...args, journal: (e) => journal.push(e) });
+    const second = await apply(events, store, journal);
 
-    expect(second).toMatchObject({ docs: 0, copied: 0, updatedRows: 0, deleted: 0 });
+    expect(second).toMatchObject({ docs: 0, copied: 0, updatedRows: 0, readyToDelete: 0 });
     expect(journal).toEqual([]);
     expect(events).toEqual([]);
     expect(await snapshot()).toEqual(after);
   });
 
-  it('откат по журналу возвращает адреса и старые объекты', async () => {
+  it('откат по журналу --apply возвращает адреса слово в слово', async () => {
     const events: string[] = [];
     const store = memStore(events);
     await seed(store);
     const before = await snapshot();
     const journal: DocJournalEntry[] = [];
-    await runDocumentMigration({ pg: pgOf(events), store, apply: true, journal: (e) => journal.push(e), log: () => {} });
+    await apply(events, store, journal);
+
+    const r = await revertDocumentMigration({ pg: pgOf(events), store, entries: journal, log: () => {} });
+
+    expect(r).toEqual({ restoredObjects: 0, revertedRows: 9, skippedRows: 0 });
+    expect(await snapshot()).toEqual(before);
+  });
+
+  it('откат после --delete-old возвращает и удалённые объекты', async () => {
+    const events: string[] = [];
+    const store = memStore(events);
+    await seed(store);
+    const before = await snapshot();
+    const journal: DocJournalEntry[] = [];
+    await apply(events, store, journal);
+    await deleteOldDocuments({ pg: pgOf(events), store, entries: journal, journal: (e) => journal.push(e), log: () => {} });
 
     const r = await revertDocumentMigration({ pg: pgOf(events), store, entries: journal, log: () => {} });
 
@@ -307,7 +404,7 @@ maybe('перенос голосовых документов против жи�
     await expect(r).rejects.toThrow(/не из перечня/);
   });
 
-  it('строку изменили во время переноса — она пропущена, старый объект оставлен; повторный прогон доводит', async () => {
+  it('строку изменили во время переноса — она пропущена, документ не в «можно удалять»; повторный прогон доводит', async () => {
     const events: string[] = [];
     const store = memStore(events);
     await seed(store);
@@ -319,40 +416,35 @@ maybe('перенос голосовых документов против жи�
         await pool.query(`UPDATE custom_chat_history SET content = content || ' (правка)' WHERE id = $1`, [params[1]]);
       }
     });
+    const firstJournal: DocJournalEntry[] = [];
 
-    const first = await runDocumentMigration({ pg: racing, store, apply: true, journal: () => {}, log: () => {} });
+    const first = await runDocumentMigration({
+      pg: racing, store, apply: true, journal: (e) => firstJournal.push(e), log: () => {},
+    });
 
-    expect(first.skippedRows).toBe(1);
-    expect(first.keptOld).toBeGreaterThanOrEqual(1);
+    expect(first).toMatchObject({ skippedRows: 1, readyToDelete: 1, stillReferenced: 1 });
+    expect(firstJournal.filter((e) => e.kind === 'replaced').map((e) => e.from)).toEqual([oldKey(UUID_USER, DOC_B)]);
     const left = (await pool.query(`SELECT content FROM custom_chat_history WHERE content LIKE $1`, [`%documents/${PHONE}/%`])).rows;
     expect(left).toHaveLength(1);
-    // Ссылка в пропущенной строке — на ещё живой объект.
-    const stillOld = left[0].content.match(/documents\/[^/]+\/([0-9a-f-]{36})\.md/)[1];
-    expect(store.has(oldKey(PHONE, stillOld))).toBe(true);
+    expect(store.has(oldKey(PHONE, DOC_A))).toBe(true);
 
-    const second = await runDocumentMigration({ pg: pgOf(events), store, apply: true, journal: () => {}, log: () => {} });
+    const secondJournal: DocJournalEntry[] = [];
+    const second = await apply(events, store, secondJournal);
 
-    expect(second.skippedRows).toBe(0);
-    expect(second.updatedRows).toBe(1);
+    expect(second).toMatchObject({ skippedRows: 0, updatedRows: 1, readyToDelete: 1 });
+    expect(secondJournal.filter((e) => e.kind === 'replaced').map((e) => e.from)).toEqual([oldKey(PHONE, DOC_A)]);
     const all = Object.values(await snapshot()).flat().join('\n');
     expect(all).not.toContain(`documents/${PHONE}/`);
-    expect(store.has(oldKey(PHONE, DOC_A))).toBe(false);
   });
 
-  it('без секретов для солёного хэша — отказ до первой записи', async () => {
+  it('только JWT_SECRET, без RELAY_FS_SALT — отказ до первой записи', async () => {
     const events: string[] = [];
     const store = memStore(events);
     await seed(store);
     delete process.env.RELAY_FS_SALT;
-    delete process.env.JWT_SECRET;
-    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
-    try {
-      await expect(
-        runDocumentMigration({ pg: pgOf(events), store, apply: true, journal: () => {}, log: () => {} }),
-      ).rejects.toThrow(/RELAY_FS_SALT/);
-    } finally {
-      warn.mockRestore();
-    }
+    process.env.JWT_SECRET = 'jwt-voice-doc-migration-spec';
+
+    await expect(apply(events, store)).rejects.toThrow(/RELAY_FS_SALT/);
     expect(events).toEqual([]);
   });
 
