@@ -354,10 +354,502 @@ async function openJournal(journalPath) {
 }
 
 
-export async function runScrub() {
-  throw new Error("не реализовано");
+// ---------------------------------------------------------------- сессии релея
+
+// Ключ сессии телефонного пользователя: <номер>_<ассистент>[_<язык>]
+// (бэк, src/chat/relay-session.ts). У почтовых и OAuth — UUID, их не трогаем.
+const PHONE_KEY_RE = /^\+?([0-9]{10,15})_/;
+// Имя папки или загрузки по такому ключу («+» релей заменял на «_»).
+const PHONE_NAME_RE = /^_?([0-9]{10,15})_/;
+const FS_KEY_RE = /^[0-9a-f]{32}$/;
+const NAME_MAX = 255;
+const byName = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Имя папки хода по ключу сессии — как его делал релей до части Б
+// (relay-agent/paths.mjs, sessionFsKey). Загрузка — это имя + "_" + имя файла.
+function legacyDirName(key) {
+  const safe = String(key).replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 48);
+  return safe === "" || safe === "." || safe === ".." ? null : safe;
 }
 
-export async function finishScrub() {
-  throw new Error("не реализовано");
+async function lstatOrNull(p) {
+  try {
+    return await fsp.lstat(p, { bigint: true });
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    throw e;
+  }
+}
+
+async function readdirOrEmpty(dir) {
+  try {
+    return await fsp.readdir(dir, { withFileTypes: true });
+  } catch (e) {
+    if (e.code === "ENOENT") return [];
+    throw e;
+  }
+}
+
+async function sameInode(a, b) {
+  const [x, y] = await Promise.all([lstatOrNull(a), lstatOrNull(b)]);
+  return !!x && !!y && x.ino === y.ino && x.dev === y.dev;
+}
+
+// sessions.json релея: ключ сессии → id сессии CLI.
+async function loadSessions(file) {
+  const raw = JSON.parse(await fsp.readFile(file, "utf8"));
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw withCode("EBADSESSIONS");
+  return Object.entries(raw).filter(([, v]) => typeof v === "string" && v);
+}
+
+// Карта «ключ сессии → fs_key» (TSV) — её считает прод, у которого соль.
+// В ней номера, поэтому доступна только владельцу. Ключ с двумя разными
+// fs_key — не ключ, а ошибка: такой выбрасывается и считается.
+async function loadFsKeyMap(file) {
+  const st = await fsp.stat(file);
+  if (st.mode & 0o077) throw withCode("EMAPMODE");
+  const map = new Map();
+  const doubtful = new Set();
+  let bad = 0;
+  for (const line of (await fsp.readFile(file, "utf8")).split("\n")) {
+    if (!line.trim()) continue;
+    const tab = line.indexOf("\t");
+    const key = tab > 0 ? line.slice(0, tab) : "";
+    const fsKey = tab > 0 ? line.slice(tab + 1).trim() : "";
+    if (!key || !FS_KEY_RE.test(fsKey)) {
+      bad++;
+      continue;
+    }
+    if (map.has(key) && map.get(key) !== fsKey) doubtful.add(key);
+    map.set(key, fsKey);
+  }
+  for (const key of doubtful) {
+    map.delete(key);
+    bad++;
+  }
+  return { map, bad };
+}
+
+// Таблица переименований (JSONL, 600): что куда переехало при конфликте имён.
+// Нужна второму заходу, когда старой папки уже нет, а транскрипт ещё не
+// переписан. Строка — сессия; более поздняя дополняет раннюю.
+async function loadState(file) {
+  const state = new Map();
+  let text;
+  try {
+    text = await fsp.readFile(file, "utf8");
+  } catch (e) {
+    if (e.code === "ENOENT") return state;
+    throw e;
+  }
+  for (const line of text.split("\n")) {
+    let e;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue; // пустая или оборванная строка
+    }
+    if (!e || typeof e.k !== "string" || !FS_KEY_RE.test(e.f)) continue;
+    const cur = state.get(e.k) ?? { f: e.f, on: new Set(), or: new Map(), un: new Set(), ur: new Map() };
+    cur.f = e.f;
+    for (const n of e.on ?? []) cur.on.add(n);
+    for (const [a, b] of Object.entries(e.or ?? {})) cur.or.set(a, b);
+    for (const n of e.un ?? []) cur.un.add(n);
+    for (const [a, b] of Object.entries(e.ur ?? {})) cur.ur.set(a, b);
+    state.set(e.k, cur);
+  }
+  return state;
+}
+
+async function appendState(file, entry) {
+  const fh = await fsp.open(file, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0o600);
+  try {
+    await fh.chmod(0o600);
+    await fh.write(JSON.stringify(entry) + "\n");
+    await fh.sync();
+  } finally {
+    await fh.close();
+  }
+}
+
+// Транскрипты: <root>/*/<id CLI>.jsonl — только обычные файлы, без симлинков.
+async function indexTranscripts(root) {
+  const byId = new Map();
+  for (const d of (await fsp.readdir(root, { withFileTypes: true })).sort((a, b) => byName(a.name, b.name))) {
+    if (!d.isDirectory()) continue;
+    let files;
+    try {
+      files = await fsp.readdir(path.join(root, d.name), { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const f of files) {
+      if (!f.isFile() || !f.name.endsWith(".jsonl")) continue;
+      const id = f.name.slice(0, -".jsonl".length);
+      if (!byId.has(id)) byId.set(id, path.join(root, d.name, f.name));
+    }
+  }
+  return byId;
+}
+
+// fs_key из самого транскрипта: строка «Output directory for created files:
+// <outputs>/<32 hex>» у ходов после части Б. Нет — undefined, разные — null.
+function transcriptFsKey(buf, outputs) {
+  const re = new RegExp(
+    "Output directory for created files: " + escapeRe(path.resolve(outputs)) + "/([0-9a-f]{32})(?![A-Za-z0-9._-])",
+    "g",
+  );
+  const found = new Set();
+  for (const m of buf.toString("utf8").matchAll(re)) found.add(m[1]);
+  if (found.size === 0) return undefined;
+  return found.size === 1 ? [...found][0] : null;
+}
+
+function mentionsPhone(buf, phones) {
+  const text = buf.toString("utf8");
+  if (text.includes(MARKER)) return true;
+  for (const m of text.matchAll(ANY_PHONE_RE)) if (phones.has(m[1])) return true;
+  return false;
+}
+
+// Свободное имя для записи, чьё имя в новой папке занято: «имя (прежний).расш»,
+// дальше «(прежний 2)»… Не длиннее NAME_MAX байт вместе с префиксом
+// (у загрузок это «<fs_key>_»).
+function freeName(name, isDir, isTaken, prefixBytes = 0) {
+  const ext = isDir ? "" : path.extname(name);
+  const base = name.slice(0, name.length - ext.length);
+  for (let n = 1; ; n++) {
+    const tag = n === 1 ? " (прежний)" : " (прежний " + n + ")";
+    let b = base;
+    while (b && prefixBytes + Buffer.byteLength(b + tag + ext) > NAME_MAX) b = Array.from(b).slice(0, -1).join("");
+    const candidate = b + tag + ext;
+    if (!isTaken(candidate)) return candidate;
+  }
+}
+
+// План сессии: что из старой папки и загрузок куда переезжает. Решения
+// прошлых заходов (таблица) сохраняются: итоговое имя у записи одно на все
+// заходы, иначе пути в транскрипте разошлись бы с диском.
+async function planSession(sess, fsKey, prev, ctx) {
+  const oldPath = path.join(ctx.outputs, sess.oldDir);
+  const newPath = path.join(ctx.outputs, fsKey);
+  const oldSt = await lstatOrNull(oldPath);
+  if (oldSt && !oldSt.isDirectory()) throw withCode(oldSt.isSymbolicLink() ? "ESYMLINK" : "ENOTDIR");
+  const newSt = await lstatOrNull(newPath);
+  if (newSt && !newSt.isDirectory()) throw withCode(newSt.isSymbolicLink() ? "ESYMLINK" : "ENOTDIR");
+
+  const plan = {
+    oldPath, newPath, oldSt, newSt,
+    outNames: new Set(prev?.on), outRenames: new Map(prev?.or),
+    upRests: new Set(prev?.un), upRenames: new Map(prev?.ur),
+    outMoves: [], upMoves: [], conflicts: 0, newRenames: false,
+  };
+  if (oldSt) {
+    const taken = new Set(newSt ? await fsp.readdir(newPath) : []);
+    const entries = (await fsp.readdir(oldPath, { withFileTypes: true })).sort((a, b) => byName(a.name, b.name));
+    for (const ent of entries) {
+      const src = path.join(oldPath, ent.name);
+      plan.outNames.add(ent.name);
+      let dst = plan.outRenames.get(ent.name) ?? ent.name;
+      // Занято — не перезаписываем: у старой записи будет суффикс. Тот же inode
+      // — это наша же жёсткая ссылка от прерванного захода.
+      if (taken.has(dst) && !(await sameInode(src, path.join(newPath, dst)))) {
+        dst = freeName(ent.name, ent.isDirectory(), (c) => taken.has(c));
+        plan.outRenames.set(ent.name, dst);
+        plan.newRenames = true;
+      }
+      taken.add(dst);
+      if (dst !== ent.name) plan.conflicts++;
+      plan.outMoves.push({ src, dst: path.join(newPath, dst), file: ent.isFile() });
+    }
+  }
+  const prefix = fsKey + "_";
+  for (const u of ctx.uploadsOf.get(sess.key) ?? []) {
+    const src = path.join(ctx.uploads, u.name);
+    plan.upRests.add(u.rest);
+    let rest = plan.upRenames.get(u.rest) ?? u.rest;
+    if (ctx.uploadNames.has(prefix + rest) && !(await sameInode(src, path.join(ctx.uploads, prefix + rest)))) {
+      rest = freeName(u.rest, false, (c) => ctx.uploadNames.has(prefix + c), Buffer.byteLength(prefix));
+      plan.upRenames.set(u.rest, rest);
+      plan.newRenames = true;
+    }
+    ctx.uploadNames.add(prefix + rest);
+    if (rest !== u.rest) plan.conflicts++;
+    plan.upMoves.push({ src, dst: path.join(ctx.uploads, prefix + rest), file: u.file });
+  }
+  return plan;
+}
+
+// Перенос без перезаписи. Файл — жёсткой ссылкой (link падает, если имя
+// занято) и удалением старого имени; папка — rename после проверки. Если
+// жёсткие ссылки запрещены (protected_hardlinks, файловая система), — так же,
+// как папка.
+async function moveEntry({ src, dst, file }) {
+  if (file) {
+    try {
+      await fsp.link(src, dst);
+      await fsp.unlink(src);
+      return;
+    } catch (e) {
+      if (e.code === "EEXIST") {
+        if (!(await sameInode(src, dst))) throw e;
+        await fsp.unlink(src);
+        return;
+      }
+      if (e.code !== "EPERM" && e.code !== "ENOTSUP") throw e;
+    }
+  }
+  if (await lstatOrNull(dst)) throw withCode("EEXIST");
+  await fsp.rename(src, dst);
+}
+
+async function executePlan(plan, s) {
+  if (plan.outMoves.length) {
+    if (!plan.newSt) {
+      // Папки fs_key ещё нет — права и владелец как у старой папки сессии.
+      try {
+        await fsp.mkdir(plan.newPath);
+        await fsp.chown(plan.newPath, Number(plan.oldSt.uid), Number(plan.oldSt.gid));
+        await fsp.chmod(plan.newPath, Number(plan.oldSt.mode) & 0o7777);
+      } catch (e) {
+        if (e.code !== "EEXIST") throw e;
+      }
+    }
+    for (const m of plan.outMoves) {
+      await moveEntry(m);
+      s.moved++;
+    }
+  }
+  if (plan.oldSt) {
+    try {
+      await fsp.rmdir(plan.oldPath);
+      s.dirsRemoved++;
+    } catch (e) {
+      if (e.code !== "ENOTEMPTY" && e.code !== "EEXIST") throw e;
+      s.dirsLeft++;
+    }
+  }
+  for (const m of plan.upMoves) {
+    await moveEntry(m);
+    s.movedUploads++;
+  }
+}
+
+// Весь проход по сессиям sessions.json. По каждой телефонной сессии — сразу
+// папка, загрузки и её транскрипт; свежесть — по mtime транскрипта. Сироты
+// (транскрипты не из sessions.json), папки и загрузки без сессии — только счёт.
+export async function runScrub(opts, { commit = commitFile } = {}) {
+  const {
+    root, sessionsPath, outputs, uploads, fsKeyMapPath = null, statePath,
+    journalPath = null, apply = false, minAgeMs = 15 * 60_000, signal,
+  } = opts;
+  const s = {
+    phones: 0, sessions: 0, nonPhoneSessions: 0,
+    withMap: 0, withTranscriptKey: 0, keyAgree: 0, withoutKey: 0, keyMismatch: 0, noTranscript: 0, fresh: 0,
+    dirs: 0, entries: 0, uploads: 0, conflicts: 0,
+    repl: { phrase: 0, dirs: 0, uploads: 0, other: 0 },
+    transcripts: 0, otherPhones: 0,
+    orphans: 0, orphansWithPhone: 0, orphanDirs: 0, orphanUploads: 0, mapBadLines: 0,
+    brokenLines: 0, brokenWithPhone: 0, nonCanonicalLines: 0,
+    written: 0, moved: 0, movedUploads: 0, dirsRemoved: 0, dirsLeft: 0,
+    errors: 0, errorList: [], interrupted: false, journal: null,
+  };
+  // Только код: в сообщениях бывает кусок содержимого. Имя — файл транскрипта,
+  // не ключ сессии: в ключе номер.
+  const fail = (file, e) => {
+    s.errors++;
+    s.errorList.push({ file, code: e.code || e.name || "Error" });
+  };
+
+  const entries = await loadSessions(sessionsPath);
+  const { map: fsMap, bad } = fsKeyMapPath ? await loadFsKeyMap(fsKeyMapPath) : { map: new Map(), bad: 0 };
+  s.mapBadLines = bad;
+  const state = await loadState(statePath);
+  const transcripts = await indexTranscripts(root);
+
+  const sessions = [];
+  const byPhone = new Map();
+  const sessionIds = new Set();
+  for (const [key, cliId] of entries) {
+    sessionIds.add(cliId);
+    const m = PHONE_KEY_RE.exec(key);
+    const oldDir = m ? legacyDirName(key) : null;
+    if (!oldDir) {
+      s.nonPhoneSessions++;
+      continue;
+    }
+    const sess = { key, cliId, phone: m[1], oldDir, transcript: transcripts.get(cliId) ?? null };
+    sessions.push(sess);
+    if (!byPhone.has(sess.phone)) byPhone.set(sess.phone, []);
+    byPhone.get(sess.phone).push(sess);
+  }
+  sessions.sort((a, b) => byName(a.key, b.key));
+  const tablePhones = new Set(byPhone.keys());
+  s.phones = tablePhones.size;
+  s.sessions = sessions.length;
+
+  // Загрузка принадлежит сессии с самым длинным совпавшим ключом-префиксом:
+  // «<номер>_14_ru_x.pdf» — сессии «<номер>_14_ru», а не «<номер>_14».
+  const uploadNames = new Set();
+  const uploadsOf = new Map();
+  for (const ent of await readdirOrEmpty(uploads)) {
+    uploadNames.add(ent.name);
+    const m = PHONE_NAME_RE.exec(ent.name);
+    if (!m) continue;
+    let owner = null;
+    for (const c of byPhone.get(m[1]) ?? []) {
+      if (ent.name.startsWith(c.oldDir + "_") && (!owner || c.oldDir.length > owner.oldDir.length)) owner = c;
+    }
+    if (!owner) {
+      s.orphanUploads++;
+      continue;
+    }
+    if (!uploadsOf.has(owner.key)) uploadsOf.set(owner.key, []);
+    uploadsOf.get(owner.key).push({ name: ent.name, rest: ent.name.slice(owner.oldDir.length + 1), file: ent.isFile() });
+  }
+  const oldDirs = new Set(sessions.map((x) => x.oldDir));
+  for (const ent of await readdirOrEmpty(outputs)) {
+    if (PHONE_NAME_RE.test(ent.name) && !oldDirs.has(ent.name) && (ent.isDirectory() || ent.isSymbolicLink())) s.orphanDirs++;
+  }
+  const ctx = { outputs, uploads, uploadsOf, uploadNames };
+
+  async function processSession(sess) {
+    let snap = null;
+    if (sess.transcript) {
+      snap = await readSnapshot(sess.transcript, { minAgeMs });
+      if (snap.fresh) {
+        s.fresh++;
+        return;
+      }
+    } else s.noTranscript++;
+
+    // fs_key: карта прода, запасной — из транскрипта. Расходятся — не трогаем:
+    // скорее всего, карта посчитана не с той солью.
+    const fromMap = fsMap.get(sess.key);
+    const fromTranscript = snap ? transcriptFsKey(snap.buf, outputs) : undefined;
+    if (fromTranscript === null || (fromMap && fromTranscript && fromMap !== fromTranscript)) {
+      s.keyMismatch++;
+      return;
+    }
+    const fsKey = fromMap ?? fromTranscript;
+    if (!fsKey) {
+      s.withoutKey++;
+      return;
+    }
+    const prev = state.get(sess.key);
+    if (prev && prev.f !== fsKey) {
+      s.keyMismatch++;
+      return;
+    }
+    if (fromMap) s.withMap++;
+    else s.withTranscriptKey++;
+    if (fromMap && fromTranscript) s.keyAgree++;
+
+    const plan = await planSession(sess, fsKey, prev, ctx);
+    const rules = sessionRules({
+      phone: sess.phone, oldDir: sess.oldDir, fsKey,
+      outNames: [...plan.outNames], outRenames: plan.outRenames,
+      upRests: [...plan.upRests], upRenames: plan.upRenames,
+      tablePhones,
+    });
+    const r = snap ? scrubContent(snap.buf, rules) : null;
+    if (plan.oldSt) s.dirs++;
+    s.entries += plan.outMoves.length;
+    s.uploads += plan.upMoves.length;
+    s.conflicts += plan.conflicts;
+    if (r) {
+      for (const k of Object.keys(s.repl)) s.repl[k] += r.counts[k];
+      if (r.out) s.transcripts++;
+      if (r.otherPhones) s.otherPhones++;
+      s.brokenLines += r.brokenLines;
+      s.brokenWithPhone += r.brokenWithPhone;
+      s.nonCanonicalLines += r.nonCanonicalLines;
+    }
+    if (!apply) return;
+
+    // Решения о новых именах — в таблицу до переноса: прервёмся посередине —
+    // следующий заход возьмёт те же имена.
+    if (plan.newRenames) {
+      await appendState(statePath, {
+        k: sess.key, f: fsKey,
+        on: [...plan.outNames], or: Object.fromEntries(plan.outRenames),
+        un: [...plan.upRests], ur: Object.fromEntries(plan.upRenames),
+      });
+    }
+    await executePlan(plan, s);
+    let written = false;
+    if (r?.out) {
+      // CLI дописал транскрипт, пока шёл перенос: файлы уже на новом месте,
+      // транскрипт перепишет следующий заход — по таблице.
+      if ((await commit(sess.transcript, snap.stat, r.out)) === "changed") s.fresh++;
+      else {
+        s.written++;
+        written = true;
+      }
+    }
+    if (plan.oldSt || plan.outMoves.length || plan.upMoves.length || written) {
+      await journal.add({
+        transcript: sess.transcript ? path.relative(root, sess.transcript) : null,
+        fsKey,
+        moved: plan.outMoves.length,
+        uploads: plan.upMoves.length,
+        conflicts: plan.conflicts,
+        replacements: r ? r.counts : null,
+        transcriptWritten: written,
+        at: new Date().toISOString(),
+      });
+    }
+  }
+
+  const journal = apply ? await openJournal(journalPath) : null;
+  try {
+    for (const sess of sessions) {
+      if (signal?.aborted) {
+        s.interrupted = true;
+        break;
+      }
+      try {
+        await processSession(sess);
+      } catch (e) {
+        fail(sess.transcript ? path.relative(root, sess.transcript) : "сессия без транскрипта", e);
+      }
+    }
+    for (const [id, file] of transcripts) {
+      if (s.interrupted) break;
+      if (sessionIds.has(id)) continue;
+      if (signal?.aborted) {
+        s.interrupted = true;
+        break;
+      }
+      s.orphans++;
+      try {
+        if (mentionsPhone((await readSnapshot(file)).buf, tablePhones)) s.orphansWithPhone++;
+      } catch (e) {
+        fail(path.relative(root, file), e);
+      }
+    }
+  } finally {
+    if (journal) s.journal = await journal.close();
+  }
+  return s;
+}
+
+// --finish: сначала проверка, что делать больше нечего (и в свежих сессиях —
+// только чтение), потом удаление таблицы переименований и карты fs_key.
+export async function finishScrub(opts) {
+  const s = await runScrub({ ...opts, apply: false, minAgeMs: 0, journalPath: null });
+  const pending = s.dirs + s.uploads + s.transcripts;
+  if (pending > 0 || s.errors > 0 || s.interrupted) return { pending, removed: [], summary: s };
+  const removed = [];
+  for (const p of [opts.statePath, opts.fsKeyMapPath]) {
+    if (!p) continue;
+    try {
+      await fsp.unlink(p);
+      removed.push(p);
+    } catch (e) {
+      if (e.code !== "ENOENT") throw e;
+    }
+  }
+  return { pending, removed, summary: s };
 }
