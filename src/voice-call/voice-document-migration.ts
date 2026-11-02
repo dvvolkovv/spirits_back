@@ -1,5 +1,6 @@
 import { DOCS_BUCKET } from './voice-call.types';
 import { voiceDocumentFolder } from './voice-document-key';
+import { requireRelayFsSalt } from '../common/one-off-script';
 
 /**
  * Разовый перенос голосовых документов из documents/<id>/<docId>.md в папку
@@ -7,20 +8,26 @@ import { voiceDocumentFolder } from './voice-document-key';
  * 2026-11-02-pii-out-of-prompts-design.md, п. 2; новые документы так
  * выкладывает VoiceDocumentService с этой правки).
  *
- * Шаги, в этом порядке:
- *   1. ссылки прежнего вида ищутся во всех местах DOC_PLACES;
+ * --apply, в этом порядке:
+ *   1. ссылки прежнего вида ищутся во всех местах DOC_PLACES (в истории чата —
+ *      только строки старше часа: свежую держит открытая вкладка, а фронт
+ *      сверяет ленту с историей посимвольно — как у переноса ссылок релея);
  *   2. объект копируется под новый ключ (скачать — положить — сверить размер);
  *   3. адрес заменяется в каждой найденной строке — с проверкой прежнего
  *      значения: строку, которую успели изменить, не трогаем;
- *   4. старый объект удаляется, только если заменены ВСЕ найденные ссылки на
- *      него. Иначе он остаётся, и следующий прогон доведёт перенос.
+ *   4. если на старый ключ в базе не осталось ни одной ссылки (по всем местам и
+ *      без отбора по возрасту) — в журнал «replaced»: старый объект можно
+ *      удалять.
+ * Старые объекты --apply НЕ удаляет (ревью ветки): это делает отдельный
+ * --delete-old <журнал> (deleteOldDocuments), когда решит владелец, — и тогда
+ * обрыв между заменой и удалением ничего не теряет.
  *
  * Объекта нет вовсе (ссылка и так мёртвая) — адрес всё равно меняется: номера
  * в тексте не остаётся, а потерять нечего.
  *
- * Журнал — только места и ключи, без текстов: по нему откат возвращает и
- * адреса, и удалённые объекты (копией с нового ключа). Новые объекты откат не
- * удаляет.
+ * Журнал — только места и ключи, без текстов: по нему откат возвращает
+ * адреса и удалённые --delete-old объекты (копией с нового ключа). Новые
+ * объекты откат не удаляет.
  */
 
 /** Место, где лежит ссылка на документ: таблица и колонка с текстом или JSON. */
@@ -28,6 +35,8 @@ export interface DocPlace {
   table: string;
   column: string;
   jsonb?: boolean;
+  /** Колонка времени строки: если задана, --apply и сухой прогон берут только строки старше часа. */
+  ageColumn?: string;
 }
 
 /**
@@ -38,7 +47,7 @@ export interface DocPlace {
 export const DOC_PLACES: readonly DocPlace[] = [
   // Сам документ в чате: «[Открыть документ полностью](адрес)» — voice-document.service.ts.
   // Карточка итогов звонка там же, и её текст пишет модель.
-  { table: 'custom_chat_history', column: 'content' },
+  { table: 'custom_chat_history', column: 'content', ageColumn: 'created_at' },
   // Ссылка, отправленная в чат встречи, ложится в расшифровку:
   // «[в чат] Документ «…»: адрес» — voice-host/src/agent.ts (document_ready).
   { table: 'voice_calls', column: 'transcript', jsonb: true },
@@ -96,6 +105,9 @@ export interface MigrationStore {
 export type DocJournalEntry =
   | { kind: 'copied'; from: string; to: string }
   | { kind: 'row'; table: string; column: string; id: string; from: string; to: string }
+  /** Скопирован, и ссылок на старый ключ в базе не осталось — --delete-old может удалить старый объект. */
+  | { kind: 'replaced'; from: string; to: string }
+  /** Старый объект удалён (--delete-old). */
   | { kind: 'deleted'; from: string; to: string };
 
 export interface DocMigrationSummary {
@@ -115,9 +127,10 @@ export interface DocMigrationSummary {
   copyFailed: number;
   updatedRows: number;
   skippedRows: number;
-  deleted: number;
-  /** Старые объекты, оставленные на месте: не все ссылки заменены или удаление не удалось. */
-  keptOld: number;
+  /** Записано «replaced»: старый объект можно удалить --delete-old. */
+  readyToDelete: number;
+  /** Скопирован, но на старый ключ в базе ещё есть ссылки (пропущенные или свежие строки) — старый объект нужен. */
+  stillReferenced: number;
 }
 
 /** Тот же тип и кэш, что у VoiceDocumentService.publish. */
@@ -145,6 +158,34 @@ function updateSql(p: DocPlace): string {
 const swapKey = (text: string, from: string, to: string) =>
   text.split(`${DOCS_BUCKET}/${from}`).join(`${DOCS_BUCKET}/${to}`);
 
+/** Шаблон LIKE на подстроку: «\», «%» и «_» в ней — буквально. */
+const likeSubstring = (s: string) => `%${s.replace(/[\\%_]/g, '\\$&')}%`;
+
+/**
+ * Какие из ключей ещё упоминаются в базе — по всем местам и без отбора по
+ * возрасту строки: свежая строка со старым адресом тоже держит старый объект.
+ */
+async function findReferencedKeys(
+  pg: MigrationPg,
+  keys: string[],
+  places: readonly DocPlace[] = DOC_PLACES,
+): Promise<Set<string>> {
+  const found = new Set<string>();
+  if (keys.length === 0) return found;
+  const patterns = keys.map((k) => likeSubstring(`${DOCS_BUCKET}/${k}`));
+  for (const place of places) {
+    if (!(await placeExists(pg, place))) continue;
+    const { rows } = await pg.query(
+      `SELECT ${place.column}::text AS v FROM ${place.table} WHERE ${place.column}::text LIKE ANY ($1::text[])`,
+      [patterns],
+    );
+    for (const r of rows) {
+      for (const k of keys) if (String(r.v).includes(`${DOCS_BUCKET}/${k}`)) found.add(k);
+    }
+  }
+  return found;
+}
+
 interface FoundRow {
   place: DocPlace;
   id: string;
@@ -162,14 +203,12 @@ export async function runDocumentMigration(p: {
   log: (m: string) => void;
   places?: readonly DocPlace[];
 }): Promise<DocMigrationSummary> {
-  // Без соли новой папки не посчитать — отказ до первого запроса.
-  if (!voiceDocumentFolder('-')) {
-    throw new Error('нет RELAY_FS_SALT (и JWT_SECRET) — папку без идентификатора не посчитать');
-  }
+  // Соль — только RELAY_FS_SALT, как у приложения: отказ до первого запроса.
+  requireRelayFsSalt();
   const places = p.places ?? DOC_PLACES;
   const s: DocMigrationSummary = {
     rowsByPlace: {}, missingPlaces: [], docs: 0, present: 0, alreadyCopied: 0, missing: 0,
-    copied: 0, copyFailed: 0, updatedRows: 0, skippedRows: 0, deleted: 0, keptOld: 0,
+    copied: 0, copyFailed: 0, updatedRows: 0, skippedRows: 0, readyToDelete: 0, stillReferenced: 0,
   };
 
   // 1. Где лежат ссылки прежнего вида.
@@ -180,9 +219,10 @@ export async function runDocumentMigration(p: {
       p.log(`места ${placeName(place)} в базе нет — пропущено`);
       continue;
     }
+    const age = place.ageColumn ? ` AND ${place.ageColumn} < now() - interval '1 hour'` : '';
     const { rows } = await p.pg.query(
       `SELECT id::text AS id, ${place.column}::text AS v FROM ${place.table}
-        WHERE ${place.column}::text LIKE $1 ORDER BY id`,
+        WHERE ${place.column}::text LIKE $1${age} ORDER BY id`,
       [`%${DOCS_BUCKET}/documents/%`],
     );
     let n = 0;
@@ -207,7 +247,7 @@ export async function runDocumentMigration(p: {
   p.log(`строк со ссылками прежнего вида: ${found.length}, документов: ${docs.size}`);
 
   // 2. Состояние объектов и копия.
-  const oldSize = new Map<string, number>();
+  const copiedKeys: string[] = [];
   const ready = new Set<string>();
   for (const d of docs.values()) {
     const old = await p.store.head(DOCS_BUCKET, d.oldKey);
@@ -229,7 +269,7 @@ export async function runDocumentMigration(p: {
       });
       const copy = await p.store.head(DOCS_BUCKET, d.newKey);
       if (!copy || copy.size !== old.size) throw new Error(`размер копии ${copy?.size} ≠ ${old.size}`);
-      oldSize.set(d.oldKey, old.size);
+      copiedKeys.push(d.oldKey);
       ready.add(d.oldKey);
       s.copied++;
       p.journal({ kind: 'copied', from: d.oldKey, to: d.newKey });
@@ -241,10 +281,8 @@ export async function runDocumentMigration(p: {
   if (!p.apply) return s;
 
   // 3. Замена адреса во всех найденных строках.
-  const incomplete = new Set<string>();
   for (const f of found) {
     const refs = f.refs.filter((r) => ready.has(r.oldKey));
-    for (const r of f.refs) if (!ready.has(r.oldKey)) incomplete.add(r.oldKey);
     if (refs.length === 0) continue;
     let next = f.value;
     for (const r of refs) next = swapKey(next, r.oldKey, docs.get(r.oldKey)!.newKey);
@@ -259,28 +297,76 @@ export async function runDocumentMigration(p: {
       }
     } else {
       s.skippedRows++;
-      for (const r of refs) incomplete.add(r.oldKey);
       p.log(`строка ${placeName(f.place)} id=${f.id} изменилась во время переноса — пропущена`);
     }
   }
 
-  // 4. Старый объект — только когда на него не осталось ни одной найденной ссылки.
-  for (const d of docs.values()) {
-    if (!oldSize.has(d.oldKey)) continue;
-    if (incomplete.has(d.oldKey)) {
-      s.keptOld++;
+  // 4. «Можно удалять» — только скопированные, на старый ключ которых в базе
+  // не осталось ни одной ссылки. Сами объекты здесь не удаляются.
+  const still = await findReferencedKeys(p.pg, copiedKeys, places);
+  for (const key of copiedKeys) {
+    if (still.has(key)) {
+      s.stillReferenced++;
+      continue;
+    }
+    s.readyToDelete++;
+    p.journal({ kind: 'replaced', from: key, to: docs.get(key)!.newKey });
+  }
+  return s;
+}
+
+/**
+ * --delete-old: удалить старые объекты, записанные в журнале --apply как
+ * «replaced», — и только их. Перед удалением: новая копия на месте и того же
+ * размера, а в базе на старый ключ нет ни одной ссылки (по всем местам, без
+ * отбора по возрасту). Иначе объект остаётся. Повторный запуск ничего не
+ * делает: удалённого уже нет.
+ */
+export async function deleteOldDocuments(p: {
+  pg: MigrationPg;
+  store: MigrationStore;
+  entries: DocJournalEntry[];
+  journal: (e: DocJournalEntry) => void;
+  log: (m: string) => void;
+}): Promise<{ deleted: number; alreadyGone: number; kept: number }> {
+  // Снимок до работы: журнал удалений могут дописывать в тот же массив.
+  const ready = new Map<string, string>();
+  for (const e of [...p.entries]) if (e.kind === 'replaced') ready.set(e.from, e.to);
+  let alreadyGone = 0;
+  let kept = 0;
+  let deleted = 0;
+  const candidates: { from: string; to: string }[] = [];
+  for (const [from, to] of ready) {
+    const old = await p.store.head(DOCS_BUCKET, from);
+    if (!old) {
+      alreadyGone++;
+      continue;
+    }
+    const copy = await p.store.head(DOCS_BUCKET, to);
+    if (!copy || copy.size !== old.size) {
+      kept++;
+      p.log('новой копии нет или она другого размера — старый объект оставлен');
+      continue;
+    }
+    candidates.push({ from, to });
+  }
+  const referenced = await findReferencedKeys(p.pg, candidates.map((c) => c.from));
+  for (const c of candidates) {
+    if (referenced.has(c.from)) {
+      kept++;
+      p.log('на старый ключ в базе есть ссылка — объект оставлен');
       continue;
     }
     try {
-      await p.store.delete({ bucket: DOCS_BUCKET, key: d.oldKey });
-      s.deleted++;
-      p.journal({ kind: 'deleted', from: d.oldKey, to: d.newKey });
+      await p.store.delete({ bucket: DOCS_BUCKET, key: c.from });
+      deleted++;
+      p.journal({ kind: 'deleted', from: c.from, to: c.to });
     } catch (e: any) {
-      s.keptOld++;
+      kept++;
       p.log(`старый объект не удалён: ${e?.message || e}`);
     }
   }
-  return s;
+  return { deleted, alreadyGone, kept };
 }
 
 /**
