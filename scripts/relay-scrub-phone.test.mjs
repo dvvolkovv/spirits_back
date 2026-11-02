@@ -20,7 +20,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { scrubContent, sessionRules, readSnapshot, commitFile, runScrub, finishScrub, moveEntry } from "./relay-scrub-phone.mjs";
+import { scrubContent, sessionRules, readSnapshot, commitFile, runScrub, finishScrub, moveEntry, retireResidual } from "./relay-scrub-phone.mjs";
 
 const PHONE = "70000000000";
 const OTHER = "70000000001"; // другой пользователь релея (есть в sessions.json)
@@ -530,11 +530,16 @@ function addSession(w, key, rows, { inMap = true, mtime, save = true } = {}) {
   const file = rows ? put(w.root, "-tmp/" + cliId + ".jsonl", jsonl(...rows), mtime ? { mtime } : {}) : null;
   return { key, cliId, file, fk: fsKeyOf(key), rel: path.join("-tmp", cliId + ".jsonl") };
 }
-const runOpts = (w, extra = {}) => ({
-  root: w.root, sessionsPath: w.sessionsPath, outputs: w.out, uploads: w.up,
-  fsKeyMapPath: w.mapPath, standMapPath: w.standMapPath, statePath: w.statePath, journalPath: w.journalPath,
-  minAgeMs: MIN15, ...extra,
-});
+// Журнал — свой на каждый запуск: существующий файл скрипт не перезаписывает.
+let journalSeq = 0;
+function runOpts(w, extra = {}) {
+  w.lastJournal = path.join(w.home, "journal-" + ++journalSeq + ".jsonl");
+  return {
+    root: w.root, sessionsPath: w.sessionsPath, outputs: w.out, uploads: w.up,
+    fsKeyMapPath: w.mapPath, standMapPath: w.standMapPath, statePath: w.statePath, journalPath: w.lastJournal,
+    minAgeMs: MIN15, ...extra,
+  };
+}
 // Тестовый стенд ходит в тот же релей с теми же ключами, но со своей солью.
 const STAND = "соль стенда";
 function saveStandMap(w) {
@@ -696,7 +701,7 @@ test("применение, сессия A: конфликты получают 
   assert.equal(fs.statSync(w.statePath).mode & 0o777, 0o600);
   assert.ok(!table.includes(PHONE), "в таблице нет номера");
   assert.ok(table.includes(a.fk));
-  const journal = fs.readFileSync(w.journalPath, "utf8");
+  const journal = fs.readFileSync(w.lastJournal, "utf8");
   assert.ok(!journal.includes(PHONE) && !journal.includes(OTHER));
   assert.ok(journal.includes(a.rel));
 });
@@ -724,7 +729,7 @@ test("применение, весь релей: двухчастный ключ
   for (const [f, buf] of [...untouched, ...orphansBefore]) assert.ok(fs.readFileSync(f).equals(buf), f);
   for (const k of [S.E.key, S.G.key, PHONE + "_99_ru"]) assert.ok(exists(w.out, k), k);
   assert.ok(exists(w.up, PHONE + "_98_w.pdf"));
-  for (const row of fs.readFileSync(w.journalPath, "utf8").trim().split("\n")) {
+  for (const row of fs.readFileSync(w.lastJournal, "utf8").trim().split("\n")) {
     assert.deepEqual(Object.keys(JSON.parse(row)).sort(), ["at", "conflicts", "fsKey", "moved", "replacements", "transcript", "transcriptWritten", "uploads"]);
   }
 });
@@ -807,7 +812,7 @@ test("повторный прогон ничего не находит и нич
 
   const s = await runScrub(runOpts(w, { apply: true }));
   assert.deepEqual(pick(s, "written", "dirs", "entries", "uploads", "transcripts"), { written: 0, dirs: 0, entries: 0, uploads: 0, transcripts: 0 });
-  assert.deepEqual(state(w.base), before);
+  assert.deepEqual(state(w.base), before, "и пустой журнал второго прогона не остаётся");
 });
 
 test("--finish: пока есть работа — отказ и всё на месте; после прохода — удаляет таблицу и обе карты", async (t) => {
@@ -1122,6 +1127,129 @@ test("--list-residual: id сессий CLI, где номер владельца
   void listPath;
 });
 
+function swapMaps(w) {
+  const prod = fs.readFileSync(w.mapPath);
+  fs.writeFileSync(w.mapPath, fs.readFileSync(w.standMapPath));
+  fs.writeFileSync(w.standMapPath, prod);
+}
+
+test("перепутанные карты (стенд в --fs-key-map, прод в --stand-map): ходов стенда больше подтверждённых — отказ", async (t) => {
+  const w = relayWorld(t);
+  sessionA(w);
+  const keyX = PHONE + "_28_ru";
+  put(w.out, keyX + "/x.txt", "x");
+  addSession(w, keyX, [preTurn(w, keyX, "Ход"), postTurn(w, fsKeyOf(keyX), "Ход прода")]);
+  sessionS(w);
+  saveStandMap(w);
+  const right = await runScrub(runOpts(w));
+  assert.deepEqual(pick(right, "keyAgree", "keyStand", "mapRefused"), { keyAgree: 2, keyStand: 1, mapRefused: false });
+
+  swapMaps(w);
+  const before = state(w.base);
+  const dry = await runScrub(runOpts(w));
+  assert.deepEqual(pick(dry, "keyAgree", "keyStand", "keyMismatch", "mapRefused"), { keyAgree: 1, keyStand: 2, keyMismatch: 0, mapRefused: true });
+  await assert.rejects(runScrub(runOpts(w, { apply: true })), { code: "EMAPCHECK" });
+  await assert.rejects(runScrub(runOpts(w, { residual: true })), { code: "EMAPCHECK" });
+  assert.deepEqual(state(w.base), before);
+});
+
+// После применения: в T и V номер остался в блоке рассуждений, E — без fs_key
+// (все трое — окончательный остаток, транскрипты старше часа), G — свежая и
+// ждёт прохода. Каталог остатка — в «домашнем» каталоге, 700.
+async function residualWorld(t) {
+  const w = relayWorld(t);
+  sessionA(w);
+  const e = sessionE(w);
+  const thinkingSession = (key) => {
+    const think = assistant("");
+    think.message.content = [{ type: "thinking", thinking: "Номер " + PHONE, signature: "EqQBCkYI" }, { type: "text", text: "ок" }];
+    return addSession(w, key, [preTurn(w, key, "Ход"), think, postTurn(w, fsKeyOf(key), "Ход")]);
+  };
+  const tr = thinkingSession(PHONE + "_25_ru");
+  const v = thinkingSession(PHONE + "_29_ru");
+  const g = sessionG(w);
+  await runScrub(runOpts(w, { apply: true }));
+  const old = new Date(Date.now() - 2 * 3_600_000);
+  for (const x of [e, tr, v]) fs.utimesSync(x.file, old, old);
+  const dir = path.join(w.home, "residual");
+  fs.mkdirSync(dir);
+  fs.chmodSync(dir, 0o700);
+  return { w, e, tr, v, g, dir };
+}
+const retireOpts = (w, dir, extra = {}) => runOpts(w, { retireDir: dir, home: w.home, ...extra });
+
+test("--retire-residual сухой: что будет перенесено — только окончательные причины; ничего не трогает", async (t) => {
+  const { w, g, dir } = await residualWorld(t);
+  const before = state(w.base);
+  const r = await retireResidual(retireOpts(w, dir));
+  assert.deepEqual(pick(r, "candidates", "willMove", "moved", "skippedLive", "skippedFresh", "skippedGone"),
+    { candidates: 3, willMove: 3, moved: 0, skippedLive: 0, skippedFresh: 0, skippedGone: 0 });
+  assert.deepEqual(r.byReason, { "рассуждения": 2, "без fs_key": 1 });
+  assert.ok(fs.existsSync(g.file), "свежая G (ждёт прохода) не кандидат");
+  assert.deepEqual(state(w.base), before);
+});
+
+test("--retire-residual --apply: rename в каталог 700; живой claude --resume и свежий транскрипт не трогаются; журнал — id и причины", async (t) => {
+  const { w, e, tr, v, dir } = await residualWorld(t);
+  const live = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", "--resume", tr.cliId], { stdio: "ignore" });
+  t.after(() => live.kill());
+  fs.utimesSync(e.file, new Date(), new Date()); // E менялся только что
+
+  const r = await retireResidual(retireOpts(w, dir, { apply: true }), { recheckMs: 0 });
+  assert.deepEqual(pick(r, "candidates", "moved", "skippedLive", "skippedFresh", "reappeared", "errors"),
+    { candidates: 3, moved: 1, skippedLive: 1, skippedFresh: 1, reappeared: 0, errors: 0 });
+  assert.ok(!fs.existsSync(v.file));
+  assert.ok(fs.existsSync(path.join(dir, v.cliId + ".jsonl")));
+  assert.ok(fs.existsSync(tr.file) && fs.existsSync(e.file));
+  const rows = fs.readFileSync(r.journal, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.deepEqual(rows.map(({ id, reasons }) => ({ id, reasons })), [{ id: v.cliId, reasons: ["рассуждения"] }]);
+  assert.deepEqual(Object.keys(rows[0]).sort(), ["at", "id", "reasons"]);
+  assert.equal(fs.statSync(r.journal).mode & 0o777, 0o600);
+  assert.ok(!fs.readFileSync(r.journal, "utf8").includes(PHONE));
+});
+
+test("--retire-residual: файл, появившийся на старом месте через ~5 с, считается отдельно и не трогается", async (t) => {
+  const { w, e, dir } = await residualWorld(t);
+  const r = await retireResidual(retireOpts(w, dir, { apply: true }), {
+    recheckMs: 5000,
+    sleep: async (ms) => {
+      assert.equal(ms, 5000);
+      fs.writeFileSync(e.file, "новый ход"); // CLI успел начать ход
+    },
+  });
+  assert.deepEqual(pick(r, "moved", "reappeared"), { moved: 3, reappeared: 1 });
+  assert.equal(fs.readFileSync(e.file, "utf8"), "новый ход");
+});
+
+test("--retire-residual: каталог вне домашнего, внутри проектов claude или не 700 — отказ", async (t) => {
+  const { w, dir } = await residualWorld(t);
+  const outside = tmpRoot(t);
+  fs.chmodSync(outside, 0o700);
+  await assert.rejects(retireResidual(runOpts(w, { retireDir: outside, home: w.home })), { code: "ERETIREHOME" });
+  const inProjects = path.join(w.root, "residual");
+  fs.mkdirSync(inProjects);
+  fs.chmodSync(inProjects, 0o700);
+  await assert.rejects(retireResidual(runOpts(w, { retireDir: inProjects, home: w.base })), { code: "ERETIREPROJECTS" });
+  fs.chmodSync(dir, 0o755);
+  await assert.rejects(retireResidual(runOpts(w, { retireDir: dir, home: w.home })), { code: "ERETIREMODE" });
+  await assert.rejects(retireResidual(runOpts(w, { retireDir: path.join(w.home, "нет"), home: w.home })), { code: "ERETIREDIR" });
+});
+
+test(
+  "--retire-residual: каталог на другой файловой системе (tmpfs /dev/shm) — отказ",
+  { skip: !fs.existsSync("/dev/shm") && "нет /dev/shm" },
+  async (t) => {
+    const { w } = await residualWorld(t);
+    const home = fs.mkdtempSync("/dev/shm/relay-scrub-home-");
+    t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+    if (fs.statSync(home).dev === fs.statSync(w.root).dev) return t.skip("/dev/shm на той же файловой системе");
+    const dir = path.join(home, "residual");
+    fs.mkdirSync(dir);
+    fs.chmodSync(dir, 0o700);
+    await assert.rejects(retireResidual(runOpts(w, { retireDir: dir, home })), { code: "ERETIREFS" });
+  },
+);
+
 // ---------------------------------------------------------------- запуск
 
 const SCRIPT = fileURLToPath(new URL("./relay-scrub-phone.mjs", import.meta.url));
@@ -1236,7 +1364,11 @@ test("CLI: ошибки запуска — код 2 и ничего не тро�
     ["--root", w.root, "--sessions", path.join(w.base, "нет.json"), "--outputs", w.out, "--uploads", w.up, "--state", w.statePath],
     // --finish проверяет по карте и её же удаляет — без карты недоделанные
     // сессии выглядели бы как «без fs_key», и таблица ушла бы раньше времени.
+    // Без карты и список остатка состоял бы почти из всех сессий.
     ["--root", w.root, "--sessions", w.sessionsPath, "--outputs", w.out, "--uploads", w.up, "--state", w.statePath, "--finish"],
+    ["--root", w.root, "--sessions", w.sessionsPath, "--outputs", w.out, "--uploads", w.up, "--state", w.statePath, "--list-residual", path.join(w.base, "r.txt")],
+    ["--root", w.root, "--sessions", w.sessionsPath, "--outputs", w.out, "--uploads", w.up, "--state", w.statePath, "--retire-residual", w.home],
+    cliArgs(w, ["--retire-residual", w.home, "--finish"]),
   ];
   for (const args of cases) {
     const r = cli(args);
@@ -1332,6 +1464,40 @@ test("CLI --list-residual: файл 600 с id сессий и причинами
   assert.ok(noPhones(r.stdout + r.stderr + text));
   assert.deepEqual(state(w.base), before);
   assert.equal(cli(cliArgs(w, ["--list-residual", listPath, "--apply"])).status, 2, "только чтение — без --apply");
+});
+
+test("CLI: список остатка и журнал не перезаписывают существующий файл — код 2, файл цел", (t) => {
+  const w = relayWorld(t);
+  sessionA(w);
+  const taken = path.join(w.home, "чужой.txt");
+  fs.writeFileSync(taken, "чужое");
+  const before = state(w.base);
+
+  const list = cli(cliArgs(w, ["--list-residual", taken]));
+  assert.equal(list.status, 2, list.stdout + list.stderr);
+  const apply = cli(cliArgs(w, ["--apply", "--journal", taken]));
+  assert.equal(apply.status, 2, apply.stdout + apply.stderr);
+  assert.match(apply.stderr, /уже есть/);
+  assert.equal(fs.readFileSync(taken, "utf8"), "чужое");
+  assert.deepEqual(state(w.base), before);
+});
+
+test("CLI --retire-residual: без --apply — только счётчики; с --apply — перенос, журнал, проверка через 5 с", async (t) => {
+  const { w, dir } = await residualWorld(t);
+  const env = { HOME: w.home };
+  const before = state(w.base);
+
+  const dry = cli(cliArgs(w, ["--retire-residual", dir]), env);
+  assert.equal(dry.status, 0, dry.stderr);
+  assert.match(dry.stdout, /^остаток к переносу: кандидатов 3 \(рассуждения 2, без fs_key 1\); будет перенесено: 3; пропущено: живых 0, свежее часа 0, нет файла 0$/m);
+  assert.deepEqual(state(w.base), before);
+
+  const journal = path.join(w.home, "retire.jsonl");
+  const r = cli(cliArgs(w, ["--retire-residual", dir, "--apply", "--journal", journal]), env);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^перенесено: 3; пропущено: живых 0, свежее часа 0, нет файла 0; появились снова через 5 с: 0$/m);
+  assert.equal(fs.readdirSync(dir).length, 3);
+  assert.ok(noPhones(r.stdout + r.stderr + dry.stdout + fs.readFileSync(journal, "utf8")));
 });
 
 test(

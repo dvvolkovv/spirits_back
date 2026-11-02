@@ -1450,3 +1450,7 @@ function invokedDirectly() {
 }
 
 if (invokedDirectly()) process.exitCode = await main();
+
+export async function retireResidual() {
+  throw new Error("не реализовано");
+}
