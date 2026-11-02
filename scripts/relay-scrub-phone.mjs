@@ -271,6 +271,7 @@ function scrubLine(lineBuf, rules) {
   res.otherPhones = ctx.otherPhones;
   res.thinking = ctx.thinking;
   res.keys = ctx.keys;
+  res.counts = ctx.counts;
   if (!ctx.changed) return res;
 
   // CLI пишет строку как JSON.stringify(запись), поэтому повторный
@@ -282,7 +283,6 @@ function scrubLine(lineBuf, rules) {
     return res;
   }
   res.text = s.slice(0, start) + JSON.stringify(value) + s.slice(end);
-  res.counts = ctx.counts;
   return res;
 }
 
@@ -313,6 +313,10 @@ export function scrubContent(buf, rules) {
     if (r.text !== null) {
       for (const k of Object.keys(sum.counts)) sum.counts[k] += r.counts[k];
       changed.push([pos, end, Buffer.from(r.text, "utf8")]);
+    } else if (r.counts && !r.nonCanonical) {
+      // Строка не меняется, но номер в ней оставлен намеренно (непереносимая
+      // папка, сирота) — это остаток, его видно в счётчике.
+      sum.counts.kept += r.counts.kept;
     }
     pos = end + 1;
   }
