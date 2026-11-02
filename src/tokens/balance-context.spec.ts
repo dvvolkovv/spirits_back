@@ -68,8 +68,11 @@ describe('BalanceContextService — прогноз остатка', () => {
   });
 
   it('статистики не хватает — прогноза нет, цифра остаётся', async () => {
-    const block = await svc(fakePg({ spends: [300, 400] })).buildContextForPrompt('u1', 8000);
-    expect(block).toContain('8000');
+    // Баланс выше порога предупреждения (10 000) — иначе с находки a3da5a2b
+    // блок несёт и собственную инструкцию про «примерно ответов», и проверка
+    // путала бы отсутствие статистики с отсутствием предупреждения.
+    const block = await svc(fakePg({ spends: [300, 400] })).buildContextForPrompt('u1', 20000);
+    expect(block).toContain('20000');
     expect(block).not.toContain('примерно');
   });
 
