@@ -770,6 +770,19 @@ test("второй заход у сессии БЕЗ конфликтов: та�
   assert.ok(!fs.readFileSync(n.file, "utf8").includes(PHONE));
 });
 
+test("путь на папку соседней сессии того же номера переписывается на её fs_key", async (t) => {
+  const w = relayWorld(t);
+  const b = sessionB(w);
+  const a = sessionA(w);
+  fs.appendFileSync(a.file, JSON.stringify(toolUse("Read", { file_path: path.join(w.out, b.key, "old.txt") })) + "\n");
+  fs.utimesSync(a.file, hourAgo(), hourAgo());
+
+  await runScrub(runOpts(w, { apply: true }));
+  const rows = parsed(fs.readFileSync(a.file));
+  assert.equal(rows.at(-1).message.content[0].input.file_path, path.join(w.out, b.fk, "old.txt"));
+  assert.equal(read(w.out, b.fk, "old.txt"), "старое");
+});
+
 test("повторный прогон ничего не находит и ничего не пишет", async (t) => {
   const { w } = fullWorld(t);
   await runScrub(runOpts(w, { apply: true }));
