@@ -138,6 +138,27 @@ describe('маркер {{file:}} с картинкой', () => {
     expect(grammy.sendPhoto).not.toHaveBeenCalled();
   });
 
+  it.each(['text/csv', 'text/plain'])('%s — документом, не ошибка: это законное вложение, не HTML-подделка (ревью качества 02.11)', async (ct) => {
+    (fetchMediaBytes as jest.Mock).mockResolvedValue({
+      data: Buffer.from('a,b,c\n1,2,3'), contentType: ct, finalUrl: 'https://example.org/data',
+    });
+    await (svc as any).deliverOutgoingMarkers(cfg, msg, [{ kind: 'file', url: 'https://example.org/report.csv' }]);
+    expect(grammy.sendDocument).toHaveBeenCalledTimes(1);
+    expect(grammy.sendPhoto).not.toHaveBeenCalled();
+    expect(grammy.sendMessage).not.toHaveBeenCalled(); // не отказ — обычная доставка, без строки «не удалось»
+  });
+
+  it('application/xhtml+xml — тот же отказ, что и text/html', async () => {
+    (fetchMediaBytes as jest.Mock).mockResolvedValue({
+      data: Buffer.from('<html></html>'), contentType: 'application/xhtml+xml', finalUrl: 'https://example.org/wiki/File:Seatmap.jpg',
+    });
+    await (svc as any).deliverOutgoingMarkers(cfg, msg, [{ kind: 'file', url: 'https://example.org/wiki/File:Seatmap.jpg' }]);
+    expect(grammy.sendPhoto).not.toHaveBeenCalled();
+    expect(grammy.sendDocument).not.toHaveBeenCalled();
+    expect(grammy.sendMessage).toHaveBeenCalledTimes(1);
+    expect(grammy.sendMessage.mock.calls[0][1]).toBe('(не удалось приложить файл)');
+  });
+
   it('Telegram ОТКАЗАЛ принять фото (GrammyError 4xx) — тот же файл уходит документом', async () => {
     (fetchMediaBytes as jest.Mock).mockResolvedValue(await realMedia('png', 40, 30, 'image/png'));
     grammy.sendPhoto.mockRejectedValueOnce(
