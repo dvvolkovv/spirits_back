@@ -434,10 +434,11 @@ const PHONE_NAME_RE = /^_?([0-9]{10,15})_/;
 const FS_KEY_RE = /^[0-9a-f]{32}$/;
 const NAME_MAX = 255;
 const byName = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
-const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // Имя папки хода по ключу сессии — как его делал релей до части Б
-// (relay-agent/paths.mjs, sessionFsKey). Загрузка — это имя + "_" + имя файла.
+// (relay-agent/paths.mjs, sessionFsKey): не больше 48 знаков. Длинные ключи
+// (<номер>_custom:<uuid>_<язык>, …_fresh_<время>) обрезались — несколько
+// сессий получали ОДНУ папку и один префикс загрузок.
 function legacyDirName(key) {
   const safe = String(key).replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 48);
   return safe === "" || safe === "." || safe === ".." ? null : safe;
@@ -473,16 +474,20 @@ async function loadSessions(file) {
   return Object.entries(raw).filter(([, v]) => typeof v === "string" && v);
 }
 
-// Карта «ключ сессии → fs_key» (TSV) — её считает прод, у которого соль.
-// В ней номера, поэтому доступна только владельцу. Ключ с двумя разными
-// fs_key — не ключ, а ошибка: такой выбрасывается и считается.
-async function loadFsKeyMap(file) {
+// Файл с номерами (карта, список ключей) — только владельцу.
+async function readPrivate(file, code) {
   const st = await fsp.stat(file);
-  if (st.mode & 0o077) throw withCode("EMAPMODE");
+  if (st.mode & 0o077) throw withCode(code);
+  return fsp.readFile(file, "utf8");
+}
+
+// Карта «ключ сессии → fs_key» (TSV) — её считает прод, у которого соль.
+// Ключ с двумя разными fs_key — не ключ, а ошибка: такой выбрасывается и считается.
+async function loadFsKeyMap(file) {
   const map = new Map();
   const doubtful = new Set();
   let bad = 0;
-  for (const line of (await fsp.readFile(file, "utf8")).split("\n")) {
+  for (const line of (await readPrivate(file, "EMAPMODE")).split("\n")) {
     if (!line.trim()) continue;
     const tab = line.indexOf("\t");
     const key = tab > 0 ? line.slice(0, tab) : "";
@@ -501,16 +506,22 @@ async function loadFsKeyMap(file) {
   return { map, bad };
 }
 
-// Таблица переименований (JSONL, 600): что куда переехало при конфликте имён.
-// Нужна второму заходу, когда старой папки уже нет, а транскрипт ещё не
-// переписан. Строка — сессия; более поздняя дополняет раннюю.
-async function loadState(file) {
-  const state = new Map();
+// Список ключей сессий для канарейки (--sessions-file), по строке.
+export async function loadSessionsFilter(file) {
+  return new Set((await readPrivate(file, "EKEYSMODE")).split("\n").map((l) => l.replace(/\r$/, "")).filter(Boolean));
+}
+
+// Таблица переносов (JSONL, 600) — по fs_key, без номера: что из старой папки
+// и загрузок сессии куда переехало (и одноимённое тоже). Пишется ДО переноса:
+// оборвётся проход между переносом и записью транскрипта — следующий заход
+// перепишет пути по ней теми же именами.
+async function loadTable(file) {
+  const table = new Map();
   let text;
   try {
     text = await fsp.readFile(file, "utf8");
   } catch (e) {
-    if (e.code === "ENOENT") return state;
+    if (e.code === "ENOENT") return table;
     throw e;
   }
   for (const line of text.split("\n")) {
@@ -520,19 +531,16 @@ async function loadState(file) {
     } catch {
       continue; // пустая или оборванная строка
     }
-    if (!e || typeof e.k !== "string" || !FS_KEY_RE.test(e.f)) continue;
-    const cur = state.get(e.k) ?? { f: e.f, on: new Set(), or: new Map(), un: new Set(), ur: new Map() };
-    cur.f = e.f;
-    for (const n of e.on ?? []) cur.on.add(n);
-    for (const [a, b] of Object.entries(e.or ?? {})) cur.or.set(a, b);
-    for (const n of e.un ?? []) cur.un.add(n);
-    for (const [a, b] of Object.entries(e.ur ?? {})) cur.ur.set(a, b);
-    state.set(e.k, cur);
+    if (!e || !FS_KEY_RE.test(e.f)) continue;
+    const cur = table.get(e.f) ?? { o: new Map(), u: new Map() };
+    for (const [a, b] of Object.entries(e.o ?? {})) cur.o.set(a, b);
+    for (const [a, b] of Object.entries(e.u ?? {})) cur.u.set(a, b);
+    table.set(e.f, cur);
   }
-  return state;
+  return table;
 }
 
-async function appendState(file, entry) {
+async function appendTable(file, entry) {
   const fh = await fsp.open(file, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0o600);
   try {
     await fh.chmod(0o600);
@@ -566,12 +574,15 @@ async function indexTranscripts(root) {
 // fs_key из самого транскрипта: строка «Output directory for created files:
 // <outputs>/<32 hex>» у ходов после части Б. Нет — undefined, разные — null.
 function transcriptFsKey(buf, outputs) {
-  const re = new RegExp(
-    "Output directory for created files: " + escapeRe(path.resolve(outputs)) + "/([0-9a-f]{32})(?![A-Za-z0-9._-])",
-    "g",
-  );
+  const marker = Buffer.from("Output directory for created files: " + path.resolve(outputs) + "/");
   const found = new Set();
-  for (const m of buf.toString("utf8").matchAll(re)) found.add(m[1]);
+  for (let i = buf.indexOf(marker); i !== -1; i = buf.indexOf(marker, i + 1)) {
+    const at = i + marker.length;
+    const candidate = buf.toString("latin1", at, at + 32);
+    if (FS_KEY_RE.test(candidate) && !isNameCh(buf[at + 32] === undefined ? undefined : String.fromCharCode(buf[at + 32]))) {
+      found.add(candidate);
+    }
+  }
   if (found.size === 0) return undefined;
   return found.size === 1 ? [...found][0] : null;
 }
@@ -581,6 +592,40 @@ function mentionsPhone(buf, phones) {
   if (text.includes(MARKER)) return true;
   for (const m of text.matchAll(ANY_PHONE_RE)) if (phones.has(m[1])) return true;
   return false;
+}
+
+// Процессы «claude --resume <id>» по /proc/*/cmdline: в такой сессии идёт ход.
+// Снимок живёт секунду — /proc не читается на каждую сессию.
+function liveResumes() {
+  let at = 0;
+  let ids = new Set();
+  return async () => {
+    if (Date.now() - at < 1000) return ids;
+    const next = new Set();
+    let pids = [];
+    try {
+      pids = await fsp.readdir("/proc");
+    } catch {
+      // не Linux — живых не видно
+    }
+    for (const pid of pids) {
+      if (!/^[0-9]+$/.test(pid)) continue;
+      let cmd;
+      try {
+        cmd = await fsp.readFile("/proc/" + pid + "/cmdline", "latin1");
+      } catch {
+        continue;
+      }
+      const args = cmd.split("\0");
+      for (let i = 0; i < args.length; i++) {
+        if (args[i] === "--resume" && args[i + 1]) next.add(args[i + 1]);
+        else if (args[i].startsWith("--resume=")) next.add(args[i].slice("--resume=".length));
+      }
+    }
+    at = Date.now();
+    ids = next;
+    return ids;
+  };
 }
 
 // Свободное имя для записи, чьё имя в новой папке занято: «имя (прежний).расш»,
@@ -601,9 +646,9 @@ function freeName(name, isDir, isTaken, prefixBytes = 0) {
 // План сессии: что из старой папки и загрузок куда переезжает. Решения
 // прошлых заходов (таблица) сохраняются: итоговое имя у записи одно на все
 // заходы, иначе пути в транскрипте разошлись бы с диском.
-async function planSession(sess, fsKey, prev, ctx) {
+async function planSession(sess, prev, ctx) {
   const oldPath = path.join(ctx.outputs, sess.oldDir);
-  const newPath = path.join(ctx.outputs, fsKey);
+  const newPath = path.join(ctx.outputs, sess.fsKey);
   const oldSt = await lstatOrNull(oldPath);
   if (oldSt && !oldSt.isDirectory()) throw withCode(oldSt.isSymbolicLink() ? "ESYMLINK" : "ENOTDIR");
   const newSt = await lstatOrNull(newPath);
@@ -611,40 +656,35 @@ async function planSession(sess, fsKey, prev, ctx) {
 
   const plan = {
     oldPath, newPath, oldSt, newSt,
-    outNames: new Set(prev?.on), outRenames: new Map(prev?.or),
-    upRests: new Set(prev?.un), upRenames: new Map(prev?.ur),
-    outMoves: [], upMoves: [], conflicts: 0, newRenames: false,
+    outMap: new Map(prev?.o), upMap: new Map(prev?.u),
+    outMoves: [], upMoves: [], conflicts: 0,
   };
   if (oldSt) {
     const taken = new Set(newSt ? await fsp.readdir(newPath) : []);
     const entries = (await fsp.readdir(oldPath, { withFileTypes: true })).sort((a, b) => byName(a.name, b.name));
     for (const ent of entries) {
       const src = path.join(oldPath, ent.name);
-      plan.outNames.add(ent.name);
-      let dst = plan.outRenames.get(ent.name) ?? ent.name;
+      let dst = plan.outMap.get(ent.name) ?? ent.name;
       // Занято — не перезаписываем: у старой записи будет суффикс. Тот же inode
       // — это наша же жёсткая ссылка от прерванного захода.
       if (taken.has(dst) && !(await sameInode(src, path.join(newPath, dst)))) {
         dst = freeName(ent.name, ent.isDirectory(), (c) => taken.has(c));
-        plan.outRenames.set(ent.name, dst);
-        plan.newRenames = true;
       }
       taken.add(dst);
+      plan.outMap.set(ent.name, dst);
       if (dst !== ent.name) plan.conflicts++;
       plan.outMoves.push({ src, dst: path.join(newPath, dst), file: ent.isFile() });
     }
   }
-  const prefix = fsKey + "_";
+  const prefix = sess.fsKey + "_";
   for (const u of ctx.uploadsOf.get(sess.key) ?? []) {
     const src = path.join(ctx.uploads, u.name);
-    plan.upRests.add(u.rest);
-    let rest = plan.upRenames.get(u.rest) ?? u.rest;
+    let rest = plan.upMap.get(u.rest) ?? u.rest;
     if (ctx.uploadNames.has(prefix + rest) && !(await sameInode(src, path.join(ctx.uploads, prefix + rest)))) {
       rest = freeName(u.rest, false, (c) => ctx.uploadNames.has(prefix + c), Buffer.byteLength(prefix));
-      plan.upRenames.set(u.rest, rest);
-      plan.newRenames = true;
     }
     ctx.uploadNames.add(prefix + rest);
+    plan.upMap.set(u.rest, rest);
     if (rest !== u.rest) plan.conflicts++;
     plan.upMoves.push({ src, dst: path.join(ctx.uploads, prefix + rest), file: u.file });
   }
@@ -652,23 +692,17 @@ async function planSession(sess, fsKey, prev, ctx) {
 }
 
 // Перенос без перезаписи. Файл — жёсткой ссылкой (link падает, если имя
-// занято) и удалением старого имени; папка — rename после проверки. Если
-// жёсткие ссылки запрещены (protected_hardlinks, файловая система), — так же,
-// как папка.
+// занято) и удалением старого имени; не вышло — ошибка сессии, без запасных
+// путей. Папка — rename после проверки, что имени нет.
 export async function moveEntry({ src, dst, file }) {
   if (file) {
     try {
       await fsp.link(src, dst);
-      await fsp.unlink(src);
-      return;
     } catch (e) {
-      if (e.code === "EEXIST") {
-        if (!(await sameInode(src, dst))) throw e;
-        await fsp.unlink(src);
-        return;
-      }
-      if (e.code !== "EPERM" && e.code !== "ENOTSUP") throw e;
+      if (e.code !== "EEXIST" || !(await sameInode(src, dst))) throw e;
     }
+    await fsp.unlink(src);
+    return;
   }
   if (await lstatOrNull(dst)) throw withCode("EEXIST");
   await fsp.rename(src, dst);
@@ -706,36 +740,49 @@ async function executePlan(plan, s) {
   }
 }
 
-// Весь проход по сессиям sessions.json. По каждой телефонной сессии — сразу
-// папка, загрузки и её транскрипт; свежесть — по mtime транскрипта. Сироты
-// (транскрипты не из sessions.json), папки и загрузки без сессии — только счёт.
+function newSummary() {
+  return {
+    phones: 0, sessions: 0, nonPhoneSessions: 0, selected: 0,
+    keyAgree: 0, keyMismatch: 0, keyAmbiguous: 0, mapRefused: false,
+    withMap: 0, withTranscriptKey: 0, withoutKey: 0, withoutKeyWithPhone: 0, noTranscript: 0,
+    fresh: 0, live: 0, deferred: 0, shared: 0, sharedSessions: 0,
+    dirs: 0, entries: 0, uploads: 0, conflicts: 0,
+    repl: newCounts(),
+    transcripts: 0, otherPhones: 0, thinkingWithPhone: 0, keysWithPhone: 0,
+    orphans: 0, orphansWithPhone: 0, orphanDirs: 0, orphanUploads: 0, mapBadLines: 0,
+    brokenLines: 0, brokenWithPhone: 0, nonCanonicalLines: 0,
+    written: 0, changedDuringWrite: 0, moved: 0, movedUploads: 0, dirsRemoved: 0, dirsLeft: 0,
+    errors: 0, errorList: [], interrupted: false, journal: null,
+  };
+}
+
+// Весь проход. Единица работы — номер: все его сессии вместе (пути в
+// транскриптах ссылаются и на папки соседних сессий того же номера). Если в
+// какой-то сессии номера идёт ход (свежий транскрипт или живой
+// «claude --resume») — весь номер откладывается до второго захода. По
+// номеру: план → таблица → перенос папок и загрузок → сразу транскрипты.
+// Сироты (транскрипты не из sessions.json), папки и загрузки без сессии —
+// только счёт. С картой --apply сначала сверяет её по всем сессиям и при
+// расхождении (или если сверить нечем) отказывает, ничего не тронув.
 export async function runScrub(opts, { commit = commitFile } = {}) {
   const {
     root, sessionsPath, outputs, uploads, fsKeyMapPath = null, statePath,
     journalPath = null, apply = false, minAgeMs = 15 * 60_000, signal,
+    onlyPhones = null, sessionsFilter = null,
+    inspectAll = false, // --finish: смотреть и свежие, и занятые живым процессом
   } = opts;
-  const s = {
-    phones: 0, sessions: 0, nonPhoneSessions: 0,
-    withMap: 0, withTranscriptKey: 0, keyAgree: 0, withoutKey: 0, keyMismatch: 0, noTranscript: 0, fresh: 0,
-    dirs: 0, entries: 0, uploads: 0, conflicts: 0,
-    repl: { phrase: 0, dirs: 0, uploads: 0, other: 0 },
-    transcripts: 0, otherPhones: 0,
-    orphans: 0, orphansWithPhone: 0, orphanDirs: 0, orphanUploads: 0, mapBadLines: 0,
-    brokenLines: 0, brokenWithPhone: 0, nonCanonicalLines: 0,
-    written: 0, moved: 0, movedUploads: 0, dirsRemoved: 0, dirsLeft: 0,
-    errors: 0, errorList: [], interrupted: false, journal: null,
-  };
+  const s = newSummary();
   // Только код: в сообщениях бывает кусок содержимого. Имя — файл транскрипта,
   // не ключ сессии: в ключе номер.
-  const fail = (file, e) => {
+  const fail = (x, e) => {
     s.errors++;
-    s.errorList.push({ file, code: e.code || e.name || "Error" });
+    s.errorList.push({ file: x.transcript ? path.relative(root, x.transcript) : "сессия без транскрипта", code: e.code || e.name || "Error" });
   };
 
   const entries = await loadSessions(sessionsPath);
   const { map: fsMap, bad } = fsKeyMapPath ? await loadFsKeyMap(fsKeyMapPath) : { map: new Map(), bad: 0 };
   s.mapBadLines = bad;
-  const state = await loadState(statePath);
+  const table = await loadTable(statePath);
   const transcripts = await indexTranscripts(root);
 
   const sessions = [];
@@ -749,20 +796,34 @@ export async function runScrub(opts, { commit = commitFile } = {}) {
       s.nonPhoneSessions++;
       continue;
     }
-    const sess = { key, cliId, phone: m[1], oldDir, transcript: transcripts.get(cliId) ?? null };
-    sessions.push(sess);
-    if (!byPhone.has(sess.phone)) byPhone.set(sess.phone, []);
-    byPhone.get(sess.phone).push(sess);
+    const x = { key, cliId, phone: m[1], oldDir, transcript: transcripts.get(cliId) ?? null };
+    sessions.push(x);
+    if (!byPhone.has(x.phone)) byPhone.set(x.phone, []);
+    byPhone.get(x.phone).push(x);
   }
   sessions.sort((a, b) => byName(a.key, b.key));
   const tablePhones = new Set(byPhone.keys());
   s.phones = tablePhones.size;
   s.sessions = sessions.length;
 
+  // Общие папки: обрезка до 48 знаков дала одну папку нескольким сессиям.
+  const perDir = new Map();
+  for (const x of sessions) perDir.set(x.oldDir, (perDir.get(x.oldDir) ?? 0) + 1);
+  for (const n of perDir.values()) if (n > 1) s.shared++;
+  const isShared = (x) => perDir.get(x.oldDir) > 1;
+
+  // Канарейка: первые N номеров (со всеми их сессиями) или список ключей.
+  const phonesSorted = [...byPhone.keys()].sort(byName);
+  const chosen = onlyPhones ? new Set(phonesSorted.slice(0, onlyPhones)) : null;
+  const isSelected = (x) => (!chosen || chosen.has(x.phone)) && (!sessionsFilter || sessionsFilter.has(x.key));
+  for (const x of sessions) if (isSelected(x)) s.selected++;
+
   // Загрузка принадлежит сессии с самым длинным совпавшим ключом-префиксом:
   // «<номер>_14_ru_x.pdf» — сессии «<номер>_14_ru», а не «<номер>_14».
+  // Загрузки общей папки и без сессии не переносятся.
   const uploadNames = new Set();
   const uploadsOf = new Map();
+  const keep = new Set();
   for (const ent of await readdirOrEmpty(uploads)) {
     uploadNames.add(ent.name);
     const m = PHONE_NAME_RE.exec(ent.name);
@@ -773,120 +834,200 @@ export async function runScrub(opts, { commit = commitFile } = {}) {
     }
     if (!owner) {
       s.orphanUploads++;
+      keep.add(ent.name);
       continue;
     }
+    if (isShared(owner)) continue;
     if (!uploadsOf.has(owner.key)) uploadsOf.set(owner.key, []);
     uploadsOf.get(owner.key).push({ name: ent.name, rest: ent.name.slice(owner.oldDir.length + 1), file: ent.isFile() });
   }
   const oldDirs = new Set(sessions.map((x) => x.oldDir));
   for (const ent of await readdirOrEmpty(outputs)) {
-    if (PHONE_NAME_RE.test(ent.name) && !oldDirs.has(ent.name) && (ent.isDirectory() || ent.isSymbolicLink())) s.orphanDirs++;
+    if (!PHONE_NAME_RE.test(ent.name) || oldDirs.has(ent.name)) continue;
+    if (ent.isDirectory() || ent.isSymbolicLink()) {
+      s.orphanDirs++;
+      keep.add(ent.name);
+    }
   }
-  const ctx = { outputs, uploads, uploadsOf, uploadNames };
 
-  async function processSession(sess) {
-    let snap = null;
-    if (sess.transcript) {
-      snap = await readSnapshot(sess.transcript, { minAgeMs });
-      if (snap.fresh) {
-        s.fresh++;
+  // Сверка: fs_key из транскриптов всех сессий (и свежих — только чтение).
+  for (const x of sessions) {
+    if (signal?.aborted) break;
+    if (!x.transcript) continue;
+    try {
+      x.fromTranscript = transcriptFsKey((await readSnapshot(x.transcript)).buf, outputs);
+    } catch (e) {
+      x.failed = true;
+      fail(x, e);
+    }
+  }
+  if (signal?.aborted) {
+    s.interrupted = true;
+    return s;
+  }
+  for (const x of sessions) {
+    if (x.failed) continue;
+    const fromMap = fsMap.get(x.key);
+    if (x.fromTranscript === null) {
+      s.keyAmbiguous++;
+      x.reason = "ambiguous";
+    } else if (fromMap && x.fromTranscript && fromMap !== x.fromTranscript) {
+      s.keyMismatch++;
+      x.reason = "mismatch";
+    } else {
+      if (fromMap && x.fromTranscript) s.keyAgree++;
+      x.fsKey = fromMap ?? x.fromTranscript;
+      if (fromMap) s.withMap++;
+      else if (x.fsKey) s.withTranscriptKey++;
+      else {
+        s.withoutKey++;
+        x.reason = "nokey";
+      }
+    }
+    if (!x.transcript) s.noTranscript++;
+  }
+  s.mapRefused = !!fsKeyMapPath && (s.keyMismatch > 0 || s.keyAgree === 0);
+  if (apply && s.mapRefused) throw Object.assign(withCode("EMAPCHECK"), { agree: s.keyAgree, mismatch: s.keyMismatch });
+  for (const x of sessions) {
+    if (x.reason !== "nokey" || !x.transcript) continue;
+    try {
+      if (mentionsPhone((await readSnapshot(x.transcript)).buf, new Set([x.phone]))) s.withoutKeyWithPhone++;
+    } catch (e) {
+      fail(x, e);
+    }
+  }
+
+  // Папка переезжает в этом заходе или уже переехала раньше (есть в таблице).
+  const movable = (x) => !!x.fsKey && !x.failed && !isShared(x) && (isSelected(x) || table.has(x.fsKey));
+  const ctx = { outputs, uploads, uploadsOf, uploadNames };
+  const live = liveResumes();
+  let journal = null;
+
+  async function processPhone(phone, group) {
+    const work = group.filter((x) => x.fsKey && !x.failed);
+    if (!work.length) return;
+    if (!inspectAll) {
+      const ids = await live();
+      let fresh = 0;
+      let busy = 0;
+      for (const x of work) {
+        if (ids.has(x.cliId)) busy++;
+        else if (x.transcript) {
+          const st = await lstatOrNull(x.transcript);
+          if (st && Date.now() - Number(st.mtimeMs) < minAgeMs) fresh++;
+        }
+      }
+      if (fresh || busy) {
+        s.fresh += fresh;
+        s.live += busy;
+        s.deferred += work.length;
         return;
       }
-    } else s.noTranscript++;
+    }
+    s.sharedSessions += work.filter(isShared).length;
 
-    // fs_key: карта прода, запасной — из транскрипта. Расходятся — не трогаем:
-    // скорее всего, карта посчитана не с той солью.
-    const fromMap = fsMap.get(sess.key);
-    const fromTranscript = snap ? transcriptFsKey(snap.buf, outputs) : undefined;
-    if (fromTranscript === null || (fromMap && fromTranscript && fromMap !== fromTranscript)) {
-      s.keyMismatch++;
-      return;
-    }
-    const fsKey = fromMap ?? fromTranscript;
-    if (!fsKey) {
-      s.withoutKey++;
-      return;
-    }
-    const prev = state.get(sess.key);
-    if (prev && prev.f !== fsKey) {
-      s.keyMismatch++;
-      return;
-    }
-    if (fromMap) s.withMap++;
-    else s.withTranscriptKey++;
-    if (fromMap && fromTranscript) s.keyAgree++;
-
-    const plan = await planSession(sess, fsKey, prev, ctx);
-    const rules = sessionRules({
-      phone: sess.phone, fsKey,
-      dirs: new Map([[sess.oldDir, {
-        fsKey, outNames: [...plan.outNames], outRenames: plan.outRenames,
-        upRests: [...plan.upRests], upRenames: plan.upRenames,
-      }]]),
-      uploadsRoot: uploads,
-      tablePhones,
-    });
-    const r = snap ? scrubContent(snap.buf, rules) : null;
-    if (plan.oldSt) s.dirs++;
-    s.entries += plan.outMoves.length;
-    s.uploads += plan.upMoves.length;
-    s.conflicts += plan.conflicts;
-    if (r) {
-      for (const k of Object.keys(s.repl)) s.repl[k] += r.counts[k];
-      if (r.out) s.transcripts++;
-      if (r.otherPhones) s.otherPhones++;
-      s.brokenLines += r.brokenLines;
-      s.brokenWithPhone += r.brokenWithPhone;
-      s.nonCanonicalLines += r.nonCanonicalLines;
-    }
-    if (!apply) return;
-
-    // Решения о новых именах — в таблицу до переноса: прервёмся посередине —
-    // следующий заход возьмёт те же имена.
-    if (plan.newRenames) {
-      await appendState(statePath, {
-        k: sess.key, f: fsKey,
-        on: [...plan.outNames], or: Object.fromEntries(plan.outRenames),
-        un: [...plan.upRests], ur: Object.fromEntries(plan.upRenames),
-      });
-    }
-    await executePlan(plan, s);
-    let written = false;
-    if (r?.out) {
-      // CLI дописал транскрипт, пока шёл перенос: файлы уже на новом месте,
-      // транскрипт перепишет следующий заход — по таблице.
-      if ((await commit(sess.transcript, snap.stat, r.out)) === "changed") s.fresh++;
-      else {
-        s.written++;
-        written = true;
+    const plans = new Map();
+    for (const x of work) {
+      if (isShared(x)) continue;
+      try {
+        plans.set(x.key, await planSession(x, table.get(x.fsKey), ctx));
+      } catch (e) {
+        x.failed = true;
+        fail(x, e);
       }
     }
-    if (plan.oldSt || plan.outMoves.length || plan.upMoves.length || written) {
-      await journal.add({
-        transcript: sess.transcript ? path.relative(root, sess.transcript) : null,
-        fsKey,
-        moved: plan.outMoves.length,
-        uploads: plan.upMoves.length,
-        conflicts: plan.conflicts,
-        replacements: r ? r.counts : null,
-        transcriptWritten: written,
-        at: new Date().toISOString(),
+    for (const p of plans.values()) {
+      if (p.oldSt) s.dirs++;
+      s.entries += p.outMoves.length;
+      s.uploads += p.upMoves.length;
+      s.conflicts += p.conflicts;
+    }
+
+    if (apply) {
+      for (const x of work) {
+        const p = plans.get(x.key);
+        if (!p || x.failed) continue;
+        try {
+          if (p.outMoves.length || p.upMoves.length) {
+            await appendTable(statePath, { f: x.fsKey, o: Object.fromEntries(p.outMap), u: Object.fromEntries(p.upMap) });
+          }
+          await executePlan(p, s);
+        } catch (e) {
+          x.failed = true;
+          fail(x, e);
+        }
+      }
+    }
+
+    // Папки всех сессий номера — для путей в транскриптах.
+    const dirs = new Map();
+    for (const y of byPhone.get(phone)) {
+      const p = plans.get(y.key);
+      const t = table.get(y.fsKey);
+      const outMap = p ? p.outMap : new Map(t?.o);
+      const upMap = p ? p.upMap : new Map(t?.u);
+      dirs.set(y.oldDir, {
+        fsKey: movable(y) ? y.fsKey : null,
+        outNames: [...outMap.keys()], outRenames: outMap,
+        upRests: [...upMap.keys()], upRenames: upMap,
       });
+    }
+
+    for (const x of work) {
+      if (x.failed) continue;
+      const p = plans.get(x.key);
+      try {
+        let r = null;
+        let written = false;
+        if (x.transcript) {
+          const snap = await readSnapshot(x.transcript);
+          r = scrubContent(snap.buf, sessionRules({ phone, fsKey: x.fsKey, dirs, keep, uploadsRoot: uploads, tablePhones }));
+          for (const k of Object.keys(s.repl)) s.repl[k] += r.counts[k];
+          if (r.out) s.transcripts++;
+          if (r.otherPhones) s.otherPhones++;
+          s.thinkingWithPhone += r.thinkingWithPhone;
+          s.keysWithPhone += r.keysWithPhone;
+          s.brokenLines += r.brokenLines;
+          s.brokenWithPhone += r.brokenWithPhone;
+          s.nonCanonicalLines += r.nonCanonicalLines;
+          if (apply && r.out) {
+            // CLI дописал транскрипт, пока шёл перенос: файлы уже на новом
+            // месте, транскрипт перепишет следующий заход — по таблице.
+            if ((await commit(x.transcript, snap.stat, r.out)) === "changed") s.changedDuringWrite++;
+            else {
+              s.written++;
+              written = true;
+            }
+          }
+        }
+        if (apply && (written || (p && (p.oldSt || p.outMoves.length || p.upMoves.length)))) {
+          await journal.add({
+            transcript: x.transcript ? path.relative(root, x.transcript) : null,
+            fsKey: x.fsKey,
+            moved: p ? p.outMoves.length : 0,
+            uploads: p ? p.upMoves.length : 0,
+            conflicts: p ? p.conflicts : 0,
+            replacements: r ? r.counts : null,
+            transcriptWritten: written,
+            at: new Date().toISOString(),
+          });
+        }
+      } catch (e) {
+        fail(x, e);
+      }
     }
   }
 
-  const journal = apply ? await openJournal(journalPath) : null;
+  journal = apply ? await openJournal(journalPath) : null;
   try {
-    for (const sess of sessions) {
+    for (const phone of phonesSorted) {
+      const group = byPhone.get(phone).filter(isSelected);
+      if (!group.length) continue;
       if (signal?.aborted) {
         s.interrupted = true;
         break;
       }
-      try {
-        await processSession(sess);
-      } catch (e) {
-        fail(sess.transcript ? path.relative(root, sess.transcript) : "сессия без транскрипта", e);
-      }
+      await processPhone(phone, group);
     }
     for (const [id, file] of transcripts) {
       if (s.interrupted) break;
@@ -899,7 +1040,7 @@ export async function runScrub(opts, { commit = commitFile } = {}) {
       try {
         if (mentionsPhone((await readSnapshot(file)).buf, tablePhones)) s.orphansWithPhone++;
       } catch (e) {
-        fail(path.relative(root, file), e);
+        fail({ transcript: file }, e);
       }
     }
   } finally {
@@ -908,12 +1049,28 @@ export async function runScrub(opts, { commit = commitFile } = {}) {
   return s;
 }
 
-// --finish: сначала проверка, что делать больше нечего (и в свежих сессиях —
-// только чтение), потом удаление таблицы переименований и карты fs_key.
+// --finish: проверка только чтением (свежие и занятые — тоже), что делать
+// больше нечего и не осталось того, из-за чего номер остался бы в сессии,
+// которую можно было обработать; потом удаление таблицы и карты.
 export async function finishScrub(opts) {
-  const s = await runScrub({ ...opts, apply: false, minAgeMs: 0, journalPath: null });
-  const pending = s.dirs + s.uploads + s.transcripts;
-  if (pending > 0 || s.errors > 0 || s.interrupted) return { pending, removed: [], summary: s };
+  const s = await runScrub({
+    ...opts, apply: false, minAgeMs: 0, journalPath: null, inspectAll: true, onlyPhones: null, sessionsFilter: null,
+  });
+  const reasons = [];
+  const add = (n, label) => {
+    if (n) reasons.push(label + ": " + n);
+  };
+  add(s.dirs, "папок к переносу");
+  add(s.uploads, "загрузок к переносу");
+  add(s.transcripts, "транскриптов к записи");
+  add(s.keyMismatch, "расхождений fs_key");
+  add(s.keyAmbiguous, "неоднозначных fs_key");
+  add(s.withoutKeyWithPhone, "без fs_key с номером");
+  add(s.brokenWithPhone, "битых строк с номером");
+  add(s.nonCanonicalLines, "неканоничных строк");
+  add(s.errors, "ошибок");
+  if (s.interrupted) reasons.push("прервано");
+  if (reasons.length) return { ok: false, reasons, removed: [], summary: s };
   const removed = [];
   for (const p of [opts.statePath, opts.fsKeyMapPath]) {
     if (!p) continue;
@@ -924,25 +1081,27 @@ export async function finishScrub(opts) {
       if (e.code !== "ENOENT") throw e;
     }
   }
-  return { pending, removed, summary: s };
+  return { ok: true, reasons, removed, summary: s };
 }
 
 // ---------------------------------------------------------------- запуск
 
-const USAGE = `Использование (на релее, от dv; скрипт едет через stdin):
+const USAGE = `Использование (на релее, от dv):
   ssh <релей> 'node --input-type=module - [флаги]' < scripts/relay-scrub-phone.mjs
   (или node relay-scrub-phone.mjs [флаги])
 Флаги:
-  --fs-key-map <файл>  карта «ключ сессии<TAB>fs_key» от прода, права 600
-  --apply              перенести и переписать; без него — сухой прогон, только счётчики
-  --finish             проверить, что делать больше нечего, и удалить таблицу и карту
-  --min-age-min <N>    не трогать сессии, чей транскрипт менялся за N минут; по умолчанию 15
-  --root <каталог>     проекты claude; по умолчанию ~/.claude/projects
-  --sessions <файл>    sessions.json релея; по умолчанию ~/file-agent/sessions.json
-  --outputs <каталог>  папки хода; по умолчанию /tmp/agent-output
-  --uploads <каталог>  загрузки; по умолчанию /tmp/agent-uploads
-  --state <файл>       таблица переименований; по умолчанию ~/.relay-scrub-map.jsonl
-  --journal <файл>     журнал; по умолчанию ~/relay-scrub-phone-<метка>.jsonl, права 600
+  --fs-key-map <файл>    карта «ключ сессии<TAB>fs_key» от прода, права 600
+  --apply                перенести и переписать; без него — сухой прогон, только счётчики
+  --only-phones <N>      канарейка: только первые N номеров (по сортировке), все их сессии
+  --sessions-file <файл> канарейка: только сессии из списка ключей (по строке), права 600
+  --finish               проверить, что делать больше нечего, и удалить таблицу и карту
+  --min-age-min <N>      номер, в сессии которого транскрипт менялся за N минут, — позже; по умолчанию 15
+  --root <каталог>       проекты claude; по умолчанию ~/.claude/projects
+  --sessions <файл>      sessions.json релея; по умолчанию ~/file-agent/sessions.json
+  --outputs <каталог>    папки хода; по умолчанию /tmp/agent-output
+  --uploads <каталог>    загрузки; по умолчанию /tmp/agent-uploads
+  --state <файл>         таблица переносов; по умолчанию ~/.relay-scrub-map.jsonl
+  --journal <файл>       журнал; по умолчанию ~/relay-scrub-phone-<метка>.jsonl, права 600
 `;
 
 function parseCli(argv) {
@@ -954,6 +1113,8 @@ function parseCli(argv) {
       "fs-key-map": { type: "string" },
       apply: { type: "boolean" },
       finish: { type: "boolean" },
+      "only-phones": { type: "string" },
+      "sessions-file": { type: "string" },
       "min-age-min": { type: "string" },
       root: { type: "string" },
       sessions: { type: "string" },
@@ -968,6 +1129,12 @@ function parseCli(argv) {
   // --finish проверяет по карте и её же удаляет: без карты недоделанные сессии
   // выглядели бы как «без fs_key», и таблица ушла бы раньше времени.
   if (values.finish && !values["fs-key-map"]) throw new Error("--finish — только с --fs-key-map");
+  if (values["only-phones"] !== undefined && values["sessions-file"] !== undefined) {
+    throw new Error("--only-phones и --sessions-file — что-то одно");
+  }
+  if (values["only-phones"] !== undefined && !/^[1-9][0-9]*$/.test(values["only-phones"])) {
+    throw new Error("--only-phones: нужно целое число номеров, больше 0");
+  }
   const rawAge = values["min-age-min"] ?? "15";
   const minutes = rawAge.trim() === "" ? NaN : Number(rawAge);
   if (!Number.isFinite(minutes) || minutes < 0) throw new Error("--min-age-min: нужно число минут, не меньше 0");
@@ -979,6 +1146,8 @@ function parseCli(argv) {
     apply: !!values.apply,
     finish: !!values.finish,
     minAgeMs: minutes * 60_000,
+    onlyPhones: values["only-phones"] === undefined ? null : Number(values["only-phones"]),
+    sessionsFile: abs(values["sessions-file"]) ?? null,
     fsKeyMapPath: abs(values["fs-key-map"]) ?? null,
     root: abs(values.root) ?? path.join(home, ".claude", "projects"),
     sessionsPath: abs(values.sessions) ?? path.join(home, "file-agent", "sessions.json"),
@@ -996,38 +1165,54 @@ function report(s, o) {
     "транскрипты: " + o.root + "; sessions.json: " + o.sessionsPath,
     "папки хода: " + o.outputs + "; загрузки: " + o.uploads,
     "карта fs_key: " + (o.fsKeyMapPath ?? "не задана") + ", строк с ошибкой: " + s.mapBadLines,
-    "номеров: " + s.phones,
-    "сессий: " + s.sessions + " (без номера: " + s.nonPhoneSessions + ")",
-    "fs_key: из карты " + s.withMap + ", из транскрипта " + s.withTranscriptKey +
-      " (совпало с картой " + s.keyAgree + "), без fs_key " + s.withoutKey + ", расхождений " + s.keyMismatch,
-    "свежих: " + s.fresh + (s.fresh ? " — пройти вторым заходом позже" : ""),
+    "сверка карты с транскриптами: совпало " + s.keyAgree + ", расхождений " + s.keyMismatch + ", неоднозначных " + s.keyAmbiguous,
+  ];
+  if (s.mapRefused) {
+    lines.push("--apply откажет: " + (s.keyMismatch ? "карта не сходится с транскриптами" : "карту нечем сверить — ни одного хода после части Б"));
+  }
+  lines.push(
+    "номеров: " + s.phones + "; сессий: " + s.sessions + " (без номера: " + s.nonPhoneSessions + "); выбрано: " + s.selected,
+    "fs_key: из карты " + s.withMap + ", из транскрипта " + s.withTranscriptKey + ", без fs_key " + s.withoutKey +
+      " (из них с номером: " + s.withoutKeyWithPhone + ")",
+    "свежих: " + s.fresh + ", с живым процессом CLI: " + s.live + "; отложено сессий (весь номер): " + s.deferred +
+      (s.deferred ? " — пройти вторым заходом позже" : ""),
     "без транскрипта: " + s.noTranscript,
+    "общих старых папок (не трогаются): " + s.shared + ", их сессий: " + s.sharedSessions,
     "папок к переносу: " + s.dirs + ", записей в них: " + s.entries + ", загрузок: " + s.uploads +
       ", конфликтов имён: " + s.conflicts,
     "замен в транскриптах: фраза " + r.phrase + ", пути папок " + r.dirs + ", пути загрузок " + r.uploads +
-      ", прочие " + r.other + "; транскриптов к записи: " + s.transcripts,
+      ", прочие " + r.other + "; оставлено в путях: " + r.kept + "; транскриптов к записи: " + s.transcripts,
     "транскриптов с номерами других пользователей: " + s.otherPhones,
+    "блоков рассуждений с номером (не трогаются): " + s.thinkingWithPhone + "; ключей JSON с номером (не трогаются): " +
+      s.keysWithPhone,
     "сирот: " + s.orphans + ", из них с номером: " + s.orphansWithPhone + "; папок без сессии: " + s.orphanDirs +
       "; загрузок без сессии: " + s.orphanUploads,
     "битых строк: " + s.brokenLines + ", из них с номером: " + s.brokenWithPhone,
-    "строк, где JSON.stringify меняет не только замены: " + s.nonCanonicalLines,
-  ];
+    "строк, где JSON.stringify меняет не только замены (не пишутся): " + s.nonCanonicalLines,
+  );
   if (o.apply) {
     lines.push(
       "переписано транскриптов: " + s.written + "; перенесено записей: " + s.moved + ", загрузок: " + s.movedUploads +
         "; удалено старых папок: " + s.dirsRemoved + ", осталось непустых: " + s.dirsLeft,
+      "изменились во время записи (второй заход): " + s.changedDuringWrite,
       "журнал: " + (s.journal ?? "не создан — записывать нечего"),
-      "таблица переименований: " + o.statePath + " (удалить — --finish после последнего захода)",
+      "таблица переносов: " + o.statePath + " (удалить — --finish после последнего захода)",
     );
   }
   lines.push("ошибок: " + s.errors);
-  if (s.interrupted) lines.push("ПРЕРВАНО: пройдены не все сессии, итог неполный");
+  if (s.interrupted) lines.push("ПРЕРВАНО: пройдены не все номера, итог неполный");
   return lines.join("\n") + "\n";
 }
 
 // Ошибка до прохода: путь можно, содержимое и номера — нет.
 function startError(e, o) {
   if (e.code === "EMAPMODE") return "карта fs_key доступна не только владельцу — chmod 600 " + o.fsKeyMapPath;
+  if (e.code === "EKEYSMODE") return "список ключей доступен не только владельцу — chmod 600 " + o.sessionsFile;
+  if (e.code === "EMAPCHECK") {
+    return e.mismatch
+      ? "карта fs_key не сходится с транскриптами: совпало " + e.agree + ", расхождений " + e.mismatch + " — ничего не тронуто"
+      : "карту fs_key нечем сверить — ни одного хода после части Б; ничего не тронуто";
+  }
   if (e.code === "EBADSESSIONS" || e.name === "SyntaxError") return "sessions.json не разобрался: " + o.sessionsPath;
   return (e.code || e.name) + (e.path ? " " + e.path : "");
 }
@@ -1051,26 +1236,24 @@ export async function main(argv = process.argv.slice(2), out = process.stdout, e
     return 2;
   }
 
-  // Ctrl+C и SIGTERM дают доделать текущую сессию: папка и транскрипт — вместе.
+  // Ctrl+C, SIGTERM и SIGHUP дают доделать текущий номер: папки и
+  // транскрипты его сессий — вместе.
   const ac = new AbortController();
   const stop = () => ac.abort();
-  process.once("SIGINT", stop);
-  process.once("SIGTERM", stop);
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP"];
+  for (const sig of signals) process.once(sig, stop);
   try {
+    const sessionsFilter = o.sessionsFile ? await loadSessionsFilter(o.sessionsFile) : null;
     if (o.finish) {
       const f = await finishScrub({ ...o, signal: ac.signal });
-      if (f.pending === 0 && f.summary.errors === 0 && !f.summary.interrupted) {
+      if (f.ok) {
         out.write("relay-scrub-phone --finish: делать больше нечего; удалено: " + (f.removed.join(", ") || "нечего удалять") + "\n");
         return 0;
       }
-      const s = f.summary;
-      out.write(
-        "relay-scrub-phone --finish: не всё сделано — папок " + s.dirs + ", загрузок " + s.uploads + ", транскриптов " +
-          s.transcripts + ", ошибок " + s.errors + (s.interrupted ? ", прервано" : "") + ". Таблица и карта оставлены.\n",
-      );
+      out.write("relay-scrub-phone --finish: не всё сделано — " + f.reasons.join(", ") + ". Таблица и карта оставлены.\n");
       return 1;
     }
-    const s = await runScrub({ ...o, signal: ac.signal });
+    const s = await runScrub({ ...o, sessionsFilter, signal: ac.signal });
     out.write(report(s, o));
     for (const { file, code } of s.errorList) err.write("ошибка: " + file + ": " + code + "\n");
     return s.interrupted ? 130 : s.errors ? 1 : 0;
@@ -1078,8 +1261,7 @@ export async function main(argv = process.argv.slice(2), out = process.stdout, e
     err.write("relay-scrub-phone: " + startError(e, o) + "\n");
     return 2;
   } finally {
-    process.off("SIGINT", stop);
-    process.off("SIGTERM", stop);
+    for (const sig of signals) process.off(sig, stop);
   }
 }
 
