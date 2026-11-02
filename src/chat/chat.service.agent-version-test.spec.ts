@@ -1,8 +1,19 @@
 import { Readable } from 'stream';
 import axios from 'axios';
 import { ChatService } from './chat.service';
+import { relayFsKey } from './linkeon-relay-fields';
 
 jest.mock('axios');
+
+// relayFsKey без секретов fs_key не выдаёт (ревью 26.10.2026) — тестам этого
+// файла, которые сверяют fs_key, нужен хоть один.
+const OLD_SALT = process.env.RELAY_FS_SALT;
+beforeAll(() => {
+  process.env.RELAY_FS_SALT = 'agent-version-test-spec';
+});
+afterAll(() => {
+  if (OLD_SALT === undefined) delete process.env.RELAY_FS_SALT; else process.env.RELAY_FS_SALT = OLD_SALT;
+});
 jest.mock('../common/telegram-alert', () => ({
   sendTelegramAlert: jest.fn(async () => {}),
   sendTelegramPayload: jest.fn(async () => {}),
@@ -117,7 +128,7 @@ describe('agentReply: isolated agent version test', () => {
     expect(fields.systemPrompt).not.toContain('User profile');
     expect(fields.systemPrompt).not.toContain('LIVE USER PROFILE');
     expect(fields.systemPrompt).not.toContain('LIVE BUSINESS PROFILE');
-    for (const key of ['linkeon_token', 'linkeon_mcp_url', 'fs_key']) {
+    for (const key of ['linkeon_token', 'linkeon_mcp_url']) {
       expect(fields[key]).toBeUndefined();
     }
     expect(h.neo4j.getProfileDescription).not.toHaveBeenCalled();
@@ -129,6 +140,29 @@ describe('agentReply: isolated agent version test', () => {
       expect.stringContaining('billing[agent_version_test:cost]'),
     );
     expect(log.mock.calls.map(([line]) => String(line)).join('\n')).not.toContain('billing[voice]');
+  });
+
+  // Спека 2026-11-02-pii-out-of-prompts-design.md, п. 3: без fs_key релей
+  // называет папку хода по ключу сессии проверки (base64 с номером админа) и
+  // пишет путь в реплику. Папка — по солёному хэшу, как в обычном чате;
+  // токена инструментов при этом по-прежнему нет.
+  it('fs_key уходит и при linkeonTools: false — папка хода по солёному хэшу, без токена инструментов', async () => {
+    const h = replyHarness();
+
+    await h.service.generateAgentReplyWithCharge(
+      '70000000000',
+      '12',
+      'check the draft',
+      'agent_test_signed_session',
+      testOpts,
+    );
+
+    const fields = h.lastFields();
+    expect(fields.sessionId).toBe('agent_test_signed_session');
+    expect(fields.fs_key).toBe(relayFsKey('agent_test_signed_session'));
+    expect(fields.fs_key).toMatch(/^[0-9a-f]{32}$/);
+    expect(fields.linkeon_token).toBeUndefined();
+    expect(fields.linkeon_mcp_url).toBeUndefined();
   });
 
   it('uses the requested test language without reading language or profile data', async () => {
