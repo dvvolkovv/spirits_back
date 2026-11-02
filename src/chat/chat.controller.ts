@@ -364,6 +364,9 @@ export class ChatController {
     // (chat-files, ниже) занимает до ~60с — без этого ход с вложениями не
     // был виден вовсе, и рестарт мог оборвать именно её.
     this.chatService.beginStream();
+    // Ход с вложениями — и в учёт идущих ходов (active-turn): иначе посреди
+    // долгого разбора файла кабинет не видит хода, а «?» его пре-эмптит.
+    const turnMark = this.chatService.beginUploadTurn(userId, String(assistantId));
     // Закрывает ход ровно один раз. beginStream/endStream раньше были
     // завязаны на то, какая ветка кода ниже доберётся до конца — бросок
     // где-то посреди finally (например, в computeUploadCharge) обходил обе
@@ -379,6 +382,7 @@ export class ChatController {
       if (streamClosed) return;
       streamClosed = true;
       this.chatService.endStream();
+      this.chatService.endUploadTurn(userId, String(assistantId), turnMark);
     };
     let persistDispatched = false;
     try {

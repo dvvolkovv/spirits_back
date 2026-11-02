@@ -18,6 +18,7 @@ import { TalerIdRoomClient } from '../meeting/talerid-room.client';
 import { RESPONSE_STYLE_RULE } from './response-style';
 import { ANSWER_FIRST_RULE } from './answer-first-rule';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
+import { INTERRUPTED_TURN_NOTE } from './interrupted-turn';
 import { CRISIS_RULE } from './crisis-rule';
 import { loadCoworkers } from './coworkers';
 import { colleaguesRule } from './colleagues-rule';
@@ -414,6 +415,41 @@ export class ChatService {
    */
   endStream(): void {
     if (this.activeStreams > 0) this.activeStreams--;
+  }
+
+  /**
+   * Отметка «ход идёт» для пары пользователь+ассистент. Возвращает метку хода:
+   * снять отметку может только её хозяин (closeTurn).
+   *
+   * Метка обязана отличаться от прежней: прерванный ход (релей пре-эмптит
+   * процесс сессии, когда приходит новое сообщение) доходит до finally ПОЗЖЕ,
+   * чем новый ход поставил свою отметку, и безусловный delete стирал её.
+   * Кабинет после этого считал, что хода нет, слал следующее «?» сразу — и
+   * релей пре-эмптил уже новый ход (находка 2ff1a026).
+   */
+  private openTurn(key: string, startedAt: number = Date.now()): number {
+    const prev = this.activeTurns.get(key);
+    const mark = prev !== undefined && startedAt <= prev ? prev + 1 : startedAt;
+    this.activeTurns.set(key, mark);
+    return mark;
+  }
+
+  /** Снимает отметку, только если она этого хода: новый ход мог её уже переписать. */
+  private closeTurn(key: string, mark: number): void {
+    if (this.activeTurns.get(key) === mark) this.activeTurns.delete(key);
+  }
+
+  /**
+   * Ход с вложениями (ChatController.uploadAndChat) — в тот же учёт, что и
+   * текстовый: иначе посреди долгого разбора файла кабинет не видит хода и
+   * шлёт «?» сразу, а релей его пре-эмптит.
+   */
+  beginUploadTurn(userId: string, assistantId: string): number {
+    return this.openTurn(`${userId}_${assistantId}`);
+  }
+
+  endUploadTurn(userId: string, assistantId: string, mark: number): void {
+    this.closeTurn(`${userId}_${assistantId}`, mark);
   }
 
   /**
@@ -1237,9 +1273,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // (пока подбирается карта), клиенты пропускают; после end таймер не
     // вклинится — запись end и finally идут синхронно.
     let ping: NodeJS.Timeout | null = null;
+    // Метка этого хода (openTurn/closeTurn) — см. комментарий у openTurn: снять
+    // отметку в finally можно только если она ещё своя, а не уже переписана
+    // новым ходом по той же паре.
+    let turnMark: number | null = null;
     try {
       this.activeStreams++;
-      this.activeTurns.set(turnKey, turnStartedAt);
+      turnMark = this.openTurn(turnKey, turnStartedAt);
       // Пока думает CLI, клиенту не уходит ничего до самого ответа — а это минуты.
       // Flutter-клиент (Dio receiveTimeout 60 с) рвал такой ход ошибкой. Пинг —
       // той же формы, что у релея: {"type":"ping"} без content/text/delta, его
@@ -1411,7 +1451,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     } finally {
       if (ping) clearInterval(ping);
       this.activeStreams--;
-      this.activeTurns.delete(turnKey);
+      if (turnMark !== null) this.closeTurn(turnKey, turnMark);
     }
   }
 
@@ -1705,6 +1745,15 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // stablePrefix вместе с персоной: перенос в системный промпт вернёт их в
     // НАЧАЛО контекста, то есть ровно туда, откуда их пришлось убирать. Весят
     // они при этом гроши — 1847 символов на 44 хода в замеренной сессии.
+    //
+    // Сообщение посреди идущего хода той же пары пре-эмптит его на релее —
+    // скажем модели, что прошлая работа прервана и что с ней делать
+    // (interrupted-turn.ts). Проверка — до того, как этот ход поставит свою
+    // отметку (openTurn ниже). Пинги мониторинга и «чистый лист» — мимо: у
+    // fresh-сессии на релее свой ключ, и чужой ход она не прерывает.
+    if (!probe && !fresh && this.activeTurns.has(`${userId}_${assistantId}`)) {
+      contextPrefix += `${INTERRUPTED_TURN_NOTE}\n\n`;
+    }
     contextPrefix += `${MEETING_HONESTY_RULE}\n\n`;
     contextPrefix += `${RESPONSE_STYLE_RULE}\n\n`;
 
@@ -1985,12 +2034,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // внутри.
     const productsTurn = randomUUID();
 
+    // Метка этого хода (openTurn/closeTurn) — см. комментарий у openTurn: снять
+    // отметку в finally можно только если она ещё своя, а не уже переписана
+    // новым ходом по той же паре (находка «Затыков недели» 2ff1a026).
+    let turnMark: number | null = null;
+
     try {
       // Ход пошёл в upstream — с этого места и до finally его нельзя рвать
       // рестартом. Инкремент внутри try, чтобы декремент в finally был парным
       // при любом исходе.
       this.activeStreams++;
-      this.activeTurns.set(`${userId}_${assistantId}`, streamStartTime);
+      turnMark = this.openTurn(`${userId}_${assistantId}`, streamStartTime);
       // Один вызов upstream r.linkeon: парсит SSE, пушит в chunks и стримит
       // 'item' клиенту. Вынесено в замыкание ради self-heal ретрая пустого потока.
       // Ключ сессии релея: и в запросе, и для шагов работы — релей кладёт
@@ -2521,7 +2575,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       setImmediate(() => { void persistResponse(true); });
     } finally {
       this.activeStreams--;
-      this.activeTurns.delete(`${userId}_${assistantId}`);
+      if (turnMark !== null) this.closeTurn(`${userId}_${assistantId}`, turnMark);
       clearInterval(heartbeat);
     }
   }
