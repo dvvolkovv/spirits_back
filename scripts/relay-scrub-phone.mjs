@@ -8,9 +8,12 @@
 // прямо в транскриптах. Спека: spirits_back
 // docs/superpowers/specs/2026-11-02-pii-out-of-prompts-design.md, п. 5.
 //
-// Запуск — на релее, от dv (владельца транскриптов):
-//   node scrub-phone-line.mjs            сухой прогон: только счётчики
-//   node scrub-phone-line.mjs --apply    замена + журнал
+// Запуск — на релее, от dv (владельца транскриптов). Скрипт разовый и в
+// дерево релея не кладётся: едет через stdin.
+//   ssh <релей> 'node --input-type=module -' < scripts/relay-scrub-phone.mjs
+//       сухой прогон: только счётчики
+//   ssh <релей> 'node --input-type=module - --apply' < scripts/relay-scrub-phone.mjs
+//       замена + журнал
 // Флаги: --root <каталог> (по умолчанию ~/.claude/projects; смотрятся
 // <root>/*/*.jsonl), --min-age-min <минуты> (по умолчанию 15),
 // --journal <файл> (по умолчанию ~/scrub-phone-line-<метка>.jsonl).
@@ -39,7 +42,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { parseArgs } from "node:util";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // Строгая форма строки — ровно та, что собирал релей. Номер — 10–15 цифр,
 // иногда с «+».
@@ -325,7 +328,8 @@ export async function scrubTree(
 
 // ---------------------------------------------------------------- запуск
 
-const USAGE = `Использование: node scrub-phone-line.mjs [--root <каталог>] [--apply] [--min-age-min <минуты>] [--journal <файл>]
+const USAGE = `Использование: node --input-type=module - [--root <каталог>] [--apply] [--min-age-min <минуты>] [--journal <файл>] < relay-scrub-phone.mjs
+               (или node relay-scrub-phone.mjs с теми же флагами)
   --root         каталог проектов claude, по умолчанию ~/.claude/projects; смотрятся <root>/*/*.jsonl
   --apply        заменить; без него — сухой прогон, только счётчики
   --min-age-min  не трогать файлы, менявшиеся за последние N минут; по умолчанию 15
@@ -428,12 +432,19 @@ export async function main(argv = process.argv.slice(2), out = process.stdout, e
   return s.interrupted ? 130 : s.errors ? 1 : 0;
 }
 
-// Запущен как скрипт, а не импортирован (тесты). realpath — на случай запуска
-// через симлинк: import.meta.url у Node — настоящий путь.
+// Запущен как скрипт, а не импортирован (тесты).
+// - Через stdin (node - < relay-scrub-phone.mjs, так он едет на релей):
+//   argv[1] — "-", а import.meta.url — не путь к файлу ("<cwd>/[eval1]").
+//   Если же через stdin пришёл другой код и импортировал этот модуль, у
+//   модуля настоящий файл — тогда прогон не запускается.
+// - Файлом: сравнение с realpath — на случай запуска через симлинк,
+//   import.meta.url у Node — настоящий путь.
 function invokedDirectly() {
-  if (!process.argv[1]) return false;
+  const entry = process.argv[1];
+  if (!entry) return false;
+  if (entry === "-") return !fs.existsSync(fileURLToPath(import.meta.url));
   try {
-    return import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href;
+    return import.meta.url === pathToFileURL(fs.realpathSync(entry)).href;
   } catch {
     return false;
   }
