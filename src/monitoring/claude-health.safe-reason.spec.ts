@@ -21,7 +21,7 @@ import { ClaudeHealthService } from './claude-health.service';
 
 const spawnMock = spawn as unknown as jest.Mock;
 const SECRET = 'СЕКРЕТ-ИЗ-ОТВЕТА';
-const LEAK = /СЕКРЕТ/;
+const LEAK = /СЕКРЕТ|SECRET/;
 
 function fakeProc(stdout: string, code = 0, stderr = '') {
   const outH: Array<(b: Buffer) => void> = [];
@@ -117,6 +117,15 @@ describe('ClaudeHealthService — причина сбоя пробы без сы
     const svc = await probe(claudeCli);
     expect(svc.cache.llmOutageKind).toBe('timeout');
     expect(svc.cache.llmError).toBe('Таймаут вызова Claude');
+  });
+
+  // Ревью 02.11, I1: отказ распознаётся по началу — дальше может идти ответ модели.
+  it('отказ CLI текстом пробы с хвостом ответа — в причине только фраза отказа', async () => {
+    const claudeCli = { text: jest.fn().mockResolvedValue('Credit balance is too low SECRET-FROM-ANSWER here'), fallbackStats: jest.fn() };
+    const svc = await probe(claudeCli);
+    expect(svc.cache.llmOutageKind).toBe('other');
+    expect(svc.cache.llmError).toBe('неизвестный сбой CLI: claude CLI отказ: other, Credit balance is too low');
+    expect(logged()).not.toMatch(LEAK);
   });
 
   it('отказ CLI текстом пробы вида other — фраза вида и безопасный текст отказа', async () => {

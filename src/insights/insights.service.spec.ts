@@ -205,10 +205,17 @@ describe('InsightsService.execute', () => {
     expect(h.store.failRun).toHaveBeenCalledWith('run-1', expect.stringContaining('разметка не удалась'));
   });
 
-  it('отказ под видом ответа — отложить; в причине безопасный текст, а не ответ модели', async () => {
+  it('ответ, похожий на лимит (не отказ CLI), — отложить; в причине только вид, без текста ответа', async () => {
     const h = harness({ labelText: ['Упёрлись в rate limit, а вот кусок разговора: СЕКРЕТ-ИЗ-ОТВЕТА'], attempts: 1 });
     await h.svc.execute('run-1', week);
-    expect(h.store.postponeRun).toHaveBeenCalledWith('run-1', 'claude CLI отказ: rate_limit');
+    expect(h.store.postponeRun).toHaveBeenCalledWith('run-1', 'ответ похож на лимит: rate_limit');
+  });
+
+  // Ревью 02.11, I1: отказ распознаётся по началу, дальше — ответ модели.
+  it('отказ CLI под видом ответа с хвостом ответа модели — в причине только фраза отказа', async () => {
+    const h = harness({ labelText: ["You've hit your usage limit SECRET-FROM-ANSWER and more"], attempts: 1 });
+    await h.svc.execute('run-1', week);
+    expect(h.store.postponeRun).toHaveBeenCalledWith('run-1', "claude CLI отказ: weekly_limit, You've hit your usage limit");
   });
 
   it('отказ самого CLI под видом ответа — в причине его текст (его пишет CLI, в нём время сброса)', async () => {
