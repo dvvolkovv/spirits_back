@@ -58,110 +58,152 @@ const ANY_PHONE_RE = /(?<![0-9])\+?([0-9]{10,15})(?![0-9])/g;
 
 const NL = 0x0a;
 const isJsonSpace = (c) => c === 0x20 || c === 0x09 || c === 0x0d || c === 0x0a;
+const isDigit = (c) => c !== undefined && c >= "0" && c <= "9";
 // Символы имён папок и загрузок релея (paths.mjs: всё прочее он заменял на "_").
 const isNameCh = (c) => c !== undefined && /[A-Za-z0-9._-]/.test(c);
 // Имя записи в тексте кончилось: дальше разделитель пути, пробел, кавычка,
-// скобка, знак препинания — или точка в конце предложения.
+// скобка, знак препинания — или точка в конце фразы.
 function endsName(s, i) {
   const c = s[i];
-  if (c === undefined || /[\s/"'`)\]}>,;:|*?<&]/.test(c)) return true;
-  return c === "." && (s[i + 1] === undefined || /\s/.test(s[i + 1]));
+  if (c === undefined || /[\s/"'`)\]}>,;:|*?<&!»”…]/.test(c)) return true;
+  return c === "." && endsName(s, i + 1);
+}
+// Конец имени по номеру (символы имён релея); точка в конце фразы — не часть имени.
+function nameEnd(s, start) {
+  let e = start;
+  while (isNameCh(s[e])) e++;
+  while (e > start && s[e - 1] === ".") e--;
+  return e;
 }
 
-// Правила транскрипта одной телефонной сессии:
+// Правила транскрипта одной телефонной сессии.
+//   phone  — номер владельца (цифры), fsKey — fs_key этой сессии;
+//   dirs   — старые папки ВСЕХ сессий этого номера: имя → { fsKey | null,
+//            outNames, outRenames, upRests, upRenames }; fsKey null — папка не
+//            переносится (общая, без fs_key, не выбрана): пути к ней как есть;
+//   keep   — имена на диске, которые не переносятся (сироты): пути как есть;
+//   uploadsRoot — корень загрузок: «<папка>_<имя>» в нём — загрузка, даже
+//            незнакомая (удалённая раньше).
+// Что делается со строкой:
 // 1) строка «Current user phone …» → нейтральная;
-// 2) старая папка хода <oldDir> (имя целиком) → <fsKey>; запись, переименованная
-//    при конфликте, — на итоговое имя;
-// 3) загрузка <oldDir>_<имя> (имя — из загрузок этой сессии) → <fsKey>_<итоговое имя>;
-// 4) остальные вхождения номера владельца как целого числа → <fsKey>.
+// 2) имя по номеру — «<номер>_…» (у ключей с «+» — «_<номер>_…») — по самой
+//    длинной подходящей старой папке номера: папка → её fs_key (запись,
+//    переименованная при конфликте, — на итоговое имя), загрузка →
+//    «<fs_key>_<итоговое имя>»; папка не переносится или имя — сирота на
+//    диске — как есть (counts.kept);
+// 3) остальные вхождения номера владельца как целого числа → fsKey сессии.
 // Номера других пользователей не трогаются; otherPhones говорит, есть ли в
-// строке номер из таблицы — для счётчика.
-export function sessionRules({
-  phone, oldDir, fsKey,
-  outNames = [], outRenames = new Map(), upRests = [], upRenames = new Map(),
-  tablePhones = new Set(),
-}) {
+// строке номер из таблицы, — для счётчика.
+export function sessionRules({ phone, fsKey, dirs = new Map(), keep = new Set(), uploadsRoot = null, tablePhones = new Set() }) {
   // Длинные имена первыми: «a b.txt» не должен стать «a» + « b.txt».
   const byLength = (list) => [...new Set(list)].sort((a, b) => b.length - a.length);
-  const names = byLength(outNames);
-  const rests = byLength(upRests);
+  const info = new Map();
+  for (const [dir, d] of dirs) {
+    info.set(dir, {
+      fsKey: d.fsKey ?? null,
+      names: byLength(d.outNames ?? []),
+      renames: d.outRenames ?? new Map(),
+      rests: new Set(d.upRests ?? []),
+      upRenames: d.upRenames ?? new Map(),
+    });
+  }
+  const dirNames = byLength([...info.keys()]);
+  const upPrefix = uploadsRoot ? path.resolve(uploadsRoot) + "/" : null;
   const ownPhoneRe = new RegExp("(?<![0-9])\\+?" + phone + "(?![0-9])", "g");
-  const upPrefix = oldDir + "_";
 
-  function dirs(s, counts) {
-    let out = "";
-    let from = 0;
-    let changed = false;
-    let i = s.indexOf(oldDir);
-    while (i !== -1) {
-      const end = i + oldDir.length;
-      if (isNameCh(s[i - 1]) || isNameCh(s[end])) {
-        i = s.indexOf(oldDir, i + 1);
-        continue;
-      }
-      let repl = fsKey;
-      let next = end;
-      if (s[end] === "/") {
-        const name = names.find((n) => s.startsWith(n, end + 1) && endsName(s, end + 1 + n.length));
-        if (name !== undefined && outRenames.has(name)) {
-          repl = fsKey + "/" + outRenames.get(name);
-          next = end + 1 + name.length;
+  // Имя по номеру, начинающееся в start и кончающееся в end. Возвращает
+  // [замена, где кончилась заменённая часть] или null — не папка и не загрузка;
+  // { keep: true } — имя оставить как есть.
+  function resolveName(x, start, end, counts) {
+    const token = x.slice(start, end);
+    const dir = dirNames.find((d) => token === d || token.startsWith(d + "_"));
+    const d = dir === undefined ? null : info.get(dir);
+    // Папка не переносится — её имена (и загрузки) как есть в любом месте,
+    // в том числе голыми именами в выводе ls.
+    if (d && !d.fsKey) return { keep: true };
+    if (d && token === dir) {
+      let repl = d.fsKey;
+      let consumed = end;
+      if (x[end] === "/") {
+        const name = d.names.find((n) => x.startsWith(n, end + 1) && endsName(x, end + 1 + n.length));
+        if (name !== undefined) {
+          // Имя записи на диске не меняется — номер в нём остаётся.
+          if (name.includes(phone)) counts.kept++;
+          repl = d.fsKey + "/" + (d.renames.get(name) ?? name);
+          consumed = end + 1 + name.length;
         }
       }
-      out += s.slice(from, i) + repl;
-      from = next;
-      changed = true;
       counts.dirs++;
-      i = s.indexOf(oldDir, next);
+      return { repl, consumed };
     }
-    return changed ? out + s.slice(from) : s;
+    if (d) {
+      const rest = token.slice(dir.length + 1);
+      if (d.rests.has(rest) || (upPrefix && x.slice(0, start).endsWith(upPrefix))) {
+        if (rest.includes(phone)) counts.kept++;
+        counts.uploads++;
+        return { repl: d.fsKey + "_" + (d.upRenames.get(rest) ?? rest), consumed: end };
+      }
+    }
+    if (keep.has(token)) return { keep: true };
+    return null;
   }
 
-  function uploads(s, counts) {
+  function phones(x, counts) {
     let out = "";
     let from = 0;
-    let changed = false;
-    let i = s.indexOf(upPrefix);
-    while (i !== -1) {
-      const at = i + upPrefix.length;
-      const rest = isNameCh(s[i - 1]) ? undefined : rests.find((r) => s.startsWith(r, at) && endsName(s, at + r.length));
-      if (rest === undefined) {
-        i = s.indexOf(upPrefix, i + 1);
-        continue;
+    let pos = 0;
+    for (;;) {
+      const i = x.indexOf(phone, pos);
+      if (i === -1) break;
+      const after = i + phone.length;
+      pos = i + 1;
+      if (isDigit(x[i - 1]) || isDigit(x[after])) continue; // часть длинного числа
+      const start = x[i - 1] === "_" && !isNameCh(x[i - 2]) ? i - 1 : i;
+      if (x[after] === "_" && (start < i || !isNameCh(x[i - 1]))) {
+        const end = nameEnd(x, start);
+        const r = resolveName(x, start, end, counts);
+        if (r && r.keep) {
+          counts.kept++;
+          pos = end;
+          continue;
+        }
+        if (r) {
+          out += x.slice(from, start) + r.repl;
+          from = pos = r.consumed;
+          continue;
+        }
       }
-      out += s.slice(from, i) + fsKey + "_" + (upRenames.get(rest) ?? rest);
-      from = at + rest.length;
-      changed = true;
-      counts.uploads++;
-      i = s.indexOf(upPrefix, from);
+      const s0 = x[i - 1] === "+" && !isDigit(x[i - 2]) ? i - 1 : i;
+      out += x.slice(from, s0) + fsKey;
+      from = pos = after;
+      counts.other++;
     }
-    return changed ? out + s.slice(from) : s;
+    return from === 0 ? x : out + x.slice(from);
   }
 
   return {
     transform(s, counts) {
       if (!s.includes(MARKER) && !LONG_DIGITS.test(s)) return s;
-      let x = s.replace(PHRASE_RE, () => {
+      const x = s.replace(PHRASE_RE, () => {
         counts.phrase++;
         return REPLACEMENT;
       });
-      if (x.includes(oldDir)) x = uploads(dirs(x, counts), counts);
-      return x.replace(ownPhoneRe, () => {
-        counts.other++;
-        return fsKey;
-      });
+      return x.includes(phone) ? phones(x, counts) : x;
     },
     otherPhones(s) {
       if (!LONG_DIGITS.test(s)) return false;
       for (const m of s.matchAll(ANY_PHONE_RE)) if (m[1] !== phone && tablePhones.has(m[1])) return true;
       return false;
     },
-    // Битая строка: есть ли в ней то, что правила заменили бы.
+    // Есть ли в строке то, что правила заменили бы (для битых строк, блоков
+    // рассуждений и ключей JSON — их не трогаем, только считаем).
     touches(s) {
       return s.includes(MARKER) || s.search(ownPhoneRe) !== -1;
     },
   };
 }
+
+const newCounts = () => ({ phrase: 0, dirs: 0, uploads: 0, other: 0, kept: 0 });
 
 // Замены во всех строковых значениях разобранного JSON. Объект правится на
 // месте: присваивание существующему ключу его места в порядке ключей не меняет.
@@ -180,7 +222,15 @@ function scrubValue(v, ctx) {
     }
     return v;
   }
+  // Блоки рассуждений не трогаем совсем: API сверяет их подпись с текстом, и
+  // правка ломает --resume («Invalid signature») — сессия перестаёт отвечать.
+  if (v.type === "thinking" || v.type === "redacted_thinking") {
+    if (ctx.rules.touches(JSON.stringify(v))) ctx.thinking++;
+    return v;
+  }
   for (const k of Object.keys(v)) {
+    // Ключи не меняем (trackedFileBackups у CLI — пути файлов): только счёт.
+    if (ctx.rules.touches(k)) ctx.keys++;
     const x = scrubValue(v[k], ctx);
     if (x !== v[k]) v[k] = x;
   }
@@ -188,8 +238,11 @@ function scrubValue(v, ctx) {
 }
 
 // Одна строка файла (без "\n"). text === null — строка остаётся прежними байтами.
-function scrubLine(lineBuf, rules, counts) {
-  const res = { text: null, broken: false, brokenWithPhone: false, otherPhones: false, nonCanonical: false };
+function scrubLine(lineBuf, rules) {
+  const res = {
+    text: null, counts: null, broken: false, brokenWithPhone: false, otherPhones: false,
+    nonCanonical: false, thinking: 0, keys: 0,
+  };
   if (lineBuf.length === 0) return res;
   const s = lineBuf.toString("utf8");
   // Как CLI при чтении: ведущие NUL пропускаются (остаются от оборванной
@@ -213,41 +266,52 @@ function scrubLine(lineBuf, rules, counts) {
     res.brokenWithPhone = rules.touches(s);
     return res;
   }
-  const ctx = { rules, counts, changed: false, otherPhones: false };
+  const ctx = { rules, counts: newCounts(), changed: false, otherPhones: false, thinking: 0, keys: 0 };
   value = scrubValue(value, ctx);
   res.otherPhones = ctx.otherPhones;
+  res.thinking = ctx.thinking;
+  res.keys = ctx.keys;
   if (!ctx.changed) return res;
 
-  res.text = s.slice(0, start) + JSON.stringify(value) + s.slice(end);
   // CLI пишет строку как JSON.stringify(запись), поэтому повторный
   // JSON.stringify совпадает с исходником везде, кроме замен. Не совпал —
-  // строку писал не CLI (или в ней не UTF-8): запись поменяет и форму JSON.
-  // Смысл тот же, но это стоит видеть до применения.
-  res.nonCanonical = JSON.stringify(JSON.parse(core)) !== core || !Buffer.from(s, "utf8").equals(lineBuf);
+  // строку писал не CLI (или в ней не UTF-8): такую не пишем вовсе, только
+  // считаем — пусть посмотрит человек.
+  if (JSON.stringify(JSON.parse(core)) !== core || !Buffer.from(s, "utf8").equals(lineBuf)) {
+    res.nonCanonical = true;
+    return res;
+  }
+  res.text = s.slice(0, start) + JSON.stringify(value) + s.slice(end);
+  res.counts = ctx.counts;
   return res;
 }
 
 // Содержимое транскрипта целиком. out === null — замен нет, файл писать не
-// нужно. Строки без замены попадают в out исходными байтами.
+// нужно. Строки без замены попадают в out исходными байтами; замены считаются
+// только у записанных строк.
 export function scrubContent(buf, rules) {
   const sum = {
     out: null,
-    counts: { phrase: 0, dirs: 0, uploads: 0, other: 0 },
+    counts: newCounts(),
     otherPhones: 0, brokenLines: 0, brokenWithPhone: 0, nonCanonicalLines: 0,
+    thinkingWithPhone: 0, keysWithPhone: 0,
   };
   const changed = []; // [начало, конец, новые байты]
   let pos = 0;
   while (pos < buf.length) {
     let end = buf.indexOf(NL, pos);
     if (end === -1) end = buf.length;
-    const r = scrubLine(buf.subarray(pos, end), rules, sum.counts);
+    const r = scrubLine(buf.subarray(pos, end), rules);
     if (r.broken) {
       sum.brokenLines++;
       if (r.brokenWithPhone) sum.brokenWithPhone++;
     }
     if (r.otherPhones) sum.otherPhones++;
+    if (r.nonCanonical) sum.nonCanonicalLines++;
+    sum.thinkingWithPhone += r.thinking;
+    sum.keysWithPhone += r.keys;
     if (r.text !== null) {
-      if (r.nonCanonical) sum.nonCanonicalLines++;
+      for (const k of Object.keys(sum.counts)) sum.counts[k] += r.counts[k];
       changed.push([pos, end, Buffer.from(r.text, "utf8")]);
     }
     pos = end + 1;
@@ -750,9 +814,12 @@ export async function runScrub(opts, { commit = commitFile } = {}) {
 
     const plan = await planSession(sess, fsKey, prev, ctx);
     const rules = sessionRules({
-      phone: sess.phone, oldDir: sess.oldDir, fsKey,
-      outNames: [...plan.outNames], outRenames: plan.outRenames,
-      upRests: [...plan.upRests], upRenames: plan.upRenames,
+      phone: sess.phone, fsKey,
+      dirs: new Map([[sess.oldDir, {
+        fsKey, outNames: [...plan.outNames], outRenames: plan.outRenames,
+        upRests: [...plan.upRests], upRenames: plan.upRenames,
+      }]]),
+      uploadsRoot: uploads,
       tablePhones,
     });
     const r = snap ? scrubContent(snap.buf, rules) : null;
