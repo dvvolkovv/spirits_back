@@ -39,10 +39,41 @@ export const LOW_BALANCE_THRESHOLD = 10000;
 /** Сколько молчим после выданного предупреждения. */
 export const WARN_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
-/** Что лежит в profile_data.low_balance_warned. */
+/** Что лежит в profile_data.low_balance_warned и profile_data.near_empty_told. */
 export interface WarnMark {
   at: string;
   atBalance: number;
+}
+
+/**
+ * Истёк ли цикл отметки {at, atBalance} — общая часть для shouldWarn (низкий
+ * баланс) и бережного завершения на остатке (profile_data.near_empty_told,
+ * BalanceContextService.grantNearEmptyNotice, ревью качества 02.11): у обеих
+ * отметок один и тот же смысл цикла. Новый цикл начинается через сутки после
+ * отметки или после пополнения (баланс стал выше, чем в момент отметки).
+ *
+ * Вынесена отдельно от shouldWarn специально: у него есть ещё порог
+ * LOW_BALANCE_THRESHOLD и исключение для приветствия, а near_empty_told эти
+ * проверки не нужны и были бы неверны — остаток «на 1-2 ответа» у дорогого
+ * ассистента может случиться и при балансе заметно выше 10 000 (находка
+ * a3da5a2b про агентные ходы Романа), и shouldWarn там молча отказал бы.
+ */
+export function warnCycleExpired(warned: WarnMark | null, balance: number, now: number): boolean {
+  if (!warned) return true;
+
+  // Битую отметку трактуем как отсутствующую: она не должна навсегда
+  // заглушить предупреждения из-за одной кривой записи.
+  const at = Date.parse(warned.at);
+  if (!Number.isFinite(at)) return true;
+
+  if (now - at >= WARN_COOLDOWN_MS) return true;
+
+  // Баланс выше, чем на момент отметки — значит было пополнение,
+  // и это новый цикл трат, а не продолжение старого.
+  const atBalance = Number(warned.atBalance);
+  if (Number.isFinite(atBalance) && balance > atBalance) return true;
+
+  return false;
 }
 
 /**
@@ -63,19 +94,6 @@ export function shouldWarn(args: {
   // первое сообщение новому пользователю не должно быть просьбой заплатить.
   if (isGreeting) return false;
   if (balance >= LOW_BALANCE_THRESHOLD) return false;
-  if (!warned) return true;
 
-  // Битую отметку трактуем как отсутствующую: она не должна навсегда
-  // заглушить предупреждения из-за одной кривой записи.
-  const at = Date.parse(warned.at);
-  if (!Number.isFinite(at)) return true;
-
-  if (now - at >= WARN_COOLDOWN_MS) return true;
-
-  // Баланс выше, чем на момент предупреждения — значит было пополнение,
-  // и это новый цикл трат, а не продолжение старого.
-  const atBalance = Number(warned.atBalance);
-  if (Number.isFinite(atBalance) && balance > atBalance) return true;
-
-  return false;
+  return warnCycleExpired(warned, balance, now);
 }

@@ -1167,6 +1167,10 @@ export class ChatService {
     const balanceBlock = await this.balanceCtx.buildContextForPrompt(userId, balance, {
       isGreeting: isGreetingMsg,
       storeBuild,
+      // agent.id, не сырой assistantId: для именных ассистентов (запрос по
+      // имени, см. resolveAgent) и кастомных (`custom:…`) это разные формы —
+      // медиана пары в forecastMessages разбирает только числовой agent.id.
+      assistantId: String(agent.id),
     });
 
 

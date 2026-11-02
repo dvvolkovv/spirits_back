@@ -3,6 +3,7 @@ import { PgService } from '../common/services/pg.service';
 import {
   medianSpend,
   shouldWarn,
+  warnCycleExpired,
   WarnMark,
 } from './consumption-rate';
 
@@ -16,10 +17,19 @@ const FORECAST_WINDOW_DAYS = 14;
  * Остаток «на один-два ответа»: дальше шлагбаум нуля оборвёт разговор, и
  * ассистенту пора бережно закрывать смысловой блок (находка a3da5a2b —
  * психологическую практику свернули на остатке в один ответ).
+ *
+ * При прогнозе max(1, floor(balance/median)) порог «≤ 2» равносилен условию
+ * «баланс меньше трёх медиан хода»: на балансе от трёх медиан и выше прогноз
+ * уже выйдет ≥ 3.
  */
 const NEAR_EMPTY_ANSWERS = 2;
 
-/** Без прогноза (мало замеров) — тот же смысл по сумме: «красный» порог витрины. */
+/**
+ * Без прогноза (мало замеров) — тот же смысл по сумме: «красный» порог
+ * витрины (spirits_front src/config/balanceThresholds.ts, CRITICAL_BALANCE).
+ * Число одно и то же не случайно: фраза «баланс почти закончился» не должна
+ * противоречить цвету плашки на экране в тот же момент.
+ */
 const NEAR_EMPTY_FALLBACK_TOKENS = 2000;
 
 /**
@@ -48,17 +58,6 @@ function messagesWord(n: number): string {
   return MESSAGE_FORMS[RU_PLURALS.select(n)] ?? 'сообщений';
 }
 
-/** То же согласование, но для слова «ответ» — в инструкции бережного завершения. */
-const ANSWER_FORMS: Record<string, string> = {
-  one: 'ответ',
-  few: 'ответа',
-  many: 'ответов',
-  other: 'ответа',
-};
-function answersWord(n: number): string {
-  return ANSWER_FORMS[RU_PLURALS.select(n)] ?? 'ответов';
-}
-
 /**
  * Блок про баланс для системного промпта ассистента.
  *
@@ -85,10 +84,15 @@ export class BalanceContextService {
   ///
   /// Баланс при этом называть можно — это факт о счёте, а не предложение
   /// купить. Убираем только указание, куда идти платить.
+  ///
+  /// [opts.assistantId] — id текущего ассистента (streamChat передаёт
+  /// agent.id, см. resolveAgent): для медианы расхода по дорогому ассистенту,
+  /// см. forecastMessages. Строка вида `custom:…` или не-целое — пользовательский
+  /// ассистент, медиану пары по нему не считаем.
   async buildContextForPrompt(
     userId: string,
     balance: number,
-    opts: { isGreeting?: boolean; storeBuild?: boolean } = {},
+    opts: { isGreeting?: boolean; storeBuild?: boolean; assistantId?: string } = {},
   ): Promise<string> {
     try {
       // В магазинной сборке баланса нет вовсе — ни на экране, ни в разговоре.
@@ -100,21 +104,19 @@ export class BalanceContextService {
       // — то же самое разглашение другим способом.
       if (opts.storeBuild) return '';
 
-      const forecast = await this.forecastMessages(userId, balance);
+      const forecast = await this.forecastMessages(userId, balance, opts.assistantId);
 
       let block = `--- Баланс пользователя ---\n`;
       block += forecast == null
         ? `На счету ${balance} токенов.\n`
         : `На счету ${balance} токенов — примерно на ${forecast} ${messagesWord(forecast)} при его обычном расходе.\n`;
       block +=
-        `Сам про баланс не заговаривай. Если спросят, сколько осталось — назови эту цифру, ` +
-        `не выдумывай и не округляй.\n` +
+        `Сам про баланс не заговаривай, кроме случаев, когда ниже прямо сказано ` +
+        `предупредить. Если спросят, сколько осталось — назови эту цифру, не выдумывай ` +
+        `и не округляй.\n` +
         `Если инструмент вернул ошибку insufficient_tokens — объясни спокойно, что на эту ` +
-        `операцию не хватает токенов, назови, сколько нужно и сколько есть. ` +
-        (opts.storeBuild
-          ? `НЕ давай ссылок на пополнение и НЕ объясняй, где купить токены: ` +
-            `в этой сборке приложения оплата недоступна. Ограничься фактом.\n`
-          : `Дай ссылку ${TOP_UP_URL}.\n`) +
+        `операцию не хватает токенов, назови, сколько нужно и сколько есть. Дай ссылку ` +
+        `${TOP_UP_URL}.\n` +
         `Не пробуй тот же инструмент повторно.\n`;
 
       // Остаток «на 1-2 ответа» — не обычное предупреждение, а инструкция
@@ -126,26 +128,43 @@ export class BalanceContextService {
         : forecast <= NEAR_EMPTY_ANSWERS);
 
       if (nearEmpty) {
-        // Одна инструкция вместо двух: завершение само говорит про пополнение.
-        // Разрешение предупредить расходуем тут же — иначе следующим ходом
-        // пришло бы ещё и обычное предупреждение.
+        // Низкобалансовое разрешение расходуем тут же — иначе следующим ходом
+        // (баланс всё ещё низкий, но уже не near-empty) пришло бы ещё и
+        // обычное предупреждение поверх завершения.
         await this.grantWarning(userId, balance, opts.isGreeting);
+
         const left = forecast == null
           ? `Баланс почти закончился — меньше ${NEAR_EMPTY_FALLBACK_TOKENS} токенов.`
-          : `Баланса хватит примерно на ${forecast} ${answersWord(forecast)}.`;
-        block +=
-          `${left} Не начинай новый длинный этап. Если идёт практика, упражнение или ` +
-          `работа по шагам — в этом ответе помоги бережно завершить текущий смысловой блок: ` +
-          `подведи итог, дай опору или следующий шаг на потом. Один раз мягко скажи, что ` +
-          `продолжить можно после пополнения: [Пополнить баланс](${TOP_UP_URL}). ` +
-          `Если уже говорил об этом в разговоре — не повторяй.\n`;
+          : `Баланса хватит примерно на ${forecast} ${messagesWord(forecast)}.`;
+
+        // «Сказано один раз» решает СЕРВЕР через отдельную отметку
+        // (near_empty_told), а не модель по истории разговора: окно
+        // «остаток на 1-2 ответа» может держаться несколько ходов подряд, и
+        // без детерминированной отметки инструкция с ссылкой повторялась бы
+        // каждый раз (находка ревью качества 02.11, I2).
+        const firstTime = await this.grantNearEmptyNotice(userId, balance);
+        block += firstTime
+          ? `${left} На текущий вопрос ответь как обычно. Сам не предлагай начинать новую ` +
+            `практику или многошаговую работу; если человек просит её сам — скажи, на ` +
+            `сколько примерно хватит, и предложи короткий вариант. Если идёт практика или ` +
+            `упражнение — в этом ответе помоги бережно завершить текущий смысловой блок: ` +
+            `подведи итог, дай опору или следующий шаг на потом. Можно сказать, что ` +
+            `продолжить получится после пополнения: [Пополнить баланс](${TOP_UP_URL}).\n`
+          : `${left} Про пополнение ты уже сказал — не повторяй; бережно закрывай смысловой блок.\n`;
       } else if (await this.grantWarning(userId, balance, opts.isGreeting)) {
+        // Без прогноза число выдумывать нельзя (medianSpend: «выдуманная
+        // цифра хуже её отсутствия») — тогда инструкция просит сказать о
+        // нехватке без числа, а не «сколько примерно ответов хватит»
+        // (находка ревью качества 02.11, I1).
+        const amountHint = forecast == null
+          ? `скажи, что токенов мало и длинная практика может не уместиться`
+          : `скажи, что хватит примерно на ${forecast} ${messagesWord(forecast)}`;
         block +=
           `Баланс на исходе, и пользователя об этом ещё не предупреждали. Скажи один раз, в ` +
           `этом ответе, коротко и без давления, что токены заканчиваются, и дай ссылку: ` +
           `[Пополнить баланс](${TOP_UP_URL}).\n` +
           `Выбери место бережно: если вы начинаете практику, упражнение или длинную задачу — ` +
-          `скажи до её начала, сколько примерно ответов хватит, чтобы человек решил, успеете ли; ` +
+          `до её начала ${amountHint}, чтобы человек решил, успеете ли; ` +
           `если человек делится переживаниями или упражнение уже идёт — не вставляй это ` +
           `посреди, а скажи одной мягкой фразой в самом конце ответа, когда мысль закончена. ` +
           `Никогда не прерывай упражнение ради этого.\n` +
@@ -162,7 +181,7 @@ export class BalanceContextService {
   }
 
   /** Сколько примерно сообщений осталось, или null если считать не на чем. */
-  private async forecastMessages(userId: string, balance: number): Promise<number | null> {
+  private async forecastMessages(userId: string, balance: number, assistantId?: string): Promise<number | null> {
     if (balance >= FORECAST_BALANCE_CEILING) return null;
 
     // ABS обязателен: расход в token_transactions лежит отрицательным числом
@@ -178,8 +197,39 @@ export class BalanceContextService {
         LIMIT 200`,
       [userId, String(FORECAST_WINDOW_DAYS)],
     );
+    const userMedian = medianSpend(res.rows.map((r: any) => Number(r.amount)));
 
-    const median = medianSpend(res.rows.map((r: any) => Number(r.amount)));
+    // Медиана по ПАРЕ пользователь+ассистент — отдельно от общей по всем
+    // сообщениям пользователя. У дорогого агентного ассистента (файлы,
+    // субагенты) ход может стоить в 10-30 раз больше медианы переписки, и
+    // общая медиана тогда обманывает: баланса хватит на один такой ход, а
+    // прогноз обещает двадцать (находка a3da5a2b — агентные ходы Романа при
+    // медиане пользователя ~400). Берём бОльшую из двух медиан — для
+    // дешёвого ассистента она совпадёт с общей, для дорогого станет честной.
+    //
+    // agent_id разбираем тем же способом, что admin.service.ts.addTokenTask:
+    // только целое число. Кастомный ассистент (`custom:…`) или отсутствующий
+    // id — медиану пары не считаем вовсе.
+    let pairMedian: number | null = null;
+    const agentId = assistantId && /^\d+$/.test(assistantId) ? parseInt(assistantId, 10) : null;
+    if (agentId != null) {
+      // Таблица без индекса по user_id (~50 тыс. строк) — запрос делаем
+      // только в этой ветке, где баланс и так уже ниже потолка прогноза.
+      const pairRes = await this.pg.query(
+        `SELECT tokens_to_consume AS amount FROM token_consumption_tasks
+          WHERE user_id = $1 AND agent_id = $2
+            AND tokens_to_consume > 0
+            AND created_at > now() - ($3 || ' days')::interval
+          ORDER BY created_at DESC
+          LIMIT 200`,
+        [userId, agentId, String(FORECAST_WINDOW_DAYS)],
+      );
+      pairMedian = medianSpend(pairRes.rows.map((r: any) => Number(r.amount)));
+    }
+
+    const median = pairMedian == null
+      ? userMedian
+      : (userMedian == null ? pairMedian : Math.max(userMedian, pairMedian));
     if (median == null || median <= 0) return null;
 
     return Math.max(1, Math.floor(balance / median));
@@ -227,6 +277,52 @@ export class BalanceContextService {
     // выданное разрешение негде. Лучше не предупредить, чем зациклиться.
     if (!upd.rowCount) {
       this.logger.warn(`отметка о предупреждении не записана: нет строки профиля у ${userId}`);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Отметка «уже сказал про бережное завершение» (profile_data.near_empty_told)
+   * — свой цикл, НЕЗАВИСИМЫЙ от low_balance_warned: окно «остаток на 1-2
+   * ответа» может держаться несколько ходов подряд, и без отдельной
+   * детерминированной отметки инструкция с ссылкой повторялась бы каждый ход
+   * — решала бы это модель по истории разговора, а не сервер (та же причина,
+   * по которой устроен grantWarning).
+   *
+   * Цикл истекает по общему правилу (warnCycleExpired): через сутки или
+   * после пополнения. Не переиспользуем shouldWarn целиком — у него свой
+   * порог LOW_BALANCE_THRESHOLD (10 000), а near_empty у дорогого ассистента
+   * может наступить и при балансе заметно выше.
+   */
+  private async grantNearEmptyNotice(userId: string, balance: number): Promise<boolean> {
+    const res = await this.pg.query(
+      `SELECT profile_data->'near_empty_told' AS told
+         FROM ai_profiles_consolidated WHERE user_id = $1`,
+      [userId],
+    );
+    const told = (res.rows[0]?.told ?? null) as WarnMark | null;
+
+    if (!warnCycleExpired(told, balance, Date.now())) return false;
+
+    const upd = await this.pg.query(
+      `UPDATE ai_profiles_consolidated
+          SET profile_data = jsonb_set(
+                coalesce(profile_data, '{}'::jsonb),
+                '{near_empty_told}',
+                $2::jsonb,
+                true
+              )
+        WHERE user_id = $1`,
+      [userId, JSON.stringify({ at: new Date().toISOString(), atBalance: balance })],
+    );
+
+    // Та же защита, что в grantWarning: строки профиля нет — запомнить
+    // негде, и отдать «это впервые» значило бы повторять полную инструкцию
+    // с ссылкой каждый ход. Короткое напоминание без ссылки — безопасный
+    // дефолт на случай, когда мы не можем подтвердить, что это первый раз.
+    if (!upd.rowCount) {
+      this.logger.warn(`отметка near_empty_told не записана: нет строки профиля у ${userId}`);
       return false;
     }
     return true;

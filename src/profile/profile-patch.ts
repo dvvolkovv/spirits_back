@@ -52,7 +52,8 @@ export const PROFILE_ENTITY_FIELDS: ReadonlySet<string> = new Set([
 
 /**
  * Что из тела profile-update попадёт в profile_data. Остальное отбрасывается:
- * служебные поля (`low_balance_warned`), поля со своими ручками и проверками
+ * служебные поля (`low_balance_warned`, `near_empty_told` — отметки
+ * BalanceContextService), поля со своими ручками и проверками
  * (`avatar_url`, `business`, `contactVisible`) и всё, что совпадает с
  * вычисленными полями профиля (`isadmin`, `tokens`, `email`…).
  */

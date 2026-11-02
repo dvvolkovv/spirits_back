@@ -22,7 +22,7 @@ describe('sanitizeProfilePatch', () => {
 
   it.each([
     'isadmin', 'tokens', 'email', 'phone', 'onboarded', 'preferred_agent', 'user_id',
-    'avatar_url', 'business', 'contactVisible', 'low_balance_warned', 'smm_sdk_session_id', 'profile', 'что-то-новое',
+    'avatar_url', 'business', 'contactVisible', 'low_balance_warned', 'near_empty_told', 'smm_sdk_session_id', 'profile', 'что-то-новое',
   ])('отбрасывает %s', (key) => {
     const { patch, dropped } = sanitizeProfilePatch({ [key]: 'x', name: 'Анна' });
     expect(patch).toEqual({ name: 'Анна' });
@@ -111,7 +111,7 @@ describe('GET /user-profile: о другом человеке — только �
     const pd = {
       name: 'Анна', family_name: 'Иванова', user_nickname: 'anna', avatar_url: 'https://my.linkeon.io/smm-media/linkeon-assets/avatars/users/u-2.jpg',
       business: { revenue: 'секрет' }, birthday: '1990-05-01', language: 'en', low_balance_warned: { at: 1 },
-      smm_sdk_session_id: 'секрет', assistant_voices: { 'Роман': 'alena' }, contactVisible: 'private',
+      near_empty_told: { at: 1 }, smm_sdk_session_id: 'секрет', assistant_voices: { 'Роман': 'alena' }, contactVisible: 'private',
     };
     const pg = pgReturning([[{ user_id: 'u-2', profile_data: pd }]]);
     const r: any = await new ProfileService(pg as any).getUserProfile('u-2');
