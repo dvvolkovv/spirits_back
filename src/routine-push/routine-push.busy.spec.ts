@@ -117,10 +117,10 @@ describe('RoutinePushService.runDue — перенос при занятой с�
     expect(push.sendPush).not.toHaveBeenCalled();
   });
 
-  it('preempted — внутренний лог deliver() «empty text» идёт через log(), не warn() (ожидаемый исход)', async () => {
+  it('preempted — внутренний лог deliver() идёт через log() (не warn()), без userId, с failReason', async () => {
     const push = { sendPush: jest.fn(async () => 1) };
     const chat = { generateAgentReplyOutcome: jest.fn(async () => failed('preempted', 'обрывок')) };
-    const rows = [row({ last_sent_date: null })];
+    const rows = [row({ last_sent_date: null })]; // user_id: 'u1' (default в row())
     const store = makeStore({ listEnabled: jest.fn(async () => rows) });
     const pg = { query: jest.fn(async () => ({ rows: [] })) };
     const svc = new RoutinePushService(pg as any, push as any, chat as any, store as any);
@@ -129,11 +129,21 @@ describe('RoutinePushService.runDue — перенос при занятой с�
 
     await svc.runDue();
 
-    expect(warnSpy.mock.calls.some((c) => String(c[0]).includes('empty text'))).toBe(false);
-    expect(logSpy.mock.calls.some((c) => String(c[0]).includes('empty text'))).toBe(true);
+    // Рядом с обезличенной «routine ${id} отложена» (см. тест выше) эта
+    // строка раньше тоже несла userId (`routine deliver: empty text for
+    // ${userId} / assistant …») — две строки вместе снова связывали id
+    // рутины с userId. И «empty text» была неверной формулировкой для
+    // хода с обрывком текста (failed, не вовсе пустой ответ).
+    const deliverLines = [...warnSpy.mock.calls, ...logSpy.mock.calls].map((c) => String(c[0]))
+      .filter((s) => s.startsWith('routine deliver:'));
+    expect(deliverLines).toHaveLength(1);
+    expect(deliverLines[0]).not.toContain('u1');
+    expect(deliverLines[0]).toContain('preempted');
+    expect(warnSpy.mock.calls.some((c) => String(c[0]).startsWith('routine deliver:'))).toBe(false);
+    expect(logSpy.mock.calls.some((c) => String(c[0]).startsWith('routine deliver:'))).toBe(true);
   });
 
-  it('прочий (не preempted) сбой — внутренний лог deliver() «empty text» остаётся warn()', async () => {
+  it('прочий (не preempted) сбой — тот же лог deliver() остаётся warn(), без userId, с failReason', async () => {
     const push = { sendPush: jest.fn(async () => 1) };
     const chat = { generateAgentReplyOutcome: jest.fn(async () => failed('max_turns')) };
     const rows = [row({ last_sent_date: null })];
@@ -144,7 +154,28 @@ describe('RoutinePushService.runDue — перенос при занятой с�
 
     await svc.runDue();
 
-    expect(warnSpy.mock.calls.some((c) => String(c[0]).includes('empty text'))).toBe(true);
+    const deliverLines = warnSpy.mock.calls.map((c) => String(c[0])).filter((s) => s.startsWith('routine deliver:'));
+    expect(deliverLines).toHaveLength(1);
+    expect(deliverLines[0]).not.toContain('u1');
+    expect(deliverLines[0]).toContain('max_turns');
+  });
+
+  it('пустой ответ без failReason — лог deliver() говорит «пустой ответ», не «ход не завершён»', async () => {
+    const push = { sendPush: jest.fn(async () => 1) };
+    const chat = { generateAgentReplyOutcome: jest.fn(async () => ok('')) };
+    const rows = [row({ last_sent_date: null })];
+    const store = makeStore({ listEnabled: jest.fn(async () => rows) });
+    const pg = { query: jest.fn(async () => ({ rows: [] })) };
+    const svc = new RoutinePushService(pg as any, push as any, chat as any, store as any);
+    const warnSpy = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+
+    await svc.runDue();
+
+    const deliverLines = warnSpy.mock.calls.map((c) => String(c[0])).filter((s) => s.startsWith('routine deliver:'));
+    expect(deliverLines).toHaveLength(1);
+    expect(deliverLines[0]).not.toContain('u1');
+    expect(deliverLines[0]).not.toContain('ход не завершён');
+    expect(deliverLines[0]).toContain('пустой ответ');
   });
 
   it.each(['transient_after_write', 'max_turns', 'cli_fatal'])(
