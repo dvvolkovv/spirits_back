@@ -158,8 +158,8 @@ export class VoiceCallInternalController {
     @Headers('x-voice-signature') signature: string,
     @Req() req: Request,
   ) {
-    const body = this.parseSigned<{ callId: string; transcript: CompletePayload['transcript'] }>(req, signature);
-    await this.calls.progress(body.callId, body.transcript);
+    const body = this.parseSigned<{ callId: string; transcript: CompletePayload['transcript']; participants?: unknown }>(req, signature);
+    await this.calls.progress(body.callId, body.transcript, body.participants);
     return { ok: true };
   }
 
@@ -175,6 +175,7 @@ export class VoiceCallInternalController {
       // Чем кончился звонок. Воркер прежней версии поля не пришлёт — тогда
       // вердикт будет «неизвестно», а не «попрощался».
       ending: body.ending,
+      participants: body.participants,
     });
     return { ok: true };
   }
