@@ -6,6 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   sandboxMode, isCanarySession, buildSandboxSettings, buildCliEnv,
+  buildSandboxTools, baseToolsForTurn, buildTurnEnv, applySandboxPrompt,
+  sandboxFailureFromToolResult, AGENT_MCP_DIR,
 } from './sandbox-policy.mjs';
 
 const FS_KEY = 'test_fs-key';
@@ -45,6 +47,9 @@ test('настройки: своя папка на запись, домашни�
   assert.ok(s.sandbox.filesystem.denyRead.includes('/home/dv'));
   assert.ok(s.sandbox.filesystem.denyRead.includes('/etc/sudoers'));
   assert.ok(s.sandbox.filesystem.denyRead.includes('/tmp/agent-mcp'));
+  assert.ok(s.sandbox.filesystem.denyRead.includes('/proc'));
+  assert.ok(s.permissions.deny.includes('Read(/proc/**)'));
+  assert.ok(s.permissions.deny.includes('Write(/proc/**)'));
   assert.equal(s.sandbox.filesystem.denyRead.includes('/tmp/agent-scratch'), false);
   assert.deepEqual(s.sandbox.network.allowedDomains, ['127.0.0.1:8471']);
   assert.ok(s.sandbox.excludedCommands.includes('sudo *'));
@@ -110,4 +115,115 @@ test('cliEnv: белый список, без лишних ключей, scrub �
 
   const noScrub = buildCliEnv({ baseEnv: {}, providerEnv: {}, fsKey: FS_KEY, scrub: false });
   assert.equal(Object.hasOwn(noScrub, 'CLAUDE_CODE_SUBPROCESS_ENV_SCRUB'), false);
+});
+
+const LEGACY_TOOLS = 'Bash(*),Read(*),Write(*),Edit(*),Glob(*),Grep(*),WebSearch(*),WebFetch(*)';
+
+test('mcp-каталог песочницы вынесен из загрузок пользователя', () => {
+  assert.equal(AGENT_MCP_DIR, '/tmp/agent-mcp');
+  assert.equal(AGENT_MCP_DIR.startsWith('/tmp/agent-uploads/'), false);
+});
+
+test('инструменты: off возвращает прежний BASE_TOOLS дословно', () => {
+  assert.equal(baseToolsForTurn(FS_KEY, false, LEGACY_TOOLS), LEGACY_TOOLS);
+});
+
+test('инструменты: on ограничивает Read/Glob/Grep и Write/Edit, но оставляет свои uploads', () => {
+  const tools = buildSandboxTools(FS_KEY);
+  const rules = tools.split(',');
+  assert.equal(baseToolsForTurn(FS_KEY, true, LEGACY_TOOLS), tools);
+  for (const name of ['Read', 'Write', 'Edit', 'Glob', 'Grep']) {
+    assert.equal(rules.includes(`${name}(*)`), false, name);
+  }
+  for (const name of ['Read', 'Glob', 'Grep']) {
+    for (const root of [
+      `/tmp/agent-output/${FS_KEY}/**`,
+      `/tmp/agent-scratch/${FS_KEY}/**`,
+      `/tmp/agent-uploads/${FS_KEY}_*`,
+      '/opt/linkeon-agent/**', '/usr/**', '/etc/**', '/opt/**',
+    ]) assert.ok(rules.includes(`${name}(${root})`), `${name}(${root})`);
+  }
+  for (const name of ['Write', 'Edit']) {
+    assert.deepEqual(rules.filter((r) => r.startsWith(`${name}(`)).sort(), [
+      `${name}(/tmp/agent-output/${FS_KEY}/**)`,
+      `${name}(/tmp/agent-scratch/${FS_KEY}/**)`,
+    ].sort());
+  }
+  for (const name of ['Bash(*)', 'WebSearch(*)', 'WebFetch(*)']) assert.ok(rules.includes(name));
+});
+
+test('инструменты: повторный базовый список после ошибки MCP не снимает ограничения', () => {
+  const baseAllowedTools = () => baseToolsForTurn(FS_KEY, true, LEGACY_TOOLS);
+  let allowedTools = baseAllowedTools() + ',mcp__linkeon__tool';
+  assert.ok(allowedTools.includes('mcp__linkeon__tool'));
+  allowedTools = baseAllowedTools();
+  assert.equal(allowedTools, buildSandboxTools(FS_KEY));
+  assert.equal(allowedTools.includes('Read(*)'), false);
+});
+
+test('окружение процесса: off возвращает прежний объект без каких-либо изменений', () => {
+  const legacyEnv = {
+    PATH: '/usr/bin:/home/dv/agent-env/bin:/home/dv/.bun/bin:/home/dv/file-agent/bin',
+    HOME: '/home/dv', MCP_TIMEOUT: '120000', MCP_TOOL_TIMEOUT: '600000', OMP_THREAD_LIMIT: '1',
+  };
+  assert.equal(buildTurnEnv({ sandboxOn: false, legacyEnv }), legacyEnv);
+  assert.deepEqual(legacyEnv, {
+    PATH: '/usr/bin:/home/dv/agent-env/bin:/home/dv/.bun/bin:/home/dv/file-agent/bin',
+    HOME: '/home/dv', MCP_TIMEOUT: '120000', MCP_TOOL_TIMEOUT: '600000', OMP_THREAD_LIMIT: '1',
+  });
+});
+
+test('окружение процесса: on строится белым списком, включает scrub и метку хода', () => {
+  const env = buildTurnEnv({
+    sandboxOn: true,
+    baseEnv: { PATH: '/home/dv/bin', HOME: '/home/dv', LANG: 'C.UTF-8', SECRET: 'x' },
+    providerEnv: { ANTHROPIC_AUTH_TOKEN: 'token', UNRELATED: 'x' },
+    fsKey: FS_KEY, tag: 'run-tag', runEnvName: 'RELAY_RUN_TAG', legacyEnv: {},
+  });
+  assert.equal(env.HOME, `/tmp/agent-scratch/${FS_KEY}`);
+  assert.equal(env.PATH.includes('/home/dv'), false);
+  assert.equal(env.SECRET, undefined);
+  assert.equal(env.UNRELATED, undefined);
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, 'token');
+  assert.equal(env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, '1');
+  assert.equal(env.RELAY_RUN_TAG, 'run-tag');
+  assert.equal(env.OMP_THREAD_LIMIT, '1');
+});
+
+const PROMPT_PART = `Full sudo access (no password). Install anything you need.
+Python 3.12 venv: source /home/dv/agent-env/bin/activate
+INSTALL ANYTHING MISSING: apt, pip, npm, wget — whatever it takes.
+fallback: /home/dv/agent-env/bin/generate_image.sh "english prompt" /path/to/output.png
+KEEP THIS TEXT`;
+
+test('промпт: off остаётся дословно прежним', () => {
+  assert.equal(applySandboxPrompt(PROMPT_PART, false), PROMPT_PART);
+});
+
+test('промпт: on не обещает sudo/apt и использует только /opt/linkeon-agent', () => {
+  const prompt = applySandboxPrompt(PROMPT_PART, true);
+  assert.equal(prompt.includes('Full sudo access'), false);
+  assert.equal(prompt.includes('INSTALL ANYTHING MISSING'), false);
+  assert.equal(prompt.includes('/home/dv/agent-env'), false);
+  assert.match(prompt, /Bash runs in a sandbox/);
+  assert.match(prompt, /sudo is unavailable/);
+  assert.match(prompt, /Write only to the output directory and your scratch directory/);
+  assert.match(prompt, /pip\/npm locally/);
+  assert.match(prompt, /configured proxy/);
+  assert.ok(prompt.includes('/opt/linkeon-agent/venv/bin/activate'));
+  assert.ok(prompt.includes('/opt/linkeon-agent/bin/generate_image.sh'));
+  assert.ok(prompt.endsWith('KEEP THIS TEXT'));
+});
+
+test('детект сбоя песочницы: только tool_result известного Bash tool_use', () => {
+  const bashIds = new Set(['bash-1']);
+  const event = (id, content) => ({
+    type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, content }] },
+  });
+  assert.equal(sandboxFailureFromToolResult(event('bash-1', 'bwrap: failed'), bashIds), true);
+  assert.equal(sandboxFailureFromToolResult(event('bash-1', 'No New Privileges error'), bashIds), true);
+  assert.equal(sandboxFailureFromToolResult(event('bash-1', [{ type: 'text', text: 'SANDBOX denied' }]), bashIds), true);
+  assert.equal(sandboxFailureFromToolResult(event('other-tool', 'bwrap: failed'), bashIds), false);
+  assert.equal(sandboxFailureFromToolResult(event('bash-1', 'command completed'), bashIds), false);
+  assert.equal(sandboxFailureFromToolResult({ type: 'assistant', message: { content: [] } }, bashIds), false);
 });

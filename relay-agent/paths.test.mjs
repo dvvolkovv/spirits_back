@@ -246,3 +246,34 @@ test("ensureListingGuard: закрывает листинг трёх корне�
   fs.writeFileSync(ownFile, "after");
   assert.equal(fs.readFileSync(ownFile, "utf8"), "after");
 });
+
+test("ensureSessionDirs: удаляет только свой scratch старше 7 дней, свежий и соседний сохраняет", async (t) => {
+  const root = fs.mkdtempSync(path.join(DIR, "scratch-age-"));
+  const scratchRoot = path.join(root, "scratch");
+  const outputs = path.join(root, "output");
+  const oldKey = "old-scratch";
+  const freshKey = "fresh-scratch";
+  const siblingKey = "sibling-scratch";
+  const oldMarker = path.join(scratchRoot, oldKey, "old.txt");
+  const freshMarker = path.join(scratchRoot, freshKey, "fresh.txt");
+  const siblingMarker = path.join(scratchRoot, siblingKey, "sibling.txt");
+  for (const marker of [oldMarker, freshMarker, siblingMarker]) {
+    fs.mkdirSync(path.dirname(marker), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(marker, marker);
+  }
+  const now = Date.now();
+  const eightDaysAgo = (now - 8 * 24 * 60 * 60 * 1000) / 1000;
+  fs.utimesSync(path.join(scratchRoot, oldKey), eightDaysAgo, eightDaysAgo);
+  fs.utimesSync(path.join(scratchRoot, siblingKey), eightDaysAgo, eightDaysAgo);
+  // Корень 0311 доказывает, что очистка идёт по известному пути без readdir.
+  fs.chmodSync(scratchRoot, 0o311);
+  t.after(() => fs.chmodSync(scratchRoot, 0o700));
+
+  await ensureSessionDirs(oldKey, { scratchRoot, outputs, now });
+  assert.equal(fs.existsSync(oldMarker), false, "старый scratch должен быть создан заново");
+  assert.equal(fs.statSync(path.join(scratchRoot, oldKey)).mode & 0o777, 0o700);
+
+  await ensureSessionDirs(freshKey, { scratchRoot, outputs, now });
+  assert.equal(fs.readFileSync(freshMarker, "utf8"), freshMarker, "свежий scratch нельзя очищать");
+  assert.equal(fs.readFileSync(siblingMarker, "utf8"), siblingMarker, "чужой старый scratch нельзя перечислять или удалять");
+});

@@ -5,7 +5,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { randomUUID } from "crypto";
-import { sessionMcpConfigName, sweepStaleSessionMcpConfigs, LIVE_MAX_AGE_MS, ensureMcpConfigDir, removeLiveConfigs } from "./session-mcp-config.mjs";
+import { sessionMcpConfigName, sweepStaleSessionMcpConfigs, LIVE_MAX_AGE_MS, ensureMcpConfigDir, removeLiveConfigs, writeSandboxSettings, removeSandboxSettings } from "./session-mcp-config.mjs";
 
 const FS_KEY = "0123456789abcdef0123456789abcdef";
 
@@ -133,5 +133,35 @@ test("removeLiveConfigs: удаляет все живые конфиги и чи
     assert.equal(set.size, 0);
   } finally {
     fs.rmSync(DIR, { recursive: true, force: true });
+  }
+});
+
+test("settings песочницы: уникальный файл хода вне uploads, JSON 0600, независимая очистка", () => {
+  const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "sandbox-settings-"));
+  const dir = path.join(ROOT, "agent-mcp");
+  let first;
+  let second;
+  try {
+    const settings = { sandbox: { enabled: true }, permissions: { deny: ["Read(/proc/**)"] } };
+    first = writeSandboxSettings(dir, FS_KEY, randomUUID(), settings);
+    second = writeSandboxSettings(dir, FS_KEY, randomUUID(), settings);
+    assert.notEqual(first, second);
+    assert.equal(path.dirname(first), dir);
+    assert.equal(first.startsWith("/tmp/agent-uploads/"), false);
+    assert.match(path.basename(first), /-session-mcp\.settings\.json$/);
+    assert.ok(Buffer.byteLength(path.basename(first)) < 255);
+    assert.equal(fs.statSync(first).mode & 0o777, 0o600);
+    assert.deepEqual(JSON.parse(fs.readFileSync(first, "utf8")), settings);
+
+    // Очистка settings не зависит от наличия sessionMcpPath: вызывается сама.
+    removeSandboxSettings(first);
+    assert.equal(fs.existsSync(first), false);
+    assert.equal(fs.existsSync(second), true);
+    assert.doesNotThrow(() => removeSandboxSettings(first));
+    assert.doesNotThrow(() => removeSandboxSettings(null));
+  } finally {
+    removeSandboxSettings(first);
+    removeSandboxSettings(second);
+    fs.rmSync(ROOT, { recursive: true, force: true });
   }
 });
