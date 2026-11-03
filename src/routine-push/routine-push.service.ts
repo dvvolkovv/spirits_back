@@ -124,9 +124,16 @@ export class RoutinePushService implements OnModuleInit {
       // WARN — если это НЕ ожидаемое «перебили» (preempted): для него
       // достаточно info, это нормальный исход конкуренции за сессию
       // (ревью 03.11), а не сбой.
+      //
+      // Без userId (повторное ревью 03.11): строка стоит рядом с
+      // обезличенной «routine ${r.id} отложена» в runDue — вместе с
+      // userId они снова связывали id рутины с телефоном у старых
+      // аккаунтов. И «empty text» была неверной формулировкой для
+      // failed-хода с обрывком (текст МОЖЕТ быть непустым) — теперь
+      // причина явно в сообщении (failReason), когда он есть.
       const deferred = failReason === 'preempted';
-      const emptyTextMsg = `routine deliver: empty text for ${userId} / assistant ${assistantId}`;
-      if (deferred) this.logger.log(emptyTextMsg); else this.logger.warn(emptyTextMsg);
+      const deliverMsg = `routine deliver: ${failed ? `ход не завершён (${failReason})` : 'пустой ответ'} (assistant ${assistantId})`;
+      if (deferred) this.logger.log(deliverMsg); else this.logger.warn(deliverMsg);
       return { delivered: 0, failed: true, failReason };
     }
     // ⚠️ Сбой генерации НЕ отправляем человеку как сообщение ассистента.
