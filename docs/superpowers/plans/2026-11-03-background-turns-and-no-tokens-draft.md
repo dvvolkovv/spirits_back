@@ -56,6 +56,20 @@
   - `ChargedAgentReply` + поле `failed?: boolean`; в возврате `failed: turnFailed`. `generateAgentReply`: `const { text, failed } = await this.agentReply(…); return failed ? '' : text;` (комментарий: обрывок прерванного хода наружу не уходит).
 - [ ] **Step 4: прогон** нового спека + `src/chat` целиком (`--forceExit`) + tsc — PASS. Коммит «fix(chat): фоновый ход не обрывает человека, сбой не уходит обрывком».
 
+> **Правка ревью 03.11** (решение контролёра, см. спеку §1 п.1): проверка
+> из Step 3 (сразу после `relaySid`) и установка метки (`beginStream`/
+> `openMark`) были разделены несколькими `await` (Neo4j, бизнес-профиль,
+> `resolveAnswerProvider`) — в этот разрыв проходили оба конкурента (два
+> фоновых хода одной сессии; фоновый поверх начавшегося хода человека).
+> Стало ДВЕ проверки: ранняя (как в Step 3, сразу после `userLanguage` —
+> чистая оптимизация, не гарантия) и окончательная — ВПЛОТНУЮ к
+> `beginStream`/`openMark`, без `await` между ними (это и закрывает
+> гонку). `sharesHumanSession = !sessionIdOverride` (было
+> `=== undefined`) — пустая строка попадает в тот же `||`-fallback, что и
+> `relaySid`. `ChargedAgentReply.failed` сделан обязательным (`boolean`,
+> не `?`); добавлено поле `failReason?: string` (из `done.failReason`,
+> `'unknown'` по умолчанию) — нужно `generateAgentReplyOutcome` (Б2).
+
 ### Task Б2: рутины — перенос на час при занятой сессии и сбое; «Проверить» честно говорит, что случилось
 
 **Files:** Modify `src/routine-push/routine-push.service.ts`, `src/routine-push/routine-store.service.ts`, `src/routine-push/routine-push.controller.ts`; Test — соседние спеки модуля (`ls src/routine-push/*.spec.ts`; если нет подходящего — `src/routine-push/routine-push.busy.spec.ts`).
