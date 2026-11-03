@@ -201,7 +201,12 @@ test("ensureSessionDirs: создаёт scratch и output с 0700, повтор�
     assert.equal(stat.mode & 0o777, 0o700, dir);
   }
 
+  fs.chmodSync(scratch, 0o755);
+  fs.chmodSync(output, 0o755);
   assert.equal(await ensureSessionDirs(FS_KEY, { scratchRoot, outputs }), scratch);
+  for (const dir of [scratch, output]) {
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700, dir);
+  }
 });
 
 test("ensureListingGuard: создаёт переданные каталоги и возвращает им 0311", async () => {

@@ -110,6 +110,7 @@ export async function ensureSessionDirs(fsKey, { scratchRoot = AGENT_SCRATCH_ROO
   const scratch = path.join(scratchRoot, fsKey);
   await fsp.mkdir(scratch, { recursive: true, mode: 0o700 });
   await fsp.mkdir(path.join(outputs, fsKey), { recursive: true, mode: 0o700 });
+  await fsp.chmod(path.join(outputs, fsKey), 0o700);
   await fsp.chmod(scratch, 0o700);
   return scratch;
 }
