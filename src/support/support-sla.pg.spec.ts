@@ -61,6 +61,26 @@ maybe('support SLA migration against PostgreSQL', () => {
     );
 
     await applyMigration();
+
+    await pool.query(`
+      CREATE TABLE ai_profiles_consolidated (
+        user_id text PRIMARY KEY,
+        profile_data jsonb NOT NULL DEFAULT '{}',
+        isadmin boolean NOT NULL DEFAULT false
+      );
+      CREATE TABLE user_id (
+        internal_id text PRIMARY KEY,
+        state text NOT NULL DEFAULT 'active'
+      );
+      INSERT INTO ai_profiles_consolidated (user_id, profile_data, isadmin) VALUES
+        ('admin-b', '{"name":"Bob"}', true),
+        ('admin-a', '{"first_name":"Alice"}', true),
+        ('admin-deleted', '{"name":"Deleted"}', true),
+        ('not-admin', '{"name":"Not Admin"}', false);
+      INSERT INTO user_id (internal_id, state) VALUES
+        ('admin-a', 'active'), ('admin-b', 'active'),
+        ('admin-deleted', 'deleted'), ('not-admin', 'active');
+    `);
   });
 
   afterAll(async () => {
@@ -159,5 +179,48 @@ maybe('support SLA migration against PostgreSQL', () => {
 
     expect(new Set(clients).size).toBe(2);
     expect((await pool.query(slaSnapshot)).rows).toEqual(before.rows);
+  });
+
+  it('lists only active admins ordered by their display name', async () => {
+    const service = new SupportService({
+      query: pool.query.bind(pool), getClient: () => pool.connect(),
+    } as any);
+
+    await expect(service.adminOperators()).resolves.toEqual([
+      { id: 'admin-a', name: 'Alice' },
+      { id: 'admin-b', name: 'Bob' },
+    ]);
+  });
+
+  it('allows exactly one of two assignments with the same expectedUpdatedAt', async () => {
+    const created = await pool.query(
+      `INSERT INTO support_tickets (user_id) VALUES ('assignment-race-user')
+       RETURNING id, updated_at`,
+    );
+    const { id } = created.rows[0];
+    const expectedUpdatedAt = created.rows[0].updated_at.toISOString();
+    const service = new SupportService({
+      query: pool.query.bind(pool), getClient: () => pool.connect(),
+    } as any);
+
+    const results = await Promise.allSettled([
+      service.assign('actor-a', id, { assigneeId: 'admin-a', expectedUpdatedAt }),
+      service.assign('actor-b', id, { assigneeId: 'admin-b', expectedUpdatedAt }),
+    ]);
+
+    const fulfilled = results.filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled');
+    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].reason.getStatus()).toBe(409);
+
+    const stored = await pool.query('SELECT assigned_to, assigned_at, status FROM support_tickets WHERE id = $1', [id]);
+    expect(stored.rows[0].assigned_to).toBe(fulfilled[0].value.assigned_to);
+    expect(stored.rows[0].assigned_at).toBeInstanceOf(Date);
+    expect(stored.rows[0].status).toBe('owner_handling');
+    const events = await pool.query(
+      "SELECT actor_id, payload FROM support_events WHERE ticket_id = $1 AND action = 'assignment'", [id],
+    );
+    expect(events.rows).toHaveLength(1);
   });
 });
