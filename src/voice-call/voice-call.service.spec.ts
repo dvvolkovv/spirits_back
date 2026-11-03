@@ -492,6 +492,98 @@ describe('разговор наполняет профиль', () => {
   });
 
   /**
+   * Как резюме зовёт человека.
+   *
+   * ⚠️ Замер по шестнадцати последним резюме владельца (03.11.2026): по имени
+   * он назван в одиннадцати, «пользователем» — в трёх, никак — в двух. Разнобой
+   * был не случайным: разметка расшифровки говорила «Пользователь», а имя
+   * модель знала из профиля, который приезжает в generateAgentReply. Два
+   * источника спорили, и побеждал случай.
+   *
+   * Имя живёт ТОЛЬКО в профиле Neo4j: в `ai_profiles_consolidated` и в таблице
+   * `user_id` его нет (проверено на проде в тот же день).
+   */
+  function namedDeps(stagedTranscript: any[], name: string | null) {
+    const d = completeDeps(stagedTranscript);
+    const neo4j = { getProfileName: jest.fn(async () => name) };
+    return { ...d, neo4j };
+  }
+
+  /**
+   * Резюме считается в фоне (`void this.finishSummary`), и теперь на пути к
+   * промпту есть поход за именем в Neo4j. Прежние тесты успевали прочитать
+   * вызов сразу после `await complete()` только потому, что до первого await
+   * внутри summarize доходило синхронно; с походом за именем это больше не так.
+   * Дожидаемся фоновой работы явно, а не на удачу с тиками.
+   */
+  const settled = () => new Promise((r) => setImmediate(r));
+
+  const promptOf = (d: any) => (d.chat.generateAgentReply as jest.Mock).mock.calls[0][2] as string;
+
+  it('резюме: реплики человека подписаны его именем, и имя названо в инструкции', async () => {
+    const d = namedDeps([{ role: 'user', text: 'сегодня был долгий день', ts: 1 }], 'Марина');
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any, d.neo4j as any);
+    await svc.complete('call-1', { transcript: [], usage });
+    await settled();
+
+    const prompt = promptOf(d);
+    expect(prompt).toContain('Марина: сегодня был долгий день');
+    expect(prompt).toContain('Собеседника зовут Марина');
+    // Разметка и инструкция больше не спорят: «Пользователь» не предлагается.
+    expect(prompt).not.toContain('Пользователь: сегодня был долгий день');
+  });
+
+  it('резюме: без имени в профиле — «пользователь», и имя выдумывать запрещено', async () => {
+    const d = namedDeps([{ role: 'user', text: 'привет', ts: 1 }], null);
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any, d.neo4j as any);
+    await svc.complete('call-1', { transcript: [], usage });
+    await settled();
+
+    const prompt = promptOf(d);
+    expect(prompt).toContain('Пользователь: привет');
+    expect(prompt).toMatch(/НЕ придумывай имени/);
+    expect(prompt).not.toContain('Собеседника зовут');
+  });
+
+  /**
+   * На встрече собеседников несколько, и у человеческих реплик уже есть имя
+   * говорящего из speaker-ledger. Одно имя из профиля их не заменяет.
+   */
+  it('резюме: на встрече имя говорящего из реплики сильнее имени из профиля', async () => {
+    const d = namedDeps([
+      { role: 'user', text: 'я подготовлю смету', ts: 1, speaker: 'Алексей' },
+      { role: 'user', text: 'а я согласую сроки', ts: 2 },
+    ], 'Марина');
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any, d.neo4j as any);
+    await svc.complete('call-1', { transcript: [], usage });
+    await settled();
+
+    const prompt = promptOf(d);
+    expect(prompt).toContain('Алексей: я подготовлю смету');
+    // Реплика без говорящего достаётся владельцу разговора — это он и есть.
+    expect(prompt).toContain('Марина: а я согласую сроки');
+  });
+
+  it('резюме: упавший Neo4j его не срывает — имя просто не подставится', async () => {
+    const d = namedDeps([{ role: 'user', text: 'привет', ts: 1 }], null);
+    d.neo4j.getProfileName = jest.fn(async () => { throw new Error('Neo4j недоступен'); });
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any, d.neo4j as any);
+    await svc.complete('call-1', { transcript: [], usage });
+    await settled();
+
+    expect(promptOf(d)).toContain('Пользователь: привет');
+  });
+
+  it('резюме: без Neo4j вовсе (стенд без модуля) — прежнее поведение', async () => {
+    const d = completeDeps([{ role: 'user', text: 'привет', ts: 1 }]);
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+    await svc.complete('call-1', { transcript: [], usage });
+    await settled();
+
+    expect(promptOf(d)).toContain('Пользователь: привет');
+  });
+
+  /**
    * ⚠️ Потолок не опускать ниже измеренного максимума.
    *
    * 1245 знаков — самое длинное живое резюме на 01.11.2026, и оно ХОРОШЕЕ:

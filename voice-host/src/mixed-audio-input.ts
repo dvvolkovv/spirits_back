@@ -11,6 +11,7 @@ import {
 import { ReadableStream, TransformStream } from 'node:stream/web';
 import { createWriteStream, readFileSync } from 'node:fs';
 import { Mixer, TICK_MS } from './mixer.js';
+import { memoryNote } from './memory-note.js';
 
 /**
  * Частота, на которой работает Realtime, — и единственная, на которой его
@@ -269,7 +270,7 @@ export class MixedRoomAudioInput extends voice.AudioInput {
         const behind = this.queue ? Math.max(0, -(this.queue.desiredSize ?? 0)) : 0;
         console.log(
           `[вход] тиков: ${this.ticks}, кадров от участников: ${this.framesIn}, ` +
-          `забрала сессия: ${this.framesTaken}, очередь к модели: ${behind}, отставание тиков: ${Math.max(0, Math.floor((Date.now() - startedAt) / TICK_MS) - emitted)} — ${per}`,
+          `забрала сессия: ${this.framesTaken}, очередь к модели: ${behind}, отставание тиков: ${Math.max(0, Math.floor((Date.now() - startedAt) / TICK_MS) - emitted)}, ${memoryNote()} — ${per}`,
         );
       }
     };

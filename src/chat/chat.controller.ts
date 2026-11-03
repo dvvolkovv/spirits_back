@@ -18,6 +18,7 @@ import { makeReadWithinDirGuard, neutralizeAtMentions, stripWordJoiner } from '.
 import { decodeMultipartFilename } from '../common/utils/multipart-filename';
 import { TEST_USERS } from '../common/test-users';
 import { parseClientUi } from './client-ui';
+import { ClientPing, startClientPing } from './client-ping';
 import { isStoreBuild } from './client-kind';
 import { toActivity } from './activity-map';
 import { RelayOutputFile, collectOutputFiles, outputFileLines } from './chat-files/relay-links';
@@ -368,8 +369,11 @@ export class ChatController {
 
     // Если клиент дисконнектился (переключил ассистента), всё равно дочитываем
     // r.linkeon.io до конца и сохраняем ответ в БД — иначе результат теряется.
+    // Пинг клиенту на долгом ходе (client-ping.ts): заводится перед запросом
+    // к релею, тишину отсчитывает каждая строка, ушедшая через safeWrite.
+    let clientPing: ClientPing | null = null;
     const safeWrite = (payload: any) => {
-      try { res.write(JSON.stringify(payload) + '\n'); } catch {}
+      try { res.write(JSON.stringify(payload) + '\n'); clientPing?.touch(); } catch {}
     };
 
     // Открываем ход для activeStreams ДО запроса к релею: deploy.sh ждёт
@@ -407,6 +411,12 @@ export class ChatController {
     // см. комментарий у объявления relayRunning в chat.service.ts.
     const relayMark = this.chatService.beginRelayRun(handoff.sessionId);
     try {
+    // Пинг на весь ход: разбор большого файла и копия файлов хода — ровно те
+    // места, где клиенту минутами ничего не уходит. Гасится перед res.end()
+    // ниже и страховкой — во внешнем finally.
+    clientPing = startClientPing(() => {
+      if (!res.writableEnded) safeWrite({ type: 'ping' });
+    });
     try {
       const agentRes = await axios.default.post(`${AGENT_URL}/chat`, fd, {
         headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
@@ -478,9 +488,8 @@ export class ChatController {
       if (pendingFiles.length > 0) {
         // Копия может занять до ~60с (chat-files, PERSIST_TURN_BUDGET_MS) —
         // всё это время от релея клиенту уже ничего не приходит, а мобильный
-        // клиент (Flutter) рвёт стрим после 60с тишины. Пинг гасится в любом
-        // случае, что бы ни случилось с самой копией.
-        const pingTimer = setInterval(() => safeWrite({ type: 'ping' }), 20_000);
+        // клиент (Flutter) рвёт стрим после 60с тишины. Живым его держит
+        // пинг всего хода (clientPing выше).
         try {
           // storeRelayLinks сама не бросает (relay-links.ts), но это гарантия
           // чужого модуля — страхуемся локально: без неё сбой внутри уронил
@@ -495,8 +504,6 @@ export class ChatController {
           const tail = '\n\n' + outputFileLines(pendingFiles, AGENT_URL).join('\n');
           chunks.push(tail);
           safeWrite({ type: 'item', content: tail });
-        } finally {
-          clearInterval(pingTimer);
         }
       }
       // M5: этот путь (загрузка файла) ни разу не ходит в product-tool и
@@ -523,6 +530,7 @@ export class ChatController {
         safeWrite({ type: 'item', content: errText });
         safeWrite({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } });
       }
+      clientPing?.stop();
       try { res.end(); } catch {}
       // Ответ клиенту уже доставлен — метка хода снимается здесь, а не после
       // persistUploadTurn/consolidateAfterChatPublic ниже (три LLM-вызова
@@ -589,6 +597,7 @@ export class ChatController {
       // нормального пути с персистом ничего не делает: closeStream там
       // вызовется позже, из setImmediate, когда история и правда сохранится.
       if (!persistDispatched) closeStream();
+      clientPing?.stop();
     }
   }
 
