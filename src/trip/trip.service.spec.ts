@@ -1,5 +1,6 @@
 import { computeCopilotState, mergeEvents, TripService } from './trip.service';
 import { buildMorningFacts, factsHash } from './day-framing';
+import { RelaySessionBusyError } from '../chat/relay-session-busy';
 
 const now = new Date('2026-07-19T10:00:00+05:00');
 const task = (uid: string, title: string, due?: string, done = false) => ({ uid, title, due, done, source: 'yandex' });
@@ -316,6 +317,30 @@ describe('computeCopilotState', () => {
         svc.generateFramingAsync('u1', 'morning', [], [], new Date('2026-08-06T02:30:00Z')),
       ).resolves.toBeUndefined();
       expect(store.upsert).not.toHaveBeenCalled();
+    });
+
+    it('RelaySessionBusyError (сессия человека занята) — пропускает молча, НЕ как сбой (бэклог e777aa94)', async () => {
+      // «Путь» делит сессию релея с чатом человека (ChatService.agentReply без
+      // sessionIdOverride) — занятость решается там же, где у рутин. Это не
+      // «ошибка LLM» из теста выше: пропуск ожидаемый, строка в логе должна
+      // отличаться от «day-framing gen failed», чтобы не выглядеть сбоем.
+      const store = { get: jest.fn().mockResolvedValue(null), upsert: jest.fn() };
+      const chat = { generateAgentReply: jest.fn().mockRejectedValue(new RelaySessionBusyError()) };
+      const svc = makeTripService({ dayFramingStore: store, chat });
+      const warnSpy = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+      const logSpy = jest.spyOn((svc as any).logger, 'log').mockImplementation(() => undefined);
+
+      await expect(
+        svc.generateFramingAsync('u1', 'morning', [], [], new Date('2026-08-06T02:30:00Z')),
+      ).resolves.toBeUndefined();
+
+      expect(store.upsert).not.toHaveBeenCalled();
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('занята'));
+      // Ревью 03.11, п.2: журнал — без номеров (у старых аккаунтов userId —
+      // телефон). 'u1' здесь не номер, но проверка та же, что защитит
+      // реальный id.
+      expect(logSpy.mock.calls[0][0]).not.toContain('u1');
     });
   });
 

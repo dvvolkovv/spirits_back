@@ -31,6 +31,7 @@ import { toActivity } from './activity-map';
 import { ASK_RULE } from './ask-rule';
 import { WORK_RULES } from './work-rules';
 import { relaySessionKey } from './relay-session';
+import { RelaySessionBusyError } from './relay-session-busy';
 import { productsRelayFields } from './products-relay-fields';
 import { LinkeonRelayFields, appendLinkeonFields, linkeonRelayFields, relayFsKey } from './linkeon-relay-fields';
 import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, LINKEON_HELP_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
@@ -300,6 +301,24 @@ export interface ChargedAgentReply {
   costUsd: number;
   charge: SdkCharge;
   durationMs: number;
+  /**
+   * done.failed от релея (в т.ч. preempted) — ход не довёл ответ до конца.
+   * text при этом может быть непустым (обрывок) — generateAgentReply (не
+   * charge-вариант) его не отдаёт наружу именно из-за этого флага, см. там.
+   * Обязательное (не ?): agentReply всегда возвращает его осознанно
+   * (turnFailed), а не забывает — ревью 03.11.
+   */
+  failed: boolean;
+  /**
+   * done.failReason, если failed — 'preempted' (человека перебил ход на
+   * релее), 'max_turns', 'cli_fatal' и т.п.; 'unknown' при failed без
+   * строки (конвенция остального chat.service.ts, см. streamUniversalAgent).
+   * Нужен RoutinePushService (generateAgentReplyOutcome ниже): день
+   * возвращается ТОЛЬКО при 'preempted', прочее — повтора нет (ревью 03.11,
+   * п.3: transient_after_write — запись могла уже пройти, max_turns — ход
+   * дорогой и рутины не тарифицируются, cli_fatal — повтор не поможет).
+   */
+  failReason?: string;
 }
 
 @Injectable()
@@ -422,16 +441,34 @@ export class ChatService {
    * той же пары разные relaySid (freshSessionId входит в ключ), и прерывание
    * одного не задевает другой (находки ревью Б2 Step 6).
    *
-   * Слепая зона: agentReply (рутины, «Путь», план действий, итоги звонков,
-   * проба качества) считает relaySid той же формулой и пишет в ТУ ЖЕ сессию
-   * релея, что и обычный чат, но эту карту не трогает вовсе — своего
-   * beginRelayRun/endRelayRun у него нет. Сообщение человека, пришедшее во
-   * время такого фонового хода, не увидит «тот ход прерван», хотя на релее
-   * произойдёт именно это (общий sessionId). Не находка: фоновые ходы
-   * короче, чем решается человек на следующую реплику, и коллизии с ними
-   * пока не видели.
+   * agentReply (рутины, «Путь», план действий, итоги звонков, проба
+   * качества) считает relaySid той же формулой и может писать в ТУ ЖЕ
+   * сессию релея, что и обычный чат, — но эту карту сам не трогает вовсе
+   * (своего beginRelayRun/endRelayRun у него нет) и не читает её, кроме
+   * шлагбаума занятости (см. backgroundRunning ниже). Сообщение человека,
+   * пришедшее во время фонового хода, НЕ увидит «тот ход прерван» — строка
+   * про прерывание остаётся только о ходах ЧЕЛОВЕКА (бэклог e777aa94: до
+   * 2026-11-03 это было обратным багом — фоновый ход мог пре-эмптить ход
+   * человека на релее без всякого предупреждения ни той, ни другой стороне).
    */
   private readonly relayRunning = new Map<string, number>();
+
+  /**
+   * Фоновый ход (agentReply БЕЗ sessionIdOverride — рутины, «Путь») в
+   * полёте, по тому же relaySid. ОТДЕЛЬНАЯ карта от relayRunning (бэклог
+   * e777aa94, см. комментарий выше): фоновый ход читает ОБЕ карты — если в
+   * сессии идёт ход человека (relayRunning) или другой фоновый ход
+   * (backgroundRunning) — не стартует вовсе (RelaySessionBusyError, см.
+   * agentReply), а не пре-эмптит его на релее. Но пишет только в эту: строка
+   * о прерванном ходе (INTERRUPTED_TURN_NOTE) проверяется ИСКЛЮЧИТЕЛЬНО по
+   * relayRunning, и человек, написавший посреди рутины, не должен получать
+   * служебную строку про «твой ход прерван» — прервалась не его работа.
+   *
+   * Эфемерные сессии (sessionIdOverride задан — план действий, консультации
+   * и документы звонков, проба качества, тест версии ассистента) не делят
+   * sessionId ни с кем и в эту карту не попадают.
+   */
+  private readonly backgroundRunning = new Map<string, number>();
 
   /** Ходов в полёте. 0 — можно перезапускать, не порвав ничей ответ. */
   getActiveStreamCount(): number {
@@ -2813,8 +2850,27 @@ ${LanguageService.buildDirective(userLanguage)}`;
   async generateAgentReply(
     userId: string, assistantId: string, message: string, sessionIdOverride?: string, opts: AgentReplyOpts = {},
   ): Promise<string> {
-    const { text } = await this.agentReply(userId, assistantId, message, sessionIdOverride, false, opts);
-    return text;
+    const { text, failed } = await this.agentReply(userId, assistantId, message, sessionIdOverride, false, opts);
+    // Обрывок прерванного хода (done.failed) наружу не уходит — иначе рутина
+    // отправила бы пушем кусок недописанного ответа (бэклог e777aa94).
+    // generateAgentReplyWithCharge и generateAgentReplyOutcome ниже отдают
+    // failed честно: там это решает вызывающий.
+    return failed ? '' : text;
+  }
+
+  /**
+   * Как generateAgentReply, но отдаёт исход целиком — text, failed и
+   * failReason (из done.failReason), а не прячет обрывок за пустой строкой.
+   * Нужен вызывающим, которым важно РАЗЛИЧИТЬ причину сбоя: RoutinePushService
+   * возвращает день на повтор только при failReason === 'preempted' (человек
+   * перебил ход на релее), а не при любом failed (ревью 03.11, п.3; бэклог
+   * e777aa94). Не тарифицирует (billed=false), как и generateAgentReply.
+   */
+  async generateAgentReplyOutcome(
+    userId: string, assistantId: string, message: string, sessionIdOverride?: string, opts: AgentReplyOpts = {},
+  ): Promise<{ text: string; failed: boolean; failReason?: string }> {
+    const { text, failed, failReason } = await this.agentReply(userId, assistantId, message, sessionIdOverride, false, opts);
+    return { text, failed, failReason };
   }
 
   /**
@@ -2882,6 +2938,34 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const userLanguage = opts.testMode === true
       ? LanguageService.normalize(opts.testLanguage)
       : await this.language.resolveUserLanguage(userId);
+
+    // sessionIdOverride — для синтетических проб: изолированная сессия, чтобы не
+    // коллидить с реальной сессией юзера/другими пробами (r.linkeon отдаёт пустой
+    // поток при конкурентном обращении к ЗАНЯТОЙ сессии — инцидент 2026-07-12).
+    // Язык в ключе сессии — по той же причине, что в основном пути: релей
+    // резюмит прежний разговор, и накопленный русский перевешивает промпт.
+    // "" — как и undefined, значит «своей сессии нет» (!sessionIdOverride,
+    // не === undefined): пустая строка — не отдельный валидный ключ.
+    const sharesHumanSession = !sessionIdOverride;
+    const relaySid = sessionIdOverride || relaySessionKey(userId, assistantId, userLanguage);
+    // Фоновый ход (sharesHumanSession) делит сессию релея с чатом человека.
+    // РАННЯЯ проверка — сразу как только relaySid известен, ДО Neo4j и
+    // бизнес-профиля ниже: если сессия уже занята, незачем ходить в них
+    // впустую («Путь» зовётся на каждый запрос состояния лаунчера). Это
+    // ТОЛЬКО оптимизация общего случая, а НЕ гарантия от гонки — между этой
+    // строкой и финальной проверкой прямо перед beginStream/openMark (ближе
+    // к концу метода) проходит несколько await (Neo4j, бизнес-профиль,
+    // resolveAnswerProvider), и за это время сессию мог занять кто-то другой.
+    // Гонку закрывает именно финальная проверка (ревью 03.11, подтверждено
+    // пробами): до него между проверкой занятости и openMark был разрыв
+    // ровно на await resolveAnswerProvider — в это окно проходили оба
+    // конкурента (два фоновых хода одной сессии, RACE1) или фоновый
+    // ход уходил в релей поверх начавшегося хода человека (RACE2).
+    if (sharesHumanSession && (this.relayRunning.has(relaySid) || this.backgroundRunning.has(relaySid))) {
+      this.logger.log(`фоновый ход отложен: сессия занята (assistant ${assistantId})`);
+      throw new RelaySessionBusyError();
+    }
+
     const agentDescription = opts.descriptionOverride !== undefined
       ? opts.descriptionOverride
       : agent.description;
@@ -2939,13 +3023,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const outboundStablePrefix = opts.testMode === true ? neutralizeAtMentions(stablePrefix) : stablePrefix;
     fd.append('message', outboundPrompt);
     if (outboundStablePrefix) fd.append('systemPrompt', outboundStablePrefix);
-    // sessionIdOverride — для синтетических проб: изолированная сессия, чтобы не
-    // коллидить с реальной сессией юзера/другими пробами (r.linkeon отдаёт пустой
-    // поток при конкурентном обращении к ЗАНЯТОЙ сессии — инцидент 2026-07-12).
-    // Язык в ключе сессии — по той же причине, что в основном пути: релей
-    // резюмит прежний разговор, и накопленный русский перевешивает промпт.
-    const relaySid = sessionIdOverride ||
-      relaySessionKey(userId, assistantId, userLanguage);
+    // relaySid/sharesHumanSession — уже посчитаны выше (сразу после
+    // userLanguage, вместе с ранней проверкой занятости).
     fd.append('sessionId', relaySid);
     // Модель ответов: личный выбор этого человека или общий рубильник (spec
     // 2026-10-31-global-llm-switch, раздел 4) — рутины, «Путь», план действий,
@@ -2976,58 +3055,85 @@ ${LanguageService.buildDirective(userLanguage)}`;
     };
     let costUsd = 0;
     let turnFailed = false;
+    let turnFailReason: string | undefined;
     const turnCost = new RelayTurnCost();
-    const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
-      headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
-      responseType: 'stream',
-      timeout: 300000,
-      maxRedirects: 0,
-    });
-    await new Promise<void>((resolve, reject) => {
-      let buffer = '';
-      resp.data.on('data', (chunk: Buffer) => {
-        buffer += chunk.toString();
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          try {
-            const ev = JSON.parse(line.slice(6));
-            if (ev.type === 'delta' || ev.type === 'text') chunks.push(ev.text);
-            else if (ev.type === 'result' && ev.text && chunks.length === 0) chunks.push(ev.text);
-            else if (ev.type === 'done') {
-              // Стоимость и расход — здесь же, где их берёт основной путь.
-              if (ev.failed === true) turnFailed = true;
-              if (typeof ev.costUsd === 'number' && ev.costUsd > 0) costUsd += ev.costUsd;
-              turnCost.add(ev);
-              if (ev.usage && typeof ev.usage === 'object') {
-                for (const k of Object.keys(usage) as (keyof SdkUsageTotals)[]) {
-                  const v = ev.usage[k];
-                  if (typeof v === 'number' && v > 0) usage[k] += v;
-                }
-              }
-              // Видимость (ревью 1.11, spec 2026-10-31-global-llm-switch §4):
-              // цепочка релея может тихо ответить не той моделью, что выбрал
-              // route выше (недоступность выбранной). Только лог — НЕ событие
-              // chat_quality: этот путь (рутины, план действий, поездки,
-              // итоги/документы звонков, проба качества) не должен портить
-              // метрики монитора качества своими вызовами. При route.provider
-              // === 'claude' не проверяем: запросу не передан provider, и
-              // релей по тому же соглашению может не прислать его в done —
-              // readDoneProvider() тогда честно вернёт undefined, а не 'claude'.
-              if (route.provider !== 'claude') {
-                const { provider: turnProvider } = readDoneProvider(ev);
-                if (turnProvider && turnProvider !== route.provider) {
-                  this.logger.warn(`agentReply: выбрана ${route.provider} (${route.choice}), ответил ${turnProvider}`);
-                }
-              }
-            }
-          } catch {}
-        }
+    // Финальная проверка занятости — ВПЛОТНУЮ к beginStream/openMark ниже,
+    // без await между ними (ревью 03.11, см. комментарий у ранней проверки
+    // выше): это и закрывает гонку. Повтор той же проверки — не лишний: она
+    // синхронна, а между ранней и этой точкой прошло несколько await
+    // (Neo4j, бизнес-профиль, resolveAnswerProvider), за которые сессию мог
+    // занять кто-то другой.
+    if (sharesHumanSession && (this.relayRunning.has(relaySid) || this.backgroundRunning.has(relaySid))) {
+      this.logger.log(`фоновый ход отложен: сессия занята (assistant ${assistantId})`);
+      throw new RelaySessionBusyError();
+    }
+    // activeStreams — чтобы deploy.sh дождался и этого хода, не только
+    // текстового чата (до 2026-11-03 agentReply в счётчик не попадал вовсе —
+    // рестарт мог оборвать рутину или «Путь» посреди запроса к релею).
+    // backgroundRunning — метка ТОЛЬКО для ходов, делящих сессию с человеком
+    // (sharesHumanSession); для эфемерных (sessionIdOverride) bgMark = null,
+    // и closeMark ниже просто не вызывается — своей метки нет и не нужна.
+    this.beginStream();
+    const bgMark = sharesHumanSession ? this.openMark(this.backgroundRunning, relaySid) : null;
+    try {
+      const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
+        headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
+        responseType: 'stream',
+        timeout: 300000,
+        maxRedirects: 0,
       });
-      resp.data.on('end', () => resolve());
-      resp.data.on('error', reject);
-    });
+      await new Promise<void>((resolve, reject) => {
+        let buffer = '';
+        resp.data.on('data', (chunk: Buffer) => {
+          buffer += chunk.toString();
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            try {
+              const ev = JSON.parse(line.slice(6));
+              if (ev.type === 'delta' || ev.type === 'text') chunks.push(ev.text);
+              else if (ev.type === 'result' && ev.text && chunks.length === 0) chunks.push(ev.text);
+              else if (ev.type === 'done') {
+                // Стоимость и расход — здесь же, где их берёт основной путь.
+                if (ev.failed === true) {
+                  turnFailed = true;
+                  turnFailReason = typeof ev.failReason === 'string' ? ev.failReason : 'unknown';
+                }
+                if (typeof ev.costUsd === 'number' && ev.costUsd > 0) costUsd += ev.costUsd;
+                turnCost.add(ev);
+                if (ev.usage && typeof ev.usage === 'object') {
+                  for (const k of Object.keys(usage) as (keyof SdkUsageTotals)[]) {
+                    const v = ev.usage[k];
+                    if (typeof v === 'number' && v > 0) usage[k] += v;
+                  }
+                }
+                // Видимость (ревью 1.11, spec 2026-10-31-global-llm-switch §4):
+                // цепочка релея может тихо ответить не той моделью, что выбрал
+                // route выше (недоступность выбранной). Только лог — НЕ событие
+                // chat_quality: этот путь (рутины, план действий, поездки,
+                // итоги/документы звонков, проба качества) не должен портить
+                // метрики монитора качества своими вызовами. При route.provider
+                // === 'claude' не проверяем: запросу не передан provider, и
+                // релей по тому же соглашению может не прислать его в done —
+                // readDoneProvider() тогда честно вернёт undefined, а не 'claude'.
+                if (route.provider !== 'claude') {
+                  const { provider: turnProvider } = readDoneProvider(ev);
+                  if (turnProvider && turnProvider !== route.provider) {
+                    this.logger.warn(`agentReply: выбрана ${route.provider} (${route.choice}), ответил ${turnProvider}`);
+                  }
+                }
+              }
+            } catch {}
+          }
+        });
+        resp.data.on('end', () => resolve());
+        resp.data.on('error', reject);
+      });
+    } finally {
+      this.endStream();
+      if (bgMark !== null) this.closeMark(this.backgroundRunning, relaySid, bgMark);
+    }
     const text = this.stripToolTags(chunks.join('')).trim();
     const charge = this.computeSdkCharge(usage, costUsd, text, turnCost.usd);
     if (opts.testMode === true) {
@@ -3048,7 +3154,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
       else this.logger.log(logLine);
       this.alertTurnCostFloor(userId, assistantId, charge, charge.tokens);
     }
-    return { text, tokens: charge.tokens, costUsd, charge, durationMs: Date.now() - startedAt };
+    return {
+      text, tokens: charge.tokens, costUsd, charge, durationMs: Date.now() - startedAt,
+      failed: turnFailed, failReason: turnFailReason,
+    };
   }
 
   /** Public wrapper для chat.controller — после upload-and-chat обогащаем профиль + tasks. */
