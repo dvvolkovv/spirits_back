@@ -64,3 +64,24 @@ describe('participantsLine', () => {
     expect(participantsLine([])).toBe('');
   });
 });
+
+describe('миграция participants доезжает до базы', () => {
+  /**
+   * Модуль применяет миграции по ЯВНОМУ списку. Файл, забытый в списке,
+   * молча не накатывается, и complete падает на проде на отсутствующей
+   * колонке — ровно так 005 едва не ушла 03.11.2026.
+   */
+  it('каждый файл миграции с 004 есть в списке VoiceCallService', () => {
+    // 001–003 накатывал scripts/migrate.ts вручную; список модуля начинается
+    // с 003_voice_call_origin, а с 004 других путей у миграций нет.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const fs = require('fs') as typeof import('fs');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const path = require('path') as typeof import('path');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { VoiceCallService } = require('./voice-call.service');
+    const files = fs.readdirSync(path.join(__dirname, 'migrations')).filter((f) => /^\d{3}_.*\.sql$/.test(f) && f >= '004');
+    expect(files).toContain('005_voice_call_participants.sql');
+    for (const f of files) expect((VoiceCallService as any).MIGRATIONS).toContain(f);
+  });
+});
