@@ -45,7 +45,7 @@ export function buildSandboxSettings(fsKey, { scratch, mcpDir } = {}) {
   validateFsKey(fsKey);
   const scratchDir = normalizeDir(scratch || `${AGENT_SCRATCH_ROOT}/${fsKey}`);
   const myOutput = `/tmp/agent-output/${fsKey}`;
-  const deny = ['/home/dv', '/etc/sudoers', '/etc/sudoers.d', normalizeDir(mcpDir || AGENT_MCP_DIR)];
+  const deny = ['/home/dv', '/proc', '/etc/sudoers', '/etc/sudoers.d', normalizeDir(mcpDir || AGENT_MCP_DIR)];
   const PROXY = process.env.RELAY_SANDBOX_PROXY || '127.0.0.1:8471';
   const net = SANDBOX_SCHEMA === 'A'
     ? { network: { allowedDomains: [PROXY] } }
@@ -99,4 +99,83 @@ export function buildCliEnv({ baseEnv, providerEnv, fsKey, scrub }) {
   env.HTTP_PROXY = env.http_proxy;
   env.HTTPS_PROXY = env.https_proxy;
   return env;
+}
+
+// Встроенные инструменты хода в песочнице. Собственные uploads — по префиксу
+// fsKey: это файлы, которые пользователь приложил именно к этому разговору.
+// Корни output/uploads/scratch в denyRead намеренно не добавляются: собственные
+// пути должны оставаться доступными, а изоляцию дают 0311 на корнях и fsKey.
+export function buildSandboxTools(fsKey) {
+  validateFsKey(fsKey);
+  const readRoots = [
+    `/tmp/agent-output/${fsKey}/**`,
+    `/tmp/agent-scratch/${fsKey}/**`,
+    `/tmp/agent-uploads/${fsKey}_*`,
+    `${AGENT_OPT_DIR}/**`, '/usr/**', '/etc/**', '/opt/**',
+  ];
+  const writeRoots = [`/tmp/agent-output/${fsKey}/**`, `/tmp/agent-scratch/${fsKey}/**`];
+  return [
+    'Bash(*)',
+    ...['Read', 'Glob', 'Grep'].flatMap((name) => readRoots.map((root) => `${name}(${root})`)),
+    ...['Write', 'Edit'].flatMap((name) => writeRoots.map((root) => `${name}(${root})`)),
+    'WebSearch(*)', 'WebFetch(*)',
+  ].join(',');
+}
+
+// Единый источник базового списка и при инициализации, и в catch MCP. В off
+// legacyTools возвращается дословно, без валидации fsKey или иных побочных эффектов.
+export function baseToolsForTurn(fsKey, sandboxOn, legacyTools) {
+  return sandboxOn ? buildSandboxTools(fsKey) : legacyTools;
+}
+
+// Окружение spawn: off — ровно объект прежней ветки server.mjs; on — белый
+// список buildCliEnv, scrub и служебная метка для уборки потомков хода.
+export function buildTurnEnv({ sandboxOn, legacyEnv, baseEnv, providerEnv, fsKey, tag, runEnvName }) {
+  if (!sandboxOn) return legacyEnv;
+  const env = buildCliEnv({ baseEnv, providerEnv, fsKey, scrub: true });
+  env[runEnvName] = tag;
+  env.OMP_THREAD_LIMIT = '1';
+  return env;
+}
+
+// Промпт меняется только у хода в песочнице. В off возвращается та же строка.
+export function applySandboxPrompt(prompt, sandboxOn) {
+  if (!sandboxOn) return prompt;
+  return prompt
+    .replace(
+      'Full sudo access (no password). Install anything you need.',
+      'Bash runs in a sandbox. sudo is unavailable. The server home directory is unavailable. Write only to the output directory and your scratch directory.',
+    )
+    .replace(
+      'INSTALL ANYTHING MISSING: apt, pip, npm, wget — whatever it takes.',
+      'INSTALL MISSING PACKAGES: use pip/npm locally in your scratch directory or a venv there; use wget/curl through the configured proxy. apt and sudo are unavailable.',
+    )
+    .replaceAll('/home/dv/agent-env/bin/activate', `${AGENT_OPT_DIR}/venv/bin/activate`)
+    .replaceAll('/home/dv/agent-env/bin/generate_image.sh', `${AGENT_OPT_DIR}/bin/generate_image.sh`);
+}
+
+const SANDBOX_FAILURE_RE = /sandbox|bwrap|no new privileges/i;
+
+function toolResultText(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map((block) => {
+    if (typeof block === 'string') return block;
+    return block && block.type === 'text' && typeof block.text === 'string' ? block.text : '';
+  }).join('\n');
+}
+
+// CLI возвращает результат инструмента событием user/tool_result, а не
+// assistant/tool_use. Считаем только результаты Bash, чьи tool_use_id были
+// замечены в assistant-событии этого же запуска; сырой текст здесь не журналируется.
+export function sandboxFailureFromToolResult(ev, bashToolUseIds) {
+  const blocks = ev && ev.type === 'user' && ev.message
+    ? ev.message.content
+    : ev && ev.type === 'tool_result' ? [ev] : [];
+  if (!Array.isArray(blocks)) return false;
+  for (const block of blocks) {
+    if (!block || block.type !== 'tool_result' || !bashToolUseIds.has(block.tool_use_id)) continue;
+    if (SANDBOX_FAILURE_RE.test(toolResultText(block.content))) return true;
+  }
+  return false;
 }

@@ -7,14 +7,18 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import { turnFsKey, legacyTurnFsKey, uploadFileName, fallbackFileName, sessionOutputDir } from "./paths.mjs";
+import { turnFsKey, legacyTurnFsKey, uploadFileName, fallbackFileName, sessionOutputDir, ensureSessionDirs, ensureListingGuard } from "./paths.mjs";
+import {
+  AGENT_MCP_DIR, sandboxMode, isCanarySession, buildSandboxSettings,
+  baseToolsForTurn, buildTurnEnv, applySandboxPrompt, sandboxFailureFromToolResult,
+} from "./sandbox-policy.mjs";
 import { eventCallContext, tailDialogue } from "./session-tail.mjs";
 import { RUN_ENV, runTag, finishedRun, reap } from "./proc-reaper.mjs";
 import { costBaseline, runCost } from "./turn-cost.mjs";
 import { createUndelivered, withCarried } from "./undelivered-files.mjs";
 import { createRelayAuth } from "./relay-auth.mjs";
 import { LINKEON_TOOLS, linkeonServer, bearerServer } from "./linkeon-mcp.mjs";
-import { sessionMcpConfigName, sweepStaleSessionMcpConfigs, ensureMcpConfigDir, removeLiveConfigs } from "./session-mcp-config.mjs";
+import { sessionMcpConfigName, sweepStaleSessionMcpConfigs, ensureMcpConfigDir, removeLiveConfigs, writeSandboxSettings, removeSandboxSettings } from "./session-mcp-config.mjs";
 import { snapshotDir, changedFiles } from "./turn-files.mjs";
 import { agentTestMode, cliToolArgs } from "./agent-test-mode.mjs";
 import { createDrainGate } from "./drain-gate.mjs";
@@ -25,12 +29,10 @@ const chatInflight = createInflight();
 const PORT = 3033;
 const UPLOAD_DIR = "/tmp/agent-uploads";
 const OUTPUT_DIR = "/tmp/agent-output";
-// Конфиги хода (session-mcp-config.mjs) — в СВОЁМ подкаталоге, не вперемешку
-// с загрузками пользователя: уборка осиротевших (sweepStaleMcpConfigs ниже)
-// иначе сканировала бы ТУ ЖЕ папку, что и настоящие файлы пользователя, и
-// совпадение суффикса имени с чьей-то загрузкой было бы потенциальной
-// опечаткой с чужими данными. 0700 — файлы внутри несут чужие Bearer-токены.
-const MCP_CONFIG_DIR = path.join(UPLOAD_DIR, "mcp");
+// Конфиги и settings хода — в отдельном системном /tmp/agent-mcp, не среди
+// загрузок пользователя. 0700: MCP-файлы несут чужие Bearer-токены. Уборка
+// осиротевших MCP-конфигов и ensure на каждой записи остаются прежними.
+const MCP_CONFIG_DIR = AGENT_MCP_DIR;
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 fs.mkdirSync(OUTPUT_DIR, { recursive: true });
@@ -41,6 +43,8 @@ app.use(cors());
 // рядом с server.mjs, права 600, не в git; режим log пишет «отказ был бы»
 // и пропускает, enforce отвечает 401.
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const SANDBOX_MODE_FILE = path.join(HERE, "sandbox-mode");
+const SANDBOX_CANARY_FILE = path.join(HERE, "sandbox-canary.keys");
 app.use(createRelayAuth({
   secretsPath: process.env.RELAY_SECRETS_FILE || path.join(HERE, "relay-secrets"),
   modePath: process.env.RELAY_AUTH_MODE_FILE || path.join(HERE, "relay-auth-mode"),
@@ -321,6 +325,14 @@ const sweepRuns = () => reap(finishedRun(liveRuns)).then(logReaped, () => {});
 const fallbackState = llm.createFallbackState();
 setInterval(sweepRuns, 5 * 60 * 1000).unref();
 
+// Только число совпадений за окно: сырой текст tool_result в журнал не идёт.
+let sandboxFailCount = 0;
+setInterval(() => {
+  if (!sandboxFailCount) return;
+  console.log("sandbox-fail count=" + sandboxFailCount);
+  sandboxFailCount = 0;
+}, 5 * 60 * 1000).unref();
+
 // Полные пути конфигов ИДУЩИХ ходов этого процесса — /chat добавляет при
 // записи, убирает в finally. Уборка ниже обязана их пропускать: консультация
 // или self-heal ретрай могут идти дольше SESSION_MCP_MAX_AGE_MS, а конфиг
@@ -432,7 +444,7 @@ const PRODUCTS_PROMPT = `
 Когда его звать, сказано в инструкциях ассистента ниже. НЕ передавай в него userId/телефон.
 `;
 
-app.post("/chat", chatInflight.middleware, createDrainGate(), upload.array("files", 10), (req, res) => {
+app.post("/chat", chatInflight.middleware, createDrainGate(), upload.array("files", 10), async (req, res) => {
   const { message, sessionId: reqSessionId } = req.body;
   const reqTestMode = agentTestMode(req.body);
   // Модель хода. По умолчанию "default" (рекомендуемая CLI — сейчас Opus 5).
@@ -497,8 +509,18 @@ app.post("/chat", chatInflight.middleware, createDrainGate(), upload.array("file
   // без него — санитизированная копия sessionId, как раньше. Старые папки не
   // переносятся: ссылки из истории чатов продолжают открываться. См. paths.mjs.
   const fsKey = turnFsKey(req.body.fs_key, sessionId, randomUUID());
+  // Режим вычисляется один раз на HTTP-ход и общий для всех повторов и
+  // провайдеров. В журнале — только режим, без sessionId и других идентификаторов.
+  const sbxMode = sandboxMode(SANDBOX_MODE_FILE);
+  const sbxOn = isCanarySession(sessionId, sbxMode, SANDBOX_CANARY_FILE);
+  console.log("sandbox: " + (sbxOn ? sbxMode : "off"));
   const outDir = path.join(OUTPUT_DIR, fsKey);
-  fs.mkdirSync(outDir, { recursive: true });
+  if (sbxOn) {
+    await ensureSessionDirs(fsKey);
+    await ensureListingGuard();
+  } else {
+    fs.mkdirSync(outDir, { recursive: true });
+  }
 
   // Папка хода ДО перехода на fs_key (26.10.2026). Модель может помнить путь
   // к файлу оттуда из истории разговора (ссылка, которую она сама когда-то
@@ -596,9 +618,13 @@ app.post("/chat", chatInflight.middleware, createDrainGate(), upload.array("file
   // завершении запроса (см. finally ниже). Любая осечка — безопасный откат к
   // базовому конфигу.
   let mcpConfigPath = BASE_MCP_PATH;
-  let allowedTools = reqTestMode ? "" : BASE_TOOLS;
-  let systemPrompt = SYSTEM_PROMPT;
+  // Одна и та же база нужна при инициализации и после ошибки MCP: catch не
+  // должен незаметно вернуть Read(*)/Write(*) ходу, который уже в песочнице.
+  const baseAllowedTools = () => reqTestMode ? "" : baseToolsForTurn(fsKey, sbxOn, BASE_TOOLS);
+  let allowedTools = baseAllowedTools();
+  let systemPrompt = applySandboxPrompt(SYSTEM_PROMPT, sbxOn);
   let sessionMcpPath = null;
+  let sandboxSettingsPath = null;
   // Set when the agent uses a TalerID *write* tool this request. The transient
   // whole-turn retry below re-runs the turn, which would double-execute a write —
   // create_note dedups by title server-side, but send_message does NOT, so a retry
@@ -664,8 +690,8 @@ app.post("/chat", chatInflight.middleware, createDrainGate(), upload.array("file
       }
       sessionMcpPath = null;
       mcpConfigPath = BASE_MCP_PATH;
-      allowedTools = BASE_TOOLS;
-      systemPrompt = SYSTEM_PROMPT;
+      allowedTools = baseAllowedTools();
+      systemPrompt = applySandboxPrompt(SYSTEM_PROMPT, sbxOn);
     }
   }
 
@@ -675,6 +701,14 @@ app.post("/chat", chatInflight.middleware, createDrainGate(), upload.array("file
   // бэкенд) оставляет поведение ровно прежним.
   if (reqSystemPrompt) systemPrompt += "\n\n" + reqSystemPrompt;
 
+  // Один settings-файл на весь HTTP-ход: его используют первый запуск, повторы
+  // и запасные провайдеры. Удаляется в finally независимо от sessionMcpPath.
+  if (sbxOn) {
+    sandboxSettingsPath = writeSandboxSettings(
+      MCP_CONFIG_DIR, fsKey, randomUUID(), buildSandboxSettings(fsKey, {}),
+    );
+  }
+
   const args = [
     "--print",
     "--model", reqModel,
@@ -683,6 +717,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate(), upload.array("file
     "--include-partial-messages",
     "--max-turns", "40",
     ...cliToolArgs(reqTestMode, allowedTools),
+    ...(sbxOn ? ["--settings", sandboxSettingsPath] : []),
     "--disallowedTools", "mcp__plugin_telegram_telegram__reply,mcp__plugin_telegram_telegram__react,mcp__plugin_telegram_telegram__edit_message,mcp__plugin_telegram_telegram__download_attachment,ToolSearch",
     "--mcp-config", mcpConfigPath,
     "--strict-mcp-config",
@@ -865,17 +900,30 @@ app.post("/chat", chatInflight.middleware, createDrainGate(), upload.array("file
 
       const tag = runTag(randomUUID());
       liveRuns.add(tag);
+      const providerEnv = runProvider === "claude" ? process.env : llm.providerSpawnEnv(process.env, llmCfgs[runProvider]);
+      // Off — прежний объект дословно, включая PATH с /home/dv. On — белый
+      // список и scrub внутри buildTurnEnv; прежний HOME/PATH туда не попадают.
+      const legacyEnv = {
+        ...providerEnv, MCP_TIMEOUT: "120000", MCP_TOOL_TIMEOUT: "600000", PATH: process.env.PATH + ":/home/dv/agent-env/bin:/home/dv/.bun/bin:/home/dv/file-agent/bin",
+        // OpenMP по умолчанию берёт по потоку на ядро. 14.10.2026 модель
+        // пустила tesseract в 4 параллельных копии — вышло 16 потоков на 4
+        // ядрах, и страница распознавалась 3–9 минут.
+        OMP_THREAD_LIMIT: "1",
+        [RUN_ENV]: tag,
+      };
+      const childEnv = buildTurnEnv({
+        sandboxOn: sbxOn,
+        legacyEnv,
+        baseEnv: process.env,
+        providerEnv: runProvider === "claude" ? {} : providerEnv,
+        fsKey,
+        tag,
+        runEnvName: RUN_ENV,
+      });
       const child = spawn("claude", runArgs, {
         cwd: "/tmp",
         stdio: ["pipe", "pipe", "pipe"],
-        env: {
-          ...(runProvider === "claude" ? process.env : llm.providerSpawnEnv(process.env, llmCfgs[runProvider])), MCP_TIMEOUT: "120000", MCP_TOOL_TIMEOUT: "600000", PATH: process.env.PATH + ":/home/dv/agent-env/bin:/home/dv/.bun/bin:/home/dv/file-agent/bin",
-          // OpenMP по умолчанию берёт по потоку на ядро. 14.10.2026 модель
-          // пустила tesseract в 4 параллельных копии — вышло 16 потоков на 4
-          // ядрах, и страница распознавалась 3–9 минут.
-          OMP_THREAD_LIMIT: "1",
-          [RUN_ENV]: tag,
-        },
+        env: childEnv,
       });
       // exit, а не close: close ждёт, пока закроются все копии stdout, и
       // потомок, унаследовавший его, задержал бы и уборку, и ответ.
@@ -922,6 +970,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate(), upload.array("file
       let transientHit = false;
       let maxTurnsHit = false;
       let staleResumeHit = false;
+      const bashToolUseIds = new Set();
 
       const handleEvent = (ev) => {
         if (ev.session_id) rememberSession(sessionId, ev.session_id);
@@ -985,12 +1034,17 @@ app.post("/chat", chatInflight.middleware, createDrainGate(), upload.array("file
         } else if (ev.type === "assistant" && ev.message) {
           for (const block of (ev.message.content || [])) {
             if (block.type === "tool_use") {
+              if (block.name === "Bash" && block.id) bashToolUseIds.add(block.id);
               if (TALERID_WRITE_RE.test(block.name || "")) taleridWriteUsed = true;
               if (!llm.SIDE_EFFECT_FREE_TOOLS.has(block.name || "")) riskyToolUsed = true;
               const inp = typeof block.input === "string" ? block.input : JSON.stringify(block.input);
               if (!clientDisconnected) res.write("data: " + JSON.stringify({ type: "tool", tool: block.name, input: inp.slice(0, 300) }) + "\n\n");
             }
           }
+        } else if (sbxOn && sandboxFailureFromToolResult(ev, bashToolUseIds)) {
+          // Не журналируем сам результат: там могут быть данные пользователя.
+          console.log("SANDBOX-FAIL " + tag);
+          sandboxFailCount++;
         } else if (ev.type === "result" && ev.result) {
           const isErrorResult =
             ev.is_error === true ||
@@ -1329,6 +1383,9 @@ app.post("/chat", chatInflight.middleware, createDrainGate(), upload.array("file
       liveMcpConfigPaths.delete(sessionMcpPath);
       try { fs.unlinkSync(sessionMcpPath); } catch {}
     }
+    // Settings не является sessionMcpPath и очищается всегда, даже если MCP
+    // для этого хода не настраивался или его запись завершилась ошибкой.
+    removeSandboxSettings(sandboxSettingsPath);
   });
 });
 

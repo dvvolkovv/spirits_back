@@ -34,6 +34,22 @@ export function ensureMcpConfigDir(dir) {
   fs.chmodSync(dir, 0o700);
 }
 
+// --settings хода живёт рядом с MCP-конфигом, но имеет своё имя и удаляется
+// независимо от него. turnId делает имя уникальным даже внутри одной сессии.
+export function writeSandboxSettings(dir, fsKey, turnId, settings) {
+  ensureMcpConfigDir(dir);
+  const name = sessionMcpConfigName(fsKey, turnId).replace(/\.json$/, ".settings.json");
+  const full = path.join(dir, name);
+  fs.writeFileSync(full, JSON.stringify(settings), { mode: 0o600 });
+  fs.chmodSync(full, 0o600);
+  return full;
+}
+
+export function removeSandboxSettings(full) {
+  if (!full) return;
+  try { fs.unlinkSync(full); } catch {}
+}
+
 // Остановка процесса (pm2 restart): process.exit не доходит до finally
 // ходов — их конфиги убираются здесь.
 export function removeLiveConfigs(liveSet) {

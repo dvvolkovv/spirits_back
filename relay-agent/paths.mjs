@@ -106,8 +106,19 @@ export function sessionOutputDir(outputDir, sid) {
   return resolved;
 }
 
-export async function ensureSessionDirs(fsKey, { scratchRoot = AGENT_SCRATCH_ROOT, outputs = "/tmp/agent-output" } = {}) {
+export async function ensureSessionDirs(fsKey, { scratchRoot = AGENT_SCRATCH_ROOT, outputs = "/tmp/agent-output", now = Date.now() } = {}) {
   const scratch = path.join(scratchRoot, fsKey);
+  // Корень scratch имеет 0311: readdir там запрещён даже владельцу. Поэтому
+  // проверяем ровно один известный путь текущего fsKey, без перечисления и
+  // без удаления соседних каталогов. Свежее рабочее окружение не трогаем.
+  try {
+    const stat = await fsp.stat(scratch);
+    if (stat.isDirectory() && now - stat.mtimeMs > 7 * 24 * 60 * 60 * 1000) {
+      await fsp.rm(scratch, { recursive: true, force: true });
+    }
+  } catch (e) {
+    if (!e || e.code !== "ENOENT") throw e;
+  }
   await fsp.mkdir(scratch, { recursive: true, mode: 0o700 });
   await fsp.mkdir(path.join(outputs, fsKey), { recursive: true, mode: 0o700 });
   await fsp.chmod(path.join(outputs, fsKey), 0o700);
