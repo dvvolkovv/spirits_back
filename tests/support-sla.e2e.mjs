@@ -251,7 +251,11 @@ async function cleanup() {
      COMMIT;`,
     dbOptions,
   );
-  assert.equal(removed, TICKET_ID, 'тестовый тикет не удалён или не совпали защитные признаки');
+  const removedLines = removed.split('\n');
+  assert.ok(
+    removedLines.includes(TICKET_ID) && removedLines.includes('DELETE 1'),
+    'тестовый тикет не удалён или не совпали защитные признаки',
+  );
   pass('только тестовый тикет и его сообщения/события удалены одной DB-транзакцией');
 }
 
