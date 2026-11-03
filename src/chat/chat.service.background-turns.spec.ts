@@ -346,7 +346,14 @@ describe('гонка: проверка занятости и openMark разде
       () => new Promise((resolve) => { releaseRoute = () => resolve({ provider: 'claude', choice: null }); }),
     );
 
-    const bg = bgTurn(svc, 'рутина');
+    // Не bgTurn(): его queue.push(up) — для хода, который реально ДОХОДИТ до
+    // axios.post. Здесь фоновый НЕ должен дойти вовсе — тот единственный
+    // апстрим в очереди предназначен текстовому ходу человека (ниже), чей
+    // axios.post по факту случается РАНЬШЕ (фоновый всё это время стоит на
+    // гейте route()). Если бы queue.push был и здесь, текстовый ход забрал
+    // бы чужой (фоновый) апстрим первым, и повис бы без данных.
+    const bg = svc.generateAgentReply('u1', '14', 'рутина');
+    bg.catch(() => {}); // см. комментарий в bgTurn — тот же повод
     await settle();
     expect(typeof releaseRoute).toBe('function'); // фоновый дошёл до route() и встал там
     expect(post).not.toHaveBeenCalled();
@@ -366,7 +373,7 @@ describe('гонка: проверка занятости и openMark разде
     // проверка молчит, а следующая зависает: фоновый реально ушёл бы в
     // релей вторым вызовом post, но его апстрим в очереди не подготовлен).
     expect(post).toHaveBeenCalledTimes(1); // фоновый до релея так и не дошёл
-    await expect(bg.call).rejects.toThrow(RelaySessionBusyError);
+    await expect(bg).rejects.toThrow(RelaySessionBusyError);
 
     t.up.push(DONE); t.up.push(null);
     await t.done;
