@@ -196,3 +196,107 @@ describe('support assignment', () => {
     expect(w.client.release).toHaveBeenCalledWith(true);
   });
 });
+
+describe('support SLA queue', () => {
+  function makeSlaWorld(row: Record<string, any> = {}) {
+    const pg = {
+      query: jest.fn(async (sql: string, _params: any[] = []) => ({
+        rows: /SELECT status FROM support_tickets/.test(sql)
+          ? [{ status: 'escalated' }]
+          : /FROM support_tickets t/.test(sql)
+            ? [row]
+            : [],
+      })),
+    };
+    const service = new SupportService(pg as any);
+    const calls = () => pg.query.mock.calls.map(([sql, params]) => ({
+      sql: sql.replace(/\s+/g, ' ').trim(), params,
+    }));
+    return { service, pg, calls };
+  }
+
+  const visibleReplies: Array<[string, (service: SupportService, visible: boolean) => Promise<void>]> = [
+    ['adminReply', (service, visible) => service.adminReply(TICKET_ID, ACTOR_ID, 'reply', visible)],
+    ['postOwnerReplyFromTelegram', (service, visible) =>
+      service.postOwnerReplyFromTelegram(TICKET_ID, 'telegram-1', 'Owner', 'reply', visible)],
+  ];
+
+  it.each(visibleReplies)('%s stops the response SLA with a preserving update after a visible reply', async (_name, reply) => {
+    const w = makeSlaWorld();
+
+    await reply(w.service, true);
+
+    const updates = w.calls().filter((c) => /first_owner_reply_at/.test(c.sql));
+    expect(updates).toEqual([{
+      sql: 'UPDATE support_tickets SET first_owner_reply_at = COALESCE(first_owner_reply_at, now()) WHERE id = $1',
+      params: [TICKET_ID],
+    }]);
+    const insertIndex = w.calls().findIndex((c) => /INSERT INTO support_messages/.test(c.sql));
+    const updateIndex = w.calls().findIndex((c) => /first_owner_reply_at/.test(c.sql));
+    expect(updateIndex).toBeGreaterThan(insertIndex);
+  });
+
+  it.each(visibleReplies)('%s does not stop the response SLA for an internal note', async (_name, reply) => {
+    const w = makeSlaWorld();
+
+    await reply(w.service, false);
+
+    expect(w.calls().some((c) => /first_owner_reply_at/.test(c.sql))).toBe(false);
+  });
+
+  it.each(['overdue', 'soon'])('%s excludes replied tickets and prioritizes overdue and due-soon tickets', async (sla) => {
+    const w = makeSlaWorld();
+
+    await w.service.adminListTickets({ sla } as any);
+
+    const { sql, params } = w.calls()[0];
+    expect(sql).toContain('first_owner_reply_at IS NULL');
+    expect(sql).toContain('first_response_due_at');
+    expect(params).toEqual([]);
+    const overdueSort = 'CASE WHEN t.first_owner_reply_at IS NULL AND t.first_response_due_at < now() THEN 0';
+    const soonSort = "WHEN t.first_owner_reply_at IS NULL AND t.first_response_due_at >= now() AND t.first_response_due_at <= now() + interval '30 minutes' THEN 1";
+    expect(sql).toContain(overdueSort);
+    expect(sql).toContain(soonSort);
+    expect(sql.indexOf(overdueSort)).toBeLessThan(sql.indexOf('CASE t.urgency'));
+    expect(sql.indexOf('CASE t.urgency')).toBeLessThan(sql.lastIndexOf('t.updated_at DESC'));
+    expect(sql).toContain("CASE t.urgency WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 4 END");
+  });
+
+  it('uses the first parameter for the actor with status=all and the second with a status', async () => {
+    const all = makeSlaWorld();
+    await all.service.adminListTickets({ status: 'all', sla: 'mine', actorId: ACTOR_ID } as any);
+    expect(all.calls()[0].sql).toContain('WHERE assigned_to = $1');
+    expect(all.calls()[0].sql).not.toContain('$SLA_ACTOR$');
+    expect(all.calls()[0].params).toEqual([ACTOR_ID]);
+
+    const status = makeSlaWorld();
+    await status.service.adminListTickets({ status: 'escalated', sla: 'mine', actorId: ACTOR_ID } as any);
+    expect(status.calls()[0].sql).toContain('WHERE t.status = $1 AND assigned_to = $2');
+    expect(status.calls()[0].sql).not.toContain('$SLA_ACTOR$');
+    expect(status.calls()[0].params).toEqual(['escalated', ACTOR_ID]);
+  });
+
+  it('returns assignment, SLA timestamps, and the assigned operator name', async () => {
+    const row = {
+      id: TICKET_ID,
+      user_id: 'user-1',
+      assigned_to: 'admin-1',
+      assigned_at: '2026-01-01T01:00:00.000Z',
+      first_response_due_at: '2026-01-01T02:00:00.000Z',
+      first_owner_reply_at: null,
+      assigned_name: 'Admin One',
+    };
+    const w = makeSlaWorld(row);
+
+    const result = await w.service.adminListTickets();
+
+    expect(result[0]).toMatchObject({
+      assignedTo: 'admin-1',
+      assignedAt: row.assigned_at,
+      firstResponseDueAt: row.first_response_due_at,
+      firstOwnerReplyAt: null,
+      assignedName: 'Admin One',
+    });
+    expect(w.calls()[0].sql).toContain('LEFT JOIN ai_profiles_consolidated op ON op.user_id = t.assigned_to');
+  });
+});
