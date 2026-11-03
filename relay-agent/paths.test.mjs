@@ -10,7 +10,18 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { randomUUID } from "crypto";
-import { sessionFsKey, turnFsKey, legacyTurnFsKey, uploadFileName, fallbackFileName, sessionOutputDir } from "./paths.mjs";
+import {
+  sessionFsKey,
+  turnFsKey,
+  legacyTurnFsKey,
+  uploadFileName,
+  fallbackFileName,
+  sessionOutputDir,
+  ensureSessionDirs,
+  ensureListingGuard,
+  AGENT_SCRATCH_ROOT,
+  AGENT_MCP_DIR,
+} from "./paths.mjs";
 
 const DIR = fs.mkdtempSync(path.join(os.tmpdir(), "paths-test-"));
 process.on("exit", () => fs.rmSync(DIR, { recursive: true, force: true }));
@@ -168,4 +179,49 @@ test("legacyTurnFsKey: нет или кривой fs_key — отдельной 
 
 test("legacyTurnFsKey: sessionId без пригодного ключа ('.', '..', пустой) — null", () => {
   for (const sid of [".", "..", ""]) assert.equal(legacyTurnFsKey(FS_KEY, sid), null, sid);
+});
+
+test("константы песочницы реэкспортируются из paths.mjs", () => {
+  assert.equal(AGENT_SCRATCH_ROOT, "/tmp/agent-scratch");
+  assert.equal(AGENT_MCP_DIR, "/tmp/agent-mcp");
+});
+
+test("ensureSessionDirs: создаёт scratch и output с 0700, повторный вызов не падает", async () => {
+  const root = fs.mkdtempSync(path.join(DIR, "session-dirs-"));
+  const scratchRoot = path.join(root, "scratch");
+  const outputs = path.join(root, "output");
+  const scratch = path.join(scratchRoot, FS_KEY);
+  const output = path.join(outputs, FS_KEY);
+
+  // Оба корня переданы явно: настоящие /tmp/agent-* тест не создаёт и не chmod'ит.
+  assert.equal(await ensureSessionDirs(FS_KEY, { scratchRoot, outputs }), scratch);
+  for (const dir of [scratch, output]) {
+    const stat = fs.statSync(dir);
+    assert.ok(stat.isDirectory(), dir);
+    assert.equal(stat.mode & 0o777, 0o700, dir);
+  }
+
+  assert.equal(await ensureSessionDirs(FS_KEY, { scratchRoot, outputs }), scratch);
+});
+
+test("ensureListingGuard: создаёт переданные каталоги и возвращает им 0311", async () => {
+  const root = fs.mkdtempSync(path.join(DIR, "listing-guard-"));
+  const outputs = path.join(root, "output");
+  const uploads = path.join(root, "uploads");
+
+  await ensureListingGuard({ outputs, uploads });
+  for (const dir of [outputs, uploads]) {
+    const stat = fs.statSync(dir);
+    assert.ok(stat.isDirectory(), dir);
+    assert.equal(stat.mode & 0o777, 0o311, dir);
+  }
+
+  // Повторный вызов обязан поправить права именно переданных каталогов,
+  // а не только без ошибки отработать на уже существующих путях.
+  fs.chmodSync(outputs, 0o755);
+  fs.chmodSync(uploads, 0o755);
+  await ensureListingGuard({ outputs, uploads });
+  for (const dir of [outputs, uploads]) {
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o311, dir);
+  }
 });
