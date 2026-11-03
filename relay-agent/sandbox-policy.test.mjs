@@ -38,6 +38,13 @@ test('канарейка: только сессии из файла списка
   assert.equal(isCanarySession('79030001111_14_ru', 'canary', path.join(dir, 'missing')), false);
 });
 
+test('канарейка: пустые строки файла не включают пустой ключ сессии', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sbx-'));
+  const keysFile = path.join(dir, 'canary-keys');
+  fs.writeFileSync(keysFile, '\n  \n');
+  assert.equal(isCanarySession('', 'canary', keysFile), false);
+});
+
 test('настройки: своя папка на запись, домашний каталог и mcp на запрет чтения', () => {
   const s = buildSandboxSettings(FS_KEY, { scratch: `/tmp/agent-scratch/${FS_KEY}/`, mcpDir: '/tmp/agent-mcp' });
   assert.equal(s.sandbox.enabled, true);
@@ -47,6 +54,9 @@ test('настройки: своя папка на запись, домашни�
   assert.ok(s.sandbox.filesystem.denyRead.includes('/home/dv'));
   assert.ok(s.sandbox.filesystem.denyRead.includes('/etc/sudoers'));
   assert.ok(s.sandbox.filesystem.denyRead.includes('/tmp/agent-mcp'));
+  assert.ok(s.sandbox.filesystem.denyRead.includes('/tmp/agent-uploads/mcp'));
+  assert.ok(s.permissions.deny.includes('Read(/tmp/agent-uploads/mcp/**)'));
+  assert.ok(s.permissions.deny.includes('Write(/tmp/agent-uploads/mcp/**)'));
   assert.ok(s.sandbox.filesystem.denyRead.includes('/proc'));
   assert.ok(s.permissions.deny.includes('Read(/proc/**)'));
   assert.ok(s.permissions.deny.includes('Write(/proc/**)'));
@@ -64,6 +74,13 @@ test('настройки: trailing slash у mcpDir убирается', () => {
   for (const rule of s.permissions.deny) assert.equal(rule.includes('//**'), false, rule);
 });
 
+test('схема песочницы fail-closed: production принимает только A', () => {
+  assert.deepEqual(buildSandboxSettings(FS_KEY, { schema: 'A' }).sandbox.network.allowedDomains, ['127.0.0.1:8471']);
+  for (const schema of ['B', '', 'a', 'unknown']) {
+    assert.throws(() => buildSandboxSettings(FS_KEY, { schema }), (e) => e instanceof TypeError && /RELAY_SANDBOX_SCHEMA/.test(e.message));
+  }
+});
+
 test('fsKey: только безопасный сегмент пути', () => {
   for (const fsKey of ['/', '..', '']) {
     assert.throws(() => buildSandboxSettings(fsKey), TypeError);
@@ -74,7 +91,7 @@ test('fsKey: только безопасный сегмент пути', () => {
 test('cliEnv: белый список, без лишних ключей, scrub включён', () => {
   const base = { PATH: '/usr/bin', HOME: '/home/dv', LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8',
     GEMINI_API_KEY: 'x', OPENROUTER_API_KEY: 'x', SSH_AUTH_SOCK: '/tmp/ssh', OLDPWD: '/x',
-    PM2_USAGE: '1', MCP_TIMEOUT: '120000' };
+    PM2_USAGE: '1', MCP_TIMEOUT: '1', MCP_TOOL_TIMEOUT: '2' };
   const env = buildCliEnv({
     baseEnv: base,
     providerEnv: {
@@ -83,6 +100,8 @@ test('cliEnv: белый список, без лишних ключей, scrub �
       CLAUDE_CODE_OAUTH_TOKEN: 'o',
       CLAUDE_CODE_MAX_RETRIES: '2',
       CLAUDE_CODE_SUBAGENT_MODEL: 'm',
+      API_TIMEOUT_MS: '300000',
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
       LD_PRELOAD: '/tmp/bad.so',
       NODE_OPTIONS: '--require=/tmp/bad.cjs',
       UNRELATED: 'x',
@@ -96,11 +115,14 @@ test('cliEnv: белый список, без лишних ключей, scrub �
   assert.equal(env.SSH_AUTH_SOCK, undefined);
   assert.equal(env.PM2_USAGE, undefined);
   assert.equal(env.MCP_TIMEOUT, '120000');
+  assert.equal(env.MCP_TOOL_TIMEOUT, '600000');
   assert.equal(env.ANTHROPIC_BASE_URL, 'https://q');
   assert.equal(env.ANTHROPIC_AUTH_TOKEN, 't');
   assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, 'o');
   assert.equal(env.CLAUDE_CODE_MAX_RETRIES, '2');
   assert.equal(env.CLAUDE_CODE_SUBAGENT_MODEL, 'm');
+  assert.equal(env.API_TIMEOUT_MS, '300000');
+  assert.equal(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '1');
   assert.equal(env.LD_PRELOAD, undefined);
   assert.equal(env.NODE_OPTIONS, undefined);
   assert.equal(env.UNRELATED, undefined);
@@ -140,8 +162,9 @@ test('инструменты: on ограничивает Read/Glob/Grep и Writ
       `/tmp/agent-output/${FS_KEY}/**`,
       `/tmp/agent-scratch/${FS_KEY}/**`,
       `/tmp/agent-uploads/${FS_KEY}_*`,
-      '/opt/linkeon-agent/**', '/usr/**', '/etc/**', '/opt/**',
+      '/opt/linkeon-agent/**', '/usr/**', '/etc/**',
     ]) assert.ok(rules.includes(`${name}(${root})`), `${name}(${root})`);
+    assert.equal(rules.includes(`${name}(/opt/**)`), false, `${name}(/opt/**)`);
   }
   for (const name of ['Write', 'Edit']) {
     assert.deepEqual(rules.filter((r) => r.startsWith(`${name}(`)).sort(), [
@@ -149,7 +172,8 @@ test('инструменты: on ограничивает Read/Glob/Grep и Writ
       `${name}(/tmp/agent-scratch/${FS_KEY}/**)`,
     ].sort());
   }
-  for (const name of ['Bash(*)', 'WebSearch(*)', 'WebFetch(*)']) assert.ok(rules.includes(name));
+  for (const name of ['Bash(*)', 'WebSearch(*)']) assert.ok(rules.includes(name));
+  assert.equal(rules.includes('WebFetch(*)'), false);
 });
 
 test('инструменты: повторный базовый список после ошибки MCP не снимает ограничения', () => {
