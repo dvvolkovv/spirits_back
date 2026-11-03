@@ -209,13 +209,23 @@ test("ensureSessionDirs: создаёт scratch и output с 0700, повтор�
   }
 });
 
-test("ensureListingGuard: создаёт переданные каталоги и возвращает им 0311", async () => {
+test("ensureListingGuard: закрывает листинг трёх корней и не ломает собственный scratch", async (t) => {
   const root = fs.mkdtempSync(path.join(DIR, "listing-guard-"));
   const outputs = path.join(root, "output");
   const uploads = path.join(root, "uploads");
+  const scratchRoot = path.join(root, "scratch");
+  const dirs = [outputs, uploads, scratchRoot];
+  const scratch = path.join(scratchRoot, FS_KEY);
+  const ownFile = path.join(scratch, "note.txt");
+  fs.mkdirSync(scratch, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(ownFile, "before");
+  t.after(() => {
+    // rmSync при выходе должен прочитать содержимое временных каталогов.
+    for (const dir of dirs) if (fs.existsSync(dir)) fs.chmodSync(dir, 0o700);
+  });
 
-  await ensureListingGuard({ outputs, uploads });
-  for (const dir of [outputs, uploads]) {
+  await ensureListingGuard({ outputs, uploads, scratchRoot });
+  for (const dir of dirs) {
     const stat = fs.statSync(dir);
     assert.ok(stat.isDirectory(), dir);
     assert.equal(stat.mode & 0o777, 0o311, dir);
@@ -225,8 +235,14 @@ test("ensureListingGuard: создаёт переданные каталоги �
   // а не только без ошибки отработать на уже существующих путях.
   fs.chmodSync(outputs, 0o755);
   fs.chmodSync(uploads, 0o755);
-  await ensureListingGuard({ outputs, uploads });
-  for (const dir of [outputs, uploads]) {
+  fs.chmodSync(scratchRoot, 0o755);
+  await ensureListingGuard({ outputs, uploads, scratchRoot });
+  for (const dir of dirs) {
     assert.equal(fs.statSync(dir).mode & 0o777, 0o311, dir);
   }
+
+  // На корне нет права чтения, но известный путь к собственному файлу остаётся
+  // доступен владельцу: execute-битов на корне и scratch достаточно для прохода.
+  fs.writeFileSync(ownFile, "after");
+  assert.equal(fs.readFileSync(ownFile, "utf8"), "after");
 });

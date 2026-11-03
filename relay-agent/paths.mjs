@@ -116,8 +116,8 @@ export async function ensureSessionDirs(fsKey, { scratchRoot = AGENT_SCRATCH_ROO
 }
 
 // 0311: по имени папки можно зайти, перечислить чужие нельзя. Релей списком не читает.
-export async function ensureListingGuard({ outputs = "/tmp/agent-output", uploads = "/tmp/agent-uploads" } = {}) {
-  for (const d of [outputs, uploads]) {
+export async function ensureListingGuard({ outputs = "/tmp/agent-output", uploads = "/tmp/agent-uploads", scratchRoot = AGENT_SCRATCH_ROOT } = {}) {
+  for (const d of [outputs, uploads, scratchRoot]) {
     await fsp.mkdir(d, { recursive: true });
     await fsp.chmod(d, 0o311);
   }
