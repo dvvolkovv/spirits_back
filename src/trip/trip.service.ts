@@ -7,6 +7,7 @@ import { CalEvent, Task } from '../calendar/calendar.types';
 import { TalerIdCalendarConnector } from '../talerid/talerid-calendar.connector';
 import { DayFramingStore } from '../calendar/day-framing.store';
 import { ChatService } from '../chat/chat.service';
+import { RelaySessionBusyError } from '../chat/relay-session-busy';
 import { activeWindow, buildMorningFacts, buildEveningFacts, framingPrompt, factsHash } from './day-framing';
 
 // Ассистент, чьим "голосом" фреймится день [Ф3, 2026-08-05] — тот же RAYA_ID='14', которым
@@ -397,6 +398,16 @@ export class TripService implements OnModuleInit {
       const action = null; // v1 — см. doc-комментарий выше
       await this.dayFramingStore?.upsert(userId, day, window, text, action, hash);
     } catch (e: any) {
+      // Сессия релея человека занята (ChatService.agentReply без
+      // sessionIdOverride делит её с чатом человека, как и рутины — бэклог
+      // e777aa94) — это НЕ сбой, а ожидаемый итог: человек в приоритете.
+      // Молча пропускаем, строка перегенерируется при следующем запросе
+      // состояния (хеш фактов не сохранён — existing.factsHash выше не
+      // совпадёт).
+      if (e instanceof RelaySessionBusyError) {
+        this.logger.log(`day-framing отложен: сессия занята (${userId}/${window})`);
+        return;
+      }
       this.logger.warn(`day-framing gen failed (${userId}/${window}): ${e?.message}`);
     }
   }
