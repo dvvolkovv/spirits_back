@@ -976,7 +976,7 @@ ${healthSummary}
     ticketId: string,
     dto: { assigneeId: string | null; expectedUpdatedAt: string },
   ): Promise<SupportTicketRow> {
-    if (!dto.expectedUpdatedAt?.trim()) {
+    if (typeof dto.expectedUpdatedAt !== 'string' || !dto.expectedUpdatedAt.trim()) {
       throw new BadRequestException('expectedUpdatedAt required');
     }
 
