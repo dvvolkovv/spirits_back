@@ -28,7 +28,7 @@ import { toActivity } from './activity-map';
 import { ASK_RULE } from './ask-rule';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
-import { LinkeonRelayFields, appendLinkeonFields, linkeonRelayFields } from './linkeon-relay-fields';
+import { LinkeonRelayFields, appendLinkeonFields, linkeonRelayFields, relayFsKey } from './linkeon-relay-fields';
 import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, LINKEON_HELP_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
 import { ProductActionsService } from '../products/product-actions.service';
 import { productActionTail, stripProductActionBlocks } from '../products/product-action-tail';
@@ -270,13 +270,16 @@ export function resolveEmptyFileLinks(
 /** Что ещё уходит релею в ответе ассистента вне чата (agentReply). */
 export interface AgentReplyOpts {
   /**
-   * Инструменты Linkeon (mcp__linkeon__*) от имени userId — токен хода и
-   * папка по fs_key (linkeon-relay-fields.ts). По умолчанию — НЕТ (ревью
-   * 26.10.2026): голосовые фоновые пути (итоги звонка, сжатие консультации,
-   * голосовая заметка и документ) и проба качества ассистента об инструментах
-   * даже не спрашивают, и получать от них токен ни к чему. Явно true — только
-   * там, где ассистент реально может позвать инструмент: рутины, «Путь» и
-   * консультация специалиста в звонке (не её сжатие, voice_condense).
+   * Инструменты Linkeon (mcp__linkeon__*) от имени userId — токен хода и адрес
+   * точки (linkeon-relay-fields.ts). По умолчанию — НЕТ (ревью 26.10.2026):
+   * голосовые фоновые пути (итоги звонка, сжатие консультации, голосовая
+   * заметка и документ) и проба качества ассистента об инструментах даже не
+   * спрашивают, и получать от них токен ни к чему. Явно true — только там, где
+   * ассистент реально может позвать инструмент: рутины, «Путь» и консультация
+   * специалиста в звонке (не её сжатие, voice_condense).
+   *
+   * Папка хода по fs_key от этого флага не зависит: fs_key уходит всегда
+   * (спека 2026-11-02-pii-out-of-prompts-design.md, п. 3).
    */
   linkeonTools?: boolean;
   descriptionOverride?: string;
@@ -2764,7 +2767,16 @@ ${LanguageService.buildDirective(userLanguage)}`;
     if (opts.testMode === true) fd.append('testMode', 'true');
     // Инструменты Linkeon — только когда вызывающий явно сказал linkeonTools:
     // true (см. AgentReplyOpts); по умолчанию — нет.
+    //
+    // fs_key — не инструмент, а имя папки хода, и уходит всегда (спека
+    // 2026-11-02-pii-out-of-prompts-design.md, п. 3): без него релей называет
+    // папку по ключу сессии — у проверки версии ассистента это base64 с
+    // номером админа, — и путь к ней попадает в реплику модели.
     if (opts.linkeonTools === true) appendLinkeonFields(fd, linkeonRelayFields(userId, relaySid));
+    else {
+      const fsKey = relayFsKey(relaySid);
+      if (fsKey) fd.append('fs_key', fsKey);
+    }
     const chunks: string[] = [];
     const usage: SdkUsageTotals = {
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,

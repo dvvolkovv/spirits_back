@@ -389,7 +389,10 @@ export class VpmService implements OnModuleInit {
       'usage.* (chat_calls_7d/30d, active_users_7d) come from the events table, where chat instrumentation ' +
       'started 2026-06-01 — so chat_calls_7d == chat_calls_30d is EXPECTED until 30d of events accrue, not a bug. ' +
       'For real history use funnel.chat_messages_*_real (from custom_chat_history, back to 2026-04). ' +
-      'funnel.* and referral.referral_registrations exclude test numbers (70000000000, 79030169187, 79169403771, 79656445804, 790300xxxxx); ' +
+      // Номера словами, а не цифрами: номер аккаунта — не нейросетям (спека
+      // 2026-11-02-pii-out-of-prompts-design.md, п. 4). Сам фильтр — TEST_USERS
+      // и TEST_PATTERN в запросах выше.
+      'funnel.* and referral.referral_registrations exclude тестовые и служебные аккаунты, включая аккаунт владельца; ' +
       'usage.* still includes them, so usage.active_users_7d may be inflated by the smoke/test accounts. ' +
       'funnel.avg_messages_per_session = avg human messages per session_id (one user×assistant conversation) — ' +
       'session depth of a single visit, distinct from personas.*.avg_messages which is cumulative across all chats; ' +

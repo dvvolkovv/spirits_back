@@ -6,6 +6,7 @@ import { TalerIdNotesConnector } from '../talerid/talerid-notes.connector';
 import { ChatService } from '../chat/chat.service';
 import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
 import { LiveKitClient } from './livekit.client';
+import { voiceDocumentKey } from './voice-document-key';
 import {
   AUTHOR_GUESS_WINDOW_MIN, CONSULT_CHARS_IN_DOC, DOC_GIST_CHARS, DOC_LEAD_CHARS, DOC_TIMEOUT_MS,
   DOCS_BUCKET, DOC_TARGET_CHARS, DocumentResult, findSpecialist, HOST_AGENT_ID, MAX_CONSULT_IN_DOC,
@@ -102,10 +103,17 @@ export class VoiceDocumentService {
    * списки, экранирование).
    */
   private async publish(userId: string, docId: string, title: string, body: string): Promise<string | null> {
+    // Папка — солёный хэш пользователя, а не его идентификатор: ссылка уходит
+    // в промпты (voice-document-key.ts). Без секретов — текстом в ленту.
+    const key = voiceDocumentKey(userId, docId);
+    if (!key) {
+      this.logger.warn(`документ «${title}» не выложен файлом: нет RELAY_FS_SALT/JWT_SECRET для папки`);
+      return null;
+    }
     try {
       return await this.storage.upload({
         bucket: DOCS_BUCKET,
-        key: `documents/${userId}/${docId}.md`,
+        key,
         body: Buffer.from(`# ${title}\n\n${body}`, 'utf8'),
         contentType: 'text/plain; charset=utf-8',
         cacheControl: 'public, max-age=31536000',

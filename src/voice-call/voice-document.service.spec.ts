@@ -1,5 +1,19 @@
 import { VoiceDocumentService } from './voice-document.service';
 import { HOST_AGENT_ID } from './voice-call.types';
+import { relayFsKey } from '../chat/linkeon-relay-fields';
+
+// Папка документа — солёный хэш пользователя (relayFsKey, спека
+// 2026-11-02-pii-out-of-prompts-design.md, п. 2); без секретов его нет.
+const OLD_SECRETS = { salt: process.env.RELAY_FS_SALT, jwt: process.env.JWT_SECRET };
+const putEnv = (k: string, v: string | undefined) => {
+  if (v === undefined) delete process.env[k];
+  else process.env[k] = v;
+};
+beforeAll(() => putEnv('RELAY_FS_SALT', 'voice-document-spec'));
+afterAll(() => {
+  putEnv('RELAY_FS_SALT', OLD_SECRETS.salt);
+  putEnv('JWT_SECRET', OLD_SECRETS.jwt);
+});
 
 /** Сам документ среди строк чата: ai-строка с markdown-заголовком. */
 const docRow = (history: any[]) => history.find((h) => h.sender_type === 'ai' && String(h.content).startsWith('##'));
@@ -312,7 +326,7 @@ describe('документ доступен по ссылке', () => {
     await svc.drainForTests();
 
     expect(storage.uploads).toHaveLength(1);
-    expect(storage.uploads[0].key).toMatch(/^documents\/user-1\/.+\.md$/);
+    expect(storage.uploads[0].key).toMatch(/^documents\/[0-9a-f]{32}\/.+\.md$/);
     // text/plain, иначе браузер предложит скачать вместо показа.
     expect(storage.uploads[0].contentType).toBe('text/plain; charset=utf-8');
     expect(storage.uploads[0].body).toContain('# Тарифы');
@@ -320,6 +334,80 @@ describe('документ доступен по ссылке', () => {
     const content = docRow(pg.history).content;
     expect(content).toContain('[Открыть документ полностью](https://');
     expect(content.length).toBeLessThan(LONG.length);
+  });
+
+  // Спека 2026-11-02-pii-out-of-prompts-design.md, п. 2: ключ был
+  // documents/<id>/<docId>.md, у телефонных пользователей — с номером, и
+  // ссылка из чата уходила в промпты (хвост истории, план действий, итоги).
+  it('ключ файла — documents/<солёный хэш пользователя>/<docId>.md, без идентификатора', async () => {
+    const storage = makeStorage();
+    const svc = new VoiceDocumentService(
+      makePg() as any,
+      { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'тело', tokens: 5, costUsd: 0 })) } as any,
+      { send: jest.fn(async () => {}) } as any,
+      storage as any,
+      makeLang() as any,
+    );
+
+    const res = await svc.create(CALL, ROOM, '70000000000', 'Тарифы', '');
+    await svc.drainForTests();
+
+    expect(res.status).toBe('accepted');
+    const docId = (res as any).docId;
+    expect(storage.uploads[0].key).toBe(`documents/${relayFsKey('70000000000')}/${docId}.md`);
+    expect(storage.uploads[0].key).not.toContain('70000000000');
+  });
+
+  it('ссылка в чате и у Романа — без идентификатора пользователя', async () => {
+    const pg = makePg();
+    const lk = { send: jest.fn(async () => {}) };
+    const svc = new VoiceDocumentService(
+      pg as any,
+      { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'тело', tokens: 5, costUsd: 0 })) } as any,
+      lk as any,
+      makeStorage() as any,
+      makeLang() as any,
+    );
+
+    await svc.create(CALL, ROOM, '70000000000', 'Тарифы', '');
+    await svc.drainForTests();
+
+    const content = docRow(pg.history).content;
+    expect(content).toContain(`/documents/${relayFsKey('70000000000')}/`);
+    expect(content).not.toContain('70000000000');
+    const ready = lk.send.mock.calls.map((c: any[]) => c[1]).find((m: any) => m.type === 'document_ready');
+    expect(ready.url).toContain(`/documents/${relayFsKey('70000000000')}/`);
+    expect(ready.url).not.toContain('70000000000');
+  });
+
+  // Без соли папки без номера не сделать, а фиктивная защита хуже честного
+  // отсутствия (как у relayFsKey): документ ложится в чат текстом целиком.
+  it('без секретов для солёного хэша файл не выкладывается — документ в ленте целиком', async () => {
+    const pg = makePg();
+    const storage = makeStorage();
+    const svc = new VoiceDocumentService(
+      pg as any,
+      { generateAgentReplyWithCharge: jest.fn(async () => ({ text: LONG, tokens: 700, costUsd: 0.2 })) } as any,
+      { send: jest.fn(async () => {}) } as any,
+      storage as any,
+      makeLang() as any,
+    );
+    putEnv('RELAY_FS_SALT', undefined);
+    putEnv('JWT_SECRET', undefined);
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      await svc.create(CALL, ROOM, '70000000000', 'Тарифы', '');
+      await svc.drainForTests();
+    } finally {
+      warn.mockRestore();
+      putEnv('RELAY_FS_SALT', 'voice-document-spec');
+      putEnv('JWT_SECRET', OLD_SECRETS.jwt);
+    }
+
+    expect(storage.upload).not.toHaveBeenCalled();
+    const content = docRow(pg.history).content;
+    expect(content).toContain(LONG.trim().slice(0, 40));
+    expect(content).not.toContain('Открыть документ');
   });
 
   it('короткий документ не режется', async () => {

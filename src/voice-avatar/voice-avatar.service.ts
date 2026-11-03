@@ -5,6 +5,7 @@ import * as path from 'path';
 import { spawn } from 'child_process';
 import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
+import { cloneVoiceName } from './voice-name';
 
 /**
  * Видео «голосом оригинала» (backlog 96cba3f7).
@@ -247,7 +248,8 @@ export class VoiceAvatarService implements OnModuleInit {
     if (!this.pg) return;
     try {
       const descriptor = await this.profile(mp3);
-      const voiceId = await this.clone(mp3, `user_${userId}`);
+      // Имя — без id пользователя (voice-name.ts); связь — по voice_id ниже.
+      const voiceId = await this.clone(mp3, cloneVoiceName());
       await this.pg.query(
         `UPDATE user_voice
             SET status='ready', elevenlabs_voice_id=$2, voice_descriptor=$3,
