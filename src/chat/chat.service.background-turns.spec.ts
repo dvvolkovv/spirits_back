@@ -88,6 +88,13 @@ function bgTurn(svc: ChatService, message = 'рутина', userId = 'u1', assis
   const up = new Readable({ read() {} });
   queue.push(up);
   const call = svc.generateAgentReply(userId, assistantId, message);
+  // Заглушка-перехватчик СРАЗУ: тест часто пропускает call через settle()
+  // до настоящей проверки (await expect(call).rejects…), а между отказом
+  // (RelaySessionBusyError) и этой проверкой промис иначе висит отклонённым
+  // без обработчика — Node помечает это unhandledRejection раньше, чем
+  // дойдёт настоящая проверка. Два обработчика на одном промисе — это ОК,
+  // настоящая проверка ниже видит тот же исход.
+  call.catch(() => {});
   return { up, call };
 }
 
@@ -307,6 +314,11 @@ describe('гонка: проверка занятости и openMark разде
 
     const callA = svc.generateAgentReply('u1', '14', 'рутина A');
     const callB = svc.generateAgentReply('u1', '14', 'рутина B');
+    // См. комментарий в bgTurn: подавляем unhandledRejection до настоящей
+    // проверки через Promise.allSettled ниже — один из двух отклонится
+    // раньше, чем мы туда дойдём (settle() между гонкой и проверкой).
+    callA.catch(() => {});
+    callB.catch(() => {});
     await settle();
     // Оба дошли до одной и той же точки (await route()), не увидев друг
     // друга: ни один пока не поставил метку — RACE1 воспроизведён.
