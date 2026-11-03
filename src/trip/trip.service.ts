@@ -405,7 +405,10 @@ export class TripService implements OnModuleInit {
       // состояния (хеш фактов не сохранён — existing.factsHash выше не
       // совпадёт).
       if (e instanceof RelaySessionBusyError) {
-        this.logger.log(`day-framing отложен: сессия занята (${userId}/${window})`);
+        // Без userId: журнал — без номеров (у старых аккаунтов userId —
+        // телефон), ревью 03.11 п.2. logger.warn ниже — старая строка
+        // (предшествует бэклогу e777aa94), её не трогаем.
+        this.logger.log(`day-framing отложен: сессия занята (${window})`);
         return;
       }
       this.logger.warn(`day-framing gen failed (${userId}/${window}): ${e?.message}`);
