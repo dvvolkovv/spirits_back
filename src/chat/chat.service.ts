@@ -2911,6 +2911,34 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const userLanguage = opts.testMode === true
       ? LanguageService.normalize(opts.testLanguage)
       : await this.language.resolveUserLanguage(userId);
+
+    // sessionIdOverride — для синтетических проб: изолированная сессия, чтобы не
+    // коллидить с реальной сессией юзера/другими пробами (r.linkeon отдаёт пустой
+    // поток при конкурентном обращении к ЗАНЯТОЙ сессии — инцидент 2026-07-12).
+    // Язык в ключе сессии — по той же причине, что в основном пути: релей
+    // резюмит прежний разговор, и накопленный русский перевешивает промпт.
+    // "" — как и undefined, значит «своей сессии нет» (!sessionIdOverride,
+    // не === undefined): пустая строка — не отдельный валидный ключ.
+    const sharesHumanSession = !sessionIdOverride;
+    const relaySid = sessionIdOverride || relaySessionKey(userId, assistantId, userLanguage);
+    // Фоновый ход (sharesHumanSession) делит сессию релея с чатом человека.
+    // РАННЯЯ проверка — сразу как только relaySid известен, ДО Neo4j и
+    // бизнес-профиля ниже: если сессия уже занята, незачем ходить в них
+    // впустую («Путь» зовётся на каждый запрос состояния лаунчера). Это
+    // ТОЛЬКО оптимизация общего случая, а НЕ гарантия от гонки — между этой
+    // строкой и финальной проверкой прямо перед beginStream/openMark (ближе
+    // к концу метода) проходит несколько await (Neo4j, бизнес-профиль,
+    // resolveAnswerProvider), и за это время сессию мог занять кто-то другой.
+    // Гонку закрывает именно финальная проверка (ревью 03.11, подтверждено
+    // пробами): до него между проверкой занятости и openMark был разрыв
+    // ровно на await resolveAnswerProvider — в это окно проходили оба
+    // конкурента (два фоновых хода одной сессии, RACE1) или фоновый
+    // ход уходил в релей поверх начавшегося хода человека (RACE2).
+    if (sharesHumanSession && (this.relayRunning.has(relaySid) || this.backgroundRunning.has(relaySid))) {
+      this.logger.log(`фоновый ход отложен: сессия занята (assistant ${assistantId})`);
+      throw new RelaySessionBusyError();
+    }
+
     const agentDescription = opts.descriptionOverride !== undefined
       ? opts.descriptionOverride
       : agent.description;
@@ -2968,25 +2996,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const outboundStablePrefix = opts.testMode === true ? neutralizeAtMentions(stablePrefix) : stablePrefix;
     fd.append('message', outboundPrompt);
     if (outboundStablePrefix) fd.append('systemPrompt', outboundStablePrefix);
-    // sessionIdOverride — для синтетических проб: изолированная сессия, чтобы не
-    // коллидить с реальной сессией юзера/другими пробами (r.linkeon отдаёт пустой
-    // поток при конкурентном обращении к ЗАНЯТОЙ сессии — инцидент 2026-07-12).
-    // Язык в ключе сессии — по той же причине, что в основном пути: релей
-    // резюмит прежний разговор, и накопленный русский перевешивает промпт.
-    const relaySid = sessionIdOverride ||
-      relaySessionKey(userId, assistantId, userLanguage);
-    // Фоновый ход (sessionIdOverride не задан — рутины, «Путь») делит сессию
-    // релея с чатом человека (relaySessionKey — та же формула, что в основном
-    // пути). Если в этой сессии уже идёт ход человека (relayRunning) или
-    // другой фоновый ход (backgroundRunning) — релей не зовём вовсе: иначе он
-    // пре-эмптит процесс сессии, и фоновый ход оборвал бы живую работу
-    // человека (бэклог e777aa94). Эфемерные сессии (sessionIdOverride задан)
-    // своей сессии ни с кем не делят — под эту проверку не попадают.
-    const sharesHumanSession = sessionIdOverride === undefined;
-    if (sharesHumanSession && (this.relayRunning.has(relaySid) || this.backgroundRunning.has(relaySid))) {
-      this.logger.log(`фоновый ход отложен: сессия занята (assistant ${assistantId})`);
-      throw new RelaySessionBusyError();
-    }
+    // relaySid/sharesHumanSession — уже посчитаны выше (сразу после
+    // userLanguage, вместе с ранней проверкой занятости).
     fd.append('sessionId', relaySid);
     // Модель ответов: личный выбор этого человека или общий рубильник (spec
     // 2026-10-31-global-llm-switch, раздел 4) — рутины, «Путь», план действий,
@@ -3018,6 +3029,16 @@ ${LanguageService.buildDirective(userLanguage)}`;
     let costUsd = 0;
     let turnFailed = false;
     const turnCost = new RelayTurnCost();
+    // Финальная проверка занятости — ВПЛОТНУЮ к beginStream/openMark ниже,
+    // без await между ними (ревью 03.11, см. комментарий у ранней проверки
+    // выше): это и закрывает гонку. Повтор той же проверки — не лишний: она
+    // синхронна, а между ранней и этой точкой прошло несколько await
+    // (Neo4j, бизнес-профиль, resolveAnswerProvider), за которые сессию мог
+    // занять кто-то другой.
+    if (sharesHumanSession && (this.relayRunning.has(relaySid) || this.backgroundRunning.has(relaySid))) {
+      this.logger.log(`фоновый ход отложен: сессия занята (assistant ${assistantId})`);
+      throw new RelaySessionBusyError();
+    }
     // activeStreams — чтобы deploy.sh дождался и этого хода, не только
     // текстового чата (до 2026-11-03 agentReply в счётчик не попадал вовсе —
     // рестарт мог оборвать рутину или «Путь» посреди запроса к релею).
@@ -3026,9 +3047,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // и closeMark ниже просто не вызывается — своей метки нет и не нужна.
     this.beginStream();
     const bgMark = sharesHumanSession ? this.openMark(this.backgroundRunning, relaySid) : null;
-    let resp;
     try {
-      resp = await axios.post(`${AGENT_URL}/chat`, fd, {
+      const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
         headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
         responseType: 'stream',
         timeout: 300000,
