@@ -21,6 +21,7 @@ import { NameGate, addressedByName } from './name-gate.js';
 import { Occupancy, MEET_EMPTY_GRACE_MS } from './occupancy.js';
 import { SpeakerLedger } from './speaker-ledger.js';
 import { Presence } from './presence.js';
+import { Roster } from './roster.js';
 import { MixedRoomAudioInput } from './mixed-audio-input.js';
 import { meetingInputOptions, realtimeTurnDetection } from './session-options.js';
 import { ExternalRoomAudioOutput } from './external-room-output.js';
@@ -191,9 +192,16 @@ export default defineAgent({
      * Исключаем себя: бот Attendee сидит в встрече полноправным участником и
      * приходит в join_leave наравне с людьми.
      */
-    const presence = isBridged
-      ? new Presence(`${agentName} · ассистент ${meta.ownerName || 'пользователя'}`)
-      : null;
+    const selfName = `${agentName} · ассистент ${meta.ownerName || 'пользователя'}`;
+    const presence = isBridged ? new Presence(selfName) : null;
+
+    /**
+     * Кто был на встрече — уходит на бэкенд вместе с транскриптом
+     * (voice_calls.participants). В отличие от presence не забывает вышедших.
+     * Своего бота исключаем только на чужой площадке: в комнатах LiveKit
+     * ассистент локальный и в remoteParticipants не попадает.
+     */
+    const roster = isMeeting ? new Roster(isBridged ? selfName : undefined) : null;
 
     /**
      * Раздать состав тем, кто на него опирается.
@@ -326,6 +334,7 @@ export default defineAgent({
           else occupancy?.left(msg.uuid);
           syncFromPresence();
           if (msg.event === 'join') {
+            roster?.seen(msg.name, Date.now());
             sawHuman = true;
             // Отметка «встреча началась». Без неё voice_calls.status навсегда
             // остаётся dialing и запирает пользователю следующий вход до
@@ -342,6 +351,7 @@ export default defineAgent({
             // составе. Возвращаем человека и в правила выхода: без этого
             // выдержка лишь отложила бы выход из живой встречи.
             sawHuman = true;
+            roster?.seen(msg.name, Date.now());
             occupancy?.joined(msg.uuid);
             syncFromPresence();
           }
@@ -1498,7 +1508,7 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
     const progressFlush = setInterval(() => {
       if (sent || transcript.length === 0) return;
       void backend
-        .progress(meta.callId, transcript)
+        .progress(meta.callId, transcript, roster?.list)
         .catch((e) => console.error('progress flush не отправлен', e));
     }, 15_000);
     progressFlush.unref?.();
@@ -1519,6 +1529,7 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
             model,
           },
           { disconnect: userDisconnect, close: closeReason },
+          roster?.list,
         );
         console.log(`complete отправлен (${why}), реплик: ${transcript.length}`);
       } catch (e) {
@@ -1548,7 +1559,10 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
         // Считаем участников ТОЙ комнаты, где идёт разговор: в своей при чужой
         // встрече никого нет и не будет, и ассистент вышел бы сразу.
         const stage = foreign ?? ctx.room;
-        for (const identity of stage.remoteParticipants.keys()) occupancy.joined(identity);
+        for (const [identity, p] of stage.remoteParticipants) {
+          occupancy.joined(identity);
+          roster?.seen(p.name || identity, Date.now());
+        }
 
         /**
          * Наедине ассистент отвечает без имени.
@@ -1573,6 +1587,7 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
 
         stage.on(RoomEvent.ParticipantConnected, (p: any) => {
           occupancy.joined(p.identity);
+          roster?.seen(p.name || p.identity, Date.now());
           syncSolo();
           void backend.meetingFirstHuman(meta.callId).catch(() => {
             // Отметка «встреча началась» — учётная, ради неё встречу не рвём.
