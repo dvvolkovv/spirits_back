@@ -43,7 +43,7 @@ function makeWorld(opts: { failRollback?: boolean; failUpdate?: Error } = {}) {
     release: jest.fn(),
   };
   const pg = {
-    query: jest.fn(async () => ({
+    query: jest.fn(async (sql: string, params?: any[]) => ({
       rows: [
         { user_id: 'admin-a', name: 'Alice' },
         { user_id: 'admin-b', name: 'Bob' },
@@ -154,6 +154,25 @@ describe('support assignment', () => {
       expect(w.calls).toHaveLength(0);
     },
   );
+
+  it('rejects a malformed expectedUpdatedAt without touching the database', async () => {
+    const w = makeWorld();
+
+    await expect(w.service.assign(ACTOR_ID, TICKET_ID, {
+      assigneeId: null, expectedUpdatedAt: 'not-a-date',
+    })).rejects.toBeInstanceOf(BadRequestException);
+    expect(w.pg.getClient).not.toHaveBeenCalled();
+    expect(w.calls).toHaveLength(0);
+  });
+
+  it('rejects a null DTO without touching the database', async () => {
+    const w = makeWorld();
+
+    await expect(w.service.assign(ACTOR_ID, TICKET_ID, null as any))
+      .rejects.toBeInstanceOf(BadRequestException);
+    expect(w.pg.getClient).not.toHaveBeenCalled();
+    expect(w.calls).toHaveLength(0);
+  });
 
   it('returns 404 for a missing ticket', async () => {
     const w = makeWorld();
