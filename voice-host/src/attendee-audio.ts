@@ -3,6 +3,7 @@ import { AudioFrame } from '@livekit/rtc-node';
 import { ReadableStream } from 'node:stream/web';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { Mixer, TICK_MS } from './mixer.js';
+import { memoryNote } from './memory-note.js';
 
 /**
  * Звук встречи на площадке без LiveKit — через вебсокет Attendee.
@@ -456,7 +457,7 @@ export class AttendeeAudioInput extends voice.AudioInput {
         const behind = this.queue ? Math.max(0, -(this.queue.desiredSize ?? 0)) : 0;
         console.log(
           `[вход] тиков: ${this.ticks}, кусков от Attendee: ${this.framesIn}, ` +
-            `забрала сессия: ${this.framesTaken}, очередь к модели: ${behind}`,
+            `забрала сессия: ${this.framesTaken}, очередь к модели: ${behind}, ${memoryNote()}`,
         );
       }
     }, TICK_MS);
