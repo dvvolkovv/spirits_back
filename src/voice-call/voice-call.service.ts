@@ -133,6 +133,7 @@ export class VoiceCallService implements OnModuleInit {
   private static readonly MIGRATIONS = [
     '003_voice_call_origin.sql',
     '004_voice_call_end_reason.sql',
+    '005_voice_call_participants.sql',
   ];
 
   async onModuleInit(): Promise<void> {
