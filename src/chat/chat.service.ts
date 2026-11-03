@@ -26,6 +26,7 @@ import { colleaguesRule } from './colleagues-rule';
 import { customAssistantHelpLine, platformGuide, TOOLS_LIST_NOTE } from './platform-guide';
 import { clientKind } from './client-kind';
 import { ClientUi, NO_CLIENT_UI } from './client-ui';
+import { ClientPing, startClientPing } from './client-ping';
 import { toActivity } from './activity-map';
 import { ASK_RULE } from './ask-rule';
 import { WORK_RULES } from './work-rules';
@@ -1687,11 +1688,16 @@ ${LanguageService.buildDirective(userLanguage)}`;
       });
     }
 
+    // Пинг клиенту на долгом ходе (client-ping.ts): заводится после `begin`,
+    // а тишину отсчитывает каждая строка, ушедшая клиенту через safeWrite.
+    let clientPing: ClientPing | null = null;
+
     // Safe res.write — drops writes after client disconnect, never throws upward.
     const safeWrite = (payload: any) => {
       if (clientDisconnected) return;
       try {
         res.write(JSON.stringify(payload) + '\n');
+        clientPing?.touch();
       } catch {
         clientDisconnected = true;
       }
@@ -1873,15 +1879,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
     safeWrite({ type: 'begin' });
 
-    // Heartbeat: send a no-op ping every 25s while r.linkeon.io is silent (long tool-runs)
-    // to prevent nginx idle-timeout (proxy_read_timeout) from killing the connection.
-    let lastDataAt = Date.now();
-    const heartbeat = setInterval(() => {
-      if (Date.now() - lastDataAt > 20000) {
-        // Frontend ChatInterface ignores unknown types — safely no-op on client.
-        safeWrite({ type: 'ping' });
-      }
-    }, 25000);
+    // Пинг, пока клиенту долго ничего не уходит: держит соединение через nginx
+    // (proxy_read_timeout) и клиентов с таймаутом ожидания строки — Flutter,
+    // внешние сервисы. Веб и Flutter незнакомый тип пропускают.
+    clientPing = startClientPing(() => {
+      if (!res.writableEnded) safeWrite({ type: 'ping' });
+    });
 
     const streamStartTime = Date.now();
     const chunks: string[] = []; // hoisted so catch block can access partial response
@@ -2248,7 +2251,6 @@ ${LanguageService.buildDirective(userLanguage)}`;
           let buffer = '';
           agentRes.data.on('data', (chunk: Buffer) => {
             try {
-              lastDataAt = Date.now();
               buffer += chunk.toString();
               const lines = buffer.split('\n');
               buffer = lines.pop() || '';
@@ -2709,7 +2711,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     } finally {
       this.activeStreams--;
       if (turnMark !== null) this.closeTurn(`${userId}_${assistantId}`, turnMark);
-      clearInterval(heartbeat);
+      clientPing?.stop();
     }
   }
 
