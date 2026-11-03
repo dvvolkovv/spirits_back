@@ -225,6 +225,28 @@ maybe('support SLA migration against PostgreSQL', () => {
     expect(events.rows).toHaveLength(1);
   });
 
+  it('rejects assignment of a resolved ticket without reopening it', async () => {
+    const created = await pool.query(
+      `INSERT INTO support_tickets (user_id, status) VALUES ('resolved-assignment-user', 'resolved')
+       RETURNING id, updated_at`,
+    );
+    const { id } = created.rows[0];
+    const service = new SupportService({
+      query: pool.query.bind(pool), getClient: () => pool.connect(),
+    } as any);
+
+    await expect(service.assign('actor-a', id, {
+      assigneeId: 'admin-a', expectedUpdatedAt: created.rows[0].updated_at.toISOString(),
+    })).rejects.toMatchObject({ response: { status: 400 } });
+
+    const stored = await pool.query('SELECT status, assigned_to FROM support_tickets WHERE id = $1', [id]);
+    expect(stored.rows[0]).toEqual({ status: 'resolved', assigned_to: null });
+    const events = await pool.query(
+      "SELECT id FROM support_events WHERE ticket_id = $1 AND action = 'assignment'", [id],
+    );
+    expect(events.rows).toHaveLength(0);
+  });
+
   function makeService(pg: any = {
     query: pool.query.bind(pool), getClient: () => pool.connect(),
   }): SupportService {
@@ -385,10 +407,11 @@ maybe('support SLA migration against PostgreSQL', () => {
     );
     const newNormal = await queueTicket('normal', 'ai_handling', 'admin-a', null);
     const newLow = await queueTicket('low', 'escalated', 'admin-b', null);
+    const resolvedOverdue = await queueTicket('critical', 'resolved', null, new Date(Date.now() - 240_000));
 
     const all = await service.adminListTickets({ status: 'all', limit: 50 });
     expect(all.map((t) => t.id)).toEqual([
-      overdueCritical, overdueLow, soonCritical, soonLow, repliedCritical, newNormal, newLow,
+      overdueCritical, overdueLow, soonCritical, soonLow, repliedCritical, newNormal, newLow, resolvedOverdue,
     ]);
     expect(all[0]).toMatchObject({
       assignedTo: 'admin-a', assignedName: 'Alice', firstOwnerReplyAt: null,
