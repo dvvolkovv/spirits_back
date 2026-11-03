@@ -396,3 +396,59 @@ describe('гонка: проверка занятости и openMark разде
     await expect(second.call).resolves.toBe('ответ');
   });
 });
+
+describe('generateAgentReplyOutcome — исход целиком (text/failed/failReason), для RoutinePushService', () => {
+  // generateAgentReply прячет обрывок прерванного хода (отдаёт ''), и этого
+  // достаточно большинству вызывающих. RoutinePushService — нет: ему нужно
+  // РАЗЛИЧИТЬ причину (preempted — человек перебил ход, день возвращаем;
+  // прочее — не возвращаем, см. спеку §1 и ревью 03.11). generateAgentReply
+  // и generateAgentReplyWithCharge своё поведение не меняют.
+  it('done.failed с failReason — отдаёт text/failed/failReason как есть', async () => {
+    const svc = makeService();
+    const up = new Readable({ read() {} });
+    queue.push(up);
+    const call = svc.generateAgentReplyOutcome('u1', '14', 'рутина');
+    await settle();
+    up.push(DELTA);
+    up.push('data: ' + JSON.stringify({ type: 'done', failed: true, failReason: 'transient_after_write' }) + '\n');
+    up.push(null);
+    const result = await call;
+    expect(result).toEqual({ text: 'ответ', failed: true, failReason: 'transient_after_write' });
+  });
+
+  it('done.failed БЕЗ failReason-строки — failReason: "unknown" (как в остальном chat.service.ts)', async () => {
+    const svc = makeService();
+    const up = new Readable({ read() {} });
+    queue.push(up);
+    const call = svc.generateAgentReplyOutcome('u1', '14', 'рутина');
+    await settle();
+    up.push(DELTA);
+    up.push('data: ' + JSON.stringify({ type: 'done', failed: true }) + '\n');
+    up.push(null);
+    const result = await call;
+    expect(result.failed).toBe(true);
+    expect(result.failReason).toBe('unknown');
+  });
+
+  it('успешный ход — failed:false, failReason не задан', async () => {
+    const svc = makeService();
+    const up = new Readable({ read() {} });
+    queue.push(up);
+    const call = svc.generateAgentReplyOutcome('u1', '14', 'рутина');
+    await settle();
+    up.push(DELTA); up.push(DONE); up.push(null);
+    const result = await call;
+    expect(result).toEqual({ text: 'ответ', failed: false, failReason: undefined });
+  });
+
+  it('busy — бросает RelaySessionBusyError так же, как generateAgentReply', async () => {
+    const svc = makeService();
+    const sid = relaySessionKey('u1', '14', 'ru');
+    const mark = svc.beginRelayRun(sid);
+    try {
+      await expect(svc.generateAgentReplyOutcome('u1', '14', 'рутина')).rejects.toThrow(RelaySessionBusyError);
+    } finally {
+      svc.endRelayRun(sid, mark);
+    }
+  });
+});
