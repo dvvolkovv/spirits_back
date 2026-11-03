@@ -66,6 +66,7 @@ maybe('support SLA migration against PostgreSQL', () => {
       CREATE TABLE ai_profiles_consolidated (
         user_id text PRIMARY KEY,
         profile_data jsonb NOT NULL DEFAULT '{}',
+        tokens bigint NOT NULL DEFAULT 0,
         isadmin boolean NOT NULL DEFAULT false
       );
       CREATE TABLE user_id (
