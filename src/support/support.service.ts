@@ -61,6 +61,7 @@ export class SupportService implements OnModuleInit {
     } catch (e: any) {
       await client.query('ROLLBACK').catch(() => undefined);
       this.logger.error(`support migration failed: ${e.message}`);
+      throw e;
     } finally {
       client.release();
     }
