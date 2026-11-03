@@ -70,6 +70,15 @@
 - [ ] **Step 3: реализация.** В `deliver` различать исходы: вернуть объект `{ delivered: number; busy?: boolean; failed?: boolean }` (или бросать `RelaySessionBusyError` наверх — как удобнее), `runDue` до `claimToday` запоминает `prev = r.last_sent_date`, при `busy`/`failed` — `releaseToday`; лог без текста рутины: `routine "${title}" отложена: занята сессия / сбой генерации (user ${userId}, assistant ${assistantId})`. `fireNow` возвращает признаки, контроллер — `res.json({ ok: true, delivered, busy, failed })`. Сводка в TG «Рутинные пуши разосланы: N» — считать только реально доставленные.
 - [ ] **Step 4: прогон** `src/routine-push` + tsc — PASS. Коммит.
 
+> **Правка ревью 03.11** (решение контролёра, см. спеку §1 п.4): releaseToday
+> вызывается ТОЛЬКО при `busy` или `failReason === 'preempted'` — не при
+> любом `failed`. Чтобы различить причину, `deliver` зовёт новый
+> `ChatService.generateAgentReplyOutcome` (не `generateAgentReply`) —
+> отдаёт `{ text, failed, failReason }` целиком. `DeliverResult` получил
+> поле `failReason?: string`. Лог «отложена» — `routine ${id}` (её uuid),
+> без `user_id` (у старых аккаунтов это телефон) и без заголовка рутины —
+> не `user ${userId}`, как было в первой редакции этого шага выше.
+
 ### Task Б3: «Путь» — пропуск при занятой сессии
 
 **Files:** Modify `src/trip/trip.service.ts` (`generateFramingAsync`); Test — спек `generateFramingAsync` (`ls src/trip/*.spec.ts`).
