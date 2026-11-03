@@ -130,6 +130,23 @@ describe('фоновый ход (agentReply без sessionIdOverride) и зан�
     }
   });
 
+  it('sessionIdOverride === "" (пустая строка) — тоже «своей сессии нет», занятость проверяется', async () => {
+    // relaySid = sessionIdOverride || relaySessionKey(...) — пустая строка
+    // падает в тот же || fallback, что и undefined. sharesHumanSession
+    // обязана видеть это так же (!sessionIdOverride, повторное ревью 03.11),
+    // иначе пустая строка подделывала бы «эфемерную» сессию, совпадающую с
+    // реальной сессией человека.
+    const svc = makeService();
+    const sid = relaySessionKey('u1', '14', 'ru');
+    const mark = svc.beginRelayRun(sid);
+    try {
+      await expect(svc.generateAgentReply('u1', '14', 'x', '')).rejects.toThrow(RelaySessionBusyError);
+      expect(post).not.toHaveBeenCalled();
+    } finally {
+      svc.endRelayRun(sid, mark);
+    }
+  });
+
   it('идёт другой фоновый ход этой сессии — второй фоновый ход тоже бросает RelaySessionBusyError', async () => {
     const svc = makeService();
     const first = bgTurn(svc, 'рутина 1');
