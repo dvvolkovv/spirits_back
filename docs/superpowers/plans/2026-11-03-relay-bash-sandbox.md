@@ -150,12 +150,12 @@ test('канарейка: только сессии из файла списка
   const modeFile = path.join(dir, 'mode');
   const keysFile = path.join(dir, 'canary-keys');
   fs.writeFileSync(modeFile, 'canary\n');
-  fs.writeFileSync(keysFile, '79030169187_14_ru\n79030169187_10_en\n');
-  assert.equal(isCanarySession('79030169187_14_ru', 'canary', keysFile), true);
+  fs.writeFileSync(keysFile, '79030001111_14_ru\n79030001111_10_en\n');
+  assert.equal(isCanarySession('79030001111_14_ru', 'canary', keysFile), true);
   assert.equal(isCanarySession('79990001122_1_ru', 'canary', keysFile), false);
-  assert.equal(isCanarySession('79030169187_14_ru', 'on', keysFile), true);
+  assert.equal(isCanarySession('79030001111_14_ru', 'on', keysFile), true);
   assert.equal(isCanarySession('79990001122_1_ru', 'on', keysFile), true);
-  assert.equal(isCanarySession('79030169187_14_ru', 'off', keysFile), false);
+  assert.equal(isCanarySession('79030001111_14_ru', 'off', keysFile), false);
 });
 
 test('настройки: своя папка на запись, домашний каталог и mcp на запрет чтения', () => {
