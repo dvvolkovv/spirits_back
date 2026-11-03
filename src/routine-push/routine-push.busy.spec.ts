@@ -117,6 +117,36 @@ describe('RoutinePushService.runDue — перенос при занятой с�
     expect(push.sendPush).not.toHaveBeenCalled();
   });
 
+  it('preempted — внутренний лог deliver() «empty text» идёт через log(), не warn() (ожидаемый исход)', async () => {
+    const push = { sendPush: jest.fn(async () => 1) };
+    const chat = { generateAgentReplyOutcome: jest.fn(async () => failed('preempted', 'обрывок')) };
+    const rows = [row({ last_sent_date: null })];
+    const store = makeStore({ listEnabled: jest.fn(async () => rows) });
+    const pg = { query: jest.fn(async () => ({ rows: [] })) };
+    const svc = new RoutinePushService(pg as any, push as any, chat as any, store as any);
+    const warnSpy = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+    const logSpy = jest.spyOn((svc as any).logger, 'log').mockImplementation(() => undefined);
+
+    await svc.runDue();
+
+    expect(warnSpy.mock.calls.some((c) => String(c[0]).includes('empty text'))).toBe(false);
+    expect(logSpy.mock.calls.some((c) => String(c[0]).includes('empty text'))).toBe(true);
+  });
+
+  it('прочий (не preempted) сбой — внутренний лог deliver() «empty text» остаётся warn()', async () => {
+    const push = { sendPush: jest.fn(async () => 1) };
+    const chat = { generateAgentReplyOutcome: jest.fn(async () => failed('max_turns')) };
+    const rows = [row({ last_sent_date: null })];
+    const store = makeStore({ listEnabled: jest.fn(async () => rows) });
+    const pg = { query: jest.fn(async () => ({ rows: [] })) };
+    const svc = new RoutinePushService(pg as any, push as any, chat as any, store as any);
+    const warnSpy = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+
+    await svc.runDue();
+
+    expect(warnSpy.mock.calls.some((c) => String(c[0]).includes('empty text'))).toBe(true);
+  });
+
   it.each(['transient_after_write', 'max_turns', 'cli_fatal'])(
     'failReason: %s — день НЕ возвращаем, повтора нет, пуша нет',
     async (reason) => {
