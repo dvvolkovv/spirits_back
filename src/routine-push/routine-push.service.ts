@@ -14,8 +14,16 @@ export interface DeliverResult {
   delivered: number;
   /** Сессия релея человека (или другой рутины) занята — попробуем через час. */
   busy?: boolean;
-  /** Генерация не вернула текст (сбойный, в т.ч. прерванный, ход) — тоже через час. */
+  /** Генерация не вернула текст (сбойный, в т.ч. перебитый, ход) — пуш не ушёл. */
   failed?: boolean;
+  /**
+   * done.failReason, когда failed. Только 'preempted' (человек перебил ход
+   * на релее) возвращает день на повтор — сессия освободится в течение
+   * часа; прочее (transient_after_write, max_turns, cli_fatal и т.п.) —
+   * часовой повтор не поможет, день съеден, как и у looksLikeFailure
+   * (ревью 03.11, п.3). См. решение в runDue.
+   */
+  failReason?: string;
 }
 
 const RAYA_ID = '14';
@@ -91,11 +99,13 @@ export class RoutinePushService implements OnModuleInit {
 
   // ── Доставка одной рутины ────────────────────────────────────────────────────
   private async deliver(userId: string, assistantId: string, prompt: string, title?: string): Promise<DeliverResult> {
-    let text: string;
+    let outcome: { text: string; failed: boolean; failReason?: string };
     try {
       // Рутина — путь, где ассистент реально может позвать инструмент Linkeon
       // (картинка, рутина, календарь): AgentReplyOpts.linkeonTools — явно true.
-      text = await this.chat.generateAgentReply(userId, assistantId, prompt, undefined, { linkeonTools: true });
+      // generateAgentReplyOutcome (не generateAgentReply) — нужен failReason:
+      // runDue возвращает день на повтор только при 'preempted', см. там.
+      outcome = await this.chat.generateAgentReplyOutcome(userId, assistantId, prompt, undefined, { linkeonTools: true });
     } catch (e) {
       // Сессия релея человека (или другой рутины) занята прямо сейчас —
       // человек в приоритете, рутину не шлём вовсе (бэклог e777aa94).
@@ -103,18 +113,29 @@ export class RoutinePushService implements OnModuleInit {
       if (e instanceof RelaySessionBusyError) return { delivered: 0, busy: true };
       throw e;
     }
-    if (!text || !text.trim()) {
-      this.logger.warn(`routine deliver: empty text for ${userId} / assistant ${assistantId}`);
-      return { delivered: 0, failed: true };
+    const { text, failed, failReason } = outcome;
+    if (failed || !text || !text.trim()) {
+      // Явный done.failed (в т.ч. перебитый ход, failReason: 'preempted') или
+      // вовсе пустой текст: рутина — сообщение, которого человек не просил;
+      // промолчать лучше, чем прислать обрывок от его имени. runDue решает,
+      // возвращать ли день на повтор (только для 'preempted' — остальное
+      // часовой повтор не исправит, см. там).
+      //
+      // WARN — если это НЕ ожидаемое «перебили» (preempted): для него
+      // достаточно info, это нормальный исход конкуренции за сессию
+      // (ревью 03.11), а не сбой.
+      const deferred = failReason === 'preempted';
+      const emptyTextMsg = `routine deliver: empty text for ${userId} / assistant ${assistantId}`;
+      if (deferred) this.logger.log(emptyTextMsg); else this.logger.warn(emptyTextMsg);
+      return { delivered: 0, failed: true, failReason };
     }
     // ⚠️ Сбой генерации НЕ отправляем человеку как сообщение ассистента.
     //
     // 12.10.2026 в 02:00 сессия Claude CLI не обновилась, ошибка вернулась ТЕКСТОМ (не
     // исключением), и владелец получил пуш от Райи с содержимым «Failed to authenticate:
     // OAuth session expired and could not be refreshed». Проверка на пустоту такое не
-    // ловит: текст есть. Рутина — сообщение, которого человек не просил; промолчать
-    // лучше, чем прислать мусор от его имени. Следующий запуск по расписанию попробует
-    // снова, а строка в логе показывает, что проход был и почему не дошёл.
+    // ловит: текст есть. Следующий запуск по расписанию попробует снова, а строка в логе
+    // показывает, что проход был и почему не дошёл.
     //
     // НЕ failed: это сбой авторизации CLI, а не «сессия освободится через
     // час» — часовой повтор на сломанной авторизации только слал бы алерты
@@ -178,13 +199,22 @@ export class RoutinePushService implements OnModuleInit {
         const prev = r.last_sent_date; // запоминаем ДО claimToday — releaseToday вернёт именно это
         if (!(await this.store.claimToday(r.id, today))) continue;           // уже застолбили
         const result = await this.deliver(r.user_id, r.assistant_id, r.prompt, r.title);
-        if (result.busy || result.failed) {
-          // Человек в приоритете (busy) или ход сбойный (failed) — день НЕ
+        if (result.busy || (result.failed && result.failReason === 'preempted')) {
+          // Сессия была занята, или человек перебил фоновый ход на релее —
+          // не наша вина, сессия освободится в течение часа: день НЕ
           // считается отправленным, следующий часовой крон попробует снова
-          // (бэклог e777aa94). Без текста рутины/сообщений в логе.
+          // (бэклог e777aa94, ревью 03.11 п.3). Лог — по id рутины (uuid),
+          // без user_id (у старых аккаунтов это телефон) и без заголовка.
           await this.store.releaseToday(r.id, today, prev);
-          this.logger.log(`routine "${r.title}" отложена: ${result.busy ? 'занята сессия' : 'сбой генерации'} `
-            + `(user ${r.user_id}, assistant ${r.assistant_id})`);
+          this.logger.log(`routine ${r.id} отложена: ${result.busy ? 'занята сессия' : 'ход перебит'} `
+            + `(assistant ${r.assistant_id})`);
+          continue;
+        }
+        if (result.failed) {
+          // Сбой НЕ из-за занятости/перебития (CLI, лимит ходов, запись
+          // могла уже пройти) — часовой повтор не поможет: день съеден, как
+          // и у looksLikeFailure. Тот же формат лога — без номеров.
+          this.logger.log(`routine ${r.id} сбой генерации, без повтора (assistant ${r.assistant_id})`);
           continue;
         }
         if (result.delivered > 0) fired++; // сводка в TG — реально доставленные, не все попытки
