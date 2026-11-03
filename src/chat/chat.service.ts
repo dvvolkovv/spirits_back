@@ -305,8 +305,20 @@ export interface ChargedAgentReply {
    * done.failed от релея (в т.ч. preempted) — ход не довёл ответ до конца.
    * text при этом может быть непустым (обрывок) — generateAgentReply (не
    * charge-вариант) его не отдаёт наружу именно из-за этого флага, см. там.
+   * Обязательное (не ?): agentReply всегда возвращает его осознанно
+   * (turnFailed), а не забывает — ревью 03.11.
    */
-  failed?: boolean;
+  failed: boolean;
+  /**
+   * done.failReason, если failed — 'preempted' (человека перебил ход на
+   * релее), 'max_turns', 'cli_fatal' и т.п.; 'unknown' при failed без
+   * строки (конвенция остального chat.service.ts, см. streamUniversalAgent).
+   * Нужен RoutinePushService (generateAgentReplyOutcome ниже): день
+   * возвращается ТОЛЬКО при 'preempted', прочее — повтора нет (ревью 03.11,
+   * п.3: transient_after_write — запись могла уже пройти, max_turns — ход
+   * дорогой и рутины не тарифицируются, cli_fatal — повтор не поможет).
+   */
+  failReason?: string;
 }
 
 @Injectable()
@@ -2841,9 +2853,24 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const { text, failed } = await this.agentReply(userId, assistantId, message, sessionIdOverride, false, opts);
     // Обрывок прерванного хода (done.failed) наружу не уходит — иначе рутина
     // отправила бы пушем кусок недописанного ответа (бэклог e777aa94).
-    // generateAgentReplyWithCharge ниже отдаёт failed честно: там это решает
-    // вызывающий (список — в ChargedAgentReply.failed).
+    // generateAgentReplyWithCharge и generateAgentReplyOutcome ниже отдают
+    // failed честно: там это решает вызывающий.
     return failed ? '' : text;
+  }
+
+  /**
+   * Как generateAgentReply, но отдаёт исход целиком — text, failed и
+   * failReason (из done.failReason), а не прячет обрывок за пустой строкой.
+   * Нужен вызывающим, которым важно РАЗЛИЧИТЬ причину сбоя: RoutinePushService
+   * возвращает день на повтор только при failReason === 'preempted' (человек
+   * перебил ход на релее), а не при любом failed (ревью 03.11, п.3; бэклог
+   * e777aa94). Не тарифицирует (billed=false), как и generateAgentReply.
+   */
+  async generateAgentReplyOutcome(
+    userId: string, assistantId: string, message: string, sessionIdOverride?: string, opts: AgentReplyOpts = {},
+  ): Promise<{ text: string; failed: boolean; failReason?: string }> {
+    const { text, failed, failReason } = await this.agentReply(userId, assistantId, message, sessionIdOverride, false, opts);
+    return { text, failed, failReason };
   }
 
   /**
@@ -3028,6 +3055,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     };
     let costUsd = 0;
     let turnFailed = false;
+    let turnFailReason: string | undefined;
     const turnCost = new RelayTurnCost();
     // Финальная проверка занятости — ВПЛОТНУЮ к beginStream/openMark ниже,
     // без await между ними (ревью 03.11, см. комментарий у ранней проверки
@@ -3068,7 +3096,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
               else if (ev.type === 'result' && ev.text && chunks.length === 0) chunks.push(ev.text);
               else if (ev.type === 'done') {
                 // Стоимость и расход — здесь же, где их берёт основной путь.
-                if (ev.failed === true) turnFailed = true;
+                if (ev.failed === true) {
+                  turnFailed = true;
+                  turnFailReason = typeof ev.failReason === 'string' ? ev.failReason : 'unknown';
+                }
                 if (typeof ev.costUsd === 'number' && ev.costUsd > 0) costUsd += ev.costUsd;
                 turnCost.add(ev);
                 if (ev.usage && typeof ev.usage === 'object') {
@@ -3123,7 +3154,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
       else this.logger.log(logLine);
       this.alertTurnCostFloor(userId, assistantId, charge, charge.tokens);
     }
-    return { text, tokens: charge.tokens, costUsd, charge, durationMs: Date.now() - startedAt, failed: turnFailed };
+    return {
+      text, tokens: charge.tokens, costUsd, charge, durationMs: Date.now() - startedAt,
+      failed: turnFailed, failReason: turnFailReason,
+    };
   }
 
   /** Public wrapper для chat.controller — после upload-and-chat обогащаем профиль + tasks. */
