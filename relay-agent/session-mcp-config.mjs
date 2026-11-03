@@ -6,6 +6,7 @@ import fs from "fs";
 import path from "path";
 
 const SUFFIX = "-session-mcp.json";
+const SETTINGS_SUFFIX = "-session-mcp.settings.json";
 
 // Имя — fsKey + уникальный id ХОДА + суффикс. Не просто fsKey + суффикс:
 // до 26.10.2026 имя было одно на СЕССИЮ, а не на ход, и это была гонка за
@@ -34,19 +35,37 @@ export function ensureMcpConfigDir(dir) {
   fs.chmodSync(dir, 0o700);
 }
 
-// --settings хода живёт рядом с MCP-конфигом, но имеет своё имя и удаляется
-// независимо от него. turnId делает имя уникальным даже внутри одной сессии.
-export function writeSandboxSettings(dir, fsKey, turnId, settings) {
+// Общий lifecycle MCP и settings: путь регистрируется ДО записи, поэтому stale
+// sweeper не удалит живой файл между созданием и завершением write. При частичной
+// записи файл и его регистрация убираются в catch, а внешний finally хода снимает
+// остальные зарегистрированные пути.
+function writeTurnJson(dir, full, value, liveSet, fileOps) {
   ensureMcpConfigDir(dir);
-  const name = sessionMcpConfigName(fsKey, turnId).replace(/\.json$/, ".settings.json");
-  const full = path.join(dir, name);
-  fs.writeFileSync(full, JSON.stringify(settings), { mode: 0o600 });
-  fs.chmodSync(full, 0o600);
-  return full;
+  liveSet.add(full);
+  try {
+    fileOps.writeFileSync(full, JSON.stringify(value), { mode: 0o600 });
+    fileOps.chmodSync(full, 0o600);
+    return full;
+  } catch (e) {
+    liveSet.delete(full);
+    try { fileOps.unlinkSync(full); } catch {}
+    throw e;
+  }
 }
 
-export function removeSandboxSettings(full) {
+export function writeSessionMcpConfig(dir, fsKey, turnId, config, liveSet = new Set(), fileOps = fs) {
+  return writeTurnJson(dir, path.join(dir, sessionMcpConfigName(fsKey, turnId)), config, liveSet, fileOps);
+}
+
+// --settings хода живёт рядом с MCP-конфигом и имеет уникальное имя хода.
+export function writeSandboxSettings(dir, fsKey, turnId, settings, liveSet = new Set(), fileOps = fs) {
+  const name = sessionMcpConfigName(fsKey, turnId).replace(/\.json$/, ".settings.json");
+  return writeTurnJson(dir, path.join(dir, name), settings, liveSet, fileOps);
+}
+
+export function removeSandboxSettings(full, liveSet) {
   if (!full) return;
+  if (liveSet) liveSet.delete(full);
   try { fs.unlinkSync(full); } catch {}
 }
 
@@ -76,7 +95,7 @@ export function sweepStaleSessionMcpConfigs(dir, maxAgeMs, liveSet = new Set(), 
     return removed;
   }
   for (const item of items) {
-    if (!item.endsWith(SUFFIX)) continue;
+    if (!item.endsWith(SUFFIX) && !item.endsWith(SETTINGS_SUFFIX)) continue;
     const full = path.join(dir, item);
     try {
       const age = now - fs.statSync(full).mtimeMs;

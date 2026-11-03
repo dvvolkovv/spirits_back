@@ -106,19 +106,10 @@ export function sessionOutputDir(outputDir, sid) {
   return resolved;
 }
 
-export async function ensureSessionDirs(fsKey, { scratchRoot = AGENT_SCRATCH_ROOT, outputs = "/tmp/agent-output", now = Date.now() } = {}) {
+export async function ensureSessionDirs(fsKey, { scratchRoot = AGENT_SCRATCH_ROOT, outputs = "/tmp/agent-output" } = {}) {
   const scratch = path.join(scratchRoot, fsKey);
-  // Корень scratch имеет 0311: readdir там запрещён даже владельцу. Поэтому
-  // проверяем ровно один известный путь текущего fsKey, без перечисления и
-  // без удаления соседних каталогов. Свежее рабочее окружение не трогаем.
-  try {
-    const stat = await fsp.stat(scratch);
-    if (stat.isDirectory() && now - stat.mtimeMs > 7 * 24 * 60 * 60 * 1000) {
-      await fsp.rm(scratch, { recursive: true, force: true });
-    }
-  } catch (e) {
-    if (!e || e.code !== "ENOENT") throw e;
-  }
+  // Никакой автоматической очистки по возрасту: рабочая папка может содержать
+  // незавершённую работу. Создаём/нормализуем только известные пути своего хода.
   await fsp.mkdir(scratch, { recursive: true, mode: 0o700 });
   await fsp.mkdir(path.join(outputs, fsKey), { recursive: true, mode: 0o700 });
   await fsp.chmod(path.join(outputs, fsKey), 0o700);
@@ -129,7 +120,7 @@ export async function ensureSessionDirs(fsKey, { scratchRoot = AGENT_SCRATCH_ROO
 // 0311: по имени папки можно зайти, перечислить чужие нельзя. Релей списком не читает.
 export async function ensureListingGuard({ outputs = "/tmp/agent-output", uploads = "/tmp/agent-uploads", scratchRoot = AGENT_SCRATCH_ROOT } = {}) {
   for (const d of [outputs, uploads, scratchRoot]) {
-    await fsp.mkdir(d, { recursive: true });
+    await fsp.mkdir(d, { recursive: true, mode: 0o311 });
     await fsp.chmod(d, 0o311);
   }
 }

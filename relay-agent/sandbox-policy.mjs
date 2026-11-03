@@ -6,7 +6,7 @@ import fs from 'node:fs';
 export const AGENT_OPT_DIR = '/opt/linkeon-agent';
 export const AGENT_SCRATCH_ROOT = '/tmp/agent-scratch';
 export const AGENT_MCP_DIR = '/tmp/agent-mcp';
-export const SANDBOX_SCHEMA = process.env.RELAY_SANDBOX_SCHEMA || 'A'; // подтверждено разведкой 03.11
+export const SANDBOX_SCHEMA = process.env.RELAY_SANDBOX_SCHEMA ?? 'A'; // подтверждено разведкой 03.11
 
 // Режим из файла на сервере (~/file-agent/sandbox-mode). Битый/отсутствующий — off.
 export function sandboxMode(modeFile) {
@@ -23,7 +23,7 @@ export function isCanarySession(sessionKey, mode, keysFile) {
   if (mode === 'on') return true;
   if (mode !== 'canary') return false;
   try {
-    return fs.readFileSync(keysFile, 'utf8').split('\n').map((s) => s.trim()).includes(sessionKey);
+    return fs.readFileSync(keysFile, 'utf8').split('\n').map((s) => s.trim()).filter(Boolean).includes(sessionKey);
   } catch {
     return false;
   }
@@ -41,15 +41,20 @@ function normalizeDir(dir) {
 }
 
 // Настройки для --settings <файл>. Пути с '<fs_key>' — подставить ключ до записи.
-export function buildSandboxSettings(fsKey, { scratch, mcpDir } = {}) {
+export function buildSandboxSettings(fsKey, {
+  scratch, mcpDir, schema = SANDBOX_SCHEMA, outputRoot = '/tmp/agent-output',
+} = {}) {
   validateFsKey(fsKey);
+  if (schema !== 'A') throw new TypeError("RELAY_SANDBOX_SCHEMA must be 'A'");
   const scratchDir = normalizeDir(scratch || `${AGENT_SCRATCH_ROOT}/${fsKey}`);
-  const myOutput = `/tmp/agent-output/${fsKey}`;
-  const deny = ['/home/dv', '/proc', '/etc/sudoers', '/etc/sudoers.d', normalizeDir(mcpDir || AGENT_MCP_DIR)];
+  const myOutput = `${normalizeDir(outputRoot)}/${fsKey}`;
+  // Второй MCP-путь — прежний каталог внутри uploads. Его физическая очистка —
+  // отдельный этап; здесь он закрыт и на чтение, и на запись независимо от mcpDir.
+  const deny = [...new Set([
+    '/home/dv', '/proc', '/etc/sudoers', '/etc/sudoers.d',
+    normalizeDir(mcpDir || AGENT_MCP_DIR), '/tmp/agent-uploads/mcp',
+  ])];
   const PROXY = process.env.RELAY_SANDBOX_PROXY || '127.0.0.1:8471';
-  const net = SANDBOX_SCHEMA === 'A'
-    ? { network: { allowedDomains: [PROXY] } }
-    : {};
   return {
     sandbox: {
       enabled: true,
@@ -59,7 +64,7 @@ export function buildSandboxSettings(fsKey, { scratch, mcpDir } = {}) {
         allowWrite: [scratchDir, myOutput],
         denyRead: [...deny],
       },
-      ...net,
+      network: { allowedDomains: [PROXY] },
     },
     permissions: {
       deny: [
@@ -76,21 +81,30 @@ export function buildSandboxSettings(fsKey, { scratch, mcpDir } = {}) {
 // Окружение CLI: белый список + переменные выбранного провайдера + scrub.
 // GEMINI_API_KEY/OPENROUTER_API_KEY не пробрасываются (ни релею, ни ассистентам не нужны).
 const ENV_PASS = new Set(['LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'MCP_TIMEOUT', 'MCP_TOOL_TIMEOUT', 'RUN_ENV']);
-const PROVIDER_ENV_PASS = new Set(['CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_MAX_RETRIES', 'CLAUDE_CODE_SUBAGENT_MODEL']);
+const PROVIDER_ENV_PASS = new Set([
+  'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_MAX_RETRIES', 'CLAUDE_CODE_SUBAGENT_MODEL',
+  'API_TIMEOUT_MS', 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
+]);
 
-export function buildCliEnv({ baseEnv, providerEnv, fsKey, scrub }) {
+export function buildCliEnv({
+  baseEnv, providerEnv, fsKey, scrub,
+  scratchRoot = AGENT_SCRATCH_ROOT, optDir = AGENT_OPT_DIR,
+  claudeConfigDir = '/home/dv/.claude',
+}) {
   validateFsKey(fsKey);
   const env = {};
   for (const k of ENV_PASS) if (baseEnv[k] !== undefined) env[k] = baseEnv[k];
   for (const [k, v] of Object.entries(providerEnv || {})) {
     if (k.startsWith('ANTHROPIC_') || PROVIDER_ENV_PASS.has(k)) env[k] = v;
   }
-  const scratchDir = `${AGENT_SCRATCH_ROOT}/${fsKey}`;
+  const scratchDir = `${normalizeDir(scratchRoot)}/${fsKey}`;
   env.HOME = scratchDir;
   env.TMPDIR = scratchDir;
-  env.CLAUDE_CONFIG_DIR = '/home/dv/.claude';
+  env.CLAUDE_CONFIG_DIR = claudeConfigDir;
+  env.MCP_TIMEOUT = '120000';
+  env.MCP_TOOL_TIMEOUT = '600000';
   if (scrub) env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = '1';
-  env.PATH = `${AGENT_OPT_DIR}/bin:/usr/local/bin:/usr/bin:/bin`;
+  env.PATH = `${normalizeDir(optDir)}/bin:/usr/local/bin:/usr/bin:/bin`;
   // Сеть — только через локальный прокси (squid на релее режет внутренние
   // назначения). no_proxy НЕ задаём: он дал бы обход резки через localhost.
   const PROXY = process.env.RELAY_SANDBOX_PROXY || '127.0.0.1:8471';
@@ -105,34 +119,44 @@ export function buildCliEnv({ baseEnv, providerEnv, fsKey, scrub }) {
 // fsKey: это файлы, которые пользователь приложил именно к этому разговору.
 // Корни output/uploads/scratch в denyRead намеренно не добавляются: собственные
 // пути должны оставаться доступными, а изоляцию дают 0311 на корнях и fsKey.
-export function buildSandboxTools(fsKey) {
+export function buildSandboxTools(fsKey, {
+  outputRoot = '/tmp/agent-output', scratchRoot = AGENT_SCRATCH_ROOT,
+  uploadRoot = '/tmp/agent-uploads', optDir = AGENT_OPT_DIR,
+} = {}) {
   validateFsKey(fsKey);
+  const output = normalizeDir(outputRoot);
+  const scratch = normalizeDir(scratchRoot);
+  const uploads = normalizeDir(uploadRoot);
+  const opt = normalizeDir(optDir);
   const readRoots = [
-    `/tmp/agent-output/${fsKey}/**`,
-    `/tmp/agent-scratch/${fsKey}/**`,
-    `/tmp/agent-uploads/${fsKey}_*`,
-    `${AGENT_OPT_DIR}/**`, '/usr/**', '/etc/**', '/opt/**',
+    `${output}/${fsKey}/**`,
+    `${scratch}/${fsKey}/**`,
+    `${uploads}/${fsKey}_*`,
+    `${opt}/**`, '/usr/**', '/etc/**',
   ];
-  const writeRoots = [`/tmp/agent-output/${fsKey}/**`, `/tmp/agent-scratch/${fsKey}/**`];
+  const writeRoots = [`${output}/${fsKey}/**`, `${scratch}/${fsKey}/**`];
   return [
     'Bash(*)',
     ...['Read', 'Glob', 'Grep'].flatMap((name) => readRoots.map((root) => `${name}(${root})`)),
     ...['Write', 'Edit'].flatMap((name) => writeRoots.map((root) => `${name}(${root})`)),
-    'WebSearch(*)', 'WebFetch(*)',
+    'WebSearch(*)',
   ].join(',');
 }
 
 // Единый источник базового списка и при инициализации, и в catch MCP. В off
 // legacyTools возвращается дословно, без валидации fsKey или иных побочных эффектов.
-export function baseToolsForTurn(fsKey, sandboxOn, legacyTools) {
-  return sandboxOn ? buildSandboxTools(fsKey) : legacyTools;
+export function baseToolsForTurn(fsKey, sandboxOn, legacyTools, options) {
+  return sandboxOn ? buildSandboxTools(fsKey, options) : legacyTools;
 }
 
 // Окружение spawn: off — ровно объект прежней ветки server.mjs; on — белый
 // список buildCliEnv, scrub и служебная метка для уборки потомков хода.
-export function buildTurnEnv({ sandboxOn, legacyEnv, baseEnv, providerEnv, fsKey, tag, runEnvName }) {
+export function buildTurnEnv({
+  sandboxOn, legacyEnv, baseEnv, providerEnv, fsKey, tag, runEnvName,
+  scratchRoot, optDir, claudeConfigDir,
+}) {
   if (!sandboxOn) return legacyEnv;
-  const env = buildCliEnv({ baseEnv, providerEnv, fsKey, scrub: true });
+  const env = buildCliEnv({ baseEnv, providerEnv, fsKey, scrub: true, scratchRoot, optDir, claudeConfigDir });
   env[runEnvName] = tag;
   env.OMP_THREAD_LIMIT = '1';
   return env;
