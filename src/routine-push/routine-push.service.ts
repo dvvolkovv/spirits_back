@@ -7,6 +7,16 @@ import { PushService } from '../push/push.service';
 import { ChatService } from '../chat/chat.service';
 import { RoutineStore, RoutineRow, ENERGY_PROMPT } from './routine-store.service';
 import { sendTelegramAlert } from '../common/telegram-alert';
+import { RelaySessionBusyError } from '../chat/relay-session-busy';
+
+/** Исход deliver(): сколько реально разослано и — если 0 — почему. */
+export interface DeliverResult {
+  delivered: number;
+  /** Сессия релея человека (или другой рутины) занята — попробуем через час. */
+  busy?: boolean;
+  /** Генерация не вернула текст (сбойный, в т.ч. прерванный, ход) — тоже через час. */
+  failed?: boolean;
+}
 
 const RAYA_ID = '14';
 
@@ -80,13 +90,22 @@ export class RoutinePushService implements OnModuleInit {
   }
 
   // ── Доставка одной рутины ────────────────────────────────────────────────────
-  private async deliver(userId: string, assistantId: string, prompt: string, title?: string): Promise<number> {
-    // Рутина — путь, где ассистент реально может позвать инструмент Linkeon
-    // (картинка, рутина, календарь): AgentReplyOpts.linkeonTools — явно true.
-    const text = await this.chat.generateAgentReply(userId, assistantId, prompt, undefined, { linkeonTools: true });
+  private async deliver(userId: string, assistantId: string, prompt: string, title?: string): Promise<DeliverResult> {
+    let text: string;
+    try {
+      // Рутина — путь, где ассистент реально может позвать инструмент Linkeon
+      // (картинка, рутина, календарь): AgentReplyOpts.linkeonTools — явно true.
+      text = await this.chat.generateAgentReply(userId, assistantId, prompt, undefined, { linkeonTools: true });
+    } catch (e) {
+      // Сессия релея человека (или другой рутины) занята прямо сейчас —
+      // человек в приоритете, рутину не шлём вовсе (бэклог e777aa94).
+      // Вызывающий (runDue/fireNow) решает, что делать с busy — не падаем.
+      if (e instanceof RelaySessionBusyError) return { delivered: 0, busy: true };
+      throw e;
+    }
     if (!text || !text.trim()) {
       this.logger.warn(`routine deliver: empty text for ${userId} / assistant ${assistantId}`);
-      return 0;
+      return { delivered: 0, failed: true };
     }
     // ⚠️ Сбой генерации НЕ отправляем человеку как сообщение ассистента.
     //
@@ -96,10 +115,14 @@ export class RoutinePushService implements OnModuleInit {
     // ловит: текст есть. Рутина — сообщение, которого человек не просил; промолчать
     // лучше, чем прислать мусор от его имени. Следующий запуск по расписанию попробует
     // снова, а строка в логе показывает, что проход был и почему не дошёл.
+    //
+    // НЕ failed: это сбой авторизации CLI, а не «сессия освободится через
+    // час» — часовой повтор на сломанной авторизации только слал бы алерты
+    // без толку (runDue день не возвращает, см. там).
     if (looksLikeFailure(text)) {
       this.logger.error(`routine deliver: ОТМЕНЕНО, генерация вернула ошибку текстом `
         + `для ${userId} / assistant ${assistantId}: ${text.slice(0, 160)}`);
-      return 0;
+      return { delivered: 0 };
     }
     const agentNum = /^\d+$/.test(assistantId) ? parseInt(assistantId, 10) : null;
     await this.pg.query(
@@ -110,12 +133,13 @@ export class RoutinePushService implements OnModuleInit {
     const name = await this.assistantName(assistantId);
     const body = text.replace(/[#*_`>\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 130);
     const isEnergy = assistantId === RAYA_ID && (title === 'Энергия дня' || !title);
-    return this.push.sendPush(userId, {
+    const delivered = await this.push.sendPush(userId, {
       title: isEnergy ? 'Энергия дня от Райи 🌅' : `${title || 'Напоминание'} · ${name} ✨`,
       body,
       url: `/chat?assistant=${assistantId}`,
       tag: `routine_${assistantId}`,
     });
+    return { delivered };
   }
 
   private async assistantName(assistantId: string): Promise<string> {
@@ -127,11 +151,12 @@ export class RoutinePushService implements OnModuleInit {
   }
 
   // «Проверить сейчас»: генерит и шлёт немедленно конкретную рутину.
-  async fireNow(userId: string, routineId: string): Promise<{ delivered: number } | null> {
+  // busy/failed — честно наверх (контроллер), а не «сгенерировали, но пуш не
+  // доставлен — включи уведомления» (это deliver() умел бы и раньше).
+  async fireNow(userId: string, routineId: string): Promise<DeliverResult | null> {
     const r = await this.store.getById(userId, routineId);
     if (!r) return null;
-    const delivered = await this.deliver(userId, r.assistantId, r.prompt, r.title);
-    return { delivered };
+    return this.deliver(userId, r.assistantId, r.prompt, r.title);
   }
 
   // ── Крон: раз в час на :00 ───────────────────────────────────────────────────
@@ -150,10 +175,20 @@ export class RoutinePushService implements OnModuleInit {
         if (this.store.localHour(r.tz, now) < r.send_hour) continue;         // ещё не время в его tz
         const today = this.store.localDate(r.tz, now);
         if (r.last_sent_date && this.store.toISO(r.last_sent_date) === today) continue;
+        const prev = r.last_sent_date; // запоминаем ДО claimToday — releaseToday вернёт именно это
         if (!(await this.store.claimToday(r.id, today))) continue;           // уже застолбили
-        const n = await this.deliver(r.user_id, r.assistant_id, r.prompt, r.title);
-        fired++;
-        this.logger.log(`routine "${r.title}" sent to ${r.user_id} (assistant ${r.assistant_id}, delivered=${n})`);
+        const result = await this.deliver(r.user_id, r.assistant_id, r.prompt, r.title);
+        if (result.busy || result.failed) {
+          // Человек в приоритете (busy) или ход сбойный (failed) — день НЕ
+          // считается отправленным, следующий часовой крон попробует снова
+          // (бэклог e777aa94). Без текста рутины/сообщений в логе.
+          await this.store.releaseToday(r.id, today, prev);
+          this.logger.log(`routine "${r.title}" отложена: ${result.busy ? 'занята сессия' : 'сбой генерации'} `
+            + `(user ${r.user_id}, assistant ${r.assistant_id})`);
+          continue;
+        }
+        if (result.delivered > 0) fired++; // сводка в TG — реально доставленные, не все попытки
+        this.logger.log(`routine "${r.title}" sent to ${r.user_id} (assistant ${r.assistant_id}, delivered=${result.delivered})`);
       } catch (e: any) {
         this.logger.error(`runDue deliver failed for ${r?.user_id}: ${e.message}`);
       }

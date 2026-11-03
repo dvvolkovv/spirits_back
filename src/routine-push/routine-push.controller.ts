@@ -63,7 +63,10 @@ export class RoutinePushController {
           if (!body?.id) return res.status(400).json({ error: 'id required' });
           const r = await this.routines.fireNow(uid, String(body.id));
           if (!r) return res.status(404).json({ error: 'not found' });
-          return res.json({ ok: true, delivered: r.delivered });
+          // busy/failed — честно кабинету (RoutinesManager показывает свои
+          // тексты settings.routines.test_busy/test_failed), а не молчаливый
+          // delivered:0, который читался бы как «включи уведомления».
+          return res.json({ ok: true, delivered: r.delivered, busy: r.busy, failed: r.failed });
         }
         case 'preset_energy': {
           const row = await this.routines.ensureEnergyPreset(uid, body?.tz);

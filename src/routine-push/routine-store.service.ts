@@ -210,4 +210,26 @@ export class RoutineStore {
     );
     return (r.rowCount || 0) > 0;
   }
+
+  /**
+   * Возвращает отметку дня к prev — только если она ЕЩЁ равна todayLocal (её
+   * сегодня поставил claimToday, и с тех пор никто её не тронул). Зовёт
+   * runDue, когда генерация не удалась (RelaySessionBusyError — сессия
+   * человека занята — или пустой текст): день не считается отправленным,
+   * следующий часовой крон попробует снова (бэклог e777aa94). prev может
+   * быть null — у рутины, которая сегодня ни разу не доставлялась.
+   *
+   * Условие "last_sent_date = todayLocal" в WHERE — защита от гонки с другим
+   * вызовом claimToday/releaseToday той же строки (например, «Проверить
+   * сейчас» и часовой крон почти одновременно): откатываем только ту
+   * пометку, которую сами же поставили.
+   */
+  async releaseToday(id: string, todayLocal: string, prev: string | null): Promise<boolean> {
+    const r = await this.pg.query(
+      `UPDATE routine_pushes SET last_sent_date = $3, updated_at = now()
+         WHERE id = $1 AND last_sent_date = $2 RETURNING id`,
+      [id, todayLocal, prev],
+    );
+    return (r.rowCount || 0) > 0;
+  }
 }
