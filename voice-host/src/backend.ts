@@ -83,6 +83,9 @@ export type CallUsage = {
   model: string;
 };
 
+/** Кто был на встрече — то же, что бэкенд ждёт в voice_calls.participants. */
+export type MeetingParticipant = { name: string; joinedAt: number };
+
 export type DocumentResult =
   | { status: 'accepted'; docId: string; title: string; specialist?: string }
   | { status: 'rejected'; reason: 'no_title' };
@@ -96,18 +99,20 @@ export const backend = {
    * Итоги звонка. `ending` — чем он кончился: причина ухода участника от
    * LiveKit и причина закрытия сессии. Необязательное: бэкенд прежней версии
    * поле проигнорирует, а разбор на его стороне неизвестное за прощание не
-   * выдаёт (src/voice-call/end-reason.ts).
+   * выдаёт (src/voice-call/end-reason.ts). `participants` — только у встречи.
    */
   complete: (
     callId: string,
     transcript: TranscriptEntry[],
     usage: CallUsage,
     ending?: { disconnect?: string; close?: string },
-  ) => post<{ ok: true }>('complete', { callId, transcript, usage, ending }),
+    participants?: MeetingParticipant[],
+  ) => post<{ ok: true }>('complete', { callId, transcript, usage, ending, participants }),
   // Прогресс-флаш транскрипта во время звонка: сбой Realtime API / пересоздание сессии
   // не теряют уже сказанное. Не финализирует — бэкенд стейджит keep-longest (owner 2026-09-01).
-  progress: (callId: string, transcript: TranscriptEntry[]) =>
-    post<{ ok: true }>('progress', { callId, transcript }),
+  // Список участников едет и здесь: оборвётся встреча до complete — он не пропадёт.
+  progress: (callId: string, transcript: TranscriptEntry[], participants?: MeetingParticipant[]) =>
+    post<{ ok: true }>('progress', { callId, transcript, participants }),
   failed: (callId: string, reason: string) =>
     post<{ ok: true }>('failed', { callId, reason }),
   meetingFirstHuman: (callId: string) =>
