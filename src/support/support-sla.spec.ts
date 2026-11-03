@@ -65,4 +65,32 @@ describe('SupportService migrations', () => {
     expect(queries[queries.length - 1]).toBe('COMMIT');
     expect(client.release).toHaveBeenCalledTimes(1);
   });
+
+  it('rolls back and rethrows the original error when the second migration fails', async () => {
+    const original = new Error('second migration failed');
+    const queries: string[] = [];
+    const client = {
+      query: jest.fn(async (sql: string) => {
+        queries.push(sql);
+        if (sql.includes('002_support_sla.sql')) throw original;
+        return { rows: [] };
+      }),
+      release: jest.fn(),
+    };
+    const pg = { getClient: jest.fn(async () => client) };
+    const service = new SupportService(pg as any);
+    jest.spyOn((service as any).logger, 'error').mockImplementation(() => {});
+
+    let rejection: unknown;
+    try {
+      await service.onModuleInit();
+    } catch (e) {
+      rejection = e;
+    }
+
+    expect(rejection).toBe(original);
+    expect(queries).toContain('ROLLBACK');
+    expect(queries).not.toContain('COMMIT');
+    expect(client.release).toHaveBeenCalledTimes(1);
+  });
 });

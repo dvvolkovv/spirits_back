@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
+import { SupportService } from './support.service';
 
 const PG = process.env.PROVISIONING_PG_URL;
 const maybe = PG ? describe : describe.skip;
@@ -134,5 +135,29 @@ maybe('support SLA migration against PostgreSQL', () => {
       `SELECT id, first_response_due_at, first_owner_reply_at FROM support_tickets ORDER BY id`,
     );
     expect(after.rows).toEqual(before.rows);
+  });
+
+  it('serializes concurrent service initialization without changing the backfill', async () => {
+    const slaSnapshot = `SELECT id, first_response_due_at, first_owner_reply_at FROM support_tickets ORDER BY id`;
+    const before = await pool.query(slaSnapshot);
+    await pool.query(
+      'UPDATE support_tickets SET first_response_due_at = NULL, first_owner_reply_at = NULL',
+    );
+    const clients: unknown[] = [];
+    const pg = {
+      getClient: async () => {
+        const client = await pool.connect();
+        clients.push(client);
+        return client;
+      },
+    };
+
+    await Promise.all([
+      new SupportService(pg as any).onModuleInit(),
+      new SupportService(pg as any).onModuleInit(),
+    ]);
+
+    expect(new Set(clients).size).toBe(2);
+    expect((await pool.query(slaSnapshot)).rows).toEqual(before.rows);
   });
 });
