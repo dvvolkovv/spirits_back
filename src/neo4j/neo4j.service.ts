@@ -150,6 +150,39 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * Как зовут человека — одним полем.
+   *
+   * Отдельно от {@link getProfileDescription} потому, что зовут отсюда не ради
+   * промпта, а ради РАЗМЕТКИ: подписать реплики человека в расшифровке звонка
+   * (voice-call.service summarize). Полное описание профиля там было бы и
+   * дорого, и лишне — нужно одно слово.
+   *
+   * ⚠️ Имя живёт ТОЛЬКО здесь. В `ai_profiles_consolidated.profile_data->>'name'`
+   * у владельца его нет (проверено на проде 03.11.2026), а в таблице `user_id`
+   * колонки имени не существует вовсе. Поэтому других источников не искать.
+   *
+   * Пустая строка приводится к null: в Neo4j несказанное имя лежит как '',
+   * а звать человека пустой строкой нельзя.
+   */
+  async getProfileName(userId: string): Promise<string | null> {
+    const session = this.getSession();
+    if (!session) return null;
+    try {
+      const result = await session.run(
+        `MATCH (p:Profile {phone: $phone}) RETURN COALESCE(p.name, '') AS name`,
+        { phone: userId },
+      );
+      const name = String(result.records[0]?.get('name') || '').trim();
+      return name || null;
+    } catch (e) {
+      this.logger.error(`getProfileName error: ${e.message}`);
+      return null;
+    } finally {
+      await session.close();
+    }
+  }
+
   async getProfileEntities(userId: string): Promise<any> {
     const session = this.getSession();
     if (!session) return null;

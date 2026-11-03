@@ -46,6 +46,7 @@ import {
   transcriptionPrompt,
   isTranscriptionEcho,
 } from './prompts.js';
+import { RepeatWatch, repeatLine } from './repeat-watch.js';
 
 const TOPIC = 'linkeon';
 
@@ -1161,23 +1162,23 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
     // та же запись доехала сюда дважды. Сверяем по идентификатору записи: если
     // id тот же, это ТА ЖЕ реплика, а не сказанная повторно.
     //
-    // Заслон заодно и есть замер: пока в логе нет строки о повторе, двойной
-    // записи не происходит, и причина повторов — в самой модели.
+    // ⚠️ Здесь стояло «заслон заодно и есть замер: пока в логе нет строки о
+    // повторе, двойной записи не происходит». Вывод неверен и снят 03.11.2026:
+    // заслон молчит и тогда, когда повтор принесла ДРУГАЯ запись, — а в
+    // расшифровках владельца за те же недели таких повторов 72 на 35
+    // разговоров. Замер делает RepeatWatch ниже, и он двусторонний.
     const seenItems = new Set<string>();
+
+    // Повторы считаем ПОСЛЕ отсева внутренних вставок и эха, но ДО сверки по
+    // идентификатору: иначе двойная доставка одной записи до счётчика не
+    // доходит, и вердикт «та же запись» получить неоткуда.
+    const repeats = new RepeatWatch();
 
     session.on(AgentSessionEventTypes.ConversationItemAdded, (ev: ConversationItemAddedEvent) => {
       if (ev.item.type !== 'message') return; // пропускаем agent_handoff-записи
       const { role, textContent } = ev.item;
       if (!textContent) return;
       const itemId = (ev.item as { id?: string }).id;
-      if (itemId) {
-        if (seenItems.has(itemId)) {
-          // Без текста: содержимое разговора в логи не попадает.
-          console.log(`[транскрипт] запись ${itemId} (${role}) уже записана — пропускаю`);
-          return;
-        }
-        seenItems.add(itemId);
-      }
       const normalizedRole: 'user' | 'assistant' = role === 'user' ? 'user' : 'assistant';
       // Наши синтетические generateReply()-вставки заводятся с role:'user' —
       // это не реплики пользователя, в транскрипт звонка их не пускаем.
@@ -1210,6 +1211,16 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
         // событий речи нет, и свидетельство приходится брать из расшифровки.
         if (isBridged) occupancy?.speechHeard(Date.now());
       }
+      const repeat = repeats.note(normalizedRole, textContent, itemId, Date.now());
+      if (repeat) console.log(repeatLine(repeat));
+      // Одна и та же запись, доехавшая дважды, в транскрипт не идёт. Повтор
+      // другой записью — идёт: если модель правда сказала это заново, запись
+      // об этом верна.
+      if (itemId) {
+        if (seenItems.has(itemId)) return;
+        seenItems.add(itemId);
+      }
+
       transcript.push({
         role: normalizedRole,
         text: textContent,
