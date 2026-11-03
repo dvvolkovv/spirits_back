@@ -23,9 +23,8 @@ const LINE =
 
 const PHONE_LINE = '- Номер телефона нейросетям не передаётся; ИИ-поддержке видны имя и почта, чтобы помочь с аккаунтом.';
 
-/** Предел статьи — kb.spec.ts (MAX_BYTES); запас — под будущую строку о номере. */
+/** Предел статьи — kb.spec.ts (MAX_BYTES). Запас в 250 байт держали под строку о номере — она в статье с 03.11.2026. */
 const MAX_BYTES = 5 * 1024;
-const RESERVE_BYTES = 250;
 
 describe('how-it-works: кому уходят данные', () => {
   const text = renderArticle(howItWorks, 'ru', 'web');
@@ -61,11 +60,11 @@ describe('how-it-works: кому уходят данные', () => {
     for (const client of KB_CLIENTS) expect(providersLine(renderArticle(howItWorks, 'ru', client))).toBe(line);
   });
 
-  it(`самый длинный вариант статьи оставляет ≥ ${RESERVE_BYTES} байт до предела ${MAX_BYTES}`, () => {
+  it(`самый длинный вариант статьи — в пределах ${MAX_BYTES} байт`, () => {
     let max = 0;
     for (const lang of SUPPORTED_LANGUAGES) {
       for (const client of KB_CLIENTS) max = Math.max(max, Buffer.byteLength(renderArticle(howItWorks, lang, client), 'utf8'));
     }
-    expect(MAX_BYTES - max).toBeGreaterThanOrEqual(RESERVE_BYTES);
+    expect(max).toBeLessThanOrEqual(MAX_BYTES);
   });
 });
