@@ -223,4 +223,186 @@ maybe('support SLA migration against PostgreSQL', () => {
     );
     expect(events.rows).toHaveLength(1);
   });
+
+  function makeService(pg: any = {
+    query: pool.query.bind(pool), getClient: () => pool.connect(),
+  }): SupportService {
+    return new SupportService(pg);
+  }
+
+  async function newTicket(status = 'escalated'): Promise<string> {
+    const r = await pool.query(
+      `INSERT INTO support_tickets (user_id, status) VALUES ($1, $2) RETURNING id`,
+      [`runtime-${Date.now()}-${Math.random()}`, status],
+    );
+    return r.rows[0].id;
+  }
+
+  it('sets the runtime due date from the first escalation and enters the soon queue without another migration', async () => {
+    const service = makeService();
+    const id = await newTicket('ai_handling');
+    const before = Date.now();
+
+    const first = await (service as any).executeTool(id, 'runtime-user', 'escalate_to_owner', {
+      reason: 'human needed', urgency: 'critical', summary: 'runtime SLA',
+    });
+    const after = Date.now();
+
+    expect(first).toEqual({ ok: true, escalated: true });
+    const stored = await pool.query(
+      'SELECT first_response_due_at FROM support_tickets WHERE id = $1', [id],
+    );
+    expect(stored.rows[0].first_response_due_at).toBeInstanceOf(Date);
+    const dueMs = stored.rows[0].first_response_due_at.getTime();
+    expect(dueMs).toBeGreaterThanOrEqual(before + 15 * 60_000);
+    expect(dueMs).toBeLessThanOrEqual(after + 15 * 60_000);
+    const soon = await service.adminListTickets({ sla: 'soon' });
+    expect(soon.map((t) => t.id)).toContain(id);
+
+    await (service as any).executeTool(id, 'runtime-user', 'escalate_to_owner', {
+      reason: 'escalated again', urgency: 'low', summary: 'must not move the first deadline',
+    });
+    const afterSecond = await pool.query(
+      'SELECT first_response_due_at FROM support_tickets WHERE id = $1', [id],
+    );
+    expect(afterSecond.rows[0].first_response_due_at).toEqual(stored.rows[0].first_response_due_at);
+  });
+
+  const replyChannels: Array<[string, (service: SupportService, id: string) => Promise<void>]> = [
+    ['admin', (service, id) => service.adminReply(id, 'admin-a', 'atomic reply')],
+    ['telegram', (service, id) => service.postOwnerReplyFromTelegram(id, 'telegram-1', 'Owner', 'atomic reply')],
+  ];
+
+  it.each(replyChannels)('%s reply rolls back completely and retry does not duplicate writes', async (_channel, reply) => {
+    const service = makeService();
+    const id = await newTicket();
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION fail_support_reply_event() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'forced reply event failure'; END $$;
+      DROP TRIGGER IF EXISTS fail_reply_event ON support_events;
+      CREATE TRIGGER fail_reply_event BEFORE INSERT ON support_events
+      FOR EACH ROW WHEN (NEW.action = 'reply') EXECUTE FUNCTION fail_support_reply_event();
+    `);
+
+    await expect(reply(service, id)).rejects.toThrow('forced reply event failure');
+    await pool.query('DROP TRIGGER fail_reply_event ON support_events');
+
+    const rolledBack = await pool.query(
+      `SELECT
+         (SELECT count(*)::int FROM support_messages WHERE ticket_id = $1 AND sender_type = 'owner') AS messages,
+         (SELECT count(*)::int FROM support_events WHERE ticket_id = $1 AND action = 'reply') AS events,
+         (SELECT status || ':' || COALESCE(first_owner_reply_at::text, 'null')
+            FROM support_tickets WHERE id = $1) AS ticket`,
+      [id],
+    );
+    expect(rolledBack.rows[0]).toEqual({ messages: 0, events: 0, ticket: 'escalated:null' });
+
+    await reply(service, id);
+
+    const retried = await pool.query(
+      `SELECT
+         (SELECT count(*)::int FROM support_messages WHERE ticket_id = $1 AND sender_type = 'owner') AS messages,
+         (SELECT count(*)::int FROM support_events WHERE ticket_id = $1 AND action = 'reply') AS events,
+         (SELECT status FROM support_tickets WHERE id = $1) AS status,
+         (SELECT first_owner_reply_at FROM support_tickets WHERE id = $1) AS marker,
+         (SELECT created_at FROM support_messages WHERE ticket_id = $1 AND sender_type = 'owner') AS message_at`,
+      [id],
+    );
+    expect(retried.rows[0]).toMatchObject({ messages: 1, events: 1, status: 'owner_handling' });
+    expect(retried.rows[0].marker).toEqual(retried.rows[0].message_at);
+  });
+
+  it('keeps the actual earliest visible reply timestamp under overlapping transactions', async () => {
+    const id = await newTicket();
+    const normal = makeService();
+    let announceInserted!: () => void;
+    const inserted = new Promise<void>((resolve) => { announceInserted = resolve; });
+    let continueReply!: () => void;
+    const gate = new Promise<void>((resolve) => { continueReply = resolve; });
+    const wrap = (raw: (sql: string, params?: any[]) => Promise<any>) => async (sql: string, params?: any[]) => {
+      const result = await raw(sql, params);
+      if (/INSERT INTO support_messages/.test(sql)) {
+        await raw('UPDATE support_messages SET created_at = $1 WHERE id = $2', [
+          new Date('2020-01-01T00:00:00.000Z'), result.rows[0].id,
+        ]);
+        announceInserted();
+        await gate;
+      }
+      return result;
+    };
+    const delayed = makeService({
+      query: wrap(pool.query.bind(pool)),
+      getClient: async () => {
+        const client = await pool.connect();
+        return { query: wrap(client.query.bind(client)), release: client.release.bind(client) };
+      },
+    });
+
+    const earlier = delayed.adminReply(id, 'admin-a', 'earlier visible reply');
+    await inserted;
+    const later = normal.adminReply(id, 'admin-b', 'later visible reply');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    continueReply();
+    await Promise.all([earlier, later]);
+
+    const result = await pool.query(
+      `SELECT t.first_owner_reply_at,
+              (SELECT array_agg(m.content ORDER BY m.created_at, m.id)
+                 FROM support_messages m
+                WHERE m.ticket_id = t.id AND m.sender_type = 'owner' AND m.visible_to_user = true) AS contents,
+              (SELECT min(m.created_at)
+                 FROM support_messages m
+                WHERE m.ticket_id = t.id AND m.sender_type = 'owner' AND m.visible_to_user = true) AS earliest
+         FROM support_tickets t WHERE t.id = $1`,
+      [id],
+    );
+    expect(result.rows[0].contents).toEqual(['earlier visible reply', 'later visible reply']);
+    expect(result.rows[0].first_owner_reply_at).toEqual(result.rows[0].earliest);
+  });
+
+  it('filters and orders real queue rows by SLA, urgency, status, and actor', async () => {
+    await pool.query('TRUNCATE support_tickets CASCADE');
+    const service = makeService();
+    async function queueTicket(
+      urgency: string, status: string, actor: string | null,
+      due: Date | null, replied: Date | null = null,
+    ): Promise<string> {
+      const r = await pool.query(
+        `INSERT INTO support_tickets
+           (user_id, urgency, status, assigned_to, first_response_due_at, first_owner_reply_at)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+        [`queue-${Math.random()}`, urgency, status, actor, due, replied],
+      );
+      return r.rows[0].id;
+    }
+    const overdueCritical = await queueTicket('critical', 'escalated', 'admin-a', new Date(Date.now() - 60_000));
+    const overdueLow = await queueTicket('low', 'owner_handling', 'admin-a', new Date(Date.now() - 120_000));
+    const soonCritical = await queueTicket('critical', 'escalated', 'admin-b', new Date(Date.now() + 10 * 60_000));
+    const soonLow = await queueTicket('low', 'escalated', 'admin-a', new Date(Date.now() + 20 * 60_000));
+    const repliedCritical = await queueTicket(
+      'critical', 'escalated', 'admin-a', new Date(Date.now() - 180_000), new Date(),
+    );
+    const newNormal = await queueTicket('normal', 'ai_handling', 'admin-a', null);
+    const newLow = await queueTicket('low', 'escalated', 'admin-b', null);
+
+    const all = await service.adminListTickets({ status: 'all', limit: 50 });
+    expect(all.map((t) => t.id)).toEqual([
+      overdueCritical, overdueLow, soonCritical, soonLow, repliedCritical, newNormal, newLow,
+    ]);
+    expect(all[0]).toMatchObject({
+      assignedTo: 'admin-a', assignedName: 'Alice', firstOwnerReplyAt: null,
+    });
+    expect(all[0].firstResponseDueAt).toEqual(expect.any(Date));
+
+    const overdue = await service.adminListTickets({ sla: 'overdue' });
+    expect(overdue.map((t) => t.id)).toEqual([overdueCritical, overdueLow]);
+    const soon = await service.adminListTickets({ sla: 'soon' });
+    expect(soon.map((t) => t.id)).toEqual([soonCritical, soonLow]);
+    expect([...overdue, ...soon].map((t) => t.id)).not.toContain(repliedCritical);
+
+    const mineEscalated = await service.adminListTickets({
+      status: 'escalated', sla: 'mine', actorId: 'admin-a',
+    });
+    expect(mineEscalated.map((t) => t.id)).toEqual([overdueCritical, soonLow, repliedCritical]);
+  });
 });
