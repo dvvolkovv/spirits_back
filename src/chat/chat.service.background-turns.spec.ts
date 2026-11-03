@@ -3,9 +3,18 @@ import axios from 'axios';
 import { ChatService } from './chat.service';
 import { relaySessionKey } from './relay-session';
 import { RelaySessionBusyError } from './relay-session-busy';
+import { resolveAnswerProvider } from './answer-provider';
 
 jest.mock('axios');
 jest.mock('../common/telegram-alert', () => ({ sendTelegramAlert: jest.fn(async () => {}) }));
+// Только resolveAnswerProvider подменяется (управляемая задержка для гонки
+// ревью 03.11: await между проверкой занятости и openMark) — остальные
+// экспорты (relayProviderFields и т.д.) остаются настоящими.
+jest.mock('./answer-provider', () => {
+  const actual = jest.requireActual('./answer-provider');
+  return { ...actual, resolveAnswerProvider: jest.fn(actual.resolveAnswerProvider) };
+});
+const actualResolveAnswerProvider = jest.requireActual('./answer-provider').resolveAnswerProvider;
 
 /**
  * agentReply (generateAgentReply/generateAgentReplyWithCharge) — путь рутин
@@ -271,5 +280,98 @@ describe('done.failed — обрывок прерванного хода нар�
     await settle();
     up.push(DELTA); up.push(DONE_FAILED); up.push(null);
     await expect(call).rejects.toThrow('Agent version test failed: relay reported failure');
+  });
+});
+
+describe('гонка: проверка занятости и openMark разделены await (ревью 03.11)', () => {
+  // До фикса: проверка занятости считала relaySid и смотрела в relayRunning/
+  // backgroundRunning, но СРАЗУ после неё шёл await resolveAnswerProvider(…)
+  // (запрос в PG через llmProvider) — и только ПОСЛЕ него ставился openMark.
+  // В это окно успевал проскочить кто угодно: другой фоновый ход (RACE1) или
+  // текстовый ход человека (RACE2). Финальная проверка должна стоять
+  // ВПЛОТНУЮ к beginStream/openMark, без await между ними.
+  afterEach(() => {
+    (resolveAnswerProvider as jest.Mock).mockReset();
+    (resolveAnswerProvider as jest.Mock).mockImplementation(actualResolveAnswerProvider);
+  });
+
+  it('RACE1: два фоновых хода одной сессии одновременно — в релей уходит только один, второй RelaySessionBusyError', async () => {
+    const svc = makeService();
+    const gates: Array<() => void> = [];
+    (resolveAnswerProvider as jest.Mock).mockImplementation(
+      () => new Promise((resolve) => { gates.push(() => resolve({ provider: 'claude', choice: null })); }),
+    );
+
+    const up = new Readable({ read() {} });
+    queue.push(up); // только один реально дойдёт до axios.post и его разберёт
+
+    const callA = svc.generateAgentReply('u1', '14', 'рутина A');
+    const callB = svc.generateAgentReply('u1', '14', 'рутина B');
+    await settle();
+    // Оба дошли до одной и той же точки (await route()), не увидев друг
+    // друга: ни один пока не поставил метку — RACE1 воспроизведён.
+    expect(gates).toHaveLength(2);
+    expect(post).not.toHaveBeenCalled();
+
+    gates[0](); gates[1](); // отпускаем оба «одновременно»
+    await settle();
+
+    expect(post).toHaveBeenCalledTimes(1); // только один дошёл до релея
+
+    up.push(DELTA); up.push(DONE); up.push(null);
+    const results = await Promise.allSettled([callA, callB]);
+    const fulfilled = results.filter((r) => r.status === 'fulfilled');
+    const rejected = results.filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0].reason).toBeInstanceOf(RelaySessionBusyError);
+  });
+
+  it('RACE2: ход человека начинается, пока фоновый ждёт route() — фоновый бросает, релей для него не вызывается', async () => {
+    const svc = makeService();
+    let releaseRoute!: () => void;
+    (resolveAnswerProvider as jest.Mock).mockImplementationOnce(
+      () => new Promise((resolve) => { releaseRoute = () => resolve({ provider: 'claude', choice: null }); }),
+    );
+
+    const bg = bgTurn(svc, 'рутина');
+    await settle();
+    expect(typeof releaseRoute).toBe('function'); // фоновый дошёл до route() и встал там
+    expect(post).not.toHaveBeenCalled();
+
+    // Человек пишет той же паре, пока фоновый ждёт, — beginRelayRun (внутри
+    // streamUniversalAgent) ставит метку в relayRunning раньше, чем фоновый
+    // успевает дойти до своего openMark.
+    const t = textTurn(svc, 'привет');
+    t.up.push(DELTA);
+    await settle();
+    expect(post).toHaveBeenCalledTimes(1); // дошёл только текстовый ход человека
+
+    releaseRoute(); // отпускаем фоновый — он должен увидеть занятую сессию
+    await settle();
+
+    // Сначала — быстрая и однозначная проверка (иначе под старым багом эта
+    // проверка молчит, а следующая зависает: фоновый реально ушёл бы в
+    // релей вторым вызовом post, но его апстрим в очереди не подготовлен).
+    expect(post).toHaveBeenCalledTimes(1); // фоновый до релея так и не дошёл
+    await expect(bg.call).rejects.toThrow(RelaySessionBusyError);
+
+    t.up.push(DONE); t.up.push(null);
+    await t.done;
+  });
+
+  it('axios.post отказал до потока (reject) — activeStreams возвращается к 0, следующий фоновый ход стартует', async () => {
+    const svc = makeService();
+    queue.push(new Error('ECONNREFUSED'));
+    const first = svc.generateAgentReply('u1', '14', 'рутина 1');
+    await settle();
+    await expect(first).rejects.toThrow('ECONNREFUSED');
+    expect(svc.getActiveStreamCount()).toBe(0);
+
+    const second = bgTurn(svc, 'рутина 2');
+    await settle();
+    expect(post).toHaveBeenCalledTimes(2); // второй реально дошёл — метка первого снята
+    second.up.push(DELTA); second.up.push(DONE); second.up.push(null);
+    await expect(second.call).resolves.toBe('ответ');
   });
 });
