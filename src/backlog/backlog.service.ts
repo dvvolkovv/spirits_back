@@ -197,8 +197,10 @@ export class BacklogService implements OnModuleInit {
       parsed = JSON.parse(cleaned);
     } catch (e: any) {
       this.logger.warn(`createFromTicket: Claude parse failed (${e.message}), inserting a stub`);
+      // Без user_id: заголовок уходит в снимок ВПМ и маркетолога, а оттуда в
+      // промпт модели; у пользователей с телефоном user_id — номер.
       parsed = {
-        title: ticket.topic || `Запрос от пользователя ${ticket.user_id}`,
+        title: ticket.topic || `Запрос из тикета ${ticketId.slice(0, 8)}`,
         analysis_md: '## Запрос пользователя\n\n_Автоматическая сводка не получилась. Сырая переписка:_\n\n```\n' +
           conversation.slice(0, 4000) +
           '\n```',
