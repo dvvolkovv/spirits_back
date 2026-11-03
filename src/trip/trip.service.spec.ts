@@ -337,6 +337,10 @@ describe('computeCopilotState', () => {
       expect(store.upsert).not.toHaveBeenCalled();
       expect(warnSpy).not.toHaveBeenCalled();
       expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('занята'));
+      // Ревью 03.11, п.2: журнал — без номеров (у старых аккаунтов userId —
+      // телефон). 'u1' здесь не номер, но проверка та же, что защитит
+      // реальный id.
+      expect(logSpy.mock.calls[0][0]).not.toContain('u1');
     });
   });
 
