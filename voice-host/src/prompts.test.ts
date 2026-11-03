@@ -1,6 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  ASK_SPECIALIST_DESCRIPTION,
   answerTo,
   answerToChat,
   CALL_CRISIS_RULE,
@@ -52,6 +53,55 @@ describe('доступ к интернету', () => {
       name: 'Роман', persona: 'ведущий', preamble: '', specialists: SPECIALISTS,
     }));
     assert.match(s, /не можешь посмотреть в интернете/i);
+  });
+});
+
+/**
+ * Свежее — сразу коллеге, а не совет «посмотрите в приложении».
+ *
+ * Встреча 06.10.2026: «Роман, какая сейчас погода в Уфе?» — дважды, и ни
+ * одного вызова; вопрос ушёл Александре, только когда сказали «СПРОСИ, какая
+ * погода». 03.11.2026 на «почему у тебя нет интернета» — снова ни одного
+ * вызова. В промпте встречи не было перечня тем, у тула в описании ни слова
+ * про сеть, а отослать к сервису погоды не запрещало ни одно правило.
+ * Погода ни у кого не в профиле — без коллеги по умолчанию модель
+ * застревает на выборе; владелец назначил Александру.
+ */
+describe('свежее — через коллег', () => {
+  const meeting = (specialists = SPECIALISTS) => flat(meetingInstructions({
+    name: 'Роман', persona: 'ведущий', preamble: '', specialists,
+  }));
+  const call = (specialists = SPECIALISTS) => flat(callInstructions('', specialists));
+
+  test('на встрече — тот же перечень тем, что в звонке', () => {
+    const s = meeting();
+    for (const topic of ['погоду', 'курсы', 'новости']) assert.ok(s.includes(topic), `нет темы «${topic}»`);
+    assert.match(s, /ask_specialist/);
+  });
+
+  for (const [mode, build] of [['звонок', call], ['встреча', meeting]] as const) {
+    test(`${mode}: не отсылать к сервисам и приложениям`, () => {
+      assert.match(build(), /Не советуй посмотреть самому — в приложении, на сайте или в сервисе/);
+    });
+
+    test(`${mode}: вне чьего-либо профиля — Александра`, () => {
+      assert.match(build(), /ни к чьей части — спрашивай Александру/);
+    });
+
+    test(`${mode}: нет Александры в составе — не называем её`, () => {
+      // Иначе модель позовёт коллегу, которого бэкенд не знает, и получит отказ.
+      const s = build([{ name: 'Алексей', role: 'юрист' }]);
+      assert.ok(!s.includes('Александр'), 'Александра названа, хотя её нет в составе');
+      assert.match(s, /ни к чьей части — бери ближайшего по теме/);
+    });
+  }
+
+  test('описание тула говорит про сеть и свежие данные', () => {
+    // Realtime-модель выбирает тул прежде всего по описанию, а погода ни у
+    // кого не в профиле: «вопрос профильному специалисту» её не цепляет.
+    assert.match(ASK_SPECIALIST_DESCRIPTION, /интернет/);
+    assert.match(ASK_SPECIALIST_DESCRIPTION, /погод/);
+    assert.match(ASK_SPECIALIST_DESCRIPTION, /БЕЗ ответа/);
   });
 });
 

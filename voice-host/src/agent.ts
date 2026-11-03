@@ -35,6 +35,7 @@ import { Room as ExternalRoom } from '@livekit/rtc-node';
 import {
   answerTo,
   answerToChat,
+  ASK_SPECIALIST_DESCRIPTION,
   callInstructions,
   callIntro,
   listenAck,
@@ -799,9 +800,7 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
 
     const tools = {
       ask_specialist: llm.tool({
-        description:
-          'Поставить вопрос профильному специалисту. Возвращается сразу, БЕЗ ответа. ' +
-          'Ответ придёт позже, и ты озвучишь его сам.',
+        description: ASK_SPECIALIST_DESCRIPTION,
         parameters: z.object({
           specialist: z.string().describe('Имя специалиста'),
           question: z.string().describe('Вопрос целиком, со всем нужным контекстом'),
@@ -1120,8 +1119,12 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
         return;
       }
       if (msg.type === 'specialist_answer') {
+        // Без этой строки не видно, доехал ли ответ: 06.10.2026 вопрос
+        // Александре ушёл, а вернулся ли — по логу не понять.
+        console.log(`[коллега] ответ от ${msg.specialist}: ${String(msg.text).length} знаков`);
         pushLine(`${INTERNAL_PREFIX} от коллеги ${msg.specialist}]: ${msg.text}`);
       } else if (msg.type === 'specialist_failed') {
+        console.log(`[коллега] ${msg.specialist} не ответил: ${msg.reason}`);
         pushLine(
           `${INTERNAL_PREFIX}: ${msg.specialist} не ответил (${msg.reason}). Извинись и ответь сам.]`,
         );
