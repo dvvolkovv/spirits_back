@@ -28,6 +28,8 @@ export function startClientPing(sendPing: () => void): ClientPing {
     lastWriteAt = Date.now();
     sendPing();
   }, CLIENT_PING_CHECK_MS);
+  // Процесс пинг не держит: упавший посреди хода спек не вешает воркер jest.
+  timer.unref?.();
   return {
     touch: () => { lastWriteAt = Date.now(); },
     stop: () => clearInterval(timer),

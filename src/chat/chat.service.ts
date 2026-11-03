@@ -1688,8 +1688,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
       });
     }
 
-    // Пинг клиенту на долгом ходе (client-ping.ts): заводится после `begin`,
-    // а тишину отсчитывает каждая строка, ушедшая клиенту через safeWrite.
+    // Пинг клиенту на долгом ходе (client-ping.ts): заводится в начале хода,
+    // в try ниже, а тишину отсчитывает каждая строка, ушедшая через safeWrite.
     let clientPing: ClientPing | null = null;
 
     // Safe res.write — drops writes after client disconnect, never throws upward.
@@ -1878,13 +1878,6 @@ ${LanguageService.buildDirective(userLanguage)}`;
     res.setHeader('Access-Control-Allow-Origin', '*');
 
     safeWrite({ type: 'begin' });
-
-    // Пинг, пока клиенту долго ничего не уходит: держит соединение через nginx
-    // (proxy_read_timeout) и клиентов с таймаутом ожидания строки — Flutter,
-    // внешние сервисы. Веб и Flutter незнакомый тип пропускают.
-    clientPing = startClientPing(() => {
-      if (!res.writableEnded) safeWrite({ type: 'ping' });
-    });
 
     const streamStartTime = Date.now();
     const chunks: string[] = []; // hoisted so catch block can access partial response
@@ -2160,6 +2153,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // при любом исходе.
       this.activeStreams++;
       turnMark = this.openTurn(`${userId}_${assistantId}`, streamStartTime);
+      // Пинг, пока клиенту долго ничего не уходит: держит соединение через
+      // nginx (proxy_read_timeout) и клиентов с таймаутом ожидания строки —
+      // Flutter, внешние сервисы; веб и Flutter незнакомый тип пропускают.
+      // Внутри try — чтобы finally гасил его при любом исходе.
+      clientPing = startClientPing(() => {
+        if (!res.writableEnded) safeWrite({ type: 'ping' });
+      });
       // Один вызов upstream r.linkeon: парсит SSE, пушит в chunks и стримит
       // 'item' клиенту. Вынесено в замыкание ради self-heal ретрая пустого потока.
       // relaySid уже посчитан выше (до проверки строки о прерывании) — тот же
