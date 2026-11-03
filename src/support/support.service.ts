@@ -976,8 +976,13 @@ ${healthSummary}
     ticketId: string,
     dto: { assigneeId: string | null; expectedUpdatedAt: string },
   ): Promise<SupportTicketRow> {
-    if (typeof dto.expectedUpdatedAt !== 'string' || !dto.expectedUpdatedAt.trim()) {
+    if (!dto || typeof dto !== 'object'
+      || typeof dto.expectedUpdatedAt !== 'string' || !dto.expectedUpdatedAt.trim()) {
       throw new BadRequestException('expectedUpdatedAt required');
+    }
+    const expectedUpdatedAtMs = Date.parse(dto.expectedUpdatedAt);
+    if (!Number.isFinite(expectedUpdatedAtMs)) {
+      throw new BadRequestException('expectedUpdatedAt must be a valid date');
     }
 
     const client = await this.pg.getClient();
@@ -989,7 +994,7 @@ ${healthSummary}
       );
       const ticket = locked.rows[0];
       if (!ticket) throw new NotFoundException('ticket not found');
-      if (new Date(ticket.updated_at).getTime() !== Date.parse(dto.expectedUpdatedAt)) {
+      if (new Date(ticket.updated_at).getTime() !== expectedUpdatedAtMs) {
         throw new ConflictException('ticket was updated');
       }
 

@@ -14,6 +14,10 @@ export interface SupportTicketRow {
   updated_at: string;
   last_message_at: string | null;
   resolved_at: string | null;
+  assigned_to: string | null;
+  assigned_at: string | null;
+  first_response_due_at: string | null;
+  first_owner_reply_at: string | null;
 }
 
 export interface SupportMessageRow {
