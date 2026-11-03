@@ -302,7 +302,7 @@ export function buildCliEnv({ baseEnv, providerEnv, fsKey, scrub }) {
 assert.equal(AGENT_SCRATCH_ROOT, '/tmp/agent-scratch');
 assert.equal(AGENT_MCP_DIR, '/tmp/agent-mcp');
 // ensureSessionDirs(fsKey) создаёт /tmp/agent-scratch/<fsKey> и /tmp/agent-output/<fsKey> (0700) и возвращает scratch
-// ensureListingGuard() делает chmod 0311 на /tmp/agent-output и /tmp/agent-uploads (idempotent, не падает, если нет)
+// ensureListingGuard() делает chmod 0311 на /tmp/agent-output, /tmp/agent-uploads и /tmp/agent-scratch (idempotent, не падает, если нет)
 ```
 
 (Импортировать новые константы/функции из `./paths.mjs`.) Прогон на ноде — красный.
@@ -310,11 +310,11 @@ assert.equal(AGENT_MCP_DIR, '/tmp/agent-mcp');
 - [ ] **Step 2: зелень** — в `relay-agent/paths.mjs` добавить:
 
 ```javascript
-export const AGENT_SCRATCH_ROOT = '/tmp/agent-scratch';
-export const AGENT_MCP_DIR = '/tmp/agent-mcp';
+import { AGENT_SCRATCH_ROOT, AGENT_MCP_DIR } from './sandbox-policy.mjs';
+export { AGENT_SCRATCH_ROOT, AGENT_MCP_DIR };
 
-export async function ensureSessionDirs(fsKey, outputs = '/tmp/agent-output') {
-  const scratch = path.join(AGENT_SCRATCH_ROOT, fsKey);
+export async function ensureSessionDirs(fsKey, { scratchRoot = AGENT_SCRATCH_ROOT, outputs = '/tmp/agent-output' } = {}) {
+  const scratch = path.join(scratchRoot, fsKey);
   await fsp.mkdir(scratch, { recursive: true, mode: 0o700 });
   await fsp.mkdir(path.join(outputs, fsKey), { recursive: true, mode: 0o700 });
   await fsp.chmod(scratch, 0o700);
@@ -323,8 +323,10 @@ export async function ensureSessionDirs(fsKey, outputs = '/tmp/agent-output') {
 }
 
 // 0311: по имени папки можно зайти, перечислить чужие нельзя. Релей списком не читает.
-export async function ensureListingGuard(outputs = '/tmp/agent-output', uploads = '/tmp/agent-uploads') {
-  for (const d of [outputs, uploads]) {
+// scratch включён обязательно: все ходы под одним uid, поэтому 0700 на корне
+// не закрыло бы ассистенту листинг чужих scratch-каталогов.
+export async function ensureListingGuard({ outputs = '/tmp/agent-output', uploads = '/tmp/agent-uploads', scratchRoot = AGENT_SCRATCH_ROOT } = {}) {
+  for (const d of [outputs, uploads, scratchRoot]) {
     await fsp.mkdir(d, { recursive: true });
     await fsp.chmod(d, 0o311);
   }
@@ -378,7 +380,7 @@ http_access deny all
 ```
 
 `sudo systemctl restart squid && sudo systemctl enable squid`. Проверки: `curl -x http://127.0.0.1:8471 -sI -m 8 https://example.com | head -1` → 200; `curl -x http://127.0.0.1:8471 -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:3033/` → 403 (squid access denied); то же для `http://169.254.169.254/` → 403.
-- [ ] 4. Права: `sudo mkdir -p /tmp/agent-mcp /tmp/agent-scratch && sudo chown dv:dv /tmp/agent-mcp /tmp/agent-scratch && chmod 0311 /tmp/agent-output /tmp/agent-uploads && chmod 0700 /tmp/agent-mcp /tmp/agent-scratch` → проверка: `ls /tmp/agent-output` от пользователя `nobody`? (нельзя удобно) — проверка через `sudo -u nobody ls /tmp/agent-output 2>&1 | head -1` ожидает «Permission denied».
+- [ ] 4. Права: `sudo mkdir -p /tmp/agent-mcp /tmp/agent-scratch && sudo chown dv:dv /tmp/agent-mcp /tmp/agent-scratch && chmod 0311 /tmp/agent-output /tmp/agent-uploads /tmp/agent-scratch && chmod 0700 /tmp/agent-mcp` → проверка: `ls /tmp/agent-output` от пользователя `nobody`? (нельзя удобно) — проверка через `sudo -u nobody ls /tmp/agent-output 2>&1 | head -1` ожидает «Permission denied».
 - [ ] 5. Уборка корня `/tmp` (старое рабочее): НЕ трогая `agent-output`, `agent-uploads`, `agent-mcp`, `agent-scratch`, `systemd-private*`, `ssh-*`, `node-compile-cache`, `.org.chromium.Chromium.*`: собрать кандидатов `find /tmp -maxdepth 1 -mindepth 1 -mtime +3`, показать владельцу список-маску (без номеров), после его «да» — `tar -czf ~/linkeon-orphans-oldtmp-$(date +%Y%m%d).tar.gz -C /tmp <список>` (umask 077), сверить число записей, удалить исходники.
 - [ ] 6. Файлы режима: `printf 'off\n' > ~/file-agent/sandbox-mode && chmod 600 ~/file-agent/sandbox-mode && cp ~/relay-scrub-canary.keys ~/file-agent/sandbox-canary.keys && chmod 600 ~/file-agent/sandbox-canary.keys` (список = 92 ключа владельца из канарейки чистки).
 - [ ] 7. Фиксация: вывод каждого шага — в журнал выполнения; фото-снимок не нужен, достаточно текстовой фиксации здесь.
@@ -388,7 +390,7 @@ http_access deny all
 ## Task 5: Стенд-прогон
 
 - [ ] 1. Стенд: копия `~/file-agent` → `~/file-agent-sandbox` (исключить `sessions.json`, `sandbox-*`, `node_modules` нет), порты 3036/3037 (по аналогии с прежним стендом; порт — env/аргумент server.mjs), `sandbox-mode` = `on`. Запуск: `cd ~/file-agent-sandbox && pm2 start ...` или `node server.mjs` под nohup; проверка `curl -s 127.0.0.1:3036/health` (или аналогичный лёгкий эндпоинт — смотреть в коде).
-- [ ] 2. Прогоны из чеклиста спеки (каждый — Bash-команда в ходе ассистента стенда): `env | grep -cE 'GEMINI_API_KEY|OPENROUTER_API_KEY'` = 0; `sudo -n true` ≠ 0; `cat /home/dv/file-agent/sessions.json` ≠ 0; `ls /tmp/agent-output` — без имён чужих папок; `curl -sI -m 8 https://example.com` — ок; `curl -s -m 3 http://127.0.0.1:3033/` — по схеме Task 0 (A: отказ); `pip install --quiet sampleproject` — ок; прокси: `curl -sI -m 8 https://example.com` (без -x, через env) — ок; `curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:3033/` → не 200; `curl -s -m 5 -o /dev/null -w '%{http_code}' http://169.254.169.254/` → не 200; `echo x > /tmp/agent-scratch/<fs_key>/f` — ок; `/files/<fs_key>/…` отдаётся (через nginx прод-релея, папку не путать со стендом).
+- [ ] 2. Прогоны из чеклиста спеки (каждый — Bash-команда в ходе ассистента стенда): `env | grep -cE 'GEMINI_API_KEY|OPENROUTER_API_KEY'` = 0; `sudo -n true` ≠ 0; `cat /home/dv/file-agent/sessions.json` ≠ 0; `ls /tmp/agent-output` — без имён чужих папок; `ls /tmp/agent-scratch` — permission denied; свой `/tmp/agent-scratch/<fs_key>/f` читается и пишется; чужой scratch по полному пути — недоступен/не должен использоваться (остаточный риск угадываемого legacy-ключа фиксируем); `curl -sI -m 8 https://example.com` — ок; `curl -s -m 3 http://127.0.0.1:3033/` — по схеме Task 0 (A: отказ); `pip install --quiet sampleproject` — ок; прокси: `curl -sI -m 8 https://example.com` (без -x, через env) — ок; `curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:3033/` → не 200; `curl -s -m 5 -o /dev/null -w '%{http_code}' http://169.254.169.254/` → не 200; `echo x > /tmp/agent-scratch/<fs_key>/f` — ок; `/files/<fs_key>/…` отдаётся (через nginx прод-релея, папку не путать со стендом).
 - [ ] 3. Три живых хода на Claude (простой вопрос, ход с файлом, ход со скачиванием картинки по внешней ссылке) — без ошибок, ответы осмысленные.
 - [ ] 4. Те же три хода на Qwen и на Kimi (переключатель провайдера стенда) — без ошибок; в выводе `env` нет токенов.
 - [ ] 5. Замер: средняя длительность хода со песочницей vs без (по журналу, ≥5 ходов) — дельта записывается; > 30 с — отметка для владельца.
