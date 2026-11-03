@@ -18,6 +18,8 @@ import { TalerIdRoomClient } from '../meeting/talerid-room.client';
 import { RESPONSE_STYLE_RULE } from './response-style';
 import { ANSWER_FIRST_RULE } from './answer-first-rule';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
+import { INTERRUPTED_TURN_NOTE } from './interrupted-turn';
+import { noTokensMessage, NoTokensOpts } from './no-tokens-message';
 import { CRISIS_RULE } from './crisis-rule';
 import { loadCoworkers } from './coworkers';
 import { colleaguesRule } from './colleagues-rule';
@@ -26,6 +28,7 @@ import { clientKind } from './client-kind';
 import { ClientUi, NO_CLIENT_UI } from './client-ui';
 import { toActivity } from './activity-map';
 import { ASK_RULE } from './ask-rule';
+import { WORK_RULES } from './work-rules';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
 import { LinkeonRelayFields, appendLinkeonFields, linkeonRelayFields, relayFsKey } from './linkeon-relay-fields';
@@ -381,7 +384,10 @@ export class ChatService {
   private activeStreams = 0;
 
   /**
-   * Живые ходы поимённо: `${userId}_${assistantId}` → когда начался.
+   * Живые ходы поимённо: `${userId}_${assistantId}` → метка хода (время
+   * начала; при коллизии в ту же мс — время +1, см. openTurn). Только для
+   * кабинета (GET /chat/active-turn, getActiveTurn/activeAssistantFor) — НЕ
+   * для решения «пре-эмптит ли реплика ход на релее» (см. relayRunning ниже).
    *
    * Счётчика выше не хватает: он отвечает деплою на вопрос «можно ли сейчас
    * рестартовать», а фронту нужен другой — «идёт ли ход ИМЕННО у меня». Без
@@ -391,6 +397,40 @@ export class ChatService {
    * убивал собственный ход (релей пре-эмптит предыдущий процесс сессии).
    */
   private readonly activeTurns = new Map<string, number>();
+
+  /**
+   * Запрос хода ЧЕЛОВЕКА к релею в полёте — по ключу сессии (relaySid =
+   * relaySessionKey(...)), метка того же устройства, что у activeTurns
+   * (openTurn/closeTurn), но другой ключ и другое назначение: по этой карте
+   * решается, пре-эмптит ли входящая реплика чужой ход на релее
+   * (interrupted-turn.ts), а не «идёт ли ход у пары» для кабинета.
+   *
+   * «В полёте» — шире, чем «процесс на релее прямо сейчас существует»: окно
+   * открыто и до того, как сам HTTP-запрос дойдёт и релей поднимет процесс,
+   * и во время паузы self-heal (800 мс между пустым прогоном и повтором) —
+   * прежний процесс уже закрыл поток, следующего ещё нет, но повтор всё
+   * равно уйдёт в ту же сессию и будет с ней конкурировать, если её к этому
+   * моменту не перехватил настоящий новый ход (самоисцеление — ниже, в
+   * streamUniversalAgent).
+   *
+   * activeTurns занят весь ход, включая копирование файлов и персист ПОСЛЕ
+   * ответа (до ~60 с) — релея там уже нет, убивать нечего. relayRunning занят
+   * только пока длится сам запрос к релею: открывается вокруг callUpstreamOnce
+   * (и self-heal повтора), закрывается в finally ДО копирования. Ключ — сам
+   * relaySid, а не userId_assistantId: у «чистого листа» и у обычного хода
+   * той же пары разные relaySid (freshSessionId входит в ключ), и прерывание
+   * одного не задевает другой (находки ревью Б2 Step 6).
+   *
+   * Слепая зона: agentReply (рутины, «Путь», план действий, итоги звонков,
+   * проба качества) считает relaySid той же формулой и пишет в ТУ ЖЕ сессию
+   * релея, что и обычный чат, но эту карту не трогает вовсе — своего
+   * beginRelayRun/endRelayRun у него нет. Сообщение человека, пришедшее во
+   * время такого фонового хода, не увидит «тот ход прерван», хотя на релее
+   * произойдёт именно это (общий sessionId). Не находка: фоновые ходы
+   * короче, чем решается человек на следующую реплику, и коллизии с ними
+   * пока не видели.
+   */
+  private readonly relayRunning = new Map<string, number>();
 
   /** Ходов в полёте. 0 — можно перезапускать, не порвав ничей ответ. */
   getActiveStreamCount(): number {
@@ -419,6 +459,65 @@ export class ChatService {
   }
 
   /**
+   * Ставит метку в `map` под ключом `key`. Возвращает метку: снять её может
+   * только хозяин (closeMark с той же меткой) — общий механизм для двух
+   * разных карт (activeTurns, relayRunning), у каждой свой ключ и смысл.
+   *
+   * Метка обязана отличаться от прежней: прерванный ход (релей пре-эмптит
+   * процесс сессии, когда приходит новое сообщение) доходит до finally ПОЗЖЕ,
+   * чем новый ход поставил свою отметку, и безусловный delete стирал её.
+   * Кабинет после этого считал, что хода нет, слал следующее «?» сразу — и
+   * релей пре-эмптил уже новый ход (находка 2ff1a026).
+   */
+  private openMark(map: Map<string, number>, key: string, startedAt: number = Date.now()): number {
+    const prev = map.get(key);
+    const mark = prev !== undefined && startedAt <= prev ? prev + 1 : startedAt;
+    map.set(key, mark);
+    return mark;
+  }
+
+  /** Снимает метку из `map`, только если она этого хозяина: кто-то мог её уже переписать. */
+  private closeMark(map: Map<string, number>, key: string, mark: number): void {
+    if (map.get(key) === mark) map.delete(key);
+  }
+
+  private openTurn(key: string, startedAt: number = Date.now()): number {
+    return this.openMark(this.activeTurns, key, startedAt);
+  }
+
+  /** Снимает отметку, только если она этого хода: новый ход мог её уже переписать. */
+  private closeTurn(key: string, mark: number): void {
+    this.closeMark(this.activeTurns, key, mark);
+  }
+
+  /**
+   * Живой процесс релея данной сессии (relayRunning, ключ relaySid) — учёт
+   * ОТДЕЛЬНЫЙ от activeTurns, см. комментарий у объявления relayRunning.
+   * Публичные: нужны и ChatController.uploadAndChat (свой relaySid —
+   * handoff.sessionId), и streamUniversalAgent.
+   */
+  beginRelayRun(relaySid: string): number {
+    return this.openMark(this.relayRunning, relaySid);
+  }
+
+  endRelayRun(relaySid: string, mark: number): void {
+    this.closeMark(this.relayRunning, relaySid, mark);
+  }
+
+  /**
+   * Ход с вложениями (ChatController.uploadAndChat) — в тот же учёт, что и
+   * текстовый: иначе посреди долгого разбора файла кабинет не видит хода и
+   * шлёт «?» сразу, а релей его пре-эмптит.
+   */
+  beginUploadTurn(userId: string, assistantId: string): number {
+    return this.openTurn(`${userId}_${assistantId}`);
+  }
+
+  endUploadTurn(userId: string, assistantId: string, mark: number): void {
+    this.closeTurn(`${userId}_${assistantId}`, mark);
+  }
+
+  /**
    * Идёт ли прямо сейчас ход по этой паре пользователь+ассистент, и сколько он
    * уже длится. Для индикатора «ассистент работает» после перезагрузки.
    */
@@ -431,11 +530,10 @@ export class ChatService {
 
   /**
    * Ассистент самого свежего хода этого пользователя — для подписи сообщений
-   * в поддержку (src/problem-report). Ход открыт и в пути релея, и у Маши;
-   * ключ activeTurns — `${userId}_${assistantId}`, а в userId подчёркиваний не
-   * бывает (телефон или UUID). Хода нет — null. Ход с вложениями
-   * (uploadAndChat) сюда не попадает: для него вернётся ассистент другого
-   * идущего хода этого пользователя, если такой есть, иначе null.
+   * в поддержку (src/problem-report). Ход открыт в пути релея, у Маши и у
+   * хода с вложениями (ChatController.uploadAndChat, beginUploadTurn) — все
+   * три пишут в тот же activeTurns. Ключ — `${userId}_${assistantId}`, а в
+   * userId подчёркиваний не бывает (телефон или UUID). Хода нет — null.
    */
   activeAssistantFor(userId: string): string | null {
     const prefix = `${userId}_`;
@@ -767,6 +865,12 @@ export class ChatService {
       stablePrefix += `${platformGuide(userLanguage, { helpTool: LINKEON_HELP_CLI_TOOL_NAME, store: opts.storeBuild, initiative: true })}\n\n${TOOLS_LIST_NOTE}\n\n`;
     }
 
+    // Правила длинной работы с файлами — всем ассистентам релея, и штатным, и
+    // пользовательским (work-rules.ts; находки «Затыков недели» 02.11.2026).
+    // До профиля: профиль меняется от консолидации, правила — нет, и начало
+    // префикса остаётся кэшируемым.
+    stablePrefix += `${WORK_RULES}\n\n`;
+
     // Профиль и бизнес-карточка — в СТАБИЛЬНУЮ часть, к персоне.
     //
     // Они меняются, но не от хода к ходу: профиль пополняется консолидацией
@@ -809,6 +913,21 @@ export class ChatService {
     // ход после переключения идёт по холодному кэшу релея. Осознанный
     // размен: платим кэшем ровно за переключение, а не постоянно.
     if (opts.ask) stablePrefix += `${ASK_RULE}\n\n`;
+
+    // Сторож размера: stablePrefix уходит релею ОДНИМ аргументом CLI (предел
+    // 128 КБ на аргумент) — WORK_RULES держит свой бюджет (≤ 6 КБ,
+    // work-rules.spec.ts), но персона ассистента, коллеги, профиль и
+    // бизнес-карточка вместе могут раздуть префикс незаметно, по кускам.
+    // 100 000 — заранее, с запасом до предела. В лог — только метрика (длина,
+    // agentId, признак custom), без текста самого промпта: в нём профиль и
+    // бизнес-карточка пользователя.
+    const prefixBytes = Buffer.byteLength(stablePrefix, 'utf8');
+    if (prefixBytes > 100_000) {
+      this.logger.warn(
+        `buildRelayStablePrefix: ${prefixBytes} байт для agentId=${agentId}` +
+        `${isCustom ? ' (custom)' : ''} — близко к пределу аргумента CLI (128 КБ)`,
+      );
+    }
 
     return stablePrefix;
   }
@@ -1068,10 +1187,13 @@ export class ChatService {
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('X-Accel-Buffering', 'no');
         res.setHeader('Access-Control-Allow-Origin', '*');
-        const noTokensMsg = '⚠️ **Недостаточно токенов**\n\nВаш баланс исчерпан. Пополните баланс, чтобы продолжить общение с ассистентами.\n\n👉 [Пополнить баланс](/chat?view=tokens)';
+        const noTokensMsg = await this.noTokensReply(userId, requestLang, { storeBuild });
         res.write(JSON.stringify({ type: 'begin' }) + '\n');
         res.write(JSON.stringify({ type: 'item', content: noTokensMsg }) + '\n');
-        res.write(JSON.stringify({ type: 'end', content: noTokensMsg, usage: { input: 0, output: 0, total: 0 } }) + '\n');
+        // reason: 'no_tokens' — старые клиенты лишнее поле в событии молча
+        // игнорируют; новым и e2e/мониторингу есть за что зацепиться без
+        // разбора текста (находка ревью качества 02.11, S1).
+        res.write(JSON.stringify({ type: 'end', content: noTokensMsg, reason: 'no_tokens', usage: { input: 0, output: 0, total: 0 } }) + '\n');
         res.end();
         return;
       }
@@ -1083,6 +1205,10 @@ export class ChatService {
     const balanceBlock = await this.balanceCtx.buildContextForPrompt(userId, balance, {
       isGreeting: isGreetingMsg,
       storeBuild,
+      // agent.id, не сырой assistantId: для именных ассистентов (запрос по
+      // имени, см. resolveAgent) и кастомных (`custom:…`) это разные формы —
+      // медиана пары в forecastMessages разбирает только числовой agent.id.
+      assistantId: String(agent.id),
     });
 
 
@@ -1233,9 +1359,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // (пока подбирается карта), клиенты пропускают; после end таймер не
     // вклинится — запись end и finally идут синхронно.
     let ping: NodeJS.Timeout | null = null;
+    // Метка этого хода (openTurn/closeTurn) — см. комментарий у openTurn: снять
+    // отметку в finally можно только если она ещё своя, а не уже переписана
+    // новым ходом по той же паре.
+    let turnMark: number | null = null;
     try {
       this.activeStreams++;
-      this.activeTurns.set(turnKey, turnStartedAt);
+      turnMark = this.openTurn(turnKey, turnStartedAt);
       // Пока думает CLI, клиенту не уходит ничего до самого ответа — а это минуты.
       // Flutter-клиент (Dio receiveTimeout 60 с) рвал такой ход ошибкой. Пинг —
       // той же формы, что у релея: {"type":"ping"} без content/text/delta, его
@@ -1407,7 +1537,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     } finally {
       if (ping) clearInterval(ping);
       this.activeStreams--;
-      this.activeTurns.delete(turnKey);
+      if (turnMark !== null) this.closeTurn(turnKey, turnMark);
     }
   }
 
@@ -1688,6 +1818,30 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // 309k символов из 813k в замеренной сессии.
     const historyBlock = this.renderHistoryBlock(recentHistory);
 
+    // Ключ сессии релея — чистая функция от уже известных
+    // userId/assistantId/userLanguage/fresh. Поднят сюда (выше проверки ниже
+    // и выше своего прежнего места у callUpstreamOnce), чтобы проверка строки
+    // о прерывании и реальный вызов релея дальше сверялись по ОДНОМУ и тому
+    // же значению, а не считали его дважды.
+    const relaySid = relaySessionKey(userId, assistantId, userLanguage, fresh ? freshSessionId : undefined);
+
+    // Сообщение посреди идущего хода той же сессии релея пре-эмптит его —
+    // скажем модели, что прошлая работа прервана и что с ней делать
+    // (interrupted-turn.ts). Проверяем по ЖИВОМУ ПРОЦЕССУ релея этой самой
+    // сессии (relayRunning, ключ relaySid) — НЕ по activeTurns (учёт кабинета
+    // по паре пользователь+ассистент, GET /chat/active-turn): activeTurns
+    // остаётся занятым всё время копирования файлов и персиста ПОСЛЕ того,
+    // как релей уже прислал `done` и его процесс закончился — иначе человек
+    // получал бы «тот ход прерван» про ход, который на самом деле уже
+    // доставлен (до ~60 с на копию). Чистый лист и обычный ход одной пары —
+    // РАЗНЫЕ relaySid (freshSessionId входит в ключ), поэтому отдельная
+    // проверка !fresh не нужна — эту роль уже играет сравнение по relaySid;
+    // старая проверка по activeTurns + !fresh путала оба случая (находки
+    // ревью Б2 Step 6: копия файлов, чистый лист, разные языковые сессии).
+    if (!probe && this.relayRunning.has(relaySid)) {
+      contextPrefix += `${INTERRUPTED_TURN_NOTE}\n\n`;
+    }
+
     // Требование языка — ПОСЛЕ всех дописанных блоков, перед самой репликой.
     //
     // Директива есть и в stablePrefix (то есть в системном промпте), но за ней
@@ -1817,6 +1971,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
     let turnProvider: LlmProvider | undefined;
     let turnFallback = false;
 
+    // Self-heal ниже может пропустить повтор, потому что за пустой прогон и
+    // паузу сессию перехватил настоящий новый ход (relayRunning.get(relaySid)
+    // !== relayMark) — тогда ЭТОТ ход завершается пустым не по вине модели:
+    // ответ на самом деле уже готовит другой, более новый ход той же сессии.
+    // persistResponse ниже из-за этого флага не подставляет заглушку «Ответ
+    // не пришёл, попробуйте ещё раз» в историю: совет пробовать снова был бы
+    // ложным, пробовать уже не нужно. В поток клиенту заглушка и без этого
+    // флага не попадает — здесь, в обычном завершении, туда уходит fullText
+    // (пустая строка), заглушка живёт только в этом aiText для истории.
+    let selfHealSkippedForTakeover = false;
+
     // Single persistence point — dedupe via `saved` flag so success and error paths
     // both call but only one actually writes.
     let saved = false;
@@ -1879,7 +2044,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // If empty on final: don't pollute history with a stub AI row; save user message + a brief retry-hint.
       // (Frontend will reload history; user can simply resend.)
       const aiText = fullText
-        || (final ? '_Ответ не пришёл. Попробуйте отправить сообщение ещё раз._' : '');
+        || (final && !selfHealSkippedForTakeover ? '_Ответ не пришёл. Попробуйте отправить сообщение ещё раз._' : '');
       if (!aiText) return; // skip empty intermediate persists
       // ЭТО реальная точка списания (ниже addTokenTask). Логируем только здесь:
       // путь показа считает то же самое, дублировать в лог незачем.
@@ -1981,17 +2146,21 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // внутри.
     const productsTurn = randomUUID();
 
+    // Метка этого хода (openTurn/closeTurn) — см. комментарий у openTurn: снять
+    // отметку в finally можно только если она ещё своя, а не уже переписана
+    // новым ходом по той же паре (находка «Затыков недели» 2ff1a026).
+    let turnMark: number | null = null;
+
     try {
       // Ход пошёл в upstream — с этого места и до finally его нельзя рвать
       // рестартом. Инкремент внутри try, чтобы декремент в finally был парным
       // при любом исходе.
       this.activeStreams++;
-      this.activeTurns.set(`${userId}_${assistantId}`, streamStartTime);
+      turnMark = this.openTurn(`${userId}_${assistantId}`, streamStartTime);
       // Один вызов upstream r.linkeon: парсит SSE, пушит в chunks и стримит
       // 'item' клиенту. Вынесено в замыкание ради self-heal ретрая пустого потока.
-      // Ключ сессии релея: и в запросе, и для шагов работы — релей кладёт
-      // загрузки под именем «<ключ>_<файл>», и префикс надо срезать.
-      const relaySid = relaySessionKey(userId, assistantId, userLanguage, fresh ? freshSessionId : undefined);
+      // relaySid уже посчитан выше (до проверки строки о прерывании) — тот же
+      // ключ сессии, без повторного вычисления.
       // Инструменты Linkeon и папка хода на релее — токеном хода и ключом без
       // номера телефона (linkeon-relay-fields.ts). Один раз на ход: повтор
       // self-heal идёт с теми же полями и в ту же папку.
@@ -2146,29 +2315,51 @@ ${LanguageService.buildDirective(userLanguage)}`;
         });
       };
 
-      await callUpstreamOnce();
+      // Метка «процесс релея этой сессии идёт» (relayRunning, ключ relaySid) —
+      // отдельный учёт от activeTurns: ровно тот промежуток, пока на релее
+      // реально может существовать убиваемый процесс. Открыта вокруг ОБОИХ
+      // возможных вызовов callUpstreamOnce (включая self-heal), закрыта в
+      // finally ДО копирования файлов (flushFileLinks ниже) — та часть хода
+      // уже не прерываема сообщением на релее, процесс там не живёт.
+      const relayMark = this.beginRelayRun(relaySid);
+      try {
+        await callUpstreamOnce();
 
-      // SELF-HEAL: r.linkeon иногда отдаёт ПУСТОЙ поток (0 delta-событий, ~сотни
-      // мс) — корень жалоб «постоянно выдаёт ошибку». Если ничего не пришло и
-      // клиент ещё на связи — тихо повторяем upstream ОДИН раз, прежде чем отдать
-      // юзеру пустоту. Безопасно: при пустом chunks клиенту ещё не ушло ни одного
-      // 'item' (дублей не будет). Инцидент/находка 2026-07-12.
-      //
-      // Шаги работы (activity) под эту гарантию не подпадают: неудавшийся
-      // прогон мог успеть прислать свои шаги ДО того, как понял, что поток
-      // пуст, а повтор пришлёт свои — итог видимый, но не ломающий: веб
-      // покажет повтор счётчиком («×2») или второй строкой, ответ не страдает.
-      // Ход из одних файлов — не пустой: раньше их ссылки уже лежали в chunks к
-      // этому месту, и повтора не было. Без этой проверки релей гонялся бы
-      // второй раз — двойная оплата и дубли файлов.
-      if (chunks.length === 0 && pendingFiles.length === 0 && !clientDisconnected) {
-        this.logger.warn(`empty stream from r.linkeon for ${userId}_${assistantId} — self-heal retry`);
-        this.events?.track('chat_quality', {
-          userId, sessionId: `${userId}_${assistantId}`,
-          props: { assistant_id: assistantId, self_heal_retry: true },
-        });
-        await new Promise((r) => setTimeout(r, 800));
-        try { await callUpstreamOnce(); } catch (e: any) { this.logger.warn(`self-heal retry failed: ${e.message}`); }
+        // SELF-HEAL: r.linkeon иногда отдаёт ПУСТОЙ поток (0 delta-событий, ~сотни
+        // мс) — корень жалоб «постоянно выдаёт ошибку». Если ничего не пришло и
+        // клиент ещё на связи — тихо повторяем upstream ОДИН раз, прежде чем отдать
+        // юзеру пустоту. Безопасно: при пустом chunks клиенту ещё не ушло ни одного
+        // 'item' (дублей не будет). Инцидент/находка 2026-07-12.
+        //
+        // Шаги работы (activity) под эту гарантию не подпадают: неудавшийся
+        // прогон мог успеть прислать свои шаги ДО того, как понял, что поток
+        // пуст, а повтор пришлёт свои — итог видимый, но не ломающий: веб
+        // покажет повтор счётчиком («×2») или второй строкой, ответ не страдает.
+        // Ход из одних файлов — не пустой: раньше их ссылки уже лежали в chunks к
+        // этому месту, и повтора не было. Без этой проверки релей гонялся бы
+        // второй раз — двойная оплата и дубли файлов.
+        if (chunks.length === 0 && pendingFiles.length === 0 && !clientDisconnected) {
+          this.logger.warn(`empty stream from r.linkeon for ${userId}_${assistantId} — self-heal retry`);
+          this.events?.track('chat_quality', {
+            userId, sessionId: `${userId}_${assistantId}`,
+            props: { assistant_id: assistantId, self_heal_retry: true },
+          });
+          await new Promise((r) => setTimeout(r, 800));
+          // За пустой прогон и эту паузу в ТУ ЖЕ relaySid мог успеть прийти
+          // настоящий новый ход (его beginRelayRun переписал relayRunning
+          // поверх нашей метки — см. openMark). Повтор всё равно уйдёт в ту
+          // же сессию на релее и будет конкурировать с ним за неё, вплоть до
+          // того, что убьёт уже чужой, живой процесс. В этом случае повтор не
+          // запускаем — уступаем сессию новому ходу.
+          if (this.relayRunning.get(relaySid) !== relayMark) {
+            this.logger.warn(`self-heal retry skipped for ${relaySid} — a newer turn took over the session`);
+            selfHealSkippedForTakeover = true;
+          } else {
+            try { await callUpstreamOnce(); } catch (e: any) { this.logger.warn(`self-heal retry failed: ${e.message}`); }
+          }
+        }
+      } finally {
+        this.endRelayRun(relaySid, relayMark);
       }
 
       // Ссылки на файлы хода из done.outputFiles — см. flushFileLinks выше.
@@ -2517,7 +2708,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       setImmediate(() => { void persistResponse(true); });
     } finally {
       this.activeStreams--;
-      this.activeTurns.delete(`${userId}_${assistantId}`);
+      if (turnMark !== null) this.closeTurn(`${userId}_${assistantId}`, turnMark);
       clearInterval(heartbeat);
     }
   }
@@ -3106,6 +3297,18 @@ ${LanguageService.buildDirective(userLanguage)}`;
   async getTokenBalance(userId: string): Promise<number> {
     const r = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1', [userId]);
     return Number(r.rows[0]?.tokens || 0);
+  }
+
+  /**
+   * Текст остановки на нуле — на языке пользователя (no-tokens-message.ts).
+   *
+   * Без .catch(): resolveUserLanguage сам ловит свои ошибки и отдаёт
+   * DEFAULT_LANGUAGE (см. LanguageService.resolveUserLanguage) — вторая
+   * защита здесь была мёртвым кодом (ревью качества 02.11, M7).
+   */
+  async noTokensReply(userId: string, requestLang?: string, opts: NoTokensOpts = {}): Promise<string> {
+    const lang = await this.language.resolveUserLanguage(userId, requestLang);
+    return noTokensMessage(lang, opts);
   }
 
   /**

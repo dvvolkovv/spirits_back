@@ -5,7 +5,7 @@ import { V } from '../values';
 // источник: где баланс — spirits_front src/components/layout/Navigation.tsx:151-191; ChatInterface.tsx:2769-2805; ProfileView.tsx:471-498
 // источник: цена ответа — src/chat/chat.service.ts:2530-2637 (по стоимости хода); категории — src/tokens/spend-category.ts:22-63
 // источник: расход по месяцам — src/tokens/tokens.controller.ts:24-44; spirits_front src/components/tokens/SpendingSummary.tsx
-// источник: низкий баланс и ноль — src/tokens/consumption-rate.ts (LOW_BALANCE_THRESHOLD); src/chat/chat.service.ts:951-971
+// источник: низкий баланс и ноль — src/tokens/consumption-rate.ts (LOW_BALANCE_THRESHOLD); шлагбаум нуля — по имени, не по строке (номера строк уже расходились с кодом): ChatService.streamChat (balance <= 0 → reason: 'no_tokens') и ChatController.uploadAndChat (тот же шлагбаум для хода с вложениями), оба в src/chat/; src/tokens/balance-context.service.ts (NEAR_EMPTY_ANSWERS); src/chat/no-tokens-message.ts
 // источник: поиск бесплатен — src/misc/misc.service.ts:117-256 (списания нет)
 // источник: сутки между предупреждениями — src/tokens/consumption-rate.ts (WARN_COOLDOWN_MS); TG при нуле — src/tg-bot/tg-bot.service.ts:725-760; поддержка — src/support/support.service.ts:386-407
 export const tokens: KbArticle = {
@@ -29,11 +29,12 @@ export const tokens: KbArticle = {
 - Поиск людей и совместимость бесплатны.
 
 ## Лимиты и цены
-- Когда баланс ниже ${V.lowBalance}, ассистент коротко скажет об этом в конце ответа — не чаще раза в ${V.lowBalanceEveryHours} часа.
+- Когда баланс ниже ${V.lowBalance}, ассистент коротко скажет об этом — не чаще раза в ${V.lowBalanceEveryHours} часа и не посреди упражнения: перед началом практики или в конце мысли.
+- Когда токенов остаётся на один-два ответа, ассистент поможет бережно завершить текущий шаг и подскажет, что продолжить можно после пополнения.
 - Пакеты и способы оплаты — тема payments.
 
 ## Если не получается
-- Баланс на нуле — чат отвечает сообщением о пополнении. Telegram-бот перестаёт отвечать: тому, кто к нему обратился, пишет, что у владельца кончились токены, а владельцу раз в сутки приходит сообщение в Telegram.
+- Баланс на нуле — чат отвечает сообщением о пополнении; разговор сохраняется, само сообщение, отправленное на нуле, ассистент не получил — после пополнения его нужно отправить ещё раз. Telegram-бот перестаёт отвечать: тому, кто к нему обратился, пишет, что у владельца кончились токены, а владельцу раз в сутки приходит сообщение в Telegram.
 - Кажется, что токены «сгорели», — открыть ${q('spending')}: там видно, на что они ушли.
 - Неверное или двойное списание токенов — ${q('support')}: ИИ-поддержка проверит картинки и видео и за явный сбой вернёт токены; крупные суммы и спорные списания она передаёт команде.
 

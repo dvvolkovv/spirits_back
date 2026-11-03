@@ -238,6 +238,13 @@ export class ChatController {
       });
     }
 
+    // Канал распространения — до шлагбаума (ревью качества 02.11, I5): в
+    // магазинной сборке текст остановки не должен упоминать токены/баланс
+    // вовсе (правило Apple 3.1.1), и noTokensReply ниже должен это знать.
+    // Переиспользуется дальше, в buildUploadHandoff — раньше вычислялся там
+    // второй раз тем же вызовом.
+    const storeBuild = isStoreBuild(req.headers['x-linkeon-distribution']);
+
     // Шлагбаум по балансу — тот же, что на обычном ходе чата (chat.service.ts,
     // «Check token balance»). До 06.09.2026 его здесь не было вовсе: загрузка
     // файлов не только не тарифицировалась, но и не спрашивала баланс, то есть
@@ -252,10 +259,16 @@ export class ChatController {
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('X-Accel-Buffering', 'no');
       res.setHeader('Access-Control-Allow-Origin', '*');
-      const noTokensMsg = '⚠️ **Недостаточно токенов**\n\nВаш баланс исчерпан. Пополните баланс, чтобы продолжить общение с ассистентами.\n\n👉 [Пополнить баланс](/chat?view=tokens)';
+      const noTokensMsg = await this.chatService.noTokensReply(
+        userId,
+        typeof body.lang === 'string' ? body.lang : undefined,
+        // upload: файлы этого запроса тоже выброшены — текст должен попросить
+        // прикрепить их заново, а не только переслать сообщение (I4).
+        { upload: true, storeBuild },
+      );
       res.write(JSON.stringify({ type: 'begin' }) + '\n');
       res.write(JSON.stringify({ type: 'item', content: noTokensMsg }) + '\n');
-      res.write(JSON.stringify({ type: 'end', content: noTokensMsg, usage: { input: 0, output: 0, total: 0 } }) + '\n');
+      res.write(JSON.stringify({ type: 'end', content: noTokensMsg, reason: 'no_tokens', usage: { input: 0, output: 0, total: 0 } }) + '\n');
       res.end();
       return;
     }
@@ -287,7 +300,7 @@ export class ChatController {
       freshSessionId,
       requestLang: typeof body.lang === 'string' ? body.lang : undefined,
       ask: ui.ask,
-      storeBuild: isStoreBuild(req.headers['x-linkeon-distribution']),
+      storeBuild,
       ui,
     });
 
@@ -364,6 +377,9 @@ export class ChatController {
     // (chat-files, ниже) занимает до ~60с — без этого ход с вложениями не
     // был виден вовсе, и рестарт мог оборвать именно её.
     this.chatService.beginStream();
+    // Ход с вложениями — и в учёт идущих ходов (active-turn): иначе посреди
+    // долгого разбора файла кабинет не видит хода, а «?» его пре-эмптит.
+    const turnMark = this.chatService.beginUploadTurn(userId, String(assistantId));
     // Закрывает ход ровно один раз. beginStream/endStream раньше были
     // завязаны на то, какая ветка кода ниже доберётся до конца — бросок
     // где-то посреди finally (например, в computeUploadCharge) обходил обе
@@ -379,8 +395,17 @@ export class ChatController {
       if (streamClosed) return;
       streamClosed = true;
       this.chatService.endStream();
+      this.chatService.endUploadTurn(userId, String(assistantId), turnMark);
     };
     let persistDispatched = false;
+    // Живой процесс релея этой сессии (relayRunning, ChatService.
+    // beginRelayRun/endRelayRun) — тот же ключ relaySid, что и у текстового
+    // хода (handoff.sessionId строится relaySessionKey, см. buildUploadHandoff):
+    // если текстовое сообщение той же сессии придёт, пока этот процесс ещё жив,
+    // оно корректно увидит «тот ход прерван» (interrupted-turn.ts). Открыт
+    // вокруг самого вызова релея, закрыт в finally ДО копирования файлов —
+    // см. комментарий у объявления relayRunning в chat.service.ts.
+    const relayMark = this.chatService.beginRelayRun(handoff.sessionId);
     try {
     try {
       const agentRes = await axios.default.post(`${AGENT_URL}/chat`, fd, {
@@ -442,6 +467,10 @@ export class ChatController {
     } catch (err: any) {
       upstreamError = err;
     } finally {
+      // Процесс релея этой сессии закончился (поток дочитан или упал) —
+      // снимаем метку ДО копирования файлов ниже (до ~60 с): см. комментарий
+      // у beginRelayRun выше.
+      this.chatService.endRelayRun(handoff.sessionId, relayMark);
       // Ссылки на файлы хода — уже на наше хранилище, до `end` и до истории:
       // одна строка в обоих местах (historyMerge.ts сверяет посимвольно).
       // Здесь, в отличие от текстового хода, они дописываются всегда — так было
@@ -495,6 +524,17 @@ export class ChatController {
         safeWrite({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } });
       }
       try { res.end(); } catch {}
+      // Ответ клиенту уже доставлен — метка хода снимается здесь, а не после
+      // persistUploadTurn/consolidateAfterChatPublic ниже (три LLM-вызова
+      // подряд, карточка бизнеса — таймаут 120 с): иначе метка висела бы
+      // секунды-десятки секунд после ответа, кабинет решал бы, что ассистент
+      // ещё работает, и следующее сообщение получало бы ложную
+      // INTERRUPTED_TURN_NOTE (ревью Б2 Step 5). У текстового хода
+      // (streamUniversalAgent) метка снимается в finally сразу после end —
+      // здесь то же самое, только раньше closeStream. Вызов в closeStream
+      // остаётся страховкой на случай исключения до этой строки: повторный
+      // endUploadTurn с той же меткой — no-op (closeTurn сверяет метку).
+      this.chatService.endUploadTurn(userId, String(assistantId), turnMark);
 
       // Save history — гарантированно, даже если клиент дисконнектился
       // на любом этапе. Запускаем после res.end чтобы не блокировать ответ.

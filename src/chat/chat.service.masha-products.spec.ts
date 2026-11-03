@@ -385,3 +385,46 @@ describe('Маша: карточка продукта приписывается
     expect(savedText).not.toContain(FAKE_ID);
   });
 });
+
+/**
+ * Ревью Б2 Step 5 (insights-backlog-fixes, 02.11.2026): та же гонка меток
+ * идущих ходов, что у пути релея (chat.service.turn-marks.spec.ts), но у
+ * Маши — прерванный ход не должен снимать отметку нового хода по той же
+ * паре (находка «Затыков недели» 2ff1a026).
+ */
+describe('Маша в вебе: гонка меток хода', () => {
+  it('второй ход стартовал, первый дошёл до finally — отметка второго на месте', async () => {
+    // Свой нейтральный userId (не USER = реальный тестовый номер из шапки
+    // файла) — репозиторий публичный, а этому блоку конкретный номер не
+    // нужен (ревью Б2 Step 6). Остальные тесты файла USER не трогаем.
+    const localUser = 'u1';
+    const { svc, claudeCli } = makeService();
+    let resolveFirst!: (v: { text: string; costUsd: number }) => void;
+    let resolveSecond!: (v: { text: string; costUsd: number }) => void;
+    (claudeCli.textWithCost as jest.Mock)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveSecond = resolve; }));
+
+    const { res: res1 } = makeRes();
+    const { res: res2 } = makeRes();
+
+    const first = svc.streamChat(localUser, 'Покажи мои продукты', '3', `${localUser}_3`, 'Имя: Тест', res1);
+    for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+    expect(svc.getActiveTurn(localUser, '3').active).toBe(true);
+
+    const second = svc.streamChat(localUser, 'ещё раз покажи', '3', `${localUser}_3`, 'Имя: Тест', res2);
+    for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+
+    // Первый ход «дозвонился» до CLI и дошёл до finally — отметка нового
+    // (второго) хода по той же паре не должна слететь вместе с его чужой.
+    resolveFirst({ text: 'Первый ответ.', costUsd: 0.01 });
+    await first;
+    for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+    expect(svc.getActiveTurn(localUser, '3').active).toBe(true);
+
+    resolveSecond({ text: 'Второй ответ.', costUsd: 0.01 });
+    await second;
+    for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+    expect(svc.getActiveTurn(localUser, '3').active).toBe(false);
+  });
+});
