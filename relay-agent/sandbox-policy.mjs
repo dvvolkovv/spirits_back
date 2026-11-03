@@ -29,11 +29,23 @@ export function isCanarySession(sessionKey, mode, keysFile) {
   }
 }
 
+function validateFsKey(fsKey) {
+  if (typeof fsKey !== 'string' || !/^[A-Za-z0-9._-]+$/.test(fsKey) || fsKey === '.' || fsKey === '..') {
+    throw new TypeError('invalid fsKey');
+  }
+}
+
+function normalizeDir(dir) {
+  const trimmed = dir.replace(/\/+$/, '');
+  return trimmed || '/';
+}
+
 // Настройки для --settings <файл>. Пути с '<fs_key>' — подставить ключ до записи.
 export function buildSandboxSettings(fsKey, { scratch, mcpDir } = {}) {
-  const scratchDir = scratch || `${AGENT_SCRATCH_ROOT}/${fsKey}`;
+  validateFsKey(fsKey);
+  const scratchDir = normalizeDir(scratch || `${AGENT_SCRATCH_ROOT}/${fsKey}`);
   const myOutput = `/tmp/agent-output/${fsKey}`;
-  const deny = ['/home/dv', '/etc/sudoers', '/etc/sudoers.d', mcpDir || AGENT_MCP_DIR];
+  const deny = ['/home/dv', '/etc/sudoers', '/etc/sudoers.d', normalizeDir(mcpDir || AGENT_MCP_DIR)];
   const PROXY = process.env.RELAY_SANDBOX_PROXY || '127.0.0.1:8471';
   const net = SANDBOX_SCHEMA === 'A'
     ? { network: { allowedDomains: [PROXY] } }
@@ -45,7 +57,7 @@ export function buildSandboxSettings(fsKey, { scratch, mcpDir } = {}) {
       excludedCommands: ['sudo *'],
       filesystem: {
         allowWrite: [scratchDir, myOutput],
-        denyRead: [...deny, scratchDir === '/tmp/agent-scratch/<fs_key>' ? '/tmp/agent-scratch' : AGENT_SCRATCH_ROOT],
+        denyRead: [...deny],
       },
       ...net,
     },
@@ -63,12 +75,16 @@ export function buildSandboxSettings(fsKey, { scratch, mcpDir } = {}) {
 
 // Окружение CLI: белый список + переменные выбранного провайдера + scrub.
 // GEMINI_API_KEY/OPENROUTER_API_KEY не пробрасываются (ни релею, ни ассистентам не нужны).
-const ENV_PASS = new Set(['PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'MCP_TIMEOUT', 'MCP_TOOL_TIMEOUT', 'RUN_ENV']);
+const ENV_PASS = new Set(['LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'MCP_TIMEOUT', 'MCP_TOOL_TIMEOUT', 'RUN_ENV']);
+const PROVIDER_ENV_PASS = new Set(['CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_MAX_RETRIES', 'CLAUDE_CODE_SUBAGENT_MODEL']);
 
 export function buildCliEnv({ baseEnv, providerEnv, fsKey, scrub }) {
+  validateFsKey(fsKey);
   const env = {};
   for (const k of ENV_PASS) if (baseEnv[k] !== undefined) env[k] = baseEnv[k];
-  Object.assign(env, providerEnv || {}); // ANTHROPIC_* выбранного провайдера
+  for (const [k, v] of Object.entries(providerEnv || {})) {
+    if (k.startsWith('ANTHROPIC_') || PROVIDER_ENV_PASS.has(k)) env[k] = v;
+  }
   const scratchDir = `${AGENT_SCRATCH_ROOT}/${fsKey}`;
   env.HOME = scratchDir;
   env.TMPDIR = scratchDir;
