@@ -1003,6 +1003,9 @@ ${healthSummary}
       if (new Date(ticket.updated_at).getTime() !== expectedUpdatedAtMs) {
         throw new ConflictException('ticket was updated');
       }
+      if (ticket.status === 'resolved') {
+        throw new BadRequestException('resolved ticket cannot be assigned');
+      }
 
       if (dto.assigneeId !== null) {
         const operators = await this.queryAdminOperators(client);
@@ -1072,6 +1075,7 @@ ${healthSummary}
          ${where}
          ORDER BY
            CASE
+             WHEN t.status = 'resolved' THEN 3
              WHEN t.first_owner_reply_at IS NULL AND t.first_response_due_at < now() THEN 0
              WHEN t.first_owner_reply_at IS NULL AND t.first_response_due_at >= now()
               AND t.first_response_due_at <= now() + interval '30 minutes' THEN 1

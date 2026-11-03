@@ -26,8 +26,8 @@ describe('support SLA', () => {
   });
 
   it.each([
-    ['overdue', 'first_owner_reply_at IS NULL AND first_response_due_at < now()', []],
-    ['soon', "first_owner_reply_at IS NULL AND first_response_due_at >= now() AND first_response_due_at <= now() + interval '30 minutes'", []],
+    ['overdue', "status <> 'resolved' AND first_owner_reply_at IS NULL AND first_response_due_at < now()", []],
+    ['soon', "status <> 'resolved' AND first_owner_reply_at IS NULL AND first_response_due_at >= now() AND first_response_due_at <= now() + interval '30 minutes'", []],
     ['unassigned', 'assigned_to IS NULL', []],
     ['mine', 'assigned_to = $SLA_ACTOR$', ['owner-1']],
   ] as Array<[SlaFilter, string, any[]]>)('builds the %s filter', (filter, sql, params) => {
