@@ -1607,7 +1607,10 @@ smoke_security_headers() {
     'X-Frame-Options: DENY' \
     'Referrer-Policy: strict-origin-when-cross-origin' \
     'Content-Security-Policy-Report-Only:'; do
-    if ! grep -qiF "$expected" <<<"$headers"; then
+    # Без -F: GNU grep 3.0 из Git Bash на -iF падает с core dump (03.11.2026),
+    # и выкат с Windows вставал на заголовке, который на месте. Метасимволов
+    # регулярок в шаблонах нет — -F ничего не давал.
+    if ! grep -qi "$expected" <<<"$headers"; then
       red "  ✗ отсутствует security-заголовок '$expected' ($ENV_NAME)"
       printf '%s\n' "$headers" | head -20
       if [[ "$ENV_NAME" == "test" ]]; then
