@@ -41,7 +41,6 @@ BACK_KEYS=(
   # ходят по токену хода. Не возвращать.
   # RELAY_SECRET не копируется: у стенда свой (relay-secret, docs/superpowers/specs/2026-10-26-relay-secret-design.md).
   TELEGRAM_BOT_TOKEN
-  TELEGRAM_WEBHOOK_SECRET
   META_APP_ID
   META_APP_SECRET
   LIVEKIT_API_KEY

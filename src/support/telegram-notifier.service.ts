@@ -135,27 +135,6 @@ export class TelegramNotifierService {
     await this.send(text, replyMarkup);
   }
 
-  /** Reply to a specific message in the support chat (used to ACK owner commands). */
-  async replyTo(messageId: number, text: string): Promise<void> {
-    if (!this.isConfigured()) return;
-    try {
-      await axios.post(
-        `https://api.telegram.org/bot${this.token}/sendMessage`,
-        {
-          chat_id: this.chatId,
-          text,
-          parse_mode: 'HTML',
-          reply_to_message_id: messageId,
-          disable_web_page_preview: true,
-        },
-        { timeout: 6000 },
-      );
-    } catch (e: any) {
-      const desc = e?.response?.data?.description || e.message;
-      this.logger.error(`telegram reply failed: ${desc}`);
-    }
-  }
-
   async notifyUserReply(p: UserReplyPayload): Promise<void> {
     const short = (s: string, n = 500) => (s.length > n ? s.slice(0, n) + '…' : s);
     const text = [
