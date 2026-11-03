@@ -189,6 +189,9 @@ test('cliEnv: белый список, без лишних ключей, scrub �
   assert.equal(env.CLAUDE_CONFIG_DIR, '/home/dv/.claude');
   assert.equal(env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, '1');
   assert.ok(env.PATH.startsWith('/opt/linkeon-agent/bin:'));
+  assert.equal(env.http_proxy, 'http://127.0.0.1:8471');
+  assert.equal(env.https_proxy, env.http_proxy);
+  assert.equal(env.no_proxy, undefined);
 });
 ```
 
@@ -233,8 +236,9 @@ export function buildSandboxSettings(fsKey, { scratch, mcpDir } = {}) {
   const scratchDir = scratch || `${AGENT_SCRATCH_ROOT}/${fsKey}`;
   const myOutput = `/tmp/agent-output/${fsKey}`;
   const deny = ['/home/dv', '/etc/sudoers', '/etc/sudoers.d', mcpDir || AGENT_MCP_DIR];
+  const PROXY = process.env.RELAY_SANDBOX_PROXY || '127.0.0.1:8471';
   const net = SANDBOX_SCHEMA === 'A'
-    ? { network: { allowedDomains: (process.env.RELAY_SANDBOX_DOMAINS || 'example.com').split(',') } }
+    ? { network: { allowedDomains: [PROXY] } }
     : {};
   return {
     sandbox: {
@@ -273,6 +277,12 @@ export function buildCliEnv({ baseEnv, providerEnv, fsKey, scrub }) {
   env.CLAUDE_CONFIG_DIR = '/home/dv/.claude';
   if (scrub) env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = '1';
   env.PATH = `${AGENT_OPT_DIR}/bin:/usr/local/bin:/usr/bin:/bin`;
+  // Сеть — только через локальный прокси (squid на релее режет внутренние
+  // назначения). no_proxy НЕ задаём: он дал бы обход резки через localhost.
+  env.http_proxy = `http://${PROXY}`;
+  env.https_proxy = `http://${PROXY}`;
+  env.HTTP_PROXY = env.http_proxy;
+  env.HTTPS_PROXY = env.https_proxy;
   return env;
 }
 ```
@@ -351,6 +361,20 @@ export async function ensureListingGuard(outputs = '/tmp/agent-output', uploads 
 - [ ] 1. `sudo apt-get install -y bubblewrap` → `bwrap --version` выводит версию.
 - [ ] 2. Профиль AppArmor (как в Task 0 Step 1) → `sudo apparmor_parser -r /etc/apparmor.d/bwrap` → `bwrap --bind / / true && echo ок`.
 - [ ] 3. `sudo mkdir -p /opt/linkeon-agent && sudo cp -a ~/agent-env /opt/linkeon-agent/venv && sudo cp -a ~/file-agent/bin/. /opt/linkeon-agent/bin/ 2>/dev/null || true && sudo cp -a ~/file-agent/scripts/. /opt/linkeon-agent/bin/ 2>/dev/null || true` → `sudo chmod -R a+rX /opt/linkeon-agent` → `ls /opt/linkeon-agent/bin | head` показывает скрипты, `test -x /opt/linkeon-agent/venv/bin/python3`.
+- [ ] 3a. Прокси (решение владельца «В», спека п.5): `ss -ltn | grep 8471` — порт свободен; `sudo apt-get install -y squid`; `/etc/squid/squid.conf` — минимальный:
+
+```
+http_port 127.0.0.1:8471
+via off
+forwarded_for off
+acl localnet dst 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 ::1/128 fc00::/7 fe80::/10
+http_access deny localnet
+acl localhost src 127.0.0.1/32 ::1/128
+http_access allow localhost
+http_access deny all
+```
+
+`sudo systemctl restart squid && sudo systemctl enable squid`. Проверки: `curl -x http://127.0.0.1:8471 -sI -m 8 https://example.com | head -1` → 200; `curl -x http://127.0.0.1:8471 -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:3033/` → 403 (squid access denied); то же для `http://169.254.169.254/` → 403.
 - [ ] 4. Права: `sudo mkdir -p /tmp/agent-mcp /tmp/agent-scratch && sudo chown dv:dv /tmp/agent-mcp /tmp/agent-scratch && chmod 0311 /tmp/agent-output /tmp/agent-uploads && chmod 0700 /tmp/agent-mcp /tmp/agent-scratch` → проверка: `ls /tmp/agent-output` от пользователя `nobody`? (нельзя удобно) — проверка через `sudo -u nobody ls /tmp/agent-output 2>&1 | head -1` ожидает «Permission denied».
 - [ ] 5. Уборка корня `/tmp` (старое рабочее): НЕ трогая `agent-output`, `agent-uploads`, `agent-mcp`, `agent-scratch`, `systemd-private*`, `ssh-*`, `node-compile-cache`, `.org.chromium.Chromium.*`: собрать кандидатов `find /tmp -maxdepth 1 -mindepth 1 -mtime +3`, показать владельцу список-маску (без номеров), после его «да» — `tar -czf ~/linkeon-orphans-oldtmp-$(date +%Y%m%d).tar.gz -C /tmp <список>` (umask 077), сверить число записей, удалить исходники.
 - [ ] 6. Файлы режима: `printf 'off\n' > ~/file-agent/sandbox-mode && chmod 600 ~/file-agent/sandbox-mode && cp ~/relay-scrub-canary.keys ~/file-agent/sandbox-canary.keys && chmod 600 ~/file-agent/sandbox-canary.keys` (список = 92 ключа владельца из канарейки чистки).
@@ -361,7 +385,7 @@ export async function ensureListingGuard(outputs = '/tmp/agent-output', uploads 
 ## Task 5: Стенд-прогон
 
 - [ ] 1. Стенд: копия `~/file-agent` → `~/file-agent-sandbox` (исключить `sessions.json`, `sandbox-*`, `node_modules` нет), порты 3036/3037 (по аналогии с прежним стендом; порт — env/аргумент server.mjs), `sandbox-mode` = `on`. Запуск: `cd ~/file-agent-sandbox && pm2 start ...` или `node server.mjs` под nohup; проверка `curl -s 127.0.0.1:3036/health` (или аналогичный лёгкий эндпоинт — смотреть в коде).
-- [ ] 2. Прогоны из чеклиста спеки (каждый — Bash-команда в ходе ассистента стенда): `env | grep -cE 'GEMINI_API_KEY|OPENROUTER_API_KEY'` = 0; `sudo -n true` ≠ 0; `cat /home/dv/file-agent/sessions.json` ≠ 0; `ls /tmp/agent-output` — без имён чужих папок; `curl -sI -m 8 https://example.com` — ок; `curl -s -m 3 http://127.0.0.1:3033/` — по схеме Task 0 (A: отказ); `pip install --quiet sampleproject` — ок; `echo x > /tmp/agent-scratch/<fs_key>/f` — ок; `/files/<fs_key>/…` отдаётся (через nginx прод-релея, папку не путать со стендом).
+- [ ] 2. Прогоны из чеклиста спеки (каждый — Bash-команда в ходе ассистента стенда): `env | grep -cE 'GEMINI_API_KEY|OPENROUTER_API_KEY'` = 0; `sudo -n true` ≠ 0; `cat /home/dv/file-agent/sessions.json` ≠ 0; `ls /tmp/agent-output` — без имён чужих папок; `curl -sI -m 8 https://example.com` — ок; `curl -s -m 3 http://127.0.0.1:3033/` — по схеме Task 0 (A: отказ); `pip install --quiet sampleproject` — ок; прокси: `curl -sI -m 8 https://example.com` (без -x, через env) — ок; `curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:3033/` → не 200; `curl -s -m 5 -o /dev/null -w '%{http_code}' http://169.254.169.254/` → не 200; `echo x > /tmp/agent-scratch/<fs_key>/f` — ок; `/files/<fs_key>/…` отдаётся (через nginx прод-релея, папку не путать со стендом).
 - [ ] 3. Три живых хода на Claude (простой вопрос, ход с файлом, ход со скачиванием картинки по внешней ссылке) — без ошибок, ответы осмысленные.
 - [ ] 4. Те же три хода на Qwen и на Kimi (переключатель провайдера стенда) — без ошибок; в выводе `env` нет токенов.
 - [ ] 5. Замер: средняя длительность хода со песочницей vs без (по журналу, ≥5 ходов) — дельта записывается; > 30 с — отметка для владельца.
