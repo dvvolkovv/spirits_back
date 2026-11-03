@@ -143,6 +143,18 @@ describe('support assignment', () => {
     expect(w.pg.getClient).not.toHaveBeenCalled();
   });
 
+  it.each([123, { value: EXPECTED_UPDATED_AT }, null])(
+    'rejects non-string expectedUpdatedAt %# without touching the database', async (value) => {
+      const w = makeWorld();
+
+      await expect(w.service.assign(ACTOR_ID, TICKET_ID, {
+        assigneeId: null, expectedUpdatedAt: value as any,
+      })).rejects.toBeInstanceOf(BadRequestException);
+      expect(w.pg.getClient).not.toHaveBeenCalled();
+      expect(w.calls).toHaveLength(0);
+    },
+  );
+
   it('returns 404 for a missing ticket', async () => {
     const w = makeWorld();
     w.client.query.mockImplementation(async (sql: string) => ({
