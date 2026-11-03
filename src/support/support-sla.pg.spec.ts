@@ -237,7 +237,7 @@ maybe('support SLA migration against PostgreSQL', () => {
 
     await expect(service.assign('actor-a', id, {
       assigneeId: 'admin-a', expectedUpdatedAt: created.rows[0].updated_at.toISOString(),
-    })).rejects.toMatchObject({ response: { status: 400 } });
+    })).rejects.toMatchObject({ response: { statusCode: 400 } });
 
     const stored = await pool.query('SELECT status, assigned_to FROM support_tickets WHERE id = $1', [id]);
     expect(stored.rows[0]).toEqual({ status: 'resolved', assigned_to: null });
