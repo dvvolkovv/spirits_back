@@ -82,7 +82,7 @@ userId в конструкции не участвует — пример из �
    включаем: собственные пути должны работать; листинг закрыт 0311 и fs_key.
 5. Песочница в настройках: `enabled`, `allowUnsandboxedCommands: false`
    (отказ без обхода), записываемые пути — свои, запрещённые на чтение —
-   `/home/dv`, `/tmp/agent-mcp`, `/etc/sudoers*`; `excludedCommands: ["sudo *"]`
+   `/home/dv`, `/tmp/agent-mcp`, `/tmp/agent-uploads/mcp`, `/etc/sudoers*`, `/proc`; `excludedCommands: ["sudo *"]`
    (требование sudo). Сеть — решение владельца 03.11 «В: прокси»: на релее
    squid на `127.0.0.1:8471` (bind только loopback, `acl localnet dst` со
    внутренними сетями → `http_access deny localnet`). Из песочницы открыт

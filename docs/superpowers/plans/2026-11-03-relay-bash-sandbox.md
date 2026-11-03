@@ -289,7 +289,7 @@ export function buildCliEnv({ baseEnv, providerEnv, fsKey, scrub }) {
 
 Запустить тесты на ноде — зелёные. **Step 3: коммит** `feat(relay-agent): политика песочницы — режим, настройки, чистое окружение (Т)` + push.
 
-**Уточнение после quality-ревью (400594ac):** корень `AGENT_SCRATCH_ROOT` в `denyRead` НЕ включается — иначе собственный scratch/HOME хода оказался бы под запретом; чужие scratch закрыты правами 0311 и непредсказуемыми fs_key. Оба билдера валидируют `fsKey` (`/^[A-Za-z0-9._-]+$/`, не `.`/`..`, иначе TypeError), `scratch`/`mcpDir` нормализуются без trailing slash, `PATH` удалён из `ENV_PASS`, а `providerEnv` пропускает только `ANTHROPIC_*` и `CLAUDE_CODE_OAUTH_TOKEN`/`CLAUDE_CODE_MAX_RETRIES`/`CLAUDE_CODE_SUBAGENT_MODEL`. Тесты дополнены этими случаями и отсутствующим canary-файлом.
+**Уточнение после quality-ревью (400594ac):** корень `AGENT_SCRATCH_ROOT` в `denyRead` НЕ включается — иначе собственный scratch/HOME хода оказался бы под запретом; чужие scratch закрыты правами 0311 и непредсказуемыми fs_key. Оба билдера валидируют `fsKey` (`/^[A-Za-z0-9._-]+$/`, не `.`/`..`, иначе TypeError), `scratch`/`mcpDir` нормализуются без trailing slash, `PATH` удалён из `ENV_PASS`, а `providerEnv` пропускает только `ANTHROPIC_*` и `CLAUDE_CODE_OAUTH_TOKEN`/`CLAUDE_CODE_MAX_RETRIES`/`CLAUDE_CODE_SUBAGENT_MODEL`/`API_TIMEOUT_MS`/`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`. Тесты дополнены этими случаями и отсутствующим canary-файлом.
 
 ---
 
@@ -327,7 +327,7 @@ export async function ensureSessionDirs(fsKey, { scratchRoot = AGENT_SCRATCH_ROO
 // не закрыло бы ассистенту листинг чужих scratch-каталогов.
 export async function ensureListingGuard({ outputs = '/tmp/agent-output', uploads = '/tmp/agent-uploads', scratchRoot = AGENT_SCRATCH_ROOT } = {}) {
   for (const d of [outputs, uploads, scratchRoot]) {
-    await fsp.mkdir(d, { recursive: true });
+    await fsp.mkdir(d, { recursive: true, mode: 0o311 });
     await fsp.chmod(d, 0o311);
   }
 }
