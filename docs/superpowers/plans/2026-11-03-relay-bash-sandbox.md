@@ -247,7 +247,7 @@ export function buildSandboxSettings(fsKey, { scratch, mcpDir } = {}) {
       excludedCommands: ['sudo *'],
       filesystem: {
         allowWrite: [scratchDir, myOutput],
-        denyRead: [...deny, scratchDir === '/tmp/agent-scratch/<fs_key>' ? '/tmp/agent-scratch' : AGENT_SCRATCH_ROOT],
+        denyRead: deny,
       },
       ...net,
     },
@@ -289,6 +289,8 @@ export function buildCliEnv({ baseEnv, providerEnv, fsKey, scrub }) {
 
 Запустить тесты на ноде — зелёные. **Step 3: коммит** `feat(relay-agent): политика песочницы — режим, настройки, чистое окружение (Т)` + push.
 
+**Уточнение после quality-ревью (400594ac):** корень `AGENT_SCRATCH_ROOT` в `denyRead` НЕ включается — иначе собственный scratch/HOME хода оказался бы под запретом; чужие scratch закрыты правами 0311 и непредсказуемыми fs_key. Оба билдера валидируют `fsKey` (`/^[A-Za-z0-9._-]+$/`, не `.`/`..`, иначе TypeError), `scratch`/`mcpDir` нормализуются без trailing slash, `PATH` удалён из `ENV_PASS`, а `providerEnv` пропускает только `ANTHROPIC_*` и `CLAUDE_CODE_OAUTH_TOKEN`/`CLAUDE_CODE_MAX_RETRIES`/`CLAUDE_CODE_SUBAGENT_MODEL`. Тесты дополнены этими случаями и отсутствующим canary-файлом.
+
 ---
 
 ## Task 2: `relay-agent/paths.mjs` — каталоги scratch/mcp и права (TDD)
@@ -316,6 +318,7 @@ export async function ensureSessionDirs(fsKey, outputs = '/tmp/agent-output') {
   await fsp.mkdir(scratch, { recursive: true, mode: 0o700 });
   await fsp.mkdir(path.join(outputs, fsKey), { recursive: true, mode: 0o700 });
   await fsp.chmod(scratch, 0o700);
+  await fsp.chmod(path.join(outputs, fsKey), 0o700);
   return scratch;
 }
 
