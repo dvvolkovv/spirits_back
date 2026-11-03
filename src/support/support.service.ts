@@ -43,22 +43,27 @@ export class SupportService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
-    const candidates = [
-      path.join(__dirname, 'migrations', '001_support.sql'),
-      path.join(__dirname, '..', '..', 'src', 'support', 'migrations', '001_support.sql'),
-    ];
-    for (const p of candidates) {
-      try {
-        if (fs.existsSync(p)) {
-          await this.pg.query(fs.readFileSync(p, 'utf8'));
-          this.logger.log(`support migration 001 applied from ${p}`);
-          return;
-        }
-      } catch (e: any) {
-        this.logger.error(`support migration failed (${p}): ${e.message}`);
+    const client = await this.pg.getClient();
+    try {
+      await client.query('BEGIN');
+      await client.query("SELECT pg_advisory_xact_lock(hashtext('support_migrations'))");
+      for (const name of ['001_support.sql', '002_support_sla.sql']) {
+        const candidates = [
+          path.join(__dirname, 'migrations', name),
+          path.join(__dirname, '..', '..', 'src', 'support', 'migrations', name),
+        ];
+        const p = candidates.find((candidate) => fs.existsSync(candidate));
+        if (!p) throw new Error(`support migration ${name} not found`);
+        await client.query(fs.readFileSync(p, 'utf8'));
+        this.logger.log(`support migration ${name} applied from ${p}`);
       }
+      await client.query('COMMIT');
+    } catch (e: any) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      this.logger.error(`support migration failed: ${e.message}`);
+    } finally {
+      client.release();
     }
-    this.logger.warn('support migration sql not found, skipping');
   }
 
   // -------------------- Ticket lifecycle --------------------
