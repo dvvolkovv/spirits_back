@@ -12,7 +12,7 @@ import {
   SupportTicketRow, SupportMessageRow, PostUserMessageDto, LIMITS, SenderType, SUPPORT_MODEL,
 } from './support.dto';
 import { supportReplyText } from './support-reply-text';
-import { slaFilterSql, SlaFilter } from './support-sla';
+import { firstResponseDueAt, slaFilterSql, SlaFilter } from './support-sla';
 import { TelegramNotifierService } from './telegram-notifier.service';
 import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert';
 import { clip, escapeHtml } from '../problem-report/problem-format';
@@ -911,9 +911,14 @@ ${healthSummary}
   private async escalate(
     ticketId: string, userId: string, reason: string, urgency: 'low' | 'normal' | 'high' | 'critical', summary: string,
   ) {
+    const dueAt = new Date(firstResponseDueAt(urgency, Date.now())).toISOString();
     await this.pg.query(
-      `UPDATE support_tickets SET status = 'escalated', urgency = $1, escalation_reason = $2, notes = $3, updated_at = now() WHERE id = $4`,
-      [urgency, reason, summary, ticketId],
+      `UPDATE support_tickets
+         SET status = 'escalated', urgency = $1, escalation_reason = $2, notes = $3,
+             first_response_due_at = COALESCE(first_response_due_at, $4::timestamptz),
+             updated_at = now()
+       WHERE id = $5`,
+      [urgency, reason, summary, dueAt, ticketId],
     );
     await this.pg.query(
       `INSERT INTO support_events (ticket_id, actor_type, actor_id, action, payload)
@@ -1130,28 +1135,57 @@ ${healthSummary}
     if (trimmed.length > LIMITS.MESSAGE_MAX) {
       throw new BadRequestException(`message too long (max ${LIMITS.MESSAGE_MAX})`);
     }
-    const t = await this.pg.query(`SELECT status FROM support_tickets WHERE id = $1`, [ticketId]);
-    if (!t.rows[0]) throw new NotFoundException('ticket not found');
-    await this.insertMessage(ticketId, 'owner', ownerId, trimmed, null, visibleToUser);
-    // Any visible owner reply implies human is handling it.
-    if (visibleToUser) {
-      await this.pg.query(
-        `UPDATE support_tickets SET first_owner_reply_at = COALESCE(first_owner_reply_at, now()) WHERE id = $1`,
-        [ticketId],
-      );
-      await this.pg.query(
-        `UPDATE support_tickets SET status = 'owner_handling', updated_at = now() WHERE id = $1 AND status IN ('escalated','ai_handling')`,
-        [ticketId],
-      );
-    }
-    await this.pg.query(
-      `INSERT INTO support_events (ticket_id, actor_type, actor_id, action, payload)
-       VALUES ($1, 'owner', $2, 'reply', $3)`,
-      [ticketId, ownerId, JSON.stringify({ visibleToUser, length: trimmed.length })],
-    );
+    await this.postOwnerReply(ticketId, ownerId, trimmed, null, visibleToUser, {
+      visibleToUser, length: trimmed.length,
+    });
     // Fire-and-forget: письмо не должно держать ответ админки, а его сбой —
     // ронять уже сохранённую реплику. Метод не бросает.
     if (visibleToUser) void this.notifyOwnerReplyByEmail(ticketId, trimmed);
+  }
+
+  private async postOwnerReply(
+    ticketId: string, senderId: string, content: string, metadata: any,
+    visibleToUser: boolean, eventPayload: any,
+  ): Promise<void> {
+    const client = await this.pg.getClient();
+    let destroyClient = false;
+    try {
+      await client.query('BEGIN');
+      const t = await client.query(
+        'SELECT status FROM support_tickets WHERE id = $1 FOR UPDATE', [ticketId],
+      );
+      if (!t.rows[0]) throw new NotFoundException('ticket not found');
+      await this.insertMessage(ticketId, 'owner', senderId, content, metadata, visibleToUser, client);
+      if (visibleToUser) {
+        await client.query(
+          `UPDATE support_tickets
+             SET first_owner_reply_at = (
+                   SELECT min(m.created_at) FROM support_messages m
+                    WHERE m.ticket_id = $1 AND m.sender_type = 'owner' AND m.visible_to_user = true
+                 ),
+                 status = CASE WHEN status IN ('escalated','ai_handling') THEN 'owner_handling' ELSE status END,
+                 updated_at = now()
+           WHERE id = $1`,
+          [ticketId],
+        );
+      }
+      await client.query(
+        `INSERT INTO support_events (ticket_id, actor_type, actor_id, action, payload)
+         VALUES ($1, 'owner', $2, 'reply', $3)`,
+        [ticketId, senderId, JSON.stringify(eventPayload)],
+      );
+      await client.query('COMMIT');
+    } catch (e) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        destroyClient = true;
+      }
+      throw e;
+    } finally {
+      if (destroyClient) client.release(true);
+      else client.release();
+    }
   }
 
   /**
@@ -1271,25 +1305,10 @@ ${healthSummary}
   async postOwnerReplyFromTelegram(
     ticketId: string, telegramUserId: string, displayName: string, content: string, visibleToUser = true,
   ): Promise<void> {
-    await this.insertMessage(
-      ticketId, 'owner', `tg:${telegramUserId}`, content,
+    await this.postOwnerReply(
+      ticketId, `tg:${telegramUserId}`, content,
       { via: 'telegram', author: displayName }, visibleToUser,
-    );
-    if (visibleToUser) {
-      await this.pg.query(
-        `UPDATE support_tickets SET first_owner_reply_at = COALESCE(first_owner_reply_at, now()) WHERE id = $1`,
-        [ticketId],
-      );
-      await this.pg.query(
-        `UPDATE support_tickets SET status = 'owner_handling', updated_at = now()
-         WHERE id = $1 AND status IN ('escalated','ai_handling')`,
-        [ticketId],
-      );
-    }
-    await this.pg.query(
-      `INSERT INTO support_events (ticket_id, actor_type, actor_id, action, payload)
-       VALUES ($1, 'owner', $2, 'reply', $3)`,
-      [ticketId, `tg:${telegramUserId}`, JSON.stringify({ via: 'telegram', author: displayName, length: content.length })],
+      { via: 'telegram', author: displayName, length: content.length },
     );
     if (visibleToUser) void this.notifyOwnerReplyByEmail(ticketId, content);
   }
@@ -1378,15 +1397,15 @@ ${healthSummary}
 
   async insertMessage(
     ticketId: string, senderType: SenderType, senderId: string | null,
-    content: string, metadata: any = null, visibleToUser = true,
+    content: string, metadata: any = null, visibleToUser = true, db: any = this.pg,
   ): Promise<SupportMessageRow> {
-    const r = await this.pg.query(
+    const r = await db.query(
       `INSERT INTO support_messages (ticket_id, sender_type, sender_id, content, metadata, visible_to_user)
        VALUES ($1, $2, $3, $4, $5::jsonb, $6)
        RETURNING *`,
       [ticketId, senderType, senderId, content, metadata ? JSON.stringify(metadata) : null, visibleToUser],
     );
-    await this.pg.query(
+    await db.query(
       `UPDATE support_tickets SET last_message_at = now(), updated_at = now() WHERE id = $1`,
       [ticketId],
     );
