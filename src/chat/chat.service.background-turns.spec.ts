@@ -364,7 +364,9 @@ describe('гонка: проверка занятости и openMark разде
     const svc = makeService();
     queue.push(new Error('ECONNREFUSED'));
     const first = svc.generateAgentReply('u1', '14', 'рутина 1');
-    await settle();
+    // Без settle() перед этой строкой: иначе первый дойдёт до отказа и
+    // останется «висеть» отклонённым без обработчика несколько тиков —
+    // Node пометит это как unhandledRejection ДО того, как мы его поймаем.
     await expect(first).rejects.toThrow('ECONNREFUSED');
     expect(svc.getActiveStreamCount()).toBe(0);
 
