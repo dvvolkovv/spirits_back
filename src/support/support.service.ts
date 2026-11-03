@@ -12,6 +12,7 @@ import {
   SupportTicketRow, SupportMessageRow, PostUserMessageDto, LIMITS, SenderType, SUPPORT_MODEL,
 } from './support.dto';
 import { supportReplyText } from './support-reply-text';
+import { slaFilterSql, SlaFilter } from './support-sla';
 import { TelegramNotifierService } from './telegram-notifier.service';
 import { sendTelegramAlert, telegramConfigured } from '../common/telegram-alert';
 import { clip, escapeHtml } from '../problem-report/problem-format';
@@ -1035,26 +1036,42 @@ ${healthSummary}
     }
   }
 
-  async adminListTickets(opts: { status?: string; limit?: number } = {}) {
+  async adminListTickets(
+    opts: { status?: string; limit?: number; sla?: SlaFilter; actorId?: string } = {},
+  ) {
     const limit = Math.max(1, Math.min(200, opts.limit ?? 50));
     const params: any[] = [];
     let whereStatus = '';
     if (opts.status && opts.status !== 'all') {
       params.push(opts.status);
-      whereStatus = `WHERE t.status = $1`;
+      whereStatus = `t.status = $1`;
     }
+    const sla = slaFilterSql(opts.sla, opts.actorId || '');
+    const whereSla = sla.sql.replace(/\$SLA_ACTOR\$/g, `$${params.length + 1}`);
+    params.push(...sla.params);
+    const where = whereSla === 'TRUE'
+      ? (whereStatus ? `WHERE ${whereStatus}` : '')
+      : `WHERE ${whereStatus ? `${whereStatus} AND ` : ''}${whereSla}`;
     const rows = await this.pg.query(
       `SELECT t.*,
               p.profile_data->>'name' AS user_name,
               p.tokens AS user_tokens,
+              COALESCE(op.profile_data->>'name', op.profile_data->>'first_name') AS assigned_name,
               (SELECT content FROM support_messages m
                 WHERE m.ticket_id = t.id AND m.visible_to_user = true
                 ORDER BY m.created_at DESC LIMIT 1) AS last_visible_msg,
               (SELECT count(*)::int FROM support_messages m WHERE m.ticket_id = t.id) AS msg_count
          FROM support_tickets t
          LEFT JOIN ai_profiles_consolidated p ON p.user_id = t.user_id
-         ${whereStatus}
+         LEFT JOIN ai_profiles_consolidated op ON op.user_id = t.assigned_to
+         ${where}
          ORDER BY
+           CASE
+             WHEN t.first_owner_reply_at IS NULL AND t.first_response_due_at < now() THEN 0
+             WHEN t.first_owner_reply_at IS NULL AND t.first_response_due_at >= now()
+              AND t.first_response_due_at <= now() + interval '30 minutes' THEN 1
+             ELSE 2
+           END,
            CASE t.urgency WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
            t.updated_at DESC
          LIMIT ${limit}`,
@@ -1070,6 +1087,11 @@ ${healthSummary}
       topic: r.topic,
       escalationReason: r.escalation_reason,
       notes: r.notes,
+      assignedTo: r.assigned_to,
+      assignedAt: r.assigned_at,
+      assignedName: r.assigned_name || null,
+      firstResponseDueAt: r.first_response_due_at,
+      firstOwnerReplyAt: r.first_owner_reply_at,
       lastMessage: r.last_visible_msg,
       messageCount: r.msg_count,
       createdAt: r.created_at,
@@ -1113,6 +1135,10 @@ ${healthSummary}
     await this.insertMessage(ticketId, 'owner', ownerId, trimmed, null, visibleToUser);
     // Any visible owner reply implies human is handling it.
     if (visibleToUser) {
+      await this.pg.query(
+        `UPDATE support_tickets SET first_owner_reply_at = COALESCE(first_owner_reply_at, now()) WHERE id = $1`,
+        [ticketId],
+      );
       await this.pg.query(
         `UPDATE support_tickets SET status = 'owner_handling', updated_at = now() WHERE id = $1 AND status IN ('escalated','ai_handling')`,
         [ticketId],
@@ -1250,6 +1276,10 @@ ${healthSummary}
       { via: 'telegram', author: displayName }, visibleToUser,
     );
     if (visibleToUser) {
+      await this.pg.query(
+        `UPDATE support_tickets SET first_owner_reply_at = COALESCE(first_owner_reply_at, now()) WHERE id = $1`,
+        [ticketId],
+      );
       await this.pg.query(
         `UPDATE support_tickets SET status = 'owner_handling', updated_at = now()
          WHERE id = $1 AND status IN ('escalated','ai_handling')`,

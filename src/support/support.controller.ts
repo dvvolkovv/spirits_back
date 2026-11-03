@@ -4,6 +4,7 @@ import { AdminGuard } from '../common/guards/admin.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { SupportService } from './support.service';
 import { PostUserMessageDto } from './support.dto';
+import { SlaFilter } from './support-sla';
 import { isStoreBuild } from '../chat/client-kind';
 
 @Controller('support')
@@ -66,15 +67,38 @@ export class SupportController {
 
   @Get('admin/tickets')
   @UseGuards(AdminGuard)
-  async adminList(@Query('status') status?: string, @Query('limit') limit?: string) {
+  async adminList(
+    @CurrentUser() u: any,
+    @Query('status') status?: string,
+    @Query('limit') limit?: string,
+    @Query('sla') sla?: SlaFilter,
+  ) {
     const n = limit ? parseInt(limit, 10) : 50;
-    return this.support.adminListTickets({ status, limit: isNaN(n) ? 50 : n });
+    return this.support.adminListTickets({
+      status, limit: isNaN(n) ? 50 : n, sla, actorId: u.userId,
+    });
+  }
+
+  @Get('admin/operators')
+  @UseGuards(AdminGuard)
+  async adminOperators() {
+    return this.support.adminOperators();
   }
 
   @Get('admin/ticket/:id')
   @UseGuards(AdminGuard)
   async adminDetail(@Param('id') id: string) {
     return this.support.adminGetTicket(id);
+  }
+
+  @Post('admin/ticket/:id/assign')
+  @UseGuards(AdminGuard)
+  async adminAssign(
+    @CurrentUser() u: any,
+    @Param('id') id: string,
+    @Body() body: { assigneeId: string | null; expectedUpdatedAt: string },
+  ) {
+    return this.support.assign(u.userId, id, body);
   }
 
   @Post('admin/ticket/:id/reply')
