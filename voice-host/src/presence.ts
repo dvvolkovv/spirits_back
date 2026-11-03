@@ -36,7 +36,7 @@ export interface ParticipantEvent {
  * равно разойдутся. Дословное имя бота из встречи выясняет спайк (вопрос 4);
  * если у Attendee найдётся стабильный признак «это бот», перейдём на него.
  */
-function nameKey(name: string): string {
+export function nameKey(name: string): string {
   return String(name ?? '')
     .normalize('NFC')
     // Любой пробельный символ, включая неразрывный, считаем обычным пробелом.

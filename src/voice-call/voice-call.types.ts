@@ -1,3 +1,4 @@
+import type { MeetingParticipant } from './participants';
 /**
  * Сообщения, которые бэкенд шлёт в LiveKit-комнату (topic 'linkeon').
  * Поле v версионирует контракт: подсистемы C (Zoom) и D (телефония)
@@ -178,6 +179,11 @@ export interface CompletePayload {
    * `end-reason.ts` неизвестное за прощание не выдаёт.
    */
   ending?: { disconnect?: string; close?: string };
+  /**
+   * Кто был на встрече (voice-host/src/roster.ts). Только у встречи;
+   * воркер прежней версии не шлёт — тогда список пустой.
+   */
+  participants?: MeetingParticipant[];
 }
 
 /**
