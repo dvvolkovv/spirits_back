@@ -1,5 +1,5 @@
 import {
-  Injectable, Logger, BadRequestException, NotFoundException, OnModuleInit, Optional,
+  Injectable, Logger, BadRequestException, ConflictException, NotFoundException, OnModuleInit, Optional,
 } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -956,6 +956,79 @@ ${healthSummary}
   }
 
   // -------------------- Admin (owner) operations --------------------
+
+  async adminOperators(): Promise<Array<{ id: string; name: string }>> {
+    return this.queryAdminOperators(this.pg);
+  }
+
+  private async queryAdminOperators(db: any): Promise<Array<{ id: string; name: string }>> {
+    const result = await db.query(
+      `SELECT p.user_id, COALESCE(p.profile_data->>'name', p.profile_data->>'first_name', p.user_id) AS name
+       FROM ai_profiles_consolidated p
+       JOIN user_id u ON u.internal_id = p.user_id AND u.state <> 'deleted'
+       WHERE p.isadmin = true ORDER BY name`,
+    );
+    return result.rows.map((row: any) => ({ id: row.user_id, name: row.name }));
+  }
+
+  async assign(
+    actorId: string,
+    ticketId: string,
+    dto: { assigneeId: string | null; expectedUpdatedAt: string },
+  ): Promise<SupportTicketRow> {
+    if (!dto.expectedUpdatedAt?.trim()) {
+      throw new BadRequestException('expectedUpdatedAt required');
+    }
+
+    const client = await this.pg.getClient();
+    let destroyClient = false;
+    try {
+      await client.query('BEGIN');
+      const locked = await client.query(
+        'SELECT * FROM support_tickets WHERE id = $1 FOR UPDATE', [ticketId],
+      );
+      const ticket = locked.rows[0];
+      if (!ticket) throw new NotFoundException('ticket not found');
+      if (new Date(ticket.updated_at).getTime() !== Date.parse(dto.expectedUpdatedAt)) {
+        throw new ConflictException('ticket was updated');
+      }
+
+      if (dto.assigneeId !== null) {
+        const operators = await this.queryAdminOperators(client);
+        if (!operators.some((operator) => operator.id === dto.assigneeId)) {
+          throw new BadRequestException('assignee must be an active admin');
+        }
+      }
+
+      const updated = await client.query(
+        `UPDATE support_tickets
+         SET assigned_to = $1,
+             assigned_at = CASE WHEN $1::text IS NULL THEN NULL ELSE now() END,
+             status = $2,
+             updated_at = now()
+         WHERE id = $3
+         RETURNING *`,
+        [dto.assigneeId, dto.assigneeId === null ? 'escalated' : 'owner_handling', ticketId],
+      );
+      await client.query(
+        `INSERT INTO support_events (ticket_id, actor_type, actor_id, action, payload)
+         VALUES ($1, 'owner', $2, 'assignment', $3::jsonb)`,
+        [ticketId, actorId, JSON.stringify({ from: ticket.assigned_to ?? null, to: dto.assigneeId })],
+      );
+      await client.query('COMMIT');
+      return updated.rows[0] as SupportTicketRow;
+    } catch (e) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        destroyClient = true;
+      }
+      throw e;
+    } finally {
+      if (destroyClient) client.release(true);
+      else client.release();
+    }
+  }
 
   async adminListTickets(opts: { status?: string; limit?: number } = {}) {
     const limit = Math.max(1, Math.min(200, opts.limit ?? 50));
