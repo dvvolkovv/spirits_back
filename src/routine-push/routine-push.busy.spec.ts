@@ -187,8 +187,8 @@ describe('RoutinePushService.runDue — перенос при занятой с�
         .mockResolvedValueOnce(failed('preempted', 'обрывок')),
     };
     const rows = [
-      row({ id: 'routine-uuid-1', user_id: '79030169187', title: 'Моя рутина', last_sent_date: null }),
-      row({ id: 'routine-uuid-2', user_id: '79030169187', title: 'Другая рутина', last_sent_date: '2026-11-02' }),
+      row({ id: 'routine-uuid-1', user_id: 'u1', title: 'Моя рутина', last_sent_date: null }),
+      row({ id: 'routine-uuid-2', user_id: 'u1', title: 'Другая рутина', last_sent_date: '2026-11-02' }),
     ];
     const store = makeStore({ listEnabled: jest.fn(async () => rows) });
     const pg = { query: jest.fn(async () => ({ rows: [] })) };
@@ -200,7 +200,7 @@ describe('RoutinePushService.runDue — перенос при занятой с�
     const deferredLines = logSpy.mock.calls.map((c) => String(c[0])).filter((s) => s.includes('отложена'));
     expect(deferredLines).toHaveLength(2);
     for (const line of deferredLines) {
-      expect(line).not.toContain('79030169187');
+      expect(line).not.toContain('u1');
       expect(line).not.toContain('Моя рутина');
       expect(line).not.toContain('Другая рутина');
     }
