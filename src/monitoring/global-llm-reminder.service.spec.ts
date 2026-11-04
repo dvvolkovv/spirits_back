@@ -1,4 +1,9 @@
 import 'reflect-metadata';
+jest.mock('@napi-rs/canvas', () => ({
+  createCanvas: jest.fn(),
+  loadImage: jest.fn(),
+  GlobalFonts: { register: jest.fn() },
+}));
 import { Logger } from '@nestjs/common';
 import { MODULE_METADATA, OPTIONAL_DEPS_METADATA } from '@nestjs/common/constants';
 jest.mock('../common/telegram-alert', () => ({
