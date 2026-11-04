@@ -21,9 +21,10 @@ const LINE =
   'Moonshot AI по своим условиям вправе после обезличивания обучать на присланном свои модели. ' +
   'Данные не продаются.';
 
-/** Предел статьи — kb.spec.ts (MAX_BYTES); запас — под будущую строку о номере. */
+const PHONE_LINE = '- Номер телефона нейросетям не передаётся; ИИ-поддержке видны имя и почта, чтобы помочь с аккаунтом.';
+
+/** Предел статьи — kb.spec.ts (MAX_BYTES). Запас в 250 байт держали под строку о номере — она в статье с 03.11.2026. */
 const MAX_BYTES = 5 * 1024;
-const RESERVE_BYTES = 250;
 
 describe('how-it-works: кому уходят данные', () => {
   const text = renderArticle(howItWorks, 'ru', 'web');
@@ -44,21 +45,26 @@ describe('how-it-works: кому уходят данные', () => {
     expect(text).not.toContain('OpenRouter');
   });
 
-  // Строка «Номер телефона нейросетям не передаётся…» — отдельным выкатом,
-  // после пунктов 1–6 спеки и в её точной формулировке.
-  it('строки о номере пока нет', () => {
-    expect(text).not.toMatch(/номер телефона[^.\n]*не передаётся/i);
+  // Строка о номере — после пунктов 1–6 спеки и чистки релея (03.11.2026),
+  // формулировка вычитана владельцем. ИИ-поддержка получает имя и почту
+  // (support.service: системный промпт и get_user_context), телефона и
+  // user_id — нет.
+  it('строка о номере — ровно эта, сразу после строки о поставщиках', () => {
+    const lines = text.split('\n');
+    const at = lines.indexOf(LINE);
+    expect(at).toBeGreaterThanOrEqual(0);
+    expect(lines[at + 1]).toBe(PHONE_LINE);
   });
 
   it('строка о поставщиках одна и та же во всех клиентах', () => {
     for (const client of KB_CLIENTS) expect(providersLine(renderArticle(howItWorks, 'ru', client))).toBe(line);
   });
 
-  it(`самый длинный вариант статьи оставляет ≥ ${RESERVE_BYTES} байт до предела ${MAX_BYTES}`, () => {
+  it(`самый длинный вариант статьи — в пределах ${MAX_BYTES} байт`, () => {
     let max = 0;
     for (const lang of SUPPORTED_LANGUAGES) {
       for (const client of KB_CLIENTS) max = Math.max(max, Buffer.byteLength(renderArticle(howItWorks, lang, client), 'utf8'));
     }
-    expect(MAX_BYTES - max).toBeGreaterThanOrEqual(RESERVE_BYTES);
+    expect(max).toBeLessThanOrEqual(MAX_BYTES);
   });
 });

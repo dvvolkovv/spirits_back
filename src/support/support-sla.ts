@@ -15,11 +15,11 @@ export type SlaFilter = 'overdue' | 'soon' | 'unassigned' | 'mine';
 
 export function slaFilterSql(filter: SlaFilter | undefined, actorId: string): { sql: string; params: any[] } {
   if (filter === 'overdue') {
-    return { sql: 'first_owner_reply_at IS NULL AND first_response_due_at < now()', params: [] };
+    return { sql: "status <> 'resolved' AND first_owner_reply_at IS NULL AND first_response_due_at < now()", params: [] };
   }
   if (filter === 'soon') {
     return {
-      sql: "first_owner_reply_at IS NULL AND first_response_due_at >= now() AND first_response_due_at <= now() + interval '30 minutes'",
+      sql: "status <> 'resolved' AND first_owner_reply_at IS NULL AND first_response_due_at >= now() AND first_response_due_at <= now() + interval '30 minutes'",
       params: [],
     };
   }

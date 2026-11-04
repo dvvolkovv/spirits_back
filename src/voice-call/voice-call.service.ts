@@ -12,6 +12,7 @@ import { BusinessProfileService } from '../business-profile/business-profile.ser
 import { LiveKitClient } from './livekit.client';
 import { AttendeeClient } from '../meeting/attendee.client';
 import { endVerdict, type EndVerdict } from './end-reason';
+import { cleanParticipants, mergeParticipants, participantsLine, type MeetingParticipant } from './participants';
 import {
   CompletePayload, CONSOLIDATE_SIDE_LIMIT, HOST_AGENT_ID, HOST_CATEGORY,
   SPECIALIST_ROLES, SPECIALISTS,
@@ -132,6 +133,7 @@ export class VoiceCallService implements OnModuleInit {
   private static readonly MIGRATIONS = [
     '003_voice_call_origin.sql',
     '004_voice_call_end_reason.sql',
+    '005_voice_call_participants.sql',
   ];
 
   async onModuleInit(): Promise<void> {
@@ -387,7 +389,19 @@ export class VoiceCallService implements OnModuleInit {
    * Пишем лишь если реплик БОЛЬШЕ сохранённого (пересозданная сессия с приветствием не
    * затирает полный). owner 2026-09-01.
    */
-  async progress(callId: string, transcript: CompletePayload['transcript']): Promise<void> {
+  async progress(callId: string, transcript: CompletePayload['transcript'], participants?: unknown): Promise<void> {
+    // Участники — отдельным запросом и не под условием на транскрипт: люди
+    // входят и тогда, когда никто не говорит. Список у воркера только растёт,
+    // поэтому пишем, пока он не короче сохранённого.
+    const people = cleanParticipants(participants);
+    if (people.length) {
+      await this.pg.query(
+        `UPDATE voice_calls SET participants = $2::jsonb
+           WHERE id = $1 AND status <> 'completed'
+             AND jsonb_array_length(COALESCE(participants, '[]'::jsonb)) <= $3`,
+        [callId, JSON.stringify(people), people.length],
+      );
+    }
     if (!Array.isArray(transcript) || transcript.length === 0) return;
     await this.pg.query(
       `UPDATE voice_calls SET transcript = $2::jsonb
@@ -488,11 +502,15 @@ export class VoiceCallService implements OnModuleInit {
     const verdict = endVerdict(ending?.disconnect, ending?.close);
     const raw = `${ending?.disconnect || '-'}|${ending?.close || '-'}`;
 
+    // Список из progress плюс финальный: complete мог прийти и без полного.
+    const participants = mergeParticipants(cleanParticipants(call.participants), cleanParticipants(payload.participants));
+
     await this.pg.query(
       `UPDATE voice_calls SET status = 'completed', ended_at = now(), duration_sec = $1,
          transcript = $2, cost_usd = $3, model = $4, tokens_charged = $5,
-         end_reason = $6, end_raw = $7 WHERE id = $8`,
-      [durationSec, JSON.stringify(transcript), cost, payload.usage.model, tokens, verdict, raw, callId],
+         end_reason = $6, end_raw = $7, participants = $9 WHERE id = $8`,
+      [durationSec, JSON.stringify(transcript), cost, payload.usage.model, tokens, verdict, raw, callId,
+        participants.length ? JSON.stringify(participants) : null],
     );
     this.logger.log(`[complete] call=${callId} кончился: ${verdict} (${raw})`);
 
@@ -534,7 +552,7 @@ export class VoiceCallService implements OnModuleInit {
     // Резюме, карточка и профиль — в фоне. Промисы намеренно не ждём: воркер
     // обрывает запрос через пятнадцать секунд, а тут походы в LLM на десятки.
     // Так уже дважды терялся транскрипт целиком.
-    void this.finishSummary(callId, call.user_id, transcript, durationSec)
+    void this.finishSummary(callId, call.user_id, transcript, durationSec, participants)
       .catch((e) => this.logger.error(`[complete] резюме для ${callId} не собрано: ${e?.message}`));
     void this.consolidateCall(call.user_id, payload.transcript)
       .catch((e) => this.logger.error(`[complete] профиль по ${callId} не обновлён: ${e?.message}`));
@@ -546,12 +564,14 @@ export class VoiceCallService implements OnModuleInit {
     userId: string,
     transcript: CompletePayload['transcript'],
     durationSec: number,
+    participants: MeetingParticipant[] = [],
   ): Promise<void> {
-    const summary = await this.summarize(userId, transcript);
+    const summary = await this.summarize(userId, transcript, participants);
     await this.pg.query(`UPDATE voice_calls SET summary = $1 WHERE id = $2`, [summary, callId]);
 
     const minutes = Math.max(1, Math.round(durationSec / 60));
-    const content = `{{voice_call: id=${callId}}}\n\nРазговор ${minutes} мин.\n\n${summary}`;
+    const who = participantsLine(participants);
+    const content = `{{voice_call: id=${callId}}}\n\nРазговор ${minutes} мин.${who ? `\n\n${who}` : ''}\n\n${summary}`;
     await this.pg.query(
       `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
        VALUES ($1, 'ai', $2, $3, 'text', 0)`,
@@ -699,7 +719,11 @@ export class VoiceCallService implements OnModuleInit {
     }
   }
 
-  private async summarize(userId: string, transcript: CompletePayload['transcript']): Promise<string> {
+  private async summarize(
+    userId: string,
+    transcript: CompletePayload['transcript'],
+    participants: MeetingParticipant[] = [],
+  ): Promise<string> {
     if (!transcript?.length) return 'Разговор без реплик.';
     // Как зовут человека в карточке — решаем ЗДЕСЬ, а не оставляем модели.
     //
@@ -733,6 +757,9 @@ export class VoiceCallService implements OnModuleInit {
       '',
       ...SUMMARY_FIDELITY_RULES,
       '',
+      // Кто был на встрече — из состава, а не из распознавания: в расшифровке
+      // имена бывают искажены, а здесь они написаны самими людьми.
+      ...(participants.length ? [`Участники встречи: ${participants.map((p) => p.name).join(', ')}.`, ''] : []),
       flat,
     ].join('\n');
     try {

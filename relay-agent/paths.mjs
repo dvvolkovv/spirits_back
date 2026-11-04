@@ -10,7 +10,11 @@
 // строки. В мае 2026 это уронило загрузку файлов: имя на ~280 кириллических
 // символов давало 280+ подчёркиваний, renameSync падал с ENAMETOOLONG.
 
+import fsp from "fs/promises";
 import path from "path";
+import { AGENT_SCRATCH_ROOT, AGENT_MCP_DIR } from "./sandbox-policy.mjs";
+
+export { AGENT_SCRATCH_ROOT, AGENT_MCP_DIR };
 
 // Бюджет имени: SESSION_KEY_MAX + "_" + BASE_MAX + EXT_MAX = 241 < 255.
 // Запас в 14 байт оставлен намеренно — суффиксы вроде "-talerid-mcp.json"
@@ -100,4 +104,23 @@ export function sessionOutputDir(outputDir, sid) {
   const rel = path.relative(base, resolved);
   if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return null;
   return resolved;
+}
+
+export async function ensureSessionDirs(fsKey, { scratchRoot = AGENT_SCRATCH_ROOT, outputs = "/tmp/agent-output" } = {}) {
+  const scratch = path.join(scratchRoot, fsKey);
+  // Никакой автоматической очистки по возрасту: рабочая папка может содержать
+  // незавершённую работу. Создаём/нормализуем только известные пути своего хода.
+  await fsp.mkdir(scratch, { recursive: true, mode: 0o700 });
+  await fsp.mkdir(path.join(outputs, fsKey), { recursive: true, mode: 0o700 });
+  await fsp.chmod(path.join(outputs, fsKey), 0o700);
+  await fsp.chmod(scratch, 0o700);
+  return scratch;
+}
+
+// 0311: по имени папки можно зайти, перечислить чужие нельзя. Релей списком не читает.
+export async function ensureListingGuard({ outputs = "/tmp/agent-output", uploads = "/tmp/agent-uploads", scratchRoot = AGENT_SCRATCH_ROOT } = {}) {
+  for (const d of [outputs, uploads, scratchRoot]) {
+    await fsp.mkdir(d, { recursive: true, mode: 0o311 });
+    await fsp.chmod(d, 0o311);
+  }
 }

@@ -186,7 +186,7 @@ PY
 }
 
 health_and_release() {
-  for attempt in $(seq 1 20); do
+  for attempt in $(seq 1 120); do
     if curl -fsS --max-time 5 http://127.0.0.1:3033/health; then
       rm -f -- "$DRAIN_FILE"
       GATE_CREATED=0
@@ -299,7 +299,7 @@ if [[ ! "$PID" =~ ^[1-9][0-9]*$ ]]; then
 fi
 DRAIN_STARTED=$SECONDS
 while true; do
-  CHILDREN=$(ps --ppid "$PID" -o pid=)
+  CHILDREN=$(ps --ppid "$PID" -o pid= || true)
   if [[ "$INITIAL_INFLIGHT" == legacy ]]; then
     if ! grep -q . <<< "$CHILDREN" && legacy_workers_drained; then
       break

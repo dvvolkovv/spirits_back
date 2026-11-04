@@ -848,3 +848,82 @@ describe('VoiceCallService.complete: отчего кончился разгов�
     expect(finalUpdate(d)![1]).not.toContain('hangup');
   });
 });
+
+describe('список участников встречи', () => {
+  const usage = { audioInputTokens: 10, audioOutputTokens: 10, model: 'gpt-realtime' };
+  const settled = () => new Promise((r) => setImmediate(r));
+
+  function deps(staged: any[] | null = null) {
+    const inserted: any[] = [];
+    const updates: { sql: string; params: any[] }[] = [];
+    const pg = {
+      inserted,
+      updates,
+      query: jest.fn(async (sql: string, params: any[] = []) => {
+        if (/INSERT INTO custom_chat_history/i.test(sql)) { inserted.push(params); return { rows: [], rowCount: 1 }; }
+        if (/^\s*UPDATE voice_calls/i.test(sql)) { updates.push({ sql, params }); return { rows: [], rowCount: 1 }; }
+        if (/FROM voice_calls/i.test(sql)) {
+          return { rows: [{ id: 'call-1', user_id: 'u1', room_name: 'room-1', status: 'active',
+            started_at: new Date(Date.now() - 600_000), transcript: [], participants: staged }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      }),
+    };
+    const chat = { generateAgentReply: jest.fn(async () => 'резюме встречи'), consolidateAfterChatPublic: jest.fn(async () => {}) };
+    const livekit = { userToken: jest.fn(), dispatchAgent: jest.fn(), send: jest.fn(async () => {}) };
+    return { pg, chat, livekit };
+  }
+  const transcript: CompletePayload['transcript'] = [{ role: 'user', text: 'начнём', ts: 1, speaker: 'Аня' }];
+
+  it('complete сохраняет участников вместе со staged из progress', async () => {
+    const d = deps([{ name: 'Аня', joinedAt: 1000 }]);
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+    await svc.complete('call-1', { transcript, usage, participants: [{ name: 'Борис', joinedAt: 2000 }] });
+
+    const done = d.pg.updates.find((u) => /status = 'completed'/.test(u.sql))!;
+    expect(done.sql).toMatch(/participants = \$\d+/);
+    const saved = done.params.find((p) => typeof p === 'string' && p.includes('Борис'));
+    expect(JSON.parse(saved)).toEqual([{ name: 'Аня', joinedAt: 1000 }, { name: 'Борис', joinedAt: 2000 }]);
+  });
+
+  it('в сообщении о встрече есть строка участников, и они названы модели резюме', async () => {
+    const d = deps();
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+    await svc.complete('call-1', { transcript, usage, participants: [{ name: 'Аня', joinedAt: 1 }, { name: 'Борис', joinedAt: 2 }] });
+    await settled(); await settled();
+
+    const card = d.pg.inserted.find((p) => String(p[2]).includes('{{voice_call:'));
+    expect(String(card![2])).toContain('Участники: Аня, Борис.');
+    const prompt = (d.chat.generateAgentReply as jest.Mock).mock.calls[0][2] as string;
+    expect(prompt).toContain('Участники встречи: Аня, Борис.');
+  });
+
+  it('у звонка без участников строки нет', async () => {
+    const d = deps();
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+    await svc.complete('call-1', { transcript, usage });
+    await settled(); await settled();
+
+    const card = d.pg.inserted.find((p) => String(p[2]).includes('{{voice_call:'));
+    expect(String(card![2])).not.toContain('Участники');
+    expect((d.chat.generateAgentReply as jest.Mock).mock.calls[0][2]).not.toContain('Участники встречи');
+  });
+
+  it('progress сохраняет участников, даже когда транскрипт не вырос', async () => {
+    const d = deps();
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+    await svc.progress('call-1', [], [{ name: 'Аня', joinedAt: 1 }]);
+
+    const upd = d.pg.updates.find((u) => /SET participants/.test(u.sql))!;
+    expect(upd).toBeDefined();
+    expect(upd.sql).toMatch(/status <> 'completed'/);
+    expect(JSON.parse(upd.params[1])).toEqual([{ name: 'Аня', joinedAt: 1 }]);
+  });
+
+  it('progress без участников список не трогает', async () => {
+    const d = deps();
+    const svc = new VoiceCallService(d.pg as any, d.chat as any, d.livekit as any);
+    await svc.progress('call-1', [{ role: 'user', text: 'a', ts: 1 }]);
+    expect(d.pg.updates.filter((u) => /SET participants/.test(u.sql))).toHaveLength(0);
+  });
+});
