@@ -37,7 +37,9 @@ export interface AlertBotTurn {
 
 export type AlertBotDraftOutcome = 'sent' | 'cancelled' | 'asked';
 export type AlertBotDraftClaim = 'sending' | 'asking' | 'cancelling';
-export type AlertBotDraftClaimResult = 'claimed' | 'in_progress' | 'unavailable';
+export type AlertBotDraftClaimResult =
+  | { status: 'claimed'; version: number }
+  | { status: 'in_progress' | 'unavailable' };
 
 export interface AlertBotDraft {
   id: string;
@@ -50,6 +52,7 @@ export interface AlertBotDraft {
   expiresAt: Date;
   outcome: AlertBotDraftOutcome | AlertBotDraftClaim | null;
   claimedAt: Date | null;
+  claimVersion: number;
   createdAt: Date;
   resolvedAt: Date | null;
 }
@@ -115,6 +118,7 @@ function mapDraft(row: any): AlertBotDraft {
     expiresAt: row.expires_at,
     outcome: row.outcome,
     claimedAt: row.claimed_at,
+    claimVersion: Number(row.claim_version),
     createdAt: row.created_at,
     resolvedAt: row.resolved_at,
   };
@@ -369,7 +373,8 @@ export class AlertBotStore {
   async claimDraft(id: string, claim: AlertBotDraftClaim): Promise<AlertBotDraftClaimResult> {
     const r = await this.pg.query(
       `UPDATE alert_bot_ticket_drafts
-       SET outcome = $2, claimed_at = now(), resolved_at = NULL
+       SET outcome = $2, claimed_at = now(), claim_version = claim_version + 1,
+           resolved_at = NULL
        WHERE id = $1 AND expires_at > now()
          AND (
            outcome IS NULL
@@ -378,10 +383,10 @@ export class AlertBotStore {
              AND (claimed_at IS NULL OR claimed_at < now() - interval '60 seconds')
            )
          )
-       RETURNING id`,
+       RETURNING claim_version`,
       [id, claim],
     );
-    if (r.rowCount === 1) return 'claimed';
+    if (r.rowCount === 1) return { status: 'claimed', version: Number(r.rows[0].claim_version) };
 
     const active = await this.pg.query(
       `SELECT id FROM alert_bot_ticket_drafts
@@ -391,32 +396,38 @@ export class AlertBotStore {
        LIMIT 1`,
       [id],
     );
-    return active.rows[0] ? 'in_progress' : 'unavailable';
+    return { status: active.rows[0] ? 'in_progress' : 'unavailable' };
   }
 
-  async finalizeDraft(id: string, outcome: AlertBotDraftOutcome): Promise<boolean> {
-    const expected = outcome === 'sent'
-      ? "outcome = 'sending'"
-      : outcome === 'asked'
-        ? "outcome = 'asking'"
-        : "(outcome IS NULL OR outcome IN ('sending', 'asking', 'cancelling'))";
+  async finalizeDraft(
+    id: string,
+    expectedAction: AlertBotDraftClaim | null,
+    outcome: AlertBotDraftOutcome,
+    version: number,
+  ): Promise<boolean> {
+    const validTransition = outcome === 'cancelled'
+      ? expectedAction === null || ['sending', 'asking', 'cancelling'].includes(expectedAction)
+      : (outcome === 'sent' && expectedAction === 'sending')
+        || (outcome === 'asked' && expectedAction === 'asking');
+    if (!validTransition || !Number.isSafeInteger(version) || version < 0) return false;
+
     const r = await this.pg.query(
       `UPDATE alert_bot_ticket_drafts
-       SET outcome = $2, claimed_at = NULL, resolved_at = now()
-       WHERE id = $1 AND ${expected}
+       SET outcome = $3, claimed_at = NULL, resolved_at = now()
+       WHERE id = $1 AND outcome IS NOT DISTINCT FROM $2 AND claim_version = $4
        RETURNING id`,
-      [id, outcome],
+      [id, expectedAction, outcome, version],
     );
     return r.rowCount === 1;
   }
 
-  async releaseDraft(id: string): Promise<boolean> {
+  async releaseDraft(id: string, expectedAction: AlertBotDraftClaim, version: number): Promise<boolean> {
     const r = await this.pg.query(
       `UPDATE alert_bot_ticket_drafts
        SET outcome = NULL, claimed_at = NULL, resolved_at = NULL
-       WHERE id = $1 AND outcome IN ('sending', 'asking', 'cancelling')
+       WHERE id = $1 AND outcome = $2 AND claim_version = $3
        RETURNING id`,
-      [id],
+      [id, expectedAction, version],
     );
     return r.rowCount === 1;
   }

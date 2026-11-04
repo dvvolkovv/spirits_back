@@ -1149,7 +1149,7 @@ ${healthSummary}
 
   private async postOwnerReply(
     ticketId: string, senderId: string, content: string, metadata: any,
-    visibleToUser: boolean, eventPayload: any,
+    visibleToUser: boolean, eventPayload: any, draftClaimVersion?: number,
   ): Promise<boolean> {
     const client = await this.pg.getClient();
     let destroyClient = false;
@@ -1162,9 +1162,17 @@ ${healthSummary}
 
       const draftId = typeof metadata?.alertBotDraftId === 'string' ? metadata.alertBotDraftId : null;
       if (draftId) {
+        // Порядок блокировок всегда ticket → draft. Старый publisher, ждавший
+        // ticket lock, после его освобождения увидит актуальный claim_version.
+        const draft = await client.query(
+          `SELECT outcome, claim_version FROM alert_bot_ticket_drafts
+           WHERE id = $1 FOR UPDATE`,
+          [draftId],
+        );
+
         // Сначала идемпотентный retry: уже опубликованный ответ остаётся успехом
-        // даже если тикет успели закрыть после первой публикации.
-        // Блокировка строки тикета сериализует retry и конкурентные callback.
+        // даже после закрытия тикета или смены claim. Прямой lookup не ограничен
+        // 500 сообщениями adminGetTicket.
         const existing = await client.query(
           `SELECT id FROM support_messages
            WHERE ticket_id = $1 AND metadata->>'alertBotDraftId' = $2 LIMIT 1`,
@@ -1174,9 +1182,15 @@ ${healthSummary}
           await client.query('COMMIT');
           return false;
         }
-      }
-      if (draftId && ['resolved', 'closed'].includes(t.rows[0].status)) {
-        throw new ConflictException('ticket is terminal');
+        if (['resolved', 'closed'].includes(t.rows[0].status)) {
+          throw new ConflictException('ticket is terminal');
+        }
+        if (
+          draft.rows[0]?.outcome !== 'sending'
+          || Number(draft.rows[0]?.claim_version) !== draftClaimVersion
+        ) {
+          throw new ConflictException('draft claim is stale');
+        }
       }
 
       await this.insertMessage(ticketId, 'owner', senderId, content, metadata, visibleToUser, client);
@@ -1330,6 +1344,7 @@ ${healthSummary}
   async postOwnerReplyFromTelegram(
     ticketId: string, telegramUserId: string, displayName: string,
     content: string, visibleToUser = true, linkeonUserId?: string, draftId?: string,
+    draftClaimVersion?: number,
   ): Promise<void> {
     const actorId = linkeonUserId || `tg:${telegramUserId}`;
     const metadata = {
@@ -1340,6 +1355,7 @@ ${healthSummary}
       ticketId, actorId, content,
       metadata, visibleToUser,
       { ...metadata, length: content.length },
+      draftClaimVersion,
     );
     if (visibleToUser && published) void this.notifyOwnerReplyByEmail(ticketId, content);
   }

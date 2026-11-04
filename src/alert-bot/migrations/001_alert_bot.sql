@@ -24,10 +24,13 @@ BEGIN
     text text NOT NULL, prompt_message_id bigint,
     expires_at timestamptz NOT NULL DEFAULT now() + interval '15 minutes',
     outcome text, claimed_at timestamptz,
+    claim_version bigint NOT NULL DEFAULT 0,
     created_at timestamptz NOT NULL DEFAULT now(), resolved_at timestamptz
   );
   ALTER TABLE alert_bot_ticket_drafts
     ADD COLUMN IF NOT EXISTS claimed_at timestamptz;
+  ALTER TABLE alert_bot_ticket_drafts
+    ADD COLUMN IF NOT EXISTS claim_version bigint NOT NULL DEFAULT 0;
   IF to_regclass('idx_alert_messages_created') IS NULL THEN
     CREATE INDEX idx_alert_messages_created ON alert_messages (created_at DESC);
   END IF;

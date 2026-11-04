@@ -77,7 +77,7 @@ export class AlertBotDrafts {
       );
     } catch {
       // Без видимого prompt активный черновик был бы недостижим для кнопок.
-      await this.store.finalizeDraft(id, 'cancelled');
+      await this.store.finalizeDraft(id, null, 'cancelled', 0);
       return 'Не удалось показать черновик — он отменён.';
     }
 
@@ -91,13 +91,20 @@ export class AlertBotDrafts {
     return null;
   }
 
-  private async finalize(id: string, outcome: AlertBotDraftOutcome): Promise<void> {
-    if (!await this.store.finalizeDraft(id, outcome)) throw new Error('draft finalize failed');
+  private async finalize(
+    id: string,
+    expectedAction: AlertBotDraftClaim,
+    outcome: AlertBotDraftOutcome,
+    version: number,
+  ): Promise<void> {
+    if (!await this.store.finalizeDraft(id, expectedAction, outcome, version)) {
+      throw new Error('draft finalize failed');
+    }
   }
 
   async handleCallback(input: DraftCallbackInput): Promise<DraftCallbackResult> {
     let answer = 'Готово';
-    let claimed = false;
+    let activeClaim: { action: AlertBotDraftClaim; version: number } | null = null;
     try {
       const draft = await this.store.getDraft(input.draftId);
       if (!draft || String(draft.chatId) !== String(input.chatId)) {
@@ -121,46 +128,32 @@ export class AlertBotDrafts {
         return {};
       }
       const claimResult = await this.store.claimDraft(draft.id, claim);
-      if (claimResult === 'in_progress') {
+      if (claimResult.status === 'in_progress') {
         answer = 'Черновик уже обрабатывается';
         return {};
       }
-      if (claimResult !== 'claimed') {
+      if (claimResult.status !== 'claimed') {
         answer = 'Черновик устарел';
         return {};
       }
-      claimed = true;
+      activeClaim = { action: claim, version: claimResult.version };
 
       if (input.action === 'ask') {
-        await this.finalize(draft.id, 'asked');
-        claimed = false;
+        await this.finalize(draft.id, activeClaim.action, 'asked', activeClaim.version);
+        activeClaim = null;
         answer = 'Вопрос передан боту';
         return { question: draft.text, ticketId: draft.ticketId };
       }
 
       if (input.action === 'cancel') {
-        await this.finalize(draft.id, 'cancelled');
-        claimed = false;
+        await this.finalize(draft.id, activeClaim.action, 'cancelled', activeClaim.version);
+        activeClaim = null;
         answer = 'Отменено';
         try {
           await this.telegram.editMessageText(input.chatId, input.messageId, 'Отменено');
         } catch {
           // Отмена уже зафиксирована; устаревший prompt — косметическая проблема.
         }
-        return {};
-      }
-
-      // Между созданием черновика и нажатием кнопки тикет могли закрыть.
-      // Но уже опубликованный draftId должен завершить восстановление как sent,
-      // даже если закрытие произошло между publish и finalize.
-      const current = await this.support.adminGetTicket(draft.ticketId);
-      const alreadyPublished = current.messages?.some(
-        (message) => message.metadata?.alertBotDraftId === draft.id,
-      );
-      if (terminal(current.ticket.status) && !alreadyPublished) {
-        await this.finalize(draft.id, 'cancelled');
-        claimed = false;
-        answer = 'Тикет уже закрыт — ответ не отправлен';
         return {};
       }
 
@@ -173,18 +166,20 @@ export class AlertBotDrafts {
           true,
           input.adminUserId,
           draft.id,
+          activeClaim.version,
         );
       } catch (error) {
         if (!terminalPublishError(error)) throw error;
-        // Гонку закрытия ловит SupportService под FOR UPDATE. Это не «sent».
-        await this.finalize(draft.id, 'cancelled');
-        claimed = false;
+        // Терминальный статус и retry уже опубликованного draftId различаются
+        // только прямым поиском сообщения под ticket+draft FOR UPDATE.
+        await this.finalize(draft.id, activeClaim.action, 'cancelled', activeClaim.version);
+        activeClaim = null;
         answer = 'Тикет уже закрыт — ответ не отправлен';
         return {};
       }
 
-      await this.finalize(draft.id, 'sent');
-      claimed = false;
+      await this.finalize(draft.id, activeClaim.action, 'sent', activeClaim.version);
+      activeClaim = null;
       answer = 'Отправлено';
       try {
         await this.telegram.editMessageText(input.chatId, input.messageId, '✅ Отправлено');
@@ -194,10 +189,10 @@ export class AlertBotDrafts {
       }
       return {};
     } catch {
-      if (claimed) {
-        // Неожиданный сбой publish/finalize: publish идемпотентен по draftId,
-        // поэтому повтор безопасен даже после неопределённого post-commit сбоя.
-        await this.store.releaseDraft(input.draftId).catch(() => undefined);
+      if (activeClaim) {
+        // Versioned release не может очистить более новый claim. Повторный publish
+        // безопасен: draftId идемпотентен, а stale version отклоняется до insert.
+        await this.store.releaseDraft(input.draftId, activeClaim.action, activeClaim.version).catch(() => undefined);
       }
       answer = 'Не удалось обработать черновик';
       return {};
