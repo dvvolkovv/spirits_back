@@ -1,6 +1,7 @@
 import 'reflect-metadata';
 import * as http from 'http';
 import { AddressInfo } from 'net';
+import { inspect } from 'util';
 import { INestApplication, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AlertBotController } from './alert-bot.controller';
@@ -80,8 +81,8 @@ describe('защищённый webhook бота алертов', () => {
     const update = { update_id: 4, message: { text: 'СЕКРЕТ-ИЗ-UPDATE' } };
     expect((await post(update, 'secret')).status).toBe(200);
     await new Promise<void>((resolve) => setImmediate(resolve));
-    const logs = loggerError.mock.calls.map((call) => call.join(' ')).join('\n');
+    const logs = loggerError.mock.calls.map((args) => inspect(args, { depth: null })).join('\n');
     expect(logs).not.toContain('СЕКРЕТ-ИЗ-ОТВЕТА');
-    expect(logs).not.toContain(JSON.stringify(update));
+    expect(logs).not.toContain('СЕКРЕТ-ИЗ-UPDATE');
   });
 });

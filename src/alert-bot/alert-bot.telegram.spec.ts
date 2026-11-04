@@ -3,11 +3,16 @@ import { AlertBotTelegram } from './alert-bot.telegram';
 jest.mock('axios');
 
 describe('Telegram бота алертов', () => {
+  const originalEnv = { ...process.env };
+
   beforeEach(() => {
     process.env.TELEGRAM_BOT_TOKEN = 'TEST-TOKEN-НЕ-НАСТОЯЩИЙ';
     process.env.ALERT_BOT_WEBHOOK_URL = 'https://example.test/webhook/alert-bot/telegram';
     process.env.ALERT_BOT_WEBHOOK_SECRET = 'secret';
     jest.resetAllMocks();
+  });
+  afterEach(() => {
+    process.env = { ...originalEnv };
   });
   it('ответ — простой текст, реплай, без превью', async () => {
     (axios.post as jest.Mock).mockResolvedValue({ data: { ok: true, result: { message_id: 10 } } });
@@ -20,7 +25,9 @@ describe('Telegram бота алертов', () => {
   it('ошибка axios не раскрывает токен', async () => {
     (axios.post as jest.Mock).mockRejectedValue({ config: { url: 'https://api.telegram.org/botTEST-TOKEN-НЕ-НАСТОЯЩИЙ/getMe' }, message: 'failed' });
     const err = await new AlertBotTelegram().getMe().catch((e) => e);
-    expect(JSON.stringify(err)).not.toContain('TEST-TOKEN-НЕ-НАСТОЯЩИЙ');
+    expect(String(err)).not.toContain('TEST-TOKEN-НЕ-НАСТОЯЩИЙ');
+    expect(err.message).not.toContain('TEST-TOKEN-НЕ-НАСТОЯЩИЙ');
+    expect(err.stack).not.toContain('TEST-TOKEN-НЕ-НАСТОЯЩИЙ');
   });
   it('пустой или свой адрес регистрируется, меню выставляется', async () => {
     (axios.post as jest.Mock).mockResolvedValue({ data: { ok: true, result: true } });
