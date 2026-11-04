@@ -307,9 +307,9 @@ export class AlertBotStore {
   }
 
   async cleanup(): Promise<void> {
-    await this.pg.query("DELETE FROM alert_bot_updates WHERE created_at < now() - interval '7 days'");
-    await this.pg.query("DELETE FROM alert_messages WHERE created_at < now() - interval '30 days'");
-    await this.pg.query("DELETE FROM alert_bot_ticket_drafts WHERE created_at < now() - interval '30 days'");
-    await this.pg.query("DELETE FROM alert_bot_turns WHERE created_at < now() - interval '90 days'");
+    await this.pg.query('DELETE FROM alert_bot_updates WHERE created_at < now() - $1::interval', ['7 days']);
+    await this.pg.query('DELETE FROM alert_messages WHERE created_at < now() - $1::interval', ['30 days']);
+    await this.pg.query('DELETE FROM alert_bot_ticket_drafts WHERE created_at < now() - $1::interval', ['30 days']);
+    await this.pg.query('DELETE FROM alert_bot_turns WHERE created_at < now() - $1::interval', ['90 days']);
   }
 }
