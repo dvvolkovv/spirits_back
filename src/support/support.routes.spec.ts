@@ -1,4 +1,9 @@
 import 'reflect-metadata';
+jest.mock('@napi-rs/canvas', () => ({
+  createCanvas: jest.fn(),
+  loadImage: jest.fn(),
+  GlobalFonts: { register: jest.fn() },
+}));
 import * as http from 'http';
 import { AddressInfo } from 'net';
 import { INestApplication, Module } from '@nestjs/common';
