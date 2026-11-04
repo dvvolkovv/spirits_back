@@ -1,3 +1,9 @@
+jest.mock('@napi-rs/canvas', () => ({
+  createCanvas: jest.fn(),
+  loadImage: jest.fn(),
+  GlobalFonts: { register: jest.fn() },
+}));
+
 import { AlertBotHealthService, HEALTH_SECTIONS, HealthSection } from './alert-bot.health';
 
 type Stub = Record<string, jest.Mock>;
