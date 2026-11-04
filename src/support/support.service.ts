@@ -1307,12 +1307,15 @@ ${healthSummary}
    * Post an owner reply into a ticket — same semantics as adminReply but sender_id comes from Telegram.
    */
   async postOwnerReplyFromTelegram(
-    ticketId: string, telegramUserId: string, displayName: string, content: string, visibleToUser = true,
+    ticketId: string, telegramUserId: string, displayName: string,
+    content: string, visibleToUser = true, linkeonUserId?: string,
   ): Promise<void> {
+    const actorId = linkeonUserId || `tg:${telegramUserId}`;
+    const metadata = { via: 'telegram', author: displayName, telegramUserId };
     await this.postOwnerReply(
-      ticketId, `tg:${telegramUserId}`, content,
-      { via: 'telegram', author: displayName }, visibleToUser,
-      { via: 'telegram', author: displayName, length: content.length },
+      ticketId, actorId, content,
+      metadata, visibleToUser,
+      { ...metadata, length: content.length },
     );
     if (visibleToUser) void this.notifyOwnerReplyByEmail(ticketId, content);
   }
@@ -1390,9 +1393,10 @@ ${healthSummary}
     return r.rows[0]?.n || 0;
   }
 
-  async setStatusFromTelegram(ticketId: string, telegramUserId: string, status: string) {
+  async setStatusFromTelegram(ticketId: string, telegramUserId: string, status: string, linkeonUserId?: string) {
     const allowed = ['resolved', 'closed', 'owner_handling', 'ai_handling'];
     if (!allowed.includes(status)) throw new BadRequestException('invalid status');
+    const actorId = linkeonUserId || `tg:${telegramUserId}`;
     await this.pg.query(
       `UPDATE support_tickets
          SET status = $1,
@@ -1404,7 +1408,7 @@ ${healthSummary}
     await this.pg.query(
       `INSERT INTO support_events (ticket_id, actor_type, actor_id, action, payload)
        VALUES ($1, 'owner', $2, 'status_change', $3)`,
-      [ticketId, `tg:${telegramUserId}`, JSON.stringify({ status, via: 'telegram' })],
+      [ticketId, actorId, JSON.stringify({ status, via: 'telegram', telegramUserId })],
     );
   }
 
