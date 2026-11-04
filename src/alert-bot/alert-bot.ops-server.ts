@@ -1,23 +1,49 @@
 import * as http from 'http';
+import { Socket } from 'net';
 import { AlertBotAccess } from './alert-bot.access';
 import { alertBotOpsPort } from './alert-bot.config';
 import { verifyOpsToken } from './alert-bot.ops-token';
-import { OpsToolHandler } from './alert-bot.types';
+import { OpsContext, OpsToolHandler } from './alert-bot.types';
 
 const MAX_BODY_BYTES = 65_536;
+const DEFAULT_TOOL_TIMEOUT_MS = 120_000;
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5_000;
+const SUPPORTED_PROTOCOLS = new Set(['2025-06-18', '2025-03-26']);
+const TOOL_FAILED = JSON.stringify({ error: 'tool_failed' });
+
+export interface AlertBotOpsServerOptions {
+  toolTimeoutMs?: number;
+  shutdownTimeoutMs?: number;
+}
 
 export class AlertBotOpsServer {
   private server: http.Server | null = null;
   private readonly toolCalls = new Map<string, string[]>();
+  private readonly sockets = new Set<Socket>();
+  private readonly toolCancels = new Set<() => void>();
+  private readonly toolTimeoutMs: number;
+  private readonly shutdownTimeoutMs: number;
 
   constructor(
     private readonly access: AlertBotAccess,
     private readonly tools: OpsToolHandler,
-  ) {}
+    options: AlertBotOpsServerOptions = {},
+  ) {
+    this.toolTimeoutMs = options.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
+    this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
+  }
 
   async start(port = alertBotOpsPort()): Promise<void> {
     if (this.server) throw new Error('ops server already started');
     const server = http.createServer((req, res) => { void this.handle(req, res); });
+    server.on('error', (error: NodeJS.ErrnoException) => {
+      const code = typeof error.code === 'string' && /^[A-Z0-9_]+$/.test(error.code) ? error.code : 'UNKNOWN';
+      console.error(`[alert-bot-ops] server error ${code}`);
+    });
+    server.on('connection', (socket) => {
+      this.sockets.add(socket);
+      socket.on('close', () => this.sockets.delete(socket));
+    });
     this.server = server;
     try {
       await new Promise<void>((resolve, reject) => {
@@ -38,8 +64,20 @@ export class AlertBotOpsServer {
     const server = this.server;
     if (!server) return;
     this.server = null;
-    await new Promise<void>((resolve, reject) => {
-      server.close((error) => error ? reject(error) : resolve());
+    for (const cancel of [...this.toolCancels]) cancel();
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        for (const socket of this.sockets) socket.destroy();
+        finish();
+      }, this.shutdownTimeoutMs);
+      server.close(finish);
     });
   }
 
@@ -108,21 +146,27 @@ export class AlertBotOpsServer {
         return;
       }
 
-      const id = body.id ?? null;
-      if (body.id === undefined && typeof body.method === 'string' && body.method.startsWith('notifications/')) {
-        this.sendEmpty(res, 202);
-        return;
-      }
-      if (body.id === undefined || typeof body.method !== 'string') {
+      if (body.jsonrpc !== '2.0' || typeof body.method !== 'string') {
         this.sendError(res, 400, null, -32600, 'invalid request');
         return;
       }
+      if (body.id === undefined && body.method.startsWith('notifications/')) {
+        this.sendEmpty(res, 202);
+        return;
+      }
+      if (body.id === undefined || !['string', 'number'].includes(typeof body.id)) {
+        this.sendError(res, 400, null, -32600, 'invalid request');
+        return;
+      }
+      const id = body.id as string | number;
 
       if (body.method === 'initialize') {
+        const requested = body.params?.protocolVersion;
+        const protocolVersion = SUPPORTED_PROTOCOLS.has(requested) ? requested : '2025-06-18';
         this.sendJson(res, 200, {
           jsonrpc: '2.0', id,
           result: {
-            protocolVersion: body.params?.protocolVersion,
+            protocolVersion,
             capabilities: { tools: {} },
             serverInfo: { name: 'ops', version: '1.0.0' },
           },
@@ -135,7 +179,8 @@ export class AlertBotOpsServer {
       }
       if (body.method === 'tools/call') {
         const name = body.params?.name;
-        const args = body.params?.arguments;
+        const suppliedArgs = body.params?.arguments;
+        const args = suppliedArgs === undefined ? {} : suppliedArgs;
         if (typeof name !== 'string' || !args || typeof args !== 'object' || Array.isArray(args)) {
           this.sendError(res, 200, id, -32602, 'invalid params');
           return;
@@ -146,7 +191,7 @@ export class AlertBotOpsServer {
 
         let text: string;
         try {
-          text = await this.tools.execute(name, args, identity);
+          text = await this.executeWithDeadline(name, args, identity);
         } catch {
           text = JSON.stringify({ error: 'tool_failed' });
         }
@@ -165,6 +210,26 @@ export class AlertBotOpsServer {
       this.sendError(res, 200, id, -32601, 'method not found');
     } catch {
       if (!res.headersSent) this.sendError(res, 500, null, -32603, 'internal error');
+    }
+  }
+
+  private async executeWithDeadline(name: string, args: Record<string, unknown>, identity: OpsContext): Promise<string> {
+    let timer: NodeJS.Timeout;
+    let cancel: () => void = () => undefined;
+    const deadline = new Promise<string>((resolve) => {
+      cancel = () => {
+        clearTimeout(timer);
+        this.toolCancels.delete(cancel);
+        resolve(TOOL_FAILED);
+      };
+      this.toolCancels.add(cancel);
+      timer = setTimeout(cancel, this.toolTimeoutMs);
+    });
+    try {
+      return await Promise.race([this.tools.execute(name, args, identity), deadline]);
+    } finally {
+      clearTimeout(timer);
+      this.toolCancels.delete(cancel);
     }
   }
 

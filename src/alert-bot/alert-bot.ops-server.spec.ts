@@ -108,6 +108,7 @@ describe('AlertBotOpsServer stateless MCP', () => {
   });
 
   it('отклоняет listen-ошибку', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
     const second = new AlertBotOpsServer(access, { definitions: () => definitions, execute });
     const port = Number(new URL(server.origin()).port);
     await expect(second.start(port)).rejects.toMatchObject({ code: 'EADDRINUSE' });
@@ -313,6 +314,7 @@ describe('AlertBotOpsServer stateless MCP', () => {
       await stopPromise;
     }
     await outcome;
+    await new Promise((resolve) => setImmediate(resolve));
     expect(stopped).toBe(true);
     expect(sockets.size).toBe(0);
   });
@@ -337,6 +339,7 @@ describe('AlertBotOpsServer stateless MCP', () => {
       for (const socket of sockets) socket.destroy();
       await stopPromise;
     }
+    await new Promise((resolve) => setImmediate(resolve));
     expect(stopped).toBe(true);
     expect(sockets.size).toBe(0);
   });
