@@ -1,14 +1,14 @@
 import * as crypto from 'crypto';
 
-const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi;
+const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
 
 export function maskText(input: string, ticketIds: Iterable<string> = []): string {
   const tickets = new Set(Array.from(ticketIds, (x) => x.toLowerCase()));
   let s = String(input);
-  s = s.replace(/\b\d{8,10}:[A-Za-z0-9_-]{30,}\b/g, '[скрыто]');
+  s = s.replace(/(?<![A-Za-z0-9_-])\d{8,10}:[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-])/g, '[скрыто]');
   s = s.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '[скрыто]');
   s = s.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [скрыто]');
-  s = s.replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, '[скрыто]');
+  s = s.replace(/(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{12,}(?![A-Za-z0-9_-])/g, '[скрыто]');
   s = s.replace(/([?&](?:token|key|secret)=)[^&#\s]+/gi, '$1[скрыто]');
   s = s.replace(UUID, (id) => tickets.has(id.toLowerCase()) ? `#${id.slice(0, 8)}` : '[id]');
   s = s.replace(/\b[0-9a-f]{32,}\b/gi, '[скрыто]');
@@ -27,7 +27,18 @@ export function maskForModel(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(maskForModel);
   if (value instanceof Date) return value.toISOString();
   if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, maskForModel(v)]));
+    const entries: [string, unknown][] = [];
+    const keys = new Set<string>();
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof item === 'function') continue;
+      const maskedKey = maskText(key);
+      let uniqueKey = maskedKey;
+      let collision = 2;
+      while (keys.has(uniqueKey)) uniqueKey = `${maskedKey}#${collision++}`;
+      keys.add(uniqueKey);
+      entries.push([uniqueKey, maskForModel(item)]);
+    }
+    return Object.fromEntries(entries);
   }
   return value;
 }
@@ -40,7 +51,7 @@ export function userLabel(userId: string, name?: string | null): { user: string;
 }
 
 export function toolText(value: unknown): string {
-  const json = JSON.stringify(maskForModel(value)) ?? 'null';
+  const json = maskText(JSON.stringify(maskForModel(value)) ?? 'null');
   if (Buffer.byteLength(json) <= 8192) return json;
   const chars = Array.from(json);
   let out = chars.slice(0, 7800).join('');
