@@ -3,6 +3,14 @@ import axios from 'axios';
 
 const log = new Logger('TelegramAlert');
 
+export type AlertSentSink = (chatId: string, messageId: number, text: string) => Promise<void>;
+
+let alertSentSink: AlertSentSink | null = null;
+
+export function setAlertSentSink(sink: AlertSentSink | null): void {
+  alertSentSink = sink;
+}
+
 /**
  * Единая точка отправки алертов мониторинга в Telegram.
  *
@@ -51,7 +59,15 @@ export async function sendTelegramPayload(
         `https://api.telegram.org/bot${token}/sendMessage`,
         { chat_id, ...rest },
         { timeout: 8000 },
-      ).catch((e: any) => {
+      ).then((r) => {
+        const messageId = Number(r.data?.result?.message_id);
+        const text = String((rest as any).text || '');
+        if (alertSentSink && Number.isFinite(messageId) && text) {
+          void alertSentSink(String(chat_id), messageId, text).catch((e: any) => {
+            log.warn(`alert journal failed for chat …${String(chat_id).slice(-4)}: ${e?.code || 'error'}`);
+          });
+        }
+      }).catch((e: any) => {
         // Один чат недоступен — остальные всё равно получат. Но молчать нельзя:
         // так с 09.08 по 23.10.2026 никто не заметил, что личка заблокировала бота.
         // Только описание от Telegram: в e.config.url лежит токен бота.
