@@ -7,6 +7,23 @@ export const AGENT_OPT_DIR = '/opt/linkeon-agent';
 export const AGENT_SCRATCH_ROOT = '/tmp/agent-scratch';
 export const AGENT_MCP_DIR = '/tmp/agent-mcp';
 export const SANDBOX_SCHEMA = process.env.RELAY_SANDBOX_SCHEMA ?? 'A'; // подтверждено разведкой 03.11
+export const SANDBOX_ALLOWED_DOMAINS = Object.freeze([
+  'example.com',
+  'pypi.org',
+  'files.pythonhosted.org',
+  'registry.npmjs.org',
+  'nodejs.org',
+  'github.com',
+  'api.github.com',
+  'raw.githubusercontent.com',
+  'codeload.github.com',
+  'objects.githubusercontent.com',
+  'huggingface.co',
+  'cdn-lfs.huggingface.co',
+  'image.pollinations.ai',
+  'fonts.google.com',
+  'fonts.gstatic.com',
+]);
 
 // Режим из файла на сервере (~/file-agent/sandbox-mode). Битый/отсутствующий — off.
 export function sandboxMode(modeFile) {
@@ -54,7 +71,6 @@ export function buildSandboxSettings(fsKey, {
     '/home/dv', '/proc', '/etc/sudoers', '/etc/sudoers.d',
     normalizeDir(mcpDir || AGENT_MCP_DIR), '/tmp/agent-uploads/mcp',
   ])];
-  const PROXY = process.env.RELAY_SANDBOX_PROXY || '127.0.0.1:8471';
   return {
     sandbox: {
       enabled: true,
@@ -64,7 +80,7 @@ export function buildSandboxSettings(fsKey, {
         allowWrite: [scratchDir, myOutput],
         denyRead: [...deny],
       },
-      network: { allowedDomains: [PROXY] },
+      network: { allowedDomains: [...SANDBOX_ALLOWED_DOMAINS] },
     },
     permissions: {
       deny: [
@@ -105,13 +121,8 @@ export function buildCliEnv({
   env.MCP_TOOL_TIMEOUT = '600000';
   if (scrub) env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = '1';
   env.PATH = `${normalizeDir(optDir)}/bin:/usr/local/bin:/usr/bin:/bin`;
-  // Сеть — только через локальный прокси (squid на релее режет внутренние
-  // назначения). no_proxy НЕ задаём: он дал бы обход резки через localhost.
-  const PROXY = process.env.RELAY_SANDBOX_PROXY || '127.0.0.1:8471';
-  env.http_proxy = `http://${PROXY}`;
-  env.https_proxy = `http://${PROXY}`;
-  env.HTTP_PROXY = env.http_proxy;
-  env.HTTPS_PROXY = env.https_proxy;
+  // Сетевой белый список применяет встроенная песочница CLI; proxy-переменные
+  // не задаём и не пробрасываем, включая no_proxy.
   return env;
 }
 
@@ -172,7 +183,7 @@ export function applySandboxPrompt(prompt, sandboxOn) {
     )
     .replace(
       'INSTALL ANYTHING MISSING: apt, pip, npm, wget — whatever it takes.',
-      'INSTALL MISSING PACKAGES: use pip/npm locally in your scratch directory or a venv there; use wget/curl through the configured proxy. apt and sudo are unavailable.',
+      'INSTALL MISSING PACKAGES: use pip/npm locally in your scratch directory or a venv there; use wget/curl only for allowed domains through the network sandbox. apt and sudo are unavailable.',
     )
     .replaceAll('/home/dv/agent-env/bin/activate', `${AGENT_OPT_DIR}/venv/bin/activate`)
     .replaceAll('/home/dv/agent-env/bin/generate_image.sh', `${AGENT_OPT_DIR}/bin/generate_image.sh`);
