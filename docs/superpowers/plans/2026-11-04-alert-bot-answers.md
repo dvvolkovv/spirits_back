@@ -679,7 +679,7 @@ Commit SQL и store: `feat(alert-bot): хранить апдейты, ходы, 
 
 - [ ] **Step 5: проверить GREEN и tsc**
 
-Прогнать `src/alert-bot/alert-bot.store.pg.spec.ts` с живым PG и `tsc`. Expected: 8 tests passed, ни deadlock, ни lock timeout; `TSC_OK`.
+Прогнать `src/alert-bot/alert-bot.store.pg.spec.ts` с живым PG и `tsc`. Expected: 9 tests passed, ни deadlock, ни lock timeout; `TSC_OK`.
 
 ### Task 4: Telegram Bot API и защищённый webhook
 
