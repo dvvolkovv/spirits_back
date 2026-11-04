@@ -70,17 +70,32 @@ maybe('хранилище бота алертов против PostgreSQL', () =
   });
   it('claim можно освободить для retry и затем финализировать', async () => {
     const id = await store.createDraft({ chatId: '1', tgUserId: '111', adminUserId: 'u-admin', ticketId: '11111111-1111-4111-8111-111111111111', text: 'ответ', promptMessageId: 32 });
-    expect(await store.claimDraft(id, 'sending')).toBe(true);
-    expect(await store.claimDraft(id, 'asking')).toBe(false);
+    expect(await store.claimDraft(id, 'sending')).toBe('claimed');
+    expect(await store.claimDraft(id, 'asking')).toBe('in_progress');
     expect(await store.releaseDraft(id)).toBe(true);
-    expect(await store.claimDraft(id, 'sending')).toBe(true);
+    expect(await store.claimDraft(id, 'sending')).toBe('claimed');
     expect(await store.finalizeDraft(id, 'sent')).toBe(true);
+    expect(await store.finalizeDraft(id, 'cancelled')).toBe(false);
     expect(await store.releaseDraft(id)).toBe(false);
+  });
+  it('просроченный и legacy lease можно reclaim, а claimed_at обновляется', async () => {
+    const expired = await store.createDraft({ chatId: '1', tgUserId: '111', adminUserId: 'u-admin', ticketId: '11111111-1111-4111-8111-111111111111', text: 'ответ', promptMessageId: 33 });
+    expect(await store.claimDraft(expired, 'sending')).toBe('claimed');
+    await pool.query("UPDATE alert_bot_ticket_drafts SET claimed_at = now() - interval '61 seconds' WHERE id = $1", [expired]);
+
+    expect(await store.claimDraft(expired, 'sending')).toBe('claimed');
+    expect((await store.getDraft(expired))?.claimedAt).toBeInstanceOf(Date);
+    expect(await store.finalizeDraft(expired, 'sent')).toBe(true);
+
+    const legacy = await store.createDraft({ chatId: '1', tgUserId: '111', adminUserId: 'u-admin', ticketId: '11111111-1111-4111-8111-111111111111', text: 'ответ', promptMessageId: 34 });
+    await pool.query("UPDATE alert_bot_ticket_drafts SET outcome = 'asking', claimed_at = NULL WHERE id = $1", [legacy]);
+    expect(await store.claimDraft(legacy, 'asking')).toBe('claimed');
+    expect(await store.finalizeDraft(legacy, 'asked')).toBe(true);
   });
   it('непоказанный черновик можно сразу отменить', async () => {
     const id = await store.createDraft({ chatId: '1', tgUserId: '111', adminUserId: 'u-admin', ticketId: '11111111-1111-4111-8111-111111111111', text: 'ответ' });
     expect(await store.finalizeDraft(id, 'cancelled')).toBe(true);
-    expect(await store.claimDraft(id, 'sending')).toBe(false);
+    expect(await store.claimDraft(id, 'sending')).toBe('unavailable');
   });
   it('журнал алертов и восстановление ходов работают', async () => {
     await store.recordAlert('1', 40, '🔥 тест');

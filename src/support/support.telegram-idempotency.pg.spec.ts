@@ -113,6 +113,33 @@ maybe('идемпотентная публикация Telegram-черновик
     expect(email).toHaveBeenCalledTimes(1);
   });
 
+  it('publish → close → retry возвращает идемпотентный успех без новых эффектов', async () => {
+    const { service, email } = makeService();
+    const ticketId = await newTicket();
+
+    await publish(service, ticketId);
+    await pool.query("UPDATE support_tickets SET status = 'closed', updated_at = now() WHERE id = $1", [ticketId]);
+    const closed = await pool.query(
+      'SELECT updated_at, first_owner_reply_at FROM support_tickets WHERE id = $1',
+      [ticketId],
+    );
+
+    await expect(publish(service, ticketId)).resolves.toBeUndefined();
+
+    expect(await effects(ticketId)).toMatchObject({
+      messages: 1,
+      events: 1,
+      tagged: 1,
+      status: 'closed',
+    });
+    const retried = await pool.query(
+      'SELECT updated_at, first_owner_reply_at FROM support_tickets WHERE id = $1',
+      [ticketId],
+    );
+    expect(retried.rows[0]).toEqual(closed.rows[0]);
+    expect(email).toHaveBeenCalledTimes(1);
+  });
+
   it.each(['resolved', 'closed'])('терминальный тикет %s под row lock не получает visible message', async (status) => {
     const { service, email } = makeService();
     const ticketId = await newTicket(status);
