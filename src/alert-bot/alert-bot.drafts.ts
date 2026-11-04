@@ -120,7 +120,12 @@ export class AlertBotDrafts {
         answer = 'Неизвестное действие';
         return {};
       }
-      if (!await this.store.claimDraft(draft.id, claim)) {
+      const claimResult = await this.store.claimDraft(draft.id, claim);
+      if (claimResult === 'in_progress') {
+        answer = 'Черновик уже обрабатывается';
+        return {};
+      }
+      if (claimResult !== 'claimed') {
         answer = 'Черновик устарел';
         return {};
       }
@@ -146,8 +151,13 @@ export class AlertBotDrafts {
       }
 
       // Между созданием черновика и нажатием кнопки тикет могли закрыть.
+      // Но уже опубликованный draftId должен завершить восстановление как sent,
+      // даже если закрытие произошло между publish и finalize.
       const current = await this.support.adminGetTicket(draft.ticketId);
-      if (terminal(current.ticket.status)) {
+      const alreadyPublished = current.messages?.some(
+        (message) => message.metadata?.alertBotDraftId === draft.id,
+      );
+      if (terminal(current.ticket.status) && !alreadyPublished) {
         await this.finalize(draft.id, 'cancelled');
         claimed = false;
         answer = 'Тикет уже закрыт — ответ не отправлен';

@@ -1161,13 +1161,10 @@ ${healthSummary}
       if (!t.rows[0]) throw new NotFoundException('ticket not found');
 
       const draftId = typeof metadata?.alertBotDraftId === 'string' ? metadata.alertBotDraftId : null;
-      if (draftId && ['resolved', 'closed'].includes(t.rows[0].status)) {
-        throw new ConflictException('ticket is terminal');
-      }
       if (draftId) {
+        // Сначала идемпотентный retry: уже опубликованный ответ остаётся успехом
+        // даже если тикет успели закрыть после первой публикации.
         // Блокировка строки тикета сериализует retry и конкурентные callback.
-        // Поэтому проверки + insert образуют идемпотентную операцию даже без
-        // дополнительного индекса по JSONB.
         const existing = await client.query(
           `SELECT id FROM support_messages
            WHERE ticket_id = $1 AND metadata->>'alertBotDraftId' = $2 LIMIT 1`,
@@ -1177,6 +1174,9 @@ ${healthSummary}
           await client.query('COMMIT');
           return false;
         }
+      }
+      if (draftId && ['resolved', 'closed'].includes(t.rows[0].status)) {
+        throw new ConflictException('ticket is terminal');
       }
 
       await this.insertMessage(ticketId, 'owner', senderId, content, metadata, visibleToUser, client);

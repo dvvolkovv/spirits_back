@@ -37,6 +37,7 @@ export interface AlertBotTurn {
 
 export type AlertBotDraftOutcome = 'sent' | 'cancelled' | 'asked';
 export type AlertBotDraftClaim = 'sending' | 'asking' | 'cancelling';
+export type AlertBotDraftClaimResult = 'claimed' | 'in_progress' | 'unavailable';
 
 export interface AlertBotDraft {
   id: string;
@@ -48,6 +49,7 @@ export interface AlertBotDraft {
   promptMessageId: number | null;
   expiresAt: Date;
   outcome: AlertBotDraftOutcome | AlertBotDraftClaim | null;
+  claimedAt: Date | null;
   createdAt: Date;
   resolvedAt: Date | null;
 }
@@ -112,6 +114,7 @@ function mapDraft(row: any): AlertBotDraft {
     promptMessageId: row.prompt_message_id === null ? null : Number(row.prompt_message_id),
     expiresAt: row.expires_at,
     outcome: row.outcome,
+    claimedAt: row.claimed_at,
     createdAt: row.created_at,
     resolvedAt: row.resolved_at,
   };
@@ -363,15 +366,32 @@ export class AlertBotStore {
     return r.rowCount === 1;
   }
 
-  async claimDraft(id: string, claim: AlertBotDraftClaim): Promise<boolean> {
+  async claimDraft(id: string, claim: AlertBotDraftClaim): Promise<AlertBotDraftClaimResult> {
     const r = await this.pg.query(
       `UPDATE alert_bot_ticket_drafts
-       SET outcome = $2, resolved_at = NULL
-       WHERE id = $1 AND outcome IS NULL AND expires_at > now()
+       SET outcome = $2, claimed_at = now(), resolved_at = NULL
+       WHERE id = $1 AND expires_at > now()
+         AND (
+           outcome IS NULL
+           OR (
+             outcome IN ('sending', 'asking', 'cancelling')
+             AND (claimed_at IS NULL OR claimed_at < now() - interval '60 seconds')
+           )
+         )
        RETURNING id`,
       [id, claim],
     );
-    return r.rowCount === 1;
+    if (r.rowCount === 1) return 'claimed';
+
+    const active = await this.pg.query(
+      `SELECT id FROM alert_bot_ticket_drafts
+       WHERE id = $1 AND expires_at > now()
+         AND outcome IN ('sending', 'asking', 'cancelling')
+         AND claimed_at >= now() - interval '60 seconds'
+       LIMIT 1`,
+      [id],
+    );
+    return active.rows[0] ? 'in_progress' : 'unavailable';
   }
 
   async finalizeDraft(id: string, outcome: AlertBotDraftOutcome): Promise<boolean> {
@@ -382,7 +402,7 @@ export class AlertBotStore {
         : "(outcome IS NULL OR outcome IN ('sending', 'asking', 'cancelling'))";
     const r = await this.pg.query(
       `UPDATE alert_bot_ticket_drafts
-       SET outcome = $2, resolved_at = now()
+       SET outcome = $2, claimed_at = NULL, resolved_at = now()
        WHERE id = $1 AND ${expected}
        RETURNING id`,
       [id, outcome],
@@ -393,7 +413,7 @@ export class AlertBotStore {
   async releaseDraft(id: string): Promise<boolean> {
     const r = await this.pg.query(
       `UPDATE alert_bot_ticket_drafts
-       SET outcome = NULL, resolved_at = NULL
+       SET outcome = NULL, claimed_at = NULL, resolved_at = NULL
        WHERE id = $1 AND outcome IN ('sending', 'asking', 'cancelling')
        RETURNING id`,
       [id],
