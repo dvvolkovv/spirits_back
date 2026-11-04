@@ -1,3 +1,8 @@
+jest.mock('@napi-rs/canvas', () => ({
+  createCanvas: jest.fn(),
+  loadImage: jest.fn(),
+  GlobalFonts: { register: jest.fn() },
+}));
 jest.mock('../common/telegram-alert', () => ({
   sendTelegramAlert: jest.fn(async () => {}),
   telegramConfigured: jest.fn(() => true),

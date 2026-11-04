@@ -1,4 +1,9 @@
 import 'reflect-metadata';
+jest.mock('@napi-rs/canvas', () => ({
+  createCanvas: jest.fn(),
+  loadImage: jest.fn(),
+  GlobalFonts: { register: jest.fn() },
+}));
 import { GUARDS_METADATA } from '@nestjs/common/constants';
 import { AdminGuard } from '../common/guards/admin.guard';
 import { JwtGuard } from '../common/guards/jwt.guard';

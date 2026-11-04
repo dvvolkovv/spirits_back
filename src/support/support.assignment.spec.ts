@@ -1,3 +1,8 @@
+jest.mock('@napi-rs/canvas', () => ({
+  createCanvas: jest.fn(),
+  loadImage: jest.fn(),
+  GlobalFonts: { register: jest.fn() },
+}));
 import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
 import { SupportService } from './support.service';
 

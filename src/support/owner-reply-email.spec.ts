@@ -6,6 +6,11 @@
  * Здесь проверяем ровно три вещи: письмо уходит тому, у кого есть адрес; на
  * серию ответов подряд не сыплется серия писем; сбой SMTP не ломает сам ответ.
  */
+jest.mock('@napi-rs/canvas', () => ({
+  createCanvas: jest.fn(),
+  loadImage: jest.fn(),
+  GlobalFonts: { register: jest.fn() },
+}));
 import { SupportService } from './support.service';
 
 type Row = Record<string, any>;

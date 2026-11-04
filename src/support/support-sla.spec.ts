@@ -1,3 +1,8 @@
+jest.mock('@napi-rs/canvas', () => ({
+  createCanvas: jest.fn(),
+  loadImage: jest.fn(),
+  GlobalFonts: { register: jest.fn() },
+}));
 import { firstResponseDueAt, SLA_SOON_MS, slaFilterSql, SlaFilter } from './support-sla';
 import { SupportService } from './support.service';
 

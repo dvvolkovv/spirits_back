@@ -1,3 +1,8 @@
+jest.mock('@napi-rs/canvas', () => ({
+  createCanvas: jest.fn(),
+  loadImage: jest.fn(),
+  GlobalFonts: { register: jest.fn() },
+}));
 jest.mock('@anthropic-ai/claude-agent-sdk', () => ({
   query: jest.fn(),
   tool: (name: string, description: string, schema: any, handler: any) => ({ name, description, schema, handler }),
