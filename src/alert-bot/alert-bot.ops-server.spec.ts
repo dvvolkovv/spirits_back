@@ -302,7 +302,7 @@ describe('AlertBotOpsServer stateless MCP', () => {
   it('stop завершается при активном зависшем вызове и закрывает соединения', async () => {
     await restart({ toolTimeoutMs: 60_000, shutdownTimeoutMs: 20 });
     execute.mockImplementationOnce(() => new Promise(() => {}));
-    const outcome = post({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'alerts' } })
+    const outcome = post({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'alerts', arguments: {} } })
       .then((response) => ({ response }), (error) => ({ error }));
     await waitForToolCall();
 
@@ -324,7 +324,7 @@ describe('AlertBotOpsServer stateless MCP', () => {
     const outcome = fetch(server.url(), {
       method: 'POST',
       headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'alerts' } }),
+      body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'alerts', arguments: {} } }),
       signal: controller.signal,
     }).then((response) => ({ response }), (error) => ({ error }));
     await waitForToolCall();
