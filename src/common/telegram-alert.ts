@@ -62,8 +62,9 @@ export async function sendTelegramPayload(
       ).then((r) => {
         const messageId = Number(r.data?.result?.message_id);
         const text = String((rest as any).text || '');
-        if (alertSentSink && Number.isFinite(messageId) && text) {
-          void alertSentSink(String(chat_id), messageId, text).catch((e: any) => {
+        const sink = alertSentSink;
+        if (r.data?.ok === true && sink && Number.isSafeInteger(messageId) && messageId > 0 && text) {
+          void Promise.resolve().then(() => sink(String(chat_id), messageId, text)).catch((e: any) => {
             log.warn(`alert journal failed for chat …${String(chat_id).slice(-4)}: ${e?.code || 'error'}`);
           });
         }
