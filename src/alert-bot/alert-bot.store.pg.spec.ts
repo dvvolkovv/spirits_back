@@ -123,6 +123,7 @@ maybe('хранилище бота алертов против PostgreSQL', () =
         await writer.end();
       }
     }
+  });
   it('часовой лимит атомарен при двух одновременных входах', async () => {
     const adminUserId = 'u-concurrent-limit';
     for (let i = 0; i < 29; i++) {
