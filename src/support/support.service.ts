@@ -1381,6 +1381,15 @@ ${healthSummary}
     return out;
   }
 
+  async countOverdueTickets(): Promise<number> {
+    const r = await this.pg.query(
+      `SELECT count(*)::int AS n FROM support_tickets
+       WHERE status IN ('escalated','owner_handling')
+         AND first_owner_reply_at IS NULL
+         AND first_response_due_at < now()`);
+    return r.rows[0]?.n || 0;
+  }
+
   async setStatusFromTelegram(ticketId: string, telegramUserId: string, status: string) {
     const allowed = ['resolved', 'closed', 'owner_handling', 'ai_handling'];
     if (!allowed.includes(status)) throw new BadRequestException('invalid status');

@@ -38,5 +38,12 @@ import { ChatModule } from '../chat/chat.module';
   imports: [CommonModule, Neo4jModule, ChatModule],
   controllers: [MonitoringController],
   providers: [MonitoringService, LogsService, SyntheticService, FunnelService, EconomyService, QualityService, ProfileDepthService, SummaryService, NetworkingService, ChurnService, SupportService, ContentService, PersonasService, AttributionService, SmsHealthService, ClaudeHealthService, BackupHealthService, ModelsRegistryService, JobsMonitorService, QualityMonitorService, ReplicationHealthService, NeoSnapshotHealthService, MinioMirrorHealthService, GeoAvailabilityService, NanoBananaHealthService, TgHealthService, PaymentsHealthService, AlertDeliveryService, RelayQwenMonitorService, GlobalLlmReminderService],
+  exports: [
+    MonitoringService, LogsService, SyntheticService, FunnelService, EconomyService, SummaryService,
+    SmsHealthService, NanoBananaHealthService, TgHealthService, PaymentsHealthService,
+    QualityMonitorService, ClaudeHealthService, GeoAvailabilityService, BackupHealthService,
+    ModelsRegistryService, JobsMonitorService, ReplicationHealthService, NeoSnapshotHealthService,
+    MinioMirrorHealthService,
+  ],
 })
 export class MonitoringModule {}

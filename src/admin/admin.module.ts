@@ -16,5 +16,6 @@ import { ReferralModule } from '../referral/referral.module';
   // 404 при зелёных юнит-тестах. Сторож — admin-products.controller.spec.ts.
   controllers: [AdminController, AdminProductsController, AdminLlmProviderController, AdminGlobalLlmController],
   providers: [AdminService, AdminProductsService],
+  exports: [AdminService],
 })
 export class AdminModule {}
