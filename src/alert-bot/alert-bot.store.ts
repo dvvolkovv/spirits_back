@@ -407,8 +407,9 @@ export class AlertBotStore {
   ): Promise<boolean> {
     const validTransition = outcome === 'cancelled'
       ? expectedAction === null || ['sending', 'asking', 'cancelling'].includes(expectedAction)
-      : (outcome === 'sent' && expectedAction === 'sending')
-        || (outcome === 'asked' && expectedAction === 'asking');
+      : outcome === 'sent'
+        ? expectedAction === 'sending' || expectedAction === 'asking' || expectedAction === 'cancelling'
+        : outcome === 'asked' && expectedAction === 'asking';
     if (!validTransition || !Number.isSafeInteger(version) || version < 0) return false;
 
     const r = await this.pg.query(

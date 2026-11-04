@@ -138,6 +138,25 @@ export class AlertBotDrafts {
       }
       activeClaim = { action: claim, version: claimResult.version };
 
+      if (input.action === 'ask' || input.action === 'cancel') {
+        // Publish мог успешно закоммититься перед сбоем процесса до finalize.
+        // Reclaim по lease не делает такой видимый ответ отменённым или вопросом.
+        const published = await this.support.findTelegramDraftPublication(draft.ticketId, draft.id);
+        if (published) {
+          await this.finalize(draft.id, activeClaim.action, 'sent', activeClaim.version);
+          activeClaim = null;
+          answer = 'Ответ уже отправлен';
+          if (input.action === 'cancel') {
+            try {
+              await this.telegram.editMessageText(input.chatId, input.messageId, '✅ Отправлено');
+            } catch {
+              // Публикация и sent уже завершены; prompt редактируется best-effort.
+            }
+          }
+          return {};
+        }
+      }
+
       if (input.action === 'ask') {
         await this.finalize(draft.id, activeClaim.action, 'asked', activeClaim.version);
         activeClaim = null;

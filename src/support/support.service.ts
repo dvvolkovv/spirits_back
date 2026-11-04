@@ -1338,6 +1338,15 @@ ${healthSummary}
     return r.rows[0] || null;
   }
 
+  async findTelegramDraftPublication(ticketId: string, draftId: string): Promise<boolean> {
+    const r = await this.pg.query(
+      `SELECT id FROM support_messages
+       WHERE ticket_id = $1 AND metadata->>'alertBotDraftId' = $2 LIMIT 1`,
+      [ticketId, draftId],
+    );
+    return Boolean(r.rows[0]);
+  }
+
   /**
    * Post an owner reply into a ticket — same semantics as adminReply but sender_id comes from Telegram.
    */
