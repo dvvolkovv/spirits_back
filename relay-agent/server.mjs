@@ -1473,7 +1473,10 @@ return {
 
 // PM2 запускает файл напрямую; импорт из тестов не открывает порт и не добавляет
 // process-listener'ы. Production-поведение и дефолтные пути остаются прежними.
-const IS_MAIN = !!process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+// PM2 fork_mode подставляет в argv[1] свой ProcessContainerFork.js, а не этот
+// файл. Поэтому entrypoint — ещё и pm_id; иначе под PM2 runtime вообще не
+// создавался и процесс молча ждал IPC, не открывая порт (04.11.2026).
+const IS_MAIN = process.env.pm_id !== undefined || (!!process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url));
 if (IS_MAIN) {
   const runtime = createRelayApp();
   for (const sig of ["SIGTERM", "SIGINT"]) {

@@ -402,3 +402,9 @@ test("server signal и stale sweeper: оба suffix удаляются, liveSet 
   assert.equal(fs.existsSync(staleSettings), false);
   assert.equal(fs.existsSync(other), true);
 });
+
+test('entrypoint: PM2 fork_mode распознаётся по pm_id, а не только argv[1]', () => {
+  const source = fs.readFileSync(new URL('./server.mjs', import.meta.url), 'utf8');
+  assert.match(source, /process\.env\.pm_id !== undefined/);
+  assert.match(source, /ProcessContainerFork\.js/);
+});
