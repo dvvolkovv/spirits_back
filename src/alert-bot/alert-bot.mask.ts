@@ -6,7 +6,7 @@ export function maskText(input: string, ticketIds: Iterable<string> = []): strin
   const tickets = new Set(Array.from(ticketIds, (x) => x.toLowerCase()));
   let s = String(input);
   s = s.replace(/(?<![A-Za-z0-9_-])\d{8,10}:[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-])/g, '[скрыто]');
-  s = s.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '[скрыто]');
+  s = s.replace(/(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])/g, '[скрыто]');
   s = s.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [скрыто]');
   s = s.replace(/(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{12,}(?![A-Za-z0-9_-])/g, '[скрыто]');
   s = s.replace(/([?&](?:token|key|secret)=)[^&#\s]+/gi, '$1[скрыто]');
