@@ -1,3 +1,5 @@
+import * as http from 'http';
+import { Socket } from 'net';
 import { AlertBotAccess } from './alert-bot.access';
 import { toolText } from './alert-bot.mask';
 import { AlertBotOpsServer } from './alert-bot.ops-server';
@@ -17,8 +19,10 @@ describe('AlertBotOpsServer stateless MCP', () => {
   let execute: jest.Mock;
   let adminToken: string;
   let userToken: string;
+  let sockets: Set<Socket>;
 
   beforeEach(async () => {
+    sockets = new Set<Socket>();
     process.env.JWT_SECRET = 'ops-wire-spec-secret';
     isAdminUserId = jest.fn(async (userId: string) => userId === 'u-admin');
     access = { isAdminUserId } as unknown as AlertBotAccess;
@@ -26,14 +30,56 @@ describe('AlertBotOpsServer stateless MCP', () => {
     const tools: OpsToolHandler = { definitions: () => definitions, execute };
     server = new AlertBotOpsServer(access, tools);
     await server.start(0);
+    trackSockets();
     adminToken = signOpsToken('u-admin', '1');
     userToken = signOpsToken('u-user', '2');
   });
 
   afterEach(async () => {
-    await server.stop();
+    const stopPromise = server.stop();
+    if (!await settlesWithin(stopPromise, 200)) {
+      for (const socket of sockets) socket.destroy();
+      await stopPromise;
+    }
+    for (const socket of sockets) socket.destroy();
+    jest.restoreAllMocks();
     delete process.env.JWT_SECRET;
   });
+
+  function trackSockets(): void {
+    const rawServer = (server as any).server as http.Server;
+    rawServer.on('connection', (socket) => {
+      sockets.add(socket);
+      socket.on('close', () => sockets.delete(socket));
+    });
+  }
+
+  async function restart(options: { toolTimeoutMs?: number; shutdownTimeoutMs?: number }): Promise<void> {
+    await server.stop();
+    const ConfigurableServer = AlertBotOpsServer as any;
+    server = new ConfigurableServer(access, { definitions: () => definitions, execute }, options);
+    await server.start(0);
+    trackSockets();
+  }
+
+  async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+    let timer: NodeJS.Timeout;
+    try {
+      return await Promise.race([
+        promise.then(() => true),
+        new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+      ]);
+    } finally {
+      clearTimeout(timer!);
+    }
+  }
+
+  async function waitForToolCall(): Promise<void> {
+    for (let attempt = 0; attempt < 40 && execute.mock.calls.length === 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(execute).toHaveBeenCalled();
+  }
 
   async function post(payload: unknown, token: string | null = adminToken): Promise<Response> {
     const headers: Record<string, string> = { 'content-type': 'application/json' };
@@ -66,6 +112,19 @@ describe('AlertBotOpsServer stateless MCP', () => {
     const port = Number(new URL(server.origin()).port);
     await expect(second.start(port)).rejects.toMatchObject({ code: 'EADDRINUSE' });
     await second.stop();
+  });
+
+  it('безопасно логирует ошибку сервера после старта и не падает', () => {
+    const errorLog = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const rawServer = (server as any).server as http.Server;
+    const observed: Error[] = [];
+    rawServer.on('error', (error) => observed.push(error));
+    const error = Object.assign(new Error('RAW-SOCKET-SECRET'), { code: 'ECONNRESET' });
+
+    expect(() => rawServer.emit('error', error)).not.toThrow();
+    expect(observed).toEqual([error]);
+    expect(errorLog).toHaveBeenCalledWith('[alert-bot-ops] server error ECONNRESET');
+    expect(JSON.stringify(errorLog.mock.calls)).not.toContain('RAW-SOCKET-SECRET');
   });
 
   it('требует валидный ops-токен и права администратора на каждый запрос', async () => {
@@ -106,6 +165,18 @@ describe('AlertBotOpsServer stateless MCP', () => {
     const notification = await post({ jsonrpc: '2.0', method: 'notifications/initialized' });
     expect(notification.status).toBe(202);
     expect(await notification.text()).toBe('');
+  });
+
+  it('поддерживает две версии протокола и выбирает 2025-06-18 по умолчанию', async () => {
+    const cases: Array<[string | undefined, string]> = [
+      ['2025-03-26', '2025-03-26'],
+      ['2099-01-01', '2025-06-18'],
+      [undefined, '2025-06-18'],
+    ];
+    for (const [requested, expected] of cases) {
+      const { body } = await rpc('initialize', requested === undefined ? undefined : { protocolVersion: requested });
+      expect(body.result.protocolVersion).toBe(expected);
+    }
   });
 
   it('возвращает пять инструментов с inputSchema', async () => {
@@ -186,11 +257,87 @@ describe('AlertBotOpsServer stateless MCP', () => {
     expect(await missingId.json()).toMatchObject({ id: null, error: { code: -32600 } });
   });
 
+  it('подставляет пустой объект при необязательных arguments', async () => {
+    const { body } = await rpc('tools/call', { name: 'alerts' });
+    expect(body.result?.isError).toBe(false);
+    expect(execute).toHaveBeenCalledWith('alerts', {}, { adminUserId: 'u-admin', chatId: '1' });
+  });
+
   it('проверяет параметры tools/call', async () => {
-    for (const params of [{ arguments: {} }, { name: 'alerts' }, { name: 'alerts', arguments: null }, { name: 'alerts', arguments: [] }]) {
+    for (const params of [{ arguments: {} }, { name: 'alerts', arguments: null }, { name: 'alerts', arguments: [] }]) {
       const { body } = await rpc('tools/call', params);
       expect(body.error.code).toBe(-32602);
     }
     expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('отклоняет неверную версию JSON-RPC и не скалярный id', async () => {
+    const wrongVersion = await post({ jsonrpc: '1.0', id: 1, method: 'tools/list' });
+    expect(wrongVersion.status).toBe(400);
+    expect(await wrongVersion.json()).toMatchObject({ id: null, error: { code: -32600 } });
+
+    for (const id of [null, { nested: 1 }, [1], true]) {
+      const response = await post({ jsonrpc: '2.0', id, method: 'tools/list' });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ id: null, error: { code: -32600 } });
+    }
+  });
+
+  it('ограничивает зависший execute дедлайном и возвращает tool_failed', async () => {
+    await restart({ toolTimeoutMs: 20, shutdownTimeoutMs: 20 });
+    execute.mockImplementationOnce(() => new Promise(() => {}));
+    const outcome = post({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'alerts', arguments: {} } })
+      .then(async (response) => ({ response, body: await response.json() }), (error) => ({ error }));
+    const completed = await settlesWithin(outcome, 150);
+    if (!completed) {
+      for (const socket of sockets) socket.destroy();
+      await outcome;
+    }
+    expect(completed).toBe(true);
+    const { body } = await outcome as any;
+    expect(body.result.isError).toBe(true);
+    expect(JSON.parse(body.result.content[0].text)).toEqual({ error: 'tool_failed' });
+  });
+
+  it('stop завершается при активном зависшем вызове и закрывает соединения', async () => {
+    await restart({ toolTimeoutMs: 60_000, shutdownTimeoutMs: 20 });
+    execute.mockImplementationOnce(() => new Promise(() => {}));
+    const outcome = post({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'alerts' } })
+      .then((response) => ({ response }), (error) => ({ error }));
+    await waitForToolCall();
+
+    const stopPromise = server.stop();
+    const stopped = await settlesWithin(stopPromise, 150);
+    if (!stopped) {
+      for (const socket of sockets) socket.destroy();
+      await stopPromise;
+    }
+    await outcome;
+    expect(stopped).toBe(true);
+    expect(sockets.size).toBe(0);
+  });
+
+  it('обрыв клиента при зависшем execute не оставляет открытых соединений', async () => {
+    await restart({ toolTimeoutMs: 60_000, shutdownTimeoutMs: 20 });
+    execute.mockImplementationOnce(() => new Promise(() => {}));
+    const controller = new AbortController();
+    const outcome = fetch(server.url(), {
+      method: 'POST',
+      headers: { authorization: `Bearer ${adminToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'alerts' } }),
+      signal: controller.signal,
+    }).then((response) => ({ response }), (error) => ({ error }));
+    await waitForToolCall();
+    controller.abort();
+    await outcome;
+
+    const stopPromise = server.stop();
+    const stopped = await settlesWithin(stopPromise, 150);
+    if (!stopped) {
+      for (const socket of sockets) socket.destroy();
+      await stopPromise;
+    }
+    expect(stopped).toBe(true);
+    expect(sockets.size).toBe(0);
   });
 });
