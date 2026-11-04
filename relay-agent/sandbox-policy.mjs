@@ -85,9 +85,6 @@ export function buildSandboxSettings(fsKey, {
     permissions: {
       deny: [
         ...deny.map((d) => `Read(${d}/**)`),
-        ...deny.map((d) => `Glob(${d}/**)`),
-        ...deny.map((d) => `Grep(${d}/**)`),
-        ...deny.map((d) => `Write(${d}/**)`),
         ...deny.map((d) => `Edit(${d}/**)`),
       ],
     },
