@@ -33,8 +33,8 @@ function makeService() {
       events.push({
         ticket_id: params?.[0],
         actor_id: params?.[1],
-        action: params?.[2],
-        payload: params?.[3] ? JSON.parse(params[3]) : null,
+        action: sql.includes("'status_change'") ? 'status_change' : 'reply',
+        payload: params?.[2] ? JSON.parse(params[2]) : null,
       });
     }
     return { rows: [] };
