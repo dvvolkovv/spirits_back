@@ -49,4 +49,46 @@ describe('маска бота алертов', () => {
     expect(Buffer.byteLength(out)).toBeLessThanOrEqual(8192);
     expect(out).toContain('[обрезано]');
   });
+
+  it('маскирует ключи и не теряет записи при коллизии масок', () => {
+    expect(maskForModel({ '+79012345678': 'первый', '+79912345678': 'второй' })).toEqual({
+      '+7 *** *** 78': 'первый',
+      '+7 *** *** 78#2': 'второй',
+    });
+    expect(toolText({ '+79012345678': 'ok' })).toBe('{"+7 *** *** 78":"ok"}');
+  });
+
+  it('не даёт собственному или унаследованному toJSON обойти маску', () => {
+    const own = {
+      note: 'ok',
+      toJSON: () => '+79012345678',
+      callback: () => 'не показывать',
+    };
+    expect(toolText(own)).toBe('{"note":"ok"}');
+
+    const inherited = Object.create({ toJSON: () => '+79012345678' }) as { note: string };
+    inherited.note = 'ok';
+    expect(toolText(inherited)).toBe('{"note":"ok"}');
+  });
+
+  it('маскирует финальный JSON независимо от сериализации', () => {
+    const stringify = jest.spyOn(JSON, 'stringify').mockReturnValue('"+79012345678"');
+    try {
+      expect(toolText({})).toBe('"+7 *** *** 78"');
+    } finally {
+      stringify.mockRestore();
+    }
+  });
+
+  it('маскирует UUID без ограничения версии и варианта', () => {
+    const ticket = '018f2c3a-9d4e-7abc-8def-abcdef123456';
+    expect(maskText(ticket)).toBe('[id]');
+    expect(maskText(ticket, [ticket])).toBe('#018f2c3a');
+    expect(maskText('00000000-0000-0000-0000-000000000000')).toBe('[id]');
+  });
+
+  it('маскирует секреты, оканчивающиеся дефисом', () => {
+    expect(maskText(`123456789:${'A'.repeat(29)}-`)).toBe('[скрыто]');
+    expect(maskText(`sk-${'A'.repeat(11)}-`)).toBe('[скрыто]');
+  });
 });
