@@ -1,3 +1,9 @@
+jest.mock('@napi-rs/canvas', () => ({
+  createCanvas: jest.fn(),
+  loadImage: jest.fn(),
+  GlobalFonts: { register: jest.fn() },
+}));
+
 import { SupportService } from './support.service';
 
 describe('просроченные тикеты поддержки', () => {

@@ -136,6 +136,7 @@ const healthy: Record<HealthSection, any> = {
   },
   synthetic: {
     generatedAt,
+    stale: false,
     scenarios: [{ scenario: 'site_reachable', latestSuccess: true, latestTs: generatedAt, latestDurationMs: 100, latestMessage: null, runs24h: 4, successes24h: 4, successRate24hPct: 100 }],
   },
 };
@@ -157,6 +158,10 @@ const incidentCases: Array<[HealthSection, any]> = [
   ['neo4j-dr', { ...healthy['neo4j-dr'], healthy: false, files: [{ ...healthy['neo4j-dr'].files[0], inSync: false }] }],
   ['minio-dr', { ...healthy['minio-dr'], healthy: false, errors: ['mirror failed'] }],
   ['synthetic', { ...healthy.synthetic, scenarios: [{ ...healthy.synthetic.scenarios[0], latestSuccess: false, latestMessage: 'HTTP 500', successes24h: 3, successRate24hPct: 75 }] }],
+  ['synthetic', { ...healthy.synthetic, stale: true, scenarios: [{ ...healthy.synthetic.scenarios[0], latestTs: '2026-11-04T10:00:00.000Z' }] }],
+  ['tg-bot', { ...healthy['tg-bot'], configured: false, webhook: { ...healthy['tg-bot'].webhook, healthy: null }, unanswered: { ...healthy['tg-bot'].unanswered, stuckChats: 1 } }],
+  ['payments', { ...healthy.payments, shop: { ...healthy.payments.shop, configured: false, healthy: null }, attempts: { ...healthy.payments.attempts, failStreak: 3 } }],
+  ['payments', { ...healthy.payments, shop: { ...healthy.payments.shop, configured: false, healthy: null }, funnel: { ...healthy.payments.funnel, healthy: false } }],
 ];
 
 const optionalUnconfiguredCases: Array<[HealthSection, any]> = [
@@ -172,6 +177,7 @@ const optionalUnconfiguredCases: Array<[HealthSection, any]> = [
 const unknownCases: Array<[HealthSection, any]> = [
   ['nanobanana', { ...healthy.nanobanana, healthy: null, checkedAt: null }],
   ['claude', { ...healthy.claude, usage: { ...healthy.claude.usage, llmStatus: null, llmCheckedAt: null } }],
+  ['claude', { ...healthy.claude, usage: { ...healthy.claude.usage, apiKeyValid: null, apiKeyError: 'probe failed' } }],
   ['geo', null],
   ['backups', { ...healthy.backups, latest: null, error: 'inspection failed' }],
   ['synthetic', { ...healthy.synthetic, scenarios: [{ ...healthy.synthetic.scenarios[0], latestSuccess: null, latestTs: null }] }],
@@ -249,6 +255,27 @@ describe('разделы технического здоровья для бот
   it.each(optionalUnconfiguredCases)('%s: необязательный не настроенный источник не является инцидентом', async (section, value) => {
     mockSections({ [section]: value });
     await expect(service.badSections()).resolves.not.toContain(section);
+  });
+
+  it('payments: funnel.healthy=null означает недостаточно попыток, а не инцидент', async () => {
+    mockSections({ payments: { ...healthy.payments, funnel: { ...healthy.payments.funnel, healthy: null } } });
+    await expect(service.badSections()).resolves.not.toContain('payments');
+  });
+
+  it('claude: без API-ключа apiKeyValid=null допустим в OAuth-режиме', async () => {
+    mockSections({
+      claude: {
+        ...healthy.claude,
+        configured: { ...healthy.claude.configured, apiKey: false },
+        usage: { ...healthy.claude.usage, apiKeyValid: null, apiKeyError: null },
+      },
+    });
+    await expect(service.badSections()).resolves.not.toContain('claude');
+  });
+
+  it.each([['models', 10], ['jobs', 11]] as Array<[HealthSection, number]>)('%s: ошибка БД производителя становится сбоем раздела', async (section, sourceIndex) => {
+    sources[sourceIndex].getOverview.mockRejectedValue(new Error('db down'));
+    await expect(service.badSections()).resolves.toContain(section);
   });
 
   it.each(unknownCases)('%s: неизвестное состояние не превращается в отсутствие сбоев', async (section, value) => {

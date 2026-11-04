@@ -94,6 +94,24 @@ describe('SyntheticService: протухание результатов', () => 
     expect(alertTexts().some((t) => t.includes('ослеп'))).toBe(true);
   });
 
+  it('getOverview явно помечает старый успешный прогон раннера как stale', async () => {
+    const svc = makeService([
+      row('chat_streaming', 180),
+      row('tg_webhook', 1),
+    ]);
+
+    const overview = await svc.getOverview();
+
+    expect(overview.scenarios[0].latestSuccess).toBe(true);
+    expect(overview.stale).toBe(true);
+  });
+
+  it('getOverview не помечает свежий успешный прогон раннера как stale', async () => {
+    const svc = makeService([row('chat_streaming', 5)]);
+
+    await expect(svc.getOverview()).resolves.toMatchObject({ stale: false });
+  });
+
   it('новый сценарий, который пишет сам бэкенд, не маскирует смерть раннера', async () => {
     // Положительный список: про будущие in-process сценарии помнить не нужно.
     const svc = makeService([
