@@ -1,12 +1,12 @@
 // Регрессия 04.11.2026: при отсутствии дочерних процессов `ps --ppid`
 // возвращает 1. Под `set -e` это останавливало deploy-relay до замены файлов,
 // хотя пустой список детей — нормальное условие drain.
-import test from 'node:test';
-import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import { execFileSync } from 'node:child_process';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const { execFileSync } = require('node:child_process');
 
-const source = fs.readFileSync(new URL('../../scripts/deploy-relay.sh', import.meta.url), 'utf8');
+const source = fs.readFileSync(require.resolve('../../scripts/deploy-relay.sh'), 'utf8');
 
 test('drain: пустой список дочерних процессов не является ошибкой', () => {
   assert.ok(source.includes('CHILDREN=$(ps --ppid "$PID" -o pid= || true)'));
