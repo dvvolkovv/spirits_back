@@ -43,6 +43,7 @@ describe('черновики ответов в тикет', () => {
   const support = {
     adminGetTicket: jest.fn(),
     postOwnerReplyFromTelegram: jest.fn(),
+    findTelegramDraftPublication: jest.fn(),
   };
   const telegram = {
     sendMessage: jest.fn(),
@@ -81,6 +82,7 @@ describe('черновики ответов в тикет', () => {
     store.attachDraftPrompt.mockResolvedValue(undefined);
     support.adminGetTicket.mockResolvedValue({ ticket: { id: TICKET, status: 'owner_handling' } });
     support.postOwnerReplyFromTelegram.mockResolvedValue(undefined);
+    support.findTelegramDraftPublication.mockResolvedValue(false);
     telegram.sendMessage.mockResolvedValue({ message_id: 900 });
     telegram.editMessageText.mockResolvedValue(undefined);
     telegram.answerCallbackQuery.mockResolvedValue(undefined);
@@ -307,6 +309,38 @@ describe('черновики ответов в тикет', () => {
     expect(support.adminGetTicket).not.toHaveBeenCalled();
     expect(support.postOwnerReplyFromTelegram).not.toHaveBeenCalled();
     expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
+  });
+
+  it('восстановленный cancel после публикации финализирует sent и сообщает, что ответ уже отправлен', async () => {
+    support.findTelegramDraftPublication.mockResolvedValue(true);
+
+    await expect(drafts.handleCallback(callback({ action: 'cancel' }))).resolves.toEqual({});
+
+    expect(support.findTelegramDraftPublication).toHaveBeenCalledWith(TICKET, DRAFT);
+    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'cancelling', 'sent', 1);
+    expect(support.findTelegramDraftPublication.mock.invocationCallOrder[0]).toBeLessThan(
+      store.finalizeDraft.mock.invocationCallOrder[0],
+    );
+    expect(store.finalizeDraft).not.toHaveBeenCalledWith(DRAFT, 'cancelling', 'cancelled', 1);
+    expect(telegram.editMessageText).toHaveBeenCalledWith(CHAT, 900, '✅ Отправлено');
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('callback-1', 'Ответ уже отправлен');
+    expect(support.postOwnerReplyFromTelegram).not.toHaveBeenCalled();
+  });
+
+  it('восстановленный ask после публикации финализирует sent и не возвращает вопрос', async () => {
+    support.findTelegramDraftPublication.mockResolvedValue(true);
+
+    await expect(drafts.handleCallback(callback({ action: 'ask' }))).resolves.toEqual({});
+
+    expect(support.findTelegramDraftPublication).toHaveBeenCalledWith(TICKET, DRAFT);
+    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'asking', 'sent', 1);
+    expect(support.findTelegramDraftPublication.mock.invocationCallOrder[0]).toBeLessThan(
+      store.finalizeDraft.mock.invocationCallOrder[0],
+    );
+    expect(store.finalizeDraft).not.toHaveBeenCalledWith(DRAFT, 'asking', 'asked', 1);
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('callback-1', 'Ответ уже отправлен');
+    expect(telegram.editMessageText).not.toHaveBeenCalled();
+    expect(support.postOwnerReplyFromTelegram).not.toHaveBeenCalled();
   });
 
   it('просроченный черновик нельзя отправить', async () => {

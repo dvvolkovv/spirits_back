@@ -83,7 +83,11 @@ maybe('callback черновика с lease против PostgreSQL', () => {
     });
   }
 
-  function callback(draftId: string, action: 'send' | 'cancel' = 'send', callbackId = 'callback-recovery') {
+  function callback(
+    draftId: string,
+    action: 'send' | 'ask' | 'cancel' = 'send',
+    callbackId = 'callback-recovery',
+  ) {
     return {
       callbackId,
       chatId: CHAT,
@@ -152,6 +156,46 @@ maybe('callback черновика с lease против PostgreSQL', () => {
     expect(telegram.editMessageText).toHaveBeenCalledWith(CHAT, 900, '✅ Отправлено');
     expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('callback-recovery', 'Отправлено');
   });
+
+  it.each(['cancel', 'ask'] as const)(
+    'publish → crash → lease expiry → %s сохраняет уже видимый ответ как sent',
+    async (action) => {
+      const ticketId = await newTicket();
+      const draftId = await newDraft(ticketId);
+      const firstClaim = await store.claimDraft(draftId, 'sending');
+      if (firstClaim.status !== 'claimed') throw new Error('first claim failed');
+      await support.postOwnerReplyFromTelegram(
+        ticketId, '111', 'u-admin', 'ответ после восстановления', true, 'u-admin', draftId, firstClaim.version,
+      );
+      // Сбой после COMMIT публикации, но до finalize: transitional claim остаётся
+      // в БД до истечения lease, затем его забирает другое действие админа.
+      await pool.query(
+        "UPDATE alert_bot_ticket_drafts SET claimed_at = now() - interval '61 seconds' WHERE id = $1",
+        [draftId],
+      );
+
+      const result = await drafts.handleCallback(callback(draftId, action, `recovered-${action}`));
+
+      expect(result).toEqual({});
+      expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'sent', claimVersion: 2 });
+      const effects = await pool.query(
+        `SELECT
+           (SELECT count(*)::int FROM support_messages
+             WHERE ticket_id = $1 AND metadata->>'alertBotDraftId' = $2) AS messages,
+           (SELECT count(*)::int FROM support_events
+             WHERE ticket_id = $1 AND action = 'reply') AS events`,
+        [ticketId, draftId],
+      );
+      expect(effects.rows[0]).toEqual({ messages: 1, events: 1 });
+      expect(email).toHaveBeenCalledTimes(1);
+      expect(telegram.answerCallbackQuery).toHaveBeenCalledWith(`recovered-${action}`, 'Ответ уже отправлен');
+      if (action === 'cancel') {
+        expect(telegram.editMessageText).toHaveBeenCalledWith(CHAT, 900, '✅ Отправлено');
+      } else {
+        expect(telegram.editMessageText).not.toHaveBeenCalled();
+      }
+    },
+  );
 
   it('claim_version ограждает старый send от нового cancel после lease expiry', async () => {
     const ticketId = await newTicket();
