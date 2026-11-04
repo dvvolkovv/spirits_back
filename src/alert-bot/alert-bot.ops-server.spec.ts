@@ -26,7 +26,7 @@ describe('AlertBotOpsServer stateless MCP', () => {
     process.env.JWT_SECRET = 'ops-wire-spec-secret';
     isAdminUserId = jest.fn(async (userId: string) => userId === 'u-admin');
     access = { isAdminUserId } as unknown as AlertBotAccess;
-    execute = jest.fn(async (_name: string, args: Record<string, unknown>) => toolText({ ok: true, args }));
+    execute = jest.fn(async (_name: string, args: Record<string, unknown>, _ctx: unknown, _signal?: AbortSignal) => toolText({ ok: true, args }));
     const tools: OpsToolHandler = { definitions: () => definitions, execute };
     server = new AlertBotOpsServer(access, tools);
     await server.start(0);
@@ -79,6 +79,29 @@ describe('AlertBotOpsServer stateless MCP', () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     expect(execute).toHaveBeenCalled();
+  }
+
+  function mockAbortableExecute(): { getSignal: () => AbortSignal | undefined; abortListener: jest.Mock } {
+    let signal: AbortSignal | undefined;
+    const abortListener = jest.fn();
+    execute.mockImplementationOnce((_name: string, _args: Record<string, unknown>, _ctx: unknown, received?: AbortSignal) => {
+      signal = received;
+      return new Promise<string>((_resolve, reject) => {
+        if (!signal) return;
+        const onAbort = () => { abortListener(); reject(new Error('aborted')); };
+        if (signal.aborted) onAbort();
+        else signal.addEventListener('abort', onAbort, { once: true });
+      });
+    });
+    return { getSignal: () => signal, abortListener };
+  }
+
+  async function expectActualAbort(getSignal: () => AbortSignal | undefined, abortListener: jest.Mock): Promise<void> {
+    for (let attempt = 0; attempt < 40 && !getSignal()?.aborted; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(getSignal()?.aborted).toBe(true);
+    expect(abortListener).toHaveBeenCalledTimes(1);
   }
 
   async function waitForSocketsClosed(): Promise<void> {
@@ -203,7 +226,7 @@ describe('AlertBotOpsServer stateless MCP', () => {
     expect(body.result.isError).toBe(false);
     expect(body.result.content[0].type).toBe('text');
     expect(JSON.parse(body.result.content[0].text)).toEqual({ ok: true, args: { hours: 24 } });
-    expect(execute).toHaveBeenCalledWith('alerts', { hours: 24 }, { adminUserId: 'u-admin', chatId: '1' });
+    expect(execute).toHaveBeenCalledWith('alerts', { hours: 24 }, { adminUserId: 'u-admin', chatId: '1' }, expect.any(AbortSignal));
     expect(server.consumeToolNames(adminToken)).toEqual(['alerts']);
     expect(server.consumeToolNames(adminToken)).toEqual([]);
   });
@@ -268,7 +291,7 @@ describe('AlertBotOpsServer stateless MCP', () => {
   it('подставляет пустой объект при необязательных arguments', async () => {
     const { body } = await rpc('tools/call', { name: 'alerts' });
     expect(body.result?.isError).toBe(false);
-    expect(execute).toHaveBeenCalledWith('alerts', {}, { adminUserId: 'u-admin', chatId: '1' });
+    expect(execute).toHaveBeenCalledWith('alerts', {}, { adminUserId: 'u-admin', chatId: '1' }, expect.any(AbortSignal));
   });
 
   it('проверяет параметры tools/call', async () => {
@@ -293,7 +316,7 @@ describe('AlertBotOpsServer stateless MCP', () => {
 
   it('ограничивает зависший execute дедлайном и возвращает tool_failed', async () => {
     await restart({ toolTimeoutMs: 20, shutdownTimeoutMs: 20 });
-    execute.mockImplementationOnce(() => new Promise(() => {}));
+    const { getSignal, abortListener } = mockAbortableExecute();
     const outcome = post({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'alerts', arguments: {} } })
       .then(async (response) => ({ response, body: await response.json() }), (error) => ({ error }));
     const completed = await settlesWithin(outcome, 150);
@@ -305,11 +328,12 @@ describe('AlertBotOpsServer stateless MCP', () => {
     const { body } = await outcome as any;
     expect(body.result.isError).toBe(true);
     expect(JSON.parse(body.result.content[0].text)).toEqual({ error: 'tool_failed' });
+    await expectActualAbort(getSignal, abortListener);
   });
 
   it('stop завершается при активном зависшем вызове и закрывает соединения', async () => {
     await restart({ toolTimeoutMs: 60_000, shutdownTimeoutMs: 20 });
-    execute.mockImplementationOnce(() => new Promise(() => {}));
+    const { getSignal, abortListener } = mockAbortableExecute();
     const outcome = post({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'alerts', arguments: {} } })
       .then((response) => ({ response }), (error) => ({ error }));
     await waitForToolCall();
@@ -323,11 +347,12 @@ describe('AlertBotOpsServer stateless MCP', () => {
     await outcome;
     await waitForSocketsClosed();
     expect(stopped).toBe(true);
+    await expectActualAbort(getSignal, abortListener);
   });
 
   it('обрыв клиента при зависшем execute не оставляет открытых соединений', async () => {
     await restart({ toolTimeoutMs: 60_000, shutdownTimeoutMs: 20 });
-    execute.mockImplementationOnce(() => new Promise(() => {}));
+    const { getSignal, abortListener } = mockAbortableExecute();
     const controller = new AbortController();
     const outcome = fetch(server.url(), {
       method: 'POST',
@@ -338,6 +363,7 @@ describe('AlertBotOpsServer stateless MCP', () => {
     await waitForToolCall();
     controller.abort();
     await outcome;
+    await expectActualAbort(getSignal, abortListener);
 
     const stopPromise = server.stop();
     const stopped = await settlesWithin(stopPromise, 150);
@@ -347,5 +373,28 @@ describe('AlertBotOpsServer stateless MCP', () => {
     }
     await waitForSocketsClosed();
     expect(stopped).toBe(true);
+  });
+
+  it('stop по backstop не ждёт Promise, игнорирующий AbortSignal', async () => {
+    await restart({ toolTimeoutMs: 60_000, shutdownTimeoutMs: 20 });
+    let signal: AbortSignal | undefined;
+    execute.mockImplementationOnce((_name: string, _args: Record<string, unknown>, _ctx: unknown, received?: AbortSignal) => {
+      signal = received;
+      return new Promise<string>(() => {});
+    });
+    const outcome = post({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'alerts', arguments: {} } })
+      .then((response) => ({ response }), (error) => ({ error }));
+    await waitForToolCall();
+
+    const stopPromise = server.stop();
+    const stopped = await settlesWithin(stopPromise, 150);
+    if (!stopped) {
+      for (const socket of sockets) socket.destroy();
+      await stopPromise;
+    }
+    await outcome;
+    await waitForSocketsClosed();
+    expect(stopped).toBe(true);
+    expect(signal?.aborted).toBe(true);
   });
 });
