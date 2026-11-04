@@ -1118,7 +1118,7 @@ Commit: `feat(alert-bot): health-карта и /status с точным SLA`; п�
 **Files:**
 - Modify: `src/support/support.service.ts`, `src/alert-bot/alert-bot.store.ts`
 - Create: `src/alert-bot/alert-bot.commands.ts`, `src/alert-bot/alert-bot.drafts.ts`
-- Test: `src/alert-bot/alert-bot.commands.spec.ts`, `src/alert-bot/alert-bot.drafts.spec.ts`, `src/alert-bot/alert-bot.store.pg.spec.ts`, `src/support/support.telegram-author.spec.ts`, `src/support/support.telegram-idempotency.pg.spec.ts`
+- Test: `src/alert-bot/alert-bot.commands.spec.ts`, `src/alert-bot/alert-bot.drafts.spec.ts`, `src/alert-bot/alert-bot.drafts.pg.spec.ts`, `src/alert-bot/alert-bot.store.pg.spec.ts`, `src/support/support.telegram-author.spec.ts`, `src/support/support.telegram-idempotency.pg.spec.ts`
 
 - [ ] **Step 1: написать падающие тесты**
 
@@ -1153,7 +1153,9 @@ it('неизвестный тикет не закрывается', async () => 
 - `handleCallback` чужого автора или чужого чата отвечает предупреждением и не вызывает `claimDraft`;
 - `send` выполняет `claimDraft(id,'sending')` → идемпотентный `postOwnerReplyFromTelegram(..., true, 'u-admin', draftId)` → `finalizeDraft(id,'sent')`, затем best-effort edit «✅ Отправлено»;
 - неожиданный сбой publish/finalize освобождает claim через `releaseDraft`, повторный `send` безопасен; повтор после неудачного claim отвечает «Черновик устарел»;
-- терминальный тикет (и при предварительном чтении, и при гонке под row lock) финализируется как `cancelled`, никогда `sent`;
+- активный непросроченный claim отвечает «уже обрабатывается» без повторной публикации; после сбоя `releaseDraft` просроченный 60-секундный lease можно reclaim и завершить `sent`;
+- терминальный тикет (и при предварительном чтении, и при гонке под row lock) для новой публикации финализируется как `cancelled`, никогда `sent`; retry уже опубликованного `draftId` после закрытия завершается `sent`;
+- `alert-bot.drafts.pg.spec.ts` на реальном PostgreSQL восстанавливает callback из заброшенного `outcome='sending'` со старым `claimed_at`; `alert-bot.store.pg.spec.ts` проверяет активный, просроченный и legacy lease;
 - `cancel` проходит через `cancelling` → `cancelled`; `ask` — через `asking` → `asked` и возвращает `{question:'текст',ticketId:TICKET}`, не вызывая модель;
 - просроченный черновик нельзя отправить; сбой `answerCallbackQuery` перехватывается и не меняет результат, попытка ack ровно одна;
 - preview вместе с заголовком ограничен 4096; сбой показа prompt отменяет черновик; сбой `attachDraftPrompt` после видимого prompt не пробрасывается и не приводит к дубликату.
@@ -1179,7 +1181,7 @@ const actorId = linkeonUserId || `tg:${telegramUserId}`;
 const metadata = { via: 'telegram', author: displayName, telegramUserId };
 ```
 
-`actorId` использовать в `insertMessage` и обоих `support_events`; `via` не убирать. При переданном `draftId` добавлять `alertBotDraftId` в metadata. В той же транзакции `SELECT ... FOR UPDATE` отклонять resolved/closed и после блокировки искать уже опубликованное сообщение с этим `alertBotDraftId`: повтор возвращает успех без message/event/email и без повторного изменения SLA. Последовательные и конкурентные retry проверяются реальным PostgreSQL в изолированной схеме. Без `draftId` прежняя логика статуса, письма и SLA не меняется.
+`actorId` использовать в `insertMessage` и обоих `support_events`; `via` не убирать. При переданном `draftId` добавлять `alertBotDraftId` в metadata. В той же транзакции после `SELECT ... FOR UPDATE` сначала искать уже опубликованное сообщение с этим `alertBotDraftId`: повтор возвращает успех без message/event/email и без повторного изменения SLA даже после закрытия тикета. Только для новой публикации resolved/closed отклоняются. Последовательные, конкурентные и publish → close → retry проверяются реальным PostgreSQL в изолированной схеме. Без `draftId` прежняя логика статуса, письма и SLA не меняется.
 
 - [ ] **Step 3: реализовать команды**
 
@@ -1213,13 +1215,16 @@ handleCallback(input: {
 }): Promise<{question?:string;ticketId?:string}>
 // getDraft → существование, chat/author identity; чужой автор/чат — answerCallbackQuery и return {};
 // claimDraft атомарно до побочных действий: sending/asking/cancelling;
-// send → adminGetTicket: resolved/closed → finalize cancelled без отправки;
+// claimed → продолжить; in_progress → «уже обрабатывается»; unavailable → «Черновик устарел»;
+// send → adminGetTicket: resolved/closed без уже опубликованного draftId → finalize cancelled;
 // publish с draftId идемпотентно под ticket FOR UPDATE, затем finalize sent;
 // неожиданная ошибка publish/finalize → releaseDraft для retry; edit best-effort;
 // ask → finalize asked и return {question:draft.text,ticketId:draft.ticket_id};
 // cancel → finalize cancelled и best-effort edit «Отменено»;
 // всегда ровно одна safely-caught попытка answerCallbackQuery в finally.
 ```
+
+Миграция `001_alert_bot.sql` идемпотентно добавляет `claimed_at timestamptz`. `claimDraft` атомарно берёт свободный непросроченный черновик либо reclaim transitional claim с `claimed_at` старше 60 секунд; `NULL` в transitional claim поддерживает строки до миграции. Успешный claim обновляет `claimed_at=now()`. Активный lease возвращает `in_progress`, финальный/просроченный черновик — `unavailable`. `finalizeDraft` разрешает `sent` только из `sending`, `asked` только из `asking`, а `cancelled` — из свободного или transitional состояния; `releaseDraft` очищает только transitional claim. Финальные состояния ни один из методов не перезаписывает. Поэтому восстановление после смерти процесса или сбоя `releaseDraft` не зависит от успешного освобождения.
 
 Commit: `feat(alert-bot): команды и подтверждаемые черновики тикетов`; прогнать четыре spec-файла и tsc. Expected: PASS, `TSC_OK`.
 
