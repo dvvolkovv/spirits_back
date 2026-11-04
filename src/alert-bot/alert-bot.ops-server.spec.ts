@@ -81,6 +81,13 @@ describe('AlertBotOpsServer stateless MCP', () => {
     expect(execute).toHaveBeenCalled();
   }
 
+  async function waitForSocketsClosed(): Promise<void> {
+    for (let attempt = 0; attempt < 40 && sockets.size > 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(sockets.size).toBe(0);
+  }
+
   async function post(payload: unknown, token: string | null = adminToken): Promise<Response> {
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (token !== null) headers.authorization = `Bearer ${token}`;
@@ -314,9 +321,8 @@ describe('AlertBotOpsServer stateless MCP', () => {
       await stopPromise;
     }
     await outcome;
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSocketsClosed();
     expect(stopped).toBe(true);
-    expect(sockets.size).toBe(0);
   });
 
   it('обрыв клиента при зависшем execute не оставляет открытых соединений', async () => {
@@ -339,8 +345,7 @@ describe('AlertBotOpsServer stateless MCP', () => {
       for (const socket of sockets) socket.destroy();
       await stopPromise;
     }
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSocketsClosed();
     expect(stopped).toBe(true);
-    expect(sockets.size).toBe(0);
   });
 });
