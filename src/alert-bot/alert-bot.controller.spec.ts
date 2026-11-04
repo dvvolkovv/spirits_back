@@ -24,6 +24,7 @@ describe('защищённый webhook бота алертов', () => {
     process.env.ALERT_BOT_WEBHOOK_URL = 'https://example.test/webhook/alert-bot/telegram';
     process.env.ALERT_BOT_WEBHOOK_SECRET = 'secret';
     handler.handleUpdate.mockReset();
+    handler.handleUpdate.mockResolvedValue(undefined);
     app = await NestFactory.create(AlertBotControllerSpecModule, { logger: false, abortOnError: false });
     app.setGlobalPrefix('webhook');
     await app.listen(0, '127.0.0.1');
