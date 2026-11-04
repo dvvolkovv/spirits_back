@@ -121,6 +121,18 @@ describe('черновики ответов в тикет', () => {
     expect(store.consumeDraft).not.toHaveBeenCalled();
   });
 
+  it('callback из другого чата не находит черновик и не производит side effects', async () => {
+    const result = await drafts.handleCallback(callback({ chatId: '-100999' }));
+
+    expect(result).toEqual({});
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('callback-1', 'Черновик не найден');
+    expect(store.consumeDraft).not.toHaveBeenCalled();
+    expect(support.adminGetTicket).not.toHaveBeenCalled();
+    expect(support.postOwnerReplyFromTelegram).not.toHaveBeenCalled();
+    expect(telegram.editMessageText).not.toHaveBeenCalled();
+  });
+
   it('send публикует ответ от аккаунта админа, отвечает на callback и меняет prompt', async () => {
     const result = await drafts.handleCallback(callback());
 
