@@ -299,7 +299,7 @@ if [[ ! "$PID" =~ ^[1-9][0-9]*$ ]]; then
 fi
 DRAIN_STARTED=$SECONDS
 while true; do
-  CHILDREN=$(ps --ppid "$PID" -o pid=)
+  CHILDREN=$(ps --ppid "$PID" -o pid= || true)
   if [[ "$INITIAL_INFLIGHT" == legacy ]]; then
     if ! grep -q . <<< "$CHILDREN" && legacy_workers_drained; then
       break
