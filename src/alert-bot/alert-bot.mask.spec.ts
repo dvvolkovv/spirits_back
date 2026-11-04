@@ -91,4 +91,10 @@ describe('маска бота алертов', () => {
     expect(maskText(`123456789:${'A'.repeat(29)}-`)).toBe('[скрыто]');
     expect(maskText(`sk-${'A'.repeat(11)}-`)).toBe('[скрыто]');
   });
+
+  it('маскирует JWT с дефисом на конце, в том числе после Bearer', () => {
+    const jwt = `eyJ${'A'.repeat(8)}.${'B'.repeat(8)}.${'C'.repeat(7)}-`;
+    expect(maskText(jwt)).toBe('[скрыто]');
+    expect(maskText(`Bearer ${jwt}`)).toBe('Bearer [скрыто]');
+  });
 });
