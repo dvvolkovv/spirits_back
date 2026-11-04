@@ -19,7 +19,10 @@ maybe('хранилище бота алертов против PostgreSQL', () =
     await admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`);
     await admin.query(`CREATE SCHEMA ${SCHEMA}`);
     pool = new Pool({ connectionString: PG, max: 4, options: `-c search_path=${SCHEMA}` });
-    store = new AlertBotStore({ query: (text: string, params?: any[]) => pool.query(text, params) } as any);
+    store = new AlertBotStore({
+      query: (text: string, params?: any[]) => pool.query(text, params),
+      getClient: () => pool.connect(),
+    } as any);
     await store.migrate();
   });
   afterAll(async () => {
@@ -47,10 +50,13 @@ maybe('хранилище бота алертов против PostgreSQL', () =
     const first = await store.createTurn({ updateId: 1101, chatId: '1', tgUserId: '111', adminUserId: 'u-admin', questionMessageId: 101, question: 'первый', privateChat: false });
     const second = await store.createTurn({ updateId: 1102, chatId: '1', tgUserId: '111', adminUserId: 'u-admin', questionMessageId: 102, question: 'второй', parentTurnId: first, privateChat: false });
     const third = await store.createTurn({ updateId: 1103, chatId: '1', tgUserId: '111', adminUserId: 'u-admin', questionMessageId: 103, question: 'третий', parentTurnId: second, privateChat: false });
+    const fourth = await store.createTurn({ updateId: 1104, chatId: '1', tgUserId: '111', adminUserId: 'u-admin', questionMessageId: 104, question: 'четвёртый', parentTurnId: third, privateChat: false });
     await store.finishTurn(first, { status: 'ok', answer: 'a1' });
     await store.finishTurn(second, { status: 'ok', answer: 'a2' });
+    await store.finishTurn(fourth, { status: 'ok', answer: 'a4' });
+    expect((await store.turnChain(fourth, 3)).map((t) => t.id)).toEqual([fourth]);
     await store.finishTurn(third, { status: 'ok', answer: 'a3' });
-    expect((await store.turnChain(third, 3)).map((t) => t.id)).toEqual([first, second, third]);
+    expect((await store.turnChain(fourth, 3)).map((t) => t.id)).toEqual([second, third, fourth]);
   });
   it('черновик меняет состояние один раз', async () => {
     const id = await store.createDraft({ chatId: '1', tgUserId: '111', adminUserId: 'u-admin', ticketId: '11111111-1111-4111-8111-111111111111', text: 'ответ', promptMessageId: 30 });
@@ -67,6 +73,14 @@ maybe('хранилище бота алертов против PostgreSQL', () =
     expect((await store.recentAlerts(24, 50))[0].text).toBe('🔥 тест');
     const id = await store.createTurn({ updateId: 1003, chatId: '1', tgUserId: '111', adminUserId: 'u-admin', questionMessageId: 11, question: 'вопрос', privateChat: true });
     expect(await store.interruptInProgress()).toEqual([expect.objectContaining({ id, chatId: '1', questionMessageId: 11 })]);
+  });
+  it('прерванный ход нельзя перезаписать финальным ответом', async () => {
+    const id = await store.createTurn({ updateId: 1004, chatId: '1', tgUserId: '111', adminUserId: 'u-admin', questionMessageId: 12, question: 'прерванный', privateChat: true });
+    expect(await store.interruptInProgress()).toEqual([expect.objectContaining({ id })]);
+    const finished = await store.finishTurn(id, { status: 'ok', answer: 'поздний ответ' });
+    const row = (await pool.query('SELECT status, error_kind, answer FROM alert_bot_turns WHERE id = $1', [id])).rows[0];
+    expect(finished).toBe(false);
+    expect(row).toMatchObject({ status: 'interrupted', error_kind: 'restart', answer: null });
   });
   it('чистка удаляет только просроченные данные', async () => {
     await pool.query(`UPDATE alert_bot_updates SET created_at = now() - interval '8 days';
@@ -98,13 +112,30 @@ maybe('хранилище бота алертов против PostgreSQL', () =
   });
   it('повторный старт не ждёт открытую пишущую транзакцию', async () => {
     const writer = new Pool({ connectionString: PG, max: 1, options: `-c search_path=${SCHEMA}` });
-    await writer.query('BEGIN');
-    await writer.query(`INSERT INTO alert_messages (chat_id, message_id, text) VALUES ('1', 999, 'open')`);
     try {
+      await writer.query('BEGIN');
+      await writer.query(`INSERT INTO alert_messages (chat_id, message_id, text) VALUES ('1', 999, 'open')`);
       await expect(store.migrate()).resolves.toBeUndefined();
     } finally {
-      await writer.query('ROLLBACK');
-      await writer.end();
+      try {
+        await writer.query('ROLLBACK');
+      } finally {
+        await writer.end();
+      }
     }
+  it('часовой лимит атомарен при двух одновременных входах', async () => {
+    const adminUserId = 'u-concurrent-limit';
+    for (let i = 0; i < 29; i++) {
+      await store.createTurn({ updateId: 3000 + i, chatId: '2', tgUserId: '222', adminUserId, questionMessageId: 3000 + i, question: `старый ${i}`, privateChat: true });
+    }
+    const results: Array<string | null> = await Promise.all([
+      (store as any).tryCreateTurn({ updateId: 3101, chatId: '2', tgUserId: '222', adminUserId, questionMessageId: 3101, question: 'первый одновременный', privateChat: true }, 30),
+      (store as any).tryCreateTurn({ updateId: 3102, chatId: '2', tgUserId: '222', adminUserId, questionMessageId: 3102, question: 'второй одновременный', privateChat: true }, 30),
+    ]);
+    expect(results.filter((id) => id !== null)).toHaveLength(1);
+    expect(results).toContain(null);
+    expect(typeof results.find((id) => id !== null)).toBe('string');
+    const count = await pool.query('SELECT count(*)::int AS n FROM alert_bot_turns WHERE linkeon_user_id = $1', [adminUserId]);
+    expect(count.rows[0].n).toBe(30);
   });
 });
