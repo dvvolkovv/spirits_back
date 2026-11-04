@@ -1116,9 +1116,9 @@ Commit: `feat(alert-bot): health-карта и /status с точным SLA`; п�
 ### Task 7: команды и черновики ответов в тикет
 
 **Files:**
-- Modify: `src/support/support.service.ts`
+- Modify: `src/support/support.service.ts`, `src/alert-bot/alert-bot.store.ts`
 - Create: `src/alert-bot/alert-bot.commands.ts`, `src/alert-bot/alert-bot.drafts.ts`
-- Test: `src/alert-bot/alert-bot.commands.spec.ts`, `src/alert-bot/alert-bot.drafts.spec.ts`, `src/support/support.telegram-author.spec.ts`
+- Test: `src/alert-bot/alert-bot.commands.spec.ts`, `src/alert-bot/alert-bot.drafts.spec.ts`, `src/alert-bot/alert-bot.store.pg.spec.ts`, `src/support/support.telegram-author.spec.ts`, `src/support/support.telegram-idempotency.pg.spec.ts`
 
 - [ ] **Step 1: написать падающие тесты**
 
@@ -1150,13 +1150,13 @@ it('неизвестный тикет не закрывается', async () => 
 `alert-bot.drafts.spec.ts`:
 - `maybeDraft(message, identity, ticket)` создаёт черновик и отправляет три кнопки с callback `draft:<uuid>:send|ask|cancel`;
 - закрытый/resolved тикет возвращает предупреждение и не создаёт черновик;
-- `handleCallback` чужого автора отвечает «Это черновик другого админа» и не вызывает store.consumeDraft;
-- `send` вызывает `postOwnerReplyFromTelegram(..., true, 'u-admin')`, отвечает `answerCallbackQuery` и редактирует сообщение «✅ Отправлено»;
-- повторный `send` после consume=false отвечает «Черновик устарел», повторной отправки пользователю нет;
-- `cancel` только помечает и редактирует «Отменено»;
-- `ask` возвращает `{question:'текст',ticketId:TICKET}` и не вызывает модель сам;
-- просроченный черновик нельзя отправить;
-- каждый callback получает ровно один `answerCallbackQuery`.
+- `handleCallback` чужого автора или чужого чата отвечает предупреждением и не вызывает `claimDraft`;
+- `send` выполняет `claimDraft(id,'sending')` → идемпотентный `postOwnerReplyFromTelegram(..., true, 'u-admin', draftId)` → `finalizeDraft(id,'sent')`, затем best-effort edit «✅ Отправлено»;
+- неожиданный сбой publish/finalize освобождает claim через `releaseDraft`, повторный `send` безопасен; повтор после неудачного claim отвечает «Черновик устарел»;
+- терминальный тикет (и при предварительном чтении, и при гонке под row lock) финализируется как `cancelled`, никогда `sent`;
+- `cancel` проходит через `cancelling` → `cancelled`; `ask` — через `asking` → `asked` и возвращает `{question:'текст',ticketId:TICKET}`, не вызывая модель;
+- просроченный черновик нельзя отправить; сбой `answerCallbackQuery` перехватывается и не меняет результат, попытка ack ровно одна;
+- preview вместе с заголовком ограничен 4096; сбой показа prompt отменяет черновик; сбой `attachDraftPrompt` после видимого prompt не пробрасывается и не приводит к дубликату.
 
 Commit: `test(alert-bot): команды и подтверждаемые ответы в тикет — красный`; проверить RED.
 
@@ -1167,7 +1167,7 @@ Commit: `test(alert-bot): команды и подтверждаемые отв�
 ```ts
 postOwnerReplyFromTelegram(
   ticketId: string, telegramUserId: string, displayName: string,
-  content: string, visibleToUser = true, linkeonUserId?: string,
+  content: string, visibleToUser = true, linkeonUserId?: string, draftId?: string,
 )
 setStatusFromTelegram(ticketId: string, telegramUserId: string, status: string, linkeonUserId?: string)
 ```
@@ -1179,7 +1179,7 @@ const actorId = linkeonUserId || `tg:${telegramUserId}`;
 const metadata = { via: 'telegram', author: displayName, telegramUserId };
 ```
 
-`actorId` использовать в `insertMessage` и обоих `support_events`; `via` не убирать. Существующая логика статуса, письма и SLA не меняется.
+`actorId` использовать в `insertMessage` и обоих `support_events`; `via` не убирать. При переданном `draftId` добавлять `alertBotDraftId` в metadata. В той же транзакции `SELECT ... FOR UPDATE` отклонять resolved/closed и после блокировки искать уже опубликованное сообщение с этим `alertBotDraftId`: повтор возвращает успех без message/event/email и без повторного изменения SLA. Последовательные и конкурентные retry проверяются реальным PostgreSQL в изолированной схеме. Без `draftId` прежняя логика статуса, письма и SLA не меняется.
 
 - [ ] **Step 3: реализовать команды**
 
@@ -1211,12 +1211,14 @@ handleCallback(input: {
   callbackId: string; chatId: string; tgUserId: string; adminUserId: string;
   draftId: string; action: 'send'|'ask'|'cancel'; messageId: number;
 }): Promise<{question?:string;ticketId?:string}>
-// getDraft → существование, chat/author identity; чужой автор — answerCallbackQuery и return {};
-// consumeDraft атомарно до любого побочного действия;
-// send → сначала adminGetTicket(draft.ticket_id): resolved/closed → отказ без отправки;
-// затем postOwnerReplyFromTelegram(...,true,adminUserId), edit «✅…»;
-// ask → return {question:draft.text,ticketId:draft.ticket_id};
-// cancel → edit «Отменено»; всегда answerCallbackQuery в finally.
+// getDraft → существование, chat/author identity; чужой автор/чат — answerCallbackQuery и return {};
+// claimDraft атомарно до побочных действий: sending/asking/cancelling;
+// send → adminGetTicket: resolved/closed → finalize cancelled без отправки;
+// publish с draftId идемпотентно под ticket FOR UPDATE, затем finalize sent;
+// неожиданная ошибка publish/finalize → releaseDraft для retry; edit best-effort;
+// ask → finalize asked и return {question:draft.text,ticketId:draft.ticket_id};
+// cancel → finalize cancelled и best-effort edit «Отменено»;
+// всегда ровно одна safely-caught попытка answerCallbackQuery в finally.
 ```
 
 Commit: `feat(alert-bot): команды и подтверждаемые черновики тикетов`; прогнать четыре spec-файла и tsc. Expected: PASS, `TSC_OK`.

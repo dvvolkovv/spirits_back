@@ -1,6 +1,6 @@
-import { Injectable } from '@nestjs/common';
+import { ConflictException, Injectable, Logger } from '@nestjs/common';
 import { SupportService } from '../support/support.service';
-import { AlertBotStore } from './alert-bot.store';
+import { AlertBotDraftClaim, AlertBotDraftOutcome, AlertBotStore } from './alert-bot.store';
 import { AlertBotTelegram } from './alert-bot.telegram';
 
 interface AlertBotIdentity {
@@ -35,8 +35,14 @@ function terminal(status: string): boolean {
   return status === 'resolved' || status === 'closed';
 }
 
+function terminalPublishError(error: unknown): boolean {
+  return error instanceof ConflictException && error.message === 'ticket is terminal';
+}
+
 @Injectable()
 export class AlertBotDrafts {
+  private readonly logger = new Logger(AlertBotDrafts.name);
+
   constructor(
     private readonly store: AlertBotStore,
     private readonly support: SupportService,
@@ -53,24 +59,45 @@ export class AlertBotDrafts {
       ticketId: input.ticket.id,
       text: input.text,
     });
-    const prompt = await this.telegram.sendMessage(
-      input.chatId,
-      `Черновик ответа в тикет #${input.ticket.id.slice(0, 8)}:\n\n${input.text}`,
-      input.questionMessageId,
-      {
-        inline_keyboard: [[
-          { text: '✅ Отправить', callback_data: `draft:${id}:send` },
-          { text: 'Спросить ИИ', callback_data: `draft:${id}:ask` },
-          { text: 'Отменить', callback_data: `draft:${id}:cancel` },
-        ]],
-      },
-    );
-    await this.store.attachDraftPrompt(id, prompt.message_id);
+    const header = `Черновик ответа в тикет #${input.ticket.id.slice(0, 8)}:\n\n`;
+    const preview = input.text.slice(0, Math.max(0, 4096 - header.length));
+    let prompt: { message_id: number };
+    try {
+      prompt = await this.telegram.sendMessage(
+        input.chatId,
+        `${header}${preview}`,
+        input.questionMessageId,
+        {
+          inline_keyboard: [[
+            { text: '✅ Отправить', callback_data: `draft:${id}:send` },
+            { text: 'Спросить ИИ', callback_data: `draft:${id}:ask` },
+            { text: 'Отменить', callback_data: `draft:${id}:cancel` },
+          ]],
+        },
+      );
+    } catch {
+      // Без видимого prompt активный черновик был бы недостижим для кнопок.
+      await this.store.finalizeDraft(id, 'cancelled');
+      return 'Не удалось показать черновик — он отменён.';
+    }
+
+    try {
+      await this.store.attachDraftPrompt(id, prompt.message_id);
+    } catch {
+      // Prompt уже виден, а callback передаёт messageId сам. Повторная попытка
+      // maybeDraft создала бы второй prompt, поэтому здесь только безопасный код.
+      this.logger.warn('alert-bot draft prompt attach failed');
+    }
     return null;
+  }
+
+  private async finalize(id: string, outcome: AlertBotDraftOutcome): Promise<void> {
+    if (!await this.store.finalizeDraft(id, outcome)) throw new Error('draft finalize failed');
   }
 
   async handleCallback(input: DraftCallbackInput): Promise<DraftCallbackResult> {
     let answer = 'Готово';
+    let claimed = false;
     try {
       const draft = await this.store.getDraft(input.draftId);
       if (!draft || String(draft.chatId) !== String(input.chatId)) {
@@ -82,19 +109,52 @@ export class AlertBotDrafts {
         return {};
       }
 
-      if (input.action === 'send') {
-        const consumed = await this.store.consumeDraft(draft.id, 'sent');
-        if (!consumed) {
-          answer = 'Черновик устарел';
-          return {};
+      const claim: AlertBotDraftClaim | null = input.action === 'send'
+        ? 'sending'
+        : input.action === 'ask'
+          ? 'asking'
+          : input.action === 'cancel'
+            ? 'cancelling'
+            : null;
+      if (!claim) {
+        answer = 'Неизвестное действие';
+        return {};
+      }
+      if (!await this.store.claimDraft(draft.id, claim)) {
+        answer = 'Черновик устарел';
+        return {};
+      }
+      claimed = true;
+
+      if (input.action === 'ask') {
+        await this.finalize(draft.id, 'asked');
+        claimed = false;
+        answer = 'Вопрос передан боту';
+        return { question: draft.text, ticketId: draft.ticketId };
+      }
+
+      if (input.action === 'cancel') {
+        await this.finalize(draft.id, 'cancelled');
+        claimed = false;
+        answer = 'Отменено';
+        try {
+          await this.telegram.editMessageText(input.chatId, input.messageId, 'Отменено');
+        } catch {
+          // Отмена уже зафиксирована; устаревший prompt — косметическая проблема.
         }
-        // Между созданием черновика и нажатием кнопки тикет могли закрыть.
-        // Статус читаем повторно после атомарного consume, но до публикации.
-        const current = await this.support.adminGetTicket(draft.ticketId);
-        if (terminal(current.ticket.status)) {
-          answer = 'Тикет уже закрыт — ответ не отправлен';
-          return {};
-        }
+        return {};
+      }
+
+      // Между созданием черновика и нажатием кнопки тикет могли закрыть.
+      const current = await this.support.adminGetTicket(draft.ticketId);
+      if (terminal(current.ticket.status)) {
+        await this.finalize(draft.id, 'cancelled');
+        claimed = false;
+        answer = 'Тикет уже закрыт — ответ не отправлен';
+        return {};
+      }
+
+      try {
         await this.support.postOwnerReplyFromTelegram(
           draft.ticketId,
           draft.tgUserId,
@@ -102,42 +162,42 @@ export class AlertBotDrafts {
           draft.text,
           true,
           input.adminUserId,
+          draft.id,
         );
+      } catch (error) {
+        if (!terminalPublishError(error)) throw error;
+        // Гонку закрытия ловит SupportService под FOR UPDATE. Это не «sent».
+        await this.finalize(draft.id, 'cancelled');
+        claimed = false;
+        answer = 'Тикет уже закрыт — ответ не отправлен';
+        return {};
+      }
+
+      await this.finalize(draft.id, 'sent');
+      claimed = false;
+      answer = 'Отправлено';
+      try {
         await this.telegram.editMessageText(input.chatId, input.messageId, '✅ Отправлено');
-        answer = 'Отправлено';
-        return {};
+      } catch {
+        // Публикация и sent уже завершены. Нельзя освобождать черновик из-за
+        // косметического сбоя edit: это спровоцировало бы лишний retry.
       }
-
-      if (input.action === 'ask') {
-        const consumed = await this.store.consumeDraft(draft.id, 'asked');
-        if (!consumed) {
-          answer = 'Черновик устарел';
-          return {};
-        }
-        answer = 'Вопрос передан боту';
-        return { question: draft.text, ticketId: draft.ticketId };
-      }
-
-      if (input.action === 'cancel') {
-        const consumed = await this.store.consumeDraft(draft.id, 'cancelled');
-        if (!consumed) {
-          answer = 'Черновик устарел';
-          return {};
-        }
-        await this.telegram.editMessageText(input.chatId, input.messageId, 'Отменено');
-        answer = 'Отменено';
-        return {};
-      }
-
-      answer = 'Неизвестное действие';
       return {};
     } catch {
-      // Текст черновика и сырые ошибки сюда не попадают: callback и журналы не
-      // должны стать вторым каналом утечки переписки с пользователем.
+      if (claimed) {
+        // Неожиданный сбой publish/finalize: publish идемпотентен по draftId,
+        // поэтому повтор безопасен даже после неопределённого post-commit сбоя.
+        await this.store.releaseDraft(input.draftId).catch(() => undefined);
+      }
       answer = 'Не удалось обработать черновик';
       return {};
     } finally {
-      await this.telegram.answerCallbackQuery(input.callbackId, answer);
+      // Ошибка ack не отменяет уже полученный результат (особенно question у /ask).
+      try {
+        await this.telegram.answerCallbackQuery(input.callbackId, answer);
+      } catch {
+        // Ровно одна попытка ack; повторять её опасно для общего обработчика.
+      }
     }
   }
 }

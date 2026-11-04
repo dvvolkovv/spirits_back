@@ -1150,7 +1150,7 @@ ${healthSummary}
   private async postOwnerReply(
     ticketId: string, senderId: string, content: string, metadata: any,
     visibleToUser: boolean, eventPayload: any,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const client = await this.pg.getClient();
     let destroyClient = false;
     try {
@@ -1159,6 +1159,26 @@ ${healthSummary}
         'SELECT status FROM support_tickets WHERE id = $1 FOR UPDATE', [ticketId],
       );
       if (!t.rows[0]) throw new NotFoundException('ticket not found');
+
+      const draftId = typeof metadata?.alertBotDraftId === 'string' ? metadata.alertBotDraftId : null;
+      if (draftId && ['resolved', 'closed'].includes(t.rows[0].status)) {
+        throw new ConflictException('ticket is terminal');
+      }
+      if (draftId) {
+        // Блокировка строки тикета сериализует retry и конкурентные callback.
+        // Поэтому проверки + insert образуют идемпотентную операцию даже без
+        // дополнительного индекса по JSONB.
+        const existing = await client.query(
+          `SELECT id FROM support_messages
+           WHERE ticket_id = $1 AND metadata->>'alertBotDraftId' = $2 LIMIT 1`,
+          [ticketId, draftId],
+        );
+        if (existing.rows[0]) {
+          await client.query('COMMIT');
+          return false;
+        }
+      }
+
       await this.insertMessage(ticketId, 'owner', senderId, content, metadata, visibleToUser, client);
       if (visibleToUser) {
         await client.query(
@@ -1179,6 +1199,7 @@ ${healthSummary}
         [ticketId, senderId, JSON.stringify(eventPayload)],
       );
       await client.query('COMMIT');
+      return true;
     } catch (e) {
       try {
         await client.query('ROLLBACK');
@@ -1308,16 +1329,19 @@ ${healthSummary}
    */
   async postOwnerReplyFromTelegram(
     ticketId: string, telegramUserId: string, displayName: string,
-    content: string, visibleToUser = true, linkeonUserId?: string,
+    content: string, visibleToUser = true, linkeonUserId?: string, draftId?: string,
   ): Promise<void> {
     const actorId = linkeonUserId || `tg:${telegramUserId}`;
-    const metadata = { via: 'telegram', author: displayName, telegramUserId };
-    await this.postOwnerReply(
+    const metadata = {
+      via: 'telegram', author: displayName, telegramUserId,
+      ...(draftId ? { alertBotDraftId: draftId } : {}),
+    };
+    const published = await this.postOwnerReply(
       ticketId, actorId, content,
       metadata, visibleToUser,
       { ...metadata, length: content.length },
     );
-    if (visibleToUser) void this.notifyOwnerReplyByEmail(ticketId, content);
+    if (visibleToUser && published) void this.notifyOwnerReplyByEmail(ticketId, content);
   }
 
   async adminStats(windowDays = 7) {

@@ -35,6 +35,9 @@ export interface AlertBotTurn {
   finishedAt: Date | null;
 }
 
+export type AlertBotDraftOutcome = 'sent' | 'cancelled' | 'asked';
+export type AlertBotDraftClaim = 'sending' | 'asking' | 'cancelling';
+
 export interface AlertBotDraft {
   id: string;
   chatId: string;
@@ -44,7 +47,7 @@ export interface AlertBotDraft {
   text: string;
   promptMessageId: number | null;
   expiresAt: Date;
-  outcome: 'sent' | 'cancelled' | 'asked' | null;
+  outcome: AlertBotDraftOutcome | AlertBotDraftClaim | null;
   createdAt: Date;
   resolvedAt: Date | null;
 }
@@ -349,13 +352,51 @@ export class AlertBotStore {
     return r.rows[0] ? mapDraft(r.rows[0]) : null;
   }
 
-  async consumeDraft(id: string, outcome: 'sent' | 'cancelled' | 'asked'): Promise<boolean> {
+  async consumeDraft(id: string, outcome: AlertBotDraftOutcome): Promise<boolean> {
     const r = await this.pg.query(
       `UPDATE alert_bot_ticket_drafts
        SET outcome = $2, resolved_at = now()
        WHERE id = $1 AND outcome IS NULL AND expires_at > now()
        RETURNING id`,
       [id, outcome],
+    );
+    return r.rowCount === 1;
+  }
+
+  async claimDraft(id: string, claim: AlertBotDraftClaim): Promise<boolean> {
+    const r = await this.pg.query(
+      `UPDATE alert_bot_ticket_drafts
+       SET outcome = $2, resolved_at = NULL
+       WHERE id = $1 AND outcome IS NULL AND expires_at > now()
+       RETURNING id`,
+      [id, claim],
+    );
+    return r.rowCount === 1;
+  }
+
+  async finalizeDraft(id: string, outcome: AlertBotDraftOutcome): Promise<boolean> {
+    const expected = outcome === 'sent'
+      ? "outcome = 'sending'"
+      : outcome === 'asked'
+        ? "outcome = 'asking'"
+        : "(outcome IS NULL OR outcome IN ('sending', 'asking', 'cancelling'))";
+    const r = await this.pg.query(
+      `UPDATE alert_bot_ticket_drafts
+       SET outcome = $2, resolved_at = now()
+       WHERE id = $1 AND ${expected}
+       RETURNING id`,
+      [id, outcome],
+    );
+    return r.rowCount === 1;
+  }
+
+  async releaseDraft(id: string): Promise<boolean> {
+    const r = await this.pg.query(
+      `UPDATE alert_bot_ticket_drafts
+       SET outcome = NULL, resolved_at = NULL
+       WHERE id = $1 AND outcome IN ('sending', 'asking', 'cancelling')
+       RETURNING id`,
+      [id],
     );
     return r.rowCount === 1;
   }
