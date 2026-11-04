@@ -168,6 +168,20 @@ describe('TgHealthService.probeWebhook', () => {
 });
 
 describe('TgHealthService.checkUnanswered', () => {
+  it('явно помечает ошибку БД вместо сохранения healthy stuckChats=0', async () => {
+    const { svc, pg } = makeService([]);
+    pg.query.mockRejectedValueOnce(new Error('db down'));
+
+    await svc.checkUnanswered();
+
+    expect(svc.getOverview().unanswered.stuckChats).toBe(0);
+    expect((svc.getOverview().unanswered as any).error).toBe('source_failed');
+
+    pg.query.mockResolvedValueOnce({ rows: [] });
+    await svc.checkUnanswered();
+    expect((svc.getOverview().unanswered as any).error).toBeNull();
+  });
+
   it('ищет только помеченные answer_expected_at и только без ответа после отметки', async () => {
     const { svc, pg } = makeService([]);
 

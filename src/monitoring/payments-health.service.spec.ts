@@ -114,6 +114,20 @@ describe('Слой 2: серия неудачных попыток', () => {
   const fail = (error = 'HTTP 403') => ({ ok: false, error, created_at: new Date('2026-08-14T16:05:00Z') });
   const success = () => ({ ok: true, error: null, created_at: new Date('2026-08-14T16:06:00Z') });
 
+  it('ошибка БД явно помечает источник, а не сохраняет healthy failStreak=0', async () => {
+    const { svc, pg } = makeService();
+    pg.query.mockRejectedValueOnce(new Error('db down'));
+
+    await svc.checkAttempts();
+
+    expect(svc.getOverview().attempts.failStreak).toBe(0);
+    expect((svc.getOverview().attempts as any).error).toBe('source_failed');
+
+    pg.query.mockResolvedValueOnce({ rows: [] });
+    await svc.checkAttempts();
+    expect((svc.getOverview().attempts as any).error).toBeNull();
+  });
+
   it('три неудачи подряд — алерт', async () => {
     const { svc } = makeService([fail(), fail(), fail()]);
 
@@ -157,6 +171,22 @@ describe('Слой 2: серия неудачных попыток', () => {
 
 describe('Слой 3: воронка создан → оплачен', () => {
   const funnel = (created: number, succeeded: number) => [{ created, succeeded }];
+
+  it('ошибка БД не оставляет прежний healthy результат без пометки', async () => {
+    const { svc, pg } = makeService(funnel(5, 1));
+    await svc.checkFunnel();
+    expect(svc.getOverview().funnel.healthy).toBe(true);
+
+    pg.query.mockRejectedValueOnce(new Error('db down'));
+    await svc.checkFunnel();
+
+    expect(svc.getOverview().funnel.healthy).toBe(true);
+    expect((svc.getOverview().funnel as any).error).toBe('source_failed');
+
+    pg.query.mockResolvedValueOnce({ rows: funnel(5, 1) });
+    await svc.checkFunnel();
+    expect((svc.getOverview().funnel as any).error).toBeNull();
+  });
 
   it('платежи создаются, успешных ноль — алерт', async () => {
     const { svc } = makeService(funnel(5, 0));

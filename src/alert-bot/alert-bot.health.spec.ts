@@ -40,7 +40,7 @@ const healthy: Record<HealthSection, any> = {
     redis: [{ instance: 'redis', up: true, memoryUsedBytes: 100, connectedClients: 2, opsPerSec: 3, keyspaceHitRatio: 0.99, evictedKeys: 0 }],
     minio: [{ instance: 'minio', up: true, buckets: 2, objects: 10, usedBytes: 100, freeBytes: 900, totalBytes: 1000 }],
     nginx: [{ instance: 'nginx', up: true, activeConnections: 2, reqPerSec: 3, acceptedTotal: 10, handledTotal: 10, reading: 0, writing: 1, waiting: 1 }],
-    neo4j: [{ instance: 'neo', up: true, heapUsedBytes: 100, heapMaxBytes: 200, heapUsedPct: 50, threads: 5, gcTimeSecTotal: 1, nodes: 10, relationships: 20 }],
+    neo4j: [{ instance: 'neo', up: true, heapUsedBytes: 100, heapMaxBytes: 200, heapUsedPct: 50, threads: 5, gcTimeSecTotal: 1, nodes: 10, relationships: 20, error: null }],
     generatedAt,
   },
   sms: {
@@ -59,13 +59,13 @@ const healthy: Record<HealthSection, any> = {
     generatedAt,
     configured: true,
     webhook: { healthy: true, url: 'https://my.linkeon.io/webhook/telegram', pendingUpdateCount: 0, lastErrorMessage: null, lastErrorAt: null, checkedAt: generatedAt, error: null, consecutiveFailures: 0 },
-    unanswered: { thresholdMinutes: 30, stuckChats: 0, checkedAt: generatedAt, chats: [] },
+    unanswered: { thresholdMinutes: 30, stuckChats: 0, checkedAt: generatedAt, error: null, chats: [] },
   },
   payments: {
     generatedAt,
     shop: { configured: true, healthy: true, status: 'enabled', accountId: 'shop', checkedAt: generatedAt, error: null, consecutiveFailures: 0 },
-    attempts: { failStreak: 0, threshold: 3, lastError: null, lastFailureAt: null, checkedAt: generatedAt },
-    funnel: { windowHours: 24, created: 5, succeeded: 4, healthy: true, checkedAt: generatedAt },
+    attempts: { failStreak: 0, threshold: 3, lastError: null, lastFailureAt: null, checkedAt: generatedAt, error: null },
+    funnel: { windowHours: 24, created: 5, succeeded: 4, healthy: true, checkedAt: generatedAt, error: null },
   },
   quality: {
     generatedAt,
@@ -87,7 +87,7 @@ const healthy: Record<HealthSection, any> = {
   },
   geo: {
     checked_at: generatedAt, target: 'https://linkeon.io', ru_total: 3, ru_ok: 3, ru_failed: 0,
-    baseline_ok: true, region_down: false,
+    baseline_ok: true, region_down: false, stale: false, error: null,
     probes: [{ city: 'Moscow', network: 'ISP', asn: 1, ok: true, statusCode: 200, reason: null }],
   },
   backups: {
@@ -144,13 +144,18 @@ const healthy: Record<HealthSection, any> = {
 const incidentCases: Array<[HealthSection, any]> = [
   ['overview', { ...healthy.overview, nodes: [{ ...healthy.overview.nodes[0], up: false }] }],
   ['databases', { ...healthy.databases, postgres: [{ ...healthy.databases.postgres[0], up: false }] }],
+  ['databases', { ...healthy.databases, neo4j: [{ ...healthy.databases.neo4j[0], nodes: null, relationships: null, error: 'source_failed' }] }],
   ['sms', { ...healthy.sms, balance: { ...healthy.sms.balance, rub: 100 } }],
   ['nanobanana', { ...healthy.nanobanana, healthy: false, error: 'probe failed', consecutiveFailures: 2 }],
   ['tg-bot', { ...healthy['tg-bot'], unanswered: { ...healthy['tg-bot'].unanswered, stuckChats: 1, chats: [{ chatId: '1', title: 'chat', waitingMinutes: 45 }] } }],
+  ['tg-bot', { ...healthy['tg-bot'], unanswered: { ...healthy['tg-bot'].unanswered, error: 'source_failed' } }],
   ['payments', { ...healthy.payments, attempts: { ...healthy.payments.attempts, failStreak: 3 } }],
+  ['payments', { ...healthy.payments, attempts: { ...healthy.payments.attempts, error: 'source_failed' } }],
+  ['payments', { ...healthy.payments, funnel: { ...healthy.payments.funnel, error: 'source_failed' } }],
   ['quality', { ...healthy.quality, alerts: ['video_failrate: 50%'] }],
   ['claude', { ...healthy.claude, usage: { ...healthy.claude.usage, llmStatus: 'down', llmError: 'probe failed' } }],
   ['geo', { ...healthy.geo, ru_ok: 0, ru_failed: 3, region_down: true, probes: [{ ...healthy.geo.probes[0], ok: false, statusCode: null, reason: 'timeout' }] }],
+  ['geo', { ...healthy.geo, checked_at: '2026-11-04T10:00:00.000Z', stale: true, error: 'source_failed' }],
   ['backups', { ...healthy.backups, latest: { ...healthy.backups.latest, fresh: false, healthy: false } }],
   ['models', { ...healthy.models, unexpected: [{ model: 'unknown', source: 'relay', calls_30d: 1, last_seen: generatedAt }] }],
   ['jobs', { ...healthy.jobs, video: { ...healthy.jobs.video, pending_total: 1, oldest_pending_age_min: 45, stuck: true } }],
