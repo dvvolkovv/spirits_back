@@ -168,7 +168,7 @@ test('настройки: своя папка на запись, домашни�
   assert.ok(s.sandbox.filesystem.denyRead.includes('/tmp/agent-mcp'));
   assert.ok(s.sandbox.excludedCommands.includes('sudo *'));
   assert.equal(typeof s.permissions.deny[0], 'string');
-  for (const d of s.permissions.deny) assert.match(d, /^(Read|Glob|Grep|Write|Edit)\(/);
+  for (const d of s.permissions.deny) assert.match(d, /^(Read|Edit)\(/);
 });
 
 test('cliEnv: белый список, без лишних ключей, scrub включён', () => {
@@ -259,9 +259,6 @@ export function buildSandboxSettings(fsKey, { scratch, mcpDir } = {}) {
     permissions: {
       deny: [
         ...deny.map((d) => `Read(${d}/**)`),
-        ...deny.map((d) => `Glob(${d}/**)`),
-        ...deny.map((d) => `Grep(${d}/**)`),
-        ...deny.map((d) => `Write(${d}/**)`),
         ...deny.map((d) => `Edit(${d}/**)`),
       ],
     },
@@ -367,7 +364,7 @@ export async function ensureListingGuard({ outputs = '/tmp/agent-output', upload
 - [ ] 2. Профиль AppArmor (как в Task 0 Step 1) → `sudo apparmor_parser -r /etc/apparmor.d/bwrap` → `bwrap --bind / / true && echo ок`.
 - [ ] 3. `sudo mkdir -p /opt/linkeon-agent && sudo cp -a ~/agent-env /opt/linkeon-agent/venv && sudo cp -a ~/file-agent/bin/. /opt/linkeon-agent/bin/ 2>/dev/null || true && sudo cp -a ~/file-agent/scripts/. /opt/linkeon-agent/bin/ 2>/dev/null || true` → `sudo chmod -R a+rX /opt/linkeon-agent` → `ls /opt/linkeon-agent/bin | head` показывает скрипты, `test -x /opt/linkeon-agent/venv/bin/python3`.
 - [ ] 3a. **Отменено после стенда 04.11:** внешний squid не используется — sandbox изолирует loopback, а wildcard пропускал DNS-rebinding. Установленный 03.11 squid остановлен и disabled; больше не ставить. Сеть — только `SANDBOX_ALLOWED_DOMAINS` из Task 1.
-- [ ] 3b. После копии `/opt/linkeon-agent`: заменить `/home/dv/agent-env` на `/opt/linkeon-agent/venv` в текстовых файлах `venv/bin` (activate + shebang); скопировать цель `bin/stop-my-jobs` (`stop-my-jobs.mjs`) рядом, иначе symlink битый; скопировать `/home/dv/.local/share/claude/versions/2.1.280` в `/opt/linkeon-agent/bin/claude-runtime` и сделать symlink `claude` — чистый PATH не содержит `/home/dv/.local/bin`. Проверки: `python prefix=/opt/...`, `claude --version` работает.
+- [ ] 3b. После копии `/opt/linkeon-agent`: заменить `/home/dv/agent-env` на `/opt/linkeon-agent/venv` в текстовых файлах `venv/bin` (activate + shebang); в конец `venv/bin/activate` добавить замену `localhost` → `127.0.0.1` в `HTTP_PROXY`/`HTTPS_PROXY`/lowercase с сохранением авторизации встроенного proxy (иначе pip падает с Temporary failure in name resolution); скопировать цель `bin/stop-my-jobs` (`stop-my-jobs.mjs`) рядом, иначе symlink битый; скопировать `/home/dv/.local/share/claude/versions/2.1.280` в `/opt/linkeon-agent/bin/claude-runtime` и сделать symlink `claude` — чистый PATH не содержит `/home/dv/.local/bin`. Проверки: `python prefix=/opt/...`, `claude --version` работает.
 - [ ] 4. Права: `sudo mkdir -p /tmp/agent-mcp /tmp/agent-scratch && sudo chown dv:dv /tmp/agent-mcp /tmp/agent-scratch && chmod 0311 /tmp/agent-output /tmp/agent-uploads /tmp/agent-scratch && chmod 0700 /tmp/agent-mcp` → проверка: `ls /tmp/agent-output` от пользователя `nobody`? (нельзя удобно) — проверка через `sudo -u nobody ls /tmp/agent-output 2>&1 | head -1` ожидает «Permission denied».
 - [ ] 5. Уборка корня `/tmp` (старое рабочее): НЕ трогая `agent-output`, `agent-uploads`, `agent-mcp`, `agent-scratch`, `systemd-private*`, `ssh-*`, `node-compile-cache`, `.org.chromium.Chromium.*`: собрать кандидатов `find /tmp -maxdepth 1 -mindepth 1 -mtime +3`, показать владельцу список-маску (без номеров), после его «да» — `tar -czf ~/linkeon-orphans-oldtmp-$(date +%Y%m%d).tar.gz -C /tmp <список>` (umask 077), сверить число записей, удалить исходники.
 - [ ] 6. Файлы режима: `printf 'off\n' > ~/file-agent/sandbox-mode && chmod 600 ~/file-agent/sandbox-mode && cp ~/relay-scrub-canary.keys ~/file-agent/sandbox-canary.keys && chmod 600 ~/file-agent/sandbox-canary.keys` (список = 92 ключа владельца из канарейки чистки).

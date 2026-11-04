@@ -78,7 +78,9 @@ userId в конструкции не участвует — пример из �
    первых дней. Write/Edit — свои папки. Не `(*)`. `permissions.deny`:
    `/home/dv/**`, `/tmp/agent-mcp/**`, `/tmp/agent-uploads/mcp/**` (прежний
    каталог токенов до одноразовой очистки), `/etc/sudoers*`, `/proc/**` —
-   запрет сильнее allowedTools. Корни output/uploads/scratch в denyRead НЕ
+   запрет сильнее allowedTools. В `permissions.deny` используются только
+   `Read(...)` и `Edit(...)`: CLI 2.1.280 покрывает Read-правилами Glob/Grep,
+   а Edit-правилами Write; отдельные Glob/Grep/Write deny он отклоняет. Корни output/uploads/scratch в denyRead НЕ
    включаем: собственные пути должны работать; листинг закрыт 0311 и fs_key.
 5. Песочница в настройках: `enabled`, `allowUnsandboxedCommands: false`
    (отказ без обхода), записываемые пути — свои, запрещённые на чтение —
