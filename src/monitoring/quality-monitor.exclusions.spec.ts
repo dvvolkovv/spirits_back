@@ -11,6 +11,11 @@
  * корректный ответ не по-русски.
  */
 
+jest.mock('@napi-rs/canvas', () => ({
+  createCanvas: jest.fn(),
+  loadImage: jest.fn(),
+  GlobalFonts: { register: jest.fn() },
+}));
 jest.mock('../common/telegram-alert', () => ({
   sendTelegramPayload: jest.fn(async () => {}),
   sendTelegramAlert: jest.fn(async () => {}),
