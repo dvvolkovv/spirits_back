@@ -83,16 +83,18 @@ userId в конструкции не участвует — пример из �
 5. Песочница в настройках: `enabled`, `allowUnsandboxedCommands: false`
    (отказ без обхода), записываемые пути — свои, запрещённые на чтение —
    `/home/dv`, `/tmp/agent-mcp`, `/tmp/agent-uploads/mcp`, `/etc/sudoers*`, `/proc`; `excludedCommands: ["sudo *"]`
-   (требование sudo). Сеть — решение владельца 03.11 «В: прокси»: на релее
-   squid на `127.0.0.1:8471` (bind только loopback, `acl localnet dst` со
-   внутренними сетями → `http_access deny localnet`). Из песочницы открыт
-   ТОЛЬКО этот адрес (`network.allowedDomains: ["127.0.0.1:8471"]`), выход
-   наружу — через переменные окружения `http_proxy`/`https_proxy` (и капс) в
-   чистом env CLI; `no_proxy` НЕ задаётся (иначе обход резки через localhost).
-   Проверено разведкой 03.11: песочница пускает loopback лишь к разрешённым
-   host:port, внешние адреса без прокси закрыты. **`WebFetch` при on/canary
+   (требование sudo). Сеть — решение владельца 04.11 «белый список доменов»:
+   `network.allowedDomains` содержит только `example.com`, `pypi.org`,
+   `files.pythonhosted.org`, `registry.npmjs.org`, `nodejs.org`, `github.com`,
+   `api.github.com`, `raw.githubusercontent.com`, `codeload.github.com`,
+   `objects.githubusercontent.com`, `huggingface.co`, `cdn-lfs.huggingface.co`,
+   `image.pollinations.ai`, `fonts.google.com`, `fonts.gstatic.com`.
+   Встроенный filtering proxy CLI назначается сам; proxy-переменные релей не
+   задаёт. Открытый `*` и внешний squid отклонены после стенда: sandbox
+   изолирует loopback, а `127.0.0.1.nip.io` дошёл до живого релея (401) —
+   wildcard пропускает DNS-rebinding. **`WebFetch` при on/canary
    запрещён**: он выполняется CLI вне bwrap и мог бы открыть внутренний адрес;
-   скачивание остаётся через Bash/curl и прокси. `/proc` закрыт на чтение,
+   скачивание остаётся через Bash/curl по белому списку. `/proc` закрыт на чтение,
    чтобы Bash не получил токены из `/proc/<pid>/environ`.
 6. Конфиг MCP: каталог `/tmp/agent-mcp`, имя `<fs_key>-<ts>.json`, 0600,
    после хода удаляется (как сейчас). В промпте пути `~/agent-env`,
