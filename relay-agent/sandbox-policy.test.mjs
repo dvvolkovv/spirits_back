@@ -74,17 +74,23 @@ test('настройки: своя папка на запись, домашни�
   assert.ok(s.sandbox.filesystem.denyRead.includes('/tmp/agent-mcp'));
   assert.ok(s.sandbox.filesystem.denyRead.includes('/tmp/agent-uploads/mcp'));
   assert.ok(s.permissions.deny.includes('Read(/tmp/agent-uploads/mcp/**)'));
-  assert.ok(s.permissions.deny.includes('Write(/tmp/agent-uploads/mcp/**)'));
+  assert.ok(s.permissions.deny.includes('Edit(/tmp/agent-uploads/mcp/**)'));
   assert.ok(s.sandbox.filesystem.denyRead.includes('/proc'));
   assert.ok(s.permissions.deny.includes('Read(/proc/**)'));
-  assert.ok(s.permissions.deny.includes('Write(/proc/**)'));
+  assert.ok(s.permissions.deny.includes('Edit(/proc/**)'));
   assert.equal(s.sandbox.filesystem.denyRead.includes('/tmp/agent-scratch'), false);
   assert.deepEqual(s.sandbox.network.allowedDomains, EXPECTED_ALLOWED_DOMAINS);
   assert.equal(s.sandbox.network.allowedDomains.includes('*'), false);
   assert.equal(s.sandbox.network.allowedDomains.some((d) => /^(?:localhost|127\.)/.test(d)), false);
   assert.ok(s.sandbox.excludedCommands.includes('sudo *'));
   assert.equal(typeof s.permissions.deny[0], 'string');
-  for (const d of s.permissions.deny) assert.match(d, /^(Read|Glob|Grep|Write|Edit)\(/);
+  for (const rule of s.permissions.deny) assert.match(rule, /^(Read|Edit)\(/);
+  for (const d of s.sandbox.filesystem.denyRead) {
+    assert.ok(s.permissions.deny.includes(`Read(${d}/**)`), `Read(${d}/**)`);
+    assert.ok(s.permissions.deny.includes(`Edit(${d}/**)`), `Edit(${d}/**)`);
+  }
+  assert.equal(s.permissions.deny.some((rule) => /^(Glob|Grep|Write)\(/.test(rule)), false);
+  assert.equal(s.permissions.deny.length, s.sandbox.filesystem.denyRead.length * 2);
 });
 
 test('настройки: trailing slash у mcpDir убирается', () => {
