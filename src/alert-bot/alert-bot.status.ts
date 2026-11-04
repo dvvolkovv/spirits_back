@@ -1,9 +1,19 @@
 import { Injectable } from '@nestjs/common';
 import { MonitoringService } from '../monitoring/monitoring.service';
 import { SupportService } from '../support/support.service';
-import { AlertBotHealthService } from './alert-bot.health';
+import { AlertBotHealthService, withDeadline } from './alert-bot.health';
 
 type PrometheusRow = { metric: Record<string, string>; value: [number, string] };
+
+export const STATUS_BLOCK_TIMEOUT_MS = 2500;
+
+function metricKey(metric: Record<string, string>): string {
+  const labels = Object.keys(metric)
+    .filter((key) => key !== '__name__' && key !== 'alertstate')
+    .sort()
+    .map((key) => [key, metric[key]]);
+  return JSON.stringify(labels);
+}
 
 @Injectable()
 export class AlertBotStatusService {
@@ -15,9 +25,9 @@ export class AlertBotStatusService {
 
   async summary(): Promise<string> {
     const [alerts, badSections, tickets] = await Promise.allSettled([
-      this.firingAlerts(),
-      this.health.badSections(),
-      this.ticketCounts(),
+      withDeadline(this.firingAlerts(), STATUS_BLOCK_TIMEOUT_MS),
+      withDeadline(this.health.badSections(), STATUS_BLOCK_TIMEOUT_MS),
+      withDeadline(this.ticketCounts(), STATUS_BLOCK_TIMEOUT_MS),
     ]);
 
     const alertLines = alerts.status === 'rejected'
@@ -40,11 +50,11 @@ export class AlertBotStatusService {
   private async firingAlerts(): Promise<string[]> {
     const [alerts, states]: [PrometheusRow[], PrometheusRow[]] = await Promise.all([
       this.monitoring.query('ALERTS{alertstate="firing"}'),
-      this.monitoring.query('ALERTS_FOR_STATE{alertstate="firing"}'),
+      this.monitoring.query('ALERTS_FOR_STATE'),
     ]);
-    const stateByMetric = new Map(states.map((row) => [JSON.stringify(row.metric), row]));
+    const stateByMetric = new Map(states.map((row) => [metricKey(row.metric), row]));
     return alerts.slice(0, 10).map((alert) => {
-      const state = stateByMetric.get(JSON.stringify(alert.metric));
+      const state = stateByMetric.get(metricKey(alert.metric));
       const seconds = Number(state?.value?.[1]);
       const since = Number.isFinite(seconds) ? ` (с ${new Date(seconds * 1000).toISOString()})` : '';
       return `${alert.metric.alertname} — ${alert.metric.instance}${since}`;

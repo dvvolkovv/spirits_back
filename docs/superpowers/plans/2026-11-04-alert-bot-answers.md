@@ -1081,12 +1081,12 @@ export class AlertBotHealthService {
 
   async badSections(): Promise<string[]> {
     const pairs = await Promise.all(HEALTH_SECTIONS.map(async (s) => [s, await this.getSection(s)] as const));
-    return pairs.filter(([, value]) => hasBadStatus(value)).map(([name]) => name);
+    return pairs.filter(([section, value]) => !isSectionHealthy(section, value)).map(([name]) => name);
   }
 }
 ```
 
-`hasBadStatus` — рекурсивная чистая функция в том же файле: ищет только ключи `status`, `state`, `health`, `llmStatus`; плохие значения — `down`, `bad`, `unhealthy`, `failed`, `error`, `critical`, `degraded`, `warn`, `stale` без учёта регистра. `unknown`, `not_configured`, `healthy`, `good`, `ok`, `up` плохими не считаются. Массивы и вложенные объекты обходить; глубина не больше 6, циклы через `WeakSet`.
+`isSectionHealthy` — нормализация по фактическому контракту каждого из 16 источников, а не общий поиск ключей `status`: `up/success`, `healthy`, `llmStatus`, `latestSuccess`, `region_down`, `stuck`, `alerts`, `unexpected` и остальные поля проверяются только для своего раздела. Необязательный источник с `configured:false` инцидентом не является; `null`, `unknown` и `{error:'source_failed'}` нельзя считать отсутствием сбоев. Каждый источник ограничен дедлайном 2 с и возвращает `source_failed` по таймауту; блоки `/status` ограничены 2,5 с и дают `данные недоступны`, таймеры очищаются. `ALERTS_FOR_STATE` запрашивается без `alertstate`, а join с `ALERTS` идёт по отсортированным меткам без `__name__` и `alertstate`.
 
 - [ ] **Step 4: добавить точный счётчик SLA и формат сводки**
 
