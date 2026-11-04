@@ -68,6 +68,20 @@ maybe('хранилище бота алертов против PostgreSQL', () =
     await pool.query('UPDATE alert_bot_ticket_drafts SET expires_at = now() - interval \'1 second\' WHERE id = $1', [id]);
     expect(await store.consumeDraft(id, 'sent')).toBe(false);
   });
+  it('claim можно освободить для retry и затем финализировать', async () => {
+    const id = await store.createDraft({ chatId: '1', tgUserId: '111', adminUserId: 'u-admin', ticketId: '11111111-1111-4111-8111-111111111111', text: 'ответ', promptMessageId: 32 });
+    expect(await store.claimDraft(id, 'sending')).toBe(true);
+    expect(await store.claimDraft(id, 'asking')).toBe(false);
+    expect(await store.releaseDraft(id)).toBe(true);
+    expect(await store.claimDraft(id, 'sending')).toBe(true);
+    expect(await store.finalizeDraft(id, 'sent')).toBe(true);
+    expect(await store.releaseDraft(id)).toBe(false);
+  });
+  it('непоказанный черновик можно сразу отменить', async () => {
+    const id = await store.createDraft({ chatId: '1', tgUserId: '111', adminUserId: 'u-admin', ticketId: '11111111-1111-4111-8111-111111111111', text: 'ответ' });
+    expect(await store.finalizeDraft(id, 'cancelled')).toBe(true);
+    expect(await store.claimDraft(id, 'sending')).toBe(false);
+  });
   it('журнал алертов и восстановление ходов работают', async () => {
     await store.recordAlert('1', 40, '🔥 тест');
     expect((await store.recentAlerts(24, 50))[0].text).toBe('🔥 тест');

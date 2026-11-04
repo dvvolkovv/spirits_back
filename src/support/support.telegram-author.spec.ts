@@ -92,6 +92,16 @@ describe('авторство ответов и действий из Telegram', 
     expect(events.map((event) => event.actor_id)).toEqual(['tg:111', 'tg:111']);
   });
 
+  it('сохраняет alertBotDraftId для идемпотентной публикации', async () => {
+    const { service, messages, events } = makeService();
+    const draftId = '22222222-2222-4222-8222-222222222222';
+
+    await service.postOwnerReplyFromTelegram(TICKET, '111', 'Дмитрий', 'текст', true, 'u-admin', draftId);
+
+    expect(messages[0].metadata).toMatchObject({ alertBotDraftId: draftId });
+    expect(events[0].payload).toMatchObject({ alertBotDraftId: draftId });
+  });
+
   it('внутренний ответ не меняет SLA и не инициирует email', async () => {
     const { service, queries, email } = makeService();
 
