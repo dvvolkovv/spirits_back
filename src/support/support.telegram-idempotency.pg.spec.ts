@@ -26,6 +26,7 @@ maybe('идемпотентная публикация Telegram-черновик
     pool = new Pool({ connectionString: PG, max: 4, options: `-c search_path=${SCHEMA}` });
     await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', '001_support.sql'), 'utf8'));
     await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', '002_support_sla.sql'), 'utf8'));
+    await pool.query(fs.readFileSync(path.join(__dirname, '..', 'alert-bot', 'migrations', '001_alert_bot.sql'), 'utf8'));
   });
 
   afterAll(async () => {
@@ -36,6 +37,7 @@ maybe('идемпотентная публикация Telegram-черновик
 
   beforeEach(async () => {
     await pool.query('TRUNCATE support_tickets CASCADE');
+    await pool.query('TRUNCATE alert_bot_ticket_drafts');
   });
 
   afterEach(() => jest.restoreAllMocks());
@@ -57,9 +59,20 @@ maybe('идемпотентная публикация Telegram-черновик
     return r.rows[0].id;
   }
 
+  async function seedDraft(ticketId: string): Promise<void> {
+    await pool.query(
+      `INSERT INTO alert_bot_ticket_drafts
+         (id, chat_id, tg_user_id, linkeon_user_id, ticket_id, text,
+          outcome, claim_version, claimed_at)
+       VALUES ($1, '-100123', '111', 'u-admin', $2, 'идемпотентный ответ',
+               'sending', 1, now())`,
+      [DRAFT, ticketId],
+    );
+  }
+
   function publish(service: SupportService, ticketId: string): Promise<void> {
     return service.postOwnerReplyFromTelegram(
-      ticketId, '111', 'Дмитрий', 'идемпотентный ответ', true, 'u-admin', DRAFT,
+      ticketId, '111', 'Дмитрий', 'идемпотентный ответ', true, 'u-admin', DRAFT, 1,
     );
   }
 
@@ -84,6 +97,7 @@ maybe('идемпотентная публикация Telegram-черновик
   it('последовательный retry не повторяет message/event/email и не трогает тикет', async () => {
     const { service, email } = makeService();
     const ticketId = await newTicket();
+    await seedDraft(ticketId);
 
     await publish(service, ticketId);
     const first = await pool.query('SELECT updated_at FROM support_tickets WHERE id = $1', [ticketId]);
@@ -106,6 +120,7 @@ maybe('идемпотентная публикация Telegram-черновик
   it('два конкурентных вызова с одним draftId дают один message/event/email', async () => {
     const { service, email } = makeService();
     const ticketId = await newTicket();
+    await seedDraft(ticketId);
 
     await Promise.all([publish(service, ticketId), publish(service, ticketId)]);
 
@@ -116,6 +131,7 @@ maybe('идемпотентная публикация Telegram-черновик
   it('publish → close → retry возвращает идемпотентный успех без новых эффектов', async () => {
     const { service, email } = makeService();
     const ticketId = await newTicket();
+    await seedDraft(ticketId);
 
     await publish(service, ticketId);
     await pool.query("UPDATE support_tickets SET status = 'closed', updated_at = now() WHERE id = $1", [ticketId]);
@@ -143,6 +159,7 @@ maybe('идемпотентная публикация Telegram-черновик
   it.each(['resolved', 'closed'])('терминальный тикет %s под row lock не получает visible message', async (status) => {
     const { service, email } = makeService();
     const ticketId = await newTicket(status);
+    await seedDraft(ticketId);
 
     await expect(publish(service, ticketId)).rejects.toMatchObject({ message: 'ticket is terminal' });
 

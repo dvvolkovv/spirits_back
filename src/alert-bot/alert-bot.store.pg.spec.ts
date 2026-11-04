@@ -68,34 +68,39 @@ maybe('хранилище бота алертов против PostgreSQL', () =
     await pool.query('UPDATE alert_bot_ticket_drafts SET expires_at = now() - interval \'1 second\' WHERE id = $1', [id]);
     expect(await store.consumeDraft(id, 'sent')).toBe(false);
   });
-  it('claim можно освободить для retry и затем финализировать', async () => {
+  it('claim fencing не даёт старому release/finalize перезаписать новую версию', async () => {
     const id = await store.createDraft({ chatId: '1', tgUserId: '111', adminUserId: 'u-admin', ticketId: '11111111-1111-4111-8111-111111111111', text: 'ответ', promptMessageId: 32 });
-    expect(await store.claimDraft(id, 'sending')).toBe('claimed');
-    expect(await store.claimDraft(id, 'asking')).toBe('in_progress');
-    expect(await store.releaseDraft(id)).toBe(true);
-    expect(await store.claimDraft(id, 'sending')).toBe('claimed');
-    expect(await store.finalizeDraft(id, 'sent')).toBe(true);
-    expect(await store.finalizeDraft(id, 'cancelled')).toBe(false);
-    expect(await store.releaseDraft(id)).toBe(false);
+    expect(await store.claimDraft(id, 'sending')).toEqual({ status: 'claimed', version: 1 });
+    expect(await store.claimDraft(id, 'asking')).toEqual({ status: 'in_progress' });
+    expect(await store.releaseDraft(id, 'sending', 0)).toBe(false);
+    expect(await store.releaseDraft(id, 'asking', 1)).toBe(false);
+    expect(await store.releaseDraft(id, 'sending', 1)).toBe(true);
+    expect(await store.claimDraft(id, 'sending')).toEqual({ status: 'claimed', version: 2 });
+    expect(await store.finalizeDraft(id, 'sending', 'sent', 1)).toBe(false);
+    expect(await store.finalizeDraft(id, 'asking', 'asked', 2)).toBe(false);
+    expect(await store.finalizeDraft(id, 'sending', 'sent', 2)).toBe(true);
+    expect(await store.finalizeDraft(id, 'sending', 'cancelled', 2)).toBe(false);
+    expect(await store.releaseDraft(id, 'sending', 2)).toBe(false);
   });
-  it('просроченный и legacy lease можно reclaim, а claimed_at обновляется', async () => {
+  it('просроченный и legacy lease можно reclaim, а claim_version растёт', async () => {
     const expired = await store.createDraft({ chatId: '1', tgUserId: '111', adminUserId: 'u-admin', ticketId: '11111111-1111-4111-8111-111111111111', text: 'ответ', promptMessageId: 33 });
-    expect(await store.claimDraft(expired, 'sending')).toBe('claimed');
+    expect(await store.claimDraft(expired, 'sending')).toEqual({ status: 'claimed', version: 1 });
     await pool.query("UPDATE alert_bot_ticket_drafts SET claimed_at = now() - interval '61 seconds' WHERE id = $1", [expired]);
 
-    expect(await store.claimDraft(expired, 'sending')).toBe('claimed');
+    expect(await store.claimDraft(expired, 'sending')).toEqual({ status: 'claimed', version: 2 });
     expect((await store.getDraft(expired))?.claimedAt).toBeInstanceOf(Date);
-    expect(await store.finalizeDraft(expired, 'sent')).toBe(true);
+    expect((await store.getDraft(expired))?.claimVersion).toBe(2);
+    expect(await store.finalizeDraft(expired, 'sending', 'sent', 2)).toBe(true);
 
     const legacy = await store.createDraft({ chatId: '1', tgUserId: '111', adminUserId: 'u-admin', ticketId: '11111111-1111-4111-8111-111111111111', text: 'ответ', promptMessageId: 34 });
     await pool.query("UPDATE alert_bot_ticket_drafts SET outcome = 'asking', claimed_at = NULL WHERE id = $1", [legacy]);
-    expect(await store.claimDraft(legacy, 'asking')).toBe('claimed');
-    expect(await store.finalizeDraft(legacy, 'asked')).toBe(true);
+    expect(await store.claimDraft(legacy, 'asking')).toEqual({ status: 'claimed', version: 1 });
+    expect(await store.finalizeDraft(legacy, 'asking', 'asked', 1)).toBe(true);
   });
   it('непоказанный черновик можно сразу отменить', async () => {
     const id = await store.createDraft({ chatId: '1', tgUserId: '111', adminUserId: 'u-admin', ticketId: '11111111-1111-4111-8111-111111111111', text: 'ответ' });
-    expect(await store.finalizeDraft(id, 'cancelled')).toBe(true);
-    expect(await store.claimDraft(id, 'sending')).toBe('unavailable');
+    expect(await store.finalizeDraft(id, null, 'cancelled', 0)).toBe(true);
+    expect(await store.claimDraft(id, 'sending')).toEqual({ status: 'unavailable' });
   });
   it('журнал алертов и восстановление ходов работают', async () => {
     await store.recordAlert('1', 40, '🔥 тест');

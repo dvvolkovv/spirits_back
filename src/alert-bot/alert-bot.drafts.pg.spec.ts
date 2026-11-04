@@ -65,6 +65,51 @@ maybe('callback черновика с lease против PostgreSQL', () => {
     email.mockClear();
   });
 
+  async function newTicket(): Promise<string> {
+    const r = await pool.query(
+      "INSERT INTO support_tickets (user_id, status) VALUES ('u-owner', 'escalated') RETURNING id",
+    );
+    return r.rows[0].id;
+  }
+
+  async function newDraft(ticketId: string, text = 'ответ после восстановления'): Promise<string> {
+    return store.createDraft({
+      chatId: CHAT,
+      tgUserId: '111',
+      adminUserId: 'u-admin',
+      ticketId,
+      text,
+      promptMessageId: 900,
+    });
+  }
+
+  function callback(draftId: string, action: 'send' | 'cancel' = 'send', callbackId = 'callback-recovery') {
+    return {
+      callbackId,
+      chatId: CHAT,
+      tgUserId: '111',
+      adminUserId: 'u-admin',
+      draftId,
+      action,
+      messageId: 900,
+    };
+  }
+
+  async function oldPublishWaitsOnTicketLock(): Promise<boolean> {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const r = await pool.query(
+        `SELECT 1 FROM pg_stat_activity
+         WHERE datname = current_database() AND pid <> pg_backend_pid()
+           AND wait_event_type = 'Lock'
+           AND query LIKE '%SELECT status FROM support_tickets%FOR UPDATE%'
+         LIMIT 1`,
+      );
+      if (r.rows[0]) return true;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return false;
+  }
+
   it('reclaim заброшенного sending публикует один ответ и финализирует sent', async () => {
     const ticket = await pool.query(
       "INSERT INTO support_tickets (user_id, status) VALUES ('u-owner', 'escalated') RETURNING id",
@@ -106,5 +151,86 @@ maybe('callback черновика с lease против PostgreSQL', () => {
     expect(email).toHaveBeenCalledTimes(1);
     expect(telegram.editMessageText).toHaveBeenCalledWith(CHAT, 900, '✅ Отправлено');
     expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('callback-recovery', 'Отправлено');
+  });
+
+  it('claim_version ограждает старый send от нового cancel после lease expiry', async () => {
+    const ticketId = await newTicket();
+    const draftId = await newDraft(ticketId, 'старый ответ');
+    const firstClaim = await store.claimDraft(draftId, 'sending');
+    expect(firstClaim).toEqual({ status: 'claimed', version: 1 });
+    const blocker = await pool.connect();
+    let oldCallback: Promise<unknown> | null = null;
+    let lockObserved = false;
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query('SELECT status FROM support_tickets WHERE id = $1 FOR UPDATE', [ticketId]);
+      oldCallback = drafts.handleCallback(callback(draftId, 'send', 'old-send'));
+      lockObserved = await oldPublishWaitsOnTicketLock();
+
+      await pool.query(
+        `UPDATE alert_bot_ticket_drafts
+         SET claimed_at = now() - interval '61 seconds'
+         WHERE id = $1 AND claim_version = 1`,
+        [draftId],
+      );
+      await drafts.handleCallback(callback(draftId, 'cancel', 'new-cancel'));
+    } finally {
+      await blocker.query('ROLLBACK').catch(() => undefined);
+      blocker.release();
+    }
+    await oldCallback;
+
+    expect(lockObserved).toBe(true);
+    expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'cancelled', claimVersion: 2 });
+    const effects = await pool.query(
+      `SELECT
+         (SELECT count(*)::int FROM support_messages WHERE ticket_id = $1) AS messages,
+         (SELECT count(*)::int FROM support_events WHERE ticket_id = $1 AND action = 'reply') AS events`,
+      [ticketId],
+    );
+    expect(effects.rows[0]).toEqual({ messages: 0, events: 0 });
+    expect(email).not.toHaveBeenCalled();
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('old-send', 'Не удалось обработать черновик');
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('new-cancel', 'Отменено');
+  });
+
+  it('retry находит публикацию за пределами первых 500 сообщений и финализирует sent после закрытия', async () => {
+    const ticketId = await newTicket();
+    const draftId = await newDraft(ticketId, 'ответ за пределами preview');
+    const firstClaim = await store.claimDraft(draftId, 'sending');
+    if (firstClaim.status !== 'claimed') throw new Error('first claim failed');
+    await support.postOwnerReplyFromTelegram(
+      ticketId, '111', 'u-admin', 'ответ за пределами preview', true, 'u-admin', draftId, firstClaim.version,
+    );
+    await pool.query(
+      `INSERT INTO support_messages
+         (ticket_id, sender_type, sender_id, content, visible_to_user, created_at)
+       SELECT $1, 'user', 'u-owner', 'older ' || g, true,
+              now() - interval '1 day' + g * interval '1 second'
+       FROM generate_series(1, 501) AS g`,
+      [ticketId],
+    );
+    await pool.query("UPDATE support_tickets SET status = 'closed' WHERE id = $1", [ticketId]);
+    await pool.query(
+      "UPDATE alert_bot_ticket_drafts SET claimed_at = now() - interval '61 seconds' WHERE id = $1",
+      [draftId],
+    );
+
+    await drafts.handleCallback(callback(draftId, 'send', 'retry-after-500'));
+
+    expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'sent', claimVersion: 2 });
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('retry-after-500', 'Отправлено');
+    expect(email).toHaveBeenCalledTimes(1);
+    const tagged = await pool.query(
+      "SELECT count(*)::int AS count FROM support_messages WHERE ticket_id = $1 AND metadata->>'alertBotDraftId' = $2",
+      [ticketId, draftId],
+    );
+    expect(tagged.rows[0].count).toBe(1);
+
+    const newDraftId = await newDraft(ticketId, 'новый ответ в закрытый тикет');
+    await drafts.handleCallback(callback(newDraftId, 'send', 'new-closed-draft'));
+    expect((await store.getDraft(newDraftId))?.outcome).toBe('cancelled');
+    expect(telegram.answerCallbackQuery.mock.calls[telegram.answerCallbackQuery.mock.calls.length - 1][1]).toContain('закрыт');
+    expect(email).toHaveBeenCalledTimes(1);
   });
 });

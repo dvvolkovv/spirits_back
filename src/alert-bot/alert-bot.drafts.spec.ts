@@ -23,6 +23,7 @@ function draft(overrides: Record<string, unknown> = {}) {
     promptMessageId: 900,
     expiresAt: new Date(Date.now() + 60_000),
     outcome: null,
+    claimVersion: 0,
     createdAt: new Date(),
     resolvedAt: null,
     ...overrides,
@@ -74,7 +75,7 @@ describe('черновики ответов в тикет', () => {
     store.createDraft.mockResolvedValue(DRAFT);
     store.getDraft.mockResolvedValue(draft());
     store.consumeDraft.mockResolvedValue(true);
-    store.claimDraft.mockResolvedValue('claimed');
+    store.claimDraft.mockResolvedValue({ status: 'claimed', version: 1 });
     store.finalizeDraft.mockResolvedValue(true);
     store.releaseDraft.mockResolvedValue(true);
     store.attachDraftPrompt.mockResolvedValue(undefined);
@@ -134,7 +135,7 @@ describe('черновики ответов в тикет', () => {
     const result = await drafts.maybeDraft(maybeInput());
 
     expect(result).toContain('отмен');
-    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'cancelled');
+    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, null, 'cancelled', 0);
     expect(store.attachDraftPrompt).not.toHaveBeenCalled();
   });
 
@@ -176,11 +177,11 @@ describe('черновики ответов в тикет', () => {
     expect(result).toEqual({});
     expect(store.claimDraft).toHaveBeenCalledWith(DRAFT, 'sending');
     expect(support.postOwnerReplyFromTelegram).toHaveBeenCalledWith(
-      TICKET, '111', 'u-admin', 'текст', true, 'u-admin', DRAFT,
+      TICKET, '111', 'u-admin', 'текст', true, 'u-admin', DRAFT, 1,
     );
-    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'sent');
-    expect(store.claimDraft.mock.invocationCallOrder[0]).toBeLessThan(support.adminGetTicket.mock.invocationCallOrder[0]);
-    expect(support.adminGetTicket.mock.invocationCallOrder[0]).toBeLessThan(support.postOwnerReplyFromTelegram.mock.invocationCallOrder[0]);
+    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'sending', 'sent', 1);
+    expect(support.adminGetTicket).not.toHaveBeenCalled();
+    expect(store.claimDraft.mock.invocationCallOrder[0]).toBeLessThan(support.postOwnerReplyFromTelegram.mock.invocationCallOrder[0]);
     expect(support.postOwnerReplyFromTelegram.mock.invocationCallOrder[0]).toBeLessThan(store.finalizeDraft.mock.invocationCallOrder[0]);
     expect(telegram.editMessageText).toHaveBeenCalledWith(CHAT, 900, '✅ Отправлено');
     expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
@@ -188,7 +189,7 @@ describe('черновики ответов в тикет', () => {
   });
 
   it('повторный send после неудачного claim не дублирует ответ пользователю', async () => {
-    store.claimDraft.mockResolvedValue('unavailable');
+    store.claimDraft.mockResolvedValue({ status: 'unavailable' });
 
     await drafts.handleCallback(callback());
 
@@ -200,7 +201,7 @@ describe('черновики ответов в тикет', () => {
 
   it('активный непросроченный claim сообщает «уже обрабатывается» без повторной публикации', async () => {
     store.getDraft.mockResolvedValue(draft({ outcome: 'sending', claimedAt: new Date() }));
-    store.claimDraft.mockResolvedValue('in_progress');
+    store.claimDraft.mockResolvedValue({ status: 'in_progress' });
 
     await drafts.handleCallback(callback());
 
@@ -211,6 +212,9 @@ describe('черновики ответов в тикет', () => {
   });
 
   it('неожиданный сбой публикации освобождает черновик для безопасного retry', async () => {
+    store.claimDraft
+      .mockResolvedValueOnce({ status: 'claimed', version: 1 })
+      .mockResolvedValueOnce({ status: 'claimed', version: 2 });
     support.postOwnerReplyFromTelegram
       .mockRejectedValueOnce(new Error('uncertain post-commit failure'))
       .mockResolvedValueOnce(undefined);
@@ -219,13 +223,15 @@ describe('черновики ответов в тикет', () => {
     await drafts.handleCallback(callback({ callbackId: 'second' }));
 
     expect(store.claimDraft).toHaveBeenCalledTimes(2);
-    expect(store.releaseDraft).toHaveBeenCalledWith(DRAFT);
+    expect(store.releaseDraft).toHaveBeenCalledWith(DRAFT, 'sending', 1);
     expect(store.releaseDraft).toHaveBeenCalledTimes(1);
-    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'sent');
+    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'sending', 'sent', 2);
     expect(store.finalizeDraft).toHaveBeenCalledTimes(1);
     expect(support.postOwnerReplyFromTelegram).toHaveBeenCalledTimes(2);
     expect(support.postOwnerReplyFromTelegram.mock.calls[0][6]).toBe(DRAFT);
     expect(support.postOwnerReplyFromTelegram.mock.calls[1][6]).toBe(DRAFT);
+    expect(support.postOwnerReplyFromTelegram.mock.calls[0][7]).toBe(1);
+    expect(support.postOwnerReplyFromTelegram.mock.calls[1][7]).toBe(2);
     expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(2);
     expect(telegram.answerCallbackQuery.mock.calls[1][1]).toBe('Отправлено');
   });
@@ -241,7 +247,9 @@ describe('черновики ответов в тикет', () => {
         outcome: 'sending',
         claimedAt: new Date(Date.now() - 61_000),
       }));
-    store.claimDraft.mockResolvedValue('claimed');
+    store.claimDraft
+      .mockResolvedValueOnce({ status: 'claimed', version: 1 })
+      .mockResolvedValueOnce({ status: 'claimed', version: 2 });
 
     await drafts.handleCallback(callback({ callbackId: 'first' }));
     await drafts.handleCallback(callback({ callbackId: 'second' }));
@@ -249,7 +257,7 @@ describe('черновики ответов в тикет', () => {
     expect(store.releaseDraft).toHaveBeenCalledTimes(1);
     expect(store.claimDraft).toHaveBeenCalledTimes(2);
     expect(support.postOwnerReplyFromTelegram).toHaveBeenCalledTimes(2);
-    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'sent');
+    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'sending', 'sent', 2);
     expect(telegram.answerCallbackQuery.mock.calls[1][1]).toBe('Отправлено');
   });
 
@@ -258,7 +266,7 @@ describe('черновики ответов в тикет', () => {
 
     await expect(drafts.handleCallback(callback())).resolves.toEqual({});
 
-    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'sent');
+    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'sending', 'sent', 1);
     expect(store.releaseDraft).not.toHaveBeenCalled();
     expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
     expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('callback-1', 'Отправлено');
@@ -272,14 +280,19 @@ describe('черновики ответов в тикет', () => {
     if (action === 'ask') expect(result).toEqual({ question: 'текст', ticketId: TICKET });
     else expect(result).toEqual({});
     expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
-    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, action === 'send' ? 'sent' : action === 'ask' ? 'asked' : 'cancelled');
+    expect(store.finalizeDraft).toHaveBeenCalledWith(
+      DRAFT,
+      action === 'send' ? 'sending' : action === 'ask' ? 'asking' : 'cancelling',
+      action === 'send' ? 'sent' : action === 'ask' ? 'asked' : 'cancelled',
+      1,
+    );
   });
 
   it('cancel финализирует черновик и меняет prompt на «Отменено»', async () => {
     await drafts.handleCallback(callback({ action: 'cancel' }));
 
     expect(store.claimDraft).toHaveBeenCalledWith(DRAFT, 'cancelling');
-    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'cancelled');
+    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'cancelling', 'cancelled', 1);
     expect(telegram.editMessageText).toHaveBeenCalledWith(CHAT, 900, 'Отменено');
     expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
     expect(support.postOwnerReplyFromTelegram).not.toHaveBeenCalled();
@@ -290,7 +303,7 @@ describe('черновики ответов в тикет', () => {
 
     expect(result).toEqual({ question: 'текст', ticketId: TICKET });
     expect(store.claimDraft).toHaveBeenCalledWith(DRAFT, 'asking');
-    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'asked');
+    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'asking', 'asked', 1);
     expect(support.adminGetTicket).not.toHaveBeenCalled();
     expect(support.postOwnerReplyFromTelegram).not.toHaveBeenCalled();
     expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
@@ -298,7 +311,7 @@ describe('черновики ответов в тикет', () => {
 
   it('просроченный черновик нельзя отправить', async () => {
     store.getDraft.mockResolvedValue(draft({ expiresAt: new Date(Date.now() - 1000) }));
-    store.claimDraft.mockResolvedValue('unavailable');
+    store.claimDraft.mockResolvedValue({ status: 'unavailable' });
 
     await drafts.handleCallback(callback());
 
@@ -307,41 +320,28 @@ describe('черновики ответов в тикет', () => {
   });
 
   it('retry уже опубликованного draft после закрытия тикета финализирует sent', async () => {
-    support.adminGetTicket.mockResolvedValue({
-      ticket: { id: TICKET, status: 'closed' },
-      messages: [{ metadata: { alertBotDraftId: DRAFT } }],
-    });
-
     await drafts.handleCallback(callback());
 
+    expect(support.adminGetTicket).not.toHaveBeenCalled();
     expect(support.postOwnerReplyFromTelegram).toHaveBeenCalledWith(
-      TICKET, '111', 'u-admin', 'текст', true, 'u-admin', DRAFT,
+      TICKET, '111', 'u-admin', 'текст', true, 'u-admin', DRAFT, 1,
     );
-    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'sent');
-    expect(store.finalizeDraft).not.toHaveBeenCalledWith(DRAFT, 'cancelled');
+    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'sending', 'sent', 1);
+    expect(store.finalizeDraft).not.toHaveBeenCalledWith(DRAFT, 'sending', 'cancelled', 1);
     expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('callback-1', 'Отправлено');
   });
 
-  it.each(['resolved', 'closed'])('перед send повторно читает тикет и отменяет черновик для статуса %s', async (status) => {
-    support.adminGetTicket.mockResolvedValue({ ticket: { id: TICKET, status } });
-
-    await drafts.handleCallback(callback());
-
-    expect(support.adminGetTicket).toHaveBeenCalledWith(TICKET);
-    expect(support.postOwnerReplyFromTelegram).not.toHaveBeenCalled();
-    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'cancelled');
-    expect(store.releaseDraft).not.toHaveBeenCalled();
-    expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
-    expect(telegram.answerCallbackQuery.mock.calls[0][1]).toContain('закрыт');
-  });
-
-  it('гонку закрытия под row lock отменяет, а не помечает sent', async () => {
+  it.each(['resolved', 'closed'])('новая публикация в терминальный тикет %s отклоняется под row lock', async () => {
     support.postOwnerReplyFromTelegram.mockRejectedValue(new ConflictException('ticket is terminal'));
 
     await drafts.handleCallback(callback());
 
-    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'cancelled');
-    expect(store.finalizeDraft).not.toHaveBeenCalledWith(DRAFT, 'sent');
+    expect(support.adminGetTicket).not.toHaveBeenCalled();
+    expect(support.postOwnerReplyFromTelegram).toHaveBeenCalledWith(
+      TICKET, '111', 'u-admin', 'текст', true, 'u-admin', DRAFT, 1,
+    );
+    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'sending', 'cancelled', 1);
+    expect(store.finalizeDraft).not.toHaveBeenCalledWith(DRAFT, 'sending', 'sent', 1);
     expect(store.releaseDraft).not.toHaveBeenCalled();
     expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
     expect(telegram.answerCallbackQuery.mock.calls[0][1]).toContain('закрыт');

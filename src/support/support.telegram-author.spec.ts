@@ -8,7 +8,7 @@ import { SupportService } from './support.service';
 
 const TICKET = '11111111-1111-4111-8111-111111111111';
 
-function makeService() {
+function makeService(draftRow: any = { outcome: 'sending', claim_version: 1 }) {
   const messages: any[] = [];
   const events: any[] = [];
   const queries: Array<{ sql: string; params?: any[] }> = [];
@@ -16,6 +16,9 @@ function makeService() {
     queries.push({ sql, params });
     if (/SELECT status FROM support_tickets/.test(sql)) {
       return { rows: [{ status: 'escalated' }] };
+    }
+    if (/SELECT outcome, claim_version FROM alert_bot_ticket_drafts/.test(sql)) {
+      return { rows: draftRow ? [draftRow] : [] };
     }
     if (/INSERT INTO support_messages/.test(sql)) {
       const row = {
@@ -96,10 +99,23 @@ describe('авторство ответов и действий из Telegram', 
     const { service, messages, events } = makeService();
     const draftId = '22222222-2222-4222-8222-222222222222';
 
-    await service.postOwnerReplyFromTelegram(TICKET, '111', 'Дмитрий', 'текст', true, 'u-admin', draftId);
+    await service.postOwnerReplyFromTelegram(TICKET, '111', 'Дмитрий', 'текст', true, 'u-admin', draftId, 1);
 
     expect(messages[0].metadata).toMatchObject({ alertBotDraftId: draftId });
     expect(events[0].payload).toMatchObject({ alertBotDraftId: draftId });
+  });
+
+  it('отклоняет новую публикацию со stale claim_version до message/event/email', async () => {
+    const { service, messages, events, email } = makeService({ outcome: 'cancelled', claim_version: 2 });
+    const draftId = '22222222-2222-4222-8222-222222222222';
+
+    await expect(service.postOwnerReplyFromTelegram(
+      TICKET, '111', 'Дмитрий', 'текст', true, 'u-admin', draftId, 1,
+    )).rejects.toMatchObject({ message: 'draft claim is stale' });
+
+    expect(messages).toHaveLength(0);
+    expect(events).toHaveLength(0);
+    expect(email).not.toHaveBeenCalled();
   });
 
   it('внутренний ответ не меняет SLA и не инициирует email', async () => {
