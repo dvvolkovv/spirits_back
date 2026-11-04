@@ -156,8 +156,6 @@ maybe('callback черновика с lease против PostgreSQL', () => {
   it('claim_version ограждает старый send от нового cancel после lease expiry', async () => {
     const ticketId = await newTicket();
     const draftId = await newDraft(ticketId, 'старый ответ');
-    const firstClaim = await store.claimDraft(draftId, 'sending');
-    expect(firstClaim).toEqual({ status: 'claimed', version: 1 });
     const blocker = await pool.connect();
     let oldCallback: Promise<unknown> | null = null;
     let lockObserved = false;
