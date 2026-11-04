@@ -24,6 +24,8 @@ const RU_LIMIT = 5;                 // сколько RU-точек запраш
 const MIN_RU_FAILS = 2;             // ≥ этого числа упавших RU-точек = «недоступно из RU»
 const ALERT_AFTER_FAILS = 2;        // K подряд провалов до алерта (анти-флейк блипов)
 const COMPONENT = 'geo_linkeon';
+// Проверка идёт раз в 15 минут; двойной интервал оставляет запас на длительный probe.
+const STALE_AFTER_MS = 30 * 60_000;
 
 interface ProbeOutcome {
   country: string | null;
@@ -40,6 +42,7 @@ export class GeoAvailabilityService implements OnModuleInit {
   private readonly log = new Logger(GeoAvailabilityService.name);
   private consecutiveFails = 0;
   private last: any = null;
+  private lastError: string | null = null;
 
   constructor(private readonly pg: PgService) {}
 
@@ -116,12 +119,18 @@ export class GeoAvailabilityService implements OnModuleInit {
       ruRes = await this.measure('http', [{ country: 'RU' }], RU_LIMIT, { protocol: 'HTTPS', request: { method: 'HEAD', path: '/' } });
       baseRes = await this.measure('http', [{ country: 'NL' }], 1, { protocol: 'HTTPS', request: { method: 'HEAD', path: '/' } });
     } catch (e: any) {
+      this.lastError = 'source_failed';
       this.log.warn(`globalping http measure failed: ${e?.response?.status || ''} ${e.message}`);
       return; // не алертим, если сам globalping недоступен (это не наш сайт)
     }
     const ru = this.parseHttp(ruRes);
     const base = this.parseHttp(baseRes);
-    if (ru.length === 0) { this.log.warn('geo check: no RU probes returned'); return; }
+    if (ru.length === 0) {
+      this.lastError = 'source_failed';
+      this.log.warn('geo check: no RU probes returned');
+      return;
+    }
+    this.lastError = null;
 
     const ruOk = ru.filter((p) => p.ok).length;
     const ruFailed = ru.length - ruOk;
@@ -216,10 +225,21 @@ export class GeoAvailabilityService implements OnModuleInit {
   }
 
   async getLatest(): Promise<any> {
-    if (this.last) return this.last;
+    const decorate = (row: any, error = this.lastError) => {
+      if (!row) return null;
+      const checkedAt = new Date(row.checked_at).getTime();
+      return {
+        ...row,
+        stale: !Number.isFinite(checkedAt) || Date.now() - checkedAt > STALE_AFTER_MS,
+        error,
+      };
+    };
+    if (this.last) return decorate(this.last);
     try {
       const r = await this.pg.query(`SELECT checked_at, target, ru_total, ru_ok, ru_failed, baseline_ok, region_down, probes FROM geo_availability_checks ORDER BY checked_at DESC LIMIT 1`);
-      return r.rows[0] ?? null;
-    } catch { return null; }
+      return decorate(r.rows[0] ?? null);
+    } catch {
+      return { stale: true, error: 'source_failed' };
+    }
   }
 }

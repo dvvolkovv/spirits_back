@@ -68,8 +68,10 @@ function isSectionHealthy(section: HealthSection, value: unknown): boolean {
         && Array.isArray(value.probes) && value.probes.length > 0
         && value.probes.every((row: any) => isRecord(row) && row.success === true);
     case 'databases':
-      return ['postgres', 'redis', 'minio', 'nginx', 'neo4j']
-        .every((key) => nonEmptyRowsUp(value[key]));
+      return ['postgres', 'redis', 'minio', 'nginx']
+        .every((key) => nonEmptyRowsUp(value[key]))
+        && nonEmptyRowsUp(value.neo4j)
+        && value.neo4j.every((row: any) => row.error === null);
     case 'sms':
       if (value.balance?.error === 'SMSAERO_LOGIN/API_KEY not set') return true;
       return isRecord(value.balance) && value.balance.error === null
@@ -81,7 +83,8 @@ function isSectionHealthy(section: HealthSection, value: unknown): boolean {
     case 'tg-bot':
       return (value.configured === false
           || (value.configured === true && value.webhook?.healthy === true))
-        && value.unanswered?.stuckChats === 0;
+        && value.unanswered?.stuckChats === 0
+        && value.unanswered?.error === null;
     case 'payments': {
       const shopKnown = value.shop?.configured === false
         || (value.shop?.configured === true && value.shop?.healthy === true);
@@ -89,7 +92,9 @@ function isSectionHealthy(section: HealthSection, value: unknown): boolean {
         && typeof value.attempts?.failStreak === 'number'
         && typeof value.attempts?.threshold === 'number'
         && value.attempts.failStreak < value.attempts.threshold
-        && isRecord(value.funnel) && value.funnel.healthy !== false;
+        && value.attempts.error === null
+        && isRecord(value.funnel) && value.funnel.healthy !== false
+        && value.funnel.error === null;
     }
     case 'quality':
       return Array.isArray(value.alerts) && value.alerts.length === 0;
@@ -100,7 +105,7 @@ function isSectionHealthy(section: HealthSection, value: unknown): boolean {
       return value.usage?.llmStatus === 'ok' && apiKeyOk;
     }
     case 'geo':
-      return value.region_down === false;
+      return value.region_down === false && value.stale === false && value.error === null;
     case 'backups':
       return value.error === null && value.latest?.healthy === true;
     case 'models':

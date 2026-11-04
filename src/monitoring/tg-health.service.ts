@@ -72,6 +72,7 @@ export interface TgHealthOverview {
     thresholdMinutes: number;
     stuckChats: number;
     checkedAt: string | null;
+    error: string | null;
     chats: Array<{ chatId: string; title: string | null; waitingMinutes: number }>;
   };
 }
@@ -92,6 +93,7 @@ export class TgHealthService {
 
   private stuckChats: Array<{ chatId: string; title: string | null; waitingMinutes: number }> = [];
   private unansweredCheckedAt: string | null = null;
+  private unansweredError: string | null = 'source_failed';
   private lastUnansweredAlertAt: Date | null = null;
   private unansweredWasStuck = false;
 
@@ -269,12 +271,14 @@ export class TgHealthService {
         [UNANSWERED_MINUTES],
       );
       this.unansweredCheckedAt = new Date().toISOString();
+      this.unansweredError = null;
       this.stuckChats = r.rows.map((row: any) => ({
         chatId: String(row.tg_chat_id),
         title: row.tg_chat_title || null,
         waitingMinutes: Math.round(Number(row.waiting_minutes)),
       }));
     } catch (e: any) {
+      this.unansweredError = 'source_failed';
       this.log.error(`unanswered check failed: ${e.message}`);
       return;
     }
@@ -354,6 +358,7 @@ export class TgHealthService {
         thresholdMinutes: UNANSWERED_MINUTES,
         stuckChats: this.stuckChats.length,
         checkedAt: this.unansweredCheckedAt,
+        error: this.unansweredError,
         chats: this.stuckChats.slice(0, 20),
       },
     };

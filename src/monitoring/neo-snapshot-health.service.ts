@@ -129,7 +129,7 @@ export class NeoSnapshotHealthService implements OnModuleInit {
     return fs.readdirSync(this.backupRoot)
       .filter((n) => /^\d{8}-\d{6}$/.test(n))
       .map((n) => path.join(this.backupRoot, n))
-      .filter((p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } })
+      .filter((p) => fs.statSync(p).isDirectory())
       .sort();
   }
 

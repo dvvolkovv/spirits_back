@@ -61,6 +61,7 @@ export interface PaymentsHealthOverview {
     lastError: string | null;
     lastFailureAt: string | null;
     checkedAt: string | null;
+    error: string | null;
   };
   funnel: {
     windowHours: number;
@@ -68,6 +69,7 @@ export interface PaymentsHealthOverview {
     succeeded: number;
     healthy: boolean | null; // null = слишком мало попыток, чтобы судить
     checkedAt: string | null;
+    error: string | null;
   };
 }
 
@@ -87,6 +89,7 @@ export class PaymentsHealthService {
   private lastAttemptError: string | null = null;
   private lastFailureAt: string | null = null;
   private attemptsCheckedAt: string | null = null;
+  private attemptsError: string | null = 'source_failed';
   private lastAttemptsAlertAt: Date | null = null;
   private attemptsWasBroken = false;
 
@@ -94,6 +97,7 @@ export class PaymentsHealthService {
   private funnelSucceeded = 0;
   private funnelHealthy: boolean | null = null;
   private funnelCheckedAt: string | null = null;
+  private funnelError: string | null = 'source_failed';
   private lastFunnelAlertAt: Date | null = null;
 
   constructor(
@@ -208,6 +212,7 @@ export class PaymentsHealthService {
         `SELECT ok, error, created_at FROM payment_attempts ORDER BY created_at DESC LIMIT 20`,
       );
       this.attemptsCheckedAt = new Date().toISOString();
+      this.attemptsError = null;
       let streak = 0;
       for (const row of r.rows) {
         if (row.ok) break;
@@ -221,6 +226,7 @@ export class PaymentsHealthService {
       }
       this.failStreak = streak;
     } catch (e: any) {
+      this.attemptsError = 'source_failed';
       this.log.error(`payment attempts check failed: ${e.message}`);
       return;
     }
@@ -262,9 +268,11 @@ export class PaymentsHealthService {
         [FUNNEL_WINDOW_HOURS],
       );
       this.funnelCheckedAt = new Date().toISOString();
+      this.funnelError = null;
       this.funnelCreated = Number(r.rows[0]?.created ?? 0);
       this.funnelSucceeded = Number(r.rows[0]?.succeeded ?? 0);
     } catch (e: any) {
+      this.funnelError = 'source_failed';
       this.log.error(`payment funnel check failed: ${e.message}`);
       return;
     }
@@ -325,6 +333,7 @@ export class PaymentsHealthService {
         lastError: this.lastAttemptError,
         lastFailureAt: this.lastFailureAt,
         checkedAt: this.attemptsCheckedAt,
+        error: this.attemptsError,
       },
       funnel: {
         windowHours: FUNNEL_WINDOW_HOURS,
@@ -332,6 +341,7 @@ export class PaymentsHealthService {
         succeeded: this.funnelSucceeded,
         healthy: this.funnelHealthy,
         checkedAt: this.funnelCheckedAt,
+        error: this.funnelError,
       },
     };
   }

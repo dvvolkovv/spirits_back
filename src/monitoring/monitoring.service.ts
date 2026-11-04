@@ -63,6 +63,7 @@ export interface Neo4jJvmOverview {
   gcTimeSecTotal: number | null;
   nodes: number | null;          // count(*) MATCH (n) — from Cypher
   relationships: number | null;  // count(*) MATCH ()-[r]->()
+  error: string | null;          // source_failed, если Cypher не прочитан
 }
 
 export interface NginxOverview {
@@ -278,17 +279,20 @@ export class MonitoringService {
     // Counts from Cypher (one query per overview call; only ~1ms for this size graph)
     let nodes: number | null = null;
     let rels: number | null = null;
+    let neo4jError: string | null = null;
     if (this.neo4j) {
       try {
         const r1 = await this.neo4j.readRows('MATCH (n) RETURN count(n) AS c');
         nodes = typeof r1[0]?.c?.toNumber === 'function' ? r1[0].c.toNumber() : Number(r1[0]?.c ?? 0);
       } catch (e: any) {
+        neo4jError = 'source_failed';
         this.log.error(`neo4j node count failed: ${e.message}`);
       }
       try {
         const r2 = await this.neo4j.readRows('MATCH ()-[r]->() RETURN count(r) AS c');
         rels = typeof r2[0]?.c?.toNumber === 'function' ? r2[0].c.toNumber() : Number(r2[0]?.c ?? 0);
       } catch (e: any) {
+        neo4jError = 'source_failed';
         this.log.error(`neo4j rel count failed: ${e.message}`);
       }
     }
@@ -306,6 +310,7 @@ export class MonitoringService {
         gcTimeSecTotal: n4G.get(i) ?? null,
         nodes,
         relationships: rels,
+        error: neo4jError,
       };
     });
 
