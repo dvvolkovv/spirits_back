@@ -349,7 +349,8 @@ export const alertBotRatePerHour = () => intEnv('ALERT_BOT_RATE_PER_HOUR', 30, 1
 export const alertBotTimeoutMs = () => intEnv('ALERT_BOT_TIMEOUT_MS', 180000, 1000, 600000);
 export const alertBotOpsPort = () => intEnv('ALERT_BOT_OPS_PORT', 3091, 1024, 65535);
 export function alertBotAllowedChat(chatId: string, chatType: string): boolean {
-  return chatType === 'private' || telegramChatIds().includes(String(chatId));
+  if (chatType === 'private') return true;
+  return (chatType === 'group' || chatType === 'supergroup') && telegramChatIds().includes(String(chatId));
 }
 ```
 

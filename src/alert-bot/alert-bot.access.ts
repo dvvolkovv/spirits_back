@@ -10,7 +10,16 @@ export class AlertBotAccess {
     const hit = this.cache.get(key);
     if (hit && hit.expires > Date.now()) return Promise.resolve(hit.value as T);
     return read().then((value) => {
-      this.cache.set(key, { value, expires: Date.now() + 60_000 });
+      const now = Date.now();
+      this.cache.set(key, { value, expires: now + 60_000 });
+      for (const [cachedKey, entry] of this.cache) {
+        if (entry.expires <= now) this.cache.delete(cachedKey);
+      }
+      while (this.cache.size > 1000) {
+        const oldest = this.cache.keys().next();
+        if (oldest.done) break;
+        this.cache.delete(oldest.value);
+      }
       return value;
     });
   }
