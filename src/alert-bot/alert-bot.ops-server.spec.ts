@@ -77,8 +77,9 @@ describe('AlertBotOpsServer stateless MCP', () => {
     expect(invalid.status).toBe(401);
     expect(await invalid.text()).toBe('');
 
-    const forbidden = await rpc('tools/list', undefined, userToken);
-    expect(forbidden.response.status).toBe(403);
+    const forbidden = await post({ jsonrpc: '2.0', id: 7, method: 'tools/list' }, userToken);
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.text()).toBe('');
     expect(isAdminUserId).toHaveBeenCalledWith('u-user');
     expect(isAdminUserId).not.toHaveBeenCalledWith('u-admin');
 
