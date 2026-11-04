@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import axios from 'axios';
 import { sendTelegramPayload, setAlertSentSink } from './telegram-alert';
 jest.mock('axios');
@@ -11,6 +12,10 @@ describe('журнал отправленных алертов', () => {
     process.env.TELEGRAM_CHAT_ID = '1,2';
     jest.resetAllMocks();
     setAlertSentSink(null);
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
   });
 
   afterAll(() => {
@@ -50,5 +55,43 @@ describe('журнал отправленных алертов', () => {
     await expect(sendTelegramPayload({ text: 'тест' })).resolves.toBeUndefined();
     await new Promise((resolve) => setImmediate(resolve));
     expect(sink).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['ok:false', { ok: false, result: { message_id: 20 } }],
+    ['message_id=null', { ok: true, result: { message_id: null } }],
+    ['пустой message_id', { ok: true, result: { message_id: '' } }],
+    ['нулевой message_id', { ok: true, result: { message_id: 0 } }],
+  ])('не вызывает приёмник для %s', async (_case, data) => {
+    process.env.TELEGRAM_CHAT_ID = '1';
+    const sink = jest.fn(async () => {});
+    setAlertSentSink(sink);
+    (axios.post as jest.Mock).mockResolvedValue({ data });
+
+    await sendTelegramPayload({ text: 'тест' });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(sink).not.toHaveBeenCalled();
+  });
+
+  it('синхронный сбой приёмника логирует без not delivered и секретного текста', async () => {
+    process.env.TELEGRAM_CHAT_ID = '1';
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => {});
+    const sink = jest.fn(() => {
+      throw new Error('SYNC-SINK-SECRET');
+    });
+    setAlertSentSink(sink);
+    (axios.post as jest.Mock).mockResolvedValue({
+      data: { ok: true, result: { message_id: 20 } },
+    });
+
+    await expect(sendTelegramPayload({ text: 'тест' })).resolves.toBeUndefined();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const warnings = warn.mock.calls.map((args) => args.join(' ')).join('\n');
+    expect(sink).toHaveBeenCalledTimes(1);
+    expect(warnings).toContain('alert journal failed');
+    expect(warnings).not.toContain('not delivered');
+    expect(warnings).not.toContain('SYNC-SINK-SECRET');
   });
 });
