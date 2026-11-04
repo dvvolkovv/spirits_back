@@ -68,7 +68,10 @@ describe('разделы технического здоровья для бот
     );
   });
 
-  afterEach(() => jest.restoreAllMocks());
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
 
   it('перечисляет все 16 разделов', () => {
     expect(HEALTH_SECTIONS).toHaveLength(16);
@@ -113,4 +116,16 @@ describe('разделы технического здоровья для бот
     await expect(service.getSection('sms')).resolves.toEqual({ error: 'source_failed' });
     await expect(service.getSection('tg-bot')).resolves.toEqual({ status: 'healthy' });
   });
+
+  it('явный сбой источника попадает в badSections', async () => {
+    sources[2].getOverview.mockRejectedValue(new Error('СЕКРЕТ-ИЗ-ОТВЕТА'));
+    await expect(service.badSections()).resolves.toContain('sms');
+  });
+
+  it('бесконечный источник завершается source_failed по дедлайну', async () => {
+    sources[2].getOverview.mockImplementation(() => new Promise(() => {}));
+    const startedAt = Date.now();
+    await expect(service.getSection('sms')).resolves.toEqual({ error: 'source_failed' });
+    expect(Date.now() - startedAt).toBeLessThan(4000);
+  }, 4500);
 });
