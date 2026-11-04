@@ -73,7 +73,24 @@ maybe('хранилище бота алертов против PostgreSQL', () =
       UPDATE alert_messages SET created_at = now() - interval '31 days';
       UPDATE alert_bot_turns SET created_at = now() - interval '91 days';
       UPDATE alert_bot_ticket_drafts SET created_at = now() - interval '31 days';`);
-    await store.cleanup();
+    const pg = (store as any).pg;
+    const originalQuery = pg.query;
+    const cleanupQueries: Array<{ text: string; params?: any[] }> = [];
+    pg.query = (text: string, params?: any[]) => {
+      cleanupQueries.push({ text, params });
+      return pool.query(text, params);
+    };
+    try {
+      await store.cleanup();
+    } finally {
+      pg.query = originalQuery;
+    }
+    expect(cleanupQueries).toEqual([
+      { text: 'DELETE FROM alert_bot_updates WHERE created_at < now() - $1::interval', params: ['7 days'] },
+      { text: 'DELETE FROM alert_messages WHERE created_at < now() - $1::interval', params: ['30 days'] },
+      { text: 'DELETE FROM alert_bot_ticket_drafts WHERE created_at < now() - $1::interval', params: ['30 days'] },
+      { text: 'DELETE FROM alert_bot_turns WHERE created_at < now() - $1::interval', params: ['90 days'] },
+    ]);
     expect((await pool.query('SELECT count(*)::int AS n FROM alert_bot_updates')).rows[0].n).toBe(0);
     expect((await pool.query('SELECT count(*)::int AS n FROM alert_messages')).rows[0].n).toBe(0);
     expect((await pool.query('SELECT count(*)::int AS n FROM alert_bot_turns')).rows[0].n).toBe(0);
