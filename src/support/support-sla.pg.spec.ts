@@ -1,3 +1,9 @@
+jest.mock('@napi-rs/canvas', () => ({
+  createCanvas: jest.fn(),
+  loadImage: jest.fn(),
+  GlobalFonts: { register: jest.fn() },
+}));
+
 import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
