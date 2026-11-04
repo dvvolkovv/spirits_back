@@ -1655,7 +1655,7 @@ it('одновременно идёт один ход, два ждут, четв
   expect(telegram.sendMessage).toHaveBeenCalledWith(expect.any(String), expect.stringContaining('Занят'), expect.anything());
 });
 it('лимит считается по журналу и переживает рестарт', async () => {
-  store.countRecentTurns.mockResolvedValue(30);
+  store.tryCreateTurn.mockResolvedValue(null);
   await turns.enqueue(input); await turns.idle();
   expect(ai.answer).not.toHaveBeenCalled();
   expect(store.finishTurn).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ status: 'rate_limited' }));
@@ -1677,12 +1677,12 @@ Commit: `test(alert-bot): очередь и устойчивость хода �
 
 Алгоритм:
 1. Если `pending >= 3`: создать/завершить turn со `status:'busy'` и отправить «Занят, спросите через минуту». Не ставить в очередь.
-2. Если `countRecentTurns(adminUserId) >= alertBotRatePerHour()`: `status:'rate_limited'`, ответ «Лимит вопросов в час исчерпан».
-3. Создать turn `in_progress`, отправить «🔎 Смотрю…», сохранить `answer_message_id`, добавить выполнение в цепочку чата.
+2. Атомарно допустить ход через `const turnId = await store.tryCreateTurn(input, alertBotRatePerHour())`. Если получен `null`: создать отдельный turn через `createTurn`, сразу завершить его со `status:'rate_limited'` и отправить «Лимит вопросов в час исчерпан». Не использовать отдельную пару `countRecentTurns` + `createTurn` для допуска.
+3. Для допущенного `turnId` отправить «🔎 Смотрю…», сохранить `answer_message_id`, добавить выполнение в цепочку чата.
 4. Внутри цепочки `beginStream()` и `try/finally endStream()`; при `parentTurnId` получить `store.turnChain(parentTurnId,3)`, иначе только для лички `recentTurns(chatId,3,30)`; вызвать `ai.answer({...input,history})`; отправить `sendChunks` с кнопками «Открыть #…» не более трёх; `finishTurn(ok)`.
 5. Кнопки строить только по `#([a-f0-9]{8})` из ответа и по тикетам, найденным через `SupportService.findTicketByPrefix`; URL `${ADMIN_ORIGIN}/admin?tab=support&ticket=${ticket.id}`.
 6. Ошибка `kind==='timeout'` → `timeout`; остальные ошибки модели → `model_down`; текст `Модель недоступна: ${kind || 'other'}.`, затем `status.summary()`. Неожиданная ошибка отправки/БД → `error`, generic «Не получилось ответить, попробуйте ещё раз». Логировать только turn id/status/error kind.
-7. `finishTurn` вызывать ровно один раз; `pending` уменьшать в `finally`.
+7. `finishTurn(turnId, result): Promise<boolean>` вызывать ровно один раз; `false` означает, что ход уже не `in_progress` (например, прерван рестартом), и его состояние не перезаписано; `pending` уменьшать в `finally`.
 
 - [ ] **Step 3: написать падающие тесты маршрутизации**
 

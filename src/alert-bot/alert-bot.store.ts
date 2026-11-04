@@ -164,11 +164,64 @@ export class AlertBotStore {
     return r.rows[0].id;
   }
 
+  async tryCreateTurn(input: TurnInput, maxPerHour: number): Promise<string | null> {
+    const client = await this.pg.getClient();
+    let transactionOpen = false;
+    let destroyClient = false;
+    try {
+      await client.query('BEGIN');
+      transactionOpen = true;
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`alert-bot:${input.adminUserId}`]);
+      const count = await client.query(
+        `SELECT count(*)::int AS n FROM alert_bot_turns
+         WHERE linkeon_user_id = $1 AND created_at >= now() - interval '1 hour'
+           AND status IN ('in_progress', 'ok', 'model_down', 'timeout', 'error', 'interrupted')`,
+        [input.adminUserId],
+      );
+      if (count.rows[0].n >= maxPerHour) {
+        await client.query('ROLLBACK');
+        transactionOpen = false;
+        return null;
+      }
+      const r = await client.query(
+        `INSERT INTO alert_bot_turns
+           (update_id, chat_id, tg_user_id, linkeon_user_id, question_message_id,
+            parent_turn_id, question, private_chat, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'in_progress')
+         RETURNING id`,
+        [
+          input.updateId,
+          input.chatId,
+          input.tgUserId,
+          input.adminUserId,
+          input.questionMessageId,
+          input.parentTurnId ?? null,
+          input.question,
+          input.privateChat,
+        ],
+      );
+      await client.query('COMMIT');
+      transactionOpen = false;
+      return r.rows[0].id;
+    } catch (error) {
+      if (transactionOpen) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          destroyClient = true;
+        }
+      }
+      throw error;
+    } finally {
+      client.release(destroyClient);
+    }
+  }
+
   async attachAnswerMessage(turnId: string, messageId: number): Promise<void> {
     await this.pg.query('UPDATE alert_bot_turns SET answer_message_id = $2 WHERE id = $1', [turnId, messageId]);
   }
 
-  async finishTurn(turnId: string, result: FinishTurnResult): Promise<void> {
+  async finishTurn(turnId: string, result: FinishTurnResult): Promise<boolean> {
     const fields: Array<[string, unknown]> = [['status', result.status]];
     if (result.answer !== undefined) fields.push(['answer', result.answer]);
     if (result.tools !== undefined) fields.push(['tools', JSON.stringify(result.tools)]);
@@ -178,12 +231,13 @@ export class AlertBotStore {
     const params = fields.map(([, value]) => value);
     params.push(turnId);
     const assignments = fields.map(([column], index) => `${column} = $${index + 1}`);
-    await this.pg.query(
+    const r = await this.pg.query(
       `UPDATE alert_bot_turns
        SET ${assignments.join(', ')}, finished_at = now()
-       WHERE id = $${params.length}`,
+       WHERE id = $${params.length} AND status = 'in_progress'`,
       params,
     );
+    return r.rowCount === 1;
   }
 
   async findTurnByAnswer(chatId: string, answerMessageId: number): Promise<AlertBotTurn | null> {
