@@ -1,3 +1,9 @@
+jest.mock('@napi-rs/canvas', () => ({
+  createCanvas: jest.fn(),
+  loadImage: jest.fn(),
+  GlobalFonts: { register: jest.fn() },
+}));
+
 import { AlertBotStatusService } from './alert-bot.status';
 
 describe('сводка /status без модели', () => {
