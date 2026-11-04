@@ -228,7 +228,7 @@ export class ModelsRegistryService implements OnModuleInit {
       return out;
     } catch (e: any) {
       this.log.warn(`models registry query failed: ${e.message}`);
-      return new Map();
+      throw e;
     }
   }
 }

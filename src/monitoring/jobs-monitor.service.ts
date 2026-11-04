@@ -110,7 +110,7 @@ export class JobsMonitorService {
       };
     } catch (e: any) {
       this.log.warn(`videoJobs failed: ${e.message}`);
-      return { status_counts: {}, pending_total: 0, oldest_pending_age_min: null, stuck: false, threshold_min: VIDEO_STUCK_MIN };
+      throw e;
     }
   }
 
@@ -141,7 +141,7 @@ export class JobsMonitorService {
       };
     } catch (e: any) {
       this.log.warn(`tokenTasks failed: ${e.message}`);
-      return { status_counts: {}, pending_total: 0, oldest_pending_age_sec: null, stuck: false, threshold_sec: TOKEN_STUCK_SEC };
+      throw e;
     }
   }
 
@@ -163,7 +163,10 @@ export class JobsMonitorService {
         rec_count: row.rec_count,
         created_at: new Date(row.created_at).toISOString(),
       }));
-    } catch { return []; }
+    } catch (e: any) {
+      this.log.warn(`vpmRecent failed: ${e.message}`);
+      throw e;
+    }
   }
 
   private async compaction(): Promise<CompactionStat> {
@@ -181,7 +184,10 @@ export class JobsMonitorService {
         `SELECT MAX(updated_at) AS t FROM ai_profiles_consolidated`,
       );
       last_run_at = last.rows[0]?.t ? new Date(last.rows[0].t).toISOString() : null;
-    } catch { /* silent */ }
+    } catch (e: any) {
+      this.log.warn(`compaction failed: ${e.message}`);
+      throw e;
+    }
 
     const now = new Date();
     const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 4, 0, 0));

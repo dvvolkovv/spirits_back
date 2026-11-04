@@ -60,7 +60,7 @@ function isSectionHealthy(section: HealthSection, value: unknown): boolean {
 
   // Эти источники необязательны; их собственные getOverview явно помечают configured:false.
   if (value.configured === false
-    && ['nanobanana', 'tg-bot', 'neo4j-dr', 'minio-dr'].includes(section)) return true;
+    && ['nanobanana', 'neo4j-dr', 'minio-dr'].includes(section)) return true;
 
   switch (section) {
     case 'overview':
@@ -79,19 +79,26 @@ function isSectionHealthy(section: HealthSection, value: unknown): boolean {
     case 'nanobanana':
       return value.configured === true && value.healthy === true;
     case 'tg-bot':
-      return value.configured === true && value.webhook?.healthy === true
+      return (value.configured === false
+          || (value.configured === true && value.webhook?.healthy === true))
         && value.unanswered?.stuckChats === 0;
-    case 'payments':
-      if (value.shop?.configured === false) return true;
-      return value.shop?.configured === true && value.shop?.healthy === true
+    case 'payments': {
+      const shopKnown = value.shop?.configured === false
+        || (value.shop?.configured === true && value.shop?.healthy === true);
+      return shopKnown
         && typeof value.attempts?.failStreak === 'number'
         && typeof value.attempts?.threshold === 'number'
         && value.attempts.failStreak < value.attempts.threshold
-        && value.funnel?.healthy === true;
+        && isRecord(value.funnel) && value.funnel.healthy !== false;
+    }
     case 'quality':
       return Array.isArray(value.alerts) && value.alerts.length === 0;
-    case 'claude':
-      return value.usage?.llmStatus === 'ok' && value.usage?.apiKeyValid !== false;
+    case 'claude': {
+      const apiKeyOk = value.configured?.apiKey === true
+        ? value.usage?.apiKeyValid === true
+        : value.configured?.apiKey === false && value.usage?.apiKeyValid !== false;
+      return value.usage?.llmStatus === 'ok' && apiKeyOk;
+    }
     case 'geo':
       return value.region_down === false;
     case 'backups':
@@ -110,7 +117,8 @@ function isSectionHealthy(section: HealthSection, value: unknown): boolean {
       return value.configured === true && value.statusPresent === true
         && value.healthy === true && Array.isArray(value.errors) && value.errors.length === 0;
     case 'synthetic':
-      return Array.isArray(value.scenarios) && value.scenarios.length > 0
+      return value.stale === false
+        && Array.isArray(value.scenarios) && value.scenarios.length > 0
         && value.scenarios.every((scenario: any) => isRecord(scenario) && scenario.latestSuccess === true);
     default:
       return false;

@@ -68,7 +68,17 @@ export interface ScenarioStatus {
 
 export interface SyntheticOverview {
   generatedAt: string;
+  stale: boolean;
   scenarios: ScenarioStatus[];
+}
+
+function runnerFreshness(scenarios: ScenarioStatus[], now: Date) {
+  const external = scenarios.filter((s) => RUNNER_SCENARIOS.includes(s.scenario));
+  const newest = external
+    .map((s) => (s.latestTs ? new Date(s.latestTs).getTime() : 0))
+    .reduce((a, b) => Math.max(a, b), 0);
+  const ageMin = newest ? (now.getTime() - newest) / 60000 : Infinity;
+  return { ageMin, stale: external.length > 0 && ageMin > STALE_MINUTES };
 }
 
 @Injectable()
@@ -119,12 +129,9 @@ export class SyntheticService implements OnModuleInit {
     // раннер не шлёт данные, мониторинг ослеп.
     // Внешних результатов нет вообще (свежая среда, раннер ещё не заводили) —
     // молчим, как и при полностью пустой таблице.
-    const external = overview.scenarios.filter((s) => RUNNER_SCENARIOS.includes(s.scenario));
-    const newest = external
-      .map((s) => (s.latestTs ? new Date(s.latestTs).getTime() : 0))
-      .reduce((a, b) => Math.max(a, b), 0);
-    const ageMin = newest ? (now.getTime() - newest) / 60000 : Infinity;
-    if (external.length && ageMin > STALE_MINUTES) {
+    const freshness = runnerFreshness(overview.scenarios, now);
+    const ageMin = freshness.ageMin;
+    if (freshness.stale) {
       const staleCooled = !this.lastStaleAlertAt || (now.getTime() - this.lastStaleAlertAt.getTime()) >= REALERT_HOURS * 3600_000;
       if (staleCooled) {
         await send(`<b>🟠 Синтетический мониторинг «ослеп»</b>\nНет результатов уже ${Math.round(ageMin)} мин (порог ${STALE_MINUTES}). Раннер на node-3, возможно, не работает — продуктовые сбои сейчас можно не заметить.`);
@@ -230,7 +237,7 @@ export class SyntheticService implements OnModuleInit {
   }
 
   async getOverview(): Promise<SyntheticOverview> {
-    if (!this.pg) return { generatedAt: new Date().toISOString(), scenarios: [] };
+    if (!this.pg) return { generatedAt: new Date().toISOString(), stale: false, scenarios: [] };
 
     // For each scenario: latest run row + 24h aggregates.
     const r = await this.pg.query(
@@ -274,6 +281,11 @@ export class SyntheticService implements OnModuleInit {
         successRate24hPct: runs > 0 ? (succ / runs) * 100 : null,
       };
     });
-    return { generatedAt: new Date().toISOString(), scenarios };
+    const now = new Date();
+    return {
+      generatedAt: now.toISOString(),
+      stale: runnerFreshness(scenarios, now).stale,
+      scenarios,
+    };
   }
 }
