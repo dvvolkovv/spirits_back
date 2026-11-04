@@ -1366,6 +1366,8 @@ Commit: `feat(alert-bot): stateless MCP только на 127.0.0.1`; прогн
 **Files:**
 - Create: `src/alert-bot/alert-bot.tools.ts`
 - Test: `src/alert-bot/alert-bot.tools.spec.ts`
+- Modify: `src/common/services/pg.service.ts` и сигнатуры вызываемых I/O-сервисов — только для проброса `AbortSignal`
+- Test: `src/common/services/pg.cancellation.spec.ts`
 
 - [ ] **Step 1: написать падающие тесты**
 
@@ -1385,6 +1387,21 @@ it('каждый из пяти ответов проходит маску', asyn
     expect(out).not.toContain('a@example.com');
     expect(out).not.toContain('11111111-1111-4111-8111-111111111111');
   }
+});
+
+it('AbortSignal доходит до HTTP-I/O и отменяет его', async () => {
+  const controller = new AbortController();
+  let received: AbortSignal | undefined;
+  logs.query.mockImplementation((_input, signal) => {
+    received = signal;
+    return new Promise((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+    });
+  });
+  const pending = tools.execute('logs', { query: 'долгий запрос' }, ctx, controller.signal);
+  controller.abort();
+  await expect(pending).resolves.toBe('{"error":"source_failed"}');
+  expect(received).toBe(controller.signal);
 });
 
 it('alerts ограничивает окно и переживает падение Prometheus', async () => {
@@ -1445,7 +1462,23 @@ it('карточка тикета содержит только последни
 });
 ```
 
-Commit: `test(alert-bot): пять read-only инструментов — красный`; проверить RED.
+В `pg.cancellation.spec.ts` отдельно доказать отмену активного node-postgres-запроса (на ноде установлен `pg 8.23.1`, runtime `Client.cancel(client, query)` есть, хотя в `@types/pg` он не объявлен):
+
+```ts
+it('abort вызывает Client.cancel для того же Query и освобождает клиента', async () => {
+  const controller = new AbortController();
+  const client = poolClientStub();
+  client.cancel.mockImplementation((_client, query) => query.callback(new Error('cancelled')));
+  const pending = pg.query('SELECT pg_sleep(60)', [], controller.signal);
+  await Promise.resolve();
+  controller.abort();
+  await expect(pending).rejects.toThrow();
+  expect(client.cancel).toHaveBeenCalledWith(client, expect.any(Query));
+  expect(client.release).toHaveBeenCalledTimes(1);
+});
+```
+
+Commit: `test(alert-bot): пять read-only инструментов и отмена I/O — красный`; проверить RED.
 
 - [ ] **Step 2: реализовать фасад и контракты**
 
@@ -1466,14 +1499,14 @@ export class AlertBotTools implements OpsToolHandler {
 
   definitions(): Array<Record<string, unknown>> { return OPS_DEFINITIONS; }
 
-  async execute(name: string, args: Record<string, unknown>, _ctx: OpsContext): Promise<string> {
+  async execute(name: string, args: Record<string, unknown>, _ctx: OpsContext, signal?: AbortSignal): Promise<string> {
     try {
       switch (name) {
-        case 'alerts': return toolText(await this.alerts(args));
-        case 'health': return toolText(await this.healthTool(args));
-        case 'logs': return toolText(await this.logs(args));
-        case 'stats': return toolText(await this.stats(args));
-        case 'tickets': return toolText(await this.tickets(args));
+        case 'alerts': return toolText(await this.alerts(args, signal));
+        case 'health': return toolText(await this.healthTool(args, signal));
+        case 'logs': return toolText(await this.logs(args, signal));
+        case 'stats': return toolText(await this.stats(args, signal));
+        case 'tickets': return toolText(await this.tickets(args, signal));
         default: return JSON.stringify({ error: 'unknown_tool' });
       }
     } catch {
@@ -1482,6 +1515,12 @@ export class AlertBotTools implements OpsToolHandler {
   }
 }
 ```
+
+**Отмена обязательна во всех слоях, а не только в сигнатуре.** Все helpers выше принимают `signal?: AbortSignal` и передают его последним необязательным аргументом в каждый вызов `monitoring`, `logsService`, `health`, `store`, `economy`, `funnel`, `summaryService`, `admin` и `support`, который выполняет I/O. Далее сигнал пробрасывается до конкретного клиента: в `fetch` — в опцию `signal`, в axios — в `config.signal`. Нельзя оставлять четвёртый параметр неиспользуемым или ограничиваться `Promise.race` без отмены нижнего запроса. Существующие mock-assertions дополнить новым аргументом (`undefined`, если signal не передан), чтобы они проверяли фактическую арность вызова.
+
+Если у HTTP/pg-клиента уже есть собственный обязательный дедлайн, его не убирать и не продлевать: связанный контроллер/таймер обязан срабатывать по `min(остаток внешнего дедлайна, собственный дедлайн)`, а после завершения снимать listener и таймер. Добавить fake-timers regression на оба порядка: более ранний внешний abort и более ранний собственный timeout.
+
+Для `PgService.query(text, params?, signal?)` использовать отдельный `PoolClient` и экземпляр `pg.Query`, чтобы иметь именно тот query-handle, который передаётся в `client.query(query)`. На `abort` вызвать runtime-метод `client.cancel(client, query)` через узкий локальный type assertion (в `@types/pg` метода нет), затем в `finally` снять abort-listener и освободить клиента. Не имитировать отмену только отбрасыванием результата. Уже установленный `query_timeout` сохранить; внешний signal должен отменять запрос раньше, если его дедлайн короче.
 
 `OPS_DEFINITIONS` — пять объектов с `name`, `description`, `inputSchema`:
 - `alerts`: необязательный integer `hours` 1–72;
@@ -1494,16 +1533,16 @@ export class AlertBotTools implements OpsToolHandler {
 
 - [ ] **Step 3: реализовать alerts и health**
 
-`alerts(args)`:
+`alerts(args, signal)`:
 1. `hours=intArg(args.hours,24,1,72)`.
 2. Через `Promise.allSettled` запросить:
-   - `monitoring.query('ALERTS{alertstate="firing"}')`;
-   - `monitoring.query('ALERTS_FOR_STATE{alertstate="firing"}')`;
-   - `monitoring.query(\`max_over_time(ALERTS{alertstate="firing"}[${hours}h])\`)`;
-   - `store.recentAlerts(hours,50)`.
+   - `monitoring.query('ALERTS{alertstate="firing"}', signal)`;
+   - `monitoring.query('ALERTS_FOR_STATE{alertstate="firing"}', signal)`;
+   - `monitoring.query(\`max_over_time(ALERTS{alertstate="firing"}[${hours}h])\`, signal)`;
+   - `store.recentAlerts(hours,50,signal)`.
 3. Вернуть `{firing:[{labels:metric,since}],history:[{labels:metric}],journal:rows}`; rejected Prometheus-блоки заменить `{error:'source_failed'}`. Не включать raw error.
 
-`healthTool(args)`: если `args.section` не входит в `HEALTH_SECTIONS`, `{error:'invalid_params'}`; иначе `{section, data: await health.getSection(section)}`.
+`healthTool(args, signal)`: если `args.section` не входит в `HEALTH_SECTIONS`, `{error:'invalid_params'}`; иначе `{section, data: await health.getSection(section, signal)}`.
 
 - [ ] **Step 4: реализовать logs с фиксированным prod selector**
 
@@ -1517,7 +1556,7 @@ const escaped = q.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g,
 const selector = `{job="linkeon-api",filename=~"/pm2_logs/linkeon-api-.*[.]log"${level ? `,level="${level}"` : ''}}`;
 const to = Date.now();
 const from = to - minutes * 60_000;
-const result = await this.logsService.query({ query: `${selector} |= "${escaped}"`, from: String(from * 1e6), to: String(to * 1e6), limit });
+const result = await this.logsService.query({ query: `${selector} |= "${escaped}"`, from: String(from * 1e6), to: String(to * 1e6), limit }, signal);
 return { lines: result.lines.map((l) => ({ ts: l.ts, filename: l.stream.filename, line: clip(maskText(l.line), 300) })) };
 ```
 
@@ -1525,20 +1564,20 @@ return { lines: result.lines.map((l) => ({ ts: l.ts, filename: l.stream.filename
 
 - [ ] **Step 5: реализовать stats и tickets**
 
-`stats(args)`:
-- `economy` → `economy.getOverview(validWindow(args.window))`, где окно по умолчанию `30d`;
-- `funnel` → `to=now`, `from=to-days`, `funnel.getFunnel(fromIso,toIso,sourceOrNull)`;
-- `summary` → `summaryService.getOverview()`;
-- `payments` → `admin.getPaymentsStats({days,includeTest:false})`;
-- `tokens` → `admin.getTokensSpendStats({days,bucket: args.bucket === 'hour' ? 'hour' : 'day'})`;
-- `active` → `admin.getActiveUsersStats({days,bucket: args.bucket === 'week' ? 'week' : 'day'})`;
+`stats(args, signal)`:
+- `economy` → `economy.getOverview(validWindow(args.window), signal)`, где окно по умолчанию `30d`;
+- `funnel` → `to=now`, `from=to-days`, `funnel.getFunnel(fromIso,toIso,sourceOrNull,signal)`;
+- `summary` → `summaryService.getOverview(signal)`;
+- `payments` → `admin.getPaymentsStats({days,includeTest:false}, signal)`;
+- `tokens` → `admin.getTokensSpendStats({days,bucket: args.bucket === 'hour' ? 'hour' : 'day'}, signal)`;
+- `active` → `admin.getActiveUsersStats({days,bucket: args.bucket === 'week' ? 'week' : 'day'}, signal)`;
 - остальное → `{error:'invalid_params'}`.
 
-`tickets(args)`:
-- карточка: строго 8 hex после `#`; `findTicketByPrefix`, затем `adminGetTicket(id)`; вернуть `ticket:#prefix`, status/urgency/reason/SLA, `user:userLabel(ticket.user_id,name)`, `messages:last10.map({senderType,content:clip(maskText(content),500),createdAt})`; events и sender_id не отдавать.
-- список: `adminListTickets({limit:200})`, при `active !== false` отфильтровать `resolved|closed`, взять `limit=intArg(...,20,1,20)`; каждый элемент `{ticket,status,urgency,ageMinutes,reason:clip(maskText(escalationReason),200),user:userLabel(userId,userName),assigned:assignedTo?userLabel(assignedTo,assignedName):null,sla:{dueAt,firstReplyAt,overdue}}`. `overdue = !firstOwnerReplyAt && dueAt && new Date(dueAt).getTime() < Date.now()`.
+`tickets(args, signal)`:
+- карточка: строго 8 hex после `#`; `findTicketByPrefix(prefix, signal)`, затем `adminGetTicket(id, signal)`; вернуть `ticket:#prefix`, status/urgency/reason/SLA, `user:userLabel(ticket.user_id,name)`, `messages:last10.map({senderType,content:clip(maskText(content),500),createdAt})`; events и sender_id не отдавать.
+- список: `adminListTickets({limit:200}, signal)`, при `active !== false` отфильтровать `resolved|closed`, взять `limit=intArg(...,20,1,20)`; каждый элемент `{ticket,status,urgency,ageMinutes,reason:clip(maskText(escalationReason),200),user:userLabel(userId,userName),assigned:assignedTo?userLabel(assignedTo,assignedName):null,sla:{dueAt,firstReplyAt,overdue}}`. `overdue = !firstOwnerReplyAt && dueAt && new Date(dueAt).getTime() < Date.now()`.
 
-Commit: `feat(alert-bot): пять маскированных read-only инструментов`; прогнать tools/health/status specs и tsc. Expected: PASS, `TSC_OK`; ни один тест не видит полный телефон, почту, UUID пользователя или `/home/dv/` в selector.
+Commit: `feat(alert-bot): пять маскированных read-only инструментов с отменой I/O`; прогнать tools/health/status/pg.cancellation specs и tsc. Expected: PASS, `TSC_OK`; abort доходит до HTTP и `Client.cancel`; ни один тест не видит полный телефон, почту, UUID пользователя или `/home/dv/` в selector.
 
 ### Task 10: вызов Claude только с пятью ops-инструментами
 

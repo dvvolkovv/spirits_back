@@ -7,7 +7,7 @@ export interface TurnInput {
 export interface OpsContext { adminUserId: string; chatId: string; }
 export interface OpsToolHandler {
   definitions(): Array<Record<string, unknown>>;
-  execute(name: string, args: Record<string, unknown>, ctx: OpsContext): Promise<string>;
+  execute(name: string, args: Record<string, unknown>, ctx: OpsContext, signal?: AbortSignal): Promise<string>;
 }
 export interface TgMessage {
   message_id: number; text?: string; caption?: string;

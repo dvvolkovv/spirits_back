@@ -16,11 +16,16 @@ export interface AlertBotOpsServerOptions {
   shutdownTimeoutMs?: number;
 }
 
+interface ActiveTool {
+  controller: AbortController;
+  cancel: () => void;
+}
+
 export class AlertBotOpsServer {
   private server: http.Server | null = null;
   private readonly toolCalls = new Map<string, string[]>();
   private readonly sockets = new Set<Socket>();
-  private readonly toolCancels = new Set<() => void>();
+  private readonly activeTools = new Set<ActiveTool>();
   private readonly toolTimeoutMs: number;
   private readonly shutdownTimeoutMs: number;
 
@@ -64,7 +69,7 @@ export class AlertBotOpsServer {
     const server = this.server;
     if (!server) return;
     this.server = null;
-    for (const cancel of [...this.toolCancels]) cancel();
+    for (const active of [...this.activeTools]) active.cancel();
     await new Promise<void>((resolve) => {
       let settled = false;
       const finish = () => {
@@ -191,7 +196,7 @@ export class AlertBotOpsServer {
 
         let text: string;
         try {
-          text = await this.executeWithDeadline(name, args, identity);
+          text = await this.executeWithDeadline(name, args, identity, req, res);
         } catch {
           text = JSON.stringify({ error: 'tool_failed' });
         }
@@ -213,23 +218,41 @@ export class AlertBotOpsServer {
     }
   }
 
-  private async executeWithDeadline(name: string, args: Record<string, unknown>, identity: OpsContext): Promise<string> {
+  private async executeWithDeadline(
+    name: string,
+    args: Record<string, unknown>,
+    identity: OpsContext,
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): Promise<string> {
+    const controller = new AbortController();
     let timer: NodeJS.Timeout;
-    let cancel: () => void = () => undefined;
-    const deadline = new Promise<string>((resolve) => {
-      cancel = () => {
-        clearTimeout(timer);
-        this.toolCancels.delete(cancel);
-        resolve(TOOL_FAILED);
-      };
-      this.toolCancels.add(cancel);
-      timer = setTimeout(cancel, this.toolTimeoutMs);
-    });
+    let resolveDeadline: (text: string) => void;
+    let cancelled = false;
+    const deadline = new Promise<string>((resolve) => { resolveDeadline = resolve; });
+    const active: ActiveTool = {
+      controller,
+      cancel: () => {
+        if (cancelled) return;
+        cancelled = true;
+        controller.abort();
+        resolveDeadline(TOOL_FAILED);
+      },
+    };
+    this.activeTools.add(active);
+    req.once('aborted', active.cancel);
+    res.once('close', active.cancel);
+    timer = setTimeout(active.cancel, this.toolTimeoutMs);
     try {
-      return await Promise.race([this.tools.execute(name, args, identity), deadline]);
+      return await Promise.race([
+        this.tools.execute(name, args, identity, controller.signal),
+        deadline,
+      ]);
     } finally {
       clearTimeout(timer);
-      this.toolCancels.delete(cancel);
+      this.activeTools.delete(active);
+      req.off('aborted', active.cancel);
+      res.off('close', active.cancel);
     }
   }
 
