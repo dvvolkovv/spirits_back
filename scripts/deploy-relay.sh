@@ -186,7 +186,7 @@ PY
 }
 
 health_and_release() {
-  for attempt in $(seq 1 20); do
+  for attempt in $(seq 1 120); do
     if curl -fsS --max-time 5 http://127.0.0.1:3033/health; then
       rm -f -- "$DRAIN_FILE"
       GATE_CREATED=0

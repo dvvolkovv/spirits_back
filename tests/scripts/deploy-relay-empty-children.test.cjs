@@ -13,3 +13,7 @@ test('drain: пустой список дочерних процессов не 
   const bash = 'set -euo pipefail; PID=$1; CHILDREN=$(ps --ppid "$PID" -o pid= || true); [[ -z "$CHILDREN" ]]; echo drain-ok';
   assert.equal(execFileSync('bash', ['-c', bash, 'bash', '99999999'], { encoding: 'utf8' }).trim(), 'drain-ok');
 });
+
+test('health-wait: холодному восстановлению сессий даётся 120 секунд', () => {
+  assert.ok(source.includes('health_and_release() {\n  for attempt in $(seq 1 120); do'));
+});
