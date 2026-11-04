@@ -10,7 +10,18 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { randomUUID } from "crypto";
-import { sessionFsKey, turnFsKey, legacyTurnFsKey, uploadFileName, fallbackFileName, sessionOutputDir } from "./paths.mjs";
+import {
+  sessionFsKey,
+  turnFsKey,
+  legacyTurnFsKey,
+  uploadFileName,
+  fallbackFileName,
+  sessionOutputDir,
+  ensureSessionDirs,
+  ensureListingGuard,
+  AGENT_SCRATCH_ROOT,
+  AGENT_MCP_DIR,
+} from "./paths.mjs";
 
 const DIR = fs.mkdtempSync(path.join(os.tmpdir(), "paths-test-"));
 process.on("exit", () => fs.rmSync(DIR, { recursive: true, force: true }));
@@ -168,4 +179,94 @@ test("legacyTurnFsKey: нет или кривой fs_key — отдельной 
 
 test("legacyTurnFsKey: sessionId без пригодного ключа ('.', '..', пустой) — null", () => {
   for (const sid of [".", "..", ""]) assert.equal(legacyTurnFsKey(FS_KEY, sid), null, sid);
+});
+
+test("константы песочницы реэкспортируются из paths.mjs", () => {
+  assert.equal(AGENT_SCRATCH_ROOT, "/tmp/agent-scratch");
+  assert.equal(AGENT_MCP_DIR, "/tmp/agent-mcp");
+});
+
+test("ensureSessionDirs: создаёт scratch и output с 0700, повторный вызов не падает", async () => {
+  const root = fs.mkdtempSync(path.join(DIR, "session-dirs-"));
+  const scratchRoot = path.join(root, "scratch");
+  const outputs = path.join(root, "output");
+  const scratch = path.join(scratchRoot, FS_KEY);
+  const output = path.join(outputs, FS_KEY);
+
+  // Оба корня переданы явно: настоящие /tmp/agent-* тест не создаёт и не chmod'ит.
+  assert.equal(await ensureSessionDirs(FS_KEY, { scratchRoot, outputs }), scratch);
+  for (const dir of [scratch, output]) {
+    const stat = fs.statSync(dir);
+    assert.ok(stat.isDirectory(), dir);
+    assert.equal(stat.mode & 0o777, 0o700, dir);
+  }
+
+  fs.chmodSync(scratch, 0o755);
+  fs.chmodSync(output, 0o755);
+  assert.equal(await ensureSessionDirs(FS_KEY, { scratchRoot, outputs }), scratch);
+  for (const dir of [scratch, output]) {
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700, dir);
+  }
+});
+
+test("ensureListingGuard: закрывает листинг трёх корней и не ломает собственный scratch", async (t) => {
+  const root = fs.mkdtempSync(path.join(DIR, "listing-guard-"));
+  const outputs = path.join(root, "output");
+  const uploads = path.join(root, "uploads");
+  const scratchRoot = path.join(root, "scratch");
+  const dirs = [outputs, uploads, scratchRoot];
+  const scratch = path.join(scratchRoot, FS_KEY);
+  const ownFile = path.join(scratch, "note.txt");
+  fs.mkdirSync(scratch, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(ownFile, "before");
+  t.after(() => {
+    // rmSync при выходе должен прочитать содержимое временных каталогов.
+    for (const dir of dirs) if (fs.existsSync(dir)) fs.chmodSync(dir, 0o700);
+  });
+
+  await ensureListingGuard({ outputs, uploads, scratchRoot });
+  for (const dir of dirs) {
+    const stat = fs.statSync(dir);
+    assert.ok(stat.isDirectory(), dir);
+    assert.equal(stat.mode & 0o777, 0o311, dir);
+  }
+
+  // Повторный вызов обязан поправить права именно переданных каталогов,
+  // а не только без ошибки отработать на уже существующих путях.
+  fs.chmodSync(outputs, 0o755);
+  fs.chmodSync(uploads, 0o755);
+  fs.chmodSync(scratchRoot, 0o755);
+  await ensureListingGuard({ outputs, uploads, scratchRoot });
+  for (const dir of dirs) {
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o311, dir);
+  }
+
+  // На корне нет права чтения, но известный путь к собственному файлу остаётся
+  // доступен владельцу: execute-битов на корне и scratch достаточно для прохода.
+  fs.writeFileSync(ownFile, "after");
+  assert.equal(fs.readFileSync(ownFile, "utf8"), "after");
+});
+
+test("ensureSessionDirs: не удаляет scratch независимо от возраста и не трогает соседний", async (t) => {
+  const root = fs.mkdtempSync(path.join(DIR, "scratch-age-"));
+  const scratchRoot = path.join(root, "scratch");
+  const outputs = path.join(root, "output");
+  const oldKey = "old-scratch";
+  const siblingKey = "sibling-scratch";
+  const oldMarker = path.join(scratchRoot, oldKey, "old.txt");
+  const siblingMarker = path.join(scratchRoot, siblingKey, "sibling.txt");
+  for (const marker of [oldMarker, siblingMarker]) {
+    fs.mkdirSync(path.dirname(marker), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(marker, marker);
+  }
+  const eightDaysAgo = (Date.now() - 8 * 24 * 60 * 60 * 1000) / 1000;
+  fs.utimesSync(path.join(scratchRoot, oldKey), eightDaysAgo, eightDaysAgo);
+  fs.utimesSync(path.join(scratchRoot, siblingKey), eightDaysAgo, eightDaysAgo);
+  fs.chmodSync(scratchRoot, 0o311);
+  t.after(() => fs.chmodSync(scratchRoot, 0o700));
+
+  await ensureSessionDirs(oldKey, { scratchRoot, outputs, now: Date.now() });
+  assert.equal(fs.readFileSync(oldMarker, "utf8"), oldMarker, "автоматической очистки scratch на этом этапе нет");
+  assert.equal(fs.statSync(path.join(scratchRoot, oldKey)).mode & 0o777, 0o700);
+  assert.equal(fs.readFileSync(siblingMarker, "utf8"), siblingMarker);
 });
