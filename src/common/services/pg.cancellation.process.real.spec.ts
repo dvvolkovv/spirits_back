@@ -162,14 +162,21 @@ describe('PgService crash regressions in separate processes', () => {
   it('ENOENT cancel-соединения завершает query и не роняет процесс', async () => {
     const marker = `alert_bot_cancel_enoent_${process.pid}_${Date.now()}`;
     const run = startChild('cancel-connect', marker);
-    await activePid(marker);
+    const pid = await activePid(marker);
 
     run.child.kill('SIGUSR1');
     const result = await waitExit(run);
 
-    expect([result.code, result.stderr]).toEqual([0, expect.any(String)]);
-    expect(result.stdout).toContain('QUERY_REJECTED');
-    expect(result.stdout).not.toContain('QUERY_RESOLVED');
-    await waitInactive(marker);
+    try {
+      expect([result.code, result.stderr]).toEqual([0, expect.any(String)]);
+      expect(result.stdout).toContain('QUERY_REJECTED');
+      expect(result.stdout).not.toContain('QUERY_RESOLVED');
+    } finally {
+      // PostgreSQL во время pg_sleep не читает закрытый socket и может доспать
+      // запрос после исчезновения клиента. Рабочий CancelRequest проверяется в
+      // pg.cancellation.real.spec; здесь аварийно очищаем именно этот backend.
+      await observer.query('SELECT pg_terminate_backend($1)', [pid]);
+      await waitInactive(marker);
+    }
   });
 });
