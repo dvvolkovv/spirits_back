@@ -167,7 +167,7 @@ describe('PgService crash regressions in separate processes', () => {
     run.child.kill('SIGUSR1');
     const result = await waitExit(run);
 
-    expect(result.code, result.stderr).toBe(0);
+    expect([result.code, result.stderr]).toEqual([0, expect.any(String)]);
     expect(result.stdout).toContain('QUERY_REJECTED');
     expect(result.stdout).not.toContain('QUERY_RESOLVED');
     await waitInactive(marker);
