@@ -80,9 +80,51 @@ describe('маска бота алертов', () => {
     }
   });
 
-  it('не превращает большие числовые timestamps в неJSON при финальной маске', () => {
-    const out = toolText({ metric: { at: 1800000000, duration: 120000000000 } });
-    expect(JSON.parse(out)).toEqual({ metric: { at: 1800000000, duration: 120000000000 } });
+  it('сохраняет числа только под temporal keys и не ломает JSON при финальной маске', () => {
+    const timestamps = {
+      at: 1_800_000_000,
+      ts: 1_800_000_001,
+      time: 1_800_000_002,
+      timestamp: 1_800_000_003,
+      date: 1_800_000_004,
+      from: 1_800_000_005,
+      to: 1_800_000_006,
+      since: 1_800_000_007,
+      until: 1_800_000_008,
+      created_at: 1_800_000_009,
+      createdAt: 1_800_000_010,
+      updated_at: 120_000_000_000,
+      updatedAt: 120_000_000_001,
+      latest_ts: 120_000_000_002,
+      latestTs: 120_000_000_003,
+      expires_at: 120_000_000_004,
+      expiresAt: 120_000_000_005,
+      due_at: 120_000_000_006,
+      dueAt: 120_000_000_007,
+    };
+    const out = toolText({ metric: timestamps });
+    expect(JSON.parse(out)).toEqual({ metric: timestamps });
+  });
+
+  it.each([1_800_000_000, 120_000_000_000])(
+    'маскирует %i под phone и обычным ключом, несмотря на Unix-диапазон',
+    (value) => {
+      const out = toolText({ phone: value, duration: value });
+      const parsed = JSON.parse(out);
+      expect(parsed.phone).toBe(maskText(String(value)));
+      expect(parsed.duration).toBe(maskText(String(value)));
+      expect(typeof parsed.phone).toBe('string');
+      expect(typeof parsed.duration).toBe('string');
+      expect(out).not.toContain(String(value));
+    },
+  );
+
+  it('не раскрывает phone из Unix-диапазона в аварийном JSON-wrapper', () => {
+    jest.spyOn(JSON, 'parse').mockImplementationOnce(() => { throw new SyntaxError('forced'); });
+    const out = toolText({ phone: 1_800_000_000 });
+    expect(out).not.toContain('1800000000');
+    expect(out).toContain(maskText('1800000000'));
+    expect(JSON.parse(out)).toEqual(expect.any(Object));
   });
 
   it('маскирует числовой телефон, сохраняя Unix timestamps числами и валидный JSON', () => {
