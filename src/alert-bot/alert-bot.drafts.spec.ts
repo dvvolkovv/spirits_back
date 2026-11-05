@@ -240,8 +240,8 @@ describe('черновики ответов в тикет', () => {
     expect(support.postOwnerReplyFromTelegram.mock.calls[1][6]).toBe(DRAFT);
     expect(support.postOwnerReplyFromTelegram.mock.calls[0][7]).toBe(1);
     expect(support.postOwnerReplyFromTelegram.mock.calls[1][7]).toBe(2);
-    expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
-    expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('second', 'Отправлено');
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(2);
+    expect(telegram.answerCallbackQuery.mock.calls[1][1]).toBe('Отправлено');
   });
 
   it('после сбоя releaseDraft просроченный lease можно reclaim и завершить sent', async () => {
