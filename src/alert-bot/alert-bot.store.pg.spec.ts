@@ -102,14 +102,13 @@ maybe('хранилище бота алертов против PostgreSQL', () =
       { findTicketByPrefix: jest.fn().mockResolvedValue(null) } as any,
     );
 
-    await expect(turns.enqueue(input)).resolves.toBe('accepted');
+    await expect(turns.enqueue(input)).rejects.toMatchObject({ kind: 'send_failed' });
 
     expect((await store.findTurnByAnswer('partial', 20))?.question).toBe(input.question);
     expect((await store.findTurnByAnswer('partial', 21))?.question).toBe(input.question);
     expect(telegram.editMessageText).not.toHaveBeenCalled();
-    expect(telegram.sendMessage).toHaveBeenCalledWith(
-      'partial', 'Ответ доставлен не полностью, попробуйте ещё раз', 10,
-    );
+    expect(telegram.sendMessage).toHaveBeenCalledTimes(1);
+    expect(telegram.sendMessage).toHaveBeenCalledWith('partial', '🔎 Смотрю…', 10);
   });
   it('atomic draft admission завершает asked до модели и не даёт второму callback создать ход', async () => {
     const adminUserId = 'u-atomic-draft';

@@ -236,7 +236,7 @@ maybe('callback черновика с lease против PostgreSQL', () => {
       await blocker.query('ROLLBACK').catch(() => undefined);
       blocker.release();
     }
-    await oldCallback;
+    await expect(oldCallback).rejects.toMatchObject({ kind: 'draft_retry' });
 
     expect(lockObserved).toBe(true);
     expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'cancelled', claimVersion: 2 });
@@ -248,7 +248,7 @@ maybe('callback черновика с lease против PostgreSQL', () => {
     );
     expect(effects.rows[0]).toEqual({ messages: 0, events: 0 });
     expect(email).not.toHaveBeenCalled();
-    expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('old-send', 'Не удалось обработать черновик');
+    expect(telegram.answerCallbackQuery).not.toHaveBeenCalledWith('old-send', expect.anything());
     expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('new-cancel', 'Отменено');
   });
 
@@ -389,8 +389,10 @@ maybe('callback черновика с lease против PostgreSQL', () => {
       await handlers[0];
 
       handlers.push(service.handleUpdate(update(7303, 'new-retry')));
-      await waitUntil(() => localTelegram.answerCallbackQuery.mock.calls.some(([id]) => id === 'new-retry'));
+      await waitUntil(() => turns.enqueue.mock.calls.length === 2);
+      const newResult = await callbackSpy.mock.results[2].value as { guardToken?: symbol };
       (localDrafts as any).finishAsk(draftId, oldToken);
+      expect((localDrafts as any).activeQuestionDraftIds.get(draftId)).toBe(newResult.guardToken);
       handlers.push(service.handleUpdate(update(7304, 'after-stale-finish')));
       await waitUntil(() => localTelegram.answerCallbackQuery.mock.calls.some(([id]) => id === 'after-stale-finish'));
     } finally {
@@ -402,6 +404,9 @@ maybe('callback черновика с lease против PostgreSQL', () => {
       else process.env.TELEGRAM_CHAT_ID = previousChat;
     }
 
+    expect(localTelegram.answerCallbackQuery).toHaveBeenCalledWith(
+      'new-retry', 'Вопрос принят',
+    );
     expect(localTelegram.answerCallbackQuery).toHaveBeenCalledWith(
       'parallel-retry', 'Черновик уже обрабатывается',
     );
@@ -429,6 +434,7 @@ maybe('callback черновика с lease против PostgreSQL', () => {
       ),
     };
     const localDrafts = new AlertBotDrafts(store, support, localTelegram as any);
+    const callbackSpy = jest.spyOn(localDrafts, 'handleCallback');
     const blockerStarted = deferred<void>();
     const blockerAnswer = deferred<{ text: string; costUsd: number; tools: string[] }>();
     const ai = {
@@ -481,7 +487,11 @@ maybe('callback черновика с lease против PostgreSQL', () => {
     try {
       await blockerStarted.promise;
       callbacks.push(service.handleUpdate(update(7101, 'first')));
-      await waitUntil(() => localTelegram.answerCallbackQuery.mock.calls.some(([id]) => id === 'first'));
+      await waitUntil(() => callbackSpy.mock.results.length === 1);
+      await expect(callbackSpy.mock.results[0].value).resolves.toEqual(expect.objectContaining({
+        question: 'вопрос из черновика', claimVersion: 1,
+      }));
+      expect(localTelegram.answerCallbackQuery).not.toHaveBeenCalledWith('first', expect.anything());
       expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'asking', claimVersion: 1 });
 
       for (const [index, callbackId] of ['second', 'third'].entries()) {
@@ -506,6 +516,7 @@ maybe('callback черновика с lease против PostgreSQL', () => {
       else process.env.TELEGRAM_CHAT_ID = previousChat;
     }
 
+    expect(localTelegram.answerCallbackQuery).toHaveBeenCalledWith('first', 'Вопрос принят');
     expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'asked', claimVersion: 1 });
     expect(ai.answer).toHaveBeenCalledTimes(2);
     expect(ai.answer.mock.calls.filter(([input]) => input.question === 'вопрос из черновика')).toHaveLength(1);
