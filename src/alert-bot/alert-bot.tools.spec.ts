@@ -181,7 +181,7 @@ describe('AlertBotTools', () => {
 
     const result = await execute(tools, 'alerts', { hours: 999 });
 
-    expect(mocks.store.recentAlerts).toHaveBeenCalledWith(72, 50);
+    expect(mocks.store.recentAlerts).toHaveBeenCalledWith(72, 50, undefined);
     expect(mocks.monitoring.query).toHaveBeenCalledTimes(3);
     expect(result.prometheus).toMatchObject({ error: 'source_failed' });
     expect(result.journal).toEqual([expect.objectContaining({ text: 'journal remains' })]);
@@ -216,7 +216,7 @@ describe('AlertBotTools', () => {
     await expect(execute(tools, 'health', { section: 'claude' })).resolves.toMatchObject({
       section: 'claude', data: { llmStatus: 'ok' },
     });
-    expect(mocks.health.getSection).toHaveBeenCalledWith('claude');
+    expect(mocks.health.getSection).toHaveBeenCalledWith('claude', undefined);
 
     await expect(execute(tools, 'health', { section: 'other' })).resolves.toEqual({ error: 'invalid_params' });
     expect(mocks.health.getSection).toHaveBeenCalledTimes(1);
@@ -264,7 +264,7 @@ describe('AlertBotTools', () => {
   ])('stats %s делегирует в AdminService', async (section, method, expected) => {
     mocks.admin[method].mockResolvedValue({ section });
     const result = await execute(tools, 'stats', { section });
-    expect(mocks.admin[method]).toHaveBeenCalledWith(expected);
+    expect(mocks.admin[method]).toHaveBeenCalledWith(expected, undefined);
     expect(result).toMatchObject({ section, data: { section } });
   });
 
@@ -277,7 +277,7 @@ describe('AlertBotTools', () => {
   ])('stats economy принимает окно %s', async (section, window) => {
     mocks.economy.getOverview.mockResolvedValue({ ok: true });
     await execute(tools, 'stats', { section, window });
-    expect(mocks.economy.getOverview).toHaveBeenCalledWith(window as EconomyWindow);
+    expect(mocks.economy.getOverview).toHaveBeenCalledWith(window as EconomyWindow, undefined);
   });
 
   it('stats funnel передаёт from/to/source, summary не требует параметров', async () => {
@@ -292,7 +292,7 @@ describe('AlertBotTools', () => {
 
     mocks.summary.getOverview.mockResolvedValue({ indicators: [] });
     await expect(execute(tools, 'stats', { section: 'summary' })).resolves.toMatchObject({ data: { indicators: [] } });
-    expect(mocks.summary.getOverview).toHaveBeenCalledWith();
+    expect(mocks.summary.getOverview).toHaveBeenCalledWith(undefined);
   });
 
   it('tickets list скрывает терминальные, ограничивает выдачу и маскирует поля', async () => {
@@ -303,7 +303,7 @@ describe('AlertBotTools', () => {
 
     const result = await execute(tools, 'tickets', { limit: 500 });
 
-    expect(mocks.support.adminListTickets).toHaveBeenCalledWith({ limit: 200 });
+    expect(mocks.support.adminListTickets).toHaveBeenCalledWith({ limit: 200 }, undefined);
     expect(result.tickets).toHaveLength(1);
     const item = result.tickets[0];
     expect(item).toMatchObject({
@@ -351,8 +351,8 @@ describe('AlertBotTools', () => {
 
     const result = await execute(tools, 'tickets', { ticket: '#11111111' });
 
-    expect(mocks.support.findTicketByPrefix).toHaveBeenCalledWith('11111111');
-    expect(mocks.support.adminGetTicket).toHaveBeenCalledWith(TICKET);
+    expect(mocks.support.findTicketByPrefix).toHaveBeenCalledWith('11111111', undefined);
+    expect(mocks.support.adminGetTicket).toHaveBeenCalledWith(TICKET, undefined);
     expect(result.ticket.id).toBe('#11111111');
     expect(result.messages).toHaveLength(10);
     expect(Array.from(result.messages[0].content)).toHaveLength(500);
@@ -366,6 +366,44 @@ describe('AlertBotTools', () => {
       await expect(execute(tools, 'tickets', { ticket })).resolves.toEqual({ error: 'invalid_params' });
     }
     expect(mocks.support.findTicketByPrefix).toHaveBeenCalledTimes(1);
+  });
+
+  it('пробрасывает один AbortSignal во все downstream entrypoint', async () => {
+    const controller = new AbortController();
+    const signal = controller.signal;
+    const call = (name: string, args: Record<string, unknown> = {}) => tools.execute(name, args, CTX, signal);
+
+    await call('alerts');
+    expect(mocks.monitoring.query).toHaveBeenCalledTimes(3);
+    for (const invocation of mocks.monitoring.query.mock.calls) expect(invocation[1]).toBe(signal);
+    expect(mocks.store.recentAlerts).toHaveBeenCalledWith(24, 50, signal);
+
+    await call('health', { section: 'claude' });
+    expect(mocks.health.getSection).toHaveBeenCalledWith('claude', signal);
+
+    await call('logs', { query: 'timeout' });
+    expect(mocks.logs.query.mock.calls[0][1]).toBe(signal);
+
+    await call('stats', { section: 'payments' });
+    expect(mocks.admin.getPaymentsStats).toHaveBeenCalledWith({ days: 7, includeTest: false }, signal);
+    await call('stats', { section: 'tokens' });
+    expect(mocks.admin.getTokensSpendStats).toHaveBeenCalledWith({ days: 7, bucket: 'day' }, signal);
+    await call('stats', { section: 'active' });
+    expect(mocks.admin.getActiveUsersStats).toHaveBeenCalledWith({ days: 7, bucket: 'day' }, signal);
+    await call('stats', { section: 'economy' });
+    expect(mocks.economy.getOverview).toHaveBeenCalledWith('7d', signal);
+    await call('stats', { section: 'funnel' });
+    expect(mocks.funnel.getFunnel.mock.calls[0][3]).toBe(signal);
+    await call('stats', { section: 'summary' });
+    expect(mocks.summary.getOverview).toHaveBeenCalledWith(signal);
+
+    await call('tickets');
+    expect(mocks.support.adminListTickets).toHaveBeenCalledWith({ limit: 200 }, signal);
+    mocks.support.findTicketByPrefix.mockResolvedValue({ id: TICKET });
+    mocks.support.adminGetTicket.mockResolvedValue({ ticket: ticketRow(), messages: [] });
+    await call('tickets', { ticket: '#11111111' });
+    expect(mocks.support.findTicketByPrefix).toHaveBeenCalledWith('11111111', signal);
+    expect(mocks.support.adminGetTicket).toHaveBeenCalledWith(TICKET, signal);
   });
 
   it('unknown_tool, invalid_params и source_failed безопасны', async () => {

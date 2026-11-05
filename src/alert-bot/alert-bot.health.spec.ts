@@ -245,6 +245,20 @@ describe('разделы технического здоровья для бот
     expect(sources[sourceIndex][method]).toHaveBeenCalledTimes(1);
   });
 
+  it('пробрасывает AbortSignal в каждый источник здоровья', async () => {
+    const controller = new AbortController();
+    for (const [section, sourceIndex, method] of sectionCases) {
+      sources[sourceIndex][method].mockClear();
+      await service.getSection(section, controller.signal);
+      expect(sources[sourceIndex][method].mock.calls[0].at(-1)).toBe(controller.signal);
+    }
+    sources[0].getNodeOverview.mockClear();
+    sources[0].getProbes.mockClear();
+    await service.getSection('overview', controller.signal);
+    expect(sources[0].getNodeOverview).toHaveBeenCalledWith(controller.signal);
+    expect(sources[0].getProbes).toHaveBeenCalledWith(controller.signal);
+  });
+
   it.each(HEALTH_SECTIONS.map((section) => [section, healthy[section]] as [HealthSection, any]))(
     '%s: реальный здоровый ответ не считается сбоем', async (section, value) => {
       mockSections({ [section]: value });
