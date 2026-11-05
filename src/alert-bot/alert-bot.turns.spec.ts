@@ -41,7 +41,7 @@ describe('AlertBotTurns', () => {
   let status: { summary: jest.Mock };
   let chat: { beginStream: jest.Mock; endStream: jest.Mock };
   let support: { findTicketByPrefix: jest.Mock };
-  let logger: { error: jest.Mock; warn: jest.Mock };
+  let logger: { error: jest.Mock; warn: jest.Mock; log: jest.Mock; debug: jest.Mock };
   let turns: AlertBotTurns;
 
   beforeEach(() => {
@@ -58,6 +58,10 @@ describe('AlertBotTurns', () => {
       recentTurns: jest.fn().mockResolvedValue([]),
       countRecentTurns: jest.fn(),
     };
+    store.admitTurn = jest.fn(async (input: TurnInput, maxPerHour: number) => {
+      const turnId = await store.tryCreateTurn(input, maxPerHour);
+      return turnId ? { status: 'accepted', turnId } : { status: 'rate_limited' };
+    });
     telegram = {
       sendMessage: jest.fn().mockResolvedValue({ message_id: 901 }),
       editMessageText: jest.fn().mockResolvedValue(undefined),
@@ -69,7 +73,7 @@ describe('AlertBotTurns', () => {
     status = { summary: jest.fn().mockResolvedValue('Алерты: горящих нет') };
     chat = { beginStream: jest.fn(), endStream: jest.fn() };
     support = { findTicketByPrefix: jest.fn().mockResolvedValue(null) };
-    logger = { error: jest.fn(), warn: jest.fn() };
+    logger = { error: jest.fn(), warn: jest.fn(), log: jest.fn(), debug: jest.fn() };
     turns = new AlertBotTurns(
       store as any,
       telegram as any,

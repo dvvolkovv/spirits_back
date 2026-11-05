@@ -27,7 +27,7 @@ export class AlertBotStatusService {
     const [alerts, badSections, tickets] = await Promise.allSettled([
       withDeadline(() => this.firingAlerts(), STATUS_BLOCK_TIMEOUT_MS),
       withDeadline(() => this.health.badSections(), STATUS_BLOCK_TIMEOUT_MS),
-      withDeadline(() => this.ticketCounts(), STATUS_BLOCK_TIMEOUT_MS),
+      withDeadline((signal) => this.ticketCounts(signal), STATUS_BLOCK_TIMEOUT_MS),
     ]);
 
     const alertLines = alerts.status === 'rejected'
@@ -61,10 +61,10 @@ export class AlertBotStatusService {
     });
   }
 
-  private async ticketCounts() {
+  private async ticketCounts(signal: AbortSignal) {
     const [active, overdue] = await Promise.all([
-      this.support.countActiveTickets(),
-      this.support.countOverdueTickets(),
+      this.support.countActiveTickets(signal),
+      this.support.countOverdueTickets(signal),
     ]);
     return { active, overdue };
   }

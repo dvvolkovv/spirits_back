@@ -76,8 +76,14 @@ export interface AdmitDraftQuestionInput extends DraftReservation {
   maxPerHour: number;
 }
 
+export type TurnAdmission =
+  | { status: 'accepted'; turnId: string }
+  | { status: 'existing'; turnId: string; turnStatus: AlertBotTurnStatus }
+  | { status: 'rate_limited' };
+
 export type DraftQuestionAdmission =
   | { status: 'accepted'; turnId: string }
+  | { status: 'existing'; turnId: string; turnStatus: AlertBotTurnStatus }
   | { status: 'rate_limited' }
   | { status: 'stale' };
 
@@ -161,13 +167,70 @@ export class AlertBotStore {
     await this.pg.query(sql);
   }
 
-  async claimUpdate(updateId: number): Promise<boolean> {
-    const r = await this.pg.query(
-      `INSERT INTO alert_bot_updates (update_id) VALUES ($1)
+  async claimUpdate(updateId: number, payload?: unknown): Promise<boolean> {
+    const inserted = await this.pg.query(
+      `INSERT INTO alert_bot_updates
+         (update_id, payload, status, attempts, updated_at)
+       VALUES ($1, $2::jsonb,
+         CASE WHEN $2::jsonb IS NULL THEN 'completed' ELSE 'processing' END, 1, now())
        ON CONFLICT (update_id) DO NOTHING RETURNING update_id`,
+      [updateId, payload === undefined ? null : JSON.stringify(payload)],
+    );
+    if (inserted.rowCount === 1) return true;
+    const reclaimed = await this.pg.query(
+      `UPDATE alert_bot_updates
+       SET status = 'processing', attempts = attempts + 1,
+           next_retry_at = NULL, error_kind = NULL, updated_at = now()
+       WHERE update_id = $1 AND status = 'failed' AND attempts < 5
+         AND next_retry_at IS NOT NULL AND next_retry_at <= now()
+       RETURNING update_id`,
       [updateId],
     );
-    return r.rowCount === 1;
+    return reclaimed.rowCount === 1;
+  }
+
+  async completeUpdate(updateId: number): Promise<void> {
+    await this.pg.query(
+      `UPDATE alert_bot_updates
+       SET status = 'completed', next_retry_at = NULL, error_kind = NULL, updated_at = now()
+       WHERE update_id = $1 AND status = 'processing'`,
+      [updateId],
+    );
+  }
+
+  async failUpdate(updateId: number, errorKind: string): Promise<boolean> {
+    const safeKind = /^[a-z][a-z0-9_.-]{0,40}$/i.test(errorKind) ? errorKind : 'error';
+    const result = await this.pg.query(
+      `UPDATE alert_bot_updates
+       SET status = 'failed', error_kind = $2, updated_at = now(),
+           next_retry_at = CASE WHEN attempts < 5
+             THEN now() + (LEAST(300, POWER(2, attempts - 1))::text || ' seconds')::interval
+             ELSE NULL END
+       WHERE update_id = $1 AND status = 'processing'
+       RETURNING attempts >= 5 AS final`,
+      [updateId, safeKind],
+    );
+    return result.rows[0]?.final === true;
+  }
+
+  async dueUpdates(limit = 20): Promise<Array<{ updateId: number; payload: unknown }>> {
+    const bounded = clampInteger(limit, 1, 100);
+    const result = await this.pg.query(
+      `SELECT update_id, payload FROM alert_bot_updates
+       WHERE status = 'failed' AND attempts < 5 AND payload IS NOT NULL
+         AND next_retry_at IS NOT NULL AND next_retry_at <= now()
+       ORDER BY next_retry_at, update_id LIMIT $1`,
+      [bounded],
+    );
+    return result.rows.map((row) => ({ updateId: Number(row.update_id), payload: row.payload }));
+  }
+
+  async requeueProcessingUpdates(): Promise<void> {
+    await this.pg.query(
+      `UPDATE alert_bot_updates
+       SET status = 'failed', next_retry_at = now(), updated_at = now()
+       WHERE status = 'processing' AND payload IS NOT NULL`,
+    );
   }
 
   async createTurn(input: TurnInput): Promise<string> {
@@ -198,6 +261,7 @@ export class AlertBotStore {
          (update_id, chat_id, tg_user_id, linkeon_user_id, question_message_id,
           parent_turn_id, question, private_chat, status, error_kind, duration_ms, finished_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, 0, now())
+       ON CONFLICT (update_id) DO UPDATE SET update_id = EXCLUDED.update_id
        RETURNING id`,
       [
         input.updateId,
@@ -214,7 +278,7 @@ export class AlertBotStore {
     return r.rows[0].id;
   }
 
-  async tryCreateTurn(input: TurnInput, maxPerHour: number): Promise<string | null> {
+  async admitTurn(input: TurnInput, maxPerHour: number): Promise<TurnAdmission> {
     const client = await this.pg.getClient();
     let transactionOpen = false;
     let destroyClient = false;
@@ -222,6 +286,19 @@ export class AlertBotStore {
       await client.query('BEGIN');
       transactionOpen = true;
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`alert-bot:${input.adminUserId}`]);
+      const existing = await client.query(
+        `SELECT id, status FROM alert_bot_turns WHERE update_id = $1`,
+        [input.updateId],
+      );
+      if (existing.rows[0]) {
+        await client.query('COMMIT');
+        transactionOpen = false;
+        return {
+          status: 'existing',
+          turnId: existing.rows[0].id,
+          turnStatus: existing.rows[0].status,
+        };
+      }
       const count = await client.query(
         `SELECT count(*)::int AS n FROM alert_bot_turns
          WHERE linkeon_user_id = $1 AND created_at >= now() - interval '1 hour'
@@ -231,7 +308,7 @@ export class AlertBotStore {
       if (count.rows[0].n >= maxPerHour) {
         await client.query('ROLLBACK');
         transactionOpen = false;
-        return null;
+        return { status: 'rate_limited' };
       }
       const r = await client.query(
         `INSERT INTO alert_bot_turns
@@ -252,7 +329,7 @@ export class AlertBotStore {
       );
       await client.query('COMMIT');
       transactionOpen = false;
-      return r.rows[0].id;
+      return { status: 'accepted', turnId: r.rows[0].id };
     } catch (error) {
       if (transactionOpen) {
         try {
@@ -267,6 +344,11 @@ export class AlertBotStore {
     }
   }
 
+  async tryCreateTurn(input: TurnInput, maxPerHour: number): Promise<string | null> {
+    const admission = await this.admitTurn(input, maxPerHour);
+    return admission.status === 'rate_limited' ? null : admission.turnId;
+  }
+
   async admitDraftQuestion(params: AdmitDraftQuestionInput): Promise<DraftQuestionAdmission> {
     const { draftId, claimVersion, input, maxPerHour } = params;
     const client = await this.pg.getClient();
@@ -276,6 +358,19 @@ export class AlertBotStore {
       await client.query('BEGIN');
       transactionOpen = true;
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`alert-bot:${input.adminUserId}`]);
+      const existing = await client.query(
+        `SELECT id, status FROM alert_bot_turns WHERE update_id = $1`,
+        [input.updateId],
+      );
+      if (existing.rows[0]) {
+        await client.query('COMMIT');
+        transactionOpen = false;
+        return {
+          status: 'existing',
+          turnId: existing.rows[0].id,
+          turnStatus: existing.rows[0].status,
+        };
+      }
       const draft = await client.query(
         `SELECT id FROM alert_bot_ticket_drafts
          WHERE id = $1 AND outcome = 'asking' AND claim_version = $2
@@ -560,7 +655,12 @@ export class AlertBotStore {
   }
 
   async cleanup(): Promise<void> {
-    await this.pg.query('DELETE FROM alert_bot_updates WHERE created_at < now() - $1::interval', ['7 days']);
+    await this.pg.query(
+      `DELETE FROM alert_bot_updates
+       WHERE created_at < now() - $1::interval
+         AND (status = 'completed' OR (status = 'failed' AND next_retry_at IS NULL))`,
+      ['7 days'],
+    );
     await this.pg.query('DELETE FROM alert_messages WHERE created_at < now() - $1::interval', ['30 days']);
     await this.pg.query('DELETE FROM alert_bot_ticket_drafts WHERE created_at < now() - $1::interval', ['30 days']);
     await this.pg.query('DELETE FROM alert_bot_turns WHERE created_at < now() - $1::interval', ['90 days']);

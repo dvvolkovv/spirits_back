@@ -28,6 +28,14 @@ import { labelsFor } from '../platform-kb/labels';
 import type { KbClient } from '../platform-kb/kb.types';
 import { EventsService } from '../events/events.service';
 
+export class TicketPrefixAmbiguousError extends Error {
+  override readonly name = 'TicketPrefixAmbiguousError';
+
+  constructor(readonly prefix: string) {
+    super('ticket prefix is ambiguous');
+  }
+}
+
 @Injectable()
 export class SupportService implements OnModuleInit {
   private readonly logger = new Logger(SupportService.name);
@@ -1337,13 +1345,22 @@ ${healthSummary}
    * Used when owner replies in Telegram — only the prefix is embedded in the escalation text.
    */
   async findTicketByPrefix(prefix: string, signal?: AbortSignal): Promise<SupportTicketRow | null> {
-    const clean = prefix.toLowerCase().replace(/[^a-f0-9]/g, '').slice(0, 8);
-    if (clean.length !== 8) return null;
+    const clean = prefix.trim().toLowerCase();
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(clean)) {
+      const exact = await this.pg.query(
+        `SELECT * FROM support_tickets WHERE id = $1 LIMIT 1`,
+        [clean],
+        signal,
+      );
+      return exact.rows[0] || null;
+    }
+    if (!/^[0-9a-f]{8}$/.test(clean)) return null;
     const r = await this.pg.query(
-      `SELECT * FROM support_tickets WHERE id::text LIKE $1 ORDER BY created_at DESC LIMIT 1`,
+      `SELECT * FROM support_tickets WHERE id::text LIKE $1 LIMIT 2`,
       [`${clean}%`],
       signal,
     );
+    if (r.rows.length > 1) throw new TicketPrefixAmbiguousError(clean);
     return r.rows[0] || null;
   }
 
@@ -1432,22 +1449,27 @@ ${healthSummary}
     };
   }
 
-  async countActiveTickets(): Promise<{ escalated: number; owner_handling: number; ai_handling: number }> {
+  async countActiveTickets(signal?: AbortSignal): Promise<{ escalated: number; owner_handling: number; ai_handling: number }> {
     const r = await this.pg.query(
       `SELECT status, count(*)::int AS n FROM support_tickets
        WHERE status IN ('escalated','owner_handling','ai_handling') GROUP BY status`,
+      [],
+      signal,
     );
     const out: any = { escalated: 0, owner_handling: 0, ai_handling: 0 };
     r.rows.forEach((row: any) => { out[row.status] = row.n; });
     return out;
   }
 
-  async countOverdueTickets(): Promise<number> {
+  async countOverdueTickets(signal?: AbortSignal): Promise<number> {
     const r = await this.pg.query(
       `SELECT count(*)::int AS n FROM support_tickets
        WHERE status IN ('escalated','owner_handling')
          AND first_owner_reply_at IS NULL
-         AND first_response_due_at < now()`);
+         AND first_response_due_at < now()`,
+      [],
+      signal,
+    );
     return r.rows[0]?.n || 0;
   }
 
@@ -1455,19 +1477,50 @@ ${healthSummary}
     const allowed = ['resolved', 'closed', 'owner_handling', 'ai_handling'];
     if (!allowed.includes(status)) throw new BadRequestException('invalid status');
     const actorId = linkeonUserId || `tg:${telegramUserId}`;
-    await this.pg.query(
-      `UPDATE support_tickets
-         SET status = $1,
-             resolved_at = CASE WHEN $1 IN ('resolved','closed') THEN now() ELSE NULL END,
-             updated_at = now()
-         WHERE id = $2`,
-      [status, ticketId],
-    );
-    await this.pg.query(
-      `INSERT INTO support_events (ticket_id, actor_type, actor_id, action, payload)
-       VALUES ($1, 'owner', $2, 'status_change', $3)`,
-      [ticketId, actorId, JSON.stringify({ status, via: 'telegram', telegramUserId })],
-    );
+    const client = await this.pg.getClient();
+    let transactionOpen = false;
+    let destroyClient = false;
+    try {
+      await client.query('BEGIN');
+      transactionOpen = true;
+      const current = await client.query(
+        `SELECT status FROM support_tickets WHERE id = $1 FOR UPDATE`,
+        [ticketId],
+      );
+      if (!current.rows[0]) {
+        await client.query('ROLLBACK');
+        transactionOpen = false;
+        return;
+      }
+      if (current.rows[0].status !== status) {
+        await client.query(
+          `UPDATE support_tickets
+             SET status = $1,
+                 resolved_at = CASE WHEN $1 IN ('resolved','closed') THEN now() ELSE NULL END,
+                 updated_at = now()
+             WHERE id = $2`,
+          [status, ticketId],
+        );
+        await client.query(
+          `INSERT INTO support_events (ticket_id, actor_type, actor_id, action, payload)
+           VALUES ($1, 'owner', $2, 'status_change', $3)`,
+          [ticketId, actorId, JSON.stringify({ status, via: 'telegram', telegramUserId })],
+        );
+      }
+      await client.query('COMMIT');
+      transactionOpen = false;
+    } catch (error) {
+      if (transactionOpen) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          destroyClient = true;
+        }
+      }
+      throw error;
+    } finally {
+      client.release(destroyClient);
+    }
   }
 
   async insertMessage(

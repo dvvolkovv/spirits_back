@@ -43,13 +43,18 @@ export class AlertBotTurns {
   enqueue(input: TurnInput, reservation?: DraftReservation): Promise<AlertBotAdmission> {
     const key = String(input.chatId);
     const pending = this.pending.get(key) || 0;
+    this.chat.beginStream();
     if (pending >= MAX_PENDING_PER_CHAT) {
-      return this.rejectBusy(input).then(() => 'busy');
+      return this.rejectBusy(input)
+        .then(() => 'busy' as const)
+        .finally(() => this.chat.endStream());
     }
 
     this.pending.set(key, pending + 1);
     const previous = this.chains.get(key) || Promise.resolve();
-    const run = previous.then(() => this.execute(input, reservation));
+    const run = previous
+      .then(() => this.execute(input, reservation))
+      .finally(() => this.chat.endStream());
     let tracked: Promise<void>;
     tracked = run.then(() => undefined, () => undefined).finally(() => {
       const left = (this.pending.get(key) || 1) - 1;
@@ -81,19 +86,20 @@ export class AlertBotTurns {
         await this.rejectRateLimited(input);
         return 'rate_limited';
       }
+      if (admitted.status === 'existing') return 'accepted';
       turnId = admitted.turnId;
     } else {
       // Admission отделён от выполнения: до turnId сбой должен попасть в service.
-      const admittedTurnId = await this.store.tryCreateTurn(input, alertBotRatePerHour());
-      if (!admittedTurnId) {
+      const admitted = await this.store.admitTurn(input, alertBotRatePerHour());
+      if (admitted.status === 'rate_limited') {
         await this.rejectRateLimited(input);
         return 'rate_limited';
       }
-      turnId = admittedTurnId;
+      if (admitted.status === 'existing') return 'accepted';
+      turnId = admitted.turnId;
     }
 
     let placeholderId: number | null = null;
-    let streamOpen = false;
     let finishAttempted = false;
     let deliveredIds: number[] = [];
     let deliveryComplete = false;
@@ -103,8 +109,6 @@ export class AlertBotTurns {
       placeholderId = placeholder.message_id;
       await this.store.attachAnswerMessages(turnId, [placeholderId]);
 
-      this.chat.beginStream();
-      streamOpen = true;
       const history = await this.history(input);
       let answer: { text: string; costUsd: number; tools: string[] };
       try {
@@ -182,8 +186,6 @@ export class AlertBotTurns {
           this.log(turnId, 'error', safeErrorKind(finishError, 'finish_failed'));
         }
       }
-    } finally {
-      if (streamOpen) this.chat.endStream();
     }
     return 'accepted';
   }
@@ -213,17 +215,45 @@ export class AlertBotTurns {
       Array.from(answer.matchAll(/#([0-9a-f]{8})\b/gi), (match) => match[1].toLowerCase()),
     ));
     const buttons: Array<Array<{ text: string; url: string }>> = [];
-    for (const prefix of prefixes.slice(0, 10)) {
-      const ticket = await this.support.findTicketByPrefix(prefix);
-      if (!ticket) continue;
-      const origin = (process.env.ADMIN_ORIGIN || 'https://my.linkeon.io').replace(/\/+$/, '');
-      buttons.push([{
-        text: `Открыть #${prefix}`,
-        url: `${origin}/admin?tab=support&ticket=${encodeURIComponent(ticket.id)}`,
-      }]);
-      if (buttons.length === 3) break;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      for (const prefix of prefixes.slice(0, 10)) {
+        let ticket: Awaited<ReturnType<SupportService['findTicketByPrefix']>>;
+        try {
+          ticket = await this.lookupTicket(prefix, controller.signal);
+        } catch (error) {
+          if ((error as { name?: unknown })?.name === 'TicketPrefixAmbiguousError') continue;
+          if (controller.signal.aborted) break;
+          this.logger.warn(`alert-bot ticket button failed kind=${safeErrorKind(error)}`);
+          continue;
+        }
+        if (!ticket) continue;
+        const origin = (process.env.ADMIN_ORIGIN || 'https://my.linkeon.io').replace(/\/+$/, '');
+        buttons.push([{
+          text: `Открыть #${prefix}`,
+          url: `${origin}/admin?tab=support&ticket=${encodeURIComponent(ticket.id)}`,
+        }]);
+        if (buttons.length === 3) break;
+      }
+    } finally {
+      clearTimeout(timer);
     }
     return buttons.length ? { inline_keyboard: buttons } : undefined;
+  }
+
+  private async lookupTicket(prefix: string, signal: AbortSignal) {
+    if (signal.aborted) throw signal.reason || new Error('aborted');
+    let onAbort: () => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(signal.reason || new Error('aborted'));
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([this.support.findTicketByPrefix(prefix, signal), cancelled]);
+    } finally {
+      signal.removeEventListener('abort', onAbort!);
+    }
   }
 
   private async replacePlaceholder(input: TurnInput, placeholderId: number | null, text: string): Promise<void> {
@@ -252,6 +282,9 @@ export class AlertBotTurns {
   }
 
   private log(turnId: string | null, status: AlertBotTurnStatus | 'ignored', kind: string): void {
-    this.logger.error(`alert-bot turn=${turnId || 'none'} status=${status} kind=${kind}`);
+    const line = `alert-bot turn=${turnId || 'none'} status=${status} kind=${kind}`;
+    if (status === 'ok') this.logger.log(line);
+    else if (status === 'ignored') this.logger.debug(line);
+    else this.logger.error(line);
   }
 }

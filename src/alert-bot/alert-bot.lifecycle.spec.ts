@@ -12,6 +12,7 @@ type Mocks = {
     interruptInProgress: jest.Mock<Promise<Array<{ id: string; chatId: string; questionMessageId: number }>>, []>;
     recordAlert: jest.Mock<Promise<void>, [string, number, string]>;
     cleanup: jest.Mock<Promise<void>, []>;
+    requeueProcessingUpdates: jest.Mock<Promise<void>, []>;
   };
   ops: {
     start: jest.Mock<Promise<void>, []>;
@@ -30,6 +31,7 @@ function makeMocks(): Mocks {
       interruptInProgress: jest.fn().mockResolvedValue([]),
       recordAlert: jest.fn().mockResolvedValue(undefined),
       cleanup: jest.fn().mockResolvedValue(undefined),
+      requeueProcessingUpdates: jest.fn().mockResolvedValue(undefined),
     },
     ops: {
       start: jest.fn().mockResolvedValue(undefined),
@@ -97,6 +99,7 @@ describe('AlertBotLifecycle', () => {
       ];
     });
     mocks.ops.start.mockImplementation(async () => { calls.push('ops.start'); });
+    mocks.store.requeueProcessingUpdates.mockImplementation(async () => { calls.push('requeue'); });
     sinkSpy.mockImplementation((sink) => { if (sink) calls.push('sink'); });
     mocks.telegram.sendMessage.mockImplementation(async (chatId) => {
       calls.push(`reply:${chatId}`);
@@ -107,12 +110,12 @@ describe('AlertBotLifecycle', () => {
     await lifecycle.onModuleInit();
 
     expect(calls).toEqual([
-      'migrate', 'ops.start', 'interrupt', 'sink', 'reply:chat-1', 'reply:chat-2', 'cleanup',
+      'migrate', 'ops.start', 'interrupt', 'requeue', 'sink', 'reply:chat-1', 'reply:chat-2', 'cleanup',
     ]);
     expect(mocks.telegram.sendMessage).toHaveBeenNthCalledWith(1, 'chat-1', RESTART_REPLY, 101);
     expect(mocks.telegram.sendMessage).toHaveBeenNthCalledWith(2, 'chat-2', RESTART_REPLY, 202);
     expect(mocks.telegram.registerWebhook).toHaveBeenCalledTimes(1);
-    expect(jest.getTimerCount()).toBe(1);
+    expect(jest.getTimerCount()).toBe(2);
 
     const sink = sinkSpy.mock.calls[0][0];
     expect(sink).not.toBeNull();
@@ -134,11 +137,12 @@ describe('AlertBotLifecycle', () => {
     expect(logs).not.toContain('RAW-SECRET-DETAIL');
   });
 
-  it('onModuleDestroy снимает sink, очищает interval и останавливает ops', async () => {
+  it('onModuleDestroy снимает sink и очищает intervals, ops останавливается заранее', async () => {
     enabled();
     await lifecycle.onModuleInit();
-    expect(jest.getTimerCount()).toBe(1);
+    expect(jest.getTimerCount()).toBe(2);
 
+    await lifecycle.beforeApplicationShutdown();
     await lifecycle.onModuleDestroy();
 
     expect(sinkSpy).toHaveBeenLastCalledWith(null);

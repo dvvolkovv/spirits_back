@@ -1,26 +1,39 @@
-import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import {
+  BeforeApplicationShutdown, Injectable, Logger, OnModuleDestroy, OnModuleInit,
+} from '@nestjs/common';
 import { setAlertSentSink } from '../common/telegram-alert';
 import { alertBotEnabled } from './alert-bot.config';
 import { AlertBotOpsServer } from './alert-bot.ops-server';
+import { AlertBotService } from './alert-bot.service';
 import { AlertBotStore } from './alert-bot.store';
 import { AlertBotTelegram } from './alert-bot.telegram';
+import { AlertBotTurns } from './alert-bot.turns';
+
+const SHUTDOWN_DRAIN_MS = 5000;
+const RETRY_INTERVAL_MS = 5000;
 
 @Injectable()
-export class AlertBotLifecycle implements OnModuleInit, OnModuleDestroy {
+export class AlertBotLifecycle implements OnModuleInit, OnModuleDestroy, BeforeApplicationShutdown {
   private cleanupTimer: NodeJS.Timeout | null = null;
+  private retryTimer: NodeJS.Timeout | null = null;
+  private shutdown: Promise<void> | null = null;
+  private retryRunning = false;
   private readonly logger = new Logger(AlertBotLifecycle.name);
 
   constructor(
     private readonly store: AlertBotStore,
     private readonly ops: AlertBotOpsServer,
     private readonly telegram: AlertBotTelegram,
+    private readonly turns: AlertBotTurns,
+    private readonly service: AlertBotService,
   ) {}
 
   async onModuleInit(): Promise<void> {
     await this.store.migrate();
     if (!alertBotEnabled()) return;
-    const interrupted = await this.store.interruptInProgress();
     await this.ops.start();
+    const interrupted = await this.store.interruptInProgress();
+    await this.store.requeueProcessingUpdates();
     setAlertSentSink((chatId, messageId, text) => this.store.recordAlert(chatId, messageId, text));
     for (const turn of interrupted) {
       await this.telegram.sendMessage(turn.chatId, 'Ответ оборвался перезапуском — спросите ещё раз', turn.questionMessageId)
@@ -29,14 +42,52 @@ export class AlertBotLifecycle implements OnModuleInit, OnModuleDestroy {
     await this.store.cleanup().catch(() => {});
     this.cleanupTimer = setInterval(() => this.store.cleanup().catch(() => {}), 24 * 60 * 60 * 1000);
     this.cleanupTimer.unref();
+    this.retryTimer = setInterval(() => { void this.retryDue(); }, RETRY_INTERVAL_MS);
+    this.retryTimer.unref();
     void this.telegram.registerWebhook().catch((e: any) => {
       this.logger.error(`alert-bot registration failed: ${e?.code || 'error'}`);
     });
   }
 
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.shutdown) return this.shutdown;
+    this.shutdown = (async () => {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          this.turns.idle(),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, SHUTDOWN_DRAIN_MS);
+            timer.unref();
+          }),
+        ]);
+      } catch {
+        this.logger.error('alert-bot shutdown drain failed kind=idle_failed');
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      await this.ops.stop();
+    })();
+    return this.shutdown;
+  }
+
   async onModuleDestroy(): Promise<void> {
     setAlertSentSink(null);
     if (this.cleanupTimer) clearInterval(this.cleanupTimer);
-    await this.ops.stop();
+    if (this.retryTimer) clearInterval(this.retryTimer);
+    this.cleanupTimer = null;
+    this.retryTimer = null;
+  }
+
+  private async retryDue(): Promise<void> {
+    if (this.retryRunning) return;
+    this.retryRunning = true;
+    try {
+      await this.service.retryFailedUpdates();
+    } catch {
+      this.logger.error('alert-bot retry pass failed kind=retry_failed');
+    } finally {
+      this.retryRunning = false;
+    }
   }
 }

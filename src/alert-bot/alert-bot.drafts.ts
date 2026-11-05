@@ -191,7 +191,7 @@ export class AlertBotDrafts {
         // Atomic admission переведёт asking → asked. Локальный ID остаётся
         // активным, пока queued/running ход не завершится в Turns.
         keepQuestionGuard = true;
-        answer = 'Вопрос обрабатывается';
+        answer = 'Вопрос принят';
         return {
           question: draft.text,
           ticketId: draft.ticketId,

@@ -56,10 +56,14 @@ function parseCommand(text: string): ParsedCommand | null {
 }
 
 function ticketPrefix(text: string): string | null {
+  const full = text.match(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i);
+  if (full) return full[0].toLowerCase();
   const short = text.match(/#([0-9a-f]{8})\b/i);
-  if (short) return short[1].toLowerCase();
-  const full = text.match(/\b([0-9a-f]{8})-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i);
-  return full ? full[1].toLowerCase() : null;
+  return short ? short[1].toLowerCase() : null;
+}
+
+function isAmbiguousTicket(error: unknown): boolean {
+  return (error as { name?: unknown })?.name === 'TicketPrefixAmbiguousError';
 }
 
 function replyText(message?: TgMessage): string | undefined {
@@ -87,15 +91,47 @@ export class AlertBotService {
     const candidate = update as TelegramUpdate;
     if (!Number.isSafeInteger(candidate?.update_id)) return;
     const updateId = Number(candidate.update_id);
+    let claimed = false;
     try {
-      if (!await this.store.claimUpdate(updateId)) return;
+      claimed = await this.store.claimUpdate(updateId, candidate);
+      if (!claimed) return;
       if (candidate.callback_query) {
         await this.handleCallback(updateId, candidate.callback_query);
+      } else if (candidate.message) {
+        await this.handleMessage(updateId, candidate.message);
+      }
+      await this.store.completeUpdate(updateId);
+    } catch (error) {
+      const kind = safeErrorKind(error);
+      this.logger.error(`alert-bot update failed kind=${kind}`);
+      if (!claimed) return;
+      let final = false;
+      try {
+        final = await this.store.failUpdate(updateId, kind);
+      } catch (failureError) {
+        this.logger.error(`alert-bot retry state failed kind=${safeErrorKind(failureError)}`);
         return;
       }
-      if (candidate.message) await this.handleMessage(updateId, candidate.message);
+      if (final) await this.sendFinalFailure(candidate);
+    }
+  }
+
+  async retryFailedUpdates(): Promise<void> {
+    const due = await this.store.dueUpdates();
+    for (const item of due) await this.handleUpdate(item.payload);
+  }
+
+  private async sendFinalFailure(update: TelegramUpdate): Promise<void> {
+    const message = update.message || update.callback_query?.message;
+    if (!message) return;
+    try {
+      await this.telegram.sendMessage(
+        String(message.chat.id),
+        'Не удалось обработать запрос. Попробуйте ещё раз позже.',
+        message.message_id,
+      );
     } catch (error) {
-      this.logger.error(`alert-bot update failed kind=${safeErrorKind(error)}`);
+      this.logger.error(`alert-bot final failure notice failed kind=${safeErrorKind(error)}`);
     }
   }
 
@@ -246,7 +282,18 @@ export class AlertBotService {
 
     const repliedPrefix = ticketPrefix(repliedText || '');
     if (message.reply_to_message && repliedPrefix && (replyToBot || command?.name === 'ask')) {
-      const ticket = await this.support.findTicketByPrefix(repliedPrefix);
+      let ticket: Awaited<ReturnType<SupportService['findTicketByPrefix']>>;
+      try {
+        ticket = await this.support.findTicketByPrefix(repliedPrefix);
+      } catch (error) {
+        if (!isAmbiguousTicket(error)) throw error;
+        await this.telegram.sendMessage(
+          chatId,
+          'Найдено несколько тикетов с таким префиксом. Укажите полный UUID.',
+          message.message_id,
+        );
+        return;
+      }
       if (ticket) {
         if (command?.name === 'ask') {
           await this.enqueue(updateId, message, identity, question, {

@@ -31,9 +31,17 @@ export class AlertBotCommands {
 
   async close(ref: string, identity: AlertBotIdentity): Promise<string> {
     const prefix = String(ref || '').trim().replace(/^#/, '');
-    if (!/^[0-9a-f]{8}$/i.test(prefix)) return `Не нашёл тикет #${prefix}.`;
+    const short = /^[0-9a-f]{8}$/i.test(prefix);
+    const full = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(prefix);
+    if (!short && !full) return `Не нашёл тикет #${prefix}.`;
 
-    const ticket = await this.support.findTicketByPrefix(prefix);
+    let ticket: Awaited<ReturnType<SupportService['findTicketByPrefix']>>;
+    try {
+      ticket = await this.support.findTicketByPrefix(prefix);
+    } catch (error) {
+      if ((error as { name?: unknown })?.name !== 'TicketPrefixAmbiguousError') throw error;
+      return 'Найдено несколько тикетов с таким префиксом. Укажите полный UUID.';
+    }
     if (!ticket) return `Не нашёл тикет #${prefix}.`;
 
     await this.support.setStatusFromTelegram(ticket.id, identity.tgUserId, 'resolved', identity.adminUserId);

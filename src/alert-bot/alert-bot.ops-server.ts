@@ -67,10 +67,10 @@ export class AlertBotOpsServer {
   }
 
   async stop(): Promise<void> {
+    for (const active of [...this.activeTools]) active.cancel();
     const server = this.server;
     if (!server) return;
     this.server = null;
-    for (const active of [...this.activeTools]) active.cancel();
     await new Promise<void>((resolve) => {
       let settled = false;
       const finish = () => {

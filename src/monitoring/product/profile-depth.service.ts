@@ -1,5 +1,6 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import { Neo4jService } from '../../neo4j/neo4j.service';
+import { throwIfAborted } from '../../common/abort';
 
 /**
  * Profile depth — see monitoring.functions.md §3.3.
@@ -72,7 +73,7 @@ export class ProfileDepthService {
       `MATCH (n)
        WHERE labels(n)[0] IN ['Value','Belief','Desire','Intent','Interest','Skill']
        RETURN labels(n)[0] AS label, count(*) AS cnt`, {}, signal
-    ).catch((e) => { this.log.error(`entity counts failed: ${e.message}`); return []; });
+    ).catch((e) => { throwIfAborted(signal); this.log.error(`entity counts failed: ${e.message}`); return []; });
 
     const entityCounts: EntityCount[] = counts.map((r) => {
       const cnt = this.toInt(r.cnt);
@@ -93,7 +94,7 @@ export class ProfileDepthService {
                            WHEN 'Belief' THEN c*2 WHEN 'Desire' THEN c*2 WHEN 'Skill' THEN c*2
                            WHEN 'Interest' THEN c*1 ELSE 0 END) AS pds
        RETURN pds`, {}, signal
-    ).catch(() => []);
+    ).catch(() => { throwIfAborted(signal); return []; });
 
     const scores = perUserRows.map((r) => this.toInt(r.pds)).sort((a, b) => a - b);
     const profiles = scores.length;
@@ -112,7 +113,7 @@ export class ProfileDepthService {
        WITH date.truncate('week', date(ts)) AS week, count(*) AS n
        RETURN toString(week) AS week, n
        ORDER BY week`, {}, signal
-    ).catch(() => []);
+    ).catch(() => { throwIfAborted(signal); return []; });
 
     return {
       generatedAt: new Date().toISOString(),

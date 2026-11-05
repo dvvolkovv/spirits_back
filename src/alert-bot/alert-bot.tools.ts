@@ -255,10 +255,10 @@ export class AlertBotTools implements OpsToolHandler {
         data = await this.admin.getPaymentsStats({ days, includeTest: false }, signal);
         break;
       case 'tokens':
-        data = await this.admin.getTokensSpendStats({ days: effectiveDays, bucket: args.bucket === 'hour' ? 'hour' : 'day' }, signal);
+        data = await this.admin.getTokensSpendStats({ days: effectiveDays, bucket: (args.bucket || 'day') as 'day' | 'hour' | 'week' }, signal);
         break;
       case 'active':
-        data = await this.admin.getActiveUsersStats({ days, bucket: args.bucket === 'week' ? 'week' : 'day' }, signal);
+        data = await this.admin.getActiveUsersStats({ days, bucket: (args.bucket || 'day') as 'day' | 'hour' | 'week' }, signal);
         break;
       case 'funnel': {
         const to = new Date(Date.now());

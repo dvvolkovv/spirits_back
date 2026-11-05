@@ -361,7 +361,9 @@ maybe('хранилище бота алертов против PostgreSQL', () =
       pg.query = originalQuery;
     }
     expect(cleanupQueries).toEqual([
-      { text: 'DELETE FROM alert_bot_updates WHERE created_at < now() - $1::interval', params: ['7 days'] },
+      { text: `DELETE FROM alert_bot_updates
+       WHERE created_at < now() - $1::interval
+         AND (status = 'completed' OR (status = 'failed' AND next_retry_at IS NULL))`, params: ['7 days'] },
       { text: 'DELETE FROM alert_messages WHERE created_at < now() - $1::interval', params: ['30 days'] },
       { text: 'DELETE FROM alert_bot_ticket_drafts WHERE created_at < now() - $1::interval', params: ['30 days'] },
       { text: 'DELETE FROM alert_bot_turns WHERE created_at < now() - $1::interval', params: ['90 days'] },

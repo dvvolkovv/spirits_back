@@ -78,7 +78,7 @@ function runnerFreshness(scenarios: ScenarioStatus[], now: Date) {
     .map((s) => (s.latestTs ? new Date(s.latestTs).getTime() : 0))
     .reduce((a, b) => Math.max(a, b), 0);
   const ageMin = newest ? (now.getTime() - newest) / 60000 : Infinity;
-  return { ageMin, stale: external.length > 0 && ageMin > STALE_MINUTES };
+  return { ageMin, stale: ageMin > STALE_MINUTES };
 }
 
 @Injectable()
@@ -134,7 +134,10 @@ export class SyntheticService implements OnModuleInit {
     if (freshness.stale) {
       const staleCooled = !this.lastStaleAlertAt || (now.getTime() - this.lastStaleAlertAt.getTime()) >= REALERT_HOURS * 3600_000;
       if (staleCooled) {
-        await send(`<b>🟠 Синтетический мониторинг «ослеп»</b>\nНет результатов уже ${Math.round(ageMin)} мин (порог ${STALE_MINUTES}). Раннер на node-3, возможно, не работает — продуктовые сбои сейчас можно не заметить.`);
+        const ageText = Number.isFinite(ageMin)
+          ? `Нет результатов уже ${Math.round(ageMin)} мин`
+          : 'Нет результатов от внешнего раннера';
+        await send(`<b>🟠 Синтетический мониторинг «ослеп»</b>\n${ageText} (порог ${STALE_MINUTES} мин). Раннер на node-3, возможно, не работает — продуктовые сбои сейчас можно не заметить.`);
         this.lastStaleAlertAt = now;
       }
     } else {

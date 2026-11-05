@@ -79,6 +79,9 @@ describe('AlertBotService', () => {
     };
     store = {
       claimUpdate: jest.fn().mockResolvedValue(true),
+      completeUpdate: jest.fn().mockResolvedValue(undefined),
+      failUpdate: jest.fn().mockResolvedValue(false),
+      dueUpdates: jest.fn().mockResolvedValue([]),
       findTurnByAnswer: jest.fn().mockResolvedValue(null),
     };
     commands = {

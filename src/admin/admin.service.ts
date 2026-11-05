@@ -1358,13 +1358,15 @@ export class AdminService implements OnModuleInit {
     };
   }
 
-  async getTokensSpendStats(opts: { bucket?: 'day' | 'hour'; days?: number } = {}, signal?: AbortSignal) {
-    const bucket = opts.bucket === 'hour' ? 'hour' : 'day';
+  async getTokensSpendStats(opts: { bucket?: 'day' | 'hour' | 'week'; days?: number } = {}, signal?: AbortSignal) {
+    const bucket = opts.bucket || 'day';
     const days = bucket === 'hour'
       ? Math.min(Math.max(opts.days ?? 2, 1), 14)
       : Math.min(Math.max(opts.days ?? 30, 1), 365);
-    const stepInterval = bucket === 'hour' ? '1 hour' : '1 day';
-    const stepCount = bucket === 'hour' ? days * 24 - 1 : days - 1;
+    const stepInterval = bucket === 'hour' ? '1 hour' : bucket === 'week' ? '1 week' : '1 day';
+    const stepCount = bucket === 'hour'
+      ? days * 24 - 1
+      : bucket === 'week' ? Math.ceil(days / 7) - 1 : days - 1;
 
     const seriesRes = await this.pg.query(
       `WITH buckets AS (
@@ -1420,9 +1422,9 @@ export class AdminService implements OnModuleInit {
     };
   }
 
-  async getActiveUsersStats(opts: { days?: number; bucket?: 'day' | 'week' } = {}, signal?: AbortSignal) {
+  async getActiveUsersStats(opts: { days?: number; bucket?: 'day' | 'hour' | 'week' } = {}, signal?: AbortSignal) {
     const days = Math.min(Math.max(opts.days ?? 30, 1), 365);
-    const bucket = opts.bucket === 'week' ? 'week' : 'day';
+    const bucket = opts.bucket || 'day';
 
     const seriesRes = await this.pg.query(
       `WITH days AS (

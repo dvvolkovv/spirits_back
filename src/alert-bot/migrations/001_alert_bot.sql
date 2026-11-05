@@ -30,6 +30,16 @@ BEGIN
   );
   ALTER TABLE alert_bot_turns
     ADD COLUMN IF NOT EXISTS answer_message_ids jsonb NOT NULL DEFAULT '[]'::jsonb;
+  ALTER TABLE alert_bot_updates
+    ADD COLUMN IF NOT EXISTS payload jsonb,
+    ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'processing',
+    ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS next_retry_at timestamptz,
+    ADD COLUMN IF NOT EXISTS error_kind text,
+    ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+  UPDATE alert_bot_updates
+  SET status = 'completed', attempts = 1, updated_at = created_at
+  WHERE payload IS NULL;
   ALTER TABLE alert_bot_ticket_drafts
     ADD COLUMN IF NOT EXISTS claimed_at timestamptz;
   ALTER TABLE alert_bot_ticket_drafts
@@ -52,6 +62,13 @@ BEGIN
   END IF;
   IF to_regclass('idx_alert_bot_turns_in_progress') IS NULL THEN
     CREATE INDEX idx_alert_bot_turns_in_progress ON alert_bot_turns (status) WHERE status = 'in_progress';
+  END IF;
+  IF to_regclass('idx_alert_bot_turns_update') IS NULL THEN
+    CREATE UNIQUE INDEX idx_alert_bot_turns_update ON alert_bot_turns (update_id);
+  END IF;
+  IF to_regclass('idx_alert_bot_updates_retry') IS NULL THEN
+    CREATE INDEX idx_alert_bot_updates_retry ON alert_bot_updates (next_retry_at)
+      WHERE status = 'failed' AND next_retry_at IS NOT NULL;
   END IF;
   IF to_regclass('idx_alert_bot_drafts_expiry') IS NULL THEN
     CREATE INDEX idx_alert_bot_drafts_expiry ON alert_bot_ticket_drafts (expires_at) WHERE outcome IS NULL;
