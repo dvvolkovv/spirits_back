@@ -22,21 +22,31 @@ export function maskText(input: string, ticketIds: Iterable<string> = []): strin
   return s;
 }
 
+const TEMPORAL_KEYS = new Set([
+  'at', 'ts', 'time', 'timestamp', 'date', 'from', 'to', 'since', 'until',
+  'createdat', 'updatedat', 'latestts', 'expiresat', 'dueat',
+]);
+
+function isTemporalKey(key: string): boolean {
+  return TEMPORAL_KEYS.has(key.replace(/[\s_-]/g, '').toLowerCase());
+}
+
 function isUnixTimestamp(value: number): boolean {
   const seconds = value >= 1_000_000_000 && value <= 4_102_444_800;
   const milliseconds = value >= 100_000_000_000 && value <= 4_102_444_800_000;
   return seconds || milliseconds;
 }
 
-export function maskForModel(value: unknown): unknown {
+export function maskForModel(value: unknown, key?: string): unknown {
   if (typeof value === 'string') return maskText(value);
-  if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) {
-    const digits = String(value);
-    if (!isUnixTimestamp(value) && digits.length >= 10 && digits.length <= 15) {
-      return maskText(digits);
+  if (typeof value === 'number' && Number.isSafeInteger(value)) {
+    const digits = String(Math.abs(value));
+    if (digits.length >= 10 && digits.length <= 15) {
+      if (key && isTemporalKey(key) && isUnixTimestamp(value)) return value;
+      return maskText(String(value));
     }
   }
-  if (Array.isArray(value)) return value.map(maskForModel);
+  if (Array.isArray(value)) return value.map((item) => maskForModel(item, key));
   if (value instanceof Date) return value.toISOString();
   if (value && typeof value === 'object') {
     const entries: [string, unknown][] = [];
@@ -48,7 +58,7 @@ export function maskForModel(value: unknown): unknown {
       let collision = 2;
       while (keys.has(uniqueKey)) uniqueKey = `${maskedKey}#${collision++}`;
       keys.add(uniqueKey);
-      entries.push([uniqueKey, maskForModel(item)]);
+      entries.push([uniqueKey, maskForModel(item, key)]);
     }
     return Object.fromEntries(entries);
   }
@@ -66,9 +76,9 @@ export function toolText(value: unknown): string {
   const serialized = JSON.stringify(maskForModel(value)) ?? 'null';
   const timestamps: string[] = [];
   const protectedJson = serialized.replace(
-    /([:,\[])(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)(?=[,\]}])/g,
-    (match, prefix: string, numeric: string) => {
-      if (!isUnixTimestamp(Number(numeric))) return match;
+    /("((?:[^"\\]|\\.)*)"\s*:\s*)(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)(?=\s*[,}])/g,
+    (match, prefix: string, key: string, numeric: string) => {
+      if (!isTemporalKey(key) || !isUnixTimestamp(Number(numeric))) return match;
       const placeholder = `__ALERT_BOT_TIMESTAMP_${timestamps.length}__`;
       timestamps.push(numeric);
       return `${prefix}${placeholder}`;
