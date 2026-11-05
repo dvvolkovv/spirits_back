@@ -279,15 +279,21 @@ describe('черновики ответов в тикет', () => {
 
     const result = await drafts.handleCallback(callback({ action }));
 
-    if (action === 'ask') expect(result).toEqual({ question: 'текст', ticketId: TICKET });
+    if (action === 'ask') expect(result).toEqual({
+      question: 'текст', ticketId: TICKET, draftId: DRAFT, claimVersion: 1,
+    });
     else expect(result).toEqual({});
     expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
-    expect(store.finalizeDraft).toHaveBeenCalledWith(
-      DRAFT,
-      action === 'send' ? 'sending' : action === 'ask' ? 'asking' : 'cancelling',
-      action === 'send' ? 'sent' : action === 'ask' ? 'asked' : 'cancelled',
-      1,
-    );
+    if (action === 'ask') {
+      expect(store.finalizeDraft).not.toHaveBeenCalled();
+    } else {
+      expect(store.finalizeDraft).toHaveBeenCalledWith(
+        DRAFT,
+        action === 'send' ? 'sending' : 'cancelling',
+        action === 'send' ? 'sent' : 'cancelled',
+        1,
+      );
+    }
   });
 
   it('cancel финализирует черновик и меняет prompt на «Отменено»', async () => {
@@ -300,12 +306,15 @@ describe('черновики ответов в тикет', () => {
     expect(support.postOwnerReplyFromTelegram).not.toHaveBeenCalled();
   });
 
-  it('ask возвращает вопрос и ticketId, сам модель не вызывает', async () => {
+  it('ask резервирует черновик и возвращает claimVersion до admission', async () => {
     const result = await drafts.handleCallback(callback({ action: 'ask' }));
 
-    expect(result).toEqual({ question: 'текст', ticketId: TICKET });
+    expect(result).toEqual({
+      question: 'текст', ticketId: TICKET, draftId: DRAFT, claimVersion: 1,
+    });
     expect(store.claimDraft).toHaveBeenCalledWith(DRAFT, 'asking');
-    expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'asking', 'asked', 1);
+    expect(store.finalizeDraft).not.toHaveBeenCalled();
+    expect(store.releaseDraft).not.toHaveBeenCalled();
     expect(support.adminGetTicket).not.toHaveBeenCalled();
     expect(support.postOwnerReplyFromTelegram).not.toHaveBeenCalled();
     expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);

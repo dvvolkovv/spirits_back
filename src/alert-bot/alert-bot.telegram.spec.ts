@@ -27,6 +27,28 @@ describe('Telegram бота алертов', () => {
     await expect(tg.sendChunks('1', 'x'.repeat(9000), 10, 7)).resolves.toEqual([10, 11, 12]);
   });
 
+  it('onIds получает накопленные ID до сбоя третьего continuation', async () => {
+    let continuation = 0;
+    (axios.post as jest.Mock).mockImplementation(async (url: string) => {
+      if (url.endsWith('/editMessageText')) {
+        return { data: { ok: true, result: { message_id: 10 } } };
+      }
+      continuation += 1;
+      if (continuation === 3) throw { code: 'ECONNRESET' };
+      return { data: { ok: true, result: { message_id: 10 + continuation } } };
+    });
+    const tg = new AlertBotTelegram();
+    const seen: number[][] = [];
+
+    await expect(tg.sendChunks(
+      '1', 'x'.repeat(14000), 10, 7, undefined,
+      async (ids) => { seen.push(ids); },
+    )).rejects.toThrow('telegram sendMessage');
+
+    expect(continuation).toBe(3);
+    expect(seen).toEqual([[10], [10, 11], [10, 11, 12]]);
+  });
+
   it('пустой ответ тоже возвращает ID первого сообщения', async () => {
     (axios.post as jest.Mock).mockResolvedValue({ data: { ok: true, result: { message_id: 10 } } });
     const tg = new AlertBotTelegram();

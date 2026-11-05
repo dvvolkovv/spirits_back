@@ -4,6 +4,7 @@ jest.mock('@napi-rs/canvas', () => ({
   GlobalFonts: { register: jest.fn() },
 }));
 
+import { ClaudeCliCallError } from '../common/services/claude-cli.service';
 import { AlertBotTurns } from './alert-bot.turns';
 import { TurnInput } from './alert-bot.types';
 
@@ -91,7 +92,11 @@ describe('AlertBotTurns', () => {
   it('сохраняет placeholder, отправляет ответ с реальными тикетами и завершает ход с метриками', async () => {
     const text = 'Смотри #11111111 и #22222222; #33333333 не найден, зато есть #44444444. Повтор #11111111.';
     ai.answer.mockResolvedValue({ text, costUsd: 0.02, tools: ['health', 'tickets'] });
-    telegram.sendChunks.mockResolvedValue([901, 902, 903]);
+    telegram.sendChunks.mockImplementation(async (...args: any[]) => {
+      const onIds = args[5];
+      for (const ids of [[901], [901, 902], [901, 902, 903]]) await onIds?.(ids);
+      return [901, 902, 903];
+    });
     support.findTicketByPrefix.mockImplementation(async (prefix: string) => {
       if (prefix === '11111111') return { id: TICKET_1 };
       if (prefix === '22222222') return { id: TICKET_2 };
@@ -99,7 +104,7 @@ describe('AlertBotTurns', () => {
       return null;
     });
 
-    await turns.enqueue(question());
+    await expect(turns.enqueue(question())).resolves.toBe('accepted');
     await turns.idle();
 
     expect(telegram.sendMessage).toHaveBeenCalledWith('100', '🔎 Смотрю…', 300);
@@ -150,6 +155,25 @@ describe('AlertBotTurns', () => {
     expect(chat.endStream).toHaveBeenCalledTimes(1);
   });
 
+  it('реальный ClaudeCliCallError с kind other получает model fallback', async () => {
+    ai.answer.mockRejectedValue(new ClaudeCliCallError(
+      'claude CLI код выхода 1: other',
+      false,
+      { kind: 'other', access: false },
+    ));
+    status.summary.mockResolvedValue('Сводка без модели');
+
+    await turns.enqueue(question());
+
+    expect(status.summary).toHaveBeenCalledTimes(1);
+    expect(telegram.editMessageText).toHaveBeenCalledWith(
+      '100', 901, 'Модель недоступна: other.\n\nСводка без модели',
+    );
+    expect(store.finishTurn).toHaveBeenCalledWith('turn-1', expect.objectContaining({
+      status: 'model_down', errorKind: 'other',
+    }));
+  });
+
   it.each([
     [{ kind: 'other' }],
     [{ kind: 'unknown' }],
@@ -181,7 +205,7 @@ describe('AlertBotTurns', () => {
     const waiting1 = turns.enqueue(question({ updateId: 2, questionMessageId: 302 }));
     const waiting2 = turns.enqueue(question({ updateId: 3, questionMessageId: 303 }));
     const busy = turns.enqueue(question({ updateId: 4, questionMessageId: 304 }));
-    await busy;
+    await expect(busy).resolves.toBe('busy');
 
     expect(ai.answer).toHaveBeenCalledTimes(1);
     expect(store.tryCreateTurn).toHaveBeenCalledTimes(1);
@@ -202,7 +226,7 @@ describe('AlertBotTurns', () => {
     store.tryCreateTurn.mockResolvedValue(null);
     store.createTurn.mockResolvedValue('limited-1');
 
-    await turns.enqueue(question());
+    await expect(turns.enqueue(question())).resolves.toBe('rate_limited');
 
     expect(store.tryCreateTurn).toHaveBeenCalledWith(question(), 7);
     expect(store.countRecentTurns).not.toHaveBeenCalled();
@@ -276,6 +300,58 @@ describe('AlertBotTurns', () => {
     expect(store.recentTurns).not.toHaveBeenCalled();
     expect(store.turnChain).not.toHaveBeenCalled();
     expect(ai.answer).toHaveBeenCalledWith(expect.objectContaining({ history: [] }));
+  });
+
+  it('сбой attach после доставки не заменяет видимый ответ и не ломает отправку', async () => {
+    store.attachAnswerMessages
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(Object.assign(new Error('RAW-ATTACH-SECRET'), { kind: 'db_down' }));
+    telegram.sendChunks.mockImplementation(async (...args: any[]) => {
+      await args[5]?.([901]);
+      return [901];
+    });
+
+    await expect(turns.enqueue(question())).resolves.toBe('accepted');
+
+    expect(telegram.sendChunks).toHaveBeenCalledTimes(1);
+    expect(telegram.editMessageText).not.toHaveBeenCalledWith(
+      '100', 901, 'Не получилось ответить, попробуйте ещё раз',
+    );
+    expect(store.finishTurn).toHaveBeenCalledWith('turn-1', expect.objectContaining({ status: 'ok' }));
+    expect(JSON.stringify(logger.error.mock.calls)).not.toContain('RAW-ATTACH-SECRET');
+  });
+
+  it('сбой finish после доставки не заменяет видимый ответ generic error', async () => {
+    store.finishTurn.mockRejectedValueOnce(Object.assign(new Error('RAW-FINISH-SECRET'), { kind: 'db_down' }));
+    telegram.sendChunks.mockImplementation(async (...args: any[]) => {
+      await args[5]?.([901]);
+      return [901];
+    });
+
+    await expect(turns.enqueue(question())).resolves.toBe('accepted');
+
+    expect(telegram.editMessageText).not.toHaveBeenCalledWith(
+      '100', 901, 'Не получилось ответить, попробуйте ещё раз',
+    );
+    expect(JSON.stringify(logger.error.mock.calls)).not.toContain('RAW-FINISH-SECRET');
+  });
+
+  it('частично доставленные chunks сохраняются и не перезаписываются generic error', async () => {
+    telegram.sendChunks.mockImplementation(async (...args: any[]) => {
+      await args[5]?.([901]);
+      await args[5]?.([901, 902]);
+      throw Object.assign(new Error('RAW-CONTINUATION-SECRET'), { kind: 'send_failed' });
+    });
+
+    await expect(turns.enqueue(question())).resolves.toBe('accepted');
+
+    expect(store.attachAnswerMessages).toHaveBeenCalledWith('turn-1', [901, 902]);
+    expect(telegram.editMessageText).not.toHaveBeenCalled();
+    expect(telegram.sendMessage).toHaveBeenCalledWith(
+      '100', 'Ответ доставлен не полностью, попробуйте ещё раз', 300,
+    );
+    expect(store.finishTurn).toHaveBeenCalledWith('turn-1', expect.objectContaining({ status: 'error' }));
+    expect(JSON.stringify(logger.error.mock.calls)).not.toContain('RAW-CONTINUATION-SECRET');
   });
 
   it('неожиданная ошибка не раскрывает сырые данные, завершается один раз и освобождает очередь', async () => {

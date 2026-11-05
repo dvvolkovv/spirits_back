@@ -88,8 +88,10 @@ describe('AlertBotService', () => {
     drafts = {
       maybeDraft: jest.fn().mockResolvedValue(null),
       handleCallback: jest.fn().mockResolvedValue({}),
+      finalizeAsk: jest.fn().mockResolvedValue(undefined),
+      releaseAsk: jest.fn().mockResolvedValue(undefined),
     };
-    turns = { enqueue: jest.fn().mockResolvedValue(undefined) };
+    turns = { enqueue: jest.fn().mockResolvedValue('accepted') };
     support = { findTicketByPrefix: jest.fn().mockResolvedValue(null) };
     logger = { error: jest.fn() };
     service = new AlertBotService(
@@ -325,7 +327,9 @@ describe('AlertBotService', () => {
 
   it('duplicate callback update_id обрабатывается один раз', async () => {
     store.claimUpdate.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
-    drafts.handleCallback.mockResolvedValue({ question: 'Вопрос', ticketId: TICKET });
+    drafts.handleCallback.mockResolvedValue({
+      question: 'Вопрос', ticketId: TICKET, draftId: DRAFT, claimVersion: 1,
+    });
 
     await service.handleUpdate(callback(`draft:${DRAFT}:ask`, {}, 8));
     await service.handleUpdate(callback(`draft:${DRAFT}:ask`, {}, 8));
@@ -335,7 +339,9 @@ describe('AlertBotService', () => {
   });
 
   it('valid draft callback делегирует drafts и enqueue возвращённый вопрос', async () => {
-    drafts.handleCallback.mockResolvedValue({ question: 'Текст черновика', ticketId: TICKET });
+    drafts.handleCallback.mockResolvedValue({
+      question: 'Текст черновика', ticketId: TICKET, draftId: DRAFT, claimVersion: 3,
+    });
 
     await service.handleUpdate(callback(`draft:${DRAFT}:ask`));
 
@@ -347,6 +353,33 @@ describe('AlertBotService', () => {
       updateId: 1, chatId: '100', adminUserId: 'admin-1', question: 'Текст черновика',
       questionMessageId: 900, privateChat: true, ticketId: TICKET,
     }));
+    expect(drafts.finalizeAsk).toHaveBeenCalledWith(DRAFT, 3);
+    expect(drafts.releaseAsk).not.toHaveBeenCalled();
+  });
+
+  it.each(['busy', 'rate_limited'])('draft ask при admission %s освобождает резерв для retry', async (admission) => {
+    drafts.handleCallback.mockResolvedValue({
+      question: 'Текст черновика', ticketId: TICKET, draftId: DRAFT, claimVersion: 4,
+    });
+    turns.enqueue.mockResolvedValue(admission);
+
+    await service.handleUpdate(callback(`draft:${DRAFT}:ask`));
+
+    expect(drafts.releaseAsk).toHaveBeenCalledWith(DRAFT, 4);
+    expect(drafts.finalizeAsk).not.toHaveBeenCalled();
+  });
+
+  it('draft ask при сбое enqueue освобождает резерв для retry', async () => {
+    drafts.handleCallback.mockResolvedValue({
+      question: 'Текст черновика', ticketId: TICKET, draftId: DRAFT, claimVersion: 5,
+    });
+    turns.enqueue.mockRejectedValue(Object.assign(new Error('RAW-ADMISSION-SECRET'), { kind: 'db_down' }));
+
+    await service.handleUpdate(callback(`draft:${DRAFT}:ask`));
+
+    expect(drafts.releaseAsk).toHaveBeenCalledWith(DRAFT, 5);
+    expect(drafts.finalizeAsk).not.toHaveBeenCalled();
+    expect(JSON.stringify(logger.error.mock.calls)).not.toContain('RAW-ADMISSION-SECRET');
   });
 
   it.each(['send', 'cancel'])('valid admin callback %s проходит через service в drafts', async (action) => {

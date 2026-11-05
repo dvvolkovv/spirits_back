@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
 import { AlertBotStore } from './alert-bot.store';
+import { AlertBotTurns } from './alert-bot.turns';
 
 const PG = process.env.PROVISIONING_PG_URL;
 const maybe = PG ? describe : describe.skip;
@@ -58,6 +59,35 @@ maybe('хранилище бота алертов против PostgreSQL', () =
     expect(row.answer_message_id).toBe('20');
     expect(row.answer_message_ids).toEqual([20, 21, 22]);
     await store.finishTurn(id, { status: 'ok' });
+  });
+  it('при сбое continuation первые ID сохраняют parent для reply', async () => {
+    const input = { updateId: 1055, chatId: 'partial', tgUserId: '111', adminUserId: 'u-partial', questionMessageId: 10, question: 'длинный ответ', privateChat: true };
+    const telegram = {
+      sendMessage: jest.fn().mockResolvedValue({ message_id: 20 }),
+      editMessageText: jest.fn().mockResolvedValue(undefined),
+      sendChunks: jest.fn().mockImplementation(async (...args: any[]) => {
+        await args[5]?.([20]);
+        await args[5]?.([20, 21]);
+        throw Object.assign(new Error('continuation failed'), { kind: 'send_failed' });
+      }),
+    };
+    const turns = new AlertBotTurns(
+      store,
+      telegram as any,
+      { answer: jest.fn().mockResolvedValue({ text: 'частичный ответ', costUsd: 0, tools: [] }) } as any,
+      { summary: jest.fn() } as any,
+      { beginStream: jest.fn(), endStream: jest.fn() } as any,
+      { findTicketByPrefix: jest.fn().mockResolvedValue(null) } as any,
+    );
+
+    await expect(turns.enqueue(input)).resolves.toBe('accepted');
+
+    expect((await store.findTurnByAnswer('partial', 20))?.question).toBe(input.question);
+    expect((await store.findTurnByAnswer('partial', 21))?.question).toBe(input.question);
+    expect(telegram.editMessageText).not.toHaveBeenCalled();
+    expect(telegram.sendMessage).toHaveBeenCalledWith(
+      'partial', 'Ответ доставлен не полностью, попробуйте ещё раз', 10,
+    );
   });
   it('system turns сразу финальны, не тратят admission и не принимают поздний finish', async () => {
     const input = { updateId: 1060, chatId: 'system', tgUserId: '111', adminUserId: 'u-system', questionMessageId: 10, question: 'системный отказ', privateChat: true };
