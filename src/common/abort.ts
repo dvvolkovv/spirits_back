@@ -16,15 +16,37 @@ export async function fetchWithTimeout(
 ): Promise<Response> {
   throwIfAborted(signal);
   const controller = new AbortController();
-  const onAbort = () => controller.abort(signal!.reason);
-  signal?.addEventListener('abort', onAbort, { once: true });
-  const timer = setTimeout(() => controller.abort(new Error(`timeout after ${timeoutMs}ms`)), timeoutMs);
-  timer.unref();
-  try {
-    return await fetch(input, { ...init, signal: controller.signal });
-  } finally {
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
     clearTimeout(timer);
     signal?.removeEventListener('abort', onAbort);
+  };
+  const onAbort = () => {
+    controller.abort(signal!.reason);
+    cleanup();
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`timeout after ${timeoutMs}ms`));
+    cleanup();
+  }, timeoutMs);
+  timer.unref();
+  try {
+    const response = await fetch(input, { ...init, signal: controller.signal });
+    const json = response.json.bind(response);
+    response.json = async () => {
+      try { return await json(); } finally { cleanup(); }
+    };
+    const text = response.text.bind(response);
+    response.text = async () => {
+      try { return await text(); } finally { cleanup(); }
+    };
+    return response;
+  } catch (error) {
+    cleanup();
+    throw error;
   }
 }
 

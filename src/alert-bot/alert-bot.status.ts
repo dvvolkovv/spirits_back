@@ -25,9 +25,9 @@ export class AlertBotStatusService {
 
   async summary(): Promise<string> {
     const [alerts, badSections, tickets] = await Promise.allSettled([
-      withDeadline(this.firingAlerts(), STATUS_BLOCK_TIMEOUT_MS),
-      withDeadline(this.health.badSections(), STATUS_BLOCK_TIMEOUT_MS),
-      withDeadline(this.ticketCounts(), STATUS_BLOCK_TIMEOUT_MS),
+      withDeadline(() => this.firingAlerts(), STATUS_BLOCK_TIMEOUT_MS),
+      withDeadline(() => this.health.badSections(), STATUS_BLOCK_TIMEOUT_MS),
+      withDeadline(() => this.ticketCounts(), STATUS_BLOCK_TIMEOUT_MS),
     ]);
 
     const alertLines = alerts.status === 'rejected'

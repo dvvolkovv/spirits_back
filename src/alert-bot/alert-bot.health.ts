@@ -24,19 +24,34 @@ export type HealthSection = typeof HEALTH_SECTIONS[number];
 
 export const HEALTH_SOURCE_TIMEOUT_MS = 2000;
 
-/** Ограничивает внешний источник, всегда убирая свой timer после завершения. */
-export function withDeadline<T>(promise: Promise<T>, timeoutMs: number, signal?: AbortSignal): Promise<T> {
+/** Ограничивает источник linked AbortController: срабатывает более ранний внешний abort или timeout. */
+export function withDeadline<T>(
+  start: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
+    const controller = new AbortController();
     const cleanup = () => {
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
     };
-    const onAbort = () => { cleanup(); reject(abortReason(signal!)); };
-    const timer = setTimeout(() => { cleanup(); reject(new Error('source_timeout')); }, timeoutMs);
+    const onAbort = () => {
+      const error = abortReason(signal!);
+      controller.abort(error);
+      cleanup();
+      reject(error);
+    };
+    const timer = setTimeout(() => {
+      const error = new Error('source_timeout');
+      controller.abort(error);
+      cleanup();
+      reject(error);
+    }, timeoutMs);
     timer.unref();
     if (signal?.aborted) { onAbort(); return; }
     signal?.addEventListener('abort', onAbort, { once: true });
-    promise.then(
+    Promise.resolve().then(() => start(controller.signal)).then(
       (value) => { cleanup(); resolve(value); },
       (error) => { cleanup(); reject(error); },
     );
@@ -160,7 +175,7 @@ export class AlertBotHealthService {
 
   async getSection(section: HealthSection, signal?: AbortSignal): Promise<unknown> {
     try {
-      return await withDeadline(this.readSection(section, signal), HEALTH_SOURCE_TIMEOUT_MS, signal);
+      return await withDeadline((deadlineSignal) => this.readSection(section, deadlineSignal), HEALTH_SOURCE_TIMEOUT_MS, signal);
     } catch {
       return { error: 'source_failed' };
     }

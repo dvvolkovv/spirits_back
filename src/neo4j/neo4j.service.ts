@@ -4,7 +4,7 @@ import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { buildProfileExtractionPrompt } from './profile-extraction-prompt';
-import { awaitWithAbort } from '../common/abort';
+import { awaitWithAbort, throwIfAborted } from '../common/abort';
 
 @Injectable()
 export class Neo4jService implements OnModuleInit, OnModuleDestroy {
@@ -57,6 +57,7 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
       return closePromise;
     };
     try {
+      throwIfAborted(signal);
       // Закрытие Session обрывает Bolt-соединение и отменяет активный RUN на сервере.
       const r = await awaitWithAbort(session.run(cypher, params), signal, () => {
         void closeSession().catch(() => {});
