@@ -2033,3 +2033,8 @@ Commit: `docs(alert-bot): описать команды, ограничения 
 
 - Для вычисления `since` запрашивать ровно `ALERTS_FOR_STATE`, без селектора `alertstate`.
 - Причина: `forStateSample` в Prometheus (`alerting.go`, строки 264–281) копирует только labels правила и алерта и добавляет имена metric/alert; label `alertstate` у этой метрики отсутствует. Фильтр по нему теряет нужные samples.
+
+
+## Корректировка Stage B (05.11.2026): active tickets фильтруются в SQL
+
+`tickets(active:true)` не должен читать 200 строк и отбрасывать resolved/closed на клиенте. `AlertBotTools` передаёт фактический `limit` и `active` в `SupportService.adminListTickets`; условие `t.status NOT IN ('resolved','closed')` входит в `WHERE` до `ORDER BY/LIMIT`. Регрессия на реальном PostgreSQL: 205 closed с более высоким queue-приоритетом и один активный тикет — активный обязан попасть в выдачу. `active:false` сохраняет полный список.

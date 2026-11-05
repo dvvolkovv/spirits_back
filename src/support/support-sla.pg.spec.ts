@@ -435,4 +435,23 @@ maybe('support SLA migration against PostgreSQL', () => {
     });
     expect(mineEscalated.map((t) => t.id)).toEqual([overdueCritical, soonLow, repliedCritical]);
   });
+
+  it('filters active tickets in SQL before LIMIT with more than 200 closed rows', async () => {
+    await pool.query('TRUNCATE support_tickets CASCADE');
+    await pool.query(`
+      INSERT INTO support_tickets (user_id, status, urgency, updated_at)
+      SELECT 'closed-' || g, 'closed', 'critical', now() + g * interval '1 millisecond'
+      FROM generate_series(1, 205) g
+    `);
+    const active = await newTicket('ai_handling');
+    await pool.query(
+      `UPDATE support_tickets SET urgency = 'low', updated_at = now() - interval '1 day' WHERE id = $1`,
+      [active],
+    );
+    const service = makeService();
+
+    const rows = await service.adminListTickets({ active: true, limit: 20 } as any);
+
+    expect(rows.map((row) => row.id)).toEqual([active]);
+  });
 });
