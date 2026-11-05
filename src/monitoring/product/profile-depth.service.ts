@@ -55,7 +55,7 @@ export class ProfileDepthService {
     return Number(v) || 0;
   }
 
-  async getOverview(): Promise<ProfileDepthOverview> {
+  async getOverview(signal?: AbortSignal): Promise<ProfileDepthOverview> {
     if (!this.neo4j) {
       return {
         generatedAt: new Date().toISOString(),
@@ -71,7 +71,7 @@ export class ProfileDepthService {
     const counts = await this.neo4j.readRows(
       `MATCH (n)
        WHERE labels(n)[0] IN ['Value','Belief','Desire','Intent','Interest','Skill']
-       RETURN labels(n)[0] AS label, count(*) AS cnt`,
+       RETURN labels(n)[0] AS label, count(*) AS cnt`, {}, signal
     ).catch((e) => { this.log.error(`entity counts failed: ${e.message}`); return []; });
 
     const entityCounts: EntityCount[] = counts.map((r) => {
@@ -92,7 +92,7 @@ export class ProfileDepthService {
             sum(CASE label WHEN 'Value' THEN c*3 WHEN 'Intent' THEN c*3
                            WHEN 'Belief' THEN c*2 WHEN 'Desire' THEN c*2 WHEN 'Skill' THEN c*2
                            WHEN 'Interest' THEN c*1 ELSE 0 END) AS pds
-       RETURN pds`,
+       RETURN pds`, {}, signal
     ).catch(() => []);
 
     const scores = perUserRows.map((r) => this.toInt(r.pds)).sort((a, b) => a - b);
@@ -111,7 +111,7 @@ export class ProfileDepthService {
        WHERE ts IS NOT NULL AND ts >= datetime() - duration({weeks: 8})
        WITH date.truncate('week', date(ts)) AS week, count(*) AS n
        RETURN toString(week) AS week, n
-       ORDER BY week`,
+       ORDER BY week`, {}, signal
     ).catch(() => []);
 
     return {

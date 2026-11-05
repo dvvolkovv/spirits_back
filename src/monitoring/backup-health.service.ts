@@ -1,3 +1,4 @@
+import { throwIfAborted } from '../common/abort';
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { spawn } from 'child_process';
@@ -291,7 +292,8 @@ export class BackupHealthService implements OnModuleInit {
     }
   }
 
-  async getOverview(): Promise<BackupHealthOverview> {
+  async getOverview(signal?: AbortSignal): Promise<BackupHealthOverview> {
+    throwIfAborted(signal);
     return this.cache;
   }
 }

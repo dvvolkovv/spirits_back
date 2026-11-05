@@ -319,7 +319,7 @@ export class AlertBotStore {
     );
   }
 
-  async recentAlerts(hours: number, limit = 50): Promise<AlertMessage[]> {
+  async recentAlerts(hours: number, limit = 50, signal?: AbortSignal): Promise<AlertMessage[]> {
     const boundedHours = clampInteger(hours, 1, 72);
     const boundedLimit = clampInteger(limit, 1, 50);
     const r = await this.pg.query(
@@ -327,6 +327,7 @@ export class AlertBotStore {
        WHERE created_at >= now() - ($1 * interval '1 hour')
        ORDER BY created_at DESC LIMIT $2`,
       [boundedHours, boundedLimit],
+      signal,
     );
     return r.rows.map((row) => ({
       id: Number(row.id),

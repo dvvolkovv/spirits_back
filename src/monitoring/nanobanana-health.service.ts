@@ -1,3 +1,4 @@
+import { throwIfAborted } from '../common/abort';
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import axios from 'axios';
@@ -154,7 +155,8 @@ export class NanoBananaHealthService implements OnModuleInit {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  getOverview(): NanoBananaHealthOverview {
+  getOverview(signal?: AbortSignal): NanoBananaHealthOverview {
+    throwIfAborted(signal);
     return {
       generatedAt: new Date().toISOString(),
       configured: this.configured(),

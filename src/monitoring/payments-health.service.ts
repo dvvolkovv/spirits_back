@@ -1,3 +1,4 @@
+import { throwIfAborted } from '../common/abort';
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import axios from 'axios';
@@ -315,7 +316,8 @@ export class PaymentsHealthService {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  getOverview(): PaymentsHealthOverview {
+  getOverview(signal?: AbortSignal): PaymentsHealthOverview {
+    throwIfAborted(signal);
     return {
       generatedAt: new Date().toISOString(),
       shop: {

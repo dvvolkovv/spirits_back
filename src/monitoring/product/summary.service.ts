@@ -46,9 +46,9 @@ export class SummaryService {
     private readonly profileDepth: ProfileDepthService,
   ) {}
 
-  private async num(sql: string, params: any[] = []): Promise<number | null> {
+  private async num(sql: string, params: any[] = [], signal?: AbortSignal): Promise<number | null> {
     try {
-      const r = await this.pg.query(sql, params);
+      const r = await this.pg.query(sql, params, signal);
       const v = r.rows[0]?.v;
       if (v === null || v === undefined) return null;
       const n = Number(v);
@@ -60,13 +60,13 @@ export class SummaryService {
   }
 
   // PDS: from ProfileDepthService overview.
-  private async pds(): Promise<number | null> {
-    const o = await this.profileDepth.getOverview().catch(() => null);
+  private async pds(signal?: AbortSignal): Promise<number | null> {
+    const o = await this.profileDepth.getOverview(signal).catch(() => null);
     return o?.perUser.avgPds ?? null;
   }
 
   // Request Accept rate: approved / (approved + declined) all time.
-  private async requestAcceptRate(): Promise<number | null> {
+  private async requestAcceptRate(signal?: AbortSignal): Promise<number | null> {
     return this.num(
       `SELECT
          CASE WHEN approved + declined = 0 THEN NULL
@@ -77,12 +77,14 @@ export class SummaryService {
            COUNT(*) FILTER (WHERE status = 'declined')::int AS declined
          FROM contact_requests
        ) t`,
+      undefined,
+      signal,
     );
   }
 
   // TTV-результат: median (signup_completed → message_sent) gap in hours,
   // last 30 days of signups.
-  private async ttvMedianHours(): Promise<number | null> {
+  private async ttvMedianHours(signal?: AbortSignal): Promise<number | null> {
     return this.num(
       `WITH cohort AS (
          SELECT user_id AS uid, MIN(ts) AS signup_ts
@@ -106,25 +108,28 @@ export class SummaryService {
        FROM cohort
        JOIN first_msg ON first_msg.uid = cohort.uid`,
       [excluded],
+      signal,
     );
   }
 
   // AI-share поддержки: % tickets that never had an 'escalate' event,
   // i.e. AI handled them end-to-end without owner involvement. Matches
   // the stricter definition used by SupportService.
-  private async aiShareSupport(): Promise<number | null> {
+  private async aiShareSupport(signal?: AbortSignal): Promise<number | null> {
     return this.num(
       `SELECT CASE WHEN COUNT(*) = 0 THEN NULL
               ELSE 100.0 * COUNT(*) FILTER (
                 WHERE id NOT IN (SELECT ticket_id FROM support_events WHERE action = 'escalate')
               ) / COUNT(*) END AS v
        FROM support_tickets`,
+      undefined,
+      signal,
     );
   }
 
   // Margin per 1000 tokens: revenue (RUB) / tokens distributed via payments * 1000.
   // Both numbers from payments.succeeded — purest signal of paid-token economics.
-  private async marginPer1k(): Promise<number | null> {
+  private async marginPer1k(signal?: AbortSignal): Promise<number | null> {
     return this.num(
       `SELECT CASE WHEN SUM(tokens) = 0 THEN NULL
               ELSE 1000.0 * SUM(amount) / SUM(tokens) END AS v
@@ -132,12 +137,13 @@ export class SummaryService {
        WHERE status = 'succeeded'
          AND user_id <> ALL($1::text[])`,
       [excluded],
+      signal,
     );
   }
 
   // Funnel: signup → first_value (proxy = first message ≥ 1).
   // Of users who signed up in last 30 days, what % had message_sent within 7 days.
-  private async signupToFirstValue(): Promise<number | null> {
+  private async signupToFirstValue(signal?: AbortSignal): Promise<number | null> {
     return this.num(
       `WITH cohort AS (
          SELECT user_id AS uid, MIN(ts) AS signup_ts
@@ -157,11 +163,12 @@ export class SummaryService {
        SELECT CASE WHEN (SELECT COUNT(*) FROM cohort) = 0 THEN NULL
               ELSE 100.0 * (SELECT COUNT(*) FROM reached) / (SELECT COUNT(*) FROM cohort) END AS v`,
       [excluded],
+      signal,
     );
   }
 
   // Funnel: % of payers who reached a second payment (all-time).
-  private async firstToSecondPayment(): Promise<number | null> {
+  private async firstToSecondPayment(signal?: AbortSignal): Promise<number | null> {
     return this.num(
       `WITH p AS (
          SELECT user_id, COUNT(*) AS n
@@ -173,11 +180,12 @@ export class SummaryService {
               ELSE 100.0 * COUNT(*) FILTER (WHERE n >= 2) / COUNT(*) END AS v
        FROM p`,
       [excluded],
+      signal,
     );
   }
 
   // Churn D30: of users who signed up 30+ days ago, % with no activity in last 14 days.
-  private async churnD30(): Promise<number | null> {
+  private async churnD30(signal?: AbortSignal): Promise<number | null> {
     return this.num(
       `WITH cohort AS (
          SELECT internal_id AS uid
@@ -199,11 +207,12 @@ export class SummaryService {
                 )
               ) / (SELECT COUNT(*) FROM cohort) END AS v`,
       [excluded],
+      signal,
     );
   }
 
   // Paid churn 60d: of users who had a payment 60+ days ago, % with no new payment since.
-  private async paidChurn60(): Promise<number | null> {
+  private async paidChurn60(signal?: AbortSignal): Promise<number | null> {
     return this.num(
       `WITH last_pay AS (
          SELECT user_id, MAX(completed_at) AS last_at, COUNT(*) AS n
@@ -215,11 +224,12 @@ export class SummaryService {
               ELSE 100.0 * COUNT(*) FILTER (WHERE last_at < now() - interval '60 days') / COUNT(*) END AS v
        FROM last_pay`,
       [excluded],
+      signal,
     );
   }
 
   // Feature health: % of latest-run synthetic scenarios that succeeded.
-  private async featureHealth(): Promise<number | null> {
+  private async featureHealth(signal?: AbortSignal): Promise<number | null> {
     return this.num(
       `WITH latest AS (
          SELECT DISTINCT ON (scenario) scenario, success
@@ -228,26 +238,28 @@ export class SummaryService {
        SELECT CASE WHEN COUNT(*) = 0 THEN NULL
               ELSE 100.0 * COUNT(*) FILTER (WHERE success) / COUNT(*) END AS v
        FROM latest`,
+      undefined,
+      signal,
     );
   }
 
-  async getOverview(): Promise<SummaryOverview> {
+  async getOverview(signal?: AbortSignal): Promise<SummaryOverview> {
     const [
       pds, raReq, ttv, aiShare, margin,
       sigToFv, firstToSecond,
       churnD30, paid60,
       featureHealth,
     ] = await Promise.all([
-      this.pds(),
-      this.requestAcceptRate(),
-      this.ttvMedianHours(),
-      this.aiShareSupport(),
-      this.marginPer1k(),
-      this.signupToFirstValue(),
-      this.firstToSecondPayment(),
-      this.churnD30(),
-      this.paidChurn60(),
-      this.featureHealth(),
+      this.pds(signal),
+      this.requestAcceptRate(signal),
+      this.ttvMedianHours(signal),
+      this.aiShareSupport(signal),
+      this.marginPer1k(signal),
+      this.signupToFirstValue(signal),
+      this.firstToSecondPayment(signal),
+      this.churnD30(signal),
+      this.paidChurn60(signal),
+      this.featureHealth(signal),
     ]);
 
     const status = (val: number | null, good: (n: number) => boolean, warn: (n: number) => boolean): Status => {

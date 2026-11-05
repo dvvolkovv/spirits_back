@@ -1,3 +1,4 @@
+import { throwIfAborted } from '../common/abort';
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
@@ -443,7 +444,8 @@ export class ClaudeHealthService implements OnModuleInit {
     return { switchProvider, enabled: !!st?.enabled, down: !!st && st.downUntil > now };
   }
 
-  async getOverview(): Promise<ClaudeHealthOverview> {
+  async getOverview(signal?: AbortSignal): Promise<ClaudeHealthOverview> {
+    throwIfAborted(signal);
     return {
       generatedAt: new Date().toISOString(),
       usage: this.cache,

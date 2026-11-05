@@ -1046,6 +1046,7 @@ ${healthSummary}
 
   async adminListTickets(
     opts: { status?: string; limit?: number; sla?: SlaFilter; actorId?: string } = {},
+    signal?: AbortSignal,
   ) {
     const limit = Math.max(1, Math.min(200, opts.limit ?? 50));
     const params: any[] = [];
@@ -1085,6 +1086,7 @@ ${healthSummary}
            t.updated_at DESC
          LIMIT ${limit}`,
       params,
+      signal,
     );
     return rows.rows.map((r: any) => ({
       id: r.id,
@@ -1109,21 +1111,24 @@ ${healthSummary}
     }));
   }
 
-  async adminGetTicket(ticketId: string) {
-    const t = await this.pg.query(`SELECT * FROM support_tickets WHERE id = $1`, [ticketId]);
+  async adminGetTicket(ticketId: string, signal?: AbortSignal) {
+    const t = await this.pg.query(`SELECT * FROM support_tickets WHERE id = $1`, [ticketId], signal);
     const row = t.rows[0];
     if (!row) throw new NotFoundException('ticket not found');
     const messages = await this.pg.query(
       `SELECT * FROM support_messages WHERE ticket_id = $1 ORDER BY created_at ASC LIMIT 500`,
       [ticketId],
+      signal,
     );
     const events = await this.pg.query(
       `SELECT * FROM support_events WHERE ticket_id = $1 ORDER BY created_at ASC LIMIT 200`,
       [ticketId],
+      signal,
     );
     const profile = await this.pg.query(
       `SELECT profile_data, tokens, email, isadmin, created_at FROM ai_profiles_consolidated WHERE user_id = $1`,
       [row.user_id],
+      signal,
     );
     return {
       ticket: row,
@@ -1328,12 +1333,13 @@ ${healthSummary}
    * Find an active ticket by its short id prefix (first 8 hex chars of the uuid).
    * Used when owner replies in Telegram — only the prefix is embedded in the escalation text.
    */
-  async findTicketByPrefix(prefix: string): Promise<SupportTicketRow | null> {
+  async findTicketByPrefix(prefix: string, signal?: AbortSignal): Promise<SupportTicketRow | null> {
     const clean = prefix.toLowerCase().replace(/[^a-f0-9]/g, '').slice(0, 8);
     if (clean.length !== 8) return null;
     const r = await this.pg.query(
       `SELECT * FROM support_tickets WHERE id::text LIKE $1 ORDER BY created_at DESC LIMIT 1`,
       [`${clean}%`],
+      signal,
     );
     return r.rows[0] || null;
   }

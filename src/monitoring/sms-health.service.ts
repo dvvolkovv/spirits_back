@@ -123,7 +123,7 @@ export class SmsHealthService implements OnModuleInit {
     }
   }
 
-  async getOverview(): Promise<SmsHealthOverview> {
+  async getOverview(signal?: AbortSignal): Promise<SmsHealthOverview> {
     const stats = await this.pg.query(
       `SELECT
          COUNT(*) FILTER (WHERE name = 'sms_aero_success')::int AS success_count,
@@ -131,12 +131,16 @@ export class SmsHealthService implements OnModuleInit {
        FROM events
        WHERE name IN ('sms_aero_success', 'sms_aero_failure')
          AND ts >= now() - interval '24 hours'`,
+      [],
+      signal,
     );
     const lastFail = await this.pg.query(
       `SELECT ts, props->>'reason' AS reason
        FROM events
        WHERE name = 'sms_aero_failure'
        ORDER BY ts DESC LIMIT 1`,
+      [],
+      signal,
     );
     const reasons = await this.pg.query(
       `SELECT COALESCE(props->>'reason', 'unknown') AS reason, COUNT(*)::int AS count
@@ -144,6 +148,8 @@ export class SmsHealthService implements OnModuleInit {
        WHERE name = 'sms_aero_failure'
          AND ts >= now() - interval '7 days'
        GROUP BY 1 ORDER BY count DESC LIMIT 5`,
+      [],
+      signal,
     );
 
     const success24h = parseInt(stats.rows[0]?.success_count || '0', 10);

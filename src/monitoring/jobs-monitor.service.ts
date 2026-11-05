@@ -70,12 +70,12 @@ export class JobsMonitorService {
 
   constructor(private readonly pg: PgService) {}
 
-  async getOverview(): Promise<JobsMonitorOverview> {
+  async getOverview(signal?: AbortSignal): Promise<JobsMonitorOverview> {
     const [video, tokens, vpm, compaction] = await Promise.all([
-      this.videoJobs(),
-      this.tokenTasks(),
-      this.vpmRecent(),
-      this.compaction(),
+      this.videoJobs(signal),
+      this.tokenTasks(signal),
+      this.vpmRecent(signal),
+      this.compaction(signal),
     ]);
     return {
       generatedAt: new Date().toISOString(),
@@ -83,13 +83,15 @@ export class JobsMonitorService {
     };
   }
 
-  private async videoJobs(): Promise<VideoJobsStat> {
+  private async videoJobs(signal?: AbortSignal): Promise<VideoJobsStat> {
     try {
       const counts = await this.pg.query(
         `SELECT status, COUNT(*)::int AS n
            FROM video_jobs
           WHERE created_at > now() - interval '30 days'
           GROUP BY status`,
+        [],
+        signal,
       );
       const status_counts: Record<string, number> = {};
       for (const r of counts.rows as any[]) status_counts[r.status] = r.n;
@@ -97,6 +99,8 @@ export class JobsMonitorService {
       const oldest = await this.pg.query(
         `SELECT EXTRACT(EPOCH FROM (now() - MIN(created_at)))/60 AS age_min
            FROM video_jobs WHERE status IN ('pending','processing')`,
+        [],
+        signal,
       );
       const ageMin = oldest.rows[0]?.age_min;
       const oldest_pending_age_min = ageMin == null ? null : +Number(ageMin).toFixed(1);
@@ -114,13 +118,15 @@ export class JobsMonitorService {
     }
   }
 
-  private async tokenTasks(): Promise<TokenTasksStat> {
+  private async tokenTasks(signal?: AbortSignal): Promise<TokenTasksStat> {
     try {
       const counts = await this.pg.query(
         `SELECT status::text AS status, COUNT(*)::int AS n
            FROM token_consumption_tasks
           WHERE created_at > now() - interval '7 days'
           GROUP BY status`,
+        [],
+        signal,
       );
       const status_counts: Record<string, number> = {};
       for (const r of counts.rows as any[]) status_counts[r.status] = r.n;
@@ -128,6 +134,8 @@ export class JobsMonitorService {
       const oldest = await this.pg.query(
         `SELECT EXTRACT(EPOCH FROM (now() - MIN(created_at))) AS age_sec
            FROM token_consumption_tasks WHERE status::text IN ('pending','processing')`,
+        [],
+        signal,
       );
       const ageSec = oldest.rows[0]?.age_sec;
       const oldest_pending_age_sec = ageSec == null ? null : +Number(ageSec).toFixed(0);
@@ -145,7 +153,7 @@ export class JobsMonitorService {
     }
   }
 
-  private async vpmRecent(): Promise<VpmRecentRun[]> {
+  private async vpmRecent(signal?: AbortSignal): Promise<VpmRecentRun[]> {
     try {
       const r = await this.pg.query(
         `SELECT id, trigger, cost_usd, duration_ms, error_message, created_at,
@@ -153,6 +161,8 @@ export class JobsMonitorService {
            FROM vpm_runs
           ORDER BY created_at DESC
           LIMIT 5`,
+        [],
+        signal,
       );
       return r.rows.map((row: any) => ({
         id: row.id,
@@ -169,7 +179,7 @@ export class JobsMonitorService {
     }
   }
 
-  private async compaction(): Promise<CompactionStat> {
+  private async compaction(signal?: AbortSignal): Promise<CompactionStat> {
     // Schedule string mirrors the @Cron('0 4 * * *') in profile-compaction.service.
     // We compute "next run in" relative to that. Last-run is best-effort: the
     // compaction writes back to ai_profiles_consolidated.updated_at on each
@@ -178,10 +188,12 @@ export class JobsMonitorService {
     let active_profiles = 0;
     let last_run_at: string | null = null;
     try {
-      const cnt = await this.pg.query(`SELECT COUNT(*)::int AS n FROM ai_profiles_consolidated`);
+      const cnt = await this.pg.query(`SELECT COUNT(*)::int AS n FROM ai_profiles_consolidated`, [], signal);
       active_profiles = cnt.rows[0]?.n || 0;
       const last = await this.pg.query(
         `SELECT MAX(updated_at) AS t FROM ai_profiles_consolidated`,
+        [],
+        signal,
       );
       last_run_at = last.rows[0]?.t ? new Date(last.rows[0].t).toISOString() : null;
     } catch (e: any) {

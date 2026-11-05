@@ -125,16 +125,16 @@ export class AlertBotTools implements OpsToolHandler {
     name: string,
     args: Record<string, unknown>,
     _ctx: OpsContext,
-    _signal?: AbortSignal,
+    signal?: AbortSignal,
   ): Promise<string> {
     try {
       let result: unknown;
       switch (name) {
-        case 'alerts': result = await this.alerts(args); break;
-        case 'health': result = await this.healthTool(args); break;
-        case 'logs': result = await this.logs(args); break;
-        case 'stats': result = await this.stats(args); break;
-        case 'tickets': result = await this.tickets(args); break;
+        case 'alerts': result = await this.alerts(args, signal); break;
+        case 'health': result = await this.healthTool(args, signal); break;
+        case 'logs': result = await this.logs(args, signal); break;
+        case 'stats': result = await this.stats(args, signal); break;
+        case 'tickets': result = await this.tickets(args, signal); break;
         default: result = { error: 'unknown_tool' };
       }
       return toolText(result);
@@ -143,13 +143,13 @@ export class AlertBotTools implements OpsToolHandler {
     }
   }
 
-  private async alerts(args: Record<string, unknown>): Promise<unknown> {
+  private async alerts(args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
     const hours = intArg(args.hours, 1, 72, 24);
     const [firingResult, stateResult, historyResult, journalResult] = await Promise.allSettled([
-      this.monitoring.query('ALERTS{alertstate="firing"}'),
-      this.monitoring.query('ALERTS_FOR_STATE{alertstate="firing"}'),
-      this.monitoring.query(`max_over_time(ALERTS{alertstate="firing"}[${hours}h])`),
-      this.store.recentAlerts(hours, 50),
+      this.monitoring.query('ALERTS{alertstate="firing"}', signal),
+      this.monitoring.query('ALERTS_FOR_STATE{alertstate="firing"}', signal),
+      this.monitoring.query(`max_over_time(ALERTS{alertstate="firing"}[${hours}h])`, signal),
+      this.store.recentAlerts(hours, 50, signal),
     ]);
 
     const prometheusFailed = [firingResult, stateResult, historyResult]
@@ -182,15 +182,15 @@ export class AlertBotTools implements OpsToolHandler {
     };
   }
 
-  private async healthTool(args: Record<string, unknown>): Promise<unknown> {
+  private async healthTool(args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
     const section = args.section;
     if (typeof section !== 'string' || !HEALTH_SECTIONS.includes(section as HealthSection)) {
       return { error: 'invalid_params' };
     }
-    return { section, data: await this.health.getSection(section as HealthSection) };
+    return { section, data: await this.health.getSection(section as HealthSection, signal) };
   }
 
-  private async logs(args: Record<string, unknown>): Promise<unknown> {
+  private async logs(args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
     if (typeof args.query !== 'string' || !args.query.trim()) return { error: 'invalid_params' };
     if (args.level !== undefined && !['error', 'warn', 'all'].includes(String(args.level))) {
       return { error: 'invalid_params' };
@@ -208,7 +208,7 @@ export class AlertBotTools implements OpsToolHandler {
     const toMs = Date.now();
     const to = (BigInt(toMs) * 1_000_000n).toString();
     const from = (BigInt(toMs - minutes * 60_000) * 1_000_000n).toString();
-    const response = await this.logsService.query({ query: selector, from, to, limit });
+    const response = await this.logsService.query({ query: selector, from, to, limit }, signal);
     return {
       query: response.query,
       from: response.from,
@@ -222,7 +222,7 @@ export class AlertBotTools implements OpsToolHandler {
     };
   }
 
-  private async stats(args: Record<string, unknown>): Promise<unknown> {
+  private async stats(args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
     const section = args.section;
     if (typeof section !== 'string' || !STATS_SECTIONS.includes(section as StatsSection)) {
       return { error: 'invalid_params' };
@@ -238,41 +238,41 @@ export class AlertBotTools implements OpsToolHandler {
     let data: unknown;
     switch (section as StatsSection) {
       case 'payments':
-        data = await this.admin.getPaymentsStats({ days, includeTest: false });
+        data = await this.admin.getPaymentsStats({ days, includeTest: false }, signal);
         break;
       case 'tokens':
-        data = await this.admin.getTokensSpendStats({ days, bucket: args.bucket === 'hour' ? 'hour' : 'day' });
+        data = await this.admin.getTokensSpendStats({ days, bucket: args.bucket === 'hour' ? 'hour' : 'day' }, signal);
         break;
       case 'active':
-        data = await this.admin.getActiveUsersStats({ days, bucket: args.bucket === 'week' ? 'week' : 'day' });
+        data = await this.admin.getActiveUsersStats({ days, bucket: args.bucket === 'week' ? 'week' : 'day' }, signal);
         break;
       case 'funnel': {
         const to = new Date(Date.now());
         const from = new Date(to.getTime() - days * DAY_MS);
         const source = typeof args.source === 'string' && args.source.trim() ? args.source.trim() : null;
-        data = await this.funnel.getFunnel(from.toISOString(), to.toISOString(), source);
+        data = await this.funnel.getFunnel(from.toISOString(), to.toISOString(), source, signal);
         break;
       }
       case 'summary':
-        data = await this.summaryService.getOverview();
+        data = await this.summaryService.getOverview(signal);
         break;
       case 'economy':
-        data = await this.economy.getOverview(window);
+        data = await this.economy.getOverview(window, signal);
         break;
     }
     return { section, days, window, data };
   }
 
-  private async tickets(args: Record<string, unknown>): Promise<unknown> {
+  private async tickets(args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
     if (args.active !== undefined && typeof args.active !== 'boolean') return { error: 'invalid_params' };
     if (args.ticket !== undefined) {
       if (typeof args.ticket !== 'string' || !/^#[0-9a-f]{8}$/i.test(args.ticket)) {
         return { error: 'invalid_params' };
       }
       const prefix = args.ticket.slice(1).toLowerCase();
-      const found = await this.support.findTicketByPrefix(prefix);
+      const found = await this.support.findTicketByPrefix(prefix, signal);
       if (!found) return { error: 'not_found' };
-      const card = await this.support.adminGetTicket(found.id);
+      const card = await this.support.adminGetTicket(found.id, signal);
       return {
         ticket: this.ticketSummary(card.ticket),
         messages: (card.messages || []).slice(-10).map((message: any) => ({
@@ -284,7 +284,7 @@ export class AlertBotTools implements OpsToolHandler {
     }
 
     const limit = intArg(args.limit, 1, 20, 20);
-    const rows = await this.support.adminListTickets({ limit: 200 });
+    const rows = await this.support.adminListTickets({ limit: 200 }, signal);
     const tickets = rows
       .filter((row: any) => args.active === false || !['resolved', 'closed'].includes(row.status))
       .slice(0, limit)

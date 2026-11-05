@@ -236,7 +236,7 @@ export class SyntheticService implements OnModuleInit {
     }
   }
 
-  async getOverview(): Promise<SyntheticOverview> {
+  async getOverview(signal?: AbortSignal): Promise<SyntheticOverview> {
     if (!this.pg) return { generatedAt: new Date().toISOString(), stale: false, scenarios: [] };
 
     // For each scenario: latest run row + 24h aggregates.
@@ -265,6 +265,8 @@ export class SyntheticService implements OnModuleInit {
        FROM latest l
        LEFT JOIN agg a ON a.scenario = l.scenario
        ORDER BY l.scenario`,
+      [],
+      signal,
     );
 
     const scenarios: ScenarioStatus[] = r.rows.map((row: any) => {

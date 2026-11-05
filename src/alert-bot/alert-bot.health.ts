@@ -14,6 +14,7 @@ import { JobsMonitorService } from '../monitoring/jobs-monitor.service';
 import { ReplicationHealthService } from '../monitoring/replication-health.service';
 import { NeoSnapshotHealthService } from '../monitoring/neo-snapshot-health.service';
 import { MinioMirrorHealthService } from '../monitoring/minio-mirror-health.service';
+import { abortReason } from '../common/abort';
 
 export const HEALTH_SECTIONS = [
   'overview', 'databases', 'sms', 'nanobanana', 'tg-bot', 'payments', 'quality', 'claude',
@@ -24,13 +25,20 @@ export type HealthSection = typeof HEALTH_SECTIONS[number];
 export const HEALTH_SOURCE_TIMEOUT_MS = 2000;
 
 /** Ограничивает внешний источник, всегда убирая свой timer после завершения. */
-export function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+export function withDeadline<T>(promise: Promise<T>, timeoutMs: number, signal?: AbortSignal): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('source_timeout')), timeoutMs);
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const onAbort = () => { cleanup(); reject(abortReason(signal!)); };
+    const timer = setTimeout(() => { cleanup(); reject(new Error('source_timeout')); }, timeoutMs);
     timer.unref();
+    if (signal?.aborted) { onAbort(); return; }
+    signal?.addEventListener('abort', onAbort, { once: true });
     promise.then(
-      (value) => { clearTimeout(timer); resolve(value); },
-      (error) => { clearTimeout(timer); reject(error); },
+      (value) => { cleanup(); resolve(value); },
+      (error) => { cleanup(); reject(error); },
     );
   });
 }
@@ -150,35 +158,35 @@ export class AlertBotHealthService {
     private readonly minio: MinioMirrorHealthService,
   ) {}
 
-  async getSection(section: HealthSection): Promise<unknown> {
+  async getSection(section: HealthSection, signal?: AbortSignal): Promise<unknown> {
     try {
-      return await withDeadline(this.readSection(section), HEALTH_SOURCE_TIMEOUT_MS);
+      return await withDeadline(this.readSection(section, signal), HEALTH_SOURCE_TIMEOUT_MS, signal);
     } catch {
       return { error: 'source_failed' };
     }
   }
 
-  private async readSection(section: HealthSection): Promise<unknown> {
+  private async readSection(section: HealthSection, signal?: AbortSignal): Promise<unknown> {
     switch (section) {
       case 'overview': {
-        const [nodes, probes] = await Promise.all([this.monitoring.getNodeOverview(), this.monitoring.getProbes()]);
+        const [nodes, probes] = await Promise.all([this.monitoring.getNodeOverview(signal), this.monitoring.getProbes(signal)]);
         return { nodes, probes, generatedAt: new Date().toISOString() };
       }
-      case 'databases': return await this.monitoring.getDatabases();
-      case 'sms': return await this.sms.getOverview();
-      case 'nanobanana': return await this.nano.getOverview();
-      case 'tg-bot': return await this.tg.getOverview();
-      case 'payments': return await this.payments.getOverview();
-      case 'quality': return await this.quality.getOverview();
-      case 'claude': return await this.claude.getOverview();
-      case 'geo': return await this.geo.getLatest();
-      case 'backups': return await this.backups.getOverview();
-      case 'models': return await this.models.getOverview();
-      case 'jobs': return await this.jobs.getOverview();
-      case 'replication': return await this.replication.getOverview();
-      case 'neo4j-dr': return await this.neo.getOverview();
-      case 'minio-dr': return await this.minio.getOverview();
-      case 'synthetic': return await this.synthetic.getOverview();
+      case 'databases': return await this.monitoring.getDatabases(signal);
+      case 'sms': return await this.sms.getOverview(signal);
+      case 'nanobanana': return await this.nano.getOverview(signal);
+      case 'tg-bot': return await this.tg.getOverview(signal);
+      case 'payments': return await this.payments.getOverview(signal);
+      case 'quality': return await this.quality.getOverview(signal);
+      case 'claude': return await this.claude.getOverview(signal);
+      case 'geo': return await this.geo.getLatest(signal);
+      case 'backups': return await this.backups.getOverview(signal);
+      case 'models': return await this.models.getOverview(signal);
+      case 'jobs': return await this.jobs.getOverview(signal);
+      case 'replication': return await this.replication.getOverview(signal);
+      case 'neo4j-dr': return await this.neo.getOverview(signal);
+      case 'minio-dr': return await this.minio.getOverview(signal);
+      case 'synthetic': return await this.synthetic.getOverview(signal);
     }
   }
 

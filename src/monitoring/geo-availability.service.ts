@@ -224,7 +224,7 @@ export class GeoAvailabilityService implements OnModuleInit {
     return `${r.probe?.city || '?'}: ${reached}`;
   }
 
-  async getLatest(): Promise<any> {
+  async getLatest(signal?: AbortSignal): Promise<any> {
     const decorate = (row: any, error = this.lastError) => {
       if (!row) return null;
       const checkedAt = new Date(row.checked_at).getTime();
@@ -236,7 +236,7 @@ export class GeoAvailabilityService implements OnModuleInit {
     };
     if (this.last) return decorate(this.last);
     try {
-      const r = await this.pg.query(`SELECT checked_at, target, ru_total, ru_ok, ru_failed, baseline_ok, region_down, probes FROM geo_availability_checks ORDER BY checked_at DESC LIMIT 1`);
+      const r = await this.pg.query(`SELECT checked_at, target, ru_total, ru_ok, ru_failed, baseline_ok, region_down, probes FROM geo_availability_checks ORDER BY checked_at DESC LIMIT 1`, [], signal);
       return decorate(r.rows[0] ?? null);
     } catch {
       return { stale: true, error: 'source_failed' };

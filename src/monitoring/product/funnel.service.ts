@@ -291,14 +291,14 @@ export class FunnelService {
     },
   ];
 
-  async getFunnel(fromIso: string, toIso: string, source: string | null): Promise<FunnelResponse> {
+  async getFunnel(fromIso: string, toIso: string, source: string | null, signal?: AbortSignal): Promise<FunnelResponse> {
     // 1. Сырые множества идентификаторов по каждому шагу (юзеры/сессии).
     const raw: Array<{ step: StepDef; ids: Set<string> }> = [];
     for (const step of this.steps) {
       const { sql, params } = step.query(fromIso, toIso, source, effectiveExcluded);
       let ids: string[] = [];
       try {
-        const r = await this.pg.query(sql, params);
+        const r = await this.pg.query(sql, params, signal);
         ids = r.rows.map((row: any) => row.user_id ?? row.session_id).filter(Boolean);
       } catch (e: any) {
         this.log.error(`funnel step ${step.key} failed: ${e.message}`);

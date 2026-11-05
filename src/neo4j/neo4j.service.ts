@@ -4,6 +4,7 @@ import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { buildProfileExtractionPrompt } from './profile-extraction-prompt';
+import { awaitWithAbort } from '../common/abort';
 
 @Injectable()
 export class Neo4jService implements OnModuleInit, OnModuleDestroy {
@@ -47,14 +48,22 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
    * Run a read-only Cypher query and return the rows as plain objects.
    * Used by monitoring metric services that don't want to manage sessions.
    */
-  async readRows(cypher: string, params: Record<string, any> = {}): Promise<Record<string, any>[]> {
+  async readRows(cypher: string, params: Record<string, any> = {}, signal?: AbortSignal): Promise<Record<string, any>[]> {
     if (!this.driver) return [];
     const session = this.driver.session({ defaultAccessMode: neo4j.session.READ });
+    let closePromise: Promise<void> | null = null;
+    const closeSession = () => {
+      if (!closePromise) closePromise = session.close();
+      return closePromise;
+    };
     try {
-      const r = await session.run(cypher, params);
+      // Закрытие Session обрывает Bolt-соединение и отменяет активный RUN на сервере.
+      const r = await awaitWithAbort(session.run(cypher, params), signal, () => {
+        void closeSession().catch(() => {});
+      });
       return r.records.map((rec) => rec.toObject());
     } finally {
-      await session.close();
+      await closeSession();
     }
   }
 

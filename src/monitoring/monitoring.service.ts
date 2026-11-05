@@ -1,5 +1,6 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import { Neo4jService } from '../neo4j/neo4j.service';
+import { fetchWithTimeout } from '../common/abort';
 
 const PROM_URL = process.env.PROMETHEUS_URL || 'http://10.10.0.3:9090';
 const TIMEOUT_MS = 5000;
@@ -94,23 +95,23 @@ export class MonitoringService {
   constructor(@Optional() private readonly neo4j?: Neo4jService) {}
 
   /** Мгновенный PromQL-запрос к Prometheus на node-3 (по WireGuard). Бросает при недоступности. */
-  async query(promql: string): Promise<Array<{ metric: Record<string, string>; value: [number, string] }>> {
+  async query(promql: string, signal?: AbortSignal): Promise<Array<{ metric: Record<string, string>; value: [number, string] }>> {
     const url = `${PROM_URL}/api/v1/query?query=${encodeURIComponent(promql)}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+    const res = await fetchWithTimeout(url, {}, TIMEOUT_MS, signal);
     if (!res.ok) throw new Error(`prom ${res.status} for ${promql}`);
     const json: any = await res.json();
     if (json?.status !== 'success') throw new Error(`prom non-success: ${json?.errorType || ''} ${json?.error || ''}`);
     return json.data.result;
   }
 
-  async getNodeOverview(): Promise<NodeOverview[]> {
+  async getNodeOverview(signal?: AbortSignal): Promise<NodeOverview[]> {
     const [up, load1, cpu, mem, disk, uptime] = await Promise.all([
-      this.query('up{job="node"}'),
-      this.query('node_load1'),
-      this.query('100 * (1 - avg by (instance, host) (rate(node_cpu_seconds_total{mode="idle"}[5m])))'),
-      this.query('(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100'),
-      this.query('(node_filesystem_size_bytes{mountpoint="/"} - node_filesystem_avail_bytes{mountpoint="/"}) / node_filesystem_size_bytes{mountpoint="/"} * 100'),
-      this.query('node_time_seconds - node_boot_time_seconds'),
+      this.query('up{job="node"}', signal),
+      this.query('node_load1', signal),
+      this.query('100 * (1 - avg by (instance, host) (rate(node_cpu_seconds_total{mode="idle"}[5m])))', signal),
+      this.query('(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100', signal),
+      this.query('(node_filesystem_size_bytes{mountpoint="/"} - node_filesystem_avail_bytes{mountpoint="/"}) / node_filesystem_size_bytes{mountpoint="/"} * 100', signal),
+      this.query('node_time_seconds - node_boot_time_seconds', signal),
     ]);
 
     const byInstance = new Map<string, NodeOverview>();
@@ -134,25 +135,25 @@ export class MonitoringService {
     return Array.from(byInstance.values()).sort((a, b) => a.instance.localeCompare(b.instance));
   }
 
-  async getDatabases(): Promise<DatabasesOverview> {
+  async getDatabases(signal?: AbortSignal): Promise<DatabasesOverview> {
     const [
       pgUp, pgSize, pgConn, pgTps, pgHit, pgRead, pgDl,
       rUp, rMem, rClients, rOps, rHits, rMisses, rEvicted,
     ] = await Promise.all([
-      this.query('pg_up'),
-      this.query('pg_database_size_bytes{datname="linkeon"}'),
-      this.query('sum by (instance) (pg_stat_database_numbackends{datname="linkeon"})'),
-      this.query('sum by (instance) (rate(pg_stat_database_xact_commit{datname="linkeon"}[5m]))'),
-      this.query('sum by (instance) (rate(pg_stat_database_blks_hit{datname="linkeon"}[5m]))'),
-      this.query('sum by (instance) (rate(pg_stat_database_blks_read{datname="linkeon"}[5m]))'),
-      this.query('sum by (instance) (pg_stat_database_deadlocks{datname="linkeon"})'),
-      this.query('redis_up'),
-      this.query('redis_memory_used_bytes'),
-      this.query('redis_connected_clients'),
-      this.query('rate(redis_commands_processed_total[5m])'),
-      this.query('redis_keyspace_hits_total'),
-      this.query('redis_keyspace_misses_total'),
-      this.query('redis_evicted_keys_total'),
+      this.query('pg_up', signal),
+      this.query('pg_database_size_bytes{datname="linkeon"}', signal),
+      this.query('sum by (instance) (pg_stat_database_numbackends{datname="linkeon"})', signal),
+      this.query('sum by (instance) (rate(pg_stat_database_xact_commit{datname="linkeon"}[5m]))', signal),
+      this.query('sum by (instance) (rate(pg_stat_database_blks_hit{datname="linkeon"}[5m]))', signal),
+      this.query('sum by (instance) (rate(pg_stat_database_blks_read{datname="linkeon"}[5m]))', signal),
+      this.query('sum by (instance) (pg_stat_database_deadlocks{datname="linkeon"})', signal),
+      this.query('redis_up', signal),
+      this.query('redis_memory_used_bytes', signal),
+      this.query('redis_connected_clients', signal),
+      this.query('rate(redis_commands_processed_total[5m])', signal),
+      this.query('redis_keyspace_hits_total', signal),
+      this.query('redis_keyspace_misses_total', signal),
+      this.query('redis_evicted_keys_total', signal),
     ]);
 
     const idx = (rows: any[]): Map<string, number> => {
@@ -200,12 +201,12 @@ export class MonitoringService {
 
     // MinIO — native /minio/v2/metrics/cluster endpoint
     const [mUp, mBuckets, mObjects, mUsed, mFree, mTotal] = await Promise.all([
-      this.query('up{job="minio"}'),
-      this.query('minio_cluster_bucket_total'),
-      this.query('minio_cluster_usage_object_total'),
-      this.query('minio_cluster_usage_total_bytes'),
-      this.query('minio_cluster_capacity_usable_free_bytes'),
-      this.query('minio_cluster_capacity_usable_total_bytes'),
+      this.query('up{job="minio"}', signal),
+      this.query('minio_cluster_bucket_total', signal),
+      this.query('minio_cluster_usage_object_total', signal),
+      this.query('minio_cluster_usage_total_bytes', signal),
+      this.query('minio_cluster_capacity_usable_free_bytes', signal),
+      this.query('minio_cluster_capacity_usable_total_bytes', signal),
     ]);
     const idxMinio = (rows: any[]): Map<string, number> => {
       const m = new Map<string, number>();
@@ -227,14 +228,14 @@ export class MonitoringService {
 
     // Nginx — nginx-prometheus-exporter
     const [nUp, nActive, nAccepted, nHandled, nReading, nWriting, nWaiting, nReqRate] = await Promise.all([
-      this.query('up{job="nginx"}'),
-      this.query('nginx_connections_active'),
-      this.query('nginx_connections_accepted'),
-      this.query('nginx_connections_handled'),
-      this.query('nginx_connections_reading'),
-      this.query('nginx_connections_writing'),
-      this.query('nginx_connections_waiting'),
-      this.query('rate(nginx_http_requests_total[5m])'),
+      this.query('up{job="nginx"}', signal),
+      this.query('nginx_connections_active', signal),
+      this.query('nginx_connections_accepted', signal),
+      this.query('nginx_connections_handled', signal),
+      this.query('nginx_connections_reading', signal),
+      this.query('nginx_connections_writing', signal),
+      this.query('nginx_connections_waiting', signal),
+      this.query('rate(nginx_http_requests_total[5m])', signal),
     ]);
     const idxNginx = (rows: any[]): Map<string, number> => {
       const m = new Map<string, number>();
@@ -261,11 +262,11 @@ export class MonitoringService {
     // removed org.neo4j.* MBeans, but JVM-level stats are still useful);
     // node/relationship counts come from a small Cypher query.
     const [n4Up, n4HeapUsed, n4HeapMax, n4Threads, n4GcTime] = await Promise.all([
-      this.query('up{job="neo4j-jmx"}'),
-      this.query('jvm_memory_used_bytes{area="heap",job="neo4j-jmx"}'),
-      this.query('jvm_memory_max_bytes{area="heap",job="neo4j-jmx"}'),
-      this.query('jvm_threads_current{job="neo4j-jmx"}'),
-      this.query('sum by (instance) (jvm_gc_collection_seconds_sum{job="neo4j-jmx"})'),
+      this.query('up{job="neo4j-jmx"}', signal),
+      this.query('jvm_memory_used_bytes{area="heap",job="neo4j-jmx"}', signal),
+      this.query('jvm_memory_max_bytes{area="heap",job="neo4j-jmx"}', signal),
+      this.query('jvm_threads_current{job="neo4j-jmx"}', signal),
+      this.query('sum by (instance) (jvm_gc_collection_seconds_sum{job="neo4j-jmx"})', signal),
     ]);
     const idxNeo = (rows: any[]): Map<string, number> => {
       const m = new Map<string, number>();
@@ -282,14 +283,14 @@ export class MonitoringService {
     let neo4jError: string | null = null;
     if (this.neo4j) {
       try {
-        const r1 = await this.neo4j.readRows('MATCH (n) RETURN count(n) AS c');
+        const r1 = await this.neo4j.readRows('MATCH (n) RETURN count(n) AS c', {}, signal);
         nodes = typeof r1[0]?.c?.toNumber === 'function' ? r1[0].c.toNumber() : Number(r1[0]?.c ?? 0);
       } catch (e: any) {
         neo4jError = 'source_failed';
         this.log.error(`neo4j node count failed: ${e.message}`);
       }
       try {
-        const r2 = await this.neo4j.readRows('MATCH ()-[r]->() RETURN count(r) AS c');
+        const r2 = await this.neo4j.readRows('MATCH ()-[r]->() RETURN count(r) AS c', {}, signal);
         rels = typeof r2[0]?.c?.toNumber === 'function' ? r2[0].c.toNumber() : Number(r2[0]?.c ?? 0);
       } catch (e: any) {
         neo4jError = 'source_failed';
@@ -317,12 +318,12 @@ export class MonitoringService {
     return { postgres, redis, minio, nginx, neo4j, generatedAt: new Date().toISOString() };
   }
 
-  async getProbes(): Promise<ProbeOverview[]> {
+  async getProbes(signal?: AbortSignal): Promise<ProbeOverview[]> {
     const [success, status, latency, tlsExp] = await Promise.all([
-      this.query('probe_success'),
-      this.query('probe_http_status_code'),
-      this.query('probe_duration_seconds'),
-      this.query('probe_ssl_earliest_cert_expiry - time()'),
+      this.query('probe_success', signal),
+      this.query('probe_http_status_code', signal),
+      this.query('probe_duration_seconds', signal),
+      this.query('probe_ssl_earliest_cert_expiry - time()', signal),
     ]);
 
     const byTarget = new Map<string, ProbeOverview>();

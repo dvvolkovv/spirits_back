@@ -1,3 +1,4 @@
+import { throwIfAborted } from '../common/abort';
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import axios from 'axios';
@@ -340,7 +341,8 @@ export class TgHealthService {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  getOverview(): TgHealthOverview {
+  getOverview(signal?: AbortSignal): TgHealthOverview {
+    throwIfAborted(signal);
     return {
       generatedAt: new Date().toISOString(),
       configured: this.configured(),

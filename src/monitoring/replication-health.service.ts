@@ -4,6 +4,7 @@ import axios from 'axios';
 import { sendTelegramPayload } from '../common/telegram-alert';
 import { Pool } from 'pg';
 import { PgService } from '../common/services/pg.service';
+import { queryWithCancellation } from '../common/services/pg-cancellation';
 
 /**
  * Replication health — surfaces PostgreSQL streaming replication state for the
@@ -229,7 +230,7 @@ export class ReplicationHealthService implements OnModuleDestroy {
     }
   }
 
-  private async getStandbyView(): Promise<StandbyView> {
+  private async getStandbyView(signal?: AbortSignal): Promise<StandbyView> {
     const empty: StandbyView = {
       configured: false,
       reachable: false,
@@ -249,7 +250,8 @@ export class ReplicationHealthService implements OnModuleDestroy {
 
     try {
       const [rec, wr] = await Promise.all([
-        pool.query(
+        queryWithCancellation(
+          pool,
           `SELECT pg_is_in_recovery()                               AS in_recovery,
                   pg_is_wal_replay_paused()                         AS replay_paused,
                   pg_last_wal_receive_lsn()::text                   AS receive_lsn,
@@ -258,8 +260,11 @@ export class ReplicationHealthService implements OnModuleDestroy {
                                   pg_last_wal_replay_lsn())::float8  AS apply_backlog_bytes,
                   EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()))::float8
                                                                     AS last_xact_replay_age_sec`,
+          [],
+          signal,
         ),
-        pool.query(
+        queryWithCancellation(
+          pool,
           `SELECT status, sender_host, sender_port, slot_name,
                   written_lsn::text    AS written_lsn,
                   flushed_lsn::text    AS flushed_lsn,
@@ -267,6 +272,8 @@ export class ReplicationHealthService implements OnModuleDestroy {
                   last_msg_receipt_time,
                   EXTRACT(EPOCH FROM (now() - last_msg_receipt_time))::float8 AS since_last_msg_sec
              FROM pg_stat_wal_receiver`,
+          [],
+          signal,
         ),
       ]);
 
@@ -321,14 +328,14 @@ export class ReplicationHealthService implements OnModuleDestroy {
     }
   }
 
-  async getOverview(): Promise<ReplicationOverview> {
+  async getOverview(signal?: AbortSignal): Promise<ReplicationOverview> {
     let publisherError: string | null = null;
     let standbys: StandbyRow[] = [];
     let slots: SlotRow[] = [];
 
     // Publisher side and standby side are independent — probe them together so
     // a slow standby connect doesn't serialize behind the prod queries.
-    const standbyViewP = this.getStandbyView();
+    const standbyViewP = this.getStandbyView(signal);
 
     try {
       const [sb, sl] = await Promise.all([
@@ -344,12 +351,16 @@ export class ReplicationHealthService implements OnModuleDestroy {
                   replay_lsn::text AS replay_lsn,
                   reply_time
              FROM pg_stat_replication`,
+          [],
+          signal,
         ),
         this.pg.query(
           `SELECT slot_name, slot_type, active, active_pid,
                   wal_status, restart_lsn::text AS restart_lsn,
                   safe_wal_size AS safe_wal_size_bytes
              FROM pg_replication_slots`,
+          [],
+          signal,
         ),
       ]);
       standbys = sb.rows.map((r: any) => ({

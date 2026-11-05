@@ -127,17 +127,17 @@ export class ModelsRegistryService implements OnModuleInit {
     await this.refresh();
   }
 
-  async getOverview(): Promise<ModelsRegistryOverview> {
+  async getOverview(signal?: AbortSignal): Promise<ModelsRegistryOverview> {
     // If cache is older than 10 min, refresh inline so /tech/models always
     // returns reasonably fresh data even between cron ticks.
     if (!this.cache || Date.now() - this.lastRefreshAt > 600_000) {
-      await this.refresh();
+      await this.refresh(signal);
     }
     return this.cache!;
   }
 
-  private async refresh(): Promise<void> {
-    const counts = await this.queryClaudeCliCounts();
+  private async refresh(signal?: AbortSignal): Promise<void> {
+    const counts = await this.queryClaudeCliCounts(signal);
     const expected: ModelStatus[] = EXPECTED.map((m) => {
       const c = counts.get(m.model) ?? { calls_30d: 0, cost_usd_30d: 0, calls_24h: 0, last_seen: null };
       return { ...m, ...c };
@@ -188,7 +188,7 @@ export class ModelsRegistryService implements OnModuleInit {
   //  - claude_cli_call (chat, vpm, backlog, tasks via ClaudeCliService)
   // To add a new provider: emit `<provider>_call` events with at minimum
   // {model, ok, latency_ms} props, then add it to the UNION below.
-  private async queryClaudeCliCounts(): Promise<Map<string, DynamicCounts>> {
+  private async queryClaudeCliCounts(signal?: AbortSignal): Promise<Map<string, DynamicCounts>> {
     try {
       const r = await this.pg.query(
         `SELECT model,
@@ -215,6 +215,8 @@ export class ModelsRegistryService implements OnModuleInit {
                GROUP BY 1
            ) sub
            GROUP BY model`,
+        [],
+        signal,
       );
       const out = new Map<string, DynamicCounts>();
       for (const row of r.rows as any[]) {

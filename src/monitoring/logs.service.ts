@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { fetchWithTimeout } from '../common/abort';
 
 const LOKI_URL = process.env.LOKI_URL || 'http://10.10.0.3:3100';
 const TIMEOUT_MS = 8000;
@@ -35,7 +36,7 @@ export class LogsService {
     }
   }
 
-  async query(opts: { query: string; from: string; to: string; limit: number }): Promise<LogsResponse> {
+  async query(opts: { query: string; from: string; to: string; limit: number }, signal?: AbortSignal): Promise<LogsResponse> {
     const params = new URLSearchParams({
       query: opts.query,
       start: opts.from,
@@ -44,7 +45,7 @@ export class LogsService {
       direction: 'backward',
     });
     const url = `${LOKI_URL}/loki/api/v1/query_range?${params.toString()}`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+    const r = await fetchWithTimeout(url, {}, TIMEOUT_MS, signal);
     if (!r.ok) {
       const body = await r.text().catch(() => '');
       throw new Error(`loki ${r.status}: ${body.slice(0, 200)}`);

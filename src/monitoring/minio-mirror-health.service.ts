@@ -1,3 +1,4 @@
+import { throwIfAborted } from '../common/abort';
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import axios from 'axios';
@@ -140,7 +141,8 @@ export class MinioMirrorHealthService {
     };
   }
 
-  async getOverview(): Promise<MinioMirrorOverview> {
+  async getOverview(signal?: AbortSignal): Promise<MinioMirrorOverview> {
+    throwIfAborted(signal);
     if (!fs.existsSync(this.statusPath)) {
       // No status file → mirror not configured on this host (e.g. test server).
       return this.empty(false);

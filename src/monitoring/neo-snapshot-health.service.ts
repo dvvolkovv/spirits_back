@@ -5,6 +5,7 @@ import axios from 'axios';
 import { sendTelegramPayload } from '../common/telegram-alert';
 import * as fs from 'fs';
 import * as path from 'path';
+import { abortReason, throwIfAborted } from '../common/abort';
 
 /**
  * Neo4j DR-snapshot health (DR Sprint 2).
@@ -133,7 +134,7 @@ export class NeoSnapshotHealthService implements OnModuleInit {
       .sort();
   }
 
-  private async refresh(): Promise<void> {
+  private async refresh(signal?: AbortSignal): Promise<void> {
     if (!this.drHost) { this.cache = this.emptyOverview(); return; }
     try {
       const dirs = this.snapshotDirs();
@@ -146,14 +147,14 @@ export class NeoSnapshotHealthService implements OnModuleInit {
         const p = latestDir ? path.join(latestDir, name) : null;
         if (p && fs.existsSync(p)) {
           const st = fs.statSync(p);
-          local[name] = { size: st.size, mtime: st.mtime.toISOString(), md5: await this.localMd5(p) };
+          local[name] = { size: st.size, mtime: st.mtime.toISOString(), md5: await this.localMd5(p, signal) };
         } else {
           local[name] = { size: null, mtime: null, md5: null };
         }
       }
 
       // Remote side (node-3 DR copy) over SSH — one round-trip for all files.
-      const remote = await this.probeRemote();
+      const remote = await this.probeRemote(signal);
 
       const files: NeoDrFile[] = DR_FILES.map((name) => {
         const l = local[name];
@@ -209,7 +210,7 @@ export class NeoSnapshotHealthService implements OnModuleInit {
   }
 
   // Probe node-3 in one SSH call: per file emit "name|size|mtimeEpoch|md5" or "name|MISSING".
-  private async probeRemote(): Promise<{
+  private async probeRemote(signal?: AbortSignal): Promise<{
     reachable: boolean;
     error: string | null;
     files: Record<string, { present: boolean; size: number | null; mtimeEpoch: number | null; md5: string | null }>;
@@ -220,7 +221,7 @@ export class NeoSnapshotHealthService implements OnModuleInit {
       `if [ -f "$f" ]; then echo "$f|$(stat -c '%s|%Y' "$f")|$(md5sum "$f" | cut -d' ' -f1)"; ` +
       `else echo "$f|MISSING"; fi; done`;
 
-    const res = await this.runSsh(remoteCmd);
+    const res = await this.runSsh(remoteCmd, signal);
     const files: Record<string, { present: boolean; size: number | null; mtimeEpoch: number | null; md5: string | null }> = {};
     if (!res.ok) {
       return { reachable: false, error: res.error || 'ssh failed', files };
@@ -243,8 +244,9 @@ export class NeoSnapshotHealthService implements OnModuleInit {
     return { reachable: true, error: null, files };
   }
 
-  private runSsh(remoteCmd: string): Promise<{ ok: boolean; stdout: string; error: string | null }> {
-    return new Promise((resolve) => {
+  private runSsh(remoteCmd: string, signal?: AbortSignal): Promise<{ ok: boolean; stdout: string; error: string | null }> {
+    throwIfAborted(signal);
+    return new Promise((resolve, reject) => {
       const args = [
         '-o', 'BatchMode=yes',
         '-o', 'ConnectTimeout=8',
@@ -255,24 +257,54 @@ export class NeoSnapshotHealthService implements OnModuleInit {
       const proc = spawn('ssh', args, { stdio: ['ignore', 'pipe', 'pipe'] });
       let stdout = '';
       let stderr = '';
+      let settled = false;
+      const cleanup = () => {
+        clearTimeout(killer);
+        signal?.removeEventListener('abort', onAbort);
+      };
+      const finish = (complete: () => void) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        complete();
+      };
+      const onAbort = () => {
+        try { proc.kill('SIGKILL'); } catch { /* ignore */ }
+        finish(() => reject(abortReason(signal!)));
+      };
       const killer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* ignore */ } }, 15000);
+      killer.unref();
+      signal?.addEventListener('abort', onAbort, { once: true });
       proc.stdout.on('data', (b) => { stdout += b.toString(); });
       proc.stderr.on('data', (b) => { stderr += b.toString(); });
       proc.on('close', (code) => {
-        clearTimeout(killer);
-        resolve({ ok: code === 0, stdout, error: code === 0 ? null : (stderr.slice(0, 200) || `ssh exit ${code}`) });
+        finish(() => resolve({ ok: code === 0, stdout, error: code === 0 ? null : (stderr.slice(0, 200) || `ssh exit ${code}`) }));
       });
-      proc.on('error', (e) => { clearTimeout(killer); resolve({ ok: false, stdout: '', error: e.message }); });
+      proc.on('error', (e) => finish(() => reject(e)));
     });
   }
 
-  private localMd5(file: string): Promise<string | null> {
-    return new Promise((resolve) => {
+  private localMd5(file: string, signal?: AbortSignal): Promise<string | null> {
+    throwIfAborted(signal);
+    return new Promise((resolve, reject) => {
       const proc = spawn('md5sum', [file], { stdio: ['ignore', 'pipe', 'pipe'] });
       let out = '';
+      let settled = false;
+      const cleanup = () => signal?.removeEventListener('abort', onAbort);
+      const finish = (complete: () => void) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        complete();
+      };
+      const onAbort = () => {
+        try { proc.kill('SIGKILL'); } catch { /* ignore */ }
+        finish(() => reject(abortReason(signal!)));
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
       proc.stdout.on('data', (b) => { out += b.toString(); });
-      proc.on('close', (code) => resolve(code === 0 ? (out.trim().split(/\s+/)[0] || null) : null));
-      proc.on('error', () => resolve(null));
+      proc.on('close', (code) => finish(() => resolve(code === 0 ? (out.trim().split(/\s+/)[0] || null) : null)));
+      proc.on('error', (e) => finish(() => reject(e)));
     });
   }
 
@@ -310,12 +342,13 @@ export class NeoSnapshotHealthService implements OnModuleInit {
     }
   }
 
-  async getOverview(): Promise<NeoSnapshotOverview> {
+  async getOverview(signal?: AbortSignal): Promise<NeoSnapshotOverview> {
     // Serve cache; if it was never populated (e.g. first call before the cron),
     // refresh on-demand so the widget isn't empty right after a restart.
     if (this.drHost && this.cache.generatedAt === new Date(0).toISOString()) {
-      await this.refresh();
+      await this.refresh(signal);
     }
+    throwIfAborted(signal);
     return this.cache;
   }
 }

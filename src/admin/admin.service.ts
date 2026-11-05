@@ -1358,7 +1358,7 @@ export class AdminService implements OnModuleInit {
     };
   }
 
-  async getTokensSpendStats(opts: { bucket?: 'day' | 'hour'; days?: number } = {}) {
+  async getTokensSpendStats(opts: { bucket?: 'day' | 'hour'; days?: number } = {}, signal?: AbortSignal) {
     const bucket = opts.bucket === 'hour' ? 'hour' : 'day';
     const days = bucket === 'hour'
       ? Math.min(Math.max(opts.days ?? 2, 1), 14)
@@ -1385,6 +1385,7 @@ export class AdminService implements OnModuleInit {
        GROUP BY b.bucket
        ORDER BY b.bucket ASC`,
       [stepCount],
+      signal
     );
 
     const totalsRes = await this.pg.query(
@@ -1397,6 +1398,8 @@ export class AdminService implements OnModuleInit {
        FROM token_transactions
        WHERE transaction_type = 'consumed'
          AND ${AdminService.excludeTest('user_id')}`,
+      undefined,
+      signal,
     );
     const t = totalsRes.rows[0] || {};
 
@@ -1417,7 +1420,7 @@ export class AdminService implements OnModuleInit {
     };
   }
 
-  async getActiveUsersStats(opts: { days?: number; bucket?: 'day' | 'week' } = {}) {
+  async getActiveUsersStats(opts: { days?: number; bucket?: 'day' | 'week' } = {}, signal?: AbortSignal) {
     const days = Math.min(Math.max(opts.days ?? 30, 1), 365);
     const bucket = opts.bucket === 'week' ? 'week' : 'day';
 
@@ -1453,6 +1456,7 @@ export class AdminService implements OnModuleInit {
        ) newr ON newr.bucket = d.bucket
        ORDER BY d.bucket`,
       [bucket, days],
+      signal
     );
 
     const totalsRes = await this.pg.query(
@@ -1481,6 +1485,8 @@ export class AdminService implements OnModuleInit {
             AND created_at >= now() - interval '30 days'
             AND ${AdminService.excludeTest('user_id')})::int AS mau
       `,
+      undefined,
+      signal,
     );
 
     return {
@@ -2382,7 +2388,7 @@ export class AdminService implements OnModuleInit {
    * таблице приводил $25 «Приёма» в выручку как 25 ₽, то есть занижал валютную
    * оплату примерно в 80 раз. Складывать разрешено только счётчики.
    */
-  async getPaymentsStats(opts: { days?: number; includeTest?: boolean } = {}) {
+  async getPaymentsStats(opts: { days?: number; includeTest?: boolean } = {}, signal?: AbortSignal) {
     const days = Math.min(Math.max(opts.days ?? 30, 1), 365);
     const notTest = AdminService.testFilter('p.user_id', opts.includeTest);
 
@@ -2409,6 +2415,7 @@ export class AdminService implements OnModuleInit {
        GROUP BY d.day, COALESCE(p.currency, 'RUB')
        ORDER BY d.day ASC`,
       [days],
+      signal
     );
 
     const revenueRes = await this.pg.query(
@@ -2431,6 +2438,8 @@ export class AdminService implements OnModuleInit {
        WHERE ${notTest}
        GROUP BY COALESCE(p.currency, 'RUB')
        ORDER BY 1 ASC`,
+      undefined,
+      signal,
     );
 
     const totalsRes = await this.pg.query(
@@ -2443,6 +2452,8 @@ export class AdminService implements OnModuleInit {
          COUNT(DISTINCT user_id) FILTER (WHERE status = 'succeeded') AS unique_payers
        FROM payments p
        WHERE ${notTest}`,
+      undefined,
+      signal,
     );
     const t = totalsRes.rows[0] || {};
 

@@ -132,7 +132,7 @@ export class QualityMonitorService {
     try { await sendTelegramAlert(text); } catch (e: any) { this.log.error(`quality alert send failed: ${e.message}`); }
   }
 
-  async getOverview(): Promise<QualityOverview> {
+  async getOverview(signal?: AbortSignal): Promise<QualityOverview> {
     const alerts: string[] = [];
 
     // 1) Провалы платных провайдеров из-за баланса/квоты/лимита (наша сторона).
@@ -145,6 +145,7 @@ export class QualityMonitorService {
             OR error_message ILIKE '%insufficient%' OR error_message ILIKE '%not enough%'
             OR error_message ILIKE '%exceeded%')`,
       [PROVIDER_FAIL_WINDOW_MIN],
+      signal,
     );
     const provCount = Number(prov.rows[0]?.n || 0);
     const provSample = prov.rows[0]?.sample || null;
@@ -157,6 +158,7 @@ export class QualityMonitorService {
       `SELECT count(*) FILTER (WHERE status = 'failed')::int AS f, count(*)::int AS t
          FROM video_jobs WHERE created_at > now() - ($1 || ' minutes')::interval`,
       [FAILRATE_WINDOW_MIN],
+      signal,
     );
     const f = Number(rate.rows[0]?.f || 0);
     const t = Number(rate.rows[0]?.t || 0);
@@ -189,6 +191,7 @@ export class QualityMonitorService {
         AND COALESCE(u.state, '') <> 'deleted'
         AND NOT (e.user_id = ANY($2::text[]))`,
       [CHAT_WINDOW_MIN, excludedUsers()],
+      signal,
     );
     const responses = Number(chatRes.rows[0]?.responses || 0);
     const emptyN = Number(chatRes.rows[0]?.empty || 0);
@@ -213,6 +216,7 @@ export class QualityMonitorService {
         WHERE transaction_type = 'refund' AND created_at > now() - ($1 || ' minutes')::interval
           AND COALESCE(metadata->>'compensation', '') <> 'true'`,
       [REFUND_WINDOW_MIN],
+      signal,
     );
     const refCount = Number(ref.rows[0]?.n || 0);
     const refTokens = Number(ref.rows[0]?.tokens || 0);

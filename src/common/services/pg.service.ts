@@ -1,5 +1,6 @@
 import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
 import { Pool, PoolClient, QueryResult } from 'pg';
+import { queryWithCancellation } from './pg-cancellation';
 
 /**
  * Захваченный advisory-лок. Держит СВОЁ соединение до release().
@@ -85,8 +86,8 @@ export class PgService implements OnModuleInit, OnModuleDestroy {
     await Promise.all([this.pool.end(), this.lockPool.end()]);
   }
 
-  async query(text: string, params?: any[]): Promise<QueryResult> {
-    return this.pool.query(text, params);
+  async query(text: string, params?: any[], signal?: AbortSignal): Promise<QueryResult> {
+    return queryWithCancellation(this.pool, text, params, signal);
   }
 
   async getClient(): Promise<PoolClient> {

@@ -71,9 +71,9 @@ export class EconomyService {
 
   constructor(private readonly pg: PgService) {}
 
-  private async one<T = any>(sql: string, params: any[] = []): Promise<T | null> {
+  private async one<T = any>(sql: string, params: any[] = [], signal?: AbortSignal): Promise<T | null> {
     try {
-      const r = await this.pg.query(sql, params);
+      const r = await this.pg.query(sql, params, signal);
       return r.rows[0] || null;
     } catch (e: any) {
       this.log.error(`economy query failed: ${e.message}`);
@@ -81,7 +81,7 @@ export class EconomyService {
     }
   }
 
-  async getOverview(window: EconomyWindow): Promise<EconomyOverview> {
+  async getOverview(window: EconomyWindow, signal?: AbortSignal): Promise<EconomyOverview> {
     const interval = WINDOW_INTERVAL[window];
 
     // 1. Revenue in window
@@ -94,6 +94,7 @@ export class EconomyService {
          AND user_id <> ALL($1::text[])
          AND ($2 = 'all' OR completed_at >= now() - $3::interval)`,
       [excluded, window, interval],
+      signal,
     );
 
     // 2. Paying users: in window and all-time
@@ -189,6 +190,7 @@ export class EconomyService {
          AND user_id <> ALL($1::text[])
        GROUP BY 1 ORDER BY 1`,
       [excluded],
+      signal,
     );
 
     const revRub = parseFloat(rev?.rub || '0');
