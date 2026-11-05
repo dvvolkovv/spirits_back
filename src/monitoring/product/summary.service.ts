@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../../common/services/pg.service';
 import { ProfileDepthService } from './profile-depth.service';
+import { throwIfAborted } from '../../common/abort';
 
 /**
  * Top-10 product health indicators — see monitoring.functions.md §3.11.
@@ -25,11 +26,13 @@ export interface Indicator {
   status: Status;
   target: string;
   hint?: string;
+  error?: 'source_failed';
 }
 
 export interface SummaryOverview {
   generatedAt: string;
   indicators: Indicator[];
+  error?: 'source_failed';
 }
 
 const DEFAULT_EXCLUDED = ['70000000000', '79030169187'];
@@ -46,7 +49,13 @@ export class SummaryService {
     private readonly profileDepth: ProfileDepthService,
   ) {}
 
-  private async num(sql: string, params: any[] = [], signal?: AbortSignal): Promise<number | null> {
+  private async num(
+    sql: string,
+    params: any[] = [],
+    signal?: AbortSignal,
+    failures?: Set<string>,
+    section?: string,
+  ): Promise<number | null> {
     try {
       const r = await this.pg.query(sql, params, signal);
       const v = r.rows[0]?.v;
@@ -54,19 +63,28 @@ export class SummaryService {
       const n = Number(v);
       return Number.isFinite(n) ? n : null;
     } catch (e: any) {
+      throwIfAborted(signal);
+      if (failures && section) failures.add(section);
       this.log.error(`summary num query failed: ${e.message}`);
       return null;
     }
   }
 
   // PDS: from ProfileDepthService overview.
-  private async pds(signal?: AbortSignal): Promise<number | null> {
-    const o = await this.profileDepth.getOverview(signal).catch(() => null);
-    return o?.perUser.avgPds ?? null;
+  private async pds(signal?: AbortSignal, failures?: Set<string>): Promise<number | null> {
+    try {
+      const o = await this.profileDepth.getOverview(signal);
+      return o?.perUser.avgPds ?? null;
+    } catch (e: any) {
+      throwIfAborted(signal);
+      failures?.add('pds');
+      this.log.error(`summary PDS query failed: ${e.message}`);
+      return null;
+    }
   }
 
   // Request Accept rate: approved / (approved + declined) all time.
-  private async requestAcceptRate(signal?: AbortSignal): Promise<number | null> {
+  private async requestAcceptRate(signal?: AbortSignal, failures?: Set<string>): Promise<number | null> {
     return this.num(
       `SELECT
          CASE WHEN approved + declined = 0 THEN NULL
@@ -79,12 +97,14 @@ export class SummaryService {
        ) t`,
       undefined,
       signal,
+      failures,
+      'accept_rate',
     );
   }
 
   // TTV-результат: median (signup_completed → message_sent) gap in hours,
   // last 30 days of signups.
-  private async ttvMedianHours(signal?: AbortSignal): Promise<number | null> {
+  private async ttvMedianHours(signal?: AbortSignal, failures?: Set<string>): Promise<number | null> {
     return this.num(
       `WITH cohort AS (
          SELECT user_id AS uid, MIN(ts) AS signup_ts
@@ -109,13 +129,15 @@ export class SummaryService {
        JOIN first_msg ON first_msg.uid = cohort.uid`,
       [excluded],
       signal,
+      failures,
+      'ttv',
     );
   }
 
   // AI-share поддержки: % tickets that never had an 'escalate' event,
   // i.e. AI handled them end-to-end without owner involvement. Matches
   // the stricter definition used by SupportService.
-  private async aiShareSupport(signal?: AbortSignal): Promise<number | null> {
+  private async aiShareSupport(signal?: AbortSignal, failures?: Set<string>): Promise<number | null> {
     return this.num(
       `SELECT CASE WHEN COUNT(*) = 0 THEN NULL
               ELSE 100.0 * COUNT(*) FILTER (
@@ -124,12 +146,14 @@ export class SummaryService {
        FROM support_tickets`,
       undefined,
       signal,
+      failures,
+      'ai_share',
     );
   }
 
   // Margin per 1000 tokens: revenue (RUB) / tokens distributed via payments * 1000.
   // Both numbers from payments.succeeded — purest signal of paid-token economics.
-  private async marginPer1k(signal?: AbortSignal): Promise<number | null> {
+  private async marginPer1k(signal?: AbortSignal, failures?: Set<string>): Promise<number | null> {
     return this.num(
       `SELECT CASE WHEN SUM(tokens) = 0 THEN NULL
               ELSE 1000.0 * SUM(amount) / SUM(tokens) END AS v
@@ -138,12 +162,14 @@ export class SummaryService {
          AND user_id <> ALL($1::text[])`,
       [excluded],
       signal,
+      failures,
+      'margin',
     );
   }
 
   // Funnel: signup → first_value (proxy = first message ≥ 1).
   // Of users who signed up in last 30 days, what % had message_sent within 7 days.
-  private async signupToFirstValue(signal?: AbortSignal): Promise<number | null> {
+  private async signupToFirstValue(signal?: AbortSignal, failures?: Set<string>): Promise<number | null> {
     return this.num(
       `WITH cohort AS (
          SELECT user_id AS uid, MIN(ts) AS signup_ts
@@ -164,11 +190,13 @@ export class SummaryService {
               ELSE 100.0 * (SELECT COUNT(*) FROM reached) / (SELECT COUNT(*) FROM cohort) END AS v`,
       [excluded],
       signal,
+      failures,
+      'signup_to_first_value',
     );
   }
 
   // Funnel: % of payers who reached a second payment (all-time).
-  private async firstToSecondPayment(signal?: AbortSignal): Promise<number | null> {
+  private async firstToSecondPayment(signal?: AbortSignal, failures?: Set<string>): Promise<number | null> {
     return this.num(
       `WITH p AS (
          SELECT user_id, COUNT(*) AS n
@@ -181,11 +209,13 @@ export class SummaryService {
        FROM p`,
       [excluded],
       signal,
+      failures,
+      'first_to_second_payment',
     );
   }
 
   // Churn D30: of users who signed up 30+ days ago, % with no activity in last 14 days.
-  private async churnD30(signal?: AbortSignal): Promise<number | null> {
+  private async churnD30(signal?: AbortSignal, failures?: Set<string>): Promise<number | null> {
     return this.num(
       `WITH cohort AS (
          SELECT internal_id AS uid
@@ -208,11 +238,13 @@ export class SummaryService {
               ) / (SELECT COUNT(*) FROM cohort) END AS v`,
       [excluded],
       signal,
+      failures,
+      'churn_d30',
     );
   }
 
   // Paid churn 60d: of users who had a payment 60+ days ago, % with no new payment since.
-  private async paidChurn60(signal?: AbortSignal): Promise<number | null> {
+  private async paidChurn60(signal?: AbortSignal, failures?: Set<string>): Promise<number | null> {
     return this.num(
       `WITH last_pay AS (
          SELECT user_id, MAX(completed_at) AS last_at, COUNT(*) AS n
@@ -225,11 +257,13 @@ export class SummaryService {
        FROM last_pay`,
       [excluded],
       signal,
+      failures,
+      'paid_churn_60',
     );
   }
 
   // Feature health: % of latest-run synthetic scenarios that succeeded.
-  private async featureHealth(signal?: AbortSignal): Promise<number | null> {
+  private async featureHealth(signal?: AbortSignal, failures?: Set<string>): Promise<number | null> {
     return this.num(
       `WITH latest AS (
          SELECT DISTINCT ON (scenario) scenario, success
@@ -240,26 +274,29 @@ export class SummaryService {
        FROM latest`,
       undefined,
       signal,
+      failures,
+      'feature_health',
     );
   }
 
   async getOverview(signal?: AbortSignal): Promise<SummaryOverview> {
+    const failures = new Set<string>();
     const [
       pds, raReq, ttv, aiShare, margin,
       sigToFv, firstToSecond,
       churnD30, paid60,
       featureHealth,
     ] = await Promise.all([
-      this.pds(signal),
-      this.requestAcceptRate(signal),
-      this.ttvMedianHours(signal),
-      this.aiShareSupport(signal),
-      this.marginPer1k(signal),
-      this.signupToFirstValue(signal),
-      this.firstToSecondPayment(signal),
-      this.churnD30(signal),
-      this.paidChurn60(signal),
-      this.featureHealth(signal),
+      this.pds(signal, failures),
+      this.requestAcceptRate(signal, failures),
+      this.ttvMedianHours(signal, failures),
+      this.aiShareSupport(signal, failures),
+      this.marginPer1k(signal, failures),
+      this.signupToFirstValue(signal, failures),
+      this.firstToSecondPayment(signal, failures),
+      this.churnD30(signal, failures),
+      this.paidChurn60(signal, failures),
+      this.featureHealth(signal, failures),
     ]);
 
     const status = (val: number | null, good: (n: number) => boolean, warn: (n: number) => boolean): Status => {
@@ -351,6 +388,12 @@ export class SummaryService {
       },
     ];
 
-    return { generatedAt: new Date().toISOString(), indicators };
+    return {
+      generatedAt: new Date().toISOString(),
+      indicators: indicators.map((indicator) => failures.has(indicator.id)
+        ? { ...indicator, error: 'source_failed' as const }
+        : indicator),
+      ...(failures.size > 0 ? { error: 'source_failed' as const } : {}),
+    };
   }
 }

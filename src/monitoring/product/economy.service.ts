@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../../common/services/pg.service';
+import { throwIfAborted } from '../../common/abort';
 
 /**
  * Economy & activation overview — see monitoring.functions.md §3.1 + §3.5.
@@ -33,13 +34,16 @@ export interface EconomyOverview {
   window: EconomyWindow;
   generatedAt: string;
   excludedUsers: string[];
+  error?: 'source_failed';
 
   revenue: {
+    error?: 'source_failed';
     totalRub: number;
     paymentsCount: number;
     avgCheckRub: number;
   };
   paying: {
+    error?: 'source_failed';
     uniquePayersWindow: number;
     uniquePayersAllTime: number;
     arppuRub: number;            // revenue in window / payers in window
@@ -48,17 +52,20 @@ export interface EconomyOverview {
     repeatRatePctAllTime: number; // % of all-time payers with 2+ payments
   };
   engagement: {
+    error?: 'source_failed';
     dau: number;
     wau: number;
     mau: number;
     stickinessPct: number;
   };
   activation: {
+    error?: 'source_failed';
     signupsInWindow: number;
     activatedInWindow: number;    // signups with 3+ message_sent within 24h
     activationRatePct: number;
   };
   tokens: {
+    error?: 'source_failed';
     totalBalance: number;
     avgBalance: number;
   };
@@ -71,11 +78,19 @@ export class EconomyService {
 
   constructor(private readonly pg: PgService) {}
 
-  private async one<T = any>(sql: string, params: any[] = [], signal?: AbortSignal): Promise<T | null> {
+  private async one<T = any>(
+    sql: string,
+    params: any[] = [],
+    signal?: AbortSignal,
+    failures?: Set<string>,
+    section?: string,
+  ): Promise<T | null> {
     try {
       const r = await this.pg.query(sql, params, signal);
       return r.rows[0] || null;
     } catch (e: any) {
+      throwIfAborted(signal);
+      if (failures && section) failures.add(section);
       this.log.error(`economy query failed: ${e.message}`);
       return null;
     }
@@ -83,6 +98,7 @@ export class EconomyService {
 
   async getOverview(window: EconomyWindow, signal?: AbortSignal): Promise<EconomyOverview> {
     const interval = WINDOW_INTERVAL[window];
+    const failures = new Set<string>();
 
     // 1. Revenue in window
     const rev = await this.one<{ rub: string; cnt: string; avg: string }>(
@@ -95,6 +111,8 @@ export class EconomyService {
          AND ($2 = 'all' OR completed_at >= now() - $3::interval)`,
       [excluded, window, interval],
       signal,
+      failures,
+      'revenue',
     );
 
     // 2. Paying users: in window and all-time
@@ -106,6 +124,8 @@ export class EconomyService {
          AND ($2 = 'all' OR completed_at >= now() - $3::interval)`,
       [excluded, window, interval],
       signal,
+      failures,
+      'paying',
     );
     const payersAll = await this.one<{ n: string }>(
       `SELECT COUNT(DISTINCT user_id)::int AS n
@@ -113,6 +133,8 @@ export class EconomyService {
        WHERE status = 'succeeded' AND user_id <> ALL($1::text[])`,
       [excluded],
       signal,
+      failures,
+      'paying',
     );
 
     // 3. Repeat rate (all-time): % of payers with 2+ payments
@@ -128,6 +150,8 @@ export class EconomyService {
       FROM c`,
       [excluded],
       signal,
+      failures,
+      'paying',
     );
 
     // 4. Engagement: DAU/WAU/MAU based on message_sent in events.
@@ -142,6 +166,8 @@ export class EconomyService {
          AND user_id <> ALL($1::text[])`,
       [excluded],
       signal,
+      failures,
+      'engagement',
     );
 
     // 5. Activation:
@@ -171,6 +197,8 @@ export class EconomyService {
               (SELECT COUNT(*)::int FROM msgs)   AS activated`,
       [excluded, window, interval],
       signal,
+      failures,
+      'activation',
     );
 
     // 6. Token balances (all active users)
@@ -183,6 +211,8 @@ export class EconomyService {
          AND p.user_id <> ALL($1::text[])`,
       [excluded],
       signal,
+      failures,
+      'tokens',
     );
 
     // 7. Daily revenue last 30 days for sparkline
@@ -224,19 +254,27 @@ export class EconomyService {
          AND ($2 = 'all' OR ts >= now() - $3::interval)`,
       [excluded, window, interval],
       signal,
+      failures,
+      'paying',
     );
     const activeInWindow = parseInt(activeRow?.n || '0', 10);
+    const failure = (section: string) => failures.has(section)
+      ? { error: 'source_failed' as const }
+      : {};
 
     return {
       window,
       generatedAt: new Date().toISOString(),
       excludedUsers: excluded,
+      ...(failures.size > 0 ? { error: 'source_failed' as const } : {}),
       revenue: {
+        ...failure('revenue'),
         totalRub: revRub,
         paymentsCount: revCnt,
         avgCheckRub: avgCheck,
       },
       paying: {
+        ...failure('paying'),
         uniquePayersWindow: payersWin,
         uniquePayersAllTime: payersAllTime,
         arppuRub: payersWin > 0 ? revRub / payersWin : 0,
@@ -245,15 +283,18 @@ export class EconomyService {
         repeatRatePctAllTime: repeatTotal > 0 ? (repeatCnt / repeatTotal) * 100 : 0,
       },
       engagement: {
+        ...failure('engagement'),
         dau, wau, mau,
         stickinessPct: mau > 0 ? (dau / mau) * 100 : 0,
       },
       activation: {
+        ...failure('activation'),
         signupsInWindow: signups,
         activatedInWindow: activated,
         activationRatePct: signups > 0 ? (activated / signups) * 100 : 0,
       },
       tokens: {
+        ...failure('tokens'),
         totalBalance: tokTotal,
         avgBalance: Math.round(tokAvg),
       },

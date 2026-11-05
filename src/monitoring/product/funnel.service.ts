@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../../common/services/pg.service';
 import { excludedUsers, TEST_USER_PATTERN } from '../../common/test-users';
+import { throwIfAborted } from '../../common/abort';
 
 /**
  * Sales funnel — see monitoring.functions.md §3.8.
@@ -24,6 +25,7 @@ export interface FunnelStep {
   ratioToFirst: number | null;
   ratioToPrev: number | null;
   identity: 'session' | 'user';
+  error?: 'source_failed';
 }
 
 export interface FunnelResponse {
@@ -33,6 +35,7 @@ export interface FunnelResponse {
   excludedUsers: string[];
   steps: FunnelStep[];
   generatedAt: string;
+  error?: 'source_failed';
 }
 
 // Полный список тестовых/админ-номеров + паттерн — тот же, что в VPM/economy.
@@ -293,17 +296,20 @@ export class FunnelService {
 
   async getFunnel(fromIso: string, toIso: string, source: string | null, signal?: AbortSignal): Promise<FunnelResponse> {
     // 1. Сырые множества идентификаторов по каждому шагу (юзеры/сессии).
-    const raw: Array<{ step: StepDef; ids: Set<string> }> = [];
+    const raw: Array<{ step: StepDef; ids: Set<string>; failed: boolean }> = [];
     for (const step of this.steps) {
       const { sql, params } = step.query(fromIso, toIso, source, effectiveExcluded);
       let ids: string[] = [];
+      let failed = false;
       try {
         const r = await this.pg.query(sql, params, signal);
         ids = r.rows.map((row: any) => row.user_id ?? row.session_id).filter(Boolean);
       } catch (e: any) {
+        throwIfAborted(signal);
+        failed = true;
         this.log.error(`funnel step ${step.key} failed: ${e.message}`);
       }
-      raw.push({ step, ids: new Set(ids) });
+      raw.push({ step, ids: new Set(ids), failed });
     }
 
     // 2. ОБРАТНОЕ накопительное объединение для user-шагов: когорта шага =
@@ -354,6 +360,7 @@ export class FunnelService {
         ratioToFirst,
         ratioToPrev,
         identity: step.identity,
+        ...(raw[i].failed ? { error: 'source_failed' as const } : {}),
       });
     }
 
@@ -364,6 +371,7 @@ export class FunnelService {
       excludedUsers: effectiveExcluded,
       steps: results,
       generatedAt: new Date().toISOString(),
+      ...(raw.some((item) => item.failed) ? { error: 'source_failed' as const } : {}),
     };
   }
 }

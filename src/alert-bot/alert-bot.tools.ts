@@ -8,6 +8,7 @@ import { SummaryService } from '../monitoring/product/summary.service';
 import { SupportService } from '../support/support.service';
 import { AlertBotHealthService, HEALTH_SECTIONS, HealthSection } from './alert-bot.health';
 import { maskText, toolText, userLabel } from './alert-bot.mask';
+import { throwIfAborted } from '../common/abort';
 import { AlertBotStore } from './alert-bot.store';
 import { OpsContext, OpsToolHandler } from './alert-bot.types';
 
@@ -133,6 +134,7 @@ export class AlertBotTools implements OpsToolHandler {
     signal?: AbortSignal,
   ): Promise<string> {
     try {
+      throwIfAborted(signal);
       let result: unknown;
       switch (name) {
         case 'alerts': result = await this.alerts(args, signal); break;
@@ -144,6 +146,7 @@ export class AlertBotTools implements OpsToolHandler {
       }
       return toolText(result);
     } catch {
+      throwIfAborted(signal);
       return toolText({ error: 'source_failed' });
     }
   }
@@ -157,6 +160,7 @@ export class AlertBotTools implements OpsToolHandler {
       this.store.recentAlerts(hours, 50, signal),
     ]);
 
+    throwIfAborted(signal);
     const prometheusFailed = [firingResult, stateResult, historyResult]
       .some((result) => result.status === 'rejected');
     const firingRows = firingResult.status === 'fulfilled' ? firingResult.value : [];
@@ -181,7 +185,11 @@ export class AlertBotTools implements OpsToolHandler {
       prometheus: {
         ...(prometheusFailed ? { error: 'source_failed' } : {}),
         firing,
-        history: historyRows,
+        history: historyRows.map((row: PromRow) => ({
+          metric: row.metric,
+          ts: row.value[0],
+          value: row.value[1],
+        })),
       },
       journal,
     };
@@ -239,6 +247,7 @@ export class AlertBotTools implements OpsToolHandler {
       return { error: 'invalid_params' };
     }
     const days = intArg(args.days, 1, 365, 7);
+    const effectiveDays = section === 'tokens' && args.bucket === 'hour' ? Math.min(days, 14) : days;
     const window = (args.window || '30d') as EconomyWindow;
     let data: unknown;
     switch (section as StatsSection) {
@@ -246,7 +255,7 @@ export class AlertBotTools implements OpsToolHandler {
         data = await this.admin.getPaymentsStats({ days, includeTest: false }, signal);
         break;
       case 'tokens':
-        data = await this.admin.getTokensSpendStats({ days, bucket: args.bucket === 'hour' ? 'hour' : 'day' }, signal);
+        data = await this.admin.getTokensSpendStats({ days: effectiveDays, bucket: args.bucket === 'hour' ? 'hour' : 'day' }, signal);
         break;
       case 'active':
         data = await this.admin.getActiveUsersStats({ days, bucket: args.bucket === 'week' ? 'week' : 'day' }, signal);
@@ -265,7 +274,13 @@ export class AlertBotTools implements OpsToolHandler {
         data = await this.economy.getOverview(window, signal);
         break;
     }
-    return { section, days, window, data };
+    return {
+      section,
+      days: effectiveDays,
+      ...(effectiveDays !== days ? { requestedDays: days } : {}),
+      window,
+      data,
+    };
   }
 
   private async tickets(args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
@@ -289,9 +304,10 @@ export class AlertBotTools implements OpsToolHandler {
     }
 
     const limit = intArg(args.limit, 1, 20, 20);
-    const rows = await this.support.adminListTickets({ limit: 200 }, signal);
+    const active = args.active !== false;
+    const rows = await this.support.adminListTickets({ limit, active }, signal);
     const tickets = rows
-      .filter((row: any) => args.active === false || !['resolved', 'closed'].includes(row.status))
+      .filter((row: any) => !active || !['resolved', 'closed'].includes(row.status))
       .slice(0, limit)
       .map((row: any) => this.ticketSummary(row));
     return { tickets };

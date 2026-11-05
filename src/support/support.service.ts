@@ -1045,7 +1045,7 @@ ${healthSummary}
   }
 
   async adminListTickets(
-    opts: { status?: string; limit?: number; sla?: SlaFilter; actorId?: string } = {},
+    opts: { status?: string; active?: boolean; limit?: number; sla?: SlaFilter; actorId?: string } = {},
     signal?: AbortSignal,
   ) {
     const limit = Math.max(1, Math.min(200, opts.limit ?? 50));
@@ -1058,9 +1058,12 @@ ${healthSummary}
     const sla = slaFilterSql(opts.sla, opts.actorId || '');
     const whereSla = sla.sql.replace(/\$SLA_ACTOR\$/g, `$${params.length + 1}`);
     params.push(...sla.params);
-    const where = whereSla === 'TRUE'
-      ? (whereStatus ? `WHERE ${whereStatus}` : '')
-      : `WHERE ${whereStatus ? `${whereStatus} AND ` : ''}${whereSla}`;
+    const where = [
+      whereStatus,
+      opts.active ? `t.status NOT IN ('resolved', 'closed')` : '',
+      whereSla === 'TRUE' ? '' : whereSla,
+    ].filter(Boolean);
+    const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
     const rows = await this.pg.query(
       `SELECT t.*,
               p.profile_data->>'name' AS user_name,
@@ -1073,7 +1076,7 @@ ${healthSummary}
          FROM support_tickets t
          LEFT JOIN ai_profiles_consolidated p ON p.user_id = t.user_id
          LEFT JOIN ai_profiles_consolidated op ON op.user_id = t.assigned_to
-         ${where}
+         ${whereSql}
          ORDER BY
            CASE
              WHEN t.status = 'resolved' THEN 3
