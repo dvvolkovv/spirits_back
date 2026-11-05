@@ -174,7 +174,7 @@ export class AlertBotTools implements OpsToolHandler {
       const since = Number.isFinite(sinceSeconds)
         ? new Date(sinceSeconds * 1000).toISOString()
         : null;
-      return { metric: row.metric, value: row.value, since };
+      return { metric: row.metric, ts: row.value[0], value: row.value[1], since };
     });
     const journal = journalResult.status === 'fulfilled'
       ? journalResult.value
