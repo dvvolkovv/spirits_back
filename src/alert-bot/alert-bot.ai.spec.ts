@@ -20,6 +20,7 @@ describe('AlertBotAi', () => {
     JWT_SECRET: process.env.JWT_SECRET,
     RELAY_FS_SALT: process.env.RELAY_FS_SALT,
     ALERT_BOT_MODEL: process.env.ALERT_BOT_MODEL,
+    ALERT_BOT_TIMEOUT_MS: process.env.ALERT_BOT_TIMEOUT_MS,
   };
   let claude: { textWithCost: jest.Mock };
   let ops: { url: jest.Mock; consumeToolNames: jest.Mock };
@@ -72,6 +73,18 @@ describe('AlertBotAi', () => {
     expect(prompt).not.toContain('a@example.com');
     expect(prompt).toContain('#11111111');
     expect(result).toEqual({ text: 'Всё спокойно', costUsd: 0.02, tools: ['alerts', 'health'] });
+  });
+
+  it('останавливает зависший preload тикета и не вызывает Claude', async () => {
+    process.env.ALERT_BOT_TIMEOUT_MS = '1000';
+    tools.execute.mockImplementation(() => new Promise(() => undefined));
+
+    await expect(ai.answer({ ...input, ticketId: TICKET })).rejects.toMatchObject({ kind: 'timeout' });
+
+    expect(claude.textWithCost).not.toHaveBeenCalled();
+    const signal = tools.execute.mock.calls[0][3] as AbortSignal;
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(signal.aborted).toBe(true);
   });
 
   it('журнал вызовов инструментов очищается и после ошибки', async () => {
