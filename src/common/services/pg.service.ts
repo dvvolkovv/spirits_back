@@ -50,6 +50,7 @@ export class AdvisoryLock {
 export class PgService implements OnModuleInit, OnModuleDestroy {
   private pool: Pool;
   private lockPool: Pool;
+  private readonly preCloseHooks: Array<() => Promise<void>> = [];
   private readonly logger = new Logger(PgService.name);
 
   onModuleInit() {
@@ -82,8 +83,17 @@ export class PgService implements OnModuleInit, OnModuleDestroy {
     this.logger.log('PostgreSQL pools created (main + advisory locks)');
   }
 
+  registerPreCloseHook(hook: () => Promise<void>): void {
+    this.preCloseHooks.push(hook);
+  }
+
   async onModuleDestroy() {
-    await Promise.all([this.pool.end(), this.lockPool.end()]);
+    try {
+      // Долгие пользователи пула останавливают admission и abort-ят I/O ДО end().
+      for (const hook of this.preCloseHooks) await hook();
+    } finally {
+      await Promise.all([this.pool.end(), this.lockPool.end()]);
+    }
   }
 
   async query(text: string, params?: any[], signal?: AbortSignal): Promise<QueryResult> {

@@ -25,8 +25,8 @@ export class AlertBotStatusService {
 
   async summary(): Promise<string> {
     const [alerts, badSections, tickets] = await Promise.allSettled([
-      withDeadline(() => this.firingAlerts(), STATUS_BLOCK_TIMEOUT_MS),
-      withDeadline(() => this.health.badSections(), STATUS_BLOCK_TIMEOUT_MS),
+      withDeadline((signal) => this.firingAlerts(signal), STATUS_BLOCK_TIMEOUT_MS),
+      withDeadline((signal) => this.health.badSections(signal), STATUS_BLOCK_TIMEOUT_MS),
       withDeadline((signal) => this.ticketCounts(signal), STATUS_BLOCK_TIMEOUT_MS),
     ]);
 
@@ -47,10 +47,10 @@ export class AlertBotStatusService {
     return [alertLines, healthLine, ticketLine].join('\n');
   }
 
-  private async firingAlerts(): Promise<string[]> {
+  private async firingAlerts(signal: AbortSignal): Promise<string[]> {
     const [alerts, states]: [PrometheusRow[], PrometheusRow[]] = await Promise.all([
-      this.monitoring.query('ALERTS{alertstate="firing"}'),
-      this.monitoring.query('ALERTS_FOR_STATE'),
+      this.monitoring.query('ALERTS{alertstate="firing"}', signal),
+      this.monitoring.query('ALERTS_FOR_STATE', signal),
     ]);
     const stateByMetric = new Map(states.map((row) => [metricKey(row.metric), row]));
     return alerts.slice(0, 10).map((alert) => {

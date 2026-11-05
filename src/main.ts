@@ -5,6 +5,7 @@ import { attachVoiceWs } from './voice/voice-ws';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bodyParser: false });
+  app.enableShutdownHooks();
 
   const bodyParser = require('body-parser');
 

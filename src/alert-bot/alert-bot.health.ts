@@ -213,8 +213,8 @@ export class AlertBotHealthService {
     }
   }
 
-  async badSections(): Promise<string[]> {
-    const pairs = await Promise.all(HEALTH_SECTIONS.map(async (s) => [s, await this.getSection(s)] as const));
+  async badSections(signal?: AbortSignal): Promise<string[]> {
+    const pairs = await Promise.all(HEALTH_SECTIONS.map(async (s) => [s, await this.getSection(s, signal)] as const));
     return pairs.filter(([section, value]) => !isSectionHealthy(section, value)).map(([name]) => name);
   }
 }

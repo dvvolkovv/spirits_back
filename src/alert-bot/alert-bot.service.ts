@@ -76,6 +76,7 @@ export class AlertBotService {
   private readonly logger = new Logger(AlertBotService.name);
   private readonly refusalSentAt = new Map<string, number>();
   private readonly activeUpdates = new Set<number>();
+  private accepting = true;
   private me: Promise<{ id: number; username: string }> | null = null;
 
   constructor(
@@ -88,13 +89,19 @@ export class AlertBotService {
     private readonly support: SupportService,
   ) {}
 
+  stopAdmission(): void {
+    this.accepting = false;
+  }
+
   async claimUpdate(update: unknown): Promise<boolean> {
+    if (!this.accepting) return false;
     const updateId = (update as TelegramUpdate)?.update_id;
     if (!Number.isSafeInteger(updateId)) return false;
     return this.store.claimUpdate(Number(updateId), update);
   }
 
   async handleUpdate(update: unknown, alreadyClaimed = false): Promise<void> {
+    if (!this.accepting && !alreadyClaimed) return;
     const candidate = update as TelegramUpdate;
     if (!Number.isSafeInteger(candidate?.update_id)) return;
     const updateId = Number(candidate.update_id);
@@ -131,6 +138,7 @@ export class AlertBotService {
   }
 
   async retryFailedUpdates(): Promise<void> {
+    if (!this.accepting) return;
     await this.store.requeueProcessingUpdates(60);
     const due = await this.store.dueUpdates();
     for (const item of due) await this.handleUpdate(item.payload);

@@ -94,7 +94,7 @@ export class ProfileDepthService {
                            WHEN 'Belief' THEN c*2 WHEN 'Desire' THEN c*2 WHEN 'Skill' THEN c*2
                            WHEN 'Interest' THEN c*1 ELSE 0 END) AS pds
        RETURN pds`, {}, signal
-    ).catch(() => { throwIfAborted(signal); return []; });
+    ).catch((e) => { throwIfAborted(signal); throw e; });
 
     const scores = perUserRows.map((r) => this.toInt(r.pds)).sort((a, b) => a - b);
     const profiles = scores.length;

@@ -2,6 +2,7 @@ import {
   BeforeApplicationShutdown, Injectable, Logger, OnModuleDestroy, OnModuleInit,
 } from '@nestjs/common';
 import { setAlertSentSink } from '../common/telegram-alert';
+import { PgService } from '../common/services/pg.service';
 import { alertBotEnabled } from './alert-bot.config';
 import { AlertBotOpsServer } from './alert-bot.ops-server';
 import { AlertBotService } from './alert-bot.service';
@@ -26,10 +27,12 @@ export class AlertBotLifecycle implements OnModuleInit, OnModuleDestroy, BeforeA
     private readonly telegram: AlertBotTelegram,
     private readonly turns: AlertBotTurns,
     private readonly service: AlertBotService,
+    private readonly pg: PgService,
   ) {}
 
   async onModuleInit(): Promise<void> {
     await this.store.migrate();
+    this.pg.registerPreCloseHook(() => this.beforeApplicationShutdown());
     if (!alertBotEnabled()) return;
     await this.ops.start();
     const interrupted = await this.store.interruptInProgress();
@@ -52,6 +55,7 @@ export class AlertBotLifecycle implements OnModuleInit, OnModuleDestroy, BeforeA
   async beforeApplicationShutdown(): Promise<void> {
     if (this.shutdown) return this.shutdown;
     this.shutdown = (async () => {
+      this.service.stopAdmission();
       let timer: NodeJS.Timeout | undefined;
       try {
         await Promise.race([

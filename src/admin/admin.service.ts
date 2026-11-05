@@ -1423,22 +1423,28 @@ export class AdminService implements OnModuleInit {
   }
 
   async getActiveUsersStats(opts: { days?: number; bucket?: 'day' | 'hour' | 'week' } = {}, signal?: AbortSignal) {
-    const days = Math.min(Math.max(opts.days ?? 30, 1), 365);
     const bucket = opts.bucket === 'hour' || opts.bucket === 'week' ? opts.bucket : 'day';
+    const days = bucket === 'hour'
+      ? Math.min(Math.max(opts.days ?? 2, 1), 14)
+      : Math.min(Math.max(opts.days ?? 30, 1), 365);
+    const stepCount = bucket === 'hour' ? days * 24 - 1 : days - 1;
 
     const seriesRes = await this.pg.query(
-      `WITH days AS (
+      `WITH buckets AS (
          SELECT generate_series(
-           date_trunc($1, now() - make_interval(days => $2 - 1)),
+           date_trunc($1, now() - CASE
+             WHEN $1 = 'hour' THEN make_interval(hours => $3)
+             ELSE make_interval(days => $2 - 1)
+           END),
            date_trunc($1, now()),
            ('1 ' || $1)::interval
          ) AS bucket
        )
        SELECT
-         to_char(d.bucket, 'YYYY-MM-DD') AS day,
+         d.bucket AS day,
          COALESCE(active.unique_users, 0)::int AS unique_users,
          COALESCE(newr.new_users, 0)::int AS new_users
-       FROM days d
+       FROM buckets d
        LEFT JOIN (
          SELECT date_trunc($1, t.created_at) AS bucket,
                 COUNT(DISTINCT t.user_id) AS unique_users
@@ -1457,7 +1463,7 @@ export class AdminService implements OnModuleInit {
          GROUP BY 1
        ) newr ON newr.bucket = d.bucket
        ORDER BY d.bucket`,
-      [bucket, days],
+      [bucket, days, stepCount],
       signal
     );
 
