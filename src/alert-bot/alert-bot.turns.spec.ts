@@ -132,6 +132,16 @@ describe('AlertBotTurns', () => {
     }));
   });
 
+  it('ищет не более десяти уникальных ticket-prefix candidates за ответ', async () => {
+    const prefixes = Array.from({ length: 100 }, (_, index) => index.toString(16).padStart(8, '0'));
+    ai.answer.mockResolvedValue({ text: prefixes.map((prefix) => `#${prefix}`).join(' '), costUsd: 0, tools: [] });
+
+    await turns.enqueue(question());
+
+    expect(support.findTicketByPrefix).toHaveBeenCalledTimes(10);
+    expect(support.findTicketByPrefix.mock.calls.map((call) => call[0])).toEqual(prefixes.slice(0, 10));
+  });
+
   it.each([
     ['auth', 'model_down'],
     ['rate_limit', 'model_down'],
@@ -383,5 +393,8 @@ describe('AlertBotTurns', () => {
     expect(telegram.editMessageText).not.toHaveBeenCalled();
     expect(store.finishTurn).toHaveBeenCalledTimes(1);
     expect(chat.endStream).toHaveBeenCalledTimes(1);
+    const logs = JSON.stringify(logger.error.mock.calls);
+    expect(logs).not.toContain('status=ok kind=done');
+    expect(logs).toContain('status=ignored kind=fenced');
   });
 });

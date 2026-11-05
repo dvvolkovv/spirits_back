@@ -147,6 +147,20 @@ describe('AlertBotService', () => {
     expect(store.createTurn).toBeUndefined();
   });
 
+  it('неуспешный refusal не включает часовой throttle и разрешает повторную отправку', async () => {
+    access.resolveTelegram.mockResolvedValue({ userId: 'user-1', isAdmin: false });
+    telegram.sendMessage
+      .mockRejectedValueOnce(Object.assign(new Error('RAW-REFUSAL-SECRET'), { kind: 'send_failed' }))
+      .mockResolvedValueOnce({ message_id: 1001 });
+
+    await service.handleUpdate(update({}, 1));
+    await service.handleUpdate(update({ text: 'Повторный вопрос' }, 2));
+
+    expect(telegram.sendMessage).toHaveBeenCalledTimes(2);
+    expect(telegram.sendMessage.mock.calls[1][1]).toContain('только для администраторов');
+    expect(JSON.stringify(logger.error.mock.calls)).not.toContain('RAW-REFUSAL-SECRET');
+  });
+
   it('unlisted group молчит даже для admin, а ordinary group message не вызывает resolveTelegram', async () => {
     await service.handleUpdate(update({ chat: { id: -100999, type: 'group' } }, 1));
     await service.handleUpdate(groupText('Обычный разговор', 2));
@@ -209,6 +223,25 @@ describe('AlertBotService', () => {
     expect(turns.enqueue).toHaveBeenCalledWith(expect.objectContaining({ parentTurnId: 'parent-chunks' }));
     expect(drafts.maybeDraft).not.toHaveBeenCalled();
     expect(support.findTicketByPrefix).not.toHaveBeenCalled();
+  });
+
+  it('reply человеку с #prefix и mention остаётся вопросом, а не ticket draft', async () => {
+    support.findTicketByPrefix.mockResolvedValue({ id: TICKET, status: 'escalated' });
+
+    await service.handleUpdate(groupText('@linkeon_alert_bot Разбери причину', 1, {
+      reply_to_message: {
+        message_id: 556,
+        text: 'Эскалация #11111111',
+        chat: { id: -100123, type: 'supergroup' },
+        from: { id: 201, is_bot: false },
+      },
+    }));
+
+    expect(drafts.maybeDraft).not.toHaveBeenCalled();
+    expect(turns.enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      question: 'Разбери причину', replyText: 'Эскалация #11111111', privateChat: false,
+    }));
+    expect(turns.enqueue.mock.calls[0][0].ticketId).toBeUndefined();
   });
 
   it('reply на escalation #11111111 без /ask создаёт draft', async () => {

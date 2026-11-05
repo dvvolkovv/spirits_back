@@ -35,6 +35,21 @@ maybe('хранилище бота алертов против PostgreSQL', () =
   it('повторная и одновременная миграция безопасны', async () => {
     await expect(Promise.all([store.migrate(), store.migrate()])).resolves.toEqual([undefined, undefined]);
   });
+  it('answer_message_ids имеет валидный GIN index для continuation lookup', async () => {
+    const result = await pool.query(`
+      SELECT c.relname, i.indisvalid, pg_get_indexdef(i.indexrelid) AS definition
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indexrelid
+      JOIN pg_class t ON t.oid = i.indrelid
+      WHERE t.relname = 'alert_bot_turns'
+        AND c.relname = 'idx_alert_bot_turns_answer_ids_gin'
+    `);
+
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0].indisvalid).toBe(true);
+    expect(result.rows[0].definition).toContain('USING gin');
+    expect(result.rows[0].definition).toContain('answer_message_ids');
+  });
   it('update_id принимается один раз', async () => {
     expect(await store.claimUpdate(1001)).toBe(true);
     expect(await store.claimUpdate(1001)).toBe(false);
