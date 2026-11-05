@@ -60,16 +60,17 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
       support as any,
     );
     const drafts = new AlertBotDrafts(store, support as any, telegram as any);
+    const commands = { start: jest.fn(), status: jest.fn(), close: jest.fn() };
     const service = new AlertBotService(
       { resolveTelegram: jest.fn().mockResolvedValue({ isAdmin: true, userId: 'admin-retry' }) } as any,
       telegram as any,
       store,
-      { start: jest.fn(), status: jest.fn(), close: jest.fn() } as any,
+      commands as any,
       drafts,
       turns,
       support as any,
     );
-    return { service, support, drafts, turns };
+    return { service, support, drafts, turns, commands };
   }
 
   function telegramMock() {
@@ -446,5 +447,103 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
     expect((await pool.query(
       'SELECT status FROM alert_bot_updates WHERE update_id = $1', [update.update_id],
     )).rows[0].status).toBe('failed');
+  });
+
+  it('direct /status timeout после remote success dead-letter-ится без повторной команды и второго сообщения', async () => {
+    const aiAnswer = jest.fn();
+    const telegram = telegramMock();
+    telegram.sendMessage.mockRejectedValueOnce(unknownTelegramOutcome());
+    const { service, commands } = makeService(telegram, aiAnswer);
+    commands.status.mockResolvedValue('Сводка по алертам');
+    const statusUpdate = {
+      ...update,
+      update_id: 92101,
+      message: { ...update.message, text: '/status' },
+    };
+
+    await service.handleUpdate(statusUpdate);
+    await service.retryFailedUpdates();
+
+    expect(commands.status).toHaveBeenCalledTimes(1);
+    expect(telegram.sendMessage).toHaveBeenCalledTimes(1);
+    expect((await pool.query(
+      'SELECT status, next_retry_at FROM alert_bot_updates WHERE update_id = $1', [statusUpdate.update_id],
+    )).rows[0]).toMatchObject({ status: 'failed', next_retry_at: null });
+  });
+
+  it('draft prompt timeout после публикации оставляет draft активным и не повторяет prompt', async () => {
+    const aiAnswer = jest.fn();
+    const telegram = telegramMock();
+    telegram.sendMessage.mockRejectedValueOnce(unknownTelegramOutcome());
+    const { service, support } = makeService(telegram, aiAnswer);
+    support.findTicketByPrefix.mockResolvedValue({ id: '11111111-1111-4111-8111-111111111111' });
+    const promptUpdate = {
+      update_id: 92102,
+      message: {
+        ...update.message,
+        text: 'Черновик ответа',
+        reply_to_message: {
+          message_id: 800,
+          text: 'Эскалация #11111111',
+          from: { id: 999, is_bot: true, username: 'linkeon_alert_bot' },
+        },
+      },
+    };
+
+    await service.handleUpdate(promptUpdate);
+    await service.retryFailedUpdates();
+
+    expect(telegram.sendMessage).toHaveBeenCalledTimes(1);
+    expect((await pool.query(
+      'SELECT outcome, prompt_message_id FROM alert_bot_ticket_drafts',
+    )).rows[0]).toMatchObject({ outcome: null, prompt_message_id: null });
+    expect((await pool.query(
+      'SELECT status, next_retry_at FROM alert_bot_updates WHERE update_id = $1', [promptUpdate.update_id],
+    )).rows[0]).toMatchObject({ status: 'failed', next_retry_at: null });
+  });
+
+  it('scheduled older retry при active guard нового callback остаётся failed, fresh duplicate завершается без работы', async () => {
+    const aiAnswer = jest.fn();
+    const telegram = telegramMock();
+    const { service, turns } = makeService(telegram, aiAnswer);
+    const draftId = await store.createDraft({
+      chatId: '100', tgUserId: '200', adminUserId: 'admin-retry',
+      ticketId: '11111111-1111-4111-8111-111111111111', text: 'Вопрос с active guard',
+    });
+    const callback = (updateId: number, callbackId: string) => ({
+      update_id: updateId,
+      callback_query: {
+        id: callbackId, data: `draft:${draftId}:ask`, from: { id: 200 },
+        message: { message_id: 900, chat: { id: 100, type: 'private' } },
+      },
+    });
+    const newer = callback(92104, 'newer-active');
+    const older = callback(92103, 'older-scheduled');
+    let finishAdmission!: (value: 'accepted') => void;
+    const admission = new Promise<'accepted'>((resolve) => { finishAdmission = resolve; });
+    jest.spyOn(turns, 'enqueue').mockReturnValue(admission);
+    const newerHandling = service.handleUpdate(newer);
+    for (let i = 0; i < 30 && (turns.enqueue as jest.Mock).mock.calls.length === 0; i += 1) await Promise.resolve();
+    expect(turns.enqueue).toHaveBeenCalledTimes(1);
+
+    await store.claimUpdate(older.update_id, older);
+    await store.failUpdate(older.update_id, 'db_down');
+    await makeDue(older.update_id);
+    await service.retryFailedUpdates();
+    const retryState = (await pool.query(
+      'SELECT status, attempts FROM alert_bot_updates WHERE update_id = $1', [older.update_id],
+    )).rows[0];
+
+    await makeDue(older.update_id);
+    await service.handleUpdate(older);
+    const freshState = (await pool.query(
+      'SELECT status FROM alert_bot_updates WHERE update_id = $1', [older.update_id],
+    )).rows[0];
+    finishAdmission('accepted');
+    await newerHandling;
+
+    expect(retryState).toMatchObject({ status: 'failed', attempts: 2 });
+    expect(freshState.status).toBe('completed');
+    expect(turns.enqueue).toHaveBeenCalledTimes(1);
   });
 });

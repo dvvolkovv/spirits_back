@@ -509,6 +509,38 @@ describe('AlertBotTurns', () => {
     expect(store.completeDelivery).toHaveBeenCalledWith('turn-1', [901]);
   });
 
+  it('queued ack приходит до завершения running turn и не повторяется accepted после admission', async () => {
+    const first = deferred<{ text: string; costUsd: number; tools: string[] }>();
+    const started = deferred();
+    ai.answer.mockImplementationOnce(() => {
+      started.resolve();
+      return first.promise;
+    });
+    const running = turns.enqueue(question({ updateId: 1, questionMessageId: 301 }));
+    await started.promise;
+    const onAdmission = jest.fn().mockResolvedValue(undefined);
+
+    const waiting = turns.enqueue(
+      question({ updateId: 2, questionMessageId: 302 }), undefined, { onAdmission },
+    );
+
+    const earlyCalls = onAdmission.mock.calls.length;
+    const earlyStatus = onAdmission.mock.calls[0]?.[0];
+    const earlyAiCalls = ai.answer.mock.calls.length;
+    const earlyAdmissions = store.tryCreateTurn.mock.calls.length;
+
+    first.resolve({ text: 'первый', costUsd: 0, tools: [] });
+    await expect(running).resolves.toBe('accepted');
+    await expect(waiting).resolves.toBe('accepted');
+
+    expect(earlyCalls).toBe(1);
+    expect(earlyStatus).toBe('queued');
+    expect(earlyAiCalls).toBe(1);
+    expect(earlyAdmissions).toBe(1);
+    expect(onAdmission).toHaveBeenCalledTimes(1);
+    expect(onAdmission).not.toHaveBeenCalledWith('accepted');
+  });
+
   it('stopAdmission отклоняет queued admission до beginStream новой модели', async () => {
     const first = deferred<{ text: string; costUsd: number; tools: string[] }>();
     const started = deferred();
