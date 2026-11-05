@@ -494,7 +494,7 @@ maybe('callback черновика с lease против PostgreSQL', () => {
       await expect(callbackSpy.mock.results[0].value).resolves.toEqual(expect.objectContaining({
         question: 'вопрос из черновика', claimVersion: 1,
       }));
-      expect(localTelegram.answerCallbackQuery).not.toHaveBeenCalledWith('first', expect.anything());
+      expect(localTelegram.answerCallbackQuery).toHaveBeenCalledWith('first', 'Вопрос поставлен в очередь');
       expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'asking', claimVersion: 1 });
 
       for (const [index, callbackId] of ['second', 'third'].entries()) {
@@ -519,7 +519,8 @@ maybe('callback черновика с lease против PostgreSQL', () => {
       else process.env.TELEGRAM_CHAT_ID = previousChat;
     }
 
-    expect(localTelegram.answerCallbackQuery).toHaveBeenCalledWith('first', 'Вопрос принят');
+    expect(localTelegram.answerCallbackQuery).toHaveBeenCalledTimes(3);
+    expect(localTelegram.answerCallbackQuery).not.toHaveBeenCalledWith('first', 'Вопрос принят');
     expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'asked', claimVersion: 1 });
     expect(ai.answer).toHaveBeenCalledTimes(2);
     expect(ai.answer.mock.calls.filter(([input]) => input.question === 'вопрос из черновика')).toHaveLength(1);

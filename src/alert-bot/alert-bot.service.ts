@@ -162,7 +162,9 @@ export class AlertBotService {
     replyMarkup?: unknown,
   ): Promise<{ message_id: number }> {
     try {
-      return await this.telegram.sendMessage(chatId, text, replyTo, replyMarkup);
+      return replyMarkup === undefined
+        ? await this.telegram.sendMessage(chatId, text, replyTo)
+        : await this.telegram.sendMessage(chatId, text, replyTo, replyMarkup);
     } catch (error) {
       if (unknownTelegramOutcome(error)) {
         // Команда могла уже дать видимый ответ. Update будет dead-letter,
