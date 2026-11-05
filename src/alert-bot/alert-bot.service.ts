@@ -179,7 +179,7 @@ export class AlertBotService {
     // Неизвестный Telegram outcome dead-letter-ится без нового видимого сообщения.
     if ([
       'placeholder_in_flight', 'notification_in_flight', 'delivery_in_flight',
-      'service_message_in_flight', 'draft_prompt_in_flight',
+      'service_message_in_flight', 'draft_prompt_in_flight', 'draft_in_progress',
     ].includes(kind)) return;
     const message = update.message || update.callback_query?.message;
     if (!message) return;

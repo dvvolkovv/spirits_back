@@ -213,11 +213,15 @@ export class AlertBotStore {
     const result = await this.pg.query(
       `UPDATE alert_bot_updates
        SET status = 'failed', error_kind = $2, updated_at = now(),
-           next_retry_at = CASE WHEN NOT $3 AND attempts < 5
-             THEN now() + (LEAST(300, POWER(2, attempts - 1))::text || ' seconds')::interval
+           attempts = CASE WHEN $2 = 'draft_in_progress'
+             THEN GREATEST(0, attempts - 1) ELSE attempts END,
+           next_retry_at = CASE
+             WHEN $2 = 'draft_in_progress' THEN now() + interval '1 second'
+             WHEN NOT $3 AND attempts < 5
+               THEN now() + (LEAST(300, POWER(2, attempts - 1))::text || ' seconds')::interval
              ELSE NULL END
        WHERE update_id = $1 AND status = 'processing'
-       RETURNING ($3 OR attempts >= 5) AS final`,
+       RETURNING ($2 <> 'draft_in_progress' AND ($3 OR attempts >= 5)) AS final`,
       [updateId, safeKind, nonRetryable],
     );
     return result.rows[0]?.final === true;

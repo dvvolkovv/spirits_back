@@ -544,7 +544,7 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
     finishAdmission('accepted');
     await newerHandling;
 
-    expect(retryState).toMatchObject({ status: 'failed', attempts: 2, error_kind: 'draft_in_progress' });
+    expect(retryState).toMatchObject({ status: 'failed', attempts: 1, error_kind: 'draft_in_progress' });
     expect(freshState.status).toBe('completed');
     expect(turns.enqueue).toHaveBeenCalledTimes(1);
     expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('older-scheduled', 'Повторите позже');
