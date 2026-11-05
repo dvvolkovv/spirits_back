@@ -44,6 +44,7 @@ function terminalPublishError(error: unknown): boolean {
 @Injectable()
 export class AlertBotDrafts {
   private readonly logger = new Logger(AlertBotDrafts.name);
+  private readonly activeQuestionDraftIds = new Set<string>();
 
   constructor(
     private readonly store: AlertBotStore,
@@ -108,14 +109,34 @@ export class AlertBotDrafts {
     await this.finalize(id, 'asking', 'asked', version);
   }
 
+  finishAsk(id: string): void {
+    this.activeQuestionDraftIds.delete(id);
+  }
+
   async releaseAsk(id: string, version: number): Promise<void> {
-    await this.store.releaseDraft(id, 'asking', version);
+    try {
+      await this.store.releaseDraft(id, 'asking', version);
+    } finally {
+      this.finishAsk(id);
+    }
   }
 
   async handleCallback(input: DraftCallbackInput): Promise<DraftCallbackResult> {
     let answer = 'Готово';
     let activeClaim: { action: AlertBotDraftClaim; version: number } | null = null;
+    let ownsQuestionGuard = false;
+    let keepQuestionGuard = false;
     try {
+      if (input.action === 'ask') {
+        if (this.activeQuestionDraftIds.has(input.draftId)) {
+          answer = 'Черновик уже обрабатывается';
+          return {};
+        }
+        // Добавляем синхронно, до первого await: повторный callback не должен
+        // заново reclaim'ить asking, пока исходный ход ждёт в локальной очереди.
+        this.activeQuestionDraftIds.add(input.draftId);
+        ownsQuestionGuard = true;
+      }
       const draft = await this.store.getDraft(input.draftId);
       if (!draft || String(draft.chatId) !== String(input.chatId)) {
         answer = 'Черновик не найден';
@@ -168,8 +189,9 @@ export class AlertBotDrafts {
       }
 
       if (input.action === 'ask') {
-        // Резерв остаётся на время admission и выполнения хода. Его снимает
-        // service при отказе/сбое либо финализирует после accepted.
+        // Atomic admission переведёт asking → asked. Локальный ID остаётся
+        // активным, пока queued/running ход не завершится в Turns.
+        keepQuestionGuard = true;
         answer = 'Вопрос обрабатывается';
         return {
           question: draft.text,
@@ -231,6 +253,9 @@ export class AlertBotDrafts {
       answer = 'Не удалось обработать черновик';
       return {};
     } finally {
+      if (ownsQuestionGuard && !keepQuestionGuard) {
+        this.activeQuestionDraftIds.delete(input.draftId);
+      }
       // Ошибка ack не отменяет уже полученный результат (особенно question у /ask).
       try {
         await this.telegram.answerCallbackQuery(input.callbackId, answer);

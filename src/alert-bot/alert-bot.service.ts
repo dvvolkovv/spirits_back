@@ -148,6 +148,11 @@ export class AlertBotService {
           privateChat: message.chat.type === 'private',
           ticketId: result.ticketId || null,
         }, reserved ? { draftId: result.draftId!, claimVersion: result.claimVersion! } : undefined);
+        if (reserved && admission !== 'accepted') {
+          // Сначала fenced release в БД, затем локальный ID: новый callback не
+          // должен проскочить между освобождением Set и release reservation.
+          await this.drafts.releaseAsk(result.draftId!, result.claimVersion!);
+        }
       } catch (error) {
         if (reserved) {
           try {
@@ -157,10 +162,8 @@ export class AlertBotService {
           }
         }
         throw error;
-      }
-      if (reserved && admission !== 'accepted') {
-        // stale version не снимает более новый claim: releaseDraft fenced по version.
-        await this.drafts.releaseAsk(result.draftId!, result.claimVersion!);
+      } finally {
+        if (reserved) this.drafts.finishAsk(result.draftId!);
       }
     }
   }
