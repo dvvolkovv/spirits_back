@@ -9,6 +9,7 @@ import { AlertBotService } from './alert-bot.service';
 const TICKET = '11111111-1111-4111-8111-111111111111';
 const DRAFT = '22222222-2222-4222-8222-222222222222';
 const ADMIN = { userId: 'admin-1', isAdmin: true };
+const GUARD_TOKEN = Symbol('draft-question-guard');
 
 function update(message: Record<string, unknown> = {}, updateId = 1): any {
   return {
@@ -362,7 +363,7 @@ describe('AlertBotService', () => {
   it('duplicate callback update_id обрабатывается один раз', async () => {
     store.claimUpdate.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
     drafts.handleCallback.mockResolvedValue({
-      question: 'Вопрос', ticketId: TICKET, draftId: DRAFT, claimVersion: 1,
+      question: 'Вопрос', ticketId: TICKET, draftId: DRAFT, claimVersion: 1, guardToken: GUARD_TOKEN,
     });
 
     await service.handleUpdate(callback(`draft:${DRAFT}:ask`, {}, 8));
@@ -374,7 +375,7 @@ describe('AlertBotService', () => {
 
   it('valid draft callback делегирует drafts и enqueue возвращённый вопрос', async () => {
     drafts.handleCallback.mockResolvedValue({
-      question: 'Текст черновика', ticketId: TICKET, draftId: DRAFT, claimVersion: 3,
+      question: 'Текст черновика', ticketId: TICKET, draftId: DRAFT, claimVersion: 3, guardToken: GUARD_TOKEN,
     });
 
     await service.handleUpdate(callback(`draft:${DRAFT}:ask`));
@@ -388,34 +389,34 @@ describe('AlertBotService', () => {
       questionMessageId: 900, privateChat: true, ticketId: TICKET,
     }), { draftId: DRAFT, claimVersion: 3 });
     expect(drafts.finalizeAsk).not.toHaveBeenCalled();
-    expect(drafts.finishAsk).toHaveBeenCalledWith(DRAFT);
+    expect(drafts.finishAsk).toHaveBeenCalledWith(DRAFT, GUARD_TOKEN);
     expect(drafts.releaseAsk).not.toHaveBeenCalled();
   });
 
   it.each(['busy', 'rate_limited', 'stale'])('draft ask при admission %s освобождает только совпавший резерв', async (admission) => {
     drafts.handleCallback.mockResolvedValue({
-      question: 'Текст черновика', ticketId: TICKET, draftId: DRAFT, claimVersion: 4,
+      question: 'Текст черновика', ticketId: TICKET, draftId: DRAFT, claimVersion: 4, guardToken: GUARD_TOKEN,
     });
     turns.enqueue.mockResolvedValue(admission);
 
     await service.handleUpdate(callback(`draft:${DRAFT}:ask`));
 
     expect(drafts.releaseAsk).toHaveBeenCalledWith(DRAFT, 4);
-    expect(drafts.finishAsk).toHaveBeenCalledWith(DRAFT);
+    expect(drafts.finishAsk).toHaveBeenCalledWith(DRAFT, GUARD_TOKEN);
     expect(turns.enqueue).toHaveBeenCalledWith(expect.anything(), { draftId: DRAFT, claimVersion: 4 });
     expect(drafts.finalizeAsk).not.toHaveBeenCalled();
   });
 
   it('draft ask при сбое enqueue освобождает резерв для retry', async () => {
     drafts.handleCallback.mockResolvedValue({
-      question: 'Текст черновика', ticketId: TICKET, draftId: DRAFT, claimVersion: 5,
+      question: 'Текст черновика', ticketId: TICKET, draftId: DRAFT, claimVersion: 5, guardToken: GUARD_TOKEN,
     });
     turns.enqueue.mockRejectedValue(Object.assign(new Error('RAW-ADMISSION-SECRET'), { kind: 'db_down' }));
 
     await service.handleUpdate(callback(`draft:${DRAFT}:ask`));
 
     expect(drafts.releaseAsk).toHaveBeenCalledWith(DRAFT, 5);
-    expect(drafts.finishAsk).toHaveBeenCalledWith(DRAFT);
+    expect(drafts.finishAsk).toHaveBeenCalledWith(DRAFT, GUARD_TOKEN);
     expect(drafts.finalizeAsk).not.toHaveBeenCalled();
     expect(JSON.stringify(logger.error.mock.calls)).not.toContain('RAW-ADMISSION-SECRET');
   });

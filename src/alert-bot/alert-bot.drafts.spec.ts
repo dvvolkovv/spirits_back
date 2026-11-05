@@ -284,9 +284,10 @@ describe('черновики ответов в тикет', () => {
 
     const result = await drafts.handleCallback(callback({ action }));
 
-    if (action === 'ask') expect(result).toEqual({
+    if (action === 'ask') expect(result).toEqual(expect.objectContaining({
       question: 'текст', ticketId: TICKET, draftId: DRAFT, claimVersion: 1,
-    });
+      guardToken: expect.any(Symbol),
+    }));
     else expect(result).toEqual({});
     expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
     if (action === 'ask') {
@@ -314,9 +315,10 @@ describe('черновики ответов в тикет', () => {
   it('ask резервирует черновик и возвращает claimVersion до admission', async () => {
     const result = await drafts.handleCallback(callback({ action: 'ask' }));
 
-    expect(result).toEqual({
+    expect(result).toEqual(expect.objectContaining({
       question: 'текст', ticketId: TICKET, draftId: DRAFT, claimVersion: 1,
-    });
+      guardToken: expect.any(Symbol),
+    }));
     expect(store.claimDraft).toHaveBeenCalledWith(DRAFT, 'asking');
     expect(store.finalizeDraft).not.toHaveBeenCalled();
     expect(store.releaseDraft).not.toHaveBeenCalled();
@@ -342,9 +344,10 @@ describe('черновики ответов в тикет', () => {
 
     const second = await drafts.handleCallback(callback({ action: 'ask', callbackId: 'second' }));
     resolveFirstClaim({ status: 'claimed', version: 1 });
-    await expect(first).resolves.toEqual({
+    await expect(first).resolves.toEqual(expect.objectContaining({
       question: 'текст', ticketId: TICKET, draftId: DRAFT, claimVersion: 1,
-    });
+      guardToken: expect.any(Symbol),
+    }));
 
     expect(second).toEqual({});
     expect(store.claimDraft).toHaveBeenCalledTimes(1);
@@ -368,41 +371,67 @@ describe('черновики ответов в тикет', () => {
       .resolves.toEqual({});
     const retry = await drafts.handleCallback(callback({ action: 'ask', callbackId: 'retry' }));
 
-    expect(retry).toEqual({
+    expect(retry).toEqual(expect.objectContaining({
       question: 'текст', ticketId: TICKET, draftId: DRAFT,
       claimVersion: failure === 'read' ? 1 : 2,
-    });
+      guardToken: expect.any(Symbol),
+    }));
     expect(store.claimDraft).toHaveBeenCalledTimes(failure === 'read' ? 1 : 2);
   });
 
-  it('finishAsk снимает локальную блокировку без release уже принятого вопроса', async () => {
+  it('finishAsk снимает локальную блокировку только по owner token', async () => {
     store.claimDraft
       .mockResolvedValueOnce({ status: 'claimed', version: 1 })
       .mockResolvedValueOnce({ status: 'claimed', version: 2 });
-    await drafts.handleCallback(callback({ action: 'ask', callbackId: 'first' }));
+    const first = await drafts.handleCallback(callback({ action: 'ask', callbackId: 'first' }));
+    const ownerToken = (first as { guardToken?: symbol }).guardToken;
 
-    (drafts as any).finishAsk(DRAFT);
+    (drafts as any).finishAsk(DRAFT, ownerToken);
     const retry = await drafts.handleCallback(callback({ action: 'ask', callbackId: 'second' }));
 
-    expect(retry).toEqual({
+    expect(retry).toEqual(expect.objectContaining({
       question: 'текст', ticketId: TICKET, draftId: DRAFT, claimVersion: 2,
-    });
+      guardToken: expect.any(Symbol),
+    }));
     expect(store.claimDraft).toHaveBeenCalledTimes(2);
     expect(store.releaseDraft).not.toHaveBeenCalled();
   });
 
-  it('releaseAsk снимает локальную блокировку вместе с reservation в БД', async () => {
+  it('stale finishAsk не снимает guard более нового retry', async () => {
     store.claimDraft
       .mockResolvedValueOnce({ status: 'claimed', version: 1 })
       .mockResolvedValueOnce({ status: 'claimed', version: 2 });
-    await drafts.handleCallback(callback({ action: 'ask', callbackId: 'first' }));
+    const first = await drafts.handleCallback(callback({ action: 'ask', callbackId: 'first' }));
+    const oldToken = (first as { guardToken?: symbol }).guardToken;
+    (drafts as any).finishAsk(DRAFT, oldToken);
+    await drafts.handleCallback(callback({ action: 'ask', callbackId: 'retry' }));
+
+    (drafts as any).finishAsk(DRAFT, oldToken);
+    const duplicate = await drafts.handleCallback(callback({ action: 'ask', callbackId: 'duplicate' }));
+
+    expect(duplicate).toEqual({});
+    expect(store.claimDraft).toHaveBeenCalledTimes(2);
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledWith(
+      'duplicate', 'Черновик уже обрабатывается',
+    );
+  });
+
+  it('releaseAsk не снимает локальный guard до owner finishAsk', async () => {
+    store.claimDraft
+      .mockResolvedValueOnce({ status: 'claimed', version: 1 })
+      .mockResolvedValueOnce({ status: 'claimed', version: 2 });
+    const first = await drafts.handleCallback(callback({ action: 'ask', callbackId: 'first' }));
 
     await drafts.releaseAsk(DRAFT, 1);
-    const retry = await drafts.handleCallback(callback({ action: 'ask', callbackId: 'second' }));
+    const duringCleanup = await drafts.handleCallback(callback({ action: 'ask', callbackId: 'during-cleanup' }));
+    (drafts as any).finishAsk(DRAFT, (first as { guardToken?: symbol }).guardToken);
+    const retry = await drafts.handleCallback(callback({ action: 'ask', callbackId: 'retry' }));
 
-    expect(retry).toEqual({
+    expect(duringCleanup).toEqual({});
+    expect(retry).toEqual(expect.objectContaining({
       question: 'текст', ticketId: TICKET, draftId: DRAFT, claimVersion: 2,
-    });
+      guardToken: expect.any(Symbol),
+    }));
     expect(store.releaseDraft).toHaveBeenCalledWith(DRAFT, 'asking', 1);
     expect(store.claimDraft).toHaveBeenCalledTimes(2);
   });

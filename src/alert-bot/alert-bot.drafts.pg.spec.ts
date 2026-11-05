@@ -302,9 +302,10 @@ maybe('callback черновика с lease против PostgreSQL', () => {
     const beforeRestart = new AlertBotDrafts(store, support, localTelegram as any);
 
     await expect(beforeRestart.handleCallback(callback(draftId, 'ask', 'before-restart')))
-      .resolves.toEqual({
+      .resolves.toEqual(expect.objectContaining({
         question: 'вопрос после restart', ticketId, draftId, claimVersion: 1,
-      });
+        guardToken: expect.any(Symbol),
+      }));
     await pool.query(
       "UPDATE alert_bot_ticket_drafts SET claimed_at = now() - interval '61 seconds' WHERE id = $1",
       [draftId],
@@ -313,11 +314,102 @@ maybe('callback черновика с lease против PostgreSQL', () => {
     const afterRestart = new AlertBotDrafts(store, support, localTelegram as any);
     const recovered = await afterRestart.handleCallback(callback(draftId, 'ask', 'after-restart'));
 
-    expect(recovered).toEqual({
+    expect(recovered).toEqual(expect.objectContaining({
       question: 'вопрос после restart', ticketId, draftId, claimVersion: 2,
-    });
+      guardToken: expect.any(Symbol),
+    }));
     expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'asking', claimVersion: 2 });
     await afterRestart.releaseAsk(draftId, 2);
+  });
+
+  it('stale release/finally не очищает guard нового retry после потери ответа БД', async () => {
+    const ticketId = await newTicket();
+    const draftId = await newDraft(ticketId, 'вопрос с ABA cleanup');
+    const previousChat = process.env.TELEGRAM_CHAT_ID;
+    process.env.TELEGRAM_CHAT_ID = CHAT;
+    const localTelegram = {
+      getMe: jest.fn().mockResolvedValue({ id: 999, username: 'linkeon_alert_bot' }),
+      answerCallbackQuery: jest.fn().mockResolvedValue(undefined),
+    };
+    const localDrafts = new AlertBotDrafts(store, support, localTelegram as any);
+    const callbackSpy = jest.spyOn(localDrafts, 'handleCallback');
+    const retryAdmission = deferred<'accepted'>();
+    const turns = {
+      enqueue: jest.fn()
+        .mockResolvedValueOnce('stale')
+        .mockImplementation(() => retryAdmission.promise),
+    };
+    const service = new AlertBotService(
+      { resolveTelegram: jest.fn().mockResolvedValue({ userId: 'u-admin', isAdmin: true }) } as any,
+      localTelegram as any,
+      store,
+      {} as any,
+      localDrafts,
+      turns as any,
+      support,
+    );
+    const update = (updateId: number, callbackId: string) => ({
+      update_id: updateId,
+      callback_query: {
+        id: callbackId,
+        from: { id: 111 },
+        data: `draft:${draftId}:ask`,
+        message: {
+          message_id: 900,
+          chat: { id: Number(CHAT), type: 'supergroup' },
+        },
+      },
+    });
+    const originalRelease = store.releaseDraft.bind(store);
+    const secondRelease = deferred<void>();
+    let releaseAttempts = 0;
+    const releaseSpy = jest.spyOn(store, 'releaseDraft').mockImplementation(
+      async (id, action, version) => {
+        releaseAttempts += 1;
+        if (releaseAttempts === 1) {
+          await originalRelease(id, action, version);
+          throw new Error('release response lost');
+        }
+        if (releaseAttempts === 2) await secondRelease.promise;
+        return originalRelease(id, action, version);
+      },
+    );
+    const handlers: Array<Promise<void>> = [];
+    let oldToken: symbol | undefined;
+
+    try {
+      handlers.push(service.handleUpdate(update(7301, 'old')));
+      await waitUntil(() => releaseAttempts === 2);
+      const oldResult = await callbackSpy.mock.results[0].value as { guardToken?: symbol };
+      oldToken = oldResult.guardToken;
+
+      handlers.push(service.handleUpdate(update(7302, 'parallel-retry')));
+      await waitUntil(() => localTelegram.answerCallbackQuery.mock.calls.some(([id]) => id === 'parallel-retry'));
+      secondRelease.resolve(undefined);
+      await handlers[0];
+
+      handlers.push(service.handleUpdate(update(7303, 'new-retry')));
+      await waitUntil(() => localTelegram.answerCallbackQuery.mock.calls.some(([id]) => id === 'new-retry'));
+      (localDrafts as any).finishAsk(draftId, oldToken);
+      handlers.push(service.handleUpdate(update(7304, 'after-stale-finish')));
+      await waitUntil(() => localTelegram.answerCallbackQuery.mock.calls.some(([id]) => id === 'after-stale-finish'));
+    } finally {
+      secondRelease.resolve(undefined);
+      retryAdmission.resolve('accepted');
+      await Promise.all(handlers);
+      releaseSpy.mockRestore();
+      if (previousChat === undefined) delete process.env.TELEGRAM_CHAT_ID;
+      else process.env.TELEGRAM_CHAT_ID = previousChat;
+    }
+
+    expect(localTelegram.answerCallbackQuery).toHaveBeenCalledWith(
+      'parallel-retry', 'Черновик уже обрабатывается',
+    );
+    expect(localTelegram.answerCallbackQuery).toHaveBeenCalledWith(
+      'after-stale-finish', 'Черновик уже обрабатывается',
+    );
+    expect(turns.enqueue).toHaveBeenCalledTimes(2);
+    expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'asking', claimVersion: 2 });
   });
 
   it('queued asking переживает два lease expiry без новых версий, busy и повторной модели', async () => {
