@@ -523,7 +523,9 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
     const admission = new Promise<'accepted'>((resolve) => { finishAdmission = resolve; });
     jest.spyOn(turns, 'enqueue').mockReturnValue(admission);
     const newerHandling = service.handleUpdate(newer);
-    for (let i = 0; i < 30 && (turns.enqueue as jest.Mock).mock.calls.length === 0; i += 1) await Promise.resolve();
+    for (let i = 0; i < 200 && (turns.enqueue as jest.Mock).mock.calls.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     expect(turns.enqueue).toHaveBeenCalledTimes(1);
 
     await store.claimUpdate(older.update_id, older);
