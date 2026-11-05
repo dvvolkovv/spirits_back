@@ -1,3 +1,9 @@
+jest.mock('@napi-rs/canvas', () => ({
+  createCanvas: jest.fn(),
+  loadImage: jest.fn(),
+  GlobalFonts: { register: jest.fn() },
+}));
+
 import { AlertBotTurns } from './alert-bot.turns';
 import { TurnInput } from './alert-bot.types';
 
@@ -27,6 +33,7 @@ function question(overrides: Partial<TurnInput> = {}): TurnInput {
 
 describe('AlertBotTurns', () => {
   const savedOrigin = process.env.ADMIN_ORIGIN;
+  const savedRate = process.env.ALERT_BOT_RATE_PER_HOUR;
   let store: Record<string, jest.Mock>;
   let telegram: Record<string, jest.Mock>;
   let ai: { answer: jest.Mock };
@@ -74,6 +81,8 @@ describe('AlertBotTurns', () => {
     await turns.idle();
     if (savedOrigin === undefined) delete process.env.ADMIN_ORIGIN;
     else process.env.ADMIN_ORIGIN = savedOrigin;
+    if (savedRate === undefined) delete process.env.ALERT_BOT_RATE_PER_HOUR;
+    else process.env.ALERT_BOT_RATE_PER_HOUR = savedRate;
     jest.restoreAllMocks();
   });
 
