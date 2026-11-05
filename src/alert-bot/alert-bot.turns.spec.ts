@@ -250,7 +250,8 @@ describe('AlertBotTurns', () => {
     expect(store.finishTurn).not.toHaveBeenCalled();
     expect(telegram.sendMessage).toHaveBeenCalledWith('100', 'Лимит вопросов в час исчерпан', 300);
     expect(ai.answer).not.toHaveBeenCalled();
-    expect(chat.beginStream).not.toHaveBeenCalled();
+    expect(chat.beginStream).toHaveBeenCalledTimes(1);
+    expect(chat.endStream).toHaveBeenCalledTimes(1);
     delete process.env.ALERT_BOT_RATE_PER_HOUR;
   });
 
@@ -447,7 +448,7 @@ describe('AlertBotTurns', () => {
     expect(telegram.editMessageText).not.toHaveBeenCalled();
     expect(store.finishTurn).toHaveBeenCalledTimes(1);
     expect(chat.endStream).toHaveBeenCalledTimes(1);
-    const logs = JSON.stringify(logger.error.mock.calls);
+    const logs = JSON.stringify([...logger.error.mock.calls, ...logger.debug.mock.calls]);
     expect(logs).not.toContain('status=ok kind=done');
     expect(logs).toContain('status=ignored kind=fenced');
   });
