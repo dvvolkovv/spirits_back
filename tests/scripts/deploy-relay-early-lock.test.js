@@ -59,7 +59,15 @@ exit 0
 function runFull(home, work, lockFile, pauseFile, async) {
   const bin = makeBin(work, home);
   const nginxConf = path.join(work, 'parking.conf');
-  write(nginxConf, 'server { location /chat { return 403; } }\n');
+  write(nginxConf, `server {
+    # Agent output files — direct download
+    location /files/ {
+        alias /tmp/agent-output/;
+        add_header Access-Control-Allow-Origin "*" always;
+    }
+  location /chat { return 403; }
+}
+`);
   const env = {
     ...process.env,
     HOME: home,

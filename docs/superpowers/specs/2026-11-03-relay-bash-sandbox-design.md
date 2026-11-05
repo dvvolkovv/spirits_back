@@ -86,7 +86,8 @@ userId в конструкции не участвует — пример из �
    (отказ без обхода), записываемые пути — свои, запрещённые на чтение —
    `/home/dv`, `/tmp/agent-mcp`, `/tmp/agent-uploads/mcp`, `/etc/sudoers*`, `/proc`; `excludedCommands: ["sudo *"]`
    (требование sudo). Сеть — решение владельца 04.11 «белый список доменов»:
-   `network.allowedDomains` содержит только `example.com`, `pypi.org`,
+   `network.allowedDomains` содержит только `example.com`, `my.linkeon.io`
+   (скачивание созданных ассистентом файлов из `/smm-media/`), `pypi.org`,
    `files.pythonhosted.org`, `registry.npmjs.org`, `nodejs.org`, `github.com`,
    `api.github.com`, `raw.githubusercontent.com`, `codeload.github.com`,
    `objects.githubusercontent.com`, `huggingface.co`, `cdn-lfs.huggingface.co`,

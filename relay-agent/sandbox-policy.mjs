@@ -9,6 +9,7 @@ export const AGENT_MCP_DIR = '/tmp/agent-mcp';
 export const SANDBOX_SCHEMA = process.env.RELAY_SANDBOX_SCHEMA ?? 'A'; // подтверждено разведкой 03.11
 export const SANDBOX_ALLOWED_DOMAINS = Object.freeze([
   'example.com',
+  'my.linkeon.io',
   'pypi.org',
   'files.pythonhosted.org',
   'registry.npmjs.org',

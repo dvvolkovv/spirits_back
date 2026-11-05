@@ -39,7 +39,16 @@ function runRollout(health, options = {}) {
   write(path.join(base, 'server.mjs'), baseServer);
   write(path.join(stage, 'server.mjs'), targetServer);
   fs.mkdirSync(path.join(live, 'node_modules'));
-  write(nginxConf, 'server {\n  location /chat { proxy_pass http://127.0.0.1:3033/chat; }\n  location /health { proxy_pass http://127.0.0.1:3033/health; }\n}\n');
+  write(nginxConf, `server {
+    # Agent output files — direct download
+    location /files/ {
+        alias /tmp/agent-output/;
+        add_header Access-Control-Allow-Origin "*" always;
+    }
+  location /chat { proxy_pass http://127.0.0.1:3033/chat; }
+  location /health { proxy_pass http://127.0.0.1:3033/health; }
+}
+`);
   if (['legacy', 'legacy-upload', 'target-fails'].includes(health)) {
     write(path.join(work, 'old-worker-alive'), '4243\n');
   }
@@ -176,6 +185,7 @@ exit 0
       restarts: fs.existsSync(path.join(work, 'restarts.log')) ? fs.readFileSync(path.join(work, 'restarts.log'), 'utf8') : '',
       curls: fs.existsSync(path.join(work, 'curl.log')) ? fs.readFileSync(path.join(work, 'curl.log'), 'utf8') : '',
       nginx: fs.existsSync(path.join(work, 'nginx.log')) ? fs.readFileSync(path.join(work, 'nginx.log'), 'utf8') : '',
+      nginxConfig: fs.readFileSync(nginxConf, 'utf8'),
       worker: fs.existsSync(path.join(work, 'worker.log')) ? fs.readFileSync(path.join(work, 'worker.log'), 'utf8') : '',
       oldWorkerAlive: fs.existsSync(path.join(work, 'old-worker-alive')),
       drainExists: fs.existsSync(drainFile),
@@ -210,6 +220,20 @@ async function waitFor(predicate, timeoutMs = 5000) {
 }
 
 describe('deploy-relay drain/admission gate', () => {
+  it('отдаёт /files/ через relay proxy вместо Nginx alias в закрытые каталоги', () => {
+    const r = runRollout('ok');
+    try {
+      expect(r.status).toBe(0);
+      expect(r.nginxConfig).toContain('# LINKEON-RELAY-FILES-PROXY');
+      expect(r.nginxConfig).toContain('proxy_pass http://127.0.0.1:3033;');
+      expect(r.nginxConfig).toContain('proxy_hide_header Access-Control-Allow-Origin;');
+      expect(r.nginxConfig).not.toContain('alias /tmp/agent-output/;');
+      expect(r.nginxConfig.match(/add_header Access-Control-Allow-Origin/g) || []).toHaveLength(1);
+    } finally {
+      r.cleanup();
+    }
+  });
+
   it('держит gate до успешного health и снимает его только после него', () => {
     const r = runRollout('ok');
     try {

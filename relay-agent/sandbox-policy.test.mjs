@@ -13,6 +13,7 @@ import {
 const FS_KEY = 'test_fs-key';
 const EXPECTED_ALLOWED_DOMAINS = [
   'example.com',
+  'my.linkeon.io',
   'pypi.org',
   'files.pythonhosted.org',
   'registry.npmjs.org',
@@ -113,6 +114,12 @@ test('сетевой белый список: настройки возвращ�
   const second = buildSandboxSettings(FS_KEY);
   assert.deepEqual(second.sandbox.network.allowedDomains, EXPECTED_ALLOWED_DOMAINS);
   assert.notEqual(first.sandbox.network.allowedDomains, second.sandbox.network.allowedDomains);
+});
+
+test('сгенерированные Linkeon-файлы доступны для скачивания в песочнице', () => {
+  const domains = buildSandboxSettings(FS_KEY).sandbox.network.allowedDomains;
+  assert.ok(domains.includes('my.linkeon.io'), 'публичный URL созданного файла должен проходить сетевой белый список');
+  assert.equal(domains.includes('*.linkeon.io'), false);
 });
 
 test('fsKey: только безопасный сегмент пути', () => {
