@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ChatService } from '../chat/chat.service';
+import type { LlmOutageKind } from '../common/llm-error';
 import { SupportService } from '../support/support.service';
 import { AlertBotAi, AlertBotAiInput } from './alert-bot.ai';
 import { alertBotRatePerHour } from './alert-bot.config';
@@ -12,6 +13,9 @@ const MAX_PENDING_PER_CHAT = 3;
 const BUSY_TEXT = 'Занят, спросите через минуту';
 const RATE_LIMITED_TEXT = 'Лимит вопросов в час исчерпан';
 const GENERIC_ERROR_TEXT = 'Не получилось ответить, попробуйте ещё раз';
+const MODEL_FAILURE_KINDS: ReadonlySet<LlmOutageKind> = new Set([
+  'auth', 'rate_limit', 'weekly_limit', 'overloaded', 'timeout',
+]);
 
 function safeErrorKind(error: unknown, fallback = 'error'): string {
   const kind = (error as { kind?: unknown })?.kind;
@@ -82,7 +86,7 @@ export class AlertBotTurns {
         answer = await this.ai.answer({ ...input, history });
       } catch (error) {
         const kind = safeErrorKind(error, 'unknown');
-        if (!['auth', 'limit', 'overloaded', 'timeout'].includes(kind)) throw error;
+        if (!MODEL_FAILURE_KINDS.has(kind as LlmOutageKind)) throw error;
         const turnStatus: AlertBotTurnStatus = kind === 'timeout' ? 'timeout' : 'model_down';
         const summary = await this.status.summary();
         const fallback = `Модель недоступна: ${kind}.\n\n${summary}`;
