@@ -533,7 +533,7 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
     await makeDue(older.update_id);
     await service.retryFailedUpdates();
     const retryState = (await pool.query(
-      'SELECT status, attempts FROM alert_bot_updates WHERE update_id = $1', [older.update_id],
+      'SELECT status, attempts, error_kind FROM alert_bot_updates WHERE update_id = $1', [older.update_id],
     )).rows[0];
 
     await makeDue(older.update_id);
@@ -544,8 +544,9 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
     finishAdmission('accepted');
     await newerHandling;
 
-    expect(retryState).toMatchObject({ status: 'failed', attempts: 2 });
+    expect(retryState).toMatchObject({ status: 'failed', attempts: 2, error_kind: 'draft_in_progress' });
     expect(freshState.status).toBe('completed');
     expect(turns.enqueue).toHaveBeenCalledTimes(1);
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('older-scheduled', 'Повторите позже');
   });
 });

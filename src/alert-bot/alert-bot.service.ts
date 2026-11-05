@@ -6,7 +6,7 @@ import { alertBotAllowedChat } from './alert-bot.config';
 import { AlertBotDrafts } from './alert-bot.drafts';
 import { AlertBotRetryableError } from './alert-bot.errors';
 import { AlertBotStore } from './alert-bot.store';
-import { AlertBotTelegram } from './alert-bot.telegram';
+import { AlertBotTelegram, unknownTelegramOutcome } from './alert-bot.telegram';
 import { AlertBotTurns } from './alert-bot.turns';
 import { TgMessage } from './alert-bot.types';
 
@@ -132,8 +132,11 @@ export class AlertBotService {
       this.logger.error(`alert-bot update failed kind=${kind}`);
       if (!claimed) return;
       let final = false;
+      const nonRetryable = ['service_message_in_flight', 'draft_prompt_in_flight'].includes(kind);
       try {
-        final = await this.store.failUpdate(updateId, kind);
+        final = nonRetryable
+          ? await this.store.failUpdate(updateId, kind, true)
+          : await this.store.failUpdate(updateId, kind);
       } catch (failureError) {
         // Строка остаётся processing только до periodic lease sweep.
         this.logger.error(`alert-bot retry state failed kind=${safeErrorKind(failureError)}`);
@@ -152,13 +155,34 @@ export class AlertBotService {
     for (const item of due) await this.handleUpdate(item.payload, false, true);
   }
 
+  private async sendDirectMessage(
+    chatId: string,
+    text: string,
+    replyTo?: number,
+    replyMarkup?: unknown,
+  ): Promise<{ message_id: number }> {
+    try {
+      return await this.telegram.sendMessage(chatId, text, replyTo, replyMarkup);
+    } catch (error) {
+      if (unknownTelegramOutcome(error)) {
+        // Команда могла уже дать видимый ответ. Update будет dead-letter,
+        // поэтому ни команда, ни противоречивое final failure не повторяются.
+        throw new AlertBotRetryableError('service_message_in_flight');
+      }
+      throw error;
+    }
+  }
+
   private async sendFinalFailure(update: TelegramUpdate, kind: string): Promise<void> {
     // Неизвестный Telegram outcome dead-letter-ится без нового видимого сообщения.
-    if (['placeholder_in_flight', 'notification_in_flight', 'delivery_in_flight'].includes(kind)) return;
+    if ([
+      'placeholder_in_flight', 'notification_in_flight', 'delivery_in_flight',
+      'service_message_in_flight', 'draft_prompt_in_flight',
+    ].includes(kind)) return;
     const message = update.message || update.callback_query?.message;
     if (!message) return;
     try {
-      await this.telegram.sendMessage(
+      await this.sendDirectMessage(
         String(message.chat.id),
         'Не удалось обработать запрос. Попробуйте ещё раз позже.',
         message.message_id,
@@ -249,11 +273,13 @@ export class AlertBotService {
   ): Promise<void> {
     const ackText = admission === 'accepted'
       ? 'Вопрос принят'
-      : admission === 'busy'
-        ? 'Занят, спросите через минуту'
-        : admission === 'rate_limited'
-          ? 'Лимит вопросов в час исчерпан'
-          : 'Черновик устарел';
+      : admission === 'queued'
+        ? 'Вопрос поставлен в очередь'
+        : admission === 'busy'
+          ? 'Занят, спросите через минуту'
+          : admission === 'rate_limited'
+            ? 'Лимит вопросов в час исчерпан'
+            : 'Черновик устарел';
     try {
       await this.telegram.answerCallbackQuery(callbackId, ackText);
     } catch {
@@ -274,7 +300,7 @@ export class AlertBotService {
         await this.refuse(message, String(message.from.id));
         return;
       }
-      await this.telegram.sendMessage(chatId, 'Понимаю только текст', message.message_id);
+      await this.sendDirectMessage(chatId, 'Понимаю только текст', message.message_id);
       return;
     }
 
@@ -300,18 +326,18 @@ export class AlertBotService {
       const result = command.name === 'start'
         ? await this.commands.start()
         : await this.commands.status();
-      await this.telegram.sendMessage(chatId, result, message.message_id);
+      await this.sendDirectMessage(chatId, result, message.message_id);
       return;
     }
     if (command?.name === 'close') {
       const repliedPrefix = ticketPrefix(replyText(message.reply_to_message) || '');
       const ref = command.args || (repliedPrefix ? `#${repliedPrefix}` : '');
       if (!ref) {
-        await this.telegram.sendMessage(chatId, CLOSE_HINT, message.message_id);
+        await this.sendDirectMessage(chatId, CLOSE_HINT, message.message_id);
         return;
       }
       const result = await this.commands.close(ref, identity);
-      await this.telegram.sendMessage(chatId, result, message.message_id);
+      await this.sendDirectMessage(chatId, result, message.message_id);
       return;
     }
 
@@ -319,7 +345,7 @@ export class AlertBotService {
       ? command.args
       : text.replace(new RegExp(`@${escapeRegExp(me.username)}\\b`, 'gi'), '').trim();
     if (!question) {
-      await this.telegram.sendMessage(chatId, ASK_HINT, message.message_id);
+      await this.sendDirectMessage(chatId, ASK_HINT, message.message_id);
       return;
     }
 
@@ -342,7 +368,7 @@ export class AlertBotService {
         ticket = await this.support.findTicketByPrefix(repliedPrefix);
       } catch (error) {
         if (!isAmbiguousTicket(error)) throw error;
-        await this.telegram.sendMessage(
+        await this.sendDirectMessage(
           chatId,
           'Найдено несколько тикетов с таким префиксом. Укажите полный UUID.',
           message.message_id,
@@ -363,7 +389,7 @@ export class AlertBotService {
             identity,
             ticket,
           });
-          if (notice) await this.telegram.sendMessage(chatId, notice, message.message_id);
+          if (notice) await this.sendDirectMessage(chatId, notice, message.message_id);
         }
         return;
       }
@@ -409,7 +435,7 @@ export class AlertBotService {
     for (const [key, sentAt] of this.refusalSentAt) {
       if (now - sentAt >= REFUSAL_EVERY_MS) this.refusalSentAt.delete(key);
     }
-    await this.telegram.sendMessage(
+    await this.sendDirectMessage(
       String(message.chat.id),
       'Доступ только для администраторов',
       message.message_id,

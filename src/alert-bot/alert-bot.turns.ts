@@ -14,7 +14,7 @@ import { TurnInput } from './alert-bot.types';
 const MAX_PENDING_PER_CHAT = 3;
 const BUSY_TEXT = 'Занят, спросите через минуту';
 const RATE_LIMITED_TEXT = 'Лимит вопросов в час исчерпан';
-export type AlertBotAdmission = 'accepted' | 'busy' | 'rate_limited' | 'stale';
+export type AlertBotAdmission = 'accepted' | 'queued' | 'busy' | 'rate_limited' | 'stale';
 export interface AlertBotTurnEnqueueOptions {
   onAdmission?: (status: AlertBotAdmission) => void | Promise<void>;
 }
@@ -64,9 +64,16 @@ export class AlertBotTurns {
     }
 
     this.pending.set(key, pending + 1);
+    const queued = pending > 0;
+    const executionOptions = queued ? { ...options, onAdmission: undefined } : options;
+    if (queued) {
+      // Слот уже зарезервирован: callback ack не ждёт предыдущий ход.
+      // Дальше accepted не дублируем, даже если фактический admission завершится ошибкой.
+      void this.acknowledgeAdmission('queued', options);
+    }
     const previous = this.chains.get(key) || Promise.resolve();
     const run = previous
-      .then(() => this.execute(input, reservation, options))
+      .then(() => this.execute(input, reservation, executionOptions))
       .finally(() => this.chat.endStream());
     let tracked: Promise<void>;
     tracked = run.then(() => undefined, () => undefined).finally(() => {

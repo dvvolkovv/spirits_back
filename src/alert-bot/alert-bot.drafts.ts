@@ -2,7 +2,7 @@ import { ConflictException, Injectable, Logger } from '@nestjs/common';
 import { SupportService } from '../support/support.service';
 import { AlertBotRetryableError } from './alert-bot.errors';
 import { AlertBotDraftClaim, AlertBotDraftOutcome, AlertBotStore } from './alert-bot.store';
-import { AlertBotTelegram } from './alert-bot.telegram';
+import { AlertBotTelegram, unknownTelegramOutcome } from './alert-bot.telegram';
 
 interface AlertBotIdentity {
   tgUserId: string;
@@ -81,8 +81,12 @@ export class AlertBotDrafts {
           ]],
         },
       );
-    } catch {
-      // Без видимого prompt активный черновик был бы недостижим для кнопок.
+    } catch (error) {
+      if (unknownTelegramOutcome(error)) {
+        // Prompt мог быть опубликован: draft и кнопки остаются действующими.
+        // Update dead-letter-ится в service вместо отмены или второго prompt.
+        throw new AlertBotRetryableError('draft_prompt_in_flight');
+      }
       await this.store.finalizeDraft(id, null, 'cancelled', 0);
       return 'Не удалось показать черновик — он отменён.';
     }
@@ -130,7 +134,8 @@ export class AlertBotDrafts {
     try {
       if (input.action === 'ask') {
         if (this.activeQuestionDraftIds.has(input.draftId)) {
-          answer = 'Черновик уже обрабатывается';
+          answer = input.internalRetry ? 'Повторите позже' : 'Черновик уже обрабатывается';
+          if (input.internalRetry) throw new AlertBotRetryableError('draft_in_progress');
           return {};
         }
         // Токен добавляется синхронно, до первого await. Только его владелец
@@ -250,8 +255,10 @@ export class AlertBotDrafts {
         // косметического сбоя edit: это спровоцировало бы лишний retry.
       }
       return {};
-    } catch {
-      answer = 'Не удалось обработать черновик';
+    } catch (error) {
+      if (!(error instanceof AlertBotRetryableError)) {
+        answer = 'Не удалось обработать черновик';
+      }
       if (activeClaim) {
         // Versioned release не может очистить более новый claim. Повторный publish
         // безопасен: draftId идемпотентен, а stale version отклоняется до insert.
@@ -259,6 +266,8 @@ export class AlertBotDrafts {
       }
       // Результат publish/finalize неизвестен. Service должен сохранить failed
       // update и повторить его; завершать update успешным здесь нельзя.
+      // Явные in-progress/defer маркеры сохраняют свой kind и retry-later ack.
+      if (error instanceof AlertBotRetryableError) throw error;
       throw new AlertBotRetryableError('draft_retry');
     } finally {
       if (questionGuardToken && !keepQuestionGuard) {

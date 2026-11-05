@@ -208,17 +208,17 @@ export class AlertBotStore {
     );
   }
 
-  async failUpdate(updateId: number, errorKind: string): Promise<boolean> {
+  async failUpdate(updateId: number, errorKind: string, nonRetryable = false): Promise<boolean> {
     const safeKind = /^[a-z][a-z0-9_.-]{0,40}$/i.test(errorKind) ? errorKind : 'error';
     const result = await this.pg.query(
       `UPDATE alert_bot_updates
        SET status = 'failed', error_kind = $2, updated_at = now(),
-           next_retry_at = CASE WHEN attempts < 5
+           next_retry_at = CASE WHEN NOT $3 AND attempts < 5
              THEN now() + (LEAST(300, POWER(2, attempts - 1))::text || ' seconds')::interval
              ELSE NULL END
        WHERE update_id = $1 AND status = 'processing'
-       RETURNING attempts >= 5 AS final`,
-      [updateId, safeKind],
+       RETURNING ($3 OR attempts >= 5) AS final`,
+      [updateId, safeKind, nonRetryable],
     );
     return result.rows[0]?.final === true;
   }
