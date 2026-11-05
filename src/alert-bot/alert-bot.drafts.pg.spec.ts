@@ -337,7 +337,10 @@ maybe('callback черновика с lease против PostgreSQL', () => {
     const turns = {
       enqueue: jest.fn()
         .mockResolvedValueOnce('stale')
-        .mockImplementation(() => retryAdmission.promise),
+        .mockImplementation((_input, _reservation, options) => {
+          void options.onAdmission('accepted');
+          return retryAdmission.promise;
+        }),
     };
     const service = new AlertBotService(
       { resolveTelegram: jest.fn().mockResolvedValue({ userId: 'u-admin', isAdmin: true }) } as any,

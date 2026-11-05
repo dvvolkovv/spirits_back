@@ -88,14 +88,18 @@ export class PgService implements OnModuleInit, OnModuleDestroy {
   private trackClient(client: PoolClient, lock = false): PoolClient {
     const clients = lock ? this.checkedOutLockClients : this.checkedOutClients;
     clients.add(client);
-    const release = client.release.bind(client);
+    const originalRelease = client.release;
+    const release = originalRelease.bind(client);
     let released = false;
-    client.release = (destroy?: boolean | Error) => {
+    const trackedRelease = (destroy?: boolean | Error) => {
       if (released) return;
       released = true;
       clients.delete(client);
       release(destroy);
     };
+    // Сохраняет instrumentation тестовых PoolClient (например, jest mock metadata).
+    Object.assign(trackedRelease, originalRelease);
+    client.release = trackedRelease;
     return client;
   }
 
