@@ -2990,6 +2990,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     };
     let costUsd = 0;
     let turnFailed = false;
+    let gotDone = false;
     const turnCost = new RelayTurnCost();
     // Фоновый ответ БЕЗ своей сессии (рутины, «Путь») пишет в основную сессию
     // человека. До 05.11.2026 он шёл мимо учёта ходов и пре-эмптил живой ход.
@@ -3026,6 +3027,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
             if (ev.type === 'delta' || ev.type === 'text') chunks.push(ev.text);
             else if (ev.type === 'result' && ev.text && chunks.length === 0) chunks.push(ev.text);
             else if (ev.type === 'done') {
+              gotDone = true;
               // Стоимость и расход — здесь же, где их берёт основной путь.
               if (ev.failed === true) turnFailed = true;
               if (typeof ev.costUsd === 'number' && ev.costUsd > 0) costUsd += ev.costUsd;
@@ -3061,6 +3063,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
     } finally {
       this.endStream();
       this.endRelayRun(relaySid, relayMark);
+    }
+    if (mainSession && (!gotDone || turnFailed)) {
+      // Человек пре-эмптил фоновый ответ (или релей оборвался): обрезанный
+      // текст нельзя писать в историю как успешный. Просим повторить позже —
+      // routine-push отложит доставку.
+      throw new RelaySessionBusyError(relaySid);
     }
     const text = this.stripToolTags(chunks.join('')).trim();
     const charge = this.computeSdkCharge(usage, costUsd, text, turnCost.usd);

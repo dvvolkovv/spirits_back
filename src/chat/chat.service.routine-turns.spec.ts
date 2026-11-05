@@ -118,4 +118,49 @@ describe('agentReply: учёт ходов и чужая работа в той �
     expect(svc.getActiveStreamCount()).toBe(0);
     expect((svc as any).relayRunning.size).toBe(0);
   });
+
+  it('EOF без done в основной сессии — busy, обрезанный текст не уходит', async () => {
+    const svc = makeService();
+    (axios.post as jest.Mock).mockImplementationOnce(async () => {
+      const s = new Readable({ read() {} });
+      process.nextTick(() => {
+        s.push(`data: ${JSON.stringify({ type: 'delta', text: 'обрыв на полус' })}\n`);
+        s.push(null); // EOF без done — человек пре-эмптил или релей упал
+      });
+      return { data: s };
+    });
+
+    await expect(svc.generateAgentReply('u-1', '12', 'напомни')).rejects.toBeInstanceOf(RelaySessionBusyError);
+    expect(svc.getActiveStreamCount()).toBe(0);
+    expect((svc as any).relayRunning.size).toBe(0);
+  });
+
+  it('done с failed в основной сессии — busy на повтор', async () => {
+    const svc = makeService();
+    (axios.post as jest.Mock).mockImplementationOnce(async () => {
+      const s = new Readable({ read() {} });
+      process.nextTick(() => {
+        s.push(`data: ${JSON.stringify({ type: 'delta', text: 'часть' })}\n`);
+        s.push(`data: ${JSON.stringify({ type: 'done', failed: true, failReason: 'preempted' })}\n`);
+        s.push(null);
+      });
+      return { data: s };
+    });
+
+    await expect(svc.generateAgentReply('u-1', '12', 'напомни')).rejects.toBeInstanceOf(RelaySessionBusyError);
+  });
+
+  it('EOF без done в СВОЕЙ сессии — прежнее поведение: текст как есть', async () => {
+    const svc = makeService();
+    (axios.post as jest.Mock).mockImplementationOnce(async () => {
+      const s = new Readable({ read() {} });
+      process.nextTick(() => {
+        s.push(`data: ${JSON.stringify({ type: 'delta', text: 'итоги' })}\n`);
+        s.push(null);
+      });
+      return { data: s };
+    });
+
+    await expect(svc.generateAgentReply('u-1', '12', 'итоги', 'voice_summary_1')).resolves.toBe('итоги');
+  });
 });

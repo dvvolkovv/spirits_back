@@ -91,13 +91,23 @@ export class RoutinePushService implements OnModuleInit {
    */
   private readonly retryTimers = new Map<string, NodeJS.Timeout>();
 
-  private scheduleRetry(userId: string, assistantId: string, prompt: string, title?: string): void {
-    const key = `${userId}_${assistantId}`;
+  private scheduleRetry(userId: string, routineId: string): void {
+    const key = `${userId}:${routineId}`;
     if (this.retryTimers.has(key)) return;
-    this.logger.log(`routine deliver: ${key} занят разговором человека — повтор через 15 минут`);
+    this.logger.log(`routine deliver: ${key} отложена на 15 минут (человек разговаривает)`);
     const timer = setTimeout(() => {
       this.retryTimers.delete(key);
-      void this.deliver(userId, assistantId, prompt, title).catch((e: any) => {
+      void (async () => {
+        // За 15 минут рутину могли удалить, выключить или изменить — берём
+        // актуальную запись, а не снимок на момент busy.
+        const r = await this.store.getById(userId, routineId);
+        if (!r || !r.enabled) return;
+        // Заново застолбим день: claim при busy освобождали. Уже доставлено
+        // другим путём — не дублируем.
+        const today = this.store.localDate(r.tz, new Date());
+        if (!(await this.store.claimToday(routineId, today))) return;
+        await this.deliver(userId, r.assistantId, r.prompt, r.title, routineId);
+      })().catch((e: any) => {
         this.logger.warn(`routine deliver retry failed for ${key}: ${e?.message}`);
       });
     }, 15 * 60 * 1000);
@@ -105,7 +115,7 @@ export class RoutinePushService implements OnModuleInit {
     this.retryTimers.set(key, timer);
   }
 
-  private async deliver(userId: string, assistantId: string, prompt: string, title?: string): Promise<number> {
+  private async deliver(userId: string, assistantId: string, prompt: string, title: string | undefined, routineId?: string): Promise<number> {
     // Рутина — путь, где ассистент реально может позвать инструмент Linkeon
     // (картинка, рутина, календарь): AgentReplyOpts.linkeonTools — явно true.
     let text: string;
@@ -113,7 +123,14 @@ export class RoutinePushService implements OnModuleInit {
       text = await this.chat.generateAgentReply(userId, assistantId, prompt, undefined, { linkeonTools: true });
     } catch (e: any) {
       if (e instanceof RelaySessionBusyError) {
-        this.scheduleRetry(userId, assistantId, prompt, title);
+        if (routineId) {
+          // Снимаем дневной claim: иначе после рестарта (таймер in-memory)
+          // cron пропустил бы рутину из-за last_sent_date, и она потерялась
+          // бы на сегодня. Освобождённый claim = повтор в следующий runDue.
+          const row = await this.store.getById(userId, routineId);
+          if (row) await this.store.releaseToday(routineId, this.store.localDate(row.tz, new Date()));
+          this.scheduleRetry(userId, routineId);
+        }
         return 0;
       }
       throw e;
@@ -164,7 +181,7 @@ export class RoutinePushService implements OnModuleInit {
   async fireNow(userId: string, routineId: string): Promise<{ delivered: number } | null> {
     const r = await this.store.getById(userId, routineId);
     if (!r) return null;
-    const delivered = await this.deliver(userId, r.assistantId, r.prompt, r.title);
+    const delivered = await this.deliver(userId, r.assistantId, r.prompt, r.title, routineId);
     return { delivered };
   }
 
@@ -185,7 +202,7 @@ export class RoutinePushService implements OnModuleInit {
         const today = this.store.localDate(r.tz, now);
         if (r.last_sent_date && this.store.toISO(r.last_sent_date) === today) continue;
         if (!(await this.store.claimToday(r.id, today))) continue;           // уже застолбили
-        const n = await this.deliver(r.user_id, r.assistant_id, r.prompt, r.title);
+        const n = await this.deliver(r.user_id, r.assistant_id, r.prompt, r.title, r.id);
         fired++;
         this.logger.log(`routine "${r.title}" sent to ${r.user_id} (assistant ${r.assistant_id}, delivered=${n})`);
       } catch (e: any) {
