@@ -549,4 +549,66 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
     expect(turns.enqueue).toHaveBeenCalledTimes(1);
     expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('older-scheduled', 'Повторите позже');
   });
+
+  it('больше пяти draft_in_progress waits не сжигает attempts и не шлёт final failure, после release update завершается', async () => {
+    const telegram = telegramMock();
+    const { service, drafts, turns } = makeService(telegram, jest.fn());
+    const draftId = await store.createDraft({
+      chatId: '100', tgUserId: '200', adminUserId: 'admin-retry',
+      ticketId: '11111111-1111-4111-8111-111111111111', text: 'Вопрос после waits',
+    });
+    const callback = (updateId: number, callbackId: string) => ({
+      update_id: updateId,
+      callback_query: {
+        id: callbackId, data: `draft:${draftId}:ask`, from: { id: 200 },
+        message: { message_id: 900, chat: { id: 100, type: 'private' } },
+      },
+    });
+    const newer = callback(92204, 'newer-wait-owner');
+    const older = callback(92203, 'older-waiting');
+    let finishAdmission!: (value: 'accepted') => void;
+    const admission = new Promise<'accepted'>((resolve) => { finishAdmission = resolve; });
+    jest.spyOn(turns, 'enqueue')
+      .mockImplementationOnce(() => admission)
+      .mockImplementation(async (_input, _reservation, options) => {
+        await options?.onAdmission?.('accepted');
+        return 'accepted';
+      });
+    const callbackSpy = jest.spyOn(drafts, 'handleCallback');
+    const newerHandling = service.handleUpdate(newer);
+    for (let i = 0; i < 200 && (turns.enqueue as jest.Mock).mock.calls.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(turns.enqueue).toHaveBeenCalledTimes(1);
+
+    await store.claimUpdate(older.update_id, older);
+    await store.failUpdate(older.update_id, 'db_down');
+    for (let i = 0; i < 6; i += 1) {
+      await makeDue(older.update_id);
+      await service.retryFailedUpdates();
+    }
+    const waitState = (await pool.query(
+      'SELECT status, attempts, error_kind, next_retry_at FROM alert_bot_updates WHERE update_id = $1',
+      [older.update_id],
+    )).rows[0];
+    const waitCount = callbackSpy.mock.calls.filter(([input]) => input.internalRetry).length;
+
+    finishAdmission('accepted');
+    await newerHandling;
+    await drafts.releaseAsk(draftId, 1);
+    await makeDue(older.update_id);
+    await service.retryFailedUpdates();
+    const finalState = (await pool.query(
+      'SELECT status, attempts, next_retry_at FROM alert_bot_updates WHERE update_id = $1', [older.update_id],
+    )).rows[0];
+
+    expect(waitCount).toBe(6);
+    expect(waitState).toMatchObject({
+      status: 'failed', attempts: 1, error_kind: 'draft_in_progress',
+    });
+    expect(waitState.next_retry_at).not.toBeNull();
+    expect(telegram.sendMessage).not.toHaveBeenCalled();
+    expect(finalState).toMatchObject({ status: 'completed', next_retry_at: null });
+    expect(turns.enqueue).toHaveBeenCalledTimes(2);
+  });
 });
