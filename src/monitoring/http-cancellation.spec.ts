@@ -82,7 +82,7 @@ describe('HTTP monitoring cancellation', () => {
     const controller = new AbortController();
     const remove = jest.spyOn(controller.signal, 'removeEventListener');
     const result = (service.query as any)('up', controller.signal) as Promise<unknown>;
-    const rejection = expect(result).rejects.toThrow('body stop');
+    void result.catch(() => {});
     await flush();
     await flush();
     expect(pending).toHaveLength(1);
@@ -90,7 +90,7 @@ describe('HTTP monitoring cancellation', () => {
     controller.abort(new Error('body stop'));
     await flush();
     expect(pending[0].signal.aborted).toBe(true);
-    await rejection;
+    await expect(result).rejects.toThrow('body stop');
     expect(remove).toHaveBeenCalledWith('abort', expect.any(Function));
     expect(jest.getTimerCount()).toBe(0);
   });
@@ -99,14 +99,14 @@ describe('HTTP monitoring cancellation', () => {
     stallJsonBody();
     const service = new MonitoringService();
     const result = (service.query as any)('up') as Promise<unknown>;
-    const rejection = expect(result).rejects.toThrow(/timeout/i);
+    void result.catch(() => {});
     await flush();
     await flush();
     expect(pending).toHaveLength(1);
 
     await jest.advanceTimersByTimeAsync(5000);
     expect(pending[0].signal.aborted).toBe(true);
-    await rejection;
+    await expect(result).rejects.toThrow(/timeout/i);
     expect(jest.getTimerCount()).toBe(0);
   });
 

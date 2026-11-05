@@ -72,7 +72,10 @@ describe('PgService.query cancellation', () => {
   it('abort во время pending pool.connect завершает вызов, а поздний client release без query', async () => {
     let resolveConnect!: (client: PoolClient) => void;
     const client = new EventEmitter() as PoolClient & { query: jest.Mock; release: jest.Mock };
-    client.query = jest.fn(async () => ({ rows: [{ ok: 1 }] }));
+    client.query = jest.fn((query: Query, callback: (error: Error | null, result?: any) => void) => {
+      callback(null, { rows: [{ ok: 1 }] });
+      return query;
+    });
     client.release = jest.fn();
     const pool = { connect: jest.fn(() => new Promise<PoolClient>((resolve) => { resolveConnect = resolve; })) };
     const service = new PgService();
