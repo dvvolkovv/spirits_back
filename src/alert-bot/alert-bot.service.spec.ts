@@ -385,12 +385,12 @@ describe('AlertBotService', () => {
     expect(turns.enqueue).toHaveBeenCalledWith(expect.objectContaining({
       updateId: 1, chatId: '100', adminUserId: 'admin-1', question: 'Текст черновика',
       questionMessageId: 900, privateChat: true, ticketId: TICKET,
-    }));
-    expect(drafts.finalizeAsk).toHaveBeenCalledWith(DRAFT, 3);
+    }), { draftId: DRAFT, claimVersion: 3 });
+    expect(drafts.finalizeAsk).not.toHaveBeenCalled();
     expect(drafts.releaseAsk).not.toHaveBeenCalled();
   });
 
-  it.each(['busy', 'rate_limited'])('draft ask при admission %s освобождает резерв для retry', async (admission) => {
+  it.each(['busy', 'rate_limited', 'stale'])('draft ask при admission %s освобождает только совпавший резерв', async (admission) => {
     drafts.handleCallback.mockResolvedValue({
       question: 'Текст черновика', ticketId: TICKET, draftId: DRAFT, claimVersion: 4,
     });
@@ -399,6 +399,7 @@ describe('AlertBotService', () => {
     await service.handleUpdate(callback(`draft:${DRAFT}:ask`));
 
     expect(drafts.releaseAsk).toHaveBeenCalledWith(DRAFT, 4);
+    expect(turns.enqueue).toHaveBeenCalledWith(expect.anything(), { draftId: DRAFT, claimVersion: 4 });
     expect(drafts.finalizeAsk).not.toHaveBeenCalled();
   });
 

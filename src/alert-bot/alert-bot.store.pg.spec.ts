@@ -8,6 +8,13 @@ const PG = process.env.PROVISIONING_PG_URL;
 const maybe = PG ? describe : describe.skip;
 const SCHEMA = `alert_bot_spec_${process.pid}`;
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
 maybe('хранилище бота алертов против PostgreSQL', () => {
   jest.setTimeout(30_000);
   let admin: Pool;
@@ -103,6 +110,149 @@ maybe('хранилище бота алертов против PostgreSQL', () =
     expect(telegram.sendMessage).toHaveBeenCalledWith(
       'partial', 'Ответ доставлен не полностью, попробуйте ещё раз', 10,
     );
+  });
+  it('atomic draft admission завершает asked до модели и не даёт второму callback создать ход', async () => {
+    const adminUserId = 'u-atomic-draft';
+    const draftId = await store.createDraft({
+      chatId: 'atomic', tgUserId: '111', adminUserId,
+      ticketId: '11111111-1111-4111-8111-111111111111', text: 'атомарный вопрос', promptMessageId: 10,
+    });
+    expect(await store.claimDraft(draftId, 'asking')).toEqual({ status: 'claimed', version: 1 });
+    const input = {
+      updateId: 1070, chatId: 'atomic', tgUserId: '111', adminUserId,
+      questionMessageId: 10, question: 'атомарный вопрос', privateChat: true,
+    };
+    const answer = deferred<{ text: string; costUsd: number; tools: string[] }>();
+    const started = deferred();
+    const ai = {
+      answer: jest.fn().mockImplementation(() => {
+        started.resolve();
+        return answer.promise;
+      }),
+    };
+    const telegram = {
+      sendMessage: jest.fn().mockResolvedValue({ message_id: 20 }),
+      editMessageText: jest.fn().mockResolvedValue(undefined),
+      sendChunks: jest.fn().mockResolvedValue([20]),
+    };
+    const turns = new AlertBotTurns(
+      store, telegram as any, ai as any,
+      { summary: jest.fn() } as any,
+      { beginStream: jest.fn(), endStream: jest.fn() } as any,
+      { findTicketByPrefix: jest.fn().mockResolvedValue(null) } as any,
+    );
+
+    const first = (turns as any).enqueue(input, { draftId, claimVersion: 1 });
+    await started.promise;
+    const second = (turns as any).enqueue(
+      { ...input, updateId: 1071 }, { draftId, claimVersion: 1 },
+    );
+
+    try {
+      expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'asked', claimVersion: 1 });
+      expect((await store.getDraft(draftId))?.resolvedAt).toBeInstanceOf(Date);
+      expect(await store.claimDraft(draftId, 'asking')).toEqual({ status: 'unavailable' });
+      expect(ai.answer).toHaveBeenCalledTimes(1);
+    } finally {
+      answer.resolve({ text: 'один ответ', costUsd: 0, tools: [] });
+      await Promise.all([first, second]);
+    }
+
+    await expect(first).resolves.toBe('accepted');
+    await expect(second).resolves.toBe('stale');
+    const rows = await pool.query(
+      `SELECT status FROM alert_bot_turns WHERE linkeon_user_id = $1 AND status <> 'busy'`,
+      [adminUserId],
+    );
+    expect(rows.rows).toEqual([{ status: 'ok' }]);
+    expect(ai.answer).toHaveBeenCalledTimes(1);
+  });
+  it('crash после atomic admission оставляет asked и один in_progress ход без finalize', async () => {
+    const adminUserId = 'u-atomic-crash';
+    const draftId = await store.createDraft({
+      chatId: 'crash', tgUserId: '111', adminUserId,
+      ticketId: '11111111-1111-4111-8111-111111111111', text: 'crash window', promptMessageId: 10,
+    });
+    expect(await store.claimDraft(draftId, 'asking')).toEqual({ status: 'claimed', version: 1 });
+    const input = {
+      updateId: 1080, chatId: 'crash', tgUserId: '111', adminUserId,
+      questionMessageId: 10, question: 'crash window', privateChat: true,
+    };
+
+    const admitted = await (store as any).admitDraftQuestion({
+      draftId, claimVersion: 1, input, maxPerHour: 30,
+    });
+
+    expect(admitted).toMatchObject({ status: 'accepted', turnId: expect.any(String) });
+    expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'asked', claimVersion: 1 });
+    expect((await store.getDraft(draftId))?.resolvedAt).toBeInstanceOf(Date);
+    const turn = await pool.query('SELECT status FROM alert_bot_turns WHERE id = $1', [admitted.turnId]);
+    expect(turn.rows).toEqual([{ status: 'in_progress' }]);
+    await expect((store as any).admitDraftQuestion({
+      draftId, claimVersion: 1, input: { ...input, updateId: 1081 }, maxPerHour: 30,
+    })).resolves.toEqual({ status: 'stale' });
+    expect(await store.claimDraft(draftId, 'asking')).toEqual({ status: 'unavailable' });
+  });
+  it('stale и hourly refusal атомарно сохраняют asking без нового хода', async () => {
+    const adminUserId = 'u-atomic-refusal';
+    const draftId = await store.createDraft({
+      chatId: 'refusal', tgUserId: '111', adminUserId,
+      ticketId: '11111111-1111-4111-8111-111111111111', text: 'retryable', promptMessageId: 10,
+    });
+    expect(await store.claimDraft(draftId, 'asking')).toEqual({ status: 'claimed', version: 1 });
+    const input = {
+      updateId: 1090, chatId: 'refusal', tgUserId: '111', adminUserId,
+      questionMessageId: 10, question: 'retryable', privateChat: true,
+    };
+
+    await expect((store as any).admitDraftQuestion({
+      draftId, claimVersion: 2, input, maxPerHour: 30,
+    })).resolves.toEqual({ status: 'stale' });
+    await expect((store as any).admitDraftQuestion({
+      draftId, claimVersion: 1, input, maxPerHour: 0,
+    })).resolves.toEqual({ status: 'rate_limited' });
+
+    expect(await store.getDraft(draftId)).toMatchObject({
+      outcome: 'asking', claimVersion: 1, resolvedAt: null,
+    });
+    expect((await pool.query(
+      'SELECT count(*)::int AS n FROM alert_bot_turns WHERE linkeon_user_id = $1', [adminUserId],
+    )).rows[0].n).toBe(0);
+  });
+  it('одновременный draft admission использует общий per-admin hourly lock', async () => {
+    const adminUserId = 'u-atomic-concurrent';
+    const makeDraft = async (suffix: number) => {
+      const id = await store.createDraft({
+        chatId: 'atomic-concurrent', tgUserId: '111', adminUserId,
+        ticketId: '11111111-1111-4111-8111-111111111111', text: `вопрос ${suffix}`, promptMessageId: suffix,
+      });
+      expect(await store.claimDraft(id, 'asking')).toEqual({ status: 'claimed', version: 1 });
+      return id;
+    };
+    const firstDraft = await makeDraft(10);
+    const secondDraft = await makeDraft(11);
+    const input = {
+      updateId: 1095, chatId: 'atomic-concurrent', tgUserId: '111', adminUserId,
+      questionMessageId: 10, question: 'первый', privateChat: true,
+    };
+
+    const results = await Promise.all([
+      (store as any).admitDraftQuestion({ draftId: firstDraft, claimVersion: 1, input, maxPerHour: 1 }),
+      (store as any).admitDraftQuestion({
+        draftId: secondDraft, claimVersion: 1,
+        input: { ...input, updateId: 1096, questionMessageId: 11, question: 'второй' }, maxPerHour: 1,
+      }),
+    ]);
+
+    expect(results.map((result: any) => result.status).sort()).toEqual(['accepted', 'rate_limited']);
+    expect((await pool.query(
+      'SELECT count(*)::int AS n FROM alert_bot_turns WHERE linkeon_user_id = $1', [adminUserId],
+    )).rows[0].n).toBe(1);
+    const drafts = await pool.query(
+      'SELECT outcome FROM alert_bot_ticket_drafts WHERE id = ANY($1::uuid[]) ORDER BY outcome',
+      [[firstDraft, secondDraft]],
+    );
+    expect(drafts.rows).toEqual([{ outcome: 'asked' }, { outcome: 'asking' }]);
   });
   it('system turns сразу финальны, не тратят admission и не принимают поздний finish', async () => {
     const input = { updateId: 1060, chatId: 'system', tgUserId: '111', adminUserId: 'u-system', questionMessageId: 10, question: 'системный отказ', privateChat: true };

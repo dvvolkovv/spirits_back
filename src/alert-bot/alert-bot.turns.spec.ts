@@ -48,6 +48,7 @@ describe('AlertBotTurns', () => {
     process.env.ADMIN_ORIGIN = 'https://my.linkeon.io/';
     store = {
       tryCreateTurn: jest.fn().mockResolvedValue('turn-1'),
+      admitDraftQuestion: jest.fn().mockResolvedValue({ status: 'accepted', turnId: 'draft-turn-1' }),
       createTurn: jest.fn().mockResolvedValue('system-turn-1'),
       recordSystemTurn: jest.fn().mockResolvedValue('system-turn-1'),
       attachAnswerMessage: jest.fn().mockResolvedValue(undefined),
@@ -259,6 +260,43 @@ describe('AlertBotTurns', () => {
 
     expect(ai.answer).toHaveBeenCalledTimes(1);
     expect(JSON.stringify(logger.error.mock.calls)).not.toContain('RAW-ADMISSION-SECRET');
+  });
+
+  it('draft reservation проходит атомарный admission до вызова модели', async () => {
+    const reservation = { draftId: 'draft-1', claimVersion: 7 };
+
+    await expect((turns as any).enqueue(question(), reservation)).resolves.toBe('accepted');
+
+    expect(store.admitDraftQuestion).toHaveBeenCalledWith({
+      draftId: 'draft-1', claimVersion: 7, input: question(), maxPerHour: 30,
+    });
+    expect(store.tryCreateTurn).not.toHaveBeenCalled();
+    expect(store.attachAnswerMessages).toHaveBeenCalledWith('draft-turn-1', [901]);
+    expect(ai.answer).toHaveBeenCalledTimes(1);
+  });
+
+  it('stale draft admission не создаёт placeholder и не вызывает модель', async () => {
+    store.admitDraftQuestion.mockResolvedValue({ status: 'stale' });
+
+    await expect((turns as any).enqueue(
+      question(), { draftId: 'draft-1', claimVersion: 8 },
+    )).resolves.toBe('stale');
+
+    expect(telegram.sendMessage).not.toHaveBeenCalled();
+    expect(ai.answer).not.toHaveBeenCalled();
+    expect(store.recordSystemTurn).not.toHaveBeenCalled();
+  });
+
+  it('rate-limited draft admission не вызывает модель и оставляет reservation для service', async () => {
+    store.admitDraftQuestion.mockResolvedValue({ status: 'rate_limited' });
+
+    await expect((turns as any).enqueue(
+      question(), { draftId: 'draft-1', claimVersion: 9 },
+    )).resolves.toBe('rate_limited');
+
+    expect(store.recordSystemTurn).toHaveBeenCalledWith(question(), 'rate_limited');
+    expect(telegram.sendMessage).toHaveBeenCalledWith('100', 'Лимит вопросов в час исчерпан', 300);
+    expect(ai.answer).not.toHaveBeenCalled();
   });
 
   it('system turn не зависит от failed finish и не оставляет in_progress', async () => {
