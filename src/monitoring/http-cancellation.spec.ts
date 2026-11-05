@@ -66,6 +66,50 @@ describe('HTTP monitoring cancellation', () => {
     expect(remove).toHaveBeenCalledWith('abort', expect.any(Function));
   });
 
+  function stallJsonBody() {
+    fetchMock.mockImplementationOnce((_url: string, init: { signal: AbortSignal }) => Promise.resolve({
+      ok: true,
+      json: () => new Promise((_resolve, reject) => {
+        pending.push({ signal: init.signal, reject });
+        init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+      }),
+    }));
+  }
+
+  it('внешний abort после headers отменяет stalled body и очищает timer/listener', async () => {
+    stallJsonBody();
+    const service = new MonitoringService();
+    const controller = new AbortController();
+    const remove = jest.spyOn(controller.signal, 'removeEventListener');
+    const result = (service.query as any)('up', controller.signal) as Promise<unknown>;
+    const rejection = expect(result).rejects.toThrow('body stop');
+    await flush();
+    await flush();
+    expect(pending).toHaveLength(1);
+
+    controller.abort(new Error('body stop'));
+    await flush();
+    expect(pending[0].signal.aborted).toBe(true);
+    await rejection;
+    expect(remove).toHaveBeenCalledWith('abort', expect.any(Function));
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('собственный timeout после headers отменяет stalled body', async () => {
+    stallJsonBody();
+    const service = new MonitoringService();
+    const result = (service.query as any)('up') as Promise<unknown>;
+    const rejection = expect(result).rejects.toThrow(/timeout/i);
+    await flush();
+    await flush();
+    expect(pending).toHaveLength(1);
+
+    await jest.advanceTimersByTimeAsync(5000);
+    expect(pending[0].signal.aborted).toBe(true);
+    await rejection;
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
   it('LogsService сохраняет собственный timeout 8000ms при внешнем signal', async () => {
     const service = new LogsService();
     const controller = new AbortController();

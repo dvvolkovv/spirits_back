@@ -144,6 +144,15 @@ describe('маска бота алертов', () => {
     expect(JSON.parse(out)).toEqual(expect.any(Object));
   });
 
+  it('маскирует UUID рядом с underscore и сохраняет ticket #prefix', () => {
+    const ticket = '018f2c3a-9d4e-7abc-8def-abcdef123456';
+    expect(maskText(`user_${ticket}`)).toBe('user_[id]');
+    expect(maskText(`${ticket}_psychologist`)).toBe('[id]_psychologist');
+    expect(maskText(`user_${ticket} ${ticket}_psychologist`, [ticket])).toBe(
+      'user_#018f2c3a #018f2c3a_psychologist',
+    );
+  });
+
   it('маскирует UUID без ограничения версии и варианта', () => {
     const ticket = '018f2c3a-9d4e-7abc-8def-abcdef123456';
     expect(maskText(ticket)).toBe('[id]');

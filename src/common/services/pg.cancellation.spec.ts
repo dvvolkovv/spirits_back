@@ -69,6 +69,33 @@ describe('PgService.query cancellation', () => {
     expect(releaseCalls).toBe(1);
   });
 
+  it('abort во время pending pool.connect завершает вызов, а поздний client release без query', async () => {
+    let resolveConnect!: (client: PoolClient) => void;
+    const client = new EventEmitter() as PoolClient & { query: jest.Mock; release: jest.Mock };
+    client.query = jest.fn(async () => ({ rows: [{ ok: 1 }] }));
+    client.release = jest.fn();
+    const pool = { connect: jest.fn(() => new Promise<PoolClient>((resolve) => { resolveConnect = resolve; })) };
+    const service = new PgService();
+    (service as any).pool = pool;
+    const controller = new AbortController();
+
+    const result = (service.query as any)('SELECT 1', [], controller.signal) as Promise<unknown>;
+    const settled = result.then(
+      () => ({ status: 'resolved' }),
+      (error: Error) => ({ status: 'rejected', error }),
+    );
+    await flush();
+    controller.abort(new Error('connect stop'));
+    await flush();
+    resolveConnect(client);
+    const outcome = await settled;
+
+    expect(outcome.status).toBe('rejected');
+    expect((outcome as any).error.message).toBe('connect stop');
+    expect(client.release).toHaveBeenCalledTimes(1);
+    expect(client.query).not.toHaveBeenCalled();
+  });
+
   it('обычный запрос тоже идёт через выделенного клиента и реальный Query, release в finally', async () => {
     const { service, client, pool, getQuery, resolveActive } = fixture();
     const result = (service.query as any)('SELECT $1::int AS n', [7]) as Promise<any>;

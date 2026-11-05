@@ -245,18 +245,23 @@ describe('разделы технического здоровья для бот
     expect(sources[sourceIndex][method]).toHaveBeenCalledTimes(1);
   });
 
-  it('пробрасывает AbortSignal в каждый источник здоровья', async () => {
+  it('передаёт в каждый источник здоровья linked AbortSignal', async () => {
     const controller = new AbortController();
     for (const [section, sourceIndex, method] of sectionCases) {
       sources[sourceIndex][method].mockClear();
       await service.getSection(section, controller.signal);
-      expect(sources[sourceIndex][method].mock.calls[0].at(-1)).toBe(controller.signal);
+      const sourceSignal = sources[sourceIndex][method].mock.calls[0].at(-1);
+      expect(sourceSignal).toBeInstanceOf(AbortSignal);
+      expect(sourceSignal).not.toBe(controller.signal);
     }
     sources[0].getNodeOverview.mockClear();
     sources[0].getProbes.mockClear();
     await service.getSection('overview', controller.signal);
-    expect(sources[0].getNodeOverview).toHaveBeenCalledWith(controller.signal);
-    expect(sources[0].getProbes).toHaveBeenCalledWith(controller.signal);
+    const nodeSignal = sources[0].getNodeOverview.mock.calls[0][0];
+    const probeSignal = sources[0].getProbes.mock.calls[0][0];
+    expect(nodeSignal).toBeInstanceOf(AbortSignal);
+    expect(probeSignal).toBe(nodeSignal);
+    expect(nodeSignal).not.toBe(controller.signal);
   });
 
   it.each(HEALTH_SECTIONS.map((section) => [section, healthy[section]] as [HealthSection, any]))(
@@ -316,6 +321,35 @@ describe('разделы технического здоровья для бот
   it('явный сбой источника попадает в badSections', async () => {
     sources[2].getOverview.mockRejectedValue(new Error('СЕКРЕТ-ИЗ-ОТВЕТА'));
     await expect(service.badSections()).resolves.toContain('sms');
+  });
+
+  it('внешний abort делает aborted signal активного источника', async () => {
+    let sourceSignal: AbortSignal | undefined;
+    sources[2].getOverview.mockImplementation((signal: AbortSignal) => {
+      sourceSignal = signal;
+      return new Promise(() => {});
+    });
+    const controller = new AbortController();
+    const result = service.getSection('sms', controller.signal);
+    expect(sourceSignal).toBeDefined();
+
+    controller.abort(new Error('health stop'));
+    await expect(result).resolves.toEqual({ error: 'source_failed' });
+    expect(sourceSignal!.aborted).toBe(true);
+  });
+
+  it('собственный 2s deadline делает aborted signal активного источника', async () => {
+    jest.useFakeTimers();
+    let sourceSignal: AbortSignal | undefined;
+    sources[2].getOverview.mockImplementation((signal: AbortSignal) => {
+      sourceSignal = signal;
+      return new Promise(() => {});
+    });
+    const result = service.getSection('sms');
+
+    await jest.advanceTimersByTimeAsync(2000);
+    await expect(result).resolves.toEqual({ error: 'source_failed' });
+    expect(sourceSignal!.aborted).toBe(true);
   });
 
   it('бесконечный источник завершается source_failed по дедлайну', async () => {
