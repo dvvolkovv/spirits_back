@@ -6,7 +6,7 @@ import { SupportService } from '../support/support.service';
 import { AlertBotAi, AlertBotAiInput } from './alert-bot.ai';
 import { alertBotRatePerHour } from './alert-bot.config';
 import { AlertBotStatusService } from './alert-bot.status';
-import { AlertBotStore, AlertBotTurnStatus } from './alert-bot.store';
+import { AlertBotStore, AlertBotTurnStatus, DraftReservation } from './alert-bot.store';
 import { AlertBotTelegram } from './alert-bot.telegram';
 import { TurnInput } from './alert-bot.types';
 
@@ -15,7 +15,7 @@ const BUSY_TEXT = 'Занят, спросите через минуту';
 const RATE_LIMITED_TEXT = 'Лимит вопросов в час исчерпан';
 const GENERIC_ERROR_TEXT = 'Не получилось ответить, попробуйте ещё раз';
 const PARTIAL_DELIVERY_TEXT = 'Ответ доставлен не полностью, попробуйте ещё раз';
-export type AlertBotAdmission = 'accepted' | 'busy' | 'rate_limited';
+export type AlertBotAdmission = 'accepted' | 'busy' | 'rate_limited' | 'stale';
 const MODEL_FAILURE_KINDS: ReadonlySet<LlmOutageKind> = new Set([
   'auth', 'rate_limit', 'weekly_limit', 'overloaded', 'timeout',
 ]);
@@ -40,7 +40,7 @@ export class AlertBotTurns {
     private readonly support: SupportService,
   ) {}
 
-  enqueue(input: TurnInput): Promise<AlertBotAdmission> {
+  enqueue(input: TurnInput, reservation?: DraftReservation): Promise<AlertBotAdmission> {
     const key = String(input.chatId);
     const pending = this.pending.get(key) || 0;
     if (pending >= MAX_PENDING_PER_CHAT) {
@@ -49,7 +49,7 @@ export class AlertBotTurns {
 
     this.pending.set(key, pending + 1);
     const previous = this.chains.get(key) || Promise.resolve();
-    const run = previous.then(() => this.execute(input));
+    const run = previous.then(() => this.execute(input, reservation));
     let tracked: Promise<void>;
     tracked = run.then(() => undefined, () => undefined).finally(() => {
       const left = (this.pending.get(key) || 1) - 1;
@@ -65,17 +65,33 @@ export class AlertBotTurns {
     await Promise.all(Array.from(this.chains.values()));
   }
 
-  private async execute(input: TurnInput): Promise<AlertBotAdmission> {
+  private async execute(input: TurnInput, reservation?: DraftReservation): Promise<AlertBotAdmission> {
     const startedAt = Date.now();
-    // Admission отделён от выполнения: до turnId сбой должен попасть в service,
-    // чтобы зарезервированный черновик можно было освободить для retry.
-    const admittedTurnId = await this.store.tryCreateTurn(input, alertBotRatePerHour());
-    if (!admittedTurnId) {
-      await this.rejectRateLimited(input);
-      return 'rate_limited';
+    // Draft finalize входит в ту же транзакцию, что и создание хода: после commit
+    // повторный callback видит asked ещё до начала работы модели.
+    let turnId: string;
+    if (reservation) {
+      const admitted = await this.store.admitDraftQuestion({
+        ...reservation,
+        input,
+        maxPerHour: alertBotRatePerHour(),
+      });
+      if (admitted.status === 'stale') return 'stale';
+      if (admitted.status === 'rate_limited') {
+        await this.rejectRateLimited(input);
+        return 'rate_limited';
+      }
+      turnId = admitted.turnId;
+    } else {
+      // Admission отделён от выполнения: до turnId сбой должен попасть в service.
+      const admittedTurnId = await this.store.tryCreateTurn(input, alertBotRatePerHour());
+      if (!admittedTurnId) {
+        await this.rejectRateLimited(input);
+        return 'rate_limited';
+      }
+      turnId = admittedTurnId;
     }
 
-    const turnId = admittedTurnId;
     let placeholderId: number | null = null;
     let streamOpen = false;
     let finishAttempted = false;

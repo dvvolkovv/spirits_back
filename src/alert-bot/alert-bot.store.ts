@@ -66,6 +66,20 @@ export interface AlertMessage {
   createdAt: Date;
 }
 
+export interface DraftReservation {
+  draftId: string;
+  claimVersion: number;
+}
+
+export interface AdmitDraftQuestionInput extends DraftReservation {
+  input: TurnInput;
+  maxPerHour: number;
+}
+
+export type DraftQuestionAdmission =
+  | { status: 'accepted'; turnId: string }
+  | { status: 'rate_limited' | 'stale' };
+
 export interface FinishTurnResult {
   status: Exclude<AlertBotTurnStatus, 'in_progress'>;
   answer?: string;
@@ -238,6 +252,77 @@ export class AlertBotStore {
       await client.query('COMMIT');
       transactionOpen = false;
       return r.rows[0].id;
+    } catch (error) {
+      if (transactionOpen) {
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          destroyClient = true;
+        }
+      }
+      throw error;
+    } finally {
+      client.release(destroyClient);
+    }
+  }
+
+  async admitDraftQuestion(params: AdmitDraftQuestionInput): Promise<DraftQuestionAdmission> {
+    const { draftId, claimVersion, input, maxPerHour } = params;
+    const client = await this.pg.getClient();
+    let transactionOpen = false;
+    let destroyClient = false;
+    try {
+      await client.query('BEGIN');
+      transactionOpen = true;
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`alert-bot:${input.adminUserId}`]);
+      const draft = await client.query(
+        `SELECT id FROM alert_bot_ticket_drafts
+         WHERE id = $1 AND outcome = 'asking' AND claim_version = $2
+         FOR UPDATE`,
+        [draftId, claimVersion],
+      );
+      if (!draft.rows[0]) {
+        await client.query('ROLLBACK');
+        transactionOpen = false;
+        return { status: 'stale' };
+      }
+      const count = await client.query(
+        `SELECT count(*)::int AS n FROM alert_bot_turns
+         WHERE linkeon_user_id = $1 AND created_at >= now() - interval '1 hour'
+           AND status IN ('in_progress', 'ok', 'model_down', 'timeout', 'error', 'interrupted')`,
+        [input.adminUserId],
+      );
+      if (count.rows[0].n >= maxPerHour) {
+        await client.query('ROLLBACK');
+        transactionOpen = false;
+        return { status: 'rate_limited' };
+      }
+      const turn = await client.query(
+        `INSERT INTO alert_bot_turns
+           (update_id, chat_id, tg_user_id, linkeon_user_id, question_message_id,
+            parent_turn_id, question, private_chat, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'in_progress')
+         RETURNING id`,
+        [
+          input.updateId,
+          input.chatId,
+          input.tgUserId,
+          input.adminUserId,
+          input.questionMessageId,
+          input.parentTurnId ?? null,
+          input.question,
+          input.privateChat,
+        ],
+      );
+      await client.query(
+        `UPDATE alert_bot_ticket_drafts
+         SET outcome = 'asked', claimed_at = NULL, resolved_at = now()
+         WHERE id = $1 AND outcome = 'asking' AND claim_version = $2`,
+        [draftId, claimVersion],
+      );
+      await client.query('COMMIT');
+      transactionOpen = false;
+      return { status: 'accepted', turnId: turn.rows[0].id };
     } catch (error) {
       if (transactionOpen) {
         try {

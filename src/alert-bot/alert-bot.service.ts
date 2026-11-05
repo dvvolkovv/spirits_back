@@ -147,7 +147,7 @@ export class AlertBotService {
           question: result.question,
           privateChat: message.chat.type === 'private',
           ticketId: result.ticketId || null,
-        });
+        }, reserved ? { draftId: result.draftId!, claimVersion: result.claimVersion! } : undefined);
       } catch (error) {
         if (reserved) {
           try {
@@ -158,12 +158,9 @@ export class AlertBotService {
         }
         throw error;
       }
-      if (reserved) {
-        if (admission === 'accepted') {
-          await this.drafts.finalizeAsk(result.draftId!, result.claimVersion!);
-        } else {
-          await this.drafts.releaseAsk(result.draftId!, result.claimVersion!);
-        }
+      if (reserved && admission !== 'accepted') {
+        // stale version не снимает более новый claim: releaseDraft fenced по version.
+        await this.drafts.releaseAsk(result.draftId!, result.claimVersion!);
       }
     }
   }
