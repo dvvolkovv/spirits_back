@@ -29,11 +29,7 @@ export class AlertBotAi {
   async answer(input: AlertBotAiInput): Promise<{ text: string; costUsd: number; tools: string[] }> {
     const ticketIds = input.ticketId ? [input.ticketId] : [];
     const ticket = input.ticketId
-      ? await this.tools.execute(
-        'tickets',
-        { ticket: `#${input.ticketId.slice(0, 8)}` },
-        { adminUserId: input.adminUserId, chatId: input.chatId },
-      )
+      ? await this.preloadTicket(input, input.ticketId)
       : '';
     const history = (input.history || []).slice(-3).map((pair) => [
       `question: ${maskText(pair.question, ticketIds)}`,
@@ -68,6 +64,30 @@ export class AlertBotAi {
       return { text: result.text, costUsd: result.costUsd, tools };
     } finally {
       if (!consumed) this.ops.consumeToolNames(token);
+    }
+  }
+
+  private async preloadTicket(input: AlertBotAiInput, ticketId: string): Promise<string> {
+    const controller = new AbortController();
+    let timer: NodeJS.Timeout;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(Object.assign(new Error('ticket_preload_timeout'), { kind: 'timeout' }));
+      }, alertBotTimeoutMs());
+    });
+    try {
+      return await Promise.race([
+        this.tools.execute(
+          'tickets',
+          { ticket: `#${ticketId.slice(0, 8)}` },
+          { adminUserId: input.adminUserId, chatId: input.chatId },
+          controller.signal,
+        ),
+        deadline,
+      ]);
+    } finally {
+      clearTimeout(timer!);
     }
   }
 }
