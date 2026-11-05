@@ -302,6 +302,10 @@ export interface ChargedAgentReply {
   durationMs: number;
 }
 
+/** Сколько фоновый ответ (рутина, «Путь») ждёт конца хода человека в той же
+ * сессии релея, прежде чем честно пропуститься (waitForRelaySessionIdle). */
+const ROUTINE_SESSION_WAIT_MS = 30 * 60 * 1000;
+
 @Injectable()
 export class ChatService {
   private readonly logger = new Logger(ChatService.name);
@@ -371,7 +375,6 @@ export class ChatService {
   private readonly inflight = new Map<string, { state: 'running' | 'done'; ts: number }>();
   private readonly DEDUP_COOLDOWN_MS = 12000;
   private readonly DEDUP_RUNNING_TTL_MS = 600000; // страховка от «залипшего» running
-
   /**
    * Сколько ходов прямо сейчас в полёте. Считается отдельно от inflight-мапы:
    * у той TTL 10 минут (страховка дедупа), а ходы юридических ассистентов идут
@@ -2867,11 +2870,34 @@ ${LanguageService.buildDirective(userLanguage)}`;
     await this.addTokenTask(userId, 0, charge.tokens, assistantId, facts);
   }
 
+  /**
+   * Ждёт, пока сессия релея освободится: рутина/«Путь», идущая в основную
+   * сессию человека, не должна пре-эмптить его живой ход (бэклог e777aa94).
+   * Смотрим обе карты: relayRunning — сам процесс релея, activeTurns — ход
+   * кабинета (между ними есть окно до запроса к релею).
+   *
+   * false по таймауту: вызывающий отвечает пустым текстом, и routine deliver
+   * такой ответ молча пропускает — следующий запуск по расписанию попробует
+   * снова. Это лучше, чем оборвать работу человека.
+   */
+  private async waitForRelaySessionIdle(relaySid: string, turnKey: string): Promise<boolean> {
+    const deadline = Date.now() + ROUTINE_SESSION_WAIT_MS;
+    let logged = false;
+    while (this.relayRunning.has(relaySid) || this.activeTurns.has(turnKey)) {
+      if (Date.now() >= deadline) return false;
+      if (!logged) {
+        this.logger.log(`agentReply: жду конца хода в ${turnKey} перед фоновым ответом`);
+        logged = true;
+      }
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+    return true;
+  }
+
   private async agentReply(
     userId: string, assistantId: string, message: string, sessionIdOverride: string | undefined, billed: boolean,
     opts: AgentReplyOpts = {},
-  ): Promise<ChargedAgentReply> {
-    const startedAt = Date.now();
+  ): Promise<ChargedAgentReply> {    const startedAt = Date.now();
     const isNumeric = /^\d+$/.test(assistantId);
     const agentRes = isNumeric
       ? await this.pg.query('SELECT * FROM agents WHERE id = $1 LIMIT 1', [parseInt(assistantId, 10)])
@@ -2977,6 +3003,25 @@ ${LanguageService.buildDirective(userLanguage)}`;
     let costUsd = 0;
     let turnFailed = false;
     const turnCost = new RelayTurnCost();
+    // Фоновый ответ БЕЗ своей сессии (рутины, «Путь») пишет в основную сессию
+    // человека. До 05.11.2026 он шёл мимо учёта ходов: пре-эмптил живой ход
+    // человека на релее, кабинет его не видел, deploy.sh — тоже. Теперь ждём
+    // конца чужого хода и регистрируемся во всех трёх картах. Вызовы со своей
+    // sessionIdOverride (голос, пробы) в activeTurns не нужны — их сессия не
+    // та, что у чата, но в relayRunning/activeStreams входят тоже.
+    const mainSession = !sessionIdOverride;
+    const turnKey = `${userId}_${assistantId}`;
+    if (mainSession) {
+      const idle = await this.waitForRelaySessionIdle(relaySid, turnKey);
+      if (!idle) {
+        this.logger.warn(`agentReply: ${turnKey} занята дольше ${ROUTINE_SESSION_WAIT_MS / 60000} мин — фоновый ответ пропущен, ход человека не трогаем`);
+        return { text: '', tokens: 0, costUsd: 0, charge: this.computeSdkCharge(null, 0, ''), durationMs: Date.now() - startedAt };
+      }
+    }
+    const relayMark = this.beginRelayRun(relaySid);
+    const turnMark = mainSession ? this.openTurn(turnKey, startedAt) : null;
+    this.beginStream();
+    try {
     const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
       headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
       responseType: 'stream',
@@ -3028,6 +3073,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
       resp.data.on('end', () => resolve());
       resp.data.on('error', reject);
     });
+    } finally {
+      this.endStream();
+      this.endRelayRun(relaySid, relayMark);
+      if (turnMark !== null) this.closeTurn(turnKey, turnMark);
+    }
     const text = this.stripToolTags(chunks.join('')).trim();
     const charge = this.computeSdkCharge(usage, costUsd, text, turnCost.usd);
     if (opts.testMode === true) {
