@@ -1,5 +1,6 @@
 import { ConflictException, Injectable, Logger } from '@nestjs/common';
 import { SupportService } from '../support/support.service';
+import { AlertBotRetryableError } from './alert-bot.errors';
 import { AlertBotDraftClaim, AlertBotDraftOutcome, AlertBotStore } from './alert-bot.store';
 import { AlertBotTelegram } from './alert-bot.telegram';
 
@@ -250,17 +251,20 @@ export class AlertBotDrafts {
         // безопасен: draftId идемпотентен, а stale version отклоняется до insert.
         await this.store.releaseDraft(input.draftId, activeClaim.action, activeClaim.version).catch(() => undefined);
       }
-      answer = 'Не удалось обработать черновик';
-      return {};
+      // Результат publish/finalize неизвестен. Service должен сохранить failed
+      // update и повторить его; завершать update успешным здесь нельзя.
+      throw new AlertBotRetryableError('draft_retry');
     } finally {
       if (questionGuardToken && !keepQuestionGuard) {
         this.finishAsk(input.draftId, questionGuardToken);
       }
-      // Ошибка ack не отменяет уже полученный результат (особенно question у /ask).
-      try {
-        await this.telegram.answerCallbackQuery(input.callbackId, answer);
-      } catch {
-        // Ровно одна попытка ack; повторять её опасно для общего обработчика.
+      // Для зарезервированного ask ack отправляет service ПОСЛЕ admission.
+      if (!(input.action === 'ask' && keepQuestionGuard)) {
+        try {
+          await this.telegram.answerCallbackQuery(input.callbackId, answer);
+        } catch {
+          // Ровно одна попытка ack; повторять её опасно для общего обработчика.
+        }
       }
     }
   }

@@ -31,6 +31,11 @@ export interface AlertBotTurn {
   errorKind: string | null;
   durationMs: number | null;
   costUsd: number | null;
+  modelStartedAt: Date | null;
+  placeholderMessageId: number | null;
+  placeholderStartedAt: Date | null;
+  deliveryStartedAt: Date | null;
+  deliveryCompletedAt: Date | null;
   privateChat: boolean;
   createdAt: Date;
   finishedAt: Date | null;
@@ -78,12 +83,12 @@ export interface AdmitDraftQuestionInput extends DraftReservation {
 
 export type TurnAdmission =
   | { status: 'accepted'; turnId: string }
-  | { status: 'existing'; turnId: string; turnStatus: AlertBotTurnStatus }
+  | { status: 'existing'; turnId: string; turnStatus: AlertBotTurnStatus; turn: AlertBotTurn }
   | { status: 'rate_limited' };
 
 export type DraftQuestionAdmission =
   | { status: 'accepted'; turnId: string }
-  | { status: 'existing'; turnId: string; turnStatus: AlertBotTurnStatus }
+  | { status: 'existing'; turnId: string; turnStatus: AlertBotTurnStatus; turn: AlertBotTurn }
   | { status: 'rate_limited' }
   | { status: 'stale' };
 
@@ -123,6 +128,11 @@ function mapTurn(row: any): AlertBotTurn {
     errorKind: row.error_kind,
     durationMs: row.duration_ms,
     costUsd: row.cost_usd === null ? null : Number(row.cost_usd),
+    modelStartedAt: row.model_started_at,
+    placeholderMessageId: row.placeholder_message_id === null ? null : Number(row.placeholder_message_id),
+    placeholderStartedAt: row.placeholder_started_at,
+    deliveryStartedAt: row.delivery_started_at,
+    deliveryCompletedAt: row.delivery_completed_at,
     privateChat: row.private_chat,
     createdAt: row.created_at,
     finishedAt: row.finished_at,
@@ -225,11 +235,14 @@ export class AlertBotStore {
     return result.rows.map((row) => ({ updateId: Number(row.update_id), payload: row.payload }));
   }
 
-  async requeueProcessingUpdates(): Promise<void> {
+  async requeueProcessingUpdates(staleSeconds = 0): Promise<void> {
+    const bounded = clampInteger(staleSeconds, 0, 24 * 60 * 60);
     await this.pg.query(
       `UPDATE alert_bot_updates
        SET status = 'failed', next_retry_at = now(), updated_at = now()
-       WHERE status = 'processing' AND payload IS NOT NULL`,
+       WHERE status = 'processing' AND payload IS NOT NULL
+         AND updated_at <= now() - ($1 * interval '1 second')`,
+      [bounded],
     );
   }
 
@@ -287,7 +300,7 @@ export class AlertBotStore {
       transactionOpen = true;
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`alert-bot:${input.adminUserId}`]);
       const existing = await client.query(
-        `SELECT id, status FROM alert_bot_turns WHERE update_id = $1`,
+        `SELECT * FROM alert_bot_turns WHERE update_id = $1`,
         [input.updateId],
       );
       if (existing.rows[0]) {
@@ -297,6 +310,7 @@ export class AlertBotStore {
           status: 'existing',
           turnId: existing.rows[0].id,
           turnStatus: existing.rows[0].status,
+          turn: mapTurn(existing.rows[0]),
         };
       }
       const count = await client.query(
@@ -359,7 +373,7 @@ export class AlertBotStore {
       transactionOpen = true;
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`alert-bot:${input.adminUserId}`]);
       const existing = await client.query(
-        `SELECT id, status FROM alert_bot_turns WHERE update_id = $1`,
+        `SELECT * FROM alert_bot_turns WHERE update_id = $1`,
         [input.updateId],
       );
       if (existing.rows[0]) {
@@ -369,6 +383,7 @@ export class AlertBotStore {
           status: 'existing',
           turnId: existing.rows[0].id,
           turnStatus: existing.rows[0].status,
+          turn: mapTurn(existing.rows[0]),
         };
       }
       const draft = await client.query(
@@ -435,6 +450,64 @@ export class AlertBotStore {
 
   async attachAnswerMessage(turnId: string, messageId: number): Promise<void> {
     await this.pg.query('UPDATE alert_bot_turns SET answer_message_id = $2 WHERE id = $1', [turnId, messageId]);
+  }
+
+  async markPlaceholderStarted(turnId: string): Promise<void> {
+    await this.pg.query(
+      `UPDATE alert_bot_turns
+       SET placeholder_started_at = COALESCE(placeholder_started_at, now())
+       WHERE id = $1`,
+      [turnId],
+    );
+  }
+
+  async deferPlaceholder(turnId: string): Promise<void> {
+    await this.pg.query(
+      'UPDATE alert_bot_turns SET placeholder_started_at = NULL WHERE id = $1 AND placeholder_message_id IS NULL',
+      [turnId],
+    );
+  }
+
+  async attachPlaceholder(turnId: string, messageId: number): Promise<void> {
+    await this.pg.query(
+      'UPDATE alert_bot_turns SET placeholder_message_id = $2 WHERE id = $1',
+      [turnId, messageId],
+    );
+  }
+
+  async markModelStarted(turnId: string): Promise<void> {
+    await this.pg.query(
+      'UPDATE alert_bot_turns SET model_started_at = COALESCE(model_started_at, now()) WHERE id = $1',
+      [turnId],
+    );
+  }
+
+  async markDeliveryStarted(turnId: string): Promise<void> {
+    await this.pg.query(
+      `UPDATE alert_bot_turns
+       SET delivery_started_at = COALESCE(delivery_started_at, now())
+       WHERE id = $1 AND delivery_completed_at IS NULL`,
+      [turnId],
+    );
+  }
+
+  async deferDelivery(turnId: string): Promise<void> {
+    await this.pg.query(
+      'UPDATE alert_bot_turns SET delivery_started_at = NULL WHERE id = $1 AND delivery_completed_at IS NULL',
+      [turnId],
+    );
+  }
+
+  async completeDelivery(turnId: string, messageIds: number[]): Promise<void> {
+    const ids = Array.from(new Set(messageIds.filter((id) => Number.isSafeInteger(id) && id > 0)));
+    if (!ids.length) throw new Error('answer message ids missing');
+    await this.pg.query(
+      `UPDATE alert_bot_turns
+       SET answer_message_id = $2, answer_message_ids = $3::jsonb,
+           delivery_started_at = NULL, delivery_completed_at = now()
+       WHERE id = $1`,
+      [turnId, ids[0], JSON.stringify(ids)],
+    );
   }
 
   async attachAnswerMessages(turnId: string, messageIds: number[]): Promise<void> {

@@ -75,6 +75,7 @@ function replyText(message?: TgMessage): string | undefined {
 export class AlertBotService {
   private readonly logger = new Logger(AlertBotService.name);
   private readonly refusalSentAt = new Map<string, number>();
+  private readonly activeUpdates = new Set<number>();
   private me: Promise<{ id: number; username: string }> | null = null;
 
   constructor(
@@ -87,14 +88,24 @@ export class AlertBotService {
     private readonly support: SupportService,
   ) {}
 
-  async handleUpdate(update: unknown): Promise<void> {
+  async claimUpdate(update: unknown): Promise<boolean> {
+    const updateId = (update as TelegramUpdate)?.update_id;
+    if (!Number.isSafeInteger(updateId)) return false;
+    return this.store.claimUpdate(Number(updateId), update);
+  }
+
+  async handleUpdate(update: unknown, alreadyClaimed = false): Promise<void> {
     const candidate = update as TelegramUpdate;
     if (!Number.isSafeInteger(candidate?.update_id)) return;
     const updateId = Number(candidate.update_id);
-    let claimed = false;
+    if (this.activeUpdates.has(updateId)) return;
+    this.activeUpdates.add(updateId);
+    let claimed = alreadyClaimed;
     try {
-      claimed = await this.store.claimUpdate(updateId, candidate);
-      if (!claimed) return;
+      if (!claimed) {
+        claimed = await this.store.claimUpdate(updateId, candidate);
+        if (!claimed) return;
+      }
       if (candidate.callback_query) {
         await this.handleCallback(updateId, candidate.callback_query);
       } else if (candidate.message) {
@@ -109,14 +120,18 @@ export class AlertBotService {
       try {
         final = await this.store.failUpdate(updateId, kind);
       } catch (failureError) {
+        // Строка остаётся processing только до periodic lease sweep.
         this.logger.error(`alert-bot retry state failed kind=${safeErrorKind(failureError)}`);
         return;
       }
       if (final) await this.sendFinalFailure(candidate);
+    } finally {
+      this.activeUpdates.delete(updateId);
     }
   }
 
   async retryFailedUpdates(): Promise<void> {
+    await this.store.requeueProcessingUpdates(60);
     const due = await this.store.dueUpdates();
     for (const item of due) await this.handleUpdate(item.payload);
   }
@@ -202,6 +217,18 @@ export class AlertBotService {
         throw error;
       } finally {
         if (reserved) this.drafts.finishAsk(result.draftId!, result.guardToken!);
+      }
+      const ackText = admission === 'accepted'
+        ? 'Вопрос принят'
+        : admission === 'busy'
+          ? 'Занят, спросите через минуту'
+          : admission === 'rate_limited'
+            ? 'Лимит вопросов в час исчерпан'
+            : 'Черновик устарел';
+      try {
+        await this.telegram.answerCallbackQuery(callback.id, ackText);
+      } catch {
+        // Admission уже известен; косметический ack не повторяет update или модель.
       }
     }
   }

@@ -53,8 +53,21 @@ export class AlertBotTelegram {
     replyTo: number,
     replyMarkup?: unknown,
     onIds?: (ids: number[]) => void | Promise<void>,
+    deliveredMessageIds: number[] = [],
   ): Promise<number[]> {
     const chunks = splitForTelegram(text);
+    if (chunks.length > 0 && deliveredMessageIds.length >= chunks.length) {
+      return deliveredMessageIds.slice(0, chunks.length);
+    }
+    if (deliveredMessageIds.length > 0) {
+      const messageIds = [...deliveredMessageIds];
+      for (const chunk of chunks.slice(messageIds.length)) {
+        const continuation = await this.sendMessage(chatId, chunk, replyTo);
+        messageIds.push(continuation.message_id);
+        await onIds?.([...messageIds]);
+      }
+      return messageIds;
+    }
     if (!chunks.length) {
       await this.editMessageText(chatId, firstMessageId, 'Модель вернула пустой ответ');
       await onIds?.([firstMessageId]);

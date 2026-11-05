@@ -29,7 +29,12 @@ BEGIN
     created_at timestamptz NOT NULL DEFAULT now(), resolved_at timestamptz
   );
   ALTER TABLE alert_bot_turns
-    ADD COLUMN IF NOT EXISTS answer_message_ids jsonb NOT NULL DEFAULT '[]'::jsonb;
+    ADD COLUMN IF NOT EXISTS answer_message_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
+    ADD COLUMN IF NOT EXISTS model_started_at timestamptz,
+    ADD COLUMN IF NOT EXISTS placeholder_message_id bigint,
+    ADD COLUMN IF NOT EXISTS placeholder_started_at timestamptz,
+    ADD COLUMN IF NOT EXISTS delivery_started_at timestamptz,
+    ADD COLUMN IF NOT EXISTS delivery_completed_at timestamptz;
   ALTER TABLE alert_bot_updates
     ADD COLUMN IF NOT EXISTS payload jsonb,
     ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'processing',
