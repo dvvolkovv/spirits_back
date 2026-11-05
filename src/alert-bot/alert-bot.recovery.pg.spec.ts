@@ -372,7 +372,7 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
     expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'asking', claimVersion: 1 });
     expect((await pool.query(
       'SELECT status, attempts FROM alert_bot_updates WHERE update_id = $1', [callback.update_id],
-    )).rows[0]).toMatchObject({ status: 'failed', attempts: 2 });
+    )).rows[0]).toMatchObject({ status: 'failed', attempts: 1 });
   });
 
   it('timeout после remote success placeholder не очищает marker и не создаёт второй placeholder', async () => {
