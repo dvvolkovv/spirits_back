@@ -78,7 +78,8 @@ export interface AdmitDraftQuestionInput extends DraftReservation {
 
 export type DraftQuestionAdmission =
   | { status: 'accepted'; turnId: string }
-  | { status: 'rate_limited' | 'stale' };
+  | { status: 'rate_limited' }
+  | { status: 'stale' };
 
 export interface FinishTurnResult {
   status: Exclude<AlertBotTurnStatus, 'in_progress'>;
