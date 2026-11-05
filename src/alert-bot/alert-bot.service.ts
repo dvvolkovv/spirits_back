@@ -135,16 +135,36 @@ export class AlertBotService {
       messageId: message.message_id,
     });
     if (result.question) {
-      await this.turns.enqueue({
-        updateId,
-        chatId: String(message.chat.id),
-        tgUserId,
-        adminUserId: identity.userId,
-        questionMessageId: message.message_id,
-        question: result.question,
-        privateChat: message.chat.type === 'private',
-        ticketId: result.ticketId || null,
-      });
+      const reserved = result.draftId !== undefined && result.claimVersion !== undefined;
+      let admission: Awaited<ReturnType<AlertBotTurns['enqueue']>>;
+      try {
+        admission = await this.turns.enqueue({
+          updateId,
+          chatId: String(message.chat.id),
+          tgUserId,
+          adminUserId: identity.userId,
+          questionMessageId: message.message_id,
+          question: result.question,
+          privateChat: message.chat.type === 'private',
+          ticketId: result.ticketId || null,
+        });
+      } catch (error) {
+        if (reserved) {
+          try {
+            await this.drafts.releaseAsk(result.draftId!, result.claimVersion!);
+          } catch (releaseError) {
+            this.logger.error(`alert-bot draft release failed kind=${safeErrorKind(releaseError)}`);
+          }
+        }
+        throw error;
+      }
+      if (reserved) {
+        if (admission === 'accepted') {
+          await this.drafts.finalizeAsk(result.draftId!, result.claimVersion!);
+        } else {
+          await this.drafts.releaseAsk(result.draftId!, result.claimVersion!);
+        }
+      }
     }
   }
 

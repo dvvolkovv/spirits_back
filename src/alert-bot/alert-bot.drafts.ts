@@ -29,6 +29,8 @@ interface DraftCallbackInput {
 export interface DraftCallbackResult {
   question?: string;
   ticketId?: string;
+  draftId?: string;
+  claimVersion?: number;
 }
 
 function terminal(status: string): boolean {
@@ -102,6 +104,14 @@ export class AlertBotDrafts {
     }
   }
 
+  async finalizeAsk(id: string, version: number): Promise<void> {
+    await this.finalize(id, 'asking', 'asked', version);
+  }
+
+  async releaseAsk(id: string, version: number): Promise<void> {
+    await this.store.releaseDraft(id, 'asking', version);
+  }
+
   async handleCallback(input: DraftCallbackInput): Promise<DraftCallbackResult> {
     let answer = 'Готово';
     let activeClaim: { action: AlertBotDraftClaim; version: number } | null = null;
@@ -158,10 +168,15 @@ export class AlertBotDrafts {
       }
 
       if (input.action === 'ask') {
-        await this.finalize(draft.id, activeClaim.action, 'asked', activeClaim.version);
-        activeClaim = null;
-        answer = 'Вопрос передан боту';
-        return { question: draft.text, ticketId: draft.ticketId };
+        // Резерв остаётся на время admission и выполнения хода. Его снимает
+        // service при отказе/сбое либо финализирует после accepted.
+        answer = 'Вопрос обрабатывается';
+        return {
+          question: draft.text,
+          ticketId: draft.ticketId,
+          draftId: draft.id,
+          claimVersion: activeClaim.version,
+        };
       }
 
       if (input.action === 'cancel') {

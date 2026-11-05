@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ChatService } from '../chat/chat.service';
+import { ClaudeCliCallError } from '../common/services/claude-cli.service';
 import type { LlmOutageKind } from '../common/llm-error';
 import { SupportService } from '../support/support.service';
 import { AlertBotAi, AlertBotAiInput } from './alert-bot.ai';
@@ -13,6 +14,8 @@ const MAX_PENDING_PER_CHAT = 3;
 const BUSY_TEXT = 'Занят, спросите через минуту';
 const RATE_LIMITED_TEXT = 'Лимит вопросов в час исчерпан';
 const GENERIC_ERROR_TEXT = 'Не получилось ответить, попробуйте ещё раз';
+const PARTIAL_DELIVERY_TEXT = 'Ответ доставлен не полностью, попробуйте ещё раз';
+export type AlertBotAdmission = 'accepted' | 'busy' | 'rate_limited';
 const MODEL_FAILURE_KINDS: ReadonlySet<LlmOutageKind> = new Set([
   'auth', 'rate_limit', 'weekly_limit', 'overloaded', 'timeout',
 ]);
@@ -37,43 +40,49 @@ export class AlertBotTurns {
     private readonly support: SupportService,
   ) {}
 
-  enqueue(input: TurnInput): Promise<void> {
+  enqueue(input: TurnInput): Promise<AlertBotAdmission> {
     const key = String(input.chatId);
     const pending = this.pending.get(key) || 0;
-    if (pending >= MAX_PENDING_PER_CHAT) return this.rejectBusy(input);
+    if (pending >= MAX_PENDING_PER_CHAT) {
+      return this.rejectBusy(input).then(() => 'busy');
+    }
 
     this.pending.set(key, pending + 1);
     const previous = this.chains.get(key) || Promise.resolve();
     const run = previous.then(() => this.execute(input));
     let tracked: Promise<void>;
-    tracked = run.finally(() => {
+    tracked = run.then(() => undefined).finally(() => {
       const left = (this.pending.get(key) || 1) - 1;
       if (left > 0) this.pending.set(key, left);
       else this.pending.delete(key);
       if (this.chains.get(key) === tracked) this.chains.delete(key);
     });
     this.chains.set(key, tracked);
-    return tracked;
+    return run;
   }
 
   async idle(): Promise<void> {
     await Promise.all(Array.from(this.chains.values()));
   }
 
-  private async execute(input: TurnInput): Promise<void> {
+  private async execute(input: TurnInput): Promise<AlertBotAdmission> {
     const startedAt = Date.now();
-    let turnId: string | null = null;
+    // Admission отделён от выполнения: до turnId сбой должен попасть в service,
+    // чтобы зарезервированный черновик можно было освободить для retry.
+    const admittedTurnId = await this.store.tryCreateTurn(input, alertBotRatePerHour());
+    if (!admittedTurnId) {
+      await this.rejectRateLimited(input);
+      return 'rate_limited';
+    }
+
+    const turnId = admittedTurnId;
     let placeholderId: number | null = null;
     let streamOpen = false;
     let finishAttempted = false;
+    let deliveredIds: number[] = [];
+    let deliveryComplete = false;
 
     try {
-      turnId = await this.store.tryCreateTurn(input, alertBotRatePerHour());
-      if (!turnId) {
-        await this.rejectRateLimited(input);
-        return;
-      }
-
       const placeholder = await this.telegram.sendMessage(input.chatId, '🔎 Смотрю…', input.questionMessageId);
       placeholderId = placeholder.message_id;
       await this.store.attachAnswerMessages(turnId, [placeholderId]);
@@ -86,20 +95,22 @@ export class AlertBotTurns {
         answer = await this.ai.answer({ ...input, history });
       } catch (error) {
         const kind = safeErrorKind(error, 'unknown');
-        if (!MODEL_FAILURE_KINDS.has(kind as LlmOutageKind)) throw error;
+        if (!(error instanceof ClaudeCliCallError) && !MODEL_FAILURE_KINDS.has(kind as LlmOutageKind)) throw error;
         const turnStatus: AlertBotTurnStatus = kind === 'timeout' ? 'timeout' : 'model_down';
         const summary = await this.status.summary();
         const fallback = `Модель недоступна: ${kind}.\n\n${summary}`;
         this.log(turnId, turnStatus, kind);
         await this.replacePlaceholder(input, placeholderId, fallback);
-        finishAttempted = true;
+        deliveredIds = placeholderId === null ? [] : [placeholderId];
+        deliveryComplete = true;
         await this.store.finishTurn(turnId, {
           status: turnStatus,
           answer: fallback,
           errorKind: kind,
           durationMs: Date.now() - startedAt,
         });
-        return;
+        finishAttempted = true;
+        return 'accepted';
       }
 
       const replyMarkup = await this.ticketButtons(answer.text);
@@ -109,9 +120,14 @@ export class AlertBotTurns {
         placeholderId,
         input.questionMessageId,
         replyMarkup,
+        async (ids) => {
+          deliveredIds = [...ids];
+          await this.persistAnswerMessages(turnId, ids);
+        },
       );
-      await this.store.attachAnswerMessages(turnId, answerMessageIds);
-      finishAttempted = true;
+      deliveredIds = [...answerMessageIds];
+      deliveryComplete = true;
+      await this.persistAnswerMessages(turnId, answerMessageIds);
       await this.store.finishTurn(turnId, {
         status: 'ok',
         answer: answer.text,
@@ -119,29 +135,49 @@ export class AlertBotTurns {
         durationMs: Date.now() - startedAt,
         costUsd: answer.costUsd,
       });
+      finishAttempted = true;
       this.log(turnId, 'ok', 'done');
     } catch (error) {
       const kind = safeErrorKind(error);
       this.log(turnId, 'error', kind);
-      try {
-        await this.replacePlaceholder(input, placeholderId, GENERIC_ERROR_TEXT);
-      } catch (sendError) {
-        this.log(turnId, 'error', safeErrorKind(sendError, 'send_failed'));
+      if (!deliveredIds.length) {
+        try {
+          await this.replacePlaceholder(input, placeholderId, GENERIC_ERROR_TEXT);
+        } catch (sendError) {
+          this.log(turnId, 'error', safeErrorKind(sendError, 'send_failed'));
+        }
+      } else if (!deliveryComplete) {
+        try {
+          await this.telegram.sendMessage(input.chatId, PARTIAL_DELIVERY_TEXT, input.questionMessageId);
+        } catch (sendError) {
+          this.log(turnId, 'error', safeErrorKind(sendError, 'send_failed'));
+        }
       }
-      if (turnId && !finishAttempted) {
-        finishAttempted = true;
+      if (!finishAttempted) {
         try {
           await this.store.finishTurn(turnId, {
             status: 'error',
             errorKind: kind,
             durationMs: Date.now() - startedAt,
           });
+          finishAttempted = true;
         } catch (finishError) {
           this.log(turnId, 'error', safeErrorKind(finishError, 'finish_failed'));
         }
       }
     } finally {
       if (streamOpen) this.chat.endStream();
+    }
+    return 'accepted';
+  }
+
+  private async persistAnswerMessages(turnId: string, ids: number[]): Promise<void> {
+    try {
+      await this.store.attachAnswerMessages(turnId, ids);
+    } catch (error) {
+      // Видимые сообщения важнее журнала: retry attach не должен обрывать chunks
+      // или приводить к overwrite уже доставленного ответа.
+      this.log(turnId, 'error', safeErrorKind(error, 'attach_failed'));
     }
   }
 

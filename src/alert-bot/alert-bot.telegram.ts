@@ -46,17 +46,27 @@ export class AlertBotTelegram {
   answerCallbackQuery(id: string, text: string): Promise<void> {
     return this.call('answerCallbackQuery', { callback_query_id: id, text });
   }
-  async sendChunks(chatId: string, text: string, firstMessageId: number, replyTo: number, replyMarkup?: unknown): Promise<number[]> {
+  async sendChunks(
+    chatId: string,
+    text: string,
+    firstMessageId: number,
+    replyTo: number,
+    replyMarkup?: unknown,
+    onIds?: (ids: number[]) => void | Promise<void>,
+  ): Promise<number[]> {
     const chunks = splitForTelegram(text);
     if (!chunks.length) {
       await this.editMessageText(chatId, firstMessageId, 'Модель вернула пустой ответ');
+      await onIds?.([firstMessageId]);
       return [firstMessageId];
     }
     await this.editMessageText(chatId, firstMessageId, chunks[0], replyMarkup);
     const messageIds = [firstMessageId];
+    await onIds?.([...messageIds]);
     for (const chunk of chunks.slice(1)) {
       const continuation = await this.sendMessage(chatId, chunk, replyTo);
       messageIds.push(continuation.message_id);
+      await onIds?.([...messageIds]);
     }
     return messageIds;
   }
