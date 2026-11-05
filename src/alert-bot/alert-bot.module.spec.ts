@@ -64,12 +64,23 @@ describe('AlertBotModule: жизненный цикл и DI', () => {
     const fallback = path.join(__dirname, '..', '..', 'src', 'alert-bot', 'migrations', '001_alert_bot.sql');
     expect(fs.existsSync(bundled)).toBe(true);
     const expectedSql = fs.readFileSync(fallback, 'utf8');
+    const distBundled = bundled.replace(
+      `${path.sep}src${path.sep}alert-bot${path.sep}`,
+      `${path.sep}dist${path.sep}alert-bot${path.sep}`,
+    );
+    const originalJoin = path.join;
+    jest.spyOn(path, 'join').mockImplementation((...parts: string[]) => {
+      if (parts.length === 3 && parts[1] === 'migrations' && parts[2] === '001_alert_bot.sql') {
+        return distBundled;
+      }
+      return originalJoin(...parts);
+    });
     const query = jest.fn().mockResolvedValue({ rows: [], rowCount: 0 });
     const exists = jest.spyOn(fs, 'existsSync').mockImplementation((candidate) => String(candidate) === fallback);
 
     await new AlertBotStore({ query } as any).migrate();
 
-    expect(exists).toHaveBeenNthCalledWith(1, bundled);
+    expect(exists).toHaveBeenNthCalledWith(1, distBundled);
     expect(exists).toHaveBeenNthCalledWith(2, fallback);
     expect(query).toHaveBeenCalledWith(expectedSql);
   });
