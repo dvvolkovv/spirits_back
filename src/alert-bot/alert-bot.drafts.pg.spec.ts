@@ -338,21 +338,21 @@ maybe('callback черновика с lease против PostgreSQL', () => {
     };
     const localDrafts = new AlertBotDrafts(store, support, localTelegram as any);
     const blockerStarted = deferred<void>();
-    const blockerAnswer = deferred<{ text: string; sessionId: string | null }>();
+    const blockerAnswer = deferred<{ text: string; costUsd: number; tools: string[] }>();
     const ai = {
       answer: jest.fn()
         .mockImplementationOnce(async () => {
           blockerStarted.resolve(undefined);
           return blockerAnswer.promise;
         })
-        .mockResolvedValueOnce({ text: 'ответ из черновика', sessionId: null }),
+        .mockResolvedValueOnce({ text: 'ответ из черновика', costUsd: 0, tools: [] }),
     };
     const status = {
       begin: jest.fn().mockResolvedValue('status'),
       typing: jest.fn().mockResolvedValue('typing'),
       end: jest.fn().mockResolvedValue(undefined),
     };
-    const chat = { begin: jest.fn(), end: jest.fn().mockResolvedValue(undefined) };
+    const chat = { beginStream: jest.fn(), endStream: jest.fn() };
     const turns = new AlertBotTurns(store, ai as any, localTelegram as any, status as any, chat as any, support);
     const service = new AlertBotService(
       { resolveTelegram: jest.fn().mockResolvedValue({ userId: 'u-admin', isAdmin: true }) } as any,
@@ -406,7 +406,7 @@ maybe('callback черновика с lease против PostgreSQL', () => {
         expect(ai.answer).toHaveBeenCalledTimes(1);
       }
     } finally {
-      blockerAnswer.resolve({ text: 'ответ блокирующего вопроса', sessionId: null });
+      blockerAnswer.resolve({ text: 'ответ блокирующего вопроса', costUsd: 0, tools: [] });
       await blockerTurn;
       await Promise.all(callbacks);
       await turns.idle();
