@@ -525,6 +525,23 @@ Synthetic-раннер шлёт отчёты на `SYNTHETIC_PUSH_URL` — на 
 (сценарий `site_reachable`). 23.10.2026 прокси лёг, и отчёты о его падении
 ушли в тот же мёртвый прокси.
 
+### Ответы бота алертов
+
+`@linkeon_alert_bot` принимает вопросы только от админов Linkeon (Telegram привязан в профиле): в личке и в группах из `TELEGRAM_CHAT_ID`. В группе — `/ask@… вопрос` или реплай на сообщение бота. `/status` работает без модели; реплай на эскалацию — черновик с кнопками «Отправить пользователю», «Это вопрос боту», «Отмена»; `/close #…` закрывает тикет.
+
+Вход включается только при `ALERT_BOT_WEBHOOK_URL` + `ALERT_BOT_WEBHOOK_SECRET`. При старте бот не перезаписывает чужой webhook. Модель — локальный Claude CLI с `noFallback`, встроенные инструменты выключены. Пять read-only MCP tools (`alerts`, `health`, `logs`, `stats`, `tickets`) живут на отдельном `127.0.0.1:ALERT_BOT_OPS_PORT`, снаружи недоступны; телефоны, id, почта и секреты маскируются. Ответ пользователю модель отправить не может.
+
+| ENV | Дефолт | Что делает |
+|-----|--------|------------|
+| `ALERT_BOT_WEBHOOK_URL` | пусто | Полный HTTPS-адрес webhook; без него вход выключен |
+| `ALERT_BOT_WEBHOOK_SECRET` | пусто | Секрет заголовка Telegram; без него вход выключен |
+| `ALERT_BOT_MODEL` | `CHAT_MODEL` | Модель ответов |
+| `ALERT_BOT_RATE_PER_HOUR` | 30 | Вопросов в час на админа |
+| `ALERT_BOT_TIMEOUT_MS` | 180000 | Потолок хода CLI |
+| `ALERT_BOT_OPS_PORT` | 3091 | Loopback-порт read-only MCP |
+
+Ходы — `alert_bot_turns` (90 дней), апдейты — `alert_bot_updates` (7 дней), черновики — `alert_bot_ticket_drafts` (30 дней), отправленные алерты — `alert_messages` (30 дней). Деплой ждёт активные ходы через общий `activeStreams`. Если модель недоступна, бот отвечает видом сбоя и `/status`.
+
 ### Misc
 - `POST /webhook/imagegen` — генерация изображений (заглушка)
 - `POST /webhook/scan-document` — сканирование документа (заглушка)
