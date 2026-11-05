@@ -135,7 +135,9 @@ export class AlertBotService {
       messageId: message.message_id,
     });
     if (result.question) {
-      const reserved = result.draftId !== undefined && result.claimVersion !== undefined;
+      const reserved = result.draftId !== undefined
+        && result.claimVersion !== undefined
+        && result.guardToken !== undefined;
       let admission: Awaited<ReturnType<AlertBotTurns['enqueue']>>;
       try {
         admission = await this.turns.enqueue({
@@ -149,8 +151,8 @@ export class AlertBotService {
           ticketId: result.ticketId || null,
         }, reserved ? { draftId: result.draftId!, claimVersion: result.claimVersion! } : undefined);
         if (reserved && admission !== 'accepted') {
-          // Сначала fenced release в БД, затем локальный ID: новый callback не
-          // должен проскочить между освобождением Set и release reservation.
+          // Сначала все попытки fenced release в БД; локальный guard снимает
+          // только outer finally с owner token этой reservation.
           await this.drafts.releaseAsk(result.draftId!, result.claimVersion!);
         }
       } catch (error) {
@@ -163,7 +165,7 @@ export class AlertBotService {
         }
         throw error;
       } finally {
-        if (reserved) this.drafts.finishAsk(result.draftId!);
+        if (reserved) this.drafts.finishAsk(result.draftId!, result.guardToken!);
       }
     }
   }

@@ -31,6 +31,7 @@ export interface DraftCallbackResult {
   ticketId?: string;
   draftId?: string;
   claimVersion?: number;
+  guardToken?: symbol;
 }
 
 function terminal(status: string): boolean {
@@ -44,7 +45,7 @@ function terminalPublishError(error: unknown): boolean {
 @Injectable()
 export class AlertBotDrafts {
   private readonly logger = new Logger(AlertBotDrafts.name);
-  private readonly activeQuestionDraftIds = new Set<string>();
+  private readonly activeQuestionDraftIds = new Map<string, symbol>();
 
   constructor(
     private readonly store: AlertBotStore,
@@ -109,22 +110,20 @@ export class AlertBotDrafts {
     await this.finalize(id, 'asking', 'asked', version);
   }
 
-  finishAsk(id: string): void {
-    this.activeQuestionDraftIds.delete(id);
+  finishAsk(id: string, guardToken: symbol): void {
+    if (this.activeQuestionDraftIds.get(id) === guardToken) {
+      this.activeQuestionDraftIds.delete(id);
+    }
   }
 
   async releaseAsk(id: string, version: number): Promise<void> {
-    try {
-      await this.store.releaseDraft(id, 'asking', version);
-    } finally {
-      this.finishAsk(id);
-    }
+    await this.store.releaseDraft(id, 'asking', version);
   }
 
   async handleCallback(input: DraftCallbackInput): Promise<DraftCallbackResult> {
     let answer = 'Готово';
     let activeClaim: { action: AlertBotDraftClaim; version: number } | null = null;
-    let ownsQuestionGuard = false;
+    let questionGuardToken: symbol | null = null;
     let keepQuestionGuard = false;
     try {
       if (input.action === 'ask') {
@@ -132,10 +131,10 @@ export class AlertBotDrafts {
           answer = 'Черновик уже обрабатывается';
           return {};
         }
-        // Добавляем синхронно, до первого await: повторный callback не должен
-        // заново reclaim'ить asking, пока исходный ход ждёт в локальной очереди.
-        this.activeQuestionDraftIds.add(input.draftId);
-        ownsQuestionGuard = true;
+        // Токен добавляется синхронно, до первого await. Только его владелец
+        // может снять guard после завершения reservation.
+        questionGuardToken = Symbol();
+        this.activeQuestionDraftIds.set(input.draftId, questionGuardToken);
       }
       const draft = await this.store.getDraft(input.draftId);
       if (!draft || String(draft.chatId) !== String(input.chatId)) {
@@ -198,6 +197,7 @@ export class AlertBotDrafts {
           ticketId: draft.ticketId,
           draftId: draft.id,
           claimVersion: activeClaim.version,
+          guardToken: questionGuardToken!,
         };
       }
 
@@ -253,8 +253,8 @@ export class AlertBotDrafts {
       answer = 'Не удалось обработать черновик';
       return {};
     } finally {
-      if (ownsQuestionGuard && !keepQuestionGuard) {
-        this.activeQuestionDraftIds.delete(input.draftId);
+      if (questionGuardToken && !keepQuestionGuard) {
+        this.finishAsk(input.draftId, questionGuardToken);
       }
       // Ошибка ack не отменяет уже полученный результат (особенно question у /ask).
       try {
