@@ -226,8 +226,9 @@ describe('черновики ответов в тикет', () => {
       .mockRejectedValueOnce(new Error('uncertain post-commit failure'))
       .mockResolvedValueOnce(undefined);
 
-    await drafts.handleCallback(callback({ callbackId: 'first' }));
-    await drafts.handleCallback(callback({ callbackId: 'second' }));
+    await expect(drafts.handleCallback(callback({ callbackId: 'first' })))
+      .rejects.toMatchObject({ kind: 'draft_retry' });
+    await expect(drafts.handleCallback(callback({ callbackId: 'second' }))).resolves.toEqual({});
 
     expect(store.claimDraft).toHaveBeenCalledTimes(2);
     expect(store.releaseDraft).toHaveBeenCalledWith(DRAFT, 'sending', 1);
@@ -239,8 +240,8 @@ describe('черновики ответов в тикет', () => {
     expect(support.postOwnerReplyFromTelegram.mock.calls[1][6]).toBe(DRAFT);
     expect(support.postOwnerReplyFromTelegram.mock.calls[0][7]).toBe(1);
     expect(support.postOwnerReplyFromTelegram.mock.calls[1][7]).toBe(2);
-    expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(2);
-    expect(telegram.answerCallbackQuery.mock.calls[1][1]).toBe('Отправлено');
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('second', 'Отправлено');
   });
 
   it('после сбоя releaseDraft просроченный lease можно reclaim и завершить sent', async () => {
@@ -258,14 +259,15 @@ describe('черновики ответов в тикет', () => {
       .mockResolvedValueOnce({ status: 'claimed', version: 1 })
       .mockResolvedValueOnce({ status: 'claimed', version: 2 });
 
-    await drafts.handleCallback(callback({ callbackId: 'first' }));
-    await drafts.handleCallback(callback({ callbackId: 'second' }));
+    await expect(drafts.handleCallback(callback({ callbackId: 'first' })))
+      .rejects.toMatchObject({ kind: 'draft_retry' });
+    await expect(drafts.handleCallback(callback({ callbackId: 'second' }))).resolves.toEqual({});
 
     expect(store.releaseDraft).toHaveBeenCalledTimes(1);
     expect(store.claimDraft).toHaveBeenCalledTimes(2);
     expect(support.postOwnerReplyFromTelegram).toHaveBeenCalledTimes(2);
     expect(store.finalizeDraft).toHaveBeenCalledWith(DRAFT, 'sending', 'sent', 2);
-    expect(telegram.answerCallbackQuery.mock.calls[1][1]).toBe('Отправлено');
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('second', 'Отправлено');
   });
 
   it('сбой edit после успешной публикации не откатывает sent и подтверждает отправку', async () => {
@@ -289,7 +291,7 @@ describe('черновики ответов в тикет', () => {
       guardToken: expect.any(Symbol),
     }));
     else expect(result).toEqual({});
-    expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(action === 'ask' ? 0 : 1);
     if (action === 'ask') {
       expect(store.finalizeDraft).not.toHaveBeenCalled();
     } else {
@@ -367,8 +369,12 @@ describe('черновики ответов в тикет', () => {
         .mockResolvedValueOnce({ status: 'claimed', version: 2 });
     }
 
-    await expect(drafts.handleCallback(callback({ action: 'ask', callbackId: 'first' })))
-      .resolves.toEqual({});
+    const first = drafts.handleCallback(callback({ action: 'ask', callbackId: 'first' }));
+    if (failure === 'read') {
+      await expect(first).rejects.toMatchObject({ kind: 'draft_retry' });
+    } else {
+      await expect(first).resolves.toEqual({});
+    }
     const retry = await drafts.handleCallback(callback({ action: 'ask', callbackId: 'retry' }));
 
     expect(retry).toEqual(expect.objectContaining({
@@ -509,7 +515,7 @@ describe('черновики ответов в тикет', () => {
   it('при ошибке публикации callback получает ровно один безопасный ответ', async () => {
     support.postOwnerReplyFromTelegram.mockRejectedValue(new Error('секрет из ошибки'));
 
-    await expect(drafts.handleCallback(callback())).resolves.toEqual({});
+    await expect(drafts.handleCallback(callback())).rejects.toMatchObject({ kind: 'draft_retry' });
 
     expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
     expect(telegram.answerCallbackQuery.mock.calls[0][1]).not.toContain('секрет');
@@ -534,7 +540,7 @@ describe('черновики ответов в тикет', () => {
   it('при ошибке чтения черновика callback всё равно получает ровно один ответ', async () => {
     store.getDraft.mockRejectedValue(new Error('database down'));
 
-    await expect(drafts.handleCallback(callback())).resolves.toEqual({});
+    await expect(drafts.handleCallback(callback())).rejects.toMatchObject({ kind: 'draft_retry' });
 
     expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
     expect(store.claimDraft).not.toHaveBeenCalled();

@@ -223,9 +223,9 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
 
       expect(telegram.sendMessage).toHaveBeenCalledTimes(2);
       expect(telegram.sendMessage.mock.calls[1][1]).toContain('Лимит');
-      expect((await pool.query(
+      expect(Number((await pool.query(
         'SELECT answer_message_id FROM alert_bot_turns WHERE update_id = $1', [update.update_id],
-      )).rows[0].answer_message_id).toBe(950);
+      )).rows[0].answer_message_id)).toBe(950);
 
       await pool.query(
         `UPDATE alert_bot_updates

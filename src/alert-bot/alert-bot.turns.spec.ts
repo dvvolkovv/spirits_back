@@ -53,6 +53,13 @@ describe('AlertBotTurns', () => {
       recordSystemTurn: jest.fn().mockResolvedValue('system-turn-1'),
       attachAnswerMessage: jest.fn().mockResolvedValue(undefined),
       attachAnswerMessages: jest.fn().mockResolvedValue(undefined),
+      markPlaceholderStarted: jest.fn().mockResolvedValue(undefined),
+      deferPlaceholder: jest.fn().mockResolvedValue(undefined),
+      attachPlaceholder: jest.fn().mockResolvedValue(undefined),
+      markModelStarted: jest.fn().mockResolvedValue(undefined),
+      markDeliveryStarted: jest.fn().mockResolvedValue(undefined),
+      deferDelivery: jest.fn().mockResolvedValue(undefined),
+      completeDelivery: jest.fn().mockResolvedValue(undefined),
       finishTurn: jest.fn().mockResolvedValue(true),
       turnChain: jest.fn().mockResolvedValue([]),
       recentTurns: jest.fn().mockResolvedValue([]),
@@ -65,7 +72,10 @@ describe('AlertBotTurns', () => {
     telegram = {
       sendMessage: jest.fn().mockResolvedValue({ message_id: 901 }),
       editMessageText: jest.fn().mockResolvedValue(undefined),
-      sendChunks: jest.fn().mockResolvedValue([901]),
+      sendChunks: jest.fn().mockImplementation(async (...args: any[]) => {
+        await args[5]?.([901]);
+        return [901];
+      }),
     };
     ai = {
       answer: jest.fn().mockResolvedValue({ text: 'Всё спокойно', costUsd: 0.02, tools: ['health'] }),
@@ -135,6 +145,10 @@ describe('AlertBotTurns', () => {
       status: 'ok', answer: text, tools: ['health', 'tickets'], costUsd: 0.02,
       durationMs: expect.any(Number),
     }));
+    expect(store.finishTurn.mock.invocationCallOrder[0]).toBeLessThan(
+      telegram.sendChunks.mock.invocationCallOrder[0],
+    );
+    expect(store.completeDelivery).toHaveBeenCalledWith('turn-1', [901, 902, 903]);
   });
 
   it('ищет не более десяти уникальных ticket-prefix candidates за ответ', async () => {
@@ -160,8 +174,9 @@ describe('AlertBotTurns', () => {
     await turns.enqueue(question());
 
     const fallback = `Модель недоступна: ${kind}.\n\nСводка без модели`;
-    expect(telegram.editMessageText).toHaveBeenCalledWith('100', 901, fallback);
-    expect(telegram.sendChunks).not.toHaveBeenCalled();
+    expect(telegram.sendChunks).toHaveBeenCalledWith(
+      '100', fallback, 901, 300, undefined, expect.any(Function), [],
+    );
     expect(store.finishTurn).toHaveBeenCalledTimes(1);
     expect(store.finishTurn).toHaveBeenCalledWith('turn-1', expect.objectContaining({
       status: expectedStatus, answer: fallback, errorKind: kind, durationMs: expect.any(Number),
@@ -181,8 +196,9 @@ describe('AlertBotTurns', () => {
     await turns.enqueue(question());
 
     expect(status.summary).toHaveBeenCalledTimes(1);
-    expect(telegram.editMessageText).toHaveBeenCalledWith(
-      '100', 901, 'Модель недоступна: other.\n\nСводка без модели',
+    expect(telegram.sendChunks).toHaveBeenCalledWith(
+      '100', 'Модель недоступна: other.\n\nСводка без модели',
+      901, 300, undefined, expect.any(Function), [],
     );
     expect(store.finishTurn).toHaveBeenCalledWith('turn-1', expect.objectContaining({
       status: 'model_down', errorKind: 'other',
@@ -197,13 +213,13 @@ describe('AlertBotTurns', () => {
   ])('неизвестная ошибка ai.answer %# не маскируется под model_down', async (errorProps) => {
     ai.answer.mockRejectedValue(Object.assign(new Error('RAW-UNEXPECTED-AI'), errorProps));
 
-    await turns.enqueue(question());
+    await expect(turns.enqueue(question())).rejects.toMatchObject({ kind: 'model_outcome_unknown' });
+    await expect(turns.enqueue(question({ updateId: 2 }))).rejects.toMatchObject({ kind: 'model_outcome_unknown' });
 
     expect(status.summary).not.toHaveBeenCalled();
-    expect(telegram.editMessageText).toHaveBeenCalledWith('100', 901, 'Не получилось ответить, попробуйте ещё раз');
-    expect(store.finishTurn).toHaveBeenCalledTimes(1);
-    expect(store.finishTurn).toHaveBeenCalledWith('turn-1', expect.objectContaining({ status: 'error' }));
-    expect(chat.endStream).toHaveBeenCalledTimes(1);
+    expect(telegram.editMessageText).not.toHaveBeenCalled();
+    expect(store.finishTurn).not.toHaveBeenCalled();
+    expect(chat.endStream).toHaveBeenCalledTimes(2);
   });
 
   it('держит один running и два waiting на чат, четвёртый получает busy без модели', async () => {
@@ -367,70 +383,70 @@ describe('AlertBotTurns', () => {
     expect(ai.answer).toHaveBeenCalledWith(expect.objectContaining({ history: [] }));
   });
 
-  it('сбой attach после доставки не заменяет видимый ответ и не ломает отправку', async () => {
+  it('сбой journal после доставки не перезаписывает видимый ответ и требует безопасного retry', async () => {
     store.attachAnswerMessages
-      .mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(Object.assign(new Error('RAW-ATTACH-SECRET'), { kind: 'db_down' }));
     telegram.sendChunks.mockImplementation(async (...args: any[]) => {
       await args[5]?.([901]);
       return [901];
     });
 
-    await expect(turns.enqueue(question())).resolves.toBe('accepted');
+    await expect(turns.enqueue(question())).rejects.toMatchObject({ kind: 'answer_journal_failed' });
 
     expect(telegram.sendChunks).toHaveBeenCalledTimes(1);
     expect(telegram.editMessageText).not.toHaveBeenCalledWith(
       '100', 901, 'Не получилось ответить, попробуйте ещё раз',
     );
     expect(store.finishTurn).toHaveBeenCalledWith('turn-1', expect.objectContaining({ status: 'ok' }));
+    expect(store.completeDelivery).not.toHaveBeenCalled();
+    expect(store.deferDelivery).not.toHaveBeenCalled();
     expect(JSON.stringify(logger.error.mock.calls)).not.toContain('RAW-ATTACH-SECRET');
   });
 
-  it('сбой finish после доставки не заменяет видимый ответ generic error', async () => {
+  it('сбой finish до доставки не показывает непроверенный ответ и остаётся retryable', async () => {
     store.finishTurn.mockRejectedValueOnce(Object.assign(new Error('RAW-FINISH-SECRET'), { kind: 'db_down' }));
-    telegram.sendChunks.mockImplementation(async (...args: any[]) => {
-      await args[5]?.([901]);
-      return [901];
-    });
 
-    await expect(turns.enqueue(question())).resolves.toBe('accepted');
+    await expect(turns.enqueue(question())).rejects.toMatchObject({ kind: 'db_down' });
 
+    expect(telegram.sendChunks).not.toHaveBeenCalled();
     expect(telegram.editMessageText).not.toHaveBeenCalledWith(
       '100', 901, 'Не получилось ответить, попробуйте ещё раз',
     );
     expect(JSON.stringify(logger.error.mock.calls)).not.toContain('RAW-FINISH-SECRET');
   });
 
-  it('частично доставленные chunks сохраняются и не перезаписываются generic error', async () => {
+  it('частично доставленные chunks сохраняются и retry не перезаписывает видимый ответ', async () => {
     telegram.sendChunks.mockImplementation(async (...args: any[]) => {
       await args[5]?.([901]);
       await args[5]?.([901, 902]);
       throw Object.assign(new Error('RAW-CONTINUATION-SECRET'), { kind: 'send_failed' });
     });
 
-    await expect(turns.enqueue(question())).resolves.toBe('accepted');
+    await expect(turns.enqueue(question())).rejects.toMatchObject({ kind: 'send_failed' });
 
     expect(store.attachAnswerMessages).toHaveBeenCalledWith('turn-1', [901, 902]);
     expect(telegram.editMessageText).not.toHaveBeenCalled();
-    expect(telegram.sendMessage).toHaveBeenCalledWith(
-      '100', 'Ответ доставлен не полностью, попробуйте ещё раз', 300,
-    );
-    expect(store.finishTurn).toHaveBeenCalledWith('turn-1', expect.objectContaining({ status: 'error' }));
+    expect(telegram.sendMessage).toHaveBeenCalledTimes(1);
+    expect(store.finishTurn).toHaveBeenCalledWith('turn-1', expect.objectContaining({ status: 'ok' }));
+    expect(store.deferDelivery).toHaveBeenCalledWith('turn-1');
+    expect(store.completeDelivery).not.toHaveBeenCalled();
     expect(JSON.stringify(logger.error.mock.calls)).not.toContain('RAW-CONTINUATION-SECRET');
   });
 
-  it('неожиданная ошибка не раскрывает сырые данные, завершается один раз и освобождает очередь', async () => {
+  it('неожиданная ошибка не раскрывает сырые данные, сохраняет ответ и освобождает очередь', async () => {
     ai.answer.mockResolvedValue({ text: 'ОТВЕТ-СЕКРЕТ', costUsd: 0.01, tools: [] });
     telegram.sendChunks.mockRejectedValueOnce(Object.assign(new Error('RAW-SEND-SECRET'), { kind: 'send_failed' }));
 
-    await turns.enqueue(question({ question: 'ВОПРОС-СЕКРЕТ' }));
-    await turns.enqueue(question({ updateId: 2 }));
+    await expect(turns.enqueue(question({ question: 'ВОПРОС-СЕКРЕТ' })))
+      .rejects.toMatchObject({ kind: 'send_failed' });
+    await expect(turns.enqueue(question({ updateId: 2 }))).resolves.toBe('accepted');
 
     expect(ai.answer).toHaveBeenCalledTimes(2);
-    expect(telegram.editMessageText).toHaveBeenCalledWith('100', 901, 'Не получилось ответить, попробуйте ещё раз');
+    expect(telegram.editMessageText).not.toHaveBeenCalled();
     expect(store.finishTurn).toHaveBeenNthCalledWith(1, 'turn-1', expect.objectContaining({
-      status: 'error', errorKind: 'send_failed', durationMs: expect.any(Number),
+      status: 'ok', answer: 'ОТВЕТ-СЕКРЕТ', durationMs: expect.any(Number),
     }));
+    expect(store.deferDelivery).toHaveBeenCalledWith('turn-1');
     expect(chat.endStream).toHaveBeenCalledTimes(2);
     const logs = JSON.stringify(logger.error.mock.calls);
     expect(logs).not.toContain('RAW-SEND-SECRET');
@@ -438,19 +454,20 @@ describe('AlertBotTurns', () => {
     expect(logs).not.toContain('ОТВЕТ-СЕКРЕТ');
   });
 
-  it('finishTurn=false после interrupt не вызывает повторную отправку или overwrite', async () => {
+  it('finishTurn=false после interrupt не вызывает доставку или overwrite', async () => {
     store.finishTurn.mockResolvedValue(false);
 
-    await turns.enqueue(question());
+    await expect(turns.enqueue(question())).rejects.toMatchObject({ kind: 'turn_fenced' });
 
-    expect(telegram.sendChunks).toHaveBeenCalledTimes(1);
+    expect(telegram.sendChunks).not.toHaveBeenCalled();
     expect(telegram.sendMessage).toHaveBeenCalledTimes(1);
     expect(telegram.editMessageText).not.toHaveBeenCalled();
     expect(store.finishTurn).toHaveBeenCalledTimes(1);
+    expect(store.completeDelivery).not.toHaveBeenCalled();
     expect(chat.endStream).toHaveBeenCalledTimes(1);
     const logs = JSON.stringify([...logger.error.mock.calls, ...logger.debug.mock.calls]);
     expect(logs).not.toContain('status=ok kind=done');
-    expect(logs).toContain('status=ignored kind=fenced');
+    expect(logs).toContain('status=error kind=turn_fenced');
   });
 
   it('queued второй ход уже учитывается в activeStreams и освобождает drain после завершения', async () => {
