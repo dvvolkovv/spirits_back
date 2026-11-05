@@ -246,6 +246,7 @@ export class AlertBotDrafts {
       }
       return {};
     } catch {
+      answer = 'Не удалось обработать черновик';
       if (activeClaim) {
         // Versioned release не может очистить более новый claim. Повторный publish
         // безопасен: draftId идемпотентен, а stale version отклоняется до insert.

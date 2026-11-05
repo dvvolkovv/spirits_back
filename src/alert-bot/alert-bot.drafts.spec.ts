@@ -518,6 +518,7 @@ describe('черновики ответов в тикет', () => {
     await expect(drafts.handleCallback(callback())).rejects.toMatchObject({ kind: 'draft_retry' });
 
     expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('callback-1', 'Не удалось обработать черновик');
     expect(telegram.answerCallbackQuery.mock.calls[0][1]).not.toContain('секрет');
     expect(telegram.editMessageText).not.toHaveBeenCalled();
   });

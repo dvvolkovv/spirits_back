@@ -248,7 +248,7 @@ maybe('callback черновика с lease против PostgreSQL', () => {
     );
     expect(effects.rows[0]).toEqual({ messages: 0, events: 0 });
     expect(email).not.toHaveBeenCalled();
-    expect(telegram.answerCallbackQuery).not.toHaveBeenCalledWith('old-send', expect.anything());
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('old-send', 'Не удалось обработать черновик');
     expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('new-cancel', 'Отменено');
   });
 
