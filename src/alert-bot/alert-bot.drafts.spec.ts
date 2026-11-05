@@ -89,6 +89,7 @@ describe('черновики ответов в тикет', () => {
   });
 
   afterEach(() => {
+    jest.resetAllMocks();
     (drafts as any).activeQuestionDraftIds?.clear();
   });
 
