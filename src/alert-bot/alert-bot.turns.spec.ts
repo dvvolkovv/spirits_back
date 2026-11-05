@@ -48,7 +48,9 @@ describe('AlertBotTurns', () => {
     store = {
       tryCreateTurn: jest.fn().mockResolvedValue('turn-1'),
       createTurn: jest.fn().mockResolvedValue('system-turn-1'),
+      recordSystemTurn: jest.fn().mockResolvedValue('system-turn-1'),
       attachAnswerMessage: jest.fn().mockResolvedValue(undefined),
+      attachAnswerMessages: jest.fn().mockResolvedValue(undefined),
       finishTurn: jest.fn().mockResolvedValue(true),
       turnChain: jest.fn().mockResolvedValue([]),
       recentTurns: jest.fn().mockResolvedValue([]),
@@ -57,7 +59,7 @@ describe('AlertBotTurns', () => {
     telegram = {
       sendMessage: jest.fn().mockResolvedValue({ message_id: 901 }),
       editMessageText: jest.fn().mockResolvedValue(undefined),
-      sendChunks: jest.fn().mockResolvedValue(undefined),
+      sendChunks: jest.fn().mockResolvedValue([901]),
     };
     ai = {
       answer: jest.fn().mockResolvedValue({ text: 'Всё спокойно', costUsd: 0.02, tools: ['health'] }),
@@ -89,6 +91,7 @@ describe('AlertBotTurns', () => {
   it('сохраняет placeholder, отправляет ответ с реальными тикетами и завершает ход с метриками', async () => {
     const text = 'Смотри #11111111 и #22222222; #33333333 не найден, зато есть #44444444. Повтор #11111111.';
     ai.answer.mockResolvedValue({ text, costUsd: 0.02, tools: ['health', 'tickets'] });
+    telegram.sendChunks.mockResolvedValue([901, 902, 903]);
     support.findTicketByPrefix.mockImplementation(async (prefix: string) => {
       if (prefix === '11111111') return { id: TICKET_1 };
       if (prefix === '22222222') return { id: TICKET_2 };
@@ -100,7 +103,8 @@ describe('AlertBotTurns', () => {
     await turns.idle();
 
     expect(telegram.sendMessage).toHaveBeenCalledWith('100', '🔎 Смотрю…', 300);
-    expect(store.attachAnswerMessage).toHaveBeenCalledWith('turn-1', 901);
+    expect(store.attachAnswerMessage).not.toHaveBeenCalled();
+    expect(store.attachAnswerMessages).toHaveBeenCalledWith('turn-1', [901, 902, 903]);
     expect(chat.beginStream).toHaveBeenCalledTimes(1);
     expect(chat.endStream).toHaveBeenCalledTimes(1);
     expect(telegram.sendChunks).toHaveBeenCalledTimes(1);
@@ -125,8 +129,10 @@ describe('AlertBotTurns', () => {
 
   it.each([
     ['auth', 'model_down'],
+    ['limit', 'model_down'],
+    ['overloaded', 'model_down'],
     ['timeout', 'timeout'],
-  ])('ошибка модели %s даёт безопасный ответ и статус %s', async (kind, expectedStatus) => {
+  ])('известная ошибка модели %s даёт безопасный ответ и статус %s', async (kind, expectedStatus) => {
     ai.answer.mockRejectedValue(Object.assign(new Error('RAW-MODEL-SECRET'), { kind }));
     status.summary.mockResolvedValue('Сводка без модели');
 
@@ -140,6 +146,22 @@ describe('AlertBotTurns', () => {
       status: expectedStatus, answer: fallback, errorKind: kind, durationMs: expect.any(Number),
     }));
     expect(chat.beginStream).toHaveBeenCalledTimes(1);
+    expect(chat.endStream).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [{ kind: 'other' }],
+    [{ kind: 'unknown' }],
+    [{}],
+  ])('неизвестная ошибка ai.answer %# не маскируется под model_down', async (errorProps) => {
+    ai.answer.mockRejectedValue(Object.assign(new Error('RAW-UNEXPECTED-AI'), errorProps));
+
+    await turns.enqueue(question());
+
+    expect(status.summary).not.toHaveBeenCalled();
+    expect(telegram.editMessageText).toHaveBeenCalledWith('100', 901, 'Не получилось ответить, попробуйте ещё раз');
+    expect(store.finishTurn).toHaveBeenCalledTimes(1);
+    expect(store.finishTurn).toHaveBeenCalledWith('turn-1', expect.objectContaining({ status: 'error' }));
     expect(chat.endStream).toHaveBeenCalledTimes(1);
   });
 
@@ -161,8 +183,9 @@ describe('AlertBotTurns', () => {
 
     expect(ai.answer).toHaveBeenCalledTimes(1);
     expect(store.tryCreateTurn).toHaveBeenCalledTimes(1);
-    expect(store.createTurn).toHaveBeenCalledWith(expect.objectContaining({ updateId: 4 }));
-    expect(store.finishTurn).toHaveBeenCalledWith('system-turn-1', expect.objectContaining({ status: 'busy' }));
+    expect(store.createTurn).not.toHaveBeenCalled();
+    expect(store.recordSystemTurn).toHaveBeenCalledWith(expect.objectContaining({ updateId: 4 }), 'busy');
+    expect(store.finishTurn).not.toHaveBeenCalled();
     expect(telegram.sendMessage).toHaveBeenCalledWith('100', 'Занят, спросите через минуту', 304);
 
     first.resolve({ text: 'первый', costUsd: 0.01, tools: [] });
@@ -181,12 +204,43 @@ describe('AlertBotTurns', () => {
 
     expect(store.tryCreateTurn).toHaveBeenCalledWith(question(), 7);
     expect(store.countRecentTurns).not.toHaveBeenCalled();
-    expect(store.createTurn).toHaveBeenCalledWith(question());
-    expect(store.finishTurn).toHaveBeenCalledWith('limited-1', expect.objectContaining({ status: 'rate_limited' }));
+    expect(store.createTurn).not.toHaveBeenCalled();
+    expect(store.recordSystemTurn).toHaveBeenCalledWith(question(), 'rate_limited');
+    expect(store.finishTurn).not.toHaveBeenCalled();
     expect(telegram.sendMessage).toHaveBeenCalledWith('100', 'Лимит вопросов в час исчерпан', 300);
     expect(ai.answer).not.toHaveBeenCalled();
     expect(chat.beginStream).not.toHaveBeenCalled();
     delete process.env.ALERT_BOT_RATE_PER_HOUR;
+  });
+
+  it('system turn не зависит от failed finish и не оставляет in_progress', async () => {
+    store.tryCreateTurn.mockResolvedValue(null);
+    store.finishTurn.mockRejectedValue(new Error('finish failed'));
+
+    await turns.enqueue(question());
+
+    expect(store.recordSystemTurn).toHaveBeenCalledWith(question(), 'rate_limited');
+    expect(store.createTurn).not.toHaveBeenCalled();
+    expect(store.finishTurn).not.toHaveBeenCalled();
+    expect(telegram.sendMessage).toHaveBeenCalledWith('100', 'Лимит вопросов в час исчерпан', 300);
+  });
+
+  it('разные чаты выполняются независимыми очередями', async () => {
+    const first = deferred<{ text: string; costUsd: number; tools: string[] }>();
+    const started = deferred();
+    ai.answer.mockImplementationOnce(() => {
+      started.resolve();
+      return first.promise;
+    });
+
+    const blocked = turns.enqueue(question({ chatId: 'chat-a' }));
+    await started.promise;
+    await turns.enqueue(question({ chatId: 'chat-b', updateId: 2 }));
+
+    expect(ai.answer).toHaveBeenCalledTimes(2);
+    expect(store.finishTurn).toHaveBeenCalledWith('turn-1', expect.objectContaining({ status: 'ok' }));
+    first.resolve({ text: 'первый чат', costUsd: 0.01, tools: [] });
+    await blocked;
   });
 
   it('для follow-up берёт turnChain, а не unrelated recentTurns', async () => {

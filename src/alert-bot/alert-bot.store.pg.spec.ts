@@ -46,6 +46,31 @@ maybe('хранилище бота алертов против PostgreSQL', () =
     expect(await store.countRecentTurns('u-admin')).toBe(1);
     expect((await store.recentTurns('1', 3, 30))[0].answer).toBe('ничего');
   });
+  it('сохраняет первый и все continuation ID, reply ко второму chunk находит родителя', async () => {
+    const id = await store.createTurn({ updateId: 1050, chatId: 'chunks', tgUserId: '111', adminUserId: 'u-chunks', questionMessageId: 10, question: 'длинный ответ', privateChat: true });
+
+    await store.attachAnswerMessages(id, [20, 21, 22]);
+
+    expect((await store.findTurnByAnswer('chunks', 20))?.id).toBe(id);
+    expect((await store.findTurnByAnswer('chunks', 21))?.id).toBe(id);
+    expect((await store.findTurnByAnswer('chunks', 22))?.id).toBe(id);
+    const row = (await pool.query('SELECT answer_message_id, answer_message_ids FROM alert_bot_turns WHERE id = $1', [id])).rows[0];
+    expect(row.answer_message_id).toBe('20');
+    expect(row.answer_message_ids).toEqual([20, 21, 22]);
+  });
+  it('system turns сразу финальны, не тратят admission и не принимают поздний finish', async () => {
+    const input = { updateId: 1060, chatId: 'system', tgUserId: '111', adminUserId: 'u-system', questionMessageId: 10, question: 'системный отказ', privateChat: true };
+    const busyId = await store.recordSystemTurn(input, 'busy');
+    const limitedId = await store.recordSystemTurn({ ...input, updateId: 1061 }, 'rate_limited');
+
+    const rows = (await pool.query('SELECT id, status, finished_at FROM alert_bot_turns WHERE id = ANY($1::uuid[])', [[busyId, limitedId]])).rows;
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row.status).sort()).toEqual(['busy', 'rate_limited']);
+    expect(rows.every((row) => row.finished_at instanceof Date)).toBe(true);
+    expect(await store.countRecentTurns('u-system')).toBe(0);
+    expect(await store.finishTurn(busyId, { status: 'ok' })).toBe(false);
+    expect(await store.tryCreateTurn({ ...input, updateId: 1062, question: 'первый настоящий ход' }, 1)).toEqual(expect.any(String));
+  });
   it('цепочка реплаев идёт по parentTurnId и ограничена тремя', async () => {
     const first = await store.createTurn({ updateId: 1101, chatId: '1', tgUserId: '111', adminUserId: 'u-admin', questionMessageId: 101, question: 'первый', privateChat: false });
     const second = await store.createTurn({ updateId: 1102, chatId: '1', tgUserId: '111', adminUserId: 'u-admin', questionMessageId: 102, question: 'второй', parentTurnId: first, privateChat: false });

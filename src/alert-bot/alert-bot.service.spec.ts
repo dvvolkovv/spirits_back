@@ -125,6 +125,14 @@ describe('AlertBotService', () => {
     expect(drafts.maybeDraft).not.toHaveBeenCalled();
   });
 
+  it('getMe кешируется между обновлениями', async () => {
+    await service.handleUpdate(update({ text: 'Первый' }, 1));
+    await service.handleUpdate(update({ text: 'Второй' }, 2));
+
+    expect(telegram.getMe).toHaveBeenCalledTimes(1);
+    expect(turns.enqueue).toHaveBeenCalledTimes(2);
+  });
+
   it('non-admin private получает отказ не чаще одного раза в час, без turn', async () => {
     access.resolveTelegram.mockResolvedValue({ userId: 'user-1', isAdmin: false });
 
@@ -155,6 +163,22 @@ describe('AlertBotService', () => {
     expect(access.resolveTelegram).toHaveBeenCalledTimes(1);
   });
 
+  it('group reply боту и @mention адресуют вопрос без лишней групповой истории', async () => {
+    store.findTurnByAnswer.mockResolvedValue({ id: 'parent-group' });
+    await service.handleUpdate(groupText('Продолжи', 1, {
+      reply_to_message: { ...botReply('Первый ответ'), chat: { id: -100123, type: 'supergroup' } },
+    }));
+    await service.handleUpdate(groupText('@linkeon_alert_bot Что с алертом?', 2));
+
+    expect(turns.enqueue).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      question: 'Продолжи', parentTurnId: 'parent-group', privateChat: false,
+    }));
+    expect(turns.enqueue).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      question: 'Что с алертом?', privateChat: false,
+    }));
+    expect(access.resolveTelegram).toHaveBeenCalledTimes(2);
+  });
+
   it('reply на ответ бота всегда follow-up с parentTurnId, без drafts и ticket lookup', async () => {
     store.findTurnByAnswer.mockResolvedValue({ id: 'parent-1' });
 
@@ -167,6 +191,20 @@ describe('AlertBotService', () => {
     expect(turns.enqueue).toHaveBeenCalledWith(expect.objectContaining({
       question: 'А подробнее?', parentTurnId: 'parent-1', replyText: 'Причина в тикете #11111111',
     }));
+    expect(drafts.maybeDraft).not.toHaveBeenCalled();
+    expect(support.findTicketByPrefix).not.toHaveBeenCalled();
+  });
+
+  it('reply ко второму chunk ответа сохраняет parentTurnId и не создаёт draft', async () => {
+    store.findTurnByAnswer.mockResolvedValue({ id: 'parent-chunks' });
+
+    await service.handleUpdate(update({
+      text: 'Поясни продолжение',
+      reply_to_message: botReply('Вторая часть с #11111111', 902),
+    }));
+
+    expect(store.findTurnByAnswer).toHaveBeenCalledWith('100', 902);
+    expect(turns.enqueue).toHaveBeenCalledWith(expect.objectContaining({ parentTurnId: 'parent-chunks' }));
     expect(drafts.maybeDraft).not.toHaveBeenCalled();
     expect(support.findTicketByPrefix).not.toHaveBeenCalled();
   });
@@ -200,6 +238,21 @@ describe('AlertBotService', () => {
       question: 'Разбери причину', ticketId: TICKET, replyText: 'Эскалация #11111111',
     }));
     expect(drafts.maybeDraft).not.toHaveBeenCalled();
+  });
+
+  it('reply без найденного тикета остаётся вопросом с replyText', async () => {
+    support.findTicketByPrefix.mockResolvedValue(null);
+
+    await service.handleUpdate(update({
+      text: 'Что это значит?',
+      reply_to_message: botReply('Эскалация #11111111'),
+    }));
+
+    expect(support.findTicketByPrefix).toHaveBeenCalledWith('11111111');
+    expect(drafts.maybeDraft).not.toHaveBeenCalled();
+    expect(turns.enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      question: 'Что это значит?', replyText: 'Эскалация #11111111',
+    }));
   });
 
   it('полный UUID в reply разрешается по первым восьми символам', async () => {
@@ -294,6 +347,17 @@ describe('AlertBotService', () => {
       updateId: 1, chatId: '100', adminUserId: 'admin-1', question: 'Текст черновика',
       questionMessageId: 900, privateChat: true, ticketId: TICKET,
     }));
+  });
+
+  it.each(['send', 'cancel'])('valid admin callback %s проходит через service в drafts', async (action) => {
+    drafts.handleCallback.mockResolvedValue({});
+
+    await service.handleUpdate(callback(`draft:${DRAFT}:${action}`));
+
+    expect(drafts.handleCallback).toHaveBeenCalledWith(expect.objectContaining({
+      callbackId: 'callback-1', adminUserId: 'admin-1', draftId: DRAFT, action,
+    }));
+    expect(turns.enqueue).not.toHaveBeenCalled();
   });
 
   it('wrong chat и non-admin callback получают refusal без действия', async () => {

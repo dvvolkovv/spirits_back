@@ -14,6 +14,26 @@ describe('Telegram бота алертов', () => {
   afterEach(() => {
     process.env = { ...originalEnv };
   });
+  it('sendChunks возвращает ID placeholder и всех continuation-сообщений', async () => {
+    let nextId = 11;
+    (axios.post as jest.Mock).mockImplementation(async (url: string) => ({
+      data: {
+        ok: true,
+        result: { message_id: url.endsWith('/editMessageText') ? 10 : nextId++ },
+      },
+    }));
+    const tg = new AlertBotTelegram();
+
+    await expect(tg.sendChunks('1', 'x'.repeat(9000), 10, 7)).resolves.toEqual([10, 11, 12]);
+  });
+
+  it('пустой ответ тоже возвращает ID первого сообщения', async () => {
+    (axios.post as jest.Mock).mockResolvedValue({ data: { ok: true, result: { message_id: 10 } } });
+    const tg = new AlertBotTelegram();
+
+    await expect(tg.sendChunks('1', '   ', 10, 7)).resolves.toEqual([10]);
+  });
+
   it('ответ — простой текст, реплай, без превью', async () => {
     (axios.post as jest.Mock).mockResolvedValue({ data: { ok: true, result: { message_id: 10 } } });
     const tg = new AlertBotTelegram();
