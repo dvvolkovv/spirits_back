@@ -1,7 +1,8 @@
 import * as http from 'http';
 import { Socket } from 'net';
+import { Inject } from '@nestjs/common';
 import { AlertBotAccess } from './alert-bot.access';
-import { alertBotOpsPort } from './alert-bot.config';
+import { ALERT_BOT_OPS_TOOLS, alertBotOpsPort } from './alert-bot.config';
 import { verifyOpsToken } from './alert-bot.ops-token';
 import { OpsContext, OpsToolHandler } from './alert-bot.types';
 
@@ -31,7 +32,7 @@ export class AlertBotOpsServer {
 
   constructor(
     private readonly access: AlertBotAccess,
-    private readonly tools: OpsToolHandler,
+    @Inject(ALERT_BOT_OPS_TOOLS) private readonly tools: OpsToolHandler,
     options: AlertBotOpsServerOptions = {},
   ) {
     this.toolTimeoutMs = options.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;

@@ -2,6 +2,7 @@ import * as crypto from 'crypto';
 import { telegramChatIds } from '../common/telegram-alert';
 
 export const ALERT_BOT_HANDLER = Symbol('ALERT_BOT_HANDLER');
+export const ALERT_BOT_OPS_TOOLS = Symbol('ALERT_BOT_OPS_TOOLS');
 export function alertBotEnabled(): boolean {
   return Boolean(process.env.ALERT_BOT_WEBHOOK_URL && process.env.ALERT_BOT_WEBHOOK_SECRET);
 }

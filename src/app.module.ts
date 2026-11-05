@@ -55,6 +55,7 @@ import { VoiceCallModule } from './voice-call/voice-call.module';
 import { MeetingModule } from './meeting/meeting.module';
 import { IntegrationsModule } from './integrations/integrations.module';
 import { GuestTrialModule } from './guest-trial/guest-trial.module';
+import { AlertBotModule } from './alert-bot/alert-bot.module';
 
 @Module({
   imports: [
@@ -114,6 +115,7 @@ import { GuestTrialModule } from './guest-trial/guest-trial.module';
     MeetingModule,
     IntegrationsModule,
     GuestTrialModule,
+    AlertBotModule,
   ],
 })
 export class AppModule {}
