@@ -297,12 +297,12 @@ export class AlertBotTurns {
     return this.notifySystem(turnId, 'busy', input);
   }
 
-  private async notifySystem(
+  private async notifySystem<T extends 'busy' | 'rate_limited'>(
     turnId: string,
-    status: 'busy' | 'rate_limited',
+    status: T,
     input: TurnInput,
     existing?: AlertBotTurn,
-  ): Promise<'busy' | 'rate_limited'> {
+  ): Promise<T> {
     if (existing && (existing.answerMessageId !== null || existing.answerMessageIds.length)) return status;
     if (existing?.placeholderStartedAt) throw new AlertBotRetryableError('notification_in_flight');
     await this.store.markPlaceholderStarted(turnId);
