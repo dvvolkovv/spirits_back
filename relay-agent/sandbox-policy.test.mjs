@@ -13,6 +13,7 @@ import {
 const FS_KEY = 'test_fs-key';
 const EXPECTED_ALLOWED_DOMAINS = [
   'example.com',
+  'my.linkeon.io',
   'pypi.org',
   'files.pythonhosted.org',
   'registry.npmjs.org',
