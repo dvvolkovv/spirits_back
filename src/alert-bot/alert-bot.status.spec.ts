@@ -5,6 +5,7 @@ jest.mock('@napi-rs/canvas', () => ({
 }));
 
 import { AlertBotStatusService } from './alert-bot.status';
+import { AlertBotHealthService } from './alert-bot.health';
 
 describe('сводка /status без модели', () => {
   const monitoring = { query: jest.fn() };
@@ -104,6 +105,25 @@ describe('сводка /status без модели', () => {
     expect(support.countOverdueTickets.mock.calls[0][0].aborted).toBe(true);
   }, 4500);
 
+  it('deadline реально abort-ит оба Prometheus query и health sections', async () => {
+    const signals: AbortSignal[] = [];
+    monitoring.query.mockImplementation((_query, signal?: AbortSignal) => {
+      if (signal) signals.push(signal);
+      return new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true }));
+    });
+    health.badSections.mockImplementation((signal?: AbortSignal) => {
+      if (signal) signals.push(signal);
+      return new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true }));
+    });
+
+    const text = await status.summary();
+
+    expect(text).toContain('Prometheus недоступен');
+    expect(text).toContain('Тех: данные недоступны');
+    expect(signals).toHaveLength(3);
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
+  }, 4500);
+
   it('ограничивает бесконечные Prometheus, health и PG дедлайном', async () => {
     monitoring.query.mockImplementation(() => new Promise(() => {}));
     health.badSections.mockImplementation(() => new Promise(() => {}));
@@ -118,4 +138,16 @@ describe('сводка /status без модели', () => {
     expect(text).toContain('Тех: данные недоступны');
     expect(text).toContain('Тикеты: данные недоступны');
   }, 4500);
+
+  it('health.badSections передаёт внешний abort signal в каждый getSection', async () => {
+    const health = Object.create(AlertBotHealthService.prototype) as AlertBotHealthService;
+    const getSection = jest.fn().mockResolvedValue({ error: 'source_failed' });
+    (health as any).getSection = getSection;
+    const controller = new AbortController();
+
+    await health.badSections(controller.signal);
+
+    expect(getSection).toHaveBeenCalledTimes(16);
+    expect(getSection.mock.calls.every((call) => call[1] === controller.signal)).toBe(true);
+  });
 });

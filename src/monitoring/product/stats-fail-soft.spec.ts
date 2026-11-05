@@ -79,6 +79,18 @@ describe('product stats fail-soft metadata and cancellation', () => {
       .rejects.toBe(reason);
   });
 
+  it('profile-depth не маскирует внутренний per-user сбой под валидный ноль', async () => {
+    const failure = new Error('per-user neo4j down');
+    const neo4j = {
+      readRows: jest.fn()
+        .mockResolvedValueOnce([])
+        .mockRejectedValueOnce(failure),
+    };
+
+    await expect(new ProfileDepthService(neo4j as any).getOverview()).rejects.toBe(failure);
+    expect(neo4j.readRows).toHaveBeenCalledTimes(2);
+  });
+
   it('summary помечает упавший PDS source_failed', async () => {
     const pg = pgMock();
     pg.query.mockResolvedValue({ rows: [{ v: 1 }] });

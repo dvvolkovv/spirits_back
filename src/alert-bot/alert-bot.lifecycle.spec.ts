@@ -22,6 +22,9 @@ type Mocks = {
     registerWebhook: jest.Mock<Promise<void>, []>;
     sendMessage: jest.Mock<Promise<{ message_id: number }>, [string, string, number]>;
   };
+  pg: {
+    registerPreCloseHook: jest.Mock<void, [() => Promise<void>]>;
+  };
 };
 
 function makeMocks(): Mocks {
@@ -40,6 +43,9 @@ function makeMocks(): Mocks {
     telegram: {
       registerWebhook: jest.fn().mockResolvedValue(undefined),
       sendMessage: jest.fn().mockResolvedValue({ message_id: 1 }),
+    },
+    pg: {
+      registerPreCloseHook: jest.fn(),
     },
   };
 }
@@ -60,7 +66,8 @@ describe('AlertBotLifecycle', () => {
     lifecycle = new (AlertBotLifecycle as any)(
       mocks.store, mocks.ops, mocks.telegram,
       { idle: jest.fn().mockResolvedValue(undefined) },
-      { retryFailedUpdates: jest.fn().mockResolvedValue(undefined) },
+      { retryFailedUpdates: jest.fn().mockResolvedValue(undefined), stopAdmission: jest.fn() },
+      mocks.pg,
     );
     sinkSpy = jest.spyOn(telegramAlert, 'setAlertSentSink');
   });
@@ -80,6 +87,7 @@ describe('AlertBotLifecycle', () => {
     await lifecycle.onModuleInit();
 
     expect(mocks.store.migrate).toHaveBeenCalledTimes(1);
+    expect(mocks.pg.registerPreCloseHook).toHaveBeenCalledTimes(1);
     expect(mocks.store.interruptInProgress).not.toHaveBeenCalled();
     expect(mocks.ops.start).not.toHaveBeenCalled();
     expect(mocks.telegram.registerWebhook).not.toHaveBeenCalled();
@@ -154,9 +162,9 @@ describe('AlertBotLifecycle', () => {
     enabled();
     const calls: string[] = [];
     const turns = { idle: jest.fn(() => { calls.push('turns.idle'); return new Promise<void>(() => {}); }) };
-    const service = { retryFailedUpdates: jest.fn() };
+    const service = { retryFailedUpdates: jest.fn(), stopAdmission: jest.fn() };
     mocks.ops.stop.mockImplementation(async () => { calls.push('ops.stop'); });
-    lifecycle = new (AlertBotLifecycle as any)(mocks.store, mocks.ops, mocks.telegram, turns, service);
+    lifecycle = new (AlertBotLifecycle as any)(mocks.store, mocks.ops, mocks.telegram, turns, service, mocks.pg);
     await lifecycle.onModuleInit();
 
     const shutdown = (lifecycle as any).beforeApplicationShutdown();

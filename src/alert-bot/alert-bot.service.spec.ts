@@ -505,6 +505,19 @@ describe('AlertBotService', () => {
     );
   });
 
+  it('shutdown останавливает новые claim и scheduled retry, не мешая уже claimed update', async () => {
+    (service as any).stopAdmission();
+
+    await expect(service.claimUpdate(update({}, 10))).resolves.toBe(false);
+    await service.retryFailedUpdates();
+    expect(store.claimUpdate).not.toHaveBeenCalled();
+    expect(store.requeueProcessingUpdates).not.toHaveBeenCalled();
+    expect(store.dueUpdates).not.toHaveBeenCalled();
+
+    await (service as any).handleUpdate(update({}, 11), true);
+    expect(turns.enqueue).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     ['accepted', 'Вопрос принят'],
     ['busy', 'Занят, спросите через минуту'],
