@@ -61,6 +61,34 @@ maybe('хранилище бота алертов против PostgreSQL', () =
     expect(await store.claimUpdate(1001)).toBe(true);
     expect(await store.claimUpdate(1001)).toBe(false);
   });
+  it('admission advisory lock имеет реальный lock_timeout', async () => {
+    const blocker = await pool.connect();
+    const input = {
+      updateId: 1003, chatId: '1', tgUserId: '111', adminUserId: 'u-lock-timeout',
+      questionMessageId: 10, question: 'bounded admission', privateChat: true,
+    };
+    await blocker.query('BEGIN');
+    await blocker.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`alert-bot:${input.adminUserId}`]);
+    const admission = store.admitTurn(input, 30);
+    const observed = admission.then(
+      (result) => ({ status: 'accepted', result }),
+      (error) => ({ status: 'rejected', error }),
+    );
+    try {
+      const outcome = await Promise.race([
+        observed,
+        new Promise<{ status: string }>((resolve) => setTimeout(() => resolve({ status: 'hung' }), 1500)),
+      ]);
+      expect(outcome.status).toBe('rejected');
+      if (outcome.status === 'rejected') {
+        expect((outcome as any).error).toMatchObject({ code: '55P03' });
+      }
+    } finally {
+      await blocker.query('ROLLBACK').catch(() => undefined);
+      blocker.release(true);
+      await observed;
+    }
+  });
   it('ход даёт контекст, лимит и финальный статус', async () => {
     const id = await store.createTurn({ updateId: 1002, chatId: '1', tgUserId: '111', adminUserId: 'u-admin', questionMessageId: 10, question: 'что горит?', privateChat: true });
     await store.attachAnswerMessage(id, 20);

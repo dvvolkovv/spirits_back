@@ -71,6 +71,16 @@ describe('публичные маршруты бота алертов', () => {
     expect(handler.handleUpdate).toHaveBeenCalledWith({ update_id: 12 }, true);
   });
 
+  it('stopped admission возвращает 503, duplicate completed остаётся 200', async () => {
+    handler.claimUpdate.mockResolvedValueOnce('stopped' as any);
+    await expect(post('/webhook/alert-bot/telegram', 'routes-secret')).resolves.toBe(503);
+    expect(handler.handleUpdate).not.toHaveBeenCalled();
+
+    handler.claimUpdate.mockResolvedValueOnce(false);
+    await expect(post('/webhook/alert-bot/telegram', 'routes-secret')).resolves.toBe(200);
+    expect(handler.handleUpdate).not.toHaveBeenCalled();
+  });
+
   it('ops MCP не опубликован через Nest', async () => {
     await expect(post('/webhook/mcp/ops', 'routes-secret')).resolves.toBe(404);
     expect(handler.claimUpdate).not.toHaveBeenCalled();

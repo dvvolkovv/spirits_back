@@ -492,6 +492,45 @@ describe('AlertBotTurns', () => {
     expect(ai.answer).toHaveBeenCalledTimes(2);
   });
 
+  it('onAdmission accepted вызывается до deferred AI, enqueue продолжает ждать delivery', async () => {
+    const generated = deferred<{ text: string; costUsd: number; tools: string[] }>();
+    ai.answer.mockReturnValue(generated.promise);
+    const onAdmission = jest.fn().mockResolvedValue(undefined);
+
+    const running = turns.enqueue(question(), undefined, { onAdmission });
+    for (let i = 0; i < 20 && ai.answer.mock.calls.length === 0; i += 1) await Promise.resolve();
+
+    expect(onAdmission).toHaveBeenCalledWith('accepted');
+    expect(onAdmission.mock.invocationCallOrder[0]).toBeLessThan(ai.answer.mock.invocationCallOrder[0]);
+    expect(store.completeDelivery).not.toHaveBeenCalled();
+
+    generated.resolve({ text: 'после admission', costUsd: 0, tools: [] });
+    await expect(running).resolves.toBe('accepted');
+    expect(store.completeDelivery).toHaveBeenCalledWith('turn-1', [901]);
+  });
+
+  it('stopAdmission отклоняет queued admission до beginStream новой модели', async () => {
+    const first = deferred<{ text: string; costUsd: number; tools: string[] }>();
+    const started = deferred();
+    ai.answer.mockImplementationOnce(() => {
+      started.resolve();
+      return first.promise;
+    });
+    const running = turns.enqueue(question({ updateId: 1 }));
+    await started.promise;
+    const waiting = turns.enqueue(question({ updateId: 2 }));
+
+    (turns as any).stopAdmission();
+    first.resolve({ text: 'первый', costUsd: 0, tools: [] });
+
+    await expect(running).resolves.toBe('accepted');
+    await expect(waiting).rejects.toMatchObject({ kind: 'stopped' });
+    expect(store.tryCreateTurn).toHaveBeenCalledTimes(1);
+    expect(ai.answer).toHaveBeenCalledTimes(1);
+    await expect(turns.enqueue(question({ updateId: 3 }))).rejects.toMatchObject({ kind: 'stopped' });
+    expect(chat.beginStream).toHaveBeenCalledTimes(2);
+  });
+
   it('ticket buttons имеют общий 5s deadline, передают signal и не держат ответ или drain', async () => {
     ai.answer.mockResolvedValue({ text: 'Смотри #11111111', costUsd: 0, tools: [] });
     let lookupSignal: AbortSignal | undefined;

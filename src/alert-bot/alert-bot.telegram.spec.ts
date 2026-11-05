@@ -56,6 +56,32 @@ describe('Telegram бота алертов', () => {
     await expect(tg.sendChunks('1', '   ', 10, 7)).resolves.toEqual([10]);
   });
 
+  it('network timeout сохраняет неизвестный исход без сырого ответа или токена', async () => {
+    (axios.post as jest.Mock).mockRejectedValue({
+      code: 'ECONNABORTED', message: 'RAW-NETWORK-SECRET', config: { url: 'botRAW-TOKEN' },
+    });
+
+    await expect(new AlertBotTelegram().sendMessage('1', 'secret text')).rejects.toMatchObject({
+      kind: 'telegram_unknown', outcome: 'unknown', retryable: false,
+    });
+    const error = await new AlertBotTelegram().sendMessage('1', 'secret text').catch((e) => e);
+    expect(error.message).not.toContain('RAW-NETWORK-SECRET');
+    expect(error.message).not.toContain('RAW-TOKEN');
+  });
+
+  it('definite Telegram API response сохраняет status и retryability', async () => {
+    (axios.post as jest.Mock).mockRejectedValue({
+      response: { status: 429, data: { description: 'RAW-TELEGRAM-DESCRIPTION' } },
+      message: 'Request failed',
+    });
+
+    const error = await new AlertBotTelegram().sendMessage('1', 'text').catch((e) => e);
+    expect(error).toMatchObject({
+      kind: 'telegram_api', outcome: 'known', retryable: true, status: 429,
+    });
+    expect(error.message).not.toContain('RAW-TELEGRAM-DESCRIPTION');
+  });
+
   it('ответ — простой текст, реплай, без превью', async () => {
     (axios.post as jest.Mock).mockResolvedValue({ data: { ok: true, result: { message_id: 10 } } });
     const tg = new AlertBotTelegram();

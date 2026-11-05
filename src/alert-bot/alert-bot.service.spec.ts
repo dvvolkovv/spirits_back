@@ -64,7 +64,7 @@ describe('AlertBotService', () => {
   let store: Record<string, jest.Mock>;
   let commands: Record<string, jest.Mock>;
   let drafts: Record<string, jest.Mock>;
-  let turns: { enqueue: jest.Mock };
+  let turns: { enqueue: jest.Mock; resumeExisting: jest.Mock };
   let support: { findTicketByPrefix: jest.Mock };
   let logger: { error: jest.Mock };
   let service: AlertBotService;
@@ -84,6 +84,7 @@ describe('AlertBotService', () => {
       dueUpdates: jest.fn().mockResolvedValue([]),
       requeueProcessingUpdates: jest.fn().mockResolvedValue(undefined),
       findTurnByAnswer: jest.fn().mockResolvedValue(null),
+      findTurnByUpdate: jest.fn().mockResolvedValue(null),
     };
     commands = {
       start: jest.fn().mockResolvedValue('Справка'),
@@ -97,7 +98,7 @@ describe('AlertBotService', () => {
       finishAsk: jest.fn(),
       releaseAsk: jest.fn().mockResolvedValue(undefined),
     };
-    turns = { enqueue: jest.fn().mockResolvedValue('accepted') };
+    turns = { enqueue: jest.fn().mockResolvedValue('accepted'), resumeExisting: jest.fn().mockResolvedValue('accepted') };
     support = { findTicketByPrefix: jest.fn().mockResolvedValue(null) };
     logger = { error: jest.fn() };
     service = new AlertBotService(
@@ -505,17 +506,43 @@ describe('AlertBotService', () => {
     );
   });
 
-  it('shutdown останавливает новые claim и scheduled retry, не мешая уже claimed update', async () => {
-    (service as any).stopAdmission();
+  it('shutdown возвращает stopped для новых claim и не запускает scheduled retry', async () => {
+    service.stopAdmission();
 
-    await expect(service.claimUpdate(update({}, 10))).resolves.toBe(false);
+    await expect(service.claimUpdate(update({}, 10))).resolves.toBe('stopped');
     await service.retryFailedUpdates();
     expect(store.claimUpdate).not.toHaveBeenCalled();
     expect(store.requeueProcessingUpdates).not.toHaveBeenCalled();
     expect(store.dueUpdates).not.toHaveBeenCalled();
+  });
 
-    await (service as any).handleUpdate(update({}, 11), true);
-    expect(turns.enqueue).toHaveBeenCalledTimes(1);
+  it('claimed → stop → late enqueue оставляет durable retry и не создаёт turn', async () => {
+    let resolveAccess!: (value: typeof ADMIN) => void;
+    access.resolveTelegram.mockImplementation(() => new Promise<typeof ADMIN>((resolve) => { resolveAccess = resolve; }));
+    const handling = service.handleUpdate(update({}, 11), true);
+    for (let i = 0; i < 20 && access.resolveTelegram.mock.calls.length === 0; i += 1) await Promise.resolve();
+
+    service.stopAdmission();
+    resolveAccess(ADMIN);
+    await handling;
+
+    expect(turns.enqueue).not.toHaveBeenCalled();
+    expect(store.completeUpdate).not.toHaveBeenCalled();
+    expect(store.failUpdate).toHaveBeenCalledWith(11, 'stopped');
+  });
+
+  it('internal retry при active draft claim остаётся failed, fresh duplicate завершается без второй публикации', async () => {
+    drafts.handleCallback.mockImplementation((input: any) => {
+      if (input.internalRetry) throw Object.assign(new Error('active'), { kind: 'draft_in_progress' });
+      return {};
+    });
+    store.dueUpdates.mockResolvedValue([{ updateId: 1, payload: callback(`draft:${DRAFT}:send`) }]);
+
+    await service.retryFailedUpdates();
+
+    expect(store.completeUpdate).not.toHaveBeenCalled();
+    expect(store.failUpdate).toHaveBeenCalledWith(1, 'draft_in_progress');
+    expect(drafts.handleCallback).toHaveBeenCalledWith(expect.objectContaining({ internalRetry: true }));
   });
 
   it.each([
@@ -527,32 +554,35 @@ describe('AlertBotService', () => {
     drafts.handleCallback.mockResolvedValue({
       question: 'Текст черновика', ticketId: TICKET, draftId: DRAFT, claimVersion: 3, guardToken: GUARD_TOKEN,
     });
-    turns.enqueue.mockResolvedValue(admission);
+    turns.enqueue.mockImplementation(async (_input, _reservation, options) => {
+      await options.onAdmission(admission);
+      return admission;
+    });
 
     await service.handleUpdate(callback(`draft:${DRAFT}:ask`));
 
     expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
     expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('callback-1', text);
-    expect(telegram.answerCallbackQuery.mock.invocationCallOrder[0]).toBeGreaterThan(
-      turns.enqueue.mock.invocationCallOrder[0],
-    );
   });
 
-  it('draft ask не получает ack, пока admission ещё не завершился', async () => {
-    let resolveAdmission!: (value: 'accepted') => void;
-    turns.enqueue.mockImplementation(() => new Promise<'accepted'>((resolve) => { resolveAdmission = resolve; }));
+  it('draft ask ack приходит по onAdmission до завершения delivery', async () => {
+    let resolveDelivery!: (value: 'accepted') => void;
+    turns.enqueue.mockImplementation(async (_input, _reservation, options) => {
+      await options.onAdmission('accepted');
+      return new Promise<'accepted'>((resolve) => { resolveDelivery = resolve; });
+    });
     drafts.handleCallback.mockResolvedValue({
       question: 'Текст черновика', ticketId: TICKET, draftId: DRAFT, claimVersion: 3, guardToken: GUARD_TOKEN,
     });
 
     const handling = service.handleUpdate(callback(`draft:${DRAFT}:ask`));
-    for (let i = 0; i < 20 && turns.enqueue.mock.calls.length === 0; i += 1) await Promise.resolve();
-    expect(telegram.answerCallbackQuery).not.toHaveBeenCalled();
-
-    resolveAdmission('accepted');
-    await handling;
-    expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
+    for (let i = 0; i < 20 && telegram.answerCallbackQuery.mock.calls.length === 0; i += 1) await Promise.resolve();
     expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('callback-1', 'Вопрос принят');
+    expect(store.completeUpdate).not.toHaveBeenCalled();
+
+    resolveDelivery('accepted');
+    await handling;
+    expect(store.completeUpdate).toHaveBeenCalledWith(1);
   });
 
   it('ошибка хранилища логируется только по kind, без текста сообщения', async () => {

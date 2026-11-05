@@ -69,7 +69,7 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
       turns,
       support as any,
     );
-    return { service, support };
+    return { service, support, drafts, turns };
   }
 
   function telegramMock() {
@@ -90,6 +90,12 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
       }),
       answerCallbackQuery: jest.fn().mockResolvedValue(undefined),
     };
+  }
+
+  function unknownTelegramOutcome() {
+    return Object.assign(new Error('timeout after remote success'), {
+      kind: 'telegram_unknown', outcome: 'unknown', retryable: false,
+    });
   }
 
   const update = {
@@ -298,5 +304,147 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
     expect((await pool.query(
       'SELECT status FROM alert_bot_updates WHERE update_id = $1', [update.update_id],
     )).rows[0].status).toBe('completed');
+  });
+
+  it('asked draft retry сразу resume-ит существующий turn без повторного draft callback', async () => {
+    const aiAnswer = jest.fn().mockResolvedValue({ text: 'Ответ после retry', costUsd: 0, tools: [] });
+    const telegram = telegramMock();
+    telegram.sendChunks.mockImplementationOnce(async () => {
+      throw Object.assign(new Error('definite API refusal'), { kind: 'send_failed' });
+    });
+    const { service, drafts, turns } = makeService(telegram, aiAnswer);
+    const draftId = await store.createDraft({
+      chatId: '100', tgUserId: '200', adminUserId: 'admin-retry',
+      ticketId: '11111111-1111-4111-8111-111111111111', text: 'Вопрос из черновика',
+    });
+    const callback = {
+      update_id: 92003,
+      callback_query: {
+        id: 'callback-ask-resume', data: `draft:${draftId}:ask`, from: { id: 200 },
+        message: { message_id: 900, chat: { id: 100, type: 'private' } },
+      },
+    };
+    const draftCallback = jest.spyOn(drafts, 'handleCallback');
+    const resume = jest.spyOn(turns as any, 'resumeExisting');
+
+    await service.handleUpdate(callback);
+    expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'asked' });
+    expect((await pool.query(
+      'SELECT status FROM alert_bot_updates WHERE update_id = $1', [callback.update_id],
+    )).rows[0].status).toBe('failed');
+
+    await makeDue(callback.update_id);
+    await service.retryFailedUpdates();
+
+    expect(draftCallback).toHaveBeenCalledTimes(1);
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(aiAnswer).toHaveBeenCalledTimes(1);
+    expect(telegram.sendChunks).toHaveBeenCalledTimes(2);
+    expect((await pool.query(
+      'SELECT status FROM alert_bot_updates WHERE update_id = $1', [callback.update_id],
+    )).rows[0].status).toBe('completed');
+  });
+
+  it('releaseAsk failure + immediate retry не завершает update по активному claim', async () => {
+    const aiAnswer = jest.fn();
+    const telegram = telegramMock();
+    const { service, drafts, turns } = makeService(telegram, aiAnswer);
+    const draftId = await store.createDraft({
+      chatId: '100', tgUserId: '200', adminUserId: 'admin-retry',
+      ticketId: '11111111-1111-4111-8111-111111111111', text: 'Вопрос с активным claim',
+    });
+    const callback = {
+      update_id: 92004,
+      callback_query: {
+        id: 'callback-release-failure', data: `draft:${draftId}:ask`, from: { id: 200 },
+        message: { message_id: 900, chat: { id: 100, type: 'private' } },
+      },
+    };
+    jest.spyOn(turns, 'enqueue').mockRejectedValue(Object.assign(new Error('admission failed'), { kind: 'db_down' }));
+    const release = jest.spyOn(drafts, 'releaseAsk').mockRejectedValue(Object.assign(new Error('release failed'), { kind: 'db_down' }));
+
+    await service.handleUpdate(callback);
+    await makeDue(callback.update_id);
+    await service.retryFailedUpdates();
+
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'asking', claimVersion: 1 });
+    expect((await pool.query(
+      'SELECT status, attempts FROM alert_bot_updates WHERE update_id = $1', [callback.update_id],
+    )).rows[0]).toMatchObject({ status: 'failed', attempts: 2 });
+  });
+
+  it('timeout после remote success placeholder не очищает marker и не создаёт второй placeholder', async () => {
+    const aiAnswer = jest.fn();
+    const telegram = telegramMock();
+    telegram.sendMessage.mockRejectedValueOnce(unknownTelegramOutcome());
+    const { service } = makeService(telegram, aiAnswer);
+
+    await service.handleUpdate(update);
+    await makeDue(update.update_id);
+    await service.retryFailedUpdates();
+
+    expect(telegram.sendMessage).toHaveBeenCalledTimes(1);
+    expect(aiAnswer).not.toHaveBeenCalled();
+    expect((await pool.query(
+      'SELECT placeholder_started_at FROM alert_bot_turns WHERE update_id = $1', [update.update_id],
+    )).rows[0].placeholder_started_at).toBeInstanceOf(Date);
+    expect((await pool.query(
+      'SELECT status FROM alert_bot_updates WHERE update_id = $1', [update.update_id],
+    )).rows[0].status).toBe('failed');
+  });
+
+  it('timeout после remote success system notification не создаёт второе уведомление', async () => {
+    process.env.ALERT_BOT_RATE_PER_HOUR = '1';
+    try {
+      await pool.query(
+        `INSERT INTO alert_bot_turns
+           (update_id, chat_id, tg_user_id, linkeon_user_id, question_message_id,
+            question, private_chat, status, finished_at)
+         VALUES (91998, '100', '200', 'admin-retry', 1, 'prior', true, 'ok', now())`,
+      );
+      const aiAnswer = jest.fn();
+      const telegram = telegramMock();
+      telegram.sendMessage.mockRejectedValueOnce(unknownTelegramOutcome());
+      const { service } = makeService(telegram, aiAnswer);
+
+      await service.handleUpdate(update);
+      await makeDue(update.update_id);
+      await service.retryFailedUpdates();
+
+      expect(telegram.sendMessage).toHaveBeenCalledTimes(1);
+      expect((await pool.query(
+        'SELECT placeholder_started_at FROM alert_bot_turns WHERE update_id = $1', [update.update_id],
+      )).rows[0].placeholder_started_at).toBeInstanceOf(Date);
+      expect((await pool.query(
+        'SELECT status FROM alert_bot_updates WHERE update_id = $1', [update.update_id],
+      )).rows[0].status).toBe('failed');
+    } finally {
+      delete process.env.ALERT_BOT_RATE_PER_HOUR;
+    }
+  });
+
+  it('timeout после remote success continuation сохраняет delivery marker и не повторяет sendChunks', async () => {
+    const aiAnswer = jest.fn().mockResolvedValue({ text: 'Длинный ответ', costUsd: 0, tools: [] });
+    const telegram = telegramMock();
+    telegram.sendChunks.mockImplementationOnce(async (...args: any[]) => {
+      await args[5]?.([901]);
+      await args[5]?.([901, 902]);
+      throw unknownTelegramOutcome();
+    });
+    const { service } = makeService(telegram, aiAnswer);
+
+    await service.handleUpdate(update);
+    await makeDue(update.update_id);
+    await service.retryFailedUpdates();
+
+    expect(telegram.sendChunks).toHaveBeenCalledTimes(1);
+    expect(aiAnswer).toHaveBeenCalledTimes(1);
+    expect((await pool.query(
+      'SELECT delivery_started_at FROM alert_bot_turns WHERE update_id = $1', [update.update_id],
+    )).rows[0].delivery_started_at).toBeInstanceOf(Date);
+    expect((await pool.query(
+      'SELECT status FROM alert_bot_updates WHERE update_id = $1', [update.update_id],
+    )).rows[0].status).toBe('failed');
   });
 });
