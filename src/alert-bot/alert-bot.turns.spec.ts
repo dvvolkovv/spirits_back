@@ -129,7 +129,8 @@ describe('AlertBotTurns', () => {
 
   it.each([
     ['auth', 'model_down'],
-    ['limit', 'model_down'],
+    ['rate_limit', 'model_down'],
+    ['weekly_limit', 'model_down'],
     ['overloaded', 'model_down'],
     ['timeout', 'timeout'],
   ])('известная ошибка модели %s даёт безопасный ответ и статус %s', async (kind, expectedStatus) => {
@@ -152,6 +153,7 @@ describe('AlertBotTurns', () => {
   it.each([
     [{ kind: 'other' }],
     [{ kind: 'unknown' }],
+    [{ kind: 'limit' }],
     [{}],
   ])('неизвестная ошибка ai.answer %# не маскируется под model_down', async (errorProps) => {
     ai.answer.mockRejectedValue(Object.assign(new Error('RAW-UNEXPECTED-AI'), errorProps));
