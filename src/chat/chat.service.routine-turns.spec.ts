@@ -1,6 +1,6 @@
 import { Readable } from 'stream';
 import axios from 'axios';
-import { ChatService } from './chat.service';
+import { ChatService, RelaySessionBusyError } from './chat.service';
 
 jest.mock('axios');
 jest.mock('../common/telegram-alert', () => ({
@@ -10,9 +10,10 @@ jest.mock('../common/telegram-alert', () => ({
 
 /**
  * Бэклог e777aa94: фоновые ответы (рутины, «Путь») шли в основную сессию
- * релея мимо учёта ходов — пре-эмптили живой ход человека, а deploy.sh их
- * не видел. Теперь agentReply ждёт конца чужого хода и регистрируется в
- * activeTurns / relayRunning / activeStreams.
+ * релея мимо учёта ходов и пре-эмптили живой ход человека. Теперь agentReply
+ * регистрируется в relayRunning/activeStreams, а занятой сессии — атомарно
+ * отказывает (RelaySessionBusyError): человек важнее, routine-push откладывает.
+ * activeTurns сознательно НЕ ставится — кабинет человека не блокируется.
  */
 
 const AGENT = { id: 12, name: 'Роман', display_name: 'Роман', description: '', system_prompt: '', category: 'business' };
@@ -20,8 +21,7 @@ const AGENT = { id: 12, name: 'Роман', display_name: 'Роман', descript
 function makeService() {
   const pg = { query: jest.fn(async (sql: string) => (/FROM agents WHERE id/.test(sql) ? { rows: [AGENT] } : { rows: [] })) };
   const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
-  const svc = new ChatService(pg as any, null as any, null as any, null as any, language as any, undefined, undefined, undefined, undefined);
-  return svc;
+  return new ChatService(pg as any, null as any, null as any, null as any, language as any, undefined, undefined, undefined, undefined);
 }
 
 function sseDone(): Readable {
@@ -39,13 +39,9 @@ async function flush(n = 10) {
 }
 
 describe('agentReply: учёт ходов и чужая работа в той же сессии', () => {
-  beforeEach(() => {
-    jest.clearAllMocks();
-    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
-  });
-  afterEach(() => jest.useRealTimers());
+  beforeEach(() => jest.clearAllMocks());
 
-  it('во время ответа виден в activeTurns, relayRunning и activeStreams; после — снят', async () => {
+  it('виден в relayRunning/activeStreams, но НЕ в activeTurns; после — снят', async () => {
     const svc = makeService();
     let release!: (v: any) => void;
     (axios.post as jest.Mock).mockImplementationOnce(() => new Promise((res) => { release = res; }));
@@ -53,55 +49,50 @@ describe('agentReply: учёт ходов и чужая работа в той �
     const done = svc.generateAgentReply('u-1', '12', 'напомни');
     await flush();
 
-    expect(svc.getActiveTurn('u-1', '12').active).toBe(true);
     expect(svc.getActiveStreamCount()).toBe(1);
     expect((svc as any).relayRunning.has('u-1_12_ru')).toBe(true);
+    // Кабинет человека фоновая работа не блокирует.
+    expect(svc.getActiveTurn('u-1', '12').active).toBe(false);
 
     release({ data: sseDone() });
     await expect(done).resolves.toBe('ок');
 
-    expect(svc.getActiveTurn('u-1', '12').active).toBe(false);
     expect(svc.getActiveStreamCount()).toBe(0);
     expect((svc as any).relayRunning.size).toBe(0);
   });
 
-  it('живой ход человека НЕ пре-эмптит: ждёт освобождения сессии', async () => {
+  it('занятая сессия — RelaySessionBusyError без вызова релея (не пре-эмптим)', async () => {
     const svc = makeService();
     (axios.post as jest.Mock).mockImplementation(async () => ({ data: sseDone() }));
     const humanMark = svc.beginRelayRun('u-1_12_ru');
 
-    const done = svc.generateAgentReply('u-1', '12', 'напомни');
-    await flush();
+    await expect(svc.generateAgentReply('u-1', '12', 'напомни')).rejects.toBeInstanceOf(RelaySessionBusyError);
     expect(axios.post).not.toHaveBeenCalled();
-
-    await jest.advanceTimersByTimeAsync(10_000);
-    expect(axios.post).not.toHaveBeenCalled();
+    // Метка человека не тронута.
+    expect((svc as any).relayRunning.get('u-1_12_ru')).toBe(humanMark);
+    expect(svc.getActiveStreamCount()).toBe(0);
 
     svc.endRelayRun('u-1_12_ru', humanMark);
-    await jest.advanceTimersByTimeAsync(5_000);
-    await done;
-
+    // Освободилась — проходит.
+    await expect(svc.generateAgentReply('u-1', '12', 'напомни')).resolves.toBe('ок');
     expect(axios.post).toHaveBeenCalledTimes(1);
-    expect((svc as any).relayRunning.size).toBe(0);
-    expect(svc.getActiveStreamCount()).toBe(0);
   });
 
-  it('сессия занята дольше 30 минут — пустой ответ вместо пре-эмпта', async () => {
+  it('два фоновых подряд: второй получает busy, первый не пострадал', async () => {
     const svc = makeService();
-    (axios.post as jest.Mock).mockImplementation(async () => ({ data: sseDone() }));
-    const humanMark = svc.beginRelayRun('u-1_12_ru');
-
-    const done = svc.generateAgentReply('u-1', '12', 'напомни');
+    let release!: (v: any) => void;
+    (axios.post as jest.Mock).mockImplementationOnce(() => new Promise((res) => { release = res; }));
+    const first = svc.generateAgentReply('u-1', '12', 'первая');
     await flush();
-    await jest.advanceTimersByTimeAsync(31 * 60 * 1000);
 
-    await expect(done).resolves.toBe('');
-    expect(axios.post).not.toHaveBeenCalled();
-    expect(svc.getActiveStreamCount()).toBe(0);
-    svc.endRelayRun('u-1_12_ru', humanMark);
+    await expect(svc.generateAgentReply('u-1', '12', 'вторая')).rejects.toBeInstanceOf(RelaySessionBusyError);
+
+    release({ data: sseDone() });
+    await expect(first).resolves.toBe('ок');
+    expect((svc as any).relayRunning.size).toBe(0);
   });
 
-  it('своя sessionIdOverride: activeTurns не ставится, relay/activeStreams учитываются', async () => {
+  it('своя sessionIdOverride: relay/activeStreams учитываются, activeTurns — нет', async () => {
     const svc = makeService();
     let release!: (v: any) => void;
     (axios.post as jest.Mock).mockImplementationOnce(() => new Promise((res) => { release = res; }));
@@ -124,7 +115,6 @@ describe('agentReply: учёт ходов и чужая работа в той �
     (axios.post as jest.Mock).mockRejectedValueOnce(new Error('relay down'));
 
     await expect(svc.generateAgentReply('u-1', '12', 'напомни')).rejects.toThrow('relay down');
-    expect(svc.getActiveTurn('u-1', '12').active).toBe(false);
     expect(svc.getActiveStreamCount()).toBe(0);
     expect((svc as any).relayRunning.size).toBe(0);
   });

@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
 import { PushService } from '../push/push.service';
-import { ChatService } from '../chat/chat.service';
+import { ChatService, RelaySessionBusyError } from '../chat/chat.service';
 import { RoutineStore, RoutineRow, ENERGY_PROMPT } from './routine-store.service';
 import { sendTelegramAlert } from '../common/telegram-alert';
 
@@ -80,10 +80,44 @@ export class RoutinePushService implements OnModuleInit {
   }
 
   // ── Доставка одной рутины ────────────────────────────────────────────────────
+  /**
+   * Отложенная доставка: человек сейчас разговаривает с этим ассистентом, и
+   * agentReply честно отказал (RelaySessionBusyError) вместо пре-эмпта его
+   * хода. Ждать внутри runDue нельзя — последовательный цикл встал бы всем
+   * остальным рутинам, а fireNow держал бы HTTP. Поэтому повтор через 15 минут
+   * таймером: цикл идёт дальше, HTTP отвечает сразу. Одна отложенная на пару
+   * пользователь+ассистент. Таймер in-memory: рестарт процесса её теряет —
+   * следующий плановый запуск по расписанию остаётся страховкой.
+   */
+  private readonly retryTimers = new Map<string, NodeJS.Timeout>();
+
+  private scheduleRetry(userId: string, assistantId: string, prompt: string, title?: string): void {
+    const key = `${userId}_${assistantId}`;
+    if (this.retryTimers.has(key)) return;
+    this.logger.log(`routine deliver: ${key} занят разговором человека — повтор через 15 минут`);
+    const timer = setTimeout(() => {
+      this.retryTimers.delete(key);
+      void this.deliver(userId, assistantId, prompt, title).catch((e: any) => {
+        this.logger.warn(`routine deliver retry failed for ${key}: ${e?.message}`);
+      });
+    }, 15 * 60 * 1000);
+    timer.unref?.();
+    this.retryTimers.set(key, timer);
+  }
+
   private async deliver(userId: string, assistantId: string, prompt: string, title?: string): Promise<number> {
     // Рутина — путь, где ассистент реально может позвать инструмент Linkeon
     // (картинка, рутина, календарь): AgentReplyOpts.linkeonTools — явно true.
-    const text = await this.chat.generateAgentReply(userId, assistantId, prompt, undefined, { linkeonTools: true });
+    let text: string;
+    try {
+      text = await this.chat.generateAgentReply(userId, assistantId, prompt, undefined, { linkeonTools: true });
+    } catch (e: any) {
+      if (e instanceof RelaySessionBusyError) {
+        this.scheduleRetry(userId, assistantId, prompt, title);
+        return 0;
+      }
+      throw e;
+    }
     if (!text || !text.trim()) {
       this.logger.warn(`routine deliver: empty text for ${userId} / assistant ${assistantId}`);
       return 0;
