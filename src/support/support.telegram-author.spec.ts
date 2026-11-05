@@ -81,7 +81,8 @@ describe('авторство ответов и действий из Telegram', 
     const replyUpdate = queries.find(({ sql }) => /first_owner_reply_at/.test(sql));
     expect(replyUpdate?.sql).toContain("status = CASE WHEN status IN ('escalated','ai_handling') THEN 'owner_handling'");
     expect(email).toHaveBeenCalledWith(TICKET, 'текст');
-    expect(client.release).toHaveBeenCalledTimes(1);
+    // Публикация и атомарная смена статуса используют отдельные транзакции.
+    expect(client.release).toHaveBeenCalledTimes(2);
   });
 
   it('без аккаунта админа сохраняет legacy-автора tg:<telegramUserId>', async () => {
