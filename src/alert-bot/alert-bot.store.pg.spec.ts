@@ -192,6 +192,8 @@ maybe('хранилище бота алертов против PostgreSQL', () =
       draftId, claimVersion: 1, input: { ...input, updateId: 1081 }, maxPerHour: 30,
     })).resolves.toEqual({ status: 'stale' });
     expect(await store.claimDraft(draftId, 'asking')).toEqual({ status: 'unavailable' });
+    // Состояние crash проверено выше; не оставляем его остальным recovery-тестам.
+    await store.finishTurn(admitted.turnId, { status: 'interrupted', errorKind: 'restart' });
   });
   it('stale и hourly refusal атомарно сохраняют asking без нового хода', async () => {
     const adminUserId = 'u-atomic-refusal';
@@ -253,6 +255,8 @@ maybe('хранилище бота алертов против PostgreSQL', () =
       [[firstDraft, secondDraft]],
     );
     expect(drafts.rows).toEqual([{ outcome: 'asked' }, { outcome: 'asking' }]);
+    const accepted = results.find((result: any) => result.status === 'accepted');
+    await store.finishTurn(accepted.turnId, { status: 'ok' });
   });
   it('system turns сразу финальны, не тратят admission и не принимают поздний finish', async () => {
     const input = { updateId: 1060, chatId: 'system', tgUserId: '111', adminUserId: 'u-system', questionMessageId: 10, question: 'системный отказ', privateChat: true };
