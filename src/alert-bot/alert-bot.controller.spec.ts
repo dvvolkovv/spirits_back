@@ -7,7 +7,10 @@ import { NestFactory } from '@nestjs/core';
 import { AlertBotController } from './alert-bot.controller';
 import { ALERT_BOT_HANDLER } from './alert-bot.config';
 
-const handler = { handleUpdate: jest.fn<Promise<void>, [unknown]>() };
+const handler = {
+  claimUpdate: jest.fn<Promise<boolean>, [unknown]>(),
+  handleUpdate: jest.fn<Promise<void>, [unknown, boolean?]>(),
+};
 
 @Module({
   controllers: [AlertBotController],
@@ -24,6 +27,8 @@ describe('защищённый webhook бота алертов', () => {
   beforeEach(async () => {
     process.env.ALERT_BOT_WEBHOOK_URL = 'https://example.test/webhook/alert-bot/telegram';
     process.env.ALERT_BOT_WEBHOOK_SECRET = 'secret';
+    handler.claimUpdate.mockReset();
+    handler.claimUpdate.mockResolvedValue(true);
     handler.handleUpdate.mockReset();
     handler.handleUpdate.mockResolvedValue(undefined);
     app = await NestFactory.create(AlertBotControllerSpecModule, { logger: false, abortOnError: false });
@@ -73,7 +78,26 @@ describe('защищённый webhook бота алертов', () => {
     const update = { update_id: 3, message: { text: 'привет' } };
     expect((await post(update, 'secret')).status).toBe(200);
     await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(handler.handleUpdate).toHaveBeenCalledWith(update);
+    expect(handler.claimUpdate).toHaveBeenCalledWith(update);
+    expect(handler.handleUpdate).toHaveBeenCalledWith(update, true);
+  });
+
+  it('сбой durable claim возвращает 503 до 200 и не запускает обработчик', async () => {
+    handler.claimUpdate.mockRejectedValue(new Error('database down'));
+    const update = { update_id: 31, message: { text: 'привет' } };
+
+    expect((await post(update, 'secret')).status).toBe(503);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(handler.handleUpdate).not.toHaveBeenCalled();
+  });
+
+  it('duplicate claim не запускает обработчик, но подтверждает Telegram 200', async () => {
+    handler.claimUpdate.mockResolvedValue(false);
+    const update = { update_id: 32, message: { text: 'привет' } };
+
+    expect((await post(update, 'secret')).status).toBe(200);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(handler.handleUpdate).not.toHaveBeenCalled();
   });
 
   it('ошибка обработчика не меняет 200 и не попадает в журнал вместе с update', async () => {

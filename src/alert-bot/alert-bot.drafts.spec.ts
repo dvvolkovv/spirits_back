@@ -324,7 +324,7 @@ describe('черновики ответов в тикет', () => {
     expect(store.releaseDraft).not.toHaveBeenCalled();
     expect(support.adminGetTicket).not.toHaveBeenCalled();
     expect(support.postOwnerReplyFromTelegram).not.toHaveBeenCalled();
-    expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
+    expect(telegram.answerCallbackQuery).not.toHaveBeenCalled();
   });
 
   it('повторный ask отклоняется локально, пока первый claim ещё ожидает БД', async () => {
@@ -514,6 +514,21 @@ describe('черновики ответов в тикет', () => {
     expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
     expect(telegram.answerCallbackQuery.mock.calls[0][1]).not.toContain('секрет');
     expect(telegram.editMessageText).not.toHaveBeenCalled();
+  });
+
+  it.each(['read', 'claim', 'publish', 'finalize'])('transient %s сбой пробрасывает safe retryable error после cleanup', async (stage) => {
+    const failure = Object.assign(new Error('RAW-DATABASE-SECRET'), { kind: 'db_down' });
+    if (stage === 'read') store.getDraft.mockRejectedValue(failure);
+    if (stage === 'claim') store.claimDraft.mockRejectedValue(failure);
+    if (stage === 'publish') support.postOwnerReplyFromTelegram.mockRejectedValue(failure);
+    if (stage === 'finalize') store.finalizeDraft.mockRejectedValue(failure);
+
+    await expect(drafts.handleCallback(callback())).rejects.toMatchObject({ kind: 'draft_retry' });
+
+    if (stage === 'publish' || stage === 'finalize') {
+      expect(store.releaseDraft).toHaveBeenCalledWith(DRAFT, 'sending', 1);
+    }
+    expect(JSON.stringify(store.releaseDraft.mock.calls)).not.toContain('RAW-DATABASE-SECRET');
   });
 
   it('при ошибке чтения черновика callback всё равно получает ровно один ответ', async () => {

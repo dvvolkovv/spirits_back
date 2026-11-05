@@ -82,6 +82,7 @@ describe('AlertBotService', () => {
       completeUpdate: jest.fn().mockResolvedValue(undefined),
       failUpdate: jest.fn().mockResolvedValue(false),
       dueUpdates: jest.fn().mockResolvedValue([]),
+      requeueProcessingUpdates: jest.fn().mockResolvedValue(undefined),
       findTurnByAnswer: jest.fn().mockResolvedValue(null),
     };
     commands = {
@@ -484,6 +485,61 @@ describe('AlertBotService', () => {
     expect(access.resolveTelegram).not.toHaveBeenCalled();
     expect(turns.enqueue).not.toHaveBeenCalled();
     expect(telegram.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('alreadyClaimed webhook update не делает второй durable claim', async () => {
+    await (service as any).handleUpdate(update(), true);
+
+    expect(store.claimUpdate).not.toHaveBeenCalled();
+    expect(turns.enqueue).toHaveBeenCalledTimes(1);
+    expect(store.completeUpdate).toHaveBeenCalledWith(1);
+  });
+
+  it('periodic retry сначала рекуеит только stale processing, затем читает due failed', async () => {
+    await service.retryFailedUpdates();
+
+    expect(store.requeueProcessingUpdates).toHaveBeenCalledWith(60);
+    expect(store.dueUpdates).toHaveBeenCalledTimes(1);
+    expect(store.requeueProcessingUpdates.mock.invocationCallOrder[0]).toBeLessThan(
+      store.dueUpdates.mock.invocationCallOrder[0],
+    );
+  });
+
+  it.each([
+    ['accepted', 'Вопрос принят'],
+    ['busy', 'Занят, спросите через минуту'],
+    ['rate_limited', 'Лимит вопросов в час исчерпан'],
+    ['stale', 'Черновик устарел'],
+  ])('draft ask ack после admission %s имеет соответствующий текст', async (admission, text) => {
+    drafts.handleCallback.mockResolvedValue({
+      question: 'Текст черновика', ticketId: TICKET, draftId: DRAFT, claimVersion: 3, guardToken: GUARD_TOKEN,
+    });
+    turns.enqueue.mockResolvedValue(admission);
+
+    await service.handleUpdate(callback(`draft:${DRAFT}:ask`));
+
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('callback-1', text);
+    expect(telegram.answerCallbackQuery.mock.invocationCallOrder[0]).toBeGreaterThan(
+      turns.enqueue.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('draft ask не получает ack, пока admission ещё не завершился', async () => {
+    let resolveAdmission!: (value: 'accepted') => void;
+    turns.enqueue.mockImplementation(() => new Promise<'accepted'>((resolve) => { resolveAdmission = resolve; }));
+    drafts.handleCallback.mockResolvedValue({
+      question: 'Текст черновика', ticketId: TICKET, draftId: DRAFT, claimVersion: 3, guardToken: GUARD_TOKEN,
+    });
+
+    const handling = service.handleUpdate(callback(`draft:${DRAFT}:ask`));
+    for (let i = 0; i < 20 && turns.enqueue.mock.calls.length === 0; i += 1) await Promise.resolve();
+    expect(telegram.answerCallbackQuery).not.toHaveBeenCalled();
+
+    resolveAdmission('accepted');
+    await handling;
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('callback-1', 'Вопрос принят');
   });
 
   it('ошибка хранилища логируется только по kind, без текста сообщения', async () => {
