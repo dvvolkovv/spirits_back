@@ -40,6 +40,10 @@ BEGIN
   IF to_regclass('idx_alert_bot_turns_answer') IS NULL THEN
     CREATE INDEX idx_alert_bot_turns_answer ON alert_bot_turns (chat_id, answer_message_id);
   END IF;
+  IF to_regclass('idx_alert_bot_turns_answer_ids_gin') IS NULL THEN
+    CREATE INDEX idx_alert_bot_turns_answer_ids_gin
+      ON alert_bot_turns USING GIN (answer_message_ids);
+  END IF;
   IF to_regclass('idx_alert_bot_turns_user_recent') IS NULL THEN
     CREATE INDEX idx_alert_bot_turns_user_recent ON alert_bot_turns (linkeon_user_id, created_at DESC);
   END IF;

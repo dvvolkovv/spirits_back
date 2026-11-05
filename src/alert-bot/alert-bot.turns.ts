@@ -51,7 +51,7 @@ export class AlertBotTurns {
     const previous = this.chains.get(key) || Promise.resolve();
     const run = previous.then(() => this.execute(input));
     let tracked: Promise<void>;
-    tracked = run.then(() => undefined).finally(() => {
+    tracked = run.then(() => undefined, () => undefined).finally(() => {
       const left = (this.pending.get(key) || 1) - 1;
       if (left > 0) this.pending.set(key, left);
       else this.pending.delete(key);
@@ -128,7 +128,7 @@ export class AlertBotTurns {
       deliveredIds = [...answerMessageIds];
       deliveryComplete = true;
       await this.persistAnswerMessages(turnId, answerMessageIds);
-      await this.store.finishTurn(turnId, {
+      const finished = await this.store.finishTurn(turnId, {
         status: 'ok',
         answer: answer.text,
         tools: answer.tools,
@@ -136,7 +136,8 @@ export class AlertBotTurns {
         costUsd: answer.costUsd,
       });
       finishAttempted = true;
-      this.log(turnId, 'ok', 'done');
+      if (finished) this.log(turnId, 'ok', 'done');
+      else this.log(turnId, 'ignored', 'fenced');
     } catch (error) {
       const kind = safeErrorKind(error);
       this.log(turnId, 'error', kind);
@@ -196,7 +197,7 @@ export class AlertBotTurns {
       Array.from(answer.matchAll(/#([0-9a-f]{8})\b/gi), (match) => match[1].toLowerCase()),
     ));
     const buttons: Array<Array<{ text: string; url: string }>> = [];
-    for (const prefix of prefixes) {
+    for (const prefix of prefixes.slice(0, 10)) {
       const ticket = await this.support.findTicketByPrefix(prefix);
       if (!ticket) continue;
       const origin = (process.env.ADMIN_ORIGIN || 'https://my.linkeon.io').replace(/\/+$/, '');
@@ -234,7 +235,7 @@ export class AlertBotTurns {
     }
   }
 
-  private log(turnId: string | null, status: AlertBotTurnStatus, kind: string): void {
+  private log(turnId: string | null, status: AlertBotTurnStatus | 'ignored', kind: string): void {
     this.logger.error(`alert-bot turn=${turnId || 'none'} status=${status} kind=${kind}`);
   }
 }

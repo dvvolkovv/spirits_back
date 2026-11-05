@@ -243,7 +243,7 @@ export class AlertBotService {
     }
 
     const repliedPrefix = ticketPrefix(repliedText || '');
-    if (message.reply_to_message && repliedPrefix) {
+    if (message.reply_to_message && repliedPrefix && (replyToBot || command?.name === 'ask')) {
       const ticket = await this.support.findTicketByPrefix(repliedPrefix);
       if (ticket) {
         if (command?.name === 'ask') {
@@ -301,7 +301,6 @@ export class AlertBotService {
     const now = Date.now();
     const previous = this.refusalSentAt.get(tgUserId) || 0;
     if (now - previous < REFUSAL_EVERY_MS) return;
-    this.refusalSentAt.set(tgUserId, now);
     for (const [key, sentAt] of this.refusalSentAt) {
       if (now - sentAt >= REFUSAL_EVERY_MS) this.refusalSentAt.delete(key);
     }
@@ -310,6 +309,7 @@ export class AlertBotService {
       'Доступ только для администраторов',
       message.message_id,
     );
+    this.refusalSentAt.set(tgUserId, now);
   }
 }
 
