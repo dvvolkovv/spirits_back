@@ -88,6 +88,10 @@ describe('черновики ответов в тикет', () => {
     telegram.answerCallbackQuery.mockResolvedValue(undefined);
   });
 
+  afterEach(() => {
+    (drafts as any).activeQuestionDraftIds?.clear();
+  });
+
   it('maybeDraft создаёт черновик и отправляет ровно три inline-кнопки', async () => {
     await drafts.maybeDraft(maybeInput());
 
@@ -318,6 +322,88 @@ describe('черновики ответов в тикет', () => {
     expect(support.adminGetTicket).not.toHaveBeenCalled();
     expect(support.postOwnerReplyFromTelegram).not.toHaveBeenCalled();
     expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
+  });
+
+  it('повторный ask отклоняется локально, пока первый claim ещё ожидает БД', async () => {
+    let resolveFirstClaim!: (value: { status: string; version: number }) => void;
+    const firstClaim = new Promise<{ status: string; version: number }>((resolve) => {
+      resolveFirstClaim = resolve;
+    });
+    store.claimDraft
+      .mockImplementationOnce(() => firstClaim)
+      .mockResolvedValueOnce({ status: 'claimed', version: 2 });
+
+    const first = drafts.handleCallback(callback({ action: 'ask', callbackId: 'first' }));
+    for (let i = 0; i < 20 && store.claimDraft.mock.calls.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    expect(store.claimDraft).toHaveBeenCalledTimes(1);
+
+    const second = await drafts.handleCallback(callback({ action: 'ask', callbackId: 'second' }));
+    resolveFirstClaim({ status: 'claimed', version: 1 });
+    await expect(first).resolves.toEqual({
+      question: 'текст', ticketId: TICKET, draftId: DRAFT, claimVersion: 1,
+    });
+
+    expect(second).toEqual({});
+    expect(store.claimDraft).toHaveBeenCalledTimes(1);
+    expect(telegram.answerCallbackQuery).toHaveBeenCalledWith(
+      'second', 'Черновик уже обрабатывается',
+    );
+  });
+
+  it.each(['read', 'claim'])('неуспешный ask снимает локальную блокировку при сбое %s', async (failure) => {
+    if (failure === 'read') {
+      store.getDraft
+        .mockRejectedValueOnce(new Error('database down'))
+        .mockResolvedValueOnce(draft());
+    } else {
+      store.claimDraft
+        .mockResolvedValueOnce({ status: 'unavailable' })
+        .mockResolvedValueOnce({ status: 'claimed', version: 2 });
+    }
+
+    await expect(drafts.handleCallback(callback({ action: 'ask', callbackId: 'first' })))
+      .resolves.toEqual({});
+    const retry = await drafts.handleCallback(callback({ action: 'ask', callbackId: 'retry' }));
+
+    expect(retry).toEqual({
+      question: 'текст', ticketId: TICKET, draftId: DRAFT,
+      claimVersion: failure === 'read' ? 1 : 2,
+    });
+    expect(store.claimDraft).toHaveBeenCalledTimes(failure === 'read' ? 1 : 2);
+  });
+
+  it('finishAsk снимает локальную блокировку без release уже принятого вопроса', async () => {
+    store.claimDraft
+      .mockResolvedValueOnce({ status: 'claimed', version: 1 })
+      .mockResolvedValueOnce({ status: 'claimed', version: 2 });
+    await drafts.handleCallback(callback({ action: 'ask', callbackId: 'first' }));
+
+    (drafts as any).finishAsk(DRAFT);
+    const retry = await drafts.handleCallback(callback({ action: 'ask', callbackId: 'second' }));
+
+    expect(retry).toEqual({
+      question: 'текст', ticketId: TICKET, draftId: DRAFT, claimVersion: 2,
+    });
+    expect(store.claimDraft).toHaveBeenCalledTimes(2);
+    expect(store.releaseDraft).not.toHaveBeenCalled();
+  });
+
+  it('releaseAsk снимает локальную блокировку вместе с reservation в БД', async () => {
+    store.claimDraft
+      .mockResolvedValueOnce({ status: 'claimed', version: 1 })
+      .mockResolvedValueOnce({ status: 'claimed', version: 2 });
+    await drafts.handleCallback(callback({ action: 'ask', callbackId: 'first' }));
+
+    await drafts.releaseAsk(DRAFT, 1);
+    const retry = await drafts.handleCallback(callback({ action: 'ask', callbackId: 'second' }));
+
+    expect(retry).toEqual({
+      question: 'текст', ticketId: TICKET, draftId: DRAFT, claimVersion: 2,
+    });
+    expect(store.releaseDraft).toHaveBeenCalledWith(DRAFT, 'asking', 1);
+    expect(store.claimDraft).toHaveBeenCalledTimes(2);
   });
 
   it('восстановленный cancel после публикации финализирует sent и сообщает, что ответ уже отправлен', async () => {

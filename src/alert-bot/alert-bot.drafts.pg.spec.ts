@@ -9,6 +9,8 @@ import * as path from 'path';
 import { Pool } from 'pg';
 import { SupportService } from '../support/support.service';
 import { AlertBotDrafts } from './alert-bot.drafts';
+import { AlertBotService } from './alert-bot.service';
+import { AlertBotTurns } from './alert-bot.turns';
 import { AlertBotStore } from './alert-bot.store';
 
 const PG = process.env.PROVISIONING_PG_URL;
@@ -97,6 +99,14 @@ maybe('callback черновика с lease против PostgreSQL', () => {
       action,
       messageId: 900,
     };
+  }
+
+  async function waitUntil(predicate: () => boolean): Promise<void> {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if (predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error('condition was not reached');
   }
 
   async function oldPublishWaitsOnTicketLock(): Promise<boolean> {
@@ -274,5 +284,136 @@ maybe('callback черновика с lease против PostgreSQL', () => {
     expect((await store.getDraft(newDraftId))?.outcome).toBe('cancelled');
     expect(telegram.answerCallbackQuery.mock.calls[telegram.answerCallbackQuery.mock.calls.length - 1][1]).toContain('закрыт');
     expect(email).toHaveBeenCalledTimes(1);
+  });
+
+  it('новый экземпляр Drafts восстанавливает заброшенный asking после restart и lease expiry', async () => {
+    const ticketId = await newTicket();
+    const draftId = await newDraft(ticketId, 'вопрос после restart');
+    const localTelegram = {
+      editMessageText: jest.fn().mockResolvedValue(undefined),
+      answerCallbackQuery: jest.fn().mockResolvedValue(undefined),
+    };
+    const beforeRestart = new AlertBotDrafts(store, support, localTelegram as any);
+
+    await expect(beforeRestart.handleCallback(callback(draftId, 'ask', 'before-restart')))
+      .resolves.toEqual({
+        question: 'вопрос после restart', ticketId, draftId, claimVersion: 1,
+      });
+    await pool.query(
+      "UPDATE alert_bot_ticket_drafts SET claimed_at = now() - interval '61 seconds' WHERE id = $1",
+      [draftId],
+    );
+
+    const afterRestart = new AlertBotDrafts(store, support, localTelegram as any);
+    const recovered = await afterRestart.handleCallback(callback(draftId, 'ask', 'after-restart'));
+
+    expect(recovered).toEqual({
+      question: 'вопрос после restart', ticketId, draftId, claimVersion: 2,
+    });
+    expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'asking', claimVersion: 2 });
+    await afterRestart.releaseAsk(draftId, 2);
+  });
+
+  it('queued asking переживает два lease expiry без новых версий, busy и повторной модели', async () => {
+    const ticketId = await newTicket();
+    const draftId = await newDraft(ticketId, 'вопрос из черновика');
+    const previousChat = process.env.TELEGRAM_CHAT_ID;
+    process.env.TELEGRAM_CHAT_ID = CHAT;
+    const localTelegram = {
+      getMe: jest.fn().mockResolvedValue({ id: 999, username: 'linkeon_alert_bot' }),
+      sendMessage: jest.fn()
+        .mockResolvedValueOnce({ message_id: 201 })
+        .mockResolvedValueOnce({ message_id: 202 }),
+      editMessageText: jest.fn().mockResolvedValue(undefined),
+      answerCallbackQuery: jest.fn().mockResolvedValue(undefined),
+      sendChunks: jest.fn().mockImplementation(
+        async (_chatId: string, _text: string, firstMessageId: number) => [firstMessageId],
+      ),
+    };
+    const localDrafts = new AlertBotDrafts(store, support, localTelegram as any);
+    const blockerStarted = deferred<void>();
+    const blockerAnswer = deferred<{ text: string; sessionId: string | null }>();
+    const ai = {
+      answer: jest.fn()
+        .mockImplementationOnce(async () => {
+          blockerStarted.resolve(undefined);
+          return blockerAnswer.promise;
+        })
+        .mockResolvedValueOnce({ text: 'ответ из черновика', sessionId: null }),
+    };
+    const status = {
+      begin: jest.fn().mockResolvedValue('status'),
+      typing: jest.fn().mockResolvedValue('typing'),
+      end: jest.fn().mockResolvedValue(undefined),
+    };
+    const chat = { begin: jest.fn(), end: jest.fn().mockResolvedValue(undefined) };
+    const turns = new AlertBotTurns(store, ai as any, localTelegram as any, status as any, chat as any, support);
+    const service = new AlertBotService(
+      { resolveTelegram: jest.fn().mockResolvedValue({ userId: 'u-admin', isAdmin: true }) } as any,
+      localTelegram as any,
+      store,
+      {} as any,
+      localDrafts,
+      turns,
+      support,
+    );
+    const update = (updateId: number, callbackId: string) => ({
+      update_id: updateId,
+      callback_query: {
+        id: callbackId,
+        from: { id: 111 },
+        data: `draft:${draftId}:ask`,
+        message: {
+          message_id: 900,
+          chat: { id: Number(CHAT), type: 'supergroup' },
+        },
+      },
+    });
+    const callbacks: Array<Promise<void>> = [];
+    const blockerTurn = turns.enqueue({
+      updateId: 7100,
+      chatId: CHAT,
+      tgUserId: '111',
+      adminUserId: 'u-admin',
+      questionMessageId: 800,
+      question: 'блокирующий вопрос',
+      privateChat: false,
+    });
+
+    try {
+      await blockerStarted.promise;
+      callbacks.push(service.handleUpdate(update(7101, 'first')));
+      await waitUntil(() => localTelegram.answerCallbackQuery.mock.calls.some(([id]) => id === 'first'));
+      expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'asking', claimVersion: 1 });
+
+      for (const [index, callbackId] of ['second', 'third'].entries()) {
+        await pool.query(
+          "UPDATE alert_bot_ticket_drafts SET claimed_at = now() - interval '61 seconds' WHERE id = $1",
+          [draftId],
+        );
+        callbacks.push(service.handleUpdate(update(7102 + index, callbackId)));
+        await waitUntil(() => localTelegram.answerCallbackQuery.mock.calls.some(([id]) => id === callbackId));
+        expect(localTelegram.answerCallbackQuery).toHaveBeenCalledWith(
+          callbackId, 'Черновик уже обрабатывается',
+        );
+        expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'asking', claimVersion: 1 });
+        expect(ai.answer).toHaveBeenCalledTimes(1);
+      }
+    } finally {
+      blockerAnswer.resolve({ text: 'ответ блокирующего вопроса', sessionId: null });
+      await blockerTurn;
+      await Promise.all(callbacks);
+      await turns.idle();
+      if (previousChat === undefined) delete process.env.TELEGRAM_CHAT_ID;
+      else process.env.TELEGRAM_CHAT_ID = previousChat;
+    }
+
+    expect(await store.getDraft(draftId)).toMatchObject({ outcome: 'asked', claimVersion: 1 });
+    expect(ai.answer).toHaveBeenCalledTimes(2);
+    expect(ai.answer.mock.calls.filter(([input]) => input.question === 'вопрос из черновика')).toHaveLength(1);
+    const draftTurns = await pool.query(
+      "SELECT status FROM alert_bot_turns WHERE question = 'вопрос из черновика'",
+    );
+    expect(draftTurns.rows).toEqual([{ status: 'ok' }]);
   });
 });

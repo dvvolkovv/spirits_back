@@ -89,6 +89,7 @@ describe('AlertBotService', () => {
       maybeDraft: jest.fn().mockResolvedValue(null),
       handleCallback: jest.fn().mockResolvedValue({}),
       finalizeAsk: jest.fn().mockResolvedValue(undefined),
+      finishAsk: jest.fn(),
       releaseAsk: jest.fn().mockResolvedValue(undefined),
     };
     turns = { enqueue: jest.fn().mockResolvedValue('accepted') };
@@ -387,6 +388,7 @@ describe('AlertBotService', () => {
       questionMessageId: 900, privateChat: true, ticketId: TICKET,
     }), { draftId: DRAFT, claimVersion: 3 });
     expect(drafts.finalizeAsk).not.toHaveBeenCalled();
+    expect(drafts.finishAsk).toHaveBeenCalledWith(DRAFT);
     expect(drafts.releaseAsk).not.toHaveBeenCalled();
   });
 
@@ -399,6 +401,7 @@ describe('AlertBotService', () => {
     await service.handleUpdate(callback(`draft:${DRAFT}:ask`));
 
     expect(drafts.releaseAsk).toHaveBeenCalledWith(DRAFT, 4);
+    expect(drafts.finishAsk).toHaveBeenCalledWith(DRAFT);
     expect(turns.enqueue).toHaveBeenCalledWith(expect.anything(), { draftId: DRAFT, claimVersion: 4 });
     expect(drafts.finalizeAsk).not.toHaveBeenCalled();
   });
@@ -412,6 +415,7 @@ describe('AlertBotService', () => {
     await service.handleUpdate(callback(`draft:${DRAFT}:ask`));
 
     expect(drafts.releaseAsk).toHaveBeenCalledWith(DRAFT, 5);
+    expect(drafts.finishAsk).toHaveBeenCalledWith(DRAFT);
     expect(drafts.finalizeAsk).not.toHaveBeenCalled();
     expect(JSON.stringify(logger.error.mock.calls)).not.toContain('RAW-ADMISSION-SECRET');
   });
