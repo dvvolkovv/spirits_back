@@ -115,6 +115,12 @@ test('сетевой белый список: настройки возвращ�
   assert.notEqual(first.sandbox.network.allowedDomains, second.sandbox.network.allowedDomains);
 });
 
+test('сгенерированные Linkeon-файлы доступны для скачивания в песочнице', () => {
+  const domains = buildSandboxSettings(FS_KEY).sandbox.network.allowedDomains;
+  assert.ok(domains.includes('my.linkeon.io'), 'публичный URL созданного файла должен проходить сетевой белый список');
+  assert.equal(domains.includes('*.linkeon.io'), false);
+});
+
 test('fsKey: только безопасный сегмент пути', () => {
   for (const fsKey of ['/', '..', '']) {
     assert.throws(() => buildSandboxSettings(fsKey), TypeError);
