@@ -189,26 +189,31 @@ describe('AlertBotTools', () => {
     expect(JSON.stringify(result)).not.toContain(SECRET);
   });
 
-  it('alerts запрашивает firing, длительность и историю и связывает since по метрике', async () => {
-    const metric = { alertname: 'ApiDown', instance: 'prod' };
+  it('alerts связывает нормализованные labels и использует timestamp ALERTS_FOR_STATE как since', async () => {
+    const firingMetric = {
+      __name__: 'ALERTS', instance: 'prod', alertstate: 'firing', alertname: 'ApiDown', severity: 'critical',
+    };
+    const stateMetric = {
+      severity: 'critical', alertname: 'ApiDown', __name__: 'ALERTS_FOR_STATE', instance: 'prod',
+    };
     mocks.monitoring.query.mockImplementation(async (query: string) => {
-      if (query.startsWith('ALERTS_FOR_STATE')) return [{ metric, value: [1_800_000_000, '120'] }];
-      if (query.startsWith('max_over_time')) return [{ metric, value: [1_800_000_000, '1'] }];
-      return [{ metric, value: [1_800_000_000, '1'] }];
+      if (query === 'ALERTS_FOR_STATE') return [{ metric: stateMetric, value: [1_800_000_120, '1800000000'] }];
+      if (query.startsWith('max_over_time')) return [{ metric: firingMetric, value: [1_800_000_120, '1'] }];
+      return [{ metric: firingMetric, value: [1_800_000_120, '1'] }];
     });
 
     const result = await execute(tools, 'alerts', { hours: 6 });
 
     expect(mocks.monitoring.query.mock.calls.map(([query]) => query)).toEqual([
       'ALERTS{alertstate="firing"}',
-      'ALERTS_FOR_STATE{alertstate="firing"}',
+      'ALERTS_FOR_STATE',
       'max_over_time(ALERTS{alertstate="firing"}[6h])',
     ]);
     expect(result.prometheus.firing[0]).toMatchObject({
-      metric,
-      since: new Date((1_800_000_000 - 120) * 1000).toISOString(),
+      metric: firingMetric,
+      since: new Date(1_800_000_000 * 1000).toISOString(),
     });
-    expect(result.prometheus.history[0].metric).toEqual(metric);
+    expect(result.prometheus.history[0].metric).toEqual(firingMetric);
   });
 
   it('health принимает claude и отклоняет неизвестный раздел', async () => {
@@ -280,6 +285,12 @@ describe('AlertBotTools', () => {
     expect(mocks.economy.getOverview).toHaveBeenCalledWith(window as EconomyWindow, undefined);
   });
 
+  it('stats economy по умолчанию использует окно 30d', async () => {
+    const result = await execute(tools, 'stats', { section: 'economy' });
+    expect(mocks.economy.getOverview).toHaveBeenCalledWith('30d', undefined);
+    expect(result.window).toBe('30d');
+  });
+
   it('stats funnel передаёт from/to/source, summary не требует параметров', async () => {
     await execute(tools, 'stats', { section: 'funnel', days: 7, source: 'ads' });
     expect(mocks.funnel.getFunnel).toHaveBeenCalledTimes(1);
@@ -314,11 +325,22 @@ describe('AlertBotTools', () => {
         dueAt: '2026-11-05T00:10:00.000Z', firstReplyAt: null, overdue: true,
       },
     });
-    expect(item.reason).toBe(Array.from(maskText(SECRET)).slice(0, 300).join(''));
+    expect(item.reason).toBe(Array.from(maskText(SECRET)).slice(0, 200).join(''));
     expect(item).not.toHaveProperty('userId');
     expect(item).not.toHaveProperty('assignedTo');
     expect(JSON.stringify(result)).not.toContain(SECRET);
     expect(JSON.stringify(result)).not.toContain(TICKET);
+  });
+
+  it('tickets обрезает reason до 200 кодовых точек после маскирования', async () => {
+    const reason = `${'я'.repeat(190)}79012345678${'z'.repeat(100)}`;
+    mocks.support.adminListTickets.mockResolvedValue([ticketRow({ escalationReason: reason })]);
+
+    const result = await execute(tools, 'tickets');
+
+    expect(result.tickets[0].reason).toBe(Array.from(maskText(reason)).slice(0, 200).join(''));
+    expect(Array.from(result.tickets[0].reason)).toHaveLength(200);
+    expect(JSON.stringify(result)).not.toContain('79012345678');
   });
 
   it('tickets active=false включает resolved/closed и применяет limit=20 по умолчанию', async () => {
@@ -346,7 +368,7 @@ describe('AlertBotTools', () => {
         content: `m${index} ${SECRET} ${'z'.repeat(600)}`, created_at: new Date('2026-11-05T00:00:00.000Z'),
       })),
       events: [{ payload: SECRET }],
-      user: { email: 'a@example.com' },
+      user: { email: 'a@example.com', profile_data: { name: 'Анна из профиля' } },
     });
 
     const result = await execute(tools, 'tickets', { ticket: '#11111111' });
@@ -354,6 +376,7 @@ describe('AlertBotTools', () => {
     expect(mocks.support.findTicketByPrefix).toHaveBeenCalledWith('11111111', undefined);
     expect(mocks.support.adminGetTicket).toHaveBeenCalledWith(TICKET, undefined);
     expect(result.ticket.id).toBe('#11111111');
+    expect(result.ticket.user.name).toBe('Анна из профиля');
     expect(result.messages).toHaveLength(10);
     expect(Array.from(result.messages[0].content)).toHaveLength(500);
     expect(result.messages[0].content).toBe(Array.from(maskText(`m1 ${SECRET} ${'z'.repeat(600)}`)).slice(0, 500).join(''));
@@ -391,7 +414,7 @@ describe('AlertBotTools', () => {
     await call('stats', { section: 'active' });
     expect(mocks.admin.getActiveUsersStats).toHaveBeenCalledWith({ days: 7, bucket: 'day' }, signal);
     await call('stats', { section: 'economy' });
-    expect(mocks.economy.getOverview).toHaveBeenCalledWith('7d', signal);
+    expect(mocks.economy.getOverview).toHaveBeenCalledWith('30d', signal);
     await call('stats', { section: 'funnel' });
     expect(mocks.funnel.getFunnel.mock.calls[0][3]).toBe(signal);
     await call('stats', { section: 'summary' });

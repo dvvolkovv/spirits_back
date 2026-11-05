@@ -85,6 +85,23 @@ describe('маска бота алертов', () => {
     expect(JSON.parse(out)).toEqual({ metric: { at: 1800000000, duration: 120000000000 } });
   });
 
+  it('маскирует числовой телефон, сохраняя Unix timestamps числами и валидный JSON', () => {
+    const out = toolText({ at: 1_800_000_000, phone: 7_901_234_5678 });
+    const parsed = JSON.parse(out);
+    expect(parsed.at).toBe(1_800_000_000);
+    expect(typeof parsed.at).toBe('number');
+    expect(parsed.phone).toBe('+7 *** *** 78');
+    expect(out).not.toContain('79012345678');
+  });
+
+  it('при сбое финальной JSON-проверки отдаёт безопасный wrapper, а не исходный JSON', () => {
+    jest.spyOn(JSON, 'parse').mockImplementationOnce(() => { throw new SyntaxError('forced'); });
+    const out = toolText({ phone: 7_901_234_5678 });
+    expect(out).not.toContain('79012345678');
+    expect(out).toContain('+7 *** *** 78');
+    expect(JSON.parse(out)).toEqual(expect.any(Object));
+  });
+
   it('маскирует UUID без ограничения версии и варианта', () => {
     const ticket = '018f2c3a-9d4e-7abc-8def-abcdef123456';
     expect(maskText(ticket)).toBe('[id]');
