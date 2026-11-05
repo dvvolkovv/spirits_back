@@ -74,12 +74,13 @@ describe('SyntheticService: протухание результатов', () => 
     expect(alertTexts().some((t) => t.includes('ослеп'))).toBe(false);
   });
 
-  it('только in-process сценарии (раннер ещё не заводили) — молчим', async () => {
+  it('только in-process сценарии: отсутствие строк RUNNER_SCENARIOS означает stale и алерт', async () => {
     const svc = makeService([row('tg_webhook', 1)]);
 
     await svc.checkAndAlert();
 
-    expect(mockedSend).not.toHaveBeenCalled();
+    expect(alertTexts().some((t) => t.includes('ослеп'))).toBe(true);
+    await expect(svc.getOverview()).resolves.toMatchObject({ stale: true });
   });
 
   it('chat_quality_probe свежий, а раннер молчит — всё равно алерт (инцидент 23.10)', async () => {

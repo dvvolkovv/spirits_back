@@ -279,6 +279,17 @@ describe('AlertBotTools', () => {
     expect(result).toMatchObject({ section, data: { section } });
   });
 
+  it('stats возвращает фактически запрошенные bucket для tokens и active', async () => {
+    await execute(tools, 'stats', { section: 'tokens', bucket: 'hour' });
+    expect(mocks.admin.getTokensSpendStats).toHaveBeenCalledWith({ days: 7, bucket: 'hour' }, undefined);
+
+    await execute(tools, 'stats', { section: 'active', bucket: 'hour' });
+    expect(mocks.admin.getActiveUsersStats).toHaveBeenCalledWith({ days: 7, bucket: 'hour' }, undefined);
+
+    await execute(tools, 'stats', { section: 'tokens', bucket: 'week' });
+    expect(mocks.admin.getTokensSpendStats).toHaveBeenCalledWith({ days: 7, bucket: 'week' }, undefined);
+  });
+
   it('stats tokens hour сообщает эффективные 14 дней вместо запрошенных 365', async () => {
     mocks.admin.getTokensSpendStats.mockResolvedValue({ bucket: 'hour', series: [] });
     const result = await execute(tools, 'stats', { section: 'tokens', bucket: 'hour', days: 365 });

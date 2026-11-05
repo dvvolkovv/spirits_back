@@ -447,4 +447,59 @@ describe('AlertBotTurns', () => {
     expect(logs).not.toContain('status=ok kind=done');
     expect(logs).toContain('status=ignored kind=fenced');
   });
+
+  it('queued второй ход уже учитывается в activeStreams и освобождает drain после завершения', async () => {
+    const first = deferred<{ text: string; costUsd: number; tools: string[] }>();
+    const started = deferred();
+    let activeStreams = 0;
+    chat.beginStream.mockImplementation(() => { activeStreams += 1; });
+    chat.endStream.mockImplementation(() => { activeStreams -= 1; });
+    ai.answer.mockImplementationOnce(() => {
+      started.resolve();
+      return first.promise;
+    });
+
+    const running = turns.enqueue(question({ updateId: 1, questionMessageId: 301 }));
+    await started.promise;
+    const waiting = turns.enqueue(question({ updateId: 2, questionMessageId: 302 }));
+
+    expect(activeStreams).toBe(2);
+    first.resolve({ text: 'первый', costUsd: 0, tools: [] });
+    await Promise.all([running, waiting]);
+    expect(activeStreams).toBe(0);
+    expect(ai.answer).toHaveBeenCalledTimes(2);
+  });
+
+  it('ticket buttons имеют общий 5s deadline, передают signal и не держат ответ или drain', async () => {
+    ai.answer.mockResolvedValue({ text: 'Смотри #11111111', costUsd: 0, tools: [] });
+    let lookupSignal: AbortSignal | undefined;
+    support.findTicketByPrefix.mockImplementation((_prefix: string, signal?: AbortSignal) => {
+      lookupSignal = signal;
+      return new Promise(() => {});
+    });
+
+    const startedAt = Date.now();
+    await expect(turns.enqueue(question())).resolves.toBe('accepted');
+
+    expect(Date.now() - startedAt).toBeLessThan(6500);
+    expect(lookupSignal?.aborted).toBe(true);
+    expect(telegram.sendChunks).toHaveBeenCalledTimes(1);
+    expect(telegram.sendChunks.mock.calls[0][4]).toBeUndefined();
+    expect(chat.endStream).toHaveBeenCalledTimes(1);
+  }, 7000);
+
+  it('ambiguous ticket prefix пропускается, а однозначный тикет сохраняет кнопку', async () => {
+    ai.answer.mockResolvedValue({ text: '#11111111 и #22222222', costUsd: 0, tools: [] });
+    support.findTicketByPrefix.mockImplementation(async (prefix: string) => {
+      if (prefix === '11111111') {
+        throw Object.assign(new Error('ambiguous'), { name: 'TicketPrefixAmbiguousError' });
+      }
+      return { id: TICKET_2 };
+    });
+
+    await expect(turns.enqueue(question())).resolves.toBe('accepted');
+
+    const markup = telegram.sendChunks.mock.calls[0][4];
+    expect(markup.inline_keyboard.flat().map((button: any) => button.text)).toEqual(['Открыть #22222222']);
+  });
 });

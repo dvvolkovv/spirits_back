@@ -375,6 +375,21 @@ describe('AlertBotOpsServer stateless MCP', () => {
     expect(stopped).toBe(true);
   });
 
+  it('stop без активного HTTP server всё равно abort-ит зависший tool', async () => {
+    const { getSignal, abortListener } = mockAbortableExecute();
+    const outcome = post({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'alerts', arguments: {} } })
+      .then((response) => ({ response }), (error) => ({ error }));
+    await waitForToolCall();
+    const rawServer = (server as any).server as http.Server;
+    (server as any).server = null;
+
+    await server.stop();
+
+    await expectActualAbort(getSignal, abortListener);
+    await outcome;
+    await new Promise<void>((resolve) => rawServer.close(() => resolve()));
+  });
+
   it('stop по backstop не ждёт Promise, игнорирующий AbortSignal', async () => {
     await restart({ toolTimeoutMs: 60_000, shutdownTimeoutMs: 20 });
     let signal: AbortSignal | undefined;

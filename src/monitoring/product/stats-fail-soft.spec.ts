@@ -1,6 +1,7 @@
 import { FunnelService } from './funnel.service';
 import { EconomyService } from './economy.service';
 import { SummaryService } from './summary.service';
+import { ProfileDepthService } from './profile-depth.service';
 
 const FROM = '2026-11-04T00:00:00.000Z';
 const TO = '2026-11-05T00:00:00.000Z';
@@ -66,6 +67,28 @@ describe('product stats fail-soft metadata and cancellation', () => {
     expect(result.indicators.find((row) => row.id === 'accept_rate'))
       .toMatchObject({ error: 'source_failed' });
     expect(result.indicators.find((row) => row.id === 'margin')).not.toHaveProperty('error');
+  });
+
+  it('profile-depth повторно выбрасывает abort вместо пустой валидной статистики', async () => {
+    const controller = new AbortController();
+    const reason = new Error('profile depth stop');
+    controller.abort(reason);
+    const neo4j = { readRows: jest.fn().mockRejectedValue(reason) };
+
+    await expect(new ProfileDepthService(neo4j as any).getOverview(controller.signal))
+      .rejects.toBe(reason);
+  });
+
+  it('summary помечает упавший PDS source_failed', async () => {
+    const pg = pgMock();
+    pg.query.mockResolvedValue({ rows: [{ v: 1 }] });
+    const profileDepth = { getOverview: jest.fn().mockRejectedValue(new Error('neo4j down')) };
+
+    const result = await new SummaryService(pg as any, profileDepth as any).getOverview();
+
+    expect(result).toMatchObject({ error: 'source_failed' });
+    expect(result.indicators.find((row) => row.id === 'pds'))
+      .toMatchObject({ error: 'source_failed' });
   });
 
   it.each(['sql', 'pds'])('summary повторно выбрасывает abort из %s fail-soft catch', async (source) => {

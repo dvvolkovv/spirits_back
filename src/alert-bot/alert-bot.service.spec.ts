@@ -292,7 +292,7 @@ describe('AlertBotService', () => {
     }));
   });
 
-  it('полный UUID в reply разрешается по первым восьми символам', async () => {
+  it('полный UUID в reply передаётся целиком, без рискованного prefix lookup', async () => {
     support.findTicketByPrefix.mockResolvedValue({ id: TICKET, status: 'owner_handling' });
 
     await service.handleUpdate(update({
@@ -300,8 +300,25 @@ describe('AlertBotService', () => {
       reply_to_message: botReply(`Эскалация ${TICKET}`),
     }));
 
-    expect(support.findTicketByPrefix).toHaveBeenCalledWith('11111111');
+    expect(support.findTicketByPrefix).toHaveBeenCalledWith(TICKET);
     expect(turns.enqueue).toHaveBeenCalledWith(expect.objectContaining({ ticketId: TICKET }));
+  });
+
+  it('ambiguous #8hex в reply не создаёт draft или model turn и просит полный UUID', async () => {
+    support.findTicketByPrefix.mockRejectedValue(
+      Object.assign(new Error('ambiguous'), { name: 'TicketPrefixAmbiguousError' }),
+    );
+
+    await service.handleUpdate(update({
+      text: 'Ответ пользователю',
+      reply_to_message: botReply('Эскалация #11111111'),
+    }));
+
+    expect(drafts.maybeDraft).not.toHaveBeenCalled();
+    expect(turns.enqueue).not.toHaveBeenCalled();
+    expect(telegram.sendMessage).toHaveBeenCalledWith(
+      '100', expect.stringContaining('полный UUID'), 10,
+    );
   });
 
   it('/start и /status выполняют deterministic commands и отправляют их текст', async () => {

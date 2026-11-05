@@ -55,7 +55,11 @@ describe('AlertBotLifecycle', () => {
   beforeEach(() => {
     jest.useFakeTimers();
     mocks = makeMocks();
-    lifecycle = new AlertBotLifecycle(mocks.store as any, mocks.ops as any, mocks.telegram as any);
+    lifecycle = new (AlertBotLifecycle as any)(
+      mocks.store, mocks.ops, mocks.telegram,
+      { idle: jest.fn().mockResolvedValue(undefined) },
+      { retryFailedUpdates: jest.fn().mockResolvedValue(undefined) },
+    );
     sinkSpy = jest.spyOn(telegramAlert, 'setAlertSentSink');
   });
 
@@ -103,7 +107,7 @@ describe('AlertBotLifecycle', () => {
     await lifecycle.onModuleInit();
 
     expect(calls).toEqual([
-      'migrate', 'interrupt', 'ops.start', 'sink', 'reply:chat-1', 'reply:chat-2', 'cleanup',
+      'migrate', 'ops.start', 'interrupt', 'sink', 'reply:chat-1', 'reply:chat-2', 'cleanup',
     ]);
     expect(mocks.telegram.sendMessage).toHaveBeenNthCalledWith(1, 'chat-1', RESTART_REPLY, 101);
     expect(mocks.telegram.sendMessage).toHaveBeenNthCalledWith(2, 'chat-2', RESTART_REPLY, 202);
@@ -139,6 +143,25 @@ describe('AlertBotLifecycle', () => {
 
     expect(sinkSpy).toHaveBeenLastCalledWith(null);
     expect(jest.getTimerCount()).toBe(0);
+    expect(mocks.ops.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it('beforeApplicationShutdown ограниченно ждёт turns и останавливает ops до закрытия пула', async () => {
+    enabled();
+    const calls: string[] = [];
+    const turns = { idle: jest.fn(() => { calls.push('turns.idle'); return new Promise<void>(() => {}); }) };
+    const service = { retryFailedUpdates: jest.fn() };
+    mocks.ops.stop.mockImplementation(async () => { calls.push('ops.stop'); });
+    lifecycle = new (AlertBotLifecycle as any)(mocks.store, mocks.ops, mocks.telegram, turns, service);
+    await lifecycle.onModuleInit();
+
+    const shutdown = (lifecycle as any).beforeApplicationShutdown();
+    await jest.advanceTimersByTimeAsync(5000);
+    await shutdown;
+    calls.push('pool.close');
+    await lifecycle.onModuleDestroy();
+
+    expect(calls).toEqual(['turns.idle', 'ops.stop', 'pool.close']);
     expect(mocks.ops.stop).toHaveBeenCalledTimes(1);
   });
 

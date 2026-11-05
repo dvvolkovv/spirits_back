@@ -166,4 +166,38 @@ maybe('идемпотентная публикация Telegram-черновик
     expect(await effects(ticketId)).toMatchObject({ messages: 0, events: 0, tagged: 0, status });
     expect(email).not.toHaveBeenCalled();
   });
+
+  it('одинаковый #8hex отклоняется, полный UUID точен, а повторный close не дублирует event', async () => {
+    const { service } = makeService();
+    const first = 'deadbeef-0000-4000-8000-000000000001';
+    const second = 'deadbeef-1111-4000-8000-000000000002';
+    await pool.query(
+      `INSERT INTO support_tickets (id, user_id, status)
+       VALUES ($1, 'collision-a', 'escalated'), ($2, 'collision-b', 'escalated')`,
+      [first, second],
+    );
+
+    await expect(service.findTicketByPrefix('deadbeef')).rejects.toMatchObject({
+      name: 'TicketPrefixAmbiguousError',
+    });
+    expect((await pool.query(
+      "SELECT count(*)::int AS n FROM support_tickets WHERE status <> 'escalated'",
+    )).rows[0].n).toBe(0);
+
+    await expect(service.findTicketByPrefix(second)).resolves.toMatchObject({ id: second });
+    await service.setStatusFromTelegram(second, '111', 'resolved', 'u-admin');
+    await service.setStatusFromTelegram(second, '111', 'resolved', 'u-admin');
+
+    const effects = await pool.query(
+      `SELECT
+         (SELECT status FROM support_tickets WHERE id = $1) AS first_status,
+         (SELECT status FROM support_tickets WHERE id = $2) AS second_status,
+         (SELECT count(*)::int FROM support_events
+           WHERE ticket_id = $2 AND action = 'status_change') AS close_events`,
+      [first, second],
+    );
+    expect(effects.rows[0]).toEqual({
+      first_status: 'escalated', second_status: 'resolved', close_events: 1,
+    });
+  });
 });

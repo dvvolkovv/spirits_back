@@ -91,6 +91,19 @@ describe('сводка /status без модели', () => {
     expect(text).toContain('ProbeFailed — prod (с 2023-11-14T22:13:20.000Z)');
   });
 
+  it('timeout поддержки передаёт linked AbortSignal в оба count query', async () => {
+    support.countActiveTickets.mockImplementation(() => new Promise(() => {}));
+    support.countOverdueTickets.mockImplementation(() => new Promise(() => {}));
+
+    const text = await status.summary();
+
+    expect(text).toContain('Тикеты: данные недоступны');
+    expect(support.countActiveTickets.mock.calls[0][0]).toBeInstanceOf(AbortSignal);
+    expect(support.countOverdueTickets.mock.calls[0][0]).toBeInstanceOf(AbortSignal);
+    expect(support.countActiveTickets.mock.calls[0][0].aborted).toBe(true);
+    expect(support.countOverdueTickets.mock.calls[0][0].aborted).toBe(true);
+  }, 4500);
+
   it('ограничивает бесконечные Prometheus, health и PG дедлайном', async () => {
     monitoring.query.mockImplementation(() => new Promise(() => {}));
     health.badSections.mockImplementation(() => new Promise(() => {}));

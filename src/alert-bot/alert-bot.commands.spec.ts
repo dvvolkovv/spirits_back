@@ -55,4 +55,21 @@ describe('команды бота алертов', () => {
     expect(support.findTicketByPrefix).not.toHaveBeenCalled();
     expect(support.setStatusFromTelegram).not.toHaveBeenCalled();
   });
+
+  it('ambiguous #8hex не закрывает чужой тикет и просит полный UUID', async () => {
+    support.findTicketByPrefix.mockRejectedValue(
+      Object.assign(new Error('ambiguous'), { name: 'TicketPrefixAmbiguousError' }),
+    );
+
+    expect(await commands.close('#11111111', identity)).toContain('полный UUID');
+    expect(support.setStatusFromTelegram).not.toHaveBeenCalled();
+  });
+
+  it('полный UUID закрывает точный тикет без prefix lookup', async () => {
+    support.findTicketByPrefix.mockResolvedValue({ id: TICKET });
+
+    expect(await commands.close(TICKET, identity)).toContain('✅');
+    expect(support.findTicketByPrefix).toHaveBeenCalledWith(TICKET);
+    expect(support.setStatusFromTelegram).toHaveBeenCalledWith(TICKET, '111', 'resolved', 'u-admin');
+  });
 });
