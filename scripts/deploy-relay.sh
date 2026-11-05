@@ -114,6 +114,46 @@ legacy_workers_drained() {
   return 0
 }
 
+nginx_files_proxy() {
+  if $SUDO grep -q '# LINKEON-RELAY-FILES-PROXY' "$NGINX_CONF"; then
+    return 0
+  fi
+  $SUDO python3 - "$NGINX_CONF" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as source:
+    text = source.read()
+old = '''    # Agent output files — direct download
+    location /files/ {
+        alias /tmp/agent-output/;
+        add_header Access-Control-Allow-Origin "*" always;
+    }'''
+new = '''    # Agent output files — relay reads private session directories
+    location /files/ {
+        # LINKEON-RELAY-FILES-PROXY
+        proxy_pass http://127.0.0.1:3033;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_hide_header Access-Control-Allow-Origin;
+        add_header Access-Control-Allow-Origin "*" always;
+    }'''
+if old not in text:
+    raise SystemExit("Nginx /files/ block is missing or differs from the legacy alias; refusing to guess")
+temporary = path + ".relay-files-proxy.tmp"
+with open(temporary, "w", encoding="utf-8") as output:
+    output.write(text.replace(old, new, 1))
+os.chmod(temporary, stat.S_IMODE(os.stat(path).st_mode))
+os.replace(temporary, path)
+PY
+  $SUDO nginx -t
+  $SUDO nginx -s reload
+  echo "Nginx /files/: proxy через relay, alias в закрытые каталоги снят"
+}
+
 nginx_drain_on() {
   LEGACY_NGINX_WORKERS=$(nginx_worker_pids)
   $SUDO python3 - "$NGINX_CONF" <<'PY'
@@ -283,6 +323,8 @@ for file in "${FILES[@]+"${FILES[@]}"}"; do
     exit 1
   fi
 done
+
+nginx_files_proxy
 
 INITIAL_INFLIGHT=$(inflight_count)
 if [[ "$INITIAL_INFLIGHT" == legacy ]]; then
