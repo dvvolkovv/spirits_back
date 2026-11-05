@@ -22,6 +22,7 @@ export interface AlertBotTurn {
   adminUserId: string;
   questionMessageId: number;
   answerMessageId: number | null;
+  answerMessageIds: number[];
   parentTurnId: string | null;
   question: string;
   answer: string | null;
@@ -92,6 +93,7 @@ function mapTurn(row: any): AlertBotTurn {
     adminUserId: row.linkeon_user_id,
     questionMessageId: Number(row.question_message_id),
     answerMessageId: row.answer_message_id === null ? null : Number(row.answer_message_id),
+    answerMessageIds: Array.isArray(row.answer_message_ids) ? row.answer_message_ids.map(Number) : [],
     parentTurnId: row.parent_turn_id,
     question: row.question,
     answer: row.answer,
@@ -174,6 +176,29 @@ export class AlertBotStore {
     return r.rows[0].id;
   }
 
+  async recordSystemTurn(input: TurnInput, status: 'busy' | 'rate_limited'): Promise<string> {
+    if (status !== 'busy' && status !== 'rate_limited') throw new Error('invalid system turn status');
+    const r = await this.pg.query(
+      `INSERT INTO alert_bot_turns
+         (update_id, chat_id, tg_user_id, linkeon_user_id, question_message_id,
+          parent_turn_id, question, private_chat, status, error_kind, duration_ms, finished_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, 0, now())
+       RETURNING id`,
+      [
+        input.updateId,
+        input.chatId,
+        input.tgUserId,
+        input.adminUserId,
+        input.questionMessageId,
+        input.parentTurnId ?? null,
+        input.question,
+        input.privateChat,
+        status,
+      ],
+    );
+    return r.rows[0].id;
+  }
+
   async tryCreateTurn(input: TurnInput, maxPerHour: number): Promise<string | null> {
     const client = await this.pg.getClient();
     let transactionOpen = false;
@@ -231,6 +256,17 @@ export class AlertBotStore {
     await this.pg.query('UPDATE alert_bot_turns SET answer_message_id = $2 WHERE id = $1', [turnId, messageId]);
   }
 
+  async attachAnswerMessages(turnId: string, messageIds: number[]): Promise<void> {
+    const ids = Array.from(new Set(messageIds.filter((id) => Number.isSafeInteger(id) && id > 0)));
+    if (!ids.length) throw new Error('answer message ids missing');
+    await this.pg.query(
+      `UPDATE alert_bot_turns
+       SET answer_message_id = $2, answer_message_ids = $3::jsonb
+       WHERE id = $1`,
+      [turnId, ids[0], JSON.stringify(ids)],
+    );
+  }
+
   async finishTurn(turnId: string, result: FinishTurnResult): Promise<boolean> {
     const fields: Array<[string, unknown]> = [['status', result.status]];
     if (result.answer !== undefined) fields.push(['answer', result.answer]);
@@ -252,8 +288,11 @@ export class AlertBotStore {
 
   async findTurnByAnswer(chatId: string, answerMessageId: number): Promise<AlertBotTurn | null> {
     const r = await this.pg.query(
-      'SELECT * FROM alert_bot_turns WHERE chat_id = $1 AND answer_message_id = $2 LIMIT 1',
-      [chatId, answerMessageId],
+      `SELECT * FROM alert_bot_turns
+       WHERE chat_id = $1
+         AND (answer_message_id = $2 OR answer_message_ids @> $3::jsonb)
+       LIMIT 1`,
+      [chatId, answerMessageId, JSON.stringify([answerMessageId])],
     );
     return r.rows[0] ? mapTurn(r.rows[0]) : null;
   }

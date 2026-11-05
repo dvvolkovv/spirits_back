@@ -72,7 +72,7 @@ export class AlertBotTurns {
 
       const placeholder = await this.telegram.sendMessage(input.chatId, '🔎 Смотрю…', input.questionMessageId);
       placeholderId = placeholder.message_id;
-      await this.store.attachAnswerMessage(turnId, placeholderId);
+      await this.store.attachAnswerMessages(turnId, [placeholderId]);
 
       this.chat.beginStream();
       streamOpen = true;
@@ -82,6 +82,7 @@ export class AlertBotTurns {
         answer = await this.ai.answer({ ...input, history });
       } catch (error) {
         const kind = safeErrorKind(error, 'unknown');
+        if (!['auth', 'limit', 'overloaded', 'timeout'].includes(kind)) throw error;
         const turnStatus: AlertBotTurnStatus = kind === 'timeout' ? 'timeout' : 'model_down';
         const summary = await this.status.summary();
         const fallback = `Модель недоступна: ${kind}.\n\n${summary}`;
@@ -98,13 +99,14 @@ export class AlertBotTurns {
       }
 
       const replyMarkup = await this.ticketButtons(answer.text);
-      await this.telegram.sendChunks(
+      const answerMessageIds = await this.telegram.sendChunks(
         input.chatId,
         answer.text,
         placeholderId,
         input.questionMessageId,
         replyMarkup,
       );
+      await this.store.attachAnswerMessages(turnId, answerMessageIds);
       finishAttempted = true;
       await this.store.finishTurn(turnId, {
         status: 'ok',
@@ -176,8 +178,7 @@ export class AlertBotTurns {
   }
 
   private async rejectRateLimited(input: TurnInput): Promise<void> {
-    const turnId = await this.store.createTurn(input);
-    await this.store.finishTurn(turnId, { status: 'rate_limited', errorKind: 'rate_limited', durationMs: 0 });
+    const turnId = await this.store.recordSystemTurn(input, 'rate_limited');
     this.log(turnId, 'rate_limited', 'rate_limited');
     await this.telegram.sendMessage(input.chatId, RATE_LIMITED_TEXT, input.questionMessageId);
   }
@@ -185,8 +186,7 @@ export class AlertBotTurns {
   private async rejectBusy(input: TurnInput): Promise<void> {
     let turnId: string | null = null;
     try {
-      turnId = await this.store.createTurn(input);
-      await this.store.finishTurn(turnId, { status: 'busy', errorKind: 'busy', durationMs: 0 });
+      turnId = await this.store.recordSystemTurn(input, 'busy');
       this.log(turnId, 'busy', 'busy');
       await this.telegram.sendMessage(input.chatId, BUSY_TEXT, input.questionMessageId);
     } catch (error) {

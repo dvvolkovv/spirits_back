@@ -13,6 +13,7 @@ BEGIN
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(), update_id bigint NOT NULL,
     chat_id text NOT NULL, tg_user_id text NOT NULL, linkeon_user_id text NOT NULL,
     question_message_id bigint NOT NULL, answer_message_id bigint, parent_turn_id uuid,
+    answer_message_ids jsonb NOT NULL DEFAULT '[]'::jsonb,
     question text NOT NULL, answer text, tools jsonb NOT NULL DEFAULT '[]'::jsonb,
     status text NOT NULL DEFAULT 'in_progress', error_kind text, duration_ms integer,
     cost_usd numeric(12,6), private_chat boolean NOT NULL DEFAULT false,
@@ -27,6 +28,8 @@ BEGIN
     claim_version bigint NOT NULL DEFAULT 0,
     created_at timestamptz NOT NULL DEFAULT now(), resolved_at timestamptz
   );
+  ALTER TABLE alert_bot_turns
+    ADD COLUMN IF NOT EXISTS answer_message_ids jsonb NOT NULL DEFAULT '[]'::jsonb;
   ALTER TABLE alert_bot_ticket_drafts
     ADD COLUMN IF NOT EXISTS claimed_at timestamptz;
   ALTER TABLE alert_bot_ticket_drafts

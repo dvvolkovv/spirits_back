@@ -71,6 +71,7 @@ function replyText(message?: TgMessage): string | undefined {
 export class AlertBotService {
   private readonly logger = new Logger(AlertBotService.name);
   private readonly refusalSentAt = new Map<string, number>();
+  private me: Promise<{ id: number; username: string }> | null = null;
 
   constructor(
     private readonly access: AlertBotAccess,
@@ -164,7 +165,7 @@ export class AlertBotService {
       return;
     }
 
-    const me = await this.telegram.getMe();
+    const me = await this.botIdentity();
     const command = parseCommand(text);
     if (command?.username && command.username.toLowerCase() !== me.username.toLowerCase()) return;
 
@@ -264,6 +265,16 @@ export class AlertBotService {
       privateChat: message.chat.type === 'private',
       ...extra,
     });
+  }
+
+  private botIdentity(): Promise<{ id: number; username: string }> {
+    if (!this.me) {
+      this.me = this.telegram.getMe().catch((error) => {
+        this.me = null;
+        throw error;
+      });
+    }
+    return this.me;
   }
 
   private async refuse(message: TgMessage, tgUserId: string): Promise<void> {

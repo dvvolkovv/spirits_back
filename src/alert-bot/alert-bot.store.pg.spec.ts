@@ -57,6 +57,7 @@ maybe('хранилище бота алертов против PostgreSQL', () =
     const row = (await pool.query('SELECT answer_message_id, answer_message_ids FROM alert_bot_turns WHERE id = $1', [id])).rows[0];
     expect(row.answer_message_id).toBe('20');
     expect(row.answer_message_ids).toEqual([20, 21, 22]);
+    await store.finishTurn(id, { status: 'ok' });
   });
   it('system turns сразу финальны, не тратят admission и не принимают поздний finish', async () => {
     const input = { updateId: 1060, chatId: 'system', tgUserId: '111', adminUserId: 'u-system', questionMessageId: 10, question: 'системный отказ', privateChat: true };
@@ -69,7 +70,9 @@ maybe('хранилище бота алертов против PostgreSQL', () =
     expect(rows.every((row) => row.finished_at instanceof Date)).toBe(true);
     expect(await store.countRecentTurns('u-system')).toBe(0);
     expect(await store.finishTurn(busyId, { status: 'ok' })).toBe(false);
-    expect(await store.tryCreateTurn({ ...input, updateId: 1062, question: 'первый настоящий ход' }, 1)).toEqual(expect.any(String));
+    const admittedId = await store.tryCreateTurn({ ...input, updateId: 1062, question: 'первый настоящий ход' }, 1);
+    expect(admittedId).toEqual(expect.any(String));
+    await store.finishTurn(admittedId!, { status: 'ok' });
   });
   it('цепочка реплаев идёт по parentTurnId и ограничена тремя', async () => {
     const first = await store.createTurn({ updateId: 1101, chatId: '1', tgUserId: '111', adminUserId: 'u-admin', questionMessageId: 101, question: 'первый', privateChat: false });

@@ -46,14 +46,19 @@ export class AlertBotTelegram {
   answerCallbackQuery(id: string, text: string): Promise<void> {
     return this.call('answerCallbackQuery', { callback_query_id: id, text });
   }
-  async sendChunks(chatId: string, text: string, firstMessageId: number, replyTo: number, replyMarkup?: unknown): Promise<void> {
+  async sendChunks(chatId: string, text: string, firstMessageId: number, replyTo: number, replyMarkup?: unknown): Promise<number[]> {
     const chunks = splitForTelegram(text);
     if (!chunks.length) {
       await this.editMessageText(chatId, firstMessageId, 'Модель вернула пустой ответ');
-      return;
+      return [firstMessageId];
     }
     await this.editMessageText(chatId, firstMessageId, chunks[0], replyMarkup);
-    for (const chunk of chunks.slice(1)) await this.sendMessage(chatId, chunk, replyTo);
+    const messageIds = [firstMessageId];
+    for (const chunk of chunks.slice(1)) {
+      const continuation = await this.sendMessage(chatId, chunk, replyTo);
+      messageIds.push(continuation.message_id);
+    }
+    return messageIds;
   }
   async registerWebhook(): Promise<void> {
     const url = process.env.ALERT_BOT_WEBHOOK_URL || '';
