@@ -408,12 +408,12 @@ describe('AlertBotService', () => {
 
     expect(drafts.handleCallback).toHaveBeenCalledWith({
       callbackId: 'callback-1', chatId: '100', tgUserId: '200', adminUserId: 'admin-1',
-      draftId: DRAFT, action: 'ask', messageId: 900,
+      draftId: DRAFT, action: 'ask', messageId: 900, internalRetry: false,
     });
     expect(turns.enqueue).toHaveBeenCalledWith(expect.objectContaining({
       updateId: 1, chatId: '100', adminUserId: 'admin-1', question: 'Текст черновика',
       questionMessageId: 900, privateChat: true, ticketId: TICKET,
-    }), { draftId: DRAFT, claimVersion: 3 });
+    }), { draftId: DRAFT, claimVersion: 3 }, expect.objectContaining({ onAdmission: expect.any(Function) }));
     expect(drafts.finalizeAsk).not.toHaveBeenCalled();
     expect(drafts.finishAsk).toHaveBeenCalledWith(DRAFT, GUARD_TOKEN);
     expect(drafts.releaseAsk).not.toHaveBeenCalled();
@@ -429,7 +429,11 @@ describe('AlertBotService', () => {
 
     expect(drafts.releaseAsk).toHaveBeenCalledWith(DRAFT, 4);
     expect(drafts.finishAsk).toHaveBeenCalledWith(DRAFT, GUARD_TOKEN);
-    expect(turns.enqueue).toHaveBeenCalledWith(expect.anything(), { draftId: DRAFT, claimVersion: 4 });
+    expect(turns.enqueue).toHaveBeenCalledWith(
+      expect.anything(),
+      { draftId: DRAFT, claimVersion: 4 },
+      expect.objectContaining({ onAdmission: expect.any(Function) }),
+    );
     expect(drafts.finalizeAsk).not.toHaveBeenCalled();
   });
 
@@ -584,6 +588,7 @@ describe('AlertBotService', () => {
     expect(telegram.answerCallbackQuery).toHaveBeenCalledWith('callback-1', 'Вопрос принят');
     expect(store.completeUpdate).not.toHaveBeenCalled();
 
+    for (let i = 0; i < 20 && !resolveDelivery; i += 1) await Promise.resolve();
     resolveDelivery('accepted');
     await handling;
     expect(store.completeUpdate).toHaveBeenCalledWith(1);

@@ -91,10 +91,9 @@ export class PgService implements OnModuleInit, OnModuleDestroy {
     const release = client.release.bind(client);
     let released = false;
     client.release = (destroy?: boolean | Error) => {
-      if (!released) {
-        released = true;
-        clients.delete(client);
-      }
+      if (released) return;
+      released = true;
+      clients.delete(client);
       release(destroy);
     };
     return client;

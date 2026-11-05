@@ -210,6 +210,7 @@ export class AlertBotService {
         && result.guardToken !== undefined;
       let admission: Awaited<ReturnType<AlertBotTurns['enqueue']>>;
       try {
+        if (!this.accepting) throw new AlertBotRetryableError('stopped');
         admission = await this.turns.enqueue({
           updateId,
           chatId: String(message.chat.id),
@@ -378,6 +379,7 @@ export class AlertBotService {
     question: string,
     extra: { parentTurnId?: string; replyText?: string; ticketId?: string },
   ): Promise<void> {
+    if (!this.accepting) throw new AlertBotRetryableError('stopped');
     await this.turns.enqueue({
       updateId,
       chatId: String(message.chat.id),
