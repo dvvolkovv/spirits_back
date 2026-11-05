@@ -19,6 +19,7 @@ export async function queryWithCancellation(
   text: string,
   params?: any[],
   signal?: AbortSignal,
+  onClient?: (client: PoolClient) => void,
 ): Promise<QueryResult> {
   throwIfAborted(signal);
 
@@ -80,6 +81,7 @@ export async function queryWithCancellation(
 
   try {
     throwIfAborted(signal);
+    onClient?.(client);
     // Pool не обрабатывает error у выданного наружу client. Listener должен быть
     // установлен до Query: обрыв backend иначе может завершить процесс событием error.
     client.on('error', onClientError);

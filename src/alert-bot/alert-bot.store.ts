@@ -298,6 +298,8 @@ export class AlertBotStore {
     try {
       await client.query('BEGIN');
       transactionOpen = true;
+      await client.query("SET LOCAL lock_timeout = '1000ms'");
+      await client.query("SET LOCAL statement_timeout = '5000ms'");
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`alert-bot:${input.adminUserId}`]);
       const existing = await client.query(
         `SELECT * FROM alert_bot_turns WHERE update_id = $1`,
@@ -371,6 +373,8 @@ export class AlertBotStore {
     try {
       await client.query('BEGIN');
       transactionOpen = true;
+      await client.query("SET LOCAL lock_timeout = '1000ms'");
+      await client.query("SET LOCAL statement_timeout = '5000ms'");
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`alert-bot:${input.adminUserId}`]);
       const existing = await client.query(
         `SELECT * FROM alert_bot_turns WHERE update_id = $1`,
@@ -538,6 +542,11 @@ export class AlertBotStore {
       params,
     );
     return r.rowCount === 1;
+  }
+
+  async findTurnByUpdate(updateId: number): Promise<AlertBotTurn | null> {
+    const r = await this.pg.query('SELECT * FROM alert_bot_turns WHERE update_id = $1 LIMIT 1', [updateId]);
+    return r.rows[0] ? mapTurn(r.rows[0]) : null;
   }
 
   async findTurnByAnswer(chatId: string, answerMessageId: number): Promise<AlertBotTurn | null> {

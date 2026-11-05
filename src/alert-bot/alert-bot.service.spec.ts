@@ -64,7 +64,7 @@ describe('AlertBotService', () => {
   let store: Record<string, jest.Mock>;
   let commands: Record<string, jest.Mock>;
   let drafts: Record<string, jest.Mock>;
-  let turns: { enqueue: jest.Mock; resumeExisting: jest.Mock };
+  let turns: { enqueue: jest.Mock; resumeExisting: jest.Mock; stopAdmission: jest.Mock };
   let support: { findTicketByPrefix: jest.Mock };
   let logger: { error: jest.Mock };
   let service: AlertBotService;
@@ -98,7 +98,11 @@ describe('AlertBotService', () => {
       finishAsk: jest.fn(),
       releaseAsk: jest.fn().mockResolvedValue(undefined),
     };
-    turns = { enqueue: jest.fn().mockResolvedValue('accepted'), resumeExisting: jest.fn().mockResolvedValue('accepted') };
+    turns = {
+      enqueue: jest.fn().mockResolvedValue('accepted'),
+      resumeExisting: jest.fn().mockResolvedValue('accepted'),
+      stopAdmission: jest.fn(),
+    };
     support = { findTicketByPrefix: jest.fn().mockResolvedValue(null) };
     logger = { error: jest.fn() };
     service = new AlertBotService(

@@ -4,6 +4,7 @@ import { AlertBotAccess } from './alert-bot.access';
 import { AlertBotCommands } from './alert-bot.commands';
 import { alertBotAllowedChat } from './alert-bot.config';
 import { AlertBotDrafts } from './alert-bot.drafts';
+import { AlertBotRetryableError } from './alert-bot.errors';
 import { AlertBotStore } from './alert-bot.store';
 import { AlertBotTelegram } from './alert-bot.telegram';
 import { AlertBotTurns } from './alert-bot.turns';
@@ -91,16 +92,17 @@ export class AlertBotService {
 
   stopAdmission(): void {
     this.accepting = false;
+    this.turns.stopAdmission();
   }
 
-  async claimUpdate(update: unknown): Promise<boolean> {
-    if (!this.accepting) return false;
+  async claimUpdate(update: unknown): Promise<'claimed' | 'duplicate' | 'stopped' | 'invalid'> {
+    if (!this.accepting) return 'stopped';
     const updateId = (update as TelegramUpdate)?.update_id;
-    if (!Number.isSafeInteger(updateId)) return false;
-    return this.store.claimUpdate(Number(updateId), update);
+    if (!Number.isSafeInteger(updateId)) return 'invalid';
+    return await this.store.claimUpdate(Number(updateId), update) ? 'claimed' : 'duplicate';
   }
 
-  async handleUpdate(update: unknown, alreadyClaimed = false): Promise<void> {
+  async handleUpdate(update: unknown, alreadyClaimed = false, internalRetry = false): Promise<void> {
     if (!this.accepting && !alreadyClaimed) return;
     const candidate = update as TelegramUpdate;
     if (!Number.isSafeInteger(candidate?.update_id)) return;
@@ -113,8 +115,14 @@ export class AlertBotService {
         claimed = await this.store.claimUpdate(updateId, candidate);
         if (!claimed) return;
       }
-      if (candidate.callback_query) {
-        await this.handleCallback(updateId, candidate.callback_query);
+      if (!this.accepting) throw new AlertBotRetryableError('stopped');
+      // Recovery начинается с durable turn, а не с повторного draft/callback flow.
+      // Это закрывает asked → retry без второго reservation или видимого действия.
+      const existing = await this.store.findTurnByUpdate(updateId);
+      if (existing) {
+        await this.turns.resumeExisting(existing);
+      } else if (candidate.callback_query) {
+        await this.handleCallback(updateId, candidate.callback_query, internalRetry);
       } else if (candidate.message) {
         await this.handleMessage(updateId, candidate.message);
       }
@@ -131,7 +139,7 @@ export class AlertBotService {
         this.logger.error(`alert-bot retry state failed kind=${safeErrorKind(failureError)}`);
         return;
       }
-      if (final) await this.sendFinalFailure(candidate);
+      if (final) await this.sendFinalFailure(candidate, kind);
     } finally {
       this.activeUpdates.delete(updateId);
     }
@@ -141,10 +149,12 @@ export class AlertBotService {
     if (!this.accepting) return;
     await this.store.requeueProcessingUpdates(60);
     const due = await this.store.dueUpdates();
-    for (const item of due) await this.handleUpdate(item.payload);
+    for (const item of due) await this.handleUpdate(item.payload, false, true);
   }
 
-  private async sendFinalFailure(update: TelegramUpdate): Promise<void> {
+  private async sendFinalFailure(update: TelegramUpdate, kind: string): Promise<void> {
+    // Неизвестный Telegram outcome dead-letter-ится без нового видимого сообщения.
+    if (['placeholder_in_flight', 'notification_in_flight', 'delivery_in_flight'].includes(kind)) return;
     const message = update.message || update.callback_query?.message;
     if (!message) return;
     try {
@@ -158,7 +168,7 @@ export class AlertBotService {
     }
   }
 
-  private async handleCallback(updateId: number, callback: TelegramCallback): Promise<void> {
+  private async handleCallback(updateId: number, callback: TelegramCallback, internalRetry = false): Promise<void> {
     const match = String(callback.data || '').match(
       /^draft:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):(send|ask|cancel)$/i,
     );
@@ -192,6 +202,7 @@ export class AlertBotService {
       draftId: match[1],
       action: match[2].toLowerCase() as 'send' | 'ask' | 'cancel',
       messageId: message.message_id,
+      internalRetry,
     });
     if (result.question) {
       const reserved = result.draftId !== undefined
@@ -208,7 +219,9 @@ export class AlertBotService {
           question: result.question,
           privateChat: message.chat.type === 'private',
           ticketId: result.ticketId || null,
-        }, reserved ? { draftId: result.draftId!, claimVersion: result.claimVersion! } : undefined);
+        }, reserved ? { draftId: result.draftId!, claimVersion: result.claimVersion! } : undefined, {
+          onAdmission: (status) => this.acknowledgeDraftAdmission(callback.id, status),
+        });
         if (reserved && admission !== 'accepted') {
           // Сначала все попытки fenced release в БД; локальный guard снимает
           // только outer finally с owner token этой reservation.
@@ -226,18 +239,24 @@ export class AlertBotService {
       } finally {
         if (reserved) this.drafts.finishAsk(result.draftId!, result.guardToken!);
       }
-      const ackText = admission === 'accepted'
-        ? 'Вопрос принят'
-        : admission === 'busy'
-          ? 'Занят, спросите через минуту'
-          : admission === 'rate_limited'
-            ? 'Лимит вопросов в час исчерпан'
-            : 'Черновик устарел';
-      try {
-        await this.telegram.answerCallbackQuery(callback.id, ackText);
-      } catch {
-        // Admission уже известен; косметический ack не повторяет update или модель.
-      }
+    }
+  }
+
+  private async acknowledgeDraftAdmission(
+    callbackId: string,
+    admission: Awaited<ReturnType<AlertBotTurns['enqueue']>>,
+  ): Promise<void> {
+    const ackText = admission === 'accepted'
+      ? 'Вопрос принят'
+      : admission === 'busy'
+        ? 'Занят, спросите через минуту'
+        : admission === 'rate_limited'
+          ? 'Лимит вопросов в час исчерпан'
+          : 'Черновик устарел';
+    try {
+      await this.telegram.answerCallbackQuery(callbackId, ackText);
+    } catch {
+      // Admission уже известен; косметический ack не повторяет update или модель.
     }
   }
 

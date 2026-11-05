@@ -3,6 +3,27 @@ import axios from 'axios';
 import { sendTelegramAlert } from '../common/telegram-alert';
 import { splitForTelegram } from '../tg-bot/tg-text-split';
 
+export type AlertBotTelegramOutcome = 'known' | 'unknown';
+
+export class AlertBotTelegramError extends Error {
+  override readonly name = 'AlertBotTelegramError';
+
+  constructor(
+    readonly method: string,
+    readonly kind: 'telegram_api' | 'telegram_unknown' | 'telegram_config',
+    readonly outcome: AlertBotTelegramOutcome,
+    readonly retryable: boolean,
+    readonly status?: number,
+  ) {
+    super(`telegram ${method} failed kind=${kind}`);
+  }
+}
+
+export function unknownTelegramOutcome(error: unknown): boolean {
+  return (error as { outcome?: unknown })?.outcome === 'unknown'
+    && (error as { kind?: unknown })?.kind === 'telegram_unknown';
+}
+
 @Injectable()
 export class AlertBotTelegram {
   private readonly logger = new Logger(AlertBotTelegram.name);
@@ -10,14 +31,27 @@ export class AlertBotTelegram {
 
   private async call(method: string, payload: Record<string, unknown> = {}): Promise<any> {
     const token = process.env.TELEGRAM_BOT_TOKEN || '';
-    if (!token) throw new Error('telegram token missing');
+    if (!token) throw new AlertBotTelegramError(method, 'telegram_config', 'known', false);
     try {
       const r = await axios.post(`https://api.telegram.org/bot${token}/${method}`, payload, { timeout: 8000 });
-      if (!r.data?.ok) throw new Error('telegram returned not ok');
+      if (!r.data?.ok) {
+        const status = Number(r.status) || undefined;
+        throw new AlertBotTelegramError(
+          method, 'telegram_api', 'known', status === 429 || (status !== undefined && status >= 500), status,
+        );
+      }
       return r.data.result;
     } catch (e: any) {
-      const why = e?.response?.data?.description || e?.code || 'request failed';
-      throw new Error(`telegram ${method}: ${why}`);
+      if (e instanceof AlertBotTelegramError) throw e;
+      const status = Number(e?.response?.status) || undefined;
+      if (status !== undefined || e?.response) {
+        throw new AlertBotTelegramError(
+          method, 'telegram_api', 'known', status === 429 || (status !== undefined && status >= 500), status,
+        );
+      }
+      // Нет ответа Telegram: запрос мог выполниться на удалённой стороне.
+      // Сырые axios error/description сюда не попадают ни в message, ни в logs.
+      throw new AlertBotTelegramError(method, 'telegram_unknown', 'unknown', false);
     }
   }
   async getMe(): Promise<{ id: number; username: string }> {

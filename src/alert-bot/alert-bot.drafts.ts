@@ -25,6 +25,7 @@ interface DraftCallbackInput {
   draftId: string;
   action: 'send' | 'ask' | 'cancel';
   messageId: number;
+  internalRetry?: boolean;
 }
 
 export interface DraftCallbackResult {
@@ -160,6 +161,10 @@ export class AlertBotDrafts {
       }
       const claimResult = await this.store.claimDraft(draft.id, claim);
       if (claimResult.status === 'in_progress') {
+        if (input.internalRetry) {
+          answer = 'Повторите позже';
+          throw new AlertBotRetryableError('draft_in_progress');
+        }
         answer = 'Черновик уже обрабатывается';
         return {};
       }

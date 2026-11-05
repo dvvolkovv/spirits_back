@@ -8,13 +8,16 @@ import { alertBotRatePerHour } from './alert-bot.config';
 import { AlertBotStatusService } from './alert-bot.status';
 import { AlertBotRetryableError } from './alert-bot.errors';
 import { AlertBotStore, AlertBotTurn, AlertBotTurnStatus, DraftReservation } from './alert-bot.store';
-import { AlertBotTelegram } from './alert-bot.telegram';
+import { AlertBotTelegram, unknownTelegramOutcome } from './alert-bot.telegram';
 import { TurnInput } from './alert-bot.types';
 
 const MAX_PENDING_PER_CHAT = 3;
 const BUSY_TEXT = 'Занят, спросите через минуту';
 const RATE_LIMITED_TEXT = 'Лимит вопросов в час исчерпан';
 export type AlertBotAdmission = 'accepted' | 'busy' | 'rate_limited' | 'stale';
+export interface AlertBotTurnEnqueueOptions {
+  onAdmission?: (status: AlertBotAdmission) => void | Promise<void>;
+}
 const MODEL_FAILURE_KINDS: ReadonlySet<LlmOutageKind> = new Set([
   'auth', 'rate_limit', 'weekly_limit', 'overloaded', 'timeout',
 ]);
@@ -29,6 +32,7 @@ export class AlertBotTurns {
   private readonly logger = new Logger(AlertBotTurns.name);
   private readonly chains = new Map<string, Promise<void>>();
   private readonly pending = new Map<string, number>();
+  private accepting = true;
 
   constructor(
     private readonly store: AlertBotStore,
@@ -39,20 +43,30 @@ export class AlertBotTurns {
     private readonly support: SupportService,
   ) {}
 
-  enqueue(input: TurnInput, reservation?: DraftReservation): Promise<AlertBotAdmission> {
+  stopAdmission(): void {
+    this.accepting = false;
+  }
+
+  enqueue(
+    input: TurnInput,
+    reservation?: DraftReservation,
+    options: AlertBotTurnEnqueueOptions = {},
+  ): Promise<AlertBotAdmission> {
+    if (!this.accepting) return Promise.reject(new AlertBotRetryableError('stopped'));
     const key = String(input.chatId);
     const pending = this.pending.get(key) || 0;
+    // Проверка и beginStream синхронны: stopAdmission не может вклиниться между ними.
     this.chat.beginStream();
     if (pending >= MAX_PENDING_PER_CHAT) {
       return this.rejectBusy(input)
-        .then(() => 'busy' as const)
+        .then((status) => this.acknowledgeAdmission(status, options))
         .finally(() => this.chat.endStream());
     }
 
     this.pending.set(key, pending + 1);
     const previous = this.chains.get(key) || Promise.resolve();
     const run = previous
-      .then(() => this.execute(input, reservation))
+      .then(() => this.execute(input, reservation, options))
       .finally(() => this.chat.endStream());
     let tracked: Promise<void>;
     tracked = run.then(() => undefined, () => undefined).finally(() => {
@@ -69,7 +83,24 @@ export class AlertBotTurns {
     await Promise.all(Array.from(this.chains.values()));
   }
 
-  private async execute(input: TurnInput, reservation?: DraftReservation): Promise<AlertBotAdmission> {
+  private async acknowledgeAdmission<T extends AlertBotAdmission>(
+    status: T,
+    options: AlertBotTurnEnqueueOptions,
+  ): Promise<T> {
+    try {
+      await options.onAdmission?.(status);
+    } catch {
+      // Ack косметический; durable turn уже имеет однозначный admission result.
+    }
+    return status;
+  }
+
+  private async execute(
+    input: TurnInput,
+    reservation?: DraftReservation,
+    options: AlertBotTurnEnqueueOptions = {},
+  ): Promise<AlertBotAdmission> {
+    if (!this.accepting) throw new AlertBotRetryableError('stopped');
     const startedAt = Date.now();
     let turnId: string;
     if (reservation) {
@@ -80,25 +111,53 @@ export class AlertBotTurns {
         input,
         maxPerHour: alertBotRatePerHour(),
       });
-      if (admitted.status === 'stale') return 'stale';
-      if (admitted.status === 'rate_limited') return this.rejectRateLimited(input);
-      if (admitted.status === 'existing') return this.resumeExisting(admitted.turn, input);
+      if (admitted.status === 'stale') return this.acknowledgeAdmission('stale', options);
+      if (admitted.status === 'rate_limited') {
+        const status = await this.rejectRateLimited(input);
+        return this.acknowledgeAdmission(status, options);
+      }
+      if (admitted.status === 'existing') return this.resumeTurn(admitted.turn, input, options);
       turnId = admitted.turnId;
     } else {
       // Admission отделён от выполнения: до turnId сбой должен попасть в service.
       const admitted = await this.store.admitTurn(input, alertBotRatePerHour());
-      if (admitted.status === 'rate_limited') return this.rejectRateLimited(input);
-      if (admitted.status === 'existing') return this.resumeExisting(admitted.turn, input);
+      if (admitted.status === 'rate_limited') {
+        const status = await this.rejectRateLimited(input);
+        return this.acknowledgeAdmission(status, options);
+      }
+      if (admitted.status === 'existing') return this.resumeTurn(admitted.turn, input, options);
       turnId = admitted.turnId;
     }
+    await this.acknowledgeAdmission('accepted', options);
     return this.runTurn(turnId, input, startedAt);
   }
 
-  private async resumeExisting(turn: AlertBotTurn, input: TurnInput): Promise<AlertBotAdmission> {
+  resumeExisting(turn: AlertBotTurn, options: AlertBotTurnEnqueueOptions = {}): Promise<AlertBotAdmission> {
+    // Публичный recovery входит в ту же chat queue и проходит accepting checks.
+    return this.enqueue({
+      updateId: turn.updateId,
+      chatId: turn.chatId,
+      tgUserId: turn.tgUserId,
+      adminUserId: turn.adminUserId,
+      questionMessageId: turn.questionMessageId,
+      question: turn.question,
+      parentTurnId: turn.parentTurnId,
+      privateChat: turn.privateChat,
+    }, undefined, options);
+  }
+
+  private async resumeTurn(
+    turn: AlertBotTurn,
+    input: TurnInput,
+    options: AlertBotTurnEnqueueOptions = {},
+  ): Promise<AlertBotAdmission> {
     if (turn.status === 'busy' || turn.status === 'rate_limited') {
-      return this.notifySystem(turn.id, turn.status, input, turn);
+      const status = await this.notifySystem(turn.id, turn.status, input, turn);
+      return this.acknowledgeAdmission(status, options);
     }
-    if (turn.answer !== null && turn.deliveryCompletedAt) return 'accepted';
+    if (turn.answer !== null && turn.deliveryCompletedAt) {
+      return this.acknowledgeAdmission('accepted', options);
+    }
     // После начала модели отсутствие сохранённого ответа — неизвестный исход.
     // Единственное безопасное восстановление — defer, а не второй Claude.
     if (turn.modelStartedAt && turn.answer === null) {
@@ -109,6 +168,7 @@ export class AlertBotTurns {
     if (turn.status !== 'in_progress' && turn.answer === null) {
       throw new AlertBotRetryableError('model_state_unknown');
     }
+    await this.acknowledgeAdmission('accepted', options);
     return this.runTurn(turn.id, input, Date.now(), turn);
   }
 
@@ -133,6 +193,10 @@ export class AlertBotTurns {
         try {
           placeholder = await this.telegram.sendMessage(input.chatId, '🔎 Смотрю…', input.questionMessageId);
         } catch (error) {
+          if (unknownTelegramOutcome(error)) {
+            // Timeout после remote success: marker остаётся, retry только defer/dead-letter.
+            throw new AlertBotRetryableError('placeholder_in_flight');
+          }
           await this.store.deferPlaceholder(turnId).catch(() => undefined);
           throw error;
         }
@@ -216,6 +280,11 @@ export class AlertBotTurns {
         // Обычный отказ Telegram до/между chunks безопасно повторяется с
         // сохранённого deliveredIds. Сбой journal после видимого результата —
         // неизвестное состояние, поэтому delivery_started_at не очищается.
+        if (unknownTelegramOutcome(error)) {
+          // Continuation/edit мог быть виден. Не очищаем delivery_started_at и не
+          // повторяем запрос: следующий recovery упрётся в delivery_in_flight.
+          throw new AlertBotRetryableError('delivery_in_flight');
+        }
         if (!journalFailure && !completing) {
           await this.store.deferDelivery(turnId).catch(() => undefined);
         }
@@ -314,6 +383,9 @@ export class AlertBotTurns {
         input.questionMessageId,
       );
     } catch (error) {
+      if (unknownTelegramOutcome(error)) {
+        throw new AlertBotRetryableError('notification_in_flight');
+      }
       await this.store.deferPlaceholder(turnId).catch(() => undefined);
       throw error;
     }

@@ -51,6 +51,8 @@ export class PgService implements OnModuleInit, OnModuleDestroy {
   private pool: Pool;
   private lockPool: Pool;
   private readonly preCloseHooks: Array<() => Promise<void>> = [];
+  private readonly checkedOutClients = new Set<PoolClient>();
+  private readonly checkedOutLockClients = new Set<PoolClient>();
   private readonly logger = new Logger(PgService.name);
 
   onModuleInit() {
@@ -83,6 +85,51 @@ export class PgService implements OnModuleInit, OnModuleDestroy {
     this.logger.log('PostgreSQL pools created (main + advisory locks)');
   }
 
+  private trackClient(client: PoolClient, lock = false): PoolClient {
+    const clients = lock ? this.checkedOutLockClients : this.checkedOutClients;
+    clients.add(client);
+    const release = client.release.bind(client);
+    let released = false;
+    client.release = (destroy?: boolean | Error) => {
+      if (!released) {
+        released = true;
+        clients.delete(client);
+      }
+      release(destroy);
+    };
+    return client;
+  }
+
+  private forceReleaseClients(): void {
+    for (const client of [...this.checkedOutClients, ...this.checkedOutLockClients]) {
+      try {
+        client.release(true);
+      } catch {
+        // pool.end всё равно получает bounded deadline ниже.
+      }
+    }
+    this.checkedOutClients.clear();
+    this.checkedOutLockClients.clear();
+  }
+
+  private async endPoolBounded(pool: Pool, kind: string): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        pool.end(),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            this.logger.error(`PostgreSQL ${kind} close deadline exceeded`);
+            resolve();
+          }, 5000);
+          timer.unref();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   registerPreCloseHook(hook: () => Promise<void>): void {
     this.preCloseHooks.push(hook);
   }
@@ -92,16 +139,24 @@ export class PgService implements OnModuleInit, OnModuleDestroy {
       // Долгие пользователи пула останавливают admission и abort-ят I/O ДО end().
       for (const hook of this.preCloseHooks) await hook();
     } finally {
-      await Promise.all([this.pool.end(), this.lockPool.end()]);
+      // Сначала остановлены admissions/ops. Затем рвём зависшие checked-out
+      // clients (включая advisory lock wait), и только после этого закрываем пулы.
+      this.forceReleaseClients();
+      await Promise.all([
+        this.endPoolBounded(this.pool, 'pool'),
+        this.endPoolBounded(this.lockPool, 'lock-pool'),
+      ]);
     }
   }
 
   async query(text: string, params?: any[], signal?: AbortSignal): Promise<QueryResult> {
-    return queryWithCancellation(this.pool, text, params, signal);
+    return queryWithCancellation(
+      this.pool, text, params, signal, (client) => this.trackClient(client),
+    );
   }
 
   async getClient(): Promise<PoolClient> {
-    return this.pool.connect();
+    return this.trackClient(await this.pool.connect());
   }
 
   /**
@@ -116,7 +171,7 @@ export class PgService implements OnModuleInit, OnModuleDestroy {
    * released=false на pid=1468274, лок остался в pg_locks.
    */
   async tryAdvisoryLock(key: number): Promise<AdvisoryLock | null> {
-    const client = await this.lockPool.connect();
+    const client = this.trackClient(await this.lockPool.connect(), true);
     try {
       const r = await client.query('SELECT pg_try_advisory_lock($1) AS got', [key]);
       if (!r.rows[0]?.got) {
