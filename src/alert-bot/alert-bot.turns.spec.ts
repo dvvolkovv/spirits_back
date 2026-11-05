@@ -249,6 +249,18 @@ describe('AlertBotTurns', () => {
     delete process.env.ALERT_BOT_RATE_PER_HOUR;
   });
 
+  it('сбой admission пробрасывается наружу и не останавливает очередь чата', async () => {
+    store.tryCreateTurn
+      .mockRejectedValueOnce(Object.assign(new Error('RAW-ADMISSION-SECRET'), { kind: 'db_down' }))
+      .mockResolvedValueOnce('turn-2');
+
+    await expect(turns.enqueue(question())).rejects.toMatchObject({ kind: 'db_down' });
+    await expect(turns.enqueue(question({ updateId: 2 }))).resolves.toBe('accepted');
+
+    expect(ai.answer).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(logger.error.mock.calls)).not.toContain('RAW-ADMISSION-SECRET');
+  });
+
   it('system turn не зависит от failed finish и не оставляет in_progress', async () => {
     store.tryCreateTurn.mockResolvedValue(null);
     store.finishTurn.mockRejectedValue(new Error('finish failed'));
