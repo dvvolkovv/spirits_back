@@ -80,6 +80,11 @@ describe('маска бота алертов', () => {
     }
   });
 
+  it('не превращает большие числовые timestamps в неJSON при финальной маске', () => {
+    const out = toolText({ metric: { at: 1800000000, duration: 120000000000 } });
+    expect(JSON.parse(out)).toEqual({ metric: { at: 1800000000, duration: 120000000000 } });
+  });
+
   it('маскирует UUID без ограничения версии и варианта', () => {
     const ticket = '018f2c3a-9d4e-7abc-8def-abcdef123456';
     expect(maskText(ticket)).toBe('[id]');

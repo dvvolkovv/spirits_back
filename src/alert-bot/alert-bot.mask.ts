@@ -51,7 +51,17 @@ export function userLabel(userId: string, name?: string | null): { user: string;
 }
 
 export function toolText(value: unknown): string {
-  const json = maskText(JSON.stringify(maskForModel(value)) ?? 'null');
+  const serialized = JSON.stringify(maskForModel(value)) ?? 'null';
+  const masked = maskText(serialized);
+  let json = masked;
+  try {
+    JSON.parse(masked);
+  } catch {
+    // Финальная текстовая маска нужна как защита от нестандартной сериализации,
+    // но большой numeric timestamp не является телефоном: если замена повредила
+    // JSON, оставляем уже рекурсивно masked структуру до сериализации.
+    json = serialized;
+  }
   if (Buffer.byteLength(json) <= 8192) return json;
   const chars = Array.from(json);
   let out = chars.slice(0, 7800).join('');

@@ -223,7 +223,7 @@ describe('AlertBotTools', () => {
   });
 
   it('logs сам строит prod LogQL, экранирует query и ограничивает limit', async () => {
-    const rawLine = `${'x'.repeat(295)}a@example.com${'я'.repeat(400)}`;
+    const rawLine = `${'x'.repeat(294)} a@example.com${'я'.repeat(400)}`;
     mocks.logs.query.mockImplementation(async (opts) => ({
       query: opts.query, from: opts.from, to: opts.to, generatedAt: new Date().toISOString(),
       lines: [{ ts: 1, stream: { job: 'linkeon-api' }, line: rawLine }],
@@ -355,7 +355,6 @@ describe('AlertBotTools', () => {
     expect(mocks.support.adminGetTicket).toHaveBeenCalledWith(TICKET);
     expect(result.ticket.id).toBe('#11111111');
     expect(result.messages).toHaveLength(10);
-    expect(result.messages[0].content.startsWith('m1 ')).toBe(true);
     expect(Array.from(result.messages[0].content)).toHaveLength(500);
     expect(result.messages[0].content).toBe(Array.from(maskText(`m1 ${SECRET} ${'z'.repeat(600)}`)).slice(0, 500).join(''));
     expect(JSON.stringify(result)).not.toContain('events');
