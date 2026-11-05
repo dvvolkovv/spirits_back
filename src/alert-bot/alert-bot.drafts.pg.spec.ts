@@ -353,7 +353,7 @@ maybe('callback черновика с lease против PostgreSQL', () => {
       end: jest.fn().mockResolvedValue(undefined),
     };
     const chat = { beginStream: jest.fn(), endStream: jest.fn() };
-    const turns = new AlertBotTurns(store, ai as any, localTelegram as any, status as any, chat as any, support);
+    const turns = new AlertBotTurns(store, localTelegram as any, ai as any, status as any, chat as any, support);
     const service = new AlertBotService(
       { resolveTelegram: jest.fn().mockResolvedValue({ userId: 'u-admin', isAdmin: true }) } as any,
       localTelegram as any,
