@@ -209,10 +209,14 @@ describe('AlertBotTools', () => {
       'ALERTS_FOR_STATE',
       'max_over_time(ALERTS{alertstate="firing"}[6h])',
     ]);
-    expect(result.prometheus.firing[0]).toMatchObject({
+    expect(result.prometheus.firing[0]).toEqual({
       metric: firingMetric,
+      ts: 1_800_000_120,
+      value: '1',
       since: new Date(1_800_000_000 * 1000).toISOString(),
     });
+    expect(JSON.stringify(result.prometheus.firing[0])).not.toContain(maskText(String(1_800_000_120)));
+    expect(JSON.stringify(result.prometheus.firing[0])).not.toMatch(/\+\d \*\*\* \*\*\* \d{2}/);
     expect(result.prometheus.history[0].metric).toEqual(firingMetric);
     expect(result.prometheus.history[0].ts).toBe(1_800_000_120);
     expect(result.prometheus.history[0].value).toBe('1');
