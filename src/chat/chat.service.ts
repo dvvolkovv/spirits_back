@@ -302,6 +302,22 @@ export interface ChargedAgentReply {
   durationMs: number;
 }
 
+/** Сколько фоновый ответ (рутина, «Путь») ждёт конца хода человека в той же
+ * сессии релея, прежде чем честно пропуститься (waitForRelaySessionIdle). */
+const ROUTINE_SESSION_WAIT_MS = 30 * 60 * 1000;
+
+/**
+ * Фоновый ответ пришёл, когда основная сессия релея занята ходом человека.
+ * Вместо пре-эмпта — этот отказ; routine-push ловит его и откладывает доставку
+ * (спека e777aa94: «откладывать до конца хода»).
+ */
+export class RelaySessionBusyError extends Error {
+  constructor(public readonly relaySid: string) {
+    super(`relay session busy: ${relaySid}`);
+    this.name = 'RelaySessionBusyError';
+  }
+}
+
 @Injectable()
 export class ChatService {
   private readonly logger = new Logger(ChatService.name);
@@ -371,7 +387,6 @@ export class ChatService {
   private readonly inflight = new Map<string, { state: 'running' | 'done'; ts: number }>();
   private readonly DEDUP_COOLDOWN_MS = 12000;
   private readonly DEDUP_RUNNING_TTL_MS = 600000; // страховка от «залипшего» running
-
   /**
    * Сколько ходов прямо сейчас в полёте. Считается отдельно от inflight-мапы:
    * у той TTL 10 минут (страховка дедупа), а ходы юридических ассистентов идут
@@ -2870,8 +2885,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
   private async agentReply(
     userId: string, assistantId: string, message: string, sessionIdOverride: string | undefined, billed: boolean,
     opts: AgentReplyOpts = {},
-  ): Promise<ChargedAgentReply> {
-    const startedAt = Date.now();
+  ): Promise<ChargedAgentReply> {    const startedAt = Date.now();
     const isNumeric = /^\d+$/.test(assistantId);
     const agentRes = isNumeric
       ? await this.pg.query('SELECT * FROM agents WHERE id = $1 LIMIT 1', [parseInt(assistantId, 10)])
@@ -2976,7 +2990,24 @@ ${LanguageService.buildDirective(userLanguage)}`;
     };
     let costUsd = 0;
     let turnFailed = false;
+    let gotDone = false;
     const turnCost = new RelayTurnCost();
+    // Фоновый ответ БЕЗ своей сессии (рутины, «Путь») пишет в основную сессию
+    // человека. До 05.11.2026 он шёл мимо учёта ходов и пре-эмптил живой ход.
+    // Теперь: сессия занята — атомарный отказ RelaySessionBusyError (проверка
+    // и метка в одном tick, без await между ними), routine-push откладывает
+    // доставку. activeTurns сознательно НЕ трогаем: кабинет человека не должен
+    // блокироваться фоновой работой — человек важнее, его ход при необходимости
+    // пре-эмптит рутину (beginRelayRun перезапишет метку).
+    // Учёт: relayRunning + activeStreams для всех вызовов, включая голосовые.
+    const mainSession = !sessionIdOverride;
+    if (mainSession && this.relayRunning.has(relaySid)) {
+      this.logger.log(`agentReply: ${userId}_${assistantId} занята ходом человека — фоновый ответ откладывается`);
+      throw new RelaySessionBusyError(relaySid);
+    }
+    const relayMark = this.beginRelayRun(relaySid);
+    this.beginStream();
+    try {
     const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
       headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
       responseType: 'stream',
@@ -2996,6 +3027,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
             if (ev.type === 'delta' || ev.type === 'text') chunks.push(ev.text);
             else if (ev.type === 'result' && ev.text && chunks.length === 0) chunks.push(ev.text);
             else if (ev.type === 'done') {
+              gotDone = true;
               // Стоимость и расход — здесь же, где их берёт основной путь.
               if (ev.failed === true) turnFailed = true;
               if (typeof ev.costUsd === 'number' && ev.costUsd > 0) costUsd += ev.costUsd;
@@ -3028,6 +3060,16 @@ ${LanguageService.buildDirective(userLanguage)}`;
       resp.data.on('end', () => resolve());
       resp.data.on('error', reject);
     });
+    } finally {
+      this.endStream();
+      this.endRelayRun(relaySid, relayMark);
+    }
+    if (mainSession && (!gotDone || turnFailed)) {
+      // Человек пре-эмптил фоновый ответ (или релей оборвался): обрезанный
+      // текст нельзя писать в историю как успешный. Просим повторить позже —
+      // routine-push отложит доставку.
+      throw new RelaySessionBusyError(relaySid);
+    }
     const text = this.stripToolTags(chunks.join('')).trim();
     const charge = this.computeSdkCharge(usage, costUsd, text, turnCost.usd);
     if (opts.testMode === true) {
