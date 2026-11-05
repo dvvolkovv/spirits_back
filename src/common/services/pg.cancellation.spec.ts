@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import { PoolClient, Query } from 'pg';
+import { Client, PoolClient, Query } from 'pg';
 import { PgService } from './pg.service';
 
 describe('PgService.query cancellation', () => {
@@ -17,9 +17,13 @@ describe('PgService.query cancellation', () => {
       return new Promise((resolve, reject) => { resolveActive = resolve; rejectActive = reject; });
     });
     client.release = jest.fn();
-    client.cancel = jest.fn((_client: PoolClient, _query: Query) => {
-      rejectActive(new Error('cancel requested'));
-    });
+    const cancel = jest.spyOn(Client.prototype as any, 'cancel').mockImplementation(
+      (target: PoolClient, query: Query) => {
+        expect(target).toBe(client);
+        expect(query).toBe(activeQuery);
+        rejectActive(new Error('cancel requested'));
+      },
+    );
     const pool = {
       connect: jest.fn(async () => client),
       // Старый путь оставлен в fixture, чтобы RED был поведенческим, а не TypeError.
@@ -30,8 +34,12 @@ describe('PgService.query cancellation', () => {
     };
     const service = new PgService();
     (service as any).pool = pool;
-    return { service, client, pool, getQuery: () => activeQuery, rejectActive: (e: Error) => rejectActive(e), resolveActive: (v: any) => resolveActive(v) };
+    return { service, client, pool, cancel, getQuery: () => activeQuery, rejectActive: (e: Error) => rejectActive(e), resolveActive: (v: any) => resolveActive(v) };
   }
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
 
   async function flush() {
     await Promise.resolve();
@@ -40,7 +48,7 @@ describe('PgService.query cancellation', () => {
   }
 
   it('abort вызывает runtime client.cancel для активного pg.Query, снимает listener и release', async () => {
-    const { service, client, getQuery, rejectActive } = fixture();
+    const { service, client, cancel, getQuery, rejectActive } = fixture();
     const controller = new AbortController();
     const remove = jest.spyOn(controller.signal, 'removeEventListener');
     const result = (service.query as any)('SELECT pg_sleep(10)', [], controller.signal) as Promise<unknown>;
@@ -49,14 +57,14 @@ describe('PgService.query cancellation', () => {
 
     controller.abort();
     await flush();
-    const cancelCalls = client.cancel.mock.calls.length;
+    const cancelCalls = cancel.mock.calls.length;
     const releaseCalls = client.release.mock.calls.length;
     rejectActive(new Error('cancel requested'));
     await rejection;
 
     expect(getQuery()).toBeInstanceOf(Query);
     expect(cancelCalls).toBe(1);
-    expect(client.cancel).toHaveBeenCalledWith(client, getQuery());
+    expect(cancel).toHaveBeenCalledWith(client, getQuery());
     expect(remove).toHaveBeenCalledWith('abort', expect.any(Function));
     expect(releaseCalls).toBe(1);
   });
