@@ -28,7 +28,12 @@ function intArg(value: unknown, min: number, max: number, fallback: number): num
 }
 
 function metricKey(metric: Record<string, string>): string {
-  return JSON.stringify(metric);
+  return JSON.stringify(
+    Object.keys(metric)
+      .filter((key) => key !== '__name__' && key !== 'alertstate')
+      .sort()
+      .map((key) => [key, metric[key]]),
+  );
 }
 
 function maskedClip(value: unknown, max: number): string | null {
@@ -147,7 +152,7 @@ export class AlertBotTools implements OpsToolHandler {
     const hours = intArg(args.hours, 1, 72, 24);
     const [firingResult, stateResult, historyResult, journalResult] = await Promise.allSettled([
       this.monitoring.query('ALERTS{alertstate="firing"}', signal),
-      this.monitoring.query('ALERTS_FOR_STATE{alertstate="firing"}', signal),
+      this.monitoring.query('ALERTS_FOR_STATE', signal),
       this.monitoring.query(`max_over_time(ALERTS{alertstate="firing"}[${hours}h])`, signal),
       this.store.recentAlerts(hours, 50, signal),
     ]);
@@ -161,9 +166,9 @@ export class AlertBotTools implements OpsToolHandler {
 
     const firing = firingRows.map((row: PromRow) => {
       const state = stateByMetric.get(metricKey(row.metric));
-      const duration = state ? Number.parseFloat(state.value[1]) : Number.NaN;
-      const since = Number.isFinite(duration)
-        ? new Date((row.value[0] - duration) * 1000).toISOString()
+      const sinceSeconds = state ? Number(state.value[1]) : Number.NaN;
+      const since = Number.isFinite(sinceSeconds)
+        ? new Date(sinceSeconds * 1000).toISOString()
         : null;
       return { metric: row.metric, value: row.value, since };
     });
@@ -234,7 +239,7 @@ export class AlertBotTools implements OpsToolHandler {
       return { error: 'invalid_params' };
     }
     const days = intArg(args.days, 1, 365, 7);
-    const window = (args.window || '7d') as EconomyWindow;
+    const window = (args.window || '30d') as EconomyWindow;
     let data: unknown;
     switch (section as StatsSection) {
       case 'payments':
@@ -274,7 +279,7 @@ export class AlertBotTools implements OpsToolHandler {
       if (!found) return { error: 'not_found' };
       const card = await this.support.adminGetTicket(found.id, signal);
       return {
-        ticket: this.ticketSummary(card.ticket),
+        ticket: this.ticketSummary(card.ticket, card.user?.profile_data?.name),
         messages: (card.messages || []).slice(-10).map((message: any) => ({
           senderType: message.senderType ?? message.sender_type ?? null,
           content: maskedClip(message.content, 500),
@@ -292,7 +297,7 @@ export class AlertBotTools implements OpsToolHandler {
     return { tickets };
   }
 
-  private ticketSummary(row: any): Record<string, unknown> {
+  private ticketSummary(row: any, profileName?: string | null): Record<string, unknown> {
     const id = String(row.id);
     const userId = row.userId ?? row.user_id;
     const assignedTo = row.assignedTo ?? row.assigned_to;
@@ -309,8 +314,8 @@ export class AlertBotTools implements OpsToolHandler {
       status: row.status,
       urgency: row.urgency,
       ageMinutes: createdDate ? Math.max(0, Math.floor((Date.now() - createdDate.getTime()) / 60_000)) : null,
-      reason: maskedClip(row.escalationReason ?? row.escalation_reason ?? row.topic, 300),
-      user: userLabel(String(userId), row.userName ?? row.user_name ?? null),
+      reason: maskedClip(row.escalationReason ?? row.escalation_reason ?? row.topic, 200),
+      user: userLabel(String(userId), profileName ?? row.userName ?? row.user_name ?? null),
       ...(assigned ? { assigned } : {}),
       sla: {
         dueAt,

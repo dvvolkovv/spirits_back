@@ -105,12 +105,14 @@ export class EconomyService {
          AND user_id <> ALL($1::text[])
          AND ($2 = 'all' OR completed_at >= now() - $3::interval)`,
       [excluded, window, interval],
+      signal,
     );
     const payersAll = await this.one<{ n: string }>(
       `SELECT COUNT(DISTINCT user_id)::int AS n
        FROM payments
        WHERE status = 'succeeded' AND user_id <> ALL($1::text[])`,
       [excluded],
+      signal,
     );
 
     // 3. Repeat rate (all-time): % of payers with 2+ payments
@@ -125,6 +127,7 @@ export class EconomyService {
              COUNT(*) FILTER (WHERE p >= 2)::int AS repeat
       FROM c`,
       [excluded],
+      signal,
     );
 
     // 4. Engagement: DAU/WAU/MAU based on message_sent in events.
@@ -138,6 +141,7 @@ export class EconomyService {
          AND user_id IS NOT NULL
          AND user_id <> ALL($1::text[])`,
       [excluded],
+      signal,
     );
 
     // 5. Activation:
@@ -166,6 +170,7 @@ export class EconomyService {
        SELECT (SELECT COUNT(*)::int FROM cohort) AS signups,
               (SELECT COUNT(*)::int FROM msgs)   AS activated`,
       [excluded, window, interval],
+      signal,
     );
 
     // 6. Token balances (all active users)
@@ -177,6 +182,7 @@ export class EconomyService {
        WHERE u.state = 'active'
          AND p.user_id <> ALL($1::text[])`,
       [excluded],
+      signal,
     );
 
     // 7. Daily revenue last 30 days for sparkline
@@ -217,6 +223,7 @@ export class EconomyService {
          AND user_id <> ALL($1::text[])
          AND ($2 = 'all' OR ts >= now() - $3::interval)`,
       [excluded, window, interval],
+      signal,
     );
     const activeInWindow = parseInt(activeRow?.n || '0', 10);
 
