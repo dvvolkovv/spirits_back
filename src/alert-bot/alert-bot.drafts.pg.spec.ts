@@ -18,6 +18,12 @@ const maybe = PG ? describe : describe.skip;
 const SCHEMA = `alert_bot_drafts_spec_${process.pid}`;
 const CHAT = '-100123';
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => { resolve = r; });
+  return { promise, resolve };
+}
+
 maybe('callback черновика с lease против PostgreSQL', () => {
   jest.setTimeout(30_000);
   let admin: Pool;
