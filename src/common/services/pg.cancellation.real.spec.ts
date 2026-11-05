@@ -57,7 +57,7 @@ describe('PgService cancellation against real PostgreSQL', () => {
     await waitFor(async () => {
       const r = await observer.query(
         `SELECT 1 AS present FROM pg_stat_activity
-          WHERE query LIKE $1 AND pid <> pg_backend_pid() LIMIT 1`,
+          WHERE query LIKE $1 AND state = 'active' AND pid <> pg_backend_pid() LIMIT 1`,
         [`%${marker}%`],
       );
       return r.rowCount === 0 ? true : null;
