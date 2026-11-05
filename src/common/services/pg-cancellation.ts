@@ -7,6 +7,10 @@ type RuntimePoolClient = PoolClient & {
 };
 type RuntimeCancelClient = {
   cancel(client: PoolClient, query: Query): void;
+  connection: {
+    once(event: 'error', listener: (error: Error) => void): unknown;
+    removeListener(event: 'error', listener: (error: Error) => void): unknown;
+  };
 };
 
 /** Отдельный client нужен, чтобы cancel адресовал именно активный Query этого вызова. */
@@ -63,8 +67,12 @@ export async function queryWithCancellation(
     // У cancel-client нет Pool, поэтому без собственного error listener ENOENT
     // становится необработанным событием и завершает весь Node-процесс.
     cancelClient.once('error', onCancelError);
+    const runtimeCancel = cancelClient as unknown as RuntimeCancelClient;
+    // Client.cancel() соединяет Connection напрямую, минуя Client._attachListeners:
+    // поэтому ENOENT приходит именно на Connection, а не на Client.
+    runtimeCancel.connection.once('error', onCancelError);
     try {
-      (cancelClient as unknown as RuntimeCancelClient).cancel(client, query);
+      runtimeCancel.cancel(client, query);
     } catch (error) {
       onCancelError(error as Error);
     }
@@ -96,7 +104,11 @@ export async function queryWithCancellation(
       const closingClient = cancelClient;
       void closingClient.end()
         .catch(() => {})
-        .finally(() => closingClient.removeListener('error', onCancelError));
+        .finally(() => {
+          closingClient.removeListener('error', onCancelError);
+          (closingClient as unknown as RuntimeCancelClient).connection
+            .removeListener('error', onCancelError);
+        });
     }
     if (destroyError) {
       // Оставляем onClientError на уничтожаемом client: поздний error из socket

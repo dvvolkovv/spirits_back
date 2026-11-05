@@ -73,6 +73,7 @@ describe('HTTP monitoring cancellation', () => {
         pending.push({ signal: init.signal, reject });
         init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
       }),
+      text: async () => '',
     }));
   }
 

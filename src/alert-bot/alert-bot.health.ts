@@ -51,7 +51,15 @@ export function withDeadline<T>(
     timer.unref();
     if (signal?.aborted) { onAbort(); return; }
     signal?.addEventListener('abort', onAbort, { once: true });
-    Promise.resolve().then(() => start(controller.signal)).then(
+    let operation: Promise<T>;
+    try {
+      operation = start(controller.signal);
+    } catch (error) {
+      cleanup();
+      reject(error);
+      return;
+    }
+    operation.then(
       (value) => { cleanup(); resolve(value); },
       (error) => { cleanup(); reject(error); },
     );

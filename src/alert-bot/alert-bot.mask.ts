@@ -1,6 +1,6 @@
 import * as crypto from 'crypto';
 
-const UUID = /(?<![A-Za-z0-9_])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![A-Za-z0-9_])/gi;
+const UUID = /(?<![A-Za-z0-9])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![A-Za-z0-9])/gi;
 
 export function maskText(input: string, ticketIds: Iterable<string> = []): string {
   const tickets = new Set(Array.from(ticketIds, (x) => x.toLowerCase()));
