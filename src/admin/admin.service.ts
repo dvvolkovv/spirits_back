@@ -1359,7 +1359,7 @@ export class AdminService implements OnModuleInit {
   }
 
   async getTokensSpendStats(opts: { bucket?: 'day' | 'hour' | 'week'; days?: number } = {}, signal?: AbortSignal) {
-    const bucket = opts.bucket || 'day';
+    const bucket = opts.bucket === 'hour' || opts.bucket === 'week' ? opts.bucket : 'day';
     const days = bucket === 'hour'
       ? Math.min(Math.max(opts.days ?? 2, 1), 14)
       : Math.min(Math.max(opts.days ?? 30, 1), 365);
@@ -1424,7 +1424,7 @@ export class AdminService implements OnModuleInit {
 
   async getActiveUsersStats(opts: { days?: number; bucket?: 'day' | 'hour' | 'week' } = {}, signal?: AbortSignal) {
     const days = Math.min(Math.max(opts.days ?? 30, 1), 365);
-    const bucket = opts.bucket || 'day';
+    const bucket = opts.bucket === 'hour' || opts.bucket === 'week' ? opts.bucket : 'day';
 
     const seriesRes = await this.pg.query(
       `WITH days AS (
