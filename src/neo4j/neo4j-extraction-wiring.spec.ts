@@ -1,6 +1,15 @@
 import axios from 'axios';
 import { Neo4jService } from './neo4j.service';
 import { buildProfileExtractionPrompt } from './profile-extraction-prompt';
+import { automaticProfilingAllowed } from '../privacy/profile-privacy';
+
+jest.mock('../privacy/profile-privacy', () => ({
+  automaticProfilingAllowed: jest.fn(),
+}));
+
+const automaticProfilingAllowedMock = automaticProfilingAllowed as jest.MockedFunction<
+  typeof automaticProfilingAllowed
+>;
 
 /**
  * Сервис отдаёт модели ровно промпт из buildProfileExtractionPrompt — и основным
@@ -11,6 +20,10 @@ import { buildProfileExtractionPrompt } from './profile-extraction-prompt';
  */
 describe('Neo4jService.consolidateFromChat: промпт извлечения', () => {
   const savedKey = process.env.OPENROUTER_API_KEY;
+
+  beforeEach(() => {
+    automaticProfilingAllowedMock.mockReset().mockResolvedValue(true);
+  });
 
   afterEach(() => {
     if (savedKey === undefined) delete process.env.OPENROUTER_API_KEY;
