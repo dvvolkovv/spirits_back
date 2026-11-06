@@ -120,7 +120,7 @@ export interface ProfileAccess {
   automaticProfiling: boolean;
 }
 
-type SearchAccessRow = {
+type ProfileAccessRow = {
   user_id: string;
   profile_data: unknown;
   approved_contact: boolean;
@@ -128,11 +128,46 @@ type SearchAccessRow = {
   blocked: boolean;
 };
 
+type SearchAccessRow = {
+  user_id: string;
+  profile_data_type: string | null;
+  automatic_profiling: unknown;
+  automatic_profiling_type: string | null;
+  discoverable: unknown;
+  discoverable_type: string | null;
+  approved_contact: boolean;
+  peer: boolean;
+  blocked: boolean;
+};
+
+function selfAutomaticProfiling(profileData: unknown): boolean {
+  if (profileData == null) return true;
+  if (typeof profileData !== 'object' || Array.isArray(profileData)) return false;
+  const value = (profileData as Record<string, unknown>).automaticProfiling;
+  if (value === undefined) return true;
+  return typeof value === 'boolean' ? value : false;
+}
+
 export async function readProfileAccess(
   pg: PrivacyPg,
   requesterId: string,
   targetId: string,
 ): Promise<ProfileAccess> {
+  if (requesterId === targetId) {
+    const own = await pg.query(
+      'SELECT profile_data FROM ai_profiles_consolidated WHERE user_id = $1',
+      [targetId],
+    );
+    if (own.rows.length === 0) {
+      return { exists: false, visible: false, automaticProfiling: false };
+    }
+    return {
+      exists: true,
+      visible: true,
+      automaticProfiling: selfAutomaticProfiling(own.rows[0].profile_data),
+    };
+  }
+
   const result = await pg.query(
     `WITH me AS (
        SELECT id FROM ai_profiles_consolidated WHERE user_id = $1
@@ -170,13 +205,11 @@ export async function readProfileAccess(
     return { exists: false, visible: false, automaticProfiling: false };
   }
 
-  const row = result.rows[0] as SearchAccessRow;
+  const row = result.rows[0] as ProfileAccessRow;
   const settings = parsePrivacySettings(row.profile_data);
   return {
     exists: true,
-    visible: requesterId === targetId || (
-      !row.blocked && (settings.discoverable || row.approved_contact || row.peer)
-    ),
+    visible: !row.blocked && (settings.discoverable || row.approved_contact || row.peer),
     automaticProfiling: settings.automaticProfiling,
   };
 }
@@ -214,29 +247,47 @@ async function searchAccessRows(
   const result = await pg.query(
     `WITH me AS (
        SELECT id FROM ai_profiles_consolidated WHERE user_id = $1
+     ), approved_contact_pairs AS MATERIALIZED (
+       SELECT cr.target_id AS profile_id
+       FROM contact_requests cr
+       JOIN me ON me.id = cr.requester_id
+       WHERE cr.status = 'approved'
+       UNION
+       SELECT cr.requester_id AS profile_id
+       FROM contact_requests cr
+       JOIN me ON me.id = cr.target_id
+       WHERE cr.status = 'approved'
+     ), peer_pairs AS MATERIALIZED (
+       SELECT pc.user_b_id AS user_id
+       FROM peer_conversations pc
+       WHERE pc.user_a_id = $1
+       UNION
+       SELECT pc.user_a_id AS user_id
+       FROM peer_conversations pc
+       WHERE pc.user_b_id = $1
+     ), block_pairs AS MATERIALIZED (
+       SELECT ub.blocked_id AS user_id
+       FROM user_blocks ub
+       WHERE ub.blocker_id = $1
+       UNION
+       SELECT ub.blocker_id AS user_id
+       FROM user_blocks ub
+       WHERE ub.blocked_id = $1
      )
      SELECT
        p.user_id,
-       p.profile_data,
-       EXISTS (
-         SELECT 1 FROM contact_requests cr
-         WHERE cr.status = 'approved'
-           AND (
-             (cr.requester_id = (SELECT id FROM me) AND cr.target_id = p.id)
-             OR (cr.target_id = (SELECT id FROM me) AND cr.requester_id = p.id)
-           )
-       ) AS approved_contact,
-       EXISTS (
-         SELECT 1 FROM peer_conversations pc
-         WHERE (pc.user_a_id = $1 AND pc.user_b_id = p.user_id)
-            OR (pc.user_a_id = p.user_id AND pc.user_b_id = $1)
-       ) AS peer,
-       EXISTS (
-         SELECT 1 FROM user_blocks ub
-         WHERE (ub.blocker_id = $1 AND ub.blocked_id = p.user_id)
-            OR (ub.blocker_id = p.user_id AND ub.blocked_id = $1)
-       ) AS blocked
+       jsonb_typeof(p.profile_data) AS profile_data_type,
+       p.profile_data -> 'automaticProfiling' AS automatic_profiling,
+       jsonb_typeof(p.profile_data -> 'automaticProfiling') AS automatic_profiling_type,
+       p.profile_data -> 'discoverable' AS discoverable,
+       jsonb_typeof(p.profile_data -> 'discoverable') AS discoverable_type,
+       (acp.profile_id IS NOT NULL) AS approved_contact,
+       (pp.user_id IS NOT NULL) AS peer,
+       (bp.user_id IS NOT NULL) AS blocked
      FROM ai_profiles_consolidated p
+     LEFT JOIN approved_contact_pairs acp ON acp.profile_id = p.id
+     LEFT JOIN peer_pairs pp ON pp.user_id = p.user_id
+     LEFT JOIN block_pairs bp ON bp.user_id = p.user_id
      WHERE p.user_id <> $1
        AND ($2::text[] IS NULL OR p.user_id = ANY($2::text[]))`,
     [requesterId, candidateIds],
@@ -244,12 +295,31 @@ async function searchAccessRows(
   return result.rows as SearchAccessRow[];
 }
 
+function searchRowPrivacySettings(row: SearchAccessRow): PrivacySettings {
+  if (
+    row.profile_data_type !== null
+    && row.profile_data_type !== 'object'
+    && row.profile_data_type !== 'null'
+  ) {
+    throw new PrivacySettingsDataError('profile_data must be an object or null');
+  }
+
+  const settings: Record<string, unknown> = {};
+  if (row.automatic_profiling_type !== null) {
+    settings.automaticProfiling = row.automatic_profiling;
+  }
+  if (row.discoverable_type !== null) {
+    settings.discoverable = row.discoverable;
+  }
+  return parsePrivacySettings(settings);
+}
+
 function searchableRows(rows: SearchAccessRow[]): Set<string> {
   const result = new Set<string>();
   for (const row of rows) {
     let settings: PrivacySettings;
     try {
-      settings = parsePrivacySettings(row.profile_data);
+      settings = searchRowPrivacySettings(row);
     } catch {
       continue;
     }
