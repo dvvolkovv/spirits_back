@@ -1,4 +1,13 @@
 import { VoiceCallService } from './voice-call.service';
+import { automaticProfilingAllowed } from '../privacy/profile-privacy';
+
+jest.mock('../privacy/profile-privacy', () => ({
+  automaticProfilingAllowed: jest.fn(),
+}));
+
+const automaticProfilingAllowedMock = automaticProfilingAllowed as jest.MockedFunction<
+  typeof automaticProfilingAllowed
+>;
 
 /**
  * ⚠️ Курсор подтяжки реплик — потеря данных владельца 11.10.2026.
@@ -15,6 +24,10 @@ import { VoiceCallService } from './voice-call.service';
  * Два дня я искал причину в промптах, гейтах и нумерации кусков. Она была здесь.
  */
 describe('profileTurns: курсор не перепрыгивает неотданное', () => {
+  beforeEach(() => {
+    automaticProfilingAllowedMock.mockReset().mockResolvedValue(true);
+  });
+
   function makeSvc(rows: any[]) {
     const pg = { query: jest.fn(async () => ({ rows })) };
     return new VoiceCallService(pg as any, ...([] as any[])) as any;
