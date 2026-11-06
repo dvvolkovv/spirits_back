@@ -5,6 +5,7 @@ import { PgService } from '../common/services/pg.service';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { buildProfileExtractionPrompt } from './profile-extraction-prompt';
 import { awaitWithAbort, throwIfAborted } from '../common/abort';
+import { automaticProfilingAllowed } from '../privacy/profile-privacy';
 
 @Injectable()
 export class Neo4jService implements OnModuleInit, OnModuleDestroy {
@@ -105,6 +106,8 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
    * Веб-чат зовёт без опций и получает всё, как раньше.
    */
   async getProfileDescription(userId: string, opts?: { includePrivate?: boolean }): Promise<string> {
+    const pg = this.pg;
+    if (!pg || !(await automaticProfilingAllowed(pg, userId))) return '';
     const session = this.getSession();
     if (!session) return '';
     try {
@@ -125,6 +128,7 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
       );
 
       if (!result.records.length) return '';
+      if (!(await automaticProfilingAllowed(pg, userId))) return '';
       const rec = result.records[0];
 
       const fmt = (items: any[]) => items
@@ -557,10 +561,13 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     assistantResponse: string,
     prevAssistantMessage?: string,
   ): Promise<void> {
+    const pg = this.pg;
+    if (!pg) return;
     const apiKey = process.env.OPENROUTER_API_KEY;
     if (!this.driver) return;
 
     try {
+      if (!(await automaticProfilingAllowed(pg, userId))) return;
       // Предыдущая реплика ассистента — нужна чтобы понять, с чем именно
       // соглашается пользователь, если в его текущей реплике есть «да/точно/
       // верно». По умолчанию достаём её сами (обычный ход: в базе уже лежит
@@ -606,13 +613,16 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
         this.logger.warn(`consolidateFromChat: failed to parse JSON for ${userId}_${agentId}; raw[0..200]=${content.slice(0, 200)}`);
         return;
       }
+      if (!(await automaticProfilingAllowed(pg, userId))) return;
       const entityTypes = ['interests', 'values', 'desires', 'beliefs', 'intents', 'skills'];
       for (const type of entityTypes) {
         if (Array.isArray(extracted[type]) && extracted[type].length > 0) {
+          if (!(await automaticProfilingAllowed(pg, userId))) return;
           await this.updateProfileEntities(userId, type.slice(0, -1), extracted[type]); // remove 's'
         }
       }
       // Update embedding every 5th consolidation (save on API costs)
+      if (!(await automaticProfilingAllowed(pg, userId))) return;
       const session2 = this.getSession();
       if (session2) {
         try {
@@ -620,6 +630,7 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
             'MATCH (p:Profile {phone: $phone}) RETURN p.consolidation_count as cnt, p.embeddingUpdatedAt as emb',
             { phone: userId },
           );
+          if (!(await automaticProfilingAllowed(pg, userId))) return;
           const cnt = (res.records[0]?.get('cnt')?.toNumber?.() || res.records[0]?.get('cnt') || 0) + 1;
           await session2.run(
             'MERGE (p:Profile {phone: $phone}) SET p.consolidation_count = $cnt',
@@ -628,6 +639,7 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
           // Update embedding every 5 consolidations or if never set
           const hasEmbedding = res.records[0]?.get('emb');
           if (!hasEmbedding || cnt % 5 === 0) {
+            if (!(await automaticProfilingAllowed(pg, userId))) return;
             await this.updateProfileEmbedding(userId);
           }
         } finally {
@@ -640,10 +652,12 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
   }
 
   async updateProfileEmbedding(userId: string): Promise<void> {
+    const pg = this.pg;
     const openaiKey = process.env.OPENAI_API_KEY;
-    if (!openaiKey || !this.driver) return;
+    if (!openaiKey || !this.driver || !pg) return;
 
     try {
+      if (!(await automaticProfilingAllowed(pg, userId))) return;
       // Build text description from profile entities
       const desc = await this.getProfileDescription(userId);
       if (!desc || desc.length < 20) return;
@@ -654,6 +668,7 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
         { model: 'text-embedding-3-large', input: desc, dimensions: 256 },
         { headers: { Authorization: `Bearer ${openaiKey}`, 'Content-Type': 'application/json' }, timeout: 15000 },
       );
+      if (!(await automaticProfilingAllowed(pg, userId))) return;
       const embedding = resp.data?.data?.[0]?.embedding;
       if (!embedding || !Array.isArray(embedding)) return;
 
