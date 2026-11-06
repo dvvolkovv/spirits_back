@@ -2,7 +2,7 @@ import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 import { Pool } from 'pg';
 
 const CONNECTION_STRING = process.env.PROVISIONING_PG_URL;
-if (!CONNECTION_STRING) throw new Error('PROVISIONING_PG_URL is required for pg.cancellation.process.real.spec.ts');
+const maybe = CONNECTION_STRING ? describe : describe.skip;
 
 const CHILD_SCRIPT = String.raw`
 const { Pool } = require('pg');
@@ -48,7 +48,7 @@ type ChildRun = {
   completion: Promise<ChildResult>;
 };
 
-describe('PgService crash regressions in separate processes', () => {
+maybe('PgService crash regressions in separate processes', () => {
   jest.setTimeout(20_000);
   let observer: Pool;
   const runs = new Set<ChildRun>();

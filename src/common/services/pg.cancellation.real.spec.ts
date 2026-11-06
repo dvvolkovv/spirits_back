@@ -2,9 +2,9 @@ import { Pool } from 'pg';
 import { PgService } from './pg.service';
 
 const CONNECTION_STRING = process.env.PROVISIONING_PG_URL;
-if (!CONNECTION_STRING) throw new Error('PROVISIONING_PG_URL is required for pg.cancellation.real.spec.ts');
+const maybe = CONNECTION_STRING ? describe : describe.skip;
 
-describe('PgService cancellation against real PostgreSQL', () => {
+maybe('PgService cancellation against real PostgreSQL', () => {
   jest.setTimeout(20_000);
   let service: PgService;
   let observer: Pool;
