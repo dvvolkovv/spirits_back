@@ -284,7 +284,16 @@ describe('agentReply: isolated agent version test', () => {
       automaticProfiling: false,
       tasksContext: 'ACTIVE TASKS MARKER',
     });
+    h.post
+      .mockImplementationOnce(async () => ({ data: sseStream([]) }))
+      .mockImplementationOnce(async () => ({
+        data: sseStream([
+          { type: 'delta', text: 'retry answer' },
+          { type: 'done', costUsd: 0.01, turnCostUsd: 0.01 },
+        ]),
+      }));
     const addTokenTask = jest.spyOn(h.service as any, 'addTokenTask').mockResolvedValue(undefined);
+    const realSetTimeout = global.setTimeout;
     // persistResponse заводит отложенную очистку dedup-ключа; сама очистка к
     // проверке prompt не относится, а её реальный таймер держит Jest после теста.
     const cleanupTimer = jest.spyOn(global, 'setTimeout').mockImplementation(
@@ -292,7 +301,7 @@ describe('agentReply: isolated agent version test', () => {
     );
 
     try {
-      await (h.service as any).streamUniversalAgent(
+      const streaming = (h.service as any).streamUniversalAgent(
         'user',
         'check relay privacy',
         '12',
@@ -311,11 +320,31 @@ describe('agentReply: isolated agent version test', () => {
         '',
         'business',
       );
+      const outcome = await Promise.race([
+        streaming.then(() => 'settled'),
+        new Promise<string>((resolve) => realSetTimeout(() => resolve('watchdog'), 250)),
+      ]);
+      expect(outcome).toBe('settled');
     } finally {
       cleanupTimer.mockRestore();
       addTokenTask.mockRestore();
     }
 
+    const lateAddTokenTask = jest.spyOn(h.service as any, 'addTokenTask');
+    const lateTimer = jest.spyOn(global, 'setTimeout');
+    try {
+      for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve));
+      expect(lateAddTokenTask).not.toHaveBeenCalled();
+      expect(lateTimer).not.toHaveBeenCalledWith(expect.any(Function), 14_000);
+    } finally {
+      for (const result of lateTimer.mock.results) {
+        if (result.type === 'return') clearTimeout(result.value);
+      }
+      lateTimer.mockRestore();
+      lateAddTokenTask.mockRestore();
+    }
+
+    expect(h.post).toHaveBeenCalledTimes(2);
     const fields = h.lastFields();
     expect(fields.systemPrompt).not.toContain('LIVE USER PROFILE');
     expect(fields.systemPrompt).not.toContain('User profile:');
