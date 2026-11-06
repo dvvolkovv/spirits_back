@@ -14,7 +14,7 @@ function makeService() {
     query: jest.fn(async (): Promise<any> => ({ rows: [] })),
   };
   const neo4j = {
-    listEntitiesForCompaction: jest.fn(),
+    listEntitiesForCompaction: jest.fn(async (): Promise<any[]> => []),
     dropEntityRelation: jest.fn(async () => {}),
     mergeEntitiesInProfile: jest.fn(async () => {}),
   };
