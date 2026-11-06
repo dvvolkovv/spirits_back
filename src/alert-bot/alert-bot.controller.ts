@@ -2,7 +2,7 @@ import { Controller, Post, Req, Res, HttpCode, NotFoundException, UnauthorizedEx
 import type { Request, Response } from 'express';
 import { ALERT_BOT_HANDLER, alertBotEnabled, validAlertBotSecret } from './alert-bot.config';
 
-@Controller('alert-bot')
+@Controller()
 export class AlertBotController {
   private readonly logger = new Logger(AlertBotController.name);
   constructor(@Inject(ALERT_BOT_HANDLER) private readonly handler: {
@@ -10,7 +10,7 @@ export class AlertBotController {
     handleUpdate(update: unknown, alreadyClaimed?: boolean): Promise<void>;
   }) {}
 
-  @Post('telegram')
+  @Post('alert-bot/telegram')
   @HttpCode(200)
   async hook(@Req() req: Request, @Res() res: Response) {
     if (!alertBotEnabled()) throw new NotFoundException();
@@ -30,5 +30,11 @@ export class AlertBotController {
     setImmediate(() => this.handler.handleUpdate(req.body, true).catch((e: any) => {
       this.logger.error(`alert-bot update failed: ${e?.code || e?.kind || 'error'}`);
     }));
+  }
+
+  @Post('telegram/alert-bot')
+  @HttpCode(200)
+  async directHook(@Req() req: Request, @Res() res: Response) {
+    return this.hook(req, res);
   }
 }

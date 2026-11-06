@@ -18,7 +18,7 @@
 
 ### 1. Вход: вебхук, кто и где
 
-- Модуль `src/alert-bot/`, точка `POST /webhook/alert-bot/telegram`.
+- Модуль `src/alert-bot/`, основная точка `POST /webhook/telegram/alert-bot`; старая `POST /webhook/alert-bot/telegram` сохраняется для совместимости и использует тот же обработчик. На проде адрес — `https://linkeon.io/webhook/telegram/alert-bot`: прямой origin обязателен, потому что Telegram не может достучаться до `my.linkeon.io` через Selectel-прокси.
 - Вход включается, только когда заданы оба: `ALERT_BOT_WEBHOOK_URL` и `ALERT_BOT_WEBHOOK_SECRET`. Иначе точка отвечает 404 на всё, а бот при старте ничего не регистрирует. Заголовок `X-Telegram-Bot-Api-Secret-Token` сверяется с секретом за постоянное время (`crypto.timingSafeEqual`); не совпал — 401.
 - **Регистрация при старте — без захвата.** Бот читает `getWebhookInfo`: адрес пуст или равен `ALERT_BOT_WEBHOOK_URL` → `setWebhook` (`secret_token`, `allowed_updates: ["message", "callback_query"]`, очередь не сбрасывается) и `setMyCommands`; там чужой адрес → ничего не меняет, пишет в лог и шлёт алерт «вебхук бота алертов занят другим адресом». Так стенд, получивший токен прода синхронизацией ключей, не уведёт бота. Переменные `ALERT_BOT_*` в `sync-api-keys-to-test.sh` не добавлять — это сторожит тест.
 - Telegram получает 200 сразу, ответ готовится в фоне (как в `TgBotController`). Повторы отсекает таблица `alert_bot_updates`: каждый апдейт сначала вставляется по `update_id`, конфликт — пропуск. Так повтор не обработается дважды, будь то вопрос, команда или нажатие кнопки.
@@ -130,7 +130,7 @@
 
 0. ✅ Снят старый `/webhook/support/telegram-hook` — 03.11, отдельным выкатом.
 1. Ветка `feat/alert-bot-answers` от `main`, TDD, гейты на ноде, ревью; слияние; `deploy.sh` (`BACK_ONLY=1 SKIP_BOTS=1`). На тестовом стенде вход выключен: нет ни переменных, ни токена.
-2. В `.env` прода — `ALERT_BOT_WEBHOOK_URL=https://my.linkeon.io/webhook/alert-bot/telegram` и случайный `ALERT_BOT_WEBHOOK_SECRET` (права файла прежние); затем перезапуск через `deploy.sh`. При старте бот регистрирует вебхук и меню.
+2. В `.env` прода — `ALERT_BOT_WEBHOOK_URL=https://linkeon.io/webhook/telegram/alert-bot` и случайный `ALERT_BOT_WEBHOOK_SECRET` (права файла прежние); затем перезапуск через `deploy.sh`. При старте бот регистрирует вебхук и меню.
 3. Живая проверка на проде: `getWebhookInfo` — наш адрес, без ошибок; владелец спрашивает в личке, затем в группе — `/ask@…` и ответом на алерт; черновик на тикете тестового аккаунта — «Отмена», затем «Отправить»; `/status`; `/close`; сообщение с упоминанием — дошло ли (записать в `CLAUDE.md`).
 4. `CLAUDE.md` бэка: раздел «Доставка алертов» — про ответы бота; заметка в памяти. Остальным админам — привязать Telegram в профиле.
 
