@@ -37,4 +37,11 @@ export class AlertBotController {
   async directHook(@Req() req: Request, @Res() res: Response) {
     return this.hook(req, res);
   }
+
+  // Второй сегмент после alert-bot не даёт маршруту telegram/:secret перехватить запрос.
+  @Post('telegram/alert-bot/telegram')
+  @HttpCode(200)
+  async directTelegramHook(@Req() req: Request, @Res() res: Response) {
+    return this.hook(req, res);
+  }
 }

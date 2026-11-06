@@ -1991,7 +1991,7 @@ Commit: `docs(alert-bot): описать команды, ограничения 
 - [ ] **Step 6: включить вход на проде — после отдельного OK владельца**
 
 Согласованной процедурой секретов добавить в `.env` прода:
-- `ALERT_BOT_WEBHOOK_URL=https://linkeon.io/webhook/telegram/alert-bot`;
+- `ALERT_BOT_WEBHOOK_URL=https://linkeon.io/webhook/telegram/alert-bot/telegram`;
 - новый случайный `ALERT_BOT_WEBHOOK_SECRET` (минимум 32 байта, не писать в репозиторий/лог/чат).
 
 Прямой origin обязателен, потому что Telegram не может достучаться до `my.linkeon.io` через Selectel-прокси.
