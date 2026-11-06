@@ -64,7 +64,7 @@ export class ProfileCompactionService {
            JOIN ai_profiles_consolidated p ON p.user_id = split_part(h.session_id, '_', 1)
            WHERE h.sender_type = 'human'
              AND h.created_at > now() - interval '7 days'
-             AND coalesce(p.profile_data->>'automaticProfiling', 'true') = 'true'`,
+             AND coalesce(p.profile_data->'automaticProfiling', 'true'::jsonb) = 'true'::jsonb`,
       );
       this.logger.log(`Compacting ${users.rows.length} active users…`);
       for (const row of users.rows) {
@@ -86,6 +86,9 @@ export class ProfileCompactionService {
     if (!(await automaticProfilingAllowed(this.pg, userId))) return { skipped: 'privacy' };
     const stats: Record<string, any> = { userId, perCategory: {} };
     for (const cat of this.CATEGORIES) {
+      if (!(await automaticProfilingAllowed(this.pg, userId))) {
+        return { ...stats, skipped: 'privacy' };
+      }
       const c: any = { dropped_noSource: 0, dropped_stale: 0, merged_groups: 0, before: 0, after: 0 };
       const entities = await this.neo4j.listEntitiesForCompaction(userId, this.singular(cat));
       c.before = entities.length;
@@ -104,6 +107,9 @@ export class ProfileCompactionService {
       //     везде и всегда»).
       const suspect = entities.filter(e => e.support < this.TRUSTED_SUPPORT);
       for (const e of suspect) {
+        if (!(await automaticProfilingAllowed(this.pg, userId))) {
+          return { ...stats, skipped: 'privacy' };
+        }
         const matches = await this.findUserMatches(userId, e.name, e.aliases);
         if (matches.length === 0) {
           if (!(await automaticProfilingAllowed(this.pg, userId))) {
@@ -114,7 +120,10 @@ export class ProfileCompactionService {
           continue;
         }
         if (e.support < this.STRICT_VALIDATE_SUPPORT) {
-          const verdict = await this.llmValidateEntity(cat, e.name, matches);
+          if (!(await automaticProfilingAllowed(this.pg, userId))) {
+            return { ...stats, skipped: 'privacy' };
+          }
+          const verdict = await this.llmValidateEntity(userId, cat, e.name, matches);
           if (verdict === false) {
             if (!(await automaticProfilingAllowed(this.pg, userId))) {
               return { ...stats, skipped: 'privacy' };
@@ -131,6 +140,9 @@ export class ProfileCompactionService {
       }
       const cutoff = Date.now() - this.STALE_DAYS * 24 * 3600 * 1000;
       const remaining = await this.neo4j.listEntitiesForCompaction(userId, this.singular(cat));
+      if (!(await automaticProfilingAllowed(this.pg, userId))) {
+        return { ...stats, skipped: 'privacy' };
+      }
       for (const e of remaining) {
         if (e.support >= 2) continue;
         const ts = e.updatedAt ? Date.parse(e.updatedAt) : 0;
@@ -145,8 +157,14 @@ export class ProfileCompactionService {
 
       // ── 3) Semantic merge — только если категория всё ещё большая ──────
       const afterPrune = await this.neo4j.listEntitiesForCompaction(userId, this.singular(cat));
+      if (!(await automaticProfilingAllowed(this.pg, userId))) {
+        return { ...stats, skipped: 'privacy' };
+      }
       if (afterPrune.length >= this.MERGE_THRESHOLD) {
-        const groups = await this.llmGroupSynonyms(cat, afterPrune);
+        if (!(await automaticProfilingAllowed(this.pg, userId))) {
+          return { ...stats, skipped: 'privacy' };
+        }
+        const groups = await this.llmGroupSynonyms(userId, cat, afterPrune);
         for (const g of groups) {
           if (g.merge_from.length < 2) continue; // singleton — пропускаем
           if (!(await automaticProfilingAllowed(this.pg, userId))) {
@@ -157,6 +175,9 @@ export class ProfileCompactionService {
         }
       }
 
+      if (!(await automaticProfilingAllowed(this.pg, userId))) {
+        return { ...stats, skipped: 'privacy' };
+      }
       const finalList = await this.neo4j.listEntitiesForCompaction(userId, this.singular(cat));
       c.after = finalList.length;
       stats.perCategory[cat] = c;
@@ -220,7 +241,7 @@ export class ProfileCompactionService {
    * Возвращает true (keep), false (drop), null (неоднозначно — keep).
    * Цена ≈ 1 Haiku call ≈ 500 input tokens ≈ $0.0005 за entity.
    */
-  private async llmValidateEntity(category: string, entityName: string, userMessages: string[]): Promise<boolean | null> {
+  private async llmValidateEntity(userId: string, category: string, entityName: string, userMessages: string[]): Promise<boolean | null> {
     // Спец-маркер из findUserMatches: validation пропускаем.
     if (userMessages.length === 1 && userMessages[0] === '__skip_validation__') return null;
     if (userMessages.length === 0) return false;
@@ -260,6 +281,7 @@ ${samples}
 
       // Fallback to OpenRouter if claude CLI failed
       if (!content && orKey) {
+        if (!(await automaticProfilingAllowed(this.pg, userId))) return null;
         const resp = await axios.post(
           'https://openrouter.ai/api/v1/chat/completions',
           {
@@ -288,6 +310,7 @@ ${samples}
    * синонимов с canonical именем и списком исходных canonical_key для merge.
    */
   private async llmGroupSynonyms(
+    userId: string,
     category: string,
     entities: Array<{ canonicalKey: string; name: string; aliases: string[]; support: number }>,
   ): Promise<Array<{ canonical: string; merge_from: string[] }>> {
@@ -326,6 +349,7 @@ ${listing}
 
       // Fallback to OpenRouter if claude CLI failed
       if (!content && orKey) {
+        if (!(await automaticProfilingAllowed(this.pg, userId))) return [];
         const resp = await axios.post(
           'https://openrouter.ai/api/v1/chat/completions',
           {
