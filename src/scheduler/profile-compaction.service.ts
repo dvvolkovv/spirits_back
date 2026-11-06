@@ -4,6 +4,7 @@ import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
+import { automaticProfilingAllowed } from '../privacy/profile-privacy';
 
 /**
  * Автоматическая компакция профиля в Neo4j.
@@ -58,10 +59,12 @@ export class ProfileCompactionService {
     this.isRunning = true;
     try {
       const users = await this.pg.query(
-        `SELECT DISTINCT split_part(session_id, '_', 1) AS user_id
-           FROM custom_chat_history
-           WHERE sender_type = 'human'
-             AND created_at > now() - interval '7 days'`,
+        `SELECT DISTINCT split_part(h.session_id, '_', 1) AS user_id
+           FROM custom_chat_history h
+           JOIN ai_profiles_consolidated p ON p.user_id = split_part(h.session_id, '_', 1)
+           WHERE h.sender_type = 'human'
+             AND h.created_at > now() - interval '7 days'
+             AND coalesce(p.profile_data->>'automaticProfiling', 'true') = 'true'`,
       );
       this.logger.log(`Compacting ${users.rows.length} active users…`);
       for (const row of users.rows) {
@@ -80,6 +83,7 @@ export class ProfileCompactionService {
   /** Один пользователь — все три прохода. Возвращает stats для лога/UI. */
   async compactUser(userId: string): Promise<Record<string, any>> {
     if (!this.neo4j) return { skipped: 'no neo4j' };
+    if (!(await automaticProfilingAllowed(this.pg, userId))) return { skipped: 'privacy' };
     const stats: Record<string, any> = { userId, perCategory: {} };
     for (const cat of this.CATEGORIES) {
       const c: any = { dropped_noSource: 0, dropped_stale: 0, merged_groups: 0, before: 0, after: 0 };
@@ -102,6 +106,9 @@ export class ProfileCompactionService {
       for (const e of suspect) {
         const matches = await this.findUserMatches(userId, e.name, e.aliases);
         if (matches.length === 0) {
+          if (!(await automaticProfilingAllowed(this.pg, userId))) {
+            return { ...stats, skipped: 'privacy' };
+          }
           await this.neo4j.dropEntityRelation(userId, this.singular(cat), e.canonicalKey);
           c.dropped_noSource++;
           continue;
@@ -109,6 +116,9 @@ export class ProfileCompactionService {
         if (e.support < this.STRICT_VALIDATE_SUPPORT) {
           const verdict = await this.llmValidateEntity(cat, e.name, matches);
           if (verdict === false) {
+            if (!(await automaticProfilingAllowed(this.pg, userId))) {
+              return { ...stats, skipped: 'privacy' };
+            }
             await this.neo4j.dropEntityRelation(userId, this.singular(cat), e.canonicalKey);
             c.dropped_llmReject = (c.dropped_llmReject || 0) + 1;
           }
@@ -116,12 +126,18 @@ export class ProfileCompactionService {
       }
 
       // ── 2) Stale prune ─────────────────────────────────────────────────
+      if (!(await automaticProfilingAllowed(this.pg, userId))) {
+        return { ...stats, skipped: 'privacy' };
+      }
       const cutoff = Date.now() - this.STALE_DAYS * 24 * 3600 * 1000;
       const remaining = await this.neo4j.listEntitiesForCompaction(userId, this.singular(cat));
       for (const e of remaining) {
         if (e.support >= 2) continue;
         const ts = e.updatedAt ? Date.parse(e.updatedAt) : 0;
         if (ts > 0 && ts < cutoff) {
+          if (!(await automaticProfilingAllowed(this.pg, userId))) {
+            return { ...stats, skipped: 'privacy' };
+          }
           await this.neo4j.dropEntityRelation(userId, this.singular(cat), e.canonicalKey);
           c.dropped_stale++;
         }
@@ -133,6 +149,9 @@ export class ProfileCompactionService {
         const groups = await this.llmGroupSynonyms(cat, afterPrune);
         for (const g of groups) {
           if (g.merge_from.length < 2) continue; // singleton — пропускаем
+          if (!(await automaticProfilingAllowed(this.pg, userId))) {
+            return { ...stats, skipped: 'privacy' };
+          }
           await this.neo4j.mergeEntitiesInProfile(userId, this.singular(cat), g.merge_from, g.canonical);
           c.merged_groups++;
         }

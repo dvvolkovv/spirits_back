@@ -17,6 +17,7 @@ import {
   CompletePayload, CONSOLIDATE_SIDE_LIMIT, HOST_AGENT_ID, HOST_CATEGORY,
   SPECIALIST_ROLES, SPECIALISTS,
 } from './voice-call.types';
+import { automaticProfilingAllowed } from '../privacy/profile-privacy';
 
 /**
  * Ставки OpenAI Realtime за 1M аудио-токенов, по моделям.
@@ -423,12 +424,20 @@ export class VoiceCallService implements OnModuleInit {
     userId: string,
     sinceTs: number,
   ): Promise<{ turns: { callId: string; index: number; text: string; ts: number }[]; cursor: number }> {
+    if (!(await automaticProfilingAllowed(this.pg, userId))) {
+      return { turns: [], cursor: sinceTs };
+    }
     const res = await this.pg.query(
       `SELECT id, transcript FROM voice_calls
          WHERE user_id = $1 AND status = 'completed' AND transcript IS NOT NULL
          ORDER BY started_at DESC LIMIT 30`,
       [userId],
     );
+    // Согласие могли отозвать, пока читался транскрипт: не собираем и не отдаём
+    // реплики и оставляем курсор на месте, чтобы после разрешения их можно было получить.
+    if (!(await automaticProfilingAllowed(this.pg, userId))) {
+      return { turns: [], cursor: sinceTs };
+    }
     const turns: { callId: string; index: number; text: string; ts: number }[] = [];
     for (const row of res.rows) {
       const arr = Array.isArray(row.transcript) ? row.transcript : [];
