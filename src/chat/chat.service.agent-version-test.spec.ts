@@ -320,11 +320,15 @@ describe('agentReply: isolated agent version test', () => {
         '',
         'business',
       );
-      const outcome = await Promise.race([
-        streaming.then(() => 'settled'),
-        new Promise<string>((resolve) => realSetTimeout(() => resolve('watchdog'), 250)),
-      ]);
-      expect(outcome).toBe('settled');
+      if (h.post.mock.calls.length > 1) {
+        const outcome = await Promise.race([
+          streaming.then(() => 'settled'),
+          new Promise<string>((resolve) => realSetTimeout(() => resolve('watchdog'), 250)),
+        ]);
+        expect(outcome).toBe('settled');
+      } else {
+        await streaming;
+      }
     } finally {
       cleanupTimer.mockRestore();
       addTokenTask.mockRestore();
@@ -353,6 +357,57 @@ describe('agentReply: isolated agent version test', () => {
     expect(fields.message).toContain('ACTIVE TASKS MARKER');
     expect(h.tasksService.buildContextForPrompt).toHaveBeenCalledWith('user', 'check relay privacy');
     expect(h.businessProfile.renderForPrompt).not.toHaveBeenCalled();
+  });
+
+  it('completes relay self-heal when the first response is empty', async () => {
+    const h = replyHarness(undefined, {
+      automaticProfiling: false,
+      tasksContext: 'ACTIVE TASKS MARKER',
+    });
+    h.post
+      .mockImplementationOnce(async () => ({ data: sseStream([]) }))
+      .mockImplementationOnce(async () => ({
+        data: sseStream([
+          { type: 'delta', text: 'retry answer' },
+          { type: 'done', costUsd: 0.01, turnCostUsd: 0.01 },
+        ]),
+      }));
+    const addTokenTask = jest.spyOn(h.service as any, 'addTokenTask').mockResolvedValue(undefined);
+    const realSetTimeout = global.setTimeout;
+    const cleanupTimer = jest.spyOn(global, 'setTimeout').mockImplementation(
+      () => ({ unref: jest.fn() }) as any,
+    );
+
+    try {
+      const streaming = (h.service as any).streamUniversalAgent(
+        'user',
+        'check relay privacy',
+        '12',
+        '12',
+        [],
+        'LIVE USER PROFILE',
+        responseHarness(),
+        'Роман',
+        'LIVE DESCRIPTION',
+        'LIVE SYSTEM PROMPT',
+        undefined,
+        false,
+        undefined,
+        'ru',
+        undefined,
+        '',
+        'business',
+      );
+      const outcome = await Promise.race([
+        streaming.then(() => 'settled'),
+        new Promise<string>((resolve) => realSetTimeout(() => resolve('watchdog'), 250)),
+      ]);
+      expect(outcome).toBe('settled');
+      expect(h.post).toHaveBeenCalledTimes(2);
+    } finally {
+      cleanupTimer.mockRestore();
+      addTokenTask.mockRestore();
+    }
   });
 
   it('прерванный ответ (done.failed) в основной сессии — busy, обрезанный текст не пишется', async () => {
