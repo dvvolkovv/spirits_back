@@ -60,14 +60,21 @@ export class AuthController implements OnModuleInit {
     @Query('src') src: string,
     @Query('nosms') nosms: string,
     @Query('lang') lang: string,
+    @Query('resend') resend: string,
     @Res() res: Response,
   ) {
     // ?nosms=1 — маркер автоматического вызова (Claude-ceremony/тесты): для
     // «двойного» номера 79656445804 глушит реальную SMS (код берётся из Redis).
     // На обычный вход владельца (без флага) SMS уходит. См. auth.service.
+    //
+    // ?resend=1 — человек ЯВНО просит выслать код ещё раз. Без него живой код в
+    // Redis гасит отправку молча, и кнопка «выслать ещё раз» показывала бы
+    // «отправили», ничего не отправив (ответ 200 одинаков для sent/exists).
+    // Потолки отправки действуют как обычно — они и есть защита от злоупотребления.
     const result = await this.authService.requestSmsCode(phone, sid, src, {
       suppressSms: nosms === '1' || nosms === 'true',
       lang,
+      resend: resend === '1' || resend === 'true',
     });
     if (result.status === 'invalid_phone') {
       return res.set(CORS).status(400).json({ error: 'invalid_phone' });

@@ -1,6 +1,6 @@
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
-import { SMS_CODE_MAX_ATTEMPTS, smsCodeKey } from './sms-code';
+import { SMS_CODE_MAX_ATTEMPTS, smsAttemptsKey, smsCodeKey } from './sms-code';
 import { isSmsPhone, SMS_LIMIT_DEFAULTS, SMS_LIMIT_ENV } from './sms-limits';
 import { clockRedis, FakeRedis } from './fake-redis.forspec';
 import { sendTelegramAlert } from '../common/telegram-alert';
@@ -112,7 +112,7 @@ function makeController(s = makeService()) {
 }
 
 const askSms = (c: AuthController, phone: string, res: any) =>
-  c.sendSms(phone, undefined as any, undefined as any, undefined as any, undefined as any, res);
+  c.sendSms(phone, undefined as any, undefined as any, undefined as any, undefined as any, undefined as any, res);
 
 describe('номер для SMS: формат', () => {
   it('не цифры, не та длина, ведущий ноль — 400 invalid_phone; Redis не тронут, SMS нет', async () => {
@@ -632,5 +632,59 @@ describe('пороги', () => {
     await s.redis.set('sms-lim:global:d', '100'); // полный, без срока
     expect(await requestAndBurn(s, RU(16))).toEqual({ status: 'suppressed' });
     expect(await s.redis.ttl('sms-lim:global:d')).toBe(86400);
+  });
+});
+
+describe('AuthService.requestSmsCode — явная просьба выслать код ещё раз', () => {
+  /**
+   * ⚠️ Человек, до которого SMS не дошла, не мог попросить её ещё раз.
+   *
+   * У аккаунта SMSAERO нет одобренной подписи отправителя: сообщения уходят «свободной
+   * подписью» со случайных имён, и часть режут операторы и спам-фильтры. Экран входа
+   * кнопки «выслать ещё раз» не давал, а сервер на повторный запрос отвечал 200
+   * «SMS sent», молча ничего не отправляя — живой код в Redis гасил отправку. Ответ
+   * одинаков для sent/exists/suppressed намеренно (по нему нельзя узнать,
+   * зарегистрирован ли номер), поэтому клиент разницы не видел и показывал «отправили».
+   */
+  const P = RU(500);
+
+  it('шлёт ТОТ ЖЕ код ещё раз и не трогает счётчик неверных попыток', async () => {
+    const s = makeService();
+    expect(await s.service.requestSmsCode(P)).toEqual({ status: 'sent' });
+    const code = await s.redis.get(smsCodeKey(P));
+    await s.service.checkCode(P, '000000');
+    expect(await s.redis.get(smsAttemptsKey(P))).toBe('1');
+
+    s.redis.advance(61); // прошла минута — интервал между отправками открыт
+    expect(await s.service.requestSmsCode(P, null, null, { resend: true })).toEqual({ status: 'sent' });
+
+    expect(s.sent).toEqual([P, P]);
+    expect(await s.redis.get(smsCodeKey(P))).toBe(code);
+    // ⚠️ попытки НЕ обнуляются: иначе «выслать ещё раз» обходил бы потолок в пять попыток
+    expect(await s.redis.get(smsAttemptsKey(P))).toBe('1');
+  });
+
+  it('без явной просьбы живой код по-прежнему гасит отправку', async () => {
+    const s = makeService();
+    expect(await s.service.requestSmsCode(P)).toEqual({ status: 'sent' });
+    s.redis.advance(61);
+    expect(await s.service.requestSmsCode(P)).toEqual({ status: 'exists' });
+    expect(s.sent).toEqual([P]);
+  });
+
+  it('упирается в потолок частоты, а не обходит его', async () => {
+    const s = makeService();
+    expect(await s.service.requestSmsCode(P)).toEqual({ status: 'sent' });
+    const r = await s.service.requestSmsCode(P, null, null, { resend: true }); // сразу, без паузы
+    expect(r.status).toBe('rate_limited');
+    expect(s.sent).toEqual([P]);
+  });
+
+  it('при истёкшем коде заводит новый и обнуляет счётчик', async () => {
+    const s = makeService();
+    await s.redis.set(smsAttemptsKey(P), '3', 300); // счётчик пережил код
+    expect(await s.service.requestSmsCode(P, null, null, { resend: true })).toEqual({ status: 'sent' });
+    expect(await s.redis.get(smsCodeKey(P))).toMatch(/^\d{6}$/);
+    expect(await s.redis.get(smsAttemptsKey(P))).toBeNull();
   });
 });
