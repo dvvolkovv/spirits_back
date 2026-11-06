@@ -29,7 +29,12 @@ describe('profileTurns: курсор не перепрыгивает неотд�
   });
 
   function makeSvc(rows: any[]) {
-    const pg = { query: jest.fn(async () => ({ rows })) };
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        const ordered = /ORDER BY started_at ASC/i.test(sql) ? [...rows].reverse() : [...rows];
+        return { rows: /LIMIT\s+30/i.test(sql) ? ordered.slice(0, 30) : ordered };
+      }),
+    };
     return new VoiceCallService(pg as any, ...([] as any[])) as any;
   }
 
@@ -68,5 +73,58 @@ describe('profileTurns: курсор не перепрыгивает неотд�
     const r = await svc.profileTurns('u1', 999);
     expect(r.turns).toHaveLength(0);
     expect(r.cursor).toBe(999);
+  });
+
+  it('не теряет и не дублирует больше 100 реплик с одинаковым ts на границе страницы', async () => {
+    const sameTs = 2_000;
+    const tiedCall = (id: string, n: number) => ({
+      id,
+      transcript: Array.from({ length: n }, (_, i) => ({ role: 'user', text: `${id}-${i}`, ts: sameTs })),
+    });
+    const svc = makeSvc([tiedCall('b', 70), tiedCall('a', 67), call('next', 1, sameTs + 1)]);
+    const keys: string[] = [];
+    const pageSizes: number[] = [];
+    const cursors: number[] = [];
+    let cursor = 0;
+
+    for (let i = 0; i < 10; i++) {
+      const r = await svc.profileTurns('u1', cursor);
+      if (!r.turns.length) break;
+      pageSizes.push(r.turns.length);
+      keys.push(...r.turns.map((t: any) => `${t.callId}:${t.index}`));
+      cursors.push(r.cursor);
+      cursor = r.cursor;
+    }
+
+    expect(pageSizes).toEqual([100, 38]);
+    expect(cursors[0]).toBeGreaterThan(sameTs);
+    expect(cursors[0]).toBeLessThan(sameTs + 1);
+    expect(cursors[1]).toBe(sameTs + 1);
+    expect(keys).toHaveLength(138);
+    expect(new Set(keys).size).toBe(138);
+  });
+
+  it('после более чем 30 звонков в период запрета отдаёт весь backlog ровно один раз', async () => {
+    const rows = Array.from({ length: 35 }, (_, i) => call(`call-${i}`, 1, 1_000 + i)).reverse();
+    let enabled = false;
+    automaticProfilingAllowedMock.mockImplementation(async () => enabled);
+    const svc = makeSvc(rows);
+
+    await expect(svc.profileTurns('u1', 0)).resolves.toEqual({ turns: [], cursor: 0 });
+    expect(svc.pg.query).not.toHaveBeenCalled();
+
+    enabled = true;
+    const keys: string[] = [];
+    let cursor = 0;
+    for (let i = 0; i < 10; i++) {
+      const r = await svc.profileTurns('u1', cursor);
+      if (!r.turns.length) break;
+      keys.push(...r.turns.map((t: any) => `${t.callId}:${t.index}`));
+      cursor = r.cursor;
+    }
+
+    expect(keys).toHaveLength(35);
+    expect(new Set(keys).size).toBe(35);
+    expect(keys.sort()).toEqual(rows.map((row) => `${row.id}:0`).sort());
   });
 });
