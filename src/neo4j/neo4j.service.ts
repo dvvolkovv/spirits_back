@@ -577,7 +577,13 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
       // паре, поэтому он передаёт её явно пятым аргументом. '' — тоже
       // валидное явное значение («начало диалога»), поэтому проверяем
       // undefined, а не истинность строки.
-      const prevAssistant = prevAssistantMessage !== undefined ? prevAssistantMessage : await this.fetchPrevAssistantMessage(userId, agentId);
+      let prevAssistant: string;
+      if (prevAssistantMessage !== undefined) {
+        prevAssistant = prevAssistantMessage;
+      } else {
+        prevAssistant = await this.fetchPrevAssistantMessage(userId, agentId);
+        if (!(await automaticProfilingAllowed(pg, userId))) return;
+      }
 
       const prompt = buildProfileExtractionPrompt(prevAssistant, userMessage, assistantResponse);
 
@@ -592,6 +598,7 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
 
       // Fallback to OpenRouter if claude CLI failed
       if (!content && apiKey) {
+        if (!(await automaticProfilingAllowed(pg, userId))) return;
         const resp = await axios.post(
           'https://openrouter.ai/api/v1/chat/completions',
           {
@@ -607,13 +614,13 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
         content = resp.data.choices?.[0]?.message?.content;
       }
       if (!content) return;
+      if (!(await automaticProfilingAllowed(pg, userId))) return;
 
       const extracted = this.extractJsonObject(content);
       if (!extracted) {
         this.logger.warn(`consolidateFromChat: failed to parse JSON for ${userId}_${agentId}; raw[0..200]=${content.slice(0, 200)}`);
         return;
       }
-      if (!(await automaticProfilingAllowed(pg, userId))) return;
       const entityTypes = ['interests', 'values', 'desires', 'beliefs', 'intents', 'skills'];
       for (const type of entityTypes) {
         if (Array.isArray(extracted[type]) && extracted[type].length > 0) {
