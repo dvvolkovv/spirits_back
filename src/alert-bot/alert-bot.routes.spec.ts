@@ -5,6 +5,8 @@ import { INestApplication, Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { ALERT_BOT_HANDLER } from './alert-bot.config';
 import { AlertBotController } from './alert-bot.controller';
+import { TgBotController } from '../tg-bot/tg-bot.controller';
+import { TgBotService } from '../tg-bot/tg-bot.service';
 
 const handler = {
   claimUpdate: jest.fn<Promise<boolean>, [unknown]>(),
@@ -12,8 +14,11 @@ const handler = {
 };
 
 @Module({
-  controllers: [AlertBotController],
-  providers: [{ provide: ALERT_BOT_HANDLER, useValue: handler }],
+  controllers: [AlertBotController, TgBotController],
+  providers: [
+    { provide: ALERT_BOT_HANDLER, useValue: handler },
+    { provide: TgBotService, useValue: { handleUpdate: jest.fn() } },
+  ],
 })
 class AlertBotRoutesSpecModule {}
 
@@ -68,6 +73,15 @@ describe('публичные маршруты бота алертов', () => {
     await expect(post('/webhook/alert-bot/telegram', 'routes-secret')).resolves.toBe(200);
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(handler.claimUpdate).toHaveBeenCalledWith({ update_id: 12 });
+    expect(handler.handleUpdate).toHaveBeenCalledWith({ update_id: 12 }, true);
+  });
+
+  it('прямой origin webhook принимает верный secret и вызывает handler один раз', async () => {
+    await expect(post('/webhook/telegram/alert-bot', 'routes-secret')).resolves.toBe(200);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(handler.claimUpdate).toHaveBeenCalledTimes(1);
+    expect(handler.claimUpdate).toHaveBeenCalledWith({ update_id: 12 });
+    expect(handler.handleUpdate).toHaveBeenCalledTimes(1);
     expect(handler.handleUpdate).toHaveBeenCalledWith({ update_id: 12 }, true);
   });
 
