@@ -3,7 +3,11 @@ import { Pool } from 'pg';
 export const PG_URL = process.env.PROVISIONING_PG_URL;
 export const describePg = PG_URL ? describe : describe.skip;
 
-export async function createPrivacyPg() {
+type CreatePrivacyPgOptions = {
+  beforeCreateTable?: (context: { schema: string; pool: Pool }) => Promise<void>;
+};
+
+export async function createPrivacyPg(options: CreatePrivacyPgOptions = {}) {
   if (!PG_URL) throw new Error('PROVISIONING_PG_URL is required');
 
   const schema = `privacy_${process.pid}_${Date.now()}`;
@@ -15,6 +19,7 @@ export async function createPrivacyPg() {
 
   try {
     await pool.query(`CREATE SCHEMA ${schema}`);
+    await options.beforeCreateTable?.({ schema, pool });
     await pool.query(`
       CREATE TABLE ai_profiles_consolidated (
         id serial PRIMARY KEY,
