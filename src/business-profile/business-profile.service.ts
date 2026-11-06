@@ -10,6 +10,7 @@ import {
   renderBusinessBlock,
 } from './business-profile.types';
 import { shouldSkipBusinessExtraction } from './extract-prefilter';
+import { automaticProfilingAllowed } from '../privacy/profile-privacy';
 
 const FIELD_BY_KEY = new Map(BUSINESS_FIELDS.map(f => [f.key as string, f]));
 
@@ -133,7 +134,10 @@ export class BusinessProfileService {
   /** Прочитать карточку и отрендерить блок для промпта. Вся логика формата —
    *  в чистой renderBusinessBlock; здесь только чтение. */
   async renderForPrompt(userId: string, category: string | null | undefined): Promise<string> {
-    return renderBusinessBlock(await this.read(userId), category);
+    if (!this.pg || !(await automaticProfilingAllowed(this.pg, userId))) return '';
+    const profile = await this.read(userId);
+    if (!(await automaticProfilingAllowed(this.pg, userId))) return '';
+    return renderBusinessBlock(profile, category);
   }
 
   /**
@@ -153,6 +157,7 @@ export class BusinessProfileService {
     assistantMessage: string,
   ): Promise<void> {
     if (!this.pg || !this.claudeCli) return;
+    if (!(await automaticProfilingAllowed(this.pg, userId))) return;
     // Порядок намеренный, от дешёвого к дорогому: локальный префильтр (бесплатно)
     // → категория агента (один SELECT, но только если реплика вообще похожа на
     // бизнес) → missingFields (ещё один SELECT) → LLM-вызов (самое дорогое).
@@ -185,6 +190,7 @@ export class BusinessProfileService {
       const fields = parsed?.fields;
       if (!fields || typeof fields !== 'object') return;
 
+      if (!(await automaticProfilingAllowed(this.pg, userId))) return;
       await this.merge(userId, fields, 'assistant');
     } catch (e: any) {
       this.logger.warn(`business extractFromTurn failed for ${userId}/${agentId}: ${e?.message}`);
