@@ -107,6 +107,80 @@ function replyHarness(events: any[] = [
 
 beforeEach(() => jest.clearAllMocks());
 
+async function runRelayPrivacyTurn(h: ReturnType<typeof replyHarness>) {
+  const addTokenTask = jest.spyOn(h.service as any, 'addTokenTask').mockResolvedValue(undefined);
+  const realSetTimeout = global.setTimeout;
+  const timers: NodeJS.Timeout[] = [];
+  // Ускоряем только два известных таймера хода. Колбэки обязательно выполняются:
+  // иначе self-heal после пустого ответа навсегда ждёт свои 800 мс.
+  const timer = jest.spyOn(global, 'setTimeout').mockImplementation((
+    (callback: (...args: any[]) => void, delay = 0, ...args: any[]) => {
+      const actualDelay = delay === 800 || delay === 14_000 ? 0 : delay;
+      const handle = realSetTimeout(callback, actualDelay, ...args);
+      timers.push(handle);
+      return handle;
+    }
+  ) as any);
+
+  try {
+    const streaming = (h.service as any).streamUniversalAgent(
+      'user',
+      'check relay privacy',
+      '12',
+      '12',
+      [],
+      'LIVE USER PROFILE',
+      responseHarness(),
+      'Роман',
+      'LIVE DESCRIPTION',
+      'LIVE SYSTEM PROMPT',
+      undefined,
+      false,
+      undefined,
+      'ru',
+      undefined,
+      '',
+      'business',
+    );
+    let watchdog: NodeJS.Timeout | undefined;
+    const outcome = await Promise.race([
+      streaming.then(() => 'settled'),
+      new Promise<string>((resolve) => {
+        watchdog = realSetTimeout(() => resolve('watchdog'), 250);
+        timers.push(watchdog);
+      }),
+    ]);
+    if (watchdog) clearTimeout(watchdog);
+    expect(outcome).toBe('settled');
+
+    // persistResponse запускается через setImmediate после возврата stream.
+    // Несколько check-фаз дают завершиться и записи истории, и списанию, и
+    // немедленному dedup-cleanup — всё ещё под безопасными spy.
+    for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve));
+    expect(addTokenTask).toHaveBeenCalledTimes(1);
+  } finally {
+    for (const handle of timers) clearTimeout(handle);
+    timer.mockRestore();
+    addTokenTask.mockRestore();
+  }
+
+  // После восстановления не должно оживать ни отложенное списание, ни настоящий
+  // 14-секундный таймер. Это отдельная проверка границы жизненного цикла теста.
+  const lateAddTokenTask = jest.spyOn(h.service as any, 'addTokenTask');
+  const lateTimer = jest.spyOn(global, 'setTimeout');
+  try {
+    for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve));
+    expect(lateAddTokenTask).not.toHaveBeenCalled();
+    expect(lateTimer).not.toHaveBeenCalledWith(expect.any(Function), 14_000);
+  } finally {
+    for (const result of lateTimer.mock.results) {
+      if (result.type === 'return') clearTimeout(result.value);
+    }
+    lateTimer.mockRestore();
+    lateAddTokenTask.mockRestore();
+  }
+}
+
 describe('agentReply: isolated agent version test', () => {
   const testOpts = {
     systemPromptOverride: 'DRAFT SYSTEM PROMPT',
@@ -284,63 +358,10 @@ describe('agentReply: isolated agent version test', () => {
       automaticProfiling: false,
       tasksContext: 'ACTIVE TASKS MARKER',
     });
-    const addTokenTask = jest.spyOn(h.service as any, 'addTokenTask').mockResolvedValue(undefined);
-    const realSetTimeout = global.setTimeout;
-    // persistResponse заводит отложенную очистку dedup-ключа; сама очистка к
-    // проверке prompt не относится, а её реальный таймер держит Jest после теста.
-    const cleanupTimer = jest.spyOn(global, 'setTimeout').mockImplementation(
-      () => ({ unref: jest.fn() }) as any,
-    );
 
-    try {
-      const streaming = (h.service as any).streamUniversalAgent(
-        'user',
-        'check relay privacy',
-        '12',
-        '12',
-        [],
-        'LIVE USER PROFILE',
-        responseHarness(),
-        'Роман',
-        'LIVE DESCRIPTION',
-        'LIVE SYSTEM PROMPT',
-        undefined,
-        false,
-        undefined,
-        'ru',
-        undefined,
-        '',
-        'business',
-      );
-      if (h.post.mock.calls.length > 1) {
-        const outcome = await Promise.race([
-          streaming.then(() => 'settled'),
-          new Promise<string>((resolve) => realSetTimeout(() => resolve('watchdog'), 250)),
-        ]);
-        expect(outcome).toBe('settled');
-      } else {
-        await streaming;
-      }
-    } finally {
-      cleanupTimer.mockRestore();
-      addTokenTask.mockRestore();
-    }
+    await runRelayPrivacyTurn(h);
 
-    const lateAddTokenTask = jest.spyOn(h.service as any, 'addTokenTask');
-    const lateTimer = jest.spyOn(global, 'setTimeout');
-    try {
-      for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve));
-      expect(lateAddTokenTask).not.toHaveBeenCalled();
-      expect(lateTimer).not.toHaveBeenCalledWith(expect.any(Function), 14_000);
-    } finally {
-      for (const result of lateTimer.mock.results) {
-        if (result.type === 'return') clearTimeout(result.value);
-      }
-      lateTimer.mockRestore();
-      lateAddTokenTask.mockRestore();
-    }
-
-    expect(h.post).toHaveBeenCalledTimes(2);
+    expect(h.post).toHaveBeenCalledTimes(1);
     const fields = h.lastFields();
     expect(fields.systemPrompt).not.toContain('LIVE USER PROFILE');
     expect(fields.systemPrompt).not.toContain('User profile:');
@@ -364,42 +385,10 @@ describe('agentReply: isolated agent version test', () => {
           { type: 'done', costUsd: 0.01, turnCostUsd: 0.01 },
         ]),
       }));
-    const addTokenTask = jest.spyOn(h.service as any, 'addTokenTask').mockResolvedValue(undefined);
-    const realSetTimeout = global.setTimeout;
-    const cleanupTimer = jest.spyOn(global, 'setTimeout').mockImplementation(
-      () => ({ unref: jest.fn() }) as any,
-    );
 
-    try {
-      const streaming = (h.service as any).streamUniversalAgent(
-        'user',
-        'check relay privacy',
-        '12',
-        '12',
-        [],
-        'LIVE USER PROFILE',
-        responseHarness(),
-        'Роман',
-        'LIVE DESCRIPTION',
-        'LIVE SYSTEM PROMPT',
-        undefined,
-        false,
-        undefined,
-        'ru',
-        undefined,
-        '',
-        'business',
-      );
-      const outcome = await Promise.race([
-        streaming.then(() => 'settled'),
-        new Promise<string>((resolve) => realSetTimeout(() => resolve('watchdog'), 250)),
-      ]);
-      expect(outcome).toBe('settled');
-      expect(h.post).toHaveBeenCalledTimes(2);
-    } finally {
-      cleanupTimer.mockRestore();
-      addTokenTask.mockRestore();
-    }
+    await runRelayPrivacyTurn(h);
+
+    expect(h.post).toHaveBeenCalledTimes(2);
   });
 
   it('прерванный ответ (done.failed) в основной сессии — busy, обрезанный текст не пишется', async () => {
