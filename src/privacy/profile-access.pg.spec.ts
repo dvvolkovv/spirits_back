@@ -79,7 +79,10 @@ describePg('profile access and search candidates against an isolated PostgreSQL 
 
   it('grants access through an approved contact in both directions', async () => {
     await privacy.pool.query(
-      `INSERT INTO contact_requests (requester_id, target_id, status)
+      `UPDATE ai_profiles_consolidated
+       SET profile_data = '{"discoverable":false}'::jsonb
+       WHERE user_id = 'u1';
+       INSERT INTO contact_requests (requester_id, target_id, status)
        VALUES (1, 2, 'approved')`,
     );
 
@@ -89,7 +92,10 @@ describePg('profile access and search candidates against an isolated PostgreSQL 
 
   it('grants access through a peer conversation in both directions', async () => {
     await privacy.pool.query(
-      `INSERT INTO peer_conversations (user_a_id, user_b_id) VALUES ('u1', 'u2')`,
+      `UPDATE ai_profiles_consolidated
+       SET profile_data = '{"discoverable":false}'::jsonb
+       WHERE user_id = 'u1';
+       INSERT INTO peer_conversations (user_a_id, user_b_id) VALUES ('u1', 'u2')`,
     );
 
     await expect(canViewProfile(privacy.pg as any, 'u1', 'u2')).resolves.toBe(true);
@@ -142,7 +148,10 @@ describePg('profile access and search candidates against an isolated PostgreSQL 
 
   it('does not grant access through a pending contact request', async () => {
     await privacy.pool.query(
-      `INSERT INTO contact_requests (requester_id, target_id, status)
+      `UPDATE ai_profiles_consolidated
+       SET profile_data = '{"discoverable":false}'::jsonb
+       WHERE user_id = 'u1';
+       INSERT INTO contact_requests (requester_id, target_id, status)
        VALUES (1, 2, 'pending')`,
     );
 
