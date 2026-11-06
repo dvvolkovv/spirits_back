@@ -17,8 +17,10 @@ export async function createPrivacyPg(options: CreatePrivacyPgOptions = {}) {
     options: `-c search_path=${schema}`,
   });
 
+  let schemaCreated = false;
   try {
     await pool.query(`CREATE SCHEMA ${schema}`);
+    schemaCreated = true;
     await options.beforeCreateTable?.({ schema, pool });
     await pool.query(`
       CREATE TABLE ai_profiles_consolidated (
@@ -30,7 +32,14 @@ export async function createPrivacyPg(options: CreatePrivacyPgOptions = {}) {
       )
     `);
   } catch (error) {
-    await pool.end();
+    if (schemaCreated) {
+      try {
+        await pool.query(`DROP SCHEMA ${schema} CASCADE`);
+      } catch {}
+    }
+    try {
+      await pool.end();
+    } catch {}
     throw error;
   }
 

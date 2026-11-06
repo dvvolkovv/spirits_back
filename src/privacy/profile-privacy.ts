@@ -80,7 +80,7 @@ export async function updatePrivacySettings(
   assertPrivacySettingsPatch(patch);
 
   const params: any[] = [userId];
-  let expression = "coalesce(profile_data, '{}'::jsonb)";
+  let expression = "coalesce(nullif(profile_data, 'null'::jsonb), '{}'::jsonb)";
   for (const key of PRIVACY_KEYS) {
     if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
     params.push(patch[key]);
