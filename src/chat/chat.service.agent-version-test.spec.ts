@@ -284,14 +284,6 @@ describe('agentReply: isolated agent version test', () => {
       automaticProfiling: false,
       tasksContext: 'ACTIVE TASKS MARKER',
     });
-    h.post
-      .mockImplementationOnce(async () => ({ data: sseStream([]) }))
-      .mockImplementationOnce(async () => ({
-        data: sseStream([
-          { type: 'delta', text: 'retry answer' },
-          { type: 'done', costUsd: 0.01, turnCostUsd: 0.01 },
-        ]),
-      }));
     const addTokenTask = jest.spyOn(h.service as any, 'addTokenTask').mockResolvedValue(undefined);
     const realSetTimeout = global.setTimeout;
     // persistResponse заводит отложенную очистку dedup-ключа; сама очистка к
