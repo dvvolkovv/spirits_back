@@ -55,7 +55,22 @@ import { sendTelegramAlert } from '../common/telegram-alert';
 import { RELAY_TURN_BUDGET_MS } from '../common/relay-budget';
 import { neutralizeAtMentions } from '../common/agent-guards';
 import { automaticProfilingAllowed } from '../privacy/profile-privacy';
+import {
+  RelayProfilingBlocks,
+  relaySessionForProfiling,
+  stripRelayProfilingBlocks,
+} from './relay-prompt-privacy';
 // Agent server at r.linkeon.io (remote Claude Code)
+
+export interface UploadHandoff {
+  baseSessionId: string;
+  sessionId: string;
+  systemPrompt: string;
+  history: string;
+  products: { products_token: string; products_mcp_url: string };
+  linkeon: LinkeonRelayFields;
+  profilingBlocks: RelayProfilingBlocks;
+}
 
 /** Файл в папке сессии, как его отдаёт relay (`GET /session/:sid/files`). */
 export interface SessionFile { name: string; url: string }
@@ -823,6 +838,8 @@ export class ChatService {
     ask?: boolean;
     /** Сборка из стора: карта без партнёрской программы и без адресов кабинета (см. platform-guide.ts). */
     storeBuild?: boolean;
+    /** Точные вставленные блоки для повторной проверки consent перед dispatch. */
+    profilingBlocks?: RelayProfilingBlocks;
   }): Promise<string> {
     const { agentId, agentName, userId, userLanguage } = opts;
     const agentDescription = opts.agentDescription || '';
@@ -915,6 +932,9 @@ export class ChatService {
     const allowedProfileText = await this.profileTextForPrompt(userId, opts.profileText);
     if (allowedProfileText) {
       stablePrefix += `User profile:\n${allowedProfileText}\n\n`;
+      if (opts.profilingBlocks) {
+        opts.profilingBlocks.personal = `User profile:\n${allowedProfileText}\n\n`;
+      }
     }
     // Бизнес-карточка: общее знание о деле пользователя для всех ассистентов.
     // Полная у category='business', одна строка у остальных — решает сервис.
@@ -923,7 +943,10 @@ export class ChatService {
         const biz = (await automaticProfilingAllowed(this.pg, userId))
           ? await this.businessProfile.renderForPrompt(userId, opts.agentCategory)
           : '';
-        if (biz) stablePrefix += biz + '\n\n';
+        if (biz) {
+          stablePrefix += biz + '\n\n';
+          if (opts.profilingBlocks) opts.profilingBlocks.business = biz + '\n\n';
+        }
       } catch (e: any) {
         this.logger.warn(`business profile injection failed: ${e?.message}`);
       }
@@ -938,6 +961,12 @@ export class ChatService {
     // ход после переключения идёт по холодному кэшу релея. Осознанный
     // размен: платим кэшем ровно за переключение, а не постоянно.
     if (opts.ask) stablePrefix += `${ASK_RULE}\n\n`;
+
+    // Consent мог измениться между чтением личного и бизнес-профиля. На границе
+    // готового промпта удаляем ровно те блоки, которые вставили выше.
+    if (!(await automaticProfilingAllowed(this.pg, userId))) {
+      stablePrefix = stripRelayProfilingBlocks(stablePrefix, opts.profilingBlocks || {});
+    }
 
     // Сторож размера: stablePrefix уходит релею ОДНИМ аргументом CLI (предел
     // 128 КБ на аргумент) — WORK_RULES держит свой бюджет (≤ 6 КБ,
@@ -995,11 +1024,12 @@ export class ChatService {
     /** Сборка из стора и что умеет клиент — для справки (client-kind.ts). */
     storeBuild?: boolean;
     ui?: ClientUi;
-  }): Promise<{ sessionId: string; systemPrompt: string; history: string; products: { products_token: string; products_mcp_url: string }; linkeon: LinkeonRelayFields }> {
+  }): Promise<UploadHandoff> {
     const { userId, assistantId, freshSessionId } = p;
     const profileText = p.profileText || '';
     const userLanguage = await this.language.resolveUserLanguage(userId, p.requestLang);
-    const sessionId = relaySessionKey(userId, assistantId, userLanguage, freshSessionId);
+    const baseSessionId = relaySessionKey(userId, assistantId, userLanguage, freshSessionId);
+    const profilingBlocks: RelayProfilingBlocks = {};
 
     // Персона — best-effort: не нашли ассистента, отвалилась БД — ход с файлом
     // всё равно должен состояться. Ключ сессии при этом уже правильный, то есть
@@ -1021,6 +1051,7 @@ export class ChatService {
           profileText,
           ask: p.ask,
           storeBuild: p.storeBuild,
+          profilingBlocks,
         });
       }
     } catch (e: any) {
@@ -1045,6 +1076,13 @@ export class ChatService {
       this.logger.warn(`upload handoff: history build failed for ${userId}_${assistantId}: ${e?.message}`);
     }
 
+    // Даже пустой новый systemPrompt не стирает профиль из resumed-сессии.
+    // Поэтому ключ выбирается по текущему consent, как и в текстовом ходе.
+    const sessionId = relaySessionForProfiling(
+      baseSessionId,
+      await automaticProfilingAllowed(this.pg, userId),
+    );
+
     // Инструменты точки продуктов — те же, что у текстового хода: сессия на
     // релее одна, и её системный промпт обещает справку.
     const products = productsRelayFields(userId, {
@@ -1055,7 +1093,21 @@ export class ChatService {
     // Инструменты Linkeon и папка хода — те же, что у текстового хода этой сессии.
     const linkeon = linkeonRelayFields(userId, sessionId);
 
-    return { sessionId, systemPrompt, history, products, linkeon };
+    return { baseSessionId, sessionId, systemPrompt, history, products, linkeon, profilingBlocks };
+  }
+
+  /** Последняя проверка непосредственно перед multipart `fd.append` контроллера. */
+  async finalizeUploadHandoffForDispatch(userId: string, handoff: UploadHandoff): Promise<UploadHandoff> {
+    const allowed = await automaticProfilingAllowed(this.pg, userId);
+    const sessionId = relaySessionForProfiling(handoff.baseSessionId, allowed);
+    return {
+      ...handoff,
+      sessionId,
+      systemPrompt: allowed
+        ? handoff.systemPrompt
+        : stripRelayProfilingBlocks(handoff.systemPrompt, handoff.profilingBlocks),
+      linkeon: linkeonRelayFields(userId, sessionId),
+    };
   }
 
   async streamChat(
@@ -1289,17 +1341,23 @@ ${MEETING_HONESTY_RULE}
 ${RESPONSE_STYLE_RULE}
 ${LanguageService.buildDirective(userLanguage)}`;
 
+    const profilingBlocks: RelayProfilingBlocks = {};
     const allowedProfileText = await this.profileTextForPrompt(userId, profileText);
     let volatileSystemPrompt = allowedProfileText
       ? `\n\n--- Профиль пользователя ---\n${allowedProfileText}`
       : '';
+    if (allowedProfileText) profilingBlocks.personal = volatileSystemPrompt;
     if (this.businessProfile) {
       try {
         // Маша — personal, получит строку-резюме, а не полную карточку.
         const biz = (await automaticProfilingAllowed(this.pg, userId))
           ? await this.businessProfile.renderForPrompt(userId, agent.category)
           : '';
-        if (biz) volatileSystemPrompt += `\n\n${biz}`;
+        if (biz) {
+          const businessBlock = `\n\n${biz}`;
+          volatileSystemPrompt += businessBlock;
+          profilingBlocks.business = businessBlock;
+        }
       } catch (e: any) {
         this.logger.warn(`business profile injection failed (Маша): ${e?.message}`);
       }
@@ -1406,6 +1464,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
       try {
         // Модель ответов: личный выбор (админка) или общий рубильник; проба — только Claude.
         const mashaRoute = await resolveAnswerProvider(probe, userId, this.llmProvider);
+        const dispatchProfilingAllowed = await automaticProfilingAllowed(this.pg, userId);
+        const dispatchVolatileSystemPrompt = dispatchProfilingAllowed
+          ? volatileSystemPrompt
+          : stripRelayProfilingBlocks(volatileSystemPrompt, profilingBlocks);
         const r = await this.claudeCli.textWithCost(fullPrompt, {
           // Блок про продукты встаёт ДО волатильной части и хвоста языка:
           // требование языка обязано остаться последней строкой (см.
@@ -1413,7 +1475,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // Правило карточек — только клиенту, который их рисует; до хвоста
           // языка, который обязан остаться последним.
           system: stableSystemPrompt + `\n\n${products.promptBlock}\n\n${FIND_FILES_CLI_PROMPT}` +
-            (ui.ask ? `\n\n${ASK_RULE}` : '') + volatileSystemPrompt + replyLanguageTail,
+            (ui.ask ? `\n\n${ASK_RULE}` : '') + dispatchVolatileSystemPrompt + replyLanguageTail,
           // Модель Маши — общая с остальным чатом, см. common/chat-model.ts
           // (там же цена решения: пин не даунгрейдится при исчерпании лимита, и
           // как откатиться через env без выката). Биллинг юзеру идёт от costUsd.
@@ -1755,9 +1817,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
     //
     // Identity, персона, коллеги, профиль, карточка бизнеса — общий сборщик с
     // ходом, в котором пришли вложения: сессия на релее у них одна.
+    const profilingBlocks: RelayProfilingBlocks = {};
     let stablePrefix = await this.buildRelayStablePrefix({
       agentId, agentName, agentDescription, agentSystemPrompt, agentCategory,
-      userId, userLanguage, profileText, ask: ui.ask, storeBuild,
+      userId, userLanguage, profileText, ask: ui.ask, storeBuild, profilingBlocks,
     });
 
     // Пер-ходовая часть. Пустая строка, а не identity-блок: тот уехал в stablePrefix.
@@ -1851,12 +1914,14 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // 309k символов из 813k в замеренной сессии.
     const historyBlock = this.renderHistoryBlock(recentHistory);
 
-    // Ключ сессии релея — чистая функция от уже известных
-    // userId/assistantId/userLanguage/fresh. Поднят сюда (выше проверки ниже
-    // и выше своего прежнего места у callUpstreamOnce), чтобы проверка строки
-    // о прерывании и реальный вызов релея дальше сверялись по ОДНОМУ и тому
-    // же значению, а не считали его дважды.
-    const relaySid = relaySessionKey(userId, assistantId, userLanguage, fresh ? freshSessionId : undefined);
+    // Базовый ключ — чистая функция от userId/assistantId/userLanguage/fresh.
+    // Отдельный no-profiling ключ не даёт возобновить контекст, где профиль уже
+    // был; при повторном разрешении исходная сессия остаётся доступной.
+    const baseRelaySid = relaySessionKey(userId, assistantId, userLanguage, fresh ? freshSessionId : undefined);
+    let relaySid = relaySessionForProfiling(
+      baseRelaySid,
+      await automaticProfilingAllowed(this.pg, userId),
+    );
 
     // Сообщение посреди идущего хода той же сессии релея пре-эмптит его —
     // скажем модели, что прошлая работа прервана и что с ней делать
@@ -2189,13 +2254,23 @@ ${LanguageService.buildDirective(userLanguage)}`;
       });
       // Один вызов upstream r.linkeon: парсит SSE, пушит в chunks и стримит
       // 'item' клиенту. Вынесено в замыкание ради self-heal ретрая пустого потока.
-      // relaySid уже посчитан выше (до проверки строки о прерывании) — тот же
-      // ключ сессии, без повторного вычисления.
-      // Инструменты Linkeon и папка хода на релее — токеном хода и ключом без
-      // номера телефона (linkeon-relay-fields.ts). Один раз на ход: повтор
-      // self-heal идёт с теми же полями и в ту же папку.
-      const linkeonFields = linkeonRelayFields(userId, relaySid);
-      const callUpstreamOnce = async (): Promise<void> => {
+      // Consent перечитывается перед КАЖДЫМ вызовом: за backoff он мог быть
+      // отозван, а stablePrefix уже содержит заранее собранные блоки.
+      const prepareUpstreamAttempt = async () => {
+        const allowed = await automaticProfilingAllowed(this.pg, userId);
+        return {
+          sessionId: relaySessionForProfiling(baseRelaySid, allowed),
+          systemPrompt: allowed
+            ? stablePrefix
+            : stripRelayProfilingBlocks(stablePrefix, profilingBlocks),
+        };
+      };
+      // fs_key и activity должны соответствовать фактической сессии попытки,
+      // включая смену режима на self-heal retry.
+      let linkeonFields = linkeonRelayFields(userId, relaySid);
+      const callUpstreamOnce = async (attempt: { sessionId: string; systemPrompt: string }): Promise<void> => {
+        const attemptLinkeonFields = linkeonRelayFields(userId, attempt.sessionId);
+        linkeonFields = attemptLinkeonFields;
         const FormData = require('form-data');
         const fd = new FormData();
         fd.append('message', prompt);
@@ -2205,7 +2280,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // и продолжает работать, поэтому выкатывать надо СНАЧАЛА релей: в
         // обратном порядке персона исчезнет из промпта и ассистенты начнут
         // представляться Claude.
-        if (stablePrefix) fd.append('systemPrompt', stablePrefix);
+        if (attempt.systemPrompt) fd.append('systemPrompt', attempt.systemPrompt);
         if (historyBlock) fd.append('history', historyBlock);
         // fresh: relay (r.linkeon.io) держит СВОЮ память по sessionId и резюмит
         // Claude-сессию — обычный id протаскивал прошлый контекст (задачи,
@@ -2223,7 +2298,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // Цена: при смене языка ассистент забывает прежний разговор. Это
         // честнее, чем отвечать не на том языке, а история в нашей БД
         // сохраняется и показывается пользователю как была.
-        fd.append('sessionId', relaySid);
+        fd.append('sessionId', attempt.sessionId);
 
         // Модель хода. Пинги мониторинга просят haiku: «ответь одним словом ок»
         // не требует Opus, а обвязка Claude Code (системный промпт CLI +
@@ -2265,7 +2340,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
         fd.append('products_mcp_url', pf.products_mcp_url);
         // Инструменты Linkeon (mcp__linkeon__*): пользователь — в подписи
         // токена, а не в аргументе, который пишет модель; папка хода — fs_key.
-        appendLinkeonFields(fd, linkeonFields);
+        appendLinkeonFields(fd, attemptLinkeonFields);
 
         const agentRes = await axios.post(`${AGENT_URL}/chat`, fd, {
           headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
@@ -2305,7 +2380,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
                     // Шаг работы для клиента, который его рисует (activity-map.ts).
                     // В chunks не идёт: к тексту ответа отношения не имеет.
                     if (ui.activity) {
-                      const step = toActivity(ev.tool, ev.input, { userId, relaySessionId: relaySid, fsKey: linkeonFields.fs_key });
+                      const step = toActivity(ev.tool, ev.input, { userId, relaySessionId: attempt.sessionId, fsKey: attemptLinkeonFields.fs_key });
                       if (step) safeWrite(step);
                     }
                   } else if (ev.type === 'result' && ev.text) {
@@ -2350,9 +2425,26 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // возможных вызовов callUpstreamOnce (включая self-heal), закрыта в
       // finally ДО копирования файлов (flushFileLinks ниже) — та часть хода
       // уже не прерываема сообщением на релее, процесс там не живёт.
-      const relayMark = this.beginRelayRun(relaySid);
+      let relayMark = this.beginRelayRun(relaySid);
+      const runUpstreamAttempt = async (takeoverSensitive = false): Promise<void> => {
+        const attempt = await prepareUpstreamAttempt();
+        // Повторная проверка ПОСЛЕ consent-query: за неё тоже мог прийти новый
+        // ход. Метку переносим на фактический ключ попытки, чтобы finally не
+        // закрыл чужой процесс и takeover-семантика сохранилась при смене режима.
+        if (takeoverSensitive && this.relayRunning.get(relaySid) !== relayMark) {
+          this.logger.warn(`self-heal retry skipped for ${relaySid} — a newer turn took over the session`);
+          selfHealSkippedForTakeover = true;
+          return;
+        }
+        if (attempt.sessionId !== relaySid) {
+          this.endRelayRun(relaySid, relayMark);
+          relaySid = attempt.sessionId;
+          relayMark = this.beginRelayRun(relaySid);
+        }
+        await callUpstreamOnce(attempt);
+      };
       try {
-        await callUpstreamOnce();
+        await runUpstreamAttempt();
 
         // SELF-HEAL: r.linkeon иногда отдаёт ПУСТОЙ поток (0 delta-событий, ~сотни
         // мс) — корень жалоб «постоянно выдаёт ошибку». Если ничего не пришло и
@@ -2374,18 +2466,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
             props: { assistant_id: assistantId, self_heal_retry: true },
           });
           await new Promise((r) => setTimeout(r, 800));
-          // За пустой прогон и эту паузу в ТУ ЖЕ relaySid мог успеть прийти
-          // настоящий новый ход (его beginRelayRun переписал relayRunning
-          // поверх нашей метки — см. openMark). Повтор всё равно уйдёт в ту
-          // же сессию на релее и будет конкурировать с ним за неё, вплоть до
-          // того, что убьёт уже чужой, живой процесс. В этом случае повтор не
-          // запускаем — уступаем сессию новому ходу.
-          if (this.relayRunning.get(relaySid) !== relayMark) {
-            this.logger.warn(`self-heal retry skipped for ${relaySid} — a newer turn took over the session`);
-            selfHealSkippedForTakeover = true;
-          } else {
-            try { await callUpstreamOnce(); } catch (e: any) { this.logger.warn(`self-heal retry failed: ${e.message}`); }
-          }
+          // Проверка takeover — внутри runUpstreamAttempt после свежего
+          // consent-query: новый ход мог перехватить сессию и за эту паузу, и за
+          // сам запрос настроек. При смене режима метка переедет на новый ключ.
+          try { await runUpstreamAttempt(true); } catch (e: any) { this.logger.warn(`self-heal retry failed: ${e.message}`); }
         }
       } finally {
         this.endRelayRun(relaySid, relayMark);
@@ -2933,20 +3017,32 @@ ${LanguageService.buildDirective(userLanguage)}`;
     if (systemPrompt && systemPrompt.trim()) {
       stablePrefix += `--- Персона и инструкции ассистента ${agentName} ---\n${systemPrompt.trim()}\n\n`;
     }
+    const profilingBlocks: RelayProfilingBlocks = {};
     const allowedProfileText = await this.profileTextForPrompt(userId, profileText);
     if (allowedProfileText) {
       stablePrefix += `User profile:\n${allowedProfileText}\n\n`;
+      profilingBlocks.personal = `User profile:\n${allowedProfileText}\n\n`;
     }
     if (opts.includeUserContext !== false && this.businessProfile) {
       try {
         const biz = (await automaticProfilingAllowed(this.pg, userId))
           ? await this.businessProfile.renderForPrompt(userId, agent.category)
           : '';
-        if (biz) stablePrefix += biz + '\n\n';
+        if (biz) {
+          stablePrefix += biz + '\n\n';
+          profilingBlocks.business = biz + '\n\n';
+        }
       } catch (e: any) {
         this.logger.warn(`business profile injection failed (agent reply): ${e?.message}`);
       }
     }
+    if (
+      !(opts.testMode === true && opts.includeUserContext === false)
+      && !(await automaticProfilingAllowed(this.pg, userId))
+    ) {
+      stablePrefix = stripRelayProfilingBlocks(stablePrefix, profilingBlocks);
+    }
+
     // Требование языка последней строкой — по той же причине, что в двух
     // других путях: директива в начале тонет под русской персоной и профилем.
     // Третье место, где приходится это дублировать; сборку промпта стоит
@@ -2962,29 +3058,42 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const prompt = prefix + message;
 
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
-    const FormData = require('form-data');
-    const fd = new FormData();
-    const outboundPrompt = opts.testMode === true ? neutralizeAtMentions(prompt) : prompt;
-    const outboundStablePrefix = opts.testMode === true ? neutralizeAtMentions(stablePrefix) : stablePrefix;
-    fd.append('message', outboundPrompt);
-    if (outboundStablePrefix) fd.append('systemPrompt', outboundStablePrefix);
+    // Модель ответов: личный выбор этого человека или общий рубильник (spec
+    // 2026-10-31-global-llm-switch, раздел 4) — рутины, «Путь», план действий,
+    // поездки, итоги и документы звонков, проба качества. ЛИЧНЫЙ выбор, а не
+    // только рубильник, — потому что рутины и «Путь» (без своей sessionIdOverride)
+    // пишут в ТУ ЖЕ сессию релея, что и чат человека (relaySessionKey ниже —
+    // та же формула, что в основном пути). Разные модели у чата и у этих
+    // фоновых путей заставляли бы одну сессию скакать между провайдерами и
+    // каждый раз оплачивать весь контекст заново, без кэша.
+    const route = await resolveAnswerProvider(false, userId, this.llmProvider);
+
+    // Последний await перед multipart: consent и ключ выбираются уже после
+    // resolveAnswerProvider, чтобы отзыв во время маршрутизации не ушёл на релей.
+    // Изолированная проба без контекста не читает profile_data по её контракту.
+    const dispatchProfilingAllowed = opts.testMode === true && opts.includeUserContext === false
+      ? true
+      : await automaticProfilingAllowed(this.pg, userId);
+    const dispatchStablePrefix = dispatchProfilingAllowed
+      ? stablePrefix
+      : stripRelayProfilingBlocks(stablePrefix, profilingBlocks);
     // sessionIdOverride — для синтетических проб: изолированная сессия, чтобы не
     // коллидить с реальной сессией юзера/другими пробами (r.linkeon отдаёт пустой
     // поток при конкурентном обращении к ЗАНЯТОЙ сессии — инцидент 2026-07-12).
     // Язык в ключе сессии — по той же причине, что в основном пути: релей
     // резюмит прежний разговор, и накопленный русский перевешивает промпт.
-    const relaySid = sessionIdOverride ||
-      relaySessionKey(userId, assistantId, userLanguage);
+    const baseRelaySid = sessionIdOverride || relaySessionKey(userId, assistantId, userLanguage);
+    const relaySid = relaySessionForProfiling(baseRelaySid, dispatchProfilingAllowed);
+
+    const FormData = require('form-data');
+    const fd = new FormData();
+    const outboundPrompt = opts.testMode === true ? neutralizeAtMentions(prompt) : prompt;
+    const outboundStablePrefix = opts.testMode === true
+      ? neutralizeAtMentions(dispatchStablePrefix)
+      : dispatchStablePrefix;
+    fd.append('message', outboundPrompt);
+    if (outboundStablePrefix) fd.append('systemPrompt', outboundStablePrefix);
     fd.append('sessionId', relaySid);
-    // Модель ответов: личный выбор этого человека или общий рубильник (spec
-    // 2026-10-31-global-llm-switch, раздел 4) — рутины, «Путь», план действий,
-    // поездки, итоги и документы звонков, проба качества. ЛИЧНЫЙ выбор, а не
-    // только рубильник, — потому что рутины и «Путь» (без своей sessionIdOverride)
-    // пишут в ТУ ЖЕ сессию релея, что и чат человека (relaySessionKey выше —
-    // та же формула, что в основном пути). Разные модели у чата и у этих
-    // фоновых путей заставляли бы одну сессию скакать между провайдерами и
-    // каждый раз оплачивать весь контекст заново, без кэша.
-    const route = await resolveAnswerProvider(false, userId, this.llmProvider);
     for (const [k, v] of Object.entries(relayProviderFields(false, route.provider))) fd.append(k, v);
     if (opts.testMode === true) fd.append('testMode', 'true');
     // Инструменты Linkeon — только когда вызывающий явно сказал linkeonTools:

@@ -414,7 +414,7 @@ describe('agentReply: isolated agent version test', () => {
     const h = replyHarness(undefined, {
       automaticProfiling: false,
       tasksContext: 'ACTIVE TASKS MARKER',
-      profilingSequence: [true, true, true, true, false],
+      profilingSequence: [true, true, true, true, true, false],
     });
     h.post
       .mockImplementationOnce(async () => ({ data: sseStream([]) }))
@@ -443,11 +443,11 @@ describe('agentReply: isolated agent version test', () => {
   it.each([
     {
       order: 'personal allowed, then revoked before business rendering',
-      profilingSequence: [true, false, false, true],
+      profilingSequence: [true, false, false, true, true],
     },
     {
       order: 'personal revoked, then restored before business rendering',
-      profilingSequence: [false, true, false, true],
+      profilingSequence: [false, true, false, true, true],
     },
   ])('removes exact mixed-consent blocks: $order', async ({ profilingSequence }) => {
     const h = replyHarness(undefined, {

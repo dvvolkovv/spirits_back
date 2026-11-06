@@ -302,7 +302,7 @@ export class ChatController {
     // Что умеет клиент (client-ui.ts). Тело multipart — ui приезжает строкой.
     const ui = parseClientUi(body.ui);
 
-    const handoff = await this.chatService.buildUploadHandoff({
+    let handoff = await this.chatService.buildUploadHandoff({
       userId,
       assistantId: String(assistantId),
       profileText,
@@ -322,6 +322,12 @@ export class ChatController {
     // Модель ответов человека — тот же выбор, что у текстового хода
     // (streamUniversalAgent). Проб мониторинга у загрузки нет.
     const answerRoute = await resolveAnswerProvider(false, userId, this.llmProvider);
+
+    // Между сборкой handoff и этой границей были await (персона, история,
+    // выбор модели). Проверяем consent здесь, непосредственно перед fd.append:
+    // раннего gate в builder недостаточно. Возвращаются согласованные prompt,
+    // sessionId и fs_key, поэтому resumed-сессия и папка хода не расходятся.
+    handoff = await this.chatService.finalizeUploadHandoffForDispatch(userId, handoff);
 
     // Proxy file + message to remote agent server
     const FormData = require('form-data');
