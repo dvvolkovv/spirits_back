@@ -40,6 +40,15 @@ describe('инъекция бизнес-карточки в сборку про�
     expect(calls.length).toBeGreaterThanOrEqual(3);
   });
 
+  it('перед каждым renderForPrompt финально перепроверяется automaticProfilingAllowed', () => {
+    const calls = src.match(/this\.businessProfile\.renderForPrompt\(/g) || [];
+    const finalGates = src.match(
+      /await automaticProfilingAllowed\(this\.pg, userId\)[\s\S]{0,120}?await this\.businessProfile\.renderForPrompt\(/g,
+    ) || [];
+    expect(calls).toHaveLength(3);
+    expect(finalGates).toHaveLength(calls.length);
+  });
+
   it('категория агента доезжает до streamUniversalAgent', () => {
     expect(src).toMatch(/a\.category|agent\.category/);
   });

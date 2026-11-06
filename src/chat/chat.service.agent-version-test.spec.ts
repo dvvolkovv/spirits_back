@@ -50,19 +50,41 @@ function fieldsOf(form: any): Record<string, string> {
   return fields;
 }
 
+function responseHarness() {
+  const res: any = {
+    status: jest.fn(),
+    setHeader: jest.fn(),
+    write: jest.fn(() => true),
+    end: jest.fn(),
+    json: jest.fn(),
+    writableEnded: false,
+  };
+  res.status.mockReturnValue(res);
+  res.end.mockImplementation(() => { res.writableEnded = true; });
+  return res;
+}
+
 function replyHarness(events: any[] = [
   { type: 'delta', text: 'draft answer' },
   { type: 'done', costUsd: 8.5, turnCostUsd: 0.01 },
-]) {
+], opts: { automaticProfiling?: boolean; tasksContext?: string } = {}) {
   const pg = {
-    query: jest.fn(async (sql: string) =>
-      /FROM agents WHERE id/.test(sql) ? { rows: [LIVE_AGENT] } : { rows: [] }),
+    query: jest.fn(async (sql: string) => {
+      if (/SELECT profile_data FROM ai_profiles_consolidated/i.test(sql)) {
+        return { rows: [{ profile_data: { automaticProfiling: opts.automaticProfiling ?? true } }] };
+      }
+      return /FROM agents WHERE id/.test(sql) ? { rows: [LIVE_AGENT] } : { rows: [] };
+    }),
   };
   const neo4j = {
     getProfileDescription: jest.fn(async () => 'LIVE USER PROFILE'),
   };
   const businessProfile = {
     renderForPrompt: jest.fn(async () => 'LIVE BUSINESS PROFILE'),
+  };
+  const tasksService = {
+    buildContextForPrompt: jest.fn(async () => opts.tasksContext || ''),
+    extractFromTurn: jest.fn(async () => {}),
   };
   const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
   const service = new ChatService(
@@ -72,7 +94,7 @@ function replyHarness(events: any[] = [
     null as any,
     language as any,
     undefined,
-    undefined,
+    tasksService as any,
     undefined,
     undefined,
     businessProfile as any,
@@ -80,7 +102,7 @@ function replyHarness(events: any[] = [
   const post = axios.post as jest.Mock;
   post.mockImplementation(async () => ({ data: sseStream(events) }));
   const lastFields = () => fieldsOf(post.mock.calls[post.mock.calls.length - 1][1]);
-  return { service, pg, neo4j, businessProfile, language, post, lastFields };
+  return { service, pg, neo4j, businessProfile, tasksService, language, post, lastFields };
 }
 
 beforeEach(() => jest.clearAllMocks());
@@ -241,6 +263,61 @@ describe('agentReply: isolated agent version test', () => {
     expect(h.businessProfile.renderForPrompt).toHaveBeenCalledWith('user', 'business');
     expect(h.language.resolveUserLanguage).toHaveBeenCalledTimes(1);
     expect(h.language.resolveUserLanguage).toHaveBeenCalledWith('user');
+  });
+
+  it('drops pre-materialized agentReply profile and business data after revocation', async () => {
+    const h = replyHarness(undefined, { automaticProfiling: false });
+
+    await h.service.generateAgentReply('user', '12', 'check privacy', 'privacy_revoked_session');
+
+    const fields = h.lastFields();
+    const outbound = `${fields.systemPrompt || ''}\n${fields.message}`;
+    expect(h.neo4j.getProfileDescription).toHaveBeenCalledWith('user');
+    expect(outbound).not.toContain('LIVE USER PROFILE');
+    expect(outbound).not.toContain('User profile:');
+    expect(outbound).not.toContain('LIVE BUSINESS PROFILE');
+    expect(h.businessProfile.renderForPrompt).not.toHaveBeenCalled();
+  });
+
+  it('drops pre-materialized relay profile and business data after revocation but keeps tasks', async () => {
+    const h = replyHarness(undefined, {
+      automaticProfiling: false,
+      tasksContext: 'ACTIVE TASKS MARKER',
+    });
+    const addTokenTask = jest.spyOn(h.service as any, 'addTokenTask').mockResolvedValue(undefined);
+
+    try {
+      await (h.service as any).streamUniversalAgent(
+        'user',
+        'check relay privacy',
+        '12',
+        '12',
+        [],
+        'LIVE USER PROFILE',
+        responseHarness(),
+        'Роман',
+        'LIVE DESCRIPTION',
+        'LIVE SYSTEM PROMPT',
+        undefined,
+        false,
+        undefined,
+        'ru',
+        undefined,
+        '',
+        'business',
+      );
+    } finally {
+      addTokenTask.mockRestore();
+    }
+
+    const fields = h.lastFields();
+    expect(fields.systemPrompt).not.toContain('LIVE USER PROFILE');
+    expect(fields.systemPrompt).not.toContain('User profile:');
+    expect(fields.systemPrompt).not.toContain('LIVE BUSINESS PROFILE');
+    expect(fields.message).not.toContain('LIVE USER PROFILE');
+    expect(fields.message).toContain('ACTIVE TASKS MARKER');
+    expect(h.tasksService.buildContextForPrompt).toHaveBeenCalledWith('user', 'check relay privacy');
+    expect(h.businessProfile.renderForPrompt).not.toHaveBeenCalled();
   });
 
   it('прерванный ответ (done.failed) в основной сессии — busy, обрезанный текст не пишется', async () => {
