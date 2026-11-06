@@ -86,14 +86,24 @@ export class AuthService {
     @Optional() private readonly events?: EventsService,
   ) {}
 
-  async requestSmsCode(phone: string, sid?: string | null, src?: string | null, opts?: { suppressSms?: boolean; lang?: string | null }): Promise<SmsRequestResult> {
+  async requestSmsCode(phone: string, sid?: string | null, src?: string | null, opts?: { suppressSms?: boolean; lang?: string | null; resend?: boolean }): Promise<SmsRequestResult> {
     // Номер из адреса запроса — что угодно. Мусор не доходит ни до Redis,
     // ни до SMS Aero.
     if (!isSmsPhone(phone)) return { status: 'invalid_phone' };
 
     // Check if code already exists in Redis
+    // ⚠️ Живой код гасит повторную отправку — но ТОЛЬКО неявную.
+    //
+    // Человек, которому SMS не дошла (у аккаунта нет одобренной подписи
+    // отправителя, и часть сообщений режут операторы), жал «Войти» и не имел
+    // способа попросить ещё раз: экран входа такой кнопки не давал, а сервер на
+    // повторный запрос отвечал 200 «SMS sent», молча ничего не отправляя. Ответ
+    // одинаков для sent/exists/suppressed намеренно — по нему нельзя узнать,
+    // зарегистрирован ли номер, — поэтому клиент эту разницу не видел и показывал
+    // «отправили». Явная просьба (?resend=1) теперь доходит до отправки.
     const existing = await this.redis.get(smsCodeKey(phone));
-    if (existing) {
+    const resend = !!opts?.resend && !!existing;
+    if (existing && !opts?.resend) {
       this.logger.log(`Code already exists for ${phone}, skipping resend`);
       return { status: 'exists' };
     }
@@ -133,11 +143,18 @@ export class AuthService {
 
     // Шестизначный код из криптостойкого генератора: Math.random для кода
     // входа не годится.
-    const code = String(randomInt(100000, 1000000));
+    // Повторная отправка шлёт ТОТ ЖЕ код, а не заводит второй: первая SMS могла
+    // просто задержаться, и человек вправе ввести любую из двух. Второй код сделал
+    // бы пришедшую первой недействительной — ровно та поломка, от которой уходим.
+    const code = resend ? (existing as string) : String(randomInt(100000, 1000000));
 
     // Новый код — новый счётчик неверных попыток (см. sms-code.ts). Счётчик
     // сбрасываем до записи кода: пока кода нет, попытки не считаются.
-    await this.redis.del(smsAttemptsKey(phone));
+    // ⚠️ При повторной отправке НЕ сбрасываем: иначе «выслать ещё раз» стало бы
+    // рычагом обхода потолка в пять попыток.
+    if (!resend) {
+      await this.redis.del(smsAttemptsKey(phone));
+    }
     await this.redis.set(smsCodeKey(phone), code, SMS_CODE_TTL_SECONDS);
 
     if (skipSms) {
