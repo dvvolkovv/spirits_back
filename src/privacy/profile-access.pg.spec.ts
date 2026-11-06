@@ -244,6 +244,110 @@ describePg('profile access and search candidates against an isolated PostgreSQL 
     expect([...filtered].sort()).toEqual(['u3']);
   });
 
+  it('keeps self access visible and usable when both stored privacy values are malformed', async () => {
+    await privacy.pool.query(
+      `UPDATE ai_profiles_consolidated
+       SET profile_data = '{"automaticProfiling":"false","discoverable":42}'::jsonb
+       WHERE user_id = 'u4'`,
+    );
+
+    await expect(readProfileAccess(privacy.pg as any, 'u4', 'u4')).resolves.toEqual({
+      exists: true,
+      visible: true,
+      automaticProfiling: false,
+    });
+    await expect(canViewProfile(privacy.pg as any, 'u4', 'u4')).resolves.toBe(true);
+    await expect(canUseProfileForRequester(privacy.pg as any, 'u4', 'u4')).resolves.toBe(true);
+    await expect(canViewProfile(privacy.pg as any, 'u1', 'u4')).resolves.toBe(false);
+    await expect(canUseProfileForRequester(privacy.pg as any, 'u1', 'u4')).resolves.toBe(false);
+  });
+
+  it('materializes relationship pairs instead of correlating contact EXISTS per candidate', async () => {
+    const query = jest.spyOn(privacy.pg, 'query');
+
+    await listSearchCandidateIds(privacy.pg as any, 'u1');
+
+    const sql = query.mock.calls[0][0] as string;
+    expect(sql).toContain('approved_contact_pairs AS MATERIALIZED');
+    expect(sql).toContain('peer_pairs AS MATERIALIZED');
+    expect(sql).toContain('block_pairs AS MATERIALIZED');
+    expect(sql).toContain('LEFT JOIN approved_contact_pairs');
+    expect(sql).toContain('LEFT JOIN peer_pairs');
+    expect(sql).toContain('LEFT JOIN block_pairs');
+    expect(sql).not.toContain('EXISTS');
+  });
+
+  it('projects only privacy JSONB values and types instead of whole profile_data', async () => {
+    const query = jest.spyOn(privacy.pg, 'query');
+
+    await listSearchCandidateIds(privacy.pg as any, 'u1');
+
+    const sql = query.mock.calls[0][0] as string;
+    expect(sql).toContain("p.profile_data -> 'automaticProfiling'");
+    expect(sql).toContain("p.profile_data -> 'discoverable'");
+    expect(sql).toContain("jsonb_typeof(p.profile_data -> 'automaticProfiling')");
+    expect(sql).toContain("jsonb_typeof(p.profile_data -> 'discoverable')");
+    expect(sql).not.toContain('p.profile_data,');
+  });
+
+  it('preserves incoming and outgoing contact and peer relationships in batch search', async () => {
+    await privacy.pool.query(
+      `INSERT INTO ai_profiles_consolidated (id, user_id, profile_data)
+       VALUES
+         (5, 'u5', '{"discoverable":false}'::jsonb),
+         (6, 'u6', '{"discoverable":false}'::jsonb),
+         (7, 'u7', '{"discoverable":false}'::jsonb),
+         (8, 'u8', '{"discoverable":false}'::jsonb);
+       INSERT INTO contact_requests (requester_id, target_id, status)
+       VALUES (1, 5, 'approved'), (6, 1, 'approved');
+       INSERT INTO peer_conversations (user_a_id, user_b_id)
+       VALUES ('u1', 'u7'), ('u8', 'u1')`,
+    );
+
+    const result = await listSearchCandidateIds(privacy.pg as any, 'u1');
+    expect([...result].sort()).toEqual(['u3', 'u5', 'u6', 'u7', 'u8']);
+  });
+
+  it('defaults missing privacy keys without fetching unrelated business JSON', async () => {
+    await privacy.pool.query(
+      `INSERT INTO ai_profiles_consolidated (id, user_id, profile_data)
+       VALUES (5, 'u5', '{"privateBusiness":"do not select"}'::jsonb)`,
+    );
+
+    const result = await listSearchCandidateIds(privacy.pg as any, 'u1');
+    expect([...result].sort()).toEqual(['u3', 'u5']);
+  });
+
+  it.each(['automaticProfiling', 'discoverable'])(
+    'excludes an explicit JSONB null %s while retaining valid candidates',
+    async (key) => {
+      await privacy.pool.query(
+        `INSERT INTO ai_profiles_consolidated (id, user_id, profile_data)
+         VALUES (5, 'u5', $1::jsonb)`,
+        [JSON.stringify({ [key]: null })],
+      );
+
+      const listed = await listSearchCandidateIds(privacy.pg as any, 'u1');
+      expect([...listed].sort()).toEqual(['u3']);
+      const filtered = await filterSearchCandidateIds(privacy.pg as any, 'u1', ['u3', 'u5']);
+      expect([...filtered].sort()).toEqual(['u3']);
+    },
+  );
+
+  it.each(['"not-an-object"', '[]'])(
+    'excludes non-object profile_data %s while retaining valid candidates',
+    async (profileData) => {
+      await privacy.pool.query(
+        `INSERT INTO ai_profiles_consolidated (id, user_id, profile_data)
+         VALUES (5, 'u5', $1::jsonb)`,
+        [profileData],
+      );
+
+      const result = await listSearchCandidateIds(privacy.pg as any, 'u1');
+      expect([...result].sort()).toEqual(['u3']);
+    },
+  );
+
   it('propagates PostgreSQL failures from both candidate queries', async () => {
     const failure = new Error('postgres unavailable');
     const broken = { query: jest.fn().mockRejectedValue(failure) };
