@@ -67,11 +67,19 @@ function responseHarness() {
 function replyHarness(events: any[] = [
   { type: 'delta', text: 'draft answer' },
   { type: 'done', costUsd: 8.5, turnCostUsd: 0.01 },
-], opts: { automaticProfiling?: boolean; tasksContext?: string } = {}) {
+], opts: {
+  automaticProfiling?: boolean;
+  tasksContext?: string;
+  profilingSequence?: boolean[];
+} = {}) {
+  const profilingSequence = [...(opts.profilingSequence || [])];
   const pg = {
     query: jest.fn(async (sql: string) => {
       if (/SELECT profile_data FROM ai_profiles_consolidated/i.test(sql)) {
-        return { rows: [{ profile_data: { automaticProfiling: opts.automaticProfiling ?? true } }] };
+        const automaticProfiling = profilingSequence.length > 0
+          ? profilingSequence.shift()
+          : opts.automaticProfiling ?? true;
+        return { rows: [{ profile_data: { automaticProfiling } }] };
       }
       return /FROM agents WHERE id/.test(sql) ? { rows: [LIVE_AGENT] } : { rows: [] };
     }),
@@ -368,6 +376,7 @@ describe('agentReply: isolated agent version test', () => {
     expect(fields.systemPrompt).not.toContain('LIVE BUSINESS PROFILE');
     expect(fields.message).not.toContain('LIVE USER PROFILE');
     expect(fields.message).toContain('ACTIVE TASKS MARKER');
+    expect(fields.sessionId).toBe('user_12_ru_noprofiling');
     expect(h.tasksService.buildContextForPrompt).toHaveBeenCalledWith('user', 'check relay privacy');
     expect(h.businessProfile.renderForPrompt).not.toHaveBeenCalled();
   });
@@ -391,7 +400,71 @@ describe('agentReply: isolated agent version test', () => {
     expect(h.post).toHaveBeenCalledTimes(2);
   });
 
-  it('прерванный ответ (done.failed) в основной сессии — busy, обрезанный текст не пишется', async () => {
+  it('does not resume a pre-existing profile-bearing agentReply session after revocation', async () => {
+    const h = replyHarness(undefined, { automaticProfiling: false });
+
+    await h.service.generateAgentReply('user', '12', 'check privacy', 'privacy_revoked_session');
+
+    const fields = h.lastFields();
+    expect(fields.sessionId).toBe('privacy_revoked_session_noprofiling');
+    expect(fields.sessionId).not.toBe('privacy_revoked_session');
+  });
+
+  it('revalidates profile blocks and session on the self-heal upstream attempt', async () => {
+    const h = replyHarness(undefined, {
+      automaticProfiling: false,
+      tasksContext: 'ACTIVE TASKS MARKER',
+      profilingSequence: [true, true, true, true, false],
+    });
+    h.post
+      .mockImplementationOnce(async () => ({ data: sseStream([]) }))
+      .mockImplementationOnce(async () => ({
+        data: sseStream([
+          { type: 'delta', text: 'retry answer' },
+          { type: 'done', costUsd: 0.01, turnCostUsd: 0.01 },
+        ]),
+      }));
+
+    await runRelayPrivacyTurn(h);
+
+    expect(h.post).toHaveBeenCalledTimes(2);
+    const first = fieldsOf(h.post.mock.calls[0][1]);
+    const retry = fieldsOf(h.post.mock.calls[1][1]);
+    expect(first.systemPrompt).toContain('LIVE USER PROFILE');
+    expect(first.systemPrompt).toContain('LIVE BUSINESS PROFILE');
+    expect(first.sessionId).toBe('user_12_ru');
+    expect(retry.systemPrompt).not.toContain('LIVE USER PROFILE');
+    expect(retry.systemPrompt).not.toContain('User profile:');
+    expect(retry.systemPrompt).not.toContain('LIVE BUSINESS PROFILE');
+    expect(retry.sessionId).toBe('user_12_ru_noprofiling');
+    expect(retry.message).toContain('ACTIVE TASKS MARKER');
+  });
+
+  it.each([
+    {
+      order: 'personal allowed, then revoked before business rendering',
+      profilingSequence: [true, false, false, true],
+    },
+    {
+      order: 'personal revoked, then restored before business rendering',
+      profilingSequence: [false, true, false, true],
+    },
+  ])('removes exact mixed-consent blocks: $order', async ({ profilingSequence }) => {
+    const h = replyHarness(undefined, {
+      automaticProfiling: false,
+      tasksContext: 'ACTIVE TASKS MARKER',
+      profilingSequence,
+    });
+
+    await runRelayPrivacyTurn(h);
+
+    const fields = h.lastFields();
+    expect(fields.systemPrompt).not.toContain('LIVE USER PROFILE');
+    expect(fields.systemPrompt).not.toContain('User profile:');
+    expect(fields.systemPrompt).not.toContain('LIVE BUSINESS PROFILE');
+    expect(fields.systemPrompt).toContain('LIVE SYSTEM PROMPT');
+    expect(fields.message).toContain('ACTIVE TASKS MARKER');
+  });
     // С 05.11.2026 (бэклог e777aa94): человек пре-эмптил фоновый ответ — его
     // обрывок нельзя вернуть как успешный, routine-push повторит доставку.
     const h = replyHarness([

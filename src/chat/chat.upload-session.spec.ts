@@ -77,11 +77,21 @@ interface Pg {
   calls: { sql: string; params: any[] }[];
 }
 
-function makePg(): Pg {
+function makePg(
+  profileData: unknown = { automaticProfiling: true },
+  profilingSequence?: boolean[],
+): Pg {
+  const sequence = [...(profilingSequence || [])];
   const calls: { sql: string; params: any[] }[] = [];
   const query = jest.fn(async (sql: string, params: any[] = []) => {
     calls.push({ sql, params });
     if (/SELECT tokens FROM ai_profiles_consolidated/.test(sql)) return { rows: [{ tokens: 1_000_000 }] };
+    if (/SELECT profile_data FROM ai_profiles_consolidated/.test(sql)) {
+      const data = profilingSequence
+        ? { automaticProfiling: sequence.length > 0 ? sequence.shift() : false }
+        : profileData;
+      return { rows: [{ profile_data: data }] };
+    }
     if (/FROM agents WHERE id/.test(sql)) return { rows: [AGENT] };
     if (/FROM agents a\s+LEFT JOIN agent_translations/.test(sql)) {
       return { rows: [{ display_name: 'Оля', description: 'коуч' }] };
@@ -220,6 +230,33 @@ describe('uploadAndChat: файл уходит в сессию разговор�
 
     expect(fields.systemPrompt).toContain(PROFILE);
     expect(fields.message).toBe('что тут по листам?');
+  });
+
+  it('missing automaticProfiling key остаётся enabled', async () => {
+    const fields = await upload(makePg({}));
+
+    expect(fields.systemPrompt).toContain(PROFILE);
+    expect(fields.sessionId).toBe(relaySessionKey('u1', '12', 'ru'));
+  });
+
+  it('revoked upload не resumeит profile-bearing сессию', async () => {
+    const fields = await upload(makePg({ automaticProfiling: false }));
+
+    expect(fields.systemPrompt || '').not.toContain(PROFILE);
+    expect(fields.sessionId).toBe(`${relaySessionKey('u1', '12', 'ru')}_noprofiling`);
+  });
+
+  it('перепроверяет consent и sanitizes prompt на multipart boundary', async () => {
+    // Персона и первичная сборка ещё видели разрешение; непосредственно перед
+    // fd.append настройка отозвана. Ранний builder gate здесь недостаточен.
+    const fields = await upload(
+      makePg({ automaticProfiling: false }, [true, true, true, false]),
+    );
+
+    expect(fields.systemPrompt || '').not.toContain(PROFILE);
+    expect(fields.systemPrompt || '').not.toContain('User profile:');
+    expect(fields.systemPrompt || '').toContain(AGENT.system_prompt);
+    expect(fields.sessionId).toBe(`${relaySessionKey('u1', '12', 'ru')}_noprofiling`);
   });
 
   it('везёт поля точки продуктов — продукты, файлы и справка, как у текстового хода', async () => {

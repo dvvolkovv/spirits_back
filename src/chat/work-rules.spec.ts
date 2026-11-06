@@ -3,7 +3,11 @@ import { WORK_RULES } from './work-rules';
 
 /** Стабильная часть промпта релея — то, что уходит в --system-prompt. */
 async function stablePrefix(agentId: string, agentName = 'Роман'): Promise<string> {
-  const pg = { query: jest.fn(async () => ({ rows: [] })) };
+  const pg = {
+    query: jest.fn(async (sql: string) => /SELECT profile_data FROM ai_profiles_consolidated/.test(sql)
+      ? { rows: [{ profile_data: { automaticProfiling: true } }] }
+      : { rows: [] }),
+  };
   const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
   const svc = new ChatService(pg as any, null as any, null as any, null as any, language as any, undefined as any);
   return (svc as any).buildRelayStablePrefix({
@@ -82,7 +86,11 @@ describe('WORK_RULES в стабильной части промпта реле�
   });
 
   it('стоит до профиля: профиль меняется, правила — нет (кэш релея)', async () => {
-    const pg = { query: jest.fn(async () => ({ rows: [] })) };
+    const pg = {
+    query: jest.fn(async (sql: string) => /SELECT profile_data FROM ai_profiles_consolidated/.test(sql)
+      ? { rows: [{ profile_data: { automaticProfiling: true } }] }
+      : { rows: [] }),
+  };
     const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
     const svc = new ChatService(pg as any, null as any, null as any, null as any, language as any, undefined as any);
     const prefix: string = await (svc as any).buildRelayStablePrefix({
@@ -100,7 +108,11 @@ describe('buildRelayStablePrefix — сторож размера (ревью)', 
   // кускам они могут раздуть префикс незаметно, а он уходит релею ОДНИМ
   // аргументом CLI (предел 128 КБ). 100 000 байт — заранее, с запасом.
   function makeSvc() {
-    const pg = { query: jest.fn(async () => ({ rows: [] })) };
+    const pg = {
+    query: jest.fn(async (sql: string) => /SELECT profile_data FROM ai_profiles_consolidated/.test(sql)
+      ? { rows: [{ profile_data: { automaticProfiling: true } }] }
+      : { rows: [] }),
+  };
     const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
     return new ChatService(pg as any, null as any, null as any, null as any, language as any, undefined as any);
   }
