@@ -85,6 +85,15 @@ describe('публичные маршруты бота алертов', () => {
     expect(handler.handleUpdate).toHaveBeenCalledWith({ update_id: 12 }, true);
   });
 
+  it('двухсегментный direct webhook не перехватывается telegram/:secret и вызывает handler один раз', async () => {
+    await expect(post('/webhook/telegram/alert-bot/telegram', 'routes-secret')).resolves.toBe(200);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(handler.claimUpdate).toHaveBeenCalledTimes(1);
+    expect(handler.claimUpdate).toHaveBeenCalledWith({ update_id: 12 });
+    expect(handler.handleUpdate).toHaveBeenCalledTimes(1);
+    expect(handler.handleUpdate).toHaveBeenCalledWith({ update_id: 12 }, true);
+  });
+
   it('stopped admission возвращает 503, duplicate completed остаётся 200', async () => {
     handler.claimUpdate.mockResolvedValueOnce('stopped' as any);
     await expect(post('/webhook/alert-bot/telegram', 'routes-secret')).resolves.toBe(503);
