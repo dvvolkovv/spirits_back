@@ -54,6 +54,7 @@ import { CHAT_MODEL, PROBE_MODEL } from '../common/chat-model';
 import { sendTelegramAlert } from '../common/telegram-alert';
 import { RELAY_TURN_BUDGET_MS } from '../common/relay-budget';
 import { neutralizeAtMentions } from '../common/agent-guards';
+import { automaticProfilingAllowed } from '../privacy/profile-privacy';
 // Agent server at r.linkeon.io (remote Claude Code)
 
 /** Файл в папке сессии, как его отдаёт relay (`GET /session/:sid/files`). */
@@ -795,6 +796,11 @@ export class ChatService {
     return agentRes.rows[0] || null;
   }
 
+  private async profileTextForPrompt(userId: string, text: string | undefined): Promise<string> {
+    if (!text || !text.trim()) return '';
+    return (await automaticProfilingAllowed(this.pg, userId)) ? text : '';
+  }
+
   /**
    * Стабильная часть промпта для релея: identity, персона из БД, коллеги,
    * профиль, карточка бизнеса. Уезжает в `--system-prompt`, поэтому шлётся раз
@@ -906,14 +912,17 @@ export class ChatService {
     // Цена: изменение профиля меняет системный промпт, то есть начало префикса,
     // и один ход пройдёт по холодному кэшу. Это правильный размен — платим
     // ровно тогда, когда профиль реально изменился, а не 44 раза подряд.
-    if (opts.profileText && opts.profileText.trim()) {
-      stablePrefix += `User profile:\n${opts.profileText}\n\n`;
+    const allowedProfileText = await this.profileTextForPrompt(userId, opts.profileText);
+    if (allowedProfileText) {
+      stablePrefix += `User profile:\n${allowedProfileText}\n\n`;
     }
     // Бизнес-карточка: общее знание о деле пользователя для всех ассистентов.
     // Полная у category='business', одна строка у остальных — решает сервис.
     if (this.businessProfile) {
       try {
-        const biz = await this.businessProfile.renderForPrompt(userId, opts.agentCategory);
+        const biz = (await automaticProfilingAllowed(this.pg, userId))
+          ? await this.businessProfile.renderForPrompt(userId, opts.agentCategory)
+          : '';
         if (biz) stablePrefix += biz + '\n\n';
       } catch (e: any) {
         this.logger.warn(`business profile injection failed: ${e?.message}`);
@@ -1280,13 +1289,16 @@ ${MEETING_HONESTY_RULE}
 ${RESPONSE_STYLE_RULE}
 ${LanguageService.buildDirective(userLanguage)}`;
 
-    let volatileSystemPrompt = (profileText && profileText.trim())
-      ? `\n\n--- Профиль пользователя ---\n${profileText}`
+    const allowedProfileText = await this.profileTextForPrompt(userId, profileText);
+    let volatileSystemPrompt = allowedProfileText
+      ? `\n\n--- Профиль пользователя ---\n${allowedProfileText}`
       : '';
     if (this.businessProfile) {
       try {
         // Маша — personal, получит строку-резюме, а не полную карточку.
-        const biz = await this.businessProfile.renderForPrompt(userId, agent.category);
+        const biz = (await automaticProfilingAllowed(this.pg, userId))
+          ? await this.businessProfile.renderForPrompt(userId, agent.category)
+          : '';
         if (biz) volatileSystemPrompt += `\n\n${biz}`;
       } catch (e: any) {
         this.logger.warn(`business profile injection failed (Маша): ${e?.message}`);
@@ -2921,12 +2933,15 @@ ${LanguageService.buildDirective(userLanguage)}`;
     if (systemPrompt && systemPrompt.trim()) {
       stablePrefix += `--- Персона и инструкции ассистента ${agentName} ---\n${systemPrompt.trim()}\n\n`;
     }
-    if (profileText && profileText.trim()) {
-      stablePrefix += `User profile:\n${profileText}\n\n`;
+    const allowedProfileText = await this.profileTextForPrompt(userId, profileText);
+    if (allowedProfileText) {
+      stablePrefix += `User profile:\n${allowedProfileText}\n\n`;
     }
     if (opts.includeUserContext !== false && this.businessProfile) {
       try {
-        const biz = await this.businessProfile.renderForPrompt(userId, agent.category);
+        const biz = (await automaticProfilingAllowed(this.pg, userId))
+          ? await this.businessProfile.renderForPrompt(userId, agent.category)
+          : '';
         if (biz) stablePrefix += biz + '\n\n';
       } catch (e: any) {
         this.logger.warn(`business profile injection failed (agent reply): ${e?.message}`);

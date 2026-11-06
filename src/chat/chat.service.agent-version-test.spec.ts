@@ -285,6 +285,11 @@ describe('agentReply: isolated agent version test', () => {
       tasksContext: 'ACTIVE TASKS MARKER',
     });
     const addTokenTask = jest.spyOn(h.service as any, 'addTokenTask').mockResolvedValue(undefined);
+    // persistResponse заводит отложенную очистку dedup-ключа; сама очистка к
+    // проверке prompt не относится, а её реальный таймер держит Jest после теста.
+    const cleanupTimer = jest.spyOn(global, 'setTimeout').mockImplementation(
+      () => ({ unref: jest.fn() }) as any,
+    );
 
     try {
       await (h.service as any).streamUniversalAgent(
@@ -307,6 +312,7 @@ describe('agentReply: isolated agent version test', () => {
         'business',
       );
     } finally {
+      cleanupTimer.mockRestore();
       addTokenTask.mockRestore();
     }
 
