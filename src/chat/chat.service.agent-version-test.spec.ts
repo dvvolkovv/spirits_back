@@ -465,6 +465,8 @@ describe('agentReply: isolated agent version test', () => {
     expect(fields.systemPrompt).toContain('LIVE SYSTEM PROMPT');
     expect(fields.message).toContain('ACTIVE TASKS MARKER');
   });
+
+  it('прерванный ответ (done.failed) в основной сессии — busy, обрезанный текст не пишется', async () => {
     // С 05.11.2026 (бэклог e777aa94): человек пре-эмптил фоновый ответ — его
     // обрывок нельзя вернуть как успешный, routine-push повторит доставку.
     const h = replyHarness([
