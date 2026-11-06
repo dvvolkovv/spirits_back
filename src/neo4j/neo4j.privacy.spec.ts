@@ -58,6 +58,52 @@ describe('Neo4jService automatic profiling privacy gates', () => {
     expect(run).not.toHaveBeenCalled();
   });
 
+  it('stops before every provider when consent is revoked while history is loading', async () => {
+    process.env.OPENROUTER_API_KEY = 'test-openrouter-key';
+    automaticProfilingAllowedMock.mockResolvedValueOnce(true).mockResolvedValue(false);
+    const post = jest.spyOn(axios, 'post').mockResolvedValue({
+      data: { choices: [{ message: { content: '{}' } }] },
+    });
+    const { svc, pg, cli, run } = makeService(null);
+
+    await svc.consolidateFromChat('u', 'a', 'USER', 'ASSISTANT');
+
+    expect(pg.query).toHaveBeenCalledTimes(1);
+    expect(cli.text).not.toHaveBeenCalled();
+    expect(post).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('does not call OpenRouter when consent is revoked after Claude returns no content', async () => {
+    process.env.OPENROUTER_API_KEY = 'test-openrouter-key';
+    automaticProfilingAllowedMock
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(true)
+      .mockResolvedValue(false);
+    const post = jest.spyOn(axios, 'post').mockResolvedValue({
+      data: { choices: [{ message: { content: '{"interests":["chess"]}' } }] },
+    });
+    const { svc, cli, run } = makeService(null);
+
+    await svc.consolidateFromChat('u', 'a', 'USER', 'ASSISTANT');
+
+    expect(cli.text).toHaveBeenCalledTimes(1);
+    expect(post).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('discards a malformed LLM response before parsing or logging its content after revocation', async () => {
+    const malformed = 'not-json SECRET_RESPONSE';
+    automaticProfilingAllowedMock.mockResolvedValueOnce(true).mockResolvedValue(false);
+    const { svc, run } = makeService(malformed);
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+
+    await svc.consolidateFromChat('u', 'a', 'USER', 'ASSISTANT', '');
+
+    expect(warn).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+  });
+
   it('discards extracted values when consent is revoked after the LLM response', async () => {
     automaticProfilingAllowedMock.mockResolvedValueOnce(true).mockResolvedValue(false);
     const { svc, cli, run } = makeService('{"interests":["chess"]}');
