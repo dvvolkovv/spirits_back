@@ -1,5 +1,18 @@
 import { BusinessProfileService } from './business-profile.service';
 import { BusinessProfile, renderBusinessBlock } from './business-profile.types';
+import { automaticProfilingAllowed } from '../privacy/profile-privacy';
+
+jest.mock('../privacy/profile-privacy', () => ({
+  automaticProfilingAllowed: jest.fn(),
+}));
+
+const automaticProfilingAllowedMock = automaticProfilingAllowed as jest.MockedFunction<
+  typeof automaticProfilingAllowed
+>;
+
+beforeEach(() => {
+  automaticProfilingAllowedMock.mockReset().mockResolvedValue(true);
+});
 
 const FULL: BusinessProfile = {
   what:       { value: 'студия маникюра, 2 точки в Казани', source: 'user', updated_at: 'x' },
