@@ -4,6 +4,10 @@ import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
 import { ContactsService, ContactVisibility } from './contacts.service';
 
+function isValidPublicProfileId(userId: number): boolean {
+  return Number.isFinite(userId) && Number.isInteger(userId) && userId > 0;
+}
+
 // Глобальный префикс `/webhook` задан в main.ts.
 @Controller('')
 export class ContactsController {
@@ -13,9 +17,9 @@ export class ContactsController {
   @UseGuards(JwtGuard)
   async publicProfile(@CurrentUser() user: any, @Param('userId') userIdRaw: string, @Res() res: Response) {
     const userId = Number(userIdRaw);
-    if (!userId || Number.isNaN(userId)) throw new BadRequestException('invalid userId');
+    if (!isValidPublicProfileId(userId)) throw new BadRequestException('invalid userId');
     const p = await this.contacts.getPublicProfile(user.userId, userId);
-    if (!p) return res.status(404).json({ code: 'PROFILE_NOT_AVAILABLE' });
+    if (!p) return res.status(404).json({ error: 'not_found', code: 'PROFILE_NOT_AVAILABLE' });
     return res.status(200).json(p);
   }
 
@@ -24,9 +28,10 @@ export class ContactsController {
   @UseGuards(JwtGuard)
   async publicProfileByPhone(@CurrentUser() user: any, @Param('phone') phone: string, @Res() res: Response) {
     const userId = await this.contacts.idByPhone(phone);
-    if (!userId) return res.status(404).json({ code: 'PROFILE_NOT_AVAILABLE' });
+    if (userId === null) return res.status(404).json({ error: 'not_found', code: 'PROFILE_NOT_AVAILABLE' });
+    if (!isValidPublicProfileId(userId)) throw new BadRequestException('invalid userId');
     const p = await this.contacts.getPublicProfile(user.userId, userId);
-    if (!p) return res.status(404).json({ code: 'PROFILE_NOT_AVAILABLE' });
+    if (!p) return res.status(404).json({ error: 'not_found', code: 'PROFILE_NOT_AVAILABLE' });
     return res.status(200).json(p);
   }
 

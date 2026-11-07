@@ -5,7 +5,7 @@ import { IdentityService } from '../identity/identity.service';
 import { OAuthAppleService } from '../auth/oauth-apple.service';
 import { sanitizeAssistantVoices, sanitizeProfilePatch } from './profile-patch';
 import { buildOtherUserProfile } from './profile-public';
-import { canUseProfileForRequester, canViewProfile } from '../privacy/profile-privacy';
+import { readProfileAccess } from '../privacy/profile-privacy';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -234,7 +234,8 @@ export class ProfileService implements OnModuleInit {
   }
 
   async getUserProfile(requesterId: string, targetId: string) {
-    if (!await canViewProfile(this.pg, requesterId, targetId)) return null;
+    const access = await readProfileAccess(this.pg, requesterId, targetId).catch(() => null);
+    if (!access?.visible) return null;
 
     const res = await this.pg.query(
       'SELECT * FROM ai_profiles_consolidated WHERE user_id = $1',
@@ -243,18 +244,17 @@ export class ProfileService implements OnModuleInit {
     const row = res.rows[0];
     if (!row) return null;
 
-    const includeProfile = await canUseProfileForRequester(this.pg, requesterId, targetId);
+    const includeProfile = access.visible && (requesterId === targetId || access.automaticProfiling);
     const neo = includeProfile && this.neo4j
       ? await this.neo4j.getProfileEntities(targetId).catch(() => null)
       : null;
 
-    // Настройки могли измениться, пока читались PostgreSQL и Neo4j. Повторная
-    // проверка не даёт вернуть уже скрытый профиль или только что paused портрет.
-    const [stillVisible, stillIncludeProfile] = await Promise.all([
-      canViewProfile(this.pg, requesterId, targetId),
-      canUseProfileForRequester(this.pg, requesterId, targetId),
-    ]);
-    if (!stillVisible) return null;
+    // Настройки могли измениться, пока читались PostgreSQL и Neo4j. Единый
+    // финальный snapshot не даёт собрать ответ из разрывных состояний политики.
+    const finalAccess = await readProfileAccess(this.pg, requesterId, targetId).catch(() => null);
+    if (!finalAccess?.visible) return null;
+    const stillIncludeProfile = finalAccess.visible
+      && (requesterId === targetId || finalAccess.automaticProfiling);
 
     return buildOtherUserProfile(row, neo, stillIncludeProfile);
   }

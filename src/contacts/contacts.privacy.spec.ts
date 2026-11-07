@@ -6,9 +6,6 @@ import { ContactsService } from './contacts.service';
 jest.mock('../privacy/profile-privacy', () => ({
   readProfileAccess: jest.fn(),
   readProfileAccessBatch: jest.fn(),
-  // Сохраняют поведение старой реализации во время RED-прогона.
-  canViewProfile: jest.fn().mockResolvedValue(true),
-  canUseProfileForRequester: jest.fn().mockResolvedValue(true),
 }));
 
 const readAccess = readProfileAccess as jest.MockedFunction<typeof readProfileAccess>;

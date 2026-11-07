@@ -1,16 +1,12 @@
-import { canUseProfileForRequester, canViewProfile, readProfileAccess } from '../privacy/profile-privacy';
+import { readProfileAccess } from '../privacy/profile-privacy';
 import { ProfileService } from './profile.service';
 import { sanitizeProfilePatch } from './profile-patch';
 
 jest.mock('../privacy/profile-privacy', () => ({
   readProfileAccess: jest.fn(),
-  canViewProfile: jest.fn(),
-  canUseProfileForRequester: jest.fn(),
 }));
 
 const readAccess = readProfileAccess as jest.MockedFunction<typeof readProfileAccess>;
-const canView = canViewProfile as jest.MockedFunction<typeof canViewProfile>;
-const canUse = canUseProfileForRequester as jest.MockedFunction<typeof canUseProfileForRequester>;
 
 beforeEach(() => {
   readAccess.mockReset().mockResolvedValue({
@@ -20,8 +16,6 @@ beforeEach(() => {
     approvedContact: false,
     peer: false,
   } as any);
-  canView.mockReset().mockResolvedValue(true);
-  canUse.mockReset().mockResolvedValue(true);
 });
 
 /**

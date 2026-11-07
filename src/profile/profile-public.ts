@@ -27,7 +27,9 @@ export function buildOtherUserProfile(
     family_name: includeProfile ? neo?.family_name || pd.family_name : pd.family_name,
   };
   for (const key of PROFILE_ENTITY_KEYS) {
-    merged[key] = includeProfile ? (neo?.[key]?.length ? neo[key] : pd[key]) || [] : [];
+    const neoHasKey = neo != null && Object.prototype.hasOwnProperty.call(neo, key);
+    const value = neoHasKey ? neo?.[key] : pd[key];
+    merged[key] = includeProfile ? value || [] : [];
   }
 
   return {

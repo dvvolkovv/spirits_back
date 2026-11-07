@@ -118,6 +118,8 @@ export interface ProfileAccess {
   exists: boolean;
   visible: boolean;
   automaticProfiling: boolean;
+  approvedContact: boolean;
+  peer: boolean;
 }
 
 type ProfileAccessRow = {
@@ -159,12 +161,14 @@ export async function readProfileAccess(
       [targetId],
     );
     if (own.rows.length === 0) {
-      return { exists: false, visible: false, automaticProfiling: false };
+      return { exists: false, visible: false, automaticProfiling: false, approvedContact: false, peer: false };
     }
     return {
       exists: true,
       visible: true,
       automaticProfiling: selfAutomaticProfiling(own.rows[0].profile_data),
+      approvedContact: false,
+      peer: false,
     };
   }
 
@@ -202,7 +206,7 @@ export async function readProfileAccess(
   );
 
   if (result.rows.length === 0) {
-    return { exists: false, visible: false, automaticProfiling: false };
+    return { exists: false, visible: false, automaticProfiling: false, approvedContact: false, peer: false };
   }
 
   const row = result.rows[0] as ProfileAccessRow;
@@ -211,6 +215,8 @@ export async function readProfileAccess(
     exists: true,
     visible: !row.blocked && (settings.discoverable || row.approved_contact || row.peer),
     automaticProfiling: settings.automaticProfiling,
+    approvedContact: row.approved_contact,
+    peer: row.peer,
   };
 }
 
@@ -312,6 +318,40 @@ function searchRowPrivacySettings(row: SearchAccessRow): PrivacySettings {
     settings.discoverable = row.discoverable;
   }
   return parsePrivacySettings(settings);
+}
+
+export async function readProfileAccessBatch(
+  pg: PrivacyPg,
+  requesterId: string,
+  targetIds: string[],
+): Promise<Map<string, ProfileAccess>> {
+  const result = new Map<string, ProfileAccess>();
+  if (targetIds.length === 0) return result;
+
+  const rows = await searchAccessRows(pg, requesterId, [...new Set(targetIds)]);
+  for (const row of rows) {
+    let settings: PrivacySettings;
+    try {
+      settings = searchRowPrivacySettings(row);
+    } catch {
+      result.set(row.user_id, {
+        exists: true,
+        visible: false,
+        automaticProfiling: false,
+        approvedContact: row.approved_contact,
+        peer: row.peer,
+      });
+      continue;
+    }
+    result.set(row.user_id, {
+      exists: true,
+      visible: !row.blocked && (settings.discoverable || row.approved_contact || row.peer),
+      automaticProfiling: settings.automaticProfiling,
+      approvedContact: row.approved_contact,
+      peer: row.peer,
+    });
+  }
+  return result;
 }
 
 function searchableRows(rows: SearchAccessRow[]): Set<string> {
