@@ -1,14 +1,26 @@
-import { canUseProfileForRequester, canViewProfile } from '../privacy/profile-privacy';
+import { readProfileAccess } from '../privacy/profile-privacy';
 import { ProfileController } from './profile.controller';
 import { ProfileService } from './profile.service';
 
 jest.mock('../privacy/profile-privacy', () => ({
-  canViewProfile: jest.fn(),
-  canUseProfileForRequester: jest.fn(),
+  readProfileAccess: jest.fn(),
+  // Сохраняют поведение старой реализации во время RED-прогона.
+  canViewProfile: jest.fn().mockResolvedValue(true),
+  canUseProfileForRequester: jest.fn().mockResolvedValue(true),
 }));
 
-const canView = canViewProfile as jest.MockedFunction<typeof canViewProfile>;
-const canUse = canUseProfileForRequester as jest.MockedFunction<typeof canUseProfileForRequester>;
+const readAccess = readProfileAccess as jest.MockedFunction<typeof readProfileAccess>;
+
+function access(overrides: Record<string, any> = {}) {
+  return {
+    exists: true,
+    visible: true,
+    automaticProfiling: true,
+    approvedContact: false,
+    peer: false,
+    ...overrides,
+  };
+}
 
 const flatKeys = ['values', 'beliefs', 'desires', 'intents', 'interests', 'skills'] as const;
 
@@ -71,12 +83,11 @@ function mockRes() {
 
 describe('other-user profile serialization', () => {
   beforeEach(() => {
-    canView.mockReset().mockResolvedValue(true);
-    canUse.mockReset().mockResolvedValue(true);
+    readAccess.mockReset().mockResolvedValue(access());
   });
 
   it('with automatic profiling disabled uses PG public fields and no Neo or stale PG entities', async () => {
-    canUse.mockResolvedValue(false);
+    readAccess.mockResolvedValue(access({ automaticProfiling: false }));
     const { service, neo4j } = makeService();
 
     const result = await service.getUserProfile('viewer', 'target');
@@ -110,8 +121,10 @@ describe('other-user profile serialization', () => {
     expect(JSON.stringify(result)).not.toContain('Neo');
   });
 
-  it('with automatic profiling enabled preserves Neo preference and PG entity fallback', async () => {
-    const { service, neo4j } = makeService();
+  it('treats Neo empty arrays as authoritative and falls back only for absent keys', async () => {
+    const neo: any = neoEntities();
+    delete neo.desires;
+    const { service, neo4j } = makeService(neo);
 
     const result = await service.getUserProfile('viewer', 'target');
 
@@ -121,43 +134,55 @@ describe('other-user profile serialization', () => {
       name: 'Neo name',
       family_name: 'Neo family',
       values: ['neo value'],
-      beliefs: ['stale pg belief'],
+      beliefs: [],
+      desires: ['stale pg desire'],
       profile_data: {
         name: 'Neo name',
         family_name: 'Neo family',
         user_nickname: 'pg-nick',
         avatar_url: 'https://example.test/pg-avatar.jpg',
         values: ['neo value'],
-        beliefs: ['stale pg belief'],
+        beliefs: [],
+        desires: ['stale pg desire'],
       },
     });
+    expect(JSON.stringify(result)).not.toContain('stale pg belief');
     expect(JSON.stringify(result)).not.toContain('private business');
   });
 
   it('keeps own entities visible to self even when profiling is paused for others', async () => {
+    readAccess.mockResolvedValue(access({ automaticProfiling: false }));
     const { service } = makeService();
 
     const result = await service.getUserProfile('target', 'target');
 
-    expect(canView).toHaveBeenCalledWith(expect.anything(), 'target', 'target');
-    expect(canUse).toHaveBeenCalledWith(expect.anything(), 'target', 'target');
+    expect(readAccess).toHaveBeenCalledWith(expect.anything(), 'target', 'target');
     expect(result).toMatchObject({ values: ['neo value'] });
   });
 
-  it('returns null when visibility changes to hidden during the request', async () => {
-    canView.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
-    const { service } = makeService();
+  it('uses one access snapshot per checkpoint when visibility and profiling are revoked', async () => {
+    readAccess
+      .mockResolvedValueOnce(access())
+      .mockResolvedValueOnce(access({ visible: false, automaticProfiling: false }));
+    const { service, pg } = makeService();
 
     await expect(service.getUserProfile('viewer', 'target')).resolves.toBeNull();
-    expect(canView).toHaveBeenCalledTimes(2);
+    expect(readAccess).toHaveBeenCalledTimes(2);
+    expect(readAccess.mock.calls).toEqual([
+      [pg, 'viewer', 'target'],
+      [pg, 'viewer', 'target'],
+    ]);
   });
 
-  it('uses the final profiling decision and suppresses entities read earlier in the request', async () => {
-    canUse.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+  it('uses the final profiling snapshot and suppresses entities read earlier in the request', async () => {
+    readAccess
+      .mockResolvedValueOnce(access())
+      .mockResolvedValueOnce(access({ automaticProfiling: false }));
     const { service, neo4j } = makeService();
 
     const result = await service.getUserProfile('viewer', 'target');
 
+    expect(readAccess).toHaveBeenCalledTimes(2);
     expect(neo4j.getProfileEntities).toHaveBeenCalledWith('target');
     expect(result).toMatchObject({ name: 'PG name', family_name: 'PG family' });
     for (const key of flatKeys) {
@@ -168,7 +193,7 @@ describe('other-user profile serialization', () => {
 });
 
 describe('GET /user-profile privacy response', () => {
-  it('passes requester and target to the service and hides missing profiles with one public code', async () => {
+  it('passes requester and target and preserves the legacy error with the public code', async () => {
     const profileService = { getUserProfile: jest.fn().mockResolvedValue(null) };
     const controller = new ProfileController(profileService as any, null as any);
     const res = mockRes();
@@ -177,6 +202,6 @@ describe('GET /user-profile privacy response', () => {
 
     expect(profileService.getUserProfile).toHaveBeenCalledWith('viewer', 'target');
     expect(res.statusCode).toBe(404);
-    expect(res.body).toEqual({ code: 'PROFILE_NOT_AVAILABLE' });
+    expect(res.body).toEqual({ error: 'Not found', code: 'PROFILE_NOT_AVAILABLE' });
   });
 });

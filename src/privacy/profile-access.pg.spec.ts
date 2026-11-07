@@ -62,6 +62,8 @@ describePg('profile access and search candidates against an isolated PostgreSQL 
       exists: true,
       visible: true,
       automaticProfiling: false,
+      approvedContact: false,
+      peer: false,
     });
     await expect(canViewProfile(privacy.pg as any, 'u4', 'u4')).resolves.toBe(true);
     await expect(canUseProfileForRequester(privacy.pg as any, 'u4', 'u4')).resolves.toBe(true);
@@ -72,6 +74,8 @@ describePg('profile access and search candidates against an isolated PostgreSQL 
       exists: true,
       visible: false,
       automaticProfiling: true,
+      approvedContact: false,
+      peer: false,
     });
     await expect(canViewProfile(privacy.pg as any, 'u1', 'u2')).resolves.toBe(false);
     await expect(canUseProfileForRequester(privacy.pg as any, 'u1', 'u2')).resolves.toBe(false);
@@ -88,6 +92,10 @@ describePg('profile access and search candidates against an isolated PostgreSQL 
 
     await expect(canViewProfile(privacy.pg as any, 'u1', 'u2')).resolves.toBe(true);
     await expect(canViewProfile(privacy.pg as any, 'u2', 'u1')).resolves.toBe(true);
+    await expect(readProfileAccess(privacy.pg as any, 'u1', 'u2')).resolves.toMatchObject({
+      approvedContact: true,
+      peer: false,
+    });
   });
 
   it('grants access through a peer conversation in both directions', async () => {
@@ -100,6 +108,10 @@ describePg('profile access and search candidates against an isolated PostgreSQL 
 
     await expect(canViewProfile(privacy.pg as any, 'u1', 'u2')).resolves.toBe(true);
     await expect(canViewProfile(privacy.pg as any, 'u2', 'u1')).resolves.toBe(true);
+    await expect(readProfileAccess(privacy.pg as any, 'u1', 'u2')).resolves.toMatchObject({
+      approvedContact: false,
+      peer: true,
+    });
   });
 
   it.each([
@@ -120,6 +132,8 @@ describePg('profile access and search candidates against an isolated PostgreSQL 
       exists: true,
       visible: false,
       automaticProfiling: true,
+      approvedContact: true,
+      peer: true,
     });
     await expect(canViewProfile(privacy.pg as any, 'u1', 'u2')).resolves.toBe(false);
     await expect(canViewProfile(privacy.pg as any, 'u2', 'u1')).resolves.toBe(false);
@@ -130,6 +144,8 @@ describePg('profile access and search candidates against an isolated PostgreSQL 
       exists: true,
       visible: true,
       automaticProfiling: false,
+      approvedContact: false,
+      peer: false,
     });
     await expect(canViewProfile(privacy.pg as any, 'u1', 'u4')).resolves.toBe(true);
     await expect(canUseProfileForRequester(privacy.pg as any, 'u1', 'u4')).resolves.toBe(false);
@@ -141,9 +157,28 @@ describePg('profile access and search candidates against an isolated PostgreSQL 
       exists: false,
       visible: false,
       automaticProfiling: false,
+      approvedContact: false,
+      peer: false,
     });
     await expect(canViewProfile(privacy.pg as any, 'u1', 'missing')).resolves.toBe(false);
     await expect(canUseProfileForRequester(privacy.pg as any, 'u1', 'missing')).resolves.toBe(false);
+  });
+
+  it('reads coherent batch access including hidden and paused counterparties', async () => {
+    const readBatch = (require('./profile-privacy') as any).readProfileAccessBatch;
+
+    const result = await readBatch(privacy.pg as any, 'u1', ['u2', 'u3', 'u4', 'missing']);
+
+    expect(result.get('u2')).toEqual({
+      exists: true,
+      visible: false,
+      automaticProfiling: true,
+      approvedContact: false,
+      peer: false,
+    });
+    expect(result.get('u3')).toMatchObject({ visible: true, automaticProfiling: true });
+    expect(result.get('u4')).toMatchObject({ visible: true, automaticProfiling: false });
+    expect(result.has('missing')).toBe(false);
   });
 
   it('does not grant access through a pending contact request', async () => {
@@ -255,6 +290,8 @@ describePg('profile access and search candidates against an isolated PostgreSQL 
       exists: true,
       visible: true,
       automaticProfiling: false,
+      approvedContact: false,
+      peer: false,
     });
     await expect(canViewProfile(privacy.pg as any, 'u4', 'u4')).resolves.toBe(true);
     await expect(canUseProfileForRequester(privacy.pg as any, 'u4', 'u4')).resolves.toBe(true);
