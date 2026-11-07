@@ -189,10 +189,12 @@ export class MiscService {
     selected = selected.filter((s) => beforeProse.has((s.found as any).phone));
     if (!selected.length) return noResults();
 
+    const proseSelectionSize = selected.length;
+    let prose = '';
     try {
-      await this.pipeLLM(buildProsePrompt(selected, userLanguage), userMessage, res);
+      prose = await this.completeLLM(buildProsePrompt(selected, userLanguage), userMessage);
     } catch (e: any) {
-      // Карточки уже собраны — отдаём их и без комментария.
+      // Проза необязательна: после финальной перепроверки отдаём карточки и без неё.
       this.logger.error(`search prose error: ${e.message}`);
     }
     const beforeCards = await filterSearchCandidateIds(
@@ -205,6 +207,14 @@ export class MiscService {
     });
     selected = selected.filter((s) => beforeCards.has((s.found as any).phone));
     if (!selected.length) return noResults();
+    if (selected.length !== proseSelectionSize) {
+      // Пока модель писала, часть доступов отозвали. Старая проза могла назвать
+      // этих людей, поэтому безопаснее отдать оставшиеся карточки без комментария.
+      prose = '';
+    }
+    if (prose) {
+      res.write(JSON.stringify({ type: 'item', content: prose }) + '\n');
+    }
     const cards = selected.map((s) => s.card);
     await this.writePaced(res, `\n\nsearch_result:${JSON.stringify(cards)}`);
     res.end();
@@ -967,6 +977,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           WITH emb
           MATCH (p:Profile)-[:HAS_VALUE]->(node:Value)
           WHERE p.phone IN $candidatePhones AND node.embedding IS NOT NULL
+            AND size(node.embedding) = 1536
           WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score
           ORDER BY score DESC
           LIMIT 20
@@ -975,6 +986,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           WITH emb
           MATCH (p:Profile)-[:HAS_DESIRE]->(node:Desire)
           WHERE p.phone IN $candidatePhones AND node.embedding IS NOT NULL
+            AND size(node.embedding) = 1536
           WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score
           ORDER BY score DESC
           LIMIT 20
@@ -983,6 +995,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           WITH emb
           MATCH (p:Profile)-[:HAS_INTEREST]->(node:Interest)
           WHERE p.phone IN $candidatePhones AND node.embedding IS NOT NULL
+            AND size(node.embedding) = 1536
           WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score
           ORDER BY score DESC
           LIMIT 20
@@ -991,6 +1004,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           WITH emb
           MATCH (p:Profile)-[:HAS_INTENT]->(node:Intent)
           WHERE p.phone IN $candidatePhones AND node.embedding IS NOT NULL
+            AND size(node.embedding) = 1536
           WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score
           ORDER BY score DESC
           LIMIT 20
@@ -999,6 +1013,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           WITH emb
           MATCH (p:Profile)-[:HAS_BELIEF]->(node:Belief)
           WHERE p.phone IN $candidatePhones AND node.embedding IS NOT NULL
+            AND size(node.embedding) = 1536
           WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score
           ORDER BY score DESC
           LIMIT 20
@@ -1007,6 +1022,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           WITH emb
           MATCH (p:Profile)-[:HAS_SKILL]->(node:Skill)
           WHERE p.phone IN $candidatePhones AND node.embedding IS NOT NULL
+            AND size(node.embedding) = 1536
           WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score
           ORDER BY score DESC
           LIMIT 20
