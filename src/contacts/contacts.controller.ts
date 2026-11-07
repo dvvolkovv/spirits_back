@@ -15,7 +15,7 @@ export class ContactsController {
     const userId = Number(userIdRaw);
     if (!userId || Number.isNaN(userId)) throw new BadRequestException('invalid userId');
     const p = await this.contacts.getPublicProfile(user.userId, userId);
-    if (!p) return res.status(404).json({ error: 'not_found' });
+    if (!p) return res.status(404).json({ code: 'PROFILE_NOT_AVAILABLE' });
     return res.status(200).json(p);
   }
 
@@ -24,9 +24,9 @@ export class ContactsController {
   @UseGuards(JwtGuard)
   async publicProfileByPhone(@CurrentUser() user: any, @Param('phone') phone: string, @Res() res: Response) {
     const userId = await this.contacts.idByPhone(phone);
-    if (!userId) return res.status(404).json({ error: 'not_found' });
+    if (!userId) return res.status(404).json({ code: 'PROFILE_NOT_AVAILABLE' });
     const p = await this.contacts.getPublicProfile(user.userId, userId);
-    if (!p) return res.status(404).json({ error: 'not_found' });
+    if (!p) return res.status(404).json({ code: 'PROFILE_NOT_AVAILABLE' });
     return res.status(200).json(p);
   }
 

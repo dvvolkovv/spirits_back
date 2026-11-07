@@ -1,6 +1,12 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
+import { canUseProfileForRequester, canViewProfile } from '../privacy/profile-privacy';
+
+const CONTACT_ENTITY_KEYS = [
+  'values', 'beliefs', 'desires', 'intents', 'interests', 'skills',
+  'valuesRich', 'beliefsRich', 'desiresRich', 'intentsRich', 'interestsRich', 'skillsRich',
+] as const;
 
 /**
  * Контакты и политика раскрытия phone:
@@ -71,6 +77,7 @@ export class ContactsService {
   async getPublicProfile(requesterPhone: string, targetId: number): Promise<any | null> {
     const targetPhone = await this.phoneById(targetId);
     if (!targetPhone) return null;
+    if (!await canViewProfile(this.pg, requesterPhone, targetPhone)) return null;
 
     const requesterId = await this.idByPhone(requesterPhone);
     const visibility = await this.contactVisibility(targetPhone);
@@ -100,32 +107,39 @@ export class ContactsService {
       } catch { /* peer_conversations может отсутствовать в dev — игнорируем */ }
     }
 
-    const entities = this.neo4j ? await this.neo4j.getProfileEntities(targetPhone).catch(() => null) : null;
+    const includeProfile = await canUseProfileForRequester(this.pg, requesterPhone, targetPhone);
+    const entities = includeProfile && this.neo4j
+      ? await this.neo4j.getProfileEntities(targetPhone).catch(() => null)
+      : null;
     const meta = await this.pg.query(
       `SELECT email, profile_data FROM ai_profiles_consolidated WHERE id = $1`,
       [targetId],
     );
 
+    // Политика могла измениться во время запросов. Раскрытие phone/email выше
+    // остаётся самостоятельным правилом, а портрет и видимость проверяем заново.
+    const [stillVisible, stillIncludeProfile] = await Promise.all([
+      canViewProfile(this.pg, requesterPhone, targetPhone),
+      canUseProfileForRequester(this.pg, requesterPhone, targetPhone),
+    ]);
+    if (!stillVisible) return null;
+
+    const profileData = meta.rows[0]?.profile_data || {};
+    const serializedEntities: Record<string, any> = {};
+    for (const key of CONTACT_ENTITY_KEYS) {
+      serializedEntities[key] = stillIncludeProfile ? entities?.[key] ?? [] : [];
+    }
+
     return {
       userId: targetId,
-      name: entities?.name,
-      family_name: entities?.family_name,
+      name: stillIncludeProfile ? entities?.name || profileData.name : profileData.name,
+      family_name: stillIncludeProfile ? entities?.family_name || profileData.family_name : profileData.family_name,
+      avatar_url: profileData.avatar_url ?? null,
       email: phoneDisclosed ? meta.rows[0]?.email ?? null : null,
       phone: phoneDisclosed ? targetPhone : null,
       contactVisible: visibility,
       phoneDisclosed,
-      values:        entities?.values ?? [],
-      beliefs:       entities?.beliefs ?? [],
-      desires:       entities?.desires ?? [],
-      intents:       entities?.intents ?? [],
-      interests:     entities?.interests ?? [],
-      skills:        entities?.skills ?? [],
-      valuesRich:    entities?.valuesRich ?? [],
-      beliefsRich:   entities?.beliefsRich ?? [],
-      desiresRich:   entities?.desiresRich ?? [],
-      intentsRich:   entities?.intentsRich ?? [],
-      interestsRich: entities?.interestsRich ?? [],
-      skillsRich:    entities?.skillsRich ?? [],
+      ...serializedEntities,
     };
   }
 

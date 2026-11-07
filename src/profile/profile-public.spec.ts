@@ -98,8 +98,6 @@ describe('other-user profile serialization', () => {
       },
       name: 'PG name',
       family_name: 'PG family',
-      user_nickname: 'pg-nick',
-      avatar_url: 'https://example.test/pg-avatar.jpg',
       values: [],
       beliefs: [],
       desires: [],
