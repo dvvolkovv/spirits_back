@@ -25,6 +25,7 @@ it('explains both real controls and preserves existing contacts', () => {
 it('does not promise deletion or full anonymity', () => {
   const profileText = renderArticle(profile, 'ru', 'web');
   const text = renderArticle(howItWorks, 'ru', 'web');
+  expect(text).toContain('новые люди');
   expect(profileText).toContain('Удалить сохранённый профиль одним переключателем.');
   expect(text).not.toContain('полная анонимность');
 });
