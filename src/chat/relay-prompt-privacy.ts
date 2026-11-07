@@ -3,9 +3,20 @@
  * При отзыве automaticProfiling удаляем только их, не затрагивая персону,
  * задачи и остальной контекст ассистента.
  */
+export interface RelayProfilingInsertion {
+  /** Позиция фактической вставки builder в исходном промпте. */
+  start: number;
+  /** Текст нужен для проверки, что диапазон всё ещё указывает на ту же вставку. */
+  text: string;
+}
+
 export interface RelayProfilingBlocks {
-  personal?: string;
-  business?: string;
+  personal?: RelayProfilingInsertion;
+  business?: RelayProfilingInsertion;
+}
+
+export function relayProfilingInsertion(prompt: string, start: number): RelayProfilingInsertion {
+  return { start, text: prompt.slice(start) };
 }
 
 export function stripRelayProfilingBlocks(
@@ -13,10 +24,15 @@ export function stripRelayProfilingBlocks(
   blocks: RelayProfilingBlocks,
 ): string {
   let sanitized = prompt;
-  for (const block of [blocks.personal, blocks.business]) {
-    if (!block) continue;
-    const at = sanitized.indexOf(block);
-    if (at >= 0) sanitized = sanitized.slice(0, at) + sanitized.slice(at + block.length);
+  const insertions = [blocks.personal, blocks.business]
+    .filter((block): block is RelayProfilingInsertion => !!block)
+    // Позиции записаны в исходном промпте. Удаление с конца не сдвигает
+    // диапазон следующего блока; повторный strip уже очищенного промпта — no-op.
+    .sort((a, b) => b.start - a.start);
+  for (const block of insertions) {
+    const end = block.start + block.text.length;
+    if (sanitized.slice(block.start, end) !== block.text) continue;
+    sanitized = sanitized.slice(0, block.start) + sanitized.slice(end);
   }
   return sanitized;
 }

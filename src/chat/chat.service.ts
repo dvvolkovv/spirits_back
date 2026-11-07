@@ -57,6 +57,7 @@ import { neutralizeAtMentions } from '../common/agent-guards';
 import { automaticProfilingAllowed } from '../privacy/profile-privacy';
 import {
   RelayProfilingBlocks,
+  relayProfilingInsertion,
   relaySessionForProfiling,
   stripRelayProfilingBlocks,
 } from './relay-prompt-privacy';
@@ -934,7 +935,7 @@ export class ChatService {
       const profileBlockStart = stablePrefix.length;
       stablePrefix += `User profile:\n${allowedProfileText}\n\n`;
       if (opts.profilingBlocks) {
-        opts.profilingBlocks.personal = stablePrefix.slice(profileBlockStart);
+        opts.profilingBlocks.personal = relayProfilingInsertion(stablePrefix, profileBlockStart);
       }
     }
     // Бизнес-карточка: общее знание о деле пользователя для всех ассистентов.
@@ -945,8 +946,11 @@ export class ChatService {
           ? await this.businessProfile.renderForPrompt(userId, opts.agentCategory)
           : '';
         if (biz) {
+          const businessBlockStart = stablePrefix.length;
           stablePrefix += biz + '\n\n';
-          if (opts.profilingBlocks) opts.profilingBlocks.business = biz + '\n\n';
+          if (opts.profilingBlocks) {
+            opts.profilingBlocks.business = relayProfilingInsertion(stablePrefix, businessBlockStart);
+          }
         }
       } catch (e: any) {
         this.logger.warn(`business profile injection failed: ${e?.message}`);
@@ -1347,7 +1351,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     let volatileSystemPrompt = allowedProfileText
       ? `\n\n--- Профиль пользователя ---\n${allowedProfileText}`
       : '';
-    if (allowedProfileText) profilingBlocks.personal = volatileSystemPrompt;
+    if (allowedProfileText) {
+      profilingBlocks.personal = relayProfilingInsertion(volatileSystemPrompt, 0);
+    }
     if (this.businessProfile) {
       try {
         // Маша — personal, получит строку-резюме, а не полную карточку.
@@ -1356,8 +1362,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
           : '';
         if (biz) {
           const businessBlock = `\n\n${biz}`;
+          const businessBlockStart = volatileSystemPrompt.length;
           volatileSystemPrompt += businessBlock;
-          profilingBlocks.business = businessBlock;
+          profilingBlocks.business = relayProfilingInsertion(volatileSystemPrompt, businessBlockStart);
         }
       } catch (e: any) {
         this.logger.warn(`business profile injection failed (Маша): ${e?.message}`);
@@ -3023,7 +3030,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     if (allowedProfileText) {
       const profileBlockStart = stablePrefix.length;
       stablePrefix += `User profile:\n${allowedProfileText}\n\n`;
-      profilingBlocks.personal = stablePrefix.slice(profileBlockStart);
+      profilingBlocks.personal = relayProfilingInsertion(stablePrefix, profileBlockStart);
     }
     if (opts.includeUserContext !== false && this.businessProfile) {
       try {
@@ -3031,8 +3038,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
           ? await this.businessProfile.renderForPrompt(userId, agent.category)
           : '';
         if (biz) {
+          const businessBlockStart = stablePrefix.length;
           stablePrefix += biz + '\n\n';
-          profilingBlocks.business = biz + '\n\n';
+          profilingBlocks.business = relayProfilingInsertion(stablePrefix, businessBlockStart);
         }
       } catch (e: any) {
         this.logger.warn(`business profile injection failed (agent reply): ${e?.message}`);
