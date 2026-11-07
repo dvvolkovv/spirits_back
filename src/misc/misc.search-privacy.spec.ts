@@ -25,12 +25,12 @@ const searchMateSource = source.slice(
   source.indexOf('private async writePaced'),
 );
 
-function profileRecord(phone = 'visible') {
+function profileRecord(phone = 'visible', matches: any[] = [], totalScore = 1) {
   const values: Record<string, any> = {
     phone,
     name: phone,
-    matches: [],
-    totalScore: 1,
+    matches,
+    totalScore,
   };
   return { get: (key: string) => values[key] };
 }
@@ -57,7 +57,7 @@ function selection(ref: number, name: string) {
 }
 
 function makeService(records: any[] = []) {
-  const run = jest.fn(async () => ({ records }));
+  const run = jest.fn(async (_cypher?: string, _params?: any) => ({ records }));
   const session = { run, close: jest.fn(async () => undefined) };
   const neo4j = { getSession: jest.fn(() => session) };
   const pg = {
@@ -126,7 +126,10 @@ describe('searchProfiles privacy structure', () => {
   it('использует шесть eligible-only cosine-веток вместо глобального vector index', () => {
     expect(searchProfilesSource).not.toContain('db.index.vector.queryNodes');
     expect(searchProfilesSource.match(/p\.phone IN \$candidatePhones/g) ?? []).toHaveLength(6);
-    expect(searchProfilesSource.match(/vector\.similarity\.cosine\(node\.embedding, emb\)/g) ?? []).toHaveLength(6);
+    const normalizedScore = '(1.0 + vector.similarity.cosine(node.embedding, emb)) / 2.0 AS score';
+    expect(searchProfilesSource.split(normalizedScore)).toHaveLength(7);
+    expect(searchProfilesSource).not.toContain('WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score');
+    expect(searchProfilesSource.match(/size\(node\.embedding\) = 1536/g) ?? []).toHaveLength(6);
     expect(searchProfilesSource.match(/LIMIT 20/g) ?? []).toHaveLength(6);
 
     const branches = [
@@ -159,8 +162,9 @@ describe('searchProfiles privacy structure', () => {
       ['beforeSelection', searchMateSource.indexOf('const beforeSelection')],
       ['selection prompt', searchMateSource.indexOf('buildSelectionPrompt(allowedMatches, userLanguage)')],
       ['beforeProse', searchMateSource.indexOf('const beforeProse')],
-      ['prose prompt', searchMateSource.indexOf('buildProsePrompt(selected, userLanguage)')],
+      ['buffered prose generation', searchMateSource.indexOf('await this.completeLLM(buildProsePrompt(selected, userLanguage), userMessage)')],
       ['beforeCards', searchMateSource.indexOf('const beforeCards')],
+      ['buffered prose write', searchMateSource.indexOf("res.write(JSON.stringify({ type: 'item', content: prose })")],
       ['cards', searchMateSource.indexOf('const cards = selected.map')],
     ];
     for (const [, at] of order) expect(at).toBeGreaterThanOrEqual(0);
@@ -168,6 +172,7 @@ describe('searchProfiles privacy structure', () => {
       expect(order[i][1]).toBeGreaterThan(order[i - 1][1]);
     }
     expect(searchMateSource).toContain('selectSearchProfiles(allowedMatches, selection)');
+    expect(searchMateSource).not.toContain('pipeLLM(buildProsePrompt');
   });
 });
 
@@ -219,6 +224,54 @@ describe('searchProfiles privacy runtime', () => {
     expect(run).not.toHaveBeenCalled();
     expect(session.close).toHaveBeenCalledTimes(1);
   });
+
+  it('сохраняет шкалу vector index: cosine=-1 даёт score=0, а не отрицательный score', async () => {
+    listMock.mockResolvedValue(new Set(['visible']));
+    const { svc, run } = makeService();
+    run.mockImplementation(async (cypher?: string) => {
+      const cosine = -1;
+      const normalized = cypher?.includes('(1.0 + vector.similarity.cosine(node.embedding, emb)) / 2.0 AS score');
+      const score = normalized ? (1.0 + cosine) / 2.0 : cosine;
+      return {
+        records: [profileRecord('visible', [
+          { category: 'Interest', name: 'node', gloss: 'gloss', score },
+        ], score)],
+      };
+    });
+
+    const [profile] = await (svc as any).searchProfiles('коуч', 'requester');
+
+    expect(profile.totalScore).toBe(0);
+    expect(profile.matches[0].score).toBe(0);
+    expect(profile.matches[0].score).toBeGreaterThanOrEqual(0);
+  });
+
+  it('кандидат с embedding не той размерности не отравляет остальные результаты', async () => {
+    listMock.mockResolvedValue(new Set(['stale', 'valid']));
+    const { svc, run } = makeService();
+    run.mockImplementation(async (cypher?: string) => {
+      const candidates = [
+        { phone: 'stale', embedding: [0.1, 0.2] },
+        { phone: 'valid', embedding: new Array(1536).fill(0.1) },
+      ];
+      const guarded = cypher?.includes('size(node.embedding) = 1536');
+      const eligible = guarded
+        ? candidates.filter((candidate) => candidate.embedding.length === 1536)
+        : candidates;
+      if (eligible.some((candidate) => candidate.embedding.length !== 1536)) {
+        throw new Error('vector dimensions differ');
+      }
+      return {
+        records: eligible.map((candidate) => profileRecord(candidate.phone, [
+          { category: 'Interest', name: 'node', gloss: 'gloss', score: 0.5 },
+        ], 0.5)),
+      };
+    });
+
+    const profiles = await (svc as any).searchProfiles('коуч', 'requester');
+
+    expect(profiles.map((profile: any) => profile.phone)).toEqual(['valid']);
+  });
 });
 
 describe('searchMate privacy runtime', () => {
@@ -229,33 +282,38 @@ describe('searchMate privacy runtime', () => {
       foundProfile('visible', 'VISIBLE-GLOSS'),
       foundProfile('hidden', 'HIDDEN-GLOSS'),
     ]);
-    complete.mockResolvedValue(JSON.stringify([
-      selection(1, 'Visible'),
-      selection(2, 'Hidden'),
-    ]));
+    complete
+      .mockResolvedValueOnce(JSON.stringify([
+        selection(1, 'Visible'),
+        selection(2, 'Hidden'),
+      ]))
+      .mockResolvedValueOnce('VISIBLE PROSE');
     pipe.mockImplementation(async (_prompt: string, _message: string, res: any) => {
-      res.write(JSON.stringify({ type: 'item', content: 'PROSE' }) + '\n');
+      res.write(JSON.stringify({ type: 'item', content: 'VISIBLE PROSE' }) + '\n');
     });
     const { res, written } = makeRes();
 
     await svc.searchMate('requester', 'коуч', res);
 
     const selectionPrompt = String(complete.mock.calls[0]?.[0] ?? '');
-    const prosePrompt = String(pipe.mock.calls[0]?.[0] ?? '');
+    const prosePrompt = String(complete.mock.calls[1]?.[0] ?? pipe.mock.calls[0]?.[0] ?? '');
     const view = clientView(written);
     expect({
       selectionVisible: selectionPrompt.includes('VISIBLE-GLOSS'),
       selectionHidden: selectionPrompt.includes('HIDDEN-GLOSS'),
       proseVisible: prosePrompt.includes('VISIBLE-GLOSS'),
       proseHidden: prosePrompt.includes('HIDDEN-GLOSS'),
+      responseProse: view.prose,
       cards: view.cards.map((card) => card.name),
     }).toEqual({
       selectionVisible: true,
       selectionHidden: false,
       proseVisible: true,
       proseHidden: false,
+      responseProse: 'VISIBLE PROSE',
       cards: ['Visible'],
     });
+    expect(pipe).not.toHaveBeenCalled();
     expect(filterMock.mock.calls.map((call) => call[2])).toEqual([
       ['visible', 'hidden'],
       ['visible'],
@@ -272,19 +330,26 @@ describe('searchMate privacy runtime', () => {
       foundProfile('visible', 'VISIBLE-GLOSS'),
       foundProfile('hidden', 'HIDDEN-GLOSS'),
     ]);
-    complete.mockResolvedValue(JSON.stringify([
-      selection(1, 'Visible'),
-      selection(2, 'Hidden'),
-    ]));
+    complete
+      .mockResolvedValueOnce(JSON.stringify([
+        selection(1, 'Visible'),
+        selection(2, 'Hidden'),
+      ]))
+      .mockResolvedValueOnce('VISIBLE PROSE');
+    pipe.mockImplementation(async (_prompt: string, _message: string, res: any) => {
+      res.write(JSON.stringify({ type: 'item', content: 'VISIBLE PROSE' }) + '\n');
+    });
     const { res, written } = makeRes();
 
     await svc.searchMate('requester', 'коуч', res);
 
-    const prosePrompt = String(pipe.mock.calls[0]?.[0] ?? '');
+    const prosePrompt = String(complete.mock.calls[1]?.[0] ?? pipe.mock.calls[0]?.[0] ?? '');
     const view = clientView(written);
     expect(prosePrompt).toContain('VISIBLE-GLOSS');
     expect(prosePrompt).not.toContain('HIDDEN-GLOSS');
+    expect(view.prose).toBe('VISIBLE PROSE');
     expect(view.cards.map((card) => card.name)).toEqual(['Visible']);
+    expect(pipe).not.toHaveBeenCalled();
     expect(filterMock.mock.calls.map((call) => call[2])).toEqual([
       ['visible', 'hidden'],
       ['visible', 'hidden'],
@@ -301,18 +366,22 @@ describe('searchMate privacy runtime', () => {
       foundProfile('visible', 'VISIBLE-GLOSS'),
     ]);
     complete.mockResolvedValue(JSON.stringify([selection(1, 'Visible')]));
+    pipe.mockImplementation(async (_prompt: string, _message: string, response: any) => {
+      response.write(JSON.stringify({ type: 'item', content: 'PRIVATE-PROSE Visible' }) + '\n');
+    });
     const { res, written } = makeRes();
 
     await svc.searchMate('requester', 'коуч', res);
 
     expect(complete).toHaveBeenCalledTimes(1);
     expect(pipe).not.toHaveBeenCalled();
+    expect(written.join('')).not.toContain('PRIVATE-PROSE');
     const view = clientView(written);
     expect(view.prose).toContain('не найдено подходящих людей');
     expect(view.cards).toEqual([]);
   });
 
-  it('если после прозы никого не осталось, финальные карточки заменяются noResults', async () => {
+  it('поздний полный отзыв не выпускает уже сгенерированную личную прозу или карточки', async () => {
     filterMock
       .mockResolvedValueOnce(new Set(['visible']))
       .mockResolvedValueOnce(new Set(['visible']))
@@ -321,20 +390,60 @@ describe('searchMate privacy runtime', () => {
     jest.spyOn(svc as any, 'searchProfiles').mockResolvedValue([
       foundProfile('visible', 'VISIBLE-GLOSS'),
     ]);
-    complete.mockResolvedValue(JSON.stringify([selection(1, 'Visible')]));
+    complete
+      .mockResolvedValueOnce(JSON.stringify([selection(1, 'Visible')]))
+      .mockResolvedValueOnce('PRIVATE-PROSE Visible');
     pipe.mockImplementation(async (_prompt: string, _message: string, response: any) => {
-      response.write(JSON.stringify({ type: 'item', content: 'PROSE' }) + '\n');
+      response.write(JSON.stringify({ type: 'item', content: 'PRIVATE-PROSE Visible' }) + '\n');
     });
     const { res, written } = makeRes();
 
     await svc.searchMate('requester', 'коуч', res);
 
-    expect(pipe).toHaveBeenCalledTimes(1);
+    expect(written.join('')).not.toContain('PRIVATE-PROSE');
+    expect(written.join('')).not.toContain('Visible');
+    expect(complete).toHaveBeenCalledTimes(2);
+    expect(pipe).not.toHaveBeenCalled();
     expect(filterMock).toHaveBeenCalledTimes(3);
     const view = clientView(written);
-    expect(view.prose).toContain('PROSE');
     expect(view.prose).toContain('не найдено подходящих людей');
     expect(view.cards).toEqual([]);
+  });
+
+  it('поздний частичный отзыв скрывает устаревшую прозу и оставляет согласованные карточки', async () => {
+    filterMock
+      .mockResolvedValueOnce(new Set(['visible', 'hidden']))
+      .mockResolvedValueOnce(new Set(['visible', 'hidden']))
+      .mockResolvedValueOnce(new Set(['visible']));
+    const { svc, complete, pipe } = makeService();
+    jest.spyOn(svc as any, 'searchProfiles').mockResolvedValue([
+      foundProfile('visible', 'VISIBLE-GLOSS'),
+      foundProfile('hidden', 'HIDDEN-GLOSS'),
+    ]);
+    complete
+      .mockResolvedValueOnce(JSON.stringify([
+        selection(1, 'Visible'),
+        selection(2, 'Hidden'),
+      ]))
+      .mockResolvedValueOnce('HIDDEN-PROSE Hidden; VISIBLE-PROSE Visible');
+    pipe.mockImplementation(async (_prompt: string, _message: string, response: any) => {
+      response.write(JSON.stringify({ type: 'item', content: 'HIDDEN-PROSE Hidden; VISIBLE-PROSE Visible' }) + '\n');
+    });
+    const { res, written } = makeRes();
+
+    await svc.searchMate('requester', 'коуч', res);
+
+    const view = clientView(written);
+    expect(view.prose).toBe('');
+    expect(written.join('')).not.toContain('HIDDEN-PROSE');
+    expect(view.cards.map((card) => card.name)).toEqual(['Visible']);
+    expect(complete).toHaveBeenCalledTimes(2);
+    expect(pipe).not.toHaveBeenCalled();
+    expect(filterMock.mock.calls.map((call) => call[2])).toEqual([
+      ['visible', 'hidden'],
+      ['visible', 'hidden'],
+      ['visible', 'hidden'],
+    ]);
   });
 
   it('ошибка PG при перепроверке fail-closed возвращает noResults без LLM', async () => {
