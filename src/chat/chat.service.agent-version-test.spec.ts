@@ -71,8 +71,10 @@ function replyHarness(events: any[] = [
   automaticProfiling?: boolean;
   tasksContext?: string;
   profilingSequence?: boolean[];
+  agentSystemPrompt?: string;
 } = {}) {
   const profilingSequence = [...(opts.profilingSequence || [])];
+  const agentSystemPrompt = opts.agentSystemPrompt || LIVE_AGENT.system_prompt;
   const pg = {
     query: jest.fn(async (sql: string) => {
       if (/SELECT profile_data FROM ai_profiles_consolidated/i.test(sql)) {
@@ -81,7 +83,9 @@ function replyHarness(events: any[] = [
           : opts.automaticProfiling ?? true;
         return { rows: [{ profile_data: { automaticProfiling } }] };
       }
-      return /FROM agents WHERE id/.test(sql) ? { rows: [LIVE_AGENT] } : { rows: [] };
+      return /FROM agents WHERE id/.test(sql)
+        ? { rows: [{ ...LIVE_AGENT, system_prompt: agentSystemPrompt }] }
+        : { rows: [] };
     }),
   };
   const neo4j = {
@@ -110,7 +114,7 @@ function replyHarness(events: any[] = [
   const post = axios.post as jest.Mock;
   post.mockImplementation(async () => ({ data: sseStream(events) }));
   const lastFields = () => fieldsOf(post.mock.calls[post.mock.calls.length - 1][1]);
-  return { service, pg, neo4j, businessProfile, tasksService, language, post, lastFields };
+  return { service, pg, neo4j, businessProfile, tasksService, language, post, lastFields, agentSystemPrompt };
 }
 
 beforeEach(() => jest.clearAllMocks());
@@ -141,7 +145,7 @@ async function runRelayPrivacyTurn(h: ReturnType<typeof replyHarness>) {
       responseHarness(),
       'Роман',
       'LIVE DESCRIPTION',
-      'LIVE SYSTEM PROMPT',
+      h.agentSystemPrompt,
       undefined,
       false,
       undefined,
@@ -187,6 +191,21 @@ async function runRelayPrivacyTurn(h: ReturnType<typeof replyHarness>) {
     lateTimer.mockRestore();
     lateAddTokenTask.mockRestore();
   }
+}
+
+const PERSONAL_BLOCK = 'User profile:\nLIVE USER PROFILE\n\n';
+const BUSINESS_BLOCK = 'LIVE BUSINESS PROFILE\n\n';
+const PERSONA_WITH_PROFILE_COPIES =
+  `PERSONA BEFORE\n${PERSONAL_BLOCK}${BUSINESS_BLOCK}PERSONA AFTER`;
+
+function expectOnlyPersonaCopies(prompt: string) {
+  // Одна копия каждого блока была в персоне до builder, вторую вставил builder.
+  // После отзыва должна остаться ровно персональная, а не более поздняя profile copy.
+  expect(prompt.split(PERSONAL_BLOCK)).toHaveLength(2);
+  expect(prompt.split(BUSINESS_BLOCK)).toHaveLength(2);
+  expect(prompt).toContain(
+    `--- Персона и инструкции ассистента Роман ---\n${PERSONA_WITH_PROFILE_COPIES}\n\n`,
+  );
 }
 
 describe('agentReply: isolated agent version test', () => {
@@ -436,6 +455,64 @@ describe('agentReply: isolated agent version test', () => {
     expect(retry.systemPrompt).not.toContain('LIVE USER PROFILE');
     expect(retry.systemPrompt).not.toContain('User profile:');
     expect(retry.systemPrompt).not.toContain('LIVE BUSINESS PROFILE');
+    expect(retry.sessionId).toBe('user_12_ru_noprofiling');
+    expect(retry.message).toContain('ACTIVE TASKS MARKER');
+  });
+
+  it('removes builder copies rather than identical persona fragments on agentReply dispatch', async () => {
+    const h = replyHarness(undefined, {
+      automaticProfiling: false,
+      profilingSequence: [true, true, true, false],
+      agentSystemPrompt: PERSONA_WITH_PROFILE_COPIES,
+    });
+
+    await h.service.generateAgentReply('user', '12', 'check privacy', 'duplicate_blocks_session');
+
+    expectOnlyPersonaCopies(h.lastFields().systemPrompt);
+    expect(h.lastFields().sessionId).toBe('duplicate_blocks_session_noprofiling');
+  });
+
+  it('removes builder copies rather than identical persona fragments on relay dispatch', async () => {
+    const h = replyHarness(undefined, {
+      automaticProfiling: false,
+      tasksContext: 'ACTIVE TASKS MARKER',
+      profilingSequence: [true, true, true, true, false],
+      agentSystemPrompt: PERSONA_WITH_PROFILE_COPIES,
+    });
+
+    await runRelayPrivacyTurn(h);
+
+    expect(h.post).toHaveBeenCalledTimes(1);
+    expectOnlyPersonaCopies(h.lastFields().systemPrompt);
+    expect(h.lastFields().sessionId).toBe('user_12_ru_noprofiling');
+    expect(h.lastFields().message).toContain('ACTIVE TASKS MARKER');
+  });
+
+  it('removes only builder copies on self-heal when persona contains identical profile blocks', async () => {
+    const h = replyHarness(undefined, {
+      automaticProfiling: false,
+      tasksContext: 'ACTIVE TASKS MARKER',
+      profilingSequence: [true, true, true, true, true, false],
+      agentSystemPrompt: PERSONA_WITH_PROFILE_COPIES,
+    });
+    h.post
+      .mockImplementationOnce(async () => ({ data: sseStream([]) }))
+      .mockImplementationOnce(async () => ({
+        data: sseStream([
+          { type: 'delta', text: 'retry answer' },
+          { type: 'done', costUsd: 0.01, turnCostUsd: 0.01 },
+        ]),
+      }));
+
+    await runRelayPrivacyTurn(h);
+
+    expect(h.post).toHaveBeenCalledTimes(2);
+    const first = fieldsOf(h.post.mock.calls[0][1]);
+    const retry = fieldsOf(h.post.mock.calls[1][1]);
+    expect(first.systemPrompt).toContain(PERSONA_WITH_PROFILE_COPIES);
+    expect(first.systemPrompt.split(PERSONAL_BLOCK)).toHaveLength(3);
+    expect(first.systemPrompt.split(BUSINESS_BLOCK)).toHaveLength(3);
+    expectOnlyPersonaCopies(retry.systemPrompt);
     expect(retry.sessionId).toBe('user_12_ru_noprofiling');
     expect(retry.message).toContain('ACTIVE TASKS MARKER');
   });

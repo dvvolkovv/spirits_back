@@ -80,6 +80,7 @@ interface Pg {
 function makePg(
   profileData: unknown = { automaticProfiling: true },
   profilingSequence?: boolean[],
+  agentSystemPrompt = AGENT.system_prompt,
 ): Pg {
   const sequence = [...(profilingSequence || [])];
   const calls: { sql: string; params: any[] }[] = [];
@@ -92,7 +93,7 @@ function makePg(
         : profileData;
       return { rows: [{ profile_data: data }] };
     }
-    if (/FROM agents WHERE id/.test(sql)) return { rows: [AGENT] };
+    if (/FROM agents WHERE id/.test(sql)) return { rows: [{ ...AGENT, system_prompt: agentSystemPrompt }] };
     if (/FROM agents a\s+LEFT JOIN agent_translations/.test(sql)) {
       return { rows: [{ display_name: 'Оля', description: 'коуч' }] };
     }
@@ -107,13 +108,18 @@ function makePg(
   return { query, calls } as Pg;
 }
 
-function makeService(pg: Pg, lang = 'ru'): ChatService {
+function makeService(
+  pg: Pg,
+  lang = 'ru',
+  businessProfile?: { renderForPrompt: jest.Mock },
+): ChatService {
   // Тот же контракт, что у текстового хода: профиль главный, поле `lang` из
   // запроса — подстраховка на случай, когда язык туда ещё не доехал.
   const language = { resolveUserLanguage: jest.fn(async (_u: string, hint?: string) => hint || lang) };
   return new ChatService(
     pg as any, null as any, null as any,
     null as any, language as any, undefined, undefined, undefined, undefined,
+    businessProfile as any,
   );
 }
 
@@ -139,10 +145,15 @@ function makeRes() {
 }
 
 const PROFILE = 'Дмитрий, ИП прекращено 2021';
+const BUSINESS_PROFILE = 'BUSINESS PROFILE COPY MARKER';
 
 /** Прогоняет upload-and-chat и отдаёт поля, ушедшие на релей. */
-async function upload(pg: Pg, body: any = {}): Promise<Record<string, string>> {
-  const svc = makeService(pg);
+async function upload(
+  pg: Pg,
+  body: any = {},
+  businessProfile?: { renderForPrompt: jest.Mock },
+): Promise<Record<string, string>> {
+  const svc = makeService(pg, 'ru', businessProfile);
   const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
   const neo4j = { getProfileDescription: jest.fn(async () => PROFILE) };
   const ctrl = new ChatController(svc, jwtSvc as any, neo4j as any, undefined);
@@ -256,6 +267,28 @@ describe('uploadAndChat: файл уходит в сессию разговор�
     expect(fields.systemPrompt || '').not.toContain(PROFILE);
     expect(fields.systemPrompt || '').not.toContain('User profile:');
     expect(fields.systemPrompt || '').toContain(AGENT.system_prompt);
+    expect(fields.sessionId).toBe(`${relaySessionKey('u1', '12', 'ru')}_noprofiling`);
+  });
+
+  it('на multipart boundary удаляет builder copies, а не совпадающие фрагменты персоны', async () => {
+    const personalBlock = `User profile:\n${PROFILE}\n\n`;
+    const businessBlock = `${BUSINESS_PROFILE}\n\n`;
+    const persona = `PERSONA BEFORE\n${personalBlock}${businessBlock}PERSONA AFTER`;
+    const fields = await upload(
+      makePg(
+        { automaticProfiling: false },
+        [true, true, true, true, false],
+        persona,
+      ),
+      {},
+      { renderForPrompt: jest.fn(async () => BUSINESS_PROFILE) },
+    );
+
+    expect(fields.systemPrompt.split(personalBlock)).toHaveLength(2);
+    expect(fields.systemPrompt.split(businessBlock)).toHaveLength(2);
+    expect(fields.systemPrompt).toContain(
+      `--- Персона и инструкции ассистента Роман ---\n${persona}\n\n`,
+    );
     expect(fields.sessionId).toBe(`${relaySessionKey('u1', '12', 'ru')}_noprofiling`);
   });
 
