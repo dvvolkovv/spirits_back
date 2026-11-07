@@ -931,9 +931,10 @@ export class ChatService {
     // ровно тогда, когда профиль реально изменился, а не 44 раза подряд.
     const allowedProfileText = await this.profileTextForPrompt(userId, opts.profileText);
     if (allowedProfileText) {
+      const profileBlockStart = stablePrefix.length;
       stablePrefix += `User profile:\n${allowedProfileText}\n\n`;
       if (opts.profilingBlocks) {
-        opts.profilingBlocks.personal = `User profile:\n${allowedProfileText}\n\n`;
+        opts.profilingBlocks.personal = stablePrefix.slice(profileBlockStart);
       }
     }
     // Бизнес-карточка: общее знание о деле пользователя для всех ассистентов.
@@ -3020,8 +3021,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const profilingBlocks: RelayProfilingBlocks = {};
     const allowedProfileText = await this.profileTextForPrompt(userId, profileText);
     if (allowedProfileText) {
+      const profileBlockStart = stablePrefix.length;
       stablePrefix += `User profile:\n${allowedProfileText}\n\n`;
-      profilingBlocks.personal = `User profile:\n${allowedProfileText}\n\n`;
+      profilingBlocks.personal = stablePrefix.slice(profileBlockStart);
     }
     if (opts.includeUserContext !== false && this.businessProfile) {
       try {
