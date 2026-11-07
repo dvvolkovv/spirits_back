@@ -4,7 +4,7 @@ import {
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
-import { GUARDS_METADATA, PATH_METADATA } from '@nestjs/common/constants';
+import { GUARDS_METADATA, HTTP_CODE_METADATA, PATH_METADATA } from '@nestjs/common/constants';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { PrivacyController } from './privacy.controller';
 
@@ -38,6 +38,10 @@ describe('PrivacyController', () => {
   it('is a dedicated JWT-protected privacy-settings controller', () => {
     expect(Reflect.getMetadata(PATH_METADATA, PrivacyController)).toBe('privacy-settings');
     expect(Reflect.getMetadata(GUARDS_METADATA, PrivacyController)).toContain(JwtGuard);
+  });
+
+  it('returns HTTP 200 for successful settings updates', () => {
+    expect(Reflect.getMetadata(HTTP_CODE_METADATA, PrivacyController.prototype.updateSettings)).toBe(200);
   });
 
   it.each([
