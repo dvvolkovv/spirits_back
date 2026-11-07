@@ -21,8 +21,10 @@ import {
 } from './search-cards';
 import { IMAGE_TOKENS_HD, imageTokens } from './image-pricing';
 import {
+  automaticProfilingAllowed,
   filterSearchCandidateIds,
   listSearchCandidateIds,
+  readProfileAccess,
 } from '../privacy/profile-privacy';
 
 const ASSETS_BUCKET = 'linkeon-assets';
@@ -77,6 +79,12 @@ const STREAM_PIECE_GAP_MS = 10;
  */
 function insufficientTokens(): Error {
   return Object.assign(new Error('Недостаточно токенов'), { code: 'INSUFFICIENT_TOKENS' });
+}
+
+class CompatibilityUnavailableError extends Error {
+  constructor(readonly code: 'PROFILE_NOT_AVAILABLE' | 'PROFILE_DATA_UNAVAILABLE') {
+    super(code);
+  }
 }
 
 @Injectable()
@@ -237,6 +245,17 @@ export class MiscService {
   }
 
   async analyzeCompatibility(userId: string, targetUsers: string[], res: Response): Promise<void> {
+    let resolvedPhones: string[];
+    try {
+      resolvedPhones = await this.resolveCompatibilityPhones(targetUsers);
+      await this.assertCompatibilityAllowed(userId, resolvedPhones);
+    } catch (error) {
+      const code = error instanceof CompatibilityUnavailableError ? error.code : 'PROFILE_NOT_AVAILABLE';
+      const status = code === 'PROFILE_DATA_UNAVAILABLE' ? 422 : 404;
+      res.status(status).json({ code });
+      return;
+    }
+
     res.status(200);
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Transfer-Encoding', 'chunked');
@@ -252,21 +271,6 @@ export class MiscService {
       return;
     }
 
-    // targetUsers может содержать userId (integer as string/number) или phone (string).
-    // Ресолвим к phone для Cypher-запросов.
-    const resolvedPhones: string[] = [];
-    for (const t of targetUsers) {
-      const raw = String(t).trim();
-      if (/^\d+$/.test(raw) && raw.length < 10) {
-        // Короткая цифра — считаем surrogate userId (phone всегда >= 10 цифр).
-        const r = await this.pg.query('SELECT user_id FROM ai_profiles_consolidated WHERE id = $1', [Number(raw)]);
-        const ph = r.rows[0]?.user_id;
-        if (ph) resolvedPhones.push(ph);
-      } else {
-        resolvedPhones.push(raw);
-      }
-    }
-
     const blocks: string[] = [];
     for (const targetPhone of resolvedPhones) {
       if (targetPhone === userId) continue;
@@ -276,6 +280,14 @@ export class MiscService {
     }
 
     if (!blocks.length) {
+      res.write(JSON.stringify({ type: 'item', content: searchMsg(userLanguage).noData }) + '\n');
+      res.end();
+      return;
+    }
+
+    try {
+      await this.assertCompatibilityAllowed(userId, resolvedPhones);
+    } catch {
       res.write(JSON.stringify({ type: 'item', content: searchMsg(userLanguage).noData }) + '\n');
       res.end();
       return;
@@ -300,6 +312,40 @@ ${blocks.join('\n\n---\n\n')}
 ${LanguageService.buildDirective(userLanguage)}`;
 
     await this.streamLLM(systemPrompt, 'Проанализируй совместимость этих людей', res);
+  }
+
+  private async resolveCompatibilityPhones(targetUsers: string[]): Promise<string[]> {
+    const phones: string[] = [];
+    for (const target of targetUsers) {
+      const raw = String(target).trim();
+      if (/^\d+$/.test(raw) && raw.length < 10) {
+        // Короткая цифра — surrogate userId (phone всегда >= 10 цифр).
+        const result = await this.pg.query(
+          'SELECT user_id FROM ai_profiles_consolidated WHERE id = $1',
+          [Number(raw)],
+        );
+        if (!result.rows[0]?.user_id) {
+          throw new CompatibilityUnavailableError('PROFILE_NOT_AVAILABLE');
+        }
+        phones.push(result.rows[0].user_id);
+      } else {
+        phones.push(raw);
+      }
+    }
+    return phones;
+  }
+
+  private async assertCompatibilityAllowed(userId: string, phones: string[]): Promise<void> {
+    for (const targetPhone of phones) {
+      if (targetPhone === userId) continue;
+      const access = await readProfileAccess(this.pg, userId, targetPhone);
+      if (!access.exists || !access.visible) {
+        throw new CompatibilityUnavailableError('PROFILE_NOT_AVAILABLE');
+      }
+      if (!access.automaticProfiling || !(await automaticProfilingAllowed(this.pg, userId))) {
+        throw new CompatibilityUnavailableError('PROFILE_DATA_UNAVAILABLE');
+      }
+    }
   }
 
   /** Считает per-node cosine-matching между двумя профилями по всем 6 категориям. */
