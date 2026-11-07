@@ -16,6 +16,8 @@
   "profile": "profile.title",
   "business": "businessCard.title",
   "settings": "settings.title",
+  "automaticProfiling": "settings.privacy_controls.automatic_profiling",
+  "discoverable": "settings.privacy_controls.discoverable",
   "calendars": "settings.calendar.title",
   "push": "settings.push.title",
   "voices": "settings.voices.title",

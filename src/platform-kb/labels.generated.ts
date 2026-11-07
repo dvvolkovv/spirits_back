@@ -3,7 +3,7 @@
 
 import type { SUPPORTED_LANGUAGES } from '../common/services/language.service';
 
-export const KB_LABEL_KEYS = ["chat","listen","voiceInput","fresh","files","call","meetingJoin","networking","imageGen","video","studio","studioAgents","studioBots","studioProducts","profile","business","settings","calendars","push","voices","android","partners","invite","help","support","zoom","routines","loginMethods","sectionPersonal","sectionBusiness","sectionGrowth","sectionMine","onboardingStart","uploadTitle","filesMedia","filesDocs","askCustom","askSubmit","sendAnyway","hangUp","callCard","meetingLeave","meetingOn","zoomConnect","searchPeople","compat","requests","peerChats","requestChat","requestContact","accept","decline","report","block","contactVisibility","visPublic","visMatch","visPrivate","contactRequests","modeImage","modeBanner","imgFormat","makeVideo","upload","videoCreate","myVideos","ownVoice","videoFormat","videoRes","videoLength","portraitPhotos","fromMyImages","uploadVoice","voicePreview","voiceDefault","tgGenLink","tgOpen","tgCheckBind","tgWhen","tgStrict","tgSmart","tgAlways","tgVoice","tgSubmit","tgReconnect","tgPrivate","prodNew","prodSite","prodBot","prodToken","prodSecrets","prodAsk","prodHistory","prodRevert","prodDomain","prodAttach","prodCheck","prodDetach","prodSleeping","prodFailed","prodRetry","prodWhy","writeSupport","edit","save","bizAddMore","calYandex","calOutlook","calIcs","talerid","taleridConnect","connect","routineEnergy","routineTest","pushTest","tokensNav","spending","topup","coupon","couponActivate","buy","receiptEmail","payCard","payCrypto","topupHistory","payoutTokens","withdrawMoney","link","unlink","mergeAccounts","language","logout","deleteAccount","deleteForever","account","loginPhone","apkDownload","tmaDay","tmaWallet","helpGuide","helpFaq","newTicket"] as const;
+export const KB_LABEL_KEYS = ["chat","listen","voiceInput","fresh","files","call","meetingJoin","networking","imageGen","video","studio","studioAgents","studioBots","studioProducts","profile","business","settings","automaticProfiling","discoverable","calendars","push","voices","android","partners","invite","help","support","zoom","routines","loginMethods","sectionPersonal","sectionBusiness","sectionGrowth","sectionMine","onboardingStart","uploadTitle","filesMedia","filesDocs","askCustom","askSubmit","sendAnyway","hangUp","callCard","meetingLeave","meetingOn","zoomConnect","searchPeople","compat","requests","peerChats","requestChat","requestContact","accept","decline","report","block","contactVisibility","visPublic","visMatch","visPrivate","contactRequests","modeImage","modeBanner","imgFormat","makeVideo","upload","videoCreate","myVideos","ownVoice","videoFormat","videoRes","videoLength","portraitPhotos","fromMyImages","uploadVoice","voicePreview","voiceDefault","tgGenLink","tgOpen","tgCheckBind","tgWhen","tgStrict","tgSmart","tgAlways","tgVoice","tgSubmit","tgReconnect","tgPrivate","prodNew","prodSite","prodBot","prodToken","prodSecrets","prodAsk","prodHistory","prodRevert","prodDomain","prodAttach","prodCheck","prodDetach","prodSleeping","prodFailed","prodRetry","prodWhy","writeSupport","edit","save","bizAddMore","calYandex","calOutlook","calIcs","talerid","taleridConnect","connect","routineEnergy","routineTest","pushTest","tokensNav","spending","topup","coupon","couponActivate","buy","receiptEmail","payCard","payCrypto","topupHistory","payoutTokens","withdrawMoney","link","unlink","mergeAccounts","language","logout","deleteAccount","deleteForever","account","loginPhone","apkDownload","tmaDay","tmaWallet","helpGuide","helpFaq","newTicket"] as const;
 export type KbLabelKey = (typeof KB_LABEL_KEYS)[number];
 
 export const KB_LABELS: Record<(typeof SUPPORTED_LANGUAGES)[number], Record<KbLabelKey, string>> = {
@@ -25,6 +25,8 @@ export const KB_LABELS: Record<(typeof SUPPORTED_LANGUAGES)[number], Record<KbLa
     profile: "Мой профиль",
     business: "Мой бизнес",
     settings: "Настройки",
+    automaticProfiling: "Автоматически пополнять мой профиль",
+    discoverable: "Меня можно найти в поиске",
     calendars: "Календари",
     push: "Уведомления на этом устройстве",
     voices: "Голоса ассистентов",
@@ -169,6 +171,8 @@ export const KB_LABELS: Record<(typeof SUPPORTED_LANGUAGES)[number], Record<KbLa
     profile: "My profile",
     business: "My business",
     settings: "Settings",
+    automaticProfiling: "Automatically build my profile",
+    discoverable: "People can find me in search",
     calendars: "Calendars",
     push: "Notifications on this device",
     voices: "Assistant voices",
@@ -313,6 +317,8 @@ export const KB_LABELS: Record<(typeof SUPPORTED_LANGUAGES)[number], Record<KbLa
     profile: "Mi perfil",
     business: "Mi negocio",
     settings: "Ajustes",
+    automaticProfiling: "Completar automáticamente mi perfil",
+    discoverable: "Pueden encontrarme en la búsqueda",
     calendars: "Calendarios",
     push: "Notificaciones en este dispositivo",
     voices: "Voces de los asistentes",
@@ -457,6 +463,8 @@ export const KB_LABELS: Record<(typeof SUPPORTED_LANGUAGES)[number], Record<KbLa
     profile: "Mein Profil",
     business: "Mein Unternehmen",
     settings: "Einstellungen",
+    automaticProfiling: "Mein Profil automatisch ergänzen",
+    discoverable: "Man kann mich in der Suche finden",
     calendars: "Kalender",
     push: "Benachrichtigungen auf diesem Gerät",
     voices: "Stimmen der Assistenten",
@@ -601,6 +609,8 @@ export const KB_LABELS: Record<(typeof SUPPORTED_LANGUAGES)[number], Record<KbLa
     profile: "Mon profil",
     business: "Mon entreprise",
     settings: "Paramètres",
+    automaticProfiling: "Compléter automatiquement mon profil",
+    discoverable: "On peut me trouver dans la recherche",
     calendars: "Calendriers",
     push: "Notifications sur cet appareil",
     voices: "Voix des assistants",
@@ -745,6 +755,8 @@ export const KB_LABELS: Record<(typeof SUPPORTED_LANGUAGES)[number], Record<KbLa
     profile: "我的个人资料",
     business: "我的生意",
     settings: "设置",
+    automaticProfiling: "自动完善我的个人资料",
+    discoverable: "允许他人在搜索中找到我",
     calendars: "日历",
     push: "此设备上的通知",
     voices: "助手语音",
@@ -889,6 +901,8 @@ export const KB_LABELS: Record<(typeof SUPPORTED_LANGUAGES)[number], Record<KbLa
     profile: "O meu perfil",
     business: "Meu negócio",
     settings: "Definições",
+    automaticProfiling: "Completar automaticamente o meu perfil",
+    discoverable: "Podem encontrar-me na pesquisa",
     calendars: "Calendários",
     push: "Notificações neste dispositivo",
     voices: "Vozes dos assistentes",
