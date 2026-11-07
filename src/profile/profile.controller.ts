@@ -67,9 +67,9 @@ export class ProfileController {
 
   @Get('user-profile')
   @UseGuards(JwtGuard)
-  async getUserProfile(@Query('userId') userId: string, @Res() res: Response) {
-    const profile = await this.profileService.getUserProfile(userId);
-    if (!profile) return res.status(404).json({ error: 'Not found' });
+  async getUserProfile(@CurrentUser() user: any, @Query('userId') userId: string, @Res() res: Response) {
+    const profile = await this.profileService.getUserProfile(user.userId, userId);
+    if (!profile) return res.status(404).json({ error: 'Not found', code: 'PROFILE_NOT_AVAILABLE' });
     return res.status(200).json(profile);
   }
 

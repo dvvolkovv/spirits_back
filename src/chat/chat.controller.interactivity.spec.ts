@@ -75,6 +75,9 @@ describe('upload-and-chat: шаги работы и правило карточ�
       query: jest.fn(async (sql: string) => {
         if (/SELECT tokens FROM ai_profiles_consolidated/.test(sql)) return { rows: [{ tokens: 1_000_000 }] };
         if (/FROM agents WHERE id/.test(sql)) return { rows: [AGENT] };
+        if (/SELECT profile_data FROM ai_profiles_consolidated/.test(sql)) {
+          return { rows: [{ profile_data: {} }] };
+        }
         return { rows: [] };
       }),
     };

@@ -1,6 +1,12 @@
-import { Injectable, Logger, Optional } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
+import { canReceiveNewProposal, readProfileAccess, readProfileAccessBatch, type ProfileAccess } from '../privacy/profile-privacy';
+
+const CONTACT_ENTITY_KEYS = [
+  'values', 'beliefs', 'desires', 'intents', 'interests', 'skills',
+  'valuesRich', 'beliefsRich', 'desiresRich', 'intentsRich', 'interestsRich', 'skillsRich',
+] as const;
 
 /**
  * Контакты и политика раскрытия phone:
@@ -71,61 +77,47 @@ export class ContactsService {
   async getPublicProfile(requesterPhone: string, targetId: number): Promise<any | null> {
     const targetPhone = await this.phoneById(targetId);
     if (!targetPhone) return null;
+    const access = await readProfileAccess(this.pg, requesterPhone, targetPhone).catch(() => null);
+    if (!access?.visible) return null;
 
-    const requesterId = await this.idByPhone(requesterPhone);
     const visibility = await this.contactVisibility(targetPhone);
-
-    // Self — всегда раскрываем.
-    let phoneDisclosed = visibility === 'public' || targetPhone === requesterPhone;
-    if (!phoneDisclosed && requesterId !== null) {
-      const appr = await this.pg.query(
-        `SELECT 1 FROM contact_requests
-         WHERE status = 'approved'
-           AND ((requester_id = $1 AND target_id = $2) OR (requester_id = $2 AND target_id = $1))
-         LIMIT 1`,
-        [requesterId, targetId],
-      );
-      if (appr.rowCount > 0) phoneDisclosed = true;
-    }
-    // Раскрываем, если между юзерами уже есть peer-переписка — контакт фактически установлен.
-    if (!phoneDisclosed) {
-      try {
-        const conv = await this.pg.query(
-          `SELECT 1 FROM peer_conversations
-           WHERE (user_a_id = $1 AND user_b_id = $2) OR (user_a_id = $2 AND user_b_id = $1)
-           LIMIT 1`,
-          [requesterPhone, targetPhone],
-        );
-        if (conv.rowCount > 0) phoneDisclosed = true;
-      } catch { /* peer_conversations может отсутствовать в dev — игнорируем */ }
-    }
-
-    const entities = this.neo4j ? await this.neo4j.getProfileEntities(targetPhone).catch(() => null) : null;
+    const self = targetPhone === requesterPhone;
+    let phoneDisclosed = visibility === 'public' || self || access.approvedContact || access.peer;
+    const includeProfile = access.visible && (self || access.automaticProfiling);
+    const entities = includeProfile && this.neo4j
+      ? await this.neo4j.getProfileEntities(targetPhone).catch(() => null)
+      : null;
     const meta = await this.pg.query(
       `SELECT email, profile_data FROM ai_profiles_consolidated WHERE id = $1`,
       [targetId],
     );
 
+    // Финальные access и contactVisible образуют одну точку сериализации:
+    // отзыв связи, блок, paused или public→private не остаются в старом ответе.
+    const [finalAccess, finalVisibility] = await Promise.all([
+      readProfileAccess(this.pg, requesterPhone, targetPhone).catch(() => null),
+      this.contactVisibility(targetPhone),
+    ]);
+    if (!finalAccess?.visible) return null;
+    const stillIncludeProfile = finalAccess.visible && (self || finalAccess.automaticProfiling);
+    phoneDisclosed = finalVisibility === 'public' || self || finalAccess.approvedContact || finalAccess.peer;
+
+    const profileData = meta.rows[0]?.profile_data || {};
+    const serializedEntities: Record<string, any> = {};
+    for (const key of CONTACT_ENTITY_KEYS) {
+      serializedEntities[key] = stillIncludeProfile ? entities?.[key] ?? [] : [];
+    }
+
     return {
       userId: targetId,
-      name: entities?.name,
-      family_name: entities?.family_name,
+      name: stillIncludeProfile ? entities?.name || profileData.name : profileData.name,
+      family_name: stillIncludeProfile ? entities?.family_name || profileData.family_name : profileData.family_name,
+      avatar_url: phoneDisclosed ? profileData.avatar_url ?? null : null,
       email: phoneDisclosed ? meta.rows[0]?.email ?? null : null,
       phone: phoneDisclosed ? targetPhone : null,
-      contactVisible: visibility,
+      contactVisible: finalVisibility,
       phoneDisclosed,
-      values:        entities?.values ?? [],
-      beliefs:       entities?.beliefs ?? [],
-      desires:       entities?.desires ?? [],
-      intents:       entities?.intents ?? [],
-      interests:     entities?.interests ?? [],
-      skills:        entities?.skills ?? [],
-      valuesRich:    entities?.valuesRich ?? [],
-      beliefsRich:   entities?.beliefsRich ?? [],
-      desiresRich:   entities?.desiresRich ?? [],
-      intentsRich:   entities?.intentsRich ?? [],
-      interestsRich: entities?.interestsRich ?? [],
-      skillsRich:    entities?.skillsRich ?? [],
+      ...serializedEntities,
     };
   }
 
@@ -135,7 +127,9 @@ export class ContactsService {
     if (requesterId === targetId) throw new Error('Cannot request own contact');
 
     const targetPhone = await this.phoneById(targetId);
-    if (!targetPhone) throw new Error('Target profile not found');
+    if (!targetPhone || !(await canReceiveNewProposal(this.pg, targetPhone))) {
+      throw new NotFoundException({ code: 'PROFILE_NOT_AVAILABLE' });
+    }
 
     const visibility = await this.contactVisibility(targetPhone);
     if (visibility === 'private') throw new Error('Пользователь не принимает запросы на контакт');
@@ -176,52 +170,74 @@ export class ContactsService {
     const targetId = await this.idByPhone(targetPhone);
     if (!targetId) return [];
     const r = await this.pg.query(
-      `SELECT cr.*, ap.user_id AS requester_phone
+      `SELECT cr.*, ap.user_id AS requester_phone, ap.profile_data AS requester_profile_data
        FROM contact_requests cr
        JOIN ai_profiles_consolidated ap ON ap.id = cr.requester_id
        WHERE cr.target_id = $1
        ORDER BY CASE WHEN cr.status = 'pending' THEN 0 ELSE 1 END, cr.created_at DESC`,
       [targetId],
     );
-    // Phone requester'а раскрываем только для approved. В pending — только имя (имя в neo4j).
+    if (r.rows.length === 0) return [];
+    const phones = [...new Set<string>(r.rows.map((row: any) => row.requester_phone).filter(Boolean))];
+    const accessByPhone = await readProfileAccessBatch(this.pg, targetPhone, phones)
+      .catch(() => new Map<string, ProfileAccess>());
+
     const rows = await Promise.all(r.rows.map(async (row: any) => {
+      const access = accessByPhone.get(row.requester_phone);
+      if (!access?.visible) return null;
+
       const out: any = { ...row };
+      const profileData = out.requester_profile_data || {};
+      delete out.requester_profile_data;
       if (row.status !== 'approved') delete out.requester_phone;
-      // Добавим short-name для UX.
-      const entities = this.neo4j
+
+      const includeProfile = access.visible && access.automaticProfiling;
+      const entities = includeProfile && this.neo4j
         ? await this.neo4j.getProfileEntities(row.requester_phone).catch(() => null)
         : null;
-      out.requester_name = entities?.name
-        ? `${entities.name}${entities.family_name ? ' ' + entities.family_name : ''}`.trim()
-        : null;
+      const name = includeProfile ? entities?.name : profileData.name;
+      const familyName = includeProfile ? entities?.family_name : profileData.family_name;
+      out.requester_name = name ? `${name}${familyName ? ' ' + familyName : ''}`.trim() : null;
       return out;
     }));
-    return rows;
+    return rows.filter(Boolean) as ContactRequest[];
   }
 
   async listOutgoing(requesterPhone: string): Promise<ContactRequest[]> {
     const requesterId = await this.idByPhone(requesterPhone);
     if (!requesterId) return [];
     const r = await this.pg.query(
-      `SELECT cr.*, ap.user_id AS target_phone
+      `SELECT cr.*, ap.user_id AS target_phone, ap.profile_data AS target_profile_data
        FROM contact_requests cr
        JOIN ai_profiles_consolidated ap ON ap.id = cr.target_id
        WHERE cr.requester_id = $1
        ORDER BY cr.created_at DESC`,
       [requesterId],
     );
+    if (r.rows.length === 0) return [];
+    const phones = [...new Set<string>(r.rows.map((row: any) => row.target_phone).filter(Boolean))];
+    const accessByPhone = await readProfileAccessBatch(this.pg, requesterPhone, phones)
+      .catch(() => new Map<string, ProfileAccess>());
+
     const rows = await Promise.all(r.rows.map(async (row: any) => {
+      const access = accessByPhone.get(row.target_phone);
+      if (!access?.visible) return null;
+
       const out: any = { ...row };
+      const profileData = out.target_profile_data || {};
+      delete out.target_profile_data;
       if (row.status !== 'approved') delete out.target_phone;
-      const entities = this.neo4j
+
+      const includeProfile = access.visible && access.automaticProfiling;
+      const entities = includeProfile && this.neo4j
         ? await this.neo4j.getProfileEntities(row.target_phone).catch(() => null)
         : null;
-      out.target_name = entities?.name
-        ? `${entities.name}${entities.family_name ? ' ' + entities.family_name : ''}`.trim()
-        : null;
+      const name = includeProfile ? entities?.name : profileData.name;
+      const familyName = includeProfile ? entities?.family_name : profileData.family_name;
+      out.target_name = name ? `${name}${familyName ? ' ' + familyName : ''}`.trim() : null;
       return out;
     }));
-    return rows;
+    return rows.filter(Boolean) as ContactRequest[];
   }
 
   async resolve(

@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
 import { CommonModule } from './common/common.module';
+import { PrivacyModule } from './privacy/privacy.module';
 import { AuthModule } from './auth/auth.module';
 import { ProfileModule } from './profile/profile.module';
 import { BackupModule } from './backup/backup.module';
@@ -62,6 +63,7 @@ import { AlertBotModule } from './alert-bot/alert-bot.module';
     ConfigModule.forRoot({ isGlobal: true }),
     ScheduleModule.forRoot(),
     CommonModule,
+    PrivacyModule,
     AuthModule,
     ProfileModule,
     BackupModule,

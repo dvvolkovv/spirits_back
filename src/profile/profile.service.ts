@@ -3,7 +3,9 @@ import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { IdentityService } from '../identity/identity.service';
 import { OAuthAppleService } from '../auth/oauth-apple.service';
-import { PUBLIC_PROFILE_KEYS, sanitizeAssistantVoices, sanitizeProfilePatch } from './profile-patch';
+import { sanitizeAssistantVoices, sanitizeProfilePatch } from './profile-patch';
+import { buildOtherUserProfile } from './profile-public';
+import { readProfileAccess } from '../privacy/profile-privacy';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -231,39 +233,30 @@ export class ProfileService implements OnModuleInit {
     }
   }
 
-  async getUserProfile(userId: string) {
+  async getUserProfile(requesterId: string, targetId: string) {
+    const access = await readProfileAccess(this.pg, requesterId, targetId).catch(() => null);
+    if (!access?.visible) return null;
+
     const res = await this.pg.query(
       'SELECT * FROM ai_profiles_consolidated WHERE user_id = $1',
-      [userId],
+      [targetId],
     );
     const row = res.rows[0];
     if (!row) return null;
 
-    // Merge Neo4j entities (values/beliefs/desires/intents/interests/skills)
-    // with profile_data from Postgres. Neo4j is the richer source.
-    const neo = this.neo4j ? await this.neo4j.getProfileEntities(userId).catch(() => null) : null;
-    const pd = row.profile_data || {};
-    const merged = {
-      name: neo?.name || pd.name,
-      family_name: neo?.family_name || pd.family_name,
-      values: (neo?.values?.length ? neo.values : pd.values) || [],
-      beliefs: (neo?.beliefs?.length ? neo.beliefs : pd.beliefs) || [],
-      desires: (neo?.desires?.length ? neo.desires : pd.desires) || [],
-      intents: (neo?.intents?.length ? neo.intents : pd.intents) || [],
-      interests: (neo?.interests?.length ? neo.interests : pd.interests) || [],
-      skills: (neo?.skills?.length ? neo.skills : pd.skills) || [],
-    };
+    const includeProfile = access.visible && (requesterId === targetId || access.automaticProfiling);
+    const neo = includeProfile && this.neo4j
+      ? await this.neo4j.getProfileEntities(targetId).catch(() => null)
+      : null;
 
-    const publicPd: Record<string, any> = {};
-    for (const k of PUBLIC_PROFILE_KEYS) {
-      if (pd[k] !== undefined) publicPd[k] = pd[k];
-    }
+    // Настройки могли измениться, пока читались PostgreSQL и Neo4j. Единый
+    // финальный snapshot не даёт собрать ответ из разрывных состояний политики.
+    const finalAccess = await readProfileAccess(this.pg, requesterId, targetId).catch(() => null);
+    if (!finalAccess?.visible) return null;
+    const stillIncludeProfile = finalAccess.visible
+      && (requesterId === targetId || finalAccess.automaticProfiling);
 
-    return {
-      user_id: row.user_id,
-      profile_data: { ...publicPd, ...merged },
-      ...merged,
-    };
+    return buildOtherUserProfile(row, neo, stillIncludeProfile);
   }
 
   async setEmail(userId: string, email: string) {

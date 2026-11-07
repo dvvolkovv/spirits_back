@@ -1,4 +1,17 @@
 import { BusinessProfileService } from './business-profile.service';
+import { automaticProfilingAllowed } from '../privacy/profile-privacy';
+
+jest.mock('../privacy/profile-privacy', () => ({
+  automaticProfilingAllowed: jest.fn(),
+}));
+
+const automaticProfilingAllowedMock = automaticProfilingAllowed as jest.MockedFunction<
+  typeof automaticProfilingAllowed
+>;
+
+beforeEach(() => {
+  automaticProfilingAllowedMock.mockReset().mockResolvedValue(true);
+});
 
 /**
  * category по умолчанию — 'business': большинство существующих тестов в этом

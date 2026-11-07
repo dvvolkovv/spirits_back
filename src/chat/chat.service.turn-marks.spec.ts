@@ -37,6 +37,9 @@ function makeService() {
   const pg = {
     query: jest.fn(async (sql: string) => {
       if (/AS spent/.test(sql)) return { rows: [{ spent: 0 }] };
+      if (/SELECT profile_data FROM ai_profiles_consolidated/.test(sql)) {
+        return { rows: [{ profile_data: {} }] };
+      }
       return { rows: [] };
     }),
   };

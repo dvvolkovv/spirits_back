@@ -1,4 +1,8 @@
 jest.mock('@anthropic-ai/claude-agent-sdk', () => ({ query: jest.fn() }));
+jest.mock('../privacy/profile-privacy', () => ({
+  listSearchCandidateIds: jest.fn(async (_pg: unknown, _requester: string, ids: string[] = []) => new Set(ids)),
+  filterSearchCandidateIds: jest.fn(async (_pg: unknown, _requester: string, ids: string[] = []) => new Set(ids)),
+}));
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { MiscService } from './misc.service';

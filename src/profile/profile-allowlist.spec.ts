@@ -1,5 +1,22 @@
+import { readProfileAccess } from '../privacy/profile-privacy';
 import { ProfileService } from './profile.service';
 import { sanitizeProfilePatch } from './profile-patch';
+
+jest.mock('../privacy/profile-privacy', () => ({
+  readProfileAccess: jest.fn(),
+}));
+
+const readAccess = readProfileAccess as jest.MockedFunction<typeof readProfileAccess>;
+
+beforeEach(() => {
+  readAccess.mockReset().mockResolvedValue({
+    exists: true,
+    visible: true,
+    automaticProfiling: true,
+    approvedContact: false,
+    peer: false,
+  } as any);
+});
 
 /**
  * POST /webhook/profile-update вливал в profile_data любой ключ, а это поле
@@ -22,7 +39,7 @@ describe('sanitizeProfilePatch', () => {
 
   it.each([
     'isadmin', 'tokens', 'email', 'phone', 'onboarded', 'preferred_agent', 'user_id',
-    'avatar_url', 'business', 'contactVisible', 'low_balance_warned', 'near_empty_told', 'smm_sdk_session_id', 'profile', 'что-то-новое',
+    'avatar_url', 'business', 'contactVisible', 'automaticProfiling', 'discoverable', 'low_balance_warned', 'near_empty_told', 'smm_sdk_session_id', 'profile', 'что-то-новое',
   ])('отбрасывает %s', (key) => {
     const { patch, dropped } = sanitizeProfilePatch({ [key]: 'x', name: 'Анна' });
     expect(patch).toEqual({ name: 'Анна' });
@@ -114,7 +131,7 @@ describe('GET /user-profile: о другом человеке — только �
       near_empty_told: { at: 1 }, smm_sdk_session_id: 'секрет', assistant_voices: { 'Роман': 'alena' }, contactVisible: 'private',
     };
     const pg = pgReturning([[{ user_id: 'u-2', profile_data: pd }]]);
-    const r: any = await new ProfileService(pg as any).getUserProfile('u-2');
+    const r: any = await new ProfileService(pg as any).getUserProfile('viewer', 'u-2');
     expect(Object.keys(r.profile_data).sort()).toEqual(
       ['avatar_url', 'beliefs', 'desires', 'family_name', 'intents', 'interests', 'name', 'skills', 'user_nickname', 'values'],
     );

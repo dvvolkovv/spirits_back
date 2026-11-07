@@ -17,6 +17,7 @@ import {
   CompletePayload, CONSOLIDATE_SIDE_LIMIT, HOST_AGENT_ID, HOST_CATEGORY,
   SPECIALIST_ROLES, SPECIALISTS,
 } from './voice-call.types';
+import { automaticProfilingAllowed } from '../privacy/profile-privacy';
 
 /**
  * Ставки OpenAI Realtime за 1M аудио-токенов, по моделям.
@@ -423,37 +424,69 @@ export class VoiceCallService implements OnModuleInit {
     userId: string,
     sinceTs: number,
   ): Promise<{ turns: { callId: string; index: number; text: string; ts: number }[]; cursor: number }> {
+    type Turn = { callId: string; index: number; text: string; ts: number };
+    type PositionedTurn = { turn: Turn; position: number; rank: number; groupSize: number };
+
+    if (!(await automaticProfilingAllowed(this.pg, userId))) {
+      return { turns: [], cursor: sinceTs };
+    }
     const res = await this.pg.query(
       `SELECT id, transcript FROM voice_calls
          WHERE user_id = $1 AND status = 'completed' AND transcript IS NOT NULL
-         ORDER BY started_at DESC LIMIT 30`,
+         ORDER BY started_at ASC, id ASC`,
       [userId],
     );
-    const turns: { callId: string; index: number; text: string; ts: number }[] = [];
+    // Согласие могли отозвать, пока читался транскрипт: не собираем и не отдаём
+    // реплики и оставляем курсор на месте, чтобы после разрешения их можно было получить.
+    if (!(await automaticProfilingAllowed(this.pg, userId))) {
+      return { turns: [], cursor: sinceTs };
+    }
+
+    // LIMIT по звонкам здесь терял старый backlog: за период запрета могло
+    // накопиться больше 30 завершённых разговоров. Курсор относится к репликам,
+    // поэтому сначала получаем весь набор, а страницу режем только после сортировки.
+    const allTurns: Turn[] = [];
     for (const row of res.rows) {
       const arr = Array.isArray(row.transcript) ? row.transcript : [];
       arr.forEach((e: any, i: number) => {
         const ts = typeof e?.ts === 'number' ? e.ts : 0;
-        if (e?.role === 'user' && ts > sinceTs && typeof e.text === 'string' && e.text.trim()) {
-          turns.push({ callId: String(row.id), index: i, text: e.text, ts });
+        if (e?.role === 'user' && typeof e.text === 'string' && e.text.trim()) {
+          allTurns.push({ callId: String(row.id), index: i, text: e.text, ts });
         }
       });
     }
-    turns.sort((a, b) => a.ts - b.ts);
-    // ⚠️ Курсор — по ОТДАННОЙ странице, а не по всему накопленному.
-    //
-    // Раньше он считался по всем подходящим репликам, а возвращались первые PAGE. Если
-    // накопилось больше, устройство получало страницу, двигало курсор за ПОСЛЕДНЮЮ из
-    // всех — и остаток пропадал навсегда, молча.
-    //
-    // Цена (владелец, 11.10.2026): в тот день было два разговора, 207 реплик. Телефон
-    // получил 100, курсор ушёл на конец, 107 реплик не пришли НИКОГДА. Первый разговор
-    // оборвался на середине, второй — где владелец рассказывал про подачу на развод,
-    // запрет на вывоз детей, заявление в опеку и дату заседания — не пришёл вовсе.
-    // Профиль эти факты не терял: он их не получал.
-    const page = turns.slice(0, VoiceCallService.PROFILE_TURNS_PAGE);
-    const cursor = page.length ? page[page.length - 1].ts : sinceTs;
-    return { turns: page, cursor };
+    allTurns.sort((a, b) => {
+      if (a.ts !== b.ts) return a.ts - b.ts;
+      if (a.callId !== b.callId) return a.callId < b.callId ? -1 : 1;
+      return a.index - b.index;
+    });
+
+    // Целый курсор сохраняет прежнюю семантику ts > cursor. Если страница
+    // закончилась внутри группы одинаковых миллисекунд, дробная часть хранит
+    // позицию в стабильном порядке группы; число и форма ответа не меняются.
+    const cursorTimestamp = Math.floor(sinceTs);
+    const compositeCursor = sinceTs > cursorTimestamp;
+    const eligible: PositionedTurn[] = [];
+    for (let start = 0; start < allTurns.length;) {
+      let end = start + 1;
+      while (end < allTurns.length && allTurns[end].ts === allTurns[start].ts) end++;
+      const groupSize = end - start;
+      for (let i = start; i < end; i++) {
+        const turn = allTurns[i];
+        const rank = i - start + 1;
+        const position = groupSize === 1 ? turn.ts : turn.ts + rank / (groupSize + 1);
+        if (turn.ts < cursorTimestamp) continue;
+        if (turn.ts === cursorTimestamp && (!compositeCursor || position <= sinceTs)) continue;
+        eligible.push({ turn, position, rank, groupSize });
+      }
+      start = end;
+    }
+
+    const page = eligible.slice(0, VoiceCallService.PROFILE_TURNS_PAGE);
+    if (page.length === 0) return { turns: [], cursor: sinceTs };
+    const last = page[page.length - 1];
+    const cursor = last.groupSize > 1 && last.rank < last.groupSize ? last.position : last.turn.ts;
+    return { turns: page.map(({ turn }) => turn), cursor };
   }
 
   async complete(callId: string, payload: CompletePayload): Promise<void> {

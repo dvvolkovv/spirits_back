@@ -5,6 +5,7 @@ import {
 import * as fs from 'fs';
 import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
+import { canReceiveNewProposal } from '../privacy/profile-privacy';
 import {
   ChatRequestRow, PeerConversationRow, PeerMessageRow,
   CreateChatRequestDto, SendMessageDto, ReportUserDto, LIMITS,
@@ -52,6 +53,10 @@ export class PeerService implements OnModuleInit {
     if (!intro) throw new BadRequestException('intro message required');
     if (intro.length > LIMITS.INTRO_MAX) {
       throw new BadRequestException(`intro message too long (max ${LIMITS.INTRO_MAX})`);
+    }
+
+    if (!(await canReceiveNewProposal(this.pg, toUserId))) {
+      throw new NotFoundException({ code: 'PROFILE_NOT_AVAILABLE' });
     }
 
     // Target must exist

@@ -20,6 +20,12 @@ import {
   selectSearchProfiles,
 } from './search-cards';
 import { IMAGE_TOKENS_HD, imageTokens } from './image-pricing';
+import {
+  automaticProfilingAllowed,
+  filterSearchCandidateIds,
+  listSearchCandidateIds,
+  readProfileAccess,
+} from '../privacy/profile-privacy';
 
 const ASSETS_BUCKET = 'linkeon-assets';
 
@@ -73,6 +79,12 @@ const STREAM_PIECE_GAP_MS = 10;
  */
 function insufficientTokens(): Error {
   return Object.assign(new Error('Недостаточно токенов'), { code: 'INSUFFICIENT_TOKENS' });
+}
+
+class CompatibilityUnavailableError extends Error {
+  constructor(readonly code: 'PROFILE_NOT_AVAILABLE' | 'PROFILE_DATA_UNAVAILABLE') {
+    super(code);
+  }
 }
 
 @Injectable()
@@ -146,15 +158,26 @@ export class MiscService {
     }
     for (const m of matches) m.userId = idMap.get(m.phone) ?? null;
 
+    const beforeSelection = await filterSearchCandidateIds(
+      this.pg,
+      userId,
+      matches.map((m) => m.phone),
+    ).catch((e) => {
+      this.logger.error(`search privacy recheck before selection error: ${e.message}`);
+      return new Set<string>();
+    });
+    const allowedMatches = matches.filter((m) => beforeSelection.has(m.phone));
+    if (!allowedMatches.length) return noResults();
+
     // Два вызова, а не один: кого показать — отдельно, проза — по уже собранным
     // карточкам. Почему так — в шапке search-cards.ts.
     const userMessage = `Запрос поиска: "${query}"`;
     let selected: SelectedProfile[];
     try {
-      const answer = await this.completeLLM(buildSelectionPrompt(matches, userLanguage), userMessage);
+      const answer = await this.completeLLM(buildSelectionPrompt(allowedMatches, userLanguage), userMessage);
       const selection = parseSearchSelection(answer);
       if (!selection) throw new Error(`selection is not a JSON array (${answer.length} chars)`);
-      selected = selectSearchProfiles(matches, selection);
+      selected = selectSearchProfiles(allowedMatches, selection);
     } catch (e: any) {
       this.logger.error(`search selection error: ${e.message}`);
       res.write(JSON.stringify({ type: 'item', content: 'Ошибка при обработке запроса.' }) + '\n');
@@ -163,11 +186,42 @@ export class MiscService {
     }
     if (!selected.length) return noResults();
 
+    const beforeProse = await filterSearchCandidateIds(
+      this.pg,
+      userId,
+      selected.map((s) => (s.found as any).phone),
+    ).catch((e) => {
+      this.logger.error(`search privacy recheck before prose error: ${e.message}`);
+      return new Set<string>();
+    });
+    selected = selected.filter((s) => beforeProse.has((s.found as any).phone));
+    if (!selected.length) return noResults();
+
+    const proseSelectionSize = selected.length;
+    let prose = '';
     try {
-      await this.pipeLLM(buildProsePrompt(selected, userLanguage), userMessage, res);
+      prose = await this.completeLLM(buildProsePrompt(selected, userLanguage), userMessage);
     } catch (e: any) {
-      // Карточки уже собраны — отдаём их и без комментария.
+      // Проза необязательна: после финальной перепроверки отдаём карточки и без неё.
       this.logger.error(`search prose error: ${e.message}`);
+    }
+    const beforeCards = await filterSearchCandidateIds(
+      this.pg,
+      userId,
+      selected.map((s) => (s.found as any).phone),
+    ).catch((e) => {
+      this.logger.error(`search privacy recheck before cards error: ${e.message}`);
+      return new Set<string>();
+    });
+    selected = selected.filter((s) => beforeCards.has((s.found as any).phone));
+    if (!selected.length) return noResults();
+    if (selected.length !== proseSelectionSize) {
+      // Пока модель писала, часть доступов отозвали. Старая проза могла назвать
+      // этих людей, поэтому безопаснее отдать оставшиеся карточки без комментария.
+      prose = '';
+    }
+    if (prose) {
+      res.write(JSON.stringify({ type: 'item', content: prose }) + '\n');
     }
     const cards = selected.map((s) => s.card);
     await this.writePaced(res, `\n\nsearch_result:${JSON.stringify(cards)}`);
@@ -191,6 +245,17 @@ export class MiscService {
   }
 
   async analyzeCompatibility(userId: string, targetUsers: string[], res: Response): Promise<void> {
+    let resolvedPhones: string[];
+    try {
+      resolvedPhones = await this.resolveCompatibilityPhones(targetUsers);
+      await this.assertCompatibilityAllowed(userId, resolvedPhones);
+    } catch (error) {
+      const code = error instanceof CompatibilityUnavailableError ? error.code : 'PROFILE_NOT_AVAILABLE';
+      const status = code === 'PROFILE_DATA_UNAVAILABLE' ? 422 : 404;
+      res.status(status).json({ code });
+      return;
+    }
+
     res.status(200);
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Transfer-Encoding', 'chunked');
@@ -206,21 +271,6 @@ export class MiscService {
       return;
     }
 
-    // targetUsers может содержать userId (integer as string/number) или phone (string).
-    // Ресолвим к phone для Cypher-запросов.
-    const resolvedPhones: string[] = [];
-    for (const t of targetUsers) {
-      const raw = String(t).trim();
-      if (/^\d+$/.test(raw) && raw.length < 10) {
-        // Короткая цифра — считаем surrogate userId (phone всегда >= 10 цифр).
-        const r = await this.pg.query('SELECT user_id FROM ai_profiles_consolidated WHERE id = $1', [Number(raw)]);
-        const ph = r.rows[0]?.user_id;
-        if (ph) resolvedPhones.push(ph);
-      } else {
-        resolvedPhones.push(raw);
-      }
-    }
-
     const blocks: string[] = [];
     for (const targetPhone of resolvedPhones) {
       if (targetPhone === userId) continue;
@@ -230,6 +280,14 @@ export class MiscService {
     }
 
     if (!blocks.length) {
+      res.write(JSON.stringify({ type: 'item', content: searchMsg(userLanguage).noData }) + '\n');
+      res.end();
+      return;
+    }
+
+    try {
+      await this.assertCompatibilityAllowed(userId, resolvedPhones);
+    } catch {
       res.write(JSON.stringify({ type: 'item', content: searchMsg(userLanguage).noData }) + '\n');
       res.end();
       return;
@@ -254,6 +312,40 @@ ${blocks.join('\n\n---\n\n')}
 ${LanguageService.buildDirective(userLanguage)}`;
 
     await this.streamLLM(systemPrompt, 'Проанализируй совместимость этих людей', res);
+  }
+
+  private async resolveCompatibilityPhones(targetUsers: string[]): Promise<string[]> {
+    const phones: string[] = [];
+    for (const target of targetUsers) {
+      const raw = String(target).trim();
+      if (/^\d+$/.test(raw) && raw.length < 10) {
+        // Короткая цифра — surrogate userId (phone всегда >= 10 цифр).
+        const result = await this.pg.query(
+          'SELECT user_id FROM ai_profiles_consolidated WHERE id = $1',
+          [Number(raw)],
+        );
+        if (!result.rows[0]?.user_id) {
+          throw new CompatibilityUnavailableError('PROFILE_NOT_AVAILABLE');
+        }
+        phones.push(result.rows[0].user_id);
+      } else {
+        phones.push(raw);
+      }
+    }
+    return phones;
+  }
+
+  private async assertCompatibilityAllowed(userId: string, phones: string[]): Promise<void> {
+    for (const targetPhone of phones) {
+      if (targetPhone === userId) continue;
+      const access = await readProfileAccess(this.pg, userId, targetPhone);
+      if (!access.exists || !access.visible) {
+        throw new CompatibilityUnavailableError('PROFILE_NOT_AVAILABLE');
+      }
+      if (!access.automaticProfiling || !(await automaticProfilingAllowed(this.pg, userId))) {
+        throw new CompatibilityUnavailableError('PROFILE_DATA_UNAVAILABLE');
+      }
+    }
   }
 
   /** Считает per-node cosine-matching между двумя профилями по всем 6 категориям. */
@@ -912,6 +1004,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const session = (this.neo4j as any).getSession();
     if (!session) return [];
     try {
+      const candidatePhones = await listSearchCandidateIds(this.pg, excludePhone);
+      if (candidatePhones.size === 0) return [];
+
       const queryEmbedding = await this.getGlossQueryEmbedding(query);
       if (!queryEmbedding) {
         this.logger.warn('No query embedding — skipping semantic search');
@@ -926,39 +1021,57 @@ ${LanguageService.buildDirective(userLanguage)}`;
         WITH $embedding AS emb
         CALL {
           WITH emb
-          CALL db.index.vector.queryNodes('value_gloss_vec_idx', 20, emb) YIELD node, score
-          MATCH (p:Profile)-[:HAS_VALUE]->(node)
-          WHERE p.phone <> $exclude
+          MATCH (p:Profile)-[:HAS_VALUE]->(node:Value)
+          WHERE p.phone IN $candidatePhones AND node.embedding IS NOT NULL
+            AND size(node.embedding) = 1536
+          WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score
+          ORDER BY score DESC
+          LIMIT 20
           RETURN p, node, score, 'Value' AS category, 3.0 AS weight
           UNION
           WITH emb
-          CALL db.index.vector.queryNodes('desire_gloss_vec_idx', 20, emb) YIELD node, score
-          MATCH (p:Profile)-[:HAS_DESIRE]->(node)
-          WHERE p.phone <> $exclude
+          MATCH (p:Profile)-[:HAS_DESIRE]->(node:Desire)
+          WHERE p.phone IN $candidatePhones AND node.embedding IS NOT NULL
+            AND size(node.embedding) = 1536
+          WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score
+          ORDER BY score DESC
+          LIMIT 20
           RETURN p, node, score, 'Desire' AS category, 2.5 AS weight
           UNION
           WITH emb
-          CALL db.index.vector.queryNodes('interest_gloss_vec_idx', 20, emb) YIELD node, score
-          MATCH (p:Profile)-[:HAS_INTEREST]->(node)
-          WHERE p.phone <> $exclude
+          MATCH (p:Profile)-[:HAS_INTEREST]->(node:Interest)
+          WHERE p.phone IN $candidatePhones AND node.embedding IS NOT NULL
+            AND size(node.embedding) = 1536
+          WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score
+          ORDER BY score DESC
+          LIMIT 20
           RETURN p, node, score, 'Interest' AS category, 2.0 AS weight
           UNION
           WITH emb
-          CALL db.index.vector.queryNodes('intent_gloss_vec_idx', 20, emb) YIELD node, score
-          MATCH (p:Profile)-[:HAS_INTENT]->(node)
-          WHERE p.phone <> $exclude
+          MATCH (p:Profile)-[:HAS_INTENT]->(node:Intent)
+          WHERE p.phone IN $candidatePhones AND node.embedding IS NOT NULL
+            AND size(node.embedding) = 1536
+          WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score
+          ORDER BY score DESC
+          LIMIT 20
           RETURN p, node, score, 'Intent' AS category, 2.0 AS weight
           UNION
           WITH emb
-          CALL db.index.vector.queryNodes('belief_gloss_vec_idx', 20, emb) YIELD node, score
-          MATCH (p:Profile)-[:HAS_BELIEF]->(node)
-          WHERE p.phone <> $exclude
+          MATCH (p:Profile)-[:HAS_BELIEF]->(node:Belief)
+          WHERE p.phone IN $candidatePhones AND node.embedding IS NOT NULL
+            AND size(node.embedding) = 1536
+          WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score
+          ORDER BY score DESC
+          LIMIT 20
           RETURN p, node, score, 'Belief' AS category, 1.2 AS weight
           UNION
           WITH emb
-          CALL db.index.vector.queryNodes('skill_gloss_vec_idx', 20, emb) YIELD node, score
-          MATCH (p:Profile)-[:HAS_SKILL]->(node)
-          WHERE p.phone <> $exclude
+          MATCH (p:Profile)-[:HAS_SKILL]->(node:Skill)
+          WHERE p.phone IN $candidatePhones AND node.embedding IS NOT NULL
+            AND size(node.embedding) = 1536
+          WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score
+          ORDER BY score DESC
+          LIMIT 20
           RETURN p, node, score, 'Skill' AS category, 1.0 AS weight
         }
         WITH p, collect({category: category, name: node.name, gloss: node.gloss, score: score, weight: weight}) AS matches
@@ -969,7 +1082,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
         RETURN p.phone AS phone, COALESCE(p.name, '') AS name, matches, totalScore
       `;
 
-      const result = await session.run(cypher, { embedding: queryEmbedding, exclude: excludePhone });
+      const result = await session.run(cypher, {
+        embedding: queryEmbedding,
+        exclude: excludePhone,
+        candidatePhones: Array.from(candidatePhones),
+      });
       return result.records.map((r: any) => {
         const matches = r.get('matches').map((m: any) => ({
           category: m.category,
