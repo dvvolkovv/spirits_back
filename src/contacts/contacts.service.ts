@@ -1,7 +1,7 @@
-import { Injectable, Logger, Optional } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
-import { readProfileAccess, readProfileAccessBatch, type ProfileAccess } from '../privacy/profile-privacy';
+import { canReceiveNewProposal, readProfileAccess, readProfileAccessBatch, type ProfileAccess } from '../privacy/profile-privacy';
 
 const CONTACT_ENTITY_KEYS = [
   'values', 'beliefs', 'desires', 'intents', 'interests', 'skills',
@@ -127,7 +127,9 @@ export class ContactsService {
     if (requesterId === targetId) throw new Error('Cannot request own contact');
 
     const targetPhone = await this.phoneById(targetId);
-    if (!targetPhone) throw new Error('Target profile not found');
+    if (!targetPhone || !(await canReceiveNewProposal(this.pg, targetPhone))) {
+      throw new NotFoundException({ code: 'PROFILE_NOT_AVAILABLE' });
+    }
 
     const visibility = await this.contactVisibility(targetPhone);
     if (visibility === 'private') throw new Error('Пользователь не принимает запросы на контакт');

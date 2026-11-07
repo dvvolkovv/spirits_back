@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Param, Body, UseGuards, Res, BadRequestException } from '@nestjs/common';
+import { Controller, Get, Post, Param, Body, UseGuards, Res, BadRequestException, HttpException } from '@nestjs/common';
 import { Response } from 'express';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
@@ -47,6 +47,7 @@ export class ContactsController {
       const r = await this.contacts.createRequest(user.userId, Number(body.userId), body.message?.slice(0, 500) ?? null);
       return res.status(200).json(r);
     } catch (e: any) {
+      if (e instanceof HttpException) throw e;
       return res.status(400).json({ error: e.message });
     }
   }
