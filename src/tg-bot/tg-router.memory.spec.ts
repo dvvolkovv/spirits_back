@@ -22,10 +22,12 @@ function makeRouter(distinctWriters: number) {
   const claudeCli = {
     textWithCost: jest.fn(async (_prompt: string, _opts: any) => ({ text: 'ответ', costUsd: 0.01 })),
   };
+  const tasks = { extractFromTurn: jest.fn(async () => {}) };
   const svc = new TgRouterService(pg as any, null as any, null as any, null as any, claudeCli as any, neo4j as any);
+  (svc as any).tasks = tasks;
   jest.spyOn(svc as any, 'resolveSystemPrompt').mockResolvedValue({ systemPrompt: 'роль' });
   jest.spyOn(svc as any, 'loadHistory').mockResolvedValue([{ role: 'user', content: 'привет' }]);
-  return { svc, neo4j, claudeCli };
+  return { svc, neo4j, claudeCli, tasks };
 }
 
 const cfg: any = { id: 'cfg-1', tg_chat_id: -5231294306, owner_user_id: '79030169187', preset_agent_id: '12' };
@@ -75,6 +77,16 @@ describe('TgRouterService.consolidateAfterReply', () => {
 
     expect(neo4j.consolidateFromChat).toHaveBeenCalledWith(
       '79030169187', '12', 'у меня дочь учится в Китае', 'понял, запомнил',
+    );
+  });
+
+  it('в сольном чате извлекает операционные задачи владельца', async () => {
+    const { svc, tasks } = makeRouter(1);
+
+    await svc.consolidateAfterReply(cfg, 'нужно выбрать школу дочери', 'составим список вариантов');
+
+    expect(tasks.extractFromTurn).toHaveBeenCalledWith(
+      '79030169187', '12', 'нужно выбрать школу дочери', 'составим список вариантов',
     );
   });
 
