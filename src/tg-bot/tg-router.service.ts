@@ -16,6 +16,7 @@ import { FACT_CHECK_RULE } from '../chat/fact-check-rule';
 import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
 import { UserLlmProviderService } from '../common/services/user-llm-provider.service';
 import { cliProviderOption, resolveAnswerProvider } from '../chat/answer-provider';
+import { TasksService } from '../tasks/tasks.service';
 
 /**
  * Дефолтный ассистент для лички, когда preferred_agent пуст или указывает на
@@ -103,8 +104,9 @@ export class TgRouterService {
     @Optional() private readonly neo4j?: Neo4jService,
     // Модель ответов владельца: личный выбор или общий рубильник (админка,
     // spec 2026-10-30-llm-provider-switch, 2026-10-31-global-llm-switch).
-    // Последним и @Optional: спеки собирают роутер позиционно.
+    // Последними и @Optional: спеки собирают роутер позиционно.
     @Optional() private readonly llmProvider?: UserLlmProviderService,
+    @Optional() private readonly tasks?: TasksService,
   ) {}
 
   /**
@@ -202,19 +204,34 @@ export class TgRouterService {
   }
 
   /**
-   * Обратная сторона: записываем разговор в тот же граф. Без этого бот не
-   * учится вообще — рассказанное ему в Telegram нигде не оседает и в вебке не
-   * видно. Только в сольном чате: в общей группе в профиль владельца попали бы
-   * чужие слова.
+   * Обратная сторона: записываем разговор в тот же граф и извлекаем задачи.
+   * Без этого бот не учится — рассказанное ему в Telegram не попадает ни в
+   * профиль, ни в раздел «Задачи» веб-кабинета. Только в сольном чате: в общей
+   * группе в память владельца попали бы чужие слова. Сбой одного хранилища не
+   * отменяет запись в другое и не роняет уже отправленный ответ.
    */
   async consolidateAfterReply(cfg: TgBotConfigRow, userMessage: string, assistantResponse: string): Promise<void> {
-    if (!this.neo4j || !userMessage || !assistantResponse) return;
+    if ((!this.neo4j && !this.tasks) || !userMessage || !assistantResponse) return;
     try {
       if (!(await this.isSoloChat(cfg))) return;
-      const agentId = cfg.custom_agent_id ?? cfg.preset_agent_id ?? 'tg-bot';
-      await this.neo4j.consolidateFromChat(cfg.owner_user_id, String(agentId), userMessage, assistantResponse);
     } catch (e: any) {
-      this.logger.warn(`neo4j consolidate for tg bot ${cfg.id} failed: ${e?.message}`);
+      this.logger.warn(`memory gate for tg bot ${cfg.id} failed: ${e?.message}`);
+      return;
+    }
+    const agentId = cfg.custom_agent_id ?? cfg.preset_agent_id ?? 'tg-bot';
+    if (this.neo4j) {
+      try {
+        await this.neo4j.consolidateFromChat(cfg.owner_user_id, String(agentId), userMessage, assistantResponse);
+      } catch (e: any) {
+        this.logger.warn(`neo4j consolidate for tg bot ${cfg.id} failed: ${e?.message}`);
+      }
+    }
+    if (this.tasks) {
+      try {
+        await this.tasks.extractFromTurn(cfg.owner_user_id, String(agentId), userMessage, assistantResponse);
+      } catch (e: any) {
+        this.logger.warn(`tasks extract for tg bot ${cfg.id} failed: ${e?.message}`);
+      }
     }
   }
 
