@@ -155,7 +155,7 @@ describe('searchProfiles privacy structure', () => {
   });
 
   it('перепроверяет доступ перед выбором, прозой и карточками', () => {
-    const order = [
+    const order: Array<[string, number]> = [
       ['beforeSelection', searchMateSource.indexOf('const beforeSelection')],
       ['selection prompt', searchMateSource.indexOf('buildSelectionPrompt(allowedMatches, userLanguage)')],
       ['beforeProse', searchMateSource.indexOf('const beforeProse')],
@@ -163,9 +163,9 @@ describe('searchProfiles privacy structure', () => {
       ['beforeCards', searchMateSource.indexOf('const beforeCards')],
       ['cards', searchMateSource.indexOf('const cards = selected.map')],
     ];
-    for (const [label, at] of order) expect(at, label).toBeGreaterThanOrEqual(0);
+    for (const [, at] of order) expect(at).toBeGreaterThanOrEqual(0);
     for (let i = 1; i < order.length; i++) {
-      expect(order[i][1], `${order[i - 1][0]} < ${order[i][0]}`).toBeGreaterThan(order[i - 1][1]);
+      expect(order[i][1]).toBeGreaterThan(order[i - 1][1]);
     }
     expect(searchMateSource).toContain('selectSearchProfiles(allowedMatches, selection)');
   });
