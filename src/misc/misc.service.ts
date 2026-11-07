@@ -20,6 +20,10 @@ import {
   selectSearchProfiles,
 } from './search-cards';
 import { IMAGE_TOKENS_HD, imageTokens } from './image-pricing';
+import {
+  filterSearchCandidateIds,
+  listSearchCandidateIds,
+} from '../privacy/profile-privacy';
 
 const ASSETS_BUCKET = 'linkeon-assets';
 
@@ -146,15 +150,26 @@ export class MiscService {
     }
     for (const m of matches) m.userId = idMap.get(m.phone) ?? null;
 
+    const beforeSelection = await filterSearchCandidateIds(
+      this.pg,
+      userId,
+      matches.map((m) => m.phone),
+    ).catch((e) => {
+      this.logger.error(`search privacy recheck before selection error: ${e.message}`);
+      return new Set<string>();
+    });
+    const allowedMatches = matches.filter((m) => beforeSelection.has(m.phone));
+    if (!allowedMatches.length) return noResults();
+
     // Два вызова, а не один: кого показать — отдельно, проза — по уже собранным
     // карточкам. Почему так — в шапке search-cards.ts.
     const userMessage = `Запрос поиска: "${query}"`;
     let selected: SelectedProfile[];
     try {
-      const answer = await this.completeLLM(buildSelectionPrompt(matches, userLanguage), userMessage);
+      const answer = await this.completeLLM(buildSelectionPrompt(allowedMatches, userLanguage), userMessage);
       const selection = parseSearchSelection(answer);
       if (!selection) throw new Error(`selection is not a JSON array (${answer.length} chars)`);
-      selected = selectSearchProfiles(matches, selection);
+      selected = selectSearchProfiles(allowedMatches, selection);
     } catch (e: any) {
       this.logger.error(`search selection error: ${e.message}`);
       res.write(JSON.stringify({ type: 'item', content: 'Ошибка при обработке запроса.' }) + '\n');
@@ -163,12 +178,33 @@ export class MiscService {
     }
     if (!selected.length) return noResults();
 
+    const beforeProse = await filterSearchCandidateIds(
+      this.pg,
+      userId,
+      selected.map((s) => (s.found as any).phone),
+    ).catch((e) => {
+      this.logger.error(`search privacy recheck before prose error: ${e.message}`);
+      return new Set<string>();
+    });
+    selected = selected.filter((s) => beforeProse.has((s.found as any).phone));
+    if (!selected.length) return noResults();
+
     try {
       await this.pipeLLM(buildProsePrompt(selected, userLanguage), userMessage, res);
     } catch (e: any) {
       // Карточки уже собраны — отдаём их и без комментария.
       this.logger.error(`search prose error: ${e.message}`);
     }
+    const beforeCards = await filterSearchCandidateIds(
+      this.pg,
+      userId,
+      selected.map((s) => (s.found as any).phone),
+    ).catch((e) => {
+      this.logger.error(`search privacy recheck before cards error: ${e.message}`);
+      return new Set<string>();
+    });
+    selected = selected.filter((s) => beforeCards.has((s.found as any).phone));
+    if (!selected.length) return noResults();
     const cards = selected.map((s) => s.card);
     await this.writePaced(res, `\n\nsearch_result:${JSON.stringify(cards)}`);
     res.end();
@@ -912,6 +948,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const session = (this.neo4j as any).getSession();
     if (!session) return [];
     try {
+      const candidatePhones = await listSearchCandidateIds(this.pg, excludePhone);
+      if (candidatePhones.size === 0) return [];
+
       const queryEmbedding = await this.getGlossQueryEmbedding(query);
       if (!queryEmbedding) {
         this.logger.warn('No query embedding — skipping semantic search');
@@ -926,39 +965,51 @@ ${LanguageService.buildDirective(userLanguage)}`;
         WITH $embedding AS emb
         CALL {
           WITH emb
-          CALL db.index.vector.queryNodes('value_gloss_vec_idx', 20, emb) YIELD node, score
-          MATCH (p:Profile)-[:HAS_VALUE]->(node)
-          WHERE p.phone <> $exclude
+          MATCH (p:Profile)-[:HAS_VALUE]->(node:Value)
+          WHERE p.phone IN $candidatePhones AND node.embedding IS NOT NULL
+          WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score
+          ORDER BY score DESC
+          LIMIT 20
           RETURN p, node, score, 'Value' AS category, 3.0 AS weight
           UNION
           WITH emb
-          CALL db.index.vector.queryNodes('desire_gloss_vec_idx', 20, emb) YIELD node, score
-          MATCH (p:Profile)-[:HAS_DESIRE]->(node)
-          WHERE p.phone <> $exclude
+          MATCH (p:Profile)-[:HAS_DESIRE]->(node:Desire)
+          WHERE p.phone IN $candidatePhones AND node.embedding IS NOT NULL
+          WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score
+          ORDER BY score DESC
+          LIMIT 20
           RETURN p, node, score, 'Desire' AS category, 2.5 AS weight
           UNION
           WITH emb
-          CALL db.index.vector.queryNodes('interest_gloss_vec_idx', 20, emb) YIELD node, score
-          MATCH (p:Profile)-[:HAS_INTEREST]->(node)
-          WHERE p.phone <> $exclude
+          MATCH (p:Profile)-[:HAS_INTEREST]->(node:Interest)
+          WHERE p.phone IN $candidatePhones AND node.embedding IS NOT NULL
+          WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score
+          ORDER BY score DESC
+          LIMIT 20
           RETURN p, node, score, 'Interest' AS category, 2.0 AS weight
           UNION
           WITH emb
-          CALL db.index.vector.queryNodes('intent_gloss_vec_idx', 20, emb) YIELD node, score
-          MATCH (p:Profile)-[:HAS_INTENT]->(node)
-          WHERE p.phone <> $exclude
+          MATCH (p:Profile)-[:HAS_INTENT]->(node:Intent)
+          WHERE p.phone IN $candidatePhones AND node.embedding IS NOT NULL
+          WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score
+          ORDER BY score DESC
+          LIMIT 20
           RETURN p, node, score, 'Intent' AS category, 2.0 AS weight
           UNION
           WITH emb
-          CALL db.index.vector.queryNodes('belief_gloss_vec_idx', 20, emb) YIELD node, score
-          MATCH (p:Profile)-[:HAS_BELIEF]->(node)
-          WHERE p.phone <> $exclude
+          MATCH (p:Profile)-[:HAS_BELIEF]->(node:Belief)
+          WHERE p.phone IN $candidatePhones AND node.embedding IS NOT NULL
+          WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score
+          ORDER BY score DESC
+          LIMIT 20
           RETURN p, node, score, 'Belief' AS category, 1.2 AS weight
           UNION
           WITH emb
-          CALL db.index.vector.queryNodes('skill_gloss_vec_idx', 20, emb) YIELD node, score
-          MATCH (p:Profile)-[:HAS_SKILL]->(node)
-          WHERE p.phone <> $exclude
+          MATCH (p:Profile)-[:HAS_SKILL]->(node:Skill)
+          WHERE p.phone IN $candidatePhones AND node.embedding IS NOT NULL
+          WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score
+          ORDER BY score DESC
+          LIMIT 20
           RETURN p, node, score, 'Skill' AS category, 1.0 AS weight
         }
         WITH p, collect({category: category, name: node.name, gloss: node.gloss, score: score, weight: weight}) AS matches
@@ -969,7 +1020,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
         RETURN p.phone AS phone, COALESCE(p.name, '') AS name, matches, totalScore
       `;
 
-      const result = await session.run(cypher, { embedding: queryEmbedding, exclude: excludePhone });
+      const result = await session.run(cypher, {
+        embedding: queryEmbedding,
+        exclude: excludePhone,
+        candidatePhones: Array.from(candidatePhones),
+      });
       return result.records.map((r: any) => {
         const matches = r.get('matches').map((m: any) => ({
           category: m.category,
