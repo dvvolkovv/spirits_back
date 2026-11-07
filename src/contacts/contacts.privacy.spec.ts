@@ -1,13 +1,15 @@
-import { BadRequestException } from '@nestjs/common';
-import { readProfileAccess } from '../privacy/profile-privacy';
+import { BadRequestException, NotFoundException } from '@nestjs/common';
+import { canReceiveNewProposal, readProfileAccess } from '../privacy/profile-privacy';
 import { ContactsController } from './contacts.controller';
 import { ContactsService } from './contacts.service';
 
 jest.mock('../privacy/profile-privacy', () => ({
+  canReceiveNewProposal: jest.fn(),
   readProfileAccess: jest.fn(),
   readProfileAccessBatch: jest.fn(),
 }));
 
+const canReceive = canReceiveNewProposal as jest.MockedFunction<typeof canReceiveNewProposal>;
 const readAccess = readProfileAccess as jest.MockedFunction<typeof readProfileAccess>;
 const readBatch = (jest.requireMock('../privacy/profile-privacy') as any).readProfileAccessBatch as jest.Mock;
 
@@ -48,6 +50,7 @@ function neoEntities() {
 function makeService(options: {
   requesterId?: number | null;
   self?: boolean;
+  targetMissing?: boolean;
   visibility?: string;
   visibilitySequence?: string[];
 } = {}) {
@@ -66,7 +69,10 @@ function makeService(options: {
   const pg = {
     query: jest.fn(async (sql: string) => {
       if (sql.includes('SELECT user_id FROM ai_profiles_consolidated WHERE id')) {
-        return { rows: [{ user_id: targetPhone }], rowCount: 1 };
+        return {
+          rows: options.targetMissing ? [] : [{ user_id: targetPhone }],
+          rowCount: options.targetMissing ? 0 : 1,
+        };
       }
       if (sql.includes('SELECT id FROM ai_profiles_consolidated WHERE user_id')) {
         const requesterId = options.requesterId === undefined ? 11 : options.requesterId;
@@ -351,6 +357,70 @@ describe.each(['incoming', 'outgoing'] as ListDirection[])('ContactsService %s l
     expect(result[0][phoneKey]).toBeUndefined();
     expect(result[0][nameKey]).toBe('Neo counterpart Neo family');
     expect(readBatch).toHaveBeenCalledTimes(1);
+  });
+});
+
+async function expectProfileNotAvailable(promise: Promise<unknown>): Promise<void> {
+  const error = await promise.then(
+    () => { throw new Error('Expected PROFILE_NOT_AVAILABLE'); },
+    (reason) => reason,
+  );
+  expect(error).toBeInstanceOf(NotFoundException);
+  const httpError = error as NotFoundException;
+  expect(httpError.getStatus()).toBe(404);
+  expect(httpError.getResponse()).toEqual({ code: 'PROFILE_NOT_AVAILABLE' });
+}
+
+describe('ContactsService.createRequest privacy', () => {
+  beforeEach(() => {
+    canReceive.mockReset().mockResolvedValue(true);
+  });
+
+  it('rejects a hidden public target before contactVisible and creates no approved row', async () => {
+    canReceive.mockResolvedValue(false);
+    const { service, pg, requesterPhone } = makeService({ visibility: 'public' });
+
+    await expectProfileNotAvailable(service.createRequest(requesterPhone, 22, 'hello'));
+
+    expect(canReceive).toHaveBeenCalledWith(pg, 'target-phone');
+    const queries = pg.query.mock.calls.map((call) => call[0]);
+    expect(queries.some((sql) => sql.includes("profile_data->>'contactVisible'"))).toBe(false);
+    expect(queries.some((sql) => sql.includes('INSERT INTO contact_requests'))).toBe(false);
+    expect(pg.query).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns the same 404 for a missing target before contactVisible or insertion', async () => {
+    canReceive.mockResolvedValue(false);
+    const { service, pg, requesterPhone } = makeService({ targetMissing: true, visibility: 'public' });
+
+    await expectProfileNotAvailable(service.createRequest(requesterPhone, 22, 'hello'));
+
+    const queries = pg.query.mock.calls.map((call) => call[0]);
+    expect(queries.some((sql) => sql.includes("profile_data->>'contactVisible'"))).toBe(false);
+    expect(queries.some((sql) => sql.includes('INSERT INTO contact_requests'))).toBe(false);
+  });
+});
+
+describe('contact request controller privacy responses', () => {
+  it('preserves the service HttpException instead of converting it to 400', async () => {
+    const error = new NotFoundException({ code: 'PROFILE_NOT_AVAILABLE' });
+    const contacts = { createRequest: jest.fn().mockRejectedValue(error) };
+    const controller = new ContactsController(contacts as any);
+    const res = mockRes();
+
+    await expect(controller.createRequest({ userId: 'viewer-phone' }, { userId: 22 }, res)).rejects.toBe(error);
+    expect(res.statusCode).toBe(0);
+  });
+
+  it('retains the legacy 400 response for non-HTTP errors', async () => {
+    const contacts = { createRequest: jest.fn().mockRejectedValue(new Error('legacy failure')) };
+    const controller = new ContactsController(contacts as any);
+    const res = mockRes();
+
+    await controller.createRequest({ userId: 'viewer-phone' }, { userId: 22 }, res);
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body).toEqual({ error: 'legacy failure' });
   });
 });
 
