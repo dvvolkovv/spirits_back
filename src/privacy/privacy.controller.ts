@@ -3,6 +3,7 @@ import {
   Body,
   Controller,
   Get,
+  HttpCode,
   NotFoundException,
   Post,
   ServiceUnavailableException,
@@ -33,6 +34,7 @@ export class PrivacyController {
   }
 
   @Post()
+  @HttpCode(200)
   async updateSettings(
     @CurrentUser() user: { userId: string },
     @Body() body: unknown,
