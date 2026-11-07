@@ -61,7 +61,15 @@ beforeEach(() => jest.clearAllMocks());
 const SID = relaySessionKey('u-test', '12', 'ru');
 
 function streamHarness(events: any[], sessionFiles: (url: string) => any[] = () => []) {
-  const pg = { query: jest.fn(async (sql: string) => (/AS spent/.test(sql) ? { rows: [{ spent: 0 }] } : { rows: [] })) };
+  const pg = {
+    query: jest.fn(async (sql: string) => {
+      if (/AS spent/.test(sql)) return { rows: [{ spent: 0 }] };
+      if (/SELECT profile_data FROM ai_profiles_consolidated/.test(sql)) {
+        return { rows: [{ profile_data: {} }] };
+      }
+      return { rows: [] };
+    }),
+  };
   const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
   const svc = new ChatService(pg as any, null as any, null as any, null as any, language as any, undefined, undefined, undefined, undefined);
   const post = axios.post as jest.Mock;
@@ -151,7 +159,15 @@ describe('streamUniversalAgent: поля инструментов Linkeon', () =
 describe('agentReply: поля инструментов Linkeon — только по явному включению', () => {
   const AGENT = { id: 12, name: 'Роман', display_name: 'Роман', description: '', system_prompt: '', category: 'business' };
   function replyHarness() {
-    const pg = { query: jest.fn(async (sql: string) => (/FROM agents WHERE id/.test(sql) ? { rows: [AGENT] } : { rows: [] })) };
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        if (/FROM agents WHERE id/.test(sql)) return { rows: [AGENT] };
+        if (/SELECT profile_data FROM ai_profiles_consolidated/.test(sql)) {
+          return { rows: [{ profile_data: {} }] };
+        }
+        return { rows: [] };
+      }),
+    };
     const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
     const svc = new ChatService(pg as any, null as any, null as any, null as any, language as any, undefined, undefined, undefined, undefined);
     const post = axios.post as jest.Mock;
