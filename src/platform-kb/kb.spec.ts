@@ -123,10 +123,11 @@ describe('статьи во всех вариантах', () => {
     expect(problems).toEqual([]);
   });
 
-  // Подпись поля «Токен бота» (продукты) и сама пометка клиента (она и
-  // существует, чтобы сказать «о деньгах не говори») — не в счёт, вырезаем
-  // перед проверкой.
-  it('сборка из стора: ни слова о деньгах, кроме подписи поля «Токен бота»', () => {
+  // Точные подписи «Токен бота» (продукты) и automaticProfiling (настройка
+  // профиля, а не платёжное «пополнение баланса»), а также пометка клиента (она
+  // и существует, чтобы сказать «о деньгах не говори») — не в счёт, вырезаем
+  // перед проверкой. Остальные «пополн…» по-прежнему проверяет MONEY.
+  it('сборка из стора: ни слова о деньгах, кроме подписей «Токен бота» и automaticProfiling', () => {
     // \b перед «списан»: без границы слова регулярка ловит «расписание»/«по
     // расписанию» (routines, call, calendars, studio-assistants) — это не о
     // деньгах, просто совпадающая подстрока.
@@ -134,8 +135,11 @@ describe('статьи во всех вариантах', () => {
     const bad = all
       .filter((v) => v.client === 'store')
       .filter((v) => {
-        const botToken = (labelsFor(v.lang) as Record<string, string>).prodToken;
+        const labels = labelsFor(v.lang) as Record<string, string>;
+        const botToken = labels.prodToken;
+        const automaticProfiling = labels.automaticProfiling;
         let text = botToken ? v.text.split(`«${botToken}»`).join('') : v.text;
+        if (automaticProfiling) text = text.split(`«${automaticProfiling}»`).join('');
         text = text.split(CLIENT_NOTES.store).join('');
         return MONEY.test(text);
       })
