@@ -12,6 +12,9 @@ import { automaticProfilingAllowed, readProfileAccess } from '../privacy/profile
 const accessMock = jest.mocked(readProfileAccess);
 const profilingMock = jest.mocked(automaticProfilingAllowed);
 const pairFixture = { overallScore: 1, perCategory: {} };
+const noData = 'Не удалось сравнить профили — нет данных с персональными описаниями (gloss/embedding).';
+const noTargets = 'Не указаны пользователи для анализа.';
+const streamItem = (content: string) => JSON.stringify({ type: 'item', content }) + '\n';
 const allowedAccess = {
   exists: true,
   visible: true,
@@ -112,6 +115,71 @@ describe('MiscService.analyzeCompatibility privacy', () => {
     expect(comparePairByEmbeddings).toHaveBeenCalledWith('requester', 'target');
     expect(streamLLM).not.toHaveBeenCalled();
     expect(res.writes.join('')).not.toContain('PRIVATE');
+  });
+
+  it('rechecks every target after graph comparisons when a later target revokes access', async () => {
+    accessMock
+      .mockResolvedValueOnce(allowedAccess)
+      .mockResolvedValueOnce(allowedAccess)
+      .mockResolvedValueOnce(allowedAccess)
+      .mockResolvedValueOnce({ ...allowedAccess, visible: false });
+    const res = response();
+
+    await service.analyzeCompatibility('requester', ['target1', 'target2'], res);
+
+    expect(accessMock.mock.calls).toEqual([
+      [pg, 'requester', 'target1'],
+      [pg, 'requester', 'target2'],
+      [pg, 'requester', 'target1'],
+      [pg, 'requester', 'target2'],
+    ]);
+    expect(comparePairByEmbeddings.mock.calls).toEqual([
+      ['requester', 'target1'],
+      ['requester', 'target2'],
+    ]);
+    expect(profilingMock).toHaveBeenCalledTimes(3);
+    expect(streamLLM).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(200);
+    expect(res.writes).toEqual([streamItem(noData)]);
+    expect(res.writes.join('')).not.toContain('PRIVATE');
+    expect(res.writes.join('')).not.toContain('target1');
+    expect(res.writes.join('')).not.toContain('target2');
+  });
+
+  it('skips access checks and self comparison, then returns noData without streaming', async () => {
+    const res = response();
+
+    await service.analyzeCompatibility('requester', ['requester'], res);
+
+    expect(accessMock).not.toHaveBeenCalled();
+    expect(profilingMock).not.toHaveBeenCalled();
+    expect(comparePairByEmbeddings).not.toHaveBeenCalled();
+    expect(streamLLM).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toBeNull();
+    expect(res.writes).toEqual([streamItem(noData)]);
+  });
+
+  it('keeps the noTargets stream response without access, graph, or LLM calls', async () => {
+    const res = response();
+
+    await service.analyzeCompatibility('requester', [], res);
+
+    expect(accessMock).not.toHaveBeenCalled();
+    expect(profilingMock).not.toHaveBeenCalled();
+    expect(comparePairByEmbeddings).not.toHaveBeenCalled();
+    expect(streamLLM).not.toHaveBeenCalled();
+    expect(pg.query).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toBeNull();
+    expect(res.headers).toEqual({
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Transfer-Encoding': 'chunked',
+      'Cache-Control': 'no-cache',
+      'X-Accel-Buffering': 'no',
+      'Access-Control-Allow-Origin': '*',
+    });
+    expect(res.writes).toEqual([streamItem(noTargets)]);
   });
 
   it('maps an unresolved surrogate ID to the same 404', async () => {
