@@ -126,9 +126,9 @@ describe('searchProfiles privacy structure', () => {
   it('использует шесть eligible-only cosine-веток вместо глобального vector index', () => {
     expect(searchProfilesSource).not.toContain('db.index.vector.queryNodes');
     expect(searchProfilesSource.match(/p\.phone IN \$candidatePhones/g) ?? []).toHaveLength(6);
-    const normalizedScore = '(1.0 + vector.similarity.cosine(node.embedding, emb)) / 2.0 AS score';
-    expect(searchProfilesSource.split(normalizedScore)).toHaveLength(7);
-    expect(searchProfilesSource).not.toContain('WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score');
+    const indexScore = 'WITH p, node, vector.similarity.cosine(node.embedding, emb) AS score';
+    expect(searchProfilesSource.split(indexScore)).toHaveLength(7);
+    expect(searchProfilesSource).not.toContain('(1.0 + vector.similarity.cosine(node.embedding, emb)) / 2.0');
     expect(searchProfilesSource.match(/size\(node\.embedding\) = 1536/g) ?? []).toHaveLength(6);
     expect(searchProfilesSource.match(/LIMIT 20/g) ?? []).toHaveLength(6);
 
@@ -225,13 +225,15 @@ describe('searchProfiles privacy runtime', () => {
     expect(session.close).toHaveBeenCalledTimes(1);
   });
 
-  it('сохраняет шкалу vector index: cosine=-1 даёт score=0, а не отрицательный score', async () => {
+  it('фиксирует шкалу Neo4j: cosine=-1 уже даёт score=0 без повторной нормализации', async () => {
     listMock.mockResolvedValue(new Set(['visible']));
     const { svc, run } = makeService();
     run.mockImplementation(async (cypher?: string) => {
       const cosine = -1;
-      const normalized = cypher?.includes('(1.0 + vector.similarity.cosine(node.embedding, emb)) / 2.0 AS score');
-      const score = normalized ? (1.0 + cosine) / 2.0 : cosine;
+      // vector.similarity.cosine в Neo4j возвращает шкалу vector index: [0, 1].
+      const indexScore = (1.0 + cosine) / 2.0;
+      const doubleNormalized = cypher?.includes('(1.0 + vector.similarity.cosine(node.embedding, emb)) / 2.0 AS score');
+      const score = doubleNormalized ? (1.0 + indexScore) / 2.0 : indexScore;
       return {
         records: [profileRecord('visible', [
           { category: 'Interest', name: 'node', gloss: 'gloss', score },
