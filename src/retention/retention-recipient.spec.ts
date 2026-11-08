@@ -24,7 +24,7 @@ describe('retention recipient rules', () => {
     expect(isRetentionUserId('79001112233')).toBe(true);
     expect(isRetentionUserId('11111111-1111-4111-8111-111111111111')).toBe(true);
     expect(isRetentionUserId('dozvon')).toBe(false);
-    expect(isRetentionUserId('11111111-1111-4111-8111-11111111111a')).toBe(false);
+    expect(isRetentionUserId('11111111-1111-4111-8111-11111111111g')).toBe(false);
   });
 
   it('email имеет приоритет даже при наличии телефона', () => {
