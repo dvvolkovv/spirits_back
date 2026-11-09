@@ -21,6 +21,11 @@ export const RETENTION_CAMPAIGN = 'retention_reengage_v1';
 export const CURIOUS_CAMPAIGN = 'curious_return_v1';
 export const RETENTION_COOLDOWN_DAYS = 14;
 
+interface RetentionSegmentResult {
+  preview: RetentionPreview;
+  suppressed: Map<string, { phone: string | null }>;
+}
+
 @Injectable()
 export class RetentionService {
   private readonly logger = new Logger(RetentionService.name);
@@ -33,18 +38,26 @@ export class RetentionService {
   ) {}
 
   async buildRetentionOutreach(opts?: { minDays?: number; maxDays?: number }): Promise<RetentionPreview> {
+    return (await this.buildGeneralSegment(opts)).preview;
+  }
+
+  async buildCuriousReturnOutreach(): Promise<RetentionPreview> {
+    return (await this.buildCuriousSegment()).preview;
+  }
+
+  private async buildGeneralSegment(opts?: { minDays?: number; maxDays?: number }): Promise<RetentionSegmentResult> {
     const minDays = opts?.minDays ?? 3;
     const maxDays = opts?.maxDays ?? 30;
     const seg = await this.pg.query(GENERAL_SEGMENT_SQL, [TEST_USERS, TEST_USER_PATTERN, minDays, maxDays]);
     return this.buildPreview(seg.rows, 'general', { min_days: minDays, max_days: maxDays });
   }
 
-  async buildCuriousReturnOutreach(): Promise<RetentionPreview> {
+  private async buildCuriousSegment(): Promise<RetentionSegmentResult> {
     const seg = await this.pg.query(CURIOUS_SEGMENT_SQL, [TEST_USERS, TEST_USER_PATTERN]);
     return this.buildPreview(seg.rows, 'curious', { min_hours: 24, max_hours: 48 });
   }
 
-  private async buildPreview(rows: any[], mode: RetentionMode, window: RetentionPreview['window']): Promise<RetentionPreview> {
+  private async buildPreview(rows: any[], mode: RetentionMode, window: RetentionPreview['window']): Promise<RetentionSegmentResult> {
     const campaign = mode === 'general' ? RETENTION_CAMPAIGN : CURIOUS_CAMPAIGN;
     const ids = rows.map((r) => r.user_id);
     const contacts = await this.recipients.resolve(ids);
@@ -64,11 +77,15 @@ export class RetentionService {
     }
 
     const drafts: RetentionDraft[] = [];
+    const suppressed = new Map<string, { phone: string | null }>();
     for (const row of rows) {
       const contact = contacts.get(row.user_id) || {
         userId: row.user_id, email: null, phone: null, language: 'ru', unsubscribed: false,
       };
-      if (contact.unsubscribed) continue;
+      if (contact.unsubscribed) {
+        suppressed.set(row.user_id, { phone: contact.phone });
+        continue;
+      }
       const channel = selectRetentionChannel(contact);
       const mail = channel === 'email' ? buildRetentionEmail({
         mode, language: contact.language, assistantName: row.assistant_name,
@@ -96,15 +113,18 @@ export class RetentionService {
     }
 
     return {
-      channel: 'mixed', campaign, window, cooldown_days: RETENTION_COOLDOWN_DAYS,
-      count: drafts.length,
-      summary: {
-        email: drafts.filter((d) => d.channel === 'email').length,
-        sms: drafts.filter((d) => d.channel === 'sms').length,
-        no_channel: drafts.filter((d) => d.channel === 'no_channel').length,
-        skipped_unsubscribed: rows.length - activeIds.length,
+      preview: {
+        channel: 'mixed', campaign, window, cooldown_days: RETENTION_COOLDOWN_DAYS,
+        count: drafts.length,
+        summary: {
+          email: drafts.filter((d) => d.channel === 'email').length,
+          sms: drafts.filter((d) => d.channel === 'sms').length,
+          no_channel: drafts.filter((d) => d.channel === 'no_channel').length,
+          skipped_unsubscribed: suppressed.size,
+        },
+        drafts,
       },
-      drafts,
+      suppressed,
     };
   }
 
@@ -132,23 +152,32 @@ export class RetentionService {
     if ((hasUsers && !validRecipientFilter(data.userIds)) || (hasPhones && !validRecipientFilter(data.phones))) {
       return { error: 'invalid_recipient_filter', message: 'Фильтр получателей должен быть непустым массивом непустых строк.' };
     }
-    const preview = mode === 'general'
-      ? await this.buildRetentionOutreach({ minDays: data.minDays, maxDays: data.maxDays })
-      : await this.buildCuriousReturnOutreach();
+    const segment = mode === 'general'
+      ? await this.buildGeneralSegment({ minDays: data.minDays, maxDays: data.maxDays })
+      : await this.buildCuriousSegment();
+    const { preview, suppressed } = segment;
     let selected = preview.drafts;
-    if (hasUsers) {
-      const set = new Set(data.userIds!);
-      selected = selected.filter((d) => set.has(d.user_id));
-    } else if (hasPhones) {
-      const set = new Set(data.phones!);
-      selected = selected.filter((d) => set.has(d.user_id) || (d.phone ? set.has(d.phone) : false));
+    const userFilter = hasUsers ? new Set(data.userIds!) : null;
+    const phoneFilter = hasPhones ? new Set(data.phones!) : null;
+    if (userFilter) {
+      selected = selected.filter((d) => userFilter.has(d.user_id));
+    } else if (phoneFilter) {
+      selected = selected.filter((d) => phoneFilter.has(d.user_id) || (d.phone ? phoneFilter.has(d.phone) : false));
     }
 
     const skippedCooldown = allowResend ? 0 : selected.filter((d) => d.channel !== 'no_channel' && d.in_cooldown).length;
     const noChannel = selected.filter((d) => d.channel === 'no_channel').length;
     const targets = selected.filter((d) => d.channel !== 'no_channel' && (allowResend || !d.in_cooldown));
     const results: RetentionResultRow[] = [];
-    let skippedUnsubscribed = hasUsers || hasPhones ? 0 : preview.summary.skipped_unsubscribed;
+    let skippedUnsubscribed = 0;
+    for (const [userId, contact] of suppressed) {
+      const isSelected = userFilter
+        ? userFilter.has(userId)
+        : phoneFilter
+          ? phoneFilter.has(userId) || (contact.phone ? phoneFilter.has(contact.phone) : false)
+          : true;
+      if (isSelected) skippedUnsubscribed += 1;
+    }
 
     for (const d of targets) {
       const channel = d.channel as 'email' | 'sms';
