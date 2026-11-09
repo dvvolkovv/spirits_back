@@ -1,5 +1,7 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { randomBytes } from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
 import { normalizeEmail } from './retention-recipient';
 
@@ -17,8 +19,40 @@ export function maskRetentionEmail(email: string): string {
 }
 
 @Injectable()
-export class RetentionUnsubscribeService {
+export class RetentionUnsubscribeService implements OnModuleInit {
+  private readonly logger = new Logger(RetentionUnsubscribeService.name);
+
   constructor(private readonly pg: PgService) {}
+
+  async onModuleInit() {
+    await this.applyMigration('001_retention_email_unsubscribes.sql');
+  }
+
+  private async applyMigration(filename: string) {
+    const candidates = [
+      path.join(__dirname, 'migrations', filename),
+      path.join(__dirname, '..', '..', 'src', 'retention', 'migrations', filename),
+    ];
+    let found = false;
+    for (const p of [...new Set(candidates)]) {
+      if (!fs.existsSync(p)) continue;
+      found = true;
+      try {
+        await this.pg.query(fs.readFileSync(p, 'utf8'));
+        this.logger.log(`retention migration ${filename} applied from ${p}`);
+        return;
+      } catch (e: any) {
+        this.logger.error(`retention migration ${filename} failed (${p}): ${e.message}`);
+      }
+    }
+    if (found) {
+      this.logger.error(
+        `retention migration ${filename} was found but did not apply on any candidate path`,
+      );
+    } else {
+      this.logger.warn(`retention migration ${filename} not found, skipping`);
+    }
+  }
 
   async ensureToken(rawEmail: string): Promise<string> {
     const email = normalizeEmail(rawEmail);
