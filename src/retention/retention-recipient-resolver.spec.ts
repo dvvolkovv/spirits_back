@@ -58,6 +58,31 @@ describe('RetentionRecipientResolver', () => {
     expect(result.get(UUID)).toMatchObject({ email: null, phone: '79001112233', unsubscribed: false });
   });
 
+  it('phone identity выбирается по recency независимо от email_verified', async () => {
+    const pg = fakePg({
+      identities: [
+        {
+          user_id: UUID,
+          provider: 'phone',
+          provider_sub: '+79001112233',
+          email_verified: true,
+          last_used_at: '2026-01-01T00:00:00.000Z',
+          created_at: '2025-01-01T00:00:00.000Z',
+        },
+        {
+          user_id: UUID,
+          provider: 'phone',
+          provider_sub: '+79009998877',
+          email_verified: false,
+          last_used_at: '2026-02-01T00:00:00.000Z',
+          created_at: '2026-01-01T00:00:00.000Z',
+        },
+      ],
+    });
+    const result = await new RetentionRecipientResolver(pg as any, language as any).resolve([UUID]);
+    expect(result.get(UUID)?.phone).toBe('79009998877');
+  });
+
   it('один отписанный адрес блокирует оба аккаунта с этим email', async () => {
     const second = '44444444-4444-4444-8444-444444444444';
     const pg = fakePg({
