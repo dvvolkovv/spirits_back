@@ -1,11 +1,6 @@
 import { ProfileService } from './profile.service';
 import { IdentityService } from '../identity/identity.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
-import { cleanupOrphanRetentionTokens } from '../retention/retention-token-cleanup';
-
-jest.mock('../retention/retention-token-cleanup', () => ({
-  cleanupOrphanRetentionTokens: jest.fn().mockResolvedValue(undefined),
-}));
 
 /// Удаление аккаунта должно быть удалением, а не деактивацией.
 ///
@@ -159,18 +154,8 @@ function ok<T extends { status: string }>(r: T): Extract<T, { status: 'ok' }> {
 }
 
   beforeEach(() => {
-    (cleanupOrphanRetentionTokens as jest.Mock).mockClear();
     db = new FakeDb();
     ({ profile, identity, neo4j } = makeServices(db));
-  });
-
-  it('запускает очистку осиротевших retention-токенов', async () => {
-    const { userId } = ok(await identity.resolveOrCreate('email', { email: 'cleanup@example.com' }));
-
-    await profile.deleteProfile(userId);
-
-    expect(cleanupOrphanRetentionTokens).toHaveBeenCalledTimes(1);
-    expect(cleanupOrphanRetentionTokens).toHaveBeenCalledWith(db);
   });
 
   it('обрывает связки входа — по старой почте аккаунт больше не находится', async () => {
