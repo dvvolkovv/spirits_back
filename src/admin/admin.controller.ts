@@ -5,6 +5,7 @@ import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
 import { ProfileCompactionService } from '../scheduler/profile-compaction.service';
 import { ReferralService } from '../referral/referral.service';
+import { RetentionService } from '../retention/retention.service';
 import { CurrentUser } from '../common/decorators/user.decorator';
 
 // AdminGuard на уровне класса: все 13 маршрутов здесь — admin/*, и раньше
@@ -19,6 +20,7 @@ export class AdminController {
   constructor(
     private readonly adminService: AdminService,
     private readonly referralService: ReferralService,
+    private readonly retentionService: RetentionService,
     @Optional() private readonly compaction?: ProfileCompactionService,
   ) {}
 
@@ -369,27 +371,25 @@ export class AdminController {
     }
   }
 
-  // Retention re-engagement (backlog 72cfc486). preview только строит черновики;
-  // send — реальная SMS-рассылка, требует confirm:true (подтверждение владельца).
+  // preview только строит черновики; send — реальная email/SMS-рассылка с confirm:true.
   @Post('admin/retention')
   async retentionAction(@Body() body: any, @Res() res: Response) {
     const { action, ...data } = body;
     switch (action) {
       case 'preview': {
-        const out = await this.adminService.buildRetentionOutreach(data);
+        const out = await this.retentionService.buildRetentionOutreach(data);
         return res.status(200).json(out);
       }
       case 'send': {
-        const out = await this.adminService.sendRetentionOutreach(data);
+        const out = await this.retentionService.sendRetentionOutreach(data);
         return res.status((out as any).error ? 400 : 200).json(out);
       }
-      // Curious return-trigger (3a54efe4): сегмент Curious, окно 24–48ч.
       case 'curious_preview': {
-        const out = await this.adminService.buildCuriousReturnOutreach();
+        const out = await this.retentionService.buildCuriousReturnOutreach();
         return res.status(200).json(out);
       }
       case 'curious_send': {
-        const out = await this.adminService.sendCuriousReturnOutreach(data);
+        const out = await this.retentionService.sendCuriousReturnOutreach(data);
         return res.status((out as any).error ? 400 : 200).json(out);
       }
       default:

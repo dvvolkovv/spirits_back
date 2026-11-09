@@ -55,7 +55,7 @@ describe('AdminController: звонки и встречи', () => {
 
   it('лента передаёт в сервис все фильтры', async () => {
     const svc = { getCallSessions: jest.fn().mockResolvedValue({ sessions: [] }) };
-    const ctrl = new AdminController(svc as any, {} as any);
+    const ctrl = new AdminController(svc as any, {} as any, {} as any);
     const res = fakeRes();
     await viaRoute(ctrl, 'callSessions', { days: '90', kind: 'meeting', provider: 'zoom', includeTest: '1', limit: '100' }, res);
 
@@ -68,7 +68,7 @@ describe('AdminController: звонки и встречи', () => {
 
   it('таблица принимает площадку и тестовые', async () => {
     const svc = { getCallsByUser: jest.fn().mockResolvedValue({}) };
-    const ctrl = new AdminController(svc as any, {} as any);
+    const ctrl = new AdminController(svc as any, {} as any, {} as any);
     await viaRoute(ctrl, 'callsByUser', { days: '30', kind: 'meeting', provider: 'talerid', includeTest: '1' }, fakeRes());
 
     expect(svc.getCallsByUser).toHaveBeenCalledWith({
@@ -78,7 +78,7 @@ describe('AdminController: звонки и встречи', () => {
 
   it('без includeTest тестовые не включаются', async () => {
     const svc = { getCallSessions: jest.fn().mockResolvedValue({}) };
-    const ctrl = new AdminController(svc as any, {} as any);
+    const ctrl = new AdminController(svc as any, {} as any, {} as any);
     await viaRoute(ctrl, 'callSessions', {}, fakeRes());
 
     expect(svc.getCallSessions).toHaveBeenCalledWith(expect.objectContaining({ includeTest: false }));

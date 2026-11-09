@@ -241,7 +241,7 @@ describe('AdminService.getUsersTokensList — колонка активност�
   });
 });
 
-describe('AdminService — сегменты обзвона не трогают активных в боте', () => {
+describe('AdminService — активационный сегмент не трогает активных в боте', () => {
   it('активационный сегмент исключает тех, кто пишет в бота', async () => {
     const pg = fakePg();
     await serviceWith(pg).buildActivationOutreach();
@@ -250,19 +250,5 @@ describe('AdminService — сегменты обзвона не трогают �
     expect(sql).toContain('custom_chat_history');
     expect(sql).toContain('tg_bot_messages');
     expect(sql).toContain('owner_user_id');
-  });
-
-  it('retention-сегмент считает последнюю активность и по боту', async () => {
-    const pg = fakePg();
-    await serviceWith(pg).buildRetentionOutreach();
-
-    expect(pg.calls[0].sql).toContain('tg_bot_messages');
-  });
-
-  it('curious-сегмент считает последнюю активность и по боту', async () => {
-    const pg = fakePg();
-    await serviceWith(pg).buildCuriousReturnOutreach();
-
-    expect(pg.calls[0].sql).toContain('tg_bot_messages');
   });
 });
