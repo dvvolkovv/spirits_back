@@ -531,14 +531,17 @@ set -u
 export LC_ALL=C
 f="$BACK/.env"
 [ -f "$f" ] || { echo "RS_ERR файла $f нет"; exit 0; }
-if command -v flock >/dev/null 2>&1; then
-  exec 9>"/tmp/.linkeon-retention-secret-$(id -u).lock" \
-    || { echo "RS_ERR lock: не открыть файл замка в /tmp"; exit 0; }
-  flock -w 30 9 \
-    || { echo "RS_ERR lock: замок не взят за 30 с — идёт параллельный выкат? Повтори позже"; exit 0; }
-fi
+command -v flock >/dev/null 2>&1 \
+  || { echo "RS_ERR flock не найден — без блокировки проверка и запись $f запрещены"; exit 0; }
+exec 9>"/tmp/.linkeon-retention-secret-$(id -u).lock" \
+  || { echo "RS_ERR lock: не открыть файл замка в /tmp"; exit 0; }
+flock -w 30 9 \
+  || { echo "RS_ERR lock: замок не взят за 30 с — идёт параллельный выкат? Повтори позже"; exit 0; }
 re='^[[:space:]]*(export[[:space:]]+)?RETENTION_UNSUBSCRIBE_SECRET='
-if ! grep -qE "$re" "$f"; then
+grep -qE "$re" "$f"
+grep_rc=$?
+[ "$grep_rc" -lt 2 ] || { echo "RS_ERR grep: не удалось прочитать $f (rc=$grep_rc)"; exit 0; }
+if [ "$grep_rc" -eq 1 ]; then
   if [ "${RS_READONLY:-}" = 1 ]; then
     echo "RS_ERR строки RETENTION_UNSUBSCRIBE_SECRET нет в $f, а SMOKE_ONLY=1 на сервер не пишет. Запусти выкат без SMOKE_ONLY, чтобы deploy.sh дописал секрет"
     exit 0
@@ -549,7 +552,12 @@ if ! grep -qE "$re" "$f"; then
   [ "${#s}" -eq 64 ] || s=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
   [ "${#s}" -eq 64 ] || { echo "RS_ERR не удалось сгенерировать 64-hex секрет"; exit 0; }
   case "$s" in *[!0-9a-fA-F]*) echo "RS_ERR генератор вернул не-hex секрет"; exit 0 ;; esac
-  if [ -s "$f" ] && [ -n "$(tail -c1 "$f")" ]; then printf '\n' >> "$f"; fi
+  if [ -s "$f" ]; then
+    last=$(tail -c1 "$f") || { echo "RS_ERR tail: не удалось проверить конец $f"; exit 0; }
+    if [ -n "$last" ]; then
+      printf '\n' >> "$f" || { echo "RS_ERR не удалось дописать перевод строки в $f"; exit 0; }
+    fi
+  fi
   printf 'RETENTION_UNSUBSCRIBE_SECRET=%s\n' "$s" >> "$f" || { echo "RS_ERR дозапись в $f не удалась"; exit 0; }
   echo RS_ADDED
 fi
