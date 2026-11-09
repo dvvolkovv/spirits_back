@@ -60,8 +60,13 @@ export class RetentionRecipientResolver {
       const email = emails.find((value) => !suppressed.has(value)) || null;
       let phone = normalizePhone(id);
       if (!phone) {
-        for (const row of identitiesById.get(id) || []) {
-          if (row.provider !== 'phone') continue;
+        const phoneIdentities = (identitiesById.get(id) || [])
+          .filter((row) => row.provider === 'phone')
+          .sort((a, b) =>
+            new Date(b.last_used_at || b.created_at || 0).getTime() -
+            new Date(a.last_used_at || a.created_at || 0).getTime(),
+          );
+        for (const row of phoneIdentities) {
           phone = normalizePhone(row.provider_sub);
           if (phone) break;
         }
