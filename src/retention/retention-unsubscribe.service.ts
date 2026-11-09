@@ -14,8 +14,9 @@ const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 
 export function maskRetentionEmail(email: string): string {
   const [local, domain] = email.split('@');
-  if (local.length <= 2) return `${local[0] || '*'}***@${domain}`;
-  return `${local[0]}***${local[local.length - 1]}@${domain}`;
+  const chars = Array.from(local);
+  if (chars.length <= 2) return `${chars[0] || '*'}***@${domain}`;
+  return `${chars[0]}***${chars[chars.length - 1]}@${domain}`;
 }
 
 @Injectable()
