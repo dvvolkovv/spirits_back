@@ -93,6 +93,51 @@ describe('RetentionService send', () => {
     expect(svc.pg.query.mock.calls[0][1][1]).not.toContain('u@example.com');
   });
 
+  it.each([
+    'retention_unsubscribe_secret_not_configured',
+    'retention_unsubscribe_secret_invalid',
+  ])('ensureToken сохраняет безопасный код %s', async (code) => {
+    const svc = harness([draft()]);
+    svc.unsubscribes.ensureToken.mockRejectedValue(new Error(code));
+    const out = await svc.sendRetentionOutreach({ confirm: true });
+    expect(out.results[0]).toMatchObject({ status: 'failed', error: code });
+    expect(svc.mail.send).not.toHaveBeenCalled();
+    expect(axios.get).not.toHaveBeenCalled();
+    const logs = JSON.stringify(svc.logger.warn.mock.calls);
+    expect(logs).toContain('u1');
+    expect(logs).toContain(code);
+    expect(logs).not.toContain('u@example.com');
+  });
+
+  it('ошибка suppression query имеет отдельный безопасный код', async () => {
+    const svc = harness([draft()]);
+    svc.unsubscribes.isUnsubscribed.mockRejectedValue(new Error('database down for u@example.com'));
+    const out = await svc.sendRetentionOutreach({ confirm: true });
+    expect(out.results[0]).toMatchObject({ status: 'failed', error: 'suppression_check_failed' });
+    expect(svc.unsubscribes.ensureToken).not.toHaveBeenCalled();
+    expect(svc.mail.send).not.toHaveBeenCalled();
+    expect(axios.get).not.toHaveBeenCalled();
+    const logs = JSON.stringify(svc.logger.warn.mock.calls);
+    expect(logs).toContain('u1');
+    expect(logs).toContain('suppression_check_failed');
+    expect(logs).not.toContain('database down');
+    expect(logs).not.toContain('u@example.com');
+  });
+
+  it('неизвестная ошибка preparation не раскрывает email или token', async () => {
+    const svc = harness([draft()]);
+    svc.unsubscribes.ensureToken.mockRejectedValue(new Error('token=raw-secret for u@example.com'));
+    const out = await svc.sendRetentionOutreach({ confirm: true });
+    expect(out.results[0]).toMatchObject({ status: 'failed', error: 'delivery_preparation_failed' });
+    expect(svc.mail.send).not.toHaveBeenCalled();
+    expect(axios.get).not.toHaveBeenCalled();
+    const logs = JSON.stringify(svc.logger.warn.mock.calls);
+    expect(logs).toContain('u1');
+    expect(logs).toContain('delivery_preparation_failed');
+    expect(logs).not.toContain('raw-secret');
+    expect(logs).not.toContain('u@example.com');
+  });
+
   it('без email отправляется SMS; no_channel не вызывает транспорт', async () => {
     const svc = harness([
       draft({ user_id: 'sms', email: null, channel: 'sms' }),
@@ -101,6 +146,25 @@ describe('RetentionService send', () => {
     const out = await svc.sendRetentionOutreach({ confirm: true });
     expect(out).toMatchObject({ sent_sms: 1, no_channel: 1 });
     expect(axios.get).toHaveBeenCalledTimes(1);
+    expect(svc.mail.send).not.toHaveBeenCalled();
+  });
+
+  it('SMS HTTP 400 сохраняет diagnostic body с границей 200 символов', async () => {
+    const svc = harness([draft({ user_id: 'sms', email: null, channel: 'sms' })]);
+    const body = { error: 'bad_request', detail: 'x'.repeat(250) };
+    (axios.get as jest.Mock).mockResolvedValue({ status: 400, data: body });
+    const out = await svc.sendRetentionOutreach({ confirm: true });
+    const expected = `SMS Aero 400: ${JSON.stringify(body).slice(0, 200)}`;
+    expect(out.results[0]).toMatchObject({ status: 'failed', error: expected });
+    expect(out.results[0].error).toHaveLength(expected.length);
+    expect(svc.mail.send).not.toHaveBeenCalled();
+  });
+
+  it('SMS network error сохраняет message с границей 200 символов', async () => {
+    const svc = harness([draft({ user_id: 'sms', email: null, channel: 'sms' })]);
+    (axios.get as jest.Mock).mockRejectedValue(new Error('N'.repeat(250)));
+    const out = await svc.sendRetentionOutreach({ confirm: true });
+    expect(out.results[0]).toMatchObject({ status: 'failed', error: 'N'.repeat(200) });
     expect(svc.mail.send).not.toHaveBeenCalled();
   });
 
