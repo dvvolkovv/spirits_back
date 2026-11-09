@@ -277,6 +277,20 @@ describe('RetentionService send', () => {
     expect(axios.get).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['userIds', new Array(1)],
+    ['userIds', ['u1', ,]],
+    ['phones', new Array(1)],
+    ['phones', ['79001112233', ,]],
+  ])('sparse-фильтр %s запрещает bulk send', async (key, value) => {
+    const svc = harness([draft()]);
+    const out = await svc.sendRetentionOutreach({ confirm: true, [key]: value });
+    expect(out.error).toBe('invalid_recipient_filter');
+    expect(svc.buildGeneralSegment).not.toHaveBeenCalled();
+    expect(svc.mail.send).not.toHaveBeenCalled();
+    expect(axios.get).not.toHaveBeenCalled();
+  });
+
   it('оба filter-свойства неоднозначны даже при пустом phones', async () => {
     const svc = harness([draft()]);
     const out = await svc.sendRetentionOutreach({ confirm: true, userIds: ['u1'], phones: [] });

@@ -48,6 +48,24 @@ describe('MailService', () => {
     });
   });
 
+  it.each([
+    ['smtp_error', '550 mailbox victim@example.com rejected; token=abc123; url=https://smtp.example.test/diagnostic'],
+    ['smtp_timeout', 'SMTP timeout: victim@example.com token=abc123 https://smtp.example.test/timeout'],
+  ])('логирует только безопасную категорию %s, сохраняя legacy error', async (category, raw) => {
+    const svc = withTransport(() => Promise.reject(new Error(raw)));
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+    const recipient = 'recipient@example.com';
+    await expect(svc.send(recipient, 'тема', 'тело')).resolves.toEqual({ ok: false, error: raw });
+    const logs = JSON.stringify(warn.mock.calls);
+    expect(logs).toContain(category);
+    expect(logs).not.toContain(recipient);
+    expect(logs).not.toContain(raw);
+    expect(logs).not.toContain('victim@example.com');
+    expect(logs).not.toContain('abc123');
+    expect(logs).not.toContain('token');
+    expect(logs).not.toContain('https://');
+  });
+
   it('передаёт plain text в nodemailer, не ломая старую сигнатуру', async () => {
     let payload: any;
     const svc = withTransport((p?: any) => { payload = p; return Promise.resolve({ messageId: 'x' }); });
