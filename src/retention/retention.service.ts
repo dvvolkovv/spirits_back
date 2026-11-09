@@ -117,29 +117,36 @@ export class RetentionService {
   }
 
   private async send(mode: RetentionMode, data: RetentionSendRequest): Promise<RetentionSendResponse> {
-    if (!data?.confirm) {
+    if (data?.confirm !== true) {
       return { error: 'confirm_required', message: 'Отправка реальным пользователям требует confirm:true (подтверждение владельца).' };
     }
-    const hasUsers = Array.isArray(data.userIds) && data.userIds.length > 0;
-    const hasPhones = Array.isArray(data.phones) && data.phones.length > 0;
+    const allowResend = data.resend === true;
+    const hasUsers = Object.prototype.hasOwnProperty.call(data, 'userIds');
+    const hasPhones = Object.prototype.hasOwnProperty.call(data, 'phones');
     if (hasUsers && hasPhones) {
       return { error: 'ambiguous_recipient_filter', message: 'Передайте либо userIds[], либо phones[], но не оба фильтра.' };
+    }
+    const validRecipientFilter = (value: unknown): value is string[] =>
+      Array.isArray(value) && value.length > 0 &&
+      value.every((entry) => typeof entry === 'string' && entry.length > 0);
+    if ((hasUsers && !validRecipientFilter(data.userIds)) || (hasPhones && !validRecipientFilter(data.phones))) {
+      return { error: 'invalid_recipient_filter', message: 'Фильтр получателей должен быть непустым массивом непустых строк.' };
     }
     const preview = mode === 'general'
       ? await this.buildRetentionOutreach({ minDays: data.minDays, maxDays: data.maxDays })
       : await this.buildCuriousReturnOutreach();
     let selected = preview.drafts;
     if (hasUsers) {
-      const set = new Set(data.userIds);
+      const set = new Set(data.userIds!);
       selected = selected.filter((d) => set.has(d.user_id));
     } else if (hasPhones) {
-      const set = new Set(data.phones);
+      const set = new Set(data.phones!);
       selected = selected.filter((d) => set.has(d.user_id) || (d.phone ? set.has(d.phone) : false));
     }
 
-    const skippedCooldown = data.resend ? 0 : selected.filter((d) => d.in_cooldown).length;
+    const skippedCooldown = allowResend ? 0 : selected.filter((d) => d.channel !== 'no_channel' && d.in_cooldown).length;
     const noChannel = selected.filter((d) => d.channel === 'no_channel').length;
-    const targets = selected.filter((d) => d.channel !== 'no_channel' && (data.resend || !d.in_cooldown));
+    const targets = selected.filter((d) => d.channel !== 'no_channel' && (allowResend || !d.in_cooldown));
     const results: RetentionResultRow[] = [];
     let skippedUnsubscribed = hasUsers || hasPhones ? 0 : preview.summary.skipped_unsubscribed;
 

@@ -76,4 +76,4 @@ export interface RetentionSendResult {
 
 export type RetentionSendResponse =
   | RetentionSendResult
-  | { error: 'confirm_required' | 'ambiguous_recipient_filter'; message: string };
+  | { error: 'confirm_required' | 'ambiguous_recipient_filter' | 'invalid_recipient_filter'; message: string };
