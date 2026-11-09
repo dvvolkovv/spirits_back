@@ -10,6 +10,7 @@ describe('retention mail', () => {
     });
     expect(mail.subject.length).toBeGreaterThan(10);
     expect(mail.text).toContain(`https://my.linkeon.io/chat?lang=${language}`);
+    expect(mail.html).toContain(`https://my.linkeon.io/chat?lang=${language}`);
     expect(mail.text).toContain('unsubscribe?token=x');
     expect(mail.html).toContain('unsubscribe?token=x');
     if (language !== 'ru') expect(mail.text).not.toContain('Здравствуйте');
