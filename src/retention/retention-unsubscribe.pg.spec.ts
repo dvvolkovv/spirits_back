@@ -83,7 +83,9 @@ maybe('stateless-отписка retention против живого PostgreSQL',
     expect(newToken).not.toBe(oldToken);
     const first = await svc.unsubscribe(oldToken);
     const second = await svc.unsubscribe(newToken);
-    expect(second?.unsubscribedAt).toEqual(first?.unsubscribedAt);
+    expect(first?.unsubscribedAt).toBeDefined();
+    expect(first?.unsubscribedAt).not.toBeNull();
+    expect(second?.unsubscribedAt?.getTime()).toBe(first?.unsubscribedAt?.getTime());
     await expect(svc.findByToken(oldToken)).resolves.toEqual({
       email: 'first-time@example.com', unsubscribedAt: first?.unsubscribedAt,
     });
