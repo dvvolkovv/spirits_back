@@ -47,15 +47,13 @@ export class MailService {
     return Boolean(this.transporter);
   }
 
-  async send(to: string, subject: string, html: string): Promise<MailResult> {
+  async send(to: string, subject: string, html: string, text?: string): Promise<MailResult> {
     if (!this.transporter) return { ok: false, error: 'smtp_not_configured' };
 
     let timer: NodeJS.Timeout | undefined;
     try {
-      // Таймауты транспорта покрывают соединение и сокет, но не гарантируют,
-      // что промис вообще завершится — наблюдалось на test.linkeon.io.
       await Promise.race([
-        this.transporter.sendMail({ from: this.from, to, subject, html }),
+        this.transporter.sendMail({ from: this.from, to, subject, html, ...(text ? { text } : {}) }),
         new Promise<never>((_, reject) => {
           timer = setTimeout(
             () => reject(new Error(`SMTP timeout: письмо на ${to} не ушло за ${SEND_TIMEOUT_MS} мс`)),
