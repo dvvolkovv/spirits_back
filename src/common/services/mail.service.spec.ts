@@ -47,4 +47,11 @@ describe('MailService', () => {
       ok: false, error: 'smtp_not_configured',
     });
   });
+
+  it('передаёт plain text в nodemailer, не ломая старую сигнатуру', async () => {
+    let payload: any;
+    const svc = withTransport((p?: any) => { payload = p; return Promise.resolve({ messageId: 'x' }); });
+    await svc.send('a@example.com', 'тема', '<p>HTML</p>', 'Текст');
+    expect(payload).toMatchObject({ subject: 'тема', html: '<p>HTML</p>', text: 'Текст' });
+  });
 });
