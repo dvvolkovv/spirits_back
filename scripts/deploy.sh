@@ -523,6 +523,90 @@ ensure_debug_secret() {
   return 1
 }
 
+# RETENTION_UNSUBSCRIBE_SECRET подписывает stateless-ссылки отписки. Как и
+# DEBUG_SECRET, он создаётся только на целевом сервере и не покидает deploy.sh.
+retention_unsubscribe_secret_probe() {
+  cat <<'EOS'
+set -u
+export LC_ALL=C
+f="$BACK/.env"
+[ -f "$f" ] || { echo "RS_ERR файла $f нет"; exit 0; }
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"/tmp/.linkeon-retention-secret-$(id -u).lock" \
+    || { echo "RS_ERR lock: не открыть файл замка в /tmp"; exit 0; }
+  flock -w 30 9 \
+    || { echo "RS_ERR lock: замок не взят за 30 с — идёт параллельный выкат? Повтори позже"; exit 0; }
+fi
+re='^[[:space:]]*(export[[:space:]]+)?RETENTION_UNSUBSCRIBE_SECRET='
+if ! grep -qE "$re" "$f"; then
+  if [ "${RS_READONLY:-}" = 1 ]; then
+    echo "RS_ERR строки RETENTION_UNSUBSCRIBE_SECRET нет в $f, а SMOKE_ONLY=1 на сервер не пишет. Запусти выкат без SMOKE_ONLY, чтобы deploy.sh дописал секрет"
+    exit 0
+  fi
+  [ -w "$f" ] || { echo "RS_ERR $f не доступен на запись"; exit 0; }
+  s=$(openssl rand -hex 32 2>/dev/null) || s=
+  case "$s" in ''|*[!0-9a-fA-F]*) s= ;; esac
+  [ "${#s}" -eq 64 ] || s=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  [ "${#s}" -eq 64 ] || { echo "RS_ERR не удалось сгенерировать 64-hex секрет"; exit 0; }
+  case "$s" in *[!0-9a-fA-F]*) echo "RS_ERR генератор вернул не-hex секрет"; exit 0 ;; esac
+  if [ -s "$f" ] && [ -n "$(tail -c1 "$f")" ]; then printf '\n' >> "$f"; fi
+  printf 'RETENTION_UNSUBSCRIBE_SECRET=%s\n' "$s" >> "$f" || { echo "RS_ERR дозапись в $f не удалась"; exit 0; }
+  echo RS_ADDED
+fi
+# Последнее вхождение и кавычки — с той же семантикой, что у debug_secret_probe.
+v=$(sed -nE "s/${re}//p" "$f" | tail -1 | tr -d '\r')
+case "$v" in
+  \"*) v=${v#\"}; v=${v%%\"*} ;;
+  \'*) v=${v#\'}; v=${v%%\'*} ;;
+  *)   v=${v%%[[:space:]]#*}; v=$(printf '%s' "$v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//') ;;
+esac
+[ "${#v}" -ge 64 ] || { echo "RS_SHORT len=${#v}"; exit 0; }
+[ "${#v}" -eq 64 ] || { echo "RS_BAD значение RETENTION_UNSUBSCRIBE_SECRET длиннее 64 знаков"; exit 0; }
+case "$v" in
+  *[!0-9a-fA-F]*) echo "RS_BAD значение RETENTION_UNSUBSCRIBE_SECRET должно содержать ровно 64 hex-знака без пробелов и других символов"; exit 0 ;;
+esac
+echo "RS_VALUE=$v"
+EOS
+}
+
+ensure_retention_unsubscribe_secret() {
+  bold "[retention-secret] RETENTION_UNSUBSCRIBE_SECRET в $BACK_PATH/.env ($ENV_NAME)"
+  local raw rc attempt val ro=
+  [[ -n "${SMOKE_ONLY:-}" ]] && ro=1
+  for attempt in 1 2 3; do
+    raw=$(retention_unsubscribe_secret_probe | ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+            -o ConnectTimeout=20 "$HOST" "BACK='$BACK_PATH' RS_READONLY='$ro' bash -s" 2>&1)
+    rc=$?
+    [[ $rc -ne 255 ]] && break
+    echo "  ! ssh to ${ENV_NAME} dropped (code 255) — retry $attempt/3" >&2
+    sleep $((attempt * 3))
+  done
+  val=$(sed -n 's/^RS_VALUE=//p' <<<"$raw" | tail -1)
+  if [[ $rc -eq 0 && -n "$val" && ${#val} -eq 64 && "$val" != *[!0-9a-fA-F]* ]]; then
+    if grep -q '^RS_ADDED$' <<<"$raw"; then
+      green "  ✓ строки не было — дописан новый RETENTION_UNSUBSCRIBE_SECRET (64 hex) в конец $BACK_PATH/.env"
+    else
+      green "  ✓ RETENTION_UNSUBSCRIBE_SECRET на месте (64 hex)"
+    fi
+    return 0
+  fi
+  if grep -q '^RS_SHORT' <<<"$raw"; then
+    red "  ✗ в $BACK_PATH/.env ($ENV_NAME) RETENTION_UNSUBSCRIBE_SECRET короче 64 знаков ($(grep -m1 '^RS_SHORT' <<<"$raw" | sed 's/^RS_SHORT //'))"
+    red "    Скрипт существующее значение не изменяет."
+  elif grep -q '^RS_BAD' <<<"$raw"; then
+    red "  ✗ в $BACK_PATH/.env ($ENV_NAME): $(grep -m1 '^RS_BAD' <<<"$raw" | sed 's/^RS_BAD //')"
+    red "    Скрипт существующее значение не заменяет."
+  elif grep -q '^RS_ERR' <<<"$raw"; then
+    red "  ✗ RETENTION_UNSUBSCRIBE_SECRET ($ENV_NAME): $(grep -m1 '^RS_ERR' <<<"$raw" | sed 's/^RS_ERR //')"
+  elif [[ $rc -eq 0 ]]; then
+    red "  ✗ RETENTION_UNSUBSCRIBE_SECRET ($ENV_NAME): проверка на $HOST не вернула корректный 64-hex статус"
+  else
+    red "  ✗ RETENTION_UNSUBSCRIBE_SECRET ($ENV_NAME): $HOST не ответил (ssh rc=$rc)"
+  fi
+  red "    Фаза остановлена до изменений на сервере; секрет в диагностику не выводится."
+  return 1
+}
+
 # Заголовок X-Debug-Secret для curl — через файл-подстановку, а не аргументом:
 # так секрет не светится в списке процессов. Пример:
 #   curl -H @<(debug_secret_header) "$base/webhook/debug/sms-code/$phone"
@@ -1677,6 +1761,7 @@ run_phase() {
   # Секрет debug-ручек — ДО рестарта API (дописать, если нет) и ДО smoke
   # (прочитать). Отказ — до любых изменений на сервере, см. функцию.
   ensure_debug_secret || return 1
+  ensure_retention_unsubscribe_secret || return 1
 
   if [[ -z "${SMOKE_ONLY:-}" ]]; then
     # Capture pre-deploy state on prod (по умолчанию) для авто-rollback'а
