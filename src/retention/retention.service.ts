@@ -146,9 +146,14 @@ export class RetentionService {
     if (hasUsers && hasPhones) {
       return { error: 'ambiguous_recipient_filter', message: 'Передайте либо userIds[], либо phones[], но не оба фильтра.' };
     }
-    const validRecipientFilter = (value: unknown): value is string[] =>
-      Array.isArray(value) && value.length > 0 &&
-      value.every((entry) => typeof entry === 'string' && entry.length > 0);
+    const validRecipientFilter = (value: unknown): value is string[] => {
+      if (!Array.isArray(value) || value.length === 0) return false;
+      for (let i = 0; i < value.length; i++) {
+        const entry = value[i];
+        if (typeof entry !== 'string' || entry.length === 0) return false;
+      }
+      return true;
+    };
     if ((hasUsers && !validRecipientFilter(data.userIds)) || (hasPhones && !validRecipientFilter(data.phones))) {
       return { error: 'invalid_recipient_filter', message: 'Фильтр получателей должен быть непустым массивом непустых строк.' };
     }

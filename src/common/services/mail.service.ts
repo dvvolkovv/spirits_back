@@ -64,7 +64,8 @@ export class MailService {
       return { ok: true };
     } catch (e: any) {
       const error = String(e?.message || 'smtp error').slice(0, 200);
-      this.logger.warn(`письмо на ${to} не ушло: ${error}`);
+      const category = /timeout/i.test(error) ? 'smtp_timeout' : 'smtp_error';
+      this.logger.warn(category);
       return { ok: false, error };
     } finally {
       if (timer) clearTimeout(timer);
