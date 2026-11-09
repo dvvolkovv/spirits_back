@@ -21,12 +21,28 @@ const preview = (drafts: RetentionDraft[]): RetentionPreview => ({
   drafts,
 });
 
-function harness(drafts: RetentionDraft[]) {
+function harness(
+  drafts: RetentionDraft[],
+  suppressedEntries: Array<[string, { phone: string | null }]> = [],
+) {
   const svc = Object.create(RetentionService.prototype) as any;
-  svc.buildRetentionOutreach = jest.fn().mockResolvedValue(preview(drafts));
-  svc.buildCuriousReturnOutreach = jest.fn().mockResolvedValue({
-    ...preview(drafts), campaign: 'curious_return_v1', window: { min_hours: 24, max_hours: 48 },
-  });
+  const suppressed = new Map(suppressedEntries);
+  const generalPreview = preview(drafts);
+  generalPreview.summary.skipped_unsubscribed = suppressed.size;
+  const curiousPreview = {
+    ...generalPreview,
+    campaign: 'curious_return_v1',
+    window: { min_hours: 24, max_hours: 48 },
+    summary: { ...generalPreview.summary },
+  };
+  svc.buildGeneralSegment = jest.fn().mockResolvedValue({ preview: generalPreview, suppressed });
+  svc.buildCuriousSegment = jest.fn().mockResolvedValue({ preview: curiousPreview, suppressed });
+  svc.buildRetentionOutreach = jest.fn().mockImplementation(
+    async () => (await svc.buildGeneralSegment()).preview,
+  );
+  svc.buildCuriousReturnOutreach = jest.fn().mockImplementation(
+    async () => (await svc.buildCuriousSegment()).preview,
+  );
   svc.pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
   svc.mail = { send: jest.fn().mockResolvedValue({ ok: true }) };
   svc.unsubscribes = {
@@ -102,6 +118,37 @@ describe('RetentionService send', () => {
     expect(out.sent_email).toBe(1);
     expect(svc.mail.send).toHaveBeenCalledTimes(1);
     expect(svc.mail.send.mock.calls[0][0]).toBe('u@example.com');
+    expect(axios.get).not.toHaveBeenCalled();
+  });
+
+  it('userIds учитывает уже подавленного получателя рядом с активным', async () => {
+    const svc = harness(
+      [draft({ user_id: 'active', email: 'active@example.com' })],
+      [['blocked', { phone: '79009998877' }]],
+    );
+    const out = await svc.sendRetentionOutreach({ confirm: true, userIds: ['active', 'blocked'] });
+    expect(out).toMatchObject({ sent: 1, skipped_unsubscribed: 1 });
+    expect(svc.mail.send).toHaveBeenCalledTimes(1);
+    expect(svc.mail.send.mock.calls[0][0]).toBe('active@example.com');
+    expect(axios.get).not.toHaveBeenCalled();
+  });
+
+  it('legacy phones находит уже подавленный аккаунт без транспорта', async () => {
+    const svc = harness([], [['blocked', { phone: '79009998877' }]]);
+    const out = await svc.sendRetentionOutreach({ confirm: true, phones: ['79009998877'] });
+    expect(out).toMatchObject({ sent: 0, skipped_unsubscribed: 1, results: [] });
+    expect(svc.mail.send).not.toHaveBeenCalled();
+    expect(axios.get).not.toHaveBeenCalled();
+  });
+
+  it('без фильтра учитываются все уже подавленные получатели', async () => {
+    const svc = harness([], [
+      ['blocked-a', { phone: null }],
+      ['blocked-b', { phone: '79009998877' }],
+    ]);
+    const out = await svc.sendRetentionOutreach({ confirm: true });
+    expect(out).toMatchObject({ sent: 0, skipped_unsubscribed: 2, results: [] });
+    expect(svc.mail.send).not.toHaveBeenCalled();
     expect(axios.get).not.toHaveBeenCalled();
   });
 
