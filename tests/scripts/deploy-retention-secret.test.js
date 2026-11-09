@@ -19,21 +19,33 @@ function withBack(content, fn) {
   }
 }
 
-function runProbe(back, { readonly = false } = {}) {
+function runProbe(back, {
+  readonly = false,
+  prelude = '',
+  path: probePath = process.env.PATH,
+} = {}) {
   const extracted = spawnSync(
     'sed',
     ['-n', '/^retention_unsubscribe_secret_probe()/,/^}/p', DEPLOY],
     { encoding: 'utf8' },
   );
   assert.equal(extracted.status, 0, extracted.stderr);
-  const result = spawnSync('bash', ['-s'], {
-    input: `${extracted.stdout}\nretention_unsubscribe_secret_probe | bash -s\n`,
+  const env = {
+    PATH: probePath,
+    BACK: back,
+    RS_READONLY: readonly ? '1' : '',
+  };
+  const generated = spawnSync('bash', ['-s'], {
+    input: `${extracted.stdout}\nretention_unsubscribe_secret_probe\n`,
     encoding: 'utf8',
-    env: {
-      PATH: process.env.PATH,
-      BACK: back,
-      RS_READONLY: readonly ? '1' : '',
-    },
+    env,
+  });
+  if (generated.error) throw generated.error;
+  assert.equal(generated.status, 0, generated.stderr);
+  const result = spawnSync('bash', ['-s'], {
+    input: `${prelude}\n${generated.stdout}`,
+    encoding: 'utf8',
+    env,
   });
   if (result.error) throw result.error;
   return result;
@@ -146,6 +158,81 @@ test('a file without a trailing newline gets a newline before the appended varia
       fs.readFileSync(file, 'utf8'),
       `OTHER=keep\nRETENTION_UNSUBSCRIBE_SECRET=${value}\n`,
     );
+  });
+});
+
+test('missing flock returns RS_ERR before reading or writing .env', () => {
+  const content = 'OTHER=keep\n';
+  withBack(content, ({ back, file }) => {
+    const prelude = [
+      'command() {',
+      '  if [ "${1:-}" = "-v" ] && [ "${2:-}" = "flock" ]; then return 1; fi',
+      '  builtin command "$@"',
+      '}',
+    ].join('\n');
+    const result = runProbe(back, { prelude });
+    assert.ok(statusLine(result, 'RS_ERR'), result.stderr || result.stdout);
+    assert.equal(statusLine(result, 'RS_ADDED'), undefined);
+    assert.equal(returnedValue(result), null);
+    assert.equal(fs.readFileSync(file, 'utf8'), content);
+  });
+});
+
+test('an unreadable .env returns RS_ERR and is restored without any append', () => {
+  const content = 'OTHER=keep\n';
+  withBack(content, ({ back, file }) => {
+    let result;
+    fs.chmodSync(file, 0);
+    try {
+      result = runProbe(back);
+    } finally {
+      fs.chmodSync(file, 0o600);
+    }
+    assert.ok(statusLine(result, 'RS_ERR'), result.stderr || result.stdout);
+    assert.equal(statusLine(result, 'RS_ADDED'), undefined);
+    assert.equal(returnedValue(result), null);
+    assert.equal(fs.readFileSync(file, 'utf8'), content);
+  });
+});
+
+test('tail -c1 failure returns RS_ERR and leaves .env byte-identical', () => {
+  const content = 'OTHER=keep';
+  withBack(content, ({ back, file }) => {
+    const bin = path.join(back, 'mock-bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'tail'), [
+      '#!/usr/bin/env bash',
+      'if [ "${1:-}" = "-c1" ]; then exit 42; fi',
+      'exec /usr/bin/tail "$@"',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    const result = runProbe(back, { path: `${bin}:${process.env.PATH}` });
+    assert.ok(statusLine(result, 'RS_ERR'), result.stderr || result.stdout);
+    assert.equal(statusLine(result, 'RS_ADDED'), undefined);
+    assert.equal(returnedValue(result), null);
+    assert.equal(fs.readFileSync(file, 'utf8'), content);
+  });
+});
+
+test('newline printf failure returns RS_ERR and leaves .env byte-identical', () => {
+  const content = 'OTHER=keep';
+  withBack(content, ({ back, file }) => {
+    const bin = path.join(back, 'mock-bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'printf'), [
+      '#!/usr/bin/env bash',
+      'if [ "${1:-}" = "\\n" ]; then exit 43; fi',
+      'exec /usr/bin/printf "$@"',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    const result = runProbe(back, {
+      path: `${bin}:${process.env.PATH}`,
+      prelude: 'enable -n printf',
+    });
+    assert.ok(statusLine(result, 'RS_ERR'), result.stderr || result.stdout);
+    assert.equal(statusLine(result, 'RS_ADDED'), undefined);
+    assert.equal(returnedValue(result), null);
+    assert.equal(fs.readFileSync(file, 'utf8'), content);
   });
 });
 
