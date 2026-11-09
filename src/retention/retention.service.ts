@@ -186,25 +186,34 @@ export class RetentionService {
       let skipped = false;
 
       if (channel === 'email') {
+        let unsubscribed = false;
         try {
-          if (await this.unsubscribes.isUnsubscribed(d.email!)) {
+          unsubscribed = await this.unsubscribes.isUnsubscribed(d.email!);
+        } catch {
+          error = 'suppression_check_failed';
+          this.logger.warn(`retention suppression check failed for ${d.user_id}: ${error}`);
+        }
+        if (!error) {
+          if (unsubscribed) {
             skipped = true;
             skippedUnsubscribed += 1;
           } else {
-            const token = await this.unsubscribes.ensureToken(d.email!);
-            const base = (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '');
-            const unsubscribeUrl = `${base}/webhook/retention/unsubscribe?token=${encodeURIComponent(token)}&lang=${d.language}`;
-            const content = buildRetentionEmail({
-              mode, language: d.language, assistantName: d.assistant_name,
-              chatUrl: retentionChatUrl(d.language), unsubscribeUrl,
-            });
-            const sent = await this.mail.send(d.email!, content.subject, content.html, content.text);
-            status = sent.ok ? 'sent' : 'failed';
-            error = sent.ok ? null : this.safeMailError(sent.error);
+            try {
+              const token = await this.unsubscribes.ensureToken(d.email!);
+              const base = (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '');
+              const unsubscribeUrl = `${base}/webhook/retention/unsubscribe?token=${encodeURIComponent(token)}&lang=${d.language}`;
+              const content = buildRetentionEmail({
+                mode, language: d.language, assistantName: d.assistant_name,
+                chatUrl: retentionChatUrl(d.language), unsubscribeUrl,
+              });
+              const sent = await this.mail.send(d.email!, content.subject, content.html, content.text);
+              status = sent.ok ? 'sent' : 'failed';
+              error = sent.ok ? null : this.safeMailError(sent.error);
+            } catch (e: any) {
+              error = this.safePreparationError(e);
+              this.logger.warn(`retention delivery preparation failed for ${d.user_id}: ${error}`);
+            }
           }
-        } catch {
-          status = 'failed';
-          error = 'delivery_preparation_failed';
         }
       } else {
         const sent = await this.sendOutreachSms(d.phone!, buildRetentionSmsMessage(mode, d.assistant_name));
@@ -252,6 +261,14 @@ export class RetentionService {
     return /timeout/i.test(String(raw || '')) ? 'smtp_timeout' : 'smtp_error';
   }
 
+  private safePreparationError(raw: any): string {
+    const code = String(raw?.message || raw || '');
+    if (code === 'retention_unsubscribe_secret_not_configured' || code === 'retention_unsubscribe_secret_invalid') {
+      return code;
+    }
+    return 'delivery_preparation_failed';
+  }
+
   private async sendOutreachSms(phone: string, text: string): Promise<{ ok: boolean; error?: string }> {
     const login = process.env.SMSAERO_LOGIN;
     const apiKey = process.env.SMSAERO_API_KEY;
@@ -264,10 +281,12 @@ export class RetentionService {
         timeout: 10000,
         validateStatus: () => true,
       });
-      if (resp.status >= 400) return { ok: false, error: `SMS Aero ${resp.status}` };
+      if (resp.status >= 400) {
+        return { ok: false, error: `SMS Aero ${resp.status}: ${JSON.stringify(resp.data).slice(0, 200)}` };
+      }
       return { ok: true };
     } catch (e: any) {
-      return { ok: false, error: 'sms_network_error' };
+      return { ok: false, error: e?.message?.slice(0, 200) || 'network error' };
     }
   }
 }
