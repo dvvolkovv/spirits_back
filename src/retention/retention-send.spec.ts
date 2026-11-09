@@ -38,15 +38,22 @@ function harness(drafts: RetentionDraft[]) {
 }
 
 describe('RetentionService send', () => {
+  let originalSmsLogin: string | undefined;
+  let originalSmsApiKey: string | undefined;
+
   beforeEach(() => {
+    originalSmsLogin = process.env.SMSAERO_LOGIN;
+    originalSmsApiKey = process.env.SMSAERO_API_KEY;
     process.env.SMSAERO_LOGIN = 'login';
     process.env.SMSAERO_API_KEY = 'key';
     (axios.get as jest.Mock).mockReset().mockResolvedValue({ status: 200, data: {} });
   });
 
   afterEach(() => {
-    delete process.env.SMSAERO_LOGIN;
-    delete process.env.SMSAERO_API_KEY;
+    if (originalSmsLogin === undefined) delete process.env.SMSAERO_LOGIN;
+    else process.env.SMSAERO_LOGIN = originalSmsLogin;
+    if (originalSmsApiKey === undefined) delete process.env.SMSAERO_API_KEY;
+    else process.env.SMSAERO_API_KEY = originalSmsApiKey;
   });
 
   it('email успешен — SMS не вызывается, plain text присутствует', async () => {
@@ -126,6 +133,56 @@ describe('RetentionService send', () => {
     expect((await svc.sendRetentionOutreach({ confirm: true, userIds: ['u1'], phones: ['79001112233'] })).error)
       .toBe('ambiguous_recipient_filter');
     expect(svc.mail.send).not.toHaveBeenCalled();
+  });
+
+  it.each(['false', 'true', 1, {}])('confirm=%p не авторизует отправку', async (confirm) => {
+    const svc = harness([draft()]);
+    const out = await svc.sendRetentionOutreach({ confirm });
+    expect(out.error).toBe('confirm_required');
+    expect(svc.buildRetentionOutreach).not.toHaveBeenCalled();
+    expect(svc.mail.send).not.toHaveBeenCalled();
+    expect(axios.get).not.toHaveBeenCalled();
+  });
+
+  it.each(['false', 'true', 1, {}])('resend=%p не обходит cooldown', async (resend) => {
+    const svc = harness([draft({ in_cooldown: true })]);
+    const out = await svc.sendRetentionOutreach({ confirm: true, resend });
+    expect(out).toMatchObject({ sent: 0, skipped_cooldown: 1 });
+    expect(svc.mail.send).not.toHaveBeenCalled();
+    expect(axios.get).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['userIds', undefined], ['userIds', null], ['userIds', 'u1'], ['userIds', {}],
+    ['userIds', []], ['userIds', ['']], ['userIds', ['u1', '']],
+    ['phones', undefined], ['phones', null], ['phones', '79001112233'], ['phones', {}],
+    ['phones', []], ['phones', ['']], ['phones', ['79001112233', '']],
+  ])('наличие malformed-фильтра %s=%p запрещает bulk send', async (key, value) => {
+    const svc = harness([draft()]);
+    const out = await svc.sendRetentionOutreach({ confirm: true, [key]: value });
+    expect(out.error).toBe('invalid_recipient_filter');
+    expect(svc.buildRetentionOutreach).not.toHaveBeenCalled();
+    expect(svc.mail.send).not.toHaveBeenCalled();
+    expect(axios.get).not.toHaveBeenCalled();
+  });
+
+  it('оба filter-свойства неоднозначны даже при пустом phones', async () => {
+    const svc = harness([draft()]);
+    const out = await svc.sendRetentionOutreach({ confirm: true, userIds: ['u1'], phones: [] });
+    expect(out.error).toBe('ambiguous_recipient_filter');
+    expect(svc.buildRetentionOutreach).not.toHaveBeenCalled();
+    expect(svc.mail.send).not.toHaveBeenCalled();
+    expect(axios.get).not.toHaveBeenCalled();
+  });
+
+  it('no_channel в cooldown не входит в skipped_cooldown', async () => {
+    const svc = harness([
+      draft({ user_id: 'none', email: null, phone: null, channel: 'no_channel', in_cooldown: true }),
+    ]);
+    const out = await svc.sendRetentionOutreach({ confirm: true });
+    expect(out).toMatchObject({ sent: 0, skipped_cooldown: 0, no_channel: 1 });
+    expect(svc.mail.send).not.toHaveBeenCalled();
+    expect(axios.get).not.toHaveBeenCalled();
   });
 
   it('Curious пишет свой campaign', async () => {
