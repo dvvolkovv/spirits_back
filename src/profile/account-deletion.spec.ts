@@ -5,7 +5,7 @@ import { cleanupOrphanRetentionTokens } from '../retention/retention-token-clean
 
 jest.mock('../retention/retention-token-cleanup', () => ({
   cleanupOrphanRetentionTokens: jest.fn().mockResolvedValue(undefined),
-}), { virtual: true });
+}));
 
 /// Удаление аккаунта должно быть удалением, а не деактивацией.
 ///

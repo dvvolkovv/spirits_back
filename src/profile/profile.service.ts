@@ -6,6 +6,7 @@ import { OAuthAppleService } from '../auth/oauth-apple.service';
 import { sanitizeAssistantVoices, sanitizeProfilePatch } from './profile-patch';
 import { buildOtherUserProfile } from './profile-public';
 import { readProfileAccess } from '../privacy/profile-privacy';
+import { cleanupOrphanRetentionTokens } from '../retention/retention-token-cleanup';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -218,6 +219,9 @@ export class ProfileService implements OnModuleInit {
     // хуже самой дыры. Дыра при этом ведёт к уже пустому аккаунту: профиль
     // очищен, история удалена, баланс обнулён. Клиент после удаления сам
     // выходит и токен выбрасывает.
+    // Token-only строка нужна, пока её адрес связан хотя бы с одним аккаунтом.
+    // Подтверждённую отписку сохраняем независимо от оставшихся ссылок.
+    await cleanupOrphanRetentionTokens(this.pg);
     return { success: true };
   }
 
