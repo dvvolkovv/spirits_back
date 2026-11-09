@@ -29,7 +29,12 @@ describe('RetentionUnsubscribeController', () => {
     expect(res.body).toContain('p***n@example.com');
     expect(res.headers['Cache-Control']).toBe('no-store');
     expect(res.headers['X-Robots-Tag']).toBe('noindex');
+    expect(res.headers['Referrer-Policy']).toBe('no-referrer');
+    expect(res.headers['Content-Security-Policy']).toContain("default-src 'none'");
+    expect(res.headers['Content-Security-Policy']).toContain("style-src 'unsafe-inline'");
+    expect(res.headers['Content-Security-Policy']).toContain("base-uri 'none'");
     expect(res.headers['Content-Security-Policy']).toContain("form-action 'self'");
+    expect(res.headers['Content-Security-Policy']).toContain("frame-ancestors 'none'");
   });
 
   it('POST выполняет идемпотентную отписку', async () => {
