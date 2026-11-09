@@ -45,5 +45,7 @@ describe('RetentionUnsubscribeService', () => {
   it('маскирует адрес на публичной странице', () => {
     expect(maskRetentionEmail('person@example.com')).toBe('p***n@example.com');
     expect(maskRetentionEmail('ab@example.com')).toBe('a***@example.com');
+    expect(maskRetentionEmail('😀@example.com')).toBe('😀***@example.com');
+    expect(maskRetentionEmail('a😀@example.com')).toBe('a***😀@example.com');
   });
 });
