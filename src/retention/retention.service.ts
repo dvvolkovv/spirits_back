@@ -80,7 +80,7 @@ export class RetentionService {
     const suppressed = new Map<string, { phone: string | null }>();
     for (const row of rows) {
       const contact = contacts.get(row.user_id) || {
-        userId: row.user_id, email: null, phone: null, language: 'ru', unsubscribed: false,
+        userId: row.user_id, email: null, phone: null, language: 'ru', name: null, unsubscribed: false,
       };
       if (contact.unsubscribed) {
         suppressed.set(row.user_id, { phone: contact.phone });

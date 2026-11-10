@@ -6,6 +6,7 @@ export interface RetentionContact {
   email: string | null;
   phone: string | null;
   language: string;
+  name: string | null;
   unsubscribed: boolean;
 }
 

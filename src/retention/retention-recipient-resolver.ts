@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { LanguageService } from '../common/services/language.service';
 import { PgService } from '../common/services/pg.service';
 import { normalizeEmail, normalizePhone } from './retention-recipient';
+import { normalizeRetentionName } from './retention-personalization';
 import type { RetentionContact } from './retention.types';
 
 @Injectable()
@@ -14,7 +15,10 @@ export class RetentionRecipientResolver {
     if (!ids.length) return result;
 
     const [profiles, accounts, identities] = await Promise.all([
-      this.pg.query('SELECT user_id, email FROM ai_profiles_consolidated WHERE user_id=ANY($1::text[])', [ids]),
+      this.pg.query(
+        "SELECT user_id, email, profile_data->>'name' AS name FROM ai_profiles_consolidated WHERE user_id=ANY($1::text[])",
+        [ids],
+      ),
       this.pg.query('SELECT internal_id::text AS user_id, primary_email FROM user_id WHERE internal_id=ANY($1::text[])', [ids]),
       this.pg.query(
         `SELECT user_id, provider, provider_sub, email, email_verified, last_used_at, created_at
@@ -76,6 +80,7 @@ export class RetentionRecipientResolver {
         email,
         phone: phone || null,
         language: await this.language.resolveUserLanguage(id),
+        name: normalizeRetentionName(profileById.get(id)?.name),
         unsubscribed: emails.length > 0 && !email,
       });
     }));
