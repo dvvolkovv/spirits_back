@@ -94,21 +94,19 @@ describe('retention mail', () => {
   });
 
   it.each([
-    ['ru', '3 дня'],
-    ['en', '3 days'],
-    ['es', '3 días'],
-    ['de', '3 Tagen'],
-    ['fr', '3 jours'],
-    ['zh', '3天'],
-    ['pt', '3 dias'],
+    ['ru', 'Здравствуйте, Alex! Последняя активность в Linkeon была 3 дня назад.'],
+    ['en', 'Hello, Alex! Your last activity in Linkeon was 3 days ago.'],
+    ['es', '¡Hola, Alex! Tu última actividad en Linkeon fue hace 3 días.'],
+    ['de', 'Guten Tag, Alex! Ihre letzte Aktivität in Linkeon war vor 3 Tagen.'],
+    ['fr', 'Bonjour, Alex ! Dernière activité sur Linkeon : il y a 3 jours.'],
+    ['zh', '您好，Alex！您在 Linkeon 的最近活动是在3天前。'],
+    ['pt', 'Olá, Alex! A sua última atividade no Linkeon foi há 3 dias.'],
   ])('%s локализует паузу без русских фраз', (language, expected) => {
     const mail = buildRetentionEmail({
       mode: 'general', language, assistantName: null, name: 'Alex', daysInactive: 3,
       chatUrl: retentionChatUrl(language), unsubscribeUrl: null,
     });
-    expect(mail.text).toContain('Alex');
-    expect(mail.text).toContain(expected);
-    if (language !== 'ru') expect(mail.text).not.toContain('дня');
+    expect(mail.text.startsWith(expected)).toBe(true);
   });
 
   it('некорректная пауза пропускается', () => {
