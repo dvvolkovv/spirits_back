@@ -93,6 +93,30 @@ describe('retention mail', () => {
     expect(mail.html).toContain('&lt;img src=x&gt;');
   });
 
+  it('имя {url} остаётся литеральным в email text и HTML', () => {
+    const chatUrl = retentionChatUrl('ru');
+    const mail = buildRetentionEmail({
+      mode: 'general', language: 'ru', assistantName: 'Роман', name: '{url}', daysInactive: 3,
+      chatUrl, unsubscribeUrl: null,
+    });
+    expect(mail.text).toContain('Здравствуйте, {url}!');
+    expect(mail.text).toContain(`в чат: ${chatUrl}.`);
+    expect(mail.text.split(chatUrl)).toHaveLength(2);
+    expect(mail.text.endsWith('Если сейчас не до этого, это совершенно нормально, не отвлекаем.')).toBe(true);
+    expect(mail.html).toContain('Здравствуйте, {url}!');
+    expect(mail.html).toContain(`href="${chatUrl}"`);
+    expect(mail.html.split('Вернуться в чат')).toHaveLength(2);
+    expect(mail.html).toContain('Если сейчас не до этого, это совершенно нормально, не отвлекаем.');
+  });
+
+  it('имя {url} остаётся литеральным в SMS, ссылка и концовка сохраняются', () => {
+    const sms = buildRetentionSmsMessage('general', 'Роман', '{url}', 3);
+    expect(sms).toContain('Здравствуйте, {url}!');
+    expect(sms).toContain('в чат: https://my.linkeon.io/chat.');
+    expect(sms.split('https://my.linkeon.io/chat')).toHaveLength(2);
+    expect(sms.endsWith('Если сейчас не до этого, это совершенно нормально, не отвлекаем.')).toBe(true);
+  });
+
   it.each([
     ['ru', 'Здравствуйте, Alex! Последняя активность в Linkeon была 3 дня назад.'],
     ['en', 'Hello, Alex! Your last activity in Linkeon was 3 days ago.'],
