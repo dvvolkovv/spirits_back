@@ -99,7 +99,7 @@ describe('retention mail', () => {
     ['es', '¡Hola, Alex! Tu última actividad en Linkeon fue hace 3 días.'],
     ['de', 'Guten Tag, Alex! Ihre letzte Aktivität in Linkeon war vor 3 Tagen.'],
     ['fr', 'Bonjour, Alex ! Dernière activité sur Linkeon : il y a 3 jours.'],
-    ['zh', '您好，Alex！您在 Linkeon 的最近活动是在3天前。'],
+    ['zh', '您好，Alex！ 您在 Linkeon 的最近活动是在3天前。'],
     ['pt', 'Olá, Alex! A sua última atividade no Linkeon foi há 3 dias.'],
   ])('%s локализует паузу без русских фраз', (language, expected) => {
     const mail = buildRetentionEmail({
