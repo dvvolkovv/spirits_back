@@ -32,6 +32,7 @@ import { OwnChatEcho } from './chat-echo.js';
 import { ListenMute } from './listen-mute.js';
 import { disconnectName } from './ending.js';
 import { GUARD_TICK_MS, StuckGenerationGuard, attachResponseLog, realtimeOf } from './stuck-generation.js';
+import { INPUT_WATCH_TICK_MS, InputWatch } from './input-watch.js';
 import { Room as ExternalRoom } from '@livekit/rtc-node';
 import {
   answerTo,
@@ -1452,25 +1453,24 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
     // complete. Так дважды терялся транскрипт (25 и 26.08.2026).
     warnAt.unref?.();
 
-    const hardStop = setTimeout(() => {
-      // Именно ЗАВЕРШАЕМ, а не только помечаем в БД. Раньше здесь был один
-      // backend.failed(): статус менялся на 'failed', а Realtime-сессия жила
-      // дальше и тарифицировалась — единственный предохранитель по деньгам
-      // ничего не останавливал. Плюс подоспевший следом complete перетирал
-      // 'failed' обратно на 'completed'.
-      void (async () => {
-        try {
-          await session.close();
-        } catch (e) {
-          console.error('session.close() failed', e);
-        }
-        try {
-          await ctx.room.disconnect();
-        } catch (e) {
-          console.error('room.disconnect() failed', e);
-        }
-      })();
-    }, SESSION_LIMIT_MS);
+    // Именно ЗАВЕРШАЕМ, а не только помечаем в БД. Раньше у предохранителя
+    // здесь был один backend.failed(): статус менялся на 'failed', а
+    // Realtime-сессия жила дальше и тарифицировалась — единственный
+    // предохранитель по деньгам ничего не останавливал. Плюс подоспевший
+    // следом complete перетирал 'failed' обратно на 'completed'.
+    const endSession = async () => {
+      try {
+        await session.close();
+      } catch (e) {
+        console.error('session.close() failed', e);
+      }
+      try {
+        await ctx.room.disconnect();
+      } catch (e) {
+        console.error('room.disconnect() failed', e);
+      }
+    };
+    const hardStop = setTimeout(() => void endSession(), SESSION_LIMIT_MS);
     hardStop.unref?.();
 
     // Итоги отправляем при ПЕРВОМ же признаке конца звонка, а не только из
@@ -1742,6 +1742,22 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
       // unref — по той же причине, что у всех таймеров здесь: иначе процесс
       // задания не завершится после закрытия сессии.
       setInterval(() => stuckGuard.check(Date.now()), GUARD_TICK_MS).unref?.();
+
+      // СТОРОЖ ПРИЁМА (10.11.2026) — подробности в input-watch.ts.
+      //
+      // Модель сказала «речь началась» и замолчала: на встрече 10.11.2026 так
+      // Роман оглох на 26 минут до конца. Сторож переоткрывает сокет, а не
+      // помогло — закрывает сессию: глухой ассистент хуже ушедшего.
+      if (startedRt) {
+        const inputWatch = new InputWatch(startedRt);
+        const inputTimer = setInterval(() => {
+          if (sessionClosed) return clearInterval(inputTimer);
+          if (inputWatch.check() !== 'dead') return;
+          clearInterval(inputTimer);
+          void endSession();
+        }, INPUT_WATCH_TICK_MS);
+        inputTimer.unref?.();
+      }
 
       // СТОРОЖ ПУСТОГО ЗВОНКА (26.10.2026).
       //

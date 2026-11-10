@@ -50,6 +50,17 @@ export const SDK_PATCHES = [
     from: '        wsConn = await this.createWsConn();\n        if (signal.aborted) break;\n        try {\n',
     to: '        try {\n          wsConn = await this.createWsConn().catch((error) => { throw isAPIError(error) ? error : new APIConnectionError({ message: (error && error.message) || String(error) }); });\n          if (signal.aborted) break;\n',
   },
+  {
+    // Ручка «переоткрыть сокет сейчас» для сторожа приёма (input-watch.ts).
+    // Своей у плагина 1.7.0 нет: переоткрытие случается только по таймеру раз
+    // в 20 минут или по обрыву. Ручка завершает текущий сокет восстановимой
+    // ошибкой — дальше штатный путь плагина: повтор, новый сокет, заново
+    // описанная сессия и разговор.
+    id: 'realtime-force-reconnect',
+    file: '@livekit/agents-plugin-openai/dist/realtime/realtime_model.js',
+    from: '    const wsCloseFuture = new Future();\n    wsConn.onerror = (error) => {\n',
+    to: '    const wsCloseFuture = new Future();\n    this.lkForceReconnect = (reason) => { if (!wsCloseFuture.done) wsCloseFuture.resolve(new APIConnectionError({ message: String(reason) })); };\n    wsConn.onerror = (error) => {\n',
+  },
 ];
 
 /** Текст с правкой. Уже наложена — тот же текст; ни того ни другого — ошибка. */
