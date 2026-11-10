@@ -44,8 +44,9 @@ describe('retention mail', () => {
   });
 
   it('SMS сохраняет текущие русские тексты', () => {
-    expect(buildRetentionSmsMessage('general', 'Роман')).toContain('Роман из LINKEON');
-    expect(buildRetentionSmsMessage('curious')).toContain('ассистенты под любые задачи');
+    expect(buildRetentionSmsMessage('general', 'Роман')).toBe('Здравствуйте! Роман из LINKEON будет рад продолжить разговор, если будет желание — можно вернуться в чат: https://my.linkeon.io/chat. Если сейчас не до этого, это совершенно нормально, не отвлекаем.');
+    expect(buildRetentionSmsMessage('general')).toBe('Здравствуйте! Ваш ассистент в LINKEON будет рад продолжить разговор, если будет желание — можно вернуться в чат: https://my.linkeon.io/chat. Если сейчас не до этого, это совершенно нормально, не отвлекаем.');
+    expect(buildRetentionSmsMessage('curious')).toBe('Здравствуйте! Напомним, что у нас есть ассистенты под любые задачи. Если есть время и желание — приходите в https://my.linkeon.io/chat и повышайте свою эффективность 👍');
   });
 
   it('General email персонализирует приветствие и паузу', () => {
@@ -69,6 +70,8 @@ describe('retention mail', () => {
       .toContain('Здравствуйте, Дмитрий! Последняя активность в Linkeon была 3 дня назад.');
     expect(buildRetentionSmsMessage('curious', null, 'Дмитрий', undefined, 25))
       .toContain('Здравствуйте, Дмитрий! Последняя активность в Linkeon была 25 часов назад.');
+    expect(buildRetentionSmsMessage('general', 'Роман', 'Дмитрий', 3))
+      .toContain('https://my.linkeon.io/chat. Если');
   });
 
   it('без имени вставляет паузу после нейтрального приветствия, без undefined', () => {
