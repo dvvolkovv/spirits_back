@@ -106,7 +106,7 @@ export class RetentionService {
         channel,
         language: contact.language,
         subject: mail?.subject || null,
-        message: mail?.text || (channel === 'sms' ? buildRetentionSmsMessage(mode, row.assistant_name) : ''),
+        message: mail?.text || (channel === 'sms' ? buildRetentionSmsMessage(mode, row.assistant_name, contact.name, row.days_inactive, row.hours_inactive) : ''),
         assistant_id: row.assistant_id,
         assistant_name: row.assistant_name || null,
         last_at: row.last_at,
