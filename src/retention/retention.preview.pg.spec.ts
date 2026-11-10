@@ -55,8 +55,12 @@ maybe('retention preview against PostgreSQL', () => {
     await pool.query(`INSERT INTO custom_chat_history VALUES ('dozvon_7', 'human', $1)`, [THREE_DAYS_AGO]);
     await chat(CURIOUS_UUID, TWENTY_FIVE_HOURS_AGO);
 
-    await pool.query(`INSERT INTO ai_profiles_consolidated (user_id, email) VALUES
-      ($1, 'uuid@example.com'), ($2, 'blocked@example.com'), ('70001112233', NULL), ('70000000000', 'test@example.com'), ($3, 'curious@example.com')`,
+    await pool.query(`INSERT INTO ai_profiles_consolidated (user_id, email, profile_data) VALUES
+      ($1, 'uuid@example.com', '{"name":"Alex"}'),
+      ($2, 'blocked@example.com', '{}'),
+      ('70001112233', NULL, '{}'),
+      ('70000000000', 'test@example.com', '{}'),
+      ($3, 'curious@example.com', '{"name":"Дмитрий"}')`,
       [EMAIL_UUID, SUPPRESSED_UUID, CURIOUS_UUID]);
     await pool.query(`INSERT INTO user_identities VALUES
       ($1, 'phone', '+79009998877', NULL, false, NULL, now())`, [SUPPRESSED_UUID]);
@@ -76,6 +80,8 @@ maybe('retention preview against PostgreSQL', () => {
     const preview = await service.buildRetentionOutreach({ minDays: 2, maxDays: 30 });
     const byId = new Map(preview.drafts.map((d) => [d.user_id, d]));
     expect(byId.get(EMAIL_UUID)).toMatchObject({ channel: 'email', email: 'uuid@example.com', language: 'en' });
+    expect(byId.get(EMAIL_UUID)?.message)
+      .toContain('Hello, Alex! Your last activity in Linkeon was 3 days ago.');
     expect(byId.get('70001112233')).toMatchObject({ channel: 'sms', phone: '70001112233' });
     expect(byId.has(SUPPRESSED_UUID)).toBe(false);
     expect(byId.has('70000000000')).toBe(false);
@@ -87,5 +93,7 @@ maybe('retention preview against PostgreSQL', () => {
     const preview = await service.buildCuriousReturnOutreach();
     expect(preview.drafts).toHaveLength(1);
     expect(preview.drafts[0]).toMatchObject({ user_id: CURIOUS_UUID, channel: 'email' });
+    expect(preview.drafts[0].message)
+      .toContain('Здравствуйте, Дмитрий! Последняя активность в Linkeon была 25 часов назад.');
   });
 });

@@ -24,9 +24,11 @@ const preview = (drafts: RetentionDraft[]): RetentionPreview => ({
 function harness(
   drafts: RetentionDraft[],
   suppressedEntries: Array<[string, { phone: string | null }]> = [],
+  personalizationEntries: Array<[string, { name: string | null }]> = [],
 ) {
   const svc = Object.create(RetentionService.prototype) as any;
   const suppressed = new Map(suppressedEntries);
+  const personalization = new Map(personalizationEntries);
   const generalPreview = preview(drafts);
   generalPreview.summary.skipped_unsubscribed = suppressed.size;
   const curiousPreview = {
@@ -35,8 +37,8 @@ function harness(
     window: { min_hours: 24, max_hours: 48 },
     summary: { ...generalPreview.summary },
   };
-  svc.buildGeneralSegment = jest.fn().mockResolvedValue({ preview: generalPreview, suppressed });
-  svc.buildCuriousSegment = jest.fn().mockResolvedValue({ preview: curiousPreview, suppressed });
+  svc.buildGeneralSegment = jest.fn().mockResolvedValue({ preview: generalPreview, suppressed, personalization });
+  svc.buildCuriousSegment = jest.fn().mockResolvedValue({ preview: curiousPreview, suppressed, personalization });
   svc.buildRetentionOutreach = jest.fn().mockImplementation(
     async () => (await svc.buildGeneralSegment()).preview,
   );
@@ -81,6 +83,16 @@ describe('RetentionService send', () => {
     const props = JSON.parse(svc.pg.query.mock.calls[0][1][1]);
     expect(props).toMatchObject({ status: 'sent', channel: 'email' });
     expect(props).not.toHaveProperty('body');
+  });
+
+  it('фактическая отправка email содержит имя и паузу', async () => {
+    const svc = harness(
+      [draft({ days_inactive: 3 })],
+      [],
+      [['u1', { name: 'Alex' }]],
+    );
+    await svc.sendRetentionOutreach({ confirm: true });
+    expect(svc.mail.send.mock.calls[0][3]).toContain('Hello, Alex! Your last activity in Linkeon was 3 days ago.');
   });
 
   it('email ошибся — SMS не вызывается, событие содержит только безопасный код', async () => {
