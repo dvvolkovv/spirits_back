@@ -18,7 +18,7 @@ describe('retention personalization', () => {
     ['en', 'general', 3, undefined, '3 days'],
     ['en', 'curious', undefined, 25, '25 hours'],
     ['de', 'general', 1, undefined, 'einem Tag'],
-    ['de', 'general', 3, undefined, 'Tagen'],
+    ['de', 'general', 3, undefined, '3 Tagen'],
     ['zh', 'general', 3, undefined, '3天'],
     ['zh', 'curious', undefined, 25, '25小时'],
   ])('%s/%s: %s → %s', (language, mode, days, hours, expected) => {
