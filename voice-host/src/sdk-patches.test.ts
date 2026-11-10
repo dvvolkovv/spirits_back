@@ -20,8 +20,8 @@ const NM = join(dirname(fileURLToPath(import.meta.url)), '..', 'node_modules');
 interface Patch { id: string; file: string; from: string; to: string }
 const patches = SDK_PATCHES as Patch[];
 
-test('правки две: цикл отправки плагина и лишний tee звука', () => {
-  assert.deepEqual(patches.map((p) => p.id).sort(), ['realtime-send-loop', 'unread-recognition-tee']);
+test('правки три: цикл отправки плагина, лишний tee звука, повтор открытия сокета', () => {
+  assert.deepEqual(patches.map((p) => p.id).sort(), ['realtime-connect-retry', 'realtime-send-loop', 'unread-recognition-tee']);
 });
 
 for (const p of patches) {

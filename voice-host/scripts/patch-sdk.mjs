@@ -36,6 +36,20 @@ export const SDK_PATCHES = [
     from: 'if (this.realtimeSession && this.audioRecognition) {\n      const [realtimeAudioStream',
     to: 'if (this.realtimeSession && this.audioRecognition && (this.audioRecognition.stt || this.audioRecognition.vad)) {\n      const [realtimeAudioStream',
   },
+  {
+    // Открытие сокета Realtime стояло ВНЕ блока повторов цикла соединения.
+    // Сервер закрыл сокет без ошибки, новый не открылся — исключение выходило
+    // из цикла, Task плагина глотал его на уровне debug, и сессия жила дальше
+    // без модели: звук уходил в никуда, ни ошибки, ни строки в логе. Встреча
+    // 10.11.2026, 20-я минута, Роман оглох до конца. Теперь открытие внутри
+    // try, а его ошибка — APIConnectionError: штатный повтор и строка
+    // «connection failed, retrying» в логе; после maxRetry — невосстановимая
+    // ошибка наверх, и сессия закрывается видимо, а не тихо.
+    id: 'realtime-connect-retry',
+    file: '@livekit/agents-plugin-openai/dist/realtime/realtime_model.js',
+    from: '        wsConn = await this.createWsConn();\n        if (signal.aborted) break;\n        try {\n',
+    to: '        try {\n          wsConn = await this.createWsConn().catch((error) => { throw isAPIError(error) ? error : new APIConnectionError({ message: (error && error.message) || String(error) }); });\n          if (signal.aborted) break;\n',
+  },
 ];
 
 /** Текст с правкой. Уже наложена — тот же текст; ни того ни другого — ошибка. */
