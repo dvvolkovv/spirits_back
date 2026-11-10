@@ -93,8 +93,10 @@ export function buildRetentionSmsMessage(
   hoursInactive?: unknown,
 ): string {
   const s = STRINGS.ru;
-  const who = assistantName ? `${assistantName}${s.fromLinkeon}` : `${s.defaultAssistant}${s.fromLinkeon}`;
-  const template = fill(mode === 'general' ? s.generalBody : s.curiousBody, who);
+  const who = assistantName ? `${assistantName} из LINKEON` : 'Ваш ассистент в LINKEON';
+  const template = mode === 'general'
+    ? `Здравствуйте! ${who} будет рад продолжить разговор, если будет желание — можно вернуться в чат: {url}. Если сейчас не до этого, это совершенно нормально, не отвлекаем.`
+    : fill(s.curiousBody, who);
   return personalizeBody(template, mode, 'ru', s, name, daysInactive, hoursInactive)
     .split('{url}').join('https://my.linkeon.io/chat');
 }
