@@ -1458,9 +1458,16 @@ const DEFERRED_TTL_MS = FOLLOWUP_WINDOW_MS;
     // Realtime-сессия жила дальше и тарифицировалась — единственный
     // предохранитель по деньгам ничего не останавливал. Плюс подоспевший
     // следом complete перетирал 'failed' обратно на 'completed'.
+    //
+    // Зовут двое — предохранитель и сторож приёма, — и SDK может закрывать
+    // сессию сам после невосстановимой ошибки. session.close() очередь не
+    // проверяет: второй вызов гонит слив и закрытие записи повторно.
+    let ending = false;
     const endSession = async () => {
+      if (ending) return;
+      ending = true;
       try {
-        await session.close();
+        if (!(session as any).closingTask) await session.close();
       } catch (e) {
         console.error('session.close() failed', e);
       }

@@ -8,11 +8,16 @@
  * realtime-connect-retry), но и после неё сокет может замолчать иначе, а
  * сторож ответа (stuck-generation.ts) видит только зависший ОТВЕТ.
  *
- * Признак — именно «речь началась и не кончилась», а не «давно нет событий».
- * В тишине встречи модель законно молчит минутами, и сторож по общей тишине
- * переоткрывал бы сокет каждые несколько минут, каждый раз заново заливая
- * весь разговор. Отрезок речи без паузы сервер закрывает за доли секунды
- * тишины; два часа живого монолога без вдоха не бывает.
+ * Признак — «речь началась, и после этого от сервера НИЧЕГО», а не «давно
+ * нет событий». В тишине встречи модель законно молчит минутами, и сторож по
+ * общей тишине переоткрывал бы сокет каждые несколько минут, каждый раз
+ * заново заливая весь разговор. Отрезок речи без паузы сервер закрывает за
+ * доли секунды тишины; двух минут живого монолога без вдоха не бывает.
+ *
+ * «Речь началась» без конца бывает и законно — тогда отметку снимаем: сокет
+ * сменили (новая сессия сервера), буфер очищен посреди речи, или после неё
+ * модель что-то прислала, то есть жива (звук мог оборваться на полуслове).
+ * Ложное переоткрытие не бесплатно: обрывает ответ Романа на полуслове.
  *
  * Что делаем. Переоткрываем сокет ручкой плагина lkForceReconnect (правка SDK
  * realtime-force-reconnect) — тем же путём, что плановое переоткрытие раз в
@@ -32,8 +37,9 @@ export const STUCK_SPEECH_MS = 120_000;
 /**
  * Сколько ждём первого события сервера после переоткрытия.
  *
- * Плагин повторяет открытие до трёх раз с таймаутом 10 с и паузой 2 с —
- * худший штатный путь около 40 с.
+ * Плагин повторяет открытие с таймаутом 10 с и паузами 0,1 и 2 с; сама
+ * ручка съедает одну попытку, и до отказа остаются три открытия — худший
+ * штатный путь около 35 с.
  */
 export const RECOVERY_MS = 60_000;
 
@@ -49,9 +55,15 @@ export interface ReconnectableRt {
 export type InputWatchResult = 'ok' | 'forced' | 'waiting' | 'recovered' | 'dead';
 
 export class InputWatch {
+  /** Когда пришло «речь началась», после которого сервер не прислал ничего. */
   private speechSince: number | undefined;
-  private lastServerEventAt = 0;
   private forcedAt: number | undefined;
+  /**
+   * Новая сессия после переоткрытия. Любое событие сервера выздоровлением не
+   * считаем: ручка может не сработать (плагин ждёт конец ответа или сокета
+   * уже нет), а старый сокет до закрытия успевает что-то прислать.
+   */
+  private reopened = false;
 
   constructor(
     private readonly rt: ReconnectableRt,
@@ -59,17 +71,19 @@ export class InputWatch {
     private readonly log: (line: string) => void = (l) => console.log(l),
   ) {
     rt.on?.('openai_server_event_received', (ev: any) => {
-      const t = this.now();
-      this.lastServerEventAt = t;
-      if (ev?.type === 'input_audio_buffer.speech_started') this.speechSince = t;
-      else if (ev?.type === 'input_audio_buffer.speech_stopped') this.speechSince = undefined;
+      if (ev?.type === 'session.created') this.reopened = true;
+      this.speechSince = ev?.type === 'input_audio_buffer.speech_started' ? this.now() : undefined;
+    });
+    rt.on?.('session_reconnected', () => {
+      this.reopened = true;
+      this.speechSince = undefined;
     });
   }
 
   check(): InputWatchResult {
     const now = this.now();
     if (this.forcedAt !== undefined) {
-      if (this.lastServerEventAt > this.forcedAt) {
+      if (this.reopened) {
         this.forcedAt = undefined;
         this.log('[вход] после переоткрытия модель снова на связи');
         return 'recovered';
@@ -88,6 +102,7 @@ export class InputWatch {
     }
     this.log(`[вход] модель молчит ${silentS}с посреди речи — переоткрываю сокет`);
     this.forcedAt = now;
+    this.reopened = false;
     this.rt.lkForceReconnect('сторож приёма: речь началась и не кончилась');
     return 'forced';
   }
