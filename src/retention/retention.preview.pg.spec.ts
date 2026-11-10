@@ -58,7 +58,7 @@ maybe('retention preview against PostgreSQL', () => {
     await pool.query(`INSERT INTO ai_profiles_consolidated (user_id, email, profile_data) VALUES
       ($1, 'uuid@example.com', '{"name":"Alex"}'),
       ($2, 'blocked@example.com', '{}'),
-      ('70001112233', NULL, '{}'),
+      ('70001112233', NULL, '{"name":"Дмитрий"}'),
       ('70000000000', 'test@example.com', '{}'),
       ($3, 'curious@example.com', '{"name":"Дмитрий"}')`,
       [EMAIL_UUID, SUPPRESSED_UUID, CURIOUS_UUID]);
@@ -83,6 +83,8 @@ maybe('retention preview against PostgreSQL', () => {
     expect(byId.get(EMAIL_UUID)?.message)
       .toContain('Hello, Alex! Your last activity in Linkeon was 3 days ago.');
     expect(byId.get('70001112233')).toMatchObject({ channel: 'sms', phone: '70001112233' });
+    expect(byId.get('70001112233')?.message)
+      .toContain('Здравствуйте, Дмитрий! Последняя активность в Linkeon была 3 дня назад.');
     expect(byId.has(SUPPRESSED_UUID)).toBe(false);
     expect(byId.has('70000000000')).toBe(false);
     expect(byId.has('dozvon')).toBe(false);

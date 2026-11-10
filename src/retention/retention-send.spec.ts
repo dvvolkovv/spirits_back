@@ -95,6 +95,17 @@ describe('RetentionService send', () => {
     expect(svc.mail.send.mock.calls[0][3]).toContain('Hello, Alex! Your last activity in Linkeon was 3 days ago.');
   });
 
+  it('фактическая отправка SMS содержит имя и паузу как в preview', async () => {
+    const svc = harness(
+      [draft({ email: null, channel: 'sms', days_inactive: 3 })],
+      [],
+      [['u1', { name: 'Дмитрий' }]],
+    );
+    await svc.sendRetentionOutreach({ confirm: true });
+    expect((axios.get as jest.Mock).mock.calls[0][1].params.text)
+      .toContain('Здравствуйте, Дмитрий! Последняя активность в Linkeon была 3 дня назад.');
+  });
+
   it('email ошибся — SMS не вызывается, событие содержит только безопасный код', async () => {
     const svc = harness([draft()]);
     svc.mail.send.mockResolvedValue({ ok: false, error: 'SMTP timeout: письмо на u@example.com' });
