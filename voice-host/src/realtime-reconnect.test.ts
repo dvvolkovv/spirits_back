@@ -108,3 +108,22 @@ test('неудачное открытие видно наверху как во�
     restore();
   }
 });
+
+test('ручка переоткрытия: сокет закрывается и открывается заново штатным путём плагина', async () => {
+  // Сторож приёма (input-watch.ts) зовёт её, когда модель замолчала посреди
+  // речи. Своего «переоткрыть сейчас» у плагина 1.7.0 нет.
+  const first = new FakeWs();
+  const second = new FakeWs();
+  const { session, calls, restore } = sessionWith([first, second]);
+  try {
+    assert.ok(await until(() => calls.length === 1 && typeof session.lkForceReconnect === 'function'), 'ручки переоткрытия нет');
+    session.lkForceReconnect('сторож приёма');
+    assert.ok(await until(() => calls.length === 2), `открытий сокета: ${calls.length}`);
+    assert.equal(first.readyState, CLOSED, 'старый сокет не закрыт');
+    assert.ok(await until(() => second.sent.some((e) => e.type === 'session.update')), 'новому сокету не отправлен session.update');
+  } finally {
+    await session.close();
+    for (const ws of [first, second]) ws.close();
+    restore();
+  }
+});
