@@ -24,6 +24,7 @@ export const RETENTION_COOLDOWN_DAYS = 14;
 interface RetentionSegmentResult {
   preview: RetentionPreview;
   suppressed: Map<string, { phone: string | null }>;
+  personalization: Map<string, { name: string | null }>;
 }
 
 @Injectable()
@@ -78,10 +79,12 @@ export class RetentionService {
 
     const drafts: RetentionDraft[] = [];
     const suppressed = new Map<string, { phone: string | null }>();
+    const personalization = new Map<string, { name: string | null }>();
     for (const row of rows) {
       const contact = contacts.get(row.user_id) || {
         userId: row.user_id, email: null, phone: null, language: 'ru', name: null, unsubscribed: false,
       };
+      personalization.set(row.user_id, { name: contact.name });
       if (contact.unsubscribed) {
         suppressed.set(row.user_id, { phone: contact.phone });
         continue;
@@ -89,6 +92,7 @@ export class RetentionService {
       const channel = selectRetentionChannel(contact);
       const mail = channel === 'email' ? buildRetentionEmail({
         mode, language: contact.language, assistantName: row.assistant_name,
+        name: contact.name, daysInactive: row.days_inactive, hoursInactive: row.hours_inactive,
         chatUrl: retentionChatUrl(contact.language), unsubscribeUrl: null,
       }) : null;
       const lastSentAt = lastSent.get(row.user_id) || null;
@@ -125,6 +129,7 @@ export class RetentionService {
         drafts,
       },
       suppressed,
+      personalization,
     };
   }
 
@@ -209,6 +214,8 @@ export class RetentionService {
               const unsubscribeUrl = `${base}/webhook/retention/unsubscribe?token=${encodeURIComponent(token)}&lang=${d.language}`;
               const content = buildRetentionEmail({
                 mode, language: d.language, assistantName: d.assistant_name,
+                name: segment.personalization?.get(d.user_id)?.name,
+                daysInactive: d.days_inactive, hoursInactive: d.hours_inactive,
                 chatUrl: retentionChatUrl(d.language), unsubscribeUrl,
               });
               const sent = await this.mail.send(d.email!, content.subject, content.html, content.text);
@@ -221,7 +228,16 @@ export class RetentionService {
           }
         }
       } else {
-        const sent = await this.sendOutreachSms(d.phone!, buildRetentionSmsMessage(mode, d.assistant_name));
+        const sent = await this.sendOutreachSms(
+          d.phone!,
+          buildRetentionSmsMessage(
+            mode,
+            d.assistant_name,
+            segment.personalization?.get(d.user_id)?.name,
+            d.days_inactive,
+            d.hours_inactive,
+          ),
+        );
         status = sent.ok ? 'sent' : 'failed';
         error = sent.ok ? null : sent.error || 'sms_error';
       }
