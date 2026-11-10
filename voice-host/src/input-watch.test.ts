@@ -10,14 +10,19 @@ import { InputWatch, RECOVERY_MS, STUCK_SPEECH_MS } from './input-watch.js';
 
 /** Подставная сессия плагина: события сервера и ручка переоткрытия. */
 function fakeRt(withHook = true) {
-  const listeners: ((ev: any) => void)[] = [];
+  const listeners = new Map<string, ((ev: any) => void)[]>();
   const rt: any = {
     forced: [] as string[],
     on(event: string, cb: (ev: any) => void) {
-      if (event === 'openai_server_event_received') listeners.push(cb);
+      listeners.set(event, [...(listeners.get(event) ?? []), cb]);
     },
+    /** Событие сервера Realtime. */
     emit(type: string) {
-      for (const cb of listeners) cb({ type });
+      for (const cb of listeners.get('openai_server_event_received') ?? []) cb({ type });
+    },
+    /** Событие самого плагина. */
+    emitRt(event: string) {
+      for (const cb of listeners.get(event) ?? []) cb({});
     },
   };
   if (withHook) rt.lkForceReconnect = (reason: string) => rt.forced.push(reason);
@@ -80,7 +85,7 @@ test('после переоткрытия модель ответила — сн
   at(1_000_000 + STUCK_SPEECH_MS);
   watch.check();
   at(1_000_000 + STUCK_SPEECH_MS + 1_000);
-  rt.emit('session.updated');
+  rt.emitRt('session_reconnected');
   assert.equal(watch.check(), 'recovered');
   assert.match(lines.join('\n'), /модель снова на связи/);
   // И дальше сторож работает как обычно.
@@ -113,4 +118,72 @@ test('порог с запасом против живого монолога: �
   assert.ok(STUCK_SPEECH_MS >= 90_000);
   // Переоткрытие с тремя повторами по таймауту 10 с укладывается в ~40 с.
   assert.ok(RECOVERY_MS >= 45_000);
+});
+
+// Ложные срабатывания: «речь началась», а конца не будет по законной причине.
+// Ложное переоткрытие обрывает ответ Романа на полуслове и заново заливает
+// весь разговор (ревью 10.11.2026).
+
+test('речь началась на старом сокете, а его сменили — конца не будет, это не зависание', () => {
+  // Плановое переоткрытие раз в 20 минут ждёт конец ответа, но не конец речи.
+  const rt = fakeRt();
+  const { watch, at } = watchOf(rt);
+  rt.emit('input_audio_buffer.speech_started');
+  at(1_000_000 + 1_000);
+  rt.emit('session.created');
+  at(1_000_000 + STUCK_SPEECH_MS * 2);
+  assert.equal(watch.check(), 'ok');
+  assert.deepEqual(rt.forced, []);
+});
+
+test('буфер очищен посреди речи — конца не будет, это не зависание', () => {
+  const rt = fakeRt();
+  const { watch, at } = watchOf(rt);
+  rt.emit('input_audio_buffer.speech_started');
+  at(1_000_000 + 1_000);
+  rt.emit('input_audio_buffer.cleared');
+  at(1_000_000 + STUCK_SPEECH_MS * 2);
+  assert.equal(watch.check(), 'ok');
+  assert.deepEqual(rt.forced, []);
+});
+
+test('после «речь началась» модель что-то шлёт — она жива, сокет не трогаем', () => {
+  // Звук мог оборваться посреди фразы (ушёл последний говоривший), и конца
+  // речи сервер не увидит. Но живой сокет при этом отвечает — 10.11.2026 не
+  // пришло НИ ОДНОГО события.
+  const rt = fakeRt();
+  const { watch, at } = watchOf(rt);
+  rt.emit('input_audio_buffer.speech_started');
+  at(1_000_000 + 30_000);
+  rt.emit('response.created');
+  at(1_000_000 + STUCK_SPEECH_MS * 2);
+  assert.equal(watch.check(), 'ok');
+  assert.deepEqual(rt.forced, []);
+});
+
+test('после переоткрытия событие старого сокета — ещё не выздоровление', () => {
+  // Ручка может не сработать (плагин ждёт конец ответа или сокета уже нет), а
+  // старый сокет до закрытия успевает прислать событие. Выздоровление — только
+  // новая сессия.
+  const rt = fakeRt();
+  const { watch, at } = watchOf(rt);
+  rt.emit('input_audio_buffer.speech_started');
+  at(1_000_000 + STUCK_SPEECH_MS);
+  watch.check();
+  at(1_000_000 + STUCK_SPEECH_MS + 1_000);
+  rt.emit('response.done');
+  assert.equal(watch.check(), 'waiting');
+  at(1_000_000 + STUCK_SPEECH_MS + RECOVERY_MS);
+  assert.equal(watch.check(), 'dead');
+});
+
+test('новая сессия сервера после переоткрытия — выздоровление', () => {
+  const rt = fakeRt();
+  const { watch, at } = watchOf(rt);
+  rt.emit('input_audio_buffer.speech_started');
+  at(1_000_000 + STUCK_SPEECH_MS);
+  watch.check();
+  at(1_000_000 + STUCK_SPEECH_MS + 2_000);
+  rt.emit('session.created');
+  assert.equal(watch.check(), 'recovered');
 });
