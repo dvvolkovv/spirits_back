@@ -100,7 +100,7 @@ describe('retention mail', () => {
       chatUrl, unsubscribeUrl: null,
     });
     expect(mail.text).toContain('Здравствуйте, {url}!');
-    expect(mail.text).toContain(`в чат: ${chatUrl}.`);
+    expect(mail.text).toContain(`в чат: ${chatUrl} Если`);
     expect(mail.text.split(chatUrl)).toHaveLength(2);
     expect(mail.text.endsWith('Если сейчас не до этого, это совершенно нормально, не отвлекаем.')).toBe(true);
     expect(mail.html).toContain('Здравствуйте, {url}!');

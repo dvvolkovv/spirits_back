@@ -97,8 +97,9 @@ export function buildRetentionSmsMessage(
   const template = mode === 'general'
     ? `Здравствуйте! ${who} будет рад продолжить разговор, если будет желание — можно вернуться в чат: {url}. Если сейчас не до этого, это совершенно нормально, не отвлекаем.`
     : fill(s.curiousBody, who);
-  return personalizeBody(template, mode, 'ru', s, name, daysInactive, hoursInactive)
-    .split('{url}').join('https://my.linkeon.io/chat');
+  const [templateBeforeUrl, afterUrl = ''] = template.split('{url}');
+  const beforeUrl = personalizeBody(templateBeforeUrl, mode, 'ru', s, name, daysInactive, hoursInactive);
+  return `${beforeUrl}https://my.linkeon.io/chat${afterUrl}`;
 }
 
 function fill(template: string, assistant: string): string {
@@ -140,12 +141,12 @@ export function buildRetentionEmail(input: {
   const s = STRINGS[language] || STRINGS.ru;
   const assistant = input.assistantName ? `${input.assistantName}${s.fromLinkeon}` : `${s.defaultAssistant}${s.fromLinkeon}`;
   const template = fill(input.mode === 'general' ? s.generalBody : s.curiousBody, assistant);
-  const personalized = personalizeBody(template, input.mode, language, s, input.name, input.daysInactive, input.hoursInactive);
-  const body = personalized.split('{url}').join(input.chatUrl);
+  const [templateBeforeUrl, afterUrl = ''] = template.split('{url}');
+  const beforeUrl = personalizeBody(templateBeforeUrl, input.mode, language, s, input.name, input.daysInactive, input.hoursInactive);
+  const body = `${beforeUrl}${input.chatUrl}${afterUrl}`;
   const subject = input.mode === 'general' ? s.generalSubject : s.curiousSubject;
-  const [beforeUrl, afterUrl] = personalized.split('{url}');
   const link = `<a href="${escapeRetentionHtml(input.chatUrl)}" style="color:#4f46e5">${escapeRetentionHtml(s.cta)}</a>`;
-  let html = `<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.5;color:#111"><p>${escapeRetentionHtml(beforeUrl)}${link}${escapeRetentionHtml(afterUrl || '')}</p>`;
+  let html = `<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.5;color:#111"><p>${escapeRetentionHtml(beforeUrl)}${link}${escapeRetentionHtml(afterUrl)}</p>`;
   let text = body;
   if (input.unsubscribeUrl) {
     text += `\n\n${s.footer}\n${s.unsubscribe}: ${input.unsubscribeUrl}`;

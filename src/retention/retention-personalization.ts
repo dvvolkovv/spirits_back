@@ -3,7 +3,8 @@ import type { RetentionMode } from './retention.types';
 
 export function normalizeRetentionName(raw: unknown): string | null {
   const value = String(raw ?? '').trim();
-  return value.length > 0 && value.length <= 80 ? value : null;
+  const length = Array.from(value).length;
+  return length > 0 && length <= 80 ? value : null;
 }
 
 const FORMS: Record<string, { day: Record<string, string>; hour: Record<string, string> }> = {
