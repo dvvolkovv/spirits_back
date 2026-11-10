@@ -118,4 +118,13 @@ describe('RetentionRecipientResolver', () => {
     expect(result.get(UUID)?.unsubscribed).toBe(true);
     expect(result.get(second)?.unsubscribed).toBe(true);
   });
+
+  it('читает name из profile_data и нормализует его', async () => {
+    const pg = fakePg({
+      profiles: [{ user_id: UUID, email: null, name: '  Дмитрий  ' }],
+    });
+    const result = await new RetentionRecipientResolver(pg as any, language as any).resolve([UUID]);
+    expect(result.get(UUID)?.name).toBe('Дмитрий');
+    expect(pg.query.mock.calls[0][0]).toContain("profile_data->>'name' AS name");
+  });
 });
