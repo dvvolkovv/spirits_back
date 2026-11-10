@@ -47,4 +47,73 @@ describe('retention mail', () => {
     expect(buildRetentionSmsMessage('general', 'Роман')).toContain('Роман из LINKEON');
     expect(buildRetentionSmsMessage('curious')).toContain('ассистенты под любые задачи');
   });
+
+  it('General email персонализирует приветствие и паузу', () => {
+    const mail = buildRetentionEmail({
+      mode: 'general', language: 'ru', assistantName: 'Роман', name: 'Дмитрий', daysInactive: 3,
+      chatUrl: retentionChatUrl('ru'), unsubscribeUrl: null,
+    });
+    expect(mail.text).toContain('Здравствуйте, Дмитрий! Последняя активность в Linkeon была 3 дня назад. Роман из LINKEON');
+  });
+
+  it('Curious email персонализирует часы', () => {
+    const mail = buildRetentionEmail({
+      mode: 'curious', language: 'ru', assistantName: null, name: 'Дмитрий', hoursInactive: 25,
+      chatUrl: retentionChatUrl('ru'), unsubscribeUrl: null,
+    });
+    expect(mail.text).toContain('Здравствуйте, Дмитрий! Последняя активность в Linkeon была 25 часов назад.');
+  });
+
+  it('SMS General и Curious получают те же персонализацию', () => {
+    expect(buildRetentionSmsMessage('general', 'Роман', 'Дмитрий', 3))
+      .toContain('Здравствуйте, Дмитрий! Последняя активность в Linkeon была 3 дня назад.');
+    expect(buildRetentionSmsMessage('curious', null, 'Дмитрий', undefined, 25))
+      .toContain('Здравствуйте, Дмитрий! Последняя активность в Linkeon была 25 часов назад.');
+  });
+
+  it('без имени вставляет паузу после нейтрального приветствия, без undefined', () => {
+    const mail = buildRetentionEmail({
+      mode: 'general', language: 'ru', assistantName: null, name: null, daysInactive: 3,
+      chatUrl: retentionChatUrl('ru'), unsubscribeUrl: null,
+    });
+    expect(mail.text).toContain('Здравствуйте! Последняя активность в Linkeon была 3 дня назад.');
+    expect(mail.text).not.toContain('undefined');
+  });
+
+  it('имя экранируется в HTML', () => {
+    const mail = buildRetentionEmail({
+      mode: 'general', language: 'en', assistantName: null, name: '<img src=x>', daysInactive: 3,
+      chatUrl: retentionChatUrl('en'), unsubscribeUrl: null,
+    });
+    expect(mail.text).toContain('<img src=x>');
+    expect(mail.html).not.toContain('<img src=x>');
+    expect(mail.html).toContain('&lt;img src=x&gt;');
+  });
+
+  it.each([
+    ['ru', '3 дня'],
+    ['en', '3 days'],
+    ['es', '3 días'],
+    ['de', '3 Tagen'],
+    ['fr', '3 jours'],
+    ['zh', '3天'],
+    ['pt', '3 dias'],
+  ])('%s локализует паузу без русских фраз', (language, expected) => {
+    const mail = buildRetentionEmail({
+      mode: 'general', language, assistantName: null, name: 'Alex', daysInactive: 3,
+      chatUrl: retentionChatUrl(language), unsubscribeUrl: null,
+    });
+    expect(mail.text).toContain('Alex');
+    expect(mail.text).toContain(expected);
+    if (language !== 'ru') expect(mail.text).not.toContain('дня');
+  });
+
+  it('некорректная пауза пропускается', () => {
+    const mail = buildRetentionEmail({
+      mode: 'general', language: 'en', assistantName: null, name: 'Alex', daysInactive: -1,
+      chatUrl: retentionChatUrl('en'), unsubscribeUrl: null,
+    });
+    expect(mail.text).toContain('Hello, Alex!');
+    expect(mail.text).not.toContain('last activity');
+  });
 });
