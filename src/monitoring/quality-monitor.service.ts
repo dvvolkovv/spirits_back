@@ -92,7 +92,14 @@ export class QualityMonitorService {
 
   @Cron('0 7,37 * * * *') // каждые 30 мин, со смещением от других кронов
   async qualityProbe() {
-    if (process.env.QUALITY_PROBE_DISABLED === 'true' || !this.chat) return;
+    // test.linkeon.io использует общий боевой релей: RELAY_QWEN_MONITOR=off
+    // отключает не только чтение /health, но и активную пробу — иначе qprobe
+    // открывает окно Claude и пополняет статистику запасных на проде.
+    if (
+      process.env.QUALITY_PROBE_DISABLED === 'true' ||
+      (process.env.RELAY_QWEN_MONITOR || '').toLowerCase() === 'off' ||
+      !this.chat
+    ) return;
     const probeUser = process.env.QUALITY_PROBE_USER || '70000000000';
     const assistantId = process.env.QUALITY_PROBE_ASSISTANT || '12'; // Роман
     const prompt = 'Техническая проверка. Ответь ОДНИМ коротким предложением на русском языке: пожелай хорошего дня.';
