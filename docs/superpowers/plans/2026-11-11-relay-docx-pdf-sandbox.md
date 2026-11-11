@@ -40,6 +40,10 @@ test('промпт on: DOCX/PDF идёт через WeasyPrint, а не LibreOff
   assert.ok(out.includes('PRE-INSTALLED: ffmpeg, ImageMagick, Inkscape, poppler-utils'));
   assert.equal(out.includes('PRE-INSTALLED: ffmpeg, ImageMagick, LibreOffice'), false);
   assert.equal(out.includes('validate with soffice'), false);
+  const pptxRule = out.split('\n').find((line) => line.includes('For pptx:'));
+  assert.ok(pptxRule.includes('validate structurally with python-pptx'));
+  assert.equal(pptxRule.includes('python-docx'), false);
+  assert.match(pptxRule, /do not claim visual PDF validation/);
   assert.match(out, /Do NOT run soffice, soffice\.bin, lowriter/);
   assert.match(out, /python-docx/);
   assert.match(out, /import weasyprint/);
@@ -91,7 +95,7 @@ Inside `applySandboxPrompt`, chain these replacements before the existing `/home
 )
 .replace(
   'validate with soffice --headless --convert-to pdf',
-  'validate with python-docx + WeasyPrint (in /opt/linkeon-agent venv), pdfinfo and pdftoppm',
+  'validate structurally with python-pptx; if visual PPTX rendering is unavailable, say so and do not claim visual PDF validation',
 )
 ```
 
@@ -135,6 +139,8 @@ pdftotext ${PROBE}/output.pdf - | grep -E 'Recipient|Greeting'
 ```
 
 Expected: `pdfinfo` exits 0 and reports a valid page count; the text check finds the synthetic recipient and greeting. Inspect the event stream and confirm zero LibreOffice invocations. If either check fails, stop: do not request deployment.
+
+Record the actual visual-check limit explicitly. In the completed pre-deploy probe, `Read(png)` was denied and layout was checked only programmatically through PIL. This proves a valid simple PDF and zero LibreOffice calls, not general visual equivalence or complex-layout preservation. Do not upgrade that evidence to a visual-inspection claim in the rollout report.
 
 - [ ] **Step 3: Run the complete relay suite at the final pushed HEAD**
 
