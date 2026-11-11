@@ -553,7 +553,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   // Вложенный каталог — только для непредсказуемого fs_key от бэка. Legacy
   // fallback остаётся плоским: его sessionId предсказуем, а scrub/backfill
   // знают именно прежние плоские пути.
-  const uploadSessionDir = req.body.fs_key === fsKey
+  const uploadSessionDir = req.files?.length && req.body.fs_key === fsKey
     ? await ensureSessionUploadDir(fsKey, { uploads: UPLOAD_DIR })
     : UPLOAD_DIR;
 
