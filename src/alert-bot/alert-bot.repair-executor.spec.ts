@@ -249,6 +249,57 @@ describe('AlertBotRepairExecutor', () => {
     }
   });
 
+  it('transient finishJob rejection повторяет flush до durable succeeded', async () => {
+    const job = await createJob();
+    const original = store.finishJob.bind(store);
+    const log = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const finish = jest.spyOn(store, 'finishJob')
+      .mockRejectedValueOnce(new Error('sensitive transient db failure'))
+      .mockImplementation(original);
+    await executor.start(job.id, 'printf durable');
+    expect(await executor.wait(job.id, 0.5)).toBe(true);
+    expect(await store.findJob(job.id)).toMatchObject({ status: 'succeeded', stdout: 'durable' });
+    expect(finish.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(JSON.stringify(log.mock.calls)).not.toContain('sensitive');
+  });
+
+  it('finishJob=false читает fresh running row и повторяет запись', async () => {
+    const job = await createJob();
+    const original = store.finishJob.bind(store);
+    const finish = jest.spyOn(store, 'finishJob')
+      .mockResolvedValueOnce(false)
+      .mockImplementation(original);
+    await executor.start(job.id, 'printf retry-false');
+    expect(await executor.wait(job.id, 0.5)).toBe(true);
+    expect(await store.findJob(job.id)).toMatchObject({ status: 'succeeded', stdout: 'retry-false' });
+    expect(finish.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('finishJob=false при уже terminal fresh row не делает overwrite', async () => {
+    const job = await createJob();
+    const original = store.finishJob.bind(store);
+    const finish = jest.spyOn(store, 'finishJob').mockImplementationOnce(async (id, result) => {
+      await original(id, result);
+      return false;
+    }).mockImplementation(original);
+    await executor.start(job.id, 'printf already-terminal');
+    expect(await executor.wait(job.id, 0.5)).toBe(true);
+    expect(await store.findJob(job.id)).toMatchObject({ status: 'succeeded', stdout: 'already-terminal' });
+    expect(finish).toHaveBeenCalledTimes(1);
+  });
+
+  it('permanent finishJob rejection сохраняет pending terminal и не сообщает success', async () => {
+    const job = await createJob();
+    const log = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const finish = jest.spyOn(store, 'finishJob').mockRejectedValue(new Error('sensitive permanent db failure'));
+    await executor.start(job.id, 'printf unknown');
+    expect(await executor.wait(job.id, 0.1)).toBe(false);
+    expect(await store.findJob(job.id)).toMatchObject({ status: 'running' });
+    expect((executor as any).processes.get(job.id)?.pending).toMatchObject({ status: 'succeeded', stdout: 'unknown' });
+    expect(finish.mock.calls.length).toBeLessThanOrEqual(6);
+    expect(JSON.stringify(log.mock.calls)).not.toContain('sensitive');
+  });
+
   it('после регистрации повторно видит cancel_requested и гасит interruptible child', async () => {
     const job = await createJob({ timeoutMs: 30_000 });
     const markRunning = store.markJobRunning.bind(store);
