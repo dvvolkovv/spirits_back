@@ -141,6 +141,7 @@ describe('AlertBotRepairExecutor', () => {
     if (!created) throw new Error('job not created');
     const job = await store.findJob(created.id);
     if (!job) throw new Error('job missing');
+    executor.registerJob(job.id, job.repairId);
     return job;
   }
 

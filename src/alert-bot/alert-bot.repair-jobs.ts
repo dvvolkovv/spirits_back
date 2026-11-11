@@ -52,6 +52,7 @@ export class AlertBotRepairJobs {
       if (!await this.store.isActiveRepair(ctx)) throw new Error('repair_inactive');
       throw new Error('job_already_active');
     }
+    this.executor.registerJob(created.id, ctx.repairId);
     await this.executor.start(created.id, rawCommand);
     return { jobId: created.id };
   }

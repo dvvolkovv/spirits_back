@@ -83,6 +83,7 @@ function delay(ms: number): Promise<void> {
 export class AlertBotRepairExecutor {
   private readonly children = new Map<string, ChildProcess>();
   private readonly repairs = new Map<string, string>();
+  private readonly jobRepairs = new Map<string, string>();
   private readonly waiters = new Map<string, Set<() => void>>();
   private readonly processes = new Map<string, ProcessState>();
   private readonly cancellingRepairs = new Set<string>();
@@ -93,16 +94,29 @@ export class AlertBotRepairExecutor {
 
   constructor(private readonly store: RepairStore) {}
 
+  registerJob(jobId: string, repairId: string): void {
+    this.jobRepairs.set(jobId, repairId);
+  }
+
   async start(jobId: string, rawCommand: string): Promise<string> {
-    const job = await this.store.findJob(jobId);
-    if (!job) throw new Error('job_not_found');
-    if (this.processes.has(jobId)) {
-      await this.flushTerminal(jobId);
-      return jobId;
+    let repairId = this.jobRepairs.get(jobId);
+    if (!repairId) {
+      const registered = await this.store.findJob(jobId);
+      if (!registered) throw new Error('job_not_found');
+      repairId = registered.repairId;
+      this.registerJob(jobId, repairId);
     }
-    const previous = this.repairChains.get(job.repairId) ?? Promise.resolve();
-    const setup = previous.then(() => this.startRegistered(job, rawCommand));
-    this.repairChains.set(job.repairId, setup.then(() => undefined, () => undefined));
+    const previous = this.repairChains.get(repairId) ?? Promise.resolve();
+    const setup = previous.then(async () => {
+      if (this.processes.has(jobId)) {
+        await this.flushTerminal(jobId);
+        return jobId;
+      }
+      const job = await this.store.findJob(jobId);
+      if (!job) throw new Error('job_not_found');
+      return this.startRegistered(job, rawCommand);
+    });
+    this.repairChains.set(repairId, setup.then(() => undefined, () => undefined));
     return setup;
   }
 
