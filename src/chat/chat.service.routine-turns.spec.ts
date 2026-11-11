@@ -32,14 +32,17 @@ function makeService() {
   return new ChatService(pg as any, null as any, null as any, null as any, language as any, undefined, undefined, undefined, undefined);
 }
 
-function sseDone(): Readable {
+function sseEvents(events: object[]): Readable {
   const s = new Readable({ read() {} });
   process.nextTick(() => {
-    s.push(`data: ${JSON.stringify({ type: 'delta', text: 'ок' })}\n`);
-    s.push(`data: ${JSON.stringify({ type: 'done' })}\n`);
+    for (const event of events) s.push(`data: ${JSON.stringify(event)}\n`);
     s.push(null);
   });
   return s;
+}
+
+function sseDone(): Readable {
+  return sseEvents([{ type: 'delta', text: 'ок' }, { type: 'done' }]);
 }
 
 async function flush(n = 10) {
@@ -71,6 +74,7 @@ describe('agentReply: учёт ходов и чужая работа в той �
 
   it('занятая сессия — RelaySessionBusyError без вызова релея (не пре-эмптим)', async () => {
     const svc = makeService();
+    const log = jest.spyOn((svc as any).logger, 'log').mockImplementation(() => {});
     (axios.post as jest.Mock).mockImplementation(async () => ({ data: sseDone() }));
     const humanMark = svc.beginRelayRun('u-1_12_ru');
 
@@ -79,6 +83,11 @@ describe('agentReply: учёт ходов и чужая работа в той �
     // Метка человека не тронута.
     expect((svc as any).relayRunning.get('u-1_12_ru')).toBe(humanMark);
     expect(svc.getActiveStreamCount()).toBe(0);
+    expect(log).toHaveBeenCalledTimes(1);
+    const busyLog = String(log.mock.calls[0][0]);
+    expect(busyLog).toBe('agentReply: фоновый ответ отложен — сессия занята (assistant 12)');
+    expect(busyLog).not.toContain('u-1');
+    expect(busyLog).not.toContain('u-1_12_ru');
 
     svc.endRelayRun('u-1_12_ru', humanMark);
     // Освободилась — проходит.
@@ -143,19 +152,61 @@ describe('agentReply: учёт ходов и чужая работа в той �
     expect((svc as any).relayRunning.size).toBe(0);
   });
 
-  it('done с failed в основной сессии — busy на повтор', async () => {
+  it('done.failed=preempted возвращает обрывок и причину через outcome, а не busy', async () => {
     const svc = makeService();
-    (axios.post as jest.Mock).mockImplementationOnce(async () => {
-      const s = new Readable({ read() {} });
-      process.nextTick(() => {
-        s.push(`data: ${JSON.stringify({ type: 'delta', text: 'часть' })}\n`);
-        s.push(`data: ${JSON.stringify({ type: 'done', failed: true, failReason: 'preempted' })}\n`);
-        s.push(null);
-      });
-      return { data: s };
-    });
+    (axios.post as jest.Mock).mockImplementation(async () => ({
+      data: sseEvents([
+        { type: 'delta', text: 'часть' },
+        { type: 'done', failed: true, failReason: 'preempted' },
+      ]),
+    }));
 
-    await expect(svc.generateAgentReply('u-1', '12', 'напомни')).rejects.toBeInstanceOf(RelaySessionBusyError);
+    await expect(svc.generateAgentReplyOutcome('u-1', '12', 'напомни')).resolves.toEqual({
+      text: 'часть',
+      failed: true,
+      failReason: 'preempted',
+    });
+  });
+
+  it('done.failed=max_turns скрыт обычным generateAgentReply, но виден charged-вызову', async () => {
+    const svc = makeService();
+    (axios.post as jest.Mock).mockImplementation(async () => ({
+      data: sseEvents([
+        { type: 'delta', text: 'часть' },
+        { type: 'done', failed: true, failReason: 'max_turns' },
+      ]),
+    }));
+
+    await expect(svc.generateAgentReply('u-1', '12', 'напомни')).resolves.toBe('');
+    const charged = await svc.generateAgentReplyWithCharge('u-1', '12', 'напомни');
+    expect(charged).toMatchObject({ text: 'часть', failed: true, failReason: 'max_turns' });
+  });
+
+  it('успешный done возвращает failed=false без failReason', async () => {
+    const svc = makeService();
+    (axios.post as jest.Mock).mockImplementation(async () => ({ data: sseDone() }));
+
+    await expect(svc.generateAgentReplyOutcome('u-1', '12', 'напомни')).resolves.toEqual({
+      text: 'ок',
+      failed: false,
+      failReason: undefined,
+    });
+  });
+
+  it('done.failed без строковой причины нормализуется в unknown', async () => {
+    const svc = makeService();
+    (axios.post as jest.Mock).mockImplementation(async () => ({
+      data: sseEvents([
+        { type: 'delta', text: 'часть' },
+        { type: 'done', failed: true },
+      ]),
+    }));
+
+    await expect(svc.generateAgentReplyOutcome('u-1', '12', 'напомни')).resolves.toEqual({
+      text: 'часть',
+      failed: true,
+      failReason: 'unknown',
+    });
   });
 
   it('EOF без done в СВОЕЙ сессии — прежнее поведение: текст как есть', async () => {

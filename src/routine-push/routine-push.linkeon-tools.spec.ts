@@ -7,10 +7,14 @@ import { RoutinePushService } from './routine-push.service';
  * поэтому deliver() передаёт его явно.
  */
 describe('рутинный пуш: linkeonTools: true', () => {
-  it('fireNow зовёт generateAgentReply с { linkeonTools: true }', async () => {
+  it('fireNow зовёт generateAgentReplyOutcome с { linkeonTools: true }', async () => {
     const pg = { query: jest.fn(async () => ({ rows: [] })) };
     const push = { sendPush: jest.fn(async () => 1) };
-    const chat = { generateAgentReply: jest.fn(async () => 'Доброе утро!') };
+    const chat = {
+      generateAgentReplyOutcome: jest.fn(async () => ({
+        text: 'Доброе утро!', failed: false, failReason: undefined,
+      })),
+    };
     const store = {
       getById: jest.fn(async () => ({
         id: 'r1', userId: 'u1', title: 'Энергия дня', assistantId: '14',
@@ -20,6 +24,8 @@ describe('рутинный пуш: linkeonTools: true', () => {
     };
     const svc = new RoutinePushService(pg as any, push as any, chat as any, store as any);
     await svc.fireNow('u1', 'r1');
-    expect(chat.generateAgentReply).toHaveBeenCalledWith('u1', '14', 'энергия дня', undefined, { linkeonTools: true });
+    expect(chat.generateAgentReplyOutcome).toHaveBeenCalledWith(
+      'u1', '14', 'энергия дня', undefined, { linkeonTools: true },
+    );
   });
 });

@@ -63,7 +63,12 @@ export class RoutinePushController {
           if (!body?.id) return res.status(400).json({ error: 'id required' });
           const r = await this.routines.fireNow(uid, String(body.id));
           if (!r) return res.status(404).json({ error: 'not found' });
-          return res.json({ ok: true, delivered: r.delivered });
+          return res.json({
+            ok: true,
+            delivered: r.delivered,
+            ...(r.busy ? { busy: true } : {}),
+            ...(r.failed ? { failed: true } : {}),
+          });
         }
         case 'preset_energy': {
           const row = await this.routines.ensureEnergyPreset(uid, body?.tz);
