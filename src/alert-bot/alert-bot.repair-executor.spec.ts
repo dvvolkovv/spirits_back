@@ -255,6 +255,7 @@ describe('AlertBotRepairExecutor', () => {
     expect(fs.existsSync(sentinel)).toBe(false);
     expect(await store.findJob(job.id)).toMatchObject({ status: 'cancelled' });
 
+    store.repairs.get('repair-1')!.status = 'requested';
     const late = await createJob();
     await expect(executor.start(late.id, 'printf late-spawn')).rejects.toThrow('repair_inactive');
     expect(spawn).not.toHaveBeenCalled();
