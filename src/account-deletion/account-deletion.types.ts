@@ -85,9 +85,14 @@ export interface DeletionDiscovery {
   };
 }
 
+export type DeletionSkipReason =
+  | 'owner_unverifiable'
+  | 'unsupported_external'
+  | 'external_note_id_unavailable';
+
 export interface DeletionSkip {
   resourceType: DeletionResourceType;
-  reason: string;
+  reason: DeletionSkipReason;
 }
 
 export interface DeletionPlan {
