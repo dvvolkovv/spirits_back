@@ -120,7 +120,7 @@ describe('account deletion safety', () => {
     [{ code: '23505' }, 'db'],
     [{ code: 'XX000' }, 'db'],
     [{ message: CANARY }, 'external_unknown'],
-  ])('классифицирует ошибку без сырого provider message: %p', (error, kind) => {
+  ])('классифицирует ошибку без сырого provider message', (error, kind) => {
     expect(deletionErrorKind(error)).toBe(kind);
   });
 
