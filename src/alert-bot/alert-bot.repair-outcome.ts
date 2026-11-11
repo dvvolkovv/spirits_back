@@ -15,16 +15,18 @@ export function deriveRepairOutcome(jobs: RepairOutcomeJob[], model: RepairModel
   const mutationCount = ordered.filter((job) => job.kind === 'exec' && job.mutates).length;
   const lastMutation = ordered.map((job) => job.kind === 'exec' && job.mutates ? job.sequence : 0).reduce((a, b) => Math.max(a, b), 0);
   const lastSuccessfulVerification = ordered.map((job) => job.kind === 'verify' && job.status === 'succeeded' && job.exitCode === 0 ? job.sequence : 0).reduce((a, b) => Math.max(a, b), 0);
-  const lastFailedJob = ordered.map((job) => job.status === 'failed' || job.status === 'timeout' || job.status === 'cancelled' ? job.sequence : 0).reduce((a, b) => Math.max(a, b), 0);
+  const lastUnsuccessfulJob = ordered.map((job) => job.status === 'failed' || job.status === 'timeout' || job.status === 'cancelled' || job.status === 'interrupted' ? job.sequence : 0).reduce((a, b) => Math.max(a, b), 0);
   const hasNonTerminalJobs = ordered.some((job) => job.status === 'queued' || job.status === 'running');
-  const verified = lastSuccessfulVerification > lastMutation && lastSuccessfulVerification > lastFailedJob;
+  const hasInterruptedJobs = ordered.some((job) => job.status === 'interrupted');
+  const verified = lastSuccessfulVerification > lastMutation && lastSuccessfulVerification > lastUnsuccessfulJob;
 
   if (model === 'cancelled') return { status: 'cancelled', mutationCount };
   if (hasNonTerminalJobs) return { status: 'interrupted', mutationCount };
   if (verified) return { status: 'verified', mutationCount };
   if (model === 'no_cause') return { status: 'failed', mutationCount };
   if (model !== 'completed') return { status: model, mutationCount };
-  if (lastFailedJob > 0) return { status: 'failed', mutationCount };
+  if (hasInterruptedJobs) return { status: 'interrupted', mutationCount };
+  if (lastUnsuccessfulJob > 0) return { status: 'failed', mutationCount };
   return { status: 'unverified', mutationCount };
 }
 
