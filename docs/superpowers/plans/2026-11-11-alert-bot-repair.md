@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-11-alert-bot-repair-design.md` (commit `9135223c`).
 
-**Worktree:** `/Users/dmitry/Downloads/spirits_back/.worktrees/alertbot-repair`, branch `feat/alertbot-repair`, base `origin/main=e57f4f09e81021205211b68617414968d3518012`.
+**Worktree:** `/Users/dmitry/Downloads/spirits_back/.worktrees/alertbot-repair`, branch `feat/alertbot-repair`, base `origin/main=5de4c0cc3c833124a2cca65f2b408bd16d9bf251`.
 
 **Commands:** все тяжёлые прогоны — только на `dv@85.192.61.231`, в `~/ci/spirits_back`, на конкретном SHA. Не использовать живой `~/spirits_back` и не запускать Jest/tsc/build на Mac.
 
@@ -48,7 +48,7 @@
 - [ ] **Step 1: Прогнать исходные suites на ноде**
 
 ```bash
-ssh dv@85.192.61.231 "git -C ~/ci/spirits_back fetch -q origin && git -C ~/ci/spirits_back checkout -q e57f4f09e81021205211b68617414968d3518012 && source ~/.nvm/nvm.sh && cd ~/ci/spirits_back && npm ci && npx jest src --maxWorkers=2"
+ssh dv@85.192.61.231 "git -C ~/ci/spirits_back fetch -q origin && git -C ~/ci/spirits_back checkout -q 5de4c0cc3c833124a2cca65f2b408bd16d9bf251 && source ~/.nvm/nvm.sh && cd ~/ci/spirits_back && npm ci && npx jest src --maxWorkers=2"
 ```
 
 Сохранить полный список passed/failed/skipped suites и tests в журнал задачи. Это baseline для дельты Task 9; известные красные main не выдавать за регрессию и не маскировать.
