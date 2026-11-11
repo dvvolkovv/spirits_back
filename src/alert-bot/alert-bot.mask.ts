@@ -6,8 +6,13 @@ export function maskSecrets(input: string): string {
   let s = String(input);
   s = s.replace(/(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s\/:@]+:)[^\s\/@]+@/g, '$1[скрыто]@');
   s = s.replace(
-    /(\b(?:export\s+)?[A-Za-z_][A-Za-z0-9_-]*(?:SECRET|PASSWORD|PASSWD|TOKEN|API[_-]KEY)[A-Za-z0-9_-]*\s*=\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s;]+)/gi,
-    '$1[скрыто]',
+    /\b(?:export\s+)?[A-Za-z_][A-Za-z0-9_-]*\s*=\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s;]+)/gi,
+    (match) => {
+      const equals = match.indexOf('=');
+      return /SECRET|PASSWORD|PASSWD|TOKEN|API[_-]KEY/i.test(match.slice(0, equals))
+        ? `${match.slice(0, equals + 1)}[скрыто]`
+        : match;
+    },
   );
   s = s.replace(/(?<![A-Za-z0-9_-])\d{8,10}:[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-])/g, '[скрыто]');
   s = s.replace(/(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])/g, '[скрыто]');
