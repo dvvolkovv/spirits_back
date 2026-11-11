@@ -442,6 +442,16 @@ for (const legacyKey of ['70000000000_12_ru', 'mcp']) {
   });
 }
 
+test('server off: текстовый ход без вложений не обращается к каталогу загрузок', async (t) => {
+  const f = await fixture(t, { mode: 'off' });
+  const conflict = path.join(f.dirs.uploadDir, FS_KEY);
+  fs.writeFileSync(conflict, 'not-a-directory');
+  const { response } = await f.request();
+  assert.equal(response.status, 200);
+  assert.equal(f.calls.length, 1);
+  assert.equal(fs.readFileSync(conflict, 'utf8'), 'not-a-directory');
+});
+
 test("server signal и stale sweeper: оба suffix удаляются, liveSet очищается", async (t) => {
   let exitSignal = null;
   const f = await fixture(t, { onSpawn() {} });
