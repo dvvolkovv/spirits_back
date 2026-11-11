@@ -550,7 +550,12 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   } else {
     fs.mkdirSync(outDir, { recursive: true });
   }
-  const uploadSessionDir = await ensureSessionUploadDir(fsKey, { uploads: UPLOAD_DIR });
+  // Вложенный каталог — только для непредсказуемого fs_key от бэка. Legacy
+  // fallback остаётся плоским: его sessionId предсказуем, а scrub/backfill
+  // знают именно прежние плоские пути.
+  const uploadSessionDir = req.body.fs_key === fsKey
+    ? await ensureSessionUploadDir(fsKey, { uploads: UPLOAD_DIR })
+    : UPLOAD_DIR;
 
   // Папка хода ДО перехода на fs_key (26.10.2026). Модель может помнить путь
   // к файлу оттуда из истории разговора (ссылка, которую она сама когда-то
