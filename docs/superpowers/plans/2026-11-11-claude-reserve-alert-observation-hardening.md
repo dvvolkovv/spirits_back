@@ -418,6 +418,169 @@ if (belowThreshold) return;
 
 Production коммит: `fix(monitoring): валидировать рубильник непосредственно перед подавлением`, с attribution. Запушить и прогнать оба suites на ноде. Ожидаются полностью зелёные suites.
 
+### Task 2B: Атомарный SQL-snapshot рубильника и личного Claude
+
+**Files:**
+- Modify: `src/monitoring/claude-health.outage-alert.spec.ts`
+- Modify: `src/monitoring/claude-health.service.ts`
+
+- [ ] **Step 1: Моделировать кэшированный и строгий provider раздельно**
+
+В `make` рядом с `alertedState` добавить:
+
+```typescript
+let atomicProvider: AnswerProvider = switchTo;
+```
+
+Для SQL `llm_settings` возвращать текущий `atomicProvider`; для прежнего SQL личных настроек сохранить `present`. Совместимый фрагмент mock:
+
+```typescript
+if (/llm_settings/.test(sql)) {
+  return {
+    rows: [{
+      global_provider: atomicProvider,
+      personal_claude: personalClaude,
+      present: personalClaude,
+    }],
+  };
+}
+```
+
+После создания сервиса добавить test setter:
+
+```typescript
+svc.setAtomicProvider = (provider: AnswerProvider) => { atomicProvider = provider; };
+```
+
+Во всех deferred-сценариях смены рубильника вызывать и `svc.globalProvider.get.mockResolvedValue(newProvider)` (cached initial/legacy), и `svc.setAtomicProvider(newProvider)` (strict final). В deferred-SQL тесте возвращать `{ rows: [{ global_provider: 'claude', personal_claude: false, present: false }] }`.
+
+- [ ] **Step 2: Добавить красные тесты strict snapshot**
+
+```typescript
+it('cached get()=Kimi, strict SQL=Claude — suppression запрещено', async () => {
+  const svc = make('kimi', healthyOnly('kimi'), false, false);
+  svc.setAtomicProvider('claude');
+  setDown(svc);
+  await svc.maybeAlertOutage();
+  expect(sent()).toHaveLength(1);
+  expect(sent()[0]).toContain('проба без входа');
+});
+
+it('ошибка strict SQL — fail-open без fallback к cached Kimi', async () => {
+  const svc = make('kimi', healthyOnly('kimi'), false, false);
+  const originalQuery = svc.pg.query.getMockImplementation()!;
+  svc.pg.query.mockImplementation(async (sql: string, params?: unknown[]) => {
+    if (/llm_settings/.test(sql)) throw new Error('strict read failed');
+    return originalQuery(sql, params);
+  });
+  setDown(svc);
+  await svc.maybeAlertOutage();
+  expect(sent()).toHaveLength(1);
+});
+
+it('strict SQL видит личный Claude — suppression запрещено', async () => {
+  const svc = make('kimi', healthyOnly('kimi'), false, false);
+  const originalQuery = svc.pg.query.getMockImplementation()!;
+  svc.pg.query.mockImplementation(async (sql: string, params?: unknown[]) => {
+    if (/llm_settings/.test(sql)) {
+      return { rows: [{ global_provider: 'kimi', personal_claude: true, present: true }] };
+    }
+    return originalQuery(sql, params);
+  });
+  setDown(svc);
+  await svc.maybeAlertOutage();
+  expect(sent()).toHaveLength(1);
+});
+
+it('breaker открылся во время strict SQL — виден в синхронном fallbackStats', async () => {
+  const providers = healthyOnly('kimi');
+  const svc = make('kimi', providers, false, false);
+  const originalQuery = svc.pg.query.getMockImplementation()!;
+  svc.pg.query.mockImplementation(async (sql: string, params?: unknown[]) => {
+    if (/llm_settings/.test(sql)) {
+      providers.kimi = downNow();
+      return { rows: [{ global_provider: 'kimi', personal_claude: false, present: false }] };
+    }
+    return originalQuery(sql, params);
+  });
+  setDown(svc);
+  await svc.maybeAlertOutage();
+  expect(sent()).toHaveLength(1);
+  expect(sent()[0]).toContain('но Kimi сейчас «не отвечает»');
+});
+```
+
+Закоммитировать тесты как `test(monitoring): атомарный snapshot рубильника (красный)` с attribution, запушить и прогнать suite на ноде. Ожидаются четыре новых красных сценария.
+
+- [ ] **Step 3: Добавить strict reader и синхронный switchStateFromStats**
+
+Импортировать `isAnswerProvider` и тип `AnswerProvider` из `llm-fallback` вместе с `FallbackProvider`.
+
+Добавить:
+
+```typescript
+/** Единый statement snapshot: provider и личный Claude согласованы; ошибка — fail-open. */
+private async readFinalProviderAndPersonal(): Promise<{ provider: AnswerProvider; personalClaude: boolean } | null> {
+  try {
+    const r = await this.pg.query(
+      `SELECT
+         (SELECT value->>'provider' FROM llm_settings WHERE key = 'global_provider') AS global_provider,
+         EXISTS (
+           SELECT 1
+           FROM ai_profiles_consolidated p
+           JOIN user_id u ON u.internal_id = p.user_id
+           WHERE p.llm_provider = 'claude'
+             AND u.state = 'active'
+         ) AS personal_claude`,
+    );
+    const value = r.rows[0]?.global_provider;
+    return {
+      provider: isAnswerProvider(value) ? value : 'claude',
+      personalClaude: r.rows[0]?.personal_claude === true,
+    };
+  } catch (e: any) {
+    this.log.warn(`llm_settings: строгий snapshot для CLI-алерта не прочитан: ${e?.message || 'unknown'}`);
+    return null;
+  }
+}
+
+private switchStateFromStats(
+  switchProvider: AnswerProvider,
+  stats: ReturnType<ClaudeCliService['fallbackStats']>,
+  now: number,
+): CliSwitchState {
+  const st = switchProvider === 'claude' ? undefined : stats.providers?.[switchProvider];
+  return { switchProvider, enabled: !!st?.enabled, down: !!st && st.downUntil > now };
+}
+```
+
+Удалить ставший ненужным `hasPersonalClaude()`. В async `switchState()` оставить чтение `globalProvider.get()` для начального gate, но вернуть `this.switchStateFromStats(await this.globalProvider.get(), stats, now)`.
+
+- [ ] **Step 4: Сделать strict SQL последним await**
+
+Блок после `const probedProvider = ...` до вычисления `globalAlive` заменить на:
+
+```typescript
+const probeOk = await this.probeSwitchProvider(probedProvider);
+const final = probeOk ? await this.readFinalProviderAndPersonal() : null;
+const afterNow = Date.now();
+const afterStats = this.claudeCli.fallbackStats(afterNow);
+const afterSw = final
+  ? this.switchStateFromStats(final.provider, afterStats, afterNow)
+  : await this.switchState(afterStats, afterNow);
+const personalClaude = final ? final.personalClaude : true;
+effectiveStats = afterStats;
+effectiveSw = afterSw;
+const sameProvider = afterSw.switchProvider === probedProvider;
+globalAlive = probeOk && final !== null && sameProvider && switchCarriesCliPath(afterSw) && !personalClaude;
+```
+
+Последующие условия `providerUnverified`/`probeFailed` оставить без изменений. При `final=null` suppression невозможен независимо от cached `switchState`. При `final!=null` после strict SQL вызываются только синхронные операции до решения.
+
+- [ ] **Step 5: Закоммитить и проверить зелёный**
+
+Production коммит: `fix(monitoring): атомарно читать рубильник и личного Claude`, с attribution. Запушить и прогнать outage suite на ноде. Ожидается полностью зелёный suite, включая все прежние deferred-тесты с `setAtomicProvider`.
+
 ### Task 3: Повторные ревью и итоговые проверки
 
 - [ ] **Step 1:** Spec compliance review подтверждает, что подавление по-прежнему соответствует решениям владельца, а новые изменения ограничены observation-only, race guard и truthful messages.
