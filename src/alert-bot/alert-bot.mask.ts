@@ -2,14 +2,20 @@ import * as crypto from 'crypto';
 
 const UUID = /(?<![A-Za-z0-9])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![A-Za-z0-9])/gi;
 
-export function maskText(input: string, ticketIds: Iterable<string> = []): string {
-  const tickets = new Set(Array.from(ticketIds, (x) => x.toLowerCase()));
+export function maskSecrets(input: string): string {
   let s = String(input);
   s = s.replace(/(?<![A-Za-z0-9_-])\d{8,10}:[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-])/g, '[скрыто]');
   s = s.replace(/(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])/g, '[скрыто]');
   s = s.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [скрыто]');
   s = s.replace(/(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{12,}(?![A-Za-z0-9_-])/g, '[скрыто]');
   s = s.replace(/([?&](?:token|key|secret)=)[^&#\s]+/gi, '$1[скрыто]');
+  s = s.replace(/\b(?:password|passwd|secret|api[_-]?key)\s*=\s*[^\s;]+/gi, (match) => `${match.split('=')[0]}=[скрыто]`);
+  return s;
+}
+
+export function maskText(input: string, ticketIds: Iterable<string> = []): string {
+  const tickets = new Set(Array.from(ticketIds, (x) => x.toLowerCase()));
+  let s = maskSecrets(input);
   s = s.replace(UUID, (id) => tickets.has(id.toLowerCase()) ? `#${id.slice(0, 8)}` : '[id]');
   s = s.replace(/\b[0-9a-f]{32,}\b/gi, '[скрыто]');
   s = s.replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, (mail) => `${mail[0]}***@${mail.split('@')[1]}`);
