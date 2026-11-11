@@ -377,6 +377,28 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     expect(svc.claudeCli.text).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['down', 'ok'] as const)('Kimi → Qwen без ключа при %s — сохраняется no-key текст', async (status) => {
+    const svc = make('kimi', { qwen: noKey, kimi: up }, status === 'ok', false);
+    if (status === 'down') setDown(svc);
+    else {
+      svc.cache.llmStatus = 'ok';
+      svc.cache.llmCheckedAt = '2026-11-11T07:15:00.000Z';
+      svc.cache.llmLatencyMs = 812;
+    }
+    let resolveProbe!: (text: string) => void;
+    svc.claudeCli.text.mockReturnValue(new Promise<string>((resolve) => { resolveProbe = resolve; }));
+    const pending = svc.maybeAlertOutage();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    svc.globalProvider.get.mockResolvedValue('qwen');
+    resolveProbe('ok');
+    await pending;
+    expect(sent()).toHaveLength(1);
+    expect(sent()[0]).toContain('CLI-путь на OAuth-подписке');
+    if (status === 'down') expect(sent()[0]).toContain('проба без входа');
+    else expect(sent()[0]).toContain('Маша/VPM/маркетолог снова работают');
+    expect(sent()[0]).not.toContain('активная проба Qwen в этом тике не выполнялась');
+  });
+
   it('fallbackAlertLine использует снимок после ожидания пробы', async () => {
     const svc = make('kimi', healthyOnly('kimi'), false, false);
     const initial = { windowMs: 900_000, providers: { qwen: noKey, kimi: up } };
