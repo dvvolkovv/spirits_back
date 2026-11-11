@@ -393,9 +393,12 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     resolveProbe('ok');
     await pending;
     expect(sent()).toHaveLength(1);
-    expect(sent()[0]).toContain('CLI-путь на OAuth-подписке');
-    if (status === 'down') expect(sent()[0]).toContain('проба без входа');
-    else expect(sent()[0]).toContain('Маша/VPM/маркетолог снова работают');
+    if (status === 'down') {
+      expect(sent()[0]).toContain('CLI-путь на OAuth-подписке');
+      expect(sent()[0]).toContain('проба без входа');
+    } else {
+      expect(sent()[0]).toContain('Маша/VPM/маркетолог снова работают');
+    }
     expect(sent()[0]).not.toContain('активная проба Qwen в этом тике не выполнялась');
   });
 
