@@ -438,7 +438,7 @@ for (const legacyKey of ['70000000000_12_ru', 'mcp']) {
     assert.equal(fs.readFileSync(flat, 'utf8'), 'legacy-document-body');
     assert.equal(fs.existsSync(path.join(f.dirs.uploadDir, legacyKey)), false);
     assert.ok(f.calls[0].child.input.includes(`- ${flat} (name: `));
-    assert.ok(arg(f.calls[0].args, '--allowedTools').includes(`Read(/tmp/agent-uploads/${legacyKey}_*)`));
+    assert.ok(arg(f.calls[0].args, '--allowedTools').includes(`Read(${f.dirs.uploadDir}/${legacyKey}_*)`));
   });
 }
 
