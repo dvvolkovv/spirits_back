@@ -67,6 +67,7 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
           return { rows: [] };
         }
         if (/llm_settings/.test(sql)) {
+          if (personalClaude instanceof Error) throw personalClaude;
           return {
             rows: [{
               global_provider: atomicProvider,

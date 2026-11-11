@@ -4,7 +4,8 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
 import { ClaudeCliCallError, ClaudeCliService } from '../common/services/claude-cli.service';
 import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
-import type { FallbackProvider } from '../common/services/llm-fallback';
+import { isAnswerProvider } from '../common/services/llm-fallback';
+import type { AnswerProvider, FallbackProvider } from '../common/services/llm-fallback';
 import { CliSwitchState, cliOutageAffectedText, cliRecoveredText, switchCarriesCliPath } from '../common/global-llm-messages';
 import axios from 'axios';
 import { sendTelegramPayload } from '../common/telegram-alert';
@@ -401,22 +402,28 @@ export class ClaudeHealthService implements OnModuleInit {
     }
   }
 
-  /** Личный Claude остаётся затронут даже при живом общем Kimi/Qwen. Сбой SQL — fail-open. */
-  private async hasPersonalClaude(): Promise<boolean> {
+  /** Единый statement snapshot: provider и личный Claude согласованы; ошибка — fail-open. */
+  private async readFinalProviderAndPersonal(): Promise<{ provider: AnswerProvider; personalClaude: boolean } | null> {
     try {
       const r = await this.pg.query(
-        `SELECT EXISTS (
-           SELECT 1
-           FROM ai_profiles_consolidated p
-           JOIN user_id u ON u.internal_id = p.user_id
-           WHERE p.llm_provider = 'claude'
-             AND u.state = 'active'
-         ) AS present`,
+        `SELECT
+           (SELECT value->>'provider' FROM llm_settings WHERE key = 'global_provider') AS global_provider,
+           EXISTS (
+             SELECT 1
+             FROM ai_profiles_consolidated p
+             JOIN user_id u ON u.internal_id = p.user_id
+             WHERE p.llm_provider = 'claude'
+               AND u.state = 'active'
+           ) AS personal_claude`,
       );
-      return r.rows[0]?.present === true;
+      const value = r.rows[0]?.global_provider;
+      return {
+        provider: isAnswerProvider(value) ? value : 'claude',
+        personalClaude: r.rows[0]?.personal_claude === true,
+      };
     } catch (e: any) {
-      this.log.warn(`llm_provider: не удалось проверить личный Claude для CLI-алерта: ${e?.message || 'unknown'}`);
-      return true;
+      this.log.warn(`llm_settings: строгий snapshot для CLI-алерта не прочитан: ${e?.message || 'unknown'}`);
+      return null;
     }
   }
 
@@ -456,14 +463,17 @@ export class ClaudeHealthService implements OnModuleInit {
     if (sw.switchProvider !== 'claude' && switchCarriesCliPath(sw)) {
       const probedProvider = sw.switchProvider;
       const probeOk = await this.probeSwitchProvider(probedProvider);
-      const personalClaude = probeOk ? await this.hasPersonalClaude() : true;
+      const final = probeOk ? await this.readFinalProviderAndPersonal() : null;
       const afterNow = Date.now();
       const afterStats = this.claudeCli.fallbackStats(afterNow);
-      const afterSw = await this.switchState(afterStats, afterNow);
+      const afterSw = final
+        ? this.switchStateFromStats(final.provider, afterStats, afterNow)
+        : await this.switchState(afterStats, afterNow);
+      const personalClaude = final ? final.personalClaude : true;
       effectiveStats = afterStats;
       effectiveSw = afterSw;
       const sameProvider = afterSw.switchProvider === probedProvider;
-      globalAlive = probeOk && sameProvider && switchCarriesCliPath(afterSw) && !personalClaude;
+      globalAlive = probeOk && final !== null && sameProvider && switchCarriesCliPath(afterSw) && !personalClaude;
       if (!sameProvider && switchCarriesCliPath(afterSw)) {
         effectiveSw = { ...afterSw, providerUnverified: true };
       } else if (sameProvider && afterSw.enabled && !afterSw.down && !probeOk) {
@@ -513,10 +523,17 @@ export class ClaudeHealthService implements OnModuleInit {
    * рубильника её пропускает (planProviders с respectDown). get() не бросает
    * (контракт GlobalLlmProviderService.get).
    */
-  private async switchState(stats: ReturnType<ClaudeCliService['fallbackStats']>, now: number): Promise<CliSwitchState> {
-    const switchProvider = await this.globalProvider.get();
+  private switchStateFromStats(
+    switchProvider: AnswerProvider,
+    stats: ReturnType<ClaudeCliService['fallbackStats']>,
+    now: number,
+  ): CliSwitchState {
     const st = switchProvider === 'claude' ? undefined : stats.providers?.[switchProvider];
     return { switchProvider, enabled: !!st?.enabled, down: !!st && st.downUntil > now };
+  }
+
+  private async switchState(stats: ReturnType<ClaudeCliService['fallbackStats']>, now: number): Promise<CliSwitchState> {
+    return this.switchStateFromStats(await this.globalProvider.get(), stats, now);
   }
 
   async getOverview(signal?: AbortSignal): Promise<ClaudeHealthOverview> {
