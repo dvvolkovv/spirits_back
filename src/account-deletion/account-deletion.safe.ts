@@ -2,6 +2,7 @@ import { createHash } from 'crypto';
 import type {
   DeletionErrorKind,
   DeletionJobSpec,
+  DeletionResourceType,
   DeletionSkip,
   DeletionSkipReason,
 } from './account-deletion.types';
@@ -11,11 +12,68 @@ export const ACCOUNT_DELETION_RETENTION_MS =
   ACCOUNT_DELETION_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 export const ACCOUNT_DELETION_WORKER_DEFAULT_ENABLED = false;
 
+const DELETION_RESOURCE_TYPE_LIST = [
+  'account.core.immediate',
+  'account.core.purge',
+  'routine.stop',
+  'routine.purge',
+  'push.purge',
+  'telegram.stop',
+  'telegram.purge',
+  'custom-agent.purge',
+  'product.stop',
+  'product.purge',
+  'calendar.stop',
+  'calendar.purge',
+  'calendar.external',
+  'integration.apple.stop',
+  'integration.zoom.stop',
+  'integration.talerid.stop',
+  'voice.stop',
+  'voice.purge',
+  'voice-document.purge',
+  'chat-file.purge',
+  'image.purge',
+  'video-job.purge',
+  'video.provider',
+  'speech.purge',
+  'listen.purge',
+  'avatar.purge',
+  'elevenlabs-voice.purge',
+  'events.purge',
+  'tasks.stop',
+  'tasks.purge',
+  'support.stop',
+  'support.purge',
+  'peer.stop',
+  'peer.purge',
+  'contacts.purge',
+  'referral.stop',
+  'referral.purge',
+  'retention.stop',
+  'profile-backup.purge',
+  'devices.purge',
+  'guest-carry.stop',
+  'guest.purge',
+  'auth-verification.stop',
+  'legacy-auth.purge',
+  'legacy-smm.stop',
+  'legacy-smm.purge',
+] as const satisfies readonly DeletionResourceType[];
+export const DELETION_RESOURCE_TYPES: ReadonlySet<DeletionResourceType> =
+  new Set(DELETION_RESOURCE_TYPE_LIST);
+
 const FORBIDDEN_KEYS = new Set([
   'text',
   'content',
   'prompt',
   'message',
+  'note',
+  'notes',
+  'description',
+  'body',
+  'comment',
+  'caption',
   'token',
   'secret',
   'secretenc',
@@ -37,7 +95,36 @@ const FORBIDDEN_KEY_PARTS = new Set([
   'credentials',
   'authorization',
 ]);
-const URL_WITH_CREDENTIALS = /[a-z][a-z0-9+.-]*:\/\/[^/\s@]*:[^/\s@]*@/i;
+const URL_WITH_USERINFO = /[a-z][a-z0-9+.-]*:\/\/[^/\s?#]*@/i;
+const FORBIDDEN_QUERY_PARTS = new Set([
+  'token',
+  'sig',
+  'signature',
+  'key',
+  'secret',
+  'password',
+  'credential',
+  'credentials',
+  'auth',
+  'authorization',
+]);
+const FORBIDDEN_QUERY_KEYS = new Set([
+  'token',
+  'sig',
+  'signature',
+  'key',
+  'secret',
+  'password',
+  'credential',
+  'credentials',
+  'auth',
+  'authorization',
+  'oauth',
+  'apikey',
+  'accesstoken',
+  'xamzcredential',
+  'xamzsignature',
+]);
 const DELETION_ERROR_KINDS = new Set<DeletionErrorKind>([
   'timeout',
   'external_5xx',
@@ -57,16 +144,59 @@ const DELETION_SKIP_REASONS = new Set<DeletionSkipReason>([
   'external_note_id_unavailable',
 ]);
 
-function unsafePayloadKey(key: string): boolean {
-  const parts = key
+function keyParts(key: string): string[] {
+  return key
     .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
     .toLowerCase()
     .split(/[^a-z0-9]+/)
     .filter(Boolean);
+}
+
+function unsafePayloadKey(key: string): boolean {
+  const parts = keyParts(key);
   const normalized = parts.join('');
   if (FORBIDDEN_KEYS.has(normalized)) return true;
   if (parts.some((part) => FORBIDDEN_KEY_PARTS.has(part))) return true;
+  if (['token', 'secret', 'password', 'credential', 'authorization']
+    .some((part) => normalized.includes(part))) return true;
+  if (normalized.includes('apikey') || normalized.includes('privatekey')) return true;
   return (parts.includes('api') || parts.includes('private')) && parts.includes('key');
+}
+
+function unsafeQueryKey(key: string): boolean {
+  const parts = keyParts(key);
+  const normalized = parts.join('');
+  if (FORBIDDEN_QUERY_KEYS.has(normalized)) return true;
+  if (parts.some((part) => FORBIDDEN_QUERY_PARTS.has(part))) return true;
+  if (['token', 'secret', 'password', 'credential', 'signature', 'apikey', 'privatekey']
+    .some((part) => normalized.includes(part))) return true;
+  return /^auth(?:entication|orization|token|key|secret|code|credential|signature|sig)/
+    .test(normalized);
+}
+
+function unsafePayloadString(value: string, userId: string): boolean {
+  if (userId.length >= 6 && value.includes(userId)) return true;
+  if (URL_WITH_USERINFO.test(value)) return true;
+  const candidates = value.match(/[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi) ?? [];
+  for (const candidate of candidates) {
+    try {
+      const url = new URL(candidate);
+      if (url.username || url.password) return true;
+      for (const key of url.searchParams.keys()) {
+        if (unsafeQueryKey(key)) return true;
+      }
+    } catch {
+      // Невалидный URL уже проверен на userinfo; секреты не раскрываем.
+    }
+  }
+  return false;
+}
+
+function assertSafeResourceType(resourceType: unknown): asserts resourceType is DeletionResourceType {
+  if (typeof resourceType !== 'string'
+    || !DELETION_RESOURCE_TYPES.has(resourceType as DeletionResourceType)) {
+    throw new Error('unsafe_resource_type');
+  }
 }
 
 export class DeletionCancelledError extends Error {
@@ -92,20 +222,22 @@ export function deletionResourceHash(bucket: string, key: string): string {
 }
 
 export function assertSafeJobSpec(job: DeletionJobSpec, userId: string): void {
-  const visit = (value: unknown, key?: string): void => {
-    if (key && unsafePayloadKey(key)) throw new Error('unsafe_payload');
-    if (typeof value === 'string') {
-      if (userId.length >= 6 && value.includes(userId)) throw new Error('unsafe_payload');
-      if (URL_WITH_CREDENTIALS.test(value)) throw new Error('unsafe_payload');
-    }
-    if (Array.isArray(value)) {
-      value.forEach((item) => visit(item));
-    } else if (value && typeof value === 'object') {
-      Object.entries(value).forEach(([nestedKey, nestedValue]) => visit(nestedValue, nestedKey));
-    }
-  };
-
-  visit(job.payload);
+  assertSafeResourceType(job.resourceType);
+  try {
+    JSON.stringify(job.payload, function (key, value) {
+      if (key && unsafePayloadKey(key)) throw new Error('unsafe_payload');
+      if (typeof value === 'bigint') throw new Error('unsafe_payload');
+      if (value instanceof URL && unsafePayloadString(value.href, userId)) {
+        throw new Error('unsafe_payload');
+      }
+      if (typeof value === 'string' && unsafePayloadString(value, userId)) {
+        throw new Error('unsafe_payload');
+      }
+      return value;
+    });
+  } catch {
+    throw new Error('unsafe_payload');
+  }
   if (userId.length >= 6 && job.resourceKey.includes(userId)) {
     throw new Error('unsafe_payload');
   }
@@ -126,11 +258,12 @@ export function accountDeletionWorkerEnabled(env: NodeJS.ProcessEnv): boolean {
 
 export function safeDeletionMessage(input: {
   deletionId: string;
-  resourceType: string;
+  resourceType: DeletionResourceType;
   resourceKey: string;
   attempts: number;
   kind: DeletionErrorKind;
 }): string {
+  assertSafeResourceType(input.resourceType);
   return `deletion=${input.deletionId} type=${input.resourceType} key=${input.resourceKey} attempt=${input.attempts} kind=${input.kind}`;
 }
 
@@ -145,6 +278,8 @@ export function deletionErrorKind(error: any): DeletionErrorKind {
   if (status === 401 || status === 403) return 'permission';
   if (status >= 500) return 'external_5xx';
   if (status >= 400) return 'external_4xx';
+  if (['EPERM', 'EACCES', 'EBUSY'].includes(error?.code)) return 'permission';
+  if (['ENOENT', 'ENOTFOUND'].includes(error?.code)) return 'not_found';
   if (typeof error?.code === 'string' && /^[0-9A-Z]{5}$/.test(error.code)) return 'db';
   return 'external_unknown';
 }
