@@ -270,7 +270,7 @@ export class AlertBotRepairExecutor {
       });
     }
     return childProcess.spawn('ssh', [
-      ...this.sshPrefix(job.host), 'setsid', 'bash', '-s',
+      ...this.sshPrefix(job.host), 'setsid', '--wait', 'bash', '-s',
     ], { detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
   }
 
