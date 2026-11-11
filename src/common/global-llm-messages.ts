@@ -89,7 +89,7 @@ const CLI_PATH_USERS = 'Маша, TG-боты, Виртуальный PM, Вир
 export function cliOutageAffectedText(s: CliSwitchState): string {
   const label = PROVIDER_LABELS[s.switchProvider];
   if (s.providerUnverified && s.switchProvider !== 'claude') {
-    return `Затронуто: пробы мониторинга, личный выбор Claude и запасной путь — во время проверки рубильник переключён на <b>${label}</b>; его активная проба в этом тике не выполнялась.`;
+    return `Затронуто: пробы мониторинга, личный выбор Claude и запасной путь — во время проверки рубильник переключён на <b>${label}</b>; его активная проба ${label} в этом тике не выполнялась.`;
   }
   if (s.probeFailed && s.switchProvider !== 'claude') {
     return `Затронуто: пробы мониторинга, личный выбор Claude и запасной путь — контрольная проба ${label} не удалась; доступность рабочего пути через ${label} не подтверждена, breaker и маршрутизация не изменялись.`;
@@ -116,7 +116,7 @@ export function cliRecoveredText(a: CliSwitchState & { checkedAt: string | null;
   const check = `проверка: ${a.checkedAt || '—'}, ${a.latencyMs ?? '—'}мс`;
   if (a.providerUnverified && a.switchProvider !== 'claude') {
     const label = PROVIDER_LABELS[a.switchProvider];
-    return `${head}Claude снова отвечает (${check}); во время проверки рубильник переключён на ${label}, его активная проба в этом тике не выполнялась.`;
+    return `${head}Claude снова отвечает (${check}); во время проверки рубильник переключён на ${label}, его активная проба ${label} в этом тике не выполнялась.`;
   }
   if (a.probeFailed && a.switchProvider !== 'claude') {
     const label = PROVIDER_LABELS[a.switchProvider];

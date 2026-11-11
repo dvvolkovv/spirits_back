@@ -333,7 +333,7 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
   it('переключение рубильника во время SQL личного Claude — fail-open', async () => {
     const svc = make('kimi', healthyOnly('kimi'), false, false);
     let resolvePersonal!: () => void;
-    const originalQuery = svc.pg.query;
+    const originalQuery = svc.pg.query.getMockImplementation()!;
     svc.pg.query.mockImplementation(async (sql: string, params?: unknown[]) => {
       if (/ai_profiles_consolidated/.test(sql)) {
         return new Promise((resolve) => {
