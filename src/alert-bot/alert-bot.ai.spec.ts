@@ -52,7 +52,7 @@ describe('AlertBotAi', () => {
     }
   });
 
-  it('CLI получает только Claude, без встроенных инструментов, и пять разрешённых ops', async () => {
+  it('CLI использует общий рубильник, без встроенных инструментов, и пять разрешённых ops', async () => {
     process.env.JWT_SECRET = 'spec-secret';
     process.env.RELAY_FS_SALT = 'spec-salt';
     process.env.ALERT_BOT_MODEL = 'claude-test';
@@ -62,7 +62,7 @@ describe('AlertBotAi', () => {
     tools.execute.mockResolvedValue('{"ticket":"#11111111"}');
     const result = await ai.answer({ ...input, question: 'Почему +79012345678?', replyText: 'a@example.com', ticketId: TICKET });
     const [prompt, opts] = claude.textWithCost.mock.calls[0];
-    expect(opts.noFallback).toBe(true);
+    expect(opts).not.toHaveProperty('noFallback');
     expect(opts.tools).toBe('');
     expect(opts.model).toBe('claude-test');
     expect(opts.allowedTools.split(',').sort()).toEqual(['mcp__ops__alerts', 'mcp__ops__health', 'mcp__ops__logs', 'mcp__ops__stats', 'mcp__ops__tickets'].sort());

@@ -67,7 +67,8 @@ export interface CliSwitchState {
 }
 
 /** Маша, TG-боты и фоновые задачи сейчас отвечают через модель рубильника, а не через Claude CLI. */
-const switchCarriesCliPath = (s: CliSwitchState): boolean => s.switchProvider !== 'claude' && s.enabled && !s.down;
+export const switchCarriesCliPath = (s: CliSwitchState): boolean =>
+  s.switchProvider !== 'claude' && s.enabled && !s.down;
 
 const CLI_PATH_USERS = 'Маша, TG-боты, Виртуальный PM, Виртуальный маркетолог, фоновые задачи';
 
