@@ -1,5 +1,6 @@
 import { computeCopilotState, mergeEvents, TripService } from './trip.service';
 import { buildMorningFacts, factsHash } from './day-framing';
+import { RelaySessionBusyError } from '../chat/chat.service';
 
 const now = new Date('2026-07-19T10:00:00+05:00');
 const task = (uid: string, title: string, due?: string, done = false) => ({ uid, title, due, done, source: 'yandex' });
@@ -308,14 +309,41 @@ describe('computeCopilotState', () => {
       expect(store.upsert).not.toHaveBeenCalled();
     });
 
-    it('best-effort: ошибка LLM не throw-ится наружу', async () => {
+    it('занятая relay-сессия откладывает фрейминг без ошибки и userId в логе', async () => {
       const store = { get: jest.fn().mockResolvedValue(null), upsert: jest.fn() };
-      const chat = { generateAgentReply: jest.fn().mockRejectedValue(new Error('r.linkeon.io down')) };
+      const chat = { generateAgentReply: jest.fn().mockRejectedValue(new RelaySessionBusyError('u1_14_ru')) };
       const svc = makeTripService({ dayFramingStore: store, chat });
+      const logger = { log: jest.fn(), warn: jest.fn() };
+      (svc as any).logger = logger;
+
       await expect(
         svc.generateFramingAsync('u1', 'morning', [], [], new Date('2026-08-06T02:30:00Z')),
       ).resolves.toBeUndefined();
+
       expect(store.upsert).not.toHaveBeenCalled();
+      expect(logger.warn).not.toHaveBeenCalled();
+      expect(logger.log).toHaveBeenCalledTimes(1);
+      expect(logger.log).toHaveBeenCalledWith('day-framing отложен: сессия занята (morning)');
+      const message = logger.log.mock.calls[0][0];
+      expect(message).not.toContain('u1');
+      expect(message).not.toContain('failed');
+    });
+
+    it('best-effort: ошибка LLM не throw-ится наружу и логируется без userId', async () => {
+      const store = { get: jest.fn().mockResolvedValue(null), upsert: jest.fn() };
+      const chat = { generateAgentReply: jest.fn().mockRejectedValue(new Error('r.linkeon.io down')) };
+      const svc = makeTripService({ dayFramingStore: store, chat });
+      const logger = { log: jest.fn(), warn: jest.fn() };
+      (svc as any).logger = logger;
+
+      await expect(
+        svc.generateFramingAsync('u1', 'morning', [], [], new Date('2026-08-06T02:30:00Z')),
+      ).resolves.toBeUndefined();
+
+      expect(store.upsert).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+      expect(logger.warn).toHaveBeenCalledWith('day-framing gen failed (morning): r.linkeon.io down');
+      expect(logger.warn.mock.calls[0][0]).not.toContain('u1');
     });
   });
 
