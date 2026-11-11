@@ -240,6 +240,184 @@ ssh dv@85.192.61.231 "source ~/.nvm/nvm.sh && git -C ~/ci/spirits_back fetch -q 
 
 Expected: оба suites полностью зелёные.
 
+### Task 2A: Финальная валидация после SQL и providerUnverified
+
+**Files:**
+- Modify: `src/monitoring/claude-health.outage-alert.spec.ts`
+- Modify: `src/common/global-llm-messages.spec.ts`
+- Modify: `src/monitoring/claude-health.service.ts`
+- Modify: `src/common/global-llm-messages.ts`
+
+- [ ] **Step 1: Добавить красные тесты гонки SQL, смены non-Claude провайдера и свежей статистики**
+
+```typescript
+it('переключение рубильника во время SQL личного Claude — fail-open', async () => {
+  const svc = make('kimi', healthyOnly('kimi'), false, false);
+  let resolvePersonal!: () => void;
+  const originalQuery = svc.pg.query;
+  svc.pg.query.mockImplementation(async (sql: string, params?: unknown[]) => {
+    if (/ai_profiles_consolidated/.test(sql)) {
+      return new Promise((resolve) => {
+        resolvePersonal = () => resolve({ rows: [{ present: false }] });
+      });
+    }
+    return originalQuery(sql, params);
+  });
+  setDown(svc);
+  const pending = svc.maybeAlertOutage();
+  for (let i = 0; i < 5 && !resolvePersonal; i++) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  expect(resolvePersonal).toBeDefined();
+  svc.globalProvider.get.mockResolvedValue('claude');
+  resolvePersonal();
+  await pending;
+  expect(sent()).toHaveLength(1);
+  expect(sent()[0]).toContain('проба без входа');
+});
+
+it.each(['down', 'ok'] as const)('Kimi → Qwen во время пробы при %s — providerUnverified вместо healthy-текста', async (status) => {
+  const svc = make('kimi', { qwen: up, kimi: up }, status === 'ok', false);
+  if (status === 'down') setDown(svc);
+  else {
+    svc.cache.llmStatus = 'ok';
+    svc.cache.llmCheckedAt = '2026-11-11T07:15:00.000Z';
+    svc.cache.llmLatencyMs = 812;
+  }
+  let resolveProbe!: (text: string) => void;
+  svc.claudeCli.text.mockReturnValue(new Promise<string>((resolve) => { resolveProbe = resolve; }));
+  const pending = svc.maybeAlertOutage();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  svc.globalProvider.get.mockResolvedValue('qwen');
+  resolveProbe('ok');
+  await pending;
+  expect(sent()).toHaveLength(1);
+  expect(sent()[0]).toContain('активная проба Qwen в этом тике не выполнялась');
+  expect(sent()[0]).not.toContain('отвечают через эту модель');
+  expect(sent()[0]).not.toContain('Маша/VPM/маркетолог снова работают');
+  expect(svc.claudeCli.text).toHaveBeenCalledTimes(1);
+});
+
+it('fallbackAlertLine использует снимок после ожидания пробы', async () => {
+  const svc = make('kimi', healthyOnly('kimi'), false, false);
+  const initial = { windowMs: 900_000, providers: { qwen: noKey, kimi: up } };
+  const fresh = {
+    windowMs: 900_000,
+    providers: { qwen: noKey, kimi: { enabled: true, ok: 2, failed: 1, downUntil: 0 } },
+  };
+  svc.claudeCli.fallbackStats.mockReturnValueOnce(initial).mockReturnValueOnce(fresh);
+  svc.claudeCli.text.mockRejectedValue(new Error('kimi unavailable'));
+  setDown(svc);
+  await svc.maybeAlertOutage();
+  expect(sent()[0]).toContain('Kimi — ответов 2, ошибок 1');
+});
+```
+
+В `global-llm-messages.spec.ts` добавить outage и recovery тесты `providerUnverified`:
+
+```typescript
+it('providerUnverified — новый провайдер не объявляется проверенным', () => {
+  const text = cliOutageAffectedText({ switchProvider: 'qwen', enabled: true, down: false, providerUnverified: true });
+  expect(text).toContain('активная проба Qwen в этом тике не выполнялась');
+  expect(text).not.toContain('отвечают через эту модель');
+});
+
+it('providerUnverified при recovery — без healthy-текста нового провайдера', () => {
+  const text = cliRecoveredText({
+    switchProvider: 'qwen', enabled: true, down: false, providerUnverified: true,
+    checkedAt: '2026-11-11T07:15:00.000Z', latencyMs: 812,
+  });
+  expect(text).toContain('Claude снова отвечает');
+  expect(text).toContain('активная проба Qwen в этом тике не выполнялась');
+  expect(text).not.toContain('Маша/VPM/маркетолог снова работают');
+});
+```
+
+Закоммитировать тесты как `test(monitoring): финальная гонка SQL и смена провайдера (красный)` с attribution, запушить ветку и прогнать оба suites на ноде. Ожидаются падения новых сценариев и `providerUnverified`-компиляции до добавления поля.
+
+- [ ] **Step 2: Добавить providerUnverified и уточнить probeFailed**
+
+В `CliSwitchState` добавить:
+
+```typescript
+/** Рубильник сменился во время проверки; новый провайдер не пробовался. */
+providerUnverified?: boolean;
+```
+
+В `cliOutageAffectedText` перед `probeFailed` добавить:
+
+```typescript
+if (s.providerUnverified && s.switchProvider !== 'claude') {
+  return `Затронуто: пробы мониторинга, личный выбор Claude и запасной путь — во время проверки рубильник переключён на <b>${label}</b>; его активная проба в этом тике не выполнялась.`;
+}
+```
+
+Существующий `probeFailed`-текст заменить на:
+
+```typescript
+return `Затронуто: пробы мониторинга, личный выбор Claude и запасной путь — контрольная проба ${label} не удалась; доступность рабочего пути через ${label} не подтверждена, breaker и маршрутизация не изменялись.`;
+```
+
+В `cliRecoveredText` перед `probeFailed` добавить:
+
+```typescript
+if (a.providerUnverified && a.switchProvider !== 'claude') {
+  const label = PROVIDER_LABELS[a.switchProvider];
+  return `${head}Claude снова отвечает (${check}); во время проверки рубильник переключён на ${label}, его активная проба в этом тике не выполнялась.`;
+}
+```
+
+`probeFailed` recovery заменить на:
+
+```typescript
+return `${head}Claude снова отвечает (${check}), но контрольная проба ${label} не удалась; доступность рабочего пути через ${label} не подтверждена, breaker и маршрутизация не изменялись.`;
+```
+
+- [ ] **Step 3: Сделать финальное чтение последним await**
+
+В `maybeAlertOutage()` заменить блок от `const stats = ...` до `if (belowThreshold) return;` на:
+
+```typescript
+const stats = this.claudeCli.fallbackStats(now.getTime());
+const sw = await this.switchState(stats, now.getTime());
+let effectiveStats = stats;
+let effectiveSw: CliSwitchState = sw;
+let globalAlive = false;
+if (sw.switchProvider !== 'claude' && switchCarriesCliPath(sw)) {
+  const probedProvider = sw.switchProvider;
+  const probeOk = await this.probeSwitchProvider(probedProvider);
+  const personalClaude = probeOk ? await this.hasPersonalClaude() : true;
+  const afterNow = Date.now();
+  const afterStats = this.claudeCli.fallbackStats(afterNow);
+  const afterSw = await this.switchState(afterStats, afterNow);
+  effectiveStats = afterStats;
+  effectiveSw = afterSw;
+  const sameProvider = afterSw.switchProvider === probedProvider;
+  globalAlive = probeOk && sameProvider && switchCarriesCliPath(afterSw) && !personalClaude;
+  if (!sameProvider && afterSw.switchProvider !== 'claude' && !afterSw.down) {
+    effectiveSw = { ...afterSw, providerUnverified: true };
+  } else if (sameProvider && !afterSw.down && !probeOk) {
+    effectiveSw = { ...afterSw, probeFailed: true };
+  }
+}
+if (globalAlive) {
+  // Последний await был до этого решения: suppression не использует устаревший рубильник.
+  if (alreadyAlerted) {
+    this.lastOutageAlertAt = null;
+    await this.setAlerted(COMPONENT, false);
+    this.log.warn(`Claude CLI alert cleared without Telegram: ${sw.switchProvider} answered probe`);
+  }
+  return;
+}
+if (belowThreshold) return;
+```
+
+В оставшемся методе заменить `fallbackAlertLine(stats)` на `fallbackAlertLine(effectiveStats)`. Теперь SQL выполняется только после успешной пробы, а финальное чтение рубильника — после SQL и непосредственно перед синхронным решением.
+
+- [ ] **Step 4: Закоммитить и проверить зелёный**
+
+Production коммит: `fix(monitoring): валидировать рубильник непосредственно перед подавлением`, с attribution. Запушить и прогнать оба suites на ноде. Ожидаются полностью зелёные suites.
+
 ### Task 3: Повторные ревью и итоговые проверки
 
 - [ ] **Step 1:** Spec compliance review подтверждает, что подавление по-прежнему соответствует решениям владельца, а новые изменения ограничены observation-only, race guard и truthful messages.
