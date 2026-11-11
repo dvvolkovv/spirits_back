@@ -1,5 +1,6 @@
 import * as childProcess from 'child_process';
 import * as fs from 'fs';
+import { PassThrough } from 'stream';
 import { AlertBotRepairExecutor } from './alert-bot.repair-executor';
 import {
   CreateRepairJobInput,
@@ -444,6 +445,38 @@ describe('AlertBotRepairExecutor', () => {
     expect(await store.findJob(job.id)).toMatchObject({
       status: 'interrupted', failureKind: 'remote_cancel_unconfirmed',
     });
+  });
+
+  it.each(['stopRepair', 'stopAll'] as const)('%s bounded при helper SSH без error/close', async (mode) => {
+    const fake = (pid: number): childProcess.ChildProcess => {
+      const child = new childProcess.ChildProcess();
+      Object.assign(child, { pid, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
+      return child;
+    };
+    const original = fake(91_001);
+    let spawn = jest.spyOn(childProcess, 'spawn').mockImplementationOnce(() => original as any);
+    spawn.mockImplementation(() => fake(91_002) as any);
+    (executor as any).remoteHelperDeadlineMs = 50;
+    const job = await createJob({ host: 'test' });
+    await executor.start(job.id, 'sleep 30');
+    let resolved = false;
+    const operation = (mode === 'stopRepair' ? executor.stopRepair('repair-1') : executor.stopAll())
+      .then(() => { resolved = true; });
+    try {
+      await Promise.race([operation, new Promise<void>((resolve) => setTimeout(resolve, 2_500))]);
+      expect(resolved).toBe(true);
+      expect(await store.findJob(job.id)).toMatchObject({
+        status: 'interrupted', failureKind: 'remote_cancel_unconfirmed',
+      });
+    } finally {
+      spawn.mockImplementation(() => {
+        const child = fake(91_003);
+        setImmediate(() => child.emit('close', 1));
+        return child as any;
+      });
+      original.emit('close', null);
+      await operation;
+    }
   });
 
   it('cancellation marker до close не даёт быстрой job записать succeeded', async () => {
