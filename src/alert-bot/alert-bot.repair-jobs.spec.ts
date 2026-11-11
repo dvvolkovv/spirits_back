@@ -230,6 +230,35 @@ describe('AlertBotRepairJobs', () => {
     }
   });
 
+  it('stopRepair ждёт начальный findJob внутри per-repair chain', async () => {
+    let releaseFind!: () => void;
+    let findEntered!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseFind = resolve; });
+    const entered = new Promise<void>((resolve) => { findEntered = resolve; });
+    const original = store.findJob.bind(store);
+    jest.spyOn(store, 'findJob').mockImplementation(async (id) => {
+      findEntered();
+      await gate;
+      return original(id);
+    });
+    const spawn = jest.spyOn(childProcess, 'spawn');
+    const observed = jobs.start(ctx, 'exec', { host: 'prod', command: 'printf must-not-run' }).then(
+      () => ({ status: 'resolved' as const }),
+      (error) => ({ status: 'rejected' as const, error }),
+    );
+    await entered;
+    let stopResolved = false;
+    const stopped = executor.stopRepair(ctx.repairId).then(() => { stopResolved = true; });
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    const resolvedBeforeRelease = stopResolved;
+    releaseFind();
+    await stopped;
+    expect((await observed).status).toBe('rejected');
+    expect(resolvedBeforeRelease).toBe(false);
+    expect(spawn).not.toHaveBeenCalled();
+    expect([...store.jobs.values()][0]).toMatchObject({ status: 'cancelled' });
+  });
+
   it('unknown host и чужой repair не запускают spawn', async () => {
     const spawn = jest.spyOn(childProcess, 'spawn');
     await expect(jobs.start(ctx, 'exec', { host: 'other', command: 'printf no' })).rejects.toThrow('unknown_host');
