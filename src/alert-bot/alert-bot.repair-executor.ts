@@ -41,17 +41,36 @@ export class AlertBotRepairExecutor {
   private readonly repairs = new Map<string, string>();
   private readonly waiters = new Map<string, Set<() => void>>();
   private readonly processes = new Map<string, ProcessState>();
+  private readonly cancellingRepairs = new Set<string>();
+  private readonly repairChains = new Map<string, Promise<void>>();
+  private stoppingAll = false;
 
   constructor(private readonly store: RepairStore) {}
 
   async start(jobId: string, rawCommand: string): Promise<void> {
     const job = await this.store.findJob(jobId);
     if (!job) throw new Error('job_not_found');
+    const previous = this.repairChains.get(job.repairId) ?? Promise.resolve();
+    const setup = previous.then(() => this.startRegistered(job, rawCommand));
+    this.repairChains.set(job.repairId, setup.then(() => undefined, () => undefined));
+    return setup;
+  }
+
+  private async startRegistered(job: RepairJobRecord, rawCommand: string): Promise<void> {
+    const jobId = job.id;
+    if (this.isCancelling(job.repairId)) {
+      await this.cancelBeforeSpawn(jobId);
+      throw new Error('repair_inactive');
+    }
     if (!await this.store.markJobRunning(jobId)) {
       await this.store.finishJob(jobId, {
         status: 'cancelled', exitCode: null, stdout: '', stderr: '', failureKind: 'repair_inactive',
       });
       this.wake(jobId);
+      throw new Error('repair_inactive');
+    }
+    if (this.isCancelling(job.repairId)) {
+      await this.cancelBeforeSpawn(jobId);
       throw new Error('repair_inactive');
     }
 
@@ -88,7 +107,9 @@ export class AlertBotRepairExecutor {
     child.once('close', (code) => {
       state.stdout = appendCapped(state.stdout, state.stdoutDecoder.end());
       state.stderr = appendCapped(state.stderr, state.stderrDecoder.end());
-      const status = state.outcome ?? (code === 0 ? 'succeeded' : 'failed');
+      const repairId = this.repairs.get(jobId);
+      const cancelled = state.interruptible && repairId !== undefined && this.isCancelling(repairId);
+      const status = state.outcome ?? (cancelled ? 'cancelled' : (code === 0 ? 'succeeded' : 'failed'));
       void this.finishProcess(jobId, status, code).catch(() => undefined);
     });
 
@@ -103,6 +124,9 @@ export class AlertBotRepairExecutor {
       state.timeout.unref();
     }
 
+    if (this.isCancelling(job.repairId) && job.interruptible) {
+      void this.terminate(jobId, 'cancelled').catch(() => undefined);
+    }
     const repair = await this.store.findRepair(job.repairId);
     const active = repair && ['requested', 'running'].includes(repair.status);
     if (!active && job.interruptible) {
@@ -143,6 +167,12 @@ export class AlertBotRepairExecutor {
   }
 
   async stopRepair(repairId: string): Promise<void> {
+    this.cancellingRepairs.add(repairId);
+    let request: Promise<boolean>;
+    try { request = this.store.requestCancel(repairId); }
+    catch { request = Promise.resolve(false); }
+    await request.catch(() => false);
+    await this.repairChains.get(repairId);
     const jobs = [...this.repairs.entries()]
       .filter(([, currentRepairId]) => currentRepairId === repairId)
       .map(([jobId]) => jobId);
@@ -150,6 +180,10 @@ export class AlertBotRepairExecutor {
   }
 
   async stopAll(): Promise<void> {
+    this.stoppingAll = true;
+    for (const repairId of this.repairChains.keys()) this.cancellingRepairs.add(repairId);
+    for (const repairId of this.repairs.values()) this.cancellingRepairs.add(repairId);
+    await Promise.all([...this.repairChains.values()]);
     const jobs = [...this.processes.entries()]
       .filter(([, state]) => state.interruptible && !state.finished)
       .map(([jobId]) => jobId);
@@ -170,6 +204,17 @@ export class AlertBotRepairExecutor {
     ], { detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
   }
 
+  private isCancelling(repairId: string): boolean {
+    return this.stoppingAll || this.cancellingRepairs.has(repairId);
+  }
+
+  private async cancelBeforeSpawn(jobId: string): Promise<void> {
+    await this.store.finishJob(jobId, {
+      status: 'cancelled', exitCode: null, stdout: '', stderr: '', failureKind: 'repair_inactive',
+    });
+    this.wake(jobId);
+  }
+
   private signalGroup(child: ChildProcess, signal: NodeJS.Signals): void {
     if (!child.pid) return;
     try { process.kill(-child.pid, signal); }
@@ -179,8 +224,8 @@ export class AlertBotRepairExecutor {
   private async terminate(jobId: string, outcome: ForcedOutcome): Promise<void> {
     const state = this.processes.get(jobId);
     const child = this.children.get(jobId);
-    if (!state || !child || !state.interruptible || state.finished) return;
-    if (!state.outcome) {
+    if (!state || !child || !state.interruptible) return;
+    if (!state.finished && !state.outcome) {
       state.outcome = outcome;
       this.signalGroup(child, 'SIGTERM');
       state.killTimer = setTimeout(() => {
@@ -202,9 +247,6 @@ export class AlertBotRepairExecutor {
     state.finished = true;
     if (state.timeout) clearTimeout(state.timeout);
     if (state.killTimer) clearTimeout(state.killTimer);
-    this.children.delete(jobId);
-    this.repairs.delete(jobId);
-    this.processes.delete(jobId);
     try {
       await this.store.finishJob(jobId, {
         status,
@@ -216,6 +258,9 @@ export class AlertBotRepairExecutor {
     } finally {
       state.complete();
       this.wake(jobId);
+      this.children.delete(jobId);
+      this.repairs.delete(jobId);
+      this.processes.delete(jobId);
     }
   }
 
