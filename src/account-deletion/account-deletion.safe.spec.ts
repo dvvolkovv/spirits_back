@@ -3,6 +3,7 @@ import {
   ACCOUNT_DELETION_RETENTION_DAYS,
   ACCOUNT_DELETION_RETENTION_MS,
   ACCOUNT_DELETION_WORKER_DEFAULT_ENABLED,
+  DELETION_RESOURCE_TYPES,
   DeletionCancelledError,
   DeletionRetryError,
   accountDeletionWorkerEnabled,
@@ -352,5 +353,126 @@ describe('account deletion quality regressions', () => {
     [418, 'external_4xx'],
   ])('классифицирует AWS httpStatusCode как response.status: %s', (status, kind) => {
     expect(deletionErrorKind({ $metadata: { httpStatusCode: status } })).toBe(kind);
+  });
+});
+
+describe('account deletion hardening regressions', () => {
+  it.each(['APISECRET', 'APIKEY', 'AUTHTOKEN', 'apikey'])(
+    'блокирует полностью uppercase secret variant: %s',
+    (key) => {
+      expect(() => assertSafeJobSpec(job({ [key]: SECRET }), USER_ID))
+        .toThrow(/^unsafe_payload$/);
+    },
+  );
+
+  it.each(['note', 'notes', 'description', 'body', 'comment', 'caption'])(
+    'блокирует text-like payload field: %s',
+    (key) => {
+      expect(() => assertSafeJobSpec(job({ [key]: CANARY }), USER_ID))
+        .toThrow(/^unsafe_payload$/);
+    },
+  );
+
+  it('блокирует любой URL userinfo, даже без password', () => {
+    expect(() => assertSafeJobSpec(job({
+      fileUrl: 'https://token@example.com/x',
+    }), USER_ID)).toThrow(/^unsafe_payload$/);
+  });
+
+  it.each([
+    'X-Amz-Credential',
+    'X-Amz-Signature',
+    'X-Amz-Security-Token',
+    'X-Goog-Credential',
+    'access_token',
+    'accessToken',
+    'token',
+    'sig',
+    'signature',
+    'key',
+    'secret',
+    'password',
+    'credential',
+    'auth',
+    'api_key',
+    'authToken',
+    'AUTHORIZATION',
+  ])('блокирует credentials query key: %s', (queryKey) => {
+    const fileUrl = `https://example.com/file?${queryKey}=technical-value`;
+    expect(() => assertSafeJobSpec(job({ fileUrl }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('не блокирует public URL с обычными query params', () => {
+    expect(() => assertSafeJobSpec(job({
+      fileUrl: 'https://example.com/public?download=1&author=linkeon',
+    }), USER_ID)).not.toThrow();
+  });
+
+  it('анализирует URL object через его JSON representation', () => {
+    const file = new URL(`https://example.com/x?access_token=${encodeURIComponent(SECRET)}`);
+    expect(() => assertSafeJobSpec(job({ file }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('анализирует результат custom toJSON', () => {
+    expect(() => assertSafeJobSpec(job({
+      document: {
+        toJSON: () => ({ fileUrl: 'https://token@example.com/x' }),
+      },
+    }), USER_ID)).toThrow(/^unsafe_payload$/);
+  });
+
+  it('контролируемо отклоняет циклический payload', () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(() => assertSafeJobSpec(job(cyclic), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('контролируемо отклоняет bigint', () => {
+    expect(() => assertSafeJobSpec(job({ externalId: BigInt(1) }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('экспортирует runtime Set всех 46 resource types', () => {
+    expect(DELETION_RESOURCE_TYPES.size).toBe(46);
+    for (const resourceType of ALL_DELETION_RESOURCE_TYPES) {
+      expect(DELETION_RESOURCE_TYPES.has(resourceType)).toBe(true);
+    }
+  });
+
+  it.each(['account.core.purge.typo', USER_ID])(
+    'отклоняет unknown/PII resource type в job без раскрытия',
+    (resourceType) => {
+      expect(() => assertSafeJobSpec({
+        ...job({}),
+        resourceType: resourceType as any,
+      }, USER_ID)).toThrow(/^unsafe_resource_type$/);
+    },
+  );
+
+  it.each(['account.core.purge.typo', USER_ID])(
+    'отклоняет arbitrary resource type в журнале без раскрытия',
+    (resourceType) => {
+      expect(() => safeDeletionMessage({
+        deletionId: 'd-1',
+        resourceType: resourceType as any,
+        resourceKey: 'p-1',
+        attempts: 2,
+        kind: 'timeout',
+      })).toThrow(/^unsafe_resource_type$/);
+    },
+  );
+
+  it.each([
+    ['EPERM', 'permission'],
+    ['EACCES', 'permission'],
+    ['EBUSY', 'permission'],
+    ['ENOENT', 'not_found'],
+    ['ENOTFOUND', 'not_found'],
+    ['ETIMEDOUT', 'timeout'],
+  ])('классифицирует Node code до SQLSTATE regex: %s', (code, kind) => {
+    expect(deletionErrorKind({ code })).toBe(kind);
   });
 });
