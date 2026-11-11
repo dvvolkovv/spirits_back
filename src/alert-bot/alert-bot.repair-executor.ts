@@ -84,6 +84,7 @@ export class AlertBotRepairExecutor {
   private readonly cancellingRepairs = new Set<string>();
   private readonly repairChains = new Map<string, Promise<void>>();
   private stoppingAll = false;
+  private stopAllEpoch = 0;
 
   constructor(private readonly store: RepairStore) {}
 
@@ -201,8 +202,10 @@ export class AlertBotRepairExecutor {
   }
 
   async wait(jobId: string, waitSeconds: number): Promise<boolean> {
+    const epoch = this.stopAllEpoch;
     if (this.processes.get(jobId)?.pending) await this.flushTerminal(jobId);
     const initial = await this.store.findJob(jobId);
+    if (epoch !== this.stopAllEpoch) return false;
     if (!initial) return false;
     if (TERMINAL_STATUSES.has(initial.status)) return true;
     const seconds = clampWaitSeconds(waitSeconds);
@@ -249,6 +252,7 @@ export class AlertBotRepairExecutor {
 
   async stopAll(): Promise<void> {
     this.stoppingAll = true;
+    this.stopAllEpoch += 1;
     for (const repairId of this.repairChains.keys()) this.cancellingRepairs.add(repairId);
     for (const repairId of this.repairs.values()) this.cancellingRepairs.add(repairId);
     for (const jobId of [...this.waiters.keys()]) this.wake(jobId);
