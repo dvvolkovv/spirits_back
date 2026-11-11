@@ -145,6 +145,12 @@ describe('AlertBotRepairJobs', () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  it('отклоняет command с NUL как invalid_command', async () => {
+    const create = jest.spyOn(store, 'createJob');
+    await expect(jobs.start(ctx, 'exec', { host: 'prod', command: 'printf before\0after' })).rejects.toThrow('invalid_command');
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it('ограничивает timeout и применяет default для неfinite значений', async () => {
     const low = await jobs.start(ctx, 'exec', { host: 'prod', command: 'printf low', timeout_ms: 1 });
     expect((await jobs.wait(ctx, low.jobId, 2)).timeoutMs).toBe(1_000);

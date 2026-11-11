@@ -213,6 +213,42 @@ describe('AlertBotRepairExecutor', () => {
     });
   });
 
+  it('синхронный spawn throw сохраняет failed/spawn_error и будит waiters', async () => {
+    const job = await createJob();
+    jest.spyOn(childProcess, 'spawn').mockImplementation(() => { throw new Error('sync spawn exploded'); });
+    await expect(executor.start(job.id, 'printf no')).resolves.toBe(job.id);
+    const startedAt = Date.now();
+    await executor.wait(job.id, 30);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(await store.findJob(job.id)).toMatchObject({ status: 'failed', failureKind: 'spawn_error' });
+    await executor.stopAll();
+  });
+
+  it('async spawn error сохраняет failed/spawn_error без возврата в running', async () => {
+    const job = await createJob();
+    const realSpawn = childProcess.spawn;
+    let child!: childProcess.ChildProcess;
+    jest.spyOn(childProcess, 'spawn').mockImplementation((...args: any[]) => {
+      child = realSpawn('bash', ['-lc', 'sleep 0.2'], args[2]);
+      return child as any;
+    });
+    try {
+      await expect(executor.start(job.id, 'printf no')).resolves.toBe(job.id);
+      child.emit('error', new Error('async spawn exploded'));
+      await executor.wait(job.id, 2);
+      expect(await store.findJob(job.id)).toMatchObject({ status: 'failed', failureKind: 'spawn_error' });
+      const startedAt = Date.now();
+      await executor.wait(job.id, 30);
+      expect(Date.now() - startedAt).toBeLessThan(1_000);
+      expect(await store.findJob(job.id)).toMatchObject({ status: 'failed', failureKind: 'spawn_error' });
+    } finally {
+      if (child.pid) {
+        try { process.kill(-child.pid, 'SIGKILL'); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+      }
+    }
+  });
+
   it('после регистрации повторно видит cancel_requested и гасит interruptible child', async () => {
     const job = await createJob({ timeoutMs: 30_000 });
     const markRunning = store.markJobRunning.bind(store);
