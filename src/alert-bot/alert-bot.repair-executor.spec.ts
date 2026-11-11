@@ -597,6 +597,38 @@ describe('AlertBotRepairExecutor', () => {
     }
   });
 
+  it('maps очищаются после terminal при отсутствии active/pending/starts', async () => {
+    const job = await createJob();
+    await executor.start(job.id, 'printf cleanup');
+    expect(await executor.wait(job.id, 0.5)).toBe(true);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect((executor as any).repairChains.has('repair-1')).toBe(false);
+    expect((executor as any).cancellingRepairs.has('repair-1')).toBe(false);
+    expect((executor as any).jobRepairs.has(job.id)).toBe(false);
+
+    const stoppedJob = await createJob();
+    await executor.start(stoppedJob.id, 'sleep 30');
+    await executor.stopRepair('repair-1');
+    expect((executor as any).cancellingRepairs.has('repair-1')).toBe(true);
+    store.repairs.get('repair-1')!.status = 'cancelled';
+    await executor.stopRepair('repair-1');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect((executor as any).repairChains.has('repair-1')).toBe(false);
+    expect((executor as any).cancellingRepairs.has('repair-1')).toBe(false);
+  });
+
+  it('maps не удаляют cancellation marker пока pending terminal жив', async () => {
+    const job = await createJob();
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    jest.spyOn(store, 'finishJob').mockRejectedValue(new Error('permanent pending'));
+    await expect(startPreSpawn('cancel_before_spawn', job)).rejects.toThrow('repair_inactive');
+    store.repairs.get('repair-1')!.status = 'cancelled';
+    await executor.stopRepair('repair-1');
+    expect((executor as any).processes.get(job.id)?.pending).toBeTruthy();
+    expect((executor as any).repairChains.has('repair-1')).toBe(true);
+    expect((executor as any).cancellingRepairs.has('repair-1')).toBe(true);
+  });
+
   it('stopAll останавливает interruptible jobs и не трогает noninterruptible', async () => {
     store.addRepair('repair-2');
     const interrupted = await createJob({ timeoutMs: 30_000 });
