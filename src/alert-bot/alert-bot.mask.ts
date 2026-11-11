@@ -4,6 +4,11 @@ const UUID = /(?<![A-Za-z0-9])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 
 export function maskSecrets(input: string): string {
   let s = String(input);
+  s = s.replace(/(\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s\/:@]+:)[^\s\/@]+@/g, '$1[скрыто]@');
+  s = s.replace(
+    /(\b(?:export\s+)?[A-Za-z_][A-Za-z0-9_-]*(?:SECRET|PASSWORD|PASSWD|TOKEN|API[_-]KEY)[A-Za-z0-9_-]*\s*=\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s;]+)/gi,
+    '$1[скрыто]',
+  );
   s = s.replace(/(?<![A-Za-z0-9_-])\d{8,10}:[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-])/g, '[скрыто]');
   s = s.replace(/(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])/g, '[скрыто]');
   s = s.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [скрыто]');
