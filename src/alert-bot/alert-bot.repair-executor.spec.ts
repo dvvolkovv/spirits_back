@@ -434,6 +434,36 @@ describe('AlertBotRepairExecutor', () => {
     expect(await store.findJob(untouched.id)).toMatchObject({ status: 'succeeded', stdout: 'other-ok\n' });
   });
 
+  it('stopAll будит waiter noninterruptible job, не убивая её', async () => {
+    const spawned: childProcess.ChildProcess[] = [];
+    const realSpawn = childProcess.spawn;
+    jest.spyOn(childProcess, 'spawn').mockImplementation((...args: any[]) => {
+      const child = realSpawn(...args as [any, any, any]);
+      spawned.push(child);
+      return child as any;
+    });
+    const job = await createJob({ interruptible: false, timeoutMs: 30_000 });
+    try {
+      await executor.start(job.id, 'sleep 30');
+      let settled = false;
+      const waiting = executor.wait(job.id, 30).then((result) => {
+        settled = true;
+        return result;
+      });
+      await executor.stopAll();
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      expect(settled).toBe(true);
+      expect(await waiting).toBe(false);
+      expect(await store.findJob(job.id)).toMatchObject({ status: 'running' });
+    } finally {
+      if (spawned[0]?.pid) {
+        try { process.kill(-spawned[0].pid, 'SIGKILL'); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+      }
+      await executor.wait(job.id, 2);
+    }
+  });
+
   it('stopAll останавливает interruptible jobs и не трогает noninterruptible', async () => {
     store.addRepair('repair-2');
     const interrupted = await createJob({ timeoutMs: 30_000 });
