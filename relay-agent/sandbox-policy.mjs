@@ -187,7 +187,7 @@ export function applySandboxPrompt(prompt, sandboxOn) {
     )
     .replace(
       'validate with soffice --headless --convert-to pdf',
-      'validate with python-docx + WeasyPrint (in /opt/linkeon-agent venv), pdfinfo and pdftoppm',
+      'validate structurally with python-pptx; if visual PPTX rendering is unavailable, say so and do not claim visual PDF validation',
     )
     .replace(
       'Full sudo access (no password). Install anything you need.',
