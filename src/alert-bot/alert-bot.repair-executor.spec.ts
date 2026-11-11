@@ -1,4 +1,5 @@
 import * as childProcess from 'child_process';
+import * as fs from 'fs';
 import { AlertBotRepairExecutor } from './alert-bot.repair-executor';
 import {
   CreateRepairJobInput,
@@ -83,6 +84,13 @@ class MemoryRepairStore {
     const repair = job && this.repairs.get(job.repairId);
     if (!job || job.status !== 'queued' || !repair || !['requested', 'running'].includes(repair.status)) return false;
     job.status = 'running';
+    return true;
+  }
+
+  async requestCancel(id: string): Promise<boolean> {
+    const repair = this.repairs.get(id);
+    if (!repair || !['requested', 'running'].includes(repair.status)) return false;
+    repair.status = 'cancel_requested';
     return true;
   }
 
@@ -207,6 +215,50 @@ describe('AlertBotRepairExecutor', () => {
     await executor.start(job.id, 'printf survived');
     await executor.wait(job.id, 2);
     expect(await store.findJob(job.id)).toMatchObject({ status: 'succeeded', stdout: 'survived' });
+  });
+
+  it('stopRepair до start сохраняет cancellation marker даже при отказе requestCancel', async () => {
+    const job = await createJob();
+    jest.spyOn(store, 'requestCancel').mockResolvedValue(false);
+    await executor.stopRepair('repair-1');
+    const spawn = jest.spyOn(childProcess, 'spawn');
+    await expect(executor.start(job.id, 'printf must-not-run')).rejects.toThrow('repair_inactive');
+    expect(spawn).not.toHaveBeenCalled();
+    expect(await store.findJob(job.id)).toMatchObject({ status: 'cancelled' });
+  });
+
+  it('stopRepair ждёт in-flight start и не даёт быстрому side effect запуститься после возврата', async () => {
+    const job = await createJob();
+    const sentinel = `/tmp/alert-bot-repair-start-stop-${process.pid}-${Date.now()}`;
+    let releaseMark!: () => void;
+    let markEntered!: () => void;
+    const markGate = new Promise<void>((resolve) => { releaseMark = resolve; });
+    const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+    const originalMark = store.markJobRunning.bind(store);
+    jest.spyOn(store, 'markJobRunning').mockImplementation(async (id) => {
+      const marked = await originalMark(id);
+      markEntered();
+      await markGate;
+      return marked;
+    });
+    const spawn = jest.spyOn(childProcess, 'spawn');
+    const observed = executor.start(job.id, `printf side-effect > ${sentinel}`).then(
+      () => ({ status: 'resolved' as const }),
+      (error) => ({ status: 'rejected' as const, error }),
+    );
+    await entered;
+    const stopped = executor.stopRepair('repair-1');
+    releaseMark();
+    await stopped;
+    expect((await observed).status).toBe('rejected');
+    expect(spawn).not.toHaveBeenCalled();
+    expect(fs.existsSync(sentinel)).toBe(false);
+    expect(await store.findJob(job.id)).toMatchObject({ status: 'cancelled' });
+
+    const late = await createJob();
+    await expect(executor.start(late.id, 'printf late-spawn')).rejects.toThrow('repair_inactive');
+    expect(spawn).not.toHaveBeenCalled();
+    fs.rmSync(sentinel, { force: true });
   });
 
   it('stopRepair останавливает только interruptible job указанного repair', async () => {

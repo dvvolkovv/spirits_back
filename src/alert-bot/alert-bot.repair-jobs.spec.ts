@@ -55,6 +55,12 @@ class MemoryRepairStore {
     return true;
   }
 
+  async requestCancel(id: string): Promise<boolean> {
+    if (id !== this.repair.id || !['requested', 'running'].includes(this.repair.status)) return false;
+    this.repair.status = 'cancel_requested';
+    return true;
+  }
+
   async finishJob(id: string, result: FinishRepairJobResult): Promise<boolean> {
     const job = this.jobs.get(id);
     if (!job || !['queued', 'running'].includes(job.status)) return false;
