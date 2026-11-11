@@ -162,7 +162,7 @@ describe('AlertBotRepairJobs', () => {
     const job = await jobs.start(ctx, 'exec', { host: 'prod', command: raw });
     const done = await jobs.wait(ctx, job.jobId, 2);
     expect(done).toMatchObject({
-      status: 'succeeded', command: 'api_key=[скрыто]',
+      status: 'succeeded', command: maskSecrets(raw),
       stdout: 'api_key=[скрыто]', stderr: 'Bearer [скрыто]',
     });
     expect(JSON.stringify([...store.jobs.values()])).not.toContain('REAL_SECRET');
