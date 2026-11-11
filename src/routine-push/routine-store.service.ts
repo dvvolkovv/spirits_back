@@ -212,17 +212,15 @@ export class RoutineStore {
   }
 
   /**
-   * Снимает дневной claim, если доставка НЕ состоялась (рутина пришла посреди
-   * разговора человека и отложена). Без этого отложенная рутина терялась бы на
-   * текущий день: in-memory таймер не переживает рестарт, а cron пропускал бы
-   * её из-за last_sent_date. Освобождённый claim = следующий runDue попробует
-   * снова — персистентная страховка поверх таймера.
+   * Откатывает только наш сегодняшний claim и возвращает прежнюю дату.
+   * Если другой владелец уже изменил last_sent_date, строка не трогается.
    */
-  async releaseToday(id: string, todayLocal: string): Promise<void> {
-    await this.pg.query(
-      `UPDATE routine_pushes SET last_sent_date = NULL, updated_at = now()
-         WHERE id = $1 AND last_sent_date = $2`,
-      [id, todayLocal],
+  async releaseToday(id: string, todayLocal: string, prev: string | null): Promise<boolean> {
+    const r = await this.pg.query(
+      `UPDATE routine_pushes SET last_sent_date = $3, updated_at = now()
+         WHERE id = $1 AND last_sent_date = $2 RETURNING id`,
+      [id, todayLocal, prev],
     );
+    return (r.rowCount || 0) > 0;
   }
 }
