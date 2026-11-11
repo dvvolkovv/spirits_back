@@ -88,6 +88,7 @@ export class AlertBotRepairExecutor {
   private readonly processes = new Map<string, ProcessState>();
   private readonly cancellingRepairs = new Set<string>();
   private readonly repairChains = new Map<string, Promise<void>>();
+  private readonly startCounts = new Map<string, number>();
   private stoppingAll = false;
   private stopAllEpoch = 0;
   private remoteHelperDeadlineMs = 10_000;
@@ -106,6 +107,7 @@ export class AlertBotRepairExecutor {
       repairId = registered.repairId;
       this.registerJob(jobId, repairId);
     }
+    this.startCounts.set(repairId, (this.startCounts.get(repairId) ?? 0) + 1);
     const previous = this.repairChains.get(repairId) ?? Promise.resolve();
     const setup = previous.then(async () => {
       if (this.processes.has(jobId)) {
@@ -117,6 +119,10 @@ export class AlertBotRepairExecutor {
       return this.startRegistered(job, rawCommand);
     });
     this.repairChains.set(repairId, setup.then(() => undefined, () => undefined));
+    void setup.then(
+      () => this.completeStart(repairId),
+      () => this.completeStart(repairId),
+    );
     return setup;
   }
 
@@ -265,6 +271,7 @@ export class AlertBotRepairExecutor {
       .filter(([, currentRepairId]) => currentRepairId === repairId)
       .map(([jobId]) => jobId);
     await Promise.all(jobs.map((jobId) => this.terminate(jobId, 'cancelled')));
+    await this.maybeCleanup(repairId);
   }
 
   async stopAll(): Promise<void> {
@@ -319,6 +326,26 @@ export class AlertBotRepairExecutor {
 
   private isCancelling(repairId: string): boolean {
     return this.stoppingAll || this.cancellingRepairs.has(repairId);
+  }
+
+  private completeStart(repairId: string): void {
+    const count = this.startCounts.get(repairId) ?? 0;
+    if (count <= 1) this.startCounts.delete(repairId);
+    else this.startCounts.set(repairId, count - 1);
+    void this.maybeCleanup(repairId);
+  }
+
+  private async maybeCleanup(repairId: string): Promise<void> {
+    if ((this.startCounts.get(repairId) ?? 0) > 0) return;
+    if ([...this.repairs.values()].includes(repairId)) return;
+    let repair;
+    try { repair = await this.store.findRepair(repairId); }
+    catch { return; }
+    if ((this.startCounts.get(repairId) ?? 0) > 0) return;
+    if ([...this.repairs.values()].includes(repairId)) return;
+    this.repairChains.delete(repairId);
+    if (repair && ['requested', 'running', 'cancel_requested'].includes(repair.status)) return;
+    this.cancellingRepairs.delete(repairId);
   }
 
   private async cancelBeforeSpawn(job: RepairJobRecord): Promise<void> {
@@ -533,11 +560,14 @@ export class AlertBotRepairExecutor {
 
   private confirmTerminal(jobId: string): void {
     const state = this.processes.get(jobId);
+    const repairId = this.repairs.get(jobId);
     if (state) state.pending = null;
     this.children.delete(jobId);
     this.repairs.delete(jobId);
+    this.jobRepairs.delete(jobId);
     this.processes.delete(jobId);
     this.wake(jobId);
+    if (repairId) void this.maybeCleanup(repairId);
   }
 
   private wake(jobId: string): void {
