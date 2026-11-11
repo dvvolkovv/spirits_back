@@ -329,6 +329,67 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     expect(sent()[0]).toContain('контрольная проба Kimi не удалась');
     expect(sent()[0]).not.toContain('Маша/VPM/маркетолог снова работают');
   });
+
+  it('переключение рубильника во время SQL личного Claude — fail-open', async () => {
+    const svc = make('kimi', healthyOnly('kimi'), false, false);
+    let resolvePersonal!: () => void;
+    const originalQuery = svc.pg.query;
+    svc.pg.query.mockImplementation(async (sql: string, params?: unknown[]) => {
+      if (/ai_profiles_consolidated/.test(sql)) {
+        return new Promise((resolve) => {
+          resolvePersonal = () => resolve({ rows: [{ present: false }] });
+        });
+      }
+      return originalQuery(sql, params);
+    });
+    setDown(svc);
+    const pending = svc.maybeAlertOutage();
+    for (let i = 0; i < 5 && !resolvePersonal; i++) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    expect(resolvePersonal).toBeDefined();
+    svc.globalProvider.get.mockResolvedValue('claude');
+    resolvePersonal();
+    await pending;
+    expect(sent()).toHaveLength(1);
+    expect(sent()[0]).toContain('проба без входа');
+  });
+
+  it.each(['down', 'ok'] as const)('Kimi → Qwen во время пробы при %s — providerUnverified вместо healthy-текста', async (status) => {
+    const svc = make('kimi', { qwen: up, kimi: up }, status === 'ok', false);
+    if (status === 'down') setDown(svc);
+    else {
+      svc.cache.llmStatus = 'ok';
+      svc.cache.llmCheckedAt = '2026-11-11T07:15:00.000Z';
+      svc.cache.llmLatencyMs = 812;
+    }
+    let resolveProbe!: (text: string) => void;
+    svc.claudeCli.text.mockReturnValue(new Promise<string>((resolve) => { resolveProbe = resolve; }));
+    const pending = svc.maybeAlertOutage();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    svc.globalProvider.get.mockResolvedValue('qwen');
+    resolveProbe('ok');
+    await pending;
+    expect(sent()).toHaveLength(1);
+    expect(sent()[0]).toContain('активная проба Qwen в этом тике не выполнялась');
+    expect(sent()[0]).not.toContain('отвечают через эту модель');
+    expect(sent()[0]).not.toContain('Маша/VPM/маркетолог снова работают');
+    expect(svc.claudeCli.text).toHaveBeenCalledTimes(1);
+  });
+
+  it('fallbackAlertLine использует снимок после ожидания пробы', async () => {
+    const svc = make('kimi', healthyOnly('kimi'), false, false);
+    const initial = { windowMs: 900_000, providers: { qwen: noKey, kimi: up } };
+    const fresh = {
+      windowMs: 900_000,
+      providers: { qwen: noKey, kimi: { enabled: true, ok: 2, failed: 1, downUntil: 0 } },
+    };
+    svc.claudeCli.fallbackStats.mockReturnValueOnce(initial).mockReturnValueOnce(fresh);
+    svc.claudeCli.text.mockRejectedValue(new Error('kimi unavailable'));
+    setDown(svc);
+    await svc.maybeAlertOutage();
+    expect(sent()[0]).toContain('Kimi — ответов 2, ошибок 1');
+  });
 });
 
 /**

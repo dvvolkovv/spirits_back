@@ -154,6 +154,12 @@ describe('cliOutageAffectedText', () => {
     expect(text).toContain('контрольная проба Kimi не удалась');
     expect(text).not.toContain('поэтому они идут обычным путём');
   });
+
+  it('providerUnverified — новый провайдер не объявляется проверенным', () => {
+    const text = cliOutageAffectedText({ switchProvider: 'qwen', enabled: true, down: false, providerUnverified: true });
+    expect(text).toContain('активная проба Qwen в этом тике не выполнялась');
+    expect(text).not.toContain('отвечают через эту модель');
+  });
 });
 
 /**
@@ -199,6 +205,16 @@ describe('cliRecoveredText', () => {
     });
     expect(text).toContain('Claude снова отвечает');
     expect(text).toContain('контрольная проба Kimi не удалась');
+    expect(text).not.toContain('Маша/VPM/маркетолог снова работают');
+  });
+
+  it('providerUnverified при recovery — без healthy-текста нового провайдера', () => {
+    const text = cliRecoveredText({
+      switchProvider: 'qwen', enabled: true, down: false, providerUnverified: true,
+      checkedAt: '2026-11-11T07:15:00.000Z', latencyMs: 812,
+    });
+    expect(text).toContain('Claude снова отвечает');
+    expect(text).toContain('активная проба Qwen в этом тике не выполнялась');
     expect(text).not.toContain('Маша/VPM/маркетолог снова работают');
   });
 });
