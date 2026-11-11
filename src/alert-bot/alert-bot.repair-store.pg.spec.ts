@@ -81,6 +81,28 @@ maybe('durable repair store против PostgreSQL', () => {
     await expect(Promise.all([store.migrate(), store.migrate()])).resolves.toEqual([undefined, undefined]);
   });
 
+  it('миграция bounded отказывается при блокировке таблицы и повторяется после rollback', async () => {
+    const blocker = await pool.connect();
+    await blocker.query('BEGIN');
+    await blocker.query('LOCK TABLE alert_bot_repairs IN ACCESS EXCLUSIVE MODE');
+    const startedAt = Date.now();
+    const observed = store.migrate().then(
+      () => ({ status: 'resolved' as const }),
+      (error) => ({ status: 'rejected' as const, error }),
+    );
+    try {
+      const outcome = await observed;
+      expect(outcome.status).toBe('rejected');
+      if (outcome.status === 'rejected') expect(outcome.error).toMatchObject({ code: '55P03' });
+      expect(Date.now() - startedAt).toBeLessThan(7_000);
+    } finally {
+      await blocker.query('ROLLBACK').catch(() => undefined);
+      blocker.release(true);
+      await observed;
+    }
+    await expect(store.migrate()).resolves.toBeUndefined();
+  });
+
   it('один update идемпотентен и один active repair на chat допускается', async () => {
     const input = repairInput('admission');
     const first = await store.admitRepair(input);
@@ -123,6 +145,33 @@ maybe('durable repair store против PostgreSQL', () => {
       "SELECT count(*)::int AS n FROM alert_bot_repairs WHERE chat_id = 'concurrent-admission'",
     );
     expect(rows.rows[0].n).toBe(1);
+  });
+
+  it('concurrent same update даёт один accepted и один existing', async () => {
+    const input = repairInput('concurrent-same-update');
+    const results = await Promise.all([
+      store.admitRepair(input),
+      store.admitRepair(input),
+    ]);
+
+    expect(results.map((result) => result.status).sort()).toEqual(['accepted', 'existing']);
+    expect(new Set(results.map((result) => result.status === 'busy' ? null : result.repairId)).size).toBe(1);
+    const rows = await pool.query(
+      'SELECT count(*)::int AS n FROM alert_bot_repairs WHERE update_id = $1',
+      [input.updateId],
+    );
+    expect(rows.rows[0].n).toBe(1);
+  });
+
+  it('повторный same update после terminal возвращает existing', async () => {
+    const input = repairInput('terminal-same-update');
+    const first = await store.admitRepair(input);
+    if (first.status !== 'accepted') throw new Error('repair not accepted');
+    expect(await store.finishRepair(first.repairId, 'verified', 0)).toBe(true);
+
+    await expect(store.admitRepair(input)).resolves.toEqual({
+      status: 'existing', repairId: first.repairId,
+    });
   });
 
   it('job lifecycle допускает одну active job и следующую sequence после finish', async () => {
@@ -190,6 +239,22 @@ maybe('durable repair store против PostgreSQL', () => {
     expect(rows.rows).toEqual([{ sequence: '1' }]);
   });
 
+  it('чужой 23505 не превращается в null и тестовый constraint удаляется', async () => {
+    const constraint = 'alert_bot_repair_jobs_spec_host_unique';
+    await pool.query(`ALTER TABLE alert_bot_repair_jobs ADD CONSTRAINT ${constraint} UNIQUE (host)`);
+    try {
+      const firstRepair = await admit('unique-host-first');
+      expect(await store.createJob(jobInput(firstRepair))).not.toBeNull();
+      const secondRepair = await admit('unique-host-second');
+
+      await expect(store.createJob(jobInput(secondRepair))).rejects.toMatchObject({
+        code: '23505', constraint,
+      });
+    } finally {
+      await pool.query(`ALTER TABLE alert_bot_repair_jobs DROP CONSTRAINT IF EXISTS ${constraint}`);
+    }
+  });
+
   it('markRepairRunning прикрепляет turn, а guard проверяет identity и статус', async () => {
     const repairId = await admit('guard');
     expect(await store.isActiveRepair(guard(repairId, 'guard'))).toBe(false);
@@ -217,6 +282,24 @@ maybe('durable repair store против PostgreSQL', () => {
     await expect(store.createJob(jobInput(repairId))).resolves.toBeNull();
     expect(await store.finishRepair(repairId, 'cancelled', 0)).toBe(true);
     expect((await store.findRepair(repairId))?.status).toBe('cancelled');
+  });
+
+  it('queued job нельзя запустить после requestCancel', async () => {
+    const repairId = await admit('cancel-before-job-start');
+    const job = await store.createJob(jobInput(repairId));
+    expect(await store.requestCancel(repairId)).toBe(true);
+
+    expect(await store.markJobRunning(job!.id)).toBe(false);
+    expect((await store.findJob(job!.id))?.status).toBe('queued');
+  });
+
+  it('queued job нельзя запустить после terminal repair', async () => {
+    const repairId = await admit('terminal-before-job-start');
+    const job = await store.createJob(jobInput(repairId));
+    expect(await store.finishRepair(repairId, 'failed', 0)).toBe(true);
+
+    expect(await store.markJobRunning(job!.id)).toBe(false);
+    expect((await store.findJob(job!.id))?.status).toBe('queued');
   });
 
   it('abandon отменяет только requested repair без turn', async () => {
