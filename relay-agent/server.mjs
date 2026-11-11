@@ -1421,6 +1421,14 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
       res.end();
     }
   } finally {
+    // Multer записывает исходники до настройки хода. После renameSync их уже
+    // нет (ENOENT); при ранней ошибке удаляем, чтобы ответ 500 не оставлял
+    // сотни мегабайт осиротевших файлов в корне uploads.
+    for (const file of req.files || []) {
+      try { fs.unlinkSync(file.path); } catch (e) {
+        if (e?.code !== "ENOENT") console.log("исходник Multer не удалён: " + (e?.code || e?.name || "?"));
+      }
+    }
     // Общий liveSet и синхронная очистка обоих suffix. Пути уникальны на ход,
     // поэтому finally preempted-запроса не трогает файлы следующего.
     removeSandboxSettings(sessionMcpPath, liveMcpConfigPaths);
