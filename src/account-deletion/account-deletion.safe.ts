@@ -105,6 +105,7 @@ const TEXT_LIKE_KEY_PARTS = [
   'body',
 ];
 const URL_WITH_USERINFO = /[a-z][a-z0-9+.-]*:\/\/[^/\s?#]*@/i;
+const PHONE_LIKE_RESOURCE_KEY = /^\+?[0-9][0-9\s().-]{5,}$/;
 const FORBIDDEN_QUERY_PARTS = new Set([
   'token',
   'sig',
@@ -190,6 +191,10 @@ function unsafeUrl(url: URL): boolean {
   for (const key of url.searchParams.keys()) {
     if (unsafeQueryKey(key)) return true;
   }
+  const fragmentParams = new URLSearchParams(url.hash.slice(1));
+  for (const key of fragmentParams.keys()) {
+    if (unsafeQueryKey(key)) return true;
+  }
   return false;
 }
 
@@ -197,7 +202,7 @@ function unsafePayloadString(value: string, userId: string): boolean {
   if (userId.length >= 6 && value.includes(userId)) return true;
   if (URL_WITH_USERINFO.test(value)) return true;
   try {
-    return unsafeUrl(new URL(value));
+    if (unsafeUrl(new URL(value))) return true;
   } catch {
     // Не URL целиком: ниже проверяем встроенные URL без fail-open.
   }
@@ -218,6 +223,13 @@ function assertSafeResourceType(resourceType: unknown): asserts resourceType is 
     || !DELETION_RESOURCE_TYPES.has(resourceType as DeletionResourceType)) {
     throw new Error('unsafe_resource_type');
   }
+}
+
+function unsafeLogResourceKey(resourceKey: string): boolean {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(resourceKey)) return true;
+  const digits = resourceKey.replace(/\D/g, '');
+  return digits.length >= 7 && digits.length <= 15
+    && PHONE_LIKE_RESOURCE_KEY.test(resourceKey);
 }
 
 export class DeletionCancelledError extends Error {
@@ -285,6 +297,8 @@ export function safeDeletionMessage(input: {
   kind: DeletionErrorKind;
 }): string {
   assertSafeResourceType(input.resourceType);
+  if (unsafeLogResourceKey(input.resourceKey)) throw new Error('unsafe_resource_key');
+  if (!DELETION_ERROR_KINDS.has(input.kind)) throw new Error('unsafe_kind');
   return `deletion=${input.deletionId} type=${input.resourceType} key=${input.resourceKey} attempt=${input.attempts} kind=${input.kind}`;
 }
 
