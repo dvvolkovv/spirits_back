@@ -232,7 +232,7 @@ maybe('durable repair store против PostgreSQL', () => {
     expect(await store.abandon(running)).toBe(false);
 
     const attached = await admit('abandon-attached');
-    await pool.query('UPDATE alert_bot_repairs SET turn_id = $2 WHERE id = $1', [attached, TURN_ID]);
+    await pool.query('UPDATE alert_bot_repairs SET turn_id = $2 WHERE id = $1', [attached, OTHER_TURN_ID]);
     expect(await store.abandon(attached)).toBe(false);
   });
 
