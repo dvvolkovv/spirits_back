@@ -109,28 +109,26 @@ export class AlertBotRepairExecutor {
   private async startRegistered(job: RepairJobRecord, rawCommand: string): Promise<string> {
     const jobId = job.id;
     if (this.isCancelling(job.repairId)) {
-      await this.cancelBeforeSpawn(jobId);
+      await this.cancelBeforeSpawn(job);
       throw new Error('repair_inactive');
     }
     if (!await this.store.markJobRunning(jobId)) {
-      await this.store.finishJob(jobId, {
+      await this.finishPreSpawn(job, {
         status: 'cancelled', exitCode: null, stdout: '', stderr: '', failureKind: 'repair_inactive',
       });
-      this.wake(jobId);
       throw new Error('repair_inactive');
     }
     if (this.isCancelling(job.repairId)) {
-      await this.cancelBeforeSpawn(jobId);
+      await this.cancelBeforeSpawn(job);
       throw new Error('repair_inactive');
     }
 
     let child: ChildProcess;
     try { child = this.spawn(job, rawCommand); }
     catch {
-      await this.store.finishJob(jobId, {
+      await this.finishPreSpawn(job, {
         status: 'failed', exitCode: null, stdout: '', stderr: 'spawn_error\n', failureKind: 'spawn_error',
       });
-      this.wake(jobId);
       return jobId;
     }
     let complete!: () => void;
@@ -309,11 +307,36 @@ export class AlertBotRepairExecutor {
     return this.stoppingAll || this.cancellingRepairs.has(repairId);
   }
 
-  private async cancelBeforeSpawn(jobId: string): Promise<void> {
-    await this.store.finishJob(jobId, {
+  private async cancelBeforeSpawn(job: RepairJobRecord): Promise<void> {
+    await this.finishPreSpawn(job, {
       status: 'cancelled', exitCode: null, stdout: '', stderr: '', failureKind: 'repair_inactive',
     });
-    this.wake(jobId);
+  }
+
+  private async finishPreSpawn(job: RepairJobRecord, result: FinishRepairJobResult): Promise<void> {
+    let complete!: () => void;
+    const completion = new Promise<void>((resolve) => { complete = resolve; });
+    const state: ProcessState = {
+      host: job.host,
+      interruptible: job.interruptible,
+      stdout: createStreamBuffer(),
+      stderr: createStreamBuffer(),
+      outcome: null,
+      finished: true,
+      pending: result,
+      flushing: null,
+      timeout: null,
+      killTimer: null,
+      completion,
+      complete,
+      processClosed: true,
+      closed: Promise.resolve(),
+      markClosed: () => undefined,
+    };
+    this.repairs.set(job.id, job.repairId);
+    this.processes.set(job.id, state);
+    try { await this.flushTerminal(job.id); }
+    finally { state.complete(); }
   }
 
   private signalGroup(child: ChildProcess, signal: NodeJS.Signals): void {
