@@ -139,10 +139,10 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
   });
 
   it.each([
-    ['без ключа', noKey],
-    ['«не отвечает»', downNow()],
-  ] as Array<[string, Prov]>)('глобальный Kimi %s — алерт сохраняется без SQL личных настроек', async (_name, kimi) => {
-    const svc = make('kimi', { qwen: noKey, kimi }, false, false);
+    ['без ключа', () => noKey],
+    ['«не отвечает»', downNow],
+  ] as Array<[string, () => Prov]>)('глобальный Kimi %s — алерт сохраняется без SQL личных настроек', async (_name, kimiState) => {
+    const svc = make('kimi', { qwen: noKey, kimi: kimiState() }, false, false);
     setDown(svc);
     await svc.maybeAlertOutage();
     expect(sent()).toHaveLength(1);
@@ -188,6 +188,10 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     setDown(svc);
     await svc.maybeAlertOutage();
     expect(sent()).toEqual([]);
+    expect(svc.pg.query).toHaveBeenCalledWith(
+      expect.stringContaining('INSERT INTO monitor_alert_state'),
+      ['claude_cli', false],
+    );
     (sendTelegramPayload as jest.Mock).mockClear();
     svc.globalProvider.get.mockResolvedValue('claude');
     await svc.maybeAlertOutage();
