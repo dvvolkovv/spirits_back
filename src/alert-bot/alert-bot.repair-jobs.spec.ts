@@ -150,6 +150,14 @@ describe('AlertBotRepairJobs', () => {
     expect((await jobs.wait(ctx, notFinite.jobId, 2)).timeoutMs).toBe(1_200_000);
   });
 
+  it('передаёт дробный timeout_ms в store как trunc целого', async () => {
+    const create = jest.spyOn(store, 'createJob');
+    const job = await jobs.start(ctx, 'exec', { host: 'prod', command: 'printf fractional', timeout_ms: 1_234.9 });
+    const done = await jobs.wait(ctx, job.jobId, 2);
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ timeoutMs: 1_234 }));
+    expect(done.timeoutMs).toBe(1_234);
+  });
+
   it('verify никогда не mutates, а exec учитывает mutates=false', async () => {
     const verify = await jobs.start(ctx, 'verify', { host: 'prod', command: 'printf verify', mutates: true });
     expect((await jobs.wait(ctx, verify.jobId, 2)).mutates).toBe(false);
