@@ -282,7 +282,8 @@ export class RepairStore {
           destroyClient = true;
         }
       }
-      if ((error as { code?: string }).code === '23505') return null;
+      const pgError = error as { code?: string; constraint?: string };
+      if (pgError.code === '23505' && pgError.constraint === 'idx_alert_bot_repair_jobs_active') return null;
       throw error;
     } finally {
       client.release(destroyClient);
@@ -304,8 +305,12 @@ export class RepairStore {
 
   async markJobRunning(id: string): Promise<boolean> {
     const result = await this.pg.query(
-      `UPDATE alert_bot_repair_jobs SET status = 'running', started_at = now()
-       WHERE id = $1 AND status = 'queued'`,
+      `UPDATE alert_bot_repair_jobs j
+       SET status = 'running', started_at = now()
+       FROM alert_bot_repairs r
+       WHERE j.id = $1 AND j.status = 'queued'
+         AND r.id = j.repair_id AND r.status IN ('requested', 'running')
+       RETURNING j.id`,
       [id],
     );
     return result.rowCount === 1;

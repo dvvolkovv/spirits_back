@@ -15,6 +15,7 @@ BEGIN
     created_at timestamptz NOT NULL DEFAULT now(),
     finished_at timestamptz
   );
+  LOCK TABLE alert_bot_repairs IN ACCESS SHARE MODE;
   CREATE TABLE IF NOT EXISTS alert_bot_repair_jobs (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     repair_id uuid NOT NULL REFERENCES alert_bot_repairs(id) ON DELETE CASCADE,
