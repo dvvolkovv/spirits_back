@@ -6,16 +6,22 @@ import { FinishRepairJobResult, RepairJobRecord, RepairStore } from './alert-bot
 
 const TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'timeout', 'cancelled', 'interrupted']);
 const MAX_OUTPUT_BYTES = 65_536;
+const MAX_RAW_OUTPUT_BYTES = 1_048_576;
 
 type ForcedOutcome = 'timeout' | 'cancelled';
+
+interface StreamBuffer {
+  raw: string;
+  bytes: number;
+  overflow: boolean;
+  decoder: StringDecoder;
+}
 
 interface ProcessState {
   host: RepairJobRecord['host'];
   interruptible: boolean;
-  stdout: string;
-  stderr: string;
-  stdoutDecoder: StringDecoder;
-  stderrDecoder: StringDecoder;
+  stdout: StreamBuffer;
+  stderr: StreamBuffer;
   outcome: ForcedOutcome | null;
   finished: boolean;
   pending: FinishRepairJobResult | null;
@@ -36,6 +42,26 @@ function appendCapped(previous: string, decodedChunk: string): string {
   let start = buffer.length - MAX_OUTPUT_BYTES;
   while (start < buffer.length && (buffer[start] & 0xc0) === 0x80) start += 1;
   return buffer.subarray(start).toString('utf8');
+}
+
+function createStreamBuffer(): StreamBuffer {
+  return { raw: '', bytes: 0, overflow: false, decoder: new StringDecoder('utf8') };
+}
+
+function appendStream(stream: StreamBuffer, decodedChunk: string): void {
+  stream.bytes += Buffer.byteLength(decodedChunk);
+  if (stream.overflow) return;
+  if (stream.bytes <= MAX_RAW_OUTPUT_BYTES) {
+    stream.raw += decodedChunk;
+    return;
+  }
+  stream.raw = '';
+  stream.overflow = true;
+}
+
+function renderStream(stream: StreamBuffer): string {
+  if (stream.overflow) return `[output_overflow:${stream.bytes} bytes]`;
+  return appendCapped('', maskSecrets(stream.raw));
 }
 
 function clampWaitSeconds(value: number): number {
@@ -108,10 +134,8 @@ export class AlertBotRepairExecutor {
     const state: ProcessState = {
       host: job.host,
       interruptible: job.interruptible,
-      stdout: '',
-      stderr: '',
-      stdoutDecoder: new StringDecoder('utf8'),
-      stderrDecoder: new StringDecoder('utf8'),
+      stdout: createStreamBuffer(),
+      stderr: createStreamBuffer(),
       outcome: null,
       finished: false,
       pending: null,
@@ -129,20 +153,20 @@ export class AlertBotRepairExecutor {
     this.processes.set(jobId, state);
 
     child.stdout!.on('data', (chunk: Buffer) => {
-      state.stdout = appendCapped(state.stdout, state.stdoutDecoder.write(chunk));
+      appendStream(state.stdout, state.stdout.decoder.write(chunk));
     });
     child.stderr!.on('data', (chunk: Buffer) => {
-      state.stderr = appendCapped(state.stderr, state.stderrDecoder.write(chunk));
+      appendStream(state.stderr, state.stderr.decoder.write(chunk));
     });
     child.once('error', () => {
-      state.stderr = appendCapped(state.stderr, 'spawn_error\n');
+      appendStream(state.stderr, 'spawn_error\n');
       void this.finishProcess(jobId, 'failed', null, 'spawn_error').catch(() => undefined);
     });
     child.once('close', (code) => {
       state.processClosed = true;
       state.markClosed();
-      state.stdout = appendCapped(state.stdout, state.stdoutDecoder.end());
-      state.stderr = appendCapped(state.stderr, state.stderrDecoder.end());
+      appendStream(state.stdout, state.stdout.decoder.end());
+      appendStream(state.stderr, state.stderr.decoder.end());
       const repairId = this.repairs.get(jobId);
       const cancelled = state.interruptible && repairId !== undefined && this.isCancelling(repairId);
       if (job.host !== 'prod' && (state.outcome || cancelled)) return;
@@ -388,8 +412,8 @@ export class AlertBotRepairExecutor {
     state.pending = {
       status,
       exitCode,
-      stdout: appendCapped('', maskSecrets(state.stdout)),
-      stderr: appendCapped('', maskSecrets(state.stderr)),
+      stdout: renderStream(state.stdout),
+      stderr: renderStream(state.stderr),
       failureKind: failureKind ?? null,
     };
     try { await this.flushTerminal(jobId); }
