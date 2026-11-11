@@ -171,6 +171,49 @@ describe('AlertBotRepairJobs', () => {
     }
   });
 
+  it('host:test immediate cancel без ожидания PID не даёт sentinel и оставшихся temp files', async () => {
+    const suffix = `${process.pid}-${Date.now()}`;
+    const sentinel = `/tmp/alert-bot-repair-immediate-${suffix}`;
+    const innerPidFile = `/tmp/alert-bot-repair-immediate-inner-${suffix}.pid`;
+    let jobId = '';
+    let innerPid = '';
+    let outerPid = '';
+    try {
+      const started = await jobs.start(ctx, 'exec', {
+        host: 'test',
+        command: `printf '%s\\n' "$$" > ${innerPidFile}; sleep 30; touch ${sentinel}`,
+        interruptible: true,
+        timeout_ms: 30_000,
+      });
+      jobId = started.jobId;
+      const pidFile = `/tmp/alert-bot-repair-${jobId}.pid`;
+      const cancelFile = `/tmp/alert-bot-repair-${jobId}.cancel`;
+      await executor.stopRepair(ctx.repairId);
+      expect(await jobs.wait(ctx, jobId, 2)).toMatchObject({ status: 'cancelled' });
+      innerPid = (await runTestSsh(`cat ${innerPidFile} 2>/dev/null || true`)).stdout;
+      outerPid = (await runTestSsh(`cat ${pidFile} 2>/dev/null || true`)).stdout;
+      const check = await runTestSsh([
+        innerPid ? `! kill -0 ${innerPid} 2>/dev/null` : 'true',
+        outerPid ? `! kill -0 -- -${outerPid} 2>/dev/null` : 'true',
+        `test ! -e ${sentinel}`,
+        `test ! -e ${pidFile}`,
+        `test ! -e ${cancelFile}`,
+      ].join(' && '));
+      expect(check.code).toBe(0);
+    } finally {
+      const pidFile = `/tmp/alert-bot-repair-${jobId}.pid`;
+      const cancelFile = `/tmp/alert-bot-repair-${jobId}.cancel`;
+      if (!innerPid) innerPid = (await runTestSsh(`cat ${innerPidFile} 2>/dev/null || true`)).stdout;
+      if (!outerPid) outerPid = (await runTestSsh(`cat ${pidFile} 2>/dev/null || true`)).stdout;
+      await executor.stopRepair(ctx.repairId).catch(() => undefined);
+      await runTestSsh([
+        outerPid ? `kill -KILL -- -${outerPid} 2>/dev/null || true` : 'true',
+        innerPid ? `kill -KILL ${innerPid} 2>/dev/null || true` : 'true',
+        `rm -f ${sentinel} ${innerPidFile} ${pidFile} ${cancelFile}`,
+      ].join('; '));
+    }
+  });
+
   it('host:test сохраняет exit/stdout/stderr и удаляет wrapper pid при обычном close', async () => {
     let jobId = '';
     try {

@@ -419,6 +419,20 @@ describe('AlertBotRepairExecutor', () => {
     fs.rmSync(sentinel, { force: true });
   });
 
+  it('SSH wrapper проверяет cancel-marker перед PID и непосредственно перед raw command', async () => {
+    const job = await createJob({ host: 'test' });
+    const payload = (executor as any).remotePayload(job, 'touch early-sentinel') as string;
+    const cancelFile = `/tmp/alert-bot-repair-${job.id}.cancel`;
+    const pidWrite = payload.indexOf('printf');
+    const rawCommand = payload.indexOf('touch early-sentinel');
+    const firstMarker = payload.indexOf(cancelFile);
+    expect(firstMarker).toBeGreaterThanOrEqual(0);
+    expect(firstMarker).toBeLessThan(pidWrite);
+    const secondMarker = payload.indexOf(cancelFile, pidWrite);
+    expect(secondMarker).toBeGreaterThan(pidWrite);
+    expect(secondMarker).toBeLessThan(rawCommand);
+  });
+
   it('неподтверждённый remote cancel даёт interrupted/remote_cancel_unconfirmed', async () => {
     const job = await createJob({ host: 'test' });
     const realSpawn = childProcess.spawn;
