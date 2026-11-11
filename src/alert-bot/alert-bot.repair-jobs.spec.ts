@@ -200,6 +200,17 @@ describe('AlertBotRepairJobs', () => {
     expect(await jobs.wait(ctx, first.jobId, 2)).toMatchObject({ status: 'cancelled' });
   });
 
+  it('createJob=null повторно различает repair_inactive и job_already_active', async () => {
+    jest.spyOn(store, 'createJob').mockResolvedValue(null);
+    const active = jest.spyOn(store, 'isActiveRepair')
+      .mockResolvedValue(true)
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false);
+    await expect(jobs.start(ctx, 'exec', { host: 'prod', command: 'printf no' })).rejects.toThrow('repair_inactive');
+    await expect(jobs.start(ctx, 'exec', { host: 'prod', command: 'printf no' })).rejects.toThrow('job_already_active');
+    expect(active).toHaveBeenCalledTimes(4);
+  });
+
   it.each(['', '   ', 'я'.repeat(20_000)])('отклоняет invalid_command без создания job', async (command) => {
     const create = jest.spyOn(store, 'createJob');
     await expect(jobs.start(ctx, 'exec', { host: 'prod', command })).rejects.toThrow('invalid_command');
