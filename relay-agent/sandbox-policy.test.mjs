@@ -297,6 +297,10 @@ test('промпт on: DOCX/PDF идёт через WeasyPrint, а не LibreOff
   assert.ok(out.includes('PRE-INSTALLED: ffmpeg, ImageMagick, Inkscape, poppler-utils'));
   assert.equal(out.includes('PRE-INSTALLED: ffmpeg, ImageMagick, LibreOffice'), false);
   assert.equal(out.includes('validate with soffice'), false);
+  const pptxRule = out.split('\n').find((line) => line.includes('For pptx:'));
+  assert.ok(pptxRule.includes('validate structurally with python-pptx'));
+  assert.equal(pptxRule.includes('python-docx'), false);
+  assert.match(pptxRule, /do not claim visual PDF validation/);
   assert.match(out, /Do NOT run soffice, soffice\.bin, lowriter/);
   assert.match(out, /python-docx/);
   assert.match(out, /import weasyprint/);
