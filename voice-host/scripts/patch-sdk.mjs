@@ -36,6 +36,31 @@ export const SDK_PATCHES = [
     from: 'if (this.realtimeSession && this.audioRecognition) {\n      const [realtimeAudioStream',
     to: 'if (this.realtimeSession && this.audioRecognition && (this.audioRecognition.stt || this.audioRecognition.vad)) {\n      const [realtimeAudioStream',
   },
+  {
+    // Открытие сокета Realtime стояло ВНЕ блока повторов цикла соединения.
+    // Сервер закрыл сокет без ошибки, новый не открылся — исключение выходило
+    // из цикла, Task плагина глотал его на уровне debug, и сессия жила дальше
+    // без модели: звук уходил в никуда, ни ошибки, ни строки в логе. Встреча
+    // 10.11.2026, 20-я минута, Роман оглох до конца. Теперь открытие внутри
+    // try, а его ошибка — APIConnectionError: штатный повтор и строка
+    // «connection failed, retrying» в логе; после maxRetry — невосстановимая
+    // ошибка наверх, и сессия закрывается видимо, а не тихо.
+    id: 'realtime-connect-retry',
+    file: '@livekit/agents-plugin-openai/dist/realtime/realtime_model.js',
+    from: '        wsConn = await this.createWsConn();\n        if (signal.aborted) break;\n        try {\n',
+    to: '        try {\n          wsConn = await this.createWsConn().catch((error) => { throw isAPIError(error) ? error : new APIConnectionError({ message: (error && error.message) || String(error) }); });\n          if (signal.aborted) break;\n',
+  },
+  {
+    // Ручка «переоткрыть сокет сейчас» для сторожа приёма (input-watch.ts).
+    // Своей у плагина 1.7.0 нет: переоткрытие случается только по таймеру раз
+    // в 20 минут или по обрыву. Ручка завершает текущий сокет восстановимой
+    // ошибкой — дальше штатный путь плагина: повтор, новый сокет, заново
+    // описанная сессия и разговор.
+    id: 'realtime-force-reconnect',
+    file: '@livekit/agents-plugin-openai/dist/realtime/realtime_model.js',
+    from: '    const wsCloseFuture = new Future();\n    wsConn.onerror = (error) => {\n',
+    to: '    const wsCloseFuture = new Future();\n    this.lkForceReconnect = (reason) => { if (!wsCloseFuture.done) wsCloseFuture.resolve(new APIConnectionError({ message: String(reason) })); };\n    wsConn.onerror = (error) => {\n',
+  },
 ];
 
 /** Текст с правкой. Уже наложена — тот же текст; ни того ни другого — ошибка. */
