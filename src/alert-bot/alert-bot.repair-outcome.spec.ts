@@ -1,7 +1,7 @@
 import { deriveRepairOutcome, repairStatusText } from './alert-bot.repair-outcome';
 
-const exec = (id: string, mutates = true, status: 'succeeded' | 'failed' | 'running' = 'succeeded') => ({ id, kind: 'exec' as const, mutates, status, exitCode: status === 'succeeded' ? 0 : status === 'failed' ? 1 : null, sequence: Number(id) });
-const verify = (id: string, exitCode = 0) => ({ id, kind: 'verify' as const, mutates: false, status: exitCode === 0 ? 'succeeded' as const : 'failed' as const, exitCode, sequence: Number(id) });
+const exec = (id: string, mutates = true, status: 'succeeded' | 'failed' | 'running' | 'interrupted' = 'succeeded') => ({ id, kind: 'exec' as const, mutates, status, exitCode: status === 'succeeded' ? 0 : status === 'failed' ? 1 : null, sequence: Number(id) });
+const verify = (id: string, exitCode: number | null = 0, status?: 'succeeded' | 'failed' | 'interrupted') => ({ id, kind: 'verify' as const, mutates: false, status: status ?? (exitCode === 0 ? 'succeeded' as const : 'failed' as const), exitCode, sequence: Number(id) });
 
 describe('repair outcome', () => {
   it.each([
@@ -15,9 +15,12 @@ describe('repair outcome', () => {
     { jobs: [exec('1')], model: 'timeout' as const, status: 'timeout' },
     { jobs: [exec('1'), verify('2')], model: 'cancelled' as const, status: 'cancelled' },
     { jobs: [exec('1'), verify('2'), verify('3', 1)], model: 'completed' as const, status: 'failed' },
+    { jobs: [exec('1'), verify('2'), verify('3', null, 'interrupted')], model: 'completed' as const, status: 'interrupted' },
     { jobs: [exec('1', true, 'failed')], model: 'completed' as const, status: 'failed' },
     { jobs: [exec('1', true, 'running')], model: 'completed' as const, status: 'interrupted' },
+    { jobs: [exec('1', true, 'interrupted')], model: 'completed' as const, status: 'interrupted' },
     { jobs: [exec('1'), verify('2', 1), verify('3')], model: 'completed' as const, status: 'verified' },
+    { jobs: [exec('1', true, 'interrupted'), verify('2')], model: 'completed' as const, status: 'verified' },
     { jobs: [exec('1'), verify('2'), exec('3', false)], model: 'completed' as const, status: 'verified' },
     { jobs: [exec('1', true, 'running')], model: 'cancelled' as const, status: 'cancelled' },
   ])('$status', ({ jobs, model, status }) => {
