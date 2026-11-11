@@ -72,6 +72,10 @@ function remotePidFile(jobId: string): string {
   return `/tmp/alert-bot-repair-${jobId}.pid`;
 }
 
+function remoteCancelFile(jobId: string): string {
+  return `/tmp/alert-bot-repair-${jobId}.cancel`;
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
@@ -283,15 +287,18 @@ export class AlertBotRepairExecutor {
 
   private remotePayload(job: RepairJobRecord, rawCommand: string): string {
     const pidFile = remotePidFile(job.id);
+    const cancelFile = remoteCancelFile(job.id);
     const marker = `__ALERT_BOT_REPAIR_${job.id}__`;
     return [
       'umask 077',
+      `if [ -e ${cancelFile} ]; then rm -f ${pidFile} ${cancelFile}; exit 0; fi`,
       `printf '%s\\n' "$$" > ${pidFile}`,
+      `if [ -e ${cancelFile} ]; then rm -f ${pidFile} ${cancelFile}; exit 0; fi`,
       `bash -s <<'${marker}'`,
       rawCommand,
       marker,
       'status=$?',
-      `rm -f ${pidFile}`,
+      `rm -f ${pidFile} ${cancelFile}`,
       'exit "$status"',
       '',
     ].join('\n');
@@ -341,11 +348,12 @@ export class AlertBotRepairExecutor {
     child: ChildProcess,
     outcome: ForcedOutcome,
   ): Promise<void> {
-    const confirmed = await this.remoteCancelAndConfirm(state.host as 'relay' | 'test', jobId);
+    await this.remoteCancelAndConfirm(state.host as 'relay' | 'test', jobId, state.processClosed);
     if (!state.processClosed) {
       this.signalGroup(child, 'SIGKILL');
       await Promise.race([state.closed, delay(1_000)]);
     }
+    const confirmed = await this.remoteCancelAndConfirm(state.host as 'relay' | 'test', jobId, true);
     await this.finishProcess(
       jobId,
       confirmed ? outcome : 'interrupted',
@@ -354,17 +362,29 @@ export class AlertBotRepairExecutor {
     );
   }
 
-  private async remoteCancelAndConfirm(host: 'relay' | 'test', jobId: string): Promise<boolean> {
+  private async remoteCancelAndConfirm(host: 'relay' | 'test', jobId: string, originalClosed: boolean): Promise<boolean> {
     const pidFile = remotePidFile(jobId);
+    const cancelFile = remoteCancelFile(jobId);
     const script = [
-      `test -r ${pidFile} || exit 2`,
+      'umask 077',
+      `: > ${cancelFile}`,
+      'attempt=0',
+      'while [ "$attempt" -lt 20 ]; do',
+      `  if [ -s ${pidFile} ]; then break; fi`,
+      `  if [ ! -e ${cancelFile} ]; then rm -f ${pidFile}; exit 0; fi`,
+      '  attempt=$((attempt + 1))',
+      '  sleep 0.1',
+      'done',
+      `if [ ! -s ${pidFile} ]; then`,
+      originalClosed ? `  rm -f ${pidFile} ${cancelFile}; exit 0` : '  exit 2',
+      'fi',
       `read -r pid < ${pidFile}`,
       `case "$pid" in ''|*[!0-9]*) exit 2;; esac`,
       'kill -TERM -- "-$pid" 2>/dev/null || true',
       'attempt=0',
       'while [ "$attempt" -lt 50 ]; do',
       '  if ! kill -0 -- "-$pid" 2>/dev/null; then',
-      `    rm -f ${pidFile}`,
+      `    rm -f ${pidFile} ${cancelFile}`,
       '    exit 0',
       '  fi',
       '  attempt=$((attempt + 1))',
@@ -374,7 +394,7 @@ export class AlertBotRepairExecutor {
       'attempt=0',
       'while [ "$attempt" -lt 10 ]; do',
       '  if ! kill -0 -- "-$pid" 2>/dev/null; then',
-      `    rm -f ${pidFile}`,
+      `    rm -f ${pidFile} ${cancelFile}`,
       '    exit 0',
       '  fi',
       '  attempt=$((attempt + 1))',
