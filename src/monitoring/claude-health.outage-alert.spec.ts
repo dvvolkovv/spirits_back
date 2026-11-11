@@ -72,7 +72,10 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
         return { rows: [] };
       }),
     };
-    const claudeCli = { text: jest.fn(), fallbackStats: jest.fn(() => ({ windowMs: 900_000, providers })) };
+    const claudeCli = {
+      text: jest.fn().mockResolvedValue('ok'),
+      fallbackStats: jest.fn(() => ({ windowMs: 900_000, providers })),
+    };
     const global = { get: jest.fn(async () => switchTo) };
     return new ClaudeHealthService(pg as any, claudeCli as any, global as any);
   };
@@ -128,6 +131,16 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
       expect.stringContaining('INSERT INTO monitor_alert_state'),
       expect.anything(),
     );
+    expect(svc.claudeCli.text).toHaveBeenCalledWith(
+      'Reply with exactly: ok',
+      expect.objectContaining({
+        provider: sw,
+        providerChoice: 'global',
+        noFallback: true,
+        model: 'claude-haiku-4-5',
+        timeoutMs: 30_000,
+      }),
+    );
   });
 
   it('живой глобальный Kimi и личный Claude — красный алерт сохраняется', async () => {
@@ -147,6 +160,7 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     await svc.maybeAlertOutage();
     expect(sent()).toHaveLength(1);
     expect(svc.pg.query.mock.calls.some(([sql]) => /ai_profiles_consolidated/.test(sql))).toBe(false);
+    expect(svc.claudeCli.text).not.toHaveBeenCalled();
   });
 
   it('сбой SQL личного Claude — fail-open, алерт сохраняется', async () => {
@@ -163,6 +177,7 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     svc.lastOutageAlertAt = new Date();
     await svc.maybeAlertOutage();
     expect(sent()).toEqual([]);
+    expect(svc.claudeCli.text).toHaveBeenCalled();
     expect(svc.lastOutageAlertAt).toBeNull();
     expect(svc.pg.query).toHaveBeenCalledWith(
       expect.stringContaining('INSERT INTO monitor_alert_state'),
@@ -211,6 +226,50 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
         checkedAt: '2026-11-11T07:15:00.000Z', latencyMs: 812,
       }),
     ]);
+  });
+
+  it.each(['error', 'empty', 'refusal'] as const)('активная Kimi-проба: %s — красный алерт и Kimi «не отвечает»', async (mode) => {
+    const svc = make('kimi', healthyOnly('kimi'), true, false);
+    if (mode === 'error') svc.claudeCli.text.mockRejectedValue(new Error('kimi unavailable'));
+    else svc.claudeCli.text.mockResolvedValue(mode === 'empty' ? '' : 'Not logged in · Please run /login');
+    setDown(svc);
+    await svc.maybeAlertOutage();
+    expect(sent()).toHaveLength(1);
+    expect(sent()[0]).toContain('но Kimi сейчас «не отвечает»');
+    expect(svc.pg.query).not.toHaveBeenCalledWith(
+      expect.stringContaining('INSERT INTO monitor_alert_state'),
+      ['claude_cli', false],
+    );
+  });
+
+  it('новый outage ниже порога без открытого инцидента — активной пробы нет', async () => {
+    const svc = make('kimi', healthyOnly('kimi'), false, false);
+    setDown(svc);
+    svc.cliConsecutiveDown = 1;
+    await svc.maybeAlertOutage();
+    expect(sent()).toEqual([]);
+    expect(svc.claudeCli.text).not.toHaveBeenCalled();
+  });
+
+  it('SQL личного Claude учитывает только активные аккаунты', async () => {
+    const svc = make('kimi', healthyOnly('kimi'), false, false);
+    setDown(svc);
+    await svc.maybeAlertOutage();
+    expect(svc.pg.query).toHaveBeenCalledWith(expect.stringMatching(
+      /ai_profiles_consolidated p[\s\S]*JOIN user_id u ON u.internal_id = p.user_id[\s\S]*u\.state = 'active'/,
+    ));
+  });
+
+  it('после молчаливой очистки сбой активной пробы даёт новый алерт', async () => {
+    const svc = make('kimi', healthyOnly('kimi'), true, false);
+    setDown(svc);
+    await svc.maybeAlertOutage();
+    expect(sent()).toEqual([]);
+    (sendTelegramPayload as jest.Mock).mockClear();
+    svc.claudeCli.text.mockRejectedValue(new Error('kimi unavailable'));
+    await svc.maybeAlertOutage();
+    expect(sent()).toHaveLength(1);
+    expect(sent()[0]).toContain('но Kimi сейчас «не отвечает»');
   });
 });
 
