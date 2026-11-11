@@ -46,7 +46,6 @@ export class AlertBotAi {
     try {
       const result = await this.claude.textWithCost(prompt, {
         system: ALERT_BOT_SYSTEM,
-        noFallback: true,
         model: alertBotModel(),
         timeoutMs: alertBotTimeoutMs(),
         tools: '',
