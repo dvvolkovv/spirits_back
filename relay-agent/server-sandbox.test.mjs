@@ -28,7 +28,13 @@ function fakeChild() {
   child.closed = false;
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
-  child.stdin = new Writable({ write(chunk, encoding, callback) { callback(); } });
+  child.input = '';
+  child.stdin = new Writable({
+    write(chunk, encoding, callback) {
+      child.input += chunk.toString();
+      callback();
+    },
+  });
   child.kill = (signal) => {
     child.killed = true;
     child.killSignal = signal;
@@ -156,8 +162,26 @@ async function fixture(t, options = {}) {
     });
     return { response, text: await response.text() };
   };
+  const requestUpload = async (files, { sessionId = 'server-upload-session', fsKey = FS_KEY } = {}) => {
+    const payload = new FormData();
+    payload.append('message', 'test uploaded documents');
+    payload.append('sessionId', sessionId);
+    if (fsKey) payload.append('fs_key', fsKey);
+    payload.append('noFallback', '1');
+    for (const file of files) {
+      payload.append('files', new Blob([file.body], {
+        type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      }), file.name);
+    }
+    const response = await fetch(baseUrl + '/chat', {
+      method: 'POST',
+      headers: { 'x-agent-secret': SECRET },
+      body: payload,
+    });
+    return { response, text: await response.text() };
+  };
   const turnFiles = () => fs.readdirSync(dirs.mcpConfigDir).filter((name) => /-session-mcp(?:\.settings)?\.json$/.test(name));
-  return { root, dirs, env, calls, runtime, request, turnFiles };
+  return { root, dirs, env, calls, runtime, request, requestUpload, turnFiles };
 }
 
 test("server off: прежние tools/env, нет --settings, MCP очищается", async (t) => {
@@ -375,6 +399,87 @@ test("server dirs: listing guard вызывается до session dirs, ста�
   for (const dir of [f.dirs.uploadDir, f.dirs.outputDir, f.dirs.scratchRoot]) {
     assert.equal(fs.statSync(dir).mode & 0o777, 0o311);
   }
+});
+
+for (const mode of ['on', 'off']) {
+  test(`server ${mode}: два DOCX доступны по точным путям и через каталог сессии`, async (t) => {
+    const f = await fixture(t, { mode });
+    const { response } = await f.requestUpload([
+      { name: 'first.docx', body: 'first-document-body' },
+      { name: 'second.docx', body: 'second-document-body' },
+    ]);
+    assert.equal(response.status, 200);
+
+    const dir = path.join(f.dirs.uploadDir, FS_KEY);
+    const expected = [`${FS_KEY}_first.docx`, `${FS_KEY}_second.docx`];
+    assert.deepEqual(fs.readdirSync(dir).filter((name) => name.endsWith('.docx')).sort(), expected);
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+    assert.equal(fs.readFileSync(path.join(dir, expected[0]), 'utf8'), 'first-document-body');
+    assert.equal(fs.readFileSync(path.join(dir, expected[1]), 'utf8'), 'second-document-body');
+
+    const prompt = f.calls[0].child.input;
+    for (const name of expected) {
+      const full = path.join(dir, name);
+      assert.ok(prompt.includes(`- ${full} (name: `), full);
+      assert.equal(fs.existsSync(full), true);
+    }
+  });
+}
+
+for (const legacyKey of ['70000000000_12_ru', 'mcp']) {
+  test(`server on: legacy ${legacyKey} сохраняет плоскую схему загрузок`, async (t) => {
+    const f = await fixture(t);
+    const { response } = await f.requestUpload([
+      { name: 'first.docx', body: 'legacy-document-body' },
+    ], { sessionId: legacyKey, fsKey: null });
+    assert.equal(response.status, 200);
+
+    const flat = path.join(f.dirs.uploadDir, `${legacyKey}_first.docx`);
+    assert.equal(fs.readFileSync(flat, 'utf8'), 'legacy-document-body');
+    assert.equal(fs.existsSync(path.join(f.dirs.uploadDir, legacyKey)), false);
+    assert.ok(f.calls[0].child.input.includes(`- ${flat} (name: `));
+    assert.ok(arg(f.calls[0].args, '--allowedTools').includes(`Read(${f.dirs.uploadDir}/${legacyKey}_*)`));
+  });
+}
+
+for (const legacyKey of ['70000000000_12_ru', 'mcp']) {
+  test(`server on: невалидный fs_key=${legacyKey} не включает вложенную схему`, async (t) => {
+    const f = await fixture(t);
+    const { response } = await f.requestUpload([
+      { name: 'first.docx', body: 'invalid-key-document-body' },
+    ], { sessionId: legacyKey, fsKey: legacyKey });
+    assert.equal(response.status, 200);
+
+    const flat = path.join(f.dirs.uploadDir, `${legacyKey}_first.docx`);
+    assert.equal(fs.readFileSync(flat, 'utf8'), 'invalid-key-document-body');
+    assert.equal(fs.existsSync(path.join(f.dirs.uploadDir, legacyKey)), false);
+    assert.ok(f.calls[0].child.input.includes(`- ${flat} (name: `));
+    assert.ok(arg(f.calls[0].args, '--allowedTools').includes(`Read(${f.dirs.uploadDir}/${legacyKey}_*)`));
+  });
+}
+
+test('server off: текстовый ход без вложений не обращается к каталогу загрузок', async (t) => {
+  const f = await fixture(t, { mode: 'off' });
+  const conflict = path.join(f.dirs.uploadDir, FS_KEY);
+  fs.writeFileSync(conflict, 'not-a-directory');
+  const { response } = await f.request();
+  assert.equal(response.status, 200);
+  assert.equal(f.calls.length, 1);
+  assert.equal(fs.readFileSync(conflict, 'utf8'), 'not-a-directory');
+});
+
+test('server off: ошибка создания каталога очищает исходные Multer temp', async (t) => {
+  const f = await fixture(t, { mode: 'off' });
+  const conflict = path.join(f.dirs.uploadDir, FS_KEY);
+  fs.writeFileSync(conflict, 'not-a-directory');
+  const { response } = await f.requestUpload([
+    { name: 'first.docx', body: 'first-document-body' },
+    { name: 'second.docx', body: 'second-document-body' },
+  ]);
+  assert.equal(response.status, 500);
+  assert.equal(f.calls.length, 0);
+  assert.deepEqual(fs.readdirSync(f.dirs.uploadDir).sort(), [FS_KEY]);
+  assert.equal(fs.readFileSync(conflict, 'utf8'), 'not-a-directory');
 });
 
 test("server signal и stale sweeper: оба suffix удаляются, liveSet очищается", async (t) => {
