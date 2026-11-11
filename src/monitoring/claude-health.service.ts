@@ -464,9 +464,9 @@ export class ClaudeHealthService implements OnModuleInit {
       effectiveSw = afterSw;
       const sameProvider = afterSw.switchProvider === probedProvider;
       globalAlive = probeOk && sameProvider && switchCarriesCliPath(afterSw) && !personalClaude;
-      if (!sameProvider && afterSw.switchProvider !== 'claude' && !afterSw.down) {
+      if (!sameProvider && switchCarriesCliPath(afterSw)) {
         effectiveSw = { ...afterSw, providerUnverified: true };
-      } else if (sameProvider && !afterSw.down && !probeOk) {
+      } else if (sameProvider && afterSw.enabled && !afterSw.down && !probeOk) {
         effectiveSw = { ...afterSw, probeFailed: true };
       }
     }
