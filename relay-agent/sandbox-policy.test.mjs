@@ -205,9 +205,11 @@ test('инструменты: on ограничивает Read/Glob/Grep и Writ
     for (const root of [
       `/tmp/agent-output/${FS_KEY}/**`,
       `/tmp/agent-scratch/${FS_KEY}/**`,
+      `/tmp/agent-uploads/${FS_KEY}/**`,
       `/tmp/agent-uploads/${FS_KEY}_*`,
       '/opt/linkeon-agent/**', '/usr/**', '/etc/**',
     ]) assert.ok(rules.includes(`${name}(${root})`), `${name}(${root})`);
+    assert.equal(rules.some((rule) => rule.includes('fedcba0987654321fedcba0987654321')), false);
     assert.equal(rules.includes(`${name}(/opt/**)`), false, `${name}(/opt/**)`);
   }
   for (const name of ['Write', 'Edit']) {
