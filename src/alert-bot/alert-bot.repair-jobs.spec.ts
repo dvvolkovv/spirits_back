@@ -171,6 +171,22 @@ describe('AlertBotRepairJobs', () => {
     }
   });
 
+  it('host:test сохраняет exit/stdout/stderr и удаляет wrapper pid при обычном close', async () => {
+    let jobId = '';
+    try {
+      const started = await jobs.start(ctx, 'exec', {
+        host: 'test', command: 'printf remote-out; printf remote-err >&2; exit 7', interruptible: true,
+      });
+      jobId = started.jobId;
+      expect(await jobs.wait(ctx, jobId, 3)).toMatchObject({
+        status: 'failed', exitCode: 7, stdout: 'remote-out', stderr: 'remote-err',
+      });
+      expect((await runTestSsh(`test ! -e /tmp/alert-bot-repair-${jobId}.pid`)).code).toBe(0);
+    } finally {
+      await runTestSsh(`rm -f /tmp/alert-bot-repair-${jobId}.pid`);
+    }
+  });
+
   it('unknown host и чужой repair не запускают spawn', async () => {
     const spawn = jest.spyOn(childProcess, 'spawn');
     await expect(jobs.start(ctx, 'exec', { host: 'other', command: 'printf no' })).rejects.toThrow('unknown_host');

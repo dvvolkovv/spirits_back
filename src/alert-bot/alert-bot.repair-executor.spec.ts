@@ -419,6 +419,41 @@ describe('AlertBotRepairExecutor', () => {
     fs.rmSync(sentinel, { force: true });
   });
 
+  it('неподтверждённый remote cancel даёт interrupted/remote_cancel_unconfirmed', async () => {
+    const job = await createJob({ host: 'test' });
+    const realSpawn = childProcess.spawn;
+    jest.spyOn(childProcess, 'spawn').mockImplementation((...args: any[]) =>
+      realSpawn('bash', ['-lc', 'sleep 30'], args[2]) as any);
+    jest.spyOn(executor as any, 'remoteCancelAndConfirm').mockResolvedValue(false);
+    await executor.start(job.id, 'sleep 30');
+    await executor.stopRepair('repair-1');
+    expect(await store.findJob(job.id)).toMatchObject({
+      status: 'interrupted', failureKind: 'remote_cancel_unconfirmed',
+    });
+  });
+
+  it('cancellation marker до close не даёт быстрой job записать succeeded', async () => {
+    const job = await createJob();
+    let releaseCheck!: () => void;
+    let checkEntered!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseCheck = resolve; });
+    const entered = new Promise<void>((resolve) => { checkEntered = resolve; });
+    const original = store.findRepair.bind(store);
+    jest.spyOn(store, 'findRepair').mockImplementation(async (id) => {
+      checkEntered();
+      await gate;
+      return original(id);
+    });
+    const started = executor.start(job.id, 'printf fast-close');
+    await entered;
+    const stopped = executor.stopRepair('repair-1');
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    releaseCheck();
+    await stopped;
+    await expect(started).resolves.toBe(job.id);
+    expect(await store.findJob(job.id)).toMatchObject({ status: 'cancelled', stdout: 'fast-close' });
+  });
+
   it('stopRepair останавливает только interruptible job указанного repair', async () => {
     store.addRepair('repair-2');
     const interrupted = await createJob({ timeoutMs: 30_000 });
