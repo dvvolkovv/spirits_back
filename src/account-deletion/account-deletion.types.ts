@@ -13,8 +13,56 @@ export type DeletionErrorKind =
   | 'unsupported_external'
   | 'cancelled';
 
+export type DeletionResourceType =
+  | 'account.core.immediate'
+  | 'account.core.purge'
+  | 'routine.stop'
+  | 'routine.purge'
+  | 'push.purge'
+  | 'telegram.stop'
+  | 'telegram.purge'
+  | 'custom-agent.purge'
+  | 'product.stop'
+  | 'product.purge'
+  | 'calendar.stop'
+  | 'calendar.purge'
+  | 'calendar.external'
+  | 'integration.apple.stop'
+  | 'integration.zoom.stop'
+  | 'integration.talerid.stop'
+  | 'voice.stop'
+  | 'voice.purge'
+  | 'voice-document.purge'
+  | 'chat-file.purge'
+  | 'image.purge'
+  | 'video-job.purge'
+  | 'video.provider'
+  | 'speech.purge'
+  | 'listen.purge'
+  | 'avatar.purge'
+  | 'elevenlabs-voice.purge'
+  | 'events.purge'
+  | 'tasks.stop'
+  | 'tasks.purge'
+  | 'support.stop'
+  | 'support.purge'
+  | 'peer.stop'
+  | 'peer.purge'
+  | 'contacts.purge'
+  | 'referral.stop'
+  | 'referral.purge'
+  | 'retention.stop'
+  | 'profile-backup.purge'
+  | 'devices.purge'
+  | 'guest-carry.stop'
+  | 'guest.purge'
+  | 'auth-verification.stop'
+  | 'legacy-auth.purge'
+  | 'legacy-smm.stop'
+  | 'legacy-smm.purge';
+
 export interface DeletionJobSpec {
-  resourceType: string;
+  resourceType: DeletionResourceType;
   resourceKey: string;
   phase: DeletionPhase;
   payload: Record<string, unknown>;
@@ -38,7 +86,7 @@ export interface DeletionDiscovery {
 }
 
 export interface DeletionSkip {
-  resourceType: string;
+  resourceType: DeletionResourceType;
   reason: string;
 }
 
@@ -64,7 +112,7 @@ export interface DeletionExecution {
 }
 
 export interface AccountDeletionAdapter {
-  readonly resourceTypes: readonly string[];
+  readonly resourceTypes: readonly DeletionResourceType[];
   execute(job: DeletionJobRow, ctx: DeletionExecution): Promise<void>;
 }
 
