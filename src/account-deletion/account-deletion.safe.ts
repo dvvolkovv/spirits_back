@@ -95,6 +95,15 @@ const FORBIDDEN_KEY_PARTS = new Set([
   'credentials',
   'authorization',
 ]);
+const TEXT_LIKE_KEY_PARTS = [
+  'text',
+  'note',
+  'message',
+  'comment',
+  'caption',
+  'description',
+  'body',
+];
 const URL_WITH_USERINFO = /[a-z][a-z0-9+.-]*:\/\/[^/\s?#]*@/i;
 const FORBIDDEN_QUERY_PARTS = new Set([
   'token',
@@ -159,6 +168,8 @@ function unsafePayloadKey(key: string): boolean {
   if (parts.some((part) => FORBIDDEN_KEY_PARTS.has(part))) return true;
   if (['token', 'secret', 'password', 'credential', 'authorization']
     .some((part) => normalized.includes(part))) return true;
+  if (!normalized.endsWith('id')
+    && TEXT_LIKE_KEY_PARTS.some((part) => normalized.includes(part))) return true;
   if (normalized.includes('apikey') || normalized.includes('privatekey')) return true;
   return (parts.includes('api') || parts.includes('private')) && parts.includes('key');
 }
@@ -174,19 +185,29 @@ function unsafeQueryKey(key: string): boolean {
     .test(normalized);
 }
 
+function unsafeUrl(url: URL): boolean {
+  if (url.username || url.password) return true;
+  for (const key of url.searchParams.keys()) {
+    if (unsafeQueryKey(key)) return true;
+  }
+  return false;
+}
+
 function unsafePayloadString(value: string, userId: string): boolean {
   if (userId.length >= 6 && value.includes(userId)) return true;
   if (URL_WITH_USERINFO.test(value)) return true;
-  const candidates = value.match(/[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi) ?? [];
+  try {
+    return unsafeUrl(new URL(value));
+  } catch {
+    // Не URL целиком: ниже проверяем встроенные URL без fail-open.
+  }
+  const normalized = value.replace(/[\t\r\n]/g, '');
+  const candidates = normalized.match(/[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi) ?? [];
   for (const candidate of candidates) {
     try {
-      const url = new URL(candidate);
-      if (url.username || url.password) return true;
-      for (const key of url.searchParams.keys()) {
-        if (unsafeQueryKey(key)) return true;
-      }
+      if (unsafeUrl(new URL(candidate))) return true;
     } catch {
-      // Невалидный URL уже проверен на userinfo; секреты не раскрываем.
+      return true;
     }
   }
   return false;
@@ -279,7 +300,7 @@ export function deletionErrorKind(error: any): DeletionErrorKind {
   if (status >= 500) return 'external_5xx';
   if (status >= 400) return 'external_4xx';
   if (['EPERM', 'EACCES', 'EBUSY'].includes(error?.code)) return 'permission';
-  if (['ENOENT', 'ENOTFOUND'].includes(error?.code)) return 'not_found';
+  if (error?.code === 'ENOENT') return 'not_found';
   if (typeof error?.code === 'string' && /^[0-9A-Z]{5}$/.test(error.code)) return 'db';
   return 'external_unknown';
 }
