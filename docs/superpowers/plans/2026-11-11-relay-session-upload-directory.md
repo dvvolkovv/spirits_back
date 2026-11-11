@@ -206,9 +206,17 @@ Expected: the only changed file is `relay-agent/server-sandbox.test.mjs`; `paths
 - Modify: `relay-agent/server.mjs:546-580`
 - Test: `relay-agent/server-sandbox.test.mjs`
 
-- [ ] **Step 1: Add the focused directory helper**
+- [ ] **Step 1: Add the strict key predicate and focused directory helper**
 
-Append to `paths.mjs` after `ensureSessionDirs`:
+Next to `FS_KEY_RE`, add the single validity predicate and call it from both `turnFsKey` and `legacyTurnFsKey` instead of repeating the regex checks:
+
+```js
+export function isValidFsKey(value) {
+  return typeof value === "string" && FS_KEY_RE.test(value);
+}
+```
+
+Then append to `paths.mjs` after `ensureSessionDirs`:
 
 ```js
 export async function ensureSessionUploadDir(fsKey, { uploads = "/tmp/agent-uploads" } = {}) {
@@ -224,7 +232,7 @@ export async function ensureSessionUploadDir(fsKey, { uploads = "/tmp/agent-uplo
 
 - [ ] **Step 2: Import and call the helper before renaming any upload**
 
-Add `ensureSessionUploadDir` to the import from `./paths.mjs` in `server.mjs`.
+Add `ensureSessionUploadDir` and `isValidFsKey` to the import from `./paths.mjs` in `server.mjs`.
 
 Immediately after the `if (sbxOn) { ... } else { ... }` block that creates `outDir`, add:
 
@@ -232,10 +240,12 @@ Immediately after the `if (sbxOn) { ... } else { ... }` block that creates `outD
 // Вложенный каталог — только для непредсказуемого fs_key от бэка. Legacy
 // fallback остаётся плоским: его sessionId предсказуем, а scrub/backfill
 // знают именно прежние плоские пути.
-const uploadSessionDir = req.files?.length && req.body.fs_key === fsKey
+const uploadSessionDir = req.files?.length && isValidFsKey(req.body.fs_key)
   ? await ensureSessionUploadDir(fsKey, { uploads: UPLOAD_DIR })
   : UPLOAD_DIR;
 ```
+
+`isValidFsKey` is exported from `paths.mjs` and applies the existing `^[0-9a-f]{32}$` rule; `turnFsKey` and `legacyTurnFsKey` call the same predicate. Equality between the submitted string and the computed fallback is not a validity check: malformed `fs_key=mcp&sessionId=mcp` must stay flat.
 
 The directory is created only for multipart with a valid server `fs_key`. Text turns and legacy fallback keep the previous root behavior; this also prevents predictable legacy directories, scrub/mask regressions, and the reserved `mcp` directory collision.
 
@@ -290,6 +300,21 @@ for (const legacyKey of ['70000000000_12_ru', 'mcp']) {
   });
 }
 
+for (const legacyKey of ['70000000000_12_ru', 'mcp']) {
+  test(`server on: невалидный fs_key=${legacyKey} не включает вложенную схему`, async (t) => {
+    const f = await fixture(t);
+    const { response } = await f.requestUpload([
+      { name: 'first.docx', body: 'invalid-key-document-body' },
+    ], { sessionId: legacyKey, fsKey: legacyKey });
+    assert.equal(response.status, 200);
+    const flat = path.join(f.dirs.uploadDir, `${legacyKey}_first.docx`);
+    assert.equal(fs.readFileSync(flat, 'utf8'), 'invalid-key-document-body');
+    assert.equal(fs.existsSync(path.join(f.dirs.uploadDir, legacyKey)), false);
+    assert.ok(f.calls[0].child.input.includes(`- ${flat} (name: `));
+    assert.ok(arg(f.calls[0].args, '--allowedTools').includes(`Read(${f.dirs.uploadDir}/${legacyKey}_*)`));
+  });
+}
+
 test('server off: текстовый ход без вложений не обращается к каталогу загрузок', async (t) => {
   const f = await fixture(t, { mode: 'off' });
   const conflict = path.join(f.dirs.uploadDir, FS_KEY);
@@ -315,7 +340,7 @@ test('server off: ошибка создания каталога очищает 
 });
 ```
 
-The legacy tests fail because the flat file is absent; the text test returns 500 instead of 200; the Multer test shows two extra source files. After the fix, all 19 tests in `server-sandbox.test.mjs` pass.
+The legacy tests fail because the flat file is absent; the text test returns 500 instead of 200; the Multer test shows two extra source files. After the fix, all 21 tests in `server-sandbox.test.mjs` pass.
 
 - [ ] **Step 4: Commit, publish, and verify the regression is green**
 
