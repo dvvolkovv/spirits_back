@@ -140,6 +140,7 @@ export function buildSandboxTools(fsKey, {
   const readRoots = [
     `${output}/${fsKey}/**`,
     `${scratch}/${fsKey}/**`,
+    `${uploads}/${fsKey}/**`,
     `${uploads}/${fsKey}_*`,
     `${opt}/**`, '/usr/**', '/etc/**',
   ];
