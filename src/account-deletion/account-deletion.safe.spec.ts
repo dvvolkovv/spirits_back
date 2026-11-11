@@ -530,3 +530,53 @@ describe('account deletion parser regressions', () => {
     }), USER_ID)).not.toThrow();
   });
 });
+
+describe('account deletion embedded URL and log regressions', () => {
+  it('проверяет каждый embedded URL после первого публичного', () => {
+    const fileUrl = `https://example.com/?download=1 https://evil.test/x?access_token=${SECRET}`;
+    expect(() => assertSafeJobSpec(job({ fileUrl }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it.each(['access_token', 'client_secret', 'X-Amz-Signature', 'api_key', 'authToken'])(
+    'блокирует credentials в URL hash: %s',
+    (queryKey) => {
+      const fileUrl = `https://example.com/x#${queryKey}=${SECRET}`;
+      expect(() => assertSafeJobSpec(job({ fileUrl }), USER_ID))
+        .toThrow(/^unsafe_payload$/);
+    },
+  );
+
+  it.each([USER_ID, '+79000000001'])(
+    'не записывает phone-like resourceKey в журнал',
+    (resourceKey) => {
+      expect(() => safeDeletionMessage({
+        deletionId: 'd-1',
+        resourceType: 'product.purge',
+        resourceKey,
+        attempts: 2,
+        kind: 'timeout',
+      })).toThrow(/^unsafe_resource_key$/);
+    },
+  );
+
+  it('не записывает resourceKey с недопустимым форматом', () => {
+    expect(() => safeDeletionMessage({
+      deletionId: 'd-1',
+      resourceType: 'product.purge',
+      resourceKey: 'private/key',
+      attempts: 2,
+      kind: 'timeout',
+    })).toThrow(/^unsafe_resource_key$/);
+  });
+
+  it('не записывает arbitrary runtime kind в журнал', () => {
+    expect(() => safeDeletionMessage({
+      deletionId: 'd-1',
+      resourceType: 'product.purge',
+      resourceKey: 'p-1',
+      attempts: 2,
+      kind: CANARY as any,
+    })).toThrow(/^unsafe_kind$/);
+  });
+});
