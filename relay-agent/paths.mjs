@@ -117,6 +117,14 @@ export async function ensureSessionDirs(fsKey, { scratchRoot = AGENT_SCRATCH_ROO
   return scratch;
 }
 
+export async function ensureSessionUploadDir(fsKey, { uploads = "/tmp/agent-uploads" } = {}) {
+  const dir = sessionOutputDir(uploads, fsKey);
+  if (!dir) throw new TypeError("invalid fsKey");
+  await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
+  await fsp.chmod(dir, 0o700);
+  return dir;
+}
+
 // 0311: по имени папки можно зайти, перечислить чужие нельзя. Релей списком не читает.
 export async function ensureListingGuard({ outputs = "/tmp/agent-output", uploads = "/tmp/agent-uploads", scratchRoot = AGENT_SCRATCH_ROOT } = {}) {
   for (const d of [outputs, uploads, scratchRoot]) {
