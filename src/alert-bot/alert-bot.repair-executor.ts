@@ -47,7 +47,7 @@ export class AlertBotRepairExecutor {
 
   constructor(private readonly store: RepairStore) {}
 
-  async start(jobId: string, rawCommand: string): Promise<void> {
+  async start(jobId: string, rawCommand: string): Promise<string> {
     const job = await this.store.findJob(jobId);
     if (!job) throw new Error('job_not_found');
     const previous = this.repairChains.get(job.repairId) ?? Promise.resolve();
@@ -56,7 +56,7 @@ export class AlertBotRepairExecutor {
     return setup;
   }
 
-  private async startRegistered(job: RepairJobRecord, rawCommand: string): Promise<void> {
+  private async startRegistered(job: RepairJobRecord, rawCommand: string): Promise<string> {
     const jobId = job.id;
     if (this.isCancelling(job.repairId)) {
       await this.cancelBeforeSpawn(jobId);
@@ -74,7 +74,15 @@ export class AlertBotRepairExecutor {
       throw new Error('repair_inactive');
     }
 
-    const child = this.spawn(job, rawCommand);
+    let child: ChildProcess;
+    try { child = this.spawn(job, rawCommand); }
+    catch {
+      await this.store.finishJob(jobId, {
+        status: 'failed', exitCode: null, stdout: '', stderr: 'spawn_error\n', failureKind: 'spawn_error',
+      });
+      this.wake(jobId);
+      return jobId;
+    }
     let complete!: () => void;
     const completion = new Promise<void>((resolve) => { complete = resolve; });
     const state: ProcessState = {
@@ -100,8 +108,8 @@ export class AlertBotRepairExecutor {
     child.stderr!.on('data', (chunk: Buffer) => {
       state.stderr = appendCapped(state.stderr, state.stderrDecoder.write(chunk));
     });
-    child.once('error', (error) => {
-      state.stderr = appendCapped(state.stderr, `${error.message}\n`);
+    child.once('error', () => {
+      state.stderr = appendCapped(state.stderr, 'spawn_error\n');
       void this.finishProcess(jobId, 'failed', null, 'spawn_error').catch(() => undefined);
     });
     child.once('close', (code) => {
@@ -130,6 +138,7 @@ export class AlertBotRepairExecutor {
     if (!active && job.interruptible) {
       void this.terminate(jobId, 'cancelled').catch(() => undefined);
     }
+    return jobId;
   }
 
   async wait(jobId: string, waitSeconds: number): Promise<boolean> {

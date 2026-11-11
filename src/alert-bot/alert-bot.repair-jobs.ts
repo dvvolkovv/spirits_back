@@ -36,7 +36,7 @@ export class AlertBotRepairJobs {
     if (!HOSTS.has(args.host)) throw new Error('unknown_host');
     if (!await this.store.isActiveRepair(ctx)) throw new Error('repair_inactive');
     const rawCommand = args.command;
-    if (typeof rawCommand !== 'string' || !rawCommand.trim() || Buffer.byteLength(rawCommand) > MAX_COMMAND_BYTES) {
+    if (typeof rawCommand !== 'string' || !rawCommand.trim() || rawCommand.includes('\0') || Buffer.byteLength(rawCommand) > MAX_COMMAND_BYTES) {
       throw new Error('invalid_command');
     }
     const created = await this.store.createJob({
