@@ -442,6 +442,22 @@ for (const legacyKey of ['70000000000_12_ru', 'mcp']) {
   });
 }
 
+for (const legacyKey of ['70000000000_12_ru', 'mcp']) {
+  test(`server on: невалидный fs_key=${legacyKey} не включает вложенную схему`, async (t) => {
+    const f = await fixture(t);
+    const { response } = await f.requestUpload([
+      { name: 'first.docx', body: 'invalid-key-document-body' },
+    ], { sessionId: legacyKey, fsKey: legacyKey });
+    assert.equal(response.status, 200);
+
+    const flat = path.join(f.dirs.uploadDir, `${legacyKey}_first.docx`);
+    assert.equal(fs.readFileSync(flat, 'utf8'), 'invalid-key-document-body');
+    assert.equal(fs.existsSync(path.join(f.dirs.uploadDir, legacyKey)), false);
+    assert.ok(f.calls[0].child.input.includes(`- ${flat} (name: `));
+    assert.ok(arg(f.calls[0].args, '--allowedTools').includes(`Read(${f.dirs.uploadDir}/${legacyKey}_*)`));
+  });
+}
+
 test('server off: текстовый ход без вложений не обращается к каталогу загрузок', async (t) => {
   const f = await fixture(t, { mode: 'off' });
   const conflict = path.join(f.dirs.uploadDir, FS_KEY);
