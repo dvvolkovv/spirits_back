@@ -168,17 +168,17 @@ it('личный Claude при восстановлении — обычный �
 - [ ] **Step 3: Закоммитить и запушить красные тесты**
 
 ```bash
-git -C /Users/dmitry/Downloads/spirits_back add -- src/monitoring/claude-health.outage-alert.spec.ts
-git -C /Users/dmitry/Downloads/spirits_back commit -m "test(monitoring): подавление Claude-алерта при живом рубильнике (красный)" -m "Co-Authored-By: Kimi Code <noreply@moonshot.ai>"
-git -C /Users/dmitry/Downloads/spirits_back push origin main
+git -C /Users/dmitry/Downloads/spirits_back/.worktrees/claude-reserve-alert add -- src/monitoring/claude-health.outage-alert.spec.ts
+git -C /Users/dmitry/Downloads/spirits_back/.worktrees/claude-reserve-alert commit -m "test(monitoring): подавление Claude-алерта при живом рубильнике (красный)" -m "Co-Authored-By: Kimi Code <noreply@moonshot.ai>"
+git -C /Users/dmitry/Downloads/spirits_back/.worktrees/claude-reserve-alert push origin fix/claude-reserve-alert
 ```
 
-Expected: коммит создан, `origin/main` указывает на него.
+Expected: коммит создан, `origin/fix/claude-reserve-alert` указывает на него.
 
 - [ ] **Step 4: Запустить focused jest на тестовой ноде и убедиться в красном**
 
 ```bash
-SHA=$(git -C /Users/dmitry/Downloads/spirits_back rev-parse HEAD)
+SHA=$(git -C /Users/dmitry/Downloads/spirits_back/.worktrees/claude-reserve-alert rev-parse HEAD)
 ssh dv@85.192.61.231 "source ~/.nvm/nvm.sh && git -C ~/ci/spirits_back fetch -q origin && git -C ~/ci/spirits_back checkout -q $SHA && cd ~/ci/spirits_back && npm ci && npx jest src/monitoring/claude-health.outage-alert.spec.ts --runInBand"
 ```
 
@@ -281,9 +281,9 @@ if (status === 'down') {
 - [ ] **Step 4: Закоммитить и запушить реализацию**
 
 ```bash
-git -C /Users/dmitry/Downloads/spirits_back add -- src/common/global-llm-messages.ts src/monitoring/claude-health.service.ts
-git -C /Users/dmitry/Downloads/spirits_back commit -m "fix(monitoring): не алертить о резервном Claude при живом рубильнике" -m "Co-Authored-By: Kimi Code <noreply@moonshot.ai>"
-git -C /Users/dmitry/Downloads/spirits_back push origin main
+git -C /Users/dmitry/Downloads/spirits_back/.worktrees/claude-reserve-alert add -- src/common/global-llm-messages.ts src/monitoring/claude-health.service.ts
+git -C /Users/dmitry/Downloads/spirits_back/.worktrees/claude-reserve-alert commit -m "fix(monitoring): не алертить о резервном Claude при живом рубильнике" -m "Co-Authored-By: Kimi Code <noreply@moonshot.ai>"
+git -C /Users/dmitry/Downloads/spirits_back/.worktrees/claude-reserve-alert push origin fix/claude-reserve-alert
 ```
 
 Expected: коммит содержит только два production-файла.
@@ -299,7 +299,7 @@ Expected: коммит содержит только два production-файл�
 - [ ] **Step 1: Прогнать связанные jest-наборы на коммите реализации**
 
 ```bash
-SHA=$(git -C /Users/dmitry/Downloads/spirits_back rev-parse HEAD)
+SHA=$(git -C /Users/dmitry/Downloads/spirits_back/.worktrees/claude-reserve-alert rev-parse HEAD)
 ssh dv@85.192.61.231 "source ~/.nvm/nvm.sh && git -C ~/ci/spirits_back fetch -q origin && git -C ~/ci/spirits_back checkout -q $SHA && cd ~/ci/spirits_back && npx jest src/monitoring/claude-health.outage-alert.spec.ts src/common/global-llm-messages.spec.ts src/monitoring/claude-health.safe-reason.spec.ts --runInBand"
 ```
 
@@ -316,8 +316,8 @@ Expected: Nest build завершается с exit code 0 без ошибок T
 - [ ] **Step 3: Проверить состав изменений и отсутствие выката**
 
 ```bash
-git -C /Users/dmitry/Downloads/spirits_back status --short --branch
-git -C /Users/dmitry/Downloads/spirits_back log -4 --oneline
+git -C /Users/dmitry/Downloads/spirits_back/.worktrees/claude-reserve-alert status --short --branch
+git -C /Users/dmitry/Downloads/spirits_back/.worktrees/claude-reserve-alert log -4 --oneline
 ```
 
 Expected: рабочее дерево чистое; в истории — спецификация, красный тест и исправление. Никакой `deploy.sh` на этом плане не запускается: прод-выкат требует отдельного подтверждения владельца.
