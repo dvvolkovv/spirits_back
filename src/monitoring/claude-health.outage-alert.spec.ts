@@ -45,15 +45,44 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
   const noKey: Prov = { enabled: false, downUntil: 0 };
   /** «Не отвечает» ещё минуту — считается в момент теста, не при сборе таблицы. */
   const downNow = (): Prov => ({ enabled: true, downUntil: Date.now() + 60_000 });
+  const healthyOnly = (provider: FallbackProvider): Provs => ({
+    qwen: provider === 'qwen' ? up : noKey,
+    kimi: provider === 'kimi' ? up : noKey,
+  });
 
-  /** Сервис с рубильником switchTo и состоянием запасных; alerted — о простое уже сообщали. */
-  const make = (switchTo: AnswerProvider, providers: Provs, alerted = false): any => {
-    const pg = { query: jest.fn(async (sql: string) => (/SELECT alerted/.test(sql) ? { rows: [{ alerted }] } : { rows: [] })) };
+  /** Сервис с рубильником switchTo; alerted — инцидент уже открыт, personalClaude — результат SQL или его сбой. */
+  const make = (
+    switchTo: AnswerProvider,
+    providers: Provs,
+    alerted = false,
+    personalClaude: boolean | Error = true,
+  ): any => {
+    let alertedState = alerted;
+    const pg = {
+      query: jest.fn(async (sql: string, params?: unknown[]) => {
+        if (/SELECT alerted/.test(sql)) return { rows: [{ alerted: alertedState }] };
+        if (/INSERT INTO monitor_alert_state/.test(sql)) {
+          alertedState = params?.[1] === true;
+          return { rows: [] };
+        }
+        if (/ai_profiles_consolidated/.test(sql)) {
+          if (personalClaude instanceof Error) throw personalClaude;
+          return { rows: [{ present: personalClaude }] };
+        }
+        return { rows: [] };
+      }),
+    };
     const claudeCli = { text: jest.fn(), fallbackStats: jest.fn(() => ({ windowMs: 900_000, providers })) };
     const global = { get: jest.fn(async () => switchTo) };
     return new ClaudeHealthService(pg as any, claudeCli as any, global as any);
   };
   const sent = (): string[] => (sendTelegramPayload as jest.Mock).mock.calls.map((c) => c[0].text);
+  const setDown = (svc: any): void => {
+    svc.cache.llmStatus = 'down';
+    svc.cache.llmOutageKind = 'weekly_limit';
+    svc.cache.llmError = 'лимит';
+    svc.cliConsecutiveDown = 99;
+  };
 
   const OUTAGE: Array<[string, AnswerProvider, () => Provs, CliSwitchState]> = [
     ['рубильник на Claude', 'claude', () => ({ qwen: up, kimi: up }), { switchProvider: 'claude', enabled: false, down: false }],
@@ -88,6 +117,96 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     svc.cache.llmLatencyMs = 812;
     await svc.maybeAlertOutage();
     expect(sent()).toEqual([cliRecoveredText({ ...state, checkedAt: '2026-11-01T07:15:00.000Z', latencyMs: 812 })]);
+  });
+
+  it.each(['kimi', 'qwen'] as const)('живой глобальный %s без личного Claude — алерт и запись состояния подавлены', async (sw) => {
+    const svc = make(sw, healthyOnly(sw), false, false);
+    setDown(svc);
+    await svc.maybeAlertOutage();
+    expect(sent()).toEqual([]);
+    expect(svc.pg.query).not.toHaveBeenCalledWith(
+      expect.stringContaining('INSERT INTO monitor_alert_state'),
+      expect.anything(),
+    );
+  });
+
+  it('живой глобальный Kimi и личный Claude — красный алерт сохраняется', async () => {
+    const svc = make('kimi', healthyOnly('kimi'), false, true);
+    setDown(svc);
+    await svc.maybeAlertOutage();
+    expect(sent()).toHaveLength(1);
+    expect(sent()[0]).toContain('<b>🔴 Локальный Claude CLI недоступен</b>');
+  });
+
+  it.each([
+    ['без ключа', noKey],
+    ['«не отвечает»', downNow()],
+  ] as Array<[string, Prov]>)('глобальный Kimi %s — алерт сохраняется без SQL личных настроек', async (_name, kimi) => {
+    const svc = make('kimi', { qwen: noKey, kimi }, false, false);
+    setDown(svc);
+    await svc.maybeAlertOutage();
+    expect(sent()).toHaveLength(1);
+    expect(svc.pg.query.mock.calls.some(([sql]) => /ai_profiles_consolidated/.test(sql))).toBe(false);
+  });
+
+  it('сбой SQL личного Claude — fail-open, алерт сохраняется', async () => {
+    const svc = make('kimi', healthyOnly('kimi'), false, new Error('db unavailable'));
+    setDown(svc);
+    await svc.maybeAlertOutage();
+    expect(sent()).toHaveLength(1);
+  });
+
+  it('открытый инцидент при наступившем подавлении — очищается молча на первом тикe после рестарта', async () => {
+    const svc = make('kimi', healthyOnly('kimi'), true, false);
+    setDown(svc);
+    svc.cliConsecutiveDown = 1;
+    svc.lastOutageAlertAt = new Date();
+    await svc.maybeAlertOutage();
+    expect(sent()).toEqual([]);
+    expect(svc.lastOutageAlertAt).toBeNull();
+    expect(svc.pg.query).toHaveBeenCalledWith(
+      expect.stringContaining('INSERT INTO monitor_alert_state'),
+      ['claude_cli', false],
+    );
+  });
+
+  it('открытый инцидент при наступившем подавлении — отбой не отправляется, состояние очищается', async () => {
+    const svc = make('kimi', healthyOnly('kimi'), true, false);
+    svc.cache.llmStatus = 'ok';
+    svc.lastOutageAlertAt = new Date();
+    await svc.maybeAlertOutage();
+    expect(sent()).toEqual([]);
+    expect(svc.lastOutageAlertAt).toBeNull();
+    expect(svc.pg.query).toHaveBeenCalledWith(
+      expect.stringContaining('INSERT INTO monitor_alert_state'),
+      ['claude_cli', false],
+    );
+  });
+
+  it('после молчаливой очистки возврат рубильника на Claude во время простоя даёт новый алерт', async () => {
+    const svc = make('kimi', healthyOnly('kimi'), true, false);
+    setDown(svc);
+    await svc.maybeAlertOutage();
+    expect(sent()).toEqual([]);
+    (sendTelegramPayload as jest.Mock).mockClear();
+    svc.globalProvider.get.mockResolvedValue('claude');
+    await svc.maybeAlertOutage();
+    expect(sent()).toHaveLength(1);
+    expect(sent()[0]).toContain('<b>🔴 Локальный Claude CLI недоступен</b>');
+  });
+
+  it('личный Claude при восстановлении — обычный отбой сохраняется', async () => {
+    const svc = make('kimi', healthyOnly('kimi'), true, true);
+    svc.cache.llmStatus = 'ok';
+    svc.cache.llmCheckedAt = '2026-11-11T07:15:00.000Z';
+    svc.cache.llmLatencyMs = 812;
+    await svc.maybeAlertOutage();
+    expect(sent()).toEqual([
+      cliRecoveredText({
+        switchProvider: 'kimi', enabled: true, down: false,
+        checkedAt: '2026-11-11T07:15:00.000Z', latencyMs: 812,
+      }),
+    ]);
   });
 });
 
