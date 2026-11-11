@@ -74,17 +74,15 @@ Expected: FAIL because `validate with soffice` and the old `PRE-INSTALLED` line 
 Immediately before `applySandboxPrompt`, add:
 
 ```js
-const SANDBOX_DOCX_RULE = `
-
-DOCX/PDF UNDER SANDBOX:
+const SANDBOX_DOCX_RULE = `DOCX/PDF UNDER SANDBOX:
 - Do NOT run soffice, soffice.bin, lowriter, or other LibreOffice entry points. Claude Code seccomp blocks the Unix-socket IPC they require; every such attempt exits 1 without producing PDF.
 - For DOCX to PDF and page previews, activate /opt/linkeon-agent/venv and use python-docx to read/edit the document plus WeasyPrint (import weasyprint) to render PDF. Preserve source structure, margins, fonts, alignment, tables and non-breaking spaces as faithfully as possible.
 - Verify output with pdfinfo and render pages with pdftoppm; inspect them. Report only what these checks prove, never that output was validated with LibreOffice.`;
 ```
 
-- [ ] **Step 2: Apply the two replacements and append the rule only when sandbox is on**
+- [ ] **Step 2: Apply the two replacements and prepend the rule only when sandbox is on**
 
-Inside `applySandboxPrompt`, chain these replacements before the existing `/home/dv` replacements and append `+ SANDBOX_DOCX_RULE` after them:
+Inside `applySandboxPrompt`, chain these replacements before the existing `/home/dv` replacements and prepend `SANDBOX_DOCX_RULE + '\n\n'` to the transformed prompt:
 
 ```js
 .replace(
@@ -97,7 +95,7 @@ Inside `applySandboxPrompt`, chain these replacements before the existing `/home
 )
 ```
 
-The return remains a pure transformation of the input plus one `SANDBOX_DOCX_RULE`; `if (!sandboxOn) return prompt;` stays first.
+The return is the sandbox rule followed by two newlines and the transformed input; `if (!sandboxOn) return prompt;` stays first. Prepending preserves the existing `on` test that expects the custom input to end with `KEEP THIS TEXT`.
 
 - [ ] **Step 3: Commit and verify green**
 
