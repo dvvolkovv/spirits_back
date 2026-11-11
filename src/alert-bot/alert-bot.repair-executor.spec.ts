@@ -202,6 +202,33 @@ describe('AlertBotRepairExecutor', () => {
     expect(done!.stdout).not.toContain('�');
   });
 
+  it('маскирует секрет до 64 КБ boundary до обрезания вывода', async () => {
+    const job = await createJob();
+    await executor.start(job.id, "node -e \"process.stdout.write('x'.repeat(65500)+'api_key=REAL_SECRET_SUFFIX_1234567890')\"");
+    await executor.wait(job.id, 2);
+    const done = await store.findJob(job.id);
+    expect(done!.stdout).not.toContain('SUFFIX_1234567890');
+    expect(done!.stdout).not.toContain('REAL_SECRET');
+    expect(Buffer.byteLength(done!.stdout)).toBeLessThanOrEqual(65_536);
+  });
+
+  it('output больше 1 MiB заменяется только размерным marker без raw tail', async () => {
+    const job = await createJob();
+    await executor.start(job.id, "node -e \"process.stdout.write('x'.repeat(1048600)+'api_key=ONE_MIB_SECRET')\"");
+    await executor.wait(job.id, 2);
+    const done = await store.findJob(job.id);
+    expect(done!.stdout).toMatch(/^\[output_overflow:\d+ bytes\]$/);
+    expect(done!.stdout).not.toContain('ONE_MIB_SECRET');
+    expect(done!.stdout).not.toContain('x');
+  });
+
+  it('явно сохраняет UTF-8 при multibyte split между chunks', async () => {
+    const job = await createJob();
+    await executor.start(job.id, "node -e \"const b=Buffer.from('я');process.stdout.write(b.subarray(0,1));setTimeout(()=>process.stdout.write(b.subarray(1)),20)\"");
+    await executor.wait(job.id, 2);
+    expect((await store.findJob(job.id))!.stdout).toBe('я');
+  });
+
   it('markJobRunning=false отклоняет запуск без spawn и отменяет queued job', async () => {
     const job = await createJob();
     jest.spyOn(store, 'markJobRunning').mockResolvedValue(false);
