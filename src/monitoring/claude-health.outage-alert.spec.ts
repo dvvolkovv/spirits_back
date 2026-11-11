@@ -77,7 +77,9 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
       fallbackStats: jest.fn(() => ({ windowMs: 900_000, providers })),
     };
     const global = { get: jest.fn(async () => switchTo) };
-    return new ClaudeHealthService(pg as any, claudeCli as any, global as any);
+    const svc = new ClaudeHealthService(pg as any, claudeCli as any, global as any);
+    svc.newSwitchProbeCli = jest.fn(() => claudeCli);
+    return svc;
   };
   const sent = (): string[] => (sendTelegramPayload as jest.Mock).mock.calls.map((c) => c[0].text);
   const setDown = (svc: any): void => {
@@ -139,8 +141,11 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
         noFallback: true,
         model: 'claude-haiku-4-5',
         timeoutMs: 30_000,
+        isolatedCwd: true,
+        noSessionPersistence: true,
       }),
     );
+    expect(svc.newSwitchProbeCli).toHaveBeenCalled();
   });
 
   it('живой глобальный Kimi и личный Claude — красный алерт сохраняется', async () => {
@@ -235,7 +240,8 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     setDown(svc);
     await svc.maybeAlertOutage();
     expect(sent()).toHaveLength(1);
-    expect(sent()[0]).toContain('но Kimi сейчас «не отвечает»');
+    expect(sent()[0]).toContain('контрольная проба Kimi не удалась');
+    expect(sent()[0]).not.toContain('поэтому они идут обычным путём');
     expect(svc.pg.query).not.toHaveBeenCalledWith(
       expect.stringContaining('INSERT INTO monitor_alert_state'),
       ['claude_cli', false],
@@ -269,7 +275,59 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     svc.claudeCli.text.mockRejectedValue(new Error('kimi unavailable'));
     await svc.maybeAlertOutage();
     expect(sent()).toHaveLength(1);
-    expect(sent()[0]).toContain('но Kimi сейчас «не отвечает»');
+    expect(sent()[0]).toContain('контрольная проба Kimi не удалась');
+    expect(sent()[0]).not.toContain('поэтому они идут обычным путём');
+  });
+
+  it('проба использует новый CLI без PG и без shared состояния', () => {
+    const svc = make('kimi', healthyOnly('kimi'), false, false);
+    delete svc.newSwitchProbeCli;
+    const first = svc.newSwitchProbeCli();
+    const second = svc.newSwitchProbeCli();
+    expect(first).not.toBe(svc.claudeCli);
+    expect(first).not.toBe(second);
+    expect(first.pg).toBeUndefined();
+    expect(second.pg).toBeUndefined();
+  });
+
+  it('переключение рубильника во время пробы — fail-open без подавления', async () => {
+    const svc = make('kimi', healthyOnly('kimi'), false, false);
+    let resolveProbe!: (text: string) => void;
+    svc.claudeCli.text.mockReturnValue(new Promise<string>((resolve) => { resolveProbe = resolve; }));
+    setDown(svc);
+    const pending = svc.maybeAlertOutage();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    svc.globalProvider.get.mockResolvedValue('claude');
+    resolveProbe('ok');
+    await pending;
+    expect(sent()).toHaveLength(1);
+    expect(sent()[0]).toContain('проба без входа');
+    expect(svc.claudeCli.text).toHaveBeenCalledTimes(1);
+  });
+
+  it('сбой активной пробы при новом инциденте — красный алерт и alerted=true', async () => {
+    const svc = make('kimi', healthyOnly('kimi'), false, false);
+    svc.claudeCli.text.mockRejectedValue(new Error('kimi unavailable'));
+    setDown(svc);
+    await svc.maybeAlertOutage();
+    expect(sent()).toHaveLength(1);
+    expect(svc.pg.query).toHaveBeenCalledWith(
+      expect.stringContaining('INSERT INTO monitor_alert_state'),
+      ['claude_cli', true],
+    );
+  });
+
+  it('сбой активной пробы при recovery — правдивый отбой без выдуманного fallback', async () => {
+    const svc = make('kimi', healthyOnly('kimi'), true, false);
+    svc.cache.llmStatus = 'ok';
+    svc.cache.llmCheckedAt = '2026-11-11T07:15:00.000Z';
+    svc.cache.llmLatencyMs = 812;
+    svc.claudeCli.text.mockRejectedValue(new Error('kimi unavailable'));
+    await svc.maybeAlertOutage();
+    expect(sent()).toHaveLength(1);
+    expect(sent()[0]).toContain('Claude снова отвечает');
+    expect(sent()[0]).toContain('контрольная проба Kimi не удалась');
+    expect(sent()[0]).not.toContain('Маша/VPM/маркетолог снова работают');
   });
 });
 

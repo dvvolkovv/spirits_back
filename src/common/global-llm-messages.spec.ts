@@ -148,6 +148,12 @@ describe('cliOutageAffectedText', () => {
     expect(cliOutageAffectedText({ switchProvider: 'kimi', enabled: true, down: false })).toContain('рубильник сейчас на <b>Kimi</b>');
     expect(cliOutageAffectedText({ switchProvider: 'kimi', enabled: true, down: true })).toContain('но Kimi сейчас «не отвечает»');
   });
+
+  it('probeFailed — не утверждает реальный breaker или fallback', () => {
+    const text = cliOutageAffectedText({ switchProvider: 'kimi', enabled: true, down: false, probeFailed: true });
+    expect(text).toContain('контрольная проба Kimi не удалась');
+    expect(text).not.toContain('поэтому они идут обычным путём');
+  });
 });
 
 /**
@@ -184,5 +190,15 @@ describe('cliRecoveredText', () => {
     expect(cliRecoveredText({ switchProvider: 'claude', enabled: false, down: false, checkedAt: null, latencyMs: null })).toBe(
       '<b>🟢 Локальный Claude CLI восстановлен</b>\nМаша/VPM/маркетолог снова работают (проверка: —, —мс).',
     );
+  });
+
+  it('probeFailed при recovery — Claude восстановлен, проба Kimi не удалась', () => {
+    const text = cliRecoveredText({
+      switchProvider: 'kimi', enabled: true, down: false, probeFailed: true,
+      checkedAt: '2026-11-11T07:15:00.000Z', latencyMs: 812,
+    });
+    expect(text).toContain('Claude снова отвечает');
+    expect(text).toContain('контрольная проба Kimi не удалась');
+    expect(text).not.toContain('Маша/VPM/маркетолог снова работают');
   });
 });
