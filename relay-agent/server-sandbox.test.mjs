@@ -452,6 +452,20 @@ test('server off: текстовый ход без вложений не обр�
   assert.equal(fs.readFileSync(conflict, 'utf8'), 'not-a-directory');
 });
 
+test('server off: ошибка создания каталога очищает исходные Multer temp', async (t) => {
+  const f = await fixture(t, { mode: 'off' });
+  const conflict = path.join(f.dirs.uploadDir, FS_KEY);
+  fs.writeFileSync(conflict, 'not-a-directory');
+  const { response } = await f.requestUpload([
+    { name: 'first.docx', body: 'first-document-body' },
+    { name: 'second.docx', body: 'second-document-body' },
+  ]);
+  assert.equal(response.status, 500);
+  assert.equal(f.calls.length, 0);
+  assert.deepEqual(fs.readdirSync(f.dirs.uploadDir).sort(), [FS_KEY]);
+  assert.equal(fs.readFileSync(conflict, 'utf8'), 'not-a-directory');
+});
+
 test("server signal и stale sweeper: оба suffix удаляются, liveSet очищается", async (t) => {
   let exitSignal = null;
   const f = await fixture(t, { onSpawn() {} });
