@@ -454,8 +454,13 @@ describe('AlertBotRepairExecutor', () => {
       return child;
     };
     const original = fake(91_001);
-    let spawn = jest.spyOn(childProcess, 'spawn').mockImplementationOnce(() => original as any);
-    spawn.mockImplementation(() => fake(91_002) as any);
+    const helpers: childProcess.ChildProcess[] = [];
+    const spawn = jest.spyOn(childProcess, 'spawn').mockImplementationOnce(() => original as any);
+    spawn.mockImplementation(() => {
+      const child = fake(91_002);
+      helpers.push(child);
+      return child as any;
+    });
     (executor as any).remoteHelperDeadlineMs = 50;
     const job = await createJob({ host: 'test' });
     await executor.start(job.id, 'sleep 30');
@@ -469,6 +474,8 @@ describe('AlertBotRepairExecutor', () => {
         status: 'interrupted', failureKind: 'remote_cancel_unconfirmed',
       });
     } finally {
+      helpers.forEach((child) => child.emit('close', 1));
+      original.emit('close', null);
       spawn.mockImplementation(() => {
         const child = fake(91_003);
         setImmediate(() => child.emit('close', 1));

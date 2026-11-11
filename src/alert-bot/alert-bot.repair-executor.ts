@@ -89,6 +89,7 @@ export class AlertBotRepairExecutor {
   private readonly repairChains = new Map<string, Promise<void>>();
   private stoppingAll = false;
   private stopAllEpoch = 0;
+  private remoteHelperDeadlineMs = 10_000;
 
   constructor(private readonly store: RepairStore) {}
 
@@ -348,12 +349,15 @@ export class AlertBotRepairExecutor {
     child: ChildProcess,
     outcome: ForcedOutcome,
   ): Promise<void> {
-    await this.remoteCancelAndConfirm(state.host as 'relay' | 'test', jobId, state.processClosed);
+    const stopOriginal = () => {
+      if (!state.processClosed) this.signalGroup(child, 'SIGKILL');
+    };
+    await this.remoteCancelAndConfirm(state.host as 'relay' | 'test', jobId, state.processClosed, stopOriginal);
     if (!state.processClosed) {
       this.signalGroup(child, 'SIGKILL');
       await Promise.race([state.closed, delay(1_000)]);
     }
-    const confirmed = await this.remoteCancelAndConfirm(state.host as 'relay' | 'test', jobId, true);
+    const confirmed = await this.remoteCancelAndConfirm(state.host as 'relay' | 'test', jobId, true, stopOriginal);
     await this.finishProcess(
       jobId,
       confirmed ? outcome : 'interrupted',
@@ -362,7 +366,12 @@ export class AlertBotRepairExecutor {
     );
   }
 
-  private async remoteCancelAndConfirm(host: 'relay' | 'test', jobId: string, originalClosed: boolean): Promise<boolean> {
+  private async remoteCancelAndConfirm(
+    host: 'relay' | 'test',
+    jobId: string,
+    originalClosed: boolean,
+    onDeadline?: () => void,
+  ): Promise<boolean> {
     const pidFile = remotePidFile(jobId);
     const cancelFile = remoteCancelFile(jobId);
     const script = [
@@ -406,18 +415,25 @@ export class AlertBotRepairExecutor {
     let child: ChildProcess;
     try {
       child = childProcess.spawn('ssh', [...this.sshPrefix(host), 'bash', '-s'], {
-        stdio: ['pipe', 'ignore', 'ignore'],
+        detached: true, stdio: ['pipe', 'ignore', 'ignore'],
       });
     } catch { return false; }
     child.stdin!.on('error', () => undefined);
     child.stdin!.end(script);
     return new Promise((resolve) => {
       let settled = false;
+      let timer: NodeJS.Timeout | null = null;
       const done = (confirmed: boolean) => {
         if (settled) return;
         settled = true;
+        if (timer) clearTimeout(timer);
         resolve(confirmed);
       };
+      timer = setTimeout(() => {
+        try { this.signalGroup(child, 'SIGKILL'); } catch { /* helper уже недоступен */ }
+        try { onDeadline?.(); } catch { /* original SSH уже недоступен */ }
+        done(false);
+      }, this.remoteHelperDeadlineMs);
       child.once('error', () => done(false));
       child.once('close', (code) => done(code === 0));
     });
