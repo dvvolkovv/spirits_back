@@ -9,7 +9,7 @@ export function maskSecrets(input: string): string {
     /\b(?:export\s+)?[A-Za-z_][A-Za-z0-9_-]*\s*=\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s;]+)/gi,
     (match) => {
       const equals = match.indexOf('=');
-      return /SECRET|PASSWORD|PASSWD|TOKEN|API[_-]KEY/i.test(match.slice(0, equals))
+      return /SECRET|PASSWORD|PASSWD|TOKEN|API[_-]?KEY/i.test(match.slice(0, equals))
         ? `${match.slice(0, equals + 1)}[скрыто]`
         : match;
     },
