@@ -450,21 +450,28 @@ export class ClaudeHealthService implements OnModuleInit {
 
     const stats = this.claudeCli.fallbackStats(now.getTime());
     const sw = await this.switchState(stats, now.getTime());
+    let effectiveStats = stats;
     let effectiveSw: CliSwitchState = sw;
     let globalAlive = false;
     if (sw.switchProvider !== 'claude' && switchCarriesCliPath(sw)) {
       const probedProvider = sw.switchProvider;
       const probeOk = await this.probeSwitchProvider(probedProvider);
+      const personalClaude = probeOk ? await this.hasPersonalClaude() : true;
       const afterNow = Date.now();
-      const afterSw = await this.switchState(this.claudeCli.fallbackStats(afterNow), afterNow);
+      const afterStats = this.claudeCli.fallbackStats(afterNow);
+      const afterSw = await this.switchState(afterStats, afterNow);
+      effectiveStats = afterStats;
       effectiveSw = afterSw;
-      globalAlive = probeOk && afterSw.switchProvider === probedProvider && switchCarriesCliPath(afterSw);
-      if (!globalAlive && afterSw.switchProvider === probedProvider && !afterSw.down && !probeOk) {
+      const sameProvider = afterSw.switchProvider === probedProvider;
+      globalAlive = probeOk && sameProvider && switchCarriesCliPath(afterSw) && !personalClaude;
+      if (!sameProvider && afterSw.switchProvider !== 'claude' && !afterSw.down) {
+        effectiveSw = { ...afterSw, providerUnverified: true };
+      } else if (sameProvider && !afterSw.down && !probeOk) {
         effectiveSw = { ...afterSw, probeFailed: true };
       }
     }
-    if (globalAlive && !(await this.hasPersonalClaude())) {
-      // Подавляем только после свежего успешного ответа общего провайдера.
+    if (globalAlive) {
+      // Последний await был до этого решения: suppression не использует устаревший рубильник.
       if (alreadyAlerted) {
         this.lastOutageAlertAt = null;
         await this.setAlerted(COMPONENT, false);
@@ -484,7 +491,7 @@ export class ClaudeHealthService implements OnModuleInit {
           `${cliOutageAffectedText(effectiveSw)} ` +
           `Чат-ассистенты (r.linkeon.io) — отдельный путь, см. synthetic chat_streaming.\n` +
           `Провалов подряд: ${this.cliConsecutiveDown}. Проверка: ${this.cache.llmCheckedAt || '—'}\n` +
-          `${fallbackAlertLine(stats)}\n` +
+          `${fallbackAlertLine(effectiveStats)}\n` +
           `Починка: на проде \`claude\` → /login (обновить OAuth).`,
         );
         this.lastOutageAlertAt = now;
