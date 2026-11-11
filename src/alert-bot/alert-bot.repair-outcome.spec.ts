@@ -1,6 +1,6 @@
 import { deriveRepairOutcome, repairStatusText } from './alert-bot.repair-outcome';
 
-const exec = (id: string, mutates = true) => ({ id, kind: 'exec' as const, mutates, status: 'succeeded' as const, exitCode: 0, sequence: Number(id) });
+const exec = (id: string, mutates = true, status: 'succeeded' | 'failed' | 'running' = 'succeeded') => ({ id, kind: 'exec' as const, mutates, status, exitCode: status === 'succeeded' ? 0 : status === 'failed' ? 1 : null, sequence: Number(id) });
 const verify = (id: string, exitCode = 0) => ({ id, kind: 'verify' as const, mutates: false, status: exitCode === 0 ? 'succeeded' as const : 'failed' as const, exitCode, sequence: Number(id) });
 
 describe('repair outcome', () => {
@@ -8,12 +8,18 @@ describe('repair outcome', () => {
     { jobs: [exec('1'), verify('2')], model: 'completed' as const, status: 'verified' },
     { jobs: [exec('1')], model: 'completed' as const, status: 'unverified' },
     { jobs: [verify('1'), exec('2')], model: 'completed' as const, status: 'unverified' },
-    { jobs: [exec('1'), verify('2', 1)], model: 'completed' as const, status: 'unverified' },
+    { jobs: [exec('1'), verify('2', 1)], model: 'completed' as const, status: 'failed' },
     { jobs: [exec('1'), verify('2')], model: 'failed' as const, status: 'verified' },
     { jobs: [exec('1')], model: 'failed' as const, status: 'failed' },
     { jobs: [], model: 'no_cause' as const, status: 'failed' },
     { jobs: [exec('1')], model: 'timeout' as const, status: 'timeout' },
     { jobs: [exec('1'), verify('2')], model: 'cancelled' as const, status: 'cancelled' },
+    { jobs: [exec('1'), verify('2'), verify('3', 1)], model: 'completed' as const, status: 'failed' },
+    { jobs: [exec('1', true, 'failed')], model: 'completed' as const, status: 'failed' },
+    { jobs: [exec('1', true, 'running')], model: 'completed' as const, status: 'interrupted' },
+    { jobs: [exec('1'), verify('2', 1), verify('3')], model: 'completed' as const, status: 'verified' },
+    { jobs: [exec('1'), verify('2'), exec('3', false)], model: 'completed' as const, status: 'verified' },
+    { jobs: [exec('1', true, 'running')], model: 'cancelled' as const, status: 'cancelled' },
   ])('$status', ({ jobs, model, status }) => {
     expect(deriveRepairOutcome(jobs, model).status).toBe(status);
   });
@@ -23,5 +29,19 @@ describe('repair outcome', () => {
     expect(repairStatusText('verified', 0)).toBe('Проверено: исправление не потребовалось');
     expect(repairStatusText('unverified', 1)).toBe('Выполнено, результат не подтверждён');
     expect(repairStatusText('failed', 0, true)).toBe('Не исправлено: причина не подтверждена');
+  });
+
+  it('связывает mutationCount с текстом итога', () => {
+    const mutating = deriveRepairOutcome([exec('1'), verify('2')], 'completed');
+    expect(mutating.mutationCount).toBe(1);
+    expect(repairStatusText(mutating.status, mutating.mutationCount)).toBe('Исправлено и проверено');
+
+    const nonMutating = deriveRepairOutcome([exec('1', false), verify('2')], 'completed');
+    expect(nonMutating.mutationCount).toBe(0);
+    expect(repairStatusText(nonMutating.status, nonMutating.mutationCount)).toBe('Проверено: исправление не потребовалось');
+
+    const failedExec = deriveRepairOutcome([exec('1', true, 'failed')], 'completed');
+    expect(failedExec.mutationCount).toBe(1);
+    expect(repairStatusText(failedExec.status, failedExec.mutationCount)).toBe('Не исправлено');
   });
 });
