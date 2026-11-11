@@ -172,10 +172,23 @@ export function buildTurnEnv({
   return env;
 }
 
+const SANDBOX_DOCX_RULE = `DOCX/PDF UNDER SANDBOX:
+- Do NOT run soffice, soffice.bin, lowriter, or other LibreOffice entry points. Claude Code seccomp blocks the Unix-socket IPC they require; every such attempt exits 1 without producing PDF.
+- For DOCX to PDF and page previews, activate /opt/linkeon-agent/venv and use python-docx to read/edit the document plus WeasyPrint (import weasyprint) to render PDF. Preserve source structure, margins, fonts, alignment, tables and non-breaking spaces as faithfully as possible.
+- Verify output with pdfinfo and render pages with pdftoppm; inspect them. Report only what these checks prove, never that output was validated with LibreOffice.`;
+
 // Промпт меняется только у хода в песочнице. В off возвращается та же строка.
 export function applySandboxPrompt(prompt, sandboxOn) {
   if (!sandboxOn) return prompt;
-  return prompt
+  return SANDBOX_DOCX_RULE + '\n\n' + prompt
+    .replace(
+      'PRE-INSTALLED: ffmpeg, ImageMagick, LibreOffice, Inkscape, poppler-utils',
+      'PRE-INSTALLED: ffmpeg, ImageMagick, Inkscape, poppler-utils',
+    )
+    .replace(
+      'validate with soffice --headless --convert-to pdf',
+      'validate structurally with python-pptx; if visual PPTX rendering is unavailable, say so and do not claim visual PDF validation',
+    )
     .replace(
       'Full sudo access (no password). Install anything you need.',
       'Bash runs in a sandbox. sudo is unavailable. The server home directory is unavailable. Write only to the output directory and your scratch directory.',
