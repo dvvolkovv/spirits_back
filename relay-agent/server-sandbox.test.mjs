@@ -28,7 +28,13 @@ function fakeChild() {
   child.closed = false;
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
-  child.stdin = new Writable({ write(chunk, encoding, callback) { callback(); } });
+  child.input = '';
+  child.stdin = new Writable({
+    write(chunk, encoding, callback) {
+      child.input += chunk.toString();
+      callback();
+    },
+  });
   child.kill = (signal) => {
     child.killed = true;
     child.killSignal = signal;
@@ -156,8 +162,26 @@ async function fixture(t, options = {}) {
     });
     return { response, text: await response.text() };
   };
+  const requestUpload = async (files) => {
+    const payload = new FormData();
+    payload.append('message', 'test uploaded documents');
+    payload.append('sessionId', 'server-upload-session');
+    payload.append('fs_key', FS_KEY);
+    payload.append('noFallback', '1');
+    for (const file of files) {
+      payload.append('files', new Blob([file.body], {
+        type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      }), file.name);
+    }
+    const response = await fetch(baseUrl + '/chat', {
+      method: 'POST',
+      headers: { 'x-agent-secret': SECRET },
+      body: payload,
+    });
+    return { response, text: await response.text() };
+  };
   const turnFiles = () => fs.readdirSync(dirs.mcpConfigDir).filter((name) => /-session-mcp(?:\.settings)?\.json$/.test(name));
-  return { root, dirs, env, calls, runtime, request, turnFiles };
+  return { root, dirs, env, calls, runtime, request, requestUpload, turnFiles };
 }
 
 test("server off: прежние tools/env, нет --settings, MCP очищается", async (t) => {
@@ -376,6 +400,31 @@ test("server dirs: listing guard вызывается до session dirs, ста�
     assert.equal(fs.statSync(dir).mode & 0o777, 0o311);
   }
 });
+
+for (const mode of ['on', 'off']) {
+  test(`server ${mode}: два DOCX доступны по точным путям и через каталог сессии`, async (t) => {
+    const f = await fixture(t, { mode });
+    const { response } = await f.requestUpload([
+      { name: 'first.docx', body: 'first-document-body' },
+      { name: 'second.docx', body: 'second-document-body' },
+    ]);
+    assert.equal(response.status, 200);
+
+    const dir = path.join(f.dirs.uploadDir, FS_KEY);
+    const expected = [`${FS_KEY}_first.docx`, `${FS_KEY}_second.docx`];
+    assert.deepEqual(fs.readdirSync(dir).filter((name) => name.endsWith('.docx')).sort(), expected);
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+    assert.equal(fs.readFileSync(path.join(dir, expected[0]), 'utf8'), 'first-document-body');
+    assert.equal(fs.readFileSync(path.join(dir, expected[1]), 'utf8'), 'second-document-body');
+
+    const prompt = f.calls[0].child.input;
+    for (const name of expected) {
+      const full = path.join(dir, name);
+      assert.ok(prompt.includes(`- ${full} (name: `), full);
+      assert.equal(fs.existsSync(full), true);
+    }
+  });
+}
 
 test("server signal и stale sweeper: оба suffix удаляются, liveSet очищается", async (t) => {
   let exitSignal = null;
