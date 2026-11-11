@@ -4,6 +4,7 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
 import { ClaudeCliCallError, ClaudeCliService } from '../common/services/claude-cli.service';
 import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
+import type { FallbackProvider } from '../common/services/llm-fallback';
 import { CliSwitchState, cliOutageAffectedText, cliRecoveredText, switchCarriesCliPath } from '../common/global-llm-messages';
 import axios from 'axios';
 import { sendTelegramPayload } from '../common/telegram-alert';
@@ -371,12 +372,38 @@ export class ClaudeHealthService implements OnModuleInit {
   // cost30dUsd считается в refresh() и отдаётся в overview, а панель мониторинга
   // красит её по ALERT_THRESHOLD_30D_USD. Пропала только рассылка в Telegram.
 
+  /** Свежая проверка выбранного рубильником провайдера; сырой текст CLI не логируем. */
+  private async probeSwitchProvider(provider: FallbackProvider): Promise<boolean> {
+    try {
+      const text = await this.claudeCli.text('Reply with exactly: ok', {
+        provider,
+        providerChoice: 'global',
+        noFallback: true,
+        model: 'claude-haiku-4-5',
+        timeoutMs: 30_000,
+      });
+      if (typeof text === 'string' && text.trim().length > 0 && !looksLikeCliRefusal(text)) return true;
+      const kind = classifyLlmError(typeof text === 'string' ? text : '').kind;
+      this.log.warn(`${provider} liveness probe DOWN (${kind})`);
+      return false;
+    } catch (e: any) {
+      const message = String(e?.message || e);
+      const kind = e instanceof ClaudeCliCallError && e.kind ? e.kind : classifyLlmError(message).kind;
+      this.log.warn(`${provider} liveness probe DOWN (${kind})`);
+      return false;
+    }
+  }
+
   /** Личный Claude остаётся затронут даже при живом общем Kimi/Qwen. Сбой SQL — fail-open. */
   private async hasPersonalClaude(): Promise<boolean> {
     try {
       const r = await this.pg.query(
         `SELECT EXISTS (
-           SELECT 1 FROM ai_profiles_consolidated WHERE llm_provider = 'claude'
+           SELECT 1
+           FROM ai_profiles_consolidated p
+           JOIN user_id u ON u.internal_id = p.user_id
+           WHERE p.llm_provider = 'claude'
+             AND u.state = 'active'
          ) AS present`,
       );
       return r.rows[0]?.present === true;
@@ -416,14 +443,18 @@ export class ClaudeHealthService implements OnModuleInit {
 
     const stats = this.claudeCli.fallbackStats(now.getTime());
     const sw = await this.switchState(stats, now.getTime());
-    if (switchCarriesCliPath(sw) && !(await this.hasPersonalClaude())) {
-      // Общий провайдер несёт рабочий путь, личного Claude нет: проба остаётся в
-      // админке, но Telegram не шумит. Старый инцидент закрываем без ложного отбоя
-      // даже на первом тикe после рестарта, когда счётчик ещё ниже порога.
+    let effectiveSw = sw;
+    let globalAlive = false;
+    if (sw.switchProvider !== 'claude' && switchCarriesCliPath(sw)) {
+      globalAlive = await this.probeSwitchProvider(sw.switchProvider);
+      if (!globalAlive) effectiveSw = { ...sw, down: true };
+    }
+    if (globalAlive && !(await this.hasPersonalClaude())) {
+      // Подавляем только после свежего успешного ответа общего провайдера.
       if (alreadyAlerted) {
         this.lastOutageAlertAt = null;
         await this.setAlerted(COMPONENT, false);
-        this.log.warn(`Claude CLI alert cleared without Telegram: ${sw.switchProvider} carries CLI path`);
+        this.log.warn(`Claude CLI alert cleared without Telegram: ${sw.switchProvider} answered probe`);
       }
       return;
     }
@@ -436,7 +467,7 @@ export class ClaudeHealthService implements OnModuleInit {
         await send(
           `<b>🔴 Локальный Claude CLI недоступен</b>\n` +
           `Причина: <b>${this.cache.llmError || 'неизвестно'}</b> (${this.cache.llmOutageKind})\n` +
-          `${cliOutageAffectedText(sw)} ` +
+          `${cliOutageAffectedText(effectiveSw)} ` +
           `Чат-ассистенты (r.linkeon.io) — отдельный путь, см. synthetic chat_streaming.\n` +
           `Провалов подряд: ${this.cliConsecutiveDown}. Проверка: ${this.cache.llmCheckedAt || '—'}\n` +
           `${fallbackAlertLine(stats)}\n` +
@@ -447,7 +478,7 @@ export class ClaudeHealthService implements OnModuleInit {
         this.log.error(`Claude CLI outage alert sent (${this.cache.llmOutageKind}, ${this.cliConsecutiveDown} fails)`);
       }
     } else {
-      await send(cliRecoveredText({ ...sw, checkedAt: this.cache.llmCheckedAt, latencyMs: this.cache.llmLatencyMs }));
+      await send(cliRecoveredText({ ...effectiveSw, checkedAt: this.cache.llmCheckedAt, latencyMs: this.cache.llmLatencyMs }));
       this.lastOutageAlertAt = null;
       await this.setAlerted(COMPONENT, false);
       this.log.warn('Claude CLI recovery alert sent');
