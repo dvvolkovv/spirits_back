@@ -1,5 +1,5 @@
 import * as jwt from 'jsonwebtoken';
-import { signOpsToken, verifyOpsToken } from './alert-bot.ops-token';
+import { signOpsToken, signRepairToken, verifyAlertBotToken, verifyOpsToken } from './alert-bot.ops-token';
 
 describe('ops token', () => {
   beforeEach(() => { process.env.JWT_SECRET = 'ops-spec-secret'; });
@@ -22,5 +22,16 @@ describe('ops token', () => {
   it('без JWT_SECRET не выпускает токен', () => {
     delete process.env.JWT_SECRET;
     expect(() => signOpsToken('u-admin', '1')).toThrow('JWT_SECRET required');
+  });
+  it('repair token привязан к admin, chat, turn и repair', () => {
+    const token = signRepairToken({ adminUserId: 'tg:123', adminTgId: '123', chatId: '-1001', turnId: 'turn-1', repairId: 'repair-1' });
+    expect(verifyAlertBotToken(token)).toEqual({ scope: 'repair', adminUserId: 'tg:123', adminTgId: '123', chatId: '-1001', turnId: 'turn-1', repairId: 'repair-1' });
+    expect(verifyOpsToken(token)).toBeNull();
+  });
+  it('repair token использует часовой бюджет и не принимает ops scope', () => {
+    const token = signRepairToken({ adminUserId: 'tg:123', adminTgId: '123', chatId: '1', turnId: 't', repairId: 'r' });
+    const decoded = jwt.decode(token) as jwt.JwtPayload;
+    expect(decoded.exp! - decoded.iat!).toBe(3720);
+    expect(verifyAlertBotToken(signOpsToken('u-admin', '1'))).toEqual({ scope: 'ops', adminUserId: 'u-admin', chatId: '1' });
   });
 });
