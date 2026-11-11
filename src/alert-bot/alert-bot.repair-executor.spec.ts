@@ -467,13 +467,15 @@ describe('AlertBotRepairExecutor', () => {
     let resolved = false;
     const operation = (mode === 'stopRepair' ? executor.stopRepair('repair-1') : executor.stopAll())
       .then(() => { resolved = true; });
+    let boundedTimer: NodeJS.Timeout;
     try {
-      await Promise.race([operation, new Promise<void>((resolve) => setTimeout(resolve, 2_500))]);
+      await Promise.race([operation, new Promise<void>((resolve) => { boundedTimer = setTimeout(resolve, 2_500); })]);
       expect(resolved).toBe(true);
       expect(await store.findJob(job.id)).toMatchObject({
         status: 'interrupted', failureKind: 'remote_cancel_unconfirmed',
       });
     } finally {
+      clearTimeout(boundedTimer!);
       helpers.forEach((child) => child.emit('close', 1));
       original.emit('close', null);
       spawn.mockImplementation(() => {
