@@ -12,6 +12,27 @@ import {
 } from './alert-bot.repair-store';
 import { RepairIdentity } from './alert-bot.types';
 
+async function runTestSsh(script: string): Promise<{ code: number | null; stdout: string }> {
+  const child = childProcess.spawn('ssh', [
+    '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'dv@85.192.61.231', 'bash', '-s',
+  ], { stdio: ['pipe', 'pipe', 'pipe'] });
+  let stdout = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+  child.stdin.end(script);
+  return new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (code) => resolve({ code, stdout: stdout.trim() }));
+  });
+}
+
+async function waitForRemoteFile(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if ((await runTestSsh(`test -s ${path}`)).code === 0) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error('remote_pid_file_timeout');
+}
+
 class MemoryRepairStore {
   readonly jobs = new Map<string, RepairJobRecord>();
   readonly repair: RepairRecord = {
@@ -108,6 +129,46 @@ describe('AlertBotRepairJobs', () => {
     const startedAt = Date.now();
     expect(await jobs.wait(ctx, job.jobId, 2)).toMatchObject({ status: 'timeout' });
     expect(Date.now() - startedAt).toBeLessThan(5_000);
+  });
+
+  it('host:test cancel завершает remote process group без sentinel и temp files', async () => {
+    const suffix = `${process.pid}-${Date.now()}`;
+    const sentinel = `/tmp/alert-bot-repair-sentinel-${suffix}`;
+    const innerPidFile = `/tmp/alert-bot-repair-inner-${suffix}.pid`;
+    let innerPid = '';
+    let outerPid = '';
+    let outerPidFile = '';
+    let jobId = '';
+    await runTestSsh(`rm -f ${sentinel} ${innerPidFile}`);
+    try {
+      const started = await jobs.start(ctx, 'exec', {
+        host: 'test',
+        command: `printf '%s\\n' "$$" > ${innerPidFile}; sleep 30; touch ${sentinel}`,
+        timeout_ms: 30_000,
+        interruptible: true,
+      });
+      jobId = started.jobId;
+      outerPidFile = `/tmp/alert-bot-repair-${jobId}.pid`;
+      await waitForRemoteFile(innerPidFile);
+      innerPid = (await runTestSsh(`cat ${innerPidFile}`)).stdout;
+      outerPid = (await runTestSsh(`cat ${outerPidFile} 2>/dev/null || true`)).stdout;
+      await executor.stopRepair(ctx.repairId);
+      expect(await jobs.wait(ctx, jobId, 2)).toMatchObject({ status: 'cancelled' });
+      const check = await runTestSsh([
+        innerPid ? `! kill -0 ${innerPid} 2>/dev/null` : 'false',
+        outerPid ? `! kill -0 -- -${outerPid} 2>/dev/null` : 'false',
+        `test ! -e ${sentinel}`,
+        `test ! -e ${outerPidFile}`,
+      ].join(' && '));
+      expect(check).toMatchObject({ code: 0 });
+    } finally {
+      await executor.stopRepair(ctx.repairId).catch(() => undefined);
+      await runTestSsh([
+        outerPid ? `kill -KILL -- -${outerPid} 2>/dev/null || true` : 'true',
+        innerPid ? `kill -KILL ${innerPid} 2>/dev/null || true` : 'true',
+        `rm -f ${sentinel} ${innerPidFile} ${outerPidFile || `/tmp/alert-bot-repair-${jobId}.pid`}`,
+      ].join('; '));
+    }
   });
 
   it('unknown host и чужой repair не запускают spawn', async () => {
