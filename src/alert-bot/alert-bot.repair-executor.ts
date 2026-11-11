@@ -133,7 +133,13 @@ export class AlertBotRepairExecutor {
     if (this.isCancelling(job.repairId) && job.interruptible) {
       void this.terminate(jobId, 'cancelled').catch(() => undefined);
     }
-    const repair = await this.store.findRepair(job.repairId);
+    let repair;
+    try { repair = await this.store.findRepair(job.repairId); }
+    catch {
+      console.error('repair_secondary_check_failed');
+      if (job.interruptible) void this.terminate(jobId, 'cancelled').catch(() => undefined);
+      return jobId;
+    }
     const active = repair && ['requested', 'running'].includes(repair.status);
     if (!active && job.interruptible) {
       void this.terminate(jobId, 'cancelled').catch(() => undefined);
