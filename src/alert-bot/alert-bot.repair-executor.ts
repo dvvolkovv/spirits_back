@@ -10,6 +10,7 @@ const MAX_OUTPUT_BYTES = 65_536;
 type ForcedOutcome = 'timeout' | 'cancelled';
 
 interface ProcessState {
+  host: RepairJobRecord['host'];
   interruptible: boolean;
   stdout: string;
   stderr: string;
@@ -23,6 +24,9 @@ interface ProcessState {
   killTimer: NodeJS.Timeout | null;
   completion: Promise<void>;
   complete: () => void;
+  processClosed: boolean;
+  closed: Promise<void>;
+  markClosed: () => void;
 }
 
 function appendCapped(previous: string, decodedChunk: string): string {
@@ -36,6 +40,14 @@ function appendCapped(previous: string, decodedChunk: string): string {
 
 function clampWaitSeconds(value: number): number {
   return Number.isFinite(value) ? Math.min(30, Math.max(0, value)) : 0;
+}
+
+function remotePidFile(jobId: string): string {
+  return `/tmp/alert-bot-repair-${jobId}.pid`;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
 export class AlertBotRepairExecutor {
@@ -91,7 +103,10 @@ export class AlertBotRepairExecutor {
     }
     let complete!: () => void;
     const completion = new Promise<void>((resolve) => { complete = resolve; });
+    let markClosed!: () => void;
+    const closed = new Promise<void>((resolve) => { markClosed = resolve; });
     const state: ProcessState = {
+      host: job.host,
       interruptible: job.interruptible,
       stdout: '',
       stderr: '',
@@ -105,6 +120,9 @@ export class AlertBotRepairExecutor {
       killTimer: null,
       completion,
       complete,
+      processClosed: false,
+      closed,
+      markClosed,
     };
     this.children.set(jobId, child);
     this.repairs.set(jobId, job.repairId);
@@ -121,17 +139,20 @@ export class AlertBotRepairExecutor {
       void this.finishProcess(jobId, 'failed', null, 'spawn_error').catch(() => undefined);
     });
     child.once('close', (code) => {
+      state.processClosed = true;
+      state.markClosed();
       state.stdout = appendCapped(state.stdout, state.stdoutDecoder.end());
       state.stderr = appendCapped(state.stderr, state.stderrDecoder.end());
       const repairId = this.repairs.get(jobId);
       const cancelled = state.interruptible && repairId !== undefined && this.isCancelling(repairId);
+      if (job.host !== 'prod' && (state.outcome || cancelled)) return;
       const status = state.outcome ?? (cancelled ? 'cancelled' : (code === 0 ? 'succeeded' : 'failed'));
       void this.finishProcess(jobId, status, code).catch(() => undefined);
     });
 
     if (job.host !== 'prod') {
       child.stdin!.on('error', () => undefined);
-      child.stdin!.end(rawCommand);
+      child.stdin!.end(this.remotePayload(job, rawCommand));
     }
     state.timeout = setTimeout(() => {
       void this.terminate(jobId, 'timeout').catch(() => undefined);
@@ -219,12 +240,32 @@ export class AlertBotRepairExecutor {
         detached: true, stdio: ['ignore', 'pipe', 'pipe'],
       });
     }
-    const destination = job.host === 'relay'
+    return childProcess.spawn('ssh', [
+      ...this.sshPrefix(job.host), 'setsid', 'bash', '-s',
+    ], { detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
+  }
+
+  private sshPrefix(host: 'relay' | 'test'): string[] {
+    const destination = host === 'relay'
       ? process.env.ALERT_BOT_REPAIR_RELAY_SSH || 'dv@5.101.115.184'
       : process.env.ALERT_BOT_REPAIR_TEST_SSH || 'dv@85.192.61.231';
-    return childProcess.spawn('ssh', [
-      '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', destination, 'bash', '-s',
-    ], { detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    return ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', destination];
+  }
+
+  private remotePayload(job: RepairJobRecord, rawCommand: string): string {
+    const pidFile = remotePidFile(job.id);
+    const marker = `__ALERT_BOT_REPAIR_${job.id}__`;
+    return [
+      'umask 077',
+      `printf '%s\\n' "$$" > ${pidFile}`,
+      `bash -s <<'${marker}'`,
+      rawCommand,
+      marker,
+      'status=$?',
+      `rm -f ${pidFile}`,
+      'exit "$status"',
+      '',
+    ].join('\n');
   }
 
   private isCancelling(repairId: string): boolean {
@@ -250,18 +291,92 @@ export class AlertBotRepairExecutor {
     if (!state || !child || (!state.interruptible && outcome !== 'timeout')) return;
     if (!state.finished && !state.outcome) {
       state.outcome = outcome;
-      this.signalGroup(child, 'SIGTERM');
-      state.killTimer = setTimeout(() => {
-        if (!state.finished) this.signalGroup(child, 'SIGKILL');
-      }, 5_000);
-      state.killTimer.unref();
+      if (state.host === 'prod') {
+        this.signalGroup(child, 'SIGTERM');
+        state.killTimer = setTimeout(() => {
+          if (!state.finished) this.signalGroup(child, 'SIGKILL');
+        }, 5_000);
+        state.killTimer.unref();
+      } else {
+        void this.terminateRemote(jobId, state, child, outcome).catch(async () => {
+          await this.finishProcess(jobId, 'interrupted', null, 'remote_cancel_unconfirmed');
+        });
+      }
     }
     await state.completion;
   }
 
+  private async terminateRemote(
+    jobId: string,
+    state: ProcessState,
+    child: ChildProcess,
+    outcome: ForcedOutcome,
+  ): Promise<void> {
+    const confirmed = await this.remoteCancelAndConfirm(state.host as 'relay' | 'test', jobId);
+    if (!state.processClosed) {
+      this.signalGroup(child, 'SIGKILL');
+      await Promise.race([state.closed, delay(1_000)]);
+    }
+    await this.finishProcess(
+      jobId,
+      confirmed ? outcome : 'interrupted',
+      null,
+      confirmed ? null : 'remote_cancel_unconfirmed',
+    );
+  }
+
+  private async remoteCancelAndConfirm(host: 'relay' | 'test', jobId: string): Promise<boolean> {
+    const pidFile = remotePidFile(jobId);
+    const script = [
+      `test -r ${pidFile} || exit 2`,
+      `read -r pid < ${pidFile}`,
+      `case "$pid" in ''|*[!0-9]*) exit 2;; esac`,
+      'kill -TERM -- "-$pid" 2>/dev/null || true',
+      'attempt=0',
+      'while [ "$attempt" -lt 50 ]; do',
+      '  if ! kill -0 -- "-$pid" 2>/dev/null; then',
+      `    rm -f ${pidFile}`,
+      '    exit 0',
+      '  fi',
+      '  attempt=$((attempt + 1))',
+      '  sleep 0.1',
+      'done',
+      'kill -KILL -- "-$pid" 2>/dev/null || true',
+      'attempt=0',
+      'while [ "$attempt" -lt 10 ]; do',
+      '  if ! kill -0 -- "-$pid" 2>/dev/null; then',
+      `    rm -f ${pidFile}`,
+      '    exit 0',
+      '  fi',
+      '  attempt=$((attempt + 1))',
+      '  sleep 0.1',
+      'done',
+      'exit 1',
+      '',
+    ].join('\n');
+    let child: ChildProcess;
+    try {
+      child = childProcess.spawn('ssh', [...this.sshPrefix(host), 'bash', '-s'], {
+        stdio: ['pipe', 'ignore', 'ignore'],
+      });
+    } catch { return false; }
+    child.stdin!.on('error', () => undefined);
+    child.stdin!.end(script);
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (confirmed: boolean) => {
+        if (settled) return;
+        settled = true;
+        resolve(confirmed);
+      };
+      child.once('error', () => done(false));
+      child.once('close', (code) => done(code === 0));
+    });
+  }
+
   private async finishProcess(
     jobId: string,
-    status: 'succeeded' | 'failed' | 'timeout' | 'cancelled',
+    status: 'succeeded' | 'failed' | 'timeout' | 'cancelled' | 'interrupted',
     exitCode: number | null,
     failureKind?: string,
   ): Promise<void> {
