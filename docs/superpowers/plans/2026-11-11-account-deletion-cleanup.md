@@ -119,21 +119,25 @@ ssh -n dv@85.192.61.231 'cd ~/ci/wt/account-deletion-cleanup && source ~/.nvm/nv
 
 Expected: все перечисленные suites PASS и `BASELINE_UNIT_OK`. При красном baseline остановиться; дальнейшие задачи не маскируют чужие падения.
 
-- [ ] **Step 3: Снять PG baseline в одноразовой БД**
+- [ ] **Step 3: Снять PG baseline в одноразовых БД**
+
+Каждый PG suite запускается в собственной fresh БД: часть product migrations создаёт enum/type заново, поэтому общая БД для всех suites даёт ложный `pg_type_typname_nsp_index`.
 
 ```bash
-ssh -n dv@85.192.61.231 'cd ~/ci/wt/account-deletion-cleanup && source ~/.nvm/nvm.sh && DB=account_deletion_base_$(date +%s)_$$ && createdb -h /var/run/postgresql "$DB" && trap "dropdb -h /var/run/postgresql --if-exists \"$DB\"" EXIT && PROVISIONING_PG_URL="postgres:///$DB?host=/var/run/postgresql" npx jest --runTestsByPath src/identity/identity.unlink.pg.spec.ts src/tg-bot/tg-config.private.pg.spec.ts src/products/product-lifecycle.pg.spec.ts src/products/product-purge.pg.spec.ts --maxWorkers=2 && printf "BASELINE_PG_OK\n"'
+ssh -n dv@85.192.61.231 'cd ~/ci/wt/account-deletion-cleanup && source ~/.nvm/nvm.sh && DB=account_deletion_base_$(date +%s)_$$ && createdb -h /var/run/postgresql "$DB" && trap "dropdb -h /var/run/postgresql --if-exists \"$DB\"" EXIT && PROVISIONING_PG_URL="postgres:///$DB?host=/var/run/postgresql" npx jest --runTestsByPath src/identity/identity.unlink.pg.spec.ts src/tg-bot/tg-config.private.pg.spec.ts src/products/product-lifecycle.pg.spec.ts --maxWorkers=2 && printf "BASELINE_PG_OK\n"'
+ssh -n dv@85.192.61.231 'cd ~/ci/wt/account-deletion-cleanup && source ~/.nvm/nvm.sh && DB=account_deletion_purge_base_$(date +%s)_$$ && createdb -h /var/run/postgresql "$DB" && trap "dropdb -h /var/run/postgresql --if-exists \"$DB\"" EXIT && PROVISIONING_PG_URL="postgres:///$DB?host=/var/run/postgresql" npx jest --runTestsByPath src/products/product-purge.pg.spec.ts --maxWorkers=2 && printf "BASELINE_PURGE_PG_OK\n"'
 ```
 
-Expected: PG suites именно PASS, не skipped; `BASELINE_PG_OK`.
+Expected: PG suites именно PASS, не skipped; `BASELINE_PG_OK` и `BASELINE_PURGE_PG_OK`.
 
-- [ ] **Step 4: Снять type/build baseline**
+- [ ] **Step 4: Снять type/build baseline и зафиксировать правило delta**
 
 ```bash
-ssh -n dv@85.192.61.231 'cd ~/ci/wt/account-deletion-cleanup && source ~/.nvm/nvm.sh && npx tsc -p tsconfig.build.json --noEmit && npx tsc -p tsconfig.json --noEmit && npm run build && printf "BASELINE_BUILD_OK\n"'
+ssh -n dv@85.192.61.231 'cd ~/ci/wt/account-deletion-cleanup && source ~/.nvm/nvm.sh && npx tsc -p tsconfig.build.json --noEmit && npm run build && printf "BASELINE_BUILD_OK\n"'
+ssh -n dv@85.192.61.231 'cd ~/ci/wt/account-deletion-cleanup && source ~/.nvm/nvm.sh && npx tsc -p tsconfig.json --noEmit > /tmp/account-deletion-tsc-baseline.log 2>&1; rc=$?; printf "BROAD_TSC_BASELINE_EXIT=%s ERRORS=%s\n" "$rc" "$(grep -c "error TS" /tmp/account-deletion-tsc-baseline.log || true)"'
 ```
 
-Expected: `BASELINE_BUILD_OK`. Контроллер сохраняет команды, SHA и сводки как baseline; никаких live apply/deploy.
+Expected: `BASELINE_BUILD_OK`. На исходном `6654411c` широкий `tsconfig.json` имеет 172 исторические ошибки в unrelated tests/voice-host/product-runner; владелец 11.11 подтвердил продолжение с production gate и normalized delta, а не исправлением чужих ошибок. Финальная проверка сравнивает нормализованный набор ошибок с этим baseline: новых ошибок быть не должно, старый набор не объявляется регрессией feature. Контроллер сохраняет команды, SHA и сводки как baseline; никаких live apply/deploy.
 
 ---
 
@@ -1851,10 +1855,11 @@ Expected: все PG suites PASS, не skipped, `FINAL_PG_OK`.
 - [ ] **Step 3: Type/build/host gates**
 
 ```bash
-ssh -n dv@85.192.61.231 'cd ~/ci/wt/account-deletion-cleanup && source ~/.nvm/nvm.sh && npx tsc -p tsconfig.build.json --noEmit && npx tsc -p tsconfig.json --noEmit && npm run build && cd product-runner && npm ci --no-audit --no-fund && npx tsc -p tsconfig.json --noEmit && npm test -- --runInBand --runTestsByPath src/host/index.spec.ts src/host/purge.spec.ts src/host/sleep.spec.ts && printf "FINAL_BUILD_HOST_OK\n"'
+ssh -n dv@85.192.61.231 'cd ~/ci/wt/account-deletion-cleanup && source ~/.nvm/nvm.sh && npx tsc -p tsconfig.build.json --noEmit && npm run build && cd product-runner && npm ci --no-audit --no-fund && npx tsc -p tsconfig.json --noEmit && npm test -- --runInBand --runTestsByPath src/host/index.spec.ts src/host/purge.spec.ts src/host/sleep.spec.ts && printf "FINAL_BUILD_HOST_OK\n"'
+ssh -n dv@85.192.61.231 'cd ~/ci/wt/account-deletion-cleanup && source ~/.nvm/nvm.sh && npx tsc -p tsconfig.json --noEmit > /tmp/account-deletion-tsc-final.log 2>&1; rc=$?; printf "BROAD_TSC_FINAL_EXIT=%s ERRORS=%s\n" "$rc" "$(grep -c "error TS" /tmp/account-deletion-tsc-final.log || true)"; node -e '"'"'const fs=require("fs"); for (const f of process.argv.slice(1)) { const lines=fs.readFileSync(f,"utf8").split("\n").map((l)=>l.replace(/^(.+?)\(\d+,\d+\): (error TS\d+:.*)$/,"$1: $2")).sort(); fs.writeFileSync(f+".norm",lines.join("\n")+"\n"); }'"'"' /tmp/account-deletion-tsc-baseline.log /tmp/account-deletion-tsc-final.log && diff -u /tmp/account-deletion-tsc-baseline.log.norm /tmp/account-deletion-tsc-final.log.norm'
 ```
 
-Expected: `FINAL_BUILD_HOST_OK`.
+Expected: `FINAL_BUILD_HOST_OK`, production build и product-runner type/tests зелёные. Нормализованный diff широкого `tsconfig.json` пустой: исторические 172 baseline-ошибки не маскируют новые, новых ошибок нет.
 
 - [ ] **Step 4: OWNER GATE A — test deploy с worker disabled**
 
