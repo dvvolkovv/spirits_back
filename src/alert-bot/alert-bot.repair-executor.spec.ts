@@ -144,6 +144,18 @@ describe('AlertBotRepairExecutor', () => {
     return job;
   }
 
+  async function startPreSpawn(kind: 'mark_false' | 'cancel_before_spawn' | 'spawn_throw', job: RepairJobRecord): Promise<string> {
+    if (kind === 'mark_false') jest.spyOn(store, 'markJobRunning').mockResolvedValue(false);
+    if (kind === 'cancel_before_spawn') {
+      jest.spyOn(store, 'requestCancel').mockResolvedValue(false);
+      await executor.stopRepair('repair-1');
+    }
+    if (kind === 'spawn_throw') {
+      jest.spyOn(childProcess, 'spawn').mockImplementation(() => { throw new Error('sync spawn exploded'); });
+    }
+    return executor.start(job.id, 'printf must-not-run');
+  }
+
   it('сохраняет exit/stdout/stderr после асинхронного завершения', async () => {
     const job = await createJob();
     await executor.start(job.id, 'printf out; printf err >&2; exit 7');
@@ -250,6 +262,35 @@ describe('AlertBotRepairExecutor', () => {
     expect(Date.now() - startedAt).toBeLessThan(1_000);
     expect(await store.findJob(job.id)).toMatchObject({ status: 'failed', failureKind: 'spawn_error' });
     await executor.stopAll();
+  });
+
+  it.each(['mark_false', 'cancel_before_spawn', 'spawn_throw'] as const)('%s transient finish error повторяет durable flush', async (kind) => {
+    const job = await createJob();
+    const original = store.finishJob.bind(store);
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    jest.spyOn(store, 'finishJob').mockRejectedValueOnce(new Error('sensitive transient')).mockImplementation(original);
+    const starting = startPreSpawn(kind, job);
+    if (kind === 'spawn_throw') await expect(starting).resolves.toBe(job.id);
+    else await expect(starting).rejects.toThrow('repair_inactive');
+    expect(await executor.wait(job.id, 0.5)).toBe(true);
+    expect(await store.findJob(job.id)).toMatchObject({
+      status: kind === 'spawn_throw' ? 'failed' : 'cancelled',
+      failureKind: kind === 'spawn_throw' ? 'spawn_error' : 'repair_inactive',
+    });
+  });
+
+  it.each(['mark_false', 'cancel_before_spawn', 'spawn_throw'] as const)('%s permanent finish error сохраняет pending и running/queued row', async (kind) => {
+    const job = await createJob();
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    jest.spyOn(store, 'finishJob').mockRejectedValue(new Error('sensitive permanent'));
+    const starting = startPreSpawn(kind, job);
+    if (kind === 'spawn_throw') await expect(starting).resolves.toBe(job.id);
+    else await expect(starting).rejects.toThrow('repair_inactive');
+    expect(await executor.wait(job.id, 0.1)).toBe(false);
+    expect(await store.findJob(job.id)).toMatchObject({ status: kind === 'spawn_throw' ? 'running' : 'queued' });
+    expect((executor as any).processes.get(job.id)?.pending).toMatchObject({
+      status: kind === 'spawn_throw' ? 'failed' : 'cancelled',
+    });
   });
 
   it('async spawn error сохраняет failed/spawn_error без возврата в running', async () => {
