@@ -7,7 +7,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import { turnFsKey, legacyTurnFsKey, uploadFileName, fallbackFileName, sessionOutputDir, ensureSessionDirs, ensureListingGuard } from "./paths.mjs";
+import { turnFsKey, legacyTurnFsKey, uploadFileName, fallbackFileName, sessionOutputDir, ensureSessionDirs, ensureSessionUploadDir, ensureListingGuard, isValidFsKey } from "./paths.mjs";
 import {
   AGENT_MCP_DIR, AGENT_SCRATCH_ROOT, sandboxMode, isCanarySession, buildSandboxSettings,
   baseToolsForTurn, buildTurnEnv, applySandboxPrompt, sandboxFailureFromToolResult,
@@ -550,6 +550,12 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   } else {
     fs.mkdirSync(outDir, { recursive: true });
   }
+  // Вложенный каталог — только для непредсказуемого fs_key от бэка. Legacy
+  // fallback остаётся плоским: его sessionId предсказуем, а scrub/backfill
+  // знают именно прежние плоские пути.
+  const uploadSessionDir = req.files?.length && isValidFsKey(req.body.fs_key)
+    ? await ensureSessionUploadDir(fsKey, { uploads: UPLOAD_DIR })
+    : UPLOAD_DIR;
 
   // Папка хода ДО перехода на fs_key (26.10.2026). Модель может помнить путь
   // к файлу оттуда из истории разговора (ссылка, которую она сама когда-то
@@ -564,12 +570,12 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   const renamedFiles = [];
   if (req.files && req.files.length > 0) {
     for (const f of req.files) {
-      const newPath = path.join(UPLOAD_DIR, uploadFileName(f.originalname, fsKey));
+      const newPath = path.join(uploadSessionDir, uploadFileName(f.originalname, fsKey));
       try {
         fs.renameSync(f.path, newPath);
         renamedFiles.push({ path: newPath, name: f.originalname, size: f.size });
       } catch (e) {
-        const fallback = path.join(UPLOAD_DIR, fallbackFileName(f.originalname, fsKey, randomUUID()));
+        const fallback = path.join(uploadSessionDir, fallbackFileName(f.originalname, fsKey, randomUUID()));
         try {
           fs.renameSync(f.path, fallback);
           renamedFiles.push({ path: fallback, name: f.originalname, size: f.size });
@@ -1415,6 +1421,14 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
       res.end();
     }
   } finally {
+    // Multer записывает исходники до настройки хода. После renameSync их уже
+    // нет (ENOENT); при ранней ошибке удаляем, чтобы ответ 500 не оставлял
+    // сотни мегабайт осиротевших файлов в корне uploads.
+    for (const file of req.files || []) {
+      try { fs.unlinkSync(file.path); } catch (e) {
+        if (e?.code !== "ENOENT") console.log("исходник Multer не удалён: " + (e?.code || e?.name || "?"));
+      }
+    }
     // Общий liveSet и синхронная очистка обоих suffix. Пути уникальны на ход,
     // поэтому finally preempted-запроса не трогает файлы следующего.
     removeSandboxSettings(sessionMcpPath, liveMcpConfigPaths);
