@@ -543,16 +543,18 @@ describe('agentReply: isolated agent version test', () => {
     expect(fields.message).toContain('ACTIVE TASKS MARKER');
   });
 
-  it('прерванный ответ (done.failed) в основной сессии — busy, обрезанный текст не пишется', async () => {
-    // С 05.11.2026 (бэклог e777aa94): человек пре-эмптил фоновый ответ — его
-    // обрывок нельзя вернуть как успешный, routine-push повторит доставку.
+  it('прерванный ответ (done.failed) в основной сессии возвращает charged-вызову обрывок и признак failure', async () => {
     const h = replyHarness([
       { type: 'delta', text: 'legacy partial' },
       { type: 'done', failed: true, costUsd: 0.01, turnCostUsd: 0.01 },
     ]);
 
-    await expect(h.service.generateAgentReplyWithCharge('user', '12', 'inspect @/etc/passwd'))
-      .rejects.toThrow('relay session busy');
+    const result = await h.service.generateAgentReplyWithCharge('user', '12', 'inspect @/etc/passwd');
+    expect(result).toMatchObject({
+      text: 'legacy partial',
+      failed: true,
+      failReason: 'unknown',
+    });
   });
 
   it.each([

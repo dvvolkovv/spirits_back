@@ -311,8 +311,13 @@ export interface AgentReplyOpts {
   billingContext?: string;
 }
 
-export interface ChargedAgentReply {
+export interface AgentReplyOutcome {
   text: string;
+  failed: boolean;
+  failReason?: string;
+}
+
+export interface ChargedAgentReply extends AgentReplyOutcome {
   tokens: number;
   costUsd: number;
   charge: SdkCharge;
@@ -2932,8 +2937,15 @@ ${LanguageService.buildDirective(userLanguage)}`;
   async generateAgentReply(
     userId: string, assistantId: string, message: string, sessionIdOverride?: string, opts: AgentReplyOpts = {},
   ): Promise<string> {
-    const { text } = await this.agentReply(userId, assistantId, message, sessionIdOverride, false, opts);
-    return text;
+    const { text, failed } = await this.agentReply(userId, assistantId, message, sessionIdOverride, false, opts);
+    return failed ? '' : text;
+  }
+
+  async generateAgentReplyOutcome(
+    userId: string, assistantId: string, message: string, sessionIdOverride?: string, opts: AgentReplyOpts = {},
+  ): Promise<AgentReplyOutcome> {
+    const { text, failed, failReason } = await this.agentReply(userId, assistantId, message, sessionIdOverride, false, opts);
+    return { text, failed, failReason };
   }
 
   /**
@@ -3124,6 +3136,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     };
     let costUsd = 0;
     let turnFailed = false;
+    let failReason: string | undefined;
     let gotDone = false;
     const turnCost = new RelayTurnCost();
     // Фоновый ответ БЕЗ своей сессии (рутины, «Путь») пишет в основную сессию
@@ -3136,7 +3149,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // Учёт: relayRunning + activeStreams для всех вызовов, включая голосовые.
     const mainSession = !sessionIdOverride;
     if (mainSession && this.relayRunning.has(relaySid)) {
-      this.logger.log(`agentReply: ${userId}_${assistantId} занята ходом человека — фоновый ответ откладывается`);
+      this.logger.log(`agentReply: фоновый ответ отложен — сессия занята (assistant ${assistantId})`);
       throw new RelaySessionBusyError(relaySid);
     }
     const relayMark = this.beginRelayRun(relaySid);
@@ -3163,7 +3176,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
             else if (ev.type === 'done') {
               gotDone = true;
               // Стоимость и расход — здесь же, где их берёт основной путь.
-              if (ev.failed === true) turnFailed = true;
+              if (ev.failed === true) {
+                turnFailed = true;
+                failReason = typeof ev.failReason === 'string' && ev.failReason.length > 0
+                  ? ev.failReason
+                  : 'unknown';
+              }
               if (typeof ev.costUsd === 'number' && ev.costUsd > 0) costUsd += ev.costUsd;
               turnCost.add(ev);
               if (ev.usage && typeof ev.usage === 'object') {
@@ -3198,10 +3216,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
       this.endStream();
       this.endRelayRun(relaySid, relayMark);
     }
-    if (mainSession && (!gotDone || turnFailed)) {
-      // Человек пре-эмптил фоновый ответ (или релей оборвался): обрезанный
-      // текст нельзя писать в историю как успешный. Просим повторить позже —
-      // routine-push отложит доставку.
+    if (mainSession && !gotDone) {
+      // EOF без done: релей оборвался или человек пре-эмптил фоновый ответ.
+      // Обрезанный текст нельзя писать в историю как успешный. Просим повторить
+      // позже — routine-push отложит доставку.
       throw new RelaySessionBusyError(relaySid);
     }
     const text = this.stripToolTags(chunks.join('')).trim();
@@ -3224,7 +3242,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       else this.logger.log(logLine);
       this.alertTurnCostFloor(userId, assistantId, charge, charge.tokens);
     }
-    return { text, tokens: charge.tokens, costUsd, charge, durationMs: Date.now() - startedAt };
+    return { text, failed: turnFailed, failReason, tokens: charge.tokens, costUsd, charge, durationMs: Date.now() - startedAt };
   }
 
   /** Public wrapper для chat.controller — после upload-and-chat обогащаем профиль + tasks. */
