@@ -470,9 +470,63 @@ describe('account deletion hardening regressions', () => {
     ['EACCES', 'permission'],
     ['EBUSY', 'permission'],
     ['ENOENT', 'not_found'],
-    ['ENOTFOUND', 'not_found'],
+    ['ENOTFOUND', 'external_unknown'],
     ['ETIMEDOUT', 'timeout'],
   ])('классифицирует Node code до SQLSTATE regex: %s', (code, kind) => {
     expect(deletionErrorKind({ code })).toBe(kind);
+  });
+});
+
+describe('account deletion parser regressions', () => {
+  it('нормализует tab в полном URL с userinfo', () => {
+    const fileUrl = `https://user${String.fromCharCode(9)}:${SECRET}@example.com/x`;
+    expect(() => assertSafeJobSpec(job({ fileUrl }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('нормализует newline в credentials query key', () => {
+    const fileUrl = `https://example.com/x?access${String.fromCharCode(10)}_token=${SECRET}`;
+    expect(() => assertSafeJobSpec(job({ fileUrl }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('блокирует credentials query на IPv6 URL', () => {
+    const fileUrl = `https://[::1]/x?access_token=${encodeURIComponent(SECRET)}`;
+    expect(() => assertSafeJobSpec(job({ fileUrl }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('не допускает fail-open для malformed URL с credentials query', () => {
+    const fileUrl = `https://[::1/x?access_token=${encodeURIComponent(SECRET)}`;
+    expect(() => assertSafeJobSpec(job({ fileUrl }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('разрешает публичный IPv6 URL без credentials', () => {
+    expect(() => assertSafeJobSpec(job({
+      fileUrl: 'https://[::1]/public?download=1',
+    }), USER_ID)).not.toThrow();
+  });
+
+  it.each([
+    'adminNote',
+    'noteText',
+    'messageText',
+    'internalComment',
+    'ADMINNOTE',
+    'NOTETEXT',
+    'message_text',
+    'INTERNALCOMMENT',
+  ])('блокирует composite personal-text key: %s', (key) => {
+    expect(() => assertSafeJobSpec(job({ [key]: CANARY }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('не блокирует technical IDs и contentType', () => {
+    expect(() => assertSafeJobSpec(job({
+      messageId: 'message-1',
+      noteId: 'note-1',
+      contentType: 'video/mp4',
+    }), USER_ID)).not.toThrow();
   });
 });
