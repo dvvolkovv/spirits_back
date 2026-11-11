@@ -58,12 +58,22 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     personalClaude: boolean | Error = true,
   ): any => {
     let alertedState = alerted;
+    let atomicProvider: AnswerProvider = switchTo;
     const pg = {
       query: jest.fn(async (sql: string, params?: unknown[]) => {
         if (/SELECT alerted/.test(sql)) return { rows: [{ alerted: alertedState }] };
         if (/INSERT INTO monitor_alert_state/.test(sql)) {
           alertedState = params?.[1] === true;
           return { rows: [] };
+        }
+        if (/llm_settings/.test(sql)) {
+          return {
+            rows: [{
+              global_provider: atomicProvider,
+              personal_claude: personalClaude,
+              present: personalClaude,
+            }],
+          };
         }
         if (/ai_profiles_consolidated/.test(sql)) {
           if (personalClaude instanceof Error) throw personalClaude;
@@ -79,6 +89,7 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     const global = { get: jest.fn(async () => switchTo) };
     const svc = new ClaudeHealthService(pg as any, claudeCli as any, global as any);
     svc.newSwitchProbeCli = jest.fn(() => claudeCli);
+    svc.setAtomicProvider = (provider: AnswerProvider) => { atomicProvider = provider; };
     return svc;
   };
   const sent = (): string[] => (sendTelegramPayload as jest.Mock).mock.calls.map((c) => c[0].text);
@@ -214,6 +225,7 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     );
     (sendTelegramPayload as jest.Mock).mockClear();
     svc.globalProvider.get.mockResolvedValue('claude');
+    svc.setAtomicProvider('claude');
     await svc.maybeAlertOutage();
     expect(sent()).toHaveLength(1);
     expect(sent()[0]).toContain('<b>🔴 Локальный Claude CLI недоступен</b>');
@@ -298,6 +310,7 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     const pending = svc.maybeAlertOutage();
     await new Promise<void>((resolve) => setImmediate(resolve));
     svc.globalProvider.get.mockResolvedValue('claude');
+    svc.setAtomicProvider('claude');
     resolveProbe('ok');
     await pending;
     expect(sent()).toHaveLength(1);
@@ -337,7 +350,7 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     svc.pg.query.mockImplementation(async (sql: string, params?: unknown[]) => {
       if (/ai_profiles_consolidated/.test(sql)) {
         return new Promise((resolve) => {
-          resolvePersonal = () => resolve({ rows: [{ present: false }] });
+          resolvePersonal = () => resolve({ rows: [{ global_provider: 'claude', personal_claude: false, present: false }] });
         });
       }
       return originalQuery(sql, params);
@@ -349,6 +362,7 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     }
     expect(resolvePersonal).toBeDefined();
     svc.globalProvider.get.mockResolvedValue('claude');
+    svc.setAtomicProvider('claude');
     resolvePersonal();
     await pending;
     expect(sent()).toHaveLength(1);
@@ -368,6 +382,7 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     const pending = svc.maybeAlertOutage();
     await new Promise<void>((resolve) => setImmediate(resolve));
     svc.globalProvider.get.mockResolvedValue('qwen');
+    svc.setAtomicProvider('qwen');
     resolveProbe('ok');
     await pending;
     expect(sent()).toHaveLength(1);
@@ -390,6 +405,7 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     const pending = svc.maybeAlertOutage();
     await new Promise<void>((resolve) => setImmediate(resolve));
     svc.globalProvider.get.mockResolvedValue('qwen');
+    svc.setAtomicProvider('qwen');
     resolveProbe('ok');
     await pending;
     expect(sent()).toHaveLength(1);
@@ -400,6 +416,58 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
       expect(sent()[0]).toContain('Маша/VPM/маркетолог снова работают');
     }
     expect(sent()[0]).not.toContain('активная проба Qwen в этом тике не выполнялась');
+  });
+
+  it('cached get()=Kimi, strict SQL=Claude — suppression запрещено', async () => {
+    const svc = make('kimi', healthyOnly('kimi'), false, false);
+    svc.setAtomicProvider('claude');
+    setDown(svc);
+    await svc.maybeAlertOutage();
+    expect(sent()).toHaveLength(1);
+    expect(sent()[0]).toContain('проба без входа');
+  });
+
+  it('ошибка strict SQL — fail-open без fallback к cached Kimi', async () => {
+    const svc = make('kimi', healthyOnly('kimi'), false, false);
+    const originalQuery = svc.pg.query.getMockImplementation()!;
+    svc.pg.query.mockImplementation(async (sql: string, params?: unknown[]) => {
+      if (/llm_settings/.test(sql)) throw new Error('strict read failed');
+      return originalQuery(sql, params);
+    });
+    setDown(svc);
+    await svc.maybeAlertOutage();
+    expect(sent()).toHaveLength(1);
+  });
+
+  it('strict SQL видит личный Claude — suppression запрещено', async () => {
+    const svc = make('kimi', healthyOnly('kimi'), false, false);
+    const originalQuery = svc.pg.query.getMockImplementation()!;
+    svc.pg.query.mockImplementation(async (sql: string, params?: unknown[]) => {
+      if (/llm_settings/.test(sql)) {
+        return { rows: [{ global_provider: 'kimi', personal_claude: true, present: true }] };
+      }
+      return originalQuery(sql, params);
+    });
+    setDown(svc);
+    await svc.maybeAlertOutage();
+    expect(sent()).toHaveLength(1);
+  });
+
+  it('breaker открылся во время strict SQL — виден в синхронном fallbackStats', async () => {
+    const providers = healthyOnly('kimi');
+    const svc = make('kimi', providers, false, false);
+    const originalQuery = svc.pg.query.getMockImplementation()!;
+    svc.pg.query.mockImplementation(async (sql: string, params?: unknown[]) => {
+      if (/llm_settings/.test(sql)) {
+        providers.kimi = downNow();
+        return { rows: [{ global_provider: 'kimi', personal_claude: false, present: false }] };
+      }
+      return originalQuery(sql, params);
+    });
+    setDown(svc);
+    await svc.maybeAlertOutage();
+    expect(sent()).toHaveLength(1);
+    expect(sent()[0]).toContain('но Kimi сейчас «не отвечает»');
   });
 
   it('fallbackAlertLine использует снимок после ожидания пробы', async () => {
