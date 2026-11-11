@@ -192,4 +192,35 @@ describe('маска бота алертов', () => {
       '[id] a***@example.com +7 *** *** 78 api_key=[скрыто]',
     );
   });
+
+  it('маскирует prefixed named-env, quoted значения и URL userinfo целиком', () => {
+    const input = [
+      'export JWT_SECRET="jwt-secret-value"',
+      "DB_PASSWORD='db-password'",
+      "api_key='first second third'",
+      'DATABASE_URL=postgres://user:url-secret@host/db',
+    ].join('; ');
+    const out = maskSecrets(input);
+    for (const secret of ['jwt-secret-value', 'db-password', 'first', 'second', 'third', 'url-secret']) {
+      expect(out).not.toContain(secret);
+      expect(JSON.stringify(maskForModel({ command: input, stdout: input, stderr: input }))).not.toContain(secret);
+      expect(toolText({ command: input })).not.toContain(secret);
+    }
+    expect(out).toContain('export JWT_SECRET=[скрыто]');
+    expect(out).toContain('DB_PASSWORD=[скрыто]');
+    expect(out).toContain('api_key=[скрыто]');
+    expect(out).toContain('DATABASE_URL=[скрыто]');
+    expect(maskSecrets('postgres://user:url-secret@host/db')).toBe('postgres://user:[скрыто]@host/db');
+  });
+
+  it('поддерживает double/single/unquoted named-env и сохраняет пути с UUID', () => {
+    const uuid = '018f2c3a-9d4e-7abc-8def-abcdef123456';
+    const path = '/tmp/7c332707003ac67af11cf1ec081e4744/a.docx';
+    const out = maskSecrets(`API-KEY="double secret"; MY_TOKEN='single secret'; BACKUP_PASSWD=unquoted ${path} ${uuid}`);
+    expect(out).not.toContain('double secret');
+    expect(out).not.toContain('single secret');
+    expect(out).not.toContain('unquoted');
+    expect(out).toContain(path);
+    expect(out).toContain(uuid);
+  });
 });

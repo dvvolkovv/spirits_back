@@ -190,6 +190,23 @@ describe('AlertBotRepairJobs', () => {
     expect(done.command).toBe(maskSecrets(raw));
   });
 
+  it('маскирует named-env и URL secrets в command/stdout/stderr', async () => {
+    const raw = `export JWT_SECRET="jwt-secret-value"; export DB_PASSWORD='db-password'; ` +
+      `printf 'JWT_SECRET=%s\\nDB_PASSWORD=%s\\n' "$JWT_SECRET" "$DB_PASSWORD"; ` +
+      `printf "api_key='first second third'\\nDATABASE_URL=postgres://user:url-secret@host/db" >&2`;
+    const job = await jobs.start(ctx, 'exec', { host: 'prod', command: raw });
+    const done = await jobs.wait(ctx, job.jobId, 2);
+    expect(done.status).toBe('succeeded');
+    const persisted = JSON.stringify([...store.jobs.values()]);
+    for (const secret of ['jwt-secret-value', 'db-password', 'first', 'second', 'third', 'url-secret']) {
+      expect(JSON.stringify(done)).not.toContain(secret);
+      expect(persisted).not.toContain(secret);
+    }
+    expect(done.stdout).toBe('JWT_SECRET=[скрыто]\nDB_PASSWORD=[скрыто]\n');
+    expect(done.stderr).toContain('api_key=[скрыто]');
+    expect(done.stderr).toContain('DATABASE_URL=[скрыто]');
+  });
+
   it('wait сразу возвращает terminal job и не ждёт requested timeout', async () => {
     const job = await jobs.start(ctx, 'exec', { host: 'prod', command: 'printf done' });
     await jobs.wait(ctx, job.jobId, 2);
