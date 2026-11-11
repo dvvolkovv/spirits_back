@@ -162,11 +162,11 @@ async function fixture(t, options = {}) {
     });
     return { response, text: await response.text() };
   };
-  const requestUpload = async (files) => {
+  const requestUpload = async (files, { sessionId = 'server-upload-session', fsKey = FS_KEY } = {}) => {
     const payload = new FormData();
     payload.append('message', 'test uploaded documents');
-    payload.append('sessionId', 'server-upload-session');
-    payload.append('fs_key', FS_KEY);
+    payload.append('sessionId', sessionId);
+    if (fsKey) payload.append('fs_key', fsKey);
     payload.append('noFallback', '1');
     for (const file of files) {
       payload.append('files', new Blob([file.body], {
@@ -423,6 +423,22 @@ for (const mode of ['on', 'off']) {
       assert.ok(prompt.includes(`- ${full} (name: `), full);
       assert.equal(fs.existsSync(full), true);
     }
+  });
+}
+
+for (const legacyKey of ['70000000000_12_ru', 'mcp']) {
+  test(`server on: legacy ${legacyKey} сохраняет плоскую схему загрузок`, async (t) => {
+    const f = await fixture(t);
+    const { response } = await f.requestUpload([
+      { name: 'first.docx', body: 'legacy-document-body' },
+    ], { sessionId: legacyKey, fsKey: null });
+    assert.equal(response.status, 200);
+
+    const flat = path.join(f.dirs.uploadDir, `${legacyKey}_first.docx`);
+    assert.equal(fs.readFileSync(flat, 'utf8'), 'legacy-document-body');
+    assert.equal(fs.existsSync(path.join(f.dirs.uploadDir, legacyKey)), false);
+    assert.ok(f.calls[0].child.input.includes(`- ${flat} (name: `));
+    assert.ok(arg(f.calls[0].args, '--allowedTools').includes(`Read(/tmp/agent-uploads/${legacyKey}_*)`));
   });
 }
 
