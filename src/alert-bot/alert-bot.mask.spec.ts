@@ -209,7 +209,7 @@ describe('маска бота алертов', () => {
     expect(out).toContain('export JWT_SECRET=[скрыто]');
     expect(out).toContain('DB_PASSWORD=[скрыто]');
     expect(out).toContain('api_key=[скрыто]');
-    expect(out).toContain('DATABASE_URL=[скрыто]');
+    expect(out).toContain('DATABASE_URL=postgres://user:[скрыто]@host/db');
     expect(maskSecrets('postgres://user:url-secret@host/db')).toBe('postgres://user:[скрыто]@host/db');
   });
 

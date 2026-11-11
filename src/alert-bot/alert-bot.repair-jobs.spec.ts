@@ -204,7 +204,7 @@ describe('AlertBotRepairJobs', () => {
     }
     expect(done.stdout).toBe('JWT_SECRET=[скрыто]\nDB_PASSWORD=[скрыто]\n');
     expect(done.stderr).toContain('api_key=[скрыто]');
-    expect(done.stderr).toContain('DATABASE_URL=[скрыто]');
+    expect(done.stderr).toContain('DATABASE_URL=postgres://user:[скрыто]@host/db');
   });
 
   it('wait сразу возвращает terminal job и не ждёт requested timeout', async () => {
