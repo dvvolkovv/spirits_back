@@ -117,12 +117,10 @@ export class AlertBotRepairExecutor {
       child.stdin!.on('error', () => undefined);
       child.stdin!.end(rawCommand);
     }
-    if (job.interruptible) {
-      state.timeout = setTimeout(() => {
-        void this.terminate(jobId, 'timeout').catch(() => undefined);
-      }, job.timeoutMs);
-      state.timeout.unref();
-    }
+    state.timeout = setTimeout(() => {
+      void this.terminate(jobId, 'timeout').catch(() => undefined);
+    }, job.timeoutMs);
+    state.timeout.unref();
 
     if (this.isCancelling(job.repairId) && job.interruptible) {
       void this.terminate(jobId, 'cancelled').catch(() => undefined);
@@ -224,7 +222,7 @@ export class AlertBotRepairExecutor {
   private async terminate(jobId: string, outcome: ForcedOutcome): Promise<void> {
     const state = this.processes.get(jobId);
     const child = this.children.get(jobId);
-    if (!state || !child || !state.interruptible) return;
+    if (!state || !child || (!state.interruptible && outcome !== 'timeout')) return;
     if (!state.finished && !state.outcome) {
       state.outcome = outcome;
       this.signalGroup(child, 'SIGTERM');
