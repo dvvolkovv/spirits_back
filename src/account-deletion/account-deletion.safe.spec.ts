@@ -7,6 +7,7 @@ import {
   DeletionRetryError,
   accountDeletionWorkerEnabled,
   assertSafeJobSpec,
+  assertSafeSkip,
   deletionErrorKind,
   deletionResourceHash,
   retryDelayMs,
@@ -14,9 +15,11 @@ import {
 } from './account-deletion.safe';
 import type {
   AccountDeletionAdapter,
+  DeletionErrorKind,
   DeletionJobSpec,
   DeletionResourceType,
   DeletionSkip,
+  DeletionSkipReason,
 } from './account-deletion.types';
 
 const ALL_DELETION_RESOURCE_TYPES = [
@@ -81,7 +84,46 @@ type ExtraDeletionResourceType = AssertNever<
 const invalidDeletionResourceType: DeletionResourceType = 'account.core.purge.typo';
 void invalidDeletionResourceType;
 
+const ALL_DELETION_ERROR_KINDS = [
+  'timeout',
+  'external_5xx',
+  'external_4xx',
+  'not_found',
+  'permission',
+  'rate_limited',
+  'db',
+  'external_unknown',
+  'owner_unverifiable',
+  'unsupported_external',
+  'cancelled',
+] as const satisfies readonly DeletionErrorKind[];
+type KnownDeletionErrorKind = typeof ALL_DELETION_ERROR_KINDS[number];
+type MissingDeletionErrorKind = AssertNever<
+  Exclude<DeletionErrorKind, KnownDeletionErrorKind>
+>;
+type ExtraDeletionErrorKind = AssertNever<
+  Exclude<KnownDeletionErrorKind, DeletionErrorKind>
+>;
+
+const ALL_DELETION_SKIP_REASONS = [
+  'owner_unverifiable',
+  'unsupported_external',
+  'external_note_id_unavailable',
+] as const satisfies readonly DeletionSkipReason[];
+type KnownDeletionSkipReason = typeof ALL_DELETION_SKIP_REASONS[number];
+type MissingDeletionSkipReason = AssertNever<
+  Exclude<DeletionSkipReason, KnownDeletionSkipReason>
+>;
+type ExtraDeletionSkipReason = AssertNever<
+  Exclude<KnownDeletionSkipReason, DeletionSkipReason>
+>;
+
+// @ts-expect-error Сырой provider message не входит в безопасный skip contract.
+const invalidDeletionSkipReason: DeletionSkipReason = 'raw provider message';
+void invalidDeletionSkipReason;
+
 const CANARY = 'ЛИЧНЫЙ-ТЕКСТ';
+const SECRET = 'СЕКРЕТ-НЕ-ЛОГИРОВАТЬ';
 const USER_ID = '79000000001';
 
 function job(payload: Record<string, unknown>, resourceKey = 'abc') {
@@ -222,5 +264,93 @@ describe('account deletion safety', () => {
     expect(Object.keys(cancelled)).toEqual(['kind']);
     expect(retry.message).not.toContain(CANARY);
     expect(cancelled.message).not.toContain(CANARY);
+  });
+});
+
+describe('account deletion quality regressions', () => {
+  it.each(ALL_DELETION_ERROR_KINDS)('сохраняет безопасный kind после round-trip: %s', (kind) => {
+    const error = kind === 'cancelled'
+      ? new DeletionCancelledError()
+      : new DeletionRetryError(kind);
+    expect(deletionErrorKind(error)).toBe(kind);
+    expect(deletionErrorKind({ kind })).toBe(kind);
+  });
+
+  it('отклоняет userId в resourceKey как unsafe_payload без canary', () => {
+    const check = () => assertSafeJobSpec(job({}, USER_ID), USER_ID);
+    expect(check).toThrow(/^unsafe_payload$/);
+    expect(check).not.toThrow(USER_ID);
+  });
+
+  it.each([
+    'credentialsUrl',
+    'credentials_url',
+    'accessToken',
+    'ACCESS_TOKEN',
+    'refreshToken',
+    'refresh_token',
+    'clientSecret',
+    'client_secret_enc',
+    'apiSecret',
+    'awsSecretAccessKey',
+    'TeXt',
+    'Password',
+    'composed_PLAN',
+  ])('отклоняет case-insensitive secret/credential variant: %s', (key) => {
+    expect(() => assertSafeJobSpec(
+      job({ nested: [{ [key]: SECRET }] }),
+      USER_ID,
+    )).toThrow(/^unsafe_payload$/);
+  });
+
+  it('отклоняет FoundFile даже после удаления текстового поля', () => {
+    expect(() => assertSafeJobSpec(job({
+      FoundFile: {
+        file: { key: 'chat/file.pdf' },
+        createdAt: '2026-11-01T00:00:00Z',
+        messageId: 1,
+      },
+    }), USER_ID)).toThrow(/^unsafe_payload$/);
+  });
+
+  it('отклоняет URL с password в любом техническом payload поле', () => {
+    expect(() => assertSafeJobSpec(job({
+      file: { fileUrl: `https://user:${SECRET}@example.com/private` },
+    }), USER_ID)).toThrow(/^unsafe_payload$/);
+  });
+
+  it('не блокирует технические IDs и публичный URL', () => {
+    expect(() => assertSafeJobSpec(job({
+      voiceId: 'voice-1',
+      externalBotId: 'bot-1',
+      productId: 'product-1',
+      fileUrl: 'https://example.com/public',
+    }), USER_ID)).not.toThrow();
+  });
+
+  it.each(ALL_DELETION_SKIP_REASONS)('принимает безопасный skip reason', (reason) => {
+    expect(() => assertSafeSkip({ resourceType: 'calendar.external', reason })).not.toThrow();
+  });
+
+  it.each([
+    CANARY,
+    USER_ID,
+    `request failed: ${CANARY}`,
+    'https://user:password@example.com/private',
+  ])('отклоняет arbitrary skip reason без раскрытия исходной строки', (reason) => {
+    const skip = { resourceType: 'calendar.external', reason } as DeletionSkip;
+    expect(() => assertSafeSkip(skip)).toThrow(/^unsafe_skip_reason$/);
+  });
+
+  it.each([
+    [429, 'rate_limited'],
+    [401, 'permission'],
+    [403, 'permission'],
+    [500, 'external_5xx'],
+    [503, 'external_5xx'],
+    [400, 'external_4xx'],
+    [418, 'external_4xx'],
+  ])('классифицирует AWS httpStatusCode как response.status: %s', (status, kind) => {
+    expect(deletionErrorKind({ $metadata: { httpStatusCode: status } })).toBe(kind);
   });
 });
