@@ -120,11 +120,11 @@ child.stdin = new Writable({
 - [ ] **Step 2: Add a multipart helper beside the existing JSON request helper**
 
 ```js
-const requestUpload = async (files) => {
+const requestUpload = async (files, { sessionId = 'server-upload-session', fsKey = FS_KEY } = {}) => {
   const payload = new FormData();
   payload.append('message', 'test uploaded documents');
-  payload.append('sessionId', 'server-upload-session');
-  payload.append('fs_key', FS_KEY);
+  payload.append('sessionId', sessionId);
+  if (fsKey) payload.append('fs_key', fsKey);
   payload.append('noFallback', '1');
   for (const file of files) {
     payload.append('files', new Blob([file.body], {
@@ -229,10 +229,15 @@ Add `ensureSessionUploadDir` to the import from `./paths.mjs` in `server.mjs`.
 Immediately after the `if (sbxOn) { ... } else { ... }` block that creates `outDir`, add:
 
 ```js
-const uploadSessionDir = await ensureSessionUploadDir(fsKey, { uploads: UPLOAD_DIR });
+// Вложенный каталог — только для непредсказуемого fs_key от бэка. Legacy
+// fallback остаётся плоским: его sessionId предсказуем, а scrub/backfill
+// знают именно прежние плоские пути.
+const uploadSessionDir = req.files?.length && req.body.fs_key === fsKey
+  ? await ensureSessionUploadDir(fsKey, { uploads: UPLOAD_DIR })
+  : UPLOAD_DIR;
 ```
 
-This runs for `on`, `canary`, and `off` before `renamedFiles` is populated.
+The directory is created only for multipart with a valid server `fs_key`. Text turns and legacy fallback keep the previous root behavior; this also prevents predictable legacy directories, scrub/mask regressions, and the reserved `mcp` directory collision.
 
 - [ ] **Step 3: Change only the parent directory of primary and fallback names**
 
@@ -247,6 +252,70 @@ const fallback = path.join(uploadSessionDir, fallbackFileName(f.originalname, fs
 ```
 
 Do not move old files, change output directories, alter prompt formatting, or add filename-decoding changes.
+
+- [ ] **Step 3A: Clean only Multer source paths in the common finally**
+
+Add this loop before the existing settings cleanup in `server.mjs`:
+
+```js
+// Multer записывает исходники до настройки хода. После renameSync их уже
+// нет (ENOENT); при ранней ошибке удаляем, чтобы ответ 500 не оставлял
+// сотни мегабайт осиротевших файлов в корне uploads.
+for (const file of req.files || []) {
+  try { fs.unlinkSync(file.path); } catch (e) {
+    if (e?.code !== "ENOENT") console.log("исходник Multer не удалён: " + (e?.code || e?.name || "?"));
+  }
+}
+```
+
+`ENOENT` after a successful rename is expected. Any pre-existing conflict file is not in `req.files` and must remain untouched.
+
+- [ ] **Step 3B: Keep review regression tests beside the two-mode test**
+
+`requestUpload` accepts `{ sessionId = 'server-upload-session', fsKey = FS_KEY } = {}` and appends `fs_key` only when `fsKey` is truthy. The following cases must be red before the implementation and green afterward:
+
+```js
+for (const legacyKey of ['70000000000_12_ru', 'mcp']) {
+  test(`server on: legacy ${legacyKey} сохраняет плоскую схему загрузок`, async (t) => {
+    const f = await fixture(t);
+    const { response } = await f.requestUpload([
+      { name: 'first.docx', body: 'legacy-document-body' },
+    ], { sessionId: legacyKey, fsKey: null });
+    assert.equal(response.status, 200);
+    const flat = path.join(f.dirs.uploadDir, `${legacyKey}_first.docx`);
+    assert.equal(fs.readFileSync(flat, 'utf8'), 'legacy-document-body');
+    assert.equal(fs.existsSync(path.join(f.dirs.uploadDir, legacyKey)), false);
+    assert.ok(f.calls[0].child.input.includes(`- ${flat} (name: `));
+    assert.ok(arg(f.calls[0].args, '--allowedTools').includes(`Read(${f.dirs.uploadDir}/${legacyKey}_*)`));
+  });
+}
+
+test('server off: текстовый ход без вложений не обращается к каталогу загрузок', async (t) => {
+  const f = await fixture(t, { mode: 'off' });
+  const conflict = path.join(f.dirs.uploadDir, FS_KEY);
+  fs.writeFileSync(conflict, 'not-a-directory');
+  const { response } = await f.request();
+  assert.equal(response.status, 200);
+  assert.equal(f.calls.length, 1);
+  assert.equal(fs.readFileSync(conflict, 'utf8'), 'not-a-directory');
+});
+
+test('server off: ошибка создания каталога очищает исходные Multer temp', async (t) => {
+  const f = await fixture(t, { mode: 'off' });
+  const conflict = path.join(f.dirs.uploadDir, FS_KEY);
+  fs.writeFileSync(conflict, 'not-a-directory');
+  const { response } = await f.requestUpload([
+    { name: 'first.docx', body: 'first-document-body' },
+    { name: 'second.docx', body: 'second-document-body' },
+  ]);
+  assert.equal(response.status, 500);
+  assert.equal(f.calls.length, 0);
+  assert.deepEqual(fs.readdirSync(f.dirs.uploadDir).sort(), [FS_KEY]);
+  assert.equal(fs.readFileSync(conflict, 'utf8'), 'not-a-directory');
+});
+```
+
+The legacy tests fail because the flat file is absent; the text test returns 500 instead of 200; the Multer test shows two extra source files. After the fix, all 19 tests in `server-sandbox.test.mjs` pass.
 
 - [ ] **Step 4: Commit, publish, and verify the regression is green**
 
