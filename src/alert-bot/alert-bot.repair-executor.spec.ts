@@ -275,6 +275,27 @@ describe('AlertBotRepairExecutor', () => {
     expect(await store.findJob(job.id)).toMatchObject({ status: 'succeeded', stdout: 'survived' });
   });
 
+  it('rejected secondary findRepair не теряет jobId и отменяет interruptible', async () => {
+    const job = await createJob();
+    jest.spyOn(store, 'findRepair').mockRejectedValue(new Error('sensitive secondary failure'));
+    const log = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    await expect(executor.start(job.id, 'sleep 30')).resolves.toBe(job.id);
+    await executor.wait(job.id, 2);
+    expect(await store.findJob(job.id)).toMatchObject({ status: 'cancelled' });
+    expect(log).toHaveBeenCalledWith('repair_secondary_check_failed');
+    expect(JSON.stringify(log.mock.calls)).not.toContain('sensitive');
+  });
+
+  it('rejected secondary findRepair не останавливает noninterruptible после spawn', async () => {
+    const job = await createJob({ interruptible: false });
+    jest.spyOn(store, 'findRepair').mockRejectedValue(new Error('sensitive secondary failure'));
+    const log = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    await expect(executor.start(job.id, 'printf survived-secondary')).resolves.toBe(job.id);
+    await executor.wait(job.id, 2);
+    expect(await store.findJob(job.id)).toMatchObject({ status: 'succeeded', stdout: 'survived-secondary' });
+    expect(JSON.stringify(log.mock.calls)).not.toContain('sensitive');
+  });
+
   it('stopRepair до start сохраняет cancellation marker даже при отказе requestCancel', async () => {
     const job = await createJob();
     jest.spyOn(store, 'requestCancel').mockResolvedValue(false);
