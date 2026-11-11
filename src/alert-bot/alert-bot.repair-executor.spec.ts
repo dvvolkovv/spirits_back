@@ -171,6 +171,28 @@ describe('AlertBotRepairExecutor', () => {
     expect(() => process.kill(-spawned[0].pid!, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
   });
 
+  it('timeout применяется и к noninterruptible job', async () => {
+    const spawned: childProcess.ChildProcess[] = [];
+    const realSpawn = childProcess.spawn;
+    jest.spyOn(childProcess, 'spawn').mockImplementation((...args: any[]) => {
+      const child = realSpawn(...args as [any, any, any]);
+      spawned.push(child);
+      return child as any;
+    });
+    const job = await createJob({ interruptible: false, timeoutMs: 50 });
+    try {
+      await executor.start(job.id, 'sleep 30');
+      await executor.wait(job.id, 0.2);
+      expect(await store.findJob(job.id)).toMatchObject({ status: 'timeout' });
+    } finally {
+      if (spawned[0]?.pid) {
+        try { process.kill(-spawned[0].pid, 'SIGKILL'); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+      }
+      await executor.wait(job.id, 2);
+    }
+  });
+
   it('output ограничен 64 КБ и сохраняет UTF-8', async () => {
     const job = await createJob();
     await executor.start(job.id, "node -e \"process.stdout.write('я'.repeat(70000))\"");
