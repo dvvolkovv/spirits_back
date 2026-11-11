@@ -12,13 +12,81 @@ import {
   retryDelayMs,
   safeDeletionMessage,
 } from './account-deletion.safe';
+import type {
+  AccountDeletionAdapter,
+  DeletionJobSpec,
+  DeletionResourceType,
+  DeletionSkip,
+} from './account-deletion.types';
+
+const ALL_DELETION_RESOURCE_TYPES = [
+  'account.core.immediate',
+  'account.core.purge',
+  'routine.stop',
+  'routine.purge',
+  'push.purge',
+  'telegram.stop',
+  'telegram.purge',
+  'custom-agent.purge',
+  'product.stop',
+  'product.purge',
+  'calendar.stop',
+  'calendar.purge',
+  'calendar.external',
+  'integration.apple.stop',
+  'integration.zoom.stop',
+  'integration.talerid.stop',
+  'voice.stop',
+  'voice.purge',
+  'voice-document.purge',
+  'chat-file.purge',
+  'image.purge',
+  'video-job.purge',
+  'video.provider',
+  'speech.purge',
+  'listen.purge',
+  'avatar.purge',
+  'elevenlabs-voice.purge',
+  'events.purge',
+  'tasks.stop',
+  'tasks.purge',
+  'support.stop',
+  'support.purge',
+  'peer.stop',
+  'peer.purge',
+  'contacts.purge',
+  'referral.stop',
+  'referral.purge',
+  'retention.stop',
+  'profile-backup.purge',
+  'devices.purge',
+  'guest-carry.stop',
+  'guest.purge',
+  'auth-verification.stop',
+  'legacy-auth.purge',
+  'legacy-smm.stop',
+  'legacy-smm.purge',
+] as const satisfies readonly DeletionResourceType[];
+
+type KnownDeletionResourceType = typeof ALL_DELETION_RESOURCE_TYPES[number];
+type AssertNever<T extends never> = T;
+type MissingDeletionResourceType = AssertNever<
+  Exclude<DeletionResourceType, KnownDeletionResourceType>
+>;
+type ExtraDeletionResourceType = AssertNever<
+  Exclude<KnownDeletionResourceType, DeletionResourceType>
+>;
+
+// @ts-expect-error Опечатка не входит в исчерпывающий deletion contract.
+const invalidDeletionResourceType: DeletionResourceType = 'account.core.purge.typo';
+void invalidDeletionResourceType;
 
 const CANARY = 'ЛИЧНЫЙ-ТЕКСТ';
 const USER_ID = '79000000001';
 
 function job(payload: Record<string, unknown>, resourceKey = 'abc') {
   return {
-    resourceType: 'chat-file.purge',
+    resourceType: 'chat-file.purge' as const,
     resourceKey,
     phase: 'purge' as const,
     payload,
@@ -26,6 +94,24 @@ function job(payload: Record<string, unknown>, resourceKey = 'abc') {
 }
 
 describe('account deletion safety', () => {
+  it('фиксирует полный resource type contract во всех публичных полях', () => {
+    const validJob: DeletionJobSpec = job({});
+    const validSkip: DeletionSkip = {
+      resourceType: 'calendar.external',
+      reason: 'owner_unverifiable',
+    };
+    const adapter: AccountDeletionAdapter = {
+      resourceTypes: ALL_DELETION_RESOURCE_TYPES,
+      execute: async () => undefined,
+    };
+
+    expect(ALL_DELETION_RESOURCE_TYPES).toHaveLength(46);
+    expect(new Set(ALL_DELETION_RESOURCE_TYPES).size).toBe(46);
+    expect(validJob.resourceType).toBe('chat-file.purge');
+    expect(validSkip.resourceType).toBe('calendar.external');
+    expect(adapter.resourceTypes).toBe(ALL_DELETION_RESOURCE_TYPES);
+  });
+
   it('отклоняет личный текст без раскрытия canary', () => {
     expect(() => assertSafeJobSpec(job({ text: CANARY }), USER_ID)).toThrow(/^unsafe_payload$/);
   });
