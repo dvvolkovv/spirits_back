@@ -64,6 +64,8 @@ export interface CliSwitchState {
   switchProvider: AnswerProvider;
   enabled: boolean;
   down: boolean;
+  /** Контрольная проба не удалась; реальный breaker и routing не менялись. */
+  probeFailed?: boolean;
 }
 
 /** Маша, TG-боты и фоновые задачи сейчас отвечают через модель рубильника, а не через Claude CLI. */
@@ -84,6 +86,9 @@ const CLI_PATH_USERS = 'Маша, TG-боты, Виртуальный PM, Вир
  */
 export function cliOutageAffectedText(s: CliSwitchState): string {
   const label = PROVIDER_LABELS[s.switchProvider];
+  if (s.probeFailed && s.switchProvider !== 'claude') {
+    return `Затронуто: <b>${CLI_PATH_USERS}</b> (CLI-путь на OAuth-подписке) — контрольная проба ${label} не удалась; breaker и маршрутизация рабочих вызовов не изменялись.`;
+  }
   if (switchCarriesCliPath(s)) {
     return `Затронуто: пробы мониторинга, личный выбор Claude и запасной путь — рубильник сейчас на <b>${label}</b>: Маша, TG-боты и фоновые задачи отвечают через эту модель.`;
   }
@@ -104,6 +109,10 @@ export function cliOutageAffectedText(s: CliSwitchState): string {
 export function cliRecoveredText(a: CliSwitchState & { checkedAt: string | null; latencyMs: number | null }): string {
   const head = '<b>🟢 Локальный Claude CLI восстановлен</b>\n';
   const check = `проверка: ${a.checkedAt || '—'}, ${a.latencyMs ?? '—'}мс`;
+  if (a.probeFailed && a.switchProvider !== 'claude') {
+    const label = PROVIDER_LABELS[a.switchProvider];
+    return `${head}Claude снова отвечает (${check}), но контрольная проба ${label} не удалась; breaker и маршрутизация рабочих вызовов не изменялись.`;
+  }
   if (switchCarriesCliPath(a)) {
     const label = PROVIDER_LABELS[a.switchProvider];
     return `${head}Claude снова отвечает (${check}): пробы мониторинга, личный выбор Claude, запасной путь. Маша, TG-боты и фоновые задачи сейчас идут через ${label} (рубильник).\nВернуть рубильник на Claude: Админка → Ассистенты.`;

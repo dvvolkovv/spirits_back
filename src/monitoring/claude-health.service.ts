@@ -372,15 +372,22 @@ export class ClaudeHealthService implements OnModuleInit {
   // cost30dUsd считается в refresh() и отдаётся в overview, а панель мониторинга
   // красит её по ALERT_THRESHOLD_30D_USD. Пропала только рассылка в Telegram.
 
+  /** Отдельный instance без PG: markUp и события пробы не меняют рабочий breaker/статистику. */
+  private newSwitchProbeCli(): ClaudeCliService {
+    return new ClaudeCliService();
+  }
+
   /** Свежая проверка выбранного рубильником провайдера; сырой текст CLI не логируем. */
   private async probeSwitchProvider(provider: FallbackProvider): Promise<boolean> {
     try {
-      const text = await this.claudeCli.text('Reply with exactly: ok', {
+      const text = await this.newSwitchProbeCli().text('Reply with exactly: ok', {
         provider,
         providerChoice: 'global',
         noFallback: true,
         model: 'claude-haiku-4-5',
         timeoutMs: 30_000,
+        isolatedCwd: true,
+        noSessionPersistence: true,
       });
       if (typeof text === 'string' && text.trim().length > 0 && !looksLikeCliRefusal(text)) return true;
       const kind = classifyLlmError(typeof text === 'string' ? text : '').kind;
@@ -443,11 +450,18 @@ export class ClaudeHealthService implements OnModuleInit {
 
     const stats = this.claudeCli.fallbackStats(now.getTime());
     const sw = await this.switchState(stats, now.getTime());
-    let effectiveSw = sw;
+    let effectiveSw: CliSwitchState = sw;
     let globalAlive = false;
     if (sw.switchProvider !== 'claude' && switchCarriesCliPath(sw)) {
-      globalAlive = await this.probeSwitchProvider(sw.switchProvider);
-      if (!globalAlive) effectiveSw = { ...sw, down: true };
+      const probedProvider = sw.switchProvider;
+      const probeOk = await this.probeSwitchProvider(probedProvider);
+      const afterNow = Date.now();
+      const afterSw = await this.switchState(this.claudeCli.fallbackStats(afterNow), afterNow);
+      effectiveSw = afterSw;
+      globalAlive = probeOk && afterSw.switchProvider === probedProvider && switchCarriesCliPath(afterSw);
+      if (!globalAlive && afterSw.switchProvider === probedProvider && !afterSw.down && !probeOk) {
+        effectiveSw = { ...afterSw, probeFailed: true };
+      }
     }
     if (globalAlive && !(await this.hasPersonalClaude())) {
       // Подавляем только после свежего успешного ответа общего провайдера.
