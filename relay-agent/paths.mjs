@@ -45,10 +45,14 @@ export function sessionFsKey(sessionId, fallback) {
 // src/chat/relay-linkeon-guard.spec.ts.
 const FS_KEY_RE = /^[0-9a-f]{32}$/;
 
+export function isValidFsKey(value) {
+  return typeof value === "string" && FS_KEY_RE.test(value);
+}
+
 // Ключ папки хода: fs_key, если бэк его прислал и он корректен, иначе —
 // прежний, из sessionId (старый бэк, анонимные и служебные ходы).
 export function turnFsKey(fsKeyFromBackend, sessionId, fallback) {
-  if (typeof fsKeyFromBackend === "string" && FS_KEY_RE.test(fsKeyFromBackend)) return fsKeyFromBackend;
+  if (isValidFsKey(fsKeyFromBackend)) return fsKeyFromBackend;
   return sessionFsKey(sessionId, fallback);
 }
 
@@ -57,7 +61,7 @@ export function turnFsKey(fsKeyFromBackend, sessionId, fallback) {
 // прислан — ход и так пишет в прежнюю). Модель может помнить путь к файлу
 // оттуда из истории разговора, поэтому server.mjs снимает и диффит обе папки.
 export function legacyTurnFsKey(fsKeyFromBackend, sessionId) {
-  if (typeof fsKeyFromBackend !== "string" || !FS_KEY_RE.test(fsKeyFromBackend)) return null;
+  if (!isValidFsKey(fsKeyFromBackend)) return null;
   const legacy = sessionFsKey(sessionId, null);
   return legacy && legacy !== fsKeyFromBackend ? legacy : null;
 }

@@ -7,7 +7,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import { turnFsKey, legacyTurnFsKey, uploadFileName, fallbackFileName, sessionOutputDir, ensureSessionDirs, ensureSessionUploadDir, ensureListingGuard } from "./paths.mjs";
+import { turnFsKey, legacyTurnFsKey, uploadFileName, fallbackFileName, sessionOutputDir, ensureSessionDirs, ensureSessionUploadDir, ensureListingGuard, isValidFsKey } from "./paths.mjs";
 import {
   AGENT_MCP_DIR, AGENT_SCRATCH_ROOT, sandboxMode, isCanarySession, buildSandboxSettings,
   baseToolsForTurn, buildTurnEnv, applySandboxPrompt, sandboxFailureFromToolResult,
@@ -553,7 +553,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   // Вложенный каталог — только для непредсказуемого fs_key от бэка. Legacy
   // fallback остаётся плоским: его sessionId предсказуем, а scrub/backfill
   // знают именно прежние плоские пути.
-  const uploadSessionDir = req.files?.length && req.body.fs_key === fsKey
+  const uploadSessionDir = req.files?.length && isValidFsKey(req.body.fs_key)
     ? await ensureSessionUploadDir(fsKey, { uploads: UPLOAD_DIR })
     : UPLOAD_DIR;
 
