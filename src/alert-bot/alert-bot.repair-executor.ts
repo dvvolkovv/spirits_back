@@ -2,7 +2,7 @@ import * as childProcess from 'child_process';
 import { ChildProcess } from 'child_process';
 import { StringDecoder } from 'string_decoder';
 import { maskSecrets } from './alert-bot.mask';
-import { RepairJobRecord, RepairStore } from './alert-bot.repair-store';
+import { FinishRepairJobResult, RepairJobRecord, RepairStore } from './alert-bot.repair-store';
 
 const TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'timeout', 'cancelled', 'interrupted']);
 const MAX_OUTPUT_BYTES = 65_536;
@@ -17,6 +17,8 @@ interface ProcessState {
   stderrDecoder: StringDecoder;
   outcome: ForcedOutcome | null;
   finished: boolean;
+  pending: FinishRepairJobResult | null;
+  flushing: Promise<boolean> | null;
   timeout: NodeJS.Timeout | null;
   killTimer: NodeJS.Timeout | null;
   completion: Promise<void>;
@@ -50,6 +52,10 @@ export class AlertBotRepairExecutor {
   async start(jobId: string, rawCommand: string): Promise<string> {
     const job = await this.store.findJob(jobId);
     if (!job) throw new Error('job_not_found');
+    if (this.processes.has(jobId)) {
+      await this.flushTerminal(jobId);
+      return jobId;
+    }
     const previous = this.repairChains.get(job.repairId) ?? Promise.resolve();
     const setup = previous.then(() => this.startRegistered(job, rawCommand));
     this.repairChains.set(job.repairId, setup.then(() => undefined, () => undefined));
@@ -93,6 +99,8 @@ export class AlertBotRepairExecutor {
       stderrDecoder: new StringDecoder('utf8'),
       outcome: null,
       finished: false,
+      pending: null,
+      flushing: null,
       timeout: null,
       killTimer: null,
       completion,
@@ -148,6 +156,7 @@ export class AlertBotRepairExecutor {
   }
 
   async wait(jobId: string, waitSeconds: number): Promise<boolean> {
+    if (this.processes.get(jobId)?.pending) await this.flushTerminal(jobId);
     const initial = await this.store.findJob(jobId);
     if (!initial) return false;
     if (TERMINAL_STATUSES.has(initial.status)) return true;
@@ -175,6 +184,7 @@ export class AlertBotRepairExecutor {
       }).catch(done);
     });
 
+    if (this.processes.get(jobId)?.pending) await this.flushTerminal(jobId);
     const current = await this.store.findJob(jobId);
     return Boolean(current && TERMINAL_STATUSES.has(current.status));
   }
@@ -260,21 +270,57 @@ export class AlertBotRepairExecutor {
     state.finished = true;
     if (state.timeout) clearTimeout(state.timeout);
     if (state.killTimer) clearTimeout(state.killTimer);
-    try {
-      await this.store.finishJob(jobId, {
-        status,
-        exitCode,
-        stdout: appendCapped('', maskSecrets(state.stdout)),
-        stderr: appendCapped('', maskSecrets(state.stderr)),
-        failureKind: failureKind ?? null,
-      });
-    } finally {
-      state.complete();
-      this.wake(jobId);
-      this.children.delete(jobId);
-      this.repairs.delete(jobId);
-      this.processes.delete(jobId);
+    state.pending = {
+      status,
+      exitCode,
+      stdout: appendCapped('', maskSecrets(state.stdout)),
+      stderr: appendCapped('', maskSecrets(state.stderr)),
+      failureKind: failureKind ?? null,
+    };
+    try { await this.flushTerminal(jobId); }
+    finally { state.complete(); }
+  }
+
+  private flushTerminal(jobId: string): Promise<boolean> {
+    const state = this.processes.get(jobId);
+    if (!state?.pending) return Promise.resolve(false);
+    if (state.flushing) return state.flushing;
+    const flushing = this.flushPending(jobId, state);
+    state.flushing = flushing;
+    void flushing.then(() => {
+      if (state.flushing === flushing) state.flushing = null;
+    });
+    return flushing;
+  }
+
+  private async flushPending(jobId: string, state: ProcessState): Promise<boolean> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      let applied = false;
+      try { applied = await this.store.finishJob(jobId, state.pending!); }
+      catch { console.error('repair_finish_failed'); }
+      if (applied) {
+        this.confirmTerminal(jobId);
+        return true;
+      }
+      try {
+        const fresh = await this.store.findJob(jobId);
+        if (fresh && TERMINAL_STATUSES.has(fresh.status)) {
+          this.confirmTerminal(jobId);
+          return true;
+        }
+      } catch { console.error('repair_finish_check_failed'); }
+      if (attempt < 2) await new Promise<void>((resolve) => setTimeout(resolve, 5));
     }
+    return false;
+  }
+
+  private confirmTerminal(jobId: string): void {
+    const state = this.processes.get(jobId);
+    if (state) state.pending = null;
+    this.children.delete(jobId);
+    this.repairs.delete(jobId);
+    this.processes.delete(jobId);
+    this.wake(jobId);
   }
 
   private wake(jobId: string): void {
