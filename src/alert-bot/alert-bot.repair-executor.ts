@@ -251,6 +251,7 @@ export class AlertBotRepairExecutor {
     this.stoppingAll = true;
     for (const repairId of this.repairChains.keys()) this.cancellingRepairs.add(repairId);
     for (const repairId of this.repairs.values()) this.cancellingRepairs.add(repairId);
+    for (const jobId of [...this.waiters.keys()]) this.wake(jobId);
     await Promise.all([...this.repairChains.values()]);
     const jobs = [...this.processes.entries()]
       .filter(([, state]) => state.interruptible && !state.finished)
