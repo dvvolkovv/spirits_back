@@ -48,7 +48,10 @@ export class AlertBotRepairJobs {
       interruptible: args.interruptible === true,
       timeoutMs: timeoutMs(args.timeout_ms),
     });
-    if (!created) throw new Error('job_already_active');
+    if (!created) {
+      if (!await this.store.isActiveRepair(ctx)) throw new Error('repair_inactive');
+      throw new Error('job_already_active');
+    }
     await this.executor.start(created.id, rawCommand);
     return { jobId: created.id };
   }
