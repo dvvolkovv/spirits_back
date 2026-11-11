@@ -1,4 +1,4 @@
-import { maskForModel, maskText, toolText, userLabel } from './alert-bot.mask';
+import { maskForModel, maskSecrets, maskText, toolText, userLabel } from './alert-bot.mask';
 
 describe('маска бота алертов', () => {
   beforeEach(() => { process.env.RELAY_FS_SALT = 'spec-salt'; });
@@ -169,5 +169,27 @@ describe('маска бота алертов', () => {
     const jwt = `eyJ${'A'.repeat(8)}.${'B'.repeat(8)}.${'C'.repeat(7)}-`;
     expect(maskText(jwt)).toBe('[скрыто]');
     expect(maskText(`Bearer ${jwt}`)).toBe('Bearer [скрыто]');
+  });
+
+  it('maskSecrets маскирует Bearer, api_key и Telegram token', () => {
+    expect(maskSecrets('Bearer abc.def.ghi')).toBe('Bearer [скрыто]');
+    expect(maskSecrets('api_key=REAL_SECRET')).toBe('api_key=[скрыто]');
+    expect(maskSecrets('123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefg')).toBe('[скрыто]');
+  });
+
+  it('maskSecrets не маскирует UUID, long hex, email и phone', () => {
+    const uuid = '018f2c3a-9d4e-7abc-8def-abcdef123456';
+    const path = '/tmp/7c332707003ac67af11cf1ec081e4744/a.docx';
+    expect(maskSecrets(uuid)).toBe(uuid);
+    expect(maskSecrets(path)).toBe(path);
+    expect(maskSecrets('a@example.com +79012345678')).toBe('a@example.com +79012345678');
+  });
+
+  it('maskText сначала маскирует секреты и сохраняет прежние UUID/hex/email/phone правила', () => {
+    const uuid = '018f2c3a-9d4e-7abc-8def-abcdef123456';
+    expect(maskText('/tmp/7c332707003ac67af11cf1ec081e4744/a.docx')).toBe('/tmp/[скрыто]/a.docx');
+    expect(maskText(`${uuid} a@example.com +79012345678 api_key=REAL_SECRET`)).toBe(
+      '[id] a***@example.com +7 *** *** 78 api_key=[скрыто]',
+    );
   });
 });
