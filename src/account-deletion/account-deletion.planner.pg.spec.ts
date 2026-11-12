@@ -11,6 +11,7 @@ import { DeletionCancelledError } from './account-deletion.safe';
 import type {
   DeletionAccount,
   DeletionJobRow,
+  DeletionJobSpec,
   DeletionSkip,
 } from './account-deletion.types';
 
@@ -264,6 +265,47 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
     expect(calls).toBe(1);
   });
 
+  it('persist использует metadata snapshot, снятый до stateful toJSON', async () => {
+    const value = account();
+    await insertDeleted(value);
+    let calls = 0;
+    const job: DeletionJobSpec = {
+      resourceType: 'elevenlabs-voice.purge',
+      resourceKey: 'voice-1',
+      phase: 'purge',
+      payload: {},
+    };
+    job.payload = {
+      toJSON: () => {
+        calls += 1;
+        job.resourceType = 'account.core.immediate';
+        job.resourceKey = 'mutated-key';
+        job.phase = 'immediate';
+        return { voiceId: 'voice-1' };
+      },
+    };
+    const planner = new AccountDeletionPlanner([]);
+
+    await planner.persist(pool, value, { jobs: [job], skips: [] });
+
+    const result = await pool.query(
+      `SELECT resource_type,resource_key,phase,payload_jsonb,next_attempt_at
+       FROM account_deletion_jobs WHERE deletion_id=$1`,
+      [value.deletionId],
+    );
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]).toMatchObject({
+      resource_type: 'elevenlabs-voice.purge',
+      resource_key: 'voice-1',
+      phase: 'purge',
+      payload_jsonb: { voiceId: 'voice-1' },
+    });
+    expect(result.rows[0].next_attempt_at).toEqual(
+      new Date(DELETED_AT.getTime() + RETENTION_MS),
+    );
+    expect(calls).toBe(1);
+  });
+
   it('direct persist отклоняет inconsistent phase до любой записи', async () => {
     const value = account();
     await insertDeleted(value);
@@ -313,6 +355,29 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
     await expect(planner.collect(pool, value, 'merge'))
       .rejects.toThrow(/^unsafe_skip_reason$/);
     expect(await jobCount()).toBe(0);
+  });
+
+  it('collect сохраняет skip snapshot до вызова следующего discoverer', async () => {
+    const value = account();
+    const skip: DeletionSkip = {
+      resourceType: 'calendar.external',
+      reason: 'owner_unverifiable',
+    };
+    const planner = new AccountDeletionPlanner([
+      async () => ({ jobs: [], skips: [skip] }),
+      async () => {
+        skip.reason = `provider ${CANARY}` as DeletionSkip['reason'];
+        return { jobs: [], skips: [] };
+      },
+    ]);
+
+    const plan = await planner.collect(pool, value, 'merge');
+
+    expect(plan.skips).toEqual([{
+      resourceType: 'calendar.external',
+      reason: 'owner_unverifiable',
+    }]);
+    expect(JSON.stringify(plan.skips)).not.toContain(CANARY);
   });
 
   it('catalog описывает только заданные зависимости', () => {
