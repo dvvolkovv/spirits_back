@@ -109,7 +109,7 @@ describe('PgService.query cancellation', () => {
     expect(client.release).toHaveBeenCalledTimes(1);
   });
 
-  it('hanging CancelRequest end разрушает cancel connection и original client за bounded время', async () => {
+  it('hanging CancelRequest end разрушает cancel stream и original client за bounded время', async () => {
     const { service, client } = fixture();
     let closingClient!: Client;
     jest.spyOn(Client.prototype, 'end').mockImplementation(function (this: Client) {
@@ -126,8 +126,8 @@ describe('PgService.query cancellation', () => {
     await flush();
     controller.abort();
     await flush();
-    const destroy = jest.fn();
-    (closingClient as any).connection.destroy = destroy;
+    const stream = (closingClient as any).connection.stream;
+    const destroy = jest.spyOn(stream, 'destroy').mockImplementation(() => stream);
     let timer: NodeJS.Timeout;
     const outcome = await Promise.race([
       observed,
