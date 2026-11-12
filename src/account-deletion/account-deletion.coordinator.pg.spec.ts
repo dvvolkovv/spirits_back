@@ -491,6 +491,36 @@ type AdapterImplementation = (
     await expect(jobs.claimNext(current.deletionId)).resolves.toBeNull();
   });
 
+  it('heartbeat обновляет in-memory lease по БД с микросекундами и сохраняет stale guards', async () => {
+    const current = account('u-heartbeat-lease-token');
+    await insertDeleted(current);
+    const id = await insertJob(current, 'routine.stop', 'routine-1', {
+      status: 'running',
+      attempts: 2,
+      leaseUntil: new Date(Date.now() + 60_000),
+    });
+    await pool.query(
+      `UPDATE account_deletion_jobs
+       SET lease_until=date_trunc('milliseconds',now())
+         + interval '5 minutes' + interval '123 microseconds'
+       WHERE id=$1`,
+      [id],
+    );
+    const claimed = await job(id);
+    const staleCopy = { ...claimed };
+    const { jobs } = compose();
+
+    await expect(jobs.assertCurrent(claimed)).resolves.toBeUndefined();
+    await expect(jobs.heartbeat(claimed)).resolves.toBe(true);
+
+    await expect(jobs.assertCurrent(claimed)).resolves.toBeUndefined();
+    await expect(jobs.assertCurrent(staleCopy))
+      .rejects.toBeInstanceOf(DeletionCancelledError);
+    await expect(jobs.assertCurrent({ ...claimed, attempts: claimed.attempts + 1 }))
+      .rejects.toBeInstanceOf(DeletionCancelledError);
+    expect(claimed.leaseUntil).toEqual((await rawJob(id)).lease_until);
+  });
+
   it('heartbeat/finish/fail с stale attempts не меняют newer job', async () => {
     const current = account('u-conditional-token');
     await insertDeleted(current);
@@ -508,9 +538,11 @@ type AdapterImplementation = (
       [id],
     );
     const newer = await rawJob(id);
+    const staleLease = stale.leaseUntil;
     const { jobs } = compose();
 
     await expect(jobs.heartbeat(stale)).resolves.toBe(false);
+    expect(stale.leaseUntil).toEqual(staleLease);
     await expect(jobs.finish(stale)).resolves.toBe(false);
     await expect(jobs.fail(stale, 'external_5xx')).resolves.toBe(false);
 
