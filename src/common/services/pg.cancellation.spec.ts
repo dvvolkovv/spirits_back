@@ -76,6 +76,16 @@ describe('PgService.query cancellation', () => {
       () => new Promise<void>((resolve) => { finishCancel = resolve; }),
     );
     const controller = new AbortController();
+    let releaseSecondConnect!: () => void;
+    let connects = 0;
+    client.release.mockImplementation(() => { releaseSecondConnect?.(); });
+    pool.connect.mockImplementation(() => {
+      connects += 1;
+      if (connects === 1) return Promise.resolve(client);
+      return new Promise<PoolClient>((resolve) => {
+        releaseSecondConnect = () => resolve(client);
+      });
+    });
     const first = (service.query as any)('SELECT pg_sleep(10)', [], controller.signal) as Promise<unknown>;
     const rejection = expect(first).rejects.toThrow('cancel requested');
     await flush();
