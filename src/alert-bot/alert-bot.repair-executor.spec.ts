@@ -431,7 +431,7 @@ describe('AlertBotRepairExecutor', () => {
     });
     const job = await createJob({ timeoutMs: 30_000 });
     try {
-      await executor.start(job.id, `trap '' TERM; sleep 3; sleep 3; touch ${sentinel}`);
+      await executor.start(job.id, `node -e "process.on('SIGTERM',()=>{});setTimeout(()=>require('fs').writeFileSync('${sentinel}','x'),6000)"`);
       const startedAt = Date.now();
       await executor.stopRepair('repair-1');
       expect(Date.now() - startedAt).toBeGreaterThanOrEqual(4_500);
