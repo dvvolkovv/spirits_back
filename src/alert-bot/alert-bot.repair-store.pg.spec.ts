@@ -229,9 +229,11 @@ maybe('durable repair store против PostgreSQL', () => {
     const repairId = await admit(`fence-${failureKind}`);
     const first = await store.createJob(jobInput(repairId));
     expect(first).not.toBeNull();
+    await expect(store.hasUnknownOutcome(repairId)).resolves.toBe(false);
     await store.finishJob(first!.id, {
       status: 'interrupted', exitCode: null, stdout: '', stderr: '', failureKind,
     });
+    await expect(store.hasUnknownOutcome(repairId)).resolves.toBe(true);
     await expect(store.createJob(jobInput(repairId))).resolves.toBeNull();
   });
 

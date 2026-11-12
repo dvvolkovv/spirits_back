@@ -56,6 +56,11 @@ class MemoryRepairStore {
     return { id, sequence: this.sequence };
   }
 
+  async hasUnknownOutcome(repairId: string): Promise<boolean> {
+    return [...this.jobs.values()].some((job) => job.repairId === repairId
+      && ['process_close_unconfirmed', 'remote_outcome_unknown'].includes(job.failureKind ?? ''));
+  }
+
   async findJob(id: string): Promise<RepairJobRecord | null> {
     const job = this.jobs.get(id);
     return job ? { ...job } : null;
@@ -369,7 +374,8 @@ describe('AlertBotRepairJobs', () => {
     expect(active).toHaveBeenCalledTimes(4);
   });
 
-  it.each(['process_close_unconfirmed', 'remote_outcome_unknown'] as const)('%s не освобождает следующую job', async (failureKind) => {
+  it.each(['process_close_unconfirmed', 'remote_outcome_unknown'] as const)('%s возвращает repair_outcome_unknown и не освобождает следующую job', async (failureKind) => {
+    store.repair.status = 'running';
     const first = await store.createJob({
       repairId: ctx.repairId, host: 'prod', command: 'redacted', kind: 'exec', mutates: true,
       interruptible: true, timeoutMs: 5_000,
@@ -382,7 +388,7 @@ describe('AlertBotRepairJobs', () => {
       repairId: ctx.repairId, host: 'prod', command: 'next', kind: 'exec', mutates: true,
       interruptible: true, timeoutMs: 5_000,
     })).resolves.toBeNull();
-    await expect(jobs.start(ctx, 'exec', { host: 'prod', command: 'printf no' })).rejects.toThrow();
+    await expect(jobs.start(ctx, 'exec', { host: 'prod', command: 'printf no' })).rejects.toThrow('repair_outcome_unknown');
     expect(spawn).not.toHaveBeenCalled();
   });
 
