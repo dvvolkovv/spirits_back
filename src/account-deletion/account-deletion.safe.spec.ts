@@ -835,3 +835,48 @@ describe('account deletion contract completeness regressions', () => {
     expect(safeDeletionMessage(logWith({ attempts: 0 }))).toContain('attempt=0');
   });
 });
+
+describe('account deletion sanitizer regressions', () => {
+  const encodeRepeated = (value: string, count: number): string => {
+    let encoded = value;
+    for (let index = 0; index < count; index += 1) encoded = encodeURIComponent(encoded);
+    return encoded;
+  };
+
+  it('отклоняет пустое имя свойства в deletionPayloadJson', () => {
+    expect(() => deletionPayloadJson({ '': CANARY }, USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('отклоняет пустое имя свойства в assertSafeJobSpec', () => {
+    expect(() => assertSafeJobSpec(job({ '': CANARY }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it.each([2, 3])('декодирует nested URL после %s-кратного encoding', (count) => {
+    const target = encodeRepeated(`https://evil.test/x?jwt=${SECRET}`, count);
+    expect(() => assertSafeJobSpec(job({
+      fileUrl: `https://example.com/redirect?target=${target}`,
+    }), USER_ID)).toThrow(/^unsafe_payload$/);
+  });
+
+  it.each([2, 3])('разрешает public nested URL после %s-кратного encoding', (count) => {
+    const target = encodeRepeated('https://example.com/public?download=1', count);
+    expect(() => assertSafeJobSpec(job({
+      fileUrl: `https://example.com/redirect?target=${target}`,
+    }), USER_ID)).not.toThrow();
+  });
+
+  it('отклоняет binary после outer toJSON до вызова binary.toJSON', () => {
+    const binary = Buffer.from(SECRET);
+    let binaryCalls = 0;
+    (binary as any).toJSON = () => {
+      binaryCalls += 1;
+      return { key: SECRET };
+    };
+    const payload = { toJSON: () => ({ file: binary }) };
+    expect(() => deletionPayloadJson(payload, USER_ID))
+      .toThrow(/^unsafe_payload$/);
+    expect(binaryCalls).toBe(0);
+  });
+});
