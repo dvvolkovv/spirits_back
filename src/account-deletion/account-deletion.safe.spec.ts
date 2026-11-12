@@ -1053,4 +1053,14 @@ describe('account deletion exact userId payload regressions', () => {
     expect(() => deletionPayloadJson({ id: 123 }, '123'))
       .toThrow(/^unsafe_payload$/);
   });
+
+  it('отклоняет allowlisted property, точно равное короткому userId', () => {
+    expect(() => deletionPayloadJson({ id: 'technical' }, 'id'))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('отклоняет persistent job с allowlisted property, равным короткому userId', () => {
+    expect(() => assertSafeJobSpec(job({ id: 'technical' }), 'id'))
+      .toThrow(/^unsafe_payload$/);
+  });
 });
