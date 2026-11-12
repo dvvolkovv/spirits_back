@@ -85,7 +85,7 @@ describe('PgService.query cancellation', () => {
     expect(end).toHaveBeenCalledTimes(1);
     const second = (service.query as any)('SELECT 1 AS ok') as Promise<unknown>;
     await flush();
-    const connectsBeforeCancelEnd = pool.connect.mock.calls.length;
+    const queriesBeforeCancelEnd = client.query.mock.calls.length;
     const releasesBeforeCancelEnd = client.release.mock.calls.length;
     finishCancel();
     await rejection;
@@ -93,8 +93,9 @@ describe('PgService.query cancellation', () => {
     resolveActive({ rows: [{ ok: 1 }] });
     await expect(second).resolves.toEqual({ rows: [{ ok: 1 }] });
 
-    expect(connectsBeforeCancelEnd).toBe(1);
+    expect(queriesBeforeCancelEnd).toBe(1);
     expect(releasesBeforeCancelEnd).toBe(0);
+    expect(client.query).toHaveBeenCalledTimes(2);
     expect(pool.connect).toHaveBeenCalledTimes(2);
     expect(client.release).toHaveBeenCalledTimes(1);
   });
