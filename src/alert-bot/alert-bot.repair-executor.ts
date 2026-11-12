@@ -8,6 +8,7 @@ const TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'timeout', 'cancelled'
 const MAX_OUTPUT_BYTES = 65_536;
 const MAX_RAW_OUTPUT_BYTES = 1_048_576;
 const LOCAL_CLOSE_WAIT_MS = 6_500;
+const STORE_LEASE_MS = 1_000;
 
 type ForcedOutcome = 'timeout' | 'cancelled';
 
@@ -77,6 +78,29 @@ async function bounded(operation: Promise<unknown>, ms = 1_000): Promise<void> {
     await Promise.race([
       operation.catch(() => undefined),
       new Promise<void>((resolve) => { timer = setTimeout(resolve, ms); }),
+    ]);
+  } finally { clearTimeout(timer!); }
+}
+
+async function withLease<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  fallback: T,
+): Promise<{ value: T; timedOut: boolean; failed: boolean }> {
+  const controller = new AbortController();
+  let timer: NodeJS.Timeout;
+  const timeout = new Promise<{ value: T; timedOut: boolean; failed: boolean }>((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      resolve({ value: fallback, timedOut: true, failed: false });
+    }, STORE_LEASE_MS);
+  });
+  try {
+    return await Promise.race([
+      operation(controller.signal).then(
+        (value) => ({ value, timedOut: false, failed: false }),
+        () => ({ value: fallback, timedOut: controller.signal.aborted, failed: !controller.signal.aborted }),
+      ),
+      timeout,
     ]);
   } finally { clearTimeout(timer!); }
 }
@@ -389,9 +413,9 @@ export class AlertBotRepairExecutor {
   private async maybeCleanup(repairId: string): Promise<void> {
     if ((this.startCounts.get(repairId) ?? 0) > 0) return;
     if ([...this.repairs.values()].includes(repairId)) return;
-    let repair;
-    try { repair = await this.store.findRepair(repairId); }
-    catch { return; }
+    const result = await withLease((signal) => this.store.findRepair(repairId, signal), null);
+    if (result.timedOut || result.failed) return;
+    const repair = result.value;
     if ((this.startCounts.get(repairId) ?? 0) > 0) return;
     if ([...this.repairs.values()].includes(repairId)) return;
     this.repairChains.delete(repairId);
@@ -496,20 +520,31 @@ export class AlertBotRepairExecutor {
 
   private async flushPending(jobId: string, state: ProcessState): Promise<boolean> {
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      let applied = false;
-      try { applied = await this.store.finishJob(jobId, state.pending!); }
-      catch { console.error('repair_finish_failed'); }
-      if (applied) {
+      const finished = await withLease(
+        (signal) => this.store.finishJob(jobId, state.pending!, signal),
+        false,
+      );
+      if (finished.timedOut) {
+        console.error('repair_finish_timeout');
+        return false;
+      }
+      if (finished.value) {
         this.confirmTerminal(jobId);
         return true;
       }
-      try {
-        const fresh = await this.store.findJob(jobId);
-        if (fresh && TERMINAL_STATUSES.has(fresh.status)) {
-          this.confirmTerminal(jobId);
-          return true;
-        }
-      } catch { console.error('repair_finish_check_failed'); }
+      const freshResult = await withLease(
+        (signal) => this.store.findJob(jobId, signal),
+        null,
+      );
+      if (freshResult.timedOut) {
+        console.error('repair_finish_check_timeout');
+        return false;
+      }
+      const fresh = freshResult.value;
+      if (fresh && TERMINAL_STATUSES.has(fresh.status)) {
+        this.confirmTerminal(jobId);
+        return true;
+      }
       if (attempt < 2) await new Promise<void>((resolve) => setTimeout(resolve, 5));
     }
     return false;

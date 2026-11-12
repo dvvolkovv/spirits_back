@@ -166,8 +166,8 @@ export class RepairStore {
     }
   }
 
-  async findRepair(id: string): Promise<RepairRecord | null> {
-    const result = await this.pg.query('SELECT * FROM alert_bot_repairs WHERE id = $1', [id]);
+  async findRepair(id: string, signal?: AbortSignal): Promise<RepairRecord | null> {
+    const result = await this.pg.query('SELECT * FROM alert_bot_repairs WHERE id = $1', [id], signal);
     return result.rows[0] ? mapRepair(result.rows[0]) : null;
   }
 
@@ -298,8 +298,8 @@ export class RepairStore {
     return result.rows.map(mapJob);
   }
 
-  async findJob(id: string): Promise<RepairJobRecord | null> {
-    const result = await this.pg.query('SELECT * FROM alert_bot_repair_jobs WHERE id = $1', [id]);
+  async findJob(id: string, signal?: AbortSignal): Promise<RepairJobRecord | null> {
+    const result = await this.pg.query('SELECT * FROM alert_bot_repair_jobs WHERE id = $1', [id], signal);
     return result.rows[0] ? mapJob(result.rows[0]) : null;
   }
 
@@ -316,13 +316,14 @@ export class RepairStore {
     return result.rowCount === 1;
   }
 
-  async finishJob(id: string, result: FinishRepairJobResult): Promise<boolean> {
+  async finishJob(id: string, result: FinishRepairJobResult, signal?: AbortSignal): Promise<boolean> {
     const updated = await this.pg.query(
       `UPDATE alert_bot_repair_jobs
        SET status = $2, exit_code = $3, stdout_redacted = $4, stderr_redacted = $5,
            failure_kind = $6, finished_at = now()
        WHERE id = $1 AND status IN ('queued', 'running')`,
       [id, result.status, result.exitCode, result.stdout, result.stderr, result.failureKind ?? null],
+      signal,
     );
     return updated.rowCount === 1;
   }
