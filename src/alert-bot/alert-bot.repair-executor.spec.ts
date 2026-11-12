@@ -375,7 +375,7 @@ describe('AlertBotRepairExecutor', () => {
 
   it('local close unconfirmed вызывает requestCancel и даёт durable interrupted', async () => {
     const child = new childProcess.ChildProcess();
-    Object.assign(child, { pid: 92_002, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
+    Object.assign(child, { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
     expect(child.pid).toBeUndefined();
     jest.spyOn(childProcess, 'spawn').mockReturnValue(child as any);
     (executor as any).closeWaitMs = 50;
@@ -390,7 +390,7 @@ describe('AlertBotRepairExecutor', () => {
 
   it('remote timeout без close получает bounded interrupted/remote_outcome_unknown', async () => {
     const child = new childProcess.ChildProcess();
-    Object.assign(child, { pid: 92_001, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
+    Object.assign(child, { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
     expect(child.pid).toBeUndefined();
     jest.spyOn(childProcess, 'spawn').mockReturnValue(child as any);
     (executor as any).closeWaitMs = 50;
