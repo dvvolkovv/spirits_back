@@ -50,6 +50,8 @@ afterEach(() => {
 
 describe('ClaudeCliService: AbortSignal', () => {
   it('abort убивает текущий CLI, завершает вызов без fallback и игнорирует поздний close', async () => {
+    process.env.QWEN_FALLBACK_API_KEY = 'spec-qwen-key';
+    process.env.KIMI_FALLBACK_API_KEY = 'spec-kimi-key';
     const controller = new AbortController();
     const { proc, emitClose } = manualProc();
     spawnMock.mockReturnValue(proc);
@@ -104,6 +106,35 @@ describe('ClaudeCliService: AbortSignal', () => {
     expect(removeListener).toHaveBeenCalledWith('abort', expect.any(Function));
     expect(jest.getTimerCount()).toBe(0);
     expect(proc.kill).toHaveBeenCalledTimes(1);
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('timeout → поздние abort и close не дают двойной kill или reject', async () => {
+    jest.useFakeTimers();
+    const controller = new AbortController();
+    const { proc, emitClose } = manualProc();
+    spawnMock.mockReturnValue(proc);
+    const rejected = jest.fn();
+
+    const promise = new ClaudeCliService().textWithCost('fix', {
+      signal: controller.signal,
+      timeoutMs: 1_000,
+    });
+    const observed = promise.catch(rejected);
+    jest.advanceTimersByTime(1_000);
+    await observed;
+
+    controller.abort();
+    emitClose(null, 'SIGTERM');
+    await Promise.resolve();
+
+    expect(rejected).toHaveBeenCalledTimes(1);
+    expect(rejected).toHaveBeenCalledWith(expect.objectContaining({
+      message: 'claude CLI timeout after 1000ms',
+      kind: 'timeout',
+    }));
+    expect(proc.kill).toHaveBeenCalledTimes(1);
+    expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
     expect(spawnMock).toHaveBeenCalledTimes(1);
   });
 

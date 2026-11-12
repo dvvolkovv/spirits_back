@@ -134,6 +134,29 @@ describe('AlertBotRepairAi', () => {
     expect(result.text).not.toContain('OUTCOME:');
   });
 
+  it('не удаляет marker-like suffix внутри прозы', async () => {
+    const text = 'Это объяснение про OUTCOME: no_cause, а не служебная строка OUTCOME: done';
+    claude.textWithCost.mockResolvedValue({ text, costUsd: 0.04 });
+
+    const result = await ai.repair(input);
+
+    expect(result.text).toBe(text);
+    expect(result.noCause).toBe(false);
+  });
+
+  it('при повторных маркерах финальный done определяет исход, а служебные строки не утекают в Telegram', async () => {
+    claude.textWithCost.mockResolvedValue({
+      text: 'Сначала причина не ясна\nOUTCOME: no_cause\nЗатем проверка прошла\nOUTCOME: done',
+      costUsd: 0.04,
+    });
+
+    const result = await ai.repair(input);
+
+    expect(result.text).toBe('Сначала причина не ясна\nЗатем проверка прошла');
+    expect(result.noCause).toBe(false);
+    expect(result.text).not.toContain('OUTCOME:');
+  });
+
   it('разделяет управляющую инструкцию и данные history, ограничивая контекст тремя парами', async () => {
     await ai.repair({
       ...input,
