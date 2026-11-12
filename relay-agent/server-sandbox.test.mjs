@@ -474,13 +474,20 @@ for (const mode of ['on', 'off']) {
     assert.equal(denied.includes('WebFetch'), mode === 'on', 'прежнее sandbox-правило WebFetch не изменилось');
     assert.equal(arg(f.calls[0].args, '--system-prompt-snapshot'), 'off');
 
-    const prompt = arg(f.calls[0].args, '--system-prompt');
-    assert.match(prompt, /Agent недоступен: весь запрошенный анализ выполняет основная модель/);
-    assert.match(prompt, /для полного разбора читай документ последовательно частями/i);
-    assert.match(prompt, /25 000 токенов/);
-    assert.match(prompt, /Не используй Bash sleep для ожидания субагентов/);
+    const rules = fs.readFileSync(arg(f.calls[0].args, '--append-system-prompt-file'), 'utf8');
+    assert.match(rules, /Agent недоступен: весь запрошенный анализ выполняет основная модель/);
+    assert.match(rules, /для полного разбора читай документ последовательно частями/i);
+    assert.match(rules, /25 000 токенов/);
+    assert.match(rules, /Не используй Bash sleep для ожидания субагентов/);
   });
 }
+
+test('document analysis rules: upload начинается с полного базового файла', () => {
+  const base = fs.readFileSync(new URL('./document-analysis-rules.txt', import.meta.url), 'utf8');
+  const upload = fs.readFileSync(new URL('./document-analysis-rules-upload.txt', import.meta.url), 'utf8');
+  assert.ok(base.length > 0);
+  assert.equal(upload.startsWith(base), true);
+});
 
 test('server off: текстовый ход сохраняет Agent и получает общие правила без дублирования', async (t) => {
   const f = await fixture(t, { mode: 'off' });
@@ -492,11 +499,11 @@ test('server off: текстовый ход сохраняет Agent и полу
   assert.ok(denied.includes('ToolSearch'));
   assert.equal(denied.includes('WebFetch'), false);
 
-  const prompt = arg(f.calls[0].args, '--system-prompt');
-  assert.match(prompt, /Не поручай Agent повторный анализ документа/);
-  assert.match(prompt, /Не используй Bash sleep для ожидания субагентов/);
-  assert.match(prompt, /Unknown skill/);
-  assert.match(prompt, /не перебирай другие skills/);
+  const rules = fs.readFileSync(arg(f.calls[0].args, '--append-system-prompt-file'), 'utf8');
+  assert.match(rules, /Не поручай Agent повторный анализ документа/);
+  assert.match(rules, /Не используй Bash sleep для ожидания субагентов/);
+  assert.match(rules, /Unknown skill/);
+  assert.match(rules, /не перебирай другие skills/);
 });
 
 test('server off: правила документов не увеличивают argv сверх 131071 байта', async (t) => {
