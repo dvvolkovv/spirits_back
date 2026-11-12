@@ -485,7 +485,7 @@ git diff --check origin/main...HEAD
 git diff --name-only origin/main...HEAD
 ```
 
-Expected: syntax-check без вывода; `diff --check` без ошибок. Изменены только `relay-agent/server.mjs`, `relay-agent/server-sandbox.test.mjs` и два документа этой задачи (spec/plan).
+Expected: syntax-check без вывода; `diff --check` без ошибок. Изменены только `relay-agent/server.mjs`, `relay-agent/server-sandbox.test.mjs`, `relay-agent/document-analysis-rules.txt`, `relay-agent/document-analysis-rules-upload.txt` и два документа этой задачи (spec/plan).
 
 - [x] **Step 2: Прогнать все relay-тесты на ноде**
 
@@ -509,6 +509,16 @@ Expected: рабочее дерево чистое; коммиты относя�
 **Итог выполнения Task 5 (2026-11-12):** полный relay-набор фактически выполнен дважды. На последнем SHA production-изменений `4c74e8d7d2897242a413c03054dbfbc7406e6665` результат: `tests 197`, `pass 197`, `fail 0`, `duration_ms 1415.689249`. На документном SHA `56d3e59031ff6bfc5426a2fabbfe9eda99f93b97` результат: `tests 197`, `pass 197`, `fail 0`, `duration_ms 1412.406337`. Syntax-check и `git diff --check` прошли; состав diff ограничен шестью разрешёнными путями. Рабочее дерево перед документированием было чистым, коммиты относятся только к этой функции и её документации.
 
 Последующий doc-only коммит не меняет relay-код и не может заранее содержать собственный SHA. Поэтому в документе зафиксированы последний проверенный кодовый SHA и фактический прогон на документном SHA `56d3e59031ff6bfc5426a2fabbfe9eda99f93b97`, а фактический финальный HEAD после этого документального уточнения указывается в отчёте controller'а. Деплой, PM2 restart и правки живого релея не выполнялись.
+
+### Task 5A: Финальные замечания общего code review
+
+- [x] **Retry/fallback:** теперь сравниваются также inline `--system-prompt`, путь и содержимое append-файла и `--system-prompt-snapshot`.
+- [x] **Resumed upload:** второй multipart-ход той же сессии проверяет совместное наличие `--resume`, запрета `Agent`, upload append-файла и `snapshot off`.
+- [x] **Unknown skill:** оба prompt-файла прямо разрешают другой локальный подход через `Read`/`Bash`; запрещено лишь новое планирование ради поиска другого Skill. Красный TDD-коммит `dbf0440c`: 31 tests / 30 pass / 1 fail, падение только новой формулировки. Зелёный коммит `344557d3`: 31/31, `duration_ms 557.824328`.
+- [x] **Документация:** добавлены обязательный раздел «Соответствие концепции» с фактически прочитанным §2.5, resumed-upload guard и все шесть разрешённых путей в Expected Task 5.
+- [x] **Полный прогон после исправлений:** `344557d3` — 198 tests / 198 pass / 0 fail, `duration_ms 1380.22466`. Production-логика не изменялась, Task 6 остаётся невыполненным, deploy/probe не выполнялись.
+
+Последующий doc-only коммит этих итогов не меняет relay-код и не может заранее содержать собственный SHA; фактический финальный HEAD и повторный прогон на нём указываются в отчёте controller'а.
 
 ### Task 6: Живой probe — только после нового явного OK владельца и официального выката
 
