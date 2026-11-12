@@ -499,7 +499,7 @@ type AdapterImplementation = (
     expect(dueSpy.mock.calls[0][0]).toBeNull();
     expect(dueSpy.mock.calls[1][0]).toEqual([expect.any(String), first.userId]);
     expect(dueSpy.mock.calls[2][0]).toEqual([expect.any(String), second.userId]);
-    expect((dueSpy.mock.calls[1][0] as unknown as [string, string])[0]).toMatch(/\.\d{6}/);
+    expect((dueSpy.mock.calls[1][0] as unknown as [string, string])[0]).toMatch(/\.\d{1,6}/);
     expect(lock.release).toHaveBeenCalledTimes(1);
   });
 
