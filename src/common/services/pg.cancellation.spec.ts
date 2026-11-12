@@ -127,7 +127,8 @@ describe('PgService.query cancellation', () => {
     await flush();
     controller.abort();
     await flush();
-    const destroy = jest.spyOn((closingClient as any).connection, 'destroy').mockImplementation(() => undefined);
+    const destroy = jest.fn();
+    (closingClient as any).connection.destroy = destroy;
     let timer: NodeJS.Timeout;
     const outcome = await Promise.race([
       observed,
