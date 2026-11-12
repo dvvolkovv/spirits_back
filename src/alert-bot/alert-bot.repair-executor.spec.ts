@@ -144,7 +144,7 @@ describe('AlertBotRepairExecutor', () => {
     return job;
   }
 
-  async function startPreSpawn(kind: 'mark_false' | 'cancel_before_spawn' | 'spawn_throw', job: RepairJobRecord): Promise<string> {
+  async function startPreSpawn(kind: 'mark_false' | 'cancel_before_spawn' | 'spawn_throw', job: RepairJobRecord): Promise<{ jobId: string; startError?: string }> {
     if (kind === 'mark_false') jest.spyOn(store, 'markJobRunning').mockResolvedValue(false);
     if (kind === 'cancel_before_spawn') {
       jest.spyOn(store, 'requestCancel').mockResolvedValue(false);
@@ -246,7 +246,7 @@ describe('AlertBotRepairExecutor', () => {
     const job = await createJob();
     jest.spyOn(store, 'markJobRunning').mockResolvedValue(false);
     const spawn = jest.spyOn(childProcess, 'spawn');
-    await expect(executor.start(job.id, 'printf no')).rejects.toThrow('repair_inactive');
+    await expect(executor.start(job.id, 'printf no')).resolves.toMatchObject({ jobId: job.id, startError: 'repair_inactive' });
     expect(spawn).not.toHaveBeenCalled();
     expect(await store.findJob(job.id)).toMatchObject({
       status: 'cancelled', failureKind: 'repair_inactive',
@@ -256,7 +256,7 @@ describe('AlertBotRepairExecutor', () => {
   it('синхронный spawn throw сохраняет failed/spawn_error и будит waiters', async () => {
     const job = await createJob();
     jest.spyOn(childProcess, 'spawn').mockImplementation(() => { throw new Error('sync spawn exploded'); });
-    await expect(executor.start(job.id, 'printf no')).resolves.toBe(job.id);
+    await expect(executor.start(job.id, 'printf no')).resolves.toMatchObject({ jobId: job.id, startError: 'spawn_error' });
     const startedAt = Date.now();
     await executor.wait(job.id, 30);
     expect(Date.now() - startedAt).toBeLessThan(1_000);
@@ -270,8 +270,10 @@ describe('AlertBotRepairExecutor', () => {
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
     jest.spyOn(store, 'finishJob').mockRejectedValueOnce(new Error('sensitive transient')).mockImplementation(original);
     const starting = startPreSpawn(kind, job);
-    if (kind === 'spawn_throw') await expect(starting).resolves.toBe(job.id);
-    else await expect(starting).rejects.toThrow('repair_inactive');
+    await expect(starting).resolves.toMatchObject({
+      jobId: job.id,
+      startError: kind === 'spawn_throw' ? 'spawn_error' : 'repair_inactive',
+    });
     expect(await executor.wait(job.id, 0.5)).toBe(true);
     expect(await store.findJob(job.id)).toMatchObject({
       status: kind === 'spawn_throw' ? 'failed' : 'cancelled',
@@ -284,8 +286,10 @@ describe('AlertBotRepairExecutor', () => {
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
     jest.spyOn(store, 'finishJob').mockRejectedValue(new Error('sensitive permanent'));
     const starting = startPreSpawn(kind, job);
-    if (kind === 'spawn_throw') await expect(starting).resolves.toBe(job.id);
-    else await expect(starting).rejects.toThrow('repair_inactive');
+    await expect(starting).resolves.toMatchObject({
+      jobId: job.id,
+      startError: kind === 'spawn_throw' ? 'spawn_error' : 'repair_inactive',
+    });
     expect(await executor.wait(job.id, 0.1)).toBe(false);
     expect(await store.findJob(job.id)).toMatchObject({ status: kind === 'spawn_throw' ? 'running' : 'queued' });
     expect((executor as any).processes.get(job.id)?.pending).toMatchObject({
@@ -302,7 +306,7 @@ describe('AlertBotRepairExecutor', () => {
       return child as any;
     });
     try {
-      await expect(executor.start(job.id, 'printf no')).resolves.toBe(job.id);
+      await expect(executor.start(job.id, 'printf no')).resolves.toMatchObject({ jobId: job.id });
       child.emit('error', new Error('async spawn exploded'));
       await executor.wait(job.id, 2);
       expect(await store.findJob(job.id)).toMatchObject({ status: 'failed', failureKind: 'spawn_error' });
@@ -399,7 +403,7 @@ describe('AlertBotRepairExecutor', () => {
     const job = await createJob();
     jest.spyOn(store, 'findRepair').mockRejectedValue(new Error('sensitive secondary failure'));
     const log = jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    await expect(executor.start(job.id, 'sleep 30')).resolves.toBe(job.id);
+    await expect(executor.start(job.id, 'sleep 30')).resolves.toMatchObject({ jobId: job.id });
     await executor.wait(job.id, 2);
     expect(await store.findJob(job.id)).toMatchObject({ status: 'cancelled' });
     expect(log).toHaveBeenCalledWith('repair_secondary_check_failed');
@@ -410,7 +414,7 @@ describe('AlertBotRepairExecutor', () => {
     const job = await createJob({ interruptible: false });
     jest.spyOn(store, 'findRepair').mockRejectedValue(new Error('sensitive secondary failure'));
     const log = jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    await expect(executor.start(job.id, 'printf survived-secondary')).resolves.toBe(job.id);
+    await expect(executor.start(job.id, 'printf survived-secondary')).resolves.toMatchObject({ jobId: job.id });
     await executor.wait(job.id, 2);
     expect(await store.findJob(job.id)).toMatchObject({ status: 'succeeded', stdout: 'survived-secondary' });
     expect(JSON.stringify(log.mock.calls)).not.toContain('sensitive');
@@ -421,7 +425,7 @@ describe('AlertBotRepairExecutor', () => {
     jest.spyOn(store, 'requestCancel').mockResolvedValue(false);
     await executor.stopRepair('repair-1');
     const spawn = jest.spyOn(childProcess, 'spawn');
-    await expect(executor.start(job.id, 'printf must-not-run')).rejects.toThrow('repair_inactive');
+    await expect(executor.start(job.id, 'printf must-not-run')).resolves.toMatchObject({ jobId: job.id, startError: 'repair_inactive' });
     expect(spawn).not.toHaveBeenCalled();
     expect(await store.findJob(job.id)).toMatchObject({ status: 'cancelled' });
   });
@@ -442,21 +446,22 @@ describe('AlertBotRepairExecutor', () => {
     });
     const spawn = jest.spyOn(childProcess, 'spawn');
     const observed = executor.start(job.id, `printf side-effect > ${sentinel}`).then(
-      () => ({ status: 'resolved' as const }),
+      (value) => ({ status: 'resolved' as const, value }),
       (error) => ({ status: 'rejected' as const, error }),
     );
     await entered;
     const stopped = executor.stopRepair('repair-1');
     releaseMark();
     await stopped;
-    expect((await observed).status).toBe('rejected');
+    expect((await observed).status).toBe('resolved');
+    expect((await observed as any).value).toMatchObject({ jobId: job.id, startError: 'repair_inactive' });
     expect(spawn).not.toHaveBeenCalled();
     expect(fs.existsSync(sentinel)).toBe(false);
     expect(await store.findJob(job.id)).toMatchObject({ status: 'cancelled' });
 
     store.repairs.get('repair-1')!.status = 'requested';
     const late = await createJob();
-    await expect(executor.start(late.id, 'printf late-spawn')).rejects.toThrow('repair_inactive');
+    await expect(executor.start(late.id, 'printf late-spawn')).resolves.toMatchObject({ jobId: late.id, startError: 'repair_inactive' });
     expect(spawn).not.toHaveBeenCalled();
     fs.rmSync(sentinel, { force: true });
   });
@@ -479,7 +484,7 @@ describe('AlertBotRepairExecutor', () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
     releaseCheck();
     await stopped;
-    await expect(started).resolves.toBe(job.id);
+    await expect(started).resolves.toMatchObject({ jobId: job.id });
     expect(await store.findJob(job.id)).toMatchObject({ status: 'cancelled', stdout: 'fast-close' });
   });
 
@@ -552,7 +557,7 @@ describe('AlertBotRepairExecutor', () => {
     const job = await createJob();
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
     jest.spyOn(store, 'finishJob').mockRejectedValue(new Error('permanent pending'));
-    await expect(startPreSpawn('cancel_before_spawn', job)).rejects.toThrow('repair_inactive');
+    await expect(startPreSpawn('cancel_before_spawn', job)).resolves.toMatchObject({ jobId: job.id, startError: 'repair_inactive' });
     store.repairs.get('repair-1')!.status = 'cancelled';
     await executor.stopRepair('repair-1');
     expect((executor as any).processes.get(job.id)?.pending).toBeTruthy();

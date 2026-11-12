@@ -201,7 +201,7 @@ describe('AlertBotRepairJobs', () => {
     });
     const spawn = jest.spyOn(childProcess, 'spawn');
     const observed = jobs.start(ctx, 'exec', { host: 'prod', command: 'printf must-not-run' }).then(
-      () => ({ status: 'resolved' as const }),
+      (value) => ({ status: 'resolved' as const, value }),
       (error) => ({ status: 'rejected' as const, error }),
     );
     await entered;
@@ -211,10 +211,41 @@ describe('AlertBotRepairJobs', () => {
     const resolvedBeforeRelease = stopResolved;
     releaseFind();
     await stopped;
-    expect((await observed).status).toBe('rejected');
+    expect((await observed).status).toBe('resolved');
+    expect((await observed as any).value).toMatchObject({ startError: 'repair_inactive' });
     expect(resolvedBeforeRelease).toBe(false);
     expect(spawn).not.toHaveBeenCalled();
     expect([...store.jobs.values()][0]).toMatchObject({ status: 'cancelled' });
+  });
+
+  it.each(['findJob', 'markJobRunning'] as const)('%s rejection и transient finish error возвращают jobId/startError и durable compensation', async (kind) => {
+    const originalOperation = kind === 'findJob' ? store.findJob.bind(store) : store.markJobRunning.bind(store);
+    jest.spyOn(store, kind).mockRejectedValueOnce(new Error(`${kind} unavailable`)).mockImplementation(originalOperation as any);
+    const originalFinish = store.finishJob.bind(store);
+    jest.spyOn(store, 'finishJob').mockRejectedValueOnce(new Error('finish unavailable')).mockImplementation(originalFinish);
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const spawn = jest.spyOn(childProcess, 'spawn');
+    const started = await jobs.start(ctx, 'exec', { host: 'prod', command: 'printf must-not-run' });
+    expect(started).toMatchObject({ jobId: expect.any(String), startError: 'store_unavailable' });
+    expect(await jobs.wait(ctx, started.jobId, 0.5)).toMatchObject({
+      status: 'interrupted', failureKind: 'store_unavailable',
+    });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it.each(['findJob', 'markJobRunning'] as const)('%s rejection и permanent finish error сохраняют pending и jobId', async (kind) => {
+    const originalOperation = kind === 'findJob' ? store.findJob.bind(store) : store.markJobRunning.bind(store);
+    jest.spyOn(store, kind).mockRejectedValueOnce(new Error(`${kind} unavailable`)).mockImplementation(originalOperation as any);
+    jest.spyOn(store, 'finishJob').mockRejectedValue(new Error('permanent finish unavailable'));
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const spawn = jest.spyOn(childProcess, 'spawn');
+    const started = await jobs.start(ctx, 'exec', { host: 'prod', command: 'printf must-not-run' });
+    expect(started).toMatchObject({ jobId: expect.any(String), startError: 'store_unavailable' });
+    expect(await jobs.wait(ctx, started.jobId, 0.1)).toMatchObject({ status: 'queued' });
+    expect((executor as any).processes.get(started.jobId)?.pending).toMatchObject({
+      status: 'interrupted', failureKind: 'store_unavailable',
+    });
+    expect(spawn).not.toHaveBeenCalled();
   });
 
   it('unknown host и чужой repair не запускают spawn', async () => {
