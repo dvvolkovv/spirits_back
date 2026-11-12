@@ -8,7 +8,14 @@ import { RoutinePushService } from './routine-push.service';
  */
 describe('рутинный пуш: linkeonTools: true', () => {
   it('fireNow зовёт generateAgentReply с { linkeonTools: true }', async () => {
-    const pg = { query: jest.fn(async () => ({ rows: [] })) };
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        if (sql.includes("SELECT 1 FROM user_id WHERE internal_id=$1 AND state='active'")) {
+          return { rows: [{ '?column?': 1 }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      }),
+    };
     const push = { sendPush: jest.fn(async () => 1) };
     const chat = { generateAgentReply: jest.fn(async () => 'Доброе утро!') };
     const store = {

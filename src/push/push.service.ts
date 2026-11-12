@@ -135,6 +135,15 @@ export class PushService implements OnModuleInit {
     }
   }
 
+  private async accountIsActive(userId: string): Promise<boolean> {
+    if (!this.pg) return false;
+    const r = await this.pg.query(
+      `SELECT 1 FROM user_id WHERE internal_id=$1 AND state='active' LIMIT 1`,
+      [userId],
+    );
+    return r.rowCount === 1 || (r.rowCount == null && r.rows.length === 1);
+  }
+
   /**
    * Endpoint подписки присылает браузер — то есть, по сути, кто угодно с
    * токеном: POST /push/subscribe принимает любую строку. На неё сервер потом
@@ -144,9 +153,12 @@ export class PushService implements OnModuleInit {
    */
   async subscribe(userId: string, sub: { endpoint: string; keys: Record<string, string> }): Promise<void> {
     if (!this.pg || !sub?.endpoint || !sub?.keys) return;
+    if (!(await this.accountIsActive(userId))) return;
     checkUrlSyntax(String(sub.endpoint));
     await this.pg.query(
-      `INSERT INTO push_subscriptions (user_id, endpoint, keys, platform) VALUES ($1, $2, $3, 'web')
+      `INSERT INTO push_subscriptions (user_id, endpoint, keys, platform)
+       SELECT $1, $2, $3, 'web'
+       WHERE EXISTS (SELECT 1 FROM user_id WHERE internal_id=$1 AND state='active')
        ON CONFLICT (endpoint) DO UPDATE SET user_id = $1, keys = $3, platform = 'web'`,
       [userId, sub.endpoint, JSON.stringify(sub.keys)],
     );
@@ -155,8 +167,11 @@ export class PushService implements OnModuleInit {
   // Регистрация нативного FCM-токена (Capacitor push) [Натив 3].
   async registerNative(userId: string, token: string): Promise<void> {
     if (!this.pg || !token) return;
+    if (!(await this.accountIsActive(userId))) return;
     await this.pg.query(
-      `INSERT INTO push_subscriptions (user_id, endpoint, keys, platform) VALUES ($1, $2, '{}'::jsonb, 'android')
+      `INSERT INTO push_subscriptions (user_id, endpoint, keys, platform)
+       SELECT $1, $2, '{}'::jsonb, 'android'
+       WHERE EXISTS (SELECT 1 FROM user_id WHERE internal_id=$1 AND state='active')
        ON CONFLICT (endpoint) DO UPDATE SET user_id = $1, platform = 'android'`,
       [userId, `fcm:${token}`],
     );
@@ -169,9 +184,12 @@ export class PushService implements OnModuleInit {
 
   /** Отправить push всем устройствам юзера (web-push + нативный FCM). Возвращает число доставленных. */
   async sendPush(userId: string, payload: PushPayload): Promise<number> {
-    if (!this.pg) return 0;
+    if (!this.pg || !(await this.accountIsActive(userId))) return 0;
     const subs = await this.pg.query(
-      `SELECT endpoint, keys, platform FROM push_subscriptions WHERE user_id = $1`,
+      `SELECT s.endpoint,s.keys,s.platform
+       FROM push_subscriptions s
+       JOIN user_id u ON u.internal_id=s.user_id AND u.state='active'
+       WHERE s.user_id=$1`,
       [userId],
     );
     let ok = 0;

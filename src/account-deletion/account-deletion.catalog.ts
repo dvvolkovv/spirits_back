@@ -1,9 +1,12 @@
+import { discoverRoutinePushDeletion } from '../routine-push/routine-account-deletion.adapter';
 import type {
   DeletionDiscoverer,
   DeletionResourceType,
 } from './account-deletion.types';
 
-export const DELETION_DISCOVERERS: readonly DeletionDiscoverer[] = [];
+export const DELETION_DISCOVERERS: readonly DeletionDiscoverer[] = [
+  discoverRoutinePushDeletion,
+];
 
 export interface DeletionDependencyRule {
   /** Ждать успешного завершения всех stop-задач этого deletion generation. */

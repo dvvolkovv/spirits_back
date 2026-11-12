@@ -101,6 +101,14 @@ export class RoutineStore {
   }
 
   // ── CRUD ─────────────────────────────────────────────────────────────────────
+  async accountIsActive(userId: string): Promise<boolean> {
+    const r = await this.pg.query(
+      `SELECT 1 FROM user_id WHERE internal_id=$1 AND state='active' LIMIT 1`,
+      [userId],
+    );
+    return r.rowCount === 1 || (r.rowCount == null && r.rows.length === 1);
+  }
+
   async list(userId: string): Promise<RoutineRow[]> {
     const r = await this.pg.query(
       `SELECT ${this.COLS} FROM routine_pushes WHERE user_id = $1 ORDER BY send_hour, created_at`,
@@ -141,7 +149,8 @@ export class RoutineStore {
   async create(
     userId: string,
     data: { title: string; assistantId: string; prompt: string; sendHour?: number; tz?: string; days?: any; enabled?: boolean },
-  ): Promise<RoutineRow> {
+  ): Promise<RoutineRow | null> {
+    if (!(await this.accountIsActive(userId))) return null;
     if ((await this.count(userId)) >= MAX_ROUTINES_PER_USER) {
       throw new Error(`limit reached: не больше ${MAX_ROUTINES_PER_USER} рутин`);
     }
@@ -153,11 +162,12 @@ export class RoutineStore {
     const lastSent = this.computeLastSent(enabled, hour, tz, days, now);
     const r = await this.pg.query(
       `INSERT INTO routine_pushes (user_id, kind, title, assistant_id, prompt, send_hour, tz, days, enabled, last_sent_date)
-       VALUES ($1, 'custom', $2, $3, $4, $5, $6, $7, $8, $9)
+       SELECT $1, 'custom', $2, $3, $4, $5, $6, $7, $8, $9
+       WHERE EXISTS (SELECT 1 FROM user_id WHERE internal_id=$1 AND state='active')
        RETURNING ${this.COLS}`,
       [userId, (data.title || 'Напоминание').slice(0, 80), String(data.assistantId), data.prompt, hour, tz, days, enabled, lastSent],
     );
-    return this.map(r.rows[0]);
+    return r.rows[0] ? this.map(r.rows[0]) : null;
   }
 
   async update(
@@ -165,6 +175,7 @@ export class RoutineStore {
     id: string,
     patch: { title?: string; assistantId?: string; prompt?: string; sendHour?: number; tz?: string; days?: any; enabled?: boolean },
   ): Promise<RoutineRow | null> {
+    if (!(await this.accountIsActive(userId))) return null;
     const cur = await this.getById(userId, id);
     if (!cur) return null;
     const title = patch.title !== undefined ? patch.title.slice(0, 80) : cur.title;
@@ -182,6 +193,7 @@ export class RoutineStore {
           SET title=$3, assistant_id=$4, prompt=$5, send_hour=$6, tz=$7, days=$8, enabled=$9,
               last_sent_date=$10, updated_at=now()
         WHERE user_id=$1 AND id=$2
+          AND EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id=$1 AND u.state='active')
         RETURNING ${this.COLS}`,
       [userId, id, title, assistantId, prompt, hour, tz, days, enabled, lastSent],
     );
@@ -196,16 +208,19 @@ export class RoutineStore {
   // ── Крон ─────────────────────────────────────────────────────────────────────
   async listEnabled(): Promise<Array<{ id: string; user_id: string; title: string; assistant_id: string; prompt: string; send_hour: number; tz: string; days: number[] | null; last_sent_date: any }>> {
     const r = await this.pg.query(
-      `SELECT id, user_id, title, assistant_id, prompt, send_hour, tz, days, last_sent_date
-         FROM routine_pushes WHERE enabled = true`,
+      `SELECT r.id,r.user_id,r.title,r.assistant_id,r.prompt,r.send_hour,r.tz,r.days,r.last_sent_date
+       FROM routine_pushes r JOIN user_id u ON u.internal_id=r.user_id AND u.state='active'
+       WHERE r.enabled=true`,
     );
     return r.rows.map((row: any) => ({ ...row, days: Array.isArray(row.days) ? row.days.map((n: any) => Number(n)) : null }));
   }
 
   async claimToday(id: string, todayLocal: string): Promise<boolean> {
     const r = await this.pg.query(
-      `UPDATE routine_pushes SET last_sent_date = $2, updated_at = now()
-         WHERE id = $1 AND (last_sent_date IS DISTINCT FROM $2) RETURNING id`,
+      `UPDATE routine_pushes r SET last_sent_date=$2,updated_at=now()
+       WHERE r.id=$1 AND r.last_sent_date IS DISTINCT FROM $2
+         AND EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id=r.user_id AND u.state='active')
+       RETURNING r.id`,
       [id, todayLocal],
     );
     return (r.rowCount || 0) > 0;
