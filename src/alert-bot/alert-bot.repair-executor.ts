@@ -110,8 +110,14 @@ export class AlertBotRepairExecutor {
   private readonly startCounts = new Map<string, number>();
   private stoppingAll = false;
   private stopAllEpoch = 0;
+  private reconciliation: NodeJS.Timeout | null;
 
-  constructor(private readonly store: RepairStore) {}
+  constructor(private readonly store: RepairStore) {
+    this.reconciliation = setInterval(() => {
+      void this.reconcile().catch(() => undefined);
+    }, 5_000);
+    this.reconciliation.unref();
+  }
 
   registerJob(jobId: string, repairId: string): void {
     this.jobRepairs.set(jobId, repairId);
@@ -304,6 +310,8 @@ export class AlertBotRepairExecutor {
   }
 
   async stopAll(): Promise<void> {
+    if (this.reconciliation) clearInterval(this.reconciliation);
+    this.reconciliation = null;
     this.stoppingAll = true;
     this.stopAllEpoch += 1;
     for (const repairId of this.repairChains.keys()) this.cancellingRepairs.add(repairId);
@@ -335,6 +343,12 @@ export class AlertBotRepairExecutor {
         && (repairId === undefined || currentRepairId === repairId))
       .map(([jobId]) => jobId);
     return Promise.all(jobs.map((jobId) => this.flushTerminal(jobId))).then(() => undefined);
+  }
+
+  private async reconcile(): Promise<void> {
+    await this.flushPendingForRepair();
+    const repairs = new Set([...this.repairChains.keys(), ...this.cancellingRepairs.values()]);
+    await Promise.all([...repairs].map((repairId) => this.maybeCleanup(repairId)));
   }
 
   private spawn(job: RepairJobRecord, rawCommand: string): ChildProcess {
