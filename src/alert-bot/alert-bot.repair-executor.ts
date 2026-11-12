@@ -7,6 +7,7 @@ import { FinishRepairJobResult, RepairJobRecord, RepairStore } from './alert-bot
 const TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'timeout', 'cancelled', 'interrupted']);
 const MAX_OUTPUT_BYTES = 65_536;
 const MAX_RAW_OUTPUT_BYTES = 1_048_576;
+const LOCAL_CLOSE_WAIT_MS = 6_500;
 
 type ForcedOutcome = 'timeout' | 'cancelled';
 
@@ -304,7 +305,7 @@ export class AlertBotRepairExecutor {
     await bounded(request);
     await bounded(this.repairChains.get(repairId) ?? Promise.resolve());
     const late = this.terminateLocal(repairId);
-    await bounded(Promise.allSettled([early, late]));
+    await bounded(Promise.allSettled([early, late]), LOCAL_CLOSE_WAIT_MS);
     await bounded(this.flushPendingForRepair(repairId));
     await bounded(this.maybeCleanup(repairId));
   }
@@ -320,7 +321,7 @@ export class AlertBotRepairExecutor {
     const early = this.terminateLocal();
     await bounded(Promise.all([...this.repairChains.values()]));
     const late = this.terminateLocal();
-    await bounded(Promise.allSettled([early, late]));
+    await bounded(Promise.allSettled([early, late]), LOCAL_CLOSE_WAIT_MS);
     await bounded(this.flushPendingForRepair());
     const repairs = new Set([...this.repairChains.keys(), ...this.cancellingRepairs.values()]);
     await bounded(Promise.all([...repairs].map((repairId) => this.maybeCleanup(repairId))));
@@ -446,9 +447,12 @@ export class AlertBotRepairExecutor {
       state.killTimer = setTimeout(() => {
         if (!state.finished) this.signalGroup(child, 'SIGKILL');
       }, 5_000);
-      state.killTimer.unref();
+      state.killTimer.ref();
     }
-    await state.completion;
+    await bounded(state.completion, LOCAL_CLOSE_WAIT_MS);
+    if (!state.finished) {
+      await this.finishProcess(jobId, 'interrupted', null, 'process_close_unconfirmed');
+    }
   }
 
   private async finishProcess(
