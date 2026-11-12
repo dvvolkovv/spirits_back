@@ -456,24 +456,53 @@ export function deletionResourceHash(bucket: string, key: string): string {
     .digest('hex');
 }
 
-export function safeJobPayloadJson(job: DeletionJobSpec, userId: string): string {
-  assertSafeResourceType(job.resourceType);
-  if (SKIP_ONLY_RESOURCE_TYPES.has(job.resourceType)) throw new Error('unsafe_resource_type');
-  const expectedPhase = job.resourceType === 'account.core.immediate'
-    || job.resourceType.endsWith('.stop') ? 'immediate' : 'purge';
-  if (job.phase !== expectedPhase) throw new Error('unsafe_phase');
-  const payloadJson = deletionPayloadJson(job.payload, userId);
-  if (typeof job.resourceKey === 'string'
-    && (job.resourceKey === userId
-      || (userId.length >= 6 && job.resourceKey.includes(userId)))) {
+export interface SafeDeletionJobSnapshot {
+  readonly resourceType: DeletionResourceType;
+  readonly resourceKey: string;
+  readonly phase: DeletionJobSpec['phase'];
+  readonly payloadJson: string;
+}
+
+export function safeDeletionJobSnapshot(
+  job: DeletionJobSpec,
+  userId: string,
+): SafeDeletionJobSnapshot {
+  const snapshot = Object.freeze({
+    resourceType: job.resourceType,
+    resourceKey: job.resourceKey,
+    phase: job.phase,
+    payload: job.payload,
+  });
+  assertSafeResourceType(snapshot.resourceType);
+  if (SKIP_ONLY_RESOURCE_TYPES.has(snapshot.resourceType)) {
+    throw new Error('unsafe_resource_type');
+  }
+  const expectedPhase = snapshot.resourceType === 'account.core.immediate'
+    || snapshot.resourceType.endsWith('.stop') ? 'immediate' : 'purge';
+  if (snapshot.phase !== expectedPhase) throw new Error('unsafe_phase');
+  const payloadJson = deletionPayloadJson(snapshot.payload, userId);
+  if (typeof snapshot.resourceKey === 'string'
+    && (snapshot.resourceKey === userId
+      || (userId.length >= 6 && snapshot.resourceKey.includes(userId)))) {
     throw new Error('unsafe_payload');
   }
-  if (unsafeResourceKeyFormat(job.resourceKey)) throw new Error('unsafe_resource_key');
-  return payloadJson;
+  if (unsafeResourceKeyFormat(snapshot.resourceKey)) {
+    throw new Error('unsafe_resource_key');
+  }
+  return Object.freeze({
+    resourceType: snapshot.resourceType,
+    resourceKey: snapshot.resourceKey,
+    phase: snapshot.phase,
+    payloadJson,
+  });
+}
+
+export function safeJobPayloadJson(job: DeletionJobSpec, userId: string): string {
+  return safeDeletionJobSnapshot(job, userId).payloadJson;
 }
 
 export function assertSafeJobSpec(job: DeletionJobSpec, userId: string): void {
-  safeJobPayloadJson(job, userId);
+  safeDeletionJobSnapshot(job, userId);
 }
 
 export function assertSafeSkip(skip: DeletionSkip): void {

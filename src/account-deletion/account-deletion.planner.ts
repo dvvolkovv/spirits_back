@@ -1,7 +1,7 @@
 import {
   ACCOUNT_DELETION_RETENTION_MS,
   assertSafeSkip,
-  safeJobPayloadJson,
+  safeDeletionJobSnapshot,
 } from './account-deletion.safe';
 import type {
   DeletionAccount,
@@ -36,12 +36,21 @@ export class AccountDeletionPlanner {
     for (const discover of this.discoverers) {
       const part = await discover({ db, account, origin });
       for (const job of part.jobs) {
-        const payloadJson = safeJobPayloadJson(job, account.userId);
-        jobs.push({ ...job, payload: JSON.parse(payloadJson) });
+        const snapshot = safeDeletionJobSnapshot(job, account.userId);
+        jobs.push({
+          resourceType: snapshot.resourceType,
+          resourceKey: snapshot.resourceKey,
+          phase: snapshot.phase,
+          payload: JSON.parse(snapshot.payloadJson),
+        });
       }
       for (const skip of part.skips) {
-        assertSafeSkip(skip);
-        skips.push(skip);
+        const snapshot: DeletionSkip = {
+          resourceType: skip.resourceType,
+          reason: skip.reason,
+        };
+        assertSafeSkip(snapshot);
+        skips.push(snapshot);
       }
     }
 
@@ -53,13 +62,12 @@ export class AccountDeletionPlanner {
     account: DeletionAccount,
     plan: DeletionPlan,
   ): Promise<void> {
-    const validatedJobs = plan.jobs.map((job) => ({
-      job,
-      payloadJson: safeJobPayloadJson(job, account.userId),
-    }));
+    const snapshots = plan.jobs.map(
+      (job) => safeDeletionJobSnapshot(job, account.userId),
+    );
 
-    for (const { job, payloadJson } of validatedJobs) {
-      const runAt = job.phase === 'immediate'
+    for (const snapshot of snapshots) {
+      const runAt = snapshot.phase === 'immediate'
         ? new Date()
         : new Date(account.deletedAt.getTime() + ACCOUNT_DELETION_RETENTION_MS);
       await db.query(
@@ -70,10 +78,10 @@ export class AccountDeletionPlanner {
         [
           account.deletionId,
           account.userId,
-          job.resourceType,
-          job.resourceKey,
-          job.phase,
-          payloadJson,
+          snapshot.resourceType,
+          snapshot.resourceKey,
+          snapshot.phase,
+          snapshot.payloadJson,
           runAt,
         ],
       );
