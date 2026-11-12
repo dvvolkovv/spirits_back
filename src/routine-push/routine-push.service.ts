@@ -8,6 +8,16 @@ import { ChatService, RelaySessionBusyError } from '../chat/chat.service';
 import { RoutineStore, RoutineRow, ENERGY_PROMPT } from './routine-store.service';
 import { sendTelegramAlert } from '../common/telegram-alert';
 
+export interface DeliverResult {
+  delivered: number;
+  /** Relay-сессия занята: можно повторить после освобождения. */
+  busy?: boolean;
+  /** Генерация не завершилась успешно: пуш и обрывок не отправляются. */
+  failed?: boolean;
+  /** done.failReason или безопасная локальная причина cli_failure_text. */
+  failReason?: string;
+}
+
 const RAYA_ID = '14';
 
 /**
@@ -112,65 +122,93 @@ export class RoutinePushService implements OnModuleInit {
     if (!(await this.accountIsActive(userId))) return;
     const key = `${userId}:${routineId}`;
     if (this.retryTimers.has(key)) return;
-    this.logger.log(`routine deliver: ${key} отложена на 15 минут (человек разговаривает)`);
+    this.logger.log(`routine ${routineId} retry через 15 минут`);
     const timer = setTimeout(() => {
       this.retryTimers.delete(key);
       void (async () => {
+        if (!(await this.accountIsActive(userId))) return;
         // За 15 минут рутину могли удалить, выключить или изменить — берём
         // актуальную запись, а не снимок на момент busy.
         const r = await this.store.getById(userId, routineId);
         if (!r || !r.enabled) return;
-        // Заново застолбим день: claim при busy освобождали. Уже доставлено
-        // другим путём — не дублируем.
         const today = this.store.localDate(r.tz, new Date());
-        if (!(await this.store.claimToday(routineId, today))) return;
-        await this.deliver(userId, r.assistantId, r.prompt, r.title, routineId);
+        const prev = r.lastSentDate;
+        if (!(await this.store.claimToday(routineId, today, userId))) return;
+        const result = await this.deliver(
+          userId, r.assistantId, r.prompt, r.title, routineId,
+        );
+        await this.releaseDeferred(routineId, today, prev, result);
       })().catch((e: any) => {
-        this.logger.warn(`routine deliver retry failed for ${key}: ${e?.message}`);
+        // Другая ошибка не даёт автоматического retry; claim остаётся на сегодня.
+        this.logger.warn(`routine ${routineId} retry failed: ${e?.name || 'Error'}`);
       });
     }, 15 * 60 * 1000);
     timer.unref?.();
     this.retryTimers.set(key, timer);
   }
 
-  private async deliver(userId: string, assistantId: string, prompt: string, title: string | undefined, routineId?: string): Promise<number> {
-    if (!(await this.accountIsActive(userId))) return 0;
-    // Рутина — путь, где ассистент реально может позвать инструмент Linkeon
-    // (картинка, рутина, календарь): AgentReplyOpts.linkeonTools — явно true.
-    let text: string;
+  /** Возвращает true, если день освобождён для позднейшей попытки. */
+  private async releaseDeferred(
+    routineId: string,
+    today: string,
+    prev: string | null,
+    result: DeliverResult,
+  ): Promise<boolean> {
+    const deferred = result.busy === true
+      || (result.failed === true && result.failReason === 'preempted');
+    if (!deferred) return false;
+    await this.store.releaseToday(routineId, today, prev);
+    this.logger.log(
+      `routine ${routineId} отложена: ${result.busy ? 'занята сессия' : 'ход перебит (preempted)'}`,
+    );
+    return true;
+  }
+
+  private async deliver(
+    userId: string,
+    assistantId: string,
+    prompt: string,
+    title: string | undefined,
+    routineId?: string,
+  ): Promise<DeliverResult> {
+    if (!(await this.accountIsActive(userId))) return { delivered: 0 };
+    let outcome: { text: string; failed: boolean; failReason?: string };
     try {
-      text = await this.chat.generateAgentReply(userId, assistantId, prompt, undefined, { linkeonTools: true });
+      // Рутина — путь, где ассистент реально может позвать инструмент Linkeon
+      // (картинка, рутина, календарь): AgentReplyOpts.linkeonTools — явно true.
+      outcome = await this.chat.generateAgentReplyOutcome(
+        userId, assistantId, prompt, undefined, { linkeonTools: true },
+      );
     } catch (e: any) {
       if (e instanceof RelaySessionBusyError) {
-        if (routineId) {
-          // Снимаем дневной claim: иначе после рестарта (таймер in-memory)
-          // cron пропустил бы рутину из-за last_sent_date, и она потерялась
-          // бы на сегодня. Освобождённый claim = повтор в следующий runDue.
-          const row = await this.store.getById(userId, routineId);
-          if (row) await this.store.releaseToday(routineId, this.store.localDate(row.tz, new Date()));
-          await this.scheduleRetry(userId, routineId);
-        }
-        return 0;
+        if (routineId) await this.scheduleRetry(userId, routineId);
+        return { delivered: 0, busy: true };
       }
+      // Исключение потока — не busy: release/retry автоматически не делаем.
       throw e;
     }
-    if (!text || !text.trim()) {
-      this.logger.warn(`routine deliver: empty text for ${userId} / assistant ${assistantId}`);
-      return 0;
+
+    const { text, failed, failReason } = outcome;
+    if (failed || !text || !text.trim()) {
+      const deferred = failReason === 'preempted';
+      const reason = failed
+        ? `ход не завершён (${failReason || 'unknown'})`
+        : 'пустой ответ';
+      const message = `routine deliver: ${reason} (assistant ${assistantId})`;
+      if (deferred) this.logger.log(message);
+      else this.logger.warn(message);
+      if (deferred && routineId) await this.scheduleRetry(userId, routineId);
+      return { delivered: 0, failed: true, failReason };
     }
-    // ⚠️ Сбой генерации НЕ отправляем человеку как сообщение ассистента.
-    //
-    // 12.10.2026 в 02:00 сессия Claude CLI не обновилась, ошибка вернулась ТЕКСТОМ (не
-    // исключением), и владелец получил пуш от Райи с содержимым «Failed to authenticate:
-    // OAuth session expired and could not be refreshed». Проверка на пустоту такое не
-    // ловит: текст есть. Рутина — сообщение, которого человек не просил; промолчать
-    // лучше, чем прислать мусор от его имени. Следующий запуск по расписанию попробует
-    // снова, а строка в логе показывает, что проход был и почему не дошёл.
+
+    // Сбой генерации не отправляем человеку как сообщение ассистента.
     if (looksLikeFailure(text)) {
-      this.logger.error(`routine deliver: ОТМЕНЕНО, генерация вернула ошибку текстом `
-        + `для ${userId} / assistant ${assistantId}: ${text.slice(0, 160)}`);
-      return 0;
+      this.logger.error(
+        `routine deliver: ошибка генерации текстом (assistant ${assistantId}, reason=cli_failure_text)`,
+      );
+      return { delivered: 0, failed: true, failReason: 'cli_failure_text' };
     }
+
     const agentNum = /^\d+$/.test(assistantId) ? parseInt(assistantId, 10) : null;
     await this.pg.query(
       `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
@@ -178,16 +216,18 @@ export class RoutinePushService implements OnModuleInit {
        WHERE EXISTS (SELECT 1 FROM user_id WHERE internal_id=$4 AND state='active')`,
       [`${userId}_${assistantId}`, agentNum, text, userId],
     );
-    if (!(await this.accountIsActive(userId))) return 0;
+    if (!(await this.accountIsActive(userId))) return { delivered: 0 };
     const name = await this.assistantName(assistantId);
     const body = text.replace(/[#*_`>\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 130);
     const isEnergy = assistantId === RAYA_ID && (title === 'Энергия дня' || !title);
-    return this.push.sendPush(userId, {
+    const delivered = await this.push.sendPush(userId, {
       title: isEnergy ? 'Энергия дня от Райи 🌅' : `${title || 'Напоминание'} · ${name} ✨`,
       body,
       url: `/chat?assistant=${assistantId}`,
       tag: `routine_${assistantId}`,
     });
+    // delivered=0 здесь означает «подписок/успешных отправок нет», не failure генерации.
+    return { delivered };
   }
 
   private async assistantName(assistantId: string): Promise<string> {
@@ -199,12 +239,11 @@ export class RoutinePushService implements OnModuleInit {
   }
 
   // «Проверить сейчас»: генерит и шлёт немедленно конкретную рутину.
-  async fireNow(userId: string, routineId: string): Promise<{ delivered: number } | null> {
+  async fireNow(userId: string, routineId: string): Promise<DeliverResult | null> {
     if (!(await this.accountIsActive(userId))) return null;
     const r = await this.store.getById(userId, routineId);
     if (!r) return null;
-    const delivered = await this.deliver(userId, r.assistantId, r.prompt, r.title, routineId);
-    return { delivered };
+    return this.deliver(userId, r.assistantId, r.prompt, r.title, routineId);
   }
 
   // ── Крон: раз в час на :00 ───────────────────────────────────────────────────
@@ -213,7 +252,7 @@ export class RoutinePushService implements OnModuleInit {
     if (process.env.ROUTINE_PUSH_DISABLED === 'true') return;
     let rows: Awaited<ReturnType<RoutineStore['listEnabled']>>;
     try { rows = await this.store.listEnabled(); }
-    catch (e: any) { this.logger.error(`runDue query failed: ${e.message}`); return; }
+    catch (e: any) { this.logger.error(`runDue query failed: ${e?.name || 'Error'}`); return; }
 
     const now = new Date();
     let fired = 0;
@@ -223,12 +262,26 @@ export class RoutinePushService implements OnModuleInit {
         if (this.store.localHour(r.tz, now) < r.send_hour) continue;         // ещё не время в его tz
         const today = this.store.localDate(r.tz, now);
         if (r.last_sent_date && this.store.toISO(r.last_sent_date) === today) continue;
-        if (!(await this.store.claimToday(r.id, today))) continue;           // уже застолбили
-        const n = await this.deliver(r.user_id, r.assistant_id, r.prompt, r.title, r.id);
-        fired++;
-        this.logger.log(`routine "${r.title}" sent to ${r.user_id} (assistant ${r.assistant_id}, delivered=${n})`);
+        const prev = r.last_sent_date ? this.store.toISO(r.last_sent_date) : null;
+        if (!(await this.store.claimToday(r.id, today, r.user_id))) continue;
+
+        const result = await this.deliver(
+          r.user_id, r.assistant_id, r.prompt, r.title, r.id,
+        );
+        if (await this.releaseDeferred(r.id, today, prev, result)) continue;
+        if (result.failed) {
+          // День остаётся застолбленным: не-preempted failure не повторяем автоматически.
+          this.logger.log(
+            `routine ${r.id} сбой генерации, без повтора (reason=${result.failReason || 'unknown'})`,
+          );
+          continue;
+        }
+        if (result.delivered > 0) fired++;
+        this.logger.log(
+          `routine ${r.id} доставка завершена (assistant ${r.assistant_id}, delivered=${result.delivered})`,
+        );
       } catch (e: any) {
-        this.logger.error(`runDue deliver failed for ${r?.user_id}: ${e.message}`);
+        this.logger.error(`runDue deliver failed for routine ${r?.id || 'unknown'}: ${e?.name || 'Error'}`);
       }
     }
     if (fired > 0) {

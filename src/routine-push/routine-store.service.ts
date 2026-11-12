@@ -215,29 +215,28 @@ export class RoutineStore {
     return r.rows.map((row: any) => ({ ...row, days: Array.isArray(row.days) ? row.days.map((n: any) => Number(n)) : null }));
   }
 
-  async claimToday(id: string, todayLocal: string): Promise<boolean> {
+  async claimToday(id: string, todayLocal: string, userId: string): Promise<boolean> {
     const r = await this.pg.query(
       `UPDATE routine_pushes r SET last_sent_date=$2,updated_at=now()
-       WHERE r.id=$1 AND r.last_sent_date IS DISTINCT FROM $2
+       WHERE r.id=$1 AND r.enabled=true AND r.user_id=$3
+         AND r.last_sent_date IS DISTINCT FROM $2
          AND EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id=r.user_id AND u.state='active')
        RETURNING r.id`,
-      [id, todayLocal],
+      [id, todayLocal, userId],
     );
     return (r.rowCount || 0) > 0;
   }
 
   /**
-   * Снимает дневной claim, если доставка НЕ состоялась (рутина пришла посреди
-   * разговора человека и отложена). Без этого отложенная рутина терялась бы на
-   * текущий день: in-memory таймер не переживает рестарт, а cron пропускал бы
-   * её из-за last_sent_date. Освобождённый claim = следующий runDue попробует
-   * снова — персистентная страховка поверх таймера.
+   * Откатывает только наш сегодняшний claim и возвращает прежнюю дату.
+   * Если другой владелец уже изменил last_sent_date, строка не трогается.
    */
-  async releaseToday(id: string, todayLocal: string): Promise<void> {
-    await this.pg.query(
-      `UPDATE routine_pushes SET last_sent_date = NULL, updated_at = now()
-         WHERE id = $1 AND last_sent_date = $2`,
-      [id, todayLocal],
+  async releaseToday(id: string, todayLocal: string, prev: string | null): Promise<boolean> {
+    const r = await this.pg.query(
+      `UPDATE routine_pushes SET last_sent_date=$3, updated_at=now()
+       WHERE id=$1 AND last_sent_date=$2 RETURNING id`,
+      [id, todayLocal, prev],
     );
+    return (r.rowCount || 0) > 0;
   }
 }
