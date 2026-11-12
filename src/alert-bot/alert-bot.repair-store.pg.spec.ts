@@ -17,6 +17,19 @@ const TURN_ID = '00000000-0000-4000-8000-000000000002';
 const OTHER_TURN_ID = '00000000-0000-4000-8000-000000000003';
 const MISSING_ID = '00000000-0000-4000-8000-000000000099';
 
+async function boundedEnteredForTest(entered: Promise<void>, timeoutMs = 5_000): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const reached = await Promise.race([
+      entered.then(() => true),
+      new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+    ]);
+    if (!reached) throw new Error('request_cancel_not_entered');
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function boundedStoppedForCleanup(stopped: Promise<void> | undefined, timeoutMs = 5_000): Promise<void> {
   if (!stopped) return;
   let timer: NodeJS.Timeout | undefined;
