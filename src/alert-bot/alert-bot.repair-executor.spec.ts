@@ -302,6 +302,7 @@ describe('AlertBotRepairExecutor', () => {
 
   it.each(['mark_false', 'cancel_before_spawn', 'spawn_throw'] as const)('%s hanging finishJob ограничен первым flush и сохраняет pending', async (kind) => {
     const job = await createJob();
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
     const finish = jest.spyOn(store, 'finishJob').mockImplementation(() => new Promise<boolean>(() => undefined));
     const starting = startPreSpawn(kind, job);
     let timer: NodeJS.Timeout;

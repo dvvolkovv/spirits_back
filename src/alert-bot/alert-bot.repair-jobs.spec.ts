@@ -287,6 +287,7 @@ describe('AlertBotRepairJobs', () => {
 
   it('rejected findJob и hanging finishJob возвращают startError с pending без второго flush', async () => {
     const original = store.findJob.bind(store);
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
     jest.spyOn(store, 'findJob').mockRejectedValueOnce(new Error('findJob unavailable')).mockImplementation(original);
     const finish = jest.spyOn(store, 'finishJob').mockImplementation(() => new Promise<boolean>(() => undefined));
     const starting = jobs.start(ctx, 'exec', { host: 'prod', command: 'printf must-not-run' });
