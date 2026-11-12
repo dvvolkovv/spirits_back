@@ -86,7 +86,7 @@ describe('AlertBotTurns', () => {
     chat = { beginStream: jest.fn(), endStream: jest.fn() };
     support = { findTicketByPrefix: jest.fn().mockResolvedValue(null) };
     logger = { error: jest.fn(), warn: jest.fn(), log: jest.fn(), debug: jest.fn() };
-    turns = new (AlertBotTurns as any)(
+    turns = new AlertBotTurns(
       store as any,
       telegram as any,
       ai as any,

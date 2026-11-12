@@ -14,8 +14,10 @@ import { AlertBotHealthService } from './alert-bot.health';
 import { AlertBotLifecycle } from './alert-bot.lifecycle';
 import { AlertBotOpsServer } from './alert-bot.ops-server';
 import { AlertBotRepairAuth } from './alert-bot.repair-auth';
+import { AlertBotRepairAi } from './alert-bot.repair-ai';
 import { AlertBotRepairExecutor } from './alert-bot.repair-executor';
 import { AlertBotRepairJobs } from './alert-bot.repair-jobs';
+import { AlertBotRepairService } from './alert-bot.repair.service';
 import { RepairStore } from './alert-bot.repair-store';
 import { AlertBotRepairTools } from './alert-bot.repair-tools';
 import { AlertBotService } from './alert-bot.service';
@@ -32,6 +34,7 @@ import { AlertBotTurns } from './alert-bot.turns';
     AlertBotAccess, AlertBotTelegram, AlertBotStore, AlertBotHealthService,
     AlertBotStatusService, AlertBotCommands, AlertBotDrafts, AlertBotTools,
     RepairStore, AlertBotRepairExecutor, AlertBotRepairJobs, AlertBotRepairAuth, AlertBotRepairTools,
+    AlertBotRepairAi, AlertBotRepairService,
     AlertBotOpsServer, AlertBotAi, AlertBotTurns, AlertBotService, AlertBotLifecycle,
     { provide: ALERT_BOT_HANDLER, useExisting: AlertBotService },
     { provide: ALERT_BOT_OPS_TOOLS, useExisting: AlertBotTools },

@@ -6,6 +6,7 @@ import { SupportService } from '../support/support.service';
 import { AlertBotAi, AlertBotAiInput } from './alert-bot.ai';
 import { alertBotRatePerHour } from './alert-bot.config';
 import { AlertBotStatusService } from './alert-bot.status';
+import { AlertBotRepairService } from './alert-bot.repair.service';
 import { AlertBotRetryableError } from './alert-bot.errors';
 import { AlertBotStore, AlertBotTurn, AlertBotTurnStatus, DraftReservation } from './alert-bot.store';
 import { AlertBotTelegram, unknownTelegramOutcome } from './alert-bot.telegram';
@@ -41,6 +42,7 @@ export class AlertBotTurns {
     private readonly status: AlertBotStatusService,
     private readonly chat: ChatService,
     private readonly support: SupportService,
+    private readonly repairs: AlertBotRepairService,
   ) {}
 
   stopAdmission(): void {
@@ -198,7 +200,11 @@ export class AlertBotTurns {
         await this.store.markPlaceholderStarted(turnId);
         let placeholder: { message_id: number };
         try {
-          placeholder = await this.telegram.sendMessage(input.chatId, '🔎 Смотрю…', input.questionMessageId);
+          placeholder = await this.telegram.sendMessage(
+            input.chatId,
+            input.mode === 'repair' ? '🛠 Исправляю…' : '🔎 Смотрю…',
+            input.questionMessageId,
+          );
         } catch (error) {
           if (unknownTelegramOutcome(error)) {
             // Timeout после remote success: marker остаётся, retry только defer/dead-letter.
@@ -216,38 +222,54 @@ export class AlertBotTurns {
       if (answer === null) {
         const history = await this.history(input);
         await this.store.markModelStarted(turnId);
-        let generated: { text: string; costUsd: number; tools: string[] };
-        try {
-          generated = await this.ai.answer({ ...input, history });
-        } catch (error) {
-          const kind = safeErrorKind(error, 'unknown');
-          if (!(error instanceof ClaudeCliCallError) && !MODEL_FAILURE_KINDS.has(kind as LlmOutageKind)) {
-            throw new AlertBotRetryableError('model_outcome_unknown');
-          }
-          turnStatus = kind === 'timeout' ? 'timeout' : 'model_down';
-          const summary = await this.status.summary();
-          answer = `Модель недоступна: ${kind}.\n\n${summary}`;
+        if (input.mode === 'repair') {
+          const repairId = input.repairId;
+          if (!repairId) throw new AlertBotRetryableError('repair_not_requested');
+          const repaired = await this.repairs.run(repairId, turnId, input, history);
+          answer = repaired.text;
+          turnStatus = repaired.turnStatus;
           const finished = await this.store.finishTurn(turnId, {
             status: turnStatus,
             answer,
-            errorKind: kind,
+            tools: repaired.tools,
             durationMs: Date.now() - startedAt,
+            costUsd: repaired.costUsd,
           });
           if (!finished) throw new AlertBotRetryableError('turn_fenced');
-          generated = { text: answer, costUsd: 0, tools: [] };
-        }
-        if (turnStatus !== 'model_down' && turnStatus !== 'timeout') {
-          answer = generated.text;
-          turnStatus = 'ok';
-          // Ответ и стоимость фиксируются ДО первой попытки delivery.
-          const finished = await this.store.finishTurn(turnId, {
-            status: 'ok',
-            answer,
-            tools: generated.tools,
-            durationMs: Date.now() - startedAt,
-            costUsd: generated.costUsd,
-          });
-          if (!finished) throw new AlertBotRetryableError('turn_fenced');
+        } else {
+          let generated: { text: string; costUsd: number; tools: string[] };
+          try {
+            generated = await this.ai.answer({ ...input, history });
+          } catch (error) {
+            const kind = safeErrorKind(error, 'unknown');
+            if (!(error instanceof ClaudeCliCallError) && !MODEL_FAILURE_KINDS.has(kind as LlmOutageKind)) {
+              throw new AlertBotRetryableError('model_outcome_unknown');
+            }
+            turnStatus = kind === 'timeout' ? 'timeout' : 'model_down';
+            const summary = await this.status.summary();
+            answer = `Модель недоступна: ${kind}.\n\n${summary}`;
+            const finished = await this.store.finishTurn(turnId, {
+              status: turnStatus,
+              answer,
+              errorKind: kind,
+              durationMs: Date.now() - startedAt,
+            });
+            if (!finished) throw new AlertBotRetryableError('turn_fenced');
+            generated = { text: answer, costUsd: 0, tools: [] };
+          }
+          if (turnStatus !== 'model_down' && turnStatus !== 'timeout') {
+            answer = generated.text;
+            turnStatus = 'ok';
+            // Ответ и стоимость фиксируются ДО первой попытки delivery.
+            const finished = await this.store.finishTurn(turnId, {
+              status: 'ok',
+              answer,
+              tools: generated.tools,
+              durationMs: Date.now() - startedAt,
+              costUsd: generated.costUsd,
+            });
+            if (!finished) throw new AlertBotRetryableError('turn_fenced');
+          }
         }
       }
 
