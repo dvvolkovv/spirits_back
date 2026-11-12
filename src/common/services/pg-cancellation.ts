@@ -109,15 +109,19 @@ export async function queryWithCancellation(
     if (cancelClient) {
       const closingClient = cancelClient;
       let closeTimer: NodeJS.Timeout | undefined;
+      let closeFailed = false;
       let closeTimedOut = false;
       try {
+        const closing = Promise.resolve()
+          .then(() => closingClient.end())
+          .catch(() => { closeFailed = true; });
         closeTimedOut = false === await Promise.race([
-          closingClient.end().catch(() => undefined),
+          closing,
           new Promise<false>((resolve) => {
             closeTimer = setTimeout(() => resolve(false), CANCEL_CLOSE_TIMEOUT_MS);
           }),
         ]);
-        if (closeTimedOut) {
+        if (closeFailed || closeTimedOut) {
           // CancelRequest не подтверждён: ни cancel connection, ни исходный
           // client нельзя оставлять живым или возвращать в pool для reuse.
           forceDestroyClient = true;
@@ -126,7 +130,7 @@ export async function queryWithCancellation(
         }
       } finally {
         if (closeTimer) clearTimeout(closeTimer);
-        if (!closeTimedOut) {
+        if (!closeFailed && !closeTimedOut) {
           closingClient.removeListener('error', onCancelError);
           (closingClient as unknown as RuntimeCancelClient).connection
             .removeListener('error', onCancelError);
