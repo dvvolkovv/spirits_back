@@ -248,10 +248,12 @@ describe('AlertBotOpsServer stateless MCP', () => {
     expect(listed.response.status).toBe(200);
     authorize.mockResolvedValueOnce(false);
 
-    const called = await rpc('tools/call', {
-      name: 'repair_exec', arguments: { host: 'prod', command: 'true' },
+    const called = await post({
+      jsonrpc: '2.0', id: 7, method: 'tools/call',
+      params: { name: 'repair_exec', arguments: { host: 'prod', command: 'true' } },
     }, repairToken);
-    expect(called.response.status).toBe(403);
+    expect(called.status).toBe(403);
+    expect(await called.text()).toBe('');
     expect(repairStart).not.toHaveBeenCalled();
   });
 
