@@ -528,7 +528,7 @@ Expected: рабочее дерево чистое; коммиты относя�
 - Create во временном каталоге релея: `synthetic-49.pdf` — без персональных данных
 - Read only: `/home/dv/file-agent/sessions.json` и транскрипт изолированной probe-сессии
 
-- [ ] **Step 1: Создать 49-страничный PDF, выполнить ход и проверить результат**
+- [x] **Step 1: Создать 49-страничный PDF, выполнить ход и проверить результат**
 
 Команда не печатает секрет и не выводит содержимое ответа. Она проверяет HTTP, `done.failed`, отсутствие `Agent`, отсутствие ожидательных `sleep`, наличие всех контрольных кодов и выводит только operational metadata.
 
@@ -557,7 +557,7 @@ import fs from "node:fs";
 
 const startedAt = Date.now();
 const secret = fs.readFileSync("/home/dv/file-agent/relay-secrets", "utf8")
-  .split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  .split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith("#")).find(Boolean);
 if (!secret) throw new Error("relay secret is empty");
 
 const form = new FormData();
@@ -636,7 +636,9 @@ rm -rf -- "$WORK" "/tmp/agent-uploads/$FS_KEY" "/tmp/agent-output/$FS_KEY" "/tmp
 
 Expected PASS: `httpStatus: 200`, `doneFailed: false`, `agentCallCount: 0`, `waitingSleepCount: 0`, `missingCodes: []`. `durationMs`, `modelCalls`, `maxContext` записать в итоговый отчёт. Удаляются только случайные probe-каталоги; транскрипт остаётся для аудита.
 
-- [ ] **Step 2: Проверить текстовый ход без глобального запрета**
+**Фактический результат после выката `2c0bb70e`:** HTTP 200, `doneFailed: false`, `durationMs 13484`, `modelCalls 2`, `maxContext 46878`, `toolCounts { "Bash": 1 }`, `agentCallCount 0`, `waitingSleepCount 0`, `missingCodes []`. Все 49 контрольных кодов присутствуют. Содержимое ответа в журнал не записывалось.
+
+- [x] **Step 2: Проверить текстовый ход без глобального запрета**
 
 Интеграционный тест Task 1 уже доказывает отсутствие глобального запрета. На живом релее выполнить обычный текстовый ход без файла; специально `Agent` не провоцировать.
 
@@ -650,7 +652,7 @@ import fs from "node:fs";
 
 const startedAt = Date.now();
 const secret = fs.readFileSync("/home/dv/file-agent/relay-secrets", "utf8")
-  .split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  .split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith("#")).find(Boolean);
 if (!secret) throw new Error("relay secret is empty");
 const response = await fetch("http://127.0.0.1:3033/chat", {
   method: "POST",
@@ -686,6 +688,10 @@ rm -rf -- "/tmp/agent-uploads/$FS_KEY" "/tmp/agent-output/$FS_KEY" "/tmp/agent-s
 
 Expected: HTTP 200, `doneFailed: false`, `answerChars > 0`, `agentCalls: 0` для этого простого ответа, никаких новых ошибок политики. В итоговом отчёте зафиксировать длительность и SHA выкаченного релея.
 
-- [ ] **Step 3: Отчитаться без содержимого документа**
+**Фактический результат:** HTTP 200, `doneFailed: false`, `durationMs 3426`, `answerChars 25`, `agentCalls 0`, `failReason: null`.
+
+**Исправление runbook после первой попытки probe:** `relay-secrets` содержит комментарии, поэтому секрет выбирается только из непустых строк без ведущего `#`. Первая попытка до HTTP-запроса приняла комментарий за секрет и остановилась на `ByteString`; production-код и выкат были не при чём. Временный синтетический PDF удалён, повторные probe прошли.
+
+- [x] **Step 3: Отчитаться без содержимого документа**
 
 Указать: TARGET SHA, официальный выкат завершён, `/health` успешен, результаты обоих probe, `durationMs`, `modelCalls`, `maxContext`, отсутствие `Agent` и ожидательных `sleep`. Не утверждать ускорение без фактического сравнения с исходными 599 550 мс и не публиковать содержимое ответа.
