@@ -288,7 +288,7 @@ function unsafePayloadString(value: string, userId: string, depth = 0): boolean 
   if (depth > 6) return true;
   let variant = value;
   for (let pass = 0; pass <= 5; pass += 1) {
-    if (userId.length >= 6 && variant.includes(userId)) return true;
+    if (variant === userId || (userId.length >= 6 && variant.includes(userId))) return true;
     if (URL_WITH_USERINFO.test(variant)) return true;
     try {
       if (unsafeUrl(new URL(variant), userId, depth)) return true;
@@ -376,7 +376,7 @@ function sanitizeJsonValue(
   if (typeof value === 'boolean') return value;
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) return null;
-    if (userId.length >= 6 && String(value) === userId) throw new Error('unsafe_payload');
+    if (String(value) === userId) throw new Error('unsafe_payload');
     return value;
   }
   if (typeof value === 'undefined' || typeof value === 'function' || typeof value === 'symbol') {
@@ -461,7 +461,8 @@ export function assertSafeJobSpec(job: DeletionJobSpec, userId: string): void {
   if (job.phase !== expectedPhase) throw new Error('unsafe_phase');
   deletionPayloadJson(job.payload, userId);
   if (typeof job.resourceKey === 'string'
-    && userId.length >= 6 && job.resourceKey.includes(userId)) {
+    && (job.resourceKey === userId
+      || (userId.length >= 6 && job.resourceKey.includes(userId)))) {
     throw new Error('unsafe_payload');
   }
   if (unsafeResourceKeyFormat(job.resourceKey)) throw new Error('unsafe_resource_key');
