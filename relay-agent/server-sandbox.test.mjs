@@ -482,6 +482,27 @@ for (const mode of ['on', 'off']) {
   });
 }
 
+test('server on: непринятый файл не включает запрет Agent', async (t) => {
+  const fileOps = {
+    ...fs,
+    renameSync() {
+      const err = new Error('rename denied by test');
+      err.code = 'EACCES';
+      throw err;
+    },
+  };
+  const f = await fixture(t, { mode: 'on', fileOps });
+  const { response } = await f.requestUpload([
+    { name: 'not-accepted.pdf', body: 'synthetic-body' },
+  ]);
+  assert.equal(response.status, 200);
+  assert.equal(f.calls.length, 1);
+
+  const denied = arg(f.calls[0].args, '--disallowedTools').split(',');
+  assert.equal(denied.includes('Agent'), false);
+  assert.equal(f.calls[0].child.input.includes('User uploaded files:'), false);
+});
+
 test('document analysis rules: upload начинается с полного базового файла', () => {
   const base = fs.readFileSync(new URL('./document-analysis-rules.txt', import.meta.url), 'utf8');
   const upload = fs.readFileSync(new URL('./document-analysis-rules-upload.txt', import.meta.url), 'utf8');
