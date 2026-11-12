@@ -32,15 +32,16 @@ export class AccountDeletionRunner {
   private async runJob(job: DeletionJobRow): Promise<void> {
     let heartbeatBusy = false;
     let heartbeatLost = false;
+    let heartbeatError: { value: unknown } | null = null;
     let heartbeat = Promise.resolve();
     const timer = setInterval(() => {
-      if (heartbeatBusy || heartbeatLost) return;
+      if (heartbeatBusy || heartbeatLost || heartbeatError) return;
       heartbeatBusy = true;
       heartbeat = (async () => {
         try {
           if (!await this.jobs.heartbeat(job)) heartbeatLost = true;
-        } catch {
-          heartbeatLost = true;
+        } catch (error) {
+          heartbeatError = { value: error };
         } finally {
           heartbeatBusy = false;
         }
@@ -62,7 +63,11 @@ export class AccountDeletionRunner {
       await heartbeat;
     }
 
-    if (heartbeatLost) adapterError = { value: new DeletionCancelledError() };
+    if (!adapterError && heartbeatError) {
+      adapterError = heartbeatError;
+    } else if (!adapterError && heartbeatLost) {
+      adapterError = { value: new DeletionCancelledError() };
+    }
     if (adapterError) {
       const kind = deletionErrorKind(adapterError.value);
       await this.jobs.fail(job, kind);

@@ -15,6 +15,10 @@ import type {
 
 type Db = DeletionDiscovery['db'];
 
+export interface DeletionDueAccount extends DeletionAccount {
+  deletedAtCursor: string;
+}
+
 export function mapDeletionJob(row: any): DeletionJobRow {
   return {
     id: row.id,
@@ -105,18 +109,20 @@ export class AccountDeletionJobs {
   }
 
   async dueAccounts(
-    after: [Date, string] | null,
+    after: [string, string] | null,
     batchSize = 50,
     retentionMs = ACCOUNT_DELETION_RETENTION_MS,
-  ): Promise<DeletionAccount[]> {
+  ): Promise<DeletionDueAccount[]> {
     const result = await this.db.query(
-      `SELECT internal_id,deletion_id,deleted_at
+      `SELECT internal_id,deletion_id,deleted_at,
+              deleted_at::text AS deleted_at_cursor
        FROM user_id
        WHERE state='deleted'
          AND deletion_id IS NOT NULL
          AND deleted_at IS NOT NULL
          AND deleted_at<=now()-($4::bigint * interval '1 millisecond')
-         AND ($1::timestamptz IS NULL OR (deleted_at,internal_id) > ($1,$2))
+         AND ($1::timestamptz IS NULL
+           OR (deleted_at,internal_id) > ($1::timestamptz,$2::text))
        ORDER BY deleted_at,internal_id
        LIMIT $3`,
       [after?.[0] ?? null, after?.[1] ?? null, batchSize, retentionMs],
@@ -125,6 +131,7 @@ export class AccountDeletionJobs {
       userId: row.internal_id,
       deletionId: row.deletion_id,
       deletedAt: row.deleted_at,
+      deletedAtCursor: row.deleted_at_cursor,
     }));
   }
 
@@ -213,9 +220,7 @@ export class AccountDeletionJobs {
          AND j.attempts=$4
          AND $5::timestamptz IS NOT NULL
          AND j.lease_until IS NOT NULL
-         AND j.lease_until > now()
-         AND j.lease_until >= $5::timestamptz
-         AND j.lease_until < $5::timestamptz + interval '1 millisecond'`,
+         AND j.lease_until > now()`,
       [job.id, job.userId, job.deletionId, job.attempts, job.leaseUntil],
     );
     if (result.rowCount !== 1) throw new DeletionCancelledError();
