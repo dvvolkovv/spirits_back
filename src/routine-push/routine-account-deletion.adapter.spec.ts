@@ -276,7 +276,7 @@ describe('RoutineStore active fences', () => {
     const pg = {
       query: jest.fn(async (sql: string, params: any[] = []) => {
         const s = sql.replace(/\s+/g, ' ').trim();
-        if (s.includes("SELECT 1 FROM user_id WHERE internal_id=$1 AND state='active'")) {
+        if (s.startsWith("SELECT 1 FROM user_id WHERE internal_id=$1 AND state='active'")) {
           return { rows: state === 'active' ? [{ '?column?': 1 }] : [], rowCount: state === 'active' ? 1 : 0 };
         }
         if (s.startsWith('SELECT count(*)::int AS n FROM routine_pushes')) {
