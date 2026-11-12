@@ -19,6 +19,7 @@ import { AlertBotOpsServer } from './alert-bot.ops-server';
 import { AlertBotRepairAuth } from './alert-bot.repair-auth';
 import { AlertBotRepairExecutor } from './alert-bot.repair-executor';
 import { AlertBotRepairJobs } from './alert-bot.repair-jobs';
+import { AlertBotRepairService } from './alert-bot.repair.service';
 import { RepairStore } from './alert-bot.repair-store';
 import { AlertBotRepairTools } from './alert-bot.repair-tools';
 import { AlertBotService } from './alert-bot.service';
@@ -44,6 +45,7 @@ describe('AlertBotModule: жизненный цикл и DI', () => {
     expect(providers).toEqual(expect.arrayContaining([
       AlertBotService, AlertBotTools, AlertBotOpsServer, AlertBotLifecycle,
       RepairStore, AlertBotRepairExecutor, AlertBotRepairJobs, AlertBotRepairAuth, AlertBotRepairTools,
+      AlertBotRepairService,
     ]));
     expect(providers).not.toContain(ChatService);
     expect(providers).not.toContain(SupportService);

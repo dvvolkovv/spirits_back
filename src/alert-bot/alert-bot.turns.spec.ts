@@ -38,6 +38,7 @@ describe('AlertBotTurns', () => {
   let store: Record<string, jest.Mock>;
   let telegram: Record<string, jest.Mock>;
   let ai: { answer: jest.Mock };
+  let repairs: { run: jest.Mock };
   let status: { summary: jest.Mock };
   let chat: { beginStream: jest.Mock; endStream: jest.Mock };
   let support: { findTicketByPrefix: jest.Mock };
@@ -80,17 +81,19 @@ describe('AlertBotTurns', () => {
     ai = {
       answer: jest.fn().mockResolvedValue({ text: 'Всё спокойно', costUsd: 0.02, tools: ['health'] }),
     };
+    repairs = { run: jest.fn() };
     status = { summary: jest.fn().mockResolvedValue('Алерты: горящих нет') };
     chat = { beginStream: jest.fn(), endStream: jest.fn() };
     support = { findTicketByPrefix: jest.fn().mockResolvedValue(null) };
     logger = { error: jest.fn(), warn: jest.fn(), log: jest.fn(), debug: jest.fn() };
-    turns = new AlertBotTurns(
+    turns = new (AlertBotTurns as any)(
       store as any,
       telegram as any,
       ai as any,
       status as any,
       chat as any,
       support as any,
+      repairs as any,
     );
     (turns as any).logger = logger;
   });
@@ -149,6 +152,75 @@ describe('AlertBotTurns', () => {
       telegram.sendChunks.mock.invocationCallOrder[0],
     );
     expect(store.completeDelivery).toHaveBeenCalledWith('turn-1', [901, 902, 903]);
+  });
+
+  it('repair использует тот же turn queue, history, journal и delivery с repair placeholder', async () => {
+    const input = question({
+      mode: 'repair', repairId: 'repair-1', question: 'Почини', replyText: 'Диагноз', parentTurnId: 'parent-1',
+    });
+    const history = [{ question: 'прежний вопрос', answer: 'прежний ответ' }];
+    store.turnChain.mockResolvedValue(history);
+    repairs.run.mockResolvedValue({
+      text: 'Исправлено и проверено\nГотово', costUsd: 0.5, tools: ['repair_exec'], turnStatus: 'ok',
+    });
+
+    await expect(turns.enqueue(input)).resolves.toBe('accepted');
+
+    expect(telegram.sendMessage).toHaveBeenCalledWith('100', '🛠 Исправляю…', 300);
+    expect(repairs.run).toHaveBeenCalledWith('repair-1', 'turn-1', input, history);
+    expect(ai.answer).not.toHaveBeenCalled();
+    expect(status.summary).not.toHaveBeenCalled();
+    expect(store.markModelStarted).toHaveBeenCalledWith('turn-1');
+    expect(store.markModelStarted.mock.invocationCallOrder[0]).toBeLessThan(repairs.run.mock.invocationCallOrder[0]);
+    expect(store.finishTurn).toHaveBeenCalledWith('turn-1', expect.objectContaining({
+      status: 'ok', answer: 'Исправлено и проверено\nГотово', tools: ['repair_exec'],
+      durationMs: expect.any(Number), costUsd: 0.5,
+    }));
+    expect(telegram.sendChunks).toHaveBeenCalledWith(
+      '100', 'Исправлено и проверено\nГотово', 901, 300, undefined, expect.any(Function), [],
+    );
+  });
+
+  it.each(['timeout', 'error'] as const)('repair turnStatus %s сохраняется до delivery', async (turnStatus) => {
+    repairs.run.mockResolvedValue({ text: 'Не исправлено', costUsd: 0.1, tools: ['repair_exec'], turnStatus });
+
+    await expect(turns.enqueue(question({ mode: 'repair', repairId: 'repair-1' }))).resolves.toBe('accepted');
+
+    expect(store.finishTurn).toHaveBeenCalledWith('turn-1', expect.objectContaining({
+      status: turnStatus, answer: 'Не исправлено', tools: ['repair_exec'], costUsd: 0.1,
+    }));
+    expect(telegram.sendChunks).toHaveBeenCalledWith(
+      '100', 'Не исправлено', 901, 300, undefined, expect.any(Function), [],
+    );
+  });
+
+  it('repair finishTurn=false не доставляет ответ и возвращает turn_fenced', async () => {
+    repairs.run.mockResolvedValue({ text: 'Готово', costUsd: 0, tools: [], turnStatus: 'ok' });
+    store.finishTurn.mockResolvedValue(false);
+
+    await expect(turns.enqueue(question({ mode: 'repair', repairId: 'repair-1' })))
+      .rejects.toMatchObject({ kind: 'turn_fenced' });
+
+    expect(repairs.run).toHaveBeenCalledTimes(1);
+    expect(telegram.sendChunks).not.toHaveBeenCalled();
+    expect(store.completeDelivery).not.toHaveBeenCalled();
+  });
+
+  it('resume repair с modelStartedAt и answer=null не запускает вторую модель', async () => {
+    store.admitTurn.mockResolvedValue({
+      status: 'existing',
+      turn: {
+        id: 'turn-1', status: 'in_progress', answer: null, answerMessageIds: [],
+        modelStartedAt: new Date(), deliveryCompletedAt: null,
+      },
+    });
+
+    await expect(turns.enqueue(question({ mode: 'repair', repairId: 'repair-1' })))
+      .rejects.toMatchObject({ kind: 'model_in_flight' });
+
+    expect(repairs.run).not.toHaveBeenCalled();
+    expect(ai.answer).not.toHaveBeenCalled();
+    expect(telegram.sendMessage).not.toHaveBeenCalled();
   });
 
   it('ищет не более десяти уникальных ticket-prefix candidates за ответ', async () => {
