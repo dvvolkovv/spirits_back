@@ -348,6 +348,13 @@ maybe('durable repair store против PostgreSQL', () => {
     expect((await store.findRepair(repairId))?.status).toBe('cancelled');
   });
 
+  it('entered wait bounded и проходит через cleanup при regression', async () => {
+    const startedAt = Date.now();
+    await expect(boundedEnteredForTest(new Promise<void>(() => undefined), 20))
+      .rejects.toThrow('request_cancel_not_entered');
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
   it('cleanup stop wait bounded при regression и не требует исходного settle', async () => {
     const startedAt = Date.now();
     await expect(boundedStoppedForCleanup(new Promise<void>(() => undefined), 20)).resolves.toBeUndefined();
@@ -403,7 +410,7 @@ maybe('durable repair store против PostgreSQL', () => {
       await blocker.query('BEGIN');
       await blocker.query('UPDATE alert_bot_repairs SET mutation_count = mutation_count WHERE id = $1', [repairId]);
       stopped = executor.stopRepair(repairId);
-      await entered;
+      await boundedEnteredForTest(entered);
       const outcome = await Promise.race([
         stopped.then(() => 'stopped'),
         new Promise<string>((resolve) => { timer = setTimeout(() => resolve('stop_hung'), 5_000); }),
