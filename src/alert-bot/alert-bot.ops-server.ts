@@ -213,7 +213,10 @@ export class AlertBotOpsServer {
         let isError = false;
         try {
           const parsed = JSON.parse(text);
-          isError = Boolean(parsed && typeof parsed === 'object' && 'error' in parsed && parsed.error !== undefined);
+          isError = Boolean(parsed && typeof parsed === 'object' && (
+            ('error' in parsed && parsed.error !== undefined)
+            || ('startError' in parsed && parsed.startError !== undefined)
+          ));
         } catch { /* Обычный текст инструмента не является JSON-ошибкой. */ }
         this.sendJson(res, 200, {
           jsonrpc: '2.0', id,
