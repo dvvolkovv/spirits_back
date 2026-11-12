@@ -880,3 +880,29 @@ describe('account deletion sanitizer regressions', () => {
     expect(binaryCalls).toBe(0);
   });
 });
+
+describe('account deletion numeric property regressions', () => {
+  it.each(['0', '123'])('отклоняет numeric property в deletionPayloadJson: %s', (key) => {
+    const value = key === '0' ? CANARY : SECRET;
+    expect(() => deletionPayloadJson({ [key]: value }, USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it.each(['0', '123'])('отклоняет numeric property в assertSafeJobSpec: %s', (key) => {
+    const value = key === '0' ? CANARY : SECRET;
+    expect(() => assertSafeJobSpec(job({ [key]: value }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('сохраняет technical fields и массивы без numeric-key bypass', () => {
+    const payload = {
+      voiceId: 'voice-1',
+      ids: ['technical-1', 'technical-2'],
+      nested: [{ productId: 'product-1' }],
+    };
+    expect(deletionPayloadJson(payload, USER_ID)).toBe(
+      '{"voiceId":"voice-1","ids":["technical-1","technical-2"],"nested":[{"productId":"product-1"}]}',
+    );
+    expect(() => assertSafeJobSpec(job(payload), USER_ID)).not.toThrow();
+  });
+});
