@@ -21,7 +21,11 @@ export class AccountDeletionJobs {
          AND u.state='deleted'
          AND j.status='running'
          AND j.attempts=$4
-         AND j.lease_until IS NOT DISTINCT FROM $5::timestamptz`,
+         AND $5::timestamptz IS NOT NULL
+         AND j.lease_until IS NOT NULL
+         AND j.lease_until > now()
+         AND j.lease_until >= $5::timestamptz
+         AND j.lease_until < $5::timestamptz + interval '1 millisecond'`,
       [job.id, job.userId, job.deletionId, job.attempts, job.leaseUntil],
     );
     if (result.rowCount !== 1) throw new DeletionCancelledError();

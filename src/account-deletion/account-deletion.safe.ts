@@ -456,19 +456,24 @@ export function deletionResourceHash(bucket: string, key: string): string {
     .digest('hex');
 }
 
-export function assertSafeJobSpec(job: DeletionJobSpec, userId: string): void {
+export function safeJobPayloadJson(job: DeletionJobSpec, userId: string): string {
   assertSafeResourceType(job.resourceType);
   if (SKIP_ONLY_RESOURCE_TYPES.has(job.resourceType)) throw new Error('unsafe_resource_type');
   const expectedPhase = job.resourceType === 'account.core.immediate'
     || job.resourceType.endsWith('.stop') ? 'immediate' : 'purge';
   if (job.phase !== expectedPhase) throw new Error('unsafe_phase');
-  deletionPayloadJson(job.payload, userId);
+  const payloadJson = deletionPayloadJson(job.payload, userId);
   if (typeof job.resourceKey === 'string'
     && (job.resourceKey === userId
       || (userId.length >= 6 && job.resourceKey.includes(userId)))) {
     throw new Error('unsafe_payload');
   }
   if (unsafeResourceKeyFormat(job.resourceKey)) throw new Error('unsafe_resource_key');
+  return payloadJson;
+}
+
+export function assertSafeJobSpec(job: DeletionJobSpec, userId: string): void {
+  safeJobPayloadJson(job, userId);
 }
 
 export function assertSafeSkip(skip: DeletionSkip): void {

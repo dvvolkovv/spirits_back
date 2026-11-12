@@ -1,6 +1,7 @@
 import {
   ACCOUNT_DELETION_RETENTION_MS,
-  assertSafeJobSpec,
+  assertSafeSkip,
+  safeJobPayloadJson,
 } from './account-deletion.safe';
 import type {
   DeletionAccount,
@@ -35,10 +36,13 @@ export class AccountDeletionPlanner {
     for (const discover of this.discoverers) {
       const part = await discover({ db, account, origin });
       for (const job of part.jobs) {
-        assertSafeJobSpec(job, account.userId);
-        jobs.push(job);
+        const payloadJson = safeJobPayloadJson(job, account.userId);
+        jobs.push({ ...job, payload: JSON.parse(payloadJson) });
       }
-      skips.push(...part.skips);
+      for (const skip of part.skips) {
+        assertSafeSkip(skip);
+        skips.push(skip);
+      }
     }
 
     return { jobs, skips };
@@ -49,7 +53,12 @@ export class AccountDeletionPlanner {
     account: DeletionAccount,
     plan: DeletionPlan,
   ): Promise<void> {
-    for (const job of plan.jobs) {
+    const validatedJobs = plan.jobs.map((job) => ({
+      job,
+      payloadJson: safeJobPayloadJson(job, account.userId),
+    }));
+
+    for (const { job, payloadJson } of validatedJobs) {
       const runAt = job.phase === 'immediate'
         ? new Date()
         : new Date(account.deletedAt.getTime() + ACCOUNT_DELETION_RETENTION_MS);
@@ -64,7 +73,7 @@ export class AccountDeletionPlanner {
           job.resourceType,
           job.resourceKey,
           job.phase,
-          JSON.stringify(job.payload),
+          payloadJson,
           runAt,
         ],
       );
