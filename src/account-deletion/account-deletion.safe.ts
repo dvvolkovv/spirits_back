@@ -400,7 +400,10 @@ function sanitizeJsonValue(
     }
     const result: Record<string, PlainJsonValue> = Object.create(null);
     for (const property of Object.keys(objectValue)) {
-      if (userId.length >= 6 && property.includes(userId)) throw new Error('unsafe_payload');
+      if (property === userId
+        || (userId.length >= 6 && property.includes(userId))) {
+        throw new Error('unsafe_payload');
+      }
       if (unsafePayloadKey(property)) throw new Error('unsafe_payload');
       const sanitized = sanitizeJsonValue(objectValue[property], userId, stack, property);
       if (sanitized !== OMIT_JSON_VALUE) result[property] = sanitized;
