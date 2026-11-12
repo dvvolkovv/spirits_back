@@ -28,6 +28,11 @@ async function boundedStoppedForCleanup(stopped: Promise<void> | undefined, time
   }
 }
 
+function forceReleaseForCleanup(client: PoolClient | undefined): void {
+  // Повторный release уже возвращённого client не должен заменить исходный assertion.
+  try { client?.release(true); } catch { /* client уже возвращён в pool */ }
+}
+
 maybe('durable repair store против PostgreSQL', () => {
   jest.setTimeout(30_000);
   let admin: Pool;
