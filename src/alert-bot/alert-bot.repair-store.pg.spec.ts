@@ -1,4 +1,6 @@
 import { Pool } from 'pg';
+import { queryWithCancellation } from '../common/services/pg-cancellation';
+import { AlertBotRepairExecutor } from './alert-bot.repair-executor';
 import { AlertBotStore } from './alert-bot.store';
 import {
   CreateRepairJobInput,
@@ -292,6 +294,54 @@ maybe('durable repair store против PostgreSQL', () => {
     await expect(store.createJob(jobInput(repairId))).resolves.toBeNull();
     expect(await store.finishRepair(repairId, 'cancelled', 0)).toBe(true);
     expect((await store.findRepair(repairId))?.status).toBe('cancelled');
+  });
+
+  it('hanging requestCancel abort-ится при bounded stop и не удерживает единственный pool client', async () => {
+    const repairId = await admit('cancel-abort-pool');
+    const blocker = await pool.connect();
+    const singlePool = new Pool({
+      connectionString: PG, max: 1, options: `-c search_path=${SCHEMA}`,
+    });
+    const signals: Array<AbortSignal | undefined> = [];
+    let markEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+    const pg = {
+      query: (text: string, params?: any[], signal?: AbortSignal) => {
+        if (text.includes("UPDATE alert_bot_repairs SET status = 'cancel_requested'")) {
+          signals.push(signal);
+          markEntered();
+        }
+        return queryWithCancellation(singlePool, text, params, signal);
+      },
+      getClient: () => singlePool.connect(),
+    };
+    const singleStore = new RepairStore(pg as any);
+    const executor = new AlertBotRepairExecutor(singleStore);
+    let stopped: Promise<void> | undefined;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await blocker.query('BEGIN');
+      await blocker.query('UPDATE alert_bot_repairs SET mutation_count = mutation_count WHERE id = $1', [repairId]);
+      stopped = executor.stopRepair(repairId);
+      await entered;
+      const outcome = await Promise.race([
+        stopped.then(() => 'stopped'),
+        new Promise<string>((resolve) => { timer = setTimeout(() => resolve('stop_hung'), 5_000); }),
+      ]);
+      expect(outcome).toBe('stopped');
+      expect(singlePool.totalCount).toBe(1);
+      expect(singlePool.idleCount).toBe(1);
+      expect(signals).toHaveLength(1);
+      expect(signals[0]?.aborted).toBe(true);
+      await expect(singleStore.findRepair(repairId)).resolves.toMatchObject({ id: repairId });
+    } finally {
+      if (timer) clearTimeout(timer);
+      await blocker.query('ROLLBACK').catch(() => undefined);
+      blocker.release(true);
+      if (stopped) await stopped;
+      await executor.stopAll();
+      await singlePool.end();
+    }
   });
 
   it('queued job нельзя запустить после requestCancel', async () => {
