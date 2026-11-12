@@ -147,6 +147,24 @@ const TEXT_LIKE_KEY_PARTS = [
   'subject',
   'summary',
 ];
+const TECHNICAL_KEY_FAMILIES = new Set([
+  'filekey',
+  'objectkey',
+  's3key',
+  'miniokey',
+  'storagekey',
+  'resourcekey',
+  'documentkey',
+  'voicekey',
+  'mediakey',
+  'cachekey',
+  'dedupekey',
+  'idempotencykey',
+  'jobkey',
+  'requestkey',
+  'locatorkey',
+  'hashkey',
+]);
 const FORBIDDEN_QUERY_PARTS = new Set([
   'token',
   'sig',
@@ -221,7 +239,8 @@ function unsafePayloadKey(key: string): boolean {
     return true;
   }
   if (['token', 'secret', 'password', 'credential', 'authorization', 'jwt', 'cookie',
-    'email', 'phone', 'session', 'code', 'accesskey'].some((part) => normalized.includes(part))) {
+    'email', 'phone', 'session', 'code', 'accesskey', 'encryptionkey', 'decryptionkey',
+    'signingkey', 'masterkey'].some((part) => normalized.includes(part))) {
     return true;
   }
   if (/^auth(?:entication|orization|token|key|secret|code|credential|signature|sig)/
@@ -231,7 +250,10 @@ function unsafePayloadKey(key: string): boolean {
   if (normalized.includes('apikey') || normalized.includes('privatekey')) return true;
   if (TECHNICAL_PAYLOAD_KEYS.has(normalized)) return false;
   if (normalized.endsWith('id') || normalized.endsWith('ids')) return false;
-  if (normalized.endsWith('key') || normalized.endsWith('keys')) return false;
+  if (TECHNICAL_KEY_FAMILIES.has(normalized)) return false;
+  if (normalized.endsWith('s') && TECHNICAL_KEY_FAMILIES.has(normalized.slice(0, -1))) {
+    return false;
+  }
   if (normalized.endsWith('url') || normalized.endsWith('urls')) return false;
   if (normalized.endsWith('path') || normalized.endsWith('paths')) return false;
   if (normalized.endsWith('kind')) return false;
@@ -274,7 +296,7 @@ function unsafePayloadString(value: string, userId: string, depth = 0): boolean 
       // Проверяем встроенные URL ниже.
     }
     const normalized = variant.replace(/[\t\r\n]/g, '');
-    const candidates = normalized.match(/(?:[a-z][a-z0-9+.-]*:)?\/\/[^\s]+/gi) ?? [];
+    const candidates = normalized.match(/(?:[a-z][a-z0-9+.-]*:[^\s]+|\/\/[^\s]+)/gi) ?? [];
     for (const candidate of candidates) {
       try {
         const url = candidate.startsWith('//')
@@ -298,8 +320,7 @@ function unsafePayloadString(value: string, userId: string, depth = 0): boolean 
       if (decoded === variant) break;
       variant = decoded;
     } catch {
-      if (/%(?:3a|2f|3f|3d|26)/i.test(variant)) return true;
-      break;
+      return true;
     }
   }
   return false;
@@ -463,9 +484,12 @@ export function safeDeletionMessage(input: {
   resourceKey: string;
   attempts: number;
   kind: DeletionErrorKind;
-  userId?: string;
+  userId: string;
 }): string {
   assertSafeResourceType(input.resourceType);
+  if (typeof input.userId !== 'string' || input.userId.trim().length === 0) {
+    throw new Error('unsafe_user_id');
+  }
   if (typeof input.deletionId !== 'string'
     || input.deletionId.length !== 36 || !DELETION_ID_RE.test(input.deletionId)) {
     throw new Error('unsafe_deletion_id');
