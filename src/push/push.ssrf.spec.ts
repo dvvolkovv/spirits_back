@@ -33,6 +33,30 @@ function makeService(rows: any[] = [], state: 'active' | 'deleted' = 'active') {
 
 const keys = { p256dh: 'k', auth: 'a' };
 
+function makeAtomicWriteRaceService() {
+  let state: 'active' | 'deleted' = 'active';
+  let firstActiveSelect = true;
+  const subscriptions: any[] = [];
+  const pg = {
+    query: jest.fn(async (sql: string, params: any[] = []) => {
+      const normalized = sql.replace(/\s+/g, ' ').trim();
+      if (normalized.startsWith("SELECT 1 FROM user_id WHERE internal_id=$1 AND state='active'") && firstActiveSelect) {
+        firstActiveSelect = false;
+        state = 'deleted';
+        return { rows: [{ '?column?': 1 }], rowCount: 1 };
+      }
+      if (normalized.startsWith('INSERT INTO push_subscriptions')) {
+        const guarded = normalized.includes('WHERE EXISTS') && normalized.includes("state='active'");
+        if (state === 'deleted' && guarded) return { rows: [], rowCount: 0 };
+        subscriptions.push({ userId: params[0], endpoint: params[1] });
+        return { rows: [], rowCount: 1 };
+      }
+      throw new Error(`unexpected query: ${normalized}`);
+    }),
+  };
+  return { svc: new PushService(pg as any), subscriptions };
+}
+
 afterEach(() => {
   __setSafeFetchDepsForTests(null);
   jest.clearAllMocks();
@@ -77,6 +101,18 @@ describe('POST /push/subscribe', () => {
       expect.stringMatching(/INSERT INTO push_subscriptions/),
       ['u-1', 'fcm:native-token'],
     );
+  });
+
+  it('active→deleted после precheck не создаёт web subscription без атомарного guard', async () => {
+    const { svc, subscriptions } = makeAtomicWriteRaceService();
+    await svc.subscribe('u-1', { endpoint: 'https://fcm.googleapis.com/fcm/send/abc', keys });
+    expect(subscriptions).toEqual([]);
+  });
+
+  it('active→deleted после precheck не создаёт native subscription без атомарного guard', async () => {
+    const { svc, subscriptions } = makeAtomicWriteRaceService();
+    await svc.registerNative('u-1', 'native-token');
+    expect(subscriptions).toEqual([]);
   });
 });
 

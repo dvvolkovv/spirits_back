@@ -24,8 +24,10 @@ class FakeDeletionDb {
   readonly users = new Map<string, FakeUser>();
   routines: Array<Record<string, any>> = [];
   subscriptions: Array<{ userId: string; endpoint: string }> = [];
+  readonly queries: Array<{ sql: string; params: any[] }> = [];
 
   async query(sql: string, params: any[] = []) {
+    this.queries.push({ sql, params });
     const s = sql.replace(/\s+/g, ' ').trim();
     if (s.startsWith('SELECT r.id FROM routine_pushes r WHERE r.user_id=$1')) {
       return {
@@ -225,6 +227,34 @@ describe('RoutineAccountDeletionAdapter', () => {
     expect(routines.clearRetryTimersForUser).not.toHaveBeenCalled();
   });
 
+  it('normalized destructive SQL сам содержит owner/state/deletion predicates', async () => {
+    const db = new FakeDeletionDb();
+    db.users.set(account.userId, { state: 'deleted', deletionId });
+    db.routines = [{ id: 'routine-1', userId: account.userId, enabled: true }];
+    db.subscriptions = [{ userId: account.userId, endpoint: 'https://private.example/endpoint' }];
+    const { adapter } = makeAdapter(db);
+
+    await adapter.execute(job('routine.stop', 'routine-1'), execution(db));
+    await adapter.execute(job('routine.purge', 'routine-1'), execution(db));
+    await adapter.execute(job('push.purge', 'push'), execution(db));
+
+    const normalized = db.queries.map(({ sql }) => sql.replace(/\s+/g, ' ').trim());
+    const stop = normalized.find((sql) => sql.startsWith('UPDATE routine_pushes r SET enabled=false'))!;
+    const routinePurge = normalized.find((sql) => sql.startsWith('DELETE FROM routine_pushes r'))!;
+    const pushPurge = normalized.find((sql) => sql.startsWith('DELETE FROM push_subscriptions s'))!;
+    for (const sql of [stop, routinePurge]) {
+      expect(sql).toContain('r.id=$1');
+      expect(sql).toContain('r.user_id=$2');
+      expect(sql).toContain('u.internal_id=$2');
+      expect(sql).toContain("u.state='deleted'");
+      expect(sql).toContain('u.deletion_id=$3');
+    }
+    expect(pushPurge).toContain('s.user_id=$1');
+    expect(pushPurge).toContain('u.internal_id=$1');
+    expect(pushPurge).toContain("u.state='deleted'");
+    expect(pushPurge).toContain('u.deletion_id=$2');
+  });
+
   it('регистрируется в существующем Registry без глобального assertReady', () => {
     const db = new FakeDeletionDb();
     const registry = new AccountDeletionRegistry();
@@ -312,14 +342,19 @@ describe('RoutineStore active fences', () => {
     expect(await makeStore('active').store.listEnabled()).toHaveLength(1);
   });
 
-  it('claimToday сохраняет CAS и не даёт deleted застолбить день', async () => {
+  it('claimToday сохраняет CAS, enabled/owner и не даёт deleted застолбить день', async () => {
     const deleted = makeStore('deleted');
-    expect(await deleted.store.claimToday('routine-1', '2026-11-11')).toBe(false);
+    expect(await (deleted.store as any).claimToday('routine-1', '2026-11-11', account.userId)).toBe(false);
     const active = makeStore('active');
-    expect(await active.store.claimToday('routine-1', '2026-11-11')).toBe(true);
-    const sql = active.pg.query.mock.calls.find(([query]) => String(query).includes('SET last_sent_date='))?.[0];
+    expect(await (active.store as any).claimToday('routine-1', '2026-11-11', account.userId)).toBe(true);
+    const call = active.pg.query.mock.calls.find(([query]) => String(query).includes('SET last_sent_date='));
+    const sql = String(call?.[0]).replace(/\s+/g, ' ');
+    expect(sql).toContain('r.enabled=true');
+    expect(sql).toContain('r.user_id=$3');
     expect(sql).toContain('last_sent_date IS DISTINCT FROM $2');
+    expect(sql).toContain("u.state='active'");
     expect(sql).toContain('RETURNING r.id');
+    expect(call?.[1]).toEqual(['routine-1', '2026-11-11', account.userId]);
   });
 
   it('create/update не создают и не обновляют deleted, active contracts сохраняются', async () => {
@@ -332,5 +367,121 @@ describe('RoutineStore active fences', () => {
     const active = makeStore('active');
     expect((await active.store.create(account.userId, data))?.id).toBe('routine-new');
     expect((await active.store.update(account.userId, 'routine-1', data))?.title).toBe('after');
+  });
+});
+
+describe('RoutineStore claim/release CAS', () => {
+  function makeCasStore(routine: { id: string; userId: string; enabled: boolean; lastSentDate: string | null }) {
+    const pg = {
+      query: jest.fn(async (sql: string, params: any[] = []) => {
+        const s = sql.replace(/\s+/g, ' ').trim();
+        if (s.startsWith('UPDATE routine_pushes r SET last_sent_date=')) {
+          const fenced = s.includes('r.enabled=true')
+            && s.includes('r.user_id=$3')
+            && s.includes("u.state='active'")
+            && s.includes('last_sent_date IS DISTINCT FROM $2');
+          const distinct = routine.lastSentDate !== params[1];
+          const claimed = fenced
+            ? distinct && routine.enabled && routine.userId === params[2]
+            : distinct;
+          if (claimed) routine.lastSentDate = params[1];
+          return { rows: claimed ? [{ id: routine.id }] : [], rowCount: claimed ? 1 : 0 };
+        }
+        if (s.startsWith('UPDATE routine_pushes SET last_sent_date=')) {
+          const cas = /WHERE id\s*=\s*\$1 AND last_sent_date\s*=\s*\$2/.test(s);
+          const released = cas && routine.lastSentDate === params[1];
+          if (released) routine.lastSentDate = params[2];
+          return { rows: released ? [{ id: routine.id }] : [], rowCount: released ? 1 : 0 };
+        }
+        throw new Error(`unexpected query: ${s}`);
+      }),
+    };
+    return { store: new RoutineStore(pg as any), pg };
+  }
+
+  it.each(['disabled', 'owner'])('%s между get и claim не даёт застолбить день', async (race) => {
+    const routine = { id: 'routine-1', userId: account.userId, enabled: true, lastSentDate: null };
+    if (race === 'disabled') routine.enabled = false;
+    else routine.userId = 'u-other';
+    const { store } = makeCasStore(routine);
+
+    expect(await (store as any).claimToday('routine-1', '2026-11-11', account.userId)).toBe(false);
+    expect(routine.lastSentDate).toBeNull();
+  });
+
+  it('releaseToday восстанавливает prev только по своему today claim', async () => {
+    const routine = { id: 'routine-1', userId: account.userId, enabled: true, lastSentDate: '2026-11-11' };
+    const { store, pg } = makeCasStore(routine);
+
+    expect(await (store as any).releaseToday('routine-1', '2026-11-11', '2026-11-04')).toBe(true);
+    expect(routine.lastSentDate).toBe('2026-11-04');
+    expect(pg.query).toHaveBeenCalledWith(expect.stringMatching(/last_sent_date\s*=\s*\$3/), [
+      'routine-1', '2026-11-11', '2026-11-04',
+    ]);
+  });
+
+  it('releaseToday не затирает более новый claim', async () => {
+    const routine = { id: 'routine-1', userId: account.userId, enabled: true, lastSentDate: '2026-11-12' };
+    const { store } = makeCasStore(routine);
+
+    expect(await (store as any).releaseToday('routine-1', '2026-11-11', '2026-11-04')).toBe(false);
+    expect(routine.lastSentDate).toBe('2026-11-12');
+  });
+});
+
+describe('RoutineStore atomic active write fence', () => {
+  function makeWriteRaceStore() {
+    let state: 'active' | 'deleted' = 'active';
+    let firstActiveSelect = true;
+    const created: any[] = [];
+    const current = {
+      id: 'routine-1', user_id: account.userId, title: 'before', assistant_id: '14', prompt: 'before',
+      send_hour: 8, tz: 'Europe/Moscow', days: null, enabled: true, last_sent_date: null,
+    };
+    const pg = {
+      query: jest.fn(async (sql: string, params: any[] = []) => {
+        const s = sql.replace(/\s+/g, ' ').trim();
+        if (s.startsWith("SELECT 1 FROM user_id WHERE internal_id=$1 AND state='active'") && firstActiveSelect) {
+          firstActiveSelect = false;
+          state = 'deleted';
+          return { rows: [{ '?column?': 1 }], rowCount: 1 };
+        }
+        if (s.startsWith('SELECT count(*)::int AS n FROM routine_pushes')) {
+          return { rows: [{ n: 0 }], rowCount: 1 };
+        }
+        if (s.startsWith('SELECT id, user_id, title, assistant_id, prompt, send_hour, tz, days, enabled, last_sent_date FROM routine_pushes WHERE user_id = $1 AND id = $2')) {
+          return { rows: [{ ...current }], rowCount: 1 };
+        }
+        if (s.startsWith('INSERT INTO routine_pushes')) {
+          const guarded = s.includes('WHERE EXISTS') && s.includes("state='active'");
+          if (state === 'deleted' && guarded) return { rows: [], rowCount: 0 };
+          const row = { ...current, id: 'routine-new', title: params[1], prompt: params[3] };
+          created.push(row);
+          return { rows: [row], rowCount: 1 };
+        }
+        if (s.startsWith('UPDATE routine_pushes SET title=')) {
+          const guarded = s.includes('AND EXISTS') && s.includes("u.state='active'");
+          if (state === 'deleted' && guarded) return { rows: [], rowCount: 0 };
+          current.title = params[2];
+          current.prompt = params[4];
+          return { rows: [{ ...current }], rowCount: 1 };
+        }
+        throw new Error(`unexpected query: ${s}`);
+      }),
+    };
+    return { store: new RoutineStore(pg as any), created, current };
+  }
+
+  it('create не пишет, если deleted наступил после active SELECT', async () => {
+    const { store, created } = makeWriteRaceStore();
+    expect(await store.create(account.userId, { title: 'after', assistantId: '14', prompt: 'after' })).toBeNull();
+    expect(created).toEqual([]);
+  });
+
+  it('update не пишет, если deleted наступил после active SELECT', async () => {
+    const { store, current } = makeWriteRaceStore();
+    expect(await store.update(account.userId, 'routine-1', { title: 'after', prompt: 'after' })).toBeNull();
+    expect(current.title).toBe('before');
+    expect(current.prompt).toBe('before');
   });
 });
