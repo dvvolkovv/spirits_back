@@ -137,6 +137,7 @@ export class AlertBotRepairExecutor {
   private stopAllEpoch = 0;
   private reconciliation: NodeJS.Timeout | null;
   private reconciling = false;
+  private closeWaitMs = LOCAL_CLOSE_WAIT_MS;
 
   constructor(private readonly store: RepairStore) {
     this.reconciliation = setInterval(() => {
@@ -330,7 +331,7 @@ export class AlertBotRepairExecutor {
     await bounded(request);
     await bounded(this.repairChains.get(repairId) ?? Promise.resolve());
     const late = this.terminateLocal(repairId);
-    await bounded(Promise.allSettled([early, late]), LOCAL_CLOSE_WAIT_MS);
+    await bounded(Promise.allSettled([early, late]), this.closeWaitMs);
     await bounded(this.flushPendingForRepair(repairId));
     await bounded(this.maybeCleanup(repairId));
   }
@@ -346,7 +347,7 @@ export class AlertBotRepairExecutor {
     const early = this.terminateLocal();
     await bounded(Promise.all([...this.repairChains.values()]));
     const late = this.terminateLocal();
-    await bounded(Promise.allSettled([early, late]), LOCAL_CLOSE_WAIT_MS);
+    await bounded(Promise.allSettled([early, late]), this.closeWaitMs);
     await bounded(this.flushPendingForRepair());
     const repairs = new Set([...this.repairChains.keys(), ...this.cancellingRepairs.values()]);
     await bounded(Promise.all([...repairs].map((repairId) => this.maybeCleanup(repairId))));
@@ -463,9 +464,15 @@ export class AlertBotRepairExecutor {
     const child = this.children.get(jobId);
     if (!state || !child) return;
     if (state.host !== 'prod') {
-      if (outcome === 'timeout' && !state.finished && !state.outcome) {
-        state.outcome = 'timeout';
-        this.signalGroup(child, 'SIGKILL');
+      if (outcome === 'timeout' && !state.finished) {
+        if (!state.outcome) {
+          state.outcome = 'timeout';
+          this.signalGroup(child, 'SIGKILL');
+        }
+        await bounded(state.completion, this.closeWaitMs);
+        if (!state.finished) {
+          await this.finishProcess(jobId, 'interrupted', null, 'remote_outcome_unknown');
+        }
       }
       return;
     }
@@ -478,7 +485,7 @@ export class AlertBotRepairExecutor {
       }, 5_000);
       state.killTimer.ref();
     }
-    await bounded(state.completion, LOCAL_CLOSE_WAIT_MS);
+    await bounded(state.completion, this.closeWaitMs);
     if (!state.finished) {
       await this.finishProcess(jobId, 'interrupted', null, 'process_close_unconfirmed');
     }
