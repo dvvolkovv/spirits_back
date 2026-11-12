@@ -298,6 +298,12 @@ maybe('durable repair store против PostgreSQL', () => {
     expect((await store.findRepair(repairId))?.status).toBe('cancelled');
   });
 
+  it('cleanup stop wait bounded при regression и не требует исходного settle', async () => {
+    const startedAt = Date.now();
+    await expect(boundedStoppedForCleanup(new Promise<void>(() => undefined), 20)).resolves.toBeUndefined();
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
   it('hanging requestCancel abort-ится при bounded stop и не удерживает единственный pool client', async () => {
     const repairId = await admit('cancel-abort-pool');
     const blocker = await pool.connect();
@@ -340,7 +346,7 @@ maybe('durable repair store против PostgreSQL', () => {
       if (timer) clearTimeout(timer);
       await blocker.query('ROLLBACK').catch(() => undefined);
       blocker.release(true);
-      if (stopped) await stopped;
+      await boundedStoppedForCleanup(stopped);
       await executor.stopAll();
       await singlePool.end();
     }
