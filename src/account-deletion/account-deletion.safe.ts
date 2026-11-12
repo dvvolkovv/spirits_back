@@ -62,8 +62,10 @@ const DELETION_RESOURCE_TYPE_LIST = [
 ] as const satisfies readonly DeletionResourceType[];
 export const DELETION_RESOURCE_TYPES: ReadonlySet<DeletionResourceType> =
   new Set(DELETION_RESOURCE_TYPE_LIST);
+const SKIP_ONLY_RESOURCE_TYPES: ReadonlySet<DeletionResourceType> =
+  new Set(['calendar.external', 'video.provider']);
 
-const FORBIDDEN_KEYS = new Set([
+const FORBIDDEN_PAYLOAD_KEYS = new Set([
   'text',
   'content',
   'prompt',
@@ -74,26 +76,64 @@ const FORBIDDEN_KEYS = new Set([
   'body',
   'comment',
   'caption',
+  'title',
+  'subject',
+  'summary',
+  'email',
+  'phone',
+  'cookie',
+  'jwt',
+  'code',
+  'session',
   'token',
   'secret',
   'secretenc',
   'password',
   'userid',
+  'ownerid',
+  'internalid',
   'composedplan',
   'foundfile',
+  'credentials',
+  'credential',
   'credentialsurl',
   'credentialurl',
   'accesstoken',
   'refreshtoken',
   'clientsecret',
 ]);
-const FORBIDDEN_KEY_PARTS = new Set([
-  'token',
-  'secret',
-  'password',
-  'credential',
-  'credentials',
-  'authorization',
+const TECHNICAL_PAYLOAD_KEYS = new Set([
+  'nested',
+  'file',
+  'document',
+  'payload',
+  'items',
+  'host',
+  'slug',
+  'bucket',
+  'status',
+  'reason',
+  'attempt',
+  'attempts',
+  'provider',
+  'kind',
+  'scope',
+  'dryrun',
+  'deleteold',
+  'timeoutms',
+  'maxattempts',
+  'retentiondays',
+  'gracems',
+  'hash',
+  'contenttype',
+  'path',
+  'paths',
+  'url',
+  'urls',
+  'key',
+  'keys',
+  'id',
+  'ids',
 ]);
 const TEXT_LIKE_KEY_PARTS = [
   'text',
@@ -103,9 +143,10 @@ const TEXT_LIKE_KEY_PARTS = [
   'caption',
   'description',
   'body',
+  'title',
+  'subject',
+  'summary',
 ];
-const URL_WITH_USERINFO = /[a-z][a-z0-9+.-]*:\/\/[^/\s?#]*@/i;
-const PHONE_LIKE_RESOURCE_KEY = /^\+?[0-9][0-9\s().-]{5,}$/;
 const FORBIDDEN_QUERY_PARTS = new Set([
   'token',
   'sig',
@@ -117,6 +158,9 @@ const FORBIDDEN_QUERY_PARTS = new Set([
   'credentials',
   'auth',
   'authorization',
+  'jwt',
+  'code',
+  'session',
 ]);
 const FORBIDDEN_QUERY_KEYS = new Set([
   'token',
@@ -134,7 +178,14 @@ const FORBIDDEN_QUERY_KEYS = new Set([
   'accesstoken',
   'xamzcredential',
   'xamzsignature',
+  'jwt',
+  'code',
+  'session',
+  'sessionid',
 ]);
+const URL_WITH_USERINFO = /(?:[a-z][a-z0-9+.-]*:)?\/\/[^/\s?#]*@/i;
+const RESOURCE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const DELETION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DELETION_ERROR_KINDS = new Set<DeletionErrorKind>([
   'timeout',
   'external_5xx',
@@ -163,16 +214,24 @@ function keyParts(key: string): string[] {
 }
 
 function unsafePayloadKey(key: string): boolean {
+  if (/^\d+$/.test(key)) return false;
   const parts = keyParts(key);
   const normalized = parts.join('');
-  if (FORBIDDEN_KEYS.has(normalized)) return true;
-  if (parts.some((part) => FORBIDDEN_KEY_PARTS.has(part))) return true;
-  if (['token', 'secret', 'password', 'credential', 'authorization']
-    .some((part) => normalized.includes(part))) return true;
+  if (FORBIDDEN_PAYLOAD_KEYS.has(normalized)) return true;
+  if (['token', 'secret', 'password', 'credential', 'authorization', 'jwt', 'cookie',
+    'email', 'phone', 'session', 'code'].some((part) => normalized.includes(part))) {
+    return true;
+  }
   if (!normalized.endsWith('id')
     && TEXT_LIKE_KEY_PARTS.some((part) => normalized.includes(part))) return true;
   if (normalized.includes('apikey') || normalized.includes('privatekey')) return true;
-  return (parts.includes('api') || parts.includes('private')) && parts.includes('key');
+  if (TECHNICAL_PAYLOAD_KEYS.has(normalized)) return false;
+  if (normalized.endsWith('id') || normalized.endsWith('ids')) return false;
+  if (normalized.endsWith('key') || normalized.endsWith('keys')) return false;
+  if (normalized.endsWith('url') || normalized.endsWith('urls')) return false;
+  if (normalized.endsWith('path') || normalized.endsWith('paths')) return false;
+  if (normalized.endsWith('kind')) return false;
+  return true;
 }
 
 function unsafeQueryKey(key: string): boolean {
@@ -180,37 +239,42 @@ function unsafeQueryKey(key: string): boolean {
   const normalized = parts.join('');
   if (FORBIDDEN_QUERY_KEYS.has(normalized)) return true;
   if (parts.some((part) => FORBIDDEN_QUERY_PARTS.has(part))) return true;
-  if (['token', 'secret', 'password', 'credential', 'signature', 'apikey', 'privatekey']
-    .some((part) => normalized.includes(part))) return true;
+  if (['token', 'secret', 'password', 'credential', 'signature', 'apikey', 'privatekey',
+    'jwt', 'session', 'code'].some((part) => normalized.includes(part))) return true;
   return /^auth(?:entication|orization|token|key|secret|code|credential|signature|sig)/
     .test(normalized);
 }
 
-function unsafeUrl(url: URL): boolean {
+function unsafeUrl(url: URL, userId: string, depth: number): boolean {
   if (url.username || url.password) return true;
-  for (const key of url.searchParams.keys()) {
+  const params = [
+    ...url.searchParams.entries(),
+    ...new URLSearchParams(url.hash.slice(1)).entries(),
+  ];
+  for (const [key, value] of params) {
     if (unsafeQueryKey(key)) return true;
-  }
-  const fragmentParams = new URLSearchParams(url.hash.slice(1));
-  for (const key of fragmentParams.keys()) {
-    if (unsafeQueryKey(key)) return true;
+    if (unsafePayloadString(value, userId, depth + 1)) return true;
   }
   return false;
 }
 
-function unsafePayloadString(value: string, userId: string): boolean {
+function unsafePayloadString(value: string, userId: string, depth = 0): boolean {
   if (userId.length >= 6 && value.includes(userId)) return true;
+  if (depth > 6) return true;
   if (URL_WITH_USERINFO.test(value)) return true;
   try {
-    if (unsafeUrl(new URL(value))) return true;
+    if (unsafeUrl(new URL(value), userId, depth)) return true;
   } catch {
-    // Не URL целиком: ниже проверяем встроенные URL без fail-open.
+    // Проверяем встроенные URL ниже.
   }
   const normalized = value.replace(/[\t\r\n]/g, '');
-  const candidates = normalized.match(/[a-z][a-z0-9+.-]*:\/\/[^\s]+/gi) ?? [];
+  const candidates = normalized.match(/(?:[a-z][a-z0-9+.-]*:)?\/\/[^\s]+/gi) ?? [];
   for (const candidate of candidates) {
     try {
-      if (unsafeUrl(new URL(candidate))) return true;
+      const url = candidate.startsWith('//')
+        ? new URL(candidate, 'https://deletion.invalid')
+        : new URL(candidate);
+      if (unsafeUrl(url, userId, depth)) return true;
     } catch {
       return true;
     }
@@ -225,11 +289,68 @@ function assertSafeResourceType(resourceType: unknown): asserts resourceType is 
   }
 }
 
-function unsafeLogResourceKey(resourceKey: string): boolean {
-  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(resourceKey)) return true;
-  const digits = resourceKey.replace(/\D/g, '');
-  return digits.length >= 7 && digits.length <= 15
-    && PHONE_LIKE_RESOURCE_KEY.test(resourceKey);
+function unsafeResourceKeyFormat(resourceKey: unknown): boolean {
+  return typeof resourceKey !== 'string'
+    || resourceKey.trim() !== resourceKey
+    || !RESOURCE_KEY_RE.test(resourceKey);
+}
+
+function isBinaryValue(value: unknown): boolean {
+  if (Buffer.isBuffer(value) || ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
+    return true;
+  }
+  return typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer;
+}
+
+function assertPayloadPreflight(payload: unknown): void {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('unsafe_payload');
+  }
+  const prototype = Object.getPrototypeOf(payload);
+  if (prototype !== Object.prototype && prototype !== null) throw new Error('unsafe_payload');
+
+  const seen = new WeakSet<object>();
+  const stack: unknown[] = [payload];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (isBinaryValue(current)) throw new Error('unsafe_payload');
+    if (!current || typeof current !== 'object' || seen.has(current)) continue;
+    seen.add(current);
+    for (const key of Object.keys(current)) {
+      const descriptor = Object.getOwnPropertyDescriptor(current, key);
+      if (descriptor && 'value' in descriptor) stack.push(descriptor.value);
+    }
+  }
+}
+
+export function deletionPayloadJson(payload: unknown, userId: string): string {
+  try {
+    assertPayloadPreflight(payload);
+    const serialized = JSON.stringify(payload, function (key, value) {
+      if (key && userId.length >= 6 && key.includes(userId)) {
+        throw new Error('unsafe_payload');
+      }
+      if (key && unsafePayloadKey(key)) throw new Error('unsafe_payload');
+      if (isBinaryValue(value) || typeof value === 'bigint') throw new Error('unsafe_payload');
+      if (typeof value === 'number' && Number.isFinite(value)
+        && userId.length >= 6 && String(value) === userId) {
+        throw new Error('unsafe_payload');
+      }
+      if (value instanceof URL && unsafePayloadString(value.href, userId)) {
+        throw new Error('unsafe_payload');
+      }
+      if (typeof value === 'string' && unsafePayloadString(value, userId)) {
+        throw new Error('unsafe_payload');
+      }
+      return value;
+    });
+    if (typeof serialized !== 'string' || !serialized.startsWith('{')) {
+      throw new Error('unsafe_payload');
+    }
+    return serialized;
+  } catch {
+    throw new Error('unsafe_payload');
+  }
 }
 
 export class DeletionCancelledError extends Error {
@@ -251,35 +372,27 @@ export function retryDelayMs(attempts: number): number {
 }
 
 export function deletionResourceHash(bucket: string, key: string): string {
-  return createHash('sha256').update(`${bucket}\0${key}`).digest('hex');
+  return createHash('sha256')
+    .update(`${bucket}${String.fromCharCode(0)}${key}`)
+    .digest('hex');
 }
 
 export function assertSafeJobSpec(job: DeletionJobSpec, userId: string): void {
   assertSafeResourceType(job.resourceType);
-  try {
-    JSON.stringify(job.payload, function (key, value) {
-      if (key && unsafePayloadKey(key)) throw new Error('unsafe_payload');
-      if (typeof value === 'bigint') throw new Error('unsafe_payload');
-      if (value instanceof URL && unsafePayloadString(value.href, userId)) {
-        throw new Error('unsafe_payload');
-      }
-      if (typeof value === 'string' && unsafePayloadString(value, userId)) {
-        throw new Error('unsafe_payload');
-      }
-      return value;
-    });
-  } catch {
+  if (SKIP_ONLY_RESOURCE_TYPES.has(job.resourceType)) throw new Error('unsafe_resource_type');
+  const expectedPhase = job.resourceType === 'account.core.immediate'
+    || job.resourceType.endsWith('.stop') ? 'immediate' : 'purge';
+  if (job.phase !== expectedPhase) throw new Error('unsafe_phase');
+  deletionPayloadJson(job.payload, userId);
+  if (typeof job.resourceKey === 'string'
+    && userId.length >= 6 && job.resourceKey.includes(userId)) {
     throw new Error('unsafe_payload');
   }
-  if (userId.length >= 6 && job.resourceKey.includes(userId)) {
-    throw new Error('unsafe_payload');
-  }
-  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(job.resourceKey)) {
-    throw new Error('unsafe_resource_key');
-  }
+  if (unsafeResourceKeyFormat(job.resourceKey)) throw new Error('unsafe_resource_key');
 }
 
 export function assertSafeSkip(skip: DeletionSkip): void {
+  assertSafeResourceType(skip.resourceType);
   if (!DELETION_SKIP_REASONS.has(skip.reason)) throw new Error('unsafe_skip_reason');
 }
 
@@ -295,24 +408,36 @@ export function safeDeletionMessage(input: {
   resourceKey: string;
   attempts: number;
   kind: DeletionErrorKind;
+  userId?: string;
 }): string {
   assertSafeResourceType(input.resourceType);
-  if (unsafeLogResourceKey(input.resourceKey)) throw new Error('unsafe_resource_key');
+  if (typeof input.deletionId !== 'string'
+    || input.deletionId.length !== 36 || !DELETION_ID_RE.test(input.deletionId)) {
+    throw new Error('unsafe_deletion_id');
+  }
+  if (unsafeResourceKeyFormat(input.resourceKey)
+    || (typeof input.userId === 'string' && input.userId.length >= 6
+      && input.resourceKey.includes(input.userId))) {
+    throw new Error('unsafe_resource_key');
+  }
+  if (!Number.isFinite(input.attempts) || !Number.isInteger(input.attempts) || input.attempts < 0) {
+    throw new Error('unsafe_attempts');
+  }
   if (!DELETION_ERROR_KINDS.has(input.kind)) throw new Error('unsafe_kind');
   return `deletion=${input.deletionId} type=${input.resourceType} key=${input.resourceKey} attempt=${input.attempts} kind=${input.kind}`;
 }
 
 export function deletionErrorKind(error: any): DeletionErrorKind {
-  if (typeof error?.kind === 'string' && DELETION_ERROR_KINDS.has(error.kind)) {
-    return error.kind;
-  }
-  if (error?.code === 'ETIMEDOUT' || error?.name === 'TimeoutError') return 'timeout';
   const status = error?.response?.status ?? error?.$metadata?.httpStatusCode ?? 0;
   if (status === 404) return 'not_found';
   if (status === 429) return 'rate_limited';
   if (status === 401 || status === 403) return 'permission';
   if (status >= 500) return 'external_5xx';
   if (status >= 400) return 'external_4xx';
+  if (typeof error?.kind === 'string' && DELETION_ERROR_KINDS.has(error.kind)) {
+    return error.kind;
+  }
+  if (error?.code === 'ETIMEDOUT' || error?.name === 'TimeoutError') return 'timeout';
   if (['EPERM', 'EACCES', 'EBUSY'].includes(error?.code)) return 'permission';
   if (error?.code === 'ENOENT') return 'not_found';
   if (typeof error?.code === 'string' && /^[0-9A-Z]{5}$/.test(error.code)) return 'db';
