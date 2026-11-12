@@ -10,7 +10,7 @@ type RuntimeCancelClient = {
   connection: {
     once(event: 'error', listener: (error: Error) => void): unknown;
     removeListener(event: 'error', listener: (error: Error) => void): unknown;
-    destroy(): void;
+    stream: { destroy(): void };
   };
 };
 
@@ -121,7 +121,7 @@ export async function queryWithCancellation(
           // CancelRequest не подтверждён: ни cancel connection, ни исходный
           // client нельзя оставлять живым или возвращать в pool для reuse.
           forceDestroyClient = true;
-          try { (closingClient as unknown as RuntimeCancelClient).connection.destroy(); }
+          try { (closingClient as unknown as RuntimeCancelClient).connection.stream.destroy(); }
           catch { /* original client всё равно разрушается ниже */ }
         }
       } finally {
