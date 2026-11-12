@@ -70,8 +70,20 @@ export class AlertBotRepairAi {
       });
       const tools = this.ops.consumeToolNames(token);
       consumed = true;
-      const outcome = /(?:^|\n)OUTCOME:\s*(no_cause|done)\s*$/.exec(result.text.trim());
-      const text = result.text.replace(/\n?OUTCOME:\s*(?:no_cause|done)\s*$/, '').trim();
+      const trimmed = result.text.trim();
+      const outcome = /(?:^|\n)OUTCOME:[ \t]*(no_cause|done)[ \t]*$/.exec(trimmed);
+      let text = trimmed;
+      if (outcome) {
+        // Удаляем именно распознанный terminal-фрагмент, а не похожий суффикс
+        // внутри прозы. Если терминальный маркер валиден, предыдущие служебные
+        // marker lines тоже не должны утечь в Telegram.
+        const terminalMarker = outcome[0];
+        text = `${trimmed.slice(0, outcome.index)}${trimmed.slice(outcome.index + terminalMarker.length)}`
+          .split('\n')
+          .filter((line) => !/^OUTCOME:[ \t]*(?:no_cause|done)[ \t]*\r?$/.test(line))
+          .join('\n')
+          .trim();
+      }
       return { text, costUsd: result.costUsd, tools, noCause: outcome?.[1] === 'no_cause' };
     } finally {
       if (!consumed) this.ops.consumeToolNames(token);
