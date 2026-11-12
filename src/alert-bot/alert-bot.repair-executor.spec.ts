@@ -297,6 +297,24 @@ describe('AlertBotRepairExecutor', () => {
     });
   });
 
+  it.each(['mark_false', 'cancel_before_spawn', 'spawn_throw'] as const)('%s hanging finishJob ограничен первым flush и сохраняет pending', async (kind) => {
+    const job = await createJob();
+    const finish = jest.spyOn(store, 'finishJob').mockImplementation(() => new Promise<boolean>(() => undefined));
+    const starting = startPreSpawn(kind, job);
+    let timer: NodeJS.Timeout;
+    const result = await Promise.race([
+      starting,
+      new Promise<string>((resolve) => { timer = setTimeout(() => resolve('start_hung'), 2_000); }),
+    ]);
+    clearTimeout(timer!);
+    expect(result).toMatchObject({
+      jobId: job.id,
+      startError: kind === 'spawn_throw' ? 'spawn_error' : 'repair_inactive',
+    });
+    expect((executor as any).processes.get(job.id)?.pending).toBeTruthy();
+    expect(finish).toHaveBeenCalledTimes(1);
+  });
+
   it('async spawn error сохраняет failed/spawn_error без возврата в running', async () => {
     const job = await createJob();
     const realSpawn = childProcess.spawn;

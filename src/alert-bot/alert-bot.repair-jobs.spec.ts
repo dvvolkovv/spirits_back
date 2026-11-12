@@ -276,6 +276,22 @@ describe('AlertBotRepairJobs', () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
+  it('rejected findJob и hanging finishJob возвращают startError с pending без второго flush', async () => {
+    const original = store.findJob.bind(store);
+    jest.spyOn(store, 'findJob').mockRejectedValueOnce(new Error('findJob unavailable')).mockImplementation(original);
+    const finish = jest.spyOn(store, 'finishJob').mockImplementation(() => new Promise<boolean>(() => undefined));
+    const starting = jobs.start(ctx, 'exec', { host: 'prod', command: 'printf must-not-run' });
+    let timer: NodeJS.Timeout;
+    const result = await Promise.race([
+      starting,
+      new Promise<string>((resolve) => { timer = setTimeout(() => resolve('start_hung'), 2_000); }),
+    ]);
+    clearTimeout(timer!);
+    expect(result).toMatchObject({ startError: 'store_unavailable' });
+    expect((executor as any).processes.get((result as any).jobId)?.pending).toBeTruthy();
+    expect(finish).toHaveBeenCalledTimes(1);
+  });
+
   it('periodic reconciliation восстанавливает pending после startError и stop', async () => {
     let dbDown = true;
     const originalMark = store.markJobRunning.bind(store);
