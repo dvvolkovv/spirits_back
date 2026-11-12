@@ -285,7 +285,14 @@ function unsafePayloadString(value: string, userId: string, depth = 0): boolean 
         return true;
       }
     }
-    if (pass === 5) break;
+    if (pass === 5) {
+      try {
+        if (decodeURIComponent(variant) !== variant) return true;
+      } catch {
+        return true;
+      }
+      break;
+    }
     try {
       const decoded = decodeURIComponent(variant);
       if (decoded === variant) break;
