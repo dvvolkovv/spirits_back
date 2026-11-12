@@ -326,8 +326,10 @@ maybe('durable repair store против PostgreSQL', () => {
     const cleanupPool = new Pool({ connectionString: PG, max: 1 });
     const client = await cleanupPool.connect();
     let timer: NodeJS.Timeout | undefined;
+    let endCalled = false;
     try {
       forceReleaseForCleanup(client);
+      endCalled = true;
       const outcome = await Promise.race([
         cleanupPool.end().then(() => 'ended'),
         new Promise<string>((resolve) => { timer = setTimeout(() => resolve('pool_end_hung'), 1_000); }),
@@ -336,7 +338,7 @@ maybe('durable repair store против PostgreSQL', () => {
     } finally {
       if (timer) clearTimeout(timer);
       try { client.release(true); } catch { /* уже release */ }
-      await cleanupPool.end();
+      if (!endCalled) await cleanupPool.end();
     }
   });
 
