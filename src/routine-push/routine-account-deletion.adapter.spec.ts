@@ -387,7 +387,7 @@ describe('RoutineStore claim/release CAS', () => {
           if (claimed) routine.lastSentDate = params[1];
           return { rows: claimed ? [{ id: routine.id }] : [], rowCount: claimed ? 1 : 0 };
         }
-        if (s.startsWith('UPDATE routine_pushes SET last_sent_date=')) {
+        if (/^UPDATE routine_pushes SET last_sent_date\s*=/.test(s)) {
           const cas = /WHERE id\s*=\s*\$1 AND last_sent_date\s*=\s*\$2/.test(s);
           const released = cas && routine.lastSentDate === params[1];
           if (released) routine.lastSentDate = params[2];
