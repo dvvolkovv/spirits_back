@@ -436,6 +436,7 @@ describe('AlertBotRepairExecutor', () => {
       expect((executor as any).repairs.get(job.id)).toBe('repair-1');
       expect((await store.findJob(job.id))!.status).toBe('running');
       expect(() => process.kill(-spawned[0].pid!, 0)).not.toThrow();
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
       const startedAt = Date.now();
       await executor.stopRepair('repair-1');
       expect(Date.now() - startedAt).toBeGreaterThanOrEqual(4_500);
