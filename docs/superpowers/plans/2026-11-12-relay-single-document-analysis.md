@@ -12,8 +12,10 @@
 
 ## Карта файлов
 
-- `relay-agent/server.mjs` — единственная production-правка: общие правила анализа, upload-правила, список `--disallowedTools`, injectable `renameSync` для проверки неуспешного принятия файла.
-- `relay-agent/server-sandbox.test.mjs` — integration-тесты реального хендлера с подменённым `spawn`: upload/text, retry/fallback, MCP-reset, неуспешное переименование.
+- `relay-agent/server.mjs` — production-правка хендлера: выбор append-файла по `hasNewUploads`, список `--disallowedTools`, injectable `renameSync` для проверки неуспешного принятия файла.
+- `relay-agent/document-analysis-rules.txt` — статические общие правила, подключаемые через `--append-system-prompt-file`.
+- `relay-agent/document-analysis-rules-upload.txt` — полный базовый блок плюс upload-правила; tracked static file, не per-turn временный файл.
+- `relay-agent/server-sandbox.test.mjs` — integration-тесты реального хендлера с подменённым `spawn`: upload/text, retry/fallback, MCP-reset, неуспешное переименование и граница argv.
 - `docs/superpowers/specs/2026-11-12-relay-single-document-analysis-design.md` — одобренная спецификация; менять только при изменении самого дизайна.
 - `docs/superpowers/plans/2026-11-12-relay-single-document-analysis.md` — этот план и фактические отметки выполнения.
 
@@ -215,6 +217,60 @@ ssh dv@85.192.61.231 "source ~/.nvm/nvm.sh && git -C ~/ci/spirits_back fetch -q 
 
 Expected: `fail 0`; upload on/off и text-тест PASS. Если MCP-reset теряет общие правила, не добавлять вторую копию константы в catch — использовать только `baseSystemPrompt()` из Step 3.
 
+### Task 2A: Обязательное исправление quality review — правила через static append-file
+
+**Почему изменился механизм:** первоначальные inline-шаги Task 2 дали 24/24, но quality reviewer нашёл `E2BIG` у верхней границы argv. Красный boundary-коммит `0a2f8321` подтвердил 131 826 байт вместо допустимых 131 071. Выполненный финальный вариант ниже заменяет inline-константы `DOCUMENT_ANALYSIS_RULES`/`UPLOAD_ANALYSIS_RULES` и `baseSystemPrompt()` из первоначальных шагов Task 2. Остальные требования Task 2 не изменились.
+
+**Files:**
+- Create: `relay-agent/document-analysis-rules.txt`
+- Create: `relay-agent/document-analysis-rules-upload.txt`
+- Modify: `relay-agent/server.mjs`
+- Test: `relay-agent/server-sandbox.test.mjs`
+
+- [x] **Step 1: Сохранить общие правила в статический базовый файл**
+
+`document-analysis-rules.txt` содержит две строки общих правил (без JS-обёртки):
+
+```text
+ДОКУМЕНТЫ И СУБАГЕНТЫ. Не поручай Agent повторный анализ документа, который основная модель уже анализирует или собирается анализировать в этом ходе. Не запускай два параллельных полных разбора одного документа. Не используй Bash sleep для ожидания субагентов.
+UNKNOWN SKILL. Если Skill вернул Unknown skill, продолжай задачу доступными Read/Bash: не повторяй тот же вызов, не перебирай другие skills и не перепланируй уже доступную работу.
+```
+
+- [x] **Step 2: Собрать upload-файл без расхождения базового блока**
+
+`document-analysis-rules-upload.txt` начинается с полного содержимого базового файла и добавляет:
+
+```text
+АНАЛИЗ НОВОГО ВЛОЖЕНИЯ. Agent недоступен: весь запрошенный анализ выполняет основная модель. Для полного разбора читай документ последовательно частями до покрытия всего документа. Для точечного вопроса сначала определи необходимые разделы, без автоматического полного повторного чтения. Если Read отклонил порцию из-за лимита 25 000 токенов, уменьши размер порции и не повторяй тот же объём. Не используй Bash sleep для ожидания субагентов.
+```
+
+Тест читает оба файла и требует `upload.startsWith(base)`.
+
+- [x] **Step 3: Вернуть прежний inline-промпт и выбрать append-файл**
+
+В `server.mjs` восстановлены `applySandboxPrompt(SYSTEM_PROMPT, sbxOn)` при инициализации и в MCP catch. В `args` после `"--system-prompt", systemPrompt` добавлено:
+
+```js
+"--append-system-prompt-file", path.join(
+  HERE,
+  hasNewUploads ? "document-analysis-rules-upload.txt" : "document-analysis-rules.txt",
+),
+```
+
+Временных per-turn prompt-файлов нет. `hasNewUploads`, `--disallowedTools` и `--system-prompt-snapshot off` сохранены.
+
+- [x] **Step 4: Проверить границу реальным OS spawn и повторить integration-прогон**
+
+Boundary-тест измеряет baseline `--system-prompt`, затем подставляет `reqSystemPrompt` так, чтобы прежний inline-аргумент был ровно 131 071 байт. Правила должны отсутствовать в argv и присутствовать в выбранном append-файле. Реальный вызов:
+
+```js
+const spawned = spawnSync('/bin/true', args);
+assert.equal(spawned.error, undefined);
+assert.equal(spawned.status, 0);
+```
+
+Красный прогон до fix: 25 tests / 24 pass / 1 fail, inline 131 826 байт. Финальный коммит `569cc3c53e7ee0775d600dab2262f3ccf6b6d2ac`: 26 tests / 26 pass / 0 fail / 473.156812 ms, inline ровно 131 071 байт. Spec и quality review финального варианта пройдены без issues.
+
 ### Task 3: Доказать, что непринятый файл не включает ограничение
 
 **Files:**
@@ -331,7 +387,7 @@ test('server retry: upload-политика одинакова на обеих �
     onSpawn(call, index) {
       seen.push({
         denied: arg(call.args, '--disallowedTools'),
-        prompt: arg(call.args, '--system-prompt'),
+        prompt: fs.readFileSync(arg(call.args, '--append-system-prompt-file'), 'utf8'),
       });
       finishChild(call.child, index === 0
         ? [{ type: 'result', subtype: 'error', is_error: true, result: 'API Error: 500 Internal Server Error' }]
@@ -358,7 +414,7 @@ test('server fallback: upload-политика сохраняется у зап�
     onSpawn(call, index) {
       seen.push({
         denied: arg(call.args, '--disallowedTools'),
-        prompt: arg(call.args, '--system-prompt'),
+        prompt: fs.readFileSync(arg(call.args, '--append-system-prompt-file'), 'utf8'),
       });
       finishChild(call.child, index === 0
         ? [{ type: 'result', subtype: 'success', result: 'Not logged in' }]
@@ -398,7 +454,7 @@ test('server canary: перечисленная upload-сессия получа
 В `server partial MCP write: безопасный fallback на base config` внутри `onSpawn` после проверки `empty-mcp.json` добавить:
 
 ```js
-const prompt = arg(call.args, '--system-prompt');
+const prompt = fs.readFileSync(arg(call.args, '--append-system-prompt-file'), 'utf8');
 assert.match(prompt, /Не поручай Agent повторный анализ документа/);
 assert.match(prompt, /Unknown skill/);
 ```
