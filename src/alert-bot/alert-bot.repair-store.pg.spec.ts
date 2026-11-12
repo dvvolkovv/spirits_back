@@ -1,4 +1,4 @@
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 import { queryWithCancellation } from '../common/services/pg-cancellation';
 import { AlertBotRepairExecutor } from './alert-bot.repair-executor';
 import { AlertBotStore } from './alert-bot.store';
@@ -317,12 +317,32 @@ maybe('durable repair store против PostgreSQL', () => {
     expect(Date.now() - startedAt).toBeLessThan(1_000);
   });
 
+  it('cleanup forced release освобождает checked-out client перед pool.end', async () => {
+    const cleanupPool = new Pool({ connectionString: PG, max: 1 });
+    const client = await cleanupPool.connect();
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      forceReleaseForCleanup(client);
+      const outcome = await Promise.race([
+        cleanupPool.end().then(() => 'ended'),
+        new Promise<string>((resolve) => { timer = setTimeout(() => resolve('pool_end_hung'), 1_000); }),
+      ]);
+      expect(outcome).toBe('ended');
+    } finally {
+      if (timer) clearTimeout(timer);
+      try { client.release(true); } catch { /* уже release */ }
+      await cleanupPool.end();
+    }
+  });
+
   it('hanging requestCancel abort-ится при bounded stop и не удерживает единственный pool client', async () => {
     const repairId = await admit('cancel-abort-pool');
     const blocker = await pool.connect();
     const singlePool = new Pool({
       connectionString: PG, max: 1, options: `-c search_path=${SCHEMA}`,
     });
+    let singleClient: PoolClient | undefined;
+    singlePool.on('acquire', (client) => { singleClient = client; });
     const signals: Array<AbortSignal | undefined> = [];
     let markEntered!: () => void;
     const entered = new Promise<void>((resolve) => { markEntered = resolve; });
@@ -360,6 +380,7 @@ maybe('durable repair store против PostgreSQL', () => {
       await blocker.query('ROLLBACK').catch(() => undefined);
       blocker.release(true);
       await boundedStoppedForCleanup(stopped);
+      forceReleaseForCleanup(singleClient);
       await executor.stopAll();
       await singlePool.end();
     }
