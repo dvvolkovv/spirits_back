@@ -214,7 +214,6 @@ function keyParts(key: string): string[] {
 }
 
 function unsafePayloadKey(key: string): boolean {
-  if (/^\d+$/.test(key)) return false;
   const parts = keyParts(key);
   const normalized = parts.join('');
   if (FORBIDDEN_PAYLOAD_KEYS.has(normalized)) return true;
