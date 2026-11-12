@@ -111,8 +111,8 @@ export async function queryWithCancellation(
       let closeTimer: NodeJS.Timeout | undefined;
       let closeTimedOut = false;
       try {
-        closeTimedOut = !await Promise.race([
-          closingClient.end().then(() => true, () => true),
+        closeTimedOut = false === await Promise.race([
+          closingClient.end().catch(() => undefined),
           new Promise<false>((resolve) => {
             closeTimer = setTimeout(() => resolve(false), CANCEL_CLOSE_TIMEOUT_MS);
           }),
