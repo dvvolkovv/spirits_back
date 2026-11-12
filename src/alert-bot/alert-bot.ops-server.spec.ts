@@ -267,6 +267,15 @@ describe('AlertBotOpsServer stateless MCP', () => {
     expect(execute).not.toHaveBeenCalled();
   });
 
+  it('resolved startError помечает MCP result ошибкой и сохраняет jobId', async () => {
+    repairStart.mockResolvedValue({ jobId: 'job-1', startError: 'spawn_error' });
+    const { body } = await rpc('tools/call', {
+      name: 'repair_exec', arguments: { host: 'prod', command: 'true' },
+    }, repairToken);
+    expect(body.result.isError).toBe(true);
+    expect(JSON.parse(body.result.content[0].text)).toEqual({ jobId: 'job-1', startError: 'spawn_error' });
+  });
+
   it('repair_job возвращает terminal result с UUID и путём, маскируя только секреты', async () => {
     const terminal: RepairJobRecord = {
       id: repairJobUuid,
@@ -314,6 +323,18 @@ describe('AlertBotOpsServer stateless MCP', () => {
       name: 'repair_job', arguments: { job_id: 'not-a-job', wait_seconds: 0 },
     }, repairToken);
     expect(JSON.parse(invalidJob.body.result.content[0].text)).toEqual({ error: 'job_not_found' });
+    expect(repairWait).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['object', { nested: true }],
+    ['number', 42],
+    ['null', null],
+  ])('нестроковый job_id (%s) возвращает invalid_job_id без store', async (_label, jobId) => {
+    const { body } = await rpc('tools/call', {
+      name: 'repair_job', arguments: { job_id: jobId, wait_seconds: 0 },
+    }, repairToken);
+    expect(JSON.parse(body.result.content[0].text)).toEqual({ error: 'invalid_job_id' });
     expect(repairWait).not.toHaveBeenCalled();
   });
 
