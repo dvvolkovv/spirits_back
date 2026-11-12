@@ -1029,4 +1029,9 @@ describe('account deletion key and scheme regressions', () => {
     expect(() => safeDeletionMessage(logInput({ userId, resourceKey: userId })))
       .toThrow(/^unsafe_resource_key$/);
   });
+
+  it('не журналирует resourceKey при точном совпадении с коротким userId', () => {
+    expect(() => safeDeletionMessage(logInput({ userId: 'u123', resourceKey: 'u123' })))
+      .toThrow(/^unsafe_resource_key$/);
+  });
 });
