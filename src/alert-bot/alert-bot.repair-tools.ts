@@ -100,9 +100,12 @@ export class AlertBotRepairTools implements OpsToolHandler {
         case 'repair_verify':
           return repairToolText(await this.jobs.start(repairCtx, 'verify', args as unknown as RepairJobArgs));
         case 'repair_job':
+          if (typeof args.job_id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(args.job_id)) {
+            return repairToolText({ error: 'job_not_found' });
+          }
           return repairToolText(await this.jobs.wait(
             repairCtx,
-            args.job_id as string,
+            args.job_id,
             typeof args.wait_seconds === 'number' ? args.wait_seconds : 0,
           ));
         default:
