@@ -136,7 +136,7 @@ export class AlertBotRepairExecutor {
     const previous = this.repairChains.get(repairId) ?? Promise.resolve();
     const setup = previous.then(async (): Promise<RepairStartResult> => {
       if (this.processes.has(jobId)) {
-        await this.flushTerminal(jobId);
+        await bounded(this.flushTerminal(jobId));
         return { jobId };
       }
       let job: RepairJobRecord | null;
@@ -262,7 +262,7 @@ export class AlertBotRepairExecutor {
 
   async wait(jobId: string, waitSeconds: number): Promise<boolean> {
     const epoch = this.stopAllEpoch;
-    if (this.processes.get(jobId)?.pending) await this.flushTerminal(jobId);
+    if (this.processes.get(jobId)?.pending) await bounded(this.flushTerminal(jobId));
     const initial = await this.store.findJob(jobId);
     if (epoch !== this.stopAllEpoch) return false;
     if (!initial) return false;
@@ -291,7 +291,7 @@ export class AlertBotRepairExecutor {
       }).catch(done);
     });
 
-    if (this.processes.get(jobId)?.pending) await this.flushTerminal(jobId);
+    if (this.processes.get(jobId)?.pending) await bounded(this.flushTerminal(jobId));
     const current = await this.store.findJob(jobId);
     return Boolean(current && TERMINAL_STATUSES.has(current.status));
   }
@@ -419,7 +419,7 @@ export class AlertBotRepairExecutor {
     };
     this.repairs.set(job.id, job.repairId);
     this.processes.set(job.id, state);
-    try { await this.flushTerminal(job.id); }
+    try { await bounded(this.flushTerminal(job.id)); }
     finally { state.complete(); }
   }
 
