@@ -294,6 +294,9 @@ test('server retry: upload-политика одинакова на обеих �
     onSpawn(call, index) {
       seen.push({
         denied: arg(call.args, '--disallowedTools'),
+        inlinePrompt: arg(call.args, '--system-prompt'),
+        appendFile: arg(call.args, '--append-system-prompt-file'),
+        snapshot: arg(call.args, '--system-prompt-snapshot'),
         prompt: fs.readFileSync(arg(call.args, '--append-system-prompt-file'), 'utf8'),
       });
       finishChild(call.child, index === 0
@@ -339,6 +342,9 @@ test('server fallback: upload-политика сохраняется у зап�
     onSpawn(call, index) {
       seen.push({
         denied: arg(call.args, '--disallowedTools'),
+        inlinePrompt: arg(call.args, '--system-prompt'),
+        appendFile: arg(call.args, '--append-system-prompt-file'),
+        snapshot: arg(call.args, '--system-prompt-snapshot'),
         prompt: fs.readFileSync(arg(call.args, '--append-system-prompt-file'), 'utf8'),
       });
       finishChild(call.child, index === 0
@@ -568,11 +574,27 @@ test('server on: непринятый файл не включает запре�
   assert.equal(f.calls[0].child.input.includes('User uploaded files:'), false);
 });
 
+test('server resumed upload: --resume сохраняет запрет Agent и upload append-файл', async (t) => {
+  const f = await fixture(t, { mode: 'on' });
+  await f.requestUpload([{ name: 'first.pdf', body: 'first-synthetic-body' }]);
+  await f.requestUpload([{ name: 'second.pdf', body: 'second-synthetic-body' }]);
+  assert.equal(f.calls.length, 2);
+  const resumed = f.calls[1].args;
+  assert.equal(arg(resumed, '--resume'), 'claude-test-session');
+  assert.ok(arg(resumed, '--disallowedTools').split(',').includes('Agent'));
+  assert.ok(arg(resumed, '--append-system-prompt-file').endsWith('document-analysis-rules-upload.txt'));
+  assert.equal(arg(resumed, '--system-prompt-snapshot'), 'off');
+});
+
 test('document analysis rules: upload начинается с полного базового файла', () => {
   const base = fs.readFileSync(new URL('./document-analysis-rules.txt', import.meta.url), 'utf8');
   const upload = fs.readFileSync(new URL('./document-analysis-rules-upload.txt', import.meta.url), 'utf8');
   assert.ok(base.length > 0);
   assert.equal(upload.startsWith(base), true);
+  for (const rules of [base, upload]) {
+    assert.match(rules, /Если выбранный локальный способ не сработал, используй другой подход через Read\/Bash/);
+    assert.match(rules, /не перепланируй работу только ради поиска другого Skill/);
+  }
 });
 
 test('server off: текстовый ход сохраняет Agent и получает общие правила без дублирования', async (t) => {
