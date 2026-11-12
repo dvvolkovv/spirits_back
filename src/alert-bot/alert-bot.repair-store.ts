@@ -345,6 +345,34 @@ export class RepairStore {
     return updated.rowCount === 1;
   }
 
+  async finishUnknownAndCancelRepair(
+    jobId: string,
+    repairId: string,
+    result: FinishRepairJobResult,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    // Один statement = одна неявная транзакция: cancel_requested не может
+    // стать видимым без сохранённого unknown outcome и наоборот.
+    const updated = await this.pg.query(
+      `WITH finished AS (
+         UPDATE alert_bot_repair_jobs
+         SET status = $3, exit_code = $4, stdout_redacted = $5, stderr_redacted = $6,
+             failure_kind = $7, finished_at = now()
+         WHERE id = $1 AND repair_id = $2 AND status IN ('queued', 'running')
+         RETURNING id
+       ), cancelled AS (
+         UPDATE alert_bot_repairs SET status = 'cancel_requested'
+         WHERE id = $2 AND status IN ('requested', 'running')
+           AND EXISTS (SELECT 1 FROM finished)
+         RETURNING id
+       )
+       SELECT id FROM finished`,
+      [jobId, repairId, result.status, result.exitCode, result.stdout, result.stderr, result.failureKind ?? null],
+      signal,
+    );
+    return updated.rowCount === 1;
+  }
+
   async interruptActive(): Promise<RepairRecord[]> {
     const client = await this.pg.getClient();
     let transactionOpen = false;

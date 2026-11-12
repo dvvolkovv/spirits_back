@@ -489,8 +489,6 @@ export class AlertBotRepairExecutor {
   }
 
   private async finishUnknown(jobId: string, failureKind: string): Promise<void> {
-    const repairId = this.repairs.get(jobId);
-    if (repairId) await withLease((signal) => this.store.requestCancel(repairId, signal), false);
     await this.finishProcess(jobId, 'interrupted', null, failureKind);
   }
 
@@ -530,10 +528,13 @@ export class AlertBotRepairExecutor {
 
   private async flushPending(jobId: string, state: ProcessState): Promise<boolean> {
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const finished = await withLease(
-        (signal) => this.store.finishJob(jobId, state.pending!, signal),
-        false,
-      );
+      const finished = await withLease((signal) => {
+        const pending = state.pending!;
+        const repairId = this.repairs.get(jobId);
+        return repairId && ['process_close_unconfirmed', 'remote_outcome_unknown'].includes(pending.failureKind ?? '')
+          ? this.store.finishUnknownAndCancelRepair(jobId, repairId, pending, signal)
+          : this.store.finishJob(jobId, pending, signal);
+      }, false);
       if (finished.timedOut) {
         console.error('repair_finish_timeout');
         return false;
