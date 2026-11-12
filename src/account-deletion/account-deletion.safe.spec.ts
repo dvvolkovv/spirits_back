@@ -199,6 +199,7 @@ describe('account deletion safety', () => {
   it('формирует журнал только из технических полей', () => {
     const line = safeDeletionMessage({
       deletionId: DELETION_ID,
+      userId: USER_ID,
       resourceType: 'product.purge',
       resourceKey: 'p-1',
       attempts: 2,
@@ -459,6 +460,7 @@ describe('account deletion hardening regressions', () => {
     (resourceType) => {
       expect(() => safeDeletionMessage({
         deletionId: DELETION_ID,
+      userId: USER_ID,
         resourceType: resourceType as any,
         resourceKey: 'p-1',
         attempts: 2,
@@ -553,6 +555,7 @@ describe('account deletion embedded URL and log regressions', () => {
     expect(() => assertSafeJobSpec(job({}, '123456789'), USER_ID)).not.toThrow();
     expect(() => safeDeletionMessage({
       deletionId: DELETION_ID,
+      userId: USER_ID,
       resourceType: 'product.purge',
       resourceKey: '123456789',
       attempts: 2,
@@ -560,14 +563,14 @@ describe('account deletion embedded URL and log regressions', () => {
     })).not.toThrow();
   });
 
-  it('запрещает resourceKey, совпадающий с optional userId', () => {
+  it('запрещает resourceKey, совпадающий с обязательным userId', () => {
     const input = {
       deletionId: DELETION_ID,
+      userId: USER_ID,
       resourceType: 'product.purge',
       resourceKey: USER_ID,
       attempts: 2,
       kind: 'timeout',
-      userId: USER_ID,
     } as any;
     expect(() => safeDeletionMessage(input)).toThrow(/^unsafe_resource_key$/);
   });
@@ -575,6 +578,7 @@ describe('account deletion embedded URL and log regressions', () => {
   it('не записывает resourceKey с недопустимым форматом', () => {
     expect(() => safeDeletionMessage({
       deletionId: DELETION_ID,
+      userId: USER_ID,
       resourceType: 'product.purge',
       resourceKey: 'private/key',
       attempts: 2,
@@ -585,6 +589,7 @@ describe('account deletion embedded URL and log regressions', () => {
   it('не записывает arbitrary runtime kind в журнал', () => {
     expect(() => safeDeletionMessage({
       deletionId: DELETION_ID,
+      userId: USER_ID,
       resourceType: 'product.purge',
       resourceKey: 'p-1',
       attempts: 2,
@@ -602,6 +607,7 @@ describe('account deletion contract completeness regressions', () => {
   });
   const logWith = (overrides: Record<string, unknown>) => ({
     deletionId: DELETION_ID,
+    userId: USER_ID,
     resourceType: 'product.purge',
     resourceKey: 'p-1',
     attempts: 2,
@@ -919,5 +925,108 @@ describe('account deletion decoding boundary regressions', () => {
     expect(() => assertSafeJobSpec(job({
       fileUrl: 'https://example.com/public?download=1',
     }), USER_ID)).not.toThrow();
+  });
+});
+
+describe('account deletion key and scheme regressions', () => {
+  const logInput = (overrides: Record<string, unknown> = {}) => ({
+    deletionId: DELETION_ID,
+    userId: USER_ID,
+    resourceType: 'product.purge',
+    resourceKey: 'p-1',
+    attempts: 2,
+    kind: 'timeout',
+    ...overrides,
+  } as any);
+  const encodeEveryCharacter = (value: string): string => Array.from(value)
+    .map((character) => `%${character.charCodeAt(0).toString(16).padStart(2, '0')}`)
+    .join('');
+
+  it.each(['encryptionKey', 'decryptionKey', 'signingKey', 'masterKey', 'privateSigningKey'])(
+    'отклоняет cryptographic secret key: %s',
+    (key) => {
+      expect(() => assertSafeJobSpec(job({ [key]: SECRET }), USER_ID))
+        .toThrow(/^unsafe_payload$/);
+    },
+  );
+
+  it('не разрешает произвольный key suffix', () => {
+    expect(() => assertSafeJobSpec(job({ unexpectedKey: 'technical-value' }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it.each([
+    'fileKey',
+    'objectKey',
+    's3Key',
+    'minioKey',
+    'storageKey',
+    'resourceKey',
+    'documentKey',
+    'voiceKey',
+    'mediaKey',
+    'cacheKey',
+    'dedupeKey',
+    'idempotencyKey',
+    'jobKey',
+    'requestKey',
+    'locatorKey',
+    'hashKey',
+    'fileKeys',
+  ])('разрешает technical key family: %s', (key) => {
+    expect(() => assertSafeJobSpec(job({ [key]: 'technical-key' }), USER_ID)).not.toThrow();
+  });
+
+  it('разбирает one-slash embedded URL с credentials', () => {
+    expect(() => assertSafeJobSpec(job({
+      fileUrl: `redirect https:/example.com/x?access_token=${SECRET}`,
+    }), USER_ID)).toThrow(/^unsafe_payload$/);
+  });
+
+  it('разбирает opaque embedded URL с credentials', () => {
+    expect(() => assertSafeJobSpec(job({
+      fileUrl: `redirect custom:path?access_token=${SECRET}`,
+    }), USER_ID)).toThrow(/^unsafe_payload$/);
+  });
+
+  it('разрешает public one-slash URL', () => {
+    expect(() => assertSafeJobSpec(job({
+      fileUrl: 'redirect https:/example.com/public?download=1',
+    }), USER_ID)).not.toThrow();
+  });
+
+  it('разрешает public opaque URL', () => {
+    expect(() => assertSafeJobSpec(job({
+      fileUrl: 'redirect custom:path?download=1',
+    }), USER_ID)).not.toThrow();
+  });
+
+  it.each([
+    `${encodeEveryCharacter(USER_ID)}%`,
+    `${encodeURIComponent(SECRET)}%`,
+    'technical%',
+  ])('отклоняет malformed percent-encoding без fail-open', (fileUrl) => {
+    expect(() => assertSafeJobSpec(job({ fileUrl }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('разрешает корректный percent-encoded technical value', () => {
+    expect(() => assertSafeJobSpec(job({ fileUrl: 'technical%20value' }), USER_ID)).not.toThrow();
+  });
+
+  it.each([USER_ID, DELETION_ID])('требует userId для журнала с resourceKey', (resourceKey) => {
+    expect(() => safeDeletionMessage(logInput({ userId: undefined, resourceKey })))
+      .toThrow(/^unsafe_user_id$/);
+  });
+
+  it('отклоняет пустой userId в журнале', () => {
+    expect(() => safeDeletionMessage(logInput({ userId: '' })))
+      .toThrow(/^unsafe_user_id$/);
+  });
+
+  it('не журналирует UUID resourceKey самого userId', () => {
+    const userId = '22222222-2222-4222-8222-222222222222';
+    expect(() => safeDeletionMessage(logInput({ userId, resourceKey: userId })))
+      .toThrow(/^unsafe_resource_key$/);
   });
 });
