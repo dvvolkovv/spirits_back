@@ -39,7 +39,7 @@ ssh dv@85.192.61.231 "source ~/.nvm/nvm.sh && git -C ~/ci/spirits_back fetch -q 
 - Test: `relay-agent/server-sandbox.test.mjs` — без правок в этой задаче
 - Test: `relay-agent/*.test.mjs` — полный baseline
 
-- [ ] **Step 1: Проверить исходную ветку и состав изменений**
+- [x] **Step 1: Проверить исходную ветку и состав изменений**
 
 ```bash
 git status --short --branch
@@ -48,7 +48,7 @@ git log -3 --oneline
 
 Expected: ветка `fix/relay-single-document-analysis`; среди последних коммитов спецификация `5fca85e5` и коммит этого плана; untracked/изменённых production-файлов нет.
 
-- [ ] **Step 2: Отправить точный baseline на ноду и прогнать все relay-тесты**
+- [x] **Step 2: Отправить точный baseline на ноду и прогнать все relay-тесты**
 
 ```bash
 git push -u origin fix/relay-single-document-analysis
@@ -63,7 +63,7 @@ Expected: `fail 0`. Записать в журнал выполнения `pass`
 **Files:**
 - Test: `relay-agent/server-sandbox.test.mjs:404-459`
 
-- [ ] **Step 1: Добавить красный тест запрета `Agent` на ходе с вложением**
+- [x] **Step 1: Добавить красный тест запрета `Agent` на ходе с вложением**
 
 Добавить после существующих upload-тестов:
 
@@ -91,7 +91,7 @@ for (const mode of ['on', 'off']) {
 }
 ```
 
-- [ ] **Step 2: Добавить красный тест общего промпта без глобального запрета `Agent`**
+- [x] **Step 2: Добавить красный тест общего промпта без глобального запрета `Agent`**
 
 Добавить рядом:
 
@@ -114,7 +114,7 @@ test('server off: текстовый ход сохраняет Agent и полу
 });
 ```
 
-- [ ] **Step 3: Закоммитить только тесты и доказать красный результат на точном SHA**
+- [x] **Step 3: Закоммитить только тесты и доказать красный результат на точном SHA**
 
 ```bash
 git add relay-agent/server-sandbox.test.mjs
@@ -135,7 +135,7 @@ Expected: FAIL в трёх новых тестах. В upload on/off `denied.inc
 - Modify: `relay-agent/server.mjs:748-769`
 - Test: `relay-agent/server-sandbox.test.mjs`
 
-- [ ] **Step 1: Добавить две константы правил после `SYSTEM_PROMPT`**
+- [x] **Step 1: Добавить две константы правил после `SYSTEM_PROMPT`**
 
 Вставить сразу после закрывающего шаблон `SYSTEM_PROMPT` и перед `const sessionMap = new Map();`:
 
@@ -150,7 +150,7 @@ const UPLOAD_ANALYSIS_RULES = `
 `;
 ```
 
-- [ ] **Step 2: Ввести `hasNewUploads` после фактического принятия файлов**
+- [x] **Step 2: Ввести `hasNewUploads` после фактического принятия файлов**
 
 Непосредственно перед `let prompt = "";` добавить:
 
@@ -164,7 +164,7 @@ const hasNewUploads = renamedFiles.length > 0;
 if (hasNewUploads) {
 ```
 
-- [ ] **Step 3: Сохранять общие правила и при MCP-fallback**
+- [x] **Step 3: Сохранять общие правила и при MCP-fallback**
 
 Заменить инициализацию `systemPrompt`:
 
@@ -182,7 +182,7 @@ let systemPrompt = baseSystemPrompt();
 systemPrompt = baseSystemPrompt();
 ```
 
-- [ ] **Step 4: Добавить upload-правила и собрать запрещённые инструменты списком**
+- [x] **Step 4: Добавить upload-правила и собрать запрещённые инструменты списком**
 
 Сразу после `if (reqSystemPrompt) systemPrompt += "\n\n" + reqSystemPrompt;` вставить:
 
@@ -205,7 +205,7 @@ const disallowedTools = [
 "--disallowedTools", disallowedTools,
 ```
 
-- [ ] **Step 5: Прогнать два новых теста и весь integration-файл**
+- [x] **Step 5: Прогнать два новых теста и весь integration-файл**
 
 ```bash
 git add relay-agent/server.mjs
@@ -277,7 +277,7 @@ assert.equal(spawned.status, 0);
 - Modify: `relay-agent/server.mjs:570-585`
 - Test: `relay-agent/server-sandbox.test.mjs`
 
-- [ ] **Step 1: Добавить красный тест неуспешного `renameSync`**
+- [x] **Step 1: Добавить красный тест неуспешного `renameSync`**
 
 ```js
 test('server on: непринятый файл не включает запрет Agent', async (t) => {
@@ -302,7 +302,7 @@ test('server on: непринятый файл не включает запре�
 });
 ```
 
-- [ ] **Step 2: Закоммитить тест и доказать красный результат**
+- [x] **Step 2: Закоммитить тест и доказать красный результат**
 
 ```bash
 git add relay-agent/server-sandbox.test.mjs
@@ -314,7 +314,7 @@ ssh dv@85.192.61.231 "source ~/.nvm/nvm.sh && git -C ~/ci/spirits_back fetch -q 
 
 Expected: новый тест FAIL: production вызывает глобальный `fs.renameSync`, поэтому файл принимается, `Agent` запрещён и `User uploaded files:` присутствует. Это доказывает, что тест действительно различает ветку `renamedFiles.length === 0`.
 
-- [ ] **Step 3: Перевести только upload-переименования на существующий `fileOps`**
+- [x] **Step 3: Перевести только upload-переименования на существующий `fileOps`**
 
 В двух местах хендлера заменить:
 
@@ -342,7 +342,7 @@ fileOps.renameSync(f.path, fallback);
 
 Не менять `fs.renameSync(tmp, SESSION_STORE_PATH)` в персисте сессий: тестируется только принятие вложений.
 
-- [ ] **Step 4: Прогнать integration-тесты и закоммитить минимальную правку**
+- [x] **Step 4: Прогнать integration-тесты и закоммитить минимальную правку**
 
 ```bash
 git add relay-agent/server.mjs
@@ -360,7 +360,7 @@ Expected: `fail 0`; исходный Multer-temp по-прежнему удал�
 - Test: `relay-agent/server-sandbox.test.mjs:165-184`
 - Test: `relay-agent/server-sandbox.test.mjs:254-350`
 
-- [ ] **Step 1: Разрешить upload-fixture выбирать fallback**
+- [x] **Step 1: Разрешить upload-fixture выбирать fallback**
 
 Заменить сигнатуру и начало `requestUpload` на:
 
@@ -378,7 +378,7 @@ const requestUpload = async (
 
 Остаток helper (добавление файлов, `fetch`, возврат `{ response, text }`) оставить без изменений.
 
-- [ ] **Step 2: Добавить guard transient-retry для upload**
+- [x] **Step 2: Добавить guard transient-retry для upload**
 
 ```js
 test('server retry: upload-политика одинакова на обеих попытках', async (t) => {
@@ -404,7 +404,7 @@ test('server retry: upload-политика одинакова на обеих �
 });
 ```
 
-- [ ] **Step 3: Добавить guard запасного провайдера для upload**
+- [x] **Step 3: Добавить guard запасного провайдера для upload**
 
 ```js
 test('server fallback: upload-политика сохраняется у запасного провайдера', async (t) => {
@@ -431,7 +431,7 @@ test('server fallback: upload-политика сохраняется у зап�
 });
 ```
 
-- [ ] **Step 4: Добавить guard canary-upload**
+- [x] **Step 4: Добавить guard canary-upload**
 
 ```js
 test('server canary: перечисленная upload-сессия получает тот же запрет Agent', async (t) => {
@@ -449,7 +449,7 @@ test('server canary: перечисленная upload-сессия получа
 });
 ```
 
-- [ ] **Step 5: Усилить существующий MCP partial-write тест**
+- [x] **Step 5: Усилить существующий MCP partial-write тест**
 
 В `server partial MCP write: безопасный fallback на base config` внутри `onSpawn` после проверки `empty-mcp.json` добавить:
 
@@ -459,7 +459,7 @@ assert.match(prompt, /Не поручай Agent повторный анализ 
 assert.match(prompt, /Unknown skill/);
 ```
 
-- [ ] **Step 6: Прогнать guard-тесты и закоммитить**
+- [x] **Step 6: Прогнать guard-тесты и закоммитить**
 
 ```bash
 git add relay-agent/server-sandbox.test.mjs
@@ -477,7 +477,7 @@ Expected: `fail 0`. Production-правка в этой задаче не нуж
 - Test: `relay-agent/*.test.mjs`
 - Docs: `docs/superpowers/plans/2026-11-12-relay-single-document-analysis.md`
 
-- [ ] **Step 1: Проверить syntax и diff перед полным прогоном**
+- [x] **Step 1: Проверить syntax и diff перед полным прогоном**
 
 ```bash
 node --check relay-agent/server.mjs
@@ -487,7 +487,7 @@ git diff --name-only origin/main...HEAD
 
 Expected: syntax-check без вывода; `diff --check` без ошибок. Изменены только `relay-agent/server.mjs`, `relay-agent/server-sandbox.test.mjs` и два документа этой задачи (spec/plan).
 
-- [ ] **Step 2: Прогнать все relay-тесты на ноде**
+- [x] **Step 2: Прогнать все relay-тесты на ноде**
 
 ```bash
 git push -u origin fix/relay-single-document-analysis
@@ -497,7 +497,7 @@ ssh dv@85.192.61.231 "source ~/.nvm/nvm.sh && git -C ~/ci/spirits_back fetch -q 
 
 Expected: `fail 0`; число passed не ниже baseline плюс добавленные тесты. Сохранить в журнале выполнения точные `pass`, `fail`, `duration_ms` и `SHA`.
 
-- [ ] **Step 3: Проверить чистоту ветки и отсутствие выката**
+- [x] **Step 3: Проверить чистоту ветки и отсутствие выката**
 
 ```bash
 git status --short --branch
@@ -505,6 +505,8 @@ git log --oneline origin/main..HEAD
 ```
 
 Expected: рабочее дерево чистое; коммиты относятся только к spec/plan и этой правке. Никаких `deploy-relay.sh`, `pm2 restart`, `ssh`-правок живого релея на этом этапе не выполнялось.
+
+**Итог выполнения Task 5 (2026-11-12):** на финальном SHA production-изменений `4c74e8d7d2897242a413c03054dbfbc7406e6665` полный relay-набор завершился с `tests 197`, `pass 197`, `fail 0`, `duration_ms 1415.689249`. Syntax-check и `git diff --check` прошли; состав diff ограничен шестью разрешёнными путями. Рабочее дерево перед документированием было чистым, коммиты относятся только к этой функции и её документации. Деплой, PM2 restart и правки живого релея не выполнялись. После docs-коммита полный набор повторно запускается на итоговом SHA ветки; его точные итоги фиксируются в отчёте выполнения.
 
 ### Task 6: Живой probe — только после нового явного OK владельца и официального выката
 
