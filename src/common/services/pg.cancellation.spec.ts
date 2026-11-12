@@ -58,7 +58,6 @@ describe('PgService.query cancellation', () => {
     controller.abort();
     await flush();
     const cancelCalls = cancel.mock.calls.length;
-    const releaseCalls = client.release.mock.calls.length;
     rejectActive(new Error('cancel requested'));
     await rejection;
 
@@ -66,7 +65,7 @@ describe('PgService.query cancellation', () => {
     expect(cancelCalls).toBe(1);
     expect(cancel).toHaveBeenCalledWith(client, getQuery());
     expect(remove).toHaveBeenCalledWith('abort', expect.any(Function));
-    expect(releaseCalls).toBe(1);
+    expect(client.release).toHaveBeenCalledTimes(1);
   });
 
   it('не отдаёт reused client второму query до завершения CancelRequest', async () => {
