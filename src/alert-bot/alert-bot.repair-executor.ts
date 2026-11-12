@@ -325,10 +325,7 @@ export class AlertBotRepairExecutor {
   async stopRepair(repairId: string): Promise<void> {
     this.cancellingRepairs.add(repairId);
     const early = this.terminateLocal(repairId);
-    let request: Promise<boolean>;
-    try { request = this.store.requestCancel(repairId); }
-    catch { request = Promise.resolve(false); }
-    await bounded(request);
+    await withLease((signal) => this.store.requestCancel(repairId, signal), false);
     await bounded(this.repairChains.get(repairId) ?? Promise.resolve());
     const late = this.terminateLocal(repairId);
     await bounded(Promise.allSettled([early, late]), this.closeWaitMs);
@@ -493,7 +490,7 @@ export class AlertBotRepairExecutor {
 
   private async finishUnknown(jobId: string, failureKind: string): Promise<void> {
     const repairId = this.repairs.get(jobId);
-    if (repairId) await bounded(this.store.requestCancel(repairId));
+    if (repairId) await withLease((signal) => this.store.requestCancel(repairId, signal), false);
     await this.finishProcess(jobId, 'interrupted', null, failureKind);
   }
 

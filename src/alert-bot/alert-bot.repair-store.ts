@@ -205,11 +205,12 @@ export class RepairStore {
     return result.rowCount === 1;
   }
 
-  async requestCancel(id: string): Promise<boolean> {
+  async requestCancel(id: string, signal?: AbortSignal): Promise<boolean> {
     const result = await this.pg.query(
       `UPDATE alert_bot_repairs SET status = 'cancel_requested'
        WHERE id = $1 AND status IN ('requested', 'running')`,
       [id],
+      signal,
     );
     return result.rowCount === 1;
   }
