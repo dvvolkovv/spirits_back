@@ -87,6 +87,63 @@ maybe('durable repair store против PostgreSQL', () => {
     ...overrides,
   });
 
+  const waitForFinishLock = async (): Promise<void> => {
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const result = await pool.query(
+        `SELECT pid FROM pg_stat_activity
+         WHERE pid <> pg_backend_pid() AND state = 'active' AND wait_event_type = 'Lock'
+           AND query LIKE '%alert_bot_repair_jobs%' AND query LIKE '%cancel_requested%'
+         LIMIT 1`,
+      );
+      if (result.rows[0]) return;
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error('finish_unknown_lock_timeout');
+  };
+
+  const storeWithRepairBarrier = (onRepairLocked: () => Promise<void>): RepairStore => {
+    let gated = false;
+    const pg = {
+      query: (text: string, params?: any[]) => pool.query(text, params),
+      getClient: async () => {
+        const client = await pool.connect();
+        const originalQuery = client.query.bind(client);
+        const originalRelease = client.release.bind(client);
+        client.query = (async (text: string, ...args: any[]) => {
+          const result = await (originalQuery as any)(text, ...args);
+          if (!gated && text.includes('SELECT r.id FROM alert_bot_repairs r')) {
+            gated = true;
+            await onRepairLocked();
+          }
+          return result;
+        }) as any;
+        client.release = ((destroy?: boolean | Error) => {
+          client.query = originalQuery as any;
+          client.release = originalRelease;
+          originalRelease(destroy);
+        }) as any;
+        return client;
+      },
+    };
+    return new RepairStore(pg as any);
+  };
+
+  const expectUnknownStart = async (repairId: string, chatId: string): Promise<void> => {
+    const executor = new AlertBotRepairExecutor(store);
+    const jobs = new AlertBotRepairJobs(store, executor);
+    const spawn = jest.spyOn(childProcess, 'spawn');
+    try {
+      await expect(jobs.start({
+        ...guard(repairId, chatId), scope: 'repair', adminUserId: 'admin-user',
+      }, 'exec', { host: 'prod', command: 'printf must-not-run' })).rejects.toThrow('repair_outcome_unknown');
+      expect(spawn).not.toHaveBeenCalled();
+    } finally {
+      spawn.mockRestore();
+      await executor.stopAll();
+    }
+  };
+
   beforeAll(async () => {
     admin = new Pool({ connectionString: PG, max: 1 });
     await admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`);
@@ -298,6 +355,99 @@ maybe('durable repair store против PostgreSQL', () => {
       spawn.mockRestore();
       await executor.stopAll();
     }
+  });
+
+  it.each(['process_close_unconfirmed', 'remote_outcome_unknown'] as const)('%s create-first lock schedule не даёт deadlock', async (failureKind) => {
+    const chatId = `lock-create-first-${failureKind}`;
+    const repairId = await admit(chatId);
+    await store.markRepairRunning(repairId, TURN_ID);
+    const first = await store.createJob(jobInput(repairId));
+    expect(await store.markJobRunning(first!.id)).toBe(true);
+
+    let releaseGate!: () => void;
+    let markEntered!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
+    const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+    const gatedStore = storeWithRepairBarrier(async () => {
+      markEntered();
+      await gate;
+    });
+    const creating = gatedStore.createJob(jobInput(repairId));
+    await boundedEnteredForTest(entered);
+    const finishing = store.finishUnknownAndCancelRepair(first!.id, repairId, {
+      status: 'interrupted', exitCode: null, stdout: '', stderr: '', failureKind,
+    });
+    const operations = Promise.allSettled([creating, finishing]);
+    try {
+      await waitForFinishLock();
+    } finally {
+      releaseGate();
+      await boundedStoppedForCleanup(operations.then(() => undefined));
+    }
+    expect(await operations).toEqual([
+      { status: 'fulfilled', value: null },
+      { status: 'fulfilled', value: true },
+    ]);
+    await expect(store.findRepair(repairId)).resolves.toMatchObject({ status: 'cancel_requested' });
+    await expect(store.findJob(first!.id)).resolves.toMatchObject({ status: 'interrupted', failureKind });
+    await expectUnknownStart(repairId, chatId);
+  });
+
+  it.each(['process_close_unconfirmed', 'remote_outcome_unknown'] as const)('%s finish-first lock schedule сериализует createJob', async (failureKind) => {
+    const chatId = `lock-finish-first-${failureKind}`;
+    const repairId = await admit(chatId);
+    await store.markRepairRunning(repairId, TURN_ID);
+    const first = await store.createJob(jobInput(repairId));
+    expect(await store.markJobRunning(first!.id)).toBe(true);
+    await pool.query(
+      `CREATE FUNCTION ${SCHEMA}.repair_unknown_barrier() RETURNS trigger LANGUAGE plpgsql AS $$
+       BEGIN PERFORM pg_advisory_xact_lock(918273); RETURN NEW; END; $$`,
+    );
+    await pool.query(
+      `CREATE TRIGGER repair_unknown_barrier BEFORE UPDATE ON alert_bot_repair_jobs
+       FOR EACH ROW EXECUTE FUNCTION ${SCHEMA}.repair_unknown_barrier()`,
+    );
+    const barrier = await pool.connect();
+    await barrier.query('BEGIN');
+    await barrier.query('SELECT pg_advisory_xact_lock(918273)');
+    const finishing = store.finishUnknownAndCancelRepair(first!.id, repairId, {
+      status: 'interrupted', exitCode: null, stdout: '', stderr: '', failureKind,
+    });
+    let operations: Promise<PromiseSettledResult<any>[]> | undefined;
+    try {
+      await waitForFinishLock();
+      let createSettled = false;
+      const creating = store.createJob(jobInput(repairId)).then(
+        (value) => { createSettled = true; return value; },
+        (error) => { createSettled = true; throw error; },
+      );
+      operations = Promise.allSettled([finishing, creating]);
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      expect(createSettled).toBe(false);
+    } finally {
+      await barrier.query('ROLLBACK').catch(() => undefined);
+      barrier.release(true);
+      if (operations) await boundedStoppedForCleanup(operations.then(() => undefined));
+      else await boundedStoppedForCleanup(finishing.then(() => undefined, () => undefined));
+      await pool.query('DROP TRIGGER IF EXISTS repair_unknown_barrier ON alert_bot_repair_jobs').catch(() => undefined);
+      await pool.query(`DROP FUNCTION IF EXISTS ${SCHEMA}.repair_unknown_barrier()`).catch(() => undefined);
+    }
+    expect(await operations!).toEqual([
+      { status: 'fulfilled', value: true },
+      { status: 'fulfilled', value: null },
+    ]);
+    await expect(store.findRepair(repairId)).resolves.toMatchObject({ status: 'cancel_requested' });
+    await expect(store.findJob(first!.id)).resolves.toMatchObject({ status: 'interrupted', failureKind });
+    await expectUnknownStart(repairId, chatId);
+  });
+
+  it.each(['failed', 'succeeded'] as const)('%s не блокирует следующую job после lock serialization', async (status) => {
+    const repairId = await admit(`normal-${status}-serialization`);
+    const first = await store.createJob(jobInput(repairId));
+    await store.finishJob(first!.id, {
+      status, exitCode: status === 'succeeded' ? 0 : 1, stdout: '', stderr: '', failureKind: null,
+    });
+    await expect(store.createJob(jobInput(repairId))).resolves.not.toBeNull();
   });
 
   it('Promise.all двух первых jobs создаёт ровно одну row', async () => {
