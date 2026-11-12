@@ -1,0 +1,298 @@
+import { readFileSync } from 'fs';
+import { randomUUID } from 'crypto';
+import { Pool } from 'pg';
+import { AccountDeletionPlanner } from './account-deletion.planner';
+import { AccountDeletionJobs } from './account-deletion.jobs';
+import {
+  DELETION_DEPENDENCIES,
+  DELETION_DISCOVERERS,
+} from './account-deletion.catalog';
+import { DeletionCancelledError } from './account-deletion.safe';
+import type {
+  DeletionAccount,
+  DeletionJobRow,
+} from './account-deletion.types';
+
+const PG = process.env.PROVISIONING_PG_URL;
+const DELETED_AT = new Date('2026-11-01T00:00:00.000Z');
+const RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+(PG ? describe : describe.skip)('account deletion planner', () => {
+  let pool: Pool;
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: PG });
+    await pool.query(`
+      CREATE TABLE user_id (
+        internal_id text PRIMARY KEY,
+        state text,
+        update_date timestamptz DEFAULT now()
+      )
+    `);
+    await pool.query(readFileSync(
+      'src/account-deletion/migrations/001_account_deletion.sql',
+      'utf8',
+    ));
+  });
+
+  beforeEach(async () => {
+    await pool.query('DELETE FROM account_deletion_jobs');
+    await pool.query('DELETE FROM user_id');
+  });
+
+  afterAll(async () => {
+    if (!pool) return;
+    await pool.query('DROP TABLE IF EXISTS account_deletion_jobs, user_id')
+      .catch(() => undefined);
+    await pool.end();
+  });
+
+  function account(overrides: Partial<DeletionAccount> = {}): DeletionAccount {
+    return {
+      userId: 'u-deleted',
+      deletionId: randomUUID(),
+      deletedAt: DELETED_AT,
+      ...overrides,
+    };
+  }
+
+  async function insertDeleted(
+    value: DeletionAccount,
+    state = 'deleted',
+  ): Promise<void> {
+    await pool.query(
+      `INSERT INTO user_id (internal_id,state,deleted_at,deletion_id)
+       VALUES ($1,$2,$3,$4)`,
+      [value.userId, state, value.deletedAt, value.deletionId],
+    );
+  }
+
+  async function jobCount(): Promise<number> {
+    const result = await pool.query('SELECT count(*)::int AS count FROM account_deletion_jobs');
+    return result.rows[0].count;
+  }
+
+  it('persist идемпотентен, collect не пишет и сохраняет последний external ID', async () => {
+    const value = account();
+    await insertDeleted(value);
+    const discovery = jest.fn(async () => ({
+      jobs: [{
+        resourceType: 'elevenlabs-voice.purge' as const,
+        resourceKey: 'voice-1',
+        phase: 'purge' as const,
+        payload: { voiceId: 'external-1' },
+      }],
+      skips: [],
+    }));
+    const planner = new AccountDeletionPlanner([discovery]);
+
+    const first = await planner.collect(pool, value, 'merge');
+
+    expect(first.jobs[0]).toEqual({
+      resourceType: 'account.core.purge',
+      resourceKey: 'account',
+      phase: 'purge',
+      payload: {},
+    });
+    expect(first.jobs[1]).toEqual({
+      resourceType: 'elevenlabs-voice.purge',
+      resourceKey: 'voice-1',
+      phase: 'purge',
+      payload: { voiceId: 'external-1' },
+    });
+    expect(first.skips).toEqual([]);
+    expect(discovery).toHaveBeenCalledWith({ db: pool, account: value, origin: 'merge' });
+    expect(await jobCount()).toBe(0);
+
+    await planner.persist(pool, value, first);
+    await pool.query(
+      `UPDATE account_deletion_jobs
+       SET payload_jsonb='{"voiceId":"external-retry"}'::jsonb
+       WHERE resource_type='elevenlabs-voice.purge'`,
+    );
+    await planner.persist(pool, value, first);
+
+    const rows = await pool.query(
+      `SELECT payload_jsonb FROM account_deletion_jobs
+       WHERE resource_type='elevenlabs-voice.purge'`,
+    );
+    expect(rows.rows).toHaveLength(1);
+    expect(rows.rows[0].payload_jsonb).toEqual({ voiceId: 'external-retry' });
+    expect(await jobCount()).toBe(2);
+  });
+
+  it('explicit создаёт только account.core.immediate с next_attempt_at≈now', async () => {
+    const value = account();
+    await insertDeleted(value);
+    const planner = new AccountDeletionPlanner([]);
+
+    const plan = await planner.collect(pool, value, 'explicit');
+
+    expect(plan).toEqual({
+      jobs: [{
+        resourceType: 'account.core.immediate',
+        resourceKey: 'account',
+        phase: 'immediate',
+        payload: {},
+      }],
+      skips: [],
+    });
+    const before = Date.now();
+    await planner.persist(pool, value, plan);
+    const after = Date.now();
+    const result = await pool.query(
+      `SELECT resource_type,phase,next_attempt_at
+       FROM account_deletion_jobs`,
+    );
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]).toMatchObject({
+      resource_type: 'account.core.immediate',
+      phase: 'immediate',
+    });
+    expect(result.rows[0].next_attempt_at.getTime()).toBeGreaterThanOrEqual(before);
+    expect(result.rows[0].next_attempt_at.getTime()).toBeLessThanOrEqual(after);
+  });
+
+  it('merge создаёт только account.core.purge с deletedAt+30d', async () => {
+    const value = account();
+    await insertDeleted(value);
+    const planner = new AccountDeletionPlanner([]);
+
+    const plan = await planner.collect(pool, value, 'merge');
+
+    expect(plan.jobs).toEqual([{
+      resourceType: 'account.core.purge',
+      resourceKey: 'account',
+      phase: 'purge',
+      payload: {},
+    }]);
+    await planner.persist(pool, value, plan);
+    const result = await pool.query(
+      `SELECT resource_type,phase,next_attempt_at
+       FROM account_deletion_jobs`,
+    );
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]).toMatchObject({
+      resource_type: 'account.core.purge',
+      phase: 'purge',
+    });
+    expect(result.rows[0].next_attempt_at).toEqual(
+      new Date(DELETED_AT.getTime() + RETENTION_MS),
+    );
+  });
+
+  it('collect применяет safety к каждому discovered job', async () => {
+    const value = account();
+    const planner = new AccountDeletionPlanner([async () => ({
+      jobs: [{
+        resourceType: 'elevenlabs-voice.purge' as const,
+        resourceKey: 'voice-1',
+        phase: 'purge' as const,
+        payload: { text: 'private content' },
+      }],
+      skips: [],
+    })]);
+
+    await expect(planner.collect(pool, value, 'merge')).rejects.toThrow('unsafe_payload');
+    expect(await jobCount()).toBe(0);
+  });
+
+  it('catalog описывает только заданные зависимости', () => {
+    expect(DELETION_DISCOVERERS).toEqual([]);
+    expect(DELETION_DEPENDENCIES['account.core.immediate']).toEqual({ allStop: true });
+    expect(DELETION_DEPENDENCIES['account.core.purge']).toEqual({ allStop: true });
+    expect(DELETION_DEPENDENCIES['product.purge']).toEqual({
+      sameResourceKey: ['product.stop'],
+    });
+    expect(DELETION_DEPENDENCIES['custom-agent.purge']).toEqual({
+      allOf: ['telegram.purge'],
+    });
+    expect(DELETION_DEPENDENCIES['voice.purge']).toEqual({
+      sameResourceKey: ['voice.stop'],
+      allOf: ['voice-document.purge'],
+    });
+    expect(DELETION_DEPENDENCIES['routine.purge']).toBeUndefined();
+  });
+
+  describe('assertCurrent', () => {
+    let value: DeletionAccount;
+    let currentJob: DeletionJobRow;
+    let jobs: AccountDeletionJobs;
+
+    beforeEach(async () => {
+      value = account();
+      await insertDeleted(value);
+      const leaseUntil = new Date('2026-11-12T12:34:56.789Z');
+      const nextAttemptAt = new Date('2026-11-12T12:00:00.000Z');
+      const inserted = await pool.query(
+        `INSERT INTO account_deletion_jobs
+          (deletion_id,user_id,resource_type,resource_key,phase,payload_jsonb,
+           status,attempts,next_attempt_at,lease_until)
+         VALUES ($1,$2,'account.core.purge','account','purge','{}'::jsonb,
+                 'running',2,$3,$4)
+         RETURNING id`,
+        [value.deletionId, value.userId, nextAttemptAt, leaseUntil],
+      );
+      currentJob = {
+        id: inserted.rows[0].id,
+        deletionId: value.deletionId,
+        userId: value.userId,
+        resourceType: 'account.core.purge',
+        resourceKey: 'account',
+        phase: 'purge',
+        payload: {},
+        status: 'running',
+        attempts: 2,
+        nextAttemptAt,
+        leaseUntil,
+        lastErrorKind: null,
+      };
+      jobs = new AccountDeletionJobs(pool);
+    });
+
+    it('принимает running job текущей deleted generation с точным lease', async () => {
+      await expect(jobs.assertCurrent(currentJob)).resolves.toBeUndefined();
+    });
+
+    it('отклоняет stale attempts', async () => {
+      await expect(jobs.assertCurrent({
+        ...currentJob,
+        attempts: currentJob.attempts + 1,
+      })).rejects.toBeInstanceOf(DeletionCancelledError);
+    });
+
+    it('отклоняет stale lease с точностью до timestamptz', async () => {
+      await expect(jobs.assertCurrent({
+        ...currentJob,
+        leaseUntil: new Date(currentJob.leaseUntil!.getTime() + 1),
+      })).rejects.toBeInstanceOf(DeletionCancelledError);
+    });
+
+    it('отклоняет job, который больше не running', async () => {
+      await pool.query(
+        `UPDATE account_deletion_jobs SET status='pending' WHERE id=$1`,
+        [currentJob.id],
+      );
+      await expect(jobs.assertCurrent(currentJob))
+        .rejects.toBeInstanceOf(DeletionCancelledError);
+    });
+
+    it('отклоняет changed deletionId', async () => {
+      await pool.query(
+        'UPDATE user_id SET deletion_id=$1 WHERE internal_id=$2',
+        [randomUUID(), value.userId],
+      );
+      await expect(jobs.assertCurrent(currentJob))
+        .rejects.toBeInstanceOf(DeletionCancelledError);
+    });
+
+    it('отклоняет changed state', async () => {
+      await pool.query(
+        `UPDATE user_id SET state='active' WHERE internal_id=$1`,
+        [value.userId],
+      );
+      await expect(jobs.assertCurrent(currentJob))
+        .rejects.toBeInstanceOf(DeletionCancelledError);
+    });
+  });
+});
