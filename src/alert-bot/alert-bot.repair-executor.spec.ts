@@ -1,5 +1,6 @@
 import * as childProcess from 'child_process';
 import * as fs from 'fs';
+import { PassThrough } from 'stream';
 import { AlertBotRepairExecutor } from './alert-bot.repair-executor';
 import {
   CreateRepairJobInput,
@@ -318,6 +319,7 @@ describe('AlertBotRepairExecutor', () => {
   it('hanging finishJob abort-ится и следующий reconcile делает новый вызов', async () => {
     const job = await createJob();
     const original = store.finishJob.bind(store);
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
     const signals: Array<AbortSignal | undefined> = [];
     const finish = jest.spyOn(store, 'finishJob').mockImplementation((id, result, signal?: AbortSignal) => {
       signals.push(signal);
@@ -366,6 +368,19 @@ describe('AlertBotRepairExecutor', () => {
         catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
       }
     }
+  });
+
+  it('remote timeout без close получает bounded interrupted/remote_outcome_unknown', async () => {
+    const child = new childProcess.ChildProcess();
+    Object.assign(child, { pid: 92_001, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
+    jest.spyOn(childProcess, 'spawn').mockReturnValue(child as any);
+    (executor as any).closeWaitMs = 50;
+    const job = await createJob({ host: 'test', timeoutMs: 50 });
+    await executor.start(job.id, 'sleep 30');
+    expect(await executor.wait(job.id, 1)).toBe(true);
+    expect(await store.findJob(job.id)).toMatchObject({
+      status: 'interrupted', failureKind: 'remote_outcome_unknown',
+    });
   });
 
   it('remote close(null) даёт interrupted/remote_outcome_unknown', async () => {
