@@ -70,8 +70,14 @@ function clampWaitSeconds(value: number): number {
   return Number.isFinite(value) ? Math.min(30, Math.max(0, value)) : 0;
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+async function bounded(operation: Promise<unknown>, ms = 1_000): Promise<void> {
+  let timer: NodeJS.Timeout;
+  try {
+    await Promise.race([
+      operation.catch(() => undefined),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, ms); }),
+    ]);
+  } finally { clearTimeout(timer!); }
 }
 
 function compensationJob(jobId: string, repairId: string): RepairJobRecord {
@@ -285,16 +291,16 @@ export class AlertBotRepairExecutor {
 
   async stopRepair(repairId: string): Promise<void> {
     this.cancellingRepairs.add(repairId);
+    const early = this.terminateLocal(repairId);
     let request: Promise<boolean>;
     try { request = this.store.requestCancel(repairId); }
     catch { request = Promise.resolve(false); }
-    await request.catch(() => false);
-    await this.repairChains.get(repairId);
-    const jobs = [...this.repairs.entries()]
-      .filter(([, currentRepairId]) => currentRepairId === repairId)
-      .map(([jobId]) => jobId);
-    await Promise.all(jobs.map((jobId) => this.terminate(jobId, 'cancelled')));
-    await this.maybeCleanup(repairId);
+    await bounded(request);
+    await bounded(this.repairChains.get(repairId) ?? Promise.resolve());
+    const late = this.terminateLocal(repairId);
+    await bounded(Promise.allSettled([early, late]));
+    await bounded(this.flushPendingForRepair(repairId));
+    await bounded(this.maybeCleanup(repairId));
   }
 
   async stopAll(): Promise<void> {
@@ -303,11 +309,32 @@ export class AlertBotRepairExecutor {
     for (const repairId of this.repairChains.keys()) this.cancellingRepairs.add(repairId);
     for (const repairId of this.repairs.values()) this.cancellingRepairs.add(repairId);
     for (const jobId of [...this.waiters.keys()]) this.wake(jobId);
-    await Promise.all([...this.repairChains.values()]);
-    const jobs = [...this.processes.entries()]
-      .filter(([, state]) => state.interruptible && !state.finished)
+    const early = this.terminateLocal();
+    await bounded(Promise.all([...this.repairChains.values()]));
+    const late = this.terminateLocal();
+    await bounded(Promise.allSettled([early, late]));
+    await bounded(this.flushPendingForRepair());
+    const repairs = new Set([...this.repairChains.keys(), ...this.cancellingRepairs.values()]);
+    await bounded(Promise.all([...repairs].map((repairId) => this.maybeCleanup(repairId))));
+  }
+
+  private terminateLocal(repairId?: string): Promise<void> {
+    const jobs = [...this.repairs.entries()]
+      .filter(([jobId, currentRepairId]) => {
+        const state = this.processes.get(jobId);
+        return state?.host === 'prod' && state.interruptible && !state.finished
+          && (repairId === undefined || currentRepairId === repairId);
+      })
       .map(([jobId]) => jobId);
-    await Promise.all(jobs.map((jobId) => this.terminate(jobId, 'cancelled')));
+    return Promise.all(jobs.map((jobId) => this.terminate(jobId, 'cancelled'))).then(() => undefined);
+  }
+
+  private flushPendingForRepair(repairId?: string): Promise<void> {
+    const jobs = [...this.repairs.entries()]
+      .filter(([jobId, currentRepairId]) => this.processes.get(jobId)?.pending
+        && (repairId === undefined || currentRepairId === repairId))
+      .map(([jobId]) => jobId);
+    return Promise.all(jobs.map((jobId) => this.flushTerminal(jobId))).then(() => undefined);
   }
 
   private spawn(job: RepairJobRecord, rawCommand: string): ChildProcess {
