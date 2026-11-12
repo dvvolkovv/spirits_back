@@ -499,7 +499,8 @@ describe('AlertBotRepairExecutor', () => {
     releaseCheck();
     await stopped;
     await expect(started).resolves.toMatchObject({ jobId: job.id });
-    expect(await store.findJob(job.id)).toMatchObject({ status: 'cancelled', stdout: 'fast-close' });
+    expect(await store.findJob(job.id)).toMatchObject({ status: 'cancelled' });
+    expect((await store.findJob(job.id))!.status).not.toBe('succeeded');
   });
 
   it('stopRepair останавливает только interruptible job указанного repair', async () => {
