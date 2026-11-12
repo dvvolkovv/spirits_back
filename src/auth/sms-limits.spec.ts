@@ -688,3 +688,42 @@ describe('AuthService.requestSmsCode — явная просьба выслат�
     expect(await s.redis.get(smsAttemptsKey(P))).toBeNull();
   });
 });
+
+describe('AuthService.smsText — повтор обязан отличаться текстом', () => {
+  /**
+   * ⚠️ Замер на живом номере 12.11.2026. Первая SMS дошла за 8 секунд
+   * (SMSAERO: status 1, delivery). Повтор с ТЕМ ЖЕ текстом тот же агрегатор
+   * отбил через секунду (status 6, error) — дедупликация одинакового сообщения
+   * на один номер. Тот же код с припиской «Высылаем повторно» дошёл за 9 секунд.
+   *
+   * Поэтому кнопка «выслать ещё раз» без этой приписки молча не работала:
+   * сервер отправлял, агрегатор отбрасывал, человек ждал.
+   */
+  const text = (code: string, lang: string | null, resend: boolean) =>
+    (makeService().service as any).smsText(code, lang, resend) as string;
+
+  it('повтор и первая отправка — разные тексты при одном коде', () => {
+    const first = text('123456', 'ru', false);
+    const again = text('123456', 'ru', true);
+    expect(again).not.toEqual(first);
+    expect(again).toContain('123456');
+    expect(again).toContain('повторно');
+  });
+
+  it('WebOTP-маркер остаётся ПОСЛЕДНЕЙ строкой и в повторе', () => {
+    for (const lang of ['ru', 'en', 'de', null]) {
+      const lines = text('123456', lang, true).split('\n');
+      expect(lines[lines.length - 1]).toEqual('@my.linkeon.io #123456');
+      expect(lines.length).toBe(2);
+    }
+  });
+
+  it('приписка идёт на языке сообщения, а не всегда по-русски', () => {
+    expect(text('123456', 'en', true)).toContain('again');
+    expect(text('123456', 'en', true)).not.toContain('повторно');
+  });
+
+  it('без просьбы повторить текст прежний — старые отправки не меняем', () => {
+    expect(text('123456', 'ru', false)).toEqual('Код 123456 для входа в linkeon.io\n@my.linkeon.io #123456');
+  });
+});
