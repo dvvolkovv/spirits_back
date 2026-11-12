@@ -1,3 +1,4 @@
+import { Injectable } from '@nestjs/common';
 import * as childProcess from 'child_process';
 import { ChildProcess } from 'child_process';
 import { StringDecoder } from 'string_decoder';
@@ -124,6 +125,7 @@ function compensationJob(jobId: string, repairId: string): RepairJobRecord {
   };
 }
 
+@Injectable()
 export class AlertBotRepairExecutor {
   private readonly children = new Map<string, ChildProcess>();
   private readonly repairs = new Map<string, string>();

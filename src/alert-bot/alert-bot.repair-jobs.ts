@@ -1,3 +1,4 @@
+import { Injectable } from '@nestjs/common';
 import { AlertBotRepairExecutor, RepairStartResult } from './alert-bot.repair-executor';
 import { maskSecrets } from './alert-bot.mask';
 import { RepairJobRecord, RepairStore } from './alert-bot.repair-store';
@@ -26,6 +27,7 @@ function waitSeconds(value: number): number {
   return Number.isFinite(value) ? Math.min(30, Math.max(0, value)) : 0;
 }
 
+@Injectable()
 export class AlertBotRepairJobs {
   constructor(
     private readonly store: RepairStore,
