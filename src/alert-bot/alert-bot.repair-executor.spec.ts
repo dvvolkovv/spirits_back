@@ -434,6 +434,7 @@ describe('AlertBotRepairExecutor', () => {
       await executor.start(job.id, `exec node -e "process.on('SIGTERM',()=>{});setTimeout(()=>require('fs').writeFileSync('${sentinel}','x'),6000)"`);
       expect((executor as any).processes.get(job.id)).toMatchObject({ host: 'prod', interruptible: true, finished: false });
       expect((await store.findJob(job.id))!.status).toBe('running');
+      expect(() => process.kill(-spawned[0].pid!, 0)).not.toThrow();
       const startedAt = Date.now();
       await executor.stopRepair('repair-1');
       expect(Date.now() - startedAt).toBeGreaterThanOrEqual(4_500);
