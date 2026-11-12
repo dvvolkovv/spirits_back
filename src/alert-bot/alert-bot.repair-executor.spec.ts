@@ -420,6 +420,20 @@ describe('AlertBotRepairExecutor', () => {
     expect(JSON.stringify(log.mock.calls)).not.toContain('sensitive');
   });
 
+  it('stopRepair при зависшем requestCancel сначала гасит local и завершается bounded', async () => {
+    const job = await createJob({ timeoutMs: 30_000 });
+    jest.spyOn(store, 'requestCancel').mockImplementation(() => new Promise<boolean>(() => undefined));
+    await executor.start(job.id, 'sleep 30');
+    let resolved = false;
+    const stopped = executor.stopRepair('repair-1').then(() => { resolved = true; });
+    let timer: NodeJS.Timeout;
+    await Promise.race([stopped, new Promise<void>((resolve) => { timer = setTimeout(resolve, 2_000); })]);
+    clearTimeout(timer!);
+    expect(resolved).toBe(true);
+    expect(await executor.wait(job.id, 0.5)).toBe(true);
+    expect(await store.findJob(job.id)).toMatchObject({ status: 'cancelled' });
+  });
+
   it('stopRepair до start сохраняет cancellation marker даже при отказе requestCancel', async () => {
     const job = await createJob();
     jest.spyOn(store, 'requestCancel').mockResolvedValue(false);

@@ -218,6 +218,34 @@ describe('AlertBotRepairJobs', () => {
     expect([...store.jobs.values()][0]).toMatchObject({ status: 'cancelled' });
   });
 
+  it.each(['stopRepair', 'stopAll'] as const)('%s bounded при зависшем initial findJob chain', async (mode) => {
+    let releaseFind!: () => void;
+    let findEntered!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseFind = resolve; });
+    const entered = new Promise<void>((resolve) => { findEntered = resolve; });
+    const original = store.findJob.bind(store);
+    jest.spyOn(store, 'findJob').mockImplementation(async (id) => {
+      findEntered();
+      await gate;
+      return original(id);
+    });
+    const spawn = jest.spyOn(childProcess, 'spawn');
+    const starting = jobs.start(ctx, 'exec', { host: 'prod', command: 'printf must-not-run' });
+    await entered;
+    let resolved = false;
+    const stopped = (mode === 'stopRepair' ? executor.stopRepair(ctx.repairId) : executor.stopAll())
+      .then(() => { resolved = true; });
+    let timer: NodeJS.Timeout;
+    await Promise.race([stopped, new Promise<void>((resolve) => { timer = setTimeout(resolve, 2_000); })]);
+    clearTimeout(timer!);
+    const bounded = resolved;
+    releaseFind();
+    await stopped;
+    expect(bounded).toBe(true);
+    expect(await starting).toMatchObject({ startError: 'repair_inactive' });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it.each(['findJob', 'markJobRunning'] as const)('%s rejection и transient finish error возвращают jobId/startError и durable compensation', async (kind) => {
     const originalOperation = kind === 'findJob' ? store.findJob.bind(store) : store.markJobRunning.bind(store);
     jest.spyOn(store, kind).mockRejectedValueOnce(new Error(`${kind} unavailable`)).mockImplementation(originalOperation as any);
