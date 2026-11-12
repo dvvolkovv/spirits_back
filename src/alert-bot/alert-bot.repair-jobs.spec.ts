@@ -44,6 +44,8 @@ class MemoryRepairStore {
 
   async createJob(input: CreateRepairJobInput): Promise<{ id: string; sequence: number } | null> {
     if (!['requested', 'running'].includes(this.repair.status) || input.repairId !== this.repair.id) return null;
+    if ([...this.jobs.values()].some((job) => job.repairId === input.repairId
+      && ['process_close_unconfirmed', 'remote_outcome_unknown'].includes(job.failureKind ?? ''))) return null;
     if ([...this.jobs.values()].some((job) => ['queued', 'running'].includes(job.status))) return null;
     const id = `job-${++this.sequence}`;
     this.jobs.set(id, {

@@ -251,7 +251,7 @@ export class AlertBotRepairExecutor {
       appendStream(state.stdout, state.stdout.decoder.end());
       appendStream(state.stderr, state.stderr.decoder.end());
       if (job.host !== 'prod' && (state.outcome === 'timeout' || code === null || code === 255)) {
-        void this.finishProcess(jobId, 'interrupted', null, 'remote_outcome_unknown').catch(() => undefined);
+        void this.finishUnknown(jobId, 'remote_outcome_unknown').catch(() => undefined);
         return;
       }
       const repairId = this.repairs.get(jobId);
@@ -471,7 +471,7 @@ export class AlertBotRepairExecutor {
         }
         await bounded(state.completion, this.closeWaitMs);
         if (!state.finished) {
-          await this.finishProcess(jobId, 'interrupted', null, 'remote_outcome_unknown');
+          await this.finishUnknown(jobId, 'remote_outcome_unknown');
         }
       }
       return;
@@ -487,8 +487,14 @@ export class AlertBotRepairExecutor {
     }
     await bounded(state.completion, this.closeWaitMs);
     if (!state.finished) {
-      await this.finishProcess(jobId, 'interrupted', null, 'process_close_unconfirmed');
+      await this.finishUnknown(jobId, 'process_close_unconfirmed');
     }
+  }
+
+  private async finishUnknown(jobId: string, failureKind: string): Promise<void> {
+    const repairId = this.repairs.get(jobId);
+    if (repairId) await bounded(this.store.requestCancel(repairId));
+    await this.finishProcess(jobId, 'interrupted', null, failureKind);
   }
 
   private async finishProcess(

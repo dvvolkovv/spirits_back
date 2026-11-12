@@ -241,8 +241,13 @@ export class RepairStore {
       await client.query('BEGIN');
       transactionOpen = true;
       const repair = await client.query(
-        `SELECT id FROM alert_bot_repairs
-         WHERE id = $1 AND status IN ('requested', 'running')
+        `SELECT r.id FROM alert_bot_repairs r
+         WHERE r.id = $1 AND r.status IN ('requested', 'running')
+           AND NOT EXISTS (
+             SELECT 1 FROM alert_bot_repair_jobs j
+             WHERE j.repair_id = r.id
+               AND j.failure_kind IN ('process_close_unconfirmed', 'remote_outcome_unknown')
+           )
          FOR UPDATE`,
         [input.repairId],
       );
