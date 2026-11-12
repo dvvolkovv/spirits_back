@@ -10,8 +10,11 @@ type RuntimeCancelClient = {
   connection: {
     once(event: 'error', listener: (error: Error) => void): unknown;
     removeListener(event: 'error', listener: (error: Error) => void): unknown;
+    destroy(): void;
   };
 };
+
+const CANCEL_CLOSE_TIMEOUT_MS = 1_000;
 
 /** Отдельный client нужен, чтобы cancel адресовал именно активный Query этого вызова. */
 export async function queryWithCancellation(
@@ -49,6 +52,7 @@ export async function queryWithCancellation(
   const query = new Query(text, params);
   let cancelClient: Client | undefined;
   let destroyError: Error | undefined;
+  let forceDestroyClient = false;
   let rejectPending: (error: Error) => void = () => {};
 
   const onClientError = (error: Error) => {
@@ -104,14 +108,36 @@ export async function queryWithCancellation(
     signal?.removeEventListener('abort', onAbort);
     if (cancelClient) {
       const closingClient = cancelClient;
-      try { await closingClient.end().catch(() => {}); }
-      finally {
-        closingClient.removeListener('error', onCancelError);
-        (closingClient as unknown as RuntimeCancelClient).connection
-          .removeListener('error', onCancelError);
+      let closeTimer: NodeJS.Timeout | undefined;
+      let closeTimedOut = false;
+      try {
+        closeTimedOut = !await Promise.race([
+          closingClient.end().then(() => true, () => true),
+          new Promise<false>((resolve) => {
+            closeTimer = setTimeout(() => resolve(false), CANCEL_CLOSE_TIMEOUT_MS);
+          }),
+        ]);
+        if (closeTimedOut) {
+          // CancelRequest не подтверждён: ни cancel connection, ни исходный
+          // client нельзя оставлять живым или возвращать в pool для reuse.
+          forceDestroyClient = true;
+          try { (closingClient as unknown as RuntimeCancelClient).connection.destroy(); }
+          catch { /* original client всё равно разрушается ниже */ }
+        }
+      } finally {
+        if (closeTimer) clearTimeout(closeTimer);
+        if (!closeTimedOut) {
+          closingClient.removeListener('error', onCancelError);
+          (closingClient as unknown as RuntimeCancelClient).connection
+            .removeListener('error', onCancelError);
+        }
       }
     }
-    if (destroyError) {
+    if (forceDestroyClient) {
+      // Оставляем onClientError: поздний error destroyed socket не должен
+      // стать unhandled после settle основного Promise.
+      client.release(true);
+    } else if (destroyError) {
       // Оставляем onClientError на уничтожаемом client: поздний error из socket
       // не должен стать unhandled после settle основного Promise.
       client.release(destroyError);
