@@ -34,7 +34,10 @@ export class AlertBotRepairJobs {
 
   async start(ctx: RepairIdentity, kind: 'exec' | 'verify', args: RepairJobArgs): Promise<RepairStartResult> {
     if (!HOSTS.has(args.host)) throw new Error('unknown_host');
-    if (!await this.store.isActiveRepair(ctx)) throw new Error('repair_inactive');
+    if (!await this.store.isActiveRepair(ctx)) {
+      if (await this.store.hasUnknownOutcome(ctx.repairId)) throw new Error('repair_outcome_unknown');
+      throw new Error('repair_inactive');
+    }
     const rawCommand = args.command;
     if (typeof rawCommand !== 'string' || !rawCommand.trim() || rawCommand.includes('\0') || Buffer.byteLength(rawCommand) > MAX_COMMAND_BYTES) {
       throw new Error('invalid_command');
