@@ -104,13 +104,12 @@ export async function queryWithCancellation(
     signal?.removeEventListener('abort', onAbort);
     if (cancelClient) {
       const closingClient = cancelClient;
-      void closingClient.end()
-        .catch(() => {})
-        .finally(() => {
-          closingClient.removeListener('error', onCancelError);
-          (closingClient as unknown as RuntimeCancelClient).connection
-            .removeListener('error', onCancelError);
-        });
+      try { await closingClient.end().catch(() => {}); }
+      finally {
+        closingClient.removeListener('error', onCancelError);
+        (closingClient as unknown as RuntimeCancelClient).connection
+          .removeListener('error', onCancelError);
+      }
     }
     if (destroyError) {
       // Оставляем onClientError на уничтожаемом client: поздний error из socket
