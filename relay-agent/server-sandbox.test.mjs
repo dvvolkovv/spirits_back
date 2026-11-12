@@ -7,6 +7,7 @@ import { PassThrough, Writable } from "node:stream";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { createRelayApp } from "./server.mjs";
 import { ensureSessionDirs, ensureListingGuard } from "./paths.mjs";
 
@@ -162,12 +163,13 @@ async function fixture(t, options = {}) {
     });
     return { response, text: await response.text() };
   };
-  const requestUpload = async (files, { sessionId = 'server-upload-session', fsKey = FS_KEY } = {}) => {
+  const requestUpload = async (files, { sessionId = 'server-upload-session', fsKey = FS_KEY, reqSystemPrompt } = {}) => {
     const payload = new FormData();
     payload.append('message', 'test uploaded documents');
     payload.append('sessionId', sessionId);
     if (fsKey) payload.append('fs_key', fsKey);
     payload.append('noFallback', '1');
+    if (reqSystemPrompt !== undefined) payload.append('systemPrompt', reqSystemPrompt);
     for (const file of files) {
       payload.append('files', new Blob([file.body], {
         type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -495,6 +497,37 @@ test('server off: текстовый ход сохраняет Agent и полу
   assert.match(prompt, /Не используй Bash sleep для ожидания субагентов/);
   assert.match(prompt, /Unknown skill/);
   assert.match(prompt, /не перебирай другие skills/);
+});
+
+test('server off: правила документов не увеличивают argv сверх 131071 байта', async (t) => {
+  const f = await fixture(t, { mode: 'off' });
+  const baseline = await f.requestUpload([], { sessionId: 'server-argv-baseline' });
+  assert.equal(baseline.response.status, 200);
+
+  // Восстанавливаем прежний inline baseline: в красной реализации общие правила
+  // уже добавлены в --system-prompt, а в исправленной будут только в append-файле.
+  const baselinePrompt = arg(f.calls[0].args, '--system-prompt');
+  const legacyBaselinePrompt = baselinePrompt.split('\n\nДОКУМЕНТЫ И СУБАГЕНТЫ.')[0];
+  const baselineBytes = Buffer.byteLength(legacyBaselinePrompt, 'utf8') + Buffer.byteLength('\n\n', 'utf8');
+  const reqSystemPrompt = 'x'.repeat(131071 - baselineBytes);
+  const boundary = await f.requestUpload([], { reqSystemPrompt, sessionId: 'server-argv-boundary' });
+  assert.equal(boundary.response.status, 200);
+
+  const args = f.calls[1].args;
+  const inlinePrompt = arg(args, '--system-prompt');
+  const inlineBytes = Buffer.byteLength(inlinePrompt, 'utf8');
+  assert.ok(inlineBytes <= 131071, `inline --system-prompt: ${inlineBytes} байт`);
+  assert.equal(inlineBytes, 131071);
+  for (const marker of ['ДОКУМЕНТЫ И СУБАГЕНТЫ.', 'UNKNOWN SKILL.', 'АНАЛИЗ НОВОГО ВЛОЖЕНИЯ.']) {
+    assert.equal(inlinePrompt.includes(marker), false);
+  }
+
+  const rules = fs.readFileSync(arg(args, '--append-system-prompt-file'), 'utf8');
+  assert.match(rules, /ДОКУМЕНТЫ И СУБАГЕНТЫ/);
+  assert.match(rules, /UNKNOWN SKILL/);
+  const spawned = spawnSync('/bin/true', args, { encoding: 'utf8' });
+  assert.equal(spawned.error, undefined);
+  assert.equal(spawned.status, 0);
 });
 
 test('server off: текстовый ход без вложений не обращается к каталогу загрузок', async (t) => {
