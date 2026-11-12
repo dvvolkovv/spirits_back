@@ -8,7 +8,9 @@
 
 **Tech Stack:** NestJS 10, TypeScript, PostgreSQL (`pg`), Node `child_process`, Claude CLI через существующий `ClaudeCliService`, Jest, официальный `scripts/deploy.sh`.
 
-**Spec:** `docs/superpowers/specs/2026-11-11-alert-bot-repair-design.md` (commit `9135223c`).
+**Spec:** `docs/superpowers/specs/2026-11-11-alert-bot-repair-design.md` (commit `9135223c`, решение об SSH уточнено 12.11).
+
+**Уточнение 12.11 после review executor:** владелец выбрал упрощение remote lifecycle. Для `relay/test` всегда `interruptible:false`; явный `interruptible:true` отклоняется `remote_not_interruptible`. `/stop` не убивает текущую SSH-команду, она завершается сама. Обрыв SSH по таймауту даёт `interrupted/remote_outcome_unknown`. Все remote PID/cancel-helper требования ниже отменены; локальная `prod` отмена остаётся.
 
 **Worktree:** `/Users/dmitry/Downloads/spirits_back/.worktrees/alertbot-repair`, branch `feat/alertbot-repair`, base `origin/main=5de4c0cc3c833124a2cca65f2b408bd16d9bf251`.
 
