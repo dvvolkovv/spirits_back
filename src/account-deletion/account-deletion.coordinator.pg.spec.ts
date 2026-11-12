@@ -466,6 +466,76 @@ type AdapterImplementation = (
       .toBe(true);
   });
 
+  it('keyset сохраняет PG microseconds и не возвращает последний account повторно', async () => {
+    process.env.ACCOUNT_DELETION_WORKER_ENABLED = 'true';
+    const first = account('u-cursor-a');
+    const second = account('u-cursor-b');
+    await pool.query(
+      `INSERT INTO user_id (internal_id,state,deleted_at,deletion_id)
+       VALUES
+         ($1,'deleted',now()-interval '1 day'+interval '123 microseconds',$2),
+         ($3,'deleted',now()-interval '1 day'+interval '123 microseconds',$4)`,
+      [first.userId, first.deletionId, second.userId, second.deletionId],
+    );
+    const lock = { release: jest.fn(async () => undefined) };
+    const { jobs, coordinator, planner } = compose({}, lock);
+    const originalDueAccounts = jobs.dueAccounts.bind(jobs);
+    let dueCalls = 0;
+    const dueSpy = jest.spyOn(jobs, 'dueAccounts').mockImplementation(
+      async (after, batchSize, retentionMs) => {
+        dueCalls += 1;
+        if (dueCalls > 4) throw new Error('KEYSET_DID_NOT_ADVANCE');
+        return originalDueAccounts(after, batchSize, retentionMs);
+      },
+    );
+
+    await expect(coordinator.tick({ retentionMs: 0, batchSize: 1 }))
+      .resolves.toBeUndefined();
+
+    const processed = (planner.collect as unknown as jest.Mock).mock.calls
+      .map((call) => call[1].userId);
+    expect(processed).toEqual([first.userId, second.userId]);
+    expect(dueSpy.mock.calls).toHaveLength(3);
+    expect(dueSpy.mock.calls[0][0]).toBeNull();
+    expect(dueSpy.mock.calls[1][0]).toEqual([expect.any(String), first.userId]);
+    expect(dueSpy.mock.calls[2][0]).toEqual([expect.any(String), second.userId]);
+    expect((dueSpy.mock.calls[1][0] as unknown as [string, string])[0]).toMatch(/\.\d{6}/);
+    expect(lock.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('продолжает tick после planner ошибки earliest account и логирует только safe kind', async () => {
+    process.env.ACCOUNT_DELETION_WORKER_ENABLED = 'true';
+    const earliest = account('u-earliest-error', new Date(Date.now() - 120_000));
+    const next = account('u-next-after-error', new Date(Date.now() - 60_000));
+    await insertDeleted(earliest);
+    await insertDeleted(next);
+    const lock = { release: jest.fn(async () => undefined) };
+    const { coordinator, planner, runner } = compose({}, lock);
+    (planner.collect as unknown as jest.Mock).mockImplementation(async (_db, value) => {
+      if (value.userId === earliest.userId) {
+        const error: any = new Error(`${PROVIDER_RAW} ${earliest.userId}`);
+        error.response = { status: 503 };
+        throw error;
+      }
+      return { jobs: [], skips: [] };
+    });
+    const runAccount = jest.spyOn(runner, 'runAccount');
+
+    await expect(coordinator.tick({ retentionMs: 0 })).resolves.toBeUndefined();
+
+    expect(runAccount.mock.calls.map((call) => call[0])).toEqual([next.deletionId]);
+    expect(planner.persist).toHaveBeenCalledTimes(1);
+    expect((planner.persist as unknown as jest.Mock).mock.calls[0][1].userId)
+      .toBe(next.userId);
+    const logs = logLines.join('\n');
+    expect(logs).toContain('type=account.core.purge');
+    expect(logs).toContain('attempt=0');
+    expect(logs).toContain('kind=external_5xx');
+    expect(logs).not.toContain(PROVIDER_RAW);
+    expect(logs).not.toContain(earliest.userId);
+    expect(lock.release).toHaveBeenCalledTimes(1);
+  });
+
   it('originOf различает explicit и использует merge при отсутствии core', async () => {
     const explicit = account('u-origin-explicit');
     const merge = account('u-origin-merge');
@@ -514,11 +584,39 @@ type AdapterImplementation = (
     await expect(jobs.heartbeat(claimed)).resolves.toBe(true);
 
     await expect(jobs.assertCurrent(claimed)).resolves.toBeUndefined();
-    await expect(jobs.assertCurrent(staleCopy))
-      .rejects.toBeInstanceOf(DeletionCancelledError);
+    await expect(jobs.assertCurrent(staleCopy)).resolves.toBeUndefined();
     await expect(jobs.assertCurrent({ ...claimed, attempts: claimed.attempts + 1 }))
       .rejects.toBeInstanceOf(DeletionCancelledError);
     expect(claimed.leaseUntil).toEqual((await rawJob(id)).lease_until);
+  });
+
+  it('assertCurrent принимает healthy job при heartbeat interleaving со stale local lease', async () => {
+    const current = account('u-assert-heartbeat-race');
+    await insertDeleted(current);
+    const id = await insertJob(current, 'routine.stop', 'routine-1', {
+      status: 'running',
+      attempts: 2,
+      leaseUntil: new Date(Date.now() + 60_000),
+    });
+    const claimed = await job(id);
+    const localViewBeforeHeartbeat = { ...claimed };
+    await pool.query(
+      `UPDATE account_deletion_jobs
+       SET lease_until=date_trunc('milliseconds',now())
+         + interval '5 minutes' + interval '456 microseconds'
+       WHERE id=$1
+         AND deletion_id=$2
+         AND attempts=$3
+         AND status='running'`,
+      [id, claimed.deletionId, claimed.attempts],
+    );
+    const { jobs } = compose();
+
+    await expect(jobs.assertCurrent(localViewBeforeHeartbeat)).resolves.toBeUndefined();
+    await expect(jobs.assertCurrent({
+      ...localViewBeforeHeartbeat,
+      attempts: localViewBeforeHeartbeat.attempts + 1,
+    })).rejects.toBeInstanceOf(DeletionCancelledError);
   });
 
   it('heartbeat/finish/fail с stale attempts не меняют newer job', async () => {
@@ -631,6 +729,60 @@ type AdapterImplementation = (
     await running;
     expect(jobs.finish).toHaveBeenCalledWith(claimed);
     expect(jobs.fail).not.toHaveBeenCalled();
+  });
+
+  it('transient heartbeat timeout даёт retry, а successful retry завершает job', async () => {
+    jest.useFakeTimers();
+    const current = account('u-heartbeat-timeout');
+    const claimed: DeletionJobRow = {
+      id: randomUUID(),
+      deletionId: current.deletionId,
+      userId: current.userId,
+      resourceType: 'routine.stop',
+      resourceKey: 'routine-1',
+      phase: 'immediate',
+      payload: {},
+      status: 'running',
+      attempts: 1,
+      nextAttemptAt: new Date(),
+      leaseUntil: new Date(Date.now() + 60_000),
+      lastErrorKind: null,
+    };
+    let releaseAdapter!: () => void;
+    const claims: Array<DeletionJobRow | null> = [claimed, null, claimed, null];
+    const timeout = Object.assign(new Error(PROVIDER_RAW), { code: 'ETIMEDOUT' });
+    const jobs = {
+      claimNext: jest.fn(async () => claims.shift() ?? null),
+      heartbeat: jest.fn(async () => true).mockRejectedValueOnce(timeout),
+      finish: jest.fn(async () => true),
+      fail: jest.fn(async () => true),
+      assertCurrent: jest.fn(async () => undefined),
+    };
+    const registry = new AccountDeletionRegistry();
+    const execute = jest.fn()
+      .mockImplementationOnce(() => new Promise<void>((resolve) => {
+        releaseAdapter = resolve;
+      }))
+      .mockResolvedValue(undefined);
+    registry.register({ resourceTypes: ['routine.stop'], execute });
+    const runner = new AccountDeletionRunner({} as PgService, jobs as any, registry);
+
+    const firstRun = runner.runAccount(current.deletionId);
+    await jest.advanceTimersByTimeAsync(0);
+    await jest.advanceTimersByTimeAsync(30_000);
+    releaseAdapter();
+    await jest.advanceTimersByTimeAsync(0);
+    await firstRun;
+
+    expect(jobs.fail).toHaveBeenNthCalledWith(1, claimed, 'timeout');
+    expect(jobs.fail).not.toHaveBeenCalledWith(claimed, 'cancelled');
+    expect(jobs.finish).not.toHaveBeenCalled();
+
+    const retry = runner.runAccount(current.deletionId);
+    await jest.advanceTimersByTimeAsync(0);
+    await retry;
+    expect(jobs.finish).toHaveBeenCalledWith(claimed);
+    expect(jobs.fail).toHaveBeenCalledTimes(1);
   });
 
   it('registry явно отклоняет duplicate/missing и assertReady проверяет весь каталог', () => {

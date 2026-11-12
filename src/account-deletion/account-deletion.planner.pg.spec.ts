@@ -455,7 +455,7 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       await expect(jobs.assertCurrent({
         ...currentJob,
         leaseUntil: new Date(currentJob.leaseUntil!.getTime() + 1),
-      })).rejects.toBeInstanceOf(DeletionCancelledError);
+      })).resolves.toBeUndefined();
     });
 
     it('отклоняет running job с NULL lease', async () => {
@@ -488,11 +488,11 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       })).rejects.toBeInstanceOf(DeletionCancelledError);
     });
 
-    it('отклоняет stale lease с точностью до timestamptz', async () => {
+    it('принимает stale local lease при активном DB lease и текущих attempts', async () => {
       await expect(jobs.assertCurrent({
         ...currentJob,
         leaseUntil: new Date(currentJob.leaseUntil!.getTime() + 1),
-      })).rejects.toBeInstanceOf(DeletionCancelledError);
+      })).resolves.toBeUndefined();
     });
 
     it('отклоняет job, который больше не running', async () => {
