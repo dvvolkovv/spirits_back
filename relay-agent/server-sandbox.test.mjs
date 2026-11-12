@@ -458,6 +458,45 @@ for (const legacyKey of ['70000000000_12_ru', 'mcp']) {
   });
 }
 
+for (const mode of ['on', 'off']) {
+  test(`server ${mode}: новое вложение запрещает Agent и задаёт один последовательный анализ`, async (t) => {
+    const f = await fixture(t, { mode });
+    const { response } = await f.requestUpload([
+      { name: 'policy.pdf', body: 'synthetic-pdf-body' },
+    ]);
+    assert.equal(response.status, 200);
+    assert.equal(f.calls.length, 1);
+
+    const denied = arg(f.calls[0].args, '--disallowedTools').split(',');
+    assert.ok(denied.includes('Agent'));
+    assert.equal(denied.includes('WebFetch'), mode === 'on', 'прежнее sandbox-правило WebFetch не изменилось');
+    assert.equal(arg(f.calls[0].args, '--system-prompt-snapshot'), 'off');
+
+    const prompt = arg(f.calls[0].args, '--system-prompt');
+    assert.match(prompt, /Agent недоступен: весь запрошенный анализ выполняет основная модель/);
+    assert.match(prompt, /для полного разбора читай документ последовательно частями/i);
+    assert.match(prompt, /25 000 токенов/);
+    assert.match(prompt, /Не используй Bash sleep для ожидания субагентов/);
+  });
+}
+
+test('server off: текстовый ход сохраняет Agent и получает общие правила без дублирования', async (t) => {
+  const f = await fixture(t, { mode: 'off' });
+  const { response } = await f.request();
+  assert.equal(response.status, 200);
+
+  const denied = arg(f.calls[0].args, '--disallowedTools').split(',');
+  assert.equal(denied.includes('Agent'), false);
+  assert.ok(denied.includes('ToolSearch'));
+  assert.equal(denied.includes('WebFetch'), false);
+
+  const prompt = arg(f.calls[0].args, '--system-prompt');
+  assert.match(prompt, /Не поручай Agent повторный анализ документа/);
+  assert.match(prompt, /Не используй Bash sleep для ожидания субагентов/);
+  assert.match(prompt, /Unknown skill/);
+  assert.match(prompt, /не перебирай другие skills/);
+});
+
 test('server off: текстовый ход без вложений не обращается к каталогу загрузок', async (t) => {
   const f = await fixture(t, { mode: 'off' });
   const conflict = path.join(f.dirs.uploadDir, FS_KEY);
