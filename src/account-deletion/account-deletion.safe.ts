@@ -264,24 +264,36 @@ function unsafeUrl(url: URL, userId: string, depth: number): boolean {
 }
 
 function unsafePayloadString(value: string, userId: string, depth = 0): boolean {
-  if (userId.length >= 6 && value.includes(userId)) return true;
   if (depth > 6) return true;
-  if (URL_WITH_USERINFO.test(value)) return true;
-  try {
-    if (unsafeUrl(new URL(value), userId, depth)) return true;
-  } catch {
-    // Проверяем встроенные URL ниже.
-  }
-  const normalized = value.replace(/[\t\r\n]/g, '');
-  const candidates = normalized.match(/(?:[a-z][a-z0-9+.-]*:)?\/\/[^\s]+/gi) ?? [];
-  for (const candidate of candidates) {
+  let variant = value;
+  for (let pass = 0; pass <= 5; pass += 1) {
+    if (userId.length >= 6 && variant.includes(userId)) return true;
+    if (URL_WITH_USERINFO.test(variant)) return true;
     try {
-      const url = candidate.startsWith('//')
-        ? new URL(candidate, 'https://deletion.invalid')
-        : new URL(candidate);
-      if (unsafeUrl(url, userId, depth)) return true;
+      if (unsafeUrl(new URL(variant), userId, depth)) return true;
     } catch {
-      return true;
+      // Проверяем встроенные URL ниже.
+    }
+    const normalized = variant.replace(/[\t\r\n]/g, '');
+    const candidates = normalized.match(/(?:[a-z][a-z0-9+.-]*:)?\/\/[^\s]+/gi) ?? [];
+    for (const candidate of candidates) {
+      try {
+        const url = candidate.startsWith('//')
+          ? new URL(candidate, 'https://deletion.invalid')
+          : new URL(candidate);
+        if (unsafeUrl(url, userId, depth)) return true;
+      } catch {
+        return true;
+      }
+    }
+    if (pass === 5) break;
+    try {
+      const decoded = decodeURIComponent(variant);
+      if (decoded === variant) break;
+      variant = decoded;
+    } catch {
+      if (/%(?:3a|2f|3f|3d|26)/i.test(variant)) return true;
+      break;
     }
   }
   return false;
@@ -308,48 +320,79 @@ function isBinaryValue(value: unknown): boolean {
     || (typeof Blob !== 'undefined' && value instanceof Blob);
 }
 
-function assertPayloadPreflight(payload: unknown): void {
+type PlainJsonValue = null | boolean | number | string | PlainJsonValue[] | {
+  [key: string]: PlainJsonValue;
+};
+const OMIT_JSON_VALUE = Symbol('omit_json_value');
+type SanitizedJsonValue = PlainJsonValue | typeof OMIT_JSON_VALUE;
+
+function assertPlainPayload(payload: unknown): void {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     throw new Error('unsafe_payload');
   }
   const prototype = Object.getPrototypeOf(payload);
   if (prototype !== Object.prototype && prototype !== null) throw new Error('unsafe_payload');
+}
 
-  const seen = new WeakSet<object>();
-  const stack: unknown[] = [payload];
-  while (stack.length > 0) {
-    const current = stack.pop();
-    if (isBinaryValue(current)) throw new Error('unsafe_payload');
-    if (!current || typeof current !== 'object' || seen.has(current)) continue;
-    seen.add(current);
-    for (const key of Object.keys(current)) {
-      const descriptor = Object.getOwnPropertyDescriptor(current, key);
-      if (descriptor && 'value' in descriptor) stack.push(descriptor.value);
+function sanitizeJsonValue(
+  value: unknown,
+  userId: string,
+  stack: WeakSet<object>,
+  key: string,
+): SanitizedJsonValue {
+  if (isBinaryValue(value) || typeof value === 'bigint') throw new Error('unsafe_payload');
+  if (value === null) return null;
+  if (typeof value === 'string') {
+    if (unsafePayloadString(value, userId)) throw new Error('unsafe_payload');
+    return value;
+  }
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return null;
+    if (userId.length >= 6 && String(value) === userId) throw new Error('unsafe_payload');
+    return value;
+  }
+  if (typeof value === 'undefined' || typeof value === 'function' || typeof value === 'symbol') {
+    return OMIT_JSON_VALUE;
+  }
+  if (value instanceof URL) return sanitizeJsonValue(value.href, userId, stack, key);
+
+  const objectValue = value as Record<string, unknown>;
+  if (stack.has(objectValue)) throw new Error('unsafe_payload');
+  stack.add(objectValue);
+  try {
+    const toJSON = objectValue.toJSON;
+    if (typeof toJSON === 'function') {
+      return sanitizeJsonValue(toJSON.call(objectValue, key), userId, stack, key);
     }
+    if (Array.isArray(objectValue)) {
+      return objectValue.map((item) => {
+        const sanitized = sanitizeJsonValue(item, userId, stack, key);
+        return sanitized === OMIT_JSON_VALUE ? null : sanitized;
+      });
+    }
+    const result: Record<string, PlainJsonValue> = Object.create(null);
+    for (const property of Object.keys(objectValue)) {
+      if (userId.length >= 6 && property.includes(userId)) throw new Error('unsafe_payload');
+      if (unsafePayloadKey(property)) throw new Error('unsafe_payload');
+      const sanitized = sanitizeJsonValue(objectValue[property], userId, stack, property);
+      if (sanitized !== OMIT_JSON_VALUE) result[property] = sanitized;
+    }
+    return result;
+  } finally {
+    stack.delete(objectValue);
   }
 }
 
 export function deletionPayloadJson(payload: unknown, userId: string): string {
   try {
-    assertPayloadPreflight(payload);
-    const serialized = JSON.stringify(payload, function (key, value) {
-      if (key && userId.length >= 6 && key.includes(userId)) {
-        throw new Error('unsafe_payload');
-      }
-      if (key && unsafePayloadKey(key)) throw new Error('unsafe_payload');
-      if (isBinaryValue(value) || typeof value === 'bigint') throw new Error('unsafe_payload');
-      if (typeof value === 'number' && Number.isFinite(value)
-        && userId.length >= 6 && String(value) === userId) {
-        throw new Error('unsafe_payload');
-      }
-      if (value instanceof URL && unsafePayloadString(value.href, userId)) {
-        throw new Error('unsafe_payload');
-      }
-      if (typeof value === 'string' && unsafePayloadString(value, userId)) {
-        throw new Error('unsafe_payload');
-      }
-      return value;
-    });
+    assertPlainPayload(payload);
+    const sanitized = sanitizeJsonValue(payload, userId, new WeakSet(), '');
+    if (sanitized === OMIT_JSON_VALUE || sanitized === null
+      || typeof sanitized !== 'object' || Array.isArray(sanitized)) {
+      throw new Error('unsafe_payload');
+    }
+    const serialized = JSON.stringify(sanitized);
     if (typeof serialized !== 'string' || !serialized.startsWith('{')) {
       throw new Error('unsafe_payload');
     }
