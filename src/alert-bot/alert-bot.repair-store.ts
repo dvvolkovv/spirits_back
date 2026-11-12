@@ -296,6 +296,17 @@ export class RepairStore {
     }
   }
 
+  async hasUnknownOutcome(repairId: string): Promise<boolean> {
+    const result = await this.pg.query(
+      `SELECT 1 FROM alert_bot_repair_jobs
+       WHERE repair_id = $1
+         AND failure_kind IN ('process_close_unconfirmed', 'remote_outcome_unknown')
+       LIMIT 1`,
+      [repairId],
+    );
+    return result.rowCount === 1;
+  }
+
   async listJobs(repairId: string): Promise<RepairJobRecord[]> {
     const result = await this.pg.query(
       'SELECT * FROM alert_bot_repair_jobs WHERE repair_id = $1 ORDER BY sequence',

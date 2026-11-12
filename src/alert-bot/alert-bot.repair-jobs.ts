@@ -50,6 +50,7 @@ export class AlertBotRepairJobs {
       timeoutMs: timeoutMs(args.timeout_ms),
     });
     if (!created) {
+      if (await this.store.hasUnknownOutcome(ctx.repairId)) throw new Error('repair_outcome_unknown');
       if (!await this.store.isActiveRepair(ctx)) throw new Error('repair_inactive');
       throw new Error('job_already_active');
     }
