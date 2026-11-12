@@ -669,7 +669,8 @@ describe('account deletion contract completeness regressions', () => {
     }), USER_ID)).toThrow(/^unsafe_payload$/);
   });
 
-  it.each(['title', 'jwt', 'email', 'phone', 'subject', 'summary', 'cookie', 'code', 'session'])(
+  it.each(['title', 'jwt', 'email', 'phone', 'subject', 'summary', 'cookie', 'code', 'session',
+    'accessKey', 'accessKeyId', 'authKey'])(
     'блокирует personal/credential payload key: %s',
     (key) => {
       expect(() => assertSafeJobSpec(job({ [key]: CANARY }), USER_ID))
@@ -724,7 +725,7 @@ describe('account deletion contract completeness regressions', () => {
     }), USER_ID)).not.toThrow();
   });
 
-  it.each(['ownerId', 'internalId'])('запрещает identity key: %s', (key) => {
+  it.each(['ownerId', 'internalId', 'ownerIds', 'internalIds', 'accountUserId', 'accountOwnerId'])('запрещает identity key: %s', (key) => {
     expect(() => assertSafeJobSpec(job({ [key]: 'u-owner' }), USER_ID))
       .toThrow(/^unsafe_payload$/);
   });
@@ -763,6 +764,11 @@ describe('account deletion contract completeness regressions', () => {
 
   it('отклоняет ArrayBuffer до сериализации', () => {
     expect(() => assertSafeJobSpec(job({ file: new ArrayBuffer(8) }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('отклоняет Blob до сериализации', () => {
+    expect(() => assertSafeJobSpec(job({ file: new Blob([SECRET]) }), USER_ID))
       .toThrow(/^unsafe_payload$/);
   });
 
