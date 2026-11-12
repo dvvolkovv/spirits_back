@@ -538,6 +538,7 @@ export class AlertBotRepairExecutor {
         console.error('repair_finish_timeout');
         return false;
       }
+      if (finished.failed) console.error('repair_finish_failed');
       if (finished.value) {
         this.confirmTerminal(jobId);
         return true;
@@ -550,6 +551,7 @@ export class AlertBotRepairExecutor {
         console.error('repair_finish_check_timeout');
         return false;
       }
+      if (freshResult.failed) console.error('repair_finish_check_failed');
       const fresh = freshResult.value;
       if (fresh && TERMINAL_STATUSES.has(fresh.status)) {
         this.confirmTerminal(jobId);
