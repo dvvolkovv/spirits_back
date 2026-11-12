@@ -96,9 +96,9 @@ export class AlertBotRepairTools implements OpsToolHandler {
     try {
       switch (name) {
         case 'repair_exec':
-          return repairToolText(await this.jobs.start(repairCtx, 'exec', args as RepairJobArgs));
+          return repairToolText(await this.jobs.start(repairCtx, 'exec', args as unknown as RepairJobArgs));
         case 'repair_verify':
-          return repairToolText(await this.jobs.start(repairCtx, 'verify', args as RepairJobArgs));
+          return repairToolText(await this.jobs.start(repairCtx, 'verify', args as unknown as RepairJobArgs));
         case 'repair_job':
           return repairToolText(await this.jobs.wait(
             repairCtx,
