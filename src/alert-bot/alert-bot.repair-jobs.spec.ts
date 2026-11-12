@@ -27,8 +27,8 @@ async function runTestSsh(script: string): Promise<{ code: number | null; stdout
 
 async function waitForRemoteFile(path: string): Promise<void> {
   for (let attempt = 0; attempt < 40; attempt += 1) {
-    if ((await runTestSsh(`test -s ${path}`)).code === 0) return;
-    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    if ((await runTestSsh(`test -e ${path}`)).code === 0) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
   }
   throw new Error('remote_pid_file_timeout');
 }
@@ -131,103 +131,61 @@ describe('AlertBotRepairJobs', () => {
     expect(Date.now() - startedAt).toBeLessThan(5_000);
   });
 
-  it('host:test cancel завершает remote process group без sentinel и temp files', async () => {
-    const suffix = `${process.pid}-${Date.now()}`;
-    const sentinel = `/tmp/alert-bot-repair-sentinel-${suffix}`;
-    const innerPidFile = `/tmp/alert-bot-repair-inner-${suffix}.pid`;
-    let innerPid = '';
-    let outerPid = '';
-    let outerPidFile = '';
-    let jobId = '';
-    await runTestSsh(`rm -f ${sentinel} ${innerPidFile}`);
+  it('host:test /stop не убивает remote command и поздний sentinel появляется', async () => {
+    const sentinel = `/tmp/alert-bot-repair-remote-stop-${process.pid}-${Date.now()}`;
+    let settled = false;
     try {
       const started = await jobs.start(ctx, 'exec', {
-        host: 'test',
-        command: `printf '%s\\n' "$$" > ${innerPidFile}; sleep 30; touch ${sentinel}`,
-        timeout_ms: 30_000,
-        interruptible: true,
+        host: 'test', command: `trap '' HUP; sleep 0.3; touch ${sentinel}`, timeout_ms: 5_000,
       });
-      jobId = started.jobId;
-      outerPidFile = `/tmp/alert-bot-repair-${jobId}.pid`;
-      await waitForRemoteFile(innerPidFile);
-      innerPid = (await runTestSsh(`cat ${innerPidFile}`)).stdout;
-      outerPid = (await runTestSsh(`cat ${outerPidFile} 2>/dev/null || true`)).stdout;
       await executor.stopRepair(ctx.repairId);
-      expect(await jobs.wait(ctx, jobId, 2)).toMatchObject({ status: 'cancelled' });
-      const check = await runTestSsh([
-        innerPid ? `! kill -0 ${innerPid} 2>/dev/null` : 'false',
-        outerPid ? `! kill -0 -- -${outerPid} 2>/dev/null` : 'false',
-        `test ! -e ${sentinel}`,
-        `test ! -e ${outerPidFile}`,
-      ].join(' && '));
-      expect(check).toMatchObject({ code: 0 });
+      expect(await jobs.wait(ctx, started.jobId, 3)).toMatchObject({ status: 'succeeded', exitCode: 0 });
+      settled = true;
+      await waitForRemoteFile(sentinel);
+      expect((await runTestSsh(`test -e ${sentinel}`)).code).toBe(0);
+      expect((await runTestSsh(`test ! -e /tmp/alert-bot-repair-${started.jobId}.pid && test ! -e /tmp/alert-bot-repair-${started.jobId}.cancel`)).code).toBe(0);
     } finally {
-      await executor.stopRepair(ctx.repairId).catch(() => undefined);
-      await runTestSsh([
-        outerPid ? `kill -KILL -- -${outerPid} 2>/dev/null || true` : 'true',
-        innerPid ? `kill -KILL ${innerPid} 2>/dev/null || true` : 'true',
-        `rm -f ${sentinel} ${innerPidFile} ${outerPidFile || `/tmp/alert-bot-repair-${jobId}.pid`}`,
-      ].join('; '));
+      if (!settled) await runTestSsh('sleep 3');
+      await runTestSsh(`rm -f ${sentinel} /tmp/alert-bot-repair-*.pid /tmp/alert-bot-repair-*.cancel`);
     }
   });
 
-  it('host:test immediate cancel без ожидания PID не даёт sentinel и оставшихся temp files', async () => {
-    const suffix = `${process.pid}-${Date.now()}`;
-    const sentinel = `/tmp/alert-bot-repair-immediate-${suffix}`;
-    const innerPidFile = `/tmp/alert-bot-repair-immediate-inner-${suffix}.pid`;
-    let jobId = '';
-    let innerPid = '';
-    let outerPid = '';
+  it('host:test timeout даёт interrupted/remote_outcome_unknown и поздний cleanup sentinel', async () => {
+    const sentinel = `/tmp/alert-bot-repair-remote-timeout-${process.pid}-${Date.now()}`;
+    let settled = false;
     try {
       const started = await jobs.start(ctx, 'exec', {
-        host: 'test',
-        command: `printf '%s\\n' "$$" > ${innerPidFile}; sleep 30; touch ${sentinel}`,
-        interruptible: true,
-        timeout_ms: 30_000,
+        host: 'test', command: `trap '' HUP; sleep 2; touch ${sentinel}`, timeout_ms: 50,
       });
-      jobId = started.jobId;
-      const pidFile = `/tmp/alert-bot-repair-${jobId}.pid`;
-      const cancelFile = `/tmp/alert-bot-repair-${jobId}.cancel`;
-      await executor.stopRepair(ctx.repairId);
-      expect(await jobs.wait(ctx, jobId, 2)).toMatchObject({ status: 'cancelled' });
-      innerPid = (await runTestSsh(`cat ${innerPidFile} 2>/dev/null || true`)).stdout;
-      outerPid = (await runTestSsh(`cat ${pidFile} 2>/dev/null || true`)).stdout;
-      const check = await runTestSsh([
-        innerPid ? `! kill -0 ${innerPid} 2>/dev/null` : 'true',
-        outerPid ? `! kill -0 -- -${outerPid} 2>/dev/null` : 'true',
-        `test ! -e ${sentinel}`,
-        `test ! -e ${pidFile}`,
-        `test ! -e ${cancelFile}`,
-      ].join(' && '));
-      expect(check.code).toBe(0);
+      const done = await jobs.wait(ctx, started.jobId, 3);
+      expect(done).toMatchObject({ status: 'interrupted', failureKind: 'remote_outcome_unknown' });
+      expect(done.status).not.toBe('cancelled');
+      expect(done.status).not.toBe('timeout');
+      await waitForRemoteFile(sentinel);
+      settled = true;
+      expect((await runTestSsh(`test -e ${sentinel}`)).code).toBe(0);
+      expect((await runTestSsh(`test ! -e /tmp/alert-bot-repair-${started.jobId}.pid && test ! -e /tmp/alert-bot-repair-${started.jobId}.cancel`)).code).toBe(0);
     } finally {
-      const pidFile = `/tmp/alert-bot-repair-${jobId}.pid`;
-      const cancelFile = `/tmp/alert-bot-repair-${jobId}.cancel`;
-      if (!innerPid) innerPid = (await runTestSsh(`cat ${innerPidFile} 2>/dev/null || true`)).stdout;
-      if (!outerPid) outerPid = (await runTestSsh(`cat ${pidFile} 2>/dev/null || true`)).stdout;
-      await executor.stopRepair(ctx.repairId).catch(() => undefined);
-      await runTestSsh([
-        outerPid ? `kill -KILL -- -${outerPid} 2>/dev/null || true` : 'true',
-        innerPid ? `kill -KILL ${innerPid} 2>/dev/null || true` : 'true',
-        `rm -f ${sentinel} ${innerPidFile} ${pidFile} ${cancelFile}`,
-      ].join('; '));
+      if (!settled) await runTestSsh('sleep 3');
+      await runTestSsh(`rm -f ${sentinel} /tmp/alert-bot-repair-*.pid /tmp/alert-bot-repair-*.cancel`);
     }
   });
 
-  it('host:test сохраняет exit/stdout/stderr и удаляет wrapper pid при обычном close', async () => {
-    let jobId = '';
-    try {
-      const started = await jobs.start(ctx, 'exec', {
-        host: 'test', command: 'printf remote-out; printf remote-err >&2; exit 7', interruptible: true,
-      });
-      jobId = started.jobId;
-      expect(await jobs.wait(ctx, jobId, 3)).toMatchObject({
-        status: 'failed', exitCode: 7, stdout: 'remote-out', stderr: 'remote-err',
-      });
-      expect((await runTestSsh(`test ! -e /tmp/alert-bot-repair-${jobId}.pid`)).code).toBe(0);
-    } finally {
-      await runTestSsh(`rm -f /tmp/alert-bot-repair-${jobId}.pid`);
-    }
+  it('host:test сохраняет обычный exit7 и stdout/stderr без helper files', async () => {
+    const started = await jobs.start(ctx, 'exec', {
+      host: 'test', command: 'printf remote-out; printf remote-err >&2; exit 7',
+    });
+    expect(await jobs.wait(ctx, started.jobId, 3)).toMatchObject({
+      status: 'failed', exitCode: 7, stdout: 'remote-out', stderr: 'remote-err',
+    });
+    expect((await runTestSsh(`test ! -e /tmp/alert-bot-repair-${started.jobId}.pid && test ! -e /tmp/alert-bot-repair-${started.jobId}.cancel`)).code).toBe(0);
+  });
+
+  it('remote interruptible:true отклоняется до createJob', async () => {
+    const create = jest.spyOn(store, 'createJob');
+    await expect(jobs.start(ctx, 'exec', { host: 'test', command: 'printf no', interruptible: true }))
+      .rejects.toThrow('remote_not_interruptible');
+    expect(create).not.toHaveBeenCalled();
   });
 
   it('stopRepair ждёт начальный findJob внутри per-repair chain', async () => {
