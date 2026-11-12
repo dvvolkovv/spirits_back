@@ -148,9 +148,11 @@ export class AccountDeletionJobs {
        WHERE id=$1
          AND deletion_id=$2
          AND attempts=$3
-         AND status='running'`,
+         AND status='running'
+       RETURNING lease_until`,
       [job.id, job.deletionId, job.attempts],
     );
+    if (result.rowCount === 1) job.leaseUntil = result.rows[0].lease_until;
     return result.rowCount === 1;
   }
 
