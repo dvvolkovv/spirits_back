@@ -340,6 +340,29 @@ describe('AlertBotRepairExecutor', () => {
     }
   });
 
+  it('remote close(null) даёт interrupted/remote_outcome_unknown', async () => {
+    const job = await createJob({ host: 'test' });
+    const realSpawn = childProcess.spawn;
+    let child!: childProcess.ChildProcess;
+    jest.spyOn(childProcess, 'spawn').mockImplementation((...args: any[]) => {
+      child = realSpawn('bash', ['-lc', 'sleep 0.2'], args[2]);
+      return child as any;
+    });
+    try {
+      await executor.start(job.id, 'printf remote');
+      child.emit('close', null);
+      await executor.wait(job.id, 0.5);
+      expect(await store.findJob(job.id)).toMatchObject({
+        status: 'interrupted', failureKind: 'remote_outcome_unknown',
+      });
+    } finally {
+      if (child.pid) {
+        try { process.kill(-child.pid, 'SIGKILL'); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+      }
+    }
+  });
+
   it('transient finishJob rejection повторяет flush до durable succeeded', async () => {
     const job = await createJob();
     const original = store.finishJob.bind(store);

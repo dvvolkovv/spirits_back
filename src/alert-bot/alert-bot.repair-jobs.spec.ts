@@ -181,6 +181,13 @@ describe('AlertBotRepairJobs', () => {
     expect((await runTestSsh(`test ! -e /tmp/alert-bot-repair-${started.jobId}.pid && test ! -e /tmp/alert-bot-repair-${started.jobId}.cancel`)).code).toBe(0);
   });
 
+  it('host:test exit255 означает interrupted/remote_outcome_unknown', async () => {
+    const started = await jobs.start(ctx, 'exec', { host: 'test', command: 'exit 255' });
+    expect(await jobs.wait(ctx, started.jobId, 3)).toMatchObject({
+      status: 'interrupted', failureKind: 'remote_outcome_unknown',
+    });
+  });
+
   it('remote interruptible:true отклоняется до createJob', async () => {
     const create = jest.spyOn(store, 'createJob');
     await expect(jobs.start(ctx, 'exec', { host: 'test', command: 'printf no', interruptible: true }))
