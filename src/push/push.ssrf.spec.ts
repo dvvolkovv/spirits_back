@@ -11,8 +11,20 @@ import { __setSafeFetchDepsForTests, UnsafeUrlError } from '../common/net/safe-f
  * превращал каждое уведомление в запрос к внутреннему сервису.
  */
 
-function makeService(rows: any[] = []) {
-  const pg = { query: jest.fn(async (sql: string) => (/^\s*SELECT/i.test(sql) ? { rows } : { rows: [], rowCount: 1 })) };
+function makeService(rows: any[] = [], state: 'active' | 'deleted' = 'active') {
+  const pg = {
+    query: jest.fn(async (sql: string, params: any[] = []) => {
+      const normalized = sql.replace(/\s+/g, ' ').trim();
+      if (normalized.includes("SELECT 1 FROM user_id WHERE internal_id=$1 AND state='active'")) {
+        return { rows: state === 'active' ? [{ '?column?': 1 }] : [], rowCount: state === 'active' ? 1 : 0 };
+      }
+      if (/SELECT .*endpoint.* FROM push_subscriptions/.test(normalized)) {
+        const fenced = normalized.includes("u.state='active'");
+        return { rows: state === 'deleted' && fenced ? [] : rows, rowCount: state === 'deleted' && fenced ? 0 : rows.length };
+      }
+      return { rows: [], rowCount: 1 };
+    }),
+  };
   const svc = new PushService(pg as any);
   (svc as any).configured = true;
   (svc as any).logger = { warn: jest.fn(), log: jest.fn(), error: jest.fn() };
@@ -38,7 +50,7 @@ describe('POST /push/subscribe', () => {
   ])('%s — отказ, в БД не пишется', async (endpoint) => {
     const { svc, pg } = makeService();
     await expect(svc.subscribe('u-1', { endpoint, keys })).rejects.toThrow(UnsafeUrlError);
-    expect(pg.query).not.toHaveBeenCalled();
+    expect(pg.query.mock.calls.filter(([sql]) => /INSERT INTO push_subscriptions/.test(String(sql)))).toEqual([]);
   });
 
   it('настоящий endpoint push-сервиса сохраняется как есть', async () => {
@@ -46,6 +58,25 @@ describe('POST /push/subscribe', () => {
     const endpoint = 'https://fcm.googleapis.com/fcm/send/dXk:APA91b';
     await svc.subscribe('u-1', { endpoint, keys });
     expect(pg.query).toHaveBeenCalledWith(expect.stringMatching(/INSERT INTO push_subscriptions/), ['u-1', endpoint, JSON.stringify(keys)]);
+  });
+
+  it('deleted не создаёт web subscription', async () => {
+    const { svc, pg } = makeService([], 'deleted');
+    await svc.subscribe('u-1', { endpoint: 'https://fcm.googleapis.com/fcm/send/abc', keys });
+    expect(pg.query.mock.calls.filter(([sql]) => /INSERT INTO push_subscriptions/.test(String(sql)))).toEqual([]);
+  });
+
+  it('deleted не создаёт native subscription, active сохраняет регистрацию', async () => {
+    const deleted = makeService([], 'deleted');
+    await deleted.svc.registerNative('u-1', 'native-token');
+    expect(deleted.pg.query.mock.calls.filter(([sql]) => /INSERT INTO push_subscriptions/.test(String(sql)))).toEqual([]);
+
+    const active = makeService();
+    await active.svc.registerNative('u-1', 'native-token');
+    expect(active.pg.query).toHaveBeenCalledWith(
+      expect.stringMatching(/INSERT INTO push_subscriptions/),
+      ['u-1', 'fcm:native-token'],
+    );
   });
 });
 
@@ -85,5 +116,20 @@ describe('sendPush', () => {
       expect(err).toBeInstanceOf(UnsafeUrlError);
       done();
     }));
+  });
+
+  it('deleted не выполняет outbound web/native push', async () => {
+    __setSafeFetchDepsForTests({ resolve: async () => [{ address: '142.250.74.10', family: 4 }] });
+    (webpush.sendNotification as jest.Mock).mockResolvedValue({ statusCode: 201 });
+    const { svc, pg } = makeService([
+      { endpoint: 'https://fcm.googleapis.com/fcm/send/abc', keys, platform: 'web' },
+      { endpoint: 'fcm:native-token', keys: {}, platform: 'android' },
+    ], 'deleted');
+    const fcm = jest.spyOn(svc as any, 'sendFcm');
+
+    expect(await svc.sendPush('u-1', { title: 't' })).toBe(0);
+    expect(webpush.sendNotification).not.toHaveBeenCalled();
+    expect(fcm).not.toHaveBeenCalled();
+    expect(pg.query.mock.calls.filter(([sql]) => /SELECT .*endpoint.* FROM push_subscriptions/.test(String(sql).replace(/\s+/g, ' ')))).toEqual([]);
   });
 });
