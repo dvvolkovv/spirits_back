@@ -375,7 +375,7 @@ describe('AlertBotRepairJobs', () => {
   });
 
   it.each(['process_close_unconfirmed', 'remote_outcome_unknown'] as const)('%s возвращает repair_outcome_unknown и не освобождает следующую job', async (failureKind) => {
-    store.repair.status = 'running';
+    store.repair.status = 'cancel_requested';
     const first = await store.createJob({
       repairId: ctx.repairId, host: 'prod', command: 'redacted', kind: 'exec', mutates: true,
       interruptible: true, timeoutMs: 5_000,
