@@ -315,6 +315,34 @@ describe('AlertBotRepairExecutor', () => {
     expect(finish).toHaveBeenCalledTimes(1);
   });
 
+  it('hanging finishJob abort-ится и следующий reconcile делает новый вызов', async () => {
+    const job = await createJob();
+    const original = store.finishJob.bind(store);
+    const signals: Array<AbortSignal | undefined> = [];
+    const finish = jest.spyOn(store, 'finishJob').mockImplementation((id, result, signal?: AbortSignal) => {
+      signals.push(signal);
+      if (signals.length === 1) {
+        return new Promise<boolean>((_, reject) => {
+          signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+        });
+      }
+      return original(id, result);
+    });
+    await expect(startPreSpawn('mark_false', job)).resolves.toMatchObject({
+      jobId: job.id, startError: 'repair_inactive',
+    });
+    let timer: NodeJS.Timeout;
+    await Promise.race([
+      (executor as any).reconcile() as Promise<void>,
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, 2_000); }),
+    ]);
+    clearTimeout(timer!);
+    expect(finish).toHaveBeenCalledTimes(2);
+    expect(signals[0]?.aborted).toBe(true);
+    expect(await store.findJob(job.id)).toMatchObject({ status: 'cancelled' });
+    expect((executor as any).processes.has(job.id)).toBe(false);
+  });
+
   it('async spawn error сохраняет failed/spawn_error без возврата в running', async () => {
     const job = await createJob();
     const realSpawn = childProcess.spawn;
