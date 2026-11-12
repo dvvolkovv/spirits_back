@@ -218,10 +218,15 @@ function unsafePayloadKey(key: string): boolean {
   const parts = keyParts(key);
   const normalized = parts.join('');
   if (FORBIDDEN_PAYLOAD_KEYS.has(normalized)) return true;
-  if (['token', 'secret', 'password', 'credential', 'authorization', 'jwt', 'cookie',
-    'email', 'phone', 'session', 'code'].some((part) => normalized.includes(part))) {
+  if (['userid', 'ownerid', 'internalid'].some((part) => normalized.includes(part))) {
     return true;
   }
+  if (['token', 'secret', 'password', 'credential', 'authorization', 'jwt', 'cookie',
+    'email', 'phone', 'session', 'code', 'accesskey'].some((part) => normalized.includes(part))) {
+    return true;
+  }
+  if (/^auth(?:entication|orization|token|key|secret|code|credential|signature|sig)/
+    .test(normalized)) return true;
   if (!normalized.endsWith('id')
     && TEXT_LIKE_KEY_PARTS.some((part) => normalized.includes(part))) return true;
   if (normalized.includes('apikey') || normalized.includes('privatekey')) return true;
@@ -299,7 +304,8 @@ function isBinaryValue(value: unknown): boolean {
   if (Buffer.isBuffer(value) || ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
     return true;
   }
-  return typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer;
+  return (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer)
+    || (typeof Blob !== 'undefined' && value instanceof Blob);
 }
 
 function assertPayloadPreflight(payload: unknown): void {
