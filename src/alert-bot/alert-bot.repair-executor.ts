@@ -224,7 +224,7 @@ export class AlertBotRepairExecutor {
     child.once('close', (code) => {
       appendStream(state.stdout, state.stdout.decoder.end());
       appendStream(state.stderr, state.stderr.decoder.end());
-      if (job.host !== 'prod' && state.outcome === 'timeout') {
+      if (job.host !== 'prod' && (state.outcome === 'timeout' || code === null || code === 255)) {
         void this.finishProcess(jobId, 'interrupted', null, 'remote_outcome_unknown').catch(() => undefined);
         return;
       }
