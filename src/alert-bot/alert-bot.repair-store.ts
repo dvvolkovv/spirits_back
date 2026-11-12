@@ -235,12 +235,14 @@ export class RepairStore {
   }
 
   async createJob(input: CreateRepairJobInput): Promise<{ id: string; sequence: number } | null> {
+    const lockKey = `alert-bot-repair-job:${input.repairId}`;
     const client = await this.pg.getClient();
     let transactionOpen = false;
     let destroyClient = false;
     try {
       await client.query('BEGIN');
       transactionOpen = true;
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [lockKey]);
       const repair = await client.query(
         `SELECT r.id FROM alert_bot_repairs r
          WHERE r.id = $1 AND r.status IN ('requested', 'running')
@@ -253,6 +255,17 @@ export class RepairStore {
         [input.repairId],
       );
       if (!repair.rows[0]) {
+        await client.query('ROLLBACK');
+        transactionOpen = false;
+        return null;
+      }
+      const activeJob = await client.query(
+        `SELECT id FROM alert_bot_repair_jobs
+         WHERE repair_id = $1 AND status IN ('queued', 'running')
+         LIMIT 1`,
+        [input.repairId],
+      );
+      if (activeJob.rows[0]) {
         await client.query('ROLLBACK');
         transactionOpen = false;
         return null;
@@ -351,23 +364,31 @@ export class RepairStore {
     result: FinishRepairJobResult,
     signal?: AbortSignal,
   ): Promise<boolean> {
-    // Один statement = одна неявная транзакция: cancel_requested не может
-    // стать видимым без сохранённого unknown outcome и наоборот.
+    // Один statement = одна неявная транзакция. Advisory lock и repair FOR UPDATE
+    // выполняются в том же порядке, что и createJob, до любого UPDATE.
+    const lockKey = `alert-bot-repair-job:${repairId}`;
     const updated = await this.pg.query(
-      `WITH finished AS (
+      `WITH lock AS MATERIALIZED (
+         SELECT pg_advisory_xact_lock(hashtext($1))
+       ), repair_lock AS MATERIALIZED (
+         SELECT r.id FROM alert_bot_repairs r
+         WHERE r.id = $3 AND EXISTS (SELECT 1 FROM lock)
+         FOR UPDATE
+       ), finished AS (
          UPDATE alert_bot_repair_jobs
-         SET status = $3, exit_code = $4, stdout_redacted = $5, stderr_redacted = $6,
-             failure_kind = $7, finished_at = now()
-         WHERE id = $1 AND repair_id = $2 AND status IN ('queued', 'running')
+         SET status = $4, exit_code = $5, stdout_redacted = $6, stderr_redacted = $7,
+             failure_kind = $8, finished_at = now()
+         WHERE id = $2 AND repair_id = $3 AND status IN ('queued', 'running')
+           AND EXISTS (SELECT 1 FROM repair_lock)
          RETURNING id
        ), cancelled AS (
          UPDATE alert_bot_repairs SET status = 'cancel_requested'
-         WHERE id = $2 AND status IN ('requested', 'running')
+         WHERE id = $3 AND status IN ('requested', 'running')
            AND EXISTS (SELECT 1 FROM finished)
          RETURNING id
        )
        SELECT id FROM finished`,
-      [jobId, repairId, result.status, result.exitCode, result.stdout, result.stderr, result.failureKind ?? null],
+      [lockKey, jobId, repairId, result.status, result.exitCode, result.stdout, result.stderr, result.failureKind ?? null],
       signal,
     );
     return updated.rowCount === 1;
