@@ -96,6 +96,12 @@ class MemoryRepairStore {
     return true;
   }
 
+  async finishUnknownAndCancelRepair(jobId: string, repairId: string, result: FinishRepairJobResult): Promise<boolean> {
+    const finished = await this.finishJob(jobId, result);
+    if (finished) await this.requestCancel(repairId);
+    return finished;
+  }
+
   asStore(): RepairStore {
     return this as unknown as RepairStore;
   }

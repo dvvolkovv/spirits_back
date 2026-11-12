@@ -108,6 +108,12 @@ class MemoryRepairStore {
     return true;
   }
 
+  async finishUnknownAndCancelRepair(jobId: string, repairId: string, result: FinishRepairJobResult): Promise<boolean> {
+    const finished = await this.finishJob(jobId, result);
+    if (finished) await this.requestCancel(repairId);
+    return finished;
+  }
+
   asStore(): RepairStore {
     return this as unknown as RepairStore;
   }
@@ -382,6 +388,27 @@ describe('AlertBotRepairExecutor', () => {
     const job = await createJob({ interruptible: false, timeoutMs: 50 });
     await executor.start(job.id, 'sleep 30');
     expect(await executor.wait(job.id, 1)).toBe(true);
+    expect(await store.findJob(job.id)).toMatchObject({
+      status: 'interrupted', failureKind: 'process_close_unconfirmed',
+    });
+    expect(store.repairs.get('repair-1')!.status).toBe('cancel_requested');
+  });
+
+  it('atomic unknown write transient error повторяет durable flush с cancel', async () => {
+    const child = new childProcess.ChildProcess();
+    Object.assign(child, { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
+    jest.spyOn(childProcess, 'spawn').mockReturnValue(child as any);
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const original = store.finishUnknownAndCancelRepair.bind(store);
+    const finish = jest.spyOn(store, 'finishUnknownAndCancelRepair')
+      .mockRejectedValueOnce(new Error('sensitive atomic unavailable'))
+      .mockImplementation(original);
+    (executor as any).closeWaitMs = 50;
+    const job = await createJob({ interruptible: false, timeoutMs: 50 });
+    await executor.start(job.id, 'sleep 30');
+
+    expect(await executor.wait(job.id, 1)).toBe(true);
+    expect(finish.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(await store.findJob(job.id)).toMatchObject({
       status: 'interrupted', failureKind: 'process_close_unconfirmed',
     });

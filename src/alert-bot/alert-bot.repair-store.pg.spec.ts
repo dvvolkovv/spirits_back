@@ -1,6 +1,8 @@
 import { Pool, PoolClient } from 'pg';
+import * as childProcess from 'child_process';
 import { queryWithCancellation } from '../common/services/pg-cancellation';
 import { AlertBotRepairExecutor } from './alert-bot.repair-executor';
+import { AlertBotRepairJobs } from './alert-bot.repair-jobs';
 import { AlertBotStore } from './alert-bot.store';
 import {
   CreateRepairJobInput,
@@ -253,6 +255,36 @@ maybe('durable repair store против PostgreSQL', () => {
     });
     await expect(store.hasUnknownOutcome(repairId)).resolves.toBe(true);
     await expect(store.createJob(jobInput(repairId))).resolves.toBeNull();
+  });
+
+  it('finishUnknownAndCancelRepair атомарно закрывает окно cancel_requested без unknown', async () => {
+    const repairId = await admit('atomic-unknown-cancel');
+    await store.markRepairRunning(repairId, TURN_ID);
+    const first = await store.createJob(jobInput(repairId));
+    expect(first).not.toBeNull();
+    expect(await store.markJobRunning(first!.id)).toBe(true);
+    await expect(store.createJob(jobInput(repairId))).resolves.toBeNull();
+
+    await expect(store.finishUnknownAndCancelRepair(first!.id, repairId, {
+      status: 'interrupted', exitCode: null, stdout: '', stderr: '', failureKind: 'remote_outcome_unknown',
+    })).resolves.toBe(true);
+    await expect(store.findRepair(repairId)).resolves.toMatchObject({ status: 'cancel_requested' });
+    await expect(store.findJob(first!.id)).resolves.toMatchObject({
+      status: 'interrupted', failureKind: 'remote_outcome_unknown',
+    });
+
+    const executor = new AlertBotRepairExecutor(store);
+    const jobs = new AlertBotRepairJobs(store, executor);
+    const spawn = jest.spyOn(childProcess, 'spawn');
+    try {
+      await expect(jobs.start({
+        ...guard(repairId, 'atomic-unknown-cancel'), scope: 'repair', adminUserId: 'admin-user',
+      }, 'exec', { host: 'prod', command: 'printf must-not-run' })).rejects.toThrow('repair_outcome_unknown');
+      expect(spawn).not.toHaveBeenCalled();
+    } finally {
+      spawn.mockRestore();
+      await executor.stopAll();
+    }
   });
 
   it('Promise.all двух первых jobs создаёт ровно одну row', async () => {
