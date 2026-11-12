@@ -370,6 +370,20 @@ describe('AlertBotRepairExecutor', () => {
     }
   });
 
+  it('local close unconfirmed вызывает requestCancel и даёт durable interrupted', async () => {
+    const child = new childProcess.ChildProcess();
+    Object.assign(child, { pid: 92_002, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
+    jest.spyOn(childProcess, 'spawn').mockReturnValue(child as any);
+    (executor as any).closeWaitMs = 50;
+    const job = await createJob({ interruptible: false, timeoutMs: 50 });
+    await executor.start(job.id, 'sleep 30');
+    expect(await executor.wait(job.id, 1)).toBe(true);
+    expect(await store.findJob(job.id)).toMatchObject({
+      status: 'interrupted', failureKind: 'process_close_unconfirmed',
+    });
+    expect(store.repairs.get('repair-1')!.status).toBe('cancel_requested');
+  });
+
   it('remote timeout без close получает bounded interrupted/remote_outcome_unknown', async () => {
     const child = new childProcess.ChildProcess();
     Object.assign(child, { pid: 92_001, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() });
@@ -381,6 +395,7 @@ describe('AlertBotRepairExecutor', () => {
     expect(await store.findJob(job.id)).toMatchObject({
       status: 'interrupted', failureKind: 'remote_outcome_unknown',
     });
+    expect(store.repairs.get('repair-1')!.status).toBe('cancel_requested');
   });
 
   it('remote close(null) даёт interrupted/remote_outcome_unknown', async () => {
@@ -398,6 +413,7 @@ describe('AlertBotRepairExecutor', () => {
       expect(await store.findJob(job.id)).toMatchObject({
         status: 'interrupted', failureKind: 'remote_outcome_unknown',
       });
+      expect(store.repairs.get('repair-1')!.status).toBe('cancel_requested');
     } finally {
       if (child.pid) {
         try { process.kill(-child.pid, 'SIGKILL'); }

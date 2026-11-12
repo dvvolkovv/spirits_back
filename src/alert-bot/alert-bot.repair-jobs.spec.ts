@@ -366,6 +366,36 @@ describe('AlertBotRepairJobs', () => {
     expect(active).toHaveBeenCalledTimes(4);
   });
 
+  it.each(['process_close_unconfirmed', 'remote_outcome_unknown'] as const)('%s не освобождает следующую job', async (failureKind) => {
+    const first = await store.createJob({
+      repairId: ctx.repairId, host: 'prod', command: 'redacted', kind: 'exec', mutates: true,
+      interruptible: true, timeoutMs: 5_000,
+    });
+    await store.finishJob(first!.id, {
+      status: 'interrupted', exitCode: null, stdout: '', stderr: '', failureKind,
+    });
+    const spawn = jest.spyOn(childProcess, 'spawn');
+    await expect(store.createJob({
+      repairId: ctx.repairId, host: 'prod', command: 'next', kind: 'exec', mutates: true,
+      interruptible: true, timeoutMs: 5_000,
+    })).resolves.toBeNull();
+    await expect(jobs.start(ctx, 'exec', { host: 'prod', command: 'printf no' })).rejects.toThrow();
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it('обычные failed/succeeded не блокируют следующую job', async () => {
+    const input = {
+      repairId: ctx.repairId, host: 'prod', command: 'redacted', kind: 'exec' as const,
+      mutates: true, interruptible: true, timeoutMs: 5_000,
+    };
+    const failed = await store.createJob(input);
+    await store.finishJob(failed!.id, { status: 'failed', exitCode: 1, stdout: '', stderr: '' });
+    const succeeded = await store.createJob(input);
+    expect(succeeded).not.toBeNull();
+    await store.finishJob(succeeded!.id, { status: 'succeeded', exitCode: 0, stdout: '', stderr: '' });
+    expect(await store.createJob(input)).not.toBeNull();
+  });
+
   it.each(['', '   ', 'я'.repeat(20_000)])('отклоняет invalid_command без создания job', async (command) => {
     const create = jest.spyOn(store, 'createJob');
     await expect(jobs.start(ctx, 'exec', { host: 'prod', command })).rejects.toThrow('invalid_command');

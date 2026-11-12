@@ -223,6 +223,16 @@ maybe('durable repair store против PostgreSQL', () => {
     await expect(store.listJobs(MISSING_ID)).resolves.toEqual([]);
   });
 
+  it.each(['process_close_unconfirmed', 'remote_outcome_unknown'] as const)('%s блокирует следующую job на уровне PostgreSQL', async (failureKind) => {
+    const repairId = await admit(`fence-${failureKind}`);
+    const first = await store.createJob(jobInput(repairId));
+    expect(first).not.toBeNull();
+    await store.finishJob(first!.id, {
+      status: 'interrupted', exitCode: null, stdout: '', stderr: '', failureKind,
+    });
+    await expect(store.createJob(jobInput(repairId))).resolves.toBeNull();
+  });
+
   it('Promise.all двух первых jobs создаёт ровно одну row', async () => {
     const repairId = await admit('concurrent-jobs');
     const results = await Promise.all([
