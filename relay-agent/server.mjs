@@ -166,6 +166,15 @@ kind: 'task' — ДЕЛО/задача, которую можно «выполн
 4. Если connected:false — календарь не подключён: тактично предложи подключить его, чтобы планировать через Линкеон.
 `;
 
+const DOCUMENT_ANALYSIS_RULES = `
+ДОКУМЕНТЫ И СУБАГЕНТЫ. Не поручай Agent повторный анализ документа, который основная модель уже анализирует или собирается анализировать в этом ходе. Не запускай два параллельных полных разбора одного документа. Не используй Bash sleep для ожидания субагентов.
+UNKNOWN SKILL. Если Skill вернул Unknown skill, продолжай задачу доступными Read/Bash: не повторяй тот же вызов, не перебирай другие skills и не перепланируй уже доступную работу.
+`;
+
+const UPLOAD_ANALYSIS_RULES = `
+АНАЛИЗ НОВОГО ВЛОЖЕНИЯ. Agent недоступен: весь запрошенный анализ выполняет основная модель. Для полного разбора читай документ последовательно частями до покрытия всего документа. Для точечного вопроса сначала определи необходимые разделы, без автоматического полного повторного чтения. Если Read отклонил порцию из-за лимита 25 000 токенов, уменьши размер порции и не повторяй тот же объём. Не используй Bash sleep для ожидания субагентов.
+`;
+
 const sessionMap = new Map();
 
 // Файлы ходов, чей `done` до бэкенда не дошёл, — до следующего хода сессии.
@@ -586,8 +595,9 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
     }
   }
 
+  const hasNewUploads = renamedFiles.length > 0;
   let prompt = "";
-  if (renamedFiles.length > 0) {
+  if (hasNewUploads) {
     prompt += "User uploaded files:\n";
     for (const f of renamedFiles) prompt += "- " + f.path + " (name: " + f.name + ", " + f.size + " bytes)\n";
     prompt += "\n";
@@ -637,7 +647,11 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
     outputRoot: OUTPUT_DIR, scratchRoot, uploadRoot: UPLOAD_DIR,
   });
   let allowedTools = baseAllowedTools();
-  let systemPrompt = applySandboxPrompt(SYSTEM_PROMPT, sbxOn);
+  const baseSystemPrompt = () => applySandboxPrompt(
+    `${SYSTEM_PROMPT}\n\n${DOCUMENT_ANALYSIS_RULES}`,
+    sbxOn,
+  );
+  let systemPrompt = baseSystemPrompt();
   // Set when the agent uses a TalerID *write* tool this request. The transient
   // whole-turn retry below re-runs the turn, which would double-execute a write —
   // create_note dedups by title server-side, but send_message does NOT, so a retry
@@ -700,7 +714,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
       sessionMcpPath = null;
       mcpConfigPath = BASE_MCP_PATH;
       allowedTools = baseAllowedTools();
-      systemPrompt = applySandboxPrompt(SYSTEM_PROMPT, sbxOn);
+      systemPrompt = baseSystemPrompt();
     }
   }
 
@@ -709,6 +723,16 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   // приклей мы персону раньше — она бы там потерялась. Пустое поле (старый
   // бэкенд) оставляет поведение ровно прежним.
   if (reqSystemPrompt) systemPrompt += "\n\n" + reqSystemPrompt;
+  if (hasNewUploads) systemPrompt += `\n\n${UPLOAD_ANALYSIS_RULES}`;
+  const disallowedTools = [
+    'mcp__plugin_telegram_telegram__reply',
+    'mcp__plugin_telegram_telegram__react',
+    'mcp__plugin_telegram_telegram__edit_message',
+    'mcp__plugin_telegram_telegram__download_attachment',
+    'ToolSearch',
+    ...(sbxOn ? ['WebFetch'] : []),
+    ...(hasNewUploads ? ['Agent'] : []),
+  ].join(',');
 
   // Один settings-файл на весь HTTP-ход: его используют первый запуск, повторы
   // и запасные провайдеры. Удаляется в finally независимо от sessionMcpPath.
@@ -754,7 +778,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
     "--max-turns", "40",
     ...cliToolArgs(reqTestMode, allowedTools),
     ...(sbxOn ? ["--settings", sandboxSettingsPath] : []),
-    "--disallowedTools", "mcp__plugin_telegram_telegram__reply,mcp__plugin_telegram_telegram__react,mcp__plugin_telegram_telegram__edit_message,mcp__plugin_telegram_telegram__download_attachment,ToolSearch" + (sbxOn ? ",WebFetch" : ""),
+    "--disallowedTools", disallowedTools,
     "--mcp-config", mcpConfigPath,
     "--strict-mcp-config",
     // Снимок промпта выключен. CLI 2.1.280 в режиме --print пишет в транскрипт
