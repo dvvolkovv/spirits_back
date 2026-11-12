@@ -69,6 +69,36 @@ describe('PgService.query cancellation', () => {
     expect(releaseCalls).toBe(1);
   });
 
+  it('не отдаёт reused client второму query до завершения CancelRequest', async () => {
+    const { service, client, pool, resolveActive } = fixture();
+    let finishCancel!: () => void;
+    const end = jest.spyOn(Client.prototype, 'end').mockImplementation(
+      () => new Promise<void>((resolve) => { finishCancel = resolve; }),
+    );
+    const controller = new AbortController();
+    const first = (service.query as any)('SELECT pg_sleep(10)', [], controller.signal) as Promise<unknown>;
+    const rejection = expect(first).rejects.toThrow('cancel requested');
+    await flush();
+    controller.abort();
+    await flush();
+
+    expect(end).toHaveBeenCalledTimes(1);
+    const second = (service.query as any)('SELECT 1 AS ok') as Promise<unknown>;
+    await flush();
+    const connectsBeforeCancelEnd = pool.connect.mock.calls.length;
+    const releasesBeforeCancelEnd = client.release.mock.calls.length;
+    finishCancel();
+    await rejection;
+    await flush();
+    resolveActive({ rows: [{ ok: 1 }] });
+    await expect(second).resolves.toEqual({ rows: [{ ok: 1 }] });
+
+    expect(connectsBeforeCancelEnd).toBe(1);
+    expect(releasesBeforeCancelEnd).toBe(0);
+    expect(pool.connect).toHaveBeenCalledTimes(2);
+    expect(client.release).toHaveBeenCalledTimes(1);
+  });
+
   it('abort во время pending pool.connect завершает вызов, а поздний client release без query', async () => {
     let resolveConnect!: (client: PoolClient) => void;
     const client = new EventEmitter() as PoolClient & { query: jest.Mock; release: jest.Mock };
