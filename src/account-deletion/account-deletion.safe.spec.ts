@@ -10,6 +10,7 @@ import {
   assertSafeJobSpec,
   assertSafeSkip,
   deletionErrorKind,
+  deletionPayloadJson,
   deletionResourceHash,
   retryDelayMs,
   safeDeletionMessage,
@@ -126,6 +127,7 @@ void invalidDeletionSkipReason;
 const CANARY = 'ЛИЧНЫЙ-ТЕКСТ';
 const SECRET = 'СЕКРЕТ-НЕ-ЛОГИРОВАТЬ';
 const USER_ID = '79000000001';
+const DELETION_ID = '11111111-1111-4111-8111-111111111111';
 
 function job(payload: Record<string, unknown>, resourceKey = 'abc') {
   return {
@@ -196,13 +198,13 @@ describe('account deletion safety', () => {
 
   it('формирует журнал только из технических полей', () => {
     const line = safeDeletionMessage({
-      deletionId: 'd-1',
+      deletionId: DELETION_ID,
       resourceType: 'product.purge',
       resourceKey: 'p-1',
       attempts: 2,
       kind: 'timeout',
     });
-    expect(line).toBe('deletion=d-1 type=product.purge key=p-1 attempt=2 kind=timeout');
+    expect(line).toBe(`deletion=${DELETION_ID} type=product.purge key=p-1 attempt=2 kind=timeout`);
     expect(line).not.toContain(USER_ID);
     expect(line).not.toContain(CANARY);
   });
@@ -425,7 +427,7 @@ describe('account deletion hardening regressions', () => {
 
   it('контролируемо отклоняет циклический payload', () => {
     const cyclic: Record<string, unknown> = {};
-    cyclic.self = cyclic;
+    cyclic.path = cyclic;
     expect(() => assertSafeJobSpec(job(cyclic), USER_ID))
       .toThrow(/^unsafe_payload$/);
   });
@@ -456,7 +458,7 @@ describe('account deletion hardening regressions', () => {
     'отклоняет arbitrary resource type в журнале без раскрытия',
     (resourceType) => {
       expect(() => safeDeletionMessage({
-        deletionId: 'd-1',
+        deletionId: DELETION_ID,
         resourceType: resourceType as any,
         resourceKey: 'p-1',
         attempts: 2,
@@ -547,22 +549,32 @@ describe('account deletion embedded URL and log regressions', () => {
     },
   );
 
-  it.each([USER_ID, '+79000000001'])(
-    'не записывает phone-like resourceKey в журнал',
-    (resourceKey) => {
-      expect(() => safeDeletionMessage({
-        deletionId: 'd-1',
-        resourceType: 'product.purge',
-        resourceKey,
-        attempts: 2,
-        kind: 'timeout',
-      })).toThrow(/^unsafe_resource_key$/);
-    },
-  );
+  it('разрешает numeric technical resourceKey в job и журнале', () => {
+    expect(() => assertSafeJobSpec(job({}, '123456789'), USER_ID)).not.toThrow();
+    expect(() => safeDeletionMessage({
+      deletionId: DELETION_ID,
+      resourceType: 'product.purge',
+      resourceKey: '123456789',
+      attempts: 2,
+      kind: 'timeout',
+    })).not.toThrow();
+  });
+
+  it('запрещает resourceKey, совпадающий с optional userId', () => {
+    const input = {
+      deletionId: DELETION_ID,
+      resourceType: 'product.purge',
+      resourceKey: USER_ID,
+      attempts: 2,
+      kind: 'timeout',
+      userId: USER_ID,
+    } as any;
+    expect(() => safeDeletionMessage(input)).toThrow(/^unsafe_resource_key$/);
+  });
 
   it('не записывает resourceKey с недопустимым форматом', () => {
     expect(() => safeDeletionMessage({
-      deletionId: 'd-1',
+      deletionId: DELETION_ID,
       resourceType: 'product.purge',
       resourceKey: 'private/key',
       attempts: 2,
@@ -572,11 +584,248 @@ describe('account deletion embedded URL and log regressions', () => {
 
   it('не записывает arbitrary runtime kind в журнал', () => {
     expect(() => safeDeletionMessage({
-      deletionId: 'd-1',
+      deletionId: DELETION_ID,
       resourceType: 'product.purge',
       resourceKey: 'p-1',
       attempts: 2,
       kind: CANARY as any,
     })).toThrow(/^unsafe_kind$/);
+  });
+});
+
+describe('account deletion contract completeness regressions', () => {
+  const phasedJob = (resourceType: any, phase: 'immediate' | 'purge') => ({
+    resourceType,
+    resourceKey: 'abc',
+    phase,
+    payload: {},
+  });
+  const logWith = (overrides: Record<string, unknown>) => ({
+    deletionId: DELETION_ID,
+    resourceType: 'product.purge',
+    resourceKey: 'p-1',
+    attempts: 2,
+    kind: 'timeout',
+    ...overrides,
+  } as any);
+
+  it('разрешает согласованные phase для core/stop/purge', () => {
+    for (const [resourceType, phase] of [
+      ['account.core.immediate', 'immediate'],
+      ['routine.stop', 'immediate'],
+      ['account.core.purge', 'purge'],
+      ['product.purge', 'purge'],
+    ] as const) {
+      expect(() => assertSafeJobSpec(phasedJob(resourceType, phase), USER_ID)).not.toThrow();
+    }
+  });
+
+  it.each([
+    ['chat-file.purge', 'immediate'],
+    ['routine.stop', 'purge'],
+    ['account.core.immediate', 'purge'],
+    ['account.core.purge', 'immediate'],
+  ])('запрещает несогласованную phase', (resourceType, phase) => {
+    expect(() => assertSafeJobSpec(
+      phasedJob(resourceType, phase as 'immediate' | 'purge'),
+      USER_ID,
+    )).toThrow(/^unsafe_phase$/);
+  });
+
+  it.each(['calendar.external', 'video.provider'])('запрещает skip-only resource в job', (resourceType) => {
+    expect(() => assertSafeJobSpec(phasedJob(resourceType, 'purge'), USER_ID))
+      .toThrow(/^unsafe_resource_type$/);
+  });
+
+  it('блокирует protocol-relative URL с userinfo', () => {
+    expect(() => assertSafeJobSpec(job({
+      fileUrl: `//user:${SECRET}@example.com/x`,
+    }), USER_ID)).toThrow(/^unsafe_payload$/);
+  });
+
+  it('декодирует и проверяет nested URL в query value', () => {
+    const target = encodeURIComponent(`https://evil.test/x?access_token=${SECRET}`);
+    expect(() => assertSafeJobSpec(job({
+      fileUrl: `https://example.com/redirect?target=${target}`,
+    }), USER_ID)).toThrow(/^unsafe_payload$/);
+  });
+
+  it('разрешает nested public URL', () => {
+    const target = encodeURIComponent('https://example.com/public?download=1');
+    expect(() => assertSafeJobSpec(job({
+      fileUrl: `https://example.com/redirect?target=${target}`,
+    }), USER_ID)).not.toThrow();
+  });
+
+  it.each(['jwt', 'code', 'session', 'session_id'])('блокирует session credentials в query: %s', (queryKey) => {
+    expect(() => assertSafeJobSpec(job({
+      fileUrl: `https://example.com/x?${queryKey}=${SECRET}`,
+    }), USER_ID)).toThrow(/^unsafe_payload$/);
+  });
+
+  it.each(['jwt', 'code', 'session', 'session_id'])('блокирует session credentials в hash: %s', (queryKey) => {
+    expect(() => assertSafeJobSpec(job({
+      fileUrl: `https://example.com/x#${queryKey}=${SECRET}`,
+    }), USER_ID)).toThrow(/^unsafe_payload$/);
+  });
+
+  it.each(['title', 'jwt', 'email', 'phone', 'subject', 'summary', 'cookie', 'code', 'session'])(
+    'блокирует personal/credential payload key: %s',
+    (key) => {
+      expect(() => assertSafeJobSpec(job({ [key]: CANARY }), USER_ID))
+        .toThrow(/^unsafe_payload$/);
+    },
+  );
+
+  it('отклоняет неизвестное поле при строгом technical allowlist', () => {
+    expect(() => assertSafeJobSpec(job({ unexpected: 'technical-value' }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('разрешает technical payload fields и containers', () => {
+    expect(() => assertSafeJobSpec(job({
+      voiceId: 'voice-1',
+      externalBotId: 'bot-1',
+      productId: 'product-1',
+      fileUrl: 'https://example.com/public',
+      host: 'host-1',
+      slug: 'slug-1',
+      path: '/technical/path',
+      paths: ['/technical/a'],
+      bucket: 'bucket-1',
+      status: 'pending',
+      reason: 'external_unknown',
+      attempt: 1,
+      attempts: 2,
+      provider: 'minio',
+      kind: 'hashed',
+      scope: 'account',
+      dryRun: true,
+      deleteOld: false,
+      timeoutMs: 1000,
+      maxAttempts: 5,
+      retentionDays: 30,
+      graceMs: 0,
+      hash: 'abc123',
+      url: 'https://example.com/public',
+      urls: ['https://example.com/public'],
+      key: 'object-key',
+      keys: ['object-key'],
+      id: 'technical-1',
+      ids: ['technical-1'],
+      messageId: 'message-1',
+      noteId: 'note-1',
+      contentType: 'video/mp4',
+      keyKind: 'hashed',
+      roomKind: 'sole',
+      nested: { voiceId: 'voice-2' },
+      file: { fileUrl: 'https://example.com/public' },
+      document: { productId: 'product-2' },
+    }), USER_ID)).not.toThrow();
+  });
+
+  it.each(['ownerId', 'internalId'])('запрещает identity key: %s', (key) => {
+    expect(() => assertSafeJobSpec(job({ [key]: 'u-owner' }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('запрещает userId в имени JSON-ключа', () => {
+    expect(() => assertSafeJobSpec(job({ [`prefix${USER_ID}`]: 'technical' }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('запрещает numeric ownerId, совпадающий с userId', () => {
+    expect(() => assertSafeJobSpec(job({ ownerId: Number(USER_ID) }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('запрещает numeric userId в содержимом technical ID', () => {
+    expect(() => assertSafeJobSpec(job({ id: Number(USER_ID) }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('отклоняет Buffer до вызова toJSON', () => {
+    const binary = Buffer.from(SECRET);
+    let calls = 0;
+    (binary as any).toJSON = () => {
+      calls += 1;
+      return { type: 'Buffer', data: [] };
+    };
+    expect(() => assertSafeJobSpec(job({ file: binary }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+    expect(calls).toBe(0);
+  });
+
+  it('отклоняет Uint8Array до сериализации', () => {
+    expect(() => assertSafeJobSpec(job({ file: new Uint8Array([1, 2, 3]) }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('отклоняет ArrayBuffer до сериализации', () => {
+    expect(() => assertSafeJobSpec(job({ file: new ArrayBuffer(8) }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it.each([null, ['voice-1'], 'voice-1'])('требует plain object top-level payload', (payload) => {
+    expect(() => assertSafeJobSpec({ ...job({}), payload: payload as any }, USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('возвращает проверенный JSON после одного stateful toJSON', () => {
+    let calls = 0;
+    const payload = {
+      toJSON: () => {
+        calls += 1;
+        return calls === 1 ? { voiceId: 'voice-1' } : { text: CANARY };
+      },
+    };
+    expect(deletionPayloadJson(payload, USER_ID)).toBe('{"voiceId":"voice-1"}');
+    expect(calls).toBe(1);
+  });
+
+  it('assertSafeJobSpec использует одну сериализацию', () => {
+    let calls = 0;
+    const document = {
+      toJSON: () => {
+        calls += 1;
+        return calls === 1 ? { voiceId: 'voice-1' } : { text: CANARY };
+      },
+    };
+    expect(() => assertSafeJobSpec(job({ document }), USER_ID)).not.toThrow();
+    expect(calls).toBe(1);
+  });
+
+  it.each([
+    [{ kind: 'not_found', response: { status: 503 } }, 'external_5xx'],
+    [{ kind: 'not_found', $metadata: { httpStatusCode: 503 } }, 'external_5xx'],
+  ])('даёт HTTP status приоритет над arbitrary kind', (error, kind) => {
+    expect(deletionErrorKind(error)).toBe(kind);
+  });
+
+  it.each(['account.core.purge.typo', USER_ID])('проверяет resourceType в skip', (resourceType) => {
+    expect(() => assertSafeSkip({
+      resourceType: resourceType as any,
+      reason: 'owner_unverifiable',
+    })).toThrow(/^unsafe_resource_type$/);
+  });
+
+  it.each(['d-1', `${DELETION_ID}${String.fromCharCode(10)}`, 'not-a-uuid'])(
+    'требует UUID deletionId в журнале',
+    (deletionId) => {
+      expect(() => safeDeletionMessage(logWith({ deletionId })))
+        .toThrow(/^unsafe_deletion_id$/);
+    },
+  );
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, -1, 1.5, '2'])(
+    'требует finite nonnegative integer attempts',
+    (attempts) => {
+      expect(() => safeDeletionMessage(logWith({ attempts })))
+        .toThrow(/^unsafe_attempts$/);
+    },
+  );
+
+  it('разрешает нулевой attempt', () => {
+    expect(safeDeletionMessage(logWith({ attempts: 0 }))).toContain('attempt=0');
   });
 });
