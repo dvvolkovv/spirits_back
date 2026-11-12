@@ -1,4 +1,4 @@
-import { AlertBotRepairExecutor } from './alert-bot.repair-executor';
+import { AlertBotRepairExecutor, RepairStartResult } from './alert-bot.repair-executor';
 import { maskSecrets } from './alert-bot.mask';
 import { RepairJobRecord, RepairStore } from './alert-bot.repair-store';
 import { RepairIdentity } from './alert-bot.types';
@@ -32,7 +32,7 @@ export class AlertBotRepairJobs {
     private readonly executor: AlertBotRepairExecutor,
   ) {}
 
-  async start(ctx: RepairIdentity, kind: 'exec' | 'verify', args: RepairJobArgs): Promise<{ jobId: string }> {
+  async start(ctx: RepairIdentity, kind: 'exec' | 'verify', args: RepairJobArgs): Promise<RepairStartResult> {
     if (!HOSTS.has(args.host)) throw new Error('unknown_host');
     if (!await this.store.isActiveRepair(ctx)) throw new Error('repair_inactive');
     const rawCommand = args.command;
@@ -54,8 +54,7 @@ export class AlertBotRepairJobs {
       throw new Error('job_already_active');
     }
     this.executor.registerJob(created.id, ctx.repairId);
-    await this.executor.start(created.id, rawCommand);
-    return { jobId: created.id };
+    return this.executor.start(created.id, rawCommand);
   }
 
   async wait(ctx: RepairIdentity, jobId: string, seconds: number): Promise<RepairJobRecord> {

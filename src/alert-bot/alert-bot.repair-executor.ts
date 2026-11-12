@@ -17,6 +17,11 @@ interface StreamBuffer {
   decoder: StringDecoder;
 }
 
+export interface RepairStartResult {
+  jobId: string;
+  startError?: 'store_unavailable' | 'repair_inactive' | 'spawn_error';
+}
+
 interface ProcessState {
   host: RepairJobRecord['host'];
   interruptible: boolean;
@@ -69,6 +74,25 @@ function delay(ms: number): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
+function compensationJob(jobId: string, repairId: string): RepairJobRecord {
+  return {
+    id: jobId,
+    repairId,
+    sequence: 0,
+    host: 'prod',
+    command: '',
+    kind: 'exec',
+    mutates: false,
+    interruptible: false,
+    timeoutMs: 0,
+    status: 'queued',
+    exitCode: null,
+    stdout: '',
+    stderr: '',
+    failureKind: null,
+  };
+}
+
 export class AlertBotRepairExecutor {
   private readonly children = new Map<string, ChildProcess>();
   private readonly repairs = new Map<string, string>();
@@ -87,7 +111,7 @@ export class AlertBotRepairExecutor {
     this.jobRepairs.set(jobId, repairId);
   }
 
-  async start(jobId: string, rawCommand: string): Promise<string> {
+  async start(jobId: string, rawCommand: string): Promise<RepairStartResult> {
     let repairId = this.jobRepairs.get(jobId);
     if (!repairId) {
       const registered = await this.store.findJob(jobId);
@@ -97,12 +121,19 @@ export class AlertBotRepairExecutor {
     }
     this.startCounts.set(repairId, (this.startCounts.get(repairId) ?? 0) + 1);
     const previous = this.repairChains.get(repairId) ?? Promise.resolve();
-    const setup = previous.then(async () => {
+    const setup = previous.then(async (): Promise<RepairStartResult> => {
       if (this.processes.has(jobId)) {
         await this.flushTerminal(jobId);
-        return jobId;
+        return { jobId };
       }
-      const job = await this.store.findJob(jobId);
+      let job: RepairJobRecord | null;
+      try { job = await this.store.findJob(jobId); }
+      catch {
+        await this.finishPreSpawn(compensationJob(jobId, repairId), {
+          status: 'interrupted', exitCode: null, stdout: '', stderr: '', failureKind: 'store_unavailable',
+        });
+        return { jobId, startError: 'store_unavailable' };
+      }
       if (!job) throw new Error('job_not_found');
       return this.startRegistered(job, rawCommand);
     });
@@ -114,21 +145,29 @@ export class AlertBotRepairExecutor {
     return setup;
   }
 
-  private async startRegistered(job: RepairJobRecord, rawCommand: string): Promise<string> {
+  private async startRegistered(job: RepairJobRecord, rawCommand: string): Promise<RepairStartResult> {
     const jobId = job.id;
     if (this.isCancelling(job.repairId)) {
       await this.cancelBeforeSpawn(job);
-      throw new Error('repair_inactive');
+      return { jobId, startError: 'repair_inactive' };
     }
-    if (!await this.store.markJobRunning(jobId)) {
+    let running: boolean;
+    try { running = await this.store.markJobRunning(jobId); }
+    catch {
+      await this.finishPreSpawn(job, {
+        status: 'interrupted', exitCode: null, stdout: '', stderr: '', failureKind: 'store_unavailable',
+      });
+      return { jobId, startError: 'store_unavailable' };
+    }
+    if (!running) {
       await this.finishPreSpawn(job, {
         status: 'cancelled', exitCode: null, stdout: '', stderr: '', failureKind: 'repair_inactive',
       });
-      throw new Error('repair_inactive');
+      return { jobId, startError: 'repair_inactive' };
     }
     if (this.isCancelling(job.repairId)) {
       await this.cancelBeforeSpawn(job);
-      throw new Error('repair_inactive');
+      return { jobId, startError: 'repair_inactive' };
     }
 
     let child: ChildProcess;
@@ -137,7 +176,7 @@ export class AlertBotRepairExecutor {
       await this.finishPreSpawn(job, {
         status: 'failed', exitCode: null, stdout: '', stderr: 'spawn_error\n', failureKind: 'spawn_error',
       });
-      return jobId;
+      return { jobId, startError: 'spawn_error' };
     }
     let complete!: () => void;
     const completion = new Promise<void>((resolve) => { complete = resolve; });
@@ -199,13 +238,13 @@ export class AlertBotRepairExecutor {
     catch {
       console.error('repair_secondary_check_failed');
       if (job.interruptible) void this.terminate(jobId, 'cancelled').catch(() => undefined);
-      return jobId;
+      return { jobId };
     }
     const active = repair && ['requested', 'running'].includes(repair.status);
     if (!active && job.interruptible) {
       void this.terminate(jobId, 'cancelled').catch(() => undefined);
     }
-    return jobId;
+    return { jobId };
   }
 
   async wait(jobId: string, waitSeconds: number): Promise<boolean> {
