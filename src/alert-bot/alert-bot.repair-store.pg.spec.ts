@@ -15,6 +15,19 @@ const TURN_ID = '00000000-0000-4000-8000-000000000002';
 const OTHER_TURN_ID = '00000000-0000-4000-8000-000000000003';
 const MISSING_ID = '00000000-0000-4000-8000-000000000099';
 
+async function boundedStoppedForCleanup(stopped: Promise<void> | undefined, timeoutMs = 5_000): Promise<void> {
+  if (!stopped) return;
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      stopped.catch(() => undefined),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 maybe('durable repair store против PostgreSQL', () => {
   jest.setTimeout(30_000);
   let admin: Pool;
