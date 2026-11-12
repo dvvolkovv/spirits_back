@@ -276,6 +276,33 @@ describe('AlertBotRepairJobs', () => {
     expect(spawn).not.toHaveBeenCalled();
   });
 
+  it('periodic reconciliation восстанавливает pending после startError и stop', async () => {
+    let dbDown = true;
+    const originalMark = store.markJobRunning.bind(store);
+    jest.spyOn(store, 'markJobRunning').mockRejectedValueOnce(new Error('mark unavailable')).mockImplementation(originalMark);
+    const originalFinish = store.finishJob.bind(store);
+    jest.spyOn(store, 'finishJob').mockImplementation((id, result) =>
+      dbDown ? Promise.reject(new Error('database down')) : originalFinish(id, result));
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    const started = await jobs.start(ctx, 'exec', { host: 'prod', command: 'printf must-not-run' });
+    expect(started).toMatchObject({ startError: 'store_unavailable' });
+    await executor.stopRepair(ctx.repairId);
+    expect((executor as any).processes.get(started.jobId)?.pending).toBeTruthy();
+    expect((executor as any).reconciliation).toBeTruthy();
+
+    dbDown = false;
+    store.repair.status = 'interrupted';
+    await (executor as any).reconcile();
+    expect(await jobs.wait(ctx, started.jobId, 0.5)).toMatchObject({
+      status: 'interrupted', failureKind: 'store_unavailable',
+    });
+    expect((executor as any).jobRepairs.has(started.jobId)).toBe(false);
+    expect((executor as any).repairChains.has(ctx.repairId)).toBe(false);
+    expect((executor as any).cancellingRepairs.has(ctx.repairId)).toBe(false);
+    await executor.stopAll();
+    expect((executor as any).reconciliation).toBeNull();
+  });
+
   it('unknown host и чужой repair не запускают spawn', async () => {
     const spawn = jest.spyOn(childProcess, 'spawn');
     await expect(jobs.start(ctx, 'exec', { host: 'other', command: 'printf no' })).rejects.toThrow('unknown_host');
