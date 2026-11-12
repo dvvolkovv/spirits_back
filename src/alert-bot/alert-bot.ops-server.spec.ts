@@ -310,11 +310,11 @@ describe('AlertBotOpsServer stateless MCP', () => {
     }, repairToken);
     expect(JSON.parse(invalidCommand.body.result.content[0].text)).toEqual({ error: 'invalid_command' });
 
-    repairWait.mockRejectedValueOnce(new Error('job_not_found'));
     const invalidJob = await rpc('tools/call', {
       name: 'repair_job', arguments: { job_id: 'not-a-job', wait_seconds: 0 },
     }, repairToken);
     expect(JSON.parse(invalidJob.body.result.content[0].text)).toEqual({ error: 'job_not_found' });
+    expect(repairWait).not.toHaveBeenCalled();
   });
 
   it('repair tool не exposing исходный текст неизвестной ошибки', async () => {
