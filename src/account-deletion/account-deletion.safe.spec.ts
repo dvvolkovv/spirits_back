@@ -1035,3 +1035,22 @@ describe('account deletion key and scheme regressions', () => {
       .toThrow(/^unsafe_resource_key$/);
   });
 });
+
+describe('account deletion exact userId payload regressions', () => {
+  it.each(['u123', '123'])('отклоняет resourceKey, точно равный короткому userId: %s', (userId) => {
+    expect(() => assertSafeJobSpec(job({}, userId), userId))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('отклоняет точное короткое строковое значение userId до и после decode', () => {
+    expect(() => deletionPayloadJson({ id: 'u123' }, 'u123'))
+      .toThrow(/^unsafe_payload$/);
+    expect(() => deletionPayloadJson({ id: 'u%31%32%33' }, 'u123'))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('отклоняет точное числовое значение userId независимо от его длины', () => {
+    expect(() => deletionPayloadJson({ id: 123 }, '123'))
+      .toThrow(/^unsafe_payload$/);
+  });
+});
