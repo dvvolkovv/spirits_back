@@ -495,6 +495,7 @@ export function safeDeletionMessage(input: {
     throw new Error('unsafe_deletion_id');
   }
   if (unsafeResourceKeyFormat(input.resourceKey)
+    || input.resourceKey === input.userId
     || (typeof input.userId === 'string' && input.userId.length >= 6
       && input.resourceKey.includes(input.userId))) {
     throw new Error('unsafe_resource_key');
