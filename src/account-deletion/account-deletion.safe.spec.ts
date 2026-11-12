@@ -906,3 +906,18 @@ describe('account deletion numeric property regressions', () => {
     expect(() => assertSafeJobSpec(job(payload), USER_ID)).not.toThrow();
   });
 });
+
+describe('account deletion decoding boundary regressions', () => {
+  it('отклоняет 6x encoded dangerous URL после bounded decode', () => {
+    let fileUrl = `https://evil.test/x?jwt=${SECRET}`;
+    for (let index = 0; index < 6; index += 1) fileUrl = encodeURIComponent(fileUrl);
+    expect(() => assertSafeJobSpec(job({ fileUrl }), USER_ID))
+      .toThrow(/^unsafe_payload$/);
+  });
+
+  it('разрешает стабильный public URL на decode boundary', () => {
+    expect(() => assertSafeJobSpec(job({
+      fileUrl: 'https://example.com/public?download=1',
+    }), USER_ID)).not.toThrow();
+  });
+});
