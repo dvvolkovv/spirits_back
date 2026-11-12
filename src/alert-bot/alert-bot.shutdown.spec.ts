@@ -30,7 +30,7 @@ describe('alert-bot shutdown before PostgreSQL close', () => {
         return new Promise<string>(() => {});
       }),
     };
-    const ops = new AlertBotOpsServer({} as any, tools as any, { toolTimeoutMs: 60_000 });
+    const ops = new AlertBotOpsServer({} as any, tools as any, {} as any, {} as any, { toolTimeoutMs: 60_000 });
     const turns = {
       idle: jest.fn(() => {
         events.push('turns.idle');

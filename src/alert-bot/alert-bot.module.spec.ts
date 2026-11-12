@@ -16,6 +16,11 @@ import { ALERT_BOT_HANDLER, ALERT_BOT_OPS_TOOLS } from './alert-bot.config';
 import { AlertBotLifecycle } from './alert-bot.lifecycle';
 import { AlertBotModule } from './alert-bot.module';
 import { AlertBotOpsServer } from './alert-bot.ops-server';
+import { AlertBotRepairAuth } from './alert-bot.repair-auth';
+import { AlertBotRepairExecutor } from './alert-bot.repair-executor';
+import { AlertBotRepairJobs } from './alert-bot.repair-jobs';
+import { RepairStore } from './alert-bot.repair-store';
+import { AlertBotRepairTools } from './alert-bot.repair-tools';
 import { AlertBotService } from './alert-bot.service';
 import { AlertBotStore } from './alert-bot.store';
 import { AlertBotTools } from './alert-bot.tools';
@@ -38,6 +43,7 @@ describe('AlertBotModule: жизненный цикл и DI', () => {
     const providers = Reflect.getMetadata(MODULE_METADATA.PROVIDERS, AlertBotModule);
     expect(providers).toEqual(expect.arrayContaining([
       AlertBotService, AlertBotTools, AlertBotOpsServer, AlertBotLifecycle,
+      RepairStore, AlertBotRepairExecutor, AlertBotRepairJobs, AlertBotRepairAuth, AlertBotRepairTools,
     ]));
     expect(providers).not.toContain(ChatService);
     expect(providers).not.toContain(SupportService);
@@ -57,6 +63,7 @@ describe('AlertBotModule: жизненный цикл и DI', () => {
   it('sync-api-keys-to-test не переносит настройки бота алертов', () => {
     const script = fs.readFileSync(path.join(__dirname, '../../scripts/sync-api-keys-to-test.sh'), 'utf8');
     expect(script).not.toContain('ALERT_BOT_');
+    expect(script).not.toContain('ALERT_BOT_REPAIR_');
   });
 
   it('миграция лежит в src и store умеет fallback из dist в src с pg mock', async () => {

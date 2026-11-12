@@ -3,8 +3,12 @@ import { Socket } from 'net';
 import { AlertBotAccess } from './alert-bot.access';
 import { toolText } from './alert-bot.mask';
 import { AlertBotOpsServer } from './alert-bot.ops-server';
-import { signOpsToken } from './alert-bot.ops-token';
-import { OpsToolHandler } from './alert-bot.types';
+import { signOpsToken, signRepairToken } from './alert-bot.ops-token';
+import { AlertBotRepairAuth } from './alert-bot.repair-auth';
+import { AlertBotRepairJobs } from './alert-bot.repair-jobs';
+import { AlertBotRepairTools } from './alert-bot.repair-tools';
+import { RepairJobRecord } from './alert-bot.repair-store';
+import { OpsToolHandler, RepairIdentity } from './alert-bot.types';
 
 const definitions = ['alerts', 'health', 'incidents', 'assign', 'sla'].map((name) => ({
   name,
@@ -12,13 +16,30 @@ const definitions = ['alerts', 'health', 'incidents', 'assign', 'sla'].map((name
   inputSchema: { type: 'object', properties: {} },
 }));
 
+const repairIdentity: RepairIdentity = {
+  scope: 'repair',
+  adminUserId: 'tg:123',
+  adminTgId: '123',
+  chatId: '-1001',
+  turnId: 'turn-1',
+  repairId: 'repair-1',
+};
+const repairJobUuid = '7c9e6679-7425-40de-944b-e07fc1f90ae7';
+const repairOutputPath = '/tmp/0123456789abcdef0123456789abcdef/a.docx';
+
 describe('AlertBotOpsServer stateless MCP', () => {
   let server: AlertBotOpsServer;
   let access: AlertBotAccess;
   let isAdminUserId: jest.Mock;
   let execute: jest.Mock;
+  let authorize: jest.Mock;
+  let repairStart: jest.Mock;
+  let repairWait: jest.Mock;
+  let repairAuth: AlertBotRepairAuth;
+  let repairTools: AlertBotRepairTools;
   let adminToken: string;
   let userToken: string;
+  let repairToken: string;
   let sockets: Set<Socket>;
 
   beforeEach(async () => {
@@ -26,13 +47,27 @@ describe('AlertBotOpsServer stateless MCP', () => {
     process.env.JWT_SECRET = 'ops-wire-spec-secret';
     isAdminUserId = jest.fn(async (userId: string) => userId === 'u-admin');
     access = { isAdminUserId } as unknown as AlertBotAccess;
-    execute = jest.fn(async (_name: string, args: Record<string, unknown>, _ctx: unknown, _signal?: AbortSignal) => toolText({ ok: true, args }));
+    execute = jest.fn(async (name: string, args: Record<string, unknown>, _ctx: unknown, _signal?: AbortSignal) => (
+      name.startsWith('repair_') ? toolText({ error: 'unknown_tool' }) : toolText({ ok: true, args })
+    ));
     const tools: OpsToolHandler = { definitions: () => definitions, execute };
-    server = new AlertBotOpsServer(access, tools);
+    authorize = jest.fn().mockResolvedValue(true);
+    repairAuth = { authorize } as unknown as AlertBotRepairAuth;
+    repairStart = jest.fn().mockResolvedValue({ jobId: 'job-1' });
+    repairWait = jest.fn();
+    repairTools = new AlertBotRepairTools(tools, { start: repairStart, wait: repairWait } as unknown as AlertBotRepairJobs);
+    server = new AlertBotOpsServer(access, tools, repairAuth, repairTools);
     await server.start(0);
     trackSockets();
     adminToken = signOpsToken('u-admin', '1');
     userToken = signOpsToken('u-user', '2');
+    repairToken = signRepairToken({
+      adminUserId: repairIdentity.adminUserId,
+      adminTgId: repairIdentity.adminTgId,
+      chatId: repairIdentity.chatId,
+      turnId: repairIdentity.turnId,
+      repairId: repairIdentity.repairId,
+    });
   });
 
   afterEach(async () => {
@@ -57,7 +92,7 @@ describe('AlertBotOpsServer stateless MCP', () => {
   async function restart(options: { toolTimeoutMs?: number; shutdownTimeoutMs?: number }): Promise<void> {
     await server.stop();
     const ConfigurableServer = AlertBotOpsServer as any;
-    server = new ConfigurableServer(access, { definitions: () => definitions, execute }, options);
+    server = new ConfigurableServer(access, { definitions: () => definitions, execute }, repairAuth, repairTools, options);
     await server.start(0);
     trackSockets();
   }
@@ -132,14 +167,14 @@ describe('AlertBotOpsServer stateless MCP', () => {
     expect(Number(new URL(server.origin()).port)).toBeGreaterThan(0);
     expect(server.url()).toBe(`${server.origin()}/mcp`);
 
-    const unstarted = new AlertBotOpsServer(access, { definitions: () => definitions, execute });
+    const unstarted = new AlertBotOpsServer(access, { definitions: () => definitions, execute }, repairAuth, repairTools);
     expect(() => unstarted.origin()).toThrow();
     await expect(unstarted.stop()).resolves.toBeUndefined();
   });
 
   it('отклоняет listen-ошибку', async () => {
     jest.spyOn(console, 'error').mockImplementation(() => undefined);
-    const second = new AlertBotOpsServer(access, { definitions: () => definitions, execute });
+    const second = new AlertBotOpsServer(access, { definitions: () => definitions, execute }, repairAuth, repairTools);
     const port = Number(new URL(server.origin()).port);
     await expect(second.start(port)).rejects.toMatchObject({ code: 'EADDRINUSE' });
     await second.stop();
@@ -176,6 +211,124 @@ describe('AlertBotOpsServer stateless MCP', () => {
     await rpc('tools/list');
     await rpc('tools/list');
     expect(isAdminUserId).toHaveBeenCalledTimes(3);
+  });
+
+  it('ops scope не exposing repair capability и не запускает jobs', async () => {
+    const listed = await rpc('tools/list');
+    const names = listed.body.result.tools.map((tool: any) => tool.name);
+    expect(names).not.toEqual(expect.arrayContaining(['repair_exec', 'repair_job', 'repair_verify']));
+
+    const called = await rpc('tools/call', {
+      name: 'repair_exec',
+      arguments: { host: 'prod', command: 'systemctl restart linkeon-api' },
+    });
+    expect(JSON.parse(called.body.result.content[0].text)).toEqual({ error: 'unknown_tool' });
+    expect(repairStart).not.toHaveBeenCalled();
+    expect(repairWait).not.toHaveBeenCalled();
+  });
+
+  it('repair scope требует authorize на каждый запрос и отдаёт read-only + три repair tools', async () => {
+    authorize.mockResolvedValueOnce(false);
+    const forbidden = await post({ jsonrpc: '2.0', id: 7, method: 'tools/list' }, repairToken);
+    expect(forbidden.status).toBe(403);
+    expect(await forbidden.text()).toBe('');
+    expect(authorize).toHaveBeenCalledWith(repairIdentity);
+    expect(isAdminUserId).not.toHaveBeenCalledWith(repairIdentity.adminUserId);
+
+    const { response, body } = await rpc('tools/list', undefined, repairToken);
+    expect(response.status).toBe(200);
+    expect(body.result.tools.map((tool: any) => tool.name)).toEqual(expect.arrayContaining([
+      'alerts', 'repair_exec', 'repair_job', 'repair_verify',
+    ]));
+    expect(body.result.tools).toHaveLength(8);
+  });
+
+  it('отзыв repair authorization между tools/list и tools/call запрещает запуск', async () => {
+    const listed = await rpc('tools/list', undefined, repairToken);
+    expect(listed.response.status).toBe(200);
+    authorize.mockResolvedValueOnce(false);
+
+    const called = await rpc('tools/call', {
+      name: 'repair_exec', arguments: { host: 'prod', command: 'true' },
+    }, repairToken);
+    expect(called.response.status).toBe(403);
+    expect(repairStart).not.toHaveBeenCalled();
+  });
+
+  it('repair_exec возвращает jobId через repair handler', async () => {
+    const args = { host: 'prod', command: 'systemctl restart linkeon-api', interruptible: true };
+    const { response, body } = await rpc('tools/call', { name: 'repair_exec', arguments: args }, repairToken);
+    expect(response.status).toBe(200);
+    expect(body.result.isError).toBe(false);
+    expect(JSON.parse(body.result.content[0].text)).toEqual({ jobId: 'job-1' });
+    expect(repairStart).toHaveBeenCalledWith(repairIdentity, 'exec', args);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('repair_job возвращает terminal result с UUID и путём, маскируя только секреты', async () => {
+    const terminal: RepairJobRecord = {
+      id: repairJobUuid,
+      repairId: repairIdentity.repairId,
+      sequence: 2,
+      host: 'prod',
+      command: 'convert document',
+      kind: 'verify',
+      mutates: false,
+      interruptible: true,
+      timeoutMs: 120000,
+      status: 'succeeded',
+      exitCode: 0,
+      stdout: `saved ${repairOutputPath}; TOKEN=raw-secret`,
+      stderr: '',
+      failureKind: null,
+    };
+    repairWait.mockResolvedValue(terminal);
+
+    const { body } = await rpc('tools/call', {
+      name: 'repair_job', arguments: { job_id: repairJobUuid, wait_seconds: 3 },
+    }, repairToken);
+    const text = body.result.content[0].text;
+    expect(JSON.parse(text)).toEqual({ ...terminal, stdout: `saved ${repairOutputPath}; TOKEN=[скрыто]` });
+    expect(text).toContain(repairJobUuid);
+    expect(text).toContain(repairOutputPath);
+    expect(text).not.toContain('raw-secret');
+    expect(repairWait).toHaveBeenCalledWith(repairIdentity, repairJobUuid, 3);
+  });
+
+  it('wrong repair args возвращают typed errors', async () => {
+    repairStart.mockRejectedValueOnce(new Error('unknown_host'));
+    const unknownHost = await rpc('tools/call', {
+      name: 'repair_exec', arguments: { host: 'unknown', command: 'true' },
+    }, repairToken);
+    expect(JSON.parse(unknownHost.body.result.content[0].text)).toEqual({ error: 'unknown_host' });
+
+    repairStart.mockRejectedValueOnce(new Error('invalid_command'));
+    const invalidCommand = await rpc('tools/call', {
+      name: 'repair_exec', arguments: { host: 'prod', command: '' },
+    }, repairToken);
+    expect(JSON.parse(invalidCommand.body.result.content[0].text)).toEqual({ error: 'invalid_command' });
+
+    repairWait.mockRejectedValueOnce(new Error('job_not_found'));
+    const invalidJob = await rpc('tools/call', {
+      name: 'repair_job', arguments: { job_id: 'not-a-job', wait_seconds: 0 },
+    }, repairToken);
+    expect(JSON.parse(invalidJob.body.result.content[0].text)).toEqual({ error: 'job_not_found' });
+  });
+
+  it('repair tool не exposing исходный текст неизвестной ошибки', async () => {
+    repairStart.mockRejectedValueOnce(new Error('RAW-REPAIR-SECRET'));
+    const { body } = await rpc('tools/call', {
+      name: 'repair_exec', arguments: { host: 'prod', command: 'true' },
+    }, repairToken);
+    expect(JSON.parse(body.result.content[0].text)).toEqual({ error: 'tool_failed' });
+    expect(JSON.stringify(body)).not.toContain('RAW-REPAIR-SECRET');
+  });
+
+  it('read-only alerts под repair scope делегируется базовому handler', async () => {
+    const { body } = await rpc('tools/call', { name: 'alerts', arguments: { hours: 2 } }, repairToken);
+    expect(JSON.parse(body.result.content[0].text)).toEqual({ ok: true, args: { hours: 2 } });
+    expect(execute).toHaveBeenCalledWith('alerts', { hours: 2 }, repairIdentity, expect.any(AbortSignal));
+    expect(repairStart).not.toHaveBeenCalled();
   });
 
   it('отвечает на initialize и принимает notifications/initialized без тела', async () => {
