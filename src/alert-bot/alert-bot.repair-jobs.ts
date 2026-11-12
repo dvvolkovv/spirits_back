@@ -39,13 +39,14 @@ export class AlertBotRepairJobs {
     if (typeof rawCommand !== 'string' || !rawCommand.trim() || rawCommand.includes('\0') || Buffer.byteLength(rawCommand) > MAX_COMMAND_BYTES) {
       throw new Error('invalid_command');
     }
+    if (args.host !== 'prod' && args.interruptible === true) throw new Error('remote_not_interruptible');
     const created = await this.store.createJob({
       repairId: ctx.repairId,
       host: args.host,
       command: maskSecrets(rawCommand),
       kind,
       mutates: kind === 'exec' && args.mutates !== false,
-      interruptible: args.interruptible === true,
+      interruptible: args.host === 'prod' && args.interruptible === true,
       timeoutMs: timeoutMs(args.timeout_ms),
     });
     if (!created) {

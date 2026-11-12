@@ -30,9 +30,6 @@ interface ProcessState {
   killTimer: NodeJS.Timeout | null;
   completion: Promise<void>;
   complete: () => void;
-  processClosed: boolean;
-  closed: Promise<void>;
-  markClosed: () => void;
 }
 
 function appendCapped(previous: string, decodedChunk: string): string {
@@ -68,14 +65,6 @@ function clampWaitSeconds(value: number): number {
   return Number.isFinite(value) ? Math.min(30, Math.max(0, value)) : 0;
 }
 
-function remotePidFile(jobId: string): string {
-  return `/tmp/alert-bot-repair-${jobId}.pid`;
-}
-
-function remoteCancelFile(jobId: string): string {
-  return `/tmp/alert-bot-repair-${jobId}.cancel`;
-}
-
 function delay(ms: number): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
@@ -91,7 +80,6 @@ export class AlertBotRepairExecutor {
   private readonly startCounts = new Map<string, number>();
   private stoppingAll = false;
   private stopAllEpoch = 0;
-  private remoteHelperDeadlineMs = 10_000;
 
   constructor(private readonly store: RepairStore) {}
 
@@ -153,8 +141,6 @@ export class AlertBotRepairExecutor {
     }
     let complete!: () => void;
     const completion = new Promise<void>((resolve) => { complete = resolve; });
-    let markClosed!: () => void;
-    const closed = new Promise<void>((resolve) => { markClosed = resolve; });
     const state: ProcessState = {
       host: job.host,
       interruptible: job.interruptible,
@@ -168,9 +154,6 @@ export class AlertBotRepairExecutor {
       killTimer: null,
       completion,
       complete,
-      processClosed: false,
-      closed,
-      markClosed,
     };
     this.children.set(jobId, child);
     this.repairs.set(jobId, job.repairId);
@@ -187,20 +170,21 @@ export class AlertBotRepairExecutor {
       void this.finishProcess(jobId, 'failed', null, 'spawn_error').catch(() => undefined);
     });
     child.once('close', (code) => {
-      state.processClosed = true;
-      state.markClosed();
       appendStream(state.stdout, state.stdout.decoder.end());
       appendStream(state.stderr, state.stderr.decoder.end());
+      if (job.host !== 'prod' && state.outcome === 'timeout') {
+        void this.finishProcess(jobId, 'interrupted', null, 'remote_outcome_unknown').catch(() => undefined);
+        return;
+      }
       const repairId = this.repairs.get(jobId);
-      const cancelled = state.interruptible && repairId !== undefined && this.isCancelling(repairId);
-      if (job.host !== 'prod' && (state.outcome || cancelled)) return;
+      const cancelled = job.host === 'prod' && state.interruptible && repairId !== undefined && this.isCancelling(repairId);
       const status = state.outcome ?? (cancelled ? 'cancelled' : (code === 0 ? 'succeeded' : 'failed'));
       void this.finishProcess(jobId, status, code).catch(() => undefined);
     });
 
     if (job.host !== 'prod') {
       child.stdin!.on('error', () => undefined);
-      child.stdin!.end(this.remotePayload(job, rawCommand));
+      child.stdin!.end(rawCommand);
     }
     state.timeout = setTimeout(() => {
       void this.terminate(jobId, 'timeout').catch(() => undefined);
@@ -294,7 +278,7 @@ export class AlertBotRepairExecutor {
       });
     }
     return childProcess.spawn('ssh', [
-      ...this.sshPrefix(job.host), 'setsid', '--wait', 'bash', '-s',
+      ...this.sshPrefix(job.host), 'bash', '-s',
     ], { detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
   }
 
@@ -303,25 +287,6 @@ export class AlertBotRepairExecutor {
       ? process.env.ALERT_BOT_REPAIR_RELAY_SSH || 'dv@5.101.115.184'
       : process.env.ALERT_BOT_REPAIR_TEST_SSH || 'dv@85.192.61.231';
     return ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', destination];
-  }
-
-  private remotePayload(job: RepairJobRecord, rawCommand: string): string {
-    const pidFile = remotePidFile(job.id);
-    const cancelFile = remoteCancelFile(job.id);
-    const marker = `__ALERT_BOT_REPAIR_${job.id}__`;
-    return [
-      'umask 077',
-      `if [ -e ${cancelFile} ]; then rm -f ${pidFile} ${cancelFile}; exit 0; fi`,
-      `printf '%s\\n' "$$" > ${pidFile}`,
-      `if [ -e ${cancelFile} ]; then rm -f ${pidFile} ${cancelFile}; exit 0; fi`,
-      `bash -s <<'${marker}'`,
-      rawCommand,
-      marker,
-      'status=$?',
-      `rm -f ${pidFile} ${cancelFile}`,
-      'exit "$status"',
-      '',
-    ].join('\n');
   }
 
   private isCancelling(repairId: string): boolean {
@@ -370,9 +335,6 @@ export class AlertBotRepairExecutor {
       killTimer: null,
       completion,
       complete,
-      processClosed: true,
-      closed: Promise.resolve(),
-      markClosed: () => undefined,
     };
     this.repairs.set(job.id, job.repairId);
     this.processes.set(job.id, state);
@@ -389,118 +351,24 @@ export class AlertBotRepairExecutor {
   private async terminate(jobId: string, outcome: ForcedOutcome): Promise<void> {
     const state = this.processes.get(jobId);
     const child = this.children.get(jobId);
-    if (!state || !child || (!state.interruptible && outcome !== 'timeout')) return;
+    if (!state || !child) return;
+    if (state.host !== 'prod') {
+      if (outcome === 'timeout' && !state.finished && !state.outcome) {
+        state.outcome = 'timeout';
+        this.signalGroup(child, 'SIGKILL');
+      }
+      return;
+    }
+    if (!state.interruptible && outcome !== 'timeout') return;
     if (!state.finished && !state.outcome) {
       state.outcome = outcome;
-      if (state.host === 'prod') {
-        this.signalGroup(child, 'SIGTERM');
-        state.killTimer = setTimeout(() => {
-          if (!state.finished) this.signalGroup(child, 'SIGKILL');
-        }, 5_000);
-        state.killTimer.unref();
-      } else {
-        void this.terminateRemote(jobId, state, child, outcome).catch(async () => {
-          await this.finishProcess(jobId, 'interrupted', null, 'remote_cancel_unconfirmed');
-        });
-      }
+      this.signalGroup(child, 'SIGTERM');
+      state.killTimer = setTimeout(() => {
+        if (!state.finished) this.signalGroup(child, 'SIGKILL');
+      }, 5_000);
+      state.killTimer.unref();
     }
     await state.completion;
-  }
-
-  private async terminateRemote(
-    jobId: string,
-    state: ProcessState,
-    child: ChildProcess,
-    outcome: ForcedOutcome,
-  ): Promise<void> {
-    const stopOriginal = () => {
-      if (!state.processClosed) this.signalGroup(child, 'SIGKILL');
-    };
-    await this.remoteCancelAndConfirm(state.host as 'relay' | 'test', jobId, state.processClosed, stopOriginal);
-    if (!state.processClosed) {
-      this.signalGroup(child, 'SIGKILL');
-      await Promise.race([state.closed, delay(1_000)]);
-    }
-    const confirmed = await this.remoteCancelAndConfirm(state.host as 'relay' | 'test', jobId, true, stopOriginal);
-    await this.finishProcess(
-      jobId,
-      confirmed ? outcome : 'interrupted',
-      null,
-      confirmed ? null : 'remote_cancel_unconfirmed',
-    );
-  }
-
-  private async remoteCancelAndConfirm(
-    host: 'relay' | 'test',
-    jobId: string,
-    originalClosed: boolean,
-    onDeadline?: () => void,
-  ): Promise<boolean> {
-    const pidFile = remotePidFile(jobId);
-    const cancelFile = remoteCancelFile(jobId);
-    const script = [
-      'umask 077',
-      `: > ${cancelFile}`,
-      'attempt=0',
-      'while [ "$attempt" -lt 20 ]; do',
-      `  if [ -s ${pidFile} ]; then break; fi`,
-      `  if [ ! -e ${cancelFile} ]; then rm -f ${pidFile}; exit 0; fi`,
-      '  attempt=$((attempt + 1))',
-      '  sleep 0.1',
-      'done',
-      `if [ ! -s ${pidFile} ]; then`,
-      originalClosed ? `  rm -f ${pidFile} ${cancelFile}; exit 0` : '  exit 2',
-      'fi',
-      `read -r pid < ${pidFile}`,
-      `case "$pid" in ''|*[!0-9]*) exit 2;; esac`,
-      'kill -TERM -- "-$pid" 2>/dev/null || true',
-      'attempt=0',
-      'while [ "$attempt" -lt 50 ]; do',
-      '  if ! kill -0 -- "-$pid" 2>/dev/null; then',
-      `    rm -f ${pidFile} ${cancelFile}`,
-      '    exit 0',
-      '  fi',
-      '  attempt=$((attempt + 1))',
-      '  sleep 0.1',
-      'done',
-      'kill -KILL -- "-$pid" 2>/dev/null || true',
-      'attempt=0',
-      'while [ "$attempt" -lt 10 ]; do',
-      '  if ! kill -0 -- "-$pid" 2>/dev/null; then',
-      `    rm -f ${pidFile} ${cancelFile}`,
-      '    exit 0',
-      '  fi',
-      '  attempt=$((attempt + 1))',
-      '  sleep 0.1',
-      'done',
-      'exit 1',
-      '',
-    ].join('\n');
-    let child: ChildProcess;
-    try {
-      child = childProcess.spawn('ssh', [...this.sshPrefix(host), 'bash', '-s'], {
-        detached: true, stdio: ['pipe', 'ignore', 'ignore'],
-      });
-    } catch { return false; }
-    child.stdin!.on('error', () => undefined);
-    child.stdin!.end(script);
-    return new Promise((resolve) => {
-      let settled = false;
-      let timer: NodeJS.Timeout | null = null;
-      const done = (confirmed: boolean) => {
-        if (settled) return;
-        settled = true;
-        if (timer) clearTimeout(timer);
-        resolve(confirmed);
-      };
-      timer = setTimeout(() => {
-        try { this.signalGroup(child, 'SIGKILL'); } catch { /* helper уже недоступен */ }
-        try { onDeadline?.(); } catch { /* original SSH уже недоступен */ }
-        done(false);
-      }, this.remoteHelperDeadlineMs);
-      child.once('error', () => done(false));
-      child.once('close', (code) => done(code === 0));
-    });
   }
 
   private async finishProcess(
