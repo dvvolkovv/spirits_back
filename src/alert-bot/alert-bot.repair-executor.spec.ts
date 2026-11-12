@@ -654,6 +654,31 @@ describe('AlertBotRepairExecutor', () => {
     expect((executor as any).cancellingRepairs.has('repair-1')).toBe(true);
   });
 
+  it('periodic reconcile single-flight при hanging findRepair через несколько ticks', async () => {
+    await createJob();
+    (executor as any).repairChains.set('repair-1', Promise.resolve());
+    (executor as any).cancellingRepairs.add('repair-1');
+    let releaseFind!: () => void;
+    let findEntered!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseFind = resolve; });
+    const entered = new Promise<void>((resolve) => { findEntered = resolve; });
+    const original = store.findRepair.bind(store);
+    const findRepair = jest.spyOn(store, 'findRepair').mockImplementation(async (id) => {
+      findEntered();
+      await gate;
+      return original(id);
+    });
+    const first = (executor as any).reconcile() as Promise<void>;
+    await entered;
+    const second = (executor as any).reconcile() as Promise<void>;
+    const third = (executor as any).reconcile() as Promise<void>;
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    const callsBeforeRelease = findRepair.mock.calls.length;
+    releaseFind();
+    await Promise.all([first, second, third]);
+    expect(callsBeforeRelease).toBe(1);
+  });
+
   it('stopAll останавливает interruptible jobs и не трогает noninterruptible', async () => {
     store.addRepair('repair-2');
     const interrupted = await createJob({ timeoutMs: 30_000 });
