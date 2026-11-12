@@ -572,12 +572,12 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
     for (const f of req.files) {
       const newPath = path.join(uploadSessionDir, uploadFileName(f.originalname, fsKey));
       try {
-        fs.renameSync(f.path, newPath);
+        fileOps.renameSync(f.path, newPath);
         renamedFiles.push({ path: newPath, name: f.originalname, size: f.size });
       } catch (e) {
         const fallback = path.join(uploadSessionDir, fallbackFileName(f.originalname, fsKey, randomUUID()));
         try {
-          fs.renameSync(f.path, fallback);
+          fileOps.renameSync(f.path, fallback);
           renamedFiles.push({ path: fallback, name: f.originalname, size: f.size });
         } catch (e2) {
           try { fs.unlinkSync(f.path); } catch {}
