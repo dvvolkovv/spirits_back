@@ -112,6 +112,7 @@ export class AlertBotRepairExecutor {
   private stoppingAll = false;
   private stopAllEpoch = 0;
   private reconciliation: NodeJS.Timeout | null;
+  private reconciling = false;
 
   constructor(private readonly store: RepairStore) {
     this.reconciliation = setInterval(() => {
@@ -347,9 +348,13 @@ export class AlertBotRepairExecutor {
   }
 
   private async reconcile(): Promise<void> {
-    await this.flushPendingForRepair();
-    const repairs = new Set([...this.repairChains.keys(), ...this.cancellingRepairs.values()]);
-    await Promise.all([...repairs].map((repairId) => this.maybeCleanup(repairId)));
+    if (this.reconciling) return;
+    this.reconciling = true;
+    try {
+      await this.flushPendingForRepair();
+      const repairs = new Set([...this.repairChains.keys(), ...this.cancellingRepairs.values()]);
+      await Promise.all([...repairs].map((repairId) => this.maybeCleanup(repairId)));
+    } finally { this.reconciling = false; }
   }
 
   private spawn(job: RepairJobRecord, rawCommand: string): ChildProcess {
