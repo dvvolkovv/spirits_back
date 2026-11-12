@@ -420,6 +420,34 @@ describe('AlertBotRepairExecutor', () => {
     expect(JSON.stringify(log.mock.calls)).not.toContain('sensitive');
   });
 
+  it('stopRepair ждёт SIGKILL/close для TERM-ignoring local command', async () => {
+    const sentinel = `/tmp/alert-bot-repair-term-ignore-${process.pid}-${Date.now()}`;
+    const spawned: childProcess.ChildProcess[] = [];
+    const realSpawn = childProcess.spawn;
+    jest.spyOn(childProcess, 'spawn').mockImplementation((...args: any[]) => {
+      const child = realSpawn(...args as [any, any, any]);
+      spawned.push(child);
+      return child as any;
+    });
+    const job = await createJob({ timeoutMs: 30_000 });
+    try {
+      await executor.start(job.id, `trap '' TERM; sleep 3; sleep 3; touch ${sentinel}`);
+      const startedAt = Date.now();
+      await executor.stopRepair('repair-1');
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(4_500);
+      expect(await store.findJob(job.id)).toMatchObject({ status: 'cancelled' });
+      expect(fs.existsSync(sentinel)).toBe(false);
+      expect(spawned[0]?.pid).toEqual(expect.any(Number));
+      expect(() => process.kill(-spawned[0].pid!, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
+    } finally {
+      if (spawned[0]?.pid) {
+        try { process.kill(-spawned[0].pid, 'SIGKILL'); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+      }
+      fs.rmSync(sentinel, { force: true });
+    }
+  });
+
   it('stopRepair при зависшем requestCancel сначала гасит local и завершается bounded', async () => {
     const job = await createJob({ timeoutMs: 30_000 });
     jest.spyOn(store, 'requestCancel').mockImplementation(() => new Promise<boolean>(() => undefined));
