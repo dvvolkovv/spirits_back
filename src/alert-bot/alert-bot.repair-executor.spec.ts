@@ -438,6 +438,27 @@ describe('AlertBotRepairExecutor', () => {
     expect(await executor.wait(job.id, 0.5)).toBe(true);
     expect(await store.findJob(job.id)).toMatchObject({ status: 'succeeded', stdout: 'durable' });
     expect(finish.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(log).toHaveBeenCalledWith('repair_finish_failed');
+    expect(JSON.stringify(log.mock.calls)).not.toContain('sensitive');
+  });
+
+  it('fresh findJob rejection пишет repair_finish_check_failed без raw error', async () => {
+    const job = await createJob();
+    const originalFinish = store.finishJob.bind(store);
+    jest.spyOn(store, 'finishJob').mockResolvedValueOnce(false).mockImplementation(originalFinish);
+    const originalFind = store.findJob.bind(store);
+    let finds = 0;
+    jest.spyOn(store, 'findJob').mockImplementation((id) => {
+      finds += 1;
+      return finds === 2 ? Promise.reject(new Error('sensitive fresh check')) : originalFind(id);
+    });
+    const log = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    await expect(startPreSpawn('mark_false', job)).resolves.toMatchObject({
+      jobId: job.id, startError: 'repair_inactive',
+    });
+    expect(await executor.wait(job.id, 0.5)).toBe(true);
+    expect(log).toHaveBeenCalledWith('repair_finish_check_failed');
     expect(JSON.stringify(log.mock.calls)).not.toContain('sensitive');
   });
 
