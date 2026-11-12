@@ -163,12 +163,15 @@ async function fixture(t, options = {}) {
     });
     return { response, text: await response.text() };
   };
-  const requestUpload = async (files, { sessionId = 'server-upload-session', fsKey = FS_KEY, reqSystemPrompt } = {}) => {
+  const requestUpload = async (
+    files,
+    { sessionId = 'server-upload-session', fsKey = FS_KEY, reqSystemPrompt, noFallback = true } = {},
+  ) => {
     const payload = new FormData();
     payload.append('message', 'test uploaded documents');
     payload.append('sessionId', sessionId);
     if (fsKey) payload.append('fs_key', fsKey);
-    payload.append('noFallback', '1');
+    if (noFallback) payload.append('noFallback', '1');
     if (reqSystemPrompt !== undefined) payload.append('systemPrompt', reqSystemPrompt);
     for (const file of files) {
       payload.append('files', new Blob([file.body], {
@@ -253,6 +256,20 @@ test("server canary: settings и запреты только у перечисл
   assert.equal(arg(f.calls[1].args, "--disallowedTools").split(",").includes("WebFetch"), false);
 });
 
+test('server canary: перечисленная upload-сессия получает тот же запрет Agent', async (t) => {
+  const f = await fixture(t, {
+    mode: 'canary',
+    canaryKeys: 'server-upload-session\n',
+  });
+  const { response } = await f.requestUpload([
+    { name: 'canary.pdf', body: 'synthetic-canary-body' },
+  ]);
+  assert.equal(response.status, 200);
+  const denied = arg(f.calls[0].args, '--disallowedTools').split(',');
+  assert.ok(denied.includes('Agent'));
+  assert.ok(denied.includes('WebFetch'));
+});
+
 test("server retry: один settings и один MCP на обе попытки, cleanup после успеха", async (t) => {
   const seen = [];
   const f = await fixture(t, {
@@ -269,6 +286,28 @@ test("server retry: один settings и один MCP на обе попытки
   assert.equal(f.calls.length, 2);
   assert.deepEqual(seen[0], seen[1]);
   assert.deepEqual(f.turnFiles(), []);
+});
+
+test('server retry: upload-политика одинакова на обеих попытках', async (t) => {
+  const seen = [];
+  const f = await fixture(t, {
+    onSpawn(call, index) {
+      seen.push({
+        denied: arg(call.args, '--disallowedTools'),
+        prompt: fs.readFileSync(arg(call.args, '--append-system-prompt-file'), 'utf8'),
+      });
+      finishChild(call.child, index === 0
+        ? [{ type: 'result', subtype: 'error', is_error: true, result: 'API Error: 500 Internal Server Error' }]
+        : undefined);
+    },
+  });
+  const { response } = await f.requestUpload([
+    { name: 'retry.pdf', body: 'synthetic-retry-body' },
+  ]);
+  assert.equal(response.status, 200);
+  assert.equal(f.calls.length, 2);
+  assert.deepEqual(seen[0], seen[1]);
+  assert.ok(seen[0].denied.split(',').includes('Agent'));
 });
 
 test("server fallback: тот же settings/MCP у запасного провайдера и его env whitelist", async (t) => {
@@ -291,6 +330,29 @@ test("server fallback: тот же settings/MCP у запасного прова
   assert.equal(f.calls[1].options.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "1");
   assert.equal(f.calls[1].options.env.UNRELATED_SECRET, undefined);
   assert.deepEqual(f.turnFiles(), []);
+});
+
+test('server fallback: upload-политика сохраняется у запасного провайдера', async (t) => {
+  const seen = [];
+  const f = await fixture(t, {
+    fallback: true,
+    onSpawn(call, index) {
+      seen.push({
+        denied: arg(call.args, '--disallowedTools'),
+        prompt: fs.readFileSync(arg(call.args, '--append-system-prompt-file'), 'utf8'),
+      });
+      finishChild(call.child, index === 0
+        ? [{ type: 'result', subtype: 'success', result: 'Not logged in' }]
+        : undefined);
+    },
+  });
+  const { response } = await f.requestUpload([
+    { name: 'fallback.pdf', body: 'synthetic-fallback-body' },
+  ], { noFallback: false });
+  assert.equal(response.status, 200);
+  assert.equal(f.calls.length, 2);
+  assert.deepEqual(seen[0], seen[1]);
+  assert.ok(seen[0].denied.split(',').includes('Agent'));
 });
 
 test("server setup error: неизвестная schema fail-closed, MCP удалён, spawn не вызывается", async (t) => {
@@ -342,6 +404,9 @@ test("server partial MCP write: безопасный fallback на base config, 
     onSpawn(call) {
       filesAtSpawn = f.turnFiles();
       assert.ok(arg(call.args, "--mcp-config").endsWith("empty-mcp.json"));
+      const prompt = fs.readFileSync(arg(call.args, '--append-system-prompt-file'), 'utf8');
+      assert.match(prompt, /Не поручай Agent повторный анализ документа/);
+      assert.match(prompt, /Unknown skill/);
       finishChild(call.child);
     },
   });
