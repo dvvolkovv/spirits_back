@@ -1,4 +1,5 @@
-import { ChatFileKind } from './extract';
+import { ChatFileKind, kindByExt, stripCode } from './extract';
+import { fileExt } from './file-meta';
 
 /**
  * Поиск файлов для инструмента find_files: разбор того, что прислала модель,
@@ -8,7 +9,8 @@ import { ChatFileKind } from './extract';
 export interface FindFilesInput {
   /** Пустая строка — без слов: просто последние файлы. */
   query: string;
-  kind: ChatFileKind | 'any';
+  /** 'link' — внешние ссылки из человеческих сообщений: не файл, а адрес. */
+  kind: ChatFileKind | 'link' | 'any';
   /** Пустая строка — у любого ассистента. */
   assistant: string;
   days: number | null;
@@ -17,7 +19,7 @@ export interface FindFilesInput {
 
 export const FIND_FILES_DEFAULT_LIMIT = 10;
 export const FIND_FILES_MAX_LIMIT = 30;
-const KINDS = new Set(['image', 'video', 'document', 'audio', 'any']);
+const KINDS = new Set(['image', 'video', 'document', 'audio', 'link', 'any']);
 
 /** Вход от модели: типы приводятся, лишнее отбрасывается, числа зажимаются в рамки. */
 export function parseFindFilesInput(raw: any): FindFilesInput {
@@ -76,4 +78,74 @@ export function plainNote(text: string, max = 200): string {
 export function assistantPart(sessionId: string, userId: string): string {
   if (!sessionId.startsWith(`${userId}_`)) return '';
   return sessionId.slice(userId.length + 1).replace(/_fresh_\d+$/, '');
+}
+
+/** Вид исходной загрузки: сначала по mime, без явного семейства — по расширению имени. */
+export function kindByMime(mime: string, name: string): ChatFileKind {
+  const m = String(mime ?? '').toLowerCase();
+  if (m.startsWith('image/')) return 'image';
+  if (m.startsWith('video/')) return 'video';
+  if (m.startsWith('audio/')) return 'audio';
+  return kindByExt(fileExt(String(name ?? '')));
+}
+
+/** Внешняя ссылка из человеческого сообщения: адрес и подпись markdown-ссылки, если была. */
+export interface HumanLink {
+  url: string;
+  text: string;
+}
+
+// Цель ссылки допускает один уровень парных скобок — как MD_LINK_RE в extract.ts:
+// «.../Файл_(формат)» не должно обрезаться на первой «)».
+const MD_HTTP_RE = /\[([^\]]*)\]\(((?:[^()\n]|\([^()\n]*\))+)\)/g;
+const BARE_HTTP_RE = /https?:\/\/[^\s<>"]+/gi;
+
+function countChar(s: string, ch: string): number {
+  let n = 0;
+  for (const c of s) if (c === ch) n++;
+  return n;
+}
+
+/**
+ * Хвостовая пунктуация и незакрытые обёртки в адрес не входят: «(https://x)»
+ * или «https://x.» — это оформление сообщения. Парные скобки внутри адреса
+ * сохраняются: «.../Файл_(формат)» — часть URL.
+ */
+export function trimUrlTail(url: string): string {
+  let u = String(url ?? '').trim();
+  for (;;) {
+    const before = u;
+    u = u.replace(/[.,;:!?…'"»]+$/, '');
+    while (u.endsWith(')') && countChar(u, ')') > countChar(u, '(')) u = u.slice(0, -1);
+    while (u.endsWith(']') && countChar(u, ']') > countChar(u, '[')) u = u.slice(0, -1);
+    if (u === before) return u;
+  }
+}
+
+/**
+ * Внешние ссылки из сообщения человека (источник origin=link инструмента
+ * find_files). Содержимое по ним НЕ скачивается — это только адрес. Внутренние
+ * /webhook/chat-uploads/ исключены: исходники покрывает отдельный источник,
+ * дубль показал бы пользователю служебный подписанный путь. Повтор адреса —
+ * одна запись (первая, с подписью markdown, если она была).
+ */
+export function extractHumanLinks(content: string): HumanLink[] {
+  const text = stripCode(String(content ?? ''));
+  const out: HumanLink[] = [];
+  const seen = new Set<string>();
+  const push = (rawUrl: string, label: string): void => {
+    // Хвост вида `url "title"` — заголовок markdown-ссылки, не часть адреса.
+    const url = trimUrlTail(rawUrl.replace(/\s+"[^"]*"?\s*$/, ''));
+    if (!/^https?:\/\/\S+$/i.test(url)) return;
+    if (url.includes('/webhook/chat-uploads/')) return;
+    if (seen.has(url)) return;
+    seen.add(url);
+    out.push({ url, text: label.trim() });
+  };
+  for (const m of text.matchAll(MD_HTTP_RE)) {
+    const target = m[2].trim();
+    if (/^https?:\/\//i.test(target)) push(target, m[1]);
+  }
+  for (const m of text.matchAll(BARE_HTTP_RE)) push(m[0], '');
+  return out;
 }
