@@ -331,38 +331,14 @@ export class ChatController {
     // Что умеет клиент (client-ui.ts). Тело multipart — ui приезжает строкой.
     const ui = parseClientUi(body.ui);
 
-    let handoff = await this.chatService.buildUploadHandoff({
-      userId,
-      assistantId: String(assistantId),
-      profileText,
-      freshSessionId,
-      requestLang: typeof body.lang === 'string' ? body.lang : undefined,
-      ask: ui.ask,
-      storeBuild,
-      ui,
-    });
-
-    // Профиль уехал в systemPrompt вместе с персоной — в тело реплики его
-    // больше не клеим: там он оседал копией на каждый ход с файлом.
-    const fullMessage = message || 'Проанализируй этот файл';
-
-    const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
-
-    // Модель ответов человека — тот же выбор, что у текстового хода
-    // (streamUniversalAgent). Проб мониторинга у загрузки нет.
-    const answerRoute = await resolveAnswerProvider(false, userId, this.llmProvider);
-
-    // Между сборкой handoff и этой границей были await (персона, история,
-    // выбор модели). Проверяем consent здесь, непосредственно перед fd.append:
-    // раннего gate в builder недостаточно. Возвращаются согласованные prompt,
-    // sessionId и fs_key, поэтому resumed-сессия и папка хода не расходятся.
-    handoff = await this.chatService.finalizeUploadHandoffForDispatch(userId, handoff);
-
-    // Исходники — в наше хранилище ДО отправки на релей (chat-uploads,
-    // spec 2026-11-13-chat-upload-memory): сбой релея или пустой ответ не
-    // должны терять файл. Сбой самого сохранения ход не прерывает: текущий
-    // ответ продолжается по прежнему relay-пути, а клиенту ниже уходит
-    // событие upload_persist_failed.
+    // Исходники — в наше хранилище ДО сборки промпта и ДО отправки на релей
+    // (chat-uploads, spec 2026-11-13-chat-upload-memory): сбой релея или
+    // пустой ответ не должны терять файл. Сохранение идёт раньше
+    // buildUploadHandoff, чтобы блок памяти сессии (uploadContext) исключил
+    // файлы ЭТОГО хода по их свежим id — они уже в multipart-промпте путями
+    // на релее. Сбой самого сохранения ход не прерывает: текущий ответ
+    // продолжается по прежнему relay-пути, а клиенту ниже уходит событие
+    // upload_persist_failed.
     const uploadSessionId = freshSessionId || `${userId}_${assistantId}`;
     let savedUploads: ChatUploadRecord[] = [];
     let uploadPersistFailed = false;
@@ -400,6 +376,38 @@ export class ChatController {
         if (budgetTimer) clearTimeout(budgetTimer);
       }
     }
+
+    let handoff = await this.chatService.buildUploadHandoff({
+      userId,
+      assistantId: String(assistantId),
+      profileText,
+      freshSessionId,
+      requestLang: typeof body.lang === 'string' ? body.lang : undefined,
+      ask: ui.ask,
+      storeBuild,
+      ui,
+      savedUploadIds: savedUploads.map((r) => r.id),
+    });
+
+    // Профиль уехал в systemPrompt вместе с персоной — в тело реплики его
+    // больше не клеим: там он оседал копией на каждый ход с файлом. Память
+    // прошлых загрузок сессии (uploadContext) — наоборот, в теле: подписанные
+    // ссылки пер-ходовые, в кэшируемом systemPrompt им места нет.
+    const fullMessage = [handoff.uploadContext, message || 'Проанализируй этот файл']
+      .filter(Boolean)
+      .join('\n\n');
+
+    const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
+
+    // Модель ответов человека — тот же выбор, что у текстового хода
+    // (streamUniversalAgent). Проб мониторинга у загрузки нет.
+    const answerRoute = await resolveAnswerProvider(false, userId, this.llmProvider);
+
+    // Между сборкой handoff и этой границей были await (персона, история,
+    // выбор модели). Проверяем consent здесь, непосредственно перед fd.append:
+    // раннего gate в builder недостаточно. Возвращаются согласованные prompt,
+    // sessionId и fs_key, поэтому resumed-сессия и папка хода не расходятся.
+    handoff = await this.chatService.finalizeUploadHandoffForDispatch(userId, handoff);
 
     // Строка истории о файлах: сохранённые — markdown-ссылкой на приватное
     // скачивание (JWT владельца), несохранённые — прежним именем. При
