@@ -788,6 +788,9 @@ export class TgBotService implements OnModuleInit {
       );
       this.logger.log(`config ${result.configId} activated for chat ${msg.chat.id}`);
     } catch (e: any) {
+      // Busy loser ещё не знает итог lock-owner: ни DM, ни lookup/leave нельзя
+      // выполнять до его commit, иначе loser получает ложный conflict/выход.
+      if (e?.lifecycleBusy) return;
       const ownerTgId = msg.from.id;
       try {
         // Причину — своими словами: сырой текст исключения бывал русским или
@@ -797,9 +800,6 @@ export class TgBotService implements OnModuleInit {
         await this.grammy.sendMessage(ownerTgId, tgText(await this.langOfTgUser(msg.from), key));
       } catch { /* ignore */ }
       this.logger.warn(`claim failed for chat ${msg.chat.id}: ${e.message}`);
-      // Busy loser ещё не знает итог lock-owner. Неблокированный lookup может
-      // вернуть null до commit победителя и ошибочно выгнать бота из группы.
-      if (e?.lifecycleBusy) return;
       // Уходим, только если в группе точно нет работающего бота: выход
       // архивирует его конфиг (handleMyChatMember). Раньше уходили всегда — и
       // старая ссылка, нажатая владельцем в группе, где бот уже отвечает,
