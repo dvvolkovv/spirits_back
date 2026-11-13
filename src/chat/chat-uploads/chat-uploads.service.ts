@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import { Readable } from 'stream';
 import { PgService } from '../../common/services/pg.service';
@@ -41,6 +41,9 @@ const COLUMNS = 'id, user_id, session_id, original_name, mime, size_bytes, sha25
 
 @Injectable()
 export class ChatUploadsService {
+  private readonly logger = new Logger(ChatUploadsService.name);
+  private bucketEnsured = false;
+
   constructor(
     private readonly pg: PgService,
     private readonly storage: StorageService,
@@ -51,7 +54,10 @@ export class ChatUploadsService {
     sessionId: string;
     files: ChatUploadInputFile[];
   }): Promise<SaveOriginalsResult> {
-    await this.storage.createBucketIfAbsent(BUCKET);
+    if (!this.bucketEnsured) {
+      await this.storage.createBucketIfAbsent(BUCKET);
+      this.bucketEnsured = true;
+    }
     const result: SaveOriginalsResult = { saved: [], failed: [] };
 
     for (const file of input.files) {
@@ -81,11 +87,17 @@ export class ChatUploadsService {
           ],
         );
         result.saved.push(this.row(rows[0]));
-      } catch {
+      } catch (e: any) {
+        this.logger.warn(
+          `saveOriginals: failed to persist file "${file.originalname}": ${this.errDetail(e)}`,
+        );
         try {
           await this.storage.delete({ bucket: BUCKET, key: storageKey });
-        } catch {
+        } catch (cleanupError: any) {
           // Best-effort cleanup: the original upload failure is reported by name.
+          this.logger.warn(
+            `saveOriginals: best-effort cleanup delete failed for "${file.originalname}": ${this.errDetail(cleanupError)}`,
+          );
         }
         result.failed.push(file.originalname);
       }
@@ -146,7 +158,13 @@ export class ChatUploadsService {
         mime: record.mime,
         sizeBytes: record.sizeBytes,
       };
-    } catch {
+    } catch (e: any) {
+      const id = String(input.id).slice(0, 64);
+      if (e instanceof NotFoundException) {
+        this.logger.debug(`openDownload: not found (id=${id})`);
+      } else {
+        this.logger.error(`openDownload: internal failure (id=${id}): ${this.errDetail(e)}`);
+      }
       throw new NotFoundException('Upload not found');
     }
   }
@@ -171,7 +189,8 @@ export class ChatUploadsService {
       `SELECT ${COLUMNS} FROM chat_uploads
        WHERE user_id = $1
          AND ($2::int IS NULL OR created_at >= now() - make_interval(days => $2::int))
-       ORDER BY created_at DESC`,
+       ORDER BY created_at DESC
+       LIMIT 200`,
       [userId, days ?? null],
     );
     return rows.map((row) => this.row(row));
@@ -185,8 +204,21 @@ export class ChatUploadsService {
     for (const row of rows) {
       try {
         await this.storage.delete({ bucket: BUCKET, key: row.storage_key });
-      } catch {
-        // Account deletion must continue even when an object is already absent.
+      } catch (e: any) {
+        if (this.isNotFound(e)) {
+          // Account deletion must continue even when an object is already absent.
+          this.logger.warn(
+            `deleteForUser: object already absent (user=${userId}, key=${row.storage_key}): ${this.errDetail(e)}`,
+          );
+          continue;
+        }
+        // storage_key — единственный указатель на байты: без успешного удаления
+        // строки нельзя терять, иначе при восстановлении MinIO байты останутся
+        // навсегда. Ошибка уходит наверх, удаление аккаунта повторяется позже.
+        this.logger.error(
+          `deleteForUser: storage delete failed (user=${userId}): ${this.errDetail(e)}; DB rows kept for retry`,
+        );
+        throw e;
       }
     }
     await this.pg.query('DELETE FROM chat_uploads WHERE user_id = $1', [userId]);
@@ -197,6 +229,21 @@ export class ChatUploadsService {
     return `Earlier user uploads:\n${records
       .map((record) => `- ${record.originalName}: ${this.assistantUrl(record.id)}`)
       .join('\n')}`;
+  }
+
+  private isNotFound(e: any): boolean {
+    return (
+      e?.name === 'NotFound' ||
+      e?.name === 'NoSuchKey' ||
+      e?.$metadata?.httpStatusCode === 404
+    );
+  }
+
+  /** Вид и сообщение ошибки — без байтов, подписей и секретов. */
+  private errDetail(e: any): string {
+    const name = e?.name || 'Error';
+    const message = typeof e?.message === 'string' ? e.message : '';
+    return `${name}: ${message}`.slice(0, 300);
   }
 
   private row(row: any): ChatUploadRecord {

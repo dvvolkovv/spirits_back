@@ -1,4 +1,6 @@
 import { createHash } from 'crypto';
+import { Readable } from 'stream';
+import { NotFoundException } from '@nestjs/common';
 import { ChatUploadsService } from './chat-uploads.service';
 
 describe('ChatUploadsService', () => {
@@ -7,6 +9,7 @@ describe('ChatUploadsService', () => {
     upload: jest.fn(async () => 'https://public.invalid/should-not-be-used'),
     delete: jest.fn(async () => {}),
     createBucketIfAbsent: jest.fn(async () => {}),
+    downloadStream: jest.fn(async () => Readable.from(['bytes'])),
   };
   const service = new ChatUploadsService(pg as any, storage as any);
 
@@ -38,11 +41,13 @@ describe('ChatUploadsService', () => {
     expect(JSON.stringify(result)).not.toContain('public.invalid');
   });
 
-  it('при ошибке записи удаляет объект и возвращает failed', async () => {
+  it('при ошибке записи удаляет объект тем же ключом и возвращает failed', async () => {
     pg.query.mockRejectedValueOnce(new Error('db down'));
     const result = await service.saveOriginals({ userId: 'u1', sessionId: 'u1_12', files: [{ buffer: Buffer.from('x'), originalname: 'x.txt' }] });
     expect(result.failed).toEqual(['x.txt']);
     expect(storage.delete).toHaveBeenCalled();
+    const uploadedKey = storage.upload.mock.calls[0][0].key;
+    expect(storage.delete.mock.calls[0][0].key).toBe(uploadedKey);
   });
 
   it('подпись живёт час и не принимает чужую/просроченную', () => {
@@ -85,6 +90,68 @@ describe('ChatUploadsService', () => {
     await fresh.saveOriginals({ userId: 'u1', sessionId: 'u1_1', files: [] });
     await fresh.saveOriginals({ userId: 'u1', sessionId: 'u1_1', files: [] });
     expect(storage.createBucketIfAbsent).toHaveBeenCalledTimes(1);
+  });
+
+  describe('openDownload', () => {
+    const RECORD_ID = '22222222-2222-4222-8222-222222222222';
+    const recordRow = () => ({
+      id: RECORD_ID,
+      user_id: 'owner1',
+      session_id: 'owner1_1',
+      original_name: 'doc.pdf',
+      mime: 'application/pdf',
+      size_bytes: 11,
+      sha256: 'b'.repeat(64),
+      storage_key: 'k/doc.pdf',
+      created_at: new Date('2026-01-02'),
+    });
+
+    it('владельцу отдаёт поток, имя, mime и размер', async () => {
+      pg.query.mockResolvedValueOnce({ rows: [recordRow()] });
+      const download = await service.openDownload({ id: RECORD_ID, userId: 'owner1' });
+      expect(download).toMatchObject({ originalName: 'doc.pdf', mime: 'application/pdf', sizeBytes: 11 });
+      expect(download.body).toBeInstanceOf(Readable);
+      expect(storage.downloadStream).toHaveBeenCalledWith({ bucket: 'linkeon-chat-uploads', key: 'k/doc.pdf' });
+    });
+
+    it('чужому userId без валидной подписи — 404', async () => {
+      pg.query.mockResolvedValueOnce({ rows: [recordRow()] });
+      await expect(service.openDownload({ id: RECORD_ID, userId: 'intruder' })).rejects.toBeInstanceOf(NotFoundException);
+      expect(storage.downloadStream).not.toHaveBeenCalled();
+    });
+
+    it('валидные exp+sig без userId открывают файл', async () => {
+      pg.query.mockResolvedValueOnce({ rows: [recordRow()] });
+      const url = new URL(service.assistantUrl(RECORD_ID, Date.now() / 1000));
+      const exp = url.searchParams.get('exp') as string;
+      const sig = url.searchParams.get('sig') as string;
+      const download = await service.openDownload({ id: RECORD_ID, exp, sig });
+      expect(download.originalName).toBe('doc.pdf');
+    });
+
+    it('просроченная подпись — 404', async () => {
+      pg.query.mockResolvedValueOnce({ rows: [recordRow()] });
+      const url = new URL(service.assistantUrl(RECORD_ID, Date.now() / 1000 - 7200));
+      const exp = url.searchParams.get('exp') as string;
+      const sig = url.searchParams.get('sig') as string;
+      await expect(service.openDownload({ id: RECORD_ID, exp, sig })).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('неверная подпись — 404', async () => {
+      pg.query.mockResolvedValueOnce({ rows: [recordRow()] });
+      const exp = String(Math.floor(Date.now() / 1000) + 600);
+      await expect(service.openDownload({ id: RECORD_ID, exp, sig: 'f'.repeat(64) })).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('несуществующая запись — 404', async () => {
+      pg.query.mockResolvedValueOnce({ rows: [] });
+      await expect(service.openDownload({ id: RECORD_ID, userId: 'owner1' })).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('невалидный (не UUID) id — 404 без обращения к pg', async () => {
+      await expect(service.openDownload({ id: 'not-a-uuid', userId: 'owner1' })).rejects.toBeInstanceOf(NotFoundException);
+      expect(pg.query).not.toHaveBeenCalled();
+    });
   });
 
   describe('deleteForUser', () => {
