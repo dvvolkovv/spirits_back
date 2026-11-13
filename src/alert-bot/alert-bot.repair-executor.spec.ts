@@ -175,6 +175,24 @@ describe('AlertBotRepairExecutor', () => {
     });
   });
 
+  it('локальный prod spawn не выносит текст команды в argv, команда доходит через stdin', async () => {
+    const marker = 'STDIN-ONLY-MARKER-9f3c2a71';
+    const calls: unknown[][] = [];
+    const realSpawn = childProcess.spawn;
+    jest.spyOn(childProcess, 'spawn').mockImplementation((...args: any[]) => {
+      calls.push(args);
+      return realSpawn(...args as [any, any, any]);
+    });
+    const job = await createJob();
+    await executor.start(job.id, `printf ${marker}`);
+    expect(await executor.wait(job.id, 5)).toBe(true);
+    expect(calls.length).toBe(1);
+    const [cmd, args] = calls[0] as [string, string[]];
+    expect(cmd).toBe('bash');
+    expect(args.some((arg) => String(arg).includes(marker))).toBe(false);
+    expect(await store.findJob(job.id)).toMatchObject({ status: 'succeeded', stdout: marker });
+  });
+
   it('bounded timeout завершает процессную группу', async () => {
     const spawned: childProcess.ChildProcess[] = [];
     const realSpawn = childProcess.spawn;
