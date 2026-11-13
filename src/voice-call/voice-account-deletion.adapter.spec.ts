@@ -56,8 +56,11 @@ class FakeVoiceDb {
         .map((c) => ({
           id: c.id,
           external_bot_id: c.external_bot_id,
-          shared_room: this.otherParticipantCalls.some((o) => o.room_name === c.room_name)
-            || this.calls.some((o) => o.id !== c.id && o.room_name === c.room_name),
+          // Семантика прод-SQL: комната общая только при звонке ДРУГОГО
+          // user_id (o.user_id <> c.user_id). Повторный вход того же
+          // пользователя общую комнату не создаёт.
+          shared_room: [...this.calls, ...this.otherParticipantCalls]
+            .some((o) => o.room_name === c.room_name && o.user_id !== c.user_id),
           persistent_room: c.room_name.startsWith('room_')
             && this.meetingRooms.some((m) => m.code === c.room_name.slice(5) && m.closed_at === null),
         }));
