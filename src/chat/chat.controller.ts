@@ -1,4 +1,4 @@
-import { Controller, Post, Get, Delete, Body, Query, Req, Res, UseGuards, Optional } from '@nestjs/common';
+import { Controller, Post, Get, Delete, Body, Query, Req, Res, UseGuards, Optional, Logger } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { ChatService, SdkUsageTotals, RelayTurnCost } from './chat.service';
 import { relayAuthHeaders } from './relay-auth';
@@ -25,14 +25,26 @@ import { RelayOutputFile, collectOutputFiles, outputFileLines } from './chat-fil
 import { stripProductActionBlocks } from '../products/product-action-tail';
 import { UserLlmProviderService } from '../common/services/user-llm-provider.service';
 import { relayProviderFields, resolveAnswerProvider } from './answer-provider';
+import { ChatUploadsService, ChatUploadRecord } from './chat-uploads/chat-uploads.service';
 
 // Потолок загрузки и зачем он именно такой — в upload-limits.ts, вместе с
 // самой константой (менять его можно только вместе с ОБОИМИ nginx).
 import { MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_TOTAL_BYTES } from './upload-limits';
 export { MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_TOTAL_BYTES };
 
+/**
+ * Экранирование имени файла для markdown-ссылки в истории: `\`, `[`, `]`.
+ * Имена приходят из multipart и могут содержать любые символы — без экранировки
+ * имя с квадратной скобкой ломало бы ссылку `📎 [имя](url)` в сохранённой строке.
+ */
+function markdownEscapeName(name: string): string {
+  return name.replace(/\\/g, '\\\\').replace(/\[/g, '\\[').replace(/\]/g, '\\]');
+}
+
 @Controller('')
 export class ChatController {
+  private readonly logger = new Logger(ChatController.name);
+
   constructor(
     private readonly chatService: ChatService,
     private readonly jwtSvc: JwtService,
@@ -42,6 +54,9 @@ export class ChatController {
     // spec 2026-10-30-llm-provider-switch, 2026-10-31-global-llm-switch) —
     // для хода с файлами. Последним и @Optional: спеки собирают контроллер позиционно.
     @Optional() private readonly llmProvider?: UserLlmProviderService,
+    // Память загрузок (spec 2026-11-13-chat-upload-memory): исходники файлов
+    // в наше хранилище до вызова релея. Тоже последним и @Optional — по той же причине.
+    @Optional() private readonly chatUploads?: ChatUploadsService,
   ) {}
 
   /**
@@ -329,6 +344,45 @@ export class ChatController {
     // sessionId и fs_key, поэтому resumed-сессия и папка хода не расходятся.
     handoff = await this.chatService.finalizeUploadHandoffForDispatch(userId, handoff);
 
+    // Исходники — в наше хранилище ДО отправки на релей (chat-uploads,
+    // spec 2026-11-13-chat-upload-memory): сбой релея или пустой ответ не
+    // должны терять файл. Сбой самого сохранения ход не прерывает: текущий
+    // ответ продолжается по прежнему relay-пути, а клиенту ниже уходит
+    // событие upload_persist_failed.
+    const uploadSessionId = freshSessionId || `${userId}_${assistantId}`;
+    let savedUploads: ChatUploadRecord[] = [];
+    let uploadPersistFailed = false;
+    if (process.env.CHAT_UPLOADS_ENABLED === 'true' && this.chatUploads) {
+      try {
+        const result = await this.chatUploads.saveOriginals({ userId, sessionId: uploadSessionId, files });
+        savedUploads = result.saved;
+        uploadPersistFailed = result.failed.length > 0;
+      } catch (e: any) {
+        // saveOriginals ловит сбои пофайлово, но бросок возможен до цикла
+        // (например, createBucketIfAbsent при недоступном MinIO).
+        this.logger.warn(
+          `[upload-and-chat] saveOriginals для ${userId}_${assistantId} бросила, продолжаю без исходников: ${e?.message?.slice(0, 200) || e}`,
+        );
+        uploadPersistFailed = true;
+      }
+    }
+
+    // Строка истории о файлах: сохранённые — markdown-ссылкой на приватное
+    // скачивание (JWT владельца), несохранённые — прежним именем. При
+    // выключенной фиче или пустом saved совпадает с прежней `📎 имена\nсообщение`
+    // посимвольно (historyMerge.ts сверяет строки истории).
+    const uploadLinks = savedUploads.map(
+      (r) => `📎 [${markdownEscapeName(r.originalName)}](${this.chatUploads!.ownerUrl(r.id)})`,
+    );
+    const failedUploadNames = files
+      .filter((f: any) => !savedUploads.some((r) => r.originalName === f.originalname))
+      .map((f: any) => f.originalname);
+    const userMsgForHistory = [
+      ...uploadLinks,
+      ...(failedUploadNames.length ? [`📎 ${failedUploadNames.join(', ')}`] : []),
+      message,
+    ].join('\n');
+
     // Proxy file + message to remote agent server
     const FormData = require('form-data');
     const axios = require('axios');
@@ -389,6 +443,13 @@ export class ChatController {
     const safeWrite = (payload: any) => {
       try { res.write(JSON.stringify(payload) + '\n'); clientPing?.touch(); } catch {}
     };
+
+    // Исходник этого запроса не сохранён — сообщаем клиенту сразу, до начала
+    // ответа: в будущих разговорах файл не найдётся (spec «Обработка ошибок»).
+    // На сам ответ не влияет: ход продолжается как обычно.
+    if (uploadPersistFailed) {
+      safeWrite({ type: 'upload_persist_failed', content: 'Файл не сохранён для будущих разговоров' });
+    }
 
     // Открываем ход для activeStreams ДО запроса к релею: deploy.sh ждёт
     // /chat/active-streams === 0 перед рестартом, а копия файлов после потока
@@ -560,11 +621,12 @@ export class ChatController {
 
       // Save history — гарантированно, даже если клиент дисконнектился
       // на любом этапе. Запускаем после res.end чтобы не блокировать ответ.
-      if (fullText.length > 0) {
-        // Все имена в одну строку: при группе файлов в истории должно быть
-        // видно, что именно присылали, а не только первый из них.
-        const names = files.map((f: any) => f.originalname).join(', ');
-        const userMsgForHistory = `📎 ${names}\n${message}`;
+      // С сохранёнными исходниками (chat-uploads) запись обязательна и при
+      // пустом ответе: «пустой или упавший ответ ассистента не отменяет
+      // сохранение» — ссылка на файл в истории должна остаться. Поведение
+      // прежних путей не меняется: без сохранённых исходников персист, как
+      // раньше, только при непустом ответе.
+      if (fullText.length > 0 || savedUploads.length > 0) {
         persistDispatched = true;
         setImmediate(async () => {
           try {
@@ -583,12 +645,17 @@ export class ChatController {
             });
             // Обогащаем профиль (Neo4j) на основе явных самораскрытий/согласий пользователя.
             // Файловые загрузки раньше не вызывали consolidate — теперь учитываются.
-            await this.chatService.consolidateAfterChatPublic(
-              userId,
-              assistantId,
-              userMsgForHistory,
-              fullText,
-            );
+            // Пустой ответ — не материал для обучения профиля: LLM-вызов
+            // только при тексте ассистента (в частности, при записи хода
+            // с пустым ответом ради ссылки на файл — не зовём).
+            if (fullText.length > 0) {
+              await this.chatService.consolidateAfterChatPublic(
+                userId,
+                assistantId,
+                userMsgForHistory,
+                fullText,
+              );
+            }
           } catch (e: any) {
             // eslint-disable-next-line no-console
             console.warn(`[upload-and-chat] persist failed for ${userId}_${assistantId}: ${e?.message}`);
