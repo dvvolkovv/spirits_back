@@ -624,13 +624,23 @@ maybe('durable repair store против PostgreSQL', () => {
     expect((await store.findJob(job!.id))?.status).toBe('queued');
   });
 
-  it('abandon отменяет только requested repair без turn', async () => {
+  it('abandon атомарно отменяет requested и cancel_requested только без turn и освобождает chat', async () => {
     const requested = await admit('abandon-requested');
     expect(await store.abandon(requested)).toBe(true);
     expect(await store.abandon(requested)).toBe(false);
     expect((await store.findRepair(requested))).toMatchObject({
       status: 'cancelled', finishedAt: expect.any(Date),
     });
+
+    const cancelling = await admit('abandon-cancelling');
+    expect(await store.requestCancel(cancelling)).toBe(true);
+    expect(await store.abandon(cancelling)).toBe(true);
+    expect(await store.abandon(cancelling)).toBe(false);
+    expect((await store.findRepair(cancelling))).toMatchObject({
+      status: 'cancelled', turnId: null, finishedAt: expect.any(Date),
+    });
+    await expect(store.admitRepair(repairInput('abandon-cancelling')))
+      .resolves.toMatchObject({ status: 'accepted' });
 
     const running = await admit('abandon-running');
     expect(await store.markRepairRunning(running, TURN_ID)).toBe(true);

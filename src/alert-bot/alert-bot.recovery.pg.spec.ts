@@ -8,6 +8,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
 import { AlertBotDrafts } from './alert-bot.drafts';
+import { AlertBotRepairService } from './alert-bot.repair.service';
+import { RepairStore } from './alert-bot.repair-store';
 import { AlertBotService } from './alert-bot.service';
 import { AlertBotStore } from './alert-bot.store';
 import { AlertBotTurns } from './alert-bot.turns';
@@ -42,15 +44,22 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
   });
 
   beforeEach(async () => {
-    await pool.query('TRUNCATE alert_bot_updates, alert_bot_turns, alert_bot_ticket_drafts, alert_messages');
+    await pool.query('TRUNCATE alert_bot_repair_jobs, alert_bot_repairs, alert_bot_updates, alert_bot_turns, alert_bot_ticket_drafts, alert_messages');
     jest.restoreAllMocks();
   });
 
-  function makeService(telegram: Record<string, jest.Mock>, aiAnswer: jest.Mock) {
+  function makeService(
+    telegram: Record<string, jest.Mock>,
+    aiAnswer: jest.Mock,
+    repairService?: AlertBotRepairService,
+  ) {
     const support = {
       findTicketByPrefix: jest.fn().mockResolvedValue(null),
       findTelegramDraftPublication: jest.fn().mockResolvedValue(false),
       postOwnerReplyFromTelegram: jest.fn().mockResolvedValue(undefined),
+    };
+    const repairRunner = repairService || {
+      run: jest.fn(), findRepairByUpdate: jest.fn().mockResolvedValue(null),
     };
     const turns = new AlertBotTurns(
       store,
@@ -59,10 +68,13 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
       { summary: jest.fn().mockResolvedValue('Сводка') } as any,
       { beginStream: jest.fn(), endStream: jest.fn() } as any,
       support as any,
-      { run: jest.fn(), findRepairByUpdate: jest.fn().mockResolvedValue(null) } as any,
+      repairRunner as any,
     );
     const drafts = new AlertBotDrafts(store, support as any, telegram as any);
     const commands = { start: jest.fn(), status: jest.fn(), close: jest.fn() };
+    const repairEntry = repairService || {
+      admit: jest.fn(), abandon: jest.fn(), stop: jest.fn(), stopAll: jest.fn().mockResolvedValue(undefined),
+    };
     const service = new AlertBotService(
       { resolveTelegram: jest.fn().mockResolvedValue({ isAdmin: true, userId: 'admin-retry' }) } as any,
       telegram as any,
@@ -71,8 +83,9 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
       drafts,
       turns,
       support as any,
+      repairEntry as any,
     );
-    return { service, support, drafts, turns, commands };
+    return { service, support, drafts, turns, commands, repairs: repairRunner };
   }
 
   function telegramMock() {
@@ -141,6 +154,50 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
     expect((await pool.query(
       'SELECT reply_text FROM alert_bot_turns WHERE update_id = $1', [input.updateId],
     )).rows[0]).toEqual({ reply_text: 'Подтверждённый диагноз' });
+  });
+
+  it('transient enqueue error сохраняет requested и retry запускает тот же repair', async () => {
+    const savedAdmins = process.env.ALERT_BOT_REPAIR_ADMIN_TG_IDS;
+    process.env.ALERT_BOT_REPAIR_ADMIN_TG_IDS = '200';
+    try {
+      const telegram = telegramMock();
+      const repairStore = new RepairStore({
+        query: (text: string, params?: any[]) => pool.query(text, params),
+        getClient: () => pool.connect(),
+      } as any);
+      const repairAi = {
+        repair: jest.fn().mockResolvedValue({ text: 'Готово', costUsd: 0, tools: [], noCause: false }),
+      };
+      const repairService = new AlertBotRepairService(repairStore, repairAi as any, {
+        stopRepair: jest.fn().mockResolvedValue(undefined),
+        stopAll: jest.fn().mockResolvedValue(undefined),
+      } as any);
+      const { service, turns } = makeService(telegram, jest.fn(), repairService);
+      const repairUpdate = {
+        ...update,
+        update_id: 92060,
+        message: { ...update.message, text: '/fix Почини ошибку' },
+      };
+      const enqueue = jest.spyOn(turns, 'enqueue')
+        .mockRejectedValueOnce(Object.assign(new Error('transient admission'), { kind: 'db_down' }));
+
+      await service.handleUpdate(repairUpdate);
+      const requested = await repairStore.findRepairByUpdate(repairUpdate.update_id);
+      await makeDue(repairUpdate.update_id);
+      await service.retryFailedUpdates();
+
+      expect(requested).toMatchObject({ status: 'requested', turnId: null });
+      expect(enqueue).toHaveBeenCalledTimes(2);
+      expect(repairAi.repair).toHaveBeenCalledTimes(1);
+      expect((await pool.query('SELECT count(*)::int AS n FROM alert_bot_repairs')).rows[0].n).toBe(1);
+      expect((await repairStore.findRepairByUpdate(repairUpdate.update_id))?.status).toBe('unverified');
+      expect((await pool.query(
+        'SELECT status FROM alert_bot_updates WHERE update_id = $1', [repairUpdate.update_id],
+      )).rows[0].status).toBe('completed');
+    } finally {
+      if (savedAdmins === undefined) delete process.env.ALERT_BOT_REPAIR_ADMIN_TG_IDS;
+      else process.env.ALERT_BOT_REPAIR_ADMIN_TG_IDS = savedAdmins;
+    }
   });
 
   it('сбой placeholder до модели оставляет durable retry и не завершает update', async () => {

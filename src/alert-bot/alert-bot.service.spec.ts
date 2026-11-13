@@ -529,6 +529,17 @@ describe('AlertBotService', () => {
     expect(repairs.abandon).toHaveBeenCalledWith('repair-1');
   });
 
+  it('неуспешный abandon после turns admission журналируется без instruction', async () => {
+    turns.enqueue.mockResolvedValue('busy');
+    repairs.abandon.mockResolvedValue(false);
+
+    await service.handleUpdate(groupText('/fix СЕКРЕТНАЯ-ЗАДАЧА', 1, { from: { id: 123 } }));
+
+    expect(repairs.abandon).toHaveBeenCalledWith('repair-1');
+    expect(logger.error).toHaveBeenCalledWith('alert-bot repair abandon failed kind=admission_cleanup');
+    expect(JSON.stringify(logger.error.mock.calls)).not.toContain('СЕКРЕТНАЯ-ЗАДАЧА');
+  });
+
   it.each(['busy', 'rate_limited'])('turns admission %s не отменяет existing repair', async (status) => {
     repairs.admit.mockResolvedValue({ status: 'existing', repairId: 'repair-existing' });
     turns.enqueue.mockResolvedValue(status);
@@ -540,15 +551,15 @@ describe('AlertBotService', () => {
   });
 
   it.each([
-    ['accepted', true],
-    ['existing', false],
-  ])('ошибка turns.enqueue отменяет repair только для новой admission=%s', async (status, shouldAbandon) => {
+    ['accepted'],
+    ['existing'],
+  ])('ошибка turns.enqueue сохраняет requested repair для retry при admission=%s', async (status) => {
     repairs.admit.mockResolvedValue({ status, repairId: 'repair-1' });
     turns.enqueue.mockRejectedValue(Object.assign(new Error('RAW-ENQUEUE-SECRET'), { kind: 'db_down' }));
 
     await service.handleUpdate(groupText('/fix почини файлы', 1, { from: { id: 123 } }));
 
-    expect(repairs.abandon).toHaveBeenCalledTimes(shouldAbandon ? 1 : 0);
+    expect(repairs.abandon).not.toHaveBeenCalled();
     expect(store.failUpdate).toHaveBeenCalledWith(1, 'db_down');
     expect(JSON.stringify(logger.error.mock.calls)).not.toContain('RAW-ENQUEUE-SECRET');
   });
@@ -564,8 +575,8 @@ describe('AlertBotService', () => {
     expect(turns.enqueue).toHaveBeenCalledTimes(1);
   });
 
-  it('repair reply на диагноз бота передаёт parentTurnId и replyText', async () => {
-    store.findTurnByAnswer.mockResolvedValue({ id: 'parent-diagnosis' });
+  it('repair reply на подтверждённый диагноз бота передаёт parentTurnId и replyText', async () => {
+    store.findTurnByAnswer.mockResolvedValue({ id: 'parent-diagnosis', status: 'ok' });
 
     await service.handleUpdate(update({
       text: 'почини',
@@ -574,12 +585,45 @@ describe('AlertBotService', () => {
     }));
 
     expect(store.findTurnByAnswer).toHaveBeenCalledWith('100', 555);
+    expect(store.findTurnByAnswer).toHaveBeenCalledTimes(1);
     expect(turns.enqueue).toHaveBeenCalledWith(expect.objectContaining({
       mode: 'repair',
       repairId: 'repair-1',
       parentTurnId: 'parent-diagnosis',
       replyText: 'Причина подтверждена',
     }));
+  });
+
+  it.each([
+    ['help', null],
+    ['status', null],
+    ['busy', { id: 'parent-busy', status: 'busy' }],
+    ['unrelated', null],
+  ])('repair phrase на %s без подтверждённого diagnosis не запускает turn', async (_kind, parent) => {
+    store.findTurnByAnswer.mockResolvedValue(parent);
+
+    await service.handleUpdate(update({
+      text: 'почини',
+      from: { id: 123 },
+      reply_to_message: botReply('Служебный ответ'),
+    }));
+
+    expect(store.findTurnByAnswer).toHaveBeenCalledTimes(1);
+    expect(repairs.admit).not.toHaveBeenCalled();
+    expect(turns.enqueue).not.toHaveBeenCalled();
+  });
+
+  it('/fix остаётся доступен по явной задаче даже без подтверждённого parent', async () => {
+    store.findTurnByAnswer.mockResolvedValue(null);
+
+    await service.handleUpdate(update({
+      text: '/fix почини файлы',
+      from: { id: 123 },
+      reply_to_message: botReply('Справка'),
+    }));
+
+    expect(repairs.admit).toHaveBeenCalledWith(expect.objectContaining({ instruction: 'почини файлы' }));
+    expect(turns.enqueue).toHaveBeenCalledWith(expect.objectContaining({ mode: 'repair' }));
   });
 
   it('edited_message игнорируется, photo в private получает text-only, group non-text молчит', async () => {
@@ -732,8 +776,23 @@ describe('AlertBotService', () => {
     );
   });
 
+  it('stopAdmission ждёт завершения repairs.stopAll', async () => {
+    let finishStop!: () => void;
+    repairs.stopAll.mockImplementation(() => new Promise<void>((resolve) => { finishStop = resolve; }));
+    let completed = false;
+
+    const stopping = Promise.resolve(service.stopAdmission()).then(() => { completed = true; });
+    await Promise.resolve();
+    expect(completed).toBe(false);
+
+    finishStop();
+    await stopping;
+    expect(completed).toBe(true);
+    expect(repairs.stopAll).toHaveBeenCalledTimes(1);
+  });
+
   it('shutdown возвращает stopped для новых claim и не запускает scheduled retry', async () => {
-    service.stopAdmission();
+    await service.stopAdmission();
 
     expect(repairs.stopAll).toHaveBeenCalledTimes(1);
     await expect(service.claimUpdate(update({}, 10))).resolves.toBe('stopped');
@@ -749,7 +808,7 @@ describe('AlertBotService', () => {
     const handling = service.handleUpdate(update({}, 11), true);
     for (let i = 0; i < 20 && access.resolveTelegram.mock.calls.length === 0; i += 1) await Promise.resolve();
 
-    service.stopAdmission();
+    await service.stopAdmission();
     resolveAccess(ADMIN);
     await handling;
 
