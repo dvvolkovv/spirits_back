@@ -73,6 +73,15 @@ class FakeDeletionDb {
       return { rows, rowCount: rows.length };
     }
 
+    if (s.startsWith('SELECT 1 FROM tg_bot_configs other WHERE other.tg_chat_id=$1')) {
+      const rows = this.configs
+        .filter((config) => config.id !== params[1]
+          && config.tg_chat_id === params[0]
+          && ['active', 'silent'].includes(config.status))
+        .map(() => ({ '?column?': 1 }));
+      return { rows: rows.slice(0, 1), rowCount: rows.length };
+    }
+
     if (s.startsWith("UPDATE tg_bot_configs c SET status='archived'")) {
       this.requirePieces(s, [
         'c.id=$1',
@@ -83,12 +92,14 @@ class FakeDeletionDb {
       ]);
       const [id, ownerId, currentDeletionId] = params;
       const config = this.configs.find((candidate) => candidate.id === id && candidate.owner_user_id === ownerId);
-      if (!config || !this.isCurrentDeletion(ownerId, currentDeletionId)) {
+      const activeOnly = s.includes("c.status IN ('active','silent')");
+      if (!config || !this.isCurrentDeletion(ownerId, currentDeletionId)
+        || (activeOnly && !['active', 'silent'].includes(config.status))) {
         return { rows: [], rowCount: 0 };
       }
       config.status = 'archived';
       config.archived_at ??= '2026-11-11T00:00:00.000Z';
-      return { rows: [], rowCount: 1 };
+      return { rows: [{ tg_chat_id: config.tg_chat_id }], rowCount: 1 };
     }
 
     if (s.startsWith('UPDATE tg_claim_tokens t SET consumed_at=now()')) {
@@ -375,6 +386,45 @@ describe('TgAccountDeletionAdapter stop', () => {
     expect(db.configs[0].status).toBe('archived');
   });
 
+  it('уже archived A + active B в том же chat: leaveChat не вызывается, B/history целы', async () => {
+    const db = new FakeDeletionDb();
+    db.users.set(account.userId, { state: 'deleted', deletionId });
+    db.users.set('u-neighbor', { state: 'active', deletionId: null });
+    db.configs = [
+      ownConfig({ status: 'archived', archived_at: '2026-10-01T00:00:00.000Z' }),
+      ownConfig({ id: 'cfg-neighbor', owner_user_id: 'u-neighbor', custom_agent_id: 'ca-neighbor' }),
+    ];
+    db.messages = [{ id: 2, config_id: 'cfg-neighbor', content: 'neighbor history' }];
+    const grammy = { leaveChat: jest.fn(async () => true) };
+    const { adapter } = makeAdapter(db, grammy);
+
+    await adapter.execute(job('telegram.stop', 'cfg-1', { chatId: '-100200' }), execution(db));
+
+    expect(grammy.leaveChat).not.toHaveBeenCalled();
+    expect(db.configs.find((config) => config.id === 'cfg-neighbor')?.status).toBe('active');
+    expect(db.messages).toEqual([{ id: 2, config_id: 'cfg-neighbor', content: 'neighbor history' }]);
+  });
+
+  it('A active + B active shared bot/chat: A архивируется локально, но живого B не выгоняет', async () => {
+    const db = new FakeDeletionDb();
+    db.users.set(account.userId, { state: 'deleted', deletionId });
+    db.users.set('u-neighbor', { state: 'active', deletionId: null });
+    db.configs = [
+      ownConfig(),
+      ownConfig({ id: 'cfg-neighbor', owner_user_id: 'u-neighbor', custom_agent_id: 'ca-neighbor' }),
+    ];
+    db.messages = [{ id: 2, config_id: 'cfg-neighbor', content: 'neighbor history' }];
+    const grammy = { leaveChat: jest.fn(async () => true) };
+    const { adapter } = makeAdapter(db, grammy);
+
+    await adapter.execute(job('telegram.stop', 'cfg-1', { chatId: '-100200' }), execution(db));
+
+    expect(db.configs.find((config) => config.id === 'cfg-1')?.status).toBe('archived');
+    expect(db.configs.find((config) => config.id === 'cfg-neighbor')?.status).toBe('active');
+    expect(grammy.leaveChat).not.toHaveBeenCalled();
+    expect(db.messages).toEqual([{ id: 2, config_id: 'cfg-neighbor', content: 'neighbor history' }]);
+  });
+
   it('reactivation old generation не архивирует, не гасит tokens/video и не вызывает leaveChat', async () => {
     const db = new FakeDeletionDb();
     db.users.set(account.userId, { state: 'active', deletionId: 'deletion-new' });
@@ -546,41 +596,51 @@ describe('deleted account не восстанавливает Telegram identity/
     expect(calls).not.toContain('COMMIT');
   });
 
-  function deletedConfigDb(initial: FakeConfig) {
+  function deletedConfigDb(initial: FakeConfig, initialState: 'active' | 'deleted' = 'deleted') {
     const configs = [initial];
     const tokens: any[] = [];
+    let ownerState = initialState;
+    let deleteAfterPrecheck = false;
     const pg = {
       query: jest.fn(async (sql: string, params: any[] = []) => {
         const s = normalize(sql);
         const activeGuard = s.includes('user_id') && s.includes("state='active'");
         if (s.startsWith("SELECT 1 FROM user_id WHERE internal_id=$1 AND state='active'")) {
-          return { rows: [], rowCount: 0 };
+          const rows = ownerState === 'active' ? [{ '?column?': 1 }] : [];
+          if (deleteAfterPrecheck) {
+            ownerState = 'deleted';
+            deleteAfterPrecheck = false;
+          }
+          return { rows, rowCount: rows.length };
         }
         if (s.startsWith('SELECT * FROM tg_bot_configs WHERE id = $1')) {
           return { rows: configs.filter((config) => config.id === params[0] && config.owner_user_id === params[1]) };
         }
         if (s.startsWith('SELECT * FROM tg_bot_configs WHERE tg_chat_id = $1')) {
-          const visible = activeGuard ? [] : configs.filter((config) => ['active', 'silent'].includes(config.status));
+          const visible = activeGuard && ownerState === 'deleted'
+            ? []
+            : configs.filter((config) => ['active', 'silent'].includes(config.status));
           return { rows: visible };
         }
         if (s.includes("SET status = 'pending'")) {
-          if (activeGuard) return { rows: [], rowCount: 0 };
+          if (activeGuard && ownerState === 'deleted') return { rows: [], rowCount: 0 };
           configs[0].status = 'pending';
           configs[0].archived_at = null;
           return { rows: [{ ...configs[0] }], rowCount: 1 };
         }
         if (s.includes("SET status = 'active'")) {
-          if (activeGuard) return { rows: [], rowCount: 0 };
+          if (activeGuard && ownerState === 'deleted') return { rows: [], rowCount: 0 };
           configs[0].status = 'active';
           return { rows: [{ ...configs[0] }], rowCount: 1 };
         }
         if (s.startsWith('INSERT INTO tg_claim_tokens')) {
-          if (!activeGuard) tokens.push({ owner_user_id: params[0], config_id: params[1] });
-          return { rows: activeGuard ? [] : [{ token: '00000000-0000-4000-8000-000000000002' }] };
+          if (activeGuard && ownerState === 'deleted') return { rows: [], rowCount: 0 };
+          tokens.push({ owner_user_id: params[0], config_id: params[1], consumed_at: null });
+          return { rows: [{ token: '00000000-0000-4000-8000-000000000002' }], rowCount: 1 };
         }
         if (s.startsWith('SELECT preferred_agent FROM ai_profiles_consolidated')) return { rows: [] };
         if (s.startsWith('INSERT INTO tg_bot_configs')) {
-          if (activeGuard) return { rows: [], rowCount: 0 };
+          if (activeGuard && ownerState === 'deleted') return { rows: [], rowCount: 0 };
           const created = ownConfig({ id: 'cfg-new', tg_chat_id: String(params[1]), custom_agent_id: null });
           configs.push(created);
           return { rows: [created], rowCount: 1 };
@@ -588,7 +648,12 @@ describe('deleted account не восстанавливает Telegram identity/
         throw new Error(`unexpected config query: ${s}`);
       }),
     };
-    return { pg, configs, tokens };
+    return {
+      pg,
+      configs,
+      tokens,
+      deleteAfterPrecheck: () => { deleteAfterPrecheck = true; },
+    };
   }
 
   it('reissueClaim не воскрешает archived config и не выпускает token для deleted', async () => {
@@ -618,12 +683,57 @@ describe('deleted account не восстанавливает Telegram identity/
     expect(configs.map((config) => config.id)).toEqual(['cfg-1']);
     expect(configs[0].status).toBe('archived');
   });
+  it('active→deleted после precheck: reissue не переводит archived в pending и не выдаёт unconsumed claim', async () => {
+    const harness = deletedConfigDb(ownConfig({ status: 'archived' }), 'active');
+    harness.deleteAfterPrecheck();
+    const grammy = { leaveChat: jest.fn() };
+    const svc = new TgConfigService(harness.pg as any, grammy as any);
+
+    await expect(svc.reissueClaim('cfg-1', account.userId)).rejects.toBeInstanceOf(BadRequestException);
+    expect(harness.configs[0].status).toBe('archived');
+    expect(harness.tokens.filter((token) => token.consumed_at == null)).toHaveLength(0);
+    expect(grammy.leaveChat).not.toHaveBeenCalled();
+  });
+
+  it('active→deleted после precheck: ensure не будит silent и не создаёт active config', async () => {
+    const silent = deletedConfigDb(ownConfig({ status: 'silent' }), 'active');
+    silent.deleteAfterPrecheck();
+    const silentSvc = new TgConfigService(silent.pg as any, {} as any);
+    await expect(silentSvc.ensurePrivateConfig(account.userId, -100200)).rejects.toThrow();
+    expect(silent.configs.map((config) => [config.id, config.status])).toEqual([['cfg-1', 'silent']]);
+
+    const archived = deletedConfigDb(ownConfig({ status: 'archived' }), 'active');
+    archived.deleteAfterPrecheck();
+    const archivedSvc = new TgConfigService(archived.pg as any, {} as any);
+    await expect(archivedSvc.ensurePrivateConfig(account.userId, -100200)).rejects.toThrow();
+    expect(archived.configs.map((config) => config.id)).toEqual(['cfg-1']);
+    expect(archived.configs[0].status).toBe('archived');
+    expect(archived.tokens.filter((token) => token.consumed_at == null)).toHaveLength(0);
+  });
+
+  it('silent UPDATE rowCount=0 после concurrent archive не возвращает synthetic active', async () => {
+    const harness = deletedConfigDb(ownConfig({ status: 'silent' }), 'active');
+    const originalQuery = harness.pg.query.getMockImplementation()!;
+    harness.pg.query.mockImplementation(async (sql: string, params: any[] = []) => {
+      if (normalize(sql).includes("SET status = 'active'")) {
+        harness.configs[0].status = 'archived';
+        return { rows: [], rowCount: 0 };
+      }
+      return originalQuery(sql, params);
+    });
+    const svc = new TgConfigService(harness.pg as any, {} as any);
+
+    await expect(svc.ensurePrivateConfig(account.userId, -100200)).rejects.toThrow();
+    expect(harness.configs[0].status).toBe('archived');
+  });
 });
 
 class FakeVideoDb {
   userState: 'active' | 'deleted' = 'active';
   configStatus: 'active' | 'silent' | 'archived' = 'active';
   deliveryStatus = 'pending';
+  deliveryError: string | null = null;
+  fenceErrorOnce = false;
   readonly queries: string[] = [];
   readonly row = {
     job_id: 'video-1',
@@ -635,21 +745,49 @@ class FakeVideoDb {
     config_id: 'cfg-1',
   };
 
-  async query(sql: string, _params: any[] = []): Promise<any> {
+  async query(sql: string, params: any[] = []): Promise<any> {
     const s = normalize(sql);
     this.queries.push(s);
     if (s.includes("profile_data->>'language'")) return { rows: [{ language: 'ru' }] };
     if (s.startsWith('SELECT tg.job_id')) {
-      return { rows: this.visible(s, false) ? [this.row] : [], rowCount: this.visible(s, false) ? 1 : 0 };
+      const visible = this.visible(s, false);
+      return { rows: visible ? [this.row] : [], rowCount: visible ? 1 : 0 };
     }
     if (s.startsWith('SELECT 1 FROM tg_bot_video_jobs tg')) {
-      return { rows: this.visible(s, true) ? [{ '?column?': 1 }] : [], rowCount: this.visible(s, true) ? 1 : 0 };
+      if (this.fenceErrorOnce) {
+        this.fenceErrorOnce = false;
+        throw new Error('transient fence DB error');
+      }
+      const visible = this.visible(s, true);
+      return { rows: visible ? [{ '?column?': 1 }] : [], rowCount: visible ? 1 : 0 };
     }
-    if (s.startsWith('UPDATE tg_bot_video_jobs SET delivery_status=')) {
-      this.deliveryStatus = s.includes("delivery_status='sent'") ? 'sent' : 'failed';
+    if (s.startsWith('UPDATE tg_bot_video_jobs SET delivery_status=')
+      || s.startsWith('UPDATE tg_bot_video_jobs tg SET delivery_status=')) {
+      const guarded = s.includes("tg.delivery_status IN ('pending','sending')")
+        && s.includes("tg.delivery_error IS DISTINCT FROM 'account_deleted'")
+        && s.includes("JOIN tg_bot_configs c ON c.id=tg.config_id AND c.status IN ('active','silent')")
+        && s.includes("JOIN user_id u ON u.internal_id=vj.user_id AND u.state='active'");
+      if (guarded && !this.canComplete()) return { rows: [], rowCount: 0 };
+      const sent = s.includes("delivery_status='sent'");
+      this.deliveryStatus = sent ? 'sent' : 'failed';
+      if (!sent) this.deliveryError = String(params[0] ?? 'unknown');
       return { rows: [], rowCount: 1 };
     }
     throw new Error(`unexpected video query: ${s}`);
+  }
+
+  stopForAccountDeletion(reactivated = false): void {
+    this.deliveryStatus = 'failed';
+    this.deliveryError = 'account_deleted';
+    this.userState = reactivated ? 'active' : 'deleted';
+    this.configStatus = reactivated ? 'active' : 'archived';
+  }
+
+  private canComplete(): boolean {
+    return this.userState === 'active'
+      && ['active', 'silent'].includes(this.configStatus)
+      && ['pending', 'sending'].includes(this.deliveryStatus)
+      && this.deliveryError !== 'account_deleted';
   }
 
   private visible(sql: string, recheck: boolean): boolean {
@@ -741,6 +879,114 @@ describe('TG video active fences', () => {
     expect(axiosGet).toHaveBeenCalledTimes(1);
     expect(grammy.sendVideo).not.toHaveBeenCalled();
     expect(grammy.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('deletion во время rejected axios.get: ни video_expired, ни перезаписи account_deleted', async () => {
+    const db = new FakeVideoDb();
+    const { svc, grammy } = makeVideoService(db);
+    axiosGet.mockImplementation(async () => {
+      db.stopForAccountDeletion();
+      throw new Error('download failed after deletion');
+    });
+
+    await (svc as any).tick();
+
+    expect(grammy.sendMessage).not.toHaveBeenCalled();
+    expect(grammy.sendVideo).not.toHaveBeenCalled();
+    expect(db.deliveryStatus).toBe('failed');
+    expect(db.deliveryError).toBe('account_deleted');
+  });
+
+  it('deletion во время rejected sendVideo: operational fallback не шлёт video_expired', async () => {
+    const db = new FakeVideoDb();
+    const { svc, grammy } = makeVideoService(db);
+    grammy.sendVideo.mockImplementation(async () => {
+      db.stopForAccountDeletion();
+      throw new Error('sendVideo failed after deletion');
+    });
+
+    await (svc as any).tick();
+
+    expect(grammy.sendVideo).toHaveBeenCalledTimes(1);
+    expect(grammy.sendMessage).not.toHaveBeenCalled();
+    expect(db.deliveryStatus).toBe('failed');
+    expect(db.deliveryError).toBe('account_deleted');
+  });
+
+  it('deletion во время failed-video sendMessage: нет второго outbound video_expired', async () => {
+    const db = new FakeVideoDb();
+    (db.row as any).status = 'failed';
+    (db.row as any).video_url = null;
+    const { svc, grammy } = makeVideoService(db);
+    grammy.sendMessage.mockImplementationOnce(async () => {
+      db.stopForAccountDeletion();
+      throw new Error('sendMessage failed after deletion');
+    });
+
+    await (svc as any).tick();
+
+    expect(grammy.sendMessage).toHaveBeenCalledTimes(1);
+    expect(axiosGet).not.toHaveBeenCalled();
+    expect(db.deliveryStatus).toBe('failed');
+    expect(db.deliveryError).toBe('account_deleted');
+  });
+
+  it('transient fence DB error fail-closed: ноль outbound и нет operational failed update', async () => {
+    const db = new FakeVideoDb();
+    db.fenceErrorOnce = true;
+    const { svc, grammy } = makeVideoService(db);
+
+    await (svc as any).tick();
+
+    expect(grammy.sendChatAction).not.toHaveBeenCalled();
+    expect(grammy.sendMessage).not.toHaveBeenCalled();
+    expect(grammy.sendVideo).not.toHaveBeenCalled();
+    expect(axiosGet).not.toHaveBeenCalled();
+    expect(db.deliveryStatus).toBe('pending');
+    expect(db.deliveryError).toBeNull();
+  });
+
+  it('stop во время успешного sendVideo: late sent не затирает account_deleted', async () => {
+    const db = new FakeVideoDb();
+    const { svc, grammy } = makeVideoService(db);
+    grammy.sendVideo.mockImplementation(async () => {
+      db.stopForAccountDeletion();
+      return {};
+    });
+
+    await (svc as any).tick();
+
+    expect(grammy.sendVideo).toHaveBeenCalledTimes(1);
+    expect(db.deliveryStatus).toBe('failed');
+    expect(db.deliveryError).toBe('account_deleted');
+    expect(grammy.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('reactivation перед late completion: старый attempt сохраняет stop marker', async () => {
+    const db = new FakeVideoDb();
+    const { svc, grammy } = makeVideoService(db);
+    grammy.sendVideo.mockImplementation(async () => {
+      db.stopForAccountDeletion(true);
+      return {};
+    });
+
+    await (svc as any).tick();
+
+    expect(db.deliveryStatus).toBe('failed');
+    expect(db.deliveryError).toBe('account_deleted');
+    expect(grammy.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('operational axios error при подтверждённом active сохраняет video_expired fallback', async () => {
+    const db = new FakeVideoDb();
+    const { svc, grammy } = makeVideoService(db);
+    axiosGet.mockRejectedValue(new Error('ordinary download failure'));
+
+    await (svc as any).tick();
+
+    expect(grammy.sendMessage).toHaveBeenCalledTimes(1);
+    expect(db.deliveryStatus).toBe('failed');
+    expect(db.deliveryError).toContain('ordinary download failure');
   });
 
   it('active delivery сохраняет прежний download/SSRF limits и sendVideo', async () => {

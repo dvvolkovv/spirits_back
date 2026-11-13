@@ -19,11 +19,16 @@ function makeClient(insertFails: boolean) {
     query: jest.fn(async (sql: string) => {
       calls.push(sql.trim().split('\n')[0].trim());
       if (sql.startsWith('SELECT owner_user_id')) return { rows: [{ owner_user_id: '79169403771' }] };
-      if (sql.includes('INSERT INTO tg_user_identities') && insertFails) {
-        throw Object.assign(new Error('duplicate key value violates unique constraint'), {
-          code: '23505',
-          constraint: 'tg_user_identities_tg_user_id_key',
-        });
+      if (sql.startsWith('SELECT 1 FROM user_id')) return { rows: [{ '?column?': 1 }], rowCount: 1 };
+      if (sql.startsWith('UPDATE tg_claim_tokens')) return { rows: [], rowCount: 1 };
+      if (sql.includes('INSERT INTO tg_user_identities')) {
+        if (insertFails) {
+          throw Object.assign(new Error('duplicate key value violates unique constraint'), {
+            code: '23505',
+            constraint: 'tg_user_identities_tg_user_id_key',
+          });
+        }
+        return { rows: [], rowCount: 1 };
       }
       return { rows: [] };
     }),
