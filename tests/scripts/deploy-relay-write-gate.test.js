@@ -26,4 +26,15 @@ describe('relay CLI sandbox write gate', () => {
     expect(command).toBeGreaterThan(section);
     expect(beforeDrain).toBeGreaterThan(section);
   });
+
+  it('live test отправляет prompt и закрывает stdin', () => {
+    const source = fs.readFileSync(path.join(root, 'relay-agent', 'sandbox-write-live.test.mjs'), 'utf8');
+    const spawned = source.indexOf('child = spawn(CLI, args');
+    const stdinEnd = source.indexOf('child.stdin.end(prompt);', spawned);
+    const outcome = source.indexOf('const outcome = await new Promise', spawned);
+
+    expect(spawned).toBeGreaterThan(-1);
+    expect(stdinEnd).toBeGreaterThan(spawned);
+    expect(stdinEnd).toBeLessThan(outcome);
+  });
 });
