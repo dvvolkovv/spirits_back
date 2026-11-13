@@ -51,6 +51,12 @@ export class ChatUploadsController {
       );
       res.destroy();
     });
+    // Обрыв клиента: pipe делает только unpipe, а S3-стрим (HTTP-ответ
+    // GetObject от MinIO) остаётся живым и paused, сокет держится до
+    // серверного таймаута — утечка fd при регулярных обрывах скачиваний.
+    // destroy() уже завершившегося стрима безопасен (образец —
+    // mcp.controller.ts, products.controller.ts).
+    res.on('close', () => file.body.destroy());
     file.body.pipe(res);
   }
 }
