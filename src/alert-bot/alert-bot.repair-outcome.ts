@@ -20,8 +20,8 @@ export function deriveRepairOutcome(jobs: RepairOutcomeJob[], model: RepairModel
   const hasInterruptedJobs = ordered.some((job) => job.status === 'interrupted');
   const verified = lastSuccessfulVerification > lastMutation && lastSuccessfulVerification > lastUnsuccessfulJob;
 
-  if (model === 'cancelled') return { status: 'cancelled', mutationCount };
   if (hasNonTerminalJobs) return { status: 'interrupted', mutationCount };
+  if (model === 'cancelled') return { status: 'cancelled', mutationCount };
   if (verified) return { status: 'verified', mutationCount };
   if (model === 'no_cause') return { status: 'failed', mutationCount };
   if (model !== 'completed') return { status: model, mutationCount };

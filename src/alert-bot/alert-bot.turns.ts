@@ -141,7 +141,8 @@ export class AlertBotTurns {
     return this.runTurn(turnId, input, startedAt);
   }
 
-  resumeExisting(turn: AlertBotTurn, options: AlertBotTurnEnqueueOptions = {}): Promise<AlertBotAdmission> {
+  async resumeExisting(turn: AlertBotTurn, options: AlertBotTurnEnqueueOptions = {}): Promise<AlertBotAdmission> {
+    const repair = await this.repairs.findRepairByUpdate(turn.updateId);
     // Публичный recovery входит в ту же chat queue и проходит accepting checks.
     return this.enqueue({
       updateId: turn.updateId,
@@ -152,6 +153,7 @@ export class AlertBotTurns {
       question: turn.question,
       parentTurnId: turn.parentTurnId,
       privateChat: turn.privateChat,
+      ...(repair ? { mode: 'repair' as const, repairId: repair.id } : {}),
     }, undefined, options);
   }
 

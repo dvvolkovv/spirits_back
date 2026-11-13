@@ -5,9 +5,11 @@ import { maskText } from './alert-bot.mask';
 import { AlertBotRepairAi } from './alert-bot.repair-ai';
 import { AlertBotRepairExecutor } from './alert-bot.repair-executor';
 import {
-  deriveRepairOutcome, RepairModelOutcome, repairStatusText,
+  deriveRepairOutcome, RepairFinalStatus, RepairModelOutcome, repairStatusText,
 } from './alert-bot.repair-outcome';
-import { AdmitRepairInput, RepairStore } from './alert-bot.repair-store';
+import {
+  AdmitRepairInput, RepairJobRecord, RepairRecord, RepairStore,
+} from './alert-bot.repair-store';
 import { TurnInput } from './alert-bot.types';
 
 export interface RepairRunResult {
@@ -17,9 +19,25 @@ export interface RepairRunResult {
   turnStatus: 'ok' | 'timeout' | 'error';
 }
 
+interface RepairGenerated {
+  text: string;
+  costUsd: number;
+  tools: string[];
+  noCause: boolean;
+}
+
+const TERMINAL_STATUSES = new Set<RepairRecord['status']>([
+  'verified', 'unverified', 'failed', 'timeout', 'cancelled', 'interrupted',
+]);
+
+function emptyGenerated(): RepairGenerated {
+  return { text: '', costUsd: 0, tools: [], noCause: false };
+}
+
 @Injectable()
 export class AlertBotRepairService {
   private readonly controllers = new Map<string, AbortController>();
+  private stoppingAll = false;
 
   constructor(
     private readonly store: RepairStore,
@@ -35,17 +53,29 @@ export class AlertBotRepairService {
     return this.store.abandon(repairId);
   }
 
+  async findRepairByUpdate(updateId: number): Promise<RepairRecord | null> {
+    return this.store.findRepairByUpdate(updateId);
+  }
+
   async stop(chatId: string, tgId: string): Promise<string> {
     if (!isAlertBotRepairAdmin(tgId)) return 'Доступ только для администраторов';
     const active = await this.store.findActiveRepair(chatId);
     if (!active) return 'Нет активного исправления';
-    await this.store.requestCancel(active.id);
+    if (!await this.store.requestCancel(active.id)) {
+      const current = await this.store.findRepair(active.id);
+      if (current && TERMINAL_STATUSES.has(current.status)) {
+        return repairStatusText(current.status as RepairFinalStatus, current.mutationCount);
+      }
+      if (current?.status === 'cancel_requested') return 'Исправление останавливается';
+      return 'Нет активного исправления';
+    }
     this.controllers.get(active.id)?.abort();
     await this.executor.stopRepair(active.id);
     return 'Исправление остановлено';
   }
 
   async stopAll(): Promise<void> {
+    this.stoppingAll = true;
     for (const controller of this.controllers.values()) controller.abort();
     await this.executor.stopAll();
   }
@@ -56,46 +86,88 @@ export class AlertBotRepairService {
     input: TurnInput,
     history: Array<{ question: string; answer: string }> = [],
   ): Promise<RepairRunResult> {
+    let generated = emptyGenerated();
     const existing = await this.store.findRepair(repairId);
     if (existing?.status === 'cancel_requested') {
-      const finished = await this.store.finishRepair(repairId, 'cancelled', 0);
-      if (!finished) throw new AlertBotRetryableError('repair_fenced');
-      return {
-        text: repairStatusText('cancelled', 0), costUsd: 0, tools: [], turnStatus: 'error',
-      };
+      return this.finalize(repairId, [], this.cancelModel(), generated, false);
     }
     if (!await this.store.markRepairRunning(repairId, turnId)) {
+      const current = await this.store.findRepair(repairId);
+      if (current?.status === 'cancel_requested') {
+        return this.finalize(repairId, [], this.cancelModel(), generated, false);
+      }
       throw new AlertBotRetryableError('repair_not_requested');
     }
 
     const controller = new AbortController();
     this.controllers.set(repairId, controller);
     let model: RepairModelOutcome = 'completed';
-    let generated = { text: '', costUsd: 0, tools: [] as string[], noCause: false };
     try {
-      generated = await this.ai.repair({
-        ...input, history, mode: 'repair', repairId, turnId, signal: controller.signal,
-      });
-      if (generated.noCause) model = 'no_cause';
-    } catch (error) {
-      model = controller.signal.aborted
-        ? 'cancelled'
-        : (error as { kind?: unknown })?.kind === 'timeout' ? 'timeout' : 'failed';
+      const current = await this.store.findRepair(repairId);
+      if (current?.status === 'cancel_requested') {
+        controller.abort();
+        model = this.cancelModel();
+      } else {
+        try {
+          generated = await this.ai.repair({
+            ...input, history, mode: 'repair', repairId, turnId, signal: controller.signal,
+          });
+          if (generated.noCause) model = 'no_cause';
+        } catch (error) {
+          model = controller.signal.aborted
+            ? this.cancelModel()
+            : (error as { kind?: unknown })?.kind === 'timeout' ? 'timeout' : 'failed';
+        }
+      }
     } finally {
       if (this.controllers.get(repairId) === controller) this.controllers.delete(repairId);
     }
 
     const jobs = await this.store.listJobs(repairId);
-    const outcome = deriveRepairOutcome(jobs, model);
-    const finished = await this.store.finishRepair(repairId, outcome.status, outcome.mutationCount);
-    if (!finished) throw new AlertBotRetryableError('repair_fenced');
+    const current = await this.store.findRepair(repairId);
+    if (current?.status === 'cancel_requested') model = this.cancelModel();
+    return this.finalize(repairId, jobs, model, generated);
+  }
+
+  private cancelModel(): RepairModelOutcome {
+    return this.stoppingAll ? 'interrupted' : 'cancelled';
+  }
+
+  private async finalize(
+    repairId: string,
+    jobs: RepairJobRecord[],
+    model: RepairModelOutcome,
+    generated: RepairGenerated,
+    includeSummary = true,
+  ): Promise<RepairRunResult> {
+    let outcome = deriveRepairOutcome(jobs, model);
+    let finished = await this.store.finishRepair(repairId, outcome.status, outcome.mutationCount);
+    if (!finished) {
+      let current = await this.store.findRepair(repairId);
+      if (current?.status === 'cancel_requested') {
+        outcome = deriveRepairOutcome(jobs, this.cancelModel());
+        finished = await this.store.finishRepair(repairId, outcome.status, outcome.mutationCount);
+        if (!finished) current = await this.store.findRepair(repairId);
+      }
+      if (!finished) {
+        if (!current || !TERMINAL_STATUSES.has(current.status)) {
+          throw new AlertBotRetryableError('repair_fenced');
+        }
+        outcome = {
+          status: current.status as RepairFinalStatus,
+          mutationCount: current.mutationCount,
+        };
+      }
+    }
+
+    const status = repairStatusText(outcome.status, outcome.mutationCount, generated.noCause);
     const summary = generated.text.trim()
       || 'Модель завершилась без текстового пояснения; смотри служебный статус.';
     const turnStatus = outcome.status === 'verified' || outcome.status === 'unverified'
       ? 'ok'
       : outcome.status === 'timeout' ? 'timeout' : 'error';
     return {
-      text: `${repairStatusText(outcome.status, outcome.mutationCount, generated.noCause)}\n${maskText(summary)}`,
+      text: includeSummary ? `${status}\n${maskText(summary)}` : status,
       costUsd: generated.costUsd,
       tools: generated.tools,
       turnStatus,

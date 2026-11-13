@@ -219,7 +219,10 @@ export class RepairStore {
     const result = await this.pg.query(
       `UPDATE alert_bot_repairs
        SET status = $2, mutation_count = $3, finished_at = now()
-       WHERE id = $1 AND status IN ('requested', 'running', 'cancel_requested')`,
+       WHERE id = $1 AND (
+         status IN ('requested', 'running')
+         OR (status = 'cancel_requested' AND $2 IN ('cancelled', 'interrupted'))
+       )`,
       [id, status, mutationCount],
     );
     return result.rowCount === 1;
