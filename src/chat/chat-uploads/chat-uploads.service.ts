@@ -193,7 +193,7 @@ export class ChatUploadsService {
   }
 
   assistantBlock(records: ChatUploadRecord[] | null | undefined): string {
-    if (!records?.length) return '';
+    if (process.env.CHAT_UPLOADS_ENABLED !== 'true' || !records?.length) return '';
     return `Earlier user uploads:\n${records
       .map((record) => `- ${record.originalName}: ${this.assistantUrl(record.id)}`)
       .join('\n')}`;
