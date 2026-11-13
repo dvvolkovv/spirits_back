@@ -33,9 +33,9 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # PM2 управляет продуктом, claude — правит его код.
-# Версии не пиннуются сознательно: образ пересобирается редко, а отставший
-# claude ломает ходы тише, чем несовместимость после обновления.
-RUN npm install -g pm2 @anthropic-ai/claude-code
+# CLI пингуется для воспроизводимого и проверенного обновления парка: репетиция
+# и боевые контейнеры обязаны использовать один и тот же image ID. PM2 не пингуется.
+RUN npm install -g pm2 @anthropic-ai/claude-code@2.1.322
 
 WORKDIR /opt/runner
 COPY ./package.json ./package-lock.json ./

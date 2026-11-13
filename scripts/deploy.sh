@@ -71,6 +71,10 @@
 #                        (default 900). Сторож занятости НЕ продавливается.
 #   PRODUCTS_HOST_WATCH_SECONDS=N — окно наблюдения за опросами живого агента,
 #                        когда переустанавливать нечего (default 20).
+#   PRODUCT_IMAGE_REHEARSE=<имя> — в боевой PHASE 4 после доставки исходников
+#                        сначала DRY_RUN, затем одноразовая репетиция на каждой
+#                        машине, и лишь после неё боевой rollout того же образа.
+#                        Красная репетиция не трогает клиентские контейнеры.
 #
 #   NO_ROLLBACK=1      — отключить авто-rollback на проде при smoke failure
 #                        (по умолчанию: если PHASE 2 smoke красный — откат
@@ -2993,6 +2997,18 @@ ensure_product_image() {
   if [[ -n "${PH_CHECK_ONLY:-}" ]]; then
     DRY_RUN=1 SOURCE_SHA="$PH_PROD_SHA" bash "$roll" "$PH_TARGET" || rc=$?
   else
+    if [[ -n "${PRODUCT_IMAGE_REHEARSE:-}" ]]; then
+      bold "  сухой прогон product image перед репетицией на $PH_TARGET"
+      DRY_RUN=1 SOURCE_SHA="$PH_PROD_SHA" bash "$roll" "$PH_TARGET" || {
+        red "  ✗ Сухой прогон product image не прошёл — rehearsal и боевые контейнеры не тронуты"
+        return 1
+      }
+      bold "  репетиция product image «${PRODUCT_IMAGE_REHEARSE}» на $PH_TARGET"
+      REHEARSE="$PRODUCT_IMAGE_REHEARSE" SOURCE_SHA="$PH_PROD_SHA" bash "$roll" "$PH_TARGET" || {
+        red "  ✗ Репетиция product image не прошла — боевые контейнеры не тронуты"
+        return 1
+      }
+    fi
     SOURCE_SHA="$PH_PROD_SHA" bash "$roll" "$PH_TARGET" || rc=$?
   fi
 
