@@ -29,7 +29,9 @@ function repairContext(ctx: OpsContext): RepairIdentity | null {
 function repairToolText(value: unknown): string {
   const json = JSON.stringify(value, (_key, item) => typeof item === 'string' ? maskSecrets(item) : item) ?? 'null';
   if (Buffer.byteLength(json) <= 8192) return json;
-  let out = json;
+  // Предварительный slice как в baseline toolText: посимвольное обрезание
+  // полного JSON было бы O(n²) и блокировало бы event loop на секунды.
+  let out = Array.from(json).slice(0, 7800).join('');
   while (Buffer.byteLength(`${out}\n…[обрезано]`) > 8192) out = Array.from(out).slice(0, -1).join('');
   return `${out}\n…[обрезано]`;
 }
