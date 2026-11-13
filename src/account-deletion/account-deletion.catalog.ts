@@ -4,6 +4,7 @@ import { discoverProductDeletion } from '../products/product-account-deletion.ad
 import { discoverCalendarDeletion } from '../calendar/calendar-account-deletion.adapter';
 import { discoverIntegrationDeletion } from '../integrations/integration-account-deletion.adapter';
 import { discoverVoiceDeletion } from '../voice-call/voice-account-deletion.adapter';
+import { discoverChatFiles } from '../chat/chat-files/chat-file-account-deletion.adapter';
 import type {
   DeletionDiscoverer,
   DeletionResourceType,
@@ -16,6 +17,7 @@ export const DELETION_DISCOVERERS: readonly DeletionDiscoverer[] = [
   discoverCalendarDeletion,
   discoverIntegrationDeletion,
   discoverVoiceDeletion,
+  discoverChatFiles,
 ];
 
 export interface DeletionDependencyRule {

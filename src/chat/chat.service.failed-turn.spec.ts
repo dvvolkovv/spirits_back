@@ -70,8 +70,9 @@ async function settle() {
 /**
  * Ответ ассистента, записанный в историю, и списанная за него сумма.
  *
- * Позиции берём с конца: у вставки ответа content и tokens_used — два последних
- * параметра, и это верно для обеих веток персиста (saveAssistantMessageRow,
+ * Позиции фиксированные: у вставки ответа content — params[2], tokens_used —
+ * params[3]; userId с Task 11 (gate на активный аккаунт) уходит ПОСЛЕДНИМ
+ * параметром. Верно для обеих веток персиста (saveAssistantMessageRow,
  * когда сообщение пользователя уже лежит в базе, и saveChatHistory, когда пара
  * пишется целиком).
  */
@@ -80,8 +81,8 @@ function savedAnswer(calls: { sql: string; params: any[] }[]) {
   const last = rows[rows.length - 1];
   if (!last) return undefined;
   return {
-    content: String(last.params[last.params.length - 2]),
-    tokens: Number(last.params[last.params.length - 1]),
+    content: String(last.params[2]),
+    tokens: Number(last.params[3]),
   };
 }
 function billingRow(calls: { sql: string; params: any[] }[]) {

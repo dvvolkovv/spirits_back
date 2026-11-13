@@ -3268,20 +3268,28 @@ ${LanguageService.buildDirective(userLanguage)}`;
   private async saveUserMessageRow(userId: string, agentId: string, userMsg: string, sessionIdOverride?: string) {
     const sessionId = sessionIdOverride || `${userId}_${agentId}`;
     const agentNum = /^\d+$/.test(agentId) ? parseInt(agentId, 10) : null;
+    // Task 11: вставка gated на живой аккаунт (INSERT ... SELECT ... WHERE
+    // EXISTS). Живой стрим, дописывающий ход после DELETE /webhook/profile,
+    // не должен воскрешать строки истории (и ссылки на файлы) для удалённого
+    // поколения. userId — ПОСЛЕДНИЙ параметр: позиции content/tokens, на
+    // которые смотрят существующие спеки, не меняются.
     await this.pg.query(
       `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
-       VALUES ($1, 'human', $2, $3, 'text')`,
-      [sessionId, agentNum, userMsg],
+       SELECT $1, 'human', $2, $3, 'text'
+       WHERE EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $4 AND u.state = 'active')`,
+      [sessionId, agentNum, userMsg, userId],
     );
   }
 
   private async saveAssistantMessageRow(userId: string, agentId: string, assistantMsg: string, tokensUsed = 0, sessionIdOverride?: string) {
     const sessionId = sessionIdOverride || `${userId}_${agentId}`;
     const agentNum = /^\d+$/.test(agentId) ? parseInt(agentId, 10) : null;
+    // Gate — как в saveUserMessageRow (Task 11).
     await this.pg.query(
       `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
-       VALUES ($1, 'ai', $2, $3, 'text', $4)`,
-      [sessionId, agentNum, assistantMsg, tokensUsed],
+       SELECT $1, 'ai', $2, $3, 'text', $4
+       WHERE EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $5 AND u.state = 'active')`,
+      [sessionId, agentNum, assistantMsg, tokensUsed, userId],
     );
   }
 

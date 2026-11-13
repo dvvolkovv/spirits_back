@@ -380,8 +380,12 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
 
   private async tick() {
     await this.expireStaleJobs();
+    // Task 11: EXISTS-гейт на активный аккаунт — задача удалённого поколения
+    // не опрашивается (Omni/Veo — платные запросы) и не обновляется.
     const res = await this.pg.query(
-      `SELECT * FROM video_jobs WHERE status='processing' ORDER BY updated_at ASC LIMIT 20`,
+      `SELECT * FROM video_jobs WHERE status='processing'
+        AND EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = video_jobs.user_id AND u.state = 'active')
+        ORDER BY updated_at ASC LIMIT 20`,
     );
     const jobs = (res.rows as VideoJobRow[]).filter((job) => !this.polling.has(job.id));
     await Promise.all(

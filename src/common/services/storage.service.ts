@@ -107,6 +107,33 @@ export class StorageService implements OnModuleInit {
     );
   }
 
+  /**
+   * Удаление с подтверждённым исходом (account-deletion, Task 11):
+   * 'deleted' — MinIO принял удаление; 'absent' — объекта уже нет
+   * (NotFound/NoSuchKey/404), что для очистки тоже успех (идемпотентно).
+   * Любая прочая ошибка — наружу: пёрж обязан отличать «объекта нет» от
+   * «запрос не прошёл», иначе retry потеряет объект. NoSuchBucket не
+   * считается отсутствием объекта: это рассогласование конфигурации.
+   */
+  async deleteConfirmed(input: DeleteInput): Promise<'deleted' | 'absent'> {
+    try {
+      await this.s3.send(
+        new DeleteObjectCommand({ Bucket: input.bucket, Key: input.key }),
+      );
+      return 'deleted';
+    } catch (e: any) {
+      if (e?.name === 'NoSuchBucket') throw e;
+      if (
+        e?.name === 'NotFound'
+        || e?.name === 'NoSuchKey'
+        || e?.$metadata?.httpStatusCode === 404
+      ) {
+        return 'absent';
+      }
+      throw e;
+    }
+  }
+
   async list(input: ListInput): Promise<string[]> {
     const res = await this.s3.send(
       new ListObjectsV2Command({

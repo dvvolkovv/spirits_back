@@ -20,11 +20,13 @@ import { CostGrowthService } from '../cost-growth/cost-growth.service';
 import { ProductsModule } from '../products/products.module';
 import { ActionPlansController } from './action-plans/action-plans.controller';
 import { ActionPlansService } from './action-plans/action-plans.service';
+import { AccountDeletionModule } from '../account-deletion/account-deletion.module';
+import { ChatFileAccountDeletionAdapter } from './chat-files/chat-file-account-deletion.adapter';
 
 @Module({
-  imports: [MiscModule, CommonModule, RoomModule, VideoModule, CalendarModule, TalerIdModule, SpeechModule, TokensModule, HumanDesignModule, ProductsModule],
+  imports: [MiscModule, CommonModule, RoomModule, VideoModule, CalendarModule, TalerIdModule, SpeechModule, TokensModule, HumanDesignModule, ProductsModule, AccountDeletionModule],
   controllers: [ChatController, ChatFilesController, ChatThumbController, ActionPlansController],
-  providers: [ChatService, ChatToolsService, ChatFileStore, ChatFilesService, ThumbnailService, CostGrowthService, ActionPlansService],
+  providers: [ChatService, ChatToolsService, ChatFileStore, ChatFilesService, ThumbnailService, CostGrowthService, ActionPlansService, ChatFileAccountDeletionAdapter],
   exports: [ChatToolsService, ChatService, ChatFilesService],
 })
 export class ChatModule {}

@@ -246,15 +246,30 @@ export class VoiceAvatarService implements OnModuleInit {
 
   private async profileAndClone(userId: string, mp3: Buffer): Promise<void> {
     if (!this.pg) return;
+    // Task 11: strict active check ДО provider-вызовов — удалённому аккаунту
+    // клон ElevenLabs не создаётся (платный внешний ресурс, который Task 14
+    // ищет по строке user_voice; строки у удалённого поколения не будет).
+    // Это не ошибка: markFailed писал бы error_message для аккаунта, которого нет.
+    const active = await this.pg.query(
+      `SELECT 1 FROM user_id WHERE internal_id = $1 AND state = 'active'`,
+      [userId],
+    );
+    if ((active.rowCount ?? active.rows?.length ?? 0) === 0) {
+      this.logger.log(`profileAndClone skipped for ${userId}: account not active`);
+      return;
+    }
     try {
       const descriptor = await this.profile(mp3);
       // Имя — без id пользователя (voice-name.ts); связь — по voice_id ниже.
       const voiceId = await this.clone(mp3, cloneVoiceName());
+      // EXISTS-гейт: аккаунт мог быть удалён, пока шло профилирование/клон —
+      // строка удалённого поколения не пишется (и не помечается проваленной).
       await this.pg.query(
         `UPDATE user_voice
             SET status='ready', elevenlabs_voice_id=$2, voice_descriptor=$3,
                 error_message=NULL, updated_at=now()
-          WHERE user_id=$1`,
+          WHERE user_id=$1
+            AND EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $1 AND u.state = 'active')`,
         [userId, voiceId, JSON.stringify(descriptor)],
       );
       this.logger.log(`voice ready for ${userId} (voice ${voiceId})`);
