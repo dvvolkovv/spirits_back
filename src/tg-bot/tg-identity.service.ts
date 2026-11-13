@@ -70,17 +70,41 @@ export class TgIdentityService {
         throw new BadRequestException('invalid or expired auth token');
       }
       const ownerId = r.rows[0].owner_user_id;
-      await client.query(`UPDATE tg_claim_tokens SET consumed_at = now() WHERE token = $1`, [token]);
+      const ownerLock = await client.query(
+        `SELECT 1 FROM user_id WHERE internal_id=$1 AND state='active' FOR UPDATE`,
+        [ownerId],
+      );
+      if (ownerLock.rows.length === 0) {
+        throw new BadRequestException('invalid or expired auth token');
+      }
+      const consumed = await client.query(
+        `UPDATE tg_claim_tokens t SET consumed_at=now()
+         WHERE t.token=$1 AND t.consumed_at IS NULL
+           AND EXISTS (
+             SELECT 1 FROM user_id u
+             WHERE u.internal_id=t.owner_user_id AND u.state='active'
+           )`,
+        [token],
+      );
+      if (consumed.rowCount !== 1) {
+        throw new BadRequestException('invalid or expired auth token');
+      }
       try {
-        await client.query(
+        const linked = await client.query(
           `INSERT INTO tg_user_identities (linkeon_user_id, tg_user_id, tg_username, tg_first_name)
-           VALUES ($1, $2, $3, $4)
+           SELECT $1, $2, $3, $4
+           WHERE EXISTS (
+             SELECT 1 FROM user_id u WHERE u.internal_id=$1 AND u.state='active'
+           )
            ON CONFLICT (linkeon_user_id) DO UPDATE SET
              tg_user_id = EXCLUDED.tg_user_id,
              tg_username = EXCLUDED.tg_username,
              tg_first_name = EXCLUDED.tg_first_name`,
           [ownerId, tgUserId, tgUsername, tgFirstName],
         );
+        if (linked.rowCount !== 1) {
+          throw new BadRequestException('invalid or expired auth token');
+        }
       } catch (e: any) {
         // ON CONFLICT закрывает только linkeon_user_id, поэтому 23505 здесь —
         // это UNIQUE на tg_user_id: Telegram занят другим аккаунтом Linkeon.

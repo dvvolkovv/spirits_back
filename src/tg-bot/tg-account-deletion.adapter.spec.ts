@@ -318,7 +318,7 @@ describe('TgAccountDeletionAdapter stop', () => {
     const db = new FakeDeletionDb();
     db.users.set(account.userId, { state: 'deleted', deletionId });
     db.users.set('u-neighbor', { state: 'active', deletionId: null });
-    db.configs = [ownConfig(), ownConfig({ id: 'cfg-neighbor', owner_user_id: 'u-neighbor', custom_agent_id: null })];
+    db.configs = [ownConfig(), ownConfig({ id: 'cfg-neighbor', owner_user_id: 'u-neighbor', tg_chat_id: '-100201', custom_agent_id: null })];
     db.claimTokens = [
       { token: 'own-auth', owner_user_id: account.userId, consumed_at: null },
       { token: 'neighbor-auth', owner_user_id: 'u-neighbor', consumed_at: null },
