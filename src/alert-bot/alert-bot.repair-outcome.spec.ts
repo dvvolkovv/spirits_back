@@ -21,7 +21,7 @@ describe('repair outcome', () => {
     { jobs: [exec('1', true, 'interrupted')], model: 'completed' as const, status: 'interrupted' },
     { jobs: [exec('1'), verify('2', 1), verify('3')], model: 'completed' as const, status: 'verified' },
     { jobs: [exec('1', true, 'interrupted'), verify('2')], model: 'completed' as const, status: 'verified' },
-    { jobs: [exec('1'), verify('2'), exec('3', false)], model: 'completed' as const, status: 'verified' },
+    { jobs: [exec('1'), verify('2'), exec('3', false)], model: 'completed' as const, status: 'unverified' },
     { jobs: [exec('1', true, 'running')], model: 'cancelled' as const, status: 'interrupted' },
   ])('$status', ({ jobs, model, status }) => {
     expect(deriveRepairOutcome(jobs, model).status).toBe(status);
@@ -39,9 +39,14 @@ describe('repair outcome', () => {
     expect(mutating.mutationCount).toBe(1);
     expect(repairStatusText(mutating.status, mutating.mutationCount)).toBe('Исправлено и проверено');
 
+    // mutates:false не уменьшает mutationCount: флаг задаёт модель и не влияет на исход
     const nonMutating = deriveRepairOutcome([exec('1', false), verify('2')], 'completed');
-    expect(nonMutating.mutationCount).toBe(0);
-    expect(repairStatusText(nonMutating.status, nonMutating.mutationCount)).toBe('Проверено: исправление не потребовалось');
+    expect(nonMutating.mutationCount).toBe(1);
+    expect(repairStatusText(nonMutating.status, nonMutating.mutationCount)).toBe('Исправлено и проверено');
+
+    const noExec = deriveRepairOutcome([verify('1')], 'completed');
+    expect(noExec.mutationCount).toBe(0);
+    expect(repairStatusText(noExec.status, noExec.mutationCount)).toBe('Проверено: исправление не потребовалось');
 
     const failedExec = deriveRepairOutcome([exec('1', true, 'failed')], 'completed');
     expect(failedExec.mutationCount).toBe(1);
@@ -52,6 +57,23 @@ describe('repair outcome', () => {
     const remote = { ...exec('1', true, 'running'), host: 'relay' };
     expect(deriveRepairOutcome([remote], 'cancelled')).toEqual({ status: 'interrupted', mutationCount: 1 });
     expect(deriveRepairOutcome([exec('1'), verify('2')], 'cancelled').status).toBe('cancelled');
+  });
+
+  it('exec с mutates:false после успешного verify не даёт ложного verified', () => {
+    const outcome = deriveRepairOutcome([exec('1', false), verify('2'), exec('3', false)], 'completed');
+    expect(outcome.status).toBe('unverified');
+  });
+
+  it('verified требует успешного verify после последнего exec любого вида, mutates информационный', () => {
+    expect(deriveRepairOutcome([exec('1', false), verify('2')], 'completed').status).toBe('verified');
+    expect(deriveRepairOutcome([verify('1'), exec('2', false)], 'completed').status).toBe('unverified');
+  });
+
+  it('mutationCount считает все exec jobs: «исправление не потребовалось» только когда exec не было вовсе', () => {
+    expect(deriveRepairOutcome([exec('1', false), verify('2')], 'completed')).toEqual({ status: 'verified', mutationCount: 1 });
+    expect(deriveRepairOutcome([verify('1')], 'completed')).toEqual({ status: 'verified', mutationCount: 0 });
+    expect(repairStatusText('verified', 1)).toBe('Исправлено и проверено');
+    expect(repairStatusText('verified', 0)).toBe('Проверено: исправление не потребовалось');
   });
 
   it.each(['remote_outcome_unknown', 'process_close_unconfirmed'])('%s не исчезает после late admin stop', (failureKind) => {
