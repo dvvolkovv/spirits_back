@@ -99,14 +99,15 @@ describe('ProductAccountDeletionAdapter', () => {
     await expect(adapter.execute(job(), ctx)).resolves.toBeUndefined();
   });
 
-  it('resourceTypes не включает Task 8 purge, registry регистрируется один раз', () => {
+  it('resourceTypes включает stop и purge, registry регистрируется один раз', () => {
     const { adapter, registry } = harness();
-    expect(adapter.resourceTypes).toEqual(['product.stop']);
+    expect(adapter.resourceTypes).toEqual(['product.stop', 'product.purge']);
     const register = jest.spyOn(registry, 'register');
     adapter.onModuleInit();
     expect(register).toHaveBeenCalledTimes(1);
     expect(register).toHaveBeenCalledWith(adapter);
     expect(registry.getExecutor('product.stop')).toBe(adapter);
+    expect(registry.getExecutor('product.purge')).toBe(adapter);
   });
 
   it('adapter/service не импортируют прямой host runner, а BlockService делит forced-stop helper', () => {
@@ -130,5 +131,126 @@ describe('ProductAccountDeletionAdapter', () => {
     const moduleSource = readFileSync(`${__dirname}/products.module.ts`, 'utf8');
     expect(moduleSource).not.toContain('assertReady');
     expect(moduleSource).not.toContain('AccountDeletionRunner');
+  });
+});
+
+/**
+ * Task 8 — product.purge: матриса ветвей fail-closed на моках фасада
+ * (ProductAccountDeletionService). Полные потоки против живой базы —
+ * product-account-deletion.pg.spec.ts; здесь только диспетчеризация и ветви.
+ */
+describe('ProductAccountDeletionAdapter — product.purge', () => {
+  const PURGED_AT = new Date('2026-11-10T00:00:00.000Z');
+
+  function purgeHarness(
+    state: { owned: boolean; purgedAt: Date | null; repoUrl: string | null } | null,
+    opts: { cleared?: boolean; deleted?: boolean } = {},
+  ) {
+    const products = {
+      stop: jest.fn(async () => 'done'),
+      wipeExpiredForProduct: jest.fn(async () => 0),
+      queuePurgeForProduct: jest.fn(async () => 1),
+      purgeState: jest.fn(async () => state),
+      removeBackupForProduct: jest.fn(async () => 0),
+      backupCleared: jest.fn(async () => opts.cleared ?? true),
+      deletePurgedProduct: jest.fn(async () => opts.deleted ?? true),
+    };
+    const registry = new AccountDeletionRegistry();
+    const adapter = new ProductAccountDeletionAdapter(products as any, registry);
+    const ctx = {
+      db: { query: jest.fn() },
+      assertCurrent: jest.fn(async () => undefined),
+    };
+    return { adapter, products, ctx };
+  }
+
+  function purgeRow(overrides: Partial<DeletionJobRow> = {}): DeletionJobRow {
+    return {
+      ...job(),
+      id: '99999999-9999-4999-8999-999999999999',
+      resourceType: 'product.purge',
+      phase: 'purge',
+      ...overrides,
+    };
+  }
+
+  it('purge не подтверждён (purged_at null) — fail-closed retry, удаления нет, payload цел', async () => {
+    const { adapter, products, ctx } = purgeHarness({ owned: true, purgedAt: null, repoUrl: null });
+    const value = purgeRow();
+    const payload = JSON.parse(JSON.stringify(value.payload));
+
+    await expect(adapter.execute(value, ctx)).rejects.toEqual(new DeletionRetryError('external_unknown'));
+
+    expect(products.wipeExpiredForProduct).toHaveBeenCalledWith(PRODUCT_ID, 'u-deleted');
+    expect(products.queuePurgeForProduct).toHaveBeenCalledWith(PRODUCT_ID, 'u-deleted');
+    expect(products.removeBackupForProduct).not.toHaveBeenCalled();
+    expect(products.deletePurgedProduct).not.toHaveBeenCalled();
+    expect(value.payload).toEqual(payload);
+  });
+
+  it('подтверждённый purge — scoped-шаги по порядку, assertCurrent между ними, удаление последним', async () => {
+    const { adapter, products, ctx } = purgeHarness({ owned: true, purgedAt: PURGED_AT, repoUrl: null });
+
+    await expect(adapter.execute(purgeRow(), ctx)).resolves.toBeUndefined();
+
+    expect(ctx.assertCurrent).toHaveBeenCalledTimes(4);
+    expect(products.deletePurgedProduct).toHaveBeenCalledWith(PRODUCT_ID, 'u-deleted', DELETION_ID);
+    // Без repo_url факт стирания копии не спрашивается.
+    expect(products.backupCleared).not.toHaveBeenCalled();
+    const order = [
+      products.wipeExpiredForProduct,
+      products.queuePurgeForProduct,
+      products.purgeState,
+      products.removeBackupForProduct,
+      products.deletePurgedProduct,
+    ].map((fn) => fn.mock.invocationCallOrder[0]);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+  });
+
+  it('строка продукта уже отсутствует — подтверждённый успех без удаления (идемпотентность)', async () => {
+    const { adapter, products, ctx } = purgeHarness(null);
+
+    await expect(adapter.execute(purgeRow(), ctx)).resolves.toBeUndefined();
+
+    expect(products.removeBackupForProduct).not.toHaveBeenCalled();
+    expect(products.deletePurgedProduct).not.toHaveBeenCalled();
+  });
+
+  it('чужой продукт (owned=false) — fail-closed, удаления нет', async () => {
+    const { adapter, products, ctx } = purgeHarness({ owned: false, purgedAt: PURGED_AT, repoUrl: null });
+
+    await expect(adapter.execute(purgeRow(), ctx)).rejects.toEqual(new DeletionRetryError('external_unknown'));
+
+    expect(products.deletePurgedProduct).not.toHaveBeenCalled();
+  });
+
+  it('резервная копия не стёрта — retry, строка переживает attempt', async () => {
+    const { adapter, products, ctx } = purgeHarness(
+      { owned: true, purgedAt: PURGED_AT, repoUrl: 'backup@10.0.0.1:/x/slug-1.git' },
+      { cleared: false },
+    );
+
+    await expect(adapter.execute(purgeRow(), ctx)).rejects.toEqual(new DeletionRetryError('external_unknown'));
+
+    expect(products.removeBackupForProduct).toHaveBeenCalledWith(PRODUCT_ID, 'u-deleted');
+    expect(products.backupCleared).toHaveBeenCalledWith(PRODUCT_ID, 'u-deleted');
+    expect(products.deletePurgedProduct).not.toHaveBeenCalled();
+  });
+
+  it('deletePurgedProduct отказал (стражи не прошли) — retry, а не успех', async () => {
+    const { adapter, products, ctx } = purgeHarness(
+      { owned: true, purgedAt: PURGED_AT, repoUrl: null },
+      { deleted: false },
+    );
+
+    await expect(adapter.execute(purgeRow(), ctx)).rejects.toEqual(new DeletionRetryError('external_unknown'));
+
+    expect(products.deletePurgedProduct).toHaveBeenCalled();
+  });
+
+  it('неизвестный resourceType — по-прежнему ошибка диспетчеризации', async () => {
+    const { adapter, ctx } = purgeHarness(null);
+    await expect(adapter.execute(purgeRow({ resourceType: 'telegram.purge' }), ctx)).rejects
+      .toThrow('unsupported_deletion_resource');
   });
 });

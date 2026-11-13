@@ -1,5 +1,6 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { NotFoundException } from '@nestjs/common';
 import { Pool } from 'pg';
@@ -26,6 +27,15 @@ const NEIGHBOR_ID = '44444444-4444-4444-8444-444444444444';
 const DELETION_ID = '11111111-1111-4111-8111-111111111111';
 const OLD_DELETION_ID = '55555555-5555-4555-8555-555555555555';
 const OTHER_DELETION_ID = '66666666-6666-4666-8666-666666666666';
+/**
+ * Аккаунт для purge-тестов удалён раньше, чем DELETED_AT: срок хранения
+ * (deleted_at + 30 дней) уже вышел, и продукт «archived и в срок» — тот же
+ * предикат, по которому отбирает обход product-purge.service.ts.
+ */
+const PURGE_DELETED_AT = new Date('2026-10-01T00:00:00.000Z');
+const PURGE_AFTER_DUE = new Date(PURGE_DELETED_AT.getTime() + 30 * 86_400_000);
+const PURGE_PRODUCT_ID = '77777777-7777-4777-8777-777777777777';
+const OTHER_PURGE_PRODUCT_ID = '88888888-8888-4888-8888-888888888888';
 const sha = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
 
 maybe('product account deletion против живого Postgres', () => {
@@ -37,10 +47,18 @@ maybe('product account deletion против живого Postgres', () => {
     getClient: () => Promise<any>;
   };
   let lifecycle: ProductLifecycleService;
+  let provisioning: ProvisioningService;
   let turns: TurnsService;
   let misc: { checkTokenBalance: jest.Mock; deductTokens: jest.Mock };
   let service: ProductAccountDeletionService;
   let adapter: ProductAccountDeletionAdapter;
+  /**
+   * Корень резервных копий на тест — приём из product-purge.pg.spec.ts:
+   * настоящий путь временного каталога (на macOS os.tmpdir() — /var/…, а на
+   * деле /private/var/…, и сверка корня realpath знак в знак отказала бы).
+   */
+  const TMP_ROOT = fs.realpathSync(os.tmpdir());
+  let tmp: string;
 
   beforeAll(async () => {
     pool = new Pool({ connectionString: PG, max: 8 });
@@ -81,6 +99,8 @@ maybe('product account deletion против живого Postgres', () => {
   // бы на CTE каждого следующего теста (так M-6 терял свой done-sleep).
   afterEach(() => {
     jest.restoreAllMocks();
+    delete process.env.PRODUCT_REPOS_DIR;
+    if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
   });
 
   beforeEach(async () => {
@@ -91,9 +111,14 @@ maybe('product account deletion против живого Postgres', () => {
        VALUES ('host-shared', 'root@10.50.0.1', '10.50.0.1', 'c.linkeon.io', $1, 20, 'clients')`,
       [sha('host-shared-agent-fixture')],
     );
+    // Каталог резервных копий на тест: scoped-стирание копии проверяется по
+    // настоящей ФС (backupPathFor + realpath-страховки product-purge.service).
+    tmp = fs.mkdtempSync(path.join(TMP_ROOT, 'acct-del-purge-'));
+    process.env.PRODUCT_REPOS_DIR = path.join(tmp, 'product-repos');
+    fs.mkdirSync(process.env.PRODUCT_REPOS_DIR);
 
     const secrets = new SecretsService({ get: (key: string) => key === 'PRODUCT_SECRETS_KEY' ? KEY : undefined } as any);
-    const provisioning = new ProvisioningService(
+    provisioning = new ProvisioningService(
       pg as any,
       secrets,
       new HostsService(pg as any),
@@ -222,6 +247,126 @@ maybe('product account deletion против живого Postgres', () => {
     const result = await pool.query(
       `SELECT id,status,error FROM product_provision_jobs
        WHERE product_id=$1 AND kind='sleep' ORDER BY created_at DESC,id DESC LIMIT 1`,
+      [productId],
+    );
+    return result.rows[0];
+  }
+
+  // ---- product.purge: фикстуры и запросы Task 8 ----
+
+  function purgeJob(overrides: Partial<DeletionJobRow> = {}): DeletionJobRow {
+    return {
+      id: crypto.randomUUID(),
+      deletionId: DELETION_ID,
+      userId: 'u-deleted',
+      resourceType: 'product.purge',
+      resourceKey: PURGE_PRODUCT_ID,
+      phase: 'purge',
+      payload: { productId: PURGE_PRODUCT_ID, slug: 'slug-1', hostId: 'host-shared' },
+      status: 'running',
+      attempts: 1,
+      nextAttemptAt: PURGE_AFTER_DUE,
+      leaseUntil: new Date(Date.now() + 300_000),
+      lastErrorKind: null,
+      ...overrides,
+    };
+  }
+
+  /** Архивный продукт аккаунта, у которого срок хранения (PURGE_DELETED_AT + 30 дней) уже вышел. */
+  async function seedArchivedDueProduct(
+    productId: string,
+    userId: string,
+    hostId: string,
+    deletionId: string,
+    slug: string,
+  ): Promise<void> {
+    await seedAccount(userId, deletionId, 'deleted', PURGE_DELETED_AT);
+    await seedProduct({
+      id: productId,
+      userId,
+      status: 'archived',
+      slug,
+      hostId,
+      archivedAt: PURGE_DELETED_AT,
+      purgeAfter: PURGE_AFTER_DUE,
+    });
+  }
+
+  /** Purge-задание уже забрано агентом машины: исход для сервера неизвестен. */
+  async function seedPurgeRunning(productId: string): Promise<string> {
+    const result = await pool.query(
+      `INSERT INTO product_provision_jobs (product_id,kind,status,started_at)
+       VALUES ($1,'purge','running',now()) RETURNING id`,
+      [productId],
+    );
+    return result.rows[0].id;
+  }
+
+  async function seedAction(productId: string, userId: string): Promise<string> {
+    const result = await pool.query(
+      `INSERT INTO product_actions (user_id,product_id,kind,status,channel,payload,result,resolved_at)
+       VALUES ($1,$2,'create_site','done','web','{"name":"П"}'::jsonb,'{}'::jsonb,now()) RETURNING id`,
+      [userId, productId],
+    );
+    return result.rows[0].id;
+  }
+
+  async function seedDomain(productId: string, slug: string): Promise<void> {
+    await pool.query(
+      `INSERT INTO product_domains (product_id,domain,names,token,status)
+       VALUES ($1,$2,$3,'t','active')`,
+      [productId, `${slug}.c.linkeon.io`, `{${slug}.c.linkeon.io}`],
+    );
+  }
+
+  /**
+   * Подтверждение агентом машины — pull-модель: queued-задание purge уходит
+   * агенту (running + started_at), и он отчитывается успехом через
+   * существующий путь completeJob → completePurgeJob: именно он ставит
+   * purged_at в проде. Никакого SSH/runner — только строка задания и отчёт.
+   */
+  async function reportHostPurgeSuccess(productId: string): Promise<void> {
+    const claimed = await pool.query(
+      `UPDATE product_provision_jobs SET status='running',started_at=now()
+        WHERE product_id=$1 AND kind='purge' AND status='queued'
+       RETURNING id`,
+      [productId],
+    );
+    if (!claimed.rows[0]) throw new Error('нет queued purge-задания — отчёт хоста некому принять');
+    await provisioning.completeJob(claimed.rows[0].id, { ok: true });
+  }
+
+  async function activeJobKind(productId: string): Promise<string | null> {
+    const result = await pool.query(
+      `SELECT kind FROM product_provision_jobs
+        WHERE product_id=$1 AND status IN ('queued','running')
+        ORDER BY created_at DESC,id DESC LIMIT 1`,
+      [productId],
+    );
+    return result.rows[0]?.kind ?? null;
+  }
+
+  async function productExists(productId: string): Promise<boolean> {
+    const result = await pool.query(`SELECT 1 FROM products WHERE id=$1`, [productId]);
+    return result.rows.length > 0;
+  }
+
+  async function hostExists(hostId: string): Promise<boolean> {
+    const result = await pool.query(`SELECT 1 FROM product_hosts WHERE id=$1`, [hostId]);
+    return result.rows.length > 0;
+  }
+
+  async function turnsActionsJobsDomains(productId: string): Promise<{
+    turns: number;
+    actions: number;
+    jobs: number;
+    domains: number;
+  }> {
+    const result = await pool.query(
+      `SELECT (SELECT count(*)::int FROM product_turns WHERE product_id=$1) AS turns,
+              (SELECT count(*)::int FROM product_actions WHERE product_id=$1) AS actions,
+              (SELECT count(*)::int FROM product_provision_jobs WHERE product_id=$1) AS jobs,
+              (SELECT count(*)::int FROM product_domains WHERE product_id=$1) AS domains`,
       [productId],
     );
     return result.rows[0];
@@ -505,5 +650,114 @@ maybe('product account deletion против живого Postgres', () => {
     expect((await latestSleep()).id).toBe(sleepId);
     expect((await latestSleep()).status).toBe('done');
     expect((await pool.query(`SELECT count(*)::int AS n FROM product_provision_jobs WHERE product_id=$1 AND kind='sleep'`, [PRODUCT_ID])).rows[0].n).toBe(1);
+  });
+
+  it('queued/running purge не удаляет relational rows; confirmed purge удаляет только свой продукт', async () => {
+    await seedArchivedDueProduct(PURGE_PRODUCT_ID, 'u-deleted', 'host-shared', DELETION_ID, 'slug-1');
+    await seedArchivedDueProduct(OTHER_PURGE_PRODUCT_ID, 'u-other', 'host-shared', OTHER_DELETION_ID, 'slug-2');
+    await seedTurn(PURGE_PRODUCT_ID, 'u-deleted', 'done');
+    await seedTurn(OTHER_PURGE_PRODUCT_ID, 'u-other', 'done');
+    await seedJob(PURGE_PRODUCT_ID, 'done', 'provision');
+    await seedJob(OTHER_PURGE_PRODUCT_ID, 'done', 'provision');
+    await seedAction(PURGE_PRODUCT_ID, 'u-deleted');
+    await seedAction(OTHER_PURGE_PRODUCT_ID, 'u-other');
+    await seedDomain(PURGE_PRODUCT_ID, 'slug-1');
+    await seedDomain(OTHER_PURGE_PRODUCT_ID, 'slug-2');
+    const value = purgeJob();
+    const payload = JSON.parse(JSON.stringify(value.payload));
+
+    // Первый attempt: purge только поставлен агенту машины (pull-модель) —
+    // исход НЕ подтверждён, всё relational остаётся на месте.
+    await expect(adapter.execute(value, execution())).rejects.toMatchObject({ kind: 'external_unknown' });
+    expect(await activeJobKind(PURGE_PRODUCT_ID)).toBe('purge');
+    expect(await productExists(PURGE_PRODUCT_ID)).toBe(true);
+    expect(await turnsActionsJobsDomains(PURGE_PRODUCT_ID)).toEqual({ turns: 1, actions: 1, jobs: 2, domains: 1 });
+    expect(value.payload).toEqual(payload);
+
+    // Агент машины подтвердил стирание (purged_at) — только тогда relational
+    // cleanup, и только своего продукта: сосед, хост и его задания выживают.
+    await reportHostPurgeSuccess(PURGE_PRODUCT_ID);
+    await expect(adapter.execute(value, execution())).resolves.toBeUndefined();
+
+    expect(await productExists(PURGE_PRODUCT_ID)).toBe(false);
+    expect(await turnsActionsJobsDomains(PURGE_PRODUCT_ID)).toEqual({ turns: 0, actions: 0, jobs: 0, domains: 0 });
+    expect(await productExists(OTHER_PURGE_PRODUCT_ID)).toBe(true);
+    expect(await turnsActionsJobsDomains(OTHER_PURGE_PRODUCT_ID)).toEqual({ turns: 1, actions: 1, jobs: 1, domains: 1 });
+    expect(await hostExists('host-shared')).toBe(true);
+    expect(value.payload).toEqual(payload);
+  });
+
+  it('неизвестный host исход оставляет slug/host/purge job', async () => {
+    await seedArchivedDueProduct(PURGE_PRODUCT_ID, 'u-deleted', 'host-shared', DELETION_ID, 'slug-1');
+    const runningId = await seedPurgeRunning(PURGE_PRODUCT_ID);
+    const value = purgeJob();
+
+    await expect(adapter.execute(value, execution())).rejects.toMatchObject({ kind: 'external_unknown' });
+
+    expect(value.payload).toEqual({ productId: PURGE_PRODUCT_ID, slug: 'slug-1', hostId: 'host-shared' });
+    expect(await productExists(PURGE_PRODUCT_ID)).toBe(true);
+    expect((await pool.query(`SELECT slug,host_id FROM products WHERE id=$1`, [PURGE_PRODUCT_ID])).rows[0])
+      .toEqual({ slug: 'slug-1', host_id: 'host-shared' });
+    // Дубль задания не ставится: running-задание агента остаётся единственной строкой purge.
+    expect((await pool.query(`SELECT id,status FROM product_provision_jobs WHERE product_id=$1 AND kind='purge'`, [PURGE_PRODUCT_ID])).rows)
+      .toEqual([{ id: runningId, status: 'running' }]);
+  });
+
+  it('подтверждённый purge стирает резервную копию до удаления строки; чужой каталог цел', async () => {
+    const root = process.env.PRODUCT_REPOS_DIR!;
+    await seedArchivedDueProduct(PURGE_PRODUCT_ID, 'u-deleted', 'host-shared', DELETION_ID, 'slug-1');
+    await pool.query(`UPDATE products SET repo_url=$2 WHERE id=$1`, [PURGE_PRODUCT_ID, `backup@10.0.0.1:${root}/slug-1.git`]);
+    fs.mkdirSync(path.join(root, 'slug-1.git'));
+    fs.writeFileSync(path.join(root, 'slug-1.git', 'HEAD'), 'ref: refs/heads/master\n');
+    // Каталог копии другого продукта обязан пережить стирание.
+    fs.mkdirSync(path.join(root, 'slug-2.git'));
+    const value = purgeJob();
+
+    // Не подтверждено — резервная копия не трогается.
+    await expect(adapter.execute(value, execution())).rejects.toMatchObject({ kind: 'external_unknown' });
+    expect(fs.existsSync(path.join(root, 'slug-1.git'))).toBe(true);
+
+    await reportHostPurgeSuccess(PURGE_PRODUCT_ID);
+    await expect(adapter.execute(value, execution())).resolves.toBeUndefined();
+
+    expect(await productExists(PURGE_PRODUCT_ID)).toBe(false);
+    expect(fs.existsSync(path.join(root, 'slug-1.git'))).toBe(false);
+    expect(fs.existsSync(path.join(root, 'slug-2.git'))).toBe(true);
+  });
+
+  it('копия не на этой машине — строка продукта НЕ удаляется, fail-closed retry', async () => {
+    await seedArchivedDueProduct(PURGE_PRODUCT_ID, 'u-deleted', 'host-shared', DELETION_ID, 'slug-1');
+    const foreign = 'backup@10.0.0.1:/somewhere/else/slug-1.git';
+    await pool.query(`UPDATE products SET repo_url=$2 WHERE id=$1`, [PURGE_PRODUCT_ID, foreign]);
+    const value = purgeJob();
+    await expect(adapter.execute(value, execution())).rejects.toMatchObject({ kind: 'external_unknown' });
+    await reportHostPurgeSuccess(PURGE_PRODUCT_ID);
+
+    // repo_url указывает не на нашу машину — «стереть руками»: удаление строки
+    // заблокировано, пока копия не исчезнет (fail-closed).
+    await expect(adapter.execute(value, execution())).rejects.toMatchObject({ kind: 'external_unknown' });
+
+    const row = await pool.query(`SELECT purged_at IS NOT NULL AS purged,repo_url FROM products WHERE id=$1`, [PURGE_PRODUCT_ID]);
+    expect(row.rows[0]).toEqual({ purged: true, repo_url: foreign });
+  });
+
+  it('ревью: чужой purged-продукт — stop fail-closed, строка не тронута', async () => {
+    await seedAccount('u-deleted', DELETION_ID);
+    await seedAccount('u-other', OTHER_DELETION_ID, 'active', null);
+    await seedProduct({
+      id: PRODUCT_ID,
+      userId: 'u-other',
+      status: 'archived',
+      slug: 'slug-1',
+      archivedAt: DELETED_AT,
+      purgeAfter: DELETED_AT,
+      purgedAt: DELETED_AT,
+    });
+
+    // purgedOrMissing требует СВОЙ user_id: чужой purged-продукт подтверждённым
+    // успехом не признаётся и остаётся fail-closed.
+    await expect(adapter.execute(stopJob(), execution())).rejects.toMatchObject({ kind: 'external_unknown' });
+    expect(await productExists(PRODUCT_ID)).toBe(true);
+    expect((await pool.query(`SELECT purged_at FROM products WHERE id=$1`, [PRODUCT_ID])).rows[0].purged_at).toEqual(DELETED_AT);
   });
 });
