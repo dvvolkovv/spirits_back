@@ -45,10 +45,17 @@ function harness(status: string | null = 'queued') {
 }
 
 describe('product account deletion discovery', () => {
-  it('создаёт только product.stop с техническими slug/host и owner+generation predicates', async () => {
+  const PURGED_ID = '66666666-6666-4666-8666-666666666666';
+
+  it('создаёт product.stop нестёртым и product.purge ВСЕМ продуктам поколения', async () => {
     const db = { query: jest.fn(async () => ({
-      rows: [{ id: PRODUCT_ID, slug: 'slug-1', host_id: 'host-shared' }],
-      rowCount: 1,
+      rows: [
+        { id: PRODUCT_ID, slug: 'slug-1', host_id: 'host-shared', purged_at: null },
+        // Уже стёрт штатным обходом до удаления аккаунта: stop не нужен,
+        // а строка и журнал должны чиститься — purge-job обязателен.
+        { id: PURGED_ID, slug: 'slug-2', host_id: null, purged_at: new Date('2026-10-15T00:00:00.000Z') },
+      ],
+      rowCount: 2,
     })) };
     const account = {
       userId: 'u-deleted',
@@ -59,12 +66,26 @@ describe('product account deletion discovery', () => {
     const plan = await discoverProductDeletion({ db, account, origin: 'merge' });
 
     expect(plan).toEqual({
-      jobs: [{
-        resourceType: 'product.stop',
-        resourceKey: PRODUCT_ID,
-        phase: 'immediate',
-        payload: { productId: PRODUCT_ID, slug: 'slug-1', hostId: 'host-shared' },
-      }],
+      jobs: [
+        {
+          resourceType: 'product.stop',
+          resourceKey: PRODUCT_ID,
+          phase: 'immediate',
+          payload: { productId: PRODUCT_ID, slug: 'slug-1', hostId: 'host-shared' },
+        },
+        {
+          resourceType: 'product.purge',
+          resourceKey: PRODUCT_ID,
+          phase: 'purge',
+          payload: { productId: PRODUCT_ID, slug: 'slug-1', hostId: 'host-shared' },
+        },
+        {
+          resourceType: 'product.purge',
+          resourceKey: PURGED_ID,
+          phase: 'purge',
+          payload: { productId: PURGED_ID, slug: 'slug-2', hostId: null },
+        },
+      ],
       skips: [],
     });
     expect(db.query).toHaveBeenCalledTimes(1);
@@ -72,6 +93,9 @@ describe('product account deletion discovery', () => {
     expect(sql).toContain('p.user_id=$1');
     expect(sql).toContain("u.state='deleted'");
     expect(sql).toContain('u.deletion_id=$2');
+    // Поколение отбирается БЕЗ фильтра purged_at — стёртые видны purge-ветке.
+    expect(sql).toContain('p.purged_at');
+    expect(sql).not.toMatch(/AND p\.purged_at IS NULL/);
     expect(params).toEqual(['u-deleted', DELETION_ID]);
     expect(DELETION_DISCOVERERS.filter((item) => item === discoverProductDeletion)).toHaveLength(1);
   });

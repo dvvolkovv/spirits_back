@@ -4,12 +4,20 @@ import * as os from 'os';
 import * as path from 'path';
 import { NotFoundException } from '@nestjs/common';
 import { Pool } from 'pg';
+import { AccountDeletionJobs } from '../account-deletion/account-deletion.jobs';
+import { AccountDeletionPlanner } from '../account-deletion/account-deletion.planner';
 import { AccountDeletionRegistry } from '../account-deletion/account-deletion.registry';
 import type { DeletionExecution, DeletionJobRow } from '../account-deletion/account-deletion.types';
 import { HostsService } from './hosts.service';
 import { LimitsService } from './limits.service';
-import { ProductAccountDeletionAdapter } from './product-account-deletion.adapter';
-import { ProductAccountDeletionService } from './product-account-deletion.service';
+import {
+  discoverProductDeletion,
+  ProductAccountDeletionAdapter,
+} from './product-account-deletion.adapter';
+import {
+  PRODUCT_DELETION_PURGE_DAYS,
+  ProductAccountDeletionService,
+} from './product-account-deletion.service';
 import { ProductActionsService } from './product-actions.service';
 import { ProductLifecycleService } from './product-lifecycle.service';
 import { ProductPurgeService } from './product-purge.service';
@@ -34,7 +42,9 @@ const OTHER_DELETION_ID = '66666666-6666-4666-8666-666666666666';
  * предикат, по которому отбирает обход product-purge.service.ts.
  */
 const PURGE_DELETED_AT = new Date('2026-10-01T00:00:00.000Z');
-const PURGE_AFTER_DUE = new Date(PURGE_DELETED_AT.getTime() + 30 * 86_400_000);
+const PURGE_AFTER_DUE = new Date(
+  PURGE_DELETED_AT.getTime() + PRODUCT_DELETION_PURGE_DAYS * 86_400_000,
+);
 const PURGE_PRODUCT_ID = '77777777-7777-4777-8777-777777777777';
 const OTHER_PURGE_PRODUCT_ID = '88888888-8888-4888-8888-888888888888';
 const sha = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
@@ -85,12 +95,19 @@ maybe('product account deletion против живого Postgres', () => {
       isadmin boolean DEFAULT false,
       tokens bigint DEFAULT 1000000 NOT NULL
     )`);
+    // Таблица заданий удаления и недостающие колонки user_id — для теста
+    // discovery/claim (миграция идемпотентна: user_id здесь уже с
+    // deleted_at/deletion_id, DO-блок их не пересоздаёт).
+    await pool.query(fs.readFileSync(
+      path.join(__dirname, '..', 'account-deletion', 'migrations', '001_account_deletion.sql'),
+      'utf8',
+    ));
     const count = await pool.query('SELECT count(*) FROM products');
     if (Number(count.rows[0].count) > 0) throw new Error('нужна свежая одноразовая база');
   });
 
   afterAll(async () => {
-    await pool?.query('TRUNCATE products, product_provision_jobs, product_turns, product_actions, product_hosts, user_id, ai_profiles_consolidated RESTART IDENTITY CASCADE');
+    await pool?.query('TRUNCATE products, product_provision_jobs, product_turns, product_actions, product_hosts, user_id, ai_profiles_consolidated, account_deletion_jobs RESTART IDENTITY CASCADE');
     await pool?.end();
   });
 
@@ -106,7 +123,7 @@ maybe('product account deletion против живого Postgres', () => {
 
   beforeEach(async () => {
     await pool.query('TRUNCATE products, product_provision_jobs, product_turns, product_actions, product_host_agent, product_hosts, product_user_limits RESTART IDENTITY CASCADE');
-    await pool.query('TRUNCATE user_id, ai_profiles_consolidated RESTART IDENTITY CASCADE');
+    await pool.query('TRUNCATE user_id, ai_profiles_consolidated, account_deletion_jobs RESTART IDENTITY CASCADE');
     await pool.query(
       `INSERT INTO product_hosts (id, ssh_target, public_ip, domain_suffix, agent_token_hash, capacity, audience)
        VALUES ('host-shared', 'root@10.50.0.1', '10.50.0.1', 'c.linkeon.io', $1, 20, 'clients')`,
@@ -762,5 +779,84 @@ maybe('product account deletion против живого Postgres', () => {
     await expect(adapter.execute(stopJob(), execution())).rejects.toMatchObject({ kind: 'external_unknown' });
     expect(await productExists(PRODUCT_ID)).toBe(true);
     expect((await pool.query(`SELECT purged_at FROM products WHERE id=$1`, [PRODUCT_ID])).rows[0].purged_at).toEqual(DELETED_AT);
+  });
+
+  it('discovery: стёртому штатным обходом продукту — единственный purge-job, claim не ждёт stop', async () => {
+    await seedAccount('u-deleted', DELETION_ID, 'deleted', PURGE_DELETED_AT);
+    await seedProduct({
+      id: PURGE_PRODUCT_ID,
+      userId: 'u-deleted',
+      status: 'archived',
+      slug: 'slug-1',
+      archivedAt: PURGE_DELETED_AT,
+      purgeAfter: PURGE_AFTER_DUE,
+      purgedAt: new Date('2026-10-20T00:00:00.000Z'),
+    });
+    await seedAction(PURGE_PRODUCT_ID, 'u-deleted');
+
+    const planner = new AccountDeletionPlanner([discoverProductDeletion]);
+    const account = { userId: 'u-deleted', deletionId: DELETION_ID, deletedAt: PURGE_DELETED_AT };
+    const plan = await planner.collect(pg, account, 'merge');
+
+    // Стёртому продукту stop-job не создаётся, purge-job — обязателен: его
+    // строка и журнал должны быть удалены после подтверждения поколения.
+    expect(plan.jobs.map((job) => [job.resourceType, job.resourceKey, job.phase])).toEqual([
+      ['account.core.purge', 'account', 'purge'],
+      ['product.purge', PURGE_PRODUCT_ID, 'purge'],
+    ]);
+
+    // Персистятся только продуктовые строки: account.core.purge с тем же runAt
+    // перехватил бы claimNext недетерминированно (ядро — не предмет теста).
+    await planner.persist(pg, account, {
+      jobs: plan.jobs.filter((job) => job.resourceType.startsWith('product.')),
+      skips: plan.skips,
+    });
+    const rows = await pool.query(
+      `SELECT resource_type,resource_key,phase,payload_jsonb,next_attempt_at FROM account_deletion_jobs`,
+    );
+    expect(rows.rows).toEqual([{
+      resource_type: 'product.purge',
+      resource_key: PURGE_PRODUCT_ID,
+      phase: 'purge',
+      payload_jsonb: { productId: PURGE_PRODUCT_ID, slug: 'slug-1', hostId: 'host-shared' },
+      // Planner относит purge на срок хранения: PURGE_DELETED_AT + 30 дней —
+      // численно тот же момент, что PURGE_AFTER_DUE.
+      next_attempt_at: PURGE_AFTER_DUE,
+    }]);
+
+    // DEADLOCK-проверка: зависимость sameResourceKey product.stop выражена
+    // NOT EXISTS — при отсутствии stop-строки она удовлетворена, и claimNext
+    // выдаёт purge, а не вечно ждёт несуществующий job.
+    const deletionJobs = new AccountDeletionJobs(pg);
+    const claimed = await deletionJobs.claimNext(DELETION_ID);
+    expect(claimed?.resourceType).toBe('product.purge');
+
+    // Настоящий assertCurrent координатора — вся цепочка до удаления строки.
+    await adapter.execute(claimed!, {
+      db: pg,
+      assertCurrent: (job) => deletionJobs.assertCurrent(job),
+    });
+
+    expect(await productExists(PURGE_PRODUCT_ID)).toBe(false);
+    expect(await turnsActionsJobsDomains(PURGE_PRODUCT_ID)).toEqual({ turns: 0, actions: 0, jobs: 0, domains: 0 });
+  });
+
+  it('M-1: живой repo_url у стёртого продукта — deletePurgedProduct отказывает, строка цела', async () => {
+    await seedArchivedDueProduct(PURGE_PRODUCT_ID, 'u-deleted', 'host-shared', DELETION_ID, 'slug-1');
+    const foreign = 'backup@10.0.0.1:/somewhere/else/slug-1.git';
+    await pool.query(
+      `UPDATE products SET purged_at=$2,repo_url=$3 WHERE id=$1`,
+      [PURGE_PRODUCT_ID, new Date('2026-10-20T00:00:00.000Z'), foreign],
+    );
+
+    // repo_url-страж в target-CTE: копия, выставленная/не стёртая между
+    // purgeState и delete, блокирует удаление строки — защита от гонки и от
+    // будущих вызывающих в обход adapter (backupCleared).
+    await expect(service.deletePurgedProduct(PURGE_PRODUCT_ID, 'u-deleted', DELETION_ID))
+      .resolves.toBe(false);
+
+    expect(await productExists(PURGE_PRODUCT_ID)).toBe(true);
+    expect((await pool.query(`SELECT repo_url FROM products WHERE id=$1`, [PURGE_PRODUCT_ID])).rows[0].repo_url)
+      .toBe(foreign);
   });
 });
