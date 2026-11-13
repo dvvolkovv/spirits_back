@@ -317,14 +317,14 @@ export async function runCliProbe({
         stop();
       });
 
-      mainTimer = setTimeout(() => {
-        timedOut = true;
-        stop();
-      }, timeoutMs);
       try { child.stdin.end(prompt); } catch (error) {
         stdinError = errorCode(error);
         stop();
       }
+      mainTimer = setTimeout(() => {
+        timedOut = true;
+        stop();
+      }, timeoutMs);
     });
   } finally {
     const cleanupErrors = await cleanupProcesses({ child, tag, reapImpl, graceMs: reapGraceMs });
