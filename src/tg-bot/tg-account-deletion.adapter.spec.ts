@@ -112,7 +112,7 @@ class FakeDeletionDb {
         .map((config) => ({ id: config.id, owner_user_id: config.owner_user_id }));
       return { rows: rows.slice(0, 1), rowCount: rows.length };
     }
-    if (s.startsWith('UPDATE tg_claim_tokens SET consumed_at=now()')) {
+    if (s.startsWith('UPDATE tg_claim_tokens SET consumed_at')) {
       const token = this.claimTokens.find((candidate) => candidate.token === params[0] && candidate.consumed_at == null);
       if (!token) return { rows: [], rowCount: 0 };
       token.consumed_at = '2026-11-11T00:00:00.000Z';
@@ -607,7 +607,7 @@ describe('TG archive/claim lifecycle locking', () => {
     db.users.set(account.userId, { state: 'deleted', deletionId, deletedAt: account.deletedAt.toISOString() });
     db.users.set('u-neighbor', { state: 'active', deletionId: null });
     db.configs = [
-      ownConfig(),
+      ownConfig({ status: 'archived', archived_at: account.deletedAt.toISOString() }),
       ownConfig({ id: 'cfg-b', owner_user_id: 'u-neighbor', status: 'pending', tg_chat_id: null, custom_agent_id: 'ca-b' }),
     ];
     db.claimTokens = [claimToken('cfg-b', 'u-neighbor', 'claim-b')];
