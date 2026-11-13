@@ -231,7 +231,7 @@ export class RepairStore {
   async abandon(id: string): Promise<boolean> {
     const result = await this.pg.query(
       `UPDATE alert_bot_repairs SET status = 'cancelled', finished_at = now()
-       WHERE id = $1 AND status = 'requested' AND turn_id IS NULL`,
+       WHERE id = $1 AND status IN ('requested', 'cancel_requested') AND turn_id IS NULL`,
       [id],
     );
     return result.rowCount === 1;

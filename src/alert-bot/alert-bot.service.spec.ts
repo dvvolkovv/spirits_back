@@ -406,6 +406,8 @@ describe('AlertBotService', () => {
   });
 
   it.each(['исправь файлы', 'почини файлы'])('%s в reply боту запускает repair', async (text) => {
+    store.findTurnByAnswer.mockResolvedValue({ id: 'parent-diagnosis', status: 'ok' });
+
     await service.handleUpdate(groupText(text, 1, {
       from: { id: 123 },
       reply_to_message: { ...botReply('Диагноз'), chat: { id: -100123, type: 'supergroup' } },

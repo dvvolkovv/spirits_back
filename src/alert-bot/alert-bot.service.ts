@@ -94,10 +94,10 @@ export class AlertBotService {
     private readonly repairs: AlertBotRepairService,
   ) {}
 
-  stopAdmission(): void {
+  async stopAdmission(): Promise<void> {
     this.accepting = false;
     this.turns.stopAdmission();
-    void this.repairs.stopAll().catch(() => {});
+    await this.repairs.stopAll();
   }
 
   async claimUpdate(update: unknown): Promise<'claimed' | 'duplicate' | 'stopped' | 'invalid'> {
@@ -322,7 +322,7 @@ export class AlertBotService {
     if (!addressed || !message.from?.id) return;
 
     const tgUserId = String(message.from.id);
-    const repairPhrase = replyToBot && /^(?:исправь|почини)(?:\s|$)/iu.test(text);
+    const repairPhraseCandidate = replyToBot && /^(?:исправь|почини)(?:\s|$)/iu.test(text);
     if (command?.name === 'stop') {
       if (!isAlertBotRepairAdmin(tgUserId)) {
         await this.refuse(message, tgUserId);
@@ -332,7 +332,7 @@ export class AlertBotService {
       await this.sendDirectMessage(chatId, result, message.message_id);
       return;
     }
-    if (command?.name === 'fix' || repairPhrase) {
+    if (command?.name === 'fix' || repairPhraseCandidate) {
       if (!isAlertBotRepairAdmin(tgUserId)) {
         await this.refuse(message, tgUserId);
         return;
@@ -342,12 +342,17 @@ export class AlertBotService {
         await this.sendDirectMessage(chatId, FIX_HINT, message.message_id);
         return;
       }
+      const repliedText = replyText(message.reply_to_message);
+      const parent = replyToBot && message.reply_to_message
+        ? await this.store.findTurnByAnswer(chatId, message.reply_to_message.message_id)
+        : null;
+      if (command?.name !== 'fix' && parent?.status !== 'ok') return;
       const repairIdentity = await this.access.resolveTelegram(message.from.id);
       const identity: Identity = {
         tgUserId,
         adminUserId: repairIdentity.userId || `tg:${tgUserId}`,
       };
-      await this.enqueueRepair(updateId, message, identity, instruction, replyToBot);
+      await this.enqueueRepair(updateId, message, identity, instruction, parent, repliedText);
       return;
     }
 
@@ -439,16 +444,14 @@ export class AlertBotService {
     message: TgMessage,
     identity: Identity,
     instruction: string,
-    replyToBot: boolean,
+    parent: Awaited<ReturnType<AlertBotStore['findTurnByAnswer']>>,
+    repliedText?: string,
   ): Promise<void> {
     if (!this.accepting) throw new AlertBotRetryableError('stopped');
     const chatId = String(message.chat.id);
     const extra: { parentTurnId?: string; replyText?: string } = {};
-    if (replyToBot && message.reply_to_message) {
-      const parent = await this.store.findTurnByAnswer(chatId, message.reply_to_message.message_id);
-      if (parent) extra.parentTurnId = parent.id;
-      extra.replyText = replyText(message.reply_to_message);
-    }
+    if (parent) extra.parentTurnId = parent.id;
+    if (repliedText) extra.replyText = repliedText;
 
     const admission = await this.repairs.admit({
       updateId,
@@ -461,26 +464,21 @@ export class AlertBotService {
       return;
     }
 
-    let turnAdmission: Awaited<ReturnType<AlertBotTurns['enqueue']>>;
-    try {
-      turnAdmission = await this.turns.enqueue({
-        updateId,
-        chatId,
-        tgUserId: identity.tgUserId,
-        adminUserId: identity.adminUserId,
-        questionMessageId: message.message_id,
-        question: instruction,
-        privateChat: message.chat.type === 'private',
-        mode: 'repair',
-        repairId: admission.repairId,
-        ...extra,
-      });
-    } catch (error) {
-      if (admission.status === 'accepted') await this.repairs.abandon(admission.repairId);
-      throw error;
-    }
+    const turnAdmission = await this.turns.enqueue({
+      updateId,
+      chatId,
+      tgUserId: identity.tgUserId,
+      adminUserId: identity.adminUserId,
+      questionMessageId: message.message_id,
+      question: instruction,
+      privateChat: message.chat.type === 'private',
+      mode: 'repair',
+      repairId: admission.repairId,
+      ...extra,
+    });
     if (admission.status === 'accepted' && ['busy', 'rate_limited'].includes(turnAdmission)) {
-      await this.repairs.abandon(admission.repairId);
+      const abandoned = await this.repairs.abandon(admission.repairId);
+      if (!abandoned) this.logger.error('alert-bot repair abandon failed kind=admission_cleanup');
     }
   }
 
