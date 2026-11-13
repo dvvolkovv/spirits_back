@@ -80,11 +80,13 @@ class ProtocolCollector {
         return;
       }
       this.gotResult = true;
-      const hasApiError = Object.prototype.hasOwnProperty.call(event, "api_error_status");
-      if (hasApiError) {
-        this.apiErrorStatus = typeof event.api_error_status === "number" ? event.api_error_status : "present";
+      // Прод-семантика (server.mjs, llm-fallback.mjs): ошибка — только truthy
+      // api_error_status. CLI 2.1.280 эмитит на успехе явный null — не ошибка.
+      const apiError = event.api_error_status;
+      if (apiError) {
+        this.apiErrorStatus = typeof apiError === "number" ? apiError : "present";
       }
-      this.resultSuccess = event.subtype === "success" && event.is_error !== true && !hasApiError;
+      this.resultSuccess = event.subtype === "success" && event.is_error !== true && this.apiErrorStatus == null;
       this.resultError = !this.resultSuccess;
       return;
     }

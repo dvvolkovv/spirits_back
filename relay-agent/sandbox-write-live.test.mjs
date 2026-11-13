@@ -43,7 +43,10 @@ test("CLI sandbox записывает и scratch, и output", {
     claudeConfigDir: "/home/dv/.claude",
   });
   childEnv[RUN_ENV] = tag;
-  const command = `printf scratch-ok > "$TMPDIR/probe.txt" && printf output-ok > "${outputProbe}" && cat "$TMPDIR/probe.txt" "${outputProbe}"`;
+  // Абсолютные пути, не env TMPDIR: sandbox CLI переопределяет его для своих
+  // Bash-подпроцессов, и probe уйдёт мимо проверяемого scratch-каталога.
+  const scratchProbePath = path.join(scratch, "probe.txt");
+  const command = `printf scratch-ok > "${scratchProbePath}" && printf output-ok > "${outputProbe}" && cat "${scratchProbePath}" "${outputProbe}"`;
   const prompt = `Use the Bash tool exactly once to run this command verbatim: ${command}\nDo not use another tool and do not disable or bypass the sandbox. Then reply DONE.`;
   const args = [
     "--print",
