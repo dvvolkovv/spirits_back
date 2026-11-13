@@ -180,22 +180,22 @@ describe('AlertBotRepairAi', () => {
   it('маскирует PII и секреты в replyText и history, не оставляя сырых значений', async () => {
     await ai.repair({
       ...input,
-      replyText: 'Звонок с +7 903 016 91 87, почта user@example.com, ключ sk-abcdefgh12345678',
+      replyText: 'Звонок с +7 999 123 45 67, почта user@example.com, ключ sk-abcdefgh12345678',
       history: [{
-        question: 'Проверь номер +79030169187',
+        question: 'Проверь номер +79991234567',
         answer: 'Админ admin@example.com, токен Bearer raw-token-value',
       }],
     });
 
     const [prompt] = claude.textWithCost.mock.calls[0];
     expect(prompt).toContain('replied_diagnosis: ');
-    expect(prompt).toContain('+7 *** *** 87');
+    expect(prompt).toContain('+7 *** *** 67');
     expect(prompt).toContain('u***@example.com');
     expect(prompt).toContain('a***@example.com');
     expect(prompt).toContain('Bearer [скрыто]');
     expect(prompt).toContain('[скрыто]');
-    expect(prompt).not.toContain('+7 903 016 91 87');
-    expect(prompt).not.toContain('+79030169187');
+    expect(prompt).not.toContain('+7 999 123 45 67');
+    expect(prompt).not.toContain('+79991234567');
     expect(prompt).not.toContain('user@example.com');
     expect(prompt).not.toContain('admin@example.com');
     expect(prompt).not.toContain('sk-abcdefgh12345678');
@@ -205,11 +205,11 @@ describe('AlertBotRepairAi', () => {
   it('admin_instruction остаётся дословным текстом админа', async () => {
     await ai.repair({
       ...input,
-      question: 'Почини worker, мой контакт +7 903 016 91 87',
+      question: 'Почини worker, мой контакт +7 999 123 45 67',
     });
 
     const [prompt] = claude.textWithCost.mock.calls[0];
-    expect(prompt).toContain('admin_instruction: Почини worker, мой контакт +7 903 016 91 87');
+    expect(prompt).toContain('admin_instruction: Почини worker, мой контакт +7 999 123 45 67');
   });
 
   it('очищает журнал инструментов и после ошибки CLI', async () => {
