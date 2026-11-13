@@ -62,6 +62,16 @@ class FakeCalendarDb {
       const found = this.tripCalendars.some((t) => t.user_id === params[0]);
       return { rows: found ? [{ '?column?': 1 }] : [], rowCount: found ? 1 : 0 };
     }
+    if (s.startsWith('SELECT 1 FROM linkeon_tasks l WHERE l.user_id=$1')) {
+      const found = this.isCurrentDeletion(params[0], params[1])
+        && this.linkeonTasks.some((row) => row.user_id === params[0]);
+      return { rows: found ? [{ '?column?': 1 }] : [], rowCount: found ? 1 : 0 };
+    }
+    if (s.startsWith('SELECT 1 FROM day_framing d WHERE d.user_id=$1')) {
+      const found = this.isCurrentDeletion(params[0], params[1])
+        && this.dayFraming.some((row) => row.user_id === params[0]);
+      return { rows: found ? [{ '?column?': 1 }] : [], rowCount: found ? 1 : 0 };
+    }
     if (s.startsWith('DELETE FROM calendar_proposals p')) {
       return this.deleteOwned('proposals', params);
     }
@@ -287,6 +297,53 @@ describe('calendar deletion discovery', () => {
       resourceType: 'calendar.external',
       reason: 'owner_unverifiable',
     }]);
+  });
+
+  // Follow-up review I-4: purge-задача создавалась только при строках в
+  // connections/proposals/trip_calendars — пользователь ТОЛЬКО с делами или
+  // фреймами не получал purge, и linkeon_tasks/day_framing переживали удаление.
+  // Discovery обязан видеть оба источника (fail-closed, домен тот же).
+  it('только linkeon_tasks — discovery создаёт calendar.purge', async () => {
+    const db = new FakeCalendarDb();
+    db.users.set(account.userId, { state: 'deleted', deletionId });
+    db.linkeonTasks.push({ uid: 'lt-only', user_id: account.userId, title: 'Дело' });
+
+    const plan = await discoverCalendarDeletion({ db: db as any, account, origin: 'explicit' });
+
+    expect(plan.jobs.map((item) => [item.resourceType, item.resourceKey, item.phase])).toEqual([
+      ['calendar.purge', 'calendar', 'purge'],
+    ]);
+    expect(plan.skips).toEqual([]);
+  });
+
+  it('только day_framing — discovery создаёт calendar.purge', async () => {
+    const db = new FakeCalendarDb();
+    db.users.set(account.userId, { state: 'deleted', deletionId });
+    db.dayFraming.push({
+      user_id: account.userId,
+      day: '2026-11-01',
+      kind: 'morning',
+      text: 'ФРЕЙМ',
+    });
+
+    const plan = await discoverCalendarDeletion({ db: db as any, account, origin: 'explicit' });
+
+    expect(plan.jobs.map((item) => item.resourceType)).toEqual(['calendar.purge']);
+  });
+
+  it('connections + дела: stop и ОДИН calendar.purge без дубля', async () => {
+    const db = new FakeCalendarDb();
+    db.users.set(account.userId, { state: 'deleted', deletionId });
+    db.connections.push({ id: 'cal-y', user_id: account.userId, provider: 'yandex' });
+    db.linkeonTasks.push({ uid: 'lt-x', user_id: account.userId, title: 'Дело' });
+    db.dayFraming.push({ user_id: account.userId, day: '2026-11-02', kind: 'evening', text: 'В' });
+
+    const plan = await discoverCalendarDeletion({ db: db as any, account, origin: 'explicit' });
+
+    expect(plan.jobs.map((item) => [item.resourceType, item.resourceKey, item.phase])).toEqual([
+      ['calendar.stop', 'yandex', 'immediate'],
+      ['calendar.purge', 'calendar', 'purge'],
+    ]);
   });
 });
 
