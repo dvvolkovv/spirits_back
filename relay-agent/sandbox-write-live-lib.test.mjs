@@ -158,7 +158,7 @@ test("timeout завершается bounded, пока потомок держи
       prompt: "PROMPT",
       env: { PATH: process.env.PATH },
       tag,
-      timeoutMs: 30,
+      timeoutMs: 250,
       killWaitMs: 10,
       reapGraceMs: 1,
       spawnImpl: (_cli, _args, { env }) => {
