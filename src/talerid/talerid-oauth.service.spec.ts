@@ -618,4 +618,37 @@ describe('TalerIdOauthService.disconnect — идемпотентность и �
     await expect(service.disconnect('nobody')).resolves.toBeUndefined();
     expect(store.delete).toHaveBeenCalledTimes(2);
   });
+
+  // Review I-2: delete-then-await одним расширяет окно воскрешения. Пока
+  // disconnect ждёт ПЕРВЫЙ flight, новый обмен токенов видит пустую map и
+  // стартует ВТОРОЙ refresh — у TalerID он ещё и рвёт grant-цепочку ротацией.
+  // Drain обязан дождаться ВСЕХ flight'ов, включая стартовавшие во время
+  // ожидания, и только потом удалять строку.
+  it('drain ждёт и второй refresh, стартовавший во время ожидания', async () => {
+    let connected = false;
+    const store: any = {
+      saveConnection: jest.fn(async () => { connected = true; }),
+      delete: jest.fn(async () => { connected = false; }),
+    };
+    const service = new TalerIdOauthService(store, {} as any);
+    const inFlight = (service as any).refreshInFlight as Map<string, Promise<unknown>>;
+    const second = (async () => {
+      await tick(20);
+      await store.saveConnection('user-1', { taleridUserId: 't2' });
+      return 't2';
+    })();
+    inFlight.set('user-1', (async () => {
+      await tick(5);
+      await store.saveConnection('user-1', { taleridUserId: 't1' });
+      // «Новый обмен токенов во время drain» регистрирует второй flight.
+      inFlight.set('user-1', second);
+      return 't1';
+    })());
+
+    await service.disconnect('user-1');
+    await tick(40);
+
+    expect(connected).toBe(false);
+    expect(store.delete).toHaveBeenCalledTimes(1);
+  });
 });

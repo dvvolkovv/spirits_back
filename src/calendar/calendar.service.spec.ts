@@ -367,3 +367,48 @@ describe('CalendarService — забор на удалённом аккаунт�
     expect(events).toEqual([]);
   });
 });
+
+// Review I-1 (account deletion): CalendarController.connect пропускает
+// body.provider без валидации. Отравленная строка calendar_connections
+// (provider с пробелом/длиной >128) ломает sanitizer deletion-discovery, и
+// planner.collect падает ЦЕЛИКОМ — аккаунт никогда не удаляется. Первый слой
+// защиты: whitelist в connect (фактически поддержан только yandex — baseUrl
+// захардкожен), невалидный provider → существующая ошибка подключения, БЕЗ
+// внешней проверки и БЕЗ записи строки.
+describe('CalendarService.connect — whitelist provider (review I-1)', () => {
+  beforeAll(() => { process.env.CALENDAR_SECRET_KEY = '0123456789abcdef0123456789abcdef'; });
+
+  const makeSvc = () => {
+    const pg = activeRowsPg();
+    const service = new CalendarService(pg as any, {} as any, {} as any, {} as any);
+    (service as any).connector = {
+      test: jest.fn().mockResolvedValue(true),
+      discoverCollection: jest.fn().mockResolvedValue('https://cal.example/'),
+      discoverTaskCollection: jest.fn().mockResolvedValue(null),
+    };
+    return { service, pg };
+  };
+
+  it.each([
+    ['Yandex 360'],
+    ['yandex '],
+    ['x'.repeat(200)],
+    [''],
+  ])('provider %j отклоняется без записи и внешнего вызова', async (provider) => {
+    const { service, pg } = makeSvc();
+    const res = await service.connect('u1', provider, 'me', 'app-pass');
+    expect(res.ok).toBe(false);
+    expect(res.error).toBe('Не удалось подключиться — проверь логин и пароль приложения');
+    expect((service as any).connector.test).not.toHaveBeenCalled();
+    for (const call of pg.query.mock.calls) {
+      expect(String(call[0])).not.toContain('INSERT INTO calendar_connections');
+    }
+  });
+
+  it('yandex по-прежнему подключается', async () => {
+    const { service, pg } = makeSvc();
+    const res = await service.connect('u1', 'yandex', 'me', 'app-pass');
+    expect(res.ok).toBe(true);
+    expect(pg.query).toHaveBeenCalledWith(expect.stringContaining('INSERT INTO calendar_connections'), expect.anything());
+  });
+});

@@ -35,6 +35,8 @@ class FakeCalendarDb {
   proposals: Array<Record<string, any>> = [];
   connections: Array<Record<string, any>> = [];
   tripCalendars: Array<Record<string, any>> = [];
+  linkeonTasks: Array<Record<string, any>> = [];
+  dayFraming: Array<Record<string, any>> = [];
   /** Канарейка: календарный адаптер не имеет права трогать интеграционные таблицы. */
   integrationFlags: Array<Record<string, any>> = [{ id: 'flag-1', kind: 'zoom' }];
   readonly queries: Array<{ sql: string; params: any[] }> = [];
@@ -69,11 +71,17 @@ class FakeCalendarDb {
     if (s.startsWith('DELETE FROM calendar_connections c')) {
       return this.deleteOwned('connections', params);
     }
+    if (s.startsWith('DELETE FROM linkeon_tasks l')) {
+      return this.deleteOwned('linkeonTasks', params);
+    }
+    if (s.startsWith('DELETE FROM day_framing d')) {
+      return this.deleteOwned('dayFraming', params);
+    }
     throw new Error(`unexpected query: ${s}`);
   }
 
   private deleteOwned(
-    field: 'proposals' | 'tripCalendars' | 'connections',
+    field: 'proposals' | 'tripCalendars' | 'connections' | 'linkeonTasks' | 'dayFraming',
     params: any[],
   ) {
     const [userId, deletionId] = params;
@@ -153,6 +161,13 @@ function seed(db: FakeCalendarDb) {
     url: 'https://private.example/cal.ics',
     enabled: true,
   });
+  db.linkeonTasks.push({ uid: 'lt-1', user_id: account.userId, title: 'Дело' });
+  db.dayFraming.push({
+    user_id: account.userId,
+    day: '2026-11-01',
+    kind: 'morning',
+    text: 'ФРЕЙМ-ТЕКСТ',
+  });
 }
 
 describe('calendar deletion discovery', () => {
@@ -189,6 +204,10 @@ describe('calendar deletion discovery', () => {
     expect(db.proposals).toHaveLength(0);
     expect(db.connections).toHaveLength(0);
     expect(db.tripCalendars).toHaveLength(0);
+    // Review I-4: локальный «дом дел» и фреймы дня — тоже calendar/trip-домен,
+    // их стирает calendar.purge тем же generation predicate.
+    expect(db.linkeonTasks).toHaveLength(0);
+    expect(db.dayFraming).toHaveLength(0);
   });
 
   it('без локальных строк не создаёт задач, чужие строки не трогает', async () => {
@@ -229,6 +248,45 @@ describe('calendar deletion discovery', () => {
     // Но и с evidence discovery НЕ вызывает внешний DELETE: удаление внешних
     // событий — не часть локального purge (calendar.external — skip-only тип).
     expect(plan.jobs.map((item) => item.resourceType)).toEqual(['calendar.purge']);
+  });
+
+  it('отравленная строка provider даёт безопасный enum resourceKey и не бросает (review I-1)', async () => {
+    // CalendarController.connect исторически пропускал body.provider без
+    // валидации; строка вроде 'Yandex 360' (пробел) или 'yandex ' (хвостовой
+    // пробел) ломает RESOURCE_KEY_RE/unsafePayloadString в sanitizer'е, и
+    // ОШИБКА ОДНОГО discoverer'а роняет весь planner.collect. Discovery обязан
+    // clamp'ить provider в фиксированный enum и дедуплицировать stop-задачи.
+    const db = new FakeCalendarDb();
+    db.users.set(account.userId, { state: 'deleted', deletionId });
+    db.connections.push({ id: 'cal-bad1', user_id: account.userId, provider: 'Yandex 360' });
+    db.connections.push({ id: 'cal-bad2', user_id: account.userId, provider: 'yandex ' });
+    db.connections.push({ id: 'cal-ex', user_id: account.userId, provider: 'exchange' });
+    db.connections.push({ id: 'cal-long', user_id: account.userId, provider: 'x'.repeat(200) });
+
+    const plan = await discoverCalendarDeletion({ db: db as any, account, origin: 'explicit' });
+
+    const stops = plan.jobs.filter((item) => item.resourceType === 'calendar.stop');
+    expect(stops.map((item) => item.resourceKey).sort()).toEqual(['exchange', 'yandex']);
+    for (const item of plan.jobs) {
+      expect(() => safeDeletionJobSnapshot(item, account.userId)).not.toThrow();
+    }
+    const serialized = JSON.stringify(plan);
+    expect(serialized).not.toContain('Yandex 360');
+    expect(serialized).not.toContain('xxx');
+  });
+
+  it('несколько внешних событий без evidence дают ОДИН skip на discovery (review I-9)', async () => {
+    const db = new FakeCalendarDb();
+    db.users.set(account.userId, { state: 'deleted', deletionId });
+    db.proposals.push({ id: 'pr-a', user_id: account.userId, event: { uid: 'uid-a' } });
+    db.proposals.push({ id: 'pr-b', user_id: account.userId, event: { uid: 'uid-b' } });
+
+    const plan = await discoverCalendarDeletion({ db: db as any, account, origin: 'explicit' });
+
+    expect(plan.skips).toEqual([{
+      resourceType: 'calendar.external',
+      reason: 'owner_unverifiable',
+    }]);
   });
 });
 
@@ -289,6 +347,8 @@ describe('CalendarAccountDeletionAdapter', () => {
     db.proposals.push({ id: 'pr-other', user_id: 'u-other', event: { uid: 'keep' } });
     db.connections.push({ id: 'cal-other', user_id: 'u-other', provider: 'yandex' });
     db.tripCalendars.push({ user_id: 'u-other', kind: 'outlook', url: 'https://keep.example' });
+    db.linkeonTasks.push({ uid: 'lt-other', user_id: 'u-other', title: 'Чужое дело' });
+    db.dayFraming.push({ user_id: 'u-other', day: '2026-11-01', kind: 'morning', text: 'чужой фрейм' });
     const { adapter } = makeAdapter(db);
     const ctx = execution(db);
 
@@ -299,6 +359,8 @@ describe('CalendarAccountDeletionAdapter', () => {
     expect(db.proposals.map((row) => row.id)).toEqual(['pr-other']);
     expect(db.connections.map((row) => row.id)).toEqual(['cal-other']);
     expect(db.tripCalendars).toHaveLength(1);
+    expect(db.linkeonTasks.map((row) => row.uid)).toEqual(['lt-other']);
+    expect(db.dayFraming.map((row) => row.user_id)).toEqual(['u-other']);
   });
 
   it('после reactivation старый deletionId ничего не удаляет', async () => {
@@ -312,6 +374,8 @@ describe('CalendarAccountDeletionAdapter', () => {
     expect(db.proposals).toHaveLength(1);
     expect(db.connections).toHaveLength(1);
     expect(db.tripCalendars).toHaveLength(1);
+    expect(db.linkeonTasks).toHaveLength(1);
+    expect(db.dayFraming).toHaveLength(1);
   });
 
   it('normalized destructive SQL сам содержит owner/state/deletion predicates', async () => {
@@ -324,7 +388,7 @@ describe('CalendarAccountDeletionAdapter', () => {
     const deletes = db.queries
       .map(({ sql }) => sql.replace(/\s+/g, ' ').trim())
       .filter((sql) => sql.startsWith('DELETE FROM'));
-    expect(deletes).toHaveLength(3);
+    expect(deletes).toHaveLength(5);
     for (const sql of deletes) {
       expect(sql).toContain('user_id=$1');
       expect(sql).toContain('u.internal_id=$1');

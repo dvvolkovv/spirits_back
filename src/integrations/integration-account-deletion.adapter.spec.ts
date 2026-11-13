@@ -56,7 +56,9 @@ class FakeIntegrationDb {
   }
 }
 
-const deletionId = 'deletion-old';
+// Валидный UUID: warn-путь Apple (review I-3) строит сообщение через
+// safeDeletionMessage, а он отвергает deletionId не-UUID.
+const deletionId = '7f9c2a1e-3b4d-4e5f-8a6b-9c0d1e2f3a4b';
 const account: DeletionAccount = {
   userId: 'u-deleted',
   deletionId,
@@ -90,6 +92,7 @@ function makeDeps(overrides: Partial<{
   const apple = {
     revokeToken: jest.fn(async () => overrides.revokeResult ?? true),
     primaryClientId: jest.fn(() => 'com.linkeon.app'),
+    canCallApple: jest.fn(() => true),
   };
   const zoom = { disconnect: jest.fn(async () => {}) };
   const talerid = { disconnect: jest.fn(async () => {}) };
@@ -277,5 +280,59 @@ describe('IntegrationAccountDeletionAdapter', () => {
     expect(DELETION_DISCOVERERS.filter((item) => item === discoverIntegrationDeletion)).toHaveLength(1);
     expect(Reflect.getMetadata('providers', IntegrationsModule)).toContain(IntegrationAccountDeletionAdapter);
     expect(Reflect.getMetadata('imports', IntegrationsModule)).toContain(AccountDeletionModule);
+  });
+
+  // Review I-3: без ключей Apple canCallApple()===false и revokeToken молча
+  // возвращает false → DeletionRetryError('external_unknown') вечным циклом,
+  // неотличимым от настоящего внешнего сбоя. Оператор должен увидеть РАЗОВЫЙ
+  // warn/error с техническим текстом (без userId и токенов), поведение — то же
+  // fail-closed retry.
+  it('ключи Apple не настроены — retry остаётся, но warn ровно один на процесс', async () => {
+    (IntegrationAccountDeletionAdapter as any).warnedAppleNotConfigured.clear();
+    const db = new FakeIntegrationDb();
+    const deps = makeDeps();
+    deps.apple.canCallApple.mockReturnValue(false);
+    const { adapter } = makeAdapter(db, deps);
+    const logger: any = { warn: jest.fn(), error: jest.fn() };
+    (adapter as any).logger = logger;
+    const ctx = execution(db);
+
+    await expect(adapter.execute(job('integration.apple.stop', 'apple'), ctx))
+      .rejects.toMatchObject({ kind: 'external_unknown' });
+    await expect(adapter.execute(job('integration.apple.stop', 'apple'), ctx))
+      .rejects.toMatchObject({ kind: 'external_unknown' });
+
+    expect(deps.apple.revokeToken).not.toHaveBeenCalled();
+    const messages = [
+      ...logger.warn.mock.calls,
+      ...logger.error.mock.calls,
+    ].map((call) => String(call[0]));
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain('integration.apple.stop');
+    expect(messages[0]).not.toContain(account.userId);
+    expect(messages[0]).not.toContain(APPLE_REFRESH);
+  });
+
+  // Review I-12a: первый токен отозван, второй упал таймаутом → retry обязан
+  // прогнать ВСЕ токены заново. Apple /auth/revoke идемпотентен (повторный
+  // отзыв уже отозванного токена возвращает успех), поэтому повторный revoke
+  // первого токена безопасен.
+  it('apple.stop partial failure: повторный execute снова отзывает все токены', async () => {
+    const db = new FakeIntegrationDb();
+    const deps = makeDeps({ tokens: ['T1', 'T2'] });
+    deps.apple.revokeToken
+      .mockResolvedValueOnce(true)
+      .mockRejectedValueOnce({ code: 'ETIMEDOUT' });
+    const { adapter } = makeAdapter(db, deps);
+    const ctx = execution(db);
+
+    await expect(adapter.execute(job('integration.apple.stop', 'apple'), ctx))
+      .rejects.toMatchObject({ kind: 'timeout' });
+
+    await adapter.execute(job('integration.apple.stop', 'apple'), ctx);
+
+    expect(deps.apple.revokeToken).toHaveBeenCalledTimes(4);
+    expect(deps.apple.revokeToken.mock.calls.map((call) => call[0]))
+      .toEqual(['T1', 'T2', 'T1', 'T2']);
   });
 });
