@@ -27,6 +27,17 @@ describe('relay CLI sandbox write gate', () => {
     expect(beforeDrain).toBeGreaterThan(section);
   });
 
+  it('README фиксирует ручной откат на TARGET_SHA старше гейта', () => {
+    const readme = fs.readFileSync(path.join(root, 'relay-agent', 'README.md'), 'utf8');
+    const section = readme.indexOf('## Обязательная проверка записи при смене sandbox runtime');
+    const preGate = readme.indexOf('TARGET_SHA старше', section);
+    const manual = readme.indexOf('вручную', preGate);
+
+    expect(section).toBeGreaterThan(-1);
+    expect(preGate).toBeGreaterThan(section);
+    expect(manual).toBeGreaterThan(preGate);
+  });
+
   it('live test отправляет prompt и закрывает stdin', () => {
     const source = fs.readFileSync(path.join(root, 'relay-agent', 'sandbox-write-live-lib.mjs'), 'utf8');
     const spawned = source.indexOf('child = spawnImpl(cli, args');
