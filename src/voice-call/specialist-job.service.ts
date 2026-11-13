@@ -72,12 +72,39 @@ export class SpecialistJobService {
     return { status: 'asked', jobId, specialist };
   }
 
+  /**
+   * Строгая проверка живости аккаунта (Task 10, удаление аккаунтов): один
+   * SELECT state FROM user_id до LLM и до обновления строк. Нет строки или
+   * state не 'active' — продолжение молча не выполняется: удалённый аккаунт
+   * не консультируется у специалистов и не оставляет новых строк. Без кеша —
+   * между вызовами возможна reactivation.
+   */
+  private async assertActive(userId: string): Promise<boolean> {
+    try {
+      const r = await this.pg.query(
+        `SELECT state FROM user_id WHERE internal_id=$1 LIMIT 1`,
+        [userId],
+      );
+      return r.rows[0]?.state === 'active';
+    } catch {
+      // Сбой проверки трактуем fail-closed: job останется 'queued' и его
+      // подберёт реапер — лучше задержка живому, чем работа на удалённого.
+      return false;
+    }
+  }
+
   private async run(
     jobId: string, callId: string, roomName: string, userId: string,
     specialist: string, agentId: number, question: string,
   ): Promise<void> {
     const started = Date.now();
     let tokens = 0;
+    // Task 10: аккаунт могли удалить между тулом и этим продолжением. Job
+    // остаётся 'queued' — строки не обновляем, в LLM не идём.
+    if (!(await this.assertActive(userId))) {
+      this.logger.warn(`job не продолжен: аккаунт неактивен`);
+      return;
+    }
     await this.pg.query(`UPDATE voice_call_jobs SET status = 'running' WHERE id = $1`, [jobId]);
     await this.safeSend(roomName, { v: 1, type: 'specialist_pending', jobId, specialist });
 
@@ -109,6 +136,15 @@ export class SpecialistJobService {
       const answer = (reply.text || '').trim();
       if (!answer) throw new Error('пустой ответ специалиста');
       tokens = reply.tokens;
+
+      // Task 10: аккаунт могли удалить, пока специалист думал (до четырёх
+      // минут). Done-обновление, списание и строки в чате удалённому не
+      // нужны; это НЕ ошибка — в catch с 'failed' и specialist_failed не
+      // уходим, комната уже закрыта удалением.
+      if (!(await this.assertActive(userId))) {
+        this.logger.warn(`job не завершён записью: аккаунт неактивен`);
+        return;
+      }
 
       // В БД кладём ответ целиком: он попадёт в транскрипт и карточку звонка,
       // где длина не мешает и текст можно перечитать.

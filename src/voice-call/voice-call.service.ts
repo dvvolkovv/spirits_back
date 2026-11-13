@@ -722,6 +722,89 @@ export class VoiceCallService implements OnModuleInit {
     if (roomName) await this.livekit.removeAgents(roomName);
   }
 
+  /**
+   * Task 10 (удаление аккаунта): стереть внешний ID бота ПОСЛЕ подтверждённого
+   * вывода. Generation predicate в EXISTS — старый deletionId после
+   * reactivation не чистит ничего: пользователь вернулся, и звонок снова его.
+   * Колонку не трогаем, пока исход бота неизвестен, — иначе навсегда забудем
+   * про бота, который, возможно, всё ещё сидит в чужой встрече.
+   */
+  async clearReleasedBotForDeletion(callId: string, deletionId: string, userId: string): Promise<void> {
+    await this.pg.query(
+      `UPDATE voice_calls SET external_bot_id = NULL
+        WHERE id = $1 AND external_bot_id IS NOT NULL AND user_id = $2
+          AND EXISTS (
+            SELECT 1 FROM user_id u
+            WHERE u.internal_id = $2 AND u.state = 'deleted' AND u.deletion_id = $3
+          )`,
+      [callId, userId, deletionId],
+    );
+  }
+
+  /**
+   * Общая половина strict-пары для deletion-пути: пометить звонок
+   * остановленным и подтвердить исход комнаты в LiveKit.
+   *
+   * Возвращает ПОДТВЕРЖДЁННЫЙ boolean. UPDATE защищён generation predicate:
+   * если аккаунт успели оживить, строка не тронется. 0 строк — не всегда
+   * провал: звонок мог быть остановлен раньше (идемпотентный повтор). Тогда
+   * перечитываем строку: dialing/active при несработавшем UPDATE означает
+   * несовпадение поколения (reactivation) — fail-closed false; терминальный
+   * статус — звонок уже лёг, остаётся подтвердить комнату strict-методом
+   * LiveKit (404 комнаты — подтверждение, неизвестный исход — false → retry).
+   */
+  private async stopCallForDeletion(
+    callId: string, deletionId: string, raw: string, keepRoom: boolean,
+  ): Promise<boolean> {
+    const res = await this.pg.query(
+      `UPDATE voice_calls SET status = 'interrupted', ended_at = now(),
+              end_reason = 'reaped', end_raw = $2
+        WHERE id = $1 AND status IN ('dialing','active')
+          AND EXISTS (
+            SELECT 1 FROM user_id u
+            WHERE u.internal_id = voice_calls.user_id
+              AND u.state = 'deleted' AND u.deletion_id = $3
+          )
+        RETURNING room_name`,
+      [callId, raw, deletionId],
+    );
+    let roomName: string | null | undefined = res.rows[0]?.room_name;
+    if ((res.rowCount ?? 0) === 0) {
+      const check = await this.pg.query(
+        `SELECT status, room_name FROM voice_calls WHERE id = $1`,
+        [callId],
+      );
+      const row = check.rows[0];
+      if (!row) return false; // строки нет — подтвердить нечего, исход неизвестен
+      if (row.status === 'dialing' || row.status === 'active') return false; // поколение не совпало
+      roomName = row.room_name;
+    }
+    if (!roomName) return true; // комнаты нет — закрывать нечего, подтверждено
+    return keepRoom
+      ? await this.livekit.removeAgentsStrict(roomName)
+      : await this.livekit.closeRoomStrict(roomName);
+  }
+
+  /**
+   * Task 10: личный звонок один на один — комната создана ради звонка и
+   * закрывается вместе с ним. Strict-вариант {@link markInterrupted}:
+   * подтверждённый boolean, ошибки не глотаются.
+   */
+  async markInterruptedStrict(callId: string, deletionId: string): Promise<boolean> {
+    return this.stopCallForDeletion(callId, deletionId, 'deletion:stop', false);
+  }
+
+  /**
+   * Task 10: общая встреча — комната принадлежит людям и остаётся жить,
+   * убираем только наших агентов. Strict-вариант
+   * {@link markInterruptedKeepingRoom}. RoomService.close из deletion-пути
+   * не вызывается никогда: закрытие meeting_rooms выкинуло бы остальных
+   * участников из-за удаления одного аккаунта.
+   */
+  async markInterruptedKeepingRoomStrict(callId: string, deletionId: string): Promise<boolean> {
+    return this.stopCallForDeletion(callId, deletionId, 'deletion:stop-keeping-room', true);
+  }
+
   /** Живой ли звонок — job'ы по завершённому создавать незачем. */
   isActive(call: { status: string }): boolean {
     return call.status === 'dialing' || call.status === 'active';

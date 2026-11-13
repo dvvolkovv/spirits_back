@@ -12,6 +12,8 @@ import { CalendarModule } from '../calendar/calendar.module';
 import { MeetingModule } from '../meeting/meeting.module';
 import { ContextModule } from '../context/context.module';
 import { TalerIdModule } from '../talerid/talerid.module';
+import { AccountDeletionModule } from '../account-deletion/account-deletion.module';
+import { VoiceAccountDeletionAdapter } from './voice-account-deletion.adapter';
 
 /**
  * VOICE_CALLBACK_SECRET читается ТОЛЬКО во время запроса, в контроллере.
@@ -29,9 +31,9 @@ import { TalerIdModule } from '../talerid/talerid.module';
  * диагностика в лог, она отрабатывает уже после ConfigModule.
  */
 @Module({
-  imports: [CommonModule, ChatModule, ContextModule, TalerIdModule, CalendarModule, forwardRef(() => MeetingModule)],
+  imports: [CommonModule, ChatModule, ContextModule, TalerIdModule, CalendarModule, AccountDeletionModule, forwardRef(() => MeetingModule)],
   controllers: [VoiceCallController, VoiceCallInternalController, VoiceCallStatusController],
-  providers: [VoiceCallService, SpecialistJobService, VoiceDocumentService, VoiceCallReaperService],
+  providers: [VoiceCallService, SpecialistJobService, VoiceDocumentService, VoiceCallReaperService, VoiceAccountDeletionAdapter],
   exports: [VoiceCallService],
 })
 export class VoiceCallModule implements OnModuleInit {

@@ -3,6 +3,7 @@ import { discoverTelegramDeletion } from '../tg-bot/tg-account-deletion.adapter'
 import { discoverProductDeletion } from '../products/product-account-deletion.adapter';
 import { discoverCalendarDeletion } from '../calendar/calendar-account-deletion.adapter';
 import { discoverIntegrationDeletion } from '../integrations/integration-account-deletion.adapter';
+import { discoverVoiceDeletion } from '../voice-call/voice-account-deletion.adapter';
 import type {
   DeletionDiscoverer,
   DeletionResourceType,
@@ -14,6 +15,7 @@ export const DELETION_DISCOVERERS: readonly DeletionDiscoverer[] = [
   discoverProductDeletion,
   discoverCalendarDeletion,
   discoverIntegrationDeletion,
+  discoverVoiceDeletion,
 ];
 
 export interface DeletionDependencyRule {
