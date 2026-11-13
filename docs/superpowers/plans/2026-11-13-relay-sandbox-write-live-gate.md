@@ -76,6 +76,17 @@ describe('relay CLI sandbox write gate', () => {
     expect(command).toBeGreaterThan(section);
     expect(beforeDrain).toBeGreaterThan(section);
   });
+
+  it('live test отправляет prompt и закрывает stdin', () => {
+    const source = fs.readFileSync(path.join(root, 'relay-agent', 'sandbox-write-live.test.mjs'), 'utf8');
+    const spawned = source.indexOf('child = spawn(CLI, args');
+    const stdinEnd = source.indexOf('child.stdin.end(prompt);', spawned);
+    const outcome = source.indexOf('const outcome = await new Promise', spawned);
+
+    expect(spawned).toBeGreaterThan(-1);
+    expect(stdinEnd).toBeGreaterThan(spawned);
+    expect(stdinEnd).toBeLessThan(outcome);
+  });
 });
 ```
 
@@ -104,7 +115,7 @@ Run:
 ssh dv@85.192.61.231 'set -e; cd ~/ci/spirits_back-relay-sandbox-write-gate-20261113; source ~/.nvm/nvm.sh; npx jest tests/scripts/deploy-relay-write-gate.test.js --runInBand'
 ```
 
-Expected: exit non-zero, `2 failed`: первая проверка имеет `live === -1`, вторая — `section === -1`. Это RED до реализации, не основание ослабить test.
+Expected: exit non-zero, `3 failed`: первая проверка имеет `live === -1`, вторая — `section === -1`; третья падает, потому что `relay-agent/sandbox-write-live.test.mjs` ещё отсутствует либо `stdinEnd === -1`. Это RED до реализации, не основание ослабить test.
 
 ---
 
@@ -195,6 +206,7 @@ test("CLI sandbox записывает и scratch, и output", {
   ];
 
   child = spawn(CLI, args, { cwd: "/tmp", env: childEnv, stdio: ["pipe", "pipe", "pipe"] });
+  child.stdin.end(prompt);
   const outcome = await new Promise((resolve) => {
     let buffer = "";
     let stderrBytes = 0;
@@ -428,7 +440,7 @@ Run на test-ноде:
 ssh dv@85.192.61.231 'set -e; cd ~/ci/spirits_back-relay-sandbox-write-gate-20261113; source ~/.nvm/nvm.sh; npx jest tests/scripts/deploy-relay-write-gate.test.js tests/scripts/deploy-relay-drain.test.js tests/scripts/deploy-relay-early-lock.test.js --runInBand'
 ```
 
-Expected: все три файла PASS, `0 failed`; новый guard — `2 passed`.
+Expected: все три файла PASS, `0 failed`; новый guard — `3 passed`.
 
 ---
 

@@ -73,6 +73,7 @@ test("CLI sandbox записывает и scratch, и output", {
   ];
 
   child = spawn(CLI, args, { cwd: "/tmp", env: childEnv, stdio: ["pipe", "pipe", "pipe"] });
+  child.stdin.end(prompt);
   const outcome = await new Promise((resolve) => {
     let buffer = "";
     let stderrBytes = 0;
