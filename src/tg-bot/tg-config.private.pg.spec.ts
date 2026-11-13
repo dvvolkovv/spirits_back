@@ -119,6 +119,22 @@ maybe('личка бота против живого Postgres', () => {
     expect(await rowsOfChat(CHAT)).toHaveLength(1);
   });
 
+  it.each([
+    ['конфига нет', false],
+    ['живой конфиг чужой', true],
+  ])('два параллельных вызова одного владельца (%s) — оба получают один и тот же конфиг, без исключения', async (_label, foreignFirst) => {
+    if (foreignFirst) await config(A, CHAT);
+    const svc = service(2);
+
+    const [x, y] = await Promise.all([svc.ensurePrivateConfig(B, CHAT), svc.ensurePrivateConfig(B, CHAT)]);
+
+    expect(x.id).toBe(y.id);
+    expect(x.owner_user_id).toBe(B);
+    const live = (await rowsOfChat(CHAT)).filter((r) => r.status === 'active' || r.status === 'silent');
+    expect(live).toEqual([expect.objectContaining({ id: x.id, owner_user_id: B })]);
+    expect(errors).toEqual([]);
+  });
+
   it('deleted владелец не будит silent config и не создаёт новый', async () => {
     const mine = await config(B, CHAT, 'silent');
     await pool.query(`UPDATE user_id SET state='deleted',deletion_id=$1 WHERE internal_id=$2`, ['11111111-1111-4111-8111-111111111111', B]);
