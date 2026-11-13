@@ -195,7 +195,8 @@ test("CLI sandbox записывает и scratch, и output", {
     scrub: true,
     claudeConfigDir: "/home/dv/.claude",
   });
-  const command = `printf scratch-ok > "$TMPDIR/probe.txt" && printf output-ok > "${outputProbe}" && cat "$TMPDIR/probe.txt" "${outputProbe}"`;
+  const scratchProbePath = path.join(scratch, "probe.txt");
+  const command = `printf scratch-ok > "${scratchProbePath}" && printf output-ok > "${outputProbe}" && cat "${scratchProbePath}" "${outputProbe}"`;
   const prompt = `Use the Bash tool exactly once to run this command verbatim: ${command}\nDo not use another tool and do not disable or bypass the sandbox. Then reply DONE.`;
   const args = [
     "--print",
@@ -342,7 +343,7 @@ Task 3 запрещён до завершения этого шага. Наст�
 
 1. terminal `subtype=success`, `is_error=false` принимается из финального buffer без newline;
 2. `error_max_turns` с `is_error=false` отклоняется;
-3. само наличие `api_error_status` отклоняет result;
+3. truthy `api_error_status` отклоняет result; явный `null`/falsy — нет (прод-семантика `!!ev.api_error_status`; 2.1.280 эмитит null на успехе);
 4. финальный `is_error=true` без newline не теряется;
 5. malformed NDJSON даёт `protocol_error` даже рядом с success;
 6. отсутствие terminal result не fail-open;
@@ -400,7 +401,7 @@ export function readExpectedProbe(root, name, expected);
 - `env[RUN_ENV] = tag`, где tag получен через `runTag(randomUUID())`; `reap((candidate) => candidate === tag, { graceMs })` выполняется из `finally` на всех путях;
 - основное завершение фиксируется по `exit`, не по `close`; kill/timeout имеют отдельное bounded ожидание `killWaitMs`, затем stdio уничтожаются;
 - stdin error handler установлен до `child.stdin.end(prompt)`; prompt отправляется до создания main timer ожидания;
-- результат success только при явном `type=result`, `subtype=success`, `is_error !== true` и отсутствии собственного свойства `api_error_status`;
+- результат success только при явном `type=result`, `subtype=success`, `is_error !== true` и отсутствии truthy `api_error_status` (прод-семантика; явный null от 2.1.280 ошибкой не считается);
 - финальный buffer обрабатывается без newline; malformed/oversized/missing result остаются RED;
 - поддерживаются top-level и вложенные `tool_result`; failure entries ограничены и не содержат raw output;
 - probe root/file проходят `lstat`, symlink отклоняются, `realpath` обязан оставаться внутри root, размер обязан совпасть до чтения; возвращаются только `{ ok, status, size }`;
@@ -470,6 +471,15 @@ Expected: `tests 218`, `pass 217`, `fail 0`, `skipped 1`.
 - Test: `relay-agent/sandbox-write-live.test.mjs`
 - Test: `relay-agent/sandbox-write-live-lib.mjs`
 - No live project files changed; оба новых файла существуют только в уникальном `/tmp`-каталоге на время команды.
+
+> **Итоги первого живого прогона (13.11.2026):** RED на 2.1.322 подтверждён с первого
+> раза (`toolFailures=[{"kind":"EROFS",...}]`, scratch/output missing, 6.3 с). GREEN на
+> 2.1.280 дал ложный RED по двум независимым причинам: (1) CLI 2.1.280 эмитит
+> `"api_error_status": null` в success-результате, а коллектор проверял наличие ключа —
+> переведено на прод-семантику truthy (`server.mjs:1101`, `llm-fallback.mjs:162`);
+> (2) `$TMPDIR` внутри sandbox CLI переопределён для Bash-подпроцессов — probe ушёл мимо
+> host-каталога, команда переведена на абсолютный путь. Правки: 8d151c42 (красный),
+> 4090f63b (зелёный). Шаг 2 требует повторного прогона.
 
 - [ ] **Step 1: Запустить RED против сохранённого 2.1.322 через stdin**
 
@@ -546,7 +556,7 @@ RELAY_CLAUDE_BIN=/opt/linkeon-agent/bin/claude \
 node --test /home/dv/file-agent/sandbox-write-live.test.mjs
 ```
 
-Тест создаёт уникальный `fs_key` и проверяет точное содержимое probe-файла и в scratch (`$TMPDIR`), и в `/tmp/agent-output/<fs_key>`. Он не использует `/chat`, поэтому работает при закрытом admission и не затрагивает пользовательские сессии.
+Тест создаёт уникальный `fs_key` и проверяет точное содержимое probe-файла и в scratch (`/tmp/agent-scratch/<fs_key>`, по абсолютному пути — sandbox CLI переопределяет TMPDIR подпроцессов), и в `/tmp/agent-output/<fs_key>`. Он не использует `/chat`, поэтому работает при закрытом admission и не затрагивает пользовательские сессии.
 
 Красный результат запрещает открывать admission: вернуть прежний сохранённый runtime, проверить его `--version` и `/health`, затем снять drain. Нельзя заменять эту проверку чтением sandbox-настроек или прогоном только unit-тестов: CLI 2.1.322 при корректных настройках возвращал `EROFS` для обоих разрешённых каталогов. Sandbox не отключать и не ослаблять.
 
