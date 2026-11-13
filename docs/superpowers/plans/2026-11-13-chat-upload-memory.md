@@ -18,7 +18,7 @@
 - **Тесты, tsc и сборки — только на ноде** `dv@85.192.61.231`, воркдерево `~/ci/wt/chat-upload-memory`. В каждой ssh-команде — `source ~/.nvm/nvm.sh`.
 - На ноде не трогать `~/spirits_back`, `~/spirits_front`, `~/dev`; в `~/ci/spirits_back` разрешены только `git -C … fetch` и `worktree add/remove`.
 - TDD: падающий тест отдельным коммитом → проверить RED → реализация следующим коммитом → проверить GREEN. Никаких amend/force/rebase.
-- Коммиты заканчивать `Co-Authored-By: Kimi <noreply@anthropic.com>`. В тестах — только синтетические имена и ID, без реальных телефонов и секретов.
+- Коммиты заканчивать `Co-Authored-By: Claude Code <noreply@anthropic.com>`. В тестах — только синтетические имена и ID, без реальных телефонов и секретов.
 - Публичный `StorageService.upload()` возвращает URL, но его нельзя сохранять в историю или metadata. Исходники доступны только через `ChatUploadsController`.
 
 Шаблон прогона после локального коммита:
@@ -270,7 +270,7 @@ Expected: 3 tests PASS, `TSC_OK`.
 ```bash
 git add src/chat/chat-uploads && git commit -m "feat(chat-uploads): реестр исходных загрузок и приватные подписи
 
-Co-Authored-By: Kimi <noreply@anthropic.com>"
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ### Task 2: приватное скачивание и модуль
@@ -454,7 +454,7 @@ const userMsgForHistory = [...links, ...(failedNames.length ? [`📎 ${failedNam
 ```bash
 git add src/chat/chat.controller.ts src/chat/chat.upload-session.spec.ts src/chat/chat.upload-chat-files.spec.ts && git commit -m "feat(chat-uploads): сохранять исходники до релея и ссылки в истории
 
-Co-Authored-By: Kimi <noreply@anthropic.com>"
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ### Task 4: единый frontend multipart и приватная ссылка
@@ -513,7 +513,7 @@ if (href.startsWith('/webhook/chat-uploads/')) {
 ```bash
 git add src/components/chat/ChatInterface.tsx src/components/chat/historyMerge.ts src/components/chat/historyMerge.test.ts src/components/chat/uploadMemory.test.tsx src/i18n/locales && git commit -m "feat(chat-uploads): единый multipart и приватное скачивание в кабинете
 
-Co-Authored-By: Kimi <noreply@anthropic.com>"
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ### Task 5: `find_files` для исходников и внешних ссылок
@@ -568,7 +568,7 @@ Commit: `test(chat-uploads): find_files исходников и внешних �
 ```bash
 git add src/chat/chat-files src/products/products-cli-tool.ts && git commit -m "feat(chat-uploads): искать исходные загрузки и внешние ссылки
 
-Co-Authored-By: Kimi <noreply@anthropic.com>"
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ### Task 6: последние загрузки в prompt каждого хода
@@ -630,7 +630,7 @@ async recentForSession(userId: string, sessionId: string, excludeIds: string[] =
 ```bash
 git add src/chat/chat-uploads src/chat/chat.service.ts src/chat/chat.controller.ts && git commit -m "feat(chat-uploads): восстанавливать последние загрузки в prompt каждого хода
 
-Co-Authored-By: Kimi <noreply@anthropic.com>"
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ### Task 7: удаление аккаунта и эксплуатационная документация
@@ -661,7 +661,7 @@ Commit: `test(chat-uploads): удаление аккаунта — красны�
 ```bash
 git add src/profile src/platform-kb/articles/account.ts scripts/provision-test.sh CLAUDE.md src/chat/chat-uploads && git commit -m "feat(chat-uploads): удаление исходников при удалении аккаунта и эксплуатация
 
-Co-Authored-By: Kimi <noreply@anthropic.com>"
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ### Task 8: полные гейты и выкат
