@@ -143,6 +143,34 @@ describe('ChatUploadsController (HTTP)', () => {
       expect.objectContaining({ id: RECORD_ID, exp: String(exp), sig }),
     );
   });
+
+  it('обрыв клиента уничтожает стрим источника — fd/соединение не утекают', async () => {
+    // pipe при close ответа делает только unpipe: S3-стрим (HTTP-ответ
+    // GetObject от MinIO) остаётся живым и paused, сокет держится до
+    // серверного таймаута. PassThrough без end имитирует крупное скачивание,
+    // прерванное клиентом после первых байт.
+    const body = new PassThrough();
+    openDownload.mockImplementationOnce(async () => ({
+      body,
+      originalName: 'big.pdf',
+      mime: 'application/pdf',
+      sizeBytes: 1024 * 1024,
+    }));
+    body.write('chunk');
+
+    const req = http.get(
+      base,
+      { agent: false, headers: { authorization: `Bearer ${jwtService.signAccess('u1')}` } },
+      (res) => {
+        res.once('data', () => req.destroy());
+      },
+    );
+    await new Promise<void>((resolve) => req.once('close', resolve));
+    // Дать серверной стороне время увидеть обрыв соединения.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    expect(body.destroyed).toBe(true);
+  });
 });
 
 describe('ChatUploadsController (ошибка потока)', () => {
