@@ -301,9 +301,9 @@ it('JWT владельца скачивает, чужой JWT и неверна�
 
 Commit: `test(chat-uploads): приватное скачивание — красный`; проверить RED.
 
-- [ ] **Step 2: добавить `downloadStream` и `createBucketIfAbsent`**
+- [ ] **Step 2: проверить `downloadStream` и `createBucketIfAbsent` (уже добавлены в Task 1)**
 
-В `StorageService` использовать `GetObjectCommand` и вернуть `response.Body as Readable`. Не вызывать `download()` для больших исходников. `createBucketIfAbsent` использует только `CreateBucketCommand`, игнорирует `BucketAlreadyOwnedByYou`/`BucketAlreadyExists` и не добавляет policy.
+Оба метода уже реализованы в `StorageService` в Task 1 (`storage.service.ts:78` `createBucketIfAbsent`, `:114` `downloadStream` через `GetObjectCommand`, возврат `response.Body as Readable`, без policy). Шаг сводится к проверке, что они на месте и соответствуют контракту; повторно не реализовывать.
 
 - [ ] **Step 3: реализовать контроллер и модуль**
 
@@ -380,7 +380,7 @@ export class ChatUploadsModule implements OnModuleInit {
 ```bash
 git add src/common/services/storage.service.ts src/chat/chat-uploads src/chat/chat.module.ts && git commit -m "feat(chat-uploads): приватное скачивание и независимый модуль
 
-Co-Authored-By: Kimi <noreply@anthropic.com>"
+Co-Authored-By: Claude Code <noreply@anthropic.com>"
 ```
 
 ### Task 3: сохранение multipart до релея и история
