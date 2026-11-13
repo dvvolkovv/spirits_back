@@ -9,6 +9,7 @@ import {
 } from './account-deletion.catalog';
 import { DeletionCancelledError } from './account-deletion.safe';
 import { discoverRoutinePushDeletion } from '../routine-push/routine-account-deletion.adapter';
+import { discoverTelegramDeletion } from '../tg-bot/tg-account-deletion.adapter';
 import type {
   DeletionAccount,
   DeletionJobRow,
@@ -382,7 +383,7 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
   });
 
   it('catalog описывает только заданные зависимости', () => {
-    expect(DELETION_DISCOVERERS).toEqual([discoverRoutinePushDeletion]);
+    expect(DELETION_DISCOVERERS).toEqual([discoverRoutinePushDeletion, discoverTelegramDeletion]);
     expect(DELETION_DEPENDENCIES['account.core.immediate']).toEqual({ allStop: true });
     expect(DELETION_DEPENDENCIES['account.core.purge']).toEqual({ allStop: true });
     expect(DELETION_DEPENDENCIES['product.purge']).toEqual({
