@@ -4,6 +4,9 @@ import { buildMorningFacts, factsHash } from './day-framing';
 const now = new Date('2026-07-19T10:00:00+05:00');
 const task = (uid: string, title: string, due?: string, done = false) => ({ uid, title, due, done, source: 'yandex' });
 const ev = (uid: string, title: string, at: string, end?: string) => ({ uid, title, at, end, source: 'yandex' });
+// Task 9: applyAction начинается с SELECT state FROM user_id — старые тесты
+// дают пустой pg-мок, поэтому «активный» ответ нужен всем существующим сценариям.
+const activePg = () => ({ query: async () => ({ rows: [{ state: 'active' }] }) });
 
 describe('computeCopilotState', () => {
   it('headline = ближайшая незакрытая задача к сроку', () => {
@@ -160,7 +163,7 @@ describe('computeCopilotState', () => {
       rescheduleTask: jest.fn().mockResolvedValue({ ok: true }),
     } as any;
     const linkeonTasks = { list: jest.fn().mockResolvedValue([]) } as any;
-    const svc = (calendar: any) => new TripService({} as any, calendar, taleridCal, linkeonTasks);
+    const svc = (calendar: any) => new TripService(activePg() as any, calendar, taleridCal, linkeonTasks);
 
     it('proposal_accept → пишет event в календарь + помечает accepted', async () => {
       const event = { title: 'Созвон', datetime: '2026-07-20T15:00:00', durationMin: 60 };
@@ -207,7 +210,7 @@ describe('computeCopilotState', () => {
       const linkeonTasks = overrides.linkeonTasks ?? ({ list: jest.fn().mockResolvedValue([]) } as any);
       const dayFramingStore = overrides.dayFramingStore ?? ({ get: jest.fn().mockResolvedValue(null), markDismissed: jest.fn() } as any);
       const chat = overrides.chat ?? ({ generateAgentReply: jest.fn().mockResolvedValue('') } as any);
-      return new TripService({} as any, calendar, taleridCal, linkeonTasks, chat, dayFramingStore);
+      return new TripService(activePg() as any, calendar, taleridCal, linkeonTasks, chat, dayFramingStore);
     };
 
     it('day_framing_dismiss с kind=morning → зовёт store.markDismissed(userId, day, "morning")', async () => {
@@ -265,7 +268,7 @@ describe('computeCopilotState', () => {
       const dayFramingStore =
         overrides.dayFramingStore ?? ({ get: jest.fn().mockResolvedValue(null), upsert: jest.fn() } as any);
       const chat = overrides.chat ?? ({ generateAgentReply: jest.fn().mockResolvedValue('') } as any);
-      return new TripService({} as any, calendar, taleridCal, linkeonTasks, chat, dayFramingStore);
+      return new TripService(activePg() as any, calendar, taleridCal, linkeonTasks, chat, dayFramingStore);
     };
 
     it('строит факты, дёргает chat.generateAgentReply, апсертит результат в store', async () => {
@@ -341,7 +344,7 @@ describe('computeCopilotState', () => {
       const dayFramingStore =
         overrides.dayFramingStore ?? ({ get: jest.fn().mockResolvedValue(null), upsert: jest.fn() } as any);
       const chat = overrides.chat ?? ({ generateAgentReply: jest.fn().mockResolvedValue('') } as any);
-      return new TripService({} as any, calendar, taleridCal, linkeonTasks, chat, dayFramingStore);
+      return new TripService(activePg() as any, calendar, taleridCal, linkeonTasks, chat, dayFramingStore);
     };
 
     beforeEach(() => {

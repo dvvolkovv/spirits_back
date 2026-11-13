@@ -279,6 +279,13 @@ export class TalerIdOauthService {
   }
 
   async disconnect(userId: string): Promise<void> {
+    // In-flight refresh/auto-reprovision по завершении делает saveConnection()
+    // (upsert) и воскресил бы подключение уже удалённого аккаунта. Сначала
+    // дожидаемся его (результат уже не важен), затем стираем строку повторно:
+    // disconnect идемпотентен и последнее слово всегда за ним.
+    const running = this.refreshInFlight.get(userId);
+    this.refreshInFlight.delete(userId);
+    if (running) await running.then(() => undefined, () => undefined);
     await this.store.delete(userId);
   }
 }

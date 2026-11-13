@@ -96,6 +96,13 @@ export class ZoomOauthService {
   }
 
   async disconnect(userId: string): Promise<void> {
+    // Single-flight refresh, запущенный до disconnect, по завершении делает
+    // store.save() и воскресил бы подключение уже удалённого аккаунта. Сначала
+    // дожидаемся in-flight (результат уже не важен), затем стираем строку
+    // повторно: disconnect идемпотентен и последнее слово всегда за ним.
+    const running = this.refreshing.get(userId);
+    this.refreshing.delete(userId);
+    if (running) await running.then(() => undefined, () => undefined);
     await this.store.remove(userId);
   }
 

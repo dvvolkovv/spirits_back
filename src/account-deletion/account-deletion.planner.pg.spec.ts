@@ -11,6 +11,8 @@ import { DeletionCancelledError } from './account-deletion.safe';
 import { discoverRoutinePushDeletion } from '../routine-push/routine-account-deletion.adapter';
 import { discoverTelegramDeletion } from '../tg-bot/tg-account-deletion.adapter';
 import { discoverProductDeletion } from '../products/product-account-deletion.adapter';
+import { discoverCalendarDeletion } from '../calendar/calendar-account-deletion.adapter';
+import { discoverIntegrationDeletion } from '../integrations/integration-account-deletion.adapter';
 import type {
   DeletionAccount,
   DeletionJobRow,
@@ -388,6 +390,8 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       discoverRoutinePushDeletion,
       discoverTelegramDeletion,
       discoverProductDeletion,
+      discoverCalendarDeletion,
+      discoverIntegrationDeletion,
     ]);
     expect(DELETION_DEPENDENCIES['account.core.immediate']).toEqual({ allStop: true });
     expect(DELETION_DEPENDENCIES['account.core.purge']).toEqual({ allStop: true });
@@ -402,6 +406,9 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       allOf: ['voice-document.purge'],
     });
     expect(DELETION_DEPENDENCIES['routine.purge']).toBeUndefined();
+    expect(DELETION_DEPENDENCIES['calendar.purge']).toEqual({
+      allOf: ['calendar.stop'],
+    });
   });
 
   describe('assertCurrent', () => {

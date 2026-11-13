@@ -1,6 +1,8 @@
 import { discoverRoutinePushDeletion } from '../routine-push/routine-account-deletion.adapter';
 import { discoverTelegramDeletion } from '../tg-bot/tg-account-deletion.adapter';
 import { discoverProductDeletion } from '../products/product-account-deletion.adapter';
+import { discoverCalendarDeletion } from '../calendar/calendar-account-deletion.adapter';
+import { discoverIntegrationDeletion } from '../integrations/integration-account-deletion.adapter';
 import type {
   DeletionDiscoverer,
   DeletionResourceType,
@@ -10,6 +12,8 @@ export const DELETION_DISCOVERERS: readonly DeletionDiscoverer[] = [
   discoverRoutinePushDeletion,
   discoverTelegramDeletion,
   discoverProductDeletion,
+  discoverCalendarDeletion,
+  discoverIntegrationDeletion,
 ];
 
 export interface DeletionDependencyRule {
@@ -32,6 +36,9 @@ export const DELETION_DEPENDENCIES: Readonly<Partial<Record<
   'account.core.immediate': { allStop: true },
   'account.core.purge': { allStop: true },
   'product.purge': { sameResourceKey: ['product.stop'] },
+  // Секреты и строки календаря стираются только после успешной остановки
+  // подключений (design spec: «Остановка ... происходит до удаления»).
+  'calendar.purge': { allOf: ['calendar.stop'] },
   'custom-agent.purge': { allOf: ['telegram.purge'] },
   'voice.purge': {
     sameResourceKey: ['voice.stop'],

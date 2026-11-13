@@ -20,7 +20,13 @@ import { __setSafeFetchDepsForTests, assertPublicUrl } from '../common/net/safe-
 const ICS = 'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:1\r\nDTSTART:20260920T090000Z\r\nDTEND:20260920T100000Z\r\nSUMMARY:Планёрка\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n';
 
 function makeService() {
-  const pg = { query: jest.fn(async () => ({ rows: [], rowCount: 1 })) };
+  // Task 9: connectExchange начинается с SELECT state FROM user_id — отвечаем
+  // active, чтобы забор не маскировал проверяемые здесь SSRF-сценарии.
+  const pg = {
+    query: jest.fn(async (sql: string) => (String(sql).includes('SELECT state FROM user_id')
+      ? { rows: [{ state: 'active' }] }
+      : { rows: [], rowCount: 1 })),
+  };
   const svc = new CalendarService(pg as any, {} as any, {} as any, {} as any);
   return { svc, pg };
 }
@@ -119,7 +125,12 @@ describe('Exchange: адрес сервера ввёл человек', () => {
     expect(r).toEqual({ ok: false, error: 'Адрес сервера не подходит: адрес ведёт во внутреннюю сеть' });
     expect(test).not.toHaveBeenCalled();
     expect(execFile).not.toHaveBeenCalled();
-    expect(pg.query).not.toHaveBeenCalled();
+    // Task 9: единственный запрос к БД до отказа — забор состояния аккаунта
+    // (SELECT state FROM user_id); записи подключения и прочих обращений нет.
+    expect(pg.query).toHaveBeenCalled();
+    for (const call of pg.query.mock.calls) {
+      expect(String(call[0])).toContain('SELECT state FROM user_id');
+    }
   });
 
   it('коннектор сам не пускает curl во внутреннюю сеть (test → false, listEvents → [])', async () => {

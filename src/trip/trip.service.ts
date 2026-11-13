@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleInit, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, BadRequestException, ForbiddenException } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { CoPilotState } from './trip.types';
 import { CalendarService } from '../calendar/calendar.service';
@@ -412,6 +412,15 @@ export class TripService implements OnModuleInit {
   async applyAction(userId: string, idemKey: string, kind: string, payload: any): Promise<CoPilotState> {
     if (!idemKey) throw new BadRequestException('idemKey required');
     if (!kind) throw new BadRequestException('kind required');
+
+    // Забор на удалённом аккаунте (Task 9): applyAction мутирует задачи и
+    // внешние календари (включая ветки, идущие в TalerID напрямую) — удалённый
+    // аккаунт не должен менять ни своё, ни тем более чужое состояние.
+    const accountState = await this.pg.query(
+      `SELECT state FROM user_id WHERE internal_id=$1 LIMIT 1`,
+      [userId],
+    );
+    if (accountState.rows[0]?.state !== 'active') throw new ForbiddenException('account_inactive');
 
     if (kind === 'task_done') {
       const uid = payload?.uid;

@@ -78,12 +78,33 @@ export class CalendarService {
   ) {}
 
   /**
+   * Строгая проверка живости аккаунта (Task 9, удаление аккаунтов): один
+   * SELECT state FROM user_id до любых кредов/внешних вызовов. Нет строки или
+   * state не 'active' — аккаунт считаем удалённым и fail-closed не пускаем:
+   * удалённый аккаунт не должен ни читать чужие календари, ни писать в них,
+   * ни переподключаться. Отрицательный результат не кешируем — между вызовами
+   * возможна reactivation.
+   */
+  private async assertActive(userId: string): Promise<boolean> {
+    const r = await this.pg.query(
+      `SELECT state FROM user_id WHERE internal_id=$1 LIMIT 1`,
+      [userId],
+    );
+    return r.rows[0]?.state === 'active';
+  }
+
+  /** Сообщение забора: не раскрываем причину (удалён/заблокирован/нет строки). */
+  private static readonly INACTIVE_ERROR = 'Аккаунт неактивен';
+
+  /**
    * Best-effort "is TalerID the connected ecosystem for this user" check. Wrapped defensively —
    * a store failure must never break the (Yandex) calendar path, it just means we treat the user
    * as TalerID-not-connected for this call.
    */
   private async talerIdConnected(userId: string): Promise<boolean> {
     try {
+      // Забор до обращения к стору: удалённый аккаунт не «подключён» ни к чему.
+      if (!(await this.assertActive(userId))) return false;
       const conn = await this.talerIdStore.getConnection(userId);
       return conn?.status === 'connected';
     } catch (e: any) {
@@ -221,6 +242,8 @@ export class CalendarService {
   }
 
   private async creds(userId: string): Promise<CalendarCreds | null> {
+    // Забор до расшифровки секретов: удалённому аккаунту креды не выдаём.
+    if (!(await this.assertActive(userId))) return null;
     const r = await this.pg.query(
       `SELECT base_url, username, secret_enc, collection_url, todo_collection_url FROM calendar_connections WHERE user_id=$1 AND enabled=true AND provider='yandex' LIMIT 1`,
       [userId],
@@ -260,6 +283,7 @@ export class CalendarService {
   /** Переподключить сохранённое (отключённое) подключение: проверяем сохранённый пароль приложения
    *  и, если он ещё годен, снова включаем — без повторного ввода. Устарел → просим ввести заново. */
   async reconnect(userId: string): Promise<{ ok: boolean; error?: string }> {
+    if (!(await this.assertActive(userId))) return { ok: false, error: CalendarService.INACTIVE_ERROR };
     const row = (await this.pg.query(
       `SELECT provider, base_url, username, secret_enc FROM calendar_connections WHERE user_id=$1 AND secret_enc IS NOT NULL AND provider='yandex' ORDER BY enabled DESC LIMIT 1`,
       [userId],
@@ -273,6 +297,7 @@ export class CalendarService {
   }
 
   async connect(userId: string, provider: string, username: string, appPassword: string): Promise<{ ok: boolean; error?: string }> {
+    if (!(await this.assertActive(userId))) return { ok: false, error: CalendarService.INACTIVE_ERROR };
     const baseUrl = 'https://caldav.yandex.ru'; // provider→baseUrl map; yandex only for now
     username = (username || '').trim();
     // Яндекс ПОКАЗЫВАЕТ пароль приложения группами через пробелы («xxxx xxxx xxxx xxxx»), но сам
@@ -304,6 +329,7 @@ export class CalendarService {
   // ---- Exchange (рабочий Outlook по EWS/NTLM), read-only ----
 
   private async exchangeCreds(userId: string): Promise<ExchangeCreds | null> {
+    if (!(await this.assertActive(userId))) return null;
     const row = (await this.pg.query(
       `SELECT base_url, username, secret_enc FROM calendar_connections WHERE user_id=$1 AND provider='exchange' AND enabled=true LIMIT 1`,
       [userId],
@@ -315,6 +341,7 @@ export class CalendarService {
   /** Подключить рабочий Exchange по EWS: NTLM username = login@domain, пароль хранится шифрованно.
    *  Проверяем кредами реальный запрос, иначе «подключим» неработающее. */
   async connectExchange(userId: string, server: string, domain: string, login: string, password: string): Promise<{ ok: boolean; error?: string }> {
+    if (!(await this.assertActive(userId))) return { ok: false, error: CalendarService.INACTIVE_ERROR };
     server = (server || 'mail.clearwayintegration.com').trim().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
     domain = (domain || '').trim();
     login = (login || '').trim();
@@ -400,6 +427,8 @@ export class CalendarService {
    * No cross-source dedup (out of scope — plan §10.5, simple union).
    */
   async listEvents(userId: string, start: Date, end: Date): Promise<CalEvent[]> {
+    // Удалённый аккаунт не читает внешние календари (co-pilot для него мёртв).
+    if (!(await this.assertActive(userId))) return [];
     const out: CalEvent[] = [];
     const creds = await this.creds(userId);
     if (creds) {
@@ -480,6 +509,7 @@ export class CalendarService {
     userId: string,
     event: ProposedEvent,
   ): Promise<{ ok: boolean; created?: number; failed?: number; uids?: string[]; error?: string }> {
+    if (!(await this.assertActive(userId))) return { ok: false, error: 'Календарь не подключён' };
     if (await this.talerIdConnected(userId)) {
       try {
         const { created, failed, ids } = await this.talerIdConnector.createEvent(userId, event);
@@ -511,6 +541,10 @@ export class CalendarService {
    */
   async deleteEvent(userId: string, uid: string, source?: string): Promise<{ ok: boolean; error?: string }> {
     if (!uid) return { ok: false, error: 'Нет идентификатора события' };
+    // Забор ДО роутинга по source: ветка 'talerid' идёт в connector напрямую,
+    // минуя creds(), — без этой строки удалённый аккаунт стирал бы внешние
+    // события через TalerID MCP.
+    if (!(await this.assertActive(userId))) return { ok: false, error: 'Календарь не подключён' };
     if (source === 'talerid') {
       const r = await this.talerIdConnector.deleteEvent(userId, uid);
       if (r.ok) this.onWrite?.(userId);

@@ -147,15 +147,11 @@ export class ProfileService implements OnModuleInit {
   }
 
   async deleteProfile(userId: string) {
-    // Отзыв доступа Apple — обязательное требование к приложениям с Sign in
-    // with Apple: без него приложение навсегда остаётся в настройках Apple ID
-    // пользователя, а повторный вход молча возвращает прежнюю связку, будто
-    // аккаунт и не удаляли.
-    //
-    // Делается ДО удаления: после него identity-строки ещё нужны, чтобы найти
-    // сохранённый refresh-токен. Неудача отзыва удаление не срывает —
-    // человек попросил удалить аккаунт, и внешний сбой не повод ему отказать.
-    await this.revokeAppleAccess(userId);
+    // Отзыв доступа Apple (требование Sign in with Apple) отсюда убран и живёт
+    // в deletion-pipeline: integration.apple.stop в IntegrationsModule
+    // (Task 9) выполняется до identity unlink — порядок гарантирует зависимость
+    // account.core.purge {allStop:true}. Legacy deleteProfile будет заменён
+    // делегированием в координатор (Task 18).
 
     // `_` в LIKE экранирован: иначе удаление номера 7903016918 стёрло бы и
     // переписку 79030169187 — `_` в шаблоне совпадает с любым символом.
@@ -219,18 +215,6 @@ export class ProfileService implements OnModuleInit {
     // очищен, история удалена, баланс обнулён. Клиент после удаления сам
     // выходит и токен выбрасывает.
     return { success: true };
-  }
-
-  private async revokeAppleAccess(userId: string): Promise<void> {
-    if (!this.identity || !this.apple) return;
-    try {
-      const tokens = await this.identity.providerRefreshTokens(userId, 'apple');
-      for (const token of tokens) {
-        await this.apple.revokeToken(token, this.apple.primaryClientId());
-      }
-    } catch (e: any) {
-      this.logger?.warn?.(`отзыв доступа Apple при удалении ${userId} не удался: ${e.message}`);
-    }
   }
 
   async getUserProfile(requesterId: string, targetId: string) {

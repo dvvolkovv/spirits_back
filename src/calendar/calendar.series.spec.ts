@@ -83,9 +83,10 @@ describe('YandexCalDavConnector.createEvent — series writer', () => {
 describe('CalendarService.createEvent — wraps the series writer', () => {
   it('ok=true and onWrite fired when created>0, even with partial failure', async () => {
     const pg = {
-      query: jest.fn().mockResolvedValue({
-        rows: [{ base_url: YANDEX_CALDAV_BASE, username: 'u@yandex.ru', secret_enc: '', collection_url: COLLECTION_URL, todo_collection_url: null }],
-      }),
+      // Task 9: createEvent начинается с SELECT state FROM user_id (забор на удалённом аккаунте).
+      query: jest.fn(async (sql: string) => (String(sql).includes('SELECT state FROM user_id')
+        ? { rows: [{ state: 'active' }] }
+        : { rows: [{ base_url: YANDEX_CALDAV_BASE, username: 'u@yandex.ru', secret_enc: '', collection_url: COLLECTION_URL, todo_collection_url: null }] })),
     };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
@@ -102,9 +103,10 @@ describe('CalendarService.createEvent — wraps the series writer', () => {
 
   it('ok=false when created=0 (total failure), no cache bust', async () => {
     const pg = {
-      query: jest.fn().mockResolvedValue({
-        rows: [{ base_url: YANDEX_CALDAV_BASE, username: 'u@yandex.ru', secret_enc: '', collection_url: COLLECTION_URL, todo_collection_url: null }],
-      }),
+      // Task 9: createEvent начинается с SELECT state FROM user_id (забор на удалённом аккаунте).
+      query: jest.fn(async (sql: string) => (String(sql).includes('SELECT state FROM user_id')
+        ? { rows: [{ state: 'active' }] }
+        : { rows: [{ base_url: YANDEX_CALDAV_BASE, username: 'u@yandex.ru', secret_enc: '', collection_url: COLLECTION_URL, todo_collection_url: null }] })),
     };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
@@ -122,7 +124,7 @@ describe('CalendarService.createEvent — wraps the series writer', () => {
 
 describe('CalendarService.findConflicts — series-aware', () => {
   it('finds an overlap that only occurs at a LATER occurrence (occ #5), not occ #0', async () => {
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const pg = { query: jest.fn(async (sql: string) => (String(sql).includes('SELECT state FROM user_id') ? { rows: [{ state: 'active' }] } : { rows: [] })) };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
     const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
@@ -143,7 +145,7 @@ describe('CalendarService.findConflicts — series-aware', () => {
   });
 
   it('returns [] when expandOccurrences yields nothing (no datetime/recurrence/dates)', async () => {
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const pg = { query: jest.fn(async (sql: string) => (String(sql).includes('SELECT state FROM user_id') ? { rows: [{ state: 'active' }] } : { rows: [] })) };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
     const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
@@ -154,7 +156,7 @@ describe('CalendarService.findConflicts — series-aware', () => {
   });
 
   it('dedups matches across occurrences by uid', async () => {
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const pg = { query: jest.fn(async (sql: string) => (String(sql).includes('SELECT state FROM user_id') ? { rows: [{ state: 'active' }] } : { rows: [] })) };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
     const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
@@ -231,7 +233,7 @@ describe('CalendarService.getProposal — occurrenceCount/firstAt/lastAt', () =>
   });
 
   it('returns null when no row found', async () => {
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const pg = { query: jest.fn(async (sql: string) => (String(sql).includes('SELECT state FROM user_id') ? { rows: [{ state: 'active' }] } : { rows: [] })) };
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
     const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);

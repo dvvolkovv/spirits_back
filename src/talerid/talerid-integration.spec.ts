@@ -13,7 +13,16 @@ describe('CalendarService — TalerID aggregation + write routing', () => {
   afterEach(() => { jest.restoreAllMocks(); });
 
   function makePg(overrides: Partial<Record<string, jest.Mock>> = {}) {
-    return { query: jest.fn().mockResolvedValue({ rows: [] }), ...overrides } as any;
+    // Task 9: гейтящие методы CalendarService (listEvents/createEvent/...)
+    // начинаются с `SELECT state FROM user_id` — на него всегда отвечаем
+    // active, остальное делегируем прежнему моку.
+    const inner = overrides.query ?? jest.fn().mockResolvedValue({ rows: [] });
+    return {
+      ...overrides,
+      query: jest.fn((sql: string, params?: any[]) => (String(sql).includes('SELECT state FROM user_id')
+        ? Promise.resolve({ rows: [{ state: 'active' }] })
+        : inner(sql, params))),
+    } as any;
   }
   function makeTalerStore(overrides: Partial<Record<string, jest.Mock>> = {}) {
     return { getConnection: jest.fn().mockResolvedValue(null), ...overrides } as any;

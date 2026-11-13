@@ -2,13 +2,23 @@ import { encryptSecret, decryptSecret, hasSecretKey } from './crypto';
 import { overlaps, CalendarService } from './calendar.service';
 import { YandexCalDavConnector } from './caldav';
 
+// Task 9: гейтящие методы (creds/connect/reconnect/listEvents/createEvent/
+// deleteEvent/...) начинаются с `SELECT state FROM user_id`. Старые моки
+// отвечали { rows: [] } на всё, что теперь означало бы «аккаунт удалён».
+// Helper ниже отвечает active на state-запрос и пустой результат на всё прочее.
+const activeRowsPg = () => ({
+  query: jest.fn(async (sql: string) => (String(sql).includes('SELECT state FROM user_id')
+    ? { rows: [{ state: 'active' }] }
+    : { rows: [] })),
+});
+
 describe('connect() app-password hygiene', () => {
   beforeAll(() => { process.env.CALENDAR_SECRET_KEY = '0123456789abcdef0123456789abcdef'; });
   afterEach(() => jest.restoreAllMocks());
   // Regression: Яндекс показывает пароль приложения группами через пробелы; введённый как есть,
   // он уходил в Basic-auth с пробелами → 401 на «правильном» пароле. connect() должен вырезать ВСЕ пробелы.
   it('strips whitespace from the app-password and trims the username', async () => {
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const pg = activeRowsPg();
     const service = new CalendarService(pg as any, {} as any, {} as any, {} as any);
     const testSpy = jest.spyOn(YandexCalDavConnector.prototype, 'test').mockResolvedValue(true);
     jest.spyOn(YandexCalDavConnector.prototype, 'discoverCollection').mockResolvedValue('https://cal.example/');
@@ -79,7 +89,7 @@ describe('overlaps', () => {
 // own row in calendar_connections — never a hardcoded id, never another user's connection.
 describe('CalendarService.createEvent — write-scoping (no cross-user writes)', () => {
   it('is scoped to the passed userId and fails closed when that user has no connection', async () => {
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const pg = activeRowsPg();
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
     const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
@@ -94,7 +104,7 @@ describe('CalendarService.createEvent — write-scoping (no cross-user writes)',
   });
 
   it("never reaches another user's (the owner's) connection while creating an event for userB", async () => {
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const pg = activeRowsPg();
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
     const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
@@ -115,7 +125,7 @@ describe('CalendarService.createEvent — write-scoping (no cross-user writes)',
 // never touch another user's connection either.
 describe('CalendarService.setTaskDone — write-scoping (no cross-user writes)', () => {
   it('is scoped to the passed userId and fails closed when that user has no connection', async () => {
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const pg = activeRowsPg();
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
     const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
@@ -130,7 +140,7 @@ describe('CalendarService.setTaskDone — write-scoping (no cross-user writes)',
   });
 
   it("never reaches another user's (the owner's) connection while setting a task done for userB", async () => {
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const pg = activeRowsPg();
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
     const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
@@ -153,7 +163,7 @@ describe('createTaskFromProposal — task proposals route to the cloud task home
     const create = jest.fn().mockResolvedValue({ uid: 'u1' });
     const linkeonTasks = { create };
     const service = new CalendarService(
-      { query: jest.fn().mockResolvedValue({ rows: [] }) } as any,
+      activeRowsPg() as any,
       {} as any, {} as any, linkeonTasks as any,
     );
     return { service, create };
@@ -197,7 +207,7 @@ describe('createTaskRouted — TalerID-connected users write tasks to TalerID (o
     const createTask = jest.fn().mockResolvedValue({ ok: true, uid: 't1' });
     const linkeonCreate = jest.fn();
     const svc = new CalendarService(
-      { query: jest.fn().mockResolvedValue({ rows: [] }) } as any,
+      activeRowsPg() as any,
       { getConnection: jest.fn().mockResolvedValue({ status: 'connected' }) } as any,
       { createTask } as any,
       { create: linkeonCreate } as any,
@@ -216,7 +226,7 @@ describe('createTaskRouted — TalerID-connected users write tasks to TalerID (o
   });
   it('TalerID createTask fails → createTaskFromProposal returns false (proposal reverts)', async () => {
     const svc = new CalendarService(
-      { query: jest.fn().mockResolvedValue({ rows: [] }) } as any,
+      activeRowsPg() as any,
       { getConnection: jest.fn().mockResolvedValue({ status: 'connected' }) } as any,
       { createTask: jest.fn().mockResolvedValue({ ok: false }) } as any,
       { create: jest.fn() } as any,
@@ -235,7 +245,7 @@ describe('renameTasksByTitle — TalerID rename (dedupe routine occurrences by u
     ]);
     const updateTask = jest.fn().mockResolvedValue({ ok: true });
     const svc = new CalendarService(
-      { query: jest.fn().mockResolvedValue({ rows: [] }) } as any,
+      activeRowsPg() as any,
       { getConnection: jest.fn().mockResolvedValue({ status: 'connected' }) } as any,
       { listTasks, updateTask } as any,
       { create: jest.fn() } as any,
