@@ -7,6 +7,7 @@ import { PassThrough, Writable } from "node:stream";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { createRelayApp } from "./server.mjs";
 import { ensureSessionDirs, ensureListingGuard } from "./paths.mjs";
 
@@ -162,12 +163,16 @@ async function fixture(t, options = {}) {
     });
     return { response, text: await response.text() };
   };
-  const requestUpload = async (files, { sessionId = 'server-upload-session', fsKey = FS_KEY } = {}) => {
+  const requestUpload = async (
+    files,
+    { sessionId = 'server-upload-session', fsKey = FS_KEY, reqSystemPrompt, noFallback = true } = {},
+  ) => {
     const payload = new FormData();
     payload.append('message', 'test uploaded documents');
     payload.append('sessionId', sessionId);
     if (fsKey) payload.append('fs_key', fsKey);
-    payload.append('noFallback', '1');
+    if (noFallback) payload.append('noFallback', '1');
+    if (reqSystemPrompt !== undefined) payload.append('systemPrompt', reqSystemPrompt);
     for (const file of files) {
       payload.append('files', new Blob([file.body], {
         type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -251,6 +256,20 @@ test("server canary: settings и запреты только у перечисл
   assert.equal(arg(f.calls[1].args, "--disallowedTools").split(",").includes("WebFetch"), false);
 });
 
+test('server canary: перечисленная upload-сессия получает тот же запрет Agent', async (t) => {
+  const f = await fixture(t, {
+    mode: 'canary',
+    canaryKeys: 'server-upload-session\n',
+  });
+  const { response } = await f.requestUpload([
+    { name: 'canary.pdf', body: 'synthetic-canary-body' },
+  ]);
+  assert.equal(response.status, 200);
+  const denied = arg(f.calls[0].args, '--disallowedTools').split(',');
+  assert.ok(denied.includes('Agent'));
+  assert.ok(denied.includes('WebFetch'));
+});
+
 test("server retry: один settings и один MCP на обе попытки, cleanup после успеха", async (t) => {
   const seen = [];
   const f = await fixture(t, {
@@ -267,6 +286,31 @@ test("server retry: один settings и один MCP на обе попытки
   assert.equal(f.calls.length, 2);
   assert.deepEqual(seen[0], seen[1]);
   assert.deepEqual(f.turnFiles(), []);
+});
+
+test('server retry: upload-политика одинакова на обеих попытках', async (t) => {
+  const seen = [];
+  const f = await fixture(t, {
+    onSpawn(call, index) {
+      seen.push({
+        denied: arg(call.args, '--disallowedTools'),
+        inlinePrompt: arg(call.args, '--system-prompt'),
+        appendFile: arg(call.args, '--append-system-prompt-file'),
+        snapshot: arg(call.args, '--system-prompt-snapshot'),
+        prompt: fs.readFileSync(arg(call.args, '--append-system-prompt-file'), 'utf8'),
+      });
+      finishChild(call.child, index === 0
+        ? [{ type: 'result', subtype: 'error', is_error: true, result: 'API Error: 500 Internal Server Error' }]
+        : undefined);
+    },
+  });
+  const { response } = await f.requestUpload([
+    { name: 'retry.pdf', body: 'synthetic-retry-body' },
+  ]);
+  assert.equal(response.status, 200);
+  assert.equal(f.calls.length, 2);
+  assert.deepEqual(seen[0], seen[1]);
+  assert.ok(seen[0].denied.split(',').includes('Agent'));
 });
 
 test("server fallback: тот же settings/MCP у запасного провайдера и его env whitelist", async (t) => {
@@ -289,6 +333,32 @@ test("server fallback: тот же settings/MCP у запасного прова
   assert.equal(f.calls[1].options.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "1");
   assert.equal(f.calls[1].options.env.UNRELATED_SECRET, undefined);
   assert.deepEqual(f.turnFiles(), []);
+});
+
+test('server fallback: upload-политика сохраняется у запасного провайдера', async (t) => {
+  const seen = [];
+  const f = await fixture(t, {
+    fallback: true,
+    onSpawn(call, index) {
+      seen.push({
+        denied: arg(call.args, '--disallowedTools'),
+        inlinePrompt: arg(call.args, '--system-prompt'),
+        appendFile: arg(call.args, '--append-system-prompt-file'),
+        snapshot: arg(call.args, '--system-prompt-snapshot'),
+        prompt: fs.readFileSync(arg(call.args, '--append-system-prompt-file'), 'utf8'),
+      });
+      finishChild(call.child, index === 0
+        ? [{ type: 'result', subtype: 'success', result: 'Not logged in' }]
+        : undefined);
+    },
+  });
+  const { response } = await f.requestUpload([
+    { name: 'fallback.pdf', body: 'synthetic-fallback-body' },
+  ], { noFallback: false });
+  assert.equal(response.status, 200);
+  assert.equal(f.calls.length, 2);
+  assert.deepEqual(seen[0], seen[1]);
+  assert.ok(seen[0].denied.split(',').includes('Agent'));
 });
 
 test("server setup error: неизвестная schema fail-closed, MCP удалён, spawn не вызывается", async (t) => {
@@ -340,6 +410,9 @@ test("server partial MCP write: безопасный fallback на base config, 
     onSpawn(call) {
       filesAtSpawn = f.turnFiles();
       assert.ok(arg(call.args, "--mcp-config").endsWith("empty-mcp.json"));
+      const prompt = fs.readFileSync(arg(call.args, '--append-system-prompt-file'), 'utf8');
+      assert.match(prompt, /Не поручай Agent повторный анализ документа/);
+      assert.match(prompt, /Unknown skill/);
       finishChild(call.child);
     },
   });
@@ -457,6 +530,120 @@ for (const legacyKey of ['70000000000_12_ru', 'mcp']) {
     assert.ok(arg(f.calls[0].args, '--allowedTools').includes(`Read(${f.dirs.uploadDir}/${legacyKey}_*)`));
   });
 }
+
+for (const mode of ['on', 'off']) {
+  test(`server ${mode}: новое вложение запрещает Agent и задаёт один последовательный анализ`, async (t) => {
+    const f = await fixture(t, { mode });
+    const { response } = await f.requestUpload([
+      { name: 'policy.pdf', body: 'synthetic-pdf-body' },
+    ]);
+    assert.equal(response.status, 200);
+    assert.equal(f.calls.length, 1);
+
+    const denied = arg(f.calls[0].args, '--disallowedTools').split(',');
+    assert.ok(denied.includes('Agent'));
+    assert.equal(denied.includes('WebFetch'), mode === 'on', 'прежнее sandbox-правило WebFetch не изменилось');
+    assert.equal(arg(f.calls[0].args, '--system-prompt-snapshot'), 'off');
+
+    const rules = fs.readFileSync(arg(f.calls[0].args, '--append-system-prompt-file'), 'utf8');
+    assert.match(rules, /Agent недоступен: весь запрошенный анализ выполняет основная модель/);
+    assert.match(rules, /для полного разбора читай документ последовательно частями/i);
+    assert.match(rules, /25 000 токенов/);
+    assert.match(rules, /Не используй Bash sleep для ожидания субагентов/);
+  });
+}
+
+test('server on: непринятый файл не включает запрет Agent', async (t) => {
+  const fileOps = {
+    ...fs,
+    renameSync() {
+      const err = new Error('rename denied by test');
+      err.code = 'EACCES';
+      throw err;
+    },
+  };
+  const f = await fixture(t, { mode: 'on', fileOps });
+  const { response } = await f.requestUpload([
+    { name: 'not-accepted.pdf', body: 'synthetic-body' },
+  ]);
+  assert.equal(response.status, 200);
+  assert.equal(f.calls.length, 1);
+
+  const denied = arg(f.calls[0].args, '--disallowedTools').split(',');
+  assert.equal(denied.includes('Agent'), false);
+  assert.equal(f.calls[0].child.input.includes('User uploaded files:'), false);
+});
+
+test('server resumed upload: --resume сохраняет запрет Agent и upload append-файл', async (t) => {
+  const f = await fixture(t, { mode: 'on' });
+  await f.requestUpload([{ name: 'first.pdf', body: 'first-synthetic-body' }]);
+  await f.requestUpload([{ name: 'second.pdf', body: 'second-synthetic-body' }]);
+  assert.equal(f.calls.length, 2);
+  const resumed = f.calls[1].args;
+  assert.equal(arg(resumed, '--resume'), 'claude-test-session');
+  assert.ok(arg(resumed, '--disallowedTools').split(',').includes('Agent'));
+  assert.ok(arg(resumed, '--append-system-prompt-file').endsWith('document-analysis-rules-upload.txt'));
+  assert.equal(arg(resumed, '--system-prompt-snapshot'), 'off');
+});
+
+test('document analysis rules: upload начинается с полного базового файла', () => {
+  const base = fs.readFileSync(new URL('./document-analysis-rules.txt', import.meta.url), 'utf8');
+  const upload = fs.readFileSync(new URL('./document-analysis-rules-upload.txt', import.meta.url), 'utf8');
+  assert.ok(base.length > 0);
+  assert.equal(upload.startsWith(base), true);
+  for (const rules of [base, upload]) {
+    assert.match(rules, /Если выбранный локальный способ не сработал, используй другой подход через Read\/Bash/);
+    assert.match(rules, /не перепланируй работу только ради поиска другого Skill/);
+  }
+});
+
+test('server off: текстовый ход сохраняет Agent и получает общие правила без дублирования', async (t) => {
+  const f = await fixture(t, { mode: 'off' });
+  const { response } = await f.request();
+  assert.equal(response.status, 200);
+
+  const denied = arg(f.calls[0].args, '--disallowedTools').split(',');
+  assert.equal(denied.includes('Agent'), false);
+  assert.ok(denied.includes('ToolSearch'));
+  assert.equal(denied.includes('WebFetch'), false);
+
+  const rules = fs.readFileSync(arg(f.calls[0].args, '--append-system-prompt-file'), 'utf8');
+  assert.match(rules, /Не поручай Agent повторный анализ документа/);
+  assert.match(rules, /Не используй Bash sleep для ожидания субагентов/);
+  assert.match(rules, /Unknown skill/);
+  assert.match(rules, /не перебирай другие skills/);
+});
+
+test('server off: правила документов не увеличивают argv сверх 131071 байта', async (t) => {
+  const f = await fixture(t, { mode: 'off' });
+  const baseline = await f.requestUpload([], { sessionId: 'server-argv-baseline' });
+  assert.equal(baseline.response.status, 200);
+
+  // Восстанавливаем прежний inline baseline: в красной реализации общие правила
+  // уже добавлены в --system-prompt, а в исправленной будут только в append-файле.
+  const baselinePrompt = arg(f.calls[0].args, '--system-prompt');
+  const legacyBaselinePrompt = baselinePrompt.split('\n\nДОКУМЕНТЫ И СУБАГЕНТЫ.')[0];
+  const baselineBytes = Buffer.byteLength(legacyBaselinePrompt, 'utf8') + Buffer.byteLength('\n\n', 'utf8');
+  const reqSystemPrompt = 'x'.repeat(131071 - baselineBytes);
+  const boundary = await f.requestUpload([], { reqSystemPrompt, sessionId: 'server-argv-boundary' });
+  assert.equal(boundary.response.status, 200);
+
+  const args = f.calls[1].args;
+  const inlinePrompt = arg(args, '--system-prompt');
+  const inlineBytes = Buffer.byteLength(inlinePrompt, 'utf8');
+  assert.ok(inlineBytes <= 131071, `inline --system-prompt: ${inlineBytes} байт`);
+  assert.equal(inlineBytes, 131071);
+  for (const marker of ['ДОКУМЕНТЫ И СУБАГЕНТЫ.', 'UNKNOWN SKILL.', 'АНАЛИЗ НОВОГО ВЛОЖЕНИЯ.']) {
+    assert.equal(inlinePrompt.includes(marker), false);
+  }
+
+  const rules = fs.readFileSync(arg(args, '--append-system-prompt-file'), 'utf8');
+  assert.match(rules, /ДОКУМЕНТЫ И СУБАГЕНТЫ/);
+  assert.match(rules, /UNKNOWN SKILL/);
+  const spawned = spawnSync('/bin/true', args, { encoding: 'utf8' });
+  assert.equal(spawned.error, undefined);
+  assert.equal(spawned.status, 0);
+});
 
 test('server off: текстовый ход без вложений не обращается к каталогу загрузок', async (t) => {
   const f = await fixture(t, { mode: 'off' });

@@ -288,6 +288,27 @@ test('промпт: on не обещает sudo/apt и использует то
   assert.ok(prompt.endsWith('KEEP THIS TEXT'));
 });
 
+test('промпт on: DOCX/PDF идёт через WeasyPrint, а не LibreOffice', () => {
+  const input = [
+    'PRE-INSTALLED: ffmpeg, ImageMagick, LibreOffice, Inkscape, poppler-utils',
+    '4. For pptx: use python-pptx, keep simple, validate with soffice --headless --convert-to pdf.',
+  ].join('\n');
+  const out = applySandboxPrompt(input, true);
+  assert.ok(out.includes('PRE-INSTALLED: ffmpeg, ImageMagick, Inkscape, poppler-utils'));
+  assert.equal(out.includes('PRE-INSTALLED: ffmpeg, ImageMagick, LibreOffice'), false);
+  assert.equal(out.includes('validate with soffice'), false);
+  const pptxRule = out.split('\n').find((line) => line.includes('For pptx:'));
+  assert.ok(pptxRule.includes('validate structurally with python-pptx'));
+  assert.equal(pptxRule.includes('python-docx'), false);
+  assert.match(pptxRule, /do not claim visual PDF validation/);
+  assert.match(out, /Do NOT run soffice, soffice\.bin, lowriter/);
+  assert.match(out, /python-docx/);
+  assert.match(out, /import weasyprint/);
+  assert.match(out, /pdfinfo/);
+  assert.match(out, /pdftoppm/);
+  assert.match(out, /seccomp/);
+});
+
 test('детект сбоя песочницы: только tool_result известного Bash tool_use', () => {
   const bashIds = new Set(['bash-1']);
   const event = (id, content) => ({

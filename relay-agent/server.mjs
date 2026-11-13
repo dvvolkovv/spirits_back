@@ -572,12 +572,12 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
     for (const f of req.files) {
       const newPath = path.join(uploadSessionDir, uploadFileName(f.originalname, fsKey));
       try {
-        fs.renameSync(f.path, newPath);
+        fileOps.renameSync(f.path, newPath);
         renamedFiles.push({ path: newPath, name: f.originalname, size: f.size });
       } catch (e) {
         const fallback = path.join(uploadSessionDir, fallbackFileName(f.originalname, fsKey, randomUUID()));
         try {
-          fs.renameSync(f.path, fallback);
+          fileOps.renameSync(f.path, fallback);
           renamedFiles.push({ path: fallback, name: f.originalname, size: f.size });
         } catch (e2) {
           try { fs.unlinkSync(f.path); } catch {}
@@ -586,8 +586,9 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
     }
   }
 
+  const hasNewUploads = renamedFiles.length > 0;
   let prompt = "";
-  if (renamedFiles.length > 0) {
+  if (hasNewUploads) {
     prompt += "User uploaded files:\n";
     for (const f of renamedFiles) prompt += "- " + f.path + " (name: " + f.name + ", " + f.size + " bytes)\n";
     prompt += "\n";
@@ -709,6 +710,15 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   // приклей мы персону раньше — она бы там потерялась. Пустое поле (старый
   // бэкенд) оставляет поведение ровно прежним.
   if (reqSystemPrompt) systemPrompt += "\n\n" + reqSystemPrompt;
+  const disallowedTools = [
+    'mcp__plugin_telegram_telegram__reply',
+    'mcp__plugin_telegram_telegram__react',
+    'mcp__plugin_telegram_telegram__edit_message',
+    'mcp__plugin_telegram_telegram__download_attachment',
+    'ToolSearch',
+    ...(sbxOn ? ['WebFetch'] : []),
+    ...(hasNewUploads ? ['Agent'] : []),
+  ].join(',');
 
   // Один settings-файл на весь HTTP-ход: его используют первый запуск, повторы
   // и запасные провайдеры. Удаляется в finally независимо от sessionMcpPath.
@@ -754,7 +764,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
     "--max-turns", "40",
     ...cliToolArgs(reqTestMode, allowedTools),
     ...(sbxOn ? ["--settings", sandboxSettingsPath] : []),
-    "--disallowedTools", "mcp__plugin_telegram_telegram__reply,mcp__plugin_telegram_telegram__react,mcp__plugin_telegram_telegram__edit_message,mcp__plugin_telegram_telegram__download_attachment,ToolSearch" + (sbxOn ? ",WebFetch" : ""),
+    "--disallowedTools", disallowedTools,
     "--mcp-config", mcpConfigPath,
     "--strict-mcp-config",
     // Снимок промпта выключен. CLI 2.1.280 в режиме --print пишет в транскрипт
@@ -766,6 +776,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
     // новому. Цена — холодный кэш на ходе, где поменялся промпт (так и было до 23.09).
     "--system-prompt-snapshot", "off",
     "--system-prompt", systemPrompt,
+    "--append-system-prompt-file", path.join(HERE, hasNewUploads ? "document-analysis-rules-upload.txt" : "document-analysis-rules.txt"),
   ];
 
   let clientDisconnected = false;
