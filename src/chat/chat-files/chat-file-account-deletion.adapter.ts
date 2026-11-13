@@ -256,7 +256,8 @@ export class ChatFileAccountDeletionAdapter implements OnModuleInit, AccountDele
     }
 
     await ctx.assertCurrent(job);
-    await this.assertSoleOwner(job, ctx, bucket, key);
+    // Чужая ссылка на тот же объект — объект сохраняется, job успешен.
+    if (await this.hasForeignReference(job, ctx, bucket, key)) return;
     await ctx.assertCurrent(job);
 
     await this.deleteConfirmedOrRetry({ bucket, key });
@@ -271,25 +272,26 @@ export class ChatFileAccountDeletionAdapter implements OnModuleInit, AccountDele
   }
 
   /**
-   * Единственность владения перед КАЖДЫМ удалением: чужая ссылка на тот же
-   * объект сохраняет объект (job успешен), собственная каноническая строка —
-   * retry kind db (её удалит её задача, повтор дождётся).
+   * Единственность владения перед КАЖДЫМ удалением: true — объект нужен
+   * чужим данным (удалять нельзя); собственная каноническая строка ещё на
+   * месте — retry kind db (её удалит её задача, повтор дождётся).
    */
-  private async assertSoleOwner(
+  private async hasForeignReference(
     job: DeletionJobRow,
     ctx: DeletionExecution,
     bucket: string,
     key: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const needles = needlesFor(bucket, key);
     for (const place of refPlaces(needles.length)) {
       const res = await ctx.db.query(place.sql, [job.userId, ...needles]);
       const row = res.rows?.[0] ?? {};
       const total = Number(row.total ?? 0);
       const own = Number(row.own ?? 0);
-      if (total > own) return; // объект нужен чужим данным — не удаляем
+      if (total > own) return true;
       if (own > 0) throw new DeletionRetryError('db');
     }
+    return false;
   }
 
   /**
