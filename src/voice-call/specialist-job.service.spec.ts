@@ -8,11 +8,17 @@ function makePg() {
   const jobs: any[] = [];
   const history: any[] = [];
   const charges: any[] = [];
-  return {
+  const self: any = {
     jobs,
     history,
     charges,
+    // Task 10 (удаление аккаунта): строгий active-гейт читает state из user_id.
+    // По умолчанию active — существующие тесты не меняют поведение.
+    userState: 'active',
     query: jest.fn(async (sql: string, params: any[] = []) => {
+      if (/FROM user_id\b/i.test(sql)) {
+        return { rows: [{ state: self.userState }], rowCount: 1 };
+      }
       if (/INSERT INTO custom_chat_history/i.test(sql)) {
         history.push({ session_id: params[0], agent: params[1], content: params[2], sender_type: /'human'/.test(sql) ? 'human' : 'ai' });
         return { rows: [], rowCount: 1 };
@@ -42,6 +48,7 @@ function makePg() {
       return { rows: [], rowCount: 0 };
     }),
   };
+  return self;
 }
 
 /** Заглушка LanguageService. */
@@ -372,5 +379,57 @@ describe('списание за консультацию', () => {
 
     expect(chat.generateAgentReplyWithCharge).toHaveBeenCalledTimes(1);
     expect(chat.generateAgentReplyWithCharge.mock.calls[0][4]).toBeUndefined();
+  });
+});
+
+/**
+ * Task 10 (удаление аккаунта): фоновое продолжение ask() обязано иметь
+ * строгий active-гейт (SELECT state FROM user_id, без кэша) ДО похода в LLM
+ * и ДО обновления строк. Удалённый аккаунт не консультируется у специалистов
+ * и не оставляет новых строк.
+ */
+describe('удалённый аккаунт: консультация специалиста не продолжается', () => {
+  const ROOM = 'voice_test_room';
+  const CALL = '44444444-4444-4444-4444-444444444444';
+
+  it('ask(): пользователь удалён до старта — LLM не зовётся, строки не обновляются', async () => {
+    const pg = makePg();
+    pg.userState = 'deleted';
+    const chat = { generateAgentReplyWithCharge: jest.fn() };
+    const lk = { send: jest.fn(async () => {}) };
+    const svc = new SpecialistJobService(pg as any, chat as any, lk as any, makeLang() as any);
+
+    const res = await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'Можно ли так?');
+    expect(res).toMatchObject({ status: 'asked' });
+    await svc.drainForTests();
+
+    expect(chat.generateAgentReplyWithCharge).not.toHaveBeenCalled();
+    // Job не уходит ни в 'running', ни в 'done'/'failed' — строки не обновляются.
+    expect(pg.jobs).toHaveLength(1);
+    expect(pg.jobs[0].status).toBe('queued');
+    expect(pg.history).toHaveLength(0);
+    expect(pg.charges).toHaveLength(0);
+  });
+
+  it('ask(): удаление во время ответа специалиста — done/charge/чат не пишутся', async () => {
+    const pg = makePg();
+    const chat = {
+      generateAgentReplyWithCharge: jest.fn(async () => {
+        // Аккаунт удалили, пока специалист думал.
+        pg.userState = 'deleted';
+        return { text: 'ответ юриста', tokens: 100, costUsd: 0.1 };
+      }),
+    };
+    const lk = { send: jest.fn(async () => {}) };
+    const svc = new SpecialistJobService(pg as any, chat as any, lk as any, makeLang() as any);
+
+    await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'Можно ли так?');
+    await svc.drainForTests();
+
+    // done-обновления и списания нет; ответ в чат не ложится.
+    expect(pg.jobs[0].status).not.toBe('done');
+    expect(pg.charges).toHaveLength(0);
+    const answers = pg.history.filter((h: any) => h.sender_type === 'ai');
+    expect(answers).toHaveLength(0);
   });
 });
