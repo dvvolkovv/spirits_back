@@ -39,4 +39,25 @@ describe('ChatUploadsService', () => {
     expect(service.verifyAssistant('11111111-1111-4111-8111-111111111111', '4600', 'bad', 1000)).toBe(false);
     expect(service.verifyAssistant('11111111-1111-4111-8111-111111111111', '4600', url.split('sig=')[1], 4601)).toBe(false);
   });
+
+  it('блок ассистента пуст при выключенном флаге и подписан при включённом', () => {
+    const record = {
+      id: '11111111-1111-4111-8111-111111111111',
+      userId: 'u1',
+      sessionId: 'u1_12',
+      originalName: 'a.pdf',
+      mime: 'application/pdf',
+      sizeBytes: 3,
+      sha256: 'a'.repeat(64),
+      storageKey: 'k/a.pdf',
+      createdAt: '2026-01-01T00:00:00.000Z',
+    };
+    process.env.CHAT_UPLOADS_ENABLED = 'false';
+    expect(service.assistantBlock([record])).toBe('');
+
+    process.env.CHAT_UPLOADS_ENABLED = 'true';
+    const block = service.assistantBlock([record]);
+    expect(block).toContain(`Earlier user uploads:\n- a.pdf: https://my.linkeon.test/webhook/chat-uploads/${record.id}`);
+    expect(block).toMatch(/\?exp=\d+&sig=[0-9a-f]{64}$/);
+  });
 });
