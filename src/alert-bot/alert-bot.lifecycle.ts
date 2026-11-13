@@ -39,6 +39,7 @@ export class AlertBotLifecycle implements OnModuleInit, OnModuleDestroy, BeforeA
     if (!alertBotEnabled()) return;
     await this.ops.start();
     const interrupted = await this.store.interruptInProgress();
+    await this.repairStore.interruptActive();
     await this.store.requeueProcessingUpdates();
     setAlertSentSink((chatId, messageId, text) => this.store.recordAlert(chatId, messageId, text));
     for (const turn of interrupted) {
@@ -46,7 +47,11 @@ export class AlertBotLifecycle implements OnModuleInit, OnModuleDestroy, BeforeA
         .catch(() => {});
     }
     await this.store.cleanup().catch(() => {});
-    this.cleanupTimer = setInterval(() => this.store.cleanup().catch(() => {}), 24 * 60 * 60 * 1000);
+    await this.repairStore.cleanup().catch(() => {});
+    this.cleanupTimer = setInterval(() => {
+      void this.store.cleanup().catch(() => {});
+      void this.repairStore.cleanup().catch(() => {});
+    }, 24 * 60 * 60 * 1000);
     this.cleanupTimer.unref();
     this.retryTimer = setInterval(() => { void this.retryDue(); }, RETRY_INTERVAL_MS);
     this.retryTimer.unref();
