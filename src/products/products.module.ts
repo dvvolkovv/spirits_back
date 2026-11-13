@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { AccountDeletionModule } from '../account-deletion/account-deletion.module';
 import { CommonModule } from '../common/common.module';
 import { MiscModule } from '../misc/misc.module';
 import { ProductsController } from './products.controller';
@@ -23,9 +24,11 @@ import { ProductLifecycleService } from './product-lifecycle.service';
 import { ProductLifecycleTool } from './product-lifecycle-tool';
 import { ProductKeysService } from './product-keys.service';
 import { ProductPurgeService } from './product-purge.service';
+import { ProductAccountDeletionService } from './product-account-deletion.service';
+import { ProductAccountDeletionAdapter } from './product-account-deletion.adapter';
 
 @Module({
-  imports: [CommonModule, MiscModule],
+  imports: [CommonModule, MiscModule, AccountDeletionModule],
   // HostController обязан быть ЗДЕСЬ, а не только существовать: маршруты
   // незарегистрированного контроллера отдают 404, а все тесты вида
   // `new HostController(mock)` остаются зелёными. Сторож — products.routes.spec.ts.
@@ -90,6 +93,8 @@ import { ProductPurgeService } from './product-purge.service';
     // отвечал бы «смена ключей недоступна» при полностью выкаченном коде.
     ProductKeysService,
     ProductPurgeService,
+    ProductAccountDeletionService,
+    ProductAccountDeletionAdapter,
   ],
   exports: [
     ProductsService,

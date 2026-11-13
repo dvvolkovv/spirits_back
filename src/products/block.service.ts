@@ -6,6 +6,11 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
+import {
+  killActiveProvisionJobsCte,
+  killActiveTurnsCte,
+  queueForcedSleepCte,
+} from './product-forced-stop';
 
 /**
  * Форма `products.id`. Проверяется ПЕРВОЙ — почему именно первой, разобрано в
@@ -301,26 +306,7 @@ export class BlockService {
             FROM found f
            WHERE f.archived_at IS NULL
              AND (SELECT count(*) FROM found) = 1
-       ), killed_jobs AS (
-          UPDATE product_provision_jobs j
-             SET status = 'failed', error = $3, finished_at = now()
-            FROM target t
-           WHERE j.product_id = t.id
-             AND j.status IN ('queued','running')
-          RETURNING j.id
-       ), killed_turns AS (
-          -- Ход убивается БЕЗ оглядки на его признаки жизни — этим блокировка
-          -- и отличается от сна (см. докблок класса). 'queued' здесь наравне с
-          -- 'running': ход, который ещё не забрал раннер, всё равно держит
-          -- замок product_turns_one_active и всё равно уехал бы в контейнер,
-          -- если бы гашение сорвалось.
-          UPDATE product_turns tr
-             SET status = 'failed', error = $4, finished_at = now()
-            FROM target t
-           WHERE tr.product_id = t.id
-             AND tr.status IN ('queued','running')
-          RETURNING tr.id
-       ), marked AS (
+       ), ${killActiveProvisionJobsCte('$3')}, ${killActiveTurnsCte('$4')}, marked AS (
           -- sleep_reason НЕ трогается. Продукт мог спать за неуплату до
           -- блокировки, и снятие блокировки вернёт его в 'sleeping': стёртая
           -- причина оставила бы владельца со спящим продуктом без объяснения.
@@ -329,20 +315,7 @@ export class BlockService {
             FROM target t
            WHERE p.id = t.id
           RETURNING p.id
-       ), queued AS (
-          INSERT INTO product_provision_jobs (product_id, kind, status)
-          SELECT m.id, 'sleep', 'queued'
-            FROM marked m
-           -- Ссылка на killed_jobs существует ради ПОРЯДКА, а не ради
-           -- значения: см. «порядок частей закреплён ссылкой» выше. Без неё
-           -- вставка исполняется раньше снятия и падает с 23505.
-           --
-           -- ON CONFLICT DO NOTHING здесь НЕТ намеренно: он превратил бы
-           -- чужую гонку из отката всего оператора в блокированный продукт с
-           -- работающим контейнером. См. докблок выше.
-           WHERE (SELECT count(*) FROM killed_jobs) >= 0
-          RETURNING product_id
-       )
+       ), ${queueForcedSleepCte()}
        SELECT f.id, f.slug, f.status, (f.archived_at IS NOT NULL) AS archived,
               (SELECT count(*) FROM queued)       AS queued,
               (SELECT count(*) FROM killed_jobs)  AS killed_jobs,

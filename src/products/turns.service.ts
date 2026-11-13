@@ -313,7 +313,11 @@ export class TurnsService implements OnModuleInit, OnModuleDestroy {
     // будущий телеграм-вход унаследовал бы шлагбаум по балансу даром, а
     // проверку владения молча не получил. Условие в тот же запрос — бесплатно.
     const p = await this.pg.query(
-      `SELECT status FROM products WHERE id = $1 AND user_id = $2 AND archived_at IS NULL`,
+      `SELECT status FROM products WHERE id = $1 AND user_id = $2 AND archived_at IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM user_id u
+            WHERE u.internal_id=products.user_id AND u.state='deleted'
+         )`,
       [input.productId, input.userId],
     );
     const productStatus = p.rows[0]?.status;
@@ -384,11 +388,23 @@ export class TurnsService implements OnModuleInit, OnModuleDestroy {
     try {
       const r = await this.pg.query(
         `INSERT INTO product_turns (product_id, user_id, channel, prompt, revert_to_sha, status)
-         VALUES ($1, $2, $3, $4, $5, 'queued')
+         SELECT * FROM (VALUES ($1, $2, $3, $4, $5, 'queued')) AS draft
+           (product_id, user_id, channel, prompt, revert_to_sha, status)
+         WHERE EXISTS (
+           SELECT 1 FROM products p
+            WHERE p.id=$1 AND p.user_id=$2 AND p.archived_at IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM user_id u
+                 WHERE u.internal_id=p.user_id AND u.state='deleted'
+              )
+         )
          RETURNING id, status`,
         [input.productId, input.userId, input.channel, masked.text, input.revertToSha ?? null],
       );
-      const row: TurnRow = r.rows[0];
+      const row: TurnRow | undefined = r.rows[0];
+      // Удаление могло стать видимым между ранним SELECT и INSERT. Атомарный
+      // predicate выше тогда не ставит строку, а вызов получает тот же not found.
+      if (!row) throw new NotFoundException('Product not found');
       return masked.count > 0 ? { ...row, masked: { count: masked.count, names: masked.names } } : row;
     } catch (e: any) {
       // Только замок product_turns_one_active. Это не ошибка сервера: клиент

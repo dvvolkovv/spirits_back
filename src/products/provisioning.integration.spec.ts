@@ -180,6 +180,14 @@ maybe('провижининг против живого Postgres', () => {
     for (const f of MIGRATIONS) {
       await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', f), 'utf8'));
     }
+    // Общий account-deletion guard в TurnsService: пустая таблица сохраняет
+    // прежнее active-поведение всех фикстур этого suite.
+    await pool.query(`CREATE TABLE IF NOT EXISTS user_id (
+      internal_id text PRIMARY KEY,
+      state text,
+      deleted_at timestamptz,
+      deletion_id uuid
+    )`);
     // ГАРД НА ЧУЖУЮ БАЗУ. beforeEach делает TRUNCATE и адрес не разбирает, а
     // на той же тестовой ноде живёт база стенда test.linkeon.io, где эти три
     // таблицы уже созданы: один PROVISIONING_PG_URL, скопированный не из той
