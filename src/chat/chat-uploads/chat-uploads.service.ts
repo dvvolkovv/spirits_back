@@ -1,5 +1,7 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 import { Readable } from 'stream';
 import { PgService } from '../../common/services/pg.service';
 import { StorageService } from '../../common/services/storage.service';
@@ -48,6 +50,22 @@ export class ChatUploadsService {
     private readonly pg: PgService,
     private readonly storage: StorageService,
   ) {}
+
+  /**
+   * Создать таблицу реестра при старте модуля (образец — alert-bot.store.ts).
+   * nest-cli не копирует .sql в dist, поэтому второй кандидат читает файл из
+   * src: после сборки сервис лежит в dist/chat/chat-uploads, и «..» ровно три.
+   */
+  async migrate(): Promise<void> {
+    const candidates = [
+      path.join(__dirname, 'migrations', '001_chat_uploads.sql'),
+      path.join(__dirname, '..', '..', '..', 'src', 'chat', 'chat-uploads', 'migrations', '001_chat_uploads.sql'),
+    ];
+    const migrationPath = candidates.find((candidate) => fs.existsSync(candidate));
+    if (!migrationPath) throw new Error('chat-uploads migration 001_chat_uploads.sql not found');
+    const sql = fs.readFileSync(migrationPath, 'utf8');
+    await this.pg.query(sql);
+  }
 
   async saveOriginals(input: {
     userId: string;
