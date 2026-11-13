@@ -4,7 +4,7 @@
 
 **Goal:** Сделать реальную запись в scratch и output обязательным гейтом relay-выкатов и смены sandbox CLI, чтобы повторение `EROFS` на CLI `2.1.322` блокировало rollout до затрагивания пользователей.
 
-**Architecture:** Обычный relay suite остаётся изолированным и бесплатным: новый live-тест по умолчанию пропускается. На relay-host он явно включается переменной среды, запускает выбранный native CLI с настоящими sandbox-настройками и проверяет содержимое двух изолированных probe-файлов. Статический Jest-guard фиксирует место живого гейта после unit suite, но до первого изменения живого relay-дерева.
+**Architecture:** Обычный relay suite остаётся изолированным и бесплатным: новый live-тест по умолчанию пропускается. На relay-host он явно включается переменной среды, запускает выбранный native CLI с настоящими sandbox-настройками и проверяет содержимое двух изолированных probe-файлов. `sandbox-write-live-lib.mjs` отделяет bounded lifecycle, строгий NDJSON-протокол, безопасное чтение probe и cleanup; 19 детерминированных regression-тестов проверяют его без Claude. Статический Jest-guard фиксирует место живого гейта после unit suite, но до первого изменения живого relay-дерева, а также передачу prompt через stdin до ожидания outcome.
 
 **Tech Stack:** Node.js 22 `node:test`, Jest для статического deploy-guard, Claude Code CLI `haiku`, существующие `sandbox-policy.mjs`/`paths.mjs`, Bash rollout scripts.
 
@@ -20,7 +20,7 @@
 ## Обязательные ограничения
 
 - Не запускать `npm ci`, Jest или полный relay suite на Mac. Только `node --check`, чтение и лёгкие локальные команды.
-- Не копировать новый test в `/home/dv/file-agent` вручную. Для RED/GREEN перед выкатом передавать содержимое по SSH через stdin и запускать из живого каталога только импорты существующей политики.
+- Не копировать новые test/helper в `/home/dv/file-agent` вручную. Для RED/GREEN перед выкатом передавать `sandbox-write-live.test.mjs` и `sandbox-write-live-lib.mjs` tar-потоком через SSH stdin в уникальный `/tmp`-каталог; существующие `sandbox-policy.mjs`, `paths.mjs` и `proc-reaper.mjs` подключать symlink-ами из живого каталога. Временный каталог удалять через `trap`.
 - Не переключать `/opt/linkeon-agent/bin/claude-runtime`: активный runtime остаётся `2.1.280`. Сохранённый `2.1.322` вызывается только явным абсолютным путём для RED.
 - Не создавать и не снимать `/tmp/linkeon-relay-drain` во время RED/GREEN. Live-тест работает напрямую с CLI на уникальном `fs_key`, не через `/chat`.
 - Не менять backend Agent SDK, product-runner, модели, промпты ассистентов или sandbox-настройки.
@@ -29,11 +29,13 @@
 
 ## Карта файлов
 
-- Create: `relay-agent/sandbox-write-live.test.mjs` — opt-in живой test выбранного CLI и двух файлов.
-- Create: `tests/scripts/deploy-relay-write-gate.test.js` — статический regression guard обязательного места live-gate в rollout.
+- Create: `relay-agent/sandbox-write-live.test.mjs` — тонкий opt-in живой test выбранного CLI и двух файлов.
+- Create: `relay-agent/sandbox-write-live-lib.mjs` — bounded CLI lifecycle, строгий NDJSON-parser, безопасное чтение probe и независимый cleanup.
+- Create: `relay-agent/sandbox-write-live-lib.test.mjs` — 19 детерминированных regression-тестов без реального Claude.
+- Create: `tests/scripts/deploy-relay-write-gate.test.js` — статический regression guard обязательного места live-gate в rollout и передачи prompt в helper.
 - Modify: `scripts/deploy-relay.sh` — один вызов live-gate в staging до изменения живых файлов.
 - Modify: `relay-agent/README.md` — обязательная команда для будущей смены runtime до снятия drain.
-- Existing, не менять: `relay-agent/sandbox-policy.mjs`, `relay-agent/paths.mjs`, `relay-agent/server.mjs`.
+- Existing, не менять: `relay-agent/sandbox-policy.mjs`, `relay-agent/paths.mjs`, `relay-agent/proc-reaper.mjs`, `relay-agent/server.mjs`.
 
 ---
 
@@ -78,13 +80,15 @@ describe('relay CLI sandbox write gate', () => {
   });
 
   it('live test отправляет prompt и закрывает stdin', () => {
-    const source = fs.readFileSync(path.join(root, 'relay-agent', 'sandbox-write-live.test.mjs'), 'utf8');
-    const spawned = source.indexOf('child = spawn(CLI, args');
+    const source = fs.readFileSync(path.join(root, 'relay-agent', 'sandbox-write-live-lib.mjs'), 'utf8');
+    const spawned = source.indexOf('child = spawnImpl(cli, args');
+    const stdinHandler = source.indexOf('child.stdin.once("error"', spawned);
     const stdinEnd = source.indexOf('child.stdin.end(prompt);', spawned);
-    const outcome = source.indexOf('const outcome = await new Promise', spawned);
+    const outcome = source.indexOf('mainTimer = setTimeout', spawned);
 
     expect(spawned).toBeGreaterThan(-1);
-    expect(stdinEnd).toBeGreaterThan(spawned);
+    expect(stdinHandler).toBeGreaterThan(spawned);
+    expect(stdinEnd).toBeGreaterThan(stdinHandler);
     expect(stdinEnd).toBeLessThan(outcome);
   });
 });
@@ -115,11 +119,13 @@ Run:
 ssh dv@85.192.61.231 'set -e; cd ~/ci/spirits_back-relay-sandbox-write-gate-20261113; source ~/.nvm/nvm.sh; npx jest tests/scripts/deploy-relay-write-gate.test.js --runInBand'
 ```
 
-Expected: exit non-zero, `3 failed`: первая проверка имеет `live === -1`, вторая — `section === -1`; третья падает, потому что `relay-agent/sandbox-write-live.test.mjs` ещё отсутствует либо `stdinEnd === -1`. Это RED до реализации, не основание ослабить test.
+Expected: exit non-zero, `3 failed`: первая проверка имеет `live === -1`, вторая — `section === -1`; третья падает, потому что `relay-agent/sandbox-write-live-lib.mjs` ещё отсутствует либо нарушен порядок `spawn → stdin error handler → stdin.end → ожидание`. Это RED до реализации, не основание ослабить test.
 
 ---
 
 ### Task 2: Живой test реальной записи CLI
+
+Это первичная версия входа. Перед Task 3 обязателен Task 2A: его regression-тесты сначала воспроизводят дефекты первичной версии, затем live test переводится на hardened helper.
 
 **Files:**
 - Create: `relay-agent/sandbox-write-live.test.mjs`
@@ -319,31 +325,171 @@ Expected: exit 0; `tests 1`, `pass 0`, `fail 0`, `skipped 1`. Несуществ
 
 ---
 
+### Task 2A: Детерминированный hardening live test
+
+Task 3 запрещён до завершения этого шага. Настоящий Claude и relay-host здесь не запускаются: regression-тесты используют fake child/process и только тестовый Node-процесс с потомком для bounded timeout.
+
+**Files:**
+- Create: `relay-agent/sandbox-write-live-lib.mjs`
+- Create: `relay-agent/sandbox-write-live-lib.test.mjs`
+- Modify: `relay-agent/sandbox-write-live.test.mjs`
+- Modify: `tests/scripts/deploy-relay-write-gate.test.js`
+- Read, не менять: `relay-agent/proc-reaper.mjs`
+
+- [ ] **Step 1: Записать 19 failing regression-тестов**
+
+Создать `relay-agent/sandbox-write-live-lib.test.mjs` с независимыми тестами следующих классов:
+
+1. terminal `subtype=success`, `is_error=false` принимается из финального buffer без newline;
+2. `error_max_turns` с `is_error=false` отклоняется;
+3. само наличие `api_error_status` отклоняет result;
+4. финальный `is_error=true` без newline не теряется;
+5. malformed NDJSON даёт `protocol_error` даже рядом с success;
+6. отсутствие terminal result не fail-open;
+7. oversized line и oversized buffer ограничены и дают `protocol_error`;
+8. top-level `tool_result` классифицирует EROFS без сохранения сырого output;
+9. число `toolFailures` ограничено, сохраняются только kind/status/bytes;
+10. timeout с реальным потомком, удерживающим stdout, завершается bounded и завершается `reap` дерева;
+11. синхронный stdin EPIPE становится красным outcome без unhandled error;
+12. child error не мешает kill/reap/destroy живого процесса;
+13. regular probe с точным содержимым принимается без возврата содержимого;
+14. symlink probe отклоняется;
+15. symlink root отклоняется;
+16. oversized probe отклоняется по размеру до чтения;
+17. partial setup cleanup удаляет уже созданные dirs и вызывает reap;
+18. удаление output выполняется даже после ошибки удаления scratch;
+19. в live test `t.after` зарегистрирован до `ensureSessionDirs`.
+
+Для timeout-теста использовать `timeoutMs: 250`, `killWaitMs: 10`, `reapGraceMs: 1` и внешний guard 2000 ms, чтобы родитель успел запустить потомка, а regression не зависел от `close`.
+
+Закоммитить только тест:
+
+```bash
+git -C /Users/dmitry/Downloads/spirits_back/.worktrees/relay-sandbox-write-live-gate add relay-agent/sandbox-write-live-lib.test.mjs
+git -C /Users/dmitry/Downloads/spirits_back/.worktrees/relay-sandbox-write-live-gate commit -m "test(relay): regression для hardening live CLI (красный)" -m "Co-Authored-By: Claude Code <noreply@anthropic.com>"
+git -C /Users/dmitry/Downloads/spirits_back/.worktrees/relay-sandbox-write-live-gate push origin feat/relay-sandbox-write-live-gate
+SHA=$(git -C /Users/dmitry/Downloads/spirits_back/.worktrees/relay-sandbox-write-live-gate rev-parse HEAD)
+ssh dv@85.192.61.231 "set -e; git -C ~/ci/spirits_back-relay-sandbox-write-gate-20261113 fetch -q origin feat/relay-sandbox-write-live-gate; git -C ~/ci/spirits_back-relay-sandbox-write-gate-20261113 checkout -q $SHA"
+ssh dv@85.192.61.231 'cd ~/ci/spirits_back-relay-sandbox-write-gate-20261113; source ~/.nvm/nvm.sh; node --test relay-agent/sandbox-write-live-lib.test.mjs'
+```
+
+Expected: exit non-zero, `tests 19`, `pass 0`, `fail 19`. До helper 18 тестов падают на его отсутствии, а порядок cleanup — на текущем live test.
+
+- [ ] **Step 2: Реализовать helper минимальным refactor**
+
+`relay-agent/sandbox-write-live-lib.mjs` экспортирует:
+
+```javascript
+export async function runCliProbe({
+  cli, args, prompt, env, cwd = "/tmp", tag,
+  spawnImpl = spawn, reapImpl = reap, onChild = null,
+  timeoutMs = 120_000, killWaitMs = 100, reapGraceMs = 25,
+  maxLineBytes = 64 * 1024, maxBufferBytes = 64 * 1024, maxFailures = 8,
+});
+
+export async function cleanupLiveProbe({
+  child = null, tag, scratch, output,
+  reapImpl = reap, graceMs = 25, rmSync = fs.rmSync,
+});
+
+export function readExpectedProbe(root, name, expected);
+```
+
+Обязательные инварианты:
+
+- `env[RUN_ENV] = tag`, где tag получен через `runTag(randomUUID())`; `reap((candidate) => candidate === tag, { graceMs })` выполняется из `finally` на всех путях;
+- основное завершение фиксируется по `exit`, не по `close`; kill/timeout имеют отдельное bounded ожидание `killWaitMs`, затем stdio уничтожаются;
+- stdin error handler установлен до `child.stdin.end(prompt)`; prompt отправляется до создания main timer ожидания;
+- результат success только при явном `type=result`, `subtype=success`, `is_error !== true` и отсутствии собственного свойства `api_error_status`;
+- финальный buffer обрабатывается без newline; malformed/oversized/missing result остаются RED;
+- поддерживаются top-level и вложенные `tool_result`; failure entries ограничены и не содержат raw output;
+- probe root/file проходят `lstat`, symlink отклоняются, `realpath` обязан оставаться внутри root, размер обязан совпасть до чтения; возвращаются только `{ ok, status, size }`;
+- cleanup scratch/output выполняется независимо, а ошибки возвращаются как классификации без произвольных сообщений.
+
+Заменить первичный live test на тонкую оркестрацию: cleanup регистрируется до `ensureSessionDirs`, `tag=runTag(randomUUID())`, `childEnv[RUN_ENV]=tag`, затем вызываются `runCliProbe` и два `readExpectedProbe`. Assertions точного содержимого остаются внутри `readExpectedProbe`; diagnostics содержат только статусы/размеры и не содержат `scratchContent`/`outputContent`.
+
+Static stdin guard в Task 1 читает helper и требует порядок `spawnImpl → stdin error handler → stdin.end → mainTimer`; два deploy/README assertions не меняются.
+
+- [ ] **Step 3: Проверить синтаксис локально**
+
+```bash
+node --check /Users/dmitry/Downloads/spirits_back/.worktrees/relay-sandbox-write-live-gate/relay-agent/sandbox-write-live-lib.mjs
+node --check /Users/dmitry/Downloads/spirits_back/.worktrees/relay-sandbox-write-live-gate/relay-agent/sandbox-write-live-lib.test.mjs
+node --check /Users/dmitry/Downloads/spirits_back/.worktrees/relay-sandbox-write-live-gate/relay-agent/sandbox-write-live.test.mjs
+```
+
+Expected: каждая команда exit 0, no output.
+
+- [ ] **Step 4: Закоммитить fix и проверить GREEN на CI**
+
+```bash
+git -C /Users/dmitry/Downloads/spirits_back/.worktrees/relay-sandbox-write-live-gate add relay-agent/sandbox-write-live-lib.mjs relay-agent/sandbox-write-live-lib.test.mjs relay-agent/sandbox-write-live.test.mjs tests/scripts/deploy-relay-write-gate.test.js
+git -C /Users/dmitry/Downloads/spirits_back/.worktrees/relay-sandbox-write-live-gate commit -m "fix(relay): hardening живого CLI write test" -m "Co-Authored-By: Claude Code <noreply@anthropic.com>"
+git -C /Users/dmitry/Downloads/spirits_back/.worktrees/relay-sandbox-write-live-gate push origin feat/relay-sandbox-write-live-gate
+SHA=$(git -C /Users/dmitry/Downloads/spirits_back/.worktrees/relay-sandbox-write-live-gate rev-parse HEAD)
+ssh dv@85.192.61.231 "set -e; git -C ~/ci/spirits_back-relay-sandbox-write-gate-20261113 fetch -q origin feat/relay-sandbox-write-live-gate; git -C ~/ci/spirits_back-relay-sandbox-write-gate-20261113 checkout -q $SHA"
+```
+
+Focused regression:
+
+```bash
+ssh dv@85.192.61.231 'set -e; cd ~/ci/spirits_back-relay-sandbox-write-gate-20261113; source ~/.nvm/nvm.sh; node --test relay-agent/sandbox-write-live-lib.test.mjs'
+```
+
+Expected: `tests 19`, `pass 19`, `fail 0`, `skipped 0`.
+
+Static guard:
+
+```bash
+ssh dv@85.192.61.231 'cd ~/ci/spirits_back-relay-sandbox-write-gate-20261113; source ~/.nvm/nvm.sh; npx jest tests/scripts/deploy-relay-write-gate.test.js --runInBand'
+```
+
+Expected: stdin assertion PASS; два intentional RED для Task 4 остаются, итого `2 failed, 1 passed, 3 total`.
+
+Default-skip:
+
+```bash
+ssh dv@85.192.61.231 'set -e; cd ~/ci/spirits_back-relay-sandbox-write-gate-20261113; source ~/.nvm/nvm.sh; RELAY_CLAUDE_BIN=/definitely/missing node --test relay-agent/sandbox-write-live.test.mjs'
+```
+
+Expected: `tests 1`, `pass 0`, `fail 0`, `skipped 1`.
+
+Полный relay suite на CI:
+
+```bash
+ssh dv@85.192.61.231 'set -e; cd ~/ci/spirits_back-relay-sandbox-write-gate-20261113; source ~/.nvm/nvm.sh; node --test relay-agent/*.test.mjs'
+```
+
+Expected: `tests 218`, `pass 217`, `fail 0`, `skipped 1`.
+
+---
+
 ### Task 3: Доказать RED на 2.1.322 и GREEN на 2.1.280
 
 **Files:**
 - Test: `relay-agent/sandbox-write-live.test.mjs`
-- No live project files changed.
+- Test: `relay-agent/sandbox-write-live-lib.mjs`
+- No live project files changed; оба новых файла существуют только в уникальном `/tmp`-каталоге на время команды.
 
 - [ ] **Step 1: Запустить RED против сохранённого 2.1.322 через stdin**
 
 Run из корня изолированного worktree:
 
 ```bash
-ssh -o BatchMode=yes dv@5.101.115.184 'cd /home/dv/file-agent && RELAY_LIVE_CLI_WRITE_TEST=1 RELAY_CLAUDE_BIN=/opt/linkeon-agent/bin/claude-runtime-2.1.322 node --input-type=module -' < relay-agent/sandbox-write-live.test.mjs
+tar -cf - -C relay-agent sandbox-write-live-lib.mjs sandbox-write-live.test.mjs | ssh -o BatchMode=yes dv@5.101.115.184 'set -e; tmp=$(mktemp -d /tmp/relay-live-gate.XXXXXX); trap "rm -rf $tmp" EXIT; tar -xf - -C "$tmp"; for module in sandbox-policy.mjs paths.mjs proc-reaper.mjs; do ln -s "/home/dv/file-agent/$module" "$tmp/$module"; done; cd "$tmp"; RELAY_LIVE_CLI_WRITE_TEST=1 RELAY_CLAUDE_BIN=/opt/linkeon-agent/bin/claude-runtime-2.1.322 node --test sandbox-write-live.test.mjs'
 ```
 
-Expected: exit non-zero; failed assertion содержит `CLI=/opt/linkeon-agent/bin/claude-runtime-2.1.322`, `scratchProbes=0` и/или `outputContent=null`, а `toolFailures` содержит `Read-only file system`. Это воспроизведение исходного дефекта новым test. Не менять assertion, чтобы получить зелёный результат.
+Expected: exit non-zero; failed assertion содержит `CLI=/opt/linkeon-agent/bin/claude-runtime-2.1.322`, `scratch={"ok":false,...}` и/или `output={"ok":false,...}`, а `toolFailures` содержит классификацию `{"kind":"EROFS",...}`. Сырой tool output и содержимое файлов в diagnostics отсутствуют. Это воспроизведение исходного дефекта новым test. Не менять assertion, чтобы получить зелёный результат.
 
 - [ ] **Step 2: Запустить GREEN против активного 2.1.280 через stdin**
 
 Run:
 
 ```bash
-ssh -o BatchMode=yes dv@5.101.115.184 'cd /home/dv/file-agent && RELAY_LIVE_CLI_WRITE_TEST=1 RELAY_CLAUDE_BIN=/opt/linkeon-agent/bin/claude-runtime-2.1.280 node --input-type=module -' < relay-agent/sandbox-write-live.test.mjs
+tar -cf - -C relay-agent sandbox-write-live-lib.mjs sandbox-write-live.test.mjs | ssh -o BatchMode=yes dv@5.101.115.184 'set -e; tmp=$(mktemp -d /tmp/relay-live-gate.XXXXXX); trap "rm -rf $tmp" EXIT; tar -xf - -C "$tmp"; for module in sandbox-policy.mjs paths.mjs proc-reaper.mjs; do ln -s "/home/dv/file-agent/$module" "$tmp/$module"; done; cd "$tmp"; RELAY_LIVE_CLI_WRITE_TEST=1 RELAY_CLAUDE_BIN=/opt/linkeon-agent/bin/claude-runtime-2.1.280 node --test sandbox-write-live.test.mjs'
 ```
 
-Expected: exit 0; `tests 1`, `pass 1`, `fail 0`, `skipped 0`; diagnostic содержит `scratchContent="scratch-ok"` и `outputContent="output-ok"`, `toolFailures=[]`.
+Expected: exit 0; `tests 1`, `pass 1`, `fail 0`, `skipped 0`; diagnostic содержит `gotResult=true`, `resultSuccess=true`, `scratch={"ok":true,"status":"ok","size":10}`, `output={"ok":true,"status":"ok","size":9}`, `toolFailures=[]` и `cleanupErrors=[]`.
 
 - [ ] **Step 3: Убедиться, что проверки не изменили активный runtime и admission**
 
@@ -465,7 +611,7 @@ ssh dv@85.192.61.231 "set -e; git -C ~/ci/spirits_back-relay-sandbox-write-gate-
 ssh dv@85.192.61.231 'set -e; cd ~/ci/spirits_back-relay-sandbox-write-gate-20261113; source ~/.nvm/nvm.sh; node --test relay-agent/*.test.mjs'
 ```
 
-Expected: `tests 199`, `pass 198`, `fail 0`, `skipped 1`. Единственный skip — `CLI sandbox записывает и scratch, и output` без `RELAY_LIVE_CLI_WRITE_TEST=1`; все 198 baseline-тестов остаются зелёными.
+Expected: `tests 218`, `pass 217`, `fail 0`, `skipped 1`. Единственный skip — `CLI sandbox записывает и scratch, и output` без `RELAY_LIVE_CLI_WRITE_TEST=1`; 198 baseline-тестов и 19 deterministic hardening regression-тестов остаются зелёными.
 
 - [ ] **Step 2: Проверить diff и чистоту дерева**
 
@@ -477,15 +623,18 @@ git -C /Users/dmitry/Downloads/spirits_back/.worktrees/relay-sandbox-write-live-
 git -C /Users/dmitry/Downloads/spirits_back/.worktrees/relay-sandbox-write-live-gate diff --stat origin/main...HEAD
 ```
 
-Expected: `diff --check` без вывода; worktree clean; diff содержит только два новых test, `scripts/deploy-relay.sh`, `relay-agent/README.md`, approved spec и этот plan.
+Expected: `diff --check` без вывода; worktree clean; diff содержит только `relay-agent/sandbox-write-live-lib.mjs`, `relay-agent/sandbox-write-live-lib.test.mjs`, `relay-agent/sandbox-write-live.test.mjs`, `tests/scripts/deploy-relay-write-gate.test.js`, `scripts/deploy-relay.sh`, `relay-agent/README.md`, approved spec и этот plan.
 
 - [ ] **Step 3: Выполнить code review**
 
 Использовать `superpowers:requesting-code-review`. Review обязано отдельно проверить:
 
 - без opt-in невозможно случайно запустить CLI;
-- child завершается по timeout и собственные probe-каталоги удаляются даже при assertion failure;
-- `EROFS` и отсутствие любого из двух файлов делают test красным;
+- завершение фиксируется по `exit`; timeout и child/stdin errors имеют bounded kill/reap/destroy на всех путях, включая потомка с унаследованными fd;
+- terminal result обязан быть явным success; `error_max_turns`, `api_error_status`, malformed/oversized NDJSON и отсутствие result остаются RED;
+- probe root/file не следуют symlink, regular file и точный размер проверяются до чтения, diagnostics не содержат содержимое;
+- child завершается по timeout и собственные probe-каталоги удаляются даже при assertion/partial setup failure;
+- `EROFS` и отсутствие любого из двух файлов делают test красным; failure count ограничен, raw tool output не сохраняется;
 - deploy gate находится до первого изменения живых файлов и не имеет bypass;
 - нет чтения/вывода секретов, пользовательских документов или системного промпта;
 - активный runtime и sandbox-политика не изменены.
