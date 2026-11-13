@@ -10,10 +10,10 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-13-relay-sandbox-write-live-gate-design.md`
 
-**Isolated worktree:** `/Users/dmitry/Downloads/spirits_back/.worktrees/relay-sandbox-write-live-gate`  
-**Branch:** `feat/relay-sandbox-write-live-gate`  
-**Base:** `origin/main` = `f8b0828b76fa787f164a634f70d270b142e0063e`  
-**CI clone:** `dv@85.192.61.231:~/ci/spirits_back-relay-sandbox-write-gate-20261113`
+- **Isolated worktree:** `/Users/dmitry/Downloads/spirits_back/.worktrees/relay-sandbox-write-live-gate`
+- **Branch:** `feat/relay-sandbox-write-live-gate`
+- **Base:** `origin/main` = `f8b0828b76fa787f164a634f70d270b142e0063e`
+- **CI clone:** `dv@85.192.61.231:~/ci/spirits_back-relay-sandbox-write-gate-20261113`
 
 **Уже проверенная база:** на точном base SHA на test-ноде `node --test relay-agent/*.test.mjs` — 198 tests, 198 pass, 0 fail, 0 skipped.
 
