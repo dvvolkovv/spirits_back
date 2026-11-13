@@ -222,4 +222,18 @@ describe('AlertBotRepairTools', () => {
     expect(Buffer.byteLength(result)).toBeLessThanOrEqual(8192);
     expect(result.endsWith('\n…[обрезано]')).toBe(true);
   });
+
+  it('обрезает JSON >150 КБ без O(n²) блокировки event loop', async () => {
+    wait.mockResolvedValue(terminalJob({
+      command: 'c'.repeat(32 * 1024),
+      stdout: 'x'.repeat(64 * 1024),
+      stderr: 'y'.repeat(64 * 1024),
+    }));
+    const startedAt = Date.now();
+    const result = await tools.execute('repair_job', { job_id: jobUuid }, repairCtx);
+    const elapsed = Date.now() - startedAt;
+    expect(Buffer.byteLength(result)).toBeLessThanOrEqual(8192);
+    expect(result.endsWith('\n…[обрезано]')).toBe(true);
+    expect(elapsed).toBeLessThan(1000);
+  });
 });
