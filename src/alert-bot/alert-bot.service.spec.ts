@@ -67,7 +67,14 @@ describe('AlertBotService', () => {
   let drafts: Record<string, jest.Mock>;
   let turns: { enqueue: jest.Mock; resumeExisting: jest.Mock; stopAdmission: jest.Mock };
   let support: { findTicketByPrefix: jest.Mock };
-  let repairs: { admit: jest.Mock; abandon: jest.Mock; stop: jest.Mock; stopAll: jest.Mock };
+  let repairs: {
+    admit: jest.Mock;
+    abandon: jest.Mock;
+    abandonUnstarted: jest.Mock;
+    findRepairByUpdate: jest.Mock;
+    stop: jest.Mock;
+    stopAll: jest.Mock;
+  };
   let logger: { error: jest.Mock };
   let service: AlertBotService;
 
@@ -110,6 +117,8 @@ describe('AlertBotService', () => {
     repairs = {
       admit: jest.fn().mockResolvedValue({ status: 'accepted', repairId: 'repair-1' }),
       abandon: jest.fn().mockResolvedValue(true),
+      abandonUnstarted: jest.fn().mockResolvedValue(true),
+      findRepairByUpdate: jest.fn().mockResolvedValue(null),
       stop: jest.fn().mockResolvedValue('Исправление остановлено'),
       stopAll: jest.fn().mockResolvedValue(undefined),
     };
@@ -562,8 +571,52 @@ describe('AlertBotService', () => {
     await service.handleUpdate(groupText('/fix почини файлы', 1, { from: { id: 123 } }));
 
     expect(repairs.abandon).not.toHaveBeenCalled();
+    expect(repairs.findRepairByUpdate).not.toHaveBeenCalled();
     expect(store.failUpdate).toHaveBeenCalledWith(1, 'db_down');
     expect(JSON.stringify(logger.error.mock.calls)).not.toContain('RAW-ENQUEUE-SECRET');
+  });
+
+  it('dead-letter update финализирует unstarted repair перед final failure', async () => {
+    store.failUpdate.mockResolvedValue(true);
+    repairs.findRepairByUpdate.mockResolvedValue({ id: 'repair-1' });
+    turns.enqueue.mockRejectedValue(Object.assign(new Error('admission failed'), { kind: 'db_down' }));
+
+    await service.handleUpdate(groupText('/fix почини файлы', 1, { from: { id: 123 } }));
+
+    expect(repairs.findRepairByUpdate).toHaveBeenCalledWith(1);
+    expect(repairs.abandonUnstarted).toHaveBeenCalledWith('repair-1');
+    expect(repairs.abandonUnstarted.mock.invocationCallOrder[0]).toBeLessThan(
+      telegram.sendMessage.mock.invocationCallOrder[0],
+    );
+    expect(telegram.sendMessage).toHaveBeenCalledWith(
+      '-100123', 'Не удалось обработать запрос. Попробуйте ещё раз позже.', 10,
+    );
+  });
+
+  it('dead-letter abandon=false журналируется и не отменяет final failure', async () => {
+    store.failUpdate.mockResolvedValue(true);
+    repairs.findRepairByUpdate.mockResolvedValue({ id: 'repair-1' });
+    repairs.abandonUnstarted.mockResolvedValue(false);
+    turns.enqueue.mockRejectedValue(Object.assign(new Error('admission failed'), { kind: 'db_down' }));
+
+    await service.handleUpdate(groupText('/fix почини файлы', 1, { from: { id: 123 } }));
+
+    expect(logger.error).toHaveBeenCalledWith('alert-bot repair dead-letter abandon skipped kind=not_unstarted');
+    expect(telegram.sendMessage).toHaveBeenCalledWith(
+      '-100123', 'Не удалось обработать запрос. Попробуйте ещё раз позже.', 10,
+    );
+  });
+
+  it('ошибка dead-letter abandon пробрасывается и не маскируется final failure', async () => {
+    store.failUpdate.mockResolvedValue(true);
+    repairs.findRepairByUpdate.mockResolvedValue({ id: 'repair-1' });
+    repairs.abandonUnstarted.mockRejectedValue(Object.assign(new Error('abandon failed'), { kind: 'abandon_db_down' }));
+    turns.enqueue.mockRejectedValue(Object.assign(new Error('admission failed'), { kind: 'db_down' }));
+
+    await expect(service.handleUpdate(groupText('/fix почини файлы', 1, { from: { id: 123 } })))
+      .rejects.toMatchObject({ kind: 'abandon_db_down' });
+
+    expect(telegram.sendMessage).not.toHaveBeenCalled();
   });
 
   it('duplicate update не создаёт второй repair', async () => {

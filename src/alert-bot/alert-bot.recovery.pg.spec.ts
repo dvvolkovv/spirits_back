@@ -200,6 +200,61 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
     }
   });
 
+  it('dead-letter после исчерпания retry отменяет unstarted repair и освобождает новый /fix', async () => {
+    const savedAdmins = process.env.ALERT_BOT_REPAIR_ADMIN_TG_IDS;
+    process.env.ALERT_BOT_REPAIR_ADMIN_TG_IDS = '200';
+    try {
+      const telegram = telegramMock();
+      const repairStore = new RepairStore({
+        query: (text: string, params?: any[]) => pool.query(text, params),
+        getClient: () => pool.connect(),
+      } as any);
+      const repairAi = {
+        repair: jest.fn().mockResolvedValue({ text: 'Готово', costUsd: 0, tools: [], noCause: false }),
+      };
+      const repairService = new AlertBotRepairService(repairStore, repairAi as any, {
+        stopRepair: jest.fn().mockResolvedValue(undefined),
+        stopAll: jest.fn().mockResolvedValue(undefined),
+      } as any);
+      const { service, turns } = makeService(telegram, jest.fn(), repairService);
+      const repairUpdate = {
+        ...update,
+        update_id: 92061,
+        message: { ...update.message, text: '/fix Почини ошибку' },
+      };
+      const enqueue = jest.spyOn(turns, 'enqueue')
+        .mockRejectedValue(Object.assign(new Error('persistent admission failure'), { kind: 'db_down' }));
+
+      await service.handleUpdate(repairUpdate);
+      for (let attempt = 2; attempt <= 5; attempt += 1) {
+        await makeDue(repairUpdate.update_id);
+        await service.retryFailedUpdates();
+      }
+
+      expect((await pool.query(
+        'SELECT attempts, next_retry_at FROM alert_bot_updates WHERE update_id = $1', [repairUpdate.update_id],
+      )).rows[0]).toMatchObject({ attempts: 5, next_retry_at: null });
+      expect((await repairStore.findRepairByUpdate(repairUpdate.update_id))?.status).toBe('cancelled');
+
+      enqueue.mockRestore();
+      const nextFix = {
+        ...update,
+        update_id: 92062,
+        message: { ...update.message, text: '/fix Почини следующую ошибку' },
+      };
+      await service.handleUpdate(nextFix);
+
+      expect(repairAi.repair).toHaveBeenCalledTimes(1);
+      expect((await repairStore.findRepairByUpdate(nextFix.update_id))?.status).toBe('unverified');
+      expect((await pool.query(
+        'SELECT status FROM alert_bot_updates WHERE update_id = $1', [nextFix.update_id],
+      )).rows[0].status).toBe('completed');
+    } finally {
+      if (savedAdmins === undefined) delete process.env.ALERT_BOT_REPAIR_ADMIN_TG_IDS;
+      else process.env.ALERT_BOT_REPAIR_ADMIN_TG_IDS = savedAdmins;
+    }
+  });
+
   it('сбой placeholder до модели оставляет durable retry и не завершает update', async () => {
     const aiAnswer = jest.fn().mockResolvedValue({ text: 'Ответ', costUsd: 0, tools: [] });
     const telegram = telegramMock();

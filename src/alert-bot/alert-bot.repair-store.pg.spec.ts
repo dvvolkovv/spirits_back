@@ -53,6 +53,7 @@ maybe('durable repair store против PostgreSQL', () => {
   let admin: Pool;
   let pool: Pool;
   let store: RepairStore;
+  let baseStore: AlertBotStore;
   let nextUpdateId = 20_000;
 
   const repairInput = (chatId: string) => ({
@@ -153,7 +154,7 @@ maybe('durable repair store против PostgreSQL', () => {
       query: (text: string, params?: any[]) => pool.query(text, params),
       getClient: () => pool.connect(),
     } as any;
-    const baseStore = new AlertBotStore(pg);
+    baseStore = new AlertBotStore(pg);
     await baseStore.migrate();
     store = new RepairStore(pg);
     await store.migrate();
@@ -649,6 +650,41 @@ maybe('durable repair store против PostgreSQL', () => {
     const attached = await admit('abandon-attached');
     await pool.query('UPDATE alert_bot_repairs SET turn_id = $2 WHERE id = $1', [attached, OTHER_TURN_ID]);
     expect(await store.abandon(attached)).toBe(false);
+  });
+
+  it('abandonUnstarted отменяет dead-letter repair только до model_started_at', async () => {
+    const requested = await admit('dead-letter-requested');
+    expect(await store.abandonUnstarted(requested)).toBe(true);
+    expect(await store.abandonUnstarted(requested)).toBe(false);
+    expect((await store.findRepair(requested))?.status).toBe('cancelled');
+    await expect(store.admitRepair(repairInput('dead-letter-requested')))
+      .resolves.toMatchObject({ status: 'accepted' });
+
+    const placeholder = await admit('dead-letter-placeholder');
+    const placeholderTurn = await baseStore.createTurn({
+      updateId: nextUpdateId++, chatId: 'dead-letter-placeholder', tgUserId: '200',
+      adminUserId: 'admin-placeholder', questionMessageId: 10, question: 'Почини', privateChat: true,
+    });
+    await pool.query('UPDATE alert_bot_turns SET placeholder_started_at = now() WHERE id = $1', [placeholderTurn]);
+    expect(await store.markRepairRunning(placeholder, placeholderTurn)).toBe(true);
+    expect(await store.requestCancel(placeholder)).toBe(true);
+    expect(await store.abandonUnstarted(placeholder)).toBe(true);
+    expect((await store.findRepair(placeholder))).toMatchObject({ status: 'cancelled', turnId: placeholderTurn });
+
+    const started = await admit('dead-letter-model-started');
+    const startedTurn = await baseStore.createTurn({
+      updateId: nextUpdateId++, chatId: 'dead-letter-model-started', tgUserId: '200',
+      adminUserId: 'admin-started', questionMessageId: 10, question: 'Почини', privateChat: true,
+    });
+    await pool.query(
+      'UPDATE alert_bot_turns SET placeholder_started_at = now(), model_started_at = now() WHERE id = $1',
+      [startedTurn],
+    );
+    expect(await store.markRepairRunning(started, startedTurn)).toBe(true);
+    expect(await store.requestCancel(started)).toBe(true);
+
+    expect(await store.abandonUnstarted(started)).toBe(false);
+    expect((await store.findRepair(started))).toMatchObject({ status: 'cancel_requested', turnId: startedTurn });
   });
 
   it('interruptActive завершает active jobs и repairs без перезапуска', async () => {

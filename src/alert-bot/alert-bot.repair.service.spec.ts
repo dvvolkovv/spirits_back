@@ -74,6 +74,7 @@ describe('AlertBotRepairService', () => {
     store = {
       admitRepair: jest.fn().mockResolvedValue({ status: 'accepted', repairId: REPAIR_ID }),
       abandon: jest.fn().mockResolvedValue(true),
+      abandonUnstarted: jest.fn().mockResolvedValue(true),
       findRepair: jest.fn().mockResolvedValue(repair()),
       findActiveRepair: jest.fn().mockResolvedValue(repair('running')),
       markRepairRunning: jest.fn().mockResolvedValue(true),
@@ -556,10 +557,12 @@ describe('AlertBotRepairService', () => {
       updateId: 1, chatId: '100', adminTgId: '200', instruction: 'Почини ошибку',
     })).resolves.toEqual({ status: 'accepted', repairId: REPAIR_ID });
     await expect(service.abandon(REPAIR_ID)).resolves.toBe(true);
+    await expect(service.abandonUnstarted(REPAIR_ID)).resolves.toBe(true);
 
     expect(store.admitRepair).toHaveBeenCalledWith({
       updateId: 1, chatId: '100', adminTgId: '200', instruction: 'Почини ошибку',
     });
     expect(store.abandon).toHaveBeenCalledWith(REPAIR_ID);
+    expect(store.abandonUnstarted).toHaveBeenCalledWith(REPAIR_ID);
   });
 });
