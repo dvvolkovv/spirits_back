@@ -79,11 +79,18 @@ graph is rebuilt continuously from chat, so a day's gap self-heals over time.
 
 node-3 runs a MinIO mirror (`10.10.0.3:9000`, data `/var/lib/linkeon-dr/minio`)
 holding buckets `linkeon-smm-videos`, `linkeon-smm-music`, `linkeon-assets`
-(images, speech, call documents, avatars), `linkeon-chat-files` (files the
-assistants created in chats; added 2026-10) and `linkeon-chat-uploads` (users'
-original chat uploads; **private**, added 2026-11). The mirror is
+(images, speech, call documents, avatars) and `linkeon-chat-files` (files the
+assistants created in chats; added 2026-10). The mirror is
 `--overwrite` **without `--remove`**, so node-3 holds ≥ everything prod had
 (a prod-side wipe does NOT cascade to DR).
+
+**`linkeon-chat-uploads` (users' original chat uploads; private, added 2026-11)
+is NOT mirrored yet.** The bucket list lives on the prod server in
+`/home/dvolkov/backups/linkeon/minio-mirror.sh` (`BUCKETS=(…)`), not in this
+repo. When the feature is enabled on prod (`CHAT_UPLOADS_ENABLED=true`), add
+`linkeon-chat-uploads` to `BUCKETS` there. Until that step is done the bucket
+has no DR copy, and the `linkeon-chat-uploads` restore command below is the
+TARGET state only — running it against node-3 will find nothing.
 
 ```bash
 # mc aliases (creds in ~/spirits_back/.env: MINIO_ROOT_USER / MINIO_ROOT_PASSWORD)
@@ -94,6 +101,8 @@ mc mirror --overwrite node3minio/linkeon-smm-videos newprod/linkeon-smm-videos
 mc mirror --overwrite node3minio/linkeon-smm-music  newprod/linkeon-smm-music
 mc mirror --overwrite node3minio/linkeon-assets     newprod/linkeon-assets
 mc mirror --overwrite node3minio/linkeon-chat-files newprod/linkeon-chat-files
+# TARGET state — valid only after linkeon-chat-uploads is added to BUCKETS
+# in minio-mirror.sh on prod (see above); before that, node-3 has no copy.
 mc mirror --overwrite node3minio/linkeon-chat-uploads newprod/linkeon-chat-uploads
 # Anonymous access: GetObject ONLY. Never `mc anonymous set download` —
 # that canned policy also allows anonymous s3:ListBucket (full key listing).
