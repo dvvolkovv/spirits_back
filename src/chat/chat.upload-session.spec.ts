@@ -325,6 +325,35 @@ describe('uploadAndChat: инструменты Linkeon и папка хода',
   });
 });
 
+/** Синтетическая запись chat_uploads — общая для тестов памяти загрузок. */
+const UPLOAD_RECORD = {
+  id: '11111111-1111-4111-8111-111111111111',
+  userId: 'u1',
+  sessionId: 'u1_12',
+  originalName: 'a.pdf',
+  mime: 'application/pdf',
+  sizeBytes: 1,
+  sha256: '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824',
+  storageKey: 'synthetic/a.pdf',
+  createdAt: '2026-11-13T00:00:00.000Z',
+};
+const UPLOAD_LINK = '📎 [a.pdf](/webhook/chat-uploads/11111111-1111-4111-8111-111111111111)';
+
+function makeChatUploadsMock(result: { saved: any[]; failed: string[] }) {
+  return {
+    saveOriginals: jest.fn(async () => result),
+    ownerUrl: jest.fn((id: string) => `/webhook/chat-uploads/${id}`),
+  };
+}
+
+function makeUploadReq(name: string, message: string) {
+  return {
+    headers: { authorization: 'Bearer token' },
+    files: [{ originalname: name, buffer: Buffer.from('x'), mimetype: 'application/pdf', size: 1 }],
+    body: { message, assistantId: '12' },
+  } as any;
+}
+
 /**
  * Память загрузок (spec 2026-11-13-chat-upload-memory, Task 3): исходник
  * уезжает в наше хранилище ДО отправки на релей, а приватная ссылка на него
@@ -333,18 +362,6 @@ describe('uploadAndChat: инструменты Linkeon и папка хода',
  * на следующий вопрос.
  */
 describe('uploadAndChat: исходник сохраняется до релея', () => {
-  const RECORD = {
-    id: '11111111-1111-4111-8111-111111111111',
-    userId: 'u1',
-    sessionId: 'u1_12',
-    originalName: 'a.pdf',
-    mime: 'application/pdf',
-    sizeBytes: 1,
-    sha256: '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824',
-    storageKey: 'synthetic/a.pdf',
-    createdAt: '2026-11-13T00:00:00.000Z',
-  };
-
   const OLD_UPLOADS_FLAG = process.env.CHAT_UPLOADS_ENABLED;
   beforeEach(() => { process.env.CHAT_UPLOADS_ENABLED = 'true'; });
   afterEach(() => {
@@ -354,10 +371,7 @@ describe('uploadAndChat: исходник сохраняется до релея
   });
 
   it('сохраняет исходник до relay и кладёт ссылку в историю даже при пустом ответе', async () => {
-    const chatUploads = {
-      saveOriginals: jest.fn(async () => ({ saved: [RECORD], failed: [] })),
-      ownerUrl: jest.fn((id: string) => `/webhook/chat-uploads/${id}`),
-    };
+    const chatUploads = makeChatUploadsMock({ saved: [UPLOAD_RECORD], failed: [] });
     const svc = makeService(makePg());
     const persist = jest.spyOn(svc, 'persistUploadTurn').mockResolvedValue(0);
     const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
@@ -369,13 +383,9 @@ describe('uploadAndChat: исходник сохраняется до релея
     const post = jest.fn(async () => ({ data: sseStream([]) }));
     (axios as any).default = { post };
     (axios as any).post = post;
-    const req = {
-      headers: { authorization: 'Bearer token' },
-      files: [{ originalname: 'a.pdf', buffer: Buffer.from('x'), mimetype: 'application/pdf', size: 1 }],
-      body: { message: 'что тут написано?', assistantId: '12' },
-    } as any;
+    const res = makeRes();
 
-    await ctrl.uploadAndChat(req, makeRes());
+    await ctrl.uploadAndChat(makeUploadReq('a.pdf', 'что тут написано?'), res);
     for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
 
     // Исходник сохранён ДО запроса на релей: даже если релей упадёт, файл останется.
@@ -390,9 +400,179 @@ describe('uploadAndChat: исходник сохраняется до релея
     // Пустой ответ ассистента не отменяет запись истории: пользовательское
     // сообщение с приватной ссылкой на исходник обязано сохраниться.
     expect(persist).toHaveBeenCalledTimes(1);
-    expect(persist.mock.calls[0][0].userMsg).toContain(
-      '📎 [a.pdf](/webhook/chat-uploads/11111111-1111-4111-8111-111111111111)',
-    );
+    expect(persist.mock.calls[0][0].userMsg).toContain(UPLOAD_LINK);
     expect(persist.mock.calls[0][0].userMsg).toContain('что тут написано?');
+
+    // M6 (ревью 13.11.2026): успешное сохранение (failed=[]) не выдаёт
+    // upload_persist_failed — событие только для реальных сбоев.
+    expect(res.written.some((w: any) => w.type === 'upload_persist_failed')).toBe(false);
+  });
+});
+
+/**
+ * Ревью I1 (13.11.2026): сохранение исходников идёт ДО первого байта ответа
+ * (до res.status/begin). Деградация MinIO/Postgres не должна держать клиента
+ * на молчащем соединении: nginx режет 504, а бэкенд продолжает и платит за
+ * ход релея, который никто не ждёт. Сохранение ограничено бюджетом
+ * CHAT_UPLOADS_SAVE_BUDGET_MS (дефолт 20с): при превышении ход продолжается
+ * без исходников, а клиенту уходит upload_persist_failed.
+ */
+describe('uploadAndChat: бюджет сохранения исходников (ревью I1)', () => {
+  const OLD_UPLOADS_FLAG = process.env.CHAT_UPLOADS_ENABLED;
+  const OLD_BUDGET = process.env.CHAT_UPLOADS_SAVE_BUDGET_MS;
+  beforeEach(() => {
+    process.env.CHAT_UPLOADS_ENABLED = 'true';
+    // Инъекция короткого бюджета: не ждём 20с и не воюем с фейковыми таймерами.
+    process.env.CHAT_UPLOADS_SAVE_BUDGET_MS = '30';
+  });
+  afterEach(() => {
+    jest.clearAllMocks();
+    if (OLD_UPLOADS_FLAG === undefined) delete process.env.CHAT_UPLOADS_ENABLED;
+    else process.env.CHAT_UPLOADS_ENABLED = OLD_UPLOADS_FLAG;
+    if (OLD_BUDGET === undefined) delete process.env.CHAT_UPLOADS_SAVE_BUDGET_MS;
+    else process.env.CHAT_UPLOADS_SAVE_BUDGET_MS = OLD_BUDGET;
+  });
+
+  function setup(chatUploads: any, events: any[]) {
+    const svc = makeService(makePg());
+    const persist = jest.spyOn(svc, 'persistUploadTurn').mockResolvedValue(0);
+    const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+    const neo4j = { getProfileDescription: jest.fn(async () => PROFILE) };
+    const ctrl = new (ChatController as any)(svc, jwtSvc, neo4j, undefined, undefined, chatUploads);
+    const post = jest.fn(async () => ({ data: sseStream(events) }));
+    (axios as any).default = { post };
+    (axios as any).post = post;
+    return { svc, persist, ctrl, post };
+  }
+
+  it('saveOriginals висит — через бюджет ход продолжается без него и с upload_persist_failed', async () => {
+    const chatUploads = {
+      // Никогда не резолвится: имитация зависшего MinIO. Поздний reject
+      // обязан гаситься в контроллере, не становясь unhandledRejection.
+      saveOriginals: jest.fn(() => new Promise<any>(() => {})),
+      ownerUrl: jest.fn((id: string) => `/webhook/chat-uploads/${id}`),
+    };
+    const { persist, ctrl, post } = setup(chatUploads, [
+      { type: 'delta', text: ANSWER },
+      { type: 'done' },
+    ]);
+    const res = makeRes();
+
+    await ctrl.uploadAndChat(makeUploadReq('a.pdf', 'что тут написано?'), res);
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+
+    // Релей вызван и ответ доставлен несмотря на зависшее сохранение.
+    expect(post).toHaveBeenCalled();
+    expect(res.written).toContainEqual({
+      type: 'upload_persist_failed',
+      content: 'Файл не сохранён для будущих разговоров',
+    });
+    expect(res.written.find((w: any) => w.type === 'end')?.content).toBe(ANSWER);
+    expect(res.end).toHaveBeenCalled();
+    // Ничего не сохранено — история в прежнем формате, без ссылок.
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(persist.mock.calls[0][0].userMsg).toBe('📎 a.pdf\nчто тут написано?');
+  });
+
+  it('быстрый saveOriginals — бюджет не срабатывает, upload_persist_failed нет', async () => {
+    const chatUploads = makeChatUploadsMock({ saved: [UPLOAD_RECORD], failed: [] });
+    const { persist, ctrl, post } = setup(chatUploads, [
+      { type: 'delta', text: ANSWER },
+      { type: 'done' },
+    ]);
+    const res = makeRes();
+
+    await ctrl.uploadAndChat(makeUploadReq('a.pdf', 'что тут написано?'), res);
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+
+    expect(post).toHaveBeenCalled();
+    expect(res.written.some((w: any) => w.type === 'upload_persist_failed')).toBe(false);
+    expect(persist.mock.calls[0][0].userMsg).toContain(UPLOAD_LINK);
+  });
+});
+
+/**
+ * Ревью I2 (13.11.2026): при невыставленном флаге строка истории обязана
+ * байт-в-байт совпадать с прежней `📎 имена\nсообщение` (historyMerge.ts
+ * сверяет строки истории посимвольно), а сохранение исходников не вызывается.
+ */
+describe('uploadAndChat: инвариант истории при выключенной фиче (ревью I2)', () => {
+  const OLD_UPLOADS_FLAG = process.env.CHAT_UPLOADS_ENABLED;
+  beforeEach(() => { delete process.env.CHAT_UPLOADS_ENABLED; });
+  afterEach(() => {
+    jest.clearAllMocks();
+    if (OLD_UPLOADS_FLAG === undefined) delete process.env.CHAT_UPLOADS_ENABLED;
+    else process.env.CHAT_UPLOADS_ENABLED = OLD_UPLOADS_FLAG;
+  });
+
+  it('флаг не выставлен — userMsg посимвольно старого формата, saveOriginals не вызван', async () => {
+    const chatUploads = makeChatUploadsMock({ saved: [], failed: [] });
+    const svc = makeService(makePg());
+    const persist = jest.spyOn(svc, 'persistUploadTurn').mockResolvedValue(0);
+    const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+    const neo4j = { getProfileDescription: jest.fn(async () => PROFILE) };
+    const ctrl = new (ChatController as any)(svc, jwtSvc, neo4j, undefined, undefined, chatUploads);
+    const post = jest.fn(async () => ({ data: sseStream([{ type: 'delta', text: ANSWER }, { type: 'done' }]) }));
+    (axios as any).default = { post };
+    (axios as any).post = post;
+
+    await ctrl.uploadAndChat(makeUploadReq('scan.jpg', 'переведи'), makeRes());
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+
+    expect(chatUploads.saveOriginals).not.toHaveBeenCalled();
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(persist.mock.calls[0][0].userMsg).toBe('📎 scan.jpg\nпереведи');
+  });
+});
+
+/**
+ * Ревью I3 (13.11.2026): обучение профиля (consolidateAfterChatPublic) —
+ * LLM-вызов, ему нужен текст ассистента. При записи хода с пустым ответом
+ * (ради ссылки на файл в истории) вызываться не должен; при непустом —
+ * работает как раньше.
+ */
+describe('uploadAndChat: гейт consolidate (ревью I3)', () => {
+  const OLD_UPLOADS_FLAG = process.env.CHAT_UPLOADS_ENABLED;
+  beforeEach(() => { process.env.CHAT_UPLOADS_ENABLED = 'true'; });
+  afterEach(() => {
+    jest.clearAllMocks();
+    if (OLD_UPLOADS_FLAG === undefined) delete process.env.CHAT_UPLOADS_ENABLED;
+    else process.env.CHAT_UPLOADS_ENABLED = OLD_UPLOADS_FLAG;
+  });
+
+  async function runWith(events: any[]) {
+    const chatUploads = makeChatUploadsMock({ saved: [UPLOAD_RECORD], failed: [] });
+    const svc = makeService(makePg());
+    const persist = jest.spyOn(svc, 'persistUploadTurn').mockResolvedValue(0);
+    const consolidate = jest.spyOn(svc, 'consolidateAfterChatPublic').mockResolvedValue(undefined);
+    const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+    const neo4j = { getProfileDescription: jest.fn(async () => PROFILE) };
+    const ctrl = new (ChatController as any)(svc, jwtSvc, neo4j, undefined, undefined, chatUploads);
+    const post = jest.fn(async () => ({ data: sseStream(events) }));
+    (axios as any).default = { post };
+    (axios as any).post = post;
+
+    await ctrl.uploadAndChat(makeUploadReq('a.pdf', 'что тут написано?'), makeRes());
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+    return { persist, consolidate };
+  }
+
+  it('пустой ответ — история записана, consolidate не вызван', async () => {
+    const { persist, consolidate } = await runWith([]);
+
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(consolidate).not.toHaveBeenCalled();
+  });
+
+  it('непустой ответ — consolidate вызван, как раньше', async () => {
+    const { persist, consolidate } = await runWith([
+      { type: 'delta', text: ANSWER },
+      { type: 'done' },
+    ]);
+
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(consolidate).toHaveBeenCalledTimes(1);
+    expect(consolidate.mock.calls[0][2]).toContain(UPLOAD_LINK);
+    expect(consolidate.mock.calls[0][3]).toBe(ANSWER);
   });
 });
