@@ -293,13 +293,16 @@ describe('ссылки: новая гасит старые; к группе по
   });
 
   function makeClaim(o: { token?: any; owner?: number | null; conflict?: boolean; conflictOwner?: string; tokenTaken?: boolean; configTaken?: boolean }) {
-    const pg = { query: jest.fn(async (sql: string) => {
-      if (/FROM tg_claim_tokens t/.test(sql)) return { rows: o.token ? [o.token] : [] };
-      if (/id != \$2/.test(sql)) return { rows: o.conflict ? [{ id: 'other', owner_user_id: o.conflictOwner ?? 'u-stranger' }] : [] };
-      if (/UPDATE tg_claim_tokens/.test(sql)) return o.tokenTaken ? { rows: [], rowCount: 0 } : { rows: [{ token: 'tok' }], rowCount: 1 };
-      if (/UPDATE tg_bot_configs/.test(sql)) return o.configTaken ? { rows: [], rowCount: 0 } : { rows: [{ id: 'c1' }], rowCount: 1 };
-      return { rows: [] };
-    }) };
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        if (/FROM tg_claim_tokens t/.test(sql)) return { rows: o.token ? [o.token] : [] };
+        if (/id != \$2/.test(sql)) return { rows: o.conflict ? [{ id: 'other', owner_user_id: o.conflictOwner ?? 'u-stranger' }] : [] };
+        if (/UPDATE tg_claim_tokens/.test(sql)) return o.tokenTaken ? { rows: [], rowCount: 0 } : { rows: [{ token: 'tok' }], rowCount: 1 };
+        if (/UPDATE tg_bot_configs/.test(sql)) return o.configTaken ? { rows: [], rowCount: 0 } : { rows: [{ id: 'c1' }], rowCount: 1 };
+        return { rows: [] };
+      }),
+      tryAdvisoryLock: jest.fn(async () => ({ release: jest.fn(async () => {}) })),
+    };
     const identity = { getIdentityByLinkeonId: jest.fn(async () => (o.owner === null ? null : { tgUserId: o.owner ?? 7 })) };
     return { svc: new TgClaimService(pg as any, identity as any), pg };
   }

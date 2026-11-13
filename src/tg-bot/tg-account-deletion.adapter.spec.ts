@@ -11,6 +11,7 @@ import type {
   DeletionResourceType,
 } from '../account-deletion/account-deletion.types';
 import { TgBotModule } from './tg-bot.module';
+import { TgClaimService } from './tg-claim.service';
 import { TgConfigService } from './tg-config.service';
 import { TgIdentityService } from './tg-identity.service';
 import { TgVideoDispatchService } from './tg-video-dispatch.service';
@@ -36,6 +37,7 @@ interface FakeConfig {
   id: string;
   owner_user_id: string;
   tg_chat_id: string | null;
+  tg_chat_title?: string | null;
   custom_agent_id: string | null;
   status: string;
   archived_at: string | null;
@@ -43,7 +45,7 @@ interface FakeConfig {
 }
 
 class FakeDeletionDb {
-  readonly users = new Map<string, { state: 'active' | 'deleted'; deletionId: string | null }>();
+  readonly users = new Map<string, { state: 'active' | 'deleted'; deletionId: string | null; deletedAt?: string }>();
   configs: FakeConfig[] = [];
   customAgents: Array<Record<string, any>> = [];
   claimTokens: Array<Record<string, any>> = [];
@@ -52,6 +54,21 @@ class FakeDeletionDb {
   adminAgents: Array<Record<string, any>> = [];
   agentVersions: Array<Record<string, any>> = [];
   readonly queries: Array<{ sql: string; params: any[] }> = [];
+  readonly events: string[] = [];
+  beforeActivation: (() => Promise<void>) | null = null;
+  private lockOwner: { key: number } | null = null;
+
+  readonly tryAdvisoryLock = jest.fn(async (key: number) => {
+    this.events.push(this.lockOwner ? `lock-busy:${key}` : `lock:${key}`);
+    if (this.lockOwner) return null;
+    this.lockOwner = { key };
+    return {
+      release: jest.fn(async () => {
+        this.events.push(`release:${key}`);
+        this.lockOwner = null;
+      }),
+    };
+  });
 
   async query(sql: string, params: any[] = []): Promise<any> {
     const s = normalize(sql);
@@ -73,11 +90,64 @@ class FakeDeletionDb {
       return { rows, rowCount: rows.length };
     }
 
+    if (s.startsWith('SELECT t.owner_user_id') && s.includes('FROM tg_claim_tokens t')) {
+      const token = this.claimTokens.find((candidate) => candidate.token === params[0]
+        && candidate.kind === 'claim' && candidate.consumed_at == null);
+      if (!token) return { rows: [], rowCount: 0 };
+      const config = this.configs.find((candidate) => candidate.id === token.config_id);
+      return {
+        rows: [{
+          owner_user_id: token.owner_user_id,
+          config_id: token.config_id,
+          display_name: config?.display_name ?? null,
+          status: config?.status ?? null,
+        }],
+        rowCount: 1,
+      };
+    }
+    if (s.startsWith('SELECT id, owner_user_id FROM tg_bot_configs') && s.includes('id != $2')) {
+      const rows = this.configs
+        .filter((config) => config.id !== params[1] && config.tg_chat_id === String(params[0])
+          && ['active', 'silent'].includes(config.status))
+        .map((config) => ({ id: config.id, owner_user_id: config.owner_user_id }));
+      return { rows: rows.slice(0, 1), rowCount: rows.length };
+    }
+    if (s.startsWith('UPDATE tg_claim_tokens SET consumed_at=now()')) {
+      const token = this.claimTokens.find((candidate) => candidate.token === params[0] && candidate.consumed_at == null);
+      if (!token) return { rows: [], rowCount: 0 };
+      token.consumed_at = '2026-11-11T00:00:00.000Z';
+      return { rows: [{ token: token.token }], rowCount: 1 };
+    }
+    if (s.startsWith('UPDATE tg_bot_configs SET tg_chat_id = $1')) {
+      if (this.beforeActivation) await this.beforeActivation();
+      const [chatId, title, configId, ownerId] = params;
+      const config = this.configs.find((candidate) => candidate.id === configId);
+      const activeGuard = s.includes("u.state='active'");
+      if (!config || config.status !== 'pending'
+        || (activeGuard && this.users.get(ownerId)?.state !== 'active')) {
+        return { rows: [], rowCount: 0 };
+      }
+      config.tg_chat_id = String(chatId);
+      config.tg_chat_title = title;
+      config.status = 'active';
+      this.events.push(`activate:${config.id}`);
+      return { rows: [{ id: config.id }], rowCount: 1 };
+    }
+    if (s.startsWith('SELECT * FROM tg_bot_configs WHERE tg_chat_id = $1')
+      || s.startsWith('SELECT c.* FROM tg_bot_configs c JOIN user_id')) {
+      const activeAccountGuard = s.includes('JOIN user_id') && s.includes("u.state='active'");
+      const rows = this.configs.filter((config) => config.tg_chat_id === String(params[0])
+        && ['active', 'silent'].includes(config.status)
+        && (!activeAccountGuard || this.users.get(config.owner_user_id)?.state === 'active'));
+      return { rows: rows.slice(0, 1), rowCount: rows.length };
+    }
+
     if (s.startsWith('SELECT 1 FROM tg_bot_configs other WHERE other.tg_chat_id=$1')) {
+      const statuses = s.includes("'pending'") ? ['active', 'silent', 'pending'] : ['active', 'silent'];
       const rows = this.configs
         .filter((config) => config.id !== params[1]
           && config.tg_chat_id === params[0]
-          && ['active', 'silent'].includes(config.status))
+          && statuses.includes(config.status))
         .map(() => ({ '?column?': 1 }));
       return { rows: rows.slice(0, 1), rowCount: rows.length };
     }
@@ -92,14 +162,19 @@ class FakeDeletionDb {
       ]);
       const [id, ownerId, currentDeletionId] = params;
       const config = this.configs.find((candidate) => candidate.id === id && candidate.owner_user_id === ownerId);
-      const activeOnly = s.includes("c.status IN ('active','silent')");
-      if (!config || !this.isCurrentDeletion(ownerId, currentDeletionId)
-        || (activeOnly && !['active', 'silent'].includes(config.status))) {
+      const retryAware = s.includes("c.status IN ('pending','active','silent')")
+        && s.includes('c.archived_at>=u.deleted_at');
+      const deletionDate = this.users.get(ownerId)?.deletedAt ?? account.deletedAt.toISOString();
+      const eligible = retryAware
+        ? ['pending', 'active', 'silent'].includes(config?.status ?? '')
+          || (config?.status === 'archived' && config.archived_at != null && config.archived_at >= deletionDate)
+        : config?.status != null && ['active', 'silent'].includes(config.status);
+      if (!config || !this.isCurrentDeletion(ownerId, currentDeletionId) || !eligible) {
         return { rows: [], rowCount: 0 };
       }
       config.status = 'archived';
-      config.archived_at ??= '2026-11-11T00:00:00.000Z';
-      return { rows: [{ tg_chat_id: config.tg_chat_id }], rowCount: 1 };
+      config.archived_at ??= deletionDate;
+      return { rows: [{ tg_chat_id: config.tg_chat_id, archived_at: config.archived_at }], rowCount: 1 };
     }
 
     if (s.startsWith('UPDATE tg_claim_tokens t SET consumed_at=now()')) {
@@ -263,6 +338,28 @@ function makeAdapter(db: FakeDeletionDb, grammy: any) {
   const registry = new AccountDeletionRegistry();
   const adapter = new TgAccountDeletionAdapter(db as any, configs, registry);
   return { adapter, configs, registry };
+}
+
+function makeClaimService(db: FakeDeletionDb): TgClaimService {
+  const identity = {
+    getIdentityByLinkeonId: jest.fn(async (ownerId: string) => ({
+      tgUserId: ownerId === 'u-neighbor' ? 20002 : 10001,
+      tgUsername: null,
+      tgFirstName: null,
+    })),
+  };
+  return new TgClaimService(db as any, identity as any);
+}
+
+function claimToken(configId: string, ownerId: string, token: string): Record<string, any> {
+  return {
+    token,
+    kind: 'claim',
+    owner_user_id: ownerId,
+    config_id: configId,
+    consumed_at: null,
+    expires_at: '2026-11-12T00:00:00.000Z',
+  };
 }
 
 function ownConfig(overrides: Partial<FakeConfig> = {}): FakeConfig {
@@ -439,6 +536,158 @@ describe('TgAccountDeletionAdapter stop', () => {
     expect(db.configs[0].status).toBe('active');
     expect(db.claimTokens[0].consumed_at).toBeNull();
     expect(db.videoDeliveries[0].delivery_status).toBe('pending');
+    expect(grammy.leaveChat).not.toHaveBeenCalled();
+  });
+});
+
+describe('TG archive/claim lifecycle locking', () => {
+  it('timeout → archived current deletion обязан повторить leave; давно archived не вызывает external', async () => {
+    const db = new FakeDeletionDb();
+    db.users.set(account.userId, { state: 'deleted', deletionId, deletedAt: account.deletedAt.toISOString() });
+    db.configs = [ownConfig()];
+    const grammy = { leaveChat: jest.fn() };
+    grammy.leaveChat
+      .mockImplementationOnce(async () => {
+        db.events.push('leave:1');
+        throw { code: 'ETIMEDOUT' };
+      })
+      .mockImplementationOnce(async () => {
+        db.events.push('leave:2');
+        return true;
+      });
+    const { adapter } = makeAdapter(db, grammy);
+    const stop = job('telegram.stop', 'cfg-1', { chatId: '-100200' });
+
+    await expect(adapter.execute(stop, execution(db))).rejects.toMatchObject({ kind: 'timeout' });
+    expect(db.configs[0].status).toBe('archived');
+    await adapter.execute(stop, execution(db));
+
+    expect(grammy.leaveChat).toHaveBeenCalledTimes(2);
+    const key = db.tryAdvisoryLock.mock.calls[0]?.[0];
+    expect(key).toEqual(expect.any(Number));
+    expect(db.events).toEqual([
+      `lock:${key}`, 'leave:1', `release:${key}`,
+      `lock:${key}`, 'leave:2', `release:${key}`,
+    ]);
+
+    const old = new FakeDeletionDb();
+    old.users.set(account.userId, { state: 'deleted', deletionId, deletedAt: account.deletedAt.toISOString() });
+    old.configs = [ownConfig({ status: 'archived', archived_at: '2026-10-01T00:00:00.000Z' })];
+    const oldGrammy = { leaveChat: jest.fn(async () => true) };
+    const { adapter: oldAdapter } = makeAdapter(old, oldGrammy);
+    await oldAdapter.execute(stop, execution(old));
+    expect(oldGrammy.leaveChat).not.toHaveBeenCalled();
+  });
+
+  it('B pending до archive lock блокирует leave; B активируется после без выгнанного бота', async () => {
+    const db = new FakeDeletionDb();
+    db.users.set(account.userId, { state: 'deleted', deletionId, deletedAt: account.deletedAt.toISOString() });
+    db.users.set('u-neighbor', { state: 'active', deletionId: null });
+    db.configs = [
+      ownConfig(),
+      ownConfig({ id: 'cfg-b', owner_user_id: 'u-neighbor', status: 'pending', custom_agent_id: 'ca-b' }),
+    ];
+    db.claimTokens = [claimToken('cfg-b', 'u-neighbor', 'claim-b')];
+    const grammy = { leaveChat: jest.fn(async () => true) };
+    const { adapter } = makeAdapter(db, grammy);
+    const claim = makeClaimService(db);
+
+    await adapter.execute(job('telegram.stop', 'cfg-1', { chatId: '-100200' }), execution(db));
+    await claim.claim('claim-b', 20002, -100200, 'B');
+
+    expect(grammy.leaveChat).not.toHaveBeenCalled();
+    expect(db.configs.find((config) => config.id === 'cfg-b')?.status).toBe('active');
+    expect(db.tryAdvisoryLock.mock.calls.length).toBe(2);
+    expect(db.tryAdvisoryLock.mock.calls[0][0]).toBe(db.tryAdvisoryLock.mock.calls[1][0]);
+    expect(db.events.filter((event) => event.startsWith('release:'))).toHaveLength(2);
+  });
+
+  it('B activation держит lock: A stop получает retry, не leave; после B active stop завершается локально', async () => {
+    const db = new FakeDeletionDb();
+    db.users.set(account.userId, { state: 'deleted', deletionId, deletedAt: account.deletedAt.toISOString() });
+    db.users.set('u-neighbor', { state: 'active', deletionId: null });
+    db.configs = [
+      ownConfig(),
+      ownConfig({ id: 'cfg-b', owner_user_id: 'u-neighbor', status: 'pending', tg_chat_id: null, custom_agent_id: 'ca-b' }),
+    ];
+    db.claimTokens = [claimToken('cfg-b', 'u-neighbor', 'claim-b')];
+    let entered!: () => void;
+    const activationEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let openGate!: () => void;
+    const gate = new Promise<void>((resolve) => { openGate = resolve; });
+    db.beforeActivation = async () => { entered(); await gate; };
+    const claim = makeClaimService(db);
+    const grammy = { leaveChat: jest.fn(async () => true) };
+    const { adapter } = makeAdapter(db, grammy);
+    const stop = job('telegram.stop', 'cfg-1', { chatId: '-100200' });
+
+    const claiming = claim.claim('claim-b', 20002, -100200, 'B');
+    await activationEntered;
+    const first = await adapter.execute(stop, execution(db)).then(() => null).catch((error) => error);
+    openGate();
+    await claiming;
+    const second = await adapter.execute(stop, execution(db)).then(() => null).catch((error) => error);
+
+    expect(first).toMatchObject({ kind: 'external_unknown' });
+    expect(second).toBeNull();
+    expect(grammy.leaveChat).not.toHaveBeenCalled();
+    expect(db.configs.find((config) => config.id === 'cfg-b')?.status).toBe('active');
+    expect(db.tryAdvisoryLock.mock.calls.length).toBe(3);
+    const keys = db.tryAdvisoryLock.mock.calls.map(([key]) => key);
+    expect(new Set(keys).size).toBe(1);
+    expect(db.events.filter((event) => event.startsWith('release:'))).toHaveLength(2);
+  });
+
+  it('A leave держит lock: пришедший B не активируется до release, повтор после leave успешен', async () => {
+    const db = new FakeDeletionDb();
+    db.users.set(account.userId, { state: 'deleted', deletionId, deletedAt: account.deletedAt.toISOString() });
+    db.users.set('u-neighbor', { state: 'active', deletionId: null });
+    db.configs = [ownConfig()];
+    const claim = makeClaimService(db);
+    let during: any;
+    const grammy = {
+      leaveChat: jest.fn(async () => {
+        db.events.push('leave:start');
+        db.configs.push(ownConfig({
+          id: 'cfg-b', owner_user_id: 'u-neighbor', status: 'pending', tg_chat_id: null, custom_agent_id: 'ca-b',
+        }));
+        db.claimTokens.push(claimToken('cfg-b', 'u-neighbor', 'claim-b'));
+        during = await claim.claim('claim-b', 20002, -100200, 'B').then(() => null).catch((error) => error);
+        db.events.push('leave:end');
+        return true;
+      }),
+    };
+    const { adapter } = makeAdapter(db, grammy);
+
+    await adapter.execute(job('telegram.stop', 'cfg-1', { chatId: '-100200' }), execution(db));
+    const retry = await claim.claim('claim-b', 20002, -100200, 'B').then(() => null).catch((error) => error);
+
+    expect(during).toMatchObject({ claimFailure: 'group_taken' });
+    expect(retry).toBeNull();
+    expect(db.events.indexOf('leave:end')).toBeLessThan(db.events.indexOf('activate:cfg-b'));
+    expect(db.configs.find((config) => config.id === 'cfg-b')?.status).toBe('active');
+    expect(db.tryAdvisoryLock.mock.calls.length).toBe(3);
+    expect(new Set(db.tryAdvisoryLock.mock.calls.map(([key]) => key)).size).toBe(1);
+    expect(db.events.filter((event) => event.startsWith('release:'))).toHaveLength(2);
+  });
+
+  it('pending stop архивирует config, late claim не активирует, deleted active config не находится group flow', async () => {
+    const db = new FakeDeletionDb();
+    db.users.set(account.userId, { state: 'deleted', deletionId, deletedAt: account.deletedAt.toISOString() });
+    db.configs = [ownConfig({ status: 'pending', tg_chat_id: null })];
+    const grammy = { leaveChat: jest.fn(async () => true) };
+    const { adapter, configs } = makeAdapter(db, grammy);
+    const claim = makeClaimService(db);
+
+    await adapter.execute(job('telegram.stop', 'cfg-1', { chatId: null }), execution(db));
+    db.claimTokens.push(claimToken('cfg-1', account.userId, 'late-claim'));
+    const late = await claim.claim('late-claim', 10001, -100200, 'Late').then(() => null).catch((error) => error);
+    db.configs.push(ownConfig({ id: 'cfg-deleted-active', tg_chat_id: '-100999', status: 'active' }));
+
+    expect(late).toMatchObject({ claimFailure: 'expired' });
+    expect(db.configs.find((config) => config.id === 'cfg-1')?.status).toBe('archived');
+    expect(await configs.getActiveByTgChatId(-100200)).toBeNull();
+    expect(await configs.getActiveByTgChatId(-100999)).toBeNull();
     expect(grammy.leaveChat).not.toHaveBeenCalled();
   });
 });
