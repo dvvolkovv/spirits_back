@@ -170,7 +170,7 @@ describe('searchForUser: внешние ссылки из человечески
   it('USER_LINKS_SQL — та же область сессий, человеческие сообщения, фильтр дней', () => {
     expect(USER_LINKS_SQL).toContain(`session_id LIKE $1 || '\\_%' ESCAPE '\\'`);
     expect(USER_LINKS_SQL).toMatch(/sender_type = 'human'/);
-    expect(USER_LINKS_SQL).toMatch(/content ~ 'https?:\/\//);
+    expect(USER_LINKS_SQL).toMatch(/content ~ 'https\?:\/\//);
     expect(USER_LINKS_SQL).toMatch(/\$2::int IS NULL OR created_at >= now\(\) - make_interval\(days => \$2::int\)/);
   });
 
