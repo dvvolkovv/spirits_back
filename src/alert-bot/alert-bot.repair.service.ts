@@ -54,6 +54,10 @@ export class AlertBotRepairService {
     return this.store.abandon(repairId);
   }
 
+  async abandonUnstarted(repairId: string): Promise<boolean> {
+    return this.store.abandonUnstarted(repairId);
+  }
+
   async findRepairByUpdate(updateId: number): Promise<RepairRecord | null> {
     return this.store.findRepairByUpdate(updateId);
   }

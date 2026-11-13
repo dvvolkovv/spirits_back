@@ -351,6 +351,10 @@ maybe('callback черновика с lease против PostgreSQL', () => {
       localDrafts,
       turns as any,
       support,
+      {
+        findRepairByUpdate: jest.fn().mockResolvedValue(null),
+        abandonUnstarted: jest.fn().mockResolvedValue(true),
+      } as any,
     );
     const update = (updateId: number, callbackId: string) => ({
       update_id: updateId,
@@ -467,6 +471,10 @@ maybe('callback черновика с lease против PostgreSQL', () => {
       localDrafts,
       turns,
       support,
+      {
+        findRepairByUpdate: jest.fn().mockResolvedValue(null),
+        abandonUnstarted: jest.fn().mockResolvedValue(true),
+      } as any,
     );
     const update = (updateId: number, callbackId: string) => ({
       update_id: updateId,

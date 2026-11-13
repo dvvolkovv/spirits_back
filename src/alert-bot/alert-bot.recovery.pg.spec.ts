@@ -74,6 +74,8 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
     const commands = { start: jest.fn(), status: jest.fn(), close: jest.fn() };
     const repairEntry = repairService || {
       admit: jest.fn(), abandon: jest.fn(), stop: jest.fn(), stopAll: jest.fn().mockResolvedValue(undefined),
+      findRepairByUpdate: jest.fn().mockResolvedValue(null),
+      abandonUnstarted: jest.fn().mockResolvedValue(true),
     };
     const service = new AlertBotService(
       { resolveTelegram: jest.fn().mockResolvedValue({ isAdmin: true, userId: 'admin-retry' }) } as any,

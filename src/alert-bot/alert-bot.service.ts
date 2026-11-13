@@ -147,7 +147,14 @@ export class AlertBotService {
         this.logger.error(`alert-bot retry state failed kind=${safeErrorKind(failureError)}`);
         return;
       }
-      if (final) await this.sendFinalFailure(candidate, kind);
+      if (final) {
+        const repair = await this.repairs.findRepairByUpdate(updateId);
+        if (repair) {
+          const abandoned = await this.repairs.abandonUnstarted(repair.id);
+          if (!abandoned) this.logger.error('alert-bot repair dead-letter abandon skipped kind=not_unstarted');
+        }
+        await this.sendFinalFailure(candidate, kind);
+      }
     } finally {
       this.activeUpdates.delete(updateId);
     }

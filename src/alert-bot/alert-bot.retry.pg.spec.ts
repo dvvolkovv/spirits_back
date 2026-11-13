@@ -66,6 +66,10 @@ maybe('дurable retry обновлений бота алертов против 
       } as any,
       turns,
       { findTicketByPrefix: jest.fn().mockResolvedValue(null) } as any,
+      {
+        findRepairByUpdate: jest.fn().mockResolvedValue(null),
+        abandonUnstarted: jest.fn().mockResolvedValue(true),
+      } as any,
     );
     return { service, turns };
   }

@@ -237,6 +237,19 @@ export class RepairStore {
     return result.rowCount === 1;
   }
 
+  async abandonUnstarted(id: string): Promise<boolean> {
+    const result = await this.pg.query(
+      `UPDATE alert_bot_repairs r SET status = 'cancelled', finished_at = now()
+       WHERE r.id = $1 AND r.status IN ('requested', 'cancel_requested')
+         AND NOT EXISTS (
+           SELECT 1 FROM alert_bot_turns t
+           WHERE t.id = r.turn_id AND t.model_started_at IS NOT NULL
+         )`,
+      [id],
+    );
+    return result.rowCount === 1;
+  }
+
   async createJob(input: CreateRepairJobInput): Promise<{ id: string; sequence: number } | null> {
     const lockKey = `alert-bot-repair-job:${input.repairId}`;
     const client = await this.pg.getClient();
