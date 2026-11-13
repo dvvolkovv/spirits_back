@@ -41,6 +41,20 @@ function markdownEscapeName(name: string): string {
   return name.replace(/\\/g, '\\\\').replace(/\[/g, '\\[').replace(/\]/g, '\\]');
 }
 
+/**
+ * Бюджет сохранения исходников ДО первого байта ответа (ревью I1, 13.11.2026),
+ * мс. Сохранение (MinIO PutObject + PG insert) идёт до res.status/begin, и без
+ * бюджета деградация MinIO держала бы клиента на молчащем соединении: nginx
+ * режет 504, а бэкенд продолжает и платит за ход релея, который никто не ждёт.
+ * Дефолт в стиле PERSIST_TURN_BUDGET_MS (chat-files); env-переопределение
+ * читается в момент вызова — для тестов и аварийных сценариев.
+ */
+const CHAT_UPLOADS_SAVE_BUDGET_MS_DEFAULT = 20_000;
+function chatUploadsSaveBudgetMs(): number {
+  const parsed = Number(process.env.CHAT_UPLOADS_SAVE_BUDGET_MS);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : CHAT_UPLOADS_SAVE_BUDGET_MS_DEFAULT;
+}
+
 @Controller('')
 export class ChatController {
   private readonly logger = new Logger(ChatController.name);
@@ -353,17 +367,37 @@ export class ChatController {
     let savedUploads: ChatUploadRecord[] = [];
     let uploadPersistFailed = false;
     if (process.env.CHAT_UPLOADS_ENABLED === 'true' && this.chatUploads) {
+      const budgetMs = chatUploadsSaveBudgetMs();
+      const savePromise = this.chatUploads.saveOriginals({ userId, sessionId: uploadSessionId, files });
+      // Проигравший гонку saveOriginals может дорезолвиться (или упасть) уже
+      // после бюджета: результат игнорируется, а reject обязан быть погашен,
+      // иначе унесём unhandledRejection в уже идущий ответ (ревью I1).
+      void savePromise.catch(() => {});
+      let budgetTimer: NodeJS.Timeout | undefined;
       try {
-        const result = await this.chatUploads.saveOriginals({ userId, sessionId: uploadSessionId, files });
+        const result = await Promise.race([
+          savePromise,
+          new Promise<never>((_, reject) => {
+            budgetTimer = setTimeout(
+              () => reject(new Error(`save budget ${budgetMs}ms exceeded`)),
+              budgetMs,
+            );
+          }),
+        ]);
         savedUploads = result.saved;
         uploadPersistFailed = result.failed.length > 0;
       } catch (e: any) {
-        // saveOriginals ловит сбои пофайлово, но бросок возможен до цикла
-        // (например, createBucketIfAbsent при недоступном MinIO).
+        // Два случая: бросок до пофайлового цикла (например,
+        // createBucketIfAbsent при недоступном MinIO — saveOriginals ловит
+        // сбои только внутри цикла) и превышение бюджета. Ход не прерывается:
+        // текущий ответ продолжается по прежнему relay-пути.
         this.logger.warn(
-          `[upload-and-chat] saveOriginals для ${userId}_${assistantId} бросила, продолжаю без исходников: ${e?.message?.slice(0, 200) || e}`,
+          `[upload-and-chat] saveOriginals для ${userId}_${assistantId} не завершилась (${e?.message?.slice(0, 200) || e}), продолжаю без исходников`,
         );
+        savedUploads = [];
         uploadPersistFailed = true;
+      } finally {
+        if (budgetTimer) clearTimeout(budgetTimer);
       }
     }
 
