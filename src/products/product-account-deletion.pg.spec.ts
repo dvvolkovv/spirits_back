@@ -12,6 +12,7 @@ import { ProductAccountDeletionAdapter } from './product-account-deletion.adapte
 import { ProductAccountDeletionService } from './product-account-deletion.service';
 import { ProductActionsService } from './product-actions.service';
 import { ProductLifecycleService } from './product-lifecycle.service';
+import { ProductPurgeService } from './product-purge.service';
 import { MIGRATIONS } from './products.service';
 import { ProvisioningService } from './provisioning.service';
 import { RentService } from './rent.service';
@@ -138,7 +139,9 @@ maybe('product account deletion против живого Postgres', () => {
       new ProductActionsService(pg as any),
       secrets,
     );
-    service = new ProductAccountDeletionService(pg as any, lifecycle);
+    // ProductPurgeService конструируется напрямую (без onModuleInit — таймеры
+    // обхода в спеке не нужны): purge-шаг adapter зовёт только scoped-методы.
+    service = new ProductAccountDeletionService(pg as any, lifecycle, new ProductPurgeService(pg as any));
     adapter = new ProductAccountDeletionAdapter(service, new AccountDeletionRegistry());
   });
 

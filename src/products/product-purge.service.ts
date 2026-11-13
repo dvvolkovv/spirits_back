@@ -203,14 +203,20 @@ export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
    * Отбор — по тому, есть ли что стирать: стёртое не переписывается каждый
    * час заново. purged_at IS NULL — стёртые агентом completePurgeJob уже
    * вычистил, и обход не перебирает их правки до конца времён.
+   *
+   * wipeDue — общий отбор для обоих входов: wipeExpired (часовой обход,
+   * прежняя сигнатура) и wipeExpiredForProduct (путь удаления аккаунта,
+   * scopeSql сужает до одного продукта владельца). SQL один на двоих, чтобы
+   * наборы стираемого не разъехались.
    */
-  async wipeExpired(): Promise<number> {
+  private async wipeDue(scopeSql: string, scopeParams: any[] = []): Promise<number> {
     const r = await this.pg.query(
       `WITH due AS (
           UPDATE products p
              SET secrets_encrypted = NULL, first_prompt = NULL, first_prompt_channel = NULL
            WHERE p.archived_at IS NOT NULL AND p.purged_at IS NULL
              AND p.purge_after IS NOT NULL AND p.purge_after <= now()
+             ${scopeSql}
              AND (p.secrets_encrypted IS NOT NULL OR p.first_prompt IS NOT NULL OR p.first_prompt_channel IS NOT NULL
                   OR EXISTS (SELECT 1 FROM product_turns t
                               WHERE t.product_id = p.id
@@ -237,13 +243,96 @@ export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
        SELECT (SELECT count(*) FROM due)::int AS products,
               (SELECT count(*) FROM turns)::int AS turns,
               (SELECT count(*) FROM actions)::int AS actions`,
-      [PURGED_TEXT],
+      [PURGED_TEXT, ...scopeParams],
     );
     const row = r.rows[0] ?? { products: 0, turns: 0, actions: 0 };
     if (row.products > 0) {
       this.logger.log(`срок возврата вышел: у ${row.products} удалённых стёрты ключи и тексты (правок ${row.turns}, карточек ${row.actions})`);
     }
     return Number(row.products);
+  }
+
+  async wipeExpired(): Promise<number> {
+    return this.wipeDue('');
+  }
+
+  /**
+   * Путь удаления аккаунта (Task 8): то же стирание после срока, но строго
+   * одного продукта владельца — поверх общих предикатов фильтр p.id/p.user_id
+   * ($2/$3 после PURGED_TEXT). Чужой продукт и чужие правки не задеваются.
+   */
+  async wipeExpiredForProduct(productId: string, userId: string): Promise<number> {
+    return this.wipeDue('AND p.id = $2 AND p.user_id = $3', [productId, userId]);
+  }
+
+  /** Общий отбор должников purge: все (обход) или один продукт (scopeSql). */
+  private async duePurgeRows(scopeSql: string, scopeParams: any[] = []): Promise<any[]> {
+    const due = await this.pg.query(
+      `SELECT p.id, p.slug, p.host_id,
+              ${COUNTED_FAILURES_SQL}::int AS failed,
+              (SELECT count(*) FROM product_provision_jobs j
+                WHERE j.product_id = p.id AND j.kind = 'purge' AND j.status = 'failed'
+                  AND j.started_at IS NULL AND j.created_at >= p.archived_at)::int AS unclaimed,
+              (SELECT count(*) FROM product_provision_jobs j
+                WHERE j.product_id = p.id AND j.kind = 'purge' AND j.status = 'failed'
+                  AND j.created_at >= p.archived_at AND ${OUTDATED_SQL})::int AS outdated
+         FROM products p
+        WHERE p.archived_at IS NOT NULL AND p.purged_at IS NULL AND p.status = 'archived'
+          AND p.purge_after IS NOT NULL AND p.purge_after <= now() ${scopeSql}`,
+      scopeParams,
+    );
+    return due.rows;
+  }
+
+  /**
+   * Разбор для людей — строка в лог раз на процесс на продукт и вид исхода;
+   * общий для обхода и для пути удаления аккаунта (один экземпляр сервиса,
+   * одно множество warned). В текстах нет userId — только uuid/слаг продукта.
+   */
+  private logPurgeBlockers(rows: any[]): void {
+    for (const row of rows) {
+      if (row.host_id === null || row.host_id === undefined) {
+        this.errorOnce(`nohost:${row.id}`, `удалённый продукт ${row.id} (${row.slug}) без машины — стирание только на сервере: ключи и тексты стёрты, задание агенту не ставится`);
+        continue;
+      }
+      if (Number(row.failed) >= PURGE_FAIL_CAP) {
+        this.errorOnce(
+          `cap:${row.id}`,
+          `стирание продукта ${row.id} (${row.slug}) не ставится: ${PURGE_FAIL_CAP} провала подряд — нужен ручной разбор, на машине остались каталог и контейнер`,
+        );
+      }
+      if (Number(row.unclaimed) >= PURGE_FAIL_CAP) {
+        this.warnOnce(`unclaimed:${row.id}`, `стирание продукта ${row.id} (${row.slug}) снова и снова снимается невыданным (всего ${row.unclaimed}) — агент машины ${row.host_id} не забирает задания; продукт на машине остался`);
+      }
+      if (Number(row.outdated) > 0) {
+        this.warnOnce(`outdated:${row.id}`, `агент машины ${row.host_id} не знает задания purge (продукт ${row.slug}) — обновить агента; стирание ставится снова`);
+      }
+    }
+  }
+
+  /**
+   * Общая постановка purge-задания. FOR UPDATE OF p — тот же замок, что у сна
+   * удалённых: возврат (restore) держит строку продукта до COMMIT, и стирание,
+   * прочитавшее снимок до возврата, иначе встало бы вернувшемуся продукту.
+   * $1 — потолок провалов, scopeSql нумеруется с $2.
+   */
+  private async insertPurgeJobs(scopeSql: string, scopeParams: any[] = []): Promise<number> {
+    const r = await this.pg.query(
+      `INSERT INTO product_provision_jobs (product_id, kind, status)
+       SELECT p.id, 'purge', 'queued' FROM products p
+        WHERE p.archived_at IS NOT NULL AND p.purged_at IS NULL AND p.status = 'archived'
+          AND p.purge_after IS NOT NULL AND p.purge_after <= now()
+          AND p.host_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
+                           WHERE j.product_id = p.id AND j.status IN ('queued','running'))
+          AND ${COUNTED_FAILURES_SQL} < $1
+          ${scopeSql}
+          FOR UPDATE OF p
+       ON CONFLICT DO NOTHING
+       RETURNING product_id`,
+      [PURGE_FAIL_CAP, ...scopeParams],
+    );
+    return r.rows.length;
   }
 
   /**
@@ -263,55 +352,21 @@ export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
    * Ключи и тексты на сервере к этому моменту уже стёрты (wipeExpired).
    */
   async queuePurges(): Promise<number> {
-    const due = await this.pg.query(
-      `SELECT p.id, p.slug, p.host_id,
-              ${COUNTED_FAILURES_SQL}::int AS failed,
-              (SELECT count(*) FROM product_provision_jobs j
-                WHERE j.product_id = p.id AND j.kind = 'purge' AND j.status = 'failed'
-                  AND j.started_at IS NULL AND j.created_at >= p.archived_at)::int AS unclaimed,
-              (SELECT count(*) FROM product_provision_jobs j
-                WHERE j.product_id = p.id AND j.kind = 'purge' AND j.status = 'failed'
-                  AND j.created_at >= p.archived_at AND ${OUTDATED_SQL})::int AS outdated
-         FROM products p
-        WHERE p.archived_at IS NOT NULL AND p.purged_at IS NULL AND p.status = 'archived'
-          AND p.purge_after IS NOT NULL AND p.purge_after <= now()`,
-    );
-    for (const row of due.rows) {
-      if (row.host_id === null || row.host_id === undefined) {
-        this.errorOnce(`nohost:${row.id}`, `удалённый продукт ${row.id} (${row.slug}) без машины — стирание только на сервере: ключи и тексты стёрты, задание агенту не ставится`);
-        continue;
-      }
-      if (Number(row.failed) >= PURGE_FAIL_CAP) {
-        this.errorOnce(
-          `cap:${row.id}`,
-          `стирание продукта ${row.id} (${row.slug}) не ставится: ${PURGE_FAIL_CAP} провала подряд — нужен ручной разбор, на машине остались каталог и контейнер`,
-        );
-      }
-      if (Number(row.unclaimed) >= PURGE_FAIL_CAP) {
-        this.warnOnce(`unclaimed:${row.id}`, `стирание продукта ${row.id} (${row.slug}) снова и снова снимается невыданным (всего ${row.unclaimed}) — агент машины ${row.host_id} не забирает задания; продукт на машине остался`);
-      }
-      if (Number(row.outdated) > 0) {
-        this.warnOnce(`outdated:${row.id}`, `агент машины ${row.host_id} не знает задания purge (продукт ${row.slug}) — обновить агента; стирание ставится снова`);
-      }
-    }
-    // FOR UPDATE OF p — тот же замок, что у сна удалённых: возврат (restore)
-    // держит строку продукта до COMMIT, и стирание, прочитавшее снимок до
-    // возврата, иначе встало бы вернувшемуся продукту.
-    const r = await this.pg.query(
-      `INSERT INTO product_provision_jobs (product_id, kind, status)
-       SELECT p.id, 'purge', 'queued' FROM products p
-        WHERE p.archived_at IS NOT NULL AND p.purged_at IS NULL AND p.status = 'archived'
-          AND p.purge_after IS NOT NULL AND p.purge_after <= now()
-          AND p.host_id IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM product_provision_jobs j
-                           WHERE j.product_id = p.id AND j.status IN ('queued','running'))
-          AND ${COUNTED_FAILURES_SQL} < $1
-          FOR UPDATE OF p
-       ON CONFLICT DO NOTHING
-       RETURNING product_id`,
-      [PURGE_FAIL_CAP],
-    );
-    return r.rows.length;
+    this.logPurgeBlockers(await this.duePurgeRows(''));
+    return this.insertPurgeJobs('');
+  }
+
+  /**
+   * Путь удаления аккаунта (Task 8): постановка purge строго одному продукту
+   * владельца — те же предикаты, замок, потолок провалов и NOT EXISTS
+   * активного задания, что у обхода; поверх них фильтр p.id/p.user_id.
+   * Повтор при уже стоящем задании — no-op (ON CONFLICT DO NOTHING + NOT
+   * EXISTS), подтверждением успеха это не считается: purged_at ставит только
+   * отчёт агента (completePurgeJob).
+   */
+  async queuePurgeForProduct(productId: string, userId: string): Promise<number> {
+    this.logPurgeBlockers(await this.duePurgeRows('AND p.id = $1 AND p.user_id = $2', [productId, userId]));
+    return this.insertPurgeJobs('AND p.id = $2 AND p.user_id = $3', [productId, userId]);
   }
 
   /**
@@ -338,21 +393,59 @@ export class ProductPurgeService implements OnModuleInit, OnModuleDestroy {
         ORDER BY purged_at`,
     );
     if (r.rows.length === 0) return 0;
+    const root = await this.backupRoot();
+    if (root === null) return 0;
+    return this.clearBackups(r.rows, root);
+  }
+
+  /**
+   * Путь удаления аккаунта (Task 8): стирание резервной копии строго одного
+   * продукта владельца — тот же строгий приём (backupRoot/clearBackups), что
+   * и у обхода; поверх него фильтр id/user_id/purged_at/repo_url. Возвращает
+   * число обнулённых repo_url; копия не на этой машине или корень не прочитан
+   * — 0, и adapter трактует нестирание как fail-closed retry.
+   */
+  async removeBackupForProduct(productId: string, userId: string): Promise<number> {
+    const r = await this.pg.query(
+      `SELECT id, slug, repo_url FROM products
+        WHERE id = $1 AND user_id = $2
+          AND purged_at IS NOT NULL AND repo_url IS NOT NULL`,
+      [productId, userId],
+    );
+    if (r.rows.length === 0) return 0;
+    const root = await this.backupRoot();
+    if (root === null) return 0;
+    return this.clearBackups(r.rows, root);
+  }
+
+  /**
+   * Корень резервных копий, проверенный по настоящей ФС: realpath знак в знак.
+   * Отказ (нет каталога или по дороге ссылка) — null с разовым error, а не
+   * «стирать нечего»: repo_url при этом не трогается.
+   */
+  private async backupRoot(): Promise<string | null> {
     const root = reposRoot();
     let realRoot: string;
     try {
       realRoot = await fs.promises.realpath(root);
     } catch (e: any) {
       this.errorOnce(`root:${root}`, `каталог резервных копий ${root} не прочитан (${fsCode(e)}) — копии стёртых продуктов не стираются, repo_url не тронут`);
-      return 0;
+      return null;
     }
     if (realRoot !== root) {
       this.errorOnce(`root:${root}`, `каталог резервных копий ${root} на деле ${realRoot} — по дороге ссылка, копии не стираются (задать PRODUCT_REPOS_DIR настоящим путём)`);
-      return 0;
+      return null;
     }
+    return root;
+  }
 
+  /** Тело стирания копий: общий цикл обхода и scoped-пути удаления аккаунта. */
+  private async clearBackups(
+    rows: { id: string; slug: string; repo_url: string }[],
+    root: string,
+  ): Promise<number> {
     let removed = 0;
-    for (const p of r.rows) {
+    for (const p of rows) {
       const where = backupPathFor(p.repo_url, p.slug, root);
       if (!where) {
         this.warnOnce(`foreign:${p.id}`, `резервная копия стёртого продукта ${p.slug} не на этой машине или не по форме (${p.repo_url}) — стереть руками`);

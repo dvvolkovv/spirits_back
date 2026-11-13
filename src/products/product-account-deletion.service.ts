@@ -6,8 +6,19 @@ import {
   queueForcedSleepCte,
 } from './product-forced-stop';
 import { ProductLifecycleService } from './product-lifecycle.service';
+import { ProductPurgeService } from './product-purge.service';
 
 export type ProductSleepStatus = 'queued' | 'running' | 'done' | 'failed';
+
+/**
+ * Факты продукта для шага product.purge: принадлежит ли владельцу, поставлен
+ * ли штамп стирания агентом машины (completePurgeJob) и где резервная копия.
+ */
+export interface ProductPurgeState {
+  owned: boolean;
+  purgedAt: Date | null;
+  repoUrl: string | null;
+}
 
 /**
  * Срок хранения архива продукта удалённого аккаунта до стирания — 30 дней
@@ -35,7 +46,107 @@ export class ProductAccountDeletionService {
   constructor(
     private readonly pg: PgService,
     private readonly lifecycle: ProductLifecycleService,
+    private readonly purge: ProductPurgeService,
   ) {}
+
+  /** Scoped-стирание архива одного продукта (секреты, тексты, first_prompt). */
+  async wipeExpiredForProduct(productId: string, userId: string): Promise<number> {
+    return this.purge.wipeExpiredForProduct(productId, userId);
+  }
+
+  /** Scoped-постановка host pull-модели purge одному продукту владельца. */
+  async queuePurgeForProduct(productId: string, userId: string): Promise<number> {
+    return this.purge.queuePurgeForProduct(productId, userId);
+  }
+
+  /** Scoped-стирание резервной копии одного продукта (строго на этой машине). */
+  async removeBackupForProduct(productId: string, userId: string): Promise<number> {
+    return this.purge.removeBackupForProduct(productId, userId);
+  }
+
+  /**
+   * Факты purge-шага по продукту: null — строки нет вовсе (идемпотентный
+   * успех), owned=false — чужой продукт (fail-closed, не удаляем). purged_at
+   * ставит только отчёт агента машины (completePurgeJob) — до него
+   * relational-строки не трогаются.
+   */
+  async purgeState(productId: string, userId: string): Promise<ProductPurgeState | null> {
+    const r = await this.pg.query(
+      `SELECT p.user_id = $2 AS owned, p.purged_at, p.repo_url
+         FROM products p
+        WHERE p.id = $1`,
+      [productId, userId],
+    );
+    const row = r.rows[0];
+    if (!row) return null;
+    return {
+      owned: row.owned === true,
+      purgedAt: row.purged_at ?? null,
+      repoUrl: row.repo_url ?? null,
+    };
+  }
+
+  /**
+   * Подтверждение, что резервная копия обнулена (repo_url IS NULL) у стёртого
+   * продукта. Отсутствие строки — тоже подтверждение: удалять уже нечего.
+   */
+  async backupCleared(productId: string, userId: string): Promise<boolean> {
+    const r = await this.pg.query(
+      `SELECT p.repo_url IS NULL AS cleared
+         FROM products p
+        WHERE p.id = $1 AND p.user_id = $2 AND p.purged_at IS NOT NULL`,
+      [productId, userId],
+    );
+    if (!r.rows[0]) return true;
+    return r.rows[0].cleared === true;
+  }
+
+  /**
+   * Финал purge-шага: relational-строки продукта удаляются ТОЛЬКО после того,
+   * как агент машины подтвердил стирание (purged_at IS NOT NULL) и только
+   * своему удалению текущего поколения (u.state='deleted' + deletion_id —
+   * тот же страж, что у assertCurrent и archiveState). Один оператор в
+   * транзакции: product_actions — ON DELETE SET NULL (журнал), поэтому
+   * удаляется явно в CTE; turns/jobs/domains уходят каскадами.
+   *
+   * Повтор при уже удалённой строке — подтверждённый успех (true): повторный
+   * attempt координатора не должен вечно держать job. Отказ стражей (чужой
+   * продукт, не стёрт, старое поколение) — false, и adapter уходит в
+   * fail-closed retry.
+   */
+  async deletePurgedProduct(
+    productId: string,
+    userId: string,
+    deletionId: string,
+  ): Promise<boolean> {
+    const r = await this.pg.query(
+      `WITH target AS (
+          SELECT p.id
+            FROM products p
+            JOIN user_id u ON u.internal_id = p.user_id
+           WHERE p.id = $1 AND p.user_id = $2
+             AND u.state = 'deleted' AND u.deletion_id = $3
+             AND p.purged_at IS NOT NULL
+             FOR UPDATE OF p
+       ), actions AS (
+          DELETE FROM product_actions a USING target t
+           WHERE a.product_id = t.id RETURNING a.id
+       ), deleted AS (
+          DELETE FROM products p USING target t
+           WHERE p.id = t.id RETURNING p.id
+       )
+       -- Обе ссылки держат data-modifying CTE частью плана этого оператора —
+       -- тот же приём, что в forceStop (см. комментарий там про форму запроса).
+       SELECT (SELECT id FROM deleted) AS id,(SELECT count(*) FROM actions) AS removed_actions`,
+      [productId, userId, deletionId],
+    );
+    if (r.rows[0]?.id) return true;
+    const exists = await this.pg.query(
+      `SELECT 1 FROM products WHERE id = $1`,
+      [productId],
+    );
+    return exists.rows.length === 0;
+  }
 
   /**
    * Читает только архив текущего deletion generation с полностью выставленным
