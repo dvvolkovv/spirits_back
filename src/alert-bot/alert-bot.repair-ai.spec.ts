@@ -177,6 +177,41 @@ describe('AlertBotRepairAi', () => {
     expect(prompt).toContain('question: 4');
   });
 
+  it('маскирует PII и секреты в replyText и history, не оставляя сырых значений', async () => {
+    await ai.repair({
+      ...input,
+      replyText: 'Звонок с +7 903 016 91 87, почта user@example.com, ключ sk-abcdefgh12345678',
+      history: [{
+        question: 'Проверь номер +79030169187',
+        answer: 'Админ admin@example.com, токен Bearer raw-token-value',
+      }],
+    });
+
+    const [prompt] = claude.textWithCost.mock.calls[0];
+    expect(prompt).toContain('replied_diagnosis: ');
+    expect(prompt).toContain('+7 *** *** 87');
+    expect(prompt).toContain('u***@example.com');
+    expect(prompt).toContain('a***@example.com');
+    expect(prompt).toContain('Bearer [скрыто]');
+    expect(prompt).toContain('[скрыто]');
+    expect(prompt).not.toContain('+7 903 016 91 87');
+    expect(prompt).not.toContain('+79030169187');
+    expect(prompt).not.toContain('user@example.com');
+    expect(prompt).not.toContain('admin@example.com');
+    expect(prompt).not.toContain('sk-abcdefgh12345678');
+    expect(prompt).not.toContain('raw-token-value');
+  });
+
+  it('admin_instruction остаётся дословным текстом админа', async () => {
+    await ai.repair({
+      ...input,
+      question: 'Почини worker, мой контакт +7 903 016 91 87',
+    });
+
+    const [prompt] = claude.textWithCost.mock.calls[0];
+    expect(prompt).toContain('admin_instruction: Почини worker, мой контакт +7 903 016 91 87');
+  });
+
   it('очищает журнал инструментов и после ошибки CLI', async () => {
     claude.textWithCost.mockRejectedValue(Object.assign(new Error('safe'), { kind: 'other' }));
 
