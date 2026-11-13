@@ -110,6 +110,14 @@ export class AlertBotTurns {
     options: AlertBotTurnEnqueueOptions = {},
   ): Promise<AlertBotAdmission> {
     if (!this.accepting) throw new AlertBotRetryableError('stopped');
+    if (input.recoverRepair) {
+      const repair = await this.repairs.findRepairByUpdate(input.updateId);
+      input = {
+        ...input,
+        recoverRepair: undefined,
+        ...(repair ? { mode: 'repair' as const, repairId: repair.id } : {}),
+      };
+    }
     const startedAt = Date.now();
     let turnId: string;
     if (reservation) {
@@ -141,8 +149,7 @@ export class AlertBotTurns {
     return this.runTurn(turnId, input, startedAt);
   }
 
-  async resumeExisting(turn: AlertBotTurn, options: AlertBotTurnEnqueueOptions = {}): Promise<AlertBotAdmission> {
-    const repair = await this.repairs.findRepairByUpdate(turn.updateId);
+  resumeExisting(turn: AlertBotTurn, options: AlertBotTurnEnqueueOptions = {}): Promise<AlertBotAdmission> {
     // Публичный recovery входит в ту же chat queue и проходит accepting checks.
     return this.enqueue({
       updateId: turn.updateId,
@@ -151,9 +158,10 @@ export class AlertBotTurns {
       adminUserId: turn.adminUserId,
       questionMessageId: turn.questionMessageId,
       question: turn.question,
+      replyText: turn.replyText ?? undefined,
       parentTurnId: turn.parentTurnId,
       privateChat: turn.privateChat,
-      ...(repair ? { mode: 'repair' as const, repairId: repair.id } : {}),
+      recoverRepair: true,
     }, undefined, options);
   }
 

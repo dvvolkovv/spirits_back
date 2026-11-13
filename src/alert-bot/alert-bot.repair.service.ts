@@ -37,6 +37,7 @@ function emptyGenerated(): RepairGenerated {
 @Injectable()
 export class AlertBotRepairService {
   private readonly controllers = new Map<string, AbortController>();
+  private readonly adminCancelledRepairs = new Set<string>();
   private stoppingAll = false;
 
   constructor(
@@ -61,17 +62,18 @@ export class AlertBotRepairService {
     if (!isAlertBotRepairAdmin(tgId)) return 'Доступ только для администраторов';
     const active = await this.store.findActiveRepair(chatId);
     if (!active) return 'Нет активного исправления';
-    if (!await this.store.requestCancel(active.id)) {
+    const requested = await this.store.requestCancel(active.id);
+    if (!requested) {
       const current = await this.store.findRepair(active.id);
       if (current && TERMINAL_STATUSES.has(current.status)) {
         return repairStatusText(current.status as RepairFinalStatus, current.mutationCount);
       }
-      if (current?.status === 'cancel_requested') return 'Исправление останавливается';
-      return 'Нет активного исправления';
+      if (current?.status !== 'cancel_requested') return 'Нет активного исправления';
     }
+    this.adminCancelledRepairs.add(active.id);
     this.controllers.get(active.id)?.abort();
     await this.executor.stopRepair(active.id);
-    return 'Исправление остановлено';
+    return requested ? 'Исправление остановлено' : 'Исправление останавливается';
   }
 
   async stopAll(): Promise<void> {
@@ -89,12 +91,12 @@ export class AlertBotRepairService {
     let generated = emptyGenerated();
     const existing = await this.store.findRepair(repairId);
     if (existing?.status === 'cancel_requested') {
-      return this.finalize(repairId, [], this.cancelModel(), generated, false);
+      return this.finalize(repairId, [], this.cancelModel(repairId), generated, false);
     }
     if (!await this.store.markRepairRunning(repairId, turnId)) {
       const current = await this.store.findRepair(repairId);
-      if (current?.status === 'cancel_requested') {
-        return this.finalize(repairId, [], this.cancelModel(), generated, false);
+      if (current?.status === 'cancel_requested' || this.stoppingAll) {
+        return this.finalize(repairId, [], this.cancelModel(repairId), generated, false);
       }
       throw new AlertBotRetryableError('repair_not_requested');
     }
@@ -104,9 +106,9 @@ export class AlertBotRepairService {
     let model: RepairModelOutcome = 'completed';
     try {
       const current = await this.store.findRepair(repairId);
-      if (current?.status === 'cancel_requested') {
+      if (this.stoppingAll || current?.status === 'cancel_requested') {
         controller.abort();
-        model = this.cancelModel();
+        model = this.cancelModel(repairId);
       } else {
         try {
           generated = await this.ai.repair({
@@ -115,7 +117,7 @@ export class AlertBotRepairService {
           if (generated.noCause) model = 'no_cause';
         } catch (error) {
           model = controller.signal.aborted
-            ? this.cancelModel()
+            ? this.cancelModel(repairId)
             : (error as { kind?: unknown })?.kind === 'timeout' ? 'timeout' : 'failed';
         }
       }
@@ -123,14 +125,17 @@ export class AlertBotRepairService {
       if (this.controllers.get(repairId) === controller) this.controllers.delete(repairId);
     }
 
+    if (this.adminCancelledRepairs.has(repairId)) await this.executor.stopRepair(repairId);
     const jobs = await this.store.listJobs(repairId);
     const current = await this.store.findRepair(repairId);
-    if (current?.status === 'cancel_requested') model = this.cancelModel();
+    if (this.stoppingAll) model = 'interrupted';
+    else if (current?.status === 'cancel_requested') model = this.cancelModel(repairId);
     return this.finalize(repairId, jobs, model, generated);
   }
 
-  private cancelModel(): RepairModelOutcome {
-    return this.stoppingAll ? 'interrupted' : 'cancelled';
+  private cancelModel(repairId: string): RepairModelOutcome {
+    if (this.stoppingAll) return 'interrupted';
+    return this.adminCancelledRepairs.has(repairId) ? 'cancelled' : 'interrupted';
   }
 
   private async finalize(
@@ -145,7 +150,7 @@ export class AlertBotRepairService {
     if (!finished) {
       let current = await this.store.findRepair(repairId);
       if (current?.status === 'cancel_requested') {
-        outcome = deriveRepairOutcome(jobs, this.cancelModel());
+        outcome = deriveRepairOutcome(jobs, this.cancelModel(repairId));
         finished = await this.store.finishRepair(repairId, outcome.status, outcome.mutationCount);
         if (!finished) current = await this.store.findRepair(repairId);
       }

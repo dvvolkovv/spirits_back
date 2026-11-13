@@ -3,7 +3,7 @@ export interface TurnInput {
   updateId: number; chatId: string; tgUserId: string; adminUserId: string;
   questionMessageId: number; question: string; replyText?: string;
   parentTurnId?: string | null; ticketId?: string | null; privateChat: boolean;
-  mode?: 'repair'; repairId?: string;
+  mode?: 'repair'; repairId?: string; recoverRepair?: boolean;
 }
 export interface RepairIdentity {
   scope: 'repair';

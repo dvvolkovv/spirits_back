@@ -2,6 +2,7 @@ DO $$
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtext('alert-bot/002'));
   PERFORM set_config('lock_timeout', '5s', true);
+  ALTER TABLE alert_bot_turns ADD COLUMN IF NOT EXISTS reply_text text;
   CREATE TABLE IF NOT EXISTS alert_bot_repairs (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     update_id bigint NOT NULL,

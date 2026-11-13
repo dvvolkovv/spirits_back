@@ -22,6 +22,7 @@ export function deriveRepairOutcome(jobs: RepairOutcomeJob[], model: RepairModel
 
   if (hasNonTerminalJobs) return { status: 'interrupted', mutationCount };
   if (model === 'cancelled') return { status: 'cancelled', mutationCount };
+  if (model === 'interrupted') return { status: 'interrupted', mutationCount };
   if (verified) return { status: 'verified', mutationCount };
   if (model === 'no_cause') return { status: 'failed', mutationCount };
   if (model !== 'completed') return { status: model, mutationCount };
