@@ -277,6 +277,7 @@ Co-Authored-By: Kimi <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `src/common/services/storage.service.ts`
+- Modify: `src/chat/chat-uploads/chat-uploads.service.ts` (метод `migrate()`)
 - Create: `src/chat/chat-uploads/chat-uploads.controller.ts`
 - Create: `src/chat/chat-uploads/chat-uploads.module.ts`
 - Modify: `src/chat/chat.module.ts`
@@ -332,9 +333,47 @@ export class ChatUploadsController {
 
 `ChatUploadsModule` импортирует `CommonModule`, объявляет контроллер и сервис, экспортирует сервис. `ChatModule` только импортирует `ChatUploadsModule`; `ProfileModule` сможет импортировать его позже без цикла.
 
+Модуль обязан применить миграцию при старте — без этого таблица `chat_uploads` не существует ни на стенде, ни на проде. Паттерн тот же, что в `alert-bot.store.ts:169` (`AlertBotStore.migrate` + `AlertBotLifecycle.onModuleInit`): nest assets не копируют SQL в `dist` (в `nest-cli.json` только `human-design/data/*.json`), поэтому нужен fallback `dist → src`.
+
+В `ChatUploadsService` добавить:
+
+```ts
+async migrate(): Promise<void> {
+  const candidates = [
+    path.join(__dirname, 'migrations', '001_chat_uploads.sql'),
+    path.join(__dirname, '..', '..', '..', 'src', 'chat', 'chat-uploads', 'migrations', '001_chat_uploads.sql'),
+  ];
+  const migrationPath = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!migrationPath) throw new Error('chat-uploads migration 001_chat_uploads.sql not found');
+  const sql = fs.readFileSync(migrationPath, 'utf8');
+  await this.pg.query(sql);
+}
+```
+
+⚠️ В отличие от alert-bot здесь **три** `..`: сервис после сборки лежит в `dist/chat/chat-uploads/`, а не в `dist/alert-bot/`.
+
+Модуль:
+
+```ts
+@Module({
+  imports: [CommonModule],
+  controllers: [ChatUploadsController],
+  providers: [ChatUploadsService],
+  exports: [ChatUploadsService],
+})
+export class ChatUploadsModule implements OnModuleInit {
+  constructor(private readonly uploads: ChatUploadsService) {}
+  async onModuleInit(): Promise<void> {
+    await this.uploads.migrate();
+  }
+}
+```
+
+В `chat-uploads.module.spec.ts` проверить: (1) `onModuleInit` вызывает `uploads.migrate()`; (2) `migrate()` с mock-`pg` отправляет SQL, содержащий `CREATE TABLE IF NOT EXISTS chat_uploads`, а при отсутствии файла бросает `chat-uploads migration ... not found` (не глотает ошибку молча); (3) сбой `migrate()` прокидывается из `onModuleInit` — приложение не стартует с несозданной таблицей.
+
 - [ ] **Step 4: проверить GREEN и wiring**
 
-Прогнать controller/module specs и `tsc`. Дополнительно проверить, что `ChatModule` и `ProfileModule` могут импортировать `ChatUploadsModule` без цикла.
+Прогнать controller/module specs и `tsc`. Дополнительно проверить, что `ChatModule` и `ProfileModule` могут импортировать `ChatUploadsModule` без цикла. Проверить, что SQL-файл реально читается из ts-окружения (`npx jest src/chat/chat-uploads/chat-uploads.module.spec.ts` — тест `migrate()` проходит по fallback-пути `src/`).
 
 - [ ] **Step 5: commit**
 
