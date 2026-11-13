@@ -211,6 +211,13 @@ export class BlockService {
    * идущий ход, перевести в 'blocked' с причиной, поставить задание на
    * гашение.
    *
+   * Тела CTE killed_jobs/killed_turns/queued общие с удалением аккаунта
+   * (product-forced-stop.ts) — инлайновые обоснования их формы ('queued'
+   * наравне с 'running' из-за замка product_turns_one_active; ссылка на
+   * killed_jobs ради порядка; отсутствие ON CONFLICT DO NOTHING у гашения)
+   * живут в докблоках helper'а, а разделы ниже — про то же у оператора в
+   * целом.
+   *
    * ## ПОРЯДОК ЧАСТЕЙ ЗАКРЕПЛЁН ССЫЛКОЙ, А НЕ НАДЕЖДОЙ — ЭТО ИЗМЕРЕНО
    *
    * `product_provision_jobs_one_active` — ЧАСТИЧНЫЙ УНИКАЛЬНЫЙ индекс по
