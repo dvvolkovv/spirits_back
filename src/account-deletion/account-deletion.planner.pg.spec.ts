@@ -14,6 +14,7 @@ import { discoverProductDeletion } from '../products/product-account-deletion.ad
 import { discoverCalendarDeletion } from '../calendar/calendar-account-deletion.adapter';
 import { discoverIntegrationDeletion } from '../integrations/integration-account-deletion.adapter';
 import { discoverVoiceDeletion } from '../voice-call/voice-account-deletion.adapter';
+import { discoverChatFiles } from '../chat/chat-files/chat-file-account-deletion.adapter';
 import type {
   DeletionAccount,
   DeletionJobRow,
@@ -394,6 +395,7 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       discoverCalendarDeletion,
       discoverIntegrationDeletion,
       discoverVoiceDeletion,
+      discoverChatFiles,
     ]);
     expect(DELETION_DEPENDENCIES['account.core.immediate']).toEqual({ allStop: true });
     expect(DELETION_DEPENDENCIES['account.core.purge']).toEqual({ allStop: true });

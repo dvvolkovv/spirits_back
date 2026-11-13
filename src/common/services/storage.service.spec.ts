@@ -1,5 +1,5 @@
 // src/common/services/storage.service.spec.ts
-import { PutObjectCommand } from '@aws-sdk/client-s3';
+import { DeleteObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { StorageService } from './storage.service';
 
 describe('StorageService.upload', () => {
@@ -60,5 +60,82 @@ describe('StorageService.upload', () => {
   it('publicUrl склеивает базу без двойного слэша', () => {
     const { svc } = make();
     expect(svc.publicUrl('b', 'id/a%20b.pdf')).toBe('https://pub/b/id/a%20b.pdf');
+  });
+});
+
+/**
+ * Task 11 — deleteConfirmed: строгая семантика удаления для account-deletion.
+ *
+ * Обычный delete() возвращает void и не отличает «объект удалён» от «MinIO
+ * ответил 2xx на отсутствующий ключ» от «запрос не прошёл» (S3 DeleteObject
+ * идемпотентен на протоколе, но ошибка транспорта/бакета молча глотается
+ * только вызывающим кодом). Пёржу нужен подтверждённый исход:
+ * 'deleted' | 'absent' — успех (absent = удалять нечего, идемпотентно),
+ * любая прочая ошибка — наружу, чтобы job ушёл в retry, а не в done.
+ */
+describe('StorageService.deleteConfirmed', () => {
+  const saved = { ...process.env };
+
+  beforeEach(() => {
+    process.env.MINIO_ENDPOINT = 'http://127.0.0.1:9000';
+    process.env.MINIO_ACCESS_KEY = 'k';
+    process.env.MINIO_SECRET_KEY = 's';
+    process.env.MINIO_PUBLIC_URL = 'https://pub/';
+  });
+  afterEach(() => {
+    process.env = { ...saved };
+  });
+
+  function make(send: jest.Mock) {
+    const svc = new StorageService();
+    svc.onModuleInit();
+    (svc as any).s3 = { send };
+    return svc;
+  }
+
+  it('2xx на DeleteObject — подтверждённый успех "deleted"', async () => {
+    const send = jest.fn(async () => ({}));
+    const svc = make(send);
+
+    await expect(svc.deleteConfirmed({ bucket: 'b', key: 'k' })).resolves.toBe('deleted');
+
+    const cmd = send.mock.calls[0][0] as DeleteObjectCommand;
+    expect(cmd).toBeInstanceOf(DeleteObjectCommand);
+    expect(cmd.input).toEqual({ Bucket: 'b', Key: 'k' });
+  });
+
+  it('объекта нет (NotFound / NoSuchKey / 404) — тоже успех, "absent"', async () => {
+    const cases: Array<{ name?: string; status?: number }> = [
+      { name: 'NotFound' },
+      { name: 'NoSuchKey' },
+      { status: 404 },
+    ];
+    for (const c of cases) {
+      const err: any = new Error('gone');
+      if (c.name) err.name = c.name;
+      if (c.status) err.$metadata = { httpStatusCode: c.status };
+      const svc = make(jest.fn(async () => { throw err; }));
+      await expect(svc.deleteConfirmed({ bucket: 'b', key: 'k' })).resolves.toBe('absent');
+    }
+  });
+
+  it('неизвестная ошибка (timeout, 5xx, NoSuchBucket) — наружу, не "deleted"', async () => {
+    const cases: any[] = [
+      Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }),
+      Object.assign(new Error('boom'), { name: 'InternalError', $metadata: { httpStatusCode: 503 } }),
+      Object.assign(new Error('no bucket'), { name: 'NoSuchBucket', $metadata: { httpStatusCode: 404 } }),
+    ];
+    for (const err of cases) {
+      const svc = make(jest.fn(async () => { throw err; }));
+      await expect(svc.deleteConfirmed({ bucket: 'b', key: 'k' })).rejects.toBe(err);
+    }
+  });
+
+  it('старый delete() не тронут — по-прежнему void без проверки исхода', async () => {
+    const err: any = new Error('gone');
+    err.name = 'NotFound';
+    const send = jest.fn(async () => { throw err; });
+    const svc = make(send);
+    await expect(svc.delete({ bucket: 'b', key: 'k' })).rejects.toBe(err);
   });
 });
