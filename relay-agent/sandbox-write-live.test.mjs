@@ -5,45 +5,31 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
 import { buildSandboxSettings, buildCliEnv } from "./sandbox-policy.mjs";
 import { ensureSessionDirs } from "./paths.mjs";
+import { RUN_ENV, runTag } from "./proc-reaper.mjs";
+import { runCliProbe, readExpectedProbe, cleanupLiveProbe } from "./sandbox-write-live-lib.mjs";
 
 const LIVE = process.env.RELAY_LIVE_CLI_WRITE_TEST === "1";
 const CLI = process.env.RELAY_CLAUDE_BIN || "/opt/linkeon-agent/bin/claude";
-
-function findNamed(root, wanted) {
-  const found = [];
-  const pending = [root];
-  while (pending.length) {
-    const current = pending.pop();
-    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
-      const full = path.join(current, entry.name);
-      if (entry.isDirectory()) pending.push(full);
-      else if (entry.isFile() && entry.name === wanted) found.push(full);
-    }
-  }
-  return found;
-}
 
 test("CLI sandbox записывает и scratch, и output", {
   skip: LIVE ? false : "живой CLI test включается только RELAY_LIVE_CLI_WRITE_TEST=1",
   timeout: 180_000,
 }, async (t) => {
   const fsKey = randomUUID().replaceAll("-", "");
+  const tag = runTag(randomUUID());
   const scratch = `/tmp/agent-scratch/${fsKey}`;
   const output = `/tmp/agent-output/${fsKey}`;
   const outputProbe = path.join(output, "probe.txt");
-  let child;
-  let finished = false;
+  let child = null;
 
-  await ensureSessionDirs(fsKey);
-  t.after(() => {
-    if (child && !finished) child.kill("SIGKILL");
-    fs.rmSync(scratch, { recursive: true, force: true });
-    fs.rmSync(output, { recursive: true, force: true });
+  t.after(async () => {
+    const errors = await cleanupLiveProbe({ child, tag, scratch, output, graceMs: 25 });
+    assert.deepEqual(errors, [], `cleanup=${JSON.stringify(errors)}`);
   });
 
+  await ensureSessionDirs(fsKey);
   const settingsPath = path.join(scratch, "probe-settings.json");
   const mcpPath = path.join(scratch, "probe-empty-mcp.json");
   fs.writeFileSync(settingsPath, JSON.stringify(buildSandboxSettings(fsKey)), { mode: 0o600 });
@@ -56,6 +42,7 @@ test("CLI sandbox записывает и scratch, и output", {
     scrub: true,
     claudeConfigDir: "/home/dv/.claude",
   });
+  childEnv[RUN_ENV] = tag;
   const command = `printf scratch-ok > "$TMPDIR/probe.txt" && printf output-ok > "${outputProbe}" && cat "$TMPDIR/probe.txt" "${outputProbe}"`;
   const prompt = `Use the Bash tool exactly once to run this command verbatim: ${command}\nDo not use another tool and do not disable or bypass the sandbox. Then reply DONE.`;
   const args = [
@@ -72,78 +59,52 @@ test("CLI sandbox записывает и scratch, и output", {
     "--system-prompt", "Follow the user instruction exactly. Never disable or bypass the sandbox.",
   ];
 
-  child = spawn(CLI, args, { cwd: "/tmp", env: childEnv, stdio: ["pipe", "pipe", "pipe"] });
-  child.stdin.end(prompt);
-  const outcome = await new Promise((resolve) => {
-    let buffer = "";
-    let stderrBytes = 0;
-    let timedOut = false;
-    let resultError = false;
-    let spawnError = null;
-    let settled = false;
-    const toolFailures = [];
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, 120_000);
-    const finish = (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({ code, timedOut, resultError, spawnError, stderrBytes, toolFailures });
-    };
-
-    child.stdout.on("data", (chunk) => {
-      buffer += chunk;
-      const lines = buffer.split("\n");
-      buffer = lines.pop();
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        let event;
-        try { event = JSON.parse(line); } catch { continue; }
-        if (event.type === "result" && event.is_error === true) resultError = true;
-        if (event.type !== "user") continue;
-        for (const block of event.message?.content || []) {
-          if (block.type !== "tool_result") continue;
-          const text = typeof block.content === "string" ? block.content : JSON.stringify(block.content);
-          if (block.is_error || /read-only file system|\bEROFS\b/i.test(text)) {
-            toolFailures.push(text.slice(0, 500));
-          }
-        }
-      }
-    });
-    child.stderr.on("data", (chunk) => { stderrBytes += chunk.length; });
-    child.once("error", (error) => {
-      spawnError = error.code || error.name;
-      finish(127);
-    });
-    child.once("close", (code) => finish(code ?? 1));
+  const outcome = await runCliProbe({
+    cli: CLI,
+    args,
+    prompt,
+    env: childEnv,
+    tag,
+    onChild: (spawned) => { child = spawned; },
+    timeoutMs: 120_000,
+    killWaitMs: 100,
+    reapGraceMs: 25,
   });
-  finished = true;
-
-  const scratchProbes = findNamed(scratch, "probe.txt");
-  const scratchContent = scratchProbes.length === 1 ? fs.readFileSync(scratchProbes[0], "utf8") : null;
-  const outputContent = fs.existsSync(outputProbe) ? fs.readFileSync(outputProbe, "utf8") : null;
+  const scratchProbe = readExpectedProbe(scratch, "probe.txt", "scratch-ok");
+  const outputResult = readExpectedProbe(output, "probe.txt", "output-ok");
   const evidence = [
     `CLI=${CLI}`,
     `exit=${outcome.code}`,
+    `signal=${outcome.signal}`,
     `spawnError=${outcome.spawnError}`,
+    `stdinError=${outcome.stdinError}`,
     `timedOut=${outcome.timedOut}`,
+    `gotResult=${outcome.gotResult}`,
+    `resultSuccess=${outcome.resultSuccess}`,
     `resultError=${outcome.resultError}`,
+    `apiErrorStatus=${outcome.apiErrorStatus}`,
+    `protocolError=${outcome.protocolError}`,
     `stderrBytes=${outcome.stderrBytes}`,
-    `scratchProbes=${scratchProbes.length}`,
-    `scratchContent=${JSON.stringify(scratchContent)}`,
-    `outputContent=${JSON.stringify(outputContent)}`,
+    `scratch=${JSON.stringify(scratchProbe)}`,
+    `output=${JSON.stringify(outputResult)}`,
     `toolFailures=${JSON.stringify(outcome.toolFailures)}`,
+    `toolFailuresDropped=${outcome.toolFailuresDropped}`,
+    `cleanupErrors=${JSON.stringify(outcome.cleanupErrors)}`,
   ].join("; ");
 
   assert.equal(outcome.timedOut, false, evidence);
   assert.equal(outcome.spawnError, null, evidence);
+  assert.equal(outcome.stdinError, null, evidence);
+  assert.equal(outcome.gotResult, true, evidence);
+  assert.equal(outcome.resultSuccess, true, evidence);
   assert.equal(outcome.resultError, false, evidence);
+  assert.equal(outcome.apiErrorStatus, null, evidence);
+  assert.equal(outcome.protocolError, false, evidence);
   assert.equal(outcome.code, 0, evidence);
-  assert.equal(scratchProbes.length, 1, evidence);
-  assert.equal(scratchContent, "scratch-ok", evidence);
-  assert.equal(outputContent, "output-ok", evidence);
+  assert.equal(scratchProbe.ok, true, evidence);
+  assert.equal(outputResult.ok, true, evidence);
   assert.deepEqual(outcome.toolFailures, [], evidence);
+  assert.equal(outcome.toolFailuresDropped, 0, evidence);
+  assert.deepEqual(outcome.cleanupErrors, [], evidence);
   t.diagnostic(evidence);
 });

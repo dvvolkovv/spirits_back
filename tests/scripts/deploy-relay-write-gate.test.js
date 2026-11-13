@@ -28,13 +28,15 @@ describe('relay CLI sandbox write gate', () => {
   });
 
   it('live test отправляет prompt и закрывает stdin', () => {
-    const source = fs.readFileSync(path.join(root, 'relay-agent', 'sandbox-write-live.test.mjs'), 'utf8');
-    const spawned = source.indexOf('child = spawn(CLI, args');
+    const source = fs.readFileSync(path.join(root, 'relay-agent', 'sandbox-write-live-lib.mjs'), 'utf8');
+    const spawned = source.indexOf('child = spawnImpl(cli, args');
+    const stdinHandler = source.indexOf('child.stdin.once("error"', spawned);
     const stdinEnd = source.indexOf('child.stdin.end(prompt);', spawned);
-    const outcome = source.indexOf('const outcome = await new Promise', spawned);
+    const outcome = source.indexOf('mainTimer = setTimeout', spawned);
 
     expect(spawned).toBeGreaterThan(-1);
-    expect(stdinEnd).toBeGreaterThan(spawned);
+    expect(stdinHandler).toBeGreaterThan(spawned);
+    expect(stdinEnd).toBeGreaterThan(stdinHandler);
     expect(stdinEnd).toBeLessThan(outcome);
   });
 });
