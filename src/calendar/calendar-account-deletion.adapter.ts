@@ -55,6 +55,28 @@ export const discoverCalendarDeletion: DeletionDiscoverer = async ({ db, account
     `SELECT 1 FROM trip_calendars t WHERE t.user_id=$1 LIMIT 1`,
     [account.userId],
   );
+  // Follow-up review I-4: «дом дел» и фреймы дня — тоже calendar-домен, и
+  // пользователь ТОЛЬКО с ними обязан получать purge-задачу. Generation
+  // predicate в EXISTS — fail-closed: планируем очистку, лишь пока строка
+  // удалённого поколения на месте.
+  const tasks = await db.query(
+    `SELECT 1 FROM linkeon_tasks l
+      WHERE l.user_id=$1
+        AND EXISTS (
+          SELECT 1 FROM user_id u
+          WHERE u.internal_id=$1 AND u.state='deleted' AND u.deletion_id=$2
+        ) LIMIT 1`,
+    [account.userId, account.deletionId],
+  );
+  const framing = await db.query(
+    `SELECT 1 FROM day_framing d
+      WHERE d.user_id=$1
+        AND EXISTS (
+          SELECT 1 FROM user_id u
+          WHERE u.internal_id=$1 AND u.state='deleted' AND u.deletion_id=$2
+        ) LIMIT 1`,
+    [account.userId, account.deletionId],
+  );
 
   const jobs: DeletionJobSpec[] = [];
   const skips: DeletionSkip[] = [];
@@ -92,7 +114,8 @@ export const discoverCalendarDeletion: DeletionDiscoverer = async ({ db, account
   if (unverifiableExternal) {
     skips.push({ resourceType: 'calendar.external', reason: 'owner_unverifiable' });
   }
-  if (connections.rows.length > 0 || proposals.rows.length > 0 || ics.rows.length > 0) {
+  if (connections.rows.length > 0 || proposals.rows.length > 0 || ics.rows.length > 0
+    || tasks.rows.length > 0 || framing.rows.length > 0) {
     jobs.push({
       resourceType: 'calendar.purge',
       resourceKey: 'calendar',
