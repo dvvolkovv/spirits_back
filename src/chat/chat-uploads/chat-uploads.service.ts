@@ -255,9 +255,16 @@ export class ChatUploadsService {
     // Task 6): в resumed-сессиях релея копии блока накапливаются ход за ходом,
     // а подпись живёт ~1 час. Модель, взявшая ссылку из устаревшей копии,
     // получает 404 и решает, что файл пропал.
+    //
+    // Строка-запрет (I2, финальное ревью): этот блок модель видит каждый ход,
+    // а запрет «не показывать assistantUrl» раньше жил только в описаниях
+    // find_files и manage_product. Вставленная в ответ ссылка оседает в
+    // истории и протухает через час — файл пользователю отдаётся только через
+    // url из find_files.
     return [
       'Earlier user uploads:',
       'Signed links expire after ~1 hour. If this block appears more than once in the conversation, use ONLY the LATEST copy — links from earlier copies are stale and return 404.',
+      'These links are for your internal use only; NEVER show or paste them to the user — to give the user a file, find it via find_files and share only its "url" field.',
       ...records.map((record) => `- ${record.originalName}: ${this.assistantUrl(record.id)}`),
     ].join('\n');
   }

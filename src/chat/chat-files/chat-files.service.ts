@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { PgService } from '../../common/services/pg.service';
-import { ChatUploadsService } from '../chat-uploads/chat-uploads.service';
+import { ChatUploadsService, ChatUploadRecord } from '../chat-uploads/chat-uploads.service';
 import { ChatFileKind, ExtractEnv, ExtractedFile, extractChatFiles } from './extract';
 import {
   FindFilesInput, assistantPart, extractHumanLinks, kindByMime,
@@ -259,15 +259,26 @@ export class ChatFilesService {
    * список от новых к старым, затем фильтры (вид, ассистент) и очки по словам
    * запроса; при равных очках свежие выше (сортировка устойчива). `days` и
    * `limit` действуют на все источники сразу.
+   *
+   * Исходники и ссылки гейтятся CHAT_UPLOADS_ENABLED: флаг выключен — реестр
+   * не опрашивается, USER_LINKS_SQL не выполняется, assistantUrl не чеканится,
+   * и find_files возвращает только файлы ассистентов, как до фичи. Флаг
+   * читается тем же способом, что в chat.service.ts (uploadContextBlock),
+   * chat.controller.ts и chat-uploads.service.ts (assistantBlock).
    */
   async searchForUser(
     userId: string,
     input: FindFilesInput,
   ): Promise<{ ok: true; total: number; files: FoundForTool[] }> {
+    const uploadsOn = process.env.CHAT_UPLOADS_ENABLED === 'true';
     const [filesRes, uploadRecords, linksRes] = await Promise.all([
       this.pg.query(USER_FILES_SQL, [userId, input.days]),
-      this.uploads.searchOriginals(userId, input.days ?? undefined),
-      this.pg.query(USER_LINKS_SQL, [userId, input.days]),
+      uploadsOn
+        ? this.uploads.searchOriginals(userId, input.days ?? undefined)
+        : Promise.resolve<ChatUploadRecord[]>([]),
+      uploadsOn
+        ? this.pg.query(USER_LINKS_SQL, [userId, input.days])
+        : Promise.resolve<{ rows: any[] }>({ rows: [] }),
     ]);
     const found = collectFiles(filesRes.rows, extractEnv());
 
