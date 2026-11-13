@@ -49,21 +49,22 @@ maybe('TG identity deletion mid-transaction race against PostgreSQL', () => {
     const pg = {
       getClient: jest.fn(async () => {
         const client = await pool.connect();
-        const query = client.query.bind(client);
-        (client as any).query = async (sql: string, params?: any[]) => {
-          const result = await query(sql, params);
-          const normalized = normalize(sql);
-          queries.push(normalized);
-          if (deleteNow && normalized.startsWith('SELECT owner_user_id FROM tg_claim_tokens')) {
-            deleteNow = false;
-            await pool.query(
-              `UPDATE user_id SET state='deleted',deletion_id=$1 WHERE internal_id=$2`,
-              [DELETION, owner],
-            );
-          }
-          return result;
+        return {
+          query: async (sql: string, params?: any[]) => {
+            const result = await client.query(sql, params);
+            const normalized = normalize(sql);
+            queries.push(normalized);
+            if (deleteNow && normalized.startsWith('SELECT owner_user_id FROM tg_claim_tokens')) {
+              deleteNow = false;
+              await pool.query(
+                `UPDATE user_id SET state='deleted',deletion_id=$1 WHERE internal_id=$2`,
+                [DELETION, owner],
+              );
+            }
+            return result;
+          },
+          release: () => client.release(),
         };
-        return client;
       }),
     };
     return { svc: new TgIdentityService(pg as any), queries };
