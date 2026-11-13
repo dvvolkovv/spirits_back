@@ -4,6 +4,7 @@ import {
   S3Client,
   PutObjectCommand,
   GetObjectCommand,
+  CreateBucketCommand,
   DeleteObjectCommand,
   HeadObjectCommand,
   ListObjectsV2Command,
@@ -74,6 +75,15 @@ export class StorageService implements OnModuleInit {
     this.logger.log(`StorageService initialized: endpoint=${endpoint} publicBase=${this.publicBaseUrl}`);
   }
 
+  async createBucketIfAbsent(bucket: string): Promise<void> {
+    try {
+      await this.s3.send(new CreateBucketCommand({ Bucket: bucket }));
+    } catch (e: any) {
+      const code = e?.name || e?.Code || e?.code || '';
+      if (!/BucketAlready/.test(code)) throw e;
+    }
+  }
+
   async upload(input: UploadInput): Promise<string> {
     const cmd = new PutObjectCommand({
       Bucket: input.bucket,
@@ -99,6 +109,14 @@ export class StorageService implements OnModuleInit {
       chunks.push(chunk as Buffer);
     }
     return Buffer.concat(chunks);
+  }
+
+  async downloadStream(input: DownloadInput): Promise<Readable> {
+    const cmd = new GetObjectCommand({ Bucket: input.bucket, Key: input.key });
+    const res = input.abortSignal
+      ? await this.s3.send(cmd, { abortSignal: input.abortSignal })
+      : await this.s3.send(cmd);
+    return res.Body as Readable;
   }
 
   async delete(input: DeleteInput): Promise<void> {
