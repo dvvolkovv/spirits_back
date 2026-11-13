@@ -212,7 +212,7 @@ export class AlertBotRepairExecutor {
     }
 
     let child: ChildProcess;
-    try { child = this.spawn(job, rawCommand); }
+    try { child = this.spawn(job); }
     catch {
       await this.finishPreSpawn(job, {
         status: 'failed', exitCode: null, stdout: '', stderr: 'spawn_error\n', failureKind: 'spawn_error',
@@ -262,10 +262,8 @@ export class AlertBotRepairExecutor {
       void this.finishProcess(jobId, status, code).catch(() => undefined);
     });
 
-    if (job.host !== 'prod') {
-      child.stdin!.on('error', () => undefined);
-      child.stdin!.end(rawCommand);
-    }
+    child.stdin!.on('error', () => undefined);
+    child.stdin!.end(rawCommand);
     state.timeout = setTimeout(() => {
       void this.terminate(jobId, 'timeout').catch(() => undefined);
     }, job.timeoutMs);
@@ -381,10 +379,12 @@ export class AlertBotRepairExecutor {
     } finally { this.reconciling = false; }
   }
 
-  private spawn(job: RepairJobRecord, rawCommand: string): ChildProcess {
+  private spawn(job: RepairJobRecord): ChildProcess {
     if (job.host === 'prod') {
-      return childProcess.spawn('bash', ['-lc', rawCommand], {
-        detached: true, stdio: ['ignore', 'pipe', 'pipe'],
+      // Команда уходит через stdin, а не через argv: текст с потенциальными
+      // inline-секретами не должен быть виден в `ps` соседним процессам.
+      return childProcess.spawn('bash', ['-l', '-s'], {
+        detached: true, stdio: ['pipe', 'pipe', 'pipe'],
       });
     }
     return childProcess.spawn('ssh', [
