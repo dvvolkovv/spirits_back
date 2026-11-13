@@ -53,4 +53,12 @@ describe('repair outcome', () => {
     expect(deriveRepairOutcome([remote], 'cancelled')).toEqual({ status: 'interrupted', mutationCount: 1 });
     expect(deriveRepairOutcome([exec('1'), verify('2')], 'cancelled').status).toBe('cancelled');
   });
+
+  it.each(['remote_outcome_unknown', 'process_close_unconfirmed'])('%s не исчезает после late admin stop', (failureKind) => {
+    const unknown = { ...exec('1', true, 'interrupted'), failureKind };
+
+    expect(deriveRepairOutcome([unknown, verify('2')], 'cancelled').status).toBe('interrupted');
+    expect(deriveRepairOutcome([unknown, verify('2')], 'completed').status).toBe('verified');
+    expect(deriveRepairOutcome([exec('1'), verify('2')], 'cancelled').status).toBe('cancelled');
+  });
 });

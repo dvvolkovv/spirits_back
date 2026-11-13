@@ -14,6 +14,9 @@ type Mocks = {
     cleanup: jest.Mock<Promise<void>, []>;
     requeueProcessingUpdates: jest.Mock<Promise<void>, []>;
   };
+  repairStore: {
+    migrate: jest.Mock<Promise<void>, []>;
+  };
   ops: {
     start: jest.Mock<Promise<void>, []>;
     stop: jest.Mock<Promise<void>, []>;
@@ -35,6 +38,9 @@ function makeMocks(): Mocks {
       recordAlert: jest.fn().mockResolvedValue(undefined),
       cleanup: jest.fn().mockResolvedValue(undefined),
       requeueProcessingUpdates: jest.fn().mockResolvedValue(undefined),
+    },
+    repairStore: {
+      migrate: jest.fn().mockResolvedValue(undefined),
     },
     ops: {
       start: jest.fn().mockResolvedValue(undefined),
@@ -64,7 +70,7 @@ describe('AlertBotLifecycle', () => {
     jest.useFakeTimers();
     mocks = makeMocks();
     lifecycle = new (AlertBotLifecycle as any)(
-      mocks.store, mocks.ops, mocks.telegram,
+      mocks.store, mocks.repairStore, mocks.ops, mocks.telegram,
       { idle: jest.fn().mockResolvedValue(undefined) },
       { retryFailedUpdates: jest.fn().mockResolvedValue(undefined), stopAdmission: jest.fn() },
       mocks.pg,
@@ -87,6 +93,9 @@ describe('AlertBotLifecycle', () => {
     await lifecycle.onModuleInit();
 
     expect(mocks.store.migrate).toHaveBeenCalledTimes(1);
+    expect(mocks.repairStore.migrate).toHaveBeenCalledTimes(1);
+    expect(mocks.store.migrate.mock.invocationCallOrder[0]).toBeLessThan(mocks.repairStore.migrate.mock.invocationCallOrder[0]);
+    expect(mocks.repairStore.migrate.mock.invocationCallOrder[0]).toBeLessThan(mocks.pg.registerPreCloseHook.mock.invocationCallOrder[0]);
     expect(mocks.pg.registerPreCloseHook).toHaveBeenCalledTimes(1);
     expect(mocks.store.interruptInProgress).not.toHaveBeenCalled();
     expect(mocks.ops.start).not.toHaveBeenCalled();
@@ -99,6 +108,7 @@ describe('AlertBotLifecycle', () => {
     enabled();
     const calls: string[] = [];
     mocks.store.migrate.mockImplementation(async () => { calls.push('migrate'); });
+    mocks.repairStore.migrate.mockImplementation(async () => { calls.push('repair.migrate'); });
     mocks.store.interruptInProgress.mockImplementation(async () => {
       calls.push('interrupt');
       return [
@@ -118,7 +128,7 @@ describe('AlertBotLifecycle', () => {
     await lifecycle.onModuleInit();
 
     expect(calls).toEqual([
-      'migrate', 'ops.start', 'interrupt', 'requeue', 'sink', 'reply:chat-1', 'reply:chat-2', 'cleanup',
+      'migrate', 'repair.migrate', 'ops.start', 'interrupt', 'requeue', 'sink', 'reply:chat-1', 'reply:chat-2', 'cleanup',
     ]);
     expect(mocks.telegram.sendMessage).toHaveBeenNthCalledWith(1, 'chat-1', RESTART_REPLY, 101);
     expect(mocks.telegram.sendMessage).toHaveBeenNthCalledWith(2, 'chat-2', RESTART_REPLY, 202);
@@ -164,7 +174,7 @@ describe('AlertBotLifecycle', () => {
     const turns = { idle: jest.fn(() => { calls.push('turns.idle'); return new Promise<void>(() => {}); }) };
     const service = { retryFailedUpdates: jest.fn(), stopAdmission: jest.fn() };
     mocks.ops.stop.mockImplementation(async () => { calls.push('ops.stop'); });
-    lifecycle = new (AlertBotLifecycle as any)(mocks.store, mocks.ops, mocks.telegram, turns, service, mocks.pg);
+    lifecycle = new (AlertBotLifecycle as any)(mocks.store, mocks.repairStore, mocks.ops, mocks.telegram, turns, service, mocks.pg);
     await lifecycle.onModuleInit();
 
     const shutdown = (lifecycle as any).beforeApplicationShutdown();
@@ -177,6 +187,18 @@ describe('AlertBotLifecycle', () => {
     expect(mocks.ops.stop).toHaveBeenCalledTimes(1);
   });
 
+  it('ошибка repair migration не открывает turns и ops', async () => {
+    enabled();
+    const failure = new Error('repair migration failed');
+    mocks.repairStore.migrate.mockRejectedValue(failure);
+
+    await expect(lifecycle.onModuleInit()).rejects.toBe(failure);
+
+    expect(mocks.store.interruptInProgress).not.toHaveBeenCalled();
+    expect(mocks.ops.start).not.toHaveBeenCalled();
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
   it('ошибка миграции пробрасывается, вход и ops не открываются', async () => {
     enabled();
     const failure = new Error('migration failed');
@@ -185,6 +207,7 @@ describe('AlertBotLifecycle', () => {
     await expect(lifecycle.onModuleInit()).rejects.toBe(failure);
 
     expect(mocks.store.interruptInProgress).not.toHaveBeenCalled();
+    expect(mocks.repairStore.migrate).not.toHaveBeenCalled();
     expect(mocks.ops.start).not.toHaveBeenCalled();
     expect(mocks.telegram.registerWebhook).not.toHaveBeenCalled();
     expect(sinkSpy).not.toHaveBeenCalled();

@@ -249,6 +249,38 @@ describe('AlertBotRepairService', () => {
     expect(store.finishRepair).toHaveBeenCalledWith(REPAIR_ID, 'cancelled', 0);
   });
 
+  it('stop ставит admin marker до requestCancel transition и ждёт local snapshot', async () => {
+    const aiStarted = deferred();
+    const transition = deferred<boolean>();
+    const transitionStarted = deferred();
+    ai.repair.mockImplementation(() => {
+      aiStarted.resolve();
+      return Promise.resolve({ text: 'Готово', costUsd: 0, tools: [], noCause: false });
+    });
+    store.requestCancel.mockImplementation(() => {
+      transitionStarted.resolve();
+      return transition.promise;
+    });
+    store.listJobs.mockImplementation(() => [{
+      ...job(1, 'exec', true), host: 'prod',
+      status: executor.stopRepair.mock.calls.length ? 'cancelled' : 'running', exitCode: null,
+    }]);
+    const running = service.run(REPAIR_ID, TURN_ID, input());
+    await aiStarted.promise;
+    const stopping = service.stop('100', '200');
+    await transitionStarted.promise;
+
+    const result = await running;
+    const stopCallsBeforeTransition = executor.stopRepair.mock.calls.length;
+    transition.resolve(true);
+    await stopping;
+
+    expect(stopCallsBeforeTransition).toBeGreaterThan(0);
+    expect(store.finishRepair).toHaveBeenCalledWith(REPAIR_ID, 'cancelled', 1);
+    expect(result.text).toContain('Исправление остановлено админом');
+    expect((service as any).adminCancelledRepairs.size).toBe(0);
+  });
+
   it('admin cancel повторно ждёт local stopRepair перед snapshot и получает cancelled', async () => {
     const started = deferred();
     ai.repair.mockImplementation((call: { signal: AbortSignal }) => {
@@ -473,6 +505,37 @@ describe('AlertBotRepairService', () => {
     expect(result.turnStatus).toBe('error');
     expect(result.text).toContain('Исход неизвестен: исправление прервано');
     expect(result.text).not.toContain('остановлено админом');
+  });
+
+  it('успешная terminal финализация удаляет admin marker', async () => {
+    await service.stop('100', '200');
+    store.findRepair
+      .mockResolvedValueOnce(repair())
+      .mockResolvedValue(repair('cancel_requested'));
+
+    await service.run(REPAIR_ID, TURN_ID, input());
+
+    expect(store.finishRepair).toHaveBeenCalledWith(REPAIR_ID, 'cancelled', 0);
+    expect((service as any).adminCancelledRepairs.size).toBe(0);
+  });
+
+  it('ошибка finishRepair сохраняет admin marker для retry', async () => {
+    await service.stop('100', '200');
+    store.findRepair.mockResolvedValue(repair('cancel_requested'));
+    store.finishRepair.mockRejectedValue(new Error('db down'));
+
+    await expect(service.run(REPAIR_ID, TURN_ID, input())).rejects.toThrow('db down');
+
+    expect((service as any).adminCancelledRepairs.has(REPAIR_ID)).toBe(true);
+  });
+
+  it('stopAll очищает только terminal admin markers', async () => {
+    await service.stop('100', '200');
+    store.findRepair.mockResolvedValue(repair('cancelled'));
+
+    await service.stopAll();
+
+    expect((service as any).adminCancelledRepairs.size).toBe(0);
   });
 
   it('admit и abandon делегируют журналу до attachTurn', async () => {
