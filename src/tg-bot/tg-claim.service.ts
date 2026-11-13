@@ -1,5 +1,6 @@
 import { Injectable, Logger, BadRequestException, ConflictException } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
+import { tgChatLifecycleLockKey } from './tg-chat-lifecycle';
 import { TgIdentityService } from './tg-identity.service';
 
 /** Почему не удалась привязка группы — бот скажет это своими словами (tg-i18n). */
@@ -58,41 +59,52 @@ export class TgClaimService {
       throw claimError('expired', `claim по конфигу в статусе ${status ?? 'нет конфига'}`);
     }
 
-    const conflictRes = await this.pg.query(
-      `SELECT id, owner_user_id FROM tg_bot_configs
-        WHERE tg_chat_id = $1 AND status IN ('active','silent') AND id != $2 LIMIT 1`,
-      [tgChatId, configId],
-    );
-    if (conflictRes.rows.length > 0) {
-      // Свой же второй бот в ту же группу — это не «чужой аккаунт».
-      if (conflictRes.rows[0].owner_user_id === ownerId) {
-        throw claimError('own_bot_here', 'в этой группе уже работает другой бот этого владельца', true);
+    const lock = await this.pg.tryAdvisoryLock(tgChatLifecycleLockKey(tgChatId));
+    if (!lock) {
+      throw claimError('group_taken', 'в этой группе уже выполняется подключение или отключение бота', true);
+    }
+    try {
+      const conflictRes = await this.pg.query(
+        `SELECT id, owner_user_id FROM tg_bot_configs
+          WHERE tg_chat_id = $1 AND status IN ('active','silent') AND id != $2 LIMIT 1`,
+        [tgChatId, configId],
+      );
+      if (conflictRes.rows.length > 0) {
+        // Свой же второй бот в ту же группу — это не «чужой аккаунт».
+        if (conflictRes.rows[0].owner_user_id === ownerId) {
+          throw claimError('own_bot_here', 'в этой группе уже работает другой бот этого владельца', true);
+        }
+        throw claimError('group_taken', 'эта группа уже привязана к другому аккаунту Linkeon', true);
       }
-      throw claimError('group_taken', 'эта группа уже привязана к другому аккаунту Linkeon', true);
-    }
 
-    // Ссылку гасим ДО активации и атомарно: две привязки одной ссылкой (или
-    // привязка гонкой с перевыпуском) не пройдут обе. Конфиг — только из
-    // pending: проверка выше читала статус без блокировки.
-    const spent = await this.pg.query(
-      `UPDATE tg_claim_tokens SET consumed_at = now()
-        WHERE token = $1 AND consumed_at IS NULL AND expires_at > now()
-        RETURNING token`,
-      [token],
-    );
-    if (spent.rows.length === 0) {
-      throw claimError('expired', 'claim token уже израсходован');
-    }
-    const activated = await this.pg.query(
-      `UPDATE tg_bot_configs SET tg_chat_id = $1, tg_chat_title = $2, status = 'active'
-        WHERE id = $3 AND status = 'pending'
-        RETURNING id`,
-      [tgChatId, tgChatTitle, configId],
-    );
-    if (activated.rows.length === 0) {
-      throw claimError('already_connected', 'конфиг перестал быть pending до активации');
-    }
+      // Ссылку гасим ДО активации и атомарно: две привязки одной ссылкой (или
+      // привязка гонкой с перевыпуском) не пройдут обе. Конфиг — только из
+      // pending: проверка выше читала статус без блокировки.
+      const spent = await this.pg.query(
+        `UPDATE tg_claim_tokens SET consumed_at = now()
+          WHERE token = $1 AND consumed_at IS NULL AND expires_at > now()
+          RETURNING token`,
+        [token],
+      );
+      if (spent.rows.length === 0) {
+        throw claimError('expired', 'claim token уже израсходован');
+      }
+      const activated = await this.pg.query(
+        `UPDATE tg_bot_configs SET tg_chat_id = $1, tg_chat_title = $2, status = 'active'
+          WHERE id = $3 AND status = 'pending' AND owner_user_id=$4
+            AND EXISTS (
+              SELECT 1 FROM user_id u WHERE u.internal_id=$4 AND u.state='active'
+            )
+          RETURNING id`,
+        [tgChatId, tgChatTitle, configId, ownerId],
+      );
+      if (activated.rows.length === 0) {
+        throw claimError('already_connected', 'конфиг перестал быть pending до активации');
+      }
 
-    return { ownerUserId: ownerId, configId, displayName };
+      return { ownerUserId: ownerId, configId, displayName };
+    } finally {
+      await lock.release();
+    }
   }
 }

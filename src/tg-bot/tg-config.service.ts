@@ -1,6 +1,7 @@
 import { Injectable, Logger, NotFoundException, BadRequestException } from '@nestjs/common';
 import { DeletionRetryError, deletionErrorKind } from '../account-deletion/account-deletion.safe';
 import { PgService } from '../common/services/pg.service';
+import { tgChatLifecycleLockKey } from './tg-chat-lifecycle';
 import { TgGrammyClient } from './tg-grammy.client';
 
 export function isAlreadyAbsentTelegram(error: any): boolean {
@@ -249,32 +250,44 @@ export class TgConfigService {
   ): Promise<void> {
     const archived = await this.pg.query(
       `UPDATE tg_bot_configs c SET status='archived',archived_at=COALESCE(archived_at,now())
-       WHERE c.id=$1 AND c.owner_user_id=$2 AND c.status IN ('active','silent') AND EXISTS (
+       WHERE c.id=$1 AND c.owner_user_id=$2 AND EXISTS (
          SELECT 1 FROM user_id u
          WHERE u.internal_id=c.owner_user_id AND u.state='deleted' AND u.deletion_id=$3
+           AND (
+             c.status IN ('pending','active','silent')
+             OR (c.status='archived' AND c.archived_at IS NOT NULL AND c.archived_at>=u.deleted_at)
+           )
        )
        RETURNING c.tg_chat_id`,
       [id, ownerId, currentDeletionId],
     );
-    // Повторный stop и уже archived config не имеют подтверждённого external действия.
+    // Давно archived config пропускаем. Archived текущего deletion остаётся
+    // eligible: timeout внешнего leave обязан быть повторён до подтверждения.
     if (!chatId || archived.rowCount === 0) return;
     const actualChatId = String(archived.rows[0]?.tg_chat_id ?? '');
     if (!actualChatId || actualChatId !== String(chatId)) return;
-    // В tg_bot_configs нет per-config bot_id: модуль работает с одним TG_BOT_TOKEN.
-    // Поэтому другой active/silent config того же chat — это тот же самый бот.
-    const shared = await this.pg.query(
-      `SELECT 1 FROM tg_bot_configs other
-       WHERE other.tg_chat_id=$1 AND other.id<>$2 AND other.status IN ('active','silent')
-       LIMIT 1`,
-      [actualChatId, id],
-    );
-    if (shared.rows.length > 0) return;
+    const lock = await this.pg.tryAdvisoryLock(tgChatLifecycleLockKey(actualChatId));
+    if (!lock) throw new DeletionRetryError('external_unknown');
     try {
-      await this.grammy.leaveChat(Number(actualChatId));
-    } catch (error: any) {
-      if (isAlreadyAbsentTelegram(error)) return;
-      // Архив сохраняется, а технический chatId остаётся в job для повторной попытки.
-      throw new DeletionRetryError(deletionErrorKind(error));
+      // Claim activation использует тот же lock. Pending учитываем наравне с
+      // active/silent: ожидающий подключения config ещё не должен выгонять бота.
+      const shared = await this.pg.query(
+        `SELECT 1 FROM tg_bot_configs other
+         WHERE other.tg_chat_id=$1 AND other.id<>$2
+           AND other.status IN ('active','silent','pending')
+         LIMIT 1`,
+        [actualChatId, id],
+      );
+      if (shared.rows.length > 0) return;
+      try {
+        await this.grammy.leaveChat(Number(actualChatId));
+      } catch (error: any) {
+        if (isAlreadyAbsentTelegram(error)) return;
+        // Archive уже закоммичен отдельным statement; chatId сохраняется для retry.
+        throw new DeletionRetryError(deletionErrorKind(error));
+      }
+    } finally {
+      await lock.release();
     }
   }
 
@@ -345,7 +358,9 @@ export class TgConfigService {
 
   async getActiveByTgChatId(tgChatId: number): Promise<TgBotConfigRow | null> {
     const r = await this.pg.query(
-      `SELECT * FROM tg_bot_configs WHERE tg_chat_id = $1 AND status IN ('active','silent') LIMIT 1`,
+      `SELECT c.* FROM tg_bot_configs c
+        JOIN user_id u ON u.internal_id=c.owner_user_id AND u.state='active'
+        WHERE c.tg_chat_id = $1 AND c.status IN ('active','silent') LIMIT 1`,
       [tgChatId],
     );
     return r.rows[0] ?? null;
