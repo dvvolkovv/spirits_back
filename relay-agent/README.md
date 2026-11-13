@@ -82,6 +82,22 @@ Nginx `location /files/` проксируется в Express, а не читае
 
 Секреты и файлы режима релея скрипт не переносит. Ручной `scp`/`mv` и рестарт в обход этого пути не использовать. Если живой relay-agent менялся вместе с backend, его выкат и health обязаны завершиться **до живого backend E2E**, иначе E2E может пройти против старого кода.
 
+## Обязательная проверка записи при смене sandbox runtime
+
+Любой rollout нового `/opt/linkeon-agent/bin/claude-runtime` обязан после атомарного переключения и **до снятия drain** запустить живой test записи:
+
+```bash
+RELAY_LIVE_CLI_WRITE_TEST=1 \
+RELAY_CLAUDE_BIN=/opt/linkeon-agent/bin/claude \
+node --test /home/dv/file-agent/sandbox-write-live.test.mjs
+```
+
+Тест создаёт уникальный `fs_key` и проверяет точное содержимое probe-файла и в scratch (`/tmp/agent-scratch/<fs_key>`, по абсолютному пути — sandbox CLI переопределяет TMPDIR подпроцессов), и в `/tmp/agent-output/<fs_key>`. Он не использует `/chat`, поэтому работает при закрытом admission и не затрагивает пользовательские сессии.
+
+Красный результат запрещает открывать admission: вернуть прежний сохранённый runtime, проверить его `--version` и `/health`, затем снять drain. Нельзя заменять эту проверку чтением sandbox-настроек или прогоном только unit-тестов: CLI 2.1.322 при корректных настройках возвращал `EROFS` для обоих разрешённых каталогов. Sandbox не отключать и не ослаблять.
+
+Тот же гейт уже встроен в `scripts/deploy-relay.sh` после обычного `node --test *.test.mjs` и до изменения живых файлов. Сбой модели, авторизации или API также останавливает rollout; молча пропускать живой test нельзя.
+
 ## Секрет бэка (`X-Agent-Secret`)
 
 Релей проверяет все пути, кроме `/health` и `/files/*` (и `OPTIONS`-preflight) — заголовок `X-Agent-Secret` должен совпасть с одной из строк файла `relay-secrets` (рядом с `server.mjs`, права 600, не в git; путь переопределяется переменной `RELAY_SECRETS_FILE`). Режим — файл `relay-auth-mode` (путь — `RELAY_AUTH_MODE_FILE`): `log` (пропускать и писать «отказ был бы») или `enforce` (401). Оба файла перечитываются раз в 30 с, рестарт не нужен.
