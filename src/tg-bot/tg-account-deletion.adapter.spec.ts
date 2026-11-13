@@ -11,6 +11,8 @@ import type {
   DeletionResourceType,
 } from '../account-deletion/account-deletion.types';
 import { TgBotModule } from './tg-bot.module';
+import { TgBotController } from './tg-bot.controller';
+import { TgBotService } from './tg-bot.service';
 import { TgClaimService } from './tg-claim.service';
 import { TgConfigService } from './tg-config.service';
 import { TgIdentityService } from './tg-identity.service';
@@ -74,6 +76,7 @@ class FakeDeletionDb {
     const s = normalize(sql);
     this.queries.push({ sql: s, params });
     if (['BEGIN', 'COMMIT', 'ROLLBACK'].includes(s)) return { rows: [], rowCount: 0 };
+    if (s.includes("profile_data->>'language'")) return { rows: [{ language: 'ru' }] };
 
     if (s.startsWith('SELECT c.id,c.tg_chat_id FROM tg_bot_configs c WHERE c.owner_user_id=$1')) {
       const rows = this.configs
@@ -117,6 +120,13 @@ class FakeDeletionDb {
       if (!token) return { rows: [], rowCount: 0 };
       token.consumed_at = '2026-11-11T00:00:00.000Z';
       return { rows: [{ token: token.token }], rowCount: 1 };
+    }
+    if (s.startsWith("UPDATE tg_bot_configs SET status = 'archived', archived_at = now() WHERE id = $1")) {
+      const config = this.configs.find((candidate) => candidate.id === params[0]);
+      if (!config) return { rows: [], rowCount: 0 };
+      config.status = 'archived';
+      this.events.push(`member-archive:${config.id}`);
+      return { rows: [], rowCount: 1 };
     }
     if (s.startsWith('UPDATE tg_bot_configs SET tg_chat_id = $1')) {
       if (this.beforeActivation) await this.beforeActivation();
@@ -360,6 +370,48 @@ function claimToken(configId: string, ownerId: string, token: string): Record<st
     consumed_at: null,
     expires_at: '2026-11-12T00:00:00.000Z',
   };
+}
+
+function makeControllerLifecycleBot(db: FakeDeletionDb) {
+  const tgIds: Record<string, number> = { 'u-neighbor': 20002, 'u-other': 10001, 'u-live': 30003 };
+  const identity = {
+    getIdentityByLinkeonId: jest.fn(async (ownerId: string) => ({
+      tgUserId: tgIds[ownerId],
+      tgUsername: null,
+      tgFirstName: null,
+    })),
+    getLinkeonIdByTgUserId: jest.fn(async (tgUserId: number) =>
+      Object.keys(tgIds).find((ownerId) => tgIds[ownerId] === tgUserId) ?? null),
+  };
+  const grammy = {
+    sendMessage: jest.fn(async () => ({})),
+    leaveChat: jest.fn(async () => true),
+  };
+  const configs = new TgConfigService(db as any, grammy as any);
+  const claim = new TgClaimService(db as any, identity as any);
+  const bot = new TgBotService(
+    db as any, identity as any, claim, configs,
+    null as any, null as any, null as any, null as any, null as any,
+    grammy as any, null as any, null as any, null as any,
+  );
+  (bot as any).logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
+  const controller = new TgBotController(bot);
+  const callController = async (token: string, tgUserId: number) => {
+    const req = {
+      headers: { 'x-telegram-bot-api-secret-token': 'header-secret' },
+      body: {
+        message: {
+          chat: { id: -100200, type: 'supergroup', title: 'Shared group' },
+          from: { id: tgUserId },
+          text: `/start@LinkeonAgentBot ${token}`,
+        },
+      },
+    } as any;
+    const res = { status: jest.fn().mockReturnThis(), json: jest.fn().mockReturnThis() } as any;
+    await controller.handle('url-secret', req, res);
+    return res;
+  };
+  return { bot, controller, callController, configs, claim, grammy, identity };
 }
 
 function ownConfig(overrides: Partial<FakeConfig> = {}): FakeConfig {
@@ -689,6 +741,106 @@ describe('TG archive/claim lifecycle locking', () => {
     expect(await configs.getActiveByTgChatId(-100200)).toBeNull();
     expect(await configs.getActiveByTgChatId(-100999)).toBeNull();
     expect(grammy.leaveChat).not.toHaveBeenCalled();
+  });
+});
+
+describe('TG controller claim busy loser', () => {
+  let previousEnv: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    previousEnv = {
+      TG_BOT_USERNAME: process.env.TG_BOT_USERNAME,
+      TG_WEBHOOK_URL_SECRET: process.env.TG_WEBHOOK_URL_SECRET,
+      TG_WEBHOOK_HEADER_SECRET: process.env.TG_WEBHOOK_HEADER_SECRET,
+    };
+    process.env.TG_BOT_USERNAME = 'LinkeonAgentBot';
+    process.env.TG_WEBHOOK_URL_SECRET = 'url-secret';
+    process.env.TG_WEBHOOK_HEADER_SECRET = 'header-secret';
+  });
+
+  afterEach(() => {
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  it('B1 busy не вызывает leave; B2 active после commit и my_chat_member не отменяет claim', async () => {
+    const db = new FakeDeletionDb();
+    db.users.set('u-neighbor', { state: 'active', deletionId: null });
+    db.users.set('u-other', { state: 'active', deletionId: null });
+    db.configs = [
+      ownConfig({ id: 'cfg-b2', owner_user_id: 'u-neighbor', status: 'pending', tg_chat_id: null, custom_agent_id: 'ca-b2' }),
+      ownConfig({ id: 'cfg-b1', owner_user_id: 'u-other', status: 'pending', tg_chat_id: null, custom_agent_id: 'ca-b1' }),
+    ];
+    db.claimTokens = [
+      claimToken('cfg-b2', 'u-neighbor', 'claim-b2'),
+      claimToken('cfg-b1', 'u-other', 'claim-b1'),
+    ];
+    const { bot, callController, grammy } = makeControllerLifecycleBot(db);
+    let activationEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { activationEntered = resolve; });
+    let openGate!: () => void;
+    const gate = new Promise<void>((resolve) => { openGate = resolve; });
+    db.beforeActivation = async () => { activationEntered(); await gate; };
+    let b1Finished!: () => void;
+    let b2Finished!: () => void;
+    const b1Done = new Promise<void>((resolve) => { b1Finished = resolve; });
+    const b2Done = new Promise<void>((resolve) => { b2Finished = resolve; });
+    const originalUpdate = bot.handleUpdate.bind(bot);
+    jest.spyOn(bot, 'handleUpdate').mockImplementation(async (update: any) => {
+      const token = update.message?.text?.split(' ').pop();
+      await originalUpdate(update);
+      if (token === 'claim-b1') b1Finished();
+      if (token === 'claim-b2') b2Finished();
+    });
+
+    await callController('claim-b2', 20002);
+    await callController('claim-b1', 10001);
+    await entered;
+    await b1Done;
+    const loserLeaves = grammy.leaveChat.mock.calls.length;
+    openGate();
+    await b2Done;
+    if (loserLeaves > 0) {
+      await bot.handleUpdate({
+        my_chat_member: {
+          chat: { id: -100200, type: 'supergroup', title: 'Shared group' },
+          new_chat_member: { status: 'left' },
+        },
+      });
+    }
+
+    expect(loserLeaves).toBe(0);
+    expect(db.configs.find((config) => config.id === 'cfg-b2')?.status).toBe('active');
+    expect(db.configs.find((config) => config.id === 'cfg-b1')?.status).toBe('pending');
+    expect(db.events).not.toContain('member-archive:cfg-b2');
+  });
+
+  it('настоящий preexisting active conflict по-прежнему не вызывает leave', async () => {
+    const db = new FakeDeletionDb();
+    db.users.set('u-live', { state: 'active', deletionId: null });
+    db.users.set('u-neighbor', { state: 'active', deletionId: null });
+    db.configs = [
+      ownConfig({ id: 'cfg-live', owner_user_id: 'u-live', status: 'active', custom_agent_id: 'ca-live' }),
+      ownConfig({ id: 'cfg-b', owner_user_id: 'u-neighbor', status: 'pending', tg_chat_id: null, custom_agent_id: 'ca-b' }),
+    ];
+    db.claimTokens = [claimToken('cfg-b', 'u-neighbor', 'claim-b')];
+    const { bot, callController, grammy } = makeControllerLifecycleBot(db);
+    let finished!: () => void;
+    const done = new Promise<void>((resolve) => { finished = resolve; });
+    const originalUpdate = bot.handleUpdate.bind(bot);
+    jest.spyOn(bot, 'handleUpdate').mockImplementation(async (update: any) => {
+      await originalUpdate(update);
+      finished();
+    });
+
+    await callController('claim-b', 20002);
+    await done;
+
+    expect(grammy.leaveChat).not.toHaveBeenCalled();
+    expect(db.configs.find((config) => config.id === 'cfg-live')?.status).toBe('active');
+    expect(db.configs.find((config) => config.id === 'cfg-b')?.status).toBe('pending');
   });
 });
 
