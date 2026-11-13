@@ -131,8 +131,6 @@ function makeHarness() {
     dispatchAgent: jest.fn(async () => {}),
   };
   const attendee = { removeBot: jest.fn(async (): Promise<boolean | null> => true) };
-  // Канарейка: deletion-путь не имеет права закрывать комнаты через RoomService.
-  const roomService = { close: jest.fn(async () => {}) };
   const voice = new VoiceCallService(
     db as any, {} as any, livekit as any, undefined, undefined, attendee as any,
   );
@@ -142,7 +140,7 @@ function makeHarness() {
     db: db as any,
     assertCurrent: jest.fn(async () => {}),
   };
-  return { db, livekit, attendee, roomService, voice, adapter, ctx, registry };
+  return { db, livekit, attendee, voice, adapter, ctx, registry };
 }
 
 /** Встреча в общей комнате: другой участник + persistent meeting_rooms. */
@@ -216,6 +214,28 @@ describe('discoverVoiceDeletion', () => {
     expect(plan.jobs[0].payload).toMatchObject({ roomKind: 'shared' });
   });
 
+  it('звонок ТОГО ЖЕ user_id в той же комнате — sole (общей её делает только чужой участник)', async () => {
+    const { db } = makeHarness();
+    db.calls.push({
+      id: 'call-20', user_id: account.userId, room_name: 'room_SAME',
+      status: 'active', external_bot_id: null,
+    });
+    db.calls.push({
+      id: 'call-21', user_id: account.userId, room_name: 'room_SAME',
+      status: 'active', external_bot_id: null,
+    });
+
+    const plan = await discoverVoiceDeletion({ db: db as any, account, origin: 'explicit' });
+
+    // Повторный вход того же пользователя (сегодня Роман, завтра снова Роман)
+    // не делает комнату общей — фейк обязан повторять семантику SQL
+    // (o.user_id <> c.user_id), а не считать общим любой второй звонок.
+    expect(plan.jobs).toHaveLength(2);
+    for (const job of plan.jobs) {
+      expect(job.payload).toMatchObject({ roomKind: 'sole' });
+    }
+  });
+
   it('завершённый звонок без бота — задачи нет', async () => {
     const { db } = makeHarness();
     db.calls.push({
@@ -282,7 +302,7 @@ describe('VoiceAccountDeletionAdapter — voice.stop', () => {
   });
 
   it('shared room не закрывается, удаляются только agents удалённого аккаунта', async () => {
-    const { db, adapter, ctx, attendee, livekit, roomService } = makeHarness();
+    const { db, adapter, ctx, attendee, livekit } = makeHarness();
     seedSharedMeeting(db);
     attendee.removeBot.mockResolvedValue(true);
 
@@ -290,7 +310,8 @@ describe('VoiceAccountDeletionAdapter — voice.stop', () => {
 
     expect(livekit.removeAgentsStrict).toHaveBeenCalledWith('room-shared');
     expect(livekit.closeRoomStrict).not.toHaveBeenCalled();
-    expect(roomService.close).not.toHaveBeenCalled();
+    // RoomService.close здесь не проверить моком — он в deletion-путь не
+    // внедряется вовсе; запрет закреплён source-level тестом ниже.
     expect(db.meetingRooms).toHaveLength(1);
     expect(db.otherParticipantCalls).toHaveLength(1);
     // Строки других участников не меняются.
@@ -419,6 +440,21 @@ describe('VoiceAccountDeletionAdapter — voice.stop', () => {
     const { adapter, ctx } = makeHarness();
     const foreign = { ...stopJob({ callId: 'x' }), resourceType: 'voice.purge' as const, phase: 'purge' as const };
     await expect(adapter.execute(foreign, ctx)).rejects.toThrow('unsupported_deletion_resource');
+  });
+
+  it('deletion-путь не импортирует RoomService (source-level канарка)', () => {
+    // Общие комнаты закрывает RoomService.close (UPDATE meeting_rooms +
+    // livekit.closeRoom) — закрытие общей комнаты из-за удаления ОДНОГО
+    // аккаунта выкинуло бы остальных участников. Прежняя канарка (мок
+    // roomService.close) была нечестной: roomService не внедрялся ни в один
+    // объект harness'а и не мог быть вызван в принципе. Честная проверка — по
+    // исходникам deletion-пути: ни импорта модуля, ни import-строки.
+    for (const file of ['voice-account-deletion.adapter.ts', 'voice-call.service.ts']) {
+      const src = readFileSync(`${__dirname}/${file}`, 'utf8');
+      expect(file).not.toContain('room.service'); // страховка от опечатки в цикле
+      expect(src).not.toContain('meeting/room.service');
+      expect(src).not.toMatch(/^\s*import[^\n]*RoomService/m);
+    }
   });
 
   it('VoiceCallModule подключает AccountDeletionModule и адаптер ровно один раз', () => {
