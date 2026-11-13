@@ -392,7 +392,7 @@ export class TurnsService implements OnModuleInit, OnModuleDestroy {
            (product_id, user_id, channel, prompt, revert_to_sha, status)
          WHERE EXISTS (
            SELECT 1 FROM products p
-            WHERE p.id=$1 AND p.user_id=$2 AND p.archived_at IS NULL
+            WHERE p.id=$1::uuid AND p.user_id=$2 AND p.archived_at IS NULL
               AND NOT EXISTS (
                 SELECT 1 FROM user_id u
                  WHERE u.internal_id=p.user_id AND u.state='deleted'
