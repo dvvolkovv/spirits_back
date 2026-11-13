@@ -10,10 +10,23 @@ describe('ChatUploadsService', () => {
   };
   const service = new ChatUploadsService(pg as any, storage as any);
 
+  const ENV_KEYS = ['JWT_SECRET', 'BACKEND_URL', 'CHAT_UPLOADS_ENABLED'] as const;
+  let envSnapshot: Record<string, string | undefined> = {};
+
   beforeEach(() => {
     jest.clearAllMocks();
+    envSnapshot = {};
+    for (const key of ENV_KEYS) envSnapshot[key] = process.env[key];
     process.env.JWT_SECRET = 'spec-secret';
     process.env.BACKEND_URL = 'https://my.linkeon.test';
+  });
+
+  afterEach(() => {
+    for (const key of ENV_KEYS) {
+      const saved = envSnapshot[key];
+      if (saved === undefined) delete process.env[key];
+      else process.env[key] = saved;
+    }
   });
 
   it('сохраняет байты и запись без публичной ссылки', async () => {
@@ -59,5 +72,43 @@ describe('ChatUploadsService', () => {
     const block = service.assistantBlock([record]);
     expect(block).toContain(`Earlier user uploads:\n- a.pdf: https://my.linkeon.test/webhook/chat-uploads/${record.id}`);
     expect(block).toMatch(/\?exp=\d+&sig=[0-9a-f]{64}$/);
+  });
+
+  it('searchOriginals ограничивает выдачу 200 строками', async () => {
+    await service.searchOriginals('u1', 7);
+    const sql = String(pg.query.mock.calls[0][0]);
+    expect(sql).toMatch(/ORDER BY created_at DESC\s+LIMIT 200/);
+  });
+
+  it('createBucketIfAbsent вызывается не чаще раза на процесс', async () => {
+    const fresh = new ChatUploadsService(pg as any, storage as any);
+    await fresh.saveOriginals({ userId: 'u1', sessionId: 'u1_1', files: [] });
+    await fresh.saveOriginals({ userId: 'u1', sessionId: 'u1_1', files: [] });
+    expect(storage.createBucketIfAbsent).toHaveBeenCalledTimes(1);
+  });
+
+  describe('deleteForUser', () => {
+    it('при не-NotFound ошибке MinIO не удаляет строки и бросает ошибку наверх', async () => {
+      pg.query.mockResolvedValueOnce({ rows: [{ storage_key: 'k/a.pdf' }] });
+      storage.delete.mockRejectedValueOnce(
+        Object.assign(new Error('connection refused'), { name: 'ServiceUnavailable' }),
+      );
+      await expect(service.deleteForUser('u1')).rejects.toThrow('connection refused');
+      const deleteSqls = pg.query.mock.calls
+        .map((call) => String(call[0]))
+        .filter((sql) => sql.startsWith('DELETE FROM chat_uploads'));
+      expect(deleteSqls).toHaveLength(0);
+    });
+
+    it('терпит отсутствующий объект (NotFound) и удаляет строки', async () => {
+      pg.query.mockResolvedValueOnce({ rows: [{ storage_key: 'k/gone.pdf' }] });
+      storage.delete.mockRejectedValueOnce(
+        Object.assign(new Error('The specified key does not exist.'), { name: 'NotFound' }),
+      );
+      await expect(service.deleteForUser('u1')).resolves.toBeUndefined();
+      expect(
+        pg.query.mock.calls.some((call) => String(call[0]).startsWith('DELETE FROM chat_uploads')),
+      ).toBe(true);
+    });
   });
 });
