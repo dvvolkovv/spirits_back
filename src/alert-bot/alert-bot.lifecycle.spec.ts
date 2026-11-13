@@ -70,12 +70,11 @@ describe('AlertBotLifecycle', () => {
     jest.useFakeTimers();
     mocks = makeMocks();
     lifecycle = new (AlertBotLifecycle as any)(
-      mocks.store, mocks.ops, mocks.telegram,
+      mocks.store, mocks.repairStore, mocks.ops, mocks.telegram,
       { idle: jest.fn().mockResolvedValue(undefined) },
       { retryFailedUpdates: jest.fn().mockResolvedValue(undefined), stopAdmission: jest.fn() },
       mocks.pg,
     );
-    (lifecycle as any).repairStore = mocks.repairStore;
     sinkSpy = jest.spyOn(telegramAlert, 'setAlertSentSink');
   });
 
@@ -175,8 +174,7 @@ describe('AlertBotLifecycle', () => {
     const turns = { idle: jest.fn(() => { calls.push('turns.idle'); return new Promise<void>(() => {}); }) };
     const service = { retryFailedUpdates: jest.fn(), stopAdmission: jest.fn() };
     mocks.ops.stop.mockImplementation(async () => { calls.push('ops.stop'); });
-    lifecycle = new (AlertBotLifecycle as any)(mocks.store, mocks.ops, mocks.telegram, turns, service, mocks.pg);
-    (lifecycle as any).repairStore = mocks.repairStore;
+    lifecycle = new (AlertBotLifecycle as any)(mocks.store, mocks.repairStore, mocks.ops, mocks.telegram, turns, service, mocks.pg);
     await lifecycle.onModuleInit();
 
     const shutdown = (lifecycle as any).beforeApplicationShutdown();

@@ -62,15 +62,19 @@ export class AlertBotRepairService {
     if (!isAlertBotRepairAdmin(tgId)) return 'Доступ только для администраторов';
     const active = await this.store.findActiveRepair(chatId);
     if (!active) return 'Нет активного исправления';
+    this.adminCancelledRepairs.add(active.id);
     const requested = await this.store.requestCancel(active.id);
     if (!requested) {
       const current = await this.store.findRepair(active.id);
       if (current && TERMINAL_STATUSES.has(current.status)) {
+        this.adminCancelledRepairs.delete(active.id);
         return repairStatusText(current.status as RepairFinalStatus, current.mutationCount);
       }
-      if (current?.status !== 'cancel_requested') return 'Нет активного исправления';
+      if (current?.status !== 'cancel_requested') {
+        this.adminCancelledRepairs.delete(active.id);
+        return 'Нет активного исправления';
+      }
     }
-    this.adminCancelledRepairs.add(active.id);
     this.controllers.get(active.id)?.abort();
     await this.executor.stopRepair(active.id);
     return requested ? 'Исправление остановлено' : 'Исправление останавливается';
@@ -80,6 +84,14 @@ export class AlertBotRepairService {
     this.stoppingAll = true;
     for (const controller of this.controllers.values()) controller.abort();
     await this.executor.stopAll();
+    for (const repairId of [...this.adminCancelledRepairs]) {
+      try {
+        const repair = await this.store.findRepair(repairId);
+        if (repair && TERMINAL_STATUSES.has(repair.status)) this.adminCancelledRepairs.delete(repairId);
+      } catch {
+        // При сбое чтения marker сохраняется до успешной terminal финализации.
+      }
+    }
   }
 
   async run(
@@ -95,7 +107,7 @@ export class AlertBotRepairService {
     }
     if (!await this.store.markRepairRunning(repairId, turnId)) {
       const current = await this.store.findRepair(repairId);
-      if (current?.status === 'cancel_requested' || this.stoppingAll) {
+      if (current?.status === 'cancel_requested' || this.stoppingAll || this.adminCancelledRepairs.has(repairId)) {
         return this.finalize(repairId, [], this.cancelModel(repairId), generated, false);
       }
       throw new AlertBotRetryableError('repair_not_requested');
@@ -106,7 +118,7 @@ export class AlertBotRepairService {
     let model: RepairModelOutcome = 'completed';
     try {
       const current = await this.store.findRepair(repairId);
-      if (this.stoppingAll || current?.status === 'cancel_requested') {
+      if (this.stoppingAll || this.adminCancelledRepairs.has(repairId) || current?.status === 'cancel_requested') {
         controller.abort();
         model = this.cancelModel(repairId);
       } else {
@@ -129,7 +141,9 @@ export class AlertBotRepairService {
     const jobs = await this.store.listJobs(repairId);
     const current = await this.store.findRepair(repairId);
     if (this.stoppingAll) model = 'interrupted';
-    else if (current?.status === 'cancel_requested') model = this.cancelModel(repairId);
+    else if (this.adminCancelledRepairs.has(repairId) || current?.status === 'cancel_requested') {
+      model = this.cancelModel(repairId);
+    }
     return this.finalize(repairId, jobs, model, generated);
   }
 
@@ -171,8 +185,10 @@ export class AlertBotRepairService {
     const turnStatus = outcome.status === 'verified' || outcome.status === 'unverified'
       ? 'ok'
       : outcome.status === 'timeout' ? 'timeout' : 'error';
+    const text = includeSummary ? `${status}\n${maskText(summary)}` : status;
+    this.adminCancelledRepairs.delete(repairId);
     return {
-      text: includeSummary ? `${status}\n${maskText(summary)}` : status,
+      text,
       costUsd: generated.costUsd,
       tools: generated.tools,
       turnStatus,

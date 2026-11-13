@@ -48,9 +48,8 @@ describe('alert-bot shutdown before PostgreSQL close', () => {
       cleanup: jest.fn(),
     };
     const lifecycle = new (AlertBotLifecycle as any)(
-      store, ops, {}, turns, service, pg,
+      store, { migrate: jest.fn().mockResolvedValue(undefined) }, ops, {}, turns, service, pg,
     );
-    (lifecycle as any).repairStore = { migrate: jest.fn().mockResolvedValue(undefined) };
     await lifecycle.onModuleInit();
 
     const req = new EventEmitter();

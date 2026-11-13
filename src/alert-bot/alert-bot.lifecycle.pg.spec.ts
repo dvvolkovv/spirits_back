@@ -30,13 +30,13 @@ maybe('startup миграции AlertBot против PostgreSQL', () => {
     repairStore = new RepairStore(pg);
     lifecycle = new (AlertBotLifecycle as any)(
       store,
+      repairStore,
       { start: jest.fn(), stop: jest.fn() },
       { registerWebhook: jest.fn(), sendMessage: jest.fn() },
       { idle: jest.fn() },
       { retryFailedUpdates: jest.fn(), stopAdmission: jest.fn() },
       { registerPreCloseHook: jest.fn() },
     );
-    (lifecycle as any).repairStore = repairStore;
   });
 
   afterAll(async () => {

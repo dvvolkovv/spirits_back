@@ -5,6 +5,7 @@ import { setAlertSentSink } from '../common/telegram-alert';
 import { PgService } from '../common/services/pg.service';
 import { alertBotEnabled } from './alert-bot.config';
 import { AlertBotOpsServer } from './alert-bot.ops-server';
+import { RepairStore } from './alert-bot.repair-store';
 import { AlertBotService } from './alert-bot.service';
 import { AlertBotStore } from './alert-bot.store';
 import { AlertBotTelegram } from './alert-bot.telegram';
@@ -23,6 +24,7 @@ export class AlertBotLifecycle implements OnModuleInit, OnModuleDestroy, BeforeA
 
   constructor(
     private readonly store: AlertBotStore,
+    private readonly repairStore: RepairStore,
     private readonly ops: AlertBotOpsServer,
     private readonly telegram: AlertBotTelegram,
     private readonly turns: AlertBotTurns,
@@ -32,6 +34,7 @@ export class AlertBotLifecycle implements OnModuleInit, OnModuleDestroy, BeforeA
 
   async onModuleInit(): Promise<void> {
     await this.store.migrate();
+    await this.repairStore.migrate();
     this.pg.registerPreCloseHook(() => this.beforeApplicationShutdown());
     if (!alertBotEnabled()) return;
     await this.ops.start();
