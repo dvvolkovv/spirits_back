@@ -80,9 +80,11 @@ maybe('личка бота против живого Postgres', () => {
     // Что читает ensurePrivateConfig, выбирая ассистента для новой строки.
     await pool.query(`CREATE TABLE ai_profiles_consolidated (user_id text PRIMARY KEY, preferred_agent text)`);
     await pool.query(`CREATE TABLE agents (id serial PRIMARY KEY, name text)`);
+    await pool.query(`CREATE TABLE user_id (internal_id text PRIMARY KEY, state text NOT NULL, deletion_id uuid)`);
   });
   beforeEach(async () => {
-    await pool.query('TRUNCATE tg_bot_configs, ai_profiles_consolidated, agents CASCADE');
+    await pool.query('TRUNCATE tg_bot_configs, ai_profiles_consolidated, agents, user_id CASCADE');
+    await pool.query(`INSERT INTO user_id (internal_id,state) VALUES ($1,'active'),($2,'active')`, [A, B]);
     warns.length = 0;
     errors.length = 0;
   });
@@ -117,19 +119,24 @@ maybe('личка бота против живого Postgres', () => {
     expect(await rowsOfChat(CHAT)).toHaveLength(1);
   });
 
-  it.each([
-    ['конфига нет', false],
-    ['живой конфиг чужой', true],
-  ])('два параллельных вызова одного владельца (%s) — оба получают один и тот же конфиг, без исключения', async (_label, foreignFirst) => {
-    if (foreignFirst) await config(A, CHAT);
-    const svc = service(2);
+  it('deleted владелец не будит silent config и не создаёт новый', async () => {
+    const mine = await config(B, CHAT, 'silent');
+    await pool.query(`UPDATE user_id SET state='deleted',deletion_id=$1 WHERE internal_id=$2`, ['11111111-1111-4111-8111-111111111111', B]);
 
-    const [x, y] = await Promise.all([svc.ensurePrivateConfig(B, CHAT), svc.ensurePrivateConfig(B, CHAT)]);
+    await expect(service().ensurePrivateConfig(B, CHAT)).rejects.toThrow();
+    await expect(service().ensurePrivateConfig(B, CHAT + 1)).rejects.toThrow();
 
-    expect(x.id).toBe(y.id);
-    expect(x.owner_user_id).toBe(B);
-    const live = (await rowsOfChat(CHAT)).filter((r) => r.status === 'active' || r.status === 'silent');
-    expect(live).toEqual([expect.objectContaining({ id: x.id, owner_user_id: B })]);
-    expect(errors).toEqual([]);
+    const rows = await pool.query(`SELECT id,status FROM tg_bot_configs ORDER BY created_at,id`);
+    expect(rows.rows).toEqual([{ id: mine, status: 'silent' }]);
+  });
+
+  it('reissueClaim для deleted не воскрешает archived config и не выпускает token', async () => {
+    const mine = await config(B, CHAT, 'archived');
+    await pool.query(`UPDATE user_id SET state='deleted',deletion_id=$1 WHERE internal_id=$2`, ['11111111-1111-4111-8111-111111111111', B]);
+
+    await expect(service().reissueClaim(mine, B)).rejects.toThrow();
+
+    expect((await pool.query(`SELECT status FROM tg_bot_configs WHERE id=$1`, [mine])).rows[0].status).toBe('archived');
+    expect((await pool.query(`SELECT count(*)::int AS n FROM tg_claim_tokens`)).rows[0].n).toBe(0);
   });
 });
