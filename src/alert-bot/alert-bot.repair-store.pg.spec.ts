@@ -511,6 +511,17 @@ maybe('durable repair store против PostgreSQL', () => {
     expect((await store.findRepair(repairId))?.status).toBe('cancelled');
   });
 
+  it('cancel_requested нельзя перезаписать verified, но можно завершить cancelled', async () => {
+    const repairId = await admit('cancel-fences-verified');
+    expect(await store.markRepairRunning(repairId, TURN_ID)).toBe(true);
+    expect(await store.requestCancel(repairId)).toBe(true);
+
+    expect(await store.finishRepair(repairId, 'verified', 1)).toBe(false);
+    expect((await store.findRepair(repairId))?.status).toBe('cancel_requested');
+    expect(await store.finishRepair(repairId, 'cancelled', 1)).toBe(true);
+    expect((await store.findRepair(repairId))?.status).toBe('cancelled');
+  });
+
   it('entered wait bounded и проходит через cleanup при regression', async () => {
     const startedAt = Date.now();
     await expect(boundedEnteredForTest(new Promise<void>(() => undefined), 20))

@@ -162,11 +162,13 @@ describe('AlertBotRepairService', () => {
   it('late stop после AI success не позволяет verified перекрыть cancel_requested', async () => {
     store.findRepair
       .mockResolvedValueOnce(repair())
+      .mockResolvedValueOnce(repair('running'))
       .mockResolvedValueOnce(repair('cancel_requested'));
     store.listJobs.mockResolvedValue([job(1, 'exec', true), job(2, 'verify', false)]);
 
     const result = await service.run(REPAIR_ID, TURN_ID, input());
 
+    expect(ai.repair).toHaveBeenCalledTimes(1);
     expect(store.finishRepair).toHaveBeenCalledWith(REPAIR_ID, 'cancelled', 1);
     expect(result.turnStatus).toBe('error');
     expect(result.text).toContain('Исправление остановлено админом');
@@ -176,6 +178,7 @@ describe('AlertBotRepairService', () => {
   it('stop между derive и finish повторно вычисляет cancelled вместо потерянного verified', async () => {
     store.findRepair
       .mockResolvedValueOnce(repair())
+      .mockResolvedValueOnce(repair('running'))
       .mockResolvedValueOnce(repair('running'))
       .mockResolvedValueOnce(repair('cancel_requested'));
     store.listJobs.mockResolvedValue([job(1, 'exec', true), job(2, 'verify', false)]);
@@ -194,6 +197,7 @@ describe('AlertBotRepairService', () => {
   it('terminal, сохранённый конкурентным finish, не перезаписывается и используется в ответе', async () => {
     store.findRepair
       .mockResolvedValueOnce(repair())
+      .mockResolvedValueOnce(repair('running'))
       .mockResolvedValueOnce(repair('running'))
       .mockResolvedValueOnce({ ...repair('cancelled'), finishedAt: new Date('2026-11-12T01:00:00Z') });
     store.listJobs.mockResolvedValue([job(1, 'exec', true), job(2, 'verify', false)]);
