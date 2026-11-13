@@ -160,14 +160,23 @@ describe('AlertBotRepairService', () => {
   });
 
   it('late stop после AI success не позволяет verified перекрыть cancel_requested', async () => {
-    await service.stop('100', '200');
+    const started = deferred();
+    const generated = deferred<{ text: string; costUsd: number; tools: string[]; noCause: boolean }>();
+    ai.repair.mockImplementation(() => {
+      started.resolve();
+      return generated.promise;
+    });
     store.findRepair
       .mockResolvedValueOnce(repair())
       .mockResolvedValueOnce(repair('running'))
       .mockResolvedValueOnce(repair('cancel_requested'));
     store.listJobs.mockResolvedValue([job(1, 'exec', true), job(2, 'verify', false)]);
+    const running = service.run(REPAIR_ID, TURN_ID, input());
+    await started.promise;
+    await service.stop('100', '200');
+    generated.resolve({ text: 'Поздний ответ', costUsd: 0, tools: [], noCause: false });
 
-    const result = await service.run(REPAIR_ID, TURN_ID, input());
+    const result = await running;
 
     expect(ai.repair).toHaveBeenCalledTimes(1);
     expect(store.finishRepair).toHaveBeenCalledWith(REPAIR_ID, 'cancelled', 1);
@@ -192,7 +201,6 @@ describe('AlertBotRepairService', () => {
   });
 
   it('stop между derive и finish повторно вычисляет cancelled вместо потерянного verified', async () => {
-    await service.stop('100', '200');
     store.findRepair
       .mockResolvedValueOnce(repair())
       .mockResolvedValueOnce(repair('running'))
@@ -200,7 +208,10 @@ describe('AlertBotRepairService', () => {
       .mockResolvedValueOnce(repair('cancel_requested'));
     store.listJobs.mockResolvedValue([job(1, 'exec', true), job(2, 'verify', false)]);
     store.finishRepair
-      .mockResolvedValueOnce(false)
+      .mockImplementationOnce(async () => {
+        await service.stop('100', '200');
+        return false;
+      })
       .mockResolvedValueOnce(true);
 
     const result = await service.run(REPAIR_ID, TURN_ID, input());
@@ -251,11 +262,12 @@ describe('AlertBotRepairService', () => {
 
   it('stop ставит admin marker до requestCancel transition и ждёт local snapshot', async () => {
     const aiStarted = deferred();
+    const generated = deferred<{ text: string; costUsd: number; tools: string[]; noCause: boolean }>();
     const transition = deferred<boolean>();
     const transitionStarted = deferred();
     ai.repair.mockImplementation(() => {
       aiStarted.resolve();
-      return Promise.resolve({ text: 'Готово', costUsd: 0, tools: [], noCause: false });
+      return generated.promise;
     });
     store.requestCancel.mockImplementation(() => {
       transitionStarted.resolve();
@@ -269,6 +281,7 @@ describe('AlertBotRepairService', () => {
     await aiStarted.promise;
     const stopping = service.stop('100', '200');
     await transitionStarted.promise;
+    generated.resolve({ text: 'Готово', costUsd: 0, tools: [], noCause: false });
 
     const result = await running;
     const stopCallsBeforeTransition = executor.stopRepair.mock.calls.length;
