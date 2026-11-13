@@ -34,6 +34,9 @@ function runRollout(health, options = {}) {
   for (const dir of [live, stage, base]) {
     write(path.join(dir, 'helper.mjs'), helper);
     write(path.join(dir, 'a.test.mjs'), passingTest);
+    // staging-фаза deploy-relay.sh обязана запускать живой write-gate;
+    // в симуляции его заменяет проходящий заглушечный test.
+    write(path.join(dir, 'sandbox-write-live.test.mjs'), passingTest);
   }
   write(path.join(live, 'server.mjs'), baseServer);
   write(path.join(base, 'server.mjs'), baseServer);
