@@ -103,16 +103,20 @@ export class ProductAccountDeletionService {
 
   /**
    * Финал purge-шага: relational-строки продукта удаляются ТОЛЬКО после того,
-   * как агент машины подтвердил стирание (purged_at IS NOT NULL) и только
-   * своему удалению текущего поколения (u.state='deleted' + deletion_id —
-   * тот же страж, что у assertCurrent и archiveState). Один оператор в
-   * транзакции: product_actions — ON DELETE SET NULL (журнал), поэтому
-   * удаляется явно в CTE; turns/jobs/domains уходят каскадами.
+   * как агент машины подтвердил стирание (purged_at IS NOT NULL), резервная
+   * копия обнулена (repo_url IS NULL) и только своему удалению текущего
+   * поколения (u.state='deleted' + deletion_id — тот же страж, что у
+   * assertCurrent и archiveState). repo_url-страж дублирует проверку adapter
+   * (backupCleared) внутри самого оператора: копия, выставленная между чтением
+   * состояния и удалением, или вызов в обход adapter не удалят строку при
+   * живой копии. Один оператор в транзакции: product_actions — ON DELETE SET
+   * NULL (журнал), поэтому удаляется явно в CTE; turns/jobs/domains уходят
+   * каскадами.
    *
    * Повтор при уже удалённой строке — подтверждённый успех (true): повторный
    * attempt координатора не должен вечно держать job. Отказ стражей (чужой
-   * продукт, не стёрт, старое поколение) — false, и adapter уходит в
-   * fail-closed retry.
+   * продукт, не стёрт, живая копия, старое поколение) — false, и adapter
+   * уходит в fail-closed retry.
    */
   async deletePurgedProduct(
     productId: string,
@@ -127,6 +131,7 @@ export class ProductAccountDeletionService {
            WHERE p.id = $1 AND p.user_id = $2
              AND u.state = 'deleted' AND u.deletion_id = $3
              AND p.purged_at IS NOT NULL
+             AND p.repo_url IS NULL
              FOR UPDATE OF p
        ), actions AS (
           DELETE FROM product_actions a USING target t

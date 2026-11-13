@@ -6,38 +6,57 @@ import type {
   DeletionDiscoverer,
   DeletionExecution,
   DeletionJobRow,
+  DeletionJobSpec,
   DeletionResourceType,
 } from '../account-deletion/account-deletion.types';
 import { ProductAccountDeletionService } from './product-account-deletion.service';
 
-/** Read-only discovery одного поколения; purge discovery появится отдельно в Task 8. */
+/**
+ * Read-only discovery одного поколения. product.stop — только нестёртым
+ * продуктам; product.purge — ВСЕМ продуктам поколения, включая уже стёртые
+ * штатным обходом до удаления аккаунта (purged_at IS NOT NULL): их строки и
+ * журнал тоже должны быть удалены. Planner относит runAt purge-задач на
+ * deletedAt + срок хранения, а зависимость sameResourceKey product.stop
+ * (DELETION_DEPENDENCIES) не даёт purge стартовать раньше остановки; у
+ * стёртых продуктов stop-строки нет, и NOT EXISTS-зависимость claimNext
+ * считается удовлетворённой — purge выдаётся сразу по сроку.
+ */
 export const discoverProductDeletion: DeletionDiscoverer = async ({ db, account }) => {
   const products = await db.query(
-    `SELECT p.id,p.slug,p.host_id
+    `SELECT p.id,p.slug,p.host_id,p.purged_at
        FROM products p
        JOIN user_id u ON u.internal_id=p.user_id
       WHERE p.user_id=$1
         AND u.state='deleted' AND u.deletion_id=$2
-        AND p.purged_at IS NULL
       ORDER BY p.id`,
     [account.userId, account.deletionId],
   );
-  return {
-    jobs: products.rows.map((row) => {
-      const productId = String(row.id);
-      return {
+  const jobs: DeletionJobSpec[] = [];
+  for (const row of products.rows) {
+    const productId = String(row.id);
+    // slug в схеме NOT NULL; host_id может быть NULL — sanitizer пропускает
+    // null-значения, payload обоих job'ов технический (id/slug/host).
+    const payload = {
+      productId,
+      slug: String(row.slug),
+      hostId: row.host_id == null ? null : String(row.host_id),
+    };
+    if (row.purged_at == null) {
+      jobs.push({
         resourceType: 'product.stop' as const,
         resourceKey: productId,
         phase: 'immediate' as const,
-        payload: {
-          productId,
-          slug: String(row.slug),
-          hostId: row.host_id == null ? null : String(row.host_id),
-        },
-      };
-    }),
-    skips: [],
-  };
+        payload: { ...payload },
+      });
+    }
+    jobs.push({
+      resourceType: 'product.purge' as const,
+      resourceKey: productId,
+      phase: 'purge' as const,
+      payload: { ...payload },
+    });
+  }
+  return { jobs, skips: [] };
 };
 
 @Injectable()
