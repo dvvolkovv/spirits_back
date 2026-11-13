@@ -61,7 +61,10 @@ export class TgClaimService {
 
     const lock = await this.pg.tryAdvisoryLock(tgChatLifecycleLockKey(tgChatId));
     if (!lock) {
-      throw claimError('group_taken', 'в этой группе уже выполняется подключение или отключение бота', true);
+      throw Object.assign(
+        claimError('group_taken', 'в этой группе уже выполняется подключение или отключение бота', true),
+        { lifecycleBusy: true },
+      );
     }
     try {
       const conflictRes = await this.pg.query(
