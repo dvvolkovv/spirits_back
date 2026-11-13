@@ -75,6 +75,14 @@ maybe('product account deletion против живого Postgres', () => {
     await pool?.end();
   });
 
+  // Объект pg создан ОДИН раз в beforeAll и переиспользуется всеми тестами,
+  // поэтому spyOn(pg, 'query') из теста «потерянный после CTE sleep» без
+  // восстановления пережил бы свой тест и его DELETE kind='sleep' срабатывал
+  // бы на CTE каждого следующего теста (так M-6 терял свой done-sleep).
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
   beforeEach(async () => {
     await pool.query('TRUNCATE products, product_provision_jobs, product_turns, product_actions, product_host_agent, product_hosts, product_user_limits RESTART IDENTITY CASCADE');
     await pool.query('TRUNCATE user_id, ai_profiles_consolidated RESTART IDENTITY CASCADE');
