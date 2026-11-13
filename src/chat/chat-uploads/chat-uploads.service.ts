@@ -251,9 +251,15 @@ export class ChatUploadsService {
 
   assistantBlock(records: ChatUploadRecord[] | null | undefined): string {
     if (process.env.CHAT_UPLOADS_ENABLED !== 'true' || !records?.length) return '';
-    return `Earlier user uploads:\n${records
-      .map((record) => `- ${record.originalName}: ${this.assistantUrl(record.id)}`)
-      .join('\n')}`;
+    // Строка про срок и «только последняя копия» — не косметика (I1a, ревью
+    // Task 6): в resumed-сессиях релея копии блока накапливаются ход за ходом,
+    // а подпись живёт ~1 час. Модель, взявшая ссылку из устаревшей копии,
+    // получает 404 и решает, что файл пропал.
+    return [
+      'Earlier user uploads:',
+      'Signed links expire after ~1 hour. If this block appears more than once in the conversation, use ONLY the LATEST copy — links from earlier copies are stale and return 404.',
+      ...records.map((record) => `- ${record.originalName}: ${this.assistantUrl(record.id)}`),
+    ].join('\n');
   }
 
   private isNotFound(e: any): boolean {

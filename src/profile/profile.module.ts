@@ -3,11 +3,15 @@ import { ProfileController } from './profile.controller';
 import { ProfileService } from './profile.service';
 import { Neo4jModule } from '../neo4j/neo4j.module';
 import { IdentityModule } from '../identity/identity.module';
+import { ChatUploadsModule } from '../chat/chat-uploads/chat-uploads.module';
 import { OAuthAppleService } from '../auth/oauth-apple.service';
 import { EmailService } from '../auth/email.service';
 
 @Module({
-  imports: [Neo4jModule, IdentityModule],
+  // ChatUploadsModule, а не ChatModule: реестр загрузок нужен ProfileService
+  // для очистки при удалении аккаунта, а ChatUploadsModule не импортирует
+  // никого кроме CommonModule — цикла DI нет (см. его комментарий).
+  imports: [Neo4jModule, IdentityModule, ChatUploadsModule],
   controllers: [ProfileController],
   // OAuthAppleService объявлен здесь, а не притянут из AuthModule: тот его не
   // экспортирует, а импортировать модуль целиком ради одного сервиса значило

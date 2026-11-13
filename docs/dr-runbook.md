@@ -79,8 +79,9 @@ graph is rebuilt continuously from chat, so a day's gap self-heals over time.
 
 node-3 runs a MinIO mirror (`10.10.0.3:9000`, data `/var/lib/linkeon-dr/minio`)
 holding buckets `linkeon-smm-videos`, `linkeon-smm-music`, `linkeon-assets`
-(images, speech, call documents, avatars) and `linkeon-chat-files` (files the
-assistants created in chats; added 2026-10). The mirror is
+(images, speech, call documents, avatars), `linkeon-chat-files` (files the
+assistants created in chats; added 2026-10) and `linkeon-chat-uploads` (users'
+original chat uploads; **private**, added 2026-11). The mirror is
 `--overwrite` **without `--remove`**, so node-3 holds ≥ everything prod had
 (a prod-side wipe does NOT cascade to DR).
 
@@ -93,17 +94,21 @@ mc mirror --overwrite node3minio/linkeon-smm-videos newprod/linkeon-smm-videos
 mc mirror --overwrite node3minio/linkeon-smm-music  newprod/linkeon-smm-music
 mc mirror --overwrite node3minio/linkeon-assets     newprod/linkeon-assets
 mc mirror --overwrite node3minio/linkeon-chat-files newprod/linkeon-chat-files
+mc mirror --overwrite node3minio/linkeon-chat-uploads newprod/linkeon-chat-uploads
 # Anonymous access: GetObject ONLY. Never `mc anonymous set download` —
 # that canned policy also allows anonymous s3:ListBucket (full key listing).
 for b in linkeon-smm-videos linkeon-smm-music linkeon-assets linkeon-chat-files; do
   printf '%s' "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[\"*\"]},\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::$b/*\"]}]}" > /tmp/p.json
   mc anonymous set-json /tmp/p.json newprod/$b
 done
+# NEVER add linkeon-chat-uploads to the anonymous loop: that bucket is private
+# (owner-JWT / assistant-HMAC access through the backend only).
 ```
 
 The app does not use the root key. `MINIO_ACCESS_KEY` in `.env` is a separate
 MinIO user with the policy `smm-rw`, and that policy lists the buckets by name.
-On a rebuilt MinIO recreate that user and give `smm-rw` all four buckets
+On a rebuilt MinIO recreate that user and give `smm-rw` all five buckets
+(including `linkeon-chat-uploads`)
 (`arn:aws:s3:::<bucket>` and `arn:aws:s3:::<bucket>/*` for each):
 `mc admin policy create newprod smm-rw <json>`, then attach it to the user.
 A bucket missing from `smm-rw` fails quietly: PutObject returns `Access Denied.`,
