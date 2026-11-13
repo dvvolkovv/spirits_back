@@ -108,7 +108,7 @@ function makeUploads(recent: ChatUploadRecord[] = [RECORD]) {
   return { uploads, recentSpy };
 }
 
-function makeSvc(uploads?: ChatUploadsService): ChatService {
+function makeSvc(uploads?: ChatUploadsService): { svc: ChatService; pg: { query: jest.Mock } } {
   const pg = {
     query: jest.fn(async (sql: string) =>
       /AS spent/.test(sql) ? { rows: [{ spent: 0 }] } : { rows: [] },
@@ -124,7 +124,7 @@ function makeSvc(uploads?: ChatUploadsService): ChatService {
   // Позиционная сборка до последнего параметра не доходит — подставляем полем
   // (тот же приём, что у redis в chat.service.guest-carry.spec.ts).
   if (uploads) (svc as any).chatUploads = uploads;
-  return svc;
+  return { svc, pg: pg as { query: jest.Mock } };
 }
 
 /** Прогон текстового хода и поля, ушедшие на релей. */
@@ -168,7 +168,8 @@ describe('streamUniversalAgent: память последних загрузок
 
   it('после ротации prompt снова содержит имя и подписанную ссылку', async () => {
     const { uploads, recentSpy } = makeUploads();
-    const fields = await run(makeSvc(uploads), 'что в файле?');
+    const { svc } = makeSvc(uploads);
+    const fields = await run(svc, 'что в файле?');
 
     expect(fields.message).toContain('Earlier user uploads');
     expect(fields.message).toContain('a.pdf');
@@ -188,7 +189,8 @@ describe('streamUniversalAgent: память последних загрузок
 
   it('холодный старт: блок в теле хода, в history подписанных ссылок нет', async () => {
     const { uploads } = makeUploads();
-    const fields = await run(makeSvc(uploads), 'напомни, что было в файле?', {
+    const { svc } = makeSvc(uploads);
+    const fields = await run(svc, 'напомни, что было в файле?', {
       history: [
         { type: 'user', content: 'ранний вопрос' },
         { type: 'assistant', content: 'ранний ответ' },
@@ -204,7 +206,8 @@ describe('streamUniversalAgent: память последних загрузок
 
   it('чистый лист: блок есть, реестр опрошен по fresh-сессии', async () => {
     const { uploads, recentSpy } = makeUploads();
-    const fields = await run(makeSvc(uploads), 'новая тема — что было в файле?', { fresh: true });
+    const { svc } = makeSvc(uploads);
+    const fields = await run(svc, 'новая тема — что было в файле?', { fresh: true });
 
     expect(fields.message).toContain('Earlier user uploads');
     expect(fields.message).toContain('a.pdf');
@@ -214,7 +217,8 @@ describe('streamUniversalAgent: память последних загрузок
   it('флаг выключен — блока нет нигде, реестр не опрашивается', async () => {
     delete process.env.CHAT_UPLOADS_ENABLED;
     const { uploads, recentSpy } = makeUploads();
-    const fields = await run(makeSvc(uploads), 'что в файле? (флаг выключен)');
+    const { svc } = makeSvc(uploads);
+    const fields = await run(svc, 'что в файле? (флаг выключен)');
 
     expect(recentSpy).not.toHaveBeenCalled();
     expect(fields.message).not.toContain('Earlier user uploads');
@@ -225,7 +229,8 @@ describe('streamUniversalAgent: память последних загрузок
   it('сбой реестра — не повод ронять ход', async () => {
     const { uploads, recentSpy } = makeUploads();
     recentSpy.mockRejectedValue(new Error('db down'));
-    const fields = await run(makeSvc(uploads), 'что в файле? (сбой БД)');
+    const { svc } = makeSvc(uploads);
+    const fields = await run(svc, 'что в файле? (сбой БД)');
 
     expect(fields.message).not.toContain('Earlier user uploads');
     expect(fields.message.endsWith('что в файле? (сбой БД)')).toBe(true);
@@ -233,10 +238,43 @@ describe('streamUniversalAgent: память последних загрузок
 
   it('пинг мониторинга (probe) блок не везёт и реестр не опрашивает', async () => {
     const { uploads, recentSpy } = makeUploads();
-    const fields = await run(makeSvc(uploads), 'ответь одним словом ок', { probe: true });
+    const { svc } = makeSvc(uploads);
+    const fields = await run(svc, 'ответь одним словом ок', { probe: true });
 
     expect(recentSpy).not.toHaveBeenCalled();
     expect(fields.message).not.toContain('Earlier user uploads');
+  });
+
+  it('M6: в custom_chat_history уходит СЫРОЙ текст — подписанная ссылка не сохраняется', async () => {
+    // Блок живёт только в пер-ходовой части запроса к релею. Ранняя запись
+    // человеческой строки (saveUserMessageRow) обязана нести исходное
+    // сообщение: подпись в истории утечёт в долгоживущую поверхность
+    // (GET /webhook/chat/history, выгрузки) и всё равно умрёт через час.
+    const { uploads } = makeUploads();
+    const { svc, pg } = makeSvc(uploads);
+    const fields = await run(svc, 'что в файле?');
+
+    // Блок действительно был в ходе — иначе проверка истории ничего не значит.
+    expect(fields.message).toContain('Earlier user uploads');
+    expect(fields.message).toContain('sig=');
+
+    const humanInserts = pg.query.mock.calls.filter(
+      ([sql, params]) =>
+        String(sql).startsWith('INSERT INTO custom_chat_history') &&
+        String(sql).includes("'human'") &&
+        Array.isArray(params),
+    );
+    expect(humanInserts.length).toBeGreaterThan(0);
+    for (const [, params] of humanInserts) {
+      const serialized = JSON.stringify(params);
+      expect(serialized).not.toContain('sig=');
+      expect(serialized).not.toContain('Earlier user uploads');
+      expect(serialized).not.toContain('exp=');
+    }
+    // Сырой текст пользователя сохранён как есть.
+    expect(
+      humanInserts.some(([, params]) => (params as any[]).includes('что в файле?')),
+    ).toBe(true);
   });
 });
 

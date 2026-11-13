@@ -75,8 +75,14 @@ describe('ChatUploadsService', () => {
 
     process.env.CHAT_UPLOADS_ENABLED = 'true';
     const block = service.assistantBlock([record]);
-    expect(block).toContain(`Earlier user uploads:\n- a.pdf: https://my.linkeon.test/webhook/chat-uploads/${record.id}`);
+    expect(block).toContain('Earlier user uploads:');
+    expect(block).toContain(`- a.pdf: https://my.linkeon.test/webhook/chat-uploads/${record.id}`);
     expect(block).toMatch(/\?exp=\d+&sig=[0-9a-f]{64}$/);
+    // I1a (ревью Task 6): в resumed-сессиях релея накапливаются устаревшие
+    // копии блока; модель обязана брать ссылки только из ПОСЛЕДНЕЙ копии и
+    // знать, что ссылка живёт около часа.
+    expect(block).toContain('1 hour');
+    expect(block).toMatch(/ONLY the (LATEST|latest)/);
   });
 
   it('searchOriginals ограничивает выдачу 200 строками', async () => {
