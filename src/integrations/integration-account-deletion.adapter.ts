@@ -1,6 +1,6 @@
-import { Injectable, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { AccountDeletionRegistry } from '../account-deletion/account-deletion.registry';
-import { DeletionRetryError, deletionErrorKind } from '../account-deletion/account-deletion.safe';
+import { DeletionRetryError, deletionErrorKind, safeDeletionMessage } from '../account-deletion/account-deletion.safe';
 import type {
   AccountDeletionAdapter,
   DeletionDiscoverer,
@@ -71,6 +71,11 @@ export class IntegrationAccountDeletionAdapter implements OnModuleInit, AccountD
     'integration.talerid.stop',
   ];
 
+  private readonly logger = new Logger(IntegrationAccountDeletionAdapter.name);
+
+  /** Review I-3: warn-once на процесс (паттерн warnIfSleepHasNoHost, Task 7). */
+  private static readonly warnedAppleNotConfigured = new Set<string>();
+
   constructor(
     private readonly identity: IdentityService,
     private readonly apple: OAuthAppleService,
@@ -90,7 +95,21 @@ export class IntegrationAccountDeletionAdapter implements OnModuleInit, AccountD
         // Токены живут только в памяти этого вызова.
         const tokens = await this.identity.providerRefreshTokens(job.userId, 'apple');
         if (tokens.length === 0) return; // unlink уже произошёл — идемпотентный успех
+        // Review I-3: без ключей Apple canCallApple()===false и revokeToken
+        // всегда возвращает false — fail-closed retry становится вечным и на
+        // вид неотличим от настоящей внешней аварии. Раз в процесс говорим
+        // оператору техническим сообщением (без userId и токенов); поведение
+        // прежнее — DeletionRetryError('external_unknown'). Проверка ПОСЛЕ
+        // ветки «токенов нет»: если unlink уже случился, отзывать нечего, и
+        // стенд без ключей не должен вечно блокировать удаление.
+        if (!this.apple.canCallApple()) {
+          this.warnAppleNotConfiguredOnce(job);
+          throw new DeletionRetryError('external_unknown');
+        }
         const clientId = this.apple.primaryClientId();
+        // Retry после partial failure прогоняет все токены заново: Apple
+        // /auth/revoke идемпотентен — повторный отзыв уже отозванного токена
+        // возвращает успех, так что это безопасно.
         for (const token of tokens) {
           let revoked: boolean;
           try {
@@ -126,5 +145,27 @@ export class IntegrationAccountDeletionAdapter implements OnModuleInit, AccountD
       default:
         throw new Error('unsupported_deletion_resource');
     }
+  }
+
+  /** Разовый (на процесс) операторский сигнал: Apple-ключи не настроены. */
+  private warnAppleNotConfiguredOnce(job: DeletionJobRow): void {
+    const warned = IntegrationAccountDeletionAdapter.warnedAppleNotConfigured;
+    if (warned.has(job.resourceType)) return;
+    warned.add(job.resourceType);
+    let message = 'apple revoke not configured — deletion will retry (integration.apple.stop)';
+    try {
+      // safeDeletionMessage сам валидирует поля и не выпускает userId в текст.
+      message = `apple revoke not configured — deletion will retry ${safeDeletionMessage({
+        deletionId: job.deletionId,
+        resourceType: job.resourceType,
+        resourceKey: job.resourceKey,
+        attempts: job.attempts,
+        kind: 'external_unknown',
+        userId: job.userId,
+      })}`;
+    } catch {
+      // Sanitizer не принял поля строки — остаётся постоянный технический текст.
+    }
+    this.logger.error(message);
   }
 }

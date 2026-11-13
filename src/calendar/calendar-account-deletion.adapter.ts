@@ -25,11 +25,12 @@ import { CalendarService } from './calendar.service';
  * Evidence — явный маркер createdByLinkeon в JSONB события; сегодня его никто
  * не пишет, так что на текущих данных skip получают все внешние uid.
  *
- * Личные строки (calendar_proposals, trip_calendars, calendar_connections)
- * чистит purge-задача с generation predicate: старый deletionId после
- * reactivation не удаляет ничего. Секреты соединений (secret_enc) стираются
- * вместе со строкой подключения — но только после успешной остановки
- * (зависимость calendar.purge: allOf calendar.stop в каталоге).
+ * Личные строки (calendar_proposals, trip_calendars, calendar_connections,
+ * linkeon_tasks, day_framing) чистит purge-задача с generation predicate:
+ * старый deletionId после reactivation не удаляет ничего. Секреты соединений
+ * (secret_enc) стираются вместе со строкой подключения — но только после
+ * успешной остановки (зависимость calendar.purge: allOf calendar.stop в
+ * каталоге); сам stop — soft-disable (enabled=false), а не hard-delete.
  */
 
 /** Единственный признак «событие создано Линкеоном и принадлежит владельцу». */
@@ -57,10 +58,18 @@ export const discoverCalendarDeletion: DeletionDiscoverer = async ({ db, account
 
   const jobs: DeletionJobSpec[] = [];
   const skips: DeletionSkip[] = [];
+  // Review I-1 (защитный слой): CalendarController.connect исторически пропускал
+  // body.provider без валидации, поэтому в calendar_connections может лежать
+  // отравленная строка ('Yandex 360', 'yandex ', 200 символов). Она ломает
+  // sanitizer (RESOURCE_KEY_RE/unsafePayloadString), а ошибка одного discoverer'а
+  // роняет ВЕСЬ план удаления. Clamp в фиксированный enum, который execute
+  // реально использует для маршрутизации, + дедуп: PK (user_id, provider)
+  // допускает одновременные 'yandex' и 'yandex ', а stop после clamp один.
+  const stopProviders = new Set<'yandex' | 'exchange'>();
   for (const row of connections.rows) {
-    // provider — технический идентификатор ('yandex'|'exchange'|'talerid'|...),
-    // секретов и URL в этой строке нет.
-    const provider = String(row.provider);
+    stopProviders.add(row.provider === 'exchange' ? 'exchange' : 'yandex');
+  }
+  for (const provider of stopProviders) {
     jobs.push({
       resourceType: 'calendar.stop',
       resourceKey: provider,
@@ -68,16 +77,20 @@ export const discoverCalendarDeletion: DeletionDiscoverer = async ({ db, account
       payload: { provider },
     });
   }
+  let unverifiableExternal = false;
   for (const row of proposals.rows) {
     const event = row.event ?? null;
     const uid = typeof event?.uid === 'string' ? event.uid : '';
     if (!uid) continue; // внешне удалять нечего — локальную строку сотрёт purge
-    if (!hasDurableOwnershipEvidence(event)) {
-      skips.push({ resourceType: 'calendar.external', reason: 'owner_unverifiable' });
-    }
+    if (!hasDurableOwnershipEvidence(event)) unverifiableExternal = true;
     // С evidence внешний DELETE всё равно не часть deletion-pipeline:
     // calendar.external — skip-only тип, события живут во внешнем календаре
     // владельца и остаются у него.
+  }
+  // Review I-9: один skip на discovery, а не по одному на каждое событие —
+  // N одинаковых skip'ов раздувают план, не добавляя информации.
+  if (unverifiableExternal) {
+    skips.push({ resourceType: 'calendar.external', reason: 'owner_unverifiable' });
   }
   if (connections.rows.length > 0 || proposals.rows.length > 0 || ics.rows.length > 0) {
     jobs.push({
@@ -114,7 +127,10 @@ export class CalendarAccountDeletionAdapter implements OnModuleInit, AccountDele
         try {
           // Существующие disconnect/disconnectExchange идемпотентны: отсутствие
           // строки подключения — не ошибка. Внешние вызовы (revoke у провайдера)
-          // они не делают, только локальный hard-delete строки с секретами.
+          // они не делают и строку не удаляют: это soft-disable — enabled=false
+          // с сохранением secret_enc (правило reconnect: переподключение чинит
+          // доступ без повторного ввода пароля). Строка вместе с секретами
+          // стирает задача calendar.purge — после успешной остановки (allOf).
           if (provider === 'exchange') await this.calendar.disconnectExchange(job.userId);
           else await this.calendar.disconnect(job.userId);
         } catch (error) {
@@ -143,6 +159,22 @@ export class CalendarAccountDeletionAdapter implements OnModuleInit, AccountDele
               )`,
           `DELETE FROM calendar_connections c
             WHERE c.user_id=$1
+              AND EXISTS (
+                SELECT 1 FROM user_id u
+                WHERE u.internal_id=$1 AND u.state='deleted' AND u.deletion_id=$2
+              )`,
+          // Review I-4: linkeon_tasks («дом дел») и day_framing (фреймы дня) —
+          // тоже calendar/trip-домен (LinkeonTasksService и DayFramingStore —
+          // провайдеры CalendarModule), таблицы без FK, и до этой правки их не
+          // стирал никто: план чистил tasks (TasksService), но не linkeon_tasks.
+          `DELETE FROM linkeon_tasks l
+            WHERE l.user_id=$1
+              AND EXISTS (
+                SELECT 1 FROM user_id u
+                WHERE u.internal_id=$1 AND u.state='deleted' AND u.deletion_id=$2
+              )`,
+          `DELETE FROM day_framing d
+            WHERE d.user_id=$1
               AND EXISTS (
                 SELECT 1 FROM user_id u
                 WHERE u.internal_id=$1 AND u.state='deleted' AND u.deletion_id=$2

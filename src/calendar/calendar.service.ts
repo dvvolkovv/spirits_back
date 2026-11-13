@@ -298,6 +298,16 @@ export class CalendarService {
 
   async connect(userId: string, provider: string, username: string, appPassword: string): Promise<{ ok: boolean; error?: string }> {
     if (!(await this.assertActive(userId))) return { ok: false, error: CalendarService.INACTIVE_ERROR };
+    // Review I-1: provider приходит из тела запроса и попадает в PK строки
+    // подключения, а затем в resourceKey/payload deletion-задач. Произвольная
+    // строка ('Yandex 360', 'yandex ', 200 символов) отравила бы calendar_connections
+    // и сломала sanitizer при планировании удаления — аккаунт завис бы в вечном
+    // warn-цикле. baseUrl ниже всё равно захардкожен под Яндекс, поэтому whitelist
+    // из одного элемента; невалидный provider — существующая ошибка подключения,
+    // БЕЗ записи строки и внешних вызовов.
+    if (provider !== 'yandex') {
+      return { ok: false, error: 'Не удалось подключиться — проверь логин и пароль приложения' };
+    }
     const baseUrl = 'https://caldav.yandex.ru'; // provider→baseUrl map; yandex only for now
     username = (username || '').trim();
     // Яндекс ПОКАЗЫВАЕТ пароль приложения группами через пробелы («xxxx xxxx xxxx xxxx»), но сам

@@ -183,7 +183,11 @@ export class TalerIdOauthService {
       if (Date.now() - updatedMs < RECOVERY_COOLDOWN_MS) return null;
       const inFlightRecovery = this.refreshInFlight.get(userId);
       if (inFlightRecovery) return inFlightRecovery;
-      const rp = this.autoReprovision(userId).finally(() => this.refreshInFlight.delete(userId));
+      // Review I-2: finally убирает только СВОЮ запись — за время полёта в map
+      // мог встать второй flight (его дожидается drain в disconnect).
+      const rp = this.autoReprovision(userId).finally(() => {
+        if (this.refreshInFlight.get(userId) === rp) this.refreshInFlight.delete(userId);
+      });
       this.refreshInFlight.set(userId, rp);
       return rp;
     }
@@ -200,7 +204,11 @@ export class TalerIdOauthService {
     const inFlight = this.refreshInFlight.get(userId);
     if (inFlight) return inFlight;
 
-    const p = this.doRefresh(userId).finally(() => this.refreshInFlight.delete(userId));
+    // Review I-2: finally убирает только СВОЮ запись — иначе снесёт второй
+    // flight, зарегистрированный во время drain, и disconnect потеряет его.
+    const p = this.doRefresh(userId).finally(() => {
+      if (this.refreshInFlight.get(userId) === p) this.refreshInFlight.delete(userId);
+    });
     this.refreshInFlight.set(userId, p);
     return p;
   }
@@ -279,13 +287,22 @@ export class TalerIdOauthService {
   }
 
   async disconnect(userId: string): Promise<void> {
-    // In-flight refresh/auto-reprovision по завершении делает saveConnection()
-    // (upsert) и воскресил бы подключение уже удалённого аккаунта. Сначала
-    // дожидаемся его (результат уже не важен), затем стираем строку повторно:
-    // disconnect идемпотентен и последнее слово всегда за ним.
-    const running = this.refreshInFlight.get(userId);
-    this.refreshInFlight.delete(userId);
-    if (running) await running.then(() => undefined, () => undefined);
+    // Review I-2: in-flight refresh/auto-reprovision по завершении делает
+    // saveConnection() (upsert) и воскресил бы подключение уже удалённого
+    // аккаунта, а второй обмен токенов во время drain ещё и рвёт grant-цепочку
+    // ротацией. Прежний delete-then-await одним ждал только ПЕРВЫЙ flight.
+    // Теперь запись из map не вынимаем (каждый полёт чистит свою в finally),
+    // циклом дожидаемся ВСЕХ flight'ов, включая стартовавшие во время ожидания,
+    // и только потом стираем строку. Неустранимое окно «новый flight ПОСЛЕ
+    // drain» in-process не закрывается — прикрыто гейтами выше по стеку.
+    let running = this.refreshInFlight.get(userId);
+    while (running) {
+      await running.then(() => undefined, () => undefined);
+      // Защитная уборка stale-записи; чужую более свежую не трогаем — её
+      // дождётся следующая итерация.
+      if (this.refreshInFlight.get(userId) === running) this.refreshInFlight.delete(userId);
+      running = this.refreshInFlight.get(userId);
+    }
     await this.store.delete(userId);
   }
 }
