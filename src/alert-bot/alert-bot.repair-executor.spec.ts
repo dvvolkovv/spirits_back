@@ -600,14 +600,22 @@ describe('AlertBotRepairExecutor', () => {
       spawned.push(child);
       return child as any;
     });
+    const ready = `${sentinel}.ready`;
     const job = await createJob({ timeoutMs: 30_000 });
     try {
-      await executor.start(job.id, `exec node -e "process.on('SIGTERM',()=>{});setTimeout(()=>require('fs').writeFileSync('${sentinel}','x'),6000)"`);
+      await executor.start(job.id, `exec node -e "process.on('SIGTERM',()=>{});require('fs').writeFileSync('${ready}','1');setTimeout(()=>require('fs').writeFileSync('${sentinel}','x'),6000)"`);
       expect((executor as any).processes.get(job.id)).toMatchObject({ host: 'prod', interruptible: true, finished: false });
       expect((executor as any).repairs.get(job.id)).toBe('repair-1');
       expect((await store.findJob(job.id))!.status).toBe('running');
       expect(() => process.kill(-spawned[0].pid!, 0)).not.toThrow();
-      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      // Ждём, пока child реально зарегистрирует игнорирование SIGTERM:
+      // фиксированный sleep был гонкой — SIGTERM до готовности node убивал
+      // группу сразу, и stopRepair возвращался за миллисекунды.
+      const readyDeadline = Date.now() + 10_000;
+      while (!fs.existsSync(ready) && Date.now() < readyDeadline) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      }
+      expect(fs.existsSync(ready)).toBe(true);
       const startedAt = Date.now();
       await executor.stopRepair('repair-1');
       expect(Date.now() - startedAt).toBeGreaterThanOrEqual(4_500);
@@ -621,6 +629,7 @@ describe('AlertBotRepairExecutor', () => {
         catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
       }
       fs.rmSync(sentinel, { force: true });
+      fs.rmSync(ready, { force: true });
     }
   });
 
