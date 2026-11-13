@@ -257,3 +257,103 @@ describe('renameTasksByTitle — TalerID rename (dedupe routine occurrences by u
     expect(updateTask).not.toHaveBeenCalled();
   });
 });
+
+// Task 9 (account deletion): удалённый аккаунт не должен управлять календарём.
+// Любой вызов, который способен уйти во внешний коннектор (CalDAV/Exchange/
+// TalerID), обязан начинаться со строгой проверки state='active' одним
+// SELECT state FROM user_id — без кэшей. Остановку подключения выполняет
+// deletion-адаптер через disconnect/disconnectExchange (они НЕ гейтятся).
+describe('CalendarService — забор на удалённом аккаунте (Task 9)', () => {
+  beforeAll(() => { process.env.CALENDAR_SECRET_KEY = '0123456789abcdef0123456789abcdef'; });
+
+  const inactivePg = (state: string) => ({
+    query: jest.fn(async (sql: string) => {
+      const s = String(sql);
+      if (s.includes('SELECT state FROM user_id')) return { rows: [{ state }] };
+      // Сохранённое подключение существует: без забора reconnect пошёл бы
+      // проверять пароль во внешний CalDAV.
+      if (s.includes('FROM calendar_connections') && s.includes('secret_enc IS NOT NULL')) {
+        return {
+          rows: [{
+            provider: 'yandex',
+            base_url: 'https://caldav.yandex.ru',
+            username: 'me',
+            secret_enc: encryptSecret('app-pass'),
+          }],
+        };
+      }
+      return { rows: [] };
+    }),
+  });
+
+  function makeService(state: string) {
+    const pg = inactivePg(state);
+    const talerIdStore = { getConnection: jest.fn().mockResolvedValue({ status: 'connected' }) };
+    const talerIdConnector = {
+      listEvents: jest.fn().mockResolvedValue([]),
+      createEvent: jest.fn(),
+      deleteEvent: jest.fn(),
+    };
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
+    (service as any).connector = {
+      test: jest.fn().mockResolvedValue(true),
+      discoverCollection: jest.fn().mockResolvedValue('https://cal.example/'),
+      discoverTaskCollection: jest.fn().mockResolvedValue(null),
+      listEvents: jest.fn().mockResolvedValue([]),
+      createEvent: jest.fn(),
+      deleteEvent: jest.fn(),
+    };
+    (service as any).exchange = { test: jest.fn().mockResolvedValue(true), listEvents: jest.fn().mockResolvedValue([]) };
+    return { service, pg, talerIdStore, talerIdConnector };
+  }
+
+  it('deleted: reconnect не трогает connector и не возвращает ok', async () => {
+    const { service, talerIdStore } = makeService('deleted');
+    const res = await service.reconnect('u-deleted');
+    expect(res.ok).toBe(false);
+    expect((service as any).connector.test).not.toHaveBeenCalled();
+    expect(talerIdStore.getConnection).not.toHaveBeenCalled();
+  });
+
+  it('deleted: connect не проверяет креды во внешнем CalDAV', async () => {
+    const { service } = makeService('deleted');
+    const res = await service.connect('u-deleted', 'yandex', 'me', 'app-pass');
+    expect(res.ok).toBe(false);
+    expect((service as any).connector.test).not.toHaveBeenCalled();
+  });
+
+  it('deleted: createEvent не уходит ни в TalerID, ни в CalDAV', async () => {
+    const { service, talerIdStore, talerIdConnector } = makeService('deleted');
+    const res = await service.createEvent('u-deleted', { title: 'x', datetime: '2026-11-11T10:00:00' });
+    expect(res.ok).toBe(false);
+    expect(talerIdStore.getConnection).not.toHaveBeenCalled();
+    expect(talerIdConnector.createEvent).not.toHaveBeenCalled();
+    expect((service as any).connector.createEvent).not.toHaveBeenCalled();
+  });
+
+  it('deleted: deleteEvent (включая source=talerid) не удаляет внешнее событие', async () => {
+    const { service, talerIdConnector } = makeService('deleted');
+    const res = await service.deleteEvent('u-deleted', 'uid-1', 'talerid');
+    expect(res.ok).toBe(false);
+    expect(talerIdConnector.deleteEvent).not.toHaveBeenCalled();
+    expect((service as any).connector.deleteEvent).not.toHaveBeenCalled();
+  });
+
+  it('deleted: listEvents возвращает [] и не читает внешние источники', async () => {
+    const { service, talerIdConnector } = makeService('deleted');
+    const events = await service.listEvents('u-deleted', new Date(), new Date(Date.now() + 864e5));
+    expect(events).toEqual([]);
+    expect((service as any).connector.listEvents).not.toHaveBeenCalled();
+    expect((service as any).exchange.listEvents).not.toHaveBeenCalled();
+    expect(talerIdConnector.listEvents).not.toHaveBeenCalled();
+  });
+
+  it('active: поведение прежнее — reconnect проверяет сохранённый пароль, listEvents читает источники', async () => {
+    const { service } = makeService('active');
+    const res = await service.reconnect('u-active');
+    expect(res.ok).toBe(true);
+    expect((service as any).connector.test).toHaveBeenCalledTimes(1);
+    const events = await service.listEvents('u-active', new Date(), new Date(Date.now() + 864e5));
+    expect(events).toEqual([]);
+  });
+});

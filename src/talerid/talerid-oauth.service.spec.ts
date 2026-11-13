@@ -584,3 +584,38 @@ describe('TalerIdOauthService', () => {
     });
   });
 });
+
+// Task 9 (account deletion): disconnect — идемпотентный hard-delete. Он обязан
+// дождаться in-flight refresh/auto-reprovision и удалить строку ПОСЛЕ: иначе
+// saveConnection из autoReprovision воскресит подключение удалённого аккаунта.
+describe('TalerIdOauthService.disconnect — идемпотентность и никакого воскрешения', () => {
+  const tick = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  it('ждёт in-flight reprovision и удаляет подключение окончательно', async () => {
+    let connected = false;
+    const store: any = {
+      saveConnection: jest.fn(async () => { connected = true; }),
+      delete: jest.fn(async () => { connected = false; }),
+    };
+    const service = new TalerIdOauthService(store, {} as any);
+    (service as any).refreshInFlight.set('user-1', (async () => {
+      await tick(10);
+      await store.saveConnection('user-1', { taleridUserId: 't1' });
+      return 'токен';
+    })());
+
+    await service.disconnect('user-1');
+    await tick(30);
+
+    expect(connected).toBe(false);
+    expect(store.delete).toHaveBeenCalledWith('user-1');
+  });
+
+  it('без подключения — успех, повтор тоже', async () => {
+    const store: any = { saveConnection: jest.fn(), delete: jest.fn(async () => {}) };
+    const service = new TalerIdOauthService(store, {} as any);
+    await expect(service.disconnect('nobody')).resolves.toBeUndefined();
+    await expect(service.disconnect('nobody')).resolves.toBeUndefined();
+    expect(store.delete).toHaveBeenCalledTimes(2);
+  });
+});

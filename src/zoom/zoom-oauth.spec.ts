@@ -117,3 +117,39 @@ describe('ZoomOauthService', () => {
     await expect(new ZoomOauthService(client, store).obfToken('u1', '1')).resolves.toBeNull();
   });
 });
+
+// Task 9 (account deletion): disconnect обязан быть идемпотентным hard-delete
+// и НЕ допускать «воскрешения» подключения single-flight refresh-ом, который
+// ещё в полёте: refresh завершится и сохранит токены поверх удалённой строки.
+describe('ZoomOauthService.disconnect — идемпотентность и никакого воскрешения', () => {
+  const tick = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  it('ждёт in-flight refresh и удаляет подключение окончательно', async () => {
+    let connected = false;
+    const store: any = {
+      get: jest.fn(async () => null),
+      save: jest.fn(async () => { connected = true; }),
+      remove: jest.fn(async () => { connected = false; }),
+    };
+    const service = new ZoomOauthService({} as any, store);
+    (service as any).refreshing.set('u1', (async () => {
+      await tick(10);
+      await store.save({ userId: 'u1', refreshToken: 'новый' });
+      return 'токен';
+    })());
+
+    await service.disconnect('u1');
+    await tick(30);
+
+    expect(connected).toBe(false);
+    expect(store.remove).toHaveBeenCalled();
+  });
+
+  it('без подключения — успех, повтор тоже', async () => {
+    const store: any = { get: jest.fn(async () => null), save: jest.fn(), remove: jest.fn(async () => {}) };
+    const service = new ZoomOauthService({} as any, store);
+    await expect(service.disconnect('nobody')).resolves.toBeUndefined();
+    await expect(service.disconnect('nobody')).resolves.toBeUndefined();
+    expect(store.remove).toHaveBeenCalledTimes(2);
+  });
+});
