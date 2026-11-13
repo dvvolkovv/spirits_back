@@ -1,4 +1,4 @@
-import { MODULE_METADATA } from '@nestjs/common/lib/constants';
+import { MODULE_METADATA } from '@nestjs/common/constants';
 import { AccountDeletionModule } from '../account-deletion/account-deletion.module';
 import { AccountDeletionRegistry } from '../account-deletion/account-deletion.registry';
 import { safeDeletionJobSnapshot } from '../account-deletion/account-deletion.safe';
