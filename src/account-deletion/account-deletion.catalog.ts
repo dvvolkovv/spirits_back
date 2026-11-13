@@ -1,4 +1,5 @@
 import { discoverRoutinePushDeletion } from '../routine-push/routine-account-deletion.adapter';
+import { discoverTelegramDeletion } from '../tg-bot/tg-account-deletion.adapter';
 import type {
   DeletionDiscoverer,
   DeletionResourceType,
@@ -6,6 +7,7 @@ import type {
 
 export const DELETION_DISCOVERERS: readonly DeletionDiscoverer[] = [
   discoverRoutinePushDeletion,
+  discoverTelegramDeletion,
 ];
 
 export interface DeletionDependencyRule {

@@ -117,6 +117,9 @@ export class CustomAgentsService implements OnModuleInit {
 
   async remove(id: string, ownerId: string): Promise<void> {
     await this.getById(id, ownerId);  // throws NotFound if absent or not owned
+    // normal remove не применим к account deletion purge: archived TG configs
+    // всё равно держат FK. Поэтому account deletion сначала выполняет telegram.purge
+    // и лишь затем отдельный custom-agent.purge с NOT EXISTS по оставшимся configs.
     // FK-блок: проверяем что роль не используется в активных tg_bot_configs
     const usageRes = await this.pg.query(
       `SELECT id, display_name FROM tg_bot_configs

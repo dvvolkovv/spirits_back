@@ -1,6 +1,17 @@
 import { Injectable, Logger, NotFoundException, BadRequestException } from '@nestjs/common';
+import { DeletionRetryError, deletionErrorKind } from '../account-deletion/account-deletion.safe';
 import { PgService } from '../common/services/pg.service';
 import { TgGrammyClient } from './tg-grammy.client';
+
+export function isAlreadyAbsentTelegram(error: any): boolean {
+  const status = Number(error?.response?.status ?? error?.response?.error_code ?? error?.error_code ?? 0);
+  if (![400, 403, 404].includes(status)) return false;
+  const description = String(
+    error?.description ?? error?.response?.description ?? error?.message ?? '',
+  ).toLowerCase();
+  return /chat not found|bot was kicked|bot is not a member|bot was blocked by the user|user is deactivated/
+    .test(description);
+}
 
 export interface TgBotConfigRow {
   id: string;
@@ -29,6 +40,14 @@ export class TgConfigService {
     private readonly pg: PgService,
     private readonly grammy: TgGrammyClient,
   ) {}
+
+  private async assertActiveAccount(ownerId: string): Promise<void> {
+    const active = await this.pg.query(
+      `SELECT 1 FROM user_id WHERE internal_id=$1 AND state='active'`,
+      [ownerId],
+    );
+    if (active.rows.length === 0) throw new BadRequestException('account is not active');
+  }
 
   async createPending(
     ownerId: string,
@@ -95,6 +114,7 @@ export class TgConfigService {
     id: string,
     ownerId: string,
   ): Promise<{ config: TgBotConfigRow; claimToken: string; deepLink: string }> {
+    await this.assertActiveAccount(ownerId);
     const cfg = await this.getById(id, ownerId);
     if (!['pending', 'archived'].includes(cfg.status)) {
       throw new BadRequestException(
@@ -213,6 +233,31 @@ export class TgConfigService {
     );
   }
 
+  async archiveForAccountDeletion(
+    id: string,
+    ownerId: string,
+    chatId: string | null,
+    currentDeletionId: string,
+  ): Promise<void> {
+    const archived = await this.pg.query(
+      `UPDATE tg_bot_configs c SET status='archived',archived_at=COALESCE(archived_at,now())
+       WHERE c.id=$1 AND c.owner_user_id=$2 AND EXISTS (
+         SELECT 1 FROM user_id u
+         WHERE u.internal_id=c.owner_user_id AND u.state='deleted' AND u.deletion_id=$3
+       )`,
+      [id, ownerId, currentDeletionId],
+    );
+    // Старый generation после reactivation не должен даже внешне затрагивать новый config.
+    if (!chatId || archived.rowCount === 0) return;
+    try {
+      await this.grammy.leaveChat(Number(chatId));
+    } catch (error: any) {
+      if (isAlreadyAbsentTelegram(error)) return;
+      // Архив сохраняется, а технический chatId остаётся в job для повторной попытки.
+      throw new DeletionRetryError(deletionErrorKind(error));
+    }
+  }
+
   /**
    * Группа стала супергруппой (migrate_to_chat_id): у неё новый id. Конфиг и
    * его история переезжают — иначе бот в новой супергруппе молчит, а
@@ -299,6 +344,7 @@ export class TgConfigService {
    * потребовал бы обращения по имени, что в диалоге один на один абсурдно.
    */
   async ensurePrivateConfig(ownerId: string, tgChatId: number): Promise<TgBotConfigRow> {
+    await this.assertActiveAccount(ownerId);
     const existing = await this.pg.query(
       `SELECT * FROM tg_bot_configs
         WHERE tg_chat_id = $1 AND status IN ('active','silent')

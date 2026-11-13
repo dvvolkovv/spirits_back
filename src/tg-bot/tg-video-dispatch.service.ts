@@ -39,11 +39,12 @@ export class TgVideoDispatchService implements OnModuleInit, OnModuleDestroy {
 
   private async tick(): Promise<void> {
     const r = await this.pg.query(
-      `SELECT tg.job_id, tg.tg_chat_id, tg.tg_reply_to_message_id,
-              vj.status, vj.video_url, c.owner_user_id
+      `SELECT tg.job_id,tg.tg_chat_id,tg.tg_reply_to_message_id,
+              vj.status, vj.video_url, c.owner_user_id, tg.config_id
          FROM tg_bot_video_jobs tg
          JOIN video_jobs vj ON vj.id = tg.job_id
-         LEFT JOIN tg_bot_configs c ON c.id = tg.config_id
+         JOIN tg_bot_configs c ON c.id=tg.config_id AND c.status IN ('active','silent')
+         JOIN user_id u ON u.internal_id=vj.user_id AND u.state='active'
         WHERE tg.delivery_status = 'pending'
           AND vj.status IN ('ready', 'failed')
         ORDER BY tg.created_at
@@ -56,6 +57,19 @@ export class TgVideoDispatchService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private async isActiveDelivery(jobId: string): Promise<boolean> {
+    const active = await this.pg.query(
+      `SELECT 1 FROM tg_bot_video_jobs tg
+         JOIN video_jobs vj ON vj.id=tg.job_id
+         JOIN tg_bot_configs c ON c.id=tg.config_id AND c.status IN ('active','silent')
+         JOIN user_id u ON u.internal_id=vj.user_id AND u.state='active'
+       WHERE tg.job_id=$1 AND tg.delivery_status='pending'
+       LIMIT 1`,
+      [jobId],
+    );
+    return active.rows.length === 1;
+  }
+
   private async deliver(row: {
     job_id: string;
     tg_chat_id: string;
@@ -63,6 +77,7 @@ export class TgVideoDispatchService implements OnModuleInit, OnModuleDestroy {
     status: string;
     video_url: string | null;
     owner_user_id?: string | null;
+    config_id?: string | null;
   }): Promise<void> {
     const chatId = Number(row.tg_chat_id);
     // Язык — владельца бота (язык его профиля).
@@ -72,6 +87,9 @@ export class TgVideoDispatchService implements OnModuleInit, OnModuleDestroy {
     // тогда видео всё равно уходит, просто без ответа.
     const replyOpts = replyTo ? { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } } : {};
     try {
+      // Selection и каждый последующий await оставляют окно для deletion/archive.
+      // Неизвестное/неактивное состояние не должно приводить к внешнему вызову.
+      if (!await this.isActiveDelivery(row.job_id)) return;
       if (row.status === 'failed' || !row.video_url) {
         await this.grammy.sendMessage(
           chatId,
@@ -80,12 +98,14 @@ export class TgVideoDispatchService implements OnModuleInit, OnModuleDestroy {
         );
       } else {
         await this.grammy.sendChatAction(chatId, 'upload_video').catch(() => {});
+        if (!await this.isActiveDelivery(row.job_id)) return;
         const resp = await axios.get(row.video_url, {
           responseType: 'arraybuffer',
           timeout: 60_000,
           maxContentLength: MAX_VIDEO_BYTES,
         });
         const buf = Buffer.from(resp.data);
+        if (!await this.isActiveDelivery(row.job_id)) return;
         await this.grammy.sendVideo(chatId, buf, replyOpts);
       }
       await this.pg.query(

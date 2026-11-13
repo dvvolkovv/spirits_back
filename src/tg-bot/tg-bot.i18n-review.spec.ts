@@ -457,7 +457,9 @@ describe('видео: ответ на исчезнувшее сообщение 
   it('уведомление уходит с allow_sending_without_reply — сообщение могли удалить за 1–3 минуты генерации', async () => {
     const { TgVideoDispatchService } = require('./tg-video-dispatch.service');
     const grammy = { sendMessage: jest.fn(async () => ({})), sendChatAction: jest.fn(async () => {}) };
-    const svc = new TgVideoDispatchService(pgSpeaking('ru') as any, grammy as any);
+    const svc = new TgVideoDispatchService(pgSpeaking('ru', (sql) => sql.includes('FROM tg_bot_video_jobs tg')
+      ? { rows: [{ '?column?': 1 }] }
+      : { rows: [] }) as any, grammy as any);
     (svc as any).logger = quiet;
     await (svc as any).deliver({ job_id: 'j', tg_chat_id: '-100', tg_reply_to_message_id: 5, status: 'failed', video_url: null, owner_user_id: 'u-1' });
     expect((grammy.sendMessage.mock.calls[0] as any[])[2]).toEqual({ reply_parameters: { message_id: 5, allow_sending_without_reply: true } });

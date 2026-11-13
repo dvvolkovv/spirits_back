@@ -1,4 +1,6 @@
 import { Module, forwardRef } from '@nestjs/common';
+import { AccountDeletionModule } from '../account-deletion/account-deletion.module';
+import { TgAccountDeletionAdapter } from './tg-account-deletion.adapter';
 import { TgBotController } from './tg-bot.controller';
 import { TgBotConfigController } from './tg-bot-config.controller';
 import { TgBotService } from './tg-bot.service';
@@ -29,6 +31,7 @@ import { TgProductActionsService } from './tg-product-actions.service';
   // forwardRef на BlogModule и ShortsModule — вторая половина разрыва колец:
   // блог и ролики берут отсюда TgGrammyClient, бот оттуда — сервисы кнопок.
   imports: [
+    AccountDeletionModule,
     AgentsModule,
     CommonModule,
     MiscModule,
@@ -51,6 +54,7 @@ import { TgProductActionsService } from './tg-product-actions.service';
     TgBotService, TgGrammyClient, TgIdentityService, TgConfigService,
     TgClaimService, TgRouterService, TgVoiceService, TgBillingService, TgCommandsService,
     TgVideoDispatchService, TgMeetingService, CostGrowthService, TgProductActionsService,
+    TgAccountDeletionAdapter,
   ],
   exports: [
     TgBotService, TgGrammyClient, TgIdentityService, TgConfigService,

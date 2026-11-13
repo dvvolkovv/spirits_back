@@ -58,6 +58,10 @@ export class TgIdentityService {
       const r = await client.query(
         `SELECT owner_user_id FROM tg_claim_tokens
           WHERE token = $1 AND kind = 'auth' AND consumed_at IS NULL AND expires_at > now()
+            AND EXISTS (
+              SELECT 1 FROM user_id u
+              WHERE u.internal_id=tg_claim_tokens.owner_user_id AND u.state='active'
+            )
           LIMIT 1
           FOR UPDATE`,
         [token],
