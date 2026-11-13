@@ -159,6 +159,53 @@ describe('AlertBotRepairService', () => {
     );
   });
 
+  it('late stop после AI success не позволяет verified перекрыть cancel_requested', async () => {
+    store.findRepair
+      .mockResolvedValueOnce(repair())
+      .mockResolvedValueOnce(repair('cancel_requested'));
+    store.listJobs.mockResolvedValue([job(1, 'exec', true), job(2, 'verify', false)]);
+
+    const result = await service.run(REPAIR_ID, TURN_ID, input());
+
+    expect(store.finishRepair).toHaveBeenCalledWith(REPAIR_ID, 'cancelled', 1);
+    expect(result.turnStatus).toBe('error');
+    expect(result.text).toContain('Исправление остановлено админом');
+    expect(result.text).not.toContain('Исправлено и проверено');
+  });
+
+  it('stop между derive и finish повторно вычисляет cancelled вместо потерянного verified', async () => {
+    store.findRepair
+      .mockResolvedValueOnce(repair())
+      .mockResolvedValueOnce(repair('running'))
+      .mockResolvedValueOnce(repair('cancel_requested'));
+    store.listJobs.mockResolvedValue([job(1, 'exec', true), job(2, 'verify', false)]);
+    store.finishRepair
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+
+    const result = await service.run(REPAIR_ID, TURN_ID, input());
+
+    expect(store.finishRepair).toHaveBeenNthCalledWith(1, REPAIR_ID, 'verified', 1);
+    expect(store.finishRepair).toHaveBeenNthCalledWith(2, REPAIR_ID, 'cancelled', 1);
+    expect(result.turnStatus).toBe('error');
+    expect(result.text).toContain('Исправление остановлено админом');
+  });
+
+  it('terminal, сохранённый конкурентным finish, не перезаписывается и используется в ответе', async () => {
+    store.findRepair
+      .mockResolvedValueOnce(repair())
+      .mockResolvedValueOnce(repair('running'))
+      .mockResolvedValueOnce({ ...repair('cancelled'), finishedAt: new Date('2026-11-12T01:00:00Z') });
+    store.listJobs.mockResolvedValue([job(1, 'exec', true), job(2, 'verify', false)]);
+    store.finishRepair.mockResolvedValue(false);
+
+    const result = await service.run(REPAIR_ID, TURN_ID, input());
+
+    expect(store.finishRepair).toHaveBeenCalledTimes(1);
+    expect(result.turnStatus).toBe('error');
+    expect(result.text).toContain('Исправление остановлено админом');
+  });
+
   it('/stop отменяет активный repair, будит модель и останавливает executor', async () => {
     const started = deferred();
     let signal: AbortSignal | undefined;
@@ -198,6 +245,17 @@ describe('AlertBotRepairService', () => {
     expect(executor.stopRepair).not.toHaveBeenCalled();
   });
 
+  it('/stop при проигранной cancellation race возвращает сохранённый terminal, а не stopped', async () => {
+    store.requestCancel.mockResolvedValue(false);
+    store.findRepair.mockResolvedValue({
+      ...repair('verified'), mutationCount: 1, finishedAt: new Date('2026-11-12T01:00:00Z'),
+    });
+
+    await expect(service.stop('100', '200')).resolves.toBe('Исправлено и проверено');
+
+    expect(executor.stopRepair).not.toHaveBeenCalled();
+  });
+
   it('cancel_requested до run не вызывает AI и фиксирует cancelled', async () => {
     store.findRepair.mockResolvedValue(repair('cancel_requested'));
 
@@ -209,6 +267,33 @@ describe('AlertBotRepairService', () => {
     expect(result).toEqual({
       text: 'Исправление остановлено админом', costUsd: 0, tools: [], turnStatus: 'error',
     });
+  });
+
+  it('stop до attach: markRepairRunning=false перечитывает cancel_requested и завершает turn result', async () => {
+    store.findRepair
+      .mockResolvedValueOnce(repair())
+      .mockResolvedValueOnce(repair('cancel_requested'));
+    store.markRepairRunning.mockResolvedValue(false);
+
+    const result = await service.run(REPAIR_ID, TURN_ID, input());
+
+    expect(ai.repair).not.toHaveBeenCalled();
+    expect(store.finishRepair).toHaveBeenCalledWith(REPAIR_ID, 'cancelled', 0);
+    expect(result).toMatchObject({ turnStatus: 'error', text: expect.stringContaining('Исправление остановлено админом') });
+  });
+
+  it('stop после attach отменяет controller и завершает cancelled до AI', async () => {
+    const abort = jest.spyOn(AbortController.prototype, 'abort');
+    store.findRepair
+      .mockResolvedValueOnce(repair())
+      .mockResolvedValueOnce(repair('cancel_requested'));
+
+    const result = await service.run(REPAIR_ID, TURN_ID, input());
+
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(ai.repair).not.toHaveBeenCalled();
+    expect(store.finishRepair).toHaveBeenCalledWith(REPAIR_ID, 'cancelled', 0);
+    expect(result.turnStatus).toBe('error');
   });
 
   it('finishRepair=false превращает terminal write в repair_fenced без повторной записи', async () => {
@@ -229,7 +314,7 @@ describe('AlertBotRepairService', () => {
     expect(store.finishRepair).not.toHaveBeenCalled();
   });
 
-  it('stopAll отменяет контроллеры и останавливает executor', async () => {
+  it('stopAll означает shutdown interrupted, а не отмену админом', async () => {
     const started = deferred();
     let signal: AbortSignal | undefined;
     ai.repair.mockImplementation((call: { signal: AbortSignal }) => {
@@ -243,10 +328,14 @@ describe('AlertBotRepairService', () => {
     await started.promise;
 
     await service.stopAll();
-    await expect(running).resolves.toMatchObject({ turnStatus: 'error' });
+    const result = await running;
 
     expect(signal?.aborted).toBe(true);
     expect(executor.stopAll).toHaveBeenCalledTimes(1);
+    expect(store.finishRepair).toHaveBeenCalledWith(REPAIR_ID, 'interrupted', 0);
+    expect(result.turnStatus).toBe('error');
+    expect(result.text).toContain('Исход неизвестен: исправление прервано');
+    expect(result.text).not.toContain('остановлено админом');
   });
 
   it('admit и abandon делегируют журналу до attachTurn', async () => {

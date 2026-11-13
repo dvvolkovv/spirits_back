@@ -58,6 +58,7 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
       { summary: jest.fn().mockResolvedValue('Сводка') } as any,
       { beginStream: jest.fn(), endStream: jest.fn() } as any,
       support as any,
+      { run: jest.fn(), findRepairByUpdate: jest.fn().mockResolvedValue(null) } as any,
     );
     const drafts = new AlertBotDrafts(store, support as any, telegram as any);
     const commands = { start: jest.fn(), status: jest.fn(), close: jest.fn() };

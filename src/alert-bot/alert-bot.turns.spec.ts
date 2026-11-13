@@ -5,6 +5,7 @@ jest.mock('@napi-rs/canvas', () => ({
 }));
 
 import { ClaudeCliCallError } from '../common/services/claude-cli.service';
+import { AlertBotRepairService } from './alert-bot.repair.service';
 import { AlertBotTurns } from './alert-bot.turns';
 import { TurnInput } from './alert-bot.types';
 
@@ -38,7 +39,7 @@ describe('AlertBotTurns', () => {
   let store: Record<string, jest.Mock>;
   let telegram: Record<string, jest.Mock>;
   let ai: { answer: jest.Mock };
-  let repairs: { run: jest.Mock };
+  let repairs: { run: jest.Mock; findRepairByUpdate: jest.Mock };
   let status: { summary: jest.Mock };
   let chat: { beginStream: jest.Mock; endStream: jest.Mock };
   let support: { findTicketByPrefix: jest.Mock };
@@ -81,7 +82,7 @@ describe('AlertBotTurns', () => {
     ai = {
       answer: jest.fn().mockResolvedValue({ text: 'Всё спокойно', costUsd: 0.02, tools: ['health'] }),
     };
-    repairs = { run: jest.fn() };
+    repairs = { run: jest.fn(), findRepairByUpdate: jest.fn().mockResolvedValue(null) };
     status = { summary: jest.fn().mockResolvedValue('Алерты: горящих нет') };
     chat = { beginStream: jest.fn(), endStream: jest.fn() };
     support = { findTicketByPrefix: jest.fn().mockResolvedValue(null) };
@@ -221,6 +222,46 @@ describe('AlertBotTurns', () => {
     expect(repairs.run).not.toHaveBeenCalled();
     expect(ai.answer).not.toHaveBeenCalled();
     expect(telegram.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('resumeExisting восстанавливает repair по updateId и не оставляет requested до model_started_at', async () => {
+    const existing = {
+      id: 'turn-1', updateId: 1, chatId: '100', tgUserId: '200', adminUserId: 'admin-1',
+      questionMessageId: 300, question: 'Почини', parentTurnId: null, privateChat: true,
+      status: 'in_progress', answer: null, answerMessageIds: [], modelStartedAt: null,
+      placeholderMessageId: 901, placeholderStartedAt: new Date(),
+      deliveryStartedAt: null, deliveryCompletedAt: null,
+    };
+    const repair = {
+      id: 'repair-1', updateId: 1, turnId: null, chatId: '100', adminTgId: '200',
+      instruction: 'Почини', status: 'requested', failureKind: null, mutationCount: 0,
+      createdAt: new Date(), finishedAt: null,
+    };
+    store.admitTurn.mockResolvedValue({ status: 'existing', turn: existing });
+    store.findRepairByUpdate = jest.fn().mockResolvedValue(repair);
+    store.findRepair = jest.fn().mockResolvedValue(repair);
+    store.markRepairRunning = jest.fn().mockResolvedValue(true);
+    store.listJobs = jest.fn().mockResolvedValue([]);
+    store.finishRepair = jest.fn().mockResolvedValue(true);
+    const repairAi = {
+      repair: jest.fn().mockResolvedValue({ text: 'Готово', costUsd: 0.2, tools: ['repair_exec'], noCause: false }),
+    };
+    const repairService = new AlertBotRepairService(store as any, repairAi as any, {
+      stopRepair: jest.fn(), stopAll: jest.fn(),
+    } as any);
+    turns = new AlertBotTurns(
+      store as any, telegram as any, ai as any, status as any, chat as any, support as any, repairService,
+    );
+
+    await expect(turns.resumeExisting(existing as any)).resolves.toBe('accepted');
+
+    expect(store.findRepairByUpdate).toHaveBeenCalledWith(1);
+    expect(repairAi.repair).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'repair', repairId: 'repair-1', turnId: 'turn-1',
+    }));
+    expect(ai.answer).not.toHaveBeenCalled();
+    expect(store.finishRepair).toHaveBeenCalledWith('repair-1', 'unverified', 0);
+    expect(store.finishTurn).toHaveBeenCalledWith('turn-1', expect.objectContaining({ status: 'ok' }));
   });
 
   it('ищет не более десяти уникальных ticket-prefix candidates за ответ', async () => {

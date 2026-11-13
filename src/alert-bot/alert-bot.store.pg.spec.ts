@@ -128,6 +128,7 @@ maybe('хранилище бота алертов против PostgreSQL', () =
       { summary: jest.fn() } as any,
       { beginStream: jest.fn(), endStream: jest.fn() } as any,
       { findTicketByPrefix: jest.fn().mockResolvedValue(null) } as any,
+      { run: jest.fn(), findRepairByUpdate: jest.fn().mockResolvedValue(null) } as any,
     );
 
     await expect(turns.enqueue(input)).rejects.toMatchObject({ kind: 'send_failed' });
@@ -167,6 +168,7 @@ maybe('хранилище бота алертов против PostgreSQL', () =
       { summary: jest.fn() } as any,
       { beginStream: jest.fn(), endStream: jest.fn() } as any,
       { findTicketByPrefix: jest.fn().mockResolvedValue(null) } as any,
+      { run: jest.fn(), findRepairByUpdate: jest.fn().mockResolvedValue(null) } as any,
     );
 
     const first = (turns as any).enqueue(input, { draftId, claimVersion: 1 });

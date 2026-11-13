@@ -51,6 +51,7 @@ maybe('дurable retry обновлений бота алертов против 
       { summary: jest.fn().mockResolvedValue('Сводка') } as any,
       { beginStream: jest.fn(), endStream: jest.fn() } as any,
       { findTicketByPrefix: jest.fn().mockResolvedValue(null) } as any,
+      { run: jest.fn(), findRepairByUpdate: jest.fn().mockResolvedValue(null) } as any,
     );
     const service = new AlertBotService(
       { resolveTelegram: jest.fn().mockResolvedValue({ isAdmin: true, userId: 'admin-retry' }) } as any,

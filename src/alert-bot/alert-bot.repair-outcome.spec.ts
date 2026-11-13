@@ -22,7 +22,7 @@ describe('repair outcome', () => {
     { jobs: [exec('1'), verify('2', 1), verify('3')], model: 'completed' as const, status: 'verified' },
     { jobs: [exec('1', true, 'interrupted'), verify('2')], model: 'completed' as const, status: 'verified' },
     { jobs: [exec('1'), verify('2'), exec('3', false)], model: 'completed' as const, status: 'verified' },
-    { jobs: [exec('1', true, 'running')], model: 'cancelled' as const, status: 'cancelled' },
+    { jobs: [exec('1', true, 'running')], model: 'cancelled' as const, status: 'interrupted' },
   ])('$status', ({ jobs, model, status }) => {
     expect(deriveRepairOutcome(jobs, model).status).toBe(status);
   });
@@ -46,5 +46,11 @@ describe('repair outcome', () => {
     const failedExec = deriveRepairOutcome([exec('1', true, 'failed')], 'completed');
     expect(failedExec.mutationCount).toBe(1);
     expect(repairStatusText(failedExec.status, failedExec.mutationCount)).toBe('Не исправлено');
+  });
+
+  it('running remote job имеет приоритет над cancelled модели', () => {
+    const remote = { ...exec('1', true, 'running'), host: 'relay' };
+    expect(deriveRepairOutcome([remote], 'cancelled')).toEqual({ status: 'interrupted', mutationCount: 1 });
+    expect(deriveRepairOutcome([exec('1'), verify('2')], 'cancelled').status).toBe('cancelled');
   });
 });
