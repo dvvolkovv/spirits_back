@@ -16,6 +16,8 @@ type Mocks = {
   };
   repairStore: {
     migrate: jest.Mock<Promise<void>, []>;
+    interruptActive: jest.Mock<Promise<Array<{ id: string }>>, []>;
+    cleanup: jest.Mock<Promise<void>, []>;
   };
   ops: {
     start: jest.Mock<Promise<void>, []>;
@@ -41,6 +43,8 @@ function makeMocks(): Mocks {
     },
     repairStore: {
       migrate: jest.fn().mockResolvedValue(undefined),
+      interruptActive: jest.fn().mockResolvedValue([]),
+      cleanup: jest.fn().mockResolvedValue(undefined),
     },
     ops: {
       start: jest.fn().mockResolvedValue(undefined),
@@ -116,6 +120,10 @@ describe('AlertBotLifecycle', () => {
         { id: 'turn-2', chatId: 'chat-2', questionMessageId: 202 },
       ];
     });
+    mocks.repairStore.interruptActive.mockImplementation(async () => {
+      calls.push('repair.interrupt');
+      return [{ id: 'repair-1' }];
+    });
     mocks.ops.start.mockImplementation(async () => { calls.push('ops.start'); });
     mocks.store.requeueProcessingUpdates.mockImplementation(async () => { calls.push('requeue'); });
     sinkSpy.mockImplementation((sink) => { if (sink) calls.push('sink'); });
@@ -124,11 +132,13 @@ describe('AlertBotLifecycle', () => {
       return { message_id: 1 };
     });
     mocks.store.cleanup.mockImplementation(async () => { calls.push('cleanup'); });
+    mocks.repairStore.cleanup.mockImplementation(async () => { calls.push('repair.cleanup'); });
 
     await lifecycle.onModuleInit();
 
     expect(calls).toEqual([
-      'migrate', 'repair.migrate', 'ops.start', 'interrupt', 'requeue', 'sink', 'reply:chat-1', 'reply:chat-2', 'cleanup',
+      'migrate', 'repair.migrate', 'ops.start', 'interrupt', 'repair.interrupt',
+      'requeue', 'sink', 'reply:chat-1', 'reply:chat-2', 'cleanup', 'repair.cleanup',
     ]);
     expect(mocks.telegram.sendMessage).toHaveBeenNthCalledWith(1, 'chat-1', RESTART_REPLY, 101);
     expect(mocks.telegram.sendMessage).toHaveBeenNthCalledWith(2, 'chat-2', RESTART_REPLY, 202);
@@ -139,6 +149,18 @@ describe('AlertBotLifecycle', () => {
     expect(sink).not.toBeNull();
     await sink!('chat-1', 303, 'alert text');
     expect(mocks.store.recordAlert).toHaveBeenCalledWith('chat-1', 303, 'alert text');
+  });
+
+  it('periodic cleanup очищает и базовые turns, и terminal repairs', async () => {
+    enabled();
+    await lifecycle.onModuleInit();
+    expect(mocks.store.cleanup).toHaveBeenCalledTimes(1);
+    expect(mocks.repairStore.cleanup).toHaveBeenCalledTimes(1);
+
+    await jest.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+
+    expect(mocks.store.cleanup).toHaveBeenCalledTimes(2);
+    expect(mocks.repairStore.cleanup).toHaveBeenCalledTimes(2);
   });
 
   it('ошибка registerWebhook журналируется без сырого текста и не валит запуск', async () => {
@@ -172,7 +194,10 @@ describe('AlertBotLifecycle', () => {
     enabled();
     const calls: string[] = [];
     const turns = { idle: jest.fn(() => { calls.push('turns.idle'); return new Promise<void>(() => {}); }) };
-    const service = { retryFailedUpdates: jest.fn(), stopAdmission: jest.fn() };
+    const service = {
+      retryFailedUpdates: jest.fn(),
+      stopAdmission: jest.fn(() => { calls.push('admission.stop'); }),
+    };
     mocks.ops.stop.mockImplementation(async () => { calls.push('ops.stop'); });
     lifecycle = new (AlertBotLifecycle as any)(mocks.store, mocks.repairStore, mocks.ops, mocks.telegram, turns, service, mocks.pg);
     await lifecycle.onModuleInit();
@@ -183,7 +208,7 @@ describe('AlertBotLifecycle', () => {
     calls.push('pool.close');
     await lifecycle.onModuleDestroy();
 
-    expect(calls).toEqual(['turns.idle', 'ops.stop', 'pool.close']);
+    expect(calls).toEqual(['admission.stop', 'turns.idle', 'ops.stop', 'pool.close']);
     expect(mocks.ops.stop).toHaveBeenCalledTimes(1);
   });
 

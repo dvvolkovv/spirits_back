@@ -105,6 +105,15 @@ describe('Telegram бота алертов', () => {
     const methods = (axios.post as jest.Mock).mock.calls.map((c) => c[0].split('/').pop());
     expect(methods).toContain('setWebhook');
     expect(methods).toContain('setMyCommands');
+    const menus = (axios.post as jest.Mock).mock.calls
+      .filter(([url]) => String(url).endsWith('/setMyCommands'))
+      .map(([, payload]) => payload.commands);
+    expect(menus).toHaveLength(2);
+    for (const commands of menus) {
+      expect(commands.map(({ command }: { command: string }) => command)).toEqual([
+        'ask', 'status', 'close', 'fix', 'stop',
+      ]);
+    }
   });
   it('чужой адрес не перезаписывается', async () => {
     const tg = new AlertBotTelegram();
