@@ -202,6 +202,13 @@ export class ChatUploadsService {
     return rows.map((row) => this.row(row));
   }
 
+  /**
+   * Исходники пользователя для find_files (origin=upload). LIMIT 200 выбран
+   * согласованно с SEARCH_ROWS_LIMIT истории чата (chat-files.service.ts):
+   * столько же строк читает поиск по ответам ассистентов — 200 свежих
+   * загрузок с запасом покрывают реального пользователя, а конвейер find_files
+   * всё равно режет выдачу своим limit (≤30).
+   */
   async searchOriginals(userId: string, days?: number): Promise<ChatUploadRecord[]> {
     const { rows } = await this.pg.query(
       `SELECT ${COLUMNS} FROM chat_uploads

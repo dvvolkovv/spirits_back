@@ -100,40 +100,63 @@ export interface HumanLink {
 const MD_HTTP_RE = /\[([^\]]*)\]\(((?:[^()\n]|\([^()\n]*\))+)\)/g;
 const BARE_HTTP_RE = /https?:\/\/[^\s<>"]+/gi;
 
-function countChar(s: string, ch: string): number {
-  let n = 0;
-  for (const c of s) if (c === ch) n++;
-  return n;
-}
+/**
+ * Потолок длины адреса. Настоящие URL длиннее пары килобайт — редкость, а
+ * «ссылка» из мегабайта скобок — мусор или атака: без cap разбор хвоста
+ * держал бы event loop. Всё, что длиннее, ссылкой не считается.
+ */
+export const MAX_LINK_URL_CHARS = 2048;
+
+const TAIL_PUNCT = '.,;:!?…\'"»';
 
 /**
  * Хвостовая пунктуация и незакрытые обёртки в адрес не входят: «(https://x)»
  * или «https://x.» — это оформление сообщения. Парные скобки внутри адреса
  * сохраняются: «.../Файл_(формат)» — часть URL.
+ *
+ * Линейно: баланс скобок считается одним проходом, снятие хвоста идёт с конца
+ * с декрементом баланса. Пересчёт баланса на каждой итерации (прежняя версия)
+ * давал O(M²) — на сообщении из 100 тысяч «)» это были минуты блокировки
+ * общего прод-процесса на каждый find_files этого пользователя.
  */
 export function trimUrlTail(url: string): string {
-  let u = String(url ?? '').trim();
-  for (;;) {
-    const before = u;
-    u = u.replace(/[.,;:!?…'"»]+$/, '');
-    while (u.endsWith(')') && countChar(u, ')') > countChar(u, '(')) u = u.slice(0, -1);
-    while (u.endsWith(']') && countChar(u, ']') > countChar(u, '[')) u = u.slice(0, -1);
-    if (u === before) return u;
+  const u = String(url ?? '').trim();
+  let round = 0;
+  let square = 0;
+  for (const ch of u) {
+    if (ch === '(') round++;
+    else if (ch === ')') round--;
+    else if (ch === '[') square++;
+    else if (ch === ']') square--;
   }
+  let end = u.length;
+  while (end > 0) {
+    const ch = u[end - 1];
+    if (TAIL_PUNCT.includes(ch)) { end--; continue; }
+    if (ch === ')' && round < 0) { end--; round++; continue; }
+    if (ch === ']' && square < 0) { end--; square++; continue; }
+    break;
+  }
+  return u.slice(0, end);
 }
 
 /**
  * Внешние ссылки из сообщения человека (источник origin=link инструмента
  * find_files). Содержимое по ним НЕ скачивается — это только адрес. Внутренние
  * /webhook/chat-uploads/ исключены: исходники покрывает отдельный источник,
- * дубль показал бы пользователю служебный подписанный путь. Повтор адреса —
- * одна запись (первая, с подписью markdown, если она была).
+ * дубль показал бы пользователю служебный подписанный путь.
+ *
+ * Дедуп по адресу: внутри сообщения выигрывает первое вхождение (markdown-проход
+ * идёт раньше bare — если адрес был ссылкой с подписью, подпись сохранится);
+ * между сообщениями — самое свежее (строки истории идут от новых к старым,
+ * см. seenLinks в searchForUser).
  */
 export function extractHumanLinks(content: string): HumanLink[] {
   const text = stripCode(String(content ?? ''));
   const out: HumanLink[] = [];
   const seen = new Set<string>();
   const push = (rawUrl: string, label: string): void => {
+    if (rawUrl.length > MAX_LINK_URL_CHARS) return;
     // Хвост вида `url "title"` — заголовок markdown-ссылки, не часть адреса.
     const url = trimUrlTail(rawUrl.replace(/\s+"[^"]*"?\s*$/, ''));
     if (!/^https?:\/\/\S+$/i.test(url)) return;

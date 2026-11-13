@@ -6,6 +6,7 @@ import {
   FindFilesInput, assistantPart, extractHumanLinks, kindByMime,
   normalizeForSearch, plainNote, queryWords, scoreFile,
 } from './find-files';
+import { safeFileName } from './file-meta';
 import { thumbPathFor } from './thumbnails';
 
 /**
@@ -53,6 +54,20 @@ export const SESSION_FILES_SQL = `SELECT id, content, created_at FROM custom_cha
 export const SEARCH_ROWS_LIMIT = 5000;
 
 /**
+ * Защитный потолок разбора человеческого сообщения со ссылками: контент
+ * режется до extractHumanLinks. Сообщение любой длины лежит в истории
+ * легально, но разбор мегабайтов на каждый find_files — блокировка общего
+ * процесса; 64 КБ с запасом покрывают реальное сообщение со ссылками.
+ */
+export const LINK_CONTENT_MAX_CHARS = 65_536;
+
+/**
+ * Часть сообщения, которую link-кандидат несёт в скоринг и note: note всё
+ * равно режется до 200 знаков (plainNote), а слова запроса ищутся в начале.
+ */
+export const LINK_TEXT_MAX_CHARS = 4_096;
+
+/**
  * Все переписки пользователя, включая «Чистый лист». `_` в LIKE экранирован:
  * без этого `7903016918_%` захватил бы и переписку номера 79030169187.
  */
@@ -92,8 +107,10 @@ export interface FoundForTool {
   url?: string;
   /**
    * Подписанный короткоживущий адрес для чтения исходника САМОЙ моделью
-   * (chat-uploads assistantUrl). Пользователю не показывается и в логи не
-   * пишется: это capability-ссылка на чужие байты без входа.
+   * (chat-uploads assistantUrl): capability-ссылка на байты без входа.
+   * Пользователю не показывается; в наши логи и телеметрию не пишется.
+   * Вывод модели серверно не фильтруется — защита промптовая, как у
+   * assistantBlock в chat-uploads.service.ts.
    */
   assistantUrl?: string;
   stored: boolean;
@@ -284,7 +301,10 @@ export class ChatFilesService {
       candidates.push({
         origin: 'upload',
         kind: kindByMime(rec.mime, rec.originalName),
-        name: rec.originalName,
+        // Имя из multipart враждебно так же, как остальной пользовательский
+        // ввод: safeFileName снимает управляющие, невидимые (RLO) и служебные
+        // символы — как в storageKey при сохранении исходника.
+        name: safeFileName(rec.originalName),
         createdAt: rec.createdAt,
         sessionId: rec.sessionId,
         text: '',
@@ -297,8 +317,10 @@ export class ChatFilesService {
     for (const row of linksRes.rows) {
       const createdAt = new Date(row.created_at).toISOString();
       const sessionId = String(row.session_id ?? '');
-      const text = String(row.content ?? '');
-      for (const link of extractHumanLinks(text)) {
+      // Потолок разбора — до extractHumanLinks; в кандидатах ещё короче:
+      // скоринг и note не нуждаются в мегабайтах.
+      const content = String(row.content ?? '').slice(0, LINK_CONTENT_MAX_CHARS);
+      for (const link of extractHumanLinks(content)) {
         // Повтор адреса в разных сообщениях — одна запись, самая свежая
         // (строки уже отсортированы от новых к старым).
         if (seenLinks.has(link.url)) continue;
@@ -309,7 +331,7 @@ export class ChatFilesService {
           name: link.text || link.url,
           createdAt,
           sessionId,
-          text,
+          text: content.slice(0, LINK_TEXT_MAX_CHARS),
           url: link.url,
           stored: true,
         });
