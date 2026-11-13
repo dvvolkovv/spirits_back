@@ -174,6 +174,10 @@ describe('streamUniversalAgent: память последних загрузок
     expect(fields.message).toContain('Earlier user uploads');
     expect(fields.message).toContain('a.pdf');
     expect(fields.message).toContain('sig=');
+    // I2 (ревью): блок модель видит каждый ход — заголовок обязан запрещать
+    // показ подписанного адреса пользователю: ссылка осядет в истории и
+    // протухнет через час. Файл пользователю — только через url из find_files.
+    expect(fields.message).toContain('NEVER show');
     // Подписанная ссылка — только в пер-ходовой части, не в системном промпте.
     expect(fields.systemPrompt || '').not.toContain('sig=');
     expect(fields.systemPrompt || '').not.toContain('Earlier user uploads');

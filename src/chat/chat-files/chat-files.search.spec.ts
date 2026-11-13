@@ -56,7 +56,8 @@ function makePg(opts: { uploads?: any[]; links?: any[] } = {}) {
 
 // assistantUrl подписывается JWT_SECRET и строится от BACKEND_URL — сохраняем
 // и возвращаем окружение, чтобы тесты не протекали в соседние файлы воркера.
-const ENV_KEYS = ['JWT_SECRET', 'BACKEND_URL', 'MINIO_PUBLIC_URL'];
+// CHAT_UPLOADS_ENABLED — гейт источников upload/link в searchForUser.
+const ENV_KEYS = ['JWT_SECRET', 'BACKEND_URL', 'MINIO_PUBLIC_URL', 'CHAT_UPLOADS_ENABLED'];
 const savedEnv: Record<string, string | undefined> = {};
 beforeAll(() => {
   for (const key of ENV_KEYS) savedEnv[key] = process.env[key];
@@ -73,6 +74,7 @@ beforeEach(() => {
   delete process.env.AGENT_URL;
   delete process.env.BACKEND_URL;
   process.env.JWT_SECRET = 'spec-secret';
+  process.env.CHAT_UPLOADS_ENABLED = 'true';
 });
 
 // Шпионы (fetch и прочие) снимаем здесь, а не в тесте: при упавшем assert
@@ -255,5 +257,30 @@ describe('searchForUser: три источника — один конвейер
     expect(roman.r.files.map((f) => f.origin)).toEqual(['upload', 'assistant']);
     const irina = await search({ assistant: 'ирина' }, { uploads: UPLOAD_ROWS, links: LINK_ROWS });
     expect(irina.r.files.map((f) => f.origin)).toEqual(['link', 'assistant', 'assistant']);
+  });
+});
+
+describe('searchForUser: гейт по флагу CHAT_UPLOADS_ENABLED', () => {
+  it('флаг не выставлен — реестр и ссылки не опрашиваются, выдача только assistant', async () => {
+    delete process.env.CHAT_UPLOADS_ENABLED;
+    // Шпион на прототипе: настоящий ChatUploadsService создаётся внутри search(),
+    // поэтому «реестр не опрашивался» ловится только на уровне класса.
+    const searchOriginals = jest.spyOn(ChatUploadsService.prototype, 'searchOriginals');
+    const { r, pg } = await search({}, { uploads: UPLOAD_ROWS, links: LINK_ROWS });
+
+    expect(searchOriginals).not.toHaveBeenCalled();
+    expect(pg.calls.some((c) => c.sql === USER_LINKS_SQL)).toBe(false);
+    expect(pg.calls.some((c) => /FROM chat_uploads/.test(c.sql))).toBe(false);
+    // Поведение ровно как до фичи: файлы ассистентов читаются и возвращаются.
+    expect(pg.calls[0].sql).toBe(USER_FILES_SQL);
+    expect(r.total).toBe(4);
+    expect(r.files.every((f) => f.origin === 'assistant')).toBe(true);
+    expect(r.files.some((f) => f.assistantUrl !== undefined)).toBe(false);
+  });
+
+  it('флаг true — все три источника в выдаче', async () => {
+    process.env.CHAT_UPLOADS_ENABLED = 'true';
+    const { r } = await search({}, { uploads: UPLOAD_ROWS, links: LINK_ROWS });
+    expect(new Set(r.files.map((f) => f.origin))).toEqual(new Set(['assistant', 'upload', 'link']));
   });
 });

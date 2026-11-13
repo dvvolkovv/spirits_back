@@ -83,6 +83,10 @@ describe('ChatUploadsService', () => {
     // знать, что ссылка живёт около часа.
     expect(block).toContain('1 hour');
     expect(block).toMatch(/ONLY the (LATEST|latest)/);
+    // I2 (ревью): явный запрет в заголовке — подписанный адрес только для
+    // модели; пользователю файл отдаётся через url из find_files.
+    expect(block).toContain('NEVER show');
+    expect(block).toContain('find_files');
   });
 
   it('searchOriginals ограничивает выдачу 200 строками', async () => {
