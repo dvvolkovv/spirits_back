@@ -27,6 +27,7 @@ maybe('дurable retry обновлений бота алертов против 
     await admin.query(`CREATE SCHEMA ${SCHEMA}`);
     pool = new Pool({ connectionString: PG, max: 4, options: `-c search_path=${SCHEMA}` });
     await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', '001_alert_bot.sql'), 'utf8'));
+    await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', '002_alert_bot_repair.sql'), 'utf8'));
     store = new AlertBotStore({
       query: (text: string, params?: any[]) => pool.query(text, params),
       getClient: () => pool.connect(),

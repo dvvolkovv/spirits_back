@@ -54,6 +54,7 @@ maybe('callback черновика с lease против PostgreSQL', () => {
     } as any;
     store = new AlertBotStore(pg);
     await store.migrate();
+    await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', '002_alert_bot_repair.sql'), 'utf8'));
     support = new SupportService(pg);
     email = jest.spyOn(support, 'notifyOwnerReplyByEmail').mockResolvedValue({ sent: true });
     drafts = new AlertBotDrafts(store, support, telegram as any);

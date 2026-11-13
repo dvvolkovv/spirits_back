@@ -28,6 +28,7 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
     await admin.query(`CREATE SCHEMA ${SCHEMA}`);
     pool = new Pool({ connectionString: PG, max: 4, options: `-c search_path=${SCHEMA}` });
     await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', '001_alert_bot.sql'), 'utf8'));
+    await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', '002_alert_bot_repair.sql'), 'utf8'));
     store = new AlertBotStore({
       query: (text: string, params?: any[]) => pool.query(text, params),
       getClient: () => pool.connect(),
@@ -118,6 +119,29 @@ maybe('state-aware recovery бота алертов против PostgreSQL', ()
       [updateId],
     );
   }
+
+  it('parentless reply recovery сохраняет и возвращает replied diagnosis', async () => {
+    const aiAnswer = jest.fn().mockResolvedValue({ text: 'Исправлено', costUsd: 0, tools: [] });
+    const telegram = telegramMock();
+    const { turns } = makeService(telegram, aiAnswer);
+    const input = {
+      updateId: 92050, chatId: '100', tgUserId: '200', adminUserId: 'admin-reply-recovery',
+      questionMessageId: 10, question: 'Почини', replyText: 'Подтверждённый диагноз',
+      parentTurnId: null, privateChat: true,
+    };
+    await store.createTurn(input);
+    const admitted = await store.admitTurn(input, 30);
+    if (admitted.status !== 'existing') throw new Error('turn must already exist');
+
+    await expect(turns.resumeExisting(admitted.turn)).resolves.toBe('accepted');
+
+    expect(aiAnswer).toHaveBeenCalledWith(expect.objectContaining({
+      parentTurnId: null, replyText: 'Подтверждённый диагноз',
+    }));
+    expect((await pool.query(
+      'SELECT reply_text FROM alert_bot_turns WHERE update_id = $1', [input.updateId],
+    )).rows[0]).toEqual({ reply_text: 'Подтверждённый диагноз' });
+  });
 
   it('сбой placeholder до модели оставляет durable retry и не завершает update', async () => {
     const aiAnswer = jest.fn().mockResolvedValue({ text: 'Ответ', costUsd: 0, tools: [] });

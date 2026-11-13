@@ -160,6 +160,7 @@ describe('AlertBotRepairService', () => {
   });
 
   it('late stop после AI success не позволяет verified перекрыть cancel_requested', async () => {
+    await service.stop('100', '200');
     store.findRepair
       .mockResolvedValueOnce(repair())
       .mockResolvedValueOnce(repair('running'))
@@ -175,7 +176,23 @@ describe('AlertBotRepairService', () => {
     expect(result.text).not.toContain('Исправлено и проверено');
   });
 
+  it('внутренний cancel_requested после AI означает interrupted, а не admin cancel', async () => {
+    store.findRepair
+      .mockResolvedValueOnce(repair())
+      .mockResolvedValueOnce(repair('running'))
+      .mockResolvedValueOnce(repair('cancel_requested'));
+    store.listJobs.mockResolvedValue([job(1, 'exec', true), job(2, 'verify', false)]);
+
+    const result = await service.run(REPAIR_ID, TURN_ID, input());
+
+    expect(ai.repair).toHaveBeenCalledTimes(1);
+    expect(store.finishRepair).toHaveBeenCalledWith(REPAIR_ID, 'interrupted', 1);
+    expect(result.text).toContain('Исход неизвестен: исправление прервано');
+    expect(result.text).not.toContain('остановлено админом');
+  });
+
   it('stop между derive и finish повторно вычисляет cancelled вместо потерянного verified', async () => {
+    await service.stop('100', '200');
     store.findRepair
       .mockResolvedValueOnce(repair())
       .mockResolvedValueOnce(repair('running'))
@@ -232,6 +249,52 @@ describe('AlertBotRepairService', () => {
     expect(store.finishRepair).toHaveBeenCalledWith(REPAIR_ID, 'cancelled', 0);
   });
 
+  it('admin cancel повторно ждёт local stopRepair перед snapshot и получает cancelled', async () => {
+    const started = deferred();
+    ai.repair.mockImplementation((call: { signal: AbortSignal }) => {
+      started.resolve();
+      return new Promise((_, reject) => {
+        call.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { kind: 'aborted' })), { once: true });
+      });
+    });
+    store.listJobs.mockImplementation(() => {
+      const closed = executor.stopRepair.mock.calls.length >= 2;
+      return [{
+        ...job(1, 'exec', true), host: 'prod',
+        status: closed ? 'cancelled' : 'running', exitCode: null,
+      }];
+    });
+    const running = service.run(REPAIR_ID, TURN_ID, input());
+    await started.promise;
+
+    await service.stop('100', '200');
+    const result = await running;
+
+    expect(executor.stopRepair).toHaveBeenCalledTimes(2);
+    expect(store.finishRepair).toHaveBeenCalledWith(REPAIR_ID, 'cancelled', 1);
+    expect(result.text).toContain('Исправление остановлено админом');
+  });
+
+  it('admin cancel не ждёт remote close и running remote остаётся interrupted', async () => {
+    const started = deferred();
+    ai.repair.mockImplementation((call: { signal: AbortSignal }) => {
+      started.resolve();
+      return new Promise((_, reject) => {
+        call.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { kind: 'aborted' })), { once: true });
+      });
+    });
+    store.listJobs.mockResolvedValue([{ ...job(1, 'exec', true), host: 'relay', status: 'running', exitCode: null }]);
+    const running = service.run(REPAIR_ID, TURN_ID, input());
+    await started.promise;
+
+    await service.stop('100', '200');
+    const result = await running;
+
+    expect(executor.stopRepair).toHaveBeenCalledTimes(2);
+    expect(store.finishRepair).toHaveBeenCalledWith(REPAIR_ID, 'interrupted', 1);
+    expect(result.text).toContain('Исход неизвестен: исправление прервано');
+  });
+
   it('/stop не даёт non-admin вызвать mutation', async () => {
     await expect(service.stop('100', '999')).resolves.toBe('Доступ только для администраторов');
 
@@ -260,20 +323,53 @@ describe('AlertBotRepairService', () => {
     expect(executor.stopRepair).not.toHaveBeenCalled();
   });
 
-  it('cancel_requested до run не вызывает AI и фиксирует cancelled', async () => {
+  it('/stop при requestCancel=false и cancel_requested всё равно abort-ит живой AI', async () => {
+    const started = deferred();
+    let signal: AbortSignal | undefined;
+    let rejectAi!: (reason: unknown) => void;
+    ai.repair.mockImplementation((call: { signal: AbortSignal }) => {
+      signal = call.signal;
+      started.resolve();
+      return new Promise((_, reject) => {
+        rejectAi = reject;
+        call.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { kind: 'aborted' })), { once: true });
+      });
+    });
+    store.requestCancel.mockResolvedValue(false);
+    store.findRepair
+      .mockResolvedValueOnce(repair())
+      .mockResolvedValueOnce(repair('running'))
+      .mockResolvedValue(repair('cancel_requested'));
+    const running = service.run(REPAIR_ID, TURN_ID, input());
+    await started.promise;
+
+    await expect(service.stop('100', '200')).resolves.toBe('Исправление останавливается');
+    const aborted = Boolean(signal?.aborted);
+    if (!aborted) {
+      rejectAi(new Error('cleanup after red'));
+      await running;
+    }
+    expect(aborted).toBe(true);
+    if (aborted) await expect(running).resolves.toMatchObject({ turnStatus: 'error' });
+    expect(executor.stopRepair).toHaveBeenCalledWith(REPAIR_ID);
+    expect(store.finishRepair).toHaveBeenCalledWith(REPAIR_ID, 'cancelled', 0);
+  });
+
+  it('внутренний cancel_requested до run не вызывает AI и фиксирует interrupted', async () => {
     store.findRepair.mockResolvedValue(repair('cancel_requested'));
 
     const result = await service.run(REPAIR_ID, TURN_ID, input());
 
     expect(ai.repair).not.toHaveBeenCalled();
     expect(store.markRepairRunning).not.toHaveBeenCalled();
-    expect(store.finishRepair).toHaveBeenCalledWith(REPAIR_ID, 'cancelled', 0);
+    expect(store.finishRepair).toHaveBeenCalledWith(REPAIR_ID, 'interrupted', 0);
     expect(result).toEqual({
-      text: 'Исправление остановлено админом', costUsd: 0, tools: [], turnStatus: 'error',
+      text: 'Исход неизвестен: исправление прервано', costUsd: 0, tools: [], turnStatus: 'error',
     });
   });
 
   it('stop до attach: markRepairRunning=false перечитывает cancel_requested и завершает turn result', async () => {
+    await service.stop('100', '200');
     store.findRepair
       .mockResolvedValueOnce(repair())
       .mockResolvedValueOnce(repair('cancel_requested'));
@@ -287,6 +383,7 @@ describe('AlertBotRepairService', () => {
   });
 
   it('stop после attach отменяет controller и завершает cancelled до AI', async () => {
+    await service.stop('100', '200');
     const abort = jest.spyOn(AbortController.prototype, 'abort');
     store.findRepair
       .mockResolvedValueOnce(repair())
@@ -316,6 +413,42 @@ describe('AlertBotRepairService', () => {
 
     expect(ai.repair).not.toHaveBeenCalled();
     expect(store.finishRepair).not.toHaveBeenCalled();
+  });
+
+  it('stopAll во время начального findRepair не запускает AI и завершает interrupted', async () => {
+    const initial = deferred<RepairRecord>();
+    store.findRepair
+      .mockImplementationOnce(() => initial.promise)
+      .mockResolvedValue(repair('running'));
+    const running = service.run(REPAIR_ID, TURN_ID, input());
+    expect(store.findRepair).toHaveBeenCalledTimes(1);
+
+    await service.stopAll();
+    initial.resolve(repair());
+    const result = await running;
+
+    expect(ai.repair).not.toHaveBeenCalled();
+    expect(store.finishRepair).toHaveBeenCalledWith(REPAIR_ID, 'interrupted', 0);
+    expect(result.text).toContain('Исход неизвестен: исправление прервано');
+  });
+
+  it('stopAll перед derive не даёт verified после уже завершённого AI', async () => {
+    const jobs = deferred<RepairJobRecord[]>();
+    const listed = deferred();
+    store.listJobs.mockImplementation(() => {
+      listed.resolve();
+      return jobs.promise;
+    });
+    const running = service.run(REPAIR_ID, TURN_ID, input());
+    await listed.promise;
+
+    await service.stopAll();
+    jobs.resolve([job(1, 'exec', true), job(2, 'verify', false)]);
+    const result = await running;
+
+    expect(ai.repair).toHaveBeenCalledTimes(1);
+    expect(store.finishRepair).toHaveBeenCalledWith(REPAIR_ID, 'interrupted', 1);
+    expect(result.text).not.toContain('Исправлено и проверено');
   });
 
   it('stopAll означает shutdown interrupted, а не отмену админом', async () => {

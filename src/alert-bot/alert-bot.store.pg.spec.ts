@@ -32,6 +32,7 @@ maybe('хранилище бота алертов против PostgreSQL', () =
       getClient: () => pool.connect(),
     } as any);
     await store.migrate();
+    await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', '002_alert_bot_repair.sql'), 'utf8'));
   });
   afterAll(async () => {
     await pool?.end();
@@ -97,6 +98,36 @@ maybe('хранилище бота алертов против PostgreSQL', () =
     expect(await store.countRecentTurns('u-admin')).toBe(1);
     expect((await store.recentTurns('1', 3, 30))[0].answer).toBe('ничего');
   });
+  it('reply_text сохраняется через createTurn, admitTurn, draft admission и system turn', async () => {
+    const base = {
+      chatId: 'reply-persist', tgUserId: '111', adminUserId: 'u-reply-persist',
+      questionMessageId: 10, question: 'Почини', privateChat: true,
+    };
+    await store.createTurn({ ...base, updateId: 1080, replyText: 'create diagnosis' });
+    await store.admitTurn({ ...base, updateId: 1081, replyText: 'admit diagnosis' }, 30);
+    await store.recordSystemTurn({ ...base, updateId: 1082, replyText: 'system diagnosis' }, 'busy');
+    const draftId = await store.createDraft({
+      chatId: base.chatId, tgUserId: base.tgUserId, adminUserId: base.adminUserId,
+      ticketId: '11111111-1111-4111-8111-111111111111', text: 'черновик', promptMessageId: 20,
+    });
+    expect(await store.claimDraft(draftId, 'asking')).toEqual({ status: 'claimed', version: 1 });
+    await (store as any).admitDraftQuestion({
+      draftId, claimVersion: 1,
+      input: { ...base, updateId: 1083, replyText: 'draft diagnosis' }, maxPerHour: 30,
+    });
+
+    const rows = await pool.query(
+      'SELECT update_id, reply_text FROM alert_bot_turns WHERE update_id = ANY($1::bigint[]) ORDER BY update_id',
+      [[1080, 1081, 1082, 1083]],
+    );
+    expect(rows.rows).toEqual([
+      { update_id: '1080', reply_text: 'create diagnosis' },
+      { update_id: '1081', reply_text: 'admit diagnosis' },
+      { update_id: '1082', reply_text: 'system diagnosis' },
+      { update_id: '1083', reply_text: 'draft diagnosis' },
+    ]);
+  });
+
   it('сохраняет первый и все continuation ID, reply ко второму chunk находит родителя', async () => {
     const id = await store.createTurn({ updateId: 1050, chatId: 'chunks', tgUserId: '111', adminUserId: 'u-chunks', questionMessageId: 10, question: 'длинный ответ', privateChat: true });
 

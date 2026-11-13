@@ -227,7 +227,7 @@ describe('AlertBotTurns', () => {
   it('resumeExisting восстанавливает repair по updateId и не оставляет requested до model_started_at', async () => {
     const existing = {
       id: 'turn-1', updateId: 1, chatId: '100', tgUserId: '200', adminUserId: 'admin-1',
-      questionMessageId: 300, question: 'Почини', parentTurnId: null, privateChat: true,
+      questionMessageId: 300, question: 'Почини', replyText: 'Родной диагноз', parentTurnId: null, privateChat: true,
       status: 'in_progress', answer: null, answerMessageIds: [], modelStartedAt: null,
       placeholderMessageId: 901, placeholderStartedAt: new Date(),
       deliveryStartedAt: null, deliveryCompletedAt: null,
@@ -257,11 +257,41 @@ describe('AlertBotTurns', () => {
 
     expect(store.findRepairByUpdate).toHaveBeenCalledWith(1);
     expect(repairAi.repair).toHaveBeenCalledWith(expect.objectContaining({
-      mode: 'repair', repairId: 'repair-1', turnId: 'turn-1',
+      mode: 'repair', repairId: 'repair-1', turnId: 'turn-1', replyText: 'Родной диагноз',
     }));
     expect(ai.answer).not.toHaveBeenCalled();
     expect(store.finishRepair).toHaveBeenCalledWith('repair-1', 'unverified', 0);
     expect(store.finishTurn).toHaveBeenCalledWith('turn-1', expect.objectContaining({ status: 'ok' }));
+  });
+
+  it('delayed repair lookup не меняет порядок recovery в очереди чата и не вызывает ai.answer', async () => {
+    const recoveryTurn = (updateId: number) => ({
+      id: `turn-${updateId}`, updateId, chatId: '100', tgUserId: '200', adminUserId: 'admin-1',
+      questionMessageId: 300 + updateId, question: `Почини ${updateId}`, replyText: `Диагноз ${updateId}`,
+      parentTurnId: null, privateChat: true, status: 'in_progress', answer: null, answerMessageIds: [],
+      modelStartedAt: null, placeholderMessageId: 901, placeholderStartedAt: new Date(),
+      deliveryStartedAt: null, deliveryCompletedAt: null,
+    });
+    const firstTurn = recoveryTurn(1);
+    const secondTurn = recoveryTurn(2);
+    const firstLookup = deferred<{ id: string }>();
+    repairs.findRepairByUpdate.mockImplementation((updateId: number) => (
+      updateId === 1 ? firstLookup.promise : Promise.resolve({ id: 'repair-2' })
+    ));
+    repairs.run.mockResolvedValue({ text: 'Готово', costUsd: 0, tools: [], turnStatus: 'ok' });
+    store.admitTurn.mockImplementation(async (input: TurnInput) => ({
+      status: 'existing', turn: input.updateId === 1 ? firstTurn : secondTurn,
+    }));
+
+    const first = turns.resumeExisting(firstTurn as any);
+    const second = turns.resumeExisting(secondTurn as any);
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+    firstLookup.resolve({ id: 'repair-1' });
+    await expect(Promise.all([first, second])).resolves.toEqual(['accepted', 'accepted']);
+
+    expect(repairs.run.mock.calls.map((call) => call[0])).toEqual(['repair-1', 'repair-2']);
+    expect(repairs.findRepairByUpdate.mock.calls.map((call) => call[0])).toEqual([1, 2]);
+    expect(ai.answer).not.toHaveBeenCalled();
   });
 
   it('ищет не более десяти уникальных ticket-prefix candidates за ответ', async () => {
