@@ -388,7 +388,8 @@ export class TurnsService implements OnModuleInit, OnModuleDestroy {
     try {
       const r = await this.pg.query(
         `INSERT INTO product_turns (product_id, user_id, channel, prompt, revert_to_sha, status)
-         SELECT * FROM (VALUES ($1, $2, $3, $4, $5, 'queued')) AS draft
+         SELECT draft.product_id::uuid,draft.user_id,draft.channel,draft.prompt,draft.revert_to_sha,draft.status
+           FROM (VALUES ($1, $2, $3, $4, $5, 'queued')) AS draft
            (product_id, user_id, channel, prompt, revert_to_sha, status)
          WHERE EXISTS (
            SELECT 1 FROM products p
