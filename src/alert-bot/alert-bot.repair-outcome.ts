@@ -12,13 +12,17 @@ export interface RepairOutcomeJob {
 
 export function deriveRepairOutcome(jobs: RepairOutcomeJob[], model: RepairModelOutcome): { status: RepairFinalStatus; mutationCount: number } {
   const ordered = [...jobs].sort((a, b) => a.sequence - b.sequence);
-  const mutationCount = ordered.filter((job) => job.kind === 'exec' && job.mutates).length;
-  const lastMutation = ordered.map((job) => job.kind === 'exec' && job.mutates ? job.sequence : 0).reduce((a, b) => Math.max(a, b), 0);
+  // Флаг mutates задаёт модель, поэтому он не является основанием для исхода и
+  // остаётся в журнале информационным: verified требует успешного verify после
+  // последнего exec ЛЮБОГО вида, а mutationCount считает все exec jobs —
+  // «исправление не потребовалось» только когда exec не было вовсе.
+  const mutationCount = ordered.filter((job) => job.kind === 'exec').length;
+  const lastExec = ordered.map((job) => job.kind === 'exec' ? job.sequence : 0).reduce((a, b) => Math.max(a, b), 0);
   const lastSuccessfulVerification = ordered.map((job) => job.kind === 'verify' && job.status === 'succeeded' && job.exitCode === 0 ? job.sequence : 0).reduce((a, b) => Math.max(a, b), 0);
   const lastUnsuccessfulJob = ordered.map((job) => job.status === 'failed' || job.status === 'timeout' || job.status === 'cancelled' || job.status === 'interrupted' ? job.sequence : 0).reduce((a, b) => Math.max(a, b), 0);
   const hasNonTerminalJobs = ordered.some((job) => job.status === 'queued' || job.status === 'running');
   const hasInterruptedJobs = ordered.some((job) => job.status === 'interrupted');
-  const verified = lastSuccessfulVerification > lastMutation && lastSuccessfulVerification > lastUnsuccessfulJob;
+  const verified = lastSuccessfulVerification > lastExec && lastSuccessfulVerification > lastUnsuccessfulJob;
 
   if (hasNonTerminalJobs) return { status: 'interrupted', mutationCount };
   if (model === 'cancelled' && hasInterruptedJobs) return { status: 'interrupted', mutationCount };
