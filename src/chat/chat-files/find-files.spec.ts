@@ -1,5 +1,5 @@
 import {
-  FIND_FILES_DEFAULT_LIMIT, assistantPart, extractHumanLinks, kindByMime, normalizeForSearch, parseFindFilesInput, plainNote, queryWords, scoreFile,
+  FIND_FILES_DEFAULT_LIMIT, assistantPart, extractHumanLinks, kindByMime, normalizeForSearch, parseFindFilesInput, plainNote, queryWords, scoreFile, trimUrlTail,
 } from './find-files';
 
 describe('parseFindFilesInput', () => {
@@ -85,5 +85,25 @@ describe('extractHumanLinks', () => {
 
   it('внутренние /webhook/chat-uploads/ исключены: их покрывает источник исходников', () => {
     expect(extractHumanLinks('файл https://my.linkeon.io/webhook/chat-uploads/11111111-1111-4111-8111-111111111111 тут')).toEqual([]);
+  });
+});
+
+describe('trimUrlTail и cap — защита от квадратичной бомбы', () => {
+  it('100 тысяч закрывающих скобок снимаются линейно, быстрее секунды', () => {
+    const url = 'http://x' + ')'.repeat(100_000);
+    const t0 = Date.now();
+    expect(trimUrlTail(url)).toBe('http://x');
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  it('мусор длиннее cap не становится ссылкой — сообщение с ним не вешает поиск', () => {
+    expect(extractHumanLinks('http://x' + ')'.repeat(5000))).toEqual([]);
+  });
+
+  it('cap не ломает легитимные длинные адреса: query, fragment, парные скобки', () => {
+    const long = 'https://example.com/p?q=' + 'a'.repeat(300) + '#frag';
+    expect(extractHumanLinks(`смотри ${long} здесь`)[0].url).toBe(long);
+    expect(extractHumanLinks('https://ru.wikipedia.org/wiki/Файл_(формат)?oldid=123456#Ссылки')[0].url)
+      .toBe('https://ru.wikipedia.org/wiki/Файл_(формат)?oldid=123456#Ссылки');
   });
 });

@@ -56,12 +56,13 @@ function makePg(opts: { uploads?: any[]; links?: any[] } = {}) {
 
 // assistantUrl подписывается JWT_SECRET и строится от BACKEND_URL — сохраняем
 // и возвращаем окружение, чтобы тесты не протекали в соседние файлы воркера.
+const ENV_KEYS = ['JWT_SECRET', 'BACKEND_URL', 'MINIO_PUBLIC_URL'];
 const savedEnv: Record<string, string | undefined> = {};
 beforeAll(() => {
-  for (const key of ['JWT_SECRET', 'BACKEND_URL']) savedEnv[key] = process.env[key];
+  for (const key of ENV_KEYS) savedEnv[key] = process.env[key];
 });
 afterAll(() => {
-  for (const key of ['JWT_SECRET', 'BACKEND_URL']) {
+  for (const key of ENV_KEYS) {
     if (savedEnv[key] === undefined) delete process.env[key];
     else process.env[key] = savedEnv[key] as string;
   }
@@ -72,6 +73,12 @@ beforeEach(() => {
   delete process.env.AGENT_URL;
   delete process.env.BACKEND_URL;
   process.env.JWT_SECRET = 'spec-secret';
+});
+
+// Шпионы (fetch и прочие) снимаем здесь, а не в тесте: при упавшем assert
+// они не должны утекать в следующие тесты файла.
+afterEach(() => {
+  jest.restoreAllMocks();
 });
 
 const search = async (raw: any, data: { uploads?: any[]; links?: any[] } = {}) => {
@@ -155,6 +162,19 @@ describe('searchForUser: исходные загрузки пользовате�
     const { pg } = await search({ days: 30 }, { uploads: UPLOAD_ROWS });
     expect(pg.calls.find((c) => /FROM chat_uploads/.test(c.sql))!.params).toEqual(['u1', 30]);
   });
+
+  it('имя исходника санитизируется: управляющие, невидимые символы и перевод строки не проходят', async () => {
+    const evil = {
+      ...UPLOAD_ROWS[0],
+      id: '22222222-2222-4222-8222-222222222222',
+      // «](» — разводка markdown-ссылки, RLO U+202E (переворачивает хвост имени), \n — разрыв строки
+      original_name: `a](b${String.fromCharCode(0x202e)}c\nd.png`,
+      created_at: '2026-10-09T10:00:00Z',
+    };
+    const { r } = await search({}, { uploads: [evil] });
+    const upload = r.files.find((f) => f.origin === 'upload')!;
+    expect(upload.name).toBe('a](bcd.png');
+  });
 });
 
 describe('searchForUser: внешние ссылки из человеческих сообщений', () => {
@@ -164,7 +184,6 @@ describe('searchForUser: внешние ссылки из человечески
     expect(r.files[0]).toMatchObject({ kind: 'link', origin: 'link', url: 'https://example.com/a.pdf', stored: true });
     expect(r.files[0].note).toBe('Глянь отчёт — там цифры');
     expect(fetchMock).not.toHaveBeenCalled();
-    fetchMock.mockRestore();
   });
 
   it('USER_LINKS_SQL — та же область сессий, человеческие сообщения, фильтр дней', () => {
@@ -184,6 +203,28 @@ describe('searchForUser: внешние ссылки из человечески
   it('kind=link оставляет только внешние ссылки', async () => {
     const { r } = await search({ kind: 'link' }, { uploads: UPLOAD_ROWS, links: LINK_ROWS });
     expect(r.files.map((f) => [f.origin, f.url])).toEqual([['link', 'https://example.com/a.pdf']]);
+  });
+
+  it('один адрес в разных сообщениях — одна запись, самая свежая', async () => {
+    const { r } = await search({}, {
+      links: [
+        { id: 10, session_id: 'u1_12', content: 'свежая https://example.com/a.pdf', created_at: '2026-10-07T10:00:00Z' },
+        { id: 6, session_id: 'u1_12', content: 'старая https://example.com/a.pdf', created_at: '2026-10-01T10:00:00Z' },
+      ],
+    });
+    const links = r.files.filter((f) => f.origin === 'link');
+    expect(links).toHaveLength(1);
+    expect(links[0]).toMatchObject({ date: '2026-10-07', note: 'свежая' });
+  });
+
+  it('гигантское человеческое сообщение не вешает поиск: контент режется до разбора', async () => {
+    const huge = 'https://example.com/big ' + 'а'.repeat(300_000);
+    const t0 = Date.now();
+    const { r } = await search({ query: 'big' }, {
+      links: [{ id: 11, session_id: 'u1_12', content: huge, created_at: '2026-10-07T10:00:00Z' }],
+    });
+    expect(r.files[0]).toMatchObject({ origin: 'link', url: 'https://example.com/big' });
+    expect(Date.now() - t0).toBeLessThan(1000);
   });
 });
 
