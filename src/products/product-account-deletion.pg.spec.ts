@@ -39,6 +39,7 @@ maybe('product account deletion против живого Postgres', () => {
   let lifecycle: ProductLifecycleService;
   let turns: TurnsService;
   let misc: { checkTokenBalance: jest.Mock; deductTokens: jest.Mock };
+  let service: ProductAccountDeletionService;
   let adapter: ProductAccountDeletionAdapter;
 
   beforeAll(async () => {
@@ -50,9 +51,12 @@ maybe('product account deletion против живого Postgres', () => {
     for (const file of MIGRATIONS) {
       await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', file), 'utf8'));
     }
-    await pool.query(`CREATE TABLE user_id (
+    // Форма фикстуры — ТА ЖЕ, что в product-lifecycle.pg.spec.ts и
+    // provisioning.integration.spec.ts (IF NOT EXISTS, nullable state): при
+    // общем PROVISIONING_PG_URL порядок suite'ов не должен влиять на результат.
+    await pool.query(`CREATE TABLE IF NOT EXISTS user_id (
       internal_id text PRIMARY KEY,
-      state text NOT NULL,
+      state text,
       deleted_at timestamptz,
       deletion_id uuid
     )`);
@@ -101,7 +105,7 @@ maybe('product account deletion против живого Postgres', () => {
       new ProductActionsService(pg as any),
       secrets,
     );
-    const service = new ProductAccountDeletionService(pg as any, lifecycle);
+    service = new ProductAccountDeletionService(pg as any, lifecycle);
     adapter = new ProductAccountDeletionAdapter(service, new AccountDeletionRegistry());
   });
 
@@ -126,9 +130,10 @@ maybe('product account deletion против живого Postgres', () => {
     userId: string;
     status: string;
     slug: string;
-    hostId?: string;
+    hostId?: string | null;
     archivedAt?: Date | null;
     purgeAfter?: Date | null;
+    purgedAt?: Date | null;
     blockReason?: string | null;
     firstPrompt?: string | null;
   }): Promise<string> {
@@ -136,8 +141,8 @@ maybe('product account deletion против живого Postgres', () => {
     await pool.query(
       `INSERT INTO products (
          id,user_id,name,slug,kind,status,checkout_path,runner_token_hash,host_id,
-         archived_at,purge_after,block_reason,first_prompt,first_prompt_channel
-       ) VALUES ($1,$2,$3,$4,'site',$5,'/product',$6,$7,$8,$9,$10,$11,$12)`,
+         archived_at,purge_after,purged_at,block_reason,first_prompt,first_prompt_channel
+       ) VALUES ($1,$2,$3,$4,'site',$5,'/product',$6,$7,$8,$9,$10,$11,$12,$13)`,
       [
         id,
         o.userId,
@@ -145,9 +150,10 @@ maybe('product account deletion против живого Postgres', () => {
         o.slug,
         o.status,
         sha(`runner-${id}`),
-        o.hostId ?? 'host-shared',
+        o.hostId === undefined ? 'host-shared' : o.hostId,
         o.archivedAt ?? null,
         o.purgeAfter ?? null,
+        o.purgedAt ?? null,
         o.blockReason ?? null,
         o.firstPrompt ?? null,
         o.firstPrompt == null ? null : 'web',
@@ -389,5 +395,107 @@ maybe('product account deletion против живого Postgres', () => {
     expect((await pool.query(`SELECT status,error FROM product_turns WHERE id=$1`, [turnId])).rows[0]).toEqual({ status: 'running', error: null });
     expect(await latestSleep()).toBeUndefined();
     expect(repair).not.toHaveBeenCalled();
+  });
+
+  it('I-1: продукт уже стёрт штатным purge — подтверждённая остановка, а не вечный retry', async () => {
+    await seedAccount('u-deleted', DELETION_ID);
+    const purgedAt = new Date('2026-11-10T00:00:00.000Z');
+    await seedProduct({
+      id: PRODUCT_ID,
+      userId: 'u-deleted',
+      status: 'archived',
+      slug: 'slug-1',
+      archivedAt: DELETED_AT,
+      purgeAfter: DELETED_AT,
+      purgedAt,
+    });
+    const value = stopJob();
+    const payload = JSON.parse(JSON.stringify(value.payload));
+
+    // purged — более сильная остановка, чем sleep: контейнера и данных уже
+    // нет. External_unknown здесь означал бы вечный retry одного product.stop,
+    // который блокирует ВСЁ удаление аккаунта.
+    await expect(adapter.execute(value, execution())).resolves.toBeUndefined();
+
+    expect(value.payload).toEqual(payload);
+    // Job не висит: новая работа и новый sleep не ставятся, строка не правится.
+    expect(await latestSleep()).toBeUndefined();
+    expect((await pool.query('SELECT count(*)::int AS n FROM product_provision_jobs')).rows[0].n).toBe(0);
+    const product = await pool.query(
+      `SELECT status,archived_at,purged_at,purge_after FROM products WHERE id=$1`,
+      [PRODUCT_ID],
+    );
+    expect(product.rows[0]).toMatchObject({
+      status: 'archived',
+      archived_at: DELETED_AT,
+      purged_at: purgedAt,
+      purge_after: DELETED_AT,
+    });
+  });
+
+  it('I-1: строка продукта отсутствует — та же подтверждённая остановка', async () => {
+    await seedAccount('u-deleted', DELETION_ID);
+
+    await expect(adapter.execute(stopJob(), execution())).resolves.toBeUndefined();
+    expect(await latestSleep()).toBeUndefined();
+  });
+
+  it('I-2: продукт без хоста — sleep остаётся queued, retry сохраняется, error-сигнал разовый', async () => {
+    await seedAccount('u-deleted', DELETION_ID);
+    await seedProduct({ id: PRODUCT_ID, userId: 'u-deleted', status: 'running', slug: 'slug-1', hostId: null });
+    // До фикса у сервиса не было logger — fallback держит тест красным по
+    // существу (0 вызовов), а не падением spyOn.
+    const errorSpy = jest
+      .spyOn((service as any).logger ?? { error: () => undefined }, 'error')
+      .mockImplementation(() => undefined);
+
+    await expect(adapter.execute(stopJob(), execution())).rejects.toMatchObject({ kind: 'external_unknown' });
+
+    // claimJob выдаёт sleep строго по p.host_id — queued-sleep не заберёт никто.
+    expect((await latestSleep()).status).toBe('queued');
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const message = String(errorSpy.mock.calls[0][0]);
+    expect(message).toContain('no host');
+    expect(message).toContain(PRODUCT_ID);
+    // Никакого userId/PII в тексте.
+    expect(message).not.toContain('u-deleted');
+
+    // Повторный attempt идемпотентен: тот же retry, дубля error-лога нет.
+    await expect(adapter.execute(stopJob(), execution())).rejects.toMatchObject({ kind: 'external_unknown' });
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect((await latestSleep()).status).toBe('queued');
+    expect((await pool.query(`SELECT count(*)::int AS n FROM product_provision_jobs WHERE product_id=$1 AND kind='sleep'`, [PRODUCT_ID])).rows[0].n).toBe(1);
+  });
+
+  it('M-6: уже архивный продукт с подтверждённым сном — дата архива сохраняется, purge_after нового поколения', async () => {
+    await seedAccount('u-deleted', DELETION_ID);
+    const archivedAt = new Date('2026-10-01T00:00:00.000Z');
+    await seedProduct({
+      id: PRODUCT_ID,
+      userId: 'u-deleted',
+      status: 'archived',
+      slug: 'slug-1',
+      archivedAt,
+      purgeAfter: new Date('2026-10-31T00:00:00.000Z'), // срок СТАРОГО поколения
+    });
+    const sleepId = await seedJob(PRODUCT_ID, 'done', 'sleep');
+    await pool.query(
+      `UPDATE product_provision_jobs SET created_at=$2,started_at=$2,finished_at=$2 WHERE id=$1`,
+      [sleepId, new Date('2026-10-01T01:00:00.000Z')],
+    );
+
+    await expect(adapter.execute(stopJob(), execution())).resolves.toBeUndefined();
+
+    const product = await pool.query(`SELECT status,archived_at,purge_after FROM products WHERE id=$1`, [PRODUCT_ID]);
+    expect(product.rows[0].status).toBe('archived');
+    // COALESCE(archived_at,now()) не затирает старую дату архива...
+    expect(product.rows[0].archived_at).toEqual(archivedAt);
+    // ...а purge_after перезаписывается на новое поколение (deleted_at+30d).
+    expect(product.rows[0].purge_after).toEqual(new Date(DELETED_AT.getTime() + 30 * 86_400_000));
+    // LATERAL выбрал последний sleep не старше текущей архивации — старый
+    // done; новый queued-sleep поверх подтверждённого не ставится.
+    expect((await latestSleep()).id).toBe(sleepId);
+    expect((await latestSleep()).status).toBe('done');
+    expect((await pool.query(`SELECT count(*)::int AS n FROM product_provision_jobs WHERE product_id=$1 AND kind='sleep'`, [PRODUCT_ID])).rows[0].n).toBe(1);
   });
 });
