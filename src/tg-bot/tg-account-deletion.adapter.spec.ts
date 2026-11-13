@@ -800,6 +800,7 @@ describe('TG controller claim busy loser', () => {
     await entered;
     await b1Done;
     const loserLeaves = grammy.leaveChat.mock.calls.length;
+    const loserMessages = grammy.sendMessage.mock.calls.filter(([chatId]) => chatId === 10001);
     openGate();
     await b2Done;
     if (loserLeaves > 0) {
@@ -812,6 +813,8 @@ describe('TG controller claim busy loser', () => {
     }
 
     expect(loserLeaves).toBe(0);
+    expect(loserMessages).toHaveLength(0);
+    expect(loserMessages.some(([, text]) => String(text).includes('уже привязана'))).toBe(false);
     expect(db.configs.find((config) => config.id === 'cfg-b2')?.status).toBe('active');
     expect(db.configs.find((config) => config.id === 'cfg-b1')?.status).toBe('pending');
     expect(db.events).not.toContain('member-archive:cfg-b2');
