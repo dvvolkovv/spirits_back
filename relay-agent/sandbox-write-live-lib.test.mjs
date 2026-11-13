@@ -77,6 +77,36 @@ test("api_error_status делает terminal result красным", async () =>
   assert.equal(outcome.apiErrorStatus, 429);
 });
 
+// Прод-семантика (server.mjs, llm-fallback.mjs): !!ev.api_error_status.
+// CLI 2.1.280 на успехе эмитит "api_error_status": null — гейт обязан его
+// пропускать, иначе 2.1.280 перманентно красный (ложный RED, 13.11.2026).
+test("api_error_status null на success — прод-семантика, не RED", async () => {
+  const { runCliProbe } = await loadLib();
+  const event = '{"type":"result","subtype":"success","is_error":false,"api_error_status":null}\n';
+  const { outcome } = await runChunks(runCliProbe, [event]);
+  assert.equal(outcome.gotResult, true);
+  assert.equal(outcome.resultSuccess, true);
+  assert.equal(outcome.resultError, false);
+  assert.equal(outcome.apiErrorStatus, null);
+});
+
+test("falsy api_error_status (0) не красит result, как в проде", async () => {
+  const { runCliProbe } = await loadLib();
+  const event = '{"type":"result","subtype":"success","is_error":false,"api_error_status":0}\n';
+  const { outcome } = await runChunks(runCliProbe, [event]);
+  assert.equal(outcome.resultSuccess, true);
+  assert.equal(outcome.apiErrorStatus, null);
+});
+
+test("truthy не-числовой api_error_status фиксируется как present", async () => {
+  const { runCliProbe } = await loadLib();
+  const event = '{"type":"result","subtype":"success","is_error":false,"api_error_status":"overloaded"}\n';
+  const { outcome } = await runChunks(runCliProbe, [event]);
+  assert.equal(outcome.resultSuccess, false);
+  assert.equal(outcome.resultError, true);
+  assert.equal(outcome.apiErrorStatus, "present");
+});
+
 test("финальный is_error без newline не теряется", async () => {
   const { runCliProbe } = await loadLib();
   const event = '{"type":"result","subtype":"success","is_error":true}';
@@ -367,4 +397,13 @@ test("live test регистрирует cleanup до ensureSessionDirs", () => 
   const setup = source.indexOf("await ensureSessionDirs");
   assert.ok(cleanup > -1);
   assert.ok(setup > cleanup, "partial setup не должен оставаться без cleanup");
+});
+
+// Sandbox CLI переопределяет TMPDIR для своих Bash-подпроцессов (в инциденте
+// фигурировал подкаталог claude-<uid>): запись через "$TMPDIR/..." уходит мимо
+// проверяемого scratch-каталога. Probe обязан использовать абсолютный путь.
+test("live test пишет scratch probe по абсолютному пути, а не через $TMPDIR", () => {
+  const source = fs.readFileSync(new URL("./sandbox-write-live.test.mjs", import.meta.url), "utf8");
+  assert.equal(source.includes("$TMPDIR"), false, "$TMPDIR внутри sandbox CLI — не host scratchDir");
+  assert.ok(source.includes("scratchProbePath"), "команда должна писать в явный путь scratch");
 });
