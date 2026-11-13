@@ -339,10 +339,18 @@ const UPLOAD_RECORD = {
 };
 const UPLOAD_LINK = '📎 [a.pdf](/webhook/chat-uploads/11111111-1111-4111-8111-111111111111)';
 
-function makeChatUploadsMock(result: { saved: any[]; failed: string[] }) {
+function makeChatUploadsMock(result: { saved: any[]; failed: string[] }, recent: any[] = []) {
   return {
     saveOriginals: jest.fn(async () => result),
     ownerUrl: jest.fn((id: string) => `/webhook/chat-uploads/${id}`),
+    // Память загрузок (Task 6): последние загрузки сессии кроме файлов текущего хода.
+    recentForSession: jest.fn(async () => recent),
+    assistantBlock: jest.fn((records: any[]) =>
+      records?.length
+        ? `Earlier user uploads:\n${records
+            .map((r) => `- ${r.originalName}: https://backend.test/webhook/chat-uploads/${r.id}?exp=1&sig=test`)
+            .join('\n')}`
+        : ''),
   };
 }
 
@@ -574,5 +582,97 @@ describe('uploadAndChat: гейт consolidate (ревью I3)', () => {
     expect(consolidate).toHaveBeenCalledTimes(1);
     expect(consolidate.mock.calls[0][2]).toContain(UPLOAD_LINK);
     expect(consolidate.mock.calls[0][3]).toBe(ANSWER);
+  });
+});
+
+/**
+ * Память загрузок (spec 2026-11-13-chat-upload-memory, Task 6): ход с
+ * вложениями везёт в теле реплики последние загрузки сессии (имя и
+ * короткоживущая подписанная ссылка) КРОМЕ файлов текущего хода — они уже
+ * есть в multipart-промпте путями на релее, второй экземпляр только путал бы
+ * модель. Подписанная ссылка не должна попадать в systemPrompt: он кэшируется
+ * на релее, а подпись чеканится заново каждый ход.
+ */
+describe('uploadAndChat: память прошлых загрузок в prompt (Task 6)', () => {
+  const OLD_UPLOADS_FLAG = process.env.CHAT_UPLOADS_ENABLED;
+  beforeEach(() => { process.env.CHAT_UPLOADS_ENABLED = 'true'; });
+  afterEach(() => {
+    jest.clearAllMocks();
+    if (OLD_UPLOADS_FLAG === undefined) delete process.env.CHAT_UPLOADS_ENABLED;
+    else process.env.CHAT_UPLOADS_ENABLED = OLD_UPLOADS_FLAG;
+  });
+
+  /** Загрузка ПРЕДЫДУЩЕГО хода той же сессии — её блок и должен вернуть. */
+  const EARLIER_RECORD = {
+    ...UPLOAD_RECORD,
+    id: '22222222-2222-4222-8222-222222222222',
+    originalName: 'b.pdf',
+  };
+
+  async function runMultipart(req: any, chatUploads: any): Promise<Record<string, string>> {
+    const svc = makeService(makePg());
+    // buildUploadHandoff собирает uploadContext на сервисе — подставляем полем,
+    // как в остальных спеках (позиционная сборка до конца сигнатуры не доходит).
+    (svc as any).chatUploads = chatUploads;
+    jest.spyOn(svc, 'persistUploadTurn').mockResolvedValue(0);
+    const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+    const neo4j = { getProfileDescription: jest.fn(async () => PROFILE) };
+    const ctrl = new (ChatController as any)(svc, jwtSvc, neo4j, undefined, undefined, chatUploads);
+    const post = jest.fn(async () => ({ data: sseStream([{ type: 'delta', text: ANSWER }, { type: 'done' }]) }));
+    (axios as any).default = { post };
+    (axios as any).post = post;
+
+    await ctrl.uploadAndChat(req, makeRes());
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+
+    expect(post).toHaveBeenCalled();
+    return fieldsOf(post.mock.calls[0][1]);
+  }
+
+  it('текущий multipart не дублирует только что загруженный файл', async () => {
+    const chatUploads = makeChatUploadsMock({ saved: [UPLOAD_RECORD], failed: [] }, [EARLIER_RECORD]);
+    const fields = await runMultipart(makeUploadReq('a.pdf', 'что тут написано?'), chatUploads);
+
+    // Файлы текущего хода исключены по id; запрос — по сырой сессии Postgres
+    // (без языкового суффикса релея).
+    expect(chatUploads.recentForSession).toHaveBeenCalledWith('u1', 'u1_12', [UPLOAD_RECORD.id]);
+    // Прошлая загрузка — в теле хода, текущая в блоке не дублируется.
+    expect(fields.message).toContain('b.pdf');
+    expect(fields.message).not.toContain('- a.pdf');
+    expect(fields.message).toContain('что тут написано?');
+    // Подписанная ссылка — только в пер-ходовой части.
+    expect(fields.systemPrompt || '').not.toContain('sig=');
+    expect(fields.systemPrompt || '').not.toContain('Earlier user uploads');
+  });
+
+  it('чистый лист: блок памяти ищется по fresh-сессии', async () => {
+    const chatUploads = makeChatUploadsMock({ saved: [UPLOAD_RECORD], failed: [] }, [EARLIER_RECORD]);
+    const req = makeUploadReq('a.pdf', 'что тут написано? (fresh)');
+    req.body.fresh = 'true';
+    req.body.freshTs = '1786468316338';
+    const fields = await runMultipart(req, chatUploads);
+
+    expect(chatUploads.recentForSession).toHaveBeenCalledWith(
+      'u1', 'u1_12_fresh_1786468316338', [UPLOAD_RECORD.id],
+    );
+    expect(fields.message).toContain('b.pdf');
+  });
+
+  it('флаг выключен — блока памяти нет, message прежний', async () => {
+    delete process.env.CHAT_UPLOADS_ENABLED;
+    const chatUploads = makeChatUploadsMock({ saved: [], failed: [] }, [EARLIER_RECORD]);
+    const fields = await runMultipart(makeUploadReq('a.pdf', 'переведи (флаг выключен)'), chatUploads);
+
+    expect(chatUploads.recentForSession).not.toHaveBeenCalled();
+    expect(fields.message).toBe('переведи (флаг выключен)');
+  });
+
+  it('сбой реестра — multipart-ход продолжается без блока', async () => {
+    const chatUploads = makeChatUploadsMock({ saved: [UPLOAD_RECORD], failed: [] });
+    chatUploads.recentForSession.mockRejectedValue(new Error('db down'));
+    const fields = await runMultipart(makeUploadReq('a.pdf', 'что тут написано? (сбой БД)'), chatUploads);
+
+    expect(fields.message).not.toContain('Earlier user uploads');
+    expect(fields.message).toContain('что тут написано? (сбой БД)');
   });
 });
