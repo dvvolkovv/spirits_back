@@ -78,6 +78,14 @@ maybe('жизненный цикл продукта против живого Po
       isadmin boolean DEFAULT false,
       tokens bigint DEFAULT 0 NOT NULL)`);
     await pool.query(`ALTER TABLE ai_profiles_consolidated ADD COLUMN IF NOT EXISTS isadmin boolean DEFAULT false`);
+    // Account-deletion guards используют NOT EXISTS: отсутствие строки означает
+    // обычный active fixture, а удалённые сценарии добавляют строку явно.
+    await pool.query(`CREATE TABLE IF NOT EXISTS user_id (
+      internal_id text PRIMARY KEY,
+      state text,
+      deleted_at timestamptz,
+      deletion_id uuid
+    )`);
 
     // ГАРД НА ЧУЖУЮ БАЗУ — та же причина, что в provisioning.integration.spec.ts.
     const n = await pool.query('SELECT count(*) FROM products');
