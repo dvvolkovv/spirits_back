@@ -45,7 +45,7 @@ import { ProfileAccountDeletionRecapture } from './profile-account-deletion.disc
  * account_deletion_jobs (аудит плана), доменные таблицы других задач (17A–17E).
  * user_id.internal_id и surrogate-строка ai_profiles_consolidated остаются как
  * минимальный lifecycle/billing shell: на internal_id завязаны FK и аудит,
- * а contacts.purge (Task 19) читает строку профиля после core.
+ * а contacts.purge (Task 17B) читает строку профиля после core.
  */
 
 /**
@@ -131,6 +131,11 @@ export async function deleteOwnedCoreRows(
   // единственная оставшаяся копия адреса. state/deleted_at/deletion_id НЕ
   // трогаем: поколение ставит begin() и снимает reactivation, а не finalize.
   //
+  // contacts (json) гасим тоже (T17-M6): writer'ов в дереве нет, но колонка
+  // исторически могла быть наполнена, а план требует её очистки.
+  // primary_phone НЕ трогаем — решение владельца (GAP A): телефонный
+  // internal_id и так остаётся как lifecycle-ключ.
+  //
   // welcome_bonus_at сбрасываем намеренно: у пользователя с телефонным
   // входом internal_id — это сам номер, и перерегистрация неизбежно
   // попадёт в ту же строку. Без сброса он получил бы чистый аккаунт с
@@ -148,7 +153,7 @@ export async function deleteOwnedCoreRows(
   // выходит и токен выбрасывает.
   await tx.query(
     `UPDATE user_id
-      SET password_hash = NULL, primary_email = NULL,
+      SET password_hash = NULL, primary_email = NULL, contacts = NULL,
           welcome_bonus_at = NULL, update_date = now()
       WHERE internal_id = $1 AND state = 'deleted' AND deletion_id = $2`,
     params,
