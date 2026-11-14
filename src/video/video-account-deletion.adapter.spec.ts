@@ -47,14 +47,27 @@ const account: DeletionAccount = {
 };
 
 let publicDir: string;
+// Гигиена: env восстанавливается по образцу pg-спеков — спек не должен
+// оставлять BACKEND_URL/MINIO_* соседним файлам в одном воркере jest.
+const ENV_KEYS = ['BACKEND_URL', 'MINIO_BUCKET_VIDEOS', 'MINIO_PUBLIC_URL', 'PUBLIC_DIR'] as const;
+const prevEnv: Record<string, string | undefined> = {};
 
 beforeAll(() => {
+  for (const k of ENV_KEYS) prevEnv[k] = process.env[k];
   process.env.BACKEND_URL = BACKEND;
   process.env.MINIO_BUCKET_VIDEOS = VIDEO_BUCKET;
   // Реализация матчит MinIO-URL строк по префиксу s3PublicUrl (из env).
   process.env.MINIO_PUBLIC_URL = MINIO_BASE;
   publicDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vid-purge-'));
   process.env.PUBLIC_DIR = publicDir;
+});
+
+afterAll(() => {
+  for (const k of ENV_KEYS) {
+    if (prevEnv[k] === undefined) delete process.env[k];
+    else process.env[k] = prevEnv[k] as string;
+  }
+  if (publicDir) fs.rmSync(publicDir, { recursive: true, force: true });
 });
 
 interface VideoRow {

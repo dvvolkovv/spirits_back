@@ -47,13 +47,26 @@ const account: DeletionAccount = {
 };
 
 let publicDir: string;
+// Гигиена: env восстанавливается по образцу pg-спеков — спек не должен
+// оставлять BACKEND_URL/AWS_*/PUBLIC_DIR соседним файлам в одном воркере jest.
+const ENV_KEYS = ['BACKEND_URL', 'AWS_ENDPOINT', 'AWS_S3_BUCKET', 'PUBLIC_DIR'] as const;
+const prevEnv: Record<string, string | undefined> = {};
 
 beforeAll(() => {
+  for (const k of ENV_KEYS) prevEnv[k] = process.env[k];
   process.env.BACKEND_URL = BACKEND;
   process.env.AWS_ENDPOINT = 'https://storage.yandexcloud.net';
   delete process.env.AWS_S3_BUCKET;
   publicDir = fs.mkdtempSync(path.join(os.tmpdir(), 'img-purge-'));
   process.env.PUBLIC_DIR = publicDir;
+});
+
+afterAll(() => {
+  for (const k of ENV_KEYS) {
+    if (prevEnv[k] === undefined) delete process.env[k];
+    else process.env[k] = prevEnv[k] as string;
+  }
+  if (publicDir) fs.rmSync(publicDir, { recursive: true, force: true });
 });
 
 interface ImageRow {
