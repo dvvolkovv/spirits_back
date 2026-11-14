@@ -108,10 +108,11 @@ export const DELETION_DEPENDENCIES: Readonly<Partial<Record<
   // заявка на вывод. resourceKey статический ('referral') — форма как у
   // tasks/support/peer.
   'referral.purge': { allOf: ['referral.stop'] },
-  // Task 17E: контент кампании стирается только после stop ЭТОЙ кампании
-  // (статусы → cancelled, credentials соцаккаунтов отозваны до scrub).
-  // resourceKey = campaignId, кампаний на аккаунт несколько — поэтому форма
-  // sameResourceKey (как product.purge/voice.purge), а не allOf: purge одной
-  // кампании не должен ждать stop всех остальных.
+  // Task 17E: purge ждёт stop ТОГО ЖЕ resourceKey. Две формы ключа:
+  // campaignId (контент кампании стирается после её stop; кампаний
+  // несколько — purge одной не ждёт stop остальных) и статический
+  // 'legacy-smm' (user-scoped alias billing ждёт user-scoped отзыва
+  // credentials/oauth). Поэтому форма sameResourceKey (как
+  // product.purge/voice.purge), а не allOf — она покрывает обе формы.
   'legacy-smm.purge': { sameResourceKey: ['legacy-smm.stop'] },
 };

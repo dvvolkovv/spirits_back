@@ -41,25 +41,45 @@ import { PgService } from '../common/services/pg.service';
  * Общие таблицы smm_music_track/smm_pricing и official-кампании не
  * выбираются никогда.
  *
+ * Fix-раунд (design-спек 2026-11-11, строка 44: «секреты соединения
+ * удаляются по действующим правилам» — БЕЗ условия наличия кампаний):
+ * дополнительно создаётся user-scoped пара job'ов со статическим
+ * resourceKey 'legacy-smm' (образец tasks/support/peer/referral) и пустым
+ * payload — но только когда у пользователя есть хотя бы одна user-scoped
+ * строка (smm_social_account / smm_oauth_state / smm_billing_ledger /
+ * smm_premium_generation). Условность обоснована: SMM — legacy-ниша,
+ * большинство аккаунтов не имеет в этих таблицах ничего, и плодить на
+ * каждое удаление два пустых jobа (записи в очереди, lease-циклы) незачем.
+ * Пользователь с живыми access-токенами и billing-строками, но БЕЗ
+ * собственных кампаний, теперь получает полный stop+purge.
+ *
  * stop (порядок по доменной логике — статусы гасятся до стирания):
+ *  per-campaign job (resourceKey=campaignId):
  *  1. собственная кампания: drafting/approved → 'cancelled';
  *  2. её видео в активных статусах → 'cancelled';
  *  3. её публикации scheduled/publishing → 'cancelled' (published —
- *     внешний терминальный факт, статус не переписывается);
+ *     внешний терминальный факт, статус не переписывается).
+ *  user-scoped job (resourceKey='legacy-smm', payload {}):
  *  4. smm_social_account пользователя: status='revoked', credentials='{}'
  *     (access-токены платформ уничтожаются ДО purge);
  *  5. DELETE smm_oauth_state пользователя.
  *
  * purge — ОДНА транзакция (inTransaction) с generation check внутри:
+ *  per-campaign job:
  *  1. DELETE собственных smm_event_log (через video/publication цепочки) —
  *     до scrub: payload событий содержит личный контент;
  *  2. scrub smm_creator_campaign (cta/logo/slogan/caption/bg-URL),
  *     smm_scenario (title/dialog/broll_prompts/scenes_json),
  *     smm_publication (caption/external_url/external_post_id/error_message),
  *     smm_video (render_state/mp4_url/error_message),
- *     smm_campaign (topic/conversation_id);
+ *     smm_campaign (topic/conversation_id).
+ *  user-scoped job:
  *  3. smm_billing_ledger.user_id и smm_premium_generation.user_id получают
  *     deletion-scoped alias 'deleted:<deletionId>' (44 символа, text-колонки).
+ *
+ * Правило purge-after-stop (catalog: sameResourceKey) работает для обеих
+ * форм: и для статического ключа 'legacy-smm', и для campaignId — user-
+ * scoped purge так же ждёт своего user-scoped stop.
  *
  * Billing evidence НЕ удаляется: строки ledger/premium_generation и все суммы
  * (amount, tokens_charged, tokens_refunded, internal_cost_cents), video-ссылки
@@ -76,6 +96,12 @@ import { PgService } from '../common/services/pg.service';
 
 /** Сколько кампаний читать за один запрос discovery. */
 export const LEGACY_SMM_PAGE_SIZE = 500;
+
+/**
+ * Статический resourceKey user-scoped пары job'ов (образец
+ * tasks/support/peer/referral). Одновременно маркер формы job'а в execute.
+ */
+export const LEGACY_SMM_USER_RESOURCE_KEY = 'legacy-smm';
 
 /** Нулевой uuid — нижняя граница keyset-пагинации первой страницы. */
 const ZERO_UUID = '00000000-0000-0000-0000-000000000000';
@@ -135,6 +161,35 @@ export async function discoverLegacySmmDeletion(ctx: LegacySmmDiscovery): Promis
     }
   }
 
+  // User-scoped след (секреты соединений и billing-строки) существует
+  // независимо от кампаний — design-спек, строка 44. Пара job'ов со
+  // статическим ключом создаётся только при наличии таких строк: у
+  // аккаунта без SMM-следа план остаётся пустым.
+  const userScoped = await db.query(
+    `SELECT 1
+      WHERE EXISTS (SELECT 1 FROM user_id u
+             WHERE u.internal_id = $1 AND u.state = 'deleted' AND u.deletion_id = $2)
+        AND (EXISTS (SELECT 1 FROM smm_social_account a WHERE a.user_id = $1)
+          OR EXISTS (SELECT 1 FROM smm_oauth_state o WHERE o.user_id = $1)
+          OR EXISTS (SELECT 1 FROM smm_billing_ledger l WHERE l.user_id = $1)
+          OR EXISTS (SELECT 1 FROM smm_premium_generation g WHERE g.user_id = $1))`,
+    [account.userId, account.deletionId],
+  );
+  if ((userScoped.rowCount ?? 0) > 0) {
+    jobs.push({
+      resourceType: 'legacy-smm.stop',
+      resourceKey: LEGACY_SMM_USER_RESOURCE_KEY,
+      phase: 'immediate',
+      payload: {},
+    });
+    jobs.push({
+      resourceType: 'legacy-smm.purge',
+      resourceKey: LEGACY_SMM_USER_RESOURCE_KEY,
+      phase: 'purge',
+      payload: {},
+    });
+  }
+
   // Внешний пост (external_post_id) удалить у соцсети нечем: adapter для
   // провайдерских вызовов не существует, API/SSH вызовы план запрещает —
   // один skip на план (форма video.provider), без идентификаторов постов.
@@ -160,9 +215,10 @@ export async function discoverLegacySmmDeletion(ctx: LegacySmmDiscovery): Promis
 }
 
 /**
- * Параметры выражений: $1=userId, $2=deletionId, $3=campaignId; alias-UPDATE
- * дополнительно $4=deletionAlias. Каждому выражению передаётся ровно его
- * набор (PG отвергает лишние bind-параметры — 08P01).
+ * Параметры выражений: $1=userId, $2=deletionId; campaign-scoped выражения
+ * дополнительно $3=campaignId; user-scoped alias-UPDATE — $3=deletionAlias.
+ * Каждому выражению передаётся ровно его набор (PG отвергает лишние
+ * bind-параметры — 08P01).
  */
 const GEN_PREDICATE = `EXISTS (SELECT 1 FROM user_id u
      WHERE u.internal_id=$1 AND u.state='deleted' AND u.deletion_id=$2)`;
@@ -261,16 +317,17 @@ const CAMPAIGN_SCRUB_SQL = `UPDATE smm_campaign SET
    AND ${GEN_PREDICATE}`;
 
 // Billing evidence: строки и суммы сохраняются, меняется только идентичность
-// (deletion-scoped alias). OWN_CAMPAIGN_PREDICATE защищает от alias-записи
-// при job'е с чужим campaignId в payload.
-const LEDGER_ALIAS_SQL = `UPDATE smm_billing_ledger SET user_id=$4
+// (deletion-scoped alias 'deleted:<deletionId>' в $3). Алиасинг — user-scoped
+// операция: ledger/premium принадлежат пользователю, а не кампании, и должны
+// обрабатываться даже когда собственных кампаний нет. Генерация ($1/$2) —
+// единственная защита: после первого прогона WHERE user_id=$1 матчит 0 строк,
+// повторный alias идемпотентен байт-в-байт.
+const LEDGER_ALIAS_SQL = `UPDATE smm_billing_ledger SET user_id=$3
  WHERE user_id=$1
-   AND ${OWN_CAMPAIGN_PREDICATE}
    AND ${GEN_PREDICATE}`;
 
-const PREMIUM_ALIAS_SQL = `UPDATE smm_premium_generation SET user_id=$4
+const PREMIUM_ALIAS_SQL = `UPDATE smm_premium_generation SET user_id=$3
  WHERE user_id=$1
-   AND ${OWN_CAMPAIGN_PREDICATE}
    AND ${GEN_PREDICATE}`;
 
 @Injectable()
@@ -290,44 +347,71 @@ export class LegacySmmAccountDeletionAdapter implements OnModuleInit, AccountDel
     if (job.resourceType !== 'legacy-smm.stop' && job.resourceType !== 'legacy-smm.purge') {
       throw new Error('unsupported_deletion_resource');
     }
-    // Payload мог прийти только из нашего discovery, но purge исполняется
-    // через 30 дней: campaignId перепроверяется fail-closed (uuid).
+    // Две формы job'ов: user-scoped (статический resourceKey 'legacy-smm',
+    // пустой payload) и per-campaign (resourceKey=campaignId, payload
+    // {campaignId}). Payload мог прийти только из нашего discovery, но purge
+    // исполняется через 30 дней: форма перепроверяется fail-closed.
     // Рассогласование — retry db, а не слепая запись.
-    const campaignId = job.payload?.campaignId;
-    if (typeof campaignId !== 'string' || !UUID_RE.test(campaignId)) {
-      throw new DeletionRetryError('db');
+    const isUserScoped = job.resourceKey === LEGACY_SMM_USER_RESOURCE_KEY;
+    let campaignId: string | null = null;
+    if (isUserScoped) {
+      if (Object.keys(job.payload ?? {}).length !== 0) {
+        throw new DeletionRetryError('db');
+      }
+    } else {
+      const raw = job.payload?.campaignId;
+      if (typeof raw !== 'string' || !UUID_RE.test(raw)) {
+        throw new DeletionRetryError('db');
+      }
+      campaignId = raw;
     }
 
     await ctx.assertCurrent(job);
     try {
       const userParams = [job.userId, job.deletionId];
-      const campaignParams = [job.userId, job.deletionId, campaignId];
       if (job.resourceType === 'legacy-smm.stop') {
         // Транзакция не обязательна (peer-прецедент): отдельные выражения,
-        // каждое с generation predicate. Порядок доменный: статусы гасятся
-        // до отзыва credentials и DELETE oauth-состояний.
-        await ctx.db.query(CAMPAIGN_STOP_SQL, campaignParams);
-        await ctx.db.query(VIDEO_STOP_SQL, campaignParams);
-        await ctx.db.query(PUBLICATION_STOP_SQL, campaignParams);
-        await ctx.db.query(SOCIAL_REVOKE_SQL, userParams);
-        await ctx.db.query(OAUTH_DELETE_SQL, userParams);
+        // каждое с generation predicate.
+        if (isUserScoped) {
+          // Секреты соединения (design-спек, строка 44): отзыв credentials
+          // и DELETE oauth-состояний — независимо от наличия кампаний.
+          await ctx.db.query(SOCIAL_REVOKE_SQL, userParams);
+          await ctx.db.query(OAUTH_DELETE_SQL, userParams);
+        } else {
+          // Порядок доменный: статусы кампании/видео/публикаций гасятся
+          // до purge-стирания контента.
+          const campaignParams = [job.userId, job.deletionId, campaignId];
+          await ctx.db.query(CAMPAIGN_STOP_SQL, campaignParams);
+          await ctx.db.query(VIDEO_STOP_SQL, campaignParams);
+          await ctx.db.query(PUBLICATION_STOP_SQL, campaignParams);
+        }
       } else {
-        // Purge — одна транзакция с generation check внутри (план Step 3):
-        // DELETE event_log → scrub → billing alias.
+        // Purge — одна транзакция с generation check внутри (план Step 3).
         const deletionAlias = `deleted:${job.deletionId}`;
-        const aliasParams = [job.userId, job.deletionId, campaignId, deletionAlias];
-        await inTransaction(this.pg, async (tx) => {
-          const gen = await tx.query(GEN_CHECK_SQL, userParams);
-          if ((gen.rowCount ?? 0) === 0) return;
-          await tx.query(EVENT_LOG_PURGE_SQL, campaignParams);
-          await tx.query(CREATOR_SCRUB_SQL, campaignParams);
-          await tx.query(SCENARIO_SCRUB_SQL, campaignParams);
-          await tx.query(PUBLICATION_SCRUB_SQL, campaignParams);
-          await tx.query(VIDEO_SCRUB_SQL, campaignParams);
-          await tx.query(CAMPAIGN_SCRUB_SQL, campaignParams);
-          await tx.query(LEDGER_ALIAS_SQL, aliasParams);
-          await tx.query(PREMIUM_ALIAS_SQL, aliasParams);
-        });
+        if (isUserScoped) {
+          // Billing-идентичность: alias ledger/premium — user-scoped
+          // операция, строки и суммы сохраняются.
+          const aliasParams = [job.userId, job.deletionId, deletionAlias];
+          await inTransaction(this.pg, async (tx) => {
+            const gen = await tx.query(GEN_CHECK_SQL, userParams);
+            if ((gen.rowCount ?? 0) === 0) return;
+            await tx.query(LEDGER_ALIAS_SQL, aliasParams);
+            await tx.query(PREMIUM_ALIAS_SQL, aliasParams);
+          });
+        } else {
+          // Campaign-scoped данные: DELETE event_log → scrub контента.
+          const campaignParams = [job.userId, job.deletionId, campaignId];
+          await inTransaction(this.pg, async (tx) => {
+            const gen = await tx.query(GEN_CHECK_SQL, userParams);
+            if ((gen.rowCount ?? 0) === 0) return;
+            await tx.query(EVENT_LOG_PURGE_SQL, campaignParams);
+            await tx.query(CREATOR_SCRUB_SQL, campaignParams);
+            await tx.query(SCENARIO_SCRUB_SQL, campaignParams);
+            await tx.query(PUBLICATION_SCRUB_SQL, campaignParams);
+            await tx.query(VIDEO_SCRUB_SQL, campaignParams);
+            await tx.query(CAMPAIGN_SCRUB_SQL, campaignParams);
+          });
+        }
       }
     } catch (error) {
       if (error instanceof DeletionCancelledError) throw error;
