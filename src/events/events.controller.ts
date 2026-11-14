@@ -32,13 +32,15 @@ export class EventsController {
     if (GUEST_SERVER_EVENTS.includes(body.name)) {
       return res.status(204).end();
     }
-    // body.userId — НЕ доказательство владения (Task 16): если запрос дошёл
-    // с валидным JWT, аутентифицированный phone побеждает претензию из тела.
-    // У анонимного запроса body.userId остаётся — загрязнение агрегатов
-    // терпимо (см. шапку), ownership proof из body не извлекается.
+    // body.userId — недоверенный вход (ручка анонимная, см. шапку): загрязнение
+    // агрегатов терпимо by design, ownership proof из body НЕ извлекается.
+    // Приватность при удалении аккаунта обеспечивает не контроллер, а слой БД
+    // (Task 16): фильтр EventsService.flush() (state='deleted' по userId и
+    // session-префиксу `<userId>_`) и scoped purge-UPDATE по колонкам
+    // user_id/session_id в events-account-deletion.adapter.
     const userId =
-      (req as any).user?.phone ||  // present if a JWT slipped through
       body.userId ||
+      (req as any).user?.phone ||  // present if a JWT slipped through
       null;
     this.events.track(body.name, {
       userId,
