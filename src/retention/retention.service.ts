@@ -180,6 +180,9 @@ export class RetentionService {
     const targets = selected.filter((d) => d.channel !== 'no_channel' && (allowResend || !d.in_cooldown));
     const results: RetentionResultRow[] = [];
     let skippedUnsubscribed = 0;
+    // Task 17C: получатели, отсечённые повторной active-проверкой (skipped не
+    // персистится — ни письма, ни события 'retention_outreach').
+    let skippedDeleted = 0;
     for (const [userId, contact] of suppressed) {
       const isSelected = userFilter
         ? userFilter.has(userId)
@@ -218,9 +221,21 @@ export class RetentionService {
                 daysInactive: d.days_inactive, hoursInactive: d.hours_inactive,
                 chatUrl: retentionChatUrl(d.language), unsubscribeUrl,
               });
-              const sent = await this.mail.send(d.email!, content.subject, content.html, content.text);
-              status = sent.ok ? 'sent' : 'failed';
-              error = sent.ok ? null : this.safeMailError(sent.error);
+              // Task 17C: повторная strict-проверка непосредственно перед
+              // транспортом — сегмент мог быть собран до удаления аккаунта.
+              const accountState = await this.checkAccountActive(d.user_id);
+              if (accountState === 'inactive') {
+                skipped = true;
+                skippedDeleted += 1;
+              } else if (accountState === 'unknown') {
+                status = 'failed';
+                error = 'active_check_failed';
+                this.logger.warn(`retention active check failed: ${error}, campaign ${preview.campaign}`);
+              } else {
+                const sent = await this.mail.send(d.email!, content.subject, content.html, content.text);
+                status = sent.ok ? 'sent' : 'failed';
+                error = sent.ok ? null : this.safeMailError(sent.error);
+              }
             } catch (e: any) {
               error = this.safePreparationError(e);
               this.logger.warn(`retention delivery preparation failed for ${d.user_id}: ${error}`);
@@ -228,18 +243,27 @@ export class RetentionService {
           }
         }
       } else {
-        const sent = await this.sendOutreachSms(
-          d.phone!,
-          buildRetentionSmsMessage(
-            mode,
-            d.assistant_name,
-            segment.personalization?.get(d.user_id)?.name,
-            d.days_inactive,
-            d.hours_inactive,
-          ),
+        const message = buildRetentionSmsMessage(
+          mode,
+          d.assistant_name,
+          segment.personalization?.get(d.user_id)?.name,
+          d.days_inactive,
+          d.hours_inactive,
         );
-        status = sent.ok ? 'sent' : 'failed';
-        error = sent.ok ? null : sent.error || 'sms_error';
+        // Task 17C: та же повторная strict-проверка перед SMS-транспортом.
+        const accountState = await this.checkAccountActive(d.user_id);
+        if (accountState === 'inactive') {
+          skipped = true;
+          skippedDeleted += 1;
+        } else if (accountState === 'unknown') {
+          status = 'failed';
+          error = 'active_check_failed';
+          this.logger.warn(`retention active check failed: ${error}, campaign ${preview.campaign}`);
+        } else {
+          const sent = await this.sendOutreachSms(d.phone!, message);
+          status = sent.ok ? 'sent' : 'failed';
+          error = sent.ok ? null : sent.error || 'sms_error';
+        }
       }
       if (skipped) continue;
 
@@ -264,6 +288,12 @@ export class RetentionService {
       });
     }
 
+    if (skippedDeleted > 0) {
+      // Aggregate-форма без идентификаторов: сколько получателей отсеяла
+      // повторная active-проверка (удаление/блокировка после сборки сегмента).
+      this.logger.warn(`retention outreach: skipped ${skippedDeleted} inactive recipient(s), campaign ${preview.campaign}`);
+    }
+
     return {
       campaign: preview.campaign,
       sent: results.filter((r) => r.status === 'sent').length,
@@ -275,6 +305,25 @@ export class RetentionService {
       no_channel: noChannel,
       results,
     };
+  }
+
+  /**
+   * Task 17C: strict-гейт аккаунта перед платным транспортом. Три исхода:
+   * 'active' — отправляем; 'inactive' (deleted/blocked/legacy NULL state) —
+   * тихий skip без события; 'unknown' (сбой запроса) — fail-closed: не
+   * отправляем, пишем безопасный код active_check_failed. Сырая ошибка и
+   * идентификаторы в лог не поднимаются.
+   */
+  private async checkAccountActive(userId: string): Promise<'active' | 'inactive' | 'unknown'> {
+    try {
+      const r = await this.pg.query(
+        `SELECT 1 FROM user_id WHERE internal_id = $1 AND state = 'active'`,
+        [userId],
+      );
+      return (r.rowCount ?? r.rows?.length ?? 0) > 0 ? 'active' : 'inactive';
+    } catch {
+      return 'unknown';
+    }
   }
 
   private safeMailError(raw?: string): string {

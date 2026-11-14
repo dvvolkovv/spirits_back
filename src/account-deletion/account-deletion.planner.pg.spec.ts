@@ -26,6 +26,8 @@ import { discoverTasksDeletion } from '../tasks/tasks-account-deletion.adapter';
 import { discoverSupportDeletion } from '../support/support-account-deletion.adapter';
 import { discoverPeerDeletion } from '../peer/peer-account-deletion.adapter';
 import { discoverContactsDeletion } from '../contacts/contacts-account-deletion.adapter';
+import { discoverReferralDeletion } from '../referral/referral-account-deletion.adapter';
+import { discoverRetentionDeletion } from '../retention/retention-account-deletion.adapter';
 import type {
   DeletionAccount,
   DeletionJobRow,
@@ -418,6 +420,8 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       discoverSupportDeletion,
       discoverPeerDeletion,
       discoverContactsDeletion,
+      discoverReferralDeletion,
+      discoverRetentionDeletion,
     ]);
     expect(DELETION_DEPENDENCIES['account.core.immediate']).toEqual({ allStop: true });
     expect(DELETION_DEPENDENCIES['account.core.purge']).toEqual({ allStop: true });
@@ -449,6 +453,13 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       allOf: ['peer.stop'],
     });
     expect(DELETION_DEPENDENCIES['contacts.purge']).toBeUndefined();
+    // Task 17C: referral.purge ждёт referral.stop (stop блокирует вывод —
+    // между pending-проверкой и алиасингом новая заявка появиться не может);
+    // у retention.stop purge-фазы нет — правило не нужно.
+    expect(DELETION_DEPENDENCIES['referral.purge']).toEqual({
+      allOf: ['referral.stop'],
+    });
+    expect(DELETION_DEPENDENCIES['retention.stop']).toBeUndefined();
   });
 
   describe('assertCurrent', () => {

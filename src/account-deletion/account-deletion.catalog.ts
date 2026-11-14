@@ -16,6 +16,8 @@ import { discoverTasksDeletion } from '../tasks/tasks-account-deletion.adapter';
 import { discoverSupportDeletion } from '../support/support-account-deletion.adapter';
 import { discoverPeerDeletion } from '../peer/peer-account-deletion.adapter';
 import { discoverContactsDeletion } from '../contacts/contacts-account-deletion.adapter';
+import { discoverReferralDeletion } from '../referral/referral-account-deletion.adapter';
+import { discoverRetentionDeletion } from '../retention/retention-account-deletion.adapter';
 import type {
   DeletionDiscoverer,
   DeletionResourceType,
@@ -40,6 +42,8 @@ export const DELETION_DISCOVERERS: readonly DeletionDiscoverer[] = [
   discoverSupportDeletion,
   discoverPeerDeletion,
   discoverContactsDeletion,
+  discoverReferralDeletion,
+  discoverRetentionDeletion,
 ];
 
 export interface DeletionDependencyRule {
@@ -82,4 +86,10 @@ export const DELETION_DEPENDENCIES: Readonly<Partial<Record<
   // resourceKey статический ('peer'), поэтому allOf эквивалентно
   // sameResourceKey — форма как у tasks/support.
   'peer.purge': { allOf: ['peer.stop'] },
+  // Task 17C: обезличивание referral-журналов — только после деактивации
+  // лидера. stop блокирует requestWithdrawal (strict-гейт is_active), поэтому
+  // между pending-проверкой purge и алиасингом не может появиться новая
+  // заявка на вывод. resourceKey статический ('referral') — форма как у
+  // tasks/support/peer.
+  'referral.purge': { allOf: ['referral.stop'] },
 };

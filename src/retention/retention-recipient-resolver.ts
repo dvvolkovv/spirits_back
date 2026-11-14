@@ -14,16 +14,21 @@ export class RetentionRecipientResolver {
     const result = new Map<string, RetentionContact>();
     if (!ids.length) return result;
 
+    // Task 17C: контакты резолвятся только для state='active' — удалённый
+    // аккаунт не должен давать email/phone для рассылки ни из одного источника
+    // (профиль, primary_email, идентичности). Fail-closed: legacy-строки без
+    // state тоже отсекаются (см. FU-T11-2).
     const [profiles, accounts, identities] = await Promise.all([
       this.pg.query(
-        "SELECT user_id, email, profile_data->>'name' AS name FROM ai_profiles_consolidated WHERE user_id=ANY($1::text[])",
+        "SELECT user_id, email, profile_data->>'name' AS name FROM ai_profiles_consolidated WHERE user_id=ANY($1::text[]) AND EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id=ai_profiles_consolidated.user_id AND u.state='active')",
         [ids],
       ),
-      this.pg.query('SELECT internal_id::text AS user_id, primary_email FROM user_id WHERE internal_id=ANY($1::text[])', [ids]),
+      this.pg.query("SELECT internal_id::text AS user_id, primary_email FROM user_id WHERE internal_id=ANY($1::text[]) AND state='active'", [ids]),
       this.pg.query(
         `SELECT user_id, provider, provider_sub, email, email_verified, last_used_at, created_at
            FROM user_identities
           WHERE user_id=ANY($1::text[])
+            AND EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id=user_identities.user_id AND u.state='active')
           ORDER BY user_id, email_verified DESC, last_used_at DESC NULLS LAST, created_at DESC`,
         [ids],
       ),

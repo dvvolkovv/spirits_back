@@ -368,8 +368,9 @@ maybe('referral account deletion against PostgreSQL (Task 17C)', () => {
       ALTER TABLE ONLY referral_referees
         ADD CONSTRAINT referral_referees_referee_phone_key UNIQUE (referee_phone);
     `);
-    // Инлайновые таблицы — ТОЧНАЯ копия CREATE из ReferralService.onModuleInit
-    // (user_phone varchar(20)): путь расширения должен пройти по ним.
+    // Инлайновые таблицы — копия ИСТОРИЧЕСКОЙ формы CREATE из
+    // ReferralService.onModuleInit (user_phone varchar(20), как на проду до
+    // Task 17C): guarded-расширение до varchar(64) должно пройти по ним.
     await pool.query(`
       CREATE TABLE IF NOT EXISTS referral_token_payouts (
         id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -632,7 +633,9 @@ maybe('referral account deletion against PostgreSQL (Task 17C)', () => {
 
     it('деактивированный лидер — SMS нет, payout_notified не взведён', async () => {
       const leaderId = await seedLeader(NUM_LEADER, 'slug-num');
-      await seedCommission(leaderId, OTHER, 1, 600, false, 'pay-fake-0001');
+      // commission_rub=600 — ВЫШЕ порога WITHDRAW_MIN_RUB (500): тест
+      // содержателен именно про active-гейт, а не про порог суммы.
+      await seedCommission(leaderId, OTHER, 1, 6000, false, 'pay-fake-0001');
       await pool.query(`UPDATE referral_leaders SET is_active=false WHERE id=$1`, [leaderId]);
 
       await (makeService() as any).notifyPayoutIfReady(leaderId);
@@ -644,7 +647,9 @@ maybe('referral account deletion against PostgreSQL (Task 17C)', () => {
 
     it('активный лидер — SMS уходит (гейт не блокирует живых)', async () => {
       const leaderId = await seedLeader(NUM_LEADER, 'slug-num');
-      await seedCommission(leaderId, OTHER, 1, 600, false, 'pay-fake-0001');
+      // commission_rub=600 — выше порога WITHDRAW_MIN_RUB (500), чтобы дойти
+      // до sendSms; гейт обязан пропустить активного лидера.
+      await seedCommission(leaderId, OTHER, 1, 6000, false, 'pay-fake-0001');
 
       await (makeService() as any).notifyPayoutIfReady(leaderId);
 
