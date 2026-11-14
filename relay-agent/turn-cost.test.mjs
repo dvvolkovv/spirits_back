@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { lastCostState, costBaseline, runCost } from "./turn-cost.mjs";
+import { lastCostState, costBaseline, runCost, lastCostRecord, hasKnownModelCost } from "./turn-cost.mjs";
 
 const line = (o) => JSON.stringify(o) + "\n";
 const user = (text) => line({ type: "user", message: { role: "user", content: text } });
@@ -74,4 +74,14 @@ test("costBaseline: большой файл — база из хвоста", () 
 test("costBaseline: большой файл, запись только в начале — дочитывает целиком", () => {
   const filler = user("x".repeat(2 * 1024 * 1024));
   assert.equal(costBaseline(tmpFile(costState(3.75) + filler)), 3.75);
+});
+
+test("unknown model prices are never trusted, including provider switches", () => {
+  const known = { totalCostUSD: 1, hasUnknownModelCost: false };
+  assert.equal(hasKnownModelCost("claude", known), true);
+  assert.equal(hasKnownModelCost("kimi", known), false);
+  assert.equal(hasKnownModelCost("qwen", known), false);
+  assert.equal(hasKnownModelCost("claude", null), false);
+  const record = lastCostRecord(costState(1) + line({ type: "cost-state", totalCostUSD: 2, hasUnknownModelCost: true }));
+  assert.equal(hasKnownModelCost("claude", record), false);
 });
