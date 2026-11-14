@@ -1209,11 +1209,15 @@ Expected: FAIL в строковых ожиданиях («; Codex — не на
 - `/** Модель ответов: 'claude', 'qwen' или 'kimi'. */` → `/** Модель ответов: 'claude', 'qwen', 'kimi' или 'codex'. */`
 - В JSDoc (~L24–33) строку «'claude' / 'qwen' / 'kimi' — явный личный выбор» → «'claude' / 'qwen' / 'kimi' / 'codex' — явный личный выбор».
 
+- [ ] **Step 5b: Герметичность chain.spec (nit из quality-ревью Task 6)**
+
+В `src/common/services/claude-cli.chain.spec.ts` (~L561) тест делает `delete process.env.QWEN_FALLBACK_API_KEY`, но не `CODEX_FALLBACK_API_KEY` — ожидание `codex.enabled: false` опирается на отсутствие ключа в окружении прогона. Добавить рядом `delete process.env.CODEX_FALLBACK_API_KEY;` (и KIMI, если его там тоже нет — по образцу соседних строк). Входит в коммит Step 6 (добавить файл в первый `git add`).
+
 - [ ] **Step 6: Прогнать на ноде — зелёный; commit**
 
 ```bash
 cd ~/Downloads/spirits_back
-git add src/monitoring/claude-health.alert-line.spec.ts src/monitoring/relay-qwen-monitor.service.spec.ts src/monitoring/claude-health.outage-alert.spec.ts
+git add src/monitoring/claude-health.alert-line.spec.ts src/monitoring/relay-qwen-monitor.service.spec.ts src/monitoring/claude-health.outage-alert.spec.ts src/common/services/claude-cli.chain.spec.ts
 git commit -m "$(cat <<'EOF'
 test(monitoring): строки запасных и исходы с Codex
 
@@ -1233,10 +1237,10 @@ EOF
 )"
 git pull --rebase -q origin main && git push -q origin main
 SHA=$(git -C ~/Downloads/spirits_back rev-parse HEAD)
-ssh dv@85.192.61.231 "cd ~/ci/spirits_back && git fetch -q origin && git checkout -q $SHA && source ~/.nvm/nvm.sh && npx jest src/monitoring/claude-health.alert-line.spec.ts src/monitoring/relay-qwen-monitor.service.spec.ts src/monitoring/claude-health.outage-alert.spec.ts 2>&1 | tail -10"
+ssh dv@85.192.61.231 "cd ~/ci/spirits_back && git fetch -q origin && git checkout -q $SHA && source ~/.nvm/nvm.sh && npx jest src/monitoring/claude-health.alert-line.spec.ts src/monitoring/relay-qwen-monitor.service.spec.ts src/monitoring/claude-health.outage-alert.spec.ts src/common/services/claude-cli.chain.spec.ts 2>&1 | tail -10"
 ```
 
-Expected: все три спека PASS.
+Expected: все четыре спека PASS.
 
 ---
 
