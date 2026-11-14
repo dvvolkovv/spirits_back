@@ -21,6 +21,7 @@ import { discoverVideoDeletion } from '../video/video-account-deletion.adapter';
 import { discoverSpeechDeletion } from '../speech/speech-account-deletion.adapter';
 import { discoverAvatarDeletion } from '../avatar/avatar-account-deletion.adapter';
 import { discoverVoiceAvatarDeletion } from '../voice-avatar/voice-account-deletion.adapter';
+import { discoverEventsDeletion } from '../events/events-account-deletion.adapter';
 import type {
   DeletionAccount,
   DeletionJobRow,
@@ -408,6 +409,7 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       discoverSpeechDeletion,
       discoverAvatarDeletion,
       discoverVoiceAvatarDeletion,
+      discoverEventsDeletion,
     ]);
     expect(DELETION_DEPENDENCIES['account.core.immediate']).toEqual({ allStop: true });
     expect(DELETION_DEPENDENCIES['account.core.purge']).toEqual({ allStop: true });

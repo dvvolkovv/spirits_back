@@ -153,11 +153,44 @@ export class EventsService implements OnModuleInit, OnModuleDestroy {
     this.buffer = [];
 
     try {
+      // Privacy (Task 16): события удалённого аккаунта не должны попасть в
+      // таблицу ПОСЛЕ commit удаления — ни поздние track(), ни buffered.
+      // Кандидаты-владельцы: userId и префикс session_id (`<userId>_`).
+      // props НЕ сканируются: чужой id в props — не доказательство владения.
+      // Один state-запрос на весь batch. При его сбое — fail-closed: batch
+      // целиком отбрасывается (тот же исход, что при любой ошибке flush
+      // сегодня), удалённые события не вставляются «по ошибке».
+      const candidates = new Set<string>();
+      for (const e of batch) {
+        if (e.userId) candidates.add(e.userId);
+        const owner = sessionOwnerPrefix(e.sessionId);
+        if (owner) candidates.add(owner);
+      }
+      const deleted = new Set<string>();
+      if (candidates.size > 0) {
+        const res = await this.pg.query(
+          `SELECT internal_id FROM user_id
+            WHERE internal_id = ANY($1::text[]) AND state = 'deleted'`,
+          [[...candidates]],
+        );
+        for (const row of res?.rows ?? []) {
+          if (row?.internal_id != null) deleted.add(String(row.internal_id));
+        }
+      }
+      const live = deleted.size === 0
+        ? batch
+        : batch.filter((e) => {
+          if (e.userId && deleted.has(e.userId)) return false;
+          const owner = sessionOwnerPrefix(e.sessionId);
+          return !(owner !== null && deleted.has(owner));
+        });
+      if (live.length === 0) return;
+
       // Multi-row INSERT — one round-trip for the whole batch.
       const values: unknown[] = [];
       const placeholders: string[] = [];
       let i = 1;
-      for (const e of batch) {
+      for (const e of live) {
         placeholders.push(`($${i++}, $${i++}, $${i++}, $${i++}, $${i++}, $${i++})`);
         values.push(e.ts, e.userId, e.sessionId, e.name, JSON.stringify(e.props), e.source);
       }
@@ -170,4 +203,13 @@ export class EventsService implements OnModuleInit, OnModuleDestroy {
       this.log.error(`events flush failed (${batch.length} dropped): ${e.message}`);
     }
   }
+}
+
+// session_id имеет формат `<userId>_<agent...>`: владелец — подстрока до
+// ПЕРВОГО '_'. Без '_' владельца нет (sessionId целиком за userId не
+// принимается) — совпадает с LIKE $1 || '\_%' ESCAPE '\' в purge-адаптере.
+function sessionOwnerPrefix(sessionId: string | null): string | null {
+  if (!sessionId) return null;
+  const idx = sessionId.indexOf('_');
+  return idx > 0 ? sessionId.slice(0, idx) : null;
 }

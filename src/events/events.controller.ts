@@ -32,9 +32,13 @@ export class EventsController {
     if (GUEST_SERVER_EVENTS.includes(body.name)) {
       return res.status(204).end();
     }
+    // body.userId — НЕ доказательство владения (Task 16): если запрос дошёл
+    // с валидным JWT, аутентифицированный phone побеждает претензию из тела.
+    // У анонимного запроса body.userId остаётся — загрязнение агрегатов
+    // терпимо (см. шапку), ownership proof из body не извлекается.
     const userId =
-      body.userId ||
       (req as any).user?.phone ||  // present if a JWT slipped through
+      body.userId ||
       null;
     this.events.track(body.name, {
       userId,
