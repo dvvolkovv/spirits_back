@@ -217,8 +217,22 @@ class FakeSupportDb {
     }
     if (s.startsWith('INSERT INTO support_messages')) {
       if (this.failWrites) throw dbError();
-      const [ticketId, senderType, senderId, content] = params as any[];
-      const visible = params.length >= 6 ? Boolean(params[5]) : true;
+      // Две формы в support.service.ts: postUserMessage —
+      // VALUES ($1,'user',$2,$3), параметры [ticketId, senderId, content];
+      // postOwnerReply — VALUES ($1..$6), параметры
+      // [ticketId, senderType, senderId, content, metadata, visibleToUser].
+      let ticketId: unknown;
+      let senderType: unknown;
+      let senderId: unknown;
+      let content: unknown;
+      let visible = true;
+      if (params.length === 3) {
+        [ticketId, senderId, content] = params as any[];
+        senderType = 'user';
+      } else {
+        [ticketId, senderType, senderId, content] = params as any[];
+        visible = params.length >= 6 ? Boolean(params[5]) : true;
+      }
       const row: MessageRow = {
         id: `msg-${this.nextNum++}`,
         ticket_id: String(ticketId),
