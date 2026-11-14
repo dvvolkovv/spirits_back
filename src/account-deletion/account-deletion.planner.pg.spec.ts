@@ -24,6 +24,8 @@ import { discoverVoiceAvatarDeletion } from '../voice-avatar/voice-account-delet
 import { discoverEventsDeletion } from '../events/events-account-deletion.adapter';
 import { discoverTasksDeletion } from '../tasks/tasks-account-deletion.adapter';
 import { discoverSupportDeletion } from '../support/support-account-deletion.adapter';
+import { discoverPeerDeletion } from '../peer/peer-account-deletion.adapter';
+import { discoverContactsDeletion } from '../contacts/contacts-account-deletion.adapter';
 import type {
   DeletionAccount,
   DeletionJobRow,
@@ -414,6 +416,8 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       discoverEventsDeletion,
       discoverTasksDeletion,
       discoverSupportDeletion,
+      discoverPeerDeletion,
+      discoverContactsDeletion,
     ]);
     expect(DELETION_DEPENDENCIES['account.core.immediate']).toEqual({ allStop: true });
     expect(DELETION_DEPENDENCIES['account.core.purge']).toEqual({ allStop: true });
@@ -439,6 +443,12 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
     expect(DELETION_DEPENDENCIES['support.purge']).toEqual({
       allOf: ['support.stop'],
     });
+    // Task 17B: peer.purge ждёт peer.stop (алиасинг после снятия своих
+    // pending-заявок); у contacts.purge stop-фазы нет — правило не нужно.
+    expect(DELETION_DEPENDENCIES['peer.purge']).toEqual({
+      allOf: ['peer.stop'],
+    });
+    expect(DELETION_DEPENDENCIES['contacts.purge']).toBeUndefined();
   });
 
   describe('assertCurrent', () => {

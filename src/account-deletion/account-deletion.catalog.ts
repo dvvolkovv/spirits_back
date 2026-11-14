@@ -14,6 +14,8 @@ import { discoverVoiceAvatarDeletion } from '../voice-avatar/voice-account-delet
 import { discoverEventsDeletion } from '../events/events-account-deletion.adapter';
 import { discoverTasksDeletion } from '../tasks/tasks-account-deletion.adapter';
 import { discoverSupportDeletion } from '../support/support-account-deletion.adapter';
+import { discoverPeerDeletion } from '../peer/peer-account-deletion.adapter';
+import { discoverContactsDeletion } from '../contacts/contacts-account-deletion.adapter';
 import type {
   DeletionDiscoverer,
   DeletionResourceType,
@@ -36,6 +38,8 @@ export const DELETION_DISCOVERERS: readonly DeletionDiscoverer[] = [
   discoverEventsDeletion,
   discoverTasksDeletion,
   discoverSupportDeletion,
+  discoverPeerDeletion,
+  discoverContactsDeletion,
 ];
 
 export interface DeletionDependencyRule {
@@ -72,4 +76,10 @@ export const DELETION_DEPENDENCIES: Readonly<Partial<Record<
   // эквивалентно sameResourceKey — форма как у calendar.purge.
   'tasks.purge': { allOf: ['tasks.stop'] },
   'support.purge': { allOf: ['support.stop'] },
+  // Task 17B: алиасинг chat_requests выполняется после того, как stop снял
+  // собственные pending-заявки поколения — partial unique
+  // uniq_chat_requests_pending не видит пар удалённого ни до, ни после alias.
+  // resourceKey статический ('peer'), поэтому allOf эквивалентно
+  // sameResourceKey — форма как у tasks/support.
+  'peer.purge': { allOf: ['peer.stop'] },
 };

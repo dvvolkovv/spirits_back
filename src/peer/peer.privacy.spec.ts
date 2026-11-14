@@ -25,6 +25,10 @@ function makeAllowedService(options: {
 } = {}) {
   const pg = {
     query: jest.fn(async (sql: string, params: any[] = []) => {
+      // Task 17B: active-гейт sendRequest — вызывающий аккаунт активен.
+      if (sql.includes('FROM user_id WHERE internal_id')) {
+        return { rows: [{ n: 1 }], rowCount: 1 };
+      }
       if (sql.includes('SELECT 1 FROM ai_profiles_consolidated WHERE user_id')) {
         return { rows: options.targetExists === false ? [] : [{ exists: 1 }] };
       }
@@ -85,7 +89,11 @@ describe('PeerService.sendRequest privacy', () => {
     await expectProfileNotAvailable(service.sendRequest(FROM, dto));
 
     expect(canReceive).toHaveBeenCalledWith(pg, TO);
-    expect(pg.query).not.toHaveBeenCalled();
+    // Task 17B: до canReceiveNewProposal выполняется только active-гейт —
+    // никаких запросов к peer-таблицам и INSERT.
+    const queries = pg.query.mock.calls.map((call) => call[0]);
+    expect(queries.every((sql) => sql.includes('FROM user_id WHERE internal_id'))).toBe(true);
+    expectNoInsert(pg);
   });
 
   it('still applies the existing block rule when proposals are allowed', async () => {
