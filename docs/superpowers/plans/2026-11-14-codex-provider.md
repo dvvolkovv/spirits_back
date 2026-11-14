@@ -380,7 +380,12 @@ test('Дифф 4: под pm2 (pm_id в env) мост открывает порт
     });
     const up = await healthzUp(child);
     child.kill('SIGKILL');
-    await new Promise((resolve) => child.once('exit', resolve));
+    // Слушатель 'exit' регистрируется только если процесс ещё жив: обёртка без
+    // listen-сервера выходит раньше, и once('exit'), добавленный после события,
+    // не вызывается никогда (проверено исполнением 14.11.2026).
+    if (child.exitCode === null && child.signalCode === null) {
+      await new Promise((resolve) => child.once('exit', resolve));
+    }
     return up;
   };
 
