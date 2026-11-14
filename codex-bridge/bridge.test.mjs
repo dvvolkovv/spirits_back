@@ -507,3 +507,21 @@ test('Дифф 4: под pm2 (pm_id в env) мост открывает порт
   assert.equal(await run({ pm_id: undefined }), false,
     'без pm_id и не будучи главным модулем — порт не открывает');
 });
+
+test('Серверный дифф 1: входящая модель идёт на upstream и в кадры', async (t) => {
+  const { records, bridgeOrigin } = await startPair(t, (record, req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(TEXT_SSE);
+  });
+  const result = await post(bridgeOrigin, '/v1/messages', {
+    model: 'gpt-6-astra-custom',
+    messages: [{ role: 'user', content: 'hi' }],
+  });
+  assert.equal(result.status, 200);
+  assert.equal(JSON.parse(records[0].body).model, 'gpt-6-astra-custom');
+  assert.match(result.text, /gpt-6-astra-custom/);
+
+  const fallback = await post(bridgeOrigin, '/v1/messages', { messages: [] });
+  assert.equal(fallback.status, 200);
+  assert.equal(JSON.parse(records[1].body).model, 'gpt-6-astra');
+});
