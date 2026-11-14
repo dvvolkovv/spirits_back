@@ -851,13 +851,49 @@ test('Серверный дифф 3: дефолтный User-Agent — Linux x86
 });
 ```
 
-- [ ] **Step 2: Прогнать — красный; commit**
+- [ ] **Step 1b: Дописать тест guard'а stale-attempt (закрытие I1 из ревью Task 4)**
+
+Guard `if (request !== upstreamRequest) return;` (bridge.mjs, `request.on('error')`) — ключевой race-фикс диффа 2, но без этого теста его удаление оставляет весь набор зелёным. Тест НЕ красный — guard уже на месте; он фиксирует контракт «ошибка устаревшей попытки не перетирает ответ ретрая». Окно гонки создаётся таймерами: первая попытка умирает на 40 мс, вторая отвечает на 150 мс — клиентский ответ в этот момент открыт, и без guard'а клиент получил бы 502.
+
+```js
+test('Дифф 2, guard stale-attempt: ошибка устаревшей попытки не перетирает ответ ретрая', async (t) => {
+  let hits = 0;
+  let firstRes;
+  const { bridgeOrigin } = await startPair(t, (record, req, res) => {
+    hits += 1;
+    if (hits === 1) {
+      firstRes = res;
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.write('{"error":'); // частичное тело — ретрай уже стартовал, drain не завершён
+      return;
+    }
+    // Вторая попытка отвечает не сразу: окно, в котором сокет первой попытки
+    // умирает при ещё открытом (не законченном) клиентском ответе.
+    setTimeout(() => firstRes.destroy(), 40);
+    setTimeout(() => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(TEXT_SSE);
+    }, 150);
+  });
+  const result = await post(bridgeOrigin, '/v1/messages', {
+    model: 'gpt-6-astra', stream: true, messages: [{ role: 'user', content: 'hi' }],
+  });
+  assert.equal(result.status, 200);
+  assert.equal(hits, 2);
+});
+```
+
+- [ ] **Step 2: Прогнать — красный (UA); commit**
+
+Run: `cd ~/Downloads/spirits_back && node --test codex-bridge/*.test.mjs`
+Expected: `# pass 44`, `# fail 1` (красный только UA-тест; guard-тест зелёный сразу).
+
+Мутационная проверка guard-теста (НЕ коммитить): временно удалить строку `if (request !== upstreamRequest) return;` в `request.on('error')` → прогон → guard-тест обязан упасть (клиенту уходит 502; возможен и аварийный обрыв всего прогона — это тоже падение) → вернуть строку → прогон снова 44/1.
 
 ```bash
-cd ~/Downloads/spirits_back && node --test codex-bridge/*.test.mjs   # pass 43, fail 1
 git add codex-bridge/bridge.test.mjs
 git commit -m "$(cat <<'EOF'
-test(codex-bridge): дефолтный UA — Linux x86_64 (красный)
+test(codex-bridge): дефолтный UA — Linux x86_64 (красный) + тест guard'а stale-attempt
 
 Co-Authored-By: Claude Code <noreply@anthropic.com>
 EOF
@@ -889,7 +925,7 @@ export const UPSTREAM_UA = process.env.CODEX_BRIDGE_UA
 - [ ] **Step 4: Прогнать — зелёное; commit**
 
 ```bash
-node --test codex-bridge/*.test.mjs    # pass 44, fail 0
+node --test codex-bridge/*.test.mjs    # pass 45, fail 0
 git add codex-bridge/bridge.mjs
 git commit -m "$(cat <<'EOF'
 feat(codex-bridge): дифф 3 — Linux User-Agent по умолчанию
@@ -1905,14 +1941,14 @@ bash -n codex-bridge/keep-alive.sh && echo SYNTAX-OK
 4. Релей (вручную):
    - скопировать `codex-bridge/` из spirits_back в `/home/dv/file-agent/codex-bridge/` (bridge.mjs, translate.mjs, sse.mjs, keep-alive.sh);
    - обновлённый `relay-agent/llm-fallback.mjs` закоммитить как dv в живой ветке `reconcile/agent-versioned-live-part-b`;
-   - на релее: `node --check` каждого .mjs, `node --test` для llm-fallback.test.mjs и `node --test codex-bridge/*.test.mjs` → 44 pass (ловит порчу при копировании);
+   - на релее: `node --check` каждого .mjs, `node --test` для llm-fallback.test.mjs и `node --test codex-bridge/*.test.mjs` → 45 pass (ловит порчу при копировании);
    - `pm2 restart file-agent` — при нуле стримов, с OK; после — `pm2 status` и журнал без ошибок.
 
 ## Шаг 2. Сервер бэкенда (dvolkov@212.113.106.202)
 1. Закрепить CLI: `npm i -g @openai/codex@0.154.0`; `codex --version`; флаги освежителя сверить с `codex exec --help`.
 2. Логин владельца: на маке `ssh -L 1455:localhost:1455 dvolkov@212.113.106.202`, на сервере `codex login` — владелец одобряет в браузере САМ (пароль/2FA не трогать). Проверка: `test -r ~/.codex/auth.json && echo OK` (содержимое не выводить).
 3. Smoke сосуществования: один короткий `codex exec` (gpt-5.6-luna, read-only) на сервере; на маке убедиться, что роутер жив: `curl -s http://127.0.0.1:8788/healthz` → {"ok":true}.
-4. Поднять мост: `cd /home/dvolkov/spirits_back && node --test codex-bridge/*.test.mjs` → 44 pass / 0 fail (ловит порчу при выкате и версию Node), затем `cd codex-bridge && pm2 start bridge.mjs --name codex-bridge && pm2 save`. Запускать из оболочки, где НЕ экспортированы `BRIDGE_PORT`/`BRIDGE_LOG_PATH` (имена без префикса — чужая переменная окружения молча переставит мост; pm2 наследует env оболочки при первом start). Под pm2 мост поднимается благодаря диффу 4 (pm_id) — проверить `pm2 logs codex-bridge --lines 20` на строку listen.
+4. Поднять мост: `cd /home/dvolkov/spirits_back && node --test codex-bridge/*.test.mjs` → 45 pass / 0 fail (ловит порчу при выкате и версию Node), затем `cd codex-bridge && pm2 start bridge.mjs --name codex-bridge && pm2 save`. Запускать из оболочки, где НЕ экспортированы `BRIDGE_PORT`/`BRIDGE_LOG_PATH` (имена без префикса — чужая переменная окружения молча переставит мост; pm2 наследует env оболочки при первом start). Под pm2 мост поднимается благодаря диффу 4 (pm_id) — проверить `pm2 logs codex-bridge --lines 20` на строку listen.
 5. `curl -s http://127.0.0.1:8790/healthz` → {"ok":true}. Ходить ТОЛЬКО на `127.0.0.1`, не на `localhost`: мост слушает IPv4 и требует Host буквально `127.0.0.1:<port>` (иначе 421), а `localhost` на Node ≥17 резолвится в `::1` первым → ECONNREFUSED.
 6. Один живой smoke через мост (РОВНО РАЗ): `curl -sS http://127.0.0.1:8790/v1/messages -H 'content-type: application/json' -d '{"model":"gpt-6-astra","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"ответь ok"}]}'` → SSE с stop_reason end_turn.
 7. Ключ-заглушка в .env бэка (через stdin, не печатая): добавить строку `CODEX_FALLBACK_API_KEY=local-bridge`.
@@ -1963,7 +1999,7 @@ git pull --rebase -q origin main && git push -q origin main
 
 ## Финальная проверка (после всех задач)
 
-- [ ] `cd ~/Downloads/spirits_back && node --test codex-bridge/*.test.mjs relay-agent/llm-fallback.test.mjs` → 44 + relay, fail 0.
+- [ ] `cd ~/Downloads/spirits_back && node --test codex-bridge/*.test.mjs relay-agent/llm-fallback.test.mjs` → 45 + relay, fail 0.
 - [ ] На ноде (свежий sha main): `npx jest src/common/services/llm-fallback.spec.ts src/admin/admin-global-llm.controller.spec.ts src/admin/admin-llm-provider.controller.spec.ts src/monitoring/claude-health.alert-line.spec.ts src/monitoring/relay-qwen-monitor.service.spec.ts src/monitoring/claude-health.outage-alert.spec.ts` → PASS; `npx tsc -p tsconfig.build.json --noEmit` → OK.
 - [ ] `cd ~/Downloads/spirits_front` (Node 22): `pnpm vitest run src/components/admin/` → PASS; `node scripts/check-keys-exist.mjs && node scripts/check-locales.mjs` → зелёные.
 - [ ] `node --check scripts/codex-fallback-check.js`, `bash -n codex-bridge/keep-alive.sh`.
