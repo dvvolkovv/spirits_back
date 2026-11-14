@@ -3,7 +3,7 @@ import { PgService } from './pg.service';
 import { ANSWER_PROVIDERS, AnswerProvider, ProviderChoice, isAnswerProvider } from './llm-fallback';
 import { GlobalLlmProviderService } from './global-llm-provider.service';
 
-/** Модель ответов: 'claude', 'qwen' или 'kimi'. */
+/** Модель ответов: 'claude', 'qwen', 'kimi' или 'codex'. */
 export type LlmProvider = AnswerProvider;
 export const LLM_PROVIDERS: readonly LlmProvider[] = ANSWER_PROVIDERS;
 
@@ -24,8 +24,8 @@ export interface AnswerRoute {
 /**
  * Модель ответов ассистентов для конкретного человека (spec
  * 2026-10-30-llm-provider-switch, 2026-10-31-global-llm-switch).
- * NULL — «Как у всех» (общий рубильник), 'claude' / 'qwen' / 'kimi' — явный
- * личный выбор, рубильник к нему не применяется.
+ * NULL — «Как у всех» (общий рубильник), 'claude' / 'qwen' / 'kimi' / 'codex' —
+ * явный личный выбор, рубильник к нему не применяется.
  *
  * Отдельная колонка, а не ключ profile_data: profile_data пишет сам
  * пользователь через обновление профиля, а этот выбор тратит квоту владельца —
