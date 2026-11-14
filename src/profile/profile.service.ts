@@ -147,73 +147,23 @@ export class ProfileService implements OnModuleInit {
   }
 
   async deleteProfile(userId: string) {
-    // Отзыв доступа Apple (требование Sign in with Apple) отсюда убран и живёт
-    // в deletion-pipeline: integration.apple.stop в IntegrationsModule
-    // (Task 9) выполняется до identity unlink — порядок гарантирует зависимость
-    // account.core.purge {allStop:true}. Legacy deleteProfile будет заменён
-    // делегированием в координатор (Task 18).
-
-    // `_` в LIKE экранирован: иначе удаление номера 7903016918 стёрло бы и
-    // переписку 79030169187 — `_` в шаблоне совпадает с любым символом.
-    await this.pg.query(
-      `DELETE FROM custom_chat_history WHERE session_id LIKE $1 || '\\_%' ESCAPE '\\'`,
-      [userId],
-    );
-    await this.pg.query('DELETE FROM action_plans WHERE user_id = $1', [userId]);
-    await this.pg.query(
-      `UPDATE ai_profiles_consolidated
-       SET profile_data = '{}', email = NULL, preferred_agent = NULL, isadmin = false,
-           tokens = 0, updated_at = now()
-       WHERE user_id = $1`,
-      [userId],
-    );
-    await this.neo4j?.deleteUserGraph(userId);
-
-    // Связки входа рвём — иначе «удаление» им не является.
+    // Task 17: у метода не осталось собственных SQL/network вызовов.
     //
-    // Раньше строки user_identities оставались жить, чтобы перерегистрация
-    // тем же телефоном или почтой возвращала прежний баланс. Побочный эффект
-    // оказался таким: удалённый аккаунт пускал обратно по СТАРОМУ паролю, а
-    // связывание отдельной строкой поднимало ему state обратно в active. То
-    // есть с точки зрения человека аккаунт не удалялся вовсе — что и увидели
-    // при съёмке для Apple. Правило 5.1.1(v) считает это деактивацией, а не
-    // удалением.
+    // Fenced-удаление ядра (повторный capture файлов переписки, строгое
+    // стирание графа Neo4j и одна атомарная транзакция под блокировкой
+    // поколения) исполняет ProfileAccountDeletionAdapter — задачи
+    // account.core.immediate / account.core.purge. Все rationale-комментарии
+    // (escaped LIKE, правило 5.1.1(v), связка TG-бота 1:1 UNIQUE(tg_user_id),
+    // welcome_bonus_at у телефонного internal_id, двухчасовая дыра JWT от
+    // 15.08.2026) переехали в profile-account-deletion.adapter.ts вместе с
+    // SQL. Отзыв доступа Apple живёт в integration.apple.stop (Task 9) —
+    // порядок до identity unlink гарантирует зависимость account.core.*
+    // {allStop:true}.
     //
-    // Пароль и почту в user_id гасим там же: пароль иначе остался бы годным
-    // для нового аккаунта с тем же адресом, а primary_email — единственная
-    // оставшаяся копия адреса.
-    await this.pg.query('DELETE FROM user_identities WHERE user_id = $1', [userId]);
-    // Связка Telegram-бота — тоже связка входа: по ней мини-приложение узнаёт
-    // «старожилов бота», выдаёт им токены и заново заводит строку в
-    // user_identities. Пока она переживала удаление, Telegram удалённого
-    // аккаунта входил в него обратно. Бот и биллинг ботов отсутствие строки
-    // уже понимают — так выглядит любой, кто Telegram не привязывал: личка
-    // предложит подключиться, у групповых конфигов просто некому писать о
-    // балансе. Сама строка 1:1, так что освобождается и сам Telegram — его
-    // можно привязать к другому аккаунту без упора в UNIQUE (tg_user_id).
-    await this.pg.query('DELETE FROM tg_user_identities WHERE linkeon_user_id = $1', [userId]);
-    await this.pg.query(
-      `UPDATE user_id
-       SET state = 'deleted', password_hash = NULL, primary_email = NULL,
-           welcome_bonus_at = NULL, update_date = now()
-       WHERE internal_id = $1`,
-      [userId],
-    );
-    // welcome_bonus_at сбрасываем намеренно: у пользователя с телефонным
-    // входом internal_id — это сам номер, и перерегистрация неизбежно
-    // попадёт в ту же строку. Без сброса он получил бы чистый аккаунт с
-    // нулевым балансом и без стартового бонуса.
-    //
-    // Известный остаток: выданный РАНЬШЕ access-токен продолжает пускать до
-    // своего истечения — по умолчанию два часа (JWT_ACCESS_EXPIRES). Связок
-    // входа уже нет и продлить его нельзя (см. AuthService.isDeleted), но
-    // сам он ещё годен. Проверено на тестовом стенде 15.08.2026.
-    //
-    // Не закрыто сознательно: проверка состояния в JwtGuard легла бы на
-    // КАЖДЫЙ авторизованный запрос, и ошибка в ней кладёт весь API — размен
-    // хуже самой дыры. Дыра при этом ведёт к уже пустому аккаунту: профиль
-    // очищен, история удалена, баланс обнулён. Клиент после удаления сам
-    // выходит и токен выбрасывает.
+    // Task 18 заменит это тело делегированием lifecycle в координатор
+    // (begin + явный core). Промежуточное состояние допустимо: ветка
+    // мёржится целиком, worker удаления в main ещё не включён, а
+    // HTTP-контракт (200 {success:true}) сохранён.
     return { success: true };
   }
 

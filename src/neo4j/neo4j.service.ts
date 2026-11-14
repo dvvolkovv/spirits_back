@@ -286,6 +286,28 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /// Строгий вариант deleteUserGraph для deletion-pipeline (Task 17): НЕ
+  /// глотает ошибки. Legacy-метод выше оставлен без изменений для старых
+  /// путей — там недоступный Neo4j не отменяет удаление аккаунта.
+  ///
+  /// В pipeline сбой графа обязан быть видимым: адаптер account.core.*
+  /// превращает его в DeletionRetryError(deletionErrorKind(error)), а
+  /// local-строки остаются на месте для retry — граф идемпотентен
+  /// (DETACH DELETE) и выполняется до local-транзакции, поэтому повтор
+  /// безопасен. Ненастроенный драйвер (нет NEO4J_* в окружении) возвращает
+  /// управление молча: на такой установке графа просто нет.
+  async deleteUserGraphStrict(userId: string): Promise<void> {
+    const session = this.getSession();
+    if (!session) return;
+    try {
+      await session.run('MATCH (p:Profile {phone: $phone}) DETACH DELETE p', {
+        phone: userId,
+      });
+    } finally {
+      await session.close();
+    }
+  }
+
   async updateProfileEntities(userId: string, entityType: string, values: string[]): Promise<void> {
     const session = this.getSession();
     if (!session) return;

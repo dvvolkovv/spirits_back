@@ -2,6 +2,7 @@ import { DELETION_DEPENDENCIES } from './account-deletion.catalog';
 import {
   ACCOUNT_DELETION_RETENTION_MS,
   DeletionCancelledError,
+  DeletionRetryError,
   retryDelayMs,
 } from './account-deletion.safe';
 import type {
@@ -222,6 +223,58 @@ export class AccountDeletionJobs {
          AND j.lease_until IS NOT NULL
          AND j.lease_until > now()`,
       [job.id, job.userId, job.deletionId, job.attempts, job.leaseUntil],
+    );
+    if (result.rowCount !== 1) throw new DeletionCancelledError();
+  }
+
+  /**
+   * Все stop-задачи текущего поколения обязаны быть завершены до
+   * destructive-шагов core — зеркало allStop-eligibility из claimNext,
+   * перепроверенное в момент исполнения: между claim и recapture могут
+   * появиться новые stop-задачи (поздний capture файлов их не создаёт, но
+   * любой повторный collect обязан блокировать core тем же правилом).
+   *
+   * Исход retryable (kind db), а не cancelled: поколение текущее, аккаунт
+   * по-прежнему удаляется — core лишь ждёт завершения stop-задач и будет
+   * повторён runner-ом через backoff. Прецедент вида — retryable-исходы
+   * chat-file адаптера.
+   */
+  async assertNoImmediateBlockers(deletionId: string): Promise<void> {
+    const result = await this.db.query(
+      `SELECT 1
+       FROM account_deletion_jobs
+       WHERE deletion_id=$1
+         AND resource_type LIKE '%.stop'
+         AND status<>'done'
+       LIMIT 1`,
+      [deletionId],
+    );
+    if ((result.rows?.length ?? 0) > 0) throw new DeletionRetryError('db');
+  }
+
+  /**
+   * Финальный fencing внутри local-транзакции core: берёт строку user_id и
+   * строку задачи под FOR UPDATE и проверяет поколение. Блокировка
+   * сериализует competing reactivation: либо он коммитится первым и проверка
+   * здесь видит живой аккаунт (DeletionCancelledError — транзакция удаления
+   * откатывается), либо ждёт нашего коммита.
+   *
+   * В отличие от assertCurrent, lease/attempts здесь не проверяются: строка
+   * задачи уже наша и заперта до конца транзакции, а содержательно важно
+   * только поколение удаления.
+   */
+  async lockAndAssertCurrent(tx: Db, job: DeletionJobRow): Promise<void> {
+    const result = await tx.query(
+      `SELECT 1
+       FROM account_deletion_jobs j
+       JOIN user_id u ON u.internal_id=j.user_id
+       WHERE j.id=$1
+         AND j.user_id=$2
+         AND j.deletion_id=$3
+         AND u.deletion_id=$3
+         AND u.state='deleted'
+       FOR UPDATE OF u, j`,
+      [job.id, job.userId, job.deletionId],
     );
     if (result.rowCount !== 1) throw new DeletionCancelledError();
   }
