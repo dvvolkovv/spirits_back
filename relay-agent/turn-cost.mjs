@@ -44,12 +44,7 @@ export function hasKnownModelCost(provider, record) {
   return provider === "claude" && record !== null && record.hasUnknownModelCost !== true;
 }
 
-/**
- * База хода: сколько CLI насчитал сессии до запуска.
- * 0 — записей cost-state нет: сессия старше CLI 2.1.280 или ни один запуск не
- * дошёл до конца, и CLI начнёт счёт с нуля.
- * null — транскрипт не прочитался: базы нет, и стоимость хода назвать нельзя.
- */
+/** Last valid cost record, including tariff quality; null when absent or unreadable. */
 export function readCostRecord(file) {
   try {
     const size = fs.statSync(file).size;
@@ -80,6 +75,7 @@ export function runCost(total, base) {
   return Math.max(0, total - base);
 }
 
+/** Cost before this run: zero for a readable legacy transcript, null when unreadable. */
 export function costBaseline(file) {
   const record = readCostRecord(file);
   if (record) return record.totalCostUSD;

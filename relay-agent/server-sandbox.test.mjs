@@ -754,3 +754,17 @@ test("known CLI tariff remains billable with the exact current-run cost", async 
   assert.equal(done.turnCostUsd, 0.25);
   assert.equal(done.costBasis, "cli_tariff");
 });
+
+test("deadline applies after transient retries and cannot trigger another fallback", async (t) => {
+  const f = await fixture(t, { turnTimeoutMs: 60, fallback: true,
+    onSpawn: ({ child }, index) => {
+      if (index === 0) finishChild(child, [{ type: "result", subtype: "error_during_execution", is_error: true,
+        result: "API Error: 503 Service Unavailable", session_id: "retry-timeout" }]);
+    },
+  });
+  const done = doneEvent((await f.request()).text);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.calls[1].child.killed, true);
+  assert.equal(done.failReason, "turn_timeout");
+  assert.equal(done.failed, true);
+});
