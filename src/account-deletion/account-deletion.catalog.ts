@@ -12,6 +12,8 @@ import { discoverSpeechDeletion } from '../speech/speech-account-deletion.adapte
 import { discoverAvatarDeletion } from '../avatar/avatar-account-deletion.adapter';
 import { discoverVoiceAvatarDeletion } from '../voice-avatar/voice-account-deletion.adapter';
 import { discoverEventsDeletion } from '../events/events-account-deletion.adapter';
+import { discoverTasksDeletion } from '../tasks/tasks-account-deletion.adapter';
+import { discoverSupportDeletion } from '../support/support-account-deletion.adapter';
 import type {
   DeletionDiscoverer,
   DeletionResourceType,
@@ -32,6 +34,8 @@ export const DELETION_DISCOVERERS: readonly DeletionDiscoverer[] = [
   discoverAvatarDeletion,
   discoverVoiceAvatarDeletion,
   discoverEventsDeletion,
+  discoverTasksDeletion,
+  discoverSupportDeletion,
 ];
 
 export interface DeletionDependencyRule {
@@ -62,4 +66,10 @@ export const DELETION_DEPENDENCIES: Readonly<Partial<Record<
     sameResourceKey: ['voice.stop'],
     allOf: ['voice-document.purge'],
   },
+  // Task 17A: строки tasks/support стираются только после остановки
+  // (архивация задач / закрытие тикетов). resourceKey статический
+  // ('tasks'/'support', по одному job на аккаунт), поэтому allOf
+  // эквивалентно sameResourceKey — форма как у calendar.purge.
+  'tasks.purge': { allOf: ['tasks.stop'] },
+  'support.purge': { allOf: ['support.stop'] },
 };

@@ -94,15 +94,32 @@ export class TasksService implements OnModuleInit {
     if (!this.claudeCli) return;
 
     try {
+      // Task 17A: state-гейт ДО listActive/askLLMForDecision — удалённому
+      // аккаунту LLM-вызов (платный) не делается и новые задачи не пишутся
+      // (паттерн voice-avatar.service.ts profileAndClone). Сбой запроса
+      // глотается общим catch — fail-closed, экстракции нет.
+      if (!(await this.isAccountActive(userId))) return;
       const active = await this.listActive(userId);
       const decision = await this.askLLMForDecision(
         userId, agentId, userMessage, assistantMessage, active,
       );
       if (!decision) return;
+      // Между гейтами асинхронный LLM-вызов: аккаунт могли удалить, пока
+      // шло решение — повторная проверка до записи (applyDecision).
+      if (!(await this.isAccountActive(userId))) return;
       await this.applyDecision(userId, parseInt(agentId, 10) || null, decision);
     } catch (e: any) {
       this.logger.warn(`extractFromTurn failed for ${userId}/${agentId}: ${e?.message}`);
     }
+  }
+
+  /** Task 17A: активен ли аккаунт (прецедент — tg-config.service.ts assertActiveAccount). */
+  private async isAccountActive(userId: string): Promise<boolean> {
+    const res = await this.pg!.query(
+      `SELECT 1 FROM user_id WHERE internal_id = $1 AND state = 'active'`,
+      [userId],
+    );
+    return (res.rowCount ?? res.rows?.length ?? 0) > 0;
   }
 
   /** Список активных задач юзера (для context injection и для LLM-промпта). */

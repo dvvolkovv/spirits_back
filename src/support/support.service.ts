@@ -78,7 +78,24 @@ export class SupportService implements OnModuleInit {
 
   // -------------------- Ticket lifecycle --------------------
 
+  /**
+   * Task 17A: для удалённого/неактивного аккаунта новые tickets и сообщения
+   * не создаются (прецедент — tg-config.service.ts assertActiveAccount).
+   * Гейт стоит до записи в точках создания тикета и пользовательского
+   * сообщения; claim_version-логика draft'ов не затрагивается.
+   */
+  private async assertAccountActive(userId: string): Promise<void> {
+    const active = await this.pg.query(
+      `SELECT 1 FROM user_id WHERE internal_id = $1 AND state = 'active'`,
+      [userId],
+    );
+    if ((active.rowCount ?? active.rows?.length ?? 0) === 0) {
+      throw new BadRequestException('account is not active');
+    }
+  }
+
   async getOrCreateActiveTicket(userId: string): Promise<SupportTicketRow> {
+    await this.assertAccountActive(userId);
     const existing = await this.pg.query(
       `SELECT * FROM support_tickets
        WHERE user_id = $1 AND status IN ('ai_handling','escalated','owner_handling')
@@ -102,6 +119,8 @@ export class SupportService implements OnModuleInit {
    * speculatively by old code) shouldn't hide a previously-resolved ticket with real conversation.
    */
   async getLatestOrCreateTicket(userId: string): Promise<SupportTicketRow> {
+    // Task 17A: метод умеет СОЗДАВАТЬ тикет — для удалённого аккаунта нельзя.
+    await this.assertAccountActive(userId);
     const withMessages = await this.pg.query(
       `SELECT t.* FROM support_tickets t
        WHERE t.user_id = $1
@@ -193,6 +212,9 @@ export class SupportService implements OnModuleInit {
   async postUserMessage(
     userId: string, dto: PostUserMessageDto, opts: { storeBuild?: boolean } = {},
   ): Promise<{ ticketId: string }> {
+    // Task 17A: гейт до любых записей (и до AI-ответа — это платный LLM-вызов
+    // для аккаунта, которого нет).
+    await this.assertAccountActive(userId);
     const content = (dto.content || '').trim();
     if (!content) throw new BadRequestException('content required');
     if (content.length > LIMITS.MESSAGE_MAX) {
@@ -1155,6 +1177,14 @@ ${healthSummary}
     if (trimmed.length > LIMITS.MESSAGE_MAX) {
       throw new BadRequestException(`message too long (max ${LIMITS.MESSAGE_MAX})`);
     }
+    // Task 17A: проверяется состояние ВЛАДЕЛЬЦА тикета (пользователя, не
+    // админа) — после удаления аккаунта ответы в его тикет не пишутся. Гейт
+    // до входа в транзакцию postOwnerReply, чтобы не ломать claim-состояния.
+    const owner = await this.pg.query(
+      `SELECT user_id FROM support_tickets WHERE id = $1`, [ticketId],
+    );
+    if (!owner.rows[0]) throw new NotFoundException('ticket not found');
+    await this.assertAccountActive(String(owner.rows[0].user_id));
     await this.postOwnerReply(ticketId, ownerId, trimmed, null, visibleToUser, {
       visibleToUser, length: trimmed.length,
     });
