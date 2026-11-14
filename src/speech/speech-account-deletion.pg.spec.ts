@@ -2,7 +2,6 @@ import { randomUUID } from 'crypto';
 import { Pool } from 'pg';
 import { SpeechService } from './speech.service';
 import { discoverSpeechDeletion } from './speech-account-deletion.adapter';
-import { DeletionCancelledError } from '../account-deletion/account-deletion.safe';
 
 /**
  * Task 13 против живого Postgres: discovery SQL speech_clips/speech_listens
@@ -200,7 +199,10 @@ maybe('speech.purge/listen.purge против живого Postgres (Task 13)', 
     expect(left.rowCount).toBe(0);
   });
 
-  it('reactivation внутри transaction — DeletionCancelledError, rows остаются', async () => {
+  it('reactivation до исполнения — generation predicate: ничего не удалено, row остаётся', async () => {
+    // Mid-transaction reactivation (DeletionCancelledError) покрыт unit-спеком
+    // через failGenRecheck; здесь — реальный SQL generation predicate в
+    // доменном чтении: поколение не совпало → ранний идемпотентный выход.
     const calls: string[] = [];
     const svc = makeService(calls);
     const clipId = await insertClip(USER, CACHE_KEY);
@@ -209,8 +211,9 @@ maybe('speech.purge/listen.purge против живого Postgres (Task 13)', 
       [USER],
     );
 
-    await expect(svc.deleteSpeechClipForDeletion(USER, clipId, DELETION_ID))
-      .rejects.toBeInstanceOf(DeletionCancelledError);
+    await svc.deleteSpeechClipForDeletion(USER, clipId, DELETION_ID);
+
+    expect(calls).toEqual([]);
     const left = await pool.query('SELECT id FROM speech_clips');
     expect(left.rowCount).toBe(1);
   });
