@@ -28,8 +28,16 @@ import {
  * суммы) сохраняется через deletion-scoped alias, общие таблицы
  * (smm_music_track, smm_pricing) и official-кампании не выбираются никогда.
  *
+ * Fix-раунд (design-спек 2026-11-11, строка 44: «секреты соединений
+ * удаляются по действующим правилам» — БЕЗ условия наличия кампаний):
+ * job'ы двух форм — per-campaign (resourceKey=campaignId, campaign-scoped
+ * статусы/контент) и user-scoped (статический resourceKey 'legacy-smm',
+ * payload {}: social account revoke + oauth DELETE в stop, alias ledger/
+ * premium в purge). User-scoped пара создаётся discovery при наличии
+ * user-scoped строк, даже когда собственных кампаний нет вовсе.
+ *
  * PG-часть обязательна: у smm_* нет FOREIGN KEYS (001_core_schema.sql),
- * цепочка владенияcampaign → smm_scenario(campaign_id) → smm_video(scenario_id)
+ * цепочка владения campaign → smm_scenario(campaign_id) → smm_video(scenario_id)
  * → smm_publication(video_id) собирается руками через joins, и честность
  * billing-среза (суммы, video-ссылки, op/reason) проверяется на настоящей БД.
  * Alias 'deleted:<deletionId>' — 44 символа; user_id-колонки ledger и
@@ -71,12 +79,16 @@ const CONVERSATION_ID = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d';
 const CAMPAIGN_A = '00000000-0000-4000-8000-0000000000c1';
 const CAMPAIGN_B = '00000000-0000-4000-8000-0000000000c2';
 
+/** Статический resourceKey user-scoped пары (образец tasks/support/peer). */
+const USER_KEY = 'legacy-smm';
+
 class FakeSmmDb {
   readonly queries: Array<{ sql: string; params: any[] }> = [];
   constructor(private opts: {
     genOk: boolean;
     campaignIds: string[];
     externalSeen: boolean;
+    userScopedSeen: boolean;
   }) {}
   async query(sql: string, params: any[] = []) {
     const s = sql.replace(/\s+/g, ' ').trim();
@@ -95,6 +107,11 @@ class FakeSmmDb {
     }
     if (s.startsWith('SELECT 1 FROM smm_publication')) {
       return this.opts.externalSeen
+        ? { rows: [{ n: 1 }], rowCount: 1 }
+        : { rows: [], rowCount: 0 };
+    }
+    if (s.startsWith('SELECT 1 WHERE EXISTS')) {
+      return this.opts.userScopedSeen
         ? { rows: [{ n: 1 }], rowCount: 1 }
         : { rows: [], rowCount: 0 };
     }
@@ -124,9 +141,21 @@ function jobRow(
   };
 }
 
+function userScopedJobRow(
+  resourceType: 'legacy-smm.stop' | 'legacy-smm.purge',
+  overrides: Partial<DeletionJobRow> = {},
+): DeletionJobRow {
+  return jobRow(resourceType, USER_KEY, {
+    id: `job-${resourceType}-user`,
+    resourceKey: USER_KEY,
+    payload: {},
+    ...overrides,
+  });
+}
+
 describe('discoverLegacySmmDeletion — stop+purge на каждую собственную кампанию (Task 17E)', () => {
   it('два jobа на кампанию (stop immediate, purge purge), payload только {campaignId}; sanitizer плана проходит', async () => {
-    const db = new FakeSmmDb({ genOk: true, campaignIds: [CAMPAIGN_A, CAMPAIGN_B], externalSeen: false });
+    const db = new FakeSmmDb({ genOk: true, campaignIds: [CAMPAIGN_A, CAMPAIGN_B], externalSeen: false, userScopedSeen: false });
 
     const plan = await discoverLegacySmmDeletion({ db, account, origin: 'explicit' });
 
@@ -150,7 +179,7 @@ describe('discoverLegacySmmDeletion — stop+purge на каждую собст�
   });
 
   it('keyset-пагинация: pageSize=1 обходит все кампании', async () => {
-    const db = new FakeSmmDb({ genOk: true, campaignIds: [CAMPAIGN_A, CAMPAIGN_B], externalSeen: false });
+    const db = new FakeSmmDb({ genOk: true, campaignIds: [CAMPAIGN_A, CAMPAIGN_B], externalSeen: false, userScopedSeen: false });
 
     const plan = await discoverLegacySmmDeletion({
       db, account, origin: 'explicit', pageSize: 1,
@@ -159,12 +188,12 @@ describe('discoverLegacySmmDeletion — stop+purge на каждую собст�
     expect(plan.jobs.map((j) => j.resourceKey)).toEqual([
       CAMPAIGN_A, CAMPAIGN_A, CAMPAIGN_B, CAMPAIGN_B,
     ]);
-    // 1 gen + 3 страницы (A, B, пустая) + 1 external-exists.
+    // 1 gen + 3 страницы (A, B, пустая) + 1 external-exists + 1 user-scoped-exists.
     expect(db.queries.filter((q) => q.sql.startsWith('SELECT c.id FROM smm_campaign'))).toHaveLength(3);
   });
 
   it('reactivation (поколение не совпало) — план пустой, таблицы не читаются', async () => {
-    const db = new FakeSmmDb({ genOk: false, campaignIds: [CAMPAIGN_A], externalSeen: true });
+    const db = new FakeSmmDb({ genOk: false, campaignIds: [CAMPAIGN_A], externalSeen: true, userScopedSeen: true });
 
     const plan = await discoverLegacySmmDeletion({ db, account, origin: 'explicit' });
 
@@ -173,7 +202,7 @@ describe('discoverLegacySmmDeletion — stop+purge на каждую собст�
   });
 
   it('внешний пост без deletion adapter — один unsupported_external skip, а не выдуманный API/SSH вызов', async () => {
-    const db = new FakeSmmDb({ genOk: true, campaignIds: [CAMPAIGN_A], externalSeen: true });
+    const db = new FakeSmmDb({ genOk: true, campaignIds: [CAMPAIGN_A], externalSeen: true, userScopedSeen: false });
 
     const plan = await discoverLegacySmmDeletion({ db, account, origin: 'explicit' });
 
@@ -185,6 +214,49 @@ describe('discoverLegacySmmDeletion — stop+purge на каждую собст�
     }
     // Никаких не-SQL запросов (внешние вызовы к соцсетям запрещены планом).
     expect(db.queries.every((q) => q.sql.startsWith('SELECT'))).toBe(true);
+  });
+
+  it('user-scoped строки без кампаний — пара с статическим ключом legacy-smm и пустым payload', async () => {
+    const db = new FakeSmmDb({ genOk: true, campaignIds: [], externalSeen: false, userScopedSeen: true });
+
+    const plan = await discoverLegacySmmDeletion({ db, account, origin: 'explicit' });
+
+    expect(plan.jobs).toEqual([
+      { resourceType: 'legacy-smm.stop', resourceKey: USER_KEY, phase: 'immediate', payload: {} },
+      { resourceType: 'legacy-smm.purge', resourceKey: USER_KEY, phase: 'purge', payload: {} },
+    ]);
+    expect(plan.skips).toEqual([]);
+    const json = JSON.stringify(plan.jobs);
+    expect(json).not.toContain(USER);
+    expect(json).not.toContain(CRED_CANARY);
+    for (const job of plan.jobs) {
+      expect(() => safeDeletionJobSnapshot(job, USER)).not.toThrow();
+    }
+    expect(db.queries.every((q) => q.sql.startsWith('SELECT'))).toBe(true);
+  });
+
+  it('кампании + user-scoped строки — обе пары jobов', async () => {
+    const db = new FakeSmmDb({ genOk: true, campaignIds: [CAMPAIGN_A], externalSeen: false, userScopedSeen: true });
+
+    const plan = await discoverLegacySmmDeletion({ db, account, origin: 'explicit' });
+
+    expect(plan.jobs).toEqual([
+      { resourceType: 'legacy-smm.stop', resourceKey: CAMPAIGN_A, phase: 'immediate', payload: { campaignId: CAMPAIGN_A } },
+      { resourceType: 'legacy-smm.purge', resourceKey: CAMPAIGN_A, phase: 'purge', payload: { campaignId: CAMPAIGN_A } },
+      { resourceType: 'legacy-smm.stop', resourceKey: USER_KEY, phase: 'immediate', payload: {} },
+      { resourceType: 'legacy-smm.purge', resourceKey: USER_KEY, phase: 'purge', payload: {} },
+    ]);
+    for (const job of plan.jobs) {
+      expect(() => safeDeletionJobSnapshot(job, USER)).not.toThrow();
+    }
+  });
+
+  it('нет ни кампаний, ни user-scoped строк — план пустой', async () => {
+    const db = new FakeSmmDb({ genOk: true, campaignIds: [], externalSeen: false, userScopedSeen: false });
+
+    const plan = await discoverLegacySmmDeletion({ db, account, origin: 'explicit' });
+
+    expect(plan).toEqual({ jobs: [], skips: [] });
   });
 });
 
@@ -209,7 +281,7 @@ describe('wiring legacy-smm.stop/legacy-smm.purge (Task 17E)', () => {
   });
 
   it('чужой resourceType — отказ до любой записи', async () => {
-    const db = new FakeSmmDb({ genOk: true, campaignIds: [], externalSeen: false });
+    const db = new FakeSmmDb({ genOk: true, campaignIds: [], externalSeen: false, userScopedSeen: false });
     const adapter = new LegacySmmAccountDeletionAdapter({} as any, new AccountDeletionRegistry());
     const ctx: DeletionExecution = { db, assertCurrent: jest.fn(async () => undefined) };
 
@@ -221,7 +293,7 @@ describe('wiring legacy-smm.stop/legacy-smm.purge (Task 17E)', () => {
   });
 
   it('payload без валидного campaignId — DeletionRetryError(db) до любой записи', async () => {
-    const db = new FakeSmmDb({ genOk: true, campaignIds: [], externalSeen: false });
+    const db = new FakeSmmDb({ genOk: true, campaignIds: [], externalSeen: false, userScopedSeen: false });
     const adapter = new LegacySmmAccountDeletionAdapter({} as any, new AccountDeletionRegistry());
     const ctx: DeletionExecution = { db, assertCurrent: jest.fn(async () => undefined) };
 
@@ -230,6 +302,18 @@ describe('wiring legacy-smm.stop/legacy-smm.purge (Task 17E)', () => {
     ).rejects.toBeInstanceOf(DeletionRetryError);
     await expect(
       adapter.execute(jobRow('legacy-smm.stop', CAMPAIGN_A, { payload: {} }), ctx),
+    ).rejects.toMatchObject({ kind: 'db' });
+    expect(ctx.assertCurrent).not.toHaveBeenCalled();
+    expect(db.queries).toHaveLength(0);
+  });
+
+  it('user-scoped job с непустым payload — DeletionRetryError(db) до любой записи', async () => {
+    const db = new FakeSmmDb({ genOk: true, campaignIds: [], externalSeen: false, userScopedSeen: false });
+    const adapter = new LegacySmmAccountDeletionAdapter({} as any, new AccountDeletionRegistry());
+    const ctx: DeletionExecution = { db, assertCurrent: jest.fn(async () => undefined) };
+
+    await expect(
+      adapter.execute(userScopedJobRow('legacy-smm.purge', { payload: { campaignId: CAMPAIGN_A } }), ctx),
     ).rejects.toMatchObject({ kind: 'db' });
     expect(ctx.assertCurrent).not.toHaveBeenCalled();
     expect(db.queries).toHaveLength(0);
@@ -261,6 +345,29 @@ maybe('legacy SMM account deletion against PostgreSQL (Task 17E)', () => {
       query: (sql: string, params?: any[]) => pool.query(sql, params),
       getClient: () => pool.connect(),
     } as any;
+  }
+
+  function discoveryCtx() {
+    return {
+      db: { query: (sql: string, params?: unknown[]) => pool.query(sql, params as any[]) },
+      account,
+      origin: 'explicit' as const,
+    };
+  }
+
+  /**
+   * Полный прогон удаления: stop-фаза (user-scoped + кампании), затем
+   * purge-фаза (кампании + user-scoped) — порядок sameResourceKey-пар.
+   */
+  async function runDeletion(campaignIds: string[] = []): Promise<void> {
+    await adapter.execute(userScopedJobRow('legacy-smm.stop'), makeCtx());
+    for (const id of campaignIds) {
+      await adapter.execute(jobRow('legacy-smm.stop', id), makeCtx());
+    }
+    for (const id of campaignIds) {
+      await adapter.execute(jobRow('legacy-smm.purge', id), makeCtx());
+    }
+    await adapter.execute(userScopedJobRow('legacy-smm.purge'), makeCtx());
   }
 
   async function rows(sql: string, params: any[] = []): Promise<any[]> {
@@ -719,8 +826,7 @@ maybe('legacy SMM account deletion against PostgreSQL (Task 17E)', () => {
     await seedOauthState(USER);
     const before = await billingSnapshot();
 
-    await adapter.execute(jobRow('legacy-smm.stop', own.campaignId), makeCtx());
-    await adapter.execute(jobRow('legacy-smm.purge', own.campaignId), makeCtx());
+    await runDeletion([own.campaignId]);
 
     const db = await readDb();
     expect(db.socialAccounts[0]).toMatchObject({ status: 'revoked' });
@@ -779,8 +885,7 @@ maybe('legacy SMM account deletion against PostgreSQL (Task 17E)', () => {
     const otherEvent = await seedEventLog({ videoId: otherVideo });
     const orphanEvent = await seedEventLog({ eventType: 'system_step' });
 
-    await adapter.execute(jobRow('legacy-smm.stop', own.campaignId), makeCtx());
-    await adapter.execute(jobRow('legacy-smm.purge', own.campaignId), makeCtx());
+    await runDeletion([own.campaignId]);
 
     const left = await rows(`SELECT id FROM smm_event_log ORDER BY created_at, id`);
     expect(left.map((r) => r.id).sort()).toEqual([orphanEvent, otherEvent].sort());
@@ -825,22 +930,19 @@ maybe('legacy SMM account deletion against PostgreSQL (Task 17E)', () => {
       publicationStatus: 'published', externalPostId: EXTERNAL_ID_CANARY,
     });
 
-    const plan = await discoverLegacySmmDeletion({
-      db: { query: (sql: string, params?: unknown[]) => pool.query(sql, params as any[]) },
-      account,
-      origin: 'explicit',
-    });
+    const plan = await discoverLegacySmmDeletion(discoveryCtx());
 
     expect(plan.skips).toEqual([
       { resourceType: 'legacy-smm.purge', reason: 'unsupported_external' } satisfies DeletionSkip,
     ]);
     for (const skip of plan.skips) expect(() => assertSafeSkip(skip)).not.toThrow();
-    // Официальные кампании того же user_id в план не попадают.
-    expect(plan.jobs.every((j) => j.resourceKey === own.campaignId)).toBe(true);
-    expect(plan.jobs).toHaveLength(2);
+    // Официальные кампании того же user_id в план не попадают; user-scoped
+    // пара присутствует (есть ledger/premium строки пользователя).
+    expect(plan.jobs.filter((j) => j.resourceKey === own.campaignId)).toHaveLength(2);
+    expect(plan.jobs.filter((j) => j.resourceKey === USER_KEY)).toHaveLength(2);
+    expect(plan.jobs).toHaveLength(4);
 
-    await adapter.execute(jobRow('legacy-smm.stop', own.campaignId), makeCtx());
-    await adapter.execute(jobRow('legacy-smm.purge', own.campaignId), makeCtx());
+    await runDeletion([own.campaignId]);
 
     expect(await rows(`SELECT external_post_id, external_url, caption FROM smm_publication WHERE id=$1`,
       [own.publicationId]))
@@ -852,8 +954,7 @@ maybe('legacy SMM account deletion against PostgreSQL (Task 17E)', () => {
     const otherLedger = await seedLedger(OTHER, { amount: 50, op: 'charge' });
     const before = await billingSnapshot();
 
-    await adapter.execute(jobRow('legacy-smm.stop', own.campaignId), makeCtx());
-    await adapter.execute(jobRow('legacy-smm.purge', own.campaignId), makeCtx());
+    await runDeletion([own.campaignId]);
 
     expect(ALIAS).toHaveLength(44);
     expect(await rows(`SELECT DISTINCT user_id FROM smm_billing_ledger WHERE video_id=$1`, [own.videoId]))
@@ -880,15 +981,13 @@ maybe('legacy SMM account deletion against PostgreSQL (Task 17E)', () => {
          JOIN smm_video v ON v.scenario_id = s.id
         WHERE c.id = $1`, [officialId]));
 
-    const plan = await discoverLegacySmmDeletion({
-      db: { query: (sql: string, params?: unknown[]) => pool.query(sql, params as any[]) },
-      account,
-      origin: 'explicit',
-    });
-    expect(plan.jobs.every((j) => j.resourceKey === own.campaignId)).toBe(true);
+    const plan = await discoverLegacySmmDeletion(discoveryCtx());
+    const campaignKeys = plan.jobs
+      .filter((j) => j.resourceKey !== USER_KEY)
+      .map((j) => j.resourceKey);
+    expect(campaignKeys).toEqual([own.campaignId, own.campaignId]);
 
-    await adapter.execute(jobRow('legacy-smm.stop', own.campaignId), makeCtx());
-    await adapter.execute(jobRow('legacy-smm.purge', own.campaignId), makeCtx());
+    await runDeletion([own.campaignId]);
 
     expect(JSON.stringify(await rows(`SELECT * FROM smm_music_track`))).toBe(musicBefore);
     expect(JSON.stringify(await rows(`SELECT * FROM smm_pricing`))).toBe(pricingBefore);
@@ -926,8 +1025,7 @@ maybe('legacy SMM account deletion against PostgreSQL (Task 17E)', () => {
     const before = JSON.stringify(
       (await rows(otherDumpKeys, [otherCampaign, otherScenario, otherVideo, otherPub, OTHER]))[0].d);
 
-    await adapter.execute(jobRow('legacy-smm.stop', own.campaignId), makeCtx());
-    await adapter.execute(jobRow('legacy-smm.purge', own.campaignId), makeCtx());
+    await runDeletion([own.campaignId]);
 
     const after = JSON.stringify(
       (await rows(otherDumpKeys, [otherCampaign, otherScenario, otherVideo, otherPub, OTHER]))[0].d);
@@ -941,12 +1039,10 @@ maybe('legacy SMM account deletion against PostgreSQL (Task 17E)', () => {
     await seedSocialAccount(USER);
     await seedOauthState(USER);
 
-    await adapter.execute(jobRow('legacy-smm.stop', own.campaignId), makeCtx());
-    await adapter.execute(jobRow('legacy-smm.purge', own.campaignId), makeCtx());
+    await runDeletion([own.campaignId]);
     const first = await fullDump();
 
-    await expect(adapter.execute(jobRow('legacy-smm.stop', own.campaignId), makeCtx())).resolves.toBeUndefined();
-    await expect(adapter.execute(jobRow('legacy-smm.purge', own.campaignId), makeCtx())).resolves.toBeUndefined();
+    await expect(runDeletion([own.campaignId])).resolves.toBeUndefined();
 
     const second = await fullDump();
     expect(second).toBe(first);
@@ -962,8 +1058,7 @@ maybe('legacy SMM account deletion against PostgreSQL (Task 17E)', () => {
     // Другое поколение удаления (реактивация + новое удаление).
     await pool.query(`UPDATE user_id SET deletion_id=$1 WHERE internal_id=$2`, [randomUUID(), USER]);
 
-    await expect(adapter.execute(jobRow('legacy-smm.stop', own.campaignId), makeCtx())).resolves.toBeUndefined();
-    await expect(adapter.execute(jobRow('legacy-smm.purge', own.campaignId), makeCtx())).resolves.toBeUndefined();
+    await expect(runDeletion([own.campaignId])).resolves.toBeUndefined();
 
     expect(await fullDump()).toBe(before);
     expect(await rows(`SELECT credentials->>'access_token' AS t FROM smm_social_account`))
@@ -978,11 +1073,14 @@ maybe('legacy SMM account deletion against PostgreSQL (Task 17E)', () => {
     const ctx = makeCtx();
     ctx.assertCurrent.mockRejectedValue(new DeletionCancelledError());
 
+    // Все четыре jobа (user-scoped пара и campaign-пара) отменяются до записи.
+    await expect(adapter.execute(userScopedJobRow('legacy-smm.stop'), ctx))
+      .rejects.toBeInstanceOf(DeletionCancelledError);
     await expect(adapter.execute(jobRow('legacy-smm.stop', own.campaignId), ctx))
       .rejects.toBeInstanceOf(DeletionCancelledError);
-    const ctx2 = makeCtx();
-    ctx2.assertCurrent.mockRejectedValue(new DeletionCancelledError());
-    await expect(adapter.execute(jobRow('legacy-smm.purge', own.campaignId), ctx2))
+    await expect(adapter.execute(jobRow('legacy-smm.purge', own.campaignId), ctx))
+      .rejects.toBeInstanceOf(DeletionCancelledError);
+    await expect(adapter.execute(userScopedJobRow('legacy-smm.purge'), ctx))
       .rejects.toBeInstanceOf(DeletionCancelledError);
 
     expect(await fullDump()).toBe(before);
@@ -997,11 +1095,87 @@ maybe('legacy SMM account deletion against PostgreSQL (Task 17E)', () => {
     await adapter.execute(jobRow('legacy-smm.purge', otherCampaign), makeCtx());
 
     const after = await fullDump();
-    // Чужая кампания не тронута; единственное — user-scoped stop-операции
-    // (social/oauth) относятся к USER, их в этом мире нет, кроме own-цепочки.
+    // Чужая кампания не тронута: per-campaign stop/purge гейтятся
+    // OWN_CAMPAIGN_PREDICATE (c.user_id=$1 AND c.id=$3), чужой id даёт 0 строк.
     expect(after).toBe(before);
     expect(after).toContain(TOPIC_CANARY);
     expect(await rows(`SELECT topic FROM smm_campaign WHERE id=$1`, [own.campaignId]))
       .toEqual([{ topic: TOPIC_CANARY }]);
+  });
+
+  it('пользователь без кампаний: credentials отзываются, oauth удаляется, billing алиасится', async () => {
+    // Ни одной smm_campaign — только user-scoped след. Design-спек (строка 44):
+    // секреты соединения удаляются по действующим правилам, БЕЗ условия
+    // наличия кампаний.
+    await seedSocialAccount(USER);
+    await seedOauthState(USER);
+    await seedLedger(USER, { amount: 1000, op: 'charge' });
+    await seedPremium(USER);
+    const before = await billingSnapshot();
+
+    const plan = await discoverLegacySmmDeletion(discoveryCtx());
+    expect(plan.jobs).toEqual([
+      { resourceType: 'legacy-smm.stop', resourceKey: USER_KEY, phase: 'immediate', payload: {} },
+      { resourceType: 'legacy-smm.purge', resourceKey: USER_KEY, phase: 'purge', payload: {} },
+    ]);
+    expect(plan.skips).toEqual([]);
+
+    await adapter.execute(userScopedJobRow('legacy-smm.stop'), makeCtx());
+    await adapter.execute(userScopedJobRow('legacy-smm.purge'), makeCtx());
+
+    const db = await readDb();
+    expect(db.socialAccounts).toHaveLength(1);
+    expect(db.socialAccounts[0].status).toBe('revoked');
+    expect(db.socialAccounts[0].credentials).toEqual({});
+    expect(db.oauthStates).toHaveLength(0);
+
+    // Billing сохранён байт-в-байт; user_id заменён alias-ом (44 символа).
+    expect(await billingSnapshot()).toBe(before);
+    expect(ALIAS).toHaveLength(44);
+    expect(await rows(`SELECT DISTINCT user_id FROM smm_billing_ledger`))
+      .toEqual([{ user_id: ALIAS }]);
+    expect(await rows(`SELECT DISTINCT user_id FROM smm_premium_generation`))
+      .toEqual([{ user_id: ALIAS }]);
+
+    const dump = await fullDump();
+    expect(dump).not.toContain(CRED_CANARY);
+    expect(dump).toContain(ALIAS);
+    // smm_social_account.user_id остаётся: план алиасит только ledger/premium.
+    expect(dump).toContain(USER);
+  });
+
+  it('per-campaign stop не трогает user-scoped данные (social/oauth)', async () => {
+    const own = await seedOwnWorld();
+    await seedSocialAccount(USER);
+    await seedOauthState(USER);
+    const beforeSocial = JSON.stringify(await rows(`SELECT * FROM smm_social_account`));
+    const beforeOauth = JSON.stringify(await rows(`SELECT * FROM smm_oauth_state`));
+
+    await adapter.execute(jobRow('legacy-smm.stop', own.campaignId), makeCtx());
+
+    // Кампания остановлена, но social/oauth — байт-в-байт без изменений.
+    expect(await rows(`SELECT status FROM smm_campaign WHERE id=$1`, [own.campaignId]))
+      .toEqual([{ status: 'cancelled' }]);
+    expect(JSON.stringify(await rows(`SELECT * FROM smm_social_account`))).toBe(beforeSocial);
+    expect(JSON.stringify(await rows(`SELECT * FROM smm_oauth_state`))).toBe(beforeOauth);
+    expect(await rows(`SELECT credentials->>'access_token' AS t FROM smm_social_account`))
+      .toEqual([{ t: CRED_CANARY }]);
+
+    // Секреты отзывает только user-scoped stop.
+    await adapter.execute(userScopedJobRow('legacy-smm.stop'), makeCtx());
+    expect(await rows(`SELECT status, credentials::text AS c FROM smm_social_account`))
+      .toEqual([{ status: 'revoked', c: '{}' }]);
+    expect(await rows(`SELECT count(*)::int AS n FROM smm_oauth_state`)).toEqual([{ n: 0 }]);
+  });
+
+  it('нет кампаний и user-scoped строк — discovery возвращает пустой план', async () => {
+    // В базе только данные OTHER и общие таблицы — для USER работы нет.
+    await seedSocialAccount(OTHER);
+    await seedOauthState(OTHER);
+    await seedLedger(OTHER, { amount: 10, op: 'charge' });
+    await seedPremium(OTHER);
+
+    const plan = await discoverLegacySmmDeletion(discoveryCtx());
+    expect(plan).toEqual({ jobs: [], skips: [] });
   });
 });
