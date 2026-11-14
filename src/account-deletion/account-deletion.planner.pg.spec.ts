@@ -32,6 +32,7 @@ import { discoverBackupDeletion } from '../backup/backup-account-deletion.adapte
 import { discoverDevicesDeletion } from '../devices/devices-account-deletion.adapter';
 import { discoverGuestDeletion } from '../guest-trial/guest-account-deletion.adapter';
 import { discoverLegacyAuthDeletion } from '../identity/legacy-auth-account-deletion.adapter';
+import { discoverLegacySmmDeletion } from '../misc/legacy-smm-account-deletion.adapter';
 import type {
   DeletionAccount,
   DeletionJobRow,
@@ -430,6 +431,7 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       discoverDevicesDeletion,
       discoverGuestDeletion,
       discoverLegacyAuthDeletion,
+      discoverLegacySmmDeletion,
     ]);
     expect(DELETION_DEPENDENCIES['account.core.immediate']).toEqual({ allStop: true });
     expect(DELETION_DEPENDENCIES['account.core.purge']).toEqual({ allStop: true });
@@ -476,6 +478,14 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
     expect(DELETION_DEPENDENCIES['legacy-auth.purge']).toBeUndefined();
     expect(DELETION_DEPENDENCIES['profile-backup.purge']).toBeUndefined();
     expect(DELETION_DEPENDENCIES['devices.purge']).toBeUndefined();
+    // Task 17E: legacy-smm.purge ждёт stop ЭТОЙ ЖЕ кампании (credentials
+    // отзываются до стирания контента). resourceKey = campaignId, кампаний
+    // на аккаунт несколько — форма sameResourceKey (как product.purge/
+    // voice.purge), а не allOf.
+    expect(DELETION_DEPENDENCIES['legacy-smm.purge']).toEqual({
+      sameResourceKey: ['legacy-smm.stop'],
+    });
+    expect(DELETION_DEPENDENCIES['legacy-smm.stop']).toBeUndefined();
   });
 
   describe('assertCurrent', () => {

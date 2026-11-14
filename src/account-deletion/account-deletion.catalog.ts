@@ -22,6 +22,7 @@ import { discoverBackupDeletion } from '../backup/backup-account-deletion.adapte
 import { discoverDevicesDeletion } from '../devices/devices-account-deletion.adapter';
 import { discoverGuestDeletion } from '../guest-trial/guest-account-deletion.adapter';
 import { discoverLegacyAuthDeletion } from '../identity/legacy-auth-account-deletion.adapter';
+import { discoverLegacySmmDeletion } from '../misc/legacy-smm-account-deletion.adapter';
 import type {
   DeletionDiscoverer,
   DeletionResourceType,
@@ -56,6 +57,9 @@ export const DELETION_DISCOVERERS: readonly DeletionDiscoverer[] = [
   discoverDevicesDeletion,
   discoverGuestDeletion,
   discoverLegacyAuthDeletion,
+  // Task 17E: legacy SMM — чистый SQL (доменных сервисов нет), stop+purge
+  // на каждую собственную не-official кампанию.
+  discoverLegacySmmDeletion,
 ];
 
 export interface DeletionDependencyRule {
@@ -104,4 +108,10 @@ export const DELETION_DEPENDENCIES: Readonly<Partial<Record<
   // заявка на вывод. resourceKey статический ('referral') — форма как у
   // tasks/support/peer.
   'referral.purge': { allOf: ['referral.stop'] },
+  // Task 17E: контент кампании стирается только после stop ЭТОЙ кампании
+  // (статусы → cancelled, credentials соцаккаунтов отозваны до scrub).
+  // resourceKey = campaignId, кампаний на аккаунт несколько — поэтому форма
+  // sameResourceKey (как product.purge/voice.purge), а не allOf: purge одной
+  // кампании не должен ждать stop всех остальных.
+  'legacy-smm.purge': { sameResourceKey: ['legacy-smm.stop'] },
 };
