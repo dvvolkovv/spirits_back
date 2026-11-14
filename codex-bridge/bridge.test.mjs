@@ -451,3 +451,59 @@ test('upstream 401 message reaches the client but never the log file', async (t)
   assert.ok(logged.length > 0);
   assert.ok(!logged.includes('УНИКАЛЬНЫЙ_ТЕКСТ_ОШИБКИ'));
 });
+
+test('Дифф 4: под pm2 (pm_id в env) мост открывает порт', async (t) => {
+  const { spawn } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-pm2-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  // pm2 в fork mode поднимает процесс через ProcessContainerFork.js: argv[1]
+  // указывает на раннер, а не на скрипт. Имитируем обёрткой, импортирующей bridge.mjs.
+  const bridgePath = fileURLToPath(new URL('./bridge.mjs', import.meta.url));
+  const wrapperPath = path.join(dir, 'wrapper.mjs');
+  fs.writeFileSync(wrapperPath, `await import(${JSON.stringify(bridgePath)});\n`);
+
+  const logPath = path.join(dir, 'bridge.log');
+  const port = 18000 + Math.floor(Math.random() * 1000);
+
+  const healthzUp = (child) =>
+    new Promise((resolve) => {
+      const deadline = Date.now() + 5000;
+      const tick = () => {
+        if (child.exitCode !== null || child.signalCode !== null) return resolve(false);
+        const req = http.get(
+          { host: '127.0.0.1', port, path: '/healthz', timeout: 300 },
+          (res) => { res.resume(); resolve(res.statusCode === 200); },
+        );
+        req.on('error', () => {
+          if (Date.now() > deadline) return resolve(false);
+          setTimeout(tick, 100);
+        });
+        req.on('timeout', () => req.destroy());
+      };
+      tick();
+    });
+
+  const run = async (extraEnv) => {
+    const child = spawn(process.execPath, [wrapperPath], {
+      env: { ...process.env, ...extraEnv, BRIDGE_PORT: String(port), BRIDGE_LOG_PATH: logPath },
+      stdio: 'ignore',
+    });
+    const up = await healthzUp(child);
+    child.kill('SIGKILL');
+    // Если дочерний процесс уже завершился (негативная ветка — обёртка выходит
+    // сразу, т.к. мост не слушает), событие 'exit' уже fired: once('exit')
+    // после него никогда не разрешится и тест зависнет.
+    if (child.exitCode === null && child.signalCode === null) {
+      await new Promise((resolve) => child.once('exit', resolve));
+    }
+    return up;
+  };
+
+  assert.equal(await run({ pm_id: '0' }), true,
+    'при pm_id (pm2 fork mode) мост обязан открыть порт');
+  assert.equal(await run({ pm_id: undefined }), false,
+    'без pm_id и не будучи главным модулем — порт не открывает');
+});
