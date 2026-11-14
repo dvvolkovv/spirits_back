@@ -351,7 +351,8 @@ describe('VoiceAvatarAccountDeletionAdapter.execute — строгий purge (Ta
   });
 
   it('assertCurrent зовётся до external и до DELETE', async () => {
-    const { adapter, ctx } = makeHarness();
+    const { db, adapter, ctx } = makeHarness();
+    seedRow(db);
 
     await adapter.execute(voiceJob(), ctx);
 
