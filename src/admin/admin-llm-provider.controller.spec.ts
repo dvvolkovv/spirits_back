@@ -17,15 +17,17 @@ const mkRes = () => {
 describe('AdminLlmProviderController', () => {
   /** Рубильник в теле ответа (global) — в большинстве тестов не важен: стоит на Claude. */
   const global = { get: jest.fn(async () => 'claude') };
-  const OLD = { qwen: process.env.QWEN_FALLBACK_API_KEY, kimi: process.env.KIMI_FALLBACK_API_KEY };
+  const OLD = { qwen: process.env.QWEN_FALLBACK_API_KEY, kimi: process.env.KIMI_FALLBACK_API_KEY, codex: process.env.CODEX_FALLBACK_API_KEY };
   /** Какие ключи запасных заданы на бэкенде. */
-  const keys = (qwen: boolean, kimi: boolean) => {
+  const keys = (qwen: boolean, kimi: boolean, codex = false) => {
     if (qwen) process.env.QWEN_FALLBACK_API_KEY = 'sk-sp-test'; else delete process.env.QWEN_FALLBACK_API_KEY;
     if (kimi) process.env.KIMI_FALLBACK_API_KEY = 'sk-kimi-test'; else delete process.env.KIMI_FALLBACK_API_KEY;
+    if (codex) process.env.CODEX_FALLBACK_API_KEY = 'local-bridge'; else delete process.env.CODEX_FALLBACK_API_KEY;
   };
   afterEach(() => {
     if (OLD.qwen === undefined) delete process.env.QWEN_FALLBACK_API_KEY; else process.env.QWEN_FALLBACK_API_KEY = OLD.qwen;
     if (OLD.kimi === undefined) delete process.env.KIMI_FALLBACK_API_KEY; else process.env.KIMI_FALLBACK_API_KEY = OLD.kimi;
+    if (OLD.codex === undefined) delete process.env.CODEX_FALLBACK_API_KEY; else process.env.CODEX_FALLBACK_API_KEY = OLD.codex;
   });
 
   it('закрыт JwtGuard + AdminGuard', () => {
@@ -41,7 +43,7 @@ describe('AdminLlmProviderController', () => {
     expect(svc.get).toHaveBeenCalledWith('u-1');
     expect(res.status).toHaveBeenCalledWith(200);
     expect(res.json).toHaveBeenCalledWith({
-      userId: 'u-1', provider: 'kimi', effective: 'claude', global: 'claude', qwenConfigured: true, configured: { qwen: true, kimi: false },
+      userId: 'u-1', provider: 'kimi', effective: 'claude', global: 'claude', qwenConfigured: true, configured: { qwen: true, kimi: false, codex: false },
     });
   });
 
@@ -51,7 +53,7 @@ describe('AdminLlmProviderController', () => {
     const res = mkRes();
     await new AdminLlmProviderController(svc as any, global as any).get('u-1', res);
     expect(res.json).toHaveBeenCalledWith({
-      userId: 'u-1', provider: 'claude', effective: 'claude', global: 'claude', qwenConfigured: false, configured: { qwen: false, kimi: false },
+      userId: 'u-1', provider: 'claude', effective: 'claude', global: 'claude', qwenConfigured: false, configured: { qwen: false, kimi: false, codex: false },
     });
   });
 
@@ -63,7 +65,19 @@ describe('AdminLlmProviderController', () => {
     expect(svc.set).toHaveBeenCalledWith('u-1', 'kimi');
     expect(res.status).toHaveBeenCalledWith(200);
     expect(res.json).toHaveBeenCalledWith({
-      userId: 'u-1', provider: 'kimi', effective: 'kimi', global: 'claude', qwenConfigured: false, configured: { qwen: false, kimi: true },
+      userId: 'u-1', provider: 'kimi', effective: 'kimi', global: 'claude', qwenConfigured: false, configured: { qwen: false, kimi: true, codex: false },
+    });
+  });
+
+  it('POST codex: сохраняет и отдаёт новое значение', async () => {
+    keys(false, false, true);
+    const svc = { get: jest.fn(), set: jest.fn(async () => true) };
+    const res = mkRes();
+    await new AdminLlmProviderController(svc as any, global as any).set('u-1', { userId: 'admin-1' }, { provider: 'codex' }, res);
+    expect(svc.set).toHaveBeenCalledWith('u-1', 'codex');
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith({
+      userId: 'u-1', provider: 'codex', effective: 'codex', global: 'claude', qwenConfigured: false, configured: { qwen: false, kimi: false, codex: true },
     });
   });
 
@@ -72,7 +86,7 @@ describe('AdminLlmProviderController', () => {
     const res = mkRes();
     await new AdminLlmProviderController(svc as any, global as any).set('u-1', { userId: 'admin-1' }, { provider: 'gpt' }, res);
     expect(res.status).toHaveBeenCalledWith(400);
-    expect(res.json).toHaveBeenCalledWith({ error: "provider: 'default' | 'claude' | 'qwen' | 'kimi'" });
+    expect(res.json).toHaveBeenCalledWith({ error: "provider: 'default' | 'claude' | 'qwen' | 'kimi' | 'codex'" });
     expect(svc.set).not.toHaveBeenCalled();
   });
 
@@ -116,7 +130,7 @@ describe('AdminLlmProviderController', () => {
     const res = mkRes();
     await new AdminLlmProviderController(svc as any, g as any).get('u-1', res);
     expect(res.json).toHaveBeenCalledWith({
-      userId: 'u-1', provider: 'default', effective: 'qwen', global: 'qwen', qwenConfigured: true, configured: { qwen: true, kimi: false },
+      userId: 'u-1', provider: 'default', effective: 'qwen', global: 'qwen', qwenConfigured: true, configured: { qwen: true, kimi: false, codex: false },
     });
   });
 
@@ -127,7 +141,7 @@ describe('AdminLlmProviderController', () => {
     const res = mkRes();
     await new AdminLlmProviderController(svc as any, g as any).get('u-1', res);
     expect(res.json).toHaveBeenCalledWith({
-      userId: 'u-1', provider: 'default', effective: 'claude', global: 'kimi', qwenConfigured: false, configured: { qwen: false, kimi: false },
+      userId: 'u-1', provider: 'default', effective: 'claude', global: 'kimi', qwenConfigured: false, configured: { qwen: false, kimi: false, codex: false },
     });
   });
 

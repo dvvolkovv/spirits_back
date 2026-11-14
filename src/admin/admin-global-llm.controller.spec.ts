@@ -14,14 +14,16 @@ const mkRes = () => { const res: any = {}; res.status = jest.fn(() => res); res.
 const status = (provider: string) => ({ provider, since: '2026-10-31T13:40:00.000Z', by: 'admin-1' });
 
 describe('AdminGlobalLlmController', () => {
-  const OLD = { qwen: process.env.QWEN_FALLBACK_API_KEY, kimi: process.env.KIMI_FALLBACK_API_KEY };
-  const keys = (qwen: boolean, kimi: boolean) => {
+  const OLD = { qwen: process.env.QWEN_FALLBACK_API_KEY, kimi: process.env.KIMI_FALLBACK_API_KEY, codex: process.env.CODEX_FALLBACK_API_KEY };
+  const keys = (qwen: boolean, kimi: boolean, codex = false) => {
     if (qwen) process.env.QWEN_FALLBACK_API_KEY = 'sk-sp-test'; else delete process.env.QWEN_FALLBACK_API_KEY;
     if (kimi) process.env.KIMI_FALLBACK_API_KEY = 'sk-kimi-test'; else delete process.env.KIMI_FALLBACK_API_KEY;
+    if (codex) process.env.CODEX_FALLBACK_API_KEY = 'local-bridge'; else delete process.env.CODEX_FALLBACK_API_KEY;
   };
   afterEach(() => {
     if (OLD.qwen === undefined) delete process.env.QWEN_FALLBACK_API_KEY; else process.env.QWEN_FALLBACK_API_KEY = OLD.qwen;
     if (OLD.kimi === undefined) delete process.env.KIMI_FALLBACK_API_KEY; else process.env.KIMI_FALLBACK_API_KEY = OLD.kimi;
+    if (OLD.codex === undefined) delete process.env.CODEX_FALLBACK_API_KEY; else process.env.CODEX_FALLBACK_API_KEY = OLD.codex;
     (sendTelegramAlert as jest.Mock).mockClear();
     (sendTelegramAlert as jest.Mock).mockImplementation(async () => undefined);
     jest.restoreAllMocks();
@@ -38,7 +40,7 @@ describe('AdminGlobalLlmController', () => {
     const res = mkRes();
     await new AdminGlobalLlmController(svc as any).get(res);
     expect(res.status).toHaveBeenCalledWith(200);
-    expect(res.json).toHaveBeenCalledWith({ ...status('qwen'), configured: { qwen: true, kimi: false } });
+    expect(res.json).toHaveBeenCalledWith({ ...status('qwen'), configured: { qwen: true, kimi: false, codex: false } });
   });
 
   it('POST qwen: пишет с актором, лог, сообщение в группу, отдаёт новый статус целиком', async () => {
@@ -51,7 +53,7 @@ describe('AdminGlobalLlmController', () => {
     expect(res.status).toHaveBeenCalledWith(200);
     // Тело ответа целиком — не только статус-код (ревью 01.11): провайдер,
     // since, by и ключи должны дойти до клиента, а не только HTTP 200.
-    expect(res.json).toHaveBeenCalledWith({ ...status('qwen'), configured: { qwen: true, kimi: false } });
+    expect(res.json).toHaveBeenCalledWith({ ...status('qwen'), configured: { qwen: true, kimi: false, codex: false } });
     expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toContain('admin-1: claude → qwen');
     expect(sendTelegramAlert).toHaveBeenCalledTimes(1);
     expect((sendTelegramAlert as jest.Mock).mock.calls[0][0]).toContain('Модель ответов для всех: Qwen');
@@ -75,12 +77,36 @@ describe('AdminGlobalLlmController', () => {
     expect(svc.set).not.toHaveBeenCalled();
   });
 
+  it('POST codex без ключа — 409 no_key, ничего не пишет', async () => {
+    keys(true, false);
+    const svc = { status: jest.fn(), set: jest.fn() };
+    const res = mkRes();
+    await new AdminGlobalLlmController(svc as any).set({ userId: 'admin-1' }, { provider: 'codex' }, res);
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith({ error: 'no_key', provider: 'codex' });
+    expect(svc.set).not.toHaveBeenCalled();
+  });
+
+  it('POST codex с ключом — 200, лог и сообщение в группу с меткой Codex', async () => {
+    keys(true, false, true);
+    const log = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
+    const svc = { status: jest.fn(async () => status('codex')), set: jest.fn(async () => ({ previous: 'claude' })) };
+    const res = mkRes();
+    await new AdminGlobalLlmController(svc as any).set({ userId: 'admin-1' }, { provider: 'codex' }, res);
+    expect(svc.set).toHaveBeenCalledWith('codex', 'admin-1');
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith({ ...status('codex'), configured: { qwen: true, kimi: false, codex: true } });
+    expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toContain('admin-1: claude → codex');
+    expect(sendTelegramAlert).toHaveBeenCalledTimes(1);
+    expect((sendTelegramAlert as jest.Mock).mock.calls[0][0]).toContain('Модель ответов для всех: Codex');
+  });
+
   it('POST чужого значения — 400', async () => {
     const svc = { status: jest.fn(), set: jest.fn() };
     const res = mkRes();
     await new AdminGlobalLlmController(svc as any).set({ userId: 'admin-1' }, { provider: 'gpt' }, res);
     expect(res.status).toHaveBeenCalledWith(400);
-    expect(res.json).toHaveBeenCalledWith({ error: "provider: 'claude' | 'qwen' | 'kimi'" });
+    expect(res.json).toHaveBeenCalledWith({ error: "provider: 'claude' | 'qwen' | 'kimi' | 'codex'" });
     expect(svc.set).not.toHaveBeenCalled();
   });
 
@@ -121,7 +147,7 @@ describe('AdminGlobalLlmController', () => {
     const res = mkRes();
     await new AdminGlobalLlmController(svc as any).set({ userId: 'admin-1' }, { provider: 'qwen' }, res);
     expect(res.status).toHaveBeenCalledWith(200);
-    expect(res.json).toHaveBeenCalledWith({ provider: 'qwen', since: null, by: 'admin-1', configured: { qwen: true, kimi: false } });
+    expect(res.json).toHaveBeenCalledWith({ provider: 'qwen', since: null, by: 'admin-1', configured: { qwen: true, kimi: false, codex: false } });
     expect(warn.mock.calls.map((c) => String(c[0])).join('\n')).toContain('статус после записи не прочитан');
   });
 });
