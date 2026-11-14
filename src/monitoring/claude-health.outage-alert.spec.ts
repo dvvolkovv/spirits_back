@@ -48,6 +48,7 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
   const healthyOnly = (provider: FallbackProvider): Provs => ({
     qwen: provider === 'qwen' ? up : noKey,
     kimi: provider === 'kimi' ? up : noKey,
+    codex: provider === 'codex' ? up : noKey,
   });
 
   /** Сервис с рубильником switchTo; alerted — инцидент уже открыт, personalClaude — результат SQL или его сбой. */
@@ -102,10 +103,10 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
   };
 
   const OUTAGE: Array<[string, AnswerProvider, () => Provs, CliSwitchState]> = [
-    ['рубильник на Claude', 'claude', () => ({ qwen: up, kimi: up }), { switchProvider: 'claude', enabled: false, down: false }],
-    ['Kimi без ключа', 'kimi', () => ({ qwen: up, kimi: noKey }), { switchProvider: 'kimi', enabled: false, down: false }],
-    ['Qwen с ключом отвечает', 'qwen', () => ({ qwen: up, kimi: noKey }), { switchProvider: 'qwen', enabled: true, down: false }],
-    ['Qwen с ключом «не отвечает»', 'qwen', () => ({ qwen: downNow(), kimi: noKey }), { switchProvider: 'qwen', enabled: true, down: true }],
+    ['рубильник на Claude', 'claude', () => ({ qwen: up, kimi: up, codex: noKey }), { switchProvider: 'claude', enabled: false, down: false }],
+    ['Kimi без ключа', 'kimi', () => ({ qwen: up, kimi: noKey, codex: noKey }), { switchProvider: 'kimi', enabled: false, down: false }],
+    ['Qwen с ключом отвечает', 'qwen', () => ({ qwen: up, kimi: noKey, codex: noKey }), { switchProvider: 'qwen', enabled: true, down: false }],
+    ['Qwen с ключом «не отвечает»', 'qwen', () => ({ qwen: downNow(), kimi: noKey, codex: noKey }), { switchProvider: 'qwen', enabled: true, down: true }],
   ];
 
   it.each(OUTAGE)('падение, %s — строка «Затронуто» из cliOutageAffectedText', async (_name, sw, providers, state) => {
@@ -122,9 +123,9 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
   });
 
   const RECOVERY: Array<[string, AnswerProvider, () => Provs, CliSwitchState]> = [
-    ['рубильник на Qwen, Qwen отвечает', 'qwen', () => ({ qwen: up, kimi: noKey }), { switchProvider: 'qwen', enabled: true, down: false }],
-    ['рубильник на Qwen, Qwen «не отвечает»', 'qwen', () => ({ qwen: downNow(), kimi: noKey }), { switchProvider: 'qwen', enabled: true, down: true }],
-    ['рубильник на Claude', 'claude', () => ({ qwen: up, kimi: up }), { switchProvider: 'claude', enabled: false, down: false }],
+    ['рубильник на Qwen, Qwen отвечает', 'qwen', () => ({ qwen: up, kimi: noKey, codex: noKey }), { switchProvider: 'qwen', enabled: true, down: false }],
+    ['рубильник на Qwen, Qwen «не отвечает»', 'qwen', () => ({ qwen: downNow(), kimi: noKey, codex: noKey }), { switchProvider: 'qwen', enabled: true, down: true }],
+    ['рубильник на Claude', 'claude', () => ({ qwen: up, kimi: up, codex: noKey }), { switchProvider: 'claude', enabled: false, down: false }],
   ];
 
   it.each(RECOVERY)('отбой, %s — текст из cliRecoveredText', async (_name, sw, providers, state) => {
@@ -172,7 +173,7 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
     ['без ключа', () => noKey],
     ['«не отвечает»', downNow],
   ] as Array<[string, () => Prov]>)('глобальный Kimi %s — алерт сохраняется без SQL личных настроек', async (_name, kimiState) => {
-    const svc = make('kimi', { qwen: noKey, kimi: kimiState() }, false, false);
+    const svc = make('kimi', { qwen: noKey, kimi: kimiState(), codex: noKey }, false, false);
     setDown(svc);
     await svc.maybeAlertOutage();
     expect(sent()).toHaveLength(1);
@@ -371,7 +372,7 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
   });
 
   it.each(['down', 'ok'] as const)('Kimi → Qwen во время пробы при %s — providerUnverified вместо healthy-текста', async (status) => {
-    const svc = make('kimi', { qwen: up, kimi: up }, status === 'ok', false);
+    const svc = make('kimi', { qwen: up, kimi: up, codex: noKey }, status === 'ok', false);
     if (status === 'down') setDown(svc);
     else {
       svc.cache.llmStatus = 'ok';
@@ -394,7 +395,7 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
   });
 
   it.each(['down', 'ok'] as const)('Kimi → Qwen без ключа при %s — сохраняется no-key текст', async (status) => {
-    const svc = make('kimi', { qwen: noKey, kimi: up }, status === 'ok', false);
+    const svc = make('kimi', { qwen: noKey, kimi: up, codex: noKey }, status === 'ok', false);
     if (status === 'down') setDown(svc);
     else {
       svc.cache.llmStatus = 'ok';
@@ -473,10 +474,10 @@ describe('ClaudeHealthService — алерт о падении CLI и рубил
 
   it('fallbackAlertLine использует снимок после ожидания пробы', async () => {
     const svc = make('kimi', healthyOnly('kimi'), false, false);
-    const initial = { windowMs: 900_000, providers: { qwen: noKey, kimi: up } };
+    const initial = { windowMs: 900_000, providers: { qwen: noKey, kimi: up, codex: noKey } };
     const fresh = {
       windowMs: 900_000,
-      providers: { qwen: noKey, kimi: { enabled: true, ok: 2, failed: 1, downUntil: 0 } },
+      providers: { qwen: noKey, kimi: { enabled: true, ok: 2, failed: 1, downUntil: 0 }, codex: noKey },
     };
     svc.claudeCli.fallbackStats.mockReturnValueOnce(initial).mockReturnValueOnce(fresh);
     svc.claudeCli.text.mockRejectedValue(new Error('kimi unavailable'));

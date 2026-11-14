@@ -80,13 +80,13 @@ describe('relayFallbackAlertText', () => {
     const t = text(fb({ breakerOpenUntil: NOW + 1 }, { failed: 2 }, { ok: 4 }));
     expect(t).toContain('ассистенты отвечают через запасные');
     // Та же строка, что в алерте CLI (fallbackAlertLine): окно — в начале, а не хвостом.
-    expect(t).toContain('\nЗапасные за 15 мин: Qwen — ответов 0, ошибок 2; Kimi — ответов 4, ошибок 0.\n');
+    expect(t).toContain('\nЗапасные за 15 мин: Qwen — ответов 0, ошибок 2; Kimi — ответов 4, ошибок 0; Codex — не настроен.\n');
     expect(t).toContain('<code>claude</code>');
     expect(t).not.toContain('`');
   });
   it('без ключа Kimi — «не настроен», и «за 15 мин» к нему не цепляется', () => {
     const t = text(fb({}, { ok: 1 }, { enabled: false }));
-    expect(t).toContain('Запасные за 15 мин: Qwen — ответов 1, ошибок 0; Kimi — не настроен.');
+    expect(t).toContain('Запасные за 15 мин: Qwen — ответов 1, ошибок 0; Kimi — не настроен; Codex — не настроен.');
     expect(t).not.toContain('не настроен за');
   });
   it('ответов ноль, ошибки есть — запасные тоже не отвечают', () => {
@@ -96,7 +96,12 @@ describe('relayFallbackAlertText', () => {
   });
   it('старый релей — строка Qwen', () => {
     const t = text(q({ ok: 5, failed: 1 }));
-    expect(t).toContain('Запасные за 15 мин: Qwen — ответов 5, ошибок 1; Kimi — не настроен.');
+    expect(t).toContain('Запасные за 15 мин: Qwen — ответов 5, ошибок 1; Kimi — не настроен; Codex — не настроен.');
+  });
+  it('Codex в счётчиках релея — строка про Codex', () => {
+    const h = fb();
+    (h.fallback.providers as any).codex = { enabled: true, ok: 1, failed: 0, downUntil: 0 };
+    expect(text(h)).toContain('Codex — ответов 1, ошибок 0');
   });
   it('активность только по «Claude не отвечал с момента сбоя» — отдельный текст без счётчиков', () => {
     const t = text(q({ ok: 0, failed: 0, breakerOpenUntil: 0, lastOpenedAt: NOW - 600_000, lastClaudeOkAt: 0 }));
