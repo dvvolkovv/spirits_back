@@ -126,6 +126,7 @@ async function fixture(t, options = {}) {
     sandboxCanaryFile,
     drainPath: path.join(root, "drain"),
     retryDelayMs: 0,
+    turnTimeoutMs: options.turnTimeoutMs,
     fileOps: options.fileOps,
     ensureSessionDirsImpl: options.ensureSessionDirsImpl,
     ensureListingGuardImpl: options.ensureListingGuardImpl,
@@ -699,4 +700,71 @@ test('entrypoint: PM2 fork_mode распознаётся по pm_id, а не т�
   const source = fs.readFileSync(new URL('./server.mjs', import.meta.url), 'utf8');
   assert.match(source, /process\.env\.pm_id !== undefined/);
   assert.match(source, /ProcessContainerFork\.js/);
+});
+
+const doneEvent = (text) => text.split("\n").filter(l => l.startsWith("data: "))
+  .map(l => JSON.parse(l.slice(6))).find(e => e.type === "done");
+
+test("max turns requires a new user message, never silently starts a second paid run", async (t) => {
+  const f = await fixture(t, { onSpawn: ({ child }) => finishChild(child, [
+    { type: "result", subtype: "error_max_turns", session_id: "steps", usage: { input_tokens: 1000 } },
+  ]) });
+  const { text } = await f.request();
+  assert.equal(f.calls.length, 1);
+  assert.equal(doneEvent(text).failed, true);
+  assert.equal(doneEvent(text).failReason, "max_turns");
+});
+
+test("deadline kills a stalled child and completes the response without charging or retry", async (t) => {
+  const f = await fixture(t, { turnTimeoutMs: 30, onSpawn: () => {} });
+  const { text } = await f.request();
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].child.killed, true);
+  assert.equal(doneEvent(text).failReason, "turn_timeout");
+  assert.equal(doneEvent(text).failed, true);
+});
+
+test("unknown CLI tariff is diagnostic only; cumulative estimate cannot reach legacy billing", async (t) => {
+  let f;
+  f = await fixture(t, { onSpawn: ({ child }) => {
+    fs.writeFileSync(path.join(f.dirs.sessionTranscriptDir, "unknown-tariff.jsonl"), JSON.stringify({
+      type: "cost-state", totalCostUSD: 3.858360, hasUnknownModelCost: true,
+    }) + "\n");
+    finishChild(child, [{ type: "result", subtype: "success", result: "done",
+      session_id: "unknown-tariff", total_cost_usd: 3.858360, usage: { input_tokens: 1000 } }]);
+  } });
+  const done = doneEvent((await f.request()).text);
+  assert.equal(done.turnCostUsd, null);
+  assert.equal(done.costUsd, 0);
+  assert.equal(done.estimatedSessionCostUsd, 3.858360);
+  assert.equal(done.costBasis, "usage_normalization");
+  assert.equal(done.usage.input, 1000);
+});
+
+test("known CLI tariff remains billable with the exact current-run cost", async (t) => {
+  let f;
+  f = await fixture(t, { onSpawn: ({ child }) => {
+    fs.writeFileSync(path.join(f.dirs.sessionTranscriptDir, "known-tariff.jsonl"), JSON.stringify({
+      type: "cost-state", totalCostUSD: 0.25, hasUnknownModelCost: false,
+    }) + "\n");
+    finishChild(child, [{ type: "result", subtype: "success", result: "done",
+      session_id: "known-tariff", total_cost_usd: 0.25, usage: { input_tokens: 1000 } }]);
+  } });
+  const done = doneEvent((await f.request()).text);
+  assert.equal(done.turnCostUsd, 0.25);
+  assert.equal(done.costBasis, "cli_tariff");
+});
+
+test("deadline applies after transient retries and cannot trigger another fallback", async (t) => {
+  const f = await fixture(t, { turnTimeoutMs: 60, fallback: true,
+    onSpawn: ({ child }, index) => {
+      if (index === 0) finishChild(child, [{ type: "result", subtype: "error_during_execution", is_error: true,
+        result: "API Error: 503 Service Unavailable", session_id: "retry-timeout" }]);
+    },
+  });
+  const done = doneEvent((await f.request()).text);
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.calls[1].child.killed, true);
+  assert.equal(done.failReason, "turn_timeout");
+  assert.equal(done.failed, true);
 });

@@ -14,7 +14,7 @@ import {
 } from "./sandbox-policy.mjs";
 import { eventCallContext, tailDialogue } from "./session-tail.mjs";
 import { RUN_ENV, runTag, finishedRun, reap } from "./proc-reaper.mjs";
-import { costBaseline, runCost } from "./turn-cost.mjs";
+import { costBaseline, runCost, readCostRecord, hasKnownModelCost } from "./turn-cost.mjs";
 import { createUndelivered, withCarried } from "./undelivered-files.mjs";
 import { createRelayAuth } from "./relay-auth.mjs";
 import { LINKEON_TOOLS, linkeonServer, bearerServer } from "./linkeon-mcp.mjs";
@@ -43,6 +43,7 @@ export function createRelayApp({
   sandboxCanaryFile,
   drainPath = env.RELAY_DRAIN_FILE || "/tmp/linkeon-relay-drain",
   retryDelayMs = 1500,
+  turnTimeoutMs = 600_000,
   fileOps = fs,
   ensureSessionDirsImpl = ensureSessionDirs,
   ensureListingGuardImpl = ensureListingGuard,
@@ -106,6 +107,14 @@ Python 3.12 venv: source /home/dv/agent-env/bin/activate
   (rembg, Pillow, python-pptx, python-docx, reportlab, cairosvg)
 
 INSTALL ANYTHING MISSING: apt, pip, npm, wget — whatever it takes.
+
+VISUAL FILE REVISIONS (SVG, PDF, logos, layouts):
+Editing an existing vector/layout is a native-file task: edit its source geometry; the image-generation rule below does not require rasterizing it or generating a replacement.
+Before editing, state the acceptance criteria from the user's complaint. For interwoven shapes, list ALL crossings and the intended over/under order around each complete shape. Do not guess which crossing the user means from one pixel.
+Keep the original source. Change the source once, then export every delivered format from that same source. Inspect the complete final render and enlarged affected regions in each delivered format. Opening a file or matching one pixel is not visual validation.
+Never weaken a check, shrink a sample, or change an expected result merely to make your edit pass. Checks must validate the user's requested behavior, not just your patch.
+If a visual correction fails twice, stop repeating local patches: explain what remains unresolved and ask for the specific clarification needed. Do not claim it is fixed without inspecting the final output. Do not ship identical files under multiple names as distinct revisions.
+For a small visual edit, do not launch coding/TDD workflows or repeated Skill searches. Keep diagnostic renders and test files in scratch; put only verified deliverables in the output directory.
 
 IMAGE GENERATION (ABSOLUTE RULE):
 When user asks to generate/create/draw/make an image, picture, illustration, logo, banner, poster, photo:
@@ -825,6 +834,8 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   let totalCostUsd = 0;
   let turnCostUsd = 0;
   let turnCostKnown = true;
+  let unknownModelCost = false;
+  const turnDeadline = Date.now() + turnTimeoutMs;
   // Наибольший контекст среди запросов этого хода — по нему решаем, не пора ли
   // сессии на покой. См. блок «Ограничение по измеренному контексту» ниже.
   let maxTurnContext = 0;
@@ -912,8 +923,9 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   // закрытый канал. План кончился за время хода — уведомление, которое разбор
   // result придержал.
   async function runOnce(useResume, runProvider = provider) {
+    if (failReason === "turn_timeout") return {};
     const r = await runProcessOnce(useResume, runProvider);
-    if (!r.switchHit || preempted || clientDisconnected) return r;
+    if (!r.switchHit || preempted || clientDisconnected || failReason === "turn_timeout") return r;
     const next = switchProvider(useResume, r.switchWhy, r.switchDetail);
     if (next) return next;
     const fatal = FATAL_RE.test(r.switchText);
@@ -976,7 +988,12 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
       });
       // exit, а не close: close ждёт, пока закроются все копии stdout, и
       // потомок, унаследовавший его, задержал бы и уборку, и ответ.
-      child.on("exit", () => endRun(tag));
+      const timeout = setTimeout(() => {
+        notice("\n\n_(не удалось завершить работу за отведённое время. Токены за этот ход не списаны. Уточните оставшуюся задачу отдельным сообщением.)_", "turn_timeout");
+        try { child.kill("SIGKILL"); } catch {}
+        endRun(tag);
+      }, Math.max(1, turnDeadline - Date.now()));
+      child.on("exit", () => { clearTimeout(timeout); endRun(tag); });
       activeChildren.set(sessionId, {
         child,
         // preempted — прерванный ход у другого провайдера не переигрывается.
@@ -1193,7 +1210,13 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
       });
 
       child.on("close", () => {
+        clearTimeout(timeout);
         if (buf.trim()) { try { handleEvent(JSON.parse(buf)); } catch {} }
+        const costRecord = readCostRecord(sessionJsonlPath(sessionMap.get(sessionId) || ""));
+        if (!hasKnownModelCost(runProvider, costRecord)) {
+          unknownModelCost = true;
+          turnCostKnown = false;
+        }
         if (runTotal !== null) {
           if (costBase === null) turnCostKnown = false;
           else turnCostUsd += runCost(runTotal, costBase);
@@ -1204,7 +1227,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
         // с ошибкой без текста (error_during_execution) — уступает обычному пути, как
         // и любой другой его сбой; staleResumeHit и прерванный/брошенный ход — свои
         // ветки, здесь не дублируем.
-        if (runProvider === selected && selected && (!gotResult || errorNoText) && !staleResumeHit && !preempted && !clientDisconnected &&
+        if (runProvider === selected && selected && (!gotResult || errorNoText) && !staleResumeHit && !preempted && !clientDisconnected && failReason !== "turn_timeout" &&
             llm.nextStep(plan, planStep, fallbackState) >= 0 &&
             llm.mayAdvance({ failed: runProvider, selected, accessFailure: false, sentAnyText: streamedAny, riskyToolUsed })) {
           switchHit = true;
@@ -1216,6 +1239,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
       });
 
       child.on("error", (err) => {
+        clearTimeout(timeout);
         // Если claude не запустился, exit не придёт — метку снимаем здесь.
         endRun(tag);
         // Network/spawn errors are transient too
@@ -1317,25 +1341,11 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
       }
     }
 
-    // Потолок шагов: сессия ЖИВА, CLI просто остановил ход на 40-м инструменте.
-    // Раньше это давало немой обрыв — ровно случай 11.08 08:24, где в стенограмме
-    // оказалось 40 tool_use подряд и обрыв на полуслове (у соседнего успешного
-    // хода — 23). Для юриста с 144-страничной жалобой сорок шагов не потолок, а
-    // рабочая норма, поэтому продолжаем сами, а не просим пользователя повторять.
-    //
-    // Продолжение идёт тем же --resume, поэтому модель видит всё, что уже
-    // сделала. Два продолжения — предохранитель от бесконечного цикла на задаче,
-    // которая не сходится в принципе.
-    let continues = 0;
-    while (r.maxTurnsHit && continues < 2 && !clientDisconnected) {
-      continues++;
-      notice("\n\n_(работа получилась длинной — продолжаю с того места, где остановился…)_");
-      prompt = "Продолжи прерванную работу ровно с того места, где остановился, и доведи ответ до конца. Не начинай заново и не пересказывай уже сделанное.";
-      r = await runOnce(true);
-    }
+    // A new user message is required after the CLI step limit. Automatic
+    // continuations turned one unsuccessful visual edit into 27 minutes of work.
     if (r.maxTurnsHit) {
       notice(
-        "\n\n_(задача оказалась слишком большой даже для трёх заходов. Напишите «продолжай» — ассистент доведёт её до конца. Токены за незавершённый ход не списаны.)_",
+        "\n\n_(достигнут лимит шагов. Токены за незавершённый ход не списаны. Уточните, что осталось сделать, отдельным сообщением.)_",
         "max_turns",
       );
     }
@@ -1346,7 +1356,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
     // закрывает окно Claude (Claude мог уже ожить). Не считаются ходы с
     // неизвестным исходом — прерванный новым сообщением, брошенный бэкендом,
     // упёршийся в потолок шагов.
-    if (!preempted && !clientDisconnected && failReason !== "max_turns") {
+    if (!preempted && !clientDisconnected && failReason !== "max_turns" && failReason !== "turn_timeout") {
       const runOk = !!r.sawResult && !r.switchHit && !r.transientHit;
       if (provider === "claude") {
         if (runOk) fallbackState.claudeSucceeded(r.startedAt);
@@ -1409,7 +1419,11 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
       res.write("data: " + JSON.stringify({
         type: "done",
         outputFiles: filesOut,
-        costUsd: totalCostUsd,
+        // Keep the raw estimate diagnostic-only; old backends can otherwise
+        // bill cumulative session cost when usage is absent.
+        costUsd: unknownModelCost ? 0 : totalCostUsd,
+        estimatedSessionCostUsd: totalCostUsd,
+        costBasis: unknownModelCost ? "usage_normalization" : "cli_tariff",
         turnCostUsd: turnCostKnown ? Number(turnCostUsd.toFixed(6)) : null,
         usage: usageTotals,
         failed: turnFailed,
