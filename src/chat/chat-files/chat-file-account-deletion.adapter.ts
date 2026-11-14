@@ -22,7 +22,7 @@ import { extractEnv } from './chat-files.service';
 import { extractChatFiles } from './extract';
 import type { ExtractEnv } from './extract';
 import { safeDecode } from './file-meta';
-import { encodeKeyPath, THUMB_BUCKET, thumbKeyFor } from './thumbnails';
+import { encodeKeyPath, IMAGE_EXT_RE, THUMB_BUCKET, thumbKeyFor } from './thumbnails';
 
 /**
  * Task 11 — файлы переписки при удалении аккаунта.
@@ -30,7 +30,11 @@ import { encodeKeyPath, THUMB_BUCKET, thumbKeyFor } from './thumbnails';
  * История чата стирается сразу, поэтому ссылки фиксируются job'ами ДО её
  * удаления: discovery исчерпывающе читает custom_chat_history удалённого
  * поколения (keyset-пагинация, обе роли отправителя, без потолков на число
- * строк) и сохраняет из каждого файла только MinIO locator (bucket/key).
+ * строк) и сохраняет из каждого файла только MinIO locator. payload.key —
+ * base64url от сырого ключа: имя файла задаёт пользователь/модель, в нём
+ * реальны '%' (decodeURIComponent в fail-closed sanitizer бросает) и
+ * фрагменты userId (includes-проверка) — сырой ключ забраковал бы ВЕСЬ план
+ * удаления аккаунта. Алфавит A-Za-z0-9-_ безопасен для любого имени.
  * В payload нет ни личных текстов, ни userId, ни полных URL с доменом —
  * fail-closed sanitizer это дополнительно проверяет.
  *
@@ -62,73 +66,115 @@ export interface ChatFileDiscovery extends DeletionDiscovery {
   env?: ExtractEnv;
 }
 
-// Картинки, для которых панель делает миниатюру (тот же набор расширений,
-// что IMAGE_EXT_RE в thumbnails.ts).
-const IMAGE_EXT_RE = /\.(jpe?g|png|webp|gif)$/i;
-
-/**
- * Место, где может остаться адрес файла: таблица, текстовые колонки
- * (jsonb — с ::text) и предикат «строка принадлежит удаляемому аккаунту».
- * Список покрывает DOC_PLACES (voice-document-migration.ts) плюс канонические
- * URL-колонки медиа-таблиц.
- */
-interface RefPlace {
+/** Колонка места: имя (для drift-guard) и SQL-выражение (jsonb — с ::text). */
+export interface RefColumnSpec {
+  readonly column: string;
   readonly sql: string;
 }
 
-function refPlaces(needlesCount: number): RefPlace[] {
+/**
+ * Место, где может остаться адрес файла: таблица, FROM (у LEFT JOIN-площадок
+ * главная таблица стоит ПЕРВОЙ — контракт /FROM (\w+)/ в фейковых БД спек),
+ * предикат «строка принадлежит удаляемому аккаунту» ($1 — userId) и колонки.
+ * Список обязан покрывать DOC_PLACES (voice-document-migration.ts) — это
+ * держит drift-guard тест chat-file-ref-places.spec.ts.
+ */
+export interface RefPlaceSpec {
+  readonly table: string;
+  readonly from: string;
+  readonly own: string;
+  readonly columns: readonly RefColumnSpec[];
+}
+
+export const CHAT_FILE_REF_PLACES: readonly RefPlaceSpec[] = [
+  // История ВСЕХ пользователей: общий файл переживает удаление одного аккаунта.
+  {
+    table: 'custom_chat_history',
+    from: 'custom_chat_history',
+    own: `custom_chat_history.session_id LIKE $1 || '\\_%' ESCAPE '\\'`,
+    columns: [{ column: 'content', sql: 'content' }],
+  },
+  {
+    table: 'generated_images',
+    from: 'generated_images',
+    own: 'generated_images.user_id = $1',
+    columns: [{ column: 'image_url', sql: `coalesce(image_url, '')` }],
+  },
+  {
+    table: 'video_jobs',
+    from: 'video_jobs',
+    own: 'video_jobs.user_id = $1',
+    columns: [
+      { column: 'video_url', sql: `coalesce(video_url, '')` },
+      { column: 'thumbnail_url', sql: `coalesce(thumbnail_url, '')` },
+      { column: 'audio_url', sql: `coalesce(audio_url, '')` },
+      { column: 'source_image_url', sql: `coalesce(source_image_url, '')` },
+    ],
+  },
+  {
+    table: 'speech_clips',
+    from: 'speech_clips',
+    own: 'speech_clips.user_id = $1',
+    columns: [{ column: 'url', sql: `coalesce(url, '')` }],
+  },
+  {
+    table: 'voice_calls',
+    from: 'voice_calls',
+    own: 'voice_calls.user_id = $1',
+    columns: [
+      { column: 'transcript', sql: 'transcript::text' },
+      { column: 'summary', sql: `coalesce(summary, '')` },
+      { column: 'recording_url', sql: `coalesce(recording_url, '')` },
+    ],
+  },
+  {
+    table: 'voice_call_jobs',
+    from: 'voice_call_jobs LEFT JOIN voice_calls ON voice_calls.id = voice_call_jobs.call_id',
+    own: 'voice_calls.user_id = $1',
+    columns: [
+      { column: 'question', sql: `coalesce(question, '')` },
+      { column: 'answer', sql: `coalesce(answer, '')` },
+    ],
+  },
+  {
+    table: 'action_plans',
+    from: 'action_plans',
+    own: 'action_plans.user_id = $1',
+    columns: [
+      { column: 'summary', sql: `coalesce(summary, '')` },
+      { column: 'items', sql: 'items::text' },
+    ],
+  },
+  {
+    table: 'tasks',
+    from: 'tasks',
+    own: 'tasks.user_id = $1',
+    columns: [
+      { column: 'summary', sql: `coalesce(summary, '')` },
+      { column: 'claudemd', sql: `coalesce(claudemd, '')` },
+    ],
+  },
+  {
+    table: 'task_events',
+    from: 'task_events LEFT JOIN tasks ON tasks.id = task_events.task_id',
+    own: 'tasks.user_id = $1',
+    columns: [{ column: 'content', sql: 'content' }],
+  },
+];
+
+function refPlaces(needlesCount: number): Array<{ sql: string }> {
   // $1 — userId; $2..$N — варианты написания locator'а (см. needlesFor).
-  const where = (columns: string[]): string => {
+  return CHAT_FILE_REF_PLACES.map((place) => {
     const ors: string[] = [];
     for (let n = 0; n < needlesCount; n += 1) {
-      for (const col of columns) ors.push(`position($${n + 2} IN ${col}) > 0`);
+      for (const col of place.columns) ors.push(`position($${n + 2} IN ${col.sql}) > 0`);
     }
-    return `(${ors.join(' OR ')})`;
-  };
-  const count = (own: string, from: string, columns: string[]): RefPlace => ({
-    sql: `SELECT count(*)::int AS total, count(*) FILTER (WHERE ${own})::int AS own
-            FROM ${from}
-           WHERE ${where(columns)}`,
+    return {
+      sql: `SELECT count(*)::int AS total, count(*) FILTER (WHERE ${place.own})::int AS own
+            FROM ${place.from}
+           WHERE (${ors.join(' OR ')})`,
+    };
   });
-  return [
-    // История ВСЕХ пользователей: общий файл переживает удаление одного аккаунта.
-    count(
-      `custom_chat_history.session_id LIKE $1 || '\\_%' ESCAPE '\\'`,
-      'custom_chat_history',
-      ['content'],
-    ),
-    count('generated_images.user_id = $1', 'generated_images', [`coalesce(image_url, '')`]),
-    count('video_jobs.user_id = $1', 'video_jobs', [
-      `coalesce(video_url, '')`,
-      `coalesce(thumbnail_url, '')`,
-      `coalesce(audio_url, '')`,
-      `coalesce(source_image_url, '')`,
-    ]),
-    count('speech_clips.user_id = $1', 'speech_clips', [`coalesce(url, '')`]),
-    count('voice_calls.user_id = $1', 'voice_calls', [
-      'transcript::text',
-      `coalesce(summary, '')`,
-      `coalesce(recording_url, '')`,
-    ]),
-    count(
-      'voice_calls.user_id = $1',
-      'voice_call_jobs LEFT JOIN voice_calls ON voice_calls.id = voice_call_jobs.call_id',
-      [`coalesce(question, '')`, `coalesce(answer, '')`],
-    ),
-    count('action_plans.user_id = $1', 'action_plans', [
-      `coalesce(summary, '')`,
-      'items::text',
-    ]),
-    count('tasks.user_id = $1', 'tasks', [
-      `coalesce(summary, '')`,
-      `coalesce(claudemd, '')`,
-    ]),
-    count(
-      'tasks.user_id = $1',
-      'task_events LEFT JOIN tasks ON tasks.id = task_events.task_id',
-      ['content'],
-    ),
-  ];
 }
 
 /**
@@ -148,6 +194,21 @@ function needlesFor(bucket: string, key: string): string[] {
 function isSafeKey(key: string): boolean {
   if (typeof key !== 'string' || key.length === 0) return false;
   return !key.split('/').some((seg) => seg === '' || seg === '.' || seg === '..');
+}
+
+const BASE64URL_RE = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Декодирование payload.key (base64url от сырого ключа), fail-closed:
+ * вне алфавита, padding, неканоническое кодирование и не-UTF-8 — null.
+ * Round-trip отсекает всё, что Buffer.from проглатывает молча.
+ */
+function decodeKeyPayload(value: unknown): string | null {
+  if (typeof value !== 'string' || !BASE64URL_RE.test(value)) return null;
+  const decoded = Buffer.from(value, 'base64url').toString('utf8');
+  if (decoded.length === 0) return null;
+  if (Buffer.from(decoded, 'utf8').toString('base64url') !== value) return null;
+  return decoded;
 }
 
 /**
@@ -171,6 +232,9 @@ export async function discoverChatFiles(ctx: ChatFileDiscovery): Promise<Deletio
 
   let lastId = 0;
   for (;;) {
+    // LIKE '<userId>\_%': разделительный '_' экранирован, но _/% внутри самого
+    // userId — нет: internal_id это телефон (цифры) или UUID, LIKE-мета-символов
+    // там не бывает.
     const res = await db.query(
       `SELECT h.id, h.content
          FROM custom_chat_history h
@@ -217,7 +281,9 @@ export async function discoverChatFiles(ctx: ChatFileDiscovery): Promise<Deletio
           resourceType: 'chat-file.purge',
           resourceKey: deletionResourceHash(bucket, key),
           phase: 'purge',
-          payload: { bucket, key },
+          // key — base64url: сырое имя может содержать '%' или фрагмент userId,
+          // что роняет fail-closed sanitizer на весь план (см. шапку файла).
+          payload: { bucket, key: Buffer.from(key, 'utf8').toString('base64url') },
         });
       }
     }
@@ -247,11 +313,12 @@ export class ChatFileAccountDeletionAdapter implements OnModuleInit, AccountDele
       throw new Error('unsupported_deletion_resource');
     }
     const bucket = typeof job.payload?.bucket === 'string' ? job.payload.bucket : '';
-    const key = typeof job.payload?.key === 'string' ? job.payload.key : '';
     // Payload мог прийти только из нашего discovery, но purge исполняется
-    // через 30 дней: allowlist бакета и ключ без traversal проверяются заново.
+    // через 30 дней: base64url-ключ декодируется fail-closed, allowlist бакета
+    // и проверка на traversal выполняются на ДЕКОДИРОВАННОМ ключе заново.
     // Несовпадение — рассогласование схемы/данных: retry, а не слепое удаление.
-    if (bucket !== chatFilesBucket() || !isSafeKey(key)) {
+    const key = decodeKeyPayload(job.payload?.key);
+    if (key === null || bucket !== chatFilesBucket() || !isSafeKey(key)) {
       throw new DeletionRetryError('db');
     }
 

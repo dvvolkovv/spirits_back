@@ -264,7 +264,7 @@ export class VoiceAvatarService implements OnModuleInit {
       const voiceId = await this.clone(mp3, cloneVoiceName());
       // EXISTS-гейт: аккаунт мог быть удалён, пока шло профилирование/клон —
       // строка удалённого поколения не пишется (и не помечается проваленной).
-      await this.pg.query(
+      const updated = await this.pg.query(
         `UPDATE user_voice
             SET status='ready', elevenlabs_voice_id=$2, voice_descriptor=$3,
                 error_message=NULL, updated_at=now()
@@ -272,6 +272,15 @@ export class VoiceAvatarService implements OnModuleInit {
             AND EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $1 AND u.state = 'active')`,
         [userId, voiceId, JSON.stringify(descriptor)],
       );
+      if ((updated.rowCount ?? updated.rows?.length ?? 0) === 0) {
+        // Gate закрылся ПОСЛЕ создания клона: voice_id не записан, и Task 14
+        // (чистит клоны по строкам user_voice) его уже не найдёт — платный
+        // сирота у провайдера. Компенсируем сами (deleteClone best-effort,
+        // ошибки глотает); лог — без внешних идентификаторов.
+        this.logger.warn('voice clone compensated after inactive-gate');
+        await this.deleteClone(voiceId);
+        return;
+      }
       this.logger.log(`voice ready for ${userId} (voice ${voiceId})`);
     } catch (e: any) {
       this.logger.error(`profileAndClone failed for ${userId}: ${e.message}`);
