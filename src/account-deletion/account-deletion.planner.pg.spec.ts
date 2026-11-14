@@ -28,6 +28,10 @@ import { discoverPeerDeletion } from '../peer/peer-account-deletion.adapter';
 import { discoverContactsDeletion } from '../contacts/contacts-account-deletion.adapter';
 import { discoverReferralDeletion } from '../referral/referral-account-deletion.adapter';
 import { discoverRetentionDeletion } from '../retention/retention-account-deletion.adapter';
+import { discoverBackupDeletion } from '../backup/backup-account-deletion.adapter';
+import { discoverDevicesDeletion } from '../devices/devices-account-deletion.adapter';
+import { discoverGuestDeletion } from '../guest-trial/guest-account-deletion.adapter';
+import { discoverLegacyAuthDeletion } from '../identity/legacy-auth-account-deletion.adapter';
 import type {
   DeletionAccount,
   DeletionJobRow,
@@ -422,6 +426,10 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       discoverContactsDeletion,
       discoverReferralDeletion,
       discoverRetentionDeletion,
+      discoverBackupDeletion,
+      discoverDevicesDeletion,
+      discoverGuestDeletion,
+      discoverLegacyAuthDeletion,
     ]);
     expect(DELETION_DEPENDENCIES['account.core.immediate']).toEqual({ allStop: true });
     expect(DELETION_DEPENDENCIES['account.core.purge']).toEqual({ allStop: true });
@@ -460,6 +468,14 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       allOf: ['referral.stop'],
     });
     expect(DELETION_DEPENDENCIES['retention.stop']).toBeUndefined();
+    // Task 17D: новых правил нет — guest-carry.stop/auth-verification.stop
+    // стирают Redis-ключи immediate-фазой (TTL у ключей и так сутки), а
+    // guest.purge/legacy-auth.purge выполняются после retention и не разделяют
+    // со stop состояние: порядок обеспечен фазами, блокировать нечего.
+    expect(DELETION_DEPENDENCIES['guest.purge']).toBeUndefined();
+    expect(DELETION_DEPENDENCIES['legacy-auth.purge']).toBeUndefined();
+    expect(DELETION_DEPENDENCIES['profile-backup.purge']).toBeUndefined();
+    expect(DELETION_DEPENDENCIES['devices.purge']).toBeUndefined();
   });
 
   describe('assertCurrent', () => {

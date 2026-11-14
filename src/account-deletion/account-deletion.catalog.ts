@@ -18,6 +18,10 @@ import { discoverPeerDeletion } from '../peer/peer-account-deletion.adapter';
 import { discoverContactsDeletion } from '../contacts/contacts-account-deletion.adapter';
 import { discoverReferralDeletion } from '../referral/referral-account-deletion.adapter';
 import { discoverRetentionDeletion } from '../retention/retention-account-deletion.adapter';
+import { discoverBackupDeletion } from '../backup/backup-account-deletion.adapter';
+import { discoverDevicesDeletion } from '../devices/devices-account-deletion.adapter';
+import { discoverGuestDeletion } from '../guest-trial/guest-account-deletion.adapter';
+import { discoverLegacyAuthDeletion } from '../identity/legacy-auth-account-deletion.adapter';
 import type {
   DeletionDiscoverer,
   DeletionResourceType,
@@ -44,6 +48,14 @@ export const DELETION_DISCOVERERS: readonly DeletionDiscoverer[] = [
   discoverContactsDeletion,
   discoverReferralDeletion,
   discoverRetentionDeletion,
+  // Task 17D: backups, devices, guest-проба и legacy auth. Правил
+  // DELETION_DEPENDENCIES не нужно: stop-задачи (guest-carry.stop,
+  // auth-verification.stop) стирают Redis-ключи immediate-фазой, а purge
+  // выполняется после retention и не разделяет с ними состояние.
+  discoverBackupDeletion,
+  discoverDevicesDeletion,
+  discoverGuestDeletion,
+  discoverLegacyAuthDeletion,
 ];
 
 export interface DeletionDependencyRule {

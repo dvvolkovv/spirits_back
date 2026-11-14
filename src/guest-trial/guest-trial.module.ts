@@ -1,12 +1,14 @@
 // src/guest-trial/guest-trial.module.ts
 import { Module } from '@nestjs/common';
 import { ChatModule } from '../chat/chat.module';
+import { AccountDeletionModule } from '../account-deletion/account-deletion.module';
 import { GuestTrialController } from './guest-trial.controller';
 import { GuestTrialStore } from './guest-trial-store.service';
 import { GuestSessionsService } from './guest-sessions.service';
 import { GuestTurnService } from './guest-turn.service';
 import { GuestClaimService } from './guest-claim.service';
 import { GuestTrialCron } from './guest-trial.cron';
+import { GuestAccountDeletionAdapter } from './guest-account-deletion.adapter';
 
 /**
  * Проба ассистента без регистрации. ChatModule — ради ChatService.beginStream/
@@ -16,8 +18,8 @@ import { GuestTrialCron } from './guest-trial.cron';
  * владельца — общий компьютер, см. guest-claim.service.ts).
  */
 @Module({
-  imports: [ChatModule],
+  imports: [ChatModule, AccountDeletionModule],
   controllers: [GuestTrialController],
-  providers: [GuestTrialStore, GuestSessionsService, GuestTurnService, GuestClaimService, GuestTrialCron],
+  providers: [GuestTrialStore, GuestSessionsService, GuestTurnService, GuestClaimService, GuestTrialCron, GuestAccountDeletionAdapter],
 })
 export class GuestTrialModule {}
