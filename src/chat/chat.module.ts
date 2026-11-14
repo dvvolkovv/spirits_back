@@ -20,9 +20,10 @@ import { CostGrowthService } from '../cost-growth/cost-growth.service';
 import { ProductsModule } from '../products/products.module';
 import { ActionPlansController } from './action-plans/action-plans.controller';
 import { ActionPlansService } from './action-plans/action-plans.service';
+import { ChatUploadsModule } from './chat-uploads/chat-uploads.module';
 
 @Module({
-  imports: [MiscModule, CommonModule, RoomModule, VideoModule, CalendarModule, TalerIdModule, SpeechModule, TokensModule, HumanDesignModule, ProductsModule],
+  imports: [MiscModule, CommonModule, RoomModule, VideoModule, CalendarModule, TalerIdModule, SpeechModule, TokensModule, HumanDesignModule, ProductsModule, ChatUploadsModule],
   controllers: [ChatController, ChatFilesController, ChatThumbController, ActionPlansController],
   providers: [ChatService, ChatToolsService, ChatFileStore, ChatFilesService, ThumbnailService, CostGrowthService, ActionPlansService],
   exports: [ChatToolsService, ChatService, ChatFilesService],

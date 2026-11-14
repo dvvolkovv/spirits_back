@@ -1,10 +1,14 @@
 import {
-  FIND_FILES_DEFAULT_LIMIT, assistantPart, normalizeForSearch, parseFindFilesInput, plainNote, queryWords, scoreFile,
+  FIND_FILES_DEFAULT_LIMIT, assistantPart, extractHumanLinks, kindByMime, normalizeForSearch, parseFindFilesInput, plainNote, queryWords, scoreFile, trimUrlTail,
 } from './find-files';
 
 describe('parseFindFilesInput', () => {
   it('пустой вход — без слов, любой вид, без фильтров, лимит по умолчанию', () => {
     expect(parseFindFilesInput(undefined)).toEqual({ query: '', kind: 'any', assistant: '', days: null, limit: FIND_FILES_DEFAULT_LIMIT });
+  });
+  it('kind=link распознаётся, прочее — any', () => {
+    expect(parseFindFilesInput({ kind: 'LINK' }).kind).toBe('link');
+    expect(parseFindFilesInput({ kind: 'url' }).kind).toBe('any');
   });
   it('приводит типы и зажимает числа в рамки', () => {
     expect(parseFindFilesInput({ query: '  договор ', kind: 'DOCUMENT', assistant: ' Ирина ', days: '30', limit: 500 }))
@@ -46,5 +50,60 @@ describe('assistantPart', () => {
     expect(assistantPart('u1_custom:0f8e6a1c-1111-4222-8333-444455556666', 'u1')).toBe('custom:0f8e6a1c-1111-4222-8333-444455556666');
     expect(assistantPart('u1_12_fresh_1728000000000', 'u1')).toBe('12');
     expect(assistantPart('u2_12', 'u1')).toBe('');
+  });
+});
+
+describe('kindByMime', () => {
+  it('вид исходной загрузки: mime важнее расширения, без mime — расширение', () => {
+    expect(kindByMime('image/png', 'file')).toBe('image');
+    expect(kindByMime('video/mp4', 'clip')).toBe('video');
+    expect(kindByMime('audio/mpeg', 'voice')).toBe('audio');
+    expect(kindByMime('application/octet-stream', 'photo.jpg')).toBe('image');
+    expect(kindByMime('', 'архив.zip')).toBe('document');
+    expect(kindByMime('application/pdf', 'отчёт.pdf')).toBe('document');
+  });
+});
+
+describe('extractHumanLinks', () => {
+  it('markdown и голые адреса, дубли схлопываются', () => {
+    expect(extractHumanLinks('[док](https://example.com/a.pdf) и https://example.com/b.png, снова https://example.com/a.pdf'))
+      .toEqual([
+        { url: 'https://example.com/a.pdf', text: 'док' },
+        { url: 'https://example.com/b.png', text: '' },
+      ]);
+  });
+
+  it('хвостовая пунктуация и обёртки не входят в адрес, парные скобки внутри — часть адреса', () => {
+    expect(extractHumanLinks('зайди на https://example.com/page.')[0].url).toBe('https://example.com/page');
+    expect(extractHumanLinks('(https://example.com/x)')[0].url).toBe('https://example.com/x');
+    expect(extractHumanLinks('https://ru.wikipedia.org/wiki/Файл_(формат) ок')[0].url).toBe('https://ru.wikipedia.org/wiki/Файл_(формат)');
+  });
+
+  it('код — не ссылки', () => {
+    expect(extractHumanLinks('```js\nfetch("https://example.com/a")\n``` плюс `https://example.com/inline`')).toEqual([]);
+  });
+
+  it('внутренние /webhook/chat-uploads/ исключены: их покрывает источник исходников', () => {
+    expect(extractHumanLinks('файл https://my.linkeon.io/webhook/chat-uploads/11111111-1111-4111-8111-111111111111 тут')).toEqual([]);
+  });
+});
+
+describe('trimUrlTail и cap — защита от квадратичной бомбы', () => {
+  it('100 тысяч закрывающих скобок снимаются линейно, быстрее секунды', () => {
+    const url = 'http://x' + ')'.repeat(100_000);
+    const t0 = Date.now();
+    expect(trimUrlTail(url)).toBe('http://x');
+    expect(Date.now() - t0).toBeLessThan(1000);
+  });
+
+  it('мусор длиннее cap не становится ссылкой — сообщение с ним не вешает поиск', () => {
+    expect(extractHumanLinks('http://x' + ')'.repeat(5000))).toEqual([]);
+  });
+
+  it('cap не ломает легитимные длинные адреса: query, fragment, парные скобки', () => {
+    const long = 'https://example.com/p?q=' + 'a'.repeat(300) + '#frag';
+    expect(extractHumanLinks(`смотри ${long} здесь`)[0].url).toBe(long);
+    expect(extractHumanLinks('https://ru.wikipedia.org/wiki/Файл_(формат)?oldid=123456#Ссылки')[0].url)
+      .toBe('https://ru.wikipedia.org/wiki/Файл_(формат)?oldid=123456#Ссылки');
   });
 });

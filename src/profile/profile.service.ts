@@ -3,6 +3,7 @@ import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { IdentityService } from '../identity/identity.service';
 import { OAuthAppleService } from '../auth/oauth-apple.service';
+import { ChatUploadsService } from '../chat/chat-uploads/chat-uploads.service';
 import { sanitizeAssistantVoices, sanitizeProfilePatch } from './profile-patch';
 import { buildOtherUserProfile } from './profile-public';
 import { readProfileAccess } from '../privacy/profile-privacy';
@@ -22,6 +23,12 @@ export class ProfileService implements OnModuleInit {
     @Optional() private readonly neo4j?: Neo4jService,
     @Optional() private readonly identity?: IdentityService,
     @Optional() private readonly apple?: OAuthAppleService,
+    // Реестр исходников загрузок (spec 2026-11-13-chat-upload-memory).
+    // Последним и @Optional по той же причине, что у ChatService: спеки
+    // собирают сервис позиционно, а без реестра удаление идёт как до фичи.
+    // Тип — класс ChatUploadsService, сторож design:paramtypes —
+    // profile.service.spec.ts.
+    @Optional() private readonly chatUploads?: ChatUploadsService,
   ) {}
 
   // Применяем миграции профиля при старте (как BacklogService) — глобального
@@ -156,6 +163,14 @@ export class ProfileService implements OnModuleInit {
     // сохранённый refresh-токен. Неудача отзыва удаление не срывает —
     // человек попросил удалить аккаунт, и внешний сбой не повод ему отказать.
     await this.revokeAppleAccess(userId);
+
+    // Исходники загрузок чата (байты в приватном MinIO + строки chat_uploads) —
+    // данные пользователя и удаляются вместе с аккаунтом. ДО удаления истории:
+    // deleteForUser сам решает, что делать при сбое MinIO (NotFound терпит,
+    // остальное прокидывает наверх и хранит строки для повтора), — как и
+    // остальные шаги очистки ниже, этот шаг безусловный: проглоченная ошибка
+    // оставила бы байты «удалённого» аккаунта в хранилище навсегда.
+    await this.chatUploads?.deleteForUser(userId);
 
     // `_` в LIKE экранирован: иначе удаление номера 7903016918 стёрло бы и
     // переписку 79030169187 — `_` в шаблоне совпадает с любым символом.
