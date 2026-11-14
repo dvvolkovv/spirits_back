@@ -565,3 +565,41 @@ test('Серверный дифф 2: 401 дважды — второй уход�
   assert.equal(records.length, 2);
   assert.match(result.text, /Codex token rejected/);
 });
+
+test('Серверный дифф 3: дефолтный User-Agent — Linux x86_64', async (t) => {
+  const { records, bridgeOrigin } = await startPair(t, (record, req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(TEXT_SSE);
+  });
+  const result = await post(bridgeOrigin, '/v1/messages', {
+    model: 'gpt-6-astra', messages: [{ role: 'user', content: 'hi' }],
+  });
+  assert.equal(result.status, 200);
+  assert.equal(records[0].headers['user-agent'], 'codex_cli_rs/0.154.0 (Linux; x86_64)');
+});
+
+test('Дифф 2, guard stale-attempt: ошибка устаревшей попытки не перетирает ответ ретрая', async (t) => {
+  let hits = 0;
+  let firstRes;
+  const { bridgeOrigin } = await startPair(t, (record, req, res) => {
+    hits += 1;
+    if (hits === 1) {
+      firstRes = res;
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.write('{"error":'); // частичное тело — ретрай уже стартовал, drain не завершён
+      return;
+    }
+    // Вторая попытка отвечает не сразу: окно, в котором сокет первой попытки
+    // умирает при ещё открытом (не законченном) клиентском ответе.
+    setTimeout(() => firstRes.destroy(), 40);
+    setTimeout(() => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(TEXT_SSE);
+    }, 150);
+  });
+  const result = await post(bridgeOrigin, '/v1/messages', {
+    model: 'gpt-6-astra', stream: true, messages: [{ role: 'user', content: 'hi' }],
+  });
+  assert.equal(result.status, 200);
+  assert.equal(hits, 2);
+});
