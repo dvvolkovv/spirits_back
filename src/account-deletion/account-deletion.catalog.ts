@@ -7,6 +7,8 @@ import { discoverVoiceDeletion } from '../voice-call/voice-account-deletion.adap
 import { discoverChatFiles } from '../chat/chat-files/chat-file-account-deletion.adapter';
 import { discoverImageDeletion } from '../misc/image-account-deletion.adapter';
 import { discoverVideoDeletion } from '../video/video-account-deletion.adapter';
+import { discoverSpeechDeletion } from '../speech/speech-account-deletion.adapter';
+import { discoverAvatarDeletion } from '../avatar/avatar-account-deletion.adapter';
 import type {
   DeletionDiscoverer,
   DeletionResourceType,
@@ -22,6 +24,8 @@ export const DELETION_DISCOVERERS: readonly DeletionDiscoverer[] = [
   discoverChatFiles,
   discoverImageDeletion,
   discoverVideoDeletion,
+  discoverSpeechDeletion,
+  discoverAvatarDeletion,
 ];
 
 export interface DeletionDependencyRule {

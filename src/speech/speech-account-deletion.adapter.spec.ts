@@ -47,6 +47,13 @@ const account: DeletionAccount = {
 const CACHE_KEY = 'ab'.repeat(32); // sha256-hex, 64 символа
 const NONCE = '0123456789abcdef'; // randomBytes(8).toString('hex')
 
+// id в speech_clips/speech_listens — uuid (миграции 001/002); сервис
+// валидирует technical id строго, поэтому в тестах детерминированные uuid.
+const uid = (n: number): string => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+const CLIP_OWN = uid(1);
+const CLIP_OTHER = uid(2);
+const LISTEN_OWN = uid(3);
+
 interface ClipRow {
   id: string;
   user_id: string;
@@ -220,7 +227,7 @@ function purgeJob(
     deletionId,
     userId: USER,
     resourceType,
-    resourceKey: 'clip-own',
+    resourceKey: CLIP_OWN,
     phase: 'purge',
     payload,
     status: 'running',
@@ -234,7 +241,7 @@ function purgeJob(
 
 function seedClip(db: FakeSpeechDb, overrides: Partial<ClipRow> = {}): ClipRow {
   const row: ClipRow = {
-    id: 'clip-own',
+    id: CLIP_OWN,
     user_id: USER,
     cache_key: CACHE_KEY,
     url: `${MINIO_BASE}/${SPEECH_BUCKET}/audio/${CACHE_KEY}.mp3`,
@@ -253,7 +260,7 @@ function listenParts(cacheKey = CACHE_KEY, count = 2): string[] {
 
 function seedListen(db: FakeSpeechDb, overrides: Partial<ListenRow> = {}): ListenRow {
   const row: ListenRow = {
-    id: 'listen-own',
+    id: LISTEN_OWN,
     user_id: USER,
     cache_key: CACHE_KEY,
     parts: listenParts(),
@@ -266,20 +273,20 @@ function seedListen(db: FakeSpeechDb, overrides: Partial<ListenRow> = {}): Liste
 describe('discoverSpeechDeletion — speech.purge/listen.purge по каноническим строкам (Task 13)', () => {
   it('на каждую строку — job только с техническим id, без текстов и URL', async () => {
     const { db, storage } = makeHarness();
-    seedClip(db, { id: 'clip-a' });
-    seedClip(db, { id: 'clip-b', cache_key: 'cd'.repeat(32) });
-    seedClip(db, { id: 'clip-x', user_id: OTHER });
-    seedListen(db, { id: 'listen-a' });
+    seedClip(db, { id: uid(11) });
+    seedClip(db, { id: uid(12), cache_key: 'cd'.repeat(32) });
+    seedClip(db, { id: uid(13), user_id: OTHER });
+    seedListen(db, { id: uid(21) });
     db.speechListens.push({
-      id: 'listen-x', user_id: OTHER, cache_key: 'ef'.repeat(32), parts: [],
+      id: uid(22), user_id: OTHER, cache_key: 'ef'.repeat(32), parts: [],
     });
 
     const plan = await discoverSpeechDeletion({ db, account, origin: 'explicit' });
 
     expect(plan.jobs).toEqual([
-      { resourceType: 'speech.purge', resourceKey: 'clip-a', phase: 'purge', payload: { clipId: 'clip-a' } },
-      { resourceType: 'speech.purge', resourceKey: 'clip-b', phase: 'purge', payload: { clipId: 'clip-b' } },
-      { resourceType: 'listen.purge', resourceKey: 'listen-a', phase: 'purge', payload: { listenId: 'listen-a' } },
+      { resourceType: 'speech.purge', resourceKey: uid(11), phase: 'purge', payload: { clipId: uid(11) } },
+      { resourceType: 'speech.purge', resourceKey: uid(12), phase: 'purge', payload: { clipId: uid(12) } },
+      { resourceType: 'listen.purge', resourceKey: uid(21), phase: 'purge', payload: { listenId: uid(21) } },
     ]);
     expect(plan.skips).toEqual([]);
     const json = JSON.stringify(plan.jobs);
@@ -293,8 +300,8 @@ describe('discoverSpeechDeletion — speech.purge/listen.purge по канони
 
   it('keyset-пагинация: страницы читаются до пустой (clips и listens)', async () => {
     const { db } = makeHarness();
-    for (let i = 0; i < 5; i += 1) seedClip(db, { id: `clip-${i}` });
-    for (let i = 0; i < 3; i += 1) seedListen(db, { id: `listen-${i}` });
+    for (let i = 0; i < 5; i += 1) seedClip(db, { id: uid(30 + i) });
+    for (let i = 0; i < 3; i += 1) seedListen(db, { id: uid(40 + i) });
 
     const plan = await discoverSpeechDeletion({ db, account, origin: 'explicit', pageSize: 2 });
 
@@ -322,7 +329,7 @@ describe('SpeechAccountDeletionAdapter.execute — speech.purge (Task 13)', () =
     const { db, storage, adapter, ctx } = makeHarness();
     seedClip(db);
 
-    await adapter.execute(purgeJob('speech.purge', { clipId: 'clip-own' }), ctx);
+    await adapter.execute(purgeJob('speech.purge', { clipId: CLIP_OWN }), ctx);
 
     expect(storage.deleteConfirmed).toHaveBeenCalledWith({
       bucket: SPEECH_BUCKET,
@@ -340,12 +347,12 @@ describe('SpeechAccountDeletionAdapter.execute — speech.purge (Task 13)', () =
   it('одинаковый cache_key у соседа: удаляет свою row, сохраняет общий mp3', async () => {
     const { db, storage, adapter, ctx } = makeHarness();
     const own = seedClip(db);
-    db.speechClips.push({ ...own, id: 'clip-other', user_id: OTHER });
+    db.speechClips.push({ ...own, id: CLIP_OTHER, user_id: OTHER });
 
-    await adapter.execute(purgeJob('speech.purge', { clipId: 'clip-own' }), ctx);
+    await adapter.execute(purgeJob('speech.purge', { clipId: CLIP_OWN }), ctx);
 
     expect(storage.deleteConfirmed).not.toHaveBeenCalled();
-    expect(db.speechClips.map((r) => r.id)).toEqual(['clip-other']);
+    expect(db.speechClips.map((r) => r.id)).toEqual([CLIP_OTHER]);
   });
 
   it('MinIO-сбой: row и technical id остаются, retry timeout', async () => {
@@ -353,7 +360,7 @@ describe('SpeechAccountDeletionAdapter.execute — speech.purge (Task 13)', () =
     seedClip(db);
     storage.delete.mockRejectedValue({ code: 'ETIMEDOUT' });
 
-    await expect(adapter.execute(purgeJob('speech.purge', { clipId: 'clip-own' }), ctx))
+    await expect(adapter.execute(purgeJob('speech.purge', { clipId: CLIP_OWN }), ctx))
       .rejects.toMatchObject({ kind: 'timeout' });
     expect(db.speechClips).toHaveLength(1);
     expect(db.calls).not.toContain('db.deleteSpeechClip');
@@ -364,7 +371,7 @@ describe('SpeechAccountDeletionAdapter.execute — speech.purge (Task 13)', () =
     seedClip(db);
     storage.delete.mockRejectedValue(Object.assign(new Error('gone'), { name: 'NoSuchKey' }));
 
-    await adapter.execute(purgeJob('speech.purge', { clipId: 'clip-own' }), ctx);
+    await adapter.execute(purgeJob('speech.purge', { clipId: CLIP_OWN }), ctx);
 
     expect(db.speechClips).toHaveLength(0);
   });
@@ -372,7 +379,7 @@ describe('SpeechAccountDeletionAdapter.execute — speech.purge (Task 13)', () =
   it('повторный вызов при отсутствии row — идемпотентный success', async () => {
     const { db, storage, adapter, ctx } = makeHarness();
 
-    await adapter.execute(purgeJob('speech.purge', { clipId: 'clip-own' }), ctx);
+    await adapter.execute(purgeJob('speech.purge', { clipId: CLIP_OWN }), ctx);
 
     expect(db.speechClips).toHaveLength(0);
     expect(storage.deleteConfirmed).not.toHaveBeenCalled();
@@ -384,7 +391,7 @@ describe('SpeechAccountDeletionAdapter.execute — speech.purge (Task 13)', () =
     seedClip(db);
     db.failGenRecheck = true;
 
-    await expect(adapter.execute(purgeJob('speech.purge', { clipId: 'clip-own' }), ctx))
+    await expect(adapter.execute(purgeJob('speech.purge', { clipId: CLIP_OWN }), ctx))
       .rejects.toBeInstanceOf(DeletionCancelledError);
     expect(db.speechClips).toHaveLength(1);
   });
@@ -408,7 +415,7 @@ describe('SpeechAccountDeletionAdapter.execute — listen.purge (Task 13)', () =
     const { db, storage, adapter, ctx } = makeHarness();
     seedListen(db);
 
-    await adapter.execute(purgeJob('listen.purge', { listenId: 'listen-own' }, { resourceKey: 'listen-own' }), ctx);
+    await adapter.execute(purgeJob('listen.purge', { listenId: LISTEN_OWN }, { resourceKey: LISTEN_OWN }), ctx);
 
     expect(db.calls).toEqual([
       `storage.delete:${SPEECH_BUCKET}/audio/listen/${CACHE_KEY}-${NONCE}-0.mp3`,
@@ -426,7 +433,7 @@ describe('SpeechAccountDeletionAdapter.execute — listen.purge (Task 13)', () =
     storage.delete.mockRejectedValueOnce({ code: 'ETIMEDOUT' });
 
     await expect(
-      adapter.execute(purgeJob('listen.purge', { listenId: 'listen-own' }, { resourceKey: 'listen-own' }), ctx),
+      adapter.execute(purgeJob('listen.purge', { listenId: LISTEN_OWN }, { resourceKey: LISTEN_OWN }), ctx),
     ).rejects.toMatchObject({ kind: 'timeout' });
 
     expect(db.speechListens).toHaveLength(1);
@@ -434,7 +441,7 @@ describe('SpeechAccountDeletionAdapter.execute — listen.purge (Task 13)', () =
 
     // Retry с тем же payload: первый кусок уже absent, второй и row дожимаются.
     storage.delete.mockRejectedValue(Object.assign(new Error('gone'), { name: 'NoSuchKey' }));
-    await adapter.execute(purgeJob('listen.purge', { listenId: 'listen-own' }, { resourceKey: 'listen-own' }), ctx);
+    await adapter.execute(purgeJob('listen.purge', { listenId: LISTEN_OWN }, { resourceKey: LISTEN_OWN }), ctx);
     expect(db.speechListens).toHaveLength(0);
   });
 
@@ -442,7 +449,7 @@ describe('SpeechAccountDeletionAdapter.execute — listen.purge (Task 13)', () =
     const { db, storage, adapter, ctx } = makeHarness();
     seedListen(db, { parts: ['https://cdn.example.com/a.mp3', ...listenParts(CACHE_KEY, 1)] });
 
-    await adapter.execute(purgeJob('listen.purge', { listenId: 'listen-own' }, { resourceKey: 'listen-own' }), ctx);
+    await adapter.execute(purgeJob('listen.purge', { listenId: LISTEN_OWN }, { resourceKey: LISTEN_OWN }), ctx);
 
     expect(storage.deleteConfirmed).toHaveBeenCalledTimes(1);
     expect(storage.deleteConfirmed).toHaveBeenCalledWith({
@@ -459,7 +466,7 @@ describe('SpeechAccountDeletionAdapter.execute — listen.purge (Task 13)', () =
     });
 
     await expect(
-      adapter.execute(purgeJob('listen.purge', { listenId: 'listen-own' }, { resourceKey: 'listen-own' }), ctx),
+      adapter.execute(purgeJob('listen.purge', { listenId: LISTEN_OWN }, { resourceKey: LISTEN_OWN }), ctx),
     ).rejects.toMatchObject({ kind: 'db' });
     expect(storage.deleteConfirmed).not.toHaveBeenCalled();
     expect(db.speechListens).toHaveLength(1);
@@ -468,7 +475,7 @@ describe('SpeechAccountDeletionAdapter.execute — listen.purge (Task 13)', () =
   it('повторный вызов при отсутствии row — идемпотентный success', async () => {
     const { db, storage, adapter, ctx } = makeHarness();
 
-    await adapter.execute(purgeJob('listen.purge', { listenId: 'listen-own' }, { resourceKey: 'listen-own' }), ctx);
+    await adapter.execute(purgeJob('listen.purge', { listenId: LISTEN_OWN }, { resourceKey: LISTEN_OWN }), ctx);
 
     expect(storage.deleteConfirmed).not.toHaveBeenCalled();
     expect(db.queries.some((q) => q.sql.startsWith('DELETE FROM speech_listens'))).toBe(false);
@@ -479,7 +486,7 @@ describe('SpeechAccountDeletionAdapter.execute — общее (Task 13)', () => 
   it('чужой resourceType — отказ', async () => {
     const { adapter, ctx } = makeHarness();
     const job = {
-      ...purgeJob('speech.purge', { clipId: 'clip-own' }),
+      ...purgeJob('speech.purge', { clipId: CLIP_OWN }),
       resourceType: 'image.purge' as const,
     };
 
@@ -489,7 +496,7 @@ describe('SpeechAccountDeletionAdapter.execute — общее (Task 13)', () => 
   it('assertCurrent зовётся до чтения строк и после внешних операций', async () => {
     const { adapter, ctx } = makeHarness();
 
-    await adapter.execute(purgeJob('speech.purge', { clipId: 'clip-own' }), ctx);
+    await adapter.execute(purgeJob('speech.purge', { clipId: CLIP_OWN }), ctx);
 
     expect(ctx.assertCurrent.mock.calls.length).toBeGreaterThanOrEqual(2);
   });

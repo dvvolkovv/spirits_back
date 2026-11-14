@@ -8,6 +8,10 @@ import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { LanguageService } from '../common/services/language.service';
 import { RedisService } from '../common/services/redis.service';
+import {
+  DeletionCancelledError,
+  DeletionRetryError,
+} from '../account-deletion/account-deletion.safe';
 import { resolveVoice, ResolvedVoice, TtsProvider } from './voices';
 import { synthesizeYandex } from './providers/yandex';
 import { synthesizeOpenai } from './providers/openai';
@@ -653,5 +657,170 @@ export class SpeechService implements OnModuleInit {
       [clipId, userId],
     );
     return res.rows[0] ?? null;
+  }
+
+  // ==================== ACCOUNT DELETION (Task 13) ====================
+
+  /** Формат PK speech_clips/speech_listens: technical id валидируется строго. */
+  static readonly DELETION_UUID_RE =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  /** cache_key — sha256-hex (cacheKeyFor); из него строится ключ объекта. */
+  private static readonly CACHE_KEY_HEX_RE = /^[a-f0-9]{64}$/;
+
+  /**
+   * Строгое стирание клипа озвучки при удалении аккаунта.
+   *
+   * Объект audio/<cache_key>.mp3 — ОБЩИЙ кэш: cache_key это sha256(text +
+   * voice + lang), и тот же текст тем же голосом у соседа даёт тот же объект
+   * MinIO. Поэтому перед удалением объекта считается число ЧУЖИХ строк с тем
+   * же cache_key: при чужих ссылках объект пропускается (job успешен), своя
+   * row удаляется всегда. Ключ объекта выводится из cache_key строки
+   * (валидирован как sha256-hex), а не из сохранённого url и не из payload.
+   *
+   * Объект — строго ДО row: провал удаления объекта (deleteConfirmed
+   * пробрасывает любой неподтверждённый исход) оставляет строку и technical id
+   * на месте, retry продолжается с тем же payload. Отсутствие объекта
+   * (404/NoSuchKey) — подтверждённый успех. Нет строки — идемпотентный
+   * success. Внутри transaction поколение перепроверяется: аккаунт оживили —
+   * DeletionCancelledError, row не трогаем.
+   */
+  async deleteSpeechClipForDeletion(
+    userId: string,
+    clipId: string,
+    deletionId: string,
+  ): Promise<void> {
+    if (!SpeechService.DELETION_UUID_RE.test(clipId)) {
+      throw new DeletionRetryError('db');
+    }
+    const res = await this.pg.query(
+      `SELECT id, cache_key FROM speech_clips
+        WHERE id = $1 AND user_id = $2
+          AND EXISTS (
+            SELECT 1 FROM user_id u
+            WHERE u.internal_id = $2 AND u.state = 'deleted' AND u.deletion_id = $3
+          )`,
+      [clipId, userId, deletionId],
+    );
+    const row = res.rows[0];
+    if (!row) return;
+
+    const cacheKey = String(row.cache_key ?? '');
+    if (!SpeechService.CACHE_KEY_HEX_RE.test(cacheKey)) {
+      throw new DeletionRetryError('db');
+    }
+
+    // Reference count общего кэша: чужие строки на тот же cache_key — объект
+    // нужен соседям и пропускается.
+    const others = await this.pg.query(
+      'SELECT count(*)::int AS others FROM speech_clips WHERE cache_key = $1 AND user_id <> $2',
+      [cacheKey, userId],
+    );
+    if (Number(others.rows[0]?.others ?? 0) === 0) {
+      await this.storage.deleteConfirmed({
+        bucket: SPEECH_BUCKET,
+        key: `audio/${cacheKey}.mp3`,
+      });
+    }
+
+    await this.deleteSpeechRowForDeletion('speech_clips', clipId, userId, deletionId);
+  }
+
+  /**
+   * Строгое стирание «Прослушать» при удалении аккаунта.
+   *
+   * Куски audio/listen/<cache_key>-<nonce>-<i>.mp3 содержат случайный nonce
+   * строки (randomBytes на каждый синтез) и никому не общие — удаляются
+   * строго по одному, все ДО удаления row. Ключ каждого куска проверяется по
+   * шаблону, выведенному из cache_key строки: URL своего бакета вне шаблона —
+   * рассогласование данных, fail-closed retry db ещё ДО первого удаления.
+   * Чужие (не наш бакет) URL — не наши объекты, пропускаются.
+   */
+  async deleteListenForDeletion(
+    userId: string,
+    listenId: string,
+    deletionId: string,
+  ): Promise<void> {
+    if (!SpeechService.DELETION_UUID_RE.test(listenId)) {
+      throw new DeletionRetryError('db');
+    }
+    const res = await this.pg.query(
+      `SELECT id, cache_key, parts FROM speech_listens
+        WHERE id = $1 AND user_id = $2
+          AND EXISTS (
+            SELECT 1 FROM user_id u
+            WHERE u.internal_id = $2 AND u.state = 'deleted' AND u.deletion_id = $3
+          )`,
+      [listenId, userId, deletionId],
+    );
+    const row = res.rows[0];
+    if (!row) return;
+
+    const cacheKey = String(row.cache_key ?? '');
+    if (!SpeechService.CACHE_KEY_HEX_RE.test(cacheKey)) {
+      throw new DeletionRetryError('db');
+    }
+    if (!Array.isArray(row.parts)) {
+      throw new DeletionRetryError('db');
+    }
+
+    const prefix = this.storage.publicUrl(SPEECH_BUCKET, '');
+    const keyRe = new RegExp(`^audio/listen/${cacheKey}-[0-9a-f]{16}-\\d{1,6}\\.mp3$`);
+    // Сначала собираем ВСЕ цели (рассогласование бросает до первого удаления),
+    // затем удаляем строго по одному с await.
+    const keys: string[] = [];
+    for (const part of row.parts) {
+      const url = String(part ?? '').trim();
+      if (!url || !url.startsWith(prefix)) continue; // чужой URL — не наш объект
+      const key = url.slice(prefix.length).split(/[?#]/)[0];
+      if (!keyRe.test(key)) throw new DeletionRetryError('db');
+      keys.push(key);
+    }
+    for (const key of keys) {
+      await this.storage.deleteConfirmed({ bucket: SPEECH_BUCKET, key });
+    }
+
+    await this.deleteSpeechRowForDeletion('speech_listens', listenId, userId, deletionId);
+  }
+
+  /**
+   * Удаление строки speech_* в transaction с generation re-check: аккаунт
+   * оживили между удалением объектов и row — DeletionCancelledError.
+   * Table — литеральное объединение (не пользовательский ввод).
+   */
+  private async deleteSpeechRowForDeletion(
+    table: 'speech_clips' | 'speech_listens',
+    rowId: string,
+    userId: string,
+    deletionId: string,
+  ): Promise<void> {
+    const client = await this.pg.getClient();
+    try {
+      await client.query('BEGIN');
+      const gen = await client.query(
+        `SELECT 1 FROM user_id u
+          WHERE u.internal_id = $1 AND u.state = 'deleted' AND u.deletion_id = $2`,
+        [userId, deletionId],
+      );
+      if ((gen.rowCount ?? 0) === 0) {
+        await client.query('ROLLBACK');
+        throw new DeletionCancelledError();
+      }
+      await client.query(
+        `DELETE FROM ${table}
+          WHERE id = $1 AND user_id = $2
+            AND EXISTS (
+              SELECT 1 FROM user_id u
+              WHERE u.internal_id = $2 AND u.state = 'deleted' AND u.deletion_id = $3
+            )`,
+        [rowId, userId, deletionId],
+      );
+      await client.query('COMMIT');
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch { /* уже вне транзакции */ }
+      throw e;
+    } finally {
+      client.release();
+    }
   }
 }

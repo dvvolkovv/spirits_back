@@ -17,6 +17,8 @@ import { discoverVoiceDeletion } from '../voice-call/voice-account-deletion.adap
 import { discoverChatFiles } from '../chat/chat-files/chat-file-account-deletion.adapter';
 import { discoverImageDeletion } from '../misc/image-account-deletion.adapter';
 import { discoverVideoDeletion } from '../video/video-account-deletion.adapter';
+import { discoverSpeechDeletion } from '../speech/speech-account-deletion.adapter';
+import { discoverAvatarDeletion } from '../avatar/avatar-account-deletion.adapter';
 import type {
   DeletionAccount,
   DeletionJobRow,
@@ -400,6 +402,8 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       discoverChatFiles,
       discoverImageDeletion,
       discoverVideoDeletion,
+      discoverSpeechDeletion,
+      discoverAvatarDeletion,
     ]);
     expect(DELETION_DEPENDENCIES['account.core.immediate']).toEqual({ allStop: true });
     expect(DELETION_DEPENDENCIES['account.core.purge']).toEqual({ allStop: true });
