@@ -15,7 +15,18 @@ import {
 } from './video.dto';
 import { VoiceAvatarService } from '../voice-avatar/voice-avatar.service';
 import { jobCostRefunded } from './job-refund';
-import { assertFetchableMedia, fetchMediaBytes } from '../common/net/own-media';
+import {
+  assertFetchableMedia,
+  fetchMediaBytes,
+  ownStaticPath,
+  publicDir as ownPublicDir,
+} from '../common/net/own-media';
+import {
+  DeletionCancelledError,
+  DeletionRetryError,
+} from '../account-deletion/account-deletion.safe';
+import { StorageService } from '../common/services/storage.service';
+import { ownedObjectKeyOrThrow } from '../misc/misc.service';
 import { isUnsafeUrlError } from '../common/net/safe-fetch';
 import { S3Client, PutObjectCommand, DeleteObjectCommand, CreateBucketCommand, PutBucketPolicyCommand } from '@aws-sdk/client-s3';
 import { spawn } from 'child_process';
@@ -86,6 +97,9 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     private readonly veo: VeoService,
     private readonly voice: VoiceAvatarService,
     @Optional() private readonly redis?: RedisService,
+    // Account-deletion purge (Task 12) удаляет объекты видео-бакета через
+    // подтверждённый исход StorageService.deleteConfirmed, а не голым send.
+    @Optional() private readonly storage?: StorageService,
   ) {}
 
   /**
@@ -301,6 +315,152 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       this.s3.send(new DeleteObjectCommand({ Bucket: this.s3Bucket, Key: `videos/${jobId}.mp4` })),
       this.s3.send(new DeleteObjectCommand({ Bucket: this.s3Bucket, Key: `videos/${jobId}.jpg` })),
     ]);
+  }
+
+  // ==================== ACCOUNT DELETION (Task 12) ====================
+
+  /**
+   * Безопасный токен id: без '/', ведущих точек и traversal — он же seed
+   * производных путей (MinIO videos/<id>.*, локальные public/videos/<id>.*,
+   * _veoconcat/<id>). Тот же алфавит, что RESOURCE_KEY_RE плана удаления.
+   */
+  private static readonly SAFE_DELETION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+  /**
+   * Строгое стирание video job при удалении аккаунта.
+   *
+   * В отличие от deleteJob (пользовательский flow, best-effort allSettled),
+   * purge подтверждает КАЖДЫЙ owned объект до удаления row: MinIO-объекты
+   * (производные videos/<id>.mp4|jpg + video-uploads/<userId>/… и прочие own
+   * URL, прочитанные ИЗ СОХРАНЁННОЙ строки — не из payload), локальный
+   * финальный MP4/JPG и staging _veoconcat — только через checked own paths
+   * (валидный id + ownStaticPath, escape/symlink-выход бросает). Ошибки не
+   * подавляются: неподтверждённый исход — retry, row и технические id
+   * (kling_task_id) переживают попытку.
+   *
+   * Несуществующий объект/файл — подтверждённое отсутствие (успех). Нет row —
+   * успех (идемпотентный повтор). Omni interaction id — НЕ deletable файл:
+   * провайдерского cancel/delete API не существует, discovery фиксирует
+   * безопасный skip video.provider/unsupported_external, здесь он не
+   * вызывается. tg_bot_video_jobs (TG delivery) удаляется FK-cascade вместе
+   * с row.
+   */
+  async deleteVideoForDeletion(
+    userId: string,
+    videoJobId: string,
+    deletionId: string,
+  ): Promise<void> {
+    if (!VideoService.SAFE_DELETION_ID_RE.test(videoJobId)) {
+      throw new DeletionRetryError('db');
+    }
+    const res = await this.pg.query(
+      `SELECT id, video_url, thumbnail_url, source_image_url, audio_url FROM video_jobs
+        WHERE id = $1 AND user_id = $2
+          AND EXISTS (
+            SELECT 1 FROM user_id u
+            WHERE u.internal_id = $2 AND u.state = 'deleted' AND u.deletion_id = $3
+          )`,
+      [videoJobId, userId, deletionId],
+    );
+    const row = res.rows[0];
+    if (!row) return;
+
+    // Сначала собираем ВСЕ цели (escape в URL бросает до первого удаления),
+    // затем удаляем строго по одной с await — без allSettled.
+    const minioKeys = new Set<string>([`videos/${videoJobId}.mp4`, `videos/${videoJobId}.jpg`]);
+    const localFiles = new Set<string>();
+    const localDirs = new Set<string>();
+    const derived = this.deletionLocalVideoPaths(videoJobId);
+    derived.files.forEach((f) => localFiles.add(f));
+    derived.dirs.forEach((d) => localDirs.add(d));
+
+    const minioPrefix = this.s3PublicUrl('');
+    for (const raw of [row.video_url, row.thumbnail_url, row.source_image_url, row.audio_url]) {
+      const url = String(raw ?? '').trim();
+      if (!url) continue;
+      if (url.startsWith(minioPrefix)) {
+        // video-uploads/<userId>/… и прочие own-ключи читаются из сохранённой
+        // row; префикс ЧУЖОГО бакета (assets, chat-files) не совпадает — их
+        // объекты принадлежат своим каноническим строкам.
+        minioKeys.add(ownedObjectKeyOrThrow(url.slice(minioPrefix.length)));
+        continue;
+      }
+      const own = ownStaticPath(url); // escape за public/ бросает UnsafeUrlError
+      if (own) localFiles.add(own.file);
+      // Внешний provider URL — не наш объект.
+    }
+
+    for (const key of minioKeys) await this.deleteVideoMinioConfirmed(key);
+    for (const file of localFiles) {
+      await fs.promises.unlink(file).catch((e: any) => {
+        if (e?.code !== 'ENOENT') throw e; // отсутствие файла — подтверждено
+      });
+    }
+    for (const dir of localDirs) {
+      await fs.promises.rm(dir, { recursive: true, force: true });
+    }
+
+    const client = await this.pg.getClient();
+    try {
+      await client.query('BEGIN');
+      const gen = await client.query(
+        `SELECT 1 FROM user_id u
+          WHERE u.internal_id = $1 AND u.state = 'deleted' AND u.deletion_id = $2`,
+        [userId, deletionId],
+      );
+      if ((gen.rowCount ?? 0) === 0) {
+        await client.query('ROLLBACK');
+        throw new DeletionCancelledError();
+      }
+      // tg_bot_video_jobs уходит FK-cascade (ON DELETE CASCADE в миграции 003).
+      await client.query(
+        `DELETE FROM video_jobs
+          WHERE id = $1 AND user_id = $2
+            AND EXISTS (
+              SELECT 1 FROM user_id u
+              WHERE u.internal_id = $2 AND u.state = 'deleted' AND u.deletion_id = $3
+            )`,
+        [videoJobId, userId, deletionId],
+      );
+      await client.query('COMMIT');
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch { /* уже вне транзакции */ }
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Производные локальные пути job'а — только из валидного id и только внутри
+   * public/videos/ (двойная проверка resolve): финальные MP4/JPG и staging
+   * каталог _veoconcat. Симлинки внутри public/ — лексическая граница, как у
+   * ownStaticPath (см. own-media.ts).
+   */
+  private deletionLocalVideoPaths(jobId: string): { files: string[]; dirs: string[] } {
+    if (!VideoService.SAFE_DELETION_ID_RE.test(jobId)) {
+      throw new DeletionRetryError('db');
+    }
+    const videosDir = path.join(ownPublicDir(), 'videos');
+    const files = [
+      path.join(videosDir, `${jobId}.mp4`),
+      path.join(videosDir, `${jobId}.jpg`),
+    ];
+    const dirs = [path.join(videosDir, '_veoconcat', jobId)];
+    for (const p of [...files, ...dirs]) {
+      if (!p.startsWith(videosDir + path.sep)) throw new DeletionRetryError('db');
+    }
+    return { files, dirs };
+  }
+
+  /**
+   * Подтверждённое удаление в видео-бакете MinIO. Без StorageService исход
+   * подтвердить нечем — fail-closed retry (объект не должен пережить purge
+   * «потому что клиента не оказалось»).
+   */
+  private async deleteVideoMinioConfirmed(key: string): Promise<void> {
+    if (!this.storage) throw new DeletionRetryError('external_unknown');
+    await this.storage.deleteConfirmed({ bucket: this.s3Bucket, key });
   }
 
   // ================= POLLER =================

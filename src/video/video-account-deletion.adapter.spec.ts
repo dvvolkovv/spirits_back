@@ -51,6 +51,8 @@ let publicDir: string;
 beforeAll(() => {
   process.env.BACKEND_URL = BACKEND;
   process.env.MINIO_BUCKET_VIDEOS = VIDEO_BUCKET;
+  // Реализация матчит MinIO-URL строк по префиксу s3PublicUrl (из env).
+  process.env.MINIO_PUBLIC_URL = MINIO_BASE;
   publicDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vid-purge-'));
   process.env.PUBLIC_DIR = publicDir;
 });

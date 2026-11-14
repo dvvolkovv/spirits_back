@@ -43,6 +43,7 @@ maybe('video-job.purge против живого Postgres (Task 12)', () => {
   let publicDir: string;
   let prevPublicDir: string | undefined;
   let prevBackendUrl: string | undefined;
+  let prevMinioPublicUrl: string | undefined;
 
   beforeAll(async () => {
     pool = new Pool({ connectionString: PG, max: 4 });
@@ -66,8 +67,11 @@ maybe('video-job.purge против живого Postgres (Task 12)', () => {
     publicDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vid-purge-pg-'));
     prevPublicDir = process.env.PUBLIC_DIR;
     prevBackendUrl = process.env.BACKEND_URL;
+    prevMinioPublicUrl = process.env.MINIO_PUBLIC_URL;
     process.env.PUBLIC_DIR = publicDir;
     process.env.BACKEND_URL = 'https://api.test';
+    // Реализация матчит MinIO-URL строк по префиксу s3PublicUrl (из env).
+    process.env.MINIO_PUBLIC_URL = 'https://minio.test';
   });
 
   afterAll(async () => {
@@ -76,6 +80,8 @@ maybe('video-job.purge против живого Postgres (Task 12)', () => {
     else process.env.PUBLIC_DIR = prevPublicDir;
     if (prevBackendUrl === undefined) delete process.env.BACKEND_URL;
     else process.env.BACKEND_URL = prevBackendUrl;
+    if (prevMinioPublicUrl === undefined) delete process.env.MINIO_PUBLIC_URL;
+    else process.env.MINIO_PUBLIC_URL = prevMinioPublicUrl;
     await pool?.query('TRUNCATE video_jobs, tg_bot_video_jobs, tg_bot_configs, user_id CASCADE')
       .catch(() => undefined);
     await pool?.end();
