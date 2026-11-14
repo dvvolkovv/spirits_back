@@ -319,4 +319,39 @@ describe('ContextService: день — часами собеседника, а �
 
     expect(out.text).toContain('08:30 — Йога');
   });
+
+  /**
+   * Витрина записанного. ⚠️ Проверяется не наличие строки, а порядок: ниже
+   * выжимки с устройства (правило приоритета §4.3 остаётся за устройством) и
+   * выше облачного профиля — знать, о чём шла работа на той неделе,
+   * применимее перечня ценностей.
+   */
+  it('заголовки заметок и тем идут ниже устройства и выше облачного профиля', async () => {
+    const recall = { digest: jest.fn().mockResolvedValue('ВИТРИНА-ПАМЯТИ') } as any;
+    const svc = new ContextService(pgEmpty(), undefined, undefined, undefined, recall);
+    jest.spyOn(svc as any, 'sectionCloudProfile').mockResolvedValue('ОБЛАЧНЫЙ-ПРОФИЛЬ');
+
+    const out = await svc.build('u1', 'voice-launcher', { device: 'С-УСТРОЙСТВА' });
+
+    expect(out.text.indexOf('С-УСТРОЙСТВА')).toBeLessThan(out.text.indexOf('ВИТРИНА-ПАМЯТИ'));
+    expect(out.text.indexOf('ВИТРИНА-ПАМЯТИ')).toBeLessThan(out.text.indexOf('ОБЛАЧНЫЙ-ПРОФИЛЬ'));
+    expect(recall.digest).toHaveBeenCalledWith('u1');
+  });
+
+  it('витрина есть и у веб-звонка: заметки и разговоры к устройству не привязаны', async () => {
+    const recall = { digest: jest.fn().mockResolvedValue('ВИТРИНА-ПАМЯТИ') } as any;
+    const svc = new ContextService(pgEmpty(), undefined, undefined, undefined, recall);
+
+    const out = await svc.build('u1', 'voice-web');
+
+    expect(out.text).toContain('ВИТРИНА-ПАМЯТИ');
+  });
+
+  it('без сервиса памяти сборка не ломается — секции просто нет', async () => {
+    const svc = new ContextService(pgEmpty());
+
+    const out = await svc.build('u1', 'voice-launcher');
+
+    expect(out.sections.some((s) => s.name === 'memory')).toBe(false);
+  });
 });
