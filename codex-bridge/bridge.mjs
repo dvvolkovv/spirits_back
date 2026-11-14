@@ -246,112 +246,138 @@ export function createBridge({
       const payload = translateRequest(parsed, { model: requestModel, reasoningEffort });
       const target = new URL(`${upstream.replace(/\/+$/, '')}/responses`);
       const transport = target.protocol === 'https:' ? https : http;
-      const upstreamRequest = transport.request(target, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          accept: 'text/event-stream',
-          authorization: `Bearer ${auth.accessToken}`,
-          ...(auth.accountId ? { 'chatgpt-account-id': auth.accountId } : {}),
-          'openai-beta': 'responses=experimental',
-          originator: 'codex_cli_rs',
-          'user-agent': UPSTREAM_UA,
-          session_id: randomUUID(),
-        },
-        agent: false,
-      }, (upstreamRes) => {
-        const status = upstreamRes.statusCode ?? 502;
-        if (status !== 200) {
-          const chunks = [];
-          let collected = 0;
-          upstreamRes.on('data', (c) => {
-            if (collected < 4096) { chunks.push(c); collected += c.length; }
+      // Серверный дифф 2 (spec 2026-11-14): при 401 от upstream один раз
+      // перечитываем auth.json (cron-освежитель codex CLI мог уже обновить
+      // токен) и повторяем запрос РОВНО ОДИН РАЗ. Сами токены мост не
+      // обновляет никогда — ротацию refresh_token делает официальный CLI.
+      let upstreamRequest;
+      const sendUpstream = (attemptAuth, isRetry) => {
+        const request = transport.request(target, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            accept: 'text/event-stream',
+            authorization: `Bearer ${attemptAuth.accessToken}`,
+            ...(attemptAuth.accountId ? { 'chatgpt-account-id': attemptAuth.accountId } : {}),
+            'openai-beta': 'responses=experimental',
+            originator: 'codex_cli_rs',
+            'user-agent': UPSTREAM_UA,
+            session_id: randomUUID(),
+          },
+          agent: false,
+        }, (upstreamRes) => {
+          const status = upstreamRes.statusCode ?? 502;
+          if (status === 401 && !isRetry && !clientGone) {
+            const fresh = loadCodexAuth(authPath);
+            if (fresh) {
+              upstreamRes.resume();
+              emit(log, { id, type: 'error', route: 'codex', model: requestModel, status: 401, error: 'auth_retry' });
+              sendUpstream(fresh, true);
+              return;
+            }
+          }
+          if (status !== 200) {
+            const chunks = [];
+            let collected = 0;
+            upstreamRes.on('data', (c) => {
+              if (collected < 4096) { chunks.push(c); collected += c.length; }
+            });
+            upstreamRes.on('end', () => {
+              let message = `Upstream status ${status}`;
+              try {
+                const e = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+                if (typeof e?.error?.message === 'string') message = e.error.message.slice(0, 300);
+                else if (typeof e?.message === 'string') message = e.message.slice(0, 300);
+              } catch {
+                // оставляем дефолтное сообщение; тело upstream не логируем
+              }
+              if (status === 401) {
+                message = `Codex token rejected: open the Codex app once to refresh login (${message})`;
+              }
+              emit(log, { id, type: 'error', route: 'codex', model: requestModel, status, error: 'upstream_status' });
+              sendError(res, status, 'upstream_error', message);
+            });
+            upstreamRes.on('error', () => {
+              if (!res.writableEnded && !res.destroyed) sendError(res, 502, 'bad_gateway', 'Upstream read failed');
+            });
+            return;
+          }
+
+          // stream:false (Claude Code не использует, но контракт Anthropic требует):
+          // upstream всё равно стримится, фреймы копятся и собираются в один JSON.
+          // При отсутствующем поле stream мост отвечает SSE — осознанное отклонение
+          // от дефолта Anthropic (где отсутствие поля означало бы non-streaming):
+          // единственный потребитель Claude Code всегда шлёт stream явно.
+          const nonStreaming = parsed.stream === false;
+          const frames = [];
+          const stream = createAnthropicStream({
+            model: requestModel,
+            write: nonStreaming
+              ? (frame) => frames.push(frame)
+              : (frame) => {
+                if (!res.writableEnded && !res.destroyed) res.write(frame);
+              },
           });
-          upstreamRes.on('end', () => {
-            let message = `Upstream status ${status}`;
+          if (!nonStreaming) {
+            res.writeHead(200, {
+              'content-type': 'text/event-stream; charset=utf-8',
+              'cache-control': 'no-cache',
+              connection: 'keep-alive',
+            });
+            res.flushHeaders();
+          }
+          const parser = createSseParser((ev) => {
             try {
-              const e = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-              if (typeof e?.error?.message === 'string') message = e.error.message.slice(0, 300);
-              else if (typeof e?.message === 'string') message = e.message.slice(0, 300);
+              stream.handleEvent(ev);
             } catch {
-              // оставляем дефолтное сообщение; тело upstream не логируем
+              // ошибка перевода одного события не должна рвать поток
             }
-            if (status === 401) {
-              message = `Codex token rejected: open the Codex app once to refresh login (${message})`;
+          });
+          upstreamRes.setEncoding('utf8');
+          upstreamRes.on('data', (chunk) => parser.push(chunk));
+          upstreamRes.on('end', () => {
+            stream.finishIfOpen();
+            if (clientGone) {
+              emit(log, { id, type: 'error', route: 'codex', model: requestModel, status: 499, error: 'client_disconnect' });
+            } else {
+              emit(log, { id, type: 'response', route: 'codex', model: requestModel, status: 200 });
             }
-            emit(log, { id, type: 'error', route: 'codex', model: requestModel, status, error: 'upstream_status' });
-            sendError(res, status, 'upstream_error', message);
+            if (nonStreaming) {
+              try {
+                sendJson(res, 200, assembleMessage(frames));
+              } catch (error) {
+                sendError(res, 500, error.safeType ?? 'api_error',
+                  error.message ?? 'Stream assembly failed');
+              }
+              return;
+            }
+            if (!res.writableEnded) res.end();
           });
           upstreamRes.on('error', () => {
-            if (!res.writableEnded && !res.destroyed) sendError(res, 502, 'bad_gateway', 'Upstream read failed');
-          });
-          return;
-        }
-
-        // stream:false (Claude Code не использует, но контракт Anthropic требует):
-        // upstream всё равно стримится, фреймы копятся и собираются в один JSON.
-        // При отсутствующем поле stream мост отвечает SSE — осознанное отклонение
-        // от дефолта Anthropic (где отсутствие поля означало бы non-streaming):
-        // единственный потребитель Claude Code всегда шлёт stream явно.
-        const nonStreaming = parsed.stream === false;
-        const frames = [];
-        const stream = createAnthropicStream({
-          model: requestModel,
-          write: nonStreaming
-            ? (frame) => frames.push(frame)
-            : (frame) => {
-              if (!res.writableEnded && !res.destroyed) res.write(frame);
-            },
-        });
-        if (!nonStreaming) {
-          res.writeHead(200, {
-            'content-type': 'text/event-stream; charset=utf-8',
-            'cache-control': 'no-cache',
-            connection: 'keep-alive',
-          });
-          res.flushHeaders();
-        }
-        const parser = createSseParser((ev) => {
-          try {
-            stream.handleEvent(ev);
-          } catch {
-            // ошибка перевода одного события не должна рвать поток
-          }
-        });
-        upstreamRes.setEncoding('utf8');
-        upstreamRes.on('data', (chunk) => parser.push(chunk));
-        upstreamRes.on('end', () => {
-          stream.finishIfOpen();
-          if (clientGone) {
-            emit(log, { id, type: 'error', route: 'codex', model: requestModel, status: 499, error: 'client_disconnect' });
-          } else {
-            emit(log, { id, type: 'response', route: 'codex', model: requestModel, status: 200 });
-          }
-          if (nonStreaming) {
-            try {
-              sendJson(res, 200, assembleMessage(frames));
-            } catch (error) {
-              sendError(res, 500, error.safeType ?? 'api_error',
-                error.message ?? 'Stream assembly failed');
+            if (clientGone) {
+              emit(log, { id, type: 'error', route: 'codex', model: requestModel, status: 499, error: 'client_disconnect' });
+            } else {
+              emit(log, { id, type: 'error', route: 'codex', model: requestModel, status: 200, error: 'upstream_stream' });
             }
-            return;
-          }
-          if (!res.writableEnded) res.end();
+            if (nonStreaming) {
+              sendError(res, 502, 'bad_gateway', 'Upstream stream failed');
+              return;
+            }
+            stream.failOpen('Upstream connection error');
+            if (!res.writableEnded) res.end();
+          });
         });
-        upstreamRes.on('error', () => {
-          if (clientGone) {
-            emit(log, { id, type: 'error', route: 'codex', model: requestModel, status: 499, error: 'client_disconnect' });
-          } else {
-            emit(log, { id, type: 'error', route: 'codex', model: requestModel, status: 200, error: 'upstream_stream' });
-          }
-          if (nonStreaming) {
-            sendError(res, 502, 'bad_gateway', 'Upstream stream failed');
-            return;
-          }
-          stream.failOpen('Upstream connection error');
-          if (!res.writableEnded) res.end();
+        upstreamRequest = request;
+        request.on('error', () => {
+          // Ошибка СТАРОЙ попытки (её заменил ретрай) игнорируется — иначе она
+          // перетёрла бы ответ ретрая пятьсот вторым.
+          if (request !== upstreamRequest) return;
+          if (res.writableEnded || res.destroyed) return;
+          emit(log, { id, type: 'error', route: 'codex', model: requestModel, status: 502, error: 'upstream_request' });
+          sendError(res, 502, 'bad_gateway', 'Upstream request failed');
         });
-      });
+        request.end(JSON.stringify(payload));
+      };
       // Обрыв клиента — в т.ч. до прихода заголовков upstream: уничтожаем запрос
       // сразу (иначе генерация на chatgpt.com продолжает жечь квоту, а при
       // зависшем upstream сокет висит вечно) и помечаем обрыв, чтобы логи не
@@ -359,14 +385,9 @@ export function createBridge({
       // После нормального завершения destroyed === true и destroy() — no-op.
       res.on('close', () => {
         clientGone = true;
-        if (!upstreamRequest.destroyed) upstreamRequest.destroy();
+        if (upstreamRequest && !upstreamRequest.destroyed) upstreamRequest.destroy();
       });
-      upstreamRequest.on('error', () => {
-        if (res.writableEnded || res.destroyed) return;
-        emit(log, { id, type: 'error', route: 'codex', model: requestModel, status: 502, error: 'upstream_request' });
-        sendError(res, 502, 'bad_gateway', 'Upstream request failed');
-      });
-      upstreamRequest.end(JSON.stringify(payload));
+      sendUpstream(auth, false);
     } catch (error) {
       emit(log, { id, type: 'error', route: 'codex', model: requestModel, status: 500, error: error?.safeType ?? error?.name ?? 'Error' });
       if (!res.writableEnded && !res.destroyed) sendError(res, 500, 'internal_error', 'Internal error');
