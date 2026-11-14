@@ -368,7 +368,10 @@ export function createBridge({
   return server;
 }
 
-if (isMain(import.meta.url)) {
+// Под pm2 (fork mode) argv[1] указывает на ProcessContainerFork.js, а не на скрипт:
+// без проверки pm_id мост молча не открыл бы порт (инцидент 04.11 на релее,
+// см. relay-agent/server.mjs). Прямой запуск node по-прежнему решает isMain().
+if (process.env.pm_id !== undefined || isMain(import.meta.url)) {
   const port = Number.parseInt(process.env.BRIDGE_PORT ?? '8790', 10);
   const logPath = process.env.BRIDGE_LOG_PATH ?? DEFAULT_LOG_PATH;
   const log = createFileLogger(logPath);
