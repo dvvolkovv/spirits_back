@@ -157,6 +157,10 @@ export function createBridge({
   const server = http.createServer(async (req, res) => {
     const id = randomUUID();
     let clientGone = false;
+    // Серверный дифф 1 (spec 2026-11-14): уважаем входящую модель —
+    // ClaudeCliService шлёт ANTHROPIC_DEFAULT_*_MODEL из реестра, а не дефолт
+    // моста. Объявлена до try, чтобы внешний catch тоже мог её логировать.
+    let requestModel = model;
     try {
       const address = server.address();
       const port = address && typeof address === 'object' ? address.port : 0;
@@ -220,6 +224,10 @@ export function createBridge({
         return;
       }
 
+      if (typeof parsed.model === 'string' && parsed.model.trim() !== '') {
+        requestModel = parsed.model.trim();
+      }
+
       if (requestPath === '/v1/messages/count_tokens') {
         const approx = Math.max(1, Math.ceil(incoming.body.length / 4));
         emit(log, { id, type: 'response', route: 'count_tokens', status: 200 });
@@ -229,13 +237,13 @@ export function createBridge({
 
       const auth = loadCodexAuth(authPath);
       if (!auth) {
-        emit(log, { id, type: 'error', route: 'codex', model, status: 401, error: 'auth_missing' });
+        emit(log, { id, type: 'error', route: 'codex', model: requestModel, status: 401, error: 'auth_missing' });
         sendError(res, 401, 'codex_auth_missing',
           'Codex auth unavailable: open the Codex app (or run codex login) once to refresh login');
         return;
       }
 
-      const payload = translateRequest(parsed, { model, reasoningEffort });
+      const payload = translateRequest(parsed, { model: requestModel, reasoningEffort });
       const target = new URL(`${upstream.replace(/\/+$/, '')}/responses`);
       const transport = target.protocol === 'https:' ? https : http;
       const upstreamRequest = transport.request(target, {
@@ -271,7 +279,7 @@ export function createBridge({
             if (status === 401) {
               message = `Codex token rejected: open the Codex app once to refresh login (${message})`;
             }
-            emit(log, { id, type: 'error', route: 'codex', model, status, error: 'upstream_status' });
+            emit(log, { id, type: 'error', route: 'codex', model: requestModel, status, error: 'upstream_status' });
             sendError(res, status, 'upstream_error', message);
           });
           upstreamRes.on('error', () => {
@@ -288,7 +296,7 @@ export function createBridge({
         const nonStreaming = parsed.stream === false;
         const frames = [];
         const stream = createAnthropicStream({
-          model,
+          model: requestModel,
           write: nonStreaming
             ? (frame) => frames.push(frame)
             : (frame) => {
@@ -315,9 +323,9 @@ export function createBridge({
         upstreamRes.on('end', () => {
           stream.finishIfOpen();
           if (clientGone) {
-            emit(log, { id, type: 'error', route: 'codex', model, status: 499, error: 'client_disconnect' });
+            emit(log, { id, type: 'error', route: 'codex', model: requestModel, status: 499, error: 'client_disconnect' });
           } else {
-            emit(log, { id, type: 'response', route: 'codex', model, status: 200 });
+            emit(log, { id, type: 'response', route: 'codex', model: requestModel, status: 200 });
           }
           if (nonStreaming) {
             try {
@@ -332,9 +340,9 @@ export function createBridge({
         });
         upstreamRes.on('error', () => {
           if (clientGone) {
-            emit(log, { id, type: 'error', route: 'codex', model, status: 499, error: 'client_disconnect' });
+            emit(log, { id, type: 'error', route: 'codex', model: requestModel, status: 499, error: 'client_disconnect' });
           } else {
-            emit(log, { id, type: 'error', route: 'codex', model, status: 200, error: 'upstream_stream' });
+            emit(log, { id, type: 'error', route: 'codex', model: requestModel, status: 200, error: 'upstream_stream' });
           }
           if (nonStreaming) {
             sendError(res, 502, 'bad_gateway', 'Upstream stream failed');
@@ -355,12 +363,12 @@ export function createBridge({
       });
       upstreamRequest.on('error', () => {
         if (res.writableEnded || res.destroyed) return;
-        emit(log, { id, type: 'error', route: 'codex', model, status: 502, error: 'upstream_request' });
+        emit(log, { id, type: 'error', route: 'codex', model: requestModel, status: 502, error: 'upstream_request' });
         sendError(res, 502, 'bad_gateway', 'Upstream request failed');
       });
       upstreamRequest.end(JSON.stringify(payload));
     } catch (error) {
-      emit(log, { id, type: 'error', route: 'codex', model, status: 500, error: error?.safeType ?? error?.name ?? 'Error' });
+      emit(log, { id, type: 'error', route: 'codex', model: requestModel, status: 500, error: error?.safeType ?? error?.name ?? 'Error' });
       if (!res.writableEnded && !res.destroyed) sendError(res, 500, 'internal_error', 'Internal error');
     }
   });
