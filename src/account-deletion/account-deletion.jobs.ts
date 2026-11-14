@@ -109,6 +109,105 @@ export class AccountDeletionJobs {
     return result.rows[0] ? mapDeletionJob(result.rows[0]) : null;
   }
 
+  /**
+   * Task 18 — stop-очередь одного поколения для явного DELETE: зеркало
+   * claimNext, суженное до `%.stop`. Правила зависимостей не нужны: у
+   * stop-задач их нет (allStop/allOf защищают purge и core, но не стопы),
+   * а core.immediate здесь не клеймится НИКОГДА — явный путь исполняет его
+   * адресно (find + runJob), и «случайный» claim core в stop-цикле оставил
+   * бы задачу заклеймленной при ошибке до runJob.
+   *
+   * Fencing тот же, что у claimNext: строка user_id удалённого поколения
+   * (state='deleted' AND deletion_id AND deleted_at) — реактивированный
+   * аккаунт задачи не отдаёт. Просроченный lease чужого running тоже
+   * подбирается: явный retry продолжает упавший прежний запрос.
+   */
+  async claimNextStop(deletionId: string): Promise<DeletionJobRow | null> {
+    const result = await this.db.query(
+      `UPDATE account_deletion_jobs j
+       SET status='running',attempts=j.attempts+1,
+           lease_until=now()+interval '5 minutes',updated_at=now()
+       WHERE j.id=(
+         SELECT c.id
+         FROM account_deletion_jobs c
+         JOIN user_id u ON u.internal_id=c.user_id
+           AND u.state='deleted'
+           AND u.deletion_id=c.deletion_id
+           AND u.deleted_at IS NOT NULL
+         WHERE c.deletion_id=$1
+           AND c.resource_type LIKE '%.stop'
+           AND ((c.status IN ('pending','failed') AND c.next_attempt_at<=now())
+             OR (c.status='running' AND c.lease_until<now()))
+         ORDER BY c.next_attempt_at,c.id
+         LIMIT 1
+         FOR UPDATE OF c SKIP LOCKED
+       )
+       RETURNING j.*`,
+      [deletionId],
+    );
+    return result.rows[0] ? mapDeletionJob(result.rows[0]) : null;
+  }
+
+  /**
+   * Task 18 — claim конкретной задачи поколения для явного пути: тот же
+   * fencing, что у claimNext (JOIN user_id), но по id. next_attempt_at
+   * сознательно не проверяется: явный DELETE обходит backoff — человек ждёт
+   * ответа сейчас, а не через экспоненциальную задержку воркера.
+   *
+   * Claimable: pending/failed и running с истёкшим lease. done/cancelled и
+   * чужой живой lease дают null — runJob трактует это как retryable-исход,
+   * а не как молчаливый успех.
+   */
+  async claimById(id: string, deletionId: string): Promise<DeletionJobRow | null> {
+    const result = await this.db.query(
+      `UPDATE account_deletion_jobs j
+       SET status='running',attempts=j.attempts+1,
+           lease_until=now()+interval '5 minutes',updated_at=now()
+       WHERE j.id=(
+         SELECT c.id
+         FROM account_deletion_jobs c
+         JOIN user_id u ON u.internal_id=c.user_id
+           AND u.state='deleted'
+           AND u.deletion_id=c.deletion_id
+           AND u.deleted_at IS NOT NULL
+         WHERE c.id=$1
+           AND c.deletion_id=$2
+           AND (c.status IN ('pending','failed')
+             OR (c.status='running' AND c.lease_until<now()))
+         FOR UPDATE OF c SKIP LOCKED
+       )
+       RETURNING j.*`,
+      [id, deletionId],
+    );
+    return result.rows[0] ? mapDeletionJob(result.rows[0]) : null;
+  }
+
+  /**
+   * Task 18 — строгий поиск строки задачи внутри поколения. Ровно одна
+   * строка гарантирована UNIQUE(deletion_id,resource_type,resource_key);
+   * ноль строк означает рассогласование плана и хранилища (аудит-строки
+   * потеряны), несколько — повреждение ограничения. Оба исхода retryable
+   * (kind db): следующий begin() переперсистит план через
+   * ON CONFLICT DO NOTHING, и рассогласование устранится само, без ручного
+   * вмешательства.
+   */
+  async find(
+    deletionId: string,
+    resourceType: DeletionResourceType,
+    resourceKey: string,
+  ): Promise<DeletionJobRow> {
+    const result = await this.db.query(
+      `SELECT *
+       FROM account_deletion_jobs
+       WHERE deletion_id=$1
+         AND resource_type=$2
+         AND resource_key=$3`,
+      [deletionId, resourceType, resourceKey],
+    );
+    if (result.rows.length !== 1) throw new DeletionRetryError('db');
+    return mapDeletionJob(result.rows[0]);
+  }
+
   async dueAccounts(
     after: [string, string] | null,
     batchSize = 50,

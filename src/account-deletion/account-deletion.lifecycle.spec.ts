@@ -137,13 +137,16 @@ function makeJobsFake(options: JobsFakeOptions) {
   const queue = [...options.stops];
   return {
     claimNextStop: jest.fn(async () => {
-      const next = queue.shift() ?? null;
-      if (next) {
+      // Как настоящий claim: только не-done строки (done не перезапускаются).
+      while (queue.length > 0) {
+        const next = queue.shift()!;
+        if (next.status === 'done') continue;
         next.status = 'running';
         next.attempts += 1;
         next.leaseUntil = new Date(Date.now() + 300_000);
+        return next;
       }
-      return next;
+      return null;
     }),
     claimById: jest.fn(async (id: string) => {
       if (options.claimAlwaysNull) return null;

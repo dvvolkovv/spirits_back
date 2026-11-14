@@ -4,6 +4,7 @@ import { AccountDeletionJobs } from './account-deletion.jobs';
 import { AccountDeletionRegistry } from './account-deletion.registry';
 import {
   DeletionCancelledError,
+  DeletionRetryError,
   deletionErrorKind,
   safeDeletionMessage,
 } from './account-deletion.safe';
@@ -29,7 +30,45 @@ export class AccountDeletionRunner {
     }
   }
 
-  private async runJob(job: DeletionJobRow): Promise<void> {
+  /**
+   * Task 18 — синхронное исполнение immediate-стопов одного поколения для
+   * явного DELETE: HTTP-запрос не отдаёт управление почасовому воркеру,
+   * человек ждёт ответа. Цикл идёт, пока stop-очередь поколения выдаёт
+   * задачи (claimNextStop не трогает core), затем контрольный
+   * assertNoImmediateBlockers: runJob ГЛОТАЕТ ошибки адаптеров (jobs.fail +
+   * safe warn + return), поэтому «очередь пуста» само по себе не означает
+   * «все стопы успешны». Проверка превращает незавершённый stop в
+   * retryable-исход, который lifecycle транслирует в честный 503.
+   */
+  async runImmediateStops(deletionId: string): Promise<void> {
+    while (true) {
+      const job = await this.jobs.claimNextStop(deletionId);
+      if (!job) break;
+      await this.runJob(job);
+    }
+    await this.jobs.assertNoImmediateBlockers(deletionId);
+  }
+
+  /**
+   * Task 18 — метод публичен: явный путь исполняет адресную задачу (core)
+   * вне цикла claimNext. Нерunning-строка нормализуется через claimById
+   * (явный retry обходит backoff); done завершается сразу — повторному
+   * DELETE не нужно повторно исполнять успешный core. Неclaimable-строку
+   * (cancelled после реактивации, чужой живой lease) НЕЛЬЗЯ молча пропустить
+   * — это выглядело бы как успех: бросаем retryable-ошибку.
+   *
+   * Для runAccount поведение прежнее: claimNext всегда отдаёт running-строку,
+   * нормализация не срабатывает.
+   */
+  async runJob(jobRow: DeletionJobRow): Promise<void> {
+    let job = jobRow;
+    if (job.status === 'done') return;
+    if (job.status !== 'running') {
+      const claimed = await this.jobs.claimById(job.id, job.deletionId);
+      if (!claimed) throw new DeletionRetryError('db');
+      job = claimed;
+    }
+
     let heartbeatBusy = false;
     let heartbeatLost = false;
     let heartbeatError: { value: unknown } | null = null;

@@ -1,4 +1,5 @@
 import { Injectable, Logger, Optional, OnModuleInit } from '@nestjs/common';
+import { AccountDeletionLifecycle } from '../account-deletion/account-deletion.lifecycle';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { IdentityService } from '../identity/identity.service';
@@ -17,8 +18,13 @@ export { sanitizeAssistantVoices };
 export class ProfileService implements OnModuleInit {
   private readonly logger = new Logger(ProfileService.name);
 
+  // Task 18: lifecycle — ОБЯЗАТЕЛЬНАЯ зависимость (вторая позиция): явное
+  // удаление без координатора недопустимо, а TS не позволяет добавить
+  // обязательный параметр ПОСЛЕ @Optional-параметров. AccountDeletionModule
+  // (@Global) экспортирует lifecycle, поэтому imports ProfileModule не меняется.
   constructor(
     private readonly pg: PgService,
+    private readonly deletion: AccountDeletionLifecycle,
     @Optional() private readonly neo4j?: Neo4jService,
     @Optional() private readonly identity?: IdentityService,
     @Optional() private readonly apple?: OAuthAppleService,
@@ -147,23 +153,21 @@ export class ProfileService implements OnModuleInit {
   }
 
   async deleteProfile(userId: string) {
-    // Task 17: у метода не осталось собственных SQL/network вызовов.
+    // Task 18: вся работа — у lifecycle (account-deletion.lifecycle.ts):
+    // begin (поколение + план в одной транзакции), синхронные immediate-стопы,
+    // затем fenced core finalize с контролем статуса. У ProfileService по-прежнему
+    // нет собственных SQL/network вызовов на этом пути.
     //
-    // Fenced-удаление ядра (повторный capture файлов переписки, строгое
-    // стирание графа Neo4j и одна атомарная транзакция под блокировкой
-    // поколения) исполняет ProfileAccountDeletionAdapter — задачи
-    // account.core.immediate / account.core.purge. Все rationale-комментарии
-    // (escaped LIKE, правило 5.1.1(v), связка TG-бота 1:1 UNIQUE(tg_user_id),
-    // welcome_bonus_at у телефонного internal_id, двухчасовая дыра JWT от
-    // 15.08.2026) переехали в profile-account-deletion.adapter.ts вместе с
-    // SQL. Отзыв доступа Apple живёт в integration.apple.stop (Task 9) —
-    // порядок до identity unlink гарантирует зависимость account.core.*
-    // {allStop:true}.
+    // При неуспехе стопов или ядра lifecycle бросает
+    // ServiceUnavailableException с фиксированным безопасным сообщением
+    // (без deletionId/userId): контроллер с @Res() не успевает отправить
+    // ответ, штатный exception-filter Nest возвращает 503 — ложного
+    // {success:true} не возникает. Аккаунт остаётся в удалённом поколении,
+    // повторный DELETE продолжает с незавершённых задач.
     //
-    // Task 18 заменит это тело делегированием lifecycle в координатор
-    // (begin + явный core). Промежуточное состояние допустимо: ветка
-    // мёржится целиком, worker удаления в main ещё не включён, а
-    // HTTP-контракт (200 {success:true}) сохранён.
+    // Rationale-комментарии про SQL ядра — в profile-account-deletion.adapter.ts,
+    // про порядок stops→core и ветки begin — в account-deletion.lifecycle.ts.
+    await this.deletion.deleteExplicit(userId);
     return { success: true };
   }
 
