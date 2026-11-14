@@ -90,7 +90,7 @@ sed -i '' "s|'./codex-translate.mjs'|'./translate.mjs'|g; s|'./codex-sse.mjs'|'.
 
 ```bash
 grep -rn "claude-model-router\|codex-translate\|codex-sse\|/Users/dmitry" codex-bridge/ || echo CLEAN
-node --test codex-bridge/
+node --test codex-bridge/*.test.mjs
 ```
 
 Expected: `CLEAN`; `# pass 22` (translate 10 + sse 12), `# fail 0`.
@@ -291,7 +291,7 @@ export function isMain(metaUrl = import.meta.url, argvPath = process.argv[1]) {
 ```bash
 grep -n "claude-model-router\|codex-translate\|codex-sse\|/Users/dmitry" codex-bridge/bridge.mjs || echo CLEAN
 node --check codex-bridge/bridge.mjs && echo SYNTAX-OK
-node --test codex-bridge/
+node --test codex-bridge/*.test.mjs
 ```
 
 Expected: `CLEAN`, `SYNTAX-OK`, `# pass 39` (22 из Task 1 + 17 bridge), `# fail 0`.
@@ -362,7 +362,7 @@ test('Серверный дифф 1: входящая модель идёт на
 - [ ] **Step 2: Прогнать — тест красный**
 
 ```bash
-cd ~/Downloads/spirits_back && node --test codex-bridge/
+cd ~/Downloads/spirits_back && node --test codex-bridge/*.test.mjs
 ```
 
 Expected: `# pass 39`, `# fail 1` (новый тест: на upstream уходит `gpt-6-astra` вместо `gpt-6-astra-custom`).
@@ -425,7 +425,7 @@ git pull --rebase -q origin main && git push -q origin main
 - [ ] **Step 5: Прогнать — всё зелёное**
 
 ```bash
-node --test codex-bridge/
+node --test codex-bridge/*.test.mjs
 ```
 
 Expected: `# pass 40`, `# fail 0`.
@@ -503,7 +503,7 @@ test('Серверный дифф 2: 401 дважды — второй уход�
 - [ ] **Step 2: Прогнать — два красных**
 
 ```bash
-cd ~/Downloads/spirits_back && node --test codex-bridge/
+cd ~/Downloads/spirits_back && node --test codex-bridge/*.test.mjs
 ```
 
 Expected: `# pass 40`, `# fail 2` (без ретрая: `records.length === 1`, клиенту уходит 401 с первого хита).
@@ -678,7 +678,7 @@ git pull --rebase -q origin main && git push -q origin main
 - [ ] **Step 5: Прогнать — всё зелёное**
 
 ```bash
-node --check codex-bridge/bridge.mjs && node --test codex-bridge/
+node --check codex-bridge/bridge.mjs && node --test codex-bridge/*.test.mjs
 ```
 
 Expected: `# pass 42`, `# fail 0`.
@@ -729,7 +729,7 @@ test('Серверный дифф 3: дефолтный User-Agent — Linux x86
 - [ ] **Step 2: Прогнать — красный; commit**
 
 ```bash
-cd ~/Downloads/spirits_back && node --test codex-bridge/   # pass 42, fail 1
+cd ~/Downloads/spirits_back && node --test codex-bridge/*.test.mjs   # pass 42, fail 1
 git add codex-bridge/bridge.test.mjs
 git commit -m "$(cat <<'EOF'
 test(codex-bridge): дефолтный UA — Linux x86_64 (красный)
@@ -764,7 +764,7 @@ export const UPSTREAM_UA = process.env.CODEX_BRIDGE_UA
 - [ ] **Step 4: Прогнать — зелёное; commit**
 
 ```bash
-node --test codex-bridge/    # pass 43, fail 0
+node --test codex-bridge/*.test.mjs    # pass 43, fail 0
 git add codex-bridge/bridge.mjs
 git commit -m "$(cat <<'EOF'
 feat(codex-bridge): дифф 3 — Linux User-Agent по умолчанию
@@ -1838,7 +1838,7 @@ git pull --rebase -q origin main && git push -q origin main
 
 ## Финальная проверка (после всех задач)
 
-- [ ] `cd ~/Downloads/spirits_back && node --test codex-bridge/ relay-agent/llm-fallback.test.mjs` → 43 + relay, fail 0.
+- [ ] `cd ~/Downloads/spirits_back && node --test codex-bridge/*.test.mjs relay-agent/llm-fallback.test.mjs` → 43 + relay, fail 0.
 - [ ] На ноде (свежий sha main): `npx jest src/common/services/llm-fallback.spec.ts src/admin/admin-global-llm.controller.spec.ts src/admin/admin-llm-provider.controller.spec.ts src/monitoring/claude-health.alert-line.spec.ts src/monitoring/relay-qwen-monitor.service.spec.ts src/monitoring/claude-health.outage-alert.spec.ts` → PASS; `npx tsc -p tsconfig.build.json --noEmit` → OK.
 - [ ] `cd ~/Downloads/spirits_front` (Node 22): `pnpm vitest run src/components/admin/` → PASS; `node scripts/check-keys-exist.mjs && node scripts/check-locales.mjs` → зелёные.
 - [ ] `node --check scripts/codex-fallback-check.js`, `bash -n codex-bridge/keep-alive.sh`.
