@@ -151,14 +151,17 @@ maybe('profile account deletion against PostgreSQL (Task 17)', () => {
     hash?: string | null;
     email?: string | null;
     phone?: string | null;
+    contacts?: string | null;
   }): Promise<void> {
     await pool.query(
       `INSERT INTO user_id
          (internal_id, state, deleted_at, deletion_id,
-          password_hash, primary_email, primary_phone, welcome_bonus_at)
-       VALUES ($1,'deleted',$2,$3,$4,$5,$6,$2)`,
+          password_hash, primary_email, primary_phone, welcome_bonus_at,
+          contacts)
+       VALUES ($1,'deleted',$2,$3,$4,$5,$6,$2,$7::json)`,
       [opts.userId, DELETED_AT, opts.deletionId,
-        opts.hash ?? null, opts.email ?? null, opts.phone ?? null],
+        opts.hash ?? null, opts.email ?? null, opts.phone ?? null,
+        opts.contacts ?? null],
     );
   }
 
@@ -493,6 +496,9 @@ maybe('profile account deletion against PostgreSQL (Task 17)', () => {
     await seedDeletedAccount({
       userId: USER, deletionId: DELETION_ID,
       hash: 'HASH-CANARY', email: 'deleted@example.test', phone: '79990000001',
+      // T17-M6: contacts — мёртвая колонка (writer'ов в дереве нет), но план
+      // требует очистки; канарейка проверяет, что она не переживает tombstone.
+      contacts: JSON.stringify({ vk: 'КАНАРЕЙКА-КОНТАКТ' }),
     });
     await seedActiveAccount(OTHER);
     // История: своя (file + canary), своя вторая, префикс-коллизия, чужая.
@@ -585,16 +591,17 @@ maybe('profile account deletion against PostgreSQL (Task 17)', () => {
     expect(await rows(`SELECT linkeon_user_id FROM tg_user_identities`))
       .toEqual([{ linkeon_user_id: OTHER }]);
     // user_id — tombstone: state/deletion_id/deleted_at не тронуты,
-    // password/email/welcome bonus погашены.
+    // password/email/contacts/welcome bonus погашены.
     const u = await rows(
       `SELECT state, deletion_id, deleted_at, password_hash, primary_email,
-              welcome_bonus_at, update_date
+              contacts, welcome_bonus_at, update_date
          FROM user_id WHERE internal_id=$1`, [USER]);
     expect(u[0]).toMatchObject({
       state: 'deleted',
       deletion_id: DELETION_ID,
       password_hash: null,
       primary_email: null,
+      contacts: null,
       welcome_bonus_at: null,
     });
     expect(new Date(u[0].deleted_at).getTime()).toBe(DELETED_AT.getTime());

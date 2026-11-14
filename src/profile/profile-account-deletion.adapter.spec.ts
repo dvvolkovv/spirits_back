@@ -259,6 +259,8 @@ describe('deleteOwnedCoreRows — форма SQL (Task 17)', () => {
     // core finalize: SET-часть не должна их переписывать.
     expect(setClause).not.toMatch(/\bstate\b|\bdeleted_at\b|\bdeletion_id\b/);
     expect(setClause).toContain('primary_email = NULL');
+    // T17-M6: contacts — мёртвая колонка, но план :1492 требует очистки.
+    expect(setClause).toContain('contacts = NULL');
     expect(setClause).toContain('welcome_bonus_at = NULL');
     expect(setClause).toContain('update_date = now()');
     expect(whereClause).toContain(`internal_id = $1 AND state = 'deleted' AND deletion_id = $2`);
