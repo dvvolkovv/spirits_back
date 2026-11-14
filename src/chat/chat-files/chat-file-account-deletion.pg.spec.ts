@@ -408,7 +408,7 @@ maybe('purge chat-file.purge против живого Postgres (ref-check SQL)'
     );
     await pool.query(
       `INSERT INTO voice_call_jobs (id,call_id,specialist_agent_id,question,status,answer)
-       VALUES ('dddddddd-dddd-4ddd-8ddd-ddddddddde',$1,13,$2,'done',$3)`,
+       VALUES (gen_random_uuid(),$1,13,$2,'done',$3)`,
       [callId, `вопрос со ссылкой ${FILE_URL}`, 'ответ'],
     );
     const { adapter, storage, ctx } = makeAdapter();
