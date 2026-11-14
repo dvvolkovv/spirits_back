@@ -147,10 +147,11 @@ function makeJob(overrides: Partial<DeletionJobRow> = {}): DeletionJobRow {
 }
 
 const stopJob = () => makeJob();
-const purgeJob = () => makeJob({
+const purgeJob = (overrides: Partial<DeletionJobRow> = {}) => makeJob({
   id: 'job-legacy-2',
   resourceType: 'legacy-auth.purge',
   phase: 'purge',
+  ...overrides,
 });
 
 describe('discoverLegacyAuthDeletion — два пустых job на аккаунт (Task 17D)', () => {
