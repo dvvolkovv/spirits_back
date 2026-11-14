@@ -1523,6 +1523,108 @@ ${healthSummary}
     }
   }
 
+  /**
+   * Возврат токенов рукой владельца — сразу на баланс.
+   *
+   * Потолки `LIMITS.REFUND_MAX_*` ограничивают МОДЕЛЬ: всё, что больше, ИИ
+   * обязан эскалировать владельцу. А у владельца до 14.11.2026 нечем было
+   * вернуть — оставались купоны, которые человек должен сам найти и
+   * погасить. За плохую работу платформы человек не должен делать ничего:
+   * возврат приходит сам, как пополнение.
+   *
+   * Начисляем через `add_user_tokens`, а не UPDATE: иначе возврата не будет
+   * видно в истории пополнений.
+   */
+  async ownerRefund(ticketId: string, ownerId: string, amount: number, reason: string) {
+    const sum = Math.floor(Number(amount));
+    const why = String(reason || '').trim().slice(0, 500);
+    if (!Number.isFinite(sum) || sum <= 0) throw new BadRequestException('amount must be positive');
+    if (sum > LIMITS.OWNER_REFUND_MAX) {
+      throw new BadRequestException(`amount above owner cap (${LIMITS.OWNER_REFUND_MAX})`);
+    }
+    if (!why) throw new BadRequestException('reason required');
+
+    const t = await this.pg.query('SELECT user_id FROM support_tickets WHERE id = $1', [ticketId]);
+    const userId = t.rows[0]?.user_id;
+    if (!userId) throw new NotFoundException('ticket not found');
+
+    const client = await this.pg.getClient();
+    let rolledBack = false;
+    try {
+      await client.query('BEGIN');
+      // Тот же лок, что возьмёт процедура: по несуществующему пользователю
+      // add_user_tokens отработает без ошибки и не тронет ни одной строки —
+      // ответ был бы «успех», а баланс прежний.
+      const exists = await client.query(
+        'SELECT 1 FROM ai_profiles_consolidated WHERE user_id = $1 FOR UPDATE', [userId],
+      );
+      if (exists.rowCount === 0) {
+        await client.query('ROLLBACK');
+        rolledBack = true;
+        throw new NotFoundException('user not found');
+      }
+      const upd = await client.query(
+        `SELECT add_user_tokens($1, $2, 'refund', $3, $4::jsonb) AS res`,
+        [userId, sum, 'Возврат от поддержки', JSON.stringify({ ticket_id: ticketId, reason: why, by: 'owner' })],
+      );
+      await client.query(
+        'UPDATE ai_profiles_consolidated SET updated_at = now() WHERE user_id = $1', [userId],
+      );
+      await client.query(
+        `INSERT INTO support_events (ticket_id, actor_type, actor_id, action, payload)
+         VALUES ($1, 'owner', $2, 'refund', $3::jsonb)`,
+        [ticketId, ownerId, JSON.stringify({ amount: sum, reason: why })],
+      );
+      await client.query('COMMIT');
+      const raw = upd.rows[0]?.res;
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      const balance = Number(parsed?.new_balance ?? 0);
+      this.logger.log(`owner refund ${sum} (ticket ${ticketId})`);
+      await this.insertMessage(
+        ticketId, 'system', ownerId,
+        `💳 Начислено ${sum.toLocaleString('ru-RU')} токенов. Новый баланс: ${balance.toLocaleString('ru-RU')}.`,
+        { refund: true, amount: sum, by: 'owner' }, true,
+      );
+      return { ok: true, amount: sum, new_balance: balance };
+    } catch (e: any) {
+      if (!rolledBack) {
+        try { await client.query('ROLLBACK'); } catch { /* уже закрыт */ }
+      }
+      if (e instanceof NotFoundException) throw e;
+      this.logger.error(`owner refund failed: ${e.message}`);
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Убрать сообщение поддержки из переписки.
+   *
+   * Только своё — реплику владельца, ИИ или системную. Сообщение человека
+   * не удаляем: это его слова, и по ним потом разбираются.
+   *
+   * В журнал пишем id и кто автор, но НЕ текст: удаляют обычно как раз то,
+   * чего в переписке быть не должно (попавший не туда код, лишние данные), —
+   * копия в журнале свела бы удаление на нет.
+   */
+  async deleteMessage(ticketId: string, ownerId: string, messageId: string) {
+    const r = await this.pg.query(
+      'SELECT sender_type FROM support_messages WHERE id = $1 AND ticket_id = $2',
+      [messageId, ticketId],
+    );
+    const row = r.rows[0];
+    if (!row) throw new NotFoundException('message not found');
+    if (row.sender_type === 'user') throw new BadRequestException('user message cannot be deleted');
+    await this.pg.query('DELETE FROM support_messages WHERE id = $1', [messageId]);
+    await this.pg.query(
+      `INSERT INTO support_events (ticket_id, actor_type, actor_id, action, payload)
+       VALUES ($1, 'owner', $2, 'message_deleted', $3::jsonb)`,
+      [ticketId, ownerId, JSON.stringify({ message_id: messageId, sender_type: row.sender_type })],
+    );
+    return { ok: true };
+  }
+
   async insertMessage(
     ticketId: string, senderType: SenderType, senderId: string | null,
     content: string, metadata: any = null, visibleToUser = true, db: any = this.pg,

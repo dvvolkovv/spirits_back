@@ -147,6 +147,30 @@ export class AdminService implements OnModuleInit {
     }));
   }
 
+  /**
+   * Положить сообщение ассистента в чат человека.
+   *
+   * Нужно, чтобы отдать исправленную работу туда, где человек её и ждал, —
+   * в тот же чат с тем же ассистентом. Файлы передаются ссылками вида
+   * `[Скачать имя.pdf](…)`: кабинет рисует их кнопками скачивания.
+   *
+   * Списания нет: это наша работа над ошибками, а не ход пользователя.
+   */
+  async postAssistantMessage(userId: string, assistantId: number, text: string) {
+    const body = String(text || '').trim();
+    if (!userId) throw new Error('userId required');
+    if (!Number.isInteger(assistantId) || assistantId <= 0) throw new Error('assistantId required');
+    if (!body) throw new Error('text required');
+    const r = await this.pg.query(
+      `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
+       VALUES ($1, 'ai', $2, $3, 'text', 0)
+       RETURNING id, created_at`,
+      [`${userId}_${assistantId}`, assistantId, body],
+    );
+    this.logger.log(`сообщение ассистента ${assistantId} положено в чат (${body.length} знаков)`);
+    return { ok: true, id: r.rows[0]?.id, createdAt: r.rows[0]?.created_at };
+  }
+
   async createCoupon(code: string, tokenAmount: number, actor?: string) {
     const res = await this.pg.query(
       'INSERT INTO coupons (code, token_amount, created_by) VALUES ($1, $2, $3) RETURNING *',
