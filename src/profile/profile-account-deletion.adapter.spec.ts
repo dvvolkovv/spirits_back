@@ -346,9 +346,10 @@ describe('ProfileAccountDeletionRecapture.collectAndPersist (Task 17)', () => {
     // Purge откладывается на retention от deleted_at.
     expect((params[6] as Date).getTime())
       .toBe(DELETED_AT.getTime() + ACCOUNT_DELETION_RETENTION_MS);
-    // ON CONFLICT-дедупликация — в тексте INSERT (образец planner.persist).
+    // ON CONFLICT-дедупликация — в тексте INSERT (дословный текст
+    // planner.persist: framework-файл, его SQL неизменяем).
     expect(fake.inserts[0].sql)
-      .toContain('ON CONFLICT (deletion_id, resource_type, resource_key) DO NOTHING');
+      .toContain('ON CONFLICT (deletion_id,resource_type,resource_key) DO NOTHING');
   });
 
   it('поколение не совпало — cancelled без единой записи', async () => {
