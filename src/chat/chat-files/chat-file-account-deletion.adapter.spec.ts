@@ -15,7 +15,8 @@ import type {
 } from '../../account-deletion/account-deletion.types';
 import { ChatModule } from '../chat.module';
 import { chatFilesBucket } from './chat-file-store';
-import { THUMB_BUCKET, thumbKeyFor } from './thumbnails';
+import { encodeStrict } from './file-meta';
+import { encodeKeyPath, THUMB_BUCKET, thumbKeyFor } from './thumbnails';
 import {
   ChatFileAccountDeletionAdapter,
   discoverChatFiles,
@@ -27,10 +28,12 @@ import { readFileSync } from 'fs';
  *
  * История чата удаляется сразу при удалении аккаунта, поэтому технические
  * ссылки на файлы фиксируются job'ами ДО её удаления. В payload живут только
- * MinIO locator (bucket/key) — ни личных текстов, ни userId, ни полных URL
- * с доменом. Объект удаляется только при подтверждённом ЕДИНОЛИЧНОМ
- * владении: ссылка на тот же объект в чужих данных сохраняет объект.
- * Произвольные external URL и файлы релея (/tmp) не удаляются никогда.
+ * MinIO locator: bucket как есть и key в base64url (сырое имя файла может
+ * содержать '%' или фрагмент userId — fail-closed sanitizer забраковал бы
+ * весь план удаления), ни личных текстов, ни userId, ни полных URL с доменом.
+ * Объект удаляется только при подтверждённом ЕДИНОЛИЧНОМ владении: ссылка на
+ * тот же объект в чужих данных сохраняет объект. Произвольные external URL и
+ * файлы релея (/tmp) не удаляются никогда.
  */
 
 const deletionId = '9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d';
@@ -50,6 +53,8 @@ const BUCKET = 'linkeon-chat-files';
 const FILE_ID = '22222222-2222-4222-8222-222222222222';
 const FILE_NAME = 'отчёт.pdf';
 const FILE_KEY = `${FILE_ID}/${FILE_NAME}`;
+/** Прод-форма payload.key: base64url от сырого ключа. */
+const b64 = (s: string): string => Buffer.from(s, 'utf8').toString('base64url');
 const chatUrl = `${ENV.publicBaseUrl}/${BUCKET}/${FILE_ID}/${encodeURIComponent(FILE_NAME)}`;
 const VIDEO_JOB_ID = '11111111-1111-4111-8111-111111111111';
 const CLIP_ID = '33333333-3333-4333-8333-333333333333';
@@ -181,15 +186,22 @@ function seedHistory(db: FakeChatDb, rows: HistRow[]): void {
   db.history.push(...rows);
 }
 
-function purgeJob(payload: Record<string, unknown>, overrides: Partial<DeletionJobRow> = {}): DeletionJobRow {
+/** Job как его создаёт discovery: locator сырой, payload.key — base64url. */
+function purgeJob(raw: { bucket: string; key: string }, overrides: Partial<DeletionJobRow> = {}): DeletionJobRow {
+  return purgeJobRaw(
+    { bucket: raw.bucket, key: b64(raw.key) },
+    { resourceKey: deletionResourceHash(raw.bucket, raw.key), ...overrides },
+  );
+}
+
+/** Job с произвольным payload (без кодирования) — для fail-closed проверок. */
+function purgeJobRaw(payload: Record<string, unknown>, overrides: Partial<DeletionJobRow> = {}): DeletionJobRow {
   return {
     id: 'job-chat-file-1',
     deletionId,
     userId: account.userId,
     resourceType: 'chat-file.purge',
-    resourceKey: typeof payload.bucket === 'string' && typeof payload.key === 'string'
-      ? deletionResourceHash(payload.bucket, payload.key)
-      : 'job-chat-file-1',
+    resourceKey: 'job-chat-file-1',
     phase: 'purge',
     payload,
     status: 'running',
@@ -217,7 +229,7 @@ describe('discoverChatFiles — исчерпывающий snapshot ссылок
     expect(plan.jobs[0].phase).toBe('purge');
     expect(plan.jobs[0].resourceKey).toMatch(/^[a-f0-9]{64}$/);
     expect(plan.jobs[0].resourceKey).toBe(deletionResourceHash(BUCKET, FILE_KEY));
-    expect(plan.jobs[0].payload).toEqual({ bucket: BUCKET, key: FILE_KEY });
+    expect(plan.jobs[0].payload).toEqual({ bucket: BUCKET, key: b64(FILE_KEY) });
     const payloadJson = JSON.stringify(plan.jobs[0].payload);
     expect(payloadJson).not.toContain('ЛИЧНЫЙ-ТЕКСТ');
     expect(payloadJson).not.toContain('u-deleted');
@@ -346,9 +358,68 @@ describe('discoverChatFiles — исчерпывающий snapshot ссылок
       resourceType: 'chat-file.purge',
       resourceKey: deletionResourceHash(BUCKET, FILE_KEY),
       phase: 'purge',
-      payload: { bucket: BUCKET, key: FILE_KEY },
+      payload: { bucket: BUCKET, key: b64(FILE_KEY) },
     }, account.userId);
-    expect(snapshot.payloadJson).toBe(JSON.stringify({ bucket: BUCKET, key: FILE_KEY }));
+    expect(snapshot.payloadJson).toBe(JSON.stringify({ bucket: BUCKET, key: b64(FILE_KEY) }));
+  });
+
+  it('C1: «%» в имени файла — план не падает: base64url проходит sanitizer, execute удаляет', async () => {
+    const { db, adapter, ctx, storage } = makeHarness();
+    const rawKey = `${FILE_ID}/Скидка 50%.pdf`;
+    const url = `${ENV.publicBaseUrl}/${BUCKET}/${FILE_ID}/${encodeStrict('Скидка 50%.pdf')}`;
+    seedHistory(db, [{ id: 1, session_id: 'u-deleted_a', content: `[Файл](${url})` }]);
+
+    const plan = await discoverChatFiles({ db, account, origin: 'explicit', env: ENV });
+    expect(plan.jobs).toHaveLength(1);
+    expect(plan.jobs[0].payload).toEqual({ bucket: BUCKET, key: b64(rawKey) });
+    expect(plan.jobs[0].resourceKey).toBe(deletionResourceHash(BUCKET, rawKey));
+
+    // Сырой ключ с одиноким '%' роняет fail-closed sanitizer (и весь план
+    // удаления вместе с ним); base64url-форма проходит реальный снапшот.
+    expect(() => safeDeletionJobSnapshot(
+      { ...plan.jobs[0], payload: { bucket: BUCKET, key: rawKey } },
+      account.userId,
+    )).toThrow('unsafe_payload');
+    const snapshot = safeDeletionJobSnapshot(plan.jobs[0], account.userId);
+    expect(JSON.parse(snapshot.payloadJson)).toEqual({ bucket: BUCKET, key: b64(rawKey) });
+
+    // Purge исполняется, когда история уже стёрта (snapshot затем и нужен).
+    db.history.length = 0;
+    await adapter.execute(purgeJob({ bucket: BUCKET, key: rawKey }), ctx);
+    expect(storage.deleteConfirmed).toHaveBeenCalledWith({ bucket: BUCKET, key: rawKey });
+  });
+
+  it('C1: имя файла = телефон пользователя — снапшот проходит, execute удаляет', async () => {
+    const phone = '79030169187';
+    const db = new FakeChatDb();
+    db.users.set(phone, { state: 'deleted', deletionId });
+    const rawKey = `${FILE_ID}/${phone}.pdf`;
+    seedHistory(db, [{
+      id: 1,
+      session_id: `${phone}_a`,
+      content: `[Файл](${ENV.publicBaseUrl}/${BUCKET}/${FILE_ID}/${phone}.pdf)`,
+    }]);
+    const phoneAccount: DeletionAccount = { ...account, userId: phone };
+
+    const plan = await discoverChatFiles({ db, account: phoneAccount, origin: 'explicit', env: ENV });
+    expect(plan.jobs).toHaveLength(1);
+    expect(plan.jobs[0].payload).toEqual({ bucket: BUCKET, key: b64(rawKey) });
+    // Алфавит base64url не содержит совпадения с userId — иначе includes()
+    // sanitizer'а снова забраковал бы план.
+    expect(b64(rawKey)).not.toContain(phone);
+    expect(() => safeDeletionJobSnapshot(
+      { ...plan.jobs[0], payload: { bucket: BUCKET, key: rawKey } },
+      phone,
+    )).toThrow('unsafe_payload');
+    const snapshot = safeDeletionJobSnapshot(plan.jobs[0], phone);
+    expect(JSON.parse(snapshot.payloadJson)).toEqual({ bucket: BUCKET, key: b64(rawKey) });
+
+    const storage = makeStorage();
+    const adapter = new ChatFileAccountDeletionAdapter(storage as any, new AccountDeletionRegistry());
+    const ctx: DeletionExecution = { db, assertCurrent: jest.fn(async () => undefined) };
+    db.history.length = 0; // purge — после стирания истории
+    await adapter.execute({ ...purgeJob({ bucket: BUCKET, key: rawKey }), userId: phone }, ctx);
+    expect(storage.deleteConfirmed).toHaveBeenCalledWith({ bucket: BUCKET, key: rawKey });
   });
 });
 
@@ -418,7 +489,7 @@ describe('ChatFileAccountDeletionAdapter — purge (Task 11)', () => {
     await expect(adapter.execute(job, ctx)).rejects.toBeInstanceOf(DeletionRetryError);
     await expect(adapter.execute(job, ctx)).rejects.toMatchObject({ kind: 'timeout' });
     // Технический locator не потерян — retry знает, что удалять.
-    expect(job.payload).toEqual({ bucket: BUCKET, key: FILE_KEY });
+    expect(job.payload).toEqual({ bucket: BUCKET, key: b64(FILE_KEY) });
     expect(job.resourceKey).toBe(deletionResourceHash(BUCKET, FILE_KEY));
   });
 
@@ -457,6 +528,39 @@ describe('ChatFileAccountDeletionAdapter — purge (Task 11)', () => {
       ctx,
     )).rejects.toBeInstanceOf(DeletionRetryError);
     expect(storage.deleteConfirmed).not.toHaveBeenCalled();
+  });
+
+  it('C1: невалидный base64url в payload.key — fail-closed retry kind db, удаления нет', async () => {
+    const { adapter, ctx, storage } = makeHarness();
+    const invalid: Array<Record<string, unknown>> = [
+      { bucket: BUCKET, key: 'не base64!!' },                        // символы вне алфавита
+      { bucket: BUCKET, key: `${b64(FILE_KEY)}=` },                 // padding — не base64url
+      { bucket: BUCKET, key: `+${b64(FILE_KEY)}` },                 // стандартный base64 «+»
+      { bucket: BUCKET, key: '' },                                  // пусто
+      { bucket: BUCKET, key: 42 },                                  // не строка
+      { bucket: BUCKET },                                           // ключа нет
+    ];
+    for (const payload of invalid) {
+      await expect(adapter.execute(purgeJobRaw(payload), ctx)).rejects.toBeInstanceOf(DeletionRetryError);
+      await expect(adapter.execute(purgeJobRaw(payload), ctx)).rejects.toMatchObject({ kind: 'db' });
+    }
+    expect(storage.deleteConfirmed).not.toHaveBeenCalled();
+  });
+
+  it('M3: needles включают encodeKeyPath-форму для имён с \' ( ) * !', async () => {
+    const { db, adapter, ctx, storage } = makeHarness();
+    const rawKey = `${FILE_ID}/план (1) *!'заяв!.pdf`;
+
+    await adapter.execute(purgeJob({ bucket: BUCKET, key: rawKey }), ctx);
+
+    const countQueries = db.queries.filter((q) => q.sql.startsWith('SELECT count(*)::int AS total'));
+    expect(countQueries.length).toBeGreaterThan(0);
+    const needles = countQueries[0].params.slice(1).map(String);
+    expect(needles).toContain(`${BUCKET}/${rawKey}`);
+    expect(needles).toContain(`${BUCKET}/${encodeKeyPath(rawKey)}`);
+    expect(encodeKeyPath(rawKey)).not.toBe(rawKey);
+    expect(needles).toContain(`${BUCKET}/${rawKey.split('/').map(encodeURIComponent).join('/')}`);
+    expect(storage.deleteConfirmed).toHaveBeenCalledWith({ bucket: BUCKET, key: rawKey });
   });
 
   it('неподдерживаемый resourceType отклоняется', async () => {

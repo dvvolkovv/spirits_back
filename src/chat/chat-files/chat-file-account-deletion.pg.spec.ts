@@ -35,6 +35,9 @@ const ENV = {
 const BUCKET = 'linkeon-chat-files';
 const TEXT_CANARY = 'ЛИЧНЫЙ-ТЕКСТ';
 
+/** Прод-форма payload.key: base64url от сырого ключа (см. адаптер). */
+const b64 = (s: string): string => Buffer.from(s, 'utf8').toString('base64url');
+
 function minioUrl(id: string, name: string): string {
   return `${ENV.publicBaseUrl}/${BUCKET}/${id}/${name.split('/').map(encodeURIComponent).join('/')}`;
 }
@@ -130,7 +133,7 @@ maybe('discoverChatFiles против живого Postgres', () => {
     );
     expect(plan.jobs[0].payload).toEqual({
       bucket: BUCKET,
-      key: '22222222-2222-4222-8222-222222222222/отчёт.pdf',
+      key: b64('22222222-2222-4222-8222-222222222222/отчёт.pdf'),
     });
     const payloadJson = JSON.stringify(plan.jobs[0].payload);
     expect(payloadJson).not.toContain(TEXT_CANARY);
@@ -248,7 +251,7 @@ maybe('discoverChatFiles против живого Postgres', () => {
     const plan = await discoverChatFiles({ db, account, origin: 'explicit', env: ENV });
 
     expect(plan.jobs).toHaveLength(1);
-    expect(plan.jobs[0].payload).toEqual({ bucket: BUCKET, key: 'k-1/Договор (1).docx' });
+    expect(plan.jobs[0].payload).toEqual({ bucket: BUCKET, key: b64('k-1/Договор (1).docx') });
   });
 });
 
@@ -333,7 +336,7 @@ maybe('purge chat-file.purge против живого Postgres (ref-check SQL)'
       resourceType: 'chat-file.purge',
       resourceKey: deletionResourceHash(BUCKET, FILE_KEY),
       phase: 'purge',
-      payload: { bucket: BUCKET, key: FILE_KEY },
+      payload: { bucket: BUCKET, key: b64(FILE_KEY) },
       status: 'running',
       attempts: 1,
       nextAttemptAt: new Date('2026-12-11T00:00:00Z'),
@@ -394,5 +397,54 @@ maybe('purge chat-file.purge против живого Postgres (ref-check SQL)'
 
     await expect(adapter.execute(job(), ctx)).rejects.toMatchObject({ kind: 'db' });
     expect(storage.deleteConfirmed).not.toHaveBeenCalled();
+  });
+
+  it('M7: ссылка в чужом voice_call_jobs (LEFT JOIN voice_calls) — объект сохраняется', async () => {
+    const callId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+    await pool.query(
+      `INSERT INTO voice_calls (id,user_id,agent_id,room_name,status)
+       VALUES ($1,'u-other',12,'room-m7-1','ended')`,
+      [callId],
+    );
+    await pool.query(
+      `INSERT INTO voice_call_jobs (id,call_id,specialist_agent_id,question,status,answer)
+       VALUES ('dddddddd-dddd-4ddd-8ddd-ddddddddde',$1,13,$2,'done',$3)`,
+      [callId, `вопрос со ссылкой ${FILE_URL}`, 'ответ'],
+    );
+    const { adapter, storage, ctx } = makeAdapter();
+
+    await expect(adapter.execute(job(), ctx)).resolves.toBeUndefined();
+    expect(storage.deleteConfirmed).not.toHaveBeenCalled();
+  });
+
+  it('M7: ссылка в чужом task_events (LEFT JOIN tasks) — объект сохраняется', async () => {
+    const taskId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
+    await pool.query(
+      `INSERT INTO tasks (id,user_id,title,summary) VALUES ($1,'u-other','t','')`,
+      [taskId],
+    );
+    await pool.query(
+      `INSERT INTO task_events (task_id,kind,content) VALUES ($1,'note',$2)`,
+      [taskId, `заметка со ссылкой ${FILE_URL}`],
+    );
+    const { adapter, storage, ctx } = makeAdapter();
+
+    await expect(adapter.execute(job(), ctx)).resolves.toBeUndefined();
+    expect(storage.deleteConfirmed).not.toHaveBeenCalled();
+  });
+
+  it('M7: каждая из 4 url-колонок чужого video_jobs сохраняет объект', async () => {
+    for (const col of ['video_url', 'thumbnail_url', 'audio_url', 'source_image_url']) {
+      await pool.query(`TRUNCATE video_jobs`);
+      await pool.query(
+        `INSERT INTO video_jobs (id,user_id,mode,model,quality,duration_sec,tokens_spent,status,${col})
+         VALUES ('ffffffff-ffff-4fff-8fff-ffffffffffff','u-other','t2v','veo-3.1','std',5,0,'done',$1)`,
+        [FILE_URL],
+      );
+      const { adapter, storage, ctx } = makeAdapter();
+
+      await expect(adapter.execute(job(), ctx)).resolves.toBeUndefined();
+      expect(storage.deleteConfirmed).not.toHaveBeenCalled();
+    }
   });
 });

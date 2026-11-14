@@ -37,10 +37,14 @@ function makeHarness(state: 'active' | 'deleted') {
   const profile = jest.fn(async () => ({ gender: 'x' }));
   const clone = jest.fn(async () => 'voice-ext-1');
   const markFailed = jest.fn(async () => undefined);
+  const deleteClone = jest.fn(async () => undefined);
   (svc as any).profile = profile;
   (svc as any).clone = clone;
   (svc as any).markFailed = markFailed;
-  return { svc, users, voiceRows, queries, profile, clone, markFailed };
+  (svc as any).deleteClone = deleteClone;
+  const logSpy = jest.spyOn((svc as any).logger, 'log').mockImplementation(() => undefined);
+  const warnSpy = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+  return { svc, users, voiceRows, queries, profile, clone, markFailed, deleteClone, logSpy, warnSpy };
 }
 
 describe('VoiceAvatarService.profileAndClone — gate на активный аккаунт', () => {
@@ -64,6 +68,8 @@ describe('VoiceAvatarService.profileAndClone — gate на активный ак
     expect(h.profile).toHaveBeenCalledTimes(1);
     expect(h.clone).toHaveBeenCalledTimes(1);
     expect(h.voiceRows).toEqual([{ user_id: 'u-1', status: 'ready' }]);
+    expect(h.deleteClone).not.toHaveBeenCalled();
+    expect(h.logSpy).toHaveBeenCalledWith(expect.stringContaining('voice ready'));
   });
 
   it('удаление посреди клонирования: UPDATE с EXISTS-гейтом не пишет строку', async () => {
@@ -83,6 +89,28 @@ describe('VoiceAvatarService.profileAndClone — gate на активный ак
     expect(update).toMatch(/EXISTS \(SELECT 1 FROM user_id u WHERE u\.internal_id = \$1 AND u\.state = 'active'\)/);
     // Провалом это не считается: markFailed писал бы error_message для
     // аккаунта, которого нет.
+    expect(h.markFailed).not.toHaveBeenCalled();
+  });
+
+  it('I1: клон создан, но gate закрылся — сиротский клон компенсируется deleteClone', async () => {
+    const h = makeHarness('active');
+    // Аккаунт стал неактивным ПОСЛЕ вызова ElevenLabs clone: UPDATE с
+    // EXISTS-гейтом не пишет строку (rowCount 0) → voice_id некому искать
+    // (Task 14 чистит клоны по строкам user_voice). Компенсация обязательна,
+    // иначе платный клон остаётся у провайдера навсегда.
+    h.profile.mockImplementation(async () => {
+      h.users.set('u-1', 'deleted');
+      return { gender: 'x' };
+    });
+
+    await (h.svc as any).profileAndClone('u-1', Buffer.from('mp3'));
+
+    expect(h.clone).toHaveBeenCalledTimes(1);
+    expect(h.voiceRows).toEqual([]);
+    expect(h.deleteClone).toHaveBeenCalledWith('voice-ext-1');
+    // Лог компенсации — без внешних идентификаторов; «voice ready» не врёт.
+    expect(h.warnSpy).toHaveBeenCalledWith('voice clone compensated after inactive-gate');
+    expect(h.logSpy).not.toHaveBeenCalledWith(expect.stringContaining('voice ready'));
     expect(h.markFailed).not.toHaveBeenCalled();
   });
 });
