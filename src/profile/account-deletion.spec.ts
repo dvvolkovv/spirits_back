@@ -1,6 +1,8 @@
 import { AccountDeletionJobs } from '../account-deletion/account-deletion.jobs';
+import { AccountDeletionLifecycle } from '../account-deletion/account-deletion.lifecycle';
 import { AccountDeletionPlanner } from '../account-deletion/account-deletion.planner';
 import { AccountDeletionRegistry } from '../account-deletion/account-deletion.registry';
+import { AccountDeletionRunner } from '../account-deletion/account-deletion.runner';
 import type { DeletionExecution, DeletionJobRow } from '../account-deletion/account-deletion.types';
 import { IdentityService } from '../identity/identity.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
@@ -21,16 +23,20 @@ import { ProfileAccountDeletionRecapture } from './profile-account-deletion.disc
 /// С Task 17 наблюдаемое поведение даёт НЕ ProfileService.deleteProfile
 /// (он лишён собственных SQL/network вызовов), а fenced-адаптер
 /// account.core.*: повторный capture файлов, граф, затем одна транзакция
-/// (lock + deleteOwnedCoreRows). Вход в удаление — begin() координатора
-/// (Task 18) — здесь симулируется постановкой поколения (state='deleted',
-/// deletion_id, deleted_at) прямо в модель: адаптер обязан видеть то же
-/// состояние, что увидит после настоящего begin().
+/// (lock + deleteOwnedCoreRows). С Task 18 вход в удаление — настоящий
+/// lifecycle.begin(): поколение (state='deleted', deletion_id, deleted_at)
+/// ставит он же, а не ручная симуляция; планировщик пишет план в модель
+/// (INSERT задач здесь no-op — хранилище задач проверяют PG-спеки).
+/// adapter.execute по-прежнему вызывается напрямую: порядок stops→core и
+/// поведение при провале стопов покрывают lifecycle-спеки Task 18.
 
 /// Модель того, что нужно этим тестам: строки пользователей, связок входа,
 /// профиля,TG-связок и служебные таблицы deletion-pipeline.
 class FakeDb {
   users = new Map<string, any>();
   identities: any[] = [];
+  /** Счётчик поколений begin(): uuid v4-формы, детерминированный. */
+  deletionSeq = 0;
   /** user_id → profile_data. Моделирует ai_profiles_consolidated. */
   profiles = new Map<string, any>();
   /** Связки бота: linkeon_user_id ↔ tg_user_id (1:1). Моделирует tg_user_identities. */
@@ -98,6 +104,37 @@ class FakeDb {
       return { rows: row ? [{ user_id: row.user_id }] : [] };
     }
     // ---- Deletion-pipeline (Task 17) ----
+    // begin() (Task 18): чтение поколения под блокировкой строки.
+    if (s.startsWith('SELECT state, deletion_id, deleted_at FROM user_id')) {
+      const u = this.users.get(params[0]);
+      return u
+        ? {
+          rows: [{
+            state: u.state ?? null,
+            deletion_id: u.deletion_id ?? null,
+            deleted_at: u.deleted_at ?? null,
+          }],
+          rowCount: 1,
+        }
+        : { rows: [], rowCount: 0 };
+    }
+    // begin() (Task 18): выпуск нового поколения для активного аккаунта.
+    if (s.startsWith("UPDATE user_id SET state = 'deleted'")) {
+      const u = this.users.get(params[0]);
+      if (!u || u.state !== 'active') return { rows: [], rowCount: 0 };
+      const deletionId = `11111111-1111-4111-8111-${String(++this.deletionSeq).padStart(12, '0')}`;
+      Object.assign(u, {
+        state: 'deleted', deletion_id: deletionId, deleted_at: new Date(),
+      });
+      return {
+        rows: [{
+          internal_id: params[0],
+          deletion_id: deletionId,
+          deleted_at: u.deleted_at,
+        }],
+        rowCount: 1,
+      };
+    }
     // Fenced-чтение поколения для повторного capture файлов.
     if (s.startsWith('SELECT deleted_at FROM user_id')) {
       const u = this.users.get(params[0]);
@@ -182,13 +219,24 @@ function makeServices(db: FakeDb) {
   const neo4j = { deleteUserGraphStrict: jest.fn().mockResolvedValue(undefined) };
   const identity = new IdentityService(db as any);
   const jobs = new AccountDeletionJobs(db as any);
+  const registry = new AccountDeletionRegistry();
   // env не передаём: publicBaseUrl из process.env в юнит-среде пустой, но
   // история в модели и так пуста — discovery не находит файлов без сети.
   const recapture = new ProfileAccountDeletionRecapture(db as any, new AccountDeletionPlanner([]));
   const adapter = new ProfileAccountDeletionAdapter(
-    db as any, jobs, recapture, neo4j as any, new AccountDeletionRegistry(),
+    db as any, jobs, recapture, neo4j as any, registry,
   );
-  return { identity, neo4j, jobs, adapter };
+  // Task 18: настоящий вход в удаление. Здесь используется только begin()
+  // (поколение + план); stops и core спеки lifecycle гоняют отдельно.
+  const runner = new AccountDeletionRunner(db as any, jobs as any, registry as any);
+  const lifecycle = new AccountDeletionLifecycle(
+    db as any,
+    new AccountDeletionPlanner([]) as any,
+    jobs as any,
+    registry as any,
+    runner,
+  );
+  return { identity, neo4j, jobs, adapter, lifecycle };
 }
 
 describe('удаление аккаунта', () => {
@@ -197,6 +245,7 @@ describe('удаление аккаунта', () => {
   let neo4j: any;
   let jobs: AccountDeletionJobs;
   let adapter: ProfileAccountDeletionAdapter;
+  let lifecycle: AccountDeletionLifecycle;
 
 /**
  * resolveOrCreate отдаёт union: у него есть вариант link_required, когда
@@ -208,26 +257,19 @@ function ok<T extends { status: string }>(r: T): Extract<T, { status: 'ok' }> {
   return r as Extract<T, { status: 'ok' }>;
 }
 
-  let deletionSeq = 0;
-
   /**
-   * Полный путь удаления, каким его видит адаптер: begin() (Task 18) ставит
-   * поколение, затем fenced core finalize.
+   * Полный путь удаления, каким его видит адаптер: настоящий begin()
+   * (Task 18) ставит поколение и пишет план, затем fenced core finalize.
    */
   async function deleteAccount(userId: string): Promise<void> {
     if (!db.users.has(userId)) {
       db.users.set(userId, { state: 'active', welcome_bonus_at: null, password_hash: null });
     }
-    const u = db.users.get(userId);
-    const deletionId = `11111111-1111-4111-8111-${String(++deletionSeq).padStart(12, '0')}`;
-    Object.assign(u, {
-      state: 'deleted',
-      deletion_id: deletionId,
-      deleted_at: new Date('2026-11-01T00:00:00.000Z'),
-    });
+    const account = await lifecycle.begin(userId, 'explicit');
+    if (!account) throw new Error('begin() вернул null для активного аккаунта');
     const job: DeletionJobRow = {
-      id: `job-core-${deletionSeq}`,
-      deletionId,
+      id: `job-core-${account.deletionId}`,
+      deletionId: account.deletionId,
       userId,
       resourceType: 'account.core.immediate',
       resourceKey: 'account',
@@ -248,8 +290,7 @@ function ok<T extends { status: string }>(r: T): Extract<T, { status: 'ok' }> {
 
   beforeEach(() => {
     db = new FakeDb();
-    deletionSeq = 0;
-    ({ identity, neo4j, jobs, adapter } = makeServices(db));
+    ({ identity, neo4j, jobs, adapter, lifecycle } = makeServices(db));
   });
 
   it('обрывает связки входа — по старой почте аккаунт больше не находится', async () => {
