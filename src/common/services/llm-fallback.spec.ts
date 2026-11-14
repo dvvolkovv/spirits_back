@@ -83,6 +83,10 @@ describe('readFallbackConfig', () => {
     expect(all.kimi?.name).toBe('kimi');
     expect(all.codex?.name).toBe('codex');
   });
+
+  it('readFallbackConfigs — без ключа Codex его конфиг null', () => {
+    expect(readFallbackConfigs({ KIMI_FALLBACK_API_KEY: 'k' }).codex).toBeNull();
+  });
 });
 
 describe('readBreakerMs', () => {
@@ -160,7 +164,13 @@ describe('isFallbackWorthy', () => {
   });
 
   it('401-рефрейм моста Codex — достойный сбой вида auth', () => {
-    const msg = 'claude CLI error: API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"Codex token rejected: open the Codex app once to refresh login (invalid token)"}}';
+    const msg = 'claude CLI error: API Error: 401 {"type":"error","error":{"type":"upstream_error","message":"Codex token rejected: open the Codex app once to refresh login (invalid token)"}}';
+    expect(isFallbackWorthy(msg)).toBe(true);
+    expect(classifyLlmError(msg).kind).toBe('auth');
+  });
+
+  it('401 моста Codex без auth (codex_auth_missing) — тоже вида auth', () => {
+    const msg = 'claude CLI error: API Error: 401 {"type":"error","error":{"type":"codex_auth_missing","message":"Codex auth unavailable: open the Codex app (or run codex login) once to refresh login"}}';
     expect(isFallbackWorthy(msg)).toBe(true);
     expect(classifyLlmError(msg).kind).toBe('auth');
   });
@@ -335,7 +345,7 @@ describe('planProviders', () => {
   it('выбран Kimi — сначала он, затем обычный путь без него', () => {
     expect(planProviders({ selected: 'kimi', configs: both, state: new FallbackState(), now: T })).toEqual(['kimi', 'claude', 'qwen', 'codex']);
   });
-  it('выбран Kimi при открытом окне — Kimi, затем Qwen', () => {
+  it('выбран Kimi при открытом окне — Kimi, затем Qwen, Codex', () => {
     const s = new FallbackState();
     s.openClaudeWindow(60_000, T);
     expect(planProviders({ selected: 'kimi', configs: both, state: s, now: T + 1 })).toEqual(['kimi', 'qwen', 'codex']);

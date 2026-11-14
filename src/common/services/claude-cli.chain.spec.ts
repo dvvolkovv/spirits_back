@@ -565,6 +565,7 @@ describe('ClaudeCliService.fallbackStats — по провайдерам', () =>
     expect(st.providers).toEqual({
       qwen: { enabled: false, ok: 0, failed: 0, downUntil: 0 },
       kimi: { enabled: true, ok: 0, failed: 0, downUntil: 0 },
+      codex: { enabled: false, ok: 0, failed: 0, downUntil: 0 },
     });
     delete process.env.KIMI_FALLBACK_API_KEY;
     expect(new ClaudeCliService().fallbackStats().enabled).toBe(false);
