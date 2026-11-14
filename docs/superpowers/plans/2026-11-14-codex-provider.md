@@ -328,6 +328,125 @@ git pull --rebase -q origin main && git push -q origin main
 
 ---
 
+### Task 2b: Дифф 4 — запуск под pm2 (TDD)
+
+Введён по code-quality ревью Task 2. Под pm2 (fork mode) `process.argv[1]` указывает на `ProcessContainerFork.js`, а не на скрипт, поэтому `isMain()` возвращает false и мост **молча не открывает порт** — pm2 при этом показывает процесс «online» (IPC-канал держит event loop). Тот же инцидент случился 04.11.2026 на релее: прецедент и фикс — в `relay-agent/server.mjs` (`process.env.pm_id !== undefined || isMain(...)`). Runbook (Task 13) запускает мост именно через `pm2 start bridge.mjs` на обоих серверах, поэтому без этого диффа выкат упал бы на первом healthz.
+
+**Files:**
+- Modify: `spirits_back/codex-bridge/bridge.mjs` (isMain-блок, конец файла)
+- Test: `spirits_back/codex-bridge/bridge.test.mjs` (новый тест в конце файла)
+
+- [ ] **Step 1: Красный тест** — добавить в конец `codex-bridge/bridge.test.mjs`:
+
+```js
+test('Дифф 4: под pm2 (pm_id в env) мост открывает порт', async (t) => {
+  const { spawn } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-pm2-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  // pm2 в fork mode поднимает процесс через ProcessContainerFork.js: argv[1]
+  // указывает на раннер, а не на скрипт. Имитируем обёрткой, импортирующей bridge.mjs.
+  const bridgePath = fileURLToPath(new URL('./bridge.mjs', import.meta.url));
+  const wrapperPath = path.join(dir, 'wrapper.mjs');
+  fs.writeFileSync(wrapperPath, `await import(${JSON.stringify(bridgePath)});\n`);
+
+  const logPath = path.join(dir, 'bridge.log');
+  const port = 18000 + Math.floor(Math.random() * 1000);
+
+  const healthzUp = (child) =>
+    new Promise((resolve) => {
+      const deadline = Date.now() + 5000;
+      const tick = () => {
+        if (child.exitCode !== null || child.signalCode !== null) return resolve(false);
+        const req = http.get(
+          { host: '127.0.0.1', port, path: '/healthz', timeout: 300 },
+          (res) => { res.resume(); resolve(res.statusCode === 200); },
+        );
+        req.on('error', () => {
+          if (Date.now() > deadline) return resolve(false);
+          setTimeout(tick, 100);
+        });
+        req.on('timeout', () => req.destroy());
+      };
+      tick();
+    });
+
+  const run = async (extraEnv) => {
+    const child = spawn(process.execPath, [wrapperPath], {
+      env: { ...process.env, ...extraEnv, BRIDGE_PORT: String(port), BRIDGE_LOG_PATH: logPath },
+      stdio: 'ignore',
+    });
+    const up = await healthzUp(child);
+    child.kill('SIGKILL');
+    await new Promise((resolve) => child.once('exit', resolve));
+    return up;
+  };
+
+  assert.equal(await run({ pm_id: '0' }), true,
+    'при pm_id (pm2 fork mode) мост обязан открыть порт');
+  assert.equal(await run({ pm_id: undefined }), false,
+    'без pm_id и не будучи главным модулем — порт не открывает');
+});
+```
+
+Пояснения: `spawn` с `pm_id: undefined` выбрасывает этот ключ из env дочернего процесса — так задаётся негативная ветка. Позитивная ветка живёт, пока жив listen-сервер; если мост не поднялся, обёртка сразу выходит и `healthzUp` возвращает false по `exitCode`. Файловые импорты `fs`/`os`/`path`/`http` в тесте уже есть (статические, в шапке файла). Порт рандомизирован, чтобы не collide с живым маковским мостом на 8790.
+
+- [ ] **Step 2: Убедиться, что тест красный**
+
+Run: `cd ~/Downloads/spirits_back && node --test codex-bridge/*.test.mjs`
+Expected: `# pass 39`, `# fail 1` (позитивная ветка: мост без фикса не слушает).
+
+- [ ] **Step 3: Фикс** — в `codex-bridge/bridge.mjs` заменить последнюю isMain-строку:
+
+```js
+if (isMain(import.meta.url)) {
+```
+
+на:
+
+```js
+// Под pm2 (fork mode) argv[1] указывает на ProcessContainerFork.js, а не на скрипт:
+// без проверки pm_id мост молча не открыл бы порт (инцидент 04.11 на релее,
+// см. relay-agent/server.mjs). Прямой запуск node по-прежнему решает isMain().
+if (process.env.pm_id !== undefined || isMain(import.meta.url)) {
+```
+
+- [ ] **Step 4: Убедиться, что зелёный**
+
+Run: `node --test codex-bridge/*.test.mjs`
+Expected: `# pass 40`, `# fail 0`.
+
+- [ ] **Step 5: Commit (красный тест, затем фикс)**
+
+```bash
+git status --porcelain && git branch --show-current
+git add codex-bridge/bridge.test.mjs
+git commit -m "$(cat <<'EOF'
+test(codex-bridge): под pm2 мост открывает порт (красный)
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+EOF
+)"
+git add codex-bridge/bridge.mjs
+git commit -m "$(cat <<'EOF'
+fix(codex-bridge): дифф 4 — запуск под pm2 через pm_id
+
+Под pm2 fork mode argv[1] — ProcessContainerFork.js, isMain() ложен,
+и мост молча не открывал порт. Прецедент и фикс — relay-agent/server.mjs
+(инцидент 04.11.2026). Прямой запуск node не меняется.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+EOF
+)"
+git pull --rebase -q origin main && git push -q origin main
+```
+
+(Оба коммита пушатся вместе — на origin/main красный тест отдельно не появляется.)
+
+---
+
 ### Task 3: Дифф 1 — уважать входящую модель (TDD)
 
 **Files:**
@@ -366,7 +485,7 @@ test('Серверный дифф 1: входящая модель идёт на
 cd ~/Downloads/spirits_back && node --test codex-bridge/*.test.mjs
 ```
 
-Expected: `# pass 39`, `# fail 1` (новый тест: на upstream уходит `gpt-6-astra` вместо `gpt-6-astra-custom`).
+Expected: `# pass 40`, `# fail 1` (новый тест: на upstream уходит `gpt-6-astra` вместо `gpt-6-astra-custom`).
 
 - [ ] **Step 3: Commit красного теста**
 
@@ -429,7 +548,7 @@ git pull --rebase -q origin main && git push -q origin main
 node --test codex-bridge/*.test.mjs
 ```
 
-Expected: `# pass 40`, `# fail 0`.
+Expected: `# pass 41`, `# fail 0`.
 
 - [ ] **Step 6: Commit**
 
@@ -507,7 +626,7 @@ test('Серверный дифф 2: 401 дважды — второй уход�
 cd ~/Downloads/spirits_back && node --test codex-bridge/*.test.mjs
 ```
 
-Expected: `# pass 40`, `# fail 2` (без ретрая: `records.length === 1`, клиенту уходит 401 с первого хита).
+Expected: `# pass 41`, `# fail 2` (без ретрая: `records.length === 1`, клиенту уходит 401 с первого хита).
 
 - [ ] **Step 3: Commit красного теста**
 
@@ -682,7 +801,7 @@ git pull --rebase -q origin main && git push -q origin main
 node --check codex-bridge/bridge.mjs && node --test codex-bridge/*.test.mjs
 ```
 
-Expected: `# pass 42`, `# fail 0`.
+Expected: `# pass 43`, `# fail 0`.
 
 - [ ] **Step 6: Commit**
 
@@ -730,7 +849,7 @@ test('Серверный дифф 3: дефолтный User-Agent — Linux x86
 - [ ] **Step 2: Прогнать — красный; commit**
 
 ```bash
-cd ~/Downloads/spirits_back && node --test codex-bridge/*.test.mjs   # pass 42, fail 1
+cd ~/Downloads/spirits_back && node --test codex-bridge/*.test.mjs   # pass 43, fail 1
 git add codex-bridge/bridge.test.mjs
 git commit -m "$(cat <<'EOF'
 test(codex-bridge): дефолтный UA — Linux x86_64 (красный)
@@ -765,7 +884,7 @@ export const UPSTREAM_UA = process.env.CODEX_BRIDGE_UA
 - [ ] **Step 4: Прогнать — зелёное; commit**
 
 ```bash
-node --test codex-bridge/*.test.mjs    # pass 43, fail 0
+node --test codex-bridge/*.test.mjs    # pass 44, fail 0
 git add codex-bridge/bridge.mjs
 git commit -m "$(cat <<'EOF'
 feat(codex-bridge): дифф 3 — Linux User-Agent по умолчанию
@@ -1781,25 +1900,25 @@ bash -n codex-bridge/keep-alive.sh && echo SYNTAX-OK
 4. Релей (вручную):
    - скопировать `codex-bridge/` из spirits_back в `/home/dv/file-agent/codex-bridge/` (bridge.mjs, translate.mjs, sse.mjs, keep-alive.sh);
    - обновлённый `relay-agent/llm-fallback.mjs` закоммитить как dv в живой ветке `reconcile/agent-versioned-live-part-b`;
-   - на релее: `node --check` каждого .mjs, `node --test` для llm-fallback.test.mjs;
+   - на релее: `node --check` каждого .mjs, `node --test` для llm-fallback.test.mjs и `node --test codex-bridge/*.test.mjs` → 44 pass (ловит порчу при копировании);
    - `pm2 restart file-agent` — при нуле стримов, с OK; после — `pm2 status` и журнал без ошибок.
 
 ## Шаг 2. Сервер бэкенда (dvolkov@212.113.106.202)
 1. Закрепить CLI: `npm i -g @openai/codex@0.154.0`; `codex --version`; флаги освежителя сверить с `codex exec --help`.
 2. Логин владельца: на маке `ssh -L 1455:localhost:1455 dvolkov@212.113.106.202`, на сервере `codex login` — владелец одобряет в браузере САМ (пароль/2FA не трогать). Проверка: `test -r ~/.codex/auth.json && echo OK` (содержимое не выводить).
 3. Smoke сосуществования: один короткий `codex exec` (gpt-5.6-luna, read-only) на сервере; на маке убедиться, что роутер жив: `curl -s http://127.0.0.1:8788/healthz` → {"ok":true}.
-4. Поднять мост: `cd /home/dvolkov/spirits_back/codex-bridge && pm2 start bridge.mjs --name codex-bridge && pm2 save`.
-5. `curl -s http://127.0.0.1:8790/healthz` → {"ok":true}.
+4. Поднять мост: `cd /home/dvolkov/spirits_back && node --test codex-bridge/*.test.mjs` → 44 pass / 0 fail (ловит порчу при выкате и версию Node), затем `cd codex-bridge && pm2 start bridge.mjs --name codex-bridge && pm2 save`. Запускать из оболочки, где НЕ экспортированы `BRIDGE_PORT`/`BRIDGE_LOG_PATH` (имена без префикса — чужая переменная окружения молча переставит мост; pm2 наследует env оболочки при первом start). Под pm2 мост поднимается благодаря диффу 4 (pm_id) — проверить `pm2 logs codex-bridge --lines 20` на строку listen.
+5. `curl -s http://127.0.0.1:8790/healthz` → {"ok":true}. Ходить ТОЛЬКО на `127.0.0.1`, не на `localhost`: мост слушает IPv4 и требует Host буквально `127.0.0.1:<port>` (иначе 421), а `localhost` на Node ≥17 резолвится в `::1` первым → ECONNREFUSED.
 6. Один живой smoke через мост (РОВНО РАЗ): `curl -sS http://127.0.0.1:8790/v1/messages -H 'content-type: application/json' -d '{"model":"gpt-6-astra","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"ответь ok"}]}'` → SSE с stop_reason end_turn.
 7. Ключ-заглушка в .env бэка (через stdin, не печатая): добавить строку `CODEX_FALLBACK_API_KEY=local-bridge`.
 8. Перезапуск API: `BACK_ONLY=1 bash ~/Downloads/spirits_back/scripts/deploy.sh` (с мака) — при нуле стримов, с OK.
-9. Cron-освежитель: `crontab -e` → `0 4 */3 * * /home/dvolkov/spirits_back/codex-bridge/keep-alive.sh`; проверить, что `crontab -l` содержит строку.
+9. Cron-освежитель: `crontab -e` → `0 4 */3 * * /home/dvolkov/spirits_back/codex-bridge/keep-alive.sh`; проверить, что `crontab -l` содержит строку. Ротация журнала моста (`~/.linkeon/logs/codex-bridge.log`, ~150 Б на строку, строка на запрос): ротация у моста отсутствует — либо logrotate строго в режиме `copytruncate` (обычный create/move тихо унесёт fd, и журнал продолжит писаться в ротированный файл до рестарта), либо сознательно принять неограниченный рост с периодической проверкой места (на серверах был инцидент DiskFull 27.10).
 10. Живая проверка цепочки (РОВНО РАЗ, с OK): `cd /home/dvolkov/spirits_back && npm run build && CODEX_FALLBACK_API_KEY=local-bridge node scripts/codex-fallback-check.js` → все строки OK (картинка — INFO допустим), exit 0.
 11. Мониторинг: в ближайшем health-алерте строка «Codex — ответов N, ошибок M» (до первого хода — «не настроен» сменится после включения ключа).
 
 ## Шаг 3. Релей (dv@5.101.115.184) — то же, с поправками
 - Туннель и логин: `ssh -L 1455:localhost:1455 dv@5.101.115.184` → `codex login` (одобряет владелец).
-- Мост: `cd /home/dv/file-agent/codex-bridge && pm2 start bridge.mjs --name codex-bridge && pm2 save`; healthz.
+- Мост: `cd /home/dv/file-agent/codex-bridge && pm2 start bridge.mjs --name codex-bridge && pm2 save`; healthz. Те же оговорки, что на Шаге 2: чистый env оболочки (нет BRIDGE_PORT/BRIDGE_LOG_PATH), только `127.0.0.1` (не localhost), ротация журнала — только `copytruncate`. Под pm2 мост поднимается благодаря диффу 4 (pm_id).
 - Ключ: записать `local-bridge` в `/home/dv/file-agent/secrets/codex.key` через stdin, `chmod 600`. Рестарт file-agent НЕ нужен (readProviderConfig читает файл на каждый запрос).
 - Cron: `0 4 */3 * * /home/dv/file-agent/codex-bridge/keep-alive.sh` (от dv).
 - Контроль: короткий ход через канал, который обслуживает релей, с личным выбором Codex (шаг 4) — в журнале file-agent провайдер codex.
@@ -1839,7 +1958,7 @@ git pull --rebase -q origin main && git push -q origin main
 
 ## Финальная проверка (после всех задач)
 
-- [ ] `cd ~/Downloads/spirits_back && node --test codex-bridge/*.test.mjs relay-agent/llm-fallback.test.mjs` → 43 + relay, fail 0.
+- [ ] `cd ~/Downloads/spirits_back && node --test codex-bridge/*.test.mjs relay-agent/llm-fallback.test.mjs` → 44 + relay, fail 0.
 - [ ] На ноде (свежий sha main): `npx jest src/common/services/llm-fallback.spec.ts src/admin/admin-global-llm.controller.spec.ts src/admin/admin-llm-provider.controller.spec.ts src/monitoring/claude-health.alert-line.spec.ts src/monitoring/relay-qwen-monitor.service.spec.ts src/monitoring/claude-health.outage-alert.spec.ts` → PASS; `npx tsc -p tsconfig.build.json --noEmit` → OK.
 - [ ] `cd ~/Downloads/spirits_front` (Node 22): `pnpm vitest run src/components/admin/` → PASS; `node scripts/check-keys-exist.mjs && node scripts/check-locales.mjs` → зелёные.
 - [ ] `node --check scripts/codex-fallback-check.js`, `bash -n codex-bridge/keep-alive.sh`.
