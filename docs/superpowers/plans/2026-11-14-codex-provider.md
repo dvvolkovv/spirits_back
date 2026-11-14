@@ -1107,6 +1107,33 @@ ssh dv@85.192.61.231 "cd ~/ci/spirits_back && git fetch -q origin && git checkou
 
 Expected: все тесты spec PASS; `TSC-OK`. Если tsc краснеет на `src/admin/*` (configured() без codex) — это ожидаемо и чинится в Task 8; в этом случае зафиксировать список ошибок и продолжить (гейт tsc для Task 6 — отсутствие НОВЫХ ошибок вне admin/monitoring).
 
+- [ ] **Step 5: Попутные ожидания (добавлено по итогам quality-ревью Task 6)**
+
+Quality-ревью нашло осиротевший красный тест, который план не покрывал, и две неточности фикстур. Правки только в spec-файлах, одним коммитом:
+
+1. **`src/common/services/claude-cli.chain.spec.ts` (~L565)** — строгое ожидание `expect(st.providers).toEqual({ qwen..., kimi... })` на `fallbackStats()` падает: генерик над FALLBACK_ORDER добавляет в статистику запись `codex` (прод-поведение верное — без ключа провайдер выключен). Дополнить ожидание записью codex — точную форму взять из кода `stats()` в llm-fallback.ts и фактического вывода (прогоном на ноде), не выдумывать.
+2. **`src/common/services/llm-fallback.spec.ts` (~L163, тест «401-рефрейм моста Codex»)** — фикстура использует envelope `"type":"authentication_error"`, а мост реально шлёт `"type":"upstream_error"` (bridge.mjs: `sendError(res, status, 'upstream_error', message)`). Привести тип в фикстуре к фактическому и добавить рядом второй тест на второй реальный 401 моста — `codex_auth_missing` («Codex auth unavailable: open the Codex app (or run codex login) once to refresh login»): оба должны оставаться kind 'auth' и isFallbackWorthy (классификация держится на `\b401\b`, оба зелёные сразу — это контрактные тесты, не TDD-красные).
+3. **`src/common/services/llm-fallback.spec.ts` (~L317)** — устаревший заголовок «выбран Kimi при открытом окне — Kimi, затем Qwen» при ожидании `['kimi','qwen','codex']` → «…Kimi, затем Qwen, Codex».
+4. **Там же, describe('readFallbackConfigs')** — добавить симметрии: без `CODEX_FALLBACK_API_KEY` в env — `expect(all.codex).toBeNull();` (одной строкой в существующий тест «без ключей», если он это позволяет, или отдельным it).
+
+```bash
+git -C ~/Downloads/spirits_back add src/common/services/claude-cli.chain.spec.ts src/common/services/llm-fallback.spec.ts
+git -C ~/Downloads/spirits_back commit -m "$(cat <<'EOF'
+test(llm-fallback): попутные ожидания после добавления codex
+
+fallbackStats теперь включает codex (chain.spec); фикстура 401 приведена
+к реальному envelope моста (upstream_error) + вариант codex_auth_missing.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+EOF
+)"
+git -C ~/Downloads/spirits_back pull --rebase -q origin main && git -C ~/Downloads/spirits_back push -q origin main
+SHA=$(git -C ~/Downloads/spirits_back rev-parse HEAD)
+ssh dv@85.192.61.231 "cd ~/ci/spirits_back && git fetch -q origin && git checkout -q $SHA && source ~/.nvm/nvm.sh && npx jest src/common/services/llm-fallback.spec.ts src/common/services/claude-cli.chain.spec.ts 2>&1 | tail -10"
+```
+
+Expected: оба spec-файла PASS (chain.spec — 0 failed). Остальные красные сюиты на этом sha (alert-line, relay-qwen-monitor, оба admin) — плановые зоны Task 7/8, их не трогать.
+
 ---
 
 ### Task 7: Мониторинг — строки алертов и комментарии сервиса
@@ -2006,7 +2033,7 @@ git pull --rebase -q origin main && git push -q origin main
 ## Финальная проверка (после всех задач)
 
 - [ ] `cd ~/Downloads/spirits_back && node --test codex-bridge/*.test.mjs relay-agent/llm-fallback.test.mjs` → 45 + relay, fail 0.
-- [ ] На ноде (свежий sha main): `npx jest src/common/services/llm-fallback.spec.ts src/admin/admin-global-llm.controller.spec.ts src/admin/admin-llm-provider.controller.spec.ts src/monitoring/claude-health.alert-line.spec.ts src/monitoring/relay-qwen-monitor.service.spec.ts src/monitoring/claude-health.outage-alert.spec.ts` → PASS; `npx tsc -p tsconfig.build.json --noEmit` → OK.
+- [ ] На ноде (свежий sha main): `npx jest src/common/services/llm-fallback.spec.ts src/common/services/claude-cli.chain.spec.ts src/admin/admin-global-llm.controller.spec.ts src/admin/admin-llm-provider.controller.spec.ts src/monitoring/claude-health.alert-line.spec.ts src/monitoring/relay-qwen-monitor.service.spec.ts src/monitoring/claude-health.outage-alert.spec.ts` → PASS; `npx tsc -p tsconfig.build.json --noEmit` → OK.
 - [ ] `cd ~/Downloads/spirits_front` (Node 22): `pnpm vitest run src/components/admin/` → PASS; `node scripts/check-keys-exist.mjs && node scripts/check-locales.mjs` → зелёные.
 - [ ] `node --check scripts/codex-fallback-check.js`, `bash -n codex-bridge/keep-alive.sh`.
 - [ ] В обоих репо `git log origin/main -5` — коммиты на месте, рабочих деревьев чистых ничего не осталось.
