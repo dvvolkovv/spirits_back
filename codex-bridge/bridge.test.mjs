@@ -525,3 +525,43 @@ test('Серверный дифф 1: входящая модель идёт на
   assert.equal(fallback.status, 200);
   assert.equal(JSON.parse(records[1].body).model, 'gpt-6-astra');
 });
+
+test('Серверный дифф 2: 401 от upstream — перечитать auth.json и повторить ровно один раз', async (t) => {
+  let hits = 0;
+  const { records, bridgeOrigin, authPath } = await startPair(t, (record, req, res) => {
+    hits += 1;
+    if (hits === 1) {
+      // К моменту первого хита «освежитель» уже перезаписал auth.json:
+      fs.writeFileSync(authPath, JSON.stringify({
+        auth_mode: 'chatgpt',
+        OPENAI_API_KEY: null,
+        tokens: { access_token: 'fresh-access', account_id: 'acct_43', refresh_token: 'fake-refresh' },
+      }), { mode: 0o600 });
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'invalid token' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end(TEXT_SSE);
+  });
+  const result = await post(bridgeOrigin, '/v1/messages', {
+    model: 'gpt-6-astra', stream: true, messages: [{ role: 'user', content: 'hi' }],
+  });
+  assert.equal(result.status, 200);
+  assert.equal(records.length, 2);
+  assert.equal(records[1].headers.authorization, 'Bearer fresh-access');
+  assert.equal(records[1].headers['chatgpt-account-id'], 'acct_43');
+});
+
+test('Серверный дифф 2: 401 дважды — второй уходит клиенту, бесконечного ретрая нет', async (t) => {
+  const { records, bridgeOrigin } = await startPair(t, (record, req, res) => {
+    res.writeHead(401, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'invalid token' } }));
+  });
+  const result = await post(bridgeOrigin, '/v1/messages', {
+    model: 'gpt-6-astra', messages: [{ role: 'user', content: 'hi' }],
+  });
+  assert.equal(result.status, 401);
+  assert.equal(records.length, 2);
+  assert.match(result.text, /Codex token rejected/);
+});
