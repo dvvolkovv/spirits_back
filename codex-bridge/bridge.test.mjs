@@ -578,7 +578,7 @@ test('Серверный дифф 3: дефолтный User-Agent — Linux x86
   assert.equal(records[0].headers['user-agent'], 'codex_cli_rs/0.154.0 (Linux; x86_64)');
 });
 
-test('Дифф 2, guard stale-attempt: ошибка устаревшей попытки не перетирает ответ ретрая', async (t) => {
+test('Дифф 2, guard stale-attempt: ошибка устаревшей попытки не перетирает ответ ретрая', { timeout: 10_000 }, async (t) => {
   let hits = 0;
   let firstRes;
   const { bridgeOrigin } = await startPair(t, (record, req, res) => {
@@ -601,5 +601,6 @@ test('Дифф 2, guard stale-attempt: ошибка устаревшей поп�
     model: 'gpt-6-astra', stream: true, messages: [{ role: 'user', content: 'hi' }],
   });
   assert.equal(result.status, 200);
+  assert.match(result.text, /event: message_start/);
   assert.equal(hits, 2);
 });

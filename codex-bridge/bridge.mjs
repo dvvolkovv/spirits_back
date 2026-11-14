@@ -20,8 +20,9 @@ export const DEFAULT_AUTH_PATH = path.join(os.homedir(), '.codex', 'auth.json');
 export const DEFAULT_UPSTREAM = 'https://chatgpt.com/backend-api/codex';
 export const DEFAULT_BRIDGE_MODEL = 'gpt-6-astra';
 export const DEFAULT_LOG_PATH = path.join(os.homedir(), '.linkeon', 'logs', 'codex-bridge.log');
-// User-Agent сверен с реальным Codex CLI: 0.154.0 — закреплённый пин пакета
-// @openai/codex (runbook выката). Серверы Linkeon — Linux x86_64.
+// User-Agent — формат по образцу реального Codex CLI 0.154.0 (пин — в runbook
+// выката): полное значение CLI включает версию ядра и токен терминала, здесь
+// сокращено по спеке — originator/версия/ОС/arch сохранены.
 export const UPSTREAM_UA = process.env.CODEX_BRIDGE_UA
   ?? 'codex_cli_rs/0.154.0 (Linux; x86_64)';
 
