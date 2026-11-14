@@ -74,7 +74,7 @@ const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 interface DocScanPlace {
   readonly table: string;
-  readonly columns: ReadonlyArray<{ readonly column: string; readonly sql: string }>;
+  readonly columns: Array<{ readonly column: string; readonly sql: string }>;
 }
 
 /** DOC_PLACES, сгруппированные по таблицам (jsonb читается как ::text). */
