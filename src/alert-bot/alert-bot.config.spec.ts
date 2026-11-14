@@ -1,10 +1,12 @@
-import { alertBotEnabled, alertBotModel, alertBotOpsPort, alertBotRatePerHour, alertBotTimeoutMs, validAlertBotSecret } from './alert-bot.config';
+import { alertBotEnabled, alertBotModel, alertBotOpsPort, alertBotRatePerHour, alertBotRepairAdminTgIds, alertBotRepairTimeoutMs, alertBotTimeoutMs, isAlertBotRepairAdmin, validAlertBotSecret } from './alert-bot.config';
 
 const ENV_KEYS = [
   'ALERT_BOT_WEBHOOK_URL',
   'ALERT_BOT_WEBHOOK_SECRET',
   'ALERT_BOT_RATE_PER_HOUR',
   'ALERT_BOT_TIMEOUT_MS',
+  'ALERT_BOT_REPAIR_TIMEOUT_MS',
+  'ALERT_BOT_REPAIR_ADMIN_TG_IDS',
   'ALERT_BOT_OPS_PORT',
   'ALERT_BOT_MODEL',
   'CHAT_MODEL',
@@ -45,5 +47,21 @@ describe('настройки бота алертов', () => {
     delete process.env.ALERT_BOT_MODEL;
     process.env.CHAT_MODEL = 'claude-test';
     expect(alertBotModel()).toBe('claude-test');
+  });
+  it('repair разрешён только точному числовому Telegram ID и выключен пустым списком', () => {
+    delete process.env.ALERT_BOT_REPAIR_ADMIN_TG_IDS;
+    expect(alertBotRepairAdminTgIds()).toEqual([]);
+    expect(isAlertBotRepairAdmin('123')).toBe(false);
+    process.env.ALERT_BOT_REPAIR_ADMIN_TG_IDS = '123, 456,123,invalid,0';
+    expect(alertBotRepairAdminTgIds()).toEqual(['123', '456']);
+    expect(isAlertBotRepairAdmin(123)).toBe(true);
+    expect(isAlertBotRepairAdmin('0123')).toBe(false);
+    expect(isAlertBotRepairAdmin('admin')).toBe(false);
+  });
+  it('repair timeout ограничен одним часом', () => {
+    delete process.env.ALERT_BOT_REPAIR_TIMEOUT_MS;
+    expect(alertBotRepairTimeoutMs()).toBe(3_600_000);
+    process.env.ALERT_BOT_REPAIR_TIMEOUT_MS = '1000';
+    expect(alertBotRepairTimeoutMs()).toBe(3_600_000);
   });
 });

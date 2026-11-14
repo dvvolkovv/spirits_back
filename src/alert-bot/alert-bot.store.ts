@@ -25,6 +25,7 @@ export interface AlertBotTurn {
   answerMessageIds: number[];
   parentTurnId: string | null;
   question: string;
+  replyText: string | null;
   answer: string | null;
   tools: string[];
   status: AlertBotTurnStatus;
@@ -122,6 +123,7 @@ function mapTurn(row: any): AlertBotTurn {
     answerMessageIds: Array.isArray(row.answer_message_ids) ? row.answer_message_ids.map(Number) : [],
     parentTurnId: row.parent_turn_id,
     question: row.question,
+    replyText: row.reply_text ?? null,
     answer: row.answer,
     tools: row.tools ?? [],
     status: row.status,
@@ -254,8 +256,8 @@ export class AlertBotStore {
     const r = await this.pg.query(
       `INSERT INTO alert_bot_turns
          (update_id, chat_id, tg_user_id, linkeon_user_id, question_message_id,
-          parent_turn_id, question, private_chat, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'in_progress')
+          parent_turn_id, question, reply_text, private_chat, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'in_progress')
        RETURNING id`,
       [
         input.updateId,
@@ -265,6 +267,7 @@ export class AlertBotStore {
         input.questionMessageId,
         input.parentTurnId ?? null,
         input.question,
+        input.replyText ?? null,
         input.privateChat,
       ],
     );
@@ -276,8 +279,8 @@ export class AlertBotStore {
     const r = await this.pg.query(
       `INSERT INTO alert_bot_turns
          (update_id, chat_id, tg_user_id, linkeon_user_id, question_message_id,
-          parent_turn_id, question, private_chat, status, error_kind, duration_ms, finished_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, 0, now())
+          parent_turn_id, question, reply_text, private_chat, status, error_kind, duration_ms, finished_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, 0, now())
        ON CONFLICT (update_id) DO UPDATE SET update_id = EXCLUDED.update_id
        RETURNING id`,
       [
@@ -288,6 +291,7 @@ export class AlertBotStore {
         input.questionMessageId,
         input.parentTurnId ?? null,
         input.question,
+        input.replyText ?? null,
         input.privateChat,
         status,
       ],
@@ -333,8 +337,8 @@ export class AlertBotStore {
       const r = await client.query(
         `INSERT INTO alert_bot_turns
            (update_id, chat_id, tg_user_id, linkeon_user_id, question_message_id,
-            parent_turn_id, question, private_chat, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'in_progress')
+            parent_turn_id, question, reply_text, private_chat, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'in_progress')
          RETURNING id`,
         [
           input.updateId,
@@ -344,6 +348,7 @@ export class AlertBotStore {
           input.questionMessageId,
           input.parentTurnId ?? null,
           input.question,
+          input.replyText ?? null,
           input.privateChat,
         ],
       );
@@ -419,8 +424,8 @@ export class AlertBotStore {
       const turn = await client.query(
         `INSERT INTO alert_bot_turns
            (update_id, chat_id, tg_user_id, linkeon_user_id, question_message_id,
-            parent_turn_id, question, private_chat, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'in_progress')
+            parent_turn_id, question, reply_text, private_chat, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'in_progress')
          RETURNING id`,
         [
           input.updateId,
@@ -430,6 +435,7 @@ export class AlertBotStore {
           input.questionMessageId,
           input.parentTurnId ?? null,
           input.question,
+          input.replyText ?? null,
           input.privateChat,
         ],
       );

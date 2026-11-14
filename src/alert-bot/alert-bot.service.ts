@@ -2,9 +2,10 @@ import { Injectable, Logger } from '@nestjs/common';
 import { SupportService } from '../support/support.service';
 import { AlertBotAccess } from './alert-bot.access';
 import { AlertBotCommands } from './alert-bot.commands';
-import { alertBotAllowedChat } from './alert-bot.config';
+import { alertBotAllowedChat, isAlertBotRepairAdmin } from './alert-bot.config';
 import { AlertBotDrafts } from './alert-bot.drafts';
 import { AlertBotRetryableError } from './alert-bot.errors';
+import { AlertBotRepairService } from './alert-bot.repair.service';
 import { AlertBotStore } from './alert-bot.store';
 import { AlertBotTelegram, unknownTelegramOutcome } from './alert-bot.telegram';
 import { AlertBotTurns } from './alert-bot.turns';
@@ -12,6 +13,8 @@ import { TgMessage } from './alert-bot.types';
 
 const REFUSAL_EVERY_MS = 60 * 60 * 1000;
 const ASK_HINT = 'Напишите вопрос после команды, например: /ask Почему горит алерт?';
+const FIX_HINT = 'Опишите задачу после команды, например: /fix Почини ошибку в файлах.';
+const REPAIR_BUSY_TEXT = 'Другое исправление уже выполняется в этом чате';
 const CLOSE_HINT = 'Укажите тикет: /close #1234abcd или ответьте /close на сообщение эскалации.';
 
 interface TelegramCallback {
@@ -33,7 +36,7 @@ interface Identity {
 }
 
 interface ParsedCommand {
-  name: 'ask' | 'status' | 'close' | 'start';
+  name: 'ask' | 'status' | 'close' | 'start' | 'fix' | 'stop';
   username?: string;
   args: string;
 }
@@ -47,7 +50,7 @@ function safeErrorKind(error: unknown): string {
 }
 
 function parseCommand(text: string): ParsedCommand | null {
-  const match = text.match(/^\/(ask|status|close|start)(?:@([A-Za-z0-9_]+))?(?:\s+|$)/i);
+  const match = text.match(/^\/(ask|status|close|start|fix|stop)(?:@([A-Za-z0-9_]+))?(?:\s+|$)/i);
   if (!match) return null;
   return {
     name: match[1].toLowerCase() as ParsedCommand['name'],
@@ -88,11 +91,13 @@ export class AlertBotService {
     private readonly drafts: AlertBotDrafts,
     private readonly turns: AlertBotTurns,
     private readonly support: SupportService,
+    private readonly repairs: AlertBotRepairService,
   ) {}
 
-  stopAdmission(): void {
+  async stopAdmission(): Promise<void> {
     this.accepting = false;
     this.turns.stopAdmission();
+    await this.repairs.stopAll();
   }
 
   async claimUpdate(update: unknown): Promise<'claimed' | 'duplicate' | 'stopped' | 'invalid'> {
@@ -142,7 +147,14 @@ export class AlertBotService {
         this.logger.error(`alert-bot retry state failed kind=${safeErrorKind(failureError)}`);
         return;
       }
-      if (final) await this.sendFinalFailure(candidate, kind);
+      if (final) {
+        const repair = await this.repairs.findRepairByUpdate(updateId);
+        if (repair) {
+          const abandoned = await this.repairs.abandonUnstarted(repair.id);
+          if (!abandoned) this.logger.error('alert-bot repair dead-letter abandon skipped kind=not_unstarted');
+        }
+        await this.sendFinalFailure(candidate, kind);
+      }
     } finally {
       this.activeUpdates.delete(updateId);
     }
@@ -316,8 +328,42 @@ export class AlertBotService {
     const addressed = privateChat || replyToBot || Boolean(command) || mention.test(text);
     if (!addressed || !message.from?.id) return;
 
-    const resolved = await this.access.resolveTelegram(message.from.id);
     const tgUserId = String(message.from.id);
+    const repairPhraseCandidate = replyToBot && /^(?:исправь|почини)(?:\s|$)/iu.test(text);
+    if (command?.name === 'stop') {
+      if (!isAlertBotRepairAdmin(tgUserId)) {
+        await this.refuse(message, tgUserId);
+        return;
+      }
+      const result = await this.repairs.stop(chatId, tgUserId);
+      await this.sendDirectMessage(chatId, result, message.message_id);
+      return;
+    }
+    if (command?.name === 'fix' || repairPhraseCandidate) {
+      if (!isAlertBotRepairAdmin(tgUserId)) {
+        await this.refuse(message, tgUserId);
+        return;
+      }
+      const instruction = command?.name === 'fix' ? command.args : text;
+      if (!instruction) {
+        await this.sendDirectMessage(chatId, FIX_HINT, message.message_id);
+        return;
+      }
+      const repliedText = replyText(message.reply_to_message);
+      const parent = replyToBot && message.reply_to_message
+        ? await this.store.findTurnByAnswer(chatId, message.reply_to_message.message_id)
+        : null;
+      if (command?.name !== 'fix' && parent?.status !== 'ok') return;
+      const repairIdentity = await this.access.resolveTelegram(message.from.id);
+      const identity: Identity = {
+        tgUserId,
+        adminUserId: repairIdentity.userId || `tg:${tgUserId}`,
+      };
+      await this.enqueueRepair(updateId, message, identity, instruction, parent, repliedText);
+      return;
+    }
+
+    const resolved = await this.access.resolveTelegram(message.from.id);
     if (!resolved.isAdmin || !resolved.userId) {
       await this.refuse(message, tgUserId);
       return;
@@ -398,6 +444,49 @@ export class AlertBotService {
     }
 
     await this.enqueue(updateId, message, identity, question, { replyText: repliedText });
+  }
+
+  private async enqueueRepair(
+    updateId: number,
+    message: TgMessage,
+    identity: Identity,
+    instruction: string,
+    parent: Awaited<ReturnType<AlertBotStore['findTurnByAnswer']>>,
+    repliedText?: string,
+  ): Promise<void> {
+    if (!this.accepting) throw new AlertBotRetryableError('stopped');
+    const chatId = String(message.chat.id);
+    const extra: { parentTurnId?: string; replyText?: string } = {};
+    if (parent) extra.parentTurnId = parent.id;
+    if (repliedText) extra.replyText = repliedText;
+
+    const admission = await this.repairs.admit({
+      updateId,
+      chatId,
+      adminTgId: identity.tgUserId,
+      instruction,
+    });
+    if (admission.status === 'busy') {
+      await this.sendDirectMessage(chatId, REPAIR_BUSY_TEXT, message.message_id);
+      return;
+    }
+
+    const turnAdmission = await this.turns.enqueue({
+      updateId,
+      chatId,
+      tgUserId: identity.tgUserId,
+      adminUserId: identity.adminUserId,
+      questionMessageId: message.message_id,
+      question: instruction,
+      privateChat: message.chat.type === 'private',
+      mode: 'repair',
+      repairId: admission.repairId,
+      ...extra,
+    });
+    if (admission.status === 'accepted' && ['busy', 'rate_limited'].includes(turnAdmission)) {
+      const abandoned = await this.repairs.abandon(admission.repairId);
+      if (!abandoned) this.logger.error('alert-bot repair abandon failed kind=admission_cleanup');
+    }
   }
 
   private async enqueue(

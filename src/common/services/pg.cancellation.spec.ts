@@ -58,7 +58,6 @@ describe('PgService.query cancellation', () => {
     controller.abort();
     await flush();
     const cancelCalls = cancel.mock.calls.length;
-    const releaseCalls = client.release.mock.calls.length;
     rejectActive(new Error('cancel requested'));
     await rejection;
 
@@ -66,7 +65,115 @@ describe('PgService.query cancellation', () => {
     expect(cancelCalls).toBe(1);
     expect(cancel).toHaveBeenCalledWith(client, getQuery());
     expect(remove).toHaveBeenCalledWith('abort', expect.any(Function));
-    expect(releaseCalls).toBe(1);
+    expect(client.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('не отдаёт reused client второму query до завершения CancelRequest', async () => {
+    const { service, client, pool, resolveActive } = fixture();
+    let finishCancel!: () => void;
+    const end = jest.spyOn(Client.prototype, 'end').mockImplementation(
+      () => new Promise<void>((resolve) => { finishCancel = resolve; }),
+    );
+    const controller = new AbortController();
+    let releaseSecondConnect!: () => void;
+    let connects = 0;
+    client.release.mockImplementation(() => { releaseSecondConnect?.(); });
+    pool.connect.mockImplementation(() => {
+      connects += 1;
+      if (connects === 1) return Promise.resolve(client);
+      return new Promise<PoolClient>((resolve) => {
+        releaseSecondConnect = () => resolve(client);
+      });
+    });
+    const first = (service.query as any)('SELECT pg_sleep(10)', [], controller.signal) as Promise<unknown>;
+    const rejection = expect(first).rejects.toThrow('cancel requested');
+    await flush();
+    controller.abort();
+    await flush();
+
+    expect(end).toHaveBeenCalledTimes(1);
+    const second = (service.query as any)('SELECT 1 AS ok') as Promise<unknown>;
+    await flush();
+    const queriesBeforeCancelEnd = client.query.mock.calls.length;
+    const releasesBeforeCancelEnd = client.release.mock.calls.length;
+    finishCancel();
+    await rejection;
+    await flush();
+    resolveActive({ rows: [{ ok: 1 }] });
+    await expect(second).resolves.toEqual({ rows: [{ ok: 1 }] });
+
+    expect(queriesBeforeCancelEnd).toBe(1);
+    expect(releasesBeforeCancelEnd).toBe(0);
+    expect(client.query).toHaveBeenCalledTimes(2);
+    expect(pool.connect).toHaveBeenCalledTimes(2);
+    expect(client.release).toHaveBeenCalledTimes(1);
+  });
+
+  it('hanging CancelRequest end разрушает cancel stream и original client за bounded время', async () => {
+    const { service, client } = fixture();
+    let closingClient!: Client;
+    jest.spyOn(Client.prototype, 'end').mockImplementation(function (this: Client) {
+      closingClient = this;
+      return new Promise<void>(() => undefined);
+    });
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    const result = (service.query as any)('SELECT pg_sleep(10)', [], controller.signal) as Promise<unknown>;
+    const observed = result.then(
+      () => ({ status: 'resolved' as const }),
+      (error: Error) => ({ status: 'rejected' as const, error }),
+    );
+    await flush();
+    controller.abort();
+    await flush();
+    const stream = (closingClient as any).connection.stream;
+    const destroy = jest.spyOn(stream, 'destroy').mockImplementation(() => stream);
+    let timer: NodeJS.Timeout;
+    const outcome = await Promise.race([
+      observed,
+      new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), 1_800); }),
+    ]);
+    clearTimeout(timer!);
+
+    expect(outcome).toMatchObject({ status: 'rejected' });
+    expect(Date.now() - startedAt).toBeLessThan(1_800);
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(client.release).toHaveBeenCalledTimes(1);
+    expect(client.release).toHaveBeenCalledWith(true);
+  });
+
+  it('sync CancelRequest end throw разрушает stream и original client без unhandled rejection', async () => {
+    const { service, client } = fixture();
+    let closingClient!: Client;
+    jest.spyOn(Client.prototype, 'end').mockImplementation(function (this: Client) {
+      closingClient = this;
+      throw new Error('sync close exploded');
+    });
+    const controller = new AbortController();
+    const result = (service.query as any)('SELECT pg_sleep(10)', [], controller.signal) as Promise<unknown>;
+    const observed = result.then(
+      () => ({ status: 'resolved' as const }),
+      (error: Error) => ({ status: 'rejected' as const, error }),
+    );
+    await flush();
+    controller.abort();
+    await flush();
+    const stream = (closingClient as any).connection.stream;
+    const destroy = jest.spyOn(stream, 'destroy').mockImplementation(() => stream);
+    let timer: NodeJS.Timeout;
+    const outcome = await Promise.race([
+      observed,
+      new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), 1_800); }),
+    ]);
+    clearTimeout(timer!);
+
+    expect(outcome).toMatchObject({ status: 'rejected' });
+    if (typeof outcome !== 'string' && outcome.status === 'rejected') {
+      expect(outcome.error.message).toBe('cancel requested');
+    }
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(client.release).toHaveBeenCalledTimes(1);
+    expect(client.release).toHaveBeenCalledWith(true);
   });
 
   it('abort во время pending pool.connect завершает вызов, а поздний client release без query', async () => {

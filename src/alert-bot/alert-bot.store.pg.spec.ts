@@ -32,6 +32,7 @@ maybe('хранилище бота алертов против PostgreSQL', () =
       getClient: () => pool.connect(),
     } as any);
     await store.migrate();
+    await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', '002_alert_bot_repair.sql'), 'utf8'));
   });
   afterAll(async () => {
     await pool?.end();
@@ -97,6 +98,41 @@ maybe('хранилище бота алертов против PostgreSQL', () =
     expect(await store.countRecentTurns('u-admin')).toBe(1);
     expect((await store.recentTurns('1', 3, 30))[0].answer).toBe('ничего');
   });
+  it('reply_text сохраняется через createTurn, admitTurn, draft admission и system turn', async () => {
+    const updateIds = [1100, 1101, 1102, 1103];
+    const base = {
+      chatId: 'reply-persist', tgUserId: '111', adminUserId: 'u-reply-persist',
+      questionMessageId: 10, question: 'Почини', privateChat: true,
+    };
+    try {
+      await store.createTurn({ ...base, updateId: updateIds[0], replyText: 'create diagnosis' });
+      await store.admitTurn({ ...base, updateId: updateIds[1], replyText: 'admit diagnosis' }, 30);
+      await store.recordSystemTurn({ ...base, updateId: updateIds[2], replyText: 'system diagnosis' }, 'busy');
+      const draftId = await store.createDraft({
+        chatId: base.chatId, tgUserId: base.tgUserId, adminUserId: base.adminUserId,
+        ticketId: '11111111-1111-4111-8111-111111111111', text: 'черновик', promptMessageId: 20,
+      });
+      expect(await store.claimDraft(draftId, 'asking')).toEqual({ status: 'claimed', version: 1 });
+      await (store as any).admitDraftQuestion({
+        draftId, claimVersion: 1,
+        input: { ...base, updateId: updateIds[3], replyText: 'draft diagnosis' }, maxPerHour: 30,
+      });
+
+      const rows = await pool.query(
+        'SELECT update_id, reply_text FROM alert_bot_turns WHERE update_id = ANY($1::bigint[]) ORDER BY update_id',
+        [updateIds],
+      );
+      expect(rows.rows).toEqual([
+        { update_id: '1100', reply_text: 'create diagnosis' },
+        { update_id: '1101', reply_text: 'admit diagnosis' },
+        { update_id: '1102', reply_text: 'system diagnosis' },
+        { update_id: '1103', reply_text: 'draft diagnosis' },
+      ]);
+    } finally {
+      await pool.query('DELETE FROM alert_bot_turns WHERE update_id = ANY($1::bigint[])', [updateIds]);
+    }
+  });
+
   it('сохраняет первый и все continuation ID, reply ко второму chunk находит родителя', async () => {
     const id = await store.createTurn({ updateId: 1050, chatId: 'chunks', tgUserId: '111', adminUserId: 'u-chunks', questionMessageId: 10, question: 'длинный ответ', privateChat: true });
 
@@ -128,6 +164,7 @@ maybe('хранилище бота алертов против PostgreSQL', () =
       { summary: jest.fn() } as any,
       { beginStream: jest.fn(), endStream: jest.fn() } as any,
       { findTicketByPrefix: jest.fn().mockResolvedValue(null) } as any,
+      { run: jest.fn(), findRepairByUpdate: jest.fn().mockResolvedValue(null) } as any,
     );
 
     await expect(turns.enqueue(input)).rejects.toMatchObject({ kind: 'send_failed' });
@@ -167,6 +204,7 @@ maybe('хранилище бота алертов против PostgreSQL', () =
       { summary: jest.fn() } as any,
       { beginStream: jest.fn(), endStream: jest.fn() } as any,
       { findTicketByPrefix: jest.fn().mockResolvedValue(null) } as any,
+      { run: jest.fn(), findRepairByUpdate: jest.fn().mockResolvedValue(null) } as any,
     );
 
     const first = (turns as any).enqueue(input, { draftId, claimVersion: 1 });

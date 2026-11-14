@@ -143,6 +143,8 @@ export interface ClaudeCliOptions {
   model?: string;
   /** Timeout in ms. Default 60_000 (60s). Set to 0 to disable timeout completely. */
   timeoutMs?: number;
+  /** Отмена текущего вызова: SIGTERM процессу CLI, без перехода к следующему provider. */
+  signal?: AbortSignal;
   /** Файлы для multimodal-вызова (фото, PDF, txt). Пути к локальным файлам.
    *  При наличии — добавляются как @<path> в конец промпта и включается tool Read. */
   attachments?: string[];
@@ -438,6 +440,9 @@ export class ClaudeCliService implements OnModuleInit {
    * модель: выбранная (если есть ключ) или Claude, без цепочки.
    */
   private async runRaw(prompt: string, opts: ClaudeCliOptions): Promise<CliRunResult> {
+    if (opts.signal?.aborted) {
+      throw new ClaudeCliCallError('claude CLI aborted', false, { kind: 'other', access: false });
+    }
     // Чья модель (spec 2026-10-31-global-llm-switch, разделы 1 и 3): вызывающий
     // выбрал сам (provider, в том числе явный 'claude') — его выбор; мусор или
     // null в provider — как «не задан» (рубильник не обходится молча,
@@ -515,6 +520,9 @@ export class ClaudeCliService implements OnModuleInit {
     let reachedFallback = false;
     let attemptOpts = opts;
     for (let i = 0; i < plan.length; ) {
+      if (opts.signal?.aborted) {
+        throw new ClaudeCliCallError('claude CLI aborted', false, { kind: 'other', access: false });
+      }
       const p = plan[i];
       const emergency = p !== 'claude' && p !== selected;
       if (emergency) reachedFallback = true;
@@ -526,6 +534,7 @@ export class ClaudeCliService implements OnModuleInit {
         res = await this.runOnce(prompt, attemptOpts, p === 'claude' ? null : configs[p], { fallback: emergency, selected: chosen, choice });
       } catch (e) {
         err = e;
+        if (opts.signal?.aborted) throw err;
       }
       // Отказ CLI, пришедший обычным ответом (без is_error), — сбой того
       // провайдера, что его дал; окно Claude такой «успех» не закрывает.
@@ -986,7 +995,13 @@ export class ClaudeCliService implements OnModuleInit {
       let settled = false;
       // message — только безопасный текст; признаки — по сырому (safeFailure).
       const fail = (message: string, info: ClaudeCliErrorInfo) => {
+        if (settled) return;
         settled = true;
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        opts.signal?.removeEventListener('abort', onAbort);
         reject(new ClaudeCliCallError(message, sawRiskyToolUse, info));
       };
 
@@ -1010,6 +1025,13 @@ export class ClaudeCliService implements OnModuleInit {
           fail(`claude CLI timeout after ${timeoutMs}ms`, { kind: 'timeout', access: false });
         }, timeoutMs);
       }
+
+      const onAbort = () => {
+        proc.kill('SIGTERM');
+        fail('claude CLI aborted', { kind: 'other', access: false });
+      };
+      if (opts.signal?.aborted) onAbort();
+      else opts.signal?.addEventListener('abort', onAbort, { once: true });
 
       proc.stdout.on('data', (b) => {
         const chunk = outDecoder.write(b);
@@ -1062,11 +1084,14 @@ export class ClaudeCliService implements OnModuleInit {
       proc.stderr.on('data', (b) => { stderr += errDecoder.write(b); });
 
       proc.on('close', (code, signal) => {
-        // Вызов уже отклонён (таймаут, ошибка запуска): процесс, убитый по
-        // таймауту, закрывается следом — ни разбора вывода, ни второй записи
-        // в журнал не нужно.
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        opts.signal?.removeEventListener('abort', onAbort);
+        // Вызов уже отклонён (таймаут, abort, ошибка запуска): процесс,
+        // закрывающийся следом, не должен разбирать вывод или завершать вызов повторно.
         if (settled) return;
-        if (timer) clearTimeout(timer);
         // Убит сигналом извне (OOM, kill) — в тексте имя сигнала, а не «код null».
         const exitWhat = code === null && typeof signal === 'string' && /^SIG[A-Z0-9]+$/.test(signal)
           ? `сигнал ${signal}`
@@ -1211,7 +1236,6 @@ export class ClaudeCliService implements OnModuleInit {
       });
 
       proc.on('error', (err) => {
-        if (timer) clearTimeout(timer);
         // Только код (ENOENT, EACCES и т. п.), без сообщения — как у
         // синхронного отказа spawn (startProcess).
         fail(ClaudeCliService.notStartedText(err), { kind: 'other', access: false });
