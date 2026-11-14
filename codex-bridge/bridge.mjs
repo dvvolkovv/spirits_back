@@ -21,10 +21,9 @@ export const DEFAULT_UPSTREAM = 'https://chatgpt.com/backend-api/codex';
 export const DEFAULT_BRIDGE_MODEL = 'gpt-6-astra';
 export const DEFAULT_LOG_PATH = path.join(os.homedir(), '.linkeon', 'logs', 'codex-bridge.log');
 // User-Agent сверен с реальным Codex CLI: 0.154.0 — закреплённый пин пакета
-// @openai/codex (runbook выката). Серверы Linkeon — Linux x86_64; значение
-// для Linux вводится диффом 3 (Task 5), до него — значение мака.
+// @openai/codex (runbook выката). Серверы Linkeon — Linux x86_64.
 export const UPSTREAM_UA = process.env.CODEX_BRIDGE_UA
-  ?? 'codex_cli_rs/0.154.0 (MacOS 25.6.0; arm64)';
+  ?? 'codex_cli_rs/0.154.0 (Linux; x86_64)';
 
 // --- Хелперы, инлайнные из ~/.linkeon/tools/claude-model-router.mjs ---
 // (на серверах роутера нет; мост обязан быть самодостаточным)
