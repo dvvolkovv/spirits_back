@@ -742,6 +742,27 @@ export class VoiceCallService implements OnModuleInit {
   }
 
   /**
+   * Task 15 (удаление аккаунта): удалить строку звонка удалённого поколения
+   * вместе с voice_call_jobs (FK ON DELETE CASCADE, 001_voice_calls.sql).
+   * Generation predicate в EXISTS — после reactivation старый deletionId не
+   * удаляет ничего. meeting_rooms и звонки других участников не трогаются:
+   * DELETE строго по id + user_id. Вызывается из voice.purge ПОСЛЕ всех
+   * voice-document.purge (правило каталога): transcript/summary с адресами
+   * документов нужны ref-check'у объектов живыми.
+   */
+  async deleteCallRowForDeletion(callId: string, deletionId: string, userId: string): Promise<void> {
+    await this.pg.query(
+      `DELETE FROM voice_calls
+        WHERE id = $1 AND user_id = $2
+          AND EXISTS (
+            SELECT 1 FROM user_id u
+            WHERE u.internal_id = $2 AND u.state = 'deleted' AND u.deletion_id = $3
+          )`,
+      [callId, userId, deletionId],
+    );
+  }
+
+  /**
    * Общая половина strict-пары для deletion-пути: пометить звонок
    * остановленным и подтвердить исход комнаты в LiveKit.
    *

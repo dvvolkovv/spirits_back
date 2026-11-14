@@ -14,6 +14,7 @@ import { discoverProductDeletion } from '../products/product-account-deletion.ad
 import { discoverCalendarDeletion } from '../calendar/calendar-account-deletion.adapter';
 import { discoverIntegrationDeletion } from '../integrations/integration-account-deletion.adapter';
 import { discoverVoiceDeletion } from '../voice-call/voice-account-deletion.adapter';
+import { discoverVoiceDocuments } from '../voice-call/voice-document-account-deletion';
 import { discoverChatFiles } from '../chat/chat-files/chat-file-account-deletion.adapter';
 import { discoverImageDeletion } from '../misc/image-account-deletion.adapter';
 import { discoverVideoDeletion } from '../video/video-account-deletion.adapter';
@@ -400,6 +401,7 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       discoverCalendarDeletion,
       discoverIntegrationDeletion,
       discoverVoiceDeletion,
+      discoverVoiceDocuments,
       discoverChatFiles,
       discoverImageDeletion,
       discoverVideoDeletion,

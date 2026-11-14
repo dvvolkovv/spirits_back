@@ -1,6 +1,11 @@
 import { Injectable, OnModuleInit, Optional } from '@nestjs/common';
 import { AccountDeletionRegistry } from '../account-deletion/account-deletion.registry';
-import { DeletionRetryError, deletionErrorKind } from '../account-deletion/account-deletion.safe';
+import {
+  DeletionCancelledError,
+  DeletionRetryError,
+  deletionErrorKind,
+} from '../account-deletion/account-deletion.safe';
+import { VOICE_DELETION_UUID_RE } from './voice-document-account-deletion';
 import type {
   AccountDeletionAdapter,
   DeletionDiscoverer,
@@ -75,12 +80,39 @@ export const discoverVoiceDeletion: DeletionDiscoverer = async ({ db, account })
       },
     });
   }
+
+  // Task 15: строка звонка (и FK-каскад voice_call_jobs) удаляется purge-задачей
+  // через 30 дней. Планируются ВСЕ звонки аккаунта, не только живые: transcript,
+  // summary и question/answer — персональные данные любого завершённого звонка.
+  // resourceKey совпадает с voice.stop, поэтому правило каталога
+  // sameResourceKey:['voice.stop'] не даст purge обойти остановку, а
+  // allOf:['voice-document.purge'] — удалить строки раньше объектов документов
+  // (иначе адреса документов исчезли бы из transcript до удаления из бакета).
+  const all = await db.query(
+    `SELECT c.id FROM voice_calls c
+      WHERE c.user_id = $1
+        AND EXISTS (
+          SELECT 1 FROM user_id u
+          WHERE u.internal_id = $1 AND u.state = 'deleted' AND u.deletion_id = $2
+        )
+      ORDER BY c.id`,
+    [account.userId, account.deletionId],
+  );
+  for (const row of all.rows) {
+    const callId = String(row.id);
+    jobs.push({
+      resourceType: 'voice.purge',
+      resourceKey: callId,
+      phase: 'purge',
+      payload: { callId },
+    });
+  }
   return { jobs, skips: [] };
 };
 
 @Injectable()
 export class VoiceAccountDeletionAdapter implements OnModuleInit, AccountDeletionAdapter {
-  readonly resourceTypes: readonly DeletionResourceType[] = ['voice.stop'];
+  readonly resourceTypes: readonly DeletionResourceType[] = ['voice.stop', 'voice.purge'];
 
   constructor(
     private readonly voice: VoiceCallService,
@@ -130,6 +162,27 @@ export class VoiceAccountDeletionAdapter implements OnModuleInit, AccountDeletio
           throw new DeletionRetryError(deletionErrorKind(error));
         }
         if (!stopped) throw new DeletionRetryError('external_unknown');
+        await ctx.assertCurrent(job);
+        return;
+      }
+      case 'voice.purge': {
+        // Строка звонка удалённого поколения; voice_call_jobs уходит
+        // FK-каскадом (ON DELETE CASCADE, 001_voice_calls.sql). Комнаты и
+        // чужие звонки не трогаются: DELETE строго по id + user_id +
+        // generation predicate. Payload исполняется через 30 дней — callId
+        // перепроверяется fail-closed (строго uuid, формат PK voice_calls).
+        const callId = job.payload?.callId;
+        if (typeof callId !== 'string' || !VOICE_DELETION_UUID_RE.test(callId)) {
+          throw new DeletionRetryError('db');
+        }
+        await ctx.assertCurrent(job);
+        try {
+          await this.voice.deleteCallRowForDeletion(callId, job.deletionId, job.userId);
+        } catch (error) {
+          if (error instanceof DeletionCancelledError) throw error;
+          if (error instanceof DeletionRetryError) throw error;
+          throw new DeletionRetryError(deletionErrorKind(error));
+        }
         await ctx.assertCurrent(job);
         return;
       }
