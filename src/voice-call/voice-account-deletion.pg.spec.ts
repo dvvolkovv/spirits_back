@@ -5,7 +5,8 @@ import { Pool } from 'pg';
 import { discoverVoiceDeletion } from './voice-account-deletion.adapter';
 
 /**
- * Discovery voice.stop против живого Postgres (Task 10, follow-up ревью).
+ * Discovery voice.stop/voice.purge против живого Postgres (Task 10, follow-up
+ * ревью; Task 15 добавил purge-задачи на строки звонков).
  *
  * Фейковая БД unit-спека повторяет SQL по памяти, и самый сложный
  * discoverer-запрос проекта (два коррелированных EXISTS, LIKE 'room\_%' с
@@ -14,6 +15,11 @@ import { discoverVoiceDeletion } from './voice-account-deletion.adapter';
  * боевом порядке, поэтому типы колонок (UUID id, TEXT user_id) и ограничения
  * те же, что на проде.
  */
+
+const stopsOf = (jobs: readonly { resourceType: string }[]) =>
+  jobs.filter((j) => j.resourceType === 'voice.stop');
+const purgesOf = (jobs: readonly { resourceType: string }[]) =>
+  jobs.filter((j) => j.resourceType === 'voice.purge');
 
 const PG = process.env.PROVISIONING_PG_URL;
 const maybe = PG ? describe : describe.skip;
@@ -111,12 +117,20 @@ maybe('discoverVoiceDeletion против живого Postgres', () => {
     const plan = await discoverVoiceDeletion({ db, account, origin: 'explicit' });
 
     expect(plan.skips).toEqual([]);
-    expect(plan.jobs).toEqual([{
-      resourceType: 'voice.stop',
-      resourceKey: id,
-      phase: 'immediate',
-      payload: { callId: id, externalBotId: null, roomKind: 'sole' },
-    }]);
+    expect(plan.jobs).toEqual([
+      {
+        resourceType: 'voice.stop',
+        resourceKey: id,
+        phase: 'immediate',
+        payload: { callId: id, externalBotId: null, roomKind: 'sole' },
+      },
+      {
+        resourceType: 'voice.purge',
+        resourceKey: id,
+        phase: 'purge',
+        payload: { callId: id },
+      },
+    ]);
   });
 
   it('звонок ДРУГОГО user_id в той же комнате — shared', async () => {
@@ -126,9 +140,11 @@ maybe('discoverVoiceDeletion против живого Postgres', () => {
 
     const plan = await discoverVoiceDeletion({ db, account, origin: 'explicit' });
 
-    // Чужой звонок в план не попадает, но делает комнату общей.
-    expect(plan.jobs).toHaveLength(1);
-    expect(plan.jobs[0].payload).toEqual({ callId: id, externalBotId: null, roomKind: 'shared' });
+    // Чужой звонок в план не попадает (ни stop, ни purge), но делает комнату
+    // общей.
+    expect(stopsOf(plan.jobs)).toHaveLength(1);
+    expect(stopsOf(plan.jobs)[0].payload).toEqual({ callId: id, externalBotId: null, roomKind: 'shared' });
+    expect(purgesOf(plan.jobs).map((j) => j.resourceKey)).toEqual([id]);
   });
 
   it('звонок ТОГО ЖЕ user_id в той же комнате — sole (общей её делает только чужой участник)', async () => {
@@ -140,9 +156,10 @@ maybe('discoverVoiceDeletion против живого Postgres', () => {
 
     // Повторный вход того же пользователя (сегодня Роман, завтра снова Роман)
     // не делает комнату общей: SQL требует o.user_id <> c.user_id.
-    expect(plan.jobs).toHaveLength(2);
-    const kinds = Object.fromEntries(plan.jobs.map((j) => [String(j.payload.callId), j.payload.roomKind]));
+    expect(stopsOf(plan.jobs)).toHaveLength(2);
+    const kinds = Object.fromEntries(stopsOf(plan.jobs).map((j) => [String(j.payload.callId), j.payload.roomKind]));
     expect(kinds).toEqual({ [a]: 'sole', [b]: 'sole' });
+    expect(new Set(purgesOf(plan.jobs).map((j) => j.resourceKey))).toEqual(new Set([a, b]));
   });
 
   it('persistent незакрытая meeting_rooms room_<code> — shared без чужих звонков', async () => {
@@ -152,8 +169,9 @@ maybe('discoverVoiceDeletion против живого Postgres', () => {
 
     const plan = await discoverVoiceDeletion({ db, account, origin: 'explicit' });
 
-    expect(plan.jobs).toHaveLength(1);
-    expect(plan.jobs[0].payload).toMatchObject({ callId: id, roomKind: 'shared' });
+    expect(stopsOf(plan.jobs)).toHaveLength(1);
+    expect(stopsOf(plan.jobs)[0].payload).toMatchObject({ callId: id, roomKind: 'shared' });
+    expect(purgesOf(plan.jobs).map((j) => j.resourceKey)).toEqual([id]);
   });
 
   it('закрытая meeting_rooms комнату общей не делает; room-префикс без кода — тоже', async () => {
@@ -167,8 +185,8 @@ maybe('discoverVoiceDeletion против живого Postgres', () => {
 
     const plan = await discoverVoiceDeletion({ db, account, origin: 'explicit' });
 
-    expect(plan.jobs).toHaveLength(2);
-    const kinds = Object.fromEntries(plan.jobs.map((j) => [String(j.payload.callId), j.payload.roomKind]));
+    expect(stopsOf(plan.jobs)).toHaveLength(2);
+    const kinds = Object.fromEntries(stopsOf(plan.jobs).map((j) => [String(j.payload.callId), j.payload.roomKind]));
     expect(kinds).toEqual({ [closedRoom]: 'sole', [dashRoom]: 'sole' });
   });
 
@@ -207,14 +225,34 @@ maybe('discoverVoiceDeletion против живого Postgres', () => {
     };
     const plan = await discoverVoiceDeletion({ db: spyingDb, account, origin: 'explicit' });
 
-    expect(plan.jobs).toHaveLength(1);
-    expect(plan.jobs[0].payload).toEqual({
+    expect(stopsOf(plan.jobs)).toHaveLength(1);
+    expect(stopsOf(plan.jobs)[0].payload).toEqual({
       callId: id, externalBotId: 'bot-leftover', roomKind: 'sole',
     });
     // CANARY: ни payload, ни SQL discovery не содержат Zoom-адрес с токеном.
-    const payloadJson = JSON.stringify(plan.jobs[0].payload);
-    expect(payloadJson).not.toContain('CANARY-ZOOM-TOKEN');
-    expect(payloadJson).not.toContain('http');
+    for (const job of plan.jobs) {
+      const payloadJson = JSON.stringify(job.payload);
+      expect(payloadJson).not.toContain('CANARY-ZOOM-TOKEN');
+      expect(payloadJson).not.toContain('http');
+    }
     expect(queries.join('\n')).not.toContain('external_url');
+  });
+
+  it('voice.purge — все свои звонки любого статуса, чужие не попадают', async () => {
+    await seedAccount('u-deleted', DELETION_ID);
+    const active = await seedCall({ userId: 'u-deleted', roomName: 'voice_p-1' });
+    const done = await seedCall({ userId: 'u-deleted', roomName: 'voice_p-2', status: 'completed' });
+    const interrupted = await seedCall({ userId: 'u-deleted', roomName: 'voice_p-3', status: 'interrupted' });
+    const foreign = await seedCall({ userId: 'u-other', roomName: 'voice_p-4', status: 'completed' });
+
+    const plan = await discoverVoiceDeletion({ db, account, origin: 'explicit' });
+
+    const keys = purgesOf(plan.jobs).map((j) => j.resourceKey).sort();
+    expect(keys).toEqual([active, done, interrupted].sort());
+    expect(keys).not.toContain(foreign);
+    for (const job of purgesOf(plan.jobs)) {
+      expect(job.phase).toBe('purge');
+      expect(job.payload).toEqual({ callId: job.resourceKey });
+    }
   });
 });
