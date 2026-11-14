@@ -16,9 +16,11 @@ import {
   readFallbackConfig,
   readFallbackConfigs,
 } from './llm-fallback';
+import { classifyLlmError } from '../llm-error';
 
 const QWEN_MODELS = { opus: 'qwen3.8-max', sonnet: 'qwen3.8-flash', haiku: 'qwen3.6-flash' };
 const KIMI_MODELS = { opus: 'k3.1-pro', sonnet: 'k3.1-pro', haiku: 'k3.1-pro' };
+const CODEX_MODELS = { opus: 'gpt-6-astra', sonnet: 'gpt-6-astra', haiku: 'gpt-6-astra' };
 
 describe('readFallbackConfig', () => {
   it('без ключа — null (провайдер выключен)', () => {
@@ -55,11 +57,31 @@ describe('readFallbackConfig', () => {
     expect(readFallbackConfig('qwen', env)!.models).toEqual(QWEN_MODELS);
   });
 
-  it('readFallbackConfigs — по всем запасным, порядок цепочки Qwen → Kimi', () => {
-    expect(FALLBACK_ORDER).toEqual(['qwen', 'kimi']);
-    const all = readFallbackConfigs({ KIMI_FALLBACK_API_KEY: 'k' });
+  it('Codex с ключом — адрес локального моста и gpt-6-astra для всех классов', () => {
+    expect(readFallbackConfig('codex', { CODEX_FALLBACK_API_KEY: 'local-bridge' })).toEqual({
+      name: 'codex',
+      apiKey: 'local-bridge',
+      baseUrl: 'http://127.0.0.1:8790',
+      models: CODEX_MODELS,
+    });
+  });
+
+  it('переопределения из env — у Codex свои', () => {
+    const cfg = readFallbackConfig('codex', {
+      CODEX_FALLBACK_API_KEY: 'local-bridge',
+      CODEX_FALLBACK_BASE_URL: 'http://127.0.0.1:9999',
+      CODEX_FALLBACK_MODEL_OPUS: 'gpt-5.6-sol',
+    });
+    expect(cfg?.baseUrl).toBe('http://127.0.0.1:9999');
+    expect(cfg?.models).toEqual({ opus: 'gpt-5.6-sol', sonnet: 'gpt-6-astra', haiku: 'gpt-6-astra' });
+  });
+
+  it('readFallbackConfigs — по всем запасным, порядок цепочки Qwen → Kimi → Codex', () => {
+    expect(FALLBACK_ORDER).toEqual(['qwen', 'kimi', 'codex']);
+    const all = readFallbackConfigs({ KIMI_FALLBACK_API_KEY: 'k', CODEX_FALLBACK_API_KEY: 'local-bridge' });
     expect(all.qwen).toBeNull();
     expect(all.kimi?.name).toBe('kimi');
+    expect(all.codex?.name).toBe('codex');
   });
 });
 
@@ -97,6 +119,12 @@ describe('fallbackModelFor', () => {
       expect(fallbackModelFor(m, KIMI_MODELS)).toBe('k3.1-pro');
     }
   });
+
+  it('Codex: любой класс — gpt-6-astra', () => {
+    for (const req of ['claude-opus-5-5', 'sonnet', 'claude-haiku-4-5', 'default']) {
+      expect(fallbackModelFor(req, CODEX_MODELS)).toBe('gpt-6-astra');
+    }
+  });
 });
 
 describe('isFallbackWorthy', () => {
@@ -129,6 +157,12 @@ describe('isFallbackWorthy', () => {
     'claude CLI error: response exceeded the 32000 output token maximum',
   ])('длина контекста — не переключаемся: %s', (msg) => {
     expect(isFallbackWorthy(msg)).toBe(false);
+  });
+
+  it('401-рефрейм моста Codex — достойный сбой вида auth', () => {
+    const msg = 'claude CLI error: API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"Codex token rejected: open the Codex app once to refresh login (invalid token)"}}';
+    expect(isFallbackWorthy(msg)).toBe(true);
+    expect(classifyLlmError(msg).kind).toBe('auth');
   });
 });
 
@@ -204,7 +238,7 @@ describe('fallbackTimeoutMs', () => {
 });
 
 describe('isAnswerProvider', () => {
-  it.each(['claude', 'qwen', 'kimi'])('%s — да', (v) => expect(isAnswerProvider(v)).toBe(true));
+  it.each(['claude', 'qwen', 'kimi', 'codex'])('%s — да', (v) => expect(isAnswerProvider(v)).toBe(true));
   it.each(['gpt', '', 'Qwen', null, undefined, 1])('%p — нет', (v) => expect(isAnswerProvider(v)).toBe(false));
 });
 
@@ -250,15 +284,15 @@ describe('FallbackState', () => {
 });
 
 describe('planProviders', () => {
-  const cfg = (name: 'qwen' | 'kimi'): FallbackConfig => ({ name, apiKey: 'k', baseUrl: 'u', models: { opus: 'o', sonnet: 's', haiku: 'h' } });
-  const both = { qwen: cfg('qwen'), kimi: cfg('kimi') };
+  const cfg = (name: 'qwen' | 'kimi' | 'codex'): FallbackConfig => ({ name, apiKey: 'k', baseUrl: 'u', models: { opus: 'o', sonnet: 's', haiku: 'h' } });
+  const both = { qwen: cfg('qwen'), kimi: cfg('kimi'), codex: cfg('codex') }; // имя историческое — запасных уже три
   const T = 10_000;
 
   it('noFallback с выбором (ход гостя) — только выбранная модель', () => {
     expect(planProviders({ selected: 'kimi', configs: both, state: new FallbackState(), noFallback: true, now: T })).toEqual(['kimi']);
   });
   it('noFallback с выбором без ключа — Claude', () => {
-    expect(planProviders({ selected: 'qwen', configs: { qwen: null, kimi: cfg('kimi') }, state: new FallbackState(), noFallback: true, now: T })).toEqual(['claude']);
+    expect(planProviders({ selected: 'qwen', configs: { qwen: null, kimi: cfg('kimi'), codex: null }, state: new FallbackState(), noFallback: true, now: T })).toEqual(['claude']);
   });
   it('noFallback без выбора (проба мониторинга) — Claude', () => {
     expect(planProviders({ configs: both, state: new FallbackState(), noFallback: true, now: T })).toEqual(['claude']);
@@ -271,44 +305,45 @@ describe('planProviders', () => {
     s.markDown('kimi', 60_000, T);
     expect(planProviders({ selected: 'kimi', configs: both, state: s, noFallback: true, now: T + 1 })).toEqual(['kimi']);
   });
-  it('окно Claude закрыто — Claude, Qwen, Kimi', () => {
-    expect(planProviders({ configs: both, state: new FallbackState(), now: T })).toEqual(['claude', 'qwen', 'kimi']);
+  it('окно Claude закрыто — Claude, Qwen, Kimi, Codex', () => {
+    expect(planProviders({ configs: both, state: new FallbackState(), now: T })).toEqual(['claude', 'qwen', 'kimi', 'codex']);
   });
   it('без ключа Qwen — Claude, Kimi', () => {
-    expect(planProviders({ configs: { qwen: null, kimi: cfg('kimi') }, state: new FallbackState(), now: T })).toEqual(['claude', 'kimi']);
+    expect(planProviders({ configs: { qwen: null, kimi: cfg('kimi'), codex: null }, state: new FallbackState(), now: T })).toEqual(['claude', 'kimi']);
   });
   it('без ключей — только Claude', () => {
-    expect(planProviders({ configs: { qwen: null, kimi: null }, state: new FallbackState(), now: T })).toEqual(['claude']);
+    expect(planProviders({ configs: { qwen: null, kimi: null, codex: null }, state: new FallbackState(), now: T })).toEqual(['claude']);
   });
   it('окно Claude открыто — только запасные', () => {
     const s = new FallbackState();
     s.openClaudeWindow(60_000, T);
-    expect(planProviders({ configs: both, state: s, now: T + 1 })).toEqual(['qwen', 'kimi']);
+    expect(planProviders({ configs: both, state: s, now: T + 1 })).toEqual(['qwen', 'kimi', 'codex']);
   });
   it('запасной «не отвечает» — пропускается', () => {
     const s = new FallbackState();
     s.markDown('qwen', 60_000, T);
-    expect(planProviders({ configs: both, state: s, now: T + 1 })).toEqual(['claude', 'kimi']);
+    expect(planProviders({ configs: both, state: s, now: T + 1 })).toEqual(['claude', 'kimi', 'codex']);
   });
   it('окно открыто, а все запасные «не отвечают» — Claude', () => {
     const s = new FallbackState();
     s.openClaudeWindow(60_000, T);
     s.markDown('qwen', 60_000, T);
     s.markDown('kimi', 60_000, T);
+    s.markDown('codex', 60_000, T);
     expect(planProviders({ configs: both, state: s, now: T + 1 })).toEqual(['claude']);
   });
   it('выбран Kimi — сначала он, затем обычный путь без него', () => {
-    expect(planProviders({ selected: 'kimi', configs: both, state: new FallbackState(), now: T })).toEqual(['kimi', 'claude', 'qwen']);
+    expect(planProviders({ selected: 'kimi', configs: both, state: new FallbackState(), now: T })).toEqual(['kimi', 'claude', 'qwen', 'codex']);
   });
   it('выбран Kimi при открытом окне — Kimi, затем Qwen', () => {
     const s = new FallbackState();
     s.openClaudeWindow(60_000, T);
-    expect(planProviders({ selected: 'kimi', configs: both, state: s, now: T + 1 })).toEqual(['kimi', 'qwen']);
+    expect(planProviders({ selected: 'kimi', configs: both, state: s, now: T + 1 })).toEqual(['kimi', 'qwen', 'codex']);
   });
   it('выбранный пробуется первым, даже когда он «не отвечает»', () => {
     const s = new FallbackState();
     s.markDown('kimi', 60_000, T);
-    expect(planProviders({ selected: 'kimi', configs: both, state: s, now: T + 1 })).toEqual(['kimi', 'claude', 'qwen']);
+    expect(planProviders({ selected: 'kimi', configs: both, state: s, now: T + 1 })).toEqual(['kimi', 'claude', 'qwen', 'codex']);
   });
   // Уточнения по ревью 31.10: рубильник (respectDown) уважает окно «не
   // отвечает» и не тратит на такую модель попытку; личный выбор (без
@@ -316,10 +351,10 @@ describe('planProviders', () => {
   it('respectDown: выбранная «не отвечает» — обычный путь без неё, попытку не тратим', () => {
     const s = new FallbackState();
     s.markDown('kimi', 60_000, T);
-    expect(planProviders({ selected: 'kimi', configs: both, state: s, now: T + 1, respectDown: true })).toEqual(['claude', 'qwen']);
+    expect(planProviders({ selected: 'kimi', configs: both, state: s, now: T + 1, respectDown: true })).toEqual(['claude', 'qwen', 'codex']);
   });
   it('respectDown, но выбранная отвечает — всё равно первой', () => {
-    expect(planProviders({ selected: 'kimi', configs: both, state: new FallbackState(), now: T, respectDown: true })).toEqual(['kimi', 'claude', 'qwen']);
+    expect(planProviders({ selected: 'kimi', configs: both, state: new FallbackState(), now: T, respectDown: true })).toEqual(['kimi', 'claude', 'qwen', 'codex']);
   });
   it('noFallback — respectDown не действует (цепочки и так нет)', () => {
     const s = new FallbackState();
@@ -327,18 +362,27 @@ describe('planProviders', () => {
     expect(planProviders({ selected: 'kimi', configs: both, state: s, noFallback: true, now: T + 1, respectDown: true })).toEqual(['kimi']);
   });
   it('выбран без ключа — обычный путь', () => {
-    expect(planProviders({ selected: 'kimi', configs: { qwen: cfg('qwen'), kimi: null }, state: new FallbackState(), now: T })).toEqual(['claude', 'qwen']);
+    expect(planProviders({ selected: 'kimi', configs: { qwen: cfg('qwen'), kimi: null, codex: null }, state: new FallbackState(), now: T })).toEqual(['claude', 'qwen']);
   });
   it('незнакомый выбор (из БД пришло не то) — обычный путь', () => {
-    expect(planProviders({ selected: 'gpt' as FallbackProvider, configs: both, state: new FallbackState(), now: T })).toEqual(['claude', 'qwen', 'kimi']);
+    expect(planProviders({ selected: 'gpt' as FallbackProvider, configs: both, state: new FallbackState(), now: T })).toEqual(['claude', 'qwen', 'kimi', 'codex']);
   });
   it('выбор — имя из прототипа объекта (constructor) — обычный путь', () => {
-    expect(planProviders({ selected: 'constructor' as FallbackProvider, configs: both, state: new FallbackState(), now: T })).toEqual(['claude', 'qwen', 'kimi']);
+    expect(planProviders({ selected: 'constructor' as FallbackProvider, configs: both, state: new FallbackState(), now: T })).toEqual(['claude', 'qwen', 'kimi', 'codex']);
   });
-  it('выбран Kimi, окно Claude открыто, Qwen «не отвечает» — Kimi, затем Claude', () => {
+  it('выбран Kimi, окно Claude открыто, Qwen и Codex «не отвечают» — Kimi, затем Claude', () => {
     const s = new FallbackState();
     s.openClaudeWindow(60_000, T);
     s.markDown('qwen', 60_000, T);
+    s.markDown('codex', 60_000, T);
     expect(planProviders({ selected: 'kimi', configs: both, state: s, now: T + 1 })).toEqual(['kimi', 'claude']);
+  });
+  it('выбран Codex — сначала он, затем обычный путь без него', () => {
+    expect(planProviders({ selected: 'codex', configs: both, state: new FallbackState(), now: T }))
+      .toEqual(['codex', 'claude', 'qwen', 'kimi']);
+  });
+  it('noFallback с выбором Codex — только Codex', () => {
+    expect(planProviders({ selected: 'codex', configs: both, state: new FallbackState(), now: T, noFallback: true }))
+      .toEqual(['codex']);
   });
 });
