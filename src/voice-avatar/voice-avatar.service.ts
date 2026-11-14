@@ -4,6 +4,10 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import axios from 'axios';
+import {
+  DeletionRetryError,
+  deletionErrorKind,
+} from '../account-deletion/account-deletion.safe';
 import { PgService } from '../common/services/pg.service';
 import { cloneVoiceName } from './voice-name';
 
@@ -205,6 +209,31 @@ export class VoiceAvatarService implements OnModuleInit {
       await axios.delete(`${EL_BASE}/voices/${voiceId}`, { headers: { 'xi-api-key': key }, timeout: 30000 });
     } catch (e: any) {
       this.logger.warn(`deleteClone ${voiceId} failed: ${e.message}`);
+    }
+  }
+
+  /**
+   * Task 14 — строгое удаление клона для account-deletion (в отличие от
+   * best-effort deleteClone выше, который для живых пользователей глотает
+   * ошибки). Возвращает подтверждённый исход: 'deleted' (2xx) или 'absent'
+   * (404 — клона у провайдера уже нет, идемпотентный успех). Любой
+   * неподтверждённый исход (нет ключа, timeout, 5xx, сетевая ошибка) —
+   * DeletionRetryError: внешний voice_id НЕ считается удалённым и сохраняется
+   * в БД и в payload job'а для retry. Наружу уходит только kind, без
+   * e.message (там мог бы быть внешний id или детали запроса).
+   */
+  async deleteCloneConfirmed(voiceId: string): Promise<'deleted' | 'absent'> {
+    const key = process.env.ELEVENLABS_API_KEY;
+    if (!key) throw new DeletionRetryError('external_unknown');
+    try {
+      await axios.delete(`${EL_BASE}/voices/${encodeURIComponent(voiceId)}`, {
+        headers: { 'xi-api-key': key },
+        timeout: 30_000,
+      });
+      return 'deleted';
+    } catch (e: any) {
+      if (e?.response?.status === 404) return 'absent';
+      throw new DeletionRetryError(deletionErrorKind(e));
     }
   }
 

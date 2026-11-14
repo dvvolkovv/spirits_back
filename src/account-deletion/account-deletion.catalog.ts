@@ -9,6 +9,7 @@ import { discoverImageDeletion } from '../misc/image-account-deletion.adapter';
 import { discoverVideoDeletion } from '../video/video-account-deletion.adapter';
 import { discoverSpeechDeletion } from '../speech/speech-account-deletion.adapter';
 import { discoverAvatarDeletion } from '../avatar/avatar-account-deletion.adapter';
+import { discoverVoiceAvatarDeletion } from '../voice-avatar/voice-account-deletion.adapter';
 import type {
   DeletionDiscoverer,
   DeletionResourceType,
@@ -26,6 +27,7 @@ export const DELETION_DISCOVERERS: readonly DeletionDiscoverer[] = [
   discoverVideoDeletion,
   discoverSpeechDeletion,
   discoverAvatarDeletion,
+  discoverVoiceAvatarDeletion,
 ];
 
 export interface DeletionDependencyRule {
