@@ -856,7 +856,7 @@ test('Серверный дифф 3: дефолтный User-Agent — Linux x86
 Guard `if (request !== upstreamRequest) return;` (bridge.mjs, `request.on('error')`) — ключевой race-фикс диффа 2, но без этого теста его удаление оставляет весь набор зелёным. Тест НЕ красный — guard уже на месте; он фиксирует контракт «ошибка устаревшей попытки не перетирает ответ ретрая». Окно гонки создаётся таймерами: первая попытка умирает на 40 мс, вторая отвечает на 150 мс — клиентский ответ в этот момент открыт, и без guard'а клиент получил бы 502.
 
 ```js
-test('Дифф 2, guard stale-attempt: ошибка устаревшей попытки не перетирает ответ ретрая', async (t) => {
+test('Дифф 2, guard stale-attempt: ошибка устаревшей попытки не перетирает ответ ретрая', { timeout: 10_000 }, async (t) => {
   let hits = 0;
   let firstRes;
   const { bridgeOrigin } = await startPair(t, (record, req, res) => {
@@ -879,9 +879,12 @@ test('Дифф 2, guard stale-attempt: ошибка устаревшей поп�
     model: 'gpt-6-astra', stream: true, messages: [{ role: 'user', content: 'hi' }],
   });
   assert.equal(result.status, 200);
+  assert.match(result.text, /event: message_start/);
   assert.equal(hits, 2);
 });
 ```
+
+Таймаут 10 с — от quality-ревью: если 401-ретрай когда-нибудь сломается, вторая попытка не случится и `post()` без таймаута завис бы до серверного requestTimeout (~300 с), заблокировав прогон runbook'а перед `pm2 start` с невнятной диагностикой.
 
 - [ ] **Step 2: Прогнать — красный (UA); commit**
 
@@ -916,11 +919,14 @@ export const UPSTREAM_UA = process.env.CODEX_BRIDGE_UA
 на:
 
 ```js
-// User-Agent сверен с реальным Codex CLI: 0.154.0 — закреплённый пин пакета
-// @openai/codex (runbook выката). Серверы Linkeon — Linux x86_64.
+// User-Agent — формат по образцу реального Codex CLI 0.154.0 (пин — в runbook
+// выката): полное значение CLI включает версию ядра и токен терминала, здесь
+// сокращено по спеке — originator/версия/ОС/arch сохранены.
 export const UPSTREAM_UA = process.env.CODEX_BRIDGE_UA
   ?? 'codex_cli_rs/0.154.0 (Linux; x86_64)';
 ```
+
+(Формулировка комментария — от quality-ревью: реальный CLI 0.154.0 на Linux x86_64 шлёт `codex_cli_rs/0.154.0 (Linux <версия ядра>; x86_64) <токен терминала>` — см. `codex-rs/login/src/auth/default_client.rs`, `get_codex_user_agent`; прежнее «сверен с реальным CLI» вводило в заблуждение. Если upstream ужесточит fingerprinting — переходить на полный формат.)
 
 - [ ] **Step 4: Прогнать — зелёное; commit**
 
