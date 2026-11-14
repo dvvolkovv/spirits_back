@@ -127,6 +127,26 @@ describe('RecallService', () => {
     expect(items.length).toBe(1);
   });
 
+  /**
+   * ⚠️ У `callTool` TalerID своего срока ожидания НЕТ: неотвечающий MCP держал
+   * бы вызов столько, сколько держит сокет. Витрина собирается на старте
+   * звонка — человек в этот момент слушает гудки.
+   */
+  it('молчащий TalerID не держит звонок: срок вышел — идём без заметок', async () => {
+    const hanging = { listNotes: jest.fn(() => new Promise(() => {})) } as any;
+    const pg = pgOf([{ started_at: '2026-11-10T10:00:00Z', summary: 'про ипотеку' }]);
+    const svc = new RecallService(pg, hanging);
+    svc.deadlines.digest = 10;
+    svc.deadlines.search = 10;
+
+    const text = await svc.digest('u1');
+    const items = await svc.search('u1', 'ипотека');
+
+    expect(text).toContain('Прошлые разговоры');
+    expect(text).not.toContain('Заметки:');
+    expect(items.map((i) => i.kind)).toEqual(['talk']);
+  });
+
   it('витрина для преамбулы — только заголовки и даты, без текста', async () => {
     const pg = pgOf([{ started_at: '2026-11-13T16:44:00Z', summary: 'Финансовое будущее\nподробности' }]);
     const svc = new RecallService(pg, notesOf([
