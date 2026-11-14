@@ -289,12 +289,13 @@ export function isMain(metaUrl = import.meta.url, argvPath = process.argv[1]) {
 - [ ] **Step 4: Проверить чистоту, синтаксис, прогнать тесты**
 
 ```bash
-grep -n "claude-model-router\|codex-translate\|codex-sse\|/Users/dmitry" codex-bridge/bridge.mjs || echo CLEAN
+grep -n "claude-model-router\|codex-translate\|codex-sse\|/Users/dmitry" codex-bridge/bridge.mjs | grep -v 'инлайнные из' || echo CLEAN
 node --check codex-bridge/bridge.mjs && echo SYNTAX-OK
 node --test codex-bridge/*.test.mjs
 ```
 
 Expected: `CLEAN`, `SYNTAX-OK`, `# pass 39` (22 из Task 1 + 17 bridge), `# fail 0`.
+(Единственное допустимое попадание — provenance-комментарий `// --- Хелперы, инлайнные из ~/.linkeon/tools/claude-model-router.mjs ---` из verbatim-текста «головы» Step 2; он отфильтрован вторым grep. Функционально файл чист: ни импортов мак-модулей, ни путей `/Users/dmitry`.)
 
 - [ ] **Step 5: Проверить на ноде, что jest/tsc бэка не подхватывают .mjs**
 
