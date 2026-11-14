@@ -69,7 +69,7 @@ export class AdminLlmProviderController {
    */
   private async body(userId: string, choice: LlmChoice) {
     const configs = readFallbackConfigs();
-    const configured = { qwen: configs.qwen !== null, kimi: configs.kimi !== null };
+    const configured = { qwen: configs.qwen !== null, kimi: configs.kimi !== null, codex: configs.codex !== null };
     const usable = (p: AnswerProvider) => p === 'claude' || configured[p];
     const global: AnswerProvider = await this.global.get();
     const routeProvider: AnswerProvider = choice === 'default' ? global : choice;
