@@ -626,6 +626,13 @@ maybe('synthetic deletion lifecycle — полная цепочка против
         processed_by varchar(40)
       );
     `);
+    // Расширения ReferralService.onModuleInit (referral.service.ts:246,252) —
+    // прод-порядок: base-таблицы → инлайновые ALTER-ы сервиса → migrations/,
+    // где 002 читает bonus_tokens и referral_token_payouts.
+    await pool.query(`
+      ALTER TABLE referral_referees ADD COLUMN IF NOT EXISTS bonus_tokens integer NOT NULL DEFAULT 0;
+      ALTER TABLE referral_leaders ADD COLUMN IF NOT EXISTS payout_notified boolean NOT NULL DEFAULT false;
+    `);
     await migration('referral/migrations/001_user_id_to_text.sql');
     await migration('referral/migrations/002_backfill_offledger_accruals.sql');
 
