@@ -1125,6 +1125,11 @@ export async function cleanupSyntheticFixture(
   const userIds = [...input.userIds];
   const groups: Array<readonly [string, unknown[]]> = [
     [`DELETE FROM account_deletion_jobs WHERE deletion_id = ANY($1::uuid[])`, [input.deletionIds]],
+    // T22-Q6: дополнительно стираем задачи поколений по user_id — он известен
+    // всегда, а deletionId при броске внутри runSyntheticScenario может не
+    // успеть попасть в out-массив; иначе orphan-задачи (например
+    // account.core.purge на +30д) оставались бы на стенде.
+    [`DELETE FROM account_deletion_jobs WHERE user_id = ANY($1)`, [userIds]],
     [`DELETE FROM tg_bot_video_jobs WHERE tg_chat_id = -100777001`, []],
     [`DELETE FROM tg_bot_messages WHERE config_id IN (SELECT id FROM tg_bot_configs WHERE owner_user_id = ANY($1))`, [userIds]],
     [`DELETE FROM tg_claim_tokens WHERE owner_user_id = ANY($1)`, [userIds]],

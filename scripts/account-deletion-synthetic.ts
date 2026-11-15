@@ -113,6 +113,11 @@ async function main(): Promise<void> {
     const fixture = await seedSyntheticFixture(stack);
     const counts = await runSyntheticScenario(stack, fixture, deletionIds);
 
+    // T22-Q4: контракт stdout — «только счётчики», с одним ОСОЗНАННЫМ
+    // отклонением: failedKinds — enum-строки DeletionErrorKind (timeout/
+    // external_5xx/external_unknown/…), без userId/телефонов/deletionId/
+    // внешних идентификаторов. Они нужны, чтобы Gate B мог подтвердить
+    // срабатывание всех четырёх внешних границ, не читая базу.
     process.stdout.write(`${JSON.stringify(
       {
         dryRunAccounts: dryRun.accounts,
