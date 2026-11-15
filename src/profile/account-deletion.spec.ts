@@ -41,6 +41,12 @@ class FakeDb {
   profiles = new Map<string, any>();
   /** Связки бота: linkeon_user_id ↔ tg_user_id (1:1). Моделирует tg_user_identities. */
   tgIdentities: Array<{ linkeon_user_id: string; tg_user_id: number }> = [];
+  /**
+   * Модель account_deletion_jobs (Task 20): planner.persist пишет сюда план
+   * поколения, реактивация resolveOrCreate гасит незавершённые задачи.
+   * Хранилище задач в объёме, нужном этому спеку: status по generation.
+   */
+  jobs: Array<{ deletion_id: string; user_id: string; resource_type: string; status: string }> = [];
 
   async query(sql: string, params: any[] = []) {
     const s = sql.replace(/\s+/g, ' ').trim();
@@ -135,6 +141,37 @@ class FakeDb {
         rowCount: 1,
       };
     }
+    // Реактивация (Task 20): чтение поколения под блокировкой строки —
+    // SELECT deletion_id ... FOR UPDATE из resolveOrCreate.
+    if (s.startsWith('SELECT deletion_id FROM user_id')) {
+      const u = this.users.get(params[0]);
+      return u
+        ? { rows: [{ deletion_id: u.deletion_id ?? null }], rowCount: 1 }
+        : { rows: [], rowCount: 0 };
+    }
+    // Персистенция плана (planner.persist): задачи поколения в модель.
+    if (s.startsWith('INSERT INTO account_deletion_jobs')) {
+      this.jobs.push({
+        deletion_id: params[0],
+        user_id: params[1],
+        resource_type: params[2],
+        status: 'pending',
+      });
+      return { rows: [], rowCount: 1 };
+    }
+    // Реактивация (Task 20): гашение незавершённых задач старого поколения.
+    if (s.startsWith("UPDATE account_deletion_jobs SET status = 'cancelled'")) {
+      for (const job of this.jobs) {
+        if (
+          job.user_id === params[0] &&
+          job.deletion_id === params[1] &&
+          ['pending', 'running', 'failed'].includes(job.status)
+        ) {
+          job.status = 'cancelled';
+        }
+      }
+      return { rows: [], rowCount: 0 };
+    }
     // Fenced-чтение поколения для повторного capture файлов.
     if (s.startsWith('SELECT deleted_at FROM user_id')) {
       const u = this.users.get(params[0]);
@@ -179,6 +216,12 @@ class FakeDb {
     if (s.startsWith('UPDATE user_id SET state = \'active\'')) {
       const u = this.users.get(params[0]);
       if (u && u.state !== 'active') u.state = 'active';
+      // Task 20: реактивация снимает поколение ЦЕЛИКОМ — SQL содержит
+      // deleted_at = NULL, deletion_id = NULL (до Task 20 их не было).
+      if (u && /deletion_id\s*=\s*NULL/i.test(s)) {
+        u.deleted_at = null;
+        u.deletion_id = null;
+      }
       return { rows: [] };
     }
     if (s.startsWith('UPDATE user_id SET password_hash')) {
@@ -345,6 +388,33 @@ function ok<T extends { status: string }>(r: T): Extract<T, { status: 'ok' }> {
     // Бонус выдаётся заново: баланс удаление обнулило, и аккаунт должен
     // выглядеть новым, а не пустым.
     expect(db.users.get(first.userId).welcome_bonus_at).toBe('now');
+  });
+
+  it('реактивация телефона отменяет незавершённые задачи старого поколения', async () => {
+    // Task 20: stale deletion worker не должен продолжить стирание
+    // «воскресшего» аккаунта. Реактивация снимает поколение с user_id
+    // (deletion_id/deleted_at) и переводит незавершённые задачи
+    // (pending/running/failed) старого поколения в cancelled.
+    const first = ok(await identity.resolveOrCreate('phone', { phone: '79990000003' }));
+    await deleteAccount(first.userId);
+    const generation = db.users.get(first.userId).deletion_id;
+    expect(generation).toBeTruthy();
+    // begin() спланировал задачи поколения — до реактивации они незавершены.
+    expect(
+      db.jobs.some((j) => j.deletion_id === generation && j.status !== 'cancelled'),
+    ).toBe(true);
+
+    ok(await identity.resolveOrCreate('phone', { phone: '79990000003' }));
+
+    const u = db.users.get(first.userId);
+    expect(u.state).toBe('active');
+    expect(u.deletion_id).toBeNull();
+    expect(u.deleted_at).toBeNull();
+    expect(
+      db.jobs
+        .filter((j) => j.deletion_id === generation)
+        .every((j) => j.status === 'cancelled'),
+    ).toBe(true);
   });
 
   it('рвёт и связку Telegram-бота — иначе мини-приложение снова впускает в удалённый аккаунт', async () => {

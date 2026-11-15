@@ -48,10 +48,21 @@ function makeRow(overrides: Partial<DeletionJobRow> = {}): DeletionJobRow {
   };
 }
 
-function makeStack(claimResult: DeletionJobRow | null) {
+/**
+ * find по умолчанию ведёт себя как настоящий jobs.find на исчезнувшей строке
+ * (0 строк → DeletionRetryError('db')). T19-M2: runJob перечитывает строку
+ * после отказавшего claimById, поэтому фейк обязан её отдавать.
+ */
+function makeStack(
+  claimResult: DeletionJobRow | null,
+  findImpl: () => Promise<DeletionJobRow> = async () => {
+    throw new DeletionRetryError('db');
+  },
+) {
   const executed: DeletionJobRow[] = [];
   const jobs = {
     claimById: jest.fn(async () => claimResult),
+    find: jest.fn(findImpl),
     heartbeat: jest.fn(async () => true),
     finish: jest.fn(async () => true),
     fail: jest.fn(async () => true),
@@ -75,7 +86,9 @@ describe('runJob — нормализация незаклеймленных с�
       attempts: 1,
       leaseUntil: new Date(Date.now() + 300_000),
     });
-    const { runner, jobs, executed } = makeStack(null);
+    // Перечитывание (T19-M2) видит ту же running-строку: чужой исполнитель
+    // ещё держит lease — исход остаётся retryable.
+    const { runner, jobs, executed } = makeStack(null, async () => row);
 
     const error = await runner.runJob(row).catch((e) => e);
 
@@ -125,6 +138,52 @@ describe('runJob — нормализация незаклеймленных с�
 
     await expect(runner.runJob(row)).resolves.toBeUndefined();
     expect(jobs.claimById).not.toHaveBeenCalled();
+    expect(executed).toEqual([]);
+  });
+
+  /**
+   * T19-M2 (ревью Task 19): гонка «конкурент ДОДЕЛАЛ задачу между find(core)
+   * и runJob». find() вернул ещё не-done строку, claimById её уже не берёт
+   * (done не клеймится) — прежний код давал ложный DeletionRetryError('db')
+   * при фактическом успехе (на явном пути — ложный 503). Контракт после фикса:
+   * перечитать строку; done — успешный выход без исполнения и без ошибки;
+   * исчезнувшая/недостижимая строка — прежний retry('db').
+   */
+  it('T19-M2: конкурент доделал задачу — перечитывание даёт done, успешный выход без исполнения', async () => {
+    // Строка, которую нашёл lifecycle.find до гонки: pending, ещё не заклеймена.
+    const stale = makeRow({ status: 'pending', attempts: 0, leaseUntil: null });
+    // В базе к моменту claimById задача уже доделана конкурентом.
+    const fresh = makeRow({ status: 'done', attempts: 1, leaseUntil: null });
+    const { runner, jobs, executed } = makeStack(null, async () => fresh);
+
+    await expect(runner.runJob(stale)).resolves.toBeUndefined();
+
+    expect(jobs.claimById).toHaveBeenCalledWith(stale.id, stale.deletionId);
+    expect(jobs.find).toHaveBeenCalledWith(
+      stale.deletionId,
+      stale.resourceType,
+      stale.resourceKey,
+    );
+    // Успех БЕЗ исполнения: адаптер не вызван, finish/fail не трогали строку.
+    expect(executed).toEqual([]);
+    expect(jobs.finish).not.toHaveBeenCalled();
+    expect(jobs.fail).not.toHaveBeenCalled();
+  });
+
+  it('T19-M2: перечитывание не нашло done (строка недоступна) — прежний retry(db)', async () => {
+    const stale = makeRow({ status: 'pending', attempts: 0, leaseUntil: null });
+    // find по умолчанию бросает DeletionRetryError('db') — как на 0 строк.
+    const { runner, jobs, executed } = makeStack(null);
+
+    const error = await runner.runJob(stale).catch((e) => e);
+
+    expect(error).toBeInstanceOf(DeletionRetryError);
+    expect((error as DeletionRetryError).kind).toBe('db');
+    expect(jobs.find).toHaveBeenCalledWith(
+      stale.deletionId,
+      stale.resourceType,
+      stale.resourceKey,
+    );
     expect(executed).toEqual([]);
   });
 });
