@@ -25,18 +25,20 @@
  *
  * stdout — только JSON-счётчики (без userId/deletionId/телефонов) и маркер
  * SYNTHETIC_TEST_OK. Ошибки — только сообщение и код (scriptErrorText).
- * Коды выхода: 0 успех, 2 гейты/аргументы, 1 прочее.
+ * Коды выхода: 0 успех, 2 гейты/аргументы/preflight, 1 прочее.
  */
 import 'dotenv/config';
 import { hostname } from 'os';
 import { dryRunAccountDeletion } from '../src/account-deletion/account-deletion.dry-run';
 import {
+  assertSyntheticPreflight,
   checkSyntheticGates,
   cleanupSyntheticFixture,
   createSyntheticStack,
   runSyntheticScenario,
   seedSyntheticFixture,
   SyntheticGateError,
+  SyntheticPreflightError,
   SYNTHETIC_HIST_PHONE,
   SYNTHETIC_MAIN_PHONE,
   SYNTHETIC_OTHER_ID,
@@ -90,6 +92,22 @@ async function main(): Promise<void> {
     }
     if (stack.failures.totalCalls() !== 0) {
       throw new Error('dry_run_called_external_boundaries');
+    }
+
+    // T22-Q5: preflight перед посевом — при чужих due-поколениях abort
+    // (код 2, счётчик в stderr без PII). Tick-обёртки сценария на живой БД
+    // обрабатывают ВСЕ due-аккаунты, поэтому чужие поколения не должны
+    // попасть в tick; посев при отказе не выполняется (finally-уборка по
+    // ещё не созданным фикстурам — no-op).
+    try {
+      assertSyntheticPreflight({ accounts: dryRun.accounts });
+    } catch (error) {
+      if (error instanceof SyntheticPreflightError) {
+        console.error(scriptErrorText(error));
+        process.exitCode = 2;
+        return;
+      }
+      throw error;
     }
 
     const fixture = await seedSyntheticFixture(stack);

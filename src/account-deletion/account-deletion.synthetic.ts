@@ -138,6 +138,25 @@ export function checkSyntheticGates(input: SyntheticGatesInput): void {
   if (input.hostname !== SYNTHETIC_GATE_HOSTNAME) throw new SyntheticGateError();
 }
 
+export class SyntheticPreflightError extends Error {
+  constructor(accounts: number) {
+    super(`synthetic_preflight_accounts_not_zero: ${accounts}`);
+  }
+}
+
+/**
+ * T22-Q5: preflight CLI перед посевом. Если dry-run видит ХОТЯ БЫ ОДНО
+ * due-поколение, abort (код 2): tick-обёртки на живой БД обрабатывают ВСЕ
+ * due-аккаунты, а не только синтетические фикстуры, и чужие поколения стенда
+ * сценарий трогать не должен. Сообщение несёт только счётчик — никаких
+ * userId/телефонов/deletionId (печать через scriptErrorText).
+ */
+export function assertSyntheticPreflight(summary: { accounts: number }): void {
+  if (summary.accounts !== 0) {
+    throw new SyntheticPreflightError(summary.accounts);
+  }
+}
+
 // ------------------------------------------------- fault-инъекция границ
 
 export type SyntheticFaultKind =
@@ -254,11 +273,18 @@ export interface SyntheticStack {
   /** Новый instance координатора — моделирование restart-а воркера. */
   makeCoordinator(): AccountDeletionCoordinator;
   /**
+   * Scope синтетических аккаунтов (T22-Q5): посевные функции добавляют сюда
+   * userId, simulateHostAgent подтверждает задания продуктов ТОЛЬКО из
+   * этого множества — queued-задания реальных продуктов стенда он трогать
+   * не должен.
+   */
+  readonly hostAgentScope: Set<string>;
+  /**
    * Симулятор host-агента (pull-модель продуктов): забирает queued
-   * sleep/purge задания и подтверждает их через ProvisioningService
-   * .completeJob — как настоящий агент машины. При активном отказе 'host'
-   * не делает ничего: задание остаётся в очереди, адаптер продукта честно
-   * уходит в retry.
+   * sleep/purge задания продуктов из hostAgentScope и подтверждает их через
+   * ProvisioningService.completeJob — как настоящий агент машины. При
+   * активном отказе 'host' не делает ничего: задание остаётся в очереди,
+   * адаптер продукта честно уходит в retry.
    */
   simulateHostAgent(): Promise<number>;
   /** Строка переписки с файлом в chat-files-бакете — вход recapture. */
@@ -533,13 +559,21 @@ export function createSyntheticStack(pg: PgService): SyntheticStack {
   lifecycle = new AccountDeletionLifecycle(pg, planner, jobs, registry, runner);
   const coordinator = new AccountDeletionCoordinator(pg, planner, jobs, runner);
 
+  // T22-Q5: подтверждения строго по scope синтетических аккаунтов; пустой
+  // scope — «ничего не подтверждать», иначе simulateHostAgent подтверждал
+  // бы queued-задания РЕАЛЬНЫХ продуктов стенда.
+  const hostAgentScope = new Set<string>();
+
   const simulateHostAgent = async (): Promise<number> => {
     if (failures.isActive('host')) return 0;
+    if (hostAgentScope.size === 0) return 0;
     const claimed = await pg.query(
       `UPDATE product_provision_jobs
           SET status='running', started_at=now()
         WHERE status='queued' AND kind IN ('sleep','purge')
+          AND product_id IN (SELECT id FROM products WHERE user_id = ANY($1))
         RETURNING id`,
+      [[...hostAgentScope]],
     );
     let done = 0;
     for (const row of claimed.rows) {
@@ -566,6 +600,7 @@ export function createSyntheticStack(pg: PgService): SyntheticStack {
     if (result.status !== 'ok') {
       throw new Error(`resolveOrCreate(${phone}) вернул ${result.status}`);
     }
+    hostAgentScope.add(phone);
     return { userId: phone };
   };
 
@@ -583,6 +618,7 @@ export function createSyntheticStack(pg: PgService): SyntheticStack {
     provisioning,
     schema,
     makeCoordinator: () => new AccountDeletionCoordinator(pg, planner, jobs, runner),
+    hostAgentScope,
     simulateHostAgent,
     seedHistoryRow,
     seedMinimalAccount,
@@ -703,6 +739,8 @@ export async function seedSyntheticFixture(stack: SyntheticStack): Promise<Synth
   const main = SYNTHETIC_MAIN_PHONE;
   const other = SYNTHETIC_OTHER_ID;
   const hist = SYNTHETIC_HIST_PHONE;
+  // T22-Q5: синтетические аккаунты — scope подтверждений simulateHostAgent.
+  for (const userId of [main, other, hist]) stack.hostAgentScope.add(userId);
 
   // Сосед — обычный активный аккаунт без удаления.
   await pg.query(
