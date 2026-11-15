@@ -1,13 +1,14 @@
-// Запасные провайдеры на релее: выбор пользователя (provider=qwen|kimi из
-// админки бэкенда) и аварийная цепочка Claude → Qwen → Kimi. Тот же claude и те
-// же аргументы — другие модель и окружение процесса. Спецификация — spirits_back
-// docs/superpowers/specs/2026-10-31-kimi-provider-design.md. Те же правила, что
-// у бэкенда (src/common/services/llm-fallback.ts, src/common/llm-error.ts):
-// меняешь здесь — сверь там.
+// Запасные провайдеры на релее: выбор пользователя (provider=qwen|kimi|codex из
+// админки бэкенда) и аварийная цепочка Claude → Qwen → Kimi → Codex. Тот же
+// claude и те же аргументы — другие модель и окружение процесса. Спецификации —
+// spirits_back docs/superpowers/specs/2026-10-31-kimi-provider-design.md,
+// 2026-11-14-codex-provider-design.md. Те же правила, что у бэкенда
+// (src/common/services/llm-fallback.ts, src/common/llm-error.ts): меняешь
+// здесь — сверь там.
 import fs from "node:fs";
 
-export const FALLBACK_ORDER = Object.freeze(["qwen", "kimi"]);
-export const PROVIDER_LABELS = Object.freeze({ claude: "Claude", qwen: "Qwen", kimi: "Kimi" });
+export const FALLBACK_ORDER = Object.freeze(["qwen", "kimi", "codex"]);
+export const PROVIDER_LABELS = Object.freeze({ claude: "Claude", qwen: "Qwen", kimi: "Kimi", codex: "Codex" });
 // Ключ — файлом (600): читается на каждом ходе, сменить можно без рестарта;
 // нет файла — провайдер на релее выключен целиком.
 export const PROVIDER_DEFAULTS = Object.freeze({
@@ -23,8 +24,16 @@ export const PROVIDER_DEFAULTS = Object.freeze({
     baseUrl: "https://api.kimi.ai/coding",
     models: Object.freeze({ opus: "k3.1-pro", sonnet: "k3.1-pro", haiku: "k3.1-pro" }),
   }),
+  // Локальный codex-bridge (spec 2026-11-14): ключ-заглушка local-bridge —
+  // мост аутентифицируется сам через ~/.codex/auth.json (подписка ChatGPT Pro).
+  codex: Object.freeze({
+    envPrefix: "CODEX",
+    keyFile: "/home/dv/file-agent/secrets/codex.key",
+    baseUrl: "http://127.0.0.1:8790",
+    models: Object.freeze({ opus: "gpt-6-astra", sonnet: "gpt-6-astra", haiku: "gpt-6-astra" }),
+  }),
 });
-export const NO_CONFIGS = Object.freeze({ qwen: null, kimi: null });
+export const NO_CONFIGS = Object.freeze({ qwen: null, kimi: null, codex: null });
 export const DEFAULT_BREAKER_MS = 5 * 60_000;
 export const STATS_WINDOW_MS = 15 * 60_000;
 // После этих инструментов ход можно переиграть у другого провайдера: последствий нет.
