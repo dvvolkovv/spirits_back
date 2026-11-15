@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { DELETION_RESOURCE_TYPES } from './account-deletion.safe';
+import { DELETION_RESOURCE_TYPES, SKIP_ONLY_RESOURCE_TYPES } from './account-deletion.safe';
 import type {
   AccountDeletionAdapter,
   DeletionResourceType,
@@ -28,6 +28,11 @@ export class AccountDeletionRegistry {
 
   assertReady(): void {
     for (const resourceType of DELETION_RESOURCE_TYPES) {
+      // Skip-only типы (T22.6): задачи таких типов не создаются — санитайзер
+      // отклоняет JOB ('unsafe_resource_type'), discoverer'ы эмитируют только
+      // skips, — поэтому исполнитель не требуется. getExecutor для них
+      // по-прежнему бросает 'deletion_executor_missing'.
+      if (SKIP_ONLY_RESOURCE_TYPES.has(resourceType)) continue;
       if (!this.executors.has(resourceType)) {
         throw new Error('deletion_registry_not_ready');
       }

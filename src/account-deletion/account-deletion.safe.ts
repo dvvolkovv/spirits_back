@@ -62,7 +62,14 @@ const DELETION_RESOURCE_TYPE_LIST = [
 ] as const satisfies readonly DeletionResourceType[];
 export const DELETION_RESOURCE_TYPES: ReadonlySet<DeletionResourceType> =
   new Set(DELETION_RESOURCE_TYPE_LIST);
-const SKIP_ONLY_RESOURCE_TYPES: ReadonlySet<DeletionResourceType> =
+/**
+ * Skip-only типы (T22.6): discoverer'ы эмитируют по ним только skips
+ * (video — 'unsupported_external', calendar — 'owner_unverifiable'), а
+ * safeDeletionJobSnapshot отклоняет JOB'ы этих типов ('unsafe_resource_type')
+ * — задача никогда не создаётся и исполнитель для неё недостижим. Поэтому
+ * registry.assertReady() не требует для них адаптер; экспорт — для реестра.
+ */
+export const SKIP_ONLY_RESOURCE_TYPES: ReadonlySet<DeletionResourceType> =
   new Set(['calendar.external', 'video.provider']);
 
 const FORBIDDEN_PAYLOAD_KEYS = new Set([
