@@ -16,7 +16,7 @@ export async function resolveAnswerProvider(
   return svc.route(userId ?? '');
 }
 
-/** Поля формы запроса к релею: проба — только Claude, выбор Qwen/Kimi — provider.
+/** Поля формы запроса к релею: проба — только Claude, выбор Qwen/Kimi/Codex — provider.
  *  У релея своего рубильника нет — модель приходит в каждом запросе. */
 export function relayProviderFields(probe: boolean, provider: LlmProvider): Record<string, string> {
   if (probe) return { noFallback: '1' };

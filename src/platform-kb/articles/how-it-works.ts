@@ -9,7 +9,7 @@ import type { KbArticle } from '../kb.types';
 // источник: третьи лица — spirits_front src/components/onboarding/LegalModal.tsx:580-771 (политика конфиденциальности)
 // источник: вспомогательные тексты OpenAI — src/voice/voice-improve.service.ts; src/calendar/calendar.service.ts:~724; src/app-widget/energy-focus.service.ts
 // источник: голос в Telegram — src/tg-bot/tg-voice.service.ts:34-58; расшифровки — voice_calls.transcript, src/admin/admin.service.ts:1866-1877; ключи Zoom/Taler ID — src/calendar/crypto.ts
-// источник: запасные модели Qwen и Kimi — src/common/services/llm-fallback.ts, relay-agent/llm-fallback.mjs
+// источник: запасные модели Qwen, Kimi и Codex — src/common/services/llm-fallback.ts, relay-agent/llm-fallback.mjs
 // OpenRouter не назван: в коде он запасной путь фоновых задач (src/neo4j/neo4j.service.ts, src/scheduler/profile-compaction.service.ts), но ключа OPENROUTER* в .env прода нет (02.11.2026) — путь мёртв
 // источник: обучение у Moonshot AI — политика конфиденциальности на лендинге (land_linkeon src/content/legal/ru.tsx, раздел 3)
 export const howItWorks: KbArticle = {

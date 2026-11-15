@@ -436,7 +436,7 @@ export class ClaudeCliService implements OnModuleInit {
   /**
    * План попыток (spec 2026-10-31-kimi-provider-design.md, раздел 3; и
    * 2026-10-31-global-llm-switch, разделы 1 и 3): личный выбор или рубильник,
-   * Claude, запасные Qwen → Kimi в порядке цепочки. С noFallback — одна
+   * Claude, запасные Qwen → Kimi → Codex в порядке цепочки. С noFallback — одна
    * модель: выбранная (если есть ключ) или Claude, без цепочки.
    */
   private async runRaw(prompt: string, opts: ClaudeCliOptions): Promise<CliRunResult> {
