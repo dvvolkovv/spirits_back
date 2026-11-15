@@ -167,9 +167,11 @@ export class ProfileService implements OnModuleInit {
     //
     // Отзыв доступа Apple и очистка связок входа — задачи конвейера
     // (integration.apple.stop и др., см. integration-account-deletion.adapter).
-    // Исходники загрузок чата (chat_uploads) конвейер пока не удаляет —
-    // интеграция вынесена в отдельную задачу; старый inline-вызов
-    // chatUploads.deleteForUser здесь сознательно не сохранён.
+    // Исходники загрузок чата (chat_uploads) удаляет конвейер: задача
+    // chat-upload.purge (chat-uploads/chat-upload-account-deletion.adapter.ts)
+    // исполняется после retention-окна; старый inline-вызов
+    // chatUploads.deleteForUser здесь сознательно не сохранён — он миновал бы
+    // fencing (реактивация/merge пропускали бы очистку).
     //
     // Rationale-комментарии про SQL ядра — в profile-account-deletion.adapter.ts,
     // про порядок stops→core и ветки begin — в account-deletion.lifecycle.ts.

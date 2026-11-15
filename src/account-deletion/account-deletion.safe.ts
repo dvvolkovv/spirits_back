@@ -33,6 +33,7 @@ const DELETION_RESOURCE_TYPE_LIST = [
   'voice.purge',
   'voice-document.purge',
   'chat-file.purge',
+  'chat-upload.purge',
   'image.purge',
   'video-job.purge',
   'video.provider',

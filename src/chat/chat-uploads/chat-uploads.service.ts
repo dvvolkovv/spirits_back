@@ -37,7 +37,9 @@ export interface ChatUploadDownload {
   sizeBytes: number;
 }
 
-const BUCKET = 'linkeon-chat-uploads';
+/** Приватный бакет исходников; экспортирован для адаптера удаления аккаунта. */
+export const CHAT_UPLOADS_BUCKET = 'linkeon-chat-uploads';
+const BUCKET = CHAT_UPLOADS_BUCKET;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const COLUMNS = 'id, user_id, session_id, original_name, mime, size_bytes, sha256, storage_key, created_at';
 

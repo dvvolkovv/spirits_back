@@ -390,6 +390,7 @@ maybePg('dryRunAccountDeletion — BEGIN READ ONLY против настояще
       );
       CREATE TABLE meeting_rooms (code text, closed_at timestamptz);
       CREATE TABLE custom_chat_history (id serial PRIMARY KEY, session_id text, content text);
+      CREATE TABLE chat_uploads (user_id text, storage_key text);
       CREATE TABLE generated_images (id bigserial PRIMARY KEY, user_id text);
       CREATE TABLE video_jobs (id uuid PRIMARY KEY, user_id text, kling_task_id text);
       CREATE TABLE speech_clips (id uuid PRIMARY KEY, user_id text);

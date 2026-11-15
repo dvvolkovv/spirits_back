@@ -6,6 +6,7 @@ import { discoverIntegrationDeletion } from '../integrations/integration-account
 import { discoverVoiceDeletion } from '../voice-call/voice-account-deletion.adapter';
 import { discoverVoiceDocuments } from '../voice-call/voice-document-account-deletion';
 import { discoverChatFiles } from '../chat/chat-files/chat-file-account-deletion.adapter';
+import { discoverChatUploads } from '../chat/chat-uploads/chat-upload-account-deletion.adapter';
 import { discoverImageDeletion } from '../misc/image-account-deletion.adapter';
 import { discoverVideoDeletion } from '../video/video-account-deletion.adapter';
 import { discoverSpeechDeletion } from '../speech/speech-account-deletion.adapter';
@@ -37,6 +38,10 @@ export const DELETION_DISCOVERERS: readonly DeletionDiscoverer[] = [
   discoverVoiceDeletion,
   discoverVoiceDocuments,
   discoverChatFiles,
+  // Phase 2: исходники загрузок чата (chat_uploads). Одна purge-задача на
+  // аккаунт, ключи читаются из таблицы при исполнении; правил зависимостей
+  // не нужно (нет stop-фазы и общего состояния, как у chat-file.purge).
+  discoverChatUploads,
   discoverImageDeletion,
   discoverVideoDeletion,
   discoverSpeechDeletion,

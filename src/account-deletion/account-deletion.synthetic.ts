@@ -36,6 +36,7 @@ import { IntegrationAccountDeletionAdapter } from '../integrations/integration-a
 import { VoiceAccountDeletionAdapter } from '../voice-call/voice-account-deletion.adapter';
 import { VoiceDocumentAccountDeletionAdapter } from '../voice-call/voice-document-account-deletion';
 import { ChatFileAccountDeletionAdapter } from '../chat/chat-files/chat-file-account-deletion.adapter';
+import { ChatUploadAccountDeletionAdapter } from '../chat/chat-uploads/chat-upload-account-deletion.adapter';
 import { ImageAccountDeletionAdapter } from '../misc/image-account-deletion.adapter';
 import { VideoAccountDeletionAdapter } from '../video/video-account-deletion.adapter';
 import { SpeechAccountDeletionAdapter } from '../speech/speech-account-deletion.adapter';
@@ -524,6 +525,7 @@ export function createSyntheticStack(pg: PgService): SyntheticStack {
     new VoiceAccountDeletionAdapter(voice, attendee as any, registry),
     new VoiceDocumentAccountDeletionAdapter(storage, registry),
     new ChatFileAccountDeletionAdapter(storage, registry),
+    new ChatUploadAccountDeletionAdapter(storage, registry),
     new ImageAccountDeletionAdapter(misc as any, registry),
     new VideoAccountDeletionAdapter(video as any, registry),
     new SpeechAccountDeletionAdapter(speech as any, registry),
