@@ -161,12 +161,23 @@ export class AdminService implements OnModuleInit {
     if (!userId) throw new Error('userId required');
     if (!Number.isInteger(assistantId) || assistantId <= 0) throw new Error('assistantId required');
     if (!body) throw new Error('text required');
+    // Гейт на живой аккаунт (образец — chat.service.ts saveAssistantMessageRow,
+    // Task 11): вставка без проверки state воскрешала строку истории
+    // удалённого поколения после core.purge. INSERT ... SELECT ... WHERE
+    // EXISTS атомарен: удаление, гонящееся с этим вызовом, не оставит строку.
+    // userId — ПОСЛЕДНИЙ параметр: позиции session/agent/content, на которые
+    // смотрят существующие спеки, не меняются. Отказ — явная ошибка,
+    // контроллер транслирует её в 400.
     const r = await this.pg.query(
       `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
-       VALUES ($1, 'ai', $2, $3, 'text', 0)
+       SELECT $1, 'ai', $2, $3, 'text', 0
+       WHERE EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $4 AND u.state = 'active')
        RETURNING id, created_at`,
-      [`${userId}_${assistantId}`, assistantId, body],
+      [`${userId}_${assistantId}`, assistantId, body, userId],
     );
+    if ((r.rowCount ?? r.rows?.length ?? 0) === 0) {
+      throw new Error('recipient account is not active');
+    }
     this.logger.log(`сообщение ассистента ${assistantId} положено в чат (${body.length} знаков)`);
     return { ok: true, id: r.rows[0]?.id, createdAt: r.rows[0]?.created_at };
   }
