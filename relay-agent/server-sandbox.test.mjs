@@ -126,7 +126,6 @@ async function fixture(t, options = {}) {
     sandboxCanaryFile,
     drainPath: path.join(root, "drain"),
     retryDelayMs: 0,
-    turnTimeoutMs: options.turnTimeoutMs,
     fileOps: options.fileOps,
     ensureSessionDirsImpl: options.ensureSessionDirsImpl,
     ensureListingGuardImpl: options.ensureListingGuardImpl,
@@ -715,15 +714,6 @@ test("max turns requires a new user message, never silently starts a second paid
   assert.equal(doneEvent(text).failReason, "max_turns");
 });
 
-test("deadline kills a stalled child and completes the response without charging or retry", async (t) => {
-  const f = await fixture(t, { turnTimeoutMs: 30, onSpawn: () => {} });
-  const { text } = await f.request();
-  assert.equal(f.calls.length, 1);
-  assert.equal(f.calls[0].child.killed, true);
-  assert.equal(doneEvent(text).failReason, "turn_timeout");
-  assert.equal(doneEvent(text).failed, true);
-});
-
 test("unknown CLI tariff is diagnostic only; cumulative estimate cannot reach legacy billing", async (t) => {
   let f;
   f = await fixture(t, { onSpawn: ({ child }) => {
@@ -753,18 +743,4 @@ test("known CLI tariff remains billable with the exact current-run cost", async 
   const done = doneEvent((await f.request()).text);
   assert.equal(done.turnCostUsd, 0.25);
   assert.equal(done.costBasis, "cli_tariff");
-});
-
-test("deadline applies after transient retries and cannot trigger another fallback", async (t) => {
-  const f = await fixture(t, { turnTimeoutMs: 60, fallback: true,
-    onSpawn: ({ child }, index) => {
-      if (index === 0) finishChild(child, [{ type: "result", subtype: "error_during_execution", is_error: true,
-        result: "API Error: 503 Service Unavailable", session_id: "retry-timeout" }]);
-    },
-  });
-  const done = doneEvent((await f.request()).text);
-  assert.equal(f.calls.length, 2);
-  assert.equal(f.calls[1].child.killed, true);
-  assert.equal(done.failReason, "turn_timeout");
-  assert.equal(done.failed, true);
 });

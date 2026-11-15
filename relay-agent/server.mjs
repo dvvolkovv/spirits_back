@@ -43,7 +43,6 @@ export function createRelayApp({
   sandboxCanaryFile,
   drainPath = env.RELAY_DRAIN_FILE || "/tmp/linkeon-relay-drain",
   retryDelayMs = 1500,
-  turnTimeoutMs = 600_000,
   fileOps = fs,
   ensureSessionDirsImpl = ensureSessionDirs,
   ensureListingGuardImpl = ensureListingGuard,
@@ -835,7 +834,6 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   let turnCostUsd = 0;
   let turnCostKnown = true;
   let unknownModelCost = false;
-  const turnDeadline = Date.now() + turnTimeoutMs;
   // Наибольший контекст среди запросов этого хода — по нему решаем, не пора ли
   // сессии на покой. См. блок «Ограничение по измеренному контексту» ниже.
   let maxTurnContext = 0;
@@ -923,9 +921,8 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   // закрытый канал. План кончился за время хода — уведомление, которое разбор
   // result придержал.
   async function runOnce(useResume, runProvider = provider) {
-    if (failReason === "turn_timeout") return {};
     const r = await runProcessOnce(useResume, runProvider);
-    if (!r.switchHit || preempted || clientDisconnected || failReason === "turn_timeout") return r;
+    if (!r.switchHit || preempted || clientDisconnected) return r;
     const next = switchProvider(useResume, r.switchWhy, r.switchDetail);
     if (next) return next;
     const fatal = FATAL_RE.test(r.switchText);
@@ -988,12 +985,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
       });
       // exit, а не close: close ждёт, пока закроются все копии stdout, и
       // потомок, унаследовавший его, задержал бы и уборку, и ответ.
-      const timeout = setTimeout(() => {
-        notice("\n\n_(не удалось завершить работу за отведённое время. Токены за этот ход не списаны. Уточните оставшуюся задачу отдельным сообщением.)_", "turn_timeout");
-        try { child.kill("SIGKILL"); } catch {}
-        endRun(tag);
-      }, Math.max(1, turnDeadline - Date.now()));
-      child.on("exit", () => { clearTimeout(timeout); endRun(tag); });
+      child.on("exit", () => endRun(tag));
       activeChildren.set(sessionId, {
         child,
         // preempted — прерванный ход у другого провайдера не переигрывается.
@@ -1210,7 +1202,6 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
       });
 
       child.on("close", () => {
-        clearTimeout(timeout);
         if (buf.trim()) { try { handleEvent(JSON.parse(buf)); } catch {} }
         const costRecord = readCostRecord(sessionJsonlPath(sessionMap.get(sessionId) || ""));
         if (!hasKnownModelCost(runProvider, costRecord)) {
@@ -1227,7 +1218,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
         // с ошибкой без текста (error_during_execution) — уступает обычному пути, как
         // и любой другой его сбой; staleResumeHit и прерванный/брошенный ход — свои
         // ветки, здесь не дублируем.
-        if (runProvider === selected && selected && (!gotResult || errorNoText) && !staleResumeHit && !preempted && !clientDisconnected && failReason !== "turn_timeout" &&
+        if (runProvider === selected && selected && (!gotResult || errorNoText) && !staleResumeHit && !preempted && !clientDisconnected &&
             llm.nextStep(plan, planStep, fallbackState) >= 0 &&
             llm.mayAdvance({ failed: runProvider, selected, accessFailure: false, sentAnyText: streamedAny, riskyToolUsed })) {
           switchHit = true;
@@ -1239,7 +1230,6 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
       });
 
       child.on("error", (err) => {
-        clearTimeout(timeout);
         // Если claude не запустился, exit не придёт — метку снимаем здесь.
         endRun(tag);
         // Network/spawn errors are transient too
@@ -1356,7 +1346,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
     // закрывает окно Claude (Claude мог уже ожить). Не считаются ходы с
     // неизвестным исходом — прерванный новым сообщением, брошенный бэкендом,
     // упёршийся в потолок шагов.
-    if (!preempted && !clientDisconnected && failReason !== "max_turns" && failReason !== "turn_timeout") {
+    if (!preempted && !clientDisconnected && failReason !== "max_turns") {
       const runOk = !!r.sawResult && !r.switchHit && !r.transientHit;
       if (provider === "claude") {
         if (runOk) fallbackState.claudeSucceeded(r.startedAt);
