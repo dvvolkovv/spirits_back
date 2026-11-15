@@ -1,4 +1,4 @@
-import { ServiceUnavailableException } from '@nestjs/common';
+import { Logger, ServiceUnavailableException } from '@nestjs/common';
 import { AccountDeletionLifecycle, EXPLICIT_DELETION_UNAVAILABLE } from './account-deletion.lifecycle';
 import { AccountDeletionRunner } from './account-deletion.runner';
 import { DeletionRetryError } from './account-deletion.safe';
@@ -443,6 +443,33 @@ describe('account deletion lifecycle (Task 18, unit)', () => {
     // остаётся failed, и lifecycle обязан это увидеть пост-проверкой.
     expect(stack.coreRow!.status).toBe('failed');
     expect(stack.coreRow!.lastErrorKind).toBe('db');
+  });
+
+  it('warn о неуспешном core хранит настоящие attempts и kind (T18-M4/M2)', async () => {
+    // T18-M4: safeDeletionMessage получал захардкоженный attempts: 0 — лог
+    // врал о числе попыток. T18-M2: cancelled-строка больше не retry('db'), а
+    // DeletionCancelledError(kind='cancelled') — runJob бросает его ДО
+    // executor, поэтому runner здесь не ворнит и единственный warn —
+    // lifecycle-овский (иначе сообщения почти идентичны и тест был бы
+    // ложно-зелёным).
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    try {
+      const core = makeCoreRow('cancelled');
+      core.attempts = 3;
+      const stack = makeStack({ user: activeUser(), core });
+
+      await expect(stack.lifecycle.deleteExplicit(USER))
+        .rejects.toBeInstanceOf(ServiceUnavailableException);
+
+      const logged = warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((message) => message.includes('type=account.core.immediate'));
+      expect(logged).toHaveLength(1);
+      expect(logged[0]).toContain('attempt=3');
+      expect(logged[0]).toContain('kind=cancelled');
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('assertReady не готов — ошибка всплывает как есть, begin не вызывается', async () => {

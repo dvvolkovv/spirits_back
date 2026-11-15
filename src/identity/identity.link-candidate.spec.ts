@@ -22,6 +22,17 @@ class FakePg {
     this.queries.push({ sql, params });
     return this.handler(sql, params) ?? { rows: [] };
   }
+  /**
+   * Task 19 — перенос идентичностей при merge идёт внутри транзакции
+   * (inTransaction(pg)): без getClient фейк не совместим с настоящим путём.
+   * Запросы транзакции попадают в тот же handler и в тот же журнал.
+   */
+  async getClient() {
+    return {
+      query: (sql: string, params?: any[]) => this.query(sql, params ?? []),
+      release: () => undefined,
+    };
+  }
   /** Был ли запрос, создающий НОВУЮ строку пользователя. */
   get createdUser(): boolean {
     return this.queries.some((q) => /INSERT INTO user_id\b/i.test(q.sql));
@@ -165,6 +176,35 @@ describe('resolveOrCreate — кандидат на привязку вмест�
 });
 
 describe('mergeAccounts — баланс и история не должны сгорать', () => {
+  /**
+   * Task 19 — merge больше не помечает deleted напрямую: loser уходит через
+   * deletion lifecycle (begin(loser,'merge') → stopOnly → перенос под
+   * assertCurrent). Фейк пишет вызовы в ТОТ ЖЕ журнал, что и SQL, чтобы
+   * порядок credit-first → begin → stop → move проверялся одной лентой.
+   */
+  function deletionFake(calls: { sql: string; params: any[] }[]) {
+    return {
+      begin: jest.fn(async (loserUserId: string, origin: string) => {
+        calls.push({ sql: 'lifecycle.begin', params: [loserUserId, origin] });
+        return {
+          userId: loserUserId,
+          deletionId: 'd-merge-1',
+          deletedAt: new Date('2026-11-01T00:00:00.000Z'),
+        };
+      }),
+      stopOnly: jest.fn(async (deletionId: string) => {
+        calls.push({ sql: 'lifecycle.stopOnly', params: [deletionId] });
+      }),
+      assertCurrent: jest.fn(async () => {
+        calls.push({ sql: 'lifecycle.assertCurrent', params: [] });
+      }),
+    };
+  }
+
+  function moduleRefFake(deletion: unknown) {
+    return { get: () => deletion };
+  }
+
   it('переносит баланс на целевой аккаунт перед пометкой deleted', async () => {
     // Прод 21.09.2026: на a375a4db и a752d49a, помеченных deleted прошлыми
     // слияниями, осталось 47 458 токенов — их не перенёс никто.
@@ -176,7 +216,10 @@ describe('mergeAccounts — баланс и история не должны с�
       }
       return { rows: [] };
     });
-    const svc = new IdentityService(pg as any);
+    const deletion = deletionFake(calls);
+    const svc = new IdentityService(
+      pg as any, undefined, undefined, moduleRefFake(deletion) as any,
+    );
 
     await svc.mergeAccounts('orphan-1', 'target-1');
 
@@ -189,26 +232,78 @@ describe('mergeAccounts — баланс и история не должны с�
     expect(addCalls[1].params).toEqual(expect.arrayContaining(['orphan-1', -8897]));
 
     // Порядок важен: пометить deleted раньше переноса — потерять баланс.
-    const deletedAt = calls.findIndex((c) => /state = 'deleted'/i.test(c.sql));
+    // С Task 19 пометку (поколение удаления) ставит lifecycle.begin, поэтому
+    // точка отсчёта — его вызов, а не прямой UPDATE.
     const lastAdd = calls.map((c) => /add_user_tokens/i.test(c.sql)).lastIndexOf(true);
-    expect(lastAdd).toBeLessThan(deletedAt);
+    const beginIdx = calls.findIndex((c) => c.sql === 'lifecycle.begin');
+    expect(beginIdx).toBeGreaterThan(-1);
+    expect(lastAdd).toBeLessThan(beginIdx);
+    expect(deletion.begin).toHaveBeenCalledWith('orphan-1', 'merge');
+
+    // Фиксированный порядок Task 19: begin → stopOnly → move-транзакция
+    // (assertCurrent → перенос идентичностей). Внешние стопы — до переноса:
+    // apple.revokeToken читает provider_refresh_token из user_identities loser.
+    const stopIdx = calls.findIndex((c) => c.sql === 'lifecycle.stopOnly');
+    const assertIdx = calls.findIndex((c) => c.sql === 'lifecycle.assertCurrent');
+    const moveIdx = calls.findIndex((c) =>
+      /UPDATE\s+user_identities\s+SET\s+user_id/i.test(c.sql));
+    expect(deletion.stopOnly).toHaveBeenCalledWith('d-merge-1');
+    expect(stopIdx).toBeGreaterThan(beginIdx);
+    expect(assertIdx).toBeGreaterThan(stopIdx);
+    expect(moveIdx).toBeGreaterThan(assertIdx);
+
+    // Tombstone слитого аккаунта зачищается под защитой поколения: хэш пароля,
+    // профильная почта и маркер приветственного бонуса — с тем же deletion_id.
+    const tombstone = calls.find((c) => /password_hash\s*=\s*NULL/i.test(c.sql));
+    expect(tombstone).toBeDefined();
+    expect(tombstone!.sql).toMatch(/state\s*=\s*'deleted'/i);
+    expect(tombstone!.params).toEqual(
+      expect.arrayContaining(['orphan-1', 'd-merge-1']),
+    );
+
+    // Прямого UPDATE state='deleted' из mergeAccounts больше нет — поколение
+    // создаёт lifecycle.begin (на реальной БД это покрыто merge-deletion.pg.spec).
+    expect(calls.some((c) =>
+      /UPDATE\s+user_id\s+SET\s+state\s*=\s*'deleted'/i.test(c.sql))).toBe(false);
   });
 
   it('не зовёт add_user_tokens на нулевом балансе', async () => {
-    const calls: string[] = [];
-    const pg = new FakePg((sql) => {
-      calls.push(sql);
+    const calls: { sql: string; params: any[] }[] = [];
+    const pg = new FakePg((sql, params) => {
+      calls.push({ sql, params });
       if (/SELECT[\s\S]*tokens[\s\S]*FROM ai_profiles_consolidated/i.test(sql)) {
         return { rows: [{ tokens: 0 }] };
       }
       return { rows: [] };
     });
-    const svc = new IdentityService(pg as any);
+    const deletion = deletionFake(calls);
+    const svc = new IdentityService(
+      pg as any, undefined, undefined, moduleRefFake(deletion) as any,
+    );
 
     await svc.mergeAccounts('orphan-2', 'target-2');
 
-    expect(calls.some((s) => /add_user_tokens/i.test(s))).toBe(false);
-    expect(calls.some((s) => /state = 'deleted'/i.test(s))).toBe(true);
+    expect(calls.some((c) => /add_user_tokens/i.test(c.sql))).toBe(false);
+    // Пометка deleted + deletion_id — через lifecycle (begin c merge-origin),
+    // а не прямым UPDATE.
+    expect(deletion.begin).toHaveBeenCalledWith('orphan-2', 'merge');
+    expect(calls.some((c) =>
+      /UPDATE\s+user_id\s+SET\s+state\s*=\s*'deleted'/i.test(c.sql))).toBe(false);
+  });
+
+  it('без deletion lifecycle merge отказывается: полу-удалённых аккаунтов нет', async () => {
+    // Guard в начале mergeAccounts: без lifecycle нельзя ни создать поколение,
+    // ни исполнить стопы — явная ошибка вместо тихой половины пути. В проде
+    // AccountDeletionModule @Global и lifecycle есть всегда; ветка достижима
+    // только в unit-контурах и при сломанном DI.
+    const pg = new FakePg(() => ({ rows: [] }));
+    const svc = new IdentityService(pg as any);
+
+    await expect(svc.mergeAccounts('orphan-3', 'target-3'))
+      .rejects.toThrow(/deletion lifecycle/i);
+    // Ничего не перенесено и никто не помечен.
+    expect(pg.queries.some((q) => /add_user_tokens/i.test(q.sql))).toBe(false);
+    expect(pg.queries.some((q) => /UPDATE\s+user_identities/i.test(q.sql))).toBe(false);
   });
 });
 
