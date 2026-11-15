@@ -19,7 +19,7 @@ import fs from "fs";
 const TAIL_BYTES = 1024 * 1024;
 
 /** totalCostUSD последней записи cost-state в тексте транскрипта; null — записей нет. */
-export function lastCostState(text) {
+export function lastCostRecord(text) {
   let end = text.length;
   while (end > 0) {
     const start = text.lastIndexOf("\n", end - 1) + 1;
@@ -27,7 +27,7 @@ export function lastCostState(text) {
     if (line.includes('"cost-state"')) {
       try {
         const e = JSON.parse(line);
-        if (e && e.type === "cost-state" && typeof e.totalCostUSD === "number") return e.totalCostUSD;
+        if (e && e.type === "cost-state" && Number.isFinite(e.totalCostUSD) && e.totalCostUSD >= 0) return e;
       } catch { /* оборванная строка на границе хвоста или мусор */ }
     }
     end = start - 1;
@@ -35,13 +35,17 @@ export function lastCostState(text) {
   return null;
 }
 
-/**
- * База хода: сколько CLI насчитал сессии до запуска.
- * 0 — записей cost-state нет: сессия старше CLI 2.1.280 или ни один запуск не
- * дошёл до конца, и CLI начнёт счёт с нуля.
- * null — транскрипт не прочитался: базы нет, и стоимость хода назвать нельзя.
- */
-export function costBaseline(file) {
+export function lastCostState(text) {
+  return lastCostRecord(text)?.totalCostUSD ?? null;
+}
+
+/** CLI prices unknown providers using a fallback tariff. Never call it a vendor cost. */
+export function hasKnownModelCost(provider, record) {
+  return provider === "claude" && record !== null && record.hasUnknownModelCost !== true;
+}
+
+/** Last valid cost record, including tariff quality; null when absent or unreadable. */
+export function readCostRecord(file) {
   try {
     const size = fs.statSync(file).size;
     if (size > TAIL_BYTES) {
@@ -49,14 +53,14 @@ export function costBaseline(file) {
       try {
         const buf = Buffer.alloc(TAIL_BYTES);
         const n = fs.readSync(fd, buf, 0, TAIL_BYTES, size - TAIL_BYTES);
-        const found = lastCostState(buf.subarray(0, n).toString("utf8"));
+        const found = lastCostRecord(buf.subarray(0, n).toString("utf8"));
         if (found !== null) return found;
       } finally {
         fs.closeSync(fd);
       }
     }
-    const found = lastCostState(fs.readFileSync(file, "utf8"));
-    return found === null ? 0 : found;
+    const found = lastCostRecord(fs.readFileSync(file, "utf8"));
+    return found;
   } catch {
     return null;
   }
@@ -69,4 +73,11 @@ export function costBaseline(file) {
  */
 export function runCost(total, base) {
   return Math.max(0, total - base);
+}
+
+/** Cost before this run: zero for a readable legacy transcript, null when unreadable. */
+export function costBaseline(file) {
+  const record = readCostRecord(file);
+  if (record) return record.totalCostUSD;
+  try { fs.accessSync(file, fs.constants.R_OK); return 0; } catch { return null; }
 }
