@@ -119,13 +119,20 @@ const KNOWN_DEBT: Record<string, { writes: number; what: string }> = {
   // (smm/scenarios/scenarios.controller.ts). Долг закрыт не выплатой, а
   // удалением должника — оба пути больше не существуют. Список сокращён по
   // правилу из шапки: «уменьшилось — строку удалить».
-  'profile/profile.service.ts': {
+  // 16.11.2026: долг не вырос и не закрыт — ПЕРЕЕХАЛ файл. Удаление аккаунта
+  // перенесено в конвейер AccountDeletion (Phase 1-2), и та же запись
+  // обнуления переехала из profile.service.ts в purge-адаптер
+  // profile-account-deletion.adapter.ts, где теперь стоит под generation
+  // predicate. Правило шапки («уменьшилось — строку удалить») здесь не
+  // применимо: число записей не изменилось, изменился их адрес.
+  'profile/profile-account-deletion.adapter.ts': {
     writes: 1,
     what:
       'Удаление аккаунта обнуляет баланс (`tokens = 0`) вместе с остальными ' +
-      'полями. Это не списание за услугу, но баланс исчезает, а реестр ' +
-      'продолжает объяснять его как имеющийся. Отдельный вопрос — нужна ли ' +
-      'строка в реестре у аккаунта, который стирают.',
+      'полями tombstone-записи — теперь в purge-адаптере конвейера удаления, ' +
+      'под generation predicate. Это не списание за услугу, но баланс ' +
+      'исчезает, а реестр продолжает объяснять его как имеющийся. Отдельный ' +
+      'вопрос — нужна ли строка в реестре у аккаунта, который стирают.',
   },
 };
 
@@ -334,7 +341,9 @@ describe('Поиск обходов', () => {
         'base/migrations/001_core_schema.sql',
         'misc/misc.service.ts',
         'products/rent.service.ts',
-        'profile/profile.service.ts',
+        // 16.11.2026: та же запись обнуления, переехавшая из profile.service.ts
+        // в purge-адаптер конвейера удаления (см. KNOWN_DEBT).
+        'profile/profile-account-deletion.adapter.ts',
         'scheduler/token-accounting.service.ts',
         'tg-bot/tg-billing.service.ts',
         'tokens/migrations/001_add_user_tokens_lock.sql',
