@@ -45,6 +45,7 @@ const ALL_DELETION_RESOURCE_TYPES = [
   'voice.purge',
   'voice-document.purge',
   'chat-file.purge',
+  'chat-upload.purge',
   'image.purge',
   'video-job.purge',
   'video.provider',
@@ -150,8 +151,8 @@ describe('account deletion safety', () => {
       execute: async () => undefined,
     };
 
-    expect(ALL_DELETION_RESOURCE_TYPES).toHaveLength(46);
-    expect(new Set(ALL_DELETION_RESOURCE_TYPES).size).toBe(46);
+    expect(ALL_DELETION_RESOURCE_TYPES).toHaveLength(47);
+    expect(new Set(ALL_DELETION_RESOURCE_TYPES).size).toBe(47);
     expect(validJob.resourceType).toBe('chat-file.purge');
     expect(validSkip.resourceType).toBe('calendar.external');
     expect(adapter.resourceTypes).toBe(ALL_DELETION_RESOURCE_TYPES);
@@ -438,8 +439,8 @@ describe('account deletion hardening regressions', () => {
       .toThrow(/^unsafe_payload$/);
   });
 
-  it('экспортирует runtime Set всех 46 resource types', () => {
-    expect(DELETION_RESOURCE_TYPES.size).toBe(46);
+  it('экспортирует runtime Set всех 47 resource types', () => {
+    expect(DELETION_RESOURCE_TYPES.size).toBe(47);
     for (const resourceType of ALL_DELETION_RESOURCE_TYPES) {
       expect(DELETION_RESOURCE_TYPES.has(resourceType)).toBe(true);
     }

@@ -16,6 +16,7 @@ import { discoverIntegrationDeletion } from '../integrations/integration-account
 import { discoverVoiceDeletion } from '../voice-call/voice-account-deletion.adapter';
 import { discoverVoiceDocuments } from '../voice-call/voice-document-account-deletion';
 import { discoverChatFiles } from '../chat/chat-files/chat-file-account-deletion.adapter';
+import { discoverChatUploads } from '../chat/chat-uploads/chat-upload-account-deletion.adapter';
 import { discoverImageDeletion } from '../misc/image-account-deletion.adapter';
 import { discoverVideoDeletion } from '../video/video-account-deletion.adapter';
 import { discoverSpeechDeletion } from '../speech/speech-account-deletion.adapter';
@@ -415,6 +416,7 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       discoverVoiceDeletion,
       discoverVoiceDocuments,
       discoverChatFiles,
+      discoverChatUploads,
       discoverImageDeletion,
       discoverVideoDeletion,
       discoverSpeechDeletion,
@@ -486,6 +488,10 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       sameResourceKey: ['legacy-smm.stop'],
     });
     expect(DELETION_DEPENDENCIES['legacy-smm.stop']).toBeUndefined();
+    // Phase 2 (chat_uploads): у chat-upload.purge нет stop-фазы и общего
+    // состояния с другими задачами (как у chat-file.purge) — правило не нужно,
+    // срок назначает planner (deletedAt + retention).
+    expect(DELETION_DEPENDENCIES['chat-upload.purge']).toBeUndefined();
   });
 
   describe('assertCurrent', () => {
