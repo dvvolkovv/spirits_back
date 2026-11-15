@@ -9,7 +9,7 @@ import type { KbArticle } from '../kb.types';
 // источник: третьи лица — spirits_front src/components/onboarding/LegalModal.tsx:580-771 (политика конфиденциальности)
 // источник: вспомогательные тексты OpenAI — src/voice/voice-improve.service.ts; src/calendar/calendar.service.ts:~724; src/app-widget/energy-focus.service.ts
 // источник: голос в Telegram — src/tg-bot/tg-voice.service.ts:34-58; расшифровки — voice_calls.transcript, src/admin/admin.service.ts:1866-1877; ключи Zoom/Taler ID — src/calendar/crypto.ts
-// источник: запасные модели Qwen и Kimi — src/common/services/llm-fallback.ts, relay-agent/llm-fallback.mjs
+// источник: запасные модели Qwen, Kimi и Codex — src/common/services/llm-fallback.ts, relay-agent/llm-fallback.mjs
 // OpenRouter не назван: в коде он запасной путь фоновых задач (src/neo4j/neo4j.service.ts, src/scheduler/profile-compaction.service.ts), но ключа OPENROUTER* в .env прода нет (02.11.2026) — путь мёртв
 // источник: обучение у Moonshot AI — политика конфиденциальности на лендинге (land_linkeon src/content/legal/ru.tsx, раздел 3)
 export const howItWorks: KbArticle = {
@@ -40,7 +40,7 @@ export const howItWorks: KbArticle = {
 ## Кто видит
 - Другие пользователи видят личный профиль, если это разрешено настройками. При выключенном автосборе видны только явно указанные анкетные данные; при выключенном поиске новые люди профиль не находят, а существующие контакты и переписки сохраняются. Телефон и почта раскрываются по ${q('contactVisibility')} или принятому запросу.
 - Команда Linkeon — обращения, жалобы и расшифровки звонков и встреч для разбора сбоев.
-- Поставщикам нейросетей уходит то, что нужно для ответа: сообщения, переписка, профиль и файлы. Это Anthropic, OpenAI, Google, ElevenLabs, Яндекс, а также Alibaba Cloud (Qwen) и Moonshot AI (Kimi) — в том числе за пределами страны пользователя. Moonshot AI по своим условиям вправе после обезличивания обучать на присланном свои модели. Данные не продаются.
+- Поставщикам нейросетей уходит то, что нужно для ответа: сообщения, переписка, профиль и файлы. Это Anthropic, OpenAI, Google, ElevenLabs, Яндекс, а также Alibaba Cloud (Qwen), Moonshot AI (Kimi) и OpenAI (Codex) — в том числе за пределами страны пользователя. Moonshot AI по своим условиям вправе после обезличивания обучать на присланном свои модели. Данные не продаются.
 - Номер телефона нейросетям не передаётся; ИИ-поддержке видны имя и почта, чтобы помочь с аккаунтом.
 - На сайте — Яндекс Метрика (Вебвизор записывает сеансы, личные данные на экранах скрыты) и VK Ads.
 

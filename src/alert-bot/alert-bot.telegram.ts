@@ -132,6 +132,8 @@ export class AlertBotTelegram {
       { command: 'ask', description: 'Спросить бота' },
       { command: 'status', description: 'Сводка без модели' },
       { command: 'close', description: 'Закрыть тикет' },
+      { command: 'fix', description: 'Исправить по задаче' },
+      { command: 'stop', description: 'Остановить исправление' },
     ];
     await this.call('setMyCommands', { commands, scope: { type: 'all_private_chats' } });
     await this.call('setMyCommands', { commands, scope: { type: 'all_group_chats' } });

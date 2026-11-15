@@ -429,6 +429,14 @@ cd ~/Downloads/spirits_back/tests && node runner.js  # api (32) + e2e (18) = 50
   ssh dvolkov@212.113.106.202 'cd ~/spirits_back && umask 077 && node -e "require(\"dotenv\").config(); const t = require(\"./dist/mcp/linkeon-tool.token\").signLinkeonToolToken(\"70000000000\"); process.stdout.write(\"Authorization: Bearer \" + t + \"\\n\")" > /tmp/lt.hdr && curl -s -m 20 -X POST http://127.0.0.1:3001/webhook/mcp/linkeon -H @/tmp/lt.hdr -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}" | grep -o "\"name\":\"[a-z_]*\"" | head -3; rm -f /tmp/lt.hdr'
   ```
 
+### Память загрузок (`src/chat/chat-uploads`, спека `docs/superpowers/specs/2026-11-13-chat-upload-memory-design.md`)
+Ассистент помнит исходные файлы пользователя. Реестр — таблица Postgres `chat_uploads` (миграцию применяет сам `ChatUploadsModule` при старте), байты — **приватный** bucket MinIO `linkeon-chat-uploads`: никаких анонимных политик, даже точечного `s3:GetObject`, — чтение только через бэкенд.
+- **Флаг `CHAT_UPLOADS_ENABLED`** (env): по умолчанию выключен. Без него реестр не опрашивается и блок в prompt не подставляется; прежний multipart-путь загрузок работает как раньше
+- Доступ владельца: `GET /webhook/chat-uploads/:id` с JWT; чужой id — 404 без раскрытия существования записи. Доступ ассистента: тот же роут с `?exp=<unix>&sig=<hmac>` — HMAC-SHA256 от `chat-upload:v1:<id>:<exp>` на `JWT_SECRET`, TTL 1 час, новая подпись чеканится каждый ход. Подписанная ссылка пользователю не показывается — она только для чтения моделью (блок `Earlier user uploads`, до 10 последних загрузок сессии, только в пер-ходовой части prompt — не в `stablePrefix`)
+- Удаление аккаунта: `ProfileService.deleteProfile` до удаления истории вызывает `ChatUploadsService.deleteForUser` — сначала объекты MinIO (терпится только NotFound), затем `DELETE FROM chat_uploads`; иная ошибка MinIO срывает удаление, строки хранятся для повтора
+- Откат: `CHAT_UPLOADS_ENABLED=false` + redeploy; сохранённые байты и строки не удаляются (их уносит только удаление аккаунта)
+- **Чек-лист включения фичи на сервере** (оба шага ручные, вне репо): 1) добавить бакет в политику MinIO `smm-rw` (её JSON живёт на сервере — см. `docs/dr-runbook.md`), иначе PutObject под ключом приложения молча возвращает `Access Denied`; 2) добавить `linkeon-chat-uploads` в `BUCKETS` серверного `minio-mirror.sh` (прод, `/home/dvolkov/backups/linkeon/`), иначе DR-зеркало на node-3 не покрывает исходники — до этого шага команда восстановления бакета в ранбуке описывает целевое состояние и вернёт пусто
+
 ### Проба без входа (`src/guest-trial`, на проде с 31.10.2026)
 Новое устройство на `/` или `/chat` веб-кабинета получает несколько ответов ассистента до входа; после входа разговор переезжает в аккаунт. Спека — `docs/superpowers/specs/2026-10-30-guest-trial-design.md`. Кому проба, решает кабинет (`spirits_front/src/components/guest/decideUnauthEntry.ts`): в Capacitor, на других адресах и на устройстве, где уже входили, — экран входа.
 - `GET /webhook/guest/config` — `{mode, answersPerTrial, maxChars}`; `POST /webhook/guest/chat` — ход гостя (NDJSON, как чат; та же `CHAT_MODEL`, без инструментов и без запасного Qwen, `--no-session-persistence`, пустой cwd `/tmp/linkeon-claude-empty`); `POST /webhook/guest/session` `{token}` — разговор пробы после перезагрузки. Все три — без входа: чужой `Origin` (не my/test.linkeon.io и не localhost) → 403, тело больше 64 КБ → 413
@@ -529,7 +537,7 @@ Synthetic-раннер шлёт отчёты на `SYNTHETIC_PUSH_URL` — на 
 
 `@linkeon_alert_bot` принимает вопросы только от админов Linkeon (Telegram привязан в профиле): в личке и в группах из `TELEGRAM_CHAT_ID`. В группе — `/ask@… вопрос` или реплай на сообщение бота. `/status` работает без модели; реплай на эскалацию — черновик с кнопками «Отправить пользователю», «Это вопрос боту», «Отмена»; `/close #…` закрывает тикет.
 
-Вход включается только при `ALERT_BOT_WEBHOOK_URL` + `ALERT_BOT_WEBHOOK_SECRET`. На проде адрес — `https://linkeon.io/webhook/telegram/alert-bot/telegram`: прямой origin обязателен, потому что Telegram не может достучаться до `my.linkeon.io` через Selectel-прокси. Старый `/webhook/alert-bot/telegram` сохранён для совместимости. При старте бот не перезаписывает чужой webhook. Модель — локальный Claude CLI с `noFallback`, встроенные инструменты выключены. Пять read-only MCP tools (`alerts`, `health`, `logs`, `stats`, `tickets`) живут на отдельном `127.0.0.1:ALERT_BOT_OPS_PORT`, снаружи недоступны; телефоны, id, почта и секреты маскируются. Ответ пользователю модель отправить не может.
+Вход включается только при `ALERT_BOT_WEBHOOK_URL` + `ALERT_BOT_WEBHOOK_SECRET`. На проде адрес — `https://linkeon.io/webhook/telegram/alert-bot/telegram`: прямой origin обязателен, потому что Telegram не может достучаться до `my.linkeon.io` через Selectel-прокси. Старый `/webhook/alert-bot/telegram` сохранён для совместимости. При старте бот не перезаписывает чужой webhook. Модель — локальный Claude CLI через общий рубильник и существующую аварийную цепочку, без отдельного Claude-only `noFallback`; встроенные инструменты выключены. Вопросы админов и результаты read-only ops-инструментов идут выбранной общей модели. Пять read-only MCP tools (`alerts`, `health`, `logs`, `stats`, `tickets`) живут на отдельном `127.0.0.1:ALERT_BOT_OPS_PORT`, снаружи недоступны; телефоны, id, почта и секреты маскируются. Ответ пользователю модель отправить не может.
 
 | ENV | Дефолт | Что делает |
 |-----|--------|------------|
@@ -539,8 +547,26 @@ Synthetic-раннер шлёт отчёты на `SYNTHETIC_PUSH_URL` — на 
 | `ALERT_BOT_RATE_PER_HOUR` | 30 | Вопросов в час на админа |
 | `ALERT_BOT_TIMEOUT_MS` | 180000 | Потолок хода CLI |
 | `ALERT_BOT_OPS_PORT` | 3091 | Loopback-порт read-only MCP |
+| `ALERT_BOT_REPAIR_ADMIN_TG_IDS` | пусто | Числовые Telegram ID repair-админов через запятую; пусто — repair полностью выключен |
+| `ALERT_BOT_REPAIR_TIMEOUT_MS` | 3600000 | Потолок repair-хода CLI |
+| `ALERT_BOT_REPAIR_RELAY_SSH` | `dv@5.101.115.184` | SSH-псевдоним хоста `relay` |
+| `ALERT_BOT_REPAIR_TEST_SSH` | `dv@85.192.61.231` | SSH-псевдоним хоста `test` |
 
 Ходы — `alert_bot_turns` (90 дней), апдейты — `alert_bot_updates` (7 дней), черновики — `alert_bot_ticket_drafts` (30 дней), отправленные алерты — `alert_messages` (30 дней). Деплой ждёт активные ходы через общий `activeStreams`. Если модель недоступна, бот отвечает видом сбоя и `/status`.
+
+### Repair-контур бота алертов
+
+Запуск — только по явной команде админа: `/fix <задача>` или реплай «исправь/почини» на состоявшийся ответ бота. Автоматически по алерту repair не запускается никогда.
+
+- **Kill switch:** если `ALERT_BOT_REPAIR_ADMIN_TG_IDS` пуст или не задан, repair полностью выключен — записи не создаются и repair-tools не исполняются. Для отката снять env и штатно рестартнуть.
+- **Доступ:** только по числовому Telegram `from.id` из allowlist, без привязки к Linkeon-аккаунту; username, имя группы и forwarded-сообщения права не дают. Не-админ получает короткий отказ без записи в БД.
+- **Инструменты:** к пяти read-only ops tools добавляются три MCP tools — `repair_exec` (host `prod`/`relay`/`test`, команды произвольные; `relay` и `test` — только SSH, команды непрерываемые), `repair_job`, `repair_verify`. На каждый ход выдаётся отдельный capability-токен `scope=repair`, привязанный к админу, чату и turn; после финализации repair он бесполезен.
+- **Права:** команды выполняются от сервисного пользователя API и его существующих SSH-ключей — это НЕ root, нового privileged-доступа нет.
+- **Журнал:** таблицы `alert_bot_repairs` / `alert_bot_repair_jobs`, хранение 90 дней. Итоговый исход (`verified`/`unverified`/`failed`/`timeout`/`cancelled`/`interrupted`) вычисляет backend по журналу jobs; модель его переопределить не может. `verified` требует успешного `repair_verify` после последнего `exec` любого вида — модельный флаг `mutates` информационный и на исход не влияет.
+- **`/stop`:** останавливает активный repair — новые команды запрещаются, модель прерывается; текущая удалённая SSH-команда завершается сама, при неподтверждённом исходе ремонт получает «Исход неизвестен».
+- **Рестарт:** автоматического retry команд нет — после рестарта незавершённые команды помечаются `interrupted` и не перезапускаются (удалённый процесс мог продолжить работу).
+
+Дизайн — `docs/superpowers/specs/2026-11-11-alert-bot-repair-design.md` (включая раздел «Фиксация расхождений реализации»).
 
 ### Misc
 - `POST /webhook/imagegen` — генерация изображений (заглушка)

@@ -560,11 +560,13 @@ describe('ClaudeCliService — вызовы с MCP идут в stream-json', () 
 describe('ClaudeCliService.fallbackStats — по провайдерам', () => {
   it('enabled у каждого по своему ключу; общий enabled — хоть один', () => {
     delete process.env.QWEN_FALLBACK_API_KEY;
+    delete process.env.CODEX_FALLBACK_API_KEY;
     const st = new ClaudeCliService().fallbackStats();
     expect(st).toMatchObject({ enabled: true, ok: 0, failed: 0, breakerOpenUntil: 0, windowMs: 15 * 60_000 });
     expect(st.providers).toEqual({
       qwen: { enabled: false, ok: 0, failed: 0, downUntil: 0 },
       kimi: { enabled: true, ok: 0, failed: 0, downUntil: 0 },
+      codex: { enabled: false, ok: 0, failed: 0, downUntil: 0 },
     });
     delete process.env.KIMI_FALLBACK_API_KEY;
     expect(new ClaudeCliService().fallbackStats().enabled).toBe(false);

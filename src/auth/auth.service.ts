@@ -163,7 +163,7 @@ export class AuthService {
       // SMS Aero — без ожидания. Ответ клиенту от него и раньше не зависел
       // (sendSms сам ловит и логирует свои ошибки), а ожидание в сотни мс
       // отличало бы настоящую отправку от подавленной по времени ответа.
-      void this.sendSms(phone, code, opts?.lang).catch((e) =>
+      void this.sendSms(phone, code, opts?.lang, resend).catch((e) =>
         this.logger.error(`SMS send failed: ${(e as Error)?.message}`),
       );
     }
@@ -247,7 +247,7 @@ export class AuthService {
    * и от языка не зависит: по нему Chrome Android и Safari iOS подставляют
    * код в форму автоматически.
    */
-  private smsText(code: string, lang?: string | null): string {
+  private smsText(code: string, lang?: string | null, resend = false): string {
     const line: Record<string, string> = {
       ru: `Код ${code} для входа в linkeon.io`,
       en: `${code} is your linkeon.io login code`,
@@ -256,11 +256,27 @@ export class AuthService {
       fr: `${code} est ton code de connexion a linkeon.io`,
       zh: `${code} 是你的 linkeon.io 登录验证码`,
     };
+    // ⚠️ Повтор обязан отличаться ТЕКСТОМ. Замер 12.11.2026 на живом номере:
+    // первая SMS дошла за 8 с (status delivery), а повтор с ТЕМ ЖЕ текстом тот же
+    // агрегатор отбил через секунду (status 6, error) — дедупликация одинакового
+    // сообщения на один номер. Тот же код с припиской «Высылаем повторно» дошёл
+    // за 9 с. Код оставляем прежний намеренно: первая SMS могла просто задержаться.
+    const again: Record<string, string> = {
+      ru: 'Высылаем повторно.',
+      en: 'Sending it again.',
+      es: 'Lo enviamos de nuevo.',
+      de: 'Wir senden ihn erneut.',
+      fr: 'Nous le renvoyons.',
+      zh: '再次发送。',
+    };
     const root = String(lang ?? '').toLowerCase().split(/[-_]/)[0];
-    return `${line[root] ?? line.ru}\n@my.linkeon.io #${code}`;
+    const head = line[root] ?? line.ru;
+    const extra = resend ? ` ${again[root] ?? again.ru}` : '';
+    // WebOTP-маркер обязан остаться ПОСЛЕДНЕЙ строкой — приписка идёт до него.
+    return `${head}${extra}\n@my.linkeon.io #${code}`;
   }
 
-  private async sendSms(phone: string, code: string, lang?: string | null): Promise<void> {
+  private async sendSms(phone: string, code: string, lang?: string | null, resend = false): Promise<void> {
     // Telegram-like skip-list для тестовых телефонов: smoke/playwright за двухфазный
     // деплой дёргают /sms/:phone 4-6 раз, SMS Aero отбивает 400 (blacklist) — забивает
     // логи и расходует rate-limit. Код всё равно лежит в Redis (sendCode), так что
@@ -287,7 +303,7 @@ export class AuthService {
       const resp = await axios.get(url, {
         params: {
           number: phone,
-          text: this.smsText(code, lang),
+          text: this.smsText(code, lang, resend),
           // Sender signature. Default 'SMSAero' is the shared demo signature — some carriers
           // drop or deprioritize it, so part of the OTPs don't arrive (B1). Once a branded
           // signature is registered+approved in the SMSAERO account, set SMSAERO_SIGN=<approved>

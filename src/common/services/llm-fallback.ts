@@ -1,17 +1,17 @@
 import { classifyLlmError, LlmOutageKind } from '../llm-error';
 
 /**
- * Запасные провайдеры ClaudeCliService — Qwen и Kimi. Тот же бинарь claude и
+ * Запасные провайдеры ClaudeCliService — Qwen, Kimi и Codex. Тот же бинарь claude и
  * те же флаги — меняются модель и окружение процесса (адрес и ключ
  * провайдера). Спецификации: docs/superpowers/specs/2026-10-29-qwen-fallback-design.md,
- * 2026-10-31-kimi-provider-design.md. Те же правила — в relay-agent/llm-fallback.mjs:
+ * 2026-10-31-kimi-provider-design.md, 2026-11-14-codex-provider-design.md. Те же правила — в relay-agent/llm-fallback.mjs:
  * меняешь здесь — сверь там.
  *
  * Здесь — чистые функции (конфиг из env, модели, окружение, «переключаться
  * ли»), окна (FallbackState) и план попыток. Запуск CLI — в ClaudeCliService.
  */
 
-export type FallbackProvider = 'qwen' | 'kimi';
+export type FallbackProvider = 'qwen' | 'kimi' | 'codex';
 export type AnswerProvider = 'claude' | FallbackProvider;
 /** Чей это выбор (spec 2026-10-31-global-llm-switch, «Уточнения по ревью
  *  31.10»): личный выбор человека (карточка пользователя) или общий
@@ -20,9 +20,9 @@ export type AnswerProvider = 'claude' | FallbackProvider;
 export type ProviderChoice = 'user' | 'global';
 
 /** Порядок аварийной цепочки после Claude. */
-export const FALLBACK_ORDER: readonly FallbackProvider[] = ['qwen', 'kimi'];
+export const FALLBACK_ORDER: readonly FallbackProvider[] = ['qwen', 'kimi', 'codex'];
 export const ANSWER_PROVIDERS: readonly AnswerProvider[] = ['claude', ...FALLBACK_ORDER];
-export const PROVIDER_LABELS: Readonly<Record<AnswerProvider, string>> = { claude: 'Claude', qwen: 'Qwen', kimi: 'Kimi' };
+export const PROVIDER_LABELS: Readonly<Record<AnswerProvider, string>> = { claude: 'Claude', qwen: 'Qwen', kimi: 'Kimi', codex: 'Codex' };
 
 export interface FallbackModels {
   opus: string;
@@ -60,10 +60,19 @@ export const PROVIDER_DEFAULTS: Readonly<Record<FallbackProvider, ProviderDefaul
     baseUrl: 'https://api.kimi.ai/coding',
     models: { opus: 'k3.1-pro', sonnet: 'k3.1-pro', haiku: 'k3.1-pro' },
   },
+  // Локальный codex-bridge (Anthropic Messages ⇄ OpenAI Responses API,
+  // spec 2026-11-14): ключ-заглушка local-bridge — мост аутентифицируется сам
+  // через ~/.codex/auth.json (подписка ChatGPT Pro). gpt-6-astra для всех
+  // классов.
+  codex: {
+    envPrefix: 'CODEX',
+    baseUrl: 'http://127.0.0.1:8790',
+    models: { opus: 'gpt-6-astra', sonnet: 'gpt-6-astra', haiku: 'gpt-6-astra' },
+  },
 };
 
 /** Ни одного запасного — для вызовов с noFallback. */
-export const NO_FALLBACK_CONFIGS: Readonly<FallbackConfigs> = Object.freeze({ qwen: null, kimi: null });
+export const NO_FALLBACK_CONFIGS: Readonly<FallbackConfigs> = Object.freeze({ qwen: null, kimi: null, codex: null });
 
 /** Длина окон (окно Claude и «не отвечает»), мс. */
 export const DEFAULT_BREAKER_MS = 5 * 60_000;
@@ -96,7 +105,11 @@ export function readFallbackConfig(name: FallbackProvider, env: NodeJS.ProcessEn
 }
 
 export function readFallbackConfigs(env: NodeJS.ProcessEnv = process.env): FallbackConfigs {
-  return { qwen: readFallbackConfig('qwen', env), kimi: readFallbackConfig('kimi', env) };
+  return {
+    qwen: readFallbackConfig('qwen', env),
+    kimi: readFallbackConfig('kimi', env),
+    codex: readFallbackConfig('codex', env),
+  };
 }
 
 /** Длина окон: LLM_FALLBACK_BREAKER_MS; прежнее QWEN_FALLBACK_BREAKER_MS — если

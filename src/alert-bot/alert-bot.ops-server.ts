@@ -3,8 +3,10 @@ import { Socket } from 'net';
 import { Inject, Optional } from '@nestjs/common';
 import { AlertBotAccess } from './alert-bot.access';
 import { ALERT_BOT_OPS_TOOLS, alertBotOpsPort } from './alert-bot.config';
-import { verifyOpsToken } from './alert-bot.ops-token';
-import { OpsContext, OpsToolHandler } from './alert-bot.types';
+import { verifyAlertBotToken } from './alert-bot.ops-token';
+import { AlertBotRepairAuth } from './alert-bot.repair-auth';
+import { AlertBotRepairTools } from './alert-bot.repair-tools';
+import { AlertBotTokenIdentity, OpsContext, OpsToolHandler } from './alert-bot.types';
 
 const MAX_BODY_BYTES = 65_536;
 const DEFAULT_TOOL_TIMEOUT_MS = 120_000;
@@ -33,6 +35,8 @@ export class AlertBotOpsServer {
   constructor(
     private readonly access: AlertBotAccess,
     @Inject(ALERT_BOT_OPS_TOOLS) private readonly tools: OpsToolHandler,
+    private readonly repairAuth: AlertBotRepairAuth,
+    private readonly repairTools: AlertBotRepairTools,
     @Optional() options: AlertBotOpsServerOptions = {},
   ) {
     this.toolTimeoutMs = options.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
@@ -113,15 +117,20 @@ export class AlertBotOpsServer {
 
       const match = /^Bearer (.+)$/.exec(req.headers.authorization || '');
       const token = match?.[1];
-      const identity = token ? verifyOpsToken(token) : null;
+      const identity = token ? verifyAlertBotToken(token) : null;
       if (!identity || !token) {
         this.sendEmpty(res, 401);
         return;
       }
-      if (!await this.access.isAdminUserId(identity.adminUserId)) {
+      const authorized = identity.scope === 'ops'
+        ? await this.access.isAdminUserId(identity.adminUserId)
+        : await this.repairAuth.authorize(identity);
+      if (!authorized) {
         this.sendEmpty(res, 403);
         return;
       }
+      const handler = identity.scope === 'repair' ? this.repairTools : this.tools;
+      const context = this.toolContext(identity);
 
       if (req.method === 'DELETE') {
         this.sendEmpty(res, 204);
@@ -180,7 +189,7 @@ export class AlertBotOpsServer {
         return;
       }
       if (body.method === 'tools/list') {
-        this.sendJson(res, 200, { jsonrpc: '2.0', id, result: { tools: this.tools.definitions() } });
+        this.sendJson(res, 200, { jsonrpc: '2.0', id, result: { tools: handler.definitions() } });
         return;
       }
       if (body.method === 'tools/call') {
@@ -197,14 +206,17 @@ export class AlertBotOpsServer {
 
         let text: string;
         try {
-          text = await this.executeWithDeadline(name, args, identity, req, res);
+          text = await this.executeWithDeadline(name, args, context, req, res, handler);
         } catch {
           text = JSON.stringify({ error: 'tool_failed' });
         }
         let isError = false;
         try {
           const parsed = JSON.parse(text);
-          isError = Boolean(parsed && typeof parsed === 'object' && 'error' in parsed && parsed.error !== undefined);
+          isError = Boolean(parsed && typeof parsed === 'object' && (
+            ('error' in parsed && parsed.error !== undefined)
+            || ('startError' in parsed && parsed.startError !== undefined)
+          ));
         } catch { /* Обычный текст инструмента не является JSON-ошибкой. */ }
         this.sendJson(res, 200, {
           jsonrpc: '2.0', id,
@@ -219,12 +231,18 @@ export class AlertBotOpsServer {
     }
   }
 
+  private toolContext(identity: AlertBotTokenIdentity): OpsContext {
+    if (identity.scope === 'repair') return identity;
+    return { adminUserId: identity.adminUserId, chatId: identity.chatId };
+  }
+
   private async executeWithDeadline(
     name: string,
     args: Record<string, unknown>,
     identity: OpsContext,
     req: http.IncomingMessage,
     res: http.ServerResponse,
+    handler: OpsToolHandler = this.tools,
   ): Promise<string> {
     const controller = new AbortController();
     let timer: NodeJS.Timeout;
@@ -246,7 +264,7 @@ export class AlertBotOpsServer {
     timer = setTimeout(active.cancel, this.toolTimeoutMs);
     try {
       return await Promise.race([
-        this.tools.execute(name, args, identity, controller.signal),
+        handler.execute(name, args, identity, controller.signal),
         deadline,
       ]);
     } finally {

@@ -38,6 +38,7 @@ import { ProductActionsService } from '../products/product-actions.service';
 import { productActionTail, stripProductActionBlocks } from '../products/product-action-tail';
 import { ChatFileStore, PERSIST_TURN_BUDGET_MS } from './chat-files/chat-file-store';
 import { RelayOutputFile, collectOutputFiles, outputFileLines, storeRelayLinks } from './chat-files/relay-links';
+import { ChatUploadsService } from './chat-uploads/chat-uploads.service';
 import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
@@ -68,6 +69,13 @@ export interface UploadHandoff {
   sessionId: string;
   systemPrompt: string;
   history: string;
+  /**
+   * Память загрузок сессии (spec 2026-11-13-chat-upload-memory): имена и
+   * короткоживущие подписанные ссылки прошлых исходников. Контроллер клеит её
+   * в начало тела реплики. ТОЛЬКО пер-ходовая часть, не systemPrompt: подписи
+   * чеканятся заново каждый ход и сломали бы кэш системного промпта на релее.
+   */
+  uploadContext?: string;
   products: { products_token: string; products_mcp_url: string };
   linkeon: LinkeonRelayFields;
   profilingBlocks: RelayProfilingBlocks;
@@ -630,6 +638,12 @@ export class ChatService {
     // провайдер по типу Object, и @Optional молча подставит undefined.
     // Сторож — chat.service.guest-carry.spec.ts (design:paramtypes).
     @Optional() private readonly redis?: RedisService,
+    // Память загрузок (spec 2026-11-13-chat-upload-memory): реестр исходников
+    // пользователя в Postgres/MinIO. Последним и @Optional по той же причине,
+    // что chatFiles: спеки собирают ChatService позиционно, а без реестра ходы
+    // идут как до фичи. Тип — класс ChatUploadsService (сторож design:paramtypes
+    // — chat-uploads/chat-uploads.prompt.spec.ts).
+    @Optional() private readonly chatUploads?: ChatUploadsService,
   ) {}
 
   /**
@@ -1013,6 +1027,40 @@ export class ChatService {
   }
 
   /**
+   * Блок памяти загрузок сессии (spec 2026-11-13-chat-upload-memory, Task 6):
+   * до 10 последних исходников из реестра chat_uploads — имя и короткоживущая
+   * подписанная ссылка на чтение. Ротация вырезает блок `User uploaded files`
+   * из переносимого хвоста релея, поэтому память восстанавливается из реестра
+   * на КАЖДОМ ходе.
+   *
+   * Результат — только в пер-ходовую часть промпта (тело реплики), никогда в
+   * buildRelayStablePrefix: подписи чеканятся заново каждый ход и в системном
+   * промпте сломали бы кэш релея.
+   *
+   * rawSessionId — сырой ключ сессии Postgres (custom_chat_history,
+   * chat_uploads): freshSessionId или `${userId}_${assistantId}`, БЕЗ
+   * языкового суффикса ключа релея.
+   *
+   * Флаг CHAT_UPLOADS_ENABLED выключен или реестра нет — пустая строка; сбой
+   * БД/MinIO логируется и тоже даёт пустую строку: ход не должен падать из-за
+   * памятки о файлах. Подписанные ссылки в лог не пишутся.
+   */
+  private async uploadContextBlock(
+    userId: string,
+    rawSessionId: string,
+    excludeIds?: string[],
+  ): Promise<string> {
+    if (!this.chatUploads || process.env.CHAT_UPLOADS_ENABLED !== 'true') return '';
+    try {
+      const records = await this.chatUploads.recentForSession(userId, rawSessionId, excludeIds || []);
+      return this.chatUploads.assistantBlock(records);
+    } catch (e: any) {
+      this.logger.warn(`upload context failed (${userId}, session ${rawSessionId}): ${e?.message}`);
+      return '';
+    }
+  }
+
+  /**
    * Всё, что ход с вложениями обязан сказать релею, чтобы попасть в ТОТ ЖЕ
    * разговор, что и текстовый ход: ключ сессии, персона, хвост переписки.
    *
@@ -1024,6 +1072,13 @@ export class ChatService {
     assistantId: string;
     profileText?: string;
     freshSessionId?: string;
+    /**
+     * ID исходников, сохранённых ЭТИМ ходом (контроллер сохраняет их до
+     * сборки handoff). В блок памяти не включаются: файлы текущего хода уже
+     * есть в multipart-промпте путями на релее, второй экземпляр только
+     * путал бы модель.
+     */
+    savedUploadIds?: string[];
     // Подсказка языка из запроса — ровно та же, что у текстового хода. Без неё
     // у пользователя с пустым языком в профиле ключи снова разъедутся: текст
     // ушёл бы в `_en`, а файл — в `_ru` по умолчанию.
@@ -1086,6 +1141,14 @@ export class ChatService {
       this.logger.warn(`upload handoff: history build failed for ${userId}_${assistantId}: ${e?.message}`);
     }
 
+    // Память загрузок сессии — тот же сырой ключ Postgres, что у истории выше.
+    // Файлы текущего хода (savedUploadIds) исключены: они уже в multipart-промпте.
+    const uploadContext = await this.uploadContextBlock(
+      userId,
+      freshSessionId || `${userId}_${assistantId}`,
+      p.savedUploadIds,
+    );
+
     // Даже пустой новый systemPrompt не стирает профиль из resumed-сессии.
     // Поэтому ключ выбирается по текущему consent, как и в текстовом ходе.
     const sessionId = relaySessionForProfiling(
@@ -1103,7 +1166,7 @@ export class ChatService {
     // Инструменты Linkeon и папка хода — те же, что у текстового хода этой сессии.
     const linkeon = linkeonRelayFields(userId, sessionId);
 
-    return { baseSessionId, sessionId, systemPrompt, history, products, linkeon, profilingBlocks };
+    return { baseSessionId, sessionId, systemPrompt, history, uploadContext, products, linkeon, profilingBlocks };
   }
 
   /** Последняя проверка непосредственно перед multipart `fd.append` контроллера. */
@@ -1839,6 +1902,24 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // Пер-ходовая часть. Пустая строка, а не identity-блок: тот уехал в stablePrefix.
     let contextPrefix = '';
 
+    // Память загрузок текущей сессии (spec 2026-11-13-chat-upload-memory):
+    // при ротации релей вырезает блок `User uploaded files` из переносимого
+    // хвоста, поэтому каждый текстовый ход восстанавливает последние загрузки
+    // из реестра chat_uploads — имя и короткоживущая подписанная ссылка.
+    // ТОЛЬКО пер-ходовая часть (ниже, перед формой ответа): подписи чеканятся
+    // заново каждый ход, и в stablePrefix они сломали бы кэш системного
+    // промпта релея. Пинги мониторинга (probe) блок не везут — это не живой
+    // разговор (та же логика, что у гостевой приписки).
+    let uploadContext = '';
+    if (!probe) {
+      // Сырой ключ сессии Postgres (custom_chat_history, chat_uploads), а не
+      // ключ релея с языковым суффиксом — тот же, что у saveUserMessageRow.
+      const rawSessionId = fresh && freshSessionId
+        ? freshSessionId
+        : `${userId}_${assistantId}`;
+      uploadContext = await this.uploadContextBlock(userId, rawSessionId);
+    }
+
     // Текущее время ГЛАЗАМИ ПОЛЬЗОВАТЕЛЯ. Без этого модель считает время по UTC
     // сервера: 11.08 пользовательница из ЯНАО (UTC+5) написала «я тебе в 19:44
     // файлы направляю», ассистент видел у себя 14:44, и разницу в пять часов ему
@@ -1966,6 +2047,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // stablePrefix вместе с персоной: перенос в системный промпт вернёт их в
     // НАЧАЛО контекста, то есть ровно туда, откуда их пришлось убирать. Весят
     // они при этом гроши — 1847 символов на 44 хода в замеренной сессии.
+    // Память загрузок — ДО формы ответа и языковой строки, по той же причине,
+    // что и гостевая приписка (см. chat.service.guest-carry.spec.ts): модель
+    // читает язык и стиль последних строк как образец, а ссылки в блоке —
+    // технические.
+    if (uploadContext) contextPrefix += `${uploadContext}\n\n`;
+
     contextPrefix += `${MEETING_HONESTY_RULE}\n\n`;
     contextPrefix += `${RESPONSE_STYLE_RULE}\n\n`;
 

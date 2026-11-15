@@ -3,6 +3,7 @@ import { PgService } from '../common/services/pg.service';
 import { TripService } from '../trip/trip.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
+import { RecallService } from './recall.service';
 import {
   BuiltContext, ConsumerProfile, FALLBACK_TZ, PROFILES, SectionName, SectionStat, TOTAL_BUDGET,
 } from './context.types';
@@ -34,6 +35,7 @@ export class ContextService {
     @Optional() private readonly trip?: TripService,
     @Optional() private readonly neo4j?: Neo4jService,
     @Optional() private readonly businessProfile?: BusinessProfileService,
+    @Optional() private readonly recall?: RecallService,
   ) {}
 
   async build(
@@ -132,6 +134,7 @@ export class ContextService {
       case 'business':      return this.sectionBusiness(userId);
       case 'balance':       return this.sectionBalance(userId);
       case 'history':       return this.sectionHistory(userId, opts.agentId, budget);
+      case 'memory':        return this.sectionMemory(userId);
       case 'device':        return Promise.resolve(opts.device || '');
       default:              return Promise.resolve('');
     }
@@ -290,6 +293,18 @@ export class ContextService {
    * Так же набирал старый сборщик в voice-call.service.ts; при переезде на
    * общий ContextService это потерялось.
    */
+  /**
+   * Витрина записанного: заголовки заметок и темы прошлых разговоров.
+   *
+   * Текста здесь нет — он достаётся инструментом `recall`. Полный разбор,
+   * почему именно так, — в {@link RecallService.digest} и в спеке
+   * `2026-11-14-roman-recall-design.md`.
+   */
+  private async sectionMemory(userId: string): Promise<string> {
+    if (!this.recall) return '';
+    return this.recall.digest(userId);
+  }
+
   private async sectionHistory(userId: string, agentId = 12, budget = TOTAL_BUDGET): Promise<string> {
     const res = await this.pg.query(
       `SELECT sender_type, content FROM custom_chat_history

@@ -7,6 +7,8 @@ import { verifyBody } from './hmac';
 import { MeetingService } from '../meeting/meeting.service';
 import { CalendarService } from '../calendar/calendar.service';
 import { AskResult, CompletePayload, DocumentResult, NoteResult } from './voice-call.types';
+import { RecallService } from '../context/recall.service';
+import { RecallItem, RecallKind } from '../context/recall';
 
 /**
  * Ручки, которые зовёт воркер linkeon-voice-host. Закрыты HMAC-подписью тела.
@@ -25,6 +27,7 @@ export class VoiceCallInternalController {
     private readonly docs: VoiceDocumentService,
     private readonly meetings: MeetingService,
     private readonly calendar: CalendarService,
+    private readonly recall: RecallService,
   ) {}
 
   /**
@@ -151,6 +154,34 @@ export class VoiceCallInternalController {
     const res = await this.calendar.quickAddFromText(String(call.user_id), body.text || '');
     this.logger.log(`[calendar-add] call=${body.callId} «${body.text}» → ${res.status}`);
     return res;
+  }
+
+  /**
+   * Вспомнить записанное: заметки человека и резюме его прошлых разговоров.
+   *
+   * ⚠️ `user_id` берётся ИЗ ЗВОНКА, а не из тела запроса. Аргументом его
+   * подменил бы кто угодно, у кого есть подпись воркера, — то же правило, что
+   * у ходового токена MCP («пользователь из подписи, аргумента userId нет»).
+   *
+   * ⚠️ Запрос в лог не пишется: это слова человека о своей жизни. В логе
+   * только сколько нашлось — ровно как у сборки контекста (§4.6 спеки).
+   */
+  @Post('recall')
+  async recallMemory(
+    @Headers('x-voice-signature') signature: string,
+    @Req() req: Request,
+  ): Promise<{ items: RecallItem[] }> {
+    const body = this.parseSigned<{ callId: string; query?: string; kind?: string }>(req, signature);
+    const call = await this.calls.load(body.callId);
+    if (!this.calls.isActive(call)) {
+      this.logger.warn(`[recall] call=${body.callId} не активен (${call.status})`);
+      return { items: [] };
+    }
+    const kind: RecallKind | undefined =
+      body.kind === 'note' || body.kind === 'talk' ? body.kind : undefined;
+    const items = await this.recall.search(String(call.user_id), String(body.query || ''), kind);
+    this.logger.log(`[recall] call=${body.callId} kind=${kind ?? 'любое'} → нашлось ${items.length}`);
+    return { items };
   }
 
   @Post('progress')

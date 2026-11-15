@@ -39,6 +39,11 @@ const TIMEOUT_MS: Record<string, number> = {
   // Заметка, как и документ: ручка только ставит сочинение в очередь.
   note: 2_000,
   'calendar-add': 30_000,
+  // Поиск по заметкам и резюме прошлых разговоров. Тул синхронный, разговор
+  // ждёт — но заметки лежат в TalerID за MCP, то есть это поход по сети, а не
+  // в свою базу. Пять секунд: дольше молчания в трубке не выдержать, а
+  // пустой ответ честнее зависшего.
+  recall: 5_000,
 };
 
 async function post<T>(path: string, body: unknown): Promise<T> {
@@ -85,6 +90,15 @@ export type CallUsage = {
 
 /** Кто был на встрече — то же, что бэкенд ждёт в voice_calls.participants. */
 export type MeetingParticipant = { name: string; joinedAt: number };
+
+/** Кусок записанного, найденный по запросу: заметка или прошлый разговор. */
+export type RecallItem = {
+  kind: 'note' | 'talk';
+  title: string;
+  /** дд.мм.гггг; пусто, если источник даты не дал. */
+  date: string;
+  text: string;
+};
 
 export type DocumentResult =
   | { status: 'accepted'; docId: string; title: string; specialist?: string }
@@ -150,6 +164,14 @@ export const backend = {
     post<{ status: 'created' | 'clarify' | 'chat' | 'error'; question?: string; title?: string;
            whenText?: string; kind?: string; error?: string }>(
       'calendar-add', { callId, text }),
+  /**
+   * Вспомнить записанное: заметки человека и резюме его прошлых разговоров.
+   *
+   * ⚠️ Пользователя сюда НЕ передаём: бэкенд берёт его из самого звонка.
+   * Аргументом его подменил бы кто угодно, у кого есть наша подпись.
+   */
+  recall: (callId: string, query: string, kind?: 'note' | 'talk') =>
+    post<{ items: RecallItem[] }>('recall', { callId, query, kind }),
   meetBot: (callId: string, wsUrl: string) =>
     post<{ status: 'ok' | 'failed' }>('meet-bot', { callId, wsUrl }).then((r) => r.status === 'ok'),
 };

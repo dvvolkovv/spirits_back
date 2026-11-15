@@ -5,12 +5,13 @@ import { setAlertSentSink } from '../common/telegram-alert';
 import { PgService } from '../common/services/pg.service';
 import { alertBotEnabled } from './alert-bot.config';
 import { AlertBotOpsServer } from './alert-bot.ops-server';
+import { RepairStore } from './alert-bot.repair-store';
 import { AlertBotService } from './alert-bot.service';
 import { AlertBotStore } from './alert-bot.store';
 import { AlertBotTelegram } from './alert-bot.telegram';
 import { AlertBotTurns } from './alert-bot.turns';
 
-const SHUTDOWN_DRAIN_MS = 5000;
+const SHUTDOWN_DRAIN_MS = 10000;
 const RETRY_INTERVAL_MS = 5000;
 
 @Injectable()
@@ -23,6 +24,7 @@ export class AlertBotLifecycle implements OnModuleInit, OnModuleDestroy, BeforeA
 
   constructor(
     private readonly store: AlertBotStore,
+    private readonly repairStore: RepairStore,
     private readonly ops: AlertBotOpsServer,
     private readonly telegram: AlertBotTelegram,
     private readonly turns: AlertBotTurns,
@@ -32,7 +34,16 @@ export class AlertBotLifecycle implements OnModuleInit, OnModuleDestroy, BeforeA
 
   async onModuleInit(): Promise<void> {
     await this.store.migrate();
+    await this.repairStore.migrate();
+    await this.repairStore.interruptActive();
     this.pg.registerPreCloseHook(() => this.beforeApplicationShutdown());
+    await this.store.cleanup().catch(() => {});
+    await this.repairStore.cleanup().catch(() => {});
+    this.cleanupTimer = setInterval(() => {
+      void this.store.cleanup().catch(() => {});
+      void this.repairStore.cleanup().catch(() => {});
+    }, 24 * 60 * 60 * 1000);
+    this.cleanupTimer.unref();
     if (!alertBotEnabled()) return;
     await this.ops.start();
     const interrupted = await this.store.interruptInProgress();
@@ -42,9 +53,6 @@ export class AlertBotLifecycle implements OnModuleInit, OnModuleDestroy, BeforeA
       await this.telegram.sendMessage(turn.chatId, 'Ответ оборвался перезапуском — спросите ещё раз', turn.questionMessageId)
         .catch(() => {});
     }
-    await this.store.cleanup().catch(() => {});
-    this.cleanupTimer = setInterval(() => this.store.cleanup().catch(() => {}), 24 * 60 * 60 * 1000);
-    this.cleanupTimer.unref();
     this.retryTimer = setInterval(() => { void this.retryDue(); }, RETRY_INTERVAL_MS);
     this.retryTimer.unref();
     void this.telegram.registerWebhook().catch((e: any) => {
@@ -55,13 +63,17 @@ export class AlertBotLifecycle implements OnModuleInit, OnModuleDestroy, BeforeA
   async beforeApplicationShutdown(): Promise<void> {
     if (this.shutdown) return this.shutdown;
     this.shutdown = (async () => {
-      this.service.stopAdmission();
       let timer: NodeJS.Timeout | undefined;
+      let expired = false;
       try {
+        const draining = (async () => {
+          await this.service.stopAdmission();
+          if (!expired) await this.turns.idle();
+        })();
         await Promise.race([
-          this.turns.idle(),
+          draining,
           new Promise<void>((resolve) => {
-            timer = setTimeout(resolve, SHUTDOWN_DRAIN_MS);
+            timer = setTimeout(() => { expired = true; resolve(); }, SHUTDOWN_DRAIN_MS);
             timer.unref();
           }),
         ]);

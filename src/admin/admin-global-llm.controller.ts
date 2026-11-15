@@ -62,7 +62,7 @@ export class AdminGlobalLlmController {
   }
 }
 
-function configured(): { qwen: boolean; kimi: boolean } {
+function configured(): { qwen: boolean; kimi: boolean; codex: boolean } {
   const c = readFallbackConfigs();
-  return { qwen: c.qwen !== null, kimi: c.kimi !== null };
+  return { qwen: c.qwen !== null, kimi: c.kimi !== null, codex: c.codex !== null };
 }

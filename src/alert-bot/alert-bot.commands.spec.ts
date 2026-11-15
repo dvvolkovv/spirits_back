@@ -27,6 +27,9 @@ describe('команды бота алертов', () => {
     expect(await commands.start()).toContain('/ask');
     expect(await commands.start()).toContain('/status');
     expect(await commands.start()).toContain('/close');
+    expect(await commands.start()).toContain(
+      '/fix задача — исправление только для разрешённых Telegram-админов; /stop — остановить исправление',
+    );
     expect(await commands.start()).toContain('черновик');
   });
 

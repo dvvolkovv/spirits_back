@@ -4,6 +4,8 @@ import { NestFactory } from '@nestjs/core';
 import { AlertBotAccess } from './alert-bot.access';
 import { ALERT_BOT_OPS_TOOLS } from './alert-bot.config';
 import { AlertBotOpsServer } from './alert-bot.ops-server';
+import { AlertBotRepairAuth } from './alert-bot.repair-auth';
+import { AlertBotRepairTools } from './alert-bot.repair-tools';
 
 @Module({
   providers: [
@@ -13,6 +15,8 @@ import { AlertBotOpsServer } from './alert-bot.ops-server';
       provide: ALERT_BOT_OPS_TOOLS,
       useValue: { definitions: jest.fn(), execute: jest.fn() },
     },
+    { provide: AlertBotRepairAuth, useValue: { authorize: jest.fn() } },
+    { provide: AlertBotRepairTools, useValue: { definitions: jest.fn(), execute: jest.fn() } },
   ],
 })
 class AlertBotOpsServerDiSpecModule {}

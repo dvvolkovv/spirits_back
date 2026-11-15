@@ -305,6 +305,7 @@ for file in *.mjs; do
   node --check "$file"
 done
 node --test *.test.mjs
+RELAY_LIVE_CLI_WRITE_TEST=1 node --test sandbox-write-live.test.mjs
 
 cd ~/file-agent
 if ! git diff --cached --quiet; then

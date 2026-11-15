@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, Param, Query, Headers, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Delete, Body, Param, Query, Headers, UseGuards } from '@nestjs/common';
 import { JwtGuard } from '../common/guards/jwt.guard';
 import { AdminGuard } from '../common/guards/admin.guard';
 import { CurrentUser } from '../common/decorators/user.decorator';
@@ -110,6 +110,32 @@ export class SupportController {
   ) {
     await this.support.adminReply(id, u.userId, body.content, body.visibleToUser !== false);
     return { ok: true };
+  }
+
+  /**
+   * Вернуть человеку токены за плохую работу — сразу на баланс.
+   *
+   * Лимиты `refund_tokens` сдерживают ИИ-поддержку; владелец возвращает
+   * столько, сколько решил, и человеку для этого ничего делать не нужно.
+   */
+  @Post('admin/ticket/:id/refund')
+  @UseGuards(AdminGuard)
+  async adminRefund(
+    @CurrentUser() u: any,
+    @Param('id') id: string,
+    @Body() body: { amount: number; reason: string },
+  ) {
+    return this.support.ownerRefund(id, u.userId, body.amount, body.reason);
+  }
+
+  @Delete('admin/ticket/:id/message/:messageId')
+  @UseGuards(AdminGuard)
+  async adminDeleteMessage(
+    @CurrentUser() u: any,
+    @Param('id') id: string,
+    @Param('messageId') messageId: string,
+  ) {
+    return this.support.deleteMessage(id, u.userId, messageId);
   }
 
   @Post('admin/ticket/:id/status')

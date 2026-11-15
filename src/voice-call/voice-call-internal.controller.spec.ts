@@ -18,9 +18,10 @@ describe('VoiceCallInternalController: доступ', () => {
     };
     const docs = { create: jest.fn(() => ({ status: 'accepted', docId: 'd1', title: 'Письмо' })) };
     const calendar = { quickAddFromText: jest.fn(async () => ({ status: 'created', title: 'занятие Савы с Вероникой', whenText: 'завтра 08:15', kind: 'event' })) };
+    const recall = { search: jest.fn(async () => ([{ kind: 'note', title: 'Финансовая стратегия', date: '10.11.2026', text: 'ипотека, резерв' }])) };
     return {
-      ctl: new VoiceCallInternalController(jobs as any, calls as any, docs as any, null as any, calendar as any),
-      jobs, calls, docs, calendar,
+      ctl: new VoiceCallInternalController(jobs as any, calls as any, docs as any, null as any, calendar as any, recall as any),
+      jobs, calls, docs, calendar, recall,
     };
   }
 
@@ -128,7 +129,7 @@ describe('VoiceCallInternalController: доступ', () => {
         sendChatMessage: jest.fn(async () => true),
       };
       return {
-        ctl: new VoiceCallInternalController(jobs as any, calls as any, docs as any, meetings as any, null as any),
+        ctl: new VoiceCallInternalController(jobs as any, calls as any, docs as any, meetings as any, null as any, null as any),
         meetings,
       };
     }
@@ -196,6 +197,50 @@ describe('VoiceCallInternalController: доступ', () => {
       const raw2 = JSON.stringify({ callId: 'call-1', text: 'что-то' });
       await expect(ctl.calendarAdd('нет', req(raw2))).rejects.toThrow();
       expect(calendar.quickAddFromText).not.toHaveBeenCalled();
+    });
+  });
+
+  // ⚠️ Дефект владельца 13.11.2026: «прочитай заметку, которую мы в прошлый раз сделали» —
+  // Роман ответил «у меня нет прямого доступа читать твои заметки». Заметка существовала:
+  // он сам её и записал. Память была односторонней — писала и не читала.
+  describe('recall: ассистент может прочитать записанное', () => {
+    const recallBody = { callId: 'call-1', query: 'финансовое будущее' };
+    const recallRaw = JSON.stringify(recallBody);
+
+    it('ищет по пользователю ЗВОНКА, а не по тому, что прислал воркер', async () => {
+      const { ctl, recall } = makeCtl();
+      const spoofed = JSON.stringify({ ...recallBody, userId: 'чужой' });
+      const res = await ctl.recallMemory(signBody(SECRET, spoofed), req(spoofed));
+      expect(recall.search).toHaveBeenCalledWith('u1', 'финансовое будущее', undefined);
+      expect(res.items).toHaveLength(1);
+    });
+
+    it('мусорный kind не сужает поиск молча — считается «любое»', async () => {
+      const { ctl, recall } = makeCtl();
+      const body = JSON.stringify({ ...recallBody, kind: 'документы' });
+      await ctl.recallMemory(signBody(SECRET, body), req(body));
+      expect(recall.search).toHaveBeenCalledWith('u1', 'финансовое будущее', undefined);
+    });
+
+    it('kind передаётся, когда он известный', async () => {
+      const { ctl, recall } = makeCtl();
+      const body = JSON.stringify({ ...recallBody, kind: 'note' });
+      await ctl.recallMemory(signBody(SECRET, body), req(body));
+      expect(recall.search).toHaveBeenCalledWith('u1', 'финансовое будущее', 'note');
+    });
+
+    it('без подписи — 401, и поиск не выполняется', async () => {
+      const { ctl, recall } = makeCtl();
+      await expect(ctl.recallMemory('нет', req(recallRaw))).rejects.toBeInstanceOf(UnauthorizedException);
+      expect(recall.search).not.toHaveBeenCalled();
+    });
+
+    it('звонок уже кончился — пусто, а не чтение задним числом', async () => {
+      const { ctl, calls, recall } = makeCtl();
+      calls.load.mockResolvedValueOnce({ id: 'call-1', user_id: 'u1', room_name: 'r', status: 'completed' } as any);
+      const res = await ctl.recallMemory(signBody(SECRET, recallRaw), req(recallRaw));
+      expect(res.items).toEqual([]);
+      expect(recall.search).not.toHaveBeenCalled();
     });
   });
 });

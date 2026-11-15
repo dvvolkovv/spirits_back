@@ -4,7 +4,9 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { PgService } from '../common/services/pg.service';
 import { ClaudeCliCallError, ClaudeCliService } from '../common/services/claude-cli.service';
 import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
-import { CliSwitchState, cliOutageAffectedText, cliRecoveredText } from '../common/global-llm-messages';
+import { isAnswerProvider } from '../common/services/llm-fallback';
+import type { AnswerProvider, FallbackProvider } from '../common/services/llm-fallback';
+import { CliSwitchState, cliOutageAffectedText, cliRecoveredText, switchCarriesCliPath } from '../common/global-llm-messages';
 import axios from 'axios';
 import { sendTelegramPayload } from '../common/telegram-alert';
 import * as fs from 'fs';
@@ -371,6 +373,60 @@ export class ClaudeHealthService implements OnModuleInit {
   // cost30dUsd считается в refresh() и отдаётся в overview, а панель мониторинга
   // красит её по ALERT_THRESHOLD_30D_USD. Пропала только рассылка в Telegram.
 
+  /** Отдельный instance без PG: markUp и события пробы не меняют рабочий breaker/статистику. */
+  private newSwitchProbeCli(): ClaudeCliService {
+    return new ClaudeCliService();
+  }
+
+  /** Свежая проверка выбранного рубильником провайдера; сырой текст CLI не логируем. */
+  private async probeSwitchProvider(provider: FallbackProvider): Promise<boolean> {
+    try {
+      const text = await this.newSwitchProbeCli().text('Reply with exactly: ok', {
+        provider,
+        providerChoice: 'global',
+        noFallback: true,
+        model: 'claude-haiku-4-5',
+        timeoutMs: 30_000,
+        isolatedCwd: true,
+        noSessionPersistence: true,
+      });
+      if (typeof text === 'string' && text.trim().length > 0 && !looksLikeCliRefusal(text)) return true;
+      const kind = classifyLlmError(typeof text === 'string' ? text : '').kind;
+      this.log.warn(`${provider} liveness probe DOWN (${kind})`);
+      return false;
+    } catch (e: any) {
+      const message = String(e?.message || e);
+      const kind = e instanceof ClaudeCliCallError && e.kind ? e.kind : classifyLlmError(message).kind;
+      this.log.warn(`${provider} liveness probe DOWN (${kind})`);
+      return false;
+    }
+  }
+
+  /** Единый statement snapshot: provider и личный Claude согласованы; ошибка — fail-open. */
+  private async readFinalProviderAndPersonal(): Promise<{ provider: AnswerProvider; personalClaude: boolean } | null> {
+    try {
+      const r = await this.pg.query(
+        `SELECT
+           (SELECT value->>'provider' FROM llm_settings WHERE key = 'global_provider') AS global_provider,
+           EXISTS (
+             SELECT 1
+             FROM ai_profiles_consolidated p
+             JOIN user_id u ON u.internal_id = p.user_id
+             WHERE p.llm_provider = 'claude'
+               AND u.state = 'active'
+           ) AS personal_claude`,
+      );
+      const value = r.rows[0]?.global_provider;
+      return {
+        provider: isAnswerProvider(value) ? value : 'claude',
+        personalClaude: r.rows[0]?.personal_claude === true,
+      };
+    } catch (e: any) {
+      this.log.warn(`llm_settings: строгий snapshot для CLI-алерта не прочитан: ${e?.message || 'unknown'}`);
+      return null;
+    }
+  }
+
   // Алерт о простое CLI-пути (Маша / Виртуальный PM / маркетолог). Точный охват:
   // НЕ «весь AI» — чат-ассистенты (r.linkeon.io) мониторятся отдельно synthetic
   // chat_streaming. Алерт только после OUTAGE_ALERT_AFTER_FAILS подряд провалов
@@ -394,37 +450,66 @@ export class ClaudeHealthService implements OnModuleInit {
     };
 
     const alreadyAlerted = await this.getAlerted(COMPONENT);
+    const recoveryDue = status === 'ok' && alreadyAlerted;
+    if (status !== 'down' && !recoveryDue) return;
+    const belowThreshold = status === 'down' && this.cliConsecutiveDown < OUTAGE_ALERT_AFTER_FAILS;
+    if (belowThreshold && !alreadyAlerted) return;
+
+    const stats = this.claudeCli.fallbackStats(now.getTime());
+    const sw = await this.switchState(stats, now.getTime());
+    let effectiveStats = stats;
+    let effectiveSw: CliSwitchState = sw;
+    let globalAlive = false;
+    if (sw.switchProvider !== 'claude' && switchCarriesCliPath(sw)) {
+      const probedProvider = sw.switchProvider;
+      const probeOk = await this.probeSwitchProvider(probedProvider);
+      const final = probeOk ? await this.readFinalProviderAndPersonal() : null;
+      const afterNow = Date.now();
+      const afterStats = this.claudeCli.fallbackStats(afterNow);
+      const afterSw = final
+        ? this.switchStateFromStats(final.provider, afterStats, afterNow)
+        : await this.switchState(afterStats, afterNow);
+      const personalClaude = final ? final.personalClaude : true;
+      effectiveStats = afterStats;
+      effectiveSw = afterSw;
+      const sameProvider = afterSw.switchProvider === probedProvider;
+      globalAlive = probeOk && final !== null && sameProvider && switchCarriesCliPath(afterSw) && !personalClaude;
+      if (!sameProvider && switchCarriesCliPath(afterSw)) {
+        effectiveSw = { ...afterSw, providerUnverified: true };
+      } else if (sameProvider && afterSw.enabled && !afterSw.down && !probeOk) {
+        effectiveSw = { ...afterSw, probeFailed: true };
+      }
+    }
+    if (globalAlive) {
+      // Последний await был до этого решения: suppression не использует устаревший рубильник.
+      if (alreadyAlerted) {
+        this.lastOutageAlertAt = null;
+        await this.setAlerted(COMPONENT, false);
+        this.log.warn(`Claude CLI alert cleared without Telegram: ${sw.switchProvider} answered probe`);
+      }
+      return;
+    }
+    if (belowThreshold) return;
 
     if (status === 'down') {
-      // Алертим только при устойчивом простое (≥K подряд) и если ещё не алертили
-      // (или прошёл realert-интервал).
-      if (this.cliConsecutiveDown < OUTAGE_ALERT_AFTER_FAILS) return;
       const cooled = !this.lastOutageAlertAt ||
         (now.getTime() - this.lastOutageAlertAt.getTime()) >= OUTAGE_REALERT_HOURS * 3600_000;
       if (!alreadyAlerted || cooled) {
-        // Кого задевает падение Claude — зависит от общего рубильника и
-        // состояния его модели (ревью 01.11): строка «Затронуто» —
-        // cliOutageAffectedText, три состояния там.
-        const stats = this.claudeCli.fallbackStats(now.getTime());
-        const sw = await this.switchState(stats, now.getTime());
         await send(
           `<b>🔴 Локальный Claude CLI недоступен</b>\n` +
           `Причина: <b>${this.cache.llmError || 'неизвестно'}</b> (${this.cache.llmOutageKind})\n` +
-          `${cliOutageAffectedText(sw)} ` +
+          `${cliOutageAffectedText(effectiveSw)} ` +
           `Чат-ассистенты (r.linkeon.io) — отдельный путь, см. synthetic chat_streaming.\n` +
           `Провалов подряд: ${this.cliConsecutiveDown}. Проверка: ${this.cache.llmCheckedAt || '—'}\n` +
-          `${fallbackAlertLine(stats)}\n` +
+          `${fallbackAlertLine(effectiveStats)}\n` +
           `Починка: на проде \`claude\` → /login (обновить OAuth).`,
         );
         this.lastOutageAlertAt = now;
         await this.setAlerted(COMPONENT, true);
         this.log.error(`Claude CLI outage alert sent (${this.cache.llmOutageKind}, ${this.cliConsecutiveDown} fails)`);
       }
-    } else if (status === 'ok' && alreadyAlerted) {
-      // Пока модель рубильника с ключом отвечает, Маша, TG-боты и фоновые всё
-      // время шли через неё — отбой говорит другое (cliRecoveredText).
-      const sw = await this.switchState(this.claudeCli.fallbackStats(now.getTime()), now.getTime());
-      await send(cliRecoveredText({ ...sw, checkedAt: this.cache.llmCheckedAt, latencyMs: this.cache.llmLatencyMs }));
+    } else {
+      await send(cliRecoveredText({ ...effectiveSw, checkedAt: this.cache.llmCheckedAt, latencyMs: this.cache.llmLatencyMs }));
       this.lastOutageAlertAt = null;
       await this.setAlerted(COMPONENT, false);
       this.log.warn('Claude CLI recovery alert sent');
@@ -438,10 +523,17 @@ export class ClaudeHealthService implements OnModuleInit {
    * рубильника её пропускает (planProviders с respectDown). get() не бросает
    * (контракт GlobalLlmProviderService.get).
    */
-  private async switchState(stats: ReturnType<ClaudeCliService['fallbackStats']>, now: number): Promise<CliSwitchState> {
-    const switchProvider = await this.globalProvider.get();
+  private switchStateFromStats(
+    switchProvider: AnswerProvider,
+    stats: ReturnType<ClaudeCliService['fallbackStats']>,
+    now: number,
+  ): CliSwitchState {
     const st = switchProvider === 'claude' ? undefined : stats.providers?.[switchProvider];
     return { switchProvider, enabled: !!st?.enabled, down: !!st && st.downUntil > now };
+  }
+
+  private async switchState(stats: ReturnType<ClaudeCliService['fallbackStats']>, now: number): Promise<CliSwitchState> {
+    return this.switchStateFromStats(await this.globalProvider.get(), stats, now);
   }
 
   async getOverview(signal?: AbortSignal): Promise<ClaudeHealthOverview> {

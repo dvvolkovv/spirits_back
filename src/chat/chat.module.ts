@@ -22,9 +22,10 @@ import { ActionPlansController } from './action-plans/action-plans.controller';
 import { ActionPlansService } from './action-plans/action-plans.service';
 import { AccountDeletionModule } from '../account-deletion/account-deletion.module';
 import { ChatFileAccountDeletionAdapter } from './chat-files/chat-file-account-deletion.adapter';
+import { ChatUploadsModule } from './chat-uploads/chat-uploads.module';
 
 @Module({
-  imports: [MiscModule, CommonModule, RoomModule, VideoModule, CalendarModule, TalerIdModule, SpeechModule, TokensModule, HumanDesignModule, ProductsModule, AccountDeletionModule],
+  imports: [MiscModule, CommonModule, RoomModule, VideoModule, CalendarModule, TalerIdModule, SpeechModule, TokensModule, HumanDesignModule, ProductsModule, AccountDeletionModule, ChatUploadsModule],
   controllers: [ChatController, ChatFilesController, ChatThumbController, ActionPlansController],
   providers: [ChatService, ChatToolsService, ChatFileStore, ChatFilesService, ThumbnailService, CostGrowthService, ActionPlansService, ChatFileAccountDeletionAdapter],
   exports: [ChatToolsService, ChatService, ChatFilesService],

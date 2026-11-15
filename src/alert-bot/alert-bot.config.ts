@@ -20,6 +20,16 @@ function intEnv(name: string, fallback: number, min: number, max: number): numbe
 export const alertBotModel = () => process.env.ALERT_BOT_MODEL || process.env.CHAT_MODEL || 'claude-opus-5-5';
 export const alertBotRatePerHour = () => intEnv('ALERT_BOT_RATE_PER_HOUR', 30, 1, 1000);
 export const alertBotTimeoutMs = () => intEnv('ALERT_BOT_TIMEOUT_MS', 180000, 1000, 600000);
+export function alertBotRepairAdminTgIds(): string[] {
+  const values = (process.env.ALERT_BOT_REPAIR_ADMIN_TG_IDS || '')
+    .split(',').map((value) => value.trim())
+    .filter((value) => /^[1-9]\d{0,19}$/.test(value));
+  return [...new Set(values)];
+}
+export function isAlertBotRepairAdmin(tgUserId: string | number): boolean {
+  return alertBotRepairAdminTgIds().includes(String(tgUserId));
+}
+export const alertBotRepairTimeoutMs = () => intEnv('ALERT_BOT_REPAIR_TIMEOUT_MS', 3_600_000, 10_000, 3_600_000);
 export const alertBotOpsPort = () => intEnv('ALERT_BOT_OPS_PORT', 3091, 1024, 65535);
 export function alertBotAllowedChat(chatId: string, chatType: string): boolean {
   if (chatType === 'private') return true;

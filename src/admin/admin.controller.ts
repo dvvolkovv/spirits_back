@@ -202,6 +202,25 @@ export class AdminController {
     }
   }
 
+  /**
+   * Сообщение ассистента в чат человека: так мы отдаём исправленную работу.
+   */
+  @Post('admin/users/:userId/chat-message')
+  async postChatMessage(
+    @Param('userId') userId: string,
+    @Body() body: { assistantId: number; text: string },
+    @Res() res: Response,
+  ) {
+    try {
+      const out = await this.adminService.postAssistantMessage(
+        userId, Number(body?.assistantId), String(body?.text || ''),
+      );
+      return res.status(200).json(out);
+    } catch (e: any) {
+      return res.status(400).json({ error: e?.message || 'bad request' });
+    }
+  }
+
   @Get('admin/users/active')
   async usersActive(
     @Query('days') days: string | undefined,

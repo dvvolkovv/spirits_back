@@ -2,6 +2,12 @@ import { ChatService } from '../chat/chat.service';
 import { RoutinePushController } from './routine-push.controller';
 import { RoutinePushService } from './routine-push.service';
 
+/**
+ * Ревью 26.10.2026: linkeonTools — явное включение, по умолчанию false
+ * (src/chat/chat.service.ts, AgentReplyOpts). Рутина — один из путей, где
+ * ассистент реально может позвать инструмент (картинка, рутина, календарь),
+ * поэтому deliver() передаёт его явно.
+ */
 describe('рутинный пуш: outcome и linkeonTools', () => {
   it('fireNow зовёт generateAgentReplyOutcome с { linkeonTools: true }', async () => {
     const pg = {

@@ -536,6 +536,11 @@ seed_minio_assets() {
   # Файлы переписки (chat-files): то же — только s3:GetObject, без перечня ключей.
   ssh_test 'mc mb --ignore-existing local/linkeon-chat-files 2>&1 | tail -1; p=$(mktemp); printf "%s" "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[\"*\"]},\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::linkeon-chat-files/*\"]}]}" > "$p"; mc anonymous set-json "$p" local/linkeon-chat-files 2>&1 | tail -1; rm -f "$p"'
 
+  # Исходники загрузок чата (chat-uploads): бакет строго ПРИВАТНЫЙ — никаких
+  # mc anonymous вообще; доступ только через JWT владельца или короткоживущую
+  # подпись ассистента (сервис стримит байты сам).
+  ssh_test 'mc mb --ignore-existing local/linkeon-chat-uploads 2>&1 | tail -1'
+
   # Залить аватарки агентов из прода (через публичный URL, без прямого MinIO-доступа на проде)
   local n_uploaded=0
   local tmpdir

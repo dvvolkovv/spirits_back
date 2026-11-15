@@ -233,8 +233,8 @@ export class RoutineStore {
    */
   async releaseToday(id: string, todayLocal: string, prev: string | null): Promise<boolean> {
     const r = await this.pg.query(
-      `UPDATE routine_pushes SET last_sent_date=$3, updated_at=now()
-       WHERE id=$1 AND last_sent_date=$2 RETURNING id`,
+      `UPDATE routine_pushes SET last_sent_date = $3, updated_at = now()
+         WHERE id = $1 AND last_sent_date = $2 RETURNING id`,
       [id, todayLocal, prev],
     );
     return (r.rowCount || 0) > 0;

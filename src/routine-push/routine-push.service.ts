@@ -91,13 +91,8 @@ export class RoutinePushService implements OnModuleInit {
 
   // ── Доставка одной рутины ────────────────────────────────────────────────────
   /**
-   * Отложенная доставка: человек сейчас разговаривает с этим ассистентом, и
-   * agentReply честно отказал (RelaySessionBusyError) вместо пре-эмпта его
-   * хода. Ждать внутри runDue нельзя — последовательный цикл встал бы всем
-   * остальным рутинам, а fireNow держал бы HTTP. Поэтому повтор через 15 минут
-   * таймером: цикл идёт дальше, HTTP отвечает сразу. Одна отложенная на пару
-   * пользователь+ассистент. Таймер in-memory: рестарт процесса её теряет —
-   * следующий плановый запуск по расписанию остаётся страховкой.
+   * Повтор только для busy/preempted, один на пользователя+рутину. Таймер не
+   * переживает рестарт: releaseDeferred оставляет часовой cron страховкой.
    */
   private readonly retryTimers = new Map<string, NodeJS.Timeout>();
 
@@ -201,8 +196,9 @@ export class RoutinePushService implements OnModuleInit {
       return { delivered: 0, failed: true, failReason };
     }
 
-    // Сбой генерации не отправляем человеку как сообщение ассистента.
+    // ⚠️ Сбой генерации НЕ отправляем человеку как сообщение ассистента.
     if (looksLikeFailure(text)) {
+      // Не печатаем userId и сам ответ: достаточно стабильной безопасной причины.
       this.logger.error(
         `routine deliver: ошибка генерации текстом (assistant ${assistantId}, reason=cli_failure_text)`,
       );
@@ -263,7 +259,7 @@ export class RoutinePushService implements OnModuleInit {
         const today = this.store.localDate(r.tz, now);
         if (r.last_sent_date && this.store.toISO(r.last_sent_date) === today) continue;
         const prev = r.last_sent_date ? this.store.toISO(r.last_sent_date) : null;
-        if (!(await this.store.claimToday(r.id, today, r.user_id))) continue;
+        if (!(await this.store.claimToday(r.id, today, r.user_id))) continue; // уже застолбили
 
         const result = await this.deliver(
           r.user_id, r.assistant_id, r.prompt, r.title, r.id,
@@ -281,6 +277,7 @@ export class RoutinePushService implements OnModuleInit {
           `routine ${r.id} доставка завершена (assistant ${r.assistant_id}, delivered=${result.delivered})`,
         );
       } catch (e: any) {
+        // Без userId и сырого текста ошибки, который может содержать ключ сессии.
         this.logger.error(`runDue deliver failed for routine ${r?.id || 'unknown'}: ${e?.name || 'Error'}`);
       }
     }

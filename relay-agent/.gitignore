@@ -21,8 +21,8 @@ uploads/
 relay-secrets*
 relay-auth-mode*
 
-# Ключи запасных (llm-fallback.mjs, QWEN_KEY_FILE/KIMI_KEY_FILE): /home/dv/
-# file-agent/secrets/{qwen,kimi}.key, права 600. Каталог — внутри git-дерева
+# Ключи запасных (llm-fallback.mjs, QWEN_KEY_FILE/KIMI_KEY_FILE/CODEX_KEY_FILE): /home/dv/
+# file-agent/secrets/{qwen,kimi,codex}.key, права 600. Каталог — внутри git-дерева
 # релея, поэтому без этой строки ключи ушли бы в git первым же коммитом после
 # Task 11 Step 1.
 secrets/

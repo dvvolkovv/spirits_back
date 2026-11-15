@@ -4,6 +4,7 @@ import * as l from "./llm-fallback.mjs";
 
 const QWEN_MODELS = { opus: "qwen3.8-max", sonnet: "qwen3.8-flash", haiku: "qwen3.6-flash" };
 const KIMI_MODELS = { opus: "k3.1-pro", sonnet: "k3.1-pro", haiku: "k3.1-pro" };
+const CODEX_MODELS = { opus: "gpt-6-astra", sonnet: "gpt-6-astra", haiku: "gpt-6-astra" };
 const missing = () => { throw Object.assign(new Error("ENOENT"), { code: "ENOENT" }); };
 
 test("readProviderConfig: нет файла, пустой файл, чужое имя — null", () => {
@@ -26,6 +27,13 @@ test("readProviderConfig: Kimi — адрес Kimi Code, k3.1-pro, ключ secr
   assert.deepEqual(cfg, { name: "kimi", apiKey: "sk-kimi-x", baseUrl: "https://api.kimi.ai/coding", models: KIMI_MODELS });
 });
 
+test("readProviderConfig: Codex — локальный мост, gpt-6-astra, ключ secrets/codex.key", () => {
+  let asked;
+  const cfg = l.readProviderConfig("codex", {}, (p) => { asked = p; return "local-bridge"; });
+  assert.equal(asked, "/home/dv/file-agent/secrets/codex.key");
+  assert.deepEqual(cfg, { name: "codex", apiKey: "local-bridge", baseUrl: "http://127.0.0.1:8790", models: CODEX_MODELS });
+});
+
 test("readProviderConfig: путь и переопределения из env — у каждого свои", () => {
   let asked;
   const env = { KIMI_KEY_FILE: "/k", KIMI_FALLBACK_BASE_URL: "https://x/coding", KIMI_FALLBACK_MODEL_OPUS: "k3", QWEN_FALLBACK_MODEL_OPUS: "q" };
@@ -40,6 +48,7 @@ test("readProviderConfigs и anyConfigured", () => {
   const cfgs = l.readProviderConfigs({}, (p) => (p.endsWith("kimi.key") ? "k" : missing()));
   assert.equal(cfgs.qwen, null);
   assert.equal(cfgs.kimi.name, "kimi");
+  assert.equal(cfgs.codex, null);
   assert.equal(l.anyConfigured(cfgs), true);
   assert.equal(l.anyConfigured(l.NO_CONFIGS), false);
 });
@@ -61,6 +70,9 @@ test("parseSelected и isEmergency", () => {
   assert.equal(l.isEmergency("qwen", ""), true);
   assert.equal(l.isEmergency("kimi", "kimi"), false);
   assert.equal(l.isEmergency("qwen", "kimi"), true);
+  assert.equal(l.parseSelected("codex"), "codex");
+  assert.equal(l.isEmergency("codex", "codex"), false);
+  assert.equal(l.isEmergency("qwen", "codex"), true);
 });
 
 test("modelFor", () => {
@@ -69,6 +81,7 @@ test("modelFor", () => {
     assert.equal(l.modelFor(req, QWEN_MODELS), want, req);
   }
   for (const req of ["default", "sonnet", "haiku"]) assert.equal(l.modelFor(req, KIMI_MODELS), "k3.1-pro");
+  for (const req of ["default", "sonnet", "haiku"]) assert.equal(l.modelFor(req, CODEX_MODELS), "gpt-6-astra");
 });
 
 test("withModel: меняет только значение --model, исходный массив цел", () => {
@@ -302,6 +315,18 @@ test("planProviders: выбран Kimi, окно Claude открыто, Qwen «�
   assert.deepEqual(l.planProviders({ selected: "kimi", cfgs: both, state: s, now: T + 1 }), ["kimi", "claude"]);
 });
 
+test("planProviders: Codex настроен — четвёртое звено цепочки", () => {
+  const cfg = (name) => ({ name, apiKey: "k", baseUrl: "u", models: KIMI_MODELS });
+  const all = { qwen: cfg("qwen"), kimi: cfg("kimi"), codex: cfg("codex") };
+  assert.deepEqual(l.planProviders({ cfgs: all, state: l.createFallbackState(), now: 10_000 }), ["claude", "qwen", "kimi", "codex"]);
+});
+
+test("planProviders: выбран Codex — сначала он, затем обычный путь без него", () => {
+  const cfg = (name) => ({ name, apiKey: "k", baseUrl: "u", models: KIMI_MODELS });
+  const all = { qwen: cfg("qwen"), kimi: cfg("kimi"), codex: cfg("codex") };
+  assert.deepEqual(l.planProviders({ selected: "codex", cfgs: all, state: l.createFallbackState(), now: 10_000 }), ["codex", "claude", "qwen", "kimi"]);
+});
+
 test("nextStep: следующий в плане; запасной, ставший «не отвечает», пропускается; Claude — нет", () => {
   const s = l.createFallbackState();
   const plan = ["claude", "qwen", "kimi"];
@@ -364,6 +389,7 @@ test("createFallbackState: «не отвечает» и исходы по про
   assert.deepEqual(st.providers, {
     qwen: { enabled: true, ok: 0, failed: 1, downUntil: 61_000 },
     kimi: { enabled: false, ok: 1, failed: 0, downUntil: 0 },
+    codex: { enabled: false, ok: 0, failed: 0, downUntil: 0 },
   });
   assert.equal(st.windowMs, l.STATS_WINDOW_MS);
   assert.deepEqual(l.legacyQwenHealth(st), {

@@ -205,9 +205,11 @@ test('инструменты: on ограничивает Read/Glob/Grep и Writ
     for (const root of [
       `/tmp/agent-output/${FS_KEY}/**`,
       `/tmp/agent-scratch/${FS_KEY}/**`,
+      `/tmp/agent-uploads/${FS_KEY}/**`,
       `/tmp/agent-uploads/${FS_KEY}_*`,
       '/opt/linkeon-agent/**', '/usr/**', '/etc/**',
     ]) assert.ok(rules.includes(`${name}(${root})`), `${name}(${root})`);
+    assert.equal(rules.some((rule) => rule.includes('fedcba0987654321fedcba0987654321')), false);
     assert.equal(rules.includes(`${name}(/opt/**)`), false, `${name}(/opt/**)`);
   }
   for (const name of ['Write', 'Edit']) {
@@ -284,6 +286,27 @@ test('промпт: on не обещает sudo/apt и использует то
   assert.ok(prompt.includes('/opt/linkeon-agent/venv/bin/activate'));
   assert.ok(prompt.includes('/opt/linkeon-agent/bin/generate_image.sh'));
   assert.ok(prompt.endsWith('KEEP THIS TEXT'));
+});
+
+test('промпт on: DOCX/PDF идёт через WeasyPrint, а не LibreOffice', () => {
+  const input = [
+    'PRE-INSTALLED: ffmpeg, ImageMagick, LibreOffice, Inkscape, poppler-utils',
+    '4. For pptx: use python-pptx, keep simple, validate with soffice --headless --convert-to pdf.',
+  ].join('\n');
+  const out = applySandboxPrompt(input, true);
+  assert.ok(out.includes('PRE-INSTALLED: ffmpeg, ImageMagick, Inkscape, poppler-utils'));
+  assert.equal(out.includes('PRE-INSTALLED: ffmpeg, ImageMagick, LibreOffice'), false);
+  assert.equal(out.includes('validate with soffice'), false);
+  const pptxRule = out.split('\n').find((line) => line.includes('For pptx:'));
+  assert.ok(pptxRule.includes('validate structurally with python-pptx'));
+  assert.equal(pptxRule.includes('python-docx'), false);
+  assert.match(pptxRule, /do not claim visual PDF validation/);
+  assert.match(out, /Do NOT run soffice, soffice\.bin, lowriter/);
+  assert.match(out, /python-docx/);
+  assert.match(out, /import weasyprint/);
+  assert.match(out, /pdfinfo/);
+  assert.match(out, /pdftoppm/);
+  assert.match(out, /seccomp/);
 });
 
 test('детект сбоя песочницы: только tool_result известного Bash tool_use', () => {

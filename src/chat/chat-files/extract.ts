@@ -59,7 +59,7 @@ export function kindByExt(ext: string): ChatFileKind {
 }
 
 /** Код в ответе — текст, а не ссылки: в чате там ничего не кликается. */
-function stripCode(content: string): string {
+export function stripCode(content: string): string {
   return content.replace(/```[\s\S]*?```/g, ' ').replace(/`[^`\n]*`/g, ' ');
 }
 

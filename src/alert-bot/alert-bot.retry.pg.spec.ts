@@ -27,6 +27,7 @@ maybe('дurable retry обновлений бота алертов против 
     await admin.query(`CREATE SCHEMA ${SCHEMA}`);
     pool = new Pool({ connectionString: PG, max: 4, options: `-c search_path=${SCHEMA}` });
     await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', '001_alert_bot.sql'), 'utf8'));
+    await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', '002_alert_bot_repair.sql'), 'utf8'));
     store = new AlertBotStore({
       query: (text: string, params?: any[]) => pool.query(text, params),
       getClient: () => pool.connect(),
@@ -51,6 +52,7 @@ maybe('дurable retry обновлений бота алертов против 
       { summary: jest.fn().mockResolvedValue('Сводка') } as any,
       { beginStream: jest.fn(), endStream: jest.fn() } as any,
       { findTicketByPrefix: jest.fn().mockResolvedValue(null) } as any,
+      { run: jest.fn(), findRepairByUpdate: jest.fn().mockResolvedValue(null) } as any,
     );
     const service = new AlertBotService(
       { resolveTelegram: jest.fn().mockResolvedValue({ isAdmin: true, userId: 'admin-retry' }) } as any,
@@ -64,6 +66,10 @@ maybe('дurable retry обновлений бота алертов против 
       } as any,
       turns,
       { findTicketByPrefix: jest.fn().mockResolvedValue(null) } as any,
+      {
+        findRepairByUpdate: jest.fn().mockResolvedValue(null),
+        abandonUnstarted: jest.fn().mockResolvedValue(true),
+      } as any,
     );
     return { service, turns };
   }

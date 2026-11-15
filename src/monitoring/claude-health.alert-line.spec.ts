@@ -5,20 +5,27 @@ describe('fallbackAlertLine — строка про запасных в алер
 
   it('ключей нет', () => {
     expect(fallbackAlertLine({ windowMs: 900_000, providers: { qwen: p(false), kimi: p(false) } }))
-      .toBe('Запасные за 15 мин: Qwen — не настроен; Kimi — не настроен');
+      .toBe('Запасные за 15 мин: Qwen — не настроен; Kimi — не настроен; Codex — не настроен');
   });
 
   it('оба настроены — исходы по каждому', () => {
     expect(fallbackAlertLine({ windowMs: 900_000, providers: { qwen: p(true, 12, 1), kimi: p(true, 3, 0) } }))
-      .toBe('Запасные за 15 мин: Qwen — ответов 12, ошибок 1; Kimi — ответов 3, ошибок 0');
+      .toBe('Запасные за 15 мин: Qwen — ответов 12, ошибок 1; Kimi — ответов 3, ошибок 0; Codex — не настроен');
   });
 
   it('окно берётся из статистики, а не зашито в строку', () => {
     expect(fallbackAlertLine({ windowMs: 600_000, providers: { qwen: p(true, 0, 3), kimi: p(false) } }))
-      .toBe('Запасные за 10 мин: Qwen — ответов 0, ошибок 3; Kimi — не настроен');
+      .toBe('Запасные за 10 мин: Qwen — ответов 0, ошибок 3; Kimi — не настроен; Codex — не настроен');
   });
 
   it('без разбивки по провайдерам — «не настроен», без падения', () => {
-    expect(fallbackAlertLine({ windowMs: 900_000 })).toBe('Запасные за 15 мин: Qwen — не настроен; Kimi — не настроен');
+    expect(fallbackAlertLine({ windowMs: 900_000 })).toBe('Запасные за 15 мин: Qwen — не настроен; Kimi — не настроен; Codex — не настроен');
+  });
+
+  it('Codex в счётчиках — строка про Codex', () => {
+    expect(fallbackAlertLine({
+      windowMs: 900_000,
+      providers: { qwen: p(false), kimi: p(false), codex: p(true, 2, 1) },
+    })).toContain('Codex — ответов 2, ошибок 1');
   });
 });

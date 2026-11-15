@@ -16,7 +16,7 @@ import { relayProviderFields } from '../chat/answer-provider';
  *     (r.linkeon.io) не склеивает вопрос с личными чатами и не переиспользует память по пользователю.
  *   • ничего не сохраняем: ни custom_chat_history, ни профиль. Ответ отдаём и забываем.
  *   • всё идёт через модель общего рубильника Linkeon (spec 2026-10-31-global-llm-switch,
- *     §4: Claude, Qwen или Kimi — по общей настройке, не по аккаунту конкретного человека) →
+ *     §4: Claude, Qwen, Kimi или Codex — по общей настройке, не по аккаунту конкретного человека) →
  *     провайдер видит «Linkeon», не человека.
  *
  * Что это НЕ прячет (честно): если сам текст вопроса самоидентифицирующий, архитектура тут бессильна —
@@ -110,7 +110,7 @@ export class CleanAskService {
     // Эфемерная, ни к кому не привязанная сессия — новая на каждый запрос.
     fd.append('sessionId', `anon_${randomUUID()}`);
     const provider = this.globalProvider ? await this.globalProvider.get() : 'claude';
-    // probe=false — цепочка релея (Claude → Qwen → Kimi) сохранена намеренно
+    // probe=false — цепочка релея (Claude → Qwen → Kimi → Codex) сохранена намеренно
     // (spec 2026-10-31-global-llm-switch §4), в отличие от гостей пробы
     // (§6, guest-turn.service.ts — без цепочки): у первого контакта и
     // «поговорить начисто» нет экрана «войдите» как запасного варианта,

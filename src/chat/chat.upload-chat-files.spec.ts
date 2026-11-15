@@ -370,3 +370,63 @@ describe('uploadAndChat — модельный блок product-action выре�
     expect(saved).not.toContain(FAKE_ID);
   });
 });
+
+/**
+ * Обработка ошибок загрузок (spec 2026-11-13-chat-upload-memory): исходник
+ * не сохранился (MinIO/Postgres отказали) — текущий ответ продолжается по
+ * прежнему relay-пути, а клиенту уходит понятное событие
+ * upload_persist_failed. Ход не должен падать в catch с «Ошибка обработки
+ * файла»: сбой сохранения оригинала и сбой ответа — разные вещи.
+ */
+describe('uploadAndChat — upload_persist_failed', () => {
+  const OLD_UPLOADS_FLAG = process.env.CHAT_UPLOADS_ENABLED;
+  beforeEach(() => {
+    jest.clearAllMocks();
+    delete process.env.AGENT_URL;
+    process.env.CHAT_UPLOADS_ENABLED = 'true';
+  });
+  afterEach(() => {
+    if (OLD_UPLOADS_FLAG === undefined) delete process.env.CHAT_UPLOADS_ENABLED;
+    else process.env.CHAT_UPLOADS_ENABLED = OLD_UPLOADS_FLAG;
+  });
+
+  it('saveOriginals вернула ошибку — relay вызван, в потоке upload_persist_failed, без error-события', async () => {
+    const pg = makePg();
+    const language = { resolveUserLanguage: jest.fn(async () => 'ru') };
+    const svc = new ChatService(
+      pg as any, null as any, null as any, null as any, language as any,
+      undefined, undefined, undefined, undefined,
+    );
+    const chatUploads = {
+      saveOriginals: jest.fn(async () => ({ saved: [], failed: ['bad.pdf'] })),
+      ownerUrl: jest.fn((id: string) => `/webhook/chat-uploads/${id}`),
+    };
+    const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+    const ctrl = new (ChatController as any)(svc, jwtSvc, null, undefined, undefined, chatUploads);
+    const post = jest.fn(async () => ({
+      data: sseStream([{ type: 'delta', text: 'Готово.' }, { type: 'done' }]),
+    }));
+    (axios as any).default = { post };
+    (axios as any).post = post;
+    const req = {
+      headers: { authorization: 'Bearer token' },
+      files: [{ originalname: 'bad.pdf', buffer: Buffer.from('x'), mimetype: 'application/pdf', size: 1 }],
+      body: { message: 'переведи', assistantId: '12' },
+    } as any;
+    const res = makeRes();
+
+    await ctrl.uploadAndChat(req, res);
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+
+    // Релей вызван несмотря на сбой сохранения.
+    expect(post).toHaveBeenCalled();
+    expect(res.written).toContainEqual({
+      type: 'upload_persist_failed',
+      content: 'Файл не сохранён для будущих разговоров',
+    });
+    // Catch-путь контроллера не сработал: ответ отстримлен как обычно.
+    const items = res.written.filter((w: any) => w.type === 'item').map((w: any) => w.content);
+    expect(items).not.toContain('Ошибка обработки файла. Попробуйте ещё раз.');
+    expect(res.written.find((w: any) => w.type === 'end')?.content).toBe('Готово.');
+  });
+});

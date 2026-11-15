@@ -11,7 +11,7 @@
 
 export type SectionName =
   | 'identity' | 'now' | 'today' | 'history' | 'continuation'
-  | 'cloud_profile' | 'business' | 'device' | 'balance';
+  | 'cloud_profile' | 'business' | 'device' | 'balance' | 'memory';
 
 export type ConsumerProfile = 'voice-launcher' | 'voice-web' | 'chat' | 'tg';
 
@@ -54,6 +54,14 @@ export interface BuiltContext {
  *
  * ⚠️ У `voice-web` секции `device` нет намеренно: у веба нет устройства, и
  * выжимка с чужого телефона туда попасть не может.
+ *
+ * `memory` — заголовки заметок и темы прошлых разговоров, без текста. Это не
+ * память, а ВИТРИНА памяти: ассистент узнаёт, что записанное существует, и
+ * достаёт нужное инструментом `recall`. Стоит ниже выжимки с устройства и
+ * выше облачного профиля: знать, о чём шла работа на той неделе, применимее,
+ * чем перечень ценностей, но устройству по-прежнему верим первым. Разбор —
+ * звонок 13.11.2026, где ассистент ответил «у меня нет доступа» к заметке,
+ * которую сам же и записал.
  */
 export const PROFILES: Record<ConsumerProfile, Partial<Record<SectionName, SectionSpec>>> = {
   'voice-launcher': {
@@ -62,6 +70,7 @@ export const PROFILES: Record<ConsumerProfile, Partial<Record<SectionName, Secti
     continuation:  { rank: 85,  budget: 1200 },
     today:         { rank: 80,  budget: 1200 },
     device:        { rank: 70,  budget: 1200 },
+    memory:        { rank: 65,  budget: 500 },
     cloud_profile: { rank: 60,  budget: 1200 },
     business:      { rank: 50,  budget: 800 },
     balance:       { rank: 40,  budget: 120 },
@@ -72,6 +81,7 @@ export const PROFILES: Record<ConsumerProfile, Partial<Record<SectionName, Secti
     identity:      { rank: 90,  budget: 200 },
     continuation:  { rank: 85,  budget: 1200 },
     today:         { rank: 80,  budget: 1200 },
+    memory:        { rank: 65,  budget: 500 },
     cloud_profile: { rank: 60,  budget: 1200 },
     business:      { rank: 50,  budget: 800 },
     balance:       { rank: 40,  budget: 120 },

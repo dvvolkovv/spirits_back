@@ -28,7 +28,7 @@ beforeEach(() => {
 describe('ChatFilesService.listForSession', () => {
   it('читает только ответы ассистента этой переписки, с фильтром по признакам вложений', async () => {
     const pg = makePg([]);
-    await new ChatFilesService(pg as any).listForSession('u1', 'u1_12');
+    await new ChatFilesService(pg as any, null as any).listForSession('u1', 'u1_12');
     expect(pg.calls[0].sql).toBe(SESSION_FILES_SQL);
     expect(pg.calls[0].params).toEqual(['u1_12']);
     expect(SESSION_FILES_SQL).toMatch(/session_id = \$1 AND sender_type = 'ai'/);
@@ -42,7 +42,7 @@ describe('ChatFilesService.listForSession', () => {
       { id: 20, content: `опять ![](${url})`, created_at: '2026-10-05T10:00:00Z' },
       { id: 10, content: `![](${url})`, created_at: '2026-09-20T10:00:00Z' },
     ]);
-    const items = await new ChatFilesService(pg as any).listForSession('u1', 'u1_12');
+    const items = await new ChatFilesService(pg as any, null as any).listForSession('u1', 'u1_12');
     expect(items).toEqual([
       {
         key: url, kind: 'image', url, name: '1.png', ext: 'png', createdAt: '2026-10-05T10:00:00.000Z', messageId: 20, stored: true,
@@ -54,7 +54,7 @@ describe('ChatFilesService.listForSession', () => {
 
   it('у не сохранившегося файла нет адреса', async () => {
     const pg = makePg([{ id: 1, content: `[Скачать a.pdf](${RELAY}/a.pdf)`, created_at: '2026-09-01T00:00:00Z' }]);
-    const [item] = await new ChatFilesService(pg as any).listForSession('u1', 'u1_12');
+    const [item] = await new ChatFilesService(pg as any, null as any).listForSession('u1', 'u1_12');
     expect(item).toMatchObject({ key: `${RELAY}/a.pdf`, stored: false, name: 'a.pdf' });
     expect(item.url).toBeUndefined();
   });
@@ -68,7 +68,7 @@ describe('ChatFilesService.listForSession', () => {
         { id: VID_ALIEN, user_id: 'u2', status: 'ready', video_url: 'https://v/alien.mp4', thumbnail_url: null },
       ],
     );
-    const items = await new ChatFilesService(pg as any).listForSession('u1', 'u1_12');
+    const items = await new ChatFilesService(pg as any, null as any).listForSession('u1', 'u1_12');
     expect(items.map((i) => [i.key, i.url, i.thumbUrl])).toEqual([[`video_job:${VID_OK}`, 'https://v/ok.mp4', 'https://v/ok.jpg']]);
     const q = pg.calls.find((c) => /FROM video_jobs/.test(c.sql))!;
     expect(q.sql).toMatch(/id = ANY\(\$1::uuid\[\]\) AND user_id = \$2/);
@@ -81,7 +81,7 @@ describe('ChatFilesService.listForSession', () => {
       [],
       [{ id: AUD, user_id: 'u1', url: 'https://a/clip.mp3' }],
     );
-    const items = await new ChatFilesService(pg as any).listForSession('u1', 'u1_12');
+    const items = await new ChatFilesService(pg as any, null as any).listForSession('u1', 'u1_12');
     expect(items).toEqual([
       expect.objectContaining({ key: `audio_clip:${AUD}`, kind: 'audio', url: 'https://a/clip.mp3', stored: true }),
     ]);

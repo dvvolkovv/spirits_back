@@ -7,7 +7,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import { turnFsKey, legacyTurnFsKey, uploadFileName, fallbackFileName, sessionOutputDir, ensureSessionDirs, ensureListingGuard } from "./paths.mjs";
+import { turnFsKey, legacyTurnFsKey, uploadFileName, fallbackFileName, sessionOutputDir, ensureSessionDirs, ensureSessionUploadDir, ensureListingGuard, isValidFsKey } from "./paths.mjs";
 import {
   AGENT_MCP_DIR, AGENT_SCRATCH_ROOT, sandboxMode, isCanarySession, buildSandboxSettings,
   baseToolsForTurn, buildTurnEnv, applySandboxPrompt, sandboxFailureFromToolResult,
@@ -494,8 +494,8 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   // ~/.local/bin/claude (его находит PATH процесса pm2), а не /usr/bin/claude.
   const MODELS = ["default", "haiku", "sonnet", "opus", "claude-opus-5-5"];
   const reqModel = MODELS.includes(String(req.body.model || "")) ? String(req.body.model) : "default";
-  // Провайдер хода (llm-fallback.mjs): выбор пользователя (provider=qwen|kimi —
-  // админка бэкенда) и аварийная цепочка Claude → Qwen → Kimi. Ключи — файлами,
+  // Провайдер хода (llm-fallback.mjs): выбор пользователя (provider=qwen|kimi|codex —
+  // админка бэкенда) и аварийная цепочка Claude → Qwen → Kimi → Codex. Ключи — файлами,
   // читаются на каждом ходе: нет файла — провайдер выключен. noFallback=1 —
   // пробы мониторинга, только Claude.
   const reqNoFallback = String(req.body.noFallback || "") === "1";
@@ -550,6 +550,12 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   } else {
     fs.mkdirSync(outDir, { recursive: true });
   }
+  // Вложенный каталог — только для непредсказуемого fs_key от бэка. Legacy
+  // fallback остаётся плоским: его sessionId предсказуем, а scrub/backfill
+  // знают именно прежние плоские пути.
+  const uploadSessionDir = req.files?.length && isValidFsKey(req.body.fs_key)
+    ? await ensureSessionUploadDir(fsKey, { uploads: UPLOAD_DIR })
+    : UPLOAD_DIR;
 
   // Папка хода ДО перехода на fs_key (26.10.2026). Модель может помнить путь
   // к файлу оттуда из истории разговора (ссылка, которую она сама когда-то
@@ -564,14 +570,14 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   const renamedFiles = [];
   if (req.files && req.files.length > 0) {
     for (const f of req.files) {
-      const newPath = path.join(UPLOAD_DIR, uploadFileName(f.originalname, fsKey));
+      const newPath = path.join(uploadSessionDir, uploadFileName(f.originalname, fsKey));
       try {
-        fs.renameSync(f.path, newPath);
+        fileOps.renameSync(f.path, newPath);
         renamedFiles.push({ path: newPath, name: f.originalname, size: f.size });
       } catch (e) {
-        const fallback = path.join(UPLOAD_DIR, fallbackFileName(f.originalname, fsKey, randomUUID()));
+        const fallback = path.join(uploadSessionDir, fallbackFileName(f.originalname, fsKey, randomUUID()));
         try {
-          fs.renameSync(f.path, fallback);
+          fileOps.renameSync(f.path, fallback);
           renamedFiles.push({ path: fallback, name: f.originalname, size: f.size });
         } catch (e2) {
           try { fs.unlinkSync(f.path); } catch {}
@@ -580,8 +586,9 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
     }
   }
 
+  const hasNewUploads = renamedFiles.length > 0;
   let prompt = "";
-  if (renamedFiles.length > 0) {
+  if (hasNewUploads) {
     prompt += "User uploaded files:\n";
     for (const f of renamedFiles) prompt += "- " + f.path + " (name: " + f.name + ", " + f.size + " bytes)\n";
     prompt += "\n";
@@ -703,6 +710,15 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   // приклей мы персону раньше — она бы там потерялась. Пустое поле (старый
   // бэкенд) оставляет поведение ровно прежним.
   if (reqSystemPrompt) systemPrompt += "\n\n" + reqSystemPrompt;
+  const disallowedTools = [
+    'mcp__plugin_telegram_telegram__reply',
+    'mcp__plugin_telegram_telegram__react',
+    'mcp__plugin_telegram_telegram__edit_message',
+    'mcp__plugin_telegram_telegram__download_attachment',
+    'ToolSearch',
+    ...(sbxOn ? ['WebFetch'] : []),
+    ...(hasNewUploads ? ['Agent'] : []),
+  ].join(',');
 
   // Один settings-файл на весь HTTP-ход: его используют первый запуск, повторы
   // и запасные провайдеры. Удаляется в finally независимо от sessionMcpPath.
@@ -748,7 +764,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
     "--max-turns", "40",
     ...cliToolArgs(reqTestMode, allowedTools),
     ...(sbxOn ? ["--settings", sandboxSettingsPath] : []),
-    "--disallowedTools", "mcp__plugin_telegram_telegram__reply,mcp__plugin_telegram_telegram__react,mcp__plugin_telegram_telegram__edit_message,mcp__plugin_telegram_telegram__download_attachment,ToolSearch" + (sbxOn ? ",WebFetch" : ""),
+    "--disallowedTools", disallowedTools,
     "--mcp-config", mcpConfigPath,
     "--strict-mcp-config",
     // Снимок промпта выключен. CLI 2.1.280 в режиме --print пишет в транскрипт
@@ -760,6 +776,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
     // новому. Цена — холодный кэш на ходе, где поменялся промпт (так и было до 23.09).
     "--system-prompt-snapshot", "off",
     "--system-prompt", systemPrompt,
+    "--append-system-prompt-file", path.join(HERE, hasNewUploads ? "document-analysis-rules-upload.txt" : "document-analysis-rules.txt"),
   ];
 
   let clientDisconnected = false;
@@ -1415,6 +1432,14 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
       res.end();
     }
   } finally {
+    // Multer записывает исходники до настройки хода. После renameSync их уже
+    // нет (ENOENT); при ранней ошибке удаляем, чтобы ответ 500 не оставлял
+    // сотни мегабайт осиротевших файлов в корне uploads.
+    for (const file of req.files || []) {
+      try { fs.unlinkSync(file.path); } catch (e) {
+        if (e?.code !== "ENOENT") console.log("исходник Multer не удалён: " + (e?.code || e?.name || "?"));
+      }
+    }
     // Общий liveSet и синхронная очистка обоих suffix. Пути уникальны на ход,
     // поэтому finally preempted-запроса не трогает файлы следующего.
     removeSandboxSettings(sessionMcpPath, liveMcpConfigPaths);

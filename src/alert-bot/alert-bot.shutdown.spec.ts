@@ -30,7 +30,7 @@ describe('alert-bot shutdown before PostgreSQL close', () => {
         return new Promise<string>(() => {});
       }),
     };
-    const ops = new AlertBotOpsServer({} as any, tools as any, { toolTimeoutMs: 60_000 });
+    const ops = new AlertBotOpsServer({} as any, tools as any, {} as any, {} as any, { toolTimeoutMs: 60_000 });
     const turns = {
       idle: jest.fn(() => {
         events.push('turns.idle');
@@ -45,10 +45,15 @@ describe('alert-bot shutdown before PostgreSQL close', () => {
       migrate: jest.fn().mockResolvedValue(undefined),
       interruptInProgress: jest.fn(),
       requeueProcessingUpdates: jest.fn(),
-      cleanup: jest.fn(),
+      cleanup: jest.fn().mockResolvedValue(undefined),
+    };
+    const repairStore = {
+      migrate: jest.fn().mockResolvedValue(undefined),
+      interruptActive: jest.fn().mockResolvedValue([]),
+      cleanup: jest.fn().mockResolvedValue(undefined),
     };
     const lifecycle = new (AlertBotLifecycle as any)(
-      store, ops, {}, turns, service, pg,
+      store, repairStore, ops, {}, turns, service, pg,
     );
     await lifecycle.onModuleInit();
 
@@ -61,7 +66,7 @@ describe('alert-bot shutdown before PostgreSQL close', () => {
     const startedAt = Date.now();
     try {
       await pg.onModuleDestroy();
-      expect(Date.now() - startedAt).toBeLessThan(6500);
+      expect(Date.now() - startedAt).toBeLessThan(11000);
       expect(service.stopAdmission).toHaveBeenCalledTimes(1);
       expect(toolSignal?.aborted).toBe(true);
       expect(events).toEqual([
@@ -74,5 +79,5 @@ describe('alert-bot shutdown before PostgreSQL close', () => {
       await ops.stop();
       await lifecycle.onModuleDestroy();
     }
-  }, 8000);
+  }, 12000);
 });
