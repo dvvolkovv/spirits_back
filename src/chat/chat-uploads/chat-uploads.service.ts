@@ -223,34 +223,6 @@ export class ChatUploadsService {
     return rows.map((row) => this.row(row));
   }
 
-  async deleteForUser(userId: string): Promise<void> {
-    const { rows } = await this.pg.query(
-      'SELECT storage_key FROM chat_uploads WHERE user_id = $1',
-      [userId],
-    );
-    for (const row of rows) {
-      try {
-        await this.storage.delete({ bucket: BUCKET, key: row.storage_key });
-      } catch (e: any) {
-        if (this.isNotFound(e)) {
-          // Account deletion must continue even when an object is already absent.
-          this.logger.warn(
-            `deleteForUser: object already absent (user=${userId}, key=${row.storage_key}): ${this.errDetail(e)}`,
-          );
-          continue;
-        }
-        // storage_key — единственный указатель на байты: без успешного удаления
-        // строки нельзя терять, иначе при восстановлении MinIO байты останутся
-        // навсегда. Ошибка уходит наверх, удаление аккаунта повторяется позже.
-        this.logger.error(
-          `deleteForUser: storage delete failed (user=${userId}): ${this.errDetail(e)}; DB rows kept for retry`,
-        );
-        throw e;
-      }
-    }
-    await this.pg.query('DELETE FROM chat_uploads WHERE user_id = $1', [userId]);
-  }
-
   assistantBlock(records: ChatUploadRecord[] | null | undefined): string {
     if (process.env.CHAT_UPLOADS_ENABLED !== 'true' || !records?.length) return '';
     // Строка про срок и «только последняя копия» — не косметика (I1a, ревью
@@ -269,14 +241,6 @@ export class ChatUploadsService {
       'These links are for your internal use only; NEVER show or paste them to the user — to give the user a file, find it via find_files and share only its "url" field.',
       ...records.map((record) => `- ${record.originalName}: ${this.assistantUrl(record.id)}`),
     ].join('\n');
-  }
-
-  private isNotFound(e: any): boolean {
-    return (
-      e?.name === 'NotFound' ||
-      e?.name === 'NoSuchKey' ||
-      e?.$metadata?.httpStatusCode === 404
-    );
   }
 
   /** Вид и сообщение ошибки — без байтов, подписей и секретов. */

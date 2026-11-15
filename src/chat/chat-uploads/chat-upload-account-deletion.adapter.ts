@@ -32,8 +32,11 @@ import { CHAT_UPLOADS_BUCKET } from './chat-uploads.service';
  *
  * В отличие от chat-file.purge, ключи НЕ снапшотятся в payload: таблицу
  * chat_uploads никто кроме этого адаптера не стирает (старый inline-путь
- * deleteForUser из deleteProfile снят), строки доживают до purge —
- * storage_key'и читаются из таблицы в момент исполнения, гонки нет.
+ * ChatUploadsService.deleteForUser удалён — он миновал бы fencing), строки
+ * доживают до purge — storage_key'и читаются из таблицы в момент исполнения.
+ * Гонку реактивации в окне между последним assertCurrent и финальным DELETE
+ * закрывает generation predicate внутри DELETE (state='deleted' +
+ * deletion_id; дом-паттерн — devices-account-deletion.adapter.ts).
  * Одна задача на аккаунт, resourceKey статический ('chat-uploads', форма
  * tasks/support/peer/referral): userId в resourceKey забраковал бы
  * fail-closed sanitizer (safeDeletionJobSnapshot: resourceKey === userId).
@@ -116,7 +119,17 @@ export class ChatUploadAccountDeletionAdapter implements OnModuleInit, AccountDe
     }
 
     // Строки — после объектов: при любом сбое выше указатели на байты живы.
+    // TOCTOU между assertCurrent и DELETE закрывает generation predicate
+    // внутри DELETE (дом-паттерн — devices-account-deletion.adapter.ts):
+    // реактивация, закоммиченная в этом окне, сохраняет строки живого
+    // аккаунта; 0 затронутых строк — тихий успех (паттерн devices/tasks/contacts).
     await ctx.assertCurrent(job);
-    await ctx.db.query('DELETE FROM chat_uploads WHERE user_id = $1', [job.userId]);
+    await ctx.db.query(
+      `DELETE FROM chat_uploads
+        WHERE user_id = $1
+          AND EXISTS (SELECT 1 FROM user_id u
+            WHERE u.internal_id = $1 AND u.state = 'deleted' AND u.deletion_id = $2)`,
+      [job.userId, job.deletionId],
+    );
   }
 }

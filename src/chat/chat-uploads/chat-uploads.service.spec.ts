@@ -164,28 +164,7 @@ describe('ChatUploadsService', () => {
     });
   });
 
-  describe('deleteForUser', () => {
-    it('при не-NotFound ошибке MinIO не удаляет строки и бросает ошибку наверх', async () => {
-      pg.query.mockResolvedValueOnce({ rows: [{ storage_key: 'k/a.pdf' }] });
-      storage.delete.mockRejectedValueOnce(
-        Object.assign(new Error('connection refused'), { name: 'ServiceUnavailable' }),
-      );
-      await expect(service.deleteForUser('u1')).rejects.toThrow('connection refused');
-      const deleteSqls = pg.query.mock.calls
-        .map((call) => String(call[0]))
-        .filter((sql) => sql.startsWith('DELETE FROM chat_uploads'));
-      expect(deleteSqls).toHaveLength(0);
-    });
-
-    it('терпит отсутствующий объект (NotFound) и удаляет строки', async () => {
-      pg.query.mockResolvedValueOnce({ rows: [{ storage_key: 'k/gone.pdf' }] });
-      storage.delete.mockRejectedValueOnce(
-        Object.assign(new Error('The specified key does not exist.'), { name: 'NotFound' }),
-      );
-      await expect(service.deleteForUser('u1')).resolves.toBeUndefined();
-      expect(
-        pg.query.mock.calls.some((call) => String(call[0]).startsWith('DELETE FROM chat_uploads')),
-      ).toBe(true);
-    });
-  });
+  // deleteForUser удалён из сервиса (Phase 2): очистку chat_uploads при
+  // удалении аккаунта делает конвейер — chat-upload-account-deletion.adapter.ts
+  // (fencing + deleteConfirmed), покрытие — в адаптерных спеках.
 });
