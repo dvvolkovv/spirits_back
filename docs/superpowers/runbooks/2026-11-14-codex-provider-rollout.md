@@ -16,9 +16,9 @@
 2. `bash ~/Downloads/spirits_back/scripts/deploy.sh` (с мака; с ноды — `~/dev/spirits_back/scripts/deploy.sh`) — двухфазный test → smoke → prod → smoke. codex-bridge/ уезжает вместе с бэком (деплой git-based).
 3. На test-ноде цепочка останется Claude → Qwen → Kimi: CODEX_FALLBACK_API_KEY там НЕ заводится (сознательно — smoke deploy.sh должен пройти без codex).
 4. Релей (вручную):
-   - скопировать `codex-bridge/` из spirits_back в `/home/dv/file-agent/codex-bridge/` (bridge.mjs, translate.mjs, sse.mjs, keep-alive.sh);
+   - скопировать каталог `codex-bridge/` из spirits_back в `/home/dv/file-agent/codex-bridge/` ЦЕЛИКОМ (bridge.mjs, translate.mjs, sse.mjs, keep-alive.sh и все `*.test.mjs` — они нужны для проверки);
    - обновлённый `relay-agent/llm-fallback.mjs` закоммитить как dv в живой ветке `reconcile/agent-versioned-live-part-b`;
-   - на релее: `node --check` каждого .mjs, `node --test` для llm-fallback.test.mjs и `node --test codex-bridge/*.test.mjs` → 45 pass (ловит порчу при копировании);
+   - на релее: `node --check` каждого .mjs, `node --test` для llm-fallback.test.mjs → 39 pass и `node --test codex-bridge/*.test.mjs` → 45 pass (ловит порчу при копировании);
    - `pm2 restart file-agent` — при нуле стримов, с OK; после — `pm2 status` и журнал без ошибок.
 
 ## Шаг 2. Сервер бэкенда (dvolkov@212.113.106.202)
@@ -30,15 +30,16 @@
 6. Один живой smoke через мост (РОВНО РАЗ): `curl -sS http://127.0.0.1:8790/v1/messages -H 'content-type: application/json' -d '{"model":"gpt-6-astra","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"ответь ok"}]}'` → SSE с stop_reason end_turn.
 7. Ключ-заглушка в .env бэка (через stdin, не печатая): добавить строку `CODEX_FALLBACK_API_KEY=local-bridge`.
 8. Перезапуск API: `BACK_ONLY=1 bash ~/Downloads/spirits_back/scripts/deploy.sh` (с мака) — при нуле стримов, с OK.
-9. Cron-освежитель: `crontab -e` → `0 4 */3 * * /home/dvolkov/spirits_back/codex-bridge/keep-alive.sh`; проверить, что `crontab -l` содержит строку. Ротация журнала моста (`~/.linkeon/logs/codex-bridge.log`, ~150 Б на строку, строка на запрос): ротация у моста отсутствует — либо logrotate строго в режиме `copytruncate` (обычный create/move тихо унесёт fd, и журнал продолжит писаться в ротированный файл до рестарта), либо сознательно принять неограниченный рост с периодической проверкой места (на серверах был инцидент DiskFull 27.10).
+9. Cron-освежитель: `crontab -e` → `0 4 */3 * * /home/dvolkov/spirits_back/codex-bridge/keep-alive.sh`; проверить, что `crontab -l` содержит строку. Разово проверить вручную: `bash -x /home/dvolkov/spirits_back/codex-bridge/keep-alive.sh 2>&1 | tail -8` — должен вызваться `codex exec`, а не «command not found» (скрипт сам дополняет PATH: npm-global/nvm/.local; при отсутствии codex — exit 127). Ручной прогон тратит пренебрежимо малую квоту (один «ответь ok» на gpt-5.6-luna). Ротация журнала моста (`~/.linkeon/logs/codex-bridge.log`, ~150 Б на строку, строка на запрос): ротация у моста отсутствует — либо logrotate строго в режиме `copytruncate` (обычный create/move тихо унесёт fd, и журнал продолжит писаться в ротированный файл до рестарта), либо сознательно принять неограниченный рост с периодической проверкой места (на серверах был инцидент DiskFull 27.10).
 10. Живая проверка цепочки (РОВНО РАЗ, с OK): `cd /home/dvolkov/spirits_back && npm run build && CODEX_FALLBACK_API_KEY=local-bridge node scripts/codex-fallback-check.js` → все строки OK (картинка — INFO допустим), exit 0.
 11. Мониторинг: в ближайшем health-алерте строка «Codex — ответов N, ошибок M» (до первого хода — «не настроен» сменится после включения ключа).
 
 ## Шаг 3. Релей (dv@5.101.115.184) — то же, с поправками
+- Закрепить CLI: `npm i -g @openai/codex@0.154.0` (как в шаге 2.1); `codex --version`.
 - Туннель и логин: `ssh -L 1455:localhost:1455 dv@5.101.115.184` → `codex login` (одобряет владелец).
 - Мост: `cd /home/dv/file-agent/codex-bridge && pm2 start bridge.mjs --name codex-bridge && pm2 save`; healthz. Те же оговорки, что на Шаге 2: чистый env оболочки (нет BRIDGE_PORT/BRIDGE_LOG_PATH), только `127.0.0.1` (не localhost), ротация журнала — только `copytruncate`. Под pm2 мост поднимается благодаря диффу 4 (pm_id).
 - Ключ: записать `local-bridge` в `/home/dv/file-agent/secrets/codex.key` через stdin, `chmod 600`. Рестарт file-agent НЕ нужен (readProviderConfig читает файл на каждый запрос).
-- Cron: `0 4 */3 * * /home/dv/file-agent/codex-bridge/keep-alive.sh` (от dv).
+- Cron: `0 4 */3 * * /home/dv/file-agent/codex-bridge/keep-alive.sh` (от dv); разово проверить вручную `bash -x` как в шаге 2.9 (PATH cron так же голый).
 - Контроль: короткий ход через канал, который обслуживает релей, с личным выбором Codex (шаг 4) — в журнале file-agent провайдер codex.
 
 ## Шаг 4. Приёмка владельцем (E2E)
