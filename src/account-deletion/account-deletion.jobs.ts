@@ -337,22 +337,35 @@ export class AccountDeletionJobs {
    * появиться новые stop-задачи (поздний capture файлов их не создаёт, но
    * любой повторный collect обязан блокировать core тем же правилом).
    *
-   * Исход retryable (kind db), а не cancelled: поколение текущее, аккаунт
-   * по-прежнему удаляется — core лишь ждёт завершения stop-задач и будет
-   * повторён runner-ом через backoff. Прецедент вида — retryable-исходы
-   * chat-file адаптера.
+   * Исход зависит от статуса блокера (T20-M2(i) (ревью Task 20, фикс): cancelled-блокер → DeletionCancelledError, не retry):
+   *  - pending/running/failed — retryable (kind db): поколение текущее,
+   *    аккаунт по-прежнему удаляется, core лишь ждёт завершения stop-задач
+   *    и будет повторён runner-ом через backoff (прецедент вида —
+   *    retryable-исходы chat-file адаптера);
+   *  - cancelled — поколение закрыто реактивацией (Task 20 отменяет все
+   *    незавершённые задачи), исход терминальный: DeletionCancelledError.
+   *    Прежде здесь был retry('db'): на явном пути kind в логе врал
+   *    ('db' вместо 'cancelled', HTTP-исход не меняется — 503), а на
+   *    merge-пути отмена всплывала как 503 {retryable:true} БЕЗ потребления
+   *    mergeToken вместо терминального 409 с потреблением токена;
+   *  - cancelled вперемешку с failed — приоритет у cancelled: поколение
+   *    закрыто целиком, «доделывать» нечего.
    */
   async assertNoImmediateBlockers(deletionId: string): Promise<void> {
     const result = await this.db.query(
-      `SELECT 1
+      `SELECT status
        FROM account_deletion_jobs
        WHERE deletion_id=$1
          AND resource_type LIKE '%.stop'
-         AND status<>'done'
-       LIMIT 1`,
+         AND status<>'done'`,
       [deletionId],
     );
-    if ((result.rows?.length ?? 0) > 0) throw new DeletionRetryError('db');
+    const rows = result.rows ?? [];
+    if (rows.length === 0) return;
+    if (rows.some((row) => row.status === 'cancelled')) {
+      throw new DeletionCancelledError();
+    }
+    throw new DeletionRetryError('db');
   }
 
   /**

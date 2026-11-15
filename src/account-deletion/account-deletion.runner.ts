@@ -76,6 +76,13 @@ export class AccountDeletionRunner {
    * done — успешный выход без исполнения; исчезнувшая/недостижимая строка —
    * find сам бросит DeletionRetryError('db'), прежний исход.
    *
+   * T20-M2(i) (ревью Task 20): та же гонка с противоположным исходом —
+   * реактивация (Task 20) сняла поколение МЕЖДУ find(core) и runJob:
+   * переданная строка ещё pending/running, но перечитывание даёт cancelled.
+   * Такой исход — отмена, а не retryable: DeletionCancelledError, честный
+   * kind='cancelled' в логе, и явный путь не предлагает «повторить позже»
+   * для закрытого поколения (HTTP-исход deleteExplicit не меняется — 503).
+   *
    * Заклеймленные строки (из claimNext/claimNextStop — всегда running с
    * СОБСТВЕННЫМ живым lease) через этот метод не ходят: их исполняет runClaimed
    * напрямую, иначе claimById отверг бы наш же lease. Поведение
@@ -92,6 +99,9 @@ export class AccountDeletionRunner {
         jobRow.resourceKey,
       );
       if (fresh.status === 'done') return;
+      // T20-M2(i): перечитывание видит cancelled — поколение закрыто
+      // реактивацией, исход терминальный, а не retryable.
+      if (fresh.status === 'cancelled') throw new DeletionCancelledError();
       throw new DeletionRetryError('db');
     }
     await this.runClaimed(claimed);
