@@ -1,4 +1,5 @@
 import { readFileSync } from 'fs';
+import { ServiceUnavailableException } from '@nestjs/common';
 import { Pool } from 'pg';
 import { AccountDeletionJobs } from '../account-deletion/account-deletion.jobs';
 import { AccountDeletionLifecycle } from '../account-deletion/account-deletion.lifecycle';
@@ -116,6 +117,20 @@ maybe('реактивация после удаления — одна тран�
   async function jobCount(): Promise<number> {
     const r = await rows(`SELECT count(*)::int AS n FROM account_deletion_jobs`);
     return r[0].n;
+  }
+
+  /**
+   * Поколение core-задачи пользователя: после реактивации user_id.deletion_id
+   * уже NULL, а аудит-строка задачи остаётся (таблица в beforeEach TRUNCATE-
+   * ится, поэтому core.immediate у пользователя ровно один).
+   */
+  async function generationOfCore(userId: string): Promise<string> {
+    const r = await rows(
+      `SELECT deletion_id FROM account_deletion_jobs
+        WHERE user_id=$1 AND resource_type='account.core.immediate'`,
+      [userId],
+    );
+    return r[0].deletion_id;
   }
 
   async function balance(userId: string): Promise<number> {
@@ -573,6 +588,96 @@ maybe('реактивация после удаления — одна тран�
     expect(await historyCount(first.userId)).toBe(0);
     expect(await unfinishedJobs(after.deletion_id)).toBe(0);
     // Старое поколение осталось в архиве задач (аудит) и не пересоздавалось.
+    expect(await unfinishedJobs(generation1)).toBe(0);
+  });
+
+  /**
+   * T20-M3 (ревью Task 20): реактивация ВО ВРЕМЯ исполнения core-адаптера —
+   * движковый аналог flip-теста Task 19 (identity.merge-deletion.pg.spec.ts
+   * «реактивация во время стопа»), но на явном пути и в окне ПОСЛЕ внешних
+   * операций.
+   *
+   * Hook внутри neo4j.deleteUserGraphStrict (единственная внешняя операция
+   * core) воспроизводит ТОЧНЫЙ эффект IdentityService.reactivateIfNeeded
+   * (отмена незавершённых задач поколения + снятие поколения) прямым SQL в
+   * одной транзакции — прецедент identity.merge-deletion.pg.spec.ts (helper
+   * reactivate). Вход через resolveOrCreate здесь недостижим: его шаг 1
+   * возвращает существующую связку user_identities БЕЗ проверки state, а
+   * связки core стирает только в самом конце (локальная транзакция) — до
+   * неё повторная регистрация «входит» в удалённый аккаунт, а не
+   * реактивирует его (наблюдение для координатора, вне рамок Task 21).
+   *
+   * Следующий за neo4j assertCurrent (profile-account-deletion.adapter.ts,
+   * перед локальной транзакцией) обязан увидеть снятое поколение и бросить
+   * DeletionCancelledError: локальные удаления НЕ переживают реактивацию,
+   * job остаётся cancelled (поздний jobs.fail не воскрешает строку —
+   * WHERE status='running' даёт 0 строк), HTTP-исход deleteExplicit —
+   * прежний 503 (lifecycle измеряет успех статусом строки core).
+   * Per-batch gen-recheck в адаптерах НЕ добавляется (решение ревью).
+   */
+  it('T20-M3: реактивация во время core-адаптера — локальное стирание не выживает, core cancelled, аккаунт жив', async () => {
+    const PHONE = '79990000104';
+    const stack = makeStack();
+
+    const first = ok(await stack.identity.resolveOrCreate('phone', { phone: PHONE }));
+    await seedHistory(first.userId, PERSONAL_CANARY);
+
+    // Реактивация попадает ровно между внешней операцией (neo4j) и локальной
+    // транзакцией удаления — самое опасное окно flip-гонки.
+    stack.neo4j.deleteUserGraphStrict.mockImplementation(async () => {
+      const gen = await rows(
+        `SELECT deletion_id FROM user_id WHERE internal_id=$1`,
+        [first.userId],
+      );
+      const deletionId = gen[0].deletion_id;
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        // Шаг 2 reactivateIfNeeded: гасим ВСЕ незавершённые задачи поколения.
+        await client.query(
+          `UPDATE account_deletion_jobs
+              SET status='cancelled', lease_until=NULL,
+                  completed_at=now(), updated_at=now()
+            WHERE user_id=$1 AND deletion_id=$2
+              AND status IN ('pending','running','failed')`,
+          [first.userId, deletionId],
+        );
+        // Шаг 3: снимаем поколение.
+        await client.query(
+          `UPDATE user_id
+              SET state='active', deleted_at=NULL, deletion_id=NULL, update_date=now()
+            WHERE internal_id=$1 AND state <> 'active'`,
+          [first.userId],
+        );
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        throw e;
+      } finally {
+        client.release();
+      }
+    });
+
+    await expect(stack.profile.deleteProfile(first.userId))
+      .rejects.toBeInstanceOf(ServiceUnavailableException);
+    expect(stack.neo4j.deleteUserGraphStrict).toHaveBeenCalled();
+
+    // Записи адаптера не переживают реактивацию: личный текст цел (локальная
+    // транзакция core не начиналась — assertCurrent прервал исполнение).
+    expect(await historyCount(first.userId)).toBeGreaterThan(0);
+
+    // Аккаунт снова жив: поколение снято реактивацией.
+    const u = await userRow(first.userId);
+    expect(u.state).toBe('active');
+    expect(u.deletion_id).toBeNull();
+    expect(u.deleted_at).toBeNull();
+
+    // Job остаётся cancelled: реактивация отменила running-строку, а поздний
+    // jobs.fail('cancelled') её не изменил (WHERE status='running' — 0 строк).
+    const generation1 = await generationOfCore(first.userId);
+    const core = await stack.jobs.find(generation1, 'account.core.immediate', 'account');
+    expect(core.status).toBe('cancelled');
+    expect(core.leaseUntil).toBeNull();
     expect(await unfinishedJobs(generation1)).toBe(0);
   });
 });

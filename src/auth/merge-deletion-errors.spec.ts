@@ -161,4 +161,28 @@ describe('POST /webhook/auth/identities/merge — ошибки deletion-pipeline
     });
     expect(jwt.signAccess).toHaveBeenCalledWith(CONFLICT);
   });
+
+  /**
+   * T20-M4 (ревью Task 20, characterization): произвольная НЕ-deletion ошибка
+   * mergeAccounts всплывает как есть (глобальный фильтр Nest → 500), а
+   * mergeToken НЕ потреблён. Инфраструктурный сбой (например, обрыв
+   * соединения с БД) не должен маскироваться под deletion-исход и лишать
+   * повторной попытки с тем же токеном: redis.del стоит после catch-блока и
+   * выполняется только на успехе/терминальной отмене.
+   */
+  it('T20-M4: не-deletion ошибка всплывает (→500), токен НЕ потреблён', async () => {
+    const { ctrl, redis, identity } = makeCtrl(async () => {
+      throw new Error('connection terminated unexpectedly');
+    });
+    const res = mockRes();
+
+    await expect(ctrl.mergeAccounts({ mergeToken: TOKEN }, req, res))
+      .rejects.toThrow('connection terminated unexpectedly');
+
+    expect(identity.mergeAccounts).toHaveBeenCalledWith(CONFLICT, TARGET);
+    expect(redis.del).not.toHaveBeenCalled();
+    expect(redis.store.has(`merge-token-${TOKEN}`)).toBe(true);
+    // Ответ не отправлен: 500 сформирует глобальный exception-filter.
+    expect(res.status).not.toHaveBeenCalled();
+  });
 });

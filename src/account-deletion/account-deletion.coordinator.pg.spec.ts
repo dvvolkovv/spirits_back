@@ -10,6 +10,7 @@ import { AccountDeletionRunner } from './account-deletion.runner';
 import {
   DELETION_RESOURCE_TYPES,
   DeletionCancelledError,
+  DeletionRetryError,
 } from './account-deletion.safe';
 import type { PgService } from '../common/services/pg.service';
 import type {
@@ -809,5 +810,67 @@ type AdapterImplementation = (
       execute: async () => undefined,
     });
     expect(() => registry.assertReady()).not.toThrow();
+  });
+
+  /**
+   * T20-M2(ii) (ревью Task 20): cancelled-блокер в assertNoImmediateBlockers.
+   *
+   * Cancelled stop означает, что поколение ЗАКРЫТО реактивацией (Task 20
+   * отменяет все незавершённые задачи) — исход не retryable. Прежний код
+   * бросал DeletionRetryError('db') для любого status<>'done':
+   *  - явный путь: deleteExplicit ловил и давал 503, но kind в логе ('db')
+   *    скрывал отмену;
+   *  - merge-путь: stopOnly транслировал отмену в 503 {retryable:true} БЕЗ
+   *    потребления токена, хотя исход терминальный — auth.controller обязан
+   *    отдать 409 и потребить mergeToken (новый конфликт-флоу).
+   * Контракт после фикса: cancelled-блокер → DeletionCancelledError
+   * (kind='cancelled'); failed/pending — прежний retry('db'); mixed —
+   * cancelled приоритетнее (поколение мертво целиком).
+   */
+  describe('assertNoImmediateBlockers — cancelled-блокер (T20-M2(ii), PG)', () => {
+    it('cancelled stop → DeletionCancelledError(kind=cancelled), не retry(db)', async () => {
+      const acc = account('u-blockers-cancelled');
+      await insertDeleted(acc);
+      await insertJob(acc, 'routine.stop', 'r-1', { status: 'cancelled', attempts: 1 });
+      const jobs = new AccountDeletionJobs(pool);
+
+      const error = await jobs.assertNoImmediateBlockers(acc.deletionId).catch((e) => e);
+
+      expect(error).toBeInstanceOf(DeletionCancelledError);
+      expect((error as DeletionCancelledError).kind).toBe('cancelled');
+    });
+
+    it('failed stop → прежний retryable DeletionRetryError(db)', async () => {
+      const acc = account('u-blockers-failed');
+      await insertDeleted(acc);
+      await insertJob(acc, 'routine.stop', 'r-1', { status: 'failed', attempts: 2 });
+      const jobs = new AccountDeletionJobs(pool);
+
+      const error = await jobs.assertNoImmediateBlockers(acc.deletionId).catch((e) => e);
+
+      expect(error).toBeInstanceOf(DeletionRetryError);
+      expect((error as DeletionRetryError).kind).toBe('db');
+    });
+
+    it('mixed cancelled+failed → cancelled приоритетнее (поколение закрыто реактивацией)', async () => {
+      const acc = account('u-blockers-mixed');
+      await insertDeleted(acc);
+      await insertJob(acc, 'routine.stop', 'r-1', { status: 'failed', attempts: 2 });
+      await insertJob(acc, 'tasks.stop', 'tasks', { status: 'cancelled', attempts: 1 });
+      const jobs = new AccountDeletionJobs(pool);
+
+      const error = await jobs.assertNoImmediateBlockers(acc.deletionId).catch((e) => e);
+
+      expect(error).toBeInstanceOf(DeletionCancelledError);
+    });
+
+    it('все стопы done → resolves', async () => {
+      const acc = account('u-blockers-done');
+      await insertDeleted(acc);
+      await insertJob(acc, 'routine.stop', 'r-1', { status: 'done', attempts: 1 });
+      const jobs = new AccountDeletionJobs(pool);
+
+      await expect(jobs.assertNoImmediateBlockers(acc.deletionId)).resolves.toBeUndefined();
+    });
   });
 });

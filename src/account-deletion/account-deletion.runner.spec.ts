@@ -186,4 +186,32 @@ describe('runJob — нормализация незаклеймленных с�
     );
     expect(executed).toEqual([]);
   });
+
+  /**
+   * T20-M2(i) (ревью Task 20): реактивация сняла поколение МЕЖДУ find(core)
+   * и runJob — переданная строка ещё pending/running, но claimById отказывает
+   * (cancelled не клеймится), а перечитывание даёт status='cancelled'.
+   * Прежний код проваливал такой исход в DeletionRetryError('db'): честная
+   * отмена маскировалась под retryable-сбой, kind в логе врал, а явный путь
+   * предлагал «повторить позже» вместо терминального исхода. Контракт после
+   * фикса: DeletionCancelledError(kind='cancelled'), адаптер молчит.
+   */
+  it('T20-M2(i): перечитывание после отказа claim дало cancelled — DeletionCancelledError, не retry(db)', async () => {
+    const stale = makeRow({ status: 'pending', attempts: 0, leaseUntil: null });
+    const fresh = makeRow({ status: 'cancelled', attempts: 1, leaseUntil: null });
+    const { runner, jobs, executed } = makeStack(null, async () => fresh);
+
+    const error = await runner.runJob(stale).catch((e) => e);
+
+    expect(error).toBeInstanceOf(DeletionCancelledError);
+    expect((error as DeletionCancelledError).kind).toBe('cancelled');
+    expect(jobs.find).toHaveBeenCalledWith(
+      stale.deletionId,
+      stale.resourceType,
+      stale.resourceKey,
+    );
+    expect(executed).toEqual([]);
+    expect(jobs.finish).not.toHaveBeenCalled();
+    expect(jobs.fail).not.toHaveBeenCalled();
+  });
 });
