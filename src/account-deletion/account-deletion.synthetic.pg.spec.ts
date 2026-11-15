@@ -808,7 +808,10 @@ maybe('synthetic deletion lifecycle — полная цепочка против
 
   // ------------------------------------------------------------------ tests
 
-  it('composition root: весь каталог зарегистрирован, assertReady зелёный', () => {
+  it('composition root: состав реестра как в проде, assertReady зелёный (T22.6)', () => {
+    // Skip-only типы ('calendar.external', 'video.provider') не зарегистрированы
+    // (стабы убраны в T22.6): assertReady их не требует, санитайзер отклоняет
+    // JOB'ы таких типов, а discoverer'ы эмитируют только skips.
     expect(() => stack.registry.assertReady()).not.toThrow();
     // Внешних вызовов до начала сценария не было.
     expect(stack.failures.totalCalls()).toBe(0);

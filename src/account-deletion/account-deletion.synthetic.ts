@@ -25,7 +25,7 @@ import { AccountDeletionPlanner } from './account-deletion.planner';
 import { AccountDeletionRegistry } from './account-deletion.registry';
 import { AccountDeletionRunner } from './account-deletion.runner';
 import { AccountDeletionSchemaService } from './account-deletion.schema';
-import type { AccountDeletionAdapter, DeletionDiscovery } from './account-deletion.types';
+import type { DeletionDiscovery } from './account-deletion.types';
 import { ProfileAccountDeletionAdapter } from '../profile/profile-account-deletion.adapter';
 import { ProfileAccountDeletionRecapture } from '../profile/profile-account-deletion.discovery';
 import { RoutineAccountDeletionAdapter } from '../routine-push/routine-account-deletion.adapter';
@@ -76,12 +76,12 @@ import { LegacySmmAccountDeletionAdapter } from '../misc/legacy-smm-account-dele
  * удалённых подключений и платных внешних вызовов. retentionMs передаётся
  * только аргументом tick() — production env укороченного cutoff не имеет.
  *
- * Ограничение прод-wiring-а (concern для владельца): calendar.external и
- * video.provider — skip-only типы (задачи таких типов не создаются, только
- * skips), но registry.assertReady() требует исполнитель для КАЖДОГО типа
- * каталога, и ни один прод-адаптер эти два типа не регистрирует. Здесь они
- * закрыты явными noop-исполнителями, которые при (невозможном) вызове
- * бросают: assertReady зелёный, семантика skips не меняется.
+ * Прод-wiring (с Task 22.6): calendar.external и video.provider — skip-only
+ * типы; задачи таких типов не создаются (санитайзер отклоняет JOB'ы с
+ * 'unsafe_resource_type', discoverer'ы эмитируют только skips), и
+ * registry.assertReady() их исключает — как и в проде, адаптеры для них не
+ * регистрируются. Pre-22.6 noop-стабы здесь больше не нужны: состав
+ * реестра совпадает с прод-композицией один в один.
  */
 
 // ------------------------------------------------------------------ гейты
@@ -544,17 +544,9 @@ export function createSyntheticStack(pg: PgService): SyntheticStack {
   ];
   for (const adapter of adapters) adapter.onModuleInit();
 
-  // Skip-only типы: задачи не создаются (только skips), но assertReady
-  // требует исполнитель на каждый тип каталога — явные noop-заглушки,
-  // бросающие при (невозможном) вызове. См. concern в шапке файла.
-  const skipOnly = (resourceType: 'calendar.external' | 'video.provider'): AccountDeletionAdapter => ({
-    resourceTypes: [resourceType],
-    execute: async () => {
-      throw new Error('skip_only_executor_called');
-    },
-  });
-  registry.register(skipOnly('calendar.external'));
-  registry.register(skipOnly('video.provider'));
+  // Skip-only типы ('calendar.external', 'video.provider') НЕ регистрируются
+  // — как в проде: assertReady (с Task 22.6) их исключает, а санитайзер
+  // по-прежнему отклоняет JOB'ы таких типов. См. шапку файла.
 
   lifecycle = new AccountDeletionLifecycle(pg, planner, jobs, registry, runner);
   const coordinator = new AccountDeletionCoordinator(pg, planner, jobs, runner);
