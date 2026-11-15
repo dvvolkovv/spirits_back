@@ -140,7 +140,7 @@ maybe('chat-upload.purge против живого Postgres', () => {
     await adapter.execute(job(), ctx);
 
     const deleted: Array<[string, string]> = storage.deleteConfirmed.mock.calls
-      .map((call: [{ bucket: string; key: string }]) => [call[0].bucket, call[0].key])
+      .map((call: [{ bucket: string; key: string }]): [string, string] => [call[0].bucket, call[0].key])
       .sort((a, b) => a[1].localeCompare(b[1]));
     expect(deleted).toEqual([
       [BUCKET, 'k-1/отчёт.pdf'],

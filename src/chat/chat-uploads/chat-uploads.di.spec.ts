@@ -20,6 +20,7 @@
  * ПРЕДСУЩЕСТВОВАЛ в них на базе b81f6ba9 и красил blog/shorts DI-спеки.
  */
 import { Module } from '@nestjs/common';
+import type { Type } from '@nestjs/common';
 import { NestContainer } from '@nestjs/core/injector/container';
 import { InstanceLoader } from '@nestjs/core/injector/instance-loader';
 import { Injector } from '@nestjs/core/injector/injector';
@@ -36,7 +37,7 @@ import { ChatUploadsService } from './chat-uploads.service';
 
 jest.setTimeout(120000);
 
-async function buildGraph(root: unknown): Promise<NestContainer> {
+async function buildGraph(root: Type<any>): Promise<NestContainer> {
   const container = new NestContainer();
   const graphInspector = new GraphInspector(container);
   const scanner = new DependenciesScanner(container, new MetadataScanner(), graphInspector);
