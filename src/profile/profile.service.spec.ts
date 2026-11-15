@@ -13,16 +13,17 @@ import { ChatModule } from '../chat/chat.module';
  *
  * Поведенческие тесты main на старый inline-путь (chatUploads.deleteForUser
  * внутри deleteProfile, Task 7 spec 2026-11-13-chat-upload-memory) сняты
- * вместе с самим inline-путём: интеграция chat_uploads в конвейер —
- * отдельная задача (Phase 2), она же вернёт покрытие удаления исходников
- * загрузок при удалении аккаунта.
+ * вместе с самим inline-путём: интеграция chat_uploads в конвейер сделана
+ * (Phase 2) — исходники загрузок стирает задача chat-upload.purge, её
+ * покрытие живёт в chat-uploads/chat-upload-account-deletion.adapter.spec.ts
+ * и chat-upload-account-deletion.pg.spec.ts.
  */
 
 describe('ProfileService: deleteProfile делегирует конвейеру', () => {
   it('не держит зависимость от ChatUploadsService в конструкторе', () => {
-    // Сторож решения Phase 1: пока chat_uploads не интегрирован в конвейер,
-    // ProfileService не знает про реестр загрузок. Phase 2 заменит этот
-    // сторож тестами адаптера конвейера.
+    // Сторож решения Phase 1 (сохранён и после Phase 2): очистка chat_uploads
+    // идёт через адаптер конвейера, поэтому ProfileService по-прежнему не
+    // знает про реестр загрузок — inline-вызов был бы вне fencing.
     const paramTypes = Reflect.getMetadata('design:paramtypes', ProfileService) || [];
     expect(paramTypes.some((t: any) => t?.name === 'ChatUploadsService')).toBe(false);
   });
@@ -32,14 +33,13 @@ describe('ProfileService: deleteProfile делегирует конвейеру'
  * Сторожа DI — по духу chat-uploads.module.spec.ts.
  */
 describe('ProfileModule: проводка ChatUploads', () => {
-  it('ProfileModule импортирует ChatUploadsModule, а не ChatModule', () => {
-    // ChatUploadsModule не импортирует никого кроме CommonModule — цикла нет.
-    // ChatModule тянет тяжёлые зависимости (Video, Room, Products, …) и сам
-    // связан с профилем — импортировать его ради одного сервиса нельзя.
-    // Импорт сохранён после переноса удаления в конвейер — до интеграции
-    // chat_uploads в конвейер (Phase 2).
+  it('ProfileModule больше не импортирует ChatUploadsModule и не тянет ChatModule', () => {
+    // Phase 2: chat_uploads стирает конвейер (адаптер chat-upload.purge
+    // зарегистрирован из ChatUploadsModule), ни один провайдер ProfileModule
+    // не зависит от ChatUploadsService — мёртвый импорт удалён.
+    // ChatModule по-прежнему импортировать нельзя: тяжёлые зависимости и цикл.
     const imports = Reflect.getMetadata(MODULE_METADATA.IMPORTS, ProfileModule) || [];
-    expect(imports).toContain(ChatUploadsModule);
+    expect(imports).not.toContain(ChatUploadsModule);
     expect(imports).not.toContain(ChatModule);
   });
 });

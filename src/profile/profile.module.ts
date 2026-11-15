@@ -3,7 +3,6 @@ import { ProfileController } from './profile.controller';
 import { ProfileService } from './profile.service';
 import { Neo4jModule } from '../neo4j/neo4j.module';
 import { IdentityModule } from '../identity/identity.module';
-import { ChatUploadsModule } from '../chat/chat-uploads/chat-uploads.module';
 import { OAuthAppleService } from '../auth/oauth-apple.service';
 import { EmailService } from '../auth/email.service';
 import { PgService } from '../common/services/pg.service';
@@ -13,12 +12,10 @@ import { ProfileAccountDeletionAdapter } from './profile-account-deletion.adapte
 import { ProfileAccountDeletionRecapture } from './profile-account-deletion.discovery';
 
 @Module({
-  // ChatUploadsModule, а не ChatModule: ChatUploadsModule не импортирует
-  // никого кроме CommonModule — цикла DI нет (см. его комментарий).
-  // После переноса удаления аккаунта в конвейер (AccountDeletionModule)
-  // ProfileService реестр загрузок напрямую не использует; импорт сохранён
-  // до интеграции chat_uploads в конвейер отдельной задачей (Phase 2).
-  imports: [Neo4jModule, IdentityModule, AccountDeletionModule, ChatUploadsModule],
+  // ChatUploadsModule здесь больше не нужен: chat_uploads стирает конвейер
+  // (chat-upload.purge, адаптер живёт в ChatUploadsModule и регистрируется
+  // в AccountDeletionRegistry), ProfileService реестр загрузок не использует.
+  imports: [Neo4jModule, IdentityModule, AccountDeletionModule],
   controllers: [ProfileController],
   // OAuthAppleService объявлен здесь, а не притянут из AuthModule: тот его не
   // экспортирует, а импортировать модуль целиком ради одного сервиса значило
