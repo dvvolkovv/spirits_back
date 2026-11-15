@@ -882,6 +882,32 @@ maybe('synthetic deletion lifecycle — полная цепочка против
     expect(await unfinishedJobs(second.deletionId)).toHaveLength(0);
     expect(await externalIdsPresent(fixture.mainUserId)).toBe(false);
     expect(await sharedResources(fixture.otherUserId)).toEqual(fixture.allSharedResources);
+
+    // T22-Q3: recapture второго поколения — прямой assert, а не комментарий.
+    // chat-file.purge gen2 обязан существовать (посев строки с файлом перед
+    // фазой 3) и быть доделанным retry-ем; MinIO-граница при этом реально
+    // вызывалась (в фазе 4 она же отказывала timeout-ом).
+    const chatPurge2 = await rows(
+      `SELECT status FROM account_deletion_jobs
+        WHERE deletion_id=$1 AND resource_type='chat-file.purge'`,
+      [second.deletionId],
+    );
+    expect(chatPurge2.length).toBeGreaterThan(0);
+    expect(chatPurge2.every((job) => job.status === 'done')).toBe(true);
+    expect(stack.failures.calls('minio')).toBeGreaterThan(0);
+
+    // T22-Q2: финальное состояние ОСНОВНОГО аккаунта после gen2 — прямой
+    // assert: tombstone (state='deleted'), баланс обнулён, история переписки
+    // стерта, canary-контент второго поколения не пережил purge.
+    const finalMain = await newAccountResources(fixture.mainUserId);
+    expect(finalMain.state).toBe('deleted');
+    expect(finalMain.balance).toBe(0);
+    expect(finalMain.historyRows).toBe(0);
+    const canary = await one(
+      `SELECT count(*)::int AS n FROM custom_chat_history
+        WHERE content LIKE '%synthetic-deletion-second%'`,
+    );
+    expect(canary.n).toBe(0);
   });
 
   it('historical deleted контрольный row остаётся нетронутым (ловушка 14)', async () => {
