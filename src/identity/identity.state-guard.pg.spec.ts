@@ -166,15 +166,18 @@ maybe('state-guard resolveOrCreate: deleted при входе реактивир
    * регистрации.
    */
   async function seedDeletedPhone(phone: string, deletionId: string | null): Promise<void> {
+    // Номер передаётся ДВУМЯ параметрами: $1, использованный и в varchar
+    // (internal_id), и в text (primary_phone), PG не может вывести тип —
+    // «inconsistent types deduced for parameter $1».
     await pool.query(
       `INSERT INTO user_id (internal_id, primary_phone, state, deletion_id, deleted_at, welcome_bonus_at)
-       VALUES ($1, $1, 'deleted', $2::uuid, now() - interval '2 hours', now() - interval '30 days')`,
-      [phone, deletionId],
+       VALUES ($1, $2, 'deleted', $3::uuid, now() - interval '2 hours', now() - interval '30 days')`,
+      [phone, phone, deletionId],
     );
     await pool.query(
       `INSERT INTO user_identities (user_id, provider, provider_sub, email_verified, last_used_at)
-       VALUES ($1, 'phone', $1, false, now() - interval '2 hours')`,
-      [phone],
+       VALUES ($1, 'phone', $2, false, now() - interval '2 hours')`,
+      [phone, phone],
     );
     await pool.query(
       `INSERT INTO ai_profiles_consolidated (user_id, tokens) VALUES ($1, $2)`,
@@ -217,13 +220,13 @@ maybe('state-guard resolveOrCreate: deleted при входе реактивир
   async function seedBlockedPhone(phone: string): Promise<void> {
     await pool.query(
       `INSERT INTO user_id (internal_id, primary_phone, state, welcome_bonus_at)
-       VALUES ($1, $1, 'blocked', now() - interval '10 days')`,
-      [phone],
+       VALUES ($1, $2, 'blocked', now() - interval '10 days')`,
+      [phone, phone],
     );
     await pool.query(
       `INSERT INTO user_identities (user_id, provider, provider_sub, email_verified)
-       VALUES ($1, 'phone', $1, false)`,
-      [phone],
+       VALUES ($1, 'phone', $2, false)`,
+      [phone, phone],
     );
     await pool.query(
       `INSERT INTO ai_profiles_consolidated (user_id, tokens) VALUES ($1, 0)`,
@@ -554,8 +557,8 @@ maybe('state-guard resolveOrCreate: deleted при входе реактивир
     );
     await pool.query(
       `INSERT INTO user_identities (user_id, provider, provider_sub, email, email_verified)
-       VALUES ($1, 'email', $2, $2, true)`,
-      [UID, MAIL],
+       VALUES ($1, 'email', $2, $3, true)`,
+      [UID, MAIL, MAIL],
     );
     await pool.query(
       `INSERT INTO ai_profiles_consolidated (user_id, tokens) VALUES ($1, $2)`,
@@ -620,13 +623,13 @@ maybe('state-guard resolveOrCreate: deleted при входе реактивир
     const PHONE = '79990000206';
     await pool.query(
       `INSERT INTO user_id (internal_id, primary_phone, welcome_bonus_at)
-       VALUES ($1, $1, now() - interval '10 days')`,
-      [PHONE],
+       VALUES ($1, $2, now() - interval '10 days')`,
+      [PHONE, PHONE],
     );
     await pool.query(
       `INSERT INTO user_identities (user_id, provider, provider_sub, email_verified)
-       VALUES ($1, 'phone', $1, false)`,
-      [PHONE],
+       VALUES ($1, 'phone', $2, false)`,
+      [PHONE, PHONE],
     );
     await pool.query(
       `INSERT INTO ai_profiles_consolidated (user_id, tokens) VALUES ($1, 0)`,
