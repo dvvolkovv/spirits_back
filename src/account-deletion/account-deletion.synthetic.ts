@@ -720,8 +720,8 @@ export async function seedSyntheticFixture(stack: SyntheticStack): Promise<Synth
   // поколения удалений (ловушка 14): координатор её не видит.
   await pg.query(
     `INSERT INTO user_id (internal_id, primary_phone, state, deleted_at, welcome_bonus_at)
-     VALUES ($1, $1, 'deleted', now() - interval '400 days', now() - interval '400 days')`,
-    [hist],
+     VALUES ($1, $2, 'deleted', now() - interval '400 days', now() - interval '400 days')`,
+    [hist, hist],
   );
   await pg.query(
     `INSERT INTO ai_profiles_consolidated (user_id, isadmin, tokens, profile_data)
