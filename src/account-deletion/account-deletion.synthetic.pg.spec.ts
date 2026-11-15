@@ -316,6 +316,18 @@ maybe('synthetic deletion lifecycle — полная цепочка против
         WHERE deletion_id = $1 AND status IN ('pending','failed')`,
       [deletionId],
     );
+    // products.purge_after = deleted_at+30д — константа продукта
+    // (PRODUCT_DELETION_PURGE_DAYS), аргумент retentionMs на неё не влияет;
+    // queuePurgeForProduct ставит host-задание только при purge_after <= now().
+    // Перемотка — та же тестовая фикстура, что и next_attempt_at.
+    await pool.query(
+      `UPDATE products
+          SET purge_after = now() - interval '1 day'
+        WHERE purged_at IS NULL AND purge_after IS NOT NULL
+          AND user_id IN (SELECT user_id FROM account_deletion_jobs
+                           WHERE deletion_id = $1)`,
+      [deletionId],
+    );
     process.env.ACCOUNT_DELETION_WORKER_ENABLED = 'true';
     try {
       await stack.coordinator.tick({

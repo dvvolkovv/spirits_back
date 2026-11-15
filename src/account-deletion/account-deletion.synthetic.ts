@@ -968,10 +968,13 @@ export async function seedSyntheticFixture(stack: SyntheticStack): Promise<Synth
      VALUES ($1,$2,$3,1,1000,10,100,false,now())`,
     [randomUUID(), leaderId, main],
   );
+  // Вывод в settled-статусе ('paid'): pending-заявка по дизайну блокирует
+  // referral.purge до решения админа (вечный retry) — этот путь покрыт
+  // отдельным referral-account-deletion.pg.spec.ts.
   await pg.query(
     `INSERT INTO referral_withdrawals
        (id, leader_id, user_phone, amount_rub, method, requisites, status, commission_ids, created_at)
-     VALUES ($1,$2,$3,100,'card','synthetic card 0000','pending','{}',now())`,
+     VALUES ($1,$2,$3,100,'card','synthetic card 0000','paid','{}',now())`,
     [randomUUID(), leaderId, main],
   );
   await pg.query(
@@ -1271,6 +1274,18 @@ export async function tickSynthetic(
     `UPDATE account_deletion_jobs
         SET next_attempt_at = now() - interval '1 second'
       WHERE deletion_id = $1 AND status IN ('pending','failed')`,
+    [deletionId],
+  );
+  // products.purge_after = deleted_at+30д (PRODUCT_DELETION_PURGE_DAYS —
+  // константа, не retentionMs): queuePurgeForProduct ставит host-задание
+  // только при purge_after <= now(). Перемотка — та же тестовая фикстура,
+  // что и next_attempt_at (ускорение retention продукта).
+  await stack.pg.query(
+    `UPDATE products
+        SET purge_after = now() - interval '1 day'
+      WHERE purged_at IS NULL AND purge_after IS NOT NULL
+        AND user_id IN (SELECT user_id FROM account_deletion_jobs
+                         WHERE deletion_id = $1)`,
     [deletionId],
   );
   process.env.ACCOUNT_DELETION_WORKER_ENABLED = 'true';
