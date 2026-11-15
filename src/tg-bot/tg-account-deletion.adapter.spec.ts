@@ -384,7 +384,9 @@ function makeControllerLifecycleBot(db: FakeDeletionDb) {
       Object.keys(tgIds).find((ownerId) => tgIds[ownerId] === tgUserId) ?? null),
   };
   const grammy = {
-    sendMessage: jest.fn(async () => ({})),
+    // Сигнатура (chatId, text) — тесты читают mock.calls по элементам
+    // ([chatId], [, text]); broad tsc обязан видеть кортеж, поведение то же.
+    sendMessage: jest.fn(async (_chatId: number, _text: string) => ({})),
     leaveChat: jest.fn(async () => true),
   };
   const configs = new TgConfigService(db as any, grammy as any);

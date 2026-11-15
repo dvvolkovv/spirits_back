@@ -6,8 +6,11 @@ import { YandexCalDavConnector } from './caldav';
 // deleteEvent/...) начинаются с `SELECT state FROM user_id`. Старые моки
 // отвечали { rows: [] } на всё, что теперь означало бы «аккаунт удалён».
 // Helper ниже отвечает active на state-запрос и пустой результат на всё прочее.
+// Второй (необязательный) параметр в сигнатуре мока — write-scoping тесты
+// читают call[1] (параметры WHERE), и broad tsc обязан видеть кортеж из двух
+// элементов; поведение мока не меняется.
 const activeRowsPg = () => ({
-  query: jest.fn(async (sql: string) => (String(sql).includes('SELECT state FROM user_id')
+  query: jest.fn(async (sql: string, _params?: unknown[]) => (String(sql).includes('SELECT state FROM user_id')
     ? { rows: [{ state: 'active' }] }
     : { rows: [] })),
 });

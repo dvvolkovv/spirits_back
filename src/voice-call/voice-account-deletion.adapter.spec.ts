@@ -9,6 +9,7 @@ import type {
   DeletionAccount,
   DeletionExecution,
   DeletionJobRow,
+  DeletionJobSpec,
 } from '../account-deletion/account-deletion.types';
 import { VoiceCallService } from './voice-call.service';
 import { VoiceCallModule } from './voice-call.module';
@@ -327,9 +328,12 @@ function seedSharedMeeting(db: FakeVoiceDb, overrides: Partial<FakeCallRow> = {}
   db.meetingRooms.push({ code: 'SHARED', owner_user_id: 'u-other', closed_at: null });
 }
 
-const stopsOf = (jobs: readonly { resourceType: string }[]) =>
+// Полный тип задачи (DeletionJobSpec), а не узкий { resourceType }: спек
+// проверяет payload/resourceKey отфильтрованных задач, и broad tsc
+// (tsconfig.json включает спеки) обязан это видеть.
+const stopsOf = (jobs: readonly DeletionJobSpec[]) =>
   jobs.filter((j) => j.resourceType === 'voice.stop');
-const purgesOf = (jobs: readonly { resourceType: string }[]) =>
+const purgesOf = (jobs: readonly DeletionJobSpec[]) =>
   jobs.filter((j) => j.resourceType === 'voice.purge');
 
 describe('discoverVoiceDeletion', () => {

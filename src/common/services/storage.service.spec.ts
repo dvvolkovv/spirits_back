@@ -94,7 +94,9 @@ describe('StorageService.deleteConfirmed', () => {
   }
 
   it('2xx на DeleteObject — подтверждённый успех "deleted"', async () => {
-    const send = jest.fn(async () => ({}));
+    // _cmd в сигнатуре — тест читает mock.calls[0][0] (команду S3); broad tsc
+    // обязан видеть кортеж, поведение мока не меняется.
+    const send = jest.fn(async (_cmd: any) => ({}));
     const svc = make(send);
 
     await expect(svc.deleteConfirmed({ bucket: 'b', key: 'k' })).resolves.toBe('deleted');

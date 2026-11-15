@@ -48,7 +48,9 @@ describe('product account deletion discovery', () => {
   const PURGED_ID = '66666666-6666-4666-8666-666666666666';
 
   it('создаёт product.stop нестёртым и product.purge ВСЕМ продуктам поколения', async () => {
-    const db = { query: jest.fn(async () => ({
+    // Сигнатура (sql, params) — тест деконструирует mock.calls[0]; broad tsc
+    // обязан видеть кортеж из двух элементов, поведение мока не меняется.
+    const db = { query: jest.fn(async (_sql: string, _params?: unknown[]) => ({
       rows: [
         { id: PRODUCT_ID, slug: 'slug-1', host_id: 'host-shared', purged_at: null },
         // Уже стёрт штатным обходом до удаления аккаунта: stop не нужен,

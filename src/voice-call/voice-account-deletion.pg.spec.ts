@@ -2,6 +2,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
+import type { DeletionJobSpec } from '../account-deletion/account-deletion.types';
 import { discoverVoiceDeletion } from './voice-account-deletion.adapter';
 
 /**
@@ -16,9 +17,12 @@ import { discoverVoiceDeletion } from './voice-account-deletion.adapter';
  * те же, что на проде.
  */
 
-const stopsOf = (jobs: readonly { resourceType: string }[]) =>
+// Полный тип задачи (DeletionJobSpec), а не узкий { resourceType }: спек
+// проверяет payload/resourceKey/phase отфильтрованных задач, и broad tsc
+// (tsconfig.json включает спеки) обязан это видеть.
+const stopsOf = (jobs: readonly DeletionJobSpec[]) =>
   jobs.filter((j) => j.resourceType === 'voice.stop');
-const purgesOf = (jobs: readonly { resourceType: string }[]) =>
+const purgesOf = (jobs: readonly DeletionJobSpec[]) =>
   jobs.filter((j) => j.resourceType === 'voice.purge');
 
 const PG = process.env.PROVISIONING_PG_URL;

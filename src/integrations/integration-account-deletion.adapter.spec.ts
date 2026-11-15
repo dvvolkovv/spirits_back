@@ -90,7 +90,9 @@ function makeDeps(overrides: Partial<{
     providerRefreshTokens: jest.fn(async () => overrides.tokens ?? [APPLE_REFRESH]),
   };
   const apple = {
-    revokeToken: jest.fn(async () => overrides.revokeResult ?? true),
+    // Сигнатура (token, clientId) — тесты читают mock.calls по элементам
+    // (call[0]); broad tsc обязан видеть кортеж, поведение мока не меняется.
+    revokeToken: jest.fn(async (_token: string, _clientId?: string) => overrides.revokeResult ?? true),
     primaryClientId: jest.fn(() => 'com.linkeon.app'),
     canCallApple: jest.fn(() => true),
   };
