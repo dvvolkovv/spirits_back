@@ -67,6 +67,15 @@ export class AccountDeletionRunner {
    * cancelled не клеймится, но исход НЕ retryable — это отмена (реактивация):
    * DeletionCancelledError, kind='cancelled' в логе (T18-M2).
    *
+   * T19-M2 (ревью Task 19): отказ claimById при НЕ отменённой строке ещё не
+   * значит, что исход retryable. Гонка «конкурент доделал задачу между
+   * find(core) и runJob»: find() вернул pending/running, а к моменту claimById
+   * строка уже done — и done не клеймится. Прежний код давал ложный
+   * DeletionRetryError('db') при фактическом успехе (на явном пути — ложный
+   * 503 и повторный DELETE). Поэтому после отказа перечитываем строку:
+   * done — успешный выход без исполнения; исчезнувшая/недостижимая строка —
+   * find сам бросит DeletionRetryError('db'), прежний исход.
+   *
    * Заклеймленные строки (из claimNext/claimNextStop — всегда running с
    * СОБСТВЕННЫМ живым lease) через этот метод не ходят: их исполняет runClaimed
    * напрямую, иначе claimById отверг бы наш же lease. Поведение
@@ -77,6 +86,12 @@ export class AccountDeletionRunner {
     const claimed = await this.jobs.claimById(jobRow.id, jobRow.deletionId);
     if (!claimed) {
       if (jobRow.status === 'cancelled') throw new DeletionCancelledError();
+      const fresh = await this.jobs.find(
+        jobRow.deletionId,
+        jobRow.resourceType,
+        jobRow.resourceKey,
+      );
+      if (fresh.status === 'done') return;
       throw new DeletionRetryError('db');
     }
     await this.runClaimed(claimed);

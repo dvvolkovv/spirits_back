@@ -4,7 +4,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { AccountDeletionLifecycle } from '../account-deletion/account-deletion.lifecycle';
-import { inTransaction } from '../blog/blog-slot-claim';
+import { inTransaction, type SlotQueryable } from '../blog/blog-slot-claim';
 import { PgService } from '../common/services/pg.service';
 import { RedisService } from '../common/services/redis.service';
 import { EventsService } from '../events/events.service';
@@ -198,58 +198,117 @@ export class IdentityService implements OnModuleInit {
       }
     }
 
-    // 3) Create new — в транзакции
-    await this.pg.query(`BEGIN`);
-    try {
-      let userId: string;
+    // 3) Create new / реактивация — в ОДНОЙ транзакции на выделенном соединении.
+    //
+    // Именно на выделенном (inTransaction → getClient): прежний BEGIN через
+    // пул уезжал на одно соединение, а записи — на другие, и «ROLLBACK»
+    // ничего не откатывал. Для реактивации это критично: снятие поколения
+    // и отмена его задач должны стать видны одновременно, иначе воркер
+    // deletion-pipeline успеет подобрать «осиротевшие» задачи живого аккаунта.
+    const userId = await inTransaction(this.pg, async (tx) => {
+      let id: string;
       if (provider === 'phone') {
-        userId = providerSub;
-        await this.pg.query(
+        id = providerSub;
+        await tx.query(
           `INSERT INTO user_id (primary_phone, state, internal_id, signup_method)
            VALUES ($1, 'active', $2, $3) ON CONFLICT (internal_id) DO NOTHING
            RETURNING internal_id`,
-          [providerSub, userId, provider],
-        );
-        // Регистрация тем же номером после удаления неизбежно попадает в ту же
-        // строку: у телефонного входа internal_id — это сам номер, и вставка
-        // молча ничего не делает. Строку надо вернуть в активные явно, иначе
-        // человек зарегистрируется в аккаунт с состоянием deleted.
-        //
-        // Данными прошлого владельца это не грозит: удаление их уже стёрло
-        // вместе с балансом, связками и паролем. Сюда мы попадаем только
-        // когда связок нет — значит аккаунт либо новый, либо удалённый.
-        await this.pg.query(
-          `UPDATE user_id SET state = 'active', update_date = now()
-           WHERE internal_id = $1 AND state <> 'active'`,
-          [userId],
+          [providerSub, id, provider],
         );
       } else {
-        const ins = await this.pg.query(
+        const ins = await tx.query(
           `INSERT INTO user_id (state, internal_id, primary_email, signup_method)
            VALUES ('active', gen_random_uuid()::text, $1, $2)
            RETURNING internal_id`,
           [email, provider],
         );
-        userId = ins.rows[0].internal_id;
+        id = ins.rows[0].internal_id;
       }
-      await this.pg.query(
-        `INSERT INTO ai_profiles_consolidated (user_id, tokens, isadmin) VALUES ($1, 0, false) ON CONFLICT (user_id) DO NOTHING`,
-        [userId],
+      await this.reactivateIfNeeded(tx, id);
+      await this.ensureProfileAndIdentity(tx, id, provider, providerSub, email, verified);
+      await this.issueWelcomeBonus(tx, id);
+      return id;
+    });
+    // Треки — строго ПОСЛЕ COMMIT: событие не должно переживать откат.
+    this.events?.track('signup_completed', { userId, props: { method: provider } });
+    this.events?.track('auth_succeeded', { userId, props: { method: provider, is_new: true } });
+    return { status: 'ok', userId, isNew: true, mergedExisting: false };
+  }
+
+  /**
+   * Вернуть строку аккаунта в активные, если телефонная регистрация попала
+   * в уже существующую (удалённую или исторически удалённую) строку.
+   *
+   * Регистрация тем же номером после удаления неизбежно попадает в ту же
+   * строку: у телефонного входа internal_id — это сам номер, и вставка
+   * молча ничего не делает. Строку надо вернуть в активные явно, иначе
+   * человек зарегистрируется в аккаунт с состоянием deleted.
+   *
+   * Данными прошлого владельца это не грозит: удаление их уже стёрло
+   * вместе с балансом, связками и паролем. Сюда мы попадаем только
+   * когда связок нет — значит аккаунт либо новый, либо удалённый.
+   *
+   * Порядок внутри транзакции обязателен:
+   *  1. FOR UPDATE — блокируем строку, чтобы конкурентный воркер удаления
+   *     не interleaved с реактивацией (coordinator тоже берёт блокировки
+   *     поколения);
+   *  2. гасим ВСЕ незавершённые задачи старого поколения в 'cancelled'
+   *     и снимаем lease — иначе они продолжат стирать уже живой аккаунт.
+   *     Job-уровневый assertCurrent после этого увидит снятое поколение
+   *     и бросит DeletionCancelledError(kind='cancelled');
+   *  3. снимаем само поколение: deletion_id/deleted_at в NULL, state в
+   *     'active'. Следующее удаление выдаст НОВЫЙ UUID поколения
+   *     (lifecycle.begin на active-строке всегда gen_random_uuid()).
+   *
+   * Наблюдения (не фиксы этой задачи):
+   *  - blocked → active — прежняя семантика BASE (state <> 'active'), здесь
+   *    не ужесточается;
+   *  - state IS NULL не лечится: NULL <> 'active' даёт NULL, строка не
+   *    обновится. Известное ограничение (FU-T11-2), сознательно не чиним —
+   *    IS DISTINCT FROM менял бы поведение и для прочих состояний.
+   */
+  private async reactivateIfNeeded(tx: SlotQueryable, userId: string): Promise<void> {
+    const lock = await tx.query(
+      `SELECT deletion_id FROM user_id WHERE internal_id = $1 FOR UPDATE`,
+      [userId],
+    );
+    const deletionId: string | null = lock.rows[0]?.deletion_id ?? null;
+    if (deletionId) {
+      await tx.query(
+        `UPDATE account_deletion_jobs
+            SET status = 'cancelled', lease_until = NULL,
+                completed_at = now(), updated_at = now()
+          WHERE user_id = $1 AND deletion_id = $2
+            AND status IN ('pending', 'running', 'failed')`,
+        [userId, deletionId],
       );
-      await this.pg.query(
-        `INSERT INTO user_identities (user_id, provider, provider_sub, email, email_verified, last_used_at)
-         VALUES ($1, $2, $3, $4, $5, now())`,
-        [userId, provider, providerSub, email, verified],
-      );
-      await this.issueWelcomeBonus(userId);
-      await this.pg.query(`COMMIT`);
-      this.events?.track('signup_completed', { userId, props: { method: provider } });
-      this.events?.track('auth_succeeded', { userId, props: { method: provider, is_new: true } });
-      return { status: 'ok', userId, isNew: true, mergedExisting: false };
-    } catch (e: any) {
-      await this.pg.query(`ROLLBACK`);
-      throw e;
     }
+    await tx.query(
+      `UPDATE user_id
+          SET state = 'active', deleted_at = NULL, deletion_id = NULL, update_date = now()
+        WHERE internal_id = $1 AND state <> 'active'`,
+      [userId],
+    );
+  }
+
+  /** Профильная строка и связка входа — идемпотентно, внутри той же транзакции. */
+  private async ensureProfileAndIdentity(
+    tx: SlotQueryable,
+    userId: string,
+    provider: Provider,
+    providerSub: string,
+    email: string | null,
+    verified: boolean,
+  ): Promise<void> {
+    await tx.query(
+      `INSERT INTO ai_profiles_consolidated (user_id, tokens, isadmin) VALUES ($1, 0, false) ON CONFLICT (user_id) DO NOTHING`,
+      [userId],
+    );
+    await tx.query(
+      `INSERT INTO user_identities (user_id, provider, provider_sub, email, email_verified, last_used_at)
+       VALUES ($1, $2, $3, $4, $5, now())`,
+      [userId, provider, providerSub, email, verified],
+    );
   }
 
   /**
@@ -291,9 +350,13 @@ export class IdentityService implements OnModuleInit {
     return digits.length >= 4 ? `···${digits.slice(-4)}` : '···';
   }
 
-  private async issueWelcomeBonus(userId: string): Promise<void> {
-    if (!this.pg) return;
-    const claimed = await this.pg.query(
+  /**
+   * Приветственный бонус — внутри той же транзакции, что и создание/реактивация
+   * аккаунта (db — её соединение, а не пул: claim-маркер welcome_bonus_at и
+   * начисление должны стать видны вместе со строкой аккаунта).
+   */
+  private async issueWelcomeBonus(db: SlotQueryable, userId: string): Promise<void> {
+    const claimed = await db.query(
       `UPDATE user_id SET welcome_bonus_at = now()
        WHERE internal_id = $1 AND welcome_bonus_at IS NULL
        RETURNING internal_id`,
@@ -302,7 +365,7 @@ export class IdentityService implements OnModuleInit {
     if (claimed.rows.length === 0) return;
     // Через процедуру: стартовый бонус — тоже пополнение, и в истории он должен
     // быть видно, иначе у нового юзера баланс возникает из ниоткуда.
-    await this.pg.query(
+    await db.query(
       `SELECT add_user_tokens($1, $2, 'bonus', $3, NULL)`,
       [userId, WELCOME_BONUS, 'Приветственный бонус'],
     );
