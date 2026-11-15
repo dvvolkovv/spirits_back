@@ -1,5 +1,5 @@
 import { AccountDeletionRegistry } from './account-deletion.registry';
-import { DELETION_RESOURCE_TYPES } from './account-deletion.safe';
+import { DELETION_RESOURCE_TYPES, SKIP_ONLY_RESOURCE_TYPES } from './account-deletion.safe';
 import type {
   AccountDeletionAdapter,
   DeletionResourceType,
@@ -21,12 +21,14 @@ import type {
  * Контракт после фикса: assertReady требует исполнителей только для
  * несущих типов (каталог минус skip-only); getExecutor для
  * незарегистрированных типов — включая skip-only — по-прежнему бросает
- * 'deletion_executor_missing'. Skip-only имена намеренно зафиксированы
- * литералами (а не импортом SKIP_ONLY_RESOURCE_TYPES из safe.ts), чтобы
- * спек не следовал молча за изменением множества.
+ * 'deletion_executor_missing'. Skip-only имена зафиксированы литералами
+ * И прибиты equality-assert-ом к SKIP_ONLY_RESOURCE_TYPES из safe.ts
+ * (T22.6-minor): любое изменение множества — снятие типа или расширение —
+ * становится сознательным обновлением спека, молча разойтись списки не могут.
  */
 
-// Совпадает со SKIP_ONLY_RESOURCE_TYPES в account-deletion.safe.ts (пинг).
+// Литеральная копия SKIP_ONLY_RESOURCE_TYPES (account-deletion.safe.ts);
+// равенство с экспортом прибито первым тестом ниже.
 const SKIP_ONLY_TYPES: readonly DeletionResourceType[] = [
   'calendar.external',
   'video.provider',
@@ -45,6 +47,12 @@ const echoAdapter = (
 });
 
 describe('AccountDeletionRegistry.assertReady — skip-only типы (T22.6)', () => {
+  it('пин: литералы равны SKIP_ONLY_RESOURCE_TYPES из safe.ts (T22.6-minor)', () => {
+    // Без этого assert-а РАСШИРЕНИЕ множества (третий skip-only тип) прошло бы
+    // молча: спек счёл бы его load-bearing и сам зарегистрировал в реестре.
+    expect([...SKIP_ONLY_RESOURCE_TYPES].sort()).toEqual([...SKIP_ONLY_TYPES].sort());
+  });
+
   it('не требует исполнителей для skip-only типов', () => {
     // Санитарный контроль пинга: оба skip-only имени действительно в каталоге.
     for (const resourceType of SKIP_ONLY_TYPES) {
