@@ -145,6 +145,14 @@ export class IdentityService implements OnModuleInit {
     );
     if (found.rows.length) {
       const userId = found.rows[0].user_id;
+      // State-guard (T22.5): связка может указывать на удалённый аккаунт —
+      // зависшее поколение, in-flight удаление или historical-строка. Без
+      // этой проверки вход выдаёт свежий JWT на мёртвую запись: человек
+      // оказывается в кабинете, где data-сервисы гейтят state='active'
+      // (чат-история молча не сохраняется), а refresh-guard отсекает только
+      // на следующем refresh. Реактивируем НАЙДЕННУЮ строку in-place;
+      // fall-through в шаг 3 завёл бы второй аккаунт не-телефонному провайдеру.
+      await this.reactivateDeletedOnLogin(userId);
       await this.pg.query(
         `UPDATE user_identities SET last_used_at = now() WHERE provider = $1 AND provider_sub = $2`,
         [provider, providerSub],
@@ -166,6 +174,10 @@ export class IdentityService implements OnModuleInit {
            VALUES ($1, $2, $3, $4, $5, now())`,
           [userId, provider, providerSub, email, verified],
         );
+        // State-guard (T22.5) — как на шаге 1: verified email может совпасть
+        // с удалённым аккаунтом. Ссылка уже вставлена выше, реактивация
+        // вторую не вставляет (UNIQUE(provider, provider_sub) дал бы 23505).
+        await this.reactivateDeletedOnLogin(userId);
         this.events?.track('auth_succeeded', { userId, props: { method: provider, is_new: false, merged: true } });
         return { status: 'ok', userId, isNew: false, mergedExisting: true };
       }
@@ -291,6 +303,49 @@ export class IdentityService implements OnModuleInit {
     );
   }
 
+  /**
+   * State-guard (T22.5): вход по найденной связке в аккаунт state='deleted'
+   * реактивирует НАЙДЕННУЮ строку in-place — те же шаги, что reactivateIfNeeded
+   * на пути регистрации (шаг 3), но без создания второго аккаунта и без
+   * повторной вставки связки входа.
+   *
+   * Гейт-форма перекрывает буквальную `state <> 'active'` reactivateIfNeeded:
+   * только state='deleted'. 'blocked' не флипаем — это было бы самоликвидацией
+   * модерации (admin.service); NULL не лечим — отдельный вопрос владельца
+   * (FU-T11-2). Поэтому state читается дважды: снаружи транзакции (дешёвый
+   * фильтр — не тащим FOR UPDATE и транзакцию в каждый вход) и внутри неё под
+   * блокировкой строки. Отмена задач поколения и снятие поколения идут в той
+   * же транзакции (reactivateIfNeeded) — нет окна, где state уже 'active', а
+   * задачи поколения ещё живы; конкурентная реактивация превращает вызов в
+   * no-op.
+   *
+   * Связку входа НЕ вставляем: шаг 1 находит по уже существующей, шаг 2
+   * вставляет её сам до вызова. Повторный INSERT упёрся бы в
+   * UNIQUE(provider, provider_sub) (23505) — поэтому ensureProfileRow, а не
+   * ensureProfileAndIdentity. Профильная строка и бонус идемпотентны
+   * (ON CONFLICT DO NOTHING / claim welcome_bonus_at IS NULL).
+   *
+   * Вызывающий трекает auth_succeeded после возврата — то есть после COMMIT.
+   */
+  private async reactivateDeletedOnLogin(userId: string): Promise<void> {
+    if (!this.pg) return;
+    const seen = await this.pg.query(
+      `SELECT state FROM user_id WHERE internal_id = $1`,
+      [userId],
+    );
+    if (seen.rows[0]?.state !== 'deleted') return;
+    await inTransaction(this.pg, async (tx) => {
+      const lock = await tx.query(
+        `SELECT state FROM user_id WHERE internal_id = $1 FOR UPDATE`,
+        [userId],
+      );
+      if (lock.rows[0]?.state !== 'deleted') return;
+      await this.reactivateIfNeeded(tx, userId);
+      await this.ensureProfileRow(tx, userId);
+      await this.issueWelcomeBonus(tx, userId);
+    });
+  }
+
   /** Профильная строка и связка входа — идемпотентно, внутри той же транзакции. */
   private async ensureProfileAndIdentity(
     tx: SlotQueryable,
@@ -300,14 +355,19 @@ export class IdentityService implements OnModuleInit {
     email: string | null,
     verified: boolean,
   ): Promise<void> {
-    await tx.query(
-      `INSERT INTO ai_profiles_consolidated (user_id, tokens, isadmin) VALUES ($1, 0, false) ON CONFLICT (user_id) DO NOTHING`,
-      [userId],
-    );
+    await this.ensureProfileRow(tx, userId);
     await tx.query(
       `INSERT INTO user_identities (user_id, provider, provider_sub, email, email_verified, last_used_at)
        VALUES ($1, $2, $3, $4, $5, now())`,
       [userId, provider, providerSub, email, verified],
+    );
+  }
+
+  /** Профильная строка аккаунта — идемпотентно (ON CONFLICT DO NOTHING), внутри транзакции. */
+  private async ensureProfileRow(tx: SlotQueryable, userId: string): Promise<void> {
+    await tx.query(
+      `INSERT INTO ai_profiles_consolidated (user_id, tokens, isadmin) VALUES ($1, 0, false) ON CONFLICT (user_id) DO NOTHING`,
+      [userId],
     );
   }
 
