@@ -1930,6 +1930,16 @@ git pull --rebase -q origin main && git push -q origin main
 **Files:**
 - Create: `spirits_back/codex-bridge/keep-alive.sh`
 - Create: `spirits_back/docs/superpowers/runbooks/2026-11-14-codex-provider-rollout.md`
+- Modify (комментарии): `spirits_back/relay-agent/server.mjs`, `spirits_back/relay-agent/.gitignore`
+
+- [ ] **Step 0: Устаревшие комментарии в relay-agent (ниты quality-ревью Task 9)**
+
+Поведение не затронуто (server.mjs обходит реестр генериками) — только документационный дрейф:
+1. `relay-agent/server.mjs:497-498`: комментарий «provider=qwen|kimi — админка бэкенда) и аварийная цепочка Claude → Qwen → Kimi» → дописать codex (`provider=qwen|kimi|codex`, цепочка `Claude → Qwen → Kimi → Codex`). Якоря `llm-fallback-patch.py` не задевать — скрипт на уже пропатченном файле выходит сразу.
+2. `relay-agent/.gitignore:24-25`: комментарий про ключи запасных — упомянуть `CODEX_KEY_FILE`/`codex.key` рядом с qwen/kimi (паттерн `secrets/` уже покрывает, правка только комментария).
+3. `relay-agent/llm-fallback-patch.py` — исторический разовый скрипт, НЕ править (осознанно).
+
+Отдельный коммит: `docs(relay): codex в комментарях server.mjs и .gitignore` + трейлер. Прогон `node --test relay-agent/llm-fallback.test.mjs` (39/39) — комментарии не должны ничего сломать.
 
 - [ ] **Step 1: keep-alive.sh**
 
