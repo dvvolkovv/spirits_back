@@ -171,4 +171,41 @@ maybe('chat-upload.purge против живого Postgres', () => {
     await expect(adapter.execute(job(), ctx)).rejects.toMatchObject({ kind: 'external_5xx' });
     expect(await countUploads('u-deleted')).toBe(1);
   });
+
+  it('реактивация между последним assertCurrent и DELETE — строки выжили (generation predicate)', async () => {
+    await seedUpload('u-deleted', 'k-1/файл.pdf', 'файл.pdf');
+    await seedUpload('u-deleted', 'k-2/фото.png', 'фото.png');
+    const { adapter, storage, ctx } = makeAdapter();
+
+    // Детерминированная симуляция гонки: реактивация коммитится в окне
+    // ПОСЛЕ последнего assertCurrent (мок — no-op) и ровно ПЕРЕД финальным
+    // DELETE. Обёртка над db при первом запросе 'DELETE FROM chat_uploads'
+    // сначала возвращает аккаунт в живое поколение на той же БД, затем
+    // делегирует запрос адаптера. Без generation-predicate внутри DELETE
+    // отменённый job стирает строки живого аккаунта.
+    let reactivated = false;
+    const racingDb = {
+      query: async (sql: string, params?: unknown[]) => {
+        if (!reactivated && String(sql).startsWith('DELETE FROM chat_uploads')) {
+          reactivated = true;
+          await pool.query(
+            `UPDATE user_id SET state='active', deletion_id=NULL WHERE internal_id='u-deleted'`,
+          );
+        }
+        return db.query(sql, params);
+      },
+    };
+
+    await adapter.execute(job(), { ...ctx, db: racingDb });
+
+    expect(reactivated).toBe(true);
+    // Объекты к этому моменту уже удалены — но строки-указатели живого
+    // аккаунта стёрты НЕ были: счётчик поколения в DELETE их защитил.
+    expect(storage.deleteConfirmed).toHaveBeenCalledTimes(2);
+    expect(await countUploads('u-deleted')).toBe(2);
+    const state = await pool.query(
+      `SELECT state FROM user_id WHERE internal_id='u-deleted'`,
+    );
+    expect(state.rows[0].state).toBe('active');
+  });
 });
