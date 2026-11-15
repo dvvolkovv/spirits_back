@@ -246,7 +246,90 @@ describe('scripts/account-deletion-dry-run.ts — spawn без БД (Task 21)', 
 
     expect(res.status).toBe(2);
     expect(res.stderr).toContain('dry-run only');
-    expect(res.stdout).not.toContain('ACCOUNT_DELETION_DRY_RUN_OK');
+    // T21-M1 (ревью Task 21): контракт отказа — «stdout ПУСТ», а не «нет
+    // маркера»: отказная ветка не должна печатать ничего, даже частичную
+    // сводку или предупреждение.
+    expect(res.stdout).toBe('');
+  });
+});
+
+/**
+ * T21-I1 (ревью Task 21) — drift-guard рукописных зеркал.
+ *
+ * selectDeletionCandidates (account-deletion.dry-run.ts) повторяет
+ * предикаты/cutoff/ORDER BY jobs.dueAccounts, readExistingOrigin —
+ * побайтово jobs.originOf. Сейчас фрагменты идентичны, но правка одной
+ * стороны молча разъехалась бы с другой, и прогноз dry-run (Gate C)
+ * разошёлся бы с фактическим планом воркера. Guard читает оба источника
+ * как текст и сравнивает нормализованные WHERE/ORDER-фрагменты: любое
+ * расхождение предикатов, cutoff или порядка — красный тест. Единственное
+ * разрешённое отличие dueAccounts — keyset-предикат курсора батча (у
+ * dry-run курсора нет: прогноз выбирает всех кандидатов одной выборкой).
+ * Номера параметров ($N) нормализуются: стороны сознательно нумеруют их
+ * по-разному (у воркера есть LIMIT/курсор, у зеркала — только retention).
+ */
+describe('drift-guard: зеркала dry-run ↔ jobs (T21-I1)', () => {
+  const jobsSource = readFileSync(
+    path.join(__dirname, 'account-deletion.jobs.ts'), 'utf8',
+  );
+  const dryRunSource = readFileSync(
+    path.join(__dirname, 'account-deletion.dry-run.ts'), 'utf8',
+  );
+
+  function extractSql(source: string, marker: string): string {
+    const templates = source.match(/`[^`]*`/g) ?? [];
+    const hits = templates.filter((template) => template.includes(marker));
+    if (hits.length !== 1) {
+      throw new Error(`SQL-шаблон по маркеру не найден или неоднозначен: ${marker}`);
+    }
+    return hits[0].slice(1, -1);
+  }
+
+  function normalizeSql(sql: string): string {
+    return sql.replace(/\s+/g, ' ').trim();
+  }
+
+  function whereConditions(sql: string): string[] {
+    const norm = normalizeSql(sql);
+    const start = norm.indexOf(' WHERE ');
+    if (start < 0) throw new Error('WHERE не найден');
+    const rest = norm.slice(start + ' WHERE '.length);
+    const end = rest.indexOf(' ORDER BY ');
+    const body = end >= 0 ? rest.slice(0, end) : rest;
+    return body.split(' AND ').map((clause) => clause.trim().replace(/\$\d+/g, '$'));
+  }
+
+  function orderByFragment(sql: string): string {
+    const norm = normalizeSql(sql);
+    const start = norm.indexOf(' ORDER BY ');
+    if (start < 0) throw new Error('ORDER BY не найден');
+    const rest = norm.slice(start + ' ORDER BY '.length);
+    const end = rest.indexOf(' LIMIT ');
+    return (end >= 0 ? rest.slice(0, end) : rest).trim();
+  }
+
+  it('originOf ↔ readExistingOrigin — идентичный нормализованный SQL', () => {
+    const marker = "resource_type='account.core.immediate'";
+    expect(normalizeSql(extractSql(dryRunSource, marker)))
+      .toBe(normalizeSql(extractSql(jobsSource, marker)));
+  });
+
+  it('dueAccounts ↔ selectDeletionCandidates — те же предикаты (кроме keyset-курсора) и ORDER BY', () => {
+    const worker = extractSql(jobsSource, 'deleted_at::text AS deleted_at_cursor');
+    const dryRun = extractSql(dryRunSource, 'FROM user_id');
+    const workerConditions = whereConditions(worker);
+    const dryRunConditions = whereConditions(dryRun);
+
+    // Каждый предикат зеркала (включая cutoff) присутствует у воркера.
+    for (const condition of dryRunConditions) {
+      expect(workerConditions).toContain(condition);
+    }
+    // Единственное отличие воркера — keyset-предикат курсора.
+    const extra = workerConditions.filter((c) => !dryRunConditions.includes(c));
+    expect(extra).toHaveLength(1);
+    expect(extra[0]).toContain('(deleted_at,internal_id) >');
+
+    expect(orderByFragment(dryRun)).toBe(orderByFragment(worker));
   });
 });
 
