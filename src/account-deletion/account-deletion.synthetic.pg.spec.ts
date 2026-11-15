@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'crypto';
 import { mkdirSync, mkdtempSync, realpathSync, readFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -12,6 +13,7 @@ import {
   createSyntheticStack,
   reseedConsumedResources,
   seedSyntheticFixture,
+  SYNTHETIC_DELETION_PREFIX,
   SYNTHETIC_HIST_PHONE,
   SYNTHETIC_MAIN_PHONE,
   SYNTHETIC_OTHER_ID,
@@ -948,5 +950,62 @@ maybe('synthetic deletion lifecycle — полная цепочка против
     // Остальные purge-задачи доделывает обычный tick.
     await retryUntilDone(deletionId);
     expect(await unfinishedJobs(deletionId)).toHaveLength(0);
+  });
+
+  it('simulateHostAgent подтверждает только синтетические продукты (T22-Q5)', async () => {
+    // Чужой аккаунт стенда вне синтетического scope: его queued-задание
+    // симулятор host-агента забирать не имеет права — иначе синтетика
+    // подтверждала бы job'ы РЕАЛЬНЫХ продуктов живой базы.
+    const foreignUser = 'u-synthetic-foreign-host';
+    const foreignProduct = randomUUID();
+    const ownProduct = randomUUID();
+
+    const seedQueuedJob = async (productId: string, userId: string, slug: string) => {
+      await pool.query(
+        `INSERT INTO products
+           (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash, host_id)
+         VALUES ($1,$2,'Synthetic Product',$3,'site','running','/product',$4,'host-shared')`,
+        [
+          productId,
+          userId,
+          slug,
+          createHash('sha256').update(`runner-${productId}`).digest('hex'),
+        ],
+      );
+      await pool.query(
+        `INSERT INTO product_provision_jobs (product_id, kind, status)
+         VALUES ($1,'sleep','queued')`,
+        [productId],
+      );
+    };
+
+    try {
+      await seedQueuedJob(foreignProduct, foreignUser, `${SYNTHETIC_DELETION_PREFIX}foreign-host`);
+      await seedQueuedJob(ownProduct, fixture.mainUserId, `${SYNTHETIC_DELETION_PREFIX}own-host`);
+
+      await stack.simulateHostAgent();
+
+      const foreign = await one(
+        `SELECT status FROM product_provision_jobs WHERE product_id=$1`,
+        [foreignProduct],
+      );
+      const own = await one(
+        `SELECT status FROM product_provision_jobs WHERE product_id=$1`,
+        [ownProduct],
+      );
+      // Чужое задание остаётся в очереди — подтверждение строго по scope.
+      expect(foreign.status).toBe('queued');
+      // Синтетическое — забрано и подтверждено через completeJob (sleep → done).
+      expect(own.status).toBe('done');
+    } finally {
+      await pool.query(
+        `DELETE FROM product_provision_jobs WHERE product_id = ANY($1::uuid[])`,
+        [[foreignProduct, ownProduct]],
+      );
+      await pool.query(
+        `DELETE FROM products WHERE id = ANY($1::uuid[])`,
+        [[foreignProduct, ownProduct]],
+      );
+    }
   });
 });

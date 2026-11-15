@@ -4,7 +4,9 @@ import { hostname } from 'os';
 import * as path from 'path';
 import { deletionErrorKind } from './account-deletion.safe';
 import type { DeletionErrorKind } from './account-deletion.types';
+import { scriptErrorText } from '../common/one-off-script';
 import {
+  assertSyntheticPreflight,
   checkSyntheticGates,
   faultErrorFor,
   SYNTHETIC_APPLY_FLAG,
@@ -15,6 +17,7 @@ import {
   SYNTHETIC_GATE_HOSTNAME,
   SyntheticFailures,
   SyntheticGateError,
+  SyntheticPreflightError,
 } from './account-deletion.synthetic';
 
 /**
@@ -74,6 +77,29 @@ describe('checkSyntheticGates — тройной гейт до любой зап
     expect(SYNTHETIC_GATE_ENV_VALUE).toBe('test.linkeon.io');
     expect(SYNTHETIC_GATE_HOSTNAME).toBe('ugliest-salmon');
     expect(SYNTHETIC_DELETION_PREFIX).toBe('synthetic-deletion-');
+  });
+});
+
+describe('assertSyntheticPreflight — CLI preflight до seed (T22-Q5)', () => {
+  it('dry-run не видел due-поколений (accounts===0) — пропускает', () => {
+    expect(() => assertSyntheticPreflight({ accounts: 0 })).not.toThrow();
+  });
+
+  it('accounts>0 — SyntheticPreflightError со счётчиком, без PII', () => {
+    let thrown: unknown;
+    try {
+      assertSyntheticPreflight({ accounts: 3 });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(SyntheticPreflightError);
+    // Форма scriptErrorText: в stderr уходит счётчик чужих due-поколений,
+    // а не данные аккаунтов (ни userId, ни телефонов, ни deletionId).
+    const text = scriptErrorText(thrown);
+    expect(text).toContain('synthetic_preflight_accounts_not_zero');
+    expect(text).toContain('3');
+    expect(text).not.toMatch(/7999\d{7}/);
+    expect(text).not.toContain('u-synthetic');
   });
 });
 
