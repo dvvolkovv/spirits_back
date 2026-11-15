@@ -1042,6 +1042,35 @@ export async function seedSyntheticFixture(stack: SyntheticStack): Promise<Synth
 }
 
 /**
+ * Ресев ресурсов, которые первое поколение удаления ИЗРАСХОДОВАЛО и которые
+ * реактивация не восстанавливает (это честная прод-семантика, не баг):
+ *  - account.core.immediate удаляет ВСЕ user_identities → discovery
+ *    integration.apple.stop второго поколения не нашёл бы строку apple;
+ *  - voice.stop прерывает звонки (status уходит из dialing/active,
+ *    external_bot_id чистится) → discovery voice.stop пуст.
+ * Сценарий моделирует вернувшегося пользователя: новая связка Apple и новый
+ * активный звонок. Комнаты/сосед не затрагиваются (снимок allSharedResources
+ * остаётся валидным).
+ */
+export async function reseedConsumedResources(
+  stack: SyntheticStack,
+  userId: string,
+): Promise<void> {
+  const { pg } = stack;
+  await pg.query(
+    `INSERT INTO user_identities
+       (id, user_id, provider, provider_sub, email_verified, provider_refresh_token, created_at, last_used_at)
+     VALUES ($1,$2,'apple',$3,false,$4,now(),now())`,
+    [randomUUID(), userId, `${SYNTHETIC_DELETION_PREFIX}apple-2`, `${SYNTHETIC_DELETION_PREFIX}refresh-2`],
+  );
+  await pg.query(
+    `INSERT INTO voice_calls (id, user_id, agent_id, room_name, status, started_at, external_bot_id)
+     VALUES ($1,$2,12,$3,'active',now(),$4)`,
+    [randomUUID(), userId, `${SYNTHETIC_DELETION_PREFIX}room-sole-2`, `${SYNTHETIC_DELETION_PREFIX}bot-2`],
+  );
+}
+
+/**
  * Уборка фикстур по deletionId/userId — в CLI вызывается из finally.
  * Порядок: сначала задачи удаления, затем дочерние таблицы, затем
  * аккаунты. Каждая группа независима — свой try/catch, чтобы одна несуществующая
@@ -1305,6 +1334,7 @@ export async function runSyntheticScenario(
   ))?.n ?? 0;
   assert(cancelledJobs > 0, 'реактивация не отменила задачи поколения');
   await stack.seedHistoryRow(fixture.mainUserId, `${SYNTHETIC_DELETION_PREFIX}second`);
+  await reseedConsumedResources(stack, fixture.mainUserId);
 
   // Фаза 3: второе удаление — новый UUID поколения.
   const second = await deleteExplicitWithHost(stack, fixture.mainUserId);

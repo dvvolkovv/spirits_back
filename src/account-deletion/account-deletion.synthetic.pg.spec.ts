@@ -10,6 +10,7 @@ import { dryRunAccountDeletion } from './account-deletion.dry-run';
 import {
   cleanupSyntheticFixture,
   createSyntheticStack,
+  reseedConsumedResources,
   seedSyntheticFixture,
   SYNTHETIC_HIST_PHONE,
   SYNTHETIC_MAIN_PHONE,
@@ -633,6 +634,33 @@ maybe('synthetic deletion lifecycle — полная цепочка против
       ALTER TABLE referral_referees ADD COLUMN IF NOT EXISTS bonus_tokens integer NOT NULL DEFAULT 0;
       ALTER TABLE referral_leaders ADD COLUMN IF NOT EXISTS payout_notified boolean NOT NULL DEFAULT false;
     `);
+    // Task 17C: phone-колонки выплат/выводов расширены до varchar(64) —
+    // deletion-scoped alias 'deleted:<deletionId>' (44 символа) в varchar(20)
+    // не помещается (копия guarded DO-блоков referral.service.ts:212-241).
+    await pool.query(`
+      DO $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'referral_token_payouts'
+                      AND column_name = 'user_phone'
+                      AND character_maximum_length IS NOT NULL
+                      AND character_maximum_length < 64) THEN
+          ALTER TABLE referral_token_payouts ALTER COLUMN user_phone TYPE varchar(64);
+        END IF;
+      END $$;
+      DO $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'referral_withdrawals'
+                      AND column_name = 'user_phone'
+                      AND character_maximum_length IS NOT NULL
+                      AND character_maximum_length < 64) THEN
+          ALTER TABLE referral_withdrawals ALTER COLUMN user_phone TYPE varchar(64);
+        END IF;
+      END $$;
+    `);
     await migration('referral/migrations/001_user_id_to_text.sql');
     await migration('referral/migrations/002_backfill_offledger_accruals.sql');
 
@@ -811,8 +839,12 @@ maybe('synthetic deletion lifecycle — полная цепочка против
     expect(cancelled.n).toBeGreaterThan(0);
 
     // Новый аккаунт снова обрастает файлом переписки — второе поколение
-    // обязано спланировать chat-file.purge заново (recapture core).
+    // обязано спланировать chat-file.purge заново (recapture core). Ресев
+    // ресурсов, израсходованных первым поколением (user_identities удалены
+    // account.core.immediate, звонки прерваны voice.stop) — иначе discovery
+    // integration.apple.stop/voice.stop второго поколения законно пуст.
     await stack.seedHistoryRow(fixture.mainUserId, 'synthetic-deletion-second');
+    await reseedConsumedResources(stack, fixture.mainUserId);
 
     // --- Фаза 3: второе удаление — НОВЫЙ UUID поколения.
     const second = await deleteExplicit(fixture.mainUserId);
