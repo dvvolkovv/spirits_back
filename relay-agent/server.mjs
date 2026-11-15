@@ -494,8 +494,8 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   // ~/.local/bin/claude (его находит PATH процесса pm2), а не /usr/bin/claude.
   const MODELS = ["default", "haiku", "sonnet", "opus", "claude-opus-5-5"];
   const reqModel = MODELS.includes(String(req.body.model || "")) ? String(req.body.model) : "default";
-  // Провайдер хода (llm-fallback.mjs): выбор пользователя (provider=qwen|kimi —
-  // админка бэкенда) и аварийная цепочка Claude → Qwen → Kimi. Ключи — файлами,
+  // Провайдер хода (llm-fallback.mjs): выбор пользователя (provider=qwen|kimi|codex —
+  // админка бэкенда) и аварийная цепочка Claude → Qwen → Kimi → Codex. Ключи — файлами,
   // читаются на каждом ходе: нет файла — провайдер выключен. noFallback=1 —
   // пробы мониторинга, только Claude.
   const reqNoFallback = String(req.body.noFallback || "") === "1";
