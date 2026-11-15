@@ -1,7 +1,10 @@
 import { Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
+import { ModuleRef } from '@nestjs/core';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import type { AccountDeletionLifecycle } from '../account-deletion/account-deletion.lifecycle';
+import { inTransaction } from '../blog/blog-slot-claim';
 import { PgService } from '../common/services/pg.service';
 import { RedisService } from '../common/services/redis.service';
 import { EventsService } from '../events/events.service';
@@ -37,6 +40,7 @@ export class IdentityService implements OnModuleInit {
     @Optional() private readonly pg?: PgService,
     @Optional() private readonly events?: EventsService,
     @Optional() private readonly redis?: RedisService,
+    @Optional() private readonly moduleRef?: ModuleRef,
   ) {}
 
   /**
@@ -344,9 +348,21 @@ export class IdentityService implements OnModuleInit {
    * История чатов НЕ переносится сознательно: session_id собран как
    * `{userId}_{agentId}`, и перенос склеил бы два параллельных разговора с
    * одним ассистентом в одну ленту вперемешку по времени.
+   *
+   * С Task 19 loser не просто помечается state='deleted', а уходит через
+   * pipeline account-deletion с origin='merge': begin (поколение + план; core —
+   * account.core.purge, отложенный на 30 дней от deleted_at) → stopOnly
+   * (внешние стопы, включая отзыв токенов Apple — строго ДО переноса
+   * идентичностей) → перенос идентичностей и зачистка tombstone одной
+   * транзакцией под защитой поколения. Данные и историю стирает purge-задача
+   * по сроку (почасовой воркер), не этот метод.
    */
   async mergeAccounts(conflictUserId: string, targetUserId: string): Promise<{ survivorUserId: string; loserUserId: string }> {
     if (!this.pg) throw new Error('pg not configured');
+    // Без lifecycle нельзя ни создать поколение, ни исполнить стопы: отказ
+    // ДО любых изменений (в т.ч. до переноса баланса), а не половина пути.
+    const deletion = this.deletionLifecycle();
+    if (!deletion) throw new Error('deletion lifecycle not configured');
 
     // Выживает СТАРШИЙ аккаунт (по user_id.create_date): в нём обычно больше
     // накопленного. При равных/неизвестных датах выживает targetUserId — тот,
@@ -391,19 +407,104 @@ export class IdentityService implements OnModuleInit {
       this.logger.log(`merge: ${tokens} токенов ${loserUserId} → ${survivorUserId}`);
     }
 
-    // tg_user_identities слияние не переносит. Начнёт переносить — тем же шагом
-    // переносить owner_user_id лички (tg_bot_configs с tg_chat_id = tg_user_id),
-    // иначе сторож в TgConfigService.ensurePrivateConfig заархивирует личку
-    // объединённого человека как чужую.
-    await this.pg.query(
-      `UPDATE user_identities SET user_id = $1 WHERE user_id = $2`,
-      [survivorUserId, loserUserId],
-    );
-    await this.pg.query(
-      `UPDATE user_id SET state = 'deleted', update_date = now() WHERE internal_id = $1`,
-      [loserUserId],
-    );
+    // Task 19 — порядок, зафиксированный планом: credit-first баланс (выше) →
+    // begin(loser,'merge') → stopOnly (внешние стопы; integration.apple.stop
+    // читает provider_refresh_token из user_identities loser, поэтому revoke
+    // строго ДО переноса) → транзакция переноса под защитой поколения.
+    const account = await deletion.begin(loserUserId, 'merge');
+    if (account) {
+      // Неуспех стопа бросает как есть (retryable DeletionRetryError('db') от
+      // контрольного assertNoImmediateBlockers либо отмена): транзакция
+      // переноса не начнётся, идентичности и история останутся на loser.
+      // Повторный merge продолжит с того же места: begin переиспользует
+      // поколение, выполненные стопы не переисполняются. HTTP-маппинг здесь
+      // сознательно не добавляем: контроллер merge транслирует ошибку в
+      // глобальный обработчик как есть.
+      await deletion.stopOnly(account.deletionId);
+      await inTransaction(this.pg, async (tx) => {
+        // Защита поколения ВНУТРИ транзакции: реактивация/новое поколение
+        // между стопами и переносом откатывает перенос (DeletionCancelledError).
+        await deletion.assertCurrent(tx as any, account);
+        await tx.query(
+          `UPDATE user_identities
+           SET user_id = $1
+           WHERE user_id = $2`,
+          [survivorUserId, loserUserId],
+        );
+        // tg_user_identities слияние не переносит: перенос потребовал бы тем же
+        // шагом переносить owner_user_id лички (tg_bot_configs с tg_chat_id =
+        // tg_user_id), иначе сторож в TgConfigService.ensurePrivateConfig
+        // заархивирует личку объединённого человека как чужую. Уходящему в
+        // удаление loser привязка тоже не нужна — loser-строки удаляем под той
+        // же gen-защитой; Telegram survivor не трогаем.
+        await tx.query(
+          `DELETE FROM tg_user_identities
+           WHERE linkeon_user_id = $1
+             AND EXISTS (
+               SELECT 1 FROM user_id u
+                WHERE u.internal_id = $1
+                  AND u.state = 'deleted'
+                  AND u.deletion_id = $2
+             )`,
+          [loserUserId, account.deletionId],
+        );
+        // Зачистка следов входа на tombstone — под той же gen-защитой: хэш
+        // пароля, профильная почта и маркер приветственного бонуса не должны
+        // переживать удаление на строке аккаунта.
+        await tx.query(
+          `UPDATE user_id
+              SET password_hash = NULL,
+                  primary_email = NULL,
+                  welcome_bonus_at = NULL,
+                  update_date = now()
+            WHERE internal_id = $1
+              AND state = 'deleted'
+              AND deletion_id = $2`,
+          [loserUserId, account.deletionId],
+        );
+      });
+    } else {
+      // begin→null (план поведение не регламентирует — задокументированное
+      // отклонение: сохраняем legacy-путь): historical-удаление БЕЗ поколения
+      // (deleted до введения pipeline), заблокированный модерацией аккаунт
+      // (FU-T11-2 — не наша ветка) или строка с NULL state. Pipeline над ними
+      // не включается, а ожидание человека от merge прежнее: способы входа
+      // переносятся на survivor, слитый аккаунт помечается удалённым.
+      await this.pg.query(
+        `UPDATE user_identities SET user_id = $1 WHERE user_id = $2`,
+        [survivorUserId, loserUserId],
+      );
+      await this.pg.query(
+        `UPDATE user_id SET state = 'deleted', update_date = now() WHERE internal_id = $1`,
+        [loserUserId],
+      );
+    }
     return { survivorUserId, loserUserId };
+  }
+
+  /**
+   * Task 19 — deletion lifecycle для очистки merge-loser.
+   *
+   * Получается ЛЕНИВО (ModuleRef + require в момент вызова), а не value-
+   * импортом конструктора: прямой import AccountDeletionLifecycle в этот файл
+   * замкнул бы загрузочный цикл
+   *   identity.service → account-deletion.lifecycle → account-deletion.jobs
+   *     → account-deletion.catalog → integration-account-deletion.adapter
+   *     → identity.service
+   * (каталог адаптеров удаления требует integration-адаптер, а тот —
+   * IdentityService для DI). Цикл при старте приложения ломает decorator-
+   * metadata и module-level SQL jobs.ts. ModuleRef опционален: unit-контуры
+   * конструируют сервис без Nest-контейнера и получают guard-отказ в merge.
+   */
+  private deletionLifecycle(): AccountDeletionLifecycle | null {
+    if (!this.moduleRef) return null;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { AccountDeletionLifecycle } = require('../account-deletion/account-deletion.lifecycle');
+      return this.moduleRef.get(AccountDeletionLifecycle, { strict: false }) ?? null;
+    } catch {
+      return null;
+    }
   }
 
   /**

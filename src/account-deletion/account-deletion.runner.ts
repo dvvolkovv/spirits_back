@@ -26,7 +26,7 @@ export class AccountDeletionRunner {
     while (true) {
       const job = await this.jobs.claimNext(deletionId);
       if (!job) return;
-      await this.runJob(job);
+      await this.runClaimed(job);
     }
   }
 
@@ -44,30 +44,51 @@ export class AccountDeletionRunner {
     while (true) {
       const job = await this.jobs.claimNextStop(deletionId);
       if (!job) break;
-      await this.runJob(job);
+      await this.runClaimed(job);
     }
     await this.jobs.assertNoImmediateBlockers(deletionId);
   }
 
   /**
    * Task 18 — метод публичен: явный путь исполняет адресную задачу (core)
-   * вне цикла claimNext. Нерunning-строка нормализуется через claimById
-   * (явный retry обходит backoff); done завершается сразу — повторному
-   * DELETE не нужно повторно исполнять успешный core. Неclaimable-строку
-   * (cancelled после реактивации, чужой живой lease) НЕЛЬЗЯ молча пропустить
-   * — это выглядело бы как успех: бросаем retryable-ошибку.
+   * вне цикла claimNext. Done завершается сразу — повторному DELETE не нужно
+   * повторно исполнять успешный core.
    *
-   * Для runAccount поведение прежнее: claimNext всегда отдаёт running-строку,
-   * нормализация не срабатывает.
+   * T18-M1/M2 (ревью Task 18, фикс в Task 19): нормализация покрывает ВСЕ
+   * статусы кроме done, включая running. Строка, полученная через find(),
+   * НЕ заклеймена нами: running с живым lease означает конкурентное исполнение
+   * (второй DELETE или тик воркера на поколении старше 30 дней), и адаптер
+   * поверх него сломал бы инвариант «одного исполнителя» и задвоил внешние
+   * вызовы (revoke, отвязки, рассылки). Такая строка проходит через claimById
+   * и получает честный отказ: живой lease → null → DeletionRetryError('db') →
+   * 503 «повторите позже» на явном пути; истёкший lease → claimById реклеймит
+   * строку (attempts+1, свежий lease), и исполнение идёт как обычно.
+   *
+   * cancelled не клеймится, но исход НЕ retryable — это отмена (реактивация):
+   * DeletionCancelledError, kind='cancelled' в логе (T18-M2).
+   *
+   * Заклеймленные строки (из claimNext/claimNextStop — всегда running с
+   * СОБСТВЕННЫМ живым lease) через этот метод не ходят: их исполняет runClaimed
+   * напрямую, иначе claimById отверг бы наш же lease. Поведение
+   * runAccount/runImmediateStops не меняется.
    */
   async runJob(jobRow: DeletionJobRow): Promise<void> {
-    let job = jobRow;
-    if (job.status === 'done') return;
-    if (job.status !== 'running') {
-      const claimed = await this.jobs.claimById(job.id, job.deletionId);
-      if (!claimed) throw new DeletionRetryError('db');
-      job = claimed;
+    if (jobRow.status === 'done') return;
+    const claimed = await this.jobs.claimById(jobRow.id, jobRow.deletionId);
+    if (!claimed) {
+      if (jobRow.status === 'cancelled') throw new DeletionCancelledError();
+      throw new DeletionRetryError('db');
     }
+    await this.runClaimed(claimed);
+  }
+
+  /**
+   * Исполнение строки, УЖЕ заклеймленной нами (running, собственный живой
+   * lease, актуальные attempts): heartbeat, адаптер, finish/fail. Вход —
+   * только из runAccount/runImmediateStops и из нормализованного runJob.
+   */
+  private async runClaimed(jobRow: DeletionJobRow): Promise<void> {
+    const job = jobRow;
 
     let heartbeatBusy = false;
     let heartbeatLost = false;

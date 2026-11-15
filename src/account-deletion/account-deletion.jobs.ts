@@ -151,12 +151,16 @@ export class AccountDeletionJobs {
   /**
    * Task 18 — claim конкретной задачи поколения для явного пути: тот же
    * fencing, что у claimNext (JOIN user_id), но по id. next_attempt_at
-   * сознательно не проверяется: явный DELETE обходит backoff — человек ждёт
-   * ответа сейчас, а не через экспоненциальную задержку воркера.
+   * сознательно не проверяется, однако обход backoff достаётся только CORE-
+   * задаче явного DELETE (find + runJob): человек ждёт ответа сейчас, а не
+   * через экспоненциальную задержку воркера. Стопы обход НЕ получают — их
+   * клеймит claimNextStop, который next_attempt_at чтит.
    *
-   * Claimable: pending/failed и running с истёкшим lease. done/cancelled и
-   * чужой живой lease дают null — runJob трактует это как retryable-исход,
-   * а не как молчаливый успех.
+   * Claimable: pending/failed и running с истёкшим lease. Чужой живой lease —
+   * конкурентное исполнение, его перехватывать нельзя (T18-M1). done/cancelled
+   * и живой чужой lease дают null — runJob трактует это как честный отказ
+   * (retryable DeletionRetryError('db'), для cancelled —
+   * DeletionCancelledError), а не как молчаливый успех.
    */
   async claimById(id: string, deletionId: string): Promise<DeletionJobRow | null> {
     const result = await this.db.query(

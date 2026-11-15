@@ -6,6 +6,7 @@ import { AccountDeletionPlanner } from './account-deletion.planner';
 import { AccountDeletionRegistry } from './account-deletion.registry';
 import { AccountDeletionRunner } from './account-deletion.runner';
 import {
+  DeletionCancelledError,
   DeletionRetryError,
   deletionErrorKind,
   safeDeletionMessage,
@@ -74,6 +75,10 @@ export class AccountDeletionLifecycle {
     // молча — для клиента это идемпотентный успех, данных поколения нет.
     if (!account) return;
 
+    // T18-M4: attempts для safe warn — реальное значение из строки core-задачи
+    // (последний успешный read до отказа), а не захардкоженный ноль: лог обязан
+    // показывать, какой по счёту попыткой был неуспех.
+    let attempts = 0;
     try {
       await this.runner.runImmediateStops(account.deletionId);
       const core = await this.jobs.find(
@@ -81,6 +86,7 @@ export class AccountDeletionLifecycle {
         'account.core.immediate',
         'account',
       );
+      attempts = core.attempts;
       await this.runner.runJob(core);
       // Обнаружение неуспешного stop/core: runJob глотает ошибку адаптера
       // (jobs.fail + safe warn), поэтому повторно читаем строку задачи.
@@ -91,18 +97,42 @@ export class AccountDeletionLifecycle {
         'account.core.immediate',
         'account',
       );
+      attempts = finished.attempts;
       if (finished.status !== 'done') throw new DeletionRetryError('db');
     } catch (error) {
       this.logger.warn(safeDeletionMessage({
         deletionId: account.deletionId,
         resourceType: 'account.core.immediate',
         resourceKey: 'account',
-        attempts: 0,
+        attempts,
         kind: deletionErrorKind(error),
         userId,
       }));
       throw new ServiceUnavailableException(EXPLICIT_DELETION_UNAVAILABLE);
     }
+  }
+
+  /**
+   * Task 19 — immediate-стопы одного поколения БЕЗ core-шага: вход для merge.
+   *
+   * Core-задача merge-происхождения (account.core.purge) синхронно НЕ
+   * исполняется: план вешает её на deletedAt + ACCOUNT_DELETION_RETENTION_MS
+   * (30 дней), и почасовой воркер подбирает её по сроку (coordinator:
+   * dueAccounts → runAccount). Стопы — ровно те же, что при явном DELETE:
+   * цикл claimNextStop + контрольный assertNoImmediateBlockers внутри
+   * runner.runImmediateStops.
+   *
+   * Неуспех стопа бросает наружу (retryable DeletionRetryError('db') от
+   * assertNoImmediateBlockers либо DeletionCancelledError): вызывающий merge
+   * не должен начинать транзакцию переноса идентичностей на незавершённых
+   * внешних стопах.
+   *
+   * assertReady — паритет с deleteExplicit: деплой без адаптеров не должен
+   * молча «останавливать» аккаунты.
+   */
+  async stopOnly(deletionId: string): Promise<void> {
+    await this.registry.assertReady();
+    await this.runner.runImmediateStops(deletionId);
   }
 
   /**
@@ -154,6 +184,36 @@ export class AccountDeletionLifecycle {
       await this.planner.persist(tx as Db, account, plan);
       return account;
     });
+  }
+
+  /**
+   * Task 19 — проверка поколения на уровне АККАУНТА внутри чужой транзакции.
+   *
+   * Вход для merge: между stopOnly и транзакцией переноса идентичностей могла
+   * состояться реактивация или новое поколение удаления — тогда перенос обязан
+   * откатиться (DeletionCancelledError), а не приклеить survivor'у данные
+   * чужого поколения. Строка loser должна оставаться state='deleted' с тем же
+   * deletion_id.
+   *
+   * FOR UPDATE сериализует competing reactivation — то же рассуждение, что в
+   * jobs.lockAndAssertCurrent: либо реактивация коммитится первой и проверка
+   * здесь видит живой аккаунт, либо ждёт нашего коммита.
+   *
+   * Это НЕ jobs.assertCurrent(job): тот — job-уровневый (id/lease/attempts) и
+   * для merge-транзакции не подходит ни сигнатурой, ни семантикой — строки
+   * задачи у неё нет, важно только поколение аккаунта.
+   */
+  async assertCurrent(tx: Db, account: DeletionAccount): Promise<void> {
+    const result = await tx.query(
+      `SELECT 1
+       FROM user_id
+       WHERE internal_id=$1
+         AND state='deleted'
+         AND deletion_id=$2
+       FOR UPDATE`,
+      [account.userId, account.deletionId],
+    );
+    if (result.rowCount !== 1) throw new DeletionCancelledError();
   }
 
   /** Выбор поколения под уже взятой блокировкой строки (см. begin). */
