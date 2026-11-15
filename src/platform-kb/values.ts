@@ -22,6 +22,7 @@ import { SMS_LIMIT_DEFAULTS } from '../auth/sms-limits';
 import { MAX_UPLOAD_TOTAL_BYTES } from '../chat/upload-limits';
 import { LOW_BALANCE_THRESHOLD, WARN_COOLDOWN_MS } from '../tokens/consumption-rate';
 import { MAGIC_LINK_TTL_SECONDS } from '../auth/email.service';
+import { ACCOUNT_DELETION_RETENTION_DAYS } from '../account-deletion/account-deletion.safe';
 
 /**
  * Числа для статей справки. Каждое — импорт той константы, по которой идёт
@@ -83,6 +84,7 @@ export const V = {
   freeMonthProducts: String(FREE_MONTH_PRODUCTS),
   maxProducts: String(DEFAULT_MAX_PRODUCTS),
   deleteGraceDays: String(DELETE_GRACE_DAYS),
+  accountDeletionDays: String(ACCOUNT_DELETION_RETENTION_DAYS),
   maxRoutines: String(MAX_ROUTINES_PER_USER),
   lowBalance: fmt(LOW_BALANCE_THRESHOLD),
   lowBalanceEveryHours: String(Math.round(WARN_COOLDOWN_MS / 3_600_000)),
