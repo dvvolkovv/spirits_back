@@ -13,7 +13,10 @@ import type {
   DeletionPlan,
   DeletionResourceType,
 } from '../../account-deletion/account-deletion.types';
-import type { StorageService } from '../../common/services/storage.service';
+// Value-импорт, НЕ `import type`: тип стирает design:paramtypes до
+// Function/Object, и Nest не может разрешить конструктор провайдера
+// (пин — chat-uploads.di.spec.ts).
+import { StorageService } from '../../common/services/storage.service';
 import { CHAT_UPLOADS_BUCKET } from './chat-uploads.service';
 
 /**
