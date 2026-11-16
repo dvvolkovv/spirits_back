@@ -108,9 +108,7 @@ export class LegacyAuthAccountDeletionAdapter implements OnModuleInit, AccountDe
       try {
         // Префикс собирается из job.userId (колонка job, не payload); форма
         // ключа — email.service.ts: `ev-sent-<userId>-<sha256(email)[:16]>`.
-        // Потолок ожидания (T17D-M1): на полуживом TCP SCAN висит вечно, а тик
-        // держит advisory lock. По сроку — DeletionRetryError('timeout'); брошенный
-        // SCAN может доработать позже — удаление идемпотентно.
+        // Потолок ожидания Redis (T17D-M1) — см. withDeletionTimeout.
         await withDeletionTimeout(
           this.redis.deleteByPrefix(`ev-sent-${job.userId}-`),
           ACCOUNT_DELETION_REDIS_TIMEOUT_MS,

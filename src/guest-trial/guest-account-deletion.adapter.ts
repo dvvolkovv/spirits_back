@@ -111,9 +111,7 @@ export class GuestAccountDeletionAdapter implements OnModuleInit, AccountDeletio
       try {
         // Префикс собирается из job.userId (колонка job, не payload); форма
         // ключа — guestCarryKey (guest-carry.ts): `guest-carry:<userId>:<assistantId>`.
-        // Потолок ожидания (T17D-M1): на полуживом TCP SCAN висит вечно, а тик
-        // держит advisory lock. По сроку — DeletionRetryError('timeout'); брошенный
-        // SCAN может доработать позже — удаление идемпотентно.
+        // Потолок ожидания Redis (T17D-M1) — см. withDeletionTimeout.
         await withDeletionTimeout(
           this.redis.deleteByPrefix(`guest-carry:${job.userId}:`),
           ACCOUNT_DELETION_REDIS_TIMEOUT_MS,

@@ -457,10 +457,16 @@ export class DeletionRetryError extends Error {
 /**
  * T17D-M1: потолок ожидания Redis в стоп-адаптерах удаления (guest-carry.stop,
  * auth-verification.stop — deleteByPrefix). ioredis создан без commandTimeout:
- * на полуживом TCP SCAN не завершается никогда, heartbeat продлевает lease, тик
- * держит advisory lock — весь конвейер удаления и синхронный DELETE стоят до
- * рестарта. 10 с — на порядки выше полного SCAN прода (8 мс) и ниже heartbeat
- * раннера (30 с).
+ * на полуживом TCP SCAN не завершается никогда, тик держит advisory lock — весь
+ * конвейер удаления и синхронный DELETE стоят до рестарта. 10 с — на порядки
+ * выше полного SCAN прода (8 мс). Чем ограничено сверху:
+ * (а) синхронный DELETE /webhook/profile и stopOnly при merge проходят ОБА
+ *     Redis-стопа подряд (runner.runImmediateStops): худший случай 2×10 с плюс
+ *     остальные стопы должен с запасом уложиться в 60 с nginx — иначе клиент
+ *     получит 504 вместо честного 503 «повторите позже»;
+ * (б) таймаут много меньше lease задачи (5 мин, account-deletion.jobs.ts,
+ *     claimNext). Heartbeat раннера (30 с) не ограничение: при более долгом
+ *     ожидании он лишь продлит lease, это безвредно.
  */
 export const ACCOUNT_DELETION_REDIS_TIMEOUT_MS = 10_000;
 
@@ -468,9 +474,13 @@ export const ACCOUNT_DELETION_REDIS_TIMEOUT_MS = 10_000;
  * T17D-M1: обещание с потолком ожидания для внешней операции удаления. По
  * истечении ms — DeletionRetryError('timeout') (вид несёт поле kind, текст не
  * разбирается), исход до срока — как есть. Сама операция не отменяется:
- * брошенный SCAN может доработать позже — это допустимо, удаление идемпотентно,
- * а ключи принадлежат удаляемому аккаунту. Копия приёма common/with-timeout.ts:
- * тот реджектит обычным Error и общий с guest-trial/chat, поэтому не меняется.
+ * брошенный SCAN/UNLINK может доработать позже. Ключи адресованы userId, поэтому
+ * поздний UNLINK после реактивации аккаунта (Task 20) теоретически возможен;
+ * ущерб — потеря carry-пересказа пробы или дедуп-флага отправленного письма.
+ * Удаление идемпотентно: следующий retry повторит deleteByPrefix целиком.
+ * Зачем потолок и почему 10 с — см. ACCOUNT_DELETION_REDIS_TIMEOUT_MS. Копия
+ * приёма common/with-timeout.ts: тот реджектит обычным Error и общий с
+ * guest-trial/chat, поэтому не меняется.
  */
 export function withDeletionTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {

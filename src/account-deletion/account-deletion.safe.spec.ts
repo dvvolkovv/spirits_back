@@ -1077,7 +1077,7 @@ describe('withDeletionTimeout — потолок ожидания внешней
     jest.useRealTimers();
   });
 
-  it('потолок Redis — 10 с: на порядки выше SCAN прода, ниже heartbeat раннера (30 с)', () => {
+  it('потолок Redis — 10 с: два стопа подряд (2×таймаут) оставляют запас синхронному DELETE под 60 с nginx', () => {
     expect(ACCOUNT_DELETION_REDIS_TIMEOUT_MS).toBe(10_000);
   });
 
@@ -1094,8 +1094,6 @@ describe('withDeletionTimeout — потолок ожидания внешней
     const retry = new DeletionRetryError('db');
     for (const error of [refused, cancelled, retry]) {
       const source = Promise.reject(error);
-      // Отдельная подписка: исходное обещание не должно считаться необработанным.
-      source.catch(() => undefined);
 
       await expect(withDeletionTimeout(source, 1_000)).rejects.toBe(error);
     }
