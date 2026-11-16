@@ -20,6 +20,7 @@ import { ANSWER_FIRST_RULE } from './answer-first-rule';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
 import { INTERRUPTED_TURN_NOTE, relayUndeliveredNote, RelayCarry } from './interrupted-turn';
 import { postRelayWithDrainRetry, RELAY_DRAIN_DELAYS_MS, DrainRetryOpts, RelayDrainingError } from './relay-drain-retry';
+import { BlockJoiner } from './block-separator';
 import { noTokensMessage, NoTokensOpts } from './no-tokens-message';
 import { legacyGreetingReply } from './legacy-greeting';
 import { CRISIS_RULE } from './crisis-rule';
@@ -2630,6 +2631,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
           });
         });
 
+        // Шаг работы (tool) между кусками текста: первый кусок после него
+        // получает разделитель (block-separator.ts), иначе «файл.Готово».
+        const joiner = new BlockJoiner(() => chunks.join(''));
         await new Promise<void>((resolve, reject) => {
           let buffer = '';
           agentRes.data.on('data', (chunk: Buffer) => {
@@ -2644,8 +2648,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
                   const ev = JSON.parse(line.slice(6));
 
                   if (ev.type === 'delta' || ev.type === 'text') {
-                    chunks.push(ev.text);
-                    safeWrite({ type: 'item', content: ev.text });
+                    const text = joiner.text(ev.text);
+                    chunks.push(text);
+                    safeWrite({ type: 'item', content: text });
                   } else if (ev.type === 'notice' && ev.text) {
                     // Служебная реплика платформы («ответ прерван», «упёрлись в
                     // лимит шагов»). В отличие от `result` — дописывается ВСЕГДА.
@@ -2655,9 +2660,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
                     // ровно в том случае, ради которого они и написаны. Поэтому
                     // оборванный ответ выглядел как молчание: пользователь читал
                     // «Вношу группу А.» и тишину, а потом слал «?».
-                    chunks.push(ev.text);
-                    safeWrite({ type: 'item', content: ev.text });
+                    const text = joiner.text(ev.text);
+                    chunks.push(text);
+                    safeWrite({ type: 'item', content: text });
                   } else if (ev.type === 'tool') {
+                    joiner.tool();
                     // Шаг работы для клиента, который его рисует (activity-map.ts).
                     // В chunks не идёт: к тексту ответа отношения не имеет.
                     if (ui.activity) {
@@ -3497,6 +3504,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
       if (e instanceof RelayDrainingError && e.superseded) throw new RelaySessionBusyError(relaySid);
       throw e;
     }
+    // Разделитель после шага работы — как у веб-хода (block-separator.ts).
+    const joiner = new BlockJoiner(() => chunks.join(''));
     await new Promise<void>((resolve, reject) => {
       let buffer = '';
       resp.data.on('data', (chunk: Buffer) => {
@@ -3507,7 +3516,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
           if (!line.startsWith('data: ')) continue;
           try {
             const ev = JSON.parse(line.slice(6));
-            if (ev.type === 'delta' || ev.type === 'text') chunks.push(ev.text);
+            if (ev.type === 'delta' || ev.type === 'text') chunks.push(joiner.text(ev.text));
+            else if (ev.type === 'tool') joiner.tool();
             else if (ev.type === 'result' && ev.text && chunks.length === 0) chunks.push(ev.text);
             else if (ev.type === 'done') {
               gotDone = true;

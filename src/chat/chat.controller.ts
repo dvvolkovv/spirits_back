@@ -28,6 +28,7 @@ import { relayProviderFields, resolveAnswerProvider } from './answer-provider';
 import { ChatUploadsService, ChatUploadRecord } from './chat-uploads/chat-uploads.service';
 import { chatFailureText } from './chat-failure-texts';
 import { RelayDrainingError } from './relay-drain-retry';
+import { BlockJoiner } from './block-separator';
 
 // Потолок загрузки и зачем он именно такой — в upload-limits.ts, вместе с
 // самой константой (менять его можно только вместе с ОБОИМИ nginx).
@@ -569,6 +570,8 @@ export class ChatController {
         });
       });
 
+      // Разделитель после шага работы — как у веб-хода (block-separator.ts).
+      const joiner = new BlockJoiner(() => chunks.join(''));
       await new Promise<void>((resolve) => {
         let buffer = '';
         agentRes.data.on('data', (chunk: Buffer) => {
@@ -580,14 +583,17 @@ export class ChatController {
             try {
               const ev = JSON.parse(line.slice(6));
               if (ev.type === 'delta' || ev.type === 'text') {
-                chunks.push(ev.text);
-                safeWrite({ type: 'item', content: ev.text });
+                const text = joiner.text(ev.text);
+                chunks.push(text);
+                safeWrite({ type: 'item', content: text });
               } else if (ev.type === 'notice' && ev.text) {
                 // Служебная реплика платформы — показываем всегда, в отличие от
                 // `result` ниже (тот дублировал бы уже отданный текст).
-                chunks.push(ev.text);
-                safeWrite({ type: 'item', content: ev.text });
+                const text = joiner.text(ev.text);
+                chunks.push(text);
+                safeWrite({ type: 'item', content: text });
               } else if (ev.type === 'tool') {
+                joiner.tool();
                 // Шаг работы (activity-map.ts): чтение большого PDF — ровно то
                 // место, где человек дольше всего смотрит на пустой пузырь.
                 if (ui.activity) {
