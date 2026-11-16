@@ -31,11 +31,49 @@ export const RELAY_DRAIN_DELAYS_MS: readonly number[] = [2000, 4000, 8000, 15000
  */
 export const RELAY_DRAIN_DELAYS_SHORT_MS: readonly number[] = [2000, 4000, 8000, 15000, 30000];
 
+/** Чем релей отказал: 503 — шлагбаум выката, 502 и ECONNREFUSED — процесс или nginx не отвечают. */
+export type RelayRefusal = 502 | 503 | 'ECONNREFUSED';
+
 export class RelayDrainingError extends Error {
-  constructor(public readonly superseded: boolean, public readonly attempts: number) {
+  /**
+   * lastRefusal — отказ последней неудачной попытки. Человеку исход один
+   * («ассистент обновляется»), а по нему журнал и телеметрия отличают выкат
+   * (503) от аварии: релей в цикле падений (nginx 502) или лежит сам nginx
+   * (ECONNREFUSED).
+   */
+  constructor(
+    public readonly superseded: boolean,
+    public readonly attempts: number,
+    public readonly lastRefusal?: RelayRefusal,
+  ) {
     super(superseded ? 'relay draining: superseded' : 'relay draining: budget exhausted');
     this.name = 'RelayDrainingError';
   }
+}
+
+/**
+ * Журнал исхода хода, который так и не дошёл до релея (веб и загрузка).
+ * Выкат (503) и перебитый ход — штатные исходы, warn. Не дождались на 502 или
+ * ECONNREFUSED — авария релея, error: иначе она тонула бы среди выкатов. Без
+ * relaySid (в ключе сессии номер телефона) и без текста человека.
+ */
+export function logRelayDrainOutcome(
+  logger: { warn(message: string): void; error(message: string): void },
+  err: RelayDrainingError,
+): void {
+  if (err.superseded) {
+    logger.warn('шлагбаум релея: перебит');
+  } else if (err.lastRefusal === 502 || err.lastRefusal === 'ECONNREFUSED') {
+    logger.error(`релей недоступен: не дождались (${err.lastRefusal})`);
+  } else {
+    logger.warn(err.lastRefusal ? `шлагбаум релея: не дождались (${err.lastRefusal})` : 'шлагбаум релея: не дождались');
+  }
+}
+
+/** Отказ из ошибки, уже признанной isRelayDrainingError. */
+function refusalOf(err: unknown): RelayRefusal {
+  const status = (err as { response?: { status?: unknown } }).response?.status;
+  return status === 502 || status === 503 ? status : 'ECONNREFUSED';
 }
 
 /**
@@ -75,24 +113,26 @@ function closeBody(err: any) {
 export async function postRelayWithDrainRetry<T>(makePost: () => Promise<T>, opts: DrainRetryOpts = {}): Promise<T> {
   const delays = opts.delaysMs ?? RELAY_DRAIN_DELAYS_MS;
   const sleep = opts.sleep ?? defaultSleep;
+  let last: RelayRefusal | undefined;
   for (let attempt = 0; ; attempt++) {
-    if (attempt > 0 && opts.shouldStop?.()) throw new RelayDrainingError(true, attempt);
+    if (attempt > 0 && opts.shouldStop?.()) throw new RelayDrainingError(true, attempt, last);
     try {
       return await makePost();
     } catch (err) {
       if (!isRelayDrainingError(err)) throw err;
       closeBody(err);
+      last = refusalOf(err);
       // Пока шла HTTP-попытка, сессию мог занять новый ход: перебитому ходу —
       // ни заглушки «бюджет исчерпан», ни onRetry, сессия уже не его.
-      if (opts.shouldStop?.()) throw new RelayDrainingError(true, attempt + 1);
-      if (attempt >= delays.length) throw new RelayDrainingError(false, attempt + 1);
+      if (opts.shouldStop?.()) throw new RelayDrainingError(true, attempt + 1, last);
+      if (attempt >= delays.length) throw new RelayDrainingError(false, attempt + 1, last);
       const delay = delays[attempt];
       opts.onRetry?.(attempt + 1, delay);
       for (let waited = 0; waited < delay; ) {
         const step = Math.min(1000, delay - waited);
         await sleep(step);
         waited += step;
-        if (opts.shouldStop?.()) throw new RelayDrainingError(true, attempt + 1);
+        if (opts.shouldStop?.()) throw new RelayDrainingError(true, attempt + 1, last);
       }
     }
   }

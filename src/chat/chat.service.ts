@@ -19,7 +19,7 @@ import { RESPONSE_STYLE_RULE } from './response-style';
 import { ANSWER_FIRST_RULE } from './answer-first-rule';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
 import { INTERRUPTED_TURN_NOTE, relayUndeliveredNote, RelayCarry } from './interrupted-turn';
-import { postRelayWithDrainRetry, RELAY_DRAIN_DELAYS_MS, DrainRetryOpts, RelayDrainingError } from './relay-drain-retry';
+import { postRelayWithDrainRetry, RELAY_DRAIN_DELAYS_MS, DrainRetryOpts, RelayDrainingError, logRelayDrainOutcome } from './relay-drain-retry';
 import { BlockJoiner } from './block-separator';
 import { noTokensMessage, NoTokensOpts } from './no-tokens-message';
 import { legacyGreetingReply } from './legacy-greeting';
@@ -570,7 +570,8 @@ export class ChatService {
       return await postRelayWithDrainRetry(makePost, opts);
     } catch (e) {
       if (e instanceof RelayDrainingError && e.superseded && carry !== null && !this.relayCarryTaken.has(key)) {
-        throw new RelayDrainingError(false, e.attempts);
+        // lastRefusal — дальше, в журнал и телеметрию: выкат или авария релея.
+        throw new RelayDrainingError(false, e.attempts, e.lastRefusal);
       }
       throw e;
     } finally {
@@ -2343,6 +2344,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // Заглушка в историю, когда повтор под шлагбаумом исчерпан. В fullText не
     // идёт — ход не тарифицируется и не учит профиль.
     let failureStub = '';
+    // Последний отказ релея у хода, так и не дошедшего до него
+    // (RelayDrainingError.lastRefusal): '503' — выкат, '502'/'ECONNREFUSED' —
+    // авария. В chat_quality рядом с fail_reason relay_draining/relay_superseded.
+    let relayRefusal: string | undefined;
 
     // Single persistence point — dedupe via `saved` flag so success and error paths
     // both call but only one actually writes.
@@ -2389,6 +2394,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
             lang_mismatch: this.looksLanguageMismatch(fullText, userLanguage, message),
             failed: turnFailed,
             fail_reason: failReason || undefined,
+            relay_refusal: relayRefusal,
             provider: turnProvider,
             fallback: turnFallback || undefined,
             selected: routed ? answerRoute.provider : undefined,
@@ -3065,9 +3071,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
       setImmediate(() => { void persistResponse(true); });
     } catch (err) {
       if (err instanceof RelayDrainingError) {
-        // Шлагбаум выката — штатный исход, не сбой. Без relaySid (в ключе
-        // сессии номер телефона) и без текста человека.
-        this.logger.warn(err.superseded ? 'шлагбаум релея: перебит' : 'шлагбаум релея: не дождались');
+        // Шлагбаум выката — штатный исход, не сбой; 502/ECONNREFUSED до конца
+        // бюджета — авария релея, error (logRelayDrainOutcome).
+        logRelayDrainOutcome(this.logger, err);
+        relayRefusal = err.lastRefusal === undefined ? undefined : String(err.lastRefusal);
       } else {
         this.logger.error(`Universal agent proxy error: ${err.message}`);
       }

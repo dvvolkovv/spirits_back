@@ -27,7 +27,7 @@ import { UserLlmProviderService } from '../common/services/user-llm-provider.ser
 import { relayProviderFields, resolveAnswerProvider } from './answer-provider';
 import { ChatUploadsService, ChatUploadRecord } from './chat-uploads/chat-uploads.service';
 import { chatFailureText } from './chat-failure-texts';
-import { RelayDrainingError } from './relay-drain-retry';
+import { RelayDrainingError, logRelayDrainOutcome } from './relay-drain-retry';
 import { BlockJoiner } from './block-separator';
 
 // Потолок загрузки и зачем он именно такой — в upload-limits.ts, вместе с
@@ -626,9 +626,10 @@ export class ChatController {
       });
     } catch (err: any) {
       if (err instanceof RelayDrainingError) {
-        // Шлагбаум выката — штатный исход, не сбой. Без relaySid (в ключе
-        // сессии номер телефона) и без текста человека.
-        this.logger.warn(err.superseded ? 'шлагбаум релея: перебит' : 'шлагбаум релея: не дождались');
+        // Шлагбаум выката — штатный исход, не сбой; 502/ECONNREFUSED до конца
+        // бюджета — авария релея, error (logRelayDrainOutcome). chat_quality
+        // этот путь не пишет — relay_refusal только у веб-хода.
+        logRelayDrainOutcome(this.logger, err);
         drainOutcome = err.superseded ? 'superseded' : 'exhausted';
         turnFailed = true;
         // Своя метка перебитого, не 'preempted' — как у веб-хода
