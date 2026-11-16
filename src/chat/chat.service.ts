@@ -20,6 +20,7 @@ import { ANSWER_FIRST_RULE } from './answer-first-rule';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
 import { INTERRUPTED_TURN_NOTE } from './interrupted-turn';
 import { noTokensMessage, NoTokensOpts } from './no-tokens-message';
+import { legacyGreetingReply } from './legacy-greeting';
 import { CRISIS_RULE } from './crisis-rule';
 import { loadCoworkers } from './coworkers';
 import { colleaguesRule } from './colleagues-rule';
@@ -1320,6 +1321,27 @@ export class ChatService {
       type: r.sender_type === 'human' ? 'user' : 'assistant',
       content: r.content,
     }));
+
+    // Автоприветствие вкладки, открытой до 13.11 (тикет 8cf1c5ae, см.
+    // legacy-greeting.ts): отвечаем сами — без модели, без списания и без
+    // записи в историю, чтобы чат остался пустым, как у нового клиента. Стоит
+    // до чтения баланса: человек ничего не отправлял, и на нуле окно
+    // пополнения (reason: 'no_tokens') ему показывать не за что.
+    const legacyReply = legacyGreetingReply(message, recentHistory.length);
+    if (legacyReply) {
+      this.logger.log(`legacy-greeting: ответ без модели (assistant ${agent.id}, fresh=${fresh})`);
+      res.status(200);
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader('Transfer-Encoding', 'chunked');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.write(JSON.stringify({ type: 'begin' }) + '\n');
+      res.write(JSON.stringify({ type: 'item', content: legacyReply }) + '\n');
+      res.write(JSON.stringify({ type: 'end', content: legacyReply, usage: { input: 0, output: 0, total: 0 } }) + '\n');
+      res.end();
+      return;
+    }
 
     // Check token balance (skip for first greeting)
     const isGreetingMsg = recentHistory.length === 0 && /привет|расскажи про себя|hello|hi$/i.test(message.trim());
