@@ -246,6 +246,9 @@ describe('фоновый ход под шлагбаумом выката рел�
     wake();
     expect(await p).toBeInstanceOf(RelaySessionBusyError);
     expect(axios.post).toHaveBeenCalledTimes(1);
+    expect(svc.getActiveStreamCount()).toBe(0);
+    // Уступивший фоновый ход метку человека не снимает.
+    expect((svc as any).relayRunning.get(SID)).toBe(humanMark);
     svc.endRelayRun(SID, humanMark);
   });
 
@@ -258,5 +261,36 @@ describe('фоновый ход под шлагбаумом выката рел�
     expect(err).toBeInstanceOf(RelayDrainingError);
     expect(err.superseded).toBe(false);
     expect((svc as any).relayRunning.size).toBe(0);
+    expect(svc.getActiveStreamCount()).toBe(0);
+  });
+
+  it('релей вернулся — ответ приходит, на повтор уходит новая форма', async () => {
+    const svc = makeService();
+    svc.relayDrainDelaysMs = [0];
+    (axios.post as jest.Mock).mockRejectedValueOnce(err503()).mockResolvedValueOnce({ data: sseDone() });
+
+    await expect(svc.generateAgentReply('u-1', '12', 'напомни')).resolves.toBe('ок');
+    expect(axios.post).toHaveBeenCalledTimes(2);
+    const calls = (axios.post as jest.Mock).mock.calls;
+    expect(calls[0][1]).not.toBe(calls[1][1]);
+    expect((svc as any).relayRunning.size).toBe(0);
+  });
+
+  it('свой бюджет вызова: [] — не ждать, сдаться на первом 503', async () => {
+    const svc = makeService();
+    svc.relayDrainDelaysMs = [1000];
+    const sleep = jest.fn(async () => {});
+    svc.relayDrainSleep = sleep;
+    (axios.post as jest.Mock).mockRejectedValueOnce(err503());
+
+    const err = await svc
+      .generateAgentReply('u-1', '12', 'сожми', undefined, { relayDrainDelaysMs: [] })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(RelayDrainingError);
+    expect(err.superseded).toBe(false);
+    expect(axios.post).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+    expect((svc as any).relayRunning.size).toBe(0);
+    expect(svc.getActiveStreamCount()).toBe(0);
   });
 });
