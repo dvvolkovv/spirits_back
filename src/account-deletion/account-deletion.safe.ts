@@ -464,6 +464,26 @@ export class DeletionRetryError extends Error {
  */
 export const ACCOUNT_DELETION_REDIS_TIMEOUT_MS = 10_000;
 
+/**
+ * T17D-M1: обещание с потолком ожидания для внешней операции удаления. По
+ * истечении ms — DeletionRetryError('timeout') (вид несёт поле kind, текст не
+ * разбирается), исход до срока — как есть. Сама операция не отменяется:
+ * брошенный SCAN может доработать позже — это допустимо, удаление идемпотентно,
+ * а ключи принадлежат удаляемому аккаунту. Копия приёма common/with-timeout.ts:
+ * тот реджектит обычным Error и общий с guest-trial/chat, поэтому не меняется.
+ */
+export function withDeletionTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new DeletionRetryError('timeout')), ms);
+    // Сторожевой таймер не должен сам по себе держать event loop живым.
+    timer.unref?.();
+    p.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
 export function retryDelayMs(attempts: number): number {
   return Math.min(21_600_000, 60_000 * 2 ** Math.max(attempts - 1, 0));
 }

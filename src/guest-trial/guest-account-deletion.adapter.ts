@@ -1,9 +1,11 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { AccountDeletionRegistry } from '../account-deletion/account-deletion.registry';
 import {
+  ACCOUNT_DELETION_REDIS_TIMEOUT_MS,
   DeletionCancelledError,
   DeletionRetryError,
   deletionErrorKind,
+  withDeletionTimeout,
 } from '../account-deletion/account-deletion.safe';
 import type {
   AccountDeletionAdapter,
@@ -109,7 +111,13 @@ export class GuestAccountDeletionAdapter implements OnModuleInit, AccountDeletio
       try {
         // Префикс собирается из job.userId (колонка job, не payload); форма
         // ключа — guestCarryKey (guest-carry.ts): `guest-carry:<userId>:<assistantId>`.
-        await this.redis.deleteByPrefix(`guest-carry:${job.userId}:`);
+        // Потолок ожидания (T17D-M1): на полуживом TCP SCAN висит вечно, а тик
+        // держит advisory lock. По сроку — DeletionRetryError('timeout'); брошенный
+        // SCAN может доработать позже — удаление идемпотентно.
+        await withDeletionTimeout(
+          this.redis.deleteByPrefix(`guest-carry:${job.userId}:`),
+          ACCOUNT_DELETION_REDIS_TIMEOUT_MS,
+        );
       } catch (error) {
         if (error instanceof DeletionCancelledError) throw error;
         if (error instanceof DeletionRetryError) throw error;
