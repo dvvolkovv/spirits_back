@@ -1,5 +1,3 @@
-import * as fs from 'fs';
-import * as path from 'path';
 import { Pool, PoolClient } from 'pg';
 import { ChatUploadsService } from './chat-uploads.service';
 
@@ -7,7 +5,7 @@ import { ChatUploadsService } from './chat-uploads.service';
  * Миграции реестра chat_uploads против живого Postgres: 001 + 002 так, как их
  * применяет ChatUploadsService.migrate() на каждом старте API.
  *
- * Своя схема на прогон (search_path ставится на каждом соединении пула):
+ * Своя схема на прогон (search_path — в options каждого соединения пула):
  * соседние pg-спеки (chat-upload-account-deletion, account-deletion.synthetic)
  * делят ту же одноразовую базу, TRUNCATE-ят chat_uploads в public и применяют
  * только 001 — общая таблица перемешала бы их строки с нашими.
@@ -18,7 +16,6 @@ const maybe = PG ? describe : describe.skip;
 
 const SCHEMA = `chat_uploads_mig_${process.pid}_${Date.now()}`;
 const SHA = 'a'.repeat(64);
-const MIGRATION_002 = path.join(__dirname, 'migrations', '002_chat_uploads_media_notes.sql');
 
 type Db = { query: (sql: string, params?: unknown[]) => Promise<unknown> };
 
@@ -32,11 +29,13 @@ maybe('chat_uploads: миграции 001+002 против живого Postgres
   beforeAll(async () => {
     admin = new Pool({ connectionString: PG, max: 1 });
     await admin.query(`CREATE SCHEMA ${SCHEMA}`);
-    pool = new Pool({ connectionString: PG, max: 4 });
-    // Запросы клиента идут по очереди, поэтому SET успевает раньше любого
-    // запроса теста на этом соединении (приём из документации node-postgres).
-    pool.on('connect', (client) => {
-      void client.query(`SET search_path TO ${SCHEMA}`);
+    // lock_timeout — страховка теста: если миграция когда-нибудь потеряет и
+    // проверку каталога, и свой set_config('lock_timeout'), ожидание замка
+    // упадёт с 55P03 за секунды, а не повиснет до таймаута jest.
+    pool = new Pool({
+      connectionString: PG,
+      max: 4,
+      options: `-c search_path=${SCHEMA} -c lock_timeout=3s`,
     });
     service = new ChatUploadsService(
       { query: (sql: string, params?: unknown[]) => pool.query(sql, params as any[]) } as any,
@@ -148,14 +147,26 @@ maybe('chat_uploads: миграции 001+002 против живого Postgres
   });
 
   it('повторный старт не ждёт открытую пишущую транзакцию в chat_uploads', async () => {
-    // Голый ALTER TABLE … ADD COLUMN IF NOT EXISTS ждал бы ACCESS EXCLUSIVE
-    // до lock_timeout (5 с) и падал бы с 55P03; проверки каталога — нет.
     const writer: PoolClient = await pool.connect();
     try {
       await writer.query('BEGIN');
       await insertUpload(writer, 'k-open/a.pdf');
+
+      // Контроль, что тест не пустой: голый ALTER TABLE … ADD COLUMN IF NOT
+      // EXISTS при открытой записи ждёт ACCESS EXCLUSIVE ещё до проверки
+      // колонки и падает по lock_timeout.
+      await expect(
+        pool.query(`DO $$
+          BEGIN
+            PERFORM set_config('lock_timeout', '200ms', true);
+            ALTER TABLE chat_uploads ADD COLUMN IF NOT EXISTS source text;
+          END $$`),
+      ).rejects.toMatchObject({ code: '55P03' });
+
+      // Настоящий путь рестарта (001 + 002): проверки каталога замка на
+      // таблицу не берут, и старт проходит, не дожидаясь записи.
       const started = Date.now();
-      await pool.query(fs.readFileSync(MIGRATION_002, 'utf8'));
+      await service.migrate();
       expect(Date.now() - started).toBeLessThan(2_000);
     } finally {
       await writer.query('ROLLBACK');

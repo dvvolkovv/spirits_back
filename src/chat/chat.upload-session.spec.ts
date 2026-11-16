@@ -336,6 +336,11 @@ const UPLOAD_RECORD = {
   sha256: '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824',
   storageKey: 'synthetic/a.pdf',
   createdAt: '2026-11-13T00:00:00.000Z',
+  source: 'web',
+  thumbKey: null,
+  note: null,
+  noteUpdatedAt: null,
+  noteAssistantId: null,
 };
 const UPLOAD_LINK = '📎 [a.pdf](/webhook/chat-uploads/11111111-1111-4111-8111-111111111111)';
 
