@@ -149,7 +149,18 @@ function fileName(filePath: string, who: ActivityOwner): string | undefined {
         break;
       }
     }
-    const stem = base.replace(/\.[^.]*$/, '');
+    let stem = base.replace(/\.[^.]*$/, '');
+    const ext = base.slice(stem.length);
+    // relay-agent/paths.mjs с 16.11.2026: имя, у которого очистка что-то
+    // заменила или обрезала, получает «-<8 hex>» от исходного имени
+    // (uploadFileName), занятое — ещё «-2»…«-99» (uniqueUploadPath). Человеку
+    // этот хвост ничего не говорит. «_» в основе — признак очистки релеем:
+    // у имени без потерь («report-2.pdf», «build-deadbeef.txt») окончание
+    // своё, его не трогаем. Правила скрытия ниже — уже по основе без хвоста.
+    if (stem.includes('_')) {
+      stem = stem.replace(/-[0-9a-f]{8}(?:-\d{1,2})?$/, '');
+      base = stem + ext;
+    }
     // Кириллическое имя после релея — строка подчёркиваний («выписка.pdf» →
     // «_______.pdf»). Человеку оно ничего не скажет: лучше шаг без имени.
     // Та же проверка молча прячет и редкие латинские имена вроде
