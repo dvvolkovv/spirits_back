@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import * as synthetic from './account-deletion.synthetic';
 import {
   cleanupSyntheticFixture,
@@ -151,6 +152,28 @@ describe('синтетический хост продуктов — свой id
       const row = insertValues(inserts[0]);
       expect(row.id).toBe(HOST_ID);
       expect(row.accepts_new).toBe(false);
+    });
+
+    it('хеш токена агента хоста случайный на каждый посев, не от фикстурной строки', async () => {
+      // Детерминированный хеш sha256('synthetic-deletion-host-agent-fixture')
+      // вычисляет любой, кто читает публичный репозиторий; с прообразом в
+      // руках HostGuard (сверяет sha256 токена с agent_token_hash) пропустил
+      // бы запрос от имени синтетического хоста, пока его строка в базе.
+      const tokenHash = (calls: Call[]): unknown => {
+        const inserts = calls.filter((c) => /INSERT INTO product_hosts\b/.test(c.sql));
+        expect(inserts).toHaveLength(1);
+        return insertValues(inserts[0]).agent_token_hash;
+      };
+      const first = tokenHash(await runSeed());
+      const second = tokenHash(await runSeed());
+      const fixtureHash = createHash('sha256')
+        .update(`${SYNTHETIC_DELETION_PREFIX}host-agent-fixture`)
+        .digest('hex');
+      expect(first).toMatch(/^[0-9a-f]{64}$/);
+      expect(second).toMatch(/^[0-9a-f]{64}$/);
+      expect(first).not.toBe(second);
+      expect(first).not.toBe(fixtureHash);
+      expect(second).not.toBe(fixtureHash);
     });
 
     it('продукт посева стоит на синтетическом хосте', async () => {
