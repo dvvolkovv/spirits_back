@@ -2177,9 +2177,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // проверка !fresh не нужна — эту роль уже играет сравнение по relaySid;
     // старая проверка по activeTurns + !fresh путала оба случая (находки
     // ревью Б2 Step 6: копия файлов, чистый лист, разные языковые сессии).
-    if (!probe && this.relayRunning.has(relaySid)) {
-      contextPrefix += `${INTERRUPTED_TURN_NOTE}\n\n`;
-    }
+    // Если прошлый ход этой сессии не прерван, а ждёт релей за шлагбаумом
+    // выката, — вместо «тот ход прерван» заметка о недошедшем
+    // (relayUndeliveredNote), и его текст этот ход несёт с собой (relayCarry).
+    const pending = probe ? '' : this.relayPendingNote(relaySid);
+    if (pending) contextPrefix += `${pending}\n\n`;
+    const relayCarry = probe ? null : this.relayCarryFor(relaySid, { message, files: [] });
 
     // Требование языка — ПОСЛЕ всех дописанных блоков, перед самой репликой.
     //
@@ -2316,6 +2319,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // флага не попадает — здесь, в обычном завершении, туда уходит fullText
     // (пустая строка), заглушка живёт только в этом aiText для истории.
     let selfHealSkippedForTakeover = false;
+    // Заглушка в историю, когда повтор под шлагбаумом исчерпан. В fullText не
+    // идёт — ход не тарифицируется и не учит профиль.
+    let failureStub = '';
 
     // Single persistence point — dedupe via `saved` flag so success and error paths
     // both call but only one actually writes.
@@ -2379,6 +2385,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // If empty on final: don't pollute history with a stub AI row; save user message + a brief retry-hint.
       // (Frontend will reload history; user can simply resend.)
       const aiText = fullText
+        || failureStub
         || (final && !selfHealSkippedForTakeover ? chatFailureText('noReply', userLanguage, { storeBuild }) : '');
       if (!aiText) return; // skip empty intermediate persists
       // ЭТО реальная точка списания (ниже addTokenTask). Логируем только здесь:
@@ -2515,52 +2522,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // fs_key и activity должны соответствовать фактической сессии попытки,
       // включая смену режима на self-heal retry.
       let linkeonFields = linkeonRelayFields(userId, relaySid);
-      const callUpstreamOnce = async (attempt: { sessionId: string; systemPrompt: string }): Promise<void> => {
+      const callUpstreamOnce = async (attempt: { sessionId: string; systemPrompt: string }, mark: number): Promise<void> => {
         const attemptLinkeonFields = linkeonRelayFields(userId, attempt.sessionId);
         linkeonFields = attemptLinkeonFields;
-        const FormData = require('form-data');
-        const fd = new FormData();
-        fd.append('message', prompt);
-        // Стабильная часть — в --system-prompt релея, отправляется один раз на
-        // сессию и кэшируется. История — отдельным полем: релей вставит её
-        // только если стартует без --resume. Старый релей оба поля игнорирует
-        // и продолжает работать, поэтому выкатывать надо СНАЧАЛА релей: в
-        // обратном порядке персона исчезнет из промпта и ассистенты начнут
-        // представляться Claude.
-        if (attempt.systemPrompt) fd.append('systemPrompt', attempt.systemPrompt);
-        if (historyBlock) fd.append('history', historyBlock);
-        // fresh: relay (r.linkeon.io) держит СВОЮ память по sessionId и резюмит
-        // Claude-сессию — обычный id протаскивал прошлый контекст (задачи,
-        // разговоры) в «чистый лист» мимо наших блокировок. Fresh-сессия
-        // получает на relay собственную чистую память.
-        // Язык — часть ключа сессии.
-        //
-        // Релей резюмит Claude-сессию по sessionId и тащит в неё весь прежний
-        // разговор. У человека, сменившего язык, накопленная русская переписка
-        // перевешивала любые указания в промпте: три правки подряд не помогли,
-        // ассистент отвечал «Рад снова тебя видеть» по-русски аккаунту с
-        // language=en. Другой язык — другая сессия, чистая память, никакого
-        // русского образца перед глазами.
-        //
-        // Цена: при смене языка ассистент забывает прежний разговор. Это
-        // честнее, чем отвечать не на том языке, а история в нашей БД
-        // сохраняется и показывается пользователю как была.
-        fd.append('sessionId', attempt.sessionId);
-
-        // Модель хода. Пинги мониторинга просят haiku: «ответь одним словом ок»
-        // не требует Opus, а обвязка Claude Code (системный промпт CLI +
-        // определения MCP-тулов, ~47k токенов) грузится независимо от содержания
-        // хода и на Opus стоит ~$0.20 против ~$0.02 на haiku.
-        //
-        // Боевые ходы с 23.09.2026 называют модель явно (common/chat-model.ts),
-        // а не полагаются на 'default' релея. Поле по-прежнему необязательное и
-        // деградирует безопасно в обе стороны: старый релей его игнорирует, а
-        // релей с белым списком, где нашего значения ещё нет, подставит свой
-        // 'default'. В обоих случаях ход проходит — просто пин не действует,
-        // и узнать об этом можно только по modelUsage, не по ошибке.
-        fd.append('model', probe ? PROBE_MODEL : CHAT_MODEL);
-        for (const [k, v] of Object.entries(relayProviderFields(probe, answerRoute.provider))) fd.append(k, v);
-
         // Agent-direct TalerID: when the user connected the TalerID ecosystem, hand
         // the file-agent a full-scope access token + the MCP base URL of the env we
         // point at (staging vs api.talerid.io). The file-agent injects a per-session
@@ -2568,11 +2532,6 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // stays on the backend-mediated card flow). Not connected → fields omitted →
         // agent runs exactly as today.
         const tid = await this.taleridAgentFields(userId);
-        if (tid) {
-          fd.append('talerid_token', tid.token);
-          fd.append('talerid_mcp_url', tid.mcpUrl);
-        }
-
         // Инструмент продуктов. Владелец едет ПОДПИСЬЮ в заголовке, а не
         // подсказкой в промпте: телефоном в аргументе правились бы чужие сайты.
         // Тот же токен открывает справку: язык, клиент и вид ассистента едут в
@@ -2583,17 +2542,73 @@ ${LanguageService.buildDirective(userLanguage)}`;
           agent: agentId.startsWith('custom:') ? 'custom' : 'staff',
           turn: productsTurn,
         });
-        fd.append('products_token', pf.products_token);
-        fd.append('products_mcp_url', pf.products_mcp_url);
-        // Инструменты Linkeon (mcp__linkeon__*): пользователь — в подписи
-        // токена, а не в аргументе, который пишет модель; папка хода — fs_key.
-        appendLinkeonFields(fd, attemptLinkeonFields);
+        // Форма multipart — поток: второй раз её не отправить, поэтому на каждый
+        // повтор под шлагбаумом — новая (relay-drain-retry.ts).
+        const buildForm = () => {
+          const FormData = require('form-data');
+          const fd = new FormData();
+          fd.append('message', prompt);
+          // Стабильная часть — в --system-prompt релея, отправляется один раз на
+          // сессию и кэшируется. История — отдельным полем: релей вставит её
+          // только если стартует без --resume. Старый релей оба поля игнорирует
+          // и продолжает работать, поэтому выкатывать надо СНАЧАЛА релей: в
+          // обратном порядке персона исчезнет из промпта и ассистенты начнут
+          // представляться Claude.
+          if (attempt.systemPrompt) fd.append('systemPrompt', attempt.systemPrompt);
+          if (historyBlock) fd.append('history', historyBlock);
+          // fresh: relay (r.linkeon.io) держит СВОЮ память по sessionId и резюмит
+          // Claude-сессию — обычный id протаскивал прошлый контекст (задачи,
+          // разговоры) в «чистый лист» мимо наших блокировок. Fresh-сессия
+          // получает на relay собственную чистую память.
+          // Язык — часть ключа сессии.
+          //
+          // Релей резюмит Claude-сессию по sessionId и тащит в неё весь прежний
+          // разговор. У человека, сменившего язык, накопленная русская переписка
+          // перевешивала любые указания в промпте: три правки подряд не помогли,
+          // ассистент отвечал «Рад снова тебя видеть» по-русски аккаунту с
+          // language=en. Другой язык — другая сессия, чистая память, никакого
+          // русского образца перед глазами.
+          //
+          // Цена: при смене языка ассистент забывает прежний разговор. Это
+          // честнее, чем отвечать не на том языке, а история в нашей БД
+          // сохраняется и показывается пользователю как была.
+          fd.append('sessionId', attempt.sessionId);
 
-        const agentRes = await axios.post(`${AGENT_URL}/chat`, fd, {
-          headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
-          responseType: 'stream',
-          timeout: RELAY_TURN_BUDGET_MS,
-          maxRedirects: 0,
+          // Модель хода. Пинги мониторинга просят haiku: «ответь одним словом ок»
+          // не требует Opus, а обвязка Claude Code (системный промпт CLI +
+          // определения MCP-тулов, ~47k токенов) грузится независимо от содержания
+          // хода и на Opus стоит ~$0.20 против ~$0.02 на haiku.
+          //
+          // Боевые ходы с 23.09.2026 называют модель явно (common/chat-model.ts),
+          // а не полагаются на 'default' релея. Поле по-прежнему необязательное и
+          // деградирует безопасно в обе стороны: старый релей его игнорирует, а
+          // релей с белым списком, где нашего значения ещё нет, подставит свой
+          // 'default'. В обоих случаях ход проходит — просто пин не действует,
+          // и узнать об этом можно только по modelUsage, не по ошибке.
+          fd.append('model', probe ? PROBE_MODEL : CHAT_MODEL);
+          for (const [k, v] of Object.entries(relayProviderFields(probe, answerRoute.provider))) fd.append(k, v);
+
+          if (tid) {
+            fd.append('talerid_token', tid.token);
+            fd.append('talerid_mcp_url', tid.mcpUrl);
+          }
+
+          fd.append('products_token', pf.products_token);
+          fd.append('products_mcp_url', pf.products_mcp_url);
+          // Инструменты Linkeon (mcp__linkeon__*): пользователь — в подписи
+          // токена, а не в аргументе, который пишет модель; папка хода — fs_key.
+          appendLinkeonFields(fd, attemptLinkeonFields);
+          return fd;
+        };
+
+        const agentRes: any = await this.postRelayTurn(attempt.sessionId, mark, relayCarry, () => {
+          const fd = buildForm();
+          return axios.post(`${AGENT_URL}/chat`, fd, {
+            headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
+            responseType: 'stream',
+            timeout: RELAY_TURN_BUDGET_MS,
+            maxRedirects: 0,
+          });
         });
 
         await new Promise<void>((resolve, reject) => {
@@ -2688,7 +2703,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           relaySid = attempt.sessionId;
           relayMark = this.beginRelayRun(relaySid);
         }
-        await callUpstreamOnce(attempt);
+        await callUpstreamOnce(attempt, relayMark);
       };
       try {
         await runUpstreamAttempt();
@@ -2716,7 +2731,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // Проверка takeover — внутри runUpstreamAttempt после свежего
           // consent-query: новый ход мог перехватить сессию и за эту паузу, и за
           // сам запрос настроек. При смене режима метка переедет на новый ключ.
-          try { await runUpstreamAttempt(true); } catch (e: any) { this.logger.warn(`self-heal retry failed: ${e.message}`); }
+          try {
+            await runUpstreamAttempt(true);
+          } catch (e: any) {
+            // Шлагбаум выката — не «повтор не удался»: исход решает главный catch.
+            if (e instanceof RelayDrainingError) throw e;
+            this.logger.warn(`self-heal retry failed: ${e.message}`);
+          }
         }
       } finally {
         this.endRelayRun(relaySid, relayMark);
@@ -3058,9 +3079,29 @@ ${LanguageService.buildDirective(userLanguage)}`;
         this.logger.warn(`product action attach failed in catch: ${e.message}`);
       }
       // Try to write error to response; safeWrite is a no-op if client gone.
-      const errText = chatFailureText('startFailed', userLanguage);
-      safeWrite({ type: 'item', content: errText });
-      safeWrite({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } });
+      if (err instanceof RelayDrainingError && err.superseded) {
+        // Ход ждал релей за шлагбаумом, и его перебило новое сообщение: оно
+        // уже несёт текст этого хода (relayCarryFor). Тихий конец — без
+        // заглушки и без строки ассистента в истории.
+        turnFailed = true;
+        failReason = 'preempted';
+        selfHealSkippedForTakeover = true;
+        safeWrite({ type: 'end', content: '', usage: { input: 0, output: 0, total: 0 } });
+      } else if (err instanceof RelayDrainingError) {
+        // Релей обновлялся дольше бюджета повтора. Токены не списаны —
+        // turnFailed, а заглушка не в fullText.
+        turnFailed = true;
+        failReason = 'relay_draining';
+        failureStub = chatFailureText('relayUpdating', userLanguage, { storeBuild });
+        safeWrite({ type: 'item', content: failureStub });
+        safeWrite({
+          type: 'end', content: failureStub, reason: 'relay_draining', usage: { input: 0, output: 0, total: 0 },
+        });
+      } else {
+        const errText = chatFailureText('startFailed', userLanguage);
+        safeWrite({ type: 'item', content: errText });
+        safeWrite({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } });
+      }
       if (!clientDisconnected) {
         try { res.end(); } catch {}
       }
