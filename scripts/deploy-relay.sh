@@ -2,6 +2,18 @@
 # Официальный выкат relay-agent на r.linkeon.io. Не входит в deploy.sh.
 # Использование: bash scripts/deploy-relay.sh <BASE_SHA> <TARGET_SHA>
 # BASE_SHA — коммит, чьё содержимое relay-agent совпадает с живым релеем.
+#
+# Ожидание перед заменой (с 16.11.2026, пункт бэклога aa27b1d5):
+#   RELAY_DRAIN_MODE=quiet (по умолчанию) — ждать тишины БЕЗ шлагбаума (ни одного
+#     принятого /chat и ни одного процесса CLI), потом поставить шлагбаум и
+#     перепроверять тишину не дольше DRAIN_GATE_WINDOW_SECONDS (90 с — меньше
+#     бюджета повтора бэка, 150 с, src/chat/relay-drain-retry.ts). Ход проскочил
+#     под шлагбаум и не закончился за окно — шлагбаум снимается, ожидание
+#     тишины начинается заново.
+#   RELAY_DRAIN_MODE=gate — прежний порядок, для аварийного выката, когда тишины
+#     не дождаться: шлагбаум сразу, ждать тишины под ним.
+#   DRAIN_WAIT_SECONDS (1800) — сколько всего ждать тишины.
+# Релей без inflight в /health (legacy) выкатывается по-прежнему — шлагбаумом в nginx.
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
@@ -16,6 +28,17 @@ DRAIN_FILE=${RELAY_DRAIN_FILE:-/tmp/linkeon-relay-drain}
 LOCK_FILE=${RELAY_DEPLOY_LOCK_FILE:-/tmp/linkeon-relay-deploy.lock}
 NGINX_CONF=${RELAY_NGINX_CONF:-/etc/nginx/conf.d/parking.conf}
 DRAIN_WAIT_SECONDS=${DRAIN_WAIT_SECONDS:-1800}
+RELAY_DRAIN_MODE=${RELAY_DRAIN_MODE:-quiet}
+DRAIN_GATE_WINDOW_SECONDS=${DRAIN_GATE_WINDOW_SECONDS:-90}
+# Проверка до git и ssh: опечатка в режиме не должна молча включить другой порядок.
+if [[ "$RELAY_DRAIN_MODE" != quiet && "$RELAY_DRAIN_MODE" != gate ]]; then
+  echo "RELAY_DRAIN_MODE=$RELAY_DRAIN_MODE: допустимо quiet или gate" >&2
+  exit 2
+fi
+if [[ ! "$DRAIN_GATE_WINDOW_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "DRAIN_GATE_WINDOW_SECONDS=$DRAIN_GATE_WINDOW_SECONDS: нужно целое число секунд" >&2
+  exit 2
+fi
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
@@ -75,6 +98,18 @@ set -euo pipefail
 DRAIN_FILE=${DRAIN_FILE:-/tmp/linkeon-relay-drain}
 NGINX_CONF=${NGINX_CONF:-/etc/nginx/conf.d/parking.conf}
 DRAIN_WAIT_SECONDS=${DRAIN_WAIT_SECONDS:-1800}
+RELAY_DRAIN_MODE=${RELAY_DRAIN_MODE:-quiet}
+DRAIN_GATE_WINDOW_SECONDS=${DRAIN_GATE_WINDOW_SECONDS:-90}
+# Релей проверяет сам, до marker и nginx: опечатка в режиме не должна молча
+# включить другой порядок.
+if [[ "$RELAY_DRAIN_MODE" != quiet && "$RELAY_DRAIN_MODE" != gate ]]; then
+  echo "RELAY_DRAIN_MODE=$RELAY_DRAIN_MODE: допустимо quiet или gate" >&2
+  exit 2
+fi
+if [[ ! "$DRAIN_GATE_WINDOW_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "DRAIN_GATE_WINDOW_SECONDS=$DRAIN_GATE_WINDOW_SECONDS: нужно целое число секунд" >&2
+  exit 2
+fi
 SUDO=${SUDO:-sudo}
 GATE_CREATED=0
 NGINX_DRAIN=0
@@ -96,6 +131,37 @@ inflight_count() {
       console.log(inflight);
     });
   '
+}
+
+relay_has_children() {
+  local CHILDREN
+  CHILDREN=$(ps --ppid "$PID" -o pid= || true)
+  grep -q . <<< "$CHILDREN"
+}
+
+# Тишина на релее: ни одного процесса CLI (PM2 children) и ни одного принятого
+# /chat (inflight). Зовётся в условии цикла — там set -e не действует, поэтому
+# сбой health разбирается явно: не ответил — не тихо.
+relay_quiet() {
+  local inflight
+  if relay_has_children; then return 1; fi
+  if ! inflight=$(inflight_count); then
+    echo "health релея не ответил при проверке тишины" >&2
+    return 1
+  fi
+  [[ "$inflight" =~ ^[0-9]+$ ]] && (( inflight == 0 ))
+}
+
+gate_on() {
+  ( umask 077; printf '%s\n' "$TARGET_SHORT" > "$DRAIN_FILE.tmp.$$" && mv "$DRAIN_FILE.tmp.$$" "$DRAIN_FILE" )
+  GATE_CREATED=1
+}
+
+# Снять marker этого выката ДО замены файлов (quiet: ход проскочил под
+# шлагбаум). После замены marker снимает только health_and_release.
+gate_off() {
+  rm -f -- "$DRAIN_FILE"
+  GATE_CREATED=0
 }
 
 nginx_worker_pids() {
@@ -328,37 +394,71 @@ done
 nginx_files_proxy
 
 INITIAL_INFLIGHT=$(inflight_count)
-if [[ "$INITIAL_INFLIGHT" == legacy ]]; then
-  nginx_drain_on
-fi
 
-( umask 077; printf '%s\n' "$TARGET_SHORT" > "$DRAIN_FILE.tmp.$$" && mv "$DRAIN_FILE.tmp.$$" "$DRAIN_FILE" )
-GATE_CREATED=1
-
+# PID — до любого шлагбаума: без живого file-agent рестарт невозможен, и
+# закрывать admission незачем.
 PID=$(pm2 pid file-agent)
 if [[ ! "$PID" =~ ^[1-9][0-9]*$ ]]; then
   echo "PM2 file-agent не запущен (pid=$PID) — рестарт невозможен" >&2
   exit 1
 fi
+
 DRAIN_STARTED=$SECONDS
-while true; do
-  CHILDREN=$(ps --ppid "$PID" -o pid= || true)
-  if [[ "$INITIAL_INFLIGHT" == legacy ]]; then
-    if ! grep -q . <<< "$CHILDREN" && legacy_workers_drained; then
-      break
+drain_deadline() {
+  (( SECONDS - DRAIN_STARTED >= DRAIN_WAIT_SECONDS ))
+}
+
+if [[ "$INITIAL_INFLIGHT" == legacy ]]; then
+  # Релей без inflight в health — прежний порядок: шлагбаум в nginx и marker
+  # сразу, ждать детей CLI и старых Nginx workers.
+  nginx_drain_on
+  gate_on
+  until ! relay_has_children && legacy_workers_drained; do
+    if drain_deadline; then
+      echo "Ходы, принятые запросы или старые Nginx workers не завершились за $DRAIN_WAIT_SECONDS с — замена отменена" >&2
+      exit 1
     fi
-  else
-    INFLIGHT=$(inflight_count)
-    if ! grep -q . <<< "$CHILDREN" && [[ "$INFLIGHT" -eq 0 ]]; then
-      break
+    sleep 5
+  done
+elif [[ "$RELAY_DRAIN_MODE" == gate ]]; then
+  # Аварийный порядок: marker сразу, ждать тишины под ним.
+  gate_on
+  until relay_quiet; do
+    if drain_deadline; then
+      echo "Ходы, принятые запросы или старые Nginx workers не завершились за $DRAIN_WAIT_SECONDS с — замена отменена" >&2
+      exit 1
     fi
-  fi
-  if (( SECONDS - DRAIN_STARTED >= DRAIN_WAIT_SECONDS )); then
-    echo "Ходы, принятые запросы или старые Nginx workers не завершились за $DRAIN_WAIT_SECONDS с — замена отменена" >&2
-    exit 1
-  fi
-  sleep 5
-done
+    sleep 5
+  done
+else
+  # quiet: сначала тишина без шлагбаума — долгий ход (10 минут агентной
+  # работы) не держит /chat закрытым. Шлагбаум — только на перепроверку,
+  # замену и рестарт; бэк эти секунды переждёт повтором.
+  while true; do
+    until relay_quiet; do
+      if drain_deadline; then
+        echo "Тишины на релее не дождались за $DRAIN_WAIT_SECONDS с — ничего не заменено, шлагбаум не стоит" >&2
+        exit 1
+      fi
+      sleep 5
+    done
+    gate_on
+    GATE_STARTED=$SECONDS
+    until relay_quiet; do
+      if (( SECONDS - GATE_STARTED >= DRAIN_GATE_WINDOW_SECONDS )); then
+        gate_off
+        echo "Ход проскочил под шлагбаум и не закончился за $DRAIN_GATE_WINDOW_SECONDS с — шлагбаум снят, снова ждём тишины" >&2
+        if drain_deadline; then
+          echo "Тишины на релее не дождались за $DRAIN_WAIT_SECONDS с — ничего не заменено, шлагбаум не стоит" >&2
+          exit 1
+        fi
+        continue 2
+      fi
+      sleep 1
+    done
+    break
+  done
+fi
 
 REPLACED=1
 IFS=',' read -ra PUT <<< "$PUT_CSV"
@@ -384,4 +484,4 @@ git log --oneline -1
 pm2 restart file-agent >/dev/null
 REMOTE
 
-tar -cf - -C "$LOCAL_BUNDLE" . | ssh -o BatchMode=yes "$RELAY_HOST" "set -euo pipefail; exec 9>\"$LOCK_FILE\"; if ! flock -n 9; then echo 'Другой rollout держит $LOCK_FILE — staging, marker и файлы не изменены' >&2; exit 1; fi; rm -rf ~/$STAGE ~/$BASE_DIR; mkdir ~/$STAGE ~/$BASE_DIR; tar -xf - -C ~; STAGE=$STAGE BASE_DIR=$BASE_DIR TARGET_SHORT=$TARGET_SHORT FILES_CSV=$FILES_CSV PUT_CSV=$PUT_CSV DEL_CSV=$DEL_CSV ADD_CSV=$ADD_CSV DRAIN_FILE=$DRAIN_FILE LOCK_FILE=$LOCK_FILE NGINX_CONF=$NGINX_CONF DRAIN_WAIT_SECONDS=$DRAIN_WAIT_SECONDS bash ~/$STAGE/deploy-relay-remote.sh"
+tar -cf - -C "$LOCAL_BUNDLE" . | ssh -o BatchMode=yes "$RELAY_HOST" "set -euo pipefail; exec 9>\"$LOCK_FILE\"; if ! flock -n 9; then echo 'Другой rollout держит $LOCK_FILE — staging, marker и файлы не изменены' >&2; exit 1; fi; rm -rf ~/$STAGE ~/$BASE_DIR; mkdir ~/$STAGE ~/$BASE_DIR; tar -xf - -C ~; STAGE=$STAGE BASE_DIR=$BASE_DIR TARGET_SHORT=$TARGET_SHORT FILES_CSV=$FILES_CSV PUT_CSV=$PUT_CSV DEL_CSV=$DEL_CSV ADD_CSV=$ADD_CSV DRAIN_FILE=$DRAIN_FILE LOCK_FILE=$LOCK_FILE NGINX_CONF=$NGINX_CONF DRAIN_WAIT_SECONDS=$DRAIN_WAIT_SECONDS RELAY_DRAIN_MODE=$RELAY_DRAIN_MODE DRAIN_GATE_WINDOW_SECONDS=$DRAIN_GATE_WINDOW_SECONDS bash ~/$STAGE/deploy-relay-remote.sh"
