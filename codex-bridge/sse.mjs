@@ -31,9 +31,26 @@ export function createSseParser(onEvent) {
   };
 }
 
+// Код сбоя для журнала моста — только «словарное» значение, никакого текста.
+const LOGGABLE_CODE = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+// Сбой upstream: в Responses API поля лежат на верхнем уровне события, у бэкенда
+// codex (chatgpt.com) — во вложенном error. Без второго случая CLI получал
+// пустую заглушку «Upstream error», и причина отказа терялась (релей, 16.11.2026).
+// type: 'error' на верхнем уровне — имя события, а не код.
+function upstreamFailure(err, fallbackMessage) {
+  const e = err && typeof err === 'object' ? err : {};
+  const message = typeof e.message === 'string' && e.message ? e.message : fallbackMessage;
+  let code = 'api_error';
+  if (typeof e.code === 'string' && e.code) code = e.code;
+  else if (typeof e.type === 'string' && e.type && e.type !== 'error') code = e.type;
+  return [message, code];
+}
+
 export function createAnthropicStream({ model, messageId = `msg_${randomUUID()}`, write }) {
   let started = false;
   let finished = false;
+  let failureCode = null;
   let blockIndex = 0;
   let sawFunctionCall = false;
   let inputTokens = 0;
@@ -92,6 +109,7 @@ export function createAnthropicStream({ model, messageId = `msg_${randomUUID()}`
   function fail(message, type = 'api_error') {
     if (finished) return;
     finished = true;
+    failureCode = LOGGABLE_CODE.test(type) ? type : 'unknown';
     start();
     emit('error', { error: { type, message } });
   }
@@ -146,10 +164,10 @@ export function createAnthropicStream({ model, messageId = `msg_${randomUUID()}`
           break;
         }
         case 'response.failed':
-          fail(data.response?.error?.message ?? 'Upstream response failed');
+          fail(...upstreamFailure(data.response?.error, 'Upstream response failed'));
           break;
         case 'error':
-          fail(data.message ?? 'Upstream error', typeof data.code === 'string' ? data.code : 'api_error');
+          fail(...upstreamFailure(data.error && typeof data.error === 'object' ? data.error : data, 'Upstream error'));
           break;
         default:
           break; // response.in_progress, *.done, reasoning-события
@@ -163,6 +181,10 @@ export function createAnthropicStream({ model, messageId = `msg_${randomUUID()}`
     },
     get isFinished() {
       return finished;
+    },
+    // null — поток не падал; иначе код сбоя, годный в журнал.
+    get failureCode() {
+      return failureCode;
     },
   };
 }
