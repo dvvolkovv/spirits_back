@@ -200,3 +200,41 @@ test('assembleMessage приводит не-объектный JSON аргуме
   const message = assembleMessage(c.rawWrites());
   assert.deepEqual(message.content[0].input, {});
 });
+
+test('error с вложенным error (так шлёт бэкенд codex) отдаёт настоящий текст и код', () => {
+  // 16.11.2026 на релее: бэкенд codex прислал сбой во вложенном error, а мост
+  // искал поля на верхнем уровне — CLI получил пустую заглушку «Upstream error».
+  const c = collector();
+  c.stream.handleEvent({ type: 'error', data: { type: 'error', error: {
+    type: 'invalid_request_error', code: 'context_length_exceeded', message: 'input too long',
+  } } });
+  assert.deepEqual(c.types(), ['message_start', 'error']);
+  assert.deepEqual(c.events()[1].error, { type: 'context_length_exceeded', message: 'input too long' });
+  assert.equal(c.stream.failureCode, 'context_length_exceeded');
+
+  const noCode = collector();
+  noCode.stream.handleEvent({ type: 'error', data: { type: 'error', error: { type: 'invalid_request_error', message: 'bad schema' } } });
+  assert.deepEqual(noCode.events()[1].error, { type: 'invalid_request_error', message: 'bad schema' });
+});
+
+test('response.failed с кодом отдаёт его типом ошибки и в failureCode', () => {
+  const c = collector();
+  c.stream.handleEvent({ type: 'response.failed', data: { response: { error: { code: 'server_error', message: 'oops' } } } });
+  assert.deepEqual(c.events()[1].error, { type: 'server_error', message: 'oops' });
+  assert.equal(c.stream.failureCode, 'server_error');
+});
+
+test('failureCode: null без сбоя, api_error без кода, unknown для кода, негодного в журнал', () => {
+  const ok = collector();
+  ok.stream.handleEvent({ type: 'response.completed', data: { response: {} } });
+  assert.equal(ok.stream.failureCode, null);
+
+  const bare = collector();
+  bare.stream.handleEvent({ type: 'error', data: { type: 'error' } });
+  assert.deepEqual(bare.events()[1].error, { type: 'api_error', message: 'Upstream error' });
+  assert.equal(bare.stream.failureCode, 'api_error');
+
+  const weird = collector();
+  weird.stream.handleEvent({ type: 'error', data: { code: 'код с пробелами', message: 'x' } });
+  assert.equal(weird.stream.failureCode, 'unknown');
+});
