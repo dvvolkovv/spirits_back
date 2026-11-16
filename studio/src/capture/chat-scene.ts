@@ -56,7 +56,7 @@ function answerState(page: Page): Promise<AnswerState> {
   }, ASSISTANT_MSG);
 }
 
-async function waitAnswer(page: Page, before: number): Promise<string> {
+export async function waitAnswer(page: Page, before: number): Promise<string> {
   const started = Date.now();
   let last: string | null = null;
   let since = Date.now();
@@ -83,7 +83,7 @@ async function waitAnswer(page: Page, before: number): Promise<string> {
  * вопрос, отправленный поверх, ушёл бы в очередь. Готово, когда есть хотя бы
  * одно сообщение ассистента и STABLE_MS нет признаков набора.
  */
-async function waitIdle(page: Page): Promise<void> {
+export async function waitIdle(page: Page): Promise<void> {
   const started = Date.now();
   let lastCount = -1;
   let since = Date.now();
