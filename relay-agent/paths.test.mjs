@@ -328,3 +328,16 @@ test("самое длинное имя с запасным суффиксом у
   assert.ok(Buffer.byteLength(built) <= 255);
   assert.equal(tryCreate(built), null);
 });
+
+// Легаси-ключ сессии может содержать точку («a.b»): у загрузки без расширения
+// path.extname всего имени «a.b_README» — «.b_README», и суффикс уехал бы в
+// ключ («a-2.b_README»): префикс «<ключ>_» потерян, маска <ключ>_* не видит файл.
+test("uniqueUploadPath: ключ с точкой и имя без расширения — суффикс после основы, не в ключе", () => {
+  const taken = (p) => p === path.join("/u", "a.b_README");
+  assert.equal(uniqueUploadPath("/u", "a.b_README", taken), path.join("/u", "a.b_README-2"));
+});
+
+test("uniqueUploadPath: ключ с точкой и обычное расширение — суффикс перед расширением", () => {
+  const taken = (p) => p === path.join("/u", "a.b_x.pdf");
+  assert.equal(uniqueUploadPath("/u", "a.b_x.pdf", taken), path.join("/u", "a.b_x-2.pdf"));
+});
