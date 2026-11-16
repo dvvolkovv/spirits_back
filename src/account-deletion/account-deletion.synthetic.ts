@@ -750,12 +750,17 @@ export async function historicalSnapshot(
  * читатель accepts_new) на пути synthetic не вызывается — зато живой API
  * стенда, который смотрит в ту же базу, пока идёт прогон, не выберет
  * фиктивную машину для чужого нового продукта.
+ *
+ * ON CONFLICT … DO UPDATE SET accepts_new = false, а не DO NOTHING: строка
+ * могла остаться от прерванного прогона и быть открытой для новых — посев
+ * закрывает её в любом случае. Остальные поля существующей строки не
+ * трогаются.
  */
 export async function seedSyntheticHost(pg: PgService): Promise<void> {
   await pg.query(
     `INSERT INTO product_hosts (id, ssh_target, public_ip, domain_suffix, agent_token_hash, capacity, audience, accepts_new)
      VALUES ($1,'root@10.50.0.1','10.50.0.1','c.linkeon.io',$2,20,'clients',false)
-     ON CONFLICT (id) DO NOTHING`,
+     ON CONFLICT (id) DO UPDATE SET accepts_new = false`,
     [SYNTHETIC_HOST_ID, sha256(`${SYNTHETIC_DELETION_PREFIX}host-agent-fixture`)],
   );
 }
