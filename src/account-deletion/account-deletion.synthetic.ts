@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'crypto';
+import { createHash, randomBytes, randomUUID } from 'crypto';
 import { ServiceUnavailableException } from '@nestjs/common';
 import { AvatarService } from '../avatar/avatar.service';
 import { PgService } from '../common/services/pg.service';
@@ -755,13 +755,21 @@ export async function historicalSnapshot(
  * могла остаться от прерванного прогона и быть открытой для новых — посев
  * закрывает её в любом случае. Остальные поля существующей строки не
  * трогаются.
+ *
+ * Хеш токена агента — от случайных байтов на каждый посев: сам токен не
+ * сохраняется и никому не известен, поэтому HostGuard (сверяет sha256
+ * токена с agent_token_hash) от имени синтетического хоста не пропустит.
+ * Хеш от фиксированной строки вычислил бы любой читатель публичного
+ * репозитория. У строки, оставшейся от прошлого прогона, DO UPDATE хеш не
+ * меняет — это допустимо: такая строка живёт до уборки этого же прогона
+ * (cleanupSyntheticFixture удаляет хост).
  */
 export async function seedSyntheticHost(pg: PgService): Promise<void> {
   await pg.query(
     `INSERT INTO product_hosts (id, ssh_target, public_ip, domain_suffix, agent_token_hash, capacity, audience, accepts_new)
      VALUES ($1,'root@10.50.0.1','10.50.0.1','c.linkeon.io',$2,20,'clients',false)
      ON CONFLICT (id) DO UPDATE SET accepts_new = false`,
-    [SYNTHETIC_HOST_ID, sha256(`${SYNTHETIC_DELETION_PREFIX}host-agent-fixture`)],
+    [SYNTHETIC_HOST_ID, sha256(randomBytes(32).toString('hex'))],
   );
 }
 
