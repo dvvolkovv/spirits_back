@@ -591,7 +591,8 @@ maybe('profile account deletion against PostgreSQL (Task 17)', () => {
     expect(await rows(`SELECT linkeon_user_id FROM tg_user_identities`))
       .toEqual([{ linkeon_user_id: OTHER }]);
     // user_id — tombstone: state/deletion_id/deleted_at не тронуты,
-    // password/email/contacts/welcome bonus погашены.
+    // password/email/contacts погашены. welcome_bonus_at сохранён (T20-M1):
+    // бонус один раз на аккаунт, повторная регистрация его не получает.
     const u = await rows(
       `SELECT state, deletion_id, deleted_at, password_hash, primary_email,
               contacts, welcome_bonus_at, update_date
@@ -602,9 +603,10 @@ maybe('profile account deletion against PostgreSQL (Task 17)', () => {
       password_hash: null,
       primary_email: null,
       contacts: null,
-      welcome_bonus_at: null,
     });
     expect(new Date(u[0].deleted_at).getTime()).toBe(DELETED_AT.getTime());
+    expect(u[0].welcome_bonus_at).not.toBeNull();
+    expect(new Date(u[0].welcome_bonus_at).getTime()).toBe(DELETED_AT.getTime());
     expect(u[0].update_date).not.toBeNull();
     // Finance/security logs — байт-в-байт.
     expect(await preservedSnapshot()).toBe(preservedBefore);

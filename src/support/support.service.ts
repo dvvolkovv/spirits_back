@@ -36,6 +36,28 @@ export class TicketPrefixAmbiguousError extends Error {
   }
 }
 
+/**
+ * Сообщение о начислении в переписке тикета: «Начислено 1 токен», «6 444
+ * токена», «41 000 токенов». До 16.11.2026 после любого числа стояло
+ * «токенов».
+ *
+ * Форму выбирает Intl.PluralRules, как в limits.service.ts: 21 — `one`,
+ * 11–14 — `many`. `other` сведён к «токенов»: Node со small-icu отдаёт его
+ * для русского вместо `few`/`many`, и текст остаётся прежним, а не ломается.
+ */
+const TOKEN_FORMS: Record<string, string> = {
+  one: 'токен',
+  few: 'токена',
+  many: 'токенов',
+  other: 'токенов',
+};
+const RU_PLURALS = new Intl.PluralRules('ru-RU');
+
+function refundNotice(amount: number, balance: number): string {
+  const word = TOKEN_FORMS[RU_PLURALS.select(amount)] ?? TOKEN_FORMS.many;
+  return `💳 Начислено ${amount.toLocaleString('ru-RU')} ${word}. Новый баланс: ${balance.toLocaleString('ru-RU')}.`;
+}
+
 @Injectable()
 export class SupportService implements OnModuleInit {
   private readonly logger = new Logger(SupportService.name);
@@ -768,7 +790,7 @@ ${healthSummary}
       // Post a system message visible to user so they see the confirmation in-chat.
       await this.insertMessage(
         ticketId, 'system', null,
-        `💳 Начислено ${amount.toLocaleString('ru-RU')} токенов. Новый баланс: ${newBalance.toLocaleString('ru-RU')}.`,
+        refundNotice(amount, newBalance),
         { refund: true, amount, reference }, true,
       );
       return { ok: true, amount, new_balance: newBalance, ticket_total: ticketSoFar + amount, day_total: daySoFar + amount };
@@ -1612,7 +1634,7 @@ ${healthSummary}
       this.logger.log(`owner refund ${sum} (ticket ${ticketId})`);
       await this.insertMessage(
         ticketId, 'system', ownerId,
-        `💳 Начислено ${sum.toLocaleString('ru-RU')} токенов. Новый баланс: ${balance.toLocaleString('ru-RU')}.`,
+        refundNotice(sum, balance),
         { refund: true, amount: sum, by: 'owner' }, true,
       );
       return { ok: true, amount: sum, new_balance: balance };

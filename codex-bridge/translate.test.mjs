@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   messagesToInput,
   systemToInstructions,
+  TOOL_IMAGE_NOTE,
   toolsToFunctions,
   translateRequest,
 } from './translate.mjs';
@@ -139,4 +140,67 @@ test('small max_tokens is floored to MIN_OUTPUT_TOKENS (reasoning shares the bud
   assert.equal(small.max_output_tokens, 1024);
   const large = translateRequest({ model: 'gpt-6-astra', max_tokens: 8000, messages: [] });
   assert.equal(large.max_output_tokens, 8000);
+});
+
+test('картинки из tool_result доходят до модели: сообщением пользователя сразу после выходов', () => {
+  // 16.11.2026 на релее: ассистент читал загруженные фото инструментом Read, а мост
+  // оставлял от tool_result только текст — модель видела пустой результат и
+  // перечитывала файлы по кругу. input_image допустим только в сообщении
+  // пользователя, а выходы функций должны идти подряд за вызовами.
+  const input = messagesToInput([
+    { role: 'assistant', content: [
+      { type: 'tool_use', id: 'toolu_1', name: 'Read', input: { file_path: '/u/a.jpg' } },
+      { type: 'tool_use', id: 'toolu_2', name: 'Read', input: { file_path: '/u/b.jpg' } },
+    ] },
+    { role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'toolu_1', content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: 'AAA' } },
+      ] },
+      { type: 'tool_result', tool_use_id: 'toolu_2', content: [
+        { type: 'text', text: 'meta' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'BBB' } },
+      ] },
+    ] },
+  ]);
+  assert.deepEqual(input.map((i) => i.type),
+    ['function_call', 'function_call', 'function_call_output', 'function_call_output', 'message']);
+  assert.equal(input[2].output, TOOL_IMAGE_NOTE);
+  assert.equal(input[3].output, `meta\n${TOOL_IMAGE_NOTE}`);
+  assert.deepEqual(input[4], { type: 'message', role: 'user', content: [
+    { type: 'input_text', text: 'Image from tool result toolu_1:' },
+    { type: 'input_image', image_url: 'data:image/jpeg;base64,AAA', detail: 'auto' },
+    { type: 'input_text', text: 'Image from tool result toolu_2:' },
+    { type: 'input_image', image_url: 'data:image/png;base64,BBB', detail: 'auto' },
+  ] });
+});
+
+test('схемы инструментов без строковых pattern: OpenAI отвергает lookaround и роняет весь запрос', () => {
+  // 16.11.2026 на релее: «Invalid JSON schema: regex lookaround is not supported.
+  // Found at $.properties.to.pattern» — из-за одного MCP-инструмента не прошёл ни один ход.
+  const schema = {
+    type: 'object',
+    properties: {
+      to: { type: 'string', format: 'email', pattern: '^(?!\\.)(?!.*\\.\\.)[^@]+@[^@]+$' },
+      pattern: { type: 'string', description: 'свойство с таким именем — у Grep, его не трогаем' },
+      list: { type: 'array', items: { type: 'string', pattern: '^a' } },
+      mode: { type: 'object', const: { pattern: 'значение, а не ключевое слово' } },
+      default: { type: 'string', pattern: '^(?=x)' },
+    },
+    required: ['to', 'pattern'],
+  };
+  const [fn] = toolsToFunctions([{ name: 'send', input_schema: schema }]);
+  assert.deepEqual(fn.parameters, {
+    type: 'object',
+    properties: {
+      to: { type: 'string', format: 'email' },
+      pattern: { type: 'string', description: 'свойство с таким именем — у Grep, его не трогаем' },
+      list: { type: 'array', items: { type: 'string' } },
+      mode: { type: 'object', const: { pattern: 'значение, а не ключевое слово' } },
+      // параметр с именем ключевого слова-значения — всё равно схема
+      default: { type: 'string' },
+    },
+    required: ['to', 'pattern'],
+  });
+  // исходная схема CLI не мутируется
+  assert.equal(schema.properties.to.pattern, '^(?!\\.)(?!.*\\.\\.)[^@]+@[^@]+$');
 });

@@ -452,6 +452,40 @@ test('upstream 401 message reaches the client but never the log file', async (t)
   assert.ok(!logged.includes('УНИКАЛЬНЫЙ_ТЕКСТ_ОШИБКИ'));
 });
 
+test('сбой upstream внутри потока: клиенту — текст ошибки, в журнал — error с кодом и без текста', async (t) => {
+  // 16.11.2026 на релее такой сбой журналировался как response 200, а CLI
+  // получал пустую заглушку — причина отказа терялась в обоих местах.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-log-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const logPath = path.join(dir, 'bridge.log');
+  const { createFileLogger } = await import('./bridge.mjs');
+  const fileLog = createFileLogger(logPath);
+  const upstream = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end([
+      'event: error',
+      'data: {"type":"error","error":{"type":"invalid_request_error","code":"invalid_value","message":"УНИКАЛЬНЫЙ_СБОЙ_ПОТОКА_314"}}',
+      '',
+      '',
+    ].join('\n'));
+  });
+  const upstreamOrigin = await listen(upstream);
+  t.after(() => close(upstream));
+  const authPath = makeAuthFile(t);
+  const bridge = createBridge({ upstream: upstreamOrigin, authPath, log: fileLog });
+  const bridgeOrigin = await listen(bridge);
+  t.after(() => close(bridge));
+  const result = await post(bridgeOrigin, '/v1/messages', { model: 'gpt-6-astra', stream: true, messages: [] });
+  assert.equal(result.status, 200);
+  assert.match(result.text, /event: error/);
+  assert.match(result.text, /УНИКАЛЬНЫЙ_СБОЙ_ПОТОКА_314/);
+  fileLog.close();
+  const logged = fs.readFileSync(logPath, 'utf8');
+  const codex = logged.trim().split('\n').map((l) => JSON.parse(l)).filter((l) => l.route === 'codex');
+  assert.deepEqual(codex.map((l) => [l.type, l.status, l.error]), [['error', 200, 'upstream_failed:invalid_value']]);
+  assert.ok(!logged.includes('УНИКАЛЬНЫЙ_СБОЙ_ПОТОКА'));
+});
+
 test('Дифф 4: под pm2 (pm_id в env) мост открывает порт', async (t) => {
   const { spawn } = await import('node:child_process');
   const { fileURLToPath } = await import('node:url');

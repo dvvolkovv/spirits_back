@@ -339,6 +339,10 @@ export function createBridge({
             stream.finishIfOpen();
             if (clientGone) {
               emit(log, { id, type: 'error', route: 'codex', model: requestModel, status: 499, error: 'client_disconnect' });
+            } else if (stream.failureCode) {
+              // Сбой внутри потока: HTTP уже 200, но ответа нет. Раньше это
+              // журналировалось успехом — 16.11.2026 так спрятался отказ на релее.
+              emit(log, { id, type: 'error', route: 'codex', model: requestModel, status: 200, error: `upstream_failed:${stream.failureCode}` });
             } else {
               emit(log, { id, type: 'response', route: 'codex', model: requestModel, status: 200 });
             }

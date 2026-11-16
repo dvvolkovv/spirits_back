@@ -9,12 +9,13 @@ import {
   assertSyntheticPreflight,
   checkSyntheticGates,
   faultErrorFor,
+  isSyntheticGateHostname,
   SYNTHETIC_APPLY_FLAG,
   SYNTHETIC_CONFIRM_FLAG,
   SYNTHETIC_DELETION_PREFIX,
   SYNTHETIC_GATE_ENV,
   SYNTHETIC_GATE_ENV_VALUE,
-  SYNTHETIC_GATE_HOSTNAME,
+  SYNTHETIC_GATE_HOSTNAMES,
   SyntheticFailures,
   SyntheticGateError,
   SyntheticPreflightError,
@@ -25,11 +26,12 @@ import {
  *
  * Гейты CLI проверяются ЗДЕСЬ чистой функцией и spawn-ом ОТКАЗНЫХ веток.
  * ВНИМАНИЕ: полная тройка гейтов (--apply --confirm-account-deletion-cleanup
- * + ACCOUNT_DELETION_SYNTHETIC_ENV=test.linkeon.io + hostname ugliest-salmon)
- * НИКОГДА не передаётся spawn-у: на CI-ноде hostname и есть ugliest-salmon,
- * и живой запуск synthetic — это Gate B, отдельное ОК владельца. Успешный
- * путь покрывает account-deletion.synthetic.pg.spec.ts напрямую через
- * composition root, без CLI.
+ * + ACCOUNT_DELETION_SYNTHETIC_ENV=test.linkeon.io + hostname из точного
+ * allow-list SYNTHETIC_GATE_HOSTNAMES) НИКОГДА не передаётся spawn-у: на
+ * CI-ноде os.hostname() = ugliest-salmon.ptr.network, это имя входит в
+ * allow-list, и живой запуск synthetic — это Gate B, отдельное ОК
+ * владельца. Успешный путь покрывает account-deletion.synthetic.pg.spec.ts
+ * напрямую через composition root, без CLI.
  */
 
 const fullGateEnv = (): Record<string, string> => ({
@@ -40,7 +42,7 @@ describe('checkSyntheticGates — тройной гейт до любой зап
   const full = {
     argv: [SYNTHETIC_APPLY_FLAG, SYNTHETIC_CONFIRM_FLAG],
     env: fullGateEnv(),
-    hostname: SYNTHETIC_GATE_HOSTNAME,
+    hostname: 'ugliest-salmon',
   };
 
   it('полная тройка гейтов — единственная пропускающая комбинация', () => {
@@ -72,10 +74,42 @@ describe('checkSyntheticGates — тройной гейт до любой зап
       .toThrow(SyntheticGateError);
   });
 
+  it('FQDN тест-ноды ugliest-salmon.ptr.network при полной тройке — пропускает', () => {
+    // os.hostname() на тест-ноде отдаёт FQDN, а не короткое имя.
+    expect(() => checkSyntheticGates({ ...full, hostname: 'ugliest-salmon.ptr.network' }))
+      .not.toThrow();
+  });
+
+  // Двойники разрешённых имён — страховка от префиксной, регистронезависимой
+  // и нормализующей (trim, хвостовая точка) реализации: allow-list
+  // сравнивается строго на равенство.
+  const hostnameDoubles = [
+    'ugliest-salmon.evil.example',
+    'ugliest-salmon-2',
+    'UGLIEST-SALMON',
+    'ugliest-salmon.ptr.network.',
+    'ugliest-salmon ',
+    ' ugliest-salmon',
+    '',
+  ];
+
+  it.each(hostnameDoubles)('двойник hostname %p → SyntheticGateError', (name) => {
+    expect(() => checkSyntheticGates({ ...full, hostname: name }))
+      .toThrow(SyntheticGateError);
+  });
+
+  it('isSyntheticGateHostname — только точные имена allow-list', () => {
+    expect(isSyntheticGateHostname('ugliest-salmon')).toBe(true);
+    expect(isSyntheticGateHostname('ugliest-salmon.ptr.network')).toBe(true);
+    for (const name of hostnameDoubles) {
+      expect(isSyntheticGateHostname(name)).toBe(false);
+    }
+  });
+
   it('константы гейтов и префикс — без дрейфа', () => {
     expect(SYNTHETIC_GATE_ENV).toBe('ACCOUNT_DELETION_SYNTHETIC_ENV');
     expect(SYNTHETIC_GATE_ENV_VALUE).toBe('test.linkeon.io');
-    expect(SYNTHETIC_GATE_HOSTNAME).toBe('ugliest-salmon');
+    expect(SYNTHETIC_GATE_HOSTNAMES).toEqual(['ugliest-salmon', 'ugliest-salmon.ptr.network']);
     expect(SYNTHETIC_DELETION_PREFIX).toBe('synthetic-deletion-');
   });
 });
@@ -180,9 +214,26 @@ describe('scripts/account-deletion-synthetic.ts — spawn только ОТКА�
   const repo = path.resolve(__dirname, '..', '..');
 
   function spawnCli(args: string[], env: Record<string, string>) {
-    // Прецедент — dry-run.spec.ts: ts-node spawn без Nest, минимальный env
-    // (нет DATABASE_URL и нет гейт-env) → гейты обязаны отказать ДО любого
-    // подключения/записи. Полная тройка гейтов сюда не передаётся никогда.
+    // Прецедент — dry-run.spec.ts: ts-node spawn без Nest. Env ребёнка
+    // собирается явно, без process.env, — но этого мало: CLI делает
+    // `import 'dotenv/config'`, а cwd = корень репозитория. В чекауте на
+    // стенде там может лежать .env с DATABASE_URL, и dotenv подмешал бы его
+    // (и любой другой ключ из файла, включая гейт-env, если он там окажется)
+    // в env ребёнка. Поэтому:
+    // - DOTENV_CONFIG_PATH=/nonexistent — dotenv/config читает путь из этой
+    //   переменной вместо ./.env; отсутствующий файл dotenv глотает
+    //   (возвращает error, процесс не падает);
+    // - гейт-env и DATABASE_URL заданы ПУСТЫМИ строками, а не опущены:
+    //   dotenv не перезаписывает ключи, которые уже есть в process.env
+    //   (даже пустые), так что второй рубеж держит и при случайно
+    //   найденном .env. Пустой гейт != test.linkeon.io; пустой DATABASE_URL
+    //   CLI считает отсутствующим и выходит с кодом 2 до подключения, даже
+    //   если гейт пропустил.
+    // Из-за последнего код 2 и пустой stdout одинаковы у отказа гейта и у
+    // отказа по DATABASE_URL — поэтому каждый отказный кейс проверяет в
+    // stderr именно synthetic_gates_not_met.
+    // Кейсы, которым нужен гейт-env (fullGateEnv), переопределяют его через
+    // spread. Полная тройка гейтов сюда не передаётся никогда.
     return spawnSync(process.execPath, [
       require.resolve('ts-node/dist/bin'),
       '-P', path.join(repo, 'tsconfig.json'),
@@ -192,7 +243,14 @@ describe('scripts/account-deletion-synthetic.ts — spawn только ОТКА�
       cwd: repo,
       encoding: 'utf8',
       timeout: 90_000,
-      env: { PATH: process.env.PATH ?? '', TS_NODE_TRANSPILE_ONLY: '1', ...env },
+      env: {
+        PATH: process.env.PATH ?? '',
+        TS_NODE_TRANSPILE_ONLY: '1',
+        [SYNTHETIC_GATE_ENV]: '',
+        DATABASE_URL: '',
+        DOTENV_CONFIG_PATH: '/nonexistent',
+        ...env,
+      },
     });
   }
 
@@ -203,29 +261,35 @@ describe('scripts/account-deletion-synthetic.ts — spawn только ОТКА�
     expect(res.stderr).toContain('synthetic_gates_not_met');
   }, 120_000);
 
-  it('только --apply → exit 2, stdout пуст', () => {
+  it('только --apply → exit 2, stdout пуст, в stderr — synthetic_gates_not_met', () => {
     const res = spawnCli([SYNTHETIC_APPLY_FLAG], {});
     expect(res.status).toBe(2);
     expect(res.stdout).toBe('');
+    expect(res.stderr).toContain('synthetic_gates_not_met');
   }, 120_000);
 
-  it('--apply + confirm без env-гейта → exit 2, stdout пуст', () => {
+  it('--apply + confirm без env-гейта → exit 2, stdout пуст, в stderr — synthetic_gates_not_met', () => {
     const res = spawnCli([SYNTHETIC_APPLY_FLAG, SYNTHETIC_CONFIRM_FLAG], {});
     expect(res.status).toBe(2);
     expect(res.stdout).toBe('');
+    expect(res.stderr).toContain('synthetic_gates_not_met');
   }, 120_000);
 
-  it('флаги + env на чужом hostname → exit 2, stdout пуст', () => {
-    // На CI-ноде hostname и есть ugliest-salmon — кейс автоматически
-    // пропускается: гейт hostname там закрыл бы ветку, а пройти дальше
-    // (подключение к БД) тесту запрещено.
-    if (hostname() === SYNTHETIC_GATE_HOSTNAME) return;
+  it('флаги + env на чужом hostname → exit 2, stdout пуст, в stderr — synthetic_gates_not_met', () => {
+    // На CI-ноде os.hostname() = ugliest-salmon.ptr.network — имя входит в
+    // allow-list, поэтому там кейс пропускается: гейт hostname ветку не
+    // закрыл бы, CLI отказал бы уже по пустому DATABASE_URL, и проверка
+    // stderr ниже упала бы. До базы CLI не дошёл бы и без пропуска (пустой
+    // DATABASE_URL — код 2 до подключения): пропуск и пустой DATABASE_URL —
+    // двойная страховка.
+    if (isSyntheticGateHostname(hostname())) return;
     const res = spawnCli(
       [SYNTHETIC_APPLY_FLAG, SYNTHETIC_CONFIRM_FLAG],
       fullGateEnv(),
     );
     expect(res.status).toBe(2);
     expect(res.stdout).toBe('');
+    expect(res.stderr).toContain('synthetic_gates_not_met');
   }, 120_000);
 });
 

@@ -610,15 +610,49 @@ maybe('merge loser — поколение удаления и отложенны
     ]);
 
     // Tombstone loser зачищен gen-gated; survivor не тронут pipeline.
+    // welcome_bonus_at loser сохранён (T20-M1): бонус один раз на аккаунт.
     expect(loser.password_hash).toBeNull();
     expect(loser.primary_email).toBeNull();
-    expect(loser.welcome_bonus_at).toBeNull();
+    expect(loser.welcome_bonus_at).not.toBeNull();
+    expect(new Date(loser.welcome_bonus_at).toISOString()).toBe('2026-02-01T00:00:00.000Z');
     const survivor = await userRow(SURVIVOR);
     expect(survivor.state).toBe('active');
     expect(survivor.deletion_id).toBeNull();
     expect(survivor.deleted_at).toBeNull();
     expect(survivor.password_hash).toBe('SURVIVOR-HASH');
     expect(survivor.primary_email).toBe('survivor@example.test');
+  });
+
+  it('лог переноса баланса — uuid строк user_id, без internal_id (номера) обеих сторон', async () => {
+    // У телефонного входа internal_id — это сам номер, ему в логе не место
+    // (T20-M1). В лог — user_id.id обеих сторон, как в логах бонуса.
+    const SURVIVOR_PHONE = '79990000201';
+    const LOSER_PHONE = '79990000202';
+    await seedUser(SURVIVOR_PHONE, { createDate: '2026-01-01 00:00:00', tokens: 100 });
+    await seedUser(LOSER_PHONE, { createDate: '2026-02-01 00:00:00', tokens: 500 });
+    const [survivorRow] = await rows(`SELECT id FROM user_id WHERE internal_id=$1`, [SURVIVOR_PHONE]);
+    const [loserRow] = await rows(`SELECT id FROM user_id WHERE internal_id=$1`, [LOSER_PHONE]);
+    const { svc } = makeStack();
+    const log = jest.spyOn((svc as any).logger, 'log').mockImplementation(() => undefined);
+
+    let messages: string[];
+    try {
+      expect(await svc.mergeAccounts(LOSER_PHONE, SURVIVOR_PHONE))
+        .toEqual({ survivorUserId: SURVIVOR_PHONE, loserUserId: LOSER_PHONE });
+      messages = log.mock.calls.map(([m]) => String(m));
+    } finally {
+      log.mockRestore();
+    }
+
+    const merge = messages.filter((m) => m.startsWith('merge:'));
+    expect(merge).toEqual([
+      `merge: 500 токенов user_id.id=${loserRow.id} → user_id.id=${survivorRow.id}`,
+    ]);
+    expect(merge[0]).not.toContain(SURVIVOR_PHONE);
+    expect(merge[0]).not.toContain(LOSER_PHONE);
+    // Перенос состоялся — лог описывает реальное движение баланса.
+    expect(await balance(SURVIVOR_PHONE)).toBe(600);
+    expect(await balance(LOSER_PHONE)).toBe(0);
   });
 
   it('провал стопа — идентичности не перенесены, история цела, ошибка всплывает как есть', async () => {

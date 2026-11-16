@@ -47,9 +47,19 @@ class FakeDb {
    * Хранилище задач в объёме, нужном этому спеку: status по generation.
    */
   jobs: Array<{ deletion_id: string; user_id: string; resource_type: string; status: string }> = [];
+  /**
+   * Зачисления через add_user_tokens (T20-M1): журнал token_transactions в
+   * объёме, нужном этому спеку, — кому, сколько и с какой подписью.
+   */
+  credits: Array<{ user_id: string; amount: number; description: string }> = [];
 
   async query(sql: string, params: any[] = []) {
     const s = sql.replace(/\s+/g, ' ').trim();
+
+    if (s.startsWith('SELECT add_user_tokens')) {
+      this.credits.push({ user_id: params[0], amount: Number(params[1]), description: params[2] });
+      return { rows: [{ add_user_tokens: { success: true } }] };
+    }
 
     if (s.startsWith('SELECT profile_data FROM ai_profiles_consolidated')) {
       const p = this.profiles.get(params[0]);
@@ -201,15 +211,16 @@ class FakeDb {
       const u = this.users.get(params[0]);
       return { rows: u ? [{ password_hash: u.password_hash }] : [] };
     }
-    // Tombstone (deleteOwnedCoreRows): гасит пароль/почту/бонус, НЕ трогая
+    // Tombstone (deleteOwnedCoreRows): гасит пароль/почту, НЕ трогая
     // state/deletion_id — поколение принадлежит begin()/reactivation.
+    // Отметку бонуса модель гасит только если её гасит сам SQL: T20-M1
+    // проверяет как раз, что адаптер её больше не сбрасывает.
     // Должен стоять ДО общего 'UPDATE user_id SET password_hash' (identity).
     if (s.startsWith('UPDATE user_id SET password_hash = NULL')) {
       const u = this.users.get(params[0]);
       if (u && u.state === 'deleted' && u.deletion_id === params[1]) {
-        Object.assign(u, {
-          password_hash: null, primary_email: null, welcome_bonus_at: null,
-        });
+        Object.assign(u, { password_hash: null, primary_email: null });
+        if (/welcome_bonus_at\s*=\s*NULL/i.test(s)) u.welcome_bonus_at = null;
       }
       return { rows: [] };
     }
@@ -373,21 +384,27 @@ function ok<T extends { status: string }>(r: T): Extract<T, { status: 'ok' }> {
     expect(second.userId).not.toBe(first.userId);
   });
 
-  it('телефон: строка та же, но аккаунт снова активен и со стартовым бонусом', async () => {
+  it('телефон: строка та же, аккаунт снова активен, но стартовый бонус второй раз не выдаётся', async () => {
     // У телефонного входа internal_id — сам номер, и перерегистрация
     // неизбежно попадает в ту же строку. Она обязана стать активной, иначе
     // человек войдёт в аккаунт с состоянием deleted.
+    const welcome = () => db.credits.filter((c) => c.description === 'Приветственный бонус');
     const first = ok(await identity.resolveOrCreate('phone', { phone: '79990000001' }));
+    expect(welcome()).toEqual([
+      { user_id: first.userId, amount: 25_000, description: 'Приветственный бонус' },
+    ]);
     await deleteAccount(first.userId);
     expect(db.users.get(first.userId).state).toBe('deleted');
+    // T20-M1: отметка бонуса переживает удаление — бонус один раз на аккаунт
+    // за всё время, иначе удаление + повторная регистрация = ферма бонусов.
+    expect(db.users.get(first.userId).welcome_bonus_at).toBe('now');
 
     const second = ok(await identity.resolveOrCreate('phone', { phone: '79990000001' }));
 
     expect(second.userId).toBe(first.userId);
     expect(db.users.get(first.userId).state).toBe('active');
-    // Бонус выдаётся заново: баланс удаление обнулило, и аккаунт должен
-    // выглядеть новым, а не пустым.
     expect(db.users.get(first.userId).welcome_bonus_at).toBe('now');
+    expect(welcome()).toHaveLength(1);
   });
 
   it('реактивация телефона отменяет незавершённые задачи старого поколения', async () => {
