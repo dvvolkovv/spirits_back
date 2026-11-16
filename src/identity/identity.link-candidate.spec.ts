@@ -252,11 +252,13 @@ describe('mergeAccounts — баланс и история не должны с�
     expect(assertIdx).toBeGreaterThan(stopIdx);
     expect(moveIdx).toBeGreaterThan(assertIdx);
 
-    // Tombstone слитого аккаунта зачищается под защитой поколения: хэш пароля,
-    // профильная почта и маркер приветственного бонуса — с тем же deletion_id.
+    // Tombstone слитого аккаунта зачищается под защитой поколения: хэш пароля
+    // и профильная почта — с тем же deletion_id. Маркер приветственного бонуса
+    // сохраняется (T20-M1): бонус один раз на аккаунт за всё время.
     const tombstone = calls.find((c) => /password_hash\s*=\s*NULL/i.test(c.sql));
     expect(tombstone).toBeDefined();
     expect(tombstone!.sql).toMatch(/state\s*=\s*'deleted'/i);
+    expect(tombstone!.sql).not.toMatch(/welcome_bonus_at/i);
     expect(tombstone!.params).toEqual(
       expect.arrayContaining(['orphan-1', 'd-merge-1']),
     );

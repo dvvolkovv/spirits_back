@@ -852,7 +852,10 @@ maybe('synthetic deletion lifecycle — полная цепочка против
     expect(revived.deletionId).toBeNull();
     expect(revived.deletedAt).toBeNull();
     expect(revived.profileRows).toBe(1);
-    expect(revived.balance).toBe(WELCOME_BONUS);
+    // T20-M1: отметка бонуса пережила удаление — повторная регистрация тем же
+    // номером второй приветственный бонус не получает, баланс нового аккаунта 0.
+    expect(revived.hasBonus).toBe(true);
+    expect(revived.balance).toBe(0);
     expect(await unfinishedJobs(first.deletionId)).toHaveLength(0);
     // Незавершённые задачи первого поколения отменены реактивацией.
     const cancelled = await one(

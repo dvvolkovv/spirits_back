@@ -62,6 +62,7 @@ describe('IdentityService.resolveOrCreate', () => {
       { rows: [], rowCount: 1 },                                // INSERT ai_profiles_consolidated (ensureProfileRow)
       { rows: [], rowCount: 1 },                                // INSERT user_identities (ensureProfileAndIdentity)
       { rows: [{ internal_id: '79030169187' }], rowCount: 1 }, // UPDATE welcome_bonus_at … RETURNING (issueWelcomeBonus) — claim взят
+      { rows: [], rowCount: 0 },                                // сверка с журналом token_transactions (issueWelcomeBonus) — приветственного бонуса там нет
       { rows: [{ add_user_tokens: {} }], rowCount: 1 },         // SELECT add_user_tokens (issueWelcomeBonus) — результат не читается
     ]);
     const svc = new IdentityService(pg);
@@ -75,6 +76,14 @@ describe('IdentityService.resolveOrCreate', () => {
     expect(pg.tx.release).toHaveBeenCalledTimes(1);
     // Через пул — только lookup шага 1; всё, что пишет шаг 3, — на выделенном соединении.
     expect(pg.query).toHaveBeenCalledTimes(1);
+    // T20-M1: сверка с журналом — по подписи приветственного бонуса (тип
+    // 'bonus' общий с реферальным), в той же транзакции и до зачисления.
+    const journalAt = txSql.findIndex((sql) => /token_transactions/.test(sql));
+    const creditAt = txSql.findIndex((sql) => /add_user_tokens/.test(sql));
+    expect(journalAt).toBeGreaterThan(0);
+    expect(creditAt).toBeGreaterThan(journalAt);
+    expect(pg.tx.query.mock.calls[journalAt][1])
+      .toEqual(expect.arrayContaining(['79030169187', 'Приветственный бонус']));
     expect(pg.left).toBe(0);
   });
 

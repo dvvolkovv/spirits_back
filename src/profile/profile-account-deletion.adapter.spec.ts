@@ -239,7 +239,7 @@ describe('ProfileAccountDeletionAdapter.execute — порядок и fencing (T
 });
 
 describe('deleteOwnedCoreRows — форма SQL (Task 17)', () => {
-  it('tombstone не трогает state/deleted_at/deletion_id — только password/email/welcome bonus/update_date', async () => {
+  it('tombstone не трогает state/deleted_at/deletion_id/welcome_bonus_at — только password/email/contacts/update_date', async () => {
     const calls: Array<{ sql: string; params: any[] }> = [];
     const tx = {
       query: jest.fn(async (sql: string, params: any[] = []) => {
@@ -261,7 +261,9 @@ describe('deleteOwnedCoreRows — форма SQL (Task 17)', () => {
     expect(setClause).toContain('primary_email = NULL');
     // T17-M6: contacts — мёртвая колонка, но план :1492 требует очистки.
     expect(setClause).toContain('contacts = NULL');
-    expect(setClause).toContain('welcome_bonus_at = NULL');
+    // T20-M1: отметка приветственного бонуса переживает удаление — бонус один
+    // раз на аккаунт за всё время, телефонный вход реактивирует ту же строку.
+    expect(setClause).not.toContain('welcome_bonus_at');
     expect(setClause).toContain('update_date = now()');
     expect(whereClause).toContain(`internal_id = $1 AND state = 'deleted' AND deletion_id = $2`);
     for (const c of calls) expect(c.params).toEqual([USER, DELETION_ID]);

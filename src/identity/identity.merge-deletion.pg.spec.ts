@@ -610,9 +610,11 @@ maybe('merge loser — поколение удаления и отложенны
     ]);
 
     // Tombstone loser зачищен gen-gated; survivor не тронут pipeline.
+    // welcome_bonus_at loser сохранён (T20-M1): бонус один раз на аккаунт.
     expect(loser.password_hash).toBeNull();
     expect(loser.primary_email).toBeNull();
-    expect(loser.welcome_bonus_at).toBeNull();
+    expect(loser.welcome_bonus_at).not.toBeNull();
+    expect(new Date(loser.welcome_bonus_at).toISOString()).toBe('2026-02-01T00:00:00.000Z');
     const survivor = await userRow(SURVIVOR);
     expect(survivor.state).toBe('active');
     expect(survivor.deletion_id).toBeNull();
