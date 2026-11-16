@@ -136,10 +136,18 @@ export async function deleteOwnedCoreRows(
   // primary_phone НЕ трогаем — решение владельца (GAP A): телефонный
   // internal_id и так остаётся как lifecycle-ключ.
   //
-  // welcome_bonus_at сбрасываем намеренно: у пользователя с телефонным
-  // входом internal_id — это сам номер, и перерегистрация неизбежно
-  // попадёт в ту же строку. Без сброса он получил бы чистый аккаунт с
-  // нулевым балансом и без стартового бонуса.
+  // welcome_bonus_at сохраняем намеренно (T20-M1): приветственный бонус
+  // выдаётся один раз на аккаунт за всё время. У пользователя с телефонным
+  // входом internal_id — это сам номер, перерегистрация реактивирует ту же
+  // строку, и вернувшийся после удаления получает аккаунт без стартового
+  // бонуса (issueWelcomeBonus не пройдёт claim). Прежний сброс отметки
+  // позволял получать бонус заново на каждом цикле «удалил — вошёл».
+  //
+  // welcome_bonus_at — ещё и «дата рождения» аккаунта: от неё считаются
+  // окно рефералки (referral.service.ts — REFERRAL_NEW_ACCOUNT_WINDOW_MS и
+  // проверка в регистрации реферала) и когорты мониторинга
+  // (src/monitoring/product/{summary,economy,churn}.service.ts). Вернувшийся
+  // пользователь там считается старым — это осознанное следствие.
   //
   // Известный остаток: выданный РАНЬШЕ access-токен продолжает пускать до
   // своего истечения — по умолчанию два часа (JWT_ACCESS_EXPIRES). Связок
@@ -154,7 +162,7 @@ export async function deleteOwnedCoreRows(
   await tx.query(
     `UPDATE user_id
       SET password_hash = NULL, primary_email = NULL, contacts = NULL,
-          welcome_bonus_at = NULL, update_date = now()
+          update_date = now()
       WHERE internal_id = $1 AND state = 'deleted' AND deletion_id = $2`,
     params,
   );

@@ -32,6 +32,13 @@ export const IDENTITY_MIGRATIONS = [
 /** Приветственный бонус нового аккаунта. Его же называет справка (platform-kb/values.ts). */
 export const WELCOME_BONUS = 25_000;
 
+/**
+ * Подпись приветственного бонуса в журнале token_transactions. По ней же
+ * issueWelcomeBonus сверяется, выдавался ли бонус раньше: тип 'bonus' общий с
+ * реферальным бонусом, отличить их можно только по подписи.
+ */
+export const WELCOME_BONUS_DESCRIPTION = 'Приветственный бонус';
+
 @Injectable()
 export class IdentityService implements OnModuleInit {
   private readonly logger = new Logger(IdentityService.name);
@@ -414,6 +421,19 @@ export class IdentityService implements OnModuleInit {
    * Приветственный бонус — внутри той же транзакции, что и создание/реактивация
    * аккаунта (db — её соединение, а не пул: claim-маркер welcome_bonus_at и
    * начисление должны стать видны вместе со строкой аккаунта).
+   *
+   * Бонус выдаётся один раз на аккаунт за всё время (T20-M1): удаление отметку
+   * welcome_bonus_at больше не сбрасывает, и вернувшийся тем же номером
+   * получает аккаунт без стартового бонуса. Но у аккаунтов, удалённых до
+   * T20-M1, прежний tombstone отметку уже стёр — поэтому после claim
+   * сверяемся с журналом token_transactions: если приветственный бонус там
+   * уже есть, второй раз его не выдаём, а отметку ставим на дату первой такой
+   * записи, а не на now(). От welcome_bonus_at считают «дату рождения»
+   * аккаунта — окно рефералки (referral.service.ts) и когорты мониторинга, —
+   * и вернувшийся пользователь там должен остаться старым.
+   *
+   * Фильтр — по подписи WELCOME_BONUS_DESCRIPTION: тип 'bonus' общий с
+   * реферальным бонусом, и реферальная запись приветственный не заменяет.
    */
   private async issueWelcomeBonus(db: SlotQueryable, userId: string): Promise<void> {
     const claimed = await db.query(
@@ -423,11 +443,30 @@ export class IdentityService implements OnModuleInit {
       [userId],
     );
     if (claimed.rows.length === 0) return;
+    // $1::text в обоих местах: internal_id — varchar, token_transactions.user_id —
+    // text, без явного типа Postgres не выведет единый тип параметра.
+    const alreadyIssued = await db.query(
+      `UPDATE user_id u
+          SET welcome_bonus_at = j.first_at
+         FROM (SELECT min(created_at) AS first_at
+                 FROM token_transactions
+                WHERE user_id = $1::text
+                  AND transaction_type = 'bonus'
+                  AND description = $2) j
+        WHERE u.internal_id = $1::text
+          AND j.first_at IS NOT NULL
+        RETURNING u.welcome_bonus_at`,
+      [userId, WELCOME_BONUS_DESCRIPTION],
+    );
+    if (alreadyIssued.rows.length > 0) {
+      this.logger.log('welcome bonus already in journal → not reissued');
+      return;
+    }
     // Через процедуру: стартовый бонус — тоже пополнение, и в истории он должен
     // быть видно, иначе у нового юзера баланс возникает из ниоткуда.
     await db.query(
       `SELECT add_user_tokens($1, $2, 'bonus', $3, NULL)`,
-      [userId, WELCOME_BONUS, 'Приветственный бонус'],
+      [userId, WELCOME_BONUS, WELCOME_BONUS_DESCRIPTION],
     );
     this.logger.log(`welcome bonus ${WELCOME_BONUS} → ${userId}`);
   }
@@ -572,13 +611,15 @@ export class IdentityService implements OnModuleInit {
           [loserUserId, account.deletionId],
         );
         // Зачистка следов входа на tombstone — под той же gen-защитой: хэш
-        // пароля, профильная почта и маркер приветственного бонуса не должны
-        // переживать удаление на строке аккаунта.
+        // пароля и профильная почта не должны переживать удаление на строке
+        // аккаунта. Отметку welcome_bonus_at сохраняем намеренно (T20-M1):
+        // приветственный бонус — один раз на аккаунт за всё время, а сама
+        // отметка — ещё и «дата рождения» аккаунта для окна рефералки и
+        // когорт мониторинга.
         await tx.query(
           `UPDATE user_id
               SET password_hash = NULL,
                   primary_email = NULL,
-                  welcome_bonus_at = NULL,
                   update_date = now()
             WHERE internal_id = $1
               AND state = 'deleted'
