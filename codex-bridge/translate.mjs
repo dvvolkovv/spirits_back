@@ -77,6 +77,34 @@ export function messagesToInput(messages) {
   return input;
 }
 
+// Ключевые слова со значениями-данными: внутри них «pattern» — не ключевое слово.
+const SCHEMA_VALUE_KEYWORDS = new Set(['enum', 'const', 'default', 'examples']);
+// Словари «имя → схема»: имена в них — имена параметров, а не ключевые слова.
+const SCHEMA_MAP_KEYWORDS = new Set(['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas']);
+
+// OpenAI проверяет регулярки в схемах функций и отвергает часть синтаксиса
+// («regex lookaround is not supported»), причём одна такая схема роняет весь
+// запрос со всеми инструментами — 16.11.2026 так на релее не прошёл ни один ход
+// (параметр to стороннего MCP-инструмента). pattern — только подсказка модели,
+// вход всё равно проверяет сам инструмент, поэтому строковые pattern снимаем все.
+// Свойство с именем pattern (у Grep) — объект, а не строка, и остаётся.
+export function stripSchemaPatterns(schema) {
+  if (Array.isArray(schema)) return schema.map(stripSchemaPatterns);
+  if (!schema || typeof schema !== 'object') return schema;
+  const out = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === 'pattern' && typeof value === 'string') continue;
+    if (SCHEMA_VALUE_KEYWORDS.has(key)) {
+      out[key] = value;
+    } else if (SCHEMA_MAP_KEYWORDS.has(key) && value && typeof value === 'object' && !Array.isArray(value)) {
+      out[key] = Object.fromEntries(Object.entries(value).map(([name, sub]) => [name, stripSchemaPatterns(sub)]));
+    } else {
+      out[key] = stripSchemaPatterns(value);
+    }
+  }
+  return out;
+}
+
 export function toolsToFunctions(tools) {
   if (!Array.isArray(tools)) return [];
   return tools
@@ -86,7 +114,7 @@ export function toolsToFunctions(tools) {
       name: t.name,
       description: typeof t.description === 'string' ? t.description : '',
       parameters: t.input_schema && typeof t.input_schema === 'object'
-        ? t.input_schema
+        ? stripSchemaPatterns(t.input_schema)
         : { type: 'object', properties: {} },
     }));
 }
