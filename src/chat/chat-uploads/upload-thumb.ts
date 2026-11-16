@@ -12,7 +12,9 @@
  * CHAT_UPLOADS_SAVE_BUDGET_MS в chat.controller), поэтому работа sharp
  * ограничена — не больше UPLOAD_THUMB_CONCURRENCY рендеров на процесс,
  * место ждём не дольше UPLOAD_THUMB_QUEUE_WAIT_MS, сам конвейер — не дольше
- * UPLOAD_THUMB_TIMEOUT_SECONDS. Не уложились — файл сохраняется без миниатюры.
+ * UPLOAD_THUMB_TIMEOUT_SECONDS, а все миниатюры одного вызова saveOriginals
+ * укладываются в UPLOAD_THUMB_CALL_BUDGET_MS. Не уложились — файл
+ * сохраняется без миниатюры.
  */
 
 /**
@@ -30,6 +32,13 @@ export const UPLOAD_THUMB_CONCURRENCY = 2;
 export const UPLOAD_THUMB_QUEUE_WAIT_MS = 2_500;
 /** Потолок работы конвейера sharp над одной миниатюрой (sharp .timeout), с. */
 export const UPLOAD_THUMB_TIMEOUT_SECONDS = 5;
+/**
+ * Общий бюджет миниатюр одного вызова saveOriginals, мс: файлы идут по
+ * очереди внутри бюджета сохранения хода, и пачка картинок под нагрузкой не
+ * должна съесть его целиком. Бюджет кончился — остальные файлы вызова
+ * сохраняются без миниатюр.
+ */
+export const UPLOAD_THUMB_CALL_BUDGET_MS = 8_000;
 
 /** Потолок пикселей исходника — как у renderThumb: «бомба» из мелкого файла бросает, а не съедает память. */
 const MAX_INPUT_PIXELS = 50_000_000;

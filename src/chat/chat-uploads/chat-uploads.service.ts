@@ -6,7 +6,14 @@ import { Readable } from 'stream';
 import { PgService } from '../../common/services/pg.service';
 import { StorageService } from '../../common/services/storage.service';
 import { safeFileName } from '../chat-files/file-meta';
-import { isThumbnailableMime, makeUploadThumb, uploadThumbKey } from './upload-thumb';
+import {
+  UPLOAD_THUMB_CALL_BUDGET_MS,
+  UPLOAD_THUMB_QUEUE_WAIT_MS,
+  UploadThumbSlots,
+  isThumbnailableMime,
+  makeUploadThumb,
+  uploadThumbKey,
+} from './upload-thumb';
 
 export interface ChatUploadInputFile {
   buffer: Buffer;
@@ -58,10 +65,18 @@ const COLUMNS =
 /** Файлы миграций реестра — строго по порядку: 002 дополняет таблицу из 001. */
 const MIGRATIONS = ['001_chat_uploads.sql', '002_chat_uploads_media_notes.sql'] as const;
 
+/** Бюджет миниатюр одного вызова saveOriginals: срок и «дальше без миниатюр». */
+interface ThumbCallBudget {
+  deadline: number;
+  exhausted: boolean;
+}
+
 @Injectable()
 export class ChatUploadsService {
   private readonly logger = new Logger(ChatUploadsService.name);
   private bucketEnsured = false;
+  /** Места под рендер миниатюр; undefined — общие на процесс (upload-thumb.ts). Подменяется в тестах. */
+  private thumbSlots?: UploadThumbSlots;
 
   constructor(
     private readonly pg: PgService,
@@ -103,6 +118,13 @@ export class ChatUploadsService {
     }
     const result: SaveOriginalsResult = { saved: [], failed: [] };
     const source: ChatUploadSource = input.source ?? 'web';
+    // Срок миниатюр считается от начала вызова: медленная загрузка
+    // оригиналов тоже его съедает — миниатюры уступают оригиналам место в
+    // бюджете сохранения хода.
+    const thumbBudget: ThumbCallBudget = {
+      deadline: Date.now() + UPLOAD_THUMB_CALL_BUDGET_MS,
+      exhausted: false,
+    };
 
     for (const file of input.files) {
       const storageKey = `${randomUUID()}/${safeFileName(file.originalname)}`;
@@ -117,7 +139,7 @@ export class ChatUploadsService {
           contentType: mime,
           cacheControl: 'private, no-store',
         });
-        thumbKey = await this.saveThumb(file, mime, storageKey);
+        thumbKey = await this.saveThumb(file, mime, storageKey, thumbBudget);
         const { rows } = await this.pg.query(
           `INSERT INTO chat_uploads
              (user_id, session_id, original_name, mime, size_bytes, sha256, storage_key, source, thumb_key)
@@ -138,7 +160,7 @@ export class ChatUploadsService {
         result.saved.push(this.row(rows[0]));
       } catch (e: any) {
         this.logger.warn(
-          `saveOriginals: failed to persist file "${file.originalname}": ${this.errDetail(e)}`,
+          `saveOriginals: failed to persist file ${this.logName(file.originalname)}: ${this.errDetail(e)}`,
         );
         // Best-effort cleanup: оригинал и (если успела лечь) миниатюра —
         // строки нет, значит и объектов без неё оставлять незачем.
@@ -148,7 +170,7 @@ export class ChatUploadsService {
           } catch (cleanupError: any) {
             // Best-effort cleanup: the original upload failure is reported by name.
             this.logger.warn(
-              `saveOriginals: best-effort cleanup delete failed for "${file.originalname}": ${this.errDetail(cleanupError)}`,
+              `saveOriginals: best-effort cleanup delete failed for ${this.logName(file.originalname)}: ${this.errDetail(cleanupError)}`,
             );
           }
         }
@@ -166,19 +188,37 @@ export class ChatUploadsService {
    * MinIO — null с предупреждением: экранированное имя, mime и причина, без
    * байтов и без сырого текста sharp. Файл сохраняется без миниатюры — фронт
    * покажет значок.
+   *
+   * Бюджет вызова (UPLOAD_THUMB_CALL_BUDGET_MS): место под рендер ждём не
+   * дольше остатка; срок вышел или уже был busy/timeout (процесс перегружен,
+   * следующим файлам места тоже не будет) — остальные файлы вызова без
+   * миниатюр, с причиной budget.
    */
   private async saveThumb(
     file: ChatUploadInputFile,
     mime: string,
     storageKey: string,
+    budget: ThumbCallBudget,
   ): Promise<string | null> {
     if (!isThumbnailableMime(mime)) return null;
-    const thumb = await makeUploadThumb(file.buffer, mime);
-    if (thumb.ok === false) {
+    const skipped = (reason: string): null => {
       this.logger.warn(
-        `saveOriginals: thumbnail skipped for ${this.logName(file.originalname)} (${JSON.stringify(mime.slice(0, 100))}): ${thumb.reason}`,
+        `saveOriginals: thumbnail skipped for ${this.logName(file.originalname)} (${JSON.stringify(mime.slice(0, 100))}): ${reason}`,
       );
       return null;
+    };
+    const remainingMs = budget.deadline - Date.now();
+    if (budget.exhausted || remainingMs <= 0) {
+      budget.exhausted = true;
+      return skipped('budget');
+    }
+    const thumb = await makeUploadThumb(file.buffer, mime, {
+      slots: this.thumbSlots,
+      waitMs: Math.min(UPLOAD_THUMB_QUEUE_WAIT_MS, remainingMs),
+    });
+    if (thumb.ok === false) {
+      if (thumb.reason === 'busy' || thumb.reason === 'timeout') budget.exhausted = true;
+      return skipped(thumb.reason);
     }
     const key = uploadThumbKey(storageKey);
     try {
