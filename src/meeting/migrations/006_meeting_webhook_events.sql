@@ -25,3 +25,6 @@ CREATE INDEX IF NOT EXISTS meeting_webhook_events_stale_idx
   WHERE status = 'processing';
 CREATE INDEX IF NOT EXISTS meeting_webhook_events_call_idx
   ON meeting_webhook_events (call_id);
+CREATE INDEX IF NOT EXISTS meeting_webhook_events_retention_idx
+  ON meeting_webhook_events (updated_at)
+  WHERE status IN ('delivered', 'discarded', 'dead');

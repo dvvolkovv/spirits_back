@@ -166,8 +166,8 @@ maybe('MeetingWebhookInboxStore PostgreSQL', () => {
     await store.enqueue(event({ idempotencyKey: 'deliver' }));
     await store.enqueue(event({ idempotencyKey: 'discard' }));
     const claimed = (await store.claimBatch()).sort((a, b) => Number(a.id) - Number(b.id));
-    await store.markDelivered(claimed[0].id);
-    await store.markDiscarded(claimed[1].id, 'call inactive');
+    expect(await store.markDelivered(claimed[0].id, claimed[0].attempts)).toBe(true);
+    expect(await store.markDiscarded(claimed[1].id, claimed[1].attempts, 'call inactive')).toBe(true);
     const r = await pool.query(
       `SELECT status, delivered_at IS NOT NULL AS has_delivery, last_error
          FROM meeting_webhook_events ORDER BY id`,
@@ -238,10 +238,11 @@ maybe('MeetingWebhookInboxStore PostgreSQL', () => {
     const before = await snapshot();
     const retryAt = new Date(Date.now() + 60_000);
     for (const id of Object.values(ids)) {
-      await store.markDelivered(id);
-      await store.markDiscarded(id, 'late discard');
-      await store.markFailed(id, 1, 'late failure', retryAt);
-      await store.markFailed(id, 10, 'late dead', retryAt);
+      for (const attempts of [0, 1, 10]) {
+        expect(await store.markDelivered(id, attempts)).toBe(false);
+        expect(await store.markDiscarded(id, attempts, 'late discard')).toBe(false);
+        expect(await store.markFailed(id, attempts, 'late failure', retryAt)).toBeNull();
+      }
     }
     expect(await snapshot()).toEqual(before);
   });
@@ -254,14 +255,14 @@ maybe('MeetingWebhookInboxStore PostgreSQL', () => {
 
     await store.enqueue(event());
     const [c1] = await store.claimBatch();
-    await store.markFailed(c1.id, c1.attempts, 'f'.repeat(600), new Date(Date.now() - 1000));
+    expect(await store.markFailed(c1.id, c1.attempts, 'f'.repeat(600), new Date(Date.now() - 1000))).toBe('pending');
     let row = await lastError();
     expect(row.status).toBe('pending');
     expect(row.last_error).toBe('f'.repeat(500));
 
     await makeDue();
     const [c2] = await store.claimBatch();
-    await store.markDelivered(c2.id);
+    expect(await store.markDelivered(c2.id, c2.attempts)).toBe(true);
     row = await lastError();
     expect(row.status).toBe('delivered');
     expect(row.last_error).toBeNull();
@@ -269,9 +270,63 @@ maybe('MeetingWebhookInboxStore PostgreSQL', () => {
     await pool.query('DELETE FROM meeting_webhook_events');
     await store.enqueue(event({ idempotencyKey: 'trunc-discard' }));
     const [c3] = await store.claimBatch();
-    await store.markDiscarded(c3.id, 'd'.repeat(600));
+    expect(await store.markDiscarded(c3.id, c3.attempts, 'd'.repeat(600))).toBe(true);
     row = await lastError();
     expect(row.status).toBe('discarded');
     expect(row.last_error).toBe('d'.repeat(500));
+  });
+
+  it('stale worker A не может завершить claim, перехваченный B', async () => {
+    await store.enqueue(event());
+    const [a] = await store.claimBatch();
+    expect(a.attempts).toBe(1);
+    await pool.query(`UPDATE meeting_webhook_events SET updated_at = now() - interval '61 seconds'`);
+    const [b] = await store.claimBatch();
+    expect(b.id).toBe(a.id);
+    expect(b.attempts).toBe(2);
+    expect(b.recovered).toBe(true);
+
+    const snap = async () =>
+      (await pool.query(
+        `SELECT status, attempts, last_error, next_retry_at, delivered_at, updated_at FROM meeting_webhook_events`,
+      )).rows;
+    const before = await snap();
+    const retryAt = new Date(Date.now() + 60_000);
+    expect(await store.markDelivered(a.id, a.attempts)).toBe(false);
+    expect(await store.markDiscarded(a.id, a.attempts, 'stale discard')).toBe(false);
+    expect(await store.markFailed(a.id, a.attempts, 'stale failure', retryAt)).toBeNull();
+    expect(await snap()).toEqual(before);
+    expect(before[0].status).toBe('processing');
+
+    expect(await store.markDelivered(b.id, b.attempts)).toBe(true);
+    const r = await pool.query(`SELECT status, attempts FROM meeting_webhook_events`);
+    expect(r.rows[0]).toEqual({ status: 'delivered', attempts: 2 });
+  });
+
+  it('stale processing на десятой попытке становится dead, а не 11-м claim', async () => {
+    await store.enqueue(event());
+    await pool.query(
+      `UPDATE meeting_webhook_events
+          SET status = 'processing', attempts = 10, updated_at = now() - interval '61 seconds'`,
+    );
+    expect(await store.claimBatch()).toHaveLength(0);
+    const r = await pool.query(`SELECT status, attempts, last_error FROM meeting_webhook_events`);
+    expect(r.rows[0]).toEqual({
+      status: 'dead',
+      attempts: 10,
+      last_error: 'lease expired after final attempt',
+    });
+    expect(await store.claimBatch()).toHaveLength(0);
+  });
+
+  it('есть partial индекс retention по завершённым статусам', async () => {
+    const r = await pool.query(
+      `SELECT indexdef FROM pg_indexes
+       WHERE schemaname = $1 AND indexname = 'meeting_webhook_events_retention_idx'`,
+      [SCHEMA],
+    );
+    expect(r.rows).toHaveLength(1);
+    expect(r.rows[0].indexdef).toMatch(/updated_at/);
+    expect(r.rows[0].indexdef).toMatch(/delivered.*discarded.*dead/s);
   });
 });
