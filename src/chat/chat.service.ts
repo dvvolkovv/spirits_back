@@ -3112,9 +3112,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
         turnFailed = true;
         failReason = 'relay_draining';
         failureStub = chatFailureText('relayUpdating', userLanguage, { storeBuild });
-        safeWrite({ type: 'item', content: failureStub });
+        // Перед заглушкой мог уйти хвост карточки своего хода (её завёл первый
+        // прогон self-heal): без пустой строки заглушка прилипла бы к
+        // закрывающему ``` блока. В end — тот же текст, что ляжет в историю
+        // (persistResponse склеивает их так же).
+        const before = this.stripLeakedToolSyntax(chunks.join('').trim());
+        safeWrite({ type: 'item', content: before ? '\n\n' + failureStub : failureStub });
         safeWrite({
-          type: 'end', content: failureStub, reason: 'relay_draining', usage: { input: 0, output: 0, total: 0 },
+          type: 'end',
+          content: [before, failureStub].filter(Boolean).join('\n\n'),
+          reason: 'relay_draining',
+          usage: { input: 0, output: 0, total: 0 },
         });
       } else {
         const errText = chatFailureText('startFailed', userLanguage);
