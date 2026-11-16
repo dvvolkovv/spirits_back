@@ -18,7 +18,8 @@ import { TalerIdRoomClient } from '../meeting/talerid-room.client';
 import { RESPONSE_STYLE_RULE } from './response-style';
 import { ANSWER_FIRST_RULE } from './answer-first-rule';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
-import { INTERRUPTED_TURN_NOTE } from './interrupted-turn';
+import { INTERRUPTED_TURN_NOTE, relayUndeliveredNote, RelayCarry } from './interrupted-turn';
+import { postRelayWithDrainRetry, RELAY_DRAIN_DELAYS_MS, DrainRetryOpts } from './relay-drain-retry';
 import { noTokensMessage, NoTokensOpts } from './no-tokens-message';
 import { legacyGreetingReply } from './legacy-greeting';
 import { CRISIS_RULE } from './crisis-rule';
@@ -471,16 +472,98 @@ export class ChatService {
    * той же пары разные relaySid (freshSessionId входит в ключ), и прерывание
    * одного не задевает другой (находки ревью Б2 Step 6).
    *
-   * Слепая зона: agentReply (рутины, «Путь», план действий, итоги звонков,
-   * проба качества) считает relaySid той же формулой и пишет в ТУ ЖЕ сессию
-   * релея, что и обычный чат, но эту карту не трогает вовсе — своего
-   * beginRelayRun/endRelayRun у него нет. Сообщение человека, пришедшее во
-   * время такого фонового хода, не увидит «тот ход прерван», хотя на релее
-   * произойдёт именно это (общий sessionId). Не находка: фоновые ходы
-   * короче, чем решается человек на следующую реплику, и коллизии с ними
-   * пока не видели.
+   * Фоновые ходы. agentReply (рутины, «Путь», план действий, итоги звонков,
+   * проба качества) пишет в ТУ ЖЕ сессию релея, что и обычный чат. С 05.11
+   * ход основной сессии берёт здесь свою метку и отказывается от занятой
+   * сессии (RelaySessionBusyError) — так он не перебивает человека. Ход,
+   * который ждёт релей за шлагбаумом выката (relay-drain-retry.ts), метку
+   * сохраняет: следующее сообщение по-прежнему перебивает его, но вместо
+   * «тот ход прерван» получает relayUndeliveredNote с текстом и файлами
+   * ждущего — см. relayWaiting ниже. Фоновый ждущий ход (carry = null)
+   * заметки не даёт: его промпт человек не писал.
    */
   private readonly relayRunning = new Map<string, number>();
+
+  /**
+   * Ход, который ждёт релей за шлагбаумом выката (relay-drain-retry.ts), — по
+   * relaySid, с меткой того же хода, что в relayRunning. Ставится только в
+   * onRetry, то есть после первого 502/503: пока идёт первая попытка и пока
+   * читается поток, ход считается идущим, и следующее сообщение получает
+   * «тот ход прерван». carry — текст и имена файлов ждущего хода человека;
+   * у фонового хода (agentReply) — null: его промпт человек не писал.
+   * Снимается в finally postRelayTurn — и при успехе, и при отказе.
+   */
+  private readonly relayWaiting = new Map<string, { mark: number; carry: RelayCarry | null }>();
+  /** Расписание повторов под шлагбаумом; тесты подменяют. */
+  relayDrainDelaysMs: readonly number[] = RELAY_DRAIN_DELAYS_MS;
+  relayDrainSleep: ((ms: number) => Promise<void>) | undefined = undefined;
+
+  markRelayWaiting(relaySid: string, mark: number, carry: RelayCarry | null): void {
+    this.relayWaiting.set(relaySid, { mark, carry });
+  }
+
+  clearRelayWaiting(relaySid: string, mark: number): void {
+    if (this.relayWaiting.get(relaySid)?.mark === mark) this.relayWaiting.delete(relaySid);
+  }
+
+  /**
+   * POST /chat к релею с повтором под шлагбаумом. Ход сдаётся как перебитый
+   * (RelayDrainingError.superseded), как только метку его сессии забрал новый
+   * ход — тот уже несёт его сообщение (relayCarryFor).
+   */
+  async postRelayTurn<T>(
+    relaySid: string,
+    mark: number,
+    carry: RelayCarry | null,
+    makePost: () => Promise<T>,
+  ): Promise<T> {
+    const opts: DrainRetryOpts = {
+      delaysMs: this.relayDrainDelaysMs,
+      sleep: this.relayDrainSleep,
+      shouldStop: () => this.relayRunning.get(relaySid) !== mark,
+      onRetry: (attempt, delayMs) => {
+        this.markRelayWaiting(relaySid, mark, carry);
+        // Без relaySid: в ключе сессии номер телефона (журналы — без номеров).
+        this.logger.warn(`релей обновляется (502/503) — повтор ${attempt} через ${delayMs} мс`);
+      },
+    };
+    try {
+      return await postRelayWithDrainRetry(makePost, opts);
+    } finally {
+      this.clearRelayWaiting(relaySid, mark);
+    }
+  }
+
+  /** carry ждущего хода — только если ждёт именно текущий ход сессии. */
+  private waitingCarry(relaySid: string): RelayCarry | null {
+    const w = this.relayWaiting.get(relaySid);
+    return w && w.mark === this.relayRunning.get(relaySid) ? w.carry : null;
+  }
+
+  /** Своё сообщение хода плюс недошедшее ждущего — то, что новый ход несёт с собой. */
+  relayCarryFor(relaySid: string, own: RelayCarry): RelayCarry {
+    const c = this.waitingCarry(relaySid);
+    if (!c) return own;
+    return {
+      message: [c.message, own.message].filter(Boolean).join('\n\n'),
+      files: [...c.files, ...own.files],
+    };
+  }
+
+  /** Заметка о недошедшем сообщении для загрузки (у неё нет «тот ход прерван»). */
+  relayCarryNote(relaySid: string): string {
+    const c = this.waitingCarry(relaySid);
+    return c ? relayUndeliveredNote(c) : '';
+  }
+
+  /** Заметка текстовому ходу: «тот ход прерван», «не дошло» или ничего. */
+  private relayPendingNote(relaySid: string): string {
+    const running = this.relayRunning.get(relaySid);
+    if (running === undefined) return '';
+    const w = this.relayWaiting.get(relaySid);
+    if (w && w.mark === running) return w.carry ? relayUndeliveredNote(w.carry) : '';
+    return INTERRUPTED_TURN_NOTE;
+  }
 
   /** Ходов в полёте. 0 — можно перезапускать, не порвав ничей ответ. */
   getActiveStreamCount(): number {
