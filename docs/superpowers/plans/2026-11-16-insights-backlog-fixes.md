@@ -1048,7 +1048,8 @@ Expected: FAIL — `relayUndeliveredNote is not a function`, `svc.markRelayWaiti
          shouldStop: () => this.relayRunning.get(relaySid) !== mark,
          onRetry: (attempt, delayMs) => {
            this.markRelayWaiting(relaySid, mark, carry);
-           this.logger.warn(`релей обновляется (502/503) для ${relaySid} — повтор ${attempt} через ${delayMs} мс`);
+           // Без relaySid: в ключе сессии номер телефона (журналы — без номеров).
+           this.logger.warn(`релей обновляется (502/503) — повтор ${attempt} через ${delayMs} мс`);
          },
        };
        try {
@@ -1632,7 +1633,10 @@ Expected: FAIL — U-W1 получает заглушку `fileFailed` без `r
 3. Сборка формы (~433). Строки `const FormData = require('form-data');` и `const axios = require('axios');` оставить, а всё от `const fd = new FormData();` до `for (const [k, v] of Object.entries(relayProviderFields(false, answerRoute.provider))) fd.append(k, v);` включительно (комментарии и порядок не менять) обернуть:
    ```ts
        // Форма multipart — поток: на каждый повтор под шлагбаумом — новая
-       // (relay-drain-retry.ts). Буферы файлов в памяти, повтор их не теряет.
+       // (relay-drain-retry.ts). Буферы файлов в памяти, повтор их не теряет,
+       // но заливает заново: nginx релея по умолчанию принимает тело целиком до
+       // проксирования, так что каждый повтор — снова весь объём файлов, а
+       // буферы держатся в памяти, пока ход ждёт (до ~150 с).
        const buildForm = () => {
          const fd = new FormData();
          // … все прежние fd.append без изменений …
