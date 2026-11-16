@@ -65,6 +65,35 @@ describe('postRelayWithDrainRetry', () => {
     expect(make).toHaveBeenCalledTimes(3);
   });
 
+  // Последний отказ отличает выкат (503 шлагбаума) от аварии: релей в цикле
+  // падений (nginx 502) или лежит сам nginx (ECONNREFUSED).
+  it('бюджет исчерпан после 503 и 502 → lastRefusal = 502', async () => {
+    const make = jest.fn().mockRejectedValueOnce(httpErr(503)).mockRejectedValueOnce(httpErr(502));
+    const err = await postRelayWithDrainRetry(make, { delaysMs: [1], sleep: noSleep }).catch((e) => e);
+    expect(err).toBeInstanceOf(RelayDrainingError);
+    expect(err.superseded).toBe(false);
+    expect(err.lastRefusal).toBe(502);
+  });
+
+  it('бюджет исчерпан на одних ECONNREFUSED → lastRefusal = ECONNREFUSED', async () => {
+    const make = jest.fn().mockRejectedValue(codeErr('ECONNREFUSED'));
+    const err = await postRelayWithDrainRetry(make, { delaysMs: [1], sleep: noSleep }).catch((e) => e);
+    expect(err).toBeInstanceOf(RelayDrainingError);
+    expect(err.superseded).toBe(false);
+    expect(err.lastRefusal).toBe('ECONNREFUSED');
+  });
+
+  it('перебит во время ожидания после 503 → lastRefusal = 503', async () => {
+    let stop = false;
+    const make = jest.fn().mockRejectedValue(httpErr(503));
+    const err = await postRelayWithDrainRetry(make, {
+      delaysMs: [30000], shouldStop: () => stop, sleep: async () => { stop = true; },
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(RelayDrainingError);
+    expect(err.superseded).toBe(true);
+    expect(err.lastRefusal).toBe(503);
+  });
+
   it('shouldStop во время ожидания → superseded не позже чем через секунду', async () => {
     let stop = false;
     let steps = 0;

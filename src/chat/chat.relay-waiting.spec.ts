@@ -158,6 +158,9 @@ describe('перебитый ход без переноса', () => {
     const err = await p;
     expect(err).toBeInstanceOf(RelayDrainingError);
     expect(err.superseded).toBe(false);
+    // Пересозданная ошибка не теряет последний отказ: по нему журнал и
+    // телеметрия отличают выкат от аварии.
+    expect(err.lastRefusal).toBe(503);
     expect(post).toHaveBeenCalledTimes(1);
   });
 

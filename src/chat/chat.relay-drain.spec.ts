@@ -69,6 +69,10 @@ async function settle() {
 const err503 = () => Object.assign(new Error('Request failed with status code 503'), {
   response: { status: 503, data: Readable.from([]) },
 });
+// 502 — nginx релея: процесс не поднялся (рестарт выката или цикл падений).
+const err502 = () => Object.assign(new Error('502'), { response: { status: 502, data: Readable.from([]) } });
+/** Тексты вызовов журнала (warn/error) — первый аргумент. */
+const logged = (spy: jest.SpyInstance) => spy.mock.calls.map((c) => String(c[0]));
 const stream = () => new Readable({ read() {} });
 
 /** Строки NDJSON, ушедшие клиенту. */
@@ -118,7 +122,7 @@ function uploadTurnWith(
   } as any;
   const res = newRes();
   const done = ctrl.uploadAndChat(req, res);
-  return { done, res };
+  return { done, res, ctrl };
 }
 
 const tokenInserts = (calls: { sql: string }[]) => calls.filter((c) => /INSERT INTO token_consumption_tasks/.test(c.sql));
@@ -195,6 +199,51 @@ describe('веб-ход под шлагбаумом выката релея', ()
     expectNoLearning(learn);
   });
 
+  /**
+   * Авария релея (цикл падений → nginx 502, лежит nginx → ECONNREFUSED)
+   * человеку выглядит так же, как выкат: ~149 с ожидания и «ассистент
+   * обновляется». Различие — в журнале и телеметрии по последнему отказу.
+   */
+  it('W2b: выкат (503) — предупреждение в журнале, relay_refusal 503 в телеметрии', async () => {
+    const { svc } = makeServiceWithPgCalls();
+    svc.relayDrainDelaysMs = [0];
+    const track = jest.fn();
+    (svc as any).events = { track };
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => {});
+    const error = jest.spyOn((svc as any).logger, 'error').mockImplementation(() => {});
+    const t = turn(svc, 'hello', [err503(), err503()], 'en');
+    await t.done;
+    await settle();
+
+    expect(track).toHaveBeenCalledWith('chat_quality', expect.objectContaining({
+      props: expect.objectContaining({ failed: true, fail_reason: 'relay_draining', relay_refusal: '503' }),
+    }));
+    expect(logged(warn)).toContain('шлагбаум релея: не дождались (503)');
+    expect(logged(error).filter((m) => m.includes('релей недоступен'))).toEqual([]);
+  });
+
+  it('W2c: релей недоступен (502) — ошибка в журнале без ключа сессии, relay_refusal 502', async () => {
+    const { svc } = makeServiceWithPgCalls();
+    svc.relayDrainDelaysMs = [0];
+    const track = jest.fn();
+    (svc as any).events = { track };
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => {});
+    const error = jest.spyOn((svc as any).logger, 'error').mockImplementation(() => {});
+    const t = turn(svc, 'hello', [err502(), err502()], 'en');
+    await t.done;
+    await settle();
+
+    expect(track).toHaveBeenCalledWith('chat_quality', expect.objectContaining({
+      props: expect.objectContaining({ failed: true, fail_reason: 'relay_draining', relay_refusal: '502' }),
+    }));
+    const down = logged(error).filter((m) => m.includes('релей недоступен'));
+    expect(down).toEqual(['релей недоступен: не дождались (502)']);
+    // В ключе сессии — номер телефона: в журнал не идёт.
+    for (const m of down) expect(m).not.toContain('u1_7');
+    // Аварию не выдаём за выкат.
+    expect(logged(warn).filter((m) => m.startsWith('шлагбаум релея'))).toEqual([]);
+  });
+
   it('W3: новое сообщение, пока ход ждёт, — несёт его текст, ждущий сдаётся молча', async () => {
     const { svc, calls } = makeServiceWithPgCalls();
     let wake: () => void = () => {};
@@ -223,7 +272,7 @@ describe('веб-ход под шлагбаумом выката релея', ()
     expect(items(a.res)).toEqual([]);
     // Своя метка: перебитый под шлагбаумом — не пустой ответ модели.
     expect(track).toHaveBeenCalledWith('chat_quality', expect.objectContaining({
-      props: expect.objectContaining({ failed: true, fail_reason: 'relay_superseded' }),
+      props: expect.objectContaining({ failed: true, fail_reason: 'relay_superseded', relay_refusal: '503' }),
     }));
 
     upB.push(DONE); upB.push(null);
@@ -376,6 +425,30 @@ describe('загрузка файла под шлагбаумом выката �
     // Заглушка — не разговор: профиль, задачи и карточка бизнеса не учатся.
     expectNoLearning(learn);
     expectNothingLeft(svc);
+  });
+
+  it('U-W1b: выкат (503) — предупреждение; релей лежит (ECONNREFUSED) — ошибка без ключа сессии', async () => {
+    const refused = () => Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
+    const run = async (upstreams: Error[]) => {
+      const { svc } = makeServiceWithPgCalls();
+      svc.relayDrainDelaysMs = [0];
+      const u = uploadTurnWith(svc, upstreams);
+      const warn = jest.spyOn((u.ctrl as any).logger, 'warn').mockImplementation(() => {});
+      const error = jest.spyOn((u.ctrl as any).logger, 'error').mockImplementation(() => {});
+      await u.done;
+      await settle();
+      return { warn: logged(warn), error: logged(error) };
+    };
+
+    const drain = await run([err503(), err503()]);
+    expect(drain.warn).toContain('шлагбаум релея: не дождались (503)');
+    expect(drain.error.filter((m) => m.includes('релей недоступен'))).toEqual([]);
+
+    const down = await run([refused(), refused()]);
+    const downLines = down.error.filter((m) => m.includes('релей недоступен'));
+    expect(downLines).toEqual(['релей недоступен: не дождались (ECONNREFUSED)']);
+    for (const m of downLines) expect(m).not.toContain('u1_7');
+    expect(down.warn.filter((m) => m.startsWith('шлагбаум релея'))).toEqual([]);
   });
 
   /**
