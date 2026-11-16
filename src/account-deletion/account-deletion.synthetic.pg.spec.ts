@@ -13,6 +13,7 @@ import {
   createSyntheticStack,
   reseedConsumedResources,
   seedSyntheticFixture,
+  seedSyntheticHost,
   SYNTHETIC_DELETION_PREFIX,
   SYNTHETIC_HIST_PHONE,
   SYNTHETIC_HOST_ID,
@@ -1015,6 +1016,43 @@ maybe('synthetic deletion lifecycle — полная цепочка против
       await pool.query(
         `DELETE FROM products WHERE id = ANY($1::uuid[])`,
         [[foreignProduct, ownProduct]],
+      );
+    }
+  });
+
+  it('посев хоста закрывает для новых уже существующий синтетический хост', async () => {
+    // Строка хоста могла остаться от прерванного прогона и быть открытой для
+    // новых (accepts_new = true — например, после ручной правки). Посев
+    // обязан закрыть её, а не молча оставить как есть: иначе живой API
+    // стенда выберет фиктивную машину для чужого нового продукта.
+    //
+    // Независимость от порядка: строка заводится здесь же upsert'ом (была ли
+    // она после beforeAll или её уже убрал тест уборки ниже — всё равно), а
+    // finally возвращает её в то состояние, в каком её оставляет посев
+    // beforeAll (хост есть, accepts_new = false). Поэтому тест уборки после
+    // этого видит прежнее предусловие, и падение здесь не роняет его.
+    try {
+      await pool.query(
+        `INSERT INTO product_hosts (id, ssh_target, public_ip, domain_suffix, agent_token_hash, capacity, audience, accepts_new)
+         VALUES ($1,'root@10.50.0.1','10.50.0.1','c.linkeon.io',$2,20,'clients',true)
+         ON CONFLICT (id) DO UPDATE SET accepts_new = true`,
+        [SYNTHETIC_HOST_ID, createHash('sha256').update(randomUUID()).digest('hex')],
+      );
+      expect(await one(
+        `SELECT accepts_new FROM product_hosts WHERE id=$1`,
+        [SYNTHETIC_HOST_ID],
+      )).toEqual({ accepts_new: true });
+
+      await seedSyntheticHost(stack.pg);
+
+      expect(await one(
+        `SELECT accepts_new FROM product_hosts WHERE id=$1`,
+        [SYNTHETIC_HOST_ID],
+      )).toEqual({ accepts_new: false });
+    } finally {
+      await pool.query(
+        `UPDATE product_hosts SET accepts_new = false WHERE id=$1`,
+        [SYNTHETIC_HOST_ID],
       );
     }
   });
