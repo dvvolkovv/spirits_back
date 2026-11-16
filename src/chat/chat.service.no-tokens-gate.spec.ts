@@ -48,8 +48,7 @@ function makeRes() {
   return { res, writes };
 }
 
-// Не «привет»/«hello»/«hi» — иначе isGreetingMsg пропускает гейт вовсе
-// (первое приветствие не спрашивает баланс), и сценарий «ноль» не наступит.
+// Обычные реплики; приветствия в пустом чате на нуле — отдельный блок ниже.
 const RU_MESSAGE = 'что у меня с балансом';
 const EN_MESSAGE = 'tell me about my balance please';
 

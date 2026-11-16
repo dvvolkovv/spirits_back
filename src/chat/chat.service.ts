@@ -1343,7 +1343,11 @@ export class ChatService {
       return;
     }
 
-    // Check token balance (skip for first greeting)
+    // Приветствие в пустом чате: только чтобы блок баланса не пугал
+    // предупреждениями с первой реплики. Шлагбаум нуля оно больше не обходит
+    // (тикет 8cf1c5ae): прежде такой ход шёл в модель и на нуле, списание
+    // упиралось в ноль, а «Чистый лист» давал пустой чат сколько угодно раз —
+    // бесплатные ходы. Автоприветствие старых вкладок отвечено выше, без модели.
     const isGreetingMsg = recentHistory.length === 0 && /привет|расскажи про себя|hello|hi$/i.test(message.trim());
     // Баланс нужен и шлагбауму, и блоку промпта — читаем один раз.
     let balance = 0;
@@ -1351,24 +1355,22 @@ export class ChatService {
       const balRes = await this.pg.query('SELECT tokens FROM ai_profiles_consolidated WHERE user_id = $1', [userId]);
       balance = Number(balRes.rows[0]?.tokens || 0);
     }
-    if (!isGreetingMsg) {
-      if (balance <= 0) {
-        res.status(200);
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        res.setHeader('Transfer-Encoding', 'chunked');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('X-Accel-Buffering', 'no');
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        const noTokensMsg = await this.noTokensReply(userId, requestLang, { storeBuild });
-        res.write(JSON.stringify({ type: 'begin' }) + '\n');
-        res.write(JSON.stringify({ type: 'item', content: noTokensMsg }) + '\n');
-        // reason: 'no_tokens' — старые клиенты лишнее поле в событии молча
-        // игнорируют; новым и e2e/мониторингу есть за что зацепиться без
-        // разбора текста (находка ревью качества 02.11, S1).
-        res.write(JSON.stringify({ type: 'end', content: noTokensMsg, reason: 'no_tokens', usage: { input: 0, output: 0, total: 0 } }) + '\n');
-        res.end();
-        return;
-      }
+    if (balance <= 0) {
+      res.status(200);
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader('Transfer-Encoding', 'chunked');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      const noTokensMsg = await this.noTokensReply(userId, requestLang, { storeBuild });
+      res.write(JSON.stringify({ type: 'begin' }) + '\n');
+      res.write(JSON.stringify({ type: 'item', content: noTokensMsg }) + '\n');
+      // reason: 'no_tokens' — старые клиенты лишнее поле в событии молча
+      // игнорируют; новым и e2e/мониторингу есть за что зацепиться без
+      // разбора текста (находка ревью качества 02.11, S1).
+      res.write(JSON.stringify({ type: 'end', content: noTokensMsg, reason: 'no_tokens', usage: { input: 0, output: 0, total: 0 } }) + '\n');
+      res.end();
+      return;
     }
 
     // Блок про баланс собирается ОДИН раз за ход и передаётся готовой строкой
