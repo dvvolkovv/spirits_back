@@ -1,4 +1,7 @@
+import * as http from 'http';
+import { AddressInfo } from 'net';
 import { Readable } from 'stream';
+import axios from 'axios';
 import { postRelayWithDrainRetry, RelayDrainingError, isRelayDrainingError, RELAY_DRAIN_DELAYS_MS } from './relay-drain-retry';
 
 const httpErr = (status: number) => {
@@ -72,18 +75,90 @@ describe('postRelayWithDrainRetry', () => {
     }).catch((e) => e);
     expect(err).toBeInstanceOf(RelayDrainingError);
     expect(err.superseded).toBe(true);
+    expect(err.attempts).toBe(1);
     expect(steps).toBe(2);
     expect(make).toHaveBeenCalledTimes(1);
   });
 
+  it('ход перебит во время неудачной попытки → superseded сразу, без onRetry и ожидания', async () => {
+    let stop = false;
+    const make = jest.fn(async () => { stop = true; throw httpErr(503); });
+    const onRetry = jest.fn();
+    const sleep = jest.fn(async () => {});
+    const err = await postRelayWithDrainRetry(make, {
+      delaysMs: [5, 5], shouldStop: () => stop, onRetry, sleep,
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(RelayDrainingError);
+    expect(err.superseded).toBe(true);
+    expect(err.attempts).toBe(1);
+    expect(onRetry).not.toHaveBeenCalled();
+    expect(sleep).not.toHaveBeenCalled();
+    expect(make).toHaveBeenCalledTimes(1);
+  });
+
+  it('ход перебит во время последней попытки → superseded, а не «бюджет исчерпан»', async () => {
+    let stop = false;
+    const make = jest.fn(async () => { stop = true; throw httpErr(503); });
+    const err = await postRelayWithDrainRetry(make, { delaysMs: [], shouldStop: () => stop, sleep: noSleep }).catch((e) => e);
+    expect(err).toBeInstanceOf(RelayDrainingError);
+    expect(err.superseded).toBe(true);
+    expect(make).toHaveBeenCalledTimes(1);
+  });
+
+  it('тело отказа закрывается и на последней попытке', async () => {
+    const destroy = jest.fn();
+    const e = Object.assign(new Error('503'), { response: { status: 503, data: { destroy } } });
+    const make = jest.fn().mockRejectedValue(e);
+    const err = await postRelayWithDrainRetry(make, { delaysMs: [], sleep: noSleep }).catch((x) => x);
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(err).toBeInstanceOf(RelayDrainingError);
+    expect(err.superseded).toBe(false);
+  });
+
   it('первая попытка не спрашивает shouldStop', async () => {
     const make = jest.fn().mockResolvedValue('ok');
-    await expect(postRelayWithDrainRetry(make, { shouldStop: () => true })).resolves.toBe('ok');
+    const shouldStop = jest.fn(() => true);
+    await expect(postRelayWithDrainRetry(make, { shouldStop })).resolves.toBe('ok');
+    expect(shouldStop).not.toHaveBeenCalled();
   });
 
   it('боевое расписание укладывается в ~2.5 минуты', () => {
     const total = RELAY_DRAIN_DELAYS_MS.reduce((a, b) => a + b, 0);
     expect(total).toBeGreaterThanOrEqual(120_000);
     expect(total).toBeLessThanOrEqual(180_000);
+  });
+});
+
+// Настоящий axios и настоящий HTTP: проверяем, что отказ с responseType: 'stream'
+// распознаётся по response.status и повтор действительно уходит вторым запросом.
+// axios здесь не замокан: automock выключен, в корневом __mocks__ его нет.
+describe('postRelayWithDrainRetry поверх настоящего axios', () => {
+  let server: http.Server;
+  let url = '';
+  let hits = 0;
+
+  beforeAll(async () => {
+    server = http.createServer((req, res) => {
+      hits++;
+      req.resume();
+      res.writeHead(503, { 'content-type': 'text/plain' });
+      res.end('draining');
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/chat`;
+  });
+
+  afterAll(async () => {
+    (server as any).closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('503 с телом: повтор вторым запросом, затем RelayDrainingError(superseded=false)', async () => {
+    const make = () => axios.post(url, 'x', { responseType: 'stream' });
+    const err = await postRelayWithDrainRetry(make, { delaysMs: [0] }).catch((e) => e);
+    expect(err).toBeInstanceOf(RelayDrainingError);
+    expect(err.superseded).toBe(false);
+    expect(err.attempts).toBe(2);
+    expect(hits).toBe(2);
   });
 });
