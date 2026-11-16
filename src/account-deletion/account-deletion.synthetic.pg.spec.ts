@@ -558,6 +558,7 @@ maybe('synthetic deletion lifecycle — полная цепочка против
     await migration('meeting/migrations/003_drop_room_name_unique.sql');
     await migration('meeting/migrations/004_meet_bot.sql');
     await migration('meeting/migrations/005_zoom_url.sql');
+    await migration('meeting/migrations/006_meeting_webhook_events.sql');
     await migration('voice-call/migrations/002_job_tokens.sql');
     await migration('voice-call/migrations/003_call_tokens.sql');
     await migration('voice-call/migrations/003_voice_call_origin.sql');
@@ -790,6 +791,15 @@ maybe('synthetic deletion lifecycle — полная цепочка против
     stack.registry.assertReady();
 
     fixture = await seedSyntheticFixture(stack);
+
+    await pool.query(
+      `INSERT INTO meeting_webhook_events (call_id, idempotency_key, trigger, message)
+       SELECT id,
+              'synthetic-inbox-' || user_id,
+              'bot.state_change',
+              '{"v":1,"type":"meet_bot_state","state":"joined","fatal":false}'::jsonb
+         FROM voice_calls`,
+    );
   });
 
   afterAll(async () => {
