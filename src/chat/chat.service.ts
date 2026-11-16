@@ -3862,7 +3862,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
     /** Язык и сборка — для текста сбоя CLI на языке человека. */
     userLanguage?: string;
     storeBuild?: boolean;
+    /**
+     * Только строка человека: ход ждал релей за шлагбаумом выката, и его
+     * перебило новое сообщение — оно несёт текст этого хода к модели, а
+     * ответа у самого хода нет. Ни строки ассистента, ни списания.
+     */
+    userOnly?: boolean;
   }): Promise<number> {
+    if (p.userOnly) {
+      await this.saveUserMessageRow(p.userId, p.assistantId, p.userMsg, p.sessionIdOverride);
+      return 0;
+    }
     let text = p.assistantMsg;
     let turnFailed = p.turnFailed === true;
     let failReason = p.failReason || '';

@@ -443,7 +443,8 @@ export class ChatController {
     // (relay-drain-retry.ts). Буферы файлов в памяти, повтор их не теряет,
     // но заливает заново: nginx релея по умолчанию принимает тело целиком до
     // проксирования, так что каждый повтор — снова весь объём файлов, а
-    // буферы держатся в памяти, пока ход ждёт (до ~150 с).
+    // буферы держатся в памяти, пока ход ждёт: до ~150 с пауз плюс время
+    // каждой заливки (партия до 100 МБ).
     const buildForm = () => {
       const fd = new FormData();
       // Поле `files` повторяется по разу на файл — так multipart и передаёт
@@ -557,7 +558,7 @@ export class ChatController {
       if (!res.writableEnded) safeWrite({ type: 'ping' });
     });
     try {
-      const agentRes: any = await this.chatService.postRelayTurn(handoff.sessionId, relayMark, relayCarry, () => {
+      const agentRes = await this.chatService.postRelayTurn(handoff.sessionId, relayMark, relayCarry, () => {
         const fd = buildForm();
         return axios.default.post(`${AGENT_URL}/chat`, fd, {
           headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
@@ -618,6 +619,9 @@ export class ChatController {
       });
     } catch (err: any) {
       if (err instanceof RelayDrainingError) {
+        // Шлагбаум выката — штатный исход, не сбой. Без relaySid (в ключе
+        // сессии номер телефона) и без текста человека.
+        this.logger.warn(err.superseded ? 'шлагбаум релея: перебит' : 'шлагбаум релея: не дождались');
         drainOutcome = err.superseded ? 'superseded' : 'exhausted';
         turnFailed = true;
         // Своя метка перебитого, не 'preempted' — как у веб-хода
@@ -717,7 +721,13 @@ export class ChatController {
       // сохранение» — ссылка на файл в истории должна остаться. Поведение
       // прежних путей не меняется: без сохранённых исходников персист, как
       // раньше, только при непустом ответе.
-      if (fullText.length > 0 || savedUploads.length > 0) {
+      //
+      // Перебитый под шлагбаумом ход — только строка человека (userOnly): его
+      // текст ушёл к модели с новым ходом, но написал его человек, и из
+      // истории он пропасть не должен (у веб-хода строка человека тоже
+      // остаётся). Пустой строки ассистента и списания нет.
+      const supersededByDrain = drainOutcome === 'superseded';
+      if (fullText.length > 0 || savedUploads.length > 0 || supersededByDrain) {
         persistDispatched = true;
         setImmediate(async () => {
           try {
@@ -735,6 +745,7 @@ export class ChatController {
               sessionIdOverride: freshSessionId,
               userLanguage: handoff.userLanguage,
               storeBuild,
+              userOnly: supersededByDrain,
             });
             // Обогащаем профиль (Neo4j) на основе явных самораскрытий/согласий пользователя.
             // Файловые загрузки раньше не вызывали consolidate — теперь учитываются.
