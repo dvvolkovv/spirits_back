@@ -21,6 +21,16 @@
  */
 export const RELAY_DRAIN_DELAYS_MS: readonly number[] = [2000, 4000, 8000, 15000, 30000, 30000, 30000, 30000];
 
+/**
+ * Короткое расписание (~59 с вместо ~149 с) — для вызовов под собственным
+ * таймаутом (консультация специалиста и голосовые документы/заметки в звонке).
+ * Их withTimeout только гонится с ходом и не отменяет его: при полном
+ * расписании вызывающий уже сдался бы, а ход после выката всё равно сходил бы
+ * в модель — без списания, с выброшенным ответом. ~59 с оставляют в таймауте
+ * вызова место на саму генерацию.
+ */
+export const RELAY_DRAIN_DELAYS_SHORT_MS: readonly number[] = [2000, 4000, 8000, 15000, 30000];
+
 export class RelayDrainingError extends Error {
   constructor(public readonly superseded: boolean, public readonly attempts: number) {
     super(superseded ? 'relay draining: superseded' : 'relay draining: budget exhausted');

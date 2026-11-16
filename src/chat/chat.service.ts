@@ -322,6 +322,15 @@ export interface AgentReplyOpts {
   includeUserContext?: boolean;
   testMode?: boolean;
   billingContext?: string;
+  /**
+   * Своё расписание повторов под шлагбаумом выката релея (relay-drain-retry.ts)
+   * для этого вызова. `[]` — не ждать: на первом 502/503 сразу
+   * RelayDrainingError(superseded = false). По умолчанию — расписание сервиса
+   * (relayDrainDelaysMs). Нужно вызовам под собственным коротким таймаутом:
+   * withTimeout ход не отменяет, и без своего бюджета брошенный ход после
+   * выката всё равно сходил бы в модель.
+   */
+  relayDrainDelaysMs?: readonly number[];
 }
 
 export interface AgentReplyOutcome {
@@ -533,16 +542,20 @@ export class ChatService {
    * обновляется — отправьте ещё раз» без списания. Фоновый ход (carry = null)
    * остаётся перебитым: agentReply превратит это в «сессия занята», и рутина
    * повторится.
+   *
+   * delaysMs — своё расписание вызова (AgentReplyOpts.relayDrainDelaysMs);
+   * без него — расписание сервиса.
    */
   async postRelayTurn<T>(
     relaySid: string,
     mark: number,
     carry: RelayCarry | null,
     makePost: () => Promise<T>,
+    delaysMs?: readonly number[],
   ): Promise<T> {
     const key = `${relaySid}#${mark}`;
     const opts: DrainRetryOpts = {
-      delaysMs: this.relayDrainDelaysMs,
+      delaysMs: delaysMs ?? this.relayDrainDelaysMs,
       sleep: this.relayDrainSleep,
       shouldStop: () => this.relayRunning.get(relaySid) !== mark,
       onRetry: (attempt, delayMs) => {
@@ -3392,8 +3405,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // каждый раз оплачивать весь контекст заново, без кэша.
     const route = await resolveAnswerProvider(false, userId, this.llmProvider);
 
-    // Последний await перед multipart: consent и ключ выбираются уже после
-    // resolveAnswerProvider, чтобы отзыв во время маршрутизации не ушёл на релей.
+    // Consent проверяется один раз перед отправкой: consent и ключ выбираются
+    // уже после resolveAnswerProvider, чтобы отзыв во время маршрутизации не
+    // ушёл на релей. Пока ход ждёт релей за шлагбаумом выката (до ~149 с),
+    // подготовленный префикс уходит повторно как есть — так же, как в ходе
+    // человека.
     // Изолированная проба без контекста не читает profile_data по её контракту.
     const dispatchProfilingAllowed = opts.testMode === true && opts.includeUserContext === false
       ? true
@@ -3464,6 +3480,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // Фоновый ход ждёт релей за шлагбаумом выката, как и ход человека, но без
     // carry: его промпт человек не писал. Если человек написал, пока фоновый
     // ход ждал, — уступаем, как при занятой сессии (routine-push отложит).
+    // Вызов под своим коротким таймаутом ждёт по своему расписанию
+    // (opts.relayDrainDelaysMs).
     let resp: any;
     try {
       resp = await this.postRelayTurn(relaySid, relayMark, null, () => {
@@ -3474,7 +3492,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           timeout: 300000,
           maxRedirects: 0,
         });
-      });
+      }, opts.relayDrainDelaysMs);
     } catch (e) {
       if (e instanceof RelayDrainingError && e.superseded) throw new RelaySessionBusyError(relaySid);
       throw e;
