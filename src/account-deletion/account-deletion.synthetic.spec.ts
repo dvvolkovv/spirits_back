@@ -216,18 +216,22 @@ describe('scripts/account-deletion-synthetic.ts — spawn только ОТКА�
   function spawnCli(args: string[], env: Record<string, string>) {
     // Прецедент — dry-run.spec.ts: ts-node spawn без Nest. Env ребёнка
     // собирается явно, без process.env, — но этого мало: CLI делает
-    // `import 'dotenv/config'`, а cwd = корень репозитория. В клоне стенда
-    // там лежит .env с ACCOUNT_DELETION_SYNTHETIC_ENV=test.linkeon.io и
-    // DATABASE_URL, и кейс «без env-гейта» на ноде прошёл бы гейты и
-    // запустил живой synthetic против настоящей базы. Поэтому:
+    // `import 'dotenv/config'`, а cwd = корень репозитория. В чекауте на
+    // стенде там может лежать .env с DATABASE_URL, и dotenv подмешал бы его
+    // (и любой другой ключ из файла, включая гейт-env, если он там окажется)
+    // в env ребёнка. Поэтому:
     // - DOTENV_CONFIG_PATH=/nonexistent — dotenv/config читает путь из этой
     //   переменной вместо ./.env; отсутствующий файл dotenv глотает
     //   (возвращает error, процесс не падает);
     // - гейт-env и DATABASE_URL заданы ПУСТЫМИ строками, а не опущены:
     //   dotenv не перезаписывает ключи, которые уже есть в process.env
     //   (даже пустые), так что второй рубеж держит и при случайно
-    //   найденном .env. Пустой гейт != test.linkeon.io, пустой DATABASE_URL
-    //   CLI считает отсутствующим.
+    //   найденном .env. Пустой гейт != test.linkeon.io; пустой DATABASE_URL
+    //   CLI считает отсутствующим и выходит с кодом 2 до подключения, даже
+    //   если гейт пропустил.
+    // Из-за последнего код 2 и пустой stdout одинаковы у отказа гейта и у
+    // отказа по DATABASE_URL — поэтому каждый отказный кейс проверяет в
+    // stderr именно synthetic_gates_not_met.
     // Кейсы, которым нужен гейт-env (fullGateEnv), переопределяют его через
     // spread. Полная тройка гейтов сюда не передаётся никогда.
     return spawnSync(process.execPath, [
@@ -257,22 +261,27 @@ describe('scripts/account-deletion-synthetic.ts — spawn только ОТКА�
     expect(res.stderr).toContain('synthetic_gates_not_met');
   }, 120_000);
 
-  it('только --apply → exit 2, stdout пуст', () => {
+  it('только --apply → exit 2, stdout пуст, в stderr — synthetic_gates_not_met', () => {
     const res = spawnCli([SYNTHETIC_APPLY_FLAG], {});
     expect(res.status).toBe(2);
     expect(res.stdout).toBe('');
+    expect(res.stderr).toContain('synthetic_gates_not_met');
   }, 120_000);
 
-  it('--apply + confirm без env-гейта → exit 2, stdout пуст', () => {
+  it('--apply + confirm без env-гейта → exit 2, stdout пуст, в stderr — synthetic_gates_not_met', () => {
     const res = spawnCli([SYNTHETIC_APPLY_FLAG, SYNTHETIC_CONFIRM_FLAG], {});
     expect(res.status).toBe(2);
     expect(res.stdout).toBe('');
+    expect(res.stderr).toContain('synthetic_gates_not_met');
   }, 120_000);
 
-  it('флаги + env на чужом hostname → exit 2, stdout пуст', () => {
+  it('флаги + env на чужом hostname → exit 2, stdout пуст, в stderr — synthetic_gates_not_met', () => {
     // На CI-ноде os.hostname() = ugliest-salmon.ptr.network — имя входит в
     // allow-list, поэтому там кейс пропускается: гейт hostname ветку не
-    // закрыл бы, а пройти дальше (подключение к БД) тесту запрещено.
+    // закрыл бы, CLI отказал бы уже по пустому DATABASE_URL, и проверка
+    // stderr ниже упала бы. До базы CLI не дошёл бы и без пропуска (пустой
+    // DATABASE_URL — код 2 до подключения): пропуск и пустой DATABASE_URL —
+    // двойная страховка.
     if (isSyntheticGateHostname(hostname())) return;
     const res = spawnCli(
       [SYNTHETIC_APPLY_FLAG, SYNTHETIC_CONFIRM_FLAG],
@@ -280,6 +289,7 @@ describe('scripts/account-deletion-synthetic.ts — spawn только ОТКА�
     );
     expect(res.status).toBe(2);
     expect(res.stdout).toBe('');
+    expect(res.stderr).toContain('synthetic_gates_not_met');
   }, 120_000);
 });
 
