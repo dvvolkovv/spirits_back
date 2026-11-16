@@ -548,14 +548,19 @@ export class IdentityService implements OnModuleInit {
     // накопленного. При равных/неизвестных датах выживает targetUserId — тот,
     // под которым человек сейчас залогинен, чтобы зря не менять сессию. Если
     // выжил не target, контроллер выдаст свежий JWT на survivor.
+    // id — для лога ниже: в лог пишем user_id.id (uuid строки), а не
+    // internal_id — у телефонного входа internal_id это сам номер.
     const dates = await this.pg.query(
-      `SELECT internal_id, create_date FROM user_id WHERE internal_id = ANY($1)`,
+      `SELECT internal_id, id, create_date FROM user_id WHERE internal_id = ANY($1)`,
       [[conflictUserId, targetUserId]],
     );
+    const row = (id: string) => dates.rows.find((x: any) => x.internal_id === id);
     const at = (id: string) => {
-      const r = dates.rows.find((x: any) => x.internal_id === id);
+      const r = row(id);
       return r?.create_date ? new Date(r.create_date).getTime() : null;
     };
+    // Нет строки или id — «?», а не internal_id.
+    const rowId = (id: string): string => row(id)?.id ?? '?';
     const dc = at(conflictUserId);
     const dt = at(targetUserId);
     const survivorUserId =
@@ -584,7 +589,9 @@ export class IdentityService implements OnModuleInit {
         -tokens,
         `Перенос остатка на основной аккаунт ${survivorUserId}`,
       ]);
-      this.logger.log(`merge: ${tokens} токенов ${loserUserId} → ${survivorUserId}`);
+      this.logger.log(
+        `merge: ${tokens} токенов user_id.id=${rowId(loserUserId)} → user_id.id=${rowId(survivorUserId)}`,
+      );
     }
 
     // Task 19 — порядок, зафиксированный планом: credit-first баланс (выше) →
