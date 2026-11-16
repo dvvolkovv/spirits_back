@@ -140,3 +140,34 @@ test('small max_tokens is floored to MIN_OUTPUT_TOKENS (reasoning shares the bud
   const large = translateRequest({ model: 'gpt-6-astra', max_tokens: 8000, messages: [] });
   assert.equal(large.max_output_tokens, 8000);
 });
+
+test('схемы инструментов без строковых pattern: OpenAI отвергает lookaround и роняет весь запрос', () => {
+  // 16.11.2026 на релее: «Invalid JSON schema: regex lookaround is not supported.
+  // Found at $.properties.to.pattern» — из-за одного MCP-инструмента не прошёл ни один ход.
+  const schema = {
+    type: 'object',
+    properties: {
+      to: { type: 'string', format: 'email', pattern: '^(?!\\.)(?!.*\\.\\.)[^@]+@[^@]+$' },
+      pattern: { type: 'string', description: 'свойство с таким именем — у Grep, его не трогаем' },
+      list: { type: 'array', items: { type: 'string', pattern: '^a' } },
+      mode: { type: 'object', const: { pattern: 'значение, а не ключевое слово' } },
+      default: { type: 'string', pattern: '^(?=x)' },
+    },
+    required: ['to', 'pattern'],
+  };
+  const [fn] = toolsToFunctions([{ name: 'send', input_schema: schema }]);
+  assert.deepEqual(fn.parameters, {
+    type: 'object',
+    properties: {
+      to: { type: 'string', format: 'email' },
+      pattern: { type: 'string', description: 'свойство с таким именем — у Grep, его не трогаем' },
+      list: { type: 'array', items: { type: 'string' } },
+      mode: { type: 'object', const: { pattern: 'значение, а не ключевое слово' } },
+      // параметр с именем ключевого слова-значения — всё равно схема
+      default: { type: 'string' },
+    },
+    required: ['to', 'pattern'],
+  });
+  // исходная схема CLI не мутируется
+  assert.equal(schema.properties.to.pattern, '^(?!\\.)(?!.*\\.\\.)[^@]+@[^@]+$');
+});
