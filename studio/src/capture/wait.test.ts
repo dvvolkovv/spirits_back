@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { chromium, type Browser, type Page } from 'playwright';
-import { waitAnswer, waitIdle } from './chat-scene';
+import { JOB_DEADLINE_MS } from '../worker/db';
+import { CAPTURE_BUDGET_MS, waitAnswer, waitIdle } from './chat-scene';
 
 /**
  * Лента кабинета: приветствие ассистента и, пока где-то идёт ход, признак
@@ -36,6 +37,15 @@ async function within<T>(work: Promise<T>, ms: number): Promise<T> {
     clearTimeout(timer);
   }
 }
+
+test('запас съёмки вмещает долгий ответ и укладывается в срок задания', () => {
+  // Самые долгие ответы студии 12–14.11.2026 — до 12 минут, сверху приветствие и уточнение.
+  assert.ok(CAPTURE_BUDGET_MS >= 15 * 60_000, `запас съёмки ${CAPTURE_BUDGET_MS / 60_000} мин`);
+  // Вне запаса — вход в кабинет до съёмки, снимки, выгрузка и запись итога после: 3 минуты
+  // с лихвой. Иначе рабочий процесс выйдет по сроку задания раньше, чем съёмка скажет,
+  // чего не дождалась, и попытка сгорит без причины в last_error.
+  assert.ok(CAPTURE_BUDGET_MS + 3 * 60_000 <= JOB_DEADLINE_MS, `запас ${CAPTURE_BUDGET_MS / 60_000} мин, срок задания ${JOB_DEADLINE_MS / 60_000} мин`);
+});
 
 test('waitAnswer: долгий ответ бросает к сроку съёмки, а не по своим пяти минутам', { timeout: 60_000 }, async () => {
   await withPage(feed('animate-spin'), async (p) => {
