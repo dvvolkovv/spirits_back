@@ -11,17 +11,20 @@
  *   npx ts-node -P tsconfig.json scripts/account-deletion-synthetic.ts \
  *     --apply --confirm-account-deletion-cleanup
  *
- * Тройной гейт (оба флага + env-значение + hostname ugliest-salmon)
- * проверяется ПЕРВЫМ, до любого подключения и до любой записи: неполная
- * комбинация — код 2 и synthetic_gates_not_met в stderr, stdout пуст.
+ * Тройной гейт (оба флага + env-значение + hostname из точного allow-list:
+ * ugliest-salmon или ugliest-salmon.ptr.network) проверяется ПЕРВЫМ, до
+ * любого подключения и до любой записи: неполная комбинация — код 2 и
+ * synthetic_gates_not_met в stderr, stdout пуст.
  * Нет DATABASE_URL — тоже код 2, без подключения.
  *
  * Данные — только синтетические фикстуры (src/account-deletion/
  * account-deletion.synthetic.ts): телефоны последовательности 7999000010x,
- * ресурсы с префиксом synthetic-deletion-. Внешние границы (MinIO-транспорт,
+ * ресурсы с префиксом synthetic-deletion- (включая свой хост продуктов,
+ * закрытый для новых). Внешние границы (MinIO-транспорт,
  * LiveKit, Attendee, ElevenLabs, календарь/OAuth-провайдеры, Telegram,
  * Redis, Neo4j, host-агент) — doubles со strict tri-state; никаких реальных
- * внешних вызовов. Уборка фикстур — в finally по deletion_id/userId.
+ * внешних вызовов. Уборка фикстур — в finally по deletion_id/userId и по
+ * id синтетического хоста.
  *
  * stdout — только JSON-счётчики (без userId/deletionId/телефонов) и маркер
  * SYNTHETIC_TEST_OK. Ошибки — только сообщение и код (scriptErrorText).

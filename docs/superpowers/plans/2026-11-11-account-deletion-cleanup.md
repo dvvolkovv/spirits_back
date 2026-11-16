@@ -1759,7 +1759,7 @@ Commit `test(privacy): полный synthetic deletion/reactivation (красн�
 
 Synthetic использует реальные PG migrations/services и host-agent completion через `ProvisioningService.completeJob`, а не `UPDATE purged_at` напрямую; MinIO/Attendee/ElevenLabs/calendar fault adapters возвращают strict tri-state. Никакого Docker/SSH и платных внешних вызовов. `retentionMs` передаётся только constructor аргументом в тесте; production env не имеет укороченного cutoff.
 
-`scripts/account-deletion-synthetic.ts` использует тот же composition root и требует одновременно `--apply --confirm-account-deletion-cleanup`, env `ACCOUNT_DELETION_SYNTHETIC_ENV=test.linkeon.io` и hostname `ugliest-salmon`; иначе exit 2 до любой записи. Скрипт создаёт только synthetic IDs с префиксом `synthetic-deletion-`, в finally удаляет одноразовые тестовые fixtures по deletionId и печатает только `SYNTHETIC_TEST_OK` и counts.
+`scripts/account-deletion-synthetic.ts` использует тот же composition root и требует одновременно `--apply --confirm-account-deletion-cleanup`, env `ACCOUNT_DELETION_SYNTHETIC_ENV=test.linkeon.io` и hostname из точного allow-list (`ugliest-salmon`, `ugliest-salmon.ptr.network`); иначе exit 2 до любой записи. Скрипт создаёт только synthetic IDs с префиксом `synthetic-deletion-`, в finally удаляет одноразовые тестовые fixtures по deletionId и печатает только `SYNTHETIC_TEST_OK` и counts.
 
 - [ ] **Step 4: GREEN commit/push и PG PASS + broad tsc**
 
