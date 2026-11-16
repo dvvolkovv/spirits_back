@@ -142,6 +142,14 @@ case "${health}" in
     if [[ "$restarts" -eq 0 ]]; then echo '{"status":"ok","inflight":0}'; exit 0; fi
     exit 1 ;;
   inflight-seq)
+    # FOREIGN_MARKER_AT=n: на n-м вызове health кто-то вручную ставит свой
+    # marker (аварийный drain) — уже после того, как gate этого вызова посчитан.
+    if [[ -n "$FOREIGN_MARKER_AT" ]]; then
+      hc=$(cat "$WORK/health-calls" 2>/dev/null || echo 0)
+      hc=$((hc + 1))
+      echo "$hc" > "$WORK/health-calls"
+      if [[ "$hc" -eq "$FOREIGN_MARKER_AT" ]]; then printf 'foreign\n' > "$DRAIN_FILE"; fi
+    fi
     n=$(head -n 1 "$WORK/inflight-seq" 2>/dev/null || true)
     if [[ -n "$n" ]]; then
       tail -n +2 "$WORK/inflight-seq" > "$WORK/inflight-seq.next"
@@ -391,6 +399,28 @@ describe('deploy-relay: сначала тишина, потом короткий
       expect(r.restarts).toBe('restart gate=yes\n');
       expect(r.liveServer).toContain('target');
       expect(r.drainExists).toBe(false);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it('чужой marker появился, пока ждали тишины, — выход 1, marker не затёрт и не снят, замены нет', () => {
+    const r = runRollout('inflight-seq', {
+      inflightSeq: [1, 1, 0],
+      env: { FOREIGN_MARKER_AT: '2' },
+    });
+    try {
+      expect(r.status).toBe(1);
+      expect(r.inflight).toEqual([
+        'inflight=1 gate=no', // INITIAL_INFLIGHT
+        'inflight=1 gate=no', // фаза 1: ход идёт; в этот момент кто-то ставит свой marker
+        'inflight=0 gate=yes', // фаза 1: тихо, но marker уже чужой
+      ]);
+      expect(r.stderr).toContain('marker');
+      expect(r.drainExists).toBe(true);
+      expect(fs.readFileSync(r.drainFile, 'utf8').trim()).toBe('foreign');
+      expect(r.restarts).toBe('');
+      expect(r.liveServer).toContain('base');
     } finally {
       r.cleanup();
     }
