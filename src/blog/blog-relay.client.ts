@@ -38,8 +38,11 @@ export class BlogRelayClient {
     private readonly globalProvider?: GlobalLlmProviderService,
   ) {}
 
-  /** Повтор под шлагбаумом выката релея; тесты подменяют расписание. */
-  drainOpts: DrainRetryOpts = {};
+  /** Повтор под шлагбаумом выката релея (полное расписание); тесты подменяют расписание. */
+  private drainOpts: DrainRetryOpts = {
+    onRetry: (attempt, delayMs) =>
+      this.logger.warn(`релей обновляется или недоступен — повтор ${attempt} через ${delayMs} мс`),
+  };
 
   /**
    * Один вызов релея. sessionId — новый на каждый пост: длинные сессии
@@ -69,7 +72,7 @@ export class BlogRelayClient {
       return fd;
     };
 
-    const resp: any = await postRelayWithDrainRetry(() => {
+    const resp = await postRelayWithDrainRetry(() => {
       const fd = buildForm();
       return axios.post(`${agentUrl}/chat`, fd, {
         headers: { ...fd.getHeaders(), ...relayAuthHeaders() },

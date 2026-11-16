@@ -5,7 +5,7 @@ import { AgentsService } from '../agents/agents.service';
 import { relayAuthHeaders } from '../chat/relay-auth';
 import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
 import { relayProviderFields } from '../chat/answer-provider';
-import { postRelayWithDrainRetry, DrainRetryOpts } from '../chat/relay-drain-retry';
+import { postRelayWithDrainRetry, DrainRetryOpts, RELAY_DRAIN_DELAYS_SHORT_MS } from '../chat/relay-drain-retry';
 
 /**
  * «Поговорить начисто» [owner 2026-08-24] — запрос в облачный LLM, НЕ связанный с пользователем.
@@ -38,8 +38,17 @@ export class CleanAskService {
     private readonly globalProvider?: GlobalLlmProviderService,
   ) {}
 
-  /** Повтор под шлагбаумом выката релея; тесты подменяют расписание. */
-  drainOpts: DrainRetryOpts = {};
+  /**
+   * Повтор под шлагбаумом выката релея; тесты подменяют расписание.
+   * Расписание короткое (~59 с): /ask и /first-contact ждёт человек у
+   * экрана (в том числе до входа, на знакомстве) — полные ~149 с спиннера
+   * хуже понятной ошибки. Автоблог (фон) ждёт по полному расписанию.
+   */
+  private drainOpts: DrainRetryOpts = {
+    delaysMs: RELAY_DRAIN_DELAYS_SHORT_MS,
+    onRetry: (attempt, delayMs) =>
+      this.logger.warn(`релей обновляется или недоступен — повтор ${attempt} через ${delayMs} мс`),
+  };
 
   private static readonly SYSTEM =
     'Ты — живой, тактичный собеседник в приватном чате. Это ДИАЛОГ, а не справка: отвечай КОРОТКО и ' +
@@ -128,7 +137,7 @@ export class CleanAskService {
     };
 
     const chunks: string[] = [];
-    const resp: any = await postRelayWithDrainRetry(() => {
+    const resp = await postRelayWithDrainRetry(() => {
       const fd = buildForm();
       return axios.post(`${AGENT_URL}/chat`, fd, {
         headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
