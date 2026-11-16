@@ -10,19 +10,23 @@ const sign = (p: unknown) =>
   createHmac('sha256', Buffer.from(SECRET, 'base64')).update(canonicalJson(p), 'utf8').digest('base64');
 
 describe('MeetWebhookController', () => {
-  let livekit: { send: jest.Mock };
+  let inbox: { enqueue: jest.Mock };
+  let delivery: { kick: jest.Mock };
   let calls: { load: jest.Mock; isActive: jest.Mock };
   let ctl: MeetWebhookController;
 
   beforeEach(() => {
     process.env.ATTENDEE_WEBHOOK_SECRET = SECRET;
-    livekit = { send: jest.fn().mockResolvedValue(undefined) };
+    inbox = { enqueue: jest.fn().mockResolvedValue('inserted') };
+    delivery = { kick: jest.fn() };
     calls = {
       load: jest.fn().mockResolvedValue({ id: 'c1', room_name: 'meet_c1', status: 'active' }),
       isActive: jest.fn().mockReturnValue(true),
     };
-    ctl = new MeetWebhookController(livekit as any, calls as any);
+    ctl = new MeetWebhookController(calls as any, inbox as any, delivery as any);
   });
+
+  const sent = (i = 0) => inbox.enqueue.mock.calls[i][0].message;
 
   const hook = (trigger: string, data: unknown, key = 'k1') => ({
     idempotency_key: key, bot_id: 'b1', bot_metadata: { callId: 'c1' }, trigger, data,
@@ -33,7 +37,7 @@ describe('MeetWebhookController', () => {
       participant_name: 'Сергей', participant_uuid: 'u1', event_type: 'join', timestamp_ms: 1,
     });
     await ctl.receive(sign(p), p as any);
-    expect(livekit.send).toHaveBeenCalledWith('meet_c1', {
+    expect(sent()).toEqual({
       v: 1, type: 'meet_participant', event: 'join', uuid: 'u1', name: 'Сергей',
     });
   });
@@ -43,7 +47,7 @@ describe('MeetWebhookController', () => {
       participant_name: 'Сергей', participant_uuid: 'u1', event_type: 'leave', timestamp_ms: 2,
     });
     await ctl.receive(sign(p), p as any);
-    expect(livekit.send.mock.calls[0][1].event).toBe('leave');
+    expect(sent().event).toBe('leave');
   });
 
   it('говорящий уходит отдельным событием', async () => {
@@ -51,7 +55,7 @@ describe('MeetWebhookController', () => {
       participant_name: 'Сергей', participant_uuid: 'u1', event_type: 'speech_start',
     });
     await ctl.receive(sign(p), p as any);
-    expect(livekit.send.mock.calls[0][1]).toEqual({
+    expect(sent()).toEqual({
       v: 1, type: 'meet_speaking', uuid: 'u1', name: 'Сергей', speaking: true,
     });
   });
@@ -61,13 +65,13 @@ describe('MeetWebhookController', () => {
       participant_name: 'Сергей', participant_uuid: 'u1', event_type: 'speech_stop',
     });
     await ctl.receive(sign(p), p as any);
-    expect(livekit.send.mock.calls[0][1].speaking).toBe(false);
+    expect(sent().speaking).toBe(false);
   });
 
   it('смертельное состояние бота помечается fatal', async () => {
     const p = hook('bot.state_change', { new_state: 'fatal_error', old_state: 'joining' });
     await ctl.receive(sign(p), p as any);
-    expect(livekit.send.mock.calls[0][1]).toEqual({
+    expect(sent()).toEqual({
       v: 1, type: 'meet_bot_state', state: 'fatal_error', fatal: true,
     });
   });
@@ -82,7 +86,7 @@ describe('MeetWebhookController', () => {
       event_type: 'could_not_join_meeting', event_sub_type: 'request_to_join_denied',
     });
     await ctl.receive(sign(p), p as any);
-    expect(livekit.send.mock.calls[0][1]).toEqual({
+    expect(sent()).toEqual({
       v: 1, type: 'meet_bot_state', state: 'fatal_error', fatal: true,
       sub: 'request_to_join_denied',
     });
@@ -95,13 +99,13 @@ describe('MeetWebhookController', () => {
       new_state: 'ended', old_state: 'leaving', event_type: 'left_meeting', event_sub_type: null,
     });
     await ctl.receive(sign(p), p as any);
-    expect(livekit.send.mock.calls[0][1].sub).toBe('left_meeting');
+    expect(sent().sub).toBe('left_meeting');
   });
 
   it('встреча закончилась — тоже fatal', async () => {
     const p = hook('bot.state_change', { new_state: 'ended', old_state: 'joined_recording' });
     await ctl.receive(sign(p), p as any);
-    expect(livekit.send.mock.calls[0][1].fatal).toBe(true);
+    expect(sent().fatal).toBe(true);
   });
 
   it('комната ожидания НЕ смертельна', async () => {
@@ -110,24 +114,24 @@ describe('MeetWebhookController', () => {
     // нас впустить.
     const p = hook('bot.state_change', { new_state: 'waiting_room', old_state: 'joining' });
     await ctl.receive(sign(p), p as any);
-    expect(livekit.send.mock.calls[0][1]).toEqual({
+    expect(sent()).toEqual({
       v: 1, type: 'meet_bot_state', state: 'waiting_room', fatal: false,
     });
   });
 
   it('промежуточные состояния входа не смертельны', async () => {
     for (const st of ['joining', 'joined_not_recording', 'joined_recording', 'connecting']) {
-      livekit.send.mockClear();
+      inbox.enqueue.mockClear();
       const p = hook('bot.state_change', { new_state: st, old_state: 'ready' }, `k-${st}`);
       await ctl.receive(sign(p), p as any);
-      expect(livekit.send.mock.calls[0][1].fatal).toBe(false);
+      expect(sent().fatal).toBe(false);
     }
   });
 
   it('обычное состояние бота не считается смертельным', async () => {
     const p = hook('bot.state_change', { new_state: 'joined_recording', old_state: 'joining' });
     await ctl.receive(sign(p), p as any);
-    expect(livekit.send.mock.calls[0][1].fatal).toBe(false);
+    expect(sent().fatal).toBe(false);
   });
 
   it('сообщение чата уходит в комнату с автором и признаком «лично»', async () => {
@@ -138,7 +142,7 @@ describe('MeetWebhookController', () => {
       text: 'https://www.google.com/', sender_name: 'Владимир', sender_uuid: 'u1', to: 'everyone',
     });
     await ctl.receive(sign(p), p as any);
-    expect(livekit.send).toHaveBeenCalledWith('meet_c1', {
+    expect(sent()).toEqual({
       v: 1, type: 'meet_chat',
       text: 'https://www.google.com/', sender: 'Владимир', uuid: 'u1', private: false,
     });
@@ -151,25 +155,14 @@ describe('MeetWebhookController', () => {
       text: 'Роман, посмотри вот это', sender_name: 'Владимир', sender_uuid: 'u1', to: 'only_bot',
     });
     await ctl.receive(sign(p), p as any);
-    expect(livekit.send.mock.calls[0][1].private).toBe(true);
+    expect(sent().private).toBe(true);
   });
 
   it('пустое сообщение в комнату не уходит', async () => {
     // В контексте оно только мешает, а ответа вслух тем более не стоит.
     const p = hook('chat_messages.update', { text: '   ', sender_name: 'Владимир', to: 'everyone' });
     await ctl.receive(sign(p), p as any);
-    expect(livekit.send).not.toHaveBeenCalled();
-  });
-
-  it('повтор по idempotency_key не дублируется', async () => {
-    // Attendee ретраит настойчиво (до 30 раз), а дубль «вошёл» копил бы
-    // участников в Presence на стороне воркера.
-    const p = hook('participant_events.join_leave', {
-      participant_name: 'Сергей', participant_uuid: 'u1', event_type: 'join', timestamp_ms: 1,
-    });
-    await ctl.receive(sign(p), p as any);
-    await ctl.receive(sign(p), p as any);
-    expect(livekit.send).toHaveBeenCalledTimes(1);
+    expect(inbox.enqueue).not.toHaveBeenCalled();
   });
 
   it('разные события того же бота не глушат друг друга', async () => {
@@ -181,13 +174,13 @@ describe('MeetWebhookController', () => {
     }, 'k2');
     await ctl.receive(sign(a), a as any);
     await ctl.receive(sign(b), b as any);
-    expect(livekit.send).toHaveBeenCalledTimes(2);
+    expect(inbox.enqueue).toHaveBeenCalledTimes(2);
   });
 
   it('плохая подпись — 401 и ничего не отправлено', async () => {
     const p = hook('bot.state_change', { new_state: 'joined' });
     await expect(ctl.receive('мусор', p as any)).rejects.toThrow(UnauthorizedException);
-    expect(livekit.send).not.toHaveBeenCalled();
+    expect(inbox.enqueue).not.toHaveBeenCalled();
   });
 
   it('несовпадение подписи попадает в лог вместе с канонизацией', async () => {
@@ -212,43 +205,68 @@ describe('MeetWebhookController', () => {
     // в UI Attendee. Ошибкой отвечать нельзя: Attendee начнёт ретраить.
     const p = { idempotency_key: 'k9', bot_id: 'b1', trigger: 'bot.state_change', data: { new_state: 'joined' } };
     await expect(ctl.receive(sign(p), p as any)).resolves.toEqual({ ok: true });
-    expect(livekit.send).not.toHaveBeenCalled();
+    expect(inbox.enqueue).not.toHaveBeenCalled();
   });
 
   it('завершённый звонок не получает событий', async () => {
     calls.isActive.mockReturnValue(false);
     const p = hook('bot.state_change', { new_state: 'joined' });
     await ctl.receive(sign(p), p as any);
-    expect(livekit.send).not.toHaveBeenCalled();
-  });
-
-  it('неизвестный звонок не роняет ручку', async () => {
-    calls.load.mockRejectedValue(new Error('нет такого'));
-    const p = hook('bot.state_change', { new_state: 'joined' });
-    await expect(ctl.receive(sign(p), p as any)).resolves.toEqual({ ok: true });
-    expect(livekit.send).not.toHaveBeenCalled();
+    expect(inbox.enqueue).not.toHaveBeenCalled();
   });
 
   it('незнакомый триггер игнорируется', async () => {
     const p = hook('transcript.update', { speaker_name: 'Сергей' });
     await ctl.receive(sign(p), p as any);
-    expect(livekit.send).not.toHaveBeenCalled();
+    expect(inbox.enqueue).not.toHaveBeenCalled();
   });
 
-  it('падение отправки в комнату не роняет ручку', async () => {
-    // Комната могла быть уже удалена. Ответить ошибкой значит заставить
-    // Attendee ретраить 30 раз впустую.
-    livekit.send.mockRejectedValue(new Error('room not found'));
+  it('вставка нового события: callId, ключ, trigger, message и один kick', async () => {
+    const p = hook('bot.state_change', { new_state: 'joined' }, 'k7');
+    await expect(ctl.receive(sign(p), p as any)).resolves.toEqual({ ok: true });
+    expect(inbox.enqueue).toHaveBeenCalledTimes(1);
+    expect(inbox.enqueue).toHaveBeenCalledWith({
+      callId: 'c1', idempotencyKey: 'k7', trigger: 'bot.state_change',
+      message: { v: 1, type: 'meet_bot_state', state: 'joined', fatal: false },
+    });
+    expect(delivery.kick).toHaveBeenCalledTimes(1);
+  });
+
+  it('дубликат подтверждается и тоже будит доставку один раз', async () => {
+    inbox.enqueue.mockResolvedValue('duplicate');
     const p = hook('bot.state_change', { new_state: 'joined' });
     await expect(ctl.receive(sign(p), p as any)).resolves.toEqual({ ok: true });
+    expect(delivery.kick).toHaveBeenCalledTimes(1);
   });
 
-  it('при переполнении вытесняет старые ключи, а не растёт бесконечно', async () => {
-    // Воркер живёт неделями; множество без потолка росло бы всю его жизнь.
-    const p = (i: number) => hook('participant_events.join_leave', {
-      participant_name: 'Ч', participant_uuid: `u${i}`, event_type: 'join', timestamp_ms: i,
-    }, `key${i}`);
-    for (let i = 0; i < 5_100; i++) await ctl.receive(sign(p(i)), p(i) as any);
-    expect((ctl as any).seen.size).toBeLessThanOrEqual(5_000);
+  it('calls.load вернул null — ack без enqueue', async () => {
+    calls.load.mockResolvedValue(null);
+    const p = hook('bot.state_change', { new_state: 'joined' });
+    await expect(ctl.receive(sign(p), p as any)).resolves.toEqual({ ok: true });
+    expect(inbox.enqueue).not.toHaveBeenCalled();
+    expect(delivery.kick).not.toHaveBeenCalled();
+  });
+
+  it('calls.load упал — 503 и без enqueue', async () => {
+    jest.spyOn((ctl as any).logger, 'error').mockImplementation(() => {});
+    calls.load.mockRejectedValue(new Error('db down'));
+    const p = hook('bot.state_change', { new_state: 'joined' });
+    await expect(ctl.receive(sign(p), p as any)).rejects.toThrow(ServiceUnavailableException);
+    expect(inbox.enqueue).not.toHaveBeenCalled();
+  });
+
+  it('enqueue упал — 503 и без kick', async () => {
+    jest.spyOn((ctl as any).logger, 'error').mockImplementation(() => {});
+    inbox.enqueue.mockRejectedValue(new Error('pg down'));
+    const p = hook('bot.state_change', { new_state: 'joined' });
+    await expect(ctl.receive(sign(p), p as any)).rejects.toThrow(ServiceUnavailableException);
+    expect(delivery.kick).not.toHaveBeenCalled();
+  });
+
+  it('FK 23503 (звонка уже нет) — ack без kick', async () => {
+    inbox.enqueue.mockRejectedValue(Object.assign(new Error('fk'), { code: '23503' }));
+    const p = hook('bot.state_change', { new_state: 'joined' });
+    await expect(ctl.receive(sign(p), p as any)).resolves.toEqual({ ok: true });
+    expect(delivery.kick).not.toHaveBeenCalled();
   });
 });
