@@ -11,13 +11,19 @@ const TX_CONTROL = new Set(['BEGIN', 'COMMIT', 'ROLLBACK']);
  * resolveOrCreate детерминирован, поэтому сценарий читается сверху вниз ровно
  * в том порядке, в каком их шлёт код. BEGIN/COMMIT/ROLLBACK очередь не
  * расходуют (ответ { rows: [] }), но остаются в tx.query.mock.calls.
- * Запрос без ответа в сценарии — исключение: дрейф кода должен ронять тест.
+ *
+ * Запрос без ответа в сценарии — исключение. Ответ, который код так и не
+ * запросил, ловит expect(pg.left).toBe(0). Текст SQL и клиент (пул или tx) на
+ * позиции мок не сверяет: с запросом запись связывает только подпись к ней.
  */
 function makePg(scripted) {
   let i = 0;
   const next = (who, sql) => {
     const r = scripted[i++];
-    if (!r) throw new Error(`${who} #${i} unexpected: ${sql.slice(0, 60)}`);
+    if (!r) {
+      const head = sql.replace(/\s+/g, ' ').trim().slice(0, 100);
+      throw new Error(`сценарий: нет ответа на запрос #${i} из ${scripted.length} (${who}): ${head}`);
+    }
     return r;
   };
   const tx = {
@@ -28,6 +34,8 @@ function makePg(scripted) {
     query: jest.fn(async (sql) => next('pg.query', sql)),
     getClient: jest.fn(async () => tx),
     tx,
+    /** Сколько ответов сценария код так и не запросил; не 0 — тоже дрейф. */
+    get left() { return scripted.length - i; },
   };
 }
 
@@ -41,6 +49,7 @@ describe('IdentityService.resolveOrCreate', () => {
     const svc = new IdentityService(pg);
     const out = await svc.resolveOrCreate('phone', { phone: '79030169187' });
     expect(out).toEqual({ status: 'ok', userId: 'u1', isNew: false, mergedExisting: false });
+    expect(pg.left).toBe(0);
   });
 
   test('новый user — INSERT user_id, ai_profiles_consolidated, user_identities, welcome bonus', async () => {
@@ -64,6 +73,9 @@ describe('IdentityService.resolveOrCreate', () => {
     expect(txSql[0]).toBe('BEGIN');
     expect(txSql[txSql.length - 1]).toBe('COMMIT');
     expect(pg.tx.release).toHaveBeenCalledTimes(1);
+    // Через пул — только lookup шага 1; всё, что пишет шаг 3, — на выделенном соединении.
+    expect(pg.query).toHaveBeenCalledTimes(1);
+    expect(pg.left).toBe(0);
   });
 
   test('OAuth с verified email — merge к существующему юзеру', async () => {
@@ -76,6 +88,7 @@ describe('IdentityService.resolveOrCreate', () => {
     const svc = new IdentityService(pg);
     const out = await svc.resolveOrCreate('google', { sub: 'g-123', email: 'foo@gmail.com', emailVerified: true });
     expect(out).toEqual({ status: 'ok', userId: 'EXISTING', isNew: false, mergedExisting: true });
+    expect(pg.left).toBe(0);
   });
 
   test('phone нормализуется (убираем +, скобки, пробелы)', async () => {
@@ -88,5 +101,6 @@ describe('IdentityService.resolveOrCreate', () => {
     await svc.resolveOrCreate('phone', { phone: '+7 (903) 016-91-87' });
     const lookupParams = pg.query.mock.calls[0][1];
     expect(lookupParams).toContain('79030169187');
+    expect(pg.left).toBe(0);
   });
 });
