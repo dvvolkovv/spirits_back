@@ -212,14 +212,17 @@ maybe('MeetingWebhookInboxStore PostgreSQL', () => {
 
   it('finish-методы меняют только processing и не перезаписывают терминальные состояния', async () => {
     const ids: Record<string, string> = {};
-    for (const status of ['pending', 'delivered', 'discarded']) {
+    for (const status of ['pending', 'delivered', 'discarded', 'dead']) {
       await store.enqueue(event({ idempotencyKey: `guard-${status}` }));
       const r = await pool.query(
         `UPDATE meeting_webhook_events
             SET status = $1,
-                last_error = CASE WHEN $1 = 'discarded' THEN 'original' ELSE NULL END,
+                last_error = CASE WHEN $1 = 'discarded' THEN 'original'
+                                  WHEN $1 = 'dead' THEN 'dead-original-error'
+                                  ELSE NULL END,
                 delivered_at = CASE WHEN $1 = 'delivered' THEN now() ELSE NULL END,
-                updated_at = now() - interval '5 seconds'
+                updated_at = CASE WHEN $1 = 'dead' THEN now() - interval '3 days'
+                                  ELSE now() - interval '5 seconds' END
           WHERE idempotency_key = $2
           RETURNING id`,
         [status, `guard-${status}`],
