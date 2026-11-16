@@ -211,9 +211,22 @@ describe('scripts/account-deletion-synthetic.ts — spawn только ОТКА�
   const repo = path.resolve(__dirname, '..', '..');
 
   function spawnCli(args: string[], env: Record<string, string>) {
-    // Прецедент — dry-run.spec.ts: ts-node spawn без Nest, минимальный env
-    // (нет DATABASE_URL и нет гейт-env) → гейты обязаны отказать ДО любого
-    // подключения/записи. Полная тройка гейтов сюда не передаётся никогда.
+    // Прецедент — dry-run.spec.ts: ts-node spawn без Nest. Env ребёнка
+    // собирается явно, без process.env, — но этого мало: CLI делает
+    // `import 'dotenv/config'`, а cwd = корень репозитория. В клоне стенда
+    // там лежит .env с ACCOUNT_DELETION_SYNTHETIC_ENV=test.linkeon.io и
+    // DATABASE_URL, и кейс «без env-гейта» на ноде прошёл бы гейты и
+    // запустил живой synthetic против настоящей базы. Поэтому:
+    // - DOTENV_CONFIG_PATH=/nonexistent — dotenv/config читает путь из этой
+    //   переменной вместо ./.env; отсутствующий файл dotenv глотает
+    //   (возвращает error, процесс не падает);
+    // - гейт-env и DATABASE_URL заданы ПУСТЫМИ строками, а не опущены:
+    //   dotenv не перезаписывает ключи, которые уже есть в process.env
+    //   (даже пустые), так что второй рубеж держит и при случайно
+    //   найденном .env. Пустой гейт != test.linkeon.io, пустой DATABASE_URL
+    //   CLI считает отсутствующим.
+    // Кейсы, которым нужен гейт-env (fullGateEnv), переопределяют его через
+    // spread. Полная тройка гейтов сюда не передаётся никогда.
     return spawnSync(process.execPath, [
       require.resolve('ts-node/dist/bin'),
       '-P', path.join(repo, 'tsconfig.json'),
@@ -223,7 +236,14 @@ describe('scripts/account-deletion-synthetic.ts — spawn только ОТКА�
       cwd: repo,
       encoding: 'utf8',
       timeout: 90_000,
-      env: { PATH: process.env.PATH ?? '', TS_NODE_TRANSPILE_ONLY: '1', ...env },
+      env: {
+        PATH: process.env.PATH ?? '',
+        TS_NODE_TRANSPILE_ONLY: '1',
+        [SYNTHETIC_GATE_ENV]: '',
+        DATABASE_URL: '',
+        DOTENV_CONFIG_PATH: '/nonexistent',
+        ...env,
+      },
     });
   }
 
