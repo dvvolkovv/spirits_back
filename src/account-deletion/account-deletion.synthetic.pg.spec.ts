@@ -897,6 +897,13 @@ maybe('synthetic deletion lifecycle — полная цепочка против
     expect(await unfinishedJobs(second.deletionId)).toHaveLength(0);
     expect(await externalIdsPresent(fixture.mainUserId)).toBe(false);
     expect(await sharedResources(fixture.otherUserId)).toEqual(fixture.allSharedResources);
+    const inboxOwners = await rows(
+      `SELECT idempotency_key FROM meeting_webhook_events
+        WHERE idempotency_key LIKE 'synthetic-inbox-%' ORDER BY idempotency_key`,
+    );
+    expect(inboxOwners).toEqual([
+      { idempotency_key: `synthetic-inbox-${fixture.otherUserId}` },
+    ]);
 
     // T22-Q3: recapture второго поколения — прямой assert, а не комментарий.
     // chat-file.purge gen2 обязан существовать (посев строки с файлом перед
