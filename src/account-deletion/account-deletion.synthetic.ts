@@ -744,6 +744,23 @@ export async function historicalSnapshot(
 }
 
 /**
+ * Строка хоста продуктов synthetic (SYNTHETIC_HOST_ID). Форма строки — из
+ * product pg spec, id и хеш токена — свои. accepts_new = false: продукт
+ * посева ставится на хост явным host_id, а pickForNewProduct (единственный
+ * читатель accepts_new) на пути synthetic не вызывается — зато живой API
+ * стенда, который смотрит в ту же базу, пока идёт прогон, не выберет
+ * фиктивную машину для чужого нового продукта.
+ */
+export async function seedSyntheticHost(pg: PgService): Promise<void> {
+  await pg.query(
+    `INSERT INTO product_hosts (id, ssh_target, public_ip, domain_suffix, agent_token_hash, capacity, audience, accepts_new)
+     VALUES ($1,'root@10.50.0.1','10.50.0.1','c.linkeon.io',$2,20,'clients',false)
+     ON CONFLICT (id) DO NOTHING`,
+    [SYNTHETIC_HOST_ID, sha256(`${SYNTHETIC_DELETION_PREFIX}host-agent-fixture`)],
+  );
+}
+
+/**
  * Полный посев синтетического аккаунта: по ресурсу на каждый домен,
  * чьи purge/stop-задачи должны реально исполниться. Все ключи и тексты —
  * с префиксом synthetic-deletion- (или синтетические UUID/телефоны),
@@ -913,18 +930,8 @@ export async function seedSyntheticFixture(stack: SyntheticStack): Promise<Synth
     [main, `${SYNTHETIC_DELETION_PREFIX}hash`],
   );
 
-  // Продукт на СВОЁМ синтетическом хосте (форма строки хоста — из product pg
-  // spec, id и хеш токена — свои). accepts_new = false: продукт посева
-  // ставится на хост явным host_id, а pickForNewProduct (единственный
-  // читатель accepts_new) на пути synthetic не вызывается — зато живой API
-  // стенда, который смотрит в ту же базу, пока идёт прогон, не выберет
-  // фиктивную машину для чужого нового продукта.
-  await pg.query(
-    `INSERT INTO product_hosts (id, ssh_target, public_ip, domain_suffix, agent_token_hash, capacity, audience, accepts_new)
-     VALUES ($1,'root@10.50.0.1','10.50.0.1','c.linkeon.io',$2,20,'clients',false)
-     ON CONFLICT (id) DO NOTHING`,
-    [SYNTHETIC_HOST_ID, sha256(`${SYNTHETIC_DELETION_PREFIX}host-agent-fixture`)],
-  );
+  // Продукт на СВОЁМ синтетическом хосте — см. seedSyntheticHost.
+  await seedSyntheticHost(pg);
   const productId = randomUUID();
   await pg.query(
     `INSERT INTO products
