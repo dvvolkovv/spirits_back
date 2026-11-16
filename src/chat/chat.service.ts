@@ -31,6 +31,7 @@ import { ClientPing, startClientPing } from './client-ping';
 import { toActivity } from './activity-map';
 import { ASK_RULE } from './ask-rule';
 import { WORK_RULES } from './work-rules';
+import { chatFailureText } from './chat-failure-texts';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
 import { LinkeonRelayFields, appendLinkeonFields, linkeonRelayFields, relayFsKey } from './linkeon-relay-fields';
@@ -80,6 +81,8 @@ export interface UploadHandoff {
   products: { products_token: string; products_mcp_url: string };
   linkeon: LinkeonRelayFields;
   profilingBlocks: RelayProfilingBlocks;
+  /** Язык человека — для текстов сбоев хода с файлом (chat-failure-texts.ts). */
+  userLanguage?: string;
 }
 
 /** Файл в папке сессии, как его отдаёт relay (`GET /session/:sid/files`). */
@@ -1167,7 +1170,7 @@ export class ChatService {
     // Инструменты Linkeon и папка хода — те же, что у текстового хода этой сессии.
     const linkeon = linkeonRelayFields(userId, sessionId);
 
-    return { baseSessionId, sessionId, systemPrompt, history, uploadContext, products, linkeon, profilingBlocks };
+    return { baseSessionId, sessionId, systemPrompt, history, uploadContext, products, linkeon, profilingBlocks, userLanguage };
   }
 
   /** Последняя проверка непосредственно перед multipart `fd.append` контроллера. */
@@ -2218,7 +2221,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
         this.logger.error(`CLI-отказ долетел до бэкенда как ответ (${userId}_${assistantId}): ${fullText.slice(0, 120)}`);
         turnFailed = true;
         failReason = failReason || 'cli_fatal_text';
-        fullText = '_Не получилось: временный сбой на стороне платформы. Токены за этот ход не списаны — попробуйте отправить сообщение ещё раз._';
+        fullText = chatFailureText('cliFatal', userLanguage, { storeBuild });
       }
       if (final) {
         // Quality-телеметрия: пустой ответ / англ-утечка / объём — для агрегатов
@@ -2256,7 +2259,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // If empty on final: don't pollute history with a stub AI row; save user message + a brief retry-hint.
       // (Frontend will reload history; user can simply resend.)
       const aiText = fullText
-        || (final && !selfHealSkippedForTakeover ? '_Ответ не пришёл. Попробуйте отправить сообщение ещё раз._' : '');
+        || (final && !selfHealSkippedForTakeover ? chatFailureText('noReply', userLanguage) : '');
       if (!aiText) return; // skip empty intermediate persists
       // ЭТО реальная точка списания (ниже addTokenTask). Логируем только здесь:
       // путь показа считает то же самое, дублировать в лог незачем.
@@ -2935,7 +2938,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
         this.logger.warn(`product action attach failed in catch: ${e.message}`);
       }
       // Try to write error to response; safeWrite is a no-op if client gone.
-      const errText = 'Ошибка запуска агента. Попробуйте ещё раз.';
+      const errText = chatFailureText('startFailed', userLanguage);
       safeWrite({ type: 'item', content: errText });
       safeWrite({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } });
       if (!clientDisconnected) {
@@ -3668,6 +3671,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // «Чистый лист»: ход с файлом обязан лечь в ту же историю, что и текстовый,
     // иначе в fresh-чате его видно не будет, а всплывёт он в основном.
     sessionIdOverride?: string;
+    /** Язык и сборка — для текста сбоя CLI на языке человека. */
+    userLanguage?: string;
+    storeBuild?: boolean;
   }): Promise<number> {
     let text = p.assistantMsg;
     let turnFailed = p.turnFailed === true;
@@ -3680,7 +3686,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       this.logger.error(`CLI-отказ долетел как ответ на загрузку (${p.userId}_${p.assistantId}): ${text.slice(0, 120)}`);
       turnFailed = true;
       failReason = failReason || 'cli_fatal_text';
-      text = '_Не получилось: временный сбой на стороне платформы. Токены за этот ход не списаны — попробуйте отправить сообщение ещё раз._';
+      text = chatFailureText('cliFatal', p.userLanguage, { storeBuild: p.storeBuild });
     }
 
     const charge = this.computeSdkCharge(p.usage, p.costUsd, text, p.turnCostUsd ?? null);

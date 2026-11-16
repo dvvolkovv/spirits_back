@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../../common/services/pg.service';
 import { excludedUsers, TEST_USER_PATTERN } from '../../common/test-users';
 import { throwIfAborted } from '../../common/abort';
+import { allChatFailureTexts } from '../../chat/chat-failure-texts';
 
 /**
  * Sales funnel — see monitoring.functions.md §3.8.
@@ -84,12 +85,15 @@ export class FunnelService {
   // ответы, но события не писались → воронка их теряла. В истории нет source,
   // поэтому при ВЫБРАННОМ source остаёмся на событийном пути (как раньше);
   // без source (общая воронка) — объединяем с историей. excludeStubs убирает
-  // заглушки-ошибки ("Ответ не пришёл"/"Ошибка запуска") из счёта ai-ответов.
+  // заглушки-ошибки ("Ответ не пришёл"/"Ошибка запуска") и все тексты
+  // chat-failure-texts.ts из счёта ai-ответов.
   private chatBackedStep(eventName: string, senderType: 'human' | 'ai', excludeStubs: boolean): StepDef['query'] {
     return (from, to, source, excluded) => {
       if (source) return this.userStep(eventName)(from, to, source, excluded);
+      // Заглушки сбоев на всех языках (chat-failure-texts.ts) — точным
+      // совпадением; ILIKE остаются для строк, записанных до 16.11.2026.
       const stubFilter = excludeStubs
-        ? `AND content NOT ILIKE '%Ответ не пришёл%' AND content NOT ILIKE 'Ошибка запуска%'`
+        ? `AND content NOT ILIKE '%Ответ не пришёл%' AND content NOT ILIKE 'Ошибка запуска%' AND content <> ALL($6::text[])`
         : '';
       return {
         sql: `
@@ -104,7 +108,9 @@ export class FunnelService {
           ) u
           WHERE user_id IS NOT NULL AND user_id <> ''
           GROUP BY user_id`,
-        params: [eventName, from, to, excluded, senderType],
+        params: excludeStubs
+          ? [eventName, from, to, excluded, senderType, allChatFailureTexts()]
+          : [eventName, from, to, excluded, senderType],
       };
     };
   }

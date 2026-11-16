@@ -26,6 +26,7 @@ import { stripProductActionBlocks } from '../products/product-action-tail';
 import { UserLlmProviderService } from '../common/services/user-llm-provider.service';
 import { relayProviderFields, resolveAnswerProvider } from './answer-provider';
 import { ChatUploadsService, ChatUploadRecord } from './chat-uploads/chat-uploads.service';
+import { chatFailureText } from './chat-failure-texts';
 
 // Потолок загрузки и зачем он именно такой — в upload-limits.ts, вместе с
 // самой константой (менять его можно только вместе с ОБОИМИ nginx).
@@ -643,7 +644,7 @@ export class ChatController {
           : this.chatService.computeUploadCharge(agentUsage, agentCostUsd, fullText, agentTurnCost.usd).tokens;
         safeWrite({ type: 'end', content: fullText, usage: { input: 0, output: shown, total: shown } });
       } else if (upstreamError) {
-        const errText = 'Ошибка обработки файла. Попробуйте ещё раз.';
+        const errText = chatFailureText('fileFailed', handoff.userLanguage);
         safeWrite({ type: 'item', content: errText });
         safeWrite({ type: 'end', content: errText, usage: { input: 0, output: 0, total: 0 } });
       }
@@ -684,6 +685,8 @@ export class ChatController {
               turnFailed,
               failReason,
               sessionIdOverride: freshSessionId,
+              userLanguage: handoff.userLanguage,
+              storeBuild,
             });
             // Обогащаем профиль (Neo4j) на основе явных самораскрытий/согласий пользователя.
             // Файловые загрузки раньше не вызывали consolidate — теперь учитываются.
