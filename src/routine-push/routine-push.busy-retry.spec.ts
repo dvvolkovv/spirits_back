@@ -1,5 +1,6 @@
 import { RoutinePushService } from './routine-push.service';
 import { RelaySessionBusyError } from '../chat/chat.service';
+import { RelayDrainingError } from '../chat/relay-drain-retry';
 
 /**
  * Рутина не пре-эмптит ход человека. Busy/preempted освобождают только свой
@@ -257,5 +258,29 @@ describe('рутина при занятой сессии человека', () 
     expect(push.sendPush).not.toHaveBeenCalled();
     expect(store.releaseToday).not.toHaveBeenCalled();
     expect((svc as any).retryTimers.size).toBe(0);
+  });
+
+  it('релей обновляется дольше бюджета — как busy: retry без history', async () => {
+    const chat = jest.fn(async () => { throw new RelayDrainingError(false, 9); });
+    const { svc, store } = makeService(chat);
+
+    await expect((svc as any).deliver('u-1', '12', 'напомни', 't', 'r-1'))
+      .resolves.toEqual({ delivered: 0, draining: true });
+    expect(store.releaseToday).not.toHaveBeenCalled();
+    expect((svc as any).retryTimers.size).toBe(1);
+    expect((svc as any).pg.query.mock.calls.filter((c: any[]) => /INSERT INTO custom_chat_history/.test(c[0]))).toEqual([]);
+  });
+
+  it('runDue: релей обновляется — claim освобождается с исходным prev', async () => {
+    const chat = jest.fn(async () => { throw new RelayDrainingError(false, 9); });
+    const previous = new Date('2026-11-04T00:00:00Z');
+    const { svc, store } = makeService(chat, {
+      listEnabled: jest.fn(async () => [dueRow({ last_sent_date: previous })]),
+    });
+
+    await svc.runDue();
+
+    expect(store.claimToday).toHaveBeenCalledWith('r-1', '2026-11-05', 'u-1');
+    expect(store.releaseToday).toHaveBeenCalledWith('r-1', '2026-11-05', '2026-11-04');
   });
 });

@@ -1,6 +1,7 @@
 import { computeCopilotState, mergeEvents, TripService } from './trip.service';
 import { buildMorningFacts, factsHash } from './day-framing';
 import { RelaySessionBusyError } from '../chat/chat.service';
+import { RelayDrainingError } from '../chat/relay-drain-retry';
 
 const now = new Date('2026-07-19T10:00:00+05:00');
 const task = (uid: string, title: string, due?: string, done = false) => ({ uid, title, due, done, source: 'yandex' });
@@ -330,6 +331,23 @@ describe('computeCopilotState', () => {
       const message = logger.log.mock.calls[0][0];
       expect(message).not.toContain('u1');
       expect(message).not.toContain('failed');
+    });
+
+    it('релей обновляется — фрейминг откладывается, как при занятой сессии', async () => {
+      const store = { get: jest.fn().mockResolvedValue(null), upsert: jest.fn() };
+      const chat = { generateAgentReply: jest.fn().mockRejectedValue(new RelayDrainingError(false, 9)) };
+      const svc = makeTripService({ dayFramingStore: store, chat });
+      const logger = { log: jest.fn(), warn: jest.fn() };
+      (svc as any).logger = logger;
+
+      await expect(
+        svc.generateFramingAsync('u1', 'morning', [], [], new Date('2026-08-06T02:30:00Z')),
+      ).resolves.toBeUndefined();
+
+      expect(store.upsert).not.toHaveBeenCalled();
+      expect(logger.warn).not.toHaveBeenCalled();
+      expect(logger.log).toHaveBeenCalledWith('day-framing отложен: релей обновляется (morning)');
+      expect(logger.log.mock.calls[0][0]).not.toContain('u1');
     });
 
     it('best-effort: ошибка LLM не throw-ится наружу и логируется без userId', async () => {
