@@ -105,4 +105,75 @@ export class MeetingWebhookInboxStore implements OnModuleInit {
     this.logger.debug(`meet webhook inbox ${result}: callId=${input.callId} trigger=${input.trigger}`);
     return result;
   }
+
+  async claimBatch(limit = 20): Promise<ClaimedInboxEvent[]> {
+    const r = await this.pg.query(
+      `WITH candidates AS (
+         SELECT id, (status = 'processing') AS recovered
+           FROM meeting_webhook_events
+          WHERE (status = 'pending' AND next_retry_at <= now())
+             OR (status = 'processing' AND updated_at < now() - interval '60 seconds')
+          ORDER BY next_retry_at, created_at, id
+          FOR UPDATE SKIP LOCKED
+          LIMIT $1
+       )
+       UPDATE meeting_webhook_events AS e
+          SET status = 'processing', attempts = e.attempts + 1, updated_at = now()
+         FROM candidates
+        WHERE e.id = candidates.id
+        RETURNING e.id, e.call_id AS "callId", e.trigger, e.message, e.attempts,
+                  candidates.recovered`,
+      [limit],
+    );
+    return r.rows;
+  }
+
+  async markDelivered(id: string): Promise<void> {
+    await this.pg.query(
+      `UPDATE meeting_webhook_events
+          SET status = 'delivered', delivered_at = now(), updated_at = now(), last_error = NULL
+        WHERE id = $1 AND status = 'processing'`,
+      [id],
+    );
+  }
+
+  async markDiscarded(id: string, reason: string): Promise<void> {
+    await this.pg.query(
+      `UPDATE meeting_webhook_events
+          SET status = 'discarded', last_error = left($2, 500), updated_at = now()
+        WHERE id = $1 AND status = 'processing'`,
+      [id, reason],
+    );
+  }
+
+  async markFailed(
+    id: string,
+    attempts: number,
+    error: string,
+    nextRetryAt: Date,
+  ): Promise<'pending' | 'dead'> {
+    const status = attempts >= 10 ? 'dead' : 'pending';
+    await this.pg.query(
+      `UPDATE meeting_webhook_events
+          SET status = $2, last_error = left($3, 500), next_retry_at = $4::timestamptz, updated_at = now()
+        WHERE id = $1 AND status = 'processing'`,
+      [id, status, error, nextRetryAt.toISOString()],
+    );
+    return status;
+  }
+
+  async cleanup(): Promise<{ completed: number; dead: number }> {
+    const completed = await this.pg.query(
+      `DELETE FROM meeting_webhook_events
+        WHERE status IN ('delivered', 'discarded')
+          AND updated_at < now() - interval '24 hours'
+        RETURNING id`,
+    );
+    const dead = await this.pg.query(
+      `DELETE FROM meeting_webhook_events
+        WHERE status = 'dead' AND updated_at < now() - interval '7 days'
+        RETURNING id`,
+    );
+    return { completed: completed.rows.length, dead: dead.rows.length };
+  }
 }
