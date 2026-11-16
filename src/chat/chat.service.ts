@@ -3409,29 +3409,33 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const baseRelaySid = sessionIdOverride || relaySessionKey(userId, assistantId, userLanguage);
     const relaySid = relaySessionForProfiling(baseRelaySid, dispatchProfilingAllowed);
 
-    const FormData = require('form-data');
-    const fd = new FormData();
     const outboundPrompt = opts.testMode === true ? neutralizeAtMentions(prompt) : prompt;
     const outboundStablePrefix = opts.testMode === true
       ? neutralizeAtMentions(dispatchStablePrefix)
       : dispatchStablePrefix;
-    fd.append('message', outboundPrompt);
-    if (outboundStablePrefix) fd.append('systemPrompt', outboundStablePrefix);
-    fd.append('sessionId', relaySid);
-    for (const [k, v] of Object.entries(relayProviderFields(false, route.provider))) fd.append(k, v);
-    if (opts.testMode === true) fd.append('testMode', 'true');
-    // Инструменты Linkeon — только когда вызывающий явно сказал linkeonTools:
-    // true (см. AgentReplyOpts); по умолчанию — нет.
-    //
-    // fs_key — не инструмент, а имя папки хода, и уходит всегда (спека
-    // 2026-11-02-pii-out-of-prompts-design.md, п. 3): без него релей называет
-    // папку по ключу сессии — у проверки версии ассистента это base64 с
-    // номером админа, — и путь к ней попадает в реплику модели.
-    if (opts.linkeonTools === true) appendLinkeonFields(fd, linkeonRelayFields(userId, relaySid));
-    else {
-      const fsKey = relayFsKey(relaySid);
-      if (fsKey) fd.append('fs_key', fsKey);
-    }
+    const FormData = require('form-data');
+    // Форма multipart — поток: на каждый повтор под шлагбаумом — новая.
+    const buildForm = () => {
+      const fd = new FormData();
+      fd.append('message', outboundPrompt);
+      if (outboundStablePrefix) fd.append('systemPrompt', outboundStablePrefix);
+      fd.append('sessionId', relaySid);
+      for (const [k, v] of Object.entries(relayProviderFields(false, route.provider))) fd.append(k, v);
+      if (opts.testMode === true) fd.append('testMode', 'true');
+      // Инструменты Linkeon — только когда вызывающий явно сказал linkeonTools:
+      // true (см. AgentReplyOpts); по умолчанию — нет.
+      //
+      // fs_key — не инструмент, а имя папки хода, и уходит всегда (спека
+      // 2026-11-02-pii-out-of-prompts-design.md, п. 3): без него релей называет
+      // папку по ключу сессии — у проверки версии ассистента это base64 с
+      // номером админа, — и путь к ней попадает в реплику модели.
+      if (opts.linkeonTools === true) appendLinkeonFields(fd, linkeonRelayFields(userId, relaySid));
+      else {
+        const fsKey = relayFsKey(relaySid);
+        if (fsKey) fd.append('fs_key', fsKey);
+      }
+      return fd;
+    };
     const chunks: string[] = [];
     const usage: SdkUsageTotals = {
       input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, webSearch: 0, webFetch: 0,
@@ -3457,12 +3461,24 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const relayMark = this.beginRelayRun(relaySid);
     this.beginStream();
     try {
-    const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
-      headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
-      responseType: 'stream',
-      timeout: 300000,
-      maxRedirects: 0,
-    });
+    // Фоновый ход ждёт релей за шлагбаумом выката, как и ход человека, но без
+    // carry: его промпт человек не писал. Если человек написал, пока фоновый
+    // ход ждал, — уступаем, как при занятой сессии (routine-push отложит).
+    let resp: any;
+    try {
+      resp = await this.postRelayTurn(relaySid, relayMark, null, () => {
+        const fd = buildForm();
+        return axios.post(`${AGENT_URL}/chat`, fd, {
+          headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
+          responseType: 'stream',
+          timeout: 300000,
+          maxRedirects: 0,
+        });
+      });
+    } catch (e) {
+      if (e instanceof RelayDrainingError && e.superseded) throw new RelaySessionBusyError(relaySid);
+      throw e;
+    }
     await new Promise<void>((resolve, reject) => {
       let buffer = '';
       resp.data.on('data', (chunk: Buffer) => {
