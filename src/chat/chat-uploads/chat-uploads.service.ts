@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -6,6 +6,11 @@ import { Readable } from 'stream';
 import { PgService } from '../../common/services/pg.service';
 import { StorageService } from '../../common/services/storage.service';
 import { safeFileName } from '../chat-files/file-meta';
+// Value-импорт, не `import type`: тип стёр бы design:paramtypes, и Nest не
+// внедрил бы LanguageService (пин — chat-uploads.delete.spec.ts).
+import { LanguageService } from '../../common/services/language.service';
+import { deletedUploadLine } from './deleted-line';
+import { uploadHistoryLink } from './markdown-name';
 import {
   UPLOAD_THUMB_CALL_BUDGET_MS,
   UPLOAD_THUMB_QUEUE_WAIT_MS,
@@ -55,10 +60,31 @@ export interface ChatUploadDownload {
   sizeBytes: number;
 }
 
+/**
+ * Удаление загрузки владельцем не дошло до конца: MinIO не подтвердил
+ * удаление объекта (любой исход, кроме 'deleted'/'absent'). Строка реестра и
+ * история не тронуты, повтор безопасен; контроллер отвечает 502. Сообщение
+ * без имени файла и ключей — их нельзя в логи и ответы.
+ */
+export class ChatUploadDeleteError extends Error {
+  constructor(message = 'chat upload storage delete failed') {
+    super(message);
+    this.name = 'ChatUploadDeleteError';
+  }
+}
+
 /** Приватный бакет исходников; экспортирован для адаптера удаления аккаунта. */
 export const CHAT_UPLOADS_BUCKET = 'linkeon-chat-uploads';
 const BUCKET = CHAT_UPLOADS_BUCKET;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/**
+ * Строка 📎 удалённого файла в истории сессии → «📎 имя — файл удалён».
+ * Фильтр — strpos, а не LIKE: в $2 имя экранировано markdownEscapeName
+ * (\, \[, \]), а в LIKE обратная косая — escape-символ, и строка с такими
+ * именами не находилась бы. replace() сравнивает буквально.
+ */
+const HISTORY_REWRITE_SQL =
+  'UPDATE custom_chat_history SET content = replace(content, $2, $3) WHERE session_id = $1 AND strpos(content, $2) > 0';
 const COLUMNS =
   'id, user_id, session_id, original_name, mime, size_bytes, sha256, storage_key, created_at, '
   + 'source, thumb_key, note, note_updated_at, note_assistant_id';
@@ -81,6 +107,11 @@ export class ChatUploadsService {
   constructor(
     private readonly pg: PgService,
     private readonly storage: StorageService,
+    // Язык профиля для строки «файл удалён» (deleteForOwner). @Optional — чтобы
+    // спеки, создающие сервис двумя аргументами, не менялись; без сервиса
+    // строка пишется по-русски. В реальном графе LanguageService есть всегда
+    // (CommonModule) — пин в chat-uploads.di.spec.ts.
+    @Optional() private readonly language?: LanguageService,
   ) {}
 
   /**
@@ -314,6 +345,90 @@ export class ChatUploadsService {
       }
       throw new NotFoundException('Upload not found');
     }
+  }
+
+  /**
+   * Миниатюра для панели кабинета — только владельцу (подписи ассистента тут
+   * нет: превью нужно человеку, а не модели). Отдаётся только по thumb_key.
+   * Любой сбой — не владелец, нет записи или thumb_key, объекта нет, MinIO
+   * упал — единый 404 без раскрытия, как в openDownload. Миниатюра — webp с
+   * длинной стороной до 480 px, десятки КБ: читаем целиком, чтобы знать
+   * Content-Length (у потока GetObject его нет).
+   */
+  async openThumb(input: { id: string; userId: string }): Promise<ChatUploadDownload> {
+    try {
+      const record = await this.loadOwned(input);
+      if (!record.thumbKey) throw new NotFoundException('Upload not found');
+      const bytes = await this.storage.download({ bucket: BUCKET, key: record.thumbKey });
+      return {
+        body: Readable.from([bytes]),
+        originalName: record.originalName,
+        mime: 'image/webp',
+        sizeBytes: bytes.length,
+      };
+    } catch (e: any) {
+      const id = String(input.id).slice(0, 64);
+      if (e instanceof NotFoundException) {
+        this.logger.debug(`openThumb: not found (id=${id})`);
+      } else {
+        this.logger.error(`openThumb: internal failure (id=${id}): ${this.errDetail(e)}`);
+      }
+      throw new NotFoundException('Upload not found');
+    }
+  }
+
+  /**
+   * Удаление загрузки самим пользователем (спека 2026-11-16, раздел 1).
+   * Порядок:
+   *  1. объекты MinIO — миниатюры, затем оригинал (deleteConfirmed: 'deleted'
+   *     и 'absent' — успех). Миниатюра стирается и по thumb_key, и по
+   *     вычисляемому thumbs/<storage_key>.webp: неоднозначно оборвавшаяся
+   *     загрузка миниатюры при сохранении могла оставить объект при
+   *     thumb_key = NULL. Миниатюры первыми: если оригинал не удалится,
+   *     строка останется с рабочим файлом, а пропадёт только превью;
+   *  2. строка реестра (вместе с ней уходит и комментарий ассистента);
+   *  3. строка 📎 в истории сессии → «📎 имя — файл удалён» на языке профиля.
+   * Чужой/несуществующий id — NotFoundException (404 без раскрытия). Любой
+   * иной исход MinIO — ChatUploadDeleteError: строка и история целы, повтор
+   * безопасен. Сбой шага 3 удаление не проваливает — файл уже стёрт, повтор
+   * дал бы 404; остаётся лог.
+   */
+  async deleteForOwner(input: { id: string; userId: string }): Promise<void> {
+    const record = await this.loadOwned(input);
+
+    const thumbKeys = [...new Set([record.thumbKey, uploadThumbKey(record.storageKey)].filter(Boolean))];
+    for (const key of [...thumbKeys, record.storageKey]) {
+      try {
+        await this.storage.deleteConfirmed({ bucket: BUCKET, key });
+      } catch (e: any) {
+        this.logger.error(`deleteForOwner: storage delete failed (id=${record.id}): ${this.errDetail(e)}`);
+        throw new ChatUploadDeleteError();
+      }
+    }
+
+    await this.pg.query('DELETE FROM chat_uploads WHERE id = $1 AND user_id = $2', [record.id, input.userId]);
+
+    try {
+      const lang = this.language ? await this.language.resolveUserLanguage(input.userId) : null;
+      await this.pg.query(HISTORY_REWRITE_SQL, [
+        record.sessionId,
+        // Посимвольно та строка, что пишет upload-and-chat (chat.controller.ts).
+        uploadHistoryLink(record.originalName, this.ownerUrl(record.id)),
+        deletedUploadLine(record.originalName, lang),
+      ]);
+    } catch (e: any) {
+      this.logger.error(`deleteForOwner: history rewrite failed (id=${record.id}): ${this.errDetail(e)}`);
+    }
+  }
+
+  /** Запись владельца или NotFoundException; не-UUID отсекается до запроса (иначе PG упал бы на приведении). */
+  private async loadOwned(input: { id: string; userId: string }): Promise<ChatUploadRecord> {
+    if (!input.userId || !UUID_RE.test(input.id)) throw new NotFoundException('Upload not found');
+    const { rows } = await this.pg.query(
+      `SELECT ${COLUMNS} FROM chat_uploads WHERE id = $1 AND user_id = $2`,
+      [input.id, input.userId],
+    );
+    return this.row(rows[0]);
   }
 
   async recentForSession(
