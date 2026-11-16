@@ -142,6 +142,13 @@ maybe('MeetingWebhookInboxStore PostgreSQL', () => {
     const [claimed] = await store.claimBatch();
     const retryAt = new Date(Date.now() + 1000);
     expect(await store.markFailed(claimed.id, claimed.attempts, 'temporary', retryAt)).toBe('pending');
+    const persisted = await pool.query(
+      `SELECT status, next_retry_at, last_error FROM meeting_webhook_events WHERE id = $1`,
+      [claimed.id],
+    );
+    expect(persisted.rows[0].status).toBe('pending');
+    expect(persisted.rows[0].next_retry_at.toISOString()).toBe(retryAt.toISOString());
+    expect(persisted.rows[0].last_error).toBe('temporary');
     expect(await store.claimBatch()).toHaveLength(0);
 
     await pool.query(
@@ -171,21 +178,97 @@ maybe('MeetingWebhookInboxStore PostgreSQL', () => {
   });
 
   it('retention удаляет только завершённые записи нужного возраста', async () => {
-    for (const status of ['delivered', 'discarded', 'dead', 'pending', 'processing']) {
-      await store.enqueue(event({ idempotencyKey: `retention-${status}` }));
+    const rows: Array<[string, string, string]> = [
+      ['delivered', '25 hours', 'old-delivered'],
+      ['discarded', '25 hours', 'old-discarded'],
+      ['dead', '8 days', 'old-dead'],
+      ['pending', '25 hours', 'old-pending'],
+      ['processing', '25 hours', 'old-processing'],
+      ['delivered', '23 hours', 'fresh-delivered'],
+      ['discarded', '23 hours', 'fresh-discarded'],
+      ['dead', '6 days', 'fresh-dead'],
+    ];
+    for (const [status, age, key] of rows) {
+      await store.enqueue(event({ idempotencyKey: key }));
       await pool.query(
         `UPDATE meeting_webhook_events
-            SET status = $1,
-                updated_at = CASE WHEN $1 = 'dead' THEN now() - interval '8 days'
-                                  ELSE now() - interval '25 hours' END
-          WHERE idempotency_key = $2`,
-        [status, `retention-${status}`],
+            SET status = $1, updated_at = now() - $2::interval
+          WHERE idempotency_key = $3`,
+        [status, age, key],
       );
     }
-    await store.cleanup();
+    expect(await store.cleanup()).toEqual({ completed: 2, dead: 1 });
     const r = await pool.query(
       `SELECT idempotency_key FROM meeting_webhook_events ORDER BY idempotency_key`,
     );
-    expect(r.rows.map((x) => x.idempotency_key)).toEqual(['retention-pending', 'retention-processing']);
+    expect(r.rows.map((x) => x.idempotency_key)).toEqual([
+      'fresh-dead',
+      'fresh-delivered',
+      'fresh-discarded',
+      'old-pending',
+      'old-processing',
+    ]);
+  });
+
+  it('finish-методы меняют только processing и не перезаписывают терминальные состояния', async () => {
+    const ids: Record<string, string> = {};
+    for (const status of ['pending', 'delivered', 'discarded']) {
+      await store.enqueue(event({ idempotencyKey: `guard-${status}` }));
+      const r = await pool.query(
+        `UPDATE meeting_webhook_events
+            SET status = $1,
+                last_error = CASE WHEN $1 = 'discarded' THEN 'original' ELSE NULL END,
+                delivered_at = CASE WHEN $1 = 'delivered' THEN now() ELSE NULL END,
+                updated_at = now() - interval '5 seconds'
+          WHERE idempotency_key = $2
+          RETURNING id`,
+        [status, `guard-${status}`],
+      );
+      ids[status] = r.rows[0].id;
+      expect(typeof ids[status]).toBe('string');
+    }
+    const snapshot = async () =>
+      (await pool.query(
+        `SELECT id::text AS id, status, attempts, last_error, next_retry_at, delivered_at, updated_at
+           FROM meeting_webhook_events ORDER BY id`,
+      )).rows;
+    const before = await snapshot();
+    const retryAt = new Date(Date.now() + 60_000);
+    for (const id of Object.values(ids)) {
+      await store.markDelivered(id);
+      await store.markDiscarded(id, 'late discard');
+      await store.markFailed(id, 1, 'late failure', retryAt);
+      await store.markFailed(id, 10, 'late dead', retryAt);
+    }
+    expect(await snapshot()).toEqual(before);
+  });
+
+  it('ошибки обрезаются до 500 символов, delivered очищает last_error', async () => {
+    const lastError = async () =>
+      (await pool.query(`SELECT status, last_error FROM meeting_webhook_events`)).rows[0];
+    const makeDue = () =>
+      pool.query(`UPDATE meeting_webhook_events SET next_retry_at = now() - interval '1 second'`);
+
+    await store.enqueue(event());
+    const [c1] = await store.claimBatch();
+    await store.markFailed(c1.id, c1.attempts, 'f'.repeat(600), new Date(Date.now() - 1000));
+    let row = await lastError();
+    expect(row.status).toBe('pending');
+    expect(row.last_error).toBe('f'.repeat(500));
+
+    await makeDue();
+    const [c2] = await store.claimBatch();
+    await store.markDelivered(c2.id);
+    row = await lastError();
+    expect(row.status).toBe('delivered');
+    expect(row.last_error).toBeNull();
+
+    await pool.query('DELETE FROM meeting_webhook_events');
+    await store.enqueue(event({ idempotencyKey: 'trunc-discard' }));
+    const [c3] = await store.claimBatch();
+    await store.markDiscarded(c3.id, 'd'.repeat(600));
+    row = await lastError();
+    expect(row.status).toBe('discarded');
+    expect(row.last_error).toBe('d'.repeat(500));
   });
 });
