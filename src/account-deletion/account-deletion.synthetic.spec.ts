@@ -72,6 +72,27 @@ describe('checkSyntheticGates — тройной гейт до любой зап
       .toThrow(SyntheticGateError);
   });
 
+  it('FQDN тест-ноды ugliest-salmon.ptr.network при полной тройке — пропускает', () => {
+    // os.hostname() на тест-ноде отдаёт FQDN, а не короткое имя.
+    expect(() => checkSyntheticGates({ ...full, hostname: 'ugliest-salmon.ptr.network' }))
+      .not.toThrow();
+  });
+
+  // Двойники разрешённых имён — страховка от префиксной, регистронезависимой
+  // и нормализующей реализации: allow-list сравнивается строго на равенство.
+  const hostnameDoubles = [
+    'ugliest-salmon.evil.example',
+    'ugliest-salmon-2',
+    'UGLIEST-SALMON',
+    'ugliest-salmon.ptr.network.',
+    '',
+  ];
+
+  it.each(hostnameDoubles)('двойник hostname %p → SyntheticGateError', (name) => {
+    expect(() => checkSyntheticGates({ ...full, hostname: name }))
+      .toThrow(SyntheticGateError);
+  });
+
   it('константы гейтов и префикс — без дрейфа', () => {
     expect(SYNTHETIC_GATE_ENV).toBe('ACCOUNT_DELETION_SYNTHETIC_ENV');
     expect(SYNTHETIC_GATE_ENV_VALUE).toBe('test.linkeon.io');
