@@ -4,6 +4,13 @@ const { IdentityService } = require('../../dist/identity/identity.service');
 // на выделенный клиент ровно такими строками.
 const TX_CONTROL = new Set(['BEGIN', 'COMMIT', 'ROLLBACK']);
 
+// Синтетический номер (диапазон 7999…, как в соседних спеках). Смысла
+// сверх «какой-то телефон» не несёт: makePg — сценарий ответов, ни isadmin,
+// ни другие свойства аккаунта по номеру тут не проверяются.
+const PHONE = '79990000001';
+// Тот же номер так, как его вводит человек: с +, скобками, пробелами, дефисами.
+const PHONE_TYPED = `+${PHONE[0]} (${PHONE.slice(1, 4)}) ${PHONE.slice(4, 7)}-${PHONE.slice(7, 9)}-${PHONE.slice(9)}`;
+
 /**
  * Фейк PgService со сценарием ответов.
  *
@@ -47,7 +54,7 @@ describe('IdentityService.resolveOrCreate', () => {
       { rows: [], rowCount: 1 },       // UPDATE last_used_at
     ]);
     const svc = new IdentityService(pg);
-    const out = await svc.resolveOrCreate('phone', { phone: '79030169187' });
+    const out = await svc.resolveOrCreate('phone', { phone: PHONE });
     expect(out).toEqual({ status: 'ok', userId: 'u1', isNew: false, mergedExisting: false });
     expect(pg.left).toBe(0);
   });
@@ -56,7 +63,7 @@ describe('IdentityService.resolveOrCreate', () => {
     const pg = makePg([
       { rows: [] },                                             // lookup user_identities — связки нет
       // шаг 3 — inTransaction: дальше tx.query клиента из getClient()
-      { rows: [{ internal_id: '79030169187' }], rowCount: 1 }, // INSERT user_id … ON CONFLICT DO NOTHING
+      { rows: [{ internal_id: PHONE }], rowCount: 1 },          // INSERT user_id … ON CONFLICT DO NOTHING
       { rows: [{ deletion_id: null }] },                        // SELECT deletion_id … FOR UPDATE (reactivateIfNeeded)
       { rows: [], rowCount: 0 },                                // UPDATE user_id SET state = 'active' (reactivateIfNeeded) — строка уже active
       { rows: [], rowCount: 1 },                                // INSERT ai_profiles_consolidated (ensureProfileRow)
@@ -66,9 +73,9 @@ describe('IdentityService.resolveOrCreate', () => {
       { rows: [{ add_user_tokens: {} }], rowCount: 1 },         // SELECT add_user_tokens (issueWelcomeBonus) — результат не читается
     ]);
     const svc = new IdentityService(pg);
-    const out = await svc.resolveOrCreate('phone', { phone: '79030169187' });
+    const out = await svc.resolveOrCreate('phone', { phone: PHONE });
     expect(out.isNew).toBe(true);
-    expect(out.userId).toBe('79030169187');
+    expect(out.userId).toBe(PHONE);
     expect(out.mergedExisting).toBe(false);
     const txSql = pg.tx.query.mock.calls.map(([sql]) => sql);
     expect(txSql[0]).toBe('BEGIN');
@@ -83,7 +90,7 @@ describe('IdentityService.resolveOrCreate', () => {
     expect(journalAt).toBeGreaterThan(0);
     expect(creditAt).toBeGreaterThan(journalAt);
     expect(pg.tx.query.mock.calls[journalAt][1])
-      .toEqual(expect.arrayContaining(['79030169187', 'Приветственный бонус']));
+      .toEqual(expect.arrayContaining([PHONE, 'Приветственный бонус']));
     expect(pg.left).toBe(0);
   });
 
@@ -107,9 +114,9 @@ describe('IdentityService.resolveOrCreate', () => {
       { rows: [], rowCount: 1 },       // UPDATE last_used_at
     ]);
     const svc = new IdentityService(pg);
-    await svc.resolveOrCreate('phone', { phone: '+7 (903) 016-91-87' });
+    await svc.resolveOrCreate('phone', { phone: PHONE_TYPED });
     const lookupParams = pg.query.mock.calls[0][1];
-    expect(lookupParams).toContain('79030169187');
+    expect(lookupParams).toContain(PHONE);
     expect(pg.left).toBe(0);
   });
 });
