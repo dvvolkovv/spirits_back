@@ -26,9 +26,10 @@ import { stripProductActionBlocks } from '../products/product-action-tail';
 import { UserLlmProviderService } from '../common/services/user-llm-provider.service';
 import { relayProviderFields, resolveAnswerProvider } from './answer-provider';
 import { ChatUploadsService, ChatUploadRecord } from './chat-uploads/chat-uploads.service';
-// Экранирование имени в строке истории `📎 [имя](url)` — общее с удалением
-// загрузки (deleteForOwner ищет ровно эту строку), поэтому в отдельном модуле.
-import { markdownEscapeName } from './chat-uploads/markdown-name';
+// Строка истории `📎 [имя](url)` (шаблон и экранирование имени) — общая с
+// удалением загрузки (deleteForOwner ищет ровно эту строку), поэтому в
+// отдельном модуле.
+import { uploadHistoryLink } from './chat-uploads/markdown-name';
 
 // Потолок загрузки и зачем он именно такой — в upload-limits.ts, вместе с
 // самой константой (менять его можно только вместе с ОБОИМИ nginx).
@@ -407,8 +408,8 @@ export class ChatController {
     // скачивание (JWT владельца), несохранённые — прежним именем. При
     // выключенной фиче или пустом saved совпадает с прежней `📎 имена\nсообщение`
     // посимвольно (historyMerge.ts сверяет строки истории).
-    const uploadLinks = savedUploads.map(
-      (r) => `📎 [${markdownEscapeName(r.originalName)}](${this.chatUploads!.ownerUrl(r.id)})`,
+    const uploadLinks = savedUploads.map((r) =>
+      uploadHistoryLink(r.originalName, this.chatUploads!.ownerUrl(r.id)),
     );
     const failedUploadNames = files
       .filter((f: any) => !savedUploads.some((r) => r.originalName === f.originalname))
