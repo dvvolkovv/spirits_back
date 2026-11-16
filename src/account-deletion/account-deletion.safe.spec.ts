@@ -1,5 +1,6 @@
 import { createHash } from 'crypto';
 import {
+  ACCOUNT_DELETION_REDIS_TIMEOUT_MS,
   ACCOUNT_DELETION_RETENTION_DAYS,
   ACCOUNT_DELETION_RETENTION_MS,
   ACCOUNT_DELETION_WORKER_DEFAULT_ENABLED,
@@ -14,6 +15,7 @@ import {
   deletionResourceHash,
   retryDelayMs,
   safeDeletionMessage,
+  withDeletionTimeout,
 } from './account-deletion.safe';
 import type {
   AccountDeletionAdapter,
@@ -1063,5 +1065,74 @@ describe('account deletion exact userId payload regressions', () => {
   it('отклоняет persistent job с allowlisted property, равным короткому userId', () => {
     expect(() => assertSafeJobSpec(job({ id: 'technical' }), 'id'))
       .toThrow(/^unsafe_payload$/);
+  });
+});
+
+describe('withDeletionTimeout — потолок ожидания внешней операции (T17D-M1)', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('потолок Redis — 10 с: на порядки выше SCAN прода, ниже heartbeat раннера (30 с)', () => {
+    expect(ACCOUNT_DELETION_REDIS_TIMEOUT_MS).toBe(10_000);
+  });
+
+  it('успех проходит как есть, сторожевой таймер снят', async () => {
+    const value = { deleted: 3 };
+
+    await expect(withDeletionTimeout(Promise.resolve(value), 1_000)).resolves.toBe(value);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('ошибка проходит как есть (тот же объект), сторожевой таймер снят', async () => {
+    const refused = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
+    const cancelled = new DeletionCancelledError();
+    const retry = new DeletionRetryError('db');
+    for (const error of [refused, cancelled, retry]) {
+      const source = Promise.reject(error);
+      // Отдельная подписка: исходное обещание не должно считаться необработанным.
+      source.catch(() => undefined);
+
+      await expect(withDeletionTimeout(source, 1_000)).rejects.toBe(error);
+    }
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('по истечении срока — DeletionRetryError(timeout); вид — полем kind, не текстом', async () => {
+    let outcome: unknown = 'pending';
+    void withDeletionTimeout(new Promise<never>(() => undefined), 1_000).then(
+      () => { outcome = 'resolved'; },
+      (error: unknown) => { outcome = error; },
+    );
+
+    await jest.advanceTimersByTimeAsync(999);
+    expect(outcome).toBe('pending');
+    await jest.advanceTimersByTimeAsync(1);
+
+    expect(outcome).toBeInstanceOf(DeletionRetryError);
+    expect((outcome as DeletionRetryError).kind).toBe('timeout');
+    expect(deletionErrorKind(outcome)).toBe('timeout');
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('поздний исход брошенной операции игнорируется: остаётся timeout', async () => {
+    let lateReject!: (error: Error) => void;
+    const abandoned = new Promise<number>((_resolve, reject) => { lateReject = reject; });
+    let outcome: unknown = 'pending';
+    void withDeletionTimeout(abandoned, 1_000).then(
+      () => { outcome = 'resolved'; },
+      (error: unknown) => { outcome = error; },
+    );
+
+    await jest.advanceTimersByTimeAsync(1_000);
+    lateReject(new Error('late scan failure'));
+    await jest.advanceTimersByTimeAsync(0);
+
+    expect(outcome).toBeInstanceOf(DeletionRetryError);
+    expect((outcome as DeletionRetryError).kind).toBe('timeout');
   });
 });

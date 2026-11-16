@@ -454,6 +454,16 @@ export class DeletionRetryError extends Error {
   }
 }
 
+/**
+ * T17D-M1: потолок ожидания Redis в стоп-адаптерах удаления (guest-carry.stop,
+ * auth-verification.stop — deleteByPrefix). ioredis создан без commandTimeout:
+ * на полуживом TCP SCAN не завершается никогда, heartbeat продлевает lease, тик
+ * держит advisory lock — весь конвейер удаления и синхронный DELETE стоят до
+ * рестарта. 10 с — на порядки выше полного SCAN прода (8 мс) и ниже heartbeat
+ * раннера (30 с).
+ */
+export const ACCOUNT_DELETION_REDIS_TIMEOUT_MS = 10_000;
+
 export function retryDelayMs(attempts: number): number {
   return Math.min(21_600_000, 60_000 * 2 ** Math.max(attempts - 1, 0));
 }

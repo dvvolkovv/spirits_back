@@ -4,7 +4,9 @@ import { AccountDeletionModule } from '../account-deletion/account-deletion.modu
 import { AccountDeletionRegistry } from '../account-deletion/account-deletion.registry';
 import { DELETION_DISCOVERERS } from '../account-deletion/account-deletion.catalog';
 import {
+  ACCOUNT_DELETION_REDIS_TIMEOUT_MS,
   DeletionCancelledError,
+  DeletionRetryError,
   safeDeletionJobSnapshot,
 } from '../account-deletion/account-deletion.safe';
 import type {
@@ -102,12 +104,19 @@ class FakeLegacyDb {
   }
 }
 
-/** Фейковый Redis: журнал удалённых префиксов, отказ по флагам. */
+/** Фейковый Redis: журнал удалённых префиксов, отказ и зависание по флагам. */
 class FakeRedis {
   readonly deletedPrefixes: string[] = [];
+  /** Префиксы, на которых SCAN завис (полуживой TCP, T17D-M1). */
+  readonly hangingPrefixes: string[] = [];
   failNext = false;
+  hang = false;
 
   async deleteByPrefix(prefix: string): Promise<number> {
+    if (this.hang) {
+      this.hangingPrefixes.push(prefix);
+      return new Promise<number>(() => undefined);
+    }
     if (this.failNext) {
       this.failNext = false;
       throw Object.assign(new Error('connect ETIMEDOUT'), { code: 'ETIMEDOUT' });
@@ -290,6 +299,49 @@ describe('LegacyAuthAccountDeletionAdapter.execute (Task 17D)', () => {
     expect(db.queries).toHaveLength(0);
     expect(redis.deletedPrefixes).toHaveLength(0);
     expect(ctx.assertCurrent).not.toHaveBeenCalled();
+  });
+});
+
+describe('auth-verification.stop: потолок ожидания Redis (T17D-M1)', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it('зависший SCAN — DeletionRetryError(timeout) по истечении потолка, второй assertCurrent не вызван', async () => {
+    const { redis, adapter, ctx } = makeHarness();
+    redis.hang = true;
+    let outcome: unknown = 'pending';
+    void adapter.execute(stopJob(), ctx).then(
+      () => { outcome = 'resolved'; },
+      (error: unknown) => { outcome = error; },
+    );
+
+    // До срока — ждём: быстрый SCAN таймаутом не режется.
+    await jest.advanceTimersByTimeAsync(ACCOUNT_DELETION_REDIS_TIMEOUT_MS - 1);
+    expect(redis.hangingPrefixes).toEqual(['ev-sent-u-deleted-']);
+    expect(outcome).toBe('pending');
+    await jest.advanceTimersByTimeAsync(1);
+
+    expect(outcome).toBeInstanceOf(DeletionRetryError);
+    expect(outcome).toMatchObject({ kind: 'timeout' });
+    // Ошибка вылетает до второго assertCurrent: job выполненным не считается.
+    expect(ctx.assertCurrent).toHaveBeenCalledTimes(1);
+    expect(redis.deletedPrefixes).toHaveLength(0);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('быстрый SCAN — успех как раньше, сторожевой таймер снят', async () => {
+    const { redis, adapter, ctx } = makeHarness();
+
+    await expect(adapter.execute(stopJob(), ctx)).resolves.toBeUndefined();
+
+    expect(redis.deletedPrefixes).toEqual(['ev-sent-u-deleted-']);
+    expect(ctx.assertCurrent).toHaveBeenCalledTimes(2);
+    expect(jest.getTimerCount()).toBe(0);
   });
 });
 
