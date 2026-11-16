@@ -29,6 +29,7 @@ import { GraphInspector } from '@nestjs/core/inspector/graph-inspector';
 import { MetadataScanner } from '@nestjs/core/metadata-scanner';
 
 import { AccountDeletionRegistry } from '../../account-deletion/account-deletion.registry';
+import { LanguageService } from '../../common/services/language.service';
 import { StorageService } from '../../common/services/storage.service';
 import { VoiceDocumentAccountDeletionAdapter } from '../../voice-call/voice-document-account-deletion';
 import { ChatFileAccountDeletionAdapter } from '../chat-files/chat-file-account-deletion.adapter';
@@ -83,6 +84,11 @@ describe('DI-граф загрузок чата', () => {
     // Инжектировано именно StorageService, а не undefined/Object-заглушка.
     expect((adapter as { storage: unknown }).storage).toBeInstanceOf(StorageService);
     expect(find(container, ChatUploadsService)).toBeInstanceOf(ChatUploadsService);
+    // LanguageService в конструкторе — @Optional(): без этой проверки потеря
+    // провайдера прошла бы молча, и «файл удалён» всегда писался бы по-русски.
+    expect((find(container, ChatUploadsService) as { language: unknown }).language).toBeInstanceOf(
+      LanguageService,
+    );
   });
 
   // Негативный контроль: проверка не резиновая — голый модуль с одним
