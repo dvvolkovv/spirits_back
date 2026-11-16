@@ -441,7 +441,7 @@ export class IdentityService implements OnModuleInit {
    * реферальным бонусом, и реферальная запись приветственный не заменяет.
    */
   private async issueWelcomeBonus(db: SlotQueryable, userId: string): Promise<void> {
-    // В логи — user_id.id (uuid-ключ строки), а не internal_id: у телефонного
+    // В логи — user_id.id (uuid строки), а не internal_id: у телефонного
     // входа internal_id — это сам номер.
     const claimed = await db.query(
       `UPDATE user_id SET welcome_bonus_at = now()
@@ -471,7 +471,12 @@ export class IdentityService implements OnModuleInit {
     );
     if (alreadyIssued.rows.length > 0) {
       const firstAt = alreadyIssued.rows[0].first_at;
-      const first = firstAt ? new Date(firstAt).toISOString() : 'created_at NULL';
+      // toISOString() бросает RangeError на невалидной дате (node-pg отдаёт
+      // 'infinity' как Infinity), а исключение откатит транзакцию входа.
+      const firstDate = new Date(firstAt);
+      const first = firstAt == null
+        ? 'created_at NULL'
+        : Number.isFinite(firstDate.getTime()) ? firstDate.toISOString() : String(firstAt);
       this.logger.log(`welcome bonus already in journal (first ${first}) → not reissued, user_id.id=${rowId}`);
       return;
     }

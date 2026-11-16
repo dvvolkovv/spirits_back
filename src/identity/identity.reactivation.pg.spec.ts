@@ -741,8 +741,8 @@ maybe('реактивация после удаления — одна тран�
     it('(d) отметка NULL, в журнале уже есть «Приветственный бонус» — не выдаётся, отметка = самая ранняя запись', async () => {
       const PHONE = '79990000111';
       // Удалён до T20-M1: tombstone сбросил отметку, и 001_identity_init.sql
-      // её не вернул (не было рестарта или create_date NULL); поколение
-      // завершено.
+      // её не вернул — строку 57 убрали, миграция 001 на старте не прошла или
+      // create_date IS NULL (см. докблок issueWelcomeBonus); поколение завершено.
       // Бонусов в журнале два — ферма успела получить его повторно.
       await pool.query(
         `INSERT INTO user_id (internal_id, primary_phone, state, deleted_at, deletion_id, welcome_bonus_at)
