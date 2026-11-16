@@ -82,7 +82,7 @@ export class QualityMonitorService {
     if (hardFail) issues.push(hardFail);
     else if (!text || text.trim().length < 5) issues.push('пустой/слишком короткий ответ');
     else {
-      if (/ошибка запуска агента|ответ не пришёл|failed to fetch|internal server error/i.test(text)) issues.push('ответ-плейсхолдер ошибки');
+      if (/ошибка запуска (агента|ассистента)|ответ не пришёл|failed to fetch|internal server error/i.test(text)) issues.push('ответ-плейсхолдер ошибки');
       const letters = (text.match(/\p{L}/gu) || []).length;
       const cyr = (text.match(/[Ѐ-ӿ]/g) || []).length;
       if (letters >= 20 && cyr / letters < 0.3) issues.push('ответ не на русском (англ-утечка)');

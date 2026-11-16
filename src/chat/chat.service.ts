@@ -82,7 +82,7 @@ export interface UploadHandoff {
   linkeon: LinkeonRelayFields;
   profilingBlocks: RelayProfilingBlocks;
   /** Язык человека — для текстов сбоев хода с файлом (chat-failure-texts.ts). */
-  userLanguage?: string;
+  userLanguage: string;
 }
 
 /** Файл в папке сессии, как его отдаёт relay (`GET /session/:sid/files`). */
@@ -2259,7 +2259,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // If empty on final: don't pollute history with a stub AI row; save user message + a brief retry-hint.
       // (Frontend will reload history; user can simply resend.)
       const aiText = fullText
-        || (final && !selfHealSkippedForTakeover ? chatFailureText('noReply', userLanguage) : '');
+        || (final && !selfHealSkippedForTakeover ? chatFailureText('noReply', userLanguage, { storeBuild }) : '');
       if (!aiText) return; // skip empty intermediate persists
       // ЭТО реальная точка списания (ниже addTokenTask). Логируем только здесь:
       // путь показа считает то же самое, дублировать в лог незачем.

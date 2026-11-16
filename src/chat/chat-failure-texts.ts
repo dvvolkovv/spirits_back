@@ -1,3 +1,7 @@
+import { LanguageService, SUPPORTED_LANGUAGES } from '../common/services/language.service';
+
+type Lang = (typeof SUPPORTED_LANGUAGES)[number];
+
 /**
  * Тексты, которые человек видит, когда ход не получился, — на его языке.
  *
@@ -12,16 +16,20 @@
  * текстов, где обычный вариант обещает «токены не списаны», есть вариант
  * `store`. Загрузка просит прислать и файлы — вариант `upload`.
  *
- * Тексты в курсиве (`_…_`) — так их рисует кабинет. Ни один не должен
- * попадаться на looksCliFailure (chat.service.ts) и looksLikeFailure
- * (routine-push.service.ts): иначе сервис принял бы свою же заглушку за
- * сбой CLI. Это сторожит chat-failure-texts.spec.ts.
+ * relayUpdating, noReply и cliFatal — в курсиве (`_…_`), так их рисует
+ * кабинет; startFailed и fileFailed — обычной строкой, как прежние заглушки.
+ * Ни один текст не должен попадаться на looksCliFailure (chat.service.ts) и
+ * looksLikeFailure (routine-push.service.ts): иначе сервис принял бы свою же
+ * заглушку за сбой CLI. Это сторожит chat-failure-texts.spec.ts.
+ *
+ * Таблица типизирована по SUPPORTED_LANGUAGES: забытый язык — ошибка сборки,
+ * а не молчаливый откат на русский.
  */
 export type ChatFailureKind = 'relayUpdating' | 'startFailed' | 'fileFailed' | 'noReply' | 'cliFatal';
 
 interface Variants { text: string; upload?: string; store?: string; storeUpload?: string }
 
-const TEXTS: Record<ChatFailureKind, Record<string, Variants>> = {
+const TEXTS: Record<ChatFailureKind, Record<Lang, Variants>> = {
   relayUpdating: {
     ru: {
       text: '_Ассистент сейчас обновляется и не успел взяться за сообщение. Токены не списаны — отправьте его ещё раз через пару минут._',
@@ -36,28 +44,28 @@ const TEXTS: Record<ChatFailureKind, Record<string, Variants>> = {
       storeUpload: "_The assistant is updating right now and didn't get to your message — please send the message and files again in a couple of minutes._",
     },
     es: {
-      text: '_El asistente se está actualizando y no llegó a tu mensaje. No se han descontado tokens: envíalo de nuevo en un par de minutos._',
-      upload: '_El asistente se está actualizando y no llegó a tu mensaje. No se han descontado tokens: envía el mensaje y los archivos de nuevo en un par de minutos._',
-      store: '_El asistente se está actualizando y no llegó a tu mensaje. Envíalo de nuevo en un par de minutos._',
-      storeUpload: '_El asistente se está actualizando y no llegó a tu mensaje. Envía el mensaje y los archivos de nuevo en un par de minutos._',
+      text: '_El asistente se está actualizando y no pudo atender tu mensaje. No se han descontado tokens: envíalo de nuevo en un par de minutos._',
+      upload: '_El asistente se está actualizando y no pudo atender tu mensaje. No se han descontado tokens: envía el mensaje y los archivos de nuevo en un par de minutos._',
+      store: '_El asistente se está actualizando y no pudo atender tu mensaje. Envíalo de nuevo en un par de minutos._',
+      storeUpload: '_El asistente se está actualizando y no pudo atender tu mensaje. Envía el mensaje y los archivos de nuevo en un par de minutos._',
     },
     de: {
-      text: '_Der Assistent wird gerade aktualisiert und ist nicht zu deiner Nachricht gekommen. Es wurden keine Tokens abgebucht – sende sie in ein paar Minuten erneut._',
-      upload: '_Der Assistent wird gerade aktualisiert und ist nicht zu deiner Nachricht gekommen. Es wurden keine Tokens abgebucht – sende die Nachricht und die Dateien in ein paar Minuten erneut._',
-      store: '_Der Assistent wird gerade aktualisiert und ist nicht zu deiner Nachricht gekommen – sende sie in ein paar Minuten erneut._',
-      storeUpload: '_Der Assistent wird gerade aktualisiert und ist nicht zu deiner Nachricht gekommen – sende die Nachricht und die Dateien in ein paar Minuten erneut._',
+      text: '_Der Assistent wird gerade aktualisiert und konnte deine Nachricht nicht bearbeiten. Es wurden keine Tokens abgebucht – sende die Nachricht in ein paar Minuten erneut._',
+      upload: '_Der Assistent wird gerade aktualisiert und konnte deine Nachricht nicht bearbeiten. Es wurden keine Tokens abgebucht – sende die Nachricht und die Dateien in ein paar Minuten erneut._',
+      store: '_Der Assistent wird gerade aktualisiert und konnte deine Nachricht nicht bearbeiten – sende die Nachricht in ein paar Minuten erneut._',
+      storeUpload: '_Der Assistent wird gerade aktualisiert und konnte deine Nachricht nicht bearbeiten – sende die Nachricht und die Dateien in ein paar Minuten erneut._',
     },
     fr: {
-      text: "_L'assistant est en cours de mise à jour et n'a pas pu traiter ton message. Aucun jeton n'a été débité : renvoie-le dans quelques minutes._",
+      text: "_L'assistant est en cours de mise à jour et n'a pas pu traiter ton message. Aucun jeton n'a été débité : renvoie ton message dans quelques minutes._",
       upload: "_L'assistant est en cours de mise à jour et n'a pas pu traiter ton message. Aucun jeton n'a été débité : renvoie le message et les fichiers dans quelques minutes._",
-      store: "_L'assistant est en cours de mise à jour et n'a pas pu traiter ton message. Renvoie-le dans quelques minutes._",
+      store: "_L'assistant est en cours de mise à jour et n'a pas pu traiter ton message. Renvoie ton message dans quelques minutes._",
       storeUpload: "_L'assistant est en cours de mise à jour et n'a pas pu traiter ton message. Renvoie le message et les fichiers dans quelques minutes._",
     },
     pt: {
-      text: '_O assistente está a ser atualizado e não chegou a pegar na sua mensagem. Não foram descontados tokens — envie-a novamente daqui a uns minutos._',
-      upload: '_O assistente está a ser atualizado e não chegou a pegar na sua mensagem. Não foram descontados tokens — envie a mensagem e os ficheiros novamente daqui a uns minutos._',
-      store: '_O assistente está a ser atualizado e não chegou a pegar na sua mensagem — envie-a novamente daqui a uns minutos._',
-      storeUpload: '_O assistente está a ser atualizado e não chegou a pegar na sua mensagem — envie a mensagem e os ficheiros novamente daqui a uns minutos._',
+      text: '_O assistente está a ser atualizado e não chegou a processar a sua mensagem. Não foram descontados tokens — envie-a novamente daqui a uns minutos._',
+      upload: '_O assistente está a ser atualizado e não chegou a processar a sua mensagem. Não foram descontados tokens — envie a mensagem e os ficheiros novamente daqui a uns minutos._',
+      store: '_O assistente está a ser atualizado e não chegou a processar a sua mensagem — envie-a novamente daqui a uns minutos._',
+      storeUpload: '_O assistente está a ser atualizado e não chegou a processar a sua mensagem — envie a mensagem e os ficheiros novamente daqui a uns minutos._',
     },
     zh: {
       text: '_助手正在更新，未能处理这条消息。未扣除代币——请几分钟后重新发送。_',
@@ -99,23 +107,23 @@ const TEXTS: Record<ChatFailureKind, Record<string, Variants>> = {
       store: '_Не получилось: временный сбой на стороне платформы — попробуйте отправить сообщение ещё раз._',
     },
     en: {
-      text: "_That didn't work: a temporary platform error. No tokens were charged for this turn — please try sending the message again._",
+      text: "_That didn't work: a temporary platform error. No tokens were charged for this message — please try sending it again._",
       store: "_That didn't work: a temporary platform error — please try sending the message again._",
     },
     es: {
-      text: '_No ha funcionado: fallo temporal de la plataforma. No se han descontado tokens por este turno: intenta enviar el mensaje de nuevo._',
+      text: '_No ha funcionado: fallo temporal de la plataforma. No se han descontado tokens por este mensaje: intenta enviarlo de nuevo._',
       store: '_No ha funcionado: fallo temporal de la plataforma. Intenta enviar el mensaje de nuevo._',
     },
     de: {
-      text: '_Das hat nicht geklappt: vorübergehender Fehler der Plattform. Für diesen Schritt wurden keine Tokens abgebucht – versuch, die Nachricht noch einmal zu senden._',
+      text: '_Das hat nicht geklappt: vorübergehender Fehler der Plattform. Für diese Nachricht wurden keine Tokens abgebucht – versuch, die Nachricht noch einmal zu senden._',
       store: '_Das hat nicht geklappt: vorübergehender Fehler der Plattform – versuch, die Nachricht noch einmal zu senden._',
     },
     fr: {
-      text: "_Ça n'a pas marché : panne temporaire de la plateforme. Aucun jeton n'a été débité pour ce tour : essaie de renvoyer le message._",
+      text: "_Ça n'a pas marché : panne temporaire de la plateforme. Aucun jeton n'a été débité pour ce message : essaie de le renvoyer._",
       store: "_Ça n'a pas marché : panne temporaire de la plateforme. Essaie de renvoyer le message._",
     },
     pt: {
-      text: '_Não resultou: falha temporária da plataforma. Não foram descontados tokens por esta resposta — tente enviar a mensagem novamente._',
+      text: '_Não resultou: falha temporária da plataforma. Não foram descontados tokens por esta mensagem — tente enviá-la novamente._',
       store: '_Não resultou: falha temporária da plataforma — tente enviar a mensagem novamente._',
     },
     zh: {
@@ -130,8 +138,10 @@ export function chatFailureText(
   lang: string | null | undefined,
   opts: { upload?: boolean; storeBuild?: boolean } = {},
 ): string {
-  const byLang = TEXTS[kind];
-  const v = byLang[String(lang || '').toLowerCase()] ?? byLang.ru;
+  // normalize сводит «pt-BR» к «pt», а всё вне SUPPORTED_LANGUAGES (в том
+  // числе «__proto__» и «constructor») — к DEFAULT_LANGUAGE: ключ таблицы
+  // всегда из списка, по прототипу объекта поиск не идёт.
+  const v = TEXTS[kind][LanguageService.normalize(lang) as Lang];
   if (opts.storeBuild && opts.upload) return v.storeUpload ?? v.store ?? v.upload ?? v.text;
   if (opts.storeBuild) return v.store ?? v.text;
   if (opts.upload) return v.upload ?? v.text;
