@@ -62,8 +62,10 @@ import { LegacySmmAccountDeletionAdapter } from '../misc/legacy-smm-account-dele
  *    DDL накатывает спек);
  *  - CLI scripts/account-deletion-synthetic.ts (Gate B владельца: полный
  *    набор --apply --confirm-account-deletion-cleanup + env
- *    ACCOUNT_DELETION_SYNTHETIC_ENV=test.linkeon.io + hostname
- *    ugliest-salmon; без тройки гейтов — exit 2 до любого подключения).
+ *    ACCOUNT_DELETION_SYNTHETIC_ENV=test.linkeon.io + hostname из точного
+ *    allow-list SYNTHETIC_GATE_HOSTNAMES — ugliest-salmon или его FQDN
+ *    ugliest-salmon.ptr.network; без тройки гейтов — exit 2 до любого
+ *    подключения).
  *
  * Честность границ: НАСТОЯЩИЕ SchemaService/Planner(DELETION_DISCOVERERS)/
  * Jobs/Runner/Coordinator/Lifecycle/Registry, настоящие IdentityService,
@@ -90,7 +92,7 @@ import { LegacySmmAccountDeletionAdapter } from '../misc/legacy-smm-account-dele
 export const SYNTHETIC_DELETION_PREFIX = 'synthetic-deletion-';
 export const SYNTHETIC_GATE_ENV = 'ACCOUNT_DELETION_SYNTHETIC_ENV';
 export const SYNTHETIC_GATE_ENV_VALUE = 'test.linkeon.io';
-export const SYNTHETIC_GATE_HOSTNAME = 'ugliest-salmon';
+export const SYNTHETIC_GATE_HOSTNAMES = ['ugliest-salmon', 'ugliest-salmon.ptr.network'] as const;
 export const SYNTHETIC_APPLY_FLAG = '--apply';
 export const SYNTHETIC_CONFIRM_FLAG = '--confirm-account-deletion-cleanup';
 
@@ -119,10 +121,18 @@ export interface SyntheticGatesInput {
   readonly hostname: string;
 }
 
+/** Точное вхождение в SYNTHETIC_GATE_HOSTNAMES — строгое равенство, без нормализации. */
+export function isSyntheticGateHostname(name: string): boolean {
+  return SYNTHETIC_GATE_HOSTNAMES.some((allowed) => allowed === name);
+}
+
 /**
  * Тройной гейт — проверяется ДО любого подключения/записи. Пропускает
  * только полную комбинацию: оба флага (и ничего лишнего) + env-значение
- * test.linkeon.io + hostname ugliest-salmon.
+ * test.linkeon.io + hostname из SYNTHETIC_GATE_HOSTNAMES. Имён два, потому
+ * что os.hostname() на тест-ноде отдаёт FQDN ugliest-salmon.ptr.network.
+ * Сравнение — только точное: префиксы, регистр и нормализация запрещены,
+ * иначе гейт пропустил бы двойников вроде ugliest-salmon.evil.example.
  */
 export function checkSyntheticGates(input: SyntheticGatesInput): void {
   const args = [...input.argv];
@@ -136,7 +146,7 @@ export function checkSyntheticGates(input: SyntheticGatesInput): void {
   if (input.env[SYNTHETIC_GATE_ENV] !== SYNTHETIC_GATE_ENV_VALUE) {
     throw new SyntheticGateError();
   }
-  if (input.hostname !== SYNTHETIC_GATE_HOSTNAME) throw new SyntheticGateError();
+  if (!isSyntheticGateHostname(input.hostname)) throw new SyntheticGateError();
 }
 
 export class SyntheticPreflightError extends Error {

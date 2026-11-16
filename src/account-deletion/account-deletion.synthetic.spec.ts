@@ -9,12 +9,13 @@ import {
   assertSyntheticPreflight,
   checkSyntheticGates,
   faultErrorFor,
+  isSyntheticGateHostname,
   SYNTHETIC_APPLY_FLAG,
   SYNTHETIC_CONFIRM_FLAG,
   SYNTHETIC_DELETION_PREFIX,
   SYNTHETIC_GATE_ENV,
   SYNTHETIC_GATE_ENV_VALUE,
-  SYNTHETIC_GATE_HOSTNAME,
+  SYNTHETIC_GATE_HOSTNAMES,
   SyntheticFailures,
   SyntheticGateError,
   SyntheticPreflightError,
@@ -25,11 +26,12 @@ import {
  *
  * Гейты CLI проверяются ЗДЕСЬ чистой функцией и spawn-ом ОТКАЗНЫХ веток.
  * ВНИМАНИЕ: полная тройка гейтов (--apply --confirm-account-deletion-cleanup
- * + ACCOUNT_DELETION_SYNTHETIC_ENV=test.linkeon.io + hostname ugliest-salmon)
- * НИКОГДА не передаётся spawn-у: на CI-ноде hostname и есть ugliest-salmon,
- * и живой запуск synthetic — это Gate B, отдельное ОК владельца. Успешный
- * путь покрывает account-deletion.synthetic.pg.spec.ts напрямую через
- * composition root, без CLI.
+ * + ACCOUNT_DELETION_SYNTHETIC_ENV=test.linkeon.io + hostname из точного
+ * allow-list SYNTHETIC_GATE_HOSTNAMES) НИКОГДА не передаётся spawn-у: на
+ * CI-ноде os.hostname() = ugliest-salmon.ptr.network, это имя входит в
+ * allow-list, и живой запуск synthetic — это Gate B, отдельное ОК
+ * владельца. Успешный путь покрывает account-deletion.synthetic.pg.spec.ts
+ * напрямую через composition root, без CLI.
  */
 
 const fullGateEnv = (): Record<string, string> => ({
@@ -40,7 +42,7 @@ describe('checkSyntheticGates — тройной гейт до любой зап
   const full = {
     argv: [SYNTHETIC_APPLY_FLAG, SYNTHETIC_CONFIRM_FLAG],
     env: fullGateEnv(),
-    hostname: SYNTHETIC_GATE_HOSTNAME,
+    hostname: 'ugliest-salmon',
   };
 
   it('полная тройка гейтов — единственная пропускающая комбинация', () => {
@@ -93,10 +95,18 @@ describe('checkSyntheticGates — тройной гейт до любой зап
       .toThrow(SyntheticGateError);
   });
 
+  it('isSyntheticGateHostname — только точные имена allow-list', () => {
+    expect(isSyntheticGateHostname('ugliest-salmon')).toBe(true);
+    expect(isSyntheticGateHostname('ugliest-salmon.ptr.network')).toBe(true);
+    for (const name of hostnameDoubles) {
+      expect(isSyntheticGateHostname(name)).toBe(false);
+    }
+  });
+
   it('константы гейтов и префикс — без дрейфа', () => {
     expect(SYNTHETIC_GATE_ENV).toBe('ACCOUNT_DELETION_SYNTHETIC_ENV');
     expect(SYNTHETIC_GATE_ENV_VALUE).toBe('test.linkeon.io');
-    expect(SYNTHETIC_GATE_HOSTNAME).toBe('ugliest-salmon');
+    expect(SYNTHETIC_GATE_HOSTNAMES).toEqual(['ugliest-salmon', 'ugliest-salmon.ptr.network']);
     expect(SYNTHETIC_DELETION_PREFIX).toBe('synthetic-deletion-');
   });
 });
@@ -237,10 +247,10 @@ describe('scripts/account-deletion-synthetic.ts — spawn только ОТКА�
   }, 120_000);
 
   it('флаги + env на чужом hostname → exit 2, stdout пуст', () => {
-    // На CI-ноде hostname и есть ugliest-salmon — кейс автоматически
-    // пропускается: гейт hostname там закрыл бы ветку, а пройти дальше
-    // (подключение к БД) тесту запрещено.
-    if (hostname() === SYNTHETIC_GATE_HOSTNAME) return;
+    // На CI-ноде os.hostname() = ugliest-salmon.ptr.network — имя входит в
+    // allow-list, поэтому там кейс пропускается: гейт hostname ветку не
+    // закрыл бы, а пройти дальше (подключение к БД) тесту запрещено.
+    if (isSyntheticGateHostname(hostname())) return;
     const res = spawnCli(
       [SYNTHETIC_APPLY_FLAG, SYNTHETIC_CONFIRM_FLAG],
       fullGateEnv(),

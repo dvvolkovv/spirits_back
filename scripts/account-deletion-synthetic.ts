@@ -11,9 +11,10 @@
  *   npx ts-node -P tsconfig.json scripts/account-deletion-synthetic.ts \
  *     --apply --confirm-account-deletion-cleanup
  *
- * Тройной гейт (оба флага + env-значение + hostname ugliest-salmon)
- * проверяется ПЕРВЫМ, до любого подключения и до любой записи: неполная
- * комбинация — код 2 и synthetic_gates_not_met в stderr, stdout пуст.
+ * Тройной гейт (оба флага + env-значение + hostname из точного allow-list:
+ * ugliest-salmon или ugliest-salmon.ptr.network) проверяется ПЕРВЫМ, до
+ * любого подключения и до любой записи: неполная комбинация — код 2 и
+ * synthetic_gates_not_met в stderr, stdout пуст.
  * Нет DATABASE_URL — тоже код 2, без подключения.
  *
  * Данные — только синтетические фикстуры (src/account-deletion/
