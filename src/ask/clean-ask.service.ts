@@ -5,6 +5,7 @@ import { AgentsService } from '../agents/agents.service';
 import { relayAuthHeaders } from '../chat/relay-auth';
 import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
 import { relayProviderFields } from '../chat/answer-provider';
+import { postRelayWithDrainRetry, DrainRetryOpts } from '../chat/relay-drain-retry';
 
 /**
  * «Поговорить начисто» [owner 2026-08-24] — запрос в облачный LLM, НЕ связанный с пользователем.
@@ -36,6 +37,9 @@ export class CleanAskService {
     // @Optional(): поломка DI роняет старт, а не оставляет молча Claude.
     private readonly globalProvider?: GlobalLlmProviderService,
   ) {}
+
+  /** Повтор под шлагбаумом выката релея; тесты подменяют расписание. */
+  drainOpts: DrainRetryOpts = {};
 
   private static readonly SYSTEM =
     'Ты — живой, тактичный собеседник в приватном чате. Это ДИАЛОГ, а не справка: отвечай КОРОТКО и ' +
@@ -105,25 +109,34 @@ export class CleanAskService {
   private async callRelay(message: string): Promise<string> {
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
     const FormData = require('form-data');
-    const fd = new FormData();
-    fd.append('message', message);
-    // Эфемерная, ни к кому не привязанная сессия — новая на каждый запрос.
-    fd.append('sessionId', `anon_${randomUUID()}`);
+    // Эфемерная, ни к кому не привязанная сессия — новая на каждый запрос,
+    // но одна на все повторы этого запроса под шлагбаумом выката.
+    const sessionId = `anon_${randomUUID()}`;
     const provider = this.globalProvider ? await this.globalProvider.get() : 'claude';
-    // probe=false — цепочка релея (Claude → Qwen → Kimi → Codex) сохранена намеренно
-    // (spec 2026-10-31-global-llm-switch §4), в отличие от гостей пробы
-    // (§6, guest-turn.service.ts — без цепочки): у первого контакта и
-    // «поговорить начисто» нет экрана «войдите» как запасного варианта,
-    // если выбранная модель недоступна.
-    for (const [k, v] of Object.entries(relayProviderFields(false, provider))) fd.append(k, v);
+    // Форма multipart — поток: на каждый повтор — новая (relay-drain-retry.ts).
+    const buildForm = () => {
+      const fd = new FormData();
+      fd.append('message', message);
+      fd.append('sessionId', sessionId);
+      // probe=false — цепочка релея (Claude → Qwen → Kimi → Codex) сохранена намеренно
+      // (spec 2026-10-31-global-llm-switch §4), в отличие от гостей пробы
+      // (§6, guest-turn.service.ts — без цепочки): у первого контакта и
+      // «поговорить начисто» нет экрана «войдите» как запасного варианта,
+      // если выбранная модель недоступна.
+      for (const [k, v] of Object.entries(relayProviderFields(false, provider))) fd.append(k, v);
+      return fd;
+    };
 
     const chunks: string[] = [];
-    const resp = await axios.post(`${AGENT_URL}/chat`, fd, {
-      headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
-      responseType: 'stream',
-      timeout: 300000,
-      maxRedirects: 0,
-    });
+    const resp: any = await postRelayWithDrainRetry(() => {
+      const fd = buildForm();
+      return axios.post(`${AGENT_URL}/chat`, fd, {
+        headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
+        responseType: 'stream',
+        timeout: 300000,
+        maxRedirects: 0,
+      });
+    }, this.drainOpts);
     await new Promise<void>((resolve, reject) => {
       let buffer = '';
       resp.data.on('data', (chunk: Buffer) => {
