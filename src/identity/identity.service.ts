@@ -32,6 +32,13 @@ export const IDENTITY_MIGRATIONS = [
 /** Приветственный бонус нового аккаунта. Его же называет справка (platform-kb/values.ts). */
 export const WELCOME_BONUS = 25_000;
 
+/**
+ * Подпись приветственного бонуса в журнале token_transactions. По ней же
+ * issueWelcomeBonus сверяется, выдавался ли бонус раньше: тип 'bonus' общий с
+ * реферальным бонусом, отличить их можно только по подписи.
+ */
+export const WELCOME_BONUS_DESCRIPTION = 'Приветственный бонус';
+
 @Injectable()
 export class IdentityService implements OnModuleInit {
   private readonly logger = new Logger(IdentityService.name);
@@ -414,22 +421,72 @@ export class IdentityService implements OnModuleInit {
    * Приветственный бонус — внутри той же транзакции, что и создание/реактивация
    * аккаунта (db — её соединение, а не пул: claim-маркер welcome_bonus_at и
    * начисление должны стать видны вместе со строкой аккаунта).
+   *
+   * Бонус выдаётся один раз на аккаунт за всё время (T20-M1): удаление отметку
+   * welcome_bonus_at не сбрасывает, и вернувшийся тем же номером получает
+   * аккаунт без стартового бонуса — claim ниже не пройдёт.
+   *
+   * Сверка с журналом token_transactions после claim — страховка, а не
+   * основная защита: пустые отметки старых строк (и стёртые прежним
+   * tombstone до T20-M1) на каждом старте API заполняет
+   * migrations/001_identity_init.sql (welcome_bonus_at = create_date WHERE
+   * welcome_bonus_at IS NULL). Сверка нужна, если эту строку уберут, если
+   * миграция 001 на старте не пройдёт или если у строки create_date IS NULL.
+   * Приветственный бонус в журнале уже есть — второй раз не выдаём, а
+   * отметку ставим на дату первой такой записи, а не на now(): от
+   * welcome_bonus_at считают «дату рождения» аккаунта (окно рефералки в
+   * referral.service.ts, когорты мониторинга).
+   *
+   * Фильтр — по подписи WELCOME_BONUS_DESCRIPTION: тип 'bonus' общий с
+   * реферальным бонусом, и реферальная запись приветственный не заменяет.
    */
   private async issueWelcomeBonus(db: SlotQueryable, userId: string): Promise<void> {
+    // В логи — user_id.id (uuid строки), а не internal_id: у телефонного
+    // входа internal_id — это сам номер.
     const claimed = await db.query(
       `UPDATE user_id SET welcome_bonus_at = now()
        WHERE internal_id = $1 AND welcome_bonus_at IS NULL
-       RETURNING internal_id`,
+       RETURNING id`,
       [userId],
     );
     if (claimed.rows.length === 0) return;
+    const rowId = claimed.rows[0].id;
+    // $1::text в обоих местах: internal_id — varchar, token_transactions.user_id —
+    // text, без явного типа Postgres не выведет единый тип параметра.
+    // Наличие записи — по count(*), а не по min(created_at): created_at
+    // допускает NULL, и min() такую запись не видит. Если у всех записей дата
+    // пуста, отметка остаётся now() из claim выше.
+    const alreadyIssued = await db.query(
+      `UPDATE user_id u
+          SET welcome_bonus_at = COALESCE(j.first_at, u.welcome_bonus_at)
+         FROM (SELECT count(*) AS n, min(created_at) AS first_at
+                 FROM token_transactions
+                WHERE user_id = $1::text
+                  AND transaction_type = 'bonus'
+                  AND description = $2) j
+        WHERE u.internal_id = $1::text
+          AND j.n > 0
+        RETURNING j.first_at`,
+      [userId, WELCOME_BONUS_DESCRIPTION],
+    );
+    if (alreadyIssued.rows.length > 0) {
+      const firstAt = alreadyIssued.rows[0].first_at;
+      // toISOString() бросает RangeError на невалидной дате (node-pg отдаёт
+      // 'infinity' как Infinity), а исключение откатит транзакцию входа.
+      const firstDate = new Date(firstAt);
+      const first = firstAt == null
+        ? 'created_at NULL'
+        : Number.isFinite(firstDate.getTime()) ? firstDate.toISOString() : String(firstAt);
+      this.logger.log(`welcome bonus already in journal (first ${first}) → not reissued, user_id.id=${rowId}`);
+      return;
+    }
     // Через процедуру: стартовый бонус — тоже пополнение, и в истории он должен
     // быть видно, иначе у нового юзера баланс возникает из ниоткуда.
     await db.query(
       `SELECT add_user_tokens($1, $2, 'bonus', $3, NULL)`,
-      [userId, WELCOME_BONUS, 'Приветственный бонус'],
+      [userId, WELCOME_BONUS, WELCOME_BONUS_DESCRIPTION],
     );
-    this.logger.log(`welcome bonus ${WELCOME_BONUS} → ${userId}`);
+    this.logger.log(`welcome bonus ${WELCOME_BONUS} → user_id.id=${rowId}`);
   }
 
   async linkMethod<P extends Provider>(userId: string, provider: P, data: ProviderData<P>): Promise<{ ok: true } | { ok: false; reason: 'conflict' | 'invalid'; conflictUserId?: string }> {
@@ -491,14 +548,19 @@ export class IdentityService implements OnModuleInit {
     // накопленного. При равных/неизвестных датах выживает targetUserId — тот,
     // под которым человек сейчас залогинен, чтобы зря не менять сессию. Если
     // выжил не target, контроллер выдаст свежий JWT на survivor.
+    // id — для лога ниже: в лог пишем user_id.id (uuid строки), а не
+    // internal_id — у телефонного входа internal_id это сам номер.
     const dates = await this.pg.query(
-      `SELECT internal_id, create_date FROM user_id WHERE internal_id = ANY($1)`,
+      `SELECT internal_id, id, create_date FROM user_id WHERE internal_id = ANY($1)`,
       [[conflictUserId, targetUserId]],
     );
+    const row = (id: string) => dates.rows.find((x: any) => x.internal_id === id);
     const at = (id: string) => {
-      const r = dates.rows.find((x: any) => x.internal_id === id);
+      const r = row(id);
       return r?.create_date ? new Date(r.create_date).getTime() : null;
     };
+    // Нет строки или id — «?», а не internal_id.
+    const rowId = (id: string): string => row(id)?.id ?? '?';
     const dc = at(conflictUserId);
     const dt = at(targetUserId);
     const survivorUserId =
@@ -527,7 +589,9 @@ export class IdentityService implements OnModuleInit {
         -tokens,
         `Перенос остатка на основной аккаунт ${survivorUserId}`,
       ]);
-      this.logger.log(`merge: ${tokens} токенов ${loserUserId} → ${survivorUserId}`);
+      this.logger.log(
+        `merge: ${tokens} токенов user_id.id=${rowId(loserUserId)} → user_id.id=${rowId(survivorUserId)}`,
+      );
     }
 
     // Task 19 — порядок, зафиксированный планом: credit-first баланс (выше) →
@@ -572,13 +636,15 @@ export class IdentityService implements OnModuleInit {
           [loserUserId, account.deletionId],
         );
         // Зачистка следов входа на tombstone — под той же gen-защитой: хэш
-        // пароля, профильная почта и маркер приветственного бонуса не должны
-        // переживать удаление на строке аккаунта.
+        // пароля и профильная почта не должны переживать удаление на строке
+        // аккаунта. Отметку welcome_bonus_at сохраняем намеренно (T20-M1):
+        // приветственный бонус — один раз на аккаунт за всё время, а сама
+        // отметка — ещё и «дата рождения» аккаунта для окна рефералки и
+        // когорт мониторинга.
         await tx.query(
           `UPDATE user_id
               SET password_hash = NULL,
                   primary_email = NULL,
-                  welcome_bonus_at = NULL,
                   update_date = now()
             WHERE internal_id = $1
               AND state = 'deleted'

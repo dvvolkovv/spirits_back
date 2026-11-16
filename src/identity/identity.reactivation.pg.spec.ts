@@ -44,10 +44,14 @@ import type { ResolveResult } from './identity.types';
  *     'running') → resolvePhone снова: тот же internal_id, строка active без
  *     deletion_id/deleted_at, незавершённых задач старого поколения нет,
  *     stale-задача cancelled (assertCurrent → kind 'cancelled'), ресурсы
- *     нового аккаунта в единственном экземпляре, бонус выдан заново;
+ *     нового аккаунта в единственном экземпляре; приветственный бонус
+ *     НЕ выдан повторно (T20-M1: tombstone сохраняет welcome_bonus_at);
  *  2. historical deleted (deletion_id NULL) — реактивация без задач,
  *     coordinator такое не подбирает;
  *  3. повторное удаление после реактивации — НОВЫЙ UUID поколения.
+ *
+ * T20-M1 (отдельный describe ниже): issueWelcomeBonus сверяется с журналом
+ * token_transactions, если отметка welcome_bonus_at пуста.
  */
 
 const PG = process.env.PROVISIONING_PG_URL;
@@ -131,6 +135,21 @@ maybe('реактивация после удаления — одна тран�
       [userId],
     );
     return r[0].deletion_id;
+  }
+
+  /**
+   * Суммы записей «Приветственный бонус» в журнале, по времени. Подпись —
+   * литералом: это контракт с историей операций, а не деталь реализации.
+   */
+  async function welcomeCredits(userId: string): Promise<number[]> {
+    const r = await rows(
+      `SELECT amount FROM token_transactions
+        WHERE user_id=$1 AND transaction_type='bonus'
+          AND description='Приветственный бонус'
+        ORDER BY created_at`,
+      [userId],
+    );
+    return r.map((x) => Number(x.amount));
   }
 
   async function balance(userId: string): Promise<number> {
@@ -481,6 +500,11 @@ maybe('реактивация после удаления — одна тран�
 
     const first = ok(await stack.identity.resolveOrCreate('phone', { phone: PHONE }));
     expect(first.isNew).toBe(true);
+    // Создание: ровно одна запись «Приветственный бонус» на 25 000.
+    const bonusMark = (await userRow(first.userId)).welcome_bonus_at;
+    expect(bonusMark).not.toBeNull();
+    expect(await welcomeCredits(first.userId)).toEqual([WELCOME_BONUS]);
+    expect(await balance(first.userId)).toBe(WELCOME_BONUS);
     await seedHistory(first.userId, PERSONAL_CANARY);
 
     // Явное удаление: поколение G1, стопы и core исполнены синхронно.
@@ -523,9 +547,13 @@ maybe('реактивация после удаления — одна тран�
     expect(await profileRowCount(first.userId)).toBe(1);
     expect(await identityCount(first.userId)).toBe(1);
 
-    // Бонус выдан заново (tombstone сбросил welcome_bonus_at), история не воскресла.
+    // T20-M1: бонус НЕ выдан заново. Отметка пережила удаление (tombstone её
+    // не сбрасывает), в журнале по-прежнему одна запись «Приветственный
+    // бонус», баланс вернувшегося не вырос на 25 000. История не воскресла.
     expect(u.welcome_bonus_at).not.toBeNull();
-    expect(await balance(first.userId)).toBe(WELCOME_BONUS);
+    expect(new Date(u.welcome_bonus_at).getTime()).toBe(new Date(bonusMark).getTime());
+    expect(await welcomeCredits(first.userId)).toEqual([WELCOME_BONUS]);
+    expect(await balance(first.userId)).toBe(0);
     expect(await historyCount(first.userId)).toBe(0);
   });
 
@@ -679,5 +707,143 @@ maybe('реактивация после удаления — одна тран�
     expect(core.status).toBe('cancelled');
     expect(core.leaseUntil).toBeNull();
     expect(await unfinishedJobs(generation1)).toBe(0);
+  });
+
+  /**
+   * T20-M1 — сверка с журналом при пустой отметке welcome_bonus_at.
+   *
+   * Это страховка: на проде пустые отметки на каждом старте API заполняет
+   * 001_identity_init.sql (welcome_bonus_at = create_date), а сверка
+   * срабатывает, если эту строку уберут, миграция 001 не пройдёт или у строки
+   * create_date IS NULL. Строки здесь сеются с пустой отметкой уже после
+   * накатки 001 в beforeAll — проверяется сама сверка. Приветственный бонус
+   * остаётся в token_transactions (журнал удаление не трогает) — по нему и
+   * видно, что бонус уже выдавался. Фильтр именно по подписи: тип 'bonus'
+   * общий с реферальным.
+   */
+  describe('T20-M1: приветственный бонус сверяется с журналом', () => {
+    const REFERRAL_DESCRIPTION = 'Реферальный бонус за регистрацию по приглашению';
+
+    async function seedCredit(
+      userId: string,
+      amount: number,
+      description: string,
+      createdAt: string | null,
+    ): Promise<void> {
+      await pool.query(
+        `INSERT INTO token_transactions
+           (user_id, transaction_type, amount, balance_after, description, metadata, created_at)
+         VALUES ($1, 'bonus', $2, $2, $3, NULL, $4::timestamptz)`,
+        [userId, amount, description, createdAt],
+      );
+    }
+
+    it('(d) отметка NULL, в журнале уже есть «Приветственный бонус» — не выдаётся, отметка = самая ранняя запись', async () => {
+      const PHONE = '79990000111';
+      // Удалён до T20-M1: tombstone сбросил отметку, и 001_identity_init.sql
+      // её не вернул — строку 57 убрали, миграция 001 на старте не прошла или
+      // create_date IS NULL (см. докблок issueWelcomeBonus); поколение завершено.
+      // Бонусов в журнале два — ферма успела получить его повторно.
+      await pool.query(
+        `INSERT INTO user_id (internal_id, primary_phone, state, deleted_at, deletion_id, welcome_bonus_at)
+         VALUES ($1, $2, 'deleted', now() - interval '30 days', gen_random_uuid(), NULL)`,
+        [PHONE, PHONE],
+      );
+      await pool.query(
+        `INSERT INTO ai_profiles_consolidated (user_id, tokens) VALUES ($1, 0)`,
+        [PHONE],
+      );
+      await seedCredit(PHONE, WELCOME_BONUS, 'Приветственный бонус', '2026-03-01T10:00:00.123456Z');
+      await seedCredit(PHONE, WELCOME_BONUS, 'Приветственный бонус', '2026-06-01T10:00:00.654321Z');
+      const stack = makeStack();
+
+      const r = ok(await stack.identity.resolveOrCreate('phone', { phone: PHONE }));
+      expect(r.userId).toBe(PHONE);
+
+      expect((await userRow(PHONE)).state).toBe('active');
+      // Новой записи нет, баланс не вырос.
+      expect(await welcomeCredits(PHONE)).toEqual([WELCOME_BONUS, WELCOME_BONUS]);
+      expect(await balance(PHONE)).toBe(0);
+      // Отметка — created_at самой ранней записи, с точностью до микросекунд
+      // (не now(): окно рефералки и когорты считают от неё «дату рождения»).
+      const mark = await rows(
+        `SELECT welcome_bonus_at = '2026-03-01T10:00:00.123456Z'::timestamptz AS same
+           FROM user_id WHERE internal_id=$1`,
+        [PHONE],
+      );
+      expect(mark[0].same).toBe(true);
+    });
+
+    it('(e) отметка NULL, журнал пуст — бонус выдаётся ровно один раз, повторный вызов no-op', async () => {
+      const PHONE = '79990000112';
+      await pool.query(
+        `INSERT INTO user_id (internal_id, primary_phone, state, welcome_bonus_at)
+         VALUES ($1, $2, 'active', NULL)`,
+        [PHONE, PHONE],
+      );
+      const stack = makeStack();
+
+      ok(await stack.identity.resolveOrCreate('phone', { phone: PHONE }));
+      expect(await welcomeCredits(PHONE)).toEqual([WELCOME_BONUS]);
+      expect(await balance(PHONE)).toBe(WELCOME_BONUS);
+      const mark = (await userRow(PHONE)).welcome_bonus_at;
+      expect(mark).not.toBeNull();
+
+      // Повторный вызов: отметка стоит — ни записи, ни зачисления.
+      await (stack.identity as any).issueWelcomeBonus(db, PHONE);
+      expect(await welcomeCredits(PHONE)).toEqual([WELCOME_BONUS]);
+      expect(await balance(PHONE)).toBe(WELCOME_BONUS);
+      expect(new Date((await userRow(PHONE)).welcome_bonus_at).getTime())
+        .toBe(new Date(mark).getTime());
+    });
+
+    it('(f) отметка NULL, в журнале только реферальный бонус — приветственный выдаётся', async () => {
+      const PHONE = '79990000113';
+      await pool.query(
+        `INSERT INTO user_id (internal_id, primary_phone, state, welcome_bonus_at)
+         VALUES ($1, $2, 'active', NULL)`,
+        [PHONE, PHONE],
+      );
+      await pool.query(
+        `INSERT INTO ai_profiles_consolidated (user_id, tokens) VALUES ($1, 5000)`,
+        [PHONE],
+      );
+      // Тот же transaction_type 'bonus', другая подпись.
+      await seedCredit(PHONE, 5000, REFERRAL_DESCRIPTION, '2026-03-01T10:00:00Z');
+      const stack = makeStack();
+
+      ok(await stack.identity.resolveOrCreate('phone', { phone: PHONE }));
+      expect(await welcomeCredits(PHONE)).toEqual([WELCOME_BONUS]);
+      expect(await balance(PHONE)).toBe(5000 + WELCOME_BONUS);
+      const mark = await rows(
+        `SELECT welcome_bonus_at IS NOT NULL AS set,
+                welcome_bonus_at <> '2026-03-01T10:00:00Z'::timestamptz AS not_referral
+           FROM user_id WHERE internal_id=$1`,
+        [PHONE],
+      );
+      expect(mark[0]).toEqual({ set: true, not_referral: true });
+    });
+
+    it('(g) отметка NULL, в журнале «Приветственный бонус» с created_at NULL — не выдаётся, отметка ставится', async () => {
+      const PHONE = '79990000114';
+      await pool.query(
+        `INSERT INTO user_id (internal_id, primary_phone, state, welcome_bonus_at)
+         VALUES ($1, $2, 'active', NULL)`,
+        [PHONE, PHONE],
+      );
+      await pool.query(
+        `INSERT INTO ai_profiles_consolidated (user_id, tokens) VALUES ($1, 0)`,
+        [PHONE],
+      );
+      // Колонка created_at допускает NULL, а min(created_at) такую запись не
+      // видит — запись от этого не перестаёт быть выданным бонусом.
+      await seedCredit(PHONE, WELCOME_BONUS, 'Приветственный бонус', null);
+      const stack = makeStack();
+
+      ok(await stack.identity.resolveOrCreate('phone', { phone: PHONE }));
+      expect(await welcomeCredits(PHONE)).toEqual([WELCOME_BONUS]);
+      expect(await balance(PHONE)).toBe(0);
+      expect((await userRow(PHONE)).welcome_bonus_at).not.toBeNull();
+    });
   });
 });

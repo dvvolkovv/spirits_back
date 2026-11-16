@@ -162,8 +162,8 @@ maybe('state-guard resolveOrCreate: deleted при входе реактивир
   /**
    * Удалённый аккаунт, у которого связка входа ЖИВА: core.immediate до неё
    * не дошёл (зависшее/in-flight удаление) или это historical-строка.
-   * welcome_bonus_at сохранён (tombstone не выполнялся), баланс — как после
-   * регистрации.
+   * welcome_bonus_at сохранён (tombstone его и не сбрасывает — T20-M1),
+   * баланс — как после регистрации.
    */
   async function seedDeletedPhone(phone: string, deletionId: string | null): Promise<void> {
     // Номер передаётся ДВУМЯ параметрами: $1, использованный и в varchar
@@ -521,7 +521,8 @@ maybe('state-guard resolveOrCreate: deleted при входе реактивир
     expect(await profileRowCount(PHONE)).toBe(1);
 
     // Бонус не задвоен: welcome_bonus_at пережил зависшее удаление (tombstone
-    // не выполнялся) — claim вернул 0 строк, add_user_tokens не вызывался.
+    // его не сбрасывает — T20-M1) — claim вернул 0 строк, add_user_tokens не
+    // вызывался.
     expect(u.welcome_bonus_at).not.toBeNull();
     expect(await balance(PHONE)).toBe(WELCOME_BONUS);
   });
