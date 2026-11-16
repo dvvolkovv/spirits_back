@@ -11,7 +11,7 @@ export interface NewInboxEvent {
 }
 
 export interface ClaimedInboxEvent {
-  id: number;
+  id: string; // BIGSERIAL приходит из pg строкой
   callId: string;
   trigger: string;
   message: Record<string, unknown>;
@@ -46,8 +46,14 @@ export class MeetingWebhookInboxStore implements OnModuleInit {
       return;
     }
     let client: any = null;
+    let broken = false;
+    const onClientError = (e: Error) => {
+      broken = true;
+      this.logger.error(`meeting migration client error: ${e?.message}`);
+    };
     try {
       client = await this.pg.getClient();
+      client.on('error', onClientError);
       await client.query('BEGIN');
       await client.query("SET LOCAL lock_timeout = '3s'");
       await client.query('SELECT pg_advisory_xact_lock($1)', [MIGRATION_LOCK_KEY]);
@@ -71,11 +77,19 @@ export class MeetingWebhookInboxStore implements OnModuleInit {
       this.logger.log(`meeting migration applied: ${MIGRATION_FILE}`);
     } catch (e: any) {
       if (client) {
-        try { await client.query('ROLLBACK'); } catch { /* соединение уже мёртвое */ }
+        try {
+          await client.query('ROLLBACK');
+        } catch {
+          // состояние транзакции неизвестно — соединение нельзя возвращать в пул
+          broken = true;
+        }
       }
       this.logger.error(`meeting migration failed (${MIGRATION_FILE}): ${e?.message}`);
     } finally {
-      client?.release();
+      if (client) {
+        client.removeListener('error', onClientError);
+        client.release(broken ? true : undefined);
+      }
     }
   }
 

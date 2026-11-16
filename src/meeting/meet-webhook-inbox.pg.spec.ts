@@ -14,6 +14,7 @@ maybe('MeetingWebhookInboxStore PostgreSQL', () => {
   let admin: Pool;
   let pool: Pool;
   let store: MeetingWebhookInboxStore;
+  let migrationBodyRuns = 0;
 
   const event = (patch: Partial<NewInboxEvent> = {}): NewInboxEvent => ({
     callId: CALL_ID,
@@ -33,7 +34,20 @@ maybe('MeetingWebhookInboxStore PostgreSQL', () => {
     ));
     const pg = {
       query: (text: string, params?: any[]) => pool.query(text, params),
-      getClient: () => pool.connect(),
+      getClient: async () => {
+        const client: any = await pool.connect();
+        if (!client.__counted) {
+          client.__counted = true;
+          const orig = client.query.bind(client);
+          client.query = (text: any, ...rest: any[]) => {
+            if (typeof text === 'string' && text.includes('CREATE TABLE IF NOT EXISTS meeting_webhook_events')) {
+              migrationBodyRuns++;
+            }
+            return orig(text, ...rest);
+          };
+        }
+        return client;
+      },
     };
     store = new MeetingWebhookInboxStore(pg as any);
     await Promise.all([store.onModuleInit(), store.onModuleInit()]);
@@ -61,6 +75,22 @@ maybe('MeetingWebhookInboxStore PostgreSQL', () => {
     );
     expect(r.rows[0].n).toBe(1);
     expect(await store.onModuleInit()).toBeUndefined();
+    expect(migrationBodyRuns).toBe(1);
+    const after = await pool.query(
+      `SELECT count(*)::int AS n FROM schema_migrations WHERE filename = $1`,
+      ['meeting/006_meeting_webhook_events.sql'],
+    );
+    expect(after.rows[0].n).toBe(1);
+  });
+
+  it('есть не-partial индекс по call_id для каскада', async () => {
+    const r = await pool.query(
+      `SELECT indexdef FROM pg_indexes
+       WHERE schemaname = $1 AND indexname = 'meeting_webhook_events_call_idx'`,
+      [SCHEMA],
+    );
+    expect(r.rows).toHaveLength(1);
+    expect(r.rows[0].indexdef).not.toMatch(/WHERE/i);
   });
 
   it('один ключ создаёт одну строку при конкурентном enqueue', async () => {
