@@ -19,7 +19,9 @@ export { AGENT_SCRATCH_ROOT, AGENT_MCP_DIR };
 
 // Бюджет имени: SESSION_KEY_MAX + "_" + BASE_MAX + EXT_MAX = 241 < 255.
 // Запас в 14 байт оставлен намеренно — суффиксы вроде "-talerid-mcp.json"
-// клеятся к ключу сессии отдельно.
+// клеятся к ключу сессии отдельно. Суффикс занятости из uniqueUploadPath
+// ("-2"…"-99" — +3 байта, "-xxxxxxxx" — +9) тоже живёт в этом запасе: с ним
+// имя загрузки не длиннее 250 байт.
 const SESSION_KEY_MAX = 48;
 const BASE_MAX = 180;
 const EXT_MAX = 12;
@@ -109,7 +111,12 @@ export function fallbackFileName(originalname, fsKey, uuid) {
 export function uniqueUploadPath(dir, name, exists, random = () => randomUUID().slice(0, 8)) {
   const first = path.join(dir, name);
   if (!exists(first)) return first;
-  const ext = path.extname(name);
+  // Настоящее расширение из uploadFileName очищено до [a-zA-Z0-9.] — «_» в нём
+  // не бывает. «_» в extname значит, что точка стоит в легаси-ключе («a.b» →
+  // «a.b_README» → «.b_README»): тогда расширения нет, суффикс идёт в конец
+  // имени, иначе он уехал бы в ключ и маска <ключ>_* потеряла бы файл.
+  const rawExt = path.extname(name);
+  const ext = rawExt.includes("_") ? "" : rawExt;
   const base = name.slice(0, name.length - ext.length);
   for (let i = 2; i <= 99; i++) {
     const candidate = path.join(dir, `${base}-${i}${ext}`);
