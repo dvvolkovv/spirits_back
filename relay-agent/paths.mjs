@@ -12,6 +12,7 @@
 
 import fsp from "fs/promises";
 import path from "path";
+import { createHash, randomUUID } from "crypto";
 import { AGENT_SCRATCH_ROOT, AGENT_MCP_DIR } from "./sandbox-policy.mjs";
 
 export { AGENT_SCRATCH_ROOT, AGENT_MCP_DIR };
@@ -22,6 +23,9 @@ export { AGENT_SCRATCH_ROOT, AGENT_MCP_DIR };
 const SESSION_KEY_MAX = 48;
 const BASE_MAX = 180;
 const EXT_MAX = 12;
+// Хеш исходного имени, когда очистка что-то потеряла: "-" + 8 hex = 9 байт,
+// на столько короче режется основа — бюджет имени прежний.
+const NAME_HASH_LEN = 8;
 
 // sessionId прилетает прямо из тела запроса и уходит в пути на диске
 // (префикс загрузки, папка вывода, URL /files/...). Ключ файловой системы
@@ -77,8 +81,16 @@ export function uploadFileName(originalname, fsKey) {
   const rawExt = path.extname(originalname);
   const ext = rawExt.replace(/[^a-zA-Z0-9.]/g, "").slice(0, EXT_MAX);
   const baseRaw = path.basename(originalname, rawExt);
-  const baseSafe = baseRaw.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, BASE_MAX);
-  return fsKey + "_" + baseSafe + ext;
+  const cleaned = baseRaw.replace(/[^a-zA-Z0-9._-]/g, "_");
+  // Без потерь (только [a-zA-Z0-9._-] и в пределах длины) — как было:
+  // на эти имена опираются легаси-пути и тесты.
+  if (cleaned === baseRaw && cleaned.length <= BASE_MAX && ext === rawExt) {
+    return fsKey + "_" + cleaned + ext;
+  }
+  // Потери были: «смета.xlsx» и «отчет.xlsx» иначе обе давали "_____.xlsx"
+  // и вторая затирала первую (16.11.2026). Хеш — от исходного имени.
+  const hash = createHash("sha256").update(String(originalname)).digest("hex").slice(0, NAME_HASH_LEN);
+  return fsKey + "_" + cleaned.slice(0, BASE_MAX - NAME_HASH_LEN - 1) + "-" + hash + ext;
 }
 
 // Запасное имя, когда основное почему-то не легло на диск. Расширение уже
@@ -86,6 +98,28 @@ export function uploadFileName(originalname, fsKey) {
 export function fallbackFileName(originalname, fsKey, uuid) {
   const ext = path.extname(originalname).replace(/[^a-zA-Z0-9.]/g, "").slice(0, EXT_MAX);
   return fsKey + "_" + uuid + ext;
+}
+
+// Путь для загрузки, который ничего не перезаписывает: две «image.jpg» с
+// iPhone, повторная загрузка того же файла. Занято — суффикс -2…-99 перед
+// расширением, дальше 8 hex из uuid (полный uuid не влезает в NAME_MAX при
+// длинном имени). Префикс "<ключ>_" сохраняется: легаси-сессии читают
+// загрузки по маске <ключ>_*. exists — проверка занятости (fs.existsSync
+// в сервере, заглушка в тестах).
+export function uniqueUploadPath(dir, name, exists, random = () => randomUUID().slice(0, 8)) {
+  const first = path.join(dir, name);
+  if (!exists(first)) return first;
+  const ext = path.extname(name);
+  const base = name.slice(0, name.length - ext.length);
+  for (let i = 2; i <= 99; i++) {
+    const candidate = path.join(dir, `${base}-${i}${ext}`);
+    if (!exists(candidate)) return candidate;
+  }
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const candidate = path.join(dir, `${base}-${random()}${ext}`);
+    if (!exists(candidate)) return candidate;
+  }
+  throw new Error("нет свободного имени для загрузки: " + name);
 }
 
 // sid в GET /session/:sid/files идёт прямо из URL (Express сам его

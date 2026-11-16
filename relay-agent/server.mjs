@@ -7,7 +7,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import { turnFsKey, legacyTurnFsKey, uploadFileName, fallbackFileName, sessionOutputDir, ensureSessionDirs, ensureSessionUploadDir, ensureListingGuard, isValidFsKey } from "./paths.mjs";
+import { turnFsKey, legacyTurnFsKey, uploadFileName, fallbackFileName, uniqueUploadPath, sessionOutputDir, ensureSessionDirs, ensureSessionUploadDir, ensureListingGuard, isValidFsKey } from "./paths.mjs";
 import {
   AGENT_MCP_DIR, AGENT_SCRATCH_ROOT, sandboxMode, isCanarySession, buildSandboxSettings,
   baseToolsForTurn, buildTurnEnv, applySandboxPrompt, sandboxFailureFromToolResult,
@@ -575,8 +575,14 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   const renamedFiles = [];
   if (req.files && req.files.length > 0) {
     for (const f of req.files) {
-      const newPath = path.join(uploadSessionDir, uploadFileName(f.originalname, fsKey));
       try {
+        // Занятое имя не перезаписываем молча — суффикс (paths.mjs,
+        // uniqueUploadPath). Ошибка подбора уходит в запасное имя ниже.
+        const newPath = uniqueUploadPath(
+          uploadSessionDir,
+          uploadFileName(f.originalname, fsKey),
+          (p) => fileOps.existsSync(p),
+        );
         fileOps.renameSync(f.path, newPath);
         renamedFiles.push({ path: newPath, name: f.originalname, size: f.size });
       } catch (e) {
