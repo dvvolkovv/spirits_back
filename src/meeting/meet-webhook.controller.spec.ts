@@ -1,4 +1,4 @@
-import { UnauthorizedException, ServiceUnavailableException } from '@nestjs/common';
+import { UnauthorizedException, ServiceUnavailableException, NotFoundException } from '@nestjs/common';
 import { MeetWebhookController } from './meet-webhook.controller';
 import { canonicalJson } from './attendee-signature';
 import { createHmac } from 'crypto';
@@ -239,7 +239,15 @@ describe('MeetWebhookController', () => {
     expect(delivery.kick).toHaveBeenCalledTimes(1);
   });
 
-  it('calls.load вернул null — ack без enqueue', async () => {
+  it('calls.load бросил NotFoundException (реальный контракт) — ack без enqueue', async () => {
+    calls.load.mockRejectedValue(new NotFoundException('call not found'));
+    const p = hook('bot.state_change', { new_state: 'joined' });
+    await expect(ctl.receive(sign(p), p as any)).resolves.toEqual({ ok: true });
+    expect(inbox.enqueue).not.toHaveBeenCalled();
+    expect(delivery.kick).not.toHaveBeenCalled();
+  });
+
+  it('calls.load вернул null (защитная ветка) — ack без enqueue', async () => {
     calls.load.mockResolvedValue(null);
     const p = hook('bot.state_change', { new_state: 'joined' });
     await expect(ctl.receive(sign(p), p as any)).resolves.toEqual({ ok: true });

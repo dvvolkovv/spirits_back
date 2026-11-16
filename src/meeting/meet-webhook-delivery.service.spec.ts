@@ -1,3 +1,4 @@
+import { NotFoundException } from '@nestjs/common';
 import { MeetingWebhookDeliveryService, retryDelayMs } from './meet-webhook-delivery.service';
 
 const EVENT = {
@@ -40,7 +41,7 @@ describe('MeetingWebhookDeliveryService', () => {
   it('доставляет точное сообщение в комнату и отмечает delivered', async () => {
     inbox.claimBatch.mockResolvedValueOnce([EVENT]);
     await svc.pump();
-    expect(livekit.send).toHaveBeenCalledWith('meet_c1', EVENT.message);
+    expect(livekit.send).toHaveBeenCalledWith('meet_c1', EVENT.message, 10_000);
     expect(inbox.markDelivered).toHaveBeenCalledWith('1', 1);
     expect(inbox.markFailed).not.toHaveBeenCalled();
   });
@@ -63,6 +64,15 @@ describe('MeetingWebhookDeliveryService', () => {
     expect(livekit.send).not.toHaveBeenCalled();
     expect(inbox.markFailed).not.toHaveBeenCalled();
     expect((svc as any).logger.debug).toHaveBeenCalled();
+  });
+
+  it('NotFoundException от calls.load — discard, не retry', async () => {
+    calls.load.mockRejectedValue(new NotFoundException('call not found'));
+    inbox.claimBatch.mockResolvedValueOnce([EVENT]);
+    await svc.pump();
+    expect(inbox.markDiscarded).toHaveBeenCalledWith('1', 1, 'call missing or inactive');
+    expect(livekit.send).not.toHaveBeenCalled();
+    expect(inbox.markFailed).not.toHaveBeenCalled();
   });
 
   it('временный сбой отправки: pending, затем вторая попытка доставляет', async () => {

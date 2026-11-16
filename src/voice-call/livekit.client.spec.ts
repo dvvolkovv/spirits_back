@@ -114,3 +114,27 @@ describe('interactive-методы сохраняют прежнее повед�
     await expect(client.removeAgents('room-3')).resolves.toBeUndefined();
   });
 });
+
+describe('LiveKitClient.send', () => {
+  it('timeoutMs превращается в requestTimeout SDK в секундах, payload не меняется', async () => {
+    const sendData = jest.fn(async () => undefined);
+    const client = makeClient({ sendData });
+    const msg = { v: 1, type: 'meet_bot_state', state: 'joined', fatal: false };
+    await client.send('room-1', msg as any, 10_000);
+    const args = (RoomServiceClient as unknown as jest.Mock).mock.calls.at(-1)!;
+    expect(args[3]).toEqual({ requestTimeout: 10 });
+    expect(sendData).toHaveBeenCalledTimes(1);
+    const [room, payload, kind, opts] = sendData.mock.calls[0] as any[];
+    expect(room).toBe('room-1');
+    expect(JSON.parse(new TextDecoder().decode(payload))).toEqual(msg);
+    expect(kind).toBe(0);
+    expect(opts).toEqual({ topic: expect.any(String) });
+  });
+
+  it('без timeoutMs опций клиенту не передаётся', async () => {
+    const client = makeClient({ sendData: jest.fn(async () => undefined) });
+    await client.send('room-1', { v: 1 } as any);
+    const args = (RoomServiceClient as unknown as jest.Mock).mock.calls.at(-1)!;
+    expect(args[3]).toBeUndefined();
+  });
+});

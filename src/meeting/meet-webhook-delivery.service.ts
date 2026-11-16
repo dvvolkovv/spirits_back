@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
 import { LiveKitClient } from '../voice-call/livekit.client';
 import { VoiceCallService } from '../voice-call/voice-call.service';
@@ -81,7 +81,13 @@ export class MeetingWebhookDeliveryService {
       if (event.recovered) {
         this.logger.warn(`[meet] восстановлено после stale lease, event=${event.id}`);
       }
-      const call = await this.calls.load(event.callId);
+      let call: Awaited<ReturnType<VoiceCallService['load']>> | null = null;
+      try {
+        call = await this.calls.load(event.callId);
+      } catch (e) {
+        // load бросает NotFoundException для неизвестного звонка — как «нет».
+        if (!(e instanceof NotFoundException)) throw e;
+      }
       if (!call || !this.calls.isActive(call)) {
         const ok = await this.inbox.markDiscarded(event.id, event.attempts, 'call missing or inactive');
         if (!ok) this.logger.debug(`[meet] stale discard, event=${event.id} attempt=${event.attempts}`);
@@ -103,7 +109,7 @@ export class MeetingWebhookDeliveryService {
       timer = setTimeout(() => reject(new Error('livekit send timeout')), SEND_TIMEOUT_MS);
     });
     try {
-      await Promise.race([this.livekit.send(room, message as any), timeout]);
+      await Promise.race([this.livekit.send(room, message as any, SEND_TIMEOUT_MS), timeout]);
     } finally {
       if (timer) clearTimeout(timer);
     }

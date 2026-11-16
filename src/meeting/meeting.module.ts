@@ -4,6 +4,8 @@ import { VoiceCallModule } from '../voice-call/voice-call.module';
 import { MeetingController } from './meeting.controller';
 import { MeetingService } from './meeting.service';
 import { MeetWebhookController } from './meet-webhook.controller';
+import { MeetingWebhookInboxStore } from './meet-webhook-inbox.store';
+import { MeetingWebhookDeliveryService } from './meet-webhook-delivery.service';
 import { RoomModule } from './room.module';
 import { AttendeeClient } from './attendee.client';
 import { ZoomModule } from '../zoom/zoom.module';
@@ -24,7 +26,7 @@ import { ZoomModule } from '../zoom/zoom.module';
 @Module({
   imports: [CommonModule, RoomModule, ZoomModule, forwardRef(() => VoiceCallModule)],
   controllers: [MeetingController, MeetWebhookController],
-  providers: [MeetingService, AttendeeClient],
+  providers: [MeetingService, AttendeeClient, MeetingWebhookInboxStore, MeetingWebhookDeliveryService],
   // AttendeeClient экспортирован отдельно от MeetingService: его будет
   // инжектить реапер из VoiceCallModule, чтобы подбирать забытых ботов.
   exports: [MeetingService, AttendeeClient],

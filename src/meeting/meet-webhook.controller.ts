@@ -1,5 +1,5 @@
 import {
-  Body, Controller, Headers, Logger, Post, ServiceUnavailableException, UnauthorizedException,
+  Body, Controller, Headers, Logger, NotFoundException, Post, ServiceUnavailableException, UnauthorizedException,
 } from '@nestjs/common';
 import { VoiceCallService } from '../voice-call/voice-call.service';
 import { canonicalJson, verifyAttendeeSignature } from './attendee-signature';
@@ -126,6 +126,9 @@ export class MeetWebhookController {
     try {
       call = await this.calls.load(callId);
     } catch (e: any) {
+      // VoiceCallService.load бросает NotFoundException для неизвестного звонка:
+      // это «адресата нет», а не сбой — ack.
+      if (e instanceof NotFoundException) return { ok: true };
       // Не смогли прочитать звонок — это не «звонка нет». Ack потерял бы
       // событие, а Attendee ретраит именно на 5xx. Payload не логируем.
       this.logger.error(`[meet] не удалось загрузить звонок, trigger=${body.trigger}: ${e?.message}`);
