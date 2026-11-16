@@ -185,10 +185,14 @@ export class QualityMonitorService {
     // Удалённые учётки и тестовые номера исключены: 15.08.2026 алерт «всплеск
     // англоязычных ответов» целиком состоял из аккаунтов, заведённых и снесённых
     // в тот же день при отладке удаления профиля.
+    //
+    // Ход, перебитый под шлагбаумом выката релея (fail_reason
+    // relay_superseded), пуст не по вине модели: его текст унёс следующий ход.
+    // Пустым не считаем — иначе каждый выкат релея давал бы ложный всплеск.
     const chatRes = await this.pg.query(
       `SELECT
          count(*) FILTER (WHERE COALESCE((e.props->>'deduped')::boolean, false) = false)::int AS responses,
-         count(*) FILTER (WHERE COALESCE((e.props->>'empty')::boolean, false))::int AS empty,
+         count(*) FILTER (WHERE COALESCE((e.props->>'empty')::boolean, false) AND COALESCE(e.props->>'fail_reason', '') <> 'relay_superseded')::int AS empty,
          count(*) FILTER (WHERE COALESCE((e.props->>'lang_mismatch')::boolean, false))::int AS leak,
          count(*) FILTER (WHERE COALESCE((e.props->>'deduped')::boolean, false))::int AS deduped
        FROM events e

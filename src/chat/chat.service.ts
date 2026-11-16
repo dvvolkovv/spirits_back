@@ -2384,9 +2384,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // If we have actual content — save it.
       // If empty on final: don't pollute history with a stub AI row; save user message + a brief retry-hint.
       // (Frontend will reload history; user can simply resend.)
-      const aiText = fullText
-        || failureStub
-        || (final && !selfHealSkippedForTakeover ? chatFailureText('noReply', userLanguage, { storeBuild }) : '');
+      // Заглушка шлагбаума в истории — всегда, даже за текстом хода (хвост
+      // карточки продукта): иначе человек не узнал бы, что сообщение надо
+      // отправить ещё раз.
+      const aiText = failureStub
+        ? [fullText, failureStub].filter(Boolean).join('\n\n')
+        : fullText || (final && !selfHealSkippedForTakeover ? chatFailureText('noReply', userLanguage, { storeBuild }) : '');
       if (!aiText) return; // skip empty intermediate persists
       // ЭТО реальная точка списания (ниже addTokenTask). Логируем только здесь:
       // путь показа считает то же самое, дублировать в лог незачем.
@@ -2461,16 +2464,19 @@ ${LanguageService.buildDirective(userLanguage)}`;
               { balance: () => this.getTokenBalance(userId) },
             );
           }
+          // Ход, не дождавшийся релея (failureStub), разговором не был: в
+          // fullText разве что хвост карточки — учить по нему нечему.
+          const learn = !failureStub;
           // Профиль формируется и в fresh-режиме (чистый лист скрывает контекст,
           // но не отключает обучение профиля).
-          if (this.neo4j) {
+          if (this.neo4j && learn) {
             try { await this.neo4j.consolidateFromChat(userId, assistantId, message, fullText); } catch {}
           }
           // Задачи из fresh-разговора не извлекаем — чистый лист без побочных задач.
-          if (this.tasksService && !fresh) {
+          if (this.tasksService && !fresh && learn) {
             try { await this.tasksService.extractFromTurn(userId, assistantId, message, fullText); } catch {}
           }
-          if (this.businessProfile && !fresh) {
+          if (this.businessProfile && !fresh && learn) {
             try { await this.businessProfile.extractFromTurn(userId, assistantId, message, fullText); } catch {}
           }
         }
@@ -2601,7 +2607,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           return fd;
         };
 
-        const agentRes: any = await this.postRelayTurn(attempt.sessionId, mark, relayCarry, () => {
+        const agentRes = await this.postRelayTurn(attempt.sessionId, mark, relayCarry, () => {
           const fd = buildForm();
           return axios.post(`${AGENT_URL}/chat`, fd, {
             headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
@@ -3031,7 +3037,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Async persist — dedup via `saved` flag with the catch-path persist.
       setImmediate(() => { void persistResponse(true); });
     } catch (err) {
-      this.logger.error(`Universal agent proxy error: ${err.message}`);
+      if (err instanceof RelayDrainingError) {
+        // Шлагбаум выката — штатный исход, не сбой. Без relaySid (в ключе
+        // сессии номер телефона) и без текста человека.
+        this.logger.warn(err.superseded ? 'шлагбаум релея: перебит' : 'шлагбаум релея: не дождались');
+      } else {
+        this.logger.error(`Universal agent proxy error: ${err.message}`);
+      }
       // Апстрим мог упасть ПОСЛЕ done (ev.outputFiles уже разобран синхронно
       // обработчиком `data`, ошибка пришла дальше по тому же потоку) — файлы
       // хода всё равно надо скопировать и дописать ссылкой, иначе их потерял
@@ -3068,7 +3080,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
           const joined = chunks.join('');
           const cleaned = stripProductActionBlocks(joined);
           if (cleaned !== joined) chunks.splice(0, chunks.length, cleaned);
-          const taken = (await this.productActions?.takeForTurn(userId, productsTurn, new Date(streamStartTime), 'web')) ?? [];
+          // Ход под шлагбаумом выката до релея не дошёл: свои карточки (если их
+          // завёл первый прогон self-heal) найдутся по метке хода. Запасной
+          // путь по времени с начала хода за минуты ожидания подобрал бы только
+          // чужие — заведённые другим ходом того же человека, — поэтому since = сейчас.
+          const since = err instanceof RelayDrainingError ? new Date() : new Date(streamStartTime);
+          const taken = (await this.productActions?.takeForTurn(userId, productsTurn, since, 'web')) ?? [];
           const tail = productActionTail(taken, ui.cards, userLanguage);
           if (tail) {
             chunks.push(tail);
@@ -3083,10 +3100,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // Ход ждал релей за шлагбаумом, и его перебило новое сообщение: оно
         // уже несёт текст этого хода (relayCarryFor). Тихий конец — без
         // заглушки и без строки ассистента в истории.
+        // Своя метка, не 'preempted': ответ не потерян, а придёт со следующим
+        // ходом, — алерт пустых ответов такие ходы не считает.
         turnFailed = true;
-        failReason = 'preempted';
+        failReason = 'relay_superseded';
         selfHealSkippedForTakeover = true;
-        safeWrite({ type: 'end', content: '', usage: { input: 0, output: 0, total: 0 } });
+        safeWrite({ type: 'end', content: '', reason: 'superseded', usage: { input: 0, output: 0, total: 0 } });
       } else if (err instanceof RelayDrainingError) {
         // Релей обновлялся дольше бюджета повтора. Токены не списаны —
         // turnFailed, а заглушка не в fullText.
