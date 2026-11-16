@@ -103,6 +103,27 @@ function turn(svc: ChatService, message: string, upstreams: (Readable | Error)[]
 const tokenInserts = (calls: { sql: string }[]) => calls.filter((c) => /INSERT INTO token_consumption_tasks/.test(c.sql));
 const savedStrings = (calls: { params: any[] }[]) => calls.flatMap((c) => c.params).filter((p) => typeof p === 'string');
 
+/**
+ * Обучение профиля, разбор задач и карточка бизнеса — то, что persistResponse
+ * зовёт за ход с текстом ответа. Подменяем зависимости, чтобы видеть вызовы.
+ */
+function learning(svc: ChatService) {
+  const spies = {
+    consolidate: jest.fn(async (..._a: any[]) => {}),
+    tasks: jest.fn(async (..._a: any[]) => {}),
+    business: jest.fn(async (..._a: any[]) => {}),
+  };
+  (svc as any).neo4j = { consolidateFromChat: spies.consolidate };
+  (svc as any).tasksService = { extractFromTurn: spies.tasks, buildContextForPrompt: jest.fn(async () => '') };
+  (svc as any).businessProfile = { extractFromTurn: spies.business, renderForPrompt: jest.fn(async () => '') };
+  return spies;
+}
+function expectNoLearning(spies: ReturnType<typeof learning>) {
+  expect(spies.consolidate).not.toHaveBeenCalled();
+  expect(spies.tasks).not.toHaveBeenCalled();
+  expect(spies.business).not.toHaveBeenCalled();
+}
+
 describe('веб-ход под шлагбаумом выката релея', () => {
   it('W1: 503, потом поток — ответ доходит, ход тарифицируется как обычный', async () => {
     const { svc, calls } = makeServiceWithPgCalls();
@@ -125,6 +146,7 @@ describe('веб-ход под шлагбаумом выката релея', ()
     svc.relayDrainDelaysMs = [0];
     const track = jest.fn();
     (svc as any).events = { track };
+    const learn = learning(svc);
     const t = turn(svc, 'hello', [err503(), err503()], 'en');
     await t.done;
     await settle();
@@ -137,6 +159,8 @@ describe('веб-ход под шлагбаумом выката релея', ()
     }));
     expect(tokenInserts(calls)).toEqual([]);
     expect(savedStrings(calls)).toContain(stub);
+    // Заглушка — не разговор: профиль, задачи и карточка бизнеса не учатся.
+    expectNoLearning(learn);
   });
 
   it('W3: новое сообщение, пока ход ждёт, — несёт его текст, ждущий сдаётся молча', async () => {
@@ -144,6 +168,8 @@ describe('веб-ход под шлагбаумом выката релея', ()
     let wake: () => void = () => {};
     svc.relayDrainDelaysMs = [1000];
     svc.relayDrainSleep = () => new Promise<void>((r) => { wake = () => r(); });
+    const track = jest.fn();
+    (svc as any).events = { track };
 
     const a = turn(svc, 'первое', [err503()]);
     await settle();
@@ -161,8 +187,12 @@ describe('веб-ход под шлагбаумом выката релея', ()
     wake();
     await a.done;
     await settle();
-    expect(ends(a.res)).toEqual([expect.objectContaining({ type: 'end', content: '' })]);
+    expect(ends(a.res)).toEqual([expect.objectContaining({ type: 'end', content: '', reason: 'superseded' })]);
     expect(items(a.res)).toEqual([]);
+    // Своя метка: перебитый под шлагбаумом — не пустой ответ модели.
+    expect(track).toHaveBeenCalledWith('chat_quality', expect.objectContaining({
+      props: expect.objectContaining({ failed: true, fail_reason: 'relay_superseded' }),
+    }));
 
     upB.push(DONE); upB.push(null);
     await b.done;
@@ -190,5 +220,55 @@ describe('веб-ход под шлагбаумом выката релея', ()
     retry.push(DELTA); retry.push(DONE); retry.push(null);
     await t.done;
     expect(ends(t.res)[0].content).toContain('ответ');
+  });
+
+  it('W5: повтор self-heal не дождался релея — заглушка «обновляется», без списания', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] });
+    const { svc, calls } = makeServiceWithPgCalls();
+    svc.relayDrainDelaysMs = [0];
+    const empty = stream();
+    const t = turn(svc, 'привет', [empty, err503(), err503()]);
+    await settle();
+    empty.push(null); // пустой поток — self-heal ждёт 800 мс и повторяет
+    await settle();
+    jest.advanceTimersByTime(800);
+    await t.done;
+    await settle();
+
+    const stub = chatFailureText('relayUpdating', 'ru');
+    expect(post).toHaveBeenCalledTimes(3);
+    expect(items(t.res)).toEqual([stub]);
+    expect(ends(t.res)).toEqual([expect.objectContaining({ type: 'end', content: stub, reason: 'relay_draining' })]);
+    expect(tokenInserts(calls)).toEqual([]);
+  });
+
+  it('W7: бюджет исчерпан — карточку, заведённую за время ожидания другим ходом, не забирает', async () => {
+    const { svc, calls } = makeServiceWithPgCalls();
+    const learn = learning(svc);
+    // Посреди ожидания другой ход того же человека заводит карточку продукта.
+    // takeForTurn, как настоящий, по запасному пути отдаёт всё, что заведено
+    // не раньше since.
+    let midTs = 0;
+    const takeForTurn = jest.fn(async (_u: string, _turn: string | null, since: Date) =>
+      (midTs > 0 && since.getTime() <= midTs ? [{ id: 'card-other', kind: 'create_bot', payload: {} }] : []));
+    (svc as any).productActions = { takeForTurn };
+    const pause = () => new Promise<void>((r) => setTimeout(r, 5));
+    svc.relayDrainDelaysMs = [1000];
+    svc.relayDrainSleep = async () => { await pause(); midTs = Date.now(); await pause(); };
+
+    const t = turn(svc, 'привет', [err503(), err503()]);
+    await t.done;
+    await settle();
+
+    const stub = chatFailureText('relayUpdating', 'ru');
+    expect(midTs).toBeGreaterThan(0);
+    expect(takeForTurn).toHaveBeenCalled();
+    expect(items(t.res)).toEqual([stub]);
+    expect(ends(t.res)).toEqual([expect.objectContaining({ type: 'end', content: stub, reason: 'relay_draining' })]);
+    const saved = savedStrings(calls).join('\n');
+    expect(saved).toContain(stub);
+    expect(saved).not.toContain('card-other');
+    expect(tokenInserts(calls)).toEqual([]);
+    expectNoLearning(learn);
   });
 });
