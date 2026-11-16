@@ -558,7 +558,8 @@ export class ChatController {
       if (!res.writableEnded) safeWrite({ type: 'ping' });
     });
     try {
-      const agentRes = await this.chatService.postRelayTurn(handoff.sessionId, relayMark, relayCarry, () => {
+      // axios здесь — require без типов: тип ответа postRelayTurn не выводится.
+      const agentRes: any = await this.chatService.postRelayTurn(handoff.sessionId, relayMark, relayCarry, () => {
         const fd = buildForm();
         return axios.default.post(`${AGENT_URL}/chat`, fd, {
           headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
