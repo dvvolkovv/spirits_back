@@ -173,7 +173,7 @@ export class ReferralService implements OnModuleInit {
         CREATE TABLE IF NOT EXISTS referral_token_payouts (
           id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
           leader_id uuid NOT NULL,
-          user_phone varchar(20) NOT NULL,
+          user_phone varchar(64) NOT NULL,
           rub numeric(10,2) NOT NULL,
           tokens integer NOT NULL,
           rate integer NOT NULL,
@@ -189,7 +189,7 @@ export class ReferralService implements OnModuleInit {
         CREATE TABLE IF NOT EXISTS referral_withdrawals (
           id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
           leader_id uuid NOT NULL,
-          user_phone varchar(20) NOT NULL,
+          user_phone varchar(64) NOT NULL,
           amount_rub numeric(10,2) NOT NULL,
           method varchar(20) NOT NULL,
           requisites text NOT NULL,
@@ -202,7 +202,46 @@ export class ReferralService implements OnModuleInit {
     } catch (e: any) {
       this.logger.error(`referral_withdrawals migration failed: ${e.message}`);
     }
-    // Двусторонний бонус: сколько токенов начислено приглашённому (аудит/идемпотентность).
+    // Task 17C: phone-колонки выплат/выводов расширены до varchar(64) — в них
+    // при обезличивании (referral.purge) пишется deletion-scoped alias
+    // 'deleted:<deletionId>' (44 символа), который в исторические varchar(20)
+    // не помещается. Расширение binary-coercible (без table rewrite) и
+    // охранительное: DO-блок срабатывает, только если колонка всё ещё уже 64
+    // (character_maximum_length IS NOT NULL — text-колонки не трогаем;
+    // leaders/referees/commissions уже TEXT силами migrations/001).
+    try {
+      await this.pg.query(`
+        DO $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = current_schema()
+                        AND table_name = 'referral_token_payouts'
+                        AND column_name = 'user_phone'
+                        AND character_maximum_length IS NOT NULL
+                        AND character_maximum_length < 64) THEN
+            ALTER TABLE referral_token_payouts ALTER COLUMN user_phone TYPE varchar(64);
+          END IF;
+        END $$`);
+    } catch (e: any) {
+      this.logger.error(`referral_token_payouts.user_phone widen migration failed: ${e.message}`);
+    }
+    try {
+      await this.pg.query(`
+        DO $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = current_schema()
+                        AND table_name = 'referral_withdrawals'
+                        AND column_name = 'user_phone'
+                        AND character_maximum_length IS NOT NULL
+                        AND character_maximum_length < 64) THEN
+            ALTER TABLE referral_withdrawals ALTER COLUMN user_phone TYPE varchar(64);
+          END IF;
+        END $$`);
+    } catch (e: any) {
+      this.logger.error(`referral_withdrawals.user_phone widen migration failed: ${e.message}`);
+    }
+    // Двусторонний бонус: сколько токенов начиснено приглашённому (аудит/идемпотентность).
     try {
       await this.pg.query(`ALTER TABLE referral_referees ADD COLUMN IF NOT EXISTS bonus_tokens integer NOT NULL DEFAULT 0`);
     } catch (e: any) {
@@ -281,7 +320,7 @@ export class ReferralService implements OnModuleInit {
         `SELECT l.user_phone, l.payout_notified,
                 COALESCE(SUM(c.commission_rub) FILTER (WHERE NOT c.paid_out), 0) AS pending
            FROM referral_leaders l LEFT JOIN referral_commissions c ON c.leader_id = l.id
-          WHERE l.id = $1 GROUP BY l.user_phone, l.payout_notified`,
+          WHERE l.id = $1 AND l.is_active GROUP BY l.user_phone, l.payout_notified`,
         [leaderId],
       );
       const row = r.rows[0];
@@ -313,7 +352,7 @@ export class ReferralService implements OnModuleInit {
     }
     if (requisites.length < 4) throw new BadRequestException('Укажите реквизиты для вывода');
 
-    const leaderRes = await this.pg.query('SELECT id FROM referral_leaders WHERE user_phone = $1 LIMIT 1', [userId]);
+    const leaderRes = await this.pg.query('SELECT id FROM referral_leaders WHERE user_phone = $1 AND is_active = true LIMIT 1', [userId]);
     const leaderId = leaderRes.rows[0]?.id;
     if (!leaderId) throw new BadRequestException('Реферальный аккаунт не найден');
 
@@ -408,7 +447,7 @@ export class ReferralService implements OnModuleInit {
   // без модерации — внутренняя операция). Атомарно: зачисление токенов +
   // пометка комиссий paid_out + запись в журнал, в одной транзакции.
   async payoutTokens(userId: string): Promise<{ rub: number; tokens: number; newBalance: number }> {
-    const leaderRes = await this.pg.query('SELECT id FROM referral_leaders WHERE user_phone = $1 LIMIT 1', [userId]);
+    const leaderRes = await this.pg.query('SELECT id FROM referral_leaders WHERE user_phone = $1 AND is_active = true LIMIT 1', [userId]);
     const leaderId = leaderRes.rows[0]?.id;
     if (!leaderId) throw new BadRequestException('Реферальный аккаунт не найден');
 
@@ -507,7 +546,7 @@ export class ReferralService implements OnModuleInit {
     // веб снимает сохранённый slug при любом исходе. Сравниваем по часам API:
     // их расхождение с часами базы — секунды против часового окна.
     const born = await this.pg.query(
-      'SELECT welcome_bonus_at FROM user_id WHERE internal_id = $1 LIMIT 1',
+      'SELECT welcome_bonus_at FROM user_id WHERE internal_id = $1 AND state = \'active\' LIMIT 1',
       [userId],
     );
     const bornAt = born.rows[0]?.welcome_bonus_at ? new Date(born.rows[0].welcome_bonus_at).getTime() : NaN;

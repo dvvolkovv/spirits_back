@@ -260,9 +260,17 @@ maybe('support SLA migration against PostgreSQL', () => {
   }
 
   async function newTicket(status = 'escalated'): Promise<string> {
+    const owner = `runtime-${Date.now()}-${Math.random()}`;
+    // Task 17A: adminReply проверяет state='active' владельца тикета —
+    // синтетический владелец должен существовать в user_id, как в проде.
+    await pool.query(
+      `INSERT INTO user_id (internal_id, state) VALUES ($1, 'active')
+       ON CONFLICT (internal_id) DO NOTHING`,
+      [owner],
+    );
     const r = await pool.query(
       `INSERT INTO support_tickets (user_id, status) VALUES ($1, $2) RETURNING id`,
-      [`runtime-${Date.now()}-${Math.random()}`, status],
+      [owner, status],
     );
     return r.rows[0].id;
   }

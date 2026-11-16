@@ -5,6 +5,7 @@ import { WELCOME_BONUS } from '../identity/identity.service';
 import { REFEREE_BONUS_TOKENS } from '../referral/referral.service';
 import { computeVeoQuote } from '../video/video.dto';
 import { LIMITS } from '../peer/peer.dto';
+import { ACCOUNT_DELETION_RETENTION_DAYS } from '../account-deletion/account-deletion.safe';
 
 describe('числа справки — из констант', () => {
   it('fmt: пробел между тысячами', () => {
@@ -21,6 +22,7 @@ describe('числа справки — из констант', () => {
     expect(V.welcomeBonus).toBe(fmt(WELCOME_BONUS));
     expect(V.refereeBonus).toBe(fmt(REFEREE_BONUS_TOKENS));
     expect(V.introMax).toBe(fmt(LIMITS.INTRO_MAX));
+    expect(V.accountDeletionDays).toBe(String(ACCOUNT_DELETION_RETENTION_DAYS));
   });
 
   it('цены видео посчитаны функцией котировки', () => {

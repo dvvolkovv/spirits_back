@@ -2,13 +2,26 @@ import { encryptSecret, decryptSecret, hasSecretKey } from './crypto';
 import { overlaps, CalendarService } from './calendar.service';
 import { YandexCalDavConnector } from './caldav';
 
+// Task 9: гейтящие методы (creds/connect/reconnect/listEvents/createEvent/
+// deleteEvent/...) начинаются с `SELECT state FROM user_id`. Старые моки
+// отвечали { rows: [] } на всё, что теперь означало бы «аккаунт удалён».
+// Helper ниже отвечает active на state-запрос и пустой результат на всё прочее.
+// Второй (необязательный) параметр в сигнатуре мока — write-scoping тесты
+// читают call[1] (параметры WHERE), и broad tsc обязан видеть кортеж из двух
+// элементов; поведение мока не меняется.
+const activeRowsPg = () => ({
+  query: jest.fn(async (sql: string, _params?: unknown[]) => (String(sql).includes('SELECT state FROM user_id')
+    ? { rows: [{ state: 'active' }] }
+    : { rows: [] })),
+});
+
 describe('connect() app-password hygiene', () => {
   beforeAll(() => { process.env.CALENDAR_SECRET_KEY = '0123456789abcdef0123456789abcdef'; });
   afterEach(() => jest.restoreAllMocks());
   // Regression: Яндекс показывает пароль приложения группами через пробелы; введённый как есть,
   // он уходил в Basic-auth с пробелами → 401 на «правильном» пароле. connect() должен вырезать ВСЕ пробелы.
   it('strips whitespace from the app-password and trims the username', async () => {
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const pg = activeRowsPg();
     const service = new CalendarService(pg as any, {} as any, {} as any, {} as any);
     const testSpy = jest.spyOn(YandexCalDavConnector.prototype, 'test').mockResolvedValue(true);
     jest.spyOn(YandexCalDavConnector.prototype, 'discoverCollection').mockResolvedValue('https://cal.example/');
@@ -79,7 +92,7 @@ describe('overlaps', () => {
 // own row in calendar_connections — never a hardcoded id, never another user's connection.
 describe('CalendarService.createEvent — write-scoping (no cross-user writes)', () => {
   it('is scoped to the passed userId and fails closed when that user has no connection', async () => {
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const pg = activeRowsPg();
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
     const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
@@ -94,7 +107,7 @@ describe('CalendarService.createEvent — write-scoping (no cross-user writes)',
   });
 
   it("never reaches another user's (the owner's) connection while creating an event for userB", async () => {
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const pg = activeRowsPg();
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
     const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
@@ -115,7 +128,7 @@ describe('CalendarService.createEvent — write-scoping (no cross-user writes)',
 // never touch another user's connection either.
 describe('CalendarService.setTaskDone — write-scoping (no cross-user writes)', () => {
   it('is scoped to the passed userId and fails closed when that user has no connection', async () => {
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const pg = activeRowsPg();
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
     const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
@@ -130,7 +143,7 @@ describe('CalendarService.setTaskDone — write-scoping (no cross-user writes)',
   });
 
   it("never reaches another user's (the owner's) connection while setting a task done for userB", async () => {
-    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const pg = activeRowsPg();
     const talerIdStore = { getConnection: jest.fn().mockResolvedValue(null) };
     const talerIdConnector = { listEvents: jest.fn(), createEvent: jest.fn() };
     const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
@@ -153,7 +166,7 @@ describe('createTaskFromProposal — task proposals route to the cloud task home
     const create = jest.fn().mockResolvedValue({ uid: 'u1' });
     const linkeonTasks = { create };
     const service = new CalendarService(
-      { query: jest.fn().mockResolvedValue({ rows: [] }) } as any,
+      activeRowsPg() as any,
       {} as any, {} as any, linkeonTasks as any,
     );
     return { service, create };
@@ -197,7 +210,7 @@ describe('createTaskRouted — TalerID-connected users write tasks to TalerID (o
     const createTask = jest.fn().mockResolvedValue({ ok: true, uid: 't1' });
     const linkeonCreate = jest.fn();
     const svc = new CalendarService(
-      { query: jest.fn().mockResolvedValue({ rows: [] }) } as any,
+      activeRowsPg() as any,
       { getConnection: jest.fn().mockResolvedValue({ status: 'connected' }) } as any,
       { createTask } as any,
       { create: linkeonCreate } as any,
@@ -216,7 +229,7 @@ describe('createTaskRouted — TalerID-connected users write tasks to TalerID (o
   });
   it('TalerID createTask fails → createTaskFromProposal returns false (proposal reverts)', async () => {
     const svc = new CalendarService(
-      { query: jest.fn().mockResolvedValue({ rows: [] }) } as any,
+      activeRowsPg() as any,
       { getConnection: jest.fn().mockResolvedValue({ status: 'connected' }) } as any,
       { createTask: jest.fn().mockResolvedValue({ ok: false }) } as any,
       { create: jest.fn() } as any,
@@ -235,7 +248,7 @@ describe('renameTasksByTitle — TalerID rename (dedupe routine occurrences by u
     ]);
     const updateTask = jest.fn().mockResolvedValue({ ok: true });
     const svc = new CalendarService(
-      { query: jest.fn().mockResolvedValue({ rows: [] }) } as any,
+      activeRowsPg() as any,
       { getConnection: jest.fn().mockResolvedValue({ status: 'connected' }) } as any,
       { listTasks, updateTask } as any,
       { create: jest.fn() } as any,
@@ -255,5 +268,150 @@ describe('renameTasksByTitle — TalerID rename (dedupe routine occurrences by u
     );
     expect(await svc.renameTasksByTitle('u', '', 'x')).toBe(0);
     expect(updateTask).not.toHaveBeenCalled();
+  });
+});
+
+// Task 9 (account deletion): удалённый аккаунт не должен управлять календарём.
+// Любой вызов, который способен уйти во внешний коннектор (CalDAV/Exchange/
+// TalerID), обязан начинаться со строгой проверки state='active' одним
+// SELECT state FROM user_id — без кэшей. Остановку подключения выполняет
+// deletion-адаптер через disconnect/disconnectExchange (они НЕ гейтятся).
+describe('CalendarService — забор на удалённом аккаунте (Task 9)', () => {
+  beforeAll(() => { process.env.CALENDAR_SECRET_KEY = '0123456789abcdef0123456789abcdef'; });
+
+  const inactivePg = (state: string) => ({
+    query: jest.fn(async (sql: string) => {
+      const s = String(sql);
+      if (s.includes('SELECT state FROM user_id')) return { rows: [{ state }] };
+      // Сохранённое подключение существует: без забора reconnect пошёл бы
+      // проверять пароль во внешний CalDAV.
+      if (s.includes('FROM calendar_connections') && s.includes('secret_enc IS NOT NULL')) {
+        return {
+          rows: [{
+            provider: 'yandex',
+            base_url: 'https://caldav.yandex.ru',
+            username: 'me',
+            secret_enc: encryptSecret('app-pass'),
+          }],
+        };
+      }
+      return { rows: [] };
+    }),
+  });
+
+  function makeService(state: string) {
+    const pg = inactivePg(state);
+    const talerIdStore = { getConnection: jest.fn().mockResolvedValue({ status: 'connected' }) };
+    const talerIdConnector = {
+      listEvents: jest.fn().mockResolvedValue([]),
+      createEvent: jest.fn(),
+      deleteEvent: jest.fn(),
+    };
+    const service = new CalendarService(pg as any, talerIdStore as any, talerIdConnector as any, {} as any);
+    (service as any).connector = {
+      test: jest.fn().mockResolvedValue(true),
+      discoverCollection: jest.fn().mockResolvedValue('https://cal.example/'),
+      discoverTaskCollection: jest.fn().mockResolvedValue(null),
+      listEvents: jest.fn().mockResolvedValue([]),
+      createEvent: jest.fn(),
+      deleteEvent: jest.fn(),
+    };
+    (service as any).exchange = { test: jest.fn().mockResolvedValue(true), listEvents: jest.fn().mockResolvedValue([]) };
+    return { service, pg, talerIdStore, talerIdConnector };
+  }
+
+  it('deleted: reconnect не трогает connector и не возвращает ok', async () => {
+    const { service, talerIdStore } = makeService('deleted');
+    const res = await service.reconnect('u-deleted');
+    expect(res.ok).toBe(false);
+    expect((service as any).connector.test).not.toHaveBeenCalled();
+    expect(talerIdStore.getConnection).not.toHaveBeenCalled();
+  });
+
+  it('deleted: connect не проверяет креды во внешнем CalDAV', async () => {
+    const { service } = makeService('deleted');
+    const res = await service.connect('u-deleted', 'yandex', 'me', 'app-pass');
+    expect(res.ok).toBe(false);
+    expect((service as any).connector.test).not.toHaveBeenCalled();
+  });
+
+  it('deleted: createEvent не уходит ни в TalerID, ни в CalDAV', async () => {
+    const { service, talerIdStore, talerIdConnector } = makeService('deleted');
+    const res = await service.createEvent('u-deleted', { title: 'x', datetime: '2026-11-11T10:00:00' });
+    expect(res.ok).toBe(false);
+    expect(talerIdStore.getConnection).not.toHaveBeenCalled();
+    expect(talerIdConnector.createEvent).not.toHaveBeenCalled();
+    expect((service as any).connector.createEvent).not.toHaveBeenCalled();
+  });
+
+  it('deleted: deleteEvent (включая source=talerid) не удаляет внешнее событие', async () => {
+    const { service, talerIdConnector } = makeService('deleted');
+    const res = await service.deleteEvent('u-deleted', 'uid-1', 'talerid');
+    expect(res.ok).toBe(false);
+    expect(talerIdConnector.deleteEvent).not.toHaveBeenCalled();
+    expect((service as any).connector.deleteEvent).not.toHaveBeenCalled();
+  });
+
+  it('deleted: listEvents возвращает [] и не читает внешние источники', async () => {
+    const { service, talerIdConnector } = makeService('deleted');
+    const events = await service.listEvents('u-deleted', new Date(), new Date(Date.now() + 864e5));
+    expect(events).toEqual([]);
+    expect((service as any).connector.listEvents).not.toHaveBeenCalled();
+    expect((service as any).exchange.listEvents).not.toHaveBeenCalled();
+    expect(talerIdConnector.listEvents).not.toHaveBeenCalled();
+  });
+
+  it('active: поведение прежнее — reconnect проверяет сохранённый пароль, listEvents читает источники', async () => {
+    const { service } = makeService('active');
+    const res = await service.reconnect('u-active');
+    expect(res.ok).toBe(true);
+    expect((service as any).connector.test).toHaveBeenCalledTimes(1);
+    const events = await service.listEvents('u-active', new Date(), new Date(Date.now() + 864e5));
+    expect(events).toEqual([]);
+  });
+});
+
+// Review I-1 (account deletion): CalendarController.connect пропускает
+// body.provider без валидации. Отравленная строка calendar_connections
+// (provider с пробелом/длиной >128) ломает sanitizer deletion-discovery, и
+// planner.collect падает ЦЕЛИКОМ — аккаунт никогда не удаляется. Первый слой
+// защиты: whitelist в connect (фактически поддержан только yandex — baseUrl
+// захардкожен), невалидный provider → существующая ошибка подключения, БЕЗ
+// внешней проверки и БЕЗ записи строки.
+describe('CalendarService.connect — whitelist provider (review I-1)', () => {
+  beforeAll(() => { process.env.CALENDAR_SECRET_KEY = '0123456789abcdef0123456789abcdef'; });
+
+  const makeSvc = () => {
+    const pg = activeRowsPg();
+    const service = new CalendarService(pg as any, {} as any, {} as any, {} as any);
+    (service as any).connector = {
+      test: jest.fn().mockResolvedValue(true),
+      discoverCollection: jest.fn().mockResolvedValue('https://cal.example/'),
+      discoverTaskCollection: jest.fn().mockResolvedValue(null),
+    };
+    return { service, pg };
+  };
+
+  it.each([
+    ['Yandex 360'],
+    ['yandex '],
+    ['x'.repeat(200)],
+    [''],
+  ])('provider %j отклоняется без записи и внешнего вызова', async (provider) => {
+    const { service, pg } = makeSvc();
+    const res = await service.connect('u1', provider, 'me', 'app-pass');
+    expect(res.ok).toBe(false);
+    expect(res.error).toBe('Не удалось подключиться — проверь логин и пароль приложения');
+    expect((service as any).connector.test).not.toHaveBeenCalled();
+    for (const call of pg.query.mock.calls) {
+      expect(String(call[0])).not.toContain('INSERT INTO calendar_connections');
+    }
+  });
+
+  it('yandex по-прежнему подключается', async () => {
+    const { service, pg } = makeSvc();
+    const res = await service.connect('u1', 'yandex', 'me', 'app-pass');
+    expect(res.ok).toBe(true);
+    expect(pg.query).toHaveBeenCalledWith(expect.stringContaining('INSERT INTO calendar_connections'), expect.anything());
   });
 });

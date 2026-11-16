@@ -44,6 +44,28 @@ export class VoiceDocumentService {
   ) {}
 
   /**
+   * Строгая проверка живости аккаунта (Task 10, удаление аккаунтов): один
+   * SELECT state FROM user_id до любых внешних вызовов и записей. Нет строки
+   * или state не 'active' — фоновое продолжение молча не выполняется:
+   * удалённый аккаунт не сочиняет документы/заметки, не ходит в LLM и MinIO
+   * и не оставляет новых строк. Отрицательный результат не кешируем — между
+   * вызовами возможна reactivation.
+   */
+  private async assertActive(userId: string): Promise<boolean> {
+    try {
+      const r = await this.pg.query(
+        `SELECT state FROM user_id WHERE internal_id=$1 LIMIT 1`,
+        [userId],
+      );
+      return r.rows[0]?.state === 'active';
+    } catch {
+      // Сбой проверки трактуем fail-closed: лучше не дописать документ
+      // живому (перезапросит), чем дописать удалённому.
+      return false;
+    }
+  }
+
+  /**
    * Задание на документ в чат того, кто его пишет.
    *
    * Пишется от лица пользователя: заказ исходит от него, Роман лишь передал
@@ -211,6 +233,11 @@ export class VoiceDocumentService {
     callId: string, roomName: string, userId: string, title: string, instructions: string,
     append: boolean,
   ): Promise<void> {
+    // Task 10: удалённый аккаунт не сочиняет заметки и не пишет в TalerID.
+    if (!(await this.assertActive(userId))) {
+      this.logger.warn(`заметка не продолжена: аккаунт неактивен`);
+      return;
+    }
     if (!this.notes) {
       await this.safeSend(roomName, { v: 1, type: 'note_failed', title, reason: 'not_connected' });
       return;
@@ -246,6 +273,13 @@ export class VoiceDocumentService {
       );
       const body = (reply.text || '').trim();
       if (!body) throw new Error('пустая заметка');
+
+      // Task 10: аккаунт могли удалить, пока модель писала заметку — запись в
+      // TalerID и списание токенов тогда уже не нужны.
+      if (!(await this.assertActive(userId))) {
+        this.logger.warn(`заметка не сохранена: аккаунт неактивен`);
+        return;
+      }
 
       // Дополнение ОБНОВЛЯЕТ ту же заметку, а не плодит вторую (дефект владельца 11.10.2026).
       const saved = prev
@@ -378,6 +412,12 @@ export class VoiceDocumentService {
     userId: string, title: string, instructions: string,
     agentId: number, author?: string,
   ): Promise<void> {
+    // Task 10: аккаунт могли удалить между тулом и этим продолжением. Гейт ДО
+    // любых строк и внешних вызовов — удалённому не пишем даже «pending».
+    if (!(await this.assertActive(userId))) {
+      this.logger.warn(`документ не продолжен: аккаунт неактивен`);
+      return;
+    }
     await this.safeSend(roomName, { v: 1, type: 'document_pending', docId, title, specialist: author });
 
     // Задание — в чат автора СРАЗУ, до того как документ написан.
@@ -420,6 +460,14 @@ export class VoiceDocumentService {
       );
       const body = (reply.text || '').trim();
       if (!body) throw new Error('пустой документ');
+
+      // Task 10: второй гейт — аккаунт могли удалить, пока модель писала
+      // документ. MinIO, строка чата и списание токенов удалённому не нужны;
+      // это НЕ ошибка, поэтому в catch с document_failed не уходим.
+      if (!(await this.assertActive(userId))) {
+        this.logger.warn(`документ не сохранён: аккаунт неактивен`);
+        return;
+      }
 
       // Файл + короткое вступление со ссылкой, а не весь текст в ленту.
       // Документ на шесть тысяч знаков в чате — стена, которую невозможно

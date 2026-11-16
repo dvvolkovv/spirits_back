@@ -117,3 +117,74 @@ describe('ZoomOauthService', () => {
     await expect(new ZoomOauthService(client, store).obfToken('u1', '1')).resolves.toBeNull();
   });
 });
+
+// Task 9 (account deletion): disconnect обязан быть идемпотентным hard-delete
+// и НЕ допускать «воскрешения» подключения single-flight refresh-ом, который
+// ещё в полёте: refresh завершится и сохранит токены поверх удалённой строки.
+describe('ZoomOauthService.disconnect — идемпотентность и никакого воскрешения', () => {
+  const tick = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  it('ждёт in-flight refresh и удаляет подключение окончательно', async () => {
+    let connected = false;
+    const store: any = {
+      get: jest.fn(async () => null),
+      save: jest.fn(async () => { connected = true; }),
+      remove: jest.fn(async () => { connected = false; }),
+    };
+    const service = new ZoomOauthService({} as any, store);
+    (service as any).refreshing.set('u1', (async () => {
+      await tick(10);
+      await store.save({ userId: 'u1', refreshToken: 'новый' });
+      return 'токен';
+    })());
+
+    await service.disconnect('u1');
+    await tick(30);
+
+    expect(connected).toBe(false);
+    expect(store.remove).toHaveBeenCalled();
+  });
+
+  it('без подключения — успех, повтор тоже', async () => {
+    const store: any = { get: jest.fn(async () => null), save: jest.fn(), remove: jest.fn(async () => {}) };
+    const service = new ZoomOauthService({} as any, store);
+    await expect(service.disconnect('nobody')).resolves.toBeUndefined();
+    await expect(service.disconnect('nobody')).resolves.toBeUndefined();
+    expect(store.remove).toHaveBeenCalledTimes(2);
+  });
+
+  // Review I-2: delete-then-await одним расширяет окно воскрешения. Пока
+  // disconnect ждёт ПЕРВЫЙ flight, новый accessToken() видит пустую map и
+  // стартует ВТОРОЙ refresh, который disconnect уже не ждёт: его save()
+  // ложится ПОСЛЕ store.remove() и возвращает к жизни подключение удалённого
+  // аккаунта. Drain обязан дождаться ВСЕХ flight'ов, включая стартовавшие
+  // во время ожидания.
+  it('drain ждёт и второй refresh, стартовавший во время ожидания', async () => {
+    let connected = false;
+    const store: any = {
+      get: jest.fn(async () => null),
+      save: jest.fn(async () => { connected = true; }),
+      remove: jest.fn(async () => { connected = false; }),
+    };
+    const service = new ZoomOauthService({} as any, store);
+    const refreshing = (service as any).refreshing as Map<string, Promise<unknown>>;
+    const second = (async () => {
+      await tick(20);
+      await store.save({ userId: 'u1', refreshToken: 'второй' });
+      return 't2';
+    })();
+    refreshing.set('u1', (async () => {
+      await tick(5);
+      await store.save({ userId: 'u1', refreshToken: 'первый' });
+      // «Новый accessToken() во время drain» регистрирует второй flight.
+      refreshing.set('u1', second);
+      return 't1';
+    })());
+
+    await service.disconnect('u1');
+    await tick(40);
+
+    expect(connected).toBe(false);
+    expect(store.remove).toHaveBeenCalledTimes(1);
+  });
+});

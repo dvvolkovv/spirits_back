@@ -1,6 +1,11 @@
 import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
 import Redis from 'ioredis';
 
+/** Экранирует glob-метасимволы Redis (* ? [ ] \), чтобы префикс матчился буквально. */
+function escapeRedisGlob(value: string): string {
+  return value.replace(/[\\*?[\]]/g, '\\$&');
+}
+
 @Injectable()
 export class RedisService implements OnModuleInit, OnModuleDestroy {
   private client: Redis;
@@ -63,6 +68,34 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
 
   async keys(pattern: string): Promise<string[]> {
     return this.client.keys(pattern);
+  }
+
+  /**
+   * Task 17D — удалить все ключи с префиксом: курсорный SCAN (MATCH
+   * "<префикс>*", COUNT-подсказка) + UNLINK батчами. Никогда не использует
+   * KEYS: KEYS блокирует сервер O(N) по всему keyspace'у, SCAN итерирует
+   * небольшими порциями, UNLINK освобождает память асинхронно. Возвращает
+   * число удалённых ключей.
+   *
+   * Glob-метасимволы ('*', '?', '[', ']', '\') в префиксе экранируются —
+   * префикс матчится буквально (вызывающий передаёт userId, но helper общий).
+   * SCAN может вернуть один ключ дважды — UNLINK идемпотентен. Батч режется
+   * на чанки по 100 ключей: COUNT это подсказка, Redis вправе вернуть больше,
+   * а spread на тысячи аргументов рискован.
+   */
+  async deleteByPrefix(prefix: string): Promise<number> {
+    const pattern = `${escapeRedisGlob(prefix)}*`;
+    let cursor = '0';
+    let deleted = 0;
+    do {
+      const [next, keys] = await this.client.scan(cursor, 'MATCH', pattern, 'COUNT', 200);
+      cursor = next;
+      for (let i = 0; i < keys.length; i += 100) {
+        const batch = keys.slice(i, i + 100);
+        deleted += await this.client.unlink(...batch);
+      }
+    } while (cursor !== '0');
+    return deleted;
   }
 
   /** Добавляет значение в конец списка. Нужно буферу событий хода (products). */

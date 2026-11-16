@@ -96,6 +96,24 @@ export class ZoomOauthService {
   }
 
   async disconnect(userId: string): Promise<void> {
+    // Review I-2: single-flight refresh, запущенный до disconnect, по завершении
+    // делает store.save() и воскресил бы подключение уже удалённого аккаунта.
+    // Прежний delete-then-await одним расширял окно: новый accessToken() во время
+    // drain видел пустую map и стартовал ВТОРОЙ flight, которого disconnect уже
+    // не ждал. Теперь запись из map не вынимаем (job чистит свою в finally), а
+    // циклом дожидаемся ВСЕХ flight'ов, включая стартовавшие во время ожидания,
+    // и только потом стираем строку. Неустранимое окно «новый flight стартовал
+    // ПОСЛЕ завершения drain» in-process не закрывается — оно прикрыто гейтами
+    // выше по стеку (сервисы не вызывают accessToken для неактивного аккаунта).
+    let running = this.refreshing.get(userId);
+    while (running) {
+      await running.then(() => undefined, () => undefined);
+      // Защитная уборка stale-записи (job, который не почистил map сам): без
+      // неё цикл не завершился бы. Чужую, более свежую запись не трогаем —
+      // её дождётся следующая итерация.
+      if (this.refreshing.get(userId) === running) this.refreshing.delete(userId);
+      running = this.refreshing.get(userId);
+    }
     await this.store.remove(userId);
   }
 
@@ -130,7 +148,10 @@ export class ZoomOauthService {
         this.logger.warn(`[zoom] обновить токен не вышло: ${e?.message}`);
         return null;
       } finally {
-        this.refreshing.delete(userId);
+        // Review I-2: убираем только СВОЮ запись. За время полёта в map мог
+        // встать второй flight (его дожидается drain в disconnect) —
+        // безусловный delete снёс бы чужую запись и drain потерял бы его.
+        if (this.refreshing.get(userId) === job) this.refreshing.delete(userId);
       }
     })();
     this.refreshing.set(userId, job);

@@ -1,9 +1,9 @@
 import { Injectable, Logger, Optional, OnModuleInit } from '@nestjs/common';
+import { AccountDeletionLifecycle } from '../account-deletion/account-deletion.lifecycle';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { IdentityService } from '../identity/identity.service';
 import { OAuthAppleService } from '../auth/oauth-apple.service';
-import { ChatUploadsService } from '../chat/chat-uploads/chat-uploads.service';
 import { sanitizeAssistantVoices, sanitizeProfilePatch } from './profile-patch';
 import { buildOtherUserProfile } from './profile-public';
 import { readProfileAccess } from '../privacy/profile-privacy';
@@ -18,17 +18,16 @@ export { sanitizeAssistantVoices };
 export class ProfileService implements OnModuleInit {
   private readonly logger = new Logger(ProfileService.name);
 
+  // Task 18: lifecycle — ОБЯЗАТЕЛЬНАЯ зависимость (вторая позиция): явное
+  // удаление без координатора недопустимо, а TS не позволяет добавить
+  // обязательный параметр ПОСЛЕ @Optional-параметров. AccountDeletionModule
+  // (@Global) экспортирует lifecycle, поэтому imports ProfileModule не меняется.
   constructor(
     private readonly pg: PgService,
+    private readonly deletion: AccountDeletionLifecycle,
     @Optional() private readonly neo4j?: Neo4jService,
     @Optional() private readonly identity?: IdentityService,
     @Optional() private readonly apple?: OAuthAppleService,
-    // Реестр исходников загрузок (spec 2026-11-13-chat-upload-memory).
-    // Последним и @Optional по той же причине, что у ChatService: спеки
-    // собирают сервис позиционно, а без реестра удаление идёт как до фичи.
-    // Тип — класс ChatUploadsService, сторож design:paramtypes —
-    // profile.service.spec.ts.
-    @Optional() private readonly chatUploads?: ChatUploadsService,
   ) {}
 
   // Применяем миграции профиля при старте (как BacklogService) — глобального
@@ -154,98 +153,31 @@ export class ProfileService implements OnModuleInit {
   }
 
   async deleteProfile(userId: string) {
-    // Отзыв доступа Apple — обязательное требование к приложениям с Sign in
-    // with Apple: без него приложение навсегда остаётся в настройках Apple ID
-    // пользователя, а повторный вход молча возвращает прежнюю связку, будто
-    // аккаунт и не удаляли.
+    // Task 18: вся работа — у lifecycle (account-deletion.lifecycle.ts):
+    // begin (поколение + план в одной транзакции), синхронные immediate-стопы,
+    // затем fenced core finalize с контролем статуса. У ProfileService по-прежнему
+    // нет собственных SQL/network вызовов на этом пути.
     //
-    // Делается ДО удаления: после него identity-строки ещё нужны, чтобы найти
-    // сохранённый refresh-токен. Неудача отзыва удаление не срывает —
-    // человек попросил удалить аккаунт, и внешний сбой не повод ему отказать.
-    await this.revokeAppleAccess(userId);
-
-    // Исходники загрузок чата (байты в приватном MinIO + строки chat_uploads) —
-    // данные пользователя и удаляются вместе с аккаунтом. ДО удаления истории:
-    // deleteForUser сам решает, что делать при сбое MinIO (NotFound терпит,
-    // остальное прокидывает наверх и хранит строки для повтора), — как и
-    // остальные шаги очистки ниже, этот шаг безусловный: проглоченная ошибка
-    // оставила бы байты «удалённого» аккаунта в хранилище навсегда.
-    await this.chatUploads?.deleteForUser(userId);
-
-    // `_` в LIKE экранирован: иначе удаление номера 7903016918 стёрло бы и
-    // переписку 79030169187 — `_` в шаблоне совпадает с любым символом.
-    await this.pg.query(
-      `DELETE FROM custom_chat_history WHERE session_id LIKE $1 || '\\_%' ESCAPE '\\'`,
-      [userId],
-    );
-    await this.pg.query('DELETE FROM action_plans WHERE user_id = $1', [userId]);
-    await this.pg.query(
-      `UPDATE ai_profiles_consolidated
-       SET profile_data = '{}', email = NULL, preferred_agent = NULL, isadmin = false,
-           tokens = 0, updated_at = now()
-       WHERE user_id = $1`,
-      [userId],
-    );
-    await this.neo4j?.deleteUserGraph(userId);
-
-    // Связки входа рвём — иначе «удаление» им не является.
+    // При неуспехе стопов или ядра lifecycle бросает
+    // ServiceUnavailableException с фиксированным безопасным сообщением
+    // (без deletionId/userId): контроллер с @Res() не успевает отправить
+    // ответ, штатный exception-filter Nest возвращает 503 — ложного
+    // {success:true} не возникает. Аккаунт остаётся в удалённом поколении,
+    // повторный DELETE продолжает с незавершённых задач.
     //
-    // Раньше строки user_identities оставались жить, чтобы перерегистрация
-    // тем же телефоном или почтой возвращала прежний баланс. Побочный эффект
-    // оказался таким: удалённый аккаунт пускал обратно по СТАРОМУ паролю, а
-    // связывание отдельной строкой поднимало ему state обратно в active. То
-    // есть с точки зрения человека аккаунт не удалялся вовсе — что и увидели
-    // при съёмке для Apple. Правило 5.1.1(v) считает это деактивацией, а не
-    // удалением.
+    // Отзыв доступа Apple и очистка связок входа — задачи конвейера
+    // (integration.apple.stop и др., см. integration-account-deletion.adapter).
+    // Исходники загрузок чата (chat_uploads) удаляет конвейер: задача
+    // chat-upload.purge (chat-uploads/chat-upload-account-deletion.adapter.ts)
+    // исполняется после retention-окна; старый inline-путь
+    // (chatUploads.deleteForUser, метод удалён) здесь сознательно не
+    // восстановлен — он миновал бы fencing (реактивация/merge пропускали бы
+    // очистку).
     //
-    // Пароль и почту в user_id гасим там же: пароль иначе остался бы годным
-    // для нового аккаунта с тем же адресом, а primary_email — единственная
-    // оставшаяся копия адреса.
-    await this.pg.query('DELETE FROM user_identities WHERE user_id = $1', [userId]);
-    // Связка Telegram-бота — тоже связка входа: по ней мини-приложение узнаёт
-    // «старожилов бота», выдаёт им токены и заново заводит строку в
-    // user_identities. Пока она переживала удаление, Telegram удалённого
-    // аккаунта входил в него обратно. Бот и биллинг ботов отсутствие строки
-    // уже понимают — так выглядит любой, кто Telegram не привязывал: личка
-    // предложит подключиться, у групповых конфигов просто некому писать о
-    // балансе. Сама строка 1:1, так что освобождается и сам Telegram — его
-    // можно привязать к другому аккаунту без упора в UNIQUE (tg_user_id).
-    await this.pg.query('DELETE FROM tg_user_identities WHERE linkeon_user_id = $1', [userId]);
-    await this.pg.query(
-      `UPDATE user_id
-       SET state = 'deleted', password_hash = NULL, primary_email = NULL,
-           welcome_bonus_at = NULL, update_date = now()
-       WHERE internal_id = $1`,
-      [userId],
-    );
-    // welcome_bonus_at сбрасываем намеренно: у пользователя с телефонным
-    // входом internal_id — это сам номер, и перерегистрация неизбежно
-    // попадёт в ту же строку. Без сброса он получил бы чистый аккаунт с
-    // нулевым балансом и без стартового бонуса.
-    //
-    // Известный остаток: выданный РАНЬШЕ access-токен продолжает пускать до
-    // своего истечения — по умолчанию два часа (JWT_ACCESS_EXPIRES). Связок
-    // входа уже нет и продлить его нельзя (см. AuthService.isDeleted), но
-    // сам он ещё годен. Проверено на тестовом стенде 15.08.2026.
-    //
-    // Не закрыто сознательно: проверка состояния в JwtGuard легла бы на
-    // КАЖДЫЙ авторизованный запрос, и ошибка в ней кладёт весь API — размен
-    // хуже самой дыры. Дыра при этом ведёт к уже пустому аккаунту: профиль
-    // очищен, история удалена, баланс обнулён. Клиент после удаления сам
-    // выходит и токен выбрасывает.
+    // Rationale-комментарии про SQL ядра — в profile-account-deletion.adapter.ts,
+    // про порядок stops→core и ветки begin — в account-deletion.lifecycle.ts.
+    await this.deletion.deleteExplicit(userId);
     return { success: true };
-  }
-
-  private async revokeAppleAccess(userId: string): Promise<void> {
-    if (!this.identity || !this.apple) return;
-    try {
-      const tokens = await this.identity.providerRefreshTokens(userId, 'apple');
-      for (const token of tokens) {
-        await this.apple.revokeToken(token, this.apple.primaryClientId());
-      }
-    } catch (e: any) {
-      this.logger?.warn?.(`отзыв доступа Apple при удалении ${userId} не удался: ${e.message}`);
-    }
   }
 
   async getUserProfile(requesterId: string, targetId: string) {

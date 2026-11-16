@@ -52,10 +52,16 @@ function makeStorage(fail = false) {
 function makePg(jobRows: any[] = [], transcriptRows: any[] = []) {
   const history: any[] = [];
   const charges: any[] = [];
-  return {
+  const self: any = {
     history,
     charges,
+    // Task 10 (удаление аккаунта): строгий active-гейт читает state из user_id.
+    // По умолчанию active — существующие тесты не меняют поведение.
+    userState: 'active',
     query: jest.fn(async (sql: string, params: any[] = []) => {
+      if (/FROM user_id\b/i.test(sql)) {
+        return { rows: [{ state: self.userState }], rowCount: 1 };
+      }
       if (/INSERT INTO custom_chat_history/i.test(sql)) {
         history.push({
           session_id: params[0],
@@ -90,6 +96,7 @@ function makePg(jobRows: any[] = [], transcriptRows: any[] = []) {
       return { rows: [], rowCount: 0 };
     }),
   };
+  return self;
 }
 
 describe('VoiceDocumentService', () => {
@@ -736,5 +743,79 @@ describe('заметка по итогам звонка (дефекты влад
     await svc.createNote(CALL, ROOM, 'user-1', 'Мой разговор', 'что-то');
     await svc.drainForTests();
     expect(notes.created).toHaveLength(1);
+  });
+});
+
+/**
+ * Task 10 (удаление аккаунта): фоновые продолжения create()/createNote()
+ * обязаны иметь строгий active-гейт (SELECT state FROM user_id, без кэша)
+ * ДО похода в LLM/MinIO/TalerID и ДО записи строк. Удалённый аккаунт не
+ * сочиняет документы и не оставляет новых строк в чате.
+ */
+describe('удалённый аккаунт: документ и заметка не продолжаются', () => {
+  const CALL = '33333333-3333-3333-3333-333333333333';
+  const ROOM = 'voice_room';
+
+  it('create(): пользователь удалён до старта — LLM/MinIO не зовутся, строк нет', async () => {
+    const pg = makePg();
+    pg.userState = 'deleted';
+    const chat = { generateAgentReplyWithCharge: jest.fn() };
+    const storage = makeStorage();
+    const svc = new VoiceDocumentService(
+      pg as any, chat as any, { send: jest.fn(async () => {}) } as any,
+      storage as any, makeLang() as any,
+    );
+
+    await svc.create(CALL, ROOM, 'user-1', 'План', 'по пунктам');
+    await svc.drainForTests();
+
+    expect(chat.generateAgentReplyWithCharge).not.toHaveBeenCalled();
+    expect(storage.upload).not.toHaveBeenCalled();
+    expect(pg.history).toHaveLength(0);
+    expect(pg.charges).toHaveLength(0);
+  });
+
+  it('create(): удаление во время LLM — MinIO и строка чата не появляются', async () => {
+    const pg = makePg();
+    const chat = {
+      generateAgentReplyWithCharge: jest.fn(async () => {
+        // Аккаунт удалили, пока модель писала документ.
+        pg.userState = 'deleted';
+        return { text: 'тело документа', tokens: 100, costUsd: 0.1 };
+      }),
+    };
+    const storage = makeStorage();
+    const svc = new VoiceDocumentService(
+      pg as any, chat as any, { send: jest.fn(async () => {}) } as any,
+      storage as any, makeLang() as any,
+    );
+
+    await svc.create(CALL, ROOM, 'user-1', 'План', 'по пунктам');
+    await svc.drainForTests();
+
+    expect(storage.upload).not.toHaveBeenCalled();
+    expect(docRows(pg.history)).toHaveLength(0);
+    expect(pg.charges).toHaveLength(0);
+  });
+
+  it('createNote(): удалённый аккаунт — заметка в TalerID не создаётся, LLM не зовётся', async () => {
+    const pg = makePg([], [{ transcript: [{ role: 'user', text: 'речь', ts: 1 }] }]);
+    pg.userState = 'deleted';
+    const chat = { generateAgentReplyWithCharge: jest.fn() };
+    const notes = {
+      createNote: jest.fn(async () => ({ ok: true, id: 'n-1' })),
+      updateNote: jest.fn(async () => ({ ok: true, id: 'n-1' })),
+    };
+    const svc = new VoiceDocumentService(
+      pg as any, chat as any, { send: jest.fn(async () => {}) } as any,
+      makeStorage() as any, makeLang() as any, notes as any,
+    );
+
+    await svc.createNote(CALL, ROOM, 'user-1', 'Тезисы', '');
+    await svc.drainForTests();
+
+    expect(chat.generateAgentReplyWithCharge).not.toHaveBeenCalled();
+    expect(notes.createNote).not.toHaveBeenCalled();
+    expect(pg.history).toHaveLength(0);
   });
 });

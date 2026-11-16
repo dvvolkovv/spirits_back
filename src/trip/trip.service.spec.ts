@@ -5,6 +5,9 @@ import { RelaySessionBusyError } from '../chat/chat.service';
 const now = new Date('2026-07-19T10:00:00+05:00');
 const task = (uid: string, title: string, due?: string, done = false) => ({ uid, title, due, done, source: 'yandex' });
 const ev = (uid: string, title: string, at: string, end?: string) => ({ uid, title, at, end, source: 'yandex' });
+// Task 9: applyAction начинается с SELECT state FROM user_id — старые тесты
+// дают пустой pg-мок, поэтому «активный» ответ нужен всем существующим сценариям.
+const activePg = () => ({ query: async () => ({ rows: [{ state: 'active' }] }) });
 
 describe('computeCopilotState', () => {
   it('headline = ближайшая незакрытая задача к сроку', () => {
@@ -161,7 +164,7 @@ describe('computeCopilotState', () => {
       rescheduleTask: jest.fn().mockResolvedValue({ ok: true }),
     } as any;
     const linkeonTasks = { list: jest.fn().mockResolvedValue([]) } as any;
-    const svc = (calendar: any) => new TripService({} as any, calendar, taleridCal, linkeonTasks);
+    const svc = (calendar: any) => new TripService(activePg() as any, calendar, taleridCal, linkeonTasks);
 
     it('proposal_accept → пишет event в календарь + помечает accepted', async () => {
       const event = { title: 'Созвон', datetime: '2026-07-20T15:00:00', durationMin: 60 };
@@ -208,7 +211,7 @@ describe('computeCopilotState', () => {
       const linkeonTasks = overrides.linkeonTasks ?? ({ list: jest.fn().mockResolvedValue([]) } as any);
       const dayFramingStore = overrides.dayFramingStore ?? ({ get: jest.fn().mockResolvedValue(null), markDismissed: jest.fn() } as any);
       const chat = overrides.chat ?? ({ generateAgentReply: jest.fn().mockResolvedValue('') } as any);
-      return new TripService({} as any, calendar, taleridCal, linkeonTasks, chat, dayFramingStore);
+      return new TripService(activePg() as any, calendar, taleridCal, linkeonTasks, chat, dayFramingStore);
     };
 
     it('day_framing_dismiss с kind=morning → зовёт store.markDismissed(userId, day, "morning")', async () => {
@@ -266,7 +269,7 @@ describe('computeCopilotState', () => {
       const dayFramingStore =
         overrides.dayFramingStore ?? ({ get: jest.fn().mockResolvedValue(null), upsert: jest.fn() } as any);
       const chat = overrides.chat ?? ({ generateAgentReply: jest.fn().mockResolvedValue('') } as any);
-      return new TripService({} as any, calendar, taleridCal, linkeonTasks, chat, dayFramingStore);
+      return new TripService(activePg() as any, calendar, taleridCal, linkeonTasks, chat, dayFramingStore);
     };
 
     it('строит факты, дёргает chat.generateAgentReply, апсертит результат в store', async () => {
@@ -369,7 +372,7 @@ describe('computeCopilotState', () => {
       const dayFramingStore =
         overrides.dayFramingStore ?? ({ get: jest.fn().mockResolvedValue(null), upsert: jest.fn() } as any);
       const chat = overrides.chat ?? ({ generateAgentReply: jest.fn().mockResolvedValue('') } as any);
-      return new TripService({} as any, calendar, taleridCal, linkeonTasks, chat, dayFramingStore);
+      return new TripService(activePg() as any, calendar, taleridCal, linkeonTasks, chat, dayFramingStore);
     };
 
     beforeEach(() => {
@@ -423,5 +426,49 @@ describe('computeCopilotState', () => {
       expect(state.dayFraming).toBeUndefined();
       expect(spy).toHaveBeenCalled();
     });
+  });
+});
+
+// Task 9 (account deletion): applyAction — единственная точка записи лаунчера —
+// обязана отказать удалённому аккаунту ДО любого обращения к календарю/делам.
+describe('TripService.applyAction — забор на удалённом аккаунте (Task 9)', () => {
+  const pgWith = (state: string) => ({
+    query: jest.fn(async (sql: string) => {
+      if (String(sql).includes('SELECT state FROM user_id')) return { rows: [{ state }] };
+      return { rows: [] };
+    }),
+  });
+  const makeCalendar = () => ({
+    listTasks: jest.fn().mockResolvedValue([]),
+    listEvents: jest.fn().mockResolvedValue([]),
+    listPendingProposals: jest.fn().mockResolvedValue([]),
+    setProposalStatus: jest.fn().mockResolvedValue(true),
+    createEvent: jest.fn().mockResolvedValue({ ok: true }),
+    deleteEvent: jest.fn().mockResolvedValue({ ok: true }),
+    renameTasksByTitle: jest.fn().mockResolvedValue(0),
+  });
+  const taleridCal = {
+    listEvents: jest.fn().mockResolvedValue([]),
+    listTasks: jest.fn().mockResolvedValue([]),
+    setTaskStatus: jest.fn().mockResolvedValue({ ok: true }),
+    rescheduleTask: jest.fn().mockResolvedValue({ ok: true }),
+  } as any;
+  const linkeonTasks = { list: jest.fn().mockResolvedValue([]), setDone: jest.fn(), drop: jest.fn(), reschedule: jest.fn(), create: jest.fn() } as any;
+
+  it('deleted: отказ и ни одного обращения к календарю/делам', async () => {
+    const calendar = makeCalendar();
+    const svc = new TripService(pgWith('deleted') as any, calendar as any, taleridCal, linkeonTasks);
+    await expect(svc.applyAction('u-deleted', 'idem-1', 'proposal_dismiss', { id: 'p1' }))
+      .rejects.toThrow();
+    expect(calendar.setProposalStatus).not.toHaveBeenCalled();
+    expect(taleridCal.setTaskStatus).not.toHaveBeenCalled();
+    expect(linkeonTasks.setDone).not.toHaveBeenCalled();
+  });
+
+  it('active: proposal_dismiss проходит как раньше', async () => {
+    const calendar = makeCalendar();
+    const svc = new TripService(pgWith('active') as any, calendar as any, taleridCal, linkeonTasks);
+    await svc.applyAction('u-active', 'idem-2', 'proposal_dismiss', { id: 'p2' });
+    expect(calendar.setProposalStatus).toHaveBeenCalledWith('u-active', 'p2', 'dismissed');
   });
 });

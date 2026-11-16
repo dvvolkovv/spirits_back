@@ -585,7 +585,11 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
     const cur = await this.pg.query(
       `SELECT p.id, p.name, p.purge_after, p.block_reason
          FROM products p
-        WHERE p.id = $1 AND p.user_id = $2 AND p.archived_at IS NOT NULL AND p.purged_at IS NULL`,
+        WHERE p.id = $1 AND p.user_id = $2 AND p.archived_at IS NOT NULL AND p.purged_at IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM user_id u
+             WHERE u.internal_id=p.user_id AND u.state='deleted'
+          )`,
       [i.productId, i.userId],
     );
     const p = cur.rows[0];
@@ -633,6 +637,10 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
       const locked = await client.query(
         `SELECT 1 FROM products
           WHERE id = $1 AND user_id = $2 AND archived_at IS NOT NULL AND purged_at IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM user_id u
+               WHERE u.internal_id=products.user_id AND u.state='deleted'
+            )
           FOR UPDATE`,
         [p.id, i.userId],
       );
@@ -767,6 +775,10 @@ export class ProductLifecycleService implements OnModuleInit, OnModuleDestroy {
             -- в начале транзакции): обход, стёрший ключи, закоммитил до нас,
             -- а значит, и срок к этому мигу уже вышел.
             WHERE id = $1 AND user_id = $2 AND archived_at IS NOT NULL AND purged_at IS NULL AND purge_after > clock_timestamp()
+              AND NOT EXISTS (
+                SELECT 1 FROM user_id u
+                 WHERE u.internal_id=products.user_id AND u.state='deleted'
+              )
             RETURNING status, paid_until > now() AS paid, paid_until`,
           [p.id, i.userId, SLEEP_REASON_NO_TOKENS, prevStatus, affordable],
         );

@@ -1,6 +1,13 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
+import { publicDir } from '../common/net/own-media';
+import {
+  DeletionCancelledError,
+  DeletionRetryError,
+} from '../account-deletion/account-deletion.safe';
 
 const ASSETS_BUCKET = 'linkeon-assets';
 
@@ -88,5 +95,59 @@ export class AvatarService {
     // If the object doesn't exist, MinIO returns 404 and the frontend `<img onError>`
     // handler hides the broken image (see AssistantSelection.tsx).
     return this.storage.publicUrl(ASSETS_BUCKET, `avatars/agents/${agentId}.jpg`);
+  }
+
+  // ==================== ACCOUNT DELETION (Task 13) ====================
+
+  /** Безопасный токен userId (телефон или uuid): без '/', traversal и пробелов. */
+  private static readonly SAFE_DELETION_USER_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
+  /** Расширения, которые sniffAvatarFormat может записать в avatars/users/. */
+  private static readonly DELETION_AVATAR_EXTS = ['jpg', 'png', 'webp', 'gif'] as const;
+
+  /**
+   * Строгое стирание ПОЛЬЗОВАТЕЛЬСКИХ аватаров при удалении аккаунта.
+   *
+   * Цели вычисляются из userId, а не читаются из профиля: profile_data.avatar_url
+   * НЕ используется как произвольная цель (в нём может лежать чужой или
+   * агентский ключ), avatars/agents/ не выбирается никогда — агентские аватары
+   * общие. Канонические цели: avatars/users/<userId>.{jpg,png,webp,gif} в
+   * MinIO (все четыре расширения — какое занято, знает только бакет) и
+   * легаси-файл public/avatars/<userId>.jpg (путь строится только из
+   * валидированного userId, с двойной проверкой, что он внутри каталога).
+   *
+   * Удаление подтверждённое (deleteConfirmed): отсутствие объекта — успех,
+   * любой неподтверждённый исход пробрасывается — адаптер account-deletion
+   * превратит его в retry. Объекты MinIO — ДО локального файла. Поколение
+   * проверяется до первого удаления: аккаунт оживили — DeletionCancelledError.
+   */
+  async deleteAvatarForDeletion(userId: string, deletionId: string): Promise<void> {
+    if (!AvatarService.SAFE_DELETION_USER_RE.test(userId)) {
+      throw new DeletionRetryError('db');
+    }
+    const gen = await this.pg.query(
+      `SELECT 1 FROM user_id u
+        WHERE u.internal_id = $1 AND u.state = 'deleted' AND u.deletion_id = $2`,
+      [userId, deletionId],
+    );
+    if ((gen.rowCount ?? 0) === 0) {
+      throw new DeletionCancelledError();
+    }
+
+    for (const ext of AvatarService.DELETION_AVATAR_EXTS) {
+      await this.storage.deleteConfirmed({
+        bucket: ASSETS_BUCKET,
+        key: `avatars/users/${userId}.${ext}`,
+      });
+    }
+
+    const avatarsDir = path.join(publicDir(), 'avatars');
+    const file = path.join(avatarsDir, `${userId}.jpg`);
+    if (!file.startsWith(avatarsDir + path.sep)) {
+      throw new DeletionRetryError('db');
+    }
+    await fs.promises.unlink(file).catch((e: any) => {
+      if (e?.code !== 'ENOENT') throw e; // отсутствие файла — подтверждено
+    });
   }
 }

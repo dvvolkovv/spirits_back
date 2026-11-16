@@ -3,15 +3,17 @@ import { Neo4jService } from '../neo4j/neo4j.service';
 import { PgService } from '../common/services/pg.service';
 import { LanguageService } from '../common/services/language.service';
 import { StorageService } from '../common/services/storage.service';
-import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import axios from 'axios';
+import * as fs from 'fs';
 import * as os from 'os';
 import { Response } from 'express';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { neutralizeAtMentions, stripWordJoiner } from '../common/agent-guards';
 import { renderBannerOverlay, BannerPosition, BannerTheme } from './banner-overlay';
-import { fetchMediaBytes } from '../common/net/own-media';
+import { fetchMediaBytes, ownStaticPath } from '../common/net/own-media';
+import { DeletionCancelledError } from '../account-deletion/account-deletion.safe';
 import {
   SelectedProfile,
   buildProsePrompt,
@@ -28,6 +30,28 @@ import {
 } from '../privacy/profile-privacy';
 
 const ASSETS_BUCKET = 'linkeon-assets';
+
+/**
+ * Хвост URL (путь после префикса бакета) → безопасный object key (Task 12).
+ * Любое сомнение — наружу (fail-closed): пустой сегмент, '.', '..', обратный
+ * слэш, NUL и не декодируемый '%' бросают вместо удаления по угаданному ключу.
+ * Ключи наших объектов генерируются сервером (images/, videos/,
+ * video-uploads/) и всегда проходят проверку.
+ */
+export function ownedObjectKeyOrThrow(rest: string): string {
+  const rawPath = String(rest ?? '').split(/[?#]/)[0];
+  let key: string;
+  try {
+    key = decodeURIComponent(rawPath);
+  } catch {
+    throw new Error('unsafe_object_key');
+  }
+  const bad = key.length === 0
+    || key.split('/').some((seg) => seg === '' || seg === '.' || seg === '..'
+      || seg.includes('\\') || seg.includes('\0'));
+  if (bad) throw new Error('unsafe_object_key');
+  return key;
+}
 
 /**
  * Фолбэк-сообщения поиска/совместимости. Уходят во фронт как готовый контент
@@ -553,6 +577,138 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
   async deleteGeneratedImage(userId: string, imageId: number): Promise<void> {
     await this.pg.query('DELETE FROM generated_images WHERE id = $1 AND user_id = $2', [imageId, userId]);
+  }
+
+  // ==================== ACCOUNT DELETION (Task 12) ====================
+
+  /**
+   * Строгое стирание сгенерированной картинки при удалении аккаунта.
+   *
+   * Отличается от deleteGeneratedImage принципиально: тот удаляет только row
+   * (объект остаётся висеть в MinIO/Yandex S3/на диске), а purge обязан
+   * подтвердить удаление КАЖДОГО owned объекта до удаления строки. Ошибки не
+   * подавляются (никакого Promise.allSettled): любой неподтверждённый исход
+   * пробрасывается наружу — адаптер account-deletion превратит его в retry, и
+   * row с техническим id переживёт попытку, чтобы повтор нашёл объект.
+   *
+   * Несуществующий объект/файл (404/NoSuchKey/ENOENT) — подтверждённое
+   * отсутствие, успех. Строка отсутствует (уже стёрта или поколение не то) —
+   * тоже успех: повтор идемпотентен. Внутри transaction generation
+   * перепроверяется: аккаунт оживили — DeletionCancelledError, row не трогаем.
+   */
+  async deleteGeneratedImageForDeletion(
+    userId: string,
+    imageId: number,
+    deletionId: string,
+  ): Promise<void> {
+    const res = await this.pg.query(
+      `SELECT id, image_url FROM generated_images
+        WHERE id = $1 AND user_id = $2
+          AND EXISTS (
+            SELECT 1 FROM user_id u
+            WHERE u.internal_id = $2 AND u.state = 'deleted' AND u.deletion_id = $3
+          )`,
+      [imageId, userId, deletionId],
+    );
+    const row = res.rows[0];
+    if (!row) return;
+
+    // Объекты — ДО row: провал удаления объекта оставляет строку на месте.
+    await this.deleteOwnedImageObjectForDeletion(String(row.image_url ?? ''));
+
+    const client = await this.pg.getClient();
+    try {
+      await client.query('BEGIN');
+      const gen = await client.query(
+        `SELECT 1 FROM user_id u
+          WHERE u.internal_id = $1 AND u.state = 'deleted' AND u.deletion_id = $2`,
+        [userId, deletionId],
+      );
+      if ((gen.rowCount ?? 0) === 0) {
+        await client.query('ROLLBACK');
+        throw new DeletionCancelledError();
+      }
+      await client.query(
+        `DELETE FROM generated_images
+          WHERE id = $1 AND user_id = $2
+            AND EXISTS (
+              SELECT 1 FROM user_id u
+              WHERE u.internal_id = $2 AND u.state = 'deleted' AND u.deletion_id = $3
+            )`,
+        [imageId, userId, deletionId],
+      );
+      await client.query('COMMIT');
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch { /* уже вне транзакции */ }
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Удалить объект сгенерированной картинки, если он НАШ. Ключи никогда не
+   * вычисляются из произвольного URL: MinIO — только точный префикс своего
+   * assets-бакета, локальный файл — только через checked ownStaticPath
+   * (escape/symlink-выход за public/ бросает UnsafeUrlError), легаси — только
+   * точный host настроенного Yandex S3 + свой бакет. Внешний URL — не наш
+   * объект: удаляется только row.
+   */
+  private async deleteOwnedImageObjectForDeletion(imageUrl: string): Promise<void> {
+    const raw = String(imageUrl ?? '').trim();
+    if (!raw) return;
+
+    // 1. MinIO linkeon-assets — текущие генерации (uploadAssetImage).
+    const prefix = this.storage.publicUrl(ASSETS_BUCKET, '');
+    if (raw.startsWith(prefix)) {
+      const key = ownedObjectKeyOrThrow(raw.slice(prefix.length));
+      await this.storage.deleteConfirmed({ bucket: ASSETS_BUCKET, key });
+      return;
+    }
+
+    // 2. Локальный /static/… — только checked own path; escape бросает.
+    const own = ownStaticPath(raw);
+    if (own) {
+      await fs.promises.unlink(own.file).catch((e: any) => {
+        if (e?.code !== 'ENOENT') throw e; // отсутствие файла — подтверждено
+      });
+      return;
+    }
+
+    // 3. Легаси Yandex S3 (uploadToS3, presigned URL) — свой настроенный
+    //    S3-клиент strict, НЕ MinIO.
+    const legacyKey = this.legacyYandexObjectKey(raw);
+    if (legacyKey !== null) {
+      await this.deleteLegacyYandexObjectConfirmed(legacyKey);
+      return;
+    }
+
+    // 4. Внешний URL — объекта у нас нет.
+  }
+
+  /** Точный host настроенного Yandex S3 + свой бакет; иначе не легаси-key. */
+  private legacyYandexObjectKey(rawUrl: string): string | null {
+    let u: URL;
+    try { u = new URL(rawUrl); } catch { return null; }
+    let endpoint: URL;
+    try {
+      endpoint = new URL(process.env.AWS_ENDPOINT || 'https://storage.yandexcloud.net');
+    } catch { return null; }
+    if (u.host !== endpoint.host) return null;
+    const prefix = `/${this.s3Bucket}/`;
+    if (!u.pathname.startsWith(prefix)) return null;
+    return ownedObjectKeyOrThrow(u.pathname.slice(prefix.length));
+  }
+
+  /** Strict-удаление в настроенном Yandex S3: 404/NoSuchKey — отсутствие. */
+  private async deleteLegacyYandexObjectConfirmed(key: string): Promise<void> {
+    try {
+      await this.s3.send(new DeleteObjectCommand({ Bucket: this.s3Bucket, Key: key }));
+    } catch (e: any) {
+      if (e?.name === 'NoSuchKey' || e?.name === 'NotFound'
+        || e?.$metadata?.httpStatusCode === 404) return;
+      throw e;
+    }
   }
 
   async checkTokenBalance(userId: string, required: number): Promise<{ ok: boolean }> {

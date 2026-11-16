@@ -75,7 +75,7 @@ export class RoutinePushService implements OnModuleInit {
   }
 
   // ── Пресет «энергия дня» (быстрая кнопка на фронте) ──────────────────────────
-  async ensureEnergyPreset(userId: string, tz?: string): Promise<RoutineRow> {
+  async ensureEnergyPreset(userId: string, tz?: string): Promise<RoutineRow | null> {
     const existing = (await this.store.list(userId)).find((r) => r.assistantId === RAYA_ID && r.title === 'Энергия дня');
     if (existing) return existing;
     return this.store.create(userId, {
@@ -96,20 +96,39 @@ export class RoutinePushService implements OnModuleInit {
    */
   private readonly retryTimers = new Map<string, NodeJS.Timeout>();
 
-  private scheduleRetry(userId: string, routineId: string): void {
+  private async accountIsActive(userId: string): Promise<boolean> {
+    const r = await this.pg.query(
+      `SELECT 1 FROM user_id WHERE internal_id=$1 AND state='active' LIMIT 1`,
+      [userId],
+    );
+    return r.rowCount === 1 || (r.rowCount == null && r.rows.length === 1);
+  }
+
+  clearRetryTimersForUser(userId: string): void {
+    const prefix = `${userId}:`;
+    for (const [key, timer] of this.retryTimers) {
+      if (!key.startsWith(prefix)) continue;
+      clearTimeout(timer);
+      this.retryTimers.delete(key);
+    }
+  }
+
+  private async scheduleRetry(userId: string, routineId: string): Promise<void> {
+    if (!(await this.accountIsActive(userId))) return;
     const key = `${userId}:${routineId}`;
     if (this.retryTimers.has(key)) return;
     this.logger.log(`routine ${routineId} retry через 15 минут`);
     const timer = setTimeout(() => {
       this.retryTimers.delete(key);
       void (async () => {
+        if (!(await this.accountIsActive(userId))) return;
         // За 15 минут рутину могли удалить, выключить или изменить — берём
         // актуальную запись, а не снимок на момент busy.
         const r = await this.store.getById(userId, routineId);
         if (!r || !r.enabled) return;
         const today = this.store.localDate(r.tz, new Date());
         const prev = r.lastSentDate;
-        if (!(await this.store.claimToday(routineId, today))) return;
+        if (!(await this.store.claimToday(routineId, today, userId))) return;
         const result = await this.deliver(
           userId, r.assistantId, r.prompt, r.title, routineId,
         );
@@ -147,6 +166,7 @@ export class RoutinePushService implements OnModuleInit {
     title: string | undefined,
     routineId?: string,
   ): Promise<DeliverResult> {
+    if (!(await this.accountIsActive(userId))) return { delivered: 0 };
     let outcome: { text: string; failed: boolean; failReason?: string };
     try {
       // Рутина — путь, где ассистент реально может позвать инструмент Linkeon
@@ -156,7 +176,7 @@ export class RoutinePushService implements OnModuleInit {
       );
     } catch (e: any) {
       if (e instanceof RelaySessionBusyError) {
-        if (routineId) this.scheduleRetry(userId, routineId);
+        if (routineId) await this.scheduleRetry(userId, routineId);
         return { delivered: 0, busy: true };
       }
       // Исключение потока — не busy: release/retry автоматически не делаем.
@@ -172,7 +192,7 @@ export class RoutinePushService implements OnModuleInit {
       const message = `routine deliver: ${reason} (assistant ${assistantId})`;
       if (deferred) this.logger.log(message);
       else this.logger.warn(message);
-      if (deferred && routineId) this.scheduleRetry(userId, routineId);
+      if (deferred && routineId) await this.scheduleRetry(userId, routineId);
       return { delivered: 0, failed: true, failReason };
     }
 
@@ -188,9 +208,11 @@ export class RoutinePushService implements OnModuleInit {
     const agentNum = /^\d+$/.test(assistantId) ? parseInt(assistantId, 10) : null;
     await this.pg.query(
       `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
-       VALUES ($1, 'ai', $2, $3, 'text')`,
-      [`${userId}_${assistantId}`, agentNum, text],
+       SELECT $1, 'ai', $2, $3, 'text'
+       WHERE EXISTS (SELECT 1 FROM user_id WHERE internal_id=$4 AND state='active')`,
+      [`${userId}_${assistantId}`, agentNum, text, userId],
     );
+    if (!(await this.accountIsActive(userId))) return { delivered: 0 };
     const name = await this.assistantName(assistantId);
     const body = text.replace(/[#*_`>\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 130);
     const isEnergy = assistantId === RAYA_ID && (title === 'Энергия дня' || !title);
@@ -214,6 +236,7 @@ export class RoutinePushService implements OnModuleInit {
 
   // «Проверить сейчас»: генерит и шлёт немедленно конкретную рутину.
   async fireNow(userId: string, routineId: string): Promise<DeliverResult | null> {
+    if (!(await this.accountIsActive(userId))) return null;
     const r = await this.store.getById(userId, routineId);
     if (!r) return null;
     return this.deliver(userId, r.assistantId, r.prompt, r.title, routineId);
@@ -236,7 +259,7 @@ export class RoutinePushService implements OnModuleInit {
         const today = this.store.localDate(r.tz, now);
         if (r.last_sent_date && this.store.toISO(r.last_sent_date) === today) continue;
         const prev = r.last_sent_date ? this.store.toISO(r.last_sent_date) : null;
-        if (!(await this.store.claimToday(r.id, today))) continue;           // уже застолбили
+        if (!(await this.store.claimToday(r.id, today, r.user_id))) continue; // уже застолбили
 
         const result = await this.deliver(
           r.user_id, r.assistant_id, r.prompt, r.title, r.id,

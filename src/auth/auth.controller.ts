@@ -13,6 +13,7 @@ import { DevicesService } from '../devices/devices.service';
 import { PgService } from '../common/services/pg.service';
 import { verifyInitData } from '../tma/init-data';
 import { DEBUG_SECRET_HEADER, isDebugConfigured, isDebugRequestAllowed, isTestEmail } from './debug-access';
+import { DeletionCancelledError, DeletionRetryError } from '../account-deletion/account-deletion.safe';
 
 /**
  * Ответ check-code, когда лимит попыток исчерпан и код погашен (sms-code.ts).
@@ -646,8 +647,39 @@ location.replace('/chat');
     const { targetUserId: storedTarget, conflictUserId } = JSON.parse(raw);
     if (storedTarget !== targetUserId) return res.set(CORS).status(403).json({ error: 'token mismatch' });
 
+    // T19-M1: ошибки deletion-pipeline маппим явно, иначе их проглатывал
+    // глобальный фильтр в 500, а токен бывал уже потреблён.
+    //
+    // DeletionRetryError (нештатный стоп / ядро у loser / db-сбой) — исход
+    // retryable: 503 {retryable:true} и токен НЕ потребляем, чтобы повторный
+    // запрос с тем же mergeToken довёл merge до конца. Форма «не потреблять»
+    // выбрана вместо переиздания токена: mergeToken живёт в redis TTL 30 минут
+    // и привязан к паре (targetUserId, conflictUserId) — пока merge не завершён,
+    // пара не устарела, а mergeAccounts идемпотентен (Task 19): поколение
+    // переиспользуется, баланс не задваивается, выполненные стопы не
+    // переисполняются.
+    //
+    // DeletionCancelledError — терминальный исход (loser реактивирован,
+    // слияние отменено): 409, токен потребляем, путь дальше — новый
+    // конфликт-флоу с новой выдачей mergeToken. JWT на такой исход не выдаём.
+    let survivorUserId: string;
+    try {
+      ({ survivorUserId } = await this.identity.mergeAccounts(conflictUserId, targetUserId));
+    } catch (e) {
+      if (e instanceof DeletionCancelledError) {
+        await this.redis.del(`merge-token-${mergeToken}`);
+        return res.set(CORS).status(409).json({ error: 'merge cancelled' });
+      }
+      if (e instanceof DeletionRetryError) {
+        // Без идентификаторов в логе: internal_id телефонного аккаунта — сам
+        // номер (PII).
+        this.logger.warn(`merge отложен (retryable, kind=${e.kind})`);
+        return res.set(CORS).status(503).json({ error: 'merge_unavailable', retryable: true });
+      }
+      throw e;
+    }
+    // Успех (и только успех с терминальной отменой) потребляет токен.
     await this.redis.del(`merge-token-${mergeToken}`);
-    const { survivorUserId } = await this.identity.mergeAccounts(conflictUserId, targetUserId);
 
     // Выживает старший аккаунт. Если это не тот, под которым юзер залогинен, его
     // текущий JWT указывает на удалённый аккаунт — выдаём свежую пару на

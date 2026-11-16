@@ -112,6 +112,68 @@ export class LiveKitClient {
     }
   }
 
+  /**
+   * 404 от LiveKit — подтверждённое отсутствие комнаты/участника, а не сбой:
+   * для strict-методов это «да, ресурса больше нет».
+   */
+  private static isGone(e: any): boolean {
+    return e?.status === 404 || /not\s*found/i.test(String(e?.message ?? ''));
+  }
+
+  /**
+   * Strict-вариант {@link closeRoom} для deletion-пути (Task 10).
+   *
+   * Возвращает ПОДТВЕРЖДЁННЫЙ исход: true — LiveKit согласился, что комнаты
+   * нет (удалил или она уже отсутствовала), false — исход неизвестен и
+   * вызывающий обязан сохранить retry. Ошибки не глотаются в «успех», как в
+   * interactive-версии: молчаливый успех навсегда оставил бы комнату удалённого
+   * аккаунта жить и тарифицироваться. Текст ошибки в лог не уходит — в нём
+   * могут быть URL/детали площадки; только имя комнаты и HTTP-статус.
+   */
+  async closeRoomStrict(roomName: string): Promise<boolean> {
+    const client = new RoomServiceClient(this.httpUrl, this.apiKey, this.apiSecret);
+    try {
+      await client.deleteRoom(roomName);
+      return true;
+    } catch (e: any) {
+      if (LiveKitClient.isGone(e)) return true;
+      this.logger.warn(`deleteRoomStrict ${roomName}: исход неизвестен (status=${e?.status ?? 'n/a'})`);
+      return false;
+    }
+  }
+
+  /**
+   * Strict-вариант {@link removeAgents} для deletion-пути (Task 10).
+   *
+   * Те же правила: подтверждённый boolean, 404 комнаты или уже вышедшего
+   * участника — это true, любой неизвестный сбой — false (retry). Комната
+   * остаётся жить: в общих встречах живые люди, удаление комнаты выкинуло бы
+   * их из-за того, что аккаунт одного из участников удалён.
+   */
+  async removeAgentsStrict(roomName: string): Promise<boolean> {
+    const client = new RoomServiceClient(this.httpUrl, this.apiKey, this.apiSecret);
+    let participants;
+    try {
+      participants = await client.listParticipants(roomName);
+    } catch (e: any) {
+      if (LiveKitClient.isGone(e)) return true;
+      this.logger.warn(`removeAgentsStrict ${roomName}: listParticipants неизвестен (status=${e?.status ?? 'n/a'})`);
+      return false;
+    }
+    for (const p of participants) {
+      if (p.kind !== ParticipantInfo_Kind.AGENT) continue;
+      try {
+        await client.removeParticipant(roomName, p.identity);
+      } catch (e: any) {
+        // Уже вышел — подтверждённый исход, идём дальше.
+        if (LiveKitClient.isGone(e)) continue;
+        this.logger.warn(`removeAgentsStrict ${roomName}: removeParticipant неизвестен (status=${e?.status ?? 'n/a'})`);
+        return false;
+      }
+    }
+    return true;
+  }
+
   /** Доставка сообщения в комнату. Слушают и воркер, и фронт. */
   async send(roomName: string, msg: VoiceDataMessage): Promise<void> {
     const client = new RoomServiceClient(this.httpUrl, this.apiKey, this.apiSecret);

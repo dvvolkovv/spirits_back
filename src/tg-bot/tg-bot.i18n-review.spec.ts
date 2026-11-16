@@ -293,13 +293,16 @@ describe('ссылки: новая гасит старые; к группе по
   });
 
   function makeClaim(o: { token?: any; owner?: number | null; conflict?: boolean; conflictOwner?: string; tokenTaken?: boolean; configTaken?: boolean }) {
-    const pg = { query: jest.fn(async (sql: string) => {
-      if (/FROM tg_claim_tokens t/.test(sql)) return { rows: o.token ? [o.token] : [] };
-      if (/id != \$2/.test(sql)) return { rows: o.conflict ? [{ id: 'other', owner_user_id: o.conflictOwner ?? 'u-stranger' }] : [] };
-      if (/UPDATE tg_claim_tokens/.test(sql)) return o.tokenTaken ? { rows: [], rowCount: 0 } : { rows: [{ token: 'tok' }], rowCount: 1 };
-      if (/UPDATE tg_bot_configs/.test(sql)) return o.configTaken ? { rows: [], rowCount: 0 } : { rows: [{ id: 'c1' }], rowCount: 1 };
-      return { rows: [] };
-    }) };
+    const pg = {
+      query: jest.fn(async (sql: string) => {
+        if (/FROM tg_claim_tokens t/.test(sql)) return { rows: o.token ? [o.token] : [] };
+        if (/id != \$2/.test(sql)) return { rows: o.conflict ? [{ id: 'other', owner_user_id: o.conflictOwner ?? 'u-stranger' }] : [] };
+        if (/UPDATE tg_claim_tokens/.test(sql)) return o.tokenTaken ? { rows: [], rowCount: 0 } : { rows: [{ token: 'tok' }], rowCount: 1 };
+        if (/UPDATE tg_bot_configs/.test(sql)) return o.configTaken ? { rows: [], rowCount: 0 } : { rows: [{ id: 'c1' }], rowCount: 1 };
+        return { rows: [] };
+      }),
+      tryAdvisoryLock: jest.fn(async () => ({ release: jest.fn(async () => {}) })),
+    };
     const identity = { getIdentityByLinkeonId: jest.fn(async () => (o.owner === null ? null : { tgUserId: o.owner ?? 7 })) };
     return { svc: new TgClaimService(pg as any, identity as any), pg };
   }
@@ -457,7 +460,9 @@ describe('видео: ответ на исчезнувшее сообщение 
   it('уведомление уходит с allow_sending_without_reply — сообщение могли удалить за 1–3 минуты генерации', async () => {
     const { TgVideoDispatchService } = require('./tg-video-dispatch.service');
     const grammy = { sendMessage: jest.fn(async () => ({})), sendChatAction: jest.fn(async () => {}) };
-    const svc = new TgVideoDispatchService(pgSpeaking('ru') as any, grammy as any);
+    const svc = new TgVideoDispatchService(pgSpeaking('ru', (sql) => sql.includes('FROM tg_bot_video_jobs tg')
+      ? { rows: [{ '?column?': 1 }] }
+      : { rows: [] }) as any, grammy as any);
     (svc as any).logger = quiet;
     await (svc as any).deliver({ job_id: 'j', tg_chat_id: '-100', tg_reply_to_message_id: 5, status: 'failed', video_url: null, owner_user_id: 'u-1' });
     expect((grammy.sendMessage.mock.calls[0] as any[])[2]).toEqual({ reply_parameters: { message_id: 5, allow_sending_without_reply: true } });

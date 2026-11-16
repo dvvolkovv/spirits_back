@@ -36,7 +36,8 @@ export const THUMB_QUEUE_WAIT_MS = 10_000;
 export const THUMB_WORK_TIMEOUT_MS = 20_000;
 
 const MAX_SRC_LENGTH = 300;
-const IMAGE_EXT_RE = /\.(jpe?g|png|webp|gif)$/i;
+/** Расширения, для которых панель делает миниатюру (использует и chat-file purge). */
+export const IMAGE_EXT_RE = /\.(jpe?g|png|webp|gif)$/i;
 
 export interface ThumbSource {
   bucket: string;

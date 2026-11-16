@@ -1,6 +1,13 @@
-import { ProfileService } from './profile.service';
+import { AccountDeletionJobs } from '../account-deletion/account-deletion.jobs';
+import { AccountDeletionLifecycle } from '../account-deletion/account-deletion.lifecycle';
+import { AccountDeletionPlanner } from '../account-deletion/account-deletion.planner';
+import { AccountDeletionRegistry } from '../account-deletion/account-deletion.registry';
+import { AccountDeletionRunner } from '../account-deletion/account-deletion.runner';
+import type { DeletionExecution, DeletionJobRow } from '../account-deletion/account-deletion.types';
 import { IdentityService } from '../identity/identity.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
+import { ProfileAccountDeletionAdapter } from './profile-account-deletion.adapter';
+import { ProfileAccountDeletionRecapture } from './profile-account-deletion.discovery';
 
 /// Удаление аккаунта должно быть удалением, а не деактивацией.
 ///
@@ -10,17 +17,36 @@ import { BusinessProfileService } from '../business-profile/business-profile.ser
 /// state обратно в active. Правило 5.1.1(v) считает такое деактивацией.
 ///
 /// Здесь не проверяется текст SQL: он может быть любым, важно наблюдаемое
-/// поведение. Поэтому «база» ниже — крошечная модель двух таблиц, и тесты
+/// поведение. Поэтому «база» ниже — крошечная модель таблиц, и тесты
 /// спрашивают её о состоянии так же, как о нём спросит вход.
+///
+/// С Task 17 наблюдаемое поведение даёт НЕ ProfileService.deleteProfile
+/// (он лишён собственных SQL/network вызовов), а fenced-адаптер
+/// account.core.*: повторный capture файлов, граф, затем одна транзакция
+/// (lock + deleteOwnedCoreRows). С Task 18 вход в удаление — настоящий
+/// lifecycle.begin(): поколение (state='deleted', deletion_id, deleted_at)
+/// ставит он же, а не ручная симуляция; планировщик пишет план в модель
+/// (INSERT задач здесь no-op — хранилище задач проверяют PG-спеки).
+/// adapter.execute по-прежнему вызывается напрямую: порядок stops→core и
+/// поведение при провале стопов покрывают lifecycle-спеки Task 18.
 
-/// Модель того, что нужно этим тестам: строки пользователей и связок входа.
+/// Модель того, что нужно этим тестам: строки пользователей, связок входа,
+/// профиля,TG-связок и служебные таблицы deletion-pipeline.
 class FakeDb {
   users = new Map<string, any>();
   identities: any[] = [];
+  /** Счётчик поколений begin(): uuid v4-формы, детерминированный. */
+  deletionSeq = 0;
   /** user_id → profile_data. Моделирует ai_profiles_consolidated. */
   profiles = new Map<string, any>();
   /** Связки бота: linkeon_user_id ↔ tg_user_id (1:1). Моделирует tg_user_identities. */
   tgIdentities: Array<{ linkeon_user_id: string; tg_user_id: number }> = [];
+  /**
+   * Модель account_deletion_jobs (Task 20): planner.persist пишет сюда план
+   * поколения, реактивация resolveOrCreate гасит незавершённые задачи.
+   * Хранилище задач в объёме, нужном этому спеку: status по generation.
+   */
+  jobs: Array<{ deletion_id: string; user_id: string; resource_type: string; status: string }> = [];
 
   async query(sql: string, params: any[] = []) {
     const s = sql.replace(/\s+/g, ' ').trim();
@@ -83,6 +109,90 @@ class FakeDb {
       const row = this.identities.find((i) => i.email === params[0] && i.email_verified);
       return { rows: row ? [{ user_id: row.user_id }] : [] };
     }
+    // ---- Deletion-pipeline (Task 17) ----
+    // begin() (Task 18): чтение поколения под блокировкой строки.
+    if (s.startsWith('SELECT state, deletion_id, deleted_at FROM user_id')) {
+      const u = this.users.get(params[0]);
+      return u
+        ? {
+          rows: [{
+            state: u.state ?? null,
+            deletion_id: u.deletion_id ?? null,
+            deleted_at: u.deleted_at ?? null,
+          }],
+          rowCount: 1,
+        }
+        : { rows: [], rowCount: 0 };
+    }
+    // begin() (Task 18): выпуск нового поколения для активного аккаунта.
+    if (s.startsWith("UPDATE user_id SET state = 'deleted'")) {
+      const u = this.users.get(params[0]);
+      if (!u || u.state !== 'active') return { rows: [], rowCount: 0 };
+      const deletionId = `11111111-1111-4111-8111-${String(++this.deletionSeq).padStart(12, '0')}`;
+      Object.assign(u, {
+        state: 'deleted', deletion_id: deletionId, deleted_at: new Date(),
+      });
+      return {
+        rows: [{
+          internal_id: params[0],
+          deletion_id: deletionId,
+          deleted_at: u.deleted_at,
+        }],
+        rowCount: 1,
+      };
+    }
+    // Реактивация (Task 20): чтение поколения под блокировкой строки —
+    // SELECT deletion_id ... FOR UPDATE из resolveOrCreate.
+    if (s.startsWith('SELECT deletion_id FROM user_id')) {
+      const u = this.users.get(params[0]);
+      return u
+        ? { rows: [{ deletion_id: u.deletion_id ?? null }], rowCount: 1 }
+        : { rows: [], rowCount: 0 };
+    }
+    // Персистенция плана (planner.persist): задачи поколения в модель.
+    if (s.startsWith('INSERT INTO account_deletion_jobs')) {
+      this.jobs.push({
+        deletion_id: params[0],
+        user_id: params[1],
+        resource_type: params[2],
+        status: 'pending',
+      });
+      return { rows: [], rowCount: 1 };
+    }
+    // Реактивация (Task 20): гашение незавершённых задач старого поколения.
+    if (s.startsWith("UPDATE account_deletion_jobs SET status = 'cancelled'")) {
+      for (const job of this.jobs) {
+        if (
+          job.user_id === params[0] &&
+          job.deletion_id === params[1] &&
+          ['pending', 'running', 'failed'].includes(job.status)
+        ) {
+          job.status = 'cancelled';
+        }
+      }
+      return { rows: [], rowCount: 0 };
+    }
+    // Fenced-чтение поколения для повторного capture файлов.
+    if (s.startsWith('SELECT deleted_at FROM user_id')) {
+      const u = this.users.get(params[0]);
+      const ok = !!u && u.state === 'deleted' && u.deletion_id === params[1];
+      return ok
+        ? { rows: [{ deleted_at: u.deleted_at }], rowCount: 1 }
+        : { rows: [], rowCount: 0 };
+    }
+    // Keyset-страница истории для discoverChatFiles: в этой модели истории
+    // нет — файлы не переоткрываются.
+    if (s.startsWith('SELECT h.id, h.content FROM custom_chat_history')) {
+      return { rows: [], rowCount: 0 };
+    }
+    if (s.startsWith('SELECT 1 FROM account_deletion_jobs')) {
+      // Проверка незавершённых stop-задач (assertNoImmediateBlockers).
+      if (s.includes("LIKE '%.stop'")) return { rows: [], rowCount: 0 };
+      // assertCurrent и lockAndAssertCurrent: params [jobId, userId, deletionId, ...].
+      const u = this.users.get(params[1]);
+      const ok = !!u && u.state === 'deleted' && u.deletion_id === params[2];
+      return ok ? { rows: [{ n: 1 }], rowCount: 1 } : { rows: [], rowCount: 0 };
+    }
     if (s.startsWith('SELECT state FROM user_id')) {
       const u = this.users.get(params[0]);
       return { rows: u ? [{ state: u.state }] : [] };
@@ -91,17 +201,27 @@ class FakeDb {
       const u = this.users.get(params[0]);
       return { rows: u ? [{ password_hash: u.password_hash }] : [] };
     }
-    if (s.startsWith('UPDATE user_id SET state = \'deleted\'')) {
+    // Tombstone (deleteOwnedCoreRows): гасит пароль/почту/бонус, НЕ трогая
+    // state/deletion_id — поколение принадлежит begin()/reactivation.
+    // Должен стоять ДО общего 'UPDATE user_id SET password_hash' (identity).
+    if (s.startsWith('UPDATE user_id SET password_hash = NULL')) {
       const u = this.users.get(params[0]);
-      if (u) Object.assign(u, {
-        state: 'deleted', password_hash: null,
-        primary_email: null, welcome_bonus_at: null,
-      });
+      if (u && u.state === 'deleted' && u.deletion_id === params[1]) {
+        Object.assign(u, {
+          password_hash: null, primary_email: null, welcome_bonus_at: null,
+        });
+      }
       return { rows: [] };
     }
     if (s.startsWith('UPDATE user_id SET state = \'active\'')) {
       const u = this.users.get(params[0]);
       if (u && u.state !== 'active') u.state = 'active';
+      // Task 20: реактивация снимает поколение ЦЕЛИКОМ — SQL содержит
+      // deleted_at = NULL, deletion_id = NULL (до Task 20 их не было).
+      if (u && /deletion_id\s*=\s*NULL/i.test(s)) {
+        u.deleted_at = null;
+        u.deletion_id = null;
+      }
       return { rows: [] };
     }
     if (s.startsWith('UPDATE user_id SET password_hash')) {
@@ -128,20 +248,47 @@ class FakeDb {
     }
     return { rows: [] };
   }
+
+  /** inTransaction (blog-slot-claim): выделенное соединение из того же пула. */
+  async getClient() {
+    return {
+      query: (sql: string, params: any[] = []) => this.query(sql, params),
+      release: () => undefined,
+    };
+  }
 }
 
 function makeServices(db: FakeDb) {
-  const neo4j = { deleteUserGraph: jest.fn().mockResolvedValue(undefined) };
-  const profile = new ProfileService(db as any, neo4j as any);
+  const neo4j = { deleteUserGraphStrict: jest.fn().mockResolvedValue(undefined) };
   const identity = new IdentityService(db as any);
-  return { profile, identity, neo4j };
+  const jobs = new AccountDeletionJobs(db as any);
+  const registry = new AccountDeletionRegistry();
+  // env не передаём: publicBaseUrl из process.env в юнит-среде пустой, но
+  // история в модели и так пуста — discovery не находит файлов без сети.
+  const recapture = new ProfileAccountDeletionRecapture(db as any, new AccountDeletionPlanner([]));
+  const adapter = new ProfileAccountDeletionAdapter(
+    db as any, jobs, recapture, neo4j as any, registry,
+  );
+  // Task 18: настоящий вход в удаление. Здесь используется только begin()
+  // (поколение + план); stops и core спеки lifecycle гоняют отдельно.
+  const runner = new AccountDeletionRunner(db as any, jobs as any, registry as any);
+  const lifecycle = new AccountDeletionLifecycle(
+    db as any,
+    new AccountDeletionPlanner([]) as any,
+    jobs as any,
+    registry as any,
+    runner,
+  );
+  return { identity, neo4j, jobs, adapter, lifecycle };
 }
 
 describe('удаление аккаунта', () => {
   let db: FakeDb;
-  let profile: ProfileService;
   let identity: IdentityService;
   let neo4j: any;
+  let jobs: AccountDeletionJobs;
+  let adapter: ProfileAccountDeletionAdapter;
+  let lifecycle: AccountDeletionLifecycle;
 
 /**
  * resolveOrCreate отдаёт union: у него есть вариант link_required, когда
@@ -153,16 +300,47 @@ function ok<T extends { status: string }>(r: T): Extract<T, { status: 'ok' }> {
   return r as Extract<T, { status: 'ok' }>;
 }
 
+  /**
+   * Полный путь удаления, каким его видит адаптер: настоящий begin()
+   * (Task 18) ставит поколение и пишет план, затем fenced core finalize.
+   */
+  async function deleteAccount(userId: string): Promise<void> {
+    if (!db.users.has(userId)) {
+      db.users.set(userId, { state: 'active', welcome_bonus_at: null, password_hash: null });
+    }
+    const account = await lifecycle.begin(userId, 'explicit');
+    if (!account) throw new Error('begin() вернул null для активного аккаунта');
+    const job: DeletionJobRow = {
+      id: `job-core-${account.deletionId}`,
+      deletionId: account.deletionId,
+      userId,
+      resourceType: 'account.core.immediate',
+      resourceKey: 'account',
+      phase: 'immediate',
+      payload: {},
+      status: 'running',
+      attempts: 1,
+      nextAttemptAt: new Date(),
+      leaseUntil: new Date(Date.now() + 300_000),
+      lastErrorKind: null,
+    };
+    const ctx: DeletionExecution = {
+      db: db as any,
+      assertCurrent: (j: DeletionJobRow) => jobs.assertCurrent(j),
+    };
+    await adapter.execute(job, ctx);
+  }
+
   beforeEach(() => {
     db = new FakeDb();
-    ({ profile, identity, neo4j } = makeServices(db));
+    ({ identity, neo4j, jobs, adapter, lifecycle } = makeServices(db));
   });
 
   it('обрывает связки входа — по старой почте аккаунт больше не находится', async () => {
     const { userId } = ok(await identity.resolveOrCreate('email', { email: 'gone@example.com' }));
     expect(await identity.findIdentityByEmail('gone@example.com')).toEqual({ userId });
 
-    await profile.deleteProfile(userId);
+    await deleteAccount(userId);
 
     expect(await identity.findIdentityByEmail('gone@example.com')).toBeNull();
   });
@@ -172,20 +350,22 @@ function ok<T extends { status: string }>(r: T): Extract<T, { status: 'ok' }> {
     await identity.setUserPasswordHash(userId, 'хеш-старого-пароля');
     expect(await identity.getUserPasswordHash(userId)).toBe('хеш-старого-пароля');
 
-    await profile.deleteProfile(userId);
+    await deleteAccount(userId);
 
     expect(await identity.getUserPasswordHash(userId)).toBeNull();
   });
 
   it('стирает граф профиля — иначе личные данные переживают удаление', async () => {
     const { userId } = ok(await identity.resolveOrCreate('email', { email: 'graph@example.com' }));
-    await profile.deleteProfile(userId);
-    expect(neo4j.deleteUserGraph).toHaveBeenCalledWith(userId);
+    await deleteAccount(userId);
+    // Строгий вариант: legacy deleteUserGraph глотает ошибки (оставлен для
+    // совместимости), deletion-pipeline обязан замечать сбой графа.
+    expect(neo4j.deleteUserGraphStrict).toHaveBeenCalledWith(userId);
   });
 
   it('повторный вход тем же провайдером НЕ возвращает прежний аккаунт', async () => {
     const first = ok(await identity.resolveOrCreate('email', { email: 'again@example.com' }));
-    await profile.deleteProfile(first.userId);
+    await deleteAccount(first.userId);
 
     const second = ok(await identity.resolveOrCreate('email', { email: 'again@example.com' }));
 
@@ -198,7 +378,7 @@ function ok<T extends { status: string }>(r: T): Extract<T, { status: 'ok' }> {
     // неизбежно попадает в ту же строку. Она обязана стать активной, иначе
     // человек войдёт в аккаунт с состоянием deleted.
     const first = ok(await identity.resolveOrCreate('phone', { phone: '79990000001' }));
-    await profile.deleteProfile(first.userId);
+    await deleteAccount(first.userId);
     expect(db.users.get(first.userId).state).toBe('deleted');
 
     const second = ok(await identity.resolveOrCreate('phone', { phone: '79990000001' }));
@@ -210,6 +390,33 @@ function ok<T extends { status: string }>(r: T): Extract<T, { status: 'ok' }> {
     expect(db.users.get(first.userId).welcome_bonus_at).toBe('now');
   });
 
+  it('реактивация телефона отменяет незавершённые задачи старого поколения', async () => {
+    // Task 20: stale deletion worker не должен продолжить стирание
+    // «воскресшего» аккаунта. Реактивация снимает поколение с user_id
+    // (deletion_id/deleted_at) и переводит незавершённые задачи
+    // (pending/running/failed) старого поколения в cancelled.
+    const first = ok(await identity.resolveOrCreate('phone', { phone: '79990000003' }));
+    await deleteAccount(first.userId);
+    const generation = db.users.get(first.userId).deletion_id;
+    expect(generation).toBeTruthy();
+    // begin() спланировал задачи поколения — до реактивации они незавершены.
+    expect(
+      db.jobs.some((j) => j.deletion_id === generation && j.status !== 'cancelled'),
+    ).toBe(true);
+
+    ok(await identity.resolveOrCreate('phone', { phone: '79990000003' }));
+
+    const u = db.users.get(first.userId);
+    expect(u.state).toBe('active');
+    expect(u.deletion_id).toBeNull();
+    expect(u.deleted_at).toBeNull();
+    expect(
+      db.jobs
+        .filter((j) => j.deletion_id === generation)
+        .every((j) => j.status === 'cancelled'),
+    ).toBe(true);
+  });
+
   it('рвёт и связку Telegram-бота — иначе мини-приложение снова впускает в удалённый аккаунт', async () => {
     // Мини-приложение ищет «старожилов бота» в tg_user_identities и по найденной
     // строке выдаёт токены. Пока строка переживала удаление, Telegram удалённого
@@ -218,7 +425,7 @@ function ok<T extends { status: string }>(r: T): Extract<T, { status: 'ok' }> {
     db.tgIdentities.push({ linkeon_user_id: userId, tg_user_id: 4242 });
     db.tgIdentities.push({ linkeon_user_id: 'someone-else', tg_user_id: 4343 });
 
-    await profile.deleteProfile(userId);
+    await deleteAccount(userId);
 
     expect(db.tgIdentities.find((i) => i.linkeon_user_id === userId)).toBeUndefined();
     // Чужая связка на месте: удаление не должно задевать соседей.
@@ -237,7 +444,7 @@ function ok<T extends { status: string }>(r: T): Extract<T, { status: 'ok' }> {
       what: { value: 'студия маникюра' },
     });
 
-    await profile.deleteProfile(userId);
+    await deleteAccount(userId);
 
     expect(await business.read(userId)).toEqual({});
   });

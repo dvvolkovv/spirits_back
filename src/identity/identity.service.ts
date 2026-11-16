@@ -1,7 +1,10 @@
 import { Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
+import { ModuleRef } from '@nestjs/core';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import type { AccountDeletionLifecycle } from '../account-deletion/account-deletion.lifecycle';
+import { inTransaction, type SlotQueryable } from '../blog/blog-slot-claim';
 import { PgService } from '../common/services/pg.service';
 import { RedisService } from '../common/services/redis.service';
 import { EventsService } from '../events/events.service';
@@ -37,6 +40,7 @@ export class IdentityService implements OnModuleInit {
     @Optional() private readonly pg?: PgService,
     @Optional() private readonly events?: EventsService,
     @Optional() private readonly redis?: RedisService,
+    @Optional() private readonly moduleRef?: ModuleRef,
   ) {}
 
   /**
@@ -141,6 +145,14 @@ export class IdentityService implements OnModuleInit {
     );
     if (found.rows.length) {
       const userId = found.rows[0].user_id;
+      // State-guard (T22.5): связка может указывать на удалённый аккаунт —
+      // зависшее поколение, in-flight удаление или historical-строка. Без
+      // этой проверки вход выдаёт свежий JWT на мёртвую запись: человек
+      // оказывается в кабинете, где data-сервисы гейтят state='active'
+      // (чат-история молча не сохраняется), а refresh-guard отсекает только
+      // на следующем refresh. Реактивируем НАЙДЕННУЮ строку in-place;
+      // fall-through в шаг 3 завёл бы второй аккаунт не-телефонному провайдеру.
+      await this.reactivateDeletedOnLogin(userId);
       await this.pg.query(
         `UPDATE user_identities SET last_used_at = now() WHERE provider = $1 AND provider_sub = $2`,
         [provider, providerSub],
@@ -162,6 +174,10 @@ export class IdentityService implements OnModuleInit {
            VALUES ($1, $2, $3, $4, $5, now())`,
           [userId, provider, providerSub, email, verified],
         );
+        // State-guard (T22.5) — как на шаге 1: verified email может совпасть
+        // с удалённым аккаунтом. Ссылка уже вставлена выше, реактивация
+        // вторую не вставляет (UNIQUE(provider, provider_sub) дал бы 23505).
+        await this.reactivateDeletedOnLogin(userId);
         this.events?.track('auth_succeeded', { userId, props: { method: provider, is_new: false, merged: true } });
         return { status: 'ok', userId, isNew: false, mergedExisting: true };
       }
@@ -194,58 +210,165 @@ export class IdentityService implements OnModuleInit {
       }
     }
 
-    // 3) Create new — в транзакции
-    await this.pg.query(`BEGIN`);
-    try {
-      let userId: string;
+    // 3) Create new / реактивация — в ОДНОЙ транзакции на выделенном соединении.
+    //
+    // Именно на выделенном (inTransaction → getClient): прежний BEGIN через
+    // пул уезжал на одно соединение, а записи — на другие, и «ROLLBACK»
+    // ничего не откатывал. Для реактивации это критично: снятие поколения
+    // и отмена его задач должны стать видны одновременно, иначе воркер
+    // deletion-pipeline успеет подобрать «осиротевшие» задачи живого аккаунта.
+    const userId = await inTransaction(this.pg, async (tx) => {
+      let id: string;
       if (provider === 'phone') {
-        userId = providerSub;
-        await this.pg.query(
+        id = providerSub;
+        await tx.query(
           `INSERT INTO user_id (primary_phone, state, internal_id, signup_method)
            VALUES ($1, 'active', $2, $3) ON CONFLICT (internal_id) DO NOTHING
            RETURNING internal_id`,
-          [providerSub, userId, provider],
-        );
-        // Регистрация тем же номером после удаления неизбежно попадает в ту же
-        // строку: у телефонного входа internal_id — это сам номер, и вставка
-        // молча ничего не делает. Строку надо вернуть в активные явно, иначе
-        // человек зарегистрируется в аккаунт с состоянием deleted.
-        //
-        // Данными прошлого владельца это не грозит: удаление их уже стёрло
-        // вместе с балансом, связками и паролем. Сюда мы попадаем только
-        // когда связок нет — значит аккаунт либо новый, либо удалённый.
-        await this.pg.query(
-          `UPDATE user_id SET state = 'active', update_date = now()
-           WHERE internal_id = $1 AND state <> 'active'`,
-          [userId],
+          [providerSub, id, provider],
         );
       } else {
-        const ins = await this.pg.query(
+        const ins = await tx.query(
           `INSERT INTO user_id (state, internal_id, primary_email, signup_method)
            VALUES ('active', gen_random_uuid()::text, $1, $2)
            RETURNING internal_id`,
           [email, provider],
         );
-        userId = ins.rows[0].internal_id;
+        id = ins.rows[0].internal_id;
       }
-      await this.pg.query(
-        `INSERT INTO ai_profiles_consolidated (user_id, tokens, isadmin) VALUES ($1, 0, false) ON CONFLICT (user_id) DO NOTHING`,
+      await this.reactivateIfNeeded(tx, id);
+      await this.ensureProfileAndIdentity(tx, id, provider, providerSub, email, verified);
+      await this.issueWelcomeBonus(tx, id);
+      return id;
+    });
+    // Треки — строго ПОСЛЕ COMMIT: событие не должно переживать откат.
+    this.events?.track('signup_completed', { userId, props: { method: provider } });
+    this.events?.track('auth_succeeded', { userId, props: { method: provider, is_new: true } });
+    return { status: 'ok', userId, isNew: true, mergedExisting: false };
+  }
+
+  /**
+   * Вернуть строку аккаунта в активные, если телефонная регистрация попала
+   * в уже существующую (удалённую или исторически удалённую) строку.
+   *
+   * Регистрация тем же номером после удаления неизбежно попадает в ту же
+   * строку: у телефонного входа internal_id — это сам номер, и вставка
+   * молча ничего не делает. Строку надо вернуть в активные явно, иначе
+   * человек зарегистрируется в аккаунт с состоянием deleted.
+   *
+   * Данными прошлого владельца это не грозит: удаление их уже стёрло
+   * вместе с балансом, связками и паролем. Сюда мы попадаем только
+   * когда связок нет — значит аккаунт либо новый, либо удалённый.
+   *
+   * Порядок внутри транзакции обязателен:
+   *  1. FOR UPDATE — блокируем строку, чтобы конкурентный воркер удаления
+   *     не interleaved с реактивацией (coordinator тоже берёт блокировки
+   *     поколения);
+   *  2. гасим ВСЕ незавершённые задачи старого поколения в 'cancelled'
+   *     и снимаем lease — иначе они продолжат стирать уже живой аккаунт.
+   *     Job-уровневый assertCurrent после этого увидит снятое поколение
+   *     и бросит DeletionCancelledError(kind='cancelled');
+   *  3. снимаем само поколение: deletion_id/deleted_at в NULL, state в
+   *     'active'. Следующее удаление выдаст НОВЫЙ UUID поколения
+   *     (lifecycle.begin на active-строке всегда gen_random_uuid()).
+   *
+   * Наблюдения (не фиксы этой задачи):
+   *  - blocked → active — прежняя семантика BASE (state <> 'active'), здесь
+   *    не ужесточается;
+   *  - state IS NULL не лечится: NULL <> 'active' даёт NULL, строка не
+   *    обновится. Известное ограничение (FU-T11-2), сознательно не чиним —
+   *    IS DISTINCT FROM менял бы поведение и для прочих состояний.
+   */
+  private async reactivateIfNeeded(tx: SlotQueryable, userId: string): Promise<void> {
+    const lock = await tx.query(
+      `SELECT deletion_id FROM user_id WHERE internal_id = $1 FOR UPDATE`,
+      [userId],
+    );
+    const deletionId: string | null = lock.rows[0]?.deletion_id ?? null;
+    if (deletionId) {
+      await tx.query(
+        `UPDATE account_deletion_jobs
+            SET status = 'cancelled', lease_until = NULL,
+                completed_at = now(), updated_at = now()
+          WHERE user_id = $1 AND deletion_id = $2
+            AND status IN ('pending', 'running', 'failed')`,
+        [userId, deletionId],
+      );
+    }
+    await tx.query(
+      `UPDATE user_id
+          SET state = 'active', deleted_at = NULL, deletion_id = NULL, update_date = now()
+        WHERE internal_id = $1 AND state <> 'active'`,
+      [userId],
+    );
+  }
+
+  /**
+   * State-guard (T22.5): вход по найденной связке в аккаунт state='deleted'
+   * реактивирует НАЙДЕННУЮ строку in-place — те же шаги, что reactivateIfNeeded
+   * на пути регистрации (шаг 3), но без создания второго аккаунта и без
+   * повторной вставки связки входа.
+   *
+   * Гейт-форма перекрывает буквальную `state <> 'active'` reactivateIfNeeded:
+   * только state='deleted'. 'blocked' не флипаем — это было бы самоликвидацией
+   * модерации (admin.service); NULL не лечим — отдельный вопрос владельца
+   * (FU-T11-2). Поэтому state читается дважды: снаружи транзакции (дешёвый
+   * фильтр — не тащим FOR UPDATE и транзакцию в каждый вход) и внутри неё под
+   * блокировкой строки. Отмена задач поколения и снятие поколения идут в той
+   * же транзакции (reactivateIfNeeded) — нет окна, где state уже 'active', а
+   * задачи поколения ещё живы; конкурентная реактивация превращает вызов в
+   * no-op.
+   *
+   * Связку входа НЕ вставляем: шаг 1 находит по уже существующей, шаг 2
+   * вставляет её сам до вызова. Повторный INSERT упёрся бы в
+   * UNIQUE(provider, provider_sub) (23505) — поэтому ensureProfileRow, а не
+   * ensureProfileAndIdentity. Профильная строка и бонус идемпотентны
+   * (ON CONFLICT DO NOTHING / claim welcome_bonus_at IS NULL).
+   *
+   * Вызывающий трекает auth_succeeded после возврата — то есть после COMMIT.
+   */
+  private async reactivateDeletedOnLogin(userId: string): Promise<void> {
+    if (!this.pg) return;
+    const seen = await this.pg.query(
+      `SELECT state FROM user_id WHERE internal_id = $1`,
+      [userId],
+    );
+    if (seen.rows[0]?.state !== 'deleted') return;
+    await inTransaction(this.pg, async (tx) => {
+      const lock = await tx.query(
+        `SELECT state FROM user_id WHERE internal_id = $1 FOR UPDATE`,
         [userId],
       );
-      await this.pg.query(
-        `INSERT INTO user_identities (user_id, provider, provider_sub, email, email_verified, last_used_at)
-         VALUES ($1, $2, $3, $4, $5, now())`,
-        [userId, provider, providerSub, email, verified],
-      );
-      await this.issueWelcomeBonus(userId);
-      await this.pg.query(`COMMIT`);
-      this.events?.track('signup_completed', { userId, props: { method: provider } });
-      this.events?.track('auth_succeeded', { userId, props: { method: provider, is_new: true } });
-      return { status: 'ok', userId, isNew: true, mergedExisting: false };
-    } catch (e: any) {
-      await this.pg.query(`ROLLBACK`);
-      throw e;
-    }
+      if (lock.rows[0]?.state !== 'deleted') return;
+      await this.reactivateIfNeeded(tx, userId);
+      await this.ensureProfileRow(tx, userId);
+      await this.issueWelcomeBonus(tx, userId);
+    });
+  }
+
+  /** Профильная строка и связка входа — идемпотентно, внутри той же транзакции. */
+  private async ensureProfileAndIdentity(
+    tx: SlotQueryable,
+    userId: string,
+    provider: Provider,
+    providerSub: string,
+    email: string | null,
+    verified: boolean,
+  ): Promise<void> {
+    await this.ensureProfileRow(tx, userId);
+    await tx.query(
+      `INSERT INTO user_identities (user_id, provider, provider_sub, email, email_verified, last_used_at)
+       VALUES ($1, $2, $3, $4, $5, now())`,
+      [userId, provider, providerSub, email, verified],
+    );
+  }
+
+  /** Профильная строка аккаунта — идемпотентно (ON CONFLICT DO NOTHING), внутри транзакции. */
+  private async ensureProfileRow(tx: SlotQueryable, userId: string): Promise<void> {
+    await tx.query(
+      `INSERT INTO ai_profiles_consolidated (user_id, tokens, isadmin) VALUES ($1, 0, false) ON CONFLICT (user_id) DO NOTHING`,
+      [userId],
+    );
   }
 
   /**
@@ -287,9 +410,13 @@ export class IdentityService implements OnModuleInit {
     return digits.length >= 4 ? `···${digits.slice(-4)}` : '···';
   }
 
-  private async issueWelcomeBonus(userId: string): Promise<void> {
-    if (!this.pg) return;
-    const claimed = await this.pg.query(
+  /**
+   * Приветственный бонус — внутри той же транзакции, что и создание/реактивация
+   * аккаунта (db — её соединение, а не пул: claim-маркер welcome_bonus_at и
+   * начисление должны стать видны вместе со строкой аккаунта).
+   */
+  private async issueWelcomeBonus(db: SlotQueryable, userId: string): Promise<void> {
+    const claimed = await db.query(
       `UPDATE user_id SET welcome_bonus_at = now()
        WHERE internal_id = $1 AND welcome_bonus_at IS NULL
        RETURNING internal_id`,
@@ -298,7 +425,7 @@ export class IdentityService implements OnModuleInit {
     if (claimed.rows.length === 0) return;
     // Через процедуру: стартовый бонус — тоже пополнение, и в истории он должен
     // быть видно, иначе у нового юзера баланс возникает из ниоткуда.
-    await this.pg.query(
+    await db.query(
       `SELECT add_user_tokens($1, $2, 'bonus', $3, NULL)`,
       [userId, WELCOME_BONUS, 'Приветственный бонус'],
     );
@@ -344,9 +471,21 @@ export class IdentityService implements OnModuleInit {
    * История чатов НЕ переносится сознательно: session_id собран как
    * `{userId}_{agentId}`, и перенос склеил бы два параллельных разговора с
    * одним ассистентом в одну ленту вперемешку по времени.
+   *
+   * С Task 19 loser не просто помечается state='deleted', а уходит через
+   * pipeline account-deletion с origin='merge': begin (поколение + план; core —
+   * account.core.purge, отложенный на 30 дней от deleted_at) → stopOnly
+   * (внешние стопы, включая отзыв токенов Apple — строго ДО переноса
+   * идентичностей) → перенос идентичностей и зачистка tombstone одной
+   * транзакцией под защитой поколения. Данные и историю стирает purge-задача
+   * по сроку (почасовой воркер), не этот метод.
    */
   async mergeAccounts(conflictUserId: string, targetUserId: string): Promise<{ survivorUserId: string; loserUserId: string }> {
     if (!this.pg) throw new Error('pg not configured');
+    // Без lifecycle нельзя ни создать поколение, ни исполнить стопы: отказ
+    // ДО любых изменений (в т.ч. до переноса баланса), а не половина пути.
+    const deletion = this.deletionLifecycle();
+    if (!deletion) throw new Error('deletion lifecycle not configured');
 
     // Выживает СТАРШИЙ аккаунт (по user_id.create_date): в нём обычно больше
     // накопленного. При равных/неизвестных датах выживает targetUserId — тот,
@@ -391,19 +530,104 @@ export class IdentityService implements OnModuleInit {
       this.logger.log(`merge: ${tokens} токенов ${loserUserId} → ${survivorUserId}`);
     }
 
-    // tg_user_identities слияние не переносит. Начнёт переносить — тем же шагом
-    // переносить owner_user_id лички (tg_bot_configs с tg_chat_id = tg_user_id),
-    // иначе сторож в TgConfigService.ensurePrivateConfig заархивирует личку
-    // объединённого человека как чужую.
-    await this.pg.query(
-      `UPDATE user_identities SET user_id = $1 WHERE user_id = $2`,
-      [survivorUserId, loserUserId],
-    );
-    await this.pg.query(
-      `UPDATE user_id SET state = 'deleted', update_date = now() WHERE internal_id = $1`,
-      [loserUserId],
-    );
+    // Task 19 — порядок, зафиксированный планом: credit-first баланс (выше) →
+    // begin(loser,'merge') → stopOnly (внешние стопы; integration.apple.stop
+    // читает provider_refresh_token из user_identities loser, поэтому revoke
+    // строго ДО переноса) → транзакция переноса под защитой поколения.
+    const account = await deletion.begin(loserUserId, 'merge');
+    if (account) {
+      // Неуспех стопа бросает как есть (retryable DeletionRetryError('db') от
+      // контрольного assertNoImmediateBlockers либо отмена): транзакция
+      // переноса не начнётся, идентичности и история останутся на loser.
+      // Повторный merge продолжит с того же места: begin переиспользует
+      // поколение, выполненные стопы не переисполняются. HTTP-маппинг здесь
+      // сознательно не добавляем: контроллер merge транслирует ошибку в
+      // глобальный обработчик как есть.
+      await deletion.stopOnly(account.deletionId);
+      await inTransaction(this.pg, async (tx) => {
+        // Защита поколения ВНУТРИ транзакции: реактивация/новое поколение
+        // между стопами и переносом откатывает перенос (DeletionCancelledError).
+        await deletion.assertCurrent(tx as any, account);
+        await tx.query(
+          `UPDATE user_identities
+           SET user_id = $1
+           WHERE user_id = $2`,
+          [survivorUserId, loserUserId],
+        );
+        // tg_user_identities слияние не переносит: перенос потребовал бы тем же
+        // шагом переносить owner_user_id лички (tg_bot_configs с tg_chat_id =
+        // tg_user_id), иначе сторож в TgConfigService.ensurePrivateConfig
+        // заархивирует личку объединённого человека как чужую. Уходящему в
+        // удаление loser привязка тоже не нужна — loser-строки удаляем под той
+        // же gen-защитой; Telegram survivor не трогаем.
+        await tx.query(
+          `DELETE FROM tg_user_identities
+           WHERE linkeon_user_id = $1
+             AND EXISTS (
+               SELECT 1 FROM user_id u
+                WHERE u.internal_id = $1
+                  AND u.state = 'deleted'
+                  AND u.deletion_id = $2
+             )`,
+          [loserUserId, account.deletionId],
+        );
+        // Зачистка следов входа на tombstone — под той же gen-защитой: хэш
+        // пароля, профильная почта и маркер приветственного бонуса не должны
+        // переживать удаление на строке аккаунта.
+        await tx.query(
+          `UPDATE user_id
+              SET password_hash = NULL,
+                  primary_email = NULL,
+                  welcome_bonus_at = NULL,
+                  update_date = now()
+            WHERE internal_id = $1
+              AND state = 'deleted'
+              AND deletion_id = $2`,
+          [loserUserId, account.deletionId],
+        );
+      });
+    } else {
+      // begin→null (план поведение не регламентирует — задокументированное
+      // отклонение: сохраняем legacy-путь): historical-удаление БЕЗ поколения
+      // (deleted до введения pipeline), заблокированный модерацией аккаунт
+      // (FU-T11-2 — не наша ветка) или строка с NULL state. Pipeline над ними
+      // не включается, а ожидание человека от merge прежнее: способы входа
+      // переносятся на survivor, слитый аккаунт помечается удалённым.
+      await this.pg.query(
+        `UPDATE user_identities SET user_id = $1 WHERE user_id = $2`,
+        [survivorUserId, loserUserId],
+      );
+      await this.pg.query(
+        `UPDATE user_id SET state = 'deleted', update_date = now() WHERE internal_id = $1`,
+        [loserUserId],
+      );
+    }
     return { survivorUserId, loserUserId };
+  }
+
+  /**
+   * Task 19 — deletion lifecycle для очистки merge-loser.
+   *
+   * Получается ЛЕНИВО (ModuleRef + require в момент вызова), а не value-
+   * импортом конструктора: прямой import AccountDeletionLifecycle в этот файл
+   * замкнул бы загрузочный цикл
+   *   identity.service → account-deletion.lifecycle → account-deletion.jobs
+   *     → account-deletion.catalog → integration-account-deletion.adapter
+   *     → identity.service
+   * (каталог адаптеров удаления требует integration-адаптер, а тот —
+   * IdentityService для DI). Цикл при старте приложения ломает decorator-
+   * metadata и module-level SQL jobs.ts. ModuleRef опционален: unit-контуры
+   * конструируют сервис без Nest-контейнера и получают guard-отказ в merge.
+   */
+  private deletionLifecycle(): AccountDeletionLifecycle | null {
+    if (!this.moduleRef) return null;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { AccountDeletionLifecycle } = require('../account-deletion/account-deletion.lifecycle');
+      return this.moduleRef.get(AccountDeletionLifecycle, { strict: false }) ?? null;
+    } catch {
+      return null;
+    }
   }
 
   /**

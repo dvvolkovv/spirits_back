@@ -90,14 +90,14 @@ function pgReturning(rows: any[][]) {
 describe('ProfileService.updateProfile', () => {
   it('пишет в базу только разрешённое', async () => {
     const pg = pgReturning([]);
-    await new ProfileService(pg as any).updateProfile('u-1', { name: 'Анна', isadmin: true, tokens: 10 ** 9 });
+    await new ProfileService(pg as any, { deleteExplicit: jest.fn() } as any).updateProfile('u-1', { name: 'Анна', isadmin: true, tokens: 10 ** 9 });
     expect(pg.calls).toHaveLength(1);
     expect(JSON.parse(pg.calls[0].params[0])).toEqual({ name: 'Анна' });
   });
 
   it('нечего писать — в базу не ходит', async () => {
     const pg = pgReturning([]);
-    await new ProfileService(pg as any).updateProfile('u-1', { isadmin: true });
+    await new ProfileService(pg as any, { deleteExplicit: jest.fn() } as any).updateProfile('u-1', { isadmin: true });
     expect(pg.calls).toHaveLength(0);
   });
 });
@@ -112,7 +112,7 @@ describe('GET /profile: ключи profile_data не перекрывают вы
       [{ id: 7, user_id: 'u-1', preferred_agent: 'Роман', tokens: 25000, email: 'real@example.com', isadmin: false, onboarded: false, profile_data: spoof }],
       [{ primary_phone: '79990000000', primary_email: null, signup_method: 'phone' }],
     ]);
-    const [{ profileJson: p }] = (await new ProfileService(pg as any).getProfile('u-1')) as any;
+    const [{ profileJson: p }] = (await new ProfileService(pg as any, { deleteExplicit: jest.fn() } as any).getProfile('u-1')) as any;
     expect(p).toMatchObject({
       id: 7, user_id: 'u-1', preferred_agent: 'Роман', tokens: 25000, email: 'real@example.com',
       phone: '79990000000', signup_method: 'phone', isadmin: false, onboarded: false,
@@ -131,7 +131,7 @@ describe('GET /user-profile: о другом человеке — только �
       near_empty_told: { at: 1 }, smm_sdk_session_id: 'секрет', assistant_voices: { 'Роман': 'alena' }, contactVisible: 'private',
     };
     const pg = pgReturning([[{ user_id: 'u-2', profile_data: pd }]]);
-    const r: any = await new ProfileService(pg as any).getUserProfile('viewer', 'u-2');
+    const r: any = await new ProfileService(pg as any, { deleteExplicit: jest.fn() } as any).getUserProfile('viewer', 'u-2');
     expect(Object.keys(r.profile_data).sort()).toEqual(
       ['avatar_url', 'beliefs', 'desires', 'family_name', 'intents', 'interests', 'name', 'skills', 'user_nickname', 'values'],
     );

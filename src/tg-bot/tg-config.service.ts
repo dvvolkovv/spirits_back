@@ -1,6 +1,18 @@
 import { Injectable, Logger, NotFoundException, BadRequestException } from '@nestjs/common';
+import { DeletionRetryError, deletionErrorKind } from '../account-deletion/account-deletion.safe';
 import { PgService } from '../common/services/pg.service';
+import { tgChatLifecycleLockKey } from './tg-chat-lifecycle';
 import { TgGrammyClient } from './tg-grammy.client';
+
+export function isAlreadyAbsentTelegram(error: any): boolean {
+  const status = Number(error?.response?.status ?? error?.response?.error_code ?? error?.error_code ?? 0);
+  if (![400, 403, 404].includes(status)) return false;
+  const description = String(
+    error?.description ?? error?.response?.description ?? error?.message ?? '',
+  ).toLowerCase();
+  return /chat not found|bot was kicked|bot is not a member|bot was blocked by the user|user is deactivated/
+    .test(description);
+}
 
 export interface TgBotConfigRow {
   id: string;
@@ -29,6 +41,14 @@ export class TgConfigService {
     private readonly pg: PgService,
     private readonly grammy: TgGrammyClient,
   ) {}
+
+  private async assertActiveAccount(ownerId: string): Promise<void> {
+    const active = await this.pg.query(
+      `SELECT 1 FROM user_id WHERE internal_id=$1 AND state='active'`,
+      [ownerId],
+    );
+    if (active.rows.length === 0) throw new BadRequestException('account is not active');
+  }
 
   async createPending(
     ownerId: string,
@@ -95,6 +115,7 @@ export class TgConfigService {
     id: string,
     ownerId: string,
   ): Promise<{ config: TgBotConfigRow; claimToken: string; deepLink: string }> {
+    await this.assertActiveAccount(ownerId);
     const cfg = await this.getById(id, ownerId);
     if (!['pending', 'archived'].includes(cfg.status)) {
       throw new BadRequestException(
@@ -112,8 +133,12 @@ export class TgConfigService {
       `UPDATE tg_bot_configs
           SET status = 'pending', tg_chat_id = NULL, tg_chat_title = NULL, archived_at = NULL
         WHERE id = $1 AND status IN ('pending', 'archived')
+          AND owner_user_id = $2
+          AND EXISTS (
+            SELECT 1 FROM user_id u WHERE u.internal_id=$2 AND u.state='active'
+          )
         RETURNING *`,
-      [id],
+      [id, ownerId],
     );
     if (updRes.rows.length === 0) {
       throw new BadRequestException('reissue доступен только для pending/archived конфигов');
@@ -123,10 +148,14 @@ export class TgConfigService {
     const expires = new Date(Date.now() + this.CLAIM_TTL_MS);
     const tokRes = await this.pg.query(
       `INSERT INTO tg_claim_tokens (kind, owner_user_id, config_id, expires_at)
-       VALUES ('claim', $1, $2, $3)
+       SELECT 'claim', $1, $2, $3
+       WHERE EXISTS (
+         SELECT 1 FROM user_id u WHERE u.internal_id=$1 AND u.state='active'
+       )
        RETURNING token`,
       [ownerId, id, expires],
     );
+    if (!tokRes.rows[0]?.token) throw new BadRequestException('account is not active');
     const claimToken = tokRes.rows[0].token;
 
     const botUsername = process.env.TG_BOT_USERNAME || 'LinkeonAgentBot';
@@ -213,6 +242,55 @@ export class TgConfigService {
     );
   }
 
+  async archiveForAccountDeletion(
+    id: string,
+    ownerId: string,
+    chatId: string | null,
+    currentDeletionId: string,
+  ): Promise<void> {
+    const archived = await this.pg.query(
+      `UPDATE tg_bot_configs c SET status='archived',archived_at=COALESCE(archived_at,now())
+       WHERE c.id=$1 AND c.owner_user_id=$2 AND EXISTS (
+         SELECT 1 FROM user_id u
+         WHERE u.internal_id=c.owner_user_id AND u.state='deleted' AND u.deletion_id=$3
+           AND (
+             c.status IN ('pending','active','silent')
+             OR (c.status='archived' AND c.archived_at IS NOT NULL AND c.archived_at>=u.deleted_at)
+           )
+       )
+       RETURNING c.tg_chat_id`,
+      [id, ownerId, currentDeletionId],
+    );
+    // Давно archived config пропускаем. Archived текущего deletion остаётся
+    // eligible: timeout внешнего leave обязан быть повторён до подтверждения.
+    if (!chatId || archived.rowCount === 0) return;
+    const actualChatId = String(archived.rows[0]?.tg_chat_id ?? '');
+    if (!actualChatId || actualChatId !== String(chatId)) return;
+    const lock = await this.pg.tryAdvisoryLock(tgChatLifecycleLockKey(actualChatId));
+    if (!lock) throw new DeletionRetryError('external_unknown');
+    try {
+      // Claim activation использует тот же lock. Pending учитываем наравне с
+      // active/silent: ожидающий подключения config ещё не должен выгонять бота.
+      const shared = await this.pg.query(
+        `SELECT 1 FROM tg_bot_configs other
+         WHERE other.tg_chat_id=$1 AND other.id<>$2
+           AND other.status IN ('active','silent','pending')
+         LIMIT 1`,
+        [actualChatId, id],
+      );
+      if (shared.rows.length > 0) return;
+      try {
+        await this.grammy.leaveChat(Number(actualChatId));
+      } catch (error: any) {
+        if (isAlreadyAbsentTelegram(error)) return;
+        // Archive уже закоммичен отдельным statement; chatId сохраняется для retry.
+        throw new DeletionRetryError(deletionErrorKind(error));
+      }
+    } finally {
+      await lock.release();
+    }
+  }
+
   /**
    * Группа стала супергруппой (migrate_to_chat_id): у неё новый id. Конфиг и
    * его история переезжают — иначе бот в новой супергруппе молчит, а
@@ -280,7 +358,9 @@ export class TgConfigService {
 
   async getActiveByTgChatId(tgChatId: number): Promise<TgBotConfigRow | null> {
     const r = await this.pg.query(
-      `SELECT * FROM tg_bot_configs WHERE tg_chat_id = $1 AND status IN ('active','silent') LIMIT 1`,
+      `SELECT c.* FROM tg_bot_configs c
+        JOIN user_id u ON u.internal_id=c.owner_user_id AND u.state='active'
+        WHERE c.tg_chat_id = $1 AND c.status IN ('active','silent') LIMIT 1`,
       [tgChatId],
     );
     return r.rows[0] ?? null;
@@ -299,6 +379,7 @@ export class TgConfigService {
    * потребовал бы обращения по имени, что в диалоге один на один абсурдно.
    */
   async ensurePrivateConfig(ownerId: string, tgChatId: number): Promise<TgBotConfigRow> {
+    await this.assertActiveAccount(ownerId);
     const existing = await this.pg.query(
       `SELECT * FROM tg_bot_configs
         WHERE tg_chat_id = $1 AND status IN ('active','silent')
@@ -317,7 +398,10 @@ export class TgConfigService {
       // пока он чужой и живой.
       await this.pg.query(
         `UPDATE tg_bot_configs SET status = 'archived', archived_at = now()
-          WHERE id = $1 AND owner_user_id <> $2 AND status IN ('active','silent')`,
+          WHERE id = $1 AND owner_user_id <> $2 AND status IN ('active','silent')
+            AND EXISTS (
+              SELECT 1 FROM user_id u WHERE u.internal_id=$2 AND u.state='active'
+            )`,
         [found.id, ownerId],
       );
       this.logger.warn(
@@ -330,10 +414,16 @@ export class TgConfigService {
       // статуса не ставит, групповой /silent до лички не доходит. Не будить —
       // значит молчать человеку один на один, пока он не догадается про /resume.
       const woke = await this.pg.query(
-        `UPDATE tg_bot_configs SET status = 'active' WHERE id = $1 AND status = 'silent' RETURNING *`,
-        [found.id],
+        `UPDATE tg_bot_configs SET status = 'active'
+          WHERE id = $1 AND status = 'silent' AND owner_user_id=$2
+            AND EXISTS (
+              SELECT 1 FROM user_id u WHERE u.internal_id=$2 AND u.state='active'
+            )
+          RETURNING *`,
+        [found.id, ownerId],
       );
-      return woke.rows[0] ?? { ...found, status: 'active' };
+      if (!woke.rows[0]) throw new BadRequestException('config is no longer active');
+      return woke.rows[0];
     }
     if (found) return found;
 
@@ -356,7 +446,11 @@ export class TgConfigService {
       `INSERT INTO tg_bot_configs (
          owner_user_id, tg_chat_id, display_name, preset_agent_id,
          addressing_mode, voice_reply_mode, status
-       ) VALUES ($1, $2, $3, $4, $5, 'mirror', 'active')
+       )
+       SELECT $1, $2, $3, $4, $5, 'mirror', 'active'
+       WHERE EXISTS (
+         SELECT 1 FROM user_id u WHERE u.internal_id=$1 AND u.state='active'
+       )
        ON CONFLICT (tg_chat_id) WHERE status IN ('active','silent') DO NOTHING
        RETURNING *`,
       [ownerId, tgChatId, 'Linkeon', agentId, 'always'],

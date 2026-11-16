@@ -68,6 +68,10 @@ function makeService(options: {
   let visibilityIndex = 0;
   const pg = {
     query: jest.fn(async (sql: string) => {
+      // Task 17B: active-гейт createRequest — вызывающий аккаунт активен.
+      if (sql.includes('FROM user_id WHERE internal_id')) {
+        return { rows: [{ n: 1 }], rowCount: 1 };
+      }
       if (sql.includes('SELECT user_id FROM ai_profiles_consolidated WHERE id')) {
         return {
           rows: options.targetMissing ? [] : [{ user_id: targetPhone }],
@@ -386,7 +390,8 @@ describe('ContactsService.createRequest privacy', () => {
     const queries = pg.query.mock.calls.map((call) => call[0]);
     expect(queries.some((sql) => sql.includes("profile_data->>'contactVisible'"))).toBe(false);
     expect(queries.some((sql) => sql.includes('INSERT INTO contact_requests'))).toBe(false);
-    expect(pg.query).toHaveBeenCalledTimes(2);
+    // Task 17B: active-гейт + idByPhone + phoneById (было 2 до появления гейта).
+    expect(pg.query).toHaveBeenCalledTimes(3);
   });
 
   it('returns the same 404 for a missing target before contactVisible or insertion', async () => {

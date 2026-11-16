@@ -3,6 +3,8 @@ import { Module } from '@nestjs/common';
 import { SpeechService } from './speech.service';
 import { SpeechController } from './speech.controller';
 import { CommonModule } from '../common/common.module';
+import { AccountDeletionModule } from '../account-deletion/account-deletion.module';
+import { SpeechAccountDeletionAdapter } from './speech-account-deletion.adapter';
 
 // PgService / StorageService / LanguageService / RedisService приходят из
 // CommonModule (он @Global, импорт тут — для явности). MiscModule больше не
@@ -10,9 +12,9 @@ import { CommonModule } from '../common/common.module';
 // MiscService.deductTokens (тот безусловен и уводил баланс в минус на
 // параллельных синтезах).
 @Module({
-  imports: [CommonModule],
+  imports: [CommonModule, AccountDeletionModule],
   controllers: [SpeechController],
-  providers: [SpeechService],
+  providers: [SpeechService, SpeechAccountDeletionAdapter],
   exports: [SpeechService],
 })
 export class SpeechModule {}

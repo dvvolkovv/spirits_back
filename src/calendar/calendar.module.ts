@@ -1,15 +1,17 @@
 import { Module, OnModuleInit } from '@nestjs/common';
+import { AccountDeletionModule } from '../account-deletion/account-deletion.module';
 import { CommonModule } from '../common/common.module';
 import { TalerIdModule } from '../talerid/talerid.module';
 import { CalendarService } from './calendar.service';
 import { CalendarController } from './calendar.controller';
+import { CalendarAccountDeletionAdapter } from './calendar-account-deletion.adapter';
 import { LinkeonTasksService } from './linkeon-tasks.service';
 import { DayFramingStore } from './day-framing.store';
 
 @Module({
-  imports: [CommonModule, TalerIdModule],
+  imports: [CommonModule, TalerIdModule, AccountDeletionModule],
   controllers: [CalendarController],
-  providers: [CalendarService, LinkeonTasksService, DayFramingStore],
+  providers: [CalendarService, LinkeonTasksService, DayFramingStore, CalendarAccountDeletionAdapter],
   exports: [CalendarService, LinkeonTasksService, DayFramingStore],
 })
 export class CalendarModule implements OnModuleInit {

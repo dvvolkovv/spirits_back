@@ -10,6 +10,7 @@ function makeService(
     productStatus?: string;
     balanceOk?: boolean;
     rekeying?: boolean;
+    accountDeleted?: boolean;
   } = {},
 ) {
   const calls: { sql: string; params: any[] }[] = [];
@@ -18,7 +19,7 @@ function makeService(
       calls.push({ sql, params });
       if (sql.includes("kind = 'rekey'")) return { rows: opts.rekeying ? [{ x: 1 }] : [] };
       if (sql.includes('SELECT status FROM products')) {
-        return { rows: [{ status: opts.productStatus ?? 'running' }] };
+        return { rows: opts.accountDeleted ? [] : [{ status: opts.productStatus ?? 'running' }] };
       }
       if (sql.includes('INSERT INTO product_turns') && opts.duplicate) {
         throw Object.assign(new Error('duplicate key value violates unique constraint'), {
@@ -149,6 +150,32 @@ describe('TurnsService.enqueue', () => {
     // Ход = реальный запуск claude -p на VM, то есть живые деньги. Вставка не
     // должна происходить вовсе, а не «происходить и не тарифицироваться».
     expect(calls.some((c) => c.sql.includes('INSERT INTO product_turns'))).toBe(false);
+  });
+});
+
+describe('TurnsService.enqueue — удалённый аккаунт', () => {
+  it('deleted не проходит guard и не доходит до баланса/INSERT', async () => {
+    const { svc, calls, misc } = makeService({ accountDeleted: true });
+
+    await expect(
+      svc.enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: 'не выполнять' }),
+    ).rejects.toThrow('Product not found');
+
+    const guard = calls.find((c) => c.sql.includes('SELECT status FROM products'))!;
+    expect(guard.sql).toContain('user_id');
+    expect(guard.sql).toContain("u.state='deleted'");
+    expect(misc.checkTokenBalance).not.toHaveBeenCalled();
+    expect(calls.some((c) => c.sql.includes('INSERT INTO product_turns'))).toBe(false);
+  });
+
+  it('сам INSERT повторяет deleted predicate, закрывая гонку после SELECT', async () => {
+    const { svc, calls } = makeService();
+    await svc.enqueue({ productId: 'p-1', userId: 'u-1', channel: 'web', prompt: 'обычный' });
+
+    const insert = calls.find((c) => c.sql.includes('INSERT INTO product_turns'))!;
+    expect(insert.sql).toContain('user_id u');
+    expect(insert.sql).toContain("u.state='deleted'");
+    expect(insert.sql).toContain('WHERE EXISTS');
   });
 });
 

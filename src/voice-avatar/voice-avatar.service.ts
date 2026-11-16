@@ -4,6 +4,10 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import axios from 'axios';
+import {
+  DeletionRetryError,
+  deletionErrorKind,
+} from '../account-deletion/account-deletion.safe';
 import { PgService } from '../common/services/pg.service';
 import { cloneVoiceName } from './voice-name';
 
@@ -208,6 +212,31 @@ export class VoiceAvatarService implements OnModuleInit {
     }
   }
 
+  /**
+   * Task 14 — строгое удаление клона для account-deletion (в отличие от
+   * best-effort deleteClone выше, который для живых пользователей глотает
+   * ошибки). Возвращает подтверждённый исход: 'deleted' (2xx) или 'absent'
+   * (404 — клона у провайдера уже нет, идемпотентный успех). Любой
+   * неподтверждённый исход (нет ключа, timeout, 5xx, сетевая ошибка) —
+   * DeletionRetryError: внешний voice_id НЕ считается удалённым и сохраняется
+   * в БД и в payload job'а для retry. Наружу уходит только kind, без
+   * e.message (там мог бы быть внешний id или детали запроса).
+   */
+  async deleteCloneConfirmed(voiceId: string): Promise<'deleted' | 'absent'> {
+    const key = process.env.ELEVENLABS_API_KEY;
+    if (!key) throw new DeletionRetryError('external_unknown');
+    try {
+      await axios.delete(`${EL_BASE}/voices/${encodeURIComponent(voiceId)}`, {
+        headers: { 'xi-api-key': key },
+        timeout: 30_000,
+      });
+      return 'deleted';
+    } catch (e: any) {
+      if (e?.response?.status === 404) return 'absent';
+      throw new DeletionRetryError(deletionErrorKind(e));
+    }
+  }
+
   // ─────────────────────────── Orchestration ───────────────────────────
 
   /**
@@ -246,17 +275,41 @@ export class VoiceAvatarService implements OnModuleInit {
 
   private async profileAndClone(userId: string, mp3: Buffer): Promise<void> {
     if (!this.pg) return;
+    // Task 11: strict active check ДО provider-вызовов — удалённому аккаунту
+    // клон ElevenLabs не создаётся (платный внешний ресурс, который Task 14
+    // ищет по строке user_voice; строки у удалённого поколения не будет).
+    // Это не ошибка: markFailed писал бы error_message для аккаунта, которого нет.
+    const active = await this.pg.query(
+      `SELECT 1 FROM user_id WHERE internal_id = $1 AND state = 'active'`,
+      [userId],
+    );
+    if ((active.rowCount ?? active.rows?.length ?? 0) === 0) {
+      this.logger.log(`profileAndClone skipped for ${userId}: account not active`);
+      return;
+    }
     try {
       const descriptor = await this.profile(mp3);
       // Имя — без id пользователя (voice-name.ts); связь — по voice_id ниже.
       const voiceId = await this.clone(mp3, cloneVoiceName());
-      await this.pg.query(
+      // EXISTS-гейт: аккаунт мог быть удалён, пока шло профилирование/клон —
+      // строка удалённого поколения не пишется (и не помечается проваленной).
+      const updated = await this.pg.query(
         `UPDATE user_voice
             SET status='ready', elevenlabs_voice_id=$2, voice_descriptor=$3,
                 error_message=NULL, updated_at=now()
-          WHERE user_id=$1`,
+          WHERE user_id=$1
+            AND EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $1 AND u.state = 'active')`,
         [userId, voiceId, JSON.stringify(descriptor)],
       );
+      if ((updated.rowCount ?? updated.rows?.length ?? 0) === 0) {
+        // Gate закрылся ПОСЛЕ создания клона: voice_id не записан, и Task 14
+        // (чистит клоны по строкам user_voice) его уже не найдёт — платный
+        // сирота у провайдера. Компенсируем сами (deleteClone best-effort,
+        // ошибки глотает); лог — без внешних идентификаторов.
+        this.logger.warn('voice clone compensated after inactive-gate');
+        await this.deleteClone(voiceId);
+        return;
+      }
       this.logger.log(`voice ready for ${userId} (voice ${voiceId})`);
     } catch (e: any) {
       this.logger.error(`profileAndClone failed for ${userId}: ${e.message}`);

@@ -7,6 +7,16 @@ import { buildProfileExtractionPrompt } from './profile-extraction-prompt';
 import { awaitWithAbort, throwIfAborted } from '../common/abort';
 import { automaticProfilingAllowed } from '../privacy/profile-privacy';
 
+/**
+ * Потолок ожидания одного Cypher-запроса в deleteUserGraphStrict (T17-M1).
+ *
+ * connectionTimeout драйвера (5 с) покрывает только установку соединения:
+ * half-open TCP оставляет session.run() висящим вечно, а вместе с ним висит
+ * execute() задачи account.core.* — heartbeat продлевает лизу, advisory lock
+ * не отпускается, и worker удаления встаёт до рестарта.
+ */
+const NEO4J_STRICT_RUN_TIMEOUT_MS = 60_000;
+
 @Injectable()
 export class Neo4jService implements OnModuleInit, OnModuleDestroy {
   private driver: Driver | null = null;
@@ -283,6 +293,73 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
       this.logger.error(`deleteUserGraph error: ${e.message}`);
     } finally {
       await session.close();
+    }
+  }
+
+  /// Строгий вариант deleteUserGraph для deletion-pipeline (Task 17): НЕ
+  /// глотает ошибки. Legacy-метод выше оставлен без изменений для старых
+  /// путей — там недоступный Neo4j не отменяет удаление аккаунта.
+  ///
+  /// В pipeline сбой графа обязан быть видимым: адаптер account.core.*
+  /// превращает его в DeletionRetryError(deletionErrorKind(error)), а
+  /// local-строки остаются на месте для retry — граф идемпотентен
+  /// (DETACH DELETE) и выполняется до local-транзакции, поэтому повтор
+  /// безопасен.
+  ///
+  /// Run ждём с bounded-таймаутом (T17-M1): по истечении сессия закрывается
+  /// принудительно — закрытие Session обрывает Bolt-соединение и отменяет
+  /// активный RUN на сервере (тот же приём, что в readRows). Ошибка таймаута
+  /// несёт code='ETIMEDOUT', который deletionErrorKind (safe.ts не изменяем)
+  /// классифицирует как 'timeout'.
+  ///
+  /// timeoutMs — параметр с production-дефолтом: тесты дают короткий
+  /// потолок, чтобы не ждать минуту на зависшем фейке.
+  async deleteUserGraphStrict(
+    userId: string,
+    timeoutMs: number = NEO4J_STRICT_RUN_TIMEOUT_MS,
+  ): Promise<void> {
+    const session = this.getSession();
+    if (!session) {
+      // T17-M4: тихий return выглядел бы как «успех» в журнале job'а —
+      // misconfig деплоя молча сохранил бы графовые PII при статусе done.
+      // Логируем сам факт, без идентификаторов пользователя.
+      this.logger.warn('Neo4j driver not configured; graph deletion skipped');
+      return;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      controller.abort(
+        Object.assign(
+          new Error(`neo4j graph deletion timed out after ${timeoutMs}ms`),
+          { code: 'ETIMEDOUT' },
+        ),
+      );
+    }, timeoutMs);
+    // Сторожевой таймер не должен сам по себе держать event loop живым.
+    timer.unref?.();
+    let closePromise: Promise<void> | null = null;
+    const closeSession = () => {
+      if (!closePromise) closePromise = session.close();
+      return closePromise;
+    };
+    try {
+      await awaitWithAbort(
+        session.run('MATCH (p:Profile {phone: $phone}) DETACH DELETE p', {
+          phone: userId,
+        }),
+        controller.signal,
+        () => { void closeSession().catch(() => {}); },
+      );
+    } finally {
+      clearTimeout(timer);
+      if (controller.signal.aborted) {
+        // По таймауту close НЕ ждём: на half-open TCP он способен зависнуть
+        // так же, как run(). Принудительное закрытие уже запущено из
+        // onAbort — pipeline продолжает двигаться.
+        void closeSession().catch(() => {});
+      } else {
+        await closeSession().catch(() => {});
+      }
     }
   }
 

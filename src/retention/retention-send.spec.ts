@@ -45,7 +45,17 @@ function harness(
   svc.buildCuriousReturnOutreach = jest.fn().mockImplementation(
     async () => (await svc.buildCuriousSegment()).preview,
   );
-  svc.pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+  // Task 17C: send() прогоняет strict-гейт `state='active'` перед транспортом.
+  // Harness покрывает логику доставки, а не удаления — гейт отвечает «жив»
+  // для всех получателей; остальные запросы (INSERT INTO events) — как раньше.
+  svc.pg = {
+    query: jest.fn().mockImplementation(async (sql: string) => {
+      if (/FROM user_id/.test(sql) && /state\s*=\s*'active'/.test(sql)) {
+        return { rows: [{ n: 1 }], rowCount: 1 };
+      }
+      return { rows: [] };
+    }),
+  };
   svc.mail = { send: jest.fn().mockResolvedValue({ ok: true }) };
   svc.unsubscribes = {
     ensureToken: jest.fn().mockResolvedValue('t'.repeat(43)),
@@ -80,7 +90,8 @@ describe('RetentionService send', () => {
     expect(out).toMatchObject({ sent: 1, sent_email: 1, sent_sms: 0 });
     expect(axios.get).not.toHaveBeenCalled();
     expect(svc.mail.send.mock.calls[0][3]).toContain('https://my.linkeon.io/chat?lang=en');
-    const props = JSON.parse(svc.pg.query.mock.calls[0][1][1]);
+    // calls[0] — active-check (Task 17C), calls[1] — INSERT INTO events.
+    const props = JSON.parse(svc.pg.query.mock.calls[1][1][1]);
     expect(props).toMatchObject({ status: 'sent', channel: 'email' });
     expect(props).not.toHaveProperty('body');
   });
@@ -113,7 +124,8 @@ describe('RetentionService send', () => {
     expect(out).toMatchObject({ sent: 0, failed: 1 });
     expect(out.results[0].error).toBe('smtp_timeout');
     expect(axios.get).not.toHaveBeenCalled();
-    expect(svc.pg.query.mock.calls[0][1][1]).not.toContain('u@example.com');
+    // calls[0] — active-check (Task 17C), calls[1] — INSERT INTO events.
+    expect(svc.pg.query.mock.calls[1][1][1]).not.toContain('u@example.com');
   });
 
   it.each([
@@ -256,7 +268,12 @@ describe('RetentionService send', () => {
 
   it('ошибка event insert не маскирует доставку и помечает log_error', async () => {
     const svc = harness([draft()]);
-    svc.pg.query.mockRejectedValue(new Error('events unavailable'));
+    // Task 17C: отказывает ТОЛЬКО вставка события — active-check обязан
+    // пройти, иначе fail-closed гейт замаскировал бы доставку.
+    svc.pg.query.mockImplementation(async (sql: string) => {
+      if (sql.includes('INSERT INTO events')) throw new Error('events unavailable');
+      return { rows: [{ n: 1 }], rowCount: 1 };
+    });
     const out = await svc.sendRetentionOutreach({ confirm: true });
     expect(out.results[0]).toMatchObject({ status: 'sent', log_error: true });
   });
@@ -336,7 +353,8 @@ describe('RetentionService send', () => {
   it('Curious пишет свой campaign', async () => {
     const svc = harness([draft()]);
     await svc.sendCuriousReturnOutreach({ confirm: true });
-    const props = JSON.parse(svc.pg.query.mock.calls[0][1][1]);
+    // calls[0] — active-check (Task 17C), calls[1] — INSERT INTO events.
+    const props = JSON.parse(svc.pg.query.mock.calls[1][1][1]);
     expect(props.campaign).toBe('curious_return_v1');
   });
 });

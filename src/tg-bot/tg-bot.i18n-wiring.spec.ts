@@ -357,7 +357,9 @@ describe('встречи и видео — на языке владельца', 
 
   it('видео не получилось — по-немецки (язык — через конфиг задачи)', async () => {
     const grammy = { sendMessage: jest.fn(async () => ({})), sendChatAction: jest.fn(async () => {}) };
-    const pg = pgSpeaking('de');
+    const pg = pgSpeaking('de', (sql) => sql.includes('FROM tg_bot_video_jobs tg')
+      ? { rows: [{ '?column?': 1 }] }
+      : { rows: [] });
     const svc = new TgVideoDispatchService(pg as any, grammy as any);
     (svc as any).logger = quiet;
     await (svc as any).deliver({ job_id: 'j', tg_chat_id: '-100', tg_reply_to_message_id: 5, status: 'failed', video_url: null, owner_user_id: 'u-1' });

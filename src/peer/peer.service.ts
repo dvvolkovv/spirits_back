@@ -44,7 +44,19 @@ export class PeerService implements OnModuleInit {
 
   // ==================== REQUESTS ====================
 
+  /** Task 17B: удалённый аккаунт не создаёт новых rows (прецедент — tg-config.service assertActiveAccount). */
+  private async assertActiveAccount(userId: string): Promise<void> {
+    const active = await this.pg.query(
+      `SELECT 1 FROM user_id WHERE internal_id = $1 AND state = 'active'`,
+      [userId],
+    );
+    if ((active.rowCount ?? active.rows?.length ?? 0) === 0) {
+      throw new BadRequestException('account is not active');
+    }
+  }
+
   async sendRequest(fromUserId: string, dto: CreateChatRequestDto): Promise<{ id: string; status: string }> {
+    await this.assertActiveAccount(fromUserId);
     const toUserId = (dto.toUserId || '').trim();
     const intro = (dto.introMessage || '').trim();
 
@@ -327,6 +339,7 @@ export class PeerService implements OnModuleInit {
   }
 
   async sendMessage(userId: string, conversationId: string, dto: SendMessageDto) {
+    await this.assertActiveAccount(userId);
     const content = (dto.content || '').trim();
     if (!content) throw new BadRequestException('content required');
     if (content.length > LIMITS.MESSAGE_MAX) {
@@ -405,6 +418,7 @@ export class PeerService implements OnModuleInit {
   // ==================== BLOCKS / REPORTS ====================
 
   async block(blockerId: string, blockedId: string) {
+    await this.assertActiveAccount(blockerId);
     if (blockerId === blockedId) throw new BadRequestException('cannot block yourself');
     await this.pg.query(
       `INSERT INTO user_blocks (blocker_id, blocked_id) VALUES ($1, $2)
@@ -423,6 +437,7 @@ export class PeerService implements OnModuleInit {
   }
 
   async report(reporterId: string, dto: ReportUserDto) {
+    await this.assertActiveAccount(reporterId);
     const targetId = (dto.targetUserId || '').trim();
     const reason = (dto.reason || '').trim();
     if (!targetId) throw new BadRequestException('targetUserId required');

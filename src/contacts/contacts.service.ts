@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { canReceiveNewProposal, readProfileAccess, readProfileAccessBatch, type ProfileAccess } from '../privacy/profile-privacy';
@@ -121,7 +121,19 @@ export class ContactsService {
     };
   }
 
+  /** Task 17B: удалённый аккаунт не создаёт новых заявок (прецедент — tg-config.service assertActiveAccount). */
+  private async assertActiveAccount(phone: string): Promise<void> {
+    const active = await this.pg.query(
+      `SELECT 1 FROM user_id WHERE internal_id = $1 AND state = 'active'`,
+      [phone],
+    );
+    if ((active.rowCount ?? active.rows?.length ?? 0) === 0) {
+      throw new BadRequestException('account is not active');
+    }
+  }
+
   async createRequest(requesterPhone: string, targetId: number, message: string | null): Promise<ContactRequest> {
+    await this.assertActiveAccount(requesterPhone);
     const requesterId = await this.idByPhone(requesterPhone);
     if (!requesterId) throw new Error('Requester profile not found');
     if (requesterId === targetId) throw new Error('Cannot request own contact');

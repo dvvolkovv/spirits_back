@@ -38,7 +38,17 @@ function makeService(
   rows: any[] = [row()],
   storeOverrides: Record<string, jest.Mock> = {},
 ) {
-  const pg = { query: jest.fn(async () => ({ rows: [] })) };
+  // Гейт удаления аккаунта (feat/account-deletion-cleanup): deliver/fireNow
+  // и запись истории начинаются с проверки state='active' — в этом спеке все
+  // аккаунты активны, иначе доставка не дошла бы до генерации.
+  const pg = {
+    query: jest.fn(async (sql: string) => {
+      if (/SELECT 1 FROM user_id WHERE internal_id=\$1 AND state='active'/.test(sql)) {
+        return { rows: [{ '?column?': 1 }], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    }),
+  };
   const push = { sendPush: jest.fn(async () => 1) };
   const store = makeStore({
     listEnabled: jest.fn(async () => rows),

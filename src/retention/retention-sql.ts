@@ -3,6 +3,10 @@ import { RETENTION_UID_SQL_RE } from './retention-recipient';
 const UID = `split_part(session_id,'_',1) ~ '${RETENTION_UID_SQL_RE}'`;
 const TG_UID = `tc.owner_user_id ~ '${RETENTION_UID_SQL_RE}'`;
 
+// Task 17C: оба сегмента INNER JOIN'ом видят только state='active' — удалённые
+// (и заблокированные) аккаунты в рассылку не попадают на уровне SQL. Строки
+// user_id без state (legacy NULL) тоже отсекаются: fail-closed для платного
+// транспорта; см. FU-T11-2 про нормализацию NULL-state.
 export const GENERAL_SEGMENT_SQL = `WITH last_chat AS (
   SELECT split_part(session_id,'_',1) AS uid, split_part(session_id,'_',2) AS assistant_id, max(created_at) AS last_at
     FROM custom_chat_history
@@ -22,6 +26,7 @@ SELECT pu.uid AS user_id, pu.assistant_id, pu.last_at,
        COALESCE(a.display_name,a.name) AS assistant_name,
        EXTRACT(DAY FROM now()-pu.last_at)::int AS days_inactive
   FROM per_user pu
+  JOIN user_id u ON u.internal_id=pu.uid AND u.state='active'
   LEFT JOIN agents a ON a.id=CASE WHEN pu.assistant_id ~ '^[0-9]+$' THEN pu.assistant_id::int END
  WHERE pu.last_at < now()-make_interval(days => $3)
    AND pu.last_at > now()-make_interval(days => $4)
@@ -53,6 +58,7 @@ export const CURIOUS_SEGMENT_SQL = `WITH last_chat AS (
 SELECT lc.uid AS user_id, lc.last_at,
        round(EXTRACT(EPOCH FROM now()-lc.last_at)/3600.0)::int AS hours_inactive
   FROM last_chat lc JOIN msgcnt mc ON mc.user_id=lc.uid
+  JOIN user_id u ON u.internal_id=lc.uid AND u.state='active'
  WHERE lc.last_at < now()-interval '24 hours'
    AND lc.last_at > now()-interval '48 hours'
    AND mc.n < 5

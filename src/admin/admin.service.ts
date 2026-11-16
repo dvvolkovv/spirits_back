@@ -161,12 +161,23 @@ export class AdminService implements OnModuleInit {
     if (!userId) throw new Error('userId required');
     if (!Number.isInteger(assistantId) || assistantId <= 0) throw new Error('assistantId required');
     if (!body) throw new Error('text required');
+    // Гейт на живой аккаунт (образец — chat.service.ts saveAssistantMessageRow,
+    // Task 11): вставка без проверки state воскрешала строку истории
+    // удалённого поколения после core.purge. INSERT ... SELECT ... WHERE
+    // EXISTS атомарен: удаление, гонящееся с этим вызовом, не оставит строку.
+    // userId — ПОСЛЕДНИЙ параметр: позиции session/agent/content, на которые
+    // смотрят существующие спеки, не меняются. Отказ — явная ошибка,
+    // контроллер транслирует её в 400.
     const r = await this.pg.query(
       `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
-       VALUES ($1, 'ai', $2, $3, 'text', 0)
+       SELECT $1, 'ai', $2, $3, 'text', 0
+       WHERE EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $4 AND u.state = 'active')
        RETURNING id, created_at`,
-      [`${userId}_${assistantId}`, assistantId, body],
+      [`${userId}_${assistantId}`, assistantId, body, userId],
     );
+    if ((r.rowCount ?? r.rows?.length ?? 0) === 0) {
+      throw new Error('recipient account is not active');
+    }
     this.logger.log(`сообщение ассистента ${assistantId} положено в чат (${body.length} знаков)`);
     return { ok: true, id: r.rows[0]?.id, createdAt: r.rows[0]?.created_at };
   }
@@ -598,7 +609,11 @@ export class AdminService implements OnModuleInit {
     if (!data.resend) targets = targets.filter((d) => !d.in_cooldown);
 
     const results: Array<{ phone: string; status: string; error: string | null }> = [];
+    let skippedDeleted = 0;
     for (const d of targets) {
+      // Task 17C: удалённый/заблокированный аккаунт не получает activation SMS —
+      // повторная strict-проверка перед транспортом (без события в events).
+      if (!(await this.isOutreachRecipientActive(d.phone))) { skippedDeleted += 1; continue; }
       const r = await this.sendOutreachSms(d.phone, d.message);
       const status = r.ok ? 'sent' : 'failed';
       await this.pg.query(
@@ -615,8 +630,29 @@ export class AdminService implements OnModuleInit {
       sent: results.filter((r) => r.status === 'sent').length,
       failed: results.filter((r) => r.status === 'failed').length,
       skipped_cooldown: drafts.length - targets.length,
+      skipped_deleted: skippedDeleted,
       results,
     };
+  }
+
+  /**
+   * Task 17C: strict-репроверка получателя outreach непосредственно перед
+   * платным транспортом. Сегменты (activation/advocate) могут быть собраны до
+   * удаления аккаунта — state <> 'active' (deleted/blocked/legacy NULL)
+   * отправку отменяет. При сбое запроса — fail-closed: не отправляем,
+   * safe-форма лога без идентификаторов и сырых сообщений об ошибках.
+   */
+  private async isOutreachRecipientActive(userId: string): Promise<boolean> {
+    try {
+      const r = await this.pg.query(
+        `SELECT 1 FROM user_id WHERE internal_id = $1 AND state = 'active'`,
+        [userId],
+      );
+      return (r.rowCount ?? r.rows?.length ?? 0) > 0;
+    } catch {
+      this.logger.warn('admin outreach: active check failed (fail-closed skip)');
+      return false;
+    }
   }
 
   private async sendOutreachSms(phone: string, text: string): Promise<{ ok: boolean; error?: string }> {
@@ -757,7 +793,10 @@ export class AdminService implements OnModuleInit {
     if (!data.resend) targets = targets.filter((d) => !d.already_sent_at);
 
     const results = [];
+    let skippedDeleted = 0;
     for (const d of targets) {
+      // Task 17C: удалённый/заблокированный аккаунт не получает advocate-нудж.
+      if (!(await this.isOutreachRecipientActive(d.user_id))) { skippedDeleted += 1; continue; }
       const sms = d.phone ? await this.sendOutreachSms(d.phone, d.sms) : { ok: false, error: 'no_phone' };
       const email = d.email ? await this.sendOutreachEmail(d.email, d.email_subject, d.email_html) : { ok: false, error: 'no_email' };
       const status = sms.ok || email.ok ? 'sent' : 'failed';
@@ -775,6 +814,7 @@ export class AdminService implements OnModuleInit {
       sent: results.filter((r) => r.status === 'sent').length,
       failed: results.filter((r) => r.status === 'failed').length,
       skipped_already_sent: drafts.length - targets.length,
+      skipped_deleted: skippedDeleted,
       results,
     };
   }
@@ -796,7 +836,10 @@ export class AdminService implements OnModuleInit {
         .slice(0, AdminService.ADVOCATE_AUTONUDGE_MAX_PER_RUN);
       if (!fresh.length) return;
       const sentUsers: string[] = [];
+      let skippedDeleted = 0;
       for (const d of fresh) {
+        // Task 17C: авто-нудж тоже reproверяет аккаунт перед транспортом.
+        if (!(await this.isOutreachRecipientActive(d.user_id))) { skippedDeleted += 1; continue; }
         const sms = d.phone ? await this.sendOutreachSms(d.phone, d.sms) : { ok: false, error: 'no_phone' };
         const email = d.email ? await this.sendOutreachEmail(d.email, d.email_subject, d.email_html) : { ok: false, error: 'no_email' };
         const status = sms.ok || email.ok ? 'sent' : 'failed';
@@ -809,7 +852,7 @@ export class AdminService implements OnModuleInit {
           })],
         ).catch((e) => this.logger.warn(`auto advocate log failed: ${e.message}`));
       }
-      this.logger.log(`advocate auto-nudge: sent ${sentUsers.length}/${fresh.length}`);
+      this.logger.log(`advocate auto-nudge: sent ${sentUsers.length}/${fresh.length}, skipped inactive ${skippedDeleted}`);
       if (sentUsers.length > 0) {
         await sendTelegramAlert(
           `🤝 <b>Advocate auto-nudge</b>: отправлено ${sentUsers.length} вовлечённым платящим (реф-приглашение SMS+email).\nЮзеры: ${sentUsers.join(', ')}`,

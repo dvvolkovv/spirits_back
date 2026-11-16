@@ -61,7 +61,8 @@ function makeService(neo: any = neoEntities()) {
   return {
     pg,
     neo4j,
-    service: new ProfileService(pg as any, neo4j as any),
+    // Task 18: lifecycle — обязательный 2-й параметр (стаб), neo4j сдвинулся на 3-й.
+    service: new ProfileService(pg as any, { deleteExplicit: jest.fn() } as any, neo4j as any),
   };
 }
 

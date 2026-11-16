@@ -40,7 +40,9 @@ describe('ProfileService.updateProfile — assistant_voices', () => {
         return { rows: [] };
       },
     };
-    return { service: new ProfileService(pg), calls };
+    // Task 18: lifecycle — обязательный 2-й параметр конструктора; этим
+    // тестам он не нужен (только updateProfile), поэтому стаб.
+    return { service: new ProfileService(pg, { deleteExplicit: jest.fn() } as any), calls };
   }
 
   function patchOf(calls: Array<{ sql: string; params: any[] }>) {

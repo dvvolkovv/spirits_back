@@ -39,11 +39,12 @@ export class TgVideoDispatchService implements OnModuleInit, OnModuleDestroy {
 
   private async tick(): Promise<void> {
     const r = await this.pg.query(
-      `SELECT tg.job_id, tg.tg_chat_id, tg.tg_reply_to_message_id,
-              vj.status, vj.video_url, c.owner_user_id
+      `SELECT tg.job_id,tg.tg_chat_id,tg.tg_reply_to_message_id,
+              vj.status, vj.video_url, c.owner_user_id, tg.config_id
          FROM tg_bot_video_jobs tg
          JOIN video_jobs vj ON vj.id = tg.job_id
-         LEFT JOIN tg_bot_configs c ON c.id = tg.config_id
+         JOIN tg_bot_configs c ON c.id=tg.config_id AND c.status IN ('active','silent')
+         JOIN user_id u ON u.internal_id=vj.user_id AND u.state='active'
         WHERE tg.delivery_status = 'pending'
           AND vj.status IN ('ready', 'failed')
         ORDER BY tg.created_at
@@ -56,6 +57,39 @@ export class TgVideoDispatchService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private async isActiveDelivery(jobId: string): Promise<boolean> {
+    const active = await this.pg.query(
+      `SELECT 1 FROM tg_bot_video_jobs tg
+         JOIN video_jobs vj ON vj.id=tg.job_id
+         JOIN tg_bot_configs c ON c.id=tg.config_id AND c.status IN ('active','silent')
+         JOIN user_id u ON u.internal_id=vj.user_id AND u.state='active'
+       WHERE tg.job_id=$1 AND tg.delivery_status='pending'
+       LIMIT 1`,
+      [jobId],
+    );
+    return active.rows.length === 1;
+  }
+
+  /** Ошибка самого fence — не operational failure и не повод для fallback сообщения. */
+  private async activeOrFalse(jobId: string): Promise<boolean> {
+    try {
+      return await this.isActiveDelivery(jobId);
+    } catch {
+      return false;
+    }
+  }
+
+  private completionGuard(): string {
+    return `tg.delivery_status IN ('pending','sending')
+      AND tg.delivery_error IS DISTINCT FROM 'account_deleted'
+      AND EXISTS (
+        SELECT 1 FROM video_jobs vj
+        JOIN tg_bot_configs c ON c.id=tg.config_id AND c.status IN ('active','silent')
+        JOIN user_id u ON u.internal_id=vj.user_id AND u.state='active'
+        WHERE vj.id=tg.job_id
+      )`;
+  }
+
   private async deliver(row: {
     job_id: string;
     tg_chat_id: string;
@@ -63,6 +97,7 @@ export class TgVideoDispatchService implements OnModuleInit, OnModuleDestroy {
     status: string;
     video_url: string | null;
     owner_user_id?: string | null;
+    config_id?: string | null;
   }): Promise<void> {
     const chatId = Number(row.tg_chat_id);
     // Язык — владельца бота (язык его профиля).
@@ -71,44 +106,66 @@ export class TgVideoDispatchService implements OnModuleInit, OnModuleDestroy {
     // Сообщение, на которое отвечаем, могли удалить за 1–3 минуты генерации —
     // тогда видео всё равно уходит, просто без ответа.
     const replyOpts = replyTo ? { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } } : {};
-    try {
-      if (row.status === 'failed' || !row.video_url) {
-        await this.grammy.sendMessage(
-          chatId,
-          tgText(lang, 'video_failed'),
-          replyOpts,
-        );
-      } else {
-        await this.grammy.sendChatAction(chatId, 'upload_video').catch(() => {});
+    if (!await this.activeOrFalse(row.job_id)) return;
+
+    if (row.status === 'failed' || !row.video_url) {
+      try {
+        await this.grammy.sendMessage(chatId, tgText(lang, 'video_failed'), replyOpts);
+      } catch (error: any) {
+        await this.handleOperationalFailure(row, error, lang, replyOpts);
+        return;
+      }
+    } else {
+      await this.grammy.sendChatAction(chatId, 'upload_video').catch(() => {});
+      if (!await this.activeOrFalse(row.job_id)) return;
+      let buf: Buffer;
+      try {
         const resp = await axios.get(row.video_url, {
           responseType: 'arraybuffer',
           timeout: 60_000,
           maxContentLength: MAX_VIDEO_BYTES,
         });
-        const buf = Buffer.from(resp.data);
-        await this.grammy.sendVideo(chatId, buf, replyOpts);
+        buf = Buffer.from(resp.data);
+      } catch (error: any) {
+        await this.handleOperationalFailure(row, error, lang, replyOpts);
+        return;
       }
-      await this.pg.query(
-        `UPDATE tg_bot_video_jobs SET delivery_status='sent', delivered_at=now() WHERE job_id=$1`,
-        [row.job_id],
-      );
-      this.logger.log(`video job ${row.job_id} → chat ${chatId} (${row.status})`);
-    } catch (e: any) {
-      this.logger.warn(`failed to deliver video job ${row.job_id} → chat ${chatId}: ${e.message}`);
-      // Помечаем failed чтобы не зацикливаться. Юзер не получает ничего; в идеале
-      // бы повторить с backoff.
-      await this.pg.query(
-        `UPDATE tg_bot_video_jobs SET delivery_status='failed', delivery_error=$1, delivered_at=now() WHERE job_id=$2`,
-        [String(e.message ?? 'unknown').slice(0, 500), row.job_id],
-      );
-      // Notice юзеру что не получилось
+      if (!await this.activeOrFalse(row.job_id)) return;
       try {
-        await this.grammy.sendMessage(
-          chatId,
-          tgText(lang, 'video_expired'),
-          replyOpts,
-        );
-      } catch { /* ignore */ }
+        await this.grammy.sendVideo(chatId, buf, replyOpts);
+      } catch (error: any) {
+        await this.handleOperationalFailure(row, error, lang, replyOpts);
+        return;
+      }
     }
+
+    await this.pg.query(
+      `UPDATE tg_bot_video_jobs tg SET delivery_status='sent',delivered_at=now()
+       WHERE tg.job_id=$1 AND ${this.completionGuard()}`,
+      [row.job_id],
+    );
+    this.logger.log(`video job ${row.job_id} → chat ${chatId} (${row.status})`);
+  }
+
+  private async handleOperationalFailure(
+    row: { job_id: string; tg_chat_id: string; tg_reply_to_message_id: number | null; status: string },
+    error: any,
+    lang: Parameters<typeof tgText>[0],
+    replyOpts: Record<string, unknown>,
+  ): Promise<void> {
+    const chatId = Number(row.tg_chat_id);
+    this.logger.warn(`failed to deliver video job ${row.job_id} → chat ${chatId}: ${error?.message}`);
+    // Сюда попадают только ошибки axios/Grammy. Fence ошибки обрабатываются
+    // отдельно в activeOrFalse и никогда не превращаются в video_expired.
+    if (!await this.activeOrFalse(row.job_id)) return;
+    try {
+      await this.grammy.sendMessage(chatId, tgText(lang, 'video_expired'), replyOpts);
+    } catch { /* ignore */ }
+    await this.pg.query(
+      `UPDATE tg_bot_video_jobs tg
+       SET delivery_status='failed',delivery_error=$1,delivered_at=now()
+       WHERE tg.job_id=$2 AND ${this.completionGuard()}`,
+      [String(error?.message ?? 'unknown').slice(0, 500), row.job_id],
+    );
   }
 }

@@ -1,6 +1,6 @@
-import { ProfileService } from './profile.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import { ProfileCompactionService } from '../scheduler/profile-compaction.service';
+import { deleteOwnedCoreRows } from './profile-account-deletion.adapter';
 
 /**
  * У custom_chat_history нет колонки user_id: переписку пользователя ищут по
@@ -12,6 +12,8 @@ import { ProfileCompactionService } from '../scheduler/profile-compaction.servic
 
 const SHORT = '7903016918';
 const LONG = '79030169187';
+/** Поколение удаления для fenced-выражений deleteOwnedCoreRows (Task 17). */
+const DELETION_ID = 'd1111111-1111-4111-8111-111111111111';
 
 /** PostgreSQL LIKE → RegExp. Escape-символ — обратный слэш (он же по умолчанию). */
 function likeToRegExp(pattern: string): RegExp {
@@ -53,13 +55,15 @@ function expectOwnSessionsOnly(sql: string, params: any[]) {
 
 describe('переписка пользователя по префиксу session_id', () => {
   it('удаление аккаунта не стирает переписку номера, который начинается так же', async () => {
+    // С Task 17 SQL удаления аккаунта живёт в deleteOwnedCoreRows
+    // (fenced-транзакция адаптера account.core.*), а не в ProfileService.
     const pg = capturePg();
-    await new ProfileService(pg as any).deleteProfile(SHORT);
+    await deleteOwnedCoreRows(pg, { userId: SHORT, deletionId: DELETION_ID } as any);
     const del = pg.calls.find((c) => /DELETE FROM custom_chat_history/.test(c.sql));
     expect(del).toBeDefined();
     expectOwnSessionsOnly(del!.sql, del!.params);
     const plans = pg.calls.find((c) => /DELETE FROM action_plans/.test(c.sql));
-    expect(plans?.params).toEqual([SHORT]);
+    expect(plans?.params).toEqual([SHORT, DELETION_ID]);
   });
 
   it('бизнес-история смотрит только свою переписку', async () => {
