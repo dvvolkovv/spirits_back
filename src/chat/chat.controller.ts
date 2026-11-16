@@ -26,20 +26,14 @@ import { stripProductActionBlocks } from '../products/product-action-tail';
 import { UserLlmProviderService } from '../common/services/user-llm-provider.service';
 import { relayProviderFields, resolveAnswerProvider } from './answer-provider';
 import { ChatUploadsService, ChatUploadRecord } from './chat-uploads/chat-uploads.service';
+// Экранирование имени в строке истории `📎 [имя](url)` — общее с удалением
+// загрузки (deleteForOwner ищет ровно эту строку), поэтому в отдельном модуле.
+import { markdownEscapeName } from './chat-uploads/markdown-name';
 
 // Потолок загрузки и зачем он именно такой — в upload-limits.ts, вместе с
 // самой константой (менять его можно только вместе с ОБОИМИ nginx).
 import { MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_TOTAL_BYTES } from './upload-limits';
 export { MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_TOTAL_BYTES };
-
-/**
- * Экранирование имени файла для markdown-ссылки в истории: `\`, `[`, `]`.
- * Имена приходят из multipart и могут содержать любые символы — без экранировки
- * имя с квадратной скобкой ломало бы ссылку `📎 [имя](url)` в сохранённой строке.
- */
-function markdownEscapeName(name: string): string {
-  return name.replace(/\\/g, '\\\\').replace(/\[/g, '\\[').replace(/\]/g, '\\]');
-}
 
 /**
  * Бюджет сохранения исходников ДО первого байта ответа (ревью I1, 13.11.2026),
