@@ -91,6 +91,13 @@ maybe('synthetic deletion lifecycle — полная цепочка против
   let tmp: string;
   const savedEnv: NodeJS.ProcessEnv = { ...process.env };
   const deletionIds: string[] = [];
+  /** userIds уборки — общие для afterAll и проверки остатка хоста. */
+  const cleanupUserIds = (): string[] => [
+    fixture.mainUserId,
+    fixture.otherUserId,
+    fixture.histUserId,
+    SYNTHETIC_RESTART_PHONE,
+  ];
 
   const withSearchPath = (url: string): string => {
     const sep = url.includes('?') ? '&' : '?';
@@ -787,10 +794,7 @@ maybe('synthetic deletion lifecycle — полная цепочка против
   afterAll(async () => {
     try {
       if (stack && fixture) {
-        await cleanupSyntheticFixture(stack, {
-          deletionIds,
-          userIds: [fixture.mainUserId, fixture.otherUserId, fixture.histUserId, SYNTHETIC_RESTART_PHONE],
-        });
+        await cleanupSyntheticFixture(stack, { deletionIds, userIds: cleanupUserIds() });
       }
     } catch {
       // одноразовая схема всё равно уходит CASCADE-ом ниже
@@ -1013,5 +1017,106 @@ maybe('synthetic deletion lifecycle — полная цепочка против
         [[foreignProduct, ownProduct]],
       );
     }
+  });
+
+  // ПОСЛЕДНИЙ тест блока: он сам вызывает cleanup. afterAll вызовет его ещё
+  // раз — уборка идемпотентна (только DELETE … WHERE, повтор удаляет ноль строк).
+  it('cleanup убирает синтетический хост и всё, что на нём, из живой схемы', async () => {
+    // Без этой проверки опечатка в SQL уборки хоста осталась бы незамеченной:
+    // cleanup глотает ошибки по группам, afterAll глотает ошибку целиком,
+    // а схема уходит DROP SCHEMA … CASCADE.
+    //
+    // Посев — чтобы каждая ветка уборки хоста имела что удалять:
+    //  - продукт ЧУЖОГО пользователя (вне userIds уборки) на синтетическом
+    //    хосте: его, его задание и строку журнала убирают только ветки
+    //    по host_id, а не по user_id;
+    //  - строка product_actions с тем же чужим user_id: если бы products
+    //    удалялись раньше журнала, ON DELETE SET NULL отвязал бы её, и она
+    //    осталась бы — проверяется ниже по id;
+    //  - отметка агента: цепочка synthetic её не заводит, без посева
+    //    DELETE из product_host_agent ничего бы не проверял.
+    const count = async (sql: string, params: unknown[] = []): Promise<number> =>
+      (await one(sql, params)).n;
+    const residueUser = 'u-synthetic-foreign-host-residue';
+    const residueProduct = randomUUID();
+    await pool.query(
+      `INSERT INTO products
+         (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash, host_id)
+       VALUES ($1,$2,'Synthetic Product',$3,'site','running','/product',$4,$5)`,
+      [
+        residueProduct,
+        residueUser,
+        `${SYNTHETIC_DELETION_PREFIX}residue-host`,
+        createHash('sha256').update(`runner-${residueProduct}`).digest('hex'),
+        SYNTHETIC_HOST_ID,
+      ],
+    );
+    await pool.query(
+      `INSERT INTO product_provision_jobs (product_id, kind, status)
+       VALUES ($1,'sleep','queued')`,
+      [residueProduct],
+    );
+    const action = await one(
+      `INSERT INTO product_actions (user_id, product_id, kind, status, channel)
+       VALUES ($1,$2,'purge','done','system')
+       RETURNING id::text AS id`,
+      [residueUser, residueProduct],
+    );
+    await pool.query(
+      `INSERT INTO product_host_agent (host_id, seen_at) VALUES ($1, now())
+       ON CONFLICT (host_id) DO NOTHING`,
+      [SYNTHETIC_HOST_ID],
+    );
+
+    // Предусловие: до уборки хост и всё на нём реально есть в схеме —
+    // иначе нули ниже ничего бы не доказывали.
+    const host = await one(
+      `SELECT accepts_new FROM product_hosts WHERE id=$1`,
+      [SYNTHETIC_HOST_ID],
+    );
+    expect(host).toEqual({ accepts_new: false });
+    const hostProducts: string[] = (
+      await rows(`SELECT id::text AS id FROM products WHERE host_id=$1`, [SYNTHETIC_HOST_ID])
+    ).map((row) => row.id);
+    expect(hostProducts).toContain(residueProduct);
+    expect(await count(
+      `SELECT count(*)::int AS n FROM product_provision_jobs WHERE product_id = ANY($1::uuid[])`,
+      [hostProducts],
+    )).toBeGreaterThan(0);
+    expect(await count(
+      `SELECT count(*)::int AS n FROM product_actions WHERE id=$1`,
+      [action.id],
+    )).toBe(1);
+    expect(await count(
+      `SELECT count(*)::int AS n FROM product_host_agent WHERE host_id=$1`,
+      [SYNTHETIC_HOST_ID],
+    )).toBe(1);
+
+    await cleanupSyntheticFixture(stack, { deletionIds, userIds: cleanupUserIds() });
+
+    expect(await count(
+      `SELECT count(*)::int AS n FROM product_hosts WHERE id=$1`,
+      [SYNTHETIC_HOST_ID],
+    )).toBe(0);
+    expect(await count(
+      `SELECT count(*)::int AS n FROM product_host_agent WHERE host_id=$1`,
+      [SYNTHETIC_HOST_ID],
+    )).toBe(0);
+    expect(await count(
+      `SELECT count(*)::int AS n FROM products WHERE host_id=$1 OR id = ANY($2::uuid[])`,
+      [SYNTHETIC_HOST_ID, hostProducts],
+    )).toBe(0);
+    expect(await count(
+      `SELECT count(*)::int AS n FROM product_provision_jobs WHERE product_id = ANY($1::uuid[])`,
+      [hostProducts],
+    )).toBe(0);
+    expect(await count(
+      `SELECT count(*)::int AS n FROM product_actions WHERE id=$1`,
+      [action.id],
+    )).toBe(0);
+    // Общий хост product pg spec synthetic не заводит и не оставляет.
+    expect(await count(
+      `SELECT count(*)::int AS n FROM product_hosts WHERE id='host-shared'`,
+    )).toBe(0);
   });
 });
