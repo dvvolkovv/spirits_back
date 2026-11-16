@@ -102,6 +102,20 @@ function turn(svc: ChatService, message: string, upstreams: (Readable | Error)[]
   return { done, res };
 }
 
+function uploadTurnWith(svc: ChatService, upstreams: (Readable | Error)[], bodyExtra: Record<string, any> = {}) {
+  queue.push(...upstreams);
+  const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+  const ctrl = new ChatController(svc, jwtSvc as any, null as any, undefined);
+  const req = {
+    headers: { authorization: 'Bearer t' },
+    files: [{ originalname: 'a.pdf', buffer: Buffer.from('x'), mimetype: 'application/pdf', size: 1 }],
+    body: { message: 'смотри файл', assistantId: '7', ...bodyExtra },
+  } as any;
+  const res = newRes();
+  const done = ctrl.uploadAndChat(req, res);
+  return { done, res };
+}
+
 const tokenInserts = (calls: { sql: string }[]) => calls.filter((c) => /INSERT INTO token_consumption_tasks/.test(c.sql));
 const savedStrings = (calls: { params: any[] }[]) => calls.flatMap((c) => c.params).filter((p) => typeof p === 'string');
 
@@ -302,5 +316,75 @@ describe('веб-ход под шлагбаумом выката релея', ()
     expect(ends(t.res)).toEqual([expect.objectContaining({ type: 'end', content: history, reason: 'relay_draining' })]);
     expect(tokenInserts(calls)).toEqual([]);
     expectNoLearning(learn);
+  });
+});
+
+describe('загрузка файла под шлагбаумом выката релея', () => {
+  it('U-W1: бюджет исчерпан — заглушка про сообщение и файлы на языке человека', async () => {
+    const { svc } = makeServiceWithPgCalls();
+    svc.relayDrainDelaysMs = [0];
+    const u = uploadTurnWith(svc, [err503(), err503()], { lang: 'de' });
+    await u.done;
+    await settle();
+
+    const stub = chatFailureText('relayUpdating', 'de', { upload: true });
+    expect(items(u.res)).toEqual([stub]);
+    expect(ends(u.res)).toEqual([expect.objectContaining({
+      type: 'end', content: stub, reason: 'relay_draining', usage: { input: 0, output: 0, total: 0 },
+    })]);
+  });
+
+  it('U-W2: загрузка ждёт — текстовый ход несёт её текст и просит файлы заново', async () => {
+    const { svc } = makeServiceWithPgCalls();
+    let wake: () => void = () => {};
+    svc.relayDrainDelaysMs = [1000];
+    svc.relayDrainSleep = () => new Promise<void>((r) => { wake = () => r(); });
+
+    const u = uploadTurnWith(svc, [err503()]);
+    await settle();
+    const upT = stream();
+    const t = turn(svc, 'ну что там?', [upT]);
+    upT.push(DELTA);
+    await settle();
+
+    expect(msg(1)).toContain('a.pdf');
+    expect(msg(1)).toContain('прислать их ещё раз');
+    expect(msg(1)).toContain('смотри файл');
+    expect(msg(1)).not.toContain(NOTE);
+
+    wake();
+    await u.done;
+    await settle();
+    // Тихий конец перебитого — та же метка, что у веб-хода (W3).
+    expect(ends(u.res)).toEqual([expect.objectContaining({ type: 'end', content: '', reason: 'superseded' })]);
+    expect(items(u.res)).toEqual([]);
+
+    upT.push(DONE); upT.push(null);
+    await t.done;
+  });
+
+  it('U-W3: текстовый ход ждёт — загрузка несёт его текст', async () => {
+    const { svc } = makeServiceWithPgCalls();
+    let wake: () => void = () => {};
+    svc.relayDrainDelaysMs = [1000];
+    svc.relayDrainSleep = () => new Promise<void>((r) => { wake = () => r(); });
+
+    const a = turn(svc, 'первое', [err503()]);
+    await settle();
+    const upU = stream();
+    const u = uploadTurnWith(svc, [upU]);
+    await settle();
+
+    expect(msg(1)).toContain('не дошло');
+    expect(msg(1)).toContain('первое');
+    expect(msg(1)).toContain('смотри файл');
+    expect(sid(1)).toBe(sid(0));
+
+    wake();
+    await a.done;
+    upU.push(DELTA); upU.push(DONE); upU.push(null);
+    await u.done;
+    await settle();
+    expect(ends(a.res)).toEqual([expect.objectContaining({ type: 'end', content: '' })]);
   });
 });
