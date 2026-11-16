@@ -6,6 +6,7 @@ import { Readable } from 'stream';
 import { PgService } from '../../common/services/pg.service';
 import { StorageService } from '../../common/services/storage.service';
 import { safeFileName } from '../chat-files/file-meta';
+import { makeUploadThumb, uploadThumbKey } from './upload-thumb';
 
 export interface ChatUploadInputFile {
   buffer: Buffer;
@@ -93,37 +94,45 @@ export class ChatUploadsService {
     userId: string;
     sessionId: string;
     files: ChatUploadInputFile[];
+    /** Откуда файл; по умолчанию web (upload-and-chat: веб и оба приложения). */
+    source?: ChatUploadSource;
   }): Promise<SaveOriginalsResult> {
     if (!this.bucketEnsured) {
       await this.storage.createBucketIfAbsent(BUCKET);
       this.bucketEnsured = true;
     }
     const result: SaveOriginalsResult = { saved: [], failed: [] };
+    const source: ChatUploadSource = input.source ?? 'web';
 
     for (const file of input.files) {
       const storageKey = `${randomUUID()}/${safeFileName(file.originalname)}`;
+      const mime = file.mimetype || 'application/octet-stream';
+      let thumbKey: string | null = null;
       try {
         const sha256 = createHash('sha256').update(file.buffer).digest('hex');
         await this.storage.upload({
           bucket: BUCKET,
           key: storageKey,
           body: file.buffer,
-          contentType: file.mimetype || 'application/octet-stream',
+          contentType: mime,
           cacheControl: 'private, no-store',
         });
+        thumbKey = await this.saveThumb(file, mime, storageKey);
         const { rows } = await this.pg.query(
           `INSERT INTO chat_uploads
-             (user_id, session_id, original_name, mime, size_bytes, sha256, storage_key)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
+             (user_id, session_id, original_name, mime, size_bytes, sha256, storage_key, source, thumb_key)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
            RETURNING ${COLUMNS}`,
           [
             input.userId,
             input.sessionId,
             file.originalname,
-            file.mimetype || 'application/octet-stream',
+            mime,
             file.buffer.length,
             sha256,
             storageKey,
+            source,
+            thumbKey,
           ],
         );
         result.saved.push(this.row(rows[0]));
@@ -131,19 +140,58 @@ export class ChatUploadsService {
         this.logger.warn(
           `saveOriginals: failed to persist file "${file.originalname}": ${this.errDetail(e)}`,
         );
-        try {
-          await this.storage.delete({ bucket: BUCKET, key: storageKey });
-        } catch (cleanupError: any) {
-          // Best-effort cleanup: the original upload failure is reported by name.
-          this.logger.warn(
-            `saveOriginals: best-effort cleanup delete failed for "${file.originalname}": ${this.errDetail(cleanupError)}`,
-          );
+        // Best-effort cleanup: оригинал и (если успела лечь) миниатюра —
+        // строки нет, значит и объектов без неё оставлять незачем.
+        for (const key of thumbKey ? [storageKey, thumbKey] : [storageKey]) {
+          try {
+            await this.storage.delete({ bucket: BUCKET, key });
+          } catch (cleanupError: any) {
+            // Best-effort cleanup: the original upload failure is reported by name.
+            this.logger.warn(
+              `saveOriginals: best-effort cleanup delete failed for "${file.originalname}": ${this.errDetail(cleanupError)}`,
+            );
+          }
         }
         result.failed.push(file.originalname);
       }
     }
 
     return result;
+  }
+
+  /**
+   * WebP-миниатюра картинки рядом с оригиналом (thumbs/<storage_key>.webp).
+   * Никогда не бросает: не картинка — null молча; не получилась или не легла
+   * в MinIO — null с предупреждением (имя, mime и вид ошибки, без байтов), и
+   * файл сохраняется без миниатюры — фронт покажет значок.
+   */
+  private async saveThumb(
+    file: ChatUploadInputFile,
+    mime: string,
+    storageKey: string,
+  ): Promise<string | null> {
+    if (!mime.toLowerCase().startsWith('image/')) return null;
+    const thumb = await makeUploadThumb(file.buffer, mime);
+    if (!thumb) {
+      this.logger.warn(`saveOriginals: thumbnail not rendered for "${file.originalname}" (${mime.slice(0, 100)})`);
+      return null;
+    }
+    const key = uploadThumbKey(storageKey);
+    try {
+      await this.storage.upload({
+        bucket: BUCKET,
+        key,
+        body: thumb,
+        contentType: 'image/webp',
+        cacheControl: 'private, no-store',
+      });
+      return key;
+    } catch (e: any) {
+      this.logger.warn(
+        `saveOriginals: thumbnail upload failed for "${file.originalname}": ${this.errDetail(e)}`,
+      );
+      return null;
+    }
   }
 
   ownerUrl(id: string): string {
