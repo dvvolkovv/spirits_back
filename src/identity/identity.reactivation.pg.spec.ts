@@ -728,7 +728,7 @@ maybe('реактивация после удаления — одна тран�
       userId: string,
       amount: number,
       description: string,
-      createdAt: string,
+      createdAt: string | null,
     ): Promise<void> {
       await pool.query(
         `INSERT INTO token_transactions
@@ -822,6 +822,28 @@ maybe('реактивация после удаления — одна тран�
         [PHONE],
       );
       expect(mark[0]).toEqual({ set: true, not_referral: true });
+    });
+
+    it('(g) отметка NULL, в журнале «Приветственный бонус» с created_at NULL — не выдаётся, отметка ставится', async () => {
+      const PHONE = '79990000114';
+      await pool.query(
+        `INSERT INTO user_id (internal_id, primary_phone, state, welcome_bonus_at)
+         VALUES ($1, $2, 'active', NULL)`,
+        [PHONE, PHONE],
+      );
+      await pool.query(
+        `INSERT INTO ai_profiles_consolidated (user_id, tokens) VALUES ($1, 0)`,
+        [PHONE],
+      );
+      // Колонка created_at допускает NULL, а min(created_at) такую запись не
+      // видит — запись от этого не перестаёт быть выданным бонусом.
+      await seedCredit(PHONE, WELCOME_BONUS, 'Приветственный бонус', null);
+      const stack = makeStack();
+
+      ok(await stack.identity.resolveOrCreate('phone', { phone: PHONE }));
+      expect(await welcomeCredits(PHONE)).toEqual([WELCOME_BONUS]);
+      expect(await balance(PHONE)).toBe(0);
+      expect((await userRow(PHONE)).welcome_bonus_at).not.toBeNull();
     });
   });
 });
