@@ -152,8 +152,25 @@ relay_quiet() {
   [[ "$inflight" =~ ^[0-9]+$ ]] && (( inflight == 0 ))
 }
 
+# Marker ставится атомарно и только если его ещё нет: ln, в отличие от mv, не
+# перезаписывает существующий файл. В quiet выкат ждёт тишины до
+# DRAIN_WAIT_SECONDS; если за это время кто-то вручную поставил свой marker
+# (аварийный drain), его нельзя ни затереть, ни потом снять. Выход — при
+# GATE_CREATED=0, поэтому finish_rollout чужой marker не трогает. То же
+# правило, что проверка marker в начале, только позже по времени.
 gate_on() {
-  ( umask 077; printf '%s\n' "$TARGET_SHORT" > "$DRAIN_FILE.tmp.$$" && mv "$DRAIN_FILE.tmp.$$" "$DRAIN_FILE" )
+  local tmp="$DRAIN_FILE.tmp.$$"
+  ( umask 077; printf '%s\n' "$TARGET_SHORT" > "$tmp" )
+  if ! ln "$tmp" "$DRAIN_FILE" 2>/dev/null; then
+    rm -f -- "$tmp"
+    if [[ -e "$DRAIN_FILE" ]]; then
+      echo "Чужой drain marker появился во время ожидания — выкат остановлен, marker не тронут" >&2
+    else
+      echo "Не удалось поставить drain marker $DRAIN_FILE — выкат остановлен" >&2
+    fi
+    exit 1
+  fi
+  rm -f -- "$tmp"
   GATE_CREATED=1
 }
 
