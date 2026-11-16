@@ -7,7 +7,7 @@ import { recognize } from '../animate/stt';
 import { captureScene } from '../capture/run-capture';
 import { parseConfig } from '../config';
 import { renderRun } from '../render/run-render';
-import { LEASE_MINUTES, pgQueue } from './db';
+import { JOB_DEADLINE_MS, pgQueue } from './db';
 import { pruneOld, runOne, type JobDeps } from './jobs';
 import { watchStop } from './stop';
 import { s3Storage } from './storage';
@@ -25,14 +25,6 @@ import { s3Storage } from './storage';
  */
 const IDLE_MS = 15_000;
 const KEEP_DAYS = 7;
-/**
- * Срок одного задания — на 2 минуты короче аренды. Зависший рендер или съёмку
- * изнутри не прервать (Chromium, Remotion), поэтому по сроку процесс выходит:
- * раньше, чем аренда истечёт и задание заберёт другой процесс, — двух сборок
- * одного ролика сразу не бывает. Задание вернётся в очередь по истечении
- * аренды, третья такая попытка уйдёт в failed (claimJob, db.ts).
- */
-const JOB_DEADLINE_MS = (LEASE_MINUTES - 2) * 60_000;
 
 const cfg = parseConfig(process.env, { capture: true, tts: true, worker: true, animate: true });
 const google: GoogleDeps = { apiKey: cfg.googleKey };
@@ -70,7 +62,7 @@ log(`worker: старт${once ? ' (одно задание)' : ''}`);
 try {
   while (!stopping()) {
     const deadline = setTimeout(() => {
-      log(`worker: задание не уложилось в ${LEASE_MINUTES - 2} мин — выхожу, задание вернётся в очередь по истечении аренды`);
+      log(`worker: задание не уложилось в ${JOB_DEADLINE_MS / 60_000} мин — выхожу, задание вернётся в очередь по истечении аренды`);
       process.exit(1);
     }, JOB_DEADLINE_MS);
     let did: boolean;

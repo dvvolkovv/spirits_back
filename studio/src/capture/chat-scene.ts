@@ -16,7 +16,26 @@ export const VIEWPORT = CAPTURE_VIEWPORT;
 export const SCALE = CAPTURE_SCALE;
 /** Ответ готов, если он не меняется столько и в ленте нет признаков набора. */
 const STABLE_MS = 3000;
-const ANSWER_TIMEOUT_MS = 5 * 60_000;
+/**
+ * Лента спокойна, если в ней столько нет признаков набора. Дольше кулдауна
+ * дублей бэкенда (DEDUP_COOLDOWN_MS — 12 с, src/chat/chat.service.ts): повтор
+ * съёмки открывает чистый лист, пока прежний ход с тем же вопросом ещё идёт, и
+ * признак «работает» снимается не раньше конца того хода. Вопрос, ушедший через
+ * 3 с, бэкенд счёл бы дублем и прислал заглушку «Этот запрос я только что
+ * обработал…» — она сдвигала пузырь вопроса под шапку (question_hidden,
+ * 14.11.2026).
+ */
+const IDLE_STABLE_MS = 15_000;
+/**
+ * Сколько всего съёмка ждёт кабинет, от запуска браузера до последнего ответа:
+ * приветствие (или прежний ход), ответ и уточнения тратят один запас. Ответы на
+ * тяжёлые вопросы — файлы, презентации, свежие данные — идут до 12 минут
+ * (12–14.11.2026); прежние 5 минут на каждое ожидание бросали их недописанными,
+ * ход на бэкенде шёл дальше, и повтор съёмки упирался в него. Запас короче срока
+ * задания (JOB_DEADLINE_MS, worker/db.ts) на вход, снимки и выгрузку: иначе
+ * рабочий процесс выйдет по сроку раньше, чем съёмка скажет, чего не дождалась.
+ */
+export const CAPTURE_BUDGET_MS = 24 * 60_000;
 /** Предел высокого кадра: 5000 CSS px × 3 = 15000 px, ниже предела скриншота Chromium. */
 const MAX_TALL_CSS = 5000;
 const ASSISTANT_MSG = '[data-testid="chat-message"].justify-start';
@@ -56,11 +75,18 @@ function answerState(page: Page): Promise<AnswerState> {
   }, ASSISTANT_MSG);
 }
 
-async function waitAnswer(page: Page, before: number): Promise<string> {
+/** «7 мин», «40 с» — сколько ждали, для сообщения владельцу. */
+const waited = (since: number): string => {
+  const ms = Date.now() - since;
+  return ms >= 60_000 ? `${Math.round(ms / 60_000)} мин` : `${Math.round(ms / 1000)} с`;
+};
+
+/** Ждёт ответ на реплику до deadline (мс от эпохи) — срока всей съёмки, CAPTURE_BUDGET_MS. */
+export async function waitAnswer(page: Page, before: number, deadline: number): Promise<string> {
   const started = Date.now();
   let last: string | null = null;
   let since = Date.now();
-  while (Date.now() - started < ANSWER_TIMEOUT_MS) {
+  while (Date.now() < deadline) {
     const s = await answerState(page);
     const arrived = s.count > before;
     const text = arrived ? s.text : null;
@@ -69,36 +95,37 @@ async function waitAnswer(page: Page, before: number): Promise<string> {
       since = Date.now();
     } else if (arrived && !s.streaming && !s.busy && Date.now() - since >= STABLE_MS) {
       // Даже пустой текст возвращаем: «ответ без абзацев» отловит answerProblems,
-      // а не пятиминутный таймаут.
+      // а не таймаут съёмки.
       return s.text;
     }
     await page.waitForTimeout(1000);
   }
-  throw new StudioError('answer_timeout', 'capture: ответ не закончился за 5 минут', true);
+  throw new StudioError('answer_timeout', `capture: ответ не закончился за ${waited(started)} — съёмка ждёт кабинет не дольше ${CAPTURE_BUDGET_MS / 60_000} мин`, true);
 }
 
 /**
  * Ждёт, пока лента успокоится. В пустом «чистом листе» кабинет сам шлёт
- * приветствие (ChatInterface.sendInitialGreeting — настоящий ход ассистента);
- * вопрос, отправленный поверх, ушёл бы в очередь. Готово, когда есть хотя бы
- * одно сообщение ассистента и STABLE_MS нет признаков набора.
+ * приветствие (ChatInterface.sendInitialGreeting — настоящий ход ассистента), а
+ * у повтора съёмки ещё может идти прежний ход; вопрос, отправленный поверх, ушёл
+ * бы в очередь. Готово, когда есть хотя бы одно сообщение ассистента и
+ * IDLE_STABLE_MS нет признаков набора. deadline — срок всей съёмки.
  */
-async function waitIdle(page: Page): Promise<void> {
+export async function waitIdle(page: Page, deadline: number): Promise<void> {
   const started = Date.now();
   let lastCount = -1;
   let since = Date.now();
-  while (Date.now() - started < ANSWER_TIMEOUT_MS) {
+  while (Date.now() < deadline) {
     const s = await answerState(page);
     const idle = s.count > 0 && !s.streaming && !s.busy;
     if (!idle || s.count !== lastCount) {
       lastCount = s.count;
       since = Date.now();
-    } else if (Date.now() - since >= STABLE_MS) {
+    } else if (Date.now() - since >= IDLE_STABLE_MS) {
       return;
     }
     await page.waitForTimeout(1000);
   }
-  throw new StudioError('idle_timeout', 'capture: лента не успокоилась за 5 минут — приветствие ассистента не закончилось', true);
+  throw new StudioError('idle_timeout', `capture: лента не успокоилась за ${waited(started)} — приветствие или прежний ход ассистента не закончились`, true);
 }
 
 /** Отправляет реплику и ждёт её пузырь; возвращает число ответов ассистента до отправки. */
@@ -161,6 +188,7 @@ export async function captureChat(
 ): Promise<CaptureResult | null> {
   fs.mkdirSync(outDir, { recursive: true });
   const shot = (name: string) => path.join(outDir, name);
+  const deadline = Date.now() + CAPTURE_BUDGET_MS;
   const browser = await chromium.launch({ headless: true });
   try {
     const context = await browser.newContext({
@@ -194,7 +222,7 @@ export async function captureChat(
     // Рекламные плашки кабинета — не в кадр (promo.ts). Стиль живёт до конца
     // съёмки: страница одна, без перезагрузки.
     await page.addStyleTag({ content: hidePromoCss() });
-    await waitIdle(page);
+    await waitIdle(page, deadline);
     const picked = (await page.locator('[data-testid="assistant-dropdown-btn"]').innerText().catch(() => '')).trim();
     if (!picked.includes(scene.assistantName)) {
       await page.screenshot({ path: shot('wrong-assistant.png') });
@@ -211,12 +239,12 @@ export async function captureChat(
       throw new StudioError('question_hidden', `capture: пузырь вопроса не виден целиком — см. ${shot('question-hidden.png')}`, true);
     }
     await page.screenshot({ path: shot('question.png') });
-    let answer = await waitAnswer(page, before);
+    let answer = await waitAnswer(page, before, deadline);
     let turns = 1;
     for (const followup of scene.followups.slice(0, 2)) {
       if (!isCounterQuestion(answer, opts.minAnswerChars)) break;
       before = await send(page, followup);
-      answer = await waitAnswer(page, before);
+      answer = await waitAnswer(page, before, deadline);
       turns += 1;
     }
     const problems = answerProblems(answer, opts.minAnswerChars);
