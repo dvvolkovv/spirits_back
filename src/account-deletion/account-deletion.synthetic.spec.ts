@@ -81,12 +81,15 @@ describe('checkSyntheticGates — тройной гейт до любой зап
   });
 
   // Двойники разрешённых имён — страховка от префиксной, регистронезависимой
-  // и нормализующей реализации: allow-list сравнивается строго на равенство.
+  // и нормализующей (trim, хвостовая точка) реализации: allow-list
+  // сравнивается строго на равенство.
   const hostnameDoubles = [
     'ugliest-salmon.evil.example',
     'ugliest-salmon-2',
     'UGLIEST-SALMON',
     'ugliest-salmon.ptr.network.',
+    'ugliest-salmon ',
+    ' ugliest-salmon',
     '',
   ];
 
