@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 import { Readable } from 'stream';
-import { NotFoundException } from '@nestjs/common';
+import { Logger, NotFoundException } from '@nestjs/common';
 import { LanguageService } from '../../common/services/language.service';
 import { PgService } from '../../common/services/pg.service';
 import { StorageService } from '../../common/services/storage.service';
@@ -67,7 +67,9 @@ function makeHarness(
       queries.push({ sql: s, params });
       if (s.startsWith('SELECT')) {
         // Семантика WHERE id = $1 AND user_id = $2: чужому строка не видна.
-        const hit = !!row && params[0] === row.id && params[1] === row.user_id;
+        // openDownload выбирает по одному id (владельца проверяет сам).
+        const byOwner = s.includes('user_id = $2');
+        const hit = !!row && params[0] === row.id && (!byOwner || params[1] === row.user_id);
         return { rows: hit ? [row] : [], rowCount: hit ? 1 : 0 };
       }
       if (s.startsWith('DELETE FROM chat_uploads')) return { rows: [], rowCount: 1 };
@@ -90,6 +92,18 @@ function makeHarness(
       : new ChatUploadsService(pg as any, storage as any, language as any);
   const writes = () => queries.filter((q) => !q.sql.startsWith('SELECT'));
   return { pg, storage, language, service, queries, writes };
+}
+
+/** Все строки журнала сервиса (любой уровень) — для проверок приватности. */
+function captureLogs(service: ChatUploadsService): () => string[] {
+  const logger = (service as unknown as { logger: Logger }).logger;
+  const lines: string[] = [];
+  for (const level of ['error', 'warn', 'log', 'debug', 'verbose'] as const) {
+    jest.spyOn(logger, level).mockImplementation((message: unknown) => {
+      lines.push(String(message));
+    });
+  }
+  return () => lines;
 }
 
 async function readAll(body: Readable): Promise<string> {
@@ -176,6 +190,17 @@ describe('ChatUploadsService.deleteForOwner', () => {
     await service.deleteForOwner({ id: RECORD_ID, userId: OWNER });
 
     expect(queries[queries.length - 1].params[2]).toBe('📎 Гостиная [1].jpg — файл удалён');
+  });
+
+  it('LanguageService упал — история всё равно переписывается, по-русски', async () => {
+    const { service, language, writes } = makeHarness({ lang: 'en' });
+    language.resolveUserLanguage.mockRejectedValueOnce(new Error('db down'));
+
+    await expect(service.deleteForOwner({ id: RECORD_ID, userId: OWNER })).resolves.toBeUndefined();
+
+    const all = writes();
+    expect(all.map((q) => q.sql.slice(0, 6))).toEqual(['DELETE', 'UPDATE']);
+    expect(all[1].params[2]).toBe('📎 Гостиная [1].jpg — файл удалён');
   });
 
   it('thumb_key NULL — всё равно пробует thumbs/<KEY>.webp (absent терпимо), затем оригинал', async () => {
@@ -318,5 +343,105 @@ describe('ChatUploadsService.openThumb', () => {
     );
 
     await expect(service.openThumb({ id: RECORD_ID, userId: OWNER })).rejects.toBeInstanceOf(NotFoundException);
+  });
+});
+
+/**
+ * Журнал сервиса — без имени файла и ключей объектов: ключ — это
+ * `<uuid>/<safeFileName(имя)>`, а текст ошибок S3/pg может его повторять.
+ * В журнал идёт только вид ошибки (name, HTTP-статус S3, код pg/системы);
+ * id запроса — в кавычках, без сырых переводов строки.
+ */
+describe('ChatUploadsService: журнал без имён файлов и ключей', () => {
+  it('сбой удаления в MinIO — вид ошибки и статус, без имени файла, ключа и текста сообщения', async () => {
+    const { service, storage } = makeHarness();
+    const logs = captureLogs(service);
+    storage.deleteConfirmed.mockRejectedValueOnce(
+      Object.assign(new Error(`boom ${KEY} ${NAME}`), {
+        name: 'InternalError',
+        $metadata: { httpStatusCode: 500 },
+      }),
+    );
+
+    await expect(service.deleteForOwner({ id: RECORD_ID, userId: OWNER })).rejects.toBeInstanceOf(
+      ChatUploadDeleteError,
+    );
+
+    const text = logs().join('\n');
+    expect(text).toContain('InternalError');
+    expect(text).toContain('500');
+    expect(text).not.toContain(KEY);
+    expect(text).not.toContain(NAME);
+    expect(text).not.toContain('boom');
+  });
+
+  it('сбой UPDATE истории — вид ошибки и SQLSTATE, без имени файла и текста сообщения', async () => {
+    const { service, pg } = makeHarness();
+    const logs = captureLogs(service);
+    const base = pg.query.getMockImplementation()!;
+    pg.query.mockImplementation(async (sql: string, params: unknown[] = []) => {
+      if (norm(sql).startsWith('UPDATE custom_chat_history')) {
+        throw Object.assign(new Error(`value too long near "${NAME}"`), { name: 'error', code: '22001' });
+      }
+      return base(sql, params);
+    });
+
+    await expect(service.deleteForOwner({ id: RECORD_ID, userId: OWNER })).resolves.toBeUndefined();
+
+    const text = logs().join('\n');
+    expect(text).toContain('22001');
+    expect(text).not.toContain(NAME);
+    expect(text).not.toContain('value too long');
+  });
+
+  it('openThumb: сбой MinIO — 404, в журнале вид ошибки без ключа миниатюры', async () => {
+    const { service, storage } = makeHarness();
+    const logs = captureLogs(service);
+    storage.download.mockRejectedValueOnce(
+      Object.assign(new Error(`read ${THUMB} failed`), { name: 'TimeoutError', code: 'ETIMEDOUT' }),
+    );
+
+    await expect(service.openThumb({ id: RECORD_ID, userId: OWNER })).rejects.toBeInstanceOf(NotFoundException);
+
+    const text = logs().join('\n');
+    expect(text).toContain('TimeoutError');
+    expect(text).toContain('ETIMEDOUT');
+    expect(text).not.toContain(THUMB);
+    expect(text).not.toContain(KEY);
+  });
+
+  it('openDownload: сбой MinIO — 404, в журнале вид ошибки и статус без ключа', async () => {
+    const { service, storage } = makeHarness();
+    const logs = captureLogs(service);
+    storage.downloadStream.mockRejectedValueOnce(
+      Object.assign(new Error(`GetObject ${KEY}`), {
+        name: 'ServiceUnavailable',
+        $metadata: { httpStatusCode: 503 },
+      }),
+    );
+
+    await expect(service.openDownload({ id: RECORD_ID, userId: OWNER })).rejects.toBeInstanceOf(
+      NotFoundException,
+    );
+
+    const text = logs().join('\n');
+    expect(text).toContain('ServiceUnavailable');
+    expect(text).toContain('503');
+    expect(text).not.toContain(KEY);
+  });
+
+  it('id запроса в журнале — в кавычках, перевод строки не подделает запись', async () => {
+    const { service } = makeHarness();
+    const logs = captureLogs(service);
+    const forged = 'x\n[Nest] 1  - FAKE LOG LINE';
+
+    await expect(service.openThumb({ id: forged, userId: OWNER })).rejects.toBeInstanceOf(NotFoundException);
+    await expect(service.openDownload({ id: forged, userId: OWNER })).rejects.toBeInstanceOf(NotFoundException);
+
+    expect(logs()).toHaveLength(2);
+    for (const line of logs()) {
+      expect(line).not.toContain('\n');
+      expect(line).toContain(JSON.stringify(forged));
+    }
   });
 });
