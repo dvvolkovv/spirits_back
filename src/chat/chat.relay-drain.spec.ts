@@ -102,10 +102,15 @@ function turn(svc: ChatService, message: string, upstreams: (Readable | Error)[]
   return { done, res };
 }
 
-function uploadTurnWith(svc: ChatService, upstreams: (Readable | Error)[], bodyExtra: Record<string, any> = {}) {
+function uploadTurnWith(
+  svc: ChatService,
+  upstreams: (Readable | Error)[],
+  bodyExtra: Record<string, any> = {},
+  chatUploads?: any,
+) {
   queue.push(...upstreams);
   const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
-  const ctrl = new ChatController(svc, jwtSvc as any, null as any, undefined);
+  const ctrl = new ChatController(svc, jwtSvc as any, null as any, undefined, undefined, chatUploads);
   const req = {
     headers: { authorization: 'Bearer t' },
     files: [{ originalname: 'a.pdf', buffer: Buffer.from('x'), mimetype: 'application/pdf', size: 1 }],
@@ -117,6 +122,17 @@ function uploadTurnWith(svc: ChatService, upstreams: (Readable | Error)[], bodyE
 }
 
 const tokenInserts = (calls: { sql: string }[]) => calls.filter((c) => /INSERT INTO token_consumption_tasks/.test(c.sql));
+/** Тексты строк истории, записанных от человека или ассистента ($3 — content). */
+const historyRows = (calls: { sql: string; params: any[] }[], sender: 'human' | 'ai') =>
+  calls
+    .filter((c) => /INSERT INTO custom_chat_history/.test(c.sql) && c.sql.includes(`'${sender}'`))
+    .map((c) => c.params[2]);
+/** Ход не оставил за собой ни потока, ни метки релея, ни ожидания. */
+function expectNothingLeft(svc: ChatService) {
+  expect(svc.getActiveStreamCount()).toBe(0);
+  expect((svc as any).relayRunning.size).toBe(0);
+  expect((svc as any).relayWaiting.size).toBe(0);
+}
 const savedStrings = (calls: { params: any[] }[]) => calls.flatMap((c) => c.params).filter((p) => typeof p === 'string');
 
 /**
@@ -320,8 +336,31 @@ describe('веб-ход под шлагбаумом выката релея', ()
 });
 
 describe('загрузка файла под шлагбаумом выката релея', () => {
+  it('U-W0: 503, потом поток — повтор уходит новой формой с теми же файлами, ход тарифицируется', async () => {
+    const { svc, calls } = makeServiceWithPgCalls();
+    svc.relayDrainDelaysMs = [0];
+    const up = stream();
+    const u = uploadTurnWith(svc, [err503(), up]);
+    await settle();
+    up.push(DELTA); up.push(DONE); up.push(null);
+    await u.done;
+    await settle();
+
+    expect(post).toHaveBeenCalledTimes(2);
+    // Форма multipart — поток: повтор не может переотправить первую.
+    expect(post.mock.calls[0][1]).not.toBe(post.mock.calls[1][1]);
+    for (const i of [0, 1]) {
+      expect(field(post.mock.calls[i], 'files')).toBe('x');
+      expect(msg(i)).toContain('смотри файл');
+    }
+    expect(ends(u.res)[0].content).toContain('ответ');
+    expect(tokenInserts(calls).length).toBe(1);
+    expectNothingLeft(svc);
+  });
+
   it('U-W1: бюджет исчерпан — заглушка про сообщение и файлы на языке человека', async () => {
-    const { svc } = makeServiceWithPgCalls();
+    const { svc, calls } = makeServiceWithPgCalls();
+    const learn = learning(svc);
     svc.relayDrainDelaysMs = [0];
     const u = uploadTurnWith(svc, [err503(), err503()], { lang: 'de' });
     await u.done;
@@ -332,15 +371,25 @@ describe('загрузка файла под шлагбаумом выката �
     expect(ends(u.res)).toEqual([expect.objectContaining({
       type: 'end', content: stub, reason: 'relay_draining', usage: { input: 0, output: 0, total: 0 },
     })]);
+    expect(tokenInserts(calls)).toEqual([]);
+    expect(savedStrings(calls)).toContain(stub);
+    // Заглушка — не разговор: профиль, задачи и карточка бизнеса не учатся.
+    expectNoLearning(learn);
+    expectNothingLeft(svc);
   });
 
-  it('U-W2: загрузка ждёт — текстовый ход несёт её текст и просит файлы заново', async () => {
-    const { svc } = makeServiceWithPgCalls();
+  /**
+   * Загрузка ждёт релей, текстовый ход её перебивает и несёт её текст. Сама
+   * загрузка кончается тихо: строка человека остаётся в истории (он это
+   * писал), пустой строки ассистента нет.
+   */
+  async function supersededUpload(chatUploads?: any) {
+    const { svc, calls } = makeServiceWithPgCalls();
     let wake: () => void = () => {};
     svc.relayDrainDelaysMs = [1000];
     svc.relayDrainSleep = () => new Promise<void>((r) => { wake = () => r(); });
 
-    const u = uploadTurnWith(svc, [err503()]);
+    const u = uploadTurnWith(svc, [err503()], {}, chatUploads);
     await settle();
     const upT = stream();
     const t = turn(svc, 'ну что там?', [upT]);
@@ -361,6 +410,33 @@ describe('загрузка файла под шлагбаумом выката �
 
     upT.push(DONE); upT.push(null);
     await t.done;
+    await settle();
+
+    expect(historyRows(calls, 'human').some((c) => String(c).includes('смотри файл'))).toBe(true);
+    expect(historyRows(calls, 'ai')).not.toContain('');
+    expectNothingLeft(svc);
+    return { calls };
+  }
+
+  it('U-W2: загрузка ждёт — текстовый ход несёт её текст и просит файлы заново', async () => {
+    await supersededUpload();
+  });
+
+  it('U-W2b: то же с сохранёнными исходниками — строка человека со ссылкой, без пустой строки ассистента', async () => {
+    const OLD_UPLOADS_FLAG = process.env.CHAT_UPLOADS_ENABLED;
+    process.env.CHAT_UPLOADS_ENABLED = 'true';
+    try {
+      const chatUploads = {
+        saveOriginals: jest.fn(async () => ({ saved: [{ id: 'up1', originalName: 'a.pdf' }], failed: [] })),
+        ownerUrl: jest.fn((id: string) => `/webhook/chat-uploads/${id}`),
+      };
+      const { calls } = await supersededUpload(chatUploads);
+      expect(chatUploads.saveOriginals).toHaveBeenCalled();
+      expect(historyRows(calls, 'human')).toContain('📎 [a.pdf](/webhook/chat-uploads/up1)\nсмотри файл');
+    } finally {
+      if (OLD_UPLOADS_FLAG === undefined) delete process.env.CHAT_UPLOADS_ENABLED;
+      else process.env.CHAT_UPLOADS_ENABLED = OLD_UPLOADS_FLAG;
+    }
   });
 
   it('U-W3: текстовый ход ждёт — загрузка несёт его текст', async () => {
