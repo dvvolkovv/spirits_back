@@ -13,6 +13,9 @@ export interface ChatUploadInputFile {
   mimetype?: string;
 }
 
+/** Откуда пришёл файл: web — веб и оба приложения, scan — PDF Маши, telegram — личка с ботом. */
+export type ChatUploadSource = 'web' | 'scan' | 'telegram';
+
 export interface ChatUploadRecord {
   id: string;
   userId: string;
@@ -23,6 +26,13 @@ export interface ChatUploadRecord {
   sha256: string;
   storageKey: string;
   createdAt: string;
+  source: ChatUploadSource;
+  /** Ключ webp-миниатюры в том же бакете; null — миниатюры нет (не картинка или не получилась). */
+  thumbKey: string | null;
+  /** Комментарий ассистента (note_file), до 500 символов. */
+  note: string | null;
+  noteUpdatedAt: string | null;
+  noteAssistantId: string | null;
 }
 
 export interface SaveOriginalsResult {
@@ -41,7 +51,11 @@ export interface ChatUploadDownload {
 export const CHAT_UPLOADS_BUCKET = 'linkeon-chat-uploads';
 const BUCKET = CHAT_UPLOADS_BUCKET;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const COLUMNS = 'id, user_id, session_id, original_name, mime, size_bytes, sha256, storage_key, created_at';
+const COLUMNS =
+  'id, user_id, session_id, original_name, mime, size_bytes, sha256, storage_key, created_at, '
+  + 'source, thumb_key, note, note_updated_at, note_assistant_id';
+/** Файлы миграций реестра — строго по порядку: 002 дополняет таблицу из 001. */
+const MIGRATIONS = ['001_chat_uploads.sql', '002_chat_uploads_media_notes.sql'] as const;
 
 @Injectable()
 export class ChatUploadsService {
@@ -54,19 +68,25 @@ export class ChatUploadsService {
   ) {}
 
   /**
-   * Создать таблицу реестра при старте модуля (образец — alert-bot.store.ts).
-   * nest-cli не копирует .sql в dist, поэтому второй кандидат читает файл из
-   * src: после сборки сервис лежит в dist/chat/chat-uploads, и «..» ровно три.
+   * Создать и дополнить таблицу реестра при старте модуля (образец —
+   * alert-bot.store.ts): 001, затем 002. nest-cli не копирует .sql в dist,
+   * поэтому второй кандидат читает файл из src: после сборки сервис лежит в
+   * dist/chat/chat-uploads, и «..» ровно три. Сначала находятся ВСЕ файлы и
+   * только потом выполняются: пропавший 002 не оставляет старт «на полпути».
    */
   async migrate(): Promise<void> {
-    const candidates = [
-      path.join(__dirname, 'migrations', '001_chat_uploads.sql'),
-      path.join(__dirname, '..', '..', '..', 'src', 'chat', 'chat-uploads', 'migrations', '001_chat_uploads.sql'),
-    ];
-    const migrationPath = candidates.find((candidate) => fs.existsSync(candidate));
-    if (!migrationPath) throw new Error('chat-uploads migration 001_chat_uploads.sql not found');
-    const sql = fs.readFileSync(migrationPath, 'utf8');
-    await this.pg.query(sql);
+    const paths = MIGRATIONS.map((file) => {
+      const candidates = [
+        path.join(__dirname, 'migrations', file),
+        path.join(__dirname, '..', '..', '..', 'src', 'chat', 'chat-uploads', 'migrations', file),
+      ];
+      const migrationPath = candidates.find((candidate) => fs.existsSync(candidate));
+      if (!migrationPath) throw new Error(`chat-uploads migration ${file} not found`);
+      return migrationPath;
+    });
+    for (const migrationPath of paths) {
+      await this.pg.query(fs.readFileSync(migrationPath, 'utf8'));
+    }
   }
 
   async saveOriginals(input: {
@@ -262,6 +282,13 @@ export class ChatUploadsService {
       sha256: String(row.sha256),
       storageKey: String(row.storage_key),
       createdAt: new Date(row.created_at).toISOString(),
+      // Колонка NOT NULL DEFAULT 'web'; запасное 'web' — для строк без неё
+      // (моки соседних спеков), чтобы не получить строку 'undefined'.
+      source: (row.source ?? 'web') as ChatUploadSource,
+      thumbKey: row.thumb_key == null ? null : String(row.thumb_key),
+      note: row.note == null ? null : String(row.note),
+      noteUpdatedAt: row.note_updated_at == null ? null : new Date(row.note_updated_at).toISOString(),
+      noteAssistantId: row.note_assistant_id == null ? null : String(row.note_assistant_id),
     };
   }
 
