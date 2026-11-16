@@ -38,30 +38,50 @@ describe('resultRules — правила сдачи результата', () =>
     expect(WEB).toContain('pdfinfo');
     expect(WEB).toContain('qpdf --check');
     expect(WEB).toContain('pdftoppm');
+    // Отрисовка — выборочно: все страницы подряд — дорого.
+    expect(WEB).toContain('выборочно отрисуй через pdftoppm');
+    expect(WEB).not.toContain('отрисуй страницы через pdftoppm и посмотри на них');
     expect(WEB).toContain('Две попытки не помогли');
   });
 
-  it('итог хода: без заметок для себя, последний абзац — итог, повтор просьбы — показать готовое', () => {
+  it('итог хода: без заметок для себя, итог — только после работы, вопрос и есть итог, повтор просьбы — показать готовое', () => {
     expect(WEB).toContain('Не пиши заметок для себя');
-    expect(WEB).toContain('Последний абзац ответа — итог');
+    // Итог последним абзацем — только если в ходе была работа; безусловного
+    // «Последний абзац ответа — итог» нет.
+    expect(WEB).toContain('Если в ходе была работа (файлы, инструменты, несколько шагов), последний абзац ответа — итог');
+    expect(WEB).not.toContain('Последний абзац ответа — итог');
+    expect(WEB).toContain('вопрос и есть итог');
     expect(WEB).toContain('покажи, где он');
   });
 
   it('платные действия в вебе: цена до серии, отказ по балансу — с выходом', () => {
     expect(WEB).toContain('назови цену и спроси');
-    expect(WEB).toContain('по блоку о балансе');
+    expect(WEB).toContain('в блоке о балансе');
     expect(WEB).toContain('своими средствами');
   });
 
-  it('магазинная сборка: выход и вопрос есть, денег нет (Apple 3.1.1)', () => {
+  it('магазинная сборка: выход и вопрос есть, о деньгах — явный запрет (Apple 3.1.1)', () => {
     expect(STORE).toContain('предложи, что можно сделать иначе');
     expect(STORE).toContain('спроси, как продолжить');
-    expect(STORE).not.toMatch(/токен|баланс|пополн|стоимост|цен[аеуы]|https?:\/\//i);
+    // Темы запрета названы прямо; веб-инструкций о цене и балансе нет.
+    expect(STORE).toContain('не упоминай цену, токены, баланс, пополнение и ссылки на оплату');
+    expect(STORE).not.toContain('назови цену');
+    expect(STORE).not.toContain('по блоку о балансе');
+    expect(STORE).not.toContain('в блоке о балансе');
+    expect(STORE).not.toMatch(/https?:\/\//i);
+  });
+
+  it('выход без платной операции — с примерами в обоих вариантах', () => {
+    for (const r of [WEB, STORE]) {
+      expect(r).toContain('нарисовать SVG кодом');
+      expect(r).toContain('доработать готовый файл из рабочей папки');
+    }
   });
 
   it('большие файлы и ссылки: 100 МБ, ffmpeg, облачные диски по белому списку, без base64 в HTML', () => {
     for (const r of [WEB, STORE]) {
-      expect(r).toContain('до 100 МБ');
+      expect(r).toContain('В чат загружается файл до 100 МБ');
+      expect(r).not.toContain('В кабинете');
       expect(r).toContain('ffmpeg');
       expect(r).toContain('белому списку');
       expect(r).toContain('не обещай скачать');
