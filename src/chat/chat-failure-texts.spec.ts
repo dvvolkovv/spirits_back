@@ -7,7 +7,9 @@ import { looksLikeFailure } from '../routine-push/routine-push.service';
 const LANGS = ['ru', 'en', 'es', 'de', 'fr', 'zh', 'pt'];
 const KINDS: ChatFailureKind[] = ['relayUpdating', 'startFailed', 'fileFailed', 'noReply', 'cliFatal'];
 const VARIANTS = [{}, { upload: true }, { storeBuild: true }, { storeBuild: true, upload: true }];
-const MONEY = /token|токен|jeton|代币|balance|баланс|saldo|guthaben|solde|余额|пополн/i;
+// Магазинная сборка (Apple 3.1.1) молчит не только о токенах и балансе, но и о
+// списании и оплате вообще.
+const MONEY = /token|токен|jeton|代币|balance|баланс|saldo|guthaben|solde|余额|пополн|charg|abgebucht|débit|descont|扣除|списан|оплат|pay|pago|paiement|zahl|充值/i;
 
 describe('chatFailureText', () => {
   it('7 языков × 5 видов × 4 варианта — ни одного пустого', () => {
@@ -43,6 +45,20 @@ describe('chatFailureText', () => {
     expect(chatFailureText('noReply', 'xx')).toBe(chatFailureText('noReply', 'ru'));
     expect(chatFailureText('noReply', undefined)).toBe(chatFailureText('noReply', 'ru'));
     expect(chatFailureText('noReply', 'EN')).toBe(chatFailureText('noReply', 'en'));
+  });
+
+  it('тег с регионом сводится к языку', () => {
+    expect(chatFailureText('noReply', 'pt-BR')).toBe(chatFailureText('noReply', 'pt'));
+    expect(chatFailureText('noReply', 'en-US')).toBe(chatFailureText('noReply', 'en'));
+  });
+
+  it('служебные ключи объекта не принимаются за язык — русский', () => {
+    for (const lang of ['__proto__', 'constructor']) {
+      const t = chatFailureText('noReply', lang);
+      expect(typeof t).toBe('string');
+      expect(t.length).toBeGreaterThan(0);
+      expect(t).toBe(chatFailureText('noReply', 'ru'));
+    }
   });
 
   it('ни один текст не принимается за сбой CLI или генерации', () => {
