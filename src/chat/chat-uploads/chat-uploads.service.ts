@@ -6,7 +6,7 @@ import { Readable } from 'stream';
 import { PgService } from '../../common/services/pg.service';
 import { StorageService } from '../../common/services/storage.service';
 import { safeFileName } from '../chat-files/file-meta';
-import { makeUploadThumb, uploadThumbKey } from './upload-thumb';
+import { isThumbnailableMime, makeUploadThumb, uploadThumbKey } from './upload-thumb';
 
 export interface ChatUploadInputFile {
   buffer: Buffer;
@@ -161,19 +161,23 @@ export class ChatUploadsService {
 
   /**
    * WebP-миниатюра картинки рядом с оригиналом (thumbs/<storage_key>.webp).
-   * Никогда не бросает: не картинка — null молча; не получилась или не легла
-   * в MinIO — null с предупреждением (имя, mime и вид ошибки, без байтов), и
-   * файл сохраняется без миниатюры — фронт покажет значок.
+   * Никогда не бросает. mime не из белого списка (isThumbnailableMime: SVG,
+   * BMP, ICO, HEIC, не картинки) — null молча. Не получилась или не легла в
+   * MinIO — null с предупреждением: экранированное имя, mime и причина, без
+   * байтов и без сырого текста sharp. Файл сохраняется без миниатюры — фронт
+   * покажет значок.
    */
   private async saveThumb(
     file: ChatUploadInputFile,
     mime: string,
     storageKey: string,
   ): Promise<string | null> {
-    if (!mime.toLowerCase().startsWith('image/')) return null;
+    if (!isThumbnailableMime(mime)) return null;
     const thumb = await makeUploadThumb(file.buffer, mime);
-    if (!thumb) {
-      this.logger.warn(`saveOriginals: thumbnail not rendered for "${file.originalname}" (${mime.slice(0, 100)})`);
+    if (thumb.ok === false) {
+      this.logger.warn(
+        `saveOriginals: thumbnail skipped for ${this.logName(file.originalname)} (${JSON.stringify(mime.slice(0, 100))}): ${thumb.reason}`,
+      );
       return null;
     }
     const key = uploadThumbKey(storageKey);
@@ -181,17 +185,32 @@ export class ChatUploadsService {
       await this.storage.upload({
         bucket: BUCKET,
         key,
-        body: thumb,
+        body: thumb.webp,
         contentType: 'image/webp',
         cacheControl: 'private, no-store',
       });
       return key;
     } catch (e: any) {
       this.logger.warn(
-        `saveOriginals: thumbnail upload failed for "${file.originalname}": ${this.errDetail(e)}`,
+        `saveOriginals: thumbnail upload failed for ${this.logName(file.originalname)}: ${this.errDetail(e)}`,
       );
+      // Сбой PutObject неоднозначен: объект мог лечь, а ответ — потеряться.
+      // Строки с этим ключом не будет, поэтому ключ чистим сразу
+      // (DeleteObject идемпотентен — удалить несуществующее не ошибка).
+      try {
+        await this.storage.delete({ bucket: BUCKET, key });
+      } catch (cleanupError: any) {
+        this.logger.warn(
+          `saveOriginals: thumbnail cleanup delete failed for ${this.logName(file.originalname)}: ${this.errDetail(cleanupError)}`,
+        );
+      }
       return null;
     }
+  }
+
+  /** Имя файла для журнала: в кавычках и экранировано — перевод строки в имени не подделает запись. */
+  private logName(name: string): string {
+    return JSON.stringify(String(name)).slice(0, 200);
   }
 
   ownerUrl(id: string): string {
