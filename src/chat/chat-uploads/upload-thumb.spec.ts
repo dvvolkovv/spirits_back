@@ -1,6 +1,8 @@
 import sharp = require('sharp');
 import {
+  UPLOAD_THUMB_CALL_BUDGET_MS,
   UPLOAD_THUMB_MAX_SIDE,
+  UPLOAD_THUMB_QUEUE_WAIT_MS,
   UploadThumbSlots,
   classifyThumbError,
   isThumbnailableMime,
@@ -51,6 +53,11 @@ describe('isThumbnailableMime', () => {
 describe('makeUploadThumb', () => {
   it('длинная сторона миниатюры — 480 px', () => {
     expect(UPLOAD_THUMB_MAX_SIDE).toBe(480);
+  });
+
+  it('бюджет миниатюр на один вызов saveOriginals — 8 с, место ждём не дольше 2,5 с', () => {
+    expect(UPLOAD_THUMB_CALL_BUDGET_MS).toBe(8_000);
+    expect(UPLOAD_THUMB_QUEUE_WAIT_MS).toBe(2_500);
   });
 
   it('PNG 1000×600 → WebP 480×288 (пропорции сохранены)', async () => {

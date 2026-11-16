@@ -1,6 +1,12 @@
 import sharp = require('sharp');
 import { ChatUploadsService } from './chat-uploads.service';
-import { uploadThumbKey } from './upload-thumb';
+import * as uploadThumb from './upload-thumb';
+import {
+  UPLOAD_THUMB_CALL_BUDGET_MS,
+  UPLOAD_THUMB_QUEUE_WAIT_MS,
+  UploadThumbSlots,
+  uploadThumbKey,
+} from './upload-thumb';
 
 /**
  * saveOriginals после миграции 002: source в INSERT и webp-миниатюра картинки
@@ -208,5 +214,117 @@ describe('ChatUploadsService.saveOriginals: источник и миниатюр
       { bucket: 'linkeon-chat-uploads', key: originalKey },
       { bucket: 'linkeon-chat-uploads', key: uploadThumbKey(originalKey) },
     ]);
+  });
+
+  it('сбой записи и уборки: имя файла в журнале экранировано и в этих строках', async () => {
+    const name = 'отчёт"\nFAKE: подделка.pdf';
+    pg.query.mockRejectedValueOnce(new Error('db down'));
+    storage.delete.mockRejectedValueOnce(new Error('minio down'));
+
+    const result = await service.saveOriginals({
+      userId: 'u1',
+      sessionId: 'u1_12',
+      files: [{ buffer: Buffer.from('%PDF-1.4 synthetic'), originalname: name, mimetype: 'application/pdf' }],
+    });
+
+    expect(result.failed).toEqual([name]);
+    // «failed to persist» и «best-effort cleanup delete failed».
+    expect(warn).toHaveBeenCalledTimes(2);
+    for (const [line] of warn.mock.calls) {
+      expect(String(line)).not.toContain('\n');
+      expect(String(line)).toContain(JSON.stringify(name));
+    }
+  });
+
+  describe('общий бюджет миниатюр на один вызов', () => {
+    const shots = (n: number) =>
+      Array.from({ length: n }, (_, i) => ({
+        buffer: jpeg,
+        originalname: `фото-${i + 1}.jpg`,
+        mimetype: 'image/jpeg',
+      }));
+    const thumbKeysInInsert = () => pg.query.mock.calls.map((call) => (call[1] as unknown[])[8]);
+    const originalKeys = () =>
+      storage.upload.mock.calls.map((call) => String(call[0].key)).filter((key) => !key.startsWith('thumbs/'));
+
+    let nowSpy: jest.SpyInstance | undefined;
+    afterEach(() => {
+      nowSpy?.mockRestore();
+      nowSpy = undefined;
+      delete (service as any).thumbSlots;
+    });
+
+    it('после первого busy миниатюры остальных файлов пропускаются, оригиналы сохраняются все', async () => {
+      // Подменённые места: свободного не бывает.
+      const acquire = jest.fn(async (_waitMs: number) => null);
+      (service as any).thumbSlots = { acquire };
+
+      const result = await service.saveOriginals({ userId: 'u1', sessionId: 'u1_12', files: shots(3) });
+
+      expect(acquire).toHaveBeenCalledTimes(1);
+      expect(acquire.mock.calls[0][0]).toBeGreaterThan(0);
+      expect(acquire.mock.calls[0][0]).toBeLessThanOrEqual(UPLOAD_THUMB_QUEUE_WAIT_MS);
+      expect(result.failed).toEqual([]);
+      expect(result.saved).toHaveLength(3);
+      expect(originalKeys()).toHaveLength(3);
+      expect(storage.upload).toHaveBeenCalledTimes(3); // ни одной миниатюры
+      expect(thumbKeysInInsert()).toEqual([null, null, null]);
+      expect(warnText()).toContain('"фото-1.jpg" ("image/jpeg"): busy');
+      expect(warnText()).toContain('"фото-2.jpg" ("image/jpeg"): budget');
+      expect(warnText()).toContain('"фото-3.jpg" ("image/jpeg"): budget');
+    });
+
+    it('после timeout — так же: остальные файлы вызова без миниатюр', async () => {
+      const make = jest
+        .spyOn(uploadThumb, 'makeUploadThumb')
+        .mockResolvedValueOnce({ ok: false, reason: 'timeout' });
+      try {
+        const result = await service.saveOriginals({ userId: 'u1', sessionId: 'u1_12', files: shots(2) });
+
+        expect(make).toHaveBeenCalledTimes(1);
+        expect(result.saved).toHaveLength(2);
+        expect(thumbKeysInInsert()).toEqual([null, null]);
+        expect(warnText()).toContain('"фото-1.jpg" ("image/jpeg"): timeout');
+        expect(warnText()).toContain('"фото-2.jpg" ("image/jpeg"): budget');
+      } finally {
+        make.mockRestore();
+      }
+    });
+
+    it('ожидание места — не больше остатка бюджета; бюджет кончился — миниатюр больше нет', async () => {
+      let now = 1_000_000;
+      nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+      const real = new UploadThumbSlots(2);
+      const acquire = jest.fn((waitMs: number) => real.acquire(waitMs));
+      (service as any).thumbSlots = { acquire };
+      // Каждая легшая миниатюра «съедает» 7 с бюджета вызова.
+      storage.upload.mockImplementation(async (input: any) => {
+        if (String(input.key).startsWith('thumbs/')) now += 7_000;
+        return 'https://public.invalid/should-not-be-used';
+      });
+
+      const result = await service.saveOriginals({ userId: 'u1', sessionId: 'u1_12', files: shots(3) });
+
+      expect(acquire.mock.calls.map((call) => call[0])).toEqual([
+        Math.min(UPLOAD_THUMB_QUEUE_WAIT_MS, UPLOAD_THUMB_CALL_BUDGET_MS),
+        Math.min(UPLOAD_THUMB_QUEUE_WAIT_MS, UPLOAD_THUMB_CALL_BUDGET_MS - 7_000),
+      ]);
+      expect(result.failed).toEqual([]);
+      expect(result.saved).toHaveLength(3);
+      const keys = originalKeys();
+      expect(keys).toHaveLength(3);
+      expect(thumbKeysInInsert()).toEqual([uploadThumbKey(keys[0]), uploadThumbKey(keys[1]), null]);
+      expect(warnText()).toContain('"фото-3.jpg" ("image/jpeg"): budget');
+    });
+
+    it('бюджет — новый на каждый вызов', async () => {
+      const acquire = jest.fn(async (_waitMs: number) => null);
+      (service as any).thumbSlots = { acquire };
+      await service.saveOriginals({ userId: 'u1', sessionId: 'u1_12', files: shots(2) });
+      delete (service as any).thumbSlots;
+
+      const result = await service.saveOriginals({ userId: 'u1', sessionId: 'u1_12', files: shots(1) });
+      expect(result.saved[0].thumbKey).toBe(uploadThumbKey(originalKeys()[2]));
+    });
   });
 });
