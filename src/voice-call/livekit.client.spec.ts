@@ -128,7 +128,7 @@ describe('LiveKitClient.send', () => {
     expect(room).toBe('room-1');
     expect(JSON.parse(new TextDecoder().decode(payload))).toEqual(msg);
     expect(kind).toBe(0);
-    expect(opts).toEqual({ topic: expect.any(String) });
+    expect(opts).toEqual({ topic: 'linkeon' });
   });
 
   it('без timeoutMs опций клиенту не передаётся', async () => {
