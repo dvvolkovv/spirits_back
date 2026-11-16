@@ -55,6 +55,10 @@ function runRollout(health, options = {}) {
   if (['legacy', 'legacy-upload', 'target-fails'].includes(health)) {
     write(path.join(work, 'old-worker-alive'), '4243\n');
   }
+  // Сценарий inflight-seq: значения inflight в health по очереди, по одному на вызов.
+  if (options.inflightSeq) {
+    write(path.join(work, 'inflight-seq'), options.inflightSeq.map((n) => `${n}\n`).join(''));
+  }
 
   executable(path.join(bin, 'sudo'), '#!/usr/bin/env bash\nexec "$@"\n');
   executable(path.join(bin, 'nginx'), `#!/usr/bin/env bash
@@ -137,6 +141,22 @@ case "${health}" in
   all-fail)
     if [[ "$restarts" -eq 0 ]]; then echo '{"status":"ok","inflight":0}'; exit 0; fi
     exit 1 ;;
+  inflight-seq)
+    n=$(head -n 1 "$WORK/inflight-seq" 2>/dev/null || true)
+    if [[ -n "$n" ]]; then
+      tail -n +2 "$WORK/inflight-seq" > "$WORK/inflight-seq.next"
+      mv "$WORK/inflight-seq.next" "$WORK/inflight-seq"
+    else
+      n=0
+    fi
+    echo "inflight=$n gate=$gate" >> "$WORK/inflight.log"
+    printf '{"status":"ok","inflight":%s}' "$n"
+    exit 0 ;;
+  inflight-by-gate)
+    if [[ "$gate" == yes ]]; then n=$INFLIGHT_GATED; else n=$INFLIGHT_OPEN; fi
+    echo "inflight=$n gate=$gate" >> "$WORK/inflight.log"
+    printf '{"status":"ok","inflight":%s}' "$n"
+    exit 0 ;;
   legacy) echo '{"status":"ok"}'; exit 0 ;;
   legacy-upload) echo '{"status":"ok"}'; exit 0 ;;
   *) echo '{"status":"ok","inflight":0}'; exit 0 ;;
@@ -169,6 +189,7 @@ exit 0
     LOCK_FILE: lockFile,
     NGINX_CONF: nginxConf,
     PAUSE_FILE: options.pauseFile || '',
+    ...(options.env || {}),
   };
   const finish = (result) => {
     if (process.env.DEBUG_ROLLOUT) {
@@ -187,6 +208,9 @@ exit 0
       liveServer: fs.readFileSync(path.join(live, 'server.mjs'), 'utf8'),
       restarts: fs.existsSync(path.join(work, 'restarts.log')) ? fs.readFileSync(path.join(work, 'restarts.log'), 'utf8') : '',
       curls: fs.existsSync(path.join(work, 'curl.log')) ? fs.readFileSync(path.join(work, 'curl.log'), 'utf8') : '',
+      inflight: fs.existsSync(path.join(work, 'inflight.log'))
+        ? fs.readFileSync(path.join(work, 'inflight.log'), 'utf8').trim().split('\n')
+        : [],
       nginx: fs.existsSync(path.join(work, 'nginx.log')) ? fs.readFileSync(path.join(work, 'nginx.log'), 'utf8') : '',
       nginxConfig: fs.readFileSync(nginxConf, 'utf8'),
       worker: fs.existsSync(path.join(work, 'worker.log')) ? fs.readFileSync(path.join(work, 'worker.log'), 'utf8') : '',
@@ -280,8 +304,8 @@ describe('deploy-relay drain/admission gate', () => {
     }
   });
 
-  it('ждёт и in-flight counter, и PM2 children до replacement/restart', () => {
-    const r = runRollout('inflight-then-zero');
+  it('RELAY_DRAIN_MODE=gate: шлагбаум сразу, ждёт и in-flight counter, и PM2 children до replacement/restart', () => {
+    const r = runRollout('inflight-then-zero', { env: { RELAY_DRAIN_MODE: 'gate' } });
     try {
       expect(r.status).toBe(0);
       expect(r.curls.trim().split('\n')).toHaveLength(3);
@@ -326,4 +350,113 @@ describe('deploy-relay drain/admission gate', () => {
     }
   });
 
+});
+
+describe('deploy-relay: сначала тишина, потом короткий шлагбаум (RELAY_DRAIN_MODE=quiet)', () => {
+  it('ход идёт — ждёт тишины без шлагбаума; шлагбаум ставится, только когда тихо', () => {
+    const r = runRollout('inflight-seq', { inflightSeq: [2, 1, 0, 0] });
+    try {
+      expect({ status: r.status, stderr: r.stderr }).toEqual({ status: 0, stderr: '' });
+      expect(r.inflight).toEqual([
+        'inflight=2 gate=no', // INITIAL_INFLIGHT: релей не legacy
+        'inflight=1 gate=no', // фаза 1: ход идёт, шлагбаума нет
+        'inflight=0 gate=no', // фаза 1: тишина
+        'inflight=0 gate=yes', // фаза 2: под шлагбаумом по-прежнему тихо
+        'inflight=0 gate=yes', // health после рестарта
+      ]);
+      expect(r.restarts).toBe('restart gate=yes\n');
+      expect(r.liveServer).toContain('target');
+      expect(r.drainExists).toBe(false);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it('ход проскочил под шлагбаум и не кончился за окно — шлагбаум снят, ожидание тишины заново', () => {
+    const r = runRollout('inflight-seq', {
+      inflightSeq: [0, 0, 1, 0, 0],
+      env: { DRAIN_GATE_WINDOW_SECONDS: '0' },
+    });
+    try {
+      expect(r.status).toBe(0);
+      expect(r.inflight).toEqual([
+        'inflight=0 gate=no',
+        'inflight=0 gate=no',
+        'inflight=1 gate=yes', // проскочил; окно 0 с — шлагбаум снимается сразу
+        'inflight=0 gate=no', // снова фаза 1, шлагбаума нет
+        'inflight=0 gate=yes',
+        'inflight=0 gate=yes', // health после рестарта
+      ]);
+      expect(r.stderr).toContain('снова ждём тишины');
+      expect(r.restarts).toBe('restart gate=yes\n');
+      expect(r.liveServer).toContain('target');
+      expect(r.drainExists).toBe(false);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it('под шлагбаумом тихо не становится до конца ожидания — выход 1, замены нет, шлагбаум снят', () => {
+    const r = runRollout('inflight-by-gate', {
+      env: { INFLIGHT_OPEN: '0', INFLIGHT_GATED: '1', DRAIN_GATE_WINDOW_SECONDS: '0', DRAIN_WAIT_SECONDS: '0' },
+    });
+    try {
+      expect(r.status).toBe(1);
+      expect(r.inflight).toEqual(['inflight=0 gate=no', 'inflight=0 gate=no', 'inflight=1 gate=yes']);
+      expect(r.stderr).toContain('не дождались');
+      expect(r.restarts).toBe('');
+      expect(r.liveServer).toContain('base');
+      expect(r.drainExists).toBe(false);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it('тишины нет совсем — выход 1 без шлагбаума, без рестарта, база живая', () => {
+    const r = runRollout('inflight-by-gate', {
+      env: { INFLIGHT_OPEN: '1', INFLIGHT_GATED: '1', DRAIN_WAIT_SECONDS: '0' },
+    });
+    try {
+      expect(r.status).toBe(1);
+      expect(r.inflight).toEqual(['inflight=1 gate=no', 'inflight=1 gate=no']);
+      expect(r.stderr).toContain('не дождались');
+      expect(r.restarts).toBe('');
+      expect(r.liveServer).toContain('base');
+      expect(r.drainExists).toBe(false);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it.each([
+    ['RELAY_DRAIN_MODE', 'bogus'],
+    ['DRAIN_GATE_WINDOW_SECONDS', '9x'],
+  ])('%s=%s — выход 2 до любых изменений на релее', (name, value) => {
+    const r = runRollout('ok', { env: { [name]: value } });
+    try {
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain(name);
+      expect(r.restarts).toBe('');
+      expect(r.liveServer).toContain('base');
+      expect(r.nginxConfig).toContain('alias /tmp/agent-output/;');
+      expect(r.drainExists).toBe(false);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it('неверный RELAY_DRAIN_MODE останавливает скрипт ещё на маке — до git и ssh', () => {
+    const r = spawnSync('bash', [DEPLOY, 'no-such-base', 'no-such-target'], {
+      encoding: 'utf8',
+      env: { ...process.env, RELAY_DRAIN_MODE: 'bogus' },
+    });
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('RELAY_DRAIN_MODE');
+  });
+
+  it('режим и окно шлагбаума уезжают на релей в ssh-вызове', () => {
+    const line = source.split('\n').find((l) => l.startsWith('tar -cf - -C "$LOCAL_BUNDLE"'));
+    expect(line).toContain('RELAY_DRAIN_MODE=$RELAY_DRAIN_MODE');
+    expect(line).toContain('DRAIN_GATE_WINDOW_SECONDS=$DRAIN_GATE_WINDOW_SECONDS');
+  });
 });
