@@ -14,22 +14,27 @@ jest.mock('axios');
  * chat.service.masha-*.spec.ts — поднимать весь streamChat через настоящий
  * SQL таблицы agents незачем, гейт по балансу решается раньше любого из них.
  */
-function makeService() {
+const PAST_GATE = 'ход прошёл мимо шлагбаума нуля';
+
+function makeService(tokens = 0) {
   const pg = {
     query: jest.fn(async (sql: string) => {
-      if (/SELECT tokens FROM ai_profiles_consolidated/.test(sql)) return { rows: [{ tokens: 0 }] };
+      if (/SELECT tokens FROM ai_profiles_consolidated/.test(sql)) return { rows: [{ tokens }] };
       return { rows: [] };
     }),
   };
   const language = { resolveUserLanguage: jest.fn(async (_u: string, hint?: string) => hint || 'ru') };
+  // Блок баланса для промпта собирается сразу за шлагбаумом: дошёл ход до
+  // него — шлагбаум ход пропустил, и тест падает с понятной причиной.
+  const balanceCtx = { buildContextForPrompt: jest.fn(async () => { throw new Error(PAST_GATE); }) };
   const svc = new ChatService(
     pg as any, null as any, null as any, null as any, language as any,
-    undefined,
+    balanceCtx as any,
   );
   jest.spyOn(svc as any, 'resolveAgent').mockResolvedValue({
     id: 7, name: 'Роман', display_name: 'Роман', description: '', system_prompt: '', category: 'assistant',
   });
-  return { svc };
+  return { svc, balanceCtx };
 }
 
 function makeRes() {
@@ -86,5 +91,40 @@ describe('ChatService.streamChat — шлагбаум нуля (balance <= 0)', 
     const { res } = makeRes();
     await svc.streamChat('u1', RU_MESSAGE, '7', 'u1_7', '', res);
     expect(axios.post).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Приветствие в пустом чате (тикет 8cf1c5ae). Прежде первое сообщение со словом
+ * из правила isGreetingMsg (/привет|расскажи про себя|hello|hi$/i) проходило
+ * шлагбаум без проверки баланса: на нуле модель отвечала полностью, а списание
+ * упиралось в ноль. «Чистый лист» даёт пустой чат сколько угодно раз — выходили
+ * бесплатные ходы. Автоприветствие старых вкладок отвечает сторож
+ * legacy-greeting.ts раньше шлагбаума, так что обход больше никому не нужен.
+ */
+describe('ChatService.streamChat — приветствие в пустом чате и шлагбаум нуля', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it.each([
+    'привет, составь мне бизнес-план на год',
+    'Расскажи про себя и напиши эссе',
+    'Hello! Write me a long essay',
+    'write me a poem, hi',
+  ])('«%s» на нуле → no_tokens, релей не вызывается', async (message) => {
+    const { svc } = makeService(0);
+    const { res, writes } = makeRes();
+    await svc.streamChat('u1', message, '7', 'u1_7', '', res);
+    const end = writes.find((w) => w.type === 'end');
+    expect(end?.reason).toBe('no_tokens');
+    expect(axios.post).not.toHaveBeenCalled();
+  });
+
+  it('при положительном балансе приветствие проходит, и блок баланса получает isGreeting', async () => {
+    const { svc, balanceCtx } = makeService(5000);
+    const { res } = makeRes();
+    await svc.streamChat('u1', 'привет', '7', 'u1_7', '', res).catch(() => {});
+    expect(balanceCtx.buildContextForPrompt).toHaveBeenCalledWith(
+      'u1', 5000, expect.objectContaining({ isGreeting: true }),
+    );
   });
 });
