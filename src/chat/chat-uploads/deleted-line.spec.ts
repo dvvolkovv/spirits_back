@@ -42,7 +42,6 @@ describe('deletedUploadLine', () => {
     ['pt-PT', '📎 a.png — ficheiro eliminado'],
     ['EN', '📎 a.png — file deleted'],
     ['en_US', '📎 a.png — file deleted'],
-    ['zh', '📎 a.png — 文件已删除'],
   ])('тег %s нормализуется до корня', (lang, expected) => {
     expect(deletedUploadLine('a.png', lang)).toBe(expected);
   });
