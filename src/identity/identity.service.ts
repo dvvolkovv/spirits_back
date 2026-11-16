@@ -453,16 +453,19 @@ export class IdentityService implements OnModuleInit {
     const rowId = claimed.rows[0].id;
     // $1::text в обоих местах: internal_id — varchar, token_transactions.user_id —
     // text, без явного типа Postgres не выведет единый тип параметра.
+    // Наличие записи — по count(*), а не по min(created_at): created_at
+    // допускает NULL, и min() такую запись не видит. Если у всех записей дата
+    // пуста, отметка остаётся now() из claim выше.
     const alreadyIssued = await db.query(
       `UPDATE user_id u
-          SET welcome_bonus_at = j.first_at
-         FROM (SELECT min(created_at) AS first_at
+          SET welcome_bonus_at = COALESCE(j.first_at, u.welcome_bonus_at)
+         FROM (SELECT count(*) AS n, min(created_at) AS first_at
                  FROM token_transactions
                 WHERE user_id = $1::text
                   AND transaction_type = 'bonus'
                   AND description = $2) j
         WHERE u.internal_id = $1::text
-          AND j.first_at IS NOT NULL
+          AND j.n > 0
         RETURNING j.first_at`,
       [userId, WELCOME_BONUS_DESCRIPTION],
     );
