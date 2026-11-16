@@ -61,7 +61,7 @@ describe('IdentityService.resolveOrCreate', () => {
       { rows: [], rowCount: 0 },                                // UPDATE user_id SET state = 'active' (reactivateIfNeeded) — строка уже active
       { rows: [], rowCount: 1 },                                // INSERT ai_profiles_consolidated (ensureProfileRow)
       { rows: [], rowCount: 1 },                                // INSERT user_identities (ensureProfileAndIdentity)
-      { rows: [{ internal_id: '79030169187' }], rowCount: 1 }, // UPDATE welcome_bonus_at … RETURNING (issueWelcomeBonus) — claim взят
+      { rows: [{ id: '00000000-0000-4000-8000-000000000001' }], rowCount: 1 }, // UPDATE welcome_bonus_at … RETURNING id (issueWelcomeBonus) — claim взят
       { rows: [], rowCount: 0 },                                // сверка с журналом token_transactions (issueWelcomeBonus) — приветственного бонуса там нет
       { rows: [{ add_user_tokens: {} }], rowCount: 1 },         // SELECT add_user_tokens (issueWelcomeBonus) — результат не читается
     ]);

@@ -441,13 +441,16 @@ export class IdentityService implements OnModuleInit {
    * реферальным бонусом, и реферальная запись приветственный не заменяет.
    */
   private async issueWelcomeBonus(db: SlotQueryable, userId: string): Promise<void> {
+    // В логи — user_id.id (uuid-ключ строки), а не internal_id: у телефонного
+    // входа internal_id — это сам номер.
     const claimed = await db.query(
       `UPDATE user_id SET welcome_bonus_at = now()
        WHERE internal_id = $1 AND welcome_bonus_at IS NULL
-       RETURNING internal_id`,
+       RETURNING id`,
       [userId],
     );
     if (claimed.rows.length === 0) return;
+    const rowId = claimed.rows[0].id;
     // $1::text в обоих местах: internal_id — varchar, token_transactions.user_id —
     // text, без явного типа Postgres не выведет единый тип параметра.
     const alreadyIssued = await db.query(
@@ -460,11 +463,13 @@ export class IdentityService implements OnModuleInit {
                   AND description = $2) j
         WHERE u.internal_id = $1::text
           AND j.first_at IS NOT NULL
-        RETURNING u.welcome_bonus_at`,
+        RETURNING j.first_at`,
       [userId, WELCOME_BONUS_DESCRIPTION],
     );
     if (alreadyIssued.rows.length > 0) {
-      this.logger.log('welcome bonus already in journal → not reissued');
+      const firstAt = alreadyIssued.rows[0].first_at;
+      const first = firstAt ? new Date(firstAt).toISOString() : 'created_at NULL';
+      this.logger.log(`welcome bonus already in journal (first ${first}) → not reissued, user_id.id=${rowId}`);
       return;
     }
     // Через процедуру: стартовый бонус — тоже пополнение, и в истории он должен
@@ -473,7 +478,7 @@ export class IdentityService implements OnModuleInit {
       `SELECT add_user_tokens($1, $2, 'bonus', $3, NULL)`,
       [userId, WELCOME_BONUS, WELCOME_BONUS_DESCRIPTION],
     );
-    this.logger.log(`welcome bonus ${WELCOME_BONUS} → ${userId}`);
+    this.logger.log(`welcome bonus ${WELCOME_BONUS} → user_id.id=${rowId}`);
   }
 
   async linkMethod<P extends Provider>(userId: string, provider: P, data: ProviderData<P>): Promise<{ ok: true } | { ok: false; reason: 'conflict' | 'invalid'; conflictUserId?: string }> {
