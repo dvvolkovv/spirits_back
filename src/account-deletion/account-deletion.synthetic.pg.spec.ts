@@ -15,6 +15,7 @@ import {
   seedSyntheticFixture,
   SYNTHETIC_DELETION_PREFIX,
   SYNTHETIC_HIST_PHONE,
+  SYNTHETIC_HOST_ID,
   SYNTHETIC_MAIN_PHONE,
   SYNTHETIC_OTHER_ID,
   SYNTHETIC_RESTART_PHONE,
@@ -968,12 +969,13 @@ maybe('synthetic deletion lifecycle — полная цепочка против
       await pool.query(
         `INSERT INTO products
            (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash, host_id)
-         VALUES ($1,$2,'Synthetic Product',$3,'site','running','/product',$4,'host-shared')`,
+         VALUES ($1,$2,'Synthetic Product',$3,'site','running','/product',$4,$5)`,
         [
           productId,
           userId,
           slug,
           createHash('sha256').update(`runner-${productId}`).digest('hex'),
+          SYNTHETIC_HOST_ID,
         ],
       );
       await pool.query(

@@ -19,10 +19,12 @@
  *
  * Данные — только синтетические фикстуры (src/account-deletion/
  * account-deletion.synthetic.ts): телефоны последовательности 7999000010x,
- * ресурсы с префиксом synthetic-deletion-. Внешние границы (MinIO-транспорт,
+ * ресурсы с префиксом synthetic-deletion- (включая свой хост продуктов,
+ * закрытый для новых). Внешние границы (MinIO-транспорт,
  * LiveKit, Attendee, ElevenLabs, календарь/OAuth-провайдеры, Telegram,
  * Redis, Neo4j, host-агент) — doubles со strict tri-state; никаких реальных
- * внешних вызовов. Уборка фикстур — в finally по deletion_id/userId.
+ * внешних вызовов. Уборка фикстур — в finally по deletion_id/userId и по
+ * id синтетического хоста.
  *
  * stdout — только JSON-счётчики (без userId/deletionId/телефонов) и маркер
  * SYNTHETIC_TEST_OK. Ошибки — только сообщение и код (scriptErrorText).

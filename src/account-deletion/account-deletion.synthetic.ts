@@ -109,6 +109,16 @@ export const SYNTHETIC_OTHER_ID = 'u-synthetic-other';
 export const SYNTHETIC_HIST_PHONE = '79990000107';
 export const SYNTHETIC_RESTART_PHONE = '79990000108';
 
+/**
+ * Свой хост продуктов synthetic. Не общий 'host-shared' из product pg spec:
+ * synthetic идёт против живой базы стенда, и общий хост с audience
+ * 'clients' и accepts_new по умолчанию true после прогона оставался бы в
+ * реестре — его выбирал бы pickForNewProduct для клиентских продуктов.
+ * Заводится закрытым для новых (accepts_new = false) и убирается в
+ * cleanupSyntheticFixture вместе со всеми продуктами на нём.
+ */
+export const SYNTHETIC_HOST_ID = `${SYNTHETIC_DELETION_PREFIX}host`;
+
 export class SyntheticGateError extends Error {
   constructor() {
     super('synthetic_gates_not_met');
@@ -736,7 +746,8 @@ export async function historicalSnapshot(
 /**
  * Полный посев синтетического аккаунта: по ресурсу на каждый домен,
  * чьи purge/stop-задачи должны реально исполниться. Все ключи и тексты —
- * с префиксом synthetic-deletion- (или синтетические UUID/телефоны).
+ * с префиксом synthetic-deletion- (или синтетические UUID/телефоны),
+ * включая хост продуктов SYNTHETIC_HOST_ID.
  */
 export async function seedSyntheticFixture(stack: SyntheticStack): Promise<SyntheticFixture> {
   const { pg } = stack;
@@ -902,19 +913,24 @@ export async function seedSyntheticFixture(stack: SyntheticStack): Promise<Synth
     [main, `${SYNTHETIC_DELETION_PREFIX}hash`],
   );
 
-  // Продукт на общем хосте (форма фикстуры — из product pg spec).
+  // Продукт на СВОЁМ синтетическом хосте (форма строки хоста — из product pg
+  // spec, id и хеш токена — свои). accepts_new = false: продукт посева
+  // ставится на хост явным host_id, а pickForNewProduct (единственный
+  // читатель accepts_new) на пути synthetic не вызывается — зато живой API
+  // стенда, который смотрит в ту же базу, пока идёт прогон, не выберет
+  // фиктивную машину для чужого нового продукта.
   await pg.query(
-    `INSERT INTO product_hosts (id, ssh_target, public_ip, domain_suffix, agent_token_hash, capacity, audience)
-     VALUES ('host-shared','root@10.50.0.1','10.50.0.1','c.linkeon.io',$1,20,'clients')
+    `INSERT INTO product_hosts (id, ssh_target, public_ip, domain_suffix, agent_token_hash, capacity, audience, accepts_new)
+     VALUES ($1,'root@10.50.0.1','10.50.0.1','c.linkeon.io',$2,20,'clients',false)
      ON CONFLICT (id) DO NOTHING`,
-    [sha256('host-shared-agent-fixture')],
+    [SYNTHETIC_HOST_ID, sha256(`${SYNTHETIC_DELETION_PREFIX}host-agent-fixture`)],
   );
   const productId = randomUUID();
   await pg.query(
     `INSERT INTO products
        (id, user_id, name, slug, kind, status, checkout_path, runner_token_hash, host_id)
-     VALUES ($1,$2,'Synthetic Product',$3,'site','running','/product',$4,'host-shared')`,
-    [productId, main, `${SYNTHETIC_DELETION_PREFIX}product`, sha256(`runner-${productId}`)],
+     VALUES ($1,$2,'Synthetic Product',$3,'site','running','/product',$4,$5)`,
+    [productId, main, `${SYNTHETIC_DELETION_PREFIX}product`, sha256(`runner-${productId}`), SYNTHETIC_HOST_ID],
   );
 
   // Задачи, тикеты, пиры.
@@ -1116,10 +1132,12 @@ export async function reseedConsumedResources(
 }
 
 /**
- * Уборка фикстур по deletionId/userId — в CLI вызывается из finally.
- * Порядок: сначала задачи удаления, затем дочерние таблицы, затем
- * аккаунты. Каждая группа независима — свой try/catch, чтобы одна несуществующая
- * таблица не оставляла мусор во всех остальных.
+ * Уборка фикстур по deletionId/userId и по SYNTHETIC_HOST_ID — в CLI
+ * вызывается из finally. Порядок: сначала задачи удаления, затем дочерние
+ * таблицы (продукты — и по user_id, и все продукты синтетического хоста;
+ * следом сам хост), затем аккаунты. Каждая группа независима — свой
+ * try/catch, чтобы одна несуществующая таблица не оставляла мусор во всех
+ * остальных.
  */
 export async function cleanupSyntheticFixture(
   stack: SyntheticStack,
@@ -1153,8 +1171,24 @@ export async function cleanupSyntheticFixture(
     [`DELETE FROM trip_calendars WHERE user_id = ANY($1)`, [userIds]],
     [`DELETE FROM linkeon_tasks WHERE user_id = ANY($1)`, [userIds]],
     [`DELETE FROM day_framing WHERE user_id = ANY($1)`, [userIds]],
+    // Журнал product_actions ссылается на products с ON DELETE SET NULL:
+    // после удаления продукта его строки уже не найти по product_id. Поэтому
+    // журнал — ДО products: по user_id синтетических аккаунтов и по
+    // продуктам синтетического хоста.
+    [`DELETE FROM product_actions
+       WHERE user_id = ANY($1)
+          OR product_id IN (SELECT id FROM products WHERE user_id = ANY($1) OR host_id = $2)`, [userIds, SYNTHETIC_HOST_ID]],
     [`DELETE FROM product_provision_jobs WHERE product_id IN (SELECT id FROM products WHERE user_id = ANY($1))`, [userIds]],
     [`DELETE FROM products WHERE user_id = ANY($1)`, [userIds]],
+    // Синтетический хост: сначала ВСЕ продукты на нём, независимо от
+    // user_id (products.host_id → product_hosts без ON DELETE — хост с
+    // продуктом не удалить). product_turns и product_domains уходят
+    // каскадом от products, задания — явно, как и выше. Затем отметка
+    // агента (CASCADE от хоста, убираем явно) и сам хост.
+    [`DELETE FROM product_provision_jobs WHERE product_id IN (SELECT id FROM products WHERE host_id = $1)`, [SYNTHETIC_HOST_ID]],
+    [`DELETE FROM products WHERE host_id = $1`, [SYNTHETIC_HOST_ID]],
+    [`DELETE FROM product_host_agent WHERE host_id = $1`, [SYNTHETIC_HOST_ID]],
+    [`DELETE FROM product_hosts WHERE id = $1`, [SYNTHETIC_HOST_ID]],
     [`DELETE FROM task_events WHERE task_id IN (SELECT id FROM tasks WHERE user_id = ANY($1))`, [userIds]],
     [`DELETE FROM tasks WHERE user_id = ANY($1)`, [userIds]],
     [`DELETE FROM support_messages WHERE ticket_id IN (SELECT id FROM support_tickets WHERE user_id = ANY($1))`, [userIds]],
