@@ -59,6 +59,10 @@ function runRollout(health, options = {}) {
   if (options.inflightSeq) {
     write(path.join(work, 'inflight-seq'), options.inflightSeq.map((n) => `${n}\n`).join(''));
   }
+  // Сценарий children-seq: число процессов CLI у file-agent по очереди, по одному на вызов ps --ppid.
+  if (options.childrenSeq) {
+    write(path.join(work, 'children-seq'), options.childrenSeq.map((n) => `${n}\n`).join(''));
+  }
 
   executable(path.join(bin, 'sudo'), '#!/usr/bin/env bash\nexec "$@"\n');
   executable(path.join(bin, 'nginx'), `#!/usr/bin/env bash
@@ -78,7 +82,14 @@ exit 2
 `);
 
   executable(path.join(bin, 'pm2'), `#!/usr/bin/env bash
-if [[ "$1" == pid ]]; then echo 4242; exit 0; fi
+if [[ "$1" == pid ]]; then
+  # PM2_PID_AFTER_FIRST: PM2 перезапустил file-agent во время ожидания —
+  # первый запрос pid видит прежний процесс, следующие — новый.
+  if [[ -n "$PM2_PID_AFTER_FIRST" && -e "$WORK/pm2-pid-asked" ]]; then echo "$PM2_PID_AFTER_FIRST"; exit 0; fi
+  touch "$WORK/pm2-pid-asked"
+  echo 4242
+  exit 0
+fi
 if [[ "$1" == restart ]]; then
   if [[ -e "$DRAIN_FILE" ]]; then gate=yes; else gate=no; fi
   echo "restart gate=$gate" >> "$WORK/restarts.log"
@@ -105,6 +116,18 @@ if [[ "$1" == -eo ]]; then
 fi
 if [[ -e "$DRAIN_FILE" ]]; then gate=yes; else gate=no; fi
 echo "ps gate=$gate" >> "$WORK/ps.log"
+if [[ -f "$WORK/children-seq" ]]; then
+  c=$(head -n 1 "$WORK/children-seq" 2>/dev/null || true)
+  if [[ -n "$c" ]]; then
+    tail -n +2 "$WORK/children-seq" > "$WORK/children-seq.next"
+    mv "$WORK/children-seq.next" "$WORK/children-seq"
+  else
+    c=0
+  fi
+  # В общий журнал с inflight — чтобы видеть порядок проверок; $2 — pid из ps --ppid.
+  echo "children=$c ppid=$2 gate=$gate" >> "$WORK/inflight.log"
+  for ((i = 0; i < c; i++)); do echo "$((9000 + i))"; done
+fi
 exit 0
 `);
   executable(path.join(bin, 'git'), `#!/usr/bin/env bash
@@ -128,6 +151,14 @@ fi
 if [[ -e "$DRAIN_FILE" ]]; then gate=yes; else gate=no; fi
 if [[ -e "$WORK/nginx-gate-on" ]]; then nginx=on; else nginx=off; fi
 echo "curl restart=$restarts gate=$gate nginx=$nginx" >> "$WORK/curl.log"
+# FOREIGN_MARKER_AT=n: на n-м вызове health кто-то вручную ставит свой
+# marker (аварийный drain) — уже после того, как gate этого вызова посчитан.
+if [[ -n "$FOREIGN_MARKER_AT" ]]; then
+  hc=$(cat "$WORK/health-calls" 2>/dev/null || echo 0)
+  hc=$((hc + 1))
+  echo "$hc" > "$WORK/health-calls"
+  if [[ "$hc" -eq "$FOREIGN_MARKER_AT" ]]; then printf 'foreign\n' > "$DRAIN_FILE"; fi
+fi
 case "${health}" in
   inflight-then-zero)
     calls=$(cat "$WORK/inflight-calls" 2>/dev/null || echo 0)
@@ -142,14 +173,6 @@ case "${health}" in
     if [[ "$restarts" -eq 0 ]]; then echo '{"status":"ok","inflight":0}'; exit 0; fi
     exit 1 ;;
   inflight-seq)
-    # FOREIGN_MARKER_AT=n: на n-м вызове health кто-то вручную ставит свой
-    # marker (аварийный drain) — уже после того, как gate этого вызова посчитан.
-    if [[ -n "$FOREIGN_MARKER_AT" ]]; then
-      hc=$(cat "$WORK/health-calls" 2>/dev/null || echo 0)
-      hc=$((hc + 1))
-      echo "$hc" > "$WORK/health-calls"
-      if [[ "$hc" -eq "$FOREIGN_MARKER_AT" ]]; then printf 'foreign\n' > "$DRAIN_FILE"; fi
-    fi
     n=$(head -n 1 "$WORK/inflight-seq" 2>/dev/null || true)
     if [[ -n "$n" ]]; then
       tail -n +2 "$WORK/inflight-seq" > "$WORK/inflight-seq.next"
@@ -158,6 +181,8 @@ case "${health}" in
       n=0
     fi
     echo "inflight=$n gate=$gate" >> "$WORK/inflight.log"
+    # Элемент fail — health в этот раз не ответил.
+    if [[ "$n" == fail ]]; then exit 1; fi
     printf '{"status":"ok","inflight":%s}' "$n"
     exit 0 ;;
   inflight-by-gate)
@@ -461,6 +486,9 @@ describe('deploy-relay: сначала тишина, потом короткий
   it.each([
     ['RELAY_DRAIN_MODE', 'bogus'],
     ['DRAIN_GATE_WINDOW_SECONDS', '9x'],
+    // Ведущий ноль bash в (( )) читает как восьмеричное: 090 — ошибка, 010 — 8 с.
+    ['DRAIN_GATE_WINDOW_SECONDS', '090'],
+    ['DRAIN_WAIT_SECONDS', 'x5'],
   ])('%s=%s — выход 2 до любых изменений на релее', (name, value) => {
     const r = runRollout('ok', { env: { [name]: value } });
     try {
@@ -488,5 +516,115 @@ describe('deploy-relay: сначала тишина, потом короткий
     const line = source.split('\n').find((l) => l.startsWith('tar -cf - -C "$LOCAL_BUNDLE"'));
     expect(line).toContain('RELAY_DRAIN_MODE=$RELAY_DRAIN_MODE');
     expect(line).toContain('DRAIN_GATE_WINDOW_SECONDS=$DRAIN_GATE_WINDOW_SECONDS');
+  });
+
+  it('процессы CLI ещё идут — шлагбаума нет; он ставится, только когда их не осталось', () => {
+    const r = runRollout('inflight-seq', { childrenSeq: [1, 1, 0] });
+    try {
+      expect({ status: r.status, stderr: r.stderr }).toEqual({ status: 0, stderr: '' });
+      expect(r.inflight).toEqual([
+        'inflight=0 gate=no', // INITIAL_INFLIGHT
+        'children=1 ppid=4242 gate=no', // фаза 1: процесс CLI идёт, шлагбаума нет
+        'children=1 ppid=4242 gate=no',
+        'children=0 ppid=4242 gate=no', // фаза 1: процессов нет...
+        'inflight=0 gate=no', // ...и принятых запросов нет — тихо
+        'children=0 ppid=4242 gate=yes', // фаза 2: под шлагбаумом по-прежнему тихо
+        'inflight=0 gate=yes',
+        'inflight=0 gate=yes', // health после рестарта
+      ]);
+      expect(r.restarts).toBe('restart gate=yes\n');
+      expect(r.liveServer).toContain('target');
+      expect(r.drainExists).toBe(false);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it('PM2 перезапустил file-agent во время ожидания — процессы CLI ищутся у нового pid', () => {
+    const r = runRollout('inflight-seq', { childrenSeq: [1, 0], env: { PM2_PID_AFTER_FIRST: '4343' } });
+    try {
+      expect(r.status).toBe(0);
+      expect(r.inflight.filter((l) => l.startsWith('children='))).toEqual([
+        'children=1 ppid=4343 gate=no',
+        'children=0 ppid=4343 gate=no',
+        'children=0 ppid=4343 gate=yes',
+      ]);
+      expect(r.restarts).toBe('restart gate=yes\n');
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it('health не ответил во время ожидания — это не тишина: шлагбаума в этот момент нет, выкат доходит до конца', () => {
+    const r = runRollout('inflight-seq', { inflightSeq: [0, 'fail', 0, 0] });
+    try {
+      expect(r.status).toBe(0);
+      expect(r.inflight).toEqual([
+        'inflight=0 gate=no', // INITIAL_INFLIGHT
+        'inflight=fail gate=no', // фаза 1: health не ответил — не тихо
+        'inflight=0 gate=no', // фаза 1: тихо
+        'inflight=0 gate=yes', // фаза 2
+        'inflight=0 gate=yes', // health после рестарта
+      ]);
+      expect(r.stderr).toContain('health релея не ответил');
+      expect(r.restarts).toBe('restart gate=yes\n');
+      expect(r.liveServer).toContain('target');
+      expect(r.drainExists).toBe(false);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it('ход проскочил под шлагбаум и кончился внутри окна — одна сессия шлагбаума, один рестарт', () => {
+    const r = runRollout('inflight-seq', { inflightSeq: [0, 0, 1, 1, 0] });
+    try {
+      expect({ status: r.status, stderr: r.stderr }).toEqual({ status: 0, stderr: '' });
+      expect(r.inflight).toEqual([
+        'inflight=0 gate=no',
+        'inflight=0 gate=no', // фаза 1: тихо
+        'inflight=1 gate=yes', // проскочил; окно по умолчанию — ждём под шлагбаумом
+        'inflight=1 gate=yes',
+        'inflight=0 gate=yes', // закончился внутри окна
+        'inflight=0 gate=yes', // health после рестарта
+      ]);
+      expect(r.restarts).toBe('restart gate=yes\n');
+      expect(r.liveServer).toContain('target');
+      expect(r.drainExists).toBe(false);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it('legacy: чужой marker к моменту шлагбаума — выход 1, marker не тронут, nginx не закрыт', () => {
+    // Первый вызов health — INITIAL_INFLIGHT, уже после проверки marker в начале.
+    const r = runRollout('legacy', { env: { FOREIGN_MARKER_AT: '1' } });
+    try {
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain('marker');
+      expect(r.drainExists).toBe(true);
+      expect(fs.readFileSync(r.drainFile, 'utf8').trim()).toBe('foreign');
+      expect(r.nginxConfig).not.toContain('LINKEON-RELAY-DRAIN');
+      expect(r.restarts).toBe('');
+      expect(r.liveServer).toContain('base');
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it.each([
+    ['DRAIN_GATE_WINDOW_SECONDS', '090'],
+    ['DRAIN_WAIT_SECONDS', 'x5'],
+  ])('%s=%s отвергается ещё на маке — выход 2 до git и ssh', (name, value) => {
+    const r = spawnSync('bash', [DEPLOY, 'no-such-base', 'no-such-target'], {
+      encoding: 'utf8',
+      env: { ...process.env, [name]: value },
+    });
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain(name);
+  });
+
+  it('окно шлагбаума по умолчанию — 45 с, и на маке, и на релее', () => {
+    const fallback = 'DRAIN_GATE_WINDOW_SECONDS=${DRAIN_GATE_WINDOW_SECONDS:-45}';
+    expect(source.split(fallback).length - 1).toBe(2);
   });
 });
