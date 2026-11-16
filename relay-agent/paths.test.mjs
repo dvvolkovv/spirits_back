@@ -9,13 +9,14 @@ import assert from "node:assert/strict";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { randomUUID } from "crypto";
+import { randomUUID, createHash } from "crypto";
 import {
   sessionFsKey,
   turnFsKey,
   legacyTurnFsKey,
   uploadFileName,
   fallbackFileName,
+  uniqueUploadPath,
   sessionOutputDir,
   ensureSessionDirs,
   ensureListingGuard,
@@ -269,4 +270,61 @@ test("ensureSessionDirs: не удаляет scratch независимо от �
   assert.equal(fs.readFileSync(oldMarker, "utf8"), oldMarker, "автоматической очистки scratch на этом этапе нет");
   assert.equal(fs.statSync(path.join(scratchRoot, oldKey)).mode & 0o777, 0o700);
   assert.equal(fs.readFileSync(siblingMarker, "utf8"), siblingMarker);
+});
+
+test("кириллические имена одной длины больше не совпадают", () => {
+  const a = uploadFileName("смета.xlsx", FS_KEY);
+  const b = uploadFileName("отчет.xlsx", FS_KEY);
+  assert.notEqual(a, b);
+  const hash = createHash("sha256").update("смета.xlsx").digest("hex").slice(0, 8);
+  assert.equal(a, `${FS_KEY}_${"_".repeat(5)}-${hash}.xlsx`);
+  assert.equal(tryCreate(a), null);
+  assert.equal(tryCreate(b), null);
+});
+
+test("одно и то же имя — один и тот же результат", () => {
+  assert.equal(uploadFileName("смета.xlsx", FS_KEY), uploadFileName("смета.xlsx", FS_KEY));
+});
+
+test("имя без потерь остаётся как было — без хеша", () => {
+  assert.equal(uploadFileName("egrul-2026_v2.pdf", FS_KEY), `${FS_KEY}_egrul-2026_v2.pdf`);
+});
+
+test("обрезанное длинное ASCII-имя тоже получает хеш: общее начало не склеивает файлы", () => {
+  const a = uploadFileName("a".repeat(200) + "1.pdf", FS_KEY);
+  const b = uploadFileName("a".repeat(200) + "2.pdf", FS_KEY);
+  assert.notEqual(a, b);
+  assert.match(a, /-[0-9a-f]{8}\.pdf$/);
+});
+
+test("длинное кириллическое имя с хешем укладывается в прежний бюджет и сохраняет расширение", () => {
+  const built = uploadFileName("Выписка".repeat(60) + ".pdf", sessionFsKey("9".repeat(300), "x"));
+  assert.ok(Buffer.byteLength(built) <= 241, String(Buffer.byteLength(built)));
+  assert.match(built, /-[0-9a-f]{8}\.pdf$/);
+  assert.equal(tryCreate(built), null);
+});
+
+test("uniqueUploadPath: свободное имя — как есть", () => {
+  assert.equal(uniqueUploadPath("/u", "k_a.pdf", () => false), path.join("/u", "k_a.pdf"));
+});
+
+test("uniqueUploadPath: занятое — суффикс -2, -3… перед расширением", () => {
+  const taken = new Set([path.join("/u", "k_a.pdf"), path.join("/u", "k_a-2.pdf")]);
+  assert.equal(uniqueUploadPath("/u", "k_a.pdf", (p) => taken.has(p)), path.join("/u", "k_a-3.pdf"));
+});
+
+test("uniqueUploadPath: заняты -2…-99 — 8 hex из uuid, префикс ключа на месте", () => {
+  const built = uniqueUploadPath("/u", "k_a.pdf", (p) => !/-[0-9a-f]{8}\.pdf$/.test(p), () => "0123abcd");
+  assert.equal(built, path.join("/u", "k_a-0123abcd.pdf"));
+});
+
+test("uniqueUploadPath: занято всё — ошибка, а не тихая перезапись", () => {
+  assert.throws(() => uniqueUploadPath("/u", "k_a.pdf", () => true, () => "0123abcd"));
+});
+
+test("самое длинное имя с запасным суффиксом укладывается в NAME_MAX", () => {
+  const name = uploadFileName("Выписка".repeat(60) + ".pdf", sessionFsKey("9".repeat(300), "x"));
+  const built = path.basename(uniqueUploadPath(DIR, name, (p) => !/-0123abcd\.pdf$/.test(p), () => "0123abcd"));
+  assert.ok(Buffer.byteLength(built) <= 255);
+  assert.equal(tryCreate(built), null);
 });
