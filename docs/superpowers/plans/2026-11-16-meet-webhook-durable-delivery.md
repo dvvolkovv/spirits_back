@@ -10,6 +10,34 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-16-meet-webhook-durable-delivery-design.md`
 
+## Статус и обязательные уточнения после reviews
+
+- Task 1 завершён и принят на `6b575020`; Task 2 завершён и принят на `6d3858a1`.
+  Их красные/зелёные snippets ниже — история TDD; фактический итог находится в текущем
+  `src/meeting/meet-webhook-inbox.store.ts` и содержит дополнительные меры качества.
+- `ClaimedInboxEvent.id` — **string**, потому что PostgreSQL BIGSERIAL/int8 возвращается из `pg`
+  строкой. Все mocks и ожидания следующих задач используют строковые ID.
+- Все завершения claim ограждены генерацией `attempts`. Итоговые сигнатуры:
+
+```ts
+markDelivered(id: string, claimAttempts: number): Promise<boolean>;
+markDiscarded(id: string, claimAttempts: number, reason: string): Promise<boolean>;
+markFailed(
+  id: string,
+  claimAttempts: number,
+  error: string,
+  nextRetryAt: Date,
+): Promise<'pending' | 'dead' | null>;
+```
+
+`false`/`null` означает, что строка уже не принадлежит этой генерации claim; DeliveryService не
+должен представлять такой исход как успешный переход или новый `dead`.
+
+- Stale `processing` с `attempts >= 10` перед очередным claim переводится в `dead` с технической
+  причиной lease expiry; попытка 11 не выдаётся. Stale строки с меньшим числом попыток reclaimable.
+- Миграция дополнительно содержит non-partial `call_id` index для FK cascade и partial terminal
+  `updated_at` index для retention. Retention counts используют `rowCount`, не `RETURNING` всех ID.
+
 ---
 
 ## Рабочие правила и CI
@@ -230,7 +258,7 @@ export interface NewInboxEvent {
 }
 
 export interface ClaimedInboxEvent {
-  id: number;
+  id: string; // BIGSERIAL/int8 приходит из pg строкой
   callId: string;
   trigger: string;
   message: Record<string, unknown>;
@@ -365,7 +393,7 @@ run_ci src/meeting/meet-webhook-inbox.pg.spec.ts
   it('success и inactive переводят processing в delivered/discarded', async () => {
     await store.enqueue(event({ idempotencyKey: 'deliver' }));
     await store.enqueue(event({ idempotencyKey: 'discard' }));
-    const claimed = (await store.claimBatch()).sort((a, b) => a.id - b.id);
+    const claimed = (await store.claimBatch()).sort((a, b) => Number(a.id) - Number(b.id));
     await store.markDelivered(claimed[0].id);
     await store.markDiscarded(claimed[1].id, 'call inactive');
     const r = await pool.query(
@@ -692,7 +720,7 @@ Controller и DeliveryService коммитятся вместе после green
 import { MeetingWebhookDeliveryService, retryDelayMs } from './meet-webhook-delivery.service';
 
 const EVENT = {
-  id: 1,
+  id: '1',
   callId: 'c1',
   trigger: 'bot.state_change',
   message: { v: 1, type: 'meet_bot_state', state: 'joined', fatal: false },
@@ -708,8 +736,8 @@ describe('MeetingWebhookDeliveryService', () => {
   beforeEach(() => {
     inbox = {
       claimBatch: jest.fn().mockResolvedValue([]),
-      markDelivered: jest.fn().mockResolvedValue(undefined),
-      markDiscarded: jest.fn().mockResolvedValue(undefined),
+      markDelivered: jest.fn().mockResolvedValue(true),
+      markDiscarded: jest.fn().mockResolvedValue(true),
       markFailed: jest.fn().mockResolvedValue('pending'),
       cleanup: jest.fn().mockResolvedValue({ completed: 0, dead: 0 }),
     };
@@ -727,7 +755,7 @@ describe('MeetingWebhookDeliveryService', () => {
     inbox.claimBatch.mockResolvedValue([EVENT]);
     await service.pump();
     expect(livekit.send).toHaveBeenCalledWith('meet_c1', EVENT.message);
-    expect(inbox.markDelivered).toHaveBeenCalledWith(1);
+    expect(inbox.markDelivered).toHaveBeenCalledWith('1', 1);
     expect(inbox.markFailed).not.toHaveBeenCalled();
   });
 
@@ -735,7 +763,7 @@ describe('MeetingWebhookDeliveryService', () => {
     inbox.claimBatch.mockResolvedValue([EVENT]);
     calls.isActive.mockReturnValue(false);
     await service.pump();
-    expect(inbox.markDiscarded).toHaveBeenCalledWith(1, 'call missing or inactive');
+    expect(inbox.markDiscarded).toHaveBeenCalledWith('1', 1, 'call missing or inactive');
     expect(livekit.send).not.toHaveBeenCalled();
   });
 
@@ -745,9 +773,9 @@ describe('MeetingWebhookDeliveryService', () => {
       .mockResolvedValueOnce([{ ...EVENT, attempts: 2 }]);
     livekit.send.mockRejectedValueOnce(new Error('room unavailable')).mockResolvedValueOnce(undefined);
     await service.pump();
-    expect(inbox.markFailed).toHaveBeenCalledWith(1, 1, 'room unavailable', expect.any(Date));
+    expect(inbox.markFailed).toHaveBeenCalledWith('1', 1, 'room unavailable', expect.any(Date));
     await service.pump();
-    expect(inbox.markDelivered).toHaveBeenCalledWith(1);
+    expect(inbox.markDelivered).toHaveBeenCalledWith('1', 2);
     expect(livekit.send).toHaveBeenCalledTimes(2);
   });
 
@@ -756,7 +784,7 @@ describe('MeetingWebhookDeliveryService', () => {
     calls.load.mockRejectedValue(new Error('postgres down'));
     inbox.markFailed.mockResolvedValue('dead');
     await service.pump();
-    expect(inbox.markFailed).toHaveBeenCalledWith(1, 10, 'postgres down', expect.any(Date));
+    expect(inbox.markFailed).toHaveBeenCalledWith('1', 10, 'postgres down', expect.any(Date));
     expect(livekit.send).not.toHaveBeenCalled();
   });
 
@@ -767,7 +795,7 @@ describe('MeetingWebhookDeliveryService', () => {
     const pumping = service.pump();
     await jest.advanceTimersByTimeAsync(10_000);
     await pumping;
-    expect(inbox.markFailed).toHaveBeenCalledWith(1, 1, 'livekit send timeout', expect.any(Date));
+    expect(inbox.markFailed).toHaveBeenCalledWith('1', 1, 'livekit send timeout', expect.any(Date));
   });
 
   it('падение после send, но до delivered, оставляет событие на повтор', async () => {
@@ -775,7 +803,7 @@ describe('MeetingWebhookDeliveryService', () => {
     inbox.markDelivered.mockRejectedValue(new Error('db died after send'));
     await service.pump();
     expect(livekit.send).toHaveBeenCalledTimes(1);
-    expect(inbox.markFailed).toHaveBeenCalledWith(1, 1, 'db died after send', expect.any(Date));
+    expect(inbox.markFailed).toHaveBeenCalledWith('1', 1, 'db died after send', expect.any(Date));
   });
 
   it('reentrant pump не захватывает вторую партию параллельно', async () => {
@@ -879,11 +907,15 @@ export class MeetingWebhookDeliveryService {
     try {
       const call = await this.calls.load(event.callId);
       if (!call || !this.calls.isActive(call)) {
-        await this.inbox.markDiscarded(event.id, 'call missing or inactive');
+        const discarded = await this.inbox.markDiscarded(
+          event.id, event.attempts, 'call missing or inactive',
+        );
+        if (!discarded) this.logger.debug(`[meet] stale discard ignored event=${event.id}`);
         return;
       }
       await this.sendWithTimeout(call.room_name, event.message);
-      await this.inbox.markDelivered(event.id);
+      const delivered = await this.inbox.markDelivered(event.id, event.attempts);
+      if (!delivered) this.logger.warn(`[meet] stale delivery completion ignored event=${event.id}`);
     } catch (e: any) {
       const error = String(e?.message ?? e).slice(0, 500);
       const delayMs = retryDelayMs(event.attempts);
@@ -894,6 +926,10 @@ export class MeetingWebhookDeliveryService {
           error,
           new Date(Date.now() + delayMs),
         );
+        if (status === null) {
+          this.logger.debug(`[meet] stale failure ignored event=${event.id} attempt=${event.attempts}`);
+          return;
+        }
         const log = `[meet] inbox event=${event.id} attempt=${event.attempts} status=${status} nextRetryMs=${delayMs}: ${error}`;
         if (status === 'dead') this.logger.error(log);
         else this.logger.warn(log);

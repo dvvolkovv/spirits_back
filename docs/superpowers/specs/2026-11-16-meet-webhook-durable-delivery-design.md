@@ -123,8 +123,10 @@ CREATE TABLE IF NOT EXISTS meeting_webhook_events (
 Индексы:
 
 - уникальный `(call_id, idempotency_key) WHERE idempotency_key IS NOT NULL`;
+- non-partial `(call_id)` для эффективного FK cascade, включая строки с NULL key;
 - due-выборка `(next_retry_at, created_at, id) WHERE status = 'pending'`;
-- stale-восстановление `(updated_at) WHERE status = 'processing'`.
+- stale-восстановление `(updated_at) WHERE status = 'processing'`;
+- retention `(updated_at) WHERE status IN ('delivered', 'discarded', 'dead')`.
 
 `ON CONFLICT` использует тот же частичный уникальный индекс. Несколько событий с `NULL` вместо
 ключа не сливаются: Attendee в таком случае не дал основания считать их одинаковыми.
@@ -168,9 +170,16 @@ pending ──claim──> processing ──success──> delivered
 processing старше lease 60 с ──новый claim──> processing (attempts + 1)
 ```
 
+- Перед claim stale `processing` с `attempts >= 10` атомарно становится `dead` с технической
+  причиной lease expiry; попытка 11 не выдаётся. Это закрывает и повторные падения после финальной
+  попытки, когда `markFailed` уже не выполняется.
 - Claim — атомарный conditional `UPDATE ... RETURNING`: захватывает только due `pending` либо
-  `processing`, чей `updated_at` старше 60 секунд; увеличивает `attempts`, ставит `processing` и
-  новый `updated_at`. Два доставщика не могут успешно захватить одну попытку.
+  `processing` с `attempts < 10`, чей `updated_at` старше 60 секунд; увеличивает `attempts`, ставит
+  `processing` и новый `updated_at`. Два доставщика не могут успешно захватить одну попытку.
+- Каждое завершение ограждено генерацией claim: условия включают `id`, `status='processing'` и
+  `attempts=claimAttempts`. Старый worker после recovery получает `false`/`null` и не может
+  перезаписать состояние нового worker; успешные `delivered`/`discarded` возвращают `true`, а
+  `markFailed` возвращает фактический `pending`/`dead` либо `null` при отсутствии перехода.
 - Перед отправкой звонок загружается заново. Ошибка загрузки — retryable; успешно полученные
   `null`/неактивный статус — `discarded`.
 - Успешный `LiveKitClient.send` → `delivered`, `delivered_at = now()`, `last_error = NULL`.
@@ -227,7 +236,9 @@ Telegram-алерты деградации встречи, dashboard и отде
 - Ошибка INSERT даёт `503`; `23503` после успешной предварительной загрузки даёт `{ok:true}`.
 - LiveKit success → `delivered`; временная ошибка → запланированный retry; десятая ошибка → `dead`.
 - Ошибка загрузки звонка в dispatcher → retry; неактивный звонок → `discarded`.
-- Зависший `processing` снова доставляется после lease.
+- Зависший `processing` снова доставляется после lease; stale попытка 10 становится `dead`, а не 11.
+- Старый worker после recovery не может завершить или провалить claim нового worker: fencing по
+  `attempts` возвращает `false`/`null`, состояние новой генерации остаётся неизменным.
 - Таймаут send не оставляет строку навсегда в `processing`.
 - Смодированное падение после send, но до отметки `delivered`, приводит к повторной отправке и не
   нарушает состояние очереди.
@@ -244,7 +255,8 @@ Telegram-алерты деградации встречи, dashboard и отде
 1. конкурентные вставки одного ключа создают ровно одну строку;
 2. два `NULL`-ключа создают две строки;
 3. конкурентные claim не возвращают одну попытку двум доставщикам;
-4. stale `processing` восстанавливается, свежий — нет;
+4. stale `processing` восстанавливается, свежий — нет; старая генерация claim ограждена от новой,
+   а истёкшая попытка 10 переходит в `dead` без выдачи попытки 11;
 5. backoff, `delivered`, `discarded`, `dead` и retention меняют строки по описанным правилам;
 6. удаление `voice_calls` каскадно удаляет связанные inbox-записи;
 7. повторный и параллельный запуски миграции не дублируют запись и не выполняют повторный DDL уже
