@@ -14,6 +14,10 @@
  * фабрика запроса, а не готовый запрос. Ожидание дробится на шаги по секунде:
  * если за это время пришло новое сообщение той же сессии (shouldStop), ход
  * сдаётся как перебитый (superseded), а не висит до конца бюджета.
+ *
+ * Допущение: между бэком и релеем нет HTTP-посредника, кроме nginx самого
+ * релея; буферизующий прокси или CDN мог бы вернуть 502 уже после того, как
+ * релей начал ход, и тогда повтор стал бы небезопасным.
  */
 export const RELAY_DRAIN_DELAYS_MS: readonly number[] = [2000, 4000, 8000, 15000, 30000, 30000, 30000, 30000];
 
@@ -24,11 +28,22 @@ export class RelayDrainingError extends Error {
   }
 }
 
-export function isRelayDrainingError(err: any): boolean {
-  const status = err?.response?.status;
-  return status === 502 || status === 503 || err?.code === 'ECONNREFUSED';
+/**
+ * Сырой отказ транспорта (ошибка axios или errno), после которого повтор
+ * безопасен. Экземпляр RelayDrainingError эта функция НЕ распознаёт — для него
+ * `instanceof RelayDrainingError`.
+ */
+export function isRelayDrainingError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { response?: { status?: unknown }; code?: unknown };
+  const status = e.response?.status;
+  return status === 502 || status === 503 || e.code === 'ECONNREFUSED';
 }
 
+/**
+ * Колбэки shouldStop и onRetry не должны бросать: исключение из них уйдёт
+ * наружу как есть, без обёртки в RelayDrainingError.
+ */
 export interface DrainRetryOpts {
   /** true — ход перебит новым сообщением той же сессии: сдаться. */
   shouldStop?: () => boolean;
@@ -57,6 +72,9 @@ export async function postRelayWithDrainRetry<T>(makePost: () => Promise<T>, opt
     } catch (err) {
       if (!isRelayDrainingError(err)) throw err;
       closeBody(err);
+      // Пока шла HTTP-попытка, сессию мог занять новый ход: перебитому ходу —
+      // ни заглушки «бюджет исчерпан», ни onRetry, сессия уже не его.
+      if (opts.shouldStop?.()) throw new RelayDrainingError(true, attempt + 1);
       if (attempt >= delays.length) throw new RelayDrainingError(false, attempt + 1);
       const delay = delays[attempt];
       opts.onRetry?.(attempt + 1, delay);

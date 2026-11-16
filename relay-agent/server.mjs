@@ -468,6 +468,11 @@ const PRODUCTS_PROMPT = `
 Когда его звать, сказано в инструкциях ассистента ниже. НЕ передавай в него userId/телефон.
 `;
 
+// Инвариант для бэка: spirits_back (src/chat/relay-drain-retry.ts) повторяет
+// POST /chat на 502/503/ECONNREFUSED. Поэтому 503 здесь отдаёт только шлагбаум
+// (до начала хода), сам обработчик /chat никогда не отвечает 502/503, а
+// заголовки SSE уходят (flushHeaders) раньше перехвата сессии и запуска CLI —
+// иначе оплаченный ход может пройти дважды.
 app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), upload.array("files", 10), async (req, res) => {
   let sessionMcpPath = null;
   let sandboxSettingsPath = null;
