@@ -92,6 +92,28 @@ describe('разделитель после шага работы — у все�
     expect(saved(calls)).toContain(JOINED);
   });
 
+  it('веб-ход: служебная реплика (notice) после шага — тоже через разделитель', async () => {
+    const { svc, calls } = makeService();
+    post.mockResolvedValueOnce({
+      data: Readable.from([
+        ev({ type: 'delta', text: 'Сейчас посмотрю файл.' }),
+        ev({ type: 'tool', tool: 'Read', input: '{}' }),
+        ev({ type: 'notice', text: 'Ответ прерван.' }),
+        ev({ type: 'done', costUsd: 0.1 }),
+      ]),
+    });
+    const res = newRes();
+    await (svc as any).streamUniversalAgent(
+      'u1', 'проверь', '7', '7', [], '', res, 'Роман', '', '', undefined, false, undefined,
+    );
+    await settle();
+
+    const joined = 'Сейчас посмотрю файл.\n\nОтвет прерван.';
+    expect(items(res).join('')).toBe(joined);
+    expect(ends(res)[0].content).toBe(joined);
+    expect(saved(calls)).toContain(joined);
+  });
+
   it('ход с файлом: в потоке клиенту, в end и в истории', async () => {
     const { svc, calls } = makeService();
     post.mockResolvedValueOnce({ data: Readable.from(STREAM) });
