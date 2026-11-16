@@ -3,6 +3,7 @@ import axios from 'axios';
 import { ChatService } from './chat.service';
 import { ChatController } from './chat.controller';
 import { chatFailureText } from './chat-failure-texts';
+import { productActionTail } from '../products/product-action-tail';
 
 jest.mock('axios');
 jest.mock('../common/telegram-alert', () => ({ sendTelegramAlert: jest.fn(async () => {}) }));
@@ -91,11 +92,12 @@ function newRes(): any {
   };
 }
 
-function turn(svc: ChatService, message: string, upstreams: (Readable | Error)[], lang?: string) {
+function turn(svc: ChatService, message: string, upstreams: (Readable | Error)[], lang?: string, ui?: any) {
   queue.push(...upstreams);
   const res = newRes();
   const done = (svc as any).streamUniversalAgent(
     'u1', message, '7', '7', [], '', res, 'Роман', '', '', undefined, false, undefined, lang,
+    ...(ui ? [undefined, undefined, undefined, false, ui] : []),
   );
   return { done, res };
 }
@@ -268,6 +270,36 @@ describe('веб-ход под шлагбаумом выката релея', ()
     const saved = savedStrings(calls).join('\n');
     expect(saved).toContain(stub);
     expect(saved).not.toContain('card-other');
+    expect(tokenInserts(calls)).toEqual([]);
+    expectNoLearning(learn);
+  });
+
+  it('W7b: своя карточка и заглушка — с разделителем, как в истории', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] });
+    const { svc, calls } = makeServiceWithPgCalls();
+    const learn = learning(svc);
+    // Первый прогон self-heal успел завести карточку меткой этого хода —
+    // takeForTurn находит её по метке при любом since.
+    const takeForTurn = jest.fn(async (..._a: any[]) => [{ id: 'card-own', kind: 'create_bot', payload: {} }]);
+    (svc as any).productActions = { takeForTurn };
+    svc.relayDrainDelaysMs = [0];
+    const empty = stream();
+    const t = turn(svc, 'привет', [empty, err503(), err503()], undefined, { activity: false, ask: false, cards: true });
+    await settle();
+    empty.push(null); // пустой поток — self-heal ждёт 800 мс и повторяет
+    await settle();
+    jest.advanceTimersByTime(800);
+    await t.done;
+    await settle();
+
+    const stub = chatFailureText('relayUpdating', 'ru');
+    const card = productActionTail([{ id: 'card-own' }], true, 'ru');
+    expect(items(t.res)).toEqual([card, '\n\n' + stub]);
+    // Закрывающий ``` карточки не слипается с заглушкой.
+    expect(items(t.res).join('')).toContain('```\n\n_');
+    const history = `${card.trim()}\n\n${stub}`;
+    expect(savedStrings(calls)).toContain(history);
+    expect(ends(t.res)).toEqual([expect.objectContaining({ type: 'end', content: history, reason: 'relay_draining' })]);
     expect(tokenInserts(calls)).toEqual([]);
     expectNoLearning(learn);
   });
