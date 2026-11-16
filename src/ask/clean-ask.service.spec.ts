@@ -120,6 +120,12 @@ describe('CleanAskService: модель общего рубильника в з�
     expect(post.mock.calls[1][1]).not.toBe(post.mock.calls[0][1]);
     expect(fieldsOf(post.mock.calls[1][1]).sessionId).toBe(fieldsOf(post.mock.calls[0][1]).sessionId);
   });
+
+  it('по умолчанию — короткое расписание повторов (человек ждёт у экрана) и повторы в журнал', () => {
+    const svc = new CleanAskService({} as any);
+    expect((svc as any).drainOpts.delaysMs).toEqual([2000, 4000, 8000, 15000, 30000]);
+    expect(typeof (svc as any).drainOpts.onRetry).toBe('function');
+  });
 });
 
 /**

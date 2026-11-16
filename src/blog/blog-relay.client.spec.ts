@@ -103,6 +103,12 @@ describe('BlogRelayClient: модель общего рубильника (spec 
     expect(post.mock.calls[1][1]).not.toBe(post.mock.calls[0][1]);
     expect(fieldsOf(post.mock.calls[1][1]).sessionId).toBe('s-1');
   });
+
+  it('по умолчанию — полное расписание повторов (фон, спешить некуда) и повторы в журнал', () => {
+    const c = new BlogRelayClient() as any;
+    expect(typeof c.drainOpts.onRetry).toBe('function');
+    expect(c.drainOpts.delaysMs).toBeUndefined();
+  });
 });
 
 /**
