@@ -19,7 +19,7 @@ import { RESPONSE_STYLE_RULE } from './response-style';
 import { ANSWER_FIRST_RULE } from './answer-first-rule';
 import { MEETING_HONESTY_RULE } from './meeting-honesty';
 import { INTERRUPTED_TURN_NOTE, relayUndeliveredNote, RelayCarry } from './interrupted-turn';
-import { postRelayWithDrainRetry, RELAY_DRAIN_DELAYS_MS, DrainRetryOpts } from './relay-drain-retry';
+import { postRelayWithDrainRetry, RELAY_DRAIN_DELAYS_MS, DrainRetryOpts, RelayDrainingError } from './relay-drain-retry';
 import { noTokensMessage, NoTokensOpts } from './no-tokens-message';
 import { legacyGreetingReply } from './legacy-greeting';
 import { CRISIS_RULE } from './crisis-rule';
@@ -348,7 +348,9 @@ const ROUTINE_SESSION_WAIT_MS = 30 * 60 * 1000;
  */
 export class RelaySessionBusyError extends Error {
   constructor(public readonly relaySid: string) {
-    super(`relay session busy: ${relaySid}`);
+    // relaySid — в свойстве, не в тексте: в ключе сессии номер телефона, а
+    // текст ошибки уходит в журналы.
+    super('relay session busy');
     this.name = 'RelaySessionBusyError';
   }
 }
@@ -450,10 +452,10 @@ export class ChatService {
   private readonly activeTurns = new Map<string, number>();
 
   /**
-   * Запрос хода ЧЕЛОВЕКА к релею в полёте — по ключу сессии (relaySid =
-   * relaySessionKey(...)), метка того же устройства, что у activeTurns
-   * (openTurn/closeTurn), но другой ключ и другое назначение: по этой карте
-   * решается, пре-эмптит ли входящая реплика чужой ход на релее
+   * Запрос хода к релею (человека или фонового) в полёте — по ключу сессии
+   * (relaySid = relaySessionKey(...)), метка того же устройства, что у
+   * activeTurns (openTurn/closeTurn), но другой ключ и другое назначение: по
+   * этой карте решается, пре-эмптит ли входящая реплика чужой ход на релее
    * (interrupted-turn.ts), а не «идёт ли ход у пары» для кабинета.
    *
    * «В полёте» — шире, чем «процесс на релее прямо сейчас существует»: окно
@@ -480,7 +482,9 @@ export class ChatService {
    * сохраняет: следующее сообщение по-прежнему перебивает его, но вместо
    * «тот ход прерван» получает relayUndeliveredNote с текстом и файлами
    * ждущего — см. relayWaiting ниже. Фоновый ждущий ход (carry = null)
-   * заметки не даёт: его промпт человек не писал.
+   * заметки не даёт: его промпт человек не писал. А пока фоновый ход ИДЁТ
+   * (не ждёт), следующее сообщение человека по-прежнему получает «тот ход
+   * прерван», хотя тот ход начинал не человек, — так было и раньше, принято.
    */
   private readonly relayRunning = new Map<string, number>();
 
@@ -507,9 +511,28 @@ export class ChatService {
   }
 
   /**
+   * Ждущие ходы, чей перенос новый ход уже забрал (relayCarryFor,
+   * relayCarryNote, relayPendingNote), — ключ `${relaySid}#${mark}`: метки —
+   * Date.now() и монотонны только внутри своей сессии. По этой отметке
+   * перебитый ход знает, ушёл ли его текст с новым ходом (postRelayTurn).
+   * Снимается в finally postRelayTurn вместе с relayWaiting.
+   */
+  private readonly relayCarryTaken = new Set<string>();
+
+  /**
    * POST /chat к релею с повтором под шлагбаумом. Ход сдаётся как перебитый
    * (RelayDrainingError.superseded), как только метку его сессии забрал новый
-   * ход — тот уже несёт его сообщение (relayCarryFor).
+   * ход и тот унёс его сообщение (relayCarryFor) — ход кончается молча.
+   *
+   * Окно гонки: новый ход мог прочитать состояние сессии ДО того, как этот
+   * встал в ожидание (первый POST ещё в полёте, или новый ход начался посреди
+   * него), — и переноса не получил. Тогда текст этого хода не ушёл ни к
+   * модели, ни с новым ходом, и молча кончаться нельзя: до шлагбаума человек
+   * хотя бы видел «Ошибка запуска». Такой ход сдаётся как «не доставлено»
+   * (superseded = false) — веб и загрузка покажут заглушку «ассистент
+   * обновляется — отправьте ещё раз» без списания. Фоновый ход (carry = null)
+   * остаётся перебитым: agentReply превратит это в «сессия занята», и рутина
+   * повторится.
    */
   async postRelayTurn<T>(
     relaySid: string,
@@ -517,6 +540,7 @@ export class ChatService {
     carry: RelayCarry | null,
     makePost: () => Promise<T>,
   ): Promise<T> {
+    const key = `${relaySid}#${mark}`;
     const opts: DrainRetryOpts = {
       delaysMs: this.relayDrainDelaysMs,
       sleep: this.relayDrainSleep,
@@ -524,20 +548,31 @@ export class ChatService {
       onRetry: (attempt, delayMs) => {
         this.markRelayWaiting(relaySid, mark, carry);
         // Без relaySid: в ключе сессии номер телефона (журналы — без номеров).
-        this.logger.warn(`релей обновляется (502/503) — повтор ${attempt} через ${delayMs} мс`);
+        this.logger.warn(`релей обновляется или недоступен — повтор ${attempt} через ${delayMs} мс`);
       },
     };
     try {
       return await postRelayWithDrainRetry(makePost, opts);
+    } catch (e) {
+      if (e instanceof RelayDrainingError && e.superseded && carry !== null && !this.relayCarryTaken.has(key)) {
+        throw new RelayDrainingError(false, e.attempts);
+      }
+      throw e;
     } finally {
       this.clearRelayWaiting(relaySid, mark);
+      this.relayCarryTaken.delete(key);
     }
   }
 
-  /** carry ждущего хода — только если ждёт именно текущий ход сессии. */
+  /**
+   * carry ждущего хода — только если ждёт именно текущий ход сессии. Отдал
+   * carry — отметил ход в relayCarryTaken: его текст теперь несёт новый ход.
+   */
   private waitingCarry(relaySid: string): RelayCarry | null {
     const w = this.relayWaiting.get(relaySid);
-    return w && w.mark === this.relayRunning.get(relaySid) ? w.carry : null;
+    if (!w || !w.carry || w.mark !== this.relayRunning.get(relaySid)) return null;
+    this.relayCarryTaken.add(`${relaySid}#${w.mark}`);
+    return w.carry;
   }
 
   /** Своё сообщение хода плюс недошедшее ждущего — то, что новый ход несёт с собой. */
@@ -560,9 +595,11 @@ export class ChatService {
   private relayPendingNote(relaySid: string): string {
     const running = this.relayRunning.get(relaySid);
     if (running === undefined) return '';
-    const w = this.relayWaiting.get(relaySid);
-    if (w && w.mark === running) return w.carry ? relayUndeliveredNote(w.carry) : '';
-    return INTERRUPTED_TURN_NOTE;
+    if (this.relayWaiting.get(relaySid)?.mark !== running) return INTERRUPTED_TURN_NOTE;
+    // Ждёт текущий ход сессии: человеку — «не дошло» (и отметка о переносе),
+    // фоновому — ничего.
+    const c = this.waitingCarry(relaySid);
+    return c ? relayUndeliveredNote(c) : '';
   }
 
   /** Ходов в полёте. 0 — можно перезапускать, не порвав ничей ответ. */
