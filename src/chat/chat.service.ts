@@ -33,6 +33,7 @@ import { ClientPing, startClientPing } from './client-ping';
 import { toActivity } from './activity-map';
 import { ASK_RULE } from './ask-rule';
 import { WORK_RULES } from './work-rules';
+import { resultRules } from './result-rules';
 import { chatFailureText } from './chat-failure-texts';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
@@ -1068,6 +1069,11 @@ export class ChatService {
     // префикса остаётся кэшируемым.
     stablePrefix += `${WORK_RULES}\n\n`;
 
+    // Правила сдачи результата (result-rules.ts; «Затыки недели» 16.11.2026) —
+    // сразу за правилами работы с файлами и тоже до профиля. У магазинной
+    // сборки правило 4 — без цены и баланса (Apple 3.1.1).
+    stablePrefix += `${resultRules({ store: opts.storeBuild === true })}\n\n`;
+
     // Профиль и бизнес-карточка — в СТАБИЛЬНУЮ часть, к персоне.
     //
     // Они меняются, но не от хода к ходу: профиль пополняется консолидацией
@@ -1131,9 +1137,10 @@ export class ChatService {
     }
 
     // Сторож размера: stablePrefix уходит релею ОДНИМ аргументом CLI (предел
-    // 128 КБ на аргумент) — WORK_RULES держит свой бюджет (≤ 6 КБ,
-    // work-rules.spec.ts), но персона ассистента, коллеги, профиль и
-    // бизнес-карточка вместе могут раздуть префикс незаметно, по кускам.
+    // 128 КБ на аргумент) — WORK_RULES и resultRules держат свои бюджеты (≤ 6 КБ
+    // каждый, work-rules.spec.ts и result-rules.spec.ts), но персона ассистента,
+    // коллеги, профиль и бизнес-карточка вместе могут раздуть префикс
+    // незаметно, по кускам.
     // 100 000 — заранее, с запасом до предела. В лог — только метрика (длина,
     // agentId, признак custom), без текста самого промпта: в нём профиль и
     // бизнес-карточка пользователя.
