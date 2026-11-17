@@ -381,7 +381,6 @@ export class ChatController {
       userId,
       assistantId: String(assistantId),
       profileText,
-      freshSessionId,
       requestLang: typeof body.lang === 'string' ? body.lang : undefined,
       ask: ui.ask,
       storeBuild,
