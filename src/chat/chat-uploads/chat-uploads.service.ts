@@ -104,6 +104,18 @@ function sanitizeUploadNote(raw: unknown): string {
 }
 
 /**
+ * Комментарий к загрузке на выводе модели — одной строкой. Сначала ещё раз
+ * sanitizeUploadNote (строка могла попасть в базу в обход setNote), затем
+ * пробельные символы, включая переводы строк и разделители U+2028/U+2029,
+ * схлопываются в пробел: комментарий не допишет «своих» строк. Один вывод
+ * на блок загрузок (assistantLine) и find_files (поле note) — модель видит
+ * комментарий одинаково. Нет комментария — пустая строка.
+ */
+export function uploadNoteOneLine(raw: unknown): string {
+  return sanitizeUploadNote(raw).replace(/\s+/g, ' ').trim();
+}
+
+/**
  * Строка 📎 удалённого файла в истории сессии → «📎 имя — файл удалён».
  * Фильтр — strpos, а не LIKE: в $2 имя экранировано markdownEscapeName
  * (\, \[, \]), а в LIKE обратная косая — escape-символ, и строка с такими
@@ -560,14 +572,15 @@ export class ChatUploadsService {
    * Имя — через safeFileName, как в find_files: оно пришло из multipart, и
    * перевод строки в нём дописал бы в блок «свою» строку; «|» в имени
    * заменяется на «¦» — иначе имя подделало бы поля строки (вид, дата,
-   * комментарий). Комментарий пишет модель: на выводе он ещё раз проходит
-   * sanitizeUploadNote (строка могла попасть в базу в обход setNote), затем
-   * пробельные символы схлопываются по той же причине, что и у имени. «|» в
+   * комментарий). Комментарий пишет модель: на выводе он проходит
+   * uploadNoteOneLine (ещё раз sanitizeUploadNote — строка могла попасть в
+   * базу в обход setNote — и схлопывание пробельных символов) по той же
+   * причине, что и имя; тот же вывод — у поля note в find_files. «|» в
    * комментарии остаётся: это последнее поле. Пусто после чистки — комментария
    * нет.
    */
   private assistantLine(record: ChatUploadRecord): string {
-    const note = sanitizeUploadNote(record.note).replace(/\s+/g, ' ').trim();
+    const note = uploadNoteOneLine(record.note);
     const head = [
       `- id=${record.id}`,
       safeFileName(record.originalName).replace(/\|/g, '¦'),
