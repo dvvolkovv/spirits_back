@@ -16,9 +16,15 @@ import { ContactsService } from './contacts.service';
  * Ответ живому партнёру — тот же, что на «заявка не найдена / уже
  * обработана»: 404 { error: 'not_found_or_not_pending' }.
  *
+ * Уже открытые контакты (approved до удаления) и публичный профиль: телефон
+ * удалённого (state='deleted') живому пользователю больше не выдаётся —
+ * строки истории остаются, номер нет. Маскируется именно удалённый: у
+ * заблокированного модерацией и легаси-аккаунтов поведение прежнее.
+ *
  * Схема — настоящие DDL: user_id / ai_profiles_consolidated /
- * contact_requests из снимка 001_core_schema.sql (core-schema-ddl.forspec.ts)
- * и миграция account-deletion. Своя схема на спеку.
+ * contact_requests из снимка 001_core_schema.sql (core-schema-ddl.forspec.ts),
+ * миграции account-deletion и peer (списки и профиль читают
+ * peer_conversations/user_blocks). Своя схема на спеку.
  */
 
 const PG = process.env.PROVISIONING_PG_URL;
@@ -27,6 +33,7 @@ const SCHEMA = `contacts_deleted_cp_spec_${process.pid}`;
 const ACCOUNT_DELETION_MIGRATION = path.join(
   __dirname, '..', 'account-deletion', 'migrations', '001_account_deletion.sql',
 );
+const PEER_MIGRATION = path.join(__dirname, '..', 'peer', 'migrations', '001_peer_tables.sql');
 
 // Синтетические номера (публичный репозиторий).
 const DELETED = '79990000641';
@@ -103,6 +110,7 @@ maybe('contacts: телефон неактивного отправителя н
     pool = new Pool({ connectionString: PG, max: 2, options: `-c search_path=${SCHEMA}` });
     await pool.query(coreTableDdl(['user_id', 'ai_profiles_consolidated', 'contact_requests']));
     await pool.query(fs.readFileSync(ACCOUNT_DELETION_MIGRATION, 'utf8'));
+    await pool.query(fs.readFileSync(PEER_MIGRATION, 'utf8'));
   });
 
   afterAll(async () => {
@@ -112,7 +120,10 @@ maybe('contacts: телефон неактивного отправителя н
   });
 
   beforeEach(async () => {
-    await pool.query(`TRUNCATE contact_requests, ai_profiles_consolidated, user_id RESTART IDENTITY`);
+    await pool.query(
+      `TRUNCATE contact_requests, ai_profiles_consolidated, user_id, peer_conversations,
+                user_blocks RESTART IDENTITY CASCADE`,
+    );
     for (const key of Object.keys(ids)) delete ids[key];
     await seedUser(DELETED, 'deleted');
     await seedUser(PARTNER, 'active');
@@ -213,6 +224,93 @@ maybe('contacts: телефон неактивного отправителя н
 
       expect(resolved).toMatchObject({ id, status: 'rejected' });
       expect(resolved).not.toHaveProperty('requester_phone');
+    });
+  });
+
+  describe('уже открытые контакты и публичный профиль', () => {
+    async function seedApproved(from: string, to: string): Promise<number> {
+      const r = await pool.query(
+        `INSERT INTO contact_requests (requester_id, target_id, message, status, resolved_at)
+         VALUES ($1,$2,'старая заявка','approved', now() - interval '1 day') RETURNING id`,
+        [ids[from], ids[to]],
+      );
+      return r.rows[0].id;
+    }
+
+    function service(): ContactsService {
+      return new ContactsService(pgShim() as any, undefined as any);
+    }
+
+    it('входящие: одобренная до удаления заявка удалённого — строка есть, телефона нет', async () => {
+      const id = await seedApproved(DELETED, PARTNER);
+
+      const row = (await service().listIncoming(PARTNER)).find((x) => x.id === id);
+
+      expect(row).toMatchObject({ id, status: 'approved' });
+      expect(row).not.toHaveProperty('requester_phone');
+      expect(JSON.stringify(row)).not.toContain(DELETED);
+    });
+
+    it('исходящие: одобренная удалённым заявка — строка есть, телефона нет', async () => {
+      const id = await seedApproved(PARTNER, DELETED);
+
+      const row = (await service().listOutgoing(PARTNER)).find((x) => x.id === id);
+
+      expect(row).toMatchObject({ id, status: 'approved' });
+      expect(row).not.toHaveProperty('target_phone');
+      expect(JSON.stringify(row)).not.toContain(DELETED);
+    });
+
+    it('списки: служебный признак удаления наружу не уходит', async () => {
+      await seedApproved(LIVE, PARTNER);
+      await seedApproved(PARTNER, LIVE);
+
+      const incoming = await service().listIncoming(PARTNER);
+      const outgoing = await service().listOutgoing(PARTNER);
+
+      for (const row of [...incoming, ...outgoing]) {
+        expect(Object.keys(row).filter((key) => /deleted|state/.test(key))).toEqual([]);
+      }
+    });
+
+    it('списки: активный и заблокированный контрагент — телефон как прежде', async () => {
+      const live = await seedApproved(LIVE, PARTNER);
+      const blocked = await seedApproved(BLOCKED, PARTNER);
+      const out = await seedApproved(PARTNER, LIVE);
+
+      const incoming = await service().listIncoming(PARTNER);
+      const outgoing = await service().listOutgoing(PARTNER);
+
+      expect(incoming.find((x) => x.id === live)).toMatchObject({ requester_phone: LIVE });
+      expect(incoming.find((x) => x.id === blocked)).toMatchObject({ requester_phone: BLOCKED });
+      expect(outgoing.find((x) => x.id === out)).toMatchObject({ target_phone: LIVE });
+    });
+
+    it('публичный профиль удалённого: открытый контакт телефон не раскрывает', async () => {
+      await seedApproved(DELETED, PARTNER);
+
+      const profile = await service().getPublicProfile(PARTNER, ids[DELETED]);
+
+      expect(profile).toMatchObject({ phone: null, phoneDisclosed: false, email: null, avatar_url: null });
+      expect(JSON.stringify(profile)).not.toContain(DELETED);
+    });
+
+    it('публичный профиль удалённого: переписка в peer телефон не раскрывает', async () => {
+      const [a, b] = [PARTNER, DELETED].sort();
+      await pool.query(`INSERT INTO peer_conversations (user_a_id, user_b_id) VALUES ($1,$2)`, [a, b]);
+
+      const profile = await service().getPublicProfile(PARTNER, ids[DELETED]);
+
+      expect(profile).toMatchObject({ phone: null, phoneDisclosed: false });
+      expect(JSON.stringify(profile)).not.toContain(DELETED);
+    });
+
+    it('публичный профиль активного открытого контакта — телефон как прежде', async () => {
+      await seedApproved(LIVE, PARTNER);
+
+      const profile = await service().getPublicProfile(PARTNER, ids[LIVE]);
+
+      expect(profile).toMatchObject({ phone: LIVE, phoneDisclosed: true });
     });
   });
 });
