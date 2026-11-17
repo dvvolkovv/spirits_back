@@ -21,11 +21,17 @@ import { __setSafeFetchDepsForTests, UnsafeUrlError } from '../common/net/safe-f
 const OWN = '77777777-7777-4777-8777-777777777777';
 const PDF = '99999999-9999-4999-8999-999999999999';
 const BIG = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const GIF = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const HEIC = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+const JPG = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
 
 const UPLOADS: Record<string, { mime: string; size_bytes: number; storage_key: string; original_name: string }> = {
   [OWN]: { mime: 'image/png', size_bytes: 9, storage_key: `${OWN}/room.png`, original_name: 'room.png' },
   [PDF]: { mime: 'application/pdf', size_bytes: 9, storage_key: `${PDF}/doc.pdf`, original_name: 'doc.pdf' },
   [BIG]: { mime: 'image/jpeg', size_bytes: 9 * 1024 * 1024, storage_key: `${BIG}/big.jpg`, original_name: 'big.jpg' },
+  [GIF]: { mime: 'image/gif', size_bytes: 9, storage_key: `${GIF}/anim.gif`, original_name: 'anim.gif' },
+  [HEIC]: { mime: 'image/heic', size_bytes: 9, storage_key: `${HEIC}/IMG_0001.HEIC`, original_name: 'IMG_0001.HEIC' },
+  [JPG]: { mime: 'image/jpg', size_bytes: 9, storage_key: `${JPG}/photo.jpg`, original_name: 'photo.jpg' },
 };
 
 /** Строка chat_uploads владельца u-1 со всеми колонками 001 и 002. */
@@ -144,6 +150,23 @@ describe('правка картинок: исходник — загрузка �
     await expect(svc.editImage('u-1', { prompt: 'p', sourceImageUrl: `/webhook/chat-uploads/${PDF}` })).rejects.toThrow(/не картинка/);
     expect(post).not.toHaveBeenCalled();
     expect(charged(pg)).toBe(false);
+  });
+
+  it('GIF — картинка не из белого списка Gemini: отказ до Gemini и до списания', async () => {
+    const post = jest.spyOn(axios, 'post');
+    const { svc, pg } = makeService();
+    await expect(svc.editImage('u-1', { prompt: 'p', sourceImageUrl: `/webhook/chat-uploads/${GIF}` })).rejects.toThrow(/не картинка/);
+    expect(post).not.toHaveBeenCalled();
+    expect(charged(pg)).toBe(false);
+  });
+
+  it('HEIC с айфона уходит в Gemini как есть, image/jpg — как image/jpeg', async () => {
+    const post = mockGemini();
+    const { svc } = makeService();
+    await svc.editImage('u-1', { prompt: 'p', sourceImageUrl: `/webhook/chat-uploads/${HEIC}` });
+    await svc.editImage('u-1', { prompt: 'p', sourceImageUrl: `/webhook/chat-uploads/${JPG}` });
+    expect((post.mock.calls[0][1] as any).contents[0].parts[1].inlineData.mimeType).toBe('image/heic');
+    expect((post.mock.calls[1][1] as any).contents[0].parts[1].inlineData.mimeType).toBe('image/jpeg');
   });
 
   it('больше 8 МБ — отказ без скачивания', async () => {

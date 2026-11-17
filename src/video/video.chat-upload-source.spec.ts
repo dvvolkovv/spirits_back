@@ -16,12 +16,16 @@ import { __setSafeFetchDepsForTests } from '../common/net/safe-fetch';
 
 const OWN = '77777777-7777-4777-8777-777777777777';
 const PDF = '99999999-9999-4999-8999-999999999999';
+const HEIC = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+const JPG = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
 const CANON = `https://my.linkeon.io/webhook/chat-uploads/${OWN}`;
 const FACE_B64 = Buffer.from('face-bytes').toString('base64');
 
 const UPLOADS: Record<string, { mime: string; size_bytes: number; storage_key: string; original_name: string }> = {
   [OWN]: { mime: 'image/jpeg', size_bytes: 10, storage_key: `${OWN}/face.jpg`, original_name: 'face.jpg' },
   [PDF]: { mime: 'application/pdf', size_bytes: 10, storage_key: `${PDF}/cv.pdf`, original_name: 'cv.pdf' },
+  [HEIC]: { mime: 'image/heic', size_bytes: 10, storage_key: `${HEIC}/IMG_0001.HEIC`, original_name: 'IMG_0001.HEIC' },
+  [JPG]: { mime: 'image/jpg', size_bytes: 10, storage_key: `${JPG}/face.jpg`, original_name: 'face.jpg' },
 };
 
 function uploadRow(id: string) {
@@ -115,6 +119,23 @@ describe('Veo: портрет из загрузки пользователя', (
     expect(err.message).toMatch(/не картинка/);
     expect(billed(clientCalls)).toBe(false);
     expect(veo.startGenerate).not.toHaveBeenCalled();
+  });
+
+  it('HEIC — портрету Omni не подходит: 400 до списания', async () => {
+    const { svc, clientCalls, veo } = makeService();
+    const err = await svc.createJob('u-1', { ...DTO, sourceImageUrl: `/webhook/chat-uploads/${HEIC}` } as any).catch((e) => e);
+    expect(err).toBeInstanceOf(BadRequestException);
+    expect(err.message).toMatch(/не картинка/);
+    expect(billed(clientCalls)).toBe(false);
+    expect(veo.startGenerate).not.toHaveBeenCalled();
+  });
+
+  it('image/jpg уходит в Omni как image/jpeg', async () => {
+    const { svc, veo } = makeService();
+    await svc.createJob('u-1', { ...DTO, sourceImageUrl: `/webhook/chat-uploads/${JPG}` } as any);
+    expect(veo.startGenerate).toHaveBeenCalledWith(
+      expect.objectContaining({ referenceImagesB64: [{ b64: FACE_B64, mime: 'image/jpeg' }] }),
+    );
   });
 
   it('сбой хранилища на проверке — не отказ: фото пропускается, как при сетевом сбое', async () => {
