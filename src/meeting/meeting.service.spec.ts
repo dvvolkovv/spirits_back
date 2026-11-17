@@ -771,9 +771,9 @@ describe('MeetingService', () => {
       expect(res).toEqual({ status: 'ok' });
       expect(attendee.createBot).toHaveBeenCalledWith({
         meetingUrl: 'https://meet.google.com/abc-defg-hij',
-        // То же имя, что и раньше собиралось в join(): участники должны
-        // видеть, кто к ним пришёл и от кого.
-        botName: 'Андрей · ассистент Дмитрий',
+        // Подпись собирает assistantSignature (как и в join()): владелец
+        // в родительном падеже, участники видят, кто пришёл и от кого.
+        botName: 'Андрей · ассистент Дмитрия',
         callId: 'c1',
         wsUrl,
         provider: 'meet',
@@ -782,6 +782,19 @@ describe('MeetingService', () => {
         /external_bot_id/.test(sql) && Array.isArray(args) && args.includes('bot_1'),
       );
       expect(upd).toBeDefined();
+    });
+
+    it('Владимир передаётся Attendee в родительном падеже', async () => {
+      withAgent('Владимир');
+      calls.load.mockResolvedValue({
+        id: 'c1', agent_id: 7, user_id: 'u1', external_room: 'abc-defg-hij',
+      });
+
+      await svc.attachBot('c1', wsUrl);
+
+      expect(attendee.createBot).toHaveBeenCalledWith(
+        expect.objectContaining({ botName: 'Андрей · ассистент Владимира' }),
+      );
     });
 
     it('Attendee не создал бота — звонок помечается failed', async () => {
