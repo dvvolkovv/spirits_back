@@ -1361,6 +1361,7 @@ COMMIT;
 - [ ] **Step 2:** `npx tsc --noEmit -p tsconfig.build.json` — без новых ошибок (дельта к main).
 - [ ] **Step 3:** `npm run build` — зелёный; `tests/unit` (грузит `dist`): `cd tests && npx jest unit/ --silent`.
 - [ ] **Step 4:** pg-спеки фичи и удаления — с временной базой.
+- [ ] **Step 5:** `spirits_back/CLAUDE.md` — короткий раздел про `chat_context_resets` (по образцу описания `chat_uploads`): что хранит, кто читает (`ChatContextResetService.getOrNull`), что точка только вперёд, удаление аккаунта стирает; изолированная fresh-сессия — только у пингов `probe`. Заметка про откат выката: аккаунты, удалённые в окне отката на версию без фичи, оставят строки в `chat_context_resets` — снимать разовым запросом с осторожностью (проигравшие слияния в 30-дневном окне тоже `state = 'deleted'`).
 
 ---
 
