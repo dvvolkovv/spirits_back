@@ -720,7 +720,9 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
 
       const extracted = this.extractJsonObject(content);
       if (!extracted) {
-        this.logger.warn(`consolidateFromChat: failed to parse JSON (agent=${agentId}); raw[0..200]=${content.slice(0, 200)}`);
+        // Только размер: сырой ответ несёт интересы и убеждения человека
+        // (правило журналов с 02.11, cb92f71f — вид, статус, размеры).
+        this.logger.warn(`consolidateFromChat: failed to parse JSON (agent=${agentId}); raw.length=${content.length}`);
         return;
       }
       const entityTypes = ['interests', 'values', 'desires', 'beliefs', 'intents', 'skills'];
