@@ -7,8 +7,8 @@ import { ChatUploadsService } from './chat-uploads.service';
  *
  * Своя схема на прогон (search_path — в options каждого соединения пула):
  * соседние pg-спеки (chat-upload-account-deletion, account-deletion.synthetic)
- * делят ту же одноразовую базу, TRUNCATE-ят chat_uploads в public и применяют
- * только 001 — общая таблица перемешала бы их строки с нашими.
+ * делят ту же одноразовую базу и TRUNCATE-ят chat_uploads в public — общая
+ * таблица перемешала бы их строки с нашими.
  */
 
 const PG = process.env.PROVISIONING_PG_URL;

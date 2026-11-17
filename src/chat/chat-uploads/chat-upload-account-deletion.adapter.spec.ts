@@ -34,6 +34,8 @@ import {
  *    нет строк — плана нет;
  *  - execute: storage_key'и читаются ИЗ ТАБЛИЦЫ в момент исполнения (таблицу
  *    никто кроме этого адаптера не стирает — гонки нет), на каждый ключ —
+ *    оригинал, thumb_key и вычисляемый thumbs/<storage_key>.webp (миграция
+ *    002; миниатюра могла лечь и при thumb_key = NULL) —
  *    deleteConfirmed (подтверждённый исход или absent = успех), затем строки
  *    удаляются; любой неизвестный исход MinIO — DeletionRetryError, строки
  *    СОХРАНЯЮТСЯ для retry (fail-closed: storage_key — единственный указатель
@@ -56,7 +58,7 @@ const KEY_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/photo (1).png';
  * чтение ключей, удаление строк). Настоящий SQL — в pg-спеке.
  */
 class FakeUploadsDb {
-  rows: Array<{ user_id: string; storage_key: string }> = [];
+  rows: Array<{ user_id: string; storage_key: string; thumb_key?: string | null }> = [];
   readonly queries: Array<{ sql: string; params: unknown[] }> = [];
 
   async query(sql: string, params: unknown[] = []): Promise<{ rows: unknown[]; rowCount: number }> {
@@ -67,11 +69,11 @@ class FakeUploadsDb {
       const hit = this.rows.some((r) => r.user_id === userId);
       return { rows: hit ? [{ n: 1 }] : [], rowCount: hit ? 1 : 0 };
     }
-    if (s.startsWith('SELECT storage_key FROM chat_uploads')) {
+    if (s.startsWith('SELECT storage_key, thumb_key FROM chat_uploads')) {
       const userId = String(params[0]);
       const rows = this.rows
         .filter((r) => r.user_id === userId)
-        .map((r) => ({ storage_key: r.storage_key }));
+        .map((r) => ({ storage_key: r.storage_key, thumb_key: r.thumb_key ?? null }));
       return { rows, rowCount: rows.length };
     }
     if (s.startsWith('DELETE FROM chat_uploads')) {
@@ -188,9 +190,14 @@ describe('ChatUploadAccountDeletionAdapter — purge', () => {
     const deleted: Array<[string, string]> = storage.deleteConfirmed.mock.calls.map(
       (call: [{ bucket: string; key: string }]) => [call[0].bucket, call[0].key],
     );
+    // thumb_key у строк нет (NULL), но миниатюра стирается и по вычисляемому
+    // ключу thumbs/<storage_key>.webp: она могла лечь в бакет при
+    // неоднозначном сбое сохранения, когда thumb_key не записался.
     expect(deleted).toEqual([
       [BUCKET, KEY_A],
+      [BUCKET, `thumbs/${KEY_A}.webp`],
       [BUCKET, KEY_B],
+      [BUCKET, `thumbs/${KEY_B}.webp`],
     ]);
     // Строки удалены ПОСЛЕ объектов (storage_key — единственный указатель на байты).
     expect(db.deleteQueries()).toHaveLength(1);
@@ -332,5 +339,100 @@ describe('ChatUploadAccountDeletionAdapter — purge', () => {
     expect(
       DELETION_DISCOVERERS.filter((item) => item === discoverChatUploads),
     ).toHaveLength(1);
+  });
+});
+
+describe('ChatUploadAccountDeletionAdapter — миниатюры (thumb_key, миграция 002)', () => {
+  const THUMB_A = `thumbs/${KEY_A}.webp`;
+  const THUMB_B = `thumbs/${KEY_B}.webp`;
+  const OTHER_KEY = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc/чужой.png';
+
+  it('миниатюра стирается вместе с оригиналом; строки — после всех объектов, чужие целы', async () => {
+    const { db, adapter, ctx, storage } = makeHarness();
+    db.rows.push(
+      { user_id: 'u-deleted', storage_key: KEY_A, thumb_key: THUMB_A },
+      { user_id: 'u-deleted', storage_key: KEY_B, thumb_key: null },
+      { user_id: 'u-other', storage_key: OTHER_KEY, thumb_key: `thumbs/${OTHER_KEY}.webp` },
+    );
+
+    await adapter.execute(purgeJob(), ctx);
+
+    const deleted: Array<[string, string]> = storage.deleteConfirmed.mock.calls.map(
+      (call: [{ bucket: string; key: string }]) => [call[0].bucket, call[0].key],
+    );
+    // A: thumb_key совпадает с вычисляемым ключом — один вызов на миниатюру.
+    // B: thumb_key NULL — вычисляемый ключ стирается всё равно (миниатюра
+    // могла лечь при неоднозначном сбое сохранения).
+    expect(deleted).toEqual([
+      [BUCKET, KEY_A],
+      [BUCKET, THUMB_A],
+      [BUCKET, KEY_B],
+      [BUCKET, THUMB_B],
+    ]);
+    expect(db.deleteQueries()).toHaveLength(1);
+    expect(db.rows.some((r) => r.user_id === 'u-deleted')).toBe(false);
+    expect(db.rows.some((r) => r.user_id === 'u-other')).toBe(true);
+    // assertCurrent: до чтения ключей, перед каждым из четырёх объектов и перед DELETE.
+    expect(ctx.assertCurrent).toHaveBeenCalledTimes(6);
+  });
+
+  it('thumb_key не совпадает с вычисляемым — стираются оба ключа миниатюры', async () => {
+    const { db, adapter, ctx, storage } = makeHarness();
+    const legacyThumb = 'thumbs/legacy/aaaa.webp';
+    db.rows.push({ user_id: 'u-deleted', storage_key: KEY_A, thumb_key: legacyThumb });
+
+    await adapter.execute(purgeJob(), ctx);
+
+    const keys = storage.deleteConfirmed.mock.calls.map(
+      (call: [{ bucket: string; key: string }]) => call[0].key,
+    );
+    expect(keys).toEqual([KEY_A, legacyThumb, THUMB_A]);
+    expect(db.rows).toEqual([]);
+  });
+
+  it('сбой удаления миниатюры — retry, строки сохранены (указатель на миниатюру не теряется)', async () => {
+    const { db, adapter, ctx, storage } = makeHarness();
+    db.rows.push({ user_id: 'u-deleted', storage_key: KEY_A, thumb_key: THUMB_A });
+    storage.deleteConfirmed
+      .mockResolvedValueOnce('deleted')
+      .mockRejectedValueOnce({ response: { status: 503 } });
+
+    await expect(adapter.execute(purgeJob(), ctx)).rejects.toMatchObject({ kind: 'external_5xx' });
+    expect(db.deleteQueries()).toEqual([]);
+    expect(db.rows).toHaveLength(1);
+  });
+
+  it('миниатюры уже нет (absent) — подтверждённый успех, строки удалены', async () => {
+    const { db, adapter, ctx, storage } = makeHarness();
+    db.rows.push({ user_id: 'u-deleted', storage_key: KEY_A, thumb_key: THUMB_A });
+    storage.deleteConfirmed.mockResolvedValueOnce('deleted').mockResolvedValueOnce('absent');
+
+    await expect(adapter.execute(purgeJob(), ctx)).resolves.toBeUndefined();
+    expect(storage.deleteConfirmed).toHaveBeenCalledTimes(2);
+    expect(db.rows).toEqual([]);
+  });
+
+  it('аномальный thumb_key — fail-closed retry kind db, ни одного удаления (даже оригинала)', async () => {
+    for (const bad of ['../etc/passwd', 'thumbs//x.webp', '', '.', 'thumbs/./x.webp']) {
+      const { db, adapter, ctx, storage } = makeHarness();
+      db.rows.push({ user_id: 'u-deleted', storage_key: KEY_A, thumb_key: bad });
+
+      await expect(adapter.execute(purgeJob(), ctx)).rejects.toBeInstanceOf(DeletionRetryError);
+      await expect(adapter.execute(purgeJob(), ctx)).rejects.toMatchObject({ kind: 'db' });
+      expect(storage.deleteConfirmed).not.toHaveBeenCalled();
+      expect(db.deleteQueries()).toEqual([]);
+    }
+  });
+
+  it('SELECT адаптера читает thumb_key вместе со storage_key', async () => {
+    const { db, adapter, ctx } = makeHarness();
+    db.rows.push({ user_id: 'u-deleted', storage_key: KEY_A });
+
+    await adapter.execute(purgeJob(), ctx);
+
+    const selects = db.queries.filter((q) => q.sql.startsWith('SELECT storage_key'));
+    expect(selects).toHaveLength(1);
+    expect(selects[0].sql).toBe('SELECT storage_key, thumb_key FROM chat_uploads WHERE user_id = $1');
+    expect(selects[0].params).toEqual(['u-deleted']);
   });
 });
