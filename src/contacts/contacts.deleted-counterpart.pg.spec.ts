@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
@@ -17,9 +18,13 @@ import { ContactsService } from './contacts.service';
  * обработана»: 404 { error: 'not_found_or_not_pending' }.
  *
  * Уже открытые контакты (approved до удаления) и публичный профиль: телефон
- * удалённого (state='deleted') живому пользователю больше не выдаётся —
- * строки истории остаются, номер нет. Маскируется именно удалённый: у
- * заблокированного модерацией и легаси-аккаунтов поведение прежнее.
+ * удалённого живому пользователю больше не выдаётся — строки истории
+ * остаются, номер нет.
+ *
+ * K6b — единый fail-closed порог: телефон выдаётся, только когда у владельца
+ * номера state='active'. Заблокированный, state NULL, нет строки user_id или
+ * её не удалось прочитать — телефона нет (во всех трёх путях: одобрение,
+ * списки, публичный профиль). Ошибка чтения пишется в журнал без PII.
  *
  * Схема — настоящие DDL: user_id / ai_profiles_consolidated /
  * contact_requests из снимка 001_core_schema.sql (core-schema-ddl.forspec.ts),
@@ -40,6 +45,8 @@ const DELETED = '79990000641';
 const PARTNER = '79990000642';
 const LIVE = '79990000643';
 const BLOCKED = '79990000644';
+// Профиль без строки user_id (легаси/рассинхрон) — телефон не выдаётся.
+const ORPHAN = '79990000645';
 const DELETION_ID = '8c7b6a59-4e3d-4c2b-9a1f-0e9d8c7b6a50';
 
 function mockRes() {
@@ -80,6 +87,14 @@ maybe('contacts: телефон неактивного отправителя н
         state === 'deleted' ? DELETION_ID : null,
       ],
     );
+    const r = await pool.query(
+      `INSERT INTO ai_profiles_consolidated (user_id, profile_data) VALUES ($1, '{}'::jsonb) RETURNING id`,
+      [phone],
+    );
+    ids[phone] = r.rows[0].id;
+  }
+
+  async function seedProfileOnly(phone: string): Promise<void> {
     const r = await pool.query(
       `INSERT INTO ai_profiles_consolidated (user_id, profile_data) VALUES ($1, '{}'::jsonb) RETURNING id`,
       [phone],
@@ -129,6 +144,7 @@ maybe('contacts: телефон неактивного отправителя н
     await seedUser(PARTNER, 'active');
     await seedUser(LIVE, 'active');
     await seedUser(BLOCKED, 'blocked');
+    await seedProfileOnly(ORPHAN);
   });
 
   describe('resolve(…, approved)', () => {
@@ -152,6 +168,14 @@ maybe('contacts: телефон неактивного отправителя н
 
     it('заблокированный отправитель (не active) — тоже не одобряется', async () => {
       const id = await seedPending(BLOCKED, PARTNER, 'привет');
+      const service = new ContactsService(pgShim() as any, undefined as any);
+
+      await expect(service.resolve(PARTNER, id, 'approved')).resolves.toBeNull();
+      expect((await requestRow(id)).status).toBe('pending');
+    });
+
+    it('у отправителя нет строки user_id — не одобряется', async () => {
+      const id = await seedPending(ORPHAN, PARTNER, 'привет');
       const service = new ContactsService(pgShim() as any, undefined as any);
 
       await expect(service.resolve(PARTNER, id, 'approved')).resolves.toBeNull();
@@ -273,17 +297,32 @@ maybe('contacts: телефон неактивного отправителя н
       }
     });
 
-    it('списки: активный и заблокированный контрагент — телефон как прежде', async () => {
+    it('списки: активный контрагент — телефон как прежде', async () => {
       const live = await seedApproved(LIVE, PARTNER);
-      const blocked = await seedApproved(BLOCKED, PARTNER);
       const out = await seedApproved(PARTNER, LIVE);
 
       const incoming = await service().listIncoming(PARTNER);
       const outgoing = await service().listOutgoing(PARTNER);
 
       expect(incoming.find((x) => x.id === live)).toMatchObject({ requester_phone: LIVE });
-      expect(incoming.find((x) => x.id === blocked)).toMatchObject({ requester_phone: BLOCKED });
       expect(outgoing.find((x) => x.id === out)).toMatchObject({ target_phone: LIVE });
+    });
+
+    it.each([
+      ['заблокированный', BLOCKED],
+      ['без строки user_id', ORPHAN],
+    ])('списки: %s контрагент — строка есть, телефона нет (K6b)', async (_label, who) => {
+      const inId = await seedApproved(who, PARTNER);
+      const outId = await seedApproved(PARTNER, who);
+
+      const incoming = (await service().listIncoming(PARTNER)).find((x) => x.id === inId);
+      const outgoing = (await service().listOutgoing(PARTNER)).find((x) => x.id === outId);
+
+      expect(incoming).toMatchObject({ id: inId, status: 'approved' });
+      expect(incoming).not.toHaveProperty('requester_phone');
+      expect(outgoing).toMatchObject({ id: outId, status: 'approved' });
+      expect(outgoing).not.toHaveProperty('target_phone');
+      expect(JSON.stringify([incoming, outgoing])).not.toContain(who);
     });
 
     it('публичный профиль удалённого: открытый контакт телефон не раскрывает', async () => {
@@ -303,6 +342,47 @@ maybe('contacts: телефон неактивного отправителя н
 
       expect(profile).toMatchObject({ phone: null, phoneDisclosed: false });
       expect(JSON.stringify(profile)).not.toContain(DELETED);
+    });
+
+    it.each([
+      ['заблокированного', BLOCKED],
+      ['без строки user_id', ORPHAN],
+    ])('публичный профиль %s открытого контакта — телефона нет (K6b)', async (_label, who) => {
+      await seedApproved(who, PARTNER);
+
+      const profile = await service().getPublicProfile(PARTNER, ids[who]);
+
+      expect(profile).toMatchObject({ phone: null, phoneDisclosed: false, email: null, avatar_url: null });
+      expect(JSON.stringify(profile)).not.toContain(who);
+    });
+
+    it('публичный профиль: состояние владельца не прочиталось — телефона нет, журнал без PII (K6b)', async () => {
+      await seedApproved(LIVE, PARTNER);
+      const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      // Сбой только у чтения состояния владельца; сообщение ошибки цитирует
+      // номер — в журнал оно попасть не должно.
+      const failing = {
+        query: async (sql: string, params?: any[]) => {
+          if (/\bFROM\s+user_id\b/.test(sql)) {
+            throw Object.assign(new Error(`connection terminated for ${LIVE}`), { code: '08006' });
+          }
+          return pool.query(sql, params);
+        },
+      };
+      try {
+        const profile = await new ContactsService(failing as any, undefined as any)
+          .getPublicProfile(PARTNER, ids[LIVE]);
+
+        expect(profile).toMatchObject({ phone: null, phoneDisclosed: false });
+        expect(warn).toHaveBeenCalledTimes(1);
+        const logged = String(warn.mock.calls[0][0]);
+        expect(logged).toContain('08006');
+        expect(logged).not.toContain(LIVE);
+        expect(logged).not.toContain(PARTNER);
+        expect(logged).not.toContain('connection terminated');
+      } finally {
+        warn.mockRestore();
+      }
     });
 
     it('публичный профиль активного открытого контакта — телефон как прежде', async () => {
