@@ -8,6 +8,7 @@ import { StudioError } from '../errors';
 import { probeFile } from '../ffprobe';
 import { CAPTURE_SCALE, CAPTURE_VIEWPORT } from '../frame';
 import type { CaptureResult, Scene } from '../types';
+import { prepareCleanChat } from './clean-chat';
 import type { Session } from './login';
 import { hidePromoCss } from './promo';
 
@@ -189,6 +190,8 @@ export async function captureChat(
   fs.mkdirSync(outDir, { recursive: true });
   const shot = (name: string) => path.join(outDir, name);
   const deadline = Date.now() + CAPTURE_BUDGET_MS;
+  // Проба только смотрит кабинет — на сервере ничего не меняет.
+  if (!opts.probeOnly) await prepareCleanChat(cfg, session, scene.assistantId);
   const browser = await chromium.launch({ headless: true });
   try {
     const context = await browser.newContext({
@@ -200,16 +203,16 @@ export async function captureChat(
       httpCredentials: cfg.basicAuth ?? undefined,
     });
     // Вход без интерфейса: токены в localStorage, как кладёт AuthContext;
-    // «чистый лист» — ключ fresh_ts_<id> в sessionStorage (ChatInterface).
+    // чистый лист — пустая лента и точка отсчёта через API (spec
+    // 2026-11-17-context-reset), prepareCleanChat выше.
     await context.addInitScript(
-      (a: { session: Session; assistantId: number; freshTs: string }) => {
+      (a: { session: Session }) => {
         localStorage.setItem('jwt_access_token', a.session.accessToken);
         localStorage.setItem('jwt_refresh_token', a.session.refreshToken);
         localStorage.setItem('authToken', a.session.accessToken);
         localStorage.setItem('userData', JSON.stringify(a.session.userData));
-        sessionStorage.setItem(`fresh_ts_${a.assistantId}`, a.freshTs);
       },
-      { session, assistantId: scene.assistantId, freshTs: String(Date.now()) },
+      { session },
     );
     const page = await context.newPage();
     await page.goto(`${cfg.cabinetUrl}/chat?assistant=${scene.assistantId}&lang=ru&utm_source=studio`, { waitUntil: 'domcontentloaded' });
