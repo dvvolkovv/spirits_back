@@ -279,10 +279,10 @@ describe('Маша: блок загрузок сессии', () => {
     expect(writes.map((w) => JSON.parse(w)).some((e) => e.type === 'item')).toBe(true);
   });
 
-  // Текст ошибки pg может повторять данные запроса и имена — в журнал идут
-  // только ключ сессии в кавычках и вид ошибки (err-kind.ts); userId уже
-  // внутри ключа и отдельно не пишется.
-  it('сбой реестра — в журнале ключ сессии и вид ошибки, без текста ошибки', async () => {
+  // Текст ошибки pg может повторять данные запроса и имена — в журнал идёт
+  // только вид ошибки (err-kind.ts). Ключ сессии тоже не пишется: в нём
+  // userId, а у телефонных аккаунтов это номер телефона.
+  it('сбой реестра — в журнале только вид ошибки: без ключа сессии, userId и текста ошибки', async () => {
     process.env.CHAT_UPLOADS_ENABLED = 'true';
     const { uploads, recentSpy } = uploadsWith();
     recentSpy.mockRejectedValue(Object.assign(new Error('db down: план.pdf'), { code: 'ECONNREFUSED' }));
@@ -294,7 +294,10 @@ describe('Маша: блок загрузок сессии', () => {
       },
     });
     const lines = warn!.mock.calls.map((call) => String(call[0]));
-    expect(lines).toContain(`upload context failed (session "${USER}_3"): Error code=ECONNREFUSED`);
+    expect(lines).toContain('upload context failed: Error code=ECONNREFUSED');
+    const ctx = lines.filter((l) => l.startsWith('upload context failed')).join('\n');
+    expect(ctx).not.toContain(USER);
+    expect(ctx).not.toContain('session');
     expect(lines.join('\n')).not.toContain('план.pdf');
     expect(lines.join('\n')).not.toContain('db down');
   });
