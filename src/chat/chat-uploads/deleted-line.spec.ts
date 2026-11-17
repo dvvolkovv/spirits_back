@@ -46,6 +46,22 @@ describe('deletedUploadLine', () => {
     expect(deletedUploadLine('a.png', lang)).toBe(expected);
   });
 
+  // Имя пришло из multipart: RLO развернул бы хвост имени в пузыре чата и
+  // подменил видимое расширение; невидимые символы — мусор. В строке —
+  // safeFileName, как в панели «Медиа/Файлы». Символы собраны из кодов.
+  it('имя — через safeFileName: bidi, невидимые и управляющие символы не доходят до строки', () => {
+    const rlo = String.fromCodePoint(0x202e);
+    const zwsp = String.fromCodePoint(0x200b);
+    const tag = String.fromCodePoint(0xe0041);
+    const line = deletedUploadLine(`счёт${rlo}fdp.exe${zwsp}${tag}\u0007`, 'en');
+    expect(line).toBe('📎 счётfdp.exe — file deleted');
+    expect(line).not.toMatch(/[\p{Cf}\p{Cc}]/u);
+  });
+
+  it('имя из одних невидимых символов — «file», как у safeFileName', () => {
+    expect(deletedUploadLine(String.fromCodePoint(0x202e, 0x200b), 'ru')).toBe('📎 file — файл удалён');
+  });
+
   it.each([[null], [undefined], [''], ['xx'], ['klingon']])('язык %p — фолбэк ru', (lang) => {
     expect(deletedUploadLine('a.png', lang as string | null | undefined)).toBe('📎 a.png — файл удалён');
   });

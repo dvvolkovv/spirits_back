@@ -184,6 +184,26 @@ describe('ChatUploadsService.deleteForOwner', () => {
     expect(language.resolveUserLanguage).toHaveBeenCalledWith(OWNER);
   });
 
+  // Искомая строка — посимвольно та, что записал upload-and-chat (сырое имя
+  // через uploadHistoryLink), иначе replace её не найдёт. Замена — для глаз
+  // человека: имя через safeFileName, RLO и невидимые символы в пузырь не идут.
+  it('имя с RLO: ищется сырая строка истории, в замене — очищенное имя', async () => {
+    const rlo = String.fromCodePoint(0x202e);
+    const zwsp = String.fromCodePoint(0x200b);
+    const rawName = `счёт${rlo}fdp.exe${zwsp}`;
+    const { service, queries } = makeHarness({ row: recordRow({ original_name: rawName }), lang: 'en' });
+
+    await service.deleteForOwner({ id: RECORD_ID, userId: OWNER });
+
+    const update = queries[queries.length - 1];
+    expect(update.sql).toBe(HISTORY_SQL);
+    expect(update.params[1]).toBe(uploadHistoryLink(rawName, `/webhook/chat-uploads/${RECORD_ID}`));
+    expect(update.params[1]).toContain(rlo);
+    expect(update.params[2]).toBe('📎 счётfdp.exe — file deleted');
+    expect(update.params[2]).not.toContain(rlo);
+    expect(update.params[2]).not.toContain(zwsp);
+  });
+
   it('без LanguageService — строка «файл удалён» по-русски', async () => {
     const { service, queries } = makeHarness({ withLanguage: false });
 
