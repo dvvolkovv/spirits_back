@@ -30,6 +30,7 @@ import { ChatUploadsService, ChatUploadRecord } from './chat-uploads/chat-upload
 // удалением загрузки (deleteForOwner ищет ровно эту строку), поэтому в
 // отдельном модуле.
 import { uploadHistoryLink } from './chat-uploads/markdown-name';
+import { errKind } from './chat-uploads/err-kind';
 
 // Потолок загрузки и зачем он именно такой — в upload-limits.ts, вместе с
 // самой константой (менять его можно только вместе с ОБОИМИ nginx).
@@ -49,6 +50,12 @@ function chatUploadsSaveBudgetMs(): number {
   const parsed = Number(process.env.CHAT_UPLOADS_SAVE_BUDGET_MS);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : CHAT_UPLOADS_SAVE_BUDGET_MS_DEFAULT;
 }
+
+/**
+ * scan-document есть только у Маши (ассистент 3, chat.service: «Маша-only
+ * путь»): фронт отправляет туда PDF, только когда выбрана она.
+ */
+const SCAN_DOCUMENT_ASSISTANT_ID = 3;
 
 @Controller('')
 export class ChatController {
@@ -737,10 +744,65 @@ export class ChatController {
     return res.status(200).json(result);
   }
 
+  /**
+   * PDF из scan-document — в реестр загрузок (spec 2026-11-16-chat-uploads-media-notes):
+   * source='scan', основная сессия Маши `<userId>_3`. Поля «Чистого листа»
+   * (fresh/freshTs) здесь сознательно не читаются: лента у ассистента одна
+   * (feat/context-reset). Файл появляется в панели «Медиа и файлы» переписки с
+   * Машей, а ассистенты видят его в блоке загрузок и через find_files.
+   * Бюджет и гашение проигравшего гонку — как у upload-and-chat. В журнал —
+   * только вид ошибки: в сессии номер телефона, имя файла и текст ошибки
+   * (S3/pg повторяют ключ с именем) туда не пишутся. Никогда не бросает: сбой
+   * сохранения разбор не прерывает.
+   */
+  private async saveScanOriginal(userId: string, file: any): Promise<void> {
+    if (process.env.CHAT_UPLOADS_ENABLED !== 'true' || !this.chatUploads) return;
+    const sessionId = `${userId}_${SCAN_DOCUMENT_ASSISTANT_ID}`;
+    const budgetMs = chatUploadsSaveBudgetMs();
+    let budgetTimer: NodeJS.Timeout | undefined;
+    let budgetExceeded = false;
+    try {
+      const savePromise = this.chatUploads.saveOriginals({
+        userId,
+        sessionId,
+        files: [{
+          buffer: file.buffer,
+          originalname: decodeMultipartFilename(file.originalname) || 'document.pdf',
+          mimetype: file.mimetype || 'application/pdf',
+        }],
+        source: 'scan',
+      });
+      // Проигравший гонку saveOriginals может дорезолвиться (или упасть) уже
+      // после бюджета: результат игнорируется, а reject гасится.
+      void savePromise.catch(() => {});
+      const result = await Promise.race([
+        savePromise,
+        new Promise<never>((_, reject) => {
+          budgetTimer = setTimeout(() => {
+            budgetExceeded = true;
+            reject(new Error(`save budget ${budgetMs}ms exceeded`));
+          }, budgetMs);
+        }),
+      ]);
+      if (result.failed.length > 0) {
+        this.logger.warn('[scan-document] исходник не сохранился, разбор продолжается');
+      }
+    } catch (e: any) {
+      // Бюджет — наш собственный текст без данных; остальное — только вид.
+      const why = budgetExceeded ? `save budget ${budgetMs}ms exceeded` : errKind(e);
+      this.logger.warn(`[scan-document] saveOriginals не завершилась (${why}), разбор продолжается`);
+    } finally {
+      if (budgetTimer) clearTimeout(budgetTimer);
+    }
+  }
+
   @Post('scan-document')
   @UseGuards(JwtGuard)
   async scanDocument(@CurrentUser() user: any, @Req() req: Request, @Res() res: Response) {
     let cwd: string | null = null;
+    // Сохранение исходника идёт параллельно с разбором; ждём его в finally,
+    // когда ответ уже отправлен, — висящих промисов обработчик не оставляет.
+    let scanSave: Promise<void> | null = null;
     try {
       // Handle multipart file upload via multer
       const multer = require('multer');
@@ -754,6 +816,10 @@ export class ChatController {
 
       const file = (req as any).file;
       if (!file) return res.status(400).json({ error: 'No file uploaded' });
+
+      // Исходник PDF — в реестр загрузок, в сессию Маши: файл виден в панели и
+      // ассистентам в следующих ходах. Параллельно с разбором; сбой не роняет разбор.
+      scanSave = this.saveScanOriginal(String(user.userId), file);
 
       // Записываем загруженный файл в одноразовый cwd, разрешаем Read tool —
       // SDK прочитает PDF/изображение нативно через vision Claude.
@@ -814,6 +880,7 @@ export class ChatController {
       if (cwd) {
         await fsp.rm(cwd, { recursive: true, force: true }).catch(() => {});
       }
+      if (scanSave) await scanSave;
     }
   }
 }
