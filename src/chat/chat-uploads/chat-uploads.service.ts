@@ -243,9 +243,9 @@ export class ChatUploadsService {
    * WebP-миниатюра картинки рядом с оригиналом (thumbs/<storage_key>.webp).
    * Никогда не бросает. mime не из белого списка (isThumbnailableMime: SVG,
    * BMP, ICO, HEIC, не картинки) — null молча. Не получилась или не легла в
-   * MinIO — null с предупреждением: экранированное имя, mime и причина, без
-   * байтов и без сырого текста sharp. Файл сохраняется без миниатюры — фронт
-   * покажет значок.
+   * MinIO — null с предупреждением: id объекта (storageKeyLogId), тип mime и
+   * причина или вид ошибки (errKind) — без имени файла, байтов и сырого
+   * текста sharp/S3. Файл сохраняется без миниатюры — фронт покажет значок.
    *
    * Бюджет вызова (UPLOAD_THUMB_CALL_BUDGET_MS): место под рендер ждём не
    * дольше остатка; срок вышел или уже был busy/timeout (процесс перегружен,
@@ -259,9 +259,13 @@ export class ChatUploadsService {
     budget: ThumbCallBudget,
   ): Promise<string | null> {
     if (!isThumbnailableMime(mime)) return null;
+    const keyId = this.storageKeyLogId(storageKey);
+    // Только тип: он уже прошёл белый список, а параметры после «;» клиент
+    // пишет сам — в них может оказаться имя файла.
+    const mimeType = mime.split(';')[0].trim().toLowerCase();
     const skipped = (reason: string): null => {
       this.logger.warn(
-        `saveOriginals: thumbnail skipped for ${this.logName(file.originalname)} (${JSON.stringify(mime.slice(0, 100))}): ${reason}`,
+        `saveOriginals: thumbnail skipped (key=${keyId}, mime=${JSON.stringify(mimeType)}): ${reason}`,
       );
       return null;
     };
@@ -289,26 +293,27 @@ export class ChatUploadsService {
       });
       return key;
     } catch (e: any) {
-      this.logger.warn(
-        `saveOriginals: thumbnail upload failed for ${this.logName(file.originalname)}: ${this.errDetail(e)}`,
-      );
+      this.logger.warn(`saveOriginals: thumbnail upload failed (key=${keyId}): ${errKind(e)}`);
       // Сбой PutObject неоднозначен: объект мог лечь, а ответ — потеряться.
       // Строки с этим ключом не будет, поэтому ключ чистим сразу
       // (DeleteObject идемпотентен — удалить несуществующее не ошибка).
       try {
         await this.storage.delete({ bucket: BUCKET, key });
       } catch (cleanupError: any) {
-        this.logger.warn(
-          `saveOriginals: thumbnail cleanup delete failed for ${this.logName(file.originalname)}: ${this.errDetail(cleanupError)}`,
-        );
+        this.logger.warn(`saveOriginals: thumbnail cleanup delete failed (key=${keyId}): ${errKind(cleanupError)}`);
       }
       return null;
     }
   }
 
-  /** Имя файла для журнала: в кавычках и экранировано — перевод строки в имени не подделает запись. */
-  private logName(name: string): string {
-    return JSON.stringify(String(name)).slice(0, 200);
+  /**
+   * Обезличенный id объекта для журнала: первый сегмент storage_key — это
+   * случайный uuid (`<uuid>/<имя>`), в кавычках через logId. По нему в бакете
+   * находятся и оригинал (`<uuid>/…`), и миниатюра (`thumbs/<uuid>/…`); имени
+   * файла, сессии и телефона в нём нет.
+   */
+  private storageKeyLogId(storageKey: string): string {
+    return logId(storageKey.split('/', 1)[0]);
   }
 
   ownerUrl(id: string): string {
@@ -634,13 +639,6 @@ export class ChatUploadsService {
       `комментарий: ${note || UPLOAD_NOTE_MISSING}`,
     ].join(' | ');
     return `${head}\n  ${this.assistantUrl(record.id)}`;
-  }
-
-  /** Вид и сообщение ошибки — без байтов, подписей и секретов. */
-  private errDetail(e: any): string {
-    const name = e?.name || 'Error';
-    const message = typeof e?.message === 'string' ? e.message : '';
-    return `${name}: ${message}`.slice(0, 300);
   }
 
   private row(row: any): ChatUploadRecord {
