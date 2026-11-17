@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import { ChatFilesService, SESSION_FILES_SQL } from './chat-files.service';
 import { ChatUploadRecord, ChatUploadsService } from '../chat-uploads/chat-uploads.service';
 
@@ -230,13 +231,46 @@ describe('ChatFilesService.listForSession с CHAT_UPLOADS_ENABLED: загруз�
   it('сбой реестра загрузок не роняет панель: файлы ассистента отдаются без загрузок', async () => {
     const pg = makePg([{ id: 20, content: `![](${AI_IMG})`, created_at: '2026-10-05T10:00:00Z' }]);
     const { uploads, list } = makeUploads([]);
-    list.mockRejectedValue(new Error('registry down'));
+    // Сообщение pg может повторять имя файла и ключ сессии — в журнал они попасть не должны.
+    list.mockRejectedValue(new Error('registry down: гостиная.jpg in u1_12'));
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
 
-    const items = await new ChatFilesService(pg as any, uploads).listForSession('u1', 'u1_12');
+    try {
+      const items = await new ChatFilesService(pg as any, uploads).listForSession('u1', 'u1_12');
 
-    expect(list).toHaveBeenCalledTimes(1);
-    expect(items.map((i) => i.key)).toEqual([AI_IMG]);
-    expect(items[0].origin).toBe('assistant');
+      expect(list).toHaveBeenCalledTimes(1);
+      expect(items.map((i) => i.key)).toEqual([AI_IMG]);
+      expect(items[0].origin).toBe('assistant');
+      // Контракт журнала: только вид ошибки (errKind), без текста, имени файла и сессии.
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith('listForSession: загрузки не прочитаны (Error)');
+      const logged = JSON.stringify(warn.mock.calls);
+      expect(logged).not.toContain('гостиная');
+      expect(logged).not.toContain('u1_12');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('имя загрузки — через safeFileName: bidi снят, ext по очищенному имени', async () => {
+    const RLO = String.fromCodePoint(0x202e);
+    const { uploads } = makeUploads([
+      upload({ originalName: `invoice${RLO}gpj.exe`, mime: 'application/octet-stream', thumbKey: null }),
+    ]);
+
+    const [item] = await new ChatFilesService(makePg([]) as any, uploads).listForSession('u1', 'u1_12');
+
+    expect(item.name).toBe('invoicegpj.exe');
+    expect(item.ext).toBe('exe');
+  });
+
+  it('имя загрузки с пробелами по краям — обрезано, ext по очищенному имени', async () => {
+    const { uploads } = makeUploads([upload({ originalName: 'фото.jpg  ' })]);
+
+    const [item] = await new ChatFilesService(makePg([]) as any, uploads).listForSession('u1', 'u1_12');
+
+    expect(item.name).toBe('фото.jpg');
+    expect(item.ext).toBe('jpg');
   });
 
   it('флаг не «true» (например «1») — реестр не опрашивается, ответ прежний', async () => {
