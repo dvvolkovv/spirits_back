@@ -17,7 +17,10 @@ import type {
 } from '../account-deletion/account-deletion.types';
 import type { ExtractEnv } from '../chat/chat-files/extract';
 import { ProfileModule } from './profile.module';
-import { ProfileAccountDeletionAdapter } from './profile-account-deletion.adapter';
+import {
+  deleteOwnedCoreRows,
+  ProfileAccountDeletionAdapter,
+} from './profile-account-deletion.adapter';
 import { ProfileAccountDeletionRecapture } from './profile-account-deletion.discovery';
 
 /**
@@ -676,6 +679,8 @@ maybe('profile account deletion against PostgreSQL (Task 17)', () => {
       [LOSER, JSON.stringify({ name: PROFILE_CANARY })]);
     await seedHistory(LOSER, PERSONAL_CANARY);
     await seedHistory(SURVIVOR, 'реплика survivor');
+    await seedContextReset(LOSER);
+    await seedContextReset(SURVIVOR);
     await pool.query(
       `INSERT INTO tg_user_identities (linkeon_user_id, tg_user_id) VALUES ($1,4545)`,
       [LOSER],
@@ -701,6 +706,9 @@ maybe('profile account deletion against PostgreSQL (Task 17)', () => {
     expect(survivor[0]).toMatchObject({ state: 'active', deletion_id: null });
     // Loser очищен и остался tombstone своего поколения.
     expect(await historyCount(LOSER)).toBe(0);
+    // Точки «Чистого листа»: у loser стёрта, у survivor на месте.
+    expect(await contextResetCount(LOSER)).toBe(0);
+    expect(await contextResetCount(SURVIVOR)).toBe(1);
     const loserProf = await rows(
       `SELECT profile_data, tokens, email FROM ai_profiles_consolidated WHERE user_id=$1`,
       [LOSER]);
@@ -771,7 +779,9 @@ maybe('profile account deletion against PostgreSQL (Task 17)', () => {
 
     expect(asserts).toBe(3);
     expect(neo4j.deleteUserGraphStrict).toHaveBeenCalledTimes(1);
-    // ROLLBACK: ни одна строка не удалена.
+    // Отмена до удалений: lockAndAssertCurrent бросает раньше первого
+    // DELETE, поэтому строки на месте. Настоящий откат уже выполненных
+    // удалений — в тесте «сбой посреди finalize» ниже.
     expect(await historyCount(USER)).toBe(1);
     expect(await contextResetCount(USER)).toBe(1);
     expect(await identityCount(USER)).toBe(1);
@@ -783,6 +793,67 @@ maybe('profile account deletion against PostgreSQL (Task 17)', () => {
     expect(u[0]).toMatchObject({
       state: 'active', deletion_id: NEW_DELETION_ID, password_hash: 'HASH-CANARY',
     });
+  });
+
+  it('условие поколения: после реактивации deleteOwnedCoreRows старого поколения точку не трогает', async () => {
+    await seedDeletedAccount({ userId: USER, deletionId: DELETION_ID });
+    await seedContextReset(USER);
+    await reactivate(USER, NEW_DELETION_ID);
+
+    // Мимо lockAndAssertCurrent: проверяем само выражение, а не fence перед ним.
+    await deleteOwnedCoreRows(db, { userId: USER, deletionId: DELETION_ID } as DeletionJobRow);
+
+    expect(await contextResetCount(USER)).toBe(1);
+  });
+
+  it('сбой посреди finalize — транзакция откатывает уже стёртые точки', async () => {
+    await seedDeletedAccount({ userId: USER, deletionId: DELETION_ID, hash: 'HASH-CANARY' });
+    await seedHistory(USER, PERSONAL_CANARY);
+    await seedContextReset(USER);
+    await pool.query(
+      `INSERT INTO ai_profiles_consolidated (user_id, tokens, profile_data)
+       VALUES ($1,12345,'{}'::jsonb)`, [USER]);
+    await seedCoreJob(USER, DELETION_ID, 'account.core.immediate');
+    const jobs = new AccountDeletionJobs(db as any);
+    const coreImmediateJob = await claimCoreJob(jobs, DELETION_ID);
+    // Клиент транзакции адаптера бросает на очистке профиля — она идёт ПОСЛЕ
+    // удаления точек, так что к сбою точка уже стёрта внутри транзакции.
+    const seen: string[] = [];
+    const failingDb = {
+      query: db.query,
+      getClient: async () => {
+        const client = await pool.connect();
+        return {
+          query: async (sql: string, params?: any[]) => {
+            const s = sql.replace(/\s+/g, ' ').trim();
+            seen.push(s.split(' ').slice(0, 3).join(' '));
+            if (s.startsWith('UPDATE ai_profiles_consolidated')) {
+              throw new Error('сбой посреди finalize');
+            }
+            return client.query(sql, params);
+          },
+          release: (err?: boolean) => client.release(err),
+        };
+      },
+    };
+    const adapter = new ProfileAccountDeletionAdapter(
+      failingDb as any,
+      jobs,
+      new ProfileAccountDeletionRecapture(db as any, new AccountDeletionPlanner([]), TEST_ENV),
+      { deleteUserGraphStrict: jest.fn(async () => undefined) } as any,
+      new AccountDeletionRegistry(),
+    );
+
+    await expect(adapter.execute(coreImmediateJob, makeCtx(jobs)))
+      .rejects.toThrow('сбой посреди finalize');
+
+    // Не вакуумно: DELETE точек успел выполниться до сбоя, а затем — ROLLBACK.
+    expect(seen).toContain('DELETE FROM chat_context_resets');
+    expect(seen.indexOf('DELETE FROM chat_context_resets'))
+      .toBeLessThan(seen.indexOf('UPDATE ai_profiles_consolidated SET'));
+    expect(seen).toContain('ROLLBACK');
+    expect(await contextResetCount(USER)).toBe(1);
+    expect(await historyCount(USER)).toBe(1);
   });
 
   it('pending stop после recapture — retryable отказ до graph, данные целы', async () => {

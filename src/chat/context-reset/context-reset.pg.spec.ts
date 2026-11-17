@@ -4,22 +4,42 @@ import { ChatContextResetService } from './context-reset.service';
 
 const PG = process.env.PROVISIONING_PG_URL;
 const maybe = PG ? describe : describe.skip;
+// Своя схема на процесс: таблицу user_id в public заводят (IF NOT EXISTS) и
+// чистят многие pg-спеки удаления — общая с ними таблица гонялась бы.
+const SCHEMA = `context_reset_spec_${process.pid}`;
 
 maybe('ChatContextResetService (pg)', () => {
+  let admin: Pool;
   let pool: Pool;
   let svc: ChatContextResetService;
 
   beforeAll(async () => {
-    pool = new Pool({ connectionString: PG, max: 2 });
+    admin = new Pool({ connectionString: PG, max: 1 });
+    await admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`);
+    await admin.query(`CREATE SCHEMA ${SCHEMA}`);
+    pool = new Pool({ connectionString: PG, max: 2, options: `-c search_path=${SCHEMA}` });
+    // user_id — колонки признака удаления дословно из 001_core_schema.sql
+    // (internal_id, state); reset сверяет по ним, удалён ли аккаунт.
+    await pool.query(`
+      CREATE TABLE user_id (
+          state text,
+          internal_id character varying NOT NULL UNIQUE
+      )
+    `);
     svc = new ChatContextResetService({ query: (sql: string, p?: any[]) => pool.query(sql, p) } as any);
     await svc.migrate();
     await svc.migrate(); // повторный старт не падает
   });
   afterAll(async () => {
-    await pool?.query('DROP TABLE IF EXISTS chat_context_resets');
     await pool?.end();
+    await admin?.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`);
+    await admin?.end();
   });
-  beforeEach(async () => { await pool.query('TRUNCATE chat_context_resets'); });
+  beforeEach(async () => { await pool.query('TRUNCATE chat_context_resets, user_id'); });
+
+  async function seedUser(internalId: string, state: string | null): Promise<void> {
+    await pool.query('INSERT INTO user_id (internal_id, state) VALUES ($1, $2)', [internalId, state]);
+  }
 
   it('без точки — null', async () => {
     expect(await svc.get('u1', '10')).toBeNull();
@@ -85,6 +105,35 @@ maybe('ChatContextResetService (pg)', () => {
     expect(await svc.get('u1', '10')).toBeNull();
     const at = await svc.reset('u1', '10', new Date(LEGACY_FRESH_MIN_MS));
     expect(at.getTime()).toBe(LEGACY_FRESH_MIN_MS);
+  });
+
+  it('удалённому аккаунту точка не пишется: access-токен живёт после удаления, строка осталась бы сиротой', async () => {
+    await seedUser('u1', 'deleted');
+    await expect(svc.reset('u1', '10')).rejects.toThrow('account deleted');
+    // Явная метка старого клиента (applyLegacyFresh) — тот же отказ.
+    await expect(svc.reset('u1', '10', new Date('2026-11-02T08:00:00Z'))).rejects.toThrow('account deleted');
+    expect(await svc.get('u1', '10')).toBeNull();
+    const { rows } = await pool.query('SELECT count(*)::int AS n FROM chat_context_resets');
+    expect(rows[0].n).toBe(0);
+  });
+
+  it('удалённому аккаунту прежняя точка не сдвигается', async () => {
+    await svc.reset('u1', '10', new Date('2026-11-02T08:00:00Z'));
+    await seedUser('u1', 'deleted');
+    await expect(svc.reset('u1', '10')).rejects.toThrow('account deleted');
+    expect((await svc.get('u1', '10'))?.toISOString()).toBe('2026-11-02T08:00:00.000Z');
+  });
+
+  it('живой аккаунт (state active или NULL у старых строк) — точка пишется, как раньше', async () => {
+    await seedUser('u-active', 'active');
+    await seedUser('u-legacy', null);
+    const a = await svc.reset('u-active', '10', new Date('2026-11-02T08:00:00Z'));
+    const b = await svc.reset('u-legacy', '10', new Date('2026-11-02T08:00:00Z'));
+    expect(a.toISOString()).toBe('2026-11-02T08:00:00.000Z');
+    expect(b.toISOString()).toBe('2026-11-02T08:00:00.000Z');
+    // Удалён другой аккаунт — на чужую точку это не влияет.
+    await seedUser('u-gone', 'deleted');
+    expect((await svc.reset('u-active', '12')).getTime()).toBeGreaterThan(Date.now() - 5000);
   });
 
   it('таблица не принимает бесконечную точку: из-за GREATEST она стёрла бы память навсегда', async () => {
