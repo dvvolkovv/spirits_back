@@ -1,5 +1,10 @@
 // src/common/services/storage.service.spec.ts
-import { DeleteObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
+import {
+  CreateBucketCommand,
+  DeleteObjectCommand,
+  HeadBucketCommand,
+  PutObjectCommand,
+} from '@aws-sdk/client-s3';
 import { StorageService } from './storage.service';
 
 describe('StorageService.upload', () => {
@@ -139,5 +144,107 @@ describe('StorageService.deleteConfirmed', () => {
     const send = jest.fn(async () => { throw err; });
     const svc = make(send);
     await expect(svc.delete({ bucket: 'b', key: 'k' })).rejects.toBe(err);
+  });
+});
+
+/**
+ * createBucketIfAbsent: сначала HeadBucket, CreateBucket — только когда
+ * бакета нет. У ключа приложения на проде может не быть s3:CreateBucket, а
+ * MinIO проверяет право раньше существования: голый CreateBucket падал бы
+ * AccessDenied на каждом сохранении в существующий бакет. Успех
+ * запоминается на бакет — повторный вызов в сеть не ходит; сбой не
+ * запоминается.
+ */
+describe('StorageService.createBucketIfAbsent', () => {
+  const svcWith = (send: jest.Mock) => {
+    const svc = new StorageService();
+    (svc as any).s3 = { send };
+    return svc;
+  };
+  const s3Error = (name: string, status: number) =>
+    Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
+  const sentTypes = (send: jest.Mock) => send.mock.calls.map((call) => call[0]?.constructor);
+
+  it('HeadBucket 200 — бакет есть, CreateBucket не шлётся', async () => {
+    const send = jest.fn().mockResolvedValue({});
+    await svcWith(send).createBucketIfAbsent('linkeon-chat-uploads');
+    expect(sentTypes(send)).toEqual([HeadBucketCommand]);
+    expect((send.mock.calls[0][0] as HeadBucketCommand).input.Bucket).toBe('linkeon-chat-uploads');
+  });
+
+  it('HeadBucket 404 (NotFound) — шлётся CreateBucket на тот же бакет', async () => {
+    const send = jest.fn()
+      .mockRejectedValueOnce(s3Error('NotFound', 404))
+      .mockResolvedValueOnce({});
+    await svcWith(send).createBucketIfAbsent('linkeon-chat-uploads');
+    expect(sentTypes(send)).toEqual([HeadBucketCommand, CreateBucketCommand]);
+    expect((send.mock.calls[1][0] as CreateBucketCommand).input.Bucket).toBe('linkeon-chat-uploads');
+  });
+
+  it('HeadBucket NoSuchBucket — тоже CreateBucket', async () => {
+    const send = jest.fn()
+      .mockRejectedValueOnce(s3Error('NoSuchBucket', 404))
+      .mockResolvedValueOnce({});
+    await svcWith(send).createBucketIfAbsent('b');
+    expect(sentTypes(send)).toEqual([HeadBucketCommand, CreateBucketCommand]);
+  });
+
+  it('бакет создан параллельно (BucketAlreadyOwnedByYou / BucketAlreadyExists) — не ошибка', async () => {
+    for (const name of ['BucketAlreadyOwnedByYou', 'BucketAlreadyExists']) {
+      const send = jest.fn()
+        .mockRejectedValueOnce(s3Error('NotFound', 404))
+        .mockRejectedValueOnce(s3Error(name, 409));
+      await expect(svcWith(send).createBucketIfAbsent('b')).resolves.toBeUndefined();
+      expect(sentTypes(send)).toEqual([HeadBucketCommand, CreateBucketCommand]);
+    }
+  });
+
+  it('HeadBucket 403 — ошибка наружу, CreateBucket не шлётся', async () => {
+    const send = jest.fn().mockRejectedValueOnce(s3Error('Forbidden', 403));
+    await expect(svcWith(send).createBucketIfAbsent('b')).rejects.toMatchObject({ name: 'Forbidden' });
+    expect(sentTypes(send)).toEqual([HeadBucketCommand]);
+  });
+
+  it('CreateBucket упал не на BucketAlready* — ошибка наружу', async () => {
+    const send = jest.fn()
+      .mockRejectedValueOnce(s3Error('NotFound', 404))
+      .mockRejectedValueOnce(s3Error('AccessDenied', 403));
+    await expect(svcWith(send).createBucketIfAbsent('b')).rejects.toMatchObject({ name: 'AccessDenied' });
+  });
+
+  it('после успеха повторный вызов в сеть не ходит', async () => {
+    const send = jest.fn().mockResolvedValue({});
+    const svc = svcWith(send);
+    await svc.createBucketIfAbsent('b');
+    await svc.createBucketIfAbsent('b');
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('после создания повторный вызов в сеть тоже не ходит', async () => {
+    const send = jest.fn()
+      .mockRejectedValueOnce(s3Error('NotFound', 404))
+      .mockResolvedValueOnce({});
+    const svc = svcWith(send);
+    await svc.createBucketIfAbsent('b');
+    await svc.createBucketIfAbsent('b');
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  it('успех запоминается на бакет: другой бакет проверяется отдельно', async () => {
+    const send = jest.fn().mockResolvedValue({});
+    const svc = svcWith(send);
+    await svc.createBucketIfAbsent('a');
+    await svc.createBucketIfAbsent('b');
+    expect(send.mock.calls.map((call) => call[0].input.Bucket)).toEqual(['a', 'b']);
+  });
+
+  it('сбой не запоминается: следующий вызов проверяет заново', async () => {
+    const send = jest.fn()
+      .mockRejectedValueOnce(s3Error('Forbidden', 403))
+      .mockResolvedValueOnce({});
+    const svc = svcWith(send);
+    await expect(svc.createBucketIfAbsent('b')).rejects.toBeTruthy();
+    await expect(svc.createBucketIfAbsent('b')).resolves.toBeUndefined();
+    expect(sentTypes(send)).toEqual([HeadBucketCommand, HeadBucketCommand]);
   });
 });

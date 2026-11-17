@@ -27,6 +27,14 @@ import {
 import { StorageService } from '../common/services/storage.service';
 import { ownedObjectKeyOrThrow } from '../misc/misc.service';
 import { isUnsafeUrlError } from '../common/net/safe-fetch';
+import { ChatUploadsService } from '../chat/chat-uploads/chat-uploads.service';
+import {
+  ChatUploadSourceError,
+  VEO_SOURCE_IMAGE_MIMES,
+  canonicalChatUploadUrl,
+  chatUploadSourceId,
+  readChatUploadImage,
+} from '../chat/chat-uploads/upload-image-source';
 import { S3Client, PutObjectCommand, DeleteObjectCommand, CreateBucketCommand, PutBucketPolicyCommand } from '@aws-sdk/client-s3';
 import { spawn } from 'child_process';
 import * as fs from 'fs';
@@ -63,6 +71,12 @@ export interface VideoPurgeSkips {
  * retry external_unknown вместо вечного цикла.
  */
 export const VIDEO_UPLOADS_MAX_LIST_PAGES = 10_000;
+
+/** Предел одного референс-фото Veo — и для внешней ссылки, и для загрузки пользователя. */
+const VEO_PORTRAIT_MAX_BYTES = 12 * 1024 * 1024;
+
+/** Загрузка пользователя как портрет: предел и форматы Omni (png, jpeg, webp). */
+const VEO_UPLOAD_SOURCE = { maxBytes: VEO_PORTRAIT_MAX_BYTES, allowedMimes: VEO_SOURCE_IMAGE_MIMES };
 
 export class InsufficientTokensError extends Error {
   status = 402;
@@ -130,6 +144,9 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     // Account-deletion purge (Task 12) удаляет объекты видео-бакета через
     // подтверждённый исход StorageService.deleteConfirmed, а не голым send.
     @Optional() private readonly storage?: StorageService,
+    // Загрузки чата как портрет для image2video (spec 2026-11-16-chat-uploads-media-notes).
+    // Последним и @Optional — спеки собирают сервис позиционно.
+    @Optional() private readonly chatUploads?: ChatUploadsService,
   ) {}
 
   /**
@@ -879,10 +896,11 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   // ================= VEO 3.1 PROVIDER =================
 
   // Скачать до 3 референс-фото в base64 для Veo referenceImages (Ingredients).
-  private async fetchReferenceImagesB64(urls: string[]): Promise<Array<{ b64: string; mime: string }>> {
+  // userId — владелец задачи: по нему читаются загрузки пользователя.
+  private async fetchReferenceImagesB64(urls: string[], userId: string): Promise<Array<{ b64: string; mime: string }>> {
     const out: Array<{ b64: string; mime: string }> = [];
     for (const u of (urls || []).slice(0, 3)) {
-      const p = await this.fetchPortraitB64(u);
+      const p = await this.fetchPortraitB64(u, userId);
       if (p) out.push({ b64: p.b64, mime: p.mime });
     }
     return out;
@@ -891,9 +909,16 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   // Ссылки на фото приходят от человека или модели (sourceImageUrl[s]) —
   // качаем через fetchMediaBytes: своё (/static/, наш MinIO) напрямую, чужое —
   // с защитой от SSRF. Относительные '/…' он сам достраивает до нашего сайта.
-  private async fetchPortraitB64(url: string): Promise<{ b64: string; mime: string } | null> {
+  // Загрузка пользователя (/webhook/chat-uploads/<id>) читается из приватного
+  // бакета только владельцем задачи (upload-image-source.ts). Любой сбой —
+  // мягкий: фото пропускается, как и раньше. Отказы по загрузке приходят без
+  // текста S3 (ChatUploadSourceError, ChatUploadStorageError) — их сообщение
+  // можно писать в журнал как есть.
+  private async fetchPortraitB64(url: string, userId: string): Promise<{ b64: string; mime: string } | null> {
     try {
-      const media = await fetchMediaBytes(url, { maxBytes: 12 * 1024 * 1024, timeoutMs: 30000, allowHttp: true });
+      const upload = await readChatUploadImage(this.chatUploads, { url, userId, ...VEO_UPLOAD_SOURCE });
+      if (upload) return upload;
+      const media = await fetchMediaBytes(url, { maxBytes: VEO_PORTRAIT_MAX_BYTES, timeoutMs: 30000, allowHttp: true });
       const mime = media.contentType || 'image/jpeg';
       return { b64: media.data.toString('base64'), mime };
     } catch (e: any) {
@@ -1143,11 +1168,18 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     const toAbs = (u: string) => u.startsWith('/')
       ? (process.env.BACKEND_URL || 'https://my.linkeon.io').replace(/\/$/, '') + u
       : u;
+    // Загрузка пользователя хранится в задаче адресом БЕЗ подписи: подпись
+    // живёт час, а перезапуск сегмента и rerun поддержки читают фото позже —
+    // по владельцу задачи, а не по подписи.
+    const toJobUrl = (u: string) => {
+      const uploadId = chatUploadSourceId(u);
+      return uploadId ? canonicalChatUploadUrl(uploadId) : toAbs(u);
+    };
     const refUrls: string[] = (
       Array.isArray(dto.sourceImageUrls) && dto.sourceImageUrls.length
         ? dto.sourceImageUrls
         : (dto.sourceImageUrl ? [dto.sourceImageUrl] : [])
-    ).filter(Boolean).slice(0, 3).map(toAbs);
+    ).filter(Boolean).slice(0, 3).map(toJobUrl);
     if (mode === 'image2video' && refUrls.length === 0) {
       throw new BadRequestException('image2video requires sourceImageUrl(s)');
     }
@@ -1156,6 +1188,17 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     // молча — и человек заплатил бы за ролик без своего лица. Сетевые сбои
     // здесь не повод отказывать: фото пропустится, как и раньше.
     for (const u of refUrls) {
+      // Загрузка пользователя проверяется по реестру: владелец, формат (png,
+      // jpeg, webp), размер. Чужая, удалённая или не картинка — 400 до
+      // списания. Сбой хранилища — как сетевой сбой: фото пропустится при
+      // скачивании.
+      try {
+        if (await readChatUploadImage(this.chatUploads, { url: u, userId, ...VEO_UPLOAD_SOURCE })) continue;
+      } catch (e: any) {
+        if (e instanceof ChatUploadSourceError) throw new BadRequestException(`фото не принято: ${e.message}`);
+        this.logger.warn(`Veo upload precheck failed: ${e.message}`);
+        continue;
+      }
       try {
         await assertFetchableMedia(u, { allowHttp: true });
       } catch (e: any) {
@@ -1231,7 +1274,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     try {
       // Портрет(ы) → referenceImages (Veo Ingredients): сходство по всему ролику.
       // С чётким промптом речь сохраняется (проверено 3 фото + реплика → есть звук).
-      const refImages = await this.fetchReferenceImagesB64(refUrls);
+      const refImages = await this.fetchReferenceImagesB64(refUrls, userId);
       const operation = await this.veo.startGenerate({
         prompt: segmentPrompts[0] ?? prompt, durationSeconds: VEO_BASE_SEC,
         aspectRatio, resolution: effectiveResolution,
@@ -1270,7 +1313,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         const refUrls = plan.veo_reference_images?.length
           ? plan.veo_reference_images
           : (job.source_image_url ? [job.source_image_url] : []);
-        const refImages = await this.fetchReferenceImagesB64(refUrls);
+        const refImages = await this.fetchReferenceImagesB64(refUrls, job.user_id);
         const op = await this.veo.startGenerate({
           prompt: plan.veo_segment_prompts?.[plan.segments_done] ?? job.prompt ?? '', durationSeconds: VEO_BASE_SEC,
           aspectRatio: plan.veo_aspect_ratio ?? '9:16', resolution: plan.veo_resolution ?? '720p',
@@ -1287,7 +1330,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         const refUrls = plan.veo_reference_images?.length
           ? plan.veo_reference_images
           : (job.source_image_url ? [job.source_image_url] : []);
-        const refImages = await this.fetchReferenceImagesB64(refUrls);
+        const refImages = await this.fetchReferenceImagesB64(refUrls, job.user_id);
         const op = await this.veo.startGenerate({
           prompt: plan.veo_segment_prompts?.[0] ?? job.prompt ?? '', durationSeconds: VEO_BASE_SEC,
           aspectRatio: plan.veo_aspect_ratio ?? '16:9', resolution: plan.veo_resolution ?? '720p',
@@ -1461,6 +1504,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       try {
         const refImages = await this.fetchReferenceImagesB64(
           plan.veo_reference_images?.length ? plan.veo_reference_images : (job.source_image_url ? [job.source_image_url] : []),
+          job.user_id,
         );
         const op = await this.veo.startGenerate({
           prompt: plan.veo_segment_prompts?.[plan.segments_done] ?? job.prompt ?? '', durationSeconds: VEO_BASE_SEC,

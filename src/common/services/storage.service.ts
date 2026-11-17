@@ -6,6 +6,7 @@ import {
   GetObjectCommand,
   CreateBucketCommand,
   DeleteObjectCommand,
+  HeadBucketCommand,
   HeadObjectCommand,
   ListObjectsV2Command,
 } from '@aws-sdk/client-s3';
@@ -67,6 +68,8 @@ export class StorageService implements OnModuleInit {
   private readonly logger = new Logger(StorageService.name);
   private s3!: S3Client;
   private publicBaseUrl!: string;
+  /** Бакеты, наличие которых уже подтверждено в этом процессе (createBucketIfAbsent). */
+  private readonly ensuredBuckets = new Set<string>();
 
   onModuleInit(): void {
     const endpoint = process.env.MINIO_ENDPOINT;
@@ -90,13 +93,32 @@ export class StorageService implements OnModuleInit {
     this.logger.log(`StorageService initialized: endpoint=${endpoint} publicBase=${this.publicBaseUrl}`);
   }
 
+  /**
+   * Бакет есть или создан. Сначала HeadBucket: у ключа приложения на проде
+   * может не быть s3:CreateBucket, а MinIO проверяет право раньше
+   * существования — голый CreateBucket падал бы AccessDenied и на
+   * существующем бакете. CreateBucket — только если HeadBucket ответил
+   * «нет такого» (NotFound / NoSuchBucket / 404); BucketAlready* при этом не
+   * ошибка — бакет мог создать соседний вызов. Прочие ошибки HeadBucket
+   * (403, сеть, 5xx) — наружу.
+   *
+   * Успех запоминается на бакет до конца процесса: повторный вызов в сеть не
+   * ходит. Сбой не запоминается — следующий вызов проверит заново.
+   */
   async createBucketIfAbsent(bucket: string): Promise<void> {
+    if (this.ensuredBuckets.has(bucket)) return;
     try {
-      await this.s3.send(new CreateBucketCommand({ Bucket: bucket }));
+      await this.s3.send(new HeadBucketCommand({ Bucket: bucket }));
     } catch (e: any) {
-      const code = e?.name || e?.Code || e?.code || '';
-      if (!/BucketAlready/.test(code)) throw e;
+      if (!isMissingBucket(e)) throw e;
+      try {
+        await this.s3.send(new CreateBucketCommand({ Bucket: bucket }));
+      } catch (createError: any) {
+        const code = createError?.name || createError?.Code || createError?.code || '';
+        if (!/BucketAlready/.test(code)) throw createError;
+      }
     }
+    this.ensuredBuckets.add(bucket);
   }
 
   async upload(input: UploadInput): Promise<string> {
@@ -247,4 +269,14 @@ export class StorageService implements OnModuleInit {
   publicUrl(bucket: string, key: string): string {
     return `${this.publicBaseUrl}/${bucket}/${key}`;
   }
+}
+
+/** HeadBucket ответил «бакета нет»: у HeadBucket нет тела, SDK даёт NotFound и 404. */
+function isMissingBucket(e: any): boolean {
+  return (
+    e?.name === 'NotFound'
+    || e?.name === 'NoSuchBucket'
+    || e?.Code === 'NoSuchBucket'
+    || e?.$metadata?.httpStatusCode === 404
+  );
 }

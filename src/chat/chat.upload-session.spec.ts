@@ -336,6 +336,11 @@ const UPLOAD_RECORD = {
   sha256: '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824',
   storageKey: 'synthetic/a.pdf',
   createdAt: '2026-11-13T00:00:00.000Z',
+  source: 'web',
+  thumbKey: null,
+  note: null,
+  noteUpdatedAt: null,
+  noteAssistantId: null,
 };
 const UPLOAD_LINK = '📎 [a.pdf](/webhook/chat-uploads/11111111-1111-4111-8111-111111111111)';
 
@@ -480,6 +485,55 @@ describe('uploadAndChat: бюджет сохранения исходников 
     // Ничего не сохранено — история в прежнем формате, без ссылок.
     expect(persist).toHaveBeenCalledTimes(1);
     expect(persist.mock.calls[0][0].userMsg).toBe('📎 a.pdf\nчто тут написано?');
+  });
+
+  /** Строка журнала о несостоявшемся сохранении исходников; ctrl.logger подменён. */
+  const saveLines = (logger: { warn: jest.Mock }) =>
+    logger.warn.mock.calls.map((c) => String(c[0])).filter((line) => line.includes('saveOriginals'));
+
+  it('saveOriginals бросил до цикла — в журнале только вид ошибки, без ключа сессии и текста', async () => {
+    // Бросок до пофайлового цикла (createBucketIfAbsent при лежащем MinIO):
+    // сообщение повторяет ключ сессии (в нём телефон) и имя файла.
+    const chatUploads = makeChatUploadsMock({ saved: [], failed: [] });
+    chatUploads.saveOriginals.mockRejectedValueOnce(
+      Object.assign(new Error('connect ECONNREFUSED minio for u1_12 a.pdf'), { code: 'ECONNREFUSED' }),
+    );
+    const { ctrl, post } = setup(chatUploads, [{ type: 'delta', text: ANSWER }, { type: 'done' }]);
+    const logger = { warn: jest.fn(), log: jest.fn(), error: jest.fn(), debug: jest.fn() };
+    (ctrl as any).logger = logger;
+    const res = makeRes();
+
+    await ctrl.uploadAndChat(makeUploadReq('a.pdf', 'что тут написано?'), res);
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+
+    expect(post).toHaveBeenCalled();
+    expect(res.written).toContainEqual({
+      type: 'upload_persist_failed',
+      content: 'Файл не сохранён для будущих разговоров',
+    });
+    expect(saveLines(logger)).toEqual([
+      '[upload-and-chat] saveOriginals не завершилась (Error code=ECONNREFUSED), продолжаю без исходников',
+    ]);
+    const logged = JSON.stringify(logger.warn.mock.calls);
+    expect(logged).not.toContain('minio for');
+    expect(logged).not.toContain('u1_12');
+  });
+
+  it('saveOriginals не уложилась в бюджет — в журнале наш текст про бюджет, без ключа сессии', async () => {
+    const chatUploads = {
+      saveOriginals: jest.fn(() => new Promise<any>(() => {})),
+      ownerUrl: jest.fn((id: string) => `/webhook/chat-uploads/${id}`),
+    };
+    const { ctrl } = setup(chatUploads, [{ type: 'delta', text: ANSWER }, { type: 'done' }]);
+    const logger = { warn: jest.fn(), log: jest.fn(), error: jest.fn(), debug: jest.fn() };
+    (ctrl as any).logger = logger;
+
+    await ctrl.uploadAndChat(makeUploadReq('a.pdf', 'что тут написано?'), makeRes());
+    for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+
+    expect(saveLines(logger)).toEqual([
+      '[upload-and-chat] saveOriginals не завершилась (save budget 30ms exceeded), продолжаю без исходников',
+    ]);
   });
 
   it('быстрый saveOriginals — бюджет не срабатывает, upload_persist_failed нет', async () => {

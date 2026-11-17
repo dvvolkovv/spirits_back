@@ -26,20 +26,16 @@ import { stripProductActionBlocks } from '../products/product-action-tail';
 import { UserLlmProviderService } from '../common/services/user-llm-provider.service';
 import { relayProviderFields, resolveAnswerProvider } from './answer-provider';
 import { ChatUploadsService, ChatUploadRecord } from './chat-uploads/chat-uploads.service';
+// Строка истории `📎 [имя](url)` (шаблон и экранирование имени) — общая с
+// удалением загрузки (deleteForOwner ищет ровно эту строку), поэтому в
+// отдельном модуле.
+import { uploadHistoryLink } from './chat-uploads/markdown-name';
+import { errKind } from './chat-uploads/err-kind';
 
 // Потолок загрузки и зачем он именно такой — в upload-limits.ts, вместе с
 // самой константой (менять его можно только вместе с ОБОИМИ nginx).
 import { MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_TOTAL_BYTES } from './upload-limits';
 export { MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_TOTAL_BYTES };
-
-/**
- * Экранирование имени файла для markdown-ссылки в истории: `\`, `[`, `]`.
- * Имена приходят из multipart и могут содержать любые символы — без экранировки
- * имя с квадратной скобкой ломало бы ссылку `📎 [имя](url)` в сохранённой строке.
- */
-function markdownEscapeName(name: string): string {
-  return name.replace(/\\/g, '\\\\').replace(/\[/g, '\\[').replace(/\]/g, '\\]');
-}
 
 /**
  * Бюджет сохранения исходников ДО первого байта ответа (ревью I1, 13.11.2026),
@@ -54,6 +50,12 @@ function chatUploadsSaveBudgetMs(): number {
   const parsed = Number(process.env.CHAT_UPLOADS_SAVE_BUDGET_MS);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : CHAT_UPLOADS_SAVE_BUDGET_MS_DEFAULT;
 }
+
+/**
+ * scan-document есть только у Маши (ассистент 3, chat.service: «Маша-only
+ * путь»): фронт отправляет туда PDF, только когда выбрана она.
+ */
+const SCAN_DOCUMENT_ASSISTANT_ID = 3;
 
 @Controller('')
 export class ChatController {
@@ -350,14 +352,15 @@ export class ChatController {
       // иначе унесём unhandledRejection в уже идущий ответ (ревью I1).
       void savePromise.catch(() => {});
       let budgetTimer: NodeJS.Timeout | undefined;
+      let budgetExceeded = false;
       try {
         const result = await Promise.race([
           savePromise,
           new Promise<never>((_, reject) => {
-            budgetTimer = setTimeout(
-              () => reject(new Error(`save budget ${budgetMs}ms exceeded`)),
-              budgetMs,
-            );
+            budgetTimer = setTimeout(() => {
+              budgetExceeded = true;
+              reject(new Error(`save budget ${budgetMs}ms exceeded`));
+            }, budgetMs);
           }),
         ]);
         savedUploads = result.saved;
@@ -367,8 +370,12 @@ export class ChatController {
         // createBucketIfAbsent при недоступном MinIO — saveOriginals ловит
         // сбои только внутри цикла) и превышение бюджета. Ход не прерывается:
         // текущий ответ продолжается по прежнему relay-пути.
+        // Как в [scan-document]: бюджет — наш собственный текст без данных,
+        // остальное — только вид ошибки (errKind). Ключа сессии в строке нет:
+        // в нём номер телефона, а сообщения MinIO/pg повторяют имя файла.
+        const why = budgetExceeded ? `save budget ${budgetMs}ms exceeded` : errKind(e);
         this.logger.warn(
-          `[upload-and-chat] saveOriginals для ${userId}_${assistantId} не завершилась (${e?.message?.slice(0, 200) || e}), продолжаю без исходников`,
+          `[upload-and-chat] saveOriginals не завершилась (${why}), продолжаю без исходников`,
         );
         savedUploads = [];
         uploadPersistFailed = true;
@@ -413,8 +420,8 @@ export class ChatController {
     // скачивание (JWT владельца), несохранённые — прежним именем. При
     // выключенной фиче или пустом saved совпадает с прежней `📎 имена\nсообщение`
     // посимвольно (historyMerge.ts сверяет строки истории).
-    const uploadLinks = savedUploads.map(
-      (r) => `📎 [${markdownEscapeName(r.originalName)}](${this.chatUploads!.ownerUrl(r.id)})`,
+    const uploadLinks = savedUploads.map((r) =>
+      uploadHistoryLink(r.originalName, this.chatUploads!.ownerUrl(r.id)),
     );
     const failedUploadNames = files
       .filter((f: any) => !savedUploads.some((r) => r.originalName === f.originalname))
@@ -742,10 +749,66 @@ export class ChatController {
     return res.status(200).json(result);
   }
 
+  /**
+   * PDF из scan-document — в реестр загрузок (spec 2026-11-16-chat-uploads-media-notes):
+   * source='scan', всегда основная сессия Маши `<userId>_3`. Поля «Чистого
+   * листа» (fresh/freshTs) не читаются сознательно: у загрузок нет отдельной
+   * fresh-сессии, PDF в любом режиме лежит в основной переписке с Машей
+   * (её панель «Медиа и файлы», find_files). Почему — spec 2026-11-17-context-reset.
+   * Бюджет и гашение проигравшего гонку — как у upload-and-chat. В журнал —
+   * только вид ошибки: сессия (в ней номер телефона) не пишется, а в эту
+   * строку журнала имя файла и текст ошибки (S3/pg повторяют ключ с именем)
+   * не пишутся. Никогда не бросает: сбой сохранения разбор не прерывает.
+   */
+  private async saveScanOriginal(userId: string, file: any): Promise<void> {
+    if (process.env.CHAT_UPLOADS_ENABLED !== 'true' || !this.chatUploads) return;
+    const sessionId = `${userId}_${SCAN_DOCUMENT_ASSISTANT_ID}`;
+    const budgetMs = chatUploadsSaveBudgetMs();
+    let budgetTimer: NodeJS.Timeout | undefined;
+    let budgetExceeded = false;
+    try {
+      const savePromise = this.chatUploads.saveOriginals({
+        userId,
+        sessionId,
+        files: [{
+          buffer: file.buffer,
+          originalname: decodeMultipartFilename(file.originalname) || 'document.pdf',
+          mimetype: file.mimetype || 'application/pdf',
+        }],
+        source: 'scan',
+      });
+      // Проигравший гонку saveOriginals может дорезолвиться (или упасть) уже
+      // после бюджета: результат игнорируется, а reject гасится.
+      void savePromise.catch(() => {});
+      const result = await Promise.race([
+        savePromise,
+        new Promise<never>((_, reject) => {
+          budgetTimer = setTimeout(() => {
+            budgetExceeded = true;
+            reject(new Error(`save budget ${budgetMs}ms exceeded`));
+          }, budgetMs);
+        }),
+      ]);
+      if (result.failed.length > 0) {
+        this.logger.warn('[scan-document] исходник не сохранился, разбор продолжается');
+      }
+    } catch (e: any) {
+      // Бюджет — наш собственный текст без данных; остальное — только вид.
+      const why = budgetExceeded ? `save budget ${budgetMs}ms exceeded` : errKind(e);
+      this.logger.warn(`[scan-document] saveOriginals не завершилась (${why}), разбор продолжается`);
+    } finally {
+      if (budgetTimer) clearTimeout(budgetTimer);
+    }
+  }
+
   @Post('scan-document')
   @UseGuards(JwtGuard)
   async scanDocument(@CurrentUser() user: any, @Req() req: Request, @Res() res: Response) {
     let cwd: string | null = null;
+    // Сохранение идёт параллельно с разбором и ответ не задерживает; в finally
+    // (ответ уже ушёл) обработчик ждёт его не дольше бюджета. Пережившее бюджет
+    // сохранение доживает само — его отказ погашен в saveScanOriginal.
+    let scanSave: Promise<void> | null = null;
     try {
       // Handle multipart file upload via multer
       const multer = require('multer');
@@ -759,6 +822,10 @@ export class ChatController {
 
       const file = (req as any).file;
       if (!file) return res.status(400).json({ error: 'No file uploaded' });
+
+      // Исходник PDF — в реестр загрузок, в сессию Маши: файл виден в панели и
+      // ассистентам в следующих ходах. Параллельно с разбором; сбой не роняет разбор.
+      scanSave = this.saveScanOriginal(String(user.userId), file);
 
       // Записываем загруженный файл в одноразовый cwd, разрешаем Read tool —
       // SDK прочитает PDF/изображение нативно через vision Claude.
@@ -819,6 +886,7 @@ export class ChatController {
       if (cwd) {
         await fsp.rm(cwd, { recursive: true, force: true }).catch(() => {});
       }
+      if (scanSave) await scanSave;
     }
   }
 }

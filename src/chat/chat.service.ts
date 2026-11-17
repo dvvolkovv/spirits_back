@@ -34,12 +34,13 @@ import { WORK_RULES } from './work-rules';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
 import { LinkeonRelayFields, appendLinkeonFields, linkeonRelayFields, relayFsKey } from './linkeon-relay-fields';
-import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, LINKEON_HELP_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
+import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, LINKEON_HELP_CLI_TOOL_NAME, NOTE_FILE_CLI_PROMPT, NOTE_FILE_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
 import { ProductActionsService } from '../products/product-actions.service';
 import { productActionTail, stripProductActionBlocks } from '../products/product-action-tail';
 import { ChatFileStore, PERSIST_TURN_BUDGET_MS } from './chat-files/chat-file-store';
 import { RelayOutputFile, collectOutputFiles, outputFileLines, storeRelayLinks } from './chat-files/relay-links';
 import { ChatUploadsService } from './chat-uploads/chat-uploads.service';
+import { errKind } from './chat-uploads/err-kind';
 import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
@@ -1028,23 +1029,34 @@ export class ChatService {
   }
 
   /**
-   * Блок памяти загрузок сессии (spec 2026-11-13-chat-upload-memory, Task 6):
-   * до 10 последних исходников из реестра chat_uploads — имя и короткоживущая
-   * подписанная ссылка на чтение. Ротация вырезает блок `User uploaded files`
-   * из переносимого хвоста релея, поэтому память восстанавливается из реестра
-   * на КАЖДОМ ходе.
+   * Блок памяти загрузок сессии (spec 2026-11-13-chat-upload-memory, Task 6;
+   * строка файла — spec 2026-11-16, раздел 2): до 10 последних исходников из
+   * реестра chat_uploads, по строке на файл — id (его ассистент передаёт в
+   * note_file), имя, вид, дата загрузки, комментарий ассистента и, следующей
+   * строкой, короткоживущая подписанная ссылка на чтение (формат —
+   * ChatUploadsService.assistantBlock). Ротация вырезает блок `User uploaded
+   * files` из переносимого хвоста релея, поэтому память восстанавливается из
+   * реестра на КАЖДОМ ходе.
    *
-   * Результат — только в пер-ходовую часть промпта (тело реплики), никогда в
-   * buildRelayStablePrefix: подписи чеканятся заново каждый ход и в системном
-   * промпте сломали бы кэш релея.
+   * Релей: результат — только в пер-ходовую часть промпта (тело реплики),
+   * никогда в buildRelayStablePrefix: подписи чеканятся заново каждый ход и в
+   * системном промпте сломали бы кэш релея.
+   *
+   * Маша (локальный CLI, streamChat): блок идёт в opts.system — после
+   * волатильной части и перед хвостом языка, который обязан остаться
+   * последней строкой. Отдельного кэшируемого системного промпта у неё нет:
+   * ClaudeCliService склеивает system с репликой в одно тело `-p`.
    *
    * rawSessionId — сырой ключ сессии Postgres (custom_chat_history,
    * chat_uploads): freshSessionId или `${userId}_${assistantId}`, БЕЗ
    * языкового суффикса ключа релея.
    *
    * Флаг CHAT_UPLOADS_ENABLED выключен или реестра нет — пустая строка; сбой
-   * БД/MinIO логируется и тоже даёт пустую строку: ход не должен падать из-за
-   * памятки о файлах. Подписанные ссылки в лог не пишутся.
+   * БД или подписи логируется и тоже даёт пустую строку: ход не должен падать
+   * из-за памятки о файлах. В журнал — только вид ошибки (err-kind.ts):
+   * текст ошибки pg может повторять данные запроса, а ключ сессии содержит
+   * userId — у телефонных аккаунтов это номер телефона. Подписанные ссылки
+   * в лог не пишутся.
    */
   private async uploadContextBlock(
     userId: string,
@@ -1056,7 +1068,7 @@ export class ChatService {
       const records = await this.chatUploads.recentForSession(userId, rawSessionId, excludeIds || []);
       return this.chatUploads.assistantBlock(records);
     } catch (e: any) {
-      this.logger.warn(`upload context failed (${userId}, session ${rawSessionId}): ${e?.message}`);
+      this.logger.warn(`upload context failed: ${errKind(e)}`);
       return '';
     }
   }
@@ -1537,6 +1549,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const products = productsCliMcp(userId, 'web', { lang: userLanguage, client: clientKind(storeBuild, ui), agent: 'staff', turn: productsTurn });
     // Звали ли в этом ходе инструмент продуктов — от этого зависит карта ниже.
     let usedProductsTool = false;
+    // Комментарии к загрузкам (note_file) — только при включённой памяти
+    // загрузок: без флага точка продуктов инструмент не показывает, а блок про
+    // него в промпте обещал бы то, чего нет.
+    const uploadNotesOn = process.env.CHAT_UPLOADS_ENABLED === 'true';
+    // Память загрузок — тот же блок, что получают ассистенты релея
+    // (uploadContextBlock): id, имя, вид, дата, комментарий и подписанная
+    // ссылка. Ключ — сырой ключ сессии Postgres этого хода (chatSessionId:
+    // `<userId>_3` или fresh-сессия «Чистого листа»). Пинги мониторинга блок
+    // не везут — как на пути релея. Флаг, отсутствие реестра и сбой БД
+    // разбирает сам uploadContextBlock: во всех трёх случаях пустая строка.
+    const mashaUploadContext = probe ? '' : await this.uploadContextBlock(userId, chatSessionId);
 
     // Ход в полёте — тот же учёт, что у пути релея: deploy.sh перед рестартом
     // ждёт /chat/active-streams до нуля, фронт спрашивает /chat/active-turn.
@@ -1578,8 +1601,14 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // replyLanguageTail выше), а блок написан по-русски.
           // Правило карточек — только клиенту, который их рисует; до хвоста
           // языка, который обязан остаться последним.
+          // Блок загрузок — после волатильной части (подписи чеканятся каждый
+          // ход, стабильную часть они не трогают; отдельного кэшируемого
+          // system у CLI нет — см. uploadContextBlock) и до хвоста языка,
+          // который обязан остаться последней строкой.
           system: stableSystemPrompt + `\n\n${products.promptBlock}\n\n${FIND_FILES_CLI_PROMPT}` +
-            (ui.ask ? `\n\n${ASK_RULE}` : '') + dispatchVolatileSystemPrompt + replyLanguageTail,
+            (uploadNotesOn ? `\n\n${NOTE_FILE_CLI_PROMPT}` : '') +
+            (ui.ask ? `\n\n${ASK_RULE}` : '') + dispatchVolatileSystemPrompt +
+            (mashaUploadContext ? `\n\n${mashaUploadContext}` : '') + replyLanguageTail,
           // Модель Маши — общая с остальным чатом, см. common/chat-model.ts
           // (там же цена решения: пин не даунгрейдится при исчерпании лимита, и
           // как откатиться через env без выката). Биллинг юзеру идёт от costUsd.
@@ -1602,7 +1631,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // + поиск файлов прошлых разговоров (find-files.tool.ts) — у TG-бота
           // его нет; + сообщить в поддержку (src/problem-report) — есть у обоих;
           // + справка о Linkeon (platform-kb).
-          allowedTools: `${products.toolName},${FIND_FILES_CLI_TOOL_NAME},${REPORT_PROBLEM_CLI_TOOL_NAME},${LINKEON_HELP_CLI_TOOL_NAME}`,
+          // + комментарий к загрузке (note-file.tool.ts) — только при флаге
+          // CHAT_UPLOADS_ENABLED, как и на самой точке.
+          allowedTools: `${products.toolName},${FIND_FILES_CLI_TOOL_NAME}${uploadNotesOn ? `,${NOTE_FILE_CLI_TOOL_NAME}` : ''},${REPORT_PROBLEM_CLI_TOOL_NAME},${LINKEON_HELP_CLI_TOOL_NAME}`,
           // onProgress переводит CLI в stream-json: только так видно, звали ли
           // инструмент продуктов в этом ходе (итог в формате json этого не несёт).
           onProgress: (ev) => {
@@ -1610,7 +1641,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
             // поддержку: «карточка», «картинка» о найденных файлах, «не проходит
             // оплата картой» в жалобе — не повод вешать метафорическую карту;
             // и к ходу со справкой: вопрос о платформе — не повод для метафорической карты.
-            if (ev.kind === 'tool_use' && (ev.name === products.toolName || ev.name === FIND_FILES_CLI_TOOL_NAME || ev.name === REPORT_PROBLEM_CLI_TOOL_NAME || ev.name === LINKEON_HELP_CLI_TOOL_NAME)) usedProductsTool = true;
+            if (ev.kind === 'tool_use' && (ev.name === products.toolName || ev.name === FIND_FILES_CLI_TOOL_NAME || ev.name === NOTE_FILE_CLI_TOOL_NAME || ev.name === REPORT_PROBLEM_CLI_TOOL_NAME || ev.name === LINKEON_HELP_CLI_TOOL_NAME)) usedProductsTool = true;
             // Шаг работы для клиента, который его рисует. Аргументов onProgress
             // не отдаёт — хватает имени: у Маши только инструменты точки продуктов.
             // Для новых инструментов понадобится input — onProgress его не отдаёт.
