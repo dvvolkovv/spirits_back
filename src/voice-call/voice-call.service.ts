@@ -394,12 +394,17 @@ export class VoiceCallService implements OnModuleInit {
     // Участники — отдельным запросом и не под условием на транскрипт: люди
     // входят и тогда, когда никто не говорит. Список у воркера только растёт,
     // поэтому пишем, пока он не короче сохранённого.
+    //
+    // K1b: оба UPDATE gated на живой аккаунт. После voice.stop звонок в
+    // 'interrupted', и status <> 'completed' его пропускал — воркер продолжал
+    // дописывать разговор удалённого. Гейт — по voice_calls.user_id, как в complete().
     const people = cleanParticipants(participants);
     if (people.length) {
       await this.pg.query(
         `UPDATE voice_calls SET participants = $2::jsonb
            WHERE id = $1 AND status <> 'completed'
-             AND jsonb_array_length(COALESCE(participants, '[]'::jsonb)) <= $3`,
+             AND jsonb_array_length(COALESCE(participants, '[]'::jsonb)) <= $3
+             AND EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = voice_calls.user_id AND u.state = 'active')`,
         [callId, JSON.stringify(people), people.length],
       );
     }
@@ -407,7 +412,8 @@ export class VoiceCallService implements OnModuleInit {
     await this.pg.query(
       `UPDATE voice_calls SET transcript = $2::jsonb
          WHERE id = $1 AND status <> 'completed'
-           AND jsonb_array_length(COALESCE(transcript, '[]'::jsonb)) < $3`,
+           AND jsonb_array_length(COALESCE(transcript, '[]'::jsonb)) < $3
+           AND EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = voice_calls.user_id AND u.state = 'active')`,
       [callId, JSON.stringify(transcript), transcript.length],
     );
   }
@@ -538,19 +544,38 @@ export class VoiceCallService implements OnModuleInit {
     // Список из progress плюс финальный: complete мог прийти и без полного.
     const participants = mergeParticipants(cleanParticipants(call.participants), cleanParticipants(payload.participants));
 
-    await this.pg.query(
+    // K1: gated на живой аккаунт (UPDATE … AND EXISTS). Финальный complete
+    // звонка удалённого аккаунта (после voice.stop) не перезаписывает
+    // транскрипт и участников; промежуточные сбросы закрывает тот же гейт в
+    // progress(). Параметры не сдвинуты — гейт ссылается на voice_calls.user_id.
+    const saved = await this.pg.query(
       `UPDATE voice_calls SET status = 'completed', ended_at = now(), duration_sec = $1,
          transcript = $2, cost_usd = $3, model = $4, tokens_charged = $5,
-         end_reason = $6, end_raw = $7, participants = $9 WHERE id = $8`,
+         end_reason = $6, end_raw = $7, participants = $9 WHERE id = $8
+         AND EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = voice_calls.user_id AND u.state = 'active')`,
       [durationSec, JSON.stringify(transcript), cost, payload.usage.model, tokens, verdict, raw, callId,
         participants.length ? JSON.stringify(participants) : null],
     );
-    this.logger.log(`[complete] call=${callId} кончился: ${verdict} (${raw})`);
 
     // Бот чужой площадки — сразу, не дожидаясь реапера: он лишний участник в
     // переговорах человека. Не блокирует остальное завершение звонка (резюме,
     // учёт, карточка) — недоступность Attendee не повод терять транскрипт.
     void this.releaseBot(callId, call.external_bot_id).catch(() => {});
+
+    // Аккаунт неактивен — строка не обновилась. Учёт, резюме, карточка и
+    // профиль удалённому не нужны (как в SpecialistJobService.run); выход
+    // здесь же держит идемпотентность: статус не 'completed', и повторный
+    // complete без него создал бы вторую строку учёта. «кончился» здесь не
+    // пишем — звонок не завершён записью; стоимость и длительность — в warn,
+    // чтобы след расходов оставался, пока учёт удалённым не пишется.
+    if (!saved.rowCount) {
+      this.logger.warn(
+        `[complete] call=${callId} аккаунт неактивен — транскрипт, учёт и резюме не пишем ` +
+          `(${verdict} ${raw}, ${durationSec}s, cost=$${cost.toFixed(4)})`,
+      );
+      return;
+    }
+    this.logger.log(`[complete] call=${callId} кончился: ${verdict} (${raw})`);
 
     // Списываем за разговор — по решению владельца 27.08.2026. Раньше здесь
     // стоял статус 'completed' с нулём: минуты считались, но не стоили ничего.
@@ -600,17 +625,28 @@ export class VoiceCallService implements OnModuleInit {
     participants: MeetingParticipant[] = [],
   ): Promise<void> {
     const summary = await this.summarize(userId, transcript, participants);
-    await this.pg.query(`UPDATE voice_calls SET summary = $1 WHERE id = $2`, [summary, callId]);
+    // K1: аккаунт могли удалить, пока считалось резюме (десятки секунд LLM).
+    // Обе записи gated на живой аккаунт в самом SQL — как saveUserMessageRow
+    // в chat.service (Task 11); история удалённого стирается один раз.
+    await this.pg.query(
+      `UPDATE voice_calls SET summary = $1 WHERE id = $2
+         AND EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = voice_calls.user_id AND u.state = 'active')`,
+      [summary, callId],
+    );
 
     const minutes = Math.max(1, Math.round(durationSec / 60));
     const who = participantsLine(participants);
     const content = `{{voice_call: id=${callId}}}\n\nРазговор ${minutes} мин.${who ? `\n\n${who}` : ''}\n\n${summary}`;
-    await this.pg.query(
+    // userId — ПОСЛЕДНИЙ параметр: позиция content, на которую смотрят спеки, не меняется.
+    const card = await this.pg.query(
       `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
-       VALUES ($1, 'ai', $2, $3, 'text', 0)`,
-      [`${userId}_${HOST_AGENT_ID}`, HOST_AGENT_ID, content],
+       SELECT $1, 'ai', $2, $3, 'text', 0
+       WHERE EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $4 AND u.state = 'active')`,
+      [`${userId}_${HOST_AGENT_ID}`, HOST_AGENT_ID, content, userId],
     );
-    this.logger.log(`[complete] call=${callId} резюме готово, карточка в ленте`);
+    this.logger.log(card.rowCount
+      ? `[complete] call=${callId} резюме готово, карточка в ленте`
+      : `[complete] call=${callId} аккаунт неактивен — карточку не пишем`);
   }
 
   /**

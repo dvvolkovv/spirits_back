@@ -12,6 +12,12 @@ jest.mock('../privacy/profile-privacy', () => ({
 const canReceive = canReceiveNewProposal as jest.MockedFunction<typeof canReceiveNewProposal>;
 const readAccess = readProfileAccess as jest.MockedFunction<typeof readProfileAccess>;
 const readBatch = (jest.requireMock('../privacy/profile-privacy') as any).readProfileAccessBatch as jest.Mock;
+// T17B-M3: active-гейт createRequest обязан фильтровать по состоянию. Фейк
+// принимает SQL гейта только вместе с state = 'active': потеря условия
+// (удалённый аккаунт проходит гейт) роняет тесты, а не получает ответ «активен».
+const ACTIVE_GATE_RE = /\bFROM\s+user_id\s+WHERE\s+internal_id\s*=\s*\$1\s+AND\s+state\s*=\s*'active'/;
+// K6b: getPublicProfile проверяет, что владелец номера активен, тем же
+// фрагментом (activeOwnerSql) — фейк отвечает «активен» через ACTIVE_GATE_RE.
 
 function access(overrides: Record<string, any> = {}) {
   return {
@@ -69,7 +75,8 @@ function makeService(options: {
   const pg = {
     query: jest.fn(async (sql: string) => {
       // Task 17B: active-гейт createRequest — вызывающий аккаунт активен.
-      if (sql.includes('FROM user_id WHERE internal_id')) {
+      if (/\bFROM user_id\b/.test(sql)) {
+        if (!ACTIVE_GATE_RE.test(sql)) throw new Error(`active gate without state filter: ${sql}`);
         return { rows: [{ n: 1 }], rowCount: 1 };
       }
       if (sql.includes('SELECT user_id FROM ai_profiles_consolidated WHERE id')) {
@@ -268,8 +275,12 @@ type ListDirection = 'incoming' | 'outgoing';
 function listRow(direction: ListDirection, status: 'pending' | 'approved') {
   const phoneKey = direction === 'incoming' ? 'requester_phone' : 'target_phone';
   const profileKey = direction === 'incoming' ? 'requester_profile_data' : 'target_profile_data';
+  // K6b: списки отдают телефон только активного контрагента (activeOwnerSql
+  // в SELECT списка) — в этих тестах контрагент активен.
+  const activeKey = direction === 'incoming' ? 'requester_active' : 'target_active';
   return {
     id: 1,
+    [activeKey]: true,
     requester_id: direction === 'incoming' ? 22 : 11,
     target_id: direction === 'incoming' ? 11 : 22,
     status,

@@ -188,23 +188,25 @@ function purgeJob(overrides: Partial<DeletionJobRow> = {}): DeletionJobRow {
   };
 }
 
-describe('discoverContactsDeletion — один пустой job на аккаунт (Task 17B)', () => {
+describe('discoverContactsDeletion — stop+purge, пустые payload (Task 17B, K6)', () => {
   it('payload {}, resourceKey без userId; sanitizer плана проходит', async () => {
     const { db } = makeHarness();
 
     const plan = await discoverContactsDeletion({ db, account, origin: 'explicit' });
 
-    expect(plan.jobs).toEqual([{
-      resourceType: 'contacts.purge',
-      resourceKey: 'contacts',
-      phase: 'purge',
-      payload: {},
-    }]);
+    // K6: contacts.stop (immediate) — форма peer.stop: висящие заявки
+    // отменяются до core, purge обезличивает текст после retention.
+    expect(plan.jobs).toEqual([
+      { resourceType: 'contacts.stop', resourceKey: 'contacts', phase: 'immediate', payload: {} },
+      { resourceType: 'contacts.purge', resourceKey: 'contacts', phase: 'purge', payload: {} },
+    ]);
     expect(plan.skips).toEqual([]);
     const json = JSON.stringify(plan.jobs);
     expect(json).not.toContain(USER);
     expect(json).not.toContain(OWN_CANARY);
-    expect(() => safeDeletionJobSnapshot(plan.jobs[0], USER)).not.toThrow();
+    for (const job of plan.jobs) {
+      expect(() => safeDeletionJobSnapshot(job, USER)).not.toThrow();
+    }
     // Discovery НЕ читает contact_requests/ai_profiles_consolidated — только
     // generation gate (message в план не поднимается).
     expect(db.queries.every((q) => q.sql.startsWith('SELECT 1 FROM user_id'))).toBe(true);
@@ -327,11 +329,11 @@ describe('ContactsService.createRequest — active guard (Task 17B)', () => {
   });
 });
 
-describe('wiring contacts.purge (Task 17B)', () => {
-  it('adapter регистрирует contacts.purge, ContactsModule его провайдит', () => {
+describe('wiring contacts.stop/contacts.purge (Task 17B, K6)', () => {
+  it('adapter регистрирует contacts.stop и contacts.purge, ContactsModule его провайдит', () => {
     const registry = { register: jest.fn() } as any;
     const adapter = new ContactsAccountDeletionAdapter(registry);
-    expect(adapter.resourceTypes).toEqual(['contacts.purge']);
+    expect(adapter.resourceTypes).toEqual(['contacts.stop', 'contacts.purge']);
     adapter.onModuleInit();
     expect(registry.register).toHaveBeenCalledWith(adapter);
 

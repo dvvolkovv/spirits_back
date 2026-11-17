@@ -27,6 +27,8 @@ maybe('идемпотентная публикация Telegram-черновик
     await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', '001_support.sql'), 'utf8'));
     await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', '002_support_sla.sql'), 'utf8'));
     await pool.query(fs.readFileSync(path.join(__dirname, '..', 'alert-bot', 'migrations', '001_alert_bot.sql'), 'utf8'));
+    // K3: ответ владельца пишется, только пока аккаунт владельца тикета active.
+    await pool.query('CREATE TABLE user_id (internal_id text PRIMARY KEY, state text NOT NULL)');
   });
 
   afterAll(async () => {
@@ -37,7 +39,7 @@ maybe('идемпотентная публикация Telegram-черновик
 
   beforeEach(async () => {
     await pool.query('TRUNCATE support_tickets CASCADE');
-    await pool.query('TRUNCATE alert_bot_ticket_drafts');
+    await pool.query('TRUNCATE alert_bot_ticket_drafts, user_id');
   });
 
   afterEach(() => jest.restoreAllMocks());
@@ -52,9 +54,11 @@ maybe('идемпотентная публикация Telegram-черновик
   }
 
   async function newTicket(status = 'escalated'): Promise<string> {
+    const owner = `user-${Math.random()}`;
+    await pool.query("INSERT INTO user_id (internal_id, state) VALUES ($1, 'active')", [owner]);
     const r = await pool.query(
       'INSERT INTO support_tickets (user_id, status) VALUES ($1, $2) RETURNING id',
-      [`user-${Math.random()}`, status],
+      [owner, status],
     );
     return r.rows[0].id;
   }

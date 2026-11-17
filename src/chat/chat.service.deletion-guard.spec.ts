@@ -87,3 +87,83 @@ describe('saveChatHistory — gate на активный аккаунт', () => 
     expect(queries.filter((q) => /FROM user_id/.test(q) && !/INSERT/.test(q))).toHaveLength(0);
   });
 });
+
+/**
+ * K1b — ссылка на встречу в чате (streamChat замыкает ход карточкой «Зайти во
+ * встречу», минуя модель). Реплика и карточка писались в историю без гейта:
+ * ход, начатый до DELETE /webhook/profile, оставлял строки удалённому —
+ * история стирается один раз. Теперь обе вставки — INSERT … SELECT … WHERE
+ * EXISTS (user_id state='active'), как в saveUserMessageRow.
+ */
+describe('streamChat, ссылка на встречу — gate на активный аккаунт', () => {
+  const GATE_RE = /WHERE EXISTS \(SELECT 1 FROM user_id u WHERE u\.internal_id = \$\d+ AND u\.state = 'active'\)/;
+  const GATE_N_RE = /WHERE EXISTS \(SELECT 1 FROM user_id u WHERE u\.internal_id = \$(\d+) AND u\.state = 'active'\)/;
+  const LINK = 'заходи https://my.linkeon.io/room/ABC234';
+
+  function makeMeetingService(state: string) {
+    const users = new Map<string, string>([['u-k1b', state]]);
+    const saved: Array<{ sql: string; params: any[] }> = [];
+    const pg = {
+      query: jest.fn(async (sql: string, params: any[] = []) => {
+        const s = sql.replace(/\s+/g, ' ').trim();
+        if (/INSERT INTO custom_chat_history/.test(s)) {
+          // Семантика прод-SQL: с гейтом — только живому, без гейта — всегда.
+          // Аккаунт берётся по номеру плейсхолдера из гейта, а не «последний
+          // параметр»: неверный $N сравнил бы internal_id с чужим значением.
+          const gate = GATE_N_RE.exec(s);
+          if (gate && users.get(String(params[Number(gate[1]) - 1])) !== 'active') return { rows: [], rowCount: 0 };
+          saved.push({ sql: s, params });
+          return { rows: [], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 0 };
+      }),
+    };
+    const rooms = { info: jest.fn(async (code: string) => ({ code, title: 'Планёрка', active: true })) };
+    const svc = new ChatService(
+      pg as any, null as any, null as any, null as any, { resolveUserLanguage: async () => 'ru' } as any,
+      undefined, undefined, undefined, undefined, undefined, rooms as any,
+    );
+    jest.spyOn(svc as any, 'resolveAgent').mockResolvedValue({
+      id: 7, name: 'Роман', display_name: 'Роман', description: '', system_prompt: '', category: 'assistant',
+    });
+    const writes: any[] = [];
+    const res: any = {
+      status: jest.fn(),
+      setHeader: jest.fn(),
+      write: jest.fn((s: string) => { try { writes.push(JSON.parse(s)); } catch {} return true; }),
+      end: jest.fn(),
+    };
+    return { svc, saved, res, writes, rooms };
+  }
+
+  it('удалённый аккаунт: ни реплика, ни карточка в историю не пишутся', async () => {
+    const h = makeMeetingService('deleted');
+
+    await h.svc.streamChat('u-k1b', LINK, '7', 'u-k1b_7', '', h.res);
+
+    expect(h.rooms.info).toHaveBeenCalledWith('ABC234');
+    expect(h.saved).toHaveLength(0);
+  });
+
+  it('активный аккаунт: реплика и карточка пишутся как раньше, $N гейта указывает на userId', async () => {
+    const h = makeMeetingService('active');
+
+    await h.svc.streamChat('u-k1b', LINK, '7', 'u-k1b_7', '', h.res);
+
+    expect(h.saved).toHaveLength(2);
+    const [human, card] = h.saved;
+    expect(human.sql).toMatch(/'human'/);
+    expect(human.params[0]).toBe('u-k1b_7');
+    expect(human.params[2]).toBe(LINK);
+    expect(card.sql).toMatch(/'ai'/);
+    expect(card.params[2]).toContain('{{meeting_join: code=ABC234');
+    for (const row of h.saved) {
+      expect(row.sql).toMatch(GATE_RE);
+      // $N гейта указывает именно на userId, и это последний параметр.
+      const n = Number(GATE_N_RE.exec(row.sql)![1]);
+      expect(row.params[n - 1]).toBe('u-k1b');
+      expect(n).toBe(row.params.length);
+    }
+    expect(h.writes.find((w) => w.type === 'end')?.content).toContain('{{meeting_join: code=ABC234');
+  });
+});

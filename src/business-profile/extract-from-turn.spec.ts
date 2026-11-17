@@ -26,7 +26,8 @@ function make(opts: { claudeReply?: string; profile?: any; category?: string | n
       if (/FROM agents/i.test(sql)) {
         return { rows: category === null ? [] : [{ category }] };
       }
-      if (/SELECT/i.test(sql)) return { rows: [{ profile_data: { business: state.business } }] };
+      // По началу запроса: в UPDATE есть SELECT внутри EXISTS-гейта (K1).
+      if (/^\s*SELECT/i.test(sql)) return { rows: [{ profile_data: { business: state.business } }] };
       state.business = JSON.parse(params[0]);
       return { rows: [], rowCount: 1 };
     }),

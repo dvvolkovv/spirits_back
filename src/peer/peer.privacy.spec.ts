@@ -13,6 +13,12 @@ const canReceive = canReceiveNewProposal as jest.MockedFunction<typeof canReceiv
 const FROM = 'requester-id';
 const TO = 'target-id';
 const dto = { toUserId: TO, introMessage: 'hello' };
+// T17B-M3: active-гейт обязан фильтровать по состоянию. Фейк принимает SQL
+// гейта только вместе с state = 'active': потеря условия (удалённый аккаунт
+// проходит гейт) роняет тесты, а не получает тихий ответ «активен».
+const ACTIVE_GATE_RE = /\bFROM\s+user_id\s+WHERE\s+internal_id\s*=\s*\$1\s+AND\s+state\s*=\s*'active'/;
+// K6b: INSERT заявки гейтится активностью получателя ($2) в самом statement.
+const INSERT_RECIPIENT_GATE_RE = /\bFROM\s+user_id\s+WHERE\s+internal_id\s*=\s*\$2\s+AND\s+state\s*=\s*'active'/;
 
 function makeAllowedService(options: {
   targetExists?: boolean;
@@ -25,8 +31,14 @@ function makeAllowedService(options: {
 } = {}) {
   const pg = {
     query: jest.fn(async (sql: string, params: any[] = []) => {
-      // Task 17B: active-гейт sendRequest — вызывающий аккаунт активен.
-      if (sql.includes('FROM user_id WHERE internal_id')) {
+      if (sql.includes('INSERT INTO chat_requests')) {
+        if (!INSERT_RECIPIENT_GATE_RE.test(sql)) throw new Error(`insert without recipient gate: ${sql}`);
+        return { rows: [{ id: 'new-request' }] };
+      }
+      // Task 17B: active-гейт sendRequest — вызывающий аккаунт активен;
+      // K6b: тем же SQL проверяется получатель (активен).
+      if (/\bFROM user_id\b/.test(sql)) {
+        if (!ACTIVE_GATE_RE.test(sql)) throw new Error(`active gate without state filter: ${sql}`);
         return { rows: [{ n: 1 }], rowCount: 1 };
       }
       if (sql.includes('SELECT 1 FROM ai_profiles_consolidated WHERE user_id')) {
@@ -49,9 +61,6 @@ function makeAllowedService(options: {
       if (sql.includes('SELECT count(*)::int AS n FROM chat_requests')) {
         if (sql.includes('created_at')) return { rows: [{ n: options.rateCount ?? 0 }] };
         return { rows: [{ n: options.pendingCount ?? 0 }] };
-      }
-      if (sql.includes('INSERT INTO chat_requests')) {
-        return { rows: [{ id: 'new-request' }] };
       }
       throw new Error(`Unexpected SQL: ${sql}`);
     }),
@@ -92,7 +101,8 @@ describe('PeerService.sendRequest privacy', () => {
     // Task 17B: до canReceiveNewProposal выполняется только active-гейт —
     // никаких запросов к peer-таблицам и INSERT.
     const queries = pg.query.mock.calls.map((call) => call[0]);
-    expect(queries.every((sql) => sql.includes('FROM user_id WHERE internal_id'))).toBe(true);
+    expect(queries.length).toBeGreaterThan(0);
+    expect(queries.every((sql) => ACTIVE_GATE_RE.test(sql))).toBe(true);
     expectNoInsert(pg);
   });
 

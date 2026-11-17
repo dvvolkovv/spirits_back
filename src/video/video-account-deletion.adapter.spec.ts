@@ -1,13 +1,20 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { Logger } from '@nestjs/common';
 import { MODULE_METADATA } from '@nestjs/common/constants';
+import {
+  CreateBucketCommand,
+  DeleteObjectCommand,
+  ListObjectsV2Command,
+  PutBucketPolicyCommand,
+  PutObjectCommand,
+} from '@aws-sdk/client-s3';
 import { AccountDeletionModule } from '../account-deletion/account-deletion.module';
 import { AccountDeletionRegistry } from '../account-deletion/account-deletion.registry';
 import { DELETION_DISCOVERERS } from '../account-deletion/account-deletion.catalog';
 import {
   DeletionCancelledError,
-  DeletionRetryError,
   safeDeletionJobSnapshot,
 } from '../account-deletion/account-deletion.safe';
 import type {
@@ -15,10 +22,12 @@ import type {
   DeletionExecution,
   DeletionJobRow,
 } from '../account-deletion/account-deletion.types';
+import { StorageService } from '../common/services/storage.service';
 import { VideoModule } from './video.module';
-import { VideoService } from './video.service';
+import { VIDEO_UPLOADS_MAX_LIST_PAGES, VideoService } from './video.service';
 import {
   discoverVideoDeletion,
+  discoverVideoUploadsDeletion,
   VideoAccountDeletionAdapter,
 } from './video-account-deletion.adapter';
 
@@ -406,13 +415,17 @@ describe('VideoAccountDeletionAdapter.execute — strict purge (Task 12)', () =>
     expect(db.videoJobs).toHaveLength(1);
   });
 
-  it('escape в /static video_url — ownStaticPath reject: retry, row остаётся', async () => {
+  it('escape в /static URL строки — путь из строки не строится (K4b): только производные, задача успешна', async () => {
     const { db, adapter, ctx } = makeHarness();
     seedRow(db, { video_url: `${BACKEND}/static/videos/..%2f..%2fetc%2fpasswd` });
 
-    await expect(adapter.execute(purgeJob({ videoJobId: 'video-1' }), ctx))
-      .rejects.toBeInstanceOf(DeletionRetryError);
-    expect(db.videoJobs).toHaveLength(1);
+    await adapter.execute(purgeJob({ videoJobId: 'video-1' }), ctx);
+
+    expect(unlinkSpy.mock.calls.map((c) => c[0]).sort()).toEqual([
+      path.join(publicDir, 'videos', 'video-1.jpg'),
+      path.join(publicDir, 'videos', 'video-1.mp4'),
+    ]);
+    expect(db.videoJobs).toHaveLength(0);
   });
 
   it('объекта MinIO уже нет (NotFound) — подтверждённое отсутствие, purge продолжается', async () => {
@@ -489,11 +502,647 @@ describe('VideoAccountDeletionAdapter.execute — strict purge (Task 12)', () =>
   });
 });
 
+// ---------------------------------------------------------------------------
+// K4 — личные загрузки video-uploads/<userId>/ без строки video_jobs.
+//
+// uploadUserAsset кладёт фото в MinIO ДО и независимо от строки задачи:
+// фото могло не дойти до задачи, cleanupOldFailedJobs стирает failed-строки,
+// не трогая объекты, а 2-е и 3-е референс-фото Veo живут только в
+// composed_plan. Purge по строкам их не видит — нужен обход всего префикса.
+
+/** Синтетический телефонный internal_id (публичный репозиторий). */
+const PHONE_USER = '79990000501';
+/** Префикс-родственник: без завершающего '/' префикс PHONE_USER задел бы его. */
+const PHONE_NEIGHBOR = '799900005010';
+const OWN_PREFIX = `video-uploads/${PHONE_USER}/`;
+
+/**
+ * Фейковый MinIO на уровне S3-транспорта: настоящий StorageService шлёт в
+ * него настоящие ListObjectsV2Command/DeleteObjectCommand. Семантика S3:
+ * Prefix — буквальный префикс ключа, ключи в лексикографическом порядке,
+ * MaxKeys/pageSize режет страницу, IsTruncated + NextContinuationToken
+ * (непрозрачный маркер последнего ключа — как у MinIO) ведут на следующую;
+ * DeleteObject по отсутствующему ключу — 204, успех.
+ */
+class FakeMinio {
+  private readonly buckets = new Map<string, Set<string>>();
+  readonly log: Array<{ op: 'list' | 'delete' | 'put'; bucket: string; prefix?: string; key?: string; token?: string }> = [];
+  pageSize = 1000;
+  /**
+   * Страховка спека: реализация без защиты от зацикленных токенов крутила бы
+   * листинг вечно (await на готовых промисах не отдаёт управление таймеру
+   * jest). Порог выше VIDEO_UPLOADS_MAX_LIST_PAGES — до него доходит только
+   * незащищённый цикл.
+   */
+  maxListCalls = 20_000;
+  private lists = 0;
+  listError: unknown = null;
+  listOverride: ((input: any) => any) | null = null;
+  /** Отказ на N-м удалении (сквозной счёт, с 1) — частичный прогон. */
+  deleteErrorAt: { n: number; error: unknown } | null = null;
+  private deletes = 0;
+
+  put(bucket: string, ...keys: string[]): void {
+    const set = this.buckets.get(bucket) ?? new Set<string>();
+    for (const key of keys) set.add(key);
+    this.buckets.set(bucket, set);
+  }
+
+  keys(bucket: string): string[] {
+    return [...(this.buckets.get(bucket) ?? [])].sort();
+  }
+
+  async send(command: unknown): Promise<any> {
+    if (command instanceof ListObjectsV2Command) {
+      const input = command.input;
+      this.log.push({
+        op: 'list',
+        bucket: String(input.Bucket),
+        prefix: input.Prefix,
+        token: input.ContinuationToken,
+      });
+      this.lists += 1;
+      if (this.lists > this.maxListCalls) throw new Error('fake_minio_runaway_listing');
+      if (this.listError) throw this.listError;
+      if (this.listOverride) return this.listOverride(input);
+      const prefix = input.Prefix ?? '';
+      const after = input.ContinuationToken
+        ? Buffer.from(input.ContinuationToken, 'base64').toString('utf8')
+        : '';
+      const limit = Math.min(input.MaxKeys ?? 1000, this.pageSize);
+      const matching = this.keys(String(input.Bucket))
+        .filter((k) => k.startsWith(prefix) && k > after);
+      const page = matching.slice(0, limit);
+      const truncated = matching.length > page.length;
+      return {
+        Contents: page.map((Key) => ({ Key, Size: 1 })),
+        KeyCount: page.length,
+        IsTruncated: truncated,
+        NextContinuationToken: truncated
+          ? Buffer.from(page[page.length - 1], 'utf8').toString('base64')
+          : undefined,
+      };
+    }
+    if (command instanceof DeleteObjectCommand) {
+      const bucket = String(command.input.Bucket);
+      const key = String(command.input.Key);
+      this.log.push({ op: 'delete', bucket, key });
+      this.deletes += 1;
+      if (this.deleteErrorAt && this.deleteErrorAt.n === this.deletes) {
+        throw this.deleteErrorAt.error;
+      }
+      this.buckets.get(bucket)?.delete(key);
+      return {};
+    }
+    if (command instanceof PutObjectCommand) {
+      const bucket = String(command.input.Bucket);
+      const key = String(command.input.Key);
+      this.log.push({ op: 'put', bucket, key });
+      this.put(bucket, key);
+      return {};
+    }
+    // ensureBucket VideoService: создание бакета и политика — без эффекта.
+    if (command instanceof CreateBucketCommand || command instanceof PutBucketPolicyCommand) {
+      return {};
+    }
+    throw new Error('unexpected S3 command');
+  }
+}
+
+function makeUploadsHarness(opts: { withStorage?: boolean } = {}) {
+  const db = new FakeVideoDb();
+  db.users.set(PHONE_USER, { state: 'deleted', deletionId });
+  db.users.set(PHONE_NEIGHBOR, { state: 'active', deletionId: null });
+  const minio = new FakeMinio();
+  // Настоящий StorageService с подменённым транспортом (как synthetic stack):
+  // onModuleInit не зовётся — env MinIO спеку не нужен.
+  const storage = new StorageService();
+  (storage as any).s3 = minio;
+  (storage as any).publicBaseUrl = MINIO_BASE;
+  const svc = new VideoService(
+    db as any,
+    makeVeo() as any,
+    {} as any,
+    undefined,
+    opts.withStorage === false ? undefined : storage,
+  );
+  const registry = new AccountDeletionRegistry();
+  const adapter = new VideoAccountDeletionAdapter(svc, registry);
+  const assertCurrent = jest.fn(async () => undefined);
+  const ctx: DeletionExecution & { assertCurrent: jest.Mock } = { db, assertCurrent };
+  return { db, minio, svc, adapter, ctx };
+}
+
+function uploadsJob(overrides: Partial<DeletionJobRow> = {}): DeletionJobRow {
+  return {
+    id: 'job-video-uploads-1',
+    deletionId,
+    userId: PHONE_USER,
+    resourceType: 'video-upload.purge',
+    resourceKey: 'video-uploads',
+    phase: 'purge',
+    payload: {},
+    status: 'running',
+    attempts: 1,
+    nextAttemptAt: new Date('2026-12-12T00:00:00Z'),
+    leaseUntil: new Date('2026-12-12T01:00:00Z'),
+    lastErrorKind: null,
+    ...overrides,
+  };
+}
+
+const ownKey = (name: string) => `${OWN_PREFIX}${name}`;
+const ownLeft = (minio: FakeMinio) =>
+  minio.keys(VIDEO_BUCKET).filter((k) => k.startsWith(OWN_PREFIX));
+const listCalls = (minio: FakeMinio) => minio.log.filter((c) => c.op === 'list');
+const deleteCalls = (minio: FakeMinio) => minio.log.filter((c) => c.op === 'delete');
+
+describe('discoverVideoUploadsDeletion — video-upload.purge на аккаунт (K4)', () => {
+  it('строк video_jobs нет — задача всё равно одна: статический ключ, пустой payload', async () => {
+    const { db } = makeUploadsHarness();
+
+    const plan = await discoverVideoUploadsDeletion({
+      db,
+      account: { ...account, userId: PHONE_USER },
+      origin: 'explicit',
+    });
+
+    expect(plan).toEqual({
+      jobs: [{
+        resourceType: 'video-upload.purge',
+        resourceKey: 'video-uploads',
+        phase: 'purge',
+        payload: {},
+      }],
+      skips: [],
+    });
+    // Цель выводится из job.userId при исполнении: ни userId, ни префикса в плане.
+    expect(JSON.stringify(plan)).not.toContain(PHONE_USER);
+    expect(JSON.stringify(plan)).not.toContain('video-uploads/');
+    for (const job of plan.jobs) expect(() => safeDeletionJobSnapshot(job, PHONE_USER)).not.toThrow();
+  });
+
+  it('реактивация (поколение не текущее) — план пустой', async () => {
+    const { db } = makeUploadsHarness();
+    db.users.set(PHONE_USER, { state: 'active', deletionId: null });
+
+    const plan = await discoverVideoUploadsDeletion({
+      db,
+      account: { ...account, userId: PHONE_USER },
+      origin: 'explicit',
+    });
+
+    expect(plan).toEqual({ jobs: [], skips: [] });
+  });
+});
+
+describe('VideoAccountDeletionAdapter.execute — video-upload.purge (K4)', () => {
+  it('(а) объекты под video-uploads/<userId>/ без строки video_jobs удаляются', async () => {
+    const { db, minio, adapter, ctx } = makeUploadsHarness();
+    minio.put(VIDEO_BUCKET, ownKey('1700000000001-a1b2c3.jpg'), ownKey('1700000000002-d4e5f6.png'));
+    expect(db.videoJobs).toHaveLength(0);
+
+    await adapter.execute(uploadsJob(), ctx);
+
+    expect(ownLeft(minio)).toEqual([]);
+    const lists = listCalls(minio);
+    expect(lists.length).toBeGreaterThanOrEqual(1);
+    for (const call of lists) {
+      expect(call).toMatchObject({ bucket: VIDEO_BUCKET, prefix: OWN_PREFIX });
+    }
+    expect(deleteCalls(minio).map((c) => `${c.bucket}/${c.key}`).sort()).toEqual([
+      `${VIDEO_BUCKET}/${ownKey('1700000000001-a1b2c3.jpg')}`,
+      `${VIDEO_BUCKET}/${ownKey('1700000000002-d4e5f6.png')}`,
+    ]);
+  });
+
+  it('(б) соседний пользователь с id-префиксом, чужие префиксы и бакеты не затронуты', async () => {
+    const { minio, adapter, ctx } = makeUploadsHarness();
+    const foreign = [
+      `video-uploads/${PHONE_NEIGHBOR}/1700000000003-n.jpg`,
+      `video-uploads/${PHONE_USER}1/1700000000004-n.jpg`,
+      'videos/11111111-1111-4111-8111-111111111111.mp4',
+      'shorts/v/video.mp4',
+    ];
+    minio.put(VIDEO_BUCKET, ownKey('1700000000001-a.jpg'), ...foreign);
+    minio.put('linkeon-assets', ownKey('1700000000001-a.jpg'));
+
+    await adapter.execute(uploadsJob(), ctx);
+
+    expect(minio.keys(VIDEO_BUCKET)).toEqual([...foreign].sort());
+    expect(minio.keys('linkeon-assets')).toEqual([ownKey('1700000000001-a.jpg')]);
+    for (const call of listCalls(minio)) expect(call.prefix).toBe(OWN_PREFIX);
+    for (const call of deleteCalls(minio)) {
+      expect(call.bucket).toBe(VIDEO_BUCKET);
+      expect(call.key!.startsWith(OWN_PREFIX)).toBe(true);
+    }
+  });
+
+  it('(в) пагинация: больше одной страницы — удалено всё, токен ведёт дальше', async () => {
+    const { minio, adapter, ctx } = makeUploadsHarness();
+    minio.pageSize = 2;
+    const own = [1, 2, 3, 4, 5].map((i) => ownKey(`170000000000${i}-p.jpg`));
+    minio.put(VIDEO_BUCKET, ...own, `video-uploads/${PHONE_NEIGHBOR}/1700000000009-n.jpg`);
+
+    await adapter.execute(uploadsJob(), ctx);
+
+    expect(ownLeft(minio)).toEqual([]);
+    expect(minio.keys(VIDEO_BUCKET)).toEqual([`video-uploads/${PHONE_NEIGHBOR}/1700000000009-n.jpg`]);
+    const lists = listCalls(minio);
+    expect(lists.length).toBeGreaterThanOrEqual(3);
+    expect(lists[0].token).toBeUndefined();
+    for (const call of lists.slice(1)) expect(typeof call.token).toBe('string');
+    expect(deleteCalls(minio)).toHaveLength(5);
+  });
+
+  it('(в) усечённая страница без токена — retry external_unknown, а не тихий успех', async () => {
+    const { minio, adapter, ctx } = makeUploadsHarness();
+    minio.put(VIDEO_BUCKET, ownKey('1700000000001-a.jpg'));
+    minio.listOverride = () => ({ Contents: [], KeyCount: 0, IsTruncated: true });
+
+    await expect(adapter.execute(uploadsJob(), ctx))
+      .rejects.toMatchObject({ kind: 'external_unknown' });
+    expect(ownLeft(minio)).toHaveLength(1);
+  });
+
+  it('(в) повтор того же токена подряд — external_unknown, без бесконечного цикла', async () => {
+    const { minio, adapter, ctx } = makeUploadsHarness();
+    minio.put(VIDEO_BUCKET, ownKey('1-a.jpg'));
+    minio.listOverride = () => ({ Contents: [], KeyCount: 0, IsTruncated: true, NextContinuationToken: 'A' });
+
+    await expect(adapter.execute(uploadsJob(), ctx))
+      .rejects.toMatchObject({ kind: 'external_unknown' });
+    expect(listCalls(minio).map((c) => c.token)).toEqual([undefined, 'A']);
+  });
+
+  it('(в) цикл токенов A→B→A (K4c) — external_unknown на третьей странице', async () => {
+    const { minio, adapter, ctx } = makeUploadsHarness();
+    minio.put(VIDEO_BUCKET, ownKey('1-a.jpg'));
+    const cycle = ['A', 'B'];
+    let i = 0;
+    minio.listOverride = () => ({
+      Contents: [],
+      KeyCount: 0,
+      IsTruncated: true,
+      NextContinuationToken: cycle[i++ % cycle.length],
+    });
+
+    await expect(adapter.execute(uploadsJob(), ctx))
+      .rejects.toMatchObject({ kind: 'external_unknown' });
+    expect(listCalls(minio).map((c) => c.token)).toEqual([undefined, 'A', 'B']);
+  });
+
+  it('(в) бесконечная череда новых токенов (K4c) — потолок страниц, external_unknown', async () => {
+    const { minio, adapter, ctx } = makeUploadsHarness();
+    minio.put(VIDEO_BUCKET, ownKey('1-a.jpg'));
+    let i = 0;
+    minio.listOverride = () => ({
+      Contents: [],
+      KeyCount: 0,
+      IsTruncated: true,
+      NextContinuationToken: `t${i++}`,
+    });
+
+    await expect(adapter.execute(uploadsJob(), ctx))
+      .rejects.toMatchObject({ kind: 'external_unknown' });
+    expect(VIDEO_UPLOADS_MAX_LIST_PAGES).toBeGreaterThan(1);
+    expect(listCalls(minio)).toHaveLength(VIDEO_UPLOADS_MAX_LIST_PAGES);
+    expect(ownLeft(minio)).toHaveLength(1);
+  });
+
+  it('запись и удаление связаны (K4c): uploadUserAsset → обход того же userId, сосед-родственник цел', async () => {
+    const { minio, svc, adapter, ctx } = makeUploadsHarness();
+    // Тот же фейк S3: VideoService пишет загрузки своим S3Client.
+    (svc as any).s3 = minio;
+    const ownUrl = await svc.uploadUserAsset(PHONE_USER, 'image', Buffer.from('face'), 'image/jpeg', 'face.jpg');
+    const neighborUrl = await svc.uploadUserAsset(PHONE_NEIGHBOR, 'image', Buffer.from('n'), 'image/png', 'n.png');
+    const bucketBase = `${MINIO_BASE}/${VIDEO_BUCKET}/`;
+    expect(ownUrl.startsWith(bucketBase)).toBe(true);
+    expect(neighborUrl.startsWith(bucketBase)).toBe(true);
+    const ownObject = ownUrl.slice(bucketBase.length);
+    const neighborObject = neighborUrl.slice(bucketBase.length);
+    expect(ownObject.startsWith(OWN_PREFIX)).toBe(true);
+    expect(minio.keys(VIDEO_BUCKET)).toEqual([ownObject, neighborObject].sort());
+
+    await adapter.execute(uploadsJob(), ctx);
+
+    expect(minio.keys(VIDEO_BUCKET)).toEqual([neighborObject]);
+    expect(deleteCalls(minio).map((c) => c.key)).toEqual([ownObject]);
+  });
+
+  it('листинг вернул ключ вне префикса — retry external_unknown, удалений нет', async () => {
+    const { minio, adapter, ctx } = makeUploadsHarness();
+    minio.put(VIDEO_BUCKET, `video-uploads/${PHONE_NEIGHBOR}/1700000000003-n.jpg`);
+    minio.listOverride = () => ({
+      Contents: [{ Key: `video-uploads/${PHONE_NEIGHBOR}/1700000000003-n.jpg` }],
+      KeyCount: 1,
+      IsTruncated: false,
+    });
+
+    await expect(adapter.execute(uploadsJob(), ctx))
+      .rejects.toMatchObject({ kind: 'external_unknown' });
+    expect(deleteCalls(minio)).toHaveLength(0);
+    expect(minio.keys(VIDEO_BUCKET)).toHaveLength(1);
+  });
+
+  it.each([
+    ['пустой', ''],
+    ['пробел', ' '],
+    ['traversal', '../79990000501'],
+    ['завершающий слэш', `${PHONE_USER}/`],
+    ['слэш внутри', `${PHONE_USER}/..`],
+    ['перевод строки', '7999\n0000501'],
+    ['NUL', `${PHONE_USER}\u0000`],
+    ['ведущая точка', '.79990000501'],
+    ['длиннее 128', '7'.repeat(129)],
+  ])('(г) неверный userId (%s) — ни одного листинга, retry db', async (_label, badUserId) => {
+    const { minio, adapter, ctx } = makeUploadsHarness();
+    minio.put(VIDEO_BUCKET, ownKey('1700000000001-a.jpg'), 'videos/x.mp4');
+
+    await expect(adapter.execute(uploadsJob({ userId: badUserId }), ctx))
+      .rejects.toMatchObject({ kind: 'db' });
+    expect(minio.log).toEqual([]);
+    expect(minio.keys(VIDEO_BUCKET)).toHaveLength(2);
+  });
+
+  it('(д) повторный прогон после частичного удаления доходит до конца; пусто — успех', async () => {
+    const { minio, adapter, ctx } = makeUploadsHarness();
+    minio.put(VIDEO_BUCKET, ownKey('1-a.jpg'), ownKey('2-b.jpg'), ownKey('3-c.jpg'));
+    minio.deleteErrorAt = { n: 2, error: Object.assign(new Error('socket'), { code: 'ETIMEDOUT' }) };
+
+    await expect(adapter.execute(uploadsJob(), ctx)).rejects.toMatchObject({ kind: 'timeout' });
+    expect(ownLeft(minio)).toHaveLength(2);
+
+    await adapter.execute(uploadsJob(), ctx);
+    expect(ownLeft(minio)).toEqual([]);
+
+    // Объектов нет — успех без удалений.
+    const deletesBefore = deleteCalls(minio).length;
+    await expect(adapter.execute(uploadsJob(), ctx)).resolves.toBeUndefined();
+    expect(deleteCalls(minio)).toHaveLength(deletesBefore);
+  });
+
+  it('ошибка листинга MinIO классифицируется (503 → external_5xx), объекты на месте', async () => {
+    const { minio, adapter, ctx } = makeUploadsHarness();
+    minio.put(VIDEO_BUCKET, ownKey('1-a.jpg'));
+    minio.listError = Object.assign(new Error('unavailable'), {
+      name: 'ServiceUnavailable',
+      $metadata: { httpStatusCode: 503 },
+    });
+
+    await expect(adapter.execute(uploadsJob(), ctx)).rejects.toMatchObject({ kind: 'external_5xx' });
+    expect(ownLeft(minio)).toHaveLength(1);
+  });
+
+  it('нет StorageService — fail-closed external_unknown, без листинга', async () => {
+    const { minio, adapter, ctx } = makeUploadsHarness({ withStorage: false });
+    minio.put(VIDEO_BUCKET, ownKey('1-a.jpg'));
+
+    await expect(adapter.execute(uploadsJob(), ctx))
+      .rejects.toMatchObject({ kind: 'external_unknown' });
+    expect(minio.log).toEqual([]);
+  });
+
+  it('реактивация (поколение не текущее) — DeletionCancelledError, без листинга', async () => {
+    const { db, minio, adapter, ctx } = makeUploadsHarness();
+    db.users.set(PHONE_USER, { state: 'active', deletionId: null });
+    minio.put(VIDEO_BUCKET, ownKey('1-a.jpg'));
+
+    await expect(adapter.execute(uploadsJob(), ctx)).rejects.toBeInstanceOf(DeletionCancelledError);
+    expect(minio.log).toEqual([]);
+    expect(ownLeft(minio)).toHaveLength(1);
+  });
+
+  it('assertCurrent — до обхода, перед каждым удалением и после; отмена посреди обхода останавливает', async () => {
+    const { minio, adapter, ctx } = makeUploadsHarness();
+    minio.put(VIDEO_BUCKET, ownKey('1-a.jpg'), ownKey('2-b.jpg'));
+
+    await adapter.execute(uploadsJob(), ctx);
+    expect(ctx.assertCurrent.mock.calls.length).toBeGreaterThanOrEqual(4);
+
+    const second = makeUploadsHarness();
+    second.minio.put(VIDEO_BUCKET, ownKey('1-a.jpg'), ownKey('2-b.jpg'), ownKey('3-c.jpg'));
+    // Поколение отменено после первого удаления: дальше ни одного объекта.
+    second.ctx.assertCurrent.mockImplementation(async () => {
+      if (deleteCalls(second.minio).length >= 1) throw new DeletionCancelledError();
+    });
+    await expect(second.adapter.execute(uploadsJob(), second.ctx))
+      .rejects.toBeInstanceOf(DeletionCancelledError);
+    expect(deleteCalls(second.minio)).toHaveLength(1);
+    expect(ownLeft(second.minio)).toHaveLength(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// K4b — video-job.purge удаляет из MinIO только объекты ЭТОЙ задачи и её
+// владельца. URL в source_image_url присылает пользователь: на проде там
+// встречаются ссылки на video-uploads/<ДРУГОЙ userId>/ — прежний purge стёр
+// бы чужую фотографию. Локальные пути строятся только из jobId строки.
+
+describe('VideoAccountDeletionAdapter.execute — белый список ключей video-job.purge (K4b)', () => {
+  let unlinkSpy: jest.SpyInstance;
+  let rmSpy: jest.SpyInstance;
+  let warnSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    unlinkSpy = jest.spyOn(fs.promises, 'unlink').mockImplementation((async () => undefined) as any);
+    rmSpy = jest.spyOn(fs.promises, 'rm').mockImplementation((async () => undefined) as any);
+    warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    unlinkSpy.mockRestore();
+    rmSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  const inBucket = (key: string) => `${MINIO_BASE}/${VIDEO_BUCKET}/${key}`;
+  const deletedKeys = (storage: ReturnType<typeof makeStorage>) =>
+    storage.deleteConfirmed.mock.calls.map((c) => c[0].key).sort();
+  const DERIVED = ['videos/video-1.jpg', 'videos/video-1.mp4'];
+  const NEIGHBOR_UPLOAD = 'video-uploads/u-other/1700000000000-face.jpg';
+
+  it('(а) source_image_url на video-uploads/<другой>/ — объект соседа цел, задача успешна', async () => {
+    const { db, storage, adapter, ctx } = makeHarness();
+    seedRow(db, { source_image_url: inBucket(NEIGHBOR_UPLOAD) });
+
+    await adapter.execute(purgeJob({ videoJobId: 'video-1' }), ctx);
+
+    expect(deletedKeys(storage)).toEqual(DERIVED);
+    expect(db.videoJobs).toHaveLength(0);
+  });
+
+  it('(а) префикс-родственник владельца (u-deleted0/) и ключ-префикс без слэша — не свои, целы', async () => {
+    const { db, storage, adapter, ctx } = makeHarness();
+    seedRow(db, {
+      source_image_url: inBucket(`video-uploads/${USER}0/1700000000000-x.jpg`),
+      audio_url: inBucket(`video-uploads/${USER}`),
+    });
+
+    await adapter.execute(purgeJob({ videoJobId: 'video-1' }), ctx);
+
+    expect(deletedKeys(storage)).toEqual(DERIVED);
+    expect(db.videoJobs).toHaveLength(0);
+  });
+
+  it('(б) shorts/…, производный ключ ДРУГОЙ задачи и произвольный ключ своего бакета — целы', async () => {
+    const { db, storage, adapter, ctx } = makeHarness();
+    seedRow(db, {
+      video_url: inBucket('videos/video-2.mp4'),
+      thumbnail_url: inBucket('shorts/v/cover.jpg'),
+      source_image_url: inBucket('misc/arbitrary.bin'),
+      audio_url: inBucket('shorts/v/video.mp4'),
+    });
+
+    await adapter.execute(purgeJob({ videoJobId: 'video-1' }), ctx);
+
+    expect(deletedKeys(storage)).toEqual(DERIVED);
+    expect(db.videoJobs).toHaveLength(0);
+  });
+
+  it('(б) ключ с traversal/пустым сегментом из строки — не удаляется и не держит задачу в retry', async () => {
+    const { db, storage, adapter, ctx } = makeHarness();
+    seedRow(db, {
+      source_image_url: inBucket(`video-uploads/${USER}/..%2Fu-other%2F1700000000000-face.jpg`),
+      audio_url: inBucket(`video-uploads/${USER}//1700000000000-x.jpg`),
+    });
+
+    await adapter.execute(purgeJob({ videoJobId: 'video-1' }), ctx);
+
+    expect(deletedKeys(storage)).toEqual(DERIVED);
+    expect(db.videoJobs).toHaveLength(0);
+  });
+
+  it('(в) свои video-uploads/<userId>/ и videos/<jobId>.* — удаляются, журнал молчит', async () => {
+    const { db, storage, adapter, ctx } = makeHarness();
+    seedRow(db, {
+      thumbnail_url: inBucket('videos/video-1.jpg'),
+      source_image_url: inBucket(`video-uploads/${USER}/1700000000000-src.jpg`),
+      audio_url: inBucket(`video-uploads/${USER}/1700000000001-ref.png?v=2`),
+    });
+
+    await adapter.execute(purgeJob({ videoJobId: 'video-1' }), ctx);
+
+    expect(deletedKeys(storage)).toEqual([
+      `video-uploads/${USER}/1700000000000-src.jpg`,
+      `video-uploads/${USER}/1700000000001-ref.png`,
+      ...DERIVED,
+    ].sort());
+    expect(db.videoJobs).toHaveLength(0);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('пропуск пишется отдельной строкой skipped (K4c): без kind=, userId, ключа и адреса', async () => {
+    const { db, adapter, ctx } = makeHarness();
+    seedRow(db, {
+      thumbnail_url: inBucket('shorts/v/cover.jpg'),
+      source_image_url: inBucket(NEIGHBOR_UPLOAD),
+      audio_url: inBucket(`video-uploads/${USER}/..%2Fx.jpg`),
+    });
+
+    await adapter.execute(purgeJob({ videoJobId: 'video-1' }, { attempts: 2 }), ctx);
+
+    const lines = warnSpy.mock.calls.map((c) => String(c[0]));
+    const line = lines.find((l) => l.includes('not_owned='));
+    expect(line).toBeDefined();
+    expect(line).toMatch(/^skipped /);
+    expect(line).not.toContain('kind=');
+    expect(line).toContain('not_owned=2');
+    expect(line).toContain('unsafe_key=1');
+    expect(line).toContain(`deletion=${deletionId}`);
+    expect(line).toContain('type=video-job.purge');
+    for (const l of lines) {
+      expect(l).not.toContain(USER);
+      expect(l).not.toContain('u-other');
+      expect(l).not.toContain('video-uploads');
+      expect(l).not.toContain('shorts');
+      expect(l).not.toContain(MINIO_BASE);
+    }
+  });
+
+  it('sanitizer не принял поля job (K4c) — строка всё равно skipped, только счётчики, без kind= и userId', async () => {
+    const { db, adapter, ctx } = makeHarness();
+    seedRow(db, { source_image_url: inBucket(NEIGHBOR_UPLOAD) });
+
+    await adapter.execute(purgeJob({ videoJobId: 'video-1' }, { resourceKey: `k-${USER}` }), ctx);
+
+    const lines = warnSpy.mock.calls.map((c) => String(c[0]));
+    const line = lines.find((l) => l.includes('not_owned='));
+    expect(line).toBeDefined();
+    expect(line).toMatch(/^skipped /);
+    expect(line).toContain('not_owned=1');
+    expect(line).not.toContain('kind=');
+    expect(line).not.toContain(USER);
+    expect(line).not.toContain('u-other');
+  });
+
+  it('URL строки на /static вне задачи (агентский аватар, чужой ролик) — локальный путь только из jobId', async () => {
+    const { db, adapter, ctx } = makeHarness();
+    seedRow(db, {
+      video_url: `${BACKEND}/static/videos/video-2.mp4`,
+      source_image_url: `${BACKEND}/static/agent-avatars/raya.png`,
+    });
+
+    await adapter.execute(purgeJob({ videoJobId: 'video-1' }), ctx);
+
+    expect(unlinkSpy.mock.calls.map((c) => c[0]).sort()).toEqual([
+      path.join(publicDir, 'videos', 'video-1.jpg'),
+      path.join(publicDir, 'videos', 'video-1.mp4'),
+    ]);
+    expect(rmSpy.mock.calls.map((c) => c[0])).toEqual([
+      path.join(publicDir, 'videos', '_veoconcat', 'video-1'),
+    ]);
+    expect(db.videoJobs).toHaveLength(0);
+  });
+
+  it.each([
+    ['traversal', '../../etc'],
+    ['traversal в хвосте', 'video-1/..'],
+    ['слэш', 'video-1/x'],
+    ['ведущий traversal', '../video-1'],
+    ['две точки', '..'],
+    ['ведущая точка', '.video-1'],
+    ['перевод строки', 'video-1\n'],
+  ])('(г) jobId с %s — ни одного удаления, retry db', async (_label, badId) => {
+    const { db, storage, adapter, ctx } = makeHarness();
+    seedRow(db);
+    seedRow(db, { id: badId });
+
+    await expect(adapter.execute(purgeJob({ videoJobId: badId }), ctx))
+      .rejects.toMatchObject({ kind: 'db' });
+    expect(storage.deleteConfirmed).not.toHaveBeenCalled();
+    expect(unlinkSpy).not.toHaveBeenCalled();
+    expect(rmSpy).not.toHaveBeenCalled();
+    expect(db.videoJobs).toHaveLength(2);
+  });
+
+  it('(д) повтор: после сбоя MinIO retry доходит до конца, после успеха — успех без новых удалений', async () => {
+    const { db, storage, adapter, ctx } = makeHarness();
+    seedRow(db, { source_image_url: inBucket(NEIGHBOR_UPLOAD) });
+    storage.delete.mockRejectedValueOnce({ code: 'ETIMEDOUT' });
+
+    await expect(adapter.execute(purgeJob({ videoJobId: 'video-1' }), ctx))
+      .rejects.toMatchObject({ kind: 'timeout' });
+    expect(db.videoJobs).toHaveLength(1);
+
+    await adapter.execute(purgeJob({ videoJobId: 'video-1' }), ctx);
+    expect(db.videoJobs).toHaveLength(0);
+    const deletes = storage.deleteConfirmed.mock.calls.length;
+    const warns = warnSpy.mock.calls.length;
+
+    await expect(adapter.execute(purgeJob({ videoJobId: 'video-1' }), ctx)).resolves.toBeUndefined();
+    expect(storage.deleteConfirmed.mock.calls.length).toBe(deletes);
+    expect(warnSpy.mock.calls.length).toBe(warns);
+    // Объект соседа не удалялся ни в одной попытке.
+    expect(storage.deleteConfirmed.mock.calls.map((c) => c[0].key)).not.toContain(NEIGHBOR_UPLOAD);
+  });
+});
+
 describe('wiring video-job.purge (Task 12)', () => {
-  it('adapter регистрирует video-job.purge, VideoModule его провайдит', () => {
+  it('adapter регистрирует video-job.purge и video-upload.purge (K4), VideoModule его провайдит', () => {
     const registry = { register: jest.fn() } as any;
     const adapter = new VideoAccountDeletionAdapter({} as any, registry);
-    expect(adapter.resourceTypes).toEqual(['video-job.purge']);
+    expect(adapter.resourceTypes).toEqual(['video-job.purge', 'video-upload.purge']);
     adapter.onModuleInit();
     expect(registry.register).toHaveBeenCalledWith(adapter);
 
@@ -505,5 +1154,11 @@ describe('wiring video-job.purge (Task 12)', () => {
 
   it('catalog содержит discoverVideoDeletion', () => {
     expect(DELETION_DISCOVERERS).toContain(discoverVideoDeletion);
+  });
+
+  it('catalog содержит discoverVideoUploadsDeletion сразу после discoverVideoDeletion (K4)', () => {
+    const at = DELETION_DISCOVERERS.indexOf(discoverVideoDeletion);
+    expect(at).toBeGreaterThanOrEqual(0);
+    expect(DELETION_DISCOVERERS[at + 1]).toBe(discoverVideoUploadsDeletion);
   });
 });

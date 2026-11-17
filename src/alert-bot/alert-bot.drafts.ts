@@ -1,5 +1,5 @@
 import { ConflictException, Injectable, Logger } from '@nestjs/common';
-import { SupportService } from '../support/support.service';
+import { SupportService, TICKET_OWNER_INACTIVE } from '../support/support.service';
 import { AlertBotRetryableError } from './alert-bot.errors';
 import { AlertBotDraftClaim, AlertBotDraftOutcome, AlertBotStore } from './alert-bot.store';
 import { AlertBotTelegram, unknownTelegramOutcome } from './alert-bot.telegram';
@@ -42,6 +42,14 @@ function terminal(status: string): boolean {
 
 function terminalPublishError(error: unknown): boolean {
   return error instanceof ConflictException && error.message === 'ticket is terminal';
+}
+
+/**
+ * K3: аккаунт владельца тикета удалён или заблокирован — ответ не записан и
+ * не запишется при повторе. Отказ, а не сбой: черновик закрывается, без retry.
+ */
+function ownerInactivePublishError(error: unknown): boolean {
+  return error instanceof ConflictException && error.message === TICKET_OWNER_INACTIVE;
 }
 
 @Injectable()
@@ -236,12 +244,15 @@ export class AlertBotDrafts {
           activeClaim.version,
         );
       } catch (error) {
-        if (!terminalPublishError(error)) throw error;
+        const ownerInactive = ownerInactivePublishError(error);
+        if (!ownerInactive && !terminalPublishError(error)) throw error;
         // Терминальный статус и retry уже опубликованного draftId различаются
         // только прямым поиском сообщения под ticket+draft FOR UPDATE.
         await this.finalize(draft.id, activeClaim.action, 'cancelled', activeClaim.version);
         activeClaim = null;
-        answer = 'Тикет уже закрыт — ответ не отправлен';
+        answer = ownerInactive
+          ? 'Аккаунт пользователя удалён или заблокирован — ответ не сохранён'
+          : 'Тикет уже закрыт — ответ не отправлен';
         return {};
       }
 

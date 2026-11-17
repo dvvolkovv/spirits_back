@@ -1,4 +1,5 @@
 import { BadRequestException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
+import { safeErrorCode } from '../common/llm-error';
 import { PgService } from '../common/services/pg.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { canReceiveNewProposal, readProfileAccess, readProfileAccessBatch, type ProfileAccess } from '../privacy/profile-privacy';
@@ -18,6 +19,25 @@ const CONTACT_ENTITY_KEYS = [
  */
 export type ContactVisibility = 'public' | 'matchOnly' | 'private';
 
+/**
+ * K6b — единый fail-closed порог contacts: аккаунт-владелец номера считается
+ * живым, только когда у него state='active'. Нет строки user_id, state NULL,
+ * 'blocked', 'deleted' — нет. Один фрагмент на все пути, где это решает:
+ * одобрение заявки и чтение телефона после него (resolve), телефоны в
+ * списках (listIncoming/listOutgoing), телефон/email/аватар публичного
+ * профиля (getPublicProfile) и получатель новой заявки (createRequest).
+ *
+ * ownerExpr — SQL-выражение internal_id владельца из кода сервиса
+ * ('$1', 'ap.user_id'), не пользовательский ввод. Колонки без алиаса
+ * резолвятся во внутреннем FROM user_id.
+ */
+export const activeOwnerSql = (ownerExpr: string): string =>
+  `EXISTS (SELECT 1 FROM user_id WHERE internal_id = ${ownerExpr} AND state = 'active')`;
+
+/** Гейт INSERT новой заявки: получатель ($2 — его surrogate id) активен. */
+const RECIPIENT_ACTIVE_SQL = `EXISTS (SELECT 1 FROM ai_profiles_consolidated ap
+            WHERE ap.id = $2 AND ${activeOwnerSql('ap.user_id')})`;
+
 export interface ContactRequest {
   id: number;
   requester_id: number;
@@ -26,7 +46,9 @@ export interface ContactRequest {
   status: 'pending' | 'approved' | 'rejected' | 'cancelled';
   created_at: string;
   resolved_at: string | null;
-  requester_phone?: string;  // заполняется только при approved (для target side)
+  // Заполняется только при approved (для target side); null — владелец номера
+  // перестал быть активным между одобрением и чтением телефона (K6/K6b).
+  requester_phone?: string | null;
 }
 
 @Injectable()
@@ -47,6 +69,25 @@ export class ContactsService {
   async idByPhone(phone: string): Promise<number | null> {
     const r = await this.pg.query('SELECT id FROM ai_profiles_consolidated WHERE user_id = $1', [phone]);
     return r.rows[0]?.id ?? null;
+  }
+
+  /**
+   * K6b: владелец номера активен (activeOwnerSql). Неактивному — ни телефона
+   * в публичном профиле, ни новой заявки. Ошибка чтения — fail-closed
+   * (считаем неактивным) с записью в журнал: только код ошибки
+   * (safeErrorCode — SQLSTATE или имя класса), без номера и без текста
+   * ошибки, который может цитировать параметры.
+   */
+  private async ownerActive(phone: string): Promise<boolean> {
+    try {
+      const r = await this.pg.query(`SELECT 1 WHERE ${activeOwnerSql('$1')}`, [phone]);
+      return (r.rowCount ?? r.rows?.length ?? 0) > 0;
+    } catch (error) {
+      this.logger.warn(
+        `contacts: owner state unreadable (${safeErrorCode(error)}), treated as inactive`,
+      );
+      return false;
+    }
   }
 
   async contactVisibility(phone: string): Promise<ContactVisibility> {
@@ -94,13 +135,17 @@ export class ContactsService {
 
     // Финальные access и contactVisible образуют одну точку сериализации:
     // отзыв связи, блок, paused или public→private не остаются в старом ответе.
-    const [finalAccess, finalVisibility] = await Promise.all([
+    const [finalAccess, finalVisibility, targetActive] = await Promise.all([
       readProfileAccess(this.pg, requesterPhone, targetPhone).catch(() => null),
       this.contactVisibility(targetPhone),
+      self ? Promise.resolve(true) : this.ownerActive(targetPhone),
     ]);
     if (!finalAccess?.visible) return null;
     const stillIncludeProfile = finalAccess.visible && (self || finalAccess.automaticProfiling);
-    phoneDisclosed = finalVisibility === 'public' || self || finalAccess.approvedContact || finalAccess.peer;
+    // K6/K6b: телефон (и email/аватар) — только активного владельца: открытый
+    // до удаления/блокировки контакт или переписка его не раскрывают.
+    phoneDisclosed = targetActive
+      && (finalVisibility === 'public' || self || finalAccess.approvedContact || finalAccess.peer);
 
     const profileData = meta.rows[0]?.profile_data || {};
     const serializedEntities: Record<string, any> = {};
@@ -139,7 +184,14 @@ export class ContactsService {
     if (requesterId === targetId) throw new Error('Cannot request own contact');
 
     const targetPhone = await this.phoneById(targetId);
-    if (!targetPhone || !(await canReceiveNewProposal(this.pg, targetPhone))) {
+    // K6b: получатель — только активный аккаунт (activeOwnerSql). Заявка
+    // удалённому/заблокированному/без строки user_id висела бы pending
+    // навсегда; ответ — тот же, что на несуществующего получателя.
+    if (
+      !targetPhone
+      || !(await canReceiveNewProposal(this.pg, targetPhone))
+      || !(await this.ownerActive(targetPhone))
+    ) {
       throw new NotFoundException({ code: 'PROFILE_NOT_AVAILABLE' });
     }
 
@@ -149,23 +201,42 @@ export class ContactsService {
       // Phone открыт — запрос не нужен. Создаём сразу approved (для истории).
       const r = await this.pg.query(
         `INSERT INTO contact_requests(requester_id, target_id, message, status, resolved_at)
-         VALUES ($1, $2, $3, 'approved', now())
+         SELECT $1, $2, $3, 'approved', now()
+          WHERE ${RECIPIENT_ACTIVE_SQL}
          ON CONFLICT DO NOTHING
          RETURNING *`,
         [requesterId, targetId, message],
       );
-      return r.rows[0] || (await this.findExisting(requesterId, targetId));
+      return r.rows[0] || (await this.existingOrUnavailable(requesterId, targetId, targetPhone));
     }
 
     // matchOnly — создаём pending. UNIQUE-индекс предотвратит дубли pending.
     const r = await this.pg.query(
       `INSERT INTO contact_requests(requester_id, target_id, message, status)
-       VALUES ($1, $2, $3, 'pending')
+       SELECT $1, $2, $3, 'pending'
+        WHERE ${RECIPIENT_ACTIVE_SQL}
        ON CONFLICT DO NOTHING
        RETURNING *`,
       [requesterId, targetId, message],
     );
-    return r.rows[0] || (await this.findExisting(requesterId, targetId));
+    return r.rows[0] || (await this.existingOrUnavailable(requesterId, targetId, targetPhone));
+  }
+
+  /**
+   * K6b: INSERT не вернул строку — либо дубль pending (ON CONFLICT, прежнее
+   * поведение: вернуть существующую), либо получателя успели сделать
+   * неактивным между проверкой и INSERT (гейт в самом INSERT) — тогда тот же
+   * отказ, что на несуществующего получателя.
+   */
+  private async existingOrUnavailable(
+    requesterId: number,
+    targetId: number,
+    targetPhone: string,
+  ): Promise<ContactRequest> {
+    if (!(await this.ownerActive(targetPhone))) {
+      throw new NotFoundException({ code: 'PROFILE_NOT_AVAILABLE' });
+    }
+    return this.findExisting(requesterId, targetId);
   }
 
   private async findExisting(requesterId: number, targetId: number): Promise<ContactRequest> {
@@ -182,7 +253,8 @@ export class ContactsService {
     const targetId = await this.idByPhone(targetPhone);
     if (!targetId) return [];
     const r = await this.pg.query(
-      `SELECT cr.*, ap.user_id AS requester_phone, ap.profile_data AS requester_profile_data
+      `SELECT cr.*, ap.user_id AS requester_phone, ap.profile_data AS requester_profile_data,
+              ${activeOwnerSql('ap.user_id')} AS requester_active
        FROM contact_requests cr
        JOIN ai_profiles_consolidated ap ON ap.id = cr.requester_id
        WHERE cr.target_id = $1
@@ -201,7 +273,12 @@ export class ContactsService {
       const out: any = { ...row };
       const profileData = out.requester_profile_data || {};
       delete out.requester_profile_data;
-      if (row.status !== 'approved') delete out.requester_phone;
+      // K6/K6b: телефон — только у approved и только активного контрагента
+      // (activeOwnerSql): контакт, открытый до удаления/блокировки, номер
+      // больше не выдаёт; нет строки user_id — тоже нет.
+      const requesterActive = out.requester_active === true;
+      delete out.requester_active;
+      if (row.status !== 'approved' || !requesterActive) delete out.requester_phone;
 
       const includeProfile = access.visible && access.automaticProfiling;
       const entities = includeProfile && this.neo4j
@@ -219,7 +296,8 @@ export class ContactsService {
     const requesterId = await this.idByPhone(requesterPhone);
     if (!requesterId) return [];
     const r = await this.pg.query(
-      `SELECT cr.*, ap.user_id AS target_phone, ap.profile_data AS target_profile_data
+      `SELECT cr.*, ap.user_id AS target_phone, ap.profile_data AS target_profile_data,
+              ${activeOwnerSql('ap.user_id')} AS target_active
        FROM contact_requests cr
        JOIN ai_profiles_consolidated ap ON ap.id = cr.target_id
        WHERE cr.requester_id = $1
@@ -238,7 +316,10 @@ export class ContactsService {
       const out: any = { ...row };
       const profileData = out.target_profile_data || {};
       delete out.target_profile_data;
-      if (row.status !== 'approved') delete out.target_phone;
+      // K6/K6b: см. listIncoming — номер неактивного контрагента не выдаётся.
+      const targetActive = out.target_active === true;
+      delete out.target_active;
+      if (row.status !== 'approved' || !targetActive) delete out.target_phone;
 
       const includeProfile = access.visible && access.automaticProfiling;
       const entities = includeProfile && this.neo4j
@@ -259,19 +340,33 @@ export class ContactsService {
   ): Promise<ContactRequest | null> {
     const targetId = await this.idByPhone(targetPhone);
     if (!targetId) return null;
+    // K6: одобрение раскрывает телефон отправителя, поэтому одобрить можно
+    // только заявку АКТИВНОГО аккаунта. Гейт — в самом UPDATE (EXISTS по
+    // user_id отправителя), без отдельной проверки до него: заявка
+    // удалённого (contacts.stop ещё не прошёл или его не было) или
+    // заблокированного не одобряется, и живой партнёр получает тот же null
+    // (404 not_found_or_not_pending), что и на обработанную заявку.
+    // Отклонение телефона не раскрывает и разрешено для любого отправителя.
     const r = await this.pg.query(
       `UPDATE contact_requests
        SET status = $1, resolved_at = now()
        WHERE id = $2 AND target_id = $3 AND status = 'pending'
+         AND (NOT $4::boolean OR EXISTS (
+           SELECT 1 FROM ai_profiles_consolidated ap
+            WHERE ap.id = contact_requests.requester_id
+              AND ${activeOwnerSql('ap.user_id')}))
        RETURNING *`,
-      [decision, requestId, targetId],
+      [decision, requestId, targetId, decision === 'approved'],
     );
     if (!r.rows[0]) return null;
     const row = r.rows[0];
-    // Если approved — вытаскиваем phone requester'а для возврата.
+    // Если approved — вытаскиваем phone requester'а для возврата. Тот же
+    // active-гейт: отправителя могли удалить между UPDATE и этим чтением —
+    // тогда телефон не выдаётся (null), а не уходит живому партнёру.
     if (row.status === 'approved') {
       const rr = await this.pg.query(
-        `SELECT user_id FROM ai_profiles_consolidated WHERE id = $1`,
+        `SELECT ap.user_id FROM ai_profiles_consolidated ap
+          WHERE ap.id = $1 AND ${activeOwnerSql('ap.user_id')}`,
         [row.requester_id],
       );
       row.requester_phone = rr.rows[0]?.user_id ?? null;

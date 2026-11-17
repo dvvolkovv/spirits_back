@@ -1,9 +1,10 @@
-import { Injectable, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { AccountDeletionRegistry } from '../account-deletion/account-deletion.registry';
 import {
   DeletionCancelledError,
   DeletionRetryError,
   deletionErrorKind,
+  safeDeletionSkipMessage,
 } from '../account-deletion/account-deletion.safe';
 import type {
   AccountDeletionAdapter,
@@ -16,6 +17,7 @@ import type {
   DeletionSkip,
 } from '../account-deletion/account-deletion.types';
 import { VideoService } from './video.service';
+import type { VideoPurgeSkips } from './video.service';
 
 /**
  * Task 12 — video_jobs при удалении аккаунта.
@@ -33,6 +35,18 @@ import { VideoService } from './video.service';
  * id — он payload-гигиену не прошёл бы и пользы не несёт), а purge никаких
  * провайдерских методов не вызывает. В payload живёт один технический
  * videoJobId: prompt, userId и пути план не покидают.
+ *
+ * K4 — video-upload.purge: личные загрузки video-uploads/<userId>/, у которых
+ * строки video_jobs нет (фото не дошло до задачи; failed-строку стёр
+ * cleanupOldFailedJobs; 2-е и 3-е референс-фото Veo — только в
+ * composed_plan). Одна задача на аккаунт (discoverVideoUploadsDeletion),
+ * обход каталога владельца при исполнении — VideoService
+ * .deleteVideoUploadsForDeletion.
+ *
+ * K4b — video-job.purge удаляет из MinIO только белый список: производные
+ * videos/<jobId>.mp4|jpg и личные загрузки владельца video-uploads/<userId>/.
+ * Ссылку строки на прочий объект своего бакета (чужая загрузка, shorts/…)
+ * purge пропускает без ошибки и пишет в журнал вид и счётчик (logSkipped).
  */
 
 /** Сколько строк video_jobs читать за один запрос discovery. */
@@ -87,9 +101,46 @@ export async function discoverVideoDeletion(ctx: VideoDiscovery): Promise<Deleti
   return { jobs, skips };
 }
 
+/** Статический resourceKey задачи обхода загрузок (одна на аккаунт). */
+export const VIDEO_UPLOAD_RESOURCE_KEY = 'video-uploads';
+
+/**
+ * K4 — discovery личных загрузок video-uploads/<userId>/.
+ *
+ * Объекты каталога не обязаны иметь строку video_jobs, поэтому задача не
+ * зависит от строк: единственный SQL — generation gate (форма avatar.purge);
+ * MinIO при планировании не листается. Job пустой (payload {}, статический
+ * resourceKey — userId в нём забраковал бы sanitizer): цель выводится из
+ * job.userId, колонки job, а не payload. Фаза purge — загрузки переживают
+ * 30-дневное окно реактивации, как video-job.purge.
+ */
+export async function discoverVideoUploadsDeletion(ctx: DeletionDiscovery): Promise<DeletionPlan> {
+  const { db, account } = ctx;
+  const gen = await db.query(
+    `SELECT 1 FROM user_id u
+      WHERE u.internal_id = $1 AND u.state = 'deleted' AND u.deletion_id = $2`,
+    [account.userId, account.deletionId],
+  );
+  if ((gen.rowCount ?? 0) === 0) return { jobs: [], skips: [] };
+  return {
+    jobs: [{
+      resourceType: 'video-upload.purge',
+      resourceKey: VIDEO_UPLOAD_RESOURCE_KEY,
+      phase: 'purge',
+      payload: {},
+    }],
+    skips: [],
+  };
+}
+
 @Injectable()
 export class VideoAccountDeletionAdapter implements OnModuleInit, AccountDeletionAdapter {
-  readonly resourceTypes: readonly DeletionResourceType[] = ['video-job.purge'];
+  private readonly logger = new Logger(VideoAccountDeletionAdapter.name);
+
+  readonly resourceTypes: readonly DeletionResourceType[] = [
+    'video-job.purge',
+    'video-upload.purge',
+  ];
 
   constructor(
     private readonly video: VideoService,
@@ -101,6 +152,10 @@ export class VideoAccountDeletionAdapter implements OnModuleInit, AccountDeletio
   }
 
   async execute(job: DeletionJobRow, ctx: DeletionExecution): Promise<void> {
+    if (job.resourceType === 'video-upload.purge') {
+      await this.executeUploads(job, ctx);
+      return;
+    }
     if (job.resourceType !== 'video-job.purge') {
       throw new Error('unsupported_deletion_resource');
     }
@@ -115,7 +170,12 @@ export class VideoAccountDeletionAdapter implements OnModuleInit, AccountDeletio
 
     await ctx.assertCurrent(job);
     try {
-      await this.video.deleteVideoForDeletion(job.userId, videoJobId, job.deletionId);
+      await this.video.deleteVideoForDeletion(
+        job.userId,
+        videoJobId,
+        job.deletionId,
+        (skips) => this.logSkipped(job, skips),
+      );
     } catch (error) {
       if (error instanceof DeletionCancelledError) throw error;
       if (error instanceof DeletionRetryError) throw error;
@@ -123,6 +183,54 @@ export class VideoAccountDeletionAdapter implements OnModuleInit, AccountDeletio
     }
     // Внешние операции (MinIO/fs) могли занять время: перед тем как считать
     // job выполненным, поколение и lease перепроверяются.
+    await ctx.assertCurrent(job);
+  }
+
+  /**
+   * K4b: ссылки строки на объекты вне белого списка не удалены сознательно.
+   * K4c: строка успешного пропуска отличима от строки сбоя раннера — форма
+   * safeDeletionSkipMessage (`skipped …`, без `kind=`), счётчики по видам;
+   * без userId, ключа и адреса. Sanitizer не принял поля job — та же метка
+   * skipped, тип задачи и только счётчики.
+   */
+  private logSkipped(job: DeletionJobRow, skips: VideoPurgeSkips): void {
+    const count = (n: number) => (Number.isInteger(n) && n >= 0 ? n : 0);
+    const counts = { not_owned: count(skips.notOwned), unsafe_key: count(skips.unsafeKey) };
+    let message = `skipped type=video-job.purge not_owned=${counts.not_owned}`
+      + ` unsafe_key=${counts.unsafe_key}`;
+    try {
+      message = safeDeletionSkipMessage({
+        deletionId: job.deletionId,
+        resourceType: job.resourceType,
+        resourceKey: job.resourceKey,
+        attempts: job.attempts,
+        userId: job.userId,
+        counts,
+      });
+    } catch {
+      // Sanitizer не принял поля job — остаётся строка только со счётчиками.
+    }
+    this.logger.warn(`${message} reason=objects_not_owned_by_job_kept`);
+  }
+
+  /**
+   * K4: обход video-uploads/<userId>/. userId валидирует доменный метод ДО
+   * построения префикса (неверный — retry db без листинга); поколение и lease
+   * перепроверяются до обхода, перед каждым удалением (beforeDelete) и после.
+   */
+  private async executeUploads(job: DeletionJobRow, ctx: DeletionExecution): Promise<void> {
+    await ctx.assertCurrent(job);
+    try {
+      await this.video.deleteVideoUploadsForDeletion(
+        job.userId,
+        job.deletionId,
+        () => ctx.assertCurrent(job),
+      );
+    } catch (error) {
+      if (error instanceof DeletionCancelledError) throw error;
+      if (error instanceof DeletionRetryError) throw error;
+      throw new DeletionRetryError(deletionErrorKind(error));
+    }
     await ctx.assertCurrent(job);
   }
 }

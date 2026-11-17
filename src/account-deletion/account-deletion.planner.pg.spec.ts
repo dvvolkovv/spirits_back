@@ -18,7 +18,10 @@ import { discoverVoiceDocuments } from '../voice-call/voice-document-account-del
 import { discoverChatFiles } from '../chat/chat-files/chat-file-account-deletion.adapter';
 import { discoverChatUploads } from '../chat/chat-uploads/chat-upload-account-deletion.adapter';
 import { discoverImageDeletion } from '../misc/image-account-deletion.adapter';
-import { discoverVideoDeletion } from '../video/video-account-deletion.adapter';
+import {
+  discoverVideoDeletion,
+  discoverVideoUploadsDeletion,
+} from '../video/video-account-deletion.adapter';
 import { discoverSpeechDeletion } from '../speech/speech-account-deletion.adapter';
 import { discoverAvatarDeletion } from '../avatar/avatar-account-deletion.adapter';
 import { discoverVoiceAvatarDeletion } from '../voice-avatar/voice-account-deletion.adapter';
@@ -419,6 +422,7 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       discoverChatUploads,
       discoverImageDeletion,
       discoverVideoDeletion,
+      discoverVideoUploadsDeletion,
       discoverSpeechDeletion,
       discoverAvatarDeletion,
       discoverVoiceAvatarDeletion,
@@ -460,11 +464,15 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       allOf: ['support.stop'],
     });
     // Task 17B: peer.purge ждёт peer.stop (алиасинг после снятия своих
-    // pending-заявок); у contacts.purge stop-фазы нет — правило не нужно.
+    // pending-заявок). K6: contacts.purge ждёт contacts.stop той же формы —
+    // текст обезличивается только у заявок, которые stop уже отменил.
     expect(DELETION_DEPENDENCIES['peer.purge']).toEqual({
       allOf: ['peer.stop'],
     });
-    expect(DELETION_DEPENDENCIES['contacts.purge']).toBeUndefined();
+    expect(DELETION_DEPENDENCIES['contacts.purge']).toEqual({
+      allOf: ['contacts.stop'],
+    });
+    expect(DELETION_DEPENDENCIES['contacts.stop']).toBeUndefined();
     // Task 17C: referral.purge ждёт referral.stop (stop блокирует вывод —
     // между pending-проверкой и алиасингом новая заявка появиться не может);
     // у retention.stop purge-фазы нет — правило не нужно.
@@ -492,6 +500,11 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
     // состояния с другими задачами (как у chat-file.purge) — правило не нужно,
     // срок назначает planner (deletedAt + retention).
     expect(DELETION_DEPENDENCIES['chat-upload.purge']).toBeUndefined();
+    // K4 (video-uploads/<userId>/): обход префикса не разделяет состояние с
+    // video-job.purge — объект, уже стёртый по строке, листинг не вернёт, а
+    // удалённый обходом строковый purge подтвердит как отсутствующий. Порядок
+    // не важен, правило не нужно; срок — planner (deletedAt + retention).
+    expect(DELETION_DEPENDENCIES['video-upload.purge']).toBeUndefined();
   });
 
   describe('assertCurrent', () => {

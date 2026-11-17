@@ -8,7 +8,10 @@ import { discoverVoiceDocuments } from '../voice-call/voice-document-account-del
 import { discoverChatFiles } from '../chat/chat-files/chat-file-account-deletion.adapter';
 import { discoverChatUploads } from '../chat/chat-uploads/chat-upload-account-deletion.adapter';
 import { discoverImageDeletion } from '../misc/image-account-deletion.adapter';
-import { discoverVideoDeletion } from '../video/video-account-deletion.adapter';
+import {
+  discoverVideoDeletion,
+  discoverVideoUploadsDeletion,
+} from '../video/video-account-deletion.adapter';
 import { discoverSpeechDeletion } from '../speech/speech-account-deletion.adapter';
 import { discoverAvatarDeletion } from '../avatar/avatar-account-deletion.adapter';
 import { discoverVoiceAvatarDeletion } from '../voice-avatar/voice-account-deletion.adapter';
@@ -43,7 +46,20 @@ export const DELETION_DISCOVERERS: readonly DeletionDiscoverer[] = [
   // не нужно (нет stop-фазы и общего состояния, как у chat-file.purge).
   discoverChatUploads,
   discoverImageDeletion,
+  // Видео-бакет (MINIO_BUCKET_VIDEOS) — два места.
+  // video-job.purge (по строке video_jobs): videos/<jobId>.mp4|jpg и из
+  // колонок строки только ключи белого списка (K4b: свои
+  // video-uploads/<userId>/…; чужое — пропуск с журналом skipped);
+  // локальные public/videos/<jobId>.* и _veoconcat/<jobId> — только из id
+  // строки.
+  // video-upload.purge (K4): весь каталог личных загрузок
+  // video-uploads/<userId>/ (листинг с пагинацией) — фото без строки (не
+  // дошли до задачи, стёрты cleanupOldFailedJobs, 2-е/3-е референс-фото Veo
+  // в composed_plan). Одна задача на аккаунт; правило зависимостей не
+  // нужно — с video-job.purge пересекается только подтверждённым
+  // отсутствием объекта.
   discoverVideoDeletion,
+  discoverVideoUploadsDeletion,
   discoverSpeechDeletion,
   discoverAvatarDeletion,
   discoverVoiceAvatarDeletion,
@@ -107,6 +123,11 @@ export const DELETION_DEPENDENCIES: Readonly<Partial<Record<
   // resourceKey статический ('peer'), поэтому allOf эквивалентно
   // sameResourceKey — форма как у tasks/support.
   'peer.purge': { allOf: ['peer.stop'] },
+  // K6: обезличивание текста заявок — после того, как stop отменил висящие
+  // заявки поколения: purge не оставляет живому партнёру pending-заявку
+  // удалённого (без текста, но одобряемую). resourceKey статический
+  // ('contacts') — форма как у peer.
+  'contacts.purge': { allOf: ['contacts.stop'] },
   // Task 17C: обезличивание referral-журналов — только после деактивации
   // лидера. stop блокирует requestWithdrawal (strict-гейт is_active), поэтому
   // между pending-проверкой purge и алиасингом не может появиться новая

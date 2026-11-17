@@ -1453,18 +1453,22 @@ export class ChatService {
         res.setHeader('X-Accel-Buffering', 'no');
         res.setHeader('Access-Control-Allow-Origin', '*');
 
+        // K1b: обе вставки gated на живой аккаунт в самом SQL — как
+        // saveUserMessageRow (Task 11); userId — последним параметром.
         await this.pg.query(
           `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type)
-           VALUES ($1, 'human', $2, $3, 'text')`,
-          [chatSessionId, agent.id, message],
+           SELECT $1, 'human', $2, $3, 'text'
+           WHERE EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $4 AND u.state = 'active')`,
+          [chatSessionId, agent.id, message, userId],
         );
         // Адрес входа уезжает в карточку только у Zoom: у остальных площадок
         // он выводится из кода, и дублировать его в теге незачем.
         const card = buildMeetingCard(room.code, room.title, meetingLink.provider, meetingLink.url);
         await this.pg.query(
           `INSERT INTO custom_chat_history (session_id, sender_type, agent, content, message_type, tokens_used)
-           VALUES ($1, 'ai', $2, $3, 'text', 0)`,
-          [chatSessionId, agent.id, card],
+           SELECT $1, 'ai', $2, $3, 'text', 0
+           WHERE EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $4 AND u.state = 'active')`,
+          [chatSessionId, agent.id, card, userId],
         );
 
         res.write(JSON.stringify({ type: 'begin' }) + '\n');

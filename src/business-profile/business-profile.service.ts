@@ -80,23 +80,29 @@ export class BusinessProfileService {
 
     if (!changed) return current;
 
+    // K1: gated на живой аккаунт в том же UPDATE. После удаления строка
+    // остаётся оболочкой с profile_data = '{}', automaticProfilingAllowed её
+    // пропускает — без гейта извлечение из хода, начатого до удаления,
+    // воскрешало бы карточку.
     const res = await this.pg.query(
       `UPDATE ai_profiles_consolidated
           SET profile_data = jsonb_set(
                 COALESCE(profile_data, '{}'::jsonb), '{business}', $1::jsonb, true),
               updated_at = now()
-        WHERE user_id = $2`,
+        WHERE user_id = $2
+          AND EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = $2 AND u.state = 'active')`,
       [JSON.stringify(next), userId],
     );
 
     // rowCount === 0 значит: строки профиля для этого userId нет (например,
     // пользователь ещё не создан identity.service — сюда не наше дело её
-    // заводить, это привело бы к сиротам). Врать вызывающему, что карточка
-    // сохранена, хуже, чем просто не сохранить: фича существует, чтобы
-    // ассистент помнил бизнес пользователя, и тихая потеря записи — самый
-    // незаметный из возможных отказов.
+    // заводить, это привело бы к сиротам) или аккаунт неактивен. Врать
+    // вызывающему, что карточка сохранена, хуже, чем просто не сохранить:
+    // фича существует, чтобы ассистент помнил бизнес пользователя, и тихая
+    // потеря записи — самый незаметный из возможных отказов. Идентификатор в
+    // лог не пишем: сюда теперь попадает и удалённый аккаунт.
     if (!res.rowCount) {
-      this.logger.warn(`merge: UPDATE не задел ни одной строки — нет профиля для user_id=${userId}`);
+      this.logger.warn(`merge: UPDATE не задел ни одной строки — нет профиля или аккаунт неактивен`);
       return current;
     }
 

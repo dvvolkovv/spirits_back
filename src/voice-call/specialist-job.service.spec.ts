@@ -3,6 +3,22 @@ import {
   findSpecialist, SPECIALIST_ROLES, SPECIALISTS, VOICE_ASK_NOTE, VOICE_BRIEF,
 } from './voice-call.types';
 
+/** Гейт K1b в INSERT истории: та же форма, что saveUserMessageRow в chat.service. */
+const HISTORY_GATE_RE = /WHERE EXISTS \(SELECT 1 FROM user_id u WHERE u\.internal_id = \$\d+ AND u\.state = 'active'\)/;
+
+/**
+ * Номер плейсхолдера internal_id внутри гейта. Тест связывает его с позицией
+ * userId в массиве параметров: «$4 при пяти параметрах» сравнил бы internal_id
+ * с tokens — у живых записи молча пропали бы, а проверка «гейт есть» и
+ * «userId последний» осталась бы зелёной.
+ */
+function gatePlaceholder(sql: string): number {
+  const m = /WHERE EXISTS \(SELECT 1 FROM user_id u WHERE u\.internal_id = \$(\d+) AND u\.state = 'active'\)/
+    .exec(sql.replace(/\s+/g, ' '));
+  if (!m) throw new Error(`в SQL нет гейта: ${sql}`);
+  return Number(m[1]);
+}
+
 /** Заглушка PgService: помнит job'ы и строки истории в памяти. */
 function makePg() {
   const jobs: any[] = [];
@@ -16,12 +32,19 @@ function makePg() {
     // По умолчанию active — существующие тесты не меняют поведение.
     userState: 'active',
     query: jest.fn(async (sql: string, params: any[] = []) => {
+      // Вставка в историю — раньше проверки user_id: гейт K1b живёт в самом
+      // INSERT (… WHERE EXISTS (SELECT 1 FROM user_id …)). Семантика прод-SQL:
+      // с гейтом строка пишется только живому аккаунту, без гейта — всегда,
+      // и тест видит незащищённую запись.
+      if (/INSERT INTO custom_chat_history/i.test(sql)) {
+        if (HISTORY_GATE_RE.test(sql.replace(/\s+/g, ' ')) && self.userState !== 'active') {
+          return { rows: [], rowCount: 0 };
+        }
+        history.push({ session_id: params[0], agent: params[1], content: params[2], sender_type: /'human'/.test(sql) ? 'human' : 'ai', sql, params });
+        return { rows: [], rowCount: 1 };
+      }
       if (/FROM user_id\b/i.test(sql)) {
         return { rows: [{ state: self.userState }], rowCount: 1 };
-      }
-      if (/INSERT INTO custom_chat_history/i.test(sql)) {
-        history.push({ session_id: params[0], agent: params[1], content: params[2], sender_type: /'human'/.test(sql) ? 'human' : 'ai' });
-        return { rows: [], rowCount: 1 };
       }
       if (/INSERT INTO token_consumption_tasks/i.test(sql)) {
         charges.push({ user_id: params[1], agent_id: params[2], output_tokens: params[3], metadata: JSON.parse(params[4]) });
@@ -439,5 +462,87 @@ describe('удалённый аккаунт: консультация специ
     expect(pg.charges).toHaveLength(0);
     const answers = pg.history.filter((h: any) => h.sender_type === 'ai');
     expect(answers).toHaveLength(0);
+  });
+
+  // K1b: строгий SELECT state стоит отдельно от записи, и между ними есть
+  // await'ы (комната, язык, списание). Каждая запись в историю обязана быть
+  // защищена своим оператором — иначе удаление в этом окне оставляет строку
+  // в чате удалённого навсегда (история стирается один раз).
+
+  it('удаление между проверкой и записью вопроса — вопрос в чат не ложится', async () => {
+    const pg = makePg();
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'ответ юриста', tokens: 100, costUsd: 0.1 })) };
+    // Удалили, пока в комнату уходил specialist_pending — после assertActive.
+    const lk = { send: jest.fn(async (_room: string, msg: any) => {
+      if (msg?.type === 'specialist_pending') pg.userState = 'deleted';
+    }) };
+    const svc = new SpecialistJobService(pg as any, chat as any, lk as any, makeLang() as any);
+
+    await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'Можно ли так?');
+    await svc.drainForTests();
+
+    expect(pg.history).toHaveLength(0);
+  });
+
+  it('удаление между проверкой и записью ответа — ответ в чат не ложится', async () => {
+    const pg = makePg();
+    const base = pg.query.getMockImplementation();
+    // Удалили, пока писалось списание — после второго assertActive.
+    pg.query.mockImplementation(async (sql: string, params: any[] = []) => {
+      const r = await base(sql, params);
+      if (/INSERT INTO token_consumption_tasks/i.test(sql)) pg.userState = 'deleted';
+      return r;
+    });
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'ответ юриста', tokens: 100, costUsd: 0.1 })) };
+    const lk = { send: jest.fn(async () => {}) };
+    const svc = new SpecialistJobService(pg as any, chat as any, lk as any, makeLang() as any);
+
+    await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'Можно ли так?');
+    await svc.drainForTests();
+
+    expect(pg.history.filter((h: any) => h.sender_type === 'ai')).toHaveLength(0);
+  });
+
+  it('сбой специалиста после удаления — отметка о неудаче в чат не ложится', async () => {
+    const pg = makePg();
+    const chat = {
+      generateAgentReplyWithCharge: jest.fn(async () => {
+        pg.userState = 'deleted';
+        throw new Error('релей лёг');
+      }),
+    };
+    const lk = { send: jest.fn(async () => {}) };
+    const svc = new SpecialistJobService(pg as any, chat as any, lk as any, makeLang() as any);
+
+    await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'Можно ли так?');
+    await svc.drainForTests();
+
+    expect(pg.history.filter((h: any) => h.sender_type === 'ai')).toHaveLength(0);
+  });
+
+  it('каждая запись в историю несёт гейт в самом INSERT, $N гейта указывает на userId (последний параметр)', async () => {
+    const pg = makePg();
+    let fail = false;
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => {
+      if (fail) throw new Error('релей лёг');
+      return { text: 'ответ юриста', tokens: 100, costUsd: 0.1 };
+    }) };
+    const lk = { send: jest.fn(async () => {}) };
+    const svc = new SpecialistJobService(pg as any, chat as any, lk as any, makeLang() as any);
+
+    await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'вопрос с ответом');
+    await svc.drainForTests();
+    fail = true;
+    await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'вопрос со сбоем');
+    await svc.drainForTests();
+
+    // вопрос + ответ, вопрос + отметка о сбое
+    expect(pg.history).toHaveLength(4);
+    for (const row of pg.history) {
+      expect(row.sql.replace(/\s+/g, ' ')).toMatch(HISTORY_GATE_RE);
+      const n = gatePlaceholder(row.sql);
+      expect(row.params[n - 1]).toBe('user-1');
+      expect(n).toBe(row.params.length);
+    }
   });
 });

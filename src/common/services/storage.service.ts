@@ -48,6 +48,21 @@ export interface ListInput {
   maxKeys?: number;
 }
 
+export interface ListPageInput {
+  bucket: string;
+  prefix: string;
+  continuationToken?: string;
+  maxKeys?: number;
+}
+
+export interface ListPage {
+  keys: string[];
+  /** Ответ усечён (IsTruncated): за этой страницей есть ещё ключи. */
+  truncated: boolean;
+  /** Токен следующей страницы; приходит только вместе с truncated. */
+  nextContinuationToken?: string;
+}
+
 @Injectable()
 export class StorageService implements OnModuleInit {
   private readonly logger = new Logger(StorageService.name);
@@ -183,6 +198,33 @@ export class StorageService implements OnModuleInit {
       }),
     );
     return (res.Contents ?? []).map((o) => o.Key as string);
+  }
+
+  /**
+   * Одна страница ListObjectsV2 по префиксу — с признаком усечения и токеном
+   * продолжения (account-deletion K4: обход video-uploads/<userId>/). В
+   * отличие от list, хвост не теряется молча: цикл по страницам ведёт
+   * вызывающий, пока truncated. Ошибки MinIO — наружу, классифицирует
+   * вызывающий.
+   */
+  async listPage(input: ListPageInput): Promise<ListPage> {
+    const res = await this.s3.send(
+      new ListObjectsV2Command({
+        Bucket: input.bucket,
+        Prefix: input.prefix,
+        ContinuationToken: input.continuationToken,
+        MaxKeys: input.maxKeys ?? 1000,
+      }),
+    );
+    const keys = (res.Contents ?? [])
+      .map((o) => o.Key)
+      .filter((key): key is string => typeof key === 'string' && key.length > 0);
+    const truncated = res.IsTruncated === true;
+    return {
+      keys,
+      truncated,
+      nextContinuationToken: truncated ? res.NextContinuationToken : undefined,
+    };
   }
 
   /** Размер и тип объекта; null — объекта нет. Прочие ошибки MinIO бросает. */

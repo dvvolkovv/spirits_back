@@ -1,3 +1,4 @@
+import { coreTableDdl } from '../base/core-schema-ddl.forspec';
 import {
   PrivacySettingsDataError,
   canUseProfileForRequester,
@@ -5,6 +6,7 @@ import {
   filterSearchCandidateIds,
   listSearchCandidateIds,
   readProfileAccess,
+  readProfileAccessBatch,
 } from './profile-privacy';
 import { createPrivacyPg, describePg } from './profile-privacy.pg-helper';
 
@@ -34,12 +36,17 @@ describePg('profile access and search candidates against an isolated PostgreSQL 
         PRIMARY KEY (blocker_id, blocked_id)
       )
     `);
+    // K6b: кандидаты поиска — только активные аккаунты; user_id — настоящий
+    // DDL из снимка 001_core_schema.sql.
+    await privacy.pool.query(coreTableDdl(['user_id']));
   });
 
   beforeEach(async () => {
     await privacy.pool.query(`
-      TRUNCATE user_blocks, peer_conversations, contact_requests, ai_profiles_consolidated
+      TRUNCATE user_blocks, peer_conversations, contact_requests, ai_profiles_consolidated, user_id
       RESTART IDENTITY;
+      INSERT INTO user_id (internal_id, state)
+      SELECT 'u' || n, 'active' FROM generate_series(1, 9) AS n;
       INSERT INTO ai_profiles_consolidated (id, user_id, profile_data)
       VALUES
         (1, 'u1', '{}'::jsonb),
@@ -392,5 +399,61 @@ describePg('profile access and search candidates against an isolated PostgreSQL 
     await expect(listSearchCandidateIds(broken as any, 'u1')).rejects.toBe(failure);
     await expect(filterSearchCandidateIds(broken as any, 'u1', ['u3'])).rejects.toBe(failure);
     expect(broken.query).toHaveBeenCalledTimes(2);
+  });
+
+  describe('K6b: в поиск попадают только активные аккаунты', () => {
+    beforeEach(async () => {
+      await privacy.pool.query(
+        `INSERT INTO ai_profiles_consolidated (id, user_id, profile_data)
+         VALUES
+           (5, 'u5', '{}'::jsonb),
+           (6, 'u6', '{}'::jsonb),
+           (7, 'u7', '{}'::jsonb),
+           (8, 'u8', '{}'::jsonb);
+         -- u5 удалён (core упал — профиль ещё не обнулён), u6 заблокирован,
+         -- у u7 нет строки user_id, u8 активен.
+         UPDATE user_id SET state = 'deleted' WHERE internal_id = 'u5';
+         UPDATE user_id SET state = 'blocked' WHERE internal_id = 'u6';
+         DELETE FROM user_id WHERE internal_id = 'u7'`,
+      );
+    });
+
+    it('listSearchCandidateIds не выдаёт удалённого, заблокированного и профиль без user_id', async () => {
+      const result = await listSearchCandidateIds(privacy.pg as any, 'u1');
+
+      expect([...result].sort()).toEqual(['u3', 'u8']);
+    });
+
+    it('filterSearchCandidateIds отсеивает их же', async () => {
+      const result = await filterSearchCandidateIds(
+        privacy.pg as any,
+        'u1',
+        ['u3', 'u5', 'u6', 'u7', 'u8'],
+      );
+
+      expect([...result].sort()).toEqual(['u3', 'u8']);
+    });
+
+    it('открытый контакт и переписка не возвращают удалённого в поиск', async () => {
+      await privacy.pool.query(
+        `INSERT INTO contact_requests (requester_id, target_id, status) VALUES (1, 5, 'approved');
+         INSERT INTO peer_conversations (user_a_id, user_b_id) VALUES ('u1', 'u6')`,
+      );
+
+      const result = await listSearchCandidateIds(privacy.pg as any, 'u1');
+
+      expect([...result].sort()).toEqual(['u3', 'u8']);
+    });
+
+    it('readProfileAccessBatch (списки контактов) не меняется: строки истории удалённого видны', async () => {
+      await privacy.pool.query(
+        `INSERT INTO contact_requests (requester_id, target_id, status) VALUES (1, 5, 'approved')`,
+      );
+
+      const access = await readProfileAccessBatch(privacy.pg as any, 'u1', ['u5', 'u8']);
+
+      expect(access.get('u5')).toMatchObject({ exists: true, visible: true, approvedContact: true });
+      expect(access.get('u8')).toMatchObject({ exists: true, visible: true });
+    });
   });
 });

@@ -9,6 +9,33 @@ import * as path from 'path';
 /** Накатываются по порядку, при каждом старте, идемпотентным SQL. */
 const MIGRATIONS = ['001_user_id_to_text.sql', '002_backfill_offledger_accruals.sql'];
 
+/**
+ * K2: причина сбоя DDL на старте — для logger.error. Таймаут блокировки
+ * (55P03) назван словами: это не поломка схемы, а чужая транзакция, державшая
+ * таблицу дольше lock_timeout; шаг пропущен, следующий старт его повторит.
+ * Остальное — сообщение PostgreSQL (у DDL в нём нет значений строк).
+ */
+function startupDdlFailure(e: any): string {
+  if (e?.code === '55P03') {
+    return 'таймаут блокировки (lock_timeout 5s): таблицу держит чужая транзакция, шаг пропущен — повторится на следующем старте';
+  }
+  return e?.message ?? String(e);
+}
+
+/** K2: что сломано, пока телефонные колонки referral не вмещают alias удаления. */
+function purgeBlockedUntilWidened(manualDdl: string): string {
+  return 'До расширения referral.purge (удаление аккаунта) будет падать на записи alias '
+    + `'deleted:<uuid>'; если ошибка повторяется на каждом старте — расширить вручную: ${manualDdl}`;
+}
+
+/** K2: последствия неприменённого файла миграции — дописываются к его ошибке. */
+const MIGRATION_PENDING: Record<string, string> = {
+  '001_user_id_to_text.sql': purgeBlockedUntilWidened(
+    'ALTER TABLE … ALTER COLUMN … TYPE text для referral_leaders.user_phone, '
+      + 'referral_referees.referee_phone, referral_commissions.referee_phone (migrations/001_user_id_to_text.sql)',
+  ),
+};
+
 // Двусторонний реф-бонус: приглашённому — стартовые токены при переходе по
 // ссылке (у пригласившего «сторона» = существующая комиссия с оплат).
 // REFEREE_BONUS_TOKENS — столько же, сколько welcome на старте (подтверждено владельцем 2026-06-19).
@@ -213,10 +240,19 @@ export class ReferralService implements OnModuleInit {
     // охранительное: DO-блок срабатывает, только если колонка всё ещё уже 64
     // (character_maximum_length IS NOT NULL — text-колонки не трогаем;
     // leaders/referees/commissions уже TEXT силами migrations/001).
+    //
+    // K2: ALTER TABLE берёт ACCESS EXCLUSIVE и без lock_timeout ждёт любую
+    // открытую транзакцию на таблице — старт API висел бы за ней, а новые
+    // запросы к таблице — за стартом. Каталог проверяется ДО ALTER (на
+    // актуальной схеме лок не просится вовсе), ожидание лока там, где ALTER
+    // нужен, ограничено 5 с — форма chat-uploads/001: set_config(..., true)
+    // живёт до конца транзакции DO-блока. Не дождался — шаг пропущен, лог
+    // говорит, что сломано до его повтора. То же ниже для ADD COLUMN.
     try {
       await this.pg.query(`
         DO $$
         BEGIN
+          PERFORM set_config('lock_timeout', '5s', true);
           IF EXISTS (SELECT 1 FROM information_schema.columns
                       WHERE table_schema = current_schema()
                         AND table_name = 'referral_token_payouts'
@@ -227,12 +263,16 @@ export class ReferralService implements OnModuleInit {
           END IF;
         END $$`);
     } catch (e: any) {
-      this.logger.error(`referral_token_payouts.user_phone widen migration failed: ${e.message}`);
+      this.logger.error(
+        `referral_token_payouts.user_phone widen migration failed: ${startupDdlFailure(e)}. `
+          + purgeBlockedUntilWidened('ALTER TABLE referral_token_payouts ALTER COLUMN user_phone TYPE varchar(64)'),
+      );
     }
     try {
       await this.pg.query(`
         DO $$
         BEGIN
+          PERFORM set_config('lock_timeout', '5s', true);
           IF EXISTS (SELECT 1 FROM information_schema.columns
                       WHERE table_schema = current_schema()
                         AND table_name = 'referral_withdrawals'
@@ -243,19 +283,44 @@ export class ReferralService implements OnModuleInit {
           END IF;
         END $$`);
     } catch (e: any) {
-      this.logger.error(`referral_withdrawals.user_phone widen migration failed: ${e.message}`);
+      this.logger.error(
+        `referral_withdrawals.user_phone widen migration failed: ${startupDdlFailure(e)}. `
+          + purgeBlockedUntilWidened('ALTER TABLE referral_withdrawals ALTER COLUMN user_phone TYPE varchar(64)'),
+      );
     }
     // Двусторонний бонус: сколько токенов начиснено приглашённому (аудит/идемпотентность).
+    // K2: ADD COLUMN IF NOT EXISTS берёт ACCESS EXCLUSIVE ДО проверки колонки
+    // (см. LLM_SETTINGS_DDL) — поэтому сначала каталог, ALTER только если нет.
     try {
-      await this.pg.query(`ALTER TABLE referral_referees ADD COLUMN IF NOT EXISTS bonus_tokens integer NOT NULL DEFAULT 0`);
+      await this.pg.query(`
+        DO $$
+        BEGIN
+          PERFORM set_config('lock_timeout', '5s', true);
+          IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_schema = current_schema()
+                            AND table_name = 'referral_referees'
+                            AND column_name = 'bonus_tokens') THEN
+            ALTER TABLE referral_referees ADD COLUMN IF NOT EXISTS bonus_tokens integer NOT NULL DEFAULT 0;
+          END IF;
+        END $$`);
     } catch (e: any) {
-      this.logger.error(`referral_referees.bonus_tokens migration failed: ${e.message}`);
+      this.logger.error(`referral_referees.bonus_tokens migration failed: ${startupDdlFailure(e)}`);
     }
     // Флаг «уже уведомили SMS о достижении порога вывода» (1 SMS на цикл накопления).
     try {
-      await this.pg.query(`ALTER TABLE referral_leaders ADD COLUMN IF NOT EXISTS payout_notified boolean NOT NULL DEFAULT false`);
+      await this.pg.query(`
+        DO $$
+        BEGIN
+          PERFORM set_config('lock_timeout', '5s', true);
+          IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_schema = current_schema()
+                            AND table_name = 'referral_leaders'
+                            AND column_name = 'payout_notified') THEN
+            ALTER TABLE referral_leaders ADD COLUMN IF NOT EXISTS payout_notified boolean NOT NULL DEFAULT false;
+          END IF;
+        END $$`);
     } catch (e: any) {
-      this.logger.error(`referral_leaders.payout_notified migration failed: ${e.message}`);
+      this.logger.error(`referral_leaders.payout_notified migration failed: ${startupDdlFailure(e)}`);
     }
 
     // Файлы из migrations/ — СТРОГО ПОСЛЕ инлайнового DDL выше: 002 читает
@@ -292,7 +357,10 @@ export class ReferralService implements OnModuleInit {
         this.logger.log(`referral migration ${filename} applied from ${p}`);
         return;
       } catch (e: any) {
-        this.logger.error(`referral migration ${filename} failed (${p}): ${e.message}`);
+        const pending = MIGRATION_PENDING[filename];
+        this.logger.error(
+          `referral migration ${filename} failed (${p}): ${startupDdlFailure(e)}${pending ? `. ${pending}` : ''}`,
+        );
       }
     }
     if (found) {

@@ -208,6 +208,42 @@ function staggered(
   } as unknown as AccountDeletionPlanner;
 }
 
+/** m3: discoverer, падающий посреди collect (после успешного stopDiscoverer). */
+const brokenDiscoverer = jest.fn<ReturnType<DeletionDiscoverer>, Parameters<DeletionDiscoverer>>(
+  async () => {
+    throw new Error('discoverer_failed');
+  },
+);
+
+/** m3: что persistFailsMidway увидел внутри транзакции перед отказом. */
+const persistProbe = { seenInside: -1 };
+
+/**
+ * m3: planner, чей persist успевает записать часть плана ВНУТРИ begin-
+ * транзакции (и сам видит эти строки), а затем бросает: проверка, что откат
+ * снимает и записанные задачи, а не только UPDATE поколения.
+ */
+function persistFailsMidway(
+  inner: AccountDeletionPlanner,
+  calls: string[],
+): AccountDeletionPlanner {
+  return {
+    collect: async (dbArg: any, account: DeletionAccount, origin: DeletionOrigin) => {
+      calls.push('begin');
+      return inner.collect(dbArg, account, origin);
+    },
+    persist: async (dbArg: any, account: DeletionAccount, plan: DeletionPlan) => {
+      await inner.persist(dbArg, account, { jobs: plan.jobs.slice(0, 2), skips: [] });
+      const seen = await dbArg.query(
+        `SELECT count(*)::int AS n FROM account_deletion_jobs WHERE deletion_id = $1`,
+        [account.deletionId],
+      );
+      persistProbe.seenInside = seen.rows[0].n;
+      throw new Error('persist_failed');
+    },
+  } as unknown as AccountDeletionPlanner;
+}
+
 maybe('explicit deletion lifecycle against PostgreSQL (Task 18)', () => {
   jest.setTimeout(60_000);
 
@@ -224,7 +260,10 @@ maybe('explicit deletion lifecycle against PostgreSQL (Task 18)', () => {
     return (await pool.query(sql, params)).rows;
   }
 
-  function makeStack(discoverers: DeletionDiscoverer[] = [stopDiscoverer]) {
+  function makeStack(
+    discoverers: DeletionDiscoverer[] = [stopDiscoverer],
+    wrapPlanner: (inner: AccountDeletionPlanner, calls: string[]) => AccountDeletionPlanner = staggered,
+  ) {
     const calls: string[] = [];
     const jobs = new AccountDeletionJobs(db as any);
     const registry = new FakeRegistry(calls);
@@ -242,7 +281,7 @@ maybe('explicit deletion lifecycle against PostgreSQL (Task 18)', () => {
     );
     registry.setCore(adapter);
     const runner = new AccountDeletionRunner(db as any, jobs as any, registry as any);
-    const planner = staggered(new AccountDeletionPlanner(discoverers), calls);
+    const planner = wrapPlanner(new AccountDeletionPlanner(discoverers), calls);
     const lifecycle = new AccountDeletionLifecycle(
       db as any,
       planner as any,
@@ -655,6 +694,95 @@ maybe('explicit deletion lifecycle against PostgreSQL (Task 18)', () => {
 
     expect(calls).toEqual([]);
     expect(await jobCount()).toBe(0);
+  });
+
+  it.each(['collect', 'persist'] as const)(
+    'm3: planner бросает в %s внутри begin — поколение откатывается целиком, задач нет',
+    async (stage) => {
+      await seedUser(USER, 'active');
+      await seedHistory(USER, PERSONAL_CANARY);
+      await seedIdentity(USER, 'email', 'deleted@example.test');
+      const before = (await rows(
+        `SELECT update_date FROM user_id WHERE internal_id=$1`, [USER],
+      ))[0].update_date;
+      brokenDiscoverer.mockClear();
+      persistProbe.seenInside = -1;
+      const { profile, calls, neo4j } = stage === 'collect'
+        ? makeStack([stopDiscoverer, brokenDiscoverer])
+        : makeStack([stopDiscoverer], persistFailsMidway);
+
+      // Ложного success нет. Текущий контракт: begin вне try deleteExplicit,
+      // поэтому ошибка планировщика всплывает как есть (не 503) — тот самый
+      // отказ точки сбоя, без обёртки.
+      const failure = await profile.deleteProfile(USER).catch((e) => e);
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).not.toBeInstanceOf(ServiceUnavailableException);
+      expect(failure.message).toBe(stage === 'collect' ? 'discoverer_failed' : 'persist_failed');
+      // Отказ — из нашей точки сбоя, а не из чего-то раньше неё.
+      if (stage === 'collect') {
+        expect(brokenDiscoverer).toHaveBeenCalledTimes(1);
+      } else {
+        // Внутри транзакции часть плана уже была записана — и всё равно откатилась.
+        expect(persistProbe.seenInside).toBe(2);
+      }
+
+      // Поколение не создано: UPDATE active→deleted откатился вместе с планом.
+      const u = await rows(
+        `SELECT state, deletion_id, deleted_at, update_date, password_hash
+           FROM user_id WHERE internal_id=$1`,
+        [USER],
+      );
+      expect(u).toEqual([{
+        state: 'active',
+        deletion_id: null,
+        deleted_at: null,
+        update_date: before,
+        password_hash: 'HASH-CANARY',
+      }]);
+      expect(await jobCount()).toBe(0);
+      // Ни стопов, ни core: исполнение не начиналось, данные целы.
+      expect(calls).toEqual(['begin']);
+      expect(neo4j.deleteUserGraphStrict).not.toHaveBeenCalled();
+      expect(await historyCount(USER)).toBe(1);
+      expect(await identityCount(USER)).toBe(1);
+
+      // Соединение транзакции вернулось в пул: следующее удаление проходит
+      // штатно и выпускает новое поколение с полным планом.
+      const next = makeStack();
+      await next.profile.deleteProfile(USER);
+      const done = await userRow(USER);
+      expect(done.state).toBe('deleted');
+      expect(done.deletion_id).toMatch(UUID_RE);
+      expect(await jobCount()).toBe(6);
+    },
+  );
+
+  it('m3: planner бросает на повторном DELETE — текущее поколение и его задачи не тронуты', async () => {
+    await seedUser(USER, 'active');
+    await seedHistory(USER, PERSONAL_CANARY);
+    const first = makeStack();
+    first.registry.fail('telegram.stop', new DeletionRetryError('timeout'));
+    await expect(first.profile.deleteProfile(USER))
+      .rejects.toBeInstanceOf(ServiceUnavailableException);
+    const u1 = await userRow(USER);
+    const snapshot = JSON.stringify(await jobRows(u1.deletion_id));
+
+    brokenDiscoverer.mockClear();
+    const second = makeStack([stopDiscoverer, brokenDiscoverer]);
+    const failure = await second.profile.deleteProfile(USER).catch((e) => e);
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(ServiceUnavailableException);
+    expect(failure.message).toBe('discoverer_failed');
+    expect(brokenDiscoverer).toHaveBeenCalledTimes(1);
+
+    const u2 = await userRow(USER);
+    expect(u2.state).toBe('deleted');
+    expect(u2.deletion_id).toBe(u1.deletion_id);
+    expect(new Date(u2.deleted_at).getTime()).toBe(new Date(u1.deleted_at).getTime());
+    expect(JSON.stringify(await jobRows(u1.deletion_id))).toBe(snapshot);
+    expect(await jobCount()).toBe(6);
+    expect(second.calls).toEqual(['begin']);
+    expect(await historyCount(USER)).toBe(1);
   });
 
   it('chat-file.purge персистится внутри begin-транзакции до удаления history (I3-T11)', async () => {
