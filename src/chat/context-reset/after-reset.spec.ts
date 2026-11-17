@@ -1,4 +1,9 @@
-import { afterReset, legacyFreshResetAt, LEGACY_FRESH_FUTURE_SLACK_MS } from './after-reset';
+import {
+  afterReset,
+  legacyFreshResetAt,
+  LEGACY_FRESH_FUTURE_SLACK_MS,
+  LEGACY_FRESH_MIN_MS,
+} from './after-reset';
 
 describe('afterReset', () => {
   const rows = [
@@ -41,9 +46,18 @@ describe('legacyFreshResetAt', () => {
   });
 
   it('мусор — не точка', () => {
-    for (const v of [undefined, null, '', 'abc', '12345', '1.5e12', '-1794804919138']) {
+    for (const v of [
+      undefined, null, '', 'abc', '12345', '1.5e12', '-1794804919138',
+      '100000', // шесть цифр проходят формат, но это 1970 год
+      '1794804919', // секунды вместо миллисекунд — тоже 1970
+    ]) {
       expect(legacyFreshResetAt(v, now)).toBeNull();
     }
+  });
+
+  it('метка раньше нижней границы — не точка: под видом чистого листа вернулась бы вся история', () => {
+    expect(legacyFreshResetAt(String(LEGACY_FRESH_MIN_MS - 1), now)).toBeNull();
+    expect(legacyFreshResetAt(String(LEGACY_FRESH_MIN_MS), now)?.getTime()).toBe(LEGACY_FRESH_MIN_MS);
   });
 
   it('метка из будущего дальше окна — не точка: иначе память стёрлась бы навсегда', () => {
