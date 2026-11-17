@@ -1,31 +1,56 @@
 -- Разовый перенос старых листов «Чистого листа» в основные ленты
 -- (spec docs/superpowers/specs/2026-11-17-context-reset-design.md, «Старые данные»;
--- проверка — src/chat/context-reset/merge-fresh-sessions.pg.spec.ts).
+-- проверка — src/chat/context-reset/merge-fresh-sessions.pg.spec.ts;
+-- откат — scripts/oneoff/2026-11-17-merge-fresh-sessions-rollback.sql).
 --
 -- Раньше лист был отдельной лентой: ключ '<userId>_<ассистент>_fresh_<метка мс>'
 -- в custom_chat_history, chat_uploads и action_plans. Теперь лента одна
 -- ('<userId>_<ассистент>'), а «Чистый лист» — точка в chat_context_resets.
 --
--- Запуск — сразу после прод-фазы deploy.sh, с OK владельца:
---   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f scripts/oneoff/2026-11-17-merge-fresh-sessions.sql
--- Перед запуском сохранить карту для отката (что где лежало и какие были точки):
---   psql "$DATABASE_URL" -tA -F, -c "SELECT 'h', id::text, session_id FROM custom_chat_history WHERE session_id ~ '_fresh_[0-9]+$' UNION ALL SELECT 'u', id::text, session_id FROM chat_uploads WHERE session_id ~ '_fresh_[0-9]+$' UNION ALL SELECT 'p', id::text, session_id FROM action_plans WHERE session_id ~ '_fresh_[0-9]+$'" > fresh-map.csv
---   psql "$DATABASE_URL" -tA -F, -c "SELECT user_id, assistant_id, reset_at FROM chat_context_resets" > resets-before.csv
+-- Где взять DATABASE_URL на сервере: в интерактивном ssh ~/.profile не
+-- читается — строку берём из .env живого чекаута (последняя DATABASE_URL=):
+--   U=$(sed -n -E 's/^[[:space:]]*(export[[:space:]]+)?DATABASE_URL[[:space:]]*=[[:space:]]*//p' ~/spirits_back/.env | tail -n 1 | sed -E -e 's/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'\$/\1/")
 --
--- Одна транзакция: упадёт любой шаг — не изменится ничего. Повторный запуск
--- ничего не меняет. Скрипт печатает счётчики «до» и «после» и итог шага 1
--- (точек по свежим листам, давних листов без точки, свежих с неверной меткой);
--- по тегам psql видно остальное: второй SELECT n — листов людей, три UPDATE n —
--- сообщений, загрузок и планов перенесено.
+-- Порядок (из ~/spirits_back на сервере):
+-- 1. Предварительный прогон — всё то же, но в конце ROLLBACK: ничего не
+--    меняет, печатает счётчики. Сначала на test.linkeon.io, затем на проде —
+--    счётчики прода показать владельцу до OK:
+--      sed 's/^COMMIT;$/ROLLBACK;/' scripts/oneoff/2026-11-17-merge-fresh-sessions.sql | psql "$U" -v ON_ERROR_STOP=1
+-- 2. С OK владельца, сразу после прод-фазы deploy.sh:
+--      psql "$U" -v ON_ERROR_STOP=1 -f scripts/oneoff/2026-11-17-merge-fresh-sessions.sql
 --
--- Тестовые аккаунты (src/common/test-users.ts: TEST_USERS и TEST_USER_PATTERN)
--- не трогаем: их листы — пинги мониторинга, которые и после выката живут
--- изолированно.
+-- Одна транзакция: упадёт любой шаг — не изменится ничего (и карты не будет).
+-- Повторный запуск ничего не меняет и ничего не дублирует. Если живой
+-- «Обновить план» вставит основной план той же пары во время скрипта, шаг 4
+-- упадёт на уникальности — откатится всё, повтор безопасен.
+--
+-- Карта отката и аудит точек пишутся в базу в той же транзакции:
+--   oneoff_20261117_fresh_map    — (kind 'h'|'u'|'p', row_id, fresh_suffix
+--     '_fresh_<метка>', moved_at): по строке на каждую перенесённую строку.
+--     Телефонов и ключей целиком нет: после переноса session_id равен основе,
+--     откат — session_id || fresh_suffix.
+--   oneoff_20261117_resets_audit — (user_id, assistant_id, old_reset_at,
+--     new_reset_at): по паре, которой скрипт поставил или сдвинул точку
+--     (old_reset_at NULL — точки не было).
+-- Обе таблицы удалить через 7 дней после успешного выката (в аудите user_id):
+--   psql "$U" -c 'DROP TABLE oneoff_20261117_fresh_map, oneoff_20261117_resets_audit'
+--
+-- Что печатает: счётчики «до» и «после» и итог шага 1 (точек поставлено или
+-- сдвинуто, давних листов без точки, свежих с неверной меткой, удалённых
+-- аккаунтов без точки). «Прочие» — листы тестовых аккаунтов и ключи
+-- нестандартного вида, скрипт их не трогает; «до» и «после» у них могут
+-- разойтись из-за живых пингов мониторинга — это не ошибка.
+--
+-- Тестовые аккаунты (src/common/test-users.ts: TEST_USERS и TEST_USER_PATTERN;
+-- копию сторожит спек) не трогаем: их листы — пинги мониторинга, которые и
+-- после выката живут изолированно.
 
 BEGIN;
 
--- Чужой замок дольше 10 с — ошибка и откат целиком, а не очередь из ходов.
+-- Чужой замок дольше 10 с или выражение дольше 2 минут — ошибка и откат
+-- целиком, а не очередь из ходов за долгой транзакцией.
 SET LOCAL lock_timeout = '10s';
+SET LOCAL statement_timeout = '120s';
 
 -- Окно свежести листа — единственный параметр скрипта.
 -- Зачем окно: лист жил в sessionStorage вкладки. Закрыв вкладку, человек
@@ -42,10 +67,27 @@ SET LOCAL lock_timeout = '10s';
 CREATE TEMP TABLE merge_window ON COMMIT DROP AS
 SELECT now() - interval '24 hours' AS fresh_since;
 
+-- Карта отката и аудит точек (см. шапку). IF NOT EXISTS — для повторного
+-- запуска; ключи не дают задублировать записи.
+CREATE TABLE IF NOT EXISTS oneoff_20261117_fresh_map (
+  kind text NOT NULL CHECK (kind IN ('h', 'u', 'p')),
+  row_id text NOT NULL,
+  fresh_suffix text NOT NULL CHECK (fresh_suffix ~ '^_fresh_[0-9]+$'),
+  moved_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (kind, row_id)
+);
+CREATE TABLE IF NOT EXISTS oneoff_20261117_resets_audit (
+  user_id text NOT NULL,
+  assistant_id text NOT NULL,
+  old_reset_at timestamptz,
+  new_reset_at timestamptz NOT NULL,
+  PRIMARY KEY (user_id, assistant_id)
+);
+
 -- Листы людей — снимок ключей из всех трёх таблиц. Ключ разбирается строго:
 -- userId (телефон или UUID) и ассистент (число или custom:<uuid>, как
 -- RESET_ASSISTANT_RE в chat.controller.ts) — '_' нет ни в том, ни в другом.
--- Ключ иного вида не трогаем: он виден в счётчике «прочих».
+-- Ключ иного вида не трогаем: он виден в счётчиках «прочих».
 -- ts — метка листа в мс; NULL, если неправдоподобна — те же границы, что у
 -- legacyFreshResetAt (after-reset.ts): не раньше 2024-01-01 UTC и не позже
 -- «сейчас + 5 минут». Такому листу точку не ставим (точка из будущего стёрла
@@ -69,9 +111,9 @@ SELECT s.session_id,
  WHERE r.m IS NOT NULL
    AND r.m[1] <> ALL (ARRAY['70000000000', '79030169187', '79169403771', '79656445804'])
    AND r.m[1] !~ '^790300[0-9]{5}$';
+ANALYZE fresh_keys;
 
 -- Счётчики — по живым таблицам: «после» показывает, что осталось на самом деле.
--- «Прочие» — тестовые аккаунты и ключи нестандартного вида; скрипт их не трогает.
 -- Планы в листах после переноса могут остаться: переезжает не больше одного
 -- плана на пару и только если у неё нет основного (шаг 4).
 CREATE TEMP VIEW fresh_counts AS
@@ -81,11 +123,20 @@ SELECT (SELECT count(*) FROM custom_chat_history
          WHERE session_id IN (SELECT session_id FROM fresh_keys)) AS "загрузок в листах",
        (SELECT count(*) FROM action_plans
          WHERE session_id IN (SELECT session_id FROM fresh_keys)) AS "планов в листах",
-       (SELECT count(*) FROM custom_chat_history h
-         WHERE h.session_id ~ '_fresh_[0-9]+$'
-           AND NOT EXISTS (SELECT 1 FROM fresh_keys k WHERE k.session_id = h.session_id))
-         AS "прочих сообщений _fresh_ (не трогаем)",
-       (SELECT count(*) FROM chat_context_resets) AS "точек";
+       (SELECT count(*) FROM custom_chat_history t
+         WHERE t.session_id ~ '_fresh_[0-9]+$'
+           AND NOT EXISTS (SELECT 1 FROM fresh_keys k WHERE k.session_id = t.session_id))
+         AS "прочих сообщений _fresh_",
+       (SELECT count(*) FROM chat_uploads t
+         WHERE t.session_id ~ '_fresh_[0-9]+$'
+           AND NOT EXISTS (SELECT 1 FROM fresh_keys k WHERE k.session_id = t.session_id))
+         AS "прочих загрузок _fresh_",
+       (SELECT count(*) FROM action_plans t
+         WHERE t.session_id ~ '_fresh_[0-9]+$'
+           AND NOT EXISTS (SELECT 1 FROM fresh_keys k WHERE k.session_id = t.session_id))
+         AS "прочих планов _fresh_",
+       (SELECT count(*) FROM chat_context_resets) AS "точек",
+       (SELECT count(*) FROM oneoff_20261117_fresh_map) AS "строк в карте отката";
 
 SELECT 'до' AS "этап", * FROM fresh_counts;
 
@@ -96,13 +147,16 @@ SELECT 'до' AS "этап", * FROM fresh_counts;
 --    ленту и тогда, когда человек в листе, — по ним «вышел ли он из листа» не
 --    судим. Давний лист — только перенос ленты (шаги 2–4), без точки.
 --    Точка = метка листа этого хода, ровно в мс: целое число мс на интервал
---    1 мс точно (метка < 2^53), без дробных секунд to_timestamp.
---    GREATEST сохраняет точку новее — например, поставленную после выката
---    старой вкладкой.
---    Итог печатается одной строкой: «точек по свежим листам» считает и пары,
---    где точка уже была (ON CONFLICT), даже если GREATEST оставил прежнюю.
+--    1 мс точно (метка < 2^53), без дробных секунд to_timestamp. Но не позже
+--    чем за 1 мс до первой строки этого листа: метку ставили часы клиента, и
+--    если они спешили, начало листа оказалось бы до точки (фильтр afterReset
+--    сравнивает в мс и строго «после», отсюда усечение до мс и минус 1 мс).
+--    Удалённому аккаунту точку не ставим — как ChatContextResetService.reset:
+--    строка осталась бы сиротой.
+CREATE TEMP TABLE in_mode ON COMMIT DROP AS
 WITH fresh_turn AS (
-  SELECT DISTINCT ON (k.base) k.base, k.user_id, k.assistant_id, k.ts, h.created_at AS at
+  SELECT DISTINCT ON (k.base)
+         k.base, k.session_id, k.user_id, k.assistant_id, k.ts, h.created_at AS at
     FROM custom_chat_history h
     JOIN fresh_keys k ON k.session_id = h.session_id
    WHERE h.sender_type = 'human' AND h.created_at IS NOT NULL
@@ -113,38 +167,79 @@ WITH fresh_turn AS (
    WHERE h.sender_type = 'human'
      AND h.session_id IN (SELECT base FROM fresh_turn)
    GROUP BY h.session_id
-), in_mode AS (
-  -- Последний ход человека у ассистента — в листе.
-  SELECT f.user_id, f.assistant_id, f.ts, f.at,
-         f.at >= (SELECT fresh_since FROM merge_window) AS recent
-    FROM fresh_turn f
-    LEFT JOIN main_turn m USING (base)
-   WHERE m.at IS NULL OR f.at > m.at
+)
+SELECT f.user_id, f.assistant_id,
+       f.at >= (SELECT fresh_since FROM merge_window) AS recent,
+       EXISTS (SELECT 1 FROM user_id u
+                WHERE u.internal_id = f.user_id AND u.state = 'deleted') AS deleted,
+       -- LEAST пропускает NULL: без CASE лист с неверной меткой получил бы точку.
+       CASE WHEN f.ts IS NOT NULL THEN
+         LEAST(timestamptz 'epoch' + f.ts * interval '1 millisecond',
+               (SELECT date_trunc('milliseconds', min(h.created_at)) - interval '1 millisecond'
+                  FROM custom_chat_history h
+                 WHERE h.session_id = f.session_id))
+       END AS reset_at
+  FROM fresh_turn f
+  LEFT JOIN main_turn m USING (base)
+ WHERE m.at IS NULL OR f.at > m.at;
+ANALYZE in_mode;
+
+-- Аудит и точки — одним выражением, по одному снимку chat_context_resets
+-- (изменяющие CTE выполняются всегда, даже без ссылки на них).
+-- В аудит — только пары, где точка действительно поставлена или сдвинута;
+-- GREATEST сохраняет точку новее (например, поставленную после выката старой
+-- вкладкой). Если её сдвинут между снимком и записью, new_reset_at в аудите не
+-- совпадёт с текущей, и откат её не тронет.
+WITH targets AS (
+  SELECT user_id, assistant_id, reset_at
+    FROM in_mode
+   WHERE recent AND reset_at IS NOT NULL AND NOT deleted
+), audited AS (
+  INSERT INTO oneoff_20261117_resets_audit (user_id, assistant_id, old_reset_at, new_reset_at)
+  SELECT t.user_id, t.assistant_id, r.reset_at, t.reset_at
+    FROM targets t
+    LEFT JOIN chat_context_resets r USING (user_id, assistant_id)
+   WHERE r.reset_at IS NULL OR r.reset_at < t.reset_at
+  ON CONFLICT (user_id, assistant_id) DO NOTHING
+  RETURNING 1
 ), placed AS (
   INSERT INTO chat_context_resets (user_id, assistant_id, reset_at)
-  SELECT i.user_id, i.assistant_id, timestamptz 'epoch' + i.ts * interval '1 millisecond'
-    FROM in_mode i
-   WHERE i.recent AND i.ts IS NOT NULL
+  SELECT user_id, assistant_id, reset_at FROM targets
   ON CONFLICT (user_id, assistant_id) DO UPDATE
     SET reset_at = GREATEST(chat_context_resets.reset_at, EXCLUDED.reset_at)
   RETURNING 1
 )
-SELECT (SELECT count(*) FROM placed) AS "точек по свежим листам",
+SELECT (SELECT count(*) FROM audited) AS "точек поставлено или сдвинуто",
        (SELECT count(*) FROM in_mode WHERE NOT recent) AS "давних листов без точки",
-       (SELECT count(*) FROM in_mode WHERE recent AND ts IS NULL) AS "свежих листов с неверной меткой";
+       (SELECT count(*) FROM in_mode WHERE recent AND reset_at IS NULL)
+         AS "свежих листов с неверной меткой",
+       (SELECT count(*) FROM in_mode WHERE recent AND reset_at IS NOT NULL AND deleted)
+         AS "удалённых аккаунтов без точки";
 
--- 2. Сообщения листов — в основные ленты.
-UPDATE custom_chat_history h
-   SET session_id = k.base
-  FROM fresh_keys k
- WHERE h.session_id = k.session_id;
+-- 2. Сообщения листов — в основные ленты; каждая — в карту отката.
+WITH moved AS (
+  UPDATE custom_chat_history h
+     SET session_id = k.base
+    FROM fresh_keys k
+   WHERE h.session_id = k.session_id
+  RETURNING h.id, k.session_id AS fresh_session, k.base
+)
+INSERT INTO oneoff_20261117_fresh_map (kind, row_id, fresh_suffix)
+SELECT 'h', id::text, substr(fresh_session, length(base) + 1) FROM moved
+ON CONFLICT (kind, row_id) DO NOTHING;
 
 -- 3. Загрузки — туда же: панель «Медиа и файлы» читает их по ключу ленты, а
 --    удаление файла ищет строку 📎 в истории по тому же ключу.
-UPDATE chat_uploads u
-   SET session_id = k.base
-  FROM fresh_keys k
- WHERE u.session_id = k.session_id;
+WITH moved AS (
+  UPDATE chat_uploads u
+     SET session_id = k.base
+    FROM fresh_keys k
+   WHERE u.session_id = k.session_id
+  RETURNING u.id, k.session_id AS fresh_session, k.base
+)
+INSERT INTO oneoff_20261117_fresh_map (kind, row_id, fresh_suffix)
+SELECT 'u', id::text, substr(fresh_session, length(base) + 1) FROM moved
+ON CONFLICT (kind, row_id) DO NOTHING;
 
 -- 4. Планы: уникальность (user_id, session_id), а NOT EXISTS видит снимок до
 --    UPDATE — два листа одной пары без основного плана получили бы один ключ и
@@ -152,19 +247,24 @@ UPDATE chat_uploads u
 --    только если у пары нет основного; остальные остаются в своих листах (их
 --    никто не читает, данные целы).
 WITH cand AS (
-  SELECT p.id, k.base,
+  SELECT p.id, k.session_id AS fresh_session, k.base,
          row_number() OVER (PARTITION BY p.user_id, k.base
                             ORDER BY p.updated_at DESC, p.id DESC) AS rn
     FROM action_plans p
     JOIN fresh_keys k ON k.session_id = p.session_id
+), moved AS (
+  UPDATE action_plans p
+     SET session_id = c.base
+    FROM cand c
+   WHERE p.id = c.id
+     AND c.rn = 1
+     AND NOT EXISTS (SELECT 1 FROM action_plans q
+                      WHERE q.user_id = p.user_id AND q.session_id = c.base)
+  RETURNING p.id, c.fresh_session, c.base
 )
-UPDATE action_plans p
-   SET session_id = c.base
-  FROM cand c
- WHERE p.id = c.id
-   AND c.rn = 1
-   AND NOT EXISTS (SELECT 1 FROM action_plans q
-                    WHERE q.user_id = p.user_id AND q.session_id = c.base);
+INSERT INTO oneoff_20261117_fresh_map (kind, row_id, fresh_suffix)
+SELECT 'p', id::text, substr(fresh_session, length(base) + 1) FROM moved
+ON CONFLICT (kind, row_id) DO NOTHING;
 
 SELECT 'после' AS "этап", * FROM fresh_counts;
 
