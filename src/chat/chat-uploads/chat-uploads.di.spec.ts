@@ -37,6 +37,7 @@ import { ChatUploadsService } from './chat-uploads.service';
 import { ChatService } from '../chat.service';
 import { ChatController } from '../chat.controller';
 import { ChatContextResetService } from '../context-reset/context-reset.service';
+import { ActionPlansService } from '../action-plans/action-plans.service';
 
 jest.setTimeout(120000);
 
@@ -122,5 +123,14 @@ describe('«Чистый лист»: один сервис точки у ChatSer
     expect(resets).toBeInstanceOf(ChatContextResetService);
     expect((find(container, ChatService) as { contextResets?: unknown }).contextResets).toBe(resets);
     expect((find(container, ChatController) as { contextResets?: unknown }).contextResets).toBe(resets);
+  });
+
+  // План действий строится по разговору после точки — сервис точки у него
+  // тоже @Optional, и забытая проводка молча воскресила бы старый разговор.
+  it('AppModule: ActionPlansService получает тот же ChatContextResetService', async () => {
+    const container = await appGraph();
+    const resets = find(container, ChatContextResetService);
+    expect(resets).toBeInstanceOf(ChatContextResetService);
+    expect((find(container, ActionPlansService) as { contextResets?: unknown }).contextResets).toBe(resets);
   });
 });
