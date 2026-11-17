@@ -310,6 +310,11 @@ describe('searchForUser: комментарии ассистента к загр
     });
   });
 
+  it('комментарий есть, но ни имя, ни комментарий не совпадают с запросом — загрузки нет в выдаче', async () => {
+    const { r } = await search({ query: 'квантовый' }, { uploads: [NOTED_UPLOAD] });
+    expect(r).toEqual({ ok: true, total: 0, files: [] });
+  });
+
   it('веса: имя (+3) > комментарий загрузки (+2) > текст ответа ассистента (+1)', async () => {
     const scan = {
       ...PLAIN_UPLOAD, id: '44444444-4444-4444-8444-444444444444', original_name: 'scan_001.pdf',
