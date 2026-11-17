@@ -506,7 +506,7 @@ export class ChatController {
     // Текст МОДЕЛИ, ушедший человеку (delta/text/result), — без служебных
     // реплик релея, ссылок на файлы и заглушки шлагбаума. По нему решается,
     // было ли что списывать за оборванный ход, и считается длина для запасного
-    // пути списания (ChatService.uploadTurnCharge, partial-billing.ts).
+    // пути списания (ChatService.turnChargeFor, partial-billing.ts).
     let modelText = '';
     // Исход ожидания релея за шлагбаумом выката: перебит новым сообщением
     // той же сессии или бюджет повтора исчерпан (relay-drain-retry.ts).
@@ -703,13 +703,12 @@ export class ChatController {
 
       if (fullText.length > 0) {
         // Индикатор считается тем же вызовом и по тем же данным хода
-        // (ChatService.uploadTurnCharge, partial-billing.ts), что и списание в
+        // (ChatService.turnChargeFor, partial-billing.ts), что и списание в
         // persistUploadTurn: и решение, списывать ли оборванный ход, и сумма.
         // Раньше здесь стояла длина ответа в символах: пользователь видел «2073
         // токена» за ход, за который не списали ничего.
-        const shown = this.chatService.uploadTurnCharge(
-          fullText,
-          { failed: turnFailed, failReason, modelText, files: pendingFiles.length },
+        const shown = this.chatService.turnChargeFor(
+          { text: fullText, failed: turnFailed, failReason, modelText, files: pendingFiles.length },
           agentUsage, agentCostUsd, agentTurnCost.usd,
         ).tokens;
         safeWrite({
