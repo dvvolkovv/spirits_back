@@ -340,16 +340,9 @@ export class ContextService {
     return lines.length ? head + lines.reverse().join('\n') : '';
   }
 
-  /** Точка «Чистого листа» пары; сбой чтения — без точки (spec 2026-11-17-context-reset, «Риски»). */
-  private async contextResetAtSafe(userId: string, assistantId: string): Promise<Date | null> {
-    if (!this.contextResets) return null;
-    try {
-      return await this.contextResets.get(userId, assistantId);
-    } catch (e: any) {
-      // Без текста разговора: только пара и причина.
-      this.logger.warn(`context reset lookup failed (${userId}_${assistantId}): ${e?.message}`);
-      return null;
-    }
+  /** Точка «Чистого листа» пары; сбой чтения — без точки, warn без текста разговора. */
+  private contextResetAtSafe(userId: string, assistantId: string): Promise<Date | null> {
+    return ChatContextResetService.getOrNull(this.contextResets, userId, assistantId, (m) => this.logger.warn(m));
   }
 
   /**

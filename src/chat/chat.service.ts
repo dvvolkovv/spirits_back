@@ -1078,14 +1078,8 @@ export class ChatService {
    * Точка «Чистого листа» пары. Сбой чтения не роняет ход: ассистент ответит
    * с прежней памятью — хуже, чем с чистой, но лучше, чем никак.
    */
-  private async contextResetAt(userId: string, assistantId: string): Promise<Date | null> {
-    if (!this.contextResets) return null;
-    try {
-      return await this.contextResets.get(userId, String(assistantId));
-    } catch (e: any) {
-      this.logger.warn(`context reset lookup failed (${userId}_${assistantId}): ${e?.message}`);
-      return null;
-    }
+  private contextResetAt(userId: string, assistantId: string): Promise<Date | null> {
+    return ChatContextResetService.getOrNull(this.contextResets, userId, String(assistantId), (m) => this.logger.warn(m));
   }
 
   /**

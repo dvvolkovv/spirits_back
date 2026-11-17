@@ -38,6 +38,33 @@ export class ChatContextResetService {
   }
 
   /**
+   * Точка пары или null — для читателей, которым сбой чтения не повод
+   * отказывать (spec 2026-11-17-context-reset, «Риски»): ход, звонок, план и
+   * лента идут с прежней памятью — хуже, чем с чистой, но лучше, чем никак.
+   *
+   * warn получает только пару и причину, без текста разговора. Нет колбэка —
+   * сбой проглатывается молча (лента: черты нет, история есть).
+   *
+   * Статический и с сервисом первым параметром: у потребителей сервис
+   * @Optional (нет его — точки нет), а их спеки подменяют сервис объектом с
+   * одним `get` — экземплярный метод эти подмены сломал бы.
+   */
+  static async getOrNull(
+    resets: Pick<ChatContextResetService, 'get'> | null | undefined,
+    userId: string,
+    assistantId: string | number,
+    warn?: (msg: string) => void,
+  ): Promise<Date | null> {
+    if (!resets) return null;
+    try {
+      return (await resets.get(userId, assistantId)) ?? null;
+    } catch (e: any) {
+      warn?.(`context reset read failed (${userId}_${assistantId}): ${e?.message}`);
+      return null;
+    }
+  }
+
+  /**
    * Ставит точку и возвращает действующую. `at` не задан (`undefined` или
    * `null`) — точка «сейчас» по часам базы (`now()`), тем же, что у
    * created_at сообщений. Точка только движется вперёд: два нажатия в разных

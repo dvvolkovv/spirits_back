@@ -806,10 +806,8 @@ export class ChatController {
     // Лента одна (spec 2026-11-17-context-reset): freshTs старых клиентов не
     // читаем. Точка — чтобы фронт провёл черту.
     const history = await this.chatService.getChatHistory(user.userId, assistantId, parseInt(limit) || 30, parseInt(offset) || 0);
-    let resetAt: Date | null = null;
-    try {
-      resetAt = this.contextResets ? await this.contextResets.get(user.userId, String(assistantId)) : null;
-    } catch { /* без черты, но с историей */ }
+    // Сбой чтения точки — без черты, но с историей; молча, как и раньше.
+    const resetAt = await ChatContextResetService.getOrNull(this.contextResets, user.userId, String(assistantId));
     return res.status(200).json({ ...history, contextResetAt: resetAt ? resetAt.toISOString() : null });
   }
 

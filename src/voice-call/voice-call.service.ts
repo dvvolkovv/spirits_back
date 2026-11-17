@@ -264,7 +264,10 @@ export class VoiceCallService implements OnModuleInit {
     if (!res.rows.length) return profile;
     // После точки «Чистого листа» — профиль и только разговор после неё:
     // ассистент в чате старое уже забыл, и звонок не должен его возвращать.
-    const resetAt = await this.contextResetAtSafe(userId, String(agentId));
+    // Сбой чтения точки — без точки, warn без текста разговора.
+    const resetAt = await ChatContextResetService.getOrNull(
+      this.contextResets, userId, String(agentId), (m) => this.logger.warn(m),
+    );
     const rows = afterReset(res.rows, resetAt, (r: any) => r.created_at);
     if (!rows.length) return profile;
 
@@ -283,18 +286,6 @@ export class VoiceCallService implements OnModuleInit {
     }
     const history = lines.reverse().join('\n');
     return profile ? `${profile}\n\n${history}` : history;
-  }
-
-  /** Точка «Чистого листа» пары; сбой чтения — без точки (spec 2026-11-17-context-reset, «Риски»). */
-  private async contextResetAtSafe(userId: string, assistantId: string): Promise<Date | null> {
-    if (!this.contextResets) return null;
-    try {
-      return await this.contextResets.get(userId, assistantId);
-    } catch (e: any) {
-      // Без текста разговора: только пара и причина.
-      this.logger.warn(`context reset lookup failed (${userId}_${assistantId}): ${e?.message}`);
-      return null;
-    }
   }
 
   /**

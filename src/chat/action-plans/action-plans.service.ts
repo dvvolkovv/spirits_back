@@ -116,15 +116,10 @@ export class ActionPlansService implements OnModuleInit {
     const history = await this.chat.getChatHistory(userId, assistantId, 30, 0);
     // После точки «Чистого листа» план — только по новому разговору: ассистент
     // старое уже не учитывает, и план не должен его воскрешать. Сбой чтения
-    // точки — план по всей выборке, а не отказ.
-    let resetAt: Date | null = null;
-    try {
-      resetAt = this.contextResets ? await this.contextResets.get(userId, assistantId) : null;
-    } catch (error: any) {
-      // Без текста разговора: только пара и причина.
-      this.logger.warn(`context reset read failed (${userId}_${assistantId}): ${error?.message}`);
-      resetAt = null;
-    }
+    // точки — план по всей выборке, а не отказ; в журнале пара без разговора.
+    const resetAt = await ChatContextResetService.getOrNull(
+      this.contextResets, userId, assistantId, (m) => this.logger.warn(m),
+    );
     const messages = afterReset(history.messages, resetAt, (message: any) => message?.timestamp)
       .filter((message: any) => clipped(message?.content, 1));
     if (!messages.some((message: any) => message.type === 'user') ||
