@@ -1072,9 +1072,14 @@ export class ChatService {
   private async uploadContextBlock(
     userId: string,
     rawSessionId: string,
-    excludeIds?: string[],
-    // Точка «Чистого листа»: файлы до неё ассистенту не напоминаем.
-    since?: Date | null,
+    // Файлы этого хода (уже в промпте путями на релее); нечего исключать —
+    // undefined явно: параметр обязателен позиционно, раз за ним идёт точка.
+    excludeIds: string[] | undefined,
+    // Точка «Чистого листа»: файлы до неё ассистенту не напоминаем. Нет точки
+    // (или пинг) — null явно. Обязательный: с необязательным вызов без точки
+    // молча компилировался — так ветка Маши из main возвращала файлы до
+    // точки. Теперь такой вызов ловит tsc.
+    since: Date | null,
   ): Promise<string> {
     if (!this.chatUploads || process.env.CHAT_UPLOADS_ENABLED !== 'true') return '';
     try {
