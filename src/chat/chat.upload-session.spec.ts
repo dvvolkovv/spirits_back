@@ -200,10 +200,14 @@ describe('uploadAndChat: файл уходит в сессию разговор�
     expect(fields.sessionId).toBe('u1_12_en');
   });
 
-  it('чистый лист: файл уходит в fresh-сессию, а не в основную', async () => {
+  it('чистый лист старого клиента: файл — в основную сессию, а не в fresh', async () => {
+    // Изолированной fresh-сессии у загрузок нет (spec 2026-11-17-context-reset):
+    // «Чистый лист» — точка в ключе. Без сервиса точки в этом харнесе ключ
+    // прежний — главное, что не fresh.
     const fields = await upload(makePg(), { fresh: 'true', freshTs: '1786468316338' });
 
-    expect(fields.sessionId).toBe('u1_12_fresh_1786468316338');
+    expect(fields.sessionId).toBe('u1_12_ru');
+    expect(fields.sessionId).not.toContain('_fresh_');
   });
 
   it('везёт персону ассистента: иначе на файл ответит generic-агент релея', async () => {
@@ -633,7 +637,9 @@ describe('uploadAndChat: память прошлых загрузок в prompt 
     expect(fields.systemPrompt || '').not.toContain('Earlier user uploads');
   });
 
-  it('чистый лист: блок памяти ищется по fresh-сессии', async () => {
+  it('чистый лист старого клиента: блок памяти ищется по основной ленте', async () => {
+    // Лента одна (spec 2026-11-17-context-reset): файлы до точки отсекает
+    // точка, а не отдельная fresh-сессия.
     const chatUploads = makeChatUploadsMock({ saved: [UPLOAD_RECORD], failed: [] }, [EARLIER_RECORD]);
     const req = makeUploadReq('a.pdf', 'что тут написано? (fresh)');
     req.body.fresh = 'true';
@@ -641,7 +647,7 @@ describe('uploadAndChat: память прошлых загрузок в prompt 
     const fields = await runMultipart(req, chatUploads);
 
     expect(chatUploads.recentForSession).toHaveBeenCalledWith(
-      'u1', 'u1_12_fresh_1786468316338', [UPLOAD_RECORD.id],
+      'u1', 'u1_12', [UPLOAD_RECORD.id],
     );
     expect(fields.message).toContain('b.pdf');
   });

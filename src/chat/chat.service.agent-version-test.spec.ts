@@ -396,7 +396,8 @@ describe('agentReply: isolated agent version test', () => {
     expect(fields.message).not.toContain('LIVE USER PROFILE');
     expect(fields.message).toContain('ACTIVE TASKS MARKER');
     expect(fields.sessionId).toBe('user_12_ru_noprofiling');
-    expect(h.tasksService.buildContextForPrompt).toHaveBeenCalledWith('user', 'check relay privacy');
+    // Точки «Чистого листа» в этом харнесе нет — задачи без отсечки.
+    expect(h.tasksService.buildContextForPrompt).toHaveBeenCalledWith('user', 'check relay privacy', { since: null });
     expect(h.businessProfile.renderForPrompt).not.toHaveBeenCalled();
   });
 

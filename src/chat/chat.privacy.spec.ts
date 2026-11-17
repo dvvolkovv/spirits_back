@@ -136,6 +136,8 @@ describe('ChatService final prompt insertion wiring', () => {
       '12',
       'user turn',
       'assistant turn',
+      // Момент хода не передан — TasksService возьмёт момент вставки.
+      undefined,
     );
   });
 });
