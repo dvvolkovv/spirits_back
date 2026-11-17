@@ -12,6 +12,15 @@ const relay = fs.readFileSync(path.join(__dirname, '../../relay-agent/server.mjs
 const allowed = (/const PRODUCTS_TOOLS = "([^"]+)";/.exec(relay)?.[1] ?? '').split(',');
 
 describe('копия релея знает все инструменты точки продуктов', () => {
+  // Набор веба зависит от CHAT_UPLOADS_ENABLED (note_file): проверка не должна
+  // меняться от флага в окружении прогона.
+  const OLD_FLAG = process.env.CHAT_UPLOADS_ENABLED;
+  beforeEach(() => { delete process.env.CHAT_UPLOADS_ENABLED; });
+  afterAll(() => {
+    if (OLD_FLAG === undefined) delete process.env.CHAT_UPLOADS_ENABLED;
+    else process.env.CHAT_UPLOADS_ENABLED = OLD_FLAG;
+  });
+
   it('веб: каждый инструмент — в PRODUCTS_TOOLS и с явным исключением в PRODUCTS_PROMPT', () => {
     const ctrl = new ProductsMcpController({} as any, {} as any, {} as any, {} as any);
     const tools = ctrl.listTools('web') as any[];

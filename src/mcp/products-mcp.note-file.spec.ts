@@ -48,8 +48,9 @@ describe('note_file на точке /webhook/mcp/products', () => {
         noteAssistantId: input.assistantId,
       })),
     };
-    const ctrl = new ProductsMcpController(tool as any, files as any, problems as any, chat as any, uploads as any);
-    return { ctrl, tool, files, chat, uploads };
+    const events = { track: jest.fn() };
+    const ctrl = new ProductsMcpController(tool as any, files as any, problems as any, chat as any, uploads as any, events as any);
+    return { ctrl, tool, files, chat, uploads, events };
   };
   const bearer = (channel: 'web' | 'telegram' = 'web', opts: any = {}) =>
     `Bearer ${signProductToolToken('u-owner', channel, opts)}`;
@@ -73,6 +74,16 @@ describe('note_file на точке /webhook/mcp/products', () => {
       const { ctrl } = make();
       expect(ctrl.listTools('telegram').map((t: any) => t.name)).not.toContain('note_file');
       expect(ctrl.listTools('telegram', { scope: 'help' }).map((t: any) => t.name)).toEqual(['linkeon_help']);
+    });
+
+    // Область help сильнее канала: веб-токен с областью help тоже получает
+    // только справку — и не может позвать note_file в обход списка.
+    it('веб-токен с областью help: note_file нет в списке, вызов — «Неизвестный инструмент»', async () => {
+      const { ctrl, uploads } = make();
+      expect(ctrl.listTools('web', { scope: 'help' }).map((t: any) => t.name)).toEqual(['linkeon_help']);
+      const r: any = await ctrl.callTool(bearer('web', { scope: 'help' }), { file_id: FILE_ID, note: 'текст' }, 'note_file');
+      expect(r).toEqual({ ok: false, error: 'Неизвестный инструмент: note_file' });
+      expect(uploads.setNote).not.toHaveBeenCalled();
     });
   });
 
@@ -144,6 +155,20 @@ describe('note_file на точке /webhook/mcp/products', () => {
       } finally {
         spies.forEach((s) => s.mockRestore());
       }
+    });
+
+    // Статистика админки — как find_files_call: канал из подписи и исход.
+    // Ни id файла, ни текста комментария в props нет.
+    it('событие note_file_call: канал и исход, без id и текста — и при успехе, и при отказе', async () => {
+      const { ctrl, uploads, events } = make();
+      await ctrl.callTool(bearer(), { file_id: FILE_ID, note: 'Договор аренды.' }, 'note_file');
+      uploads.setNote.mockRejectedValueOnce(new NotFoundException('Upload not found'));
+      await ctrl.callTool(bearer(), { file_id: FILE_ID, note: 'Договор аренды.' }, 'note_file');
+      expect(events.track.mock.calls).toEqual([
+        ['note_file_call', { userId: 'u-owner', props: { channel: 'web', ok: true } }],
+        ['note_file_call', { userId: 'u-owner', props: { channel: 'web', ok: false } }],
+      ]);
+      expect(JSON.stringify(events.track.mock.calls)).not.toMatch(new RegExp(`${FILE_ID}|Договор`));
     });
 
     it('аргументы не той формы не роняют вызов: в сервис уходят строки', async () => {

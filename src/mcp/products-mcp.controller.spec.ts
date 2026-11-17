@@ -13,6 +13,16 @@ describe('точка /mcp/products', () => {
   const OLD = process.env.JWT_SECRET;
   beforeAll(() => { process.env.JWT_SECRET = 'test-secret-for-product-tool'; });
   afterAll(() => { process.env.JWT_SECRET = OLD; });
+  // Точные списки инструментов ниже — для выключенной памяти загрузок:
+  // note_file появляется при CHAT_UPLOADS_ENABLED=true (его набор сторожит
+  // products-mcp.note-file.spec.ts), и флаг из окружения прогона не должен
+  // менять ожидания.
+  const OLD_FLAG = process.env.CHAT_UPLOADS_ENABLED;
+  beforeEach(() => { delete process.env.CHAT_UPLOADS_ENABLED; });
+  afterAll(() => {
+    if (OLD_FLAG === undefined) delete process.env.CHAT_UPLOADS_ENABLED;
+    else process.env.CHAT_UPLOADS_ENABLED = OLD_FLAG;
+  });
 
   const make = (language?: any) => {
     const calls: any[] = [];
