@@ -184,13 +184,20 @@ function withThumb(item: ChatFileItem, publicBaseUrl: string): ChatFileItem {
  * если миниатюра получилась при сохранении (thumb_key). В withThumb загрузка
  * не идёт: ручка /webhook/chat/thumb отдаёт миниатюры публичных бакетов, а
  * приватный бакет загрузок она не откроет.
+ *
+ * Имя очищено safeFileName — так же, как у файлов ассистента в той же панели,
+ * в find_files и в блоке загрузок: bidi-переключатель (RLO) в имени из
+ * multipart иначе подменил бы видимое расширение. Фронт берёт name и для имени
+ * скачиваемого файла; ext считается от очищенного имени. Строка 📎 в истории
+ * остаётся сырой: deleteForOwner ищет её точным совпадением.
  */
 export function uploadPanelItem(r: ChatUploadRecord, ownerUrl: string): ChatFileItem {
+  const name = safeFileName(r.originalName);
   return {
     key: `upload:${r.id}`,
     kind: uploadKind(r),
-    name: r.originalName,
-    ext: fileExt(r.originalName),
+    name,
+    ext: fileExt(name),
     createdAt: r.createdAt,
     url: ownerUrl,
     ...(r.thumbKey ? { thumbUrl: `${ownerUrl}/thumb` } : {}),
