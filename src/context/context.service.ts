@@ -135,7 +135,7 @@ export class ContextService {
       case 'now':           return this.sectionNow(tz);
       case 'today':         return this.sectionToday(userId, tz);
       case 'identity':      return this.sectionIdentity(userId);
-      case 'continuation':  return this.sectionContinuation(userId, budget);
+      case 'continuation':  return this.sectionContinuation(userId, budget, opts.agentId);
       case 'cloud_profile': return this.sectionCloudProfile(userId);
       case 'business':      return this.sectionBusiness(userId);
       case 'balance':       return this.sectionBalance(userId);
@@ -370,8 +370,12 @@ export class ContextService {
    * условие в запросе не даёт подхватить самого себя. Прерванные звонки сюда
    * тоже попадают — реплики лежат в transcript, который воркер флашит по ходу
    * разговора, даже если резюме так и не собралось.
+   *
+   * Звонок, закончившийся не позже точки «Чистого листа» пары, — старый
+   * разговор: после точки перезвон его не подхватывает. agentId — третьим,
+   * по умолчанию 12, как у sectionHistory.
    */
-  private async sectionContinuation(userId: string, budget = TOTAL_BUDGET): Promise<string> {
+  private async sectionContinuation(userId: string, budget = TOTAL_BUDGET, agentId = 12): Promise<string> {
     const res = await this.pg.query(
       `SELECT ended_at, transcript FROM voice_calls
         WHERE user_id = $1 AND ended_at IS NOT NULL
@@ -387,6 +391,10 @@ export class ContextService {
     // Отрицательный возраст — расхождение часов, а не будущее: считаем «только что».
     const ageMs = Math.max(0, Date.now() - endedMs);
     if (ageMs > CONTINUATION_WINDOW_MS) return '';
+    // Тот же afterReset, что у переписки: проходит только звонок, закончившийся
+    // строго после точки. Без точки и при сбое её чтения — как раньше.
+    const resetAt = await this.contextResetAtSafe(userId, String(agentId));
+    if (!afterReset([row], resetAt, (r: any) => r.ended_at).length) return '';
 
     const head =
       `--- Чем кончился прошлый разговор (${ContextService.agoText(ageMs)}) ---\n` +
