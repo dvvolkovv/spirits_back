@@ -1,6 +1,7 @@
 import { Readable } from 'stream';
 import axios from 'axios';
 import { ChatService } from './chat.service';
+import { ChatController } from './chat.controller';
 import { SEAT_TOKENS_PER_USD } from '../common/billing-rates';
 
 jest.mock('axios');
@@ -268,5 +269,139 @@ describe('веб-ход: оборванный ход списывается за
     expect(charged(calls)).toBeUndefined();
     expect(shownTokens(res)).toBe(0);
     expect(lines(warn)).toContainEqual(expect.stringContaining('billing[skipped:cli_fatal_text]'));
+  });
+});
+
+/**
+ * Ход с файлом: индикатор `shown` считает контроллер (uploadAndChat), списание
+ * — persistUploadTurn. Прогоняется весь путь, чтобы оба числа брались из
+ * одного потока релея, как в жизни.
+ */
+async function uploadTurn(svc: ChatService, events: any[]) {
+  queue.push(sse(events));
+  const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+  const ctrl = new ChatController(svc, jwtSvc as any, null as any, undefined);
+  const req = {
+    headers: { authorization: 'Bearer t' },
+    files: [{ originalname: 'a.pdf', buffer: Buffer.from('x'), mimetype: 'application/pdf', size: 1 }],
+    body: { message: 'смотри файл', assistantId: '7' },
+  } as any;
+  const res = newRes();
+  await ctrl.uploadAndChat(req, res);
+  await settle();
+  return res;
+}
+
+describe('ход с файлом: оборванный ход списывается за пришедшее', () => {
+  it('U1: transient_after_partial с текстом — списание с пометкой, shown = списанному', async () => {
+    const { svc, calls, warn } = makeService();
+    const res = await uploadTurn(svc, [
+      delta(MODEL), notice(NOTICE), done({ failed: true, failReason: 'transient_after_partial' }),
+    ]);
+
+    expect(charged(calls)).toBe(forUsd(0.5));
+    expect(chargeMeta(calls)).toMatchObject({ partial: 'transient_after_partial', source: 'cost' });
+    expect(shownTokens(res)).toBe(forUsd(0.5));
+    expect(historyTokens(calls)).toBe(forUsd(0.5));
+    expect(lines(warn)).toContainEqual(
+      expect.stringContaining(`billing[upload:partial:transient_after_partial:cost]: tokens=${forUsd(0.5)} `),
+    );
+  });
+
+  it('U2: preempted без текста модели — без списания, shown 0', async () => {
+    const { svc, calls, warn } = makeService();
+    const res = await uploadTurn(svc, [notice(PREEMPTED), done({ failed: true, failReason: 'preempted' })]);
+
+    expect(charged(calls)).toBeUndefined();
+    expect(shownTokens(res)).toBe(0);
+    expect(historyTokens(calls)).toBe(0);
+    expect(lines(warn)).toContainEqual(expect.stringContaining('billing[upload:skipped:preempted]'));
+  });
+
+  it('U3: max_turns без расхода — по длине текста модели, служебная реплика не в счёт', async () => {
+    const { svc, calls, warn } = makeService();
+    const res = await uploadTurn(svc, [
+      delta(MODEL), notice(NOTICE), { type: 'done', failed: true, failReason: 'max_turns' },
+    ]);
+
+    // Множитель — из сервиса, как в P4. С репликой длина была бы больше.
+    const byLength = MODEL.length * (svc as any).SDK_TEXT_MULTIPLIER;
+    expect(byLength).toBeGreaterThan(0);
+    expect(charged(calls)).toBe(byLength);
+    expect(shownTokens(res)).toBe(byLength);
+    expect(chargeMeta(calls)).toMatchObject({ partial: 'max_turns', source: 'length' });
+    expect(lines(warn)).toContainEqual(
+      expect.stringContaining(`billing[upload:partial:max_turns:length]: tokens=${byLength} `),
+    );
+  });
+
+  it('U4: сбой до ответа (cli_fatal) с обрывком текста — без списания, shown 0', async () => {
+    const { svc, calls } = makeService();
+    const res = await uploadTurn(svc, [
+      delta(MODEL), notice('\n\n_(модель недоступна)_'), done({ failed: true, failReason: 'cli_fatal' }),
+    ]);
+
+    expect(charged(calls)).toBeUndefined();
+    expect(shownTokens(res)).toBe(0);
+  });
+
+  it('U5: transient_after_partial после одних пробельных delta — человек не увидел ни слова, без списания', async () => {
+    // То же, что P7 у веб-хода: «пришедшим» считается только видимый текст модели.
+    const { svc, calls, warn } = makeService();
+    const res = await uploadTurn(svc, [
+      delta('\n\n'), notice(NOTICE), done({ failed: true, failReason: 'transient_after_partial' }),
+    ]);
+
+    expect(charged(calls)).toBeUndefined();
+    expect(shownTokens(res)).toBe(0);
+    expect(historyTokens(calls)).toBe(0);
+    expect(lines(warn)).toContainEqual(expect.stringContaining('billing[upload:skipped:transient_after_partial]'));
+  });
+
+  it('U6: transient_after_write только с файлом и без расхода в done — строки списания с нулём нет', async () => {
+    // То же, что P8: 0 в token_consumption_tasks планировщик поднял бы до 1 токена.
+    const { svc, calls } = makeService();
+    const res = await uploadTurn(svc, [
+      notice('_(связь с моделью прервалась после действия — проверьте результат, возможно всё прошло; при необходимости повторите)_'),
+      {
+        type: 'done', failed: true, failReason: 'transient_after_write',
+        outputFiles: [{ name: 'plan.pdf', url: '/files/u1_7_ru/plan.pdf' }],
+      },
+    ]);
+
+    expect(charged(calls)).toBeUndefined();
+    expect(shownTokens(res)).toBe(0);
+    expect(historyTokens(calls)).toBe(0);
+  });
+
+  it('U7: причина из списка, но текст — отказ CLI — без списания, в журнале upload:skipped:cli_fatal_text', async () => {
+    const { svc, calls, warn } = makeService();
+    const res = await uploadTurn(svc, [
+      delta("You've hit your session limit · resets 11:50am (UTC)"),
+      notice(NOTICE),
+      done({ failed: true, failReason: 'transient_after_partial' }),
+    ]);
+
+    expect(charged(calls)).toBeUndefined();
+    expect(shownTokens(res)).toBe(0);
+    expect(lines(warn)).toContainEqual(expect.stringContaining('billing[upload:skipped:cli_fatal_text]'));
+  });
+
+  it('U8: оборванный ход с usage и файлом — shown и списание одним числом', async () => {
+    // Расход по формуле из usage (без счёта CLI): $0.50 = 1 000 000 cacheRead × 0.1 × $5/MTok.
+    const { svc, calls } = makeService();
+    const res = await uploadTurn(svc, [
+      delta(MODEL), notice(NOTICE),
+      {
+        type: 'done', failed: true, failReason: 'transient_after_write',
+        usage: { cacheRead: 1_000_000 },
+        outputFiles: [{ name: 'plan.pdf', url: '/files/u1_7_ru/plan.pdf' }],
+      },
+    ]);
+
+    expect(charged(calls)).toBe(forUsd(0.5));
+    expect(shownTokens(res)).toBe(charged(calls));
+    expect(historyTokens(calls)).toBe(charged(calls));
+    expect(chargeMeta(calls)).toMatchObject({ partial: 'transient_after_write', source: 'usage' });
   });
 });
