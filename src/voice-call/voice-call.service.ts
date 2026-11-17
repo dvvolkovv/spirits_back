@@ -556,7 +556,6 @@ export class VoiceCallService implements OnModuleInit {
       [durationSec, JSON.stringify(transcript), cost, payload.usage.model, tokens, verdict, raw, callId,
         participants.length ? JSON.stringify(participants) : null],
     );
-    this.logger.log(`[complete] call=${callId} кончился: ${verdict} (${raw})`);
 
     // Бот чужой площадки — сразу, не дожидаясь реапера: он лишний участник в
     // переговорах человека. Не блокирует остальное завершение звонка (резюме,
@@ -566,11 +565,17 @@ export class VoiceCallService implements OnModuleInit {
     // Аккаунт неактивен — строка не обновилась. Учёт, резюме, карточка и
     // профиль удалённому не нужны (как в SpecialistJobService.run); выход
     // здесь же держит идемпотентность: статус не 'completed', и повторный
-    // complete без него создал бы вторую строку учёта.
+    // complete без него создал бы вторую строку учёта. «кончился» здесь не
+    // пишем — звонок не завершён записью; стоимость и длительность — в warn,
+    // чтобы след расходов оставался, пока учёт удалённым не пишется.
     if (!saved.rowCount) {
-      this.logger.warn(`[complete] call=${callId} аккаунт неактивен — транскрипт, учёт и резюме не пишем`);
+      this.logger.warn(
+        `[complete] call=${callId} аккаунт неактивен — транскрипт, учёт и резюме не пишем ` +
+          `(${verdict}, ${durationSec}s, cost=$${cost.toFixed(4)})`,
+      );
       return;
     }
+    this.logger.log(`[complete] call=${callId} кончился: ${verdict} (${raw})`);
 
     // Списываем за разговор — по решению владельца 27.08.2026. Раньше здесь
     // стоял статус 'completed' с нулём: минуты считались, но не стоили ничего.
