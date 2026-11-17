@@ -125,6 +125,9 @@ export class ActionPlansService implements OnModuleInit {
       .filter((message: any) => clipped(message?.content, 1));
     if (!messages.some((message: any) => message.type === 'user') ||
         !messages.some((message: any) => message.type === 'assistant')) {
+      // Текст читает фронт (spirits_front src/services/actionPlansApi.ts,
+      // NOT_ENOUGH_CONVERSATION) и показывает «мало разговора» вместо общей
+      // ошибки — менять только вместе с ним.
       throw new BadRequestException('not enough conversation for an action plan');
     }
 
