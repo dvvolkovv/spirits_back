@@ -49,6 +49,25 @@ export class ContactsService {
     return r.rows[0]?.id ?? null;
   }
 
+  /**
+   * K6: владелец профиля удалён (state='deleted'). Телефон удалённого живому
+   * пользователю не выдаётся — ни по открытому до удаления контакту, ни по
+   * переписке. Маскируется именно удалённый: заблокированный модерацией и
+   * легаси-аккаунты (state NULL) — прежнее поведение. Ошибка чтения —
+   * fail-closed: считаем удалённым, телефон не выдаём.
+   */
+  private async ownerDeleted(phone: string): Promise<boolean> {
+    try {
+      const r = await this.pg.query(
+        `SELECT 1 FROM user_id WHERE internal_id = $1 AND state = 'deleted'`,
+        [phone],
+      );
+      return (r.rowCount ?? r.rows?.length ?? 0) > 0;
+    } catch {
+      return true;
+    }
+  }
+
   async contactVisibility(phone: string): Promise<ContactVisibility> {
     const r = await this.pg.query(
       `SELECT profile_data->>'contactVisible' AS v FROM ai_profiles_consolidated WHERE user_id = $1`,
@@ -94,13 +113,17 @@ export class ContactsService {
 
     // Финальные access и contactVisible образуют одну точку сериализации:
     // отзыв связи, блок, paused или public→private не остаются в старом ответе.
-    const [finalAccess, finalVisibility] = await Promise.all([
+    const [finalAccess, finalVisibility, targetDeleted] = await Promise.all([
       readProfileAccess(this.pg, requesterPhone, targetPhone).catch(() => null),
       this.contactVisibility(targetPhone),
+      this.ownerDeleted(targetPhone),
     ]);
     if (!finalAccess?.visible) return null;
     const stillIncludeProfile = finalAccess.visible && (self || finalAccess.automaticProfiling);
-    phoneDisclosed = finalVisibility === 'public' || self || finalAccess.approvedContact || finalAccess.peer;
+    // K6: открытый до удаления контакт или переписка не раскрывают телефон
+    // (и email/аватар) удалённого аккаунта.
+    phoneDisclosed = !targetDeleted
+      && (finalVisibility === 'public' || self || finalAccess.approvedContact || finalAccess.peer);
 
     const profileData = meta.rows[0]?.profile_data || {};
     const serializedEntities: Record<string, any> = {};
@@ -182,9 +205,11 @@ export class ContactsService {
     const targetId = await this.idByPhone(targetPhone);
     if (!targetId) return [];
     const r = await this.pg.query(
-      `SELECT cr.*, ap.user_id AS requester_phone, ap.profile_data AS requester_profile_data
+      `SELECT cr.*, ap.user_id AS requester_phone, ap.profile_data AS requester_profile_data,
+              (u.state = 'deleted') AS requester_deleted
        FROM contact_requests cr
        JOIN ai_profiles_consolidated ap ON ap.id = cr.requester_id
+       LEFT JOIN user_id u ON u.internal_id = ap.user_id
        WHERE cr.target_id = $1
        ORDER BY CASE WHEN cr.status = 'pending' THEN 0 ELSE 1 END, cr.created_at DESC`,
       [targetId],
@@ -201,7 +226,11 @@ export class ContactsService {
       const out: any = { ...row };
       const profileData = out.requester_profile_data || {};
       delete out.requester_profile_data;
-      if (row.status !== 'approved') delete out.requester_phone;
+      // K6: телефон — только у approved и только живого контрагента:
+      // контакт, открытый до удаления, номер удалённого больше не выдаёт.
+      const requesterDeleted = out.requester_deleted === true;
+      delete out.requester_deleted;
+      if (row.status !== 'approved' || requesterDeleted) delete out.requester_phone;
 
       const includeProfile = access.visible && access.automaticProfiling;
       const entities = includeProfile && this.neo4j
@@ -219,9 +248,11 @@ export class ContactsService {
     const requesterId = await this.idByPhone(requesterPhone);
     if (!requesterId) return [];
     const r = await this.pg.query(
-      `SELECT cr.*, ap.user_id AS target_phone, ap.profile_data AS target_profile_data
+      `SELECT cr.*, ap.user_id AS target_phone, ap.profile_data AS target_profile_data,
+              (u.state = 'deleted') AS target_deleted
        FROM contact_requests cr
        JOIN ai_profiles_consolidated ap ON ap.id = cr.target_id
+       LEFT JOIN user_id u ON u.internal_id = ap.user_id
        WHERE cr.requester_id = $1
        ORDER BY cr.created_at DESC`,
       [requesterId],
@@ -238,7 +269,10 @@ export class ContactsService {
       const out: any = { ...row };
       const profileData = out.target_profile_data || {};
       delete out.target_profile_data;
-      if (row.status !== 'approved') delete out.target_phone;
+      // K6: см. listIncoming — номер удалённого контрагента не выдаётся.
+      const targetDeleted = out.target_deleted === true;
+      delete out.target_deleted;
+      if (row.status !== 'approved' || targetDeleted) delete out.target_phone;
 
       const includeProfile = access.visible && access.automaticProfiling;
       const entities = includeProfile && this.neo4j
