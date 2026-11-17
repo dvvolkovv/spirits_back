@@ -266,10 +266,12 @@ describe('ChatUploadsService.saveOriginals: источник и миниатюр
     });
 
     expect(result.failed).toEqual([name]);
-    // Строки и их префиксы стабильны — по ним грепают журнал.
-    expect(warn.mock.calls.map(([line]) => String(line))).toEqual([
-      'saveOriginals: failed to persist file: Error code=23505',
-      'saveOriginals: best-effort cleanup delete failed: AccessDenied',
+    // Строки и их префиксы стабильны — по ним грепают журнал. key — uuid-префикс
+    // ключа хранилища: по нему в MinIO находится объект, который не удалился.
+    const [key] = originalKeys();
+    expect(warnLines()).toEqual([
+      `saveOriginals: failed to persist file (key=${keyId(key)}): Error code=23505`,
+      `saveOriginals: best-effort cleanup delete failed (key=${keyId(key)}): AccessDenied`,
     ]);
     const logged = JSON.stringify(warn.mock.calls);
     for (const leak of ['отчёт', 'подделка', 'FAKE', 'insert failed', 'DeleteObject', 'u1_12']) {
