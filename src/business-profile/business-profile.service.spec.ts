@@ -5,7 +5,8 @@ function makePg(profile: BusinessProfile = {}) {
   const state = { business: profile };
   return {
     query: jest.fn(async (sql: string, params: any[]) => {
-      if (/SELECT/i.test(sql)) {
+      // По началу запроса: в UPDATE есть SELECT внутри EXISTS-гейта (K1).
+      if (/^\s*SELECT/i.test(sql)) {
         return { rows: [{ profile_data: { name: 'Дмитрий', business: state.business } }] };
       }
       // UPDATE ... SET profile_data = jsonb_set(...)
@@ -24,7 +25,7 @@ function makePg(profile: BusinessProfile = {}) {
 function makePgWithoutRow() {
   return {
     query: jest.fn(async (sql: string) => {
-      if (/SELECT/i.test(sql)) {
+      if (/^\s*SELECT/i.test(sql)) {
         return { rows: [] };
       }
       return { rows: [], rowCount: 0 };
