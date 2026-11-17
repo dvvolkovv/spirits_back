@@ -217,11 +217,14 @@ export class ChatUploadsService {
         );
         result.saved.push(this.row(rows[0]));
       } catch (e: any) {
-        // Только вид ошибки (errKind): имя файла — пользовательские данные, а
-        // сообщения pg/S3 повторяют его и ключ объекта. id загрузки здесь ещё
-        // нет (строка не записана), ключ сессии содержит номер телефона.
+        // Только вид ошибки (errKind) и обезличенный id объекта: имя файла —
+        // пользовательские данные, а сообщения pg/S3 повторяют его и ключ
+        // объекта. id загрузки здесь ещё нет (строка не записана), ключ сессии
+        // содержит номер телефона; uuid-префикс storage_key (storageKeyLogId)
+        // находит в MinIO объект, если уборка ниже не удалась.
         // Префикс строки стабилен — по нему грепают журнал.
-        this.logger.warn(`saveOriginals: failed to persist file: ${errKind(e)}`);
+        const keyId = this.storageKeyLogId(storageKey);
+        this.logger.warn(`saveOriginals: failed to persist file (key=${keyId}): ${errKind(e)}`);
         // Best-effort cleanup: оригинал и (если успела лечь) миниатюра —
         // строки нет, значит и объектов без неё оставлять незачем.
         for (const key of thumbKey ? [storageKey, thumbKey] : [storageKey]) {
@@ -229,7 +232,7 @@ export class ChatUploadsService {
             await this.storage.delete({ bucket: BUCKET, key });
           } catch (cleanupError: any) {
             // Сам сбой сохранения уже записан строкой выше; здесь — тоже только вид.
-            this.logger.warn(`saveOriginals: best-effort cleanup delete failed: ${errKind(cleanupError)}`);
+            this.logger.warn(`saveOriginals: best-effort cleanup delete failed (key=${keyId}): ${errKind(cleanupError)}`);
           }
         }
         result.failed.push(file.originalname);
