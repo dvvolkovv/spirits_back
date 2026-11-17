@@ -193,7 +193,9 @@ export default defineAgent({
      * Исключаем себя: бот Attendee сидит в встрече полноправным участником и
      * приходит в join_leave наравне с людьми.
      */
-    const selfName = `${agentName} · ассистент ${meta.ownerName || 'пользователя'}`;
+    // Presence и Roster должны исключать бота ровно по той подписи, которую
+    // получил Attendee и которую воркер использует для displayName.
+    const selfName = displayName;
     const presence = isBridged ? new Presence(selfName) : null;
 
     /**

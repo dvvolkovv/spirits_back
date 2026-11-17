@@ -431,7 +431,10 @@ export class MeetingService {
       );
       // Тем же способом, что раньше в join(): участники должны видеть, кто к
       // ним пришёл и от кого.
-      const botName = `${agentRes.rows[0]?.display_name || 'Ассистент'} · ассистент ${ownerName}`;
+      const botName = assistantSignature(
+        agentRes.rows[0]?.display_name || 'Ассистент',
+        ownerName,
+      );
       // Адрес входа: у Zoom он лежит в базе целиком, у Meet собирается из
       // кода. `external_url` — единственный признак, по которому здесь
       // отличается площадка, и он же страхует от рассинхрона с provider.
