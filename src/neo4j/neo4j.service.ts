@@ -631,6 +631,22 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     return null;
   }
 
+  /**
+   * K1: активен ли аккаунт (прецедент — TasksService.isAccountActive). Зовётся
+   * непосредственно перед каждой записью в граф: после удаления profile_data =
+   * '{}', и automaticProfilingAllowed такой профиль пропускает — без проверки
+   * ход, начатый до удаления, заново создавал бы граф. Ошибка запроса уходит в
+   * catch вызывающего — записи нет.
+   * Остаточное окно: удаление между этим SELECT и Cypher-записью — Postgres и Neo4j одной транзакцией не связать.
+   */
+  private async isAccountActive(pg: PgService, userId: string): Promise<boolean> {
+    const res = await pg.query(
+      `SELECT 1 FROM user_id WHERE internal_id = $1 AND state = 'active'`,
+      [userId],
+    );
+    return (res.rowCount ?? res.rows?.length ?? 0) > 0;
+  }
+
   async consolidateFromChat(
     userId: string,
     agentId: string,
@@ -702,6 +718,7 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
       for (const type of entityTypes) {
         if (Array.isArray(extracted[type]) && extracted[type].length > 0) {
           if (!(await automaticProfilingAllowed(pg, userId))) return;
+          if (!(await this.isAccountActive(pg, userId))) return;
           await this.updateProfileEntities(userId, type.slice(0, -1), extracted[type]); // remove 's'
         }
       }
@@ -715,6 +732,7 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
             { phone: userId },
           );
           if (!(await automaticProfilingAllowed(pg, userId))) return;
+          if (!(await this.isAccountActive(pg, userId))) return;
           const cnt = (res.records[0]?.get('cnt')?.toNumber?.() || res.records[0]?.get('cnt') || 0) + 1;
           await session2.run(
             'MERGE (p:Profile {phone: $phone}) SET p.consolidation_count = $cnt',
@@ -755,6 +773,7 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
       if (!(await automaticProfilingAllowed(pg, userId))) return;
       const embedding = resp.data?.data?.[0]?.embedding;
       if (!embedding || !Array.isArray(embedding)) return;
+      if (!(await this.isAccountActive(pg, userId))) return;
 
       // Store embedding in Neo4j
       const session = this.getSession();
