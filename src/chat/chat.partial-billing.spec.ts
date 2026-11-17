@@ -387,7 +387,22 @@ describe('ход с файлом: оборванный ход списывает
     expect(lines(warn)).toContainEqual(expect.stringContaining('billing[upload:skipped:cli_fatal_text]'));
   });
 
-  it('U8: оборванный ход с usage и файлом — shown и списание одним числом', async () => {
+  it('U9: ход без failed, но текст — отказ CLI — shown 0 и строки списания нет', async () => {
+    // Релей счёл ход удачным, а ответом долетел отказ CLI. До 5917bde6
+    // индикатор считал сумму без решения о списании и показывал N токенов,
+    // а persistUploadTurn не списывал ничего.
+    const { svc, calls, warn } = makeService();
+    const res = await uploadTurn(svc, [
+      delta("You've hit your session limit · resets 11:50am (UTC)"),
+      done(),
+    ]);
+
+    expect(charged(calls)).toBeUndefined();
+    expect(shownTokens(res)).toBe(0);
+    expect(lines(warn)).toContainEqual(expect.stringContaining('billing[upload:skipped:cli_fatal_text]'));
+  });
+
+  it('U8:оборванный ход с usage и файлом — shown и списание одним числом', async () => {
     // Расход по формуле из usage (без счёта CLI): $0.50 = 1 000 000 cacheRead × 0.1 × $5/MTok.
     const { svc, calls } = makeService();
     const res = await uploadTurn(svc, [
