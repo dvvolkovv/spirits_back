@@ -171,7 +171,8 @@ describe('scan-document: PDF Маши сохраняется в загрузки
     const uploads = okSave();
     const { ctrl } = makeController(uploads);
     const res = makeRes();
-    await ctrl.scanDocument({ userId: 'u-1' }, makeReq({}, undefined), res);
+    // null, а не undefined: undefined включил бы файл по умолчанию из makeReq.
+    await ctrl.scanDocument({ userId: 'u-1' }, makeReq({}, null), res);
     expect(res.statusCode).toBe(400);
     expect(uploads.saveOriginals).not.toHaveBeenCalled();
   });
