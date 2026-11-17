@@ -80,6 +80,13 @@ export class ChatUploadDeleteError extends Error {
 export const CHAT_UPLOADS_BUCKET = 'linkeon-chat-uploads';
 
 /**
+ * Потолок загрузок одной переписки в панели «Медиа/Файлы» (GET /webhook/chat/files).
+ * Файлы ассистента панель читает с потолком PANEL_ROWS_LIMIT (chat-files.service.ts);
+ * 500 собственных загрузок в одной переписке — с большим запасом.
+ */
+export const PANEL_UPLOADS_LIMIT = 500;
+
+/**
  * Исходник больше предела вызывающего (findOwnedOriginal с maxBytes). Размер
  * сверяется по реестру до скачивания: байты из хранилища не читаются.
  */
@@ -496,6 +503,31 @@ export class ChatUploadsService {
        ORDER BY created_at DESC
        LIMIT 10`,
       [userId, sessionId, excludeIds],
+    );
+    return rows.map((row) => this.row(row));
+  }
+
+  /**
+   * Загрузки одной переписки для панели «Медиа/Файлы», от новых к старым.
+   * user_id в условии обязателен, хотя session_id и так начинается с него:
+   * ключ сессии собирает контроллер, а реестр отдаёт строки только владельцу.
+   * Индекс idx_chat_uploads_user_session_created (миграция 001) покрывает
+   * и условие, и порядок. limit выше PANEL_UPLOADS_LIMIT режется до него.
+   */
+  async listForSessionPanel(
+    userId: string,
+    sessionId: string,
+    limit = PANEL_UPLOADS_LIMIT,
+  ): Promise<ChatUploadRecord[]> {
+    const capped = Number.isFinite(limit)
+      ? Math.min(Math.max(Math.trunc(limit), 1), PANEL_UPLOADS_LIMIT)
+      : PANEL_UPLOADS_LIMIT;
+    const { rows } = await this.pg.query(
+      `SELECT ${COLUMNS} FROM chat_uploads
+       WHERE user_id = $1 AND session_id = $2
+       ORDER BY created_at DESC
+       LIMIT $3`,
+      [userId, sessionId, capped],
     );
     return rows.map((row) => this.row(row));
   }
