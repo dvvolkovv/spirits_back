@@ -184,6 +184,19 @@ describe('ChatUploadsService.setNote: комментарий ассистент�
       expect(saved).toContain(ZWJ);
     });
 
+    // ZWNJ (U+200C) — часть правописания: в персидском он разделяет
+    // приставку и основу внутри слова, в языках Индии управляет лигатурами.
+    // Вырезать его — портить текст, как и ZWJ.
+    it('ZWNJ внутри слова сохраняется', async () => {
+      const zwnj = String.fromCodePoint(0x200c);
+      const word = `می${zwnj}خواهم`;
+      pg.query.mockResolvedValueOnce({ rows: [savedRow('x', '3')] });
+      await service.setNote({ id: ID, userId: 'owner1', note: `${word} ${TAGS}`, assistantId: '3' });
+      const saved = pg.query.mock.calls[0][1]![2] as string;
+      expect(saved).toBe(word);
+      expect(saved).toContain(zwnj);
+    });
+
     it('строка из одних невидимых символов формата — BadRequest, в базу не ходим', async () => {
       for (const note of [TAGS, INVISIBLE, ` ${TAGS}\n${INVISIBLE} `]) {
         await expect(service.setNote({ id: ID, userId: 'owner1', note, assistantId: '3' }))

@@ -208,6 +208,15 @@ describe('assistantBlock: строка файла с id, видом, датой 
     expect(block).toContain('- id=99999999-9999-4999-8999-99999999999d | file.bin | document | 2026-11-15 | комментарий: нет — оставь его через note_file после работы с файлом\n');
   });
 
+  it('ZWNJ внутри слова на выводе остаётся', () => {
+    const zwnj = String.fromCodePoint(0x200c);
+    const word = `می${zwnj}خواهم`;
+    const block = service.assistantBlock([
+      record({ id: '99999999-9999-4999-8999-99999999999e', note: `${word}${String.fromCodePoint(0x200b)}` }),
+    ]);
+    expect(block).toContain(`- id=99999999-9999-4999-8999-99999999999e | file.bin | document | 2026-11-15 | комментарий: ${word}\n`);
+  });
+
   // Имя — из multipart: «|» в нём подделал бы поля строки (вид, дата,
   // комментарий). В выводе имени он заменяется на «¦»; в комментарии —
   // последнем поле — остаётся как есть.
