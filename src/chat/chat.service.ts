@@ -1596,11 +1596,18 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const uploadNotesOn = process.env.CHAT_UPLOADS_ENABLED === 'true';
     // Память загрузок — тот же блок, что получают ассистенты релея
     // (uploadContextBlock): id, имя, вид, дата, комментарий и подписанная
-    // ссылка. Ключ — сырой ключ сессии Postgres этого хода (chatSessionId:
-    // `<userId>_3` или fresh-сессия «Чистого листа»). Пинги мониторинга блок
-    // не везут — как на пути релея. Флаг, отсутствие реестра и сбой БД
-    // разбирает сам uploadContextBlock: во всех трёх случаях пустая строка.
-    const mashaUploadContext = probe ? '' : await this.uploadContextBlock(userId, chatSessionId);
+    // ссылка. Ключ — сырой ключ сессии Postgres этого хода (chatSessionId):
+    // у живого человека это основная лента `<userId>_3`, и файлы до точки
+    // «Чистого листа» отсекает точка (resetAt) — тем же фильтром, что хвост
+    // переписки выше и путь релея (spec 2026-11-17-context-reset). Без точки
+    // память загрузок вернула бы ассистенту старые файлы после «Чистого
+    // листа». Изолированная fresh-сессия осталась только у пингов, а пинги
+    // мониторинга блок не везут — как на пути релея. Флаг, отсутствие реестра
+    // и сбой БД разбирает сам uploadContextBlock: во всех трёх случаях пустая
+    // строка.
+    const mashaUploadContext = probe
+      ? ''
+      : await this.uploadContextBlock(userId, chatSessionId, undefined, resetAt);
 
     // Ход в полёте — тот же учёт, что у пути релея: deploy.sh перед рестартом
     // ждёт /chat/active-streams до нуля, фронт спрашивает /chat/active-turn.
