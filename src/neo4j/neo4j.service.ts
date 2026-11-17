@@ -522,6 +522,11 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     canonical: string,
   ): Promise<void> {
     if (!fromKeys.length || !canonical?.trim()) return;
+    // K1b: компакция могла идти в момент удаления — MERGE ниже воскресил бы
+    // узел Profile удалённого. Проверка — ДО чтения группы и снятия связей:
+    // любой отказ (неактивен, сбой запроса, нет PgService) ничего не меняет.
+    // Иначе сбой гейта после DELETE r оставлял живого без группы сущностей.
+    if (!this.pg || !(await this.isAccountActive(this.pg, userId))) return;
     const session = this.getSession();
     if (!session) return;
     const type = entityType.charAt(0).toUpperCase() + entityType.slice(1).toLowerCase();
@@ -554,10 +559,6 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
       );
 
       // 3) Создадим/обновим каноническую сущность и связь.
-      // K1b: компакция могла идти в момент удаления — MERGE воскресил бы узел
-      // Profile удалённого. Проверка непосредственно перед записью; без pg
-      // проверить нечем — не пишем.
-      if (!this.pg || !(await this.isAccountActive(this.pg, userId))) return;
       await session.run(
         `MERGE (p:Profile {phone: $phone})
          MERGE (v:${type} {canonical_key: $canonicalKey})
@@ -643,8 +644,9 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
    * catch вызывающего — записи нет.
    * Остаточное окно: проверка стоит на группу записей, а не на каждый Cypher. Для сущностей
    * это N последовательных session.run в updateProfileEntities (по одному на значение), и
-   * удаление может прийти между SELECT и любым из них; счётчик, эмбеддинг и merge компакции —
-   * по одному обращению. Postgres и Neo4j одной транзакцией не связать.
+   * удаление может прийти между SELECT и любым из них; счётчик и эмбеддинг — по одному
+   * обращению; merge компакции — два (DELETE r и MERGE; гейт там стоит до чтения группы).
+   * Postgres и Neo4j одной транзакцией не связать.
    */
   private async isAccountActive(pg: PgService, userId: string): Promise<boolean> {
     const res = await pg.query(
