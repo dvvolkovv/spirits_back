@@ -196,8 +196,8 @@ describe('ChatController: «Чистый лист» как точка', () => {
     expect(args[7]).toBe(false);
   });
 
-  /** Сдвиг метки от now в секундах из строки журнала. */
-  const shiftSec = (line: string) => Number(/([+-]\d+) с\b/.exec(line)?.[1]);
+  /** Сдвиг метки от now в секундах из строки журнала (`\b` после кириллицы не работает). */
+  const shiftSec = (line: string) => Number(/ ([+-]\d+) с$/.exec(line)?.[1]);
 
   it('отвергнутая метка — предупреждение в журнал: пара и сдвиг, без текста сообщения; два хода подряд — одно', async () => {
     const { ctrl, resets } = makeCtrl();
