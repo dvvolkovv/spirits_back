@@ -34,6 +34,10 @@ export type ContactVisibility = 'public' | 'matchOnly' | 'private';
 export const activeOwnerSql = (ownerExpr: string): string =>
   `EXISTS (SELECT 1 FROM user_id WHERE internal_id = ${ownerExpr} AND state = 'active')`;
 
+/** Гейт INSERT новой заявки: получатель ($2 — его surrogate id) активен. */
+const RECIPIENT_ACTIVE_SQL = `EXISTS (SELECT 1 FROM ai_profiles_consolidated ap
+            WHERE ap.id = $2 AND ${activeOwnerSql('ap.user_id')})`;
+
 export interface ContactRequest {
   id: number;
   requester_id: number;
@@ -180,7 +184,14 @@ export class ContactsService {
     if (requesterId === targetId) throw new Error('Cannot request own contact');
 
     const targetPhone = await this.phoneById(targetId);
-    if (!targetPhone || !(await canReceiveNewProposal(this.pg, targetPhone))) {
+    // K6b: получатель — только активный аккаунт (activeOwnerSql). Заявка
+    // удалённому/заблокированному/без строки user_id висела бы pending
+    // навсегда; ответ — тот же, что на несуществующего получателя.
+    if (
+      !targetPhone
+      || !(await canReceiveNewProposal(this.pg, targetPhone))
+      || !(await this.ownerActive(targetPhone))
+    ) {
       throw new NotFoundException({ code: 'PROFILE_NOT_AVAILABLE' });
     }
 
@@ -190,23 +201,42 @@ export class ContactsService {
       // Phone открыт — запрос не нужен. Создаём сразу approved (для истории).
       const r = await this.pg.query(
         `INSERT INTO contact_requests(requester_id, target_id, message, status, resolved_at)
-         VALUES ($1, $2, $3, 'approved', now())
+         SELECT $1, $2, $3, 'approved', now()
+          WHERE ${RECIPIENT_ACTIVE_SQL}
          ON CONFLICT DO NOTHING
          RETURNING *`,
         [requesterId, targetId, message],
       );
-      return r.rows[0] || (await this.findExisting(requesterId, targetId));
+      return r.rows[0] || (await this.existingOrUnavailable(requesterId, targetId, targetPhone));
     }
 
     // matchOnly — создаём pending. UNIQUE-индекс предотвратит дубли pending.
     const r = await this.pg.query(
       `INSERT INTO contact_requests(requester_id, target_id, message, status)
-       VALUES ($1, $2, $3, 'pending')
+       SELECT $1, $2, $3, 'pending'
+        WHERE ${RECIPIENT_ACTIVE_SQL}
        ON CONFLICT DO NOTHING
        RETURNING *`,
       [requesterId, targetId, message],
     );
-    return r.rows[0] || (await this.findExisting(requesterId, targetId));
+    return r.rows[0] || (await this.existingOrUnavailable(requesterId, targetId, targetPhone));
+  }
+
+  /**
+   * K6b: INSERT не вернул строку — либо дубль pending (ON CONFLICT, прежнее
+   * поведение: вернуть существующую), либо получателя успели сделать
+   * неактивным между проверкой и INSERT (гейт в самом INSERT) — тогда тот же
+   * отказ, что на несуществующего получателя.
+   */
+  private async existingOrUnavailable(
+    requesterId: number,
+    targetId: number,
+    targetPhone: string,
+  ): Promise<ContactRequest> {
+    if (!(await this.ownerActive(targetPhone))) {
+      throw new NotFoundException({ code: 'PROFILE_NOT_AVAILABLE' });
+    }
+    return this.findExisting(requesterId, targetId);
   }
 
   private async findExisting(requesterId: number, targetId: number): Promise<ContactRequest> {
