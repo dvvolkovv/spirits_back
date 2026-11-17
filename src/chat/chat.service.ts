@@ -34,7 +34,7 @@ import { WORK_RULES } from './work-rules';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
 import { LinkeonRelayFields, appendLinkeonFields, linkeonRelayFields, relayFsKey } from './linkeon-relay-fields';
-import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, LINKEON_HELP_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
+import { FIND_FILES_CLI_PROMPT, FIND_FILES_CLI_TOOL_NAME, LINKEON_HELP_CLI_TOOL_NAME, NOTE_FILE_CLI_PROMPT, NOTE_FILE_CLI_TOOL_NAME, REPORT_PROBLEM_CLI_TOOL_NAME, productsCliMcp } from '../products/products-cli-tool';
 import { ProductActionsService } from '../products/product-actions.service';
 import { productActionTail, stripProductActionBlocks } from '../products/product-action-tail';
 import { ChatFileStore, PERSIST_TURN_BUDGET_MS } from './chat-files/chat-file-store';
@@ -1533,6 +1533,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const products = productsCliMcp(userId, 'web', { lang: userLanguage, client: clientKind(storeBuild, ui), agent: 'staff', turn: productsTurn });
     // Звали ли в этом ходе инструмент продуктов — от этого зависит карта ниже.
     let usedProductsTool = false;
+    // Комментарии к загрузкам (note_file) — только при включённой памяти
+    // загрузок: без флага точка продуктов инструмент не показывает, а блок про
+    // него в промпте обещал бы то, чего нет.
+    const uploadNotesOn = process.env.CHAT_UPLOADS_ENABLED === 'true';
 
     // Ход в полёте — тот же учёт, что у пути релея: deploy.sh перед рестартом
     // ждёт /chat/active-streams до нуля, фронт спрашивает /chat/active-turn.
@@ -1575,6 +1579,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // Правило карточек — только клиенту, который их рисует; до хвоста
           // языка, который обязан остаться последним.
           system: stableSystemPrompt + `\n\n${products.promptBlock}\n\n${FIND_FILES_CLI_PROMPT}` +
+            (uploadNotesOn ? `\n\n${NOTE_FILE_CLI_PROMPT}` : '') +
             (ui.ask ? `\n\n${ASK_RULE}` : '') + dispatchVolatileSystemPrompt + replyLanguageTail,
           // Модель Маши — общая с остальным чатом, см. common/chat-model.ts
           // (там же цена решения: пин не даунгрейдится при исчерпании лимита, и
@@ -1598,7 +1603,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // + поиск файлов прошлых разговоров (find-files.tool.ts) — у TG-бота
           // его нет; + сообщить в поддержку (src/problem-report) — есть у обоих;
           // + справка о Linkeon (platform-kb).
-          allowedTools: `${products.toolName},${FIND_FILES_CLI_TOOL_NAME},${REPORT_PROBLEM_CLI_TOOL_NAME},${LINKEON_HELP_CLI_TOOL_NAME}`,
+          // + комментарий к загрузке (note-file.tool.ts) — только при флаге
+          // CHAT_UPLOADS_ENABLED, как и на самой точке.
+          allowedTools: `${products.toolName},${FIND_FILES_CLI_TOOL_NAME}${uploadNotesOn ? `,${NOTE_FILE_CLI_TOOL_NAME}` : ''},${REPORT_PROBLEM_CLI_TOOL_NAME},${LINKEON_HELP_CLI_TOOL_NAME}`,
           // onProgress переводит CLI в stream-json: только так видно, звали ли
           // инструмент продуктов в этом ходе (итог в формате json этого не несёт).
           onProgress: (ev) => {
@@ -1606,7 +1613,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
             // поддержку: «карточка», «картинка» о найденных файлах, «не проходит
             // оплата картой» в жалобе — не повод вешать метафорическую карту;
             // и к ходу со справкой: вопрос о платформе — не повод для метафорической карты.
-            if (ev.kind === 'tool_use' && (ev.name === products.toolName || ev.name === FIND_FILES_CLI_TOOL_NAME || ev.name === REPORT_PROBLEM_CLI_TOOL_NAME || ev.name === LINKEON_HELP_CLI_TOOL_NAME)) usedProductsTool = true;
+            if (ev.kind === 'tool_use' && (ev.name === products.toolName || ev.name === FIND_FILES_CLI_TOOL_NAME || ev.name === NOTE_FILE_CLI_TOOL_NAME || ev.name === REPORT_PROBLEM_CLI_TOOL_NAME || ev.name === LINKEON_HELP_CLI_TOOL_NAME)) usedProductsTool = true;
             // Шаг работы для клиента, который его рисует. Аргументов onProgress
             // не отдаёт — хватает имени: у Маши только инструменты точки продуктов.
             // Для новых инструментов понадобится input — onProgress его не отдаёт.
