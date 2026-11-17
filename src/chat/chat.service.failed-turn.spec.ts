@@ -18,6 +18,10 @@ jest.mock('axios');
  *      одна delta уже ушла, то есть ровно в том случае, ради которого писался;
  *   2. оборванный ход тарифицировался как обычный (17 717 токенов за 209
  *      символов) и уезжал в телеметрию как {ok:true}.
+ *
+ * С 17.11.2026 (решение владельца, partial-billing.ts) оборванный ход, после
+ * которого человек что-то получил, снова списывается — по фактическому
+ * расходу хода. В телеметрии он по-прежнему не ok.
  */
 
 const delta = (text: string) => 'data: ' + JSON.stringify({ type: 'delta', text }) + '\n';
@@ -111,13 +115,33 @@ describe('ход без финального ответа', () => {
     expect(answer!.content).toContain('ответ прерван');
   });
 
-  it('за оборванный ход токены не списываются', async () => {
+  it('оборванный ход с текстом модели списывается за пришедшее (решение владельца 17.11.2026)', async () => {
+    // До 17.11 такой ход не тарифицировался вовсе. Теперь — по фактическому
+    // расходу хода (partial-billing.ts); в истории — та же цена.
     const { svc, calls } = makeService();
     const t = startTurn(svc, 'u1');
 
     t.upstream.push(delta('частичный текст'));
     t.upstream.push(notice('_(связь с моделью прервалась)_'));
     t.upstream.push(done({ failed: true, failReason: 'transient_after_partial' }));
+    t.upstream.push(null);
+    await t.finished;
+    await settle();
+
+    const row = billingRow(calls);
+    expect(row).toBeDefined();
+    expect(Number(row!.params[4])).toBeGreaterThan(0);
+    expect(savedAnswer(calls)!.tokens).toBe(Number(row!.params[4]));
+    expect(JSON.parse(String(row!.params[5]))).toMatchObject({ partial: 'transient_after_partial' });
+  });
+
+  it('сбой до ответа (cli_fatal) не списывается, даже если обрывок текста успел уйти', async () => {
+    const { svc, calls } = makeService();
+    const t = startTurn(svc, 'u1');
+
+    t.upstream.push(delta('частичный текст'));
+    t.upstream.push(notice('_(модель недоступна)_'));
+    t.upstream.push(done({ failed: true, failReason: 'cli_fatal' }));
     t.upstream.push(null);
     await t.finished;
     await settle();
