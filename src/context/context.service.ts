@@ -135,7 +135,7 @@ export class ContextService {
       case 'now':           return this.sectionNow(tz);
       case 'today':         return this.sectionToday(userId, tz);
       case 'identity':      return this.sectionIdentity(userId);
-      case 'continuation':  return this.sectionContinuation(userId, budget, opts.agentId);
+      case 'continuation':  return this.sectionContinuation(userId, opts.agentId, budget);
       case 'cloud_profile': return this.sectionCloudProfile(userId);
       case 'business':      return this.sectionBusiness(userId);
       case 'balance':       return this.sectionBalance(userId);
@@ -371,13 +371,18 @@ export class ContextService {
    * тоже попадают — реплики лежат в transcript, который воркер флашит по ходу
    * разговора, даже если резюме так и не собралось.
    *
-   * Звонок, закончившийся не позже точки «Чистого листа» пары, — старый
-   * разговор: после точки перезвон его не подхватывает. agentId — третьим,
-   * по умолчанию 12, как у sectionHistory.
+   * Разговор, начатый до точки «Чистого листа» пары, — старый: после точки
+   * перезвон его не подхватывает (так же датируются задачи из звонка, см.
+   * VoiceCallService.consolidateCall). Сравнивается НАЧАЛО звонка, а не
+   * ended_at: ended_at — момент закрытия строки, а не разговора, его ставят и
+   * вытеснение заброшенного звонка новым (start → markInterrupted прямо перед
+   * сборкой преамбулы), и реапер. Звонок 10:00 с «грязным» концом, точка в
+   * 10:20, новый звонок в 10:25 закрывает старый — по ended_at Роман получил
+   * бы дословный хвост разговора 10:00. Окно в полчаса — по-прежнему от ended_at.
    */
-  private async sectionContinuation(userId: string, budget = TOTAL_BUDGET, agentId = 12): Promise<string> {
+  private async sectionContinuation(userId: string, agentId = 12, budget = TOTAL_BUDGET): Promise<string> {
     const res = await this.pg.query(
-      `SELECT ended_at, transcript FROM voice_calls
+      `SELECT started_at, ended_at, transcript FROM voice_calls
         WHERE user_id = $1 AND ended_at IS NOT NULL
         ORDER BY started_at DESC LIMIT 1`,
       [userId],
@@ -391,10 +396,10 @@ export class ContextService {
     // Отрицательный возраст — расхождение часов, а не будущее: считаем «только что».
     const ageMs = Math.max(0, Date.now() - endedMs);
     if (ageMs > CONTINUATION_WINDOW_MS) return '';
-    // Тот же afterReset, что у переписки: проходит только звонок, закончившийся
+    // Тот же afterReset, что у переписки: проходит только звонок, начатый
     // строго после точки. Без точки и при сбое её чтения — как раньше.
     const resetAt = await this.contextResetAtSafe(userId, String(agentId));
-    if (!afterReset([row], resetAt, (r: any) => r.ended_at).length) return '';
+    if (!afterReset([row], resetAt, (r: any) => r.started_at).length) return '';
 
     const head =
       `--- Чем кончился прошлый разговор (${ContextService.agoText(ageMs)}) ---\n` +
