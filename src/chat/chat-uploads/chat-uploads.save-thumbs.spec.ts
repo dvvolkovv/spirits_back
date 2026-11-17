@@ -61,7 +61,17 @@ describe('ChatUploadsService.saveOriginals: источник и миниатюр
   });
 
   const insertParams = () => pg.query.mock.calls[0][1] as unknown[];
-  const warnText = () => warn.mock.calls.map((call) => String(call[0])).join('\n');
+  const warnLines = () => warn.mock.calls.map((call) => String(call[0]));
+  /** Ключи оригиналов в порядке загрузки (без миниатюр thumbs/…). */
+  const originalKeys = () =>
+    storage.upload.mock.calls.map((call) => String(call[0].key)).filter((key) => !key.startsWith('thumbs/'));
+  /**
+   * Обезличенный id объекта в журнале: случайный uuid — первый сегмент
+   * ключа хранилища (`<uuid>/<имя>`), в кавычках, как logId.
+   */
+  const keyId = (storageKey: string) => JSON.stringify(storageKey.split('/')[0]);
+  const skippedLine = (storageKey: string, mime: string, reason: string) =>
+    `saveOriginals: thumbnail skipped (key=${keyId(storageKey)}, mime=${JSON.stringify(mime)}): ${reason}`;
 
   it('картинка: оригинал и WebP-миниатюра в тот же бакет, thumb_key и source=web в INSERT', async () => {
     const result = await service.saveOriginals({
@@ -124,7 +134,7 @@ describe('ChatUploadsService.saveOriginals: источник и миниатюр
     },
   );
 
-  it('битая картинка: файл сохраняется, thumb_key NULL, в логе имя, mime и причина — без байтов', async () => {
+  it('битая картинка: файл сохраняется, thumb_key NULL, в логе id объекта, mime и причина — без имени и байтов', async () => {
     const jpegHalf = jpeg.subarray(0, Math.floor(jpeg.length / 2));
     const result = await service.saveOriginals({
       userId: 'u1',
@@ -142,22 +152,35 @@ describe('ChatUploadsService.saveOriginals: источник и миниатюр
     ]);
     expect(result.failed).toEqual([]);
     expect(result.saved.map((r) => r.thumbKey)).toEqual([null, null]);
-    expect(warnText()).toContain('"фото.png" ("image/png"): unsupported');
-    expect(warnText()).toContain('"обрезок.jpg" ("image/jpeg"): corrupt');
-    expect(JSON.stringify(warn.mock.calls)).not.toContain('СЕКРЕТНОЕ');
+    const [pngKey, jpgKey] = originalKeys();
+    expect(warnLines()).toEqual([
+      skippedLine(pngKey, 'image/png', 'unsupported'),
+      skippedLine(jpgKey, 'image/jpeg', 'corrupt'),
+    ]);
+    const logged = JSON.stringify(warn.mock.calls);
+    for (const leak of ['СЕКРЕТНОЕ', 'фото', 'обрезок', 'u1_12']) {
+      expect(logged).not.toContain(leak);
+    }
   });
 
-  it('имя файла в логе миниатюры экранировано: перевод строки не рвёт запись', async () => {
+  it('строка пропуска миниатюры: ни имени файла, ни параметров mime — только тип из белого списка', async () => {
+    // Параметры после «;» isThumbnailableMime пропускает, а в них клиент
+    // может прислать что угодно, в том числе имя с переводом строки.
     await service.saveOriginals({
       userId: 'u1',
       sessionId: 'u1_12',
-      files: [{ buffer: Buffer.from('не картинка'), originalname: 'фото"\nFAKE: подделка.png', mimetype: 'image/png' }],
+      files: [{
+        buffer: Buffer.from('не картинка'),
+        originalname: 'фото"\nFAKE: подделка.png',
+        mimetype: 'IMAGE/PNG; name="паспорт\nFAKE.png"',
+      }],
     });
 
-    expect(warn).toHaveBeenCalledTimes(1);
-    const line = String(warn.mock.calls[0][0]);
-    expect(line).not.toContain('\n');
-    expect(line).toContain(JSON.stringify('фото"\nFAKE: подделка.png'));
+    expect(warnLines()).toEqual([skippedLine(originalKeys()[0], 'image/png', 'unsupported')]);
+    const logged = JSON.stringify(warn.mock.calls);
+    for (const leak of ['фото', 'FAKE', 'подделка', 'паспорт', 'name=', 'u1_12']) {
+      expect(logged).not.toContain(leak);
+    }
   });
 
   it('сбой загрузки миниатюры в MinIO: файл сохраняется без thumb_key, удаляется только ключ миниатюры', async () => {
@@ -182,11 +205,14 @@ describe('ChatUploadsService.saveOriginals: источник и миниатюр
     ]);
   });
 
-  it('сбой загрузки миниатюры и её уборки: файл всё равно сохраняется', async () => {
+  it('сбой загрузки миниатюры и её уборки: файл всё равно сохраняется, в журнале только id объекта и вид ошибки', async () => {
+    // Сообщения S3 повторяют ключ объекта, а в нём имя файла.
     storage.upload
       .mockResolvedValueOnce('https://public.invalid/original')
-      .mockRejectedValueOnce(new Error('minio down'));
-    storage.delete.mockRejectedValueOnce(new Error('minio still down'));
+      .mockRejectedValueOnce(new Error('PutObject thumbs/гостиная.jpg.webp: minio down'));
+    storage.delete.mockRejectedValueOnce(
+      Object.assign(new Error('DeleteObject гостиная.jpg.webp: minio still down'), { code: 'ECONNRESET' }),
+    );
 
     const result = await service.saveOriginals({
       userId: 'u1',
@@ -197,6 +223,15 @@ describe('ChatUploadsService.saveOriginals: источник и миниатюр
     expect(result.failed).toEqual([]);
     expect(result.saved[0]).toMatchObject({ thumbKey: null });
     expect(storage.delete).toHaveBeenCalledTimes(1);
+    const [key] = originalKeys();
+    expect(warnLines()).toEqual([
+      `saveOriginals: thumbnail upload failed (key=${keyId(key)}): Error`,
+      `saveOriginals: thumbnail cleanup delete failed (key=${keyId(key)}): Error code=ECONNRESET`,
+    ]);
+    const logged = JSON.stringify(warn.mock.calls);
+    for (const leak of ['гостиная', 'PutObject', 'DeleteObject', 'minio', 'u1_12']) {
+      expect(logged).not.toContain(leak);
+    }
   });
 
   it('сбой INSERT после миниатюры: удаляются и оригинал, и миниатюра', async () => {
@@ -250,8 +285,6 @@ describe('ChatUploadsService.saveOriginals: источник и миниатюр
         mimetype: 'image/jpeg',
       }));
     const thumbKeysInInsert = () => pg.query.mock.calls.map((call) => (call[1] as unknown[])[8]);
-    const originalKeys = () =>
-      storage.upload.mock.calls.map((call) => String(call[0].key)).filter((key) => !key.startsWith('thumbs/'));
 
     let nowSpy: jest.SpyInstance | undefined;
     afterEach(() => {
@@ -275,9 +308,13 @@ describe('ChatUploadsService.saveOriginals: источник и миниатюр
       expect(originalKeys()).toHaveLength(3);
       expect(storage.upload).toHaveBeenCalledTimes(3); // ни одной миниатюры
       expect(thumbKeysInInsert()).toEqual([null, null, null]);
-      expect(warnText()).toContain('"фото-1.jpg" ("image/jpeg"): busy');
-      expect(warnText()).toContain('"фото-2.jpg" ("image/jpeg"): budget');
-      expect(warnText()).toContain('"фото-3.jpg" ("image/jpeg"): budget');
+      const keys = originalKeys();
+      expect(warnLines()).toEqual([
+        skippedLine(keys[0], 'image/jpeg', 'busy'),
+        skippedLine(keys[1], 'image/jpeg', 'budget'),
+        skippedLine(keys[2], 'image/jpeg', 'budget'),
+      ]);
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('фото');
     });
 
     it('после timeout — так же: остальные файлы вызова без миниатюр', async () => {
@@ -290,8 +327,11 @@ describe('ChatUploadsService.saveOriginals: источник и миниатюр
         expect(make).toHaveBeenCalledTimes(1);
         expect(result.saved).toHaveLength(2);
         expect(thumbKeysInInsert()).toEqual([null, null]);
-        expect(warnText()).toContain('"фото-1.jpg" ("image/jpeg"): timeout');
-        expect(warnText()).toContain('"фото-2.jpg" ("image/jpeg"): budget');
+        const keys = originalKeys();
+        expect(warnLines()).toEqual([
+          skippedLine(keys[0], 'image/jpeg', 'timeout'),
+          skippedLine(keys[1], 'image/jpeg', 'budget'),
+        ]);
       } finally {
         make.mockRestore();
       }
@@ -320,7 +360,7 @@ describe('ChatUploadsService.saveOriginals: источник и миниатюр
       const keys = originalKeys();
       expect(keys).toHaveLength(3);
       expect(thumbKeysInInsert()).toEqual([uploadThumbKey(keys[0]), uploadThumbKey(keys[1]), null]);
-      expect(warnText()).toContain('"фото-3.jpg" ("image/jpeg"): budget');
+      expect(warnLines()).toEqual([skippedLine(keys[2], 'image/jpeg', 'budget')]);
     });
 
     it('бюджет — новый на каждый вызов', async () => {
