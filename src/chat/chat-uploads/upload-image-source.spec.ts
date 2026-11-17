@@ -1,4 +1,5 @@
 import { ChatUploadTooLargeError } from './chat-uploads.service';
+import { isUserSideToolError } from '../../problem-report/problem-classify';
 import {
   ChatUploadSourceError, ChatUploadStorageError, GEMINI_SOURCE_IMAGE_MIMES, VEO_SOURCE_IMAGE_MIMES,
   canonicalChatUploadUrl, chatUploadIdFromUrl, chatUploadSourceId, readChatUploadImage,
@@ -177,5 +178,43 @@ describe('readChatUploadImage', () => {
     const err = await readChatUploadImage(undefined, { url: `/webhook/chat-uploads/${ID}`, userId: 'u-1', ...GEM }).catch((e) => e);
     expect(err).toBeInstanceOf(ChatUploadSourceError);
     expect(err.code).toBe('unavailable');
+  });
+});
+
+/**
+ * Тексты отказов сверены с problem-classify: ошибка пользователя (чужая или
+ * удалённая загрузка, не тот формат, больше предела) в «Поддержку linkeon» не
+ * идёт, а сбой реестра или хранилища и неподключённый сервис — идут. Тексты
+ * берутся из самого readChatUploadImage: поменяли формулировку — тест упадёт,
+ * пока не поправлен классификатор.
+ */
+describe('отказы по загрузке и problem-classify', () => {
+  const url = `/webhook/chat-uploads/${ID}`;
+  const reasonOf = (uploads: any) =>
+    readChatUploadImage(uploads, { url, userId: 'u-1', ...GEM }).then(() => '', (e: Error) => e.message);
+  /** misc отдаёт текст как есть, video — после «фото не принято: » (video.service.ts). */
+  const asTools = (reason: string) => [reason, `фото не принято: ${reason}`];
+
+  it('not_found, not_image и too_large — ошибки пользователя', async () => {
+    const reasons = [
+      await reasonOf(fakeUploads(null)),
+      await reasonOf(fakeUploads({ record: { mime: 'image/gif' }, body: Buffer.from('x') })),
+      await reasonOf({ findOwnedOriginal: jest.fn(async () => { throw new ChatUploadTooLargeError(9 * 1024 * 1024, MB8); }) }),
+      await readChatUploadImage(
+        { findOwnedOriginal: jest.fn(async () => { throw new ChatUploadTooLargeError(13 * 1024 * 1024, 12 * 1024 * 1024); }) },
+        { url, userId: 'u-1', maxBytes: 12 * 1024 * 1024, allowedMimes: VEO_SOURCE_IMAGE_MIMES },
+      ).then(() => '', (e: Error) => e.message),
+    ];
+    for (const r of reasons) expect(r).not.toBe('');
+    for (const msg of reasons.flatMap(asTools)) expect([msg, isUserSideToolError(msg)]).toEqual([msg, true]);
+  });
+
+  it('сбой хранилища и неподключённый сервис — сбой сервиса', async () => {
+    const reasons = [
+      await reasonOf({ findOwnedOriginal: jest.fn(async () => { throw Object.assign(new Error('x'), { name: 'NoSuchKey' }); }) }),
+      await reasonOf(undefined),
+    ];
+    for (const r of reasons) expect(r).not.toBe('');
+    for (const msg of reasons.flatMap(asTools)) expect([msg, isUserSideToolError(msg)]).toEqual([msg, false]);
   });
 });

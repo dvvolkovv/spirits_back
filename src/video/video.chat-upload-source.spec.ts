@@ -6,6 +6,7 @@ import { VideoModule } from './video.module';
 import { ChatUploadsService } from '../chat/chat-uploads/chat-uploads.service';
 import { ChatUploadsModule } from '../chat/chat-uploads/chat-uploads.module';
 import { __setSafeFetchDepsForTests } from '../common/net/safe-fetch';
+import { isUserSideToolError } from '../problem-report/problem-classify';
 
 /**
  * Видео из портрета по загрузке пользователя (spec 2026-11-16-chat-uploads-media-notes).
@@ -108,6 +109,8 @@ describe('Veo: портрет из загрузки пользователя', (
     const err = await svc.createJob('u-2', { ...DTO, sourceImageUrl: `/webhook/chat-uploads/${OWN}` } as any).catch((e) => e);
     expect(err).toBeInstanceOf(BadRequestException);
     expect(err.message).toMatch(/не найдена/);
+    // Ошибка пользователя, не сбой: в «Поддержку linkeon» не идёт (problem-classify).
+    expect(isUserSideToolError(err.message)).toBe(true);
     expect(billed(clientCalls)).toBe(false);
     expect(veo.startGenerate).not.toHaveBeenCalled();
   });
