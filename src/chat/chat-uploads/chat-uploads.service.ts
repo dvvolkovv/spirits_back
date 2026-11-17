@@ -80,6 +80,26 @@ const BUCKET = CHAT_UPLOADS_BUCKET;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Предел комментария к загрузке — тот же, что CHECK chat_uploads_note_len_check (миграция 002) и maxLength в note_file. */
 export const UPLOAD_NOTE_MAX_CHARS = 500;
+/** C0, кроме TAB и LF, плюс DEL и C1. NUL Postgres в text не примет (22021), прочие — мусор в подсказке. */
+const NOTE_CONTROL_RE = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g;
+/**
+ * Bidi-переопределения и изоляты (U+202A–U+202E, U+2066–U+2069) подменяют
+ * видимый порядок символов — та же защита, что в safeFileName. Весь \p{Cf}
+ * не режем: ZWJ (U+200D) склеивает эмодзи.
+ */
+const NOTE_BIDI_RE = /[\u202A-\u202E\u2066-\u2069]/g;
+
+/**
+ * Комментарий к загрузке в том виде, в каком он ляжет в базу: CRLF и CR
+ * сведены к LF (многострочность остаётся — в одну строку его сводит вывод в
+ * блоке загрузок), управляющие и bidi-символы вырезаны, края обрезаны.
+ * Не строка — пустая строка.
+ */
+function sanitizeUploadNote(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  return raw.replace(/\r\n?/g, '\n').replace(NOTE_CONTROL_RE, '').replace(NOTE_BIDI_RE, '').trim();
+}
+
 /**
  * Строка 📎 удалённого файла в истории сессии → «📎 имя — файл удалён».
  * Фильтр — strpos, а не LIKE: в $2 имя экранировано markdownEscapeName
@@ -475,13 +495,16 @@ export class ChatUploadsService {
    * Комментарий ассистента к загрузке (инструмент note_file). Новый текст
    * заменяет прежний целиком; вместе с ним пишутся время и ассистент хода.
    *
+   * Сначала чистка (sanitizeUploadNote: переводы строк, управляющие и
+   * bidi-символы, края), потом подсчёт: сохраняется ровно очищенная строка.
    * Длина — в символах (Array.from), как char_length в CHECK миграции 002:
    * эмодзи в JS — две единицы UTF-16, а в Postgres — один символ.
    * Владелец — условием UPDATE: чужой и несуществующий id неразличимы
-   * (NotFoundException), как в openDownload. Не-UUID и пустой userId
-   * отсекаются до запроса, как в loadOwned: Postgres упал бы на приведении к
-   * uuid, и вместо «не найден» вышла бы 500. loadOwned здесь не подходит —
-   * его отдельный SELECT лишний: владельца проверяет сам UPDATE.
+   * (NotFoundException), как в openDownload. Id не формата UUID отсекается до
+   * запроса: Postgres упал бы на приведении к uuid, и вместо «не найден»
+   * вышла бы 500. Пустой userId — тоже NotFound без запроса, как в loadOwned.
+   * loadOwned здесь не подходит — его отдельный SELECT лишний: владельца
+   * проверяет сам UPDATE.
    */
   async setNote(input: {
     id: string;
@@ -489,7 +512,7 @@ export class ChatUploadsService {
     note: string;
     assistantId: string | null;
   }): Promise<ChatUploadRecord> {
-    const note = typeof input.note === 'string' ? input.note.trim() : '';
+    const note = sanitizeUploadNote(input.note);
     const chars = Array.from(note).length;
     if (chars < 1 || chars > UPLOAD_NOTE_MAX_CHARS) {
       throw new BadRequestException(`Комментарий — от 1 до ${UPLOAD_NOTE_MAX_CHARS} символов`);
