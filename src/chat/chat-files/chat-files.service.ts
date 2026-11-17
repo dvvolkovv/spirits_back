@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { PgService } from '../../common/services/pg.service';
-import { ChatUploadsService, ChatUploadRecord, uploadNoteOneLine } from '../chat-uploads/chat-uploads.service';
+import { ChatUploadsService, ChatUploadRecord } from '../chat-uploads/chat-uploads.service';
+import { uploadNoteOneLine } from '../chat-uploads/upload-note';
 import { uploadKind } from '../chat-uploads/upload-kind';
 import { ChatFileKind, ExtractEnv, ExtractedFile, extractChatFiles } from './extract';
 import {
