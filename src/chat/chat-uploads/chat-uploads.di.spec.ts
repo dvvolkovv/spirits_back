@@ -34,6 +34,9 @@ import { VoiceDocumentAccountDeletionAdapter } from '../../voice-call/voice-docu
 import { ChatFileAccountDeletionAdapter } from '../chat-files/chat-file-account-deletion.adapter';
 import { ChatUploadAccountDeletionAdapter } from './chat-upload-account-deletion.adapter';
 import { ChatUploadsService } from './chat-uploads.service';
+import { ChatService } from '../chat.service';
+import { ChatController } from '../chat.controller';
+import { ChatContextResetService } from '../context-reset/context-reset.service';
 
 jest.setTimeout(120000);
 
@@ -45,6 +48,13 @@ async function buildGraph(root: Type<any>): Promise<NestContainer> {
   const loader = new InstanceLoader(container, new Injector(), graphInspector);
   await loader.createInstancesOfDependencies();
   return container;
+}
+
+// Граф AppModule дорогой — строим один раз на файл.
+let appGraphPromise: Promise<NestContainer> | undefined;
+function appGraph(): Promise<NestContainer> {
+  const { AppModule } = require('../../app.module');
+  return (appGraphPromise ??= buildGraph(AppModule));
 }
 
 function find(container: NestContainer, cls: unknown): unknown {
@@ -76,13 +86,24 @@ describe('DI-граф загрузок чата', () => {
   });
 
   it('AppModule: адаптер chat-upload.purge и сервис загрузок разрешимы в реальном графе', async () => {
-    const { AppModule } = require('../../app.module');
-    const container = await buildGraph(AppModule);
+    const container = await appGraph();
     const adapter = find(container, ChatUploadAccountDeletionAdapter);
     expect(adapter).toBeInstanceOf(ChatUploadAccountDeletionAdapter);
     // Инжектировано именно StorageService, а не undefined/Object-заглушка.
     expect((adapter as { storage: unknown }).storage).toBeInstanceOf(StorageService);
     expect(find(container, ChatUploadsService)).toBeInstanceOf(ChatUploadsService);
+  });
+
+  // Точка «Чистого листа» (spec 2026-11-17-context-reset) у ChatService и
+  // ChatController — @Optional: забытый импорт ContextResetModule старт не
+  // уронит, а молча оставит прод без точки. Один экземпляр на граф — тот же,
+  // что читает ChatService и пишет контроллер.
+  it('AppModule: ChatService и ChatController получают сервис точки «Чистого листа»', async () => {
+    const container = await appGraph();
+    const resets = find(container, ChatContextResetService);
+    expect(resets).toBeInstanceOf(ChatContextResetService);
+    expect((find(container, ChatService) as { contextResets?: unknown }).contextResets).toBe(resets);
+    expect((find(container, ChatController) as { contextResets?: unknown }).contextResets).toBe(resets);
   });
 
   // Негативный контроль: проверка не резиновая — голый модуль с одним

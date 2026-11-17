@@ -1,5 +1,5 @@
 import { Pool } from 'pg';
-import { LEGACY_FRESH_FUTURE_SLACK_MS } from './after-reset';
+import { LEGACY_FRESH_FUTURE_SLACK_MS, LEGACY_FRESH_MIN_MS } from './after-reset';
 import { ChatContextResetService } from './context-reset.service';
 
 const PG = process.env.PROVISIONING_PG_URL;
@@ -76,6 +76,21 @@ maybe('ChatContextResetService (pg)', () => {
 
   it('Invalid Date отвергается понятной ошибкой и не пишется', async () => {
     await expect(svc.reset('u1', '10', new Date('nope'))).rejects.toThrow('invalid context reset time');
+    expect(await svc.get('u1', '10')).toBeNull();
+  });
+
+  it('точка раньше LEGACY_FRESH_MIN_MS отвергается и не пишется — та же граница, что у legacyFreshResetAt', async () => {
+    await expect(svc.reset('u1', '10', new Date(0))).rejects.toThrow('invalid context reset time');
+    await expect(svc.reset('u1', '10', new Date(LEGACY_FRESH_MIN_MS - 1))).rejects.toThrow('invalid context reset time');
+    expect(await svc.get('u1', '10')).toBeNull();
+    const at = await svc.reset('u1', '10', new Date(LEGACY_FRESH_MIN_MS));
+    expect(at.getTime()).toBe(LEGACY_FRESH_MIN_MS);
+  });
+
+  it('таблица не принимает бесконечную точку: из-за GREATEST она стёрла бы память навсегда', async () => {
+    await expect(
+      pool.query(`INSERT INTO chat_context_resets (user_id, assistant_id, reset_at) VALUES ('u1', '10', 'infinity')`),
+    ).rejects.toThrow(/check constraint/);
     expect(await svc.get('u1', '10')).toBeNull();
   });
 });
