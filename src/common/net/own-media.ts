@@ -28,7 +28,8 @@ export function ownBaseUrl(): string {
   return (process.env.BACKEND_URL || process.env.PUBLIC_BASE_URL || DEFAULT_BASE).replace(/\/+$/, '');
 }
 
-function ownOrigins(): Set<string> {
+/** Точные origin своего сайта. Экспорт — для распознавания адресов загрузок (chat-uploads/upload-image-source.ts). */
+export function ownOrigins(): Set<string> {
   const out = new Set<string>();
   for (const raw of [process.env.BACKEND_URL, process.env.PUBLIC_BASE_URL, DEFAULT_BASE]) {
     if (!raw) continue;

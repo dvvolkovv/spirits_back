@@ -78,6 +78,18 @@ export class ChatUploadDeleteError extends Error {
 
 /** Приватный бакет исходников; экспортирован для адаптера удаления аккаунта. */
 export const CHAT_UPLOADS_BUCKET = 'linkeon-chat-uploads';
+
+/**
+ * Исходник больше предела вызывающего (findOwnedOriginal с maxBytes). Размер
+ * сверяется по реестру до скачивания: байты из хранилища не читаются.
+ */
+export class ChatUploadTooLargeError extends Error {
+  constructor(readonly sizeBytes: number, readonly maxBytes: number) {
+    super(`chat upload is larger than ${maxBytes} bytes`);
+    this.name = 'ChatUploadTooLargeError';
+  }
+}
+
 const BUCKET = CHAT_UPLOADS_BUCKET;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Предел комментария к загрузке — тот же, что CHECK chat_uploads_note_len_check (миграция 002) и maxLength в note_file. */
@@ -440,6 +452,37 @@ export class ChatUploadsService {
       [input.id, input.userId],
     );
     return this.row(rows[0]);
+  }
+
+  /**
+   * Байты исходника для инструментов картинок и видео (upload-image-source.ts):
+   * только владельцу. null — нет такой загрузки или она чужая, без различия,
+   * как 404 у GET :id. Владелец — условие SQL, чужая строка не читается.
+   *
+   * maxBytes — предел вызывающего: размер сверяется по реестру ДО скачивания
+   * и ещё раз по фактическим байтам. Превышение — ChatUploadTooLargeError.
+   * Сбой хранилища пробрасывается: вызывающий отличает его от «не найдено».
+   */
+  async findOwnedOriginal(input: {
+    id: string;
+    userId: string;
+    maxBytes?: number;
+  }): Promise<{ record: ChatUploadRecord; body: Buffer } | null> {
+    if (!UUID_RE.test(input.id) || !input.userId) return null;
+    const { rows } = await this.pg.query(
+      `SELECT ${COLUMNS} FROM chat_uploads WHERE id = $1 AND user_id = $2`,
+      [input.id, input.userId],
+    );
+    if (!rows[0]) return null;
+    const record = this.row(rows[0]);
+    if (input.maxBytes !== undefined && record.sizeBytes > input.maxBytes) {
+      throw new ChatUploadTooLargeError(record.sizeBytes, input.maxBytes);
+    }
+    const body = await this.storage.download({ bucket: BUCKET, key: record.storageKey });
+    if (input.maxBytes !== undefined && body.length > input.maxBytes) {
+      throw new ChatUploadTooLargeError(body.length, input.maxBytes);
+    }
+    return { record, body };
   }
 
   async recentForSession(
