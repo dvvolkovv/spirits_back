@@ -352,14 +352,15 @@ export class ChatController {
       // иначе унесём unhandledRejection в уже идущий ответ (ревью I1).
       void savePromise.catch(() => {});
       let budgetTimer: NodeJS.Timeout | undefined;
+      let budgetExceeded = false;
       try {
         const result = await Promise.race([
           savePromise,
           new Promise<never>((_, reject) => {
-            budgetTimer = setTimeout(
-              () => reject(new Error(`save budget ${budgetMs}ms exceeded`)),
-              budgetMs,
-            );
+            budgetTimer = setTimeout(() => {
+              budgetExceeded = true;
+              reject(new Error(`save budget ${budgetMs}ms exceeded`));
+            }, budgetMs);
           }),
         ]);
         savedUploads = result.saved;
@@ -369,8 +370,12 @@ export class ChatController {
         // createBucketIfAbsent при недоступном MinIO — saveOriginals ловит
         // сбои только внутри цикла) и превышение бюджета. Ход не прерывается:
         // текущий ответ продолжается по прежнему relay-пути.
+        // Как в [scan-document]: бюджет — наш собственный текст без данных,
+        // остальное — только вид ошибки (errKind). Ключа сессии в строке нет:
+        // в нём номер телефона, а сообщения MinIO/pg повторяют имя файла.
+        const why = budgetExceeded ? `save budget ${budgetMs}ms exceeded` : errKind(e);
         this.logger.warn(
-          `[upload-and-chat] saveOriginals для ${userId}_${assistantId} не завершилась (${e?.message?.slice(0, 200) || e}), продолжаю без исходников`,
+          `[upload-and-chat] saveOriginals не завершилась (${why}), продолжаю без исходников`,
         );
         savedUploads = [];
         uploadPersistFailed = true;
