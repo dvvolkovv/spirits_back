@@ -474,4 +474,29 @@ maybe('VoiceCallService.complete после удаления аккаунта п
     const billing = (await pool.query(`SELECT user_id, status FROM token_consumption_tasks`)).rows;
     expect(billing).toEqual([{ user_id: USER, status: 'pending' }]);
   });
+
+  // K1b: воркер сбрасывает растущий транскрипт через progress() ~раз в 15 с,
+  // и после voice.stop (status 'interrupted') условие status <> 'completed'
+  // его пропускало — разговор удалённого продолжал дописываться в строку.
+  it('удалённый аккаунт: progress не дописывает транскрипт и участников', async () => {
+    const id = await seed('deleted', 'interrupted');
+    const { svc } = makeSvc();
+
+    await svc.progress(id, payload.transcript, payload.participants);
+
+    const row = await callRow(id);
+    expect(row.transcript).toEqual(STAGED);
+    expect(row.participants).toBeNull();
+  });
+
+  it('активный аккаунт: progress стейджит транскрипт и участников как раньше', async () => {
+    const id = await seed('active', 'active');
+    const { svc } = makeSvc();
+
+    await svc.progress(id, payload.transcript, payload.participants);
+
+    const row = await callRow(id);
+    expect(row.transcript).toEqual(payload.transcript);
+    expect(row.participants).toEqual([{ name: 'Участник Синтетический', joinedAt: 1 }]);
+  });
 });
