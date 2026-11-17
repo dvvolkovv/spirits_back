@@ -342,7 +342,7 @@ describe('ChatService: момент хода для задач', () => {
     await settle();
 
     expect(tasks.extractFromTurn).toHaveBeenCalledTimes(1);
-    const turnAt = tasks.extractFromTurn.mock.calls[0][4];
+    const turnAt: Date = (tasks.extractFromTurn.mock.calls[0] as any[])[4];
     expect(turnAt).toBeInstanceOf(Date);
     expect(turnAt.getTime()).toBeLessThanOrEqual(relay.firstPostAt);
   });
@@ -361,7 +361,7 @@ describe('ChatService: момент хода для задач', () => {
     await svc.streamChat('u1', 'вопрос до точки', '12', 'u1_12', '', makeRes());
     await settle();
 
-    const turnAt: Date = tasks.extractFromTurn.mock.calls[0][4];
+    const turnAt: Date = (tasks.extractFromTurn.mock.calls[0] as any[])[4];
     expect(resetAt).not.toBeNull();
     // Задача хода до точки записана временем хода — значит, за черту не протечёт.
     expect(turnAt.getTime()).toBeLessThan(resetAt!.getTime());
@@ -394,7 +394,7 @@ describe('ChatService: момент хода для задач', () => {
     await settle();
 
     expect(tasks.extractFromTurn).toHaveBeenCalledTimes(1);
-    const turnAt = tasks.extractFromTurn.mock.calls[0][4];
+    const turnAt: Date = (tasks.extractFromTurn.mock.calls[0] as any[])[4];
     expect(turnAt).toBeInstanceOf(Date);
     expect(turnAt.getTime()).toBeLessThanOrEqual(cli.calledAt);
   });

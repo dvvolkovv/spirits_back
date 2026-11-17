@@ -516,7 +516,7 @@ describe('uploadAndChat: исходник сохраняется до релея
     // Без сервиса точки в этом харнесе ключ релея прежний — главное, что не fresh.
     const fields = fieldsOf((post.mock.calls[0] as any[])[1]);
     expect(fields.sessionId).toBe('u1_12_ru');
-    expect(chatUploads.saveOriginals.mock.calls[0][0].sessionId).toBe('u1_12');
+    expect((chatUploads.saveOriginals.mock.calls[0] as any[])[0].sessionId).toBe('u1_12');
     expect(persist).toHaveBeenCalledTimes(1);
     expect(persist.mock.calls[0][0]).not.toHaveProperty('sessionIdOverride');
     const historyInserts = pg.calls.filter((c) => /INSERT INTO custom_chat_history/.test(c.sql));
