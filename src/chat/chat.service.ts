@@ -2394,15 +2394,35 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // авария. В chat_quality рядом с fail_reason relay_draining/relay_superseded.
     let relayRefusal: string | undefined;
 
+    // Видимый текст модели — то, что человек мог прочесть: без пробельных
+    // кусков и утёкшего синтаксиса инструментов (stripLeakedToolSyntax заодно
+    // обрезает пробелы). Релей шлёт и пустые text_delta («\n\n»), после них
+    // считает, что текст пошёл, и при обрыве отдаёт transient_after_partial —
+    // а человек не увидел ни слова.
+    const visibleModelText = (): string => this.stripLeakedToolSyntax(modelText);
+
     // Решение о списании — одно на ход (partial-billing.ts): его читают и
     // индикатор «N токенов» в `end`, и persistResponse; разойдись они — человек
     // увидел бы одно, а списалось бы другое. Зовётся по итогам потока, когда
     // turnFailed, текст модели и файлы хода уже известны. Текст — из chunks, а
     // не fullText persistResponse: тот подменяет отказ CLI заглушкой, а
     // turnBilling узнаёт отказ именно по исходному тексту.
+    //
+    // Известное расхождение: поток упал уже ПОСЛЕ done и ушёл в главный catch —
+    // клиент видит в `end` 0, а persistResponse спишет оборванный ход (partial).
+    // Тот же класс, что у успешного хода, упавшего после done (там в `end` тоже
+    // 0, а списание — за весь ход); в коде не чиним.
     const decideBilling = (): BillingDecision => this.turnBilling(
       this.stripLeakedToolSyntax(chunks.join('').trim()),
-      { failed: turnFailed, failReason, modelChars: modelText.length, files: pendingFiles.length },
+      { failed: turnFailed, failReason, modelChars: visibleModelText().length, files: pendingFiles.length },
+    );
+
+    // Расход хода — одним выражением для индикатора и для списания, чтобы они
+    // не разошлись при следующей правке. У оборванного хода длина для
+    // запасного пути — видимый текст модели, без служебной реплики релея и
+    // дописок бэка; у обычного — текст, переданный вызывающим.
+    const turnCharge = (billing: BillingDecision, text: string): SdkCharge => this.computeSdkCharge(
+      agentUsage, agentCostUsd, billing.partial ? visibleModelText() : text, agentTurnCost.usd,
     );
 
     // Single persistence point — dedupe via `saved` flag so success and error paths
@@ -2425,14 +2445,22 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // дословно и тем более за него заплатить: в истории 70005550003 лежат
       // «You've hit your session limit · resets 11:50am (UTC)» и «Not logged in ·
       // Please run /login», выданные как реплики ассистента и стоившие токенов.
+      //
+      // cliRefusal — для метки журнала: отказ, узнанный по тексту, —
+      // cli_fatal_text, какую бы причину ни прислал релей (turnBilling решает
+      // так же). failReason для chat_quality остаётся релейным.
+      let cliRefusal = false;
       if (this.looksCliFailure(fullText)) {
         this.logger.error(`CLI-отказ долетел до бэкенда как ответ (${userId}_${assistantId}): ${fullText.slice(0, 120)}`);
         turnFailed = true;
         failReason = failReason || 'cli_fatal_text';
+        cliRefusal = true;
         fullText = chatFailureText('cliFatal', userLanguage, { storeBuild });
       }
       // Решение о списании — то же, что ушло в индикатор `end` (decideBilling
       // выше): отказ CLI оно узнаёт само, по исходному тексту из chunks.
+      // Исключение — поток, упавший после done (см. у decideBilling): там в
+      // `end` ушёл 0, а здесь оборванный ход спишется.
       const billing = decideBilling();
       if (final) {
         // Quality-телеметрия: пустой ответ / англ-утечка / объём — для агрегатов
@@ -2482,11 +2510,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
       if (!aiText) return; // skip empty intermediate persists
       // ЭТО реальная точка списания (ниже addTokenTask). Логируем только здесь:
       // путь показа считает то же самое, дублировать в лог незачем.
-      // У оборванного хода длина для запасного пути — текст модели, без
-      // служебной реплики релея и дописок бэка (partial-billing.ts).
-      const charge = this.computeSdkCharge(
-        agentUsage, agentCostUsd, billing.partial ? modelText : fullText, agentTurnCost.usd,
-      );
+      // Расход — turnCharge, как у индикатора (оборванный ход — по видимому
+      // тексту модели). Текст обычного хода здесь — очищенный fullText, у
+      // индикатора — сырой chunks.join(''): давнее различие, оставлено как есть.
+      const charge = turnCharge(billing, fullText);
       // Решение владельца 17.11.2026: оборванный ход, после которого человек
       // что-то получил, списывается по фактическому расходу — billing[partial:…].
       // Сбой без ответа не выставляется. Расход перед Anthropic всё равно
@@ -2494,7 +2521,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // невидимой статьёй затрат.
       const textCost = billing.billable ? charge.tokens : 0;
       const logLine = !billing.billable
-        ? `billing[skipped:${failReason}]: ход без финального ответа — не тарифицирован, ` +
+        ? `billing[skipped:${cliRefusal ? 'cli_fatal_text' : failReason}]: ход без финального ответа — не тарифицирован, ` +
           `иначе списали бы ${charge.tokens} (${charge.note})`
         : billing.partial
           ? `billing[partial:${billing.partial}:${charge.source}]: tokens=${textCost} ${charge.note}`
@@ -2540,7 +2567,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // успел что-то получить (billing.billable, partial-billing.ts).
           // Обучение профиля и разбор задач идут в любом случае: оборванный ход
           // всё равно был настоящим разговором, и терять из него контекст незачем.
-          if (billing.billable) {
+          //
+          // Оборванный ход с нулевым расходом (одни файлы, а в done ни usage, ни
+          // стоимости) строку не пишет: планировщик (TokenAccountingService)
+          // поднял бы 0 до минимума в 1 токен, а индикатор и история показали 0.
+          // Обычный ход — как раньше.
+          if (billing.billable && (textCost > 0 || !billing.partial)) {
             const turnCostUsd = agentTurnCost.usd;
             await this.addTokenTask(userId, 0, textCost, agentId, {
               costUsd: Number(agentCostUsd.toFixed(4)),
@@ -3081,14 +3113,14 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Fallback нужен, если релей ещё старой сборки и costUsd не шлёт —
       // иначе ход стал бы бесплатным.
       // Картинки/видео списываются MCP-сервисами отдельно (см. toolSpent ниже).
-      // Число для индикатора «X токенов». Считается тем же методом и по тому же
-      // решению о списании (decideBilling), что и реальное списание в
-      // persistResponse, — иначе юзер увидит одно, а спишется другое. Сбой, за
-      // который не списали, — 0; оборванный ход — по тексту модели.
+      // Число для индикатора «X токенов». Считается тем же методом (turnCharge) и
+      // по тому же решению о списании (decideBilling), что и реальное списание
+      // в persistResponse, — иначе юзер увидит одно, а спишется другое. Сбой, за
+      // который не списали, — 0; оборванный ход — по видимому тексту модели.
+      // Текст обычного хода здесь — сырой chunks.join(''), в persistResponse —
+      // очищенный fullText: давнее различие, оставлено как есть.
       const billing = decideBilling();
-      const tokensUsed = billing.billable
-        ? this.computeSdkCharge(agentUsage, agentCostUsd, billing.partial ? modelText : fullText, agentTurnCost.usd).tokens
-        : 0;
+      const tokensUsed = billing.billable ? turnCharge(billing, fullText).tokens : 0;
 
       // Sum up tool-charged tokens (image, video, etc.) during this stream.
       // MCP-tools (MiscService.generateImage, VideoService.createJob,
@@ -3221,8 +3253,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
         selfHealSkippedForTakeover = true;
         safeWrite({ type: 'end', content: '', reason: 'superseded', usage: { input: 0, output: 0, total: 0 } });
       } else if (err instanceof RelayDrainingError) {
-        // Релей обновлялся дольше бюджета повтора. Токены не списаны —
-        // turnFailed, а заглушка не в fullText.
+        // Релей обновлялся дольше бюджета повтора. Токены не списаны: причина
+        // relay_draining — вне PARTIAL_BILLED_REASONS (partial-billing.ts), а
+        // заглушка не в fullText.
         turnFailed = true;
         failReason = 'relay_draining';
         failureStub = chatFailureText('relayUpdating', userLanguage, { storeBuild });
