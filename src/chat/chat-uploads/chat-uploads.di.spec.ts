@@ -38,6 +38,8 @@ import { ChatService } from '../chat.service';
 import { ChatController } from '../chat.controller';
 import { ChatContextResetService } from '../context-reset/context-reset.service';
 import { ActionPlansService } from '../action-plans/action-plans.service';
+import { VoiceCallService } from '../../voice-call/voice-call.service';
+import { ContextService } from '../../context/context.service';
 
 jest.setTimeout(120000);
 
@@ -132,5 +134,16 @@ describe('«Чистый лист»: один сервис точки у ChatSer
     const resets = find(container, ChatContextResetService);
     expect(resets).toBeInstanceOf(ChatContextResetService);
     expect((find(container, ActionPlansService) as { contextResets?: unknown }).contextResets).toBe(resets);
+  });
+
+  // Голос Романа и сборщик контекста («Из переписки») читают основную ленту —
+  // сервис точки у обоих @Optional, и забытая проводка молча вернула бы
+  // старый разговор в звонок.
+  it('AppModule: VoiceCallService и ContextService получают тот же ChatContextResetService', async () => {
+    const container = await appGraph();
+    const resets = find(container, ChatContextResetService);
+    expect(resets).toBeInstanceOf(ChatContextResetService);
+    expect((find(container, VoiceCallService) as { contextResets?: unknown }).contextResets).toBe(resets);
+    expect((find(container, ContextService) as { contextResets?: unknown }).contextResets).toBe(resets);
   });
 });
