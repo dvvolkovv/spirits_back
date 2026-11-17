@@ -11,13 +11,22 @@
 -- читается — строку берём из .env живого чекаута (последняя DATABASE_URL=):
 --   U=$(sed -n -E 's/^[[:space:]]*(export[[:space:]]+)?DATABASE_URL[[:space:]]*=[[:space:]]*//p' ~/spirits_back/.env | tail -n 1 | sed -E -e 's/[[:space:]]+$//' -e 's/^"(.*)"$/\1/' -e "s/^'(.*)'\$/\1/")
 --
--- Порядок (из ~/spirits_back на сервере):
--- 1. Предварительный прогон — всё то же, но в конце ROLLBACK: ничего не
---    меняет, печатает счётчики. Сначала на test.linkeon.io, затем на проде —
---    счётчики прода показать владельцу до OK:
---      sed 's/^COMMIT;$/ROLLBACK;/' scripts/oneoff/2026-11-17-merge-fresh-sessions.sql | psql "$U" -v ON_ERROR_STOP=1
--- 2. С OK владельца, сразу после прод-фазы deploy.sh:
---      psql "$U" -v ON_ERROR_STOP=1 -f scripts/oneoff/2026-11-17-merge-fresh-sessions.sql
+-- Порядок (команды — из ~/spirits_back на сервере). Пробный прогон на проде
+-- до выката невозможен: таблицу chat_context_resets создаёт стартовая
+-- миграция нового бэка, да и этого файла в прод-чекауте до выката нет.
+-- (а) После TEST-фазы deploy.sh — пробный прогон на test.linkeon.io: всё то
+--     же, но в конце ROLLBACK; ничего не меняет, печатает счётчики:
+--       sed 's/^COMMIT;$/ROLLBACK;/' scripts/oneoff/2026-11-17-merge-fresh-sessions.sql | psql "$U" -v ON_ERROR_STOP=1
+-- (б) До deploy.sh — подсчёт листов людей на проде, только чтение (сессия
+--     read-only: запись база отвергнет); таблица точек ему не нужна. Список
+--     тестовых аккаунтов — копия того, что в скрипте ниже. Нет таблицы
+--     chat_uploads — убрать её звено из UNION.
+--       PGOPTIONS='-c default_transaction_read_only=on' psql "$U" -c "SELECT t AS таблица, count(*) AS строк, count(DISTINCT s) AS листов, count(DISTINCT s) FILTER (WHERE at >= now() - interval '24 hours') AS листов_за_сутки FROM (SELECT 'история' t, session_id s, created_at at FROM custom_chat_history UNION ALL SELECT 'загрузки', session_id, created_at FROM chat_uploads UNION ALL SELECT 'планы', session_id, updated_at FROM action_plans) x WHERE s ~ '^[^_]+_([0-9]{1,12}|custom:[0-9a-f-]{36})_fresh_[0-9]+$' AND split_part(s, '_', 1) NOT IN ('70000000000', '79030169187', '79169403771', '79656445804') AND NOT split_part(s, '_', 1) ~ '^790300[0-9]{5}$' GROUP BY 1 ORDER BY 1"
+--     «листов_за_сутки» у истории — верхняя оценка числа точек. По (а) и (б) —
+--     OK владельца.
+-- (в) Сразу после прод-фазы deploy.sh — пробный прогон на проде (команда из
+--     (а)); если цифры в пределах ожидаемого по (б) — перенос:
+--       psql "$U" -v ON_ERROR_STOP=1 -f scripts/oneoff/2026-11-17-merge-fresh-sessions.sql
 --
 -- Одна транзакция: упадёт любой шаг — не изменится ничего (и карты не будет).
 -- Повторный запуск ничего не меняет и ничего не дублирует. Если живой
@@ -32,6 +41,9 @@
 --   oneoff_20261117_resets_audit — (user_id, assistant_id, old_reset_at,
 --     new_reset_at): по паре, которой скрипт поставил или сдвинул точку
 --     (old_reset_at NULL — точки не было).
+-- Перед повторным переносом после отката — DROP TABLE oneoff_20261117_resets_audit:
+-- иначе аудит хранит old_reset_at и new_reset_at первого прогона (ON CONFLICT
+-- DO NOTHING), и второй откат по нему вернёт не то.
 -- Обе таблицы удалить через 7 дней после успешного выката (в аудите user_id):
 --   psql "$U" -c 'DROP TABLE oneoff_20261117_fresh_map, oneoff_20261117_resets_audit'
 --
@@ -189,7 +201,10 @@ ANALYZE in_mode;
 -- В аудит — только пары, где точка действительно поставлена или сдвинута;
 -- GREATEST сохраняет точку новее (например, поставленную после выката старой
 -- вкладкой). Если её сдвинут между снимком и записью, new_reset_at в аудите не
--- совпадёт с текущей, и откат её не тронет.
+-- совпадёт с текущей, и откат её не тронет. Обратная гонка: живая точка меньше
+-- new_reset_at, зафиксированная в те же миллисекунды (после снимка, до записи),
+-- — GREATEST её перекроет, а откат вернёт значение до неё или удалит точку.
+-- Редкость, принимаем.
 WITH targets AS (
   SELECT user_id, assistant_id, reset_at
     FROM in_mode
