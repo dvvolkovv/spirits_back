@@ -118,7 +118,7 @@ describe('DI-граф загрузок чата', () => {
  * с проверкой загрузок выше (appGraph), второй раз не строится. Пины
  * метаданных — в chat.controller.context-reset.spec.ts.
  */
-describe('«Чистый лист»: один сервис точки у ChatService и ChatController', () => {
+describe('«Чистый лист»: один сервис точки у всех потребителей', () => {
   it('AppModule: оба получают один и тот же ChatContextResetService', async () => {
     const container = await appGraph();
     const resets = find(container, ChatContextResetService);

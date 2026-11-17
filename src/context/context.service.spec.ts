@@ -188,14 +188,14 @@ describe('ContextService: подхват недавнего разговора',
     new ContextService({ query: jest.fn().mockResolvedValue(callRows(minutesAgo, transcript)) } as any);
 
   it('⚠️ ГЛАВНОЕ: берётся хвост разговора дословно, а не пересказ', async () => {
-    const text = await (svcWithCall(1) as any).sectionContinuation('u1', 1200);
+    const text = await (svcWithCall(1) as any).sectionContinuation('u1', 12, 1200);
 
     expect(text).toContain('Празднуем так, наверное, последний раз');
     expect(text).toContain('минуту назад');
   });
 
   it('давний разговор подхватом не считается — для него есть карточка в переписке', async () => {
-    expect(await (svcWithCall(180) as any).sectionContinuation('u1', 1200)).toBe('');
+    expect(await (svcWithCall(180) as any).sectionContinuation('u1', 12, 1200)).toBe('');
   });
 
   it('при нехватке бюджета отрезается НАЧАЛО разговора, а конец остаётся', async () => {
@@ -204,7 +204,7 @@ describe('ContextService: подхват недавнего разговора',
       { role: 'assistant', text: 'вторая ' + 'х'.repeat(400), ts: 2 },
       { role: 'user', text: 'ПОСЛЕДНЯЯ РЕПЛИКА', ts: 3 },
     ];
-    const text = await (svcWithCall(2, long) as any).sectionContinuation('u1', 500);
+    const text = await (svcWithCall(2, long) as any).sectionContinuation('u1', 12, 500);
 
     expect(text).toContain('ПОСЛЕДНЯЯ РЕПЛИКА');
     expect(text).not.toContain('ПЕРВАЯ РЕПЛИКА');
@@ -212,7 +212,7 @@ describe('ContextService: подхват недавнего разговора',
   });
 
   it('звонок без реплик подхватывать нечего', async () => {
-    expect(await (svcWithCall(1, []) as any).sectionContinuation('u1', 1200)).toBe('');
+    expect(await (svcWithCall(1, []) as any).sectionContinuation('u1', 12, 1200)).toBe('');
   });
 
   it('подхват стоит выше переписки и не вытесняется ею', async () => {

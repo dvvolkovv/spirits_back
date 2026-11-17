@@ -57,14 +57,16 @@ describe('голос Романа: преамбула после точки «Ч
     const d = makeDeps(ROWS());
     const get = jest.fn(async () => RESET);
 
-    const p = await legacySvc(d, resetsWith(get)).buildPreamble('u1');
+    const p = await legacySvc(d, resetsWith(get)).buildPreamble('u1', 7);
 
     expect(p).toContain('ПРОФИЛЬ: основатель голосового сервиса');
     expect(p).toContain('НОВОЕ');
     expect(p).toContain('ОТВЕТ-НОВЫЙ');
     expect(p).not.toContain('СТАРОЕ');
     expect(p).not.toContain('ОТВЕТ-СТАРЫЙ');
-    expect(get).toHaveBeenCalledWith('u1', '12');
+    // Пара — с переданным ассистентом, а не с умолчанием (12).
+    expect(get).toHaveBeenCalledWith('u1', '7');
+    expect(get).not.toHaveBeenCalledWith('u1', '12');
   });
 
   it('created_at выбирается из базы — без него точка отбросила бы всё', async () => {
@@ -150,6 +152,19 @@ describe('голос Романа: задачи из звонка датирую
     expect((turnAt as Date).getTime()).toBe(startedAt.getTime());
     // Не момент сохранения.
     expect((turnAt as Date).getTime()).toBeLessThan(before);
+  });
+
+  it('начала звонка нет (started_at: null) — пятый аргумент undefined, момент решает TasksService', async () => {
+    const d = makeDeps([], null as any);
+    const svc = legacySvc(d);
+
+    await svc.complete('call-1', { transcript: talk, usage });
+    await new Promise((r) => setImmediate(r));
+
+    expect(d.chat.consolidateAfterChatPublic).toHaveBeenCalledTimes(1);
+    const args = d.chat.consolidateAfterChatPublic.mock.calls[0] as any[];
+    expect(args).toHaveLength(5);
+    expect(args[4]).toBeUndefined();
   });
 
   it('начало звонка строкой (как бывает у драйвера) — тоже Date', async () => {
