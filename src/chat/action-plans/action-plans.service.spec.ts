@@ -24,7 +24,12 @@ describe('ActionPlansService', () => {
     items: [], created_at: '2026-10-30T10:00:00Z', updated_at: '2026-10-30T10:00:00Z',
   };
 
-  function setup(raw = '{"title":"Новый план","summary":"Кратко","items":["Первый шаг","Второй шаг"]}') {
+  // resets — сервис точки «Чистого листа», как его отдаёт DI; без него — как
+  // в графе без ContextResetModule (@Optional).
+  function setup(
+    resets?: { get: jest.Mock },
+    raw = '{"title":"Новый план","summary":"Кратко","items":["Первый шаг","Второй шаг"]}',
+  ) {
     const pg = { query: jest.fn() };
     const chat = {
       getChatHistory: jest.fn().mockResolvedValue({ messages: [
@@ -37,7 +42,7 @@ describe('ActionPlansService', () => {
       if (sql.includes('FROM action_plans')) return { rows: [] };
       return { rows: [row] };
     });
-    return { service: new ActionPlansService(pg as any, chat as any), pg, chat };
+    return { service: new ActionPlansService(pg as any, chat as any, resets as any), pg, chat };
   }
 
   it('generates in an isolated session without writing to chat history', async () => {
@@ -58,12 +63,14 @@ describe('ActionPlansService', () => {
     { type: 'assistant', content: 'НОВЫЙ ответ', timestamp: '2026-11-17T09:00:01Z' },
   ] };
 
+  const resetsAt = (iso: string) => ({ get: jest.fn(async () => new Date(iso)) });
+
   it('строит план по сообщениям после точки «Чистого листа»', async () => {
-    const { service, chat } = setup();
+    const resets = resetsAt('2026-11-17T00:00:00Z');
+    const { service, chat } = setup(resets);
     chat.getChatHistory.mockResolvedValue(beforeAndAfterReset);
-    (service as any).contextResets = { get: jest.fn(async () => new Date('2026-11-17T00:00:00Z')) };
     await service.generate('u1', '10');
-    expect((service as any).contextResets.get).toHaveBeenCalledWith('u1', '10');
+    expect(resets.get).toHaveBeenCalledWith('u1', '10');
     // История — основной ленты, без подмены сессии.
     expect(chat.getChatHistory).toHaveBeenCalledWith('u1', '10', 30, 0);
     const prompt = chat.generateAgentReply.mock.calls[0][2];
@@ -73,9 +80,8 @@ describe('ActionPlansService', () => {
   });
 
   it('после точки разговора ещё нет — 400, как при пустой истории, и модель не зовётся', async () => {
-    const { service, chat, pg } = setup();
+    const { service, chat, pg } = setup(resetsAt('2026-11-17T12:00:00Z'));
     chat.getChatHistory.mockResolvedValue(beforeAndAfterReset);
-    (service as any).contextResets = { get: jest.fn(async () => new Date('2026-11-17T12:00:00Z')) };
     const error = await service.generate('u1', '10').catch((e) => e);
     expect(error).toBeInstanceOf(BadRequestException);
     expect(error.message).toBe('not enough conversation for an action plan');
@@ -83,14 +89,30 @@ describe('ActionPlansService', () => {
     expect(pg.query).not.toHaveBeenCalledWith(expect.stringContaining('INSERT INTO action_plans'), expect.anything());
   });
 
-  it('сбой чтения точки — план строится по всей выборке, а не падает', async () => {
-    const { service, chat } = setup();
+  it('после точки только вопрос, ответа ассистента ещё нет — 400, и модель не зовётся', async () => {
+    const { service, chat, pg } = setup(resetsAt('2026-11-17T00:00:00Z'));
+    chat.getChatHistory.mockResolvedValue({ hasMore: false, messages: [
+      ...beforeAndAfterReset.messages.slice(0, 3),
+    ] });
+    const error = await service.generate('u1', '10').catch((e) => e);
+    expect(error).toBeInstanceOf(BadRequestException);
+    expect(error.message).toBe('not enough conversation for an action plan');
+    expect(chat.generateAgentReply).not.toHaveBeenCalled();
+    expect(pg.query).not.toHaveBeenCalledWith(expect.stringContaining('INSERT INTO action_plans'), expect.anything());
+  });
+
+  it('сбой чтения точки — план строится по всей выборке, а не падает; в журнале пара без разговора', async () => {
+    const { service, chat } = setup({ get: jest.fn(async () => { throw new Error('db down'); }) });
+    const warn = jest.spyOn((service as any).logger, 'warn').mockImplementation(() => undefined);
     chat.getChatHistory.mockResolvedValue(beforeAndAfterReset);
-    (service as any).contextResets = { get: jest.fn(async () => { throw new Error('db down'); }) };
     await expect(service.generate('u1', '10')).resolves.toBeDefined();
     const prompt = chat.generateAgentReply.mock.calls[0][2];
     expect(prompt).toContain('СТАРЫЙ вопрос');
     expect(prompt).toContain('НОВЫЙ вопрос');
+    expect(warn).toHaveBeenCalledTimes(1);
+    const line = String(warn.mock.calls[0][0]);
+    expect(line).toContain('u1_10');
+    expect(line).not.toMatch(/СТАРЫЙ|НОВЫЙ/);
   });
 
   it('хранит план по основной ленте', async () => {

@@ -93,6 +93,8 @@ describe('ChatController: «Чистый лист» как точка', () => {
     // resolveAgent сверяет префикс startsWith('custom:') с учётом регистра:
     // CUSTOM: — уже не пользовательский ассистент, точка легла бы не на ту пару.
     ['CUSTOM: заглавными', 'CUSTOM:3f2b8c1e-9d4a-4e6b-8a7c-1b2d3e4f5a6b'],
+    // uuid из Postgres строчный — так его и шлёт фронт; заглавный hex — не та пара.
+    ['custom: с заглавным hex', 'custom:3F2B8C1E-9D4A-4E6B-8A7C-1B2D3E4F5A6B'],
   ])('reset-context: %s — 400, точка не пишется', async (_label, assistantId) => {
     const { ctrl, resets } = makeCtrl();
     const r = res();
