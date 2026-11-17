@@ -138,6 +138,25 @@ describe('scan-document: PDF Маши сохраняется в загрузки
     expect(warnText(logger)).toMatch(/save budget 30ms exceeded/);
   });
 
+  it('ответ уходит до конца сохранения, обработчик ждёт сохранение после ответа', async () => {
+    let finishSave!: () => void;
+    const uploads = { saveOriginals: jest.fn(() => new Promise<any>((r) => { finishSave = () => r({ saved: [], failed: [] }); })) };
+    const { ctrl } = makeController(uploads);
+    const res = makeRes();
+    let responded!: () => void;
+    const respondedP = new Promise<void>((r) => { responded = r; });
+    res.json = jest.fn((p: unknown) => { res.payload = p; responded(); return res; });
+    let settled = false;
+    const done = ctrl.scanDocument({ userId: 'u-1' }, makeReq(), res).then(() => { settled = true; });
+    await respondedP;
+    expect(res.payload).toEqual({ output: PROFILE });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(settled).toBe(false);
+    finishSave();
+    await done;
+    expect(settled).toBe(true);
+  });
+
   it('разбор упал — 500, а PDF всё равно сохранён', async () => {
     jest.spyOn(console, 'error').mockImplementation(() => {});
     (query as unknown as jest.Mock).mockImplementation(() => { throw new Error('sdk down'); });
