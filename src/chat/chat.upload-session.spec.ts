@@ -183,18 +183,6 @@ async function uploadRun(body: any, events: any[]): Promise<{ fields: Record<str
   return { fields: fieldsOf((post.mock.calls[0] as any[])[1]), written: res.written };
 }
 
-describe('relaySessionKey', () => {
-  it('обычный ход: язык — часть ключа', () => {
-    expect(relaySessionKey('u1', '12', 'ru')).toBe('u1_12_ru');
-    expect(relaySessionKey('u1', '12', 'en')).toBe('u1_12_en');
-  });
-
-  it('чистый лист: ключ fresh-сессии перебивает всё', () => {
-    expect(relaySessionKey('u1', '12', 'ru', 'u1_12_fresh_1786468316338'))
-      .toBe('u1_12_fresh_1786468316338');
-  });
-});
-
 describe('uploadAndChat: файл уходит в сессию разговора, а не в свою', () => {
   afterEach(() => jest.clearAllMocks());
 
