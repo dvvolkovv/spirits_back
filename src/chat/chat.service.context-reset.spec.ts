@@ -122,10 +122,12 @@ function makeTasks() {
 }
 
 function makeRes() {
+  const written: any[] = [];
   return {
+    written,
     status: jest.fn().mockReturnThis(),
     setHeader: jest.fn(),
-    write: jest.fn(() => true),
+    write: jest.fn((s: string) => { try { written.push(JSON.parse(s)); } catch {} return true; }),
     end: jest.fn(),
     json: jest.fn().mockReturnThis(),
   } as any;
@@ -367,6 +369,110 @@ describe('ChatService: момент хода для задач', () => {
     await settle();
 
     expect(tasks.buildContextForPrompt).toHaveBeenCalledWith('u1', expect.any(String), { since: R });
+  });
+
+  it('Маша: хвост в промпте модели — только после точки', async () => {
+    // У Маши нет релея и его сессии — память целиком из хвоста, который мы
+    // сами клеим в промпт CLI. Значит, и отсекать его надо здесь.
+    const { svc, cli } = masha();
+    (svc as any).contextResets = resets(R);
+    await svc.streamChat('u1', 'Мне тревожно перед встречей', '3', 'u1_3', '', makeRes());
+    await settle();
+
+    const prompt: string = cli.textWithCost.mock.calls[0][0];
+    expect(prompt).toContain('НОВЫЙ вопрос');
+    expect(prompt).not.toContain('СТАРЫЙ');
+  });
+});
+
+/**
+ * Пинг мониторинга (probe + fresh, только тестовые аккаунты) — единственный,
+ * у кого остался изолированный путь: одноразовая сессия на каждый пинг. Точка
+ * ему не нужна и не должна его трогать.
+ */
+describe('ChatService: пинг мониторинга и точка', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  it('fresh-сессия пинга: точку не читаем, ключ релея — fresh-id, хвост не режем', async () => {
+    const svc = makeService();
+    const r = resets(R);
+    (svc as any).contextResets = r;
+    const relay = mockRelay();
+    const pingSession = 'u1_12_fresh_1786468316338';
+    await svc.streamChat(
+      'u1', 'ответь одним словом ок', '12', pingSession, '', makeRes(),
+      // req, fresh, requestLang, clientTz, storeBuild, probe
+      undefined, true, undefined, undefined, false, true,
+    );
+    await settle();
+
+    expect(r.get).not.toHaveBeenCalled();
+    const fields = fieldsOf(relay.post.mock.calls[0][1]);
+    expect(fields.sessionId).toBe(pingSession);
+    // Фикстура отдаёт одни и те же строки на любую сессию: фильтра по точке
+    // здесь нет, поэтому старая строка доходит.
+    expect(fields.history).toContain('СТАРЫЙ вопрос');
+  });
+});
+
+/**
+ * Автоприветствие вкладки, открытой до 13.11 (legacy-greeting.ts): отвечаем
+ * без модели только в ПУСТОЙ сессии. После точки «пустая» — значит пустая для
+ * ассистента: старая вкладка при «Чистом листе» шлёт приветствие сама, и
+ * платить за него человеку не за что.
+ */
+describe('ChatService: автоприветствие старой вкладки после точки', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  it('все строки ленты до точки — приветствие отвечается без модели', async () => {
+    const svc = makeService();
+    // Точка позже всех строк фикстуры (последняя — 2026-11-17T09:00:02Z).
+    (svc as any).contextResets = resets(new Date('2026-11-17T10:00:00Z'));
+    const relay = mockRelay();
+    const res = makeRes();
+    await svc.streamChat('u1', 'Привет! Расскажи про себя!', '12', 'u1_12', '', res);
+    await settle();
+
+    expect(relay.post).not.toHaveBeenCalled();
+    const end = res.written.find((w: any) => w.type === 'end');
+    expect(end.content).toBe('Здравствуйте! Чем могу помочь?');
+    expect(end.usage).toEqual({ input: 0, output: 0, total: 0 });
+  });
+});
+
+/**
+ * Дедуп отправки (inflight, окно DEDUP_COOLDOWN_MS = 12 с) гасит повтор того
+ * же вопроса. Но повтор после «Чистого листа» — не дубль: человек нажал
+ * кнопку и спросил то же самое заново, уже без старого контекста.
+ */
+describe('ChatService: дедуп и точка', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  async function twice(firstAt: Date | null, secondAt: Date | null) {
+    const svc = makeService();
+    const r = { get: jest.fn(async () => firstAt) };
+    (svc as any).contextResets = r;
+    const relay = mockRelay();
+    await svc.streamChat('u1', 'тот же вопрос', '12', 'u1_12', '', makeRes());
+    await settle();
+    r.get.mockImplementation(async () => secondAt);
+    const res = makeRes();
+    await svc.streamChat('u1', 'тот же вопрос', '12', 'u1_12', '', res);
+    await settle();
+    return { relay, res };
+  }
+
+  it('контроль: та же точка — повтор в окне отбивается как дубль', async () => {
+    const { relay, res } = await twice(R, R);
+    expect(relay.post).toHaveBeenCalledTimes(1);
+    expect(res.written.find((w: any) => w.type === 'end').content).toContain('только что обработал');
+  });
+
+  it('тот же вопрос до и после новой точки в окне дедупа — второй уходит в модель', async () => {
+    const { relay, res } = await twice(null, R);
+    expect(relay.post).toHaveBeenCalledTimes(2);
+    expect(fieldsOf(relay.post.mock.calls[1][1]).sessionId).toBe(`u1_12_ru_r${R.getTime()}`);
+    expect(JSON.stringify(res.written)).not.toContain('только что обработал');
   });
 });
 
