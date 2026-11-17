@@ -214,6 +214,21 @@ maybe('video-job.purge против живого Postgres (Task 12)', () => {
     expect(storageLog).toEqual([]);
   });
 
+  it('K4b: source_image_url на video-uploads/<другой>/ — чужой объект не удаляется, row удалена', async () => {
+    const neighbor = 'video-uploads/u-other/1700-face.jpg';
+    const jobId = await insertJob({
+      source_image_url: `https://minio.test/linkeon-smm-videos/${neighbor}`,
+    });
+    const storageLog: Array<{ bucket: string; key: string }> = [];
+    const svc = makeService(storageLog);
+
+    await svc.deleteVideoForDeletion(USER, jobId, DELETION_ID);
+
+    expect(storageLog.map((c) => c.key).sort()).toEqual([`videos/${jobId}.jpg`, `videos/${jobId}.mp4`]);
+    const rows = await pool.query('SELECT id FROM video_jobs WHERE id=$1', [jobId]);
+    expect(rows.rows).toHaveLength(0);
+  });
+
   it('повторный вызов после purge — success (идемпотентность)', async () => {
     const jobId = await insertJob();
     const storageLog: Array<{ bucket: string; key: string }> = [];
