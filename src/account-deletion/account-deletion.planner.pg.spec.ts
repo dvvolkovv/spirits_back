@@ -464,11 +464,15 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       allOf: ['support.stop'],
     });
     // Task 17B: peer.purge ждёт peer.stop (алиасинг после снятия своих
-    // pending-заявок); у contacts.purge stop-фазы нет — правило не нужно.
+    // pending-заявок). K6: contacts.purge ждёт contacts.stop той же формы —
+    // текст обезличивается только у заявок, которые stop уже отменил.
     expect(DELETION_DEPENDENCIES['peer.purge']).toEqual({
       allOf: ['peer.stop'],
     });
-    expect(DELETION_DEPENDENCIES['contacts.purge']).toBeUndefined();
+    expect(DELETION_DEPENDENCIES['contacts.purge']).toEqual({
+      allOf: ['contacts.stop'],
+    });
+    expect(DELETION_DEPENDENCIES['contacts.stop']).toBeUndefined();
     // Task 17C: referral.purge ждёт referral.stop (stop блокирует вывод —
     // между pending-проверкой и алиасингом новая заявка появиться не может);
     // у retention.stop purge-фазы нет — правило не нужно.

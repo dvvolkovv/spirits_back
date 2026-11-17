@@ -184,13 +184,16 @@ maybe('contacts.purge against PostgreSQL (T17B-M2)', () => {
     await seedUser(THIRD, 'active');
   });
 
-  it('discovery на живой схеме: generation gate находит поколение — один пустой job', async () => {
+  it('discovery на живой схеме: generation gate находит поколение — stop+purge, пустые payload', async () => {
     const db = { query: (sql: string, params?: unknown[]) => pool.query(sql, params as any[]) };
 
     await expect(discoverContactsDeletion({
       db, account: { userId: DELETED, deletionId: DELETION_ID, deletedAt: DELETED_AT }, origin: 'explicit',
     })).resolves.toEqual({
-      jobs: [{ resourceType: 'contacts.purge', resourceKey: 'contacts', phase: 'purge', payload: {} }],
+      jobs: [
+        { resourceType: 'contacts.stop', resourceKey: 'contacts', phase: 'immediate', payload: {} },
+        { resourceType: 'contacts.purge', resourceKey: 'contacts', phase: 'purge', payload: {} },
+      ],
       skips: [],
     });
     await expect(discoverContactsDeletion({

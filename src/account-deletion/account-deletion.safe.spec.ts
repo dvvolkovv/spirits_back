@@ -64,6 +64,7 @@ const ALL_DELETION_RESOURCE_TYPES = [
   'support.purge',
   'peer.stop',
   'peer.purge',
+  'contacts.stop',
   'contacts.purge',
   'referral.stop',
   'referral.purge',
@@ -155,8 +156,8 @@ describe('account deletion safety', () => {
       execute: async () => undefined,
     };
 
-    expect(ALL_DELETION_RESOURCE_TYPES).toHaveLength(48);
-    expect(new Set(ALL_DELETION_RESOURCE_TYPES).size).toBe(48);
+    expect(ALL_DELETION_RESOURCE_TYPES).toHaveLength(49);
+    expect(new Set(ALL_DELETION_RESOURCE_TYPES).size).toBe(49);
     expect(validJob.resourceType).toBe('chat-file.purge');
     expect(validSkip.resourceType).toBe('calendar.external');
     expect(adapter.resourceTypes).toBe(ALL_DELETION_RESOURCE_TYPES);
@@ -443,8 +444,8 @@ describe('account deletion hardening regressions', () => {
       .toThrow(/^unsafe_payload$/);
   });
 
-  it('экспортирует runtime Set всех 48 resource types', () => {
-    expect(DELETION_RESOURCE_TYPES.size).toBe(48);
+  it('экспортирует runtime Set всех 49 resource types', () => {
+    expect(DELETION_RESOURCE_TYPES.size).toBe(49);
     for (const resourceType of ALL_DELETION_RESOURCE_TYPES) {
       expect(DELETION_RESOURCE_TYPES.has(resourceType)).toBe(true);
     }
