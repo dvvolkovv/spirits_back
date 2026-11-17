@@ -17,15 +17,22 @@
  *
  * Поэтому ключ считается ЗДЕСЬ и только здесь: любой новый путь к релею обязан
  * звать эту функцию, а не клеить строку у себя.
+ *
+ * Точка «Чистого листа» входит в ключ: та же пара (пользователь, ассистент)
+ * после новой точки — новый ключ, а значит новая Claude-сессия без старой памяти.
  */
 export function relaySessionKey(
   userId: string,
   assistantId: string,
   userLanguage: string,
-  // «Чистый лист»: у режима своя сессия на релее, чтобы прошлый разговор не
-  // протаскивался в неё мимо наших блокировок. Задан — значит он и есть ключ.
+  // Изолированная сессия пинга мониторинга (probe + fresh, только тестовые
+  // аккаунты): задан — значит он и есть ключ.
   freshSessionId?: string,
+  // Точка «Чистого листа» (spec 2026-11-17-context-reset): новая точка —
+  // новая Claude-сессия, релей не резюмит память, накопленную до неё.
+  resetAt?: Date | null,
 ): string {
   if (freshSessionId) return freshSessionId;
-  return `${userId}_${assistantId}_${userLanguage}`;
+  const base = `${userId}_${assistantId}_${userLanguage}`;
+  return resetAt ? `${base}_r${resetAt.getTime()}` : base;
 }
