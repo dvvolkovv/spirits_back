@@ -16,7 +16,11 @@ describePg('BusinessProfileService: гейт на активный аккаун�
 
   beforeAll(async () => {
     privacy = await createPrivacyPg();
-    await privacy.pool.query(`CREATE TABLE user_id (internal_id text PRIMARY KEY, state text)`);
+    // internal_id — прод-тип (001_core_schema.sql: character varying NOT NULL,
+    // UNIQUE): гейт в merge сравнивает его с тем же $2, что и text-колонку user_id.
+    await privacy.pool.query(
+      `CREATE TABLE user_id (internal_id character varying NOT NULL UNIQUE, state text)`,
+    );
     await privacy.pool.query(`CREATE TABLE agents (id integer PRIMARY KEY, category text)`);
     await privacy.pool.query(`INSERT INTO agents (id, category) VALUES (10, 'business')`);
   });

@@ -304,8 +304,11 @@ maybe('VoiceCallService.complete после удаления аккаунта п
     ]) {
       await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', name), 'utf8'));
     }
+    // internal_id — прод-тип (001_core_schema.sql: character varying NOT NULL,
+    // UNIQUE user_id_internal_id_key), а не text: гейты сравнивают его с text-
+    // колонками и параметрами, и расхождение типов должно ловиться здесь.
     await pool.query(`CREATE TABLE user_id (
-      internal_id text PRIMARY KEY,
+      internal_id character varying NOT NULL UNIQUE,
       state text,
       deleted_at timestamptz,
       deletion_id uuid
