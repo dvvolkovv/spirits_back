@@ -76,6 +76,13 @@ export class ChatContextResetService {
    * ассистенту память навсегда; точка в 1970 под видом чистого листа вернула
    * бы всю старую историю; Invalid Date иначе всплыл бы невнятной ошибкой
    * Postgres. Не обрезаем до now — почему, см. LEGACY_FRESH_FUTURE_SLACK_MS.
+   *
+   * Удалённому аккаунту (user_id.state = 'deleted' — тот же признак, что у
+   * IdentityService.isDeleted) точка не пишется — ошибка 'account deleted'.
+   * Выданный до удаления access-токен живёт до двух часов, а core-удаление
+   * точки уже прошло: новая строка осталась бы сиротой навсегда. Нет строки
+   * в user_id или state другой — пишем, как раньше. Проверка и запись — одним
+   * выражением, без отдельного чтения перед записью.
    */
   async reset(userId: string, assistantId: string | number, at?: Date | null): Promise<Date> {
     if (at !== undefined && at !== null) {
@@ -84,14 +91,20 @@ export class ChatContextResetService {
         throw new Error('invalid context reset time');
       }
     }
+    // ::text у параметров: $1 стоит и в списке вставки (text), и в сравнении
+    // с internal_id (varchar) — без явного типа Postgres мог бы вывести разные.
     const { rows } = await this.pg.query(
       `INSERT INTO chat_context_resets (user_id, assistant_id, reset_at)
-       VALUES ($1, $2, COALESCE($3::timestamptz, now()))
+       SELECT $1::text, $2::text, COALESCE($3::timestamptz, now())
+        WHERE NOT EXISTS (
+          SELECT 1 FROM user_id WHERE internal_id = $1::text AND state = 'deleted'
+        )
        ON CONFLICT (user_id, assistant_id) DO UPDATE
          SET reset_at = GREATEST(chat_context_resets.reset_at, EXCLUDED.reset_at)
        RETURNING reset_at`,
       [userId, String(assistantId), at ?? null],
     );
+    if (!rows.length) throw new Error('account deleted');
     return new Date(rows[0].reset_at);
   }
 }
