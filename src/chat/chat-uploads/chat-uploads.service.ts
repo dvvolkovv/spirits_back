@@ -337,11 +337,11 @@ export class ChatUploadsService {
         sizeBytes: record.sizeBytes,
       };
     } catch (e: any) {
-      const id = String(input.id).slice(0, 64);
+      const id = this.logId(input.id);
       if (e instanceof NotFoundException) {
         this.logger.debug(`openDownload: not found (id=${id})`);
       } else {
-        this.logger.error(`openDownload: internal failure (id=${id}): ${this.errDetail(e)}`);
+        this.logger.error(`openDownload: internal failure (id=${id}): ${this.errKind(e)}`);
       }
       throw new NotFoundException('Upload not found');
     }
@@ -367,11 +367,11 @@ export class ChatUploadsService {
         sizeBytes: bytes.length,
       };
     } catch (e: any) {
-      const id = String(input.id).slice(0, 64);
+      const id = this.logId(input.id);
       if (e instanceof NotFoundException) {
         this.logger.debug(`openThumb: not found (id=${id})`);
       } else {
-        this.logger.error(`openThumb: internal failure (id=${id}): ${this.errDetail(e)}`);
+        this.logger.error(`openThumb: internal failure (id=${id}): ${this.errKind(e)}`);
       }
       throw new NotFoundException('Upload not found');
     }
@@ -401,7 +401,7 @@ export class ChatUploadsService {
       try {
         await this.storage.deleteConfirmed({ bucket: BUCKET, key });
       } catch (e: any) {
-        this.logger.error(`deleteForOwner: storage delete failed (id=${record.id}): ${this.errDetail(e)}`);
+        this.logger.error(`deleteForOwner: storage delete failed (id=${record.id}): ${this.errKind(e)}`);
         throw new ChatUploadDeleteError();
       }
     }
@@ -409,7 +409,10 @@ export class ChatUploadsService {
     await this.pg.query('DELETE FROM chat_uploads WHERE id = $1 AND user_id = $2', [record.id, input.userId]);
 
     try {
-      const lang = this.language ? await this.language.resolveUserLanguage(input.userId) : null;
+      // Сбой выбора языка не отменяет переписывание: тогда строка по-русски.
+      const lang = this.language
+        ? await this.language.resolveUserLanguage(input.userId).catch(() => null)
+        : null;
       await this.pg.query(HISTORY_REWRITE_SQL, [
         record.sessionId,
         // Посимвольно та строка, что пишет upload-and-chat (chat.controller.ts).
@@ -417,7 +420,7 @@ export class ChatUploadsService {
         deletedUploadLine(record.originalName, lang),
       ]);
     } catch (e: any) {
-      this.logger.error(`deleteForOwner: history rewrite failed (id=${record.id}): ${this.errDetail(e)}`);
+      this.logger.error(`deleteForOwner: history rewrite failed (id=${record.id}): ${this.errKind(e)}`);
     }
   }
 
@@ -490,6 +493,28 @@ export class ChatUploadsService {
     const name = e?.name || 'Error';
     const message = typeof e?.message === 'string' ? e.message : '';
     return `${name}: ${message}`.slice(0, 300);
+  }
+
+  /**
+   * Только вид ошибки, без текста сообщения: ключ объекта — это
+   * `<uuid>/<safeFileName(имя)>`, и сообщения S3/pg могут повторять его или
+   * имя файла. name, HTTP-статус S3 ($metadata.httpStatusCode) и код
+   * (SQLSTATE pg или системный вроде ETIMEDOUT) — каждое лишь из безопасных
+   * символов, перевод строки запись не подделает.
+   */
+  private errKind(e: any): string {
+    const name = String(e?.name || 'Error').replace(/[^\w.-]/g, '').slice(0, 64) || 'Error';
+    const parts = [name];
+    const status = e?.$metadata?.httpStatusCode;
+    if (Number.isInteger(status)) parts.push(`status=${status}`);
+    const code = e?.code;
+    if (typeof code === 'string' && /^[A-Z0-9_]{1,32}$/.test(code)) parts.push(`code=${code}`);
+    return parts.join(' ');
+  }
+
+  /** id из запроса для журнала: в кавычках и экранирован — перевод строки не подделает запись. */
+  private logId(id: unknown): string {
+    return JSON.stringify(String(id).slice(0, 64));
   }
 
   private row(row: any): ChatUploadRecord {
