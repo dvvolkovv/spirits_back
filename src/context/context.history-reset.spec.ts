@@ -116,3 +116,77 @@ describe('ContextService «Из переписки»: точка «Чистог�
     expect(paramTypes).toContain(ChatContextResetService);
   });
 });
+
+/**
+ * «Чем кончился прошлый разговор» — дословный хвост последнего звонка. Звонок,
+ * закончившийся не позже точки, — старый разговор: после «Чистого листа»
+ * перезвон в пределах получаса не должен возвращать его Роману.
+ *
+ * sectionContinuation(userId, budget, agentId) — agentId третьим, чтобы не
+ * менять вызовы существующих спек; по умолчанию 12, как у sectionHistory.
+ */
+describe('ContextService «Чем кончился прошлый разговор»: точка «Чистого листа»', () => {
+  const tail = [
+    { role: 'user', text: 'ХВОСТ-ЗВОНКА: перезвоню после встречи', ts: 1 },
+    { role: 'assistant', text: 'Хорошо, жду', ts: 2 },
+  ];
+  const minutesAgo = (m: number) => new Date(Date.now() - m * 60_000);
+  // ended_at — строкой, как в соседних спеках подхвата; на проде pg отдаёт Date.
+  const pgWithCall = (endedAt: Date | string) => ({
+    query: jest.fn(async (sql: string) =>
+      /FROM voice_calls/i.test(sql)
+        ? { rows: [{ id: 'call-1', ended_at: endedAt, transcript: tail }] }
+        : { rows: [] }),
+  });
+  const svcWithCall = (endedAt: Date | string, get?: jest.Mock) => {
+    const resets = get ? ({ get } as unknown as ChatContextResetService) : undefined;
+    return new ContextService(pgWithCall(endedAt) as any, undefined, undefined, undefined, undefined, resets);
+  };
+
+  it('звонок закончился до точки — раздела нет', async () => {
+    const get = jest.fn(async () => minutesAgo(5));
+    const svc = svcWithCall(minutesAgo(10).toISOString(), get);
+
+    expect(await (svc as any).sectionContinuation('u1', 1200)).toBe('');
+    expect(get).toHaveBeenCalledWith('u1', '12');
+  });
+
+  it('звонок закончился ровно в момент точки — раздела нет (проходит только строго после)', async () => {
+    const at = minutesAgo(5);
+    const svc = svcWithCall(new Date(at.getTime()), jest.fn(async () => new Date(at.getTime())));
+
+    expect(await (svc as any).sectionContinuation('u1', 1200)).toBe('');
+  });
+
+  it('звонок закончился после точки — раздел есть', async () => {
+    const svc = svcWithCall(minutesAgo(5), jest.fn(async () => minutesAgo(10)));
+
+    expect(await (svc as any).sectionContinuation('u1', 1200)).toContain('ХВОСТ-ЗВОНКА');
+  });
+
+  it('без точки — раздел есть, как раньше', async () => {
+    const svc = svcWithCall(minutesAgo(5), jest.fn(async () => null));
+
+    expect(await (svc as any).sectionContinuation('u1', 1200)).toContain('ХВОСТ-ЗВОНКА');
+  });
+
+  it('сбой чтения точки — раздел есть, warn без текста разговора', async () => {
+    const svc = svcWithCall(minutesAgo(5), jest.fn(async () => { throw new Error('pg прилёг'); }));
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+
+    expect(await (svc as any).sectionContinuation('u1', 1200)).toContain('ХВОСТ-ЗВОНКА');
+    const logged = warn.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(logged).toContain('u1_12');
+    expect(logged).not.toContain('ХВОСТ-ЗВОНКА');
+  });
+
+  it('build: точка берётся на пару с ассистентом из opts.agentId', async () => {
+    const get = jest.fn(async () => minutesAgo(5));
+    const svc = svcWithCall(minutesAgo(10), get);
+
+    const built = await svc.build('u1', 'voice-launcher', { agentId: 12 });
+
+    expect(built.text).not.toContain('ХВОСТ-ЗВОНКА');
+    expect(get).toHaveBeenCalledWith('u1', '12');
+  });
+});
