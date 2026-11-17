@@ -800,8 +800,9 @@ export class ChatController {
   @UseGuards(JwtGuard)
   async scanDocument(@CurrentUser() user: any, @Req() req: Request, @Res() res: Response) {
     let cwd: string | null = null;
-    // Сохранение исходника идёт параллельно с разбором; ждём его в finally,
-    // когда ответ уже отправлен, — висящих промисов обработчик не оставляет.
+    // Сохранение идёт параллельно с разбором и ответ не задерживает; в finally
+    // (ответ уже ушёл) обработчик ждёт его не дольше бюджета. Пережившее бюджет
+    // сохранение доживает само — его отказ погашен в saveScanOriginal.
     let scanSave: Promise<void> | null = null;
     try {
       // Handle multipart file upload via multer
