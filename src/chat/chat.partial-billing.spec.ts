@@ -244,7 +244,7 @@ describe('веб-ход: оборванный ход списывается за
   it('P8: transient_after_write только с файлом и без расхода в done — строки списания с нулём нет', async () => {
     // Ноль в token_consumption_tasks планировщик превращает в минимум 1 токен
     // (TokenAccountingService), а индикатор и история показали бы 0.
-    const { svc, calls } = makeService();
+    const { svc, calls, track } = makeService();
     const res = await webTurn(svc, [
       notice('_(связь с моделью прервалась после действия — проверьте результат, возможно всё прошло; при необходимости повторите)_'),
       {
@@ -256,9 +256,11 @@ describe('веб-ход: оборванный ход списывается за
     expect(charged(calls)).toBeUndefined();
     expect(shownTokens(res)).toBe(0);
     expect(historyTokens(calls)).toBe(0);
+    // partial_billed — «действительно списано»: при нулевой сумме флага нет.
+    expect(quality(track).partial_billed).toBeUndefined();
   });
 
-  it('P9: причина из списка, но текст — отказ CLI — без списания, в журнале cli_fatal_text', async () => {
+  it('P9:причина из списка, но текст — отказ CLI — без списания, в журнале cli_fatal_text', async () => {
     const { svc, calls, warn } = makeService();
     const res = await webTurn(svc, [
       delta("You've hit your session limit · resets 11:50am (UTC)"),
