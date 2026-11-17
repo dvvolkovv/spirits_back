@@ -101,8 +101,10 @@ describe('ActionPlansService', () => {
     expect(pg.query).not.toHaveBeenCalledWith(expect.stringContaining('INSERT INTO action_plans'), expect.anything());
   });
 
-  it('сбой чтения точки — план строится по всей выборке, а не падает; в журнале пара без разговора', async () => {
-    const { service, chat } = setup({ get: jest.fn(async () => { throw new Error('db down'); }) });
+  it('сбой чтения точки — план строится по всей выборке, а не падает; в журнале ассистент и вид ошибки, без userId и разговора', async () => {
+    const { service, chat } = setup({
+      get: jest.fn(async () => { throw Object.assign(new Error('db down for u1_10'), { code: 'ECONNREFUSED' }); }),
+    });
     const warn = jest.spyOn((service as any).logger, 'warn').mockImplementation(() => undefined);
     chat.getChatHistory.mockResolvedValue(beforeAndAfterReset);
     await expect(service.generate('u1', '10')).resolves.toBeDefined();
@@ -111,7 +113,9 @@ describe('ActionPlansService', () => {
     expect(prompt).toContain('НОВЫЙ вопрос');
     expect(warn).toHaveBeenCalledTimes(1);
     const line = String(warn.mock.calls[0][0]);
-    expect(line).toContain('u1_10');
+    expect(line).toBe('context reset read failed (assistant "10"): Error code=ECONNREFUSED');
+    expect(line).not.toContain('u1');
+    expect(line).not.toContain('db down');
     expect(line).not.toMatch(/СТАРЫЙ|НОВЫЙ/);
   });
 

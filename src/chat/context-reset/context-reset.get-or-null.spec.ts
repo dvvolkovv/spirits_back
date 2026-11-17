@@ -46,16 +46,33 @@ describe('ChatContextResetService.getOrNull', () => {
     expect(get).toHaveBeenCalledWith('u1', '7');
   });
 
-  it('сбой чтения — null и warn с парой и причиной', async () => {
-    const svc = svcWith(jest.fn(async () => { throw new Error('db down'); }));
+  // Журнал — по правилу памяти загрузок (err-kind.ts): userId — у телефонных
+  // аккаунтов это номер телефона — и ключ сессии не пишутся, текст ошибки pg
+  // тоже (он может повторять параметры запроса). Остаются id ассистента и вид
+  // ошибки.
+  it('сбой чтения — null и warn: ассистент и вид ошибки, без userId и текста ошибки', async () => {
+    const phone = '79030169187';
+    const svc = svcWith(jest.fn(async () => {
+      throw Object.assign(new Error(`connect ECONNREFUSED for ${phone}`), { code: 'ECONNREFUSED' });
+    }));
     const warn = jest.fn();
 
-    expect(await ChatContextResetService.getOrNull(svc, 'u1', 12, warn)).toBeNull();
+    expect(await ChatContextResetService.getOrNull(svc, phone, 12, warn)).toBeNull();
 
     expect(warn).toHaveBeenCalledTimes(1);
     const line = String(warn.mock.calls[0][0]);
-    expect(line).toContain('u1_12');
-    expect(line).toContain('db down');
+    expect(line).toBe('context reset read failed (assistant "12"): Error code=ECONNREFUSED');
+    expect(line).not.toContain(phone);
+    expect(line).not.toContain('connect');
+  });
+
+  it('id ассистента в журнале — в кавычках: перевод строки запись не подделает', async () => {
+    const svc = svcWith(jest.fn(async () => { throw new Error('db down'); }));
+    const warn = jest.fn();
+
+    await ChatContextResetService.getOrNull(svc, 'u1', '12\nFAKE line', warn);
+
+    expect(String(warn.mock.calls[0][0])).toBe('context reset read failed (assistant "12\\nFAKE line"): Error');
   });
 
   it('сбой без warn-колбэка — null, не бросает', async () => {

@@ -96,7 +96,9 @@ describe('голос Романа: преамбула после точки «Ч
 
   it('сбой чтения точки — преамбула без фильтра, звонок не срывается', async () => {
     const d = makeDeps(ROWS());
-    const svc = legacySvc(d, resetsWith(jest.fn(async () => { throw new Error('pg прилёг'); })));
+    const svc = legacySvc(d, resetsWith(jest.fn(async () => {
+      throw Object.assign(new Error('pg прилёг для u1_12'), { code: '57P01' });
+    })));
     const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
 
     const p = await svc.buildPreamble('u1');
@@ -104,7 +106,11 @@ describe('голос Романа: преамбула после точки «Ч
     expect(p).toContain('НОВОЕ');
     expect(p).toContain('СТАРОЕ');
     const logged = warn.mock.calls.map((c) => String(c[0])).join('\n');
-    expect(logged).toContain('u1_12');
+    // Ассистент и вид ошибки; ни userId (у телефонных аккаунтов — номер), ни
+    // ключа сессии, ни текста ошибки.
+    expect(logged).toContain('context reset read failed (assistant "12"): Error code=57P01');
+    expect(logged).not.toContain('u1');
+    expect(logged).not.toContain('прилёг');
     expect(logged).not.toContain('СТАРОЕ');
   });
 

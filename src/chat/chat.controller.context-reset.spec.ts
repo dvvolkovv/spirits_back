@@ -44,6 +44,9 @@ const res = () => ({
 /** Запрос в той форме, которую читает chat(): userId — из Bearer через jwtSvc. */
 const chatReq = (body: any) => ({ headers: { authorization: 'Bearer t' }, body }) as any;
 
+/** userId телефонного аккаунта — это номер телефона; в журнал он попадать не должен. */
+const PHONE = '79991234567';
+
 describe('ChatController: «Чистый лист» как точка', () => {
   it('POST reset-context ставит точку и отдаёт её', async () => {
     const { ctrl, resets } = makeCtrl();
@@ -115,15 +118,34 @@ describe('ChatController: «Чистый лист» как точка', () => {
     expect(resets.reset).toHaveBeenCalledWith('u1', expected);
   });
 
-  it('reset-context: сбой записи точки — 503 и строка в журнале, а не голый 500', async () => {
-    const { ctrl } = makeCtrl({ resets: { reset: jest.fn(async () => { throw new Error('db down'); }) } });
+  // Журнал — по правилу памяти загрузок (err-kind.ts): ни userId (у
+  // телефонных аккаунтов это номер), ни ключа сессии, ни текста ошибки — только
+  // id ассистента и вид ошибки.
+  it('reset-context: сбой записи точки — 503 и строка в журнале: ассистент и вид ошибки, без номера и текста', async () => {
+    const { ctrl } = makeCtrl({
+      resets: { reset: jest.fn(async () => { throw Object.assign(new Error(`db down for ${PHONE}`), { code: 'ECONNREFUSED' }); }) },
+    });
     const warn = jest.spyOn((ctrl as any).logger, 'warn').mockImplementation(() => undefined);
     const r = res();
-    await ctrl.resetContext({ userId: 'u1' }, { assistantId: '10' }, r);
+    await ctrl.resetContext({ userId: PHONE }, { assistantId: '10' }, r);
     expect(r.status).toHaveBeenCalledWith(503);
     expect(r.json).toHaveBeenCalledWith({ error: 'context reset unavailable' });
     expect(warn).toHaveBeenCalledTimes(1);
-    expect(String(warn.mock.calls[0][0])).toContain('u1_10');
+    const line = String(warn.mock.calls[0][0]);
+    expect(line).toBe('context reset failed (assistant "10"): Error code=ECONNREFUSED');
+    expect(line).not.toContain(PHONE);
+    expect(line).not.toContain('db down');
+  });
+
+  it('reset-context: удалённый аккаунт — 503, в журнале код отказа, а не текст', async () => {
+    const { ctrl } = makeCtrl({
+      resets: { reset: jest.fn(async () => { throw Object.assign(new Error('account deleted'), { code: 'ACCOUNT_DELETED' }); }) },
+    });
+    const warn = jest.spyOn((ctrl as any).logger, 'warn').mockImplementation(() => undefined);
+    const r = res();
+    await ctrl.resetContext({ userId: PHONE }, { assistantId: '10' }, r);
+    expect(r.status).toHaveBeenCalledWith(503);
+    expect(String(warn.mock.calls[0][0])).toBe('context reset failed (assistant "10"): Error code=ACCOUNT_DELETED');
   });
 
   it('история отдаёт contextResetAt и не читает freshTs', async () => {
@@ -192,6 +214,22 @@ describe('ChatController: «Чистый лист» как точка', () => {
     expect(args[7]).toBe(false);
   });
 
+  it('сбой записи точки старого клиента — в журнале ассистент и вид ошибки, без номера, ключа сессии и текста', async () => {
+    const ts = String(Date.now() - 60_000);
+    const { ctrl } = makeCtrl({
+      userId: PHONE,
+      resets: { reset: jest.fn(async () => { throw Object.assign(new Error(`db down for ${PHONE}_10`), { code: '57P01' }); }) },
+    });
+    const warn = jest.spyOn((ctrl as any).logger, 'warn').mockImplementation(() => undefined);
+    await ctrl.chat(chatReq({ message: 'секретный вопрос', assistantId: '10', fresh: true, freshTs: ts }), res());
+    const lines = warn.mock.calls.map((c) => String(c[0]));
+    expect(lines).toContain('legacy fresh reset failed (assistant "10"): Error code=57P01');
+    const logged = lines.join('\n');
+    expect(logged).not.toContain(PHONE);
+    expect(logged).not.toContain('db down');
+    expect(logged).not.toContain('секретный');
+  });
+
   it('метка из будущего — точку не ставит', async () => {
     const { ctrl, chatService, resets } = makeCtrl();
     await ctrl.chat(chatReq({ message: 'q', assistantId: '10', fresh: true, freshTs: String(Date.now() + 3_600_000) }), res());
@@ -204,8 +242,8 @@ describe('ChatController: «Чистый лист» как точка', () => {
   /** Сдвиг метки от now в секундах из строки журнала (`\b` после кириллицы не работает). */
   const shiftSec = (line: string) => Number(/ ([+-]\d+) с$/.exec(line)?.[1]);
 
-  it('отвергнутая метка — предупреждение в журнал: пара и сдвиг, без текста сообщения; два хода подряд — одно', async () => {
-    const { ctrl, resets } = makeCtrl();
+  it('отвергнутая метка — предупреждение в журнал: ассистент и сдвиг, без номера, ключа сессии и текста сообщения; два хода подряд — одно', async () => {
+    const { ctrl, resets } = makeCtrl({ userId: PHONE });
     const warn = jest.spyOn((ctrl as any).logger, 'warn').mockImplementation(() => undefined);
     const future = String(Date.now() + 3_600_000);
     await ctrl.chat(chatReq({ message: 'секретный вопрос', assistantId: '10', fresh: true, freshTs: future }), res());
@@ -213,8 +251,9 @@ describe('ChatController: «Чистый лист» как точка', () => {
     expect(resets.reset).not.toHaveBeenCalled();
     expect(warn).toHaveBeenCalledTimes(1);
     const line = String(warn.mock.calls[0][0]);
-    expect(line).toContain('u1_10');
+    expect(line).toMatch(/^legacy fresh: метка отвергнута \(assistant "10"\), сдвиг [+-]\d+ с$/);
     expect(Math.abs(shiftSec(line) - 3600)).toBeLessThanOrEqual(2);
+    expect(line).not.toContain(PHONE);
     expect(line).not.toContain('секретный');
   });
 

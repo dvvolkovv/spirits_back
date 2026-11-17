@@ -85,6 +85,8 @@ maybe('ChatContextResetService (pg)', () => {
   it('точка из будущего дальше окна отвергается и не пишется: иначе память стёрлась бы навсегда', async () => {
     const future = new Date(Date.now() + LEGACY_FRESH_FUTURE_SLACK_MS + 60_000);
     await expect(svc.reset('u1', '10', future)).rejects.toThrow('invalid context reset time');
+    // Код — для журнала: туда идёт только вид ошибки (errKind), без текста.
+    await expect(svc.reset('u1', '10', future)).rejects.toMatchObject({ code: 'INVALID_RESET_TIME' });
     expect(await svc.get('u1', '10')).toBeNull();
   });
 
@@ -110,6 +112,9 @@ maybe('ChatContextResetService (pg)', () => {
   it('удалённому аккаунту точка не пишется: access-токен живёт после удаления, строка осталась бы сиротой', async () => {
     await seedUser('u1', 'deleted');
     await expect(svc.reset('u1', '10')).rejects.toThrow('account deleted');
+    // Код — для журнала: туда идёт только вид ошибки (errKind), без текста;
+    // по коду отказ удалённому аккаунту отличим от сбоя базы.
+    await expect(svc.reset('u1', '10')).rejects.toMatchObject({ code: 'ACCOUNT_DELETED' });
     // Явная метка старого клиента (applyLegacyFresh) — тот же отказ.
     await expect(svc.reset('u1', '10', new Date('2026-11-02T08:00:00Z'))).rejects.toThrow('account deleted');
     expect(await svc.get('u1', '10')).toBeNull();

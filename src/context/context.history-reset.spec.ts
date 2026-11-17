@@ -83,7 +83,9 @@ describe('ContextService «Из переписки»: точка «Чистог�
   });
 
   it('сбой чтения точки — раздел строится без фильтра, без текста разговора в логе', async () => {
-    const { svc } = svcWith(ROWS(), jest.fn(async () => { throw new Error('pg прилёг'); }));
+    const { svc } = svcWith(ROWS(), jest.fn(async () => {
+      throw Object.assign(new Error('pg прилёг для u1_12'), { code: '57P01' });
+    }));
     const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
 
     const out: string = await (svc as any).sectionHistory('u1', 12);
@@ -92,7 +94,11 @@ describe('ContextService «Из переписки»: точка «Чистог�
     expect(out).toContain('СТАРОЕ');
     expect(warn).toHaveBeenCalled();
     const logged = warn.mock.calls.map((c) => String(c[0])).join('\n');
-    expect(logged).toContain('u1_12');
+    // Ассистент и вид ошибки; ни userId (у телефонных аккаунтов — номер), ни
+    // ключа сессии, ни текста ошибки.
+    expect(logged).toContain('context reset read failed (assistant "12"): Error code=57P01');
+    expect(logged).not.toContain('u1');
+    expect(logged).not.toContain('прилёг');
     expect(logged).not.toContain('СТАРОЕ');
     expect(logged).not.toContain('НОВОЕ');
   });
@@ -202,12 +208,16 @@ describe('ContextService «Чем кончился прошлый разгово
   });
 
   it('сбой чтения точки — раздел есть, warn без текста разговора', async () => {
-    const { svc } = svcWithCall(minutesAgo(25), minutesAgo(5), jest.fn(async () => { throw new Error('pg прилёг'); }));
+    const { svc } = svcWithCall(minutesAgo(25), minutesAgo(5), jest.fn(async () => {
+      throw Object.assign(new Error('pg прилёг для u1_12'), { code: '57P01' });
+    }));
     const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
 
     expect(await (svc as any).sectionContinuation('u1', 12, 1200)).toContain('ХВОСТ-ЗВОНКА');
     const logged = warn.mock.calls.map((c) => String(c[0])).join('\n');
-    expect(logged).toContain('u1_12');
+    expect(logged).toContain('context reset read failed (assistant "12"): Error code=57P01');
+    expect(logged).not.toContain('u1');
+    expect(logged).not.toContain('прилёг');
     expect(logged).not.toContain('ХВОСТ-ЗВОНКА');
   });
 
