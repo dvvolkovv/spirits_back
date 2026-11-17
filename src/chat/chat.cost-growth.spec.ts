@@ -135,7 +135,9 @@ describe('сторож роста стоимости: веб-чат, обычн�
     await runTurn(svc, [
       { type: 'delta', text: 'частичный текст' },
       { type: 'notice', text: '_(связь с моделью прервалась)_' },
-      { type: 'done', costUsd: 0.5, failed: true, failReason: 'transient_after_partial' },
+      // Стоимость хода (turnCostUsd), а не только costUsd: costUsd — сумма
+      // всей сессии, у оборванного хода в счёт не идёт (chat.partial-billing.spec.ts, P10).
+      { type: 'done', costUsd: 0.5, turnCostUsd: 0.5, failed: true, failReason: 'transient_after_partial' },
     ]);
 
     expect(costGrowth.recordTurn).toHaveBeenCalledTimes(1);

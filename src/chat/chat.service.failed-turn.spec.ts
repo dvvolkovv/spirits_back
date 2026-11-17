@@ -123,7 +123,9 @@ describe('ход без финального ответа', () => {
 
     t.upstream.push(delta('частичный текст'));
     t.upstream.push(notice('_(связь с моделью прервалась)_'));
-    t.upstream.push(done({ failed: true, failReason: 'transient_after_partial' }));
+    // Стоимость хода (turnCostUsd): costUsd хелпера done — сумма всей сессии,
+    // у оборванного хода она в счёт не идёт (chat.partial-billing.spec.ts, P10).
+    t.upstream.push(done({ failed: true, failReason: 'transient_after_partial', turnCostUsd: 0.5 }));
     t.upstream.push(null);
     await t.finished;
     await settle();
@@ -132,7 +134,7 @@ describe('ход без финального ответа', () => {
     expect(row).toBeDefined();
     expect(Number(row!.params[4])).toBeGreaterThan(0);
     expect(savedAnswer(calls)!.tokens).toBe(Number(row!.params[4]));
-    expect(JSON.parse(String(row!.params[5]))).toMatchObject({ partial: 'transient_after_partial' });
+    expect(JSON.parse(String(row!.params[5]))).toMatchObject({ partial: 'transient_after_partial', source: 'cost' });
   });
 
   it('сбой до ответа (cli_fatal) не списывается, даже если обрывок текста успел уйти', async () => {

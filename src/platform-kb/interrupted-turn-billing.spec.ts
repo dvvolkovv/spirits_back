@@ -25,9 +25,14 @@ describe('справка: оборванный ход', () => {
     expect(bad).toEqual([]);
   });
 
-  it('tokens и chat говорят, что за обрыв списывается сделанное', () => {
+  it('tokens и chat говорят, что оборванный ход оплачивается по сделанной работе', () => {
+    // Не «только сделанное»: списывается весь фактический расход хода.
     const byId = (id: string) => KB_ARTICLES.find((a) => a.id === id)!;
     expect(renderArticle(byId('tokens'), 'ru', 'web')).toContain('оплачивается по сделанной работе');
-    expect(renderArticle(byId('chat'), 'ru', 'web')).toContain('за обрыв списывается только сделанное');
+    const chat = renderArticle(byId('chat'), 'ru', 'web');
+    expect(chat).toContain('оборванный ход оплачивается по сделанной работе');
+    expect(chat).not.toContain('списывается только сделанное');
+    // В сборке для стора цен нет: фраза в chat — внутри paid(...).
+    expect(renderArticle(byId('chat'), 'ru', 'store')).not.toContain('оплачивается');
   });
 });

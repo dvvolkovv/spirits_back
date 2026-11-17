@@ -272,6 +272,49 @@ describe('веб-ход: оборванный ход списывается за
     expect(shownTokens(res)).toBe(0);
     expect(lines(warn)).toContainEqual(expect.stringContaining('billing[skipped:cli_fatal_text]'));
   });
+
+  it('P10: оборванный ход без usage и стоимости хода — costUsd сессии не в счёт, по длине видимого текста', async () => {
+    // total_cost_usd у возобновлённой сессии — сумма ВСЕЙ сессии (CLI 2.1.280;
+    // 14.10.2026 ход за $0.16 списали как $6.21). У успешного хода usage есть,
+    // и до costUsd дело не доходит; у оборванного на первом запросе нет ни
+    // usage, ни стоимости хода. В журнал и метаданные costUsd идёт как есть.
+    const { svc, calls, warn } = makeService();
+    const res = await webTurn(svc, [
+      delta(MODEL), notice(NOTICE),
+      done({ failed: true, failReason: 'transient_after_partial', costUsd: 6.21, turnCostUsd: 0 }),
+    ]);
+
+    const byLength = MODEL.length * (svc as any).SDK_TEXT_MULTIPLIER;
+    expect(charged(calls)).toBe(byLength);
+    expect(shownTokens(res)).toBe(byLength);
+    expect(chargeMeta(calls)).toMatchObject({ partial: 'transient_after_partial', source: 'length', costUsd: 6.21 });
+    const line = lines(warn).find((l) => l.includes('billing[partial:transient_after_partial:length]'));
+    expect(line).toContain(`tokens=${byLength} `);
+    expect(line).toContain('$6.2100');
+  });
+
+  it('P11: до обрыва пришла одна разметка без слов — без списания, индикатор 0', async () => {
+    const { svc, calls, track } = makeService();
+    const res = await webTurn(svc, [
+      delta('**'), notice(NOTICE), done({ failed: true, failReason: 'transient_after_partial' }),
+    ]);
+
+    expect(charged(calls)).toBeUndefined();
+    expect(shownTokens(res)).toBe(0);
+    expect(quality(track).partial_billed).toBeUndefined();
+  });
+
+  it('P12: до обрыва пришёл только блок product-action — он вычищается из ответа и пришедшим не считается', async () => {
+    const { svc, calls } = makeService();
+    const res = await webTurn(svc, [
+      delta('```product-action\n{"actionId":"a1","kind":"create"}\n```'),
+      notice(NOTICE),
+      done({ failed: true, failReason: 'transient_after_partial' }),
+    ]);
+
+    expect(charged(calls)).toBeUndefined();
+    expect(shownTokens(res)).toBe(0);
+  });
 });
 
 /**
@@ -404,7 +447,7 @@ describe('ход с файлом: оборванный ход списывает
     expect(lines(warn)).toContainEqual(expect.stringContaining('billing[upload:skipped:cli_fatal_text]'));
   });
 
-  it('U8:оборванный ход с usage и файлом — shown и списание одним числом', async () => {
+  it('U8: оборванный ход с usage и файлом — shown и списание одним числом', async () => {
     // Расход по формуле из usage (без счёта CLI): $0.50 = 1 000 000 cacheRead × 0.1 × $5/MTok.
     const { svc, calls } = makeService();
     const res = await uploadTurn(svc, [
@@ -420,5 +463,33 @@ describe('ход с файлом: оборванный ход списывает
     expect(shownTokens(res)).toBe(charged(calls));
     expect(historyTokens(calls)).toBe(charged(calls));
     expect(chargeMeta(calls)).toMatchObject({ partial: 'transient_after_write', source: 'usage' });
+  });
+
+  it('U10: оборванный ход без usage и стоимости хода — costUsd сессии не в счёт, по длине видимого текста', async () => {
+    // То же, что P10 у веб-хода.
+    const { svc, calls, warn } = makeService();
+    const res = await uploadTurn(svc, [
+      delta(MODEL), notice(NOTICE),
+      done({ failed: true, failReason: 'transient_after_partial', costUsd: 6.21, turnCostUsd: 0 }),
+    ]);
+
+    const byLength = MODEL.length * (svc as any).SDK_TEXT_MULTIPLIER;
+    expect(charged(calls)).toBe(byLength);
+    expect(shownTokens(res)).toBe(byLength);
+    expect(chargeMeta(calls)).toMatchObject({ partial: 'transient_after_partial', source: 'length', costUsd: 6.21 });
+    const line = lines(warn).find((l) => l.includes('billing[upload:partial:transient_after_partial:length]'));
+    expect(line).toContain(`tokens=${byLength} `);
+    expect(line).toContain('$6.2100');
+  });
+
+  it('U11: до обрыва пришла одна разметка без слов — без списания, shown 0', async () => {
+    const { svc, calls } = makeService();
+    const res = await uploadTurn(svc, [
+      delta('**'), notice(NOTICE), done({ failed: true, failReason: 'transient_after_partial' }),
+    ]);
+
+    expect(charged(calls)).toBeUndefined();
+    expect(shownTokens(res)).toBe(0);
+    expect(historyTokens(calls)).toBe(0);
   });
 });
