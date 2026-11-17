@@ -89,8 +89,10 @@ export async function deleteOwnedCoreRows(
   // что у истории: без неё точка смысла не имеет. Таблицу создаёт стартовая
   // миграция ContextResetModule (onModuleInit). В API удаление запускают
   // HTTP-вход и cron coordinator'а — оба оживают после onModuleInit, так что
-  // таблица к ним уже есть. Synthetic-скрипт стенда таблицу не создаёт: он
-  // идёт против базы, где её завёл API той же или более новой версии.
+  // таблица к ним уже есть. Synthetic-скрипт удаления
+  // (scripts/account-deletion-synthetic.ts) таблицу не создаёт: запускать его
+  // только после выката ветки на test; иначе core упадёт без потерь
+  // (транзакция откатится).
   await tx.query(
     `DELETE FROM chat_context_resets
       WHERE user_id = $1
