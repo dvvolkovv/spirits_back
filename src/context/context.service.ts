@@ -4,6 +4,8 @@ import { TripService } from '../trip/trip.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import { RecallService } from './recall.service';
+import { afterReset } from '../chat/context-reset/after-reset';
+import { ChatContextResetService } from '../chat/context-reset/context-reset.service';
 import {
   BuiltContext, ConsumerProfile, FALLBACK_TZ, PROFILES, SectionName, SectionStat, TOTAL_BUDGET,
 } from './context.types';
@@ -36,6 +38,10 @@ export class ContextService {
     @Optional() private readonly neo4j?: Neo4jService,
     @Optional() private readonly businessProfile?: BusinessProfileService,
     @Optional() private readonly recall?: RecallService,
+    // Точка «Чистого листа» — для раздела «Из переписки». Необязательная, как
+    // и остальное: без неё переписка идёт целиком, как до точки.
+    // Тип — класс (сторож design:paramtypes — context.history-reset.spec.ts).
+    @Optional() private readonly contextResets?: ChatContextResetService,
   ) {}
 
   async build(
@@ -307,15 +313,21 @@ export class ContextService {
 
   private async sectionHistory(userId: string, agentId = 12, budget = TOTAL_BUDGET): Promise<string> {
     const res = await this.pg.query(
-      `SELECT sender_type, content FROM custom_chat_history
+      `SELECT sender_type, content, created_at FROM custom_chat_history
        WHERE session_id = $1 ORDER BY created_at DESC LIMIT 20`,
       [`${userId}_${agentId}`],
     );
     if (!res.rows?.length) return '';
+    // После точки «Чистого листа» — только разговор после неё: ассистент в
+    // чате старое уже забыл, и звонок не должен его возвращать. Ничего нового
+    // после точки — раздела нет, как при пустой ленте.
+    const resetAt = await this.contextResetAtSafe(userId, String(agentId));
+    const rows = afterReset(res.rows, resetAt, (r: any) => r.created_at);
+    if (!rows.length) return '';
     const head = '--- Из переписки ---\n';
     let left = budget - head.length;
     const lines: string[] = [];
-    for (const r of res.rows) {
+    for (const r of rows) {
       const who = r.sender_type === 'human' ? 'Пользователь' : 'Ассистент';
       const text = String(r.content || '').replace(/\s+/g, ' ').trim();
       if (!text) continue;
@@ -326,6 +338,18 @@ export class ContextService {
       lines.push(line);
     }
     return lines.length ? head + lines.reverse().join('\n') : '';
+  }
+
+  /** Точка «Чистого листа» пары; сбой чтения — без точки (spec 2026-11-17-context-reset, «Риски»). */
+  private async contextResetAtSafe(userId: string, assistantId: string): Promise<Date | null> {
+    if (!this.contextResets) return null;
+    try {
+      return await this.contextResets.get(userId, assistantId);
+    } catch (e: any) {
+      // Без текста разговора: только пара и причина.
+      this.logger.warn(`context reset lookup failed (${userId}_${assistantId}): ${e?.message}`);
+      return null;
+    }
   }
 
   /**

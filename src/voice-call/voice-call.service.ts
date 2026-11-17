@@ -7,6 +7,8 @@ import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { CASH_TOKENS_PER_USD } from '../common/billing-rates';
 import { ChatService } from '../chat/chat.service';
+import { afterReset } from '../chat/context-reset/after-reset';
+import { ChatContextResetService } from '../chat/context-reset/context-reset.service';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import { LiveKitClient } from './livekit.client';
@@ -121,6 +123,10 @@ export class VoiceCallService implements OnModuleInit {
     // Сборщик контекста. Необязательный по той же причине, что и остальные:
     // без него разговор состоится, просто Роман будет знать меньше.
     @Optional() private readonly context?: ContextService,
+    // Точка «Чистого листа» — для старой сборки преамбулы (действующая берёт
+    // её в ContextService). Без неё переписка идёт целиком, как до точки.
+    // Тип — класс (сторож design:paramtypes — voice-call.context-reset.spec.ts).
+    @Optional() private readonly contextResets?: ChatContextResetService,
   ) {}
 
   /**
@@ -251,15 +257,20 @@ export class VoiceCallService implements OnModuleInit {
     const profile = await this.profileBlock(userId);
 
     const res = await this.pg.query(
-      `SELECT sender_type, content FROM custom_chat_history
+      `SELECT sender_type, content, created_at FROM custom_chat_history
        WHERE session_id = $1 ORDER BY created_at DESC LIMIT $2`,
       [`${userId}_${agentId}`, PREAMBLE_MSG_LIMIT],
     );
     if (!res.rows.length) return profile;
+    // После точки «Чистого листа» — профиль и только разговор после неё:
+    // ассистент в чате старое уже забыл, и звонок не должен его возвращать.
+    const resetAt = await this.contextResetAtSafe(userId, String(agentId));
+    const rows = afterReset(res.rows, resetAt, (r: any) => r.created_at);
+    if (!rows.length) return profile;
 
     const lines: string[] = [];
     let budget = PREAMBLE_CHAR_LIMIT;
-    for (const r of res.rows) {
+    for (const r of rows) {
       // «Ассистент», а не «Роман»: preamble уходит модели, которая сама и
       // есть этот ассистент, и чужое имя в её собственных репликах сбивает.
       const who = r.sender_type === 'human' ? 'Пользователь' : 'Ассистент';
@@ -272,6 +283,18 @@ export class VoiceCallService implements OnModuleInit {
     }
     const history = lines.reverse().join('\n');
     return profile ? `${profile}\n\n${history}` : history;
+  }
+
+  /** Точка «Чистого листа» пары; сбой чтения — без точки (spec 2026-11-17-context-reset, «Риски»). */
+  private async contextResetAtSafe(userId: string, assistantId: string): Promise<Date | null> {
+    if (!this.contextResets) return null;
+    try {
+      return await this.contextResets.get(userId, assistantId);
+    } catch (e: any) {
+      // Без текста разговора: только пара и причина.
+      this.logger.warn(`context reset lookup failed (${userId}_${assistantId}): ${e?.message}`);
+      return null;
+    }
   }
 
   /**
@@ -587,7 +610,7 @@ export class VoiceCallService implements OnModuleInit {
     // Так уже дважды терялся транскрипт целиком.
     void this.finishSummary(callId, call.user_id, transcript, durationSec, participants)
       .catch((e) => this.logger.error(`[complete] резюме для ${callId} не собрано: ${e?.message}`));
-    void this.consolidateCall(call.user_id, payload.transcript)
+    void this.consolidateCall(call.user_id, payload.transcript, call.started_at)
       .catch((e) => this.logger.error(`[complete] профиль по ${callId} не обновлён: ${e?.message}`));
   }
 
@@ -629,6 +652,11 @@ export class VoiceCallService implements OnModuleInit {
   private async consolidateCall(
     userId: string,
     transcript: CompletePayload['transcript'],
+    // Начало звонка (voice_calls.started_at): created_at задач из него. Без
+    // этого задача, извлечённая в фоне после звонка, получила бы момент
+    // вставки и проскочила бы точку «Чистого листа», поставленную после
+    // разговора. Начало, а не конец: разговор, начатый до точки, — старый.
+    startedAt?: Date | string | null,
   ): Promise<void> {
     if (!transcript?.length) return;
 
@@ -645,7 +673,12 @@ export class VoiceCallService implements OnModuleInit {
     // фактов о собеседнике не содержит.
     if (!said) return;
 
-    await this.chat.consolidateAfterChatPublic(userId, String(HOST_AGENT_ID), said, side('assistant'));
+    const turnAt = startedAt ? new Date(startedAt) : undefined;
+    await this.chat.consolidateAfterChatPublic(
+      userId, String(HOST_AGENT_ID), said, side('assistant'),
+      // Нечитаемое время — как раньше, момент вставки (решает TasksService).
+      turnAt && Number.isFinite(turnAt.getTime()) ? turnAt : undefined,
+    );
     this.logger.log(`[complete] профиль обновлён по разговору (${transcript.length} реплик)`);
   }
 
