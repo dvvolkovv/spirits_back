@@ -57,9 +57,26 @@ function chatUploadsSaveBudgetMs(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : CHAT_UPLOADS_SAVE_BUDGET_MS_DEFAULT;
 }
 
+/**
+ * Адрес ассистента для точки «Чистого листа» — в той форме, в какой его шлёт
+ * чат: id штатного ассистента числом или пользовательский `custom:<uuid>`
+ * (AssistantSelection.tsx, ChatService.resolveAgent). Иное — не та пара.
+ */
+const RESET_ASSISTANT_RE = /^(\d{1,12}|custom:[0-9a-f-]{36})$/i;
+
+/**
+ * Предупреждение об отвергнутой метке старого клиента — не чаще раза в час на
+ * пользователя: вкладка с кривыми часами шлёт одну и ту же метку каждый ход.
+ * Память — не больше LEGACY_FRESH_WARN_MAX_USERS записей, сверх — с нуля.
+ */
+const LEGACY_FRESH_WARN_EVERY_MS = 60 * 60 * 1000;
+const LEGACY_FRESH_WARN_MAX_USERS = 1000;
+
 @Controller('')
 export class ChatController {
   private readonly logger = new Logger(ChatController.name);
+  // userId → когда последний раз предупреждали об отвергнутой метке.
+  private readonly legacyFreshWarnedAt = new Map<string, number>();
 
   constructor(
     private readonly chatService: ChatService,
@@ -84,13 +101,38 @@ export class ChatController {
    * прежней памятью.
    */
   private async applyLegacyFresh(userId: string, assistantId: string, freshTs: unknown): Promise<void> {
-    const at = legacyFreshResetAt(freshTs, Date.now());
-    if (!at || !this.contextResets) return;
+    const now = Date.now();
+    const at = legacyFreshResetAt(freshTs, now);
+    if (!at) {
+      this.warnRejectedLegacyFresh(userId, assistantId, freshTs, now);
+      return;
+    }
+    if (!this.contextResets) return;
     try {
       await this.contextResets.reset(userId, assistantId, at);
     } catch (e: any) {
       this.logger.warn(`legacy fresh reset failed (${userId}_${assistantId}): ${e?.message}`);
     }
+  }
+
+  /**
+   * Метка старого клиента отвергнута (из будущего за окном или раньше 2024):
+   * «Чистый лист» у него молча не сработал. В журнал — только пара и сдвиг
+   * метки от now в секундах, без текста сообщений; не чаще раза в час на
+   * пользователя. Не число — сдвига нет, молчим.
+   */
+  private warnRejectedLegacyFresh(userId: string, assistantId: string, freshTs: unknown, now: number): void {
+    const s = freshTs === null || freshTs === undefined ? '' : String(freshTs);
+    const ms = Number(s);
+    if (!/^\d{6,}$/.test(s) || !Number.isFinite(ms)) return;
+    const last = this.legacyFreshWarnedAt.get(userId);
+    if (last !== undefined && now - last < LEGACY_FRESH_WARN_EVERY_MS) return;
+    if (this.legacyFreshWarnedAt.size >= LEGACY_FRESH_WARN_MAX_USERS) this.legacyFreshWarnedAt.clear();
+    this.legacyFreshWarnedAt.set(userId, now);
+    const shift = Math.round((ms - now) / 1000);
+    this.logger.warn(
+      `legacy fresh: метка отвергнута (${userId}_${assistantId}), сдвиг ${shift >= 0 ? '+' : ''}${shift} с`,
+    );
   }
 
   /**
@@ -314,6 +356,16 @@ export class ChatController {
     // второй раз тем же вызовом.
     const storeBuild = isStoreBuild(req.headers['x-linkeon-distribution']);
 
+    // «Чистый лист» старого клиента — точка (spec 2026-11-17-context-reset).
+    // Изолированной сессии у загрузок больше нет: пинги файлов не шлют. Точка —
+    // до шлагбаума нуля, как в текстовом ходе (там шлагбаум внутри streamChat),
+    // и до buildUploadHandoff: ключ релея, хвост и память загрузок читают её.
+    // Ключ ассистента — тот же assistantId (с запасным 'Роман'), что в
+    // `${userId}_${assistantId}` и у handoff, иначе точка легла бы мимо сессии.
+    // Тело здесь multipart, поэтому флаг приезжает строкой, а не булевым.
+    const freshFlag = body.fresh === true || body.fresh === 'true';
+    if (freshFlag) await this.applyLegacyFresh(userId, String(assistantId), body.freshTs);
+
     // Шлагбаум по балансу — тот же, что на обычном ходе чата (chat.service.ts,
     // «Check token balance»). До 06.09.2026 его здесь не было вовсе: загрузка
     // файлов не только не тарифицировалась, но и не спрашивала баланс, то есть
@@ -346,15 +398,6 @@ export class ChatController {
     if (this.neo4j) {
       try { profileText = await this.neo4j.getProfileDescription(userId); } catch {}
     }
-
-    // «Чистый лист» старого клиента — точка (spec 2026-11-17-context-reset).
-    // Изолированной сессии у загрузок больше нет: пинги файлов не шлют. Точка —
-    // до buildUploadHandoff: ключ релея, хвост и память загрузок читают её.
-    // Ключ ассистента — тот же assistantId (с запасным 'Роман'), что в
-    // `${userId}_${assistantId}` и у handoff, иначе точка легла бы мимо сессии.
-    // Тело здесь multipart, поэтому флаг приезжает строкой, а не булевым.
-    const freshFlag = body.fresh === true || body.fresh === 'true';
-    if (freshFlag) await this.applyLegacyFresh(userId, String(assistantId), body.freshTs);
 
     // Ключ сессии, персона и хвост переписки — те же, что у текстового хода.
     // Отдельная сборка здесь однажды уже разошлась с основной и на три недели
@@ -777,10 +820,20 @@ export class ChatController {
   @Post('chat/reset-context')
   @UseGuards(JwtGuard)
   async resetContext(@CurrentUser() user: any, @Body() body: any, @Res() res: Response) {
-    const assistantId = body?.assistantId === undefined || body?.assistantId === null ? '' : String(body.assistantId).trim();
-    if (!assistantId || assistantId.length > 100) return res.status(400).json({ error: 'assistantId is required' });
+    // Только строка или число и без trim: chat() адрес не тримит, и точка
+    // с пробелами легла бы не на ту пару.
+    const raw = body?.assistantId;
+    const assistantId = typeof raw === 'number' ? String(raw) : typeof raw === 'string' ? raw : '';
+    if (!RESET_ASSISTANT_RE.test(assistantId)) return res.status(400).json({ error: 'invalid assistantId' });
     if (!this.contextResets) return res.status(503).json({ error: 'context reset unavailable' });
-    const resetAt = await this.contextResets.reset(user.userId, assistantId);
+    let resetAt: Date;
+    try {
+      resetAt = await this.contextResets.reset(user.userId, assistantId);
+    } catch (e: any) {
+      // Как у истории: без точки, но внятным кодом, а не голым 500.
+      this.logger.warn(`context reset failed (${user.userId}_${assistantId}): ${e?.message}`);
+      return res.status(503).json({ error: 'context reset unavailable' });
+    }
     return res.status(200).json({ resetAt: resetAt.toISOString() });
   }
 
