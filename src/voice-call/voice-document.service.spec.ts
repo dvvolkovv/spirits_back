@@ -52,6 +52,19 @@ function makeStorage(fail = false) {
 /** Гейт K1b в INSERT истории: та же форма, что saveUserMessageRow в chat.service. */
 const HISTORY_GATE_RE = /WHERE EXISTS \(SELECT 1 FROM user_id u WHERE u\.internal_id = \$\d+ AND u\.state = 'active'\)/;
 
+/**
+ * Номер плейсхолдера internal_id внутри гейта. Тест связывает его с позицией
+ * userId в массиве параметров: «$4 при пяти параметрах» сравнил бы internal_id
+ * с tokens — у живых записи молча пропали бы, а проверка «гейт есть» и
+ * «userId последний» осталась бы зелёной.
+ */
+function gatePlaceholder(sql: string): number {
+  const m = /WHERE EXISTS \(SELECT 1 FROM user_id u WHERE u\.internal_id = \$(\d+) AND u\.state = 'active'\)/
+    .exec(sql.replace(/\s+/g, ' '));
+  if (!m) throw new Error(`в SQL нет гейта: ${sql}`);
+  return Number(m[1]);
+}
+
 function makePg(jobRows: any[] = [], transcriptRows: any[] = []) {
   const history: any[] = [];
   const charges: any[] = [];
@@ -890,7 +903,7 @@ describe('удалённый аккаунт: документ и заметка 
     expect(pg.history.filter((h: any) => h.sender_type === 'ai')).toHaveLength(0);
   });
 
-  it('каждая запись в историю несёт гейт в самом INSERT, userId — последним параметром', async () => {
+  it('каждая запись в историю несёт гейт в самом INSERT, $N гейта указывает на userId (последний параметр)', async () => {
     const pg = makePg();
     let fail = false;
     const chat = { generateAgentReplyWithCharge: jest.fn(async () => {
@@ -911,7 +924,9 @@ describe('удалённый аккаунт: документ и заметка 
     expect(pg.history).toHaveLength(4);
     for (const row of pg.history) {
       expect(row.sql.replace(/\s+/g, ' ')).toMatch(HISTORY_GATE_RE);
-      expect(row.params[row.params.length - 1]).toBe('user-1');
+      const n = gatePlaceholder(row.sql);
+      expect(row.params[n - 1]).toBe('user-1');
+      expect(n).toBe(row.params.length);
     }
   });
 });

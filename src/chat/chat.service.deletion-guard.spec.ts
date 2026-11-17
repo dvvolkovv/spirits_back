@@ -97,6 +97,7 @@ describe('saveChatHistory — gate на активный аккаунт', () => 
  */
 describe('streamChat, ссылка на встречу — gate на активный аккаунт', () => {
   const GATE_RE = /WHERE EXISTS \(SELECT 1 FROM user_id u WHERE u\.internal_id = \$\d+ AND u\.state = 'active'\)/;
+  const GATE_N_RE = /WHERE EXISTS \(SELECT 1 FROM user_id u WHERE u\.internal_id = \$(\d+) AND u\.state = 'active'\)/;
   const LINK = 'заходи https://my.linkeon.io/room/ABC234';
 
   function makeMeetingService(state: string) {
@@ -107,8 +108,10 @@ describe('streamChat, ссылка на встречу — gate на актив�
         const s = sql.replace(/\s+/g, ' ').trim();
         if (/INSERT INTO custom_chat_history/.test(s)) {
           // Семантика прод-SQL: с гейтом — только живому, без гейта — всегда.
-          const userId = String(params[params.length - 1]);
-          if (GATE_RE.test(s) && users.get(userId) !== 'active') return { rows: [], rowCount: 0 };
+          // Аккаунт берётся по номеру плейсхолдера из гейта, а не «последний
+          // параметр»: неверный $N сравнил бы internal_id с чужим значением.
+          const gate = GATE_N_RE.exec(s);
+          if (gate && users.get(String(params[Number(gate[1]) - 1])) !== 'active') return { rows: [], rowCount: 0 };
           saved.push({ sql: s, params });
           return { rows: [], rowCount: 1 };
         }
@@ -142,7 +145,7 @@ describe('streamChat, ссылка на встречу — gate на актив�
     expect(h.saved).toHaveLength(0);
   });
 
-  it('активный аккаунт: реплика и карточка пишутся как раньше, userId — последним параметром', async () => {
+  it('активный аккаунт: реплика и карточка пишутся как раньше, $N гейта указывает на userId', async () => {
     const h = makeMeetingService('active');
 
     await h.svc.streamChat('u-k1b', LINK, '7', 'u-k1b_7', '', h.res);
@@ -156,7 +159,10 @@ describe('streamChat, ссылка на встречу — gate на актив�
     expect(card.params[2]).toContain('{{meeting_join: code=ABC234');
     for (const row of h.saved) {
       expect(row.sql).toMatch(GATE_RE);
-      expect(row.params[row.params.length - 1]).toBe('u-k1b');
+      // $N гейта указывает именно на userId, и это последний параметр.
+      const n = Number(GATE_N_RE.exec(row.sql)![1]);
+      expect(row.params[n - 1]).toBe('u-k1b');
+      expect(n).toBe(row.params.length);
     }
     expect(h.writes.find((w) => w.type === 'end')?.content).toContain('{{meeting_join: code=ABC234');
   });
