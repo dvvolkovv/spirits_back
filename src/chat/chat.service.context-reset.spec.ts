@@ -1,5 +1,8 @@
 import 'reflect-metadata';
+import * as fs from 'fs';
+import * as path from 'path';
 import { Readable } from 'stream';
+import * as ts from 'typescript';
 import axios from 'axios';
 import { ChatService } from './chat.service';
 import { ChatContextResetService } from './context-reset/context-reset.service';
@@ -482,6 +485,48 @@ describe('ChatService: дедуп и точка', () => {
  * провайдер, и @Optional() молча подставил бы undefined — точка на проде не
  * работала бы никогда, а тесты выше это бы не заметили.
  */
+/**
+ * Точка — обязательный параметр uploadContextBlock: с необязательной вызов
+ * без неё (ветка Маши из main, память загрузок) молча скомпилировался и
+ * вернул ассистенту файлы до «Чистого листа». Обязательный параметр ловит
+ * такой вызов tsc, а этот пин держит саму обязательность: ts-jest типы не
+ * проверяет (isolatedModules), а tsc -p tsconfig.build.json спеки не видит.
+ */
+describe('uploadContextBlock: точка «Чистого листа» — обязательный параметр', () => {
+  const file = path.join(__dirname, 'chat.service.ts');
+  const sf = ts.createSourceFile(file, fs.readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
+  let decl: ts.MethodDeclaration | undefined;
+  const calls: ts.CallExpression[] = [];
+  const visit = (node: ts.Node) => {
+    if (ts.isMethodDeclaration(node) && node.name.getText(sf) === 'uploadContextBlock') decl = node;
+    if (
+      ts.isCallExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      node.expression.name.text === 'uploadContextBlock'
+    ) calls.push(node);
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+
+  it('since: Date | null — без «?» и без значения по умолчанию', () => {
+    expect(decl).toBeDefined();
+    const since = decl!.parameters.find((p) => p.name.getText(sf) === 'since');
+    expect(since).toBeDefined();
+    expect(since!.questionToken).toBeUndefined();
+    expect(since!.initializer).toBeUndefined();
+    expect(since!.type?.getText(sf).replace(/\s/g, '')).toBe('Date|null');
+  });
+
+  it('каждый вызов передаёт точку хода (resetAt) четвёртым аргументом', () => {
+    // Релей, загрузка файла (buildUploadHandoff) и Маша.
+    expect(calls.length).toBeGreaterThanOrEqual(3);
+    for (const call of calls) {
+      expect(call.arguments).toHaveLength(4);
+      expect(call.arguments[3].getText(sf)).toBe('resetAt');
+    }
+  });
+});
+
 describe('ChatService: DI-тип точки «Чистого листа»', () => {
   it('конструктор объявляет зависимость классом ChatContextResetService', () => {
     const paramTypes = Reflect.getMetadata('design:paramtypes', ChatService);
