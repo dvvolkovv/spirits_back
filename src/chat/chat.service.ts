@@ -35,6 +35,7 @@ import { ASK_RULE } from './ask-rule';
 import { WORK_RULES } from './work-rules';
 import { resultRules } from './result-rules';
 import { chatFailureText } from './chat-failure-texts';
+import { BillingDecision, TurnDelivery, billingDecision } from './partial-billing';
 import { relaySessionKey } from './relay-session';
 import { productsRelayFields } from './products-relay-fields';
 import { LinkeonRelayFields, appendLinkeonFields, linkeonRelayFields, relayFsKey } from './linkeon-relay-fields';
@@ -128,6 +129,11 @@ export interface ChargeFacts {
   taken?: ChargeTaken;
   durationMs: number;
   replyChars: number;
+  /**
+   * Списано за оборванный ход — причина обрыва из done.failReason
+   * (partial-billing.ts, решение владельца 17.11.2026). Нет поля — обычный ход.
+   */
+  partial?: string;
 }
 
 /** turn — счёт CLI за ход, floor — страховка (доля формулы), usage — формула целиком. */
@@ -2276,6 +2282,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
     const streamStartTime = Date.now();
     const chunks: string[] = []; // hoisted so catch block can access partial response
+    // Текст МОДЕЛИ, ушедший человеку (delta/text/result), — без служебных
+    // реплик релея (notice), ссылок на файлы и дописок бэка (маркеры,
+    // карточки). По нему решается, было ли что списывать за оборванный ход, и
+    // считается длина для запасного пути списания (partial-billing.ts).
+    let modelText = '';
     // M4: хвост карточки продукта, который успел дописать обычный путь (см.
     // «Карточки продуктов, заведённые этим ходом» ниже), ДО того, как апстрим
     // упал уже после него. Без этой памятки catch-ветка чистит ОБЪЕДИНЁННЫЙ
@@ -2353,9 +2364,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
     const answerRoute = await resolveAnswerProvider(probe, userId, this.llmProvider);
     // Релей сообщил, что ход закончился БЕЗ финального ответа: упёрлись в потолок
     // шагов, ход прерван новым сообщением пользователя, отказ CLI или сбой связи.
-    // Такой ход не тарифицируется — платить за пустоту пользователь не должен.
-    // Расход перед Anthropic при этом реален, поэтому частота таких ходов уезжает
-    // в chat_quality: рост — это счёт, который мы оплачиваем в одиночку.
+    // С 17.11.2026 (решение владельца) такой ход списывается по фактическому
+    // расходу, если человек успел что-то получить — текст модели или файл, — и
+    // причина из PARTIAL_BILLED_REASONS (partial-billing.ts). Сбой, после
+    // которого не пришло ничего, не тарифицируется. Для мониторинга ход в любом
+    // случае неудачный: частота таких ходов уезжает в chat_quality (failed,
+    // fail_reason, partial_billed) — несписанный расход мы оплачиваем в одиночку.
     let turnFailed = false;
     let failReason = '';
     // Чем ответил релей (done.provider/fallback) — в chat_quality.
@@ -2379,6 +2393,17 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // (RelayDrainingError.lastRefusal): '503' — выкат, '502'/'ECONNREFUSED' —
     // авария. В chat_quality рядом с fail_reason relay_draining/relay_superseded.
     let relayRefusal: string | undefined;
+
+    // Решение о списании — одно на ход (partial-billing.ts): его читают и
+    // индикатор «N токенов» в `end`, и persistResponse; разойдись они — человек
+    // увидел бы одно, а списалось бы другое. Зовётся по итогам потока, когда
+    // turnFailed, текст модели и файлы хода уже известны. Текст — из chunks, а
+    // не fullText persistResponse: тот подменяет отказ CLI заглушкой, а
+    // turnBilling узнаёт отказ именно по исходному тексту.
+    const decideBilling = (): BillingDecision => this.turnBilling(
+      this.stripLeakedToolSyntax(chunks.join('').trim()),
+      { failed: turnFailed, failReason, modelChars: modelText.length, files: pendingFiles.length },
+    );
 
     // Single persistence point — dedupe via `saved` flag so success and error paths
     // both call but only one actually writes.
@@ -2406,6 +2431,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
         failReason = failReason || 'cli_fatal_text';
         fullText = chatFailureText('cliFatal', userLanguage, { storeBuild });
       }
+      // Решение о списании — то же, что ушло в индикатор `end` (decideBilling
+      // выше): отказ CLI оно узнаёт само, по исходному тексту из chunks.
+      const billing = decideBilling();
       if (final) {
         // Quality-телеметрия: пустой ответ / англ-утечка / объём — для агрегатов
         // и алертов регрессии (инициатива «гарантия качества», беклог a867ef3b).
@@ -2425,6 +2453,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
             lang_mismatch: this.looksLanguageMismatch(fullText, userLanguage, message),
             failed: turnFailed,
             fail_reason: failReason || undefined,
+            // Оборванный ход, списанный за пришедшее (partial-billing.ts): для
+            // мониторинга он по-прежнему failed, а списание видно здесь.
+            partial_billed: billing.partial ? true : undefined,
             relay_refusal: relayRefusal,
             provider: turnProvider,
             fallback: turnFallback || undefined,
@@ -2451,15 +2482,23 @@ ${LanguageService.buildDirective(userLanguage)}`;
       if (!aiText) return; // skip empty intermediate persists
       // ЭТО реальная точка списания (ниже addTokenTask). Логируем только здесь:
       // путь показа считает то же самое, дублировать в лог незачем.
-      const charge = this.computeSdkCharge(agentUsage, agentCostUsd, fullText, agentTurnCost.usd);
-      // Ход без финального ответа пользователю не выставляется — решение владельца.
-      // Расход перед Anthropic всё равно понесён, поэтому пишем его в лог явно:
-      // иначе «бесплатные» ходы станут невидимой статьёй затрат.
-      const textCost = turnFailed ? 0 : charge.tokens;
-      const logLine = turnFailed
+      // У оборванного хода длина для запасного пути — текст модели, без
+      // служебной реплики релея и дописок бэка (partial-billing.ts).
+      const charge = this.computeSdkCharge(
+        agentUsage, agentCostUsd, billing.partial ? modelText : fullText, agentTurnCost.usd,
+      );
+      // Решение владельца 17.11.2026: оборванный ход, после которого человек
+      // что-то получил, списывается по фактическому расходу — billing[partial:…].
+      // Сбой без ответа не выставляется. Расход перед Anthropic всё равно
+      // понесён, поэтому пишем его в лог явно: иначе «бесплатные» ходы станут
+      // невидимой статьёй затрат.
+      const textCost = billing.billable ? charge.tokens : 0;
+      const logLine = !billing.billable
         ? `billing[skipped:${failReason}]: ход без финального ответа — не тарифицирован, ` +
           `иначе списали бы ${charge.tokens} (${charge.note})`
-        : `billing[${charge.source}]: tokens=${textCost} ${charge.note}`;
+        : billing.partial
+          ? `billing[partial:${billing.partial}:${charge.source}]: tokens=${textCost} ${charge.note}`
+          : `billing[${charge.source}]: tokens=${textCost} ${charge.note}`;
       if (turnFailed || charge.source === 'length') this.logger.warn(logLine);
       else this.logger.log(logLine);
 
@@ -2468,7 +2507,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // смотреть логи руками — сам по себе такой ход ничем себя не обозначает.
       // fire-and-forget — алерт не должен влиять на списание.
       //
-      // Сравниваем charge.tokens, а не textCost: у оборванного хода textCost=0,
+      // Сравниваем charge.tokens, а не textCost: у несписанного сбоя textCost=0,
       // и дорогой сбой иначе прошёл бы молча — а он-то как раз и интересен.
       await this.alertExpensiveTurn(userId, assistantId, charge, textCost);
 
@@ -2497,10 +2536,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
           await this.saveChatHistory(userId, assistantId, message, aiText, textCost, sessOverride);
         }
         if (fullText.length > 0) {
-          // Списание — только за ход, доведённый до финального ответа. Обучение
-          // профиля и разбор задач идут в любом случае: оборванный ход всё равно
-          // был настоящим разговором, и терять из него контекст незачем.
-          if (!turnFailed) {
+          // Списание — за ход с ответом, в том числе оборванный, если человек
+          // успел что-то получить (billing.billable, partial-billing.ts).
+          // Обучение профиля и разбор задач идут в любом случае: оборванный ход
+          // всё равно был настоящим разговором, и терять из него контекст незачем.
+          if (billing.billable) {
             const turnCostUsd = agentTurnCost.usd;
             await this.addTokenTask(userId, 0, textCost, agentId, {
               costUsd: Number(agentCostUsd.toFixed(4)),
@@ -2509,11 +2549,12 @@ ${LanguageService.buildDirective(userLanguage)}`;
               taken: charge.taken,
               durationMs: Date.now() - streamStartTime,
               replyChars: fullText.length,
+              ...(billing.partial ? { partial: billing.partial } : {}),
             });
             // Страховка сработала на ЗАПИСАННОМ списании — релей, похоже, ошибся.
             this.alertTurnCostFloor(userId, assistantId, charge, textCost);
             // Сторож роста стоимости: ход за ходом дороже — алерт. Только здесь,
-            // за записанным списанием: пустой ответ, оборванный ход и сбой
+            // за записанным списанием: пустой ответ, несписанный сбой и сбой
             // записи истории до списания не доходят — значит, и до сторожа.
             // Не ждём: ход от него не зависит.
             void this.costGrowth?.recordTurn(
@@ -2694,6 +2735,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
                   if (ev.type === 'delta' || ev.type === 'text') {
                     const text = joiner.text(ev.text);
                     chunks.push(text);
+                    // Текст модели — отдельно от служебных реплик (partial-billing.ts).
+                    if (typeof text === 'string') modelText += text;
                     safeWrite({ type: 'item', content: text });
                   } else if (ev.type === 'notice' && ev.text) {
                     // Служебная реплика платформы («ответ прерван», «упёрлись в
@@ -2718,6 +2761,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
                   } else if (ev.type === 'result' && ev.text) {
                     if (chunks.length === 0) {
                       chunks.push(ev.text);
+                      modelText += String(ev.text);
                       safeWrite({ type: 'item', content: ev.text });
                     }
                   } else if (ev.type === 'done') {
@@ -3037,9 +3081,14 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Fallback нужен, если релей ещё старой сборки и costUsd не шлёт —
       // иначе ход стал бы бесплатным.
       // Картинки/видео списываются MCP-сервисами отдельно (см. toolSpent ниже).
-      // Число для индикатора «X токенов». Считается тем же методом, что и реальное
-      // списание в persistResponse, — иначе юзер увидит одно, а спишется другое.
-      const tokensUsed = this.computeSdkCharge(agentUsage, agentCostUsd, fullText, agentTurnCost.usd).tokens;
+      // Число для индикатора «X токенов». Считается тем же методом и по тому же
+      // решению о списании (decideBilling), что и реальное списание в
+      // persistResponse, — иначе юзер увидит одно, а спишется другое. Сбой, за
+      // который не списали, — 0; оборванный ход — по тексту модели.
+      const billing = decideBilling();
+      const tokensUsed = billing.billable
+        ? this.computeSdkCharge(agentUsage, agentCostUsd, billing.partial ? modelText : fullText, agentTurnCost.usd).tokens
+        : 0;
 
       // Sum up tool-charged tokens (image, video, etc.) during this stream.
       // MCP-tools (MiscService.generateImage, VideoService.createJob,
@@ -3841,8 +3890,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * 23% его баланса за одно сообщение) мы узнали только потому, что полезли
    * смотреть логи руками — сам по себе такой ход ничем себя не обозначает.
    *
-   * Смотрим на `charge.tokens`, а не на списанное: у оборванного хода списано 0,
-   * и дорогой сбой иначе прошёл бы молча — а он-то как раз и интересен.
+   * Смотрим на `charge.tokens`, а не на списанное: у сбоя, за который не
+   * списали (partial-billing.ts), списано 0, и дорогой сбой иначе прошёл бы
+   * молча — а он-то как раз и интересен.
    */
   private async alertExpensiveTurn(
     userId: string,
@@ -3904,6 +3954,22 @@ ${LanguageService.buildDirective(userLanguage)}`;
   async noTokensReply(userId: string, requestLang?: string, opts: NoTokensOpts = {}): Promise<string> {
     const lang = await this.language.resolveUserLanguage(userId, requestLang);
     return noTokensMessage(lang, opts);
+  }
+
+  /**
+   * Решение о списании за ход кабинета (partial-billing.ts) — одно на
+   * индикатор «N токенов» в `end` и на точку списания: веб-ход
+   * (streamUniversalAgent) и ход с файлом (индикатор — контроллер, списание —
+   * persistUploadTurn).
+   *
+   * text — весь текст хода, ушедший человеку. Служебный отказ CLI, долетевший
+   * им целиком (looksCliFailure), — не ответ модели: решение идёт как
+   * cli_fatal_text, которого нет в списке частичного списания, какую бы
+   * причину ни прислал релей.
+   */
+  turnBilling(text: string, d: TurnDelivery): BillingDecision {
+    if (this.looksCliFailure(text)) return billingDecision({ ...d, failed: true, failReason: 'cli_fatal_text' });
+    return billingDecision(d);
   }
 
   /**
