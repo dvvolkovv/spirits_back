@@ -744,3 +744,22 @@ test("known CLI tariff remains billable with the exact current-run cost", async 
   assert.equal(done.turnCostUsd, 0.25);
   assert.equal(done.costBasis, "cli_tariff");
 });
+
+test('server: одинаковые имена и кириллица одной длины — ни один файл не затёрт', async (t) => {
+  const f = await fixture(t, { mode: 'on' });
+  const { response } = await f.requestUpload([
+    { name: 'image.docx', body: 'first-body' },
+    { name: 'image.docx', body: 'second-body' },
+    { name: 'смета.docx', body: 'smeta-body' },
+    { name: 'отчет.docx', body: 'otchet-body' },
+  ]);
+  assert.equal(response.status, 200);
+
+  const dir = path.join(f.dirs.uploadDir, FS_KEY);
+  const names = fs.readdirSync(dir).filter((name) => name.endsWith('.docx'));
+  assert.equal(names.length, 4);
+  assert.ok(names.includes(`${FS_KEY}_image.docx`));
+  assert.ok(names.includes(`${FS_KEY}_image-2.docx`));
+  const bodies = names.map((name) => fs.readFileSync(path.join(dir, name), 'utf8')).sort();
+  assert.deepEqual(bodies, ['first-body', 'otchet-body', 'second-body', 'smeta-body']);
+});
