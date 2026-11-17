@@ -26,9 +26,10 @@ describe('точка /mcp/products', () => {
     const events = { track: jest.fn() };
     const problems = { reportFromAssistant: jest.fn(async () => ({ ok: true, reported: true, say: 'ok' })) };
     const chat = { activeAssistantFor: jest.fn(() => null) };
+    const uploads = { setNote: jest.fn() };
     return {
-      ctrl: new ProductsMcpController(tool as any, files as any, problems as any, chat as any, events as any, language),
-      calls, tool, files, events, problems, chat,
+      ctrl: new ProductsMcpController(tool as any, files as any, problems as any, chat as any, uploads as any, events as any, language),
+      calls, tool, files, events, problems, chat, uploads,
     };
   };
 

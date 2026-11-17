@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Controller,
   Post,
   Get,
@@ -6,6 +7,7 @@ import {
   Req,
   Res,
   Headers,
+  NotFoundException,
   UnauthorizedException,
   Logger,
   Optional,
@@ -28,6 +30,9 @@ import {
 import { ChatFilesService } from '../chat/chat-files/chat-files.service';
 import { FIND_FILES_TOOL, FIND_FILES_TOOL_NAME } from '../chat/chat-files/find-files.tool';
 import { parseFindFilesInput } from '../chat/chat-files/find-files';
+import { NOTE_FILE_TOOL, NOTE_FILE_TOOL_NAME } from '../chat/chat-files/note-file.tool';
+import { ChatUploadsService, UPLOAD_NOTE_MAX_CHARS } from '../chat/chat-uploads/chat-uploads.service';
+import { errKind, logId } from '../chat/chat-uploads/err-kind';
 import { EventsService } from '../events/events.service';
 import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
 import { LINKEON_HELP_TOOL_NAME, executeLinkeonHelp, linkeonHelpTool } from '../platform-kb/linkeon-help';
@@ -68,6 +73,10 @@ export class ProductsMcpController {
     // модуль должен ронять старт, а не молча выключать инструмент.
     private readonly problems: ProblemReportService,
     private readonly chat: ChatService,
+    // Реестр загрузок — для note_file. Тоже без @Optional: McpModule
+    // импортирует ChatUploadsModule, и пропавший провайдер уронит старт, а не
+    // выключит комментарии молча.
+    private readonly uploads: ChatUploadsService,
     @Optional() private readonly events?: EventsService,
     @Optional() private readonly language?: LanguageService,
   ) {}
@@ -98,9 +107,13 @@ export class ProductsMcpController {
   private toolsFor(c: Pick<ProductToolClaims, 'channel' | 'client' | 'scope'>) {
     const help = linkeonHelpTool(this.clientOf(c));
     if (c.scope === 'help') return [help];
+    // Комментарий к загрузке — только в вебе и только при включённой памяти
+    // загрузок (CHAT_UPLOADS_ENABLED): без флага реестр не пишется, и
+    // комментировать нечего. Telegram получит его в очереди 2.
+    const notes = process.env.CHAT_UPLOADS_ENABLED === 'true' ? [NOTE_FILE_TOOL] : [];
     return c.channel === 'telegram'
       ? [...PRODUCT_TOOLS, REPORT_PROBLEM_TOOL, help]
-      : [...PRODUCT_TOOLS, FIND_FILES_TOOL, REPORT_PROBLEM_TOOL, help];
+      : [...PRODUCT_TOOLS, FIND_FILES_TOOL, ...notes, REPORT_PROBLEM_TOOL, help];
   }
 
   /** Вынесено из makeServer ради проверяемости: контракт схемы — часть защиты. */
@@ -154,6 +167,9 @@ export class ProductsMcpController {
       });
       return result;
     }
+    if (name === NOTE_FILE_TOOL_NAME) {
+      return this.noteFile(userId, input);
+    }
     if (name === REPORT_PROBLEM_TOOL_NAME) {
       // Пользователь и канал — из подписи, как у остальных инструментов точки.
       // Ассистент хода — только в вебе: у TG-бота хода в ChatService нет, а
@@ -168,6 +184,45 @@ export class ProductsMcpController {
       });
     }
     return this.tool.execute(userId, input, channel, turn);
+  }
+
+  /**
+   * note_file: комментарий ассистента к загрузке пользователя. Владелец — из
+   * подписи токена (userId из аргументов callTool уже выбросил).
+   *
+   * Ассистент для note_assistant_id: в токене продуктов его нет (там канал,
+   * клиент, вид ассистента staff/custom и метка хода), поэтому — тот же
+   * приём, что у report_problem: ассистент самого свежего хода этого
+   * пользователя (ChatService.activeAssistantFor), хода нет — null. Это
+   * подпись «кто оставил», а не права: писать можно только в свои загрузки.
+   * Инструмент есть только в вебе, поэтому оговорки report_problem про
+   * Telegram здесь не нужны.
+   *
+   * Прочие сбои (pg, сеть) модели — общей фразой: сообщение драйвера может
+   * повторять запрос или id. В журнал — только вид ошибки и id в кавычках,
+   * без текста комментария и владельца.
+   */
+  private async noteFile(userId: string, input: any) {
+    const id = typeof input?.file_id === 'string' ? input.file_id.trim() : '';
+    const note = typeof input?.note === 'string' ? input.note : '';
+    try {
+      const record = await this.uploads.setNote({
+        id,
+        userId,
+        note,
+        assistantId: this.chat.activeAssistantFor(userId),
+      });
+      return { ok: true, id: record.id, note: record.note };
+    } catch (e: any) {
+      if (e instanceof NotFoundException) {
+        return { ok: false, error: 'Файл не найден: передай id из блока загрузок или поле id из find_files.' };
+      }
+      if (e instanceof BadRequestException) {
+        return { ok: false, error: `Комментарий — от 1 до ${UPLOAD_NOTE_MAX_CHARS} символов.` };
+      }
+      this.logger.error(`note_file (id=${logId(id)}): internal failure: ${errKind(e)}`);
+      return { ok: false, error: 'внутренняя ошибка, попробуй позже' };
+    }
   }
 
   private makeServer(authHeader?: string): Server {
