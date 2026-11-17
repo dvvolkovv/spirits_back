@@ -116,7 +116,8 @@ export class ActionPlansService implements OnModuleInit {
     const history = await this.chat.getChatHistory(userId, assistantId, 30, 0);
     // После точки «Чистого листа» план — только по новому разговору: ассистент
     // старое уже не учитывает, и план не должен его воскрешать. Сбой чтения
-    // точки — план по всей выборке, а не отказ; в журнале пара без разговора.
+    // точки — план по всей выборке, а не отказ; в журнале только id
+    // ассистента и вид ошибки (getOrNull), без userId и текста разговора.
     const resetAt = await ChatContextResetService.getOrNull(
       this.contextResets, userId, assistantId, (m) => this.logger.warn(m),
     );
