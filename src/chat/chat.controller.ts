@@ -503,6 +503,11 @@ export class ChatController {
     const agentTurnCost = new RelayTurnCost();
     let turnFailed = false;
     let failReason = '';
+    // Текст МОДЕЛИ, ушедший человеку (delta/text/result), — без служебных
+    // реплик релея, ссылок на файлы и заглушки шлагбаума. По нему решается,
+    // было ли что списывать за оборванный ход, и считается длина для запасного
+    // пути списания (ChatService.uploadTurnCharge, partial-billing.ts).
+    let modelText = '';
     // Исход ожидания релея за шлагбаумом выката: перебит новым сообщением
     // той же сессии или бюджет повтора исчерпан (relay-drain-retry.ts).
     let drainOutcome: 'superseded' | 'exhausted' | null = null;
@@ -592,6 +597,8 @@ export class ChatController {
               if (ev.type === 'delta' || ev.type === 'text') {
                 const text = joiner.text(ev.text);
                 chunks.push(text);
+                // Текст модели — отдельно от служебных реплик (partial-billing.ts).
+                if (typeof text === 'string') modelText += text;
                 safeWrite({ type: 'item', content: text });
               } else if (ev.type === 'notice' && ev.text) {
                 // Служебная реплика платформы — показываем всегда, в отличие от
@@ -609,6 +616,7 @@ export class ChatController {
                 }
               } else if (ev.type === 'result' && ev.text && chunks.length === 0) {
                 chunks.push(ev.text);
+                modelText += String(ev.text);
                 safeWrite({ type: 'item', content: ev.text });
               } else if (ev.type === 'done') {
                 if (ev.failed === true) {
@@ -694,12 +702,16 @@ export class ChatController {
       const fullText = stripProductActionBlocks(chunks.join(''));
 
       if (fullText.length > 0) {
-        // Индикатор считается тем же методом, что и списание в persistUploadTurn.
+        // Индикатор считается тем же вызовом и по тем же данным хода
+        // (ChatService.uploadTurnCharge, partial-billing.ts), что и списание в
+        // persistUploadTurn: и решение, списывать ли оборванный ход, и сумма.
         // Раньше здесь стояла длина ответа в символах: пользователь видел «2073
         // токена» за ход, за который не списали ничего.
-        const shown = turnFailed
-          ? 0
-          : this.chatService.computeUploadCharge(agentUsage, agentCostUsd, fullText, agentTurnCost.usd).tokens;
+        const shown = this.chatService.uploadTurnCharge(
+          fullText,
+          { failed: turnFailed, failReason, modelText, files: pendingFiles.length },
+          agentUsage, agentCostUsd, agentTurnCost.usd,
+        ).tokens;
         safeWrite({
           type: 'end',
           content: fullText,
@@ -757,6 +769,8 @@ export class ChatController {
               durationMs: Date.now() - streamStartTime,
               turnFailed,
               failReason,
+              modelText,
+              files: pendingFiles.length,
               sessionIdOverride: freshSessionId,
               userLanguage: handoff.userLanguage,
               storeBuild,

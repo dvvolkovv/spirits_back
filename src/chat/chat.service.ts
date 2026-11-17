@@ -4010,10 +4010,46 @@ ${LanguageService.buildDirective(userLanguage)}`;
    *
    * Публичная обёртка нужна контроллеру: он показывает число пользователю в
    * событии `end` ДО того, как ход сохранён. Формула одна на оба пути — иначе
-   * повторяется история, из-за которой всё и затевалось.
+   * повторяется история, из-за которой всё и затевалось. С 17.11.2026 оба
+   * пути зовут её через uploadTurnCharge — вместе с решением о списании.
    */
   computeUploadCharge(usage: SdkUsageTotals | null, costUsd: number, text: string, turnCostUsd: number | null = null) {
     return this.computeSdkCharge(usage, costUsd, text, turnCostUsd);
+  }
+
+  /**
+   * Решение о списании и сумма за ход с файлом — одним вызовом для индикатора
+   * «N токенов» в `end` (ChatController.uploadAndChat) и для списания
+   * (persistUploadTurn). Разойдись они — человек увидел бы одно, а списалось бы
+   * другое; поэтому оба места зовут этот метод с одними и теми же данными хода.
+   *
+   * text — весь текст хода, ушедший человеку: по нему turnBilling узнаёт отказ
+   * CLI. modelText — текст МОДЕЛИ (delta/text/result), без служебных реплик
+   * релея и ссылок на файлы. «Пришедшее» и длина для запасного пути у
+   * оборванного хода — по ВИДИМОМУ тексту модели, как у веб-хода
+   * (visibleModelText в streamUniversalAgent): без пробельных кусков и
+   * утёкшего синтаксиса инструментов (stripLeakedToolSyntax заодно обрезает
+   * пробелы). Релей шлёт и пустые text_delta («\n\n»), после них считает, что
+   * текст пошёл, и при обрыве отдаёт transient_after_partial — а человек не
+   * увидел ни слова.
+   *
+   * tokens — сколько списать и показать: 0, если ход не тарифицируется.
+   */
+  uploadTurnCharge(
+    text: string,
+    turn: { failed: boolean; failReason: string; modelText: string; files: number },
+    usage: SdkUsageTotals | null,
+    costUsd: number,
+    turnCostUsd: number | null,
+  ): { billing: BillingDecision; charge: SdkCharge; tokens: number } {
+    const visibleModelText = this.stripLeakedToolSyntax(turn.modelText);
+    const billing = this.turnBilling(text, {
+      failed: turn.failed, failReason: turn.failReason, modelChars: visibleModelText.length, files: turn.files,
+    });
+    // Через публичную обёртку, а не computeSdkCharge: её подменяет спек броска
+    // посреди finally контроллера (chat.upload-chat-files.spec.ts).
+    const charge = this.computeUploadCharge(usage, costUsd, billing.partial ? visibleModelText : text, turnCostUsd);
+    return { billing, charge, tokens: billing.billable ? charge.tokens : 0 };
   }
 
   /**
@@ -4029,8 +4065,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * расхода и не заплатил ничего. Таких ходов с апреля накопилось 640.
    *
    * Стоимость считается заново из `usage`/`costUsd`, а не принимается готовой:
-   * метод должен уметь обнулить её сам (оборванный ход, отказ CLI), и решение
-   * об этом не может жить в контроллере.
+   * метод должен уметь обнулить её сам (сбой без ответа, отказ CLI). Решение и
+   * сумма — uploadTurnCharge, тот же вызов, по которому контроллер показал
+   * индикатор в `end`.
    */
   async persistUploadTurn(p: {
     userId: string;
@@ -4044,6 +4081,15 @@ ${LanguageService.buildDirective(userLanguage)}`;
     durationMs: number;
     turnFailed?: boolean;
     failReason?: string;
+    /**
+     * Текст МОДЕЛИ, ушедший человеку (delta/text/result), — без служебных
+     * реплик релея, ссылок на файлы и заглушек (partial-billing.ts). Решает,
+     * списывать ли оборванный ход, и идёт в запасной путь по длине. Не передан
+     * — оборванный ход без файлов не списывается, как до 17.11.2026.
+     */
+    modelText?: string;
+    /** Файлы хода, ушедшие человеку (outputFiles релея). */
+    files?: number;
     // «Чистый лист»: ход с файлом обязан лечь в ту же историю, что и текстовый,
     // иначе в fresh-чате его видно не будет, а всплывёт он в основном.
     sessionIdOverride?: string;
@@ -4064,33 +4110,51 @@ ${LanguageService.buildDirective(userLanguage)}`;
     let text = p.assistantMsg;
     let turnFailed = p.turnFailed === true;
     let failReason = p.failReason || '';
+    // Решение и сумма — те же, по которым контроллер показал индикатор в `end`
+    // (uploadTurnCharge, partial-billing.ts). Считаются по тексту ДО подмены
+    // отказа CLI заглушкой ниже: по этому тексту turnBilling отказ и узнаёт.
+    const { billing, charge, tokens: textCost } = this.uploadTurnCharge(
+      text,
+      { failed: turnFailed, failReason, modelText: p.modelText ?? '', files: p.files ?? 0 },
+      p.usage, p.costUsd, p.turnCostUsd ?? null,
+    );
 
     // Защита в глубину, та же что в основном пути: служебный отказ CLI, долетевший
     // до нас целым ответом, пользователь не должен увидеть дословно и тем более
     // за него заплатить.
+    //
+    // cliRefusal — для метки журнала: отказ, узнанный по тексту, —
+    // cli_fatal_text, какую бы причину ни прислал релей (turnBilling решает так
+    // же). Как у веб-хода (persistResponse в streamUniversalAgent).
+    let cliRefusal = false;
     if (this.looksCliFailure(text)) {
       this.logger.error(`CLI-отказ долетел как ответ на загрузку (${p.userId}_${p.assistantId}): ${text.slice(0, 120)}`);
       turnFailed = true;
       failReason = failReason || 'cli_fatal_text';
+      cliRefusal = true;
       text = chatFailureText('cliFatal', p.userLanguage, { storeBuild: p.storeBuild });
     }
 
-    const charge = this.computeSdkCharge(p.usage, p.costUsd, text, p.turnCostUsd ?? null);
-    // Ход без финального ответа пользователю не выставляется — решение владельца,
-    // то же самое, что в основном пути. Релей дописывает в такой ход строку
-    // «Токены за прерванный ход не списаны», и она должна оставаться правдой.
-    const textCost = turnFailed ? 0 : charge.tokens;
-    const logLine = turnFailed
-      ? `billing[upload:skipped:${failReason}]: ход без финального ответа — не тарифицирован, ` +
+    // Решение владельца 17.11.2026 — то же, что в основном пути: оборванный
+    // ход, после которого человек что-то получил, списывается по фактическому
+    // расходу (billing[upload:partial:…]); сбой без ответа не выставляется.
+    const logLine = !billing.billable
+      ? `billing[upload:skipped:${cliRefusal ? 'cli_fatal_text' : failReason}]: ход без финального ответа — не тарифицирован, ` +
         `иначе списали бы ${charge.tokens} (${charge.note})`
-      : `billing[upload:${charge.source}]: tokens=${textCost} ${charge.note}`;
+      : billing.partial
+        ? `billing[upload:partial:${billing.partial}:${charge.source}]: tokens=${textCost} ${charge.note}`
+        : `billing[upload:${charge.source}]: tokens=${textCost} ${charge.note}`;
     if (turnFailed || charge.source === 'length') this.logger.warn(logLine);
     else this.logger.log(logLine);
 
     await this.alertExpensiveTurn(p.userId, p.assistantId, charge, textCost);
 
     await this.saveChatHistory(p.userId, p.assistantId, p.userMsg, text, textCost, p.sessionIdOverride);
-    if (!turnFailed) {
+    // Оборванный ход с нулевым расходом (одни файлы, а в done ни usage, ни
+    // стоимости) строку не пишет: планировщик (TokenAccountingService) поднял
+    // бы 0 до минимума в 1 токен, а индикатор и история показали 0. Обычный
+    // ход — как раньше. То же условие — у веб-хода.
+    if (billing.billable && (textCost > 0 || !billing.partial)) {
       await this.addTokenTask(p.userId, 0, textCost, p.assistantId, {
         costUsd: Number(p.costUsd.toFixed(4)),
         turnCostUsd: typeof p.turnCostUsd === 'number' ? Number(p.turnCostUsd.toFixed(4)) : null,
@@ -4098,6 +4162,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
         taken: charge.taken,
         durationMs: p.durationMs,
         replyChars: text.length,
+        ...(billing.partial ? { partial: billing.partial } : {}),
       });
       this.alertTurnCostFloor(p.userId, p.assistantId, charge, textCost);
       // Сторож роста стоимости — как в обычном ходе: только за записанным
