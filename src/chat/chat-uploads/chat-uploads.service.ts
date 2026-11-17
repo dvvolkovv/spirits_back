@@ -450,8 +450,10 @@ export class ChatUploadsService {
         : null;
       await this.pg.query(HISTORY_REWRITE_SQL, [
         record.sessionId,
-        // Посимвольно та строка, что пишет upload-and-chat (chat.controller.ts).
+        // Посимвольно та строка, что пишет upload-and-chat (chat.controller.ts):
+        // сырое имя, иначе replace её не найдёт.
         uploadHistoryLink(record.originalName, this.ownerUrl(record.id)),
+        // Замена — для глаз человека: имя через safeFileName (deleted-line.ts).
         deletedUploadLine(record.originalName, lang),
       ]);
     } catch (e: any) {
