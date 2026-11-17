@@ -48,6 +48,14 @@ describe('chatUploadIdFromUrl', () => {
     expect(chatUploadIdFromUrl('data:image/png;base64,AAAA')).toBeNull();
     expect(chatUploadIdFromUrl('')).toBeNull();
   });
+
+  it('id — только форма UUID 8-4-4-4-12: 36 дефисов или сдвинутые группы не распознаются', () => {
+    expect(chatUploadIdFromUrl(`/webhook/chat-uploads/${'-'.repeat(36)}`)).toBeNull();
+    expect(chatUploadIdFromUrl('/webhook/chat-uploads/777777777-777-4777-8777-777777777777')).toBeNull();
+    expect(chatUploadIdFromUrl('/webhook/chat-uploads/77777777777747778777777777777777----')).toBeNull();
+    expect(chatUploadIdFromUrl('/webhook/chat-uploads/7777777g-7777-4777-8777-777777777777')).toBeNull();
+    expect(chatUploadIdFromUrl(`/webhook/chat-uploads/${ID}/`)).toBe(ID);
+  });
 });
 
 describe('chatUploadSourceId и canonicalChatUploadUrl', () => {
