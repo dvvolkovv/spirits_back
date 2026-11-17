@@ -2,9 +2,11 @@ import 'reflect-metadata';
 import * as http from 'http';
 import { createHmac } from 'crypto';
 import { Readable } from 'stream';
-import { INestApplication, Module, NotFoundException } from '@nestjs/common';
+import * as jsonwebtoken from 'jsonwebtoken';
+import { INestApplication, Logger, Module, NotFoundException } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { JwtService } from '../../common/services/jwt.service';
+import { signProductToolToken } from '../../products/product-tool.token';
 import { ChatUploadsController } from './chat-uploads.controller';
 import { ChatUploadDeleteError, ChatUploadsService } from './chat-uploads.service';
 
@@ -76,6 +78,21 @@ describe('ChatUploadsController: миниатюра и удаление (HTTP)',
     const exp = Math.floor(Date.now() / 1000) + 600;
     return `exp=${exp}&sig=${signature(RECORD_ID, exp)}`;
   };
+  // Истёкший access-токен владельца: тот же вид, что signAccess, срок вышел.
+  // Именно его фронт получает чаще всего — 401 даёт apiClient обновить токен.
+  const expiredBearer = () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = jsonwebtoken.sign(
+      { sub: 'u1', userId: 'u1', type: 'access', iat: now - 120, exp: now - 10 },
+      SECRET,
+    );
+    return { authorization: `Bearer ${token}` };
+  };
+  // Токен инструмента продуктов (уезжает на релей) подписан тем же секретом и
+  // несёт userId владельца, но тип у него свой — для кабинета он не годится.
+  const productToolBearer = () => ({ authorization: `Bearer ${signProductToolToken('u1')}` });
+  const refreshBearer = () => ({ authorization: `Bearer ${jwtService.signRefresh('u1')}` });
+  const garbageBearer = { authorization: 'Bearer not-a-jwt' };
 
   beforeAll(async () => {
     savedSecret = process.env.JWT_SECRET;
@@ -135,9 +152,18 @@ describe('ChatUploadsController: миниатюра и удаление (HTTP)',
     });
 
     it('refresh-токен и мусор в Bearer — 401, сервис не вызывается', async () => {
-      const refresh = { authorization: `Bearer ${jwtService.signRefresh('u1')}` };
-      expect((await send('GET', `${base}/thumb`, refresh)).status).toBe(401);
-      expect((await send('GET', `${base}/thumb`, { authorization: 'Bearer not-a-jwt' })).status).toBe(401);
+      expect((await send('GET', `${base}/thumb`, refreshBearer())).status).toBe(401);
+      expect((await send('GET', `${base}/thumb`, garbageBearer)).status).toBe(401);
+      expect(openThumb).not.toHaveBeenCalled();
+    });
+
+    it('истёкший access-токен — 401 (фронт обновит токен и повторит), сервис не вызывается', async () => {
+      expect((await send('GET', `${base}/thumb`, expiredBearer())).status).toBe(401);
+      expect(openThumb).not.toHaveBeenCalled();
+    });
+
+    it('токен инструмента продуктов — 401, сервис не вызывается', async () => {
+      expect((await send('GET', `${base}/thumb`, productToolBearer())).status).toBe(401);
       expect(openThumb).not.toHaveBeenCalled();
     });
   });
@@ -162,14 +188,37 @@ describe('ChatUploadsController: миниатюра и удаление (HTTP)',
       expect(deleteForOwner).not.toHaveBeenCalled();
     });
 
+    it('refresh-токен, мусор в Bearer, истёкший access и токен продуктов — 401, сервис не вызывается', async () => {
+      expect((await send('DELETE', base, refreshBearer())).status).toBe(401);
+      expect((await send('DELETE', base, garbageBearer)).status).toBe(401);
+      expect((await send('DELETE', base, expiredBearer())).status).toBe(401);
+      expect((await send('DELETE', base, productToolBearer())).status).toBe(401);
+      expect(deleteForOwner).not.toHaveBeenCalled();
+    });
+
     it('ChatUploadDeleteError (MinIO не подтвердил удаление) — 502', async () => {
       deleteForOwner.mockRejectedValueOnce(new ChatUploadDeleteError());
       expect((await send('DELETE', base, bearer('u1'))).status).toBe(502);
     });
 
-    it('прочая ошибка сервиса — 500, а не 502', async () => {
-      deleteForOwner.mockRejectedValueOnce(new Error('db down'));
-      expect((await send('DELETE', base, bearer('u1'))).status).toBe(500);
+    it('прочая ошибка сервиса — 500, а не 502; в журнале вид ошибки и id, без текста и стека', async () => {
+      // Сообщение pg/S3 может повторять ключ `<uuid>/<имя файла>`. Без своего
+      // журнала его вместе со стеком написал бы ExceptionsHandler Nest.
+      const logged = jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+      try {
+        const failure = Object.assign(new Error('db down: u1/Отчёт.pdf'), { code: '57P01' });
+        deleteForOwner.mockRejectedValueOnce(failure);
+        expect((await send('DELETE', base, bearer('u1'))).status).toBe(500);
+
+        const text = logged.mock.calls.map((args) => args.map(String).join(' ')).join('\n');
+        expect(text).toContain('code=57P01');
+        expect(text).toContain(`"${RECORD_ID}"`);
+        expect(text).not.toContain('db down');
+        expect(text).not.toContain('Отчёт');
+        expect(text).not.toMatch(/^\s+at /m);
+      } finally {
+        logged.mockRestore();
+      }
     });
   });
 });

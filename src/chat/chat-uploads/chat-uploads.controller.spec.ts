@@ -2,7 +2,7 @@ import 'reflect-metadata';
 import * as http from 'http';
 import { createHmac } from 'crypto';
 import { PassThrough, Readable } from 'stream';
-import { INestApplication, Module, NotFoundException } from '@nestjs/common';
+import { INestApplication, Logger, Module, NotFoundException } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { ChatUploadsController } from './chat-uploads.controller';
 import { ChatUploadsService } from './chat-uploads.service';
@@ -174,10 +174,22 @@ describe('ChatUploadsController (HTTP)', () => {
 });
 
 describe('ChatUploadsController (ошибка потока)', () => {
-  it('сбой стрима уничтожает ответ и не оставляет процесс висеть', async () => {
+  let logged: jest.SpyInstance;
+  beforeEach(() => {
+    logged = jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+  });
+  afterEach(() => logged.mockRestore());
+
+  it('сбой стрима уничтожает ответ, в журнале вид ошибки и id в кавычках, без текста сообщения', async () => {
+    // Сообщение S3 может повторять ключ объекта `<uuid>/<имя файла>`: в журнал
+    // идёт только вид (errKind), как в сервисе.
+    const failure = Object.assign(new Error('minio gone: u1/Отчёт.pdf'), {
+      name: 'S3ServiceException',
+      $metadata: { httpStatusCode: 503 },
+    });
     const body = new Readable({
       read() {
-        this.destroy(new Error('minio gone'));
+        this.destroy(failure);
       },
     });
     const svc = {
@@ -198,5 +210,37 @@ describe('ChatUploadsController (ошибка потока)', () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
 
     expect(destroy).toHaveBeenCalled();
+    const text = logged.mock.calls.map((args) => args.map(String).join(' ')).join('\n');
+    expect(text).toContain('stream failed: S3ServiceException status=503');
+    expect(text).toContain(`"${RECORD_ID}"`);
+    expect(text).not.toContain('minio gone');
+    expect(text).not.toContain('Отчёт');
+  });
+});
+
+describe('ChatUploadsController (клиент ушёл до начала ответа)', () => {
+  // Клиент оборвал соединение, пока сервис ходил в MinIO: pipe в уже
+  // уничтоженный ответ не сработает, а 'close' больше не придёт — стрим
+  // источника (сокет GetObject) остался бы висеть до серверного таймаута.
+  it.each([
+    ['download', (ctrl: ChatUploadsController, req: any, res: any) => ctrl.download(RECORD_ID, req, res)],
+    ['thumb', (ctrl: ChatUploadsController, req: any, res: any) => ctrl.thumb(RECORD_ID, req, res)],
+  ])('%s: ответ уже уничтожен — стрим источника уничтожается сразу', async (_name, call) => {
+    const body = new PassThrough();
+    const file = { body, originalName: 'a.jpg', mime: 'image/webp', sizeBytes: 1024 };
+    const svc = { openDownload: jest.fn(async () => file), openThumb: jest.fn(async () => file) };
+    const ctrl = new ChatUploadsController(
+      svc as any,
+      { verifyAccess: jest.fn(() => ({ sub: 'u1', type: 'access' })) } as any,
+    );
+    const res: any = new PassThrough();
+    res.setHeader = jest.fn();
+    res.destroy();
+    await new Promise<void>((resolve) => res.once('close', resolve));
+
+    await call(ctrl, { headers: { authorization: 'Bearer t' }, query: {} }, res);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(body.destroyed).toBe(true);
   });
 });
