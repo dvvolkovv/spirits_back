@@ -10,8 +10,12 @@ jest.mock('multer', () => {
   return multer;
 });
 jest.mock('@anthropic-ai/claude-agent-sdk', () => ({
-  ...jest.requireActual('@anthropic-ai/claude-agent-sdk'),
+  // Настоящий пакет — ESM, jest его не грузит (requireActual падает «Cannot
+  // use import statement»). Те же заглушки, что в
+  // __mocks__/@anthropic-ai/claude-agent-sdk.js, только query управляемый.
   query: jest.fn(),
+  tool: (name: string, description: string, schema: unknown, handler: unknown) => ({ name, description, schema, handler }),
+  createSdkMcpServer: (config: unknown) => config,
 }));
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
