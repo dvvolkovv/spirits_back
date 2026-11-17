@@ -1508,6 +1508,17 @@ export function sameResetAt(a: Date | null, b: Date | null): boolean {
 - Create: `src/components/chat/ContextResetDivider.tsx`, `src/components/chat/contextResetWiring.test.ts`
 - Modify: `src/components/chat/ChatInterface.tsx`; тесты `filesWiring.test.ts`, `actionPlanWiring.test.ts`, `filesEventsWiring.test.ts`, `greetingRaceWiring.test.ts`
 
+**Обновление после ревью задачи 12 — имеет приоритет над шагами ниже.** Модуль `contextReset.ts` теперь даёт `ResetMark { at: Date; afterId?: string | null }`, `resetDividerIndex(messages, mark, …)` (якорь важнее времени; первое же сообщение новее точки — черты нет) и `mergePolledReset(prev, polled)` (точка из опроса только вперёд); `sameResetAt` удалён. Причина: локальные сообщения вкладки несут время клиента до перезагрузки (опрос их не подменяет), точку ставят часы базы.
+- Импорт: `parseContextResetAt, resetDividerIndex, mergePolledReset` и тип `ResetMark` (без `sameResetAt`).
+- Состояние: `const [resetMark, setResetMark] = useState<ResetMark | null>(null)` вместо `contextResetAt`.
+- 4e (первая загрузка): до запроса `setResetMark(null)`; после — `const at = parseContextResetAt(data.contextResetAt); setResetMark(at ? { at } : null);` (без якоря: лента целиком серверная).
+- 4f (опрос): `setResetMark(prev => mergePolledReset(prev, parseContextResetAt(data?.contextResetAt)))` — только если ассистент тот же (`selectedAssistantIdRef.current === assistantId`).
+- 4j (`startFreshContext`): ранний выход также при `historyLoading`, `sendingRef.current`, `flushingRef.current` (окна, когда ход вот-вот начнётся; сверь имена рефов в файле); якорь берётся СИНХРОННО после `confirm`, до `await`: `const afterId = messages.length ? messages[messages.length - 1].id : null;`; после ответа — `const at = parseContextResetAt(data?.resetAt); if (at) setResetMark({ at, afterId });` (без запасного `new Date()`: точку по часам клиента не ставим — подхватит опрос).
+- Пока летит `reset-context` (`resettingContext`), отправка сообщения заблокирована (поле/кнопка отправки или общий признак блокировки отправки; если это `sendBlocked` в эффекте досылки — добавь `resettingContext` в его зависимости): ход, ушедший до точки, ответил бы со старой памятью, а лёг бы под черту.
+- `disabled` кнопки «Чистый лист» и пункта меню: `turnBusy || resettingContext || historyLoading` (в wiring-тесте — ровно два места с этим выражением).
+- 4n: `const resetDividerAt = useMemo(() => resetDividerIndex(messages, resetMark, hasMoreHistory), [messages, resetMark, hasMoreHistory]);` (если `hasMore` из сигнатуры убран — без него); черта внизу — когда `resetDividerAt === messages.length`.
+- Wiring-тест: вместо `resetDividerIndex(messages, contextResetAt, hasMoreHistory)` — `resetDividerIndex(messages, resetMark`; опрос — `mergePolledReset(`; первая загрузка и опрос — `parseContextResetAt(data` не меньше двух раз; якорь берётся до первого `await` в `startFreshContext`; нет `sameResetAt`.
+
 - [ ] **Step 1: Падающий wiring-тест** `contextResetWiring.test.ts` (по образцу соседних — читают исходник):
 
 ```ts
