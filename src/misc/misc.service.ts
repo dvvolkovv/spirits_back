@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { Neo4jService } from '../neo4j/neo4j.service';
 import { PgService } from '../common/services/pg.service';
 import { LanguageService } from '../common/services/language.service';
@@ -13,6 +13,8 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import { neutralizeAtMentions, stripWordJoiner } from '../common/agent-guards';
 import { renderBannerOverlay, BannerPosition, BannerTheme } from './banner-overlay';
 import { fetchMediaBytes, ownStaticPath } from '../common/net/own-media';
+import { ChatUploadsService } from '../chat/chat-uploads/chat-uploads.service';
+import { readChatUploadImage } from '../chat/chat-uploads/upload-image-source';
 import { DeletionCancelledError } from '../account-deletion/account-deletion.safe';
 import {
   SelectedProfile,
@@ -30,6 +32,9 @@ import {
 } from '../privacy/profile-privacy';
 
 const ASSETS_BUCKET = 'linkeon-assets';
+
+/** Предел исходника правки картинок — один для внешних ссылок и для загрузок пользователя. */
+const IMAGE_SOURCE_MAX_BYTES = 8 * 1024 * 1024;
 
 /**
  * Хвост URL (путь после префикса бакета) → безопасный object key (Task 12).
@@ -122,6 +127,10 @@ export class MiscService {
     private readonly pg: PgService,
     private readonly storage: StorageService,
     private readonly language: LanguageService,
+    // Загрузки чата как исходник правки (spec 2026-11-16-chat-uploads-media-notes).
+    // Последним и @Optional: спеки собирают сервис позиционно. Без него ссылка
+    // на загрузку отклоняется понятной ошибкой, остальное работает как раньше.
+    @Optional() private readonly chatUploads?: ChatUploadsService,
   ) {
     this.s3 = new S3Client({
       region: process.env.AWS_REGION || 'ru-central1',
@@ -962,7 +971,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
   }
 
   /**
-   * Resolve `/static/…` | absolute URL | data: URL → { b64, mime }.
+   * Resolve `/static/…` | `/webhook/chat-uploads/<id>` | absolute URL | data: URL → { b64, mime }.
    *
    * Ссылку выбирает человек (POST /imageedit и соседи) или модель (инструменты
    * чата, маркеры TG-бота), поэтому качаем через fetchMediaBytes: свой
@@ -970,15 +979,23 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * (внутренние адреса, редиректы туда, DNS rebinding). Раньше `/static/…`
    * склеивался в путь без проверки, и `/static/generated/../../…` читал любой
    * файл сервера.
+   *
+   * Загрузка пользователя (относительная или на нашем домене, с подписью или
+   * без) читается из приватного бакета, а не по HTTP: только владельцем хода
+   * (userId), только image/*, тот же предел. Чужая, удалённая или не картинка —
+   * ошибка с причиной (upload-image-source.ts).
    */
-  private async fetchImageAsBase64(srcUrl: string): Promise<{ b64: string; mime: string }> {
+  private async fetchImageAsBase64(srcUrl: string, userId: string): Promise<{ b64: string; mime: string }> {
     if (srcUrl.startsWith('data:')) {
       const m = srcUrl.match(/^data:([^;]+);base64,(.+)$/);
       if (!m) throw new Error('Invalid data URL');
       return { mime: m[1], b64: m[2] };
     }
 
-    const media = await fetchMediaBytes(srcUrl, { maxBytes: 8 * 1024 * 1024, timeoutMs: 30000, allowHttp: true });
+    const upload = await readChatUploadImage(this.chatUploads, { url: srcUrl, userId, maxBytes: IMAGE_SOURCE_MAX_BYTES });
+    if (upload) return upload;
+
+    const media = await fetchMediaBytes(srcUrl, { maxBytes: IMAGE_SOURCE_MAX_BYTES, timeoutMs: 30000, allowHttp: true });
     const mime = (media.contentType || 'image/png').split(';')[0].trim();
     if (!mime.startsWith('image/')) throw new Error('URL did not return an image');
     return { b64: media.data.toString('base64'), mime };
@@ -1008,7 +1025,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
 
     // Fetch source image
-    const source = await this.fetchImageAsBase64(sourceImageUrl);
+    const source = await this.fetchImageAsBase64(sourceImageUrl, userId);
 
     const geminiModel = quality === 'hd' ? 'gemini-3-pro-image-preview' : 'gemini-3.1-flash-image-preview';
 
@@ -1096,7 +1113,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
 
     // Fetch all source images in parallel
-    const sources = await Promise.all(sourceImageUrls.map((u: string) => this.fetchImageAsBase64(u)));
+    const sources = await Promise.all(sourceImageUrls.map((u: string) => this.fetchImageAsBase64(u, userId)));
 
     const geminiModel = quality === 'hd' ? 'gemini-3-pro-image-preview' : 'gemini-3.1-flash-image-preview';
 
