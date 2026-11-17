@@ -49,6 +49,7 @@ const DELETION_RESOURCE_TYPE_LIST = [
   'support.purge',
   'peer.stop',
   'peer.purge',
+  'contacts.stop',
   'contacts.purge',
   'referral.stop',
   'referral.purge',

@@ -50,6 +50,7 @@ export type DeletionResourceType =
   | 'support.purge'
   | 'peer.stop'
   | 'peer.purge'
+  | 'contacts.stop'
   | 'contacts.purge'
   | 'referral.stop'
   | 'referral.purge'

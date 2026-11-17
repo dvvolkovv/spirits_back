@@ -1279,6 +1279,7 @@ const ALL_STOP_TYPES: readonly string[] = [
   'account.core.immediate',
   'auth-verification.stop',
   'calendar.stop',
+  'contacts.stop',
   'guest-carry.stop',
   'integration.apple.stop',
   'integration.talerid.stop',

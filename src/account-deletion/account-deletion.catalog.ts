@@ -123,6 +123,11 @@ export const DELETION_DEPENDENCIES: Readonly<Partial<Record<
   // resourceKey статический ('peer'), поэтому allOf эквивалентно
   // sameResourceKey — форма как у tasks/support.
   'peer.purge': { allOf: ['peer.stop'] },
+  // K6: обезличивание текста заявок — после того, как stop отменил висящие
+  // заявки поколения: purge не оставляет живому партнёру pending-заявку
+  // удалённого (без текста, но одобряемую). resourceKey статический
+  // ('contacts') — форма как у peer.
+  'contacts.purge': { allOf: ['contacts.stop'] },
   // Task 17C: обезличивание referral-журналов — только после деактивации
   // лидера. stop блокирует requestWithdrawal (strict-гейт is_active), поэтому
   // между pending-проверкой purge и алиасингом не может появиться новая
