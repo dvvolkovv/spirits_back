@@ -525,7 +525,7 @@ describe('черновики ответов в тикет', () => {
     expect(store.releaseDraft).not.toHaveBeenCalled();
     expect(telegram.answerCallbackQuery).toHaveBeenCalledTimes(1);
     expect(telegram.answerCallbackQuery).toHaveBeenCalledWith(
-      'callback-1', 'Аккаунт пользователя удалён — ответ не сохранён',
+      'callback-1', 'Аккаунт пользователя удалён или заблокирован — ответ не сохранён',
     );
   });
 
