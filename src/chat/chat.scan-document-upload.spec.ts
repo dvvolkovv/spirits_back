@@ -136,6 +136,7 @@ describe('scan-document: PDF Маши сохраняется в загрузки
     expect(Date.now() - t0).toBeLessThan(2000);
     expect(res.statusCode).toBe(200);
     expect(warnText(logger)).toMatch(/save budget 30ms exceeded/);
+    expect(warnText(logger)).not.toMatch(/u-1|resume/);
   });
 
   it('ответ уходит до конца сохранения, обработчик ждёт сохранение после ответа', async () => {
@@ -165,6 +166,7 @@ describe('scan-document: PDF Маши сохраняется в загрузки
     const res = makeRes();
     await ctrl.scanDocument({ userId: 'u-1' }, makeReq(), res);
     expect(res.statusCode).toBe(500);
+    expect(res.payload).toEqual({ error: 'sdk down' });
     expect(uploads.saveOriginals).toHaveBeenCalledTimes(1);
   });
 
