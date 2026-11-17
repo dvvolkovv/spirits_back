@@ -495,6 +495,21 @@ maybe('VoiceCallService.complete после удаления аккаунта п
     expect(warned[0]).not.toContain(USER);
   });
 
+  // Ревью K1b: коды отключения (raw) нужны для разбора и PII не несут —
+  // в warn удалённого они те же, что в «кончился» у живого.
+  it('удалённый аккаунт: warn несёт коды отключения, без идентификатора', async () => {
+    const id = await seed('deleted', 'interrupted');
+    const { svc } = makeSvc();
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+
+    await svc.complete(id, { ...payload, ending: { disconnect: 'room_deleted', close: 'participant_disconnected' } });
+
+    const warned = warn.mock.calls.map((c) => String(c[0])).filter((m) => /аккаунт неактивен/.test(m));
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toContain('room_deleted|participant_disconnected');
+    expect(warned[0]).not.toContain(USER);
+  });
+
   it('активный аккаунт: «кончился» пишется как раньше', async () => {
     const id = await seed('active', 'active');
     const { svc } = makeSvc();
