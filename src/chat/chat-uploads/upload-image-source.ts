@@ -15,8 +15,13 @@ import type { ChatUploadsService } from './chat-uploads.service';
  * проверяется: доступ решает владелец хода (findOwnedOriginal).
  */
 
-/** Путь загрузки целиком: /thumb и прочие хвосты исходником не считаются. */
-const CHAT_UPLOAD_PATH_RE = /^\/webhook\/chat-uploads\/([0-9a-f-]{36})\/?$/i;
+/**
+ * Путь загрузки целиком: /thumb и прочие хвосты исходником не считаются. id —
+ * строго форма UUID 8-4-4-4-12 (регистр любой), как UUID_RE реестра: 36
+ * дефисов или сдвинутые группы — не адрес загрузки.
+ */
+const CHAT_UPLOAD_PATH_RE =
+  /^\/webhook\/chat-uploads\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i;
 
 /** id загрузки, если ссылка ведёт на /webhook/chat-uploads/<id> нашего сайта; иначе null. */
 export function chatUploadIdFromUrl(raw: string): string | null {
