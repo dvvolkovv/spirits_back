@@ -137,4 +137,25 @@ describe('Neo4jService — гейт на активный аккаунт пер�
     expect(writes.some((w) => w.includes('p.embedding'))).toBe(true);
     expectGateBeforeEveryWrite(events);
   });
+  // K1b: ночная компакция (profile-compaction.service) могла идти в момент
+  // удаления — после LLM-группировки mergeEntitiesInProfile делал
+  // MERGE (p:Profile {phone}) и воскрешал узел удалённого аккаунта.
+  it('компакция: mergeEntitiesInProfile не воскрешает Profile удалённого аккаунта', async () => {
+    const { svc, run } = makeService({ states: ['deleted'] });
+
+    await svc.mergeEntitiesInProfile('u-k1', 'interest', ['шахматы', 'chess'], 'шахматы');
+
+    expect(writesOf(run)).toEqual([]);
+  });
+
+  it('компакция: у активного аккаунта merge пишет каноническую сущность, перед записью — гейт', async () => {
+    const { svc, run, events } = makeService({ states: ['active'] });
+
+    await svc.mergeEntitiesInProfile('u-k1', 'interest', ['шахматы', 'chess'], 'шахматы');
+
+    const writes = writesOf(run);
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toContain('MERGE (p:Profile {phone: $phone})');
+    expectGateBeforeEveryWrite(events);
+  });
 });
