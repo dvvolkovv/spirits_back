@@ -211,14 +211,35 @@ describe('Маша: блок загрузок сессии', () => {
   const withUploads = (uploads: ChatUploadsService) => (svc: ChatService) => {
     (svc as any).chatUploads = uploads;
   };
+  // Автопрофилирование разрешено (profile_data без ключей — значения по
+  // умолчанию): волатильная часть начинается с профиля пользователя — тот же
+  // приём, что в тесте порядка блока note_file выше.
+  const withProfile = (svc: ChatService) => {
+    const query = (svc as any).pg.query as jest.Mock;
+    const base = query.getMockImplementation()!;
+    query.mockImplementation(async (sql: string, params?: unknown[]) =>
+      sql.includes('SELECT profile_data FROM ai_profiles_consolidated')
+        ? { rows: [{ profile_data: {} }] }
+        : base(sql, params));
+  };
 
-  it('флаг включён: блок — после блока note_file и перед строкой языка; реестр — по ключу `<userId>_3`', async () => {
+  it('флаг включён: блок — после блока note_file и волатильной части, перед строкой языка; реестр — по ключу `<userId>_3`', async () => {
     process.env.CHAT_UPLOADS_ENABLED = 'true';
     const { uploads, recentSpy } = uploadsWith();
-    const { opts, prompt } = await runMasha({ setup: withUploads(uploads) });
+    const { opts, prompt } = await runMasha({
+      setup: (svc) => {
+        withUploads(uploads)(svc);
+        withProfile(svc);
+      },
+    });
     const system = String(opts.system);
     expect(system).toContain(`\n\n${BLOCK}\n`);
     expect(system.indexOf(BLOCK)).toBeGreaterThan(system.indexOf(NOTE_FILE_CLI_PROMPT));
+    // Подписи чеканятся каждый ход — блок стоит за волатильной частью, а не в
+    // стабильной.
+    const volatile = system.indexOf('--- Профиль пользователя ---');
+    expect(volatile).toBeGreaterThan(0);
+    expect(system.indexOf(BLOCK)).toBeGreaterThan(volatile);
     expect(system.trim().split('\n').pop()).toBe(LANGUAGE_REPLY_LINE.ru.trim());
     expect(recentSpy).toHaveBeenCalledWith(USER, `${USER}_3`, []);
     // В реплику (история + USER) подписанная ссылка не попадает.
@@ -256,5 +277,25 @@ describe('Маша: блок загрузок сессии', () => {
     const { opts, writes } = await runMasha({ setup: withUploads(uploads) });
     expect(String(opts.system)).not.toContain(HEADER_LINE);
     expect(writes.map((w) => JSON.parse(w)).some((e) => e.type === 'item')).toBe(true);
+  });
+
+  // Текст ошибки pg может повторять данные запроса и имена — в журнал идут
+  // только ключ сессии в кавычках и вид ошибки (err-kind.ts); userId уже
+  // внутри ключа и отдельно не пишется.
+  it('сбой реестра — в журнале ключ сессии и вид ошибки, без текста ошибки', async () => {
+    process.env.CHAT_UPLOADS_ENABLED = 'true';
+    const { uploads, recentSpy } = uploadsWith();
+    recentSpy.mockRejectedValue(Object.assign(new Error('db down: план.pdf'), { code: 'ECONNREFUSED' }));
+    let warn: jest.SpyInstance | undefined;
+    await runMasha({
+      setup: (svc) => {
+        withUploads(uploads)(svc);
+        warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+      },
+    });
+    const lines = warn!.mock.calls.map((call) => String(call[0]));
+    expect(lines).toContain(`upload context failed (session "${USER}_3"): Error code=ECONNREFUSED`);
+    expect(lines.join('\n')).not.toContain('план.pdf');
+    expect(lines.join('\n')).not.toContain('db down');
   });
 });
