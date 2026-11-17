@@ -56,6 +56,14 @@ export interface VideoPurgeSkips {
   unsafeKey: number;
 }
 
+/**
+ * K4c — потолок страниц обхода video-uploads/<userId>/ (по 1000 ключей —
+ * до 10 млн объектов на пользователя). Честный листинг столько не даёт:
+ * упор в потолок — рассогласование MinIO (бесконечная череда новых токенов),
+ * retry external_unknown вместо вечного цикла.
+ */
+export const VIDEO_UPLOADS_MAX_LIST_PAGES = 10_000;
+
 export class InsufficientTokensError extends Error {
   status = 402;
   constructor(public balance: number, public required: number) {
@@ -543,7 +551,10 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
    *  - поколение проверяется до первого листинга: аккаунт оживили —
    *    DeletionCancelledError;
    *  - ключ вне префикса в ответе листинга или усечённая страница без нового
-   *    токена — retry external_unknown, а не тихий успех с хвостом.
+   *    токена — retry external_unknown, а не тихий успех с хвостом;
+   *  - K4c: токен, уже встречавшийся в этом обходе (повтор подряд или цикл
+   *    A→B→A), и упор в VIDEO_UPLOADS_MAX_LIST_PAGES — тоже external_unknown,
+   *    а не вечный цикл.
    * beforeDelete (адаптер передаёт ctx.assertCurrent) зовётся перед каждым
    * удалением — форма chat-upload.purge. Повтор после частичного сбоя
    * идемпотентен: стёртое листинг больше не вернёт, пустой каталог — успех.
@@ -567,8 +578,9 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     if ((gen.rowCount ?? 0) === 0) throw new DeletionCancelledError();
 
     const prefix = videoUploadPrefix(userId);
+    const seenTokens = new Set<string>();
     let token: string | undefined;
-    for (;;) {
+    for (let pages = 1; ; pages += 1) {
       const page = await storage.listPage({
         bucket: this.s3Bucket,
         prefix,
@@ -585,7 +597,10 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       }
       if (!page.truncated) return;
       const next = page.nextContinuationToken;
-      if (!next || next === token) throw new DeletionRetryError('external_unknown');
+      if (!next || seenTokens.has(next) || pages >= VIDEO_UPLOADS_MAX_LIST_PAGES) {
+        throw new DeletionRetryError('external_unknown');
+      }
+      seenTokens.add(next);
       token = next;
     }
   }

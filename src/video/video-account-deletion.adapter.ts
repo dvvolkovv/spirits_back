@@ -4,7 +4,7 @@ import {
   DeletionCancelledError,
   DeletionRetryError,
   deletionErrorKind,
-  safeDeletionMessage,
+  safeDeletionSkipMessage,
 } from '../account-deletion/account-deletion.safe';
 import type {
   AccountDeletionAdapter,
@@ -188,27 +188,29 @@ export class VideoAccountDeletionAdapter implements OnModuleInit, AccountDeletio
 
   /**
    * K4b: ссылки строки на объекты вне белого списка не удалены сознательно.
-   * В журнал — вид пропуска и счётчик плюс safe-форма раннера
-   * (safeDeletionMessage: без userId, ключа и адреса), чтобы оператор видел,
-   * что purge оставил чужое не по сбою.
+   * K4c: строка успешного пропуска отличима от строки сбоя раннера — форма
+   * safeDeletionSkipMessage (`skipped …`, без `kind=`), счётчики по видам;
+   * без userId, ключа и адреса. Sanitizer не принял поля job — та же метка
+   * skipped, тип задачи и только счётчики.
    */
   private logSkipped(job: DeletionJobRow, skips: VideoPurgeSkips): void {
     const count = (n: number) => (Number.isInteger(n) && n >= 0 ? n : 0);
-    let message = `video-job.purge kept objects not owned by the job`
-      + ` not_owned=${count(skips.notOwned)} unsafe_key=${count(skips.unsafeKey)}`;
+    const counts = { not_owned: count(skips.notOwned), unsafe_key: count(skips.unsafeKey) };
+    let message = `skipped type=video-job.purge not_owned=${counts.not_owned}`
+      + ` unsafe_key=${counts.unsafe_key}`;
     try {
-      message += ` ${safeDeletionMessage({
+      message = safeDeletionSkipMessage({
         deletionId: job.deletionId,
         resourceType: job.resourceType,
         resourceKey: job.resourceKey,
         attempts: job.attempts,
-        kind: 'owner_unverifiable',
         userId: job.userId,
-      })}`;
+        counts,
+      });
     } catch {
-      // Sanitizer не принял поля строки — остаются только счётчики.
+      // Sanitizer не принял поля job — остаётся строка только со счётчиками.
     }
-    this.logger.warn(message);
+    this.logger.warn(`${message} reason=objects_not_owned_by_job_kept`);
   }
 
   /**

@@ -46,16 +46,18 @@ export const DELETION_DISCOVERERS: readonly DeletionDiscoverer[] = [
   // не нужно (нет stop-фазы и общего состояния, как у chat-file.purge).
   discoverChatUploads,
   discoverImageDeletion,
-  // Видео-бакет (MINIO_BUCKET_VIDEOS) — два места. video-job.purge: по строке
-  // video_jobs — videos/<jobId>.mp4|jpg и из колонок строки только ключи
-  // белого списка (K4b: свои video-uploads/<userId>/…; чужое — пропуск с
-  // журналом), локальные public/videos/<jobId>.* и _veoconcat/<jobId> —
-  // только из id строки. K4
-  // video-upload.purge: весь каталог личных загрузок video-uploads/<userId>/
-  // (листинг с пагинацией) — фото без строки (не дошли до задачи, стёрты
-  // cleanupOldFailedJobs, 2-е/3-е референс-фото Veo в composed_plan). Одна
-  // задача на аккаунт; правила зависимостей не нужно — с video-job.purge
-  // пересекается только подтверждённым отсутствием объекта.
+  // Видео-бакет (MINIO_BUCKET_VIDEOS) — два места.
+  // video-job.purge (по строке video_jobs): videos/<jobId>.mp4|jpg и из
+  // колонок строки только ключи белого списка (K4b: свои
+  // video-uploads/<userId>/…; чужое — пропуск с журналом skipped);
+  // локальные public/videos/<jobId>.* и _veoconcat/<jobId> — только из id
+  // строки.
+  // video-upload.purge (K4): весь каталог личных загрузок
+  // video-uploads/<userId>/ (листинг с пагинацией) — фото без строки (не
+  // дошли до задачи, стёрты cleanupOldFailedJobs, 2-е/3-е референс-фото Veo
+  // в composed_plan). Одна задача на аккаунт; правило зависимостей не
+  // нужно — с video-job.purge пересекается только подтверждённым
+  // отсутствием объекта.
   discoverVideoDeletion,
   discoverVideoUploadsDeletion,
   discoverSpeechDeletion,
