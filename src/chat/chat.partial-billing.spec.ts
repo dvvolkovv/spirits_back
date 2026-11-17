@@ -186,12 +186,15 @@ describe('веб-ход: оборванный ход списывается за
       delta(MODEL), notice(NOTICE), { type: 'done', failed: true, failReason: 'max_turns' },
     ]);
 
-    // Множитель запасного пути — 2 (SDK_TEXT_MULTIPLIER). С репликой длина была бы больше.
-    expect(charged(calls)).toBe(MODEL.length * 2);
-    expect(shownTokens(res)).toBe(MODEL.length * 2);
+    // Множитель запасного пути — из сервиса (SDK_TEXT_MULTIPLIER), а не числом:
+    // его смена не должна красить тест. С репликой длина была бы больше.
+    const byLength = MODEL.length * (svc as any).SDK_TEXT_MULTIPLIER;
+    expect(byLength).toBeGreaterThan(0);
+    expect(charged(calls)).toBe(byLength);
+    expect(shownTokens(res)).toBe(byLength);
     expect(chargeMeta(calls)).toMatchObject({ partial: 'max_turns', source: 'length' });
     expect(lines(warn)).toContainEqual(
-      expect.stringContaining(`billing[partial:max_turns:length]: tokens=${MODEL.length * 2} `),
+      expect.stringContaining(`billing[partial:max_turns:length]: tokens=${byLength} `),
     );
   });
 
@@ -221,5 +224,49 @@ describe('веб-ход: оборванный ход списывается за
     expect(quality(track)).toMatchObject({ ok: true, failed: false });
     expect(quality(track).partial_billed).toBeUndefined();
     expect(lines(log)).toContainEqual(expect.stringContaining(`billing[cost]: tokens=${forUsd(0.5)} `));
+  });
+
+  it('P7: transient_after_partial после одних пробельных delta — человек не увидел ни слова, без списания', async () => {
+    // Релей шлёт и пустые text_delta («\n\n»), после них считает, что текст
+    // пошёл, и при обрыве отдаёт transient_after_partial. «Пришедшим» считается
+    // только видимый текст модели.
+    const { svc, calls, warn } = makeService();
+    const res = await webTurn(svc, [
+      delta('\n\n'), notice(NOTICE), done({ failed: true, failReason: 'transient_after_partial' }),
+    ]);
+
+    expect(charged(calls)).toBeUndefined();
+    expect(shownTokens(res)).toBe(0);
+    expect(lines(warn)).toContainEqual(expect.stringContaining('billing[skipped:transient_after_partial]'));
+  });
+
+  it('P8: transient_after_write только с файлом и без расхода в done — строки списания с нулём нет', async () => {
+    // Ноль в token_consumption_tasks планировщик превращает в минимум 1 токен
+    // (TokenAccountingService), а индикатор и история показали бы 0.
+    const { svc, calls } = makeService();
+    const res = await webTurn(svc, [
+      notice('_(связь с моделью прервалась после действия — проверьте результат, возможно всё прошло; при необходимости повторите)_'),
+      {
+        type: 'done', failed: true, failReason: 'transient_after_write',
+        outputFiles: [{ name: 'plan.pdf', url: '/files/u1_7_ru/plan.pdf' }],
+      },
+    ]);
+
+    expect(charged(calls)).toBeUndefined();
+    expect(shownTokens(res)).toBe(0);
+    expect(historyTokens(calls)).toBe(0);
+  });
+
+  it('P9: причина из списка, но текст — отказ CLI — без списания, в журнале cli_fatal_text', async () => {
+    const { svc, calls, warn } = makeService();
+    const res = await webTurn(svc, [
+      delta("You've hit your session limit · resets 11:50am (UTC)"),
+      notice(NOTICE),
+      done({ failed: true, failReason: 'transient_after_partial' }),
+    ]);
+
+    expect(charged(calls)).toBeUndefined();
+    expect(shownTokens(res)).toBe(0);
+    expect(lines(warn)).toContainEqual(expect.stringContaining('billing[skipped:cli_fatal_text]'));
   });
 });
