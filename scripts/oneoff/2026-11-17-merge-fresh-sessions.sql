@@ -13,9 +13,10 @@
 --   psql "$DATABASE_URL" -tA -F, -c "SELECT user_id, assistant_id, reset_at FROM chat_context_resets" > resets-before.csv
 --
 -- Одна транзакция: упадёт любой шаг — не изменится ничего. Повторный запуск
--- ничего не меняет. Скрипт печатает счётчики «до» и «после»; по тегам команд
--- psql видно остальное: SELECT n после SET — листов людей, INSERT 0 n — точек
--- поставлено или сдвинуто, три UPDATE n — сообщений, загрузок и планов перенесено.
+-- ничего не меняет. Скрипт печатает счётчики «до» и «после» и итог шага 1
+-- (точек по свежим листам, давних листов без точки, свежих с неверной меткой);
+-- по тегам psql видно остальное: второй SELECT n — листов людей, три UPDATE n —
+-- сообщений, загрузок и планов перенесено.
 --
 -- Тестовые аккаунты (src/common/test-users.ts: TEST_USERS и TEST_USER_PATTERN)
 -- не трогаем: их листы — пинги мониторинга, которые и после выката живут
@@ -25,6 +26,21 @@ BEGIN;
 
 -- Чужой замок дольше 10 с — ошибка и откат целиком, а не очередь из ходов.
 SET LOCAL lock_timeout = '10s';
+
+-- Окно свежести листа — единственный параметр скрипта.
+-- Зачем окно: лист жил в sessionStorage вкладки. Закрыв вкладку, человек
+-- возвращался к основной памяти — давний лист не значит «в режиме», и точка по
+-- нему стёрла бы ассистенту память, к которой человек уже вернулся. Точка нужна
+-- тем, чья вкладка с листом, вероятно, ещё открыта: sessionStorage переживает
+-- F5, а после выката обновлённая вкладка грузит новый фронт, который метку не
+-- читает, — без точки человек молча выпал бы из листа. (Если такая вкладка
+-- успеет сделать ход старым фронтом, точку поставит и бэк — applyLegacyFresh;
+-- GREATEST сводит обе.)
+-- Почему 24 часа: вкладку, где писали вчера вечером, утром обычно ещё не
+-- закрыли; старше суток — скорее закрыта. Это компромисс; менять — здесь.
+-- Граница включительно: ход ровно now() - 24 h — свежий.
+CREATE TEMP TABLE merge_window ON COMMIT DROP AS
+SELECT now() - interval '24 hours' AS fresh_since;
 
 -- Листы людей — снимок ключей из всех трёх таблиц. Ключ разбирается строго:
 -- userId (телефон или UUID) и ассистент (число или custom:<uuid>, как
@@ -75,13 +91,16 @@ SELECT 'до' AS "этап", * FROM fresh_counts;
 
 -- 1. Точка — парам, где человек на момент выката «в режиме»: его последний ход
 --    у этого ассистента был в листе, строго позже последнего хода в основной
---    ленте. Ход — сообщение человека: ответы без вопроса (рутины, сообщения
---    админа, итоги звонков) пишутся в основную ленту и тогда, когда человек в
---    листе, — по ним «вышел ли он из листа» не судим.
+--    ленте, и не раньше окна merge_window. Ход — сообщение человека: ответы
+--    без вопроса (рутины, сообщения админа, итоги звонков) пишутся в основную
+--    ленту и тогда, когда человек в листе, — по ним «вышел ли он из листа» не
+--    судим. Давний лист — только перенос ленты (шаги 2–4), без точки.
 --    Точка = метка листа этого хода, ровно в мс: целое число мс на интервал
 --    1 мс точно (метка < 2^53), без дробных секунд to_timestamp.
 --    GREATEST сохраняет точку новее — например, поставленную после выката
 --    старой вкладкой.
+--    Итог печатается одной строкой: «точек по свежим листам» считает и пары,
+--    где точка уже была (ON CONFLICT), даже если GREATEST оставил прежнюю.
 WITH fresh_turn AS (
   SELECT DISTINCT ON (k.base) k.base, k.user_id, k.assistant_id, k.ts, h.created_at AS at
     FROM custom_chat_history h
@@ -94,15 +113,25 @@ WITH fresh_turn AS (
    WHERE h.sender_type = 'human'
      AND h.session_id IN (SELECT base FROM fresh_turn)
    GROUP BY h.session_id
+), in_mode AS (
+  -- Последний ход человека у ассистента — в листе.
+  SELECT f.user_id, f.assistant_id, f.ts, f.at,
+         f.at >= (SELECT fresh_since FROM merge_window) AS recent
+    FROM fresh_turn f
+    LEFT JOIN main_turn m USING (base)
+   WHERE m.at IS NULL OR f.at > m.at
+), placed AS (
+  INSERT INTO chat_context_resets (user_id, assistant_id, reset_at)
+  SELECT i.user_id, i.assistant_id, timestamptz 'epoch' + i.ts * interval '1 millisecond'
+    FROM in_mode i
+   WHERE i.recent AND i.ts IS NOT NULL
+  ON CONFLICT (user_id, assistant_id) DO UPDATE
+    SET reset_at = GREATEST(chat_context_resets.reset_at, EXCLUDED.reset_at)
+  RETURNING 1
 )
-INSERT INTO chat_context_resets (user_id, assistant_id, reset_at)
-SELECT f.user_id, f.assistant_id, timestamptz 'epoch' + f.ts * interval '1 millisecond'
-  FROM fresh_turn f
-  LEFT JOIN main_turn m USING (base)
- WHERE f.ts IS NOT NULL
-   AND (m.at IS NULL OR f.at > m.at)
-ON CONFLICT (user_id, assistant_id) DO UPDATE
-  SET reset_at = GREATEST(chat_context_resets.reset_at, EXCLUDED.reset_at);
+SELECT (SELECT count(*) FROM placed) AS "точек по свежим листам",
+       (SELECT count(*) FROM in_mode WHERE NOT recent) AS "давних листов без точки",
+       (SELECT count(*) FROM in_mode WHERE recent AND ts IS NULL) AS "свежих листов с неверной меткой";
 
 -- 2. Сообщения листов — в основные ленты.
 UPDATE custom_chat_history h
