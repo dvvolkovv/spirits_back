@@ -168,7 +168,11 @@ export class ProductsMcpController {
       return result;
     }
     if (name === NOTE_FILE_TOOL_NAME) {
-      return this.noteFile(userId, input);
+      const result = await this.noteFile(userId, input);
+      // Статистика админки, как у find_files: канал из подписи и исход — без id
+      // файла и текста комментария.
+      this.events?.track('note_file_call', { userId, props: { channel, ok: result.ok } });
+      return result;
     }
     if (name === REPORT_PROBLEM_TOOL_NAME) {
       // Пользователь и канал — из подписи, как у остальных инструментов точки.
