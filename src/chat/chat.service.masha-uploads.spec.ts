@@ -246,12 +246,83 @@ describe('Маша: блок загрузок сессии', () => {
     expect(prompt).not.toContain(LINK);
   });
 
-  it('чистый лист: реестр опрошен по fresh-сессии', async () => {
+  // «Чистый лист» живого человека — точка отсчёта памяти (spec
+  // 2026-11-17-context-reset), а не отдельная fresh-сессия: лента одна, и
+  // реестр опрашивается по основной ленте Маши. Файл после точки ассистент
+  // видит — с id, комментарием и ссылкой, как и без точки.
+  const POINT = new Date('2026-11-15T07:00:00.000Z');
+  const withPoint = (svc: ChatService) => {
+    (svc as any).contextResets = { get: jest.fn(async () => POINT) };
+  };
+
+  it('чистый лист (точка): реестр опрошен по основной ленте `<userId>_3`, файл после точки — в блоке', async () => {
     process.env.CHAT_UPLOADS_ENABLED = 'true';
     const { uploads, recentSpy } = uploadsWith();
-    const { opts } = await runMasha({ setup: withUploads(uploads), sessionId: `${USER}_3_fresh_1`, fresh: true });
-    expect(recentSpy).toHaveBeenCalledWith(USER, `${USER}_3_fresh_1`, []);
+    const { svc, opts } = await runMasha({
+      setup: (s) => {
+        withUploads(uploads)(s);
+        withPoint(s);
+      },
+    });
+    expect((svc as any).contextResets.get).toHaveBeenCalledWith(USER, '3');
+    expect(recentSpy).toHaveBeenCalledWith(USER, `${USER}_3`, []);
     expect(String(opts.system)).toContain(BLOCK);
+  });
+
+  it('у Маши память загрузок отсекается точкой: файл до точки в блок не попадает', async () => {
+    process.env.CHAT_UPLOADS_ENABLED = 'true';
+    const OLD: ChatUploadRecord = {
+      ...RECORD,
+      id: '88888888-8888-4888-8888-888888888888',
+      originalName: 'старый-договор.pdf',
+      createdAt: '2026-11-14T09:00:00.000Z',
+      note: 'Договор аренды, обсуждали до чистого листа.',
+    };
+    // Реестр отдаёт от новых к старым — как recentForSession.
+    const { uploads } = uploadsWith([RECORD, OLD]);
+    const { opts } = await runMasha({
+      setup: (s) => {
+        withUploads(uploads)(s);
+        withPoint(s);
+      },
+    });
+    const system = String(opts.system);
+    expect(system).toContain(BLOCK);
+    expect(system).not.toContain(OLD.id);
+    expect(system).not.toContain('старый-договор.pdf');
+    expect(system).not.toContain('Договор аренды');
+  });
+
+  it('у Маши все файлы до точки — блока нет вовсе', async () => {
+    process.env.CHAT_UPLOADS_ENABLED = 'true';
+    const { uploads, recentSpy } = uploadsWith([{ ...RECORD, createdAt: '2026-11-14T09:00:00.000Z' }]);
+    const { opts } = await runMasha({
+      setup: (s) => {
+        withUploads(uploads)(s);
+        withPoint(s);
+      },
+    });
+    expect(recentSpy).toHaveBeenCalledWith(USER, `${USER}_3`, []);
+    expect(String(opts.system)).not.toContain(HEADER_LINE);
+  });
+
+  // Изолированная fresh-сессия осталась только у пингов мониторинга (fresh +
+  // probe у тестовых аккаунтов, chat.controller.ts): пинг блок не везёт.
+  it('пинг с fresh-сессией (fresh + probe): блока нет, реестр и точка не опрашиваются', async () => {
+    process.env.CHAT_UPLOADS_ENABLED = 'true';
+    const { uploads, recentSpy } = uploadsWith();
+    const { svc, opts } = await runMasha({
+      setup: (s) => {
+        withUploads(uploads)(s);
+        withPoint(s);
+      },
+      sessionId: `${USER}_3_fresh_1`,
+      fresh: true,
+      probe: true,
+    });
+    expect(recentSpy).not.toHaveBeenCalled();
+    expect((svc as any).contextResets.get).not.toHaveBeenCalled();
+    expect(String(opts.system)).not.toContain(HEADER_LINE);
   });
 
   it('флаг выключен: блока нет, реестр не опрашивается', async () => {
