@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -78,6 +78,8 @@ export class ChatUploadDeleteError extends Error {
 export const CHAT_UPLOADS_BUCKET = 'linkeon-chat-uploads';
 const BUCKET = CHAT_UPLOADS_BUCKET;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Предел комментария к загрузке — тот же, что CHECK chat_uploads_note_len_check (миграция 002) и maxLength в note_file. */
+export const UPLOAD_NOTE_MAX_CHARS = 500;
 /**
  * Строка 📎 удалённого файла в истории сессии → «📎 имя — файл удалён».
  * Фильтр — strpos, а не LIKE: в $2 имя экранировано markdownEscapeName
@@ -467,6 +469,40 @@ export class ChatUploadsService {
       [userId, days ?? null],
     );
     return rows.map((row) => this.row(row));
+  }
+
+  /**
+   * Комментарий ассистента к загрузке (инструмент note_file). Новый текст
+   * заменяет прежний целиком; вместе с ним пишутся время и ассистент хода.
+   *
+   * Длина — в символах (Array.from), как char_length в CHECK миграции 002:
+   * эмодзи в JS — две единицы UTF-16, а в Postgres — один символ.
+   * Владелец — условием UPDATE: чужой и несуществующий id неразличимы
+   * (NotFoundException), как в openDownload. Не-UUID и пустой userId
+   * отсекаются до запроса, как в loadOwned: Postgres упал бы на приведении к
+   * uuid, и вместо «не найден» вышла бы 500. loadOwned здесь не подходит —
+   * его отдельный SELECT лишний: владельца проверяет сам UPDATE.
+   */
+  async setNote(input: {
+    id: string;
+    userId: string;
+    note: string;
+    assistantId: string | null;
+  }): Promise<ChatUploadRecord> {
+    const note = typeof input.note === 'string' ? input.note.trim() : '';
+    const chars = Array.from(note).length;
+    if (chars < 1 || chars > UPLOAD_NOTE_MAX_CHARS) {
+      throw new BadRequestException(`Комментарий — от 1 до ${UPLOAD_NOTE_MAX_CHARS} символов`);
+    }
+    if (!input.userId || !UUID_RE.test(String(input.id))) throw new NotFoundException('Upload not found');
+    const { rows } = await this.pg.query(
+      `UPDATE chat_uploads
+          SET note = $3, note_updated_at = now(), note_assistant_id = $4
+        WHERE id = $1 AND user_id = $2
+        RETURNING ${COLUMNS}`,
+      [input.id, input.userId, note, input.assistantId ?? null],
+    );
+    return this.row(rows[0]);
   }
 
   assistantBlock(records: ChatUploadRecord[] | null | undefined): string {
