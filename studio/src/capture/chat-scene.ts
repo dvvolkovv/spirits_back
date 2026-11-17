@@ -8,7 +8,7 @@ import { StudioError } from '../errors';
 import { probeFile } from '../ffprobe';
 import { CAPTURE_SCALE, CAPTURE_VIEWPORT } from '../frame';
 import type { CaptureResult, Scene } from '../types';
-import { prepareCleanChat } from './clean-chat';
+import { assertEmptyFeed, prepareCleanChat } from './clean-chat';
 import type { Session } from './login';
 import { hidePromoCss } from './promo';
 
@@ -18,13 +18,15 @@ export const SCALE = CAPTURE_SCALE;
 /** Ответ готов, если он не меняется столько и в ленте нет признаков набора. */
 const STABLE_MS = 3000;
 /**
- * Лента спокойна, если в ней столько нет признаков набора. Дольше кулдауна
- * дублей бэкенда (DEDUP_COOLDOWN_MS — 12 с, src/chat/chat.service.ts): повтор
- * съёмки открывает чистый лист, пока прежний ход с тем же вопросом ещё идёт, и
- * признак «работает» снимается не раньше конца того хода. Вопрос, ушедший через
- * 3 с, бэкенд счёл бы дублем и прислал заглушку «Этот запрос я только что
- * обработал…» — она сдвигала пузырь вопроса под шапку (question_hidden,
- * 14.11.2026).
+ * Лента спокойна, если в ней столько нет признаков набора. Раньше 15 с
+ * перекрывали кулдаун дублей бэкенда (DEDUP_COOLDOWN_MS — 12 с): вопрос повтора
+ * съёмки, ушедший через 3 с после прежнего хода, получал заглушку «Этот запрос
+ * я только что обработал…», и она сдвигала пузырь вопроса под шапку
+ * (question_hidden, 14.11.2026). После новой точки «Чистого листа» дедуп не
+ * срабатывает — точка входит в его ключ (dupKey, src/chat/chat.service.ts). Но
+ * 15 с полезны и теперь: они перекрывают 8-секундный опрос ленты кабинетом —
+ * запоздалый ответ прежнего хода, если всё же ляжет, успеет показаться до
+ * вопроса, а assertEmptyFeed его поймает.
  */
 const IDLE_STABLE_MS = 15_000;
 /**
@@ -105,11 +107,13 @@ export async function waitAnswer(page: Page, before: number, deadline: number): 
 }
 
 /**
- * Ждёт, пока лента успокоится. В пустом «чистом листе» кабинет сам шлёт
- * приветствие (ChatInterface.sendInitialGreeting — настоящий ход ассистента), а
- * у повтора съёмки ещё может идти прежний ход; вопрос, отправленный поверх, ушёл
- * бы в очередь. Готово, когда есть хотя бы одно сообщение ассистента и
- * IDLE_STABLE_MS нет признаков набора. deadline — срок всей съёмки.
+ * Ждёт, пока лента успокоится. В пустой ленте кабинет показывает локальный
+ * welcomeMessage (с 13.11.2026 — не ход ассистента и не запись в базе): это и
+ * есть «сообщение ассистента», по которому проходит ожидание. В пробе лента не
+ * чищена — там последний ответ прежней сцены. Если в ленте ещё виден ход,
+ * вопрос, отправленный поверх, ушёл бы в очередь. Готово, когда есть хотя бы
+ * одно сообщение ассистента и IDLE_STABLE_MS нет признаков набора. deadline —
+ * срок всей съёмки.
  */
 export async function waitIdle(page: Page, deadline: number): Promise<void> {
   const started = Date.now();
@@ -190,8 +194,9 @@ export async function captureChat(
   fs.mkdirSync(outDir, { recursive: true });
   const shot = (name: string) => path.join(outDir, name);
   const deadline = Date.now() + CAPTURE_BUDGET_MS;
-  // Проба только смотрит кабинет — на сервере ничего не меняет.
-  if (!opts.probeOnly) await prepareCleanChat(cfg, session, scene.assistantId);
+  // Проба только смотрит кабинет — на сервере ничего не меняет. Ожидание
+  // прежнего хода в подготовке тратит тот же срок съёмки.
+  if (!opts.probeOnly) await prepareCleanChat(cfg, session, scene.assistantId, deadline);
   const browser = await chromium.launch({ headless: true });
   try {
     const context = await browser.newContext({
@@ -236,6 +241,9 @@ export async function captureChat(
       return null;
     }
 
+    // Сирота прежнего хода, легшая после очистки, не должна попасть в кадр и в
+    // память ассистента (clean-chat.ts). В пробе ленту не чистили — проверки нет.
+    await assertEmptyFeed(cfg, session, scene.assistantId);
     let before = await send(page, scene.question);
     if (!(await revealLastUserMessage(page))) {
       await page.screenshot({ path: shot('question-hidden.png') });
