@@ -95,4 +95,76 @@ describe('ChatUploadsService.setNote: комментарий ассистент�
       .rejects.toBeInstanceOf(NotFoundException);
     expect(pg.query).not.toHaveBeenCalled();
   });
+
+  it('пустой userId — NotFound без обращения к базе', async () => {
+    await expect(service.setNote({ id: ID, userId: '', note: 'текст', assistantId: '3' }))
+      .rejects.toBeInstanceOf(NotFoundException);
+    expect(pg.query).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Чистка до trim и подсчёта: Postgres не примет NUL в text (22021) — в B3
+   * модель получила бы сырую ошибку; прочие управляющие и bidi-переопределения
+   * — мусор и подмена порядка символов в подсказке. Многострочность остаётся.
+   */
+  describe('чистка комментария', () => {
+    it('NUL, прочие C0, DEL и C1 вырезаются и до UPDATE не доходят; \\t и \\n остаются', async () => {
+      pg.query.mockResolvedValueOnce({ rows: [savedRow('Чек за май', '3')] });
+      await service.setNote({
+        id: ID,
+        userId: 'owner1',
+        note: 'Чек\u0000 за\u0007\u001B май\u007F\u0085\u009F\tитог\nстрока',
+        assistantId: '3',
+      });
+      const saved = pg.query.mock.calls[0][1]![2] as string;
+      expect(saved).toBe('Чек за май\tитог\nстрока');
+      expect(saved).not.toMatch(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/);
+    });
+
+    it('строка из одних управляющих и bidi-символов — BadRequest, в базу не ходим', async () => {
+      for (const note of [
+        '\u0000\u0001\u001B\u007F\u0085\u009F',
+        '‮⁦ ⁩',
+        '\r\n\u0000\t\u000B\u000C',
+      ]) {
+        await expect(service.setNote({ id: ID, userId: 'owner1', note, assistantId: '3' }))
+          .rejects.toBeInstanceOf(BadRequestException);
+      }
+      expect(pg.query).not.toHaveBeenCalled();
+    });
+
+    it('bidi-переопределения и изоляты вырезаются, ZWJ в эмодзи остаётся', async () => {
+      pg.query.mockResolvedValueOnce({ rows: [savedRow('x', '3')] });
+      await service.setNote({
+        id: ID,
+        userId: 'owner1',
+        note: 'счёт‮gpj.exe ⁦имя⁩ ‪‫‬‭⁧⁨ 👩‍💻',
+        assistantId: '3',
+      });
+      expect(pg.query.mock.calls[0][1]![2]).toBe('счётgpj.exe имя  👩‍💻');
+    });
+
+    it('CRLF и одиночный CR становятся LF, строки не склеиваются', async () => {
+      pg.query.mockResolvedValueOnce({ rows: [savedRow('x', '3')] });
+      await service.setNote({
+        id: ID,
+        userId: 'owner1',
+        note: '\r\nСтрока 1\r\nСтрока 2\rСтрока 3\n\r\n',
+        assistantId: '3',
+      });
+      expect(pg.query.mock.calls[0][1]![2]).toBe('Строка 1\nСтрока 2\nСтрока 3');
+    });
+
+    it('длина считается после чистки: 500 букв и управляющие символы — можно', async () => {
+      const fiveHundred = 'я'.repeat(500);
+      pg.query.mockResolvedValueOnce({ rows: [savedRow(fiveHundred, '3')] });
+      await service.setNote({
+        id: ID,
+        userId: 'owner1',
+        note: `\u0000${fiveHundred.slice(0, 250)}‮\u0007${fiveHundred.slice(250)}\u0000`,
+        assistantId: '3',
+      });
+      expect(pg.query.mock.calls[0][1]![2]).toBe(fiveHundred);
+    });
+  });
 });
