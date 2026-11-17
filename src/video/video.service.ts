@@ -29,7 +29,6 @@ import { StorageService } from '../common/services/storage.service';
 import { ownedObjectKeyOrThrow } from '../misc/misc.service';
 import { isUnsafeUrlError } from '../common/net/safe-fetch';
 import { ChatUploadsService } from '../chat/chat-uploads/chat-uploads.service';
-import { errKind } from '../chat/chat-uploads/err-kind';
 import {
   ChatUploadSourceError,
   VEO_SOURCE_IMAGE_MIMES,
@@ -770,7 +769,9 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   // с защитой от SSRF. Относительные '/…' он сам достраивает до нашего сайта.
   // Загрузка пользователя (/webhook/chat-uploads/<id>) читается из приватного
   // бакета только владельцем задачи (upload-image-source.ts). Любой сбой —
-  // мягкий: фото пропускается, как и раньше.
+  // мягкий: фото пропускается, как и раньше. Отказы по загрузке приходят без
+  // текста S3 (ChatUploadSourceError, ChatUploadStorageError) — их сообщение
+  // можно писать в журнал как есть.
   private async fetchPortraitB64(url: string, userId: string): Promise<{ b64: string; mime: string } | null> {
     try {
       const upload = await readChatUploadImage(this.chatUploads, { url, userId, ...VEO_UPLOAD_SOURCE });
@@ -779,12 +780,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
       const mime = media.contentType || 'image/jpeg';
       return { b64: media.data.toString('base64'), mime };
     } catch (e: any) {
-      // По загрузке пользователя — только код отказа или вид ошибки: сообщение
-      // хранилища может повторять ключ объекта с именем файла (err-kind.ts).
-      const detail = e instanceof ChatUploadSourceError
-        ? `upload ${e.code}`
-        : (chatUploadSourceId(url) ? errKind(e) : e.message);
-      this.logger.warn(`Veo portrait fetch failed: ${detail}`);
+      this.logger.warn(`Veo portrait fetch failed: ${e.message}`);
       return null;
     }
   }
@@ -1058,7 +1054,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
         if (await readChatUploadImage(this.chatUploads, { url: u, userId, ...VEO_UPLOAD_SOURCE })) continue;
       } catch (e: any) {
         if (e instanceof ChatUploadSourceError) throw new BadRequestException(`фото не принято: ${e.message}`);
-        this.logger.warn(`Veo upload precheck failed: ${errKind(e)}`);
+        this.logger.warn(`Veo upload precheck failed: ${e.message}`);
         continue;
       }
       try {

@@ -984,7 +984,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
    * без) читается из приватного бакета, а не по HTTP: только владельцем хода
    * (userId), только форматы Gemini (png, jpeg, webp, heic, heif), тот же
    * предел. Чужая, удалённая или не картинка — ошибка с причиной
-   * (upload-image-source.ts).
+   * (upload-image-source.ts). Сбой реестра или хранилища — «хранилище загрузок
+   * не ответило (вид)»: текст S3 с ключом и именем файла в result.error, к
+   * модели и в алерт поддержки не попадает.
    */
   private async fetchImageAsBase64(srcUrl: string, userId: string): Promise<{ b64: string; mime: string }> {
     if (srcUrl.startsWith('data:')) {

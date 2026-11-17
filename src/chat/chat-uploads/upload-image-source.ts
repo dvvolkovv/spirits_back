@@ -1,6 +1,7 @@
 import { ownBaseUrl, ownOrigins } from '../../common/net/own-media';
 import { ChatUploadTooLargeError } from './chat-uploads.service';
 import type { ChatUploadsService } from './chat-uploads.service';
+import { errKind } from './err-kind';
 
 /**
  * Загрузка пользователя как исходник инструментов картинок и видео (spec
@@ -94,11 +95,26 @@ export class ChatUploadSourceError extends Error {
 }
 
 /**
+ * Реестр или хранилище загрузок не ответили — сбой сервиса, а не ошибка
+ * пользователя (problem-classify оставляет его сбоем). В тексте только вид
+ * ошибки (errKind): сообщения S3 и pg повторяют ключ объекта с именем файла, а
+ * этот текст уходит модели (result.error), в журнал и в алерт поддержки.
+ */
+export class ChatUploadStorageError extends Error {
+  constructor(readonly kind: string) {
+    super(`хранилище загрузок не ответило (${kind})`);
+    this.name = 'ChatUploadStorageError';
+  }
+}
+
+/**
  * Картинка из загрузки пользователя. null — ссылка не на загрузку (или флаг
  * выключен): вызывающий идёт прежним путём fetchMediaBytes. Чужая или
  * удалённая загрузка, формат не из allowedMimes (у каждого потребителя свой:
  * GEMINI_SOURCE_IMAGE_MIMES, VEO_SOURCE_IMAGE_MIMES) и больше maxBytes —
- * ChatUploadSourceError. Сбой хранилища пробрасывается как есть.
+ * ChatUploadSourceError. Сбой реестра или хранилища — ChatUploadStorageError
+ * без исходного текста: этот путь — единственный, где misc (fetchImageAsBase64)
+ * и video читают загрузку, так что сырой текст S3 дальше не уходит.
  */
 export async function readChatUploadImage(
   uploads: Pick<ChatUploadsService, 'findOwnedOriginal'> | null | undefined,
@@ -117,7 +133,7 @@ export async function readChatUploadImage(
       const mb = Math.round(input.maxBytes / (1024 * 1024));
       throw new ChatUploadSourceError('too_large', `загрузка пользователя больше ${mb} МБ — такой исходник не принимается`);
     }
-    throw e;
+    throw new ChatUploadStorageError(errKind(e));
   }
   if (!found) {
     throw new ChatUploadSourceError('not_found', 'загрузка пользователя не найдена: её удалили или она недоступна');
