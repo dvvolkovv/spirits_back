@@ -112,7 +112,11 @@ export class ChatUploadAccountDeletionAdapter implements OnModuleInit, AccountDe
       const key = typeof row?.storage_key === 'string' ? row.storage_key : '';
       // Миниатюра (миграция 002): NULL — её нет в реестре; любое другое
       // значение обязано быть таким же безопасным ключом, как storage_key.
-      const thumbKey = row?.thumb_key == null ? null : String(row.thumb_key);
+      // Не-строка нормализуется как у storage_key — в '' (retry db): String()
+      // сделал бы из 42 или массива «безопасный» ключ.
+      const thumbKey = row?.thumb_key == null
+        ? null
+        : typeof row.thumb_key === 'string' ? row.thumb_key : '';
       // Миниатюра стирается и по thumb_key, и по вычисляемому
       // thumbs/<storage_key>.webp: неоднозначно оборвавшаяся загрузка
       // миниатюры при сохранении могла оставить объект при thumb_key = NULL
