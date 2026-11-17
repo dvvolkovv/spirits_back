@@ -124,7 +124,7 @@ describe('ChatUploadsService.setNote: комментарий ассистент�
     it('строка из одних управляющих и bidi-символов — BadRequest, в базу не ходим', async () => {
       for (const note of [
         '\u0000\u0001\u001B\u007F\u0085\u009F',
-        '‮⁦ ⁩',
+        '\u202E\u2066 \u2069',
         '\r\n\u0000\t\u000B\u000C',
       ]) {
         await expect(service.setNote({ id: ID, userId: 'owner1', note, assistantId: '3' }))
@@ -138,10 +138,10 @@ describe('ChatUploadsService.setNote: комментарий ассистент�
       await service.setNote({
         id: ID,
         userId: 'owner1',
-        note: 'счёт‮gpj.exe ⁦имя⁩ ‪‫‬‭⁧⁨ 👩‍💻',
+        note: 'счёт\u202Egpj.exe \u2066имя\u2069 \u202A\u202B\u202C\u202D\u2067\u2068 👩\u200D💻',
         assistantId: '3',
       });
-      expect(pg.query.mock.calls[0][1]![2]).toBe('счётgpj.exe имя  👩‍💻');
+      expect(pg.query.mock.calls[0][1]![2]).toBe('счётgpj.exe имя  👩\u200D💻');
     });
 
     it('CRLF и одиночный CR становятся LF, строки не склеиваются', async () => {
@@ -161,7 +161,7 @@ describe('ChatUploadsService.setNote: комментарий ассистент�
       await service.setNote({
         id: ID,
         userId: 'owner1',
-        note: `\u0000${fiveHundred.slice(0, 250)}‮\u0007${fiveHundred.slice(250)}\u0000`,
+        note: `\u0000${fiveHundred.slice(0, 250)}\u202E\u0007${fiveHundred.slice(250)}\u0000`,
         assistantId: '3',
       });
       expect(pg.query.mock.calls[0][1]![2]).toBe(fiveHundred);
