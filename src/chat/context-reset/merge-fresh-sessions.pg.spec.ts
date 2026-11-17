@@ -28,10 +28,9 @@ const MIGRATIONS = [
 
 const TEST_ACCOUNT = '70000000000';
 const PATTERN_ACCOUNT = '79030012345'; // TEST_USER_PATTERN ^790300[0-9]{5}$
-const TS_A = 1794804919138; // 2026-11-16T04:55:19.138Z
-const TS_B = 1794468117918; // 2026-11-12T07:21:57.918Z
 const CUSTOM = 'custom:0b5c9a8e-4c1d-4f7a-9e2b-5d6c7e8f9a0b';
 const UUID_USER = '3f2a1b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b';
+const HOUR = 3600 * 1000;
 
 /** Точка в UTC до микросекунд — так видно, что метка легла ровно, без округления. */
 const exact = (ms: number): string => new Date(ms).toISOString().replace('Z', '000');
@@ -40,6 +39,9 @@ maybe('разовый перенос старых листов (pg)', () => {
   let admin: Pool;
   let pool: Pool;
   let uploads = 0;
+  // now() базы в мс на начало теста: все даты — от него, чтобы тест не протухал
+  // (точку скрипт ставит только по листам, где ход был за последние 24 часа).
+  let now = 0;
 
   beforeAll(async () => {
     admin = new Pool({ connectionString: PG, max: 1 });
@@ -71,7 +73,14 @@ maybe('разовый перенос старых листов (pg)', () => {
   });
   beforeEach(async () => {
     await pool.query('TRUNCATE custom_chat_history, chat_uploads, action_plans, chat_context_resets RESTART IDENTITY');
+    now = (await pool.query('SELECT now() AS t')).rows[0].t.getTime();
   });
+
+  /** Момент h часов назад (ISO) и метка листа, нажатого h часов назад (мс). */
+  const hoursAgo = (h: number): string => new Date(now - h * HOUR).toISOString();
+  const mark = (h: number): number => now - h * HOUR;
+  /** Ключ листа, нажатого h часов назад. */
+  const sheet = (base: string, h: number): string => `${base}_fresh_${mark(h)}`;
 
   /** Скрипт целиком; pg отдаёт массив результатов по выражению. */
   async function runScript(): Promise<QueryResult[]> {
@@ -85,6 +94,8 @@ maybe('разовый перенос старых листов (pg)', () => {
       .filter((r) => r.command === 'SELECT' && r.fields.some((f) => f.name === 'этап'))
       .map((r) => r.rows[0]);
   }
+  const numbers = (row: Record<string, unknown>) =>
+    Object.fromEntries(Object.entries(row).map(([k, v]) => [k, k === 'этап' ? v : Number(v)]));
 
   const say = (sessionId: string, at: string, sender: 'human' | 'ai' = 'human') =>
     pool.query(
@@ -135,32 +146,33 @@ maybe('разовый перенос старых листов (pg)', () => {
   }
 
   it('переносит листы в основную ленту; точку ставит тому, у кого последний ход — в листе', async () => {
-    // A: основная 10.11, лист 16.11 — на момент выката «в режиме».
-    await turn('79000000001_10', '2026-11-10T10:00:00Z');
-    await turn(`79000000001_10_fresh_${TS_A}`, '2026-11-16T05:00:00Z');
-    // B: лист 12.11, потом писал в основную 17.11 — из листа вышел.
-    await turn(`79000000002_10_fresh_${TS_B}`, '2026-11-12T07:30:00Z');
-    await turn('79000000002_10', '2026-11-17T05:00:00Z');
+    // A: основная три дня назад, лист час назад — «в режиме».
+    await turn('79000000001_10', hoursAgo(72));
+    await turn(sheet('79000000001_10', 2), hoursAgo(1));
+    // B: лист, потом писал в основную — из листа вышел.
+    await turn(sheet('79000000002_10', 5), hoursAgo(4));
+    await turn('79000000002_10', hoursAgo(0.5));
     // Тестовые аккаунты — списком и по шаблону — не трогаем.
-    await turn(`${TEST_ACCOUNT}_12_fresh_${TS_A}`, '2026-11-16T05:00:00Z');
-    await turn(`${PATTERN_ACCOUNT}_10_fresh_${TS_A}`, '2026-11-16T05:00:00Z');
+    await turn(sheet(`${TEST_ACCOUNT}_12`, 2), hoursAgo(1));
+    await turn(sheet(`${PATTERN_ACCOUNT}_10`, 2), hoursAgo(1));
 
     await runScript();
 
     expect(await feeds()).toEqual({
-      [`${TEST_ACCOUNT}_12_fresh_${TS_A}`]: 2,
+      [sheet(`${TEST_ACCOUNT}_12`, 2)]: 2,
       '79000000001_10': 4,
       '79000000002_10': 4,
-      [`${PATTERN_ACCOUNT}_10_fresh_${TS_A}`]: 2,
+      [sheet(`${PATTERN_ACCOUNT}_10`, 2)]: 2,
     });
-    expect(await points()).toEqual([{ user_id: '79000000001', assistant_id: '10', at: exact(TS_A) }]);
+    expect(await points()).toEqual([{ user_id: '79000000001', assistant_id: '10', at: exact(mark(2)) }]);
   });
 
   it('точка — ровно метка листа в мс, без округления через double', async () => {
-    const odd = TS_A - 137; // …19.001
-    const late = TS_A + 861; // …19.999
-    await turn(`79000000001_10_fresh_${odd}`, '2026-11-16T05:00:00Z');
-    await turn(`79000000002_10_fresh_${late}`, '2026-11-16T05:00:00Z');
+    const second = Math.floor(mark(2) / 1000) * 1000;
+    const odd = second + 1; // …,001
+    const late = second + 999; // …,999
+    await turn(`79000000001_10_fresh_${odd}`, hoursAgo(1));
+    await turn(`79000000002_10_fresh_${late}`, hoursAgo(1));
     await runScript();
     expect(await points()).toEqual([
       { user_id: '79000000001', assistant_id: '10', at: exact(odd) },
@@ -171,25 +183,64 @@ maybe('разовый перенос старых листов (pg)', () => {
   });
 
   it('«в режиме» решает ход человека: ответ без вопроса в основной ленте (рутина, админ) точку не отменяет', async () => {
-    await turn('79000000001_10', '2026-11-10T10:00:00Z');
-    await turn(`79000000001_10_fresh_${TS_A}`, '2026-11-16T05:00:00Z');
+    await turn('79000000001_10', hoursAgo(72));
+    await turn(sheet('79000000001_10', 2), hoursAgo(1));
     // Утренняя рутина пишет в основную ленту и тогда, когда человек в листе.
-    await say('79000000001_10', '2026-11-17T06:00:00Z', 'ai');
+    await say('79000000001_10', hoursAgo(0.5), 'ai');
     await runScript();
-    expect(await points()).toEqual([{ user_id: '79000000001', assistant_id: '10', at: exact(TS_A) }]);
+    expect(await points()).toEqual([{ user_id: '79000000001', assistant_id: '10', at: exact(mark(2)) }]);
     expect(await feeds()).toEqual({ '79000000001_10': 5 });
   });
 
+  it('свежий лист (ход час назад) — точка; давний (ход три дня назад) — лента перенесена, точки нет', async () => {
+    await turn('79000000001_10', hoursAgo(200));
+    await turn(sheet('79000000001_10', 2), hoursAgo(1));
+    // Вкладку с давним листом, скорее всего, закрыли — человек вернулся к
+    // основной памяти; точка по такому листу стёрла бы ему её.
+    await turn('79000000002_10', hoursAgo(200));
+    await turn(sheet('79000000002_10', 73), hoursAgo(72));
+    await runScript();
+    expect(await feeds()).toEqual({ '79000000001_10': 4, '79000000002_10': 4 });
+    expect(await points()).toEqual([{ user_id: '79000000001', assistant_id: '10', at: exact(mark(2)) }]);
+  });
+
+  it('граница окна — ровно 24 часа до запуска скрипта, включительно', async () => {
+    // Данные и скрипт — в одной транзакции: now() у скрипта тот же, что у
+    // вставок, и границу можно проверить до микросекунды. BEGIN скрипта внутри
+    // открытой транзакции — лишь WARNING, его COMMIT фиксирует всё.
+    const client = await pool.connect();
+    let failed: Error | undefined;
+    try {
+      await client.query('BEGIN');
+      const human = (s: string, at: string) =>
+        client.query(
+          `INSERT INTO custom_chat_history (session_id, sender_type, content, created_at) VALUES ($1, 'human', 'x', ${at})`,
+          [s],
+        );
+      await human(sheet('79000000001_10', 25), `now() - interval '24 hours'`);
+      await human(sheet('79000000002_10', 25), `now() - interval '24 hours' - interval '1 microsecond'`);
+      await client.query(read(SCRIPT));
+    } catch (e) {
+      failed = e as Error;
+      throw e;
+    } finally {
+      client.release(failed);
+    }
+    expect(await feeds()).toEqual({ '79000000001_10': 1, '79000000002_10': 1 });
+    expect(await points()).toEqual([{ user_id: '79000000001', assistant_id: '10', at: exact(mark(25)) }]);
+  });
+
   it('повторный запуск ничего не меняет', async () => {
-    await turn('79000000001_10', '2026-11-10T10:00:00Z');
-    await turn(`79000000001_10_fresh_${TS_B}`, '2026-11-12T07:30:00Z');
-    await turn(`79000000001_10_fresh_${TS_A}`, '2026-11-16T05:00:00Z');
-    await turn(`79000000002_10_fresh_${TS_B}`, '2026-11-12T07:30:00Z');
-    await turn('79000000002_10', '2026-11-17T05:00:00Z');
-    await upload('79000000001', `79000000001_10_fresh_${TS_A}`);
-    await plan('79000000001', `79000000001_10_fresh_${TS_B}`, '2026-11-12T08:00:00Z');
-    await plan('79000000001', `79000000001_10_fresh_${TS_A}`, '2026-11-16T06:00:00Z');
-    await turn(`${TEST_ACCOUNT}_12_fresh_${TS_A}`, '2026-11-16T05:00:00Z');
+    await turn('79000000001_10', hoursAgo(72));
+    await turn(sheet('79000000001_10', 100), hoursAgo(99));
+    await turn(sheet('79000000001_10', 2), hoursAgo(1));
+    await turn(sheet('79000000002_10', 5), hoursAgo(4));
+    await turn('79000000002_10', hoursAgo(0.5));
+    await turn(sheet('79000000003_10', 73), hoursAgo(72)); // давний — без точки
+    await upload('79000000001', sheet('79000000001_10', 2));
+    await plan('79000000001', sheet('79000000001_10', 100), hoursAgo(99));
+    await plan('79000000001', sheet('79000000001_10', 2), hoursAgo(0.9));
+    await turn(sheet(`${TEST_ACCOUNT}_12`, 2), hoursAgo(1));
 
     await runScript();
     const once = await snapshot();
@@ -200,32 +251,32 @@ maybe('разовый перенос старых листов (pg)', () => {
   });
 
   it('загрузки листа переезжают в основную ленту; у тестового аккаунта остаются в листе', async () => {
-    await turn(`79000000001_10_fresh_${TS_A}`, '2026-11-16T05:00:00Z');
-    await upload('79000000001', `79000000001_10_fresh_${TS_A}`);
-    await upload('79000000001', `79000000001_10_fresh_${TS_B}`);
+    await turn(sheet('79000000001_10', 2), hoursAgo(1));
+    await upload('79000000001', sheet('79000000001_10', 2));
+    await upload('79000000001', sheet('79000000001_10', 100));
     await upload('79000000001', '79000000001_10');
-    await upload(TEST_ACCOUNT, `${TEST_ACCOUNT}_12_fresh_${TS_A}`);
+    await upload(TEST_ACCOUNT, sheet(`${TEST_ACCOUNT}_12`, 2));
     await runScript();
     const { rows } = await pool.query(`SELECT session_id FROM chat_uploads ORDER BY storage_key`);
     expect(rows.map((r) => r.session_id)).toEqual([
       '79000000001_10',
       '79000000001_10',
       '79000000001_10',
-      `${TEST_ACCOUNT}_12_fresh_${TS_A}`,
+      sheet(`${TEST_ACCOUNT}_12`, 2),
     ]);
   });
 
   it('план: у пары нет основного — переезжает самый свежий план листа, остальные остаются; скрипт не падает', async () => {
-    await turn(`79000000001_10_fresh_${TS_B}`, '2026-11-12T07:30:00Z');
-    await turn(`79000000001_10_fresh_${TS_A}`, '2026-11-16T05:00:00Z');
+    await turn(sheet('79000000001_10', 100), hoursAgo(99));
+    await turn(sheet('79000000001_10', 2), hoursAgo(1));
     // Свежее по updated_at — старый лист: план обновляли позже.
-    await plan('79000000001', `79000000001_10_fresh_${TS_B}`, '2026-11-16T09:00:00Z', 'старый лист');
-    await plan('79000000001', `79000000001_10_fresh_${TS_A}`, '2026-11-16T06:00:00Z', 'новый лист');
+    await plan('79000000001', sheet('79000000001_10', 100), hoursAgo(0.5), 'старый лист');
+    await plan('79000000001', sheet('79000000001_10', 2), hoursAgo(0.9), 'новый лист');
     await runScript();
     const plans = await pool.query(`SELECT session_id, title FROM action_plans ORDER BY session_id`);
     expect(plans.rows).toEqual([
       { session_id: '79000000001_10', title: 'старый лист' },
-      { session_id: `79000000001_10_fresh_${TS_A}`, title: 'новый лист' },
+      { session_id: sheet('79000000001_10', 2), title: 'новый лист' },
     ]);
     // История при этом перенесена — транзакция не откатилась.
     expect(await feeds()).toEqual({ '79000000001_10': 4 });
@@ -233,93 +284,103 @@ maybe('разовый перенос старых листов (pg)', () => {
   });
 
   it('план: у пары есть основной — он остаётся, план листа не переезжает', async () => {
-    await turn(`79000000001_10_fresh_${TS_A}`, '2026-11-16T05:00:00Z');
-    await plan('79000000001', '79000000001_10', '2026-11-10T10:00:00Z', 'основной');
-    await plan('79000000001', `79000000001_10_fresh_${TS_A}`, '2026-11-16T06:00:00Z', 'лист');
+    await turn(sheet('79000000001_10', 2), hoursAgo(1));
+    await plan('79000000001', '79000000001_10', hoursAgo(72), 'основной');
+    await plan('79000000001', sheet('79000000001_10', 2), hoursAgo(0.9), 'лист');
     await runScript();
     const plans = await pool.query(`SELECT session_id, title FROM action_plans ORDER BY session_id`);
     expect(plans.rows).toEqual([
       { session_id: '79000000001_10', title: 'основной' },
-      { session_id: `79000000001_10_fresh_${TS_A}`, title: 'лист' },
+      { session_id: sheet('79000000001_10', 2), title: 'лист' },
     ]);
     expect(await feeds()).toEqual({ '79000000001_10': 2 });
   });
 
   it('пары одного пользователя с разными ассистентами независимы (UUID-пользователь, custom-ассистент)', async () => {
     // 10: последний ход в листе — точка.
-    await turn(`${UUID_USER}_10`, '2026-11-10T10:00:00Z');
-    await turn(`${UUID_USER}_10_fresh_${TS_A}`, '2026-11-16T05:00:00Z');
+    await turn(`${UUID_USER}_10`, hoursAgo(72));
+    await turn(sheet(`${UUID_USER}_10`, 2), hoursAgo(1));
     // custom: из листа вышел — точки нет.
-    await turn(`${UUID_USER}_${CUSTOM}_fresh_${TS_B}`, '2026-11-12T07:30:00Z');
-    await turn(`${UUID_USER}_${CUSTOM}`, '2026-11-17T05:00:00Z');
+    await turn(sheet(`${UUID_USER}_${CUSTOM}`, 5), hoursAgo(4));
+    await turn(`${UUID_USER}_${CUSTOM}`, hoursAgo(0.5));
     // 12: листа не было — ничего не меняется (хотя ход позже всех).
-    await turn(`${UUID_USER}_12`, '2026-11-17T09:00:00Z');
+    await turn(`${UUID_USER}_12`, hoursAgo(0.25));
     await runScript();
     expect(await feeds()).toEqual({
       [`${UUID_USER}_10`]: 4,
       [`${UUID_USER}_12`]: 2,
       [`${UUID_USER}_${CUSTOM}`]: 4,
     });
-    expect(await points()).toEqual([{ user_id: UUID_USER, assistant_id: '10', at: exact(TS_A) }]);
+    expect(await points()).toEqual([{ user_id: UUID_USER, assistant_id: '10', at: exact(mark(2)) }]);
   });
 
   it('точку новее метки листа сохраняет (GREATEST), старую — сдвигает на метку', async () => {
-    await turn(`79000000001_10_fresh_${TS_A}`, '2026-11-16T05:00:00Z');
-    await turn(`79000000002_10_fresh_${TS_A}`, '2026-11-16T05:00:00Z');
+    await turn(sheet('79000000001_10', 2), hoursAgo(1));
+    await turn(sheet('79000000002_10', 2), hoursAgo(1));
     // 1 — точку уже поставила после выката старая вкладка или кнопка.
-    await setPoint('79000000001', '10', '2026-11-17T08:00:00.123456Z');
-    // 2 — точка из давнего прошлого.
-    await setPoint('79000000002', '10', '2026-11-01T00:00:00Z');
+    const newer = new Date(mark(0.5)).toISOString().replace('Z', '456Z');
+    await setPoint('79000000001', '10', newer);
+    // 2 — точка десятидневной давности.
+    await setPoint('79000000002', '10', hoursAgo(240));
     await runScript();
     expect(await points()).toEqual([
-      { user_id: '79000000001', assistant_id: '10', at: '2026-11-17T08:00:00.123456' },
-      { user_id: '79000000002', assistant_id: '10', at: exact(TS_A) },
+      { user_id: '79000000001', assistant_id: '10', at: new Date(mark(0.5)).toISOString().replace('Z', '456') },
+      { user_id: '79000000002', assistant_id: '10', at: exact(mark(2)) },
     ]);
   });
 
   it('неправдоподобная метка листа — ленту переносим, точку не ставим', async () => {
-    const future = Date.now() + 24 * 3600 * 1000; // точка из будущего стёрла бы память навсегда
-    await turn(`79000000001_10_fresh_${future}`, '2026-11-16T05:00:00Z');
-    await turn('79000000002_10_fresh_100000', '2026-11-16T05:00:00Z'); // 1970
-    await turn('79000000003_10_fresh_99999999999999999999999', '2026-11-16T05:00:00Z'); // не влезает в bigint
+    const future = now + 24 * HOUR; // точка из будущего стёрла бы память навсегда
+    await turn(`79000000001_10_fresh_${future}`, hoursAgo(1));
+    await turn('79000000002_10_fresh_100000', hoursAgo(1)); // 1970
+    await turn('79000000003_10_fresh_99999999999999999999999', hoursAgo(1)); // не влезает в bigint
     await runScript();
     expect(await feeds()).toEqual({ '79000000001_10': 2, '79000000002_10': 2, '79000000003_10': 2 });
     expect(await points()).toEqual([]);
   });
 
   it('ключ нестандартного вида не трогает', async () => {
-    const odd = ['79000000001_fresh_' + TS_A, `79000000001_abc_10_fresh_${TS_A}`, `79000000001_Custom:x_fresh_${TS_A}`];
-    for (const s of odd) await turn(s, '2026-11-16T05:00:00Z');
+    const odd = [`79000000001_fresh_${mark(2)}`, sheet('79000000001_abc_10', 2), sheet('79000000001_Custom:x', 2)];
+    for (const s of odd) await turn(s, hoursAgo(1));
     await runScript();
     expect(Object.keys(await feeds()).sort()).toEqual([...odd].sort());
     expect(await points()).toEqual([]);
   });
 
-  it('печатает счётчики до и после с понятными подписями', async () => {
-    await turn(`79000000001_10_fresh_${TS_A}`, '2026-11-16T05:00:00Z');
-    await upload('79000000001', `79000000001_10_fresh_${TS_A}`);
-    await plan('79000000001', `79000000001_10_fresh_${TS_B}`, '2026-11-12T08:00:00Z');
-    await plan('79000000001', `79000000001_10_fresh_${TS_A}`, '2026-11-16T06:00:00Z');
-    await turn(`${TEST_ACCOUNT}_12_fresh_${TS_A}`, '2026-11-16T05:00:00Z');
-    const [before, after, ...rest] = counters(await runScript());
+  it('печатает счётчики до и после и итог точек с понятными подписями', async () => {
+    await turn(sheet('79000000001_10', 2), hoursAgo(1)); // свежий — точка
+    await turn(sheet('79000000002_10', 73), hoursAgo(72)); // давний — без точки
+    await turn(`79000000003_10_fresh_${now + 24 * HOUR}`, hoursAgo(1)); // свежий, метка из будущего
+    await upload('79000000001', sheet('79000000001_10', 2));
+    await plan('79000000001', sheet('79000000001_10', 100), hoursAgo(99));
+    await plan('79000000001', sheet('79000000001_10', 2), hoursAgo(0.9));
+    await turn(sheet(`${TEST_ACCOUNT}_12`, 2), hoursAgo(1));
+
+    const results = await runScript();
+    const [before, after, ...rest] = counters(results);
     expect(rest).toEqual([]);
-    const n = (row: Record<string, unknown>) =>
-      Object.fromEntries(Object.entries(row).map(([k, v]) => [k, k === 'этап' ? v : Number(v)]));
-    expect(n(before)).toEqual({
+    expect(numbers(before)).toEqual({
       'этап': 'до',
-      'сообщений в листах': 2,
+      'сообщений в листах': 6,
       'загрузок в листах': 1,
       'планов в листах': 2,
       'прочих сообщений _fresh_ (не трогаем)': 2,
       'точек': 0,
     });
-    expect(n(after)).toEqual({
+    expect(numbers(after)).toEqual({
       'этап': 'после',
       'сообщений в листах': 0,
       'загрузок в листах': 0,
       'планов в листах': 1,
       'прочих сообщений _fresh_ (не трогаем)': 2,
       'точек': 1,
+    });
+    const summary = results.filter((r) => r.fields.some((f) => f.name === 'точек по свежим листам'));
+    expect(summary).toHaveLength(1);
+    expect(numbers(summary[0].rows[0])).toEqual({
+      'точек по свежим листам': 1,
+      'давних листов без точки': 1,
+      'свежих листов с неверной меткой': 1,
     });
   });
 });
