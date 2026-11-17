@@ -153,6 +153,7 @@ describe('ChatFilesService.listForSession с CHAT_UPLOADS_ENABLED: загруз�
         id: UP_CLIP,
         originalName: 'прогулка.mp4',
         mime: 'video/mp4',
+        sizeBytes: 52_428_800,
         storageKey: `${UP_CLIP}/прогулка.mp4`,
         createdAt: '2026-09-20T08:00:00.000Z',
         source: 'telegram',
@@ -165,6 +166,7 @@ describe('ChatFilesService.listForSession с CHAT_UPLOADS_ENABLED: загруз�
         id: UP_SCAN,
         originalName: 'Договор.pdf',
         mime: 'application/pdf',
+        sizeBytes: 345_678,
         storageKey: `${UP_SCAN}/Договор.pdf`,
         createdAt: '2026-09-15T12:00:00.000Z',
         source: 'scan',
@@ -187,7 +189,7 @@ describe('ChatFilesService.listForSession с CHAT_UPLOADS_ENABLED: загруз�
         url: `/webhook/chat-uploads/${UP_PHOTO}`,
         thumbUrl: `/webhook/chat-uploads/${UP_PHOTO}/thumb`,
         stored: true, origin: 'upload', source: 'web',
-        note: 'Фото гостиной: выбрали светлые обои', uploadId: UP_PHOTO,
+        note: 'Фото гостиной: выбрали светлые обои', uploadId: UP_PHOTO, sizeBytes: 10,
       },
       {
         key: AI_IMG, kind: 'image', url: AI_IMG, name: '1.png', ext: 'png',
@@ -199,13 +201,14 @@ describe('ChatFilesService.listForSession с CHAT_UPLOADS_ENABLED: загруз�
         createdAt: '2026-09-20T08:00:00.000Z',
         url: `/webhook/chat-uploads/${UP_CLIP}`,
         stored: true, origin: 'upload', source: 'telegram', note: null, uploadId: UP_CLIP,
+        sizeBytes: 52_428_800,
       },
       {
         key: `upload:${UP_SCAN}`, kind: 'document', name: 'Договор.pdf', ext: 'pdf',
         createdAt: '2026-09-15T12:00:00.000Z',
         url: `/webhook/chat-uploads/${UP_SCAN}`,
         stored: true, origin: 'upload', source: 'scan',
-        note: 'Договор аренды: нашли пункт о залоге', uploadId: UP_SCAN,
+        note: 'Договор аренды: нашли пункт о залоге', uploadId: UP_SCAN, sizeBytes: 345_678,
       },
       {
         key: `${RELAY}/a.pdf`, kind: 'document', name: 'a.pdf', ext: 'pdf',
@@ -226,6 +229,19 @@ describe('ChatFilesService.listForSession с CHAT_UPLOADS_ENABLED: загруз�
     expect('thumbPath' in items[0]).toBe(false);
     // У загрузки нет строки истории — и поля messageId.
     expect('messageId' in items[0]).toBe(false);
+  });
+
+  it('у загрузки sizeBytes — байты оригинала из реестра; у файла ассистента поля нет', async () => {
+    const pg = makePg([{ id: 20, content: `![](${AI_IMG})`, created_at: '2026-10-05T10:00:00Z' }]);
+    const { uploads } = makeUploads([upload({ sizeBytes: 1_234_567 })]);
+
+    const items = await new ChatFilesService(pg as any, uploads).listForSession('u1', 'u1_12');
+
+    const fromUpload = items.find((i) => i.origin === 'upload')!;
+    const fromAssistant = items.find((i) => i.origin === 'assistant')!;
+    expect(fromUpload.sizeBytes).toBe(1_234_567);
+    // Размер у файла ассистента неизвестен — поля нет вовсе, а не 0 или null.
+    expect('sizeBytes' in fromAssistant).toBe(false);
   });
 
   it('сбой реестра загрузок не роняет панель: файлы ассистента отдаются без загрузок', async () => {
