@@ -4,10 +4,12 @@ import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { Pool } from 'pg';
 import { AccountDeletionRegistry } from '../account-deletion/account-deletion.registry';
+import { DeletionCancelledError } from '../account-deletion/account-deletion.safe';
 import type { DeletionJobRow } from '../account-deletion/account-deletion.types';
 import { VideoService } from './video.service';
 import {
   discoverVideoDeletion,
+  discoverVideoUploadsDeletion,
   VideoAccountDeletionAdapter,
 } from './video-account-deletion.adapter';
 
@@ -248,5 +250,74 @@ maybe('video-job.purge против живого Postgres (Task 12)', () => {
 
     const rows = await pool.query('SELECT id FROM video_jobs WHERE id=$1', [jobId]);
     expect(rows.rows).toHaveLength(0);
+  });
+
+  // K4 — личные загрузки video-uploads/<userId>/ без строки video_jobs.
+  function makeListingStorage(keys: string[], log: string[]) {
+    return {
+      listPage: jest.fn(async (input: { bucket: string; prefix: string }) => {
+        log.push(`list:${input.bucket}:${input.prefix}`);
+        return { keys: keys.filter((k) => k.startsWith(input.prefix)), truncated: false };
+      }),
+      deleteConfirmed: jest.fn(async (input: { bucket: string; key: string }) => {
+        log.push(`delete:${input.bucket}/${input.key}`);
+        return 'deleted' as const;
+      }),
+      delete: async () => undefined,
+      publicUrl: (bucket: string, key: string) => `https://minio.test/${bucket}/${key}`,
+    };
+  }
+
+  function makeUploadsService(storage: unknown) {
+    const pgDuck = {
+      query: (sql: string, params?: any[]) => pool.query(sql, params),
+      getClient: () => pool.connect(),
+    };
+    return new VideoService(
+      pgDuck as any,
+      { isConfigured: () => false } as any,
+      {} as any,
+      undefined,
+      storage as any,
+    );
+  }
+
+  it('K4 discovery: video-upload.purge на удалённое поколение без строк video_jobs; старое — пусто', async () => {
+    const current = await discoverVideoUploadsDeletion({
+      db: pool,
+      account: { userId: USER, deletionId: DELETION_ID, deletedAt: new Date() },
+      origin: 'explicit',
+    });
+    expect(current).toEqual({
+      jobs: [{ resourceType: 'video-upload.purge', resourceKey: 'video-uploads', phase: 'purge', payload: {} }],
+      skips: [],
+    });
+
+    const stale = await discoverVideoUploadsDeletion({
+      db: pool,
+      account: { userId: USER, deletionId: OLD_DELETION_ID, deletedAt: new Date() },
+      origin: 'explicit',
+    });
+    expect(stale).toEqual({ jobs: [], skips: [] });
+  });
+
+  it('K4 deleteVideoUploadsForDeletion: текущее поколение — обход своего префикса; старое — отмена без листинга', async () => {
+    const keys = [
+      `video-uploads/${USER}/1700-a.jpg`,
+      `video-uploads/${USER}-x/1700-n.jpg`,
+    ];
+    const log: string[] = [];
+    const storage = makeListingStorage(keys, log);
+    const svc = makeUploadsService(storage);
+
+    await expect(svc.deleteVideoUploadsForDeletion(USER, OLD_DELETION_ID))
+      .rejects.toBeInstanceOf(DeletionCancelledError);
+    expect(log).toEqual([]);
+
+    await svc.deleteVideoUploadsForDeletion(USER, DELETION_ID);
+    expect(log).toEqual([
+      `list:linkeon-smm-videos:video-uploads/${USER}/`,
+      `delete:linkeon-smm-videos/video-uploads/${USER}/1700-a.jpg`,
+    ]);
   });
 });

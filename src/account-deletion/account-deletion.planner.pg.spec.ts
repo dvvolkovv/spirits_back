@@ -18,7 +18,10 @@ import { discoverVoiceDocuments } from '../voice-call/voice-document-account-del
 import { discoverChatFiles } from '../chat/chat-files/chat-file-account-deletion.adapter';
 import { discoverChatUploads } from '../chat/chat-uploads/chat-upload-account-deletion.adapter';
 import { discoverImageDeletion } from '../misc/image-account-deletion.adapter';
-import { discoverVideoDeletion } from '../video/video-account-deletion.adapter';
+import {
+  discoverVideoDeletion,
+  discoverVideoUploadsDeletion,
+} from '../video/video-account-deletion.adapter';
 import { discoverSpeechDeletion } from '../speech/speech-account-deletion.adapter';
 import { discoverAvatarDeletion } from '../avatar/avatar-account-deletion.adapter';
 import { discoverVoiceAvatarDeletion } from '../voice-avatar/voice-account-deletion.adapter';
@@ -419,6 +422,7 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
       discoverChatUploads,
       discoverImageDeletion,
       discoverVideoDeletion,
+      discoverVideoUploadsDeletion,
       discoverSpeechDeletion,
       discoverAvatarDeletion,
       discoverVoiceAvatarDeletion,
@@ -492,6 +496,11 @@ const CANARY = 'CANARY_ACCOUNT_DELETION';
     // состояния с другими задачами (как у chat-file.purge) — правило не нужно,
     // срок назначает planner (deletedAt + retention).
     expect(DELETION_DEPENDENCIES['chat-upload.purge']).toBeUndefined();
+    // K4 (video-uploads/<userId>/): обход префикса не разделяет состояние с
+    // video-job.purge — объект, уже стёртый по строке, листинг не вернёт, а
+    // удалённый обходом строковый purge подтвердит как отсутствующий. Порядок
+    // не важен, правило не нужно; срок — planner (deletedAt + retention).
+    expect(DELETION_DEPENDENCIES['video-upload.purge']).toBeUndefined();
   });
 
   describe('assertCurrent', () => {
