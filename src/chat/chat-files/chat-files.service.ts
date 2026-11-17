@@ -41,6 +41,8 @@ export interface ChatFileItem {
   note?: string | null;
   /** Только у загрузок: id строки chat_uploads — для DELETE /webhook/chat-uploads/:id. */
   uploadId?: string;
+  /** Только у загрузок: размер оригинала в байтах (size_bytes реестра). У файлов ассистента поля нет. */
+  sizeBytes?: number;
 }
 
 /** Файл из истории до подстановки адресов видео и озвучки. */
@@ -206,6 +208,7 @@ export function uploadPanelItem(r: ChatUploadRecord, ownerUrl: string): ChatFile
     source: r.source,
     note: r.note,
     uploadId: r.id,
+    sizeBytes: r.sizeBytes,
   };
 }
 
