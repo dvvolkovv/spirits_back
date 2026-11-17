@@ -161,6 +161,77 @@ describe('Neo4jService — гейт на активный аккаунт пер�
 });
 
 /**
+ * Ревью K1b: гейт компакции стоял ПОСЛЕ шага 2 (DELETE r). Сбой запроса гейта
+ * (или отсутствие PgService) уводил исключение/выход наружу, когда связи
+ * группы уже сняты без замены, — тихая потеря сущностей у ЖИВОГО аккаунта.
+ * Любой отказ гейта обязан ничего не менять: проверка — до чтения группы.
+ */
+describe('Neo4jService.mergeEntitiesInProfile — гейт до любых изменений', () => {
+  const DELETE_RE = /\bDELETE r\b/;
+
+  function makeMerge(pgImpl: ((sql: string, params: any[]) => Promise<any>) | null) {
+    const events: string[] = [];
+    const pg = pgImpl && {
+      query: jest.fn(async (sql: string, params: any[] = []) => {
+        if (/FROM user_id/.test(sql)) events.push('state');
+        return pgImpl(sql, params);
+      }),
+    };
+    const run = jest.fn(async (cypher: string, _params?: any): Promise<any> => {
+      events.push(`neo:${cypher.replace(/\s+/g, ' ').trim()}`);
+      return { records: [] };
+    });
+    const session = { run, close: jest.fn(async () => undefined) };
+    const svc = new Neo4jService((pg ?? undefined) as any, {} as any);
+    (svc as any).driver = {};
+    (svc as any).getSession = jest.fn(() => session);
+    return { svc, run, events };
+  }
+  const cyphers = (run: jest.Mock) => run.mock.calls.map((c) => String(c[0]));
+  const stateRows = (active: boolean) => async () => ({ rows: active ? [{ '?column?': 1 }] : [], rowCount: active ? 1 : 0 });
+
+  it('активный аккаунт: гейт выполняется раньше чтения группы, DELETE r и MERGE', async () => {
+    const { svc, events } = makeMerge(stateRows(true));
+
+    await svc.mergeEntitiesInProfile('u-k1', 'interest', ['шахматы', 'chess'], 'шахматы');
+
+    const firstNeo = events.findIndex((e) => e.startsWith('neo:'));
+    const del = events.findIndex((e) => e.startsWith('neo:') && DELETE_RE.test(e));
+    const merge = events.findIndex((e) => e.startsWith('neo:') && /^neo:MERGE/.test(e));
+    expect(events.indexOf('state')).toBeGreaterThanOrEqual(0);
+    expect(del).toBeGreaterThan(-1);
+    expect(merge).toBeGreaterThan(-1);
+    expect(events.indexOf('state')).toBeLessThan(firstNeo);
+  });
+
+  it('удалённый аккаунт: ни DELETE r, ни MERGE не выполняются', async () => {
+    const { svc, run } = makeMerge(stateRows(false));
+
+    await svc.mergeEntitiesInProfile('u-k1', 'interest', ['шахматы', 'chess'], 'шахматы');
+
+    expect(cyphers(run).filter((c) => DELETE_RE.test(c) || /\bMERGE\b/.test(c))).toEqual([]);
+  });
+
+  it('сбой запроса гейта: связи не сняты, ничего не записано', async () => {
+    const { svc, run } = makeMerge(async () => { throw new Error('PostgreSQL недоступен'); });
+
+    await expect(
+      svc.mergeEntitiesInProfile('u-k1', 'interest', ['шахматы', 'chess'], 'шахматы'),
+    ).rejects.toThrow('PostgreSQL недоступен');
+
+    expect(cyphers(run).filter((c) => DELETE_RE.test(c) || /\bMERGE\b/.test(c))).toEqual([]);
+  });
+
+  it('без PgService проверить нечем — ничего не делаем, связи на месте', async () => {
+    const { svc, run } = makeMerge(null);
+
+    await svc.mergeEntitiesInProfile('u-k1', 'interest', ['шахматы', 'chess'], 'шахматы');
+
+    expect(cyphers(run).filter((c) => DELETE_RE.test(c) || /\bMERGE\b/.test(c))).toEqual([]);
+  });
+});
+
+/**
  * Ревью K1: internal_id — это телефон (или uuid почтового входа), и в логах
  * его быть не должно. Принятой безопасной формы для userId в логах проекта нет
  * (maskPhone — только для SMS-номеров), поэтому строки — без идентификатора.
