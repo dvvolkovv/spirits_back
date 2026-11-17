@@ -26,6 +26,7 @@ import { ShortsApprovalService } from '../shorts/shorts-approval.service';
 import { ShortsYoutubeService } from '../shorts/shorts-youtube.service';
 import { shortsEnabled } from '../shorts/short-env';
 import { fetchMediaBytes } from '../common/net/own-media';
+import { chatUploadIdFromUrl } from '../chat/chat-uploads/upload-image-source';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
 import { InsightsCallbackService, shouldRouteToInsights } from '../insights/insights-callback.service';
 import { TgProductActionsService, shouldRouteToProductActions } from './tg-product-actions.service';
@@ -148,6 +149,39 @@ type OutgoingMarker =
   | { kind: 'upscale'; source: string }
   | { kind: 'video'; prompt: string; source?: string; duration?: number; mode: 'text2video' | 'image2video'; model?: string }
   | { kind: 'file'; url: string; caption?: string; name?: string };
+
+/** Адреса исходников маркера: что уйдёт в misc (правка, склейка, апскейл) или в видео как портрет. */
+function outgoingMarkerSources(m: OutgoingMarker): string[] {
+  switch (m.kind) {
+    case 'image_edit':
+    case 'upscale':
+      return [m.source];
+    case 'image_compose':
+      return m.sources;
+    case 'video':
+      return m.source ? [m.source] : [];
+    default:
+      return [];
+  }
+}
+
+/**
+ * Загрузка пользователя (/webhook/chat-uploads/<id>) исходником маркера в
+ * Telegram не берётся (spec 2026-11-16-chat-uploads-media-notes, очередь 1).
+ * Маркеры идут от имени владельца бота (cfg.owner_user_id), а пишет их модель
+ * по просьбе любого участника группы — misc и video прочли бы приватный файл
+ * владельца из бакета для чужого человека. Проверка не зависит от
+ * CHAT_UPLOADS_ENABLED: Telegram ведёт себя одинаково при любом значении флага.
+ * Отказ — код UNSAFE_URL: в чат уходит attach_bad_link, адреса в тексте нет.
+ *
+ * Очередь 2: разрешать загрузки можно будет только в ходе самого владельца
+ * (личка с ботом, автор сообщения — владелец), а не любого участника.
+ */
+function assertNoChatUploadSource(m: OutgoingMarker): void {
+  if (outgoingMarkerSources(m).some((u) => chatUploadIdFromUrl(u))) {
+    throw Object.assign(new Error('chat upload source is not available in Telegram'), { code: 'UNSAFE_URL' });
+  }
+}
 
 // Файлы которые мы готовы автоматически прикреплять из песочницы Claude.
 // Скрипты и исходники намеренно НЕ включены — Claude может писать .py/.sh
@@ -1914,6 +1948,8 @@ export class TgBotService implements OnModuleInit {
 
   /** Отправляет один маркер: генерим картинку или скачиваем по URL → шлём в чат. */
   private async dispatchOutgoingMarker(cfg: TgBotConfigRow, msg: any, m: OutgoingMarker, lang: TgLang): Promise<void> {
+    // До misc и video: загрузки владельца исходником в Telegram не идут.
+    assertNoChatUploadSource(m);
     if (m.kind === 'image') {
       this.grammy.sendChatAction(msg.chat.id, 'upload_photo').catch(() => {});
       const res = await this.misc.generateImage(cfg.owner_user_id, { prompt: m.prompt });

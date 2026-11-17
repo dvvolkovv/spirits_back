@@ -2,12 +2,14 @@ import 'reflect-metadata';
 import * as http from 'http';
 import { createHmac } from 'crypto';
 import { PassThrough, Readable } from 'stream';
-import { INestApplication, Module, NotFoundException } from '@nestjs/common';
+import * as jsonwebtoken from 'jsonwebtoken';
+import { INestApplication, Logger, Module, NotFoundException } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { ChatUploadsController } from './chat-uploads.controller';
 import { ChatUploadsService } from './chat-uploads.service';
 import { JwtService } from '../../common/services/jwt.service';
 import { contentDispositionFor } from '../chat-files/file-meta';
+import { signProductToolToken } from '../../products/product-tool.token';
 
 /**
  * Приватное скачивание исходников. HTTP-прогон по образцу
@@ -128,10 +130,82 @@ describe('ChatUploadsController (HTTP)', () => {
     );
   });
 
-  it('невалидный Bearer — анонимный запрос (404), а не 500', async () => {
+  it('невалидный Bearer с подписью — анонимный запрос, решает подпись (404), а не 500', async () => {
     // verifyAccess бросает на мусоре: контроллер обязан считать такой запрос
     // анонимным и отдать решение подписи, а не ронять ответ.
-    expect((await get(base, { authorization: 'Bearer not-a-jwt' })).status).toBe(404);
+    expect((await get(`${base}?exp=1&sig=bad`, { authorization: 'Bearer not-a-jwt' })).status).toBe(404);
+  });
+
+  /**
+   * Без подписи доступ даёт только access-токен владельца. Нет его, истёк,
+   * refresh-токен, мусор или токен инструмента продуктов — 401, как у thumb и
+   * DELETE: apiClient фронта на 401 обновит токен и повторит запрос, а на 404
+   * показал бы «файла нет». Сервис не вызывается — 401 зависит только от
+   * авторизации, не от id, и о существовании записи ничего не говорит.
+   */
+  describe('без подписи и без валидного access-токена — 401', () => {
+    const expiredBearer = () => {
+      const now = Math.floor(Date.now() / 1000);
+      const token = jsonwebtoken.sign(
+        { sub: 'u1', userId: 'u1', type: 'access', iat: now - 120, exp: now - 10 },
+        SECRET,
+      );
+      return `Bearer ${token}`;
+    };
+
+    it('нет Authorization — 401, сервис не вызывается', async () => {
+      expect((await get(base)).status).toBe(401);
+      expect(openDownload).not.toHaveBeenCalled();
+    });
+
+    it('истёкший access-токен владельца — 401 (фронт обновит токен), сервис не вызывается', async () => {
+      expect((await get(base, { authorization: expiredBearer() })).status).toBe(401);
+      expect(openDownload).not.toHaveBeenCalled();
+    });
+
+    it('refresh-токен, мусор в Bearer и токен продуктов — 401, сервис не вызывается', async () => {
+      expect((await get(base, { authorization: `Bearer ${jwtService.signRefresh('u1')}` })).status).toBe(401);
+      expect((await get(base, { authorization: 'Bearer not-a-jwt' })).status).toBe(401);
+      expect((await get(base, { authorization: `Bearer ${signProductToolToken('u1')}` })).status).toBe(401);
+      expect(openDownload).not.toHaveBeenCalled();
+    });
+
+    it('exp без sig подписью не считается — 401', async () => {
+      const exp = Math.floor(Date.now() / 1000) + 600;
+      expect((await get(`${base}?exp=${exp}`)).status).toBe(401);
+      expect((await get(`${base}?exp=${exp}&sig=`)).status).toBe(401);
+      expect(openDownload).not.toHaveBeenCalled();
+    });
+
+    it('401 не зависит от id: несуществующая запись без токена — тот же 401', async () => {
+      const missing = base.replace(RECORD_ID, '99999999-9999-4999-8999-999999999999');
+      expect((await get(missing)).status).toBe(401);
+      expect((await get(missing, { authorization: expiredBearer() })).status).toBe(401);
+      expect(openDownload).not.toHaveBeenCalled();
+    });
+  });
+
+  it('валидный access, чужой или несуществующий id — 404 от сервиса, как раньше', async () => {
+    const missingId = '99999999-9999-4999-8999-999999999999';
+    openDownload.mockImplementationOnce(() => Promise.reject(new NotFoundException('Upload not found')));
+    const res = await get(base.replace(RECORD_ID, missingId), {
+      authorization: `Bearer ${jwtService.signAccess('u1')}`,
+    });
+    expect(res.status).toBe(404);
+    expect(openDownload).toHaveBeenLastCalledWith(expect.objectContaining({ id: missingId, userId: 'u1' }));
+  });
+
+  it('с подписью истёкший токен не мешает: решает подпись — верная 200, неверная 404', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const expired = jsonwebtoken.sign(
+      { sub: 'u1', userId: 'u1', type: 'access', iat: now - 120, exp: now - 10 },
+      SECRET,
+    );
+    const exp = now + 600;
+    const sig = signature(RECORD_ID, exp);
+    expect((await get(`${base}?exp=${exp}&sig=${sig}`, { authorization: `Bearer ${expired}` })).status).toBe(200);
+    expect((await get(`${base}?exp=${exp}&sig=bad`, { authorization: `Bearer ${expired}` })).status).toBe(404);
+    expect(openDownload).toHaveBeenCalledTimes(2);
   });
 
   it('подпись ассистента без JWT открывает файл, exp/sig доходят до сервиса', async () => {
@@ -174,10 +248,22 @@ describe('ChatUploadsController (HTTP)', () => {
 });
 
 describe('ChatUploadsController (ошибка потока)', () => {
-  it('сбой стрима уничтожает ответ и не оставляет процесс висеть', async () => {
+  let logged: jest.SpyInstance;
+  beforeEach(() => {
+    logged = jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+  });
+  afterEach(() => logged.mockRestore());
+
+  it('сбой стрима уничтожает ответ, в журнале вид ошибки и id в кавычках, без текста сообщения', async () => {
+    // Сообщение S3 может повторять ключ объекта `<uuid>/<имя файла>`: в журнал
+    // идёт только вид (errKind), как в сервисе.
+    const failure = Object.assign(new Error('minio gone: u1/Отчёт.pdf'), {
+      name: 'S3ServiceException',
+      $metadata: { httpStatusCode: 503 },
+    });
     const body = new Readable({
       read() {
-        this.destroy(new Error('minio gone'));
+        this.destroy(failure);
       },
     });
     const svc = {
@@ -188,15 +274,52 @@ describe('ChatUploadsController (ошибка потока)', () => {
         sizeBytes: 1,
       })),
     };
-    const ctrl = new ChatUploadsController(svc as any, { verifyAccess: jest.fn() } as any);
+    // Владелец по токену: без токена и без подписи контроллер ответил бы 401
+    // до сервиса, и до стрима дело не дошло бы.
+    const ctrl = new ChatUploadsController(
+      svc as any,
+      { verifyAccess: jest.fn(() => ({ sub: 'u1', type: 'access' })) } as any,
+    );
     const res: any = new PassThrough();
     res.setHeader = jest.fn();
     const destroy = jest.fn();
     res.destroy = destroy;
 
-    await ctrl.download(RECORD_ID, { headers: {}, query: {} } as any, res);
+    await ctrl.download(RECORD_ID, { headers: { authorization: 'Bearer t' }, query: {} } as any, res);
     await new Promise((resolve) => setTimeout(resolve, 20));
 
     expect(destroy).toHaveBeenCalled();
+    const text = logged.mock.calls.map((args) => args.map(String).join(' ')).join('\n');
+    expect(text).toContain('stream failed: S3ServiceException status=503');
+    expect(text).toContain(`"${RECORD_ID}"`);
+    expect(text).not.toContain('minio gone');
+    expect(text).not.toContain('Отчёт');
+  });
+});
+
+describe('ChatUploadsController (клиент ушёл до начала ответа)', () => {
+  // Клиент оборвал соединение, пока сервис ходил в MinIO: pipe в уже
+  // уничтоженный ответ не сработает, а 'close' больше не придёт — стрим
+  // источника (сокет GetObject) остался бы висеть до серверного таймаута.
+  it.each([
+    ['download', (ctrl: ChatUploadsController, req: any, res: any) => ctrl.download(RECORD_ID, req, res)],
+    ['thumb', (ctrl: ChatUploadsController, req: any, res: any) => ctrl.thumb(RECORD_ID, req, res)],
+  ])('%s: ответ уже уничтожен — стрим источника уничтожается сразу', async (_name, call) => {
+    const body = new PassThrough();
+    const file = { body, originalName: 'a.jpg', mime: 'image/webp', sizeBytes: 1024 };
+    const svc = { openDownload: jest.fn(async () => file), openThumb: jest.fn(async () => file) };
+    const ctrl = new ChatUploadsController(
+      svc as any,
+      { verifyAccess: jest.fn(() => ({ sub: 'u1', type: 'access' })) } as any,
+    );
+    const res: any = new PassThrough();
+    res.setHeader = jest.fn();
+    res.destroy();
+    await new Promise<void>((resolve) => res.once('close', resolve));
+
+    await call(ctrl, { headers: { authorization: 'Bearer t' }, query: {} }, res);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(body.destroyed).toBe(true);
   });
 });

@@ -59,6 +59,23 @@ export function scoreFile(words: string[], name: string, text: string): number {
   return score;
 }
 
+/**
+ * Очки исходной загрузки пользователя: 3 за слово в имени, 2 — за слово в
+ * комментарии ассистента (инструмент note_file). Комментарий весит больше
+ * текста ответа (scoreFile: 1): ассистент пишет его ровно затем, чтобы файл
+ * потом нашёлся, а имя «IMG_2041.jpg» ничего не говорит.
+ */
+export function scoreUpload(words: string[], name: string, note: string): number {
+  const n = normalizeForSearch(name);
+  const t = normalizeForSearch(note);
+  let score = 0;
+  for (const w of words) {
+    if (n.includes(w)) score += 3;
+    if (t.includes(w)) score += 2;
+  }
+  return score;
+}
+
 /** Текст ответа без разметки, адресов и маркеров — короткая подпись к найденному файлу. */
 export function plainNote(text: string, max = 200): string {
   const s = String(text ?? '')

@@ -175,8 +175,11 @@ export class LiveKitClient {
   }
 
   /** Доставка сообщения в комнату. Слушают и воркер, и фронт. */
-  async send(roomName: string, msg: VoiceDataMessage): Promise<void> {
-    const client = new RoomServiceClient(this.httpUrl, this.apiKey, this.apiSecret);
+  async send(roomName: string, msg: VoiceDataMessage, timeoutMs?: number): Promise<void> {
+    // requestTimeout в livekit-server-sdk 2.x — в СЕКУНДАХ (TwirpRPC:
+    // AbortSignal.timeout(timeout * 1e3)). Без timeoutMs поведение прежнее.
+    const options = timeoutMs ? { requestTimeout: Math.ceil(timeoutMs / 1000) } : undefined;
+    const client = new RoomServiceClient(this.httpUrl, this.apiKey, this.apiSecret, options);
     const payload = new TextEncoder().encode(JSON.stringify(msg));
     await client.sendData(roomName, payload, DataPacket_Kind.RELIABLE, { topic: VOICE_DATA_TOPIC });
   }

@@ -18,6 +18,7 @@ import type {
 // (пин — chat-uploads.di.spec.ts).
 import { StorageService } from '../../common/services/storage.service';
 import { CHAT_UPLOADS_BUCKET } from './chat-uploads.service';
+import { uploadThumbKey } from './upload-thumb';
 
 /**
  * Phase 2 — исходники загрузок чата (chat_uploads) при удалении аккаунта.
@@ -41,12 +42,15 @@ import { CHAT_UPLOADS_BUCKET } from './chat-uploads.service';
  * tasks/support/peer/referral): userId в resourceKey забраковал бы
  * fail-closed sanitizer (safeDeletionJobSnapshot: resourceKey === userId).
  *
- * Fail-closed: storage_key — единственный указатель на байты, поэтому
+ * Fail-closed: storage_key и thumb_key (webp-миниатюра из миграции 002, тот же
+ * бакет; NULL — миниатюры нет) — единственные указатели на байты, поэтому
  * строки удаляются ТОЛЬКО после подтверждённого удаления всех объектов
  * (deleteConfirmed: 'deleted' и 'absent' — успех; любой неизвестный исход —
  * DeletionRetryError с классификацией deletionErrorKind, строки сохраняются
- * для retry). Аномальный ключ (пустой сегмент/'.'/'..') — retry kind db,
- * слепого удаления нет. Повторный прогон после частичного сбоя идемпотентен.
+ * для retry). Миниатюра стирается и по вычисляемому thumbs/<storage_key>.webp:
+ * она могла лечь в бакет и при thumb_key = NULL (см. execute). Аномальный
+ * ключ (пустой сегмент/'.'/'..') — retry kind db, слепого удаления нет.
+ * Повторный прогон после частичного сбоя идемпотентен.
  *
  * Логирование — только safe-формы раннера (safeDeletionMessage): адаптер не
  * печатает storage_key/original_name/sha256/userId.
@@ -101,20 +105,39 @@ export class ChatUploadAccountDeletionAdapter implements OnModuleInit, AccountDe
 
     await ctx.assertCurrent(job);
     const res = await ctx.db.query(
-      'SELECT storage_key FROM chat_uploads WHERE user_id = $1',
+      'SELECT storage_key, thumb_key FROM chat_uploads WHERE user_id = $1',
       [job.userId],
     );
     for (const row of res.rows ?? []) {
       const key = typeof row?.storage_key === 'string' ? row.storage_key : '';
-      // Ключ мог прийти только из нашей таблицы, но purge исполняется через
-      // 30 дней: traversal/пустые сегменты отклоняются fail-closed.
-      if (!isSafeKey(key)) throw new DeletionRetryError('db');
-      await ctx.assertCurrent(job);
-      try {
-        await this.storage.deleteConfirmed({ bucket: CHAT_UPLOADS_BUCKET, key });
-      } catch (error) {
-        if (error instanceof DeletionCancelledError) throw error;
-        throw new DeletionRetryError(deletionErrorKind(error));
+      // Миниатюра (миграция 002): NULL — её нет в реестре; любое другое
+      // значение обязано быть таким же безопасным ключом, как storage_key.
+      // Не-строка нормализуется как у storage_key — в '' (retry db): String()
+      // сделал бы из 42 или массива «безопасный» ключ.
+      const thumbKey = row?.thumb_key == null
+        ? null
+        : typeof row.thumb_key === 'string' ? row.thumb_key : '';
+      // Миниатюра стирается и по thumb_key, и по вычисляемому
+      // thumbs/<storage_key>.webp: неоднозначно оборвавшаяся загрузка
+      // миниатюры при сохранении могла оставить объект при thumb_key = NULL
+      // (так же — ChatUploadsService.deleteForOwner). Отсеивается только NULL,
+      // а не всё ложное: пустой thumb_key — аномалия, а не «миниатюры нет».
+      const objectKeys = [
+        ...new Set([key, thumbKey, uploadThumbKey(key)].filter((k): k is string => k !== null)),
+      ];
+      // Ключи могли прийти только из нашей таблицы, но purge исполняется через
+      // 30 дней: traversal/пустые сегменты отклоняются fail-closed — ДО
+      // удаления любого объекта этой строки. Вычисляемый ключ из безопасного
+      // storage_key безопасен, но проверяется тоже.
+      if (!objectKeys.every((k) => isSafeKey(k))) throw new DeletionRetryError('db');
+      for (const objectKey of objectKeys) {
+        await ctx.assertCurrent(job);
+        try {
+          await this.storage.deleteConfirmed({ bucket: CHAT_UPLOADS_BUCKET, key: objectKey });
+        } catch (error) {
+          if (error instanceof DeletionCancelledError) throw error;
+          throw new DeletionRetryError(deletionErrorKind(error));
+        }
       }
     }
 

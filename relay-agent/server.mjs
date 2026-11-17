@@ -23,6 +23,7 @@ import { snapshotDir, changedFiles } from "./turn-files.mjs";
 import { agentTestMode, cliToolArgs } from "./agent-test-mode.mjs";
 import { createDrainGate } from "./drain-gate.mjs";
 import { createInflight } from "./inflight.mjs";
+import { uploadOptions } from "./upload-options.mjs";
 
 // Фабрика не слушает порт и не вешает process-сигналы: это позволяет прогонять
 // настоящие Express-хендлеры с изолированными каталогами и подменённым spawn.
@@ -73,10 +74,7 @@ app.use(createRelayAuth({
 app.use(express.json());
 app.use("/files", express.static(OUTPUT_DIR));
 
-const upload = multer({
-  dest: UPLOAD_DIR,
-  limits: { fileSize: 500 * 1024 * 1024 },
-});
+const upload = multer(uploadOptions(UPLOAD_DIR));
 
 // Правила 4 и 9 и абзац «ПРОВЕРКА ФАКТОВ» — спека
 // docs/superpowers/specs/2026-10-27-assistant-links-sources-roles-design.md (п. 3).
@@ -430,7 +428,7 @@ const TALERID_PROMPT = `
 // ключ `products` (им заводится сервер в конфиге ниже) и имя `manage_product` из
 // контракта MCP-сервера. Разойдутся — белый список не совпадёт с реальностью,
 // и отказ будет молчаливым.
-const PRODUCTS_TOOLS = "mcp__products__manage_product,mcp__products__find_files,mcp__products__report_problem,mcp__products__linkeon_help";
+const PRODUCTS_TOOLS = "mcp__products__manage_product,mcp__products__find_files,mcp__products__note_file,mcp__products__report_problem,mcp__products__linkeon_help";
 
 // Явная оговорка к правилу «только mcp__linkeon__*» из SYSTEM_PROMPT — без неё
 // ассистент видит инструмент и не зовёт его, считая запрещённым. Ровно такая же
@@ -460,6 +458,9 @@ const PRODUCTS_PROMPT = `
 Зови его, когда пользователь ищет или просит снова прислать файл, созданный раньше: документ, картинку, видео, озвучку — в этом разговоре или у другого ассистента.
 Ссылки из его ответа отдавай пользователю как есть, markdown-ссылкой [имя](url). Запрет печатать адреса — про файлы, которые ты создаёшь сейчас; к найденным он не относится.
 Если у файла stored=false — честно скажи, что он не сохранился. НЕ передавай в инструмент userId/телефон.
+
+КОММЕНТАРИИ К ЗАГРУЗКАМ. Тебе доступен инструмент mcp__products__note_file, если он есть в списке твоих инструментов, — тоже ЯВНОЕ исключение к правилу «только mcp__linkeon__*».
+Поработав с файлом, который загрузил пользователь, оставь к нему комментарий: 1–3 предложения — что в файле и что вы решили или сделали. Пиши комментарий на языке разговора с пользователем. file_id — id из блока «Earlier user uploads» или поле id из mcp__products__find_files (origin=upload). Если комментарий уже есть и ничего нового не решили — не переписывай его. Важное из прежнего комментария сохрани; паролей, номеров документов, карт и счетов и других чувствительных данных не пиши. НЕ передавай в инструмент userId/телефон.
 
 СООБЩИТЬ В ПОДДЕРЖКУ. Тебе доступен инструмент mcp__products__report_problem — тоже ЯВНОЕ исключение к правилу «только mcp__linkeon__*».
 Когда звать и что писать — в его описании. Если инструмент mcp__linkeon__* вернул ошибку с supportNotified=true — команда уже знает: report_problem не зови, скажи пользователю, что команда в курсе. НЕ передавай в инструмент userId/телефон.
@@ -794,8 +795,11 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   // Уже отдали клиенту хоть один кусок текста в этом ходе? Тогда переигрывать
   // ход нельзя — ответ склеится со вторым и юзер прочитает одно и то же дважды.
   let streamedAny = false;
-  // Ход закончился, не выдав финального ответа. Бэкенд по этому флагу не спишет
-  // за него токены: пользователь не должен платить за пустоту.
+  // Ход закончился, не выдав финального ответа. С 17.11.2026 бэкенд
+  // (partial-billing.ts) списывает такой ход за то, что успело прийти, и не
+  // списывает, если не пришло ничего: пользователь не должен платить за пустоту.
+  // Поэтому реплики обрывов с частичным результатом (preempted,
+  // transient_after_partial, max_turns) не обещают «токены не списаны».
   //
   // До этой правки три РАЗНЫЕ поломки выглядели для пользователя одинаково —
   // текст обрывался на полуслове без единого слова объяснения:
@@ -994,7 +998,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
         preempt: () => {
           preempted = true;
           notice(
-            "\n\n_(ответ прерван: вы отправили новое сообщение, и ассистент переключился на него. Токены за прерванный ход не списаны.)_",
+            "\n\n_(ответ прерван: вы отправили новое сообщение, и ассистент переключился на него.)_",
             "preempted",
           );
         },
@@ -1151,7 +1155,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
             if (fatalAccess) {
               if (FATAL_RE.test(ev.result)) notice(fatalHint(ev.result), "cli_fatal");
               else if (taleridWriteUsed) notice("_(связь с моделью прервалась после действия — проверьте результат, возможно всё прошло; при необходимости повторите)_", "transient_after_write");
-              else if (streamedAny) notice("\n\n_(связь с моделью прервалась, ответ оборван. Токены за этот ход не списаны — повторите вопрос.)_", "transient_after_partial");
+              else if (streamedAny) notice("\n\n_(связь с моделью прервалась, ответ оборван — повторите вопрос.)_", "transient_after_partial");
               else notice("_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_", "transient");
               return;
             }
@@ -1306,7 +1310,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
       notice("_(связь с моделью прервалась после действия — проверьте результат, возможно всё прошло; при необходимости повторите)_", "transient_after_write");
     } else if (r.transientHit && streamedAny) {
       // Ответ (пусть и частичный) клиент уже прочитал — повтор дал бы дубль.
-      notice("\n\n_(связь с моделью прервалась, ответ оборван. Токены за этот ход не списаны — повторите вопрос.)_", "transient_after_partial");
+      notice("\n\n_(связь с моделью прервалась, ответ оборван — повторите вопрос.)_", "transient_after_partial");
     } else if (r.transientHit) {
       // 401/429/5xx/network blip — wait briefly and retry on the same session.
       await new Promise((res) => setTimeout(res, retryDelayMs));
@@ -1346,7 +1350,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
     }
     if (r.maxTurnsHit) {
       notice(
-        "\n\n_(задача оказалась слишком большой даже для трёх заходов. Напишите «продолжай» — ассистент доведёт её до конца. Токены за незавершённый ход не списаны.)_",
+        "\n\n_(задача оказалась слишком большой даже для трёх заходов. Напишите «продолжай» — ассистент доведёт её до конца.)_",
         "max_turns",
       );
     }
@@ -1415,8 +1419,10 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
       if (filesOut.length > outputFiles.length) {
         console.log("[undelivered] " + sessionId + ": отдаю файлы прошлого хода: " + (filesOut.length - outputFiles.length));
       }
-      // failed — «ход не выдал финального ответа». Бэкенд по нему пропускает
-      // списание: платить за пустоту пользователь не должен.
+      // failed — «ход не выдал финального ответа», failReason — почему. С
+      // 17.11.2026 бэкенд (partial-billing.ts) по ним списывает оборванный ход за
+      // то, что успело прийти (текст модели или файлы), и пропускает списание,
+      // только если человек не получил ничего: платить за пустоту он не должен.
       res.write("data: " + JSON.stringify({
         type: "done",
         outputFiles: filesOut,

@@ -85,12 +85,12 @@ export const CHAT_TOOLS = [
   {
     name: 'edit_image',
     description:
-      'Edit / modify an existing image using Nano Banana 2 (std) or Nano Banana Pro (hd, 4K). Use when the user wants to change, fix, or iterate on a previously generated image — "сделай небо закатным", "убери фон", "добавь шапку", "сделай его рыжим", "замени надпись на X". Pass sourceImageUrl from the previous generate_image / edit_image tool result (imageUrl field). Cost: 5000 tokens (std) or 10000 tokens (hd).',
+      'Edit / modify an existing image using Nano Banana 2 (std) or Nano Banana Pro (hd, 4K). Use when the user wants to change, fix, or iterate on a previously generated image — "сделай небо закатным", "убери фон", "добавь шапку", "сделай его рыжим", "замени надпись на X". Pass sourceImageUrl from the previous generate_image / edit_image tool result (imageUrl field). Фото или картинку, которую загрузил сам пользователь, тоже можно править: можно передать url загрузки пользователя из find_files или из блока загрузок. Cost: 5000 tokens (std) or 10000 tokens (hd).',
     input_schema: {
       type: 'object',
       properties: {
         prompt: { type: 'string', description: 'What to change in the image (in the user\'s language).' },
-        sourceImageUrl: { type: 'string', description: 'URL of the image to edit. Pass the imageUrl field returned by a previous generate_image / edit_image / compose_image tool result (absolute https:// MinIO URL). Legacy /static/generated/... paths are also accepted for backward compatibility with older chat history.' },
+        sourceImageUrl: { type: 'string', description: 'URL of the image to edit. Pass the imageUrl field returned by a previous generate_image / edit_image / compose_image tool result (absolute https:// MinIO URL). Legacy /static/generated/... paths are also accepted for backward compatibility with older chat history. Для картинки пользователя можно передать url загрузки пользователя из find_files или из блока загрузок.' },
         quality: { type: 'string', enum: ['std', 'hd'], default: 'std' },
       },
       required: ['prompt', 'sourceImageUrl'],
@@ -99,7 +99,7 @@ export const CHAT_TOOLS = [
   {
     name: 'compose_image',
     description:
-      'Combine 2-3 source images into one new image using Nano Banana 2 (std) or Nano Banana Pro (hd, 4K). Use when the user wants to merge, combine, or compose multiple images — "возьми моё фото и посади меня на этот трон", "соедини товар с этим фоном", "объедини эти две картинки". Pass 2-3 URLs in sourceImageUrls (order matters — first is usually the primary subject). Cost: 5000 tokens (std) or 10000 tokens (hd).',
+      'Combine 2-3 source images into one new image using Nano Banana 2 (std) or Nano Banana Pro (hd, 4K). Use when the user wants to merge, combine, or compose multiple images — "возьми моё фото и посади меня на этот трон", "соедини товар с этим фоном", "объедини эти две картинки". Pass 2-3 URLs in sourceImageUrls (order matters — first is usually the primary subject). Любой из исходников может быть загрузкой пользователя: можно передать url загрузки пользователя из find_files или из блока загрузок. Cost: 5000 tokens (std) or 10000 tokens (hd).',
     input_schema: {
       type: 'object',
       properties: {
@@ -109,7 +109,7 @@ export const CHAT_TOOLS = [
           items: { type: 'string' },
           minItems: 2,
           maxItems: 3,
-          description: 'Array of 2-3 image URLs. Pass imageUrl fields from previous generate_image / edit_image / compose_image tool results (absolute https:// MinIO URLs). Legacy /static/generated/... paths also accepted for older chat history.',
+          description: 'Array of 2-3 image URLs. Pass imageUrl fields from previous generate_image / edit_image / compose_image tool results (absolute https:// MinIO URLs). Legacy /static/generated/... paths also accepted for older chat history. Для картинок пользователя можно передать url загрузки пользователя из find_files или из блока загрузок.',
         },
         quality: { type: 'string', enum: ['std', 'hd'], default: 'std' },
       },
@@ -119,11 +119,11 @@ export const CHAT_TOOLS = [
   {
     name: 'upscale_image',
     description:
-      'Enhance image quality using Nano Banana Pro — sharpens details, reduces noise, preserves content identically. Use when the user asks "улучши качество", "сделай чётче", "убери шум", "enhance". Note: pixel resolution stays the same; detail fidelity is what improves. Cost: 10000 tokens.',
+      'Enhance image quality using Nano Banana Pro — sharpens details, reduces noise, preserves content identically. Use when the user asks "улучши качество", "сделай чётче", "убери шум", "enhance". Note: pixel resolution stays the same; detail fidelity is what improves. Для фото, которое загрузил пользователь, можно передать url загрузки пользователя из find_files или из блока загрузок. Cost: 10000 tokens.',
     input_schema: {
       type: 'object',
       properties: {
-        sourceImageUrl: { type: 'string', description: 'URL of the image to upscale. Pass the imageUrl from a previous tool result (absolute https:// MinIO URL). Legacy /static/generated/... also accepted.' },
+        sourceImageUrl: { type: 'string', description: 'URL of the image to upscale. Pass the imageUrl from a previous tool result (absolute https:// MinIO URL). Legacy /static/generated/... also accepted. Для фото пользователя можно передать url загрузки пользователя из find_files или из блока загрузок.' },
       },
       required: ['sourceImageUrl'],
     },
@@ -136,7 +136,7 @@ export const CHAT_TOOLS = [
       'Генерация видео со звуком (Google Gemini Omni). ВАЖНО про взаимодействие:\n' +
       '• НИКОГДА не пиши и не придумывай ссылку на готовое видео сам — оно появляется у пользователя автоматически отдельной карточкой-плеером. Не вставляй URL вида /static/videos/... .\n' +
       '• Если инструмент вернул ошибку (например, дневной лимит генераций видео) — просто передай текст ошибки пользователю и НЕ давай никакой ссылки. Не выдумывай, что видео «готовится», если была ошибка.\n' +
-      'Модель одна, качество и цена одинаковые: model можно не передавать ("veo-3.1-fast" и "veo-3.1" равнозначны, выбора качества нет — не предлагай его). Подходит и для «говорящей головы» / человека, говорящего в камеру / видео из ПОРТРЕТА, и для сцен без речи. Реплику/речь пиши ПРЯМО в prompt — модель сама произносит её с синхронными губами (нативный звук, отдельный аудио-шаг не нужен). Длина до 60с (targetDurationSec, по умолчанию 8): ролик длиннее 8с собирается из 8-секундных клипов — и вертикаль, и горизонталь; на стыках возможны лёгкие склейки. Портрет или картинка — передай sourceImageUrl + mode="image2video" (без картинки — mode="text2video").\n' +
+      'Модель одна, качество и цена одинаковые: model можно не передавать ("veo-3.1-fast" и "veo-3.1" равнозначны, выбора качества нет — не предлагай его). Подходит и для «говорящей головы» / человека, говорящего в камеру / видео из ПОРТРЕТА, и для сцен без речи. Реплику/речь пиши ПРЯМО в prompt — модель сама произносит её с синхронными губами (нативный звук, отдельный аудио-шаг не нужен). Длина до 60с (targetDurationSec, по умолчанию 8): ролик длиннее 8с собирается из 8-секундных клипов — и вертикаль, и горизонталь; на стыках возможны лёгкие склейки. Портрет или картинка — передай sourceImageUrl + mode="image2video" (без картинки — mode="text2video"). Для фото, которое загрузил пользователь, можно передать url загрузки пользователя из find_files или из блока загрузок.\n' +
       '  ВАЖНО про длину речи: текст реплики должен СООТВЕТСТВОВАТЬ targetDurationSec. Ориентир — ~2–3 коротких предложения речи на каждые 8 секунд (≈20–25 слов / 8с). Для 24с дай ~6–9 предложений, для 16с — ~4–6. Если реплика короткая, а видео длинное — речь прозвучит один раз, а остаток будет естественная пауза (НЕ повтор). Поэтому либо напиши достаточно текста под нужную длину, либо подбери targetDurationSec под реальную длину реплики. Не проси длинное видео под одну короткую фразу.\n' +
       'Продлить готовый ролик или наложить на него чужую озвучку (lipsync) нельзя — таких режимов нет. Стоимость считается автоматически по длине и формату.',
     input_schema: {
@@ -151,11 +151,11 @@ export const CHAT_TOOLS = [
           maximum: 60,
           description: 'Final video length in seconds (default 8). A video over 8s, horizontal or vertical, is assembled from 8s clips; the result is trimmed to exactly this length.',
         },
-        sourceImageUrl: { type: 'string' },
+        sourceImageUrl: { type: 'string', description: 'image2video: URL портрета или картинки; можно передать url загрузки пользователя из find_files или из блока загрузок.' },
         sourceImageUrls: {
           type: 'array',
           items: { type: 'string' },
-          description: 'image2video: до 3 URL референс-фото человека (разные ракурсы). Сходство лица заметно лучше с 3 фото, чем с 1 — проси у пользователя несколько фото для «видео из портрета».',
+          description: 'image2video: до 3 URL референс-фото человека (разные ракурсы). Сходство лица заметно лучше с 3 фото, чем с 1 — проси у пользователя несколько фото для «видео из портрета». Для его собственных фото можно передать url загрузки пользователя из find_files или из блока загрузок.',
         },
         aspectRatio: {
           type: 'string',

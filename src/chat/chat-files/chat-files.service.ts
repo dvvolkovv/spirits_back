@@ -1,12 +1,15 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { PgService } from '../../common/services/pg.service';
-import { ChatUploadsService, ChatUploadRecord } from '../chat-uploads/chat-uploads.service';
+import { ChatUploadsService, ChatUploadRecord, ChatUploadSource } from '../chat-uploads/chat-uploads.service';
+import { errKind } from '../chat-uploads/err-kind';
+import { uploadNoteOneLine } from '../chat-uploads/upload-note';
+import { uploadKind } from '../chat-uploads/upload-kind';
 import { ChatFileKind, ExtractEnv, ExtractedFile, extractChatFiles } from './extract';
 import {
-  FindFilesInput, assistantPart, extractHumanLinks, kindByMime,
-  normalizeForSearch, plainNote, queryWords, scoreFile,
+  FindFilesInput, assistantPart, extractHumanLinks,
+  normalizeForSearch, plainNote, queryWords, scoreFile, scoreUpload,
 } from './find-files';
-import { safeFileName } from './file-meta';
+import { fileExt, safeFileName } from './file-meta';
 import { thumbPathFor } from './thumbnails';
 
 /**
@@ -23,8 +26,23 @@ export interface ChatFileItem {
   name: string;
   ext: string;
   createdAt: string;
-  messageId: number;
+  /** Строка истории с файлом. У загрузок пользователя (origin='upload') её нет — и поля нет. */
+  messageId?: number;
   stored: boolean;
+  /**
+   * 'assistant' — файл из ответа ассистента, 'upload' — его загрузил сам
+   * пользователь (реестр chat_uploads). При выключенном CHAT_UPLOADS_ENABLED
+   * поля нет: ответ панели прежний.
+   */
+  origin?: 'assistant' | 'upload';
+  /** Только у загрузок: откуда пришёл файл — для пометки «из Telegram». */
+  source?: ChatUploadSource;
+  /** Только у загрузок: комментарий ассистента (note_file); null — его ещё нет. */
+  note?: string | null;
+  /** Только у загрузок: id строки chat_uploads — для DELETE /webhook/chat-uploads/:id. */
+  uploadId?: string;
+  /** Только у загрузок: размер оригинала в байтах (size_bytes реестра). У файлов ассистента поля нет. */
+  sizeBytes?: number;
 }
 
 /** Файл из истории до подстановки адресов видео и озвучки. */
@@ -114,7 +132,13 @@ export interface FoundForTool {
    */
   assistantUrl?: string;
   stored: boolean;
+  /**
+   * origin=upload — комментарий ассистента к файлу (note_file), пустая строка,
+   * если его ещё нет; origin=link и assistant — строка из сообщения или ответа.
+   */
   note: string;
+  /** Только у origin=upload: id исходника — его модель передаёт в note_file. */
+  id?: string;
 }
 
 export function extractEnv(): ExtractEnv {
@@ -156,20 +180,84 @@ function withThumb(item: ChatFileItem, publicBaseUrl: string): ChatFileItem {
   return thumbPath ? { ...item, thumbPath } : item;
 }
 
+/**
+ * Загрузка пользователя как элемент панели. Адреса — приватные ручки
+ * chat-uploads (ownerUrl): фронт открывает их запросом с JWT. thumbUrl — только
+ * если миниатюра получилась при сохранении (thumb_key). В withThumb загрузка
+ * не идёт: ручка /webhook/chat/thumb отдаёт миниатюры публичных бакетов, а
+ * приватный бакет загрузок она не откроет.
+ *
+ * Имя очищено safeFileName — так же, как у файлов ассистента в той же панели,
+ * в find_files и в блоке загрузок: bidi-переключатель (RLO) в имени из
+ * multipart иначе подменил бы видимое расширение. Фронт берёт name и для имени
+ * скачиваемого файла; ext считается от очищенного имени. Строка 📎 в истории
+ * остаётся сырой: deleteForOwner ищет её точным совпадением.
+ */
+export function uploadPanelItem(r: ChatUploadRecord, ownerUrl: string): ChatFileItem {
+  const name = safeFileName(r.originalName);
+  return {
+    key: `upload:${r.id}`,
+    kind: uploadKind(r),
+    name,
+    ext: fileExt(name),
+    createdAt: r.createdAt,
+    url: ownerUrl,
+    ...(r.thumbKey ? { thumbUrl: `${ownerUrl}/thumb` } : {}),
+    stored: true,
+    origin: 'upload',
+    source: r.source,
+    note: r.note,
+    uploadId: r.id,
+    sizeBytes: r.sizeBytes,
+  };
+}
+
 @Injectable()
 export class ChatFilesService {
+  private readonly logger = new Logger(ChatFilesService.name);
+
   constructor(
     private readonly pg: PgService,
     /** Реестр исходных загрузок — источник origin=upload в find_files. */
     private readonly uploads: ChatUploadsService,
   ) {}
 
-  /** Файлы одной переписки, от новых к старым. */
+  /**
+   * Файлы одной переписки, от новых к старым.
+   *
+   * С CHAT_UPLOADS_ENABLED к файлам ассистента добавляются загрузки
+   * пользователя из реестра (listForSessionPanel). Панель читает реестр, а не
+   * текст переписки: файл, досохранённый после бюджета saveOriginals, и файл
+   * из хода с пустым ответом ассистента всё равно видны. Флаг выключен —
+   * реестр не опрашивается, ответ прежний (без origin), один запрос к истории.
+   * Флаг читается так же, как в searchForUser и assistantBlock.
+   */
   async listForSession(userId: string, sessionId: string): Promise<ChatFileItem[]> {
     const env = extractEnv();
-    const { rows } = await this.pg.query(SESSION_FILES_SQL, [sessionId]);
+    const uploadsOn = process.env.CHAT_UPLOADS_ENABLED === 'true';
+    const [{ rows }, records] = await Promise.all([
+      this.pg.query(SESSION_FILES_SQL, [sessionId]),
+      uploadsOn
+        ? this.uploads.listForSessionPanel(userId, sessionId).catch((e: any): ChatUploadRecord[] => {
+            // Сбой реестра не должен прятать файлы ассистента: панель отдаёт их
+            // без загрузок. В журнал — только вид ошибки (errKind), без текста
+            // и без id пользователя: сообщение pg может повторять имя файла.
+            this.logger.warn(`listForSession: загрузки не прочитаны (${errKind(e)})`);
+            return [];
+          })
+        : Promise.resolve<ChatUploadRecord[]>([]),
+    ]);
     const items = await this.resolve(userId, collectFiles(rows, env));
-    return items.map(({ item }) => withThumb(item, env.publicBaseUrl));
+    const fromAssistant = items.map(({ item }) => withThumb(item, env.publicBaseUrl));
+    if (!uploadsOn) return fromAssistant;
+
+    const merged: ChatFileItem[] = [
+      ...fromAssistant.map((item) => ({ ...item, origin: 'assistant' as const })),
+      ...records.map((r) => uploadPanelItem(r, this.uploads.ownerUrl(r.id))),
+    ];
+    // createdAt у обоих источников — toISOString(), строки сравнимы напрямую.
+    // sort устойчив: при равном времени файл ассистента остаётся выше загрузки.
+    return merged.sort((a, b) => (a.createdAt === b.createdAt ? 0 : a.createdAt < b.createdAt ? 1 : -1));
   }
 
   /**
@@ -257,8 +345,10 @@ export class ChatFilesService {
    * создавали ассистенты; исходники, которые пользователь загружал сам
    * (chat_uploads); внешние ссылки из его сообщений. Все три сливаются в один
    * список от новых к старым, затем фильтры (вид, ассистент) и очки по словам
-   * запроса; при равных очках свежие выше (сортировка устойчива). `days` и
-   * `limit` действуют на все источники сразу.
+   * запроса (исходник — имя и комментарий ассистента, scoreUpload; файл
+   * ассистента и ссылка — имя и текст, scoreFile); при равных очках свежие
+   * выше (сортировка устойчива). `days` и `limit` действуют на все источники
+   * сразу. У исходника в выдаче есть id — его модель передаёт в note_file.
    *
    * Исходники и ссылки гейтятся CHAT_UPLOADS_ENABLED: флаг выключен — реестр
    * не опрашивается, USER_LINKS_SQL не выполняется, assistantUrl не чеканится,
@@ -311,14 +401,18 @@ export class ChatFilesService {
     for (const rec of uploadRecords) {
       candidates.push({
         origin: 'upload',
-        kind: kindByMime(rec.mime, rec.originalName),
+        // Один источник вида для панели, блока загрузок и find_files.
+        kind: uploadKind(rec),
         // Имя из multipart враждебно так же, как остальной пользовательский
         // ввод: safeFileName снимает управляющие, невидимые (RLO) и служебные
         // символы — как в storageKey при сохранении исходника.
         name: safeFileName(rec.originalName),
         createdAt: rec.createdAt,
         sessionId: rec.sessionId,
-        text: '',
+        // Комментарий ассистента одной строкой, как в блоке загрузок
+        // (uploadNoteOneLine): по нему ищут слова запроса (scoreUpload),
+        // он же уходит модели полем note.
+        text: uploadNoteOneLine(rec.note),
         url: this.uploads.ownerUrl(rec.id),
         uploadId: rec.id,
         stored: true,
@@ -364,7 +458,14 @@ export class ChatFilesService {
         const n = names.get(partOf(c.sessionId));
         return !!n && [n.display, ...n.aliases].some((a) => normalizeForSearch(a).includes(want));
       })
-      .map((c) => ({ c, score: words.length > 0 ? scoreFile(words, c.name, c.text) : 0 }))
+      .map((c) => ({
+        c,
+        score: words.length === 0
+          ? 0
+          : c.origin === 'upload'
+            ? scoreUpload(words, c.name, c.text)
+            : scoreFile(words, c.name, c.text),
+      }))
       .filter((x) => words.length === 0 || x.score > 0)
       .sort((a, b) => b.score - a.score)
       .map((x) => x.c);
@@ -406,11 +507,14 @@ export class ChatFilesService {
             name: c.name,
             kind: c.kind,
             origin: c.origin,
+            ...(c.origin === 'upload' && c.uploadId ? { id: c.uploadId } : {}),
             date,
             assistant,
             ...(c.url ? { url: c.url } : {}),
             stored: c.stored,
-            note: c.origin === 'link' ? plainNote(c.text) : '',
+            // upload — комментарий целиком (до 500 знаков, CHECK в chat_uploads),
+            // одной строкой; link — подпись из сообщения без разметки, как раньше.
+            note: c.origin === 'link' ? plainNote(c.text) : c.text,
           },
         });
       }
