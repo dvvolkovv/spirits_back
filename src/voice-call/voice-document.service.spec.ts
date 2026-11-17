@@ -49,6 +49,9 @@ function makeStorage(fail = false) {
   };
 }
 
+/** Гейт K1b в INSERT истории: та же форма, что saveUserMessageRow в chat.service. */
+const HISTORY_GATE_RE = /WHERE EXISTS \(SELECT 1 FROM user_id u WHERE u\.internal_id = \$\d+ AND u\.state = 'active'\)/;
+
 function makePg(jobRows: any[] = [], transcriptRows: any[] = []) {
   const history: any[] = [];
   const charges: any[] = [];
@@ -59,18 +62,27 @@ function makePg(jobRows: any[] = [], transcriptRows: any[] = []) {
     // По умолчанию active — существующие тесты не меняют поведение.
     userState: 'active',
     query: jest.fn(async (sql: string, params: any[] = []) => {
-      if (/FROM user_id\b/i.test(sql)) {
-        return { rows: [{ state: self.userState }], rowCount: 1 };
-      }
+      // Вставка в историю — раньше проверки user_id: гейт K1b живёт в самом
+      // INSERT (… WHERE EXISTS (SELECT 1 FROM user_id …)). Семантика прод-SQL:
+      // с гейтом строка пишется только живому аккаунту, без гейта — всегда,
+      // и тест видит незащищённую запись.
       if (/INSERT INTO custom_chat_history/i.test(sql)) {
+        if (HISTORY_GATE_RE.test(sql.replace(/\s+/g, ' ')) && self.userState !== 'active') {
+          return { rows: [], rowCount: 0 };
+        }
         history.push({
           session_id: params[0],
           agent: params[1],
           content: params[2],
           tokens: params[3],
           sender_type: /'human'/.test(sql) ? 'human' : 'ai',
+          sql,
+          params,
         });
         return { rows: [], rowCount: 1 };
+      }
+      if (/FROM user_id\b/i.test(sql)) {
+        return { rows: [{ state: self.userState }], rowCount: 1 };
       }
       if (/INSERT INTO token_consumption_tasks/i.test(sql)) {
         charges.push({ agent_id: params[2], output_tokens: params[3] });
@@ -817,5 +829,89 @@ describe('удалённый аккаунт: документ и заметка 
     expect(chat.generateAgentReplyWithCharge).not.toHaveBeenCalled();
     expect(notes.createNote).not.toHaveBeenCalled();
     expect(pg.history).toHaveLength(0);
+  });
+
+  // K1b: строгий SELECT state стоит отдельно от записи, и между ними есть
+  // await'ы (комната, язык, MinIO). Каждая запись в историю обязана быть
+  // защищена своим оператором — иначе удаление в этом окне оставляет строку
+  // в чате удалённого навсегда (история стирается один раз).
+
+  it('удаление между проверкой и записью задания — задание в чат не ложится', async () => {
+    const pg = makePg();
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'тело документа', tokens: 100, costUsd: 0.1 })) };
+    // Удалили, пока в комнату уходил document_pending — после assertActive.
+    const lk = { send: jest.fn(async (_room: string, msg: any) => {
+      if (msg?.type === 'document_pending') pg.userState = 'deleted';
+    }) };
+    const svc = new VoiceDocumentService(pg as any, chat as any, lk as any, makeStorage() as any, makeLang() as any);
+
+    await svc.create(CALL, ROOM, 'user-1', 'План', 'по пунктам');
+    await svc.drainForTests();
+
+    expect(pg.history).toHaveLength(0);
+  });
+
+  it('удаление между проверкой и записью документа — документ в чат не ложится', async () => {
+    const pg = makePg();
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'тело документа', tokens: 100, costUsd: 0.1 })) };
+    // Удалили, пока файл уходил в MinIO — после второго assertActive.
+    const storage = makeStorage();
+    const upload = storage.upload.getMockImplementation()!;
+    storage.upload.mockImplementation(async (i: any) => {
+      pg.userState = 'deleted';
+      return upload(i);
+    });
+    const svc = new VoiceDocumentService(
+      pg as any, chat as any, { send: jest.fn(async () => {}) } as any, storage as any, makeLang() as any,
+    );
+
+    await svc.create(CALL, ROOM, 'user-1', 'План', 'по пунктам');
+    await svc.drainForTests();
+
+    expect(storage.upload).toHaveBeenCalledTimes(1);
+    expect(docRows(pg.history)).toHaveLength(0);
+  });
+
+  it('сбой модели после удаления — отметка о неудаче в чат не ложится', async () => {
+    const pg = makePg();
+    const chat = {
+      generateAgentReplyWithCharge: jest.fn(async () => {
+        pg.userState = 'deleted';
+        throw new Error('релей лёг');
+      }),
+    };
+    const svc = new VoiceDocumentService(
+      pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeStorage() as any, makeLang() as any,
+    );
+
+    await svc.create(CALL, ROOM, 'user-1', 'План', 'по пунктам');
+    await svc.drainForTests();
+
+    expect(pg.history.filter((h: any) => h.sender_type === 'ai')).toHaveLength(0);
+  });
+
+  it('каждая запись в историю несёт гейт в самом INSERT, userId — последним параметром', async () => {
+    const pg = makePg();
+    let fail = false;
+    const chat = { generateAgentReplyWithCharge: jest.fn(async () => {
+      if (fail) throw new Error('релей лёг');
+      return { text: 'тело документа', tokens: 100, costUsd: 0.1 };
+    }) };
+    const svc = new VoiceDocumentService(
+      pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeStorage() as any, makeLang() as any,
+    );
+
+    await svc.create(CALL, ROOM, 'user-1', 'План', 'по пунктам');
+    await svc.drainForTests();
+    fail = true;
+    await svc.create(CALL, ROOM, 'user-1', 'Смета', '');
+    await svc.drainForTests();
+
+    // задание + документ, задание + отметка о сбое
+    expect(pg.history).toHaveLength(4);
+    for (const row of pg.history) {
+      expect(row.sql.replace(/\s+/g, ' ')).toMatch(HISTORY_GATE_RE);
+      expect(row.params[row.params.length - 1]).toBe('user-1');
+    }
   });
 });
