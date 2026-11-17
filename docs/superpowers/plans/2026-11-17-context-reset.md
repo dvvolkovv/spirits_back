@@ -1483,6 +1483,7 @@ export function sameResetAt(a: Date | null, b: Date | null): boolean {
 **Files:**
 - Modify: `src/components/chat/files/chatFiles.ts:23-24`, `files/ChatFilesPanel.tsx:16-17,42,98,104`, `action-plan/ActionPlanPanel.tsx:10,23,36,44,85`, `src/services/actionPlansApi.ts:27-38`
 - Test: `files/chatFiles.test.ts`, `files/ChatFilesPanel.test.tsx`, `action-plan/ActionPlanPanel.test.tsx`
+- Modify (Step 5): `src/i18n/locales/ru.json` (ключ `chat.action_plan.not_enough`)
 
 - [ ] **Step 1: Обновить тесты (падают)**
   - `chatFiles.test.ts`: удалить тест с `&freshTs=`; оставить/добавить: `fetchChatFiles(12)` просит ровно `/webhook/chat/files?assistantId=12` (сверить фактический базовый URL в файле).
@@ -1495,11 +1496,10 @@ export function sameResetAt(a: Date | null, b: Date | null): boolean {
   - `ActionPlanPanel.tsx`: убрать проп `freshTs`; `actionPlansApi.get(assistantId)`, `actionPlansApi.generate(assistantId)`, deps без `freshTs`.
   - `actionPlansApi.ts`: `get(assistantId)` — `params` только с `assistantId`; `generate(assistantId)` — тело `{ assistantId }`.
 - [ ] **Step 4: Прогнать — зелёные.**
-- [ ] **Step 5: Commit** — `git commit -m "refactor(chat): панели и API без метки «Чистого листа»"`
+- [ ] **Step 5: «Мало разговора» в панели плана (по ревью задачи 6).** После точки «Обновить план» без нового разговора получает от бэка 400 `not enough conversation for an action plan`, а панель показывает общее «Не удалось загрузить или сохранить план. Попробуйте ещё раз.» — повтор не поможет. В `actionPlansApi.generate` пробросить статус и текст ошибки бэка (сейчас `json()` бросает `Error('... failed: ${status}')`), в `ActionPlanPanel.tsx` при 400 с текстом `not enough conversation` показывать ключ `chat.action_plan.not_enough` (в `src/i18n/locales/ru.json`: «Для плана пока мало разговора: напишите ассистенту хотя бы пару сообщений. После «Чистого листа» план строится только по новому разговору.»; остальные 6 локалей — в Task 15). Тест в `ActionPlanPanel.test.tsx`: 400 с этим текстом → новый текст, иной сбой → прежний. Красный → зелёный по тем же правилам.
+- [ ] **Step 6: Commit** — `git commit -m "refactor(chat): панели и API без метки «Чистого листа»"`
 
 ---
-
-**Дополнение по ревью задачи 6 (в этой задаче):** после точки «Обновить план» без нового разговора получает от бэка 400 `not enough conversation for an action plan`, а панель показывает общее «Не удалось загрузить или сохранить план. Попробуйте ещё раз.» — повтор не поможет. В `ActionPlanPanel.tsx` отличать ответ 400 (сверь, как `actionPlansApi.generate` отдаёт статус — при необходимости пробросить его) и показывать свой текст: ключ `chat.action_plan.not_enough` — ru «Для плана пока мало разговора: напишите ассистенту хотя бы пару сообщений. После «Чистого листа» план строится только по новому разговору.» (в Task 15 — во всех 7 локалях). Тест панели: 400 → этот текст, иной сбой → прежний.
 
 ### Task 14: ChatInterface — кнопка-действие, точка, черта
 
@@ -1725,7 +1725,7 @@ export function ContextResetDivider() {
 **Files:**
 - Modify: `src/i18n/locales/{ru,en,es,de,fr,pt,zh}.json` — ключи `chat.*`, `help.faq[18].a`
 
-- [ ] **Step 1: Ключи `chat`** — в каждой локали: обновить `fresh_mode_off_title`, удалить `fresh_mode_on_title`, добавить `fresh_confirm`, `fresh_divider`, `fresh_failed`. `fresh_mode_label` не трогать.
+- [ ] **Step 1: Ключи `chat`** — в каждой локали: обновить `fresh_mode_off_title`, удалить `fresh_mode_on_title`, добавить `fresh_confirm`, `fresh_divider`, `fresh_failed`. `fresh_mode_label` не трогать. Плюс ключ `chat.action_plan.not_enough` (ru добавлен в Task 13) — перевести в en/es/de/fr/pt/zh по смыслу ru, в регистре локали.
 
 | | `fresh_mode_off_title` | `fresh_confirm` | `fresh_divider` | `fresh_failed` |
 |---|---|---|---|---|
