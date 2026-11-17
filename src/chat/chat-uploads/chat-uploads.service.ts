@@ -558,14 +558,19 @@ export class ChatUploadsService {
    * подписанная ссылка, как и раньше.
    *
    * Имя — через safeFileName, как в find_files: оно пришло из multipart, и
-   * перевод строки в нём дописал бы в блок «свою» строку. Комментарий пишет
-   * модель — пробельные символы в нём схлопываются по той же причине.
+   * перевод строки в нём дописал бы в блок «свою» строку; «|» в имени
+   * заменяется на «¦» — иначе имя подделало бы поля строки (вид, дата,
+   * комментарий). Комментарий пишет модель: на выводе он ещё раз проходит
+   * sanitizeUploadNote (строка могла попасть в базу в обход setNote), затем
+   * пробельные символы схлопываются по той же причине, что и у имени. «|» в
+   * комментарии остаётся: это последнее поле. Пусто после чистки — комментария
+   * нет.
    */
   private assistantLine(record: ChatUploadRecord): string {
-    const note = String(record.note ?? '').replace(/\s+/g, ' ').trim();
+    const note = sanitizeUploadNote(record.note).replace(/\s+/g, ' ').trim();
     const head = [
       `- id=${record.id}`,
-      safeFileName(record.originalName),
+      safeFileName(record.originalName).replace(/\|/g, '¦'),
       uploadKind(record),
       String(record.createdAt ?? '').slice(0, 10),
       `комментарий: ${note || UPLOAD_NOTE_MISSING}`,

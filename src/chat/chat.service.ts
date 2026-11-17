@@ -40,6 +40,7 @@ import { productActionTail, stripProductActionBlocks } from '../products/product
 import { ChatFileStore, PERSIST_TURN_BUDGET_MS } from './chat-files/chat-file-store';
 import { RelayOutputFile, collectOutputFiles, outputFileLines, storeRelayLinks } from './chat-files/relay-links';
 import { ChatUploadsService } from './chat-uploads/chat-uploads.service';
+import { errKind, logId } from './chat-uploads/err-kind';
 import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
@@ -1028,23 +1029,33 @@ export class ChatService {
   }
 
   /**
-   * Блок памяти загрузок сессии (spec 2026-11-13-chat-upload-memory, Task 6):
-   * до 10 последних исходников из реестра chat_uploads — имя и короткоживущая
-   * подписанная ссылка на чтение. Ротация вырезает блок `User uploaded files`
-   * из переносимого хвоста релея, поэтому память восстанавливается из реестра
-   * на КАЖДОМ ходе.
+   * Блок памяти загрузок сессии (spec 2026-11-13-chat-upload-memory, Task 6;
+   * строка файла — spec 2026-11-16, раздел 2): до 10 последних исходников из
+   * реестра chat_uploads, по строке на файл — id (его ассистент передаёт в
+   * note_file), имя, вид, дата загрузки, комментарий ассистента и, следующей
+   * строкой, короткоживущая подписанная ссылка на чтение (формат —
+   * ChatUploadsService.assistantBlock). Ротация вырезает блок `User uploaded
+   * files` из переносимого хвоста релея, поэтому память восстанавливается из
+   * реестра на КАЖДОМ ходе.
    *
-   * Результат — только в пер-ходовую часть промпта (тело реплики), никогда в
-   * buildRelayStablePrefix: подписи чеканятся заново каждый ход и в системном
-   * промпте сломали бы кэш релея.
+   * Релей: результат — только в пер-ходовую часть промпта (тело реплики),
+   * никогда в buildRelayStablePrefix: подписи чеканятся заново каждый ход и в
+   * системном промпте сломали бы кэш релея.
+   *
+   * Маша (локальный CLI, streamChat): блок идёт в opts.system — после
+   * волатильной части и перед хвостом языка, который обязан остаться
+   * последней строкой. Отдельного кэшируемого системного промпта у неё нет:
+   * ClaudeCliService склеивает system с репликой в одно тело `-p`.
    *
    * rawSessionId — сырой ключ сессии Postgres (custom_chat_history,
    * chat_uploads): freshSessionId или `${userId}_${assistantId}`, БЕЗ
    * языкового суффикса ключа релея.
    *
    * Флаг CHAT_UPLOADS_ENABLED выключен или реестра нет — пустая строка; сбой
-   * БД/MinIO логируется и тоже даёт пустую строку: ход не должен падать из-за
-   * памятки о файлах. Подписанные ссылки в лог не пишутся.
+   * БД или подписи логируется и тоже даёт пустую строку: ход не должен падать
+   * из-за памятки о файлах. В журнал — только ключ сессии в кавычках и вид
+   * ошибки (err-kind.ts): текст ошибки pg может повторять данные запроса,
+   * userId уже внутри ключа. Подписанные ссылки в лог не пишутся.
    */
   private async uploadContextBlock(
     userId: string,
@@ -1056,7 +1067,7 @@ export class ChatService {
       const records = await this.chatUploads.recentForSession(userId, rawSessionId, excludeIds || []);
       return this.chatUploads.assistantBlock(records);
     } catch (e: any) {
-      this.logger.warn(`upload context failed (${userId}, session ${rawSessionId}): ${e?.message}`);
+      this.logger.warn(`upload context failed (session ${logId(rawSessionId)}): ${errKind(e)}`);
       return '';
     }
   }
@@ -1586,8 +1597,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // Правило карточек — только клиенту, который их рисует; до хвоста
           // языка, который обязан остаться последним.
           // Блок загрузок — после волатильной части (подписи чеканятся каждый
-          // ход; стабильный префикс и его кэш они не трогают) и до хвоста
-          // языка, который обязан остаться последней строкой.
+          // ход, стабильную часть они не трогают; отдельного кэшируемого
+          // system у CLI нет — см. uploadContextBlock) и до хвоста языка,
+          // который обязан остаться последней строкой.
           system: stableSystemPrompt + `\n\n${products.promptBlock}\n\n${FIND_FILES_CLI_PROMPT}` +
             (uploadNotesOn ? `\n\n${NOTE_FILE_CLI_PROMPT}` : '') +
             (ui.ask ? `\n\n${ASK_RULE}` : '') + dispatchVolatileSystemPrompt +
