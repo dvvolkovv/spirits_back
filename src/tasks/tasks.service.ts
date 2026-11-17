@@ -5,6 +5,7 @@ import axios from 'axios';
 import { PgService } from '../common/services/pg.service';
 import { ClaudeCliService } from '../common/services/claude-cli.service';
 import { shouldSkipTaskExtraction } from './extract-prefilter';
+import { afterReset } from '../chat/context-reset/after-reset';
 
 function cosineSim(a: number[], b: number[]): number {
   if (!a || !b || a.length !== b.length) return 0;
@@ -176,7 +177,13 @@ export class TasksService implements OnModuleInit {
    *
    * Если задач нет вовсе — пустая строка, ничего не инжектится.
    */
-  async buildContextForPrompt(userId: string, userMessage: string = ''): Promise<string> {
+  async buildContextForPrompt(
+    userId: string,
+    userMessage: string = '',
+    // Точка «Чистого листа» (spec 2026-11-17-context-reset): задачи общие для
+    // всех ассистентов, поэтому отсечка — по времени создания, а не по ассистенту.
+    opts: { since?: Date | null } = {},
+  ): Promise<string> {
     if (!this.pg) return '';
 
     const TOP_ACTIVE = 5;
@@ -193,7 +200,13 @@ export class TasksService implements OnModuleInit {
       archived = res.rows;
     }
 
-    if (active.length === 0 && archived.length === 0) return '';
+    // После точки — только задачи, созданные позже неё (выбранные строки
+    // фильтруются в JS: см. afterReset про микросекунды now()). Пустой остаток
+    // возвращает '' до эмбеддинга — платный вызов не нужен.
+    const activeAfter = afterReset(active, opts.since, (t) => t.created_at);
+    const archivedAfter = afterReset(archived, opts.since, (t) => t.created_at);
+
+    if (activeAfter.length === 0 && archivedAfter.length === 0) return '';
 
     // One embedding call для ранжирования обоих списков. Если ключ OpenAI
     // не настроен — qVec=null, активные берём по recency, archived recall
@@ -202,23 +215,23 @@ export class TasksService implements OnModuleInit {
 
     // Активные
     let selectedActive: TaskRow[];
-    if (active.length <= TOP_ACTIVE) {
-      selectedActive = active;
+    if (activeAfter.length <= TOP_ACTIVE) {
+      selectedActive = activeAfter;
     } else if (qVec) {
-      const scored = active.map(t => ({
+      const scored = activeAfter.map(t => ({
         t,
         score: t.embedding ? cosineSim(qVec, t.embedding) : -1,
       }));
       scored.sort((a, b) => b.score - a.score);
       selectedActive = scored.slice(0, TOP_ACTIVE).map(s => s.t);
     } else {
-      selectedActive = active.slice(0, TOP_ACTIVE);
+      selectedActive = activeAfter.slice(0, TOP_ACTIVE);
     }
 
     // Архивные (recall) — только если есть embedding юзер-реплики
     let selectedArchive: Array<{ t: TaskRow; score: number }> = [];
-    if (qVec && archived.length > 0) {
-      const scored = archived
+    if (qVec && archivedAfter.length > 0) {
+      const scored = archivedAfter
         .filter(t => t.embedding)
         .map(t => ({ t, score: cosineSim(qVec, t.embedding!) }));
       scored.sort((a, b) => b.score - a.score);
