@@ -73,10 +73,21 @@ describe('note_file у Маши (локальный CLI)', () => {
     expect(NOTE_FILE_CLI_PROMPT).not.toContain('mcp__linkeon__');
   });
 
-  // Те же две строки, что в описании инструмента (см. выше): блок промпта
-  // Маши не должен им противоречить или молчать о них.
-  it('блок промпта: язык разговора и не переписывать комментарий без нового — как в описании инструмента', () => {
-    expect(NOTE_FILE_CLI_PROMPT).toContain('Пиши комментарий на языке разговора с пользователем');
-    expect(NOTE_FILE_CLI_PROMPT).toContain('Если комментарий уже есть и ничего нового не решили — не переписывай его');
+  // Описание инструмента — источник; блок промпта Маши и абзац PRODUCTS_PROMPT
+  // релея (relay-products-tools.spec.ts) повторяют его ключевые строки
+  // дословно, чтобы три копии указаний не разошлись.
+  it('блок промпта повторяет ключевые строки описания инструмента', () => {
+    const shared = [
+      'Пиши комментарий на языке разговора с пользователем',
+      'Если комментарий уже есть и ничего нового не решили — не переписывай его',
+      'паролей, номеров документов, карт и счетов',
+    ];
+    for (const phrase of shared) {
+      expect(NOTE_FILE_TOOL.description).toContain(phrase);
+      expect(NOTE_FILE_CLI_PROMPT).toContain(phrase);
+    }
+    // id из find_files — только у загрузок пользователя.
+    expect(NOTE_FILE_TOOL.description).toContain('find_files (origin=upload)');
+    expect(NOTE_FILE_CLI_PROMPT).toContain(`${FIND_FILES_CLI_TOOL_NAME} (origin=upload)`);
   });
 });

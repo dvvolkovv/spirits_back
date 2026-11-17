@@ -1,5 +1,5 @@
 import { ChatService } from './chat.service';
-import { NOTE_FILE_CLI_PROMPT, NOTE_FILE_CLI_TOOL_NAME } from '../products/products-cli-tool';
+import { FIND_FILES_CLI_PROMPT, NOTE_FILE_CLI_PROMPT, NOTE_FILE_CLI_TOOL_NAME } from '../products/products-cli-tool';
 import { LANGUAGE_REPLY_LINE } from '../common/services/language.service';
 
 /**
@@ -106,6 +106,33 @@ describe('Маша: note_file', () => {
     const system = String(opts.system);
     expect(system).toContain(NOTE_FILE_CLI_PROMPT);
     expect(system.trim().split('\n').pop()).toBe(LANGUAGE_REPLY_LINE.ru.trim());
+  });
+
+  // Блок про комментарии — в стабильной части, сразу за поиском файлов, и до
+  // волатильной (профиль, задачи, баланс): иначе он ломал бы кэш префикса и
+  // отрывался бы от блока, на чьё поле id ссылается.
+  it('флаг включён: блок про комментарии — после поиска файлов и до волатильной части', async () => {
+    process.env.CHAT_UPLOADS_ENABLED = 'true';
+    const { opts } = await runMasha({
+      // Автопрофилирование разрешено (profile_data без ключей — значения по
+      // умолчанию), и волатильная часть начинается с профиля пользователя.
+      setup: (svc) => {
+        const query = (svc as any).pg.query as jest.Mock;
+        const base = query.getMockImplementation()!;
+        query.mockImplementation(async (sql: string, params?: unknown[]) =>
+          sql.includes('SELECT profile_data FROM ai_profiles_consolidated')
+            ? { rows: [{ profile_data: {} }] }
+            : base(sql, params));
+      },
+    });
+    const system = String(opts.system);
+    const find = system.indexOf(FIND_FILES_CLI_PROMPT);
+    const note = system.indexOf(NOTE_FILE_CLI_PROMPT);
+    const volatile = system.indexOf('--- Профиль пользователя ---');
+    expect(find).toBeGreaterThanOrEqual(0);
+    expect(volatile).toBeGreaterThan(0);
+    expect(find).toBeLessThan(note);
+    expect(note).toBeLessThan(volatile);
   });
 
   it('флаг выключен: набор инструментов прежний, про note_file ни слова', async () => {

@@ -53,11 +53,20 @@ describe('копия релея знает все инструменты точ�
     }
   });
 
-  // Те же две строки, что в описании инструмента (note-file.tool.ts): абзац
-  // про комментарии в PRODUCTS_PROMPT не должен им противоречить или молчать о них.
-  it('абзац про note_file в PRODUCTS_PROMPT: язык разговора и не переписывать без нового', () => {
+  // Ключевые строки описания инструмента (note-file.tool.ts; сверка с ним — в
+  // note-file.tool.spec.ts): абзац про комментарии в PRODUCTS_PROMPT повторяет
+  // их дословно, чтобы копии указаний не разошлись.
+  it('абзац про note_file в PRODUCTS_PROMPT повторяет ключевые строки описания инструмента', () => {
     const block = relay.slice(relay.indexOf('const PRODUCTS_PROMPT'), relay.indexOf('app.post("/chat"'));
-    expect(block).toContain('Пиши комментарий на языке разговора с пользователем');
-    expect(block).toContain('Если комментарий уже есть и ничего нового не решили — не переписывай его');
+    const para = block.slice(block.indexOf('КОММЕНТАРИИ К ЗАГРУЗКАМ'), block.indexOf('СООБЩИТЬ В ПОДДЕРЖКУ'));
+    expect(para).toContain('mcp__products__note_file');
+    for (const phrase of [
+      'Пиши комментарий на языке разговора с пользователем',
+      'Если комментарий уже есть и ничего нового не решили — не переписывай его',
+      'паролей, номеров документов, карт и счетов',
+      'mcp__products__find_files (origin=upload)',
+    ]) {
+      expect(para).toContain(phrase);
+    }
   });
 });
