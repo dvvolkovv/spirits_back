@@ -5,6 +5,7 @@ import * as path from 'path';
 import { PgService } from '../common/services/pg.service';
 import { PushService } from '../push/push.service';
 import { ChatService, RelaySessionBusyError } from '../chat/chat.service';
+import { RelayDrainingError } from '../chat/relay-drain-retry';
 import { RoutineStore, RoutineRow, ENERGY_PROMPT } from './routine-store.service';
 import { sendTelegramAlert } from '../common/telegram-alert';
 
@@ -12,6 +13,8 @@ export interface DeliverResult {
   delivered: number;
   /** Relay-сессия занята: можно повторить после освобождения. */
   busy?: boolean;
+  /** Релей за шлагбаумом выката дольше бюджета повтора: как busy. */
+  draining?: boolean;
   /** Генерация не завершилась успешно: пуш и обрывок не отправляются. */
   failed?: boolean;
   /** done.failReason или безопасная локальная причина cli_failure_text. */
@@ -91,7 +94,7 @@ export class RoutinePushService implements OnModuleInit {
 
   // ── Доставка одной рутины ────────────────────────────────────────────────────
   /**
-   * Повтор только для busy/preempted, один на пользователя+рутину. Таймер не
+   * Повтор только для busy/preempted/релей обновляется, один на пользователя+рутину. Таймер не
    * переживает рестарт: releaseDeferred оставляет часовой cron страховкой.
    */
   private readonly retryTimers = new Map<string, NodeJS.Timeout>();
@@ -150,11 +153,12 @@ export class RoutinePushService implements OnModuleInit {
     result: DeliverResult,
   ): Promise<boolean> {
     const deferred = result.busy === true
+      || result.draining === true
       || (result.failed === true && result.failReason === 'preempted');
     if (!deferred) return false;
     await this.store.releaseToday(routineId, today, prev);
     this.logger.log(
-      `routine ${routineId} отложена: ${result.busy ? 'занята сессия' : 'ход перебит (preempted)'}`,
+      `routine ${routineId} отложена: ${result.busy ? 'занята сессия' : result.draining ? 'релей обновляется' : 'ход перебит (preempted)'}`,
     );
     return true;
   }
@@ -178,6 +182,10 @@ export class RoutinePushService implements OnModuleInit {
       if (e instanceof RelaySessionBusyError) {
         if (routineId) await this.scheduleRetry(userId, routineId);
         return { delivered: 0, busy: true };
+      }
+      if (e instanceof RelayDrainingError) {
+        if (routineId) await this.scheduleRetry(userId, routineId);
+        return { delivered: 0, draining: true };
       }
       // Исключение потока — не busy: release/retry автоматически не делаем.
       throw e;

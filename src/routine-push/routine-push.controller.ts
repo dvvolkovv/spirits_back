@@ -66,7 +66,7 @@ export class RoutinePushController {
           return res.json({
             ok: true,
             delivered: r.delivered,
-            ...(r.busy ? { busy: true } : {}),
+            ...(r.busy || r.draining ? { busy: true } : {}),
             ...(r.failed ? { failed: true } : {}),
           });
         }

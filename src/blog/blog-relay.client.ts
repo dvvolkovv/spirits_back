@@ -3,6 +3,7 @@ import axios from 'axios';
 import { relayAuthHeaders } from '../chat/relay-auth';
 import { GlobalLlmProviderService } from '../common/services/global-llm-provider.service';
 import { relayProviderFields } from '../chat/answer-provider';
+import { postRelayWithDrainRetry, DrainRetryOpts } from '../chat/relay-drain-retry';
 
 /**
  * Разбор SSE-потока релея. Вынесен отдельной чистой функцией, чтобы
@@ -37,6 +38,12 @@ export class BlogRelayClient {
     private readonly globalProvider?: GlobalLlmProviderService,
   ) {}
 
+  /** Повтор под шлагбаумом выката релея (полное расписание); тесты подменяют расписание. */
+  private drainOpts: DrainRetryOpts = {
+    onRetry: (attempt, delayMs) =>
+      this.logger.warn(`релей обновляется или недоступен — повтор ${attempt} через ${delayMs} мс`),
+  };
+
   /**
    * Один вызов релея. sessionId — новый на каждый пост: длинные сессии
    * у нас глючат посторонним текстом в ответе, а память здесь не нужна —
@@ -50,21 +57,30 @@ export class BlogRelayClient {
   async ask(systemPrompt: string, message: string, sessionId: string, opts: { followSwitch?: boolean } = {}): Promise<string> {
     const agentUrl = process.env.AGENT_URL || 'https://r.linkeon.io';
     const FormData = require('form-data');
-    const fd = new FormData();
-    fd.append('message', message);
-    fd.append('systemPrompt', systemPrompt);
-    fd.append('sessionId', sessionId);
-    if (opts.followSwitch !== false) {
-      const provider = this.globalProvider ? await this.globalProvider.get() : 'claude';
-      for (const [k, v] of Object.entries(relayProviderFields(false, provider))) fd.append(k, v);
-    }
+    const provider = opts.followSwitch !== false
+      ? (this.globalProvider ? await this.globalProvider.get() : 'claude')
+      : null;
+    // Форма multipart — поток: на каждый повтор под шлагбаумом — новая.
+    const buildForm = () => {
+      const fd = new FormData();
+      fd.append('message', message);
+      fd.append('systemPrompt', systemPrompt);
+      fd.append('sessionId', sessionId);
+      if (provider !== null) {
+        for (const [k, v] of Object.entries(relayProviderFields(false, provider))) fd.append(k, v);
+      }
+      return fd;
+    };
 
-    const resp = await axios.post(`${agentUrl}/chat`, fd, {
-      headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
-      responseType: 'stream',
-      timeout: 300_000,
-      maxRedirects: 0,
-    });
+    const resp = await postRelayWithDrainRetry(() => {
+      const fd = buildForm();
+      return axios.post(`${agentUrl}/chat`, fd, {
+        headers: { ...fd.getHeaders(), ...relayAuthHeaders() },
+        responseType: 'stream',
+        timeout: 300_000,
+        maxRedirects: 0,
+      });
+    }, this.drainOpts);
 
     const raw = await new Promise<string>((resolve, reject) => {
       let buf = '';

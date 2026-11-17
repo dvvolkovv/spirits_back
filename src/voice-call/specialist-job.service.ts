@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { PgService } from '../common/services/pg.service';
 import { ChatService } from '../chat/chat.service';
+import { RELAY_DRAIN_DELAYS_SHORT_MS } from '../chat/relay-drain-retry';
 import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
 import { LiveKitClient } from './livekit.client';
 import {
@@ -128,8 +129,13 @@ export class SpecialistJobService {
       // Консультация — путь, где ассистент реально может позвать инструмент
       // Linkeon: AgentReplyOpts.linkeonTools — явно true (в отличие от её
       // сжатия, condense() ниже, — там модель только переформулирует текст).
+      // withTimeout ход не отменяет — релей на выкате ждём коротко, чтобы
+      // генерации хватило места в JOB_TIMEOUT_MS.
       const reply = await this.withTimeout(
-        this.chat.generateAgentReplyWithCharge(userId, String(agentId), `${VOICE_BRIEF}\n\n${question}`, sessionId, { linkeonTools: true }),
+        this.chat.generateAgentReplyWithCharge(
+          userId, String(agentId), `${VOICE_BRIEF}\n\n${question}`, sessionId,
+          { linkeonTools: true, relayDrainDelaysMs: RELAY_DRAIN_DELAYS_SHORT_MS },
+        ),
         JOB_TIMEOUT_MS,
       );
 
@@ -297,8 +303,13 @@ export class SpecialistJobService {
       `ВСЛУХ: 2–3 коротких предложения, только суть и главный вывод, без списков, ` +
       `заголовков и markdown. До ${SPOKEN_ANSWER_LIMIT} символов.\n\n${answer}`;
     try {
+      // Релей на выкате не ждём вовсе: за CONDENSE_TIMEOUT_MS он может не
+      // вернуться, а брошенный withTimeout ход позже всё равно сходил бы в
+      // модель. Сразу отдаём обрезанный оригинал (ниже).
       const short = await this.withTimeout(
-        this.chat.generateAgentReplyWithCharge(userId, String(HOST_AGENT_ID), prompt, `voice_condense_${randomUUID()}`),
+        this.chat.generateAgentReplyWithCharge(
+          userId, String(HOST_AGENT_ID), prompt, `voice_condense_${randomUUID()}`, { relayDrainDelaysMs: [] },
+        ),
         CONDENSE_TIMEOUT_MS,
       );
       const trimmed = (short.text || '').trim();

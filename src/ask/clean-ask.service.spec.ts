@@ -104,6 +104,28 @@ describe('CleanAskService: модель общего рубильника в з�
     await (svc as any).callRelay('вопрос');
     expect(fieldsOf(post.mock.calls[0][1]).provider).toBeUndefined();
   });
+
+  it('релей обновляется (503) — повтор с той же сессией и новой формой', async () => {
+    post.mockReset();
+    post
+      .mockImplementationOnce(async () => {
+        throw Object.assign(new Error('503'), { response: { status: 503, data: Readable.from([]) } });
+      })
+      .mockImplementationOnce(async () => ({ data: Readable.from(['data: {"type":"delta","text":"ок"}\n']) }));
+    const svc = new CleanAskService({} as any);
+    (svc as any).drainOpts = { delaysMs: [0] };
+
+    expect(await (svc as any).callRelay('вопрос')).toBe('ок');
+    expect(post).toHaveBeenCalledTimes(2);
+    expect(post.mock.calls[1][1]).not.toBe(post.mock.calls[0][1]);
+    expect(fieldsOf(post.mock.calls[1][1]).sessionId).toBe(fieldsOf(post.mock.calls[0][1]).sessionId);
+  });
+
+  it('по умолчанию — короткое расписание повторов (человек ждёт у экрана) и повторы в журнал', () => {
+    const svc = new CleanAskService({} as any);
+    expect((svc as any).drainOpts.delaysMs).toEqual([2000, 4000, 8000, 15000, 30000]);
+    expect(typeof (svc as any).drainOpts.onRetry).toBe('function');
+  });
 });
 
 /**

@@ -82,7 +82,7 @@ export class QualityMonitorService {
     if (hardFail) issues.push(hardFail);
     else if (!text || text.trim().length < 5) issues.push('пустой/слишком короткий ответ');
     else {
-      if (/ошибка запуска агента|ответ не пришёл|failed to fetch|internal server error/i.test(text)) issues.push('ответ-плейсхолдер ошибки');
+      if (/ошибка запуска (агента|ассистента)|ответ не пришёл|failed to fetch|internal server error/i.test(text)) issues.push('ответ-плейсхолдер ошибки');
       const letters = (text.match(/\p{L}/gu) || []).length;
       const cyr = (text.match(/[Ѐ-ӿ]/g) || []).length;
       if (letters >= 20 && cyr / letters < 0.3) issues.push('ответ не на русском (англ-утечка)');
@@ -185,10 +185,14 @@ export class QualityMonitorService {
     // Удалённые учётки и тестовые номера исключены: 15.08.2026 алерт «всплеск
     // англоязычных ответов» целиком состоял из аккаунтов, заведённых и снесённых
     // в тот же день при отладке удаления профиля.
+    //
+    // Ход, перебитый под шлагбаумом выката релея (fail_reason
+    // relay_superseded), пуст не по вине модели: его текст унёс следующий ход.
+    // Пустым не считаем — иначе каждый выкат релея давал бы ложный всплеск.
     const chatRes = await this.pg.query(
       `SELECT
          count(*) FILTER (WHERE COALESCE((e.props->>'deduped')::boolean, false) = false)::int AS responses,
-         count(*) FILTER (WHERE COALESCE((e.props->>'empty')::boolean, false))::int AS empty,
+         count(*) FILTER (WHERE COALESCE((e.props->>'empty')::boolean, false) AND COALESCE(e.props->>'fail_reason', '') <> 'relay_superseded')::int AS empty,
          count(*) FILTER (WHERE COALESCE((e.props->>'lang_mismatch')::boolean, false))::int AS leak,
          count(*) FILTER (WHERE COALESCE((e.props->>'deduped')::boolean, false))::int AS deduped
        FROM events e

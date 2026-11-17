@@ -259,7 +259,7 @@ describe('streamUniversalAgent — карточка продукта переж�
     await h.run(CARDS_UI);
 
     const end = endOf(h.written)!;
-    expect(end.content).toBe('Ошибка запуска агента. Попробуйте ещё раз.');
+    expect(end.content).toBe('Ошибка запуска ассистента. Попробуйте ещё раз.');
     expect(end.content).not.toContain('```product-action');
   });
 });
