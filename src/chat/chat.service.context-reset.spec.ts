@@ -5,6 +5,7 @@ import { Readable } from 'stream';
 import * as ts from 'typescript';
 import axios from 'axios';
 import { ChatService } from './chat.service';
+import { ChatUploadsService, ChatUploadRecord } from './chat-uploads/chat-uploads.service';
 import { ChatContextResetService } from './context-reset/context-reset.service';
 import { afterReset } from './context-reset/after-reset';
 import { clockRedis } from '../auth/fake-redis.forspec';
@@ -238,6 +239,39 @@ describe('ChatService: точка «Чистого листа»', () => {
     expect(chatUploads.assistantBlock).toHaveBeenCalledWith([fresh]);
     expect(fields.message).toContain('new.pdf');
     expect(fields.message).not.toContain('old.pdf');
+  });
+
+  // Ход с файлом (buildUploadHandoff) — та же память загрузок, что у
+  // текстового хода: файлы до точки ассистенту не напоминаем. Блок — боевой
+  // assistantBlock (строка с id и именем), выборка и подпись — подменены.
+  it('загрузка файла: память загрузок отсекается точкой — файла до точки в handoff нет, после точки есть', async () => {
+    process.env.CHAT_UPLOADS_ENABLED = 'true'; // afterEach снимает флаг, afterAll возвращает исходный
+    const record = (id: string, originalName: string, createdAt: string): ChatUploadRecord => ({
+      id, userId: 'u1', sessionId: 'u1_12', originalName, mime: 'application/pdf', sizeBytes: 1,
+      sha256: 'a'.repeat(64), storageKey: `synthetic/${originalName}`, createdAt, source: 'web',
+      thumbKey: null, note: null, noteUpdatedAt: null, noteAssistantId: null,
+    });
+    const before = record('11111111-1111-4111-8111-111111111111', 'договор-до-точки.pdf', '2026-11-10T09:00:00.000Z');
+    const after = record('22222222-2222-4222-8222-222222222222', 'счёт-после-точки.pdf', '2026-11-17T09:00:00.000Z');
+    const uploads = new ChatUploadsService({ query: jest.fn(async () => ({ rows: [] })) } as any, {} as any);
+    // Реестр отдаёт от новых к старым — как recentForSession.
+    const recent = jest.spyOn(uploads, 'recentForSession').mockResolvedValue([after, before]);
+    jest.spyOn(uploads, 'assistantUrl').mockImplementation((id: string) => `https://backend.test/webhook/chat-uploads/${id}?sig=spec`);
+    const svc = makeService();
+    (svc as any).chatUploads = uploads;
+    (svc as any).contextResets = resets(R);
+
+    const handoff = await svc.buildUploadHandoff({
+      userId: 'u1', assistantId: '12', requestLang: 'ru', savedUploadIds: ['33333333-3333-4333-8333-333333333333'],
+    });
+
+    // Реестр — по основной ленте; файлы этого хода исключены.
+    expect(recent).toHaveBeenCalledWith('u1', 'u1_12', ['33333333-3333-4333-8333-333333333333']);
+    expect(handoff.uploadContext).toContain(after.id);
+    expect(handoff.uploadContext).toContain('счёт-после-точки.pdf');
+    const all = JSON.stringify(handoff);
+    expect(all).not.toContain(before.id);
+    expect(all).not.toContain('договор-до-точки.pdf');
   });
 
   it('приписка гостевой пробы после точки не тянется и не стирается', async () => {
