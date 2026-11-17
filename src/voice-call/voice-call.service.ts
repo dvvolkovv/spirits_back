@@ -571,7 +571,7 @@ export class VoiceCallService implements OnModuleInit {
     if (!saved.rowCount) {
       this.logger.warn(
         `[complete] call=${callId} аккаунт неактивен — транскрипт, учёт и резюме не пишем ` +
-          `(${verdict}, ${durationSec}s, cost=$${cost.toFixed(4)})`,
+          `(${verdict} ${raw}, ${durationSec}s, cost=$${cost.toFixed(4)})`,
       );
       return;
     }
