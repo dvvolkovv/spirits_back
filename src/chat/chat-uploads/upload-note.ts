@@ -9,22 +9,26 @@
 /** C0, кроме TAB и LF, плюс DEL и C1. NUL Postgres в text не примет (22021), прочие — мусор в подсказке. */
 const NOTE_CONTROL_RE = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g;
 /**
- * Bidi-переопределения и изоляты (U+202A–U+202E, U+2066–U+2069) подменяют
- * видимый порядок символов — та же защита, что в safeFileName. Весь \p{Cf}
- * не режем: ZWJ (U+200D) склеивает эмодзи.
+ * Невидимые символы формата — весь \p{Cf}, кроме ZWJ (U+200D): он склеивает
+ * эмодзи. Сюда входят bidi-переопределения и изоляты (U+202A–U+202E,
+ * U+2066–U+2069) — подменяют видимый порядок символов, та же защита, что в
+ * safeFileName; теги U+E0000–U+E007F — прячут текст, который модель прочтёт,
+ * а человек не увидит; ZWSP, LRM/RLM, WJ и U+2061–U+2064, BOM, якоря
+ * аннотаций U+FFF9–U+FFFB.
  */
-const NOTE_BIDI_RE = /[\u202A-\u202E\u2066-\u2069]/g;
+const NOTE_FORMAT_RE = /(?!\u200D)\p{Cf}/gu;
 
 /**
  * Комментарий к загрузке в том виде, в каком он ляжет в базу: CRLF и CR
  * сведены к LF (многострочность остаётся — в одну строку его сводит
  * uploadNoteOneLine на выводе модели: в блоке загрузок и в поле note
- * find_files), управляющие и bidi-символы вырезаны, края обрезаны.
+ * find_files), управляющие символы и символы формата (кроме ZWJ) вырезаны,
+ * края обрезаны.
  * Не строка — пустая строка.
  */
 export function sanitizeUploadNote(raw: unknown): string {
   if (typeof raw !== 'string') return '';
-  return raw.replace(/\r\n?/g, '\n').replace(NOTE_CONTROL_RE, '').replace(NOTE_BIDI_RE, '').trim();
+  return raw.replace(/\r\n?/g, '\n').replace(NOTE_CONTROL_RE, '').replace(NOTE_FORMAT_RE, '').trim();
 }
 
 /**
