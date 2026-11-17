@@ -380,7 +380,13 @@ describe('списание за консультацию', () => {
   // Ревью 26.10.2026: linkeonTools — явное включение (AgentReplyOpts), по
   // умолчанию false. Консультация специалиста — путь, где ассистент реально
   // может позвать инструмент; её сжатие (voice_condense) — нет, см. ниже.
-  it('консультация специалиста зовёт модель с { linkeonTools: true }', async () => {
+  //
+  // Ожидание релея за шлагбаумом выката (relayDrainDelaysMs) — своё у каждого
+  // вызова под withTimeout: таймаут только гонится с ходом и его не отменяет.
+  // Консультация ждёт короткое расписание (~59 с из JOB_TIMEOUT_MS), сжатие
+  // (CONDENSE_TIMEOUT_MS = 45 с) не ждёт вовсе — иначе брошенный ход позже
+  // всё равно сходил бы в модель.
+  it('консультация специалиста зовёт модель с { linkeonTools: true } и коротким ожиданием релея', async () => {
     const pg = makePg();
     const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'ответ', tokens: 1200, costUsd: 0.33 })) };
     const svc = new SpecialistJobService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeLang() as any);
@@ -388,10 +394,12 @@ describe('списание за консультацию', () => {
     await svc.ask(CALL, ROOM, 'user-1', 'Алексей', 'Можно ли так?');
     await svc.drainForTests();
 
-    expect(chat.generateAgentReplyWithCharge.mock.calls[0][4]).toEqual({ linkeonTools: true });
+    expect(chat.generateAgentReplyWithCharge.mock.calls[0][4]).toEqual({
+      linkeonTools: true, relayDrainDelaysMs: [2000, 4000, 8000, 15000, 30000],
+    });
   });
 
-  it('сжатие длинного ответа (voice_condense) опции не передаёт', async () => {
+  it('сжатие длинного ответа (voice_condense) — без linkeonTools и без ожидания релея', async () => {
     const pg = makePg();
     const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'коротко', tokens: 10, costUsd: 0 })) };
     const svc = new SpecialistJobService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeLang() as any);
@@ -401,7 +409,7 @@ describe('списание за консультацию', () => {
     await (svc as any).condense('user-1', 'Алексей', longAnswer);
 
     expect(chat.generateAgentReplyWithCharge).toHaveBeenCalledTimes(1);
-    expect(chat.generateAgentReplyWithCharge.mock.calls[0][4]).toBeUndefined();
+    expect(chat.generateAgentReplyWithCharge.mock.calls[0][4]).toEqual({ relayDrainDelaysMs: [] });
   });
 });
 

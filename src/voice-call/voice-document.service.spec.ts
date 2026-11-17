@@ -162,8 +162,9 @@ describe('VoiceDocumentService', () => {
   });
 
   // Ревью 26.10.2026: linkeonTools — явное включение (AgentReplyOpts),
-  // голосовой документ им не пользуется, опции не передаём вовсе.
-  it('голосовой документ опций linkeonTools не передаёт', async () => {
+  // голосовой документ им не пользуется. Ожидание релея за шлагбаумом выката —
+  // короткое (~59 с): DOC_TIMEOUT_MS только гонится с ходом и его не отменяет.
+  it('голосовой документ опций linkeonTools не передаёт, релей ждёт коротко', async () => {
     const pg = makePg();
     const chat = { generateAgentReplyWithCharge: jest.fn(async () => ({ text: 'тело', tokens: 1200, costUsd: 0.33 })) };
     const svc = new VoiceDocumentService(pg as any, chat as any, { send: jest.fn(async () => {}) } as any, makeStorage() as any, makeLang() as any);
@@ -171,7 +172,9 @@ describe('VoiceDocumentService', () => {
     await svc.create(CALL, ROOM, 'user-1', 'План запуска', 'по пунктам');
     await svc.drainForTests();
 
-    expect(chat.generateAgentReplyWithCharge.mock.calls[0][4]).toBeUndefined();
+    expect(chat.generateAgentReplyWithCharge.mock.calls[0][4]).toEqual({
+      relayDrainDelaysMs: [2000, 4000, 8000, 15000, 30000],
+    });
   });
 
   it('о начале и готовности сообщается в комнату', async () => {
@@ -705,13 +708,16 @@ describe('заметка по итогам звонка (дефекты влад
   });
 
   // Ревью 26.10.2026: linkeonTools — явное включение (AgentReplyOpts),
-  // голосовая заметка им не пользуется, опции не передаём вовсе.
-  it('голосовая заметка опций linkeonTools не передаёт', async () => {
+  // голосовая заметка им не пользуется. Релей за шлагбаумом выката — как у
+  // документа: короткое ожидание в пределах DOC_TIMEOUT_MS.
+  it('голосовая заметка опций linkeonTools не передаёт, релей ждёт коротко', async () => {
     const notes = makeNotes();
     const { svc, chat } = makeSvc(notes);
     await svc.createNote(CALL, ROOM, 'user-1', 'Мой разговор', 'запиши детали моей истории');
     await svc.drainForTests();
-    expect(chat.generateAgentReplyWithCharge.mock.calls[0][4]).toBeUndefined();
+    expect(chat.generateAgentReplyWithCharge.mock.calls[0][4]).toEqual({
+      relayDrainDelaysMs: [2000, 4000, 8000, 15000, 30000],
+    });
   });
 
   it('промпт не велит экономить на деталях', async () => {

@@ -87,6 +87,28 @@ describe('BlogRelayClient: модель общего рубильника (spec 
     await c.ask('sys', 'msg', 's-1', { followSwitch: true });
     expect(fieldsOf(post.mock.calls[0][1]).provider).toBe('qwen');
   });
+
+  it('релей обновляется (503) — повтор с новой формой', async () => {
+    post.mockReset();
+    post
+      .mockImplementationOnce(async () => {
+        throw Object.assign(new Error('503'), { response: { status: 503, data: Readable.from([]) } });
+      })
+      .mockImplementationOnce(async () => ({ data: Readable.from(['data: {"type":"delta","text":"пост"}\n\n']) }));
+    const c = new BlogRelayClient();
+    (c as any).drainOpts = { delaysMs: [0] };
+
+    expect(await c.ask('sys', 'msg', 's-1')).toBe('пост');
+    expect(post).toHaveBeenCalledTimes(2);
+    expect(post.mock.calls[1][1]).not.toBe(post.mock.calls[0][1]);
+    expect(fieldsOf(post.mock.calls[1][1]).sessionId).toBe('s-1');
+  });
+
+  it('по умолчанию — полное расписание повторов (фон, спешить некуда) и повторы в журнал', () => {
+    const c = new BlogRelayClient() as any;
+    expect(typeof c.drainOpts.onRetry).toBe('function');
+    expect(c.drainOpts.delaysMs).toBeUndefined();
+  });
 });
 
 /**

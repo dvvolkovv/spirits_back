@@ -177,4 +177,29 @@ describe('toActivity — загрузки с префиксом fs_key', () => {
     expect(toActivity('Write', json({ file_path: `/tmp/agent-output/${FS_KEY}/report.docx` }), WHO_FS))
       .toEqual({ type: 'activity', kind: 'write_file', detail: 'report.docx' });
   });
+
+  // relay-agent/paths.mjs с 16.11.2026: имя, у которого очистка что-то
+  // заменила, получает «-<8 hex>» (uploadFileName), занятое — ещё «-N»
+  // (uniqueUploadPath). Человеку этот хвост ничего не говорит.
+  const upload = (name: string) =>
+    toActivity('Read', json({ file_path: `/tmp/agent-uploads/${FS_KEY}/${FS_KEY}_${name}` }), WHO_FS);
+
+  it('хеш релея у имени с заменёнными символами — в подписи без него', () => {
+    expect(upload('Screenshot_2026-11-16_at_10.00.00-1a2b3c4d.png'))
+      .toEqual({ type: 'activity', kind: 'read_upload', detail: 'Screenshot_2026-11-16_at_10.00.00.png' });
+  });
+
+  it('хеш и суффикс занятости — в подписи без обоих', () => {
+    expect(upload('Screenshot_2026-11-16_at_10.00.00-1a2b3c4d-2.png'))
+      .toEqual({ type: 'activity', kind: 'read_upload', detail: 'Screenshot_2026-11-16_at_10.00.00.png' });
+  });
+
+  it('имя без потерь (без «_») — своё окончание не трогаем', () => {
+    expect(upload('report-2.pdf')).toEqual({ type: 'activity', kind: 'read_upload', detail: 'report-2.pdf' });
+    expect(upload('build-deadbeef.txt')).toEqual({ type: 'activity', kind: 'read_upload', detail: 'build-deadbeef.txt' });
+  });
+
+  it('кириллица с хешем релея («смета.xlsx» → «_____-<hex>.xlsx») — по-прежнему без имени', () => {
+    expect(upload('_____-1a2b3c4d.xlsx')).toEqual({ type: 'activity', kind: 'read_upload' });
+  });
 });

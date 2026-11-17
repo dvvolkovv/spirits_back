@@ -4,6 +4,7 @@ import { PgService } from '../common/services/pg.service';
 import { StorageService } from '../common/services/storage.service';
 import { TalerIdNotesConnector } from '../talerid/talerid-notes.connector';
 import { ChatService } from '../chat/chat.service';
+import { RELAY_DRAIN_DELAYS_SHORT_MS } from '../chat/relay-drain-retry';
 import { DEFAULT_LANGUAGE, LanguageService } from '../common/services/language.service';
 import { LiveKitClient } from './livekit.client';
 import { voiceDocumentKey } from './voice-document-key';
@@ -274,8 +275,13 @@ export class VoiceDocumentService {
         `сохраняй, а не пересказывай общими словами.` +
         (prev ? `\nСтарое содержание не выбрасывай: дополняй, а не заменяй.` : '');
 
+      // withTimeout ход не отменяет — релей на выкате ждём коротко, чтобы
+      // генерации хватило места в DOC_TIMEOUT_MS.
       const reply = await this.withTimeout(
-        this.chat.generateAgentReplyWithCharge(userId, String(HOST_AGENT_ID), prompt, `voice_note_${callId}`),
+        this.chat.generateAgentReplyWithCharge(
+          userId, String(HOST_AGENT_ID), prompt, `voice_note_${callId}`,
+          { relayDrainDelaysMs: RELAY_DRAIN_DELAYS_SHORT_MS },
+        ),
         DOC_TIMEOUT_MS,
       );
       const body = (reply.text || '').trim();
@@ -461,8 +467,12 @@ export class VoiceDocumentService {
 
       // Изолированная сессия — как у вопросов специалистам: при коллизии с
       // живой сессией пользователя релей отдаёт пустой поток (инцидент 2026-07-12).
+      // Релей на выкате ждём коротко — как у заметки выше.
       const reply = await this.withTimeout(
-        this.chat.generateAgentReplyWithCharge(userId, String(agentId), prompt, `voice_doc_${callId}_${docId}`),
+        this.chat.generateAgentReplyWithCharge(
+          userId, String(agentId), prompt, `voice_doc_${callId}_${docId}`,
+          { relayDrainDelaysMs: RELAY_DRAIN_DELAYS_SHORT_MS },
+        ),
         DOC_TIMEOUT_MS,
       );
       const body = (reply.text || '').trim();

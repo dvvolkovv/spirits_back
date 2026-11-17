@@ -1,6 +1,7 @@
 import { Readable } from 'stream';
 import axios from 'axios';
 import { ChatService, RelaySessionBusyError } from './chat.service';
+import { RelayDrainingError } from './relay-drain-retry';
 
 jest.mock('axios');
 jest.mock('../common/telegram-alert', () => ({
@@ -221,5 +222,75 @@ describe('agentReply: учёт ходов и чужая работа в той �
     });
 
     await expect(svc.generateAgentReply('u-1', '12', 'итоги', 'voice_summary_1')).resolves.toBe('итоги');
+  });
+});
+
+describe('фоновый ход под шлагбаумом выката релея', () => {
+  const SID = 'u-1_12_ru';
+  const err503 = () => Object.assign(new Error('503'), { response: { status: 503, data: Readable.from([]) } });
+
+  beforeEach(() => jest.clearAllMocks());
+
+  it('человек написал, пока фоновый ход ждал, — фоновый уступает как busy, человеку без заметки', async () => {
+    const svc = makeService();
+    let wake: () => void = () => {};
+    svc.relayDrainDelaysMs = [1000];
+    svc.relayDrainSleep = () => new Promise<void>((r) => { wake = () => r(); });
+    (axios.post as jest.Mock).mockRejectedValueOnce(err503());
+
+    const p = svc.generateAgentReply('u-1', '12', 'напомни').catch((e) => e);
+    await flush(20);
+    expect((svc as any).relayPendingNote(SID)).toBe('');
+
+    const humanMark = svc.beginRelayRun(SID);
+    wake();
+    expect(await p).toBeInstanceOf(RelaySessionBusyError);
+    expect(axios.post).toHaveBeenCalledTimes(1);
+    expect(svc.getActiveStreamCount()).toBe(0);
+    // Уступивший фоновый ход метку человека не снимает.
+    expect((svc as any).relayRunning.get(SID)).toBe(humanMark);
+    svc.endRelayRun(SID, humanMark);
+  });
+
+  it('бюджет исчерпан — RelayDrainingError(superseded=false), метка снята', async () => {
+    const svc = makeService();
+    svc.relayDrainDelaysMs = [0];
+    (axios.post as jest.Mock).mockRejectedValueOnce(err503()).mockRejectedValueOnce(err503());
+
+    const err = await svc.generateAgentReply('u-1', '12', 'напомни').catch((e) => e);
+    expect(err).toBeInstanceOf(RelayDrainingError);
+    expect(err.superseded).toBe(false);
+    expect((svc as any).relayRunning.size).toBe(0);
+    expect(svc.getActiveStreamCount()).toBe(0);
+  });
+
+  it('релей вернулся — ответ приходит, на повтор уходит новая форма', async () => {
+    const svc = makeService();
+    svc.relayDrainDelaysMs = [0];
+    (axios.post as jest.Mock).mockRejectedValueOnce(err503()).mockResolvedValueOnce({ data: sseDone() });
+
+    await expect(svc.generateAgentReply('u-1', '12', 'напомни')).resolves.toBe('ок');
+    expect(axios.post).toHaveBeenCalledTimes(2);
+    const calls = (axios.post as jest.Mock).mock.calls;
+    expect(calls[0][1]).not.toBe(calls[1][1]);
+    expect((svc as any).relayRunning.size).toBe(0);
+  });
+
+  it('свой бюджет вызова: [] — не ждать, сдаться на первом 503', async () => {
+    const svc = makeService();
+    svc.relayDrainDelaysMs = [1000];
+    const sleep = jest.fn(async () => {});
+    svc.relayDrainSleep = sleep;
+    (axios.post as jest.Mock).mockRejectedValueOnce(err503());
+
+    const err = await svc
+      .generateAgentReply('u-1', '12', 'сожми', undefined, { relayDrainDelaysMs: [] })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(RelayDrainingError);
+    expect(err.superseded).toBe(false);
+    expect(axios.post).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+    expect((svc as any).relayRunning.size).toBe(0);
+    expect(svc.getActiveStreamCount()).toBe(0);
   });
 });
