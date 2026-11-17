@@ -1,4 +1,5 @@
 import { ChatService } from './chat.service';
+import { ChatUploadsService, ChatUploadRecord } from './chat-uploads/chat-uploads.service';
 import { FIND_FILES_CLI_PROMPT, NOTE_FILE_CLI_PROMPT, NOTE_FILE_CLI_TOOL_NAME } from '../products/products-cli-tool';
 import { LANGUAGE_REPLY_LINE } from '../common/services/language.service';
 
@@ -163,5 +164,93 @@ describe('Маша: note_file', () => {
     expect(item.content).not.toContain('Метафорическая карта');
     // Имя в обработчике — ровно константа CLI, а не строка из теста.
     expect(NOTE_FILE_CLI_TOOL_NAME).toBe('mcp__products__note_file');
+  });
+});
+
+describe('Маша: блок загрузок сессии', () => {
+  const RECORD: ChatUploadRecord = {
+    id: '99999999-9999-4999-8999-999999999999',
+    userId: USER,
+    sessionId: `${USER}_3`,
+    originalName: 'план.pdf',
+    mime: 'application/pdf',
+    sizeBytes: 1,
+    sha256: 'a'.repeat(64),
+    storageKey: 'synthetic/plan.pdf',
+    createdAt: '2026-11-15T07:05:00.000Z',
+    source: 'scan',
+    thumbKey: null,
+    note: 'План квартиры: две комнаты; договорились начать с гостиной.',
+    noteUpdatedAt: '2026-11-15T07:10:00.000Z',
+    noteAssistantId: '3',
+  };
+  // Подпись проверяется в chat-uploads.assistant-block.spec.ts; здесь — место
+  // блока в промпте Маши, поэтому ссылка подменена постоянной строкой.
+  const LINK = `https://backend.test/webhook/chat-uploads/${RECORD.id}?exp=1&sig=spec`;
+  const BLOCK = [
+    'Earlier user uploads:',
+    'Signed links expire after ~1 hour. If this block appears more than once in the conversation, use ONLY the LATEST copy — links from earlier copies are stale and return 404.',
+    'These links are for your internal use only; NEVER show or paste them to the user — to give the user a file, find it via find_files and share only its "url" field.',
+    `- id=${RECORD.id} | план.pdf | document | 2026-11-15 | комментарий: План квартиры: две комнаты; договорились начать с гостиной.`,
+    `  ${LINK}`,
+  ].join('\n');
+
+  /** Настоящий ChatUploadsService (assistantBlock — боевой), выборка и подпись — подменены. */
+  function uploadsWith(records: ChatUploadRecord[] = [RECORD]) {
+    const uploads = new ChatUploadsService({ query: jest.fn(async () => ({ rows: [] })) } as any, {} as any);
+    const recentSpy = jest.spyOn(uploads, 'recentForSession').mockResolvedValue(records);
+    jest.spyOn(uploads, 'assistantUrl').mockReturnValue(LINK);
+    return { uploads, recentSpy };
+  }
+  // Позиционная сборка ChatService до chatUploads не доходит — подставляем полем
+  // (тот же приём, что в chat-uploads.prompt.spec.ts).
+  const withUploads = (uploads: ChatUploadsService) => (svc: ChatService) => {
+    (svc as any).chatUploads = uploads;
+  };
+
+  it('флаг включён: блок — после блока note_file и перед строкой языка; реестр — по ключу `<userId>_3`', async () => {
+    process.env.CHAT_UPLOADS_ENABLED = 'true';
+    const { uploads, recentSpy } = uploadsWith();
+    const { opts, prompt } = await runMasha({ setup: withUploads(uploads) });
+    const system = String(opts.system);
+    expect(system).toContain(`\n\n${BLOCK}\n`);
+    expect(system.indexOf(BLOCK)).toBeGreaterThan(system.indexOf(NOTE_FILE_CLI_PROMPT));
+    expect(system.trim().split('\n').pop()).toBe(LANGUAGE_REPLY_LINE.ru.trim());
+    expect(recentSpy).toHaveBeenCalledWith(USER, `${USER}_3`, []);
+    // В реплику (история + USER) подписанная ссылка не попадает.
+    expect(prompt).not.toContain(LINK);
+  });
+
+  it('чистый лист: реестр опрошен по fresh-сессии', async () => {
+    process.env.CHAT_UPLOADS_ENABLED = 'true';
+    const { uploads, recentSpy } = uploadsWith();
+    const { opts } = await runMasha({ setup: withUploads(uploads), sessionId: `${USER}_3_fresh_1`, fresh: true });
+    expect(recentSpy).toHaveBeenCalledWith(USER, `${USER}_3_fresh_1`, []);
+    expect(String(opts.system)).toContain(BLOCK);
+  });
+
+  it('флаг выключен: блока нет, реестр не опрашивается', async () => {
+    delete process.env.CHAT_UPLOADS_ENABLED;
+    const { uploads, recentSpy } = uploadsWith();
+    const { opts } = await runMasha({ setup: withUploads(uploads) });
+    expect(recentSpy).not.toHaveBeenCalled();
+    expect(String(opts.system)).not.toContain('Earlier user uploads');
+  });
+
+  it('пинг мониторинга (probe): блока нет, реестр не опрашивается', async () => {
+    process.env.CHAT_UPLOADS_ENABLED = 'true';
+    const { uploads, recentSpy } = uploadsWith();
+    const { opts } = await runMasha({ setup: withUploads(uploads), probe: true });
+    expect(recentSpy).not.toHaveBeenCalled();
+    expect(String(opts.system)).not.toContain('Earlier user uploads');
+  });
+
+  it('сбой реестра — ход идёт без блока', async () => {
+    process.env.CHAT_UPLOADS_ENABLED = 'true';
+    const { uploads, recentSpy } = uploadsWith();
+    recentSpy.mockRejectedValue(new Error('db down'));
+    const { opts, writes } = await runMasha({ setup: withUploads(uploads) });
+    expect(String(opts.system)).not.toContain('Earlier user uploads');
+    expect(writes.map((w) => JSON.parse(w)).some((e) => e.type === 'item')).toBe(true);
   });
 });

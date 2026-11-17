@@ -76,7 +76,10 @@ describe('ChatUploadsService', () => {
     process.env.CHAT_UPLOADS_ENABLED = 'true';
     const block = service.assistantBlock([record]);
     expect(block).toContain('Earlier user uploads:');
-    expect(block).toContain(`- a.pdf: https://my.linkeon.test/webhook/chat-uploads/${record.id}`);
+    // Формат строки файла (B4): id, имя, вид, дата, комментарий; подписанная
+    // ссылка — следующей строкой с отступом.
+    expect(block).toContain(`- id=${record.id} | a.pdf | document | 2026-01-01 | комментарий: нет — оставь его через note_file после работы с файлом`);
+    expect(block).toContain(`\n  https://my.linkeon.test/webhook/chat-uploads/${record.id}?exp=`);
     expect(block).toMatch(/\?exp=\d+&sig=[0-9a-f]{64}$/);
     // I1a (ревью Task 6): в resumed-сессиях релея накапливаются устаревшие
     // копии блока; модель обязана брать ссылки только из ПОСЛЕДНЕЙ копии и
