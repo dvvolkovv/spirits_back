@@ -159,3 +159,50 @@ describe('Neo4jService — гейт на активный аккаунт пер�
     expectGateBeforeEveryWrite(events);
   });
 });
+
+/**
+ * Ревью K1: internal_id — это телефон (или uuid почтового входа), и в логах
+ * его быть не должно. Принятой безопасной формы для userId в логах проекта нет
+ * (maskPhone — только для SMS-номеров), поэтому строки — без идентификатора.
+ */
+describe('Neo4jService — логи без internal_id', () => {
+  const savedOpenAIKey = process.env.OPENAI_API_KEY;
+
+  afterEach(() => {
+    if (savedOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = savedOpenAIKey;
+    jest.restoreAllMocks();
+  });
+
+  function spyLogs(svc: Neo4jService): () => string[] {
+    const logger = (svc as any).logger;
+    const spies = (['log', 'warn', 'error'] as const).map((m) =>
+      jest.spyOn(logger, m).mockImplementation(() => undefined));
+    return () => spies.flatMap((s) => s.mock.calls.map((c: any[]) => String(c[0])));
+  }
+
+  it('нераспознанный ответ модели: warn без идентификатора', async () => {
+    const { svc } = makeService({ cliAnswer: 'not-json', states: ['active'] });
+    const logs = spyLogs(svc);
+
+    await svc.consolidateFromChat('u-k1', '12', 'я люблю шахматы', 'отлично', '');
+
+    expect(logs().some((m) => /failed to parse JSON/.test(m))).toBe(true);
+    expect(logs().filter((m) => m.includes('u-k1'))).toEqual([]);
+  });
+
+  it('эмбеддинг и замена сущностей: логи без идентификатора', async () => {
+    process.env.OPENAI_API_KEY = 'test-openai-key';
+    jest.spyOn(axios, 'post').mockResolvedValue({ data: { data: [{ embedding: [0.1, 0.2, 0.3] }] } });
+    const { svc } = makeService({ states: ['active'] });
+    jest.spyOn(svc, 'getProfileDescription').mockResolvedValue('A sufficiently long profile description');
+    const logs = spyLogs(svc);
+
+    await svc.updateProfileEmbedding('u-k1');
+    await svc.replaceEntities('u-k1', 'interest', ['шахматы']);
+
+    expect(logs().some((m) => /Embedding updated/.test(m))).toBe(true);
+    expect(logs().some((m) => /replaceEntities/.test(m))).toBe(true);
+    expect(logs().filter((m) => m.includes('u-k1'))).toEqual([]);
+  });
+});
