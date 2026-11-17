@@ -76,7 +76,10 @@ describe('ChatUploadsService', () => {
     process.env.CHAT_UPLOADS_ENABLED = 'true';
     const block = service.assistantBlock([record]);
     expect(block).toContain('Earlier user uploads:');
-    expect(block).toContain(`- a.pdf: https://my.linkeon.test/webhook/chat-uploads/${record.id}`);
+    // Формат строки файла (B4): id, имя, вид, дата, комментарий; подписанная
+    // ссылка — следующей строкой с отступом.
+    expect(block).toContain(`- id=${record.id} | a.pdf | document | 2026-01-01 | комментарий: нет — оставь его через note_file после работы с файлом`);
+    expect(block).toContain(`\n  https://my.linkeon.test/webhook/chat-uploads/${record.id}?exp=`);
     expect(block).toMatch(/\?exp=\d+&sig=[0-9a-f]{64}$/);
     // I1a (ревью Task 6): в resumed-сессиях релея накапливаются устаревшие
     // копии блока; модель обязана брать ссылки только из ПОСЛЕДНЕЙ копии и
@@ -167,4 +170,86 @@ describe('ChatUploadsService', () => {
   // deleteForUser удалён из сервиса (Phase 2): очистку chat_uploads при
   // удалении аккаунта делает конвейер — chat-upload-account-deletion.adapter.ts
   // (fencing + deleteConfirmed), покрытие — в адаптерных спеках.
+});
+
+describe('ChatUploadsService: поля миграции 002 (source, миниатюра, комментарий)', () => {
+  const pg = { query: jest.fn(async (_sql: string, _params?: unknown[]) => ({ rows: [] as any[] })) };
+  const service = new ChatUploadsService(pg as any, {} as any);
+
+  const baseRow = {
+    id: '33333333-3333-4333-8333-333333333333',
+    user_id: 'u1',
+    session_id: 'u1_12',
+    original_name: 'гостиная.png',
+    mime: 'image/png',
+    size_bytes: 2048,
+    sha256: 'c'.repeat(64),
+    storage_key: 'k-3/gostinaya.png',
+    created_at: new Date('2026-11-16T09:00:00.000Z'),
+  };
+
+  beforeEach(() => pg.query.mockClear());
+
+  it('COLUMNS читает новые поля из реестра', async () => {
+    await service.recentForSession('u1', 'u1_12');
+    const sql = String(pg.query.mock.calls[0][0]);
+    for (const column of ['source', 'thumb_key', 'note', 'note_updated_at', 'note_assistant_id']) {
+      expect(sql).toMatch(new RegExp(`\\b${column}\\b`));
+    }
+  });
+
+  it('row() переносит заполненные поля: source, thumbKey, note, noteUpdatedAt (ISO), noteAssistantId', async () => {
+    pg.query.mockResolvedValueOnce({
+      rows: [{
+        ...baseRow,
+        source: 'scan',
+        thumb_key: 'thumbs/k-3/gostinaya.png.webp',
+        note: 'Фото гостиной: три окна, светлый пол',
+        note_updated_at: new Date('2026-11-16T10:00:00.000Z'),
+        note_assistant_id: '7',
+      }],
+    });
+    const [record] = await service.recentForSession('u1', 'u1_12');
+    expect(record).toEqual({
+      id: '33333333-3333-4333-8333-333333333333',
+      userId: 'u1',
+      sessionId: 'u1_12',
+      originalName: 'гостиная.png',
+      mime: 'image/png',
+      sizeBytes: 2048,
+      sha256: 'c'.repeat(64),
+      storageKey: 'k-3/gostinaya.png',
+      createdAt: '2026-11-16T09:00:00.000Z',
+      source: 'scan',
+      thumbKey: 'thumbs/k-3/gostinaya.png.webp',
+      note: 'Фото гостиной: три окна, светлый пол',
+      noteUpdatedAt: '2026-11-16T10:00:00.000Z',
+      noteAssistantId: '7',
+    });
+  });
+
+  it('row(): NULL остаются null (не строкой "null"), source без значения — web', async () => {
+    pg.query.mockResolvedValueOnce({
+      rows: [
+        { ...baseRow, source: 'web', thumb_key: null, note: null, note_updated_at: null, note_assistant_id: null },
+        { ...baseRow, id: '44444444-4444-4444-8444-444444444444' },
+      ],
+    });
+    const [withNulls, withoutColumns] = await service.recentForSession('u1', 'u1_12');
+    expect(withNulls).toMatchObject({
+      source: 'web',
+      thumbKey: null,
+      note: null,
+      noteUpdatedAt: null,
+      noteAssistantId: null,
+    });
+    // Строка без новых колонок (моки соседних спеков, старая форма выборки).
+    expect(withoutColumns).toMatchObject({
+      source: 'web',
+      thumbKey: null,
+      note: null,
+      noteUpdatedAt: null,
+      noteAssistantId: null,
+    });
+  });
 });

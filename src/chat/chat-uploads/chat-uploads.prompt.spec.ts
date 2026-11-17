@@ -93,6 +93,11 @@ const RECORD: ChatUploadRecord = {
   sha256: '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824',
   storageKey: 'synthetic/a.pdf',
   createdAt: '2026-11-13T00:00:00.000Z',
+  source: 'web',
+  thumbKey: null,
+  note: null,
+  noteUpdatedAt: null,
+  noteAssistantId: null,
 };
 
 /** Настоящий ChatUploadsService (assistantBlock чеканит реальную подпись), выборка — мок. */

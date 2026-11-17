@@ -541,6 +541,8 @@ maybe('synthetic deletion lifecycle — полная цепочка против
     // Точки «Чистого листа»: core finalize стирает их той же транзакцией.
     await migration('chat/context-reset/migrations/001_chat_context_resets.sql');
     await migration('chat/chat-uploads/migrations/001_chat_uploads.sql');
+    // 002: execute chat-upload.purge читает thumb_key (миниатюры загрузок).
+    await migration('chat/chat-uploads/migrations/002_chat_uploads_media_notes.sql');
     await migration('custom-agents/migrations/001_custom_agents.sql');
     await migration('custom-agents/migrations/002_owner_user_id_to_text.sql');
     await migration('video/migrations/001_video_jobs.sql');

@@ -77,6 +77,16 @@ async function runMasha(message = 'Покажи мои продукты') {
   return { opts, writes };
 }
 
+// Набор инструментов и системный промпт Маши зависят от CHAT_UPLOADS_ENABLED
+// (note_file, chat.service.masha-uploads.spec.ts): побайтные проверки ниже не
+// должны меняться от флага в окружении прогона.
+const OLD_UPLOADS_FLAG = process.env.CHAT_UPLOADS_ENABLED;
+beforeEach(() => { delete process.env.CHAT_UPLOADS_ENABLED; });
+afterAll(() => {
+  if (OLD_UPLOADS_FLAG === undefined) delete process.env.CHAT_UPLOADS_ENABLED;
+  else process.env.CHAT_UPLOADS_ENABLED = OLD_UPLOADS_FLAG;
+});
+
 describe('Маша в вебе: инструмент продуктов', () => {
   const OLD_SECRET = process.env.JWT_SECRET;
   const OLD_PORT = process.env.PORT;
