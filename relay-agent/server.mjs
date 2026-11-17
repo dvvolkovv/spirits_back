@@ -794,8 +794,11 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
   // Уже отдали клиенту хоть один кусок текста в этом ходе? Тогда переигрывать
   // ход нельзя — ответ склеится со вторым и юзер прочитает одно и то же дважды.
   let streamedAny = false;
-  // Ход закончился, не выдав финального ответа. Бэкенд по этому флагу не спишет
-  // за него токены: пользователь не должен платить за пустоту.
+  // Ход закончился, не выдав финального ответа. С 17.11.2026 бэкенд
+  // (partial-billing.ts) списывает такой ход за то, что успело прийти, и не
+  // списывает, если не пришло ничего: пользователь не должен платить за пустоту.
+  // Поэтому реплики обрывов с частичным результатом (preempted,
+  // transient_after_partial, max_turns) не обещают «токены не списаны».
   //
   // До этой правки три РАЗНЫЕ поломки выглядели для пользователя одинаково —
   // текст обрывался на полуслове без единого слова объяснения:
@@ -994,7 +997,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
         preempt: () => {
           preempted = true;
           notice(
-            "\n\n_(ответ прерван: вы отправили новое сообщение, и ассистент переключился на него. Токены за прерванный ход не списаны.)_",
+            "\n\n_(ответ прерван: вы отправили новое сообщение, и ассистент переключился на него.)_",
             "preempted",
           );
         },
@@ -1151,7 +1154,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
             if (fatalAccess) {
               if (FATAL_RE.test(ev.result)) notice(fatalHint(ev.result), "cli_fatal");
               else if (taleridWriteUsed) notice("_(связь с моделью прервалась после действия — проверьте результат, возможно всё прошло; при необходимости повторите)_", "transient_after_write");
-              else if (streamedAny) notice("\n\n_(связь с моделью прервалась, ответ оборван. Токены за этот ход не списаны — повторите вопрос.)_", "transient_after_partial");
+              else if (streamedAny) notice("\n\n_(связь с моделью прервалась, ответ оборван — повторите вопрос.)_", "transient_after_partial");
               else notice("_(временный сбой связи с моделью, попробуйте отправить сообщение ещё раз)_", "transient");
               return;
             }
@@ -1306,7 +1309,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
       notice("_(связь с моделью прервалась после действия — проверьте результат, возможно всё прошло; при необходимости повторите)_", "transient_after_write");
     } else if (r.transientHit && streamedAny) {
       // Ответ (пусть и частичный) клиент уже прочитал — повтор дал бы дубль.
-      notice("\n\n_(связь с моделью прервалась, ответ оборван. Токены за этот ход не списаны — повторите вопрос.)_", "transient_after_partial");
+      notice("\n\n_(связь с моделью прервалась, ответ оборван — повторите вопрос.)_", "transient_after_partial");
     } else if (r.transientHit) {
       // 401/429/5xx/network blip — wait briefly and retry on the same session.
       await new Promise((res) => setTimeout(res, retryDelayMs));
@@ -1346,7 +1349,7 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
     }
     if (r.maxTurnsHit) {
       notice(
-        "\n\n_(задача оказалась слишком большой даже для трёх заходов. Напишите «продолжай» — ассистент доведёт её до конца. Токены за незавершённый ход не списаны.)_",
+        "\n\n_(задача оказалась слишком большой даже для трёх заходов. Напишите «продолжай» — ассистент доведёт её до конца.)_",
         "max_turns",
       );
     }
@@ -1415,8 +1418,10 @@ app.post("/chat", chatInflight.middleware, createDrainGate({ drainPath }), uploa
       if (filesOut.length > outputFiles.length) {
         console.log("[undelivered] " + sessionId + ": отдаю файлы прошлого хода: " + (filesOut.length - outputFiles.length));
       }
-      // failed — «ход не выдал финального ответа». Бэкенд по нему пропускает
-      // списание: платить за пустоту пользователь не должен.
+      // failed — «ход не выдал финального ответа», failReason — почему. С
+      // 17.11.2026 бэкенд (partial-billing.ts) по ним списывает оборванный ход за
+      // то, что успело прийти (текст модели или файлы), и пропускает списание,
+      // только если человек не получил ничего: платить за пустоту он не должен.
       res.write("data: " + JSON.stringify({
         type: "done",
         outputFiles: filesOut,
