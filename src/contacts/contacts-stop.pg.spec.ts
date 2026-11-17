@@ -1,3 +1,4 @@
+import { NotFoundException } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
@@ -310,5 +311,82 @@ maybe('contacts.stop against PostgreSQL (K6)', () => {
     ).resolves.toBeUndefined();
 
     expect(await snapshot()).toEqual(before);
+  });
+
+  describe('новые заявки неактивному получателю (K6b)', () => {
+    const service = (pg?: any) =>
+      new ContactsService(pg ?? ({ query: (sql: string, p?: any[]) => pool.query(sql, p) } as any), undefined as any);
+
+    async function notAvailable(promise: Promise<unknown>): Promise<void> {
+      const error = await promise.then(() => null, (e) => e);
+      expect(error).toBeInstanceOf(NotFoundException);
+      expect((error as NotFoundException).getResponse()).toEqual({ code: 'PROFILE_NOT_AVAILABLE' });
+    }
+
+    async function requestsTo(phone: string): Promise<any[]> {
+      return rows(
+        `SELECT id, requester_id, status FROM contact_requests WHERE target_id=$1 ORDER BY id`,
+        [ids[phone]],
+      );
+    }
+
+    /** Заявки LIVE к получателю (посев уже содержит чужие заявки к THIRD). */
+    async function fromLiveTo(phone: string): Promise<any[]> {
+      return rows(
+        `SELECT id, status FROM contact_requests WHERE requester_id=$1 AND target_id=$2 ORDER BY id`,
+        [ids[LIVE], ids[phone]],
+      );
+    }
+
+    it('после stop новая заявка удалённому не создаётся — тот же ответ, что на несуществующего', async () => {
+      await adapter.execute(stopJob(), makeCtx());
+      const before = await requestsTo(DELETED);
+
+      await notAvailable(service().createRequest(LIVE, ids[DELETED], 'ещё раз'));
+
+      expect(await requestsTo(DELETED)).toEqual(before);
+      expect((await requestsTo(DELETED)).filter((row) => row.status === 'pending')).toEqual([]);
+      // Форма ответа совпадает с несуществующим получателем.
+      await notAvailable(service().createRequest(LIVE, 999_999, 'никому'));
+    });
+
+    it('заблокированный получатель и профиль без строки user_id — заявка не создаётся', async () => {
+      await seedUser('79990000656', 'blocked', null);
+      await seedUser('79990000657', 'active', null);
+      await pool.query(`DELETE FROM user_id WHERE internal_id='79990000657'`);
+
+      await notAvailable(service().createRequest(LIVE, ids['79990000656'], 'привет'));
+      await notAvailable(service().createRequest(LIVE, ids['79990000657'], 'привет'));
+
+      expect(await requestsTo('79990000656')).toEqual([]);
+      expect(await requestsTo('79990000657')).toEqual([]);
+    });
+
+    it('получателя удалили между проверками и INSERT — гейт в самом INSERT, заявки нет', async () => {
+      const racing = {
+        query: async (sql: string, params?: any[]) => {
+          // Видимость контакта читается после проверок получателя.
+          if (sql.includes("profile_data->>'contactVisible'")) {
+            await pool.query(
+              `UPDATE user_id SET state='deleted', deleted_at=now(), deletion_id=gen_random_uuid()
+                WHERE internal_id=$1`,
+              [THIRD],
+            );
+          }
+          return pool.query(sql, params);
+        },
+      };
+
+      await notAvailable(service(racing).createRequest(LIVE, ids[THIRD], 'привет'));
+
+      expect(await fromLiveTo(THIRD)).toEqual([]);
+    });
+
+    it('активный получатель — прежнее поведение: pending создана', async () => {
+      const created = await service().createRequest(LIVE, ids[THIRD], 'привет');
+
+      expect(created).toMatchObject({ requester_id: ids[LIVE], target_id: ids[THIRD], status: 'pending' });
+      expect(await fromLiveTo(THIRD)).toEqual([{ id: created.id, status: 'pending' }]);
+    });
   });
 });
