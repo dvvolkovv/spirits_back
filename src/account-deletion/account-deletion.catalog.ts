@@ -8,7 +8,10 @@ import { discoverVoiceDocuments } from '../voice-call/voice-document-account-del
 import { discoverChatFiles } from '../chat/chat-files/chat-file-account-deletion.adapter';
 import { discoverChatUploads } from '../chat/chat-uploads/chat-upload-account-deletion.adapter';
 import { discoverImageDeletion } from '../misc/image-account-deletion.adapter';
-import { discoverVideoDeletion } from '../video/video-account-deletion.adapter';
+import {
+  discoverVideoDeletion,
+  discoverVideoUploadsDeletion,
+} from '../video/video-account-deletion.adapter';
 import { discoverSpeechDeletion } from '../speech/speech-account-deletion.adapter';
 import { discoverAvatarDeletion } from '../avatar/avatar-account-deletion.adapter';
 import { discoverVoiceAvatarDeletion } from '../voice-avatar/voice-account-deletion.adapter';
@@ -43,7 +46,16 @@ export const DELETION_DISCOVERERS: readonly DeletionDiscoverer[] = [
   // не нужно (нет stop-фазы и общего состояния, как у chat-file.purge).
   discoverChatUploads,
   discoverImageDeletion,
+  // Видео-бакет (MINIO_BUCKET_VIDEOS) — два места. video-job.purge: по строке
+  // video_jobs — videos/<jobId>.mp4|jpg, own-ключи из колонок строки,
+  // локальные public/videos/<jobId>.* и _veoconcat/<jobId>. K4
+  // video-upload.purge: весь каталог личных загрузок video-uploads/<userId>/
+  // (листинг с пагинацией) — фото без строки (не дошли до задачи, стёрты
+  // cleanupOldFailedJobs, 2-е/3-е референс-фото Veo в composed_plan). Одна
+  // задача на аккаунт; правила зависимостей не нужно — с video-job.purge
+  // пересекается только подтверждённым отсутствием объекта.
   discoverVideoDeletion,
+  discoverVideoUploadsDeletion,
   discoverSpeechDeletion,
   discoverAvatarDeletion,
   discoverVoiceAvatarDeletion,

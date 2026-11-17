@@ -33,6 +33,13 @@ import { VideoService } from './video.service';
  * id — он payload-гигиену не прошёл бы и пользы не несёт), а purge никаких
  * провайдерских методов не вызывает. В payload живёт один технический
  * videoJobId: prompt, userId и пути план не покидают.
+ *
+ * K4 — video-upload.purge: личные загрузки video-uploads/<userId>/, у которых
+ * строки video_jobs нет (фото не дошло до задачи; failed-строку стёр
+ * cleanupOldFailedJobs; 2-е и 3-е референс-фото Veo — только в
+ * composed_plan). Одна задача на аккаунт (discoverVideoUploadsDeletion),
+ * обход каталога владельца при исполнении — VideoService
+ * .deleteVideoUploadsForDeletion.
  */
 
 /** Сколько строк video_jobs читать за один запрос discovery. */
@@ -87,9 +94,44 @@ export async function discoverVideoDeletion(ctx: VideoDiscovery): Promise<Deleti
   return { jobs, skips };
 }
 
+/** Статический resourceKey задачи обхода загрузок (одна на аккаунт). */
+export const VIDEO_UPLOAD_RESOURCE_KEY = 'video-uploads';
+
+/**
+ * K4 — discovery личных загрузок video-uploads/<userId>/.
+ *
+ * Объекты каталога не обязаны иметь строку video_jobs, поэтому задача не
+ * зависит от строк: единственный SQL — generation gate (форма avatar.purge);
+ * MinIO при планировании не листается. Job пустой (payload {}, статический
+ * resourceKey — userId в нём забраковал бы sanitizer): цель выводится из
+ * job.userId, колонки job, а не payload. Фаза purge — загрузки переживают
+ * 30-дневное окно реактивации, как video-job.purge.
+ */
+export async function discoverVideoUploadsDeletion(ctx: DeletionDiscovery): Promise<DeletionPlan> {
+  const { db, account } = ctx;
+  const gen = await db.query(
+    `SELECT 1 FROM user_id u
+      WHERE u.internal_id = $1 AND u.state = 'deleted' AND u.deletion_id = $2`,
+    [account.userId, account.deletionId],
+  );
+  if ((gen.rowCount ?? 0) === 0) return { jobs: [], skips: [] };
+  return {
+    jobs: [{
+      resourceType: 'video-upload.purge',
+      resourceKey: VIDEO_UPLOAD_RESOURCE_KEY,
+      phase: 'purge',
+      payload: {},
+    }],
+    skips: [],
+  };
+}
+
 @Injectable()
 export class VideoAccountDeletionAdapter implements OnModuleInit, AccountDeletionAdapter {
-  readonly resourceTypes: readonly DeletionResourceType[] = ['video-job.purge'];
+  readonly resourceTypes: readonly DeletionResourceType[] = [
+    'video-job.purge',
+    'video-upload.purge',
+  ];
 
   constructor(
     private readonly video: VideoService,
@@ -101,6 +143,10 @@ export class VideoAccountDeletionAdapter implements OnModuleInit, AccountDeletio
   }
 
   async execute(job: DeletionJobRow, ctx: DeletionExecution): Promise<void> {
+    if (job.resourceType === 'video-upload.purge') {
+      await this.executeUploads(job, ctx);
+      return;
+    }
     if (job.resourceType !== 'video-job.purge') {
       throw new Error('unsupported_deletion_resource');
     }
@@ -123,6 +169,27 @@ export class VideoAccountDeletionAdapter implements OnModuleInit, AccountDeletio
     }
     // Внешние операции (MinIO/fs) могли занять время: перед тем как считать
     // job выполненным, поколение и lease перепроверяются.
+    await ctx.assertCurrent(job);
+  }
+
+  /**
+   * K4: обход video-uploads/<userId>/. userId валидирует доменный метод ДО
+   * построения префикса (неверный — retry db без листинга); поколение и lease
+   * перепроверяются до обхода, перед каждым удалением (beforeDelete) и после.
+   */
+  private async executeUploads(job: DeletionJobRow, ctx: DeletionExecution): Promise<void> {
+    await ctx.assertCurrent(job);
+    try {
+      await this.video.deleteVideoUploadsForDeletion(
+        job.userId,
+        job.deletionId,
+        () => ctx.assertCurrent(job),
+      );
+    } catch (error) {
+      if (error instanceof DeletionCancelledError) throw error;
+      if (error instanceof DeletionRetryError) throw error;
+      throw new DeletionRetryError(deletionErrorKind(error));
+    }
     await ctx.assertCurrent(job);
   }
 }

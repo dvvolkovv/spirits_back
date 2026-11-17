@@ -8,7 +8,7 @@ import { V } from '../values';
 // источник: язык — spirits_front src/i18n/languages.ts:11-23; src/common/services/language.service.ts:56-78
 // источник: удаление — src/profile/profile.service.ts:147-210; src/neo4j/neo4j.service.ts:226-240
 // источник: политика остановки и очистки — src/account-deletion/ (pipeline: stop сразу, purge через ACCOUNT_DELETION_RETENTION_DAYS, реактивация отменяет)
-// источник: исходники загрузок удаляются с аккаунтом — src/chat/chat-uploads/chat-upload-account-deletion.adapter.ts (chat-upload.purge через конвейер удаления, после 30-дневного окна); файлы ассистента — chat-files, прежние правила
+// источник: исходники загрузок удаляются с аккаунтом — src/chat/chat-uploads/chat-upload-account-deletion.adapter.ts (chat-upload.purge через конвейер удаления, после 30-дневного окна); фото для видео video-uploads/<userId>/ — src/video/video-account-deletion.adapter.ts (video-upload.purge, весь каталог, в том числе без строки video_jobs); файлы ассистента — chat-files, прежние правила
 // источник: повторная SMS при живом коде не уходит — src/auth/auth.service.ts:94-99; срок ссылки — src/auth/email.service.ts (MAGIC_LINK_TTL_SECONDS)
 // источник: слияние — src/identity/identity.service.ts:348-403 (переносятся способы входа и баланс; выживает более старый)
 export const account: KbArticle = {

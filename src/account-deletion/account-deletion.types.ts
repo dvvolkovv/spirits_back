@@ -37,6 +37,7 @@ export type DeletionResourceType =
   | 'chat-upload.purge'
   | 'image.purge'
   | 'video-job.purge'
+  | 'video-upload.purge'
   | 'video.provider'
   | 'speech.purge'
   | 'listen.purge'

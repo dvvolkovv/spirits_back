@@ -438,6 +438,15 @@ export function createSyntheticStack(pg: PgService): SyntheticStack {
       failures.note('video');
       failures.guard('video');
     },
+    // K4: обход video-uploads/<userId>/ (video-upload.purge) — та же граница.
+    deleteVideoUploadsForDeletion: async (
+      _userId: string,
+      _deletionId: string,
+      _beforeDelete?: () => Promise<void>,
+    ) => {
+      failures.note('video');
+      failures.guard('video');
+    },
   };
 
   const speech = {

@@ -34,6 +34,17 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
+/**
+ * Каталог личных загрузок пользователя в видео-бакете — фото, которые человек
+ * загрузил для ролика (uploadUserAsset). Одна функция и для записи, и для
+ * обхода при удалении аккаунта (video-upload.purge): формат ключа не
+ * разъедется. Завершающий '/' обязателен — без него префикс 7999000050
+ * захватил бы и каталог 79990000501.
+ */
+export function videoUploadPrefix(userId: string): string {
+  return `video-uploads/${userId}/`;
+}
+
 export class InsufficientTokensError extends Error {
   status = 402;
   constructor(public balance: number, public required: number) {
@@ -463,6 +474,74 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     await this.storage.deleteConfirmed({ bucket: this.s3Bucket, key });
   }
 
+  /**
+   * K4 — личные загрузки video-uploads/<userId>/ при удалении аккаунта.
+   *
+   * uploadUserAsset кладёт фото ДО и НЕЗАВИСИМО от строки video_jobs: фото
+   * могло не дойти до задачи, cleanupOldFailedJobs стирает failed-строки, не
+   * трогая объекты, а 2-е и 3-е референс-фото Veo живут только в
+   * composed_plan, не в колонках строки. deleteVideoForDeletion такие объекты
+   * не видит, поэтому весь каталог владельца листается постранично
+   * (ListObjectsV2 с continuation token) и каждый объект удаляется
+   * подтверждённо (deleteConfirmed). С удалением по строке обход пересекается
+   * только подтверждённым отсутствием — порядок между ними не важен.
+   *
+   * Fail-closed:
+   *  - userId проверяется ДО построения префикса (алфавит SAFE_DELETION_ID_RE —
+   *    тот же, что SAFE_DELETION_USER_RE аватаров: телефон или uuid, без '/',
+   *    пробелов и управляющих символов, ≤128): пустой userId дал бы префикс
+   *    всего каталога загрузок — retry db без единого обращения к MinIO;
+   *  - без StorageService — retry external_unknown (как deleteVideoMinioConfirmed);
+   *  - поколение проверяется до первого листинга: аккаунт оживили —
+   *    DeletionCancelledError;
+   *  - ключ вне префикса в ответе листинга или усечённая страница без нового
+   *    токена — retry external_unknown, а не тихий успех с хвостом.
+   * beforeDelete (адаптер передаёт ctx.assertCurrent) зовётся перед каждым
+   * удалением — форма chat-upload.purge. Повтор после частичного сбоя
+   * идемпотентен: стёртое листинг больше не вернёт, пустой каталог — успех.
+   * Ключи и userId здесь не логируются: журнал пишет раннер, safe-формами.
+   */
+  async deleteVideoUploadsForDeletion(
+    userId: string,
+    deletionId: string,
+    beforeDelete: () => Promise<void> = async () => undefined,
+  ): Promise<void> {
+    if (typeof userId !== 'string' || !VideoService.SAFE_DELETION_ID_RE.test(userId)) {
+      throw new DeletionRetryError('db');
+    }
+    const storage = this.storage;
+    if (!storage) throw new DeletionRetryError('external_unknown');
+    const gen = await this.pg.query(
+      `SELECT 1 FROM user_id u
+        WHERE u.internal_id = $1 AND u.state = 'deleted' AND u.deletion_id = $2`,
+      [userId, deletionId],
+    );
+    if ((gen.rowCount ?? 0) === 0) throw new DeletionCancelledError();
+
+    const prefix = videoUploadPrefix(userId);
+    let token: string | undefined;
+    for (;;) {
+      const page = await storage.listPage({
+        bucket: this.s3Bucket,
+        prefix,
+        continuationToken: token,
+      });
+      // Вся страница проверяется до первого удаления: чужой ключ в ответе —
+      // рассогласование транспорта, удалять по нему нельзя.
+      if (page.keys.some((key) => !key.startsWith(prefix))) {
+        throw new DeletionRetryError('external_unknown');
+      }
+      for (const key of page.keys) {
+        await beforeDelete();
+        await storage.deleteConfirmed({ bucket: this.s3Bucket, key });
+      }
+      if (!page.truncated) return;
+      const next = page.nextContinuationToken;
+      if (!next || next === token) throw new DeletionRetryError('external_unknown');
+      token = next;
+    }
+  }
+
   // ================= POLLER =================
   private pollTimer: NodeJS.Timeout | null = null;
   private readonly POLL_INTERVAL_MS = 5000;
@@ -686,7 +765,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     }
     const extMatch = origName.match(/\.([a-z0-9]{2,5})$/i);
     const ext = extMatch ? extMatch[1].toLowerCase() : 'jpg';
-    const key = `video-uploads/${userId}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    const key = `${videoUploadPrefix(userId)}${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
     await this.ensureBucket();
     await this.s3.send(new PutObjectCommand({
       Bucket: this.s3Bucket,
