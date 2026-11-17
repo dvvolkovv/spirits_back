@@ -554,6 +554,10 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
       );
 
       // 3) Создадим/обновим каноническую сущность и связь.
+      // K1b: компакция могла идти в момент удаления — MERGE воскресил бы узел
+      // Profile удалённого. Проверка непосредственно перед записью; без pg
+      // проверить нечем — не пишем.
+      if (!this.pg || !(await this.isAccountActive(this.pg, userId))) return;
       await session.run(
         `MERGE (p:Profile {phone: $phone})
          MERGE (v:${type} {canonical_key: $canonicalKey})
