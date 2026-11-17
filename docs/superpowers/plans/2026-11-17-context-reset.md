@@ -1179,7 +1179,7 @@ maybe('разовый перенос старых листов (pg)', () => {
       id serial PRIMARY KEY, session_id text NOT NULL, sender_type varchar(10) NOT NULL,
       content text NOT NULL, created_at timestamptz DEFAULT now())`);
     await pool.query(`CREATE TABLE IF NOT EXISTS chat_uploads (id serial PRIMARY KEY, user_id text, session_id text, created_at timestamptz DEFAULT now())`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS action_plans (id serial PRIMARY KEY, user_id text, session_id text, UNIQUE (user_id, session_id))`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS action_plans (id serial PRIMARY KEY, user_id text, session_id text, updated_at timestamptz DEFAULT now(), UNIQUE (user_id, session_id))`);
   });
   afterAll(async () => {
     await pool?.query('DROP TABLE IF EXISTS custom_chat_history, chat_uploads, action_plans, chat_context_resets');
@@ -1233,6 +1233,21 @@ maybe('разовый перенос старых листов (pg)', () => {
     expect(up.rows[0].session_id).toBe('79000000001_10');
     const plans = await pool.query(`SELECT session_id FROM action_plans ORDER BY 1`);
     expect(plans.rows.map((r) => r.session_id)).toEqual(['79000000001_10', '79000000001_10_fresh_1794804919138']);
+  });
+
+  it('два листа без основного плана: переезжает самый свежий, скрипт не падает', async () => {
+    await msg('79000000001_10_fresh_1794468117918', '2026-11-12T07:30:00Z');
+    await msg('79000000001_10_fresh_1794804919138', '2026-11-16T05:00:00Z');
+    await pool.query(`INSERT INTO action_plans (user_id, session_id, updated_at) VALUES
+      ('79000000001','79000000001_10_fresh_1794468117918','2026-11-12T08:00:00Z'),
+      ('79000000001','79000000001_10_fresh_1794804919138','2026-11-16T06:00:00Z')`);
+    await pool.query(SCRIPT);
+    const plans = await pool.query(`SELECT session_id, updated_at FROM action_plans ORDER BY 1`);
+    expect(plans.rows.map((r) => r.session_id)).toEqual(['79000000001_10', '79000000001_10_fresh_1794468117918']);
+    expect(new Date(plans.rows[0].updated_at).toISOString()).toBe('2026-11-16T06:00:00.000Z');
+    // история при этом перенесена — транзакция не откатилась
+    const h = await pool.query(`SELECT count(*)::int n FROM custom_chat_history WHERE session_id = '79000000001_10'`);
+    expect(h.rows[0].n).toBe(2);
   });
 });
 ```
@@ -1288,13 +1303,28 @@ UPDATE chat_uploads u SET session_id = regexp_replace(u.session_id, '_fresh_[0-9
  WHERE u.session_id ~ '_fresh_[0-9]+$'
    AND u.user_id NOT IN ('70000000000', '79030169187', '79169403771', '79656445804')
    AND u.user_id !~ '^790300[0-9]{5}$';
-UPDATE action_plans p SET session_id = regexp_replace(p.session_id, '_fresh_[0-9]+$', '')
- WHERE p.session_id ~ '_fresh_[0-9]+$'
-   AND p.user_id NOT IN ('70000000000', '79030169187', '79169403771', '79656445804')
-   AND p.user_id !~ '^790300[0-9]{5}$'
+-- Планы: уникальность (user_id, session_id), а NOT EXISTS видит снимок до UPDATE —
+-- два листа одной пары без основного плана получили бы один ключ и уронили бы
+-- весь скрипт. Переносим только самый свежий план листа и только если у пары
+-- нет основного; остальные остаются в своих листах (их никто не читает).
+WITH cand AS (
+  SELECT p.id,
+         regexp_replace(p.session_id, '_fresh_[0-9]+$', '') AS base,
+         row_number() OVER (
+           PARTITION BY p.user_id, regexp_replace(p.session_id, '_fresh_[0-9]+$', '')
+           ORDER BY p.updated_at DESC, p.id::text DESC
+         ) AS rn
+    FROM action_plans p
+   WHERE p.session_id ~ '_fresh_[0-9]+$'
+     AND p.user_id NOT IN ('70000000000', '79030169187', '79169403771', '79656445804')
+     AND p.user_id !~ '^790300[0-9]{5}$'
+)
+UPDATE action_plans p SET session_id = c.base
+  FROM cand c
+ WHERE p.id = c.id
+   AND c.rn = 1
    AND NOT EXISTS (SELECT 1 FROM action_plans q
-                    WHERE q.user_id = p.user_id
-                      AND q.session_id = regexp_replace(p.session_id, '_fresh_[0-9]+$', ''));
+                    WHERE q.user_id = p.user_id AND q.session_id = c.base);
 
 COMMIT;
 ```
@@ -1468,6 +1498,8 @@ export function sameResetAt(a: Date | null, b: Date | null): boolean {
 - [ ] **Step 5: Commit** — `git commit -m "refactor(chat): панели и API без метки «Чистого листа»"`
 
 ---
+
+**Дополнение по ревью задачи 6 (в этой задаче):** после точки «Обновить план» без нового разговора получает от бэка 400 `not enough conversation for an action plan`, а панель показывает общее «Не удалось загрузить или сохранить план. Попробуйте ещё раз.» — повтор не поможет. В `ActionPlanPanel.tsx` отличать ответ 400 (сверь, как `actionPlansApi.generate` отдаёт статус — при необходимости пробросить его) и показывать свой текст: ключ `chat.action_plan.not_enough` — ru «Для плана пока мало разговора: напишите ассистенту хотя бы пару сообщений. После «Чистого листа» план строится только по новому разговору.» (в Task 15 — во всех 7 локалях). Тест панели: 400 → этот текст, иной сбой → прежний.
 
 ### Task 14: ChatInterface — кнопка-действие, точка, черта
 
