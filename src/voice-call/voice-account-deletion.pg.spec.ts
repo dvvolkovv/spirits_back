@@ -434,6 +434,51 @@ maybe('VoiceCallService.complete после удаления аккаунта п
     expect(n).toBeLessThanOrEqual(1);
   });
 
+  // Решение владельца 17.11 (вариант A): аккаунт удалён до завершения звонка —
+  // complete() учёт не пишет вовсе: ни строки token_consumption_tasks ни по
+  // звонку, ни по пользователю, и повторный complete тоже. След расходов
+  // остаётся только в warn (тесты «warn несёт стоимость…» ниже). Оба исхода:
+  // voice.stop успел пометить звонок interrupted — или удаление пришло, пока
+  // звонок ещё active.
+  async function billingRows(id: string) {
+    return (await pool.query(
+      `SELECT user_id, status, metadata FROM token_consumption_tasks
+        WHERE user_id = $1 OR metadata->>'callId' = $2`,
+      [USER, id],
+    )).rows;
+  }
+
+  it.each(['interrupted', 'active'])(
+    'вариант A: удалённый аккаунт (звонок %s) — complete не пишет учёт, повтор тоже',
+    async (callStatus) => {
+      const id = await seed('deleted', callStatus);
+      const { svc } = makeSvc();
+
+      await svc.complete(id, payload);
+      await svc.complete(id, payload);
+      await sleep(300);
+
+      expect(await billingRows(id)).toEqual([]);
+      expect((await pool.query(`SELECT count(*)::int AS n FROM token_consumption_tasks`)).rows[0].n).toBe(0);
+    },
+  );
+
+  // Контроль к варианту A: тот же запрос billingRows находит строку учёта
+  // живого звонка — пустой ответ выше значит «учёта нет», а не «запрос мимо».
+  it('вариант A, контроль: активный аккаунт — ровно одна строка учёта этого звонка', async () => {
+    const id = await seed('active', 'active');
+    const { svc } = makeSvc();
+
+    await svc.complete(id, payload);
+    await svc.complete(id, payload); // повтор идемпотентен: статус уже completed
+    await waitIssued(/INSERT INTO custom_chat_history/);
+
+    const rows = await billingRows(id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ user_id: USER, status: 'pending' });
+    expect(rows[0].metadata).toMatchObject({ kind: 'voice_call', callId: id });
+  });
+
   it('аккаунт удалён, пока считалось резюме: карточки в ленте и summary нет', async () => {
     const id = await seed('active', 'active');
     const { svc } = makeSvc(async () => {
