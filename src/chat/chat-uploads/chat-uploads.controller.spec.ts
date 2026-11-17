@@ -274,13 +274,18 @@ describe('ChatUploadsController (ошибка потока)', () => {
         sizeBytes: 1,
       })),
     };
-    const ctrl = new ChatUploadsController(svc as any, { verifyAccess: jest.fn() } as any);
+    // Владелец по токену: без токена и без подписи контроллер ответил бы 401
+    // до сервиса, и до стрима дело не дошло бы.
+    const ctrl = new ChatUploadsController(
+      svc as any,
+      { verifyAccess: jest.fn(() => ({ sub: 'u1', type: 'access' })) } as any,
+    );
     const res: any = new PassThrough();
     res.setHeader = jest.fn();
     const destroy = jest.fn();
     res.destroy = destroy;
 
-    await ctrl.download(RECORD_ID, { headers: {}, query: {} } as any, res);
+    await ctrl.download(RECORD_ID, { headers: { authorization: 'Bearer t' }, query: {} } as any, res);
     await new Promise((resolve) => setTimeout(resolve, 20));
 
     expect(destroy).toHaveBeenCalled();

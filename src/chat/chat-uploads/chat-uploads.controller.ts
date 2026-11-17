@@ -25,7 +25,9 @@ import { errKind, logId } from './err-kind';
  * GET :id — скачивание исходника: владелец по JWT, ассистент по короткоживущей
  * подписи exp+sig. Решение «владелец ИЛИ подпись» и единый 404 без раскрытия
  * существования записи живут в сервисе (openDownload); контроллер лишь
- * разбирает доступ и стримит байты.
+ * разбирает доступ и стримит байты. Без sig и без валидного access-токена —
+ * 401 до сервиса, как у thumb и DELETE: фронт обновит токен и повторит, а не
+ * покажет «файла нет». 401 зависит только от авторизации, не от id.
  *
  * GET :id/thumb и DELETE :id — только владелец по JWT (спека
  * 2026-11-16-chat-uploads-media-notes-design.md): миниатюра нужна панели
@@ -45,11 +47,16 @@ export class ChatUploadsController {
 
   @Get(':id')
   async download(@Param('id') id: string, @Req() req: Request, @Res() res: Response): Promise<void> {
+    const userId = this.ownerFrom(req);
+    const sig = req.query.sig;
+    // Подписи нет — доступ даёт только access-токен владельца. С подписью
+    // (даже неверной) решает сервис, как раньше: там единый 404.
+    if (!userId && (sig === undefined || sig === '')) throw new UnauthorizedException();
     const file = await this.uploads.openDownload({
       id,
-      userId: this.ownerFrom(req),
+      userId,
       exp: req.query.exp as string | undefined,
-      sig: req.query.sig as string | undefined,
+      sig: sig as string | undefined,
     });
 
     res.setHeader('Content-Type', file.mime);
@@ -108,8 +115,8 @@ export class ChatUploadsController {
       const payload = this.jwt.verifyAccess(auth.slice(7));
       return payload?.sub || payload?.userId;
     } catch {
-      // Невалидный токен — анонимный запрос: для GET :id доступ тогда решает
-      // подпись, для thumb и DELETE это 401.
+      // Невалидный токен — анонимный запрос: для GET :id с подписью доступ
+      // тогда решает подпись, без подписи и для thumb и DELETE это 401.
       return undefined;
     }
   }
