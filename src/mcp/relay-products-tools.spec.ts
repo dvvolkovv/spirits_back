@@ -31,4 +31,33 @@ describe('копия релея знает все инструменты точ�
       expect(relay).toContain(`Тебе доступен инструмент ${name}`);
     }
   });
+
+  // note_file точка показывает только при CHAT_UPLOADS_ENABLED=true, а копия
+  // релея флага не знает: имя и оговорка должны стоять в ней заранее, иначе
+  // включение флага молча оставит веб-ассистентов без инструмента.
+  it('веб с включённой памятью загрузок: note_file тоже в PRODUCTS_TOOLS и с оговоркой', () => {
+    const old = process.env.CHAT_UPLOADS_ENABLED;
+    process.env.CHAT_UPLOADS_ENABLED = 'true';
+    try {
+      const ctrl = new ProductsMcpController({} as any, {} as any, {} as any, {} as any, {} as any);
+      const names = (ctrl.listTools('web') as any[]).map((t) => t.name);
+      expect(names).toContain('note_file');
+      for (const n of names) {
+        const name = `mcp__products__${n}`;
+        expect(allowed).toContain(name);
+        expect(relay).toContain(`Тебе доступен инструмент ${name}`);
+      }
+    } finally {
+      if (old === undefined) delete process.env.CHAT_UPLOADS_ENABLED;
+      else process.env.CHAT_UPLOADS_ENABLED = old;
+    }
+  });
+
+  // Те же две строки, что в описании инструмента (note-file.tool.ts): абзац
+  // про комментарии в PRODUCTS_PROMPT не должен им противоречить или молчать о них.
+  it('абзац про note_file в PRODUCTS_PROMPT: язык разговора и не переписывать без нового', () => {
+    const block = relay.slice(relay.indexOf('const PRODUCTS_PROMPT'), relay.indexOf('app.post("/chat"'));
+    expect(block).toContain('Пиши комментарий на языке разговора с пользователем');
+    expect(block).toContain('Если комментарий уже есть и ничего нового не решили — не переписывай его');
+  });
 });

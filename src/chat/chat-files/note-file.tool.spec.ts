@@ -1,5 +1,6 @@
 import { NOTE_FILE_TOOL, NOTE_FILE_TOOL_NAME } from './note-file.tool';
 import { UPLOAD_NOTE_MAX_CHARS } from '../chat-uploads/chat-uploads.service';
+import { FIND_FILES_CLI_TOOL_NAME, NOTE_FILE_CLI_PROMPT, NOTE_FILE_CLI_TOOL_NAME } from '../../products/products-cli-tool';
 
 describe('контракт note_file', () => {
   it('имя совпадает с тем, что разрешено релею и Маше (mcp__products__note_file)', () => {
@@ -51,5 +52,31 @@ describe('контракт note_file', () => {
     expect(NOTE_FILE_TOOL.description).toContain(
       'Если комментарий уже есть и ничего нового не решили — не переписывай его',
     );
+  });
+});
+
+describe('note_file у Маши (локальный CLI)', () => {
+  // CLI складывает имя как mcp__<ключ сервера>__<имя из контракта>. Разъедется —
+  // allowedTools не совпадёт, и вызов молча отклонится.
+  it('имя CLI складывается из ключа сервера products и имени из контракта', () => {
+    expect(NOTE_FILE_CLI_TOOL_NAME).toBe(`mcp__products__${NOTE_FILE_TOOL_NAME}`);
+    expect(NOTE_FILE_CLI_TOOL_NAME).toBe('mcp__products__note_file');
+  });
+
+  it('блок промпта: имя, откуда id, запрет userId и чувствительных данных; без релейной оговорки', () => {
+    expect(NOTE_FILE_CLI_PROMPT).toContain(NOTE_FILE_CLI_TOOL_NAME);
+    expect(NOTE_FILE_CLI_PROMPT).toContain(FIND_FILES_CLI_TOOL_NAME);
+    expect(NOTE_FILE_CLI_PROMPT).toContain('Earlier user uploads');
+    expect(NOTE_FILE_CLI_PROMPT).toMatch(/НЕ передавай[^\n]*userId/);
+    expect(NOTE_FILE_CLI_PROMPT).toMatch(/паролей, номеров документов/);
+    expect(NOTE_FILE_CLI_PROMPT).not.toMatch(/исключени/i);
+    expect(NOTE_FILE_CLI_PROMPT).not.toContain('mcp__linkeon__');
+  });
+
+  // Те же две строки, что в описании инструмента (см. выше): блок промпта
+  // Маши не должен им противоречить или молчать о них.
+  it('блок промпта: язык разговора и не переписывать комментарий без нового — как в описании инструмента', () => {
+    expect(NOTE_FILE_CLI_PROMPT).toContain('Пиши комментарий на языке разговора с пользователем');
+    expect(NOTE_FILE_CLI_PROMPT).toContain('Если комментарий уже есть и ничего нового не решили — не переписывай его');
   });
 });
