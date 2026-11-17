@@ -32,6 +32,7 @@ import { ChatUploadsService } from '../chat/chat-uploads/chat-uploads.service';
 import { errKind } from '../chat/chat-uploads/err-kind';
 import {
   ChatUploadSourceError,
+  VEO_SOURCE_IMAGE_MIMES,
   canonicalChatUploadUrl,
   chatUploadSourceId,
   readChatUploadImage,
@@ -44,6 +45,9 @@ import * as path from 'path';
 
 /** Предел одного референс-фото Veo — и для внешней ссылки, и для загрузки пользователя. */
 const VEO_PORTRAIT_MAX_BYTES = 12 * 1024 * 1024;
+
+/** Загрузка пользователя как портрет: предел и форматы Omni (png, jpeg, webp). */
+const VEO_UPLOAD_SOURCE = { maxBytes: VEO_PORTRAIT_MAX_BYTES, allowedMimes: VEO_SOURCE_IMAGE_MIMES };
 
 export class InsufficientTokensError extends Error {
   status = 402;
@@ -769,7 +773,7 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
   // мягкий: фото пропускается, как и раньше.
   private async fetchPortraitB64(url: string, userId: string): Promise<{ b64: string; mime: string } | null> {
     try {
-      const upload = await readChatUploadImage(this.chatUploads, { url, userId, maxBytes: VEO_PORTRAIT_MAX_BYTES });
+      const upload = await readChatUploadImage(this.chatUploads, { url, userId, ...VEO_UPLOAD_SOURCE });
       if (upload) return upload;
       const media = await fetchMediaBytes(url, { maxBytes: VEO_PORTRAIT_MAX_BYTES, timeoutMs: 30000, allowHttp: true });
       const mime = media.contentType || 'image/jpeg';
@@ -1046,11 +1050,12 @@ export class VideoService implements OnModuleInit, OnModuleDestroy {
     // молча — и человек заплатил бы за ролик без своего лица. Сетевые сбои
     // здесь не повод отказывать: фото пропустится, как и раньше.
     for (const u of refUrls) {
-      // Загрузка пользователя проверяется по реестру: владелец, image/*,
-      // размер. Чужая, удалённая или не картинка — 400 до списания. Сбой
-      // хранилища — как сетевой сбой: фото пропустится при скачивании.
+      // Загрузка пользователя проверяется по реестру: владелец, формат (png,
+      // jpeg, webp), размер. Чужая, удалённая или не картинка — 400 до
+      // списания. Сбой хранилища — как сетевой сбой: фото пропустится при
+      // скачивании.
       try {
-        if (await readChatUploadImage(this.chatUploads, { url: u, userId, maxBytes: VEO_PORTRAIT_MAX_BYTES })) continue;
+        if (await readChatUploadImage(this.chatUploads, { url: u, userId, ...VEO_UPLOAD_SOURCE })) continue;
       } catch (e: any) {
         if (e instanceof ChatUploadSourceError) throw new BadRequestException(`фото не принято: ${e.message}`);
         this.logger.warn(`Veo upload precheck failed: ${errKind(e)}`);

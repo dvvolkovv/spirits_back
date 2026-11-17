@@ -56,6 +56,30 @@ export function canonicalChatUploadUrl(id: string): string {
   return `${ownBaseUrl()}/webhook/chat-uploads/${id}`;
 }
 
+/**
+ * Форматы исходника правки картинок (Gemini, misc.service.ts) — те, что Gemini
+ * API называет для картинок на входе. GIF, BMP, TIFF и SVG сюда не входят.
+ */
+export const GEMINI_SOURCE_IMAGE_MIMES: readonly string[] = Object.freeze([
+  'image/png', 'image/jpeg', 'image/webp', 'image/heic', 'image/heif',
+]);
+
+/**
+ * Форматы портрета для видео (Gemini Omni, video.service.ts) — уже, чем у
+ * правки: для одного фото (image-to-video) Google называет только jpeg и png,
+ * для нескольких (reference-to-video) — ещё webp, heic и heif. Берём png, jpeg
+ * и webp: HEIC с айфона ролик без лица не оставит, а отказ скажет причину.
+ */
+export const VEO_SOURCE_IMAGE_MIMES: readonly string[] = Object.freeze([
+  'image/png', 'image/jpeg', 'image/webp',
+]);
+
+/** mime реестра без параметров и регистра; image/jpg — частое неканоническое имя jpeg. */
+function normalizeImageMime(raw: string): string {
+  const mime = String(raw ?? '').split(';')[0].trim().toLowerCase();
+  return mime === 'image/jpg' ? 'image/jpeg' : mime;
+}
+
 export type ChatUploadSourceErrorCode = 'not_found' | 'not_image' | 'too_large' | 'unavailable';
 
 /**
@@ -72,12 +96,13 @@ export class ChatUploadSourceError extends Error {
 /**
  * Картинка из загрузки пользователя. null — ссылка не на загрузку (или флаг
  * выключен): вызывающий идёт прежним путём fetchMediaBytes. Чужая или
- * удалённая загрузка, не image/* и больше maxBytes — ChatUploadSourceError.
- * Сбой хранилища пробрасывается как есть.
+ * удалённая загрузка, формат не из allowedMimes (у каждого потребителя свой:
+ * GEMINI_SOURCE_IMAGE_MIMES, VEO_SOURCE_IMAGE_MIMES) и больше maxBytes —
+ * ChatUploadSourceError. Сбой хранилища пробрасывается как есть.
  */
 export async function readChatUploadImage(
   uploads: Pick<ChatUploadsService, 'findOwnedOriginal'> | null | undefined,
-  input: { url: string; userId: string; maxBytes: number },
+  input: { url: string; userId: string; maxBytes: number; allowedMimes: readonly string[] },
 ): Promise<{ b64: string; mime: string } | null> {
   const id = chatUploadSourceId(input.url);
   if (!id) return null;
@@ -97,9 +122,13 @@ export async function readChatUploadImage(
   if (!found) {
     throw new ChatUploadSourceError('not_found', 'загрузка пользователя не найдена: её удалили или она недоступна');
   }
-  const mime = found.record.mime.split(';')[0].trim().toLowerCase();
-  if (!mime.startsWith('image/')) {
-    throw new ChatUploadSourceError('not_image', 'загрузка пользователя — не картинка: исходником могут быть только изображения');
+  const mime = normalizeImageMime(found.record.mime);
+  if (!input.allowedMimes.includes(mime)) {
+    const formats = input.allowedMimes.map((m) => m.replace(/^image\//, '')).join(', ');
+    throw new ChatUploadSourceError(
+      'not_image',
+      `загрузка пользователя — не картинка в подходящем формате (подходят: ${formats})`,
+    );
   }
   return { b64: found.body.toString('base64'), mime };
 }

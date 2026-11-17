@@ -14,7 +14,7 @@ import { neutralizeAtMentions, stripWordJoiner } from '../common/agent-guards';
 import { renderBannerOverlay, BannerPosition, BannerTheme } from './banner-overlay';
 import { fetchMediaBytes, ownStaticPath } from '../common/net/own-media';
 import { ChatUploadsService } from '../chat/chat-uploads/chat-uploads.service';
-import { readChatUploadImage } from '../chat/chat-uploads/upload-image-source';
+import { GEMINI_SOURCE_IMAGE_MIMES, readChatUploadImage } from '../chat/chat-uploads/upload-image-source';
 import { DeletionCancelledError } from '../account-deletion/account-deletion.safe';
 import {
   SelectedProfile,
@@ -982,8 +982,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
    *
    * Загрузка пользователя (относительная или на нашем домене, с подписью или
    * без) читается из приватного бакета, а не по HTTP: только владельцем хода
-   * (userId), только image/*, тот же предел. Чужая, удалённая или не картинка —
-   * ошибка с причиной (upload-image-source.ts).
+   * (userId), только форматы Gemini (png, jpeg, webp, heic, heif), тот же
+   * предел. Чужая, удалённая или не картинка — ошибка с причиной
+   * (upload-image-source.ts).
    */
   private async fetchImageAsBase64(srcUrl: string, userId: string): Promise<{ b64: string; mime: string }> {
     if (srcUrl.startsWith('data:')) {
@@ -992,7 +993,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
       return { mime: m[1], b64: m[2] };
     }
 
-    const upload = await readChatUploadImage(this.chatUploads, { url: srcUrl, userId, maxBytes: IMAGE_SOURCE_MAX_BYTES });
+    const upload = await readChatUploadImage(this.chatUploads, {
+      url: srcUrl, userId, maxBytes: IMAGE_SOURCE_MAX_BYTES, allowedMimes: GEMINI_SOURCE_IMAGE_MIMES,
+    });
     if (upload) return upload;
 
     const media = await fetchMediaBytes(srcUrl, { maxBytes: IMAGE_SOURCE_MAX_BYTES, timeoutMs: 30000, allowHttp: true });
