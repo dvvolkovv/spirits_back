@@ -47,8 +47,10 @@ export const DELETION_DISCOVERERS: readonly DeletionDiscoverer[] = [
   discoverChatUploads,
   discoverImageDeletion,
   // Видео-бакет (MINIO_BUCKET_VIDEOS) — два места. video-job.purge: по строке
-  // video_jobs — videos/<jobId>.mp4|jpg, own-ключи из колонок строки,
-  // локальные public/videos/<jobId>.* и _veoconcat/<jobId>. K4
+  // video_jobs — videos/<jobId>.mp4|jpg и из колонок строки только ключи
+  // белого списка (K4b: свои video-uploads/<userId>/…; чужое — пропуск с
+  // журналом), локальные public/videos/<jobId>.* и _veoconcat/<jobId> —
+  // только из id строки. K4
   // video-upload.purge: весь каталог личных загрузок video-uploads/<userId>/
   // (листинг с пагинацией) — фото без строки (не дошли до задачи, стёрты
   // cleanupOldFailedJobs, 2-е/3-е референс-фото Veo в composed_plan). Одна

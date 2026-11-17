@@ -1,9 +1,10 @@
-import { Injectable, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { AccountDeletionRegistry } from '../account-deletion/account-deletion.registry';
 import {
   DeletionCancelledError,
   DeletionRetryError,
   deletionErrorKind,
+  safeDeletionMessage,
 } from '../account-deletion/account-deletion.safe';
 import type {
   AccountDeletionAdapter,
@@ -16,6 +17,7 @@ import type {
   DeletionSkip,
 } from '../account-deletion/account-deletion.types';
 import { VideoService } from './video.service';
+import type { VideoPurgeSkips } from './video.service';
 
 /**
  * Task 12 — video_jobs при удалении аккаунта.
@@ -40,6 +42,11 @@ import { VideoService } from './video.service';
  * composed_plan). Одна задача на аккаунт (discoverVideoUploadsDeletion),
  * обход каталога владельца при исполнении — VideoService
  * .deleteVideoUploadsForDeletion.
+ *
+ * K4b — video-job.purge удаляет из MinIO только белый список: производные
+ * videos/<jobId>.mp4|jpg и личные загрузки владельца video-uploads/<userId>/.
+ * Ссылку строки на прочий объект своего бакета (чужая загрузка, shorts/…)
+ * purge пропускает без ошибки и пишет в журнал вид и счётчик (logSkipped).
  */
 
 /** Сколько строк video_jobs читать за один запрос discovery. */
@@ -128,6 +135,8 @@ export async function discoverVideoUploadsDeletion(ctx: DeletionDiscovery): Prom
 
 @Injectable()
 export class VideoAccountDeletionAdapter implements OnModuleInit, AccountDeletionAdapter {
+  private readonly logger = new Logger(VideoAccountDeletionAdapter.name);
+
   readonly resourceTypes: readonly DeletionResourceType[] = [
     'video-job.purge',
     'video-upload.purge',
@@ -161,7 +170,12 @@ export class VideoAccountDeletionAdapter implements OnModuleInit, AccountDeletio
 
     await ctx.assertCurrent(job);
     try {
-      await this.video.deleteVideoForDeletion(job.userId, videoJobId, job.deletionId);
+      await this.video.deleteVideoForDeletion(
+        job.userId,
+        videoJobId,
+        job.deletionId,
+        (skips) => this.logSkipped(job, skips),
+      );
     } catch (error) {
       if (error instanceof DeletionCancelledError) throw error;
       if (error instanceof DeletionRetryError) throw error;
@@ -170,6 +184,31 @@ export class VideoAccountDeletionAdapter implements OnModuleInit, AccountDeletio
     // Внешние операции (MinIO/fs) могли занять время: перед тем как считать
     // job выполненным, поколение и lease перепроверяются.
     await ctx.assertCurrent(job);
+  }
+
+  /**
+   * K4b: ссылки строки на объекты вне белого списка не удалены сознательно.
+   * В журнал — вид пропуска и счётчик плюс safe-форма раннера
+   * (safeDeletionMessage: без userId, ключа и адреса), чтобы оператор видел,
+   * что purge оставил чужое не по сбою.
+   */
+  private logSkipped(job: DeletionJobRow, skips: VideoPurgeSkips): void {
+    const count = (n: number) => (Number.isInteger(n) && n >= 0 ? n : 0);
+    let message = `video-job.purge kept objects not owned by the job`
+      + ` not_owned=${count(skips.notOwned)} unsafe_key=${count(skips.unsafeKey)}`;
+    try {
+      message += ` ${safeDeletionMessage({
+        deletionId: job.deletionId,
+        resourceType: job.resourceType,
+        resourceKey: job.resourceKey,
+        attempts: job.attempts,
+        kind: 'owner_unverifiable',
+        userId: job.userId,
+      })}`;
+    } catch {
+      // Sanitizer не принял поля строки — остаются только счётчики.
+    }
+    this.logger.warn(message);
   }
 
   /**
