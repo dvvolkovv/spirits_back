@@ -40,7 +40,7 @@ import { productActionTail, stripProductActionBlocks } from '../products/product
 import { ChatFileStore, PERSIST_TURN_BUDGET_MS } from './chat-files/chat-file-store';
 import { RelayOutputFile, collectOutputFiles, outputFileLines, storeRelayLinks } from './chat-files/relay-links';
 import { ChatUploadsService } from './chat-uploads/chat-uploads.service';
-import { errKind, logId } from './chat-uploads/err-kind';
+import { errKind } from './chat-uploads/err-kind';
 import { BalanceContextService } from '../tokens/balance-context.service';
 import { BusinessProfileService } from '../business-profile/business-profile.service';
 import { CostGrowthService } from '../cost-growth/cost-growth.service';
@@ -1053,9 +1053,10 @@ export class ChatService {
    *
    * Флаг CHAT_UPLOADS_ENABLED выключен или реестра нет — пустая строка; сбой
    * БД или подписи логируется и тоже даёт пустую строку: ход не должен падать
-   * из-за памятки о файлах. В журнал — только ключ сессии в кавычках и вид
-   * ошибки (err-kind.ts): текст ошибки pg может повторять данные запроса,
-   * userId уже внутри ключа. Подписанные ссылки в лог не пишутся.
+   * из-за памятки о файлах. В журнал — только вид ошибки (err-kind.ts):
+   * текст ошибки pg может повторять данные запроса, а ключ сессии содержит
+   * userId — у телефонных аккаунтов это номер телефона. Подписанные ссылки
+   * в лог не пишутся.
    */
   private async uploadContextBlock(
     userId: string,
@@ -1067,7 +1068,7 @@ export class ChatService {
       const records = await this.chatUploads.recentForSession(userId, rawSessionId, excludeIds || []);
       return this.chatUploads.assistantBlock(records);
     } catch (e: any) {
-      this.logger.warn(`upload context failed (session ${logId(rawSessionId)}): ${errKind(e)}`);
+      this.logger.warn(`upload context failed: ${errKind(e)}`);
       return '';
     }
   }
