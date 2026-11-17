@@ -4,6 +4,11 @@
 // увидела латинскую мешанину и сказала человеку, что у файлов битые имена.
 // busboy по умолчанию читает filename как latin1; бэк (form-data) и браузеры
 // шлют его в UTF-8. Тест гоняет настоящий multipart-запрос через multer.
+//
+// Нужен multer 2.x из node_modules самого relay-agent: в 1.x (его тянет бэк,
+// @nestjs/platform-express) настройки defParamCharset нет. В клоне без своих
+// node_modules у relay-agent импорт уходит в корневой multer 1.x, и тесты имён
+// краснеют не из-за кода — об этом говорит первый тест.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -11,7 +16,22 @@ import os from "node:os";
 import path from "node:path";
 import express from "express";
 import multer from "multer";
+import { createRequire } from "node:module";
 import { uploadOptions } from "./upload-options.mjs";
+
+function multerVersion() {
+  // Корень пакета — каталог его main (index.js), выше по дереву не ходим.
+  const dir = path.dirname(createRequire(import.meta.url).resolve("multer"));
+  return JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")).version;
+}
+
+test("multer — 2.x: в 1.x нет defParamCharset", () => {
+  const v = multerVersion();
+  assert.ok(
+    Number(v.split(".")[0]) >= 2,
+    `подхватился multer ${v}: у relay-agent нет своих node_modules? Поставьте их (npm ci в relay-agent)`,
+  );
+});
 
 async function namesAfterUpload(names) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-upload-names-"));
