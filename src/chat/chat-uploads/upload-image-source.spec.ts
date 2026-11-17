@@ -1,6 +1,6 @@
 import { ChatUploadTooLargeError } from './chat-uploads.service';
 import {
-  ChatUploadSourceError, GEMINI_SOURCE_IMAGE_MIMES, VEO_SOURCE_IMAGE_MIMES,
+  ChatUploadSourceError, ChatUploadStorageError, GEMINI_SOURCE_IMAGE_MIMES, VEO_SOURCE_IMAGE_MIMES,
   canonicalChatUploadUrl, chatUploadIdFromUrl, chatUploadSourceId, readChatUploadImage,
 } from './upload-image-source';
 
@@ -118,10 +118,24 @@ describe('readChatUploadImage', () => {
     expect(err.message).toMatch(/больше 8 МБ/);
   });
 
-  it('сбой хранилища пробрасывается как есть', async () => {
-    const boom = new Error('minio down');
-    const uploads = { findOwnedOriginal: jest.fn(async () => { throw boom; }) };
-    await expect(readChatUploadImage(uploads, { url: `/webhook/chat-uploads/${ID}`, userId: 'u-1', ...GEM })).rejects.toBe(boom);
+  it('сбой хранилища — ChatUploadStorageError: только вид ошибки, без текста S3 с ключом и именем', async () => {
+    const s3 = Object.assign(new Error(`The specified key does not exist: ${ID}/гостиная.jpg`), {
+      name: 'NoSuchKey', $metadata: { httpStatusCode: 404 },
+    });
+    const uploads = { findOwnedOriginal: jest.fn(async () => { throw s3; }) };
+    const err = await readChatUploadImage(uploads, { url: `/webhook/chat-uploads/${ID}`, userId: 'u-1', ...GEM }).catch((e) => e);
+    expect(err).toBeInstanceOf(ChatUploadStorageError);
+    expect(err).not.toBeInstanceOf(ChatUploadSourceError);
+    expect(err.message).toBe('хранилище загрузок не ответило (NoSuchKey status=404)');
+    expect(err.message).not.toMatch(/гостиная|7777|specified key/);
+  });
+
+  it('сбой реестра (pg) — тоже ChatUploadStorageError с видом и кодом', async () => {
+    const pgErr = Object.assign(new Error('connection terminated: password authentication failed for user'), { code: 'ECONNRESET' });
+    const uploads = { findOwnedOriginal: jest.fn(async () => { throw pgErr; }) };
+    const err = await readChatUploadImage(uploads, { url: `/webhook/chat-uploads/${ID}`, userId: 'u-1', ...GEM }).catch((e) => e);
+    expect(err).toBeInstanceOf(ChatUploadStorageError);
+    expect(err.message).toBe('хранилище загрузок не ответило (Error code=ECONNRESET)');
   });
 
   it('image/jpg — неканоническое имя jpeg: принимается как image/jpeg', async () => {

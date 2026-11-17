@@ -169,6 +169,20 @@ describe('правка картинок: исходник — загрузка �
     expect((post.mock.calls[1][1] as any).contents[0].parts[1].inlineData.mimeType).toBe('image/jpeg');
   });
 
+  it('сбой хранилища — ошибка без текста S3: ни ключа, ни имени файла; Gemini и списания нет', async () => {
+    const post = jest.spyOn(axios, 'post');
+    const { svc, pg, uploadStorage } = makeService();
+    uploadStorage.download.mockRejectedValue(Object.assign(
+      new Error(`The specified key does not exist: ${OWN}/room.png`),
+      { name: 'NoSuchKey', $metadata: { httpStatusCode: 404 } },
+    ));
+    const err = await svc.editImage('u-1', { prompt: 'p', sourceImageUrl: `/webhook/chat-uploads/${OWN}` }).catch((e) => e);
+    expect(err.message).toBe('хранилище загрузок не ответило (NoSuchKey status=404)');
+    expect(err.message).not.toMatch(/room\.png|specified key/);
+    expect(post).not.toHaveBeenCalled();
+    expect(charged(pg)).toBe(false);
+  });
+
   it('больше 8 МБ — отказ без скачивания', async () => {
     const post = jest.spyOn(axios, 'post');
     const { svc, uploadStorage } = makeService();

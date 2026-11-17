@@ -140,10 +140,18 @@ describe('Veo: портрет из загрузки пользователя', (
 
   it('сбой хранилища на проверке — не отказ: фото пропускается, как при сетевом сбое', async () => {
     const { svc, veo, uploadStorage } = makeService();
-    uploadStorage.download.mockRejectedValue(new Error('minio down'));
+    uploadStorage.download.mockRejectedValue(Object.assign(
+      new Error(`The specified key does not exist: ${OWN}/face.jpg`),
+      { name: 'NoSuchKey', $metadata: { httpStatusCode: 404 } },
+    ));
     const r = await svc.createJob('u-1', { ...DTO, sourceImageUrl: `/webhook/chat-uploads/${OWN}` } as any);
     expect(r.status).toBe('processing');
     expect(veo.startGenerate).toHaveBeenCalledWith(expect.objectContaining({ referenceImagesB64: [] }));
+    // В журнал — вид ошибки, без текста S3 с ключом и именем файла.
+    const warns = ((svc as any).logger.warn as jest.Mock).mock.calls.map((c) => String(c[0]));
+    expect(warns.length).toBeGreaterThan(0);
+    expect(warns.join('\n')).toContain('хранилище загрузок не ответило (NoSuchKey status=404)');
+    expect(warns.join('\n')).not.toMatch(/face\.jpg|specified key/);
   });
 
   it('перезапуск сегмента читает фото по владельцу задачи, без подписи', async () => {
