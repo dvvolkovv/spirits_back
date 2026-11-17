@@ -4,7 +4,9 @@ import {
   Delete,
   Get,
   HttpCode,
+  InternalServerErrorException,
   Logger,
+  NotFoundException,
   Param,
   Req,
   Res,
@@ -15,6 +17,7 @@ import { JwtService } from '../../common/services/jwt.service';
 import { contentDispositionFor } from '../chat-files/file-meta';
 import { ChatUploadDeleteError, ChatUploadsService } from './chat-uploads.service';
 import type { ChatUploadDownload } from './chat-uploads.service';
+import { errKind, logId } from './err-kind';
 
 /**
  * Приватные загрузки пользователя.
@@ -54,7 +57,7 @@ export class ChatUploadsController {
     res.setHeader('Cache-Control', 'private, no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Content-Disposition', contentDispositionFor(file.originalName));
-    this.streamTo(`download ${id}`, file, res);
+    this.streamTo(`download (id=${logId(id)})`, file, res);
   }
 
   @Get(':id/thumb')
@@ -69,7 +72,7 @@ export class ChatUploadsController {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     // inline: панель кладёт ответ в <img> через blob, а не скачивает файл.
     res.setHeader('Content-Disposition', 'inline');
-    this.streamTo(`thumb ${id}`, file, res);
+    this.streamTo(`thumb (id=${logId(id)})`, file, res);
   }
 
   @Delete(':id')
@@ -80,12 +83,17 @@ export class ChatUploadsController {
     try {
       await this.uploads.deleteForOwner({ id, userId });
     } catch (e) {
+      if (e instanceof NotFoundException) throw e;
       // MinIO не подтвердил удаление: строка цела, повтор безопасен. 502, а не
       // 404 — фронт должен показать «не удалось удалить», а не «файла нет».
       if (e instanceof ChatUploadDeleteError) {
         throw new BadGatewayException('Upload storage unavailable');
       }
-      throw e;
+      // Прочее (pg и т. п.) — 500, но журнал свой: сообщение pg/S3 может
+      // повторять ключ `<uuid>/<имя файла>`, а ExceptionsHandler Nest написал
+      // бы его вместе со стеком. HttpException он не журналирует.
+      this.logger.error(`delete (id=${logId(id)}): internal failure: ${errKind(e)}`);
+      throw new InternalServerErrorException();
     }
   }
 
@@ -107,12 +115,18 @@ export class ChatUploadsController {
   }
 
   private streamTo(label: string, file: ChatUploadDownload, res: Response): void {
+    // Клиент ушёл, пока сервис ходил в MinIO: 'close' ответа уже был и больше
+    // не придёт, а pipe в уничтоженный ответ стрим источника не закроет —
+    // сокет GetObject висел бы до серверного таймаута.
+    if (res.destroyed || res.writableEnded) {
+      file.body.destroy();
+      return;
+    }
     // Ошибка потока после начала ответа (MinIO оборвал соединение) не должна
-    // вешать процесс: уничтожаем ответ и логируем вид ошибки, без байтов.
+    // вешать процесс: уничтожаем ответ и логируем только вид ошибки — текст
+    // сообщения S3 может повторять ключ объекта с именем файла.
     file.body.on('error', (e: any) => {
-      this.logger.error(
-        `${label}: stream failed: ${e?.name || 'Error'}: ${String(e?.message ?? '').slice(0, 200)}`,
-      );
+      this.logger.error(`${label}: stream failed: ${errKind(e)}`);
       res.destroy();
     });
     // Обрыв клиента: pipe делает только unpipe, а S3-стрим (HTTP-ответ

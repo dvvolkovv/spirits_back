@@ -10,6 +10,7 @@ import { safeFileName } from '../chat-files/file-meta';
 // внедрил бы LanguageService (пин — chat-uploads.delete.spec.ts).
 import { LanguageService } from '../../common/services/language.service';
 import { deletedUploadLine } from './deleted-line';
+import { errKind, logId } from './err-kind';
 import { uploadHistoryLink } from './markdown-name';
 import {
   UPLOAD_THUMB_CALL_BUDGET_MS,
@@ -337,11 +338,11 @@ export class ChatUploadsService {
         sizeBytes: record.sizeBytes,
       };
     } catch (e: any) {
-      const id = this.logId(input.id);
+      const id = logId(input.id);
       if (e instanceof NotFoundException) {
         this.logger.debug(`openDownload: not found (id=${id})`);
       } else {
-        this.logger.error(`openDownload: internal failure (id=${id}): ${this.errKind(e)}`);
+        this.logger.error(`openDownload: internal failure (id=${id}): ${errKind(e)}`);
       }
       throw new NotFoundException('Upload not found');
     }
@@ -367,11 +368,11 @@ export class ChatUploadsService {
         sizeBytes: bytes.length,
       };
     } catch (e: any) {
-      const id = this.logId(input.id);
+      const id = logId(input.id);
       if (e instanceof NotFoundException) {
         this.logger.debug(`openThumb: not found (id=${id})`);
       } else {
-        this.logger.error(`openThumb: internal failure (id=${id}): ${this.errKind(e)}`);
+        this.logger.error(`openThumb: internal failure (id=${id}): ${errKind(e)}`);
       }
       throw new NotFoundException('Upload not found');
     }
@@ -401,7 +402,7 @@ export class ChatUploadsService {
       try {
         await this.storage.deleteConfirmed({ bucket: BUCKET, key });
       } catch (e: any) {
-        this.logger.error(`deleteForOwner: storage delete failed (id=${record.id}): ${this.errKind(e)}`);
+        this.logger.error(`deleteForOwner: storage delete failed (id=${record.id}): ${errKind(e)}`);
         throw new ChatUploadDeleteError();
       }
     }
@@ -420,7 +421,7 @@ export class ChatUploadsService {
         deletedUploadLine(record.originalName, lang),
       ]);
     } catch (e: any) {
-      this.logger.error(`deleteForOwner: history rewrite failed (id=${record.id}): ${this.errKind(e)}`);
+      this.logger.error(`deleteForOwner: history rewrite failed (id=${record.id}): ${errKind(e)}`);
     }
   }
 
@@ -493,28 +494,6 @@ export class ChatUploadsService {
     const name = e?.name || 'Error';
     const message = typeof e?.message === 'string' ? e.message : '';
     return `${name}: ${message}`.slice(0, 300);
-  }
-
-  /**
-   * Только вид ошибки, без текста сообщения: ключ объекта — это
-   * `<uuid>/<safeFileName(имя)>`, и сообщения S3/pg могут повторять его или
-   * имя файла. name, HTTP-статус S3 ($metadata.httpStatusCode) и код
-   * (SQLSTATE pg или системный вроде ETIMEDOUT) — каждое лишь из безопасных
-   * символов, перевод строки запись не подделает.
-   */
-  private errKind(e: any): string {
-    const name = String(e?.name || 'Error').replace(/[^\w.-]/g, '').slice(0, 64) || 'Error';
-    const parts = [name];
-    const status = e?.$metadata?.httpStatusCode;
-    if (Number.isInteger(status)) parts.push(`status=${status}`);
-    const code = e?.code;
-    if (typeof code === 'string' && /^[A-Z0-9_]{1,32}$/.test(code)) parts.push(`code=${code}`);
-    return parts.join(' ');
-  }
-
-  /** id из запроса для журнала: в кавычках и экранирован — перевод строки не подделает запись. */
-  private logId(id: unknown): string {
-    return JSON.stringify(String(id).slice(0, 64));
   }
 
   private row(row: any): ChatUploadRecord {
