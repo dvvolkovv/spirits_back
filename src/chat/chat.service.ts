@@ -3802,7 +3802,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
   }
 
   // Лента одна (spec 2026-11-17-context-reset): история — всегда основной
-  // сессии; отдельные fresh-ленты остались только у пингов мониторинга.
+  // сессии `<userId>_<assistantId>`. Fresh-сессии этот метод не читает: новые
+  // пишут только пинги мониторинга (probe), старые листы людей переносит в
+  // основную ленту разовый SQL (задача 10).
   async getChatHistory(userId: string, assistantId: string, limit = 30, offset = 0): Promise<{ messages: any[]; hasMore: boolean }> {
     const sessionId = `${userId}_${assistantId}`;
     const res = await this.pg.query(

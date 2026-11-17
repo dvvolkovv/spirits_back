@@ -61,8 +61,10 @@ function chatUploadsSaveBudgetMs(): number {
  * Адрес ассистента для точки «Чистого листа» — в той форме, в какой его шлёт
  * чат: id штатного ассистента числом или пользовательский `custom:<uuid>`
  * (AssistantSelection.tsx, ChatService.resolveAgent). Иное — не та пара.
+ * Без флага /i: resolveAgent сверяет префикс 'custom:' с учётом регистра, а
+ * uuid из Postgres строчный — так его и шлёт фронт.
  */
-const RESET_ASSISTANT_RE = /^(\d{1,12}|custom:[0-9a-fA-F-]{36})$/;
+const RESET_ASSISTANT_RE = /^(\d{1,12}|custom:[0-9a-f-]{36})$/;
 
 /**
  * Предупреждение об отвергнутой метке старого клиента — не чаще раза в час на

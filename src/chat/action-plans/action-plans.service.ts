@@ -120,7 +120,9 @@ export class ActionPlansService implements OnModuleInit {
     let resetAt: Date | null = null;
     try {
       resetAt = this.contextResets ? await this.contextResets.get(userId, assistantId) : null;
-    } catch {
+    } catch (error: any) {
+      // Без текста разговора: только пара и причина.
+      this.logger.warn(`context reset read failed (${userId}_${assistantId}): ${error?.message}`);
       resetAt = null;
     }
     const messages = afterReset(history.messages, resetAt, (message: any) => message?.timestamp)
