@@ -2,12 +2,14 @@ import 'reflect-metadata';
 import * as http from 'http';
 import { createHmac } from 'crypto';
 import { PassThrough, Readable } from 'stream';
+import * as jsonwebtoken from 'jsonwebtoken';
 import { INestApplication, Logger, Module, NotFoundException } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { ChatUploadsController } from './chat-uploads.controller';
 import { ChatUploadsService } from './chat-uploads.service';
 import { JwtService } from '../../common/services/jwt.service';
 import { contentDispositionFor } from '../chat-files/file-meta';
+import { signProductToolToken } from '../../products/product-tool.token';
 
 /**
  * Приватное скачивание исходников. HTTP-прогон по образцу
@@ -128,10 +130,82 @@ describe('ChatUploadsController (HTTP)', () => {
     );
   });
 
-  it('невалидный Bearer — анонимный запрос (404), а не 500', async () => {
+  it('невалидный Bearer с подписью — анонимный запрос, решает подпись (404), а не 500', async () => {
     // verifyAccess бросает на мусоре: контроллер обязан считать такой запрос
     // анонимным и отдать решение подписи, а не ронять ответ.
-    expect((await get(base, { authorization: 'Bearer not-a-jwt' })).status).toBe(404);
+    expect((await get(`${base}?exp=1&sig=bad`, { authorization: 'Bearer not-a-jwt' })).status).toBe(404);
+  });
+
+  /**
+   * Без подписи доступ даёт только access-токен владельца. Нет его, истёк,
+   * refresh-токен, мусор или токен инструмента продуктов — 401, как у thumb и
+   * DELETE: apiClient фронта на 401 обновит токен и повторит запрос, а на 404
+   * показал бы «файла нет». Сервис не вызывается — 401 зависит только от
+   * авторизации, не от id, и о существовании записи ничего не говорит.
+   */
+  describe('без подписи и без валидного access-токена — 401', () => {
+    const expiredBearer = () => {
+      const now = Math.floor(Date.now() / 1000);
+      const token = jsonwebtoken.sign(
+        { sub: 'u1', userId: 'u1', type: 'access', iat: now - 120, exp: now - 10 },
+        SECRET,
+      );
+      return `Bearer ${token}`;
+    };
+
+    it('нет Authorization — 401, сервис не вызывается', async () => {
+      expect((await get(base)).status).toBe(401);
+      expect(openDownload).not.toHaveBeenCalled();
+    });
+
+    it('истёкший access-токен владельца — 401 (фронт обновит токен), сервис не вызывается', async () => {
+      expect((await get(base, { authorization: expiredBearer() })).status).toBe(401);
+      expect(openDownload).not.toHaveBeenCalled();
+    });
+
+    it('refresh-токен, мусор в Bearer и токен продуктов — 401, сервис не вызывается', async () => {
+      expect((await get(base, { authorization: `Bearer ${jwtService.signRefresh('u1')}` })).status).toBe(401);
+      expect((await get(base, { authorization: 'Bearer not-a-jwt' })).status).toBe(401);
+      expect((await get(base, { authorization: `Bearer ${signProductToolToken('u1')}` })).status).toBe(401);
+      expect(openDownload).not.toHaveBeenCalled();
+    });
+
+    it('exp без sig подписью не считается — 401', async () => {
+      const exp = Math.floor(Date.now() / 1000) + 600;
+      expect((await get(`${base}?exp=${exp}`)).status).toBe(401);
+      expect((await get(`${base}?exp=${exp}&sig=`)).status).toBe(401);
+      expect(openDownload).not.toHaveBeenCalled();
+    });
+
+    it('401 не зависит от id: несуществующая запись без токена — тот же 401', async () => {
+      const missing = base.replace(RECORD_ID, '99999999-9999-4999-8999-999999999999');
+      expect((await get(missing)).status).toBe(401);
+      expect((await get(missing, { authorization: expiredBearer() })).status).toBe(401);
+      expect(openDownload).not.toHaveBeenCalled();
+    });
+  });
+
+  it('валидный access, чужой или несуществующий id — 404 от сервиса, как раньше', async () => {
+    const missingId = '99999999-9999-4999-8999-999999999999';
+    openDownload.mockImplementationOnce(() => Promise.reject(new NotFoundException('Upload not found')));
+    const res = await get(base.replace(RECORD_ID, missingId), {
+      authorization: `Bearer ${jwtService.signAccess('u1')}`,
+    });
+    expect(res.status).toBe(404);
+    expect(openDownload).toHaveBeenLastCalledWith(expect.objectContaining({ id: missingId, userId: 'u1' }));
+  });
+
+  it('с подписью истёкший токен не мешает: решает подпись — верная 200, неверная 404', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const expired = jsonwebtoken.sign(
+      { sub: 'u1', userId: 'u1', type: 'access', iat: now - 120, exp: now - 10 },
+      SECRET,
+    );
+    const exp = now + 600;
+    const sig = signature(RECORD_ID, exp);
+    expect((await get(`${base}?exp=${exp}&sig=${sig}`, { authorization: `Bearer ${expired}` })).status).toBe(200);
+    expect((await get(`${base}?exp=${exp}&sig=bad`, { authorization: `Bearer ${expired}` })).status).toBe(404);
+    expect(openDownload).toHaveBeenCalledTimes(2);
   });
 
   it('подпись ассистента без JWT открывает файл, exp/sig доходят до сервиса', async () => {
