@@ -144,6 +144,66 @@ describe('ChatUploadsService.setNote: комментарий ассистент�
       expect(pg.query.mock.calls[0][1]![2]).toBe('счётgpj.exe имя  👩\u200D💻');
     });
 
+    /**
+     * Невидимые символы формата (\p{Cf}) — кроме ZWJ, который склеивает
+     * эмодзи: теги U+E0000–E007F прячут в комментарии текст, который модель
+     * прочтёт, а человек не увидит; ZWSP, LRM/RLM, WJ, BOM и якоря
+     * аннотаций U+FFF9–FFFB — невидимый мусор. Строим их из кодов, чтобы в
+     * исходнике не было ни одного сырого невидимого символа.
+     */
+    const ZWJ = String.fromCodePoint(0x200d);
+    const FAMILY = String.fromCodePoint(0x1f468, 0x200d, 0x1f469, 0x200d, 0x1f467);
+    const TAGS = String.fromCodePoint(0xe0001, 0xe0020, 0xe0041, 0xe0062, 0xe007e, 0xe007f);
+    const INVISIBLE = String.fromCodePoint(
+      0x200b, // ZWSP
+      0x200e, // LRM
+      0x200f, // RLM
+      0x2060, // WJ
+      0x2061,
+      0x2062,
+      0x2063,
+      0x2064,
+      0xfeff, // BOM
+      0xfff9,
+      0xfffa,
+      0xfffb,
+    );
+    const cfLeft = (text: string) => Array.from(text).filter((ch) => /\p{Cf}/u.test(ch) && ch !== ZWJ);
+
+    it('невидимые символы формата вырезаются: теги, ZWSP, LRM/RLM, WJ, BOM, U+FFF9; ZWJ в эмодзи остаётся', async () => {
+      pg.query.mockResolvedValueOnce({ rows: [savedRow('x', '3')] });
+      await service.setNote({
+        id: ID,
+        userId: 'owner1',
+        note: `до${TAGS}по${INVISIBLE}сле ${FAMILY}${TAGS}`,
+        assistantId: '3',
+      });
+      const saved = pg.query.mock.calls[0][1]![2] as string;
+      expect(saved).toBe(`допосле ${FAMILY}`);
+      expect(cfLeft(saved)).toEqual([]);
+      expect(saved).toContain(ZWJ);
+    });
+
+    it('строка из одних невидимых символов формата — BadRequest, в базу не ходим', async () => {
+      for (const note of [TAGS, INVISIBLE, ` ${TAGS}\n${INVISIBLE} `]) {
+        await expect(service.setNote({ id: ID, userId: 'owner1', note, assistantId: '3' }))
+          .rejects.toBeInstanceOf(BadRequestException);
+      }
+      expect(pg.query).not.toHaveBeenCalled();
+    });
+
+    it('длина считается после чистки: 500 букв и невидимые символы формата — можно', async () => {
+      const fiveHundred = 'я'.repeat(500);
+      pg.query.mockResolvedValueOnce({ rows: [savedRow(fiveHundred, '3')] });
+      await service.setNote({
+        id: ID,
+        userId: 'owner1',
+        note: `${TAGS}${fiveHundred.slice(0, 250)}${INVISIBLE}${fiveHundred.slice(250)}${TAGS}`,
+        assistantId: '3',
+      });
+      expect(pg.query.mock.calls[0][1]![2]).toBe(fiveHundred);
+    });
+
     it('CRLF и одиночный CR становятся LF, строки не склеиваются', async () => {
       pg.query.mockResolvedValueOnce({ rows: [savedRow('x', '3')] });
       await service.setNote({

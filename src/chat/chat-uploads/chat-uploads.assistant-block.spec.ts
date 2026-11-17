@@ -193,6 +193,21 @@ describe('assistantBlock: строка файла с id, видом, датой 
     expect(block).toContain('- id=99999999-9999-4999-8999-99999999999a | file.bin | document | 2026-11-15 | комментарий: нет — оставь его через note_file после работы с файлом\n');
   });
 
+  // Строка в обход setNote может нести и невидимые символы формата: теги
+  // U+E0000–E007F (скрытый для человека текст), ZWSP, BOM, U+FFF9. На выводе
+  // их нет; ZWJ внутри эмодзи остаётся.
+  it('комментарий чистится и на выводе: без тегов и прочих невидимых символов формата', () => {
+    const tags = String.fromCodePoint(0xe0001, 0xe0049, 0xe0067, 0xe007f);
+    const family = String.fromCodePoint(0x1f468, 0x200d, 0x1f469, 0x200d, 0x1f467);
+    const invisible = String.fromCodePoint(0x200b, 0x200e, 0x2060, 0xfeff, 0xfff9);
+    const block = service.assistantBlock([
+      record({ id: '99999999-9999-4999-8999-99999999999c', note: `до${tags}по${invisible}сле ${family}` }),
+      record({ id: '99999999-9999-4999-8999-99999999999d', note: `${tags}${invisible}` }),
+    ]);
+    expect(block).toContain(`- id=99999999-9999-4999-8999-99999999999c | file.bin | document | 2026-11-15 | комментарий: допосле ${family}\n`);
+    expect(block).toContain('- id=99999999-9999-4999-8999-99999999999d | file.bin | document | 2026-11-15 | комментарий: нет — оставь его через note_file после работы с файлом\n');
+  });
+
   // Имя — из multipart: «|» в нём подделал бы поля строки (вид, дата,
   // комментарий). В выводе имени он заменяется на «¦»; в комментарии —
   // последнем поле — остаётся как есть.
