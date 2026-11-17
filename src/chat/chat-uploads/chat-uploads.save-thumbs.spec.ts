@@ -216,10 +216,13 @@ describe('ChatUploadsService.saveOriginals: источник и миниатюр
     ]);
   });
 
-  it('сбой записи и уборки: имя файла в журнале экранировано и в этих строках', async () => {
+  it('сбой записи и уборки: в журнале только вид ошибки — без имени файла, текста ошибки и сессии', async () => {
     const name = 'отчёт"\nFAKE: подделка.pdf';
-    pg.query.mockRejectedValueOnce(new Error('db down'));
-    storage.delete.mockRejectedValueOnce(new Error('minio down'));
+    // Сообщения pg и S3 повторяют имя файла и ключ объекта — их в журнал нельзя.
+    const insertError = Object.assign(new Error('insert failed: отчёт подделка.pdf in u1_12'), { code: '23505' });
+    const cleanupError = Object.assign(new Error('DeleteObject denied for подделка.pdf'), { name: 'AccessDenied' });
+    pg.query.mockRejectedValueOnce(insertError);
+    storage.delete.mockRejectedValueOnce(cleanupError);
 
     const result = await service.saveOriginals({
       userId: 'u1',
@@ -228,11 +231,14 @@ describe('ChatUploadsService.saveOriginals: источник и миниатюр
     });
 
     expect(result.failed).toEqual([name]);
-    // «failed to persist» и «best-effort cleanup delete failed».
-    expect(warn).toHaveBeenCalledTimes(2);
-    for (const [line] of warn.mock.calls) {
-      expect(String(line)).not.toContain('\n');
-      expect(String(line)).toContain(JSON.stringify(name));
+    // Строки и их префиксы стабильны — по ним грепают журнал.
+    expect(warn.mock.calls.map(([line]) => String(line))).toEqual([
+      'saveOriginals: failed to persist file: Error code=23505',
+      'saveOriginals: best-effort cleanup delete failed: AccessDenied',
+    ]);
+    const logged = JSON.stringify(warn.mock.calls);
+    for (const leak of ['отчёт', 'подделка', 'FAKE', 'insert failed', 'DeleteObject', 'u1_12']) {
+      expect(logged).not.toContain(leak);
     }
   });
 
