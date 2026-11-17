@@ -475,6 +475,37 @@ maybe('VoiceCallService.complete после удаления аккаунта п
     expect(billing).toEqual([{ user_id: USER, status: 'pending' }]);
   });
 
+  // K1b (ревью K1): для удалённого аккаунта строка «кончился» не должна
+  // появляться — звонок не завершён записью; а след расходов (стоимость и
+  // длительность) остаётся в warn, пока учёт удалённым не пишется. Без PII.
+  it('удалённый аккаунт: «кончился» не пишется, warn несёт стоимость и длительность без идентификатора', async () => {
+    const id = await seed('deleted', 'interrupted');
+    const { svc } = makeSvc();
+    const log = jest.spyOn((svc as any).logger, 'log').mockImplementation(() => undefined);
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+
+    await svc.complete(id, payload);
+
+    const logged = log.mock.calls.map((c) => String(c[0]));
+    expect(logged.filter((m) => /кончился/.test(m))).toEqual([]);
+    const warned = warn.mock.calls.map((c) => String(c[0])).filter((m) => /аккаунт неактивен/.test(m));
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toMatch(/cost=\$\d+\.\d{4}/);
+    expect(warned[0]).toMatch(/\b\d+s\b/);
+    expect(warned[0]).not.toContain(USER);
+  });
+
+  it('активный аккаунт: «кончился» пишется как раньше', async () => {
+    const id = await seed('active', 'active');
+    const { svc } = makeSvc();
+    const log = jest.spyOn((svc as any).logger, 'log').mockImplementation(() => undefined);
+
+    await svc.complete(id, payload);
+    await waitIssued(/INSERT INTO custom_chat_history/);
+
+    expect(log.mock.calls.map((c) => String(c[0])).filter((m) => /кончился/.test(m))).toHaveLength(1);
+  });
+
   // K1b: воркер сбрасывает растущий транскрипт через progress() ~раз в 15 с,
   // и после voice.stop (status 'interrupted') условие status <> 'completed'
   // его пропускало — разговор удалённого продолжал дописываться в строку.
