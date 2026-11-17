@@ -2462,6 +2462,18 @@ ${LanguageService.buildDirective(userLanguage)}`;
       // Исключение — поток, упавший после done (см. у decideBilling): там в
       // `end` ушёл 0, а здесь оборванный ход спишется.
       const billing = decideBilling();
+      // Расход — turnCharge, как у индикатора (оборванный ход — по видимому
+      // тексту модели). Текст обычного хода здесь — очищенный fullText, у
+      // индикатора — сырой chunks.join(''): давнее различие, оставлено как есть.
+      // Считается здесь, до chat_quality: partial_billed берёт ту же сумму, что
+      // уходит в списание ниже.
+      const charge = turnCharge(billing, fullText);
+      // Решение владельца 17.11.2026: оборванный ход, после которого человек
+      // что-то получил, списывается по фактическому расходу — billing[partial:…].
+      // Сбой без ответа не выставляется. Расход перед Anthropic всё равно
+      // понесён, поэтому пишем его в лог явно: иначе «бесплатные» ходы станут
+      // невидимой статьёй затрат.
+      const textCost = billing.billable ? charge.tokens : 0;
       if (final) {
         // Quality-телеметрия: пустой ответ / англ-утечка / объём — для агрегатов
         // и алертов регрессии (инициатива «гарантия качества», беклог a867ef3b).
@@ -2482,8 +2494,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
             failed: turnFailed,
             fail_reason: failReason || undefined,
             // Оборванный ход, списанный за пришедшее (partial-billing.ts): для
-            // мониторинга он по-прежнему failed, а списание видно здесь.
-            partial_billed: billing.partial ? true : undefined,
+            // мониторинга он по-прежнему failed, а списание видно здесь. Флаг —
+            // «действительно списано»: при нулевой сумме (одни файлы, а в done ни
+            // usage, ни стоимости) строки списания нет — нет и флага.
+            partial_billed: billing.partial && textCost > 0 ? true : undefined,
             relay_refusal: relayRefusal,
             provider: turnProvider,
             fallback: turnFallback || undefined,
@@ -2509,17 +2523,8 @@ ${LanguageService.buildDirective(userLanguage)}`;
         : fullText || (final && !selfHealSkippedForTakeover ? chatFailureText('noReply', userLanguage, { storeBuild }) : '');
       if (!aiText) return; // skip empty intermediate persists
       // ЭТО реальная точка списания (ниже addTokenTask). Логируем только здесь:
-      // путь показа считает то же самое, дублировать в лог незачем.
-      // Расход — turnCharge, как у индикатора (оборванный ход — по видимому
-      // тексту модели). Текст обычного хода здесь — очищенный fullText, у
-      // индикатора — сырой chunks.join(''): давнее различие, оставлено как есть.
-      const charge = turnCharge(billing, fullText);
-      // Решение владельца 17.11.2026: оборванный ход, после которого человек
-      // что-то получил, списывается по фактическому расходу — billing[partial:…].
-      // Сбой без ответа не выставляется. Расход перед Anthropic всё равно
-      // понесён, поэтому пишем его в лог явно: иначе «бесплатные» ходы станут
-      // невидимой статьёй затрат.
-      const textCost = billing.billable ? charge.tokens : 0;
+      // путь показа считает то же самое, дублировать в лог незачем. Сумма —
+      // charge/textCost выше, до chat_quality.
       const logLine = !billing.billable
         ? `billing[skipped:${cliRefusal ? 'cli_fatal_text' : failReason}]: ход без финального ответа — не тарифицирован, ` +
           `иначе списали бы ${charge.tokens} (${charge.note})`
