@@ -12,6 +12,8 @@ import {
   discoverVideoUploadsDeletion,
   VideoAccountDeletionAdapter,
 } from './video-account-deletion.adapter';
+import { canonicalChatUploadUrl, chatUploadIdFromUrl } from '../chat/chat-uploads/upload-image-source';
+import { ownBaseUrl } from '../common/net/own-media';
 
 /**
  * Task 12 против живого Postgres: discovery SQL (keyset по uuid + generation
@@ -227,6 +229,83 @@ maybe('video-job.purge против живого Postgres (Task 12)', () => {
     expect(storageLog.map((c) => c.key).sort()).toEqual([`videos/${jobId}.jpg`, `videos/${jobId}.mp4`]);
     const rows = await pool.query('SELECT id FROM video_jobs WHERE id=$1', [jobId]);
     expect(rows.rows).toHaveLength(0);
+  });
+
+  // Загрузка чата как портрет (main b100708d): в source_image_url задачи лежит
+  // <сайт>/webhook/chat-uploads/<uuid> — адрес загрузки, а не ключ бакета
+  // видео. Её объект стирает chat-upload.purge; video-job.purge не удаляет
+  // его, не считает пропуском и не ходит ни в чужой бакет, ни в сервис
+  // загрузок, ни в S3 мимо StorageService — при любом MINIO_PUBLIC_URL,
+  // включая голый домен сайта.
+  it.each([
+    ['<сайт>/smm-media', (site: string) => `${site}/smm-media`],
+    ['голый домен сайта', (site: string) => site],
+  ])('загрузка чата в source_image_url (MINIO_PUBLIC_URL = %s) — не цель purge видео', async (_label, minioBase) => {
+    const uploadId = '33333333-3333-4333-8333-333333333333';
+    const uploadUrl = canonicalChatUploadUrl(uploadId);
+    expect(uploadUrl).toBe(`${ownBaseUrl()}/webhook/chat-uploads/${uploadId}`);
+    // Фикстура — настоящий адрес загрузки, как его распознаёт видео-сервис.
+    expect(chatUploadIdFromUrl(uploadUrl)).toBe(uploadId);
+
+    const prevMinio = process.env.MINIO_PUBLIC_URL;
+    process.env.MINIO_PUBLIC_URL = minioBase(ownBaseUrl());
+    try {
+      const jobId = randomUUID();
+      await insertJob({
+        id: jobId,
+        thumbnail_url: `${process.env.MINIO_PUBLIC_URL}/linkeon-smm-videos/videos/${jobId}.jpg`,
+        source_image_url: uploadUrl,
+      });
+
+      const storageLog: Array<{ bucket: string; key: string }> = [];
+      const storageCalls: string[] = [];
+      const storage = new Proxy({}, {
+        get: (_t, prop) => (prop === 'then' ? undefined : (input: { bucket: string; key: string }) => {
+          storageCalls.push(String(prop));
+          if (prop !== 'deleteConfirmed') throw new Error(`storage.${String(prop)} не ожидался`);
+          storageLog.push(input);
+          return Promise.resolve('deleted' as const);
+        }),
+      });
+      const chatUploadsCalls: string[] = [];
+      const chatUploads = new Proxy({}, {
+        get: (_t, prop) => (prop === 'then' ? undefined : () => {
+          chatUploadsCalls.push(String(prop));
+          throw new Error(`chatUploads.${String(prop)} не ожидался`);
+        }),
+      });
+      const pgDuck = {
+        query: (sql: string, params?: any[]) => pool.query(sql, params),
+        getClient: () => pool.connect(),
+      };
+      const svc = new VideoService(
+        pgDuck as any,
+        { isConfigured: () => false } as any,
+        {} as any,
+        undefined,
+        storage as any,
+        chatUploads as any,
+      );
+      const s3Send = jest.spyOn((svc as any).s3, 'send').mockImplementation(async () => {
+        throw new Error('S3 мимо StorageService не ожидался');
+      });
+      const onSkipped = jest.fn();
+
+      await svc.deleteVideoForDeletion(USER, jobId, DELETION_ID, onSkipped);
+
+      expect(storageCalls.every((m) => m === 'deleteConfirmed')).toBe(true);
+      expect([...storageLog].sort((a, b) => a.key.localeCompare(b.key))).toEqual([
+        { bucket: 'linkeon-smm-videos', key: `videos/${jobId}.jpg` },
+        { bucket: 'linkeon-smm-videos', key: `videos/${jobId}.mp4` },
+      ]);
+      expect(onSkipped).not.toHaveBeenCalled();
+      expect(chatUploadsCalls).toEqual([]);
+      expect(s3Send).not.toHaveBeenCalled();
+      const rows = await pool.query('SELECT id FROM video_jobs WHERE id=$1', [jobId]);
+      expect(rows.rows).toHaveLength(0);
+    } finally {
+      process.env.MINIO_PUBLIC_URL = prevMinio;
+    }
   });
 
   it('повторный вызов после purge — success (идемпотентность)', async () => {
