@@ -44,12 +44,21 @@ function request(method: string, url: string, headers: Record<string, string> = 
       let text = '';
       res.setEncoding('utf8');
       res.on('data', (chunk) => (text += chunk));
-      res.on('end', () => resolve({
-        status: res.statusCode || 0,
-        headers: res.headers,
-        text,
-        body: text ? JSON.parse(text) : null,
-      }));
+      res.on('error', reject);
+      res.on('end', () => {
+        // Не-JSON тело — понятное падение теста, а не исключение в обработчике
+        // 'end' (промис не завершился бы, тест висел бы до таймаута).
+        let body: any = null;
+        try {
+          body = text ? JSON.parse(text) : null;
+        } catch {
+          reject(new Error(
+            `non-JSON response ${res.statusCode} ${res.headers['content-type'] ?? ''}: ${text.slice(0, 200)}`,
+          ));
+          return;
+        }
+        resolve({ status: res.statusCode || 0, headers: res.headers, text, body });
+      });
     });
     req.on('error', reject);
     req.end();
@@ -158,6 +167,21 @@ describe('DELETE /webhook/profile (HTTP, T18-M3)', () => {
 
     expect(res.status).toBe(401);
     expect(deleteExplicit).not.toHaveBeenCalled();
+  });
+
+  it('хелпер запроса: не-JSON ответ — понятный отказ, а не зависание до таймаута', async () => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(502, { 'content-type': 'text/html' });
+      res.end('<html>bad gateway</html>');
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const { port } = server.address() as { port: number };
+      await expect(request('GET', `http://127.0.0.1:${port}/`))
+        .rejects.toThrow(/^non-JSON response 502 text\/html: <html>bad gateway<\/html>$/);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 
   it('refresh-токен вместо access — 401, lifecycle не вызывается', async () => {

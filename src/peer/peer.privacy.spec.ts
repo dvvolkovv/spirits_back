@@ -16,7 +16,7 @@ const dto = { toUserId: TO, introMessage: 'hello' };
 // T17B-M3: active-гейт обязан фильтровать по состоянию. Фейк принимает SQL
 // гейта только вместе с state = 'active': потеря условия (удалённый аккаунт
 // проходит гейт) роняет тесты, а не получает тихий ответ «активен».
-const ACTIVE_GATE_RE = /\bFROM user_id WHERE internal_id\s*=\s*\$1\s+AND\s+state\s*=\s*'active'/;
+const ACTIVE_GATE_RE = /\bFROM\s+user_id\s+WHERE\s+internal_id\s*=\s*\$1\s+AND\s+state\s*=\s*'active'/;
 
 function makeAllowedService(options: {
   targetExists?: boolean;

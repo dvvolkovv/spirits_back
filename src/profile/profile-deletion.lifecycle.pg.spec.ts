@@ -711,9 +711,13 @@ maybe('explicit deletion lifecycle against PostgreSQL (Task 18)', () => {
         ? makeStack([stopDiscoverer, brokenDiscoverer])
         : makeStack([stopDiscoverer], persistFailsMidway);
 
-      // Ложного success нет: deleteProfile отказывает. Тип отказа (сырая
-      // ошибка или 503) здесь не закрепляется — только откат.
-      await expect(profile.deleteProfile(USER)).rejects.toBeInstanceOf(Error);
+      // Ложного success нет. Текущий контракт: begin вне try deleteExplicit,
+      // поэтому ошибка планировщика всплывает как есть (не 503) — тот самый
+      // отказ точки сбоя, без обёртки.
+      const failure = await profile.deleteProfile(USER).catch((e) => e);
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).not.toBeInstanceOf(ServiceUnavailableException);
+      expect(failure.message).toBe(stage === 'collect' ? 'discoverer_failed' : 'persist_failed');
       // Отказ — из нашей точки сбоя, а не из чего-то раньше неё.
       if (stage === 'collect') {
         expect(brokenDiscoverer).toHaveBeenCalledTimes(1);
@@ -765,7 +769,10 @@ maybe('explicit deletion lifecycle against PostgreSQL (Task 18)', () => {
 
     brokenDiscoverer.mockClear();
     const second = makeStack([stopDiscoverer, brokenDiscoverer]);
-    await expect(second.profile.deleteProfile(USER)).rejects.toBeInstanceOf(Error);
+    const failure = await second.profile.deleteProfile(USER).catch((e) => e);
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(ServiceUnavailableException);
+    expect(failure.message).toBe('discoverer_failed');
     expect(brokenDiscoverer).toHaveBeenCalledTimes(1);
 
     const u2 = await userRow(USER);

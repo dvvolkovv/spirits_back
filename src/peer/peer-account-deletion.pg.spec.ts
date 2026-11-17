@@ -521,6 +521,17 @@ maybe('peer account deletion against PostgreSQL (Task 17B)', () => {
   const failurePoints = Array.from({ length: PURGE_STATEMENTS }, (_, i) => i + 1)
     .flatMap((failAt) => (['before', 'after'] as const).map((mode) => ({ failAt, mode })));
 
+  it('purge без сбоя делает ровно PURGE_STATEMENTS запросов — новый запрос не останется без точки сбоя', async () => {
+    await seedRichPeerHistory();
+    // failAt за пределами прогона: ни один запрос не роняется, только счёт.
+    const counting = failingCtx(Number.MAX_SAFE_INTEGER, 'before');
+
+    await adapter.execute(jobRow('peer.purge'), counting.ctx);
+
+    expect(counting.calls()).toBe(PURGE_STATEMENTS);
+    expect(counting.executed()).toHaveLength(PURGE_STATEMENTS);
+  });
+
   it.each(failurePoints)(
     'частичный сбой purge на запросе $failAt ($mode): retry сходится к итогу чистого прогона без дублей',
     async ({ failAt, mode }) => {

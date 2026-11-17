@@ -15,10 +15,10 @@ const readBatch = (jest.requireMock('../privacy/profile-privacy') as any).readPr
 // T17B-M3: active-гейт createRequest обязан фильтровать по состоянию. Фейк
 // принимает SQL гейта только вместе с state = 'active': потеря условия
 // (удалённый аккаунт проходит гейт) роняет тесты, а не получает ответ «активен».
-const ACTIVE_GATE_RE = /\bFROM user_id WHERE internal_id\s*=\s*\$1\s+AND\s+state\s*=\s*'active'/;
+const ACTIVE_GATE_RE = /\bFROM\s+user_id\s+WHERE\s+internal_id\s*=\s*\$1\s+AND\s+state\s*=\s*'active'/;
 // K6: getPublicProfile проверяет, не удалён ли владелец профиля (телефон
 // удалённого не выдаётся). В этих тестах владелец не удалён — 0 строк.
-const DELETED_OWNER_RE = /\bFROM user_id WHERE internal_id\s*=\s*\$1\s+AND\s+state\s*=\s*'deleted'/;
+const DELETED_OWNER_RE = /\bFROM\s+user_id\s+WHERE\s+internal_id\s*=\s*\$1\s+AND\s+state\s*=\s*'deleted'/;
 
 function access(overrides: Record<string, any> = {}) {
   return {
