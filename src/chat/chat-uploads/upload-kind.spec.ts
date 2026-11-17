@@ -23,6 +23,14 @@ describe('uploadKind', () => {
     expect(uploadKind({ mime: 'application/octet-stream', originalName: 'voice.m4a' })).toBe('audio');
   });
 
+  it('расширение берётся от очищенного имени (safeFileName) — как ext в панели', () => {
+    // Пробелы по краям: панель покажет «фото.jpg» с ext=jpg — и вид обязан быть image.
+    expect(uploadKind({ mime: 'application/octet-stream', originalName: 'фото.jpg  ' })).toBe('image');
+    // Невидимый RLO в хвосте имени safeFileName тоже снимает.
+    const RLO = String.fromCodePoint(0x202e);
+    expect(uploadKind({ mime: '', originalName: `clip.mp4${RLO}` })).toBe('video');
+  });
+
   it('всё прочее — document', () => {
     expect(uploadKind({ mime: 'application/pdf', originalName: 'договор.pdf' })).toBe('document');
     expect(uploadKind({ mime: 'application/zip', originalName: 'архив.zip' })).toBe('document');
