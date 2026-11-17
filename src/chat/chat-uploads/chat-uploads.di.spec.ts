@@ -94,18 +94,6 @@ describe('DI-граф загрузок чата', () => {
     expect(find(container, ChatUploadsService)).toBeInstanceOf(ChatUploadsService);
   });
 
-  // Точка «Чистого листа» (spec 2026-11-17-context-reset) у ChatService и
-  // ChatController — @Optional: забытый импорт ContextResetModule старт не
-  // уронит, а молча оставит прод без точки. Один экземпляр на граф — тот же,
-  // что читает ChatService и пишет контроллер.
-  it('AppModule: ChatService и ChatController получают сервис точки «Чистого листа»', async () => {
-    const container = await appGraph();
-    const resets = find(container, ChatContextResetService);
-    expect(resets).toBeInstanceOf(ChatContextResetService);
-    expect((find(container, ChatService) as { contextResets?: unknown }).contextResets).toBe(resets);
-    expect((find(container, ChatController) as { contextResets?: unknown }).contextResets).toBe(resets);
-  });
-
   // Негативный контроль: проверка не резиновая — голый модуль с одним
   // адаптером (без CommonModule/AccountDeletionModule) рвёт граф ровно той
   // ошибкой, которую ловят пины выше.
@@ -116,5 +104,23 @@ describe('DI-граф загрузок чата', () => {
     await expect(buildGraph(BareAdapterModule)).rejects.toThrow(
       /ChatUploadAccountDeletionAdapter/,
     );
+  });
+});
+
+/**
+ * Точка «Чистого листа» (spec 2026-11-17-context-reset) у ChatService и
+ * ChatController — @Optional: забытый импорт ContextResetModule в ChatModule
+ * старт не уронит, а молча оставит прод без точки. Один экземпляр на граф —
+ * тот же, что пишет контроллер и читает ChatService. Граф AppModule — общий
+ * с проверкой загрузок выше (appGraph), второй раз не строится. Пины
+ * метаданных — в chat.controller.context-reset.spec.ts.
+ */
+describe('«Чистый лист»: один сервис точки у ChatService и ChatController', () => {
+  it('AppModule: оба получают один и тот же ChatContextResetService', async () => {
+    const container = await appGraph();
+    const resets = find(container, ChatContextResetService);
+    expect(resets).toBeInstanceOf(ChatContextResetService);
+    expect((find(container, ChatService) as { contextResets?: unknown }).contextResets).toBe(resets);
+    expect((find(container, ChatController) as { contextResets?: unknown }).contextResets).toBe(resets);
   });
 });

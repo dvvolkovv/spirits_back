@@ -259,6 +259,35 @@ describe('uploadAndChat: файл уходит в сессию разговор�
     expect(fields.sessionId).toBe(relaySessionKey('u1', 'Роман', 'ru', undefined, new Date(ts)));
   });
 
+  it('чистый лист старого клиента при нулевом балансе: точка ставится и до шлагбаума — как в текстовом ходе', async () => {
+    // В chat() точка ставится до streamChat, а шлагбаум нуля — внутри него.
+    // Загрузка обязана вести себя так же: иначе тот же старый клиент получал
+    // бы точку на тексте и не получал бы на файле.
+    const ts = Date.now() - 1000;
+    const resets = {
+      get: jest.fn(async () => null),
+      reset: jest.fn(async (_u: string, _a: string, when?: Date) => when ?? new Date()),
+    };
+    const pg = makePg();
+    const base = pg.query.getMockImplementation()!;
+    pg.query.mockImplementation(async (sql: string, params: any[] = []) =>
+      /SELECT tokens FROM ai_profiles_consolidated/.test(sql) ? { rows: [{ tokens: 0 }] } : base(sql, params));
+    const svc = makeService(pg);
+    const jwtSvc = { verify: jest.fn(() => ({ type: 'access', userId: 'u1' })) };
+    const ctrl = new ChatController(svc, jwtSvc as any, undefined as any, undefined);
+    (ctrl as any).contextResets = resets;
+    const post = jest.fn();
+    (axios as any).default = { post };
+    (axios as any).post = post;
+    const res = makeRes();
+
+    await ctrl.uploadAndChat(makeReq({ fresh: 'true', freshTs: String(ts) }), res);
+
+    expect(resets.reset).toHaveBeenCalledWith('u1', '12', new Date(ts));
+    expect(post).not.toHaveBeenCalled();
+    expect(res.written.find((w: any) => w.type === 'end')?.reason).toBe('no_tokens');
+  });
+
   it('везёт персону ассистента: иначе на файл ответит generic-агент релея', async () => {
     // Релей всегда передаёт --system-prompt, подставляя свой «universal agent»,
     // когда поля нет. При общей сессии это подменяло бы Романа на каждом ходе
