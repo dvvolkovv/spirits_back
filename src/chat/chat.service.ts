@@ -595,8 +595,12 @@ export class ChatService {
     return best ? best.id : null;
   }
 
-  private dupKey(userId: string, assistantId: string, message: string): string {
-    return `${userId}::${assistantId}::${(message || '').trim().slice(0, 300)}`;
+  // Точка «Чистого листа» — часть ключа: человек нажал «Чистый лист» и в
+  // пределах окна дедупа повторил тот же вопрос, чтобы спросить заново без
+  // старого контекста. Без точки в ключе он получил бы «уже ответил выше», а
+  // тот ответ — над чертой, из прошлого разговора.
+  private dupKey(userId: string, assistantId: string, message: string, resetAt?: Date | null): string {
+    return `${userId}::${assistantId}::${resetAt?.getTime() ?? ''}::${(message || '').trim().slice(0, 300)}`;
   }
 
   constructor(
@@ -1751,8 +1755,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
             masha,
             { balance: () => this.getTokenBalance(userId) },
           );
-          // Extract profile entities from conversation — работает и в fresh-режиме:
-          // «чистый лист» не тянет прошлый контекст, но профиль формирует.
+          // Extract profile entities from conversation — всегда, и у пинга (fresh)
+          // тоже. Ход после точки «Чистого листа» — обычный разговор: профиль,
+          // задачи и бизнес-карточка из него извлекаются как обычно.
           if (this.neo4j) {
             await this.neo4j.consolidateFromChat(userId, String(assistantId), message, fullText);
           }
@@ -1868,15 +1873,16 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // Сборка из стора — для справки и карты (см. streamChat, client-kind.ts).
     storeBuild: boolean = false,
     // Точка «Чистого листа» — собрана в streamChat (spec 2026-11-17-context-reset).
-    contextResetAt: Date | null = null,
+    resetAt: Date | null = null,
     // Момент хода — для created_at задач, извлечённых из него в фоне (см. streamChat).
     turnAt: Date = new Date(),
   ): Promise<void> {
     const AGENT_URL = process.env.AGENT_URL || 'https://r.linkeon.io';
 
     // Идемпотентность: если идентичный запрос уже «в полёте» или только что
-    // завершился — не гоняем агента и не списываем токены второй раз.
-    const dkey = this.dupKey(userId, assistantId, message);
+    // завершился — не гоняем агента и не списываем токены второй раз. Повтор
+    // после новой точки «Чистого листа» — не дубль (см. dupKey).
+    const dkey = this.dupKey(userId, assistantId, message, resetAt);
     {
       const nowTs = Date.now();
       const ex = this.inflight.get(dkey);
@@ -1993,7 +1999,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
       const rawSessionId = fresh && freshSessionId
         ? freshSessionId
         : `${userId}_${assistantId}`;
-      uploadContext = await this.uploadContextBlock(userId, rawSessionId, undefined, contextResetAt);
+      uploadContext = await this.uploadContextBlock(userId, rawSessionId, undefined, resetAt);
     }
 
     // Текущее время ГЛАЗАМИ ПОЛЬЗОВАТЕЛЯ. Без этого модель считает время по UTC
@@ -2041,7 +2047,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // после точки «Чистого листа» — только задачи, созданные после неё.
     if (this.tasksService && !fresh) {
       try {
-        const tasksCtx = await this.tasksService.buildContextForPrompt(userId, message, { since: contextResetAt });
+        const tasksCtx = await this.tasksService.buildContextForPrompt(userId, message, { since: resetAt });
         if (tasksCtx) contextPrefix += tasksCtx + '\n';
       } catch (e: any) {
         this.logger.warn(`tasks context injection failed: ${e?.message}`);
@@ -2068,7 +2074,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // Приписка гостевой пробы старше любой точки «Чистого листа» (проба — до
     // входа) — после точки её не тянем и не стираем.
     let guestCarryConsumed = false;
-    if (this.redis && !fresh && !probe && !contextResetAt) {
+    if (this.redis && !fresh && !probe && !resetAt) {
       const carry = await withTimeout(
         peekGuestCarry(this.redis, userId, assistantId),
         GUEST_CARRY_READ_TIMEOUT_MS,
@@ -2093,7 +2099,7 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // Отдельный no-profiling ключ не даёт возобновить контекст, где профиль уже
     // был; при повторном разрешении исходная сессия остаётся доступной.
     const baseRelaySid = relaySessionKey(
-      userId, assistantId, userLanguage, fresh ? freshSessionId : undefined, contextResetAt,
+      userId, assistantId, userLanguage, fresh ? freshSessionId : undefined, resetAt,
     );
     let relaySid = relaySessionForProfiling(
       baseRelaySid,
@@ -2391,8 +2397,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
               { balance: () => this.getTokenBalance(userId) },
             );
           }
-          // Профиль формируется и в fresh-режиме (чистый лист скрывает контекст,
-          // но не отключает обучение профиля).
+          // Профиль формируется всегда, и у пинга (fresh) тоже. Ход после точки
+          // «Чистого листа» — обычный разговор: точка скрывает от ассистента
+          // старый контекст, но не выключает обучение профиля и разбор задач.
           if (this.neo4j) {
             try { await this.neo4j.consolidateFromChat(userId, assistantId, message, fullText); } catch {}
           }
@@ -2467,10 +2474,11 @@ ${LanguageService.buildDirective(userLanguage)}`;
         // представляться Claude.
         if (attempt.systemPrompt) fd.append('systemPrompt', attempt.systemPrompt);
         if (historyBlock) fd.append('history', historyBlock);
-        // fresh: relay (r.linkeon.io) держит СВОЮ память по sessionId и резюмит
-        // Claude-сессию — обычный id протаскивал прошлый контекст (задачи,
-        // разговоры) в «чистый лист» мимо наших блокировок. Fresh-сессия
-        // получает на relay собственную чистую память.
+        // relay (r.linkeon.io) держит СВОЮ память по sessionId и резюмит
+        // Claude-сессию — прежний id протащил бы прошлый разговор мимо любых
+        // наших фильтров. Поэтому чистую память после точки «Чистого листа»
+        // даёт метка точки в ключе релея (relay-session.ts), а у пинга
+        // мониторинга (fresh) — своя одноразовая сессия.
         // Язык — часть ключа сессии.
         //
         // Релей резюмит Claude-сессию по sessionId и тащит в неё весь прежний
@@ -3740,8 +3748,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
     durationMs: number;
     turnFailed?: boolean;
     failReason?: string;
-    // «Чистый лист»: ход с файлом обязан лечь в ту же историю, что и текстовый,
-    // иначе в fresh-чате его видно не будет, а всплывёт он в основном.
+    // Сессия истории вместо `${userId}_${assistantId}`. Осталась от прежнего
+    // «Чистого листа» с отдельной fresh-сессией; теперь лента одна (spec
+    // 2026-11-17-context-reset), и после задачи 5 контроллер это поле не
+    // передаёт. Удалить вместе с последним вызывающим.
     sessionIdOverride?: string;
   }): Promise<number> {
     let text = p.assistantMsg;
