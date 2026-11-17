@@ -217,19 +217,19 @@ export class ChatUploadsService {
         );
         result.saved.push(this.row(rows[0]));
       } catch (e: any) {
-        this.logger.warn(
-          `saveOriginals: failed to persist file ${this.logName(file.originalname)}: ${this.errDetail(e)}`,
-        );
+        // Только вид ошибки (errKind): имя файла — пользовательские данные, а
+        // сообщения pg/S3 повторяют его и ключ объекта. id загрузки здесь ещё
+        // нет (строка не записана), ключ сессии содержит номер телефона.
+        // Префикс строки стабилен — по нему грепают журнал.
+        this.logger.warn(`saveOriginals: failed to persist file: ${errKind(e)}`);
         // Best-effort cleanup: оригинал и (если успела лечь) миниатюра —
         // строки нет, значит и объектов без неё оставлять незачем.
         for (const key of thumbKey ? [storageKey, thumbKey] : [storageKey]) {
           try {
             await this.storage.delete({ bucket: BUCKET, key });
           } catch (cleanupError: any) {
-            // Best-effort cleanup: the original upload failure is reported by name.
-            this.logger.warn(
-              `saveOriginals: best-effort cleanup delete failed for ${this.logName(file.originalname)}: ${this.errDetail(cleanupError)}`,
-            );
+            // Сам сбой сохранения уже записан строкой выше; здесь — тоже только вид.
+            this.logger.warn(`saveOriginals: best-effort cleanup delete failed: ${errKind(cleanupError)}`);
           }
         }
         result.failed.push(file.originalname);
