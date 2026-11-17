@@ -412,6 +412,9 @@ maybe('explicit deletion lifecycle against PostgreSQL (Task 18)', () => {
 
     // action_plans — настоящая миграция модуля.
     await pool.query(readFileSync('src/chat/action-plans/migrations/001_action_plans.sql', 'utf8'));
+    // chat_context_resets — настоящая миграция модуля: core стирает и точки
+    // «Чистого листа», без таблицы finalize упал бы на DELETE.
+    await pool.query(readFileSync('src/chat/context-reset/migrations/001_chat_context_resets.sql', 'utf8'));
 
     // tg_user_identities — дословно 001_tg_bot_schema.sql (только эта таблица).
     await pool.query(`
@@ -436,6 +439,7 @@ maybe('explicit deletion lifecycle against PostgreSQL (Task 18)', () => {
   beforeEach(async () => {
     await pool.query(
       `TRUNCATE account_deletion_jobs, custom_chat_history, action_plans,
+                chat_context_resets,
                 ai_profiles_consolidated, user_identities, tg_user_identities,
                 user_id`,
     );

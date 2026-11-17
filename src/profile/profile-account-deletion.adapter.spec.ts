@@ -59,10 +59,11 @@ function norm(sql: string): string {
   return sql.replace(/\s+/g, ' ').trim();
 }
 
-/** Метки шести выражений deleteOwnedCoreRows — порядок фиксирует план. */
+/** Метки семи выражений deleteOwnedCoreRows — порядок фиксирует план. */
 const DELETE_MARKERS: Array<[RegExp, string]> = [
   [/^DELETE FROM custom_chat_history/, 'delete:history'],
   [/^DELETE FROM action_plans/, 'delete:plans'],
+  [/^DELETE FROM chat_context_resets/, 'delete:context-resets'],
   [/^UPDATE ai_profiles_consolidated SET profile_data = '\{\}'/, 'clear:profile'],
   [/^DELETE FROM user_identities/, 'delete:identities'],
   [/^DELETE FROM tg_user_identities/, 'delete:tg'],
@@ -127,7 +128,7 @@ afterAll(() => {
 });
 
 describe('ProfileAccountDeletionAdapter.execute — порядок и fencing (Task 17)', () => {
-  it('порядок шагов: fences → recapture → blockers → graph → одна tx (lock + 6 fenced-выражений)', async () => {
+  it('порядок шагов: fences → recapture → blockers → graph → одна tx (lock + 7 fenced-выражений)', async () => {
     const f = makeOrderFakes();
 
     await f.adapter.execute(coreJob(), f.ctx);
@@ -136,7 +137,7 @@ describe('ProfileAccountDeletionAdapter.execute — порядок и fencing (T
       'assertCurrent', 'recapture', 'blockers', 'assertCurrent',
       'graph', 'assertCurrent',
       'getClient', 'BEGIN', 'lock',
-      'delete:history', 'delete:plans', 'clear:profile',
+      'delete:history', 'delete:plans', 'delete:context-resets', 'clear:profile',
       'delete:identities', 'delete:tg', 'tombstone:user_id',
       'COMMIT', 'release',
     ]);
@@ -146,13 +147,17 @@ describe('ProfileAccountDeletionAdapter.execute — порядок и fencing (T
     for (const q of f.txQueries) {
       expect(q.params).toEqual([USER, DELETION_ID]);
     }
-    for (const q of f.txQueries.slice(0, 5)) {
+    // Все, кроме tombstone: у него своё условие на поколение (проверено ниже).
+    for (const q of f.txQueries.slice(0, -1)) {
       expect(q.sql).toContain(
         `EXISTS (SELECT 1 FROM user_id WHERE internal_id = $1 AND state = 'deleted' AND deletion_id = $2)`,
       );
     }
     // История — по escaped session prefix: `_` в шаблоне обязан быть экранирован.
     expect(f.txQueries[0].sql).toContain(String.raw`session_id LIKE $1 || '\_%' ESCAPE '\'`);
+    // Точки «Чистого листа» — по точному user_id, без шаблонов.
+    const resets = f.txQueries.find((q) => q.sql.startsWith('DELETE FROM chat_context_resets'));
+    expect(resets?.sql).toContain('WHERE user_id = $1 AND');
   });
 
   it('чужой resourceType — отказ до любого шага', async () => {
@@ -250,8 +255,8 @@ describe('deleteOwnedCoreRows — форма SQL (Task 17)', () => {
 
     await deleteOwnedCoreRows(tx, coreJob());
 
-    expect(calls).toHaveLength(6);
-    const tombstone = calls[5];
+    expect(calls).toHaveLength(7);
+    const tombstone = calls[6];
     expect(tombstone.sql).toMatch(/^UPDATE user_id SET password_hash = NULL/);
     const [setClause, whereClause] = tombstone.sql.split(' WHERE ');
     expect(whereClause).toBeDefined();

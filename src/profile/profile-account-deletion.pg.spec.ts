@@ -234,6 +234,22 @@ maybe('profile account deletion against PostgreSQL (Task 17)', () => {
     return r[0].n;
   }
 
+  /** Точка «Чистого листа» пары «пользователь + ассистент '10'». */
+  async function seedContextReset(userId: string): Promise<void> {
+    await pool.query(
+      `INSERT INTO chat_context_resets (user_id, assistant_id, reset_at) VALUES ($1, '10', now())`,
+      [userId],
+    );
+  }
+
+  async function contextResetCount(userId: string): Promise<number> {
+    const r = await rows(
+      `SELECT count(*)::int AS n FROM chat_context_resets WHERE user_id = $1`,
+      [userId],
+    );
+    return r[0].n;
+  }
+
   async function identityCount(userId: string): Promise<number> {
     const r = await rows(
       `SELECT count(*)::int AS n FROM user_identities WHERE user_id=$1`,
@@ -366,6 +382,8 @@ maybe('profile account deletion against PostgreSQL (Task 17)', () => {
 
     // action_plans — настоящая миграция модуля.
     await pool.query(readFileSync('src/chat/action-plans/migrations/001_action_plans.sql', 'utf8'));
+    // chat_context_resets — точки «Чистого листа», настоящая миграция модуля.
+    await pool.query(readFileSync('src/chat/context-reset/migrations/001_chat_context_resets.sql', 'utf8'));
 
     // tg_user_identities — дословно 001_tg_bot_schema.sql (только эта таблица).
     await pool.query(`
@@ -435,6 +453,7 @@ maybe('profile account deletion against PostgreSQL (Task 17)', () => {
   beforeEach(async () => {
     await pool.query(
       `TRUNCATE account_deletion_jobs, custom_chat_history, action_plans,
+                chat_context_resets,
                 ai_profiles_consolidated, user_identities, tg_user_identities,
                 payments, token_transactions, login_history, user_id`,
     );
@@ -516,6 +535,11 @@ maybe('profile account deletion against PostgreSQL (Task 17)', () => {
        VALUES ($1,$2,'a1','чужой план','чужое резюме','[]'::jsonb)`,
       [OTHER, `${OTHER}_12`],
     );
+    // Точки «Чистого листа»: своя, чужая и префикс-коллизия (у точек
+    // точный user_id, но коллизия страхует от перехода на LIKE).
+    await seedContextReset(USER);
+    await seedContextReset(OTHER);
+    await seedContextReset(COLLISION);
     await pool.query(
       `INSERT INTO ai_profiles_consolidated
          (user_id, preferred_agent, isadmin, tokens, email, profile_data)
@@ -570,6 +594,10 @@ maybe('profile account deletion against PostgreSQL (Task 17)', () => {
     // Action plans.
     expect(await rows(`SELECT user_id FROM action_plans`))
       .toEqual([{ user_id: OTHER }]);
+    // Точки «Чистого листа»: своя стёрта, чужая и коллизия на месте.
+    expect(await contextResetCount(USER)).toBe(0);
+    expect(await contextResetCount(OTHER)).toBe(1);
+    expect(await contextResetCount(COLLISION)).toBe(1);
     // Профиль: строка-оболочка остаётся (surrogate id — lifecycle/billing
     // shell; от неё зависит contacts.purge), содержимое вычищено.
     const prof = await rows(
@@ -718,6 +746,7 @@ maybe('profile account deletion against PostgreSQL (Task 17)', () => {
   it('fencing внутри транзакции: flip после graph — lockAndAssertCurrent отменяет и откатывает', async () => {
     await seedDeletedAccount({ userId: USER, deletionId: DELETION_ID, hash: 'HASH-CANARY' });
     await seedHistory(USER, PERSONAL_CANARY);
+    await seedContextReset(USER);
     await seedIdentity(USER, 'email', 'deleted@example.test');
     await pool.query(
       `INSERT INTO ai_profiles_consolidated (user_id, tokens, profile_data)
@@ -744,6 +773,7 @@ maybe('profile account deletion against PostgreSQL (Task 17)', () => {
     expect(neo4j.deleteUserGraphStrict).toHaveBeenCalledTimes(1);
     // ROLLBACK: ни одна строка не удалена.
     expect(await historyCount(USER)).toBe(1);
+    expect(await contextResetCount(USER)).toBe(1);
     expect(await identityCount(USER)).toBe(1);
     const prof = await rows(
       `SELECT tokens FROM ai_profiles_consolidated WHERE user_id=$1`, [USER]);

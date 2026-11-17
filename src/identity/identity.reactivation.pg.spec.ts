@@ -361,6 +361,8 @@ maybe('реактивация после удаления — одна тран�
 
     // action_plans — настоящая миграция модуля (core стирает и её).
     await pool.query(readFileSync('src/chat/action-plans/migrations/001_action_plans.sql', 'utf8'));
+    // chat_context_resets — точки «Чистого листа» (core стирает и их).
+    await pool.query(readFileSync('src/chat/context-reset/migrations/001_chat_context_resets.sql', 'utf8'));
 
     // ai_profiles_consolidated — дословно 001_core_schema.sql + seq + UNIQUE.
     await pool.query(`
@@ -489,6 +491,7 @@ maybe('реактивация после удаления — одна тран�
   beforeEach(async () => {
     await pool.query(
       `TRUNCATE account_deletion_jobs, custom_chat_history, action_plans,
+                chat_context_resets,
                 ai_profiles_consolidated, token_transactions, user_identities,
                 tg_user_identities, user_id`,
     );
