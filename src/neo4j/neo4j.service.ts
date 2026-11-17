@@ -437,7 +437,7 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
           { phone: userId, name, canonicalKey },
         );
       }
-      this.logger.log(`replaceEntities: ${type} for ${userId} → ${values.length} items`);
+      this.logger.log(`replaceEntities: ${type} → ${values.length} items`);
     } catch (e) {
       this.logger.error(`replaceEntities error: ${e.message}`);
     } finally {
@@ -718,7 +718,7 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
 
       const extracted = this.extractJsonObject(content);
       if (!extracted) {
-        this.logger.warn(`consolidateFromChat: failed to parse JSON for ${userId}_${agentId}; raw[0..200]=${content.slice(0, 200)}`);
+        this.logger.warn(`consolidateFromChat: failed to parse JSON (agent=${agentId}); raw[0..200]=${content.slice(0, 200)}`);
         return;
       }
       const entityTypes = ['interests', 'values', 'desires', 'beliefs', 'intents', 'skills'];
@@ -790,7 +790,7 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
           'MERGE (p:Profile {phone: $phone}) SET p.embedding = $embedding, p.embeddingUpdatedAt = datetime()',
           { phone: userId, embedding },
         );
-        this.logger.log(`Embedding updated for ${userId} (${embedding.length} dims)`);
+        this.logger.log(`Embedding updated (${embedding.length} dims)`);
       } finally {
         await session.close();
       }
