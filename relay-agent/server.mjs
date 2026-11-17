@@ -23,6 +23,7 @@ import { snapshotDir, changedFiles } from "./turn-files.mjs";
 import { agentTestMode, cliToolArgs } from "./agent-test-mode.mjs";
 import { createDrainGate } from "./drain-gate.mjs";
 import { createInflight } from "./inflight.mjs";
+import { uploadOptions } from "./upload-options.mjs";
 
 // Фабрика не слушает порт и не вешает process-сигналы: это позволяет прогонять
 // настоящие Express-хендлеры с изолированными каталогами и подменённым spawn.
@@ -73,10 +74,7 @@ app.use(createRelayAuth({
 app.use(express.json());
 app.use("/files", express.static(OUTPUT_DIR));
 
-const upload = multer({
-  dest: UPLOAD_DIR,
-  limits: { fileSize: 500 * 1024 * 1024 },
-});
+const upload = multer(uploadOptions(UPLOAD_DIR));
 
 // Правила 4 и 9 и абзац «ПРОВЕРКА ФАКТОВ» — спека
 // docs/superpowers/specs/2026-10-27-assistant-links-sources-roles-design.md (п. 3).
