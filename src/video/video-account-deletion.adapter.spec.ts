@@ -3,7 +3,13 @@ import * as os from 'os';
 import * as path from 'path';
 import { Logger } from '@nestjs/common';
 import { MODULE_METADATA } from '@nestjs/common/constants';
-import { DeleteObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
+import {
+  CreateBucketCommand,
+  DeleteObjectCommand,
+  ListObjectsV2Command,
+  PutBucketPolicyCommand,
+  PutObjectCommand,
+} from '@aws-sdk/client-s3';
 import { AccountDeletionModule } from '../account-deletion/account-deletion.module';
 import { AccountDeletionRegistry } from '../account-deletion/account-deletion.registry';
 import { DELETION_DISCOVERERS } from '../account-deletion/account-deletion.catalog';
@@ -18,7 +24,7 @@ import type {
 } from '../account-deletion/account-deletion.types';
 import { StorageService } from '../common/services/storage.service';
 import { VideoModule } from './video.module';
-import { VideoService } from './video.service';
+import { VIDEO_UPLOADS_MAX_LIST_PAGES, VideoService } from './video.service';
 import {
   discoverVideoDeletion,
   discoverVideoUploadsDeletion,
@@ -520,8 +526,16 @@ const OWN_PREFIX = `video-uploads/${PHONE_USER}/`;
  */
 class FakeMinio {
   private readonly buckets = new Map<string, Set<string>>();
-  readonly log: Array<{ op: 'list' | 'delete'; bucket: string; prefix?: string; key?: string; token?: string }> = [];
+  readonly log: Array<{ op: 'list' | 'delete' | 'put'; bucket: string; prefix?: string; key?: string; token?: string }> = [];
   pageSize = 1000;
+  /**
+   * Страховка спека: реализация без защиты от зацикленных токенов крутила бы
+   * листинг вечно (await на готовых промисах не отдаёт управление таймеру
+   * jest). Порог выше VIDEO_UPLOADS_MAX_LIST_PAGES — до него доходит только
+   * незащищённый цикл.
+   */
+  maxListCalls = 20_000;
+  private lists = 0;
   listError: unknown = null;
   listOverride: ((input: any) => any) | null = null;
   /** Отказ на N-м удалении (сквозной счёт, с 1) — частичный прогон. */
@@ -547,6 +561,8 @@ class FakeMinio {
         prefix: input.Prefix,
         token: input.ContinuationToken,
       });
+      this.lists += 1;
+      if (this.lists > this.maxListCalls) throw new Error('fake_minio_runaway_listing');
       if (this.listError) throw this.listError;
       if (this.listOverride) return this.listOverride(input);
       const prefix = input.Prefix ?? '';
@@ -578,6 +594,17 @@ class FakeMinio {
       this.buckets.get(bucket)?.delete(key);
       return {};
     }
+    if (command instanceof PutObjectCommand) {
+      const bucket = String(command.input.Bucket);
+      const key = String(command.input.Key);
+      this.log.push({ op: 'put', bucket, key });
+      this.put(bucket, key);
+      return {};
+    }
+    // ensureBucket VideoService: создание бакета и политика — без эффекта.
+    if (command instanceof CreateBucketCommand || command instanceof PutBucketPolicyCommand) {
+      return {};
+    }
     throw new Error('unexpected S3 command');
   }
 }
@@ -603,7 +630,7 @@ function makeUploadsHarness(opts: { withStorage?: boolean } = {}) {
   const adapter = new VideoAccountDeletionAdapter(svc, registry);
   const assertCurrent = jest.fn(async () => undefined);
   const ctx: DeletionExecution & { assertCurrent: jest.Mock } = { db, assertCurrent };
-  return { db, minio, adapter, ctx };
+  return { db, minio, svc, adapter, ctx };
 }
 
 function uploadsJob(overrides: Partial<DeletionJobRow> = {}): DeletionJobRow {
@@ -736,6 +763,71 @@ describe('VideoAccountDeletionAdapter.execute — video-upload.purge (K4)', () =
     await expect(adapter.execute(uploadsJob(), ctx))
       .rejects.toMatchObject({ kind: 'external_unknown' });
     expect(ownLeft(minio)).toHaveLength(1);
+  });
+
+  it('(в) повтор того же токена подряд — external_unknown, без бесконечного цикла', async () => {
+    const { minio, adapter, ctx } = makeUploadsHarness();
+    minio.put(VIDEO_BUCKET, ownKey('1-a.jpg'));
+    minio.listOverride = () => ({ Contents: [], KeyCount: 0, IsTruncated: true, NextContinuationToken: 'A' });
+
+    await expect(adapter.execute(uploadsJob(), ctx))
+      .rejects.toMatchObject({ kind: 'external_unknown' });
+    expect(listCalls(minio).map((c) => c.token)).toEqual([undefined, 'A']);
+  });
+
+  it('(в) цикл токенов A→B→A (K4c) — external_unknown на третьей странице', async () => {
+    const { minio, adapter, ctx } = makeUploadsHarness();
+    minio.put(VIDEO_BUCKET, ownKey('1-a.jpg'));
+    const cycle = ['A', 'B'];
+    let i = 0;
+    minio.listOverride = () => ({
+      Contents: [],
+      KeyCount: 0,
+      IsTruncated: true,
+      NextContinuationToken: cycle[i++ % cycle.length],
+    });
+
+    await expect(adapter.execute(uploadsJob(), ctx))
+      .rejects.toMatchObject({ kind: 'external_unknown' });
+    expect(listCalls(minio).map((c) => c.token)).toEqual([undefined, 'A', 'B']);
+  });
+
+  it('(в) бесконечная череда новых токенов (K4c) — потолок страниц, external_unknown', async () => {
+    const { minio, adapter, ctx } = makeUploadsHarness();
+    minio.put(VIDEO_BUCKET, ownKey('1-a.jpg'));
+    let i = 0;
+    minio.listOverride = () => ({
+      Contents: [],
+      KeyCount: 0,
+      IsTruncated: true,
+      NextContinuationToken: `t${i++}`,
+    });
+
+    await expect(adapter.execute(uploadsJob(), ctx))
+      .rejects.toMatchObject({ kind: 'external_unknown' });
+    expect(VIDEO_UPLOADS_MAX_LIST_PAGES).toBeGreaterThan(1);
+    expect(listCalls(minio)).toHaveLength(VIDEO_UPLOADS_MAX_LIST_PAGES);
+    expect(ownLeft(minio)).toHaveLength(1);
+  });
+
+  it('запись и удаление связаны (K4c): uploadUserAsset → обход того же userId, сосед-родственник цел', async () => {
+    const { minio, svc, adapter, ctx } = makeUploadsHarness();
+    // Тот же фейк S3: VideoService пишет загрузки своим S3Client.
+    (svc as any).s3 = minio;
+    const ownUrl = await svc.uploadUserAsset(PHONE_USER, 'image', Buffer.from('face'), 'image/jpeg', 'face.jpg');
+    const neighborUrl = await svc.uploadUserAsset(PHONE_NEIGHBOR, 'image', Buffer.from('n'), 'image/png', 'n.png');
+    const bucketBase = `${MINIO_BASE}/${VIDEO_BUCKET}/`;
+    expect(ownUrl.startsWith(bucketBase)).toBe(true);
+    expect(neighborUrl.startsWith(bucketBase)).toBe(true);
+    const ownObject = ownUrl.slice(bucketBase.length);
+    const neighborObject = neighborUrl.slice(bucketBase.length);
+    expect(ownObject.startsWith(OWN_PREFIX)).toBe(true);
+    expect(minio.keys(VIDEO_BUCKET)).toEqual([ownObject, neighborObject].sort());
+
+    await adapter.execute(uploadsJob(), ctx);
+
+    expect(minio.keys(VIDEO_BUCKET)).toEqual([neighborObject]);
+    expect(deleteCalls(minio).map((c) => c.key)).toEqual([ownObject]);
   });
 
   it('листинг вернул ключ вне префикса — retry external_unknown, удалений нет', async () => {
@@ -940,7 +1032,7 @@ describe('VideoAccountDeletionAdapter.execute — белый список клю
     expect(warnSpy).not.toHaveBeenCalled();
   });
 
-  it('пропуск пишется в журнал видом и счётчиком — без userId, ключа и адреса', async () => {
+  it('пропуск пишется отдельной строкой skipped (K4c): без kind=, userId, ключа и адреса', async () => {
     const { db, adapter, ctx } = makeHarness();
     seedRow(db, {
       thumbnail_url: inBucket('shorts/v/cover.jpg'),
@@ -953,6 +1045,8 @@ describe('VideoAccountDeletionAdapter.execute — белый список клю
     const lines = warnSpy.mock.calls.map((c) => String(c[0]));
     const line = lines.find((l) => l.includes('not_owned='));
     expect(line).toBeDefined();
+    expect(line).toMatch(/^skipped /);
+    expect(line).not.toContain('kind=');
     expect(line).toContain('not_owned=2');
     expect(line).toContain('unsafe_key=1');
     expect(line).toContain(`deletion=${deletionId}`);
@@ -964,6 +1058,22 @@ describe('VideoAccountDeletionAdapter.execute — белый список клю
       expect(l).not.toContain('shorts');
       expect(l).not.toContain(MINIO_BASE);
     }
+  });
+
+  it('sanitizer не принял поля job (K4c) — строка всё равно skipped, только счётчики, без kind= и userId', async () => {
+    const { db, adapter, ctx } = makeHarness();
+    seedRow(db, { source_image_url: inBucket(NEIGHBOR_UPLOAD) });
+
+    await adapter.execute(purgeJob({ videoJobId: 'video-1' }, { resourceKey: `k-${USER}` }), ctx);
+
+    const lines = warnSpy.mock.calls.map((c) => String(c[0]));
+    const line = lines.find((l) => l.includes('not_owned='));
+    expect(line).toBeDefined();
+    expect(line).toMatch(/^skipped /);
+    expect(line).toContain('not_owned=1');
+    expect(line).not.toContain('kind=');
+    expect(line).not.toContain(USER);
+    expect(line).not.toContain('u-other');
   });
 
   it('URL строки на /static вне задачи (агентский аватар, чужой ролик) — локальный путь только из jobId', async () => {

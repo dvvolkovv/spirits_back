@@ -15,6 +15,7 @@ import {
   deletionResourceHash,
   retryDelayMs,
   safeDeletionMessage,
+  safeDeletionSkipMessage,
   withDeletionTimeout,
 } from './account-deletion.safe';
 import type {
@@ -1133,5 +1134,55 @@ describe('withDeletionTimeout — потолок ожидания внешней
 
     expect(outcome).toBeInstanceOf(DeletionRetryError);
     expect((outcome as DeletionRetryError).kind).toBe('timeout');
+  });
+});
+
+/**
+ * K4c — safe-форма УСПЕШНОГО пропуска: адаптер сознательно оставил объекты,
+ * не принадлежащие задаче. Строка не должна походить на строку сбоя раннера:
+ * префикс skipped и без kind=, по которому оператор ищет ошибки.
+ */
+describe('safeDeletionSkipMessage — пропуск отличим от сбоя (K4c)', () => {
+  const skipWith = (overrides: Record<string, unknown> = {}) => ({
+    deletionId: DELETION_ID,
+    userId: USER_ID,
+    resourceType: 'video-job.purge',
+    resourceKey: 'video-1',
+    attempts: 2,
+    counts: { not_owned: 2, unsafe_key: 0 },
+    ...overrides,
+  }) as any;
+
+  it('формат: префикс skipped, технические поля и счётчики, без kind=', () => {
+    const line = safeDeletionSkipMessage(skipWith());
+    expect(line).toBe(
+      `skipped deletion=${DELETION_ID} type=video-job.purge key=video-1 attempt=2 not_owned=2 unsafe_key=0`,
+    );
+    expect(line).not.toContain('kind=');
+    expect(line).not.toContain(USER_ID);
+  });
+
+  it('технические поля проверяются как в safeDeletionMessage', () => {
+    expect(() => safeDeletionSkipMessage(skipWith({ resourceKey: `k-${USER_ID}` })))
+      .toThrow(/^unsafe_resource_key$/);
+    expect(() => safeDeletionSkipMessage(skipWith({ deletionId: 'd-1' })))
+      .toThrow(/^unsafe_deletion_id$/);
+    expect(() => safeDeletionSkipMessage(skipWith({ resourceType: 'video-job.purge.typo' })))
+      .toThrow(/^unsafe_resource_type$/);
+    expect(() => safeDeletionSkipMessage(skipWith({ attempts: -1 })))
+      .toThrow(/^unsafe_attempts$/);
+  });
+
+  it.each([
+    ['пустые', {}],
+    ['имя с заглавной', { Not_owned: 1 }],
+    ['имя с пробелом', { 'not owned': 1 }],
+    ['имя из данных', { [USER_ID]: 1 }],
+    ['отрицательный', { not_owned: -1 }],
+    ['дробный', { not_owned: 1.5 }],
+    ['NaN', { not_owned: Number.NaN }],
+    ['строка', { not_owned: '1' }],
+  ])('счётчики: %s — unsafe_count', (_label, counts) => {
+    expect(() => safeDeletionSkipMessage(skipWith({ counts }))).toThrow(/^unsafe_count$/);
   });
 });
