@@ -32,14 +32,14 @@ import {
  *  - discovery: есть строки chat_uploads пользователя — ОДНА задача
  *    (resourceKey статический, payload пустой — ключи не снапшотятся);
  *    нет строк — плана нет;
- *  - execute: storage_key'и читаются ИЗ ТАБЛИЦЫ в момент исполнения (таблицу
- *    никто кроме этого адаптера не стирает — гонки нет), на каждый ключ —
- *    оригинал, thumb_key и вычисляемый thumbs/<storage_key>.webp (миграция
- *    002; миниатюра могла лечь и при thumb_key = NULL) —
+ *  - execute: storage_key и thumb_key читаются ИЗ ТАБЛИЦЫ в момент исполнения
+ *    (таблицу никто кроме этого адаптера не стирает — гонки нет), на каждую
+ *    строку — оригинал, thumb_key и вычисляемый thumbs/<storage_key>.webp
+ *    (миграция 002; миниатюра могла лечь и при thumb_key = NULL) —
  *    deleteConfirmed (подтверждённый исход или absent = успех), затем строки
  *    удаляются; любой неизвестный исход MinIO — DeletionRetryError, строки
- *    СОХРАНЯЮТСЯ для retry (fail-closed: storage_key — единственный указатель
- *    на байты);
+ *    СОХРАНЯЮТСЯ для retry (fail-closed: storage_key и thumb_key —
+ *    единственные указатели на байты);
  *  - идемпотентность: повторный прогон после частичного сбоя безопасен.
  */
 
@@ -199,7 +199,7 @@ describe('ChatUploadAccountDeletionAdapter — purge', () => {
       [BUCKET, KEY_B],
       [BUCKET, `thumbs/${KEY_B}.webp`],
     ]);
-    // Строки удалены ПОСЛЕ объектов (storage_key — единственный указатель на байты).
+    // Строки удалены ПОСЛЕ объектов (storage_key и thumb_key — единственные указатели на байты).
     expect(db.deleteQueries()).toHaveLength(1);
     expect(db.rows.some((r) => r.user_id === 'u-deleted')).toBe(false);
     // Чужие строки не тронуты.
@@ -422,6 +422,36 @@ describe('ChatUploadAccountDeletionAdapter — миниатюры (thumb_key, м
       expect(storage.deleteConfirmed).not.toHaveBeenCalled();
       expect(db.deleteQueries()).toEqual([]);
     }
+  });
+
+  it('thumb_key не строка и не NULL — fail-closed retry kind db (как storage_key), ни одного удаления', async () => {
+    for (const bad of [42, true, { key: 'x' }, ['thumbs', 'x.webp']]) {
+      const { db, adapter, ctx, storage } = makeHarness();
+      // String() превратил бы их в «безопасные» ключи: '42', 'true', '[object Object]', 'thumbs,x.webp'.
+      db.rows.push({ user_id: 'u-deleted', storage_key: KEY_A, thumb_key: bad as unknown as string });
+
+      await expect(adapter.execute(purgeJob(), ctx)).rejects.toBeInstanceOf(DeletionRetryError);
+      await expect(adapter.execute(purgeJob(), ctx)).rejects.toMatchObject({ kind: 'db' });
+      expect(storage.deleteConfirmed).not.toHaveBeenCalled();
+      expect(db.deleteQueries()).toEqual([]);
+    }
+  });
+
+  it('assertCurrent сторожит и удаление миниатюры: отмена перед ней — оригинал стёрт, миниатюра и строки нет', async () => {
+    const { db, adapter, ctx, storage } = makeHarness();
+    db.rows.push({ user_id: 'u-deleted', storage_key: KEY_A, thumb_key: THUMB_A });
+    // 1-й вызов — до чтения ключей, 2-й — перед оригиналом, 3-й — перед миниатюрой.
+    ctx.assertCurrent
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new DeletionCancelledError());
+
+    await expect(adapter.execute(purgeJob(), ctx)).rejects.toBeInstanceOf(DeletionCancelledError);
+    expect(storage.deleteConfirmed).toHaveBeenCalledTimes(1);
+    expect(storage.deleteConfirmed).toHaveBeenCalledWith({ bucket: BUCKET, key: KEY_A });
+    expect(ctx.assertCurrent).toHaveBeenCalledTimes(3);
+    expect(db.deleteQueries()).toEqual([]);
+    expect(db.rows).toHaveLength(1);
   });
 
   it('SELECT адаптера читает thumb_key вместе со storage_key', async () => {
