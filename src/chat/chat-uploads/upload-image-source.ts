@@ -27,11 +27,14 @@ export function chatUploadIdFromUrl(raw: string): string | null {
   } catch {
     return null;
   }
+  // Сначала путь, потом origin: любая другая ссылка отсекается без разбора
+  // окружения (так же дёшево и в маркерах Telegram, tg-bot.service.ts).
+  const m = CHAT_UPLOAD_PATH_RE.exec(u.pathname);
+  if (!m) return null;
   // Тот же список своих origin, что у own-media (BACKEND_URL, PUBLIC_BASE_URL,
   // my.linkeon.io): чужой домен с таким же путём — обычная внешняя ссылка.
   if (!ownOrigins().has(u.origin)) return null;
-  const m = CHAT_UPLOAD_PATH_RE.exec(u.pathname);
-  return m ? m[1].toLowerCase() : null;
+  return m[1].toLowerCase();
 }
 
 /**
