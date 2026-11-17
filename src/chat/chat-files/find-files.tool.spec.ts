@@ -36,4 +36,11 @@ describe('контракт find_files', () => {
     expect(FIND_FILES_CLI_PROMPT).toMatch(/НЕ ВЫВОДИ assistantUrl/);
     expect(FIND_FILES_CLI_PROMPT).toContain('kind=link');
   });
+
+  it('описание: поиск по комментариям ассистента к загрузкам и поле id для note_file', () => {
+    expect(FIND_FILES_TOOL.description).toMatch(/комментари/);
+    expect(FIND_FILES_TOOL.description).toContain('note_file');
+    expect(FIND_FILES_TOOL.description).toMatch(/поле id|id —/);
+    expect(FIND_FILES_TOOL.input_schema.properties.query.description).toMatch(/комментари/);
+  });
 });

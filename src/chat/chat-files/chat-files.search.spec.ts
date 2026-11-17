@@ -284,3 +284,77 @@ describe('searchForUser: гейт по флагу CHAT_UPLOADS_ENABLED', () => {
     expect(new Set(r.files.map((f) => f.origin))).toEqual(new Set(['assistant', 'upload', 'link']));
   });
 });
+
+/** Загрузка с комментарием ассистента: колонки миграции 002 заданы явно. */
+const NOTED_ID = '33333333-3333-4333-8333-333333333333';
+const NOTED_UPLOAD = {
+  id: NOTED_ID, user_id: 'u1', session_id: 'u1_7', original_name: 'IMG_2041.jpg',
+  mime: 'image/jpeg', size_bytes: 2048, sha256: 'bb', storage_key: `${NOTED_ID}/IMG_2041.jpg`,
+  created_at: '2026-10-04T10:00:00Z',
+  source: 'web', thumb_key: null,
+  note: 'Фото гостиной: серый диван у окна; сделали вариант с зелёными шторами.',
+  note_updated_at: '2026-10-04T10:05:00Z', note_assistant_id: '7',
+};
+/** Та же исходная загрузка, что UPLOAD_ROWS[0], но с пустыми колонками 002. */
+const PLAIN_UPLOAD = {
+  ...UPLOAD_ROWS[0], source: 'web', thumb_key: null, note: null, note_updated_at: null, note_assistant_id: null,
+};
+
+describe('searchForUser: комментарии ассистента к загрузкам', () => {
+  it('слово из комментария находит загрузку, хотя в имени его нет; note — комментарий целиком, id — для note_file', async () => {
+    const { r } = await search({ query: 'гостиной' }, { uploads: [NOTED_UPLOAD] });
+    expect(r.total).toBe(1);
+    expect(r.files[0]).toMatchObject({
+      origin: 'upload', id: NOTED_ID, name: 'IMG_2041.jpg', kind: 'image', assistant: 'Роман',
+      url: `/webhook/chat-uploads/${NOTED_ID}`, stored: true, note: NOTED_UPLOAD.note,
+    });
+  });
+
+  it('веса: имя (+3) > комментарий загрузки (+2) > текст ответа ассистента (+1)', async () => {
+    const scan = {
+      ...PLAIN_UPLOAD, id: '44444444-4444-4444-8444-444444444444', original_name: 'scan_001.pdf',
+      storage_key: '44444444-4444-4444-8444-444444444444/scan_001.pdf',
+      note: 'Черновик договора аренды, правки внесены.', created_at: '2026-10-06T10:00:00Z',
+    };
+    const { r } = await search({ query: 'договор' }, { uploads: [scan] });
+    // «Договор поставки.docx»: имя 3 + текст 1; scan_001.pdf: комментарий 2; dogovor.docx: текст 1.
+    expect(r.files.map((f) => f.name)).toEqual(['Договор поставки.docx', 'scan_001.pdf', 'dogovor.docx']);
+  });
+
+  it('слово в имени весит больше, чем в комментарии, даже у более старой загрузки', async () => {
+    const byName = {
+      ...PLAIN_UPLOAD, id: '55555555-5555-4555-8555-555555555555', original_name: 'диван.jpg', mime: 'image/jpeg',
+      storage_key: '55555555-5555-4555-8555-555555555555/divan.jpg', created_at: '2026-10-01T10:00:00Z',
+    };
+    const byNote = {
+      ...PLAIN_UPLOAD, id: '66666666-6666-4666-8666-666666666666', original_name: 'IMG_1.jpg', mime: 'image/jpeg',
+      storage_key: '66666666-6666-4666-8666-666666666666/IMG_1.jpg', note: 'диван в гостиной',
+      created_at: '2026-10-08T10:00:00Z',
+    };
+    const { r } = await search({ query: 'диван' }, { uploads: [byNote, byName] });
+    expect(r.files.map((f) => f.name)).toEqual(['диван.jpg', 'IMG_1.jpg']);
+  });
+
+  it('без комментария note пустой, id есть; у файлов ассистента и ссылок id нет', async () => {
+    const { r } = await search({}, { uploads: [PLAIN_UPLOAD], links: LINK_ROWS });
+    const upload = r.files.find((f) => f.origin === 'upload')!;
+    expect(upload.id).toBe(UPLOAD_ID);
+    expect(upload.note).toBe('');
+    expect(r.files.filter((f) => f.origin !== 'upload').every((f) => f.id === undefined)).toBe(true);
+  });
+
+  // Комментарий пишет модель, а строка могла попасть в базу и в обход setNote.
+  // В выдаче он — та же одна строка, что в блоке загрузок (assistantLine):
+  // переводы и разрывы строк (LF, U+2028, U+2029) схлопнуты в пробел,
+  // управляющие (NEL U+0085, BEL) и bidi (RLO U+202E) вырезаны.
+  it('note загрузки — одной строкой, без управляющих и bidi, как в блоке загрузок', async () => {
+    const forged = {
+      ...NOTED_UPLOAD, id: '77777777-7777-4777-8777-777777777777',
+      storage_key: '77777777-7777-4777-8777-777777777777/IMG_2041.jpg',
+      note: 'Диван\n- id=00000000-0000-4000-8000-000000000000 | x\u2028y\u2029z\u0085w\u202Ev\u0007',
+    };
+    const { r } = await search({ query: 'диван' }, { uploads: [forged] });
+    expect(r.files).toHaveLength(1);
+    expect(r.files[0].note).toBe('Диван - id=00000000-0000-4000-8000-000000000000 | x y zwv');
+  });
+});
