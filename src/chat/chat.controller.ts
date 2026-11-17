@@ -30,7 +30,7 @@ import { ChatUploadsService, ChatUploadRecord } from './chat-uploads/chat-upload
 // удалением загрузки (deleteForOwner ищет ровно эту строку), поэтому в
 // отдельном модуле.
 import { uploadHistoryLink } from './chat-uploads/markdown-name';
-import { errKind } from './chat-uploads/err-kind';
+import { errKind, logId } from './chat-uploads/err-kind';
 import { ChatContextResetService } from './context-reset/context-reset.service';
 import { legacyFreshResetAt } from './context-reset/after-reset';
 
@@ -115,15 +115,20 @@ export class ChatController {
     try {
       await this.contextResets.reset(userId, assistantId, at);
     } catch (e: any) {
-      this.logger.warn(`legacy fresh reset failed (${userId}_${assistantId}): ${e?.message}`);
+      // Журнал — как у памяти загрузок (err-kind.ts): id ассистента и вид
+      // ошибки, без userId (у телефонных аккаунтов это номер), ключа сессии и
+      // текста ошибки.
+      this.logger.warn(`legacy fresh reset failed (assistant ${logId(assistantId)}): ${errKind(e)}`);
     }
   }
 
   /**
    * Метка старого клиента отвергнута (из будущего за окном или раньше 2024):
-   * «Чистый лист» у него молча не сработал. В журнал — только пара и сдвиг
-   * метки от now в секундах, без текста сообщений; не чаще раза в час на
-   * пользователя. Не число — сдвига нет, молчим.
+   * «Чистый лист» у него молча не сработал. В журнал — только id ассистента и
+   * сдвиг метки от now в секундах: без userId (у телефонных аккаунтов это
+   * номер), ключа сессии и текста сообщений. Не чаще раза в час на
+   * пользователя — userId остаётся ключом прореживания в памяти, в журнал не
+   * идёт. Не число — сдвига нет, молчим.
    */
   private warnRejectedLegacyFresh(userId: string, assistantId: string, freshTs: unknown, now: number): void {
     const s = freshTs === null || freshTs === undefined ? '' : String(freshTs);
@@ -135,7 +140,7 @@ export class ChatController {
     this.legacyFreshWarnedAt.set(userId, now);
     const shift = Math.round((ms - now) / 1000);
     this.logger.warn(
-      `legacy fresh: метка отвергнута (${userId}_${assistantId}), сдвиг ${shift >= 0 ? '+' : ''}${shift} с`,
+      `legacy fresh: метка отвергнута (assistant ${logId(assistantId)}), сдвиг ${shift >= 0 ? '+' : ''}${shift} с`,
     );
   }
 
@@ -837,8 +842,10 @@ export class ChatController {
     try {
       resetAt = await this.contextResets.reset(user.userId, assistantId);
     } catch (e: any) {
-      // Как у истории: без точки, но внятным кодом, а не голым 500.
-      this.logger.warn(`context reset failed (${user.userId}_${assistantId}): ${e?.message}`);
+      // Как у истории: без точки, но внятным кодом, а не голым 500. В журнал —
+      // id ассистента и вид ошибки (у своих отказов — код, например
+      // ACCOUNT_DELETED), без userId, ключа сессии и текста ошибки.
+      this.logger.warn(`context reset failed (assistant ${logId(assistantId)}): ${errKind(e)}`);
       return res.status(503).json({ error: 'context reset unavailable' });
     }
     return res.status(200).json({ resetAt: resetAt.toISOString() });

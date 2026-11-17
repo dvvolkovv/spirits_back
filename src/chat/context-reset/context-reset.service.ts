@@ -3,6 +3,18 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { PgService } from '../../common/services/pg.service';
 import { LEGACY_FRESH_FUTURE_SLACK_MS, LEGACY_FRESH_MIN_MS } from './after-reset';
+import { errKind, logId } from '../chat-uploads/err-kind';
+
+/**
+ * Коды своих отказов reset(): в журнал идёт только вид ошибки (errKind) —
+ * по коду отказ отличим от сбоя базы, а текст не нужен.
+ */
+const CONTEXT_RESET_INVALID_TIME = 'INVALID_RESET_TIME';
+const CONTEXT_RESET_ACCOUNT_DELETED = 'ACCOUNT_DELETED';
+
+function resetError(message: string, code: string): Error {
+  return Object.assign(new Error(message), { code });
+}
 
 /**
  * Точка «Чистого листа» на пару «пользователь + ассистент»
@@ -42,8 +54,11 @@ export class ChatContextResetService {
    * отказывать (spec 2026-11-17-context-reset, «Риски»): ход, звонок, план и
    * лента идут с прежней памятью — хуже, чем с чистой, но лучше, чем никак.
    *
-   * warn получает только пару и причину, без текста разговора. Нет колбэка —
-   * сбой проглатывается молча (лента: черты нет, история есть).
+   * warn получает только id ассистента и вид ошибки (errKind) — по правилу
+   * журнала памяти загрузок: без userId (у телефонных аккаунтов это номер
+   * телефона), ключа сессии и текста ошибки (pg может повторять параметры
+   * запроса), а текста разговора тем более. Нет колбэка — сбой
+   * проглатывается молча (лента: черты нет, история есть).
    *
    * Статический и с сервисом первым параметром: у потребителей сервис
    * @Optional (нет его — точки нет), а их спеки подменяют сервис объектом с
@@ -59,7 +74,7 @@ export class ChatContextResetService {
     try {
       return (await resets.get(userId, assistantId)) ?? null;
     } catch (e: any) {
-      warn?.(`context reset read failed (${userId}_${assistantId}): ${e?.message}`);
+      warn?.(`context reset read failed (assistant ${logId(assistantId)}): ${errKind(e)}`);
       return null;
     }
   }
@@ -72,13 +87,15 @@ export class ChatContextResetService {
    * забытое.
    *
    * Явное время вне окна [LEGACY_FRESH_MIN_MS, now + окно] или Invalid Date —
-   * ошибка, а не запись: из-за GREATEST точка из будущего вечна и стёрла бы
-   * ассистенту память навсегда; точка в 1970 под видом чистого листа вернула
-   * бы всю старую историю; Invalid Date иначе всплыл бы невнятной ошибкой
-   * Postgres. Не обрезаем до now — почему, см. LEGACY_FRESH_FUTURE_SLACK_MS.
+   * ошибка (code INVALID_RESET_TIME), а не запись: из-за GREATEST точка из
+   * будущего вечна и стёрла бы ассистенту память навсегда; точка в 1970 под
+   * видом чистого листа вернула бы всю старую историю; Invalid Date иначе
+   * всплыл бы невнятной ошибкой Postgres. Не обрезаем до now — почему, см.
+   * LEGACY_FRESH_FUTURE_SLACK_MS.
    *
    * Удалённому аккаунту (user_id.state = 'deleted' — тот же признак, что у
-   * IdentityService.isDeleted) точка не пишется — ошибка 'account deleted'.
+   * IdentityService.isDeleted) точка не пишется — ошибка 'account deleted'
+   * (code ACCOUNT_DELETED).
    * Выданный до удаления access-токен живёт до двух часов, а core-удаление
    * точки уже прошло: новая строка осталась бы сиротой навсегда. Нет строки
    * в user_id или state другой — пишем, как раньше. Проверка и запись — одним
@@ -88,7 +105,7 @@ export class ChatContextResetService {
     if (at !== undefined && at !== null) {
       const t = at.getTime();
       if (!Number.isFinite(t) || t < LEGACY_FRESH_MIN_MS || t > Date.now() + LEGACY_FRESH_FUTURE_SLACK_MS) {
-        throw new Error('invalid context reset time');
+        throw resetError('invalid context reset time', CONTEXT_RESET_INVALID_TIME);
       }
     }
     // ::text у параметров: $1 стоит и в списке вставки (text), и в сравнении
@@ -104,7 +121,7 @@ export class ChatContextResetService {
        RETURNING reset_at`,
       [userId, String(assistantId), at ?? null],
     );
-    if (!rows.length) throw new Error('account deleted');
+    if (!rows.length) throw resetError('account deleted', CONTEXT_RESET_ACCOUNT_DELETED);
     return new Date(rows[0].reset_at);
   }
 }
