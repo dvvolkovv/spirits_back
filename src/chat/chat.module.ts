@@ -23,11 +23,14 @@ import { ActionPlansService } from './action-plans/action-plans.service';
 import { AccountDeletionModule } from '../account-deletion/account-deletion.module';
 import { ChatFileAccountDeletionAdapter } from './chat-files/chat-file-account-deletion.adapter';
 import { ChatUploadsModule } from './chat-uploads/chat-uploads.module';
+import { ContextResetModule } from './context-reset/context-reset.module';
 
 @Module({
-  imports: [MiscModule, CommonModule, RoomModule, VideoModule, CalendarModule, TalerIdModule, SpeechModule, TokensModule, HumanDesignModule, ProductsModule, AccountDeletionModule, ChatUploadsModule],
+  imports: [MiscModule, CommonModule, RoomModule, VideoModule, CalendarModule, TalerIdModule, SpeechModule, TokensModule, HumanDesignModule, ProductsModule, AccountDeletionModule, ChatUploadsModule, ContextResetModule],
   controllers: [ChatController, ChatFilesController, ChatThumbController, ActionPlansController],
   providers: [ChatService, ChatToolsService, ChatFileStore, ChatFilesService, ThumbnailService, CostGrowthService, ActionPlansService, ChatFileAccountDeletionAdapter],
-  exports: [ChatToolsService, ChatService, ChatFilesService],
+  // ContextResetModule реэкспортируется: точку «Чистого листа» читают и модули,
+  // импортирующие ChatModule (голосовой звонок, VoiceCallModule).
+  exports: [ChatToolsService, ChatService, ChatFilesService, ContextResetModule],
 })
 export class ChatModule {}

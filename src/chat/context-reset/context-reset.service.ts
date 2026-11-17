@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PgService } from '../../common/services/pg.service';
-import { LEGACY_FRESH_FUTURE_SLACK_MS } from './after-reset';
+import { LEGACY_FRESH_FUTURE_SLACK_MS, LEGACY_FRESH_MIN_MS } from './after-reset';
 
 /**
  * Точка «Чистого листа» на пару «пользователь + ассистент»
@@ -38,20 +38,22 @@ export class ChatContextResetService {
   }
 
   /**
-   * Ставит точку (по умолчанию — «сейчас» по часам базы, теми же, что у
-   * created_at сообщений) и возвращает действующую. Точка только движется
-   * вперёд: два нажатия в разных вкладках или запоздалая метка старого клиента
-   * не возвращают ассистенту забытое.
+   * Ставит точку и возвращает действующую. `at` не задан (`undefined` или
+   * `null`) — точка «сейчас» по часам базы (`now()`), тем же, что у
+   * created_at сообщений. Точка только движется вперёд: два нажатия в разных
+   * вкладках или запоздалая метка старого клиента не возвращают ассистенту
+   * забытое.
    *
-   * Явное время из будущего дальше окна или Invalid Date — ошибка, а не запись:
-   * из-за GREATEST точка из будущего вечна и стёрла бы ассистенту память
-   * навсегда, а Invalid Date иначе всплыл бы невнятной ошибкой Postgres.
-   * Не обрезаем до now — почему, см. LEGACY_FRESH_FUTURE_SLACK_MS.
+   * Явное время вне окна [LEGACY_FRESH_MIN_MS, now + окно] или Invalid Date —
+   * ошибка, а не запись: из-за GREATEST точка из будущего вечна и стёрла бы
+   * ассистенту память навсегда; точка в 1970 под видом чистого листа вернула
+   * бы всю старую историю; Invalid Date иначе всплыл бы невнятной ошибкой
+   * Postgres. Не обрезаем до now — почему, см. LEGACY_FRESH_FUTURE_SLACK_MS.
    */
-  async reset(userId: string, assistantId: string | number, at?: Date): Promise<Date> {
+  async reset(userId: string, assistantId: string | number, at?: Date | null): Promise<Date> {
     if (at !== undefined && at !== null) {
       const t = at.getTime();
-      if (!Number.isFinite(t) || t > Date.now() + LEGACY_FRESH_FUTURE_SLACK_MS) {
+      if (!Number.isFinite(t) || t < LEGACY_FRESH_MIN_MS || t > Date.now() + LEGACY_FRESH_FUTURE_SLACK_MS) {
         throw new Error('invalid context reset time');
       }
     }

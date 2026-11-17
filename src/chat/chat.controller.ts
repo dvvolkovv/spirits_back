@@ -26,6 +26,8 @@ import { stripProductActionBlocks } from '../products/product-action-tail';
 import { UserLlmProviderService } from '../common/services/user-llm-provider.service';
 import { relayProviderFields, resolveAnswerProvider } from './answer-provider';
 import { ChatUploadsService, ChatUploadRecord } from './chat-uploads/chat-uploads.service';
+import { ChatContextResetService } from './context-reset/context-reset.service';
+import { legacyFreshResetAt } from './context-reset/after-reset';
 
 // Потолок загрузки и зачем он именно такой — в upload-limits.ts, вместе с
 // самой константой (менять его можно только вместе с ОБОИМИ nginx).
@@ -71,7 +73,25 @@ export class ChatController {
     // Память загрузок (spec 2026-11-13-chat-upload-memory): исходники файлов
     // в наше хранилище до вызова релея. Тоже последним и @Optional — по той же причине.
     @Optional() private readonly chatUploads?: ChatUploadsService,
+    // Точка «Чистого листа» (spec 2026-11-17-context-reset). Последним и
+    // @Optional — по той же причине, что chatUploads.
+    @Optional() private readonly contextResets?: ChatContextResetService,
   ) {}
+
+  /**
+   * `fresh` + `freshTs` старого клиента (вкладки до выката, Flutter, e2e):
+   * точка на его метку. Сбой записи хода не роняет — ассистент ответит с
+   * прежней памятью.
+   */
+  private async applyLegacyFresh(userId: string, assistantId: string, freshTs: unknown): Promise<void> {
+    const at = legacyFreshResetAt(freshTs, Date.now());
+    if (!at || !this.contextResets) return;
+    try {
+      await this.contextResets.reset(userId, assistantId, at);
+    } catch (e: any) {
+      this.logger.warn(`legacy fresh reset failed (${userId}_${assistantId}): ${e?.message}`);
+    }
+  }
 
   /**
    * Сколько ходов прямо сейчас в полёте. Спрашивает deploy.sh перед
@@ -161,13 +181,6 @@ export class ChatController {
       } catch {}
     }
 
-    // «Чистый лист»: фронт передаёт fresh=true + freshTs (метка включения
-    // режима). Сессия собирается на бэке — фронт не знает формат userId.
-    const fresh = body.fresh === true && /^\d{6,}$/.test(String(body.freshTs || ''));
-    const finalSessionId = fresh
-      ? `${userId}_${assistantId}_fresh_${body.freshTs}`
-      : (sessionId || `${userId}_${assistantId}`);
-
     // Пинг мониторинга (smoke / synthetic-runner): ход уходит на дешёвую модель,
     // потому что проверяется живость пути, а не качество ответа.
     //
@@ -176,6 +189,19 @@ export class ChatController {
     // придётся с жалобой «ассистент поглупел», у которой нет следа ни в логах,
     // ни в промпте.
     const probe = body.probe === true && TEST_USERS.includes(userId);
+
+    // «Чистый лист» (spec 2026-11-17-context-reset). Изолированная fresh-сессия
+    // осталась только у пингов: каждый пинг — одноразовая дешёвая сессия, и он
+    // не сдвигает точку тестового аккаунта посреди других проверок. У всех
+    // остальных fresh + freshTs (старые клиенты) — это точка отсчёта, а ход
+    // идёт в основную ленту. Сессия собирается на бэке — фронт не знает
+    // формат userId.
+    const freshRequested = body.fresh === true && /^\d{6,}$/.test(String(body.freshTs || ''));
+    const fresh = freshRequested && probe;
+    if (freshRequested && !probe) await this.applyLegacyFresh(userId, String(assistantId), body.freshTs);
+    const finalSessionId = fresh
+      ? `${userId}_${assistantId}_fresh_${body.freshTs}`
+      : (sessionId || `${userId}_${assistantId}`);
     // Что умеет клиент — шаги работы и карточки вопросов (client-ui.ts).
     const ui = parseClientUi(body.ui);
     const startedAt = Date.now();
@@ -212,6 +238,11 @@ export class ChatController {
 
   @Post('agent/upload-and-chat')
   async uploadAndChat(@Req() req: Request, @Res() res: Response) {
+    // Момент хода — для задач, извлечённых из него в фоне (см.
+    // ChatService.streamChat). Ход с файлом самый долгий: без этого задача из
+    // старого файла проскочила бы точку «Чистого листа», нажатую сразу после
+    // ответа.
+    const turnAt = new Date();
     const authHeader = req.headers['authorization'];
     let userId: string | null = null;
     if (authHeader?.startsWith('Bearer ')) {
@@ -316,14 +347,14 @@ export class ChatController {
       try { profileText = await this.neo4j.getProfileDescription(userId); } catch {}
     }
 
-    // «Чистый лист» — как в текстовом ходе (см. `chat`): у режима своя сессия на
-    // релее, и файл обязан уехать в неё же. Тело здесь multipart, поэтому флаг
-    // приезжает строкой, а не булевым.
+    // «Чистый лист» старого клиента — точка (spec 2026-11-17-context-reset).
+    // Изолированной сессии у загрузок больше нет: пинги файлов не шлют. Точка —
+    // до buildUploadHandoff: ключ релея, хвост и память загрузок читают её.
+    // Ключ ассистента — тот же assistantId (с запасным 'Роман'), что в
+    // `${userId}_${assistantId}` и у handoff, иначе точка легла бы мимо сессии.
+    // Тело здесь multipart, поэтому флаг приезжает строкой, а не булевым.
     const freshFlag = body.fresh === true || body.fresh === 'true';
-    const fresh = freshFlag && /^\d{6,}$/.test(String(body.freshTs || ''));
-    const freshSessionId = fresh
-      ? `${userId}_${assistantId}_fresh_${body.freshTs}`
-      : undefined;
+    if (freshFlag) await this.applyLegacyFresh(userId, String(assistantId), body.freshTs);
 
     // Ключ сессии, персона и хвост переписки — те же, что у текстового хода.
     // Отдельная сборка здесь однажды уже разошлась с основной и на три недели
@@ -338,8 +369,9 @@ export class ChatController {
     // файлы ЭТОГО хода по их свежим id — они уже в multipart-промпте путями
     // на релее. Сбой самого сохранения ход не прерывает: текущий ответ
     // продолжается по прежнему relay-пути, а клиенту ниже уходит событие
-    // upload_persist_failed.
-    const uploadSessionId = freshSessionId || `${userId}_${assistantId}`;
+    // upload_persist_failed. Лента одна и с «Чистым листом»: исходник — в
+    // основную сессию, файлы до точки отсекает сама точка.
+    const uploadSessionId = `${userId}_${assistantId}`;
     let savedUploads: ChatUploadRecord[] = [];
     let uploadPersistFailed = false;
     if (process.env.CHAT_UPLOADS_ENABLED === 'true' && this.chatUploads) {
@@ -682,7 +714,6 @@ export class ChatController {
               durationMs: Date.now() - streamStartTime,
               turnFailed,
               failReason,
-              sessionIdOverride: freshSessionId,
             });
             // Обогащаем профиль (Neo4j) на основе явных самораскрытий/согласий пользователя.
             // Файловые загрузки раньше не вызывали consolidate — теперь учитываются.
@@ -695,6 +726,7 @@ export class ChatController {
                 assistantId,
                 userMsgForHistory,
                 fullText,
+                turnAt,
               );
             }
           } catch (e: any) {
@@ -725,13 +757,31 @@ export class ChatController {
 
   @Get('chat/history')
   @UseGuards(JwtGuard)
-  async getHistory(@CurrentUser() user: any, @Query('assistantId') assistantId: string, @Query('limit') limit: string, @Query('offset') offset: string, @Query('freshTs') freshTs: string, @Res() res: Response) {
-    // freshTs: история fresh-сессии «чистого листа» (переживает F5 на фронте).
-    const sessionOverride = freshTs && /^\d{6,}$/.test(freshTs)
-      ? `${user.userId}_${assistantId}_fresh_${freshTs}`
-      : undefined;
-    const history = await this.chatService.getChatHistory(user.userId, assistantId, parseInt(limit) || 30, parseInt(offset) || 0, sessionOverride);
-    return res.status(200).json(history);
+  async getHistory(@CurrentUser() user: any, @Query('assistantId') assistantId: string, @Query('limit') limit: string, @Query('offset') offset: string, @Res() res: Response) {
+    // Лента одна (spec 2026-11-17-context-reset): freshTs старых клиентов не
+    // читаем. Точка — чтобы фронт провёл черту.
+    const history = await this.chatService.getChatHistory(user.userId, assistantId, parseInt(limit) || 30, parseInt(offset) || 0);
+    let resetAt: Date | null = null;
+    try {
+      resetAt = this.contextResets ? await this.contextResets.get(user.userId, String(assistantId)) : null;
+    } catch { /* без черты, но с историей */ }
+    return res.status(200).json({ ...history, contextResetAt: resetAt ? resetAt.toISOString() : null });
+  }
+
+  /**
+   * «Чистый лист» (spec 2026-11-17-context-reset): точка отсчёта памяти
+   * ассистента на пару «пользователь + ассистент» — «сейчас» по часам базы.
+   * Лента не прерывается; после точки ассистент видит профиль и только новые
+   * сообщения — на любом устройстве, в рутине и в «Пути».
+   */
+  @Post('chat/reset-context')
+  @UseGuards(JwtGuard)
+  async resetContext(@CurrentUser() user: any, @Body() body: any, @Res() res: Response) {
+    const assistantId = body?.assistantId === undefined || body?.assistantId === null ? '' : String(body.assistantId).trim();
+    if (!assistantId || assistantId.length > 100) return res.status(400).json({ error: 'assistantId is required' });
+    if (!this.contextResets) return res.status(503).json({ error: 'context reset unavailable' });
+    const resetAt = await this.contextResets.reset(user.userId, assistantId);
+    return res.status(200).json({ resetAt: resetAt.toISOString() });
   }
 
   @Delete('chat/history')

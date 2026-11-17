@@ -3748,11 +3748,6 @@ ${LanguageService.buildDirective(userLanguage)}`;
     durationMs: number;
     turnFailed?: boolean;
     failReason?: string;
-    // Сессия истории вместо `${userId}_${assistantId}`. Осталась от прежнего
-    // «Чистого листа» с отдельной fresh-сессией; теперь лента одна (spec
-    // 2026-11-17-context-reset), и после задачи 5 контроллер это поле не
-    // передаёт. Удалить вместе с последним вызывающим.
-    sessionIdOverride?: string;
   }): Promise<number> {
     let text = p.assistantMsg;
     let turnFailed = p.turnFailed === true;
@@ -3782,7 +3777,9 @@ ${LanguageService.buildDirective(userLanguage)}`;
 
     await this.alertExpensiveTurn(p.userId, p.assistantId, charge, textCost);
 
-    await this.saveChatHistory(p.userId, p.assistantId, p.userMsg, text, textCost, p.sessionIdOverride);
+    // Лента одна и с «Чистым листом» (spec 2026-11-17-context-reset): ход с
+    // файлом — всегда в `${userId}_${assistantId}`.
+    await this.saveChatHistory(p.userId, p.assistantId, p.userMsg, text, textCost);
     if (!turnFailed) {
       await this.addTokenTask(p.userId, 0, textCost, p.assistantId, {
         costUsd: Number(p.costUsd.toFixed(4)),

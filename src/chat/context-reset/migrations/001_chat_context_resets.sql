@@ -8,7 +8,8 @@ BEGIN
   CREATE TABLE IF NOT EXISTS chat_context_resets (
     user_id text NOT NULL,
     assistant_id text NOT NULL,
-    reset_at timestamptz NOT NULL,
+    -- infinity с GREATEST — вечная точка: ассистент забыл бы всё навсегда.
+    reset_at timestamptz NOT NULL CHECK (isfinite(reset_at)),
     PRIMARY KEY (user_id, assistant_id)
   );
 END $$;
