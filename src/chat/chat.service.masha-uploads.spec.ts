@@ -187,8 +187,12 @@ describe('Маша: блок загрузок сессии', () => {
   // Подпись проверяется в chat-uploads.assistant-block.spec.ts; здесь — место
   // блока в промпте Маши, поэтому ссылка подменена постоянной строкой.
   const LINK = `https://backend.test/webhook/chat-uploads/${RECORD.id}?exp=1&sig=spec`;
+  // Отсутствие блока — по его заголовку с двоеточием: имя блока без двоеточия
+  // («Earlier user uploads») есть и в NOTE_FILE_CLI_PROMPT, который при
+  // включённом флаге в промпте Маши стоит всегда — и в пинге, и при сбое реестра.
+  const HEADER_LINE = 'Earlier user uploads:';
   const BLOCK = [
-    'Earlier user uploads:',
+    HEADER_LINE,
     'Signed links expire after ~1 hour. If this block appears more than once in the conversation, use ONLY the LATEST copy — links from earlier copies are stale and return 404.',
     'These links are for your internal use only; NEVER show or paste them to the user — to give the user a file, find it via find_files and share only its "url" field.',
     `- id=${RECORD.id} | план.pdf | document | 2026-11-15 | комментарий: План квартиры: две комнаты; договорились начать с гостиной.`,
@@ -234,7 +238,7 @@ describe('Маша: блок загрузок сессии', () => {
     const { uploads, recentSpy } = uploadsWith();
     const { opts } = await runMasha({ setup: withUploads(uploads) });
     expect(recentSpy).not.toHaveBeenCalled();
-    expect(String(opts.system)).not.toContain('Earlier user uploads');
+    expect(String(opts.system)).not.toContain(HEADER_LINE);
   });
 
   it('пинг мониторинга (probe): блока нет, реестр не опрашивается', async () => {
@@ -242,7 +246,7 @@ describe('Маша: блок загрузок сессии', () => {
     const { uploads, recentSpy } = uploadsWith();
     const { opts } = await runMasha({ setup: withUploads(uploads), probe: true });
     expect(recentSpy).not.toHaveBeenCalled();
-    expect(String(opts.system)).not.toContain('Earlier user uploads');
+    expect(String(opts.system)).not.toContain(HEADER_LINE);
   });
 
   it('сбой реестра — ход идёт без блока', async () => {
@@ -250,7 +254,7 @@ describe('Маша: блок загрузок сессии', () => {
     const { uploads, recentSpy } = uploadsWith();
     recentSpy.mockRejectedValue(new Error('db down'));
     const { opts, writes } = await runMasha({ setup: withUploads(uploads) });
-    expect(String(opts.system)).not.toContain('Earlier user uploads');
+    expect(String(opts.system)).not.toContain(HEADER_LINE);
     expect(writes.map((w) => JSON.parse(w)).some((e) => e.type === 'item')).toBe(true);
   });
 });
