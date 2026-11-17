@@ -1,10 +1,11 @@
 import {
-  Body, Controller, Headers, Logger, Post, ServiceUnavailableException, UnauthorizedException,
+  Body, Controller, Headers, Logger, NotFoundException, Post, ServiceUnavailableException, UnauthorizedException,
 } from '@nestjs/common';
-import { LiveKitClient } from '../voice-call/livekit.client';
 import { VoiceCallService } from '../voice-call/voice-call.service';
 import { canonicalJson, verifyAttendeeSignature } from './attendee-signature';
 import { TERMINAL_BOT_STATES } from './attendee.client';
+import { MeetingWebhookDeliveryService } from './meet-webhook-delivery.service';
+import { MeetingWebhookInboxStore } from './meet-webhook-inbox.store';
 
 /**
  * Вебхуки Attendee.
@@ -19,9 +20,14 @@ import { TERMINAL_BOT_STATES } from './attendee.client';
  * подпись Attendee считается по КАНОНИЗИРОВАННОМУ JSON, а не по сырым байтам,
  * поэтому сырое тело здесь не нужно и в main.ts ничего вешать не требуется.
  *
- * Ручка всегда отвечает `{ok: true}` на всё, что прошло подпись, — даже когда
- * событие некуда доставить. Ошибка в ответе заставила бы Attendee ретраить
- * до 30 раз впустую.
+ * Приём durable: событие сначала кладётся в inbox (PostgreSQL), и только потом
+ * подтверждается; в LiveKit его доставляет фоновый DeliveryService с ретраями.
+ *
+ * `{ok: true}` означает «событие надёжно принято» (вставка или дубликат) либо
+ * «осознанно отфильтровано» (нет callId, неизвестный триггер, пустой чат,
+ * звонок не найден или закрыт). 503 отдаётся только там, где повтор от
+ * Attendee имеет смысл: не прочитался звонок или недоступен inbox. Ошибки
+ * подписи — 401, как раньше.
  */
 
 /**
@@ -54,15 +60,6 @@ import { TERMINAL_BOT_STATES } from './attendee.client';
 const FATAL_STATES = TERMINAL_BOT_STATES;
 
 /**
- * Сколько ключей идемпотентности держим.
- *
- * Память процесса, а не Redis: событие живёт секунды, а рестарт означает, что
- * и звонка уже нет. Но потолок обязателен — без него множество растёт всю
- * жизнь процесса, а воркер живёт неделями.
- */
-const SEEN_LIMIT = 5_000;
-
-/**
  * Форма вебхука Attendee.
  *
  * ЭТО ОБЯЗАНО ОСТАТЬСЯ ИНТЕРФЕЙСОМ, а не классом.
@@ -89,11 +86,11 @@ interface AttendeeHook {
 @Controller('meet')
 export class MeetWebhookController {
   private readonly logger = new Logger(MeetWebhookController.name);
-  private readonly seen = new Set<string>();
 
   constructor(
-    private readonly livekit: LiveKitClient,
     private readonly calls: VoiceCallService,
+    private readonly inbox: MeetingWebhookInboxStore,
+    private readonly delivery: MeetingWebhookDeliveryService,
   ) {}
 
   @Post('attendee')
@@ -122,42 +119,41 @@ export class MeetWebhookController {
     // быть события бота, заведённого не нами — например, вручную в UI.
     if (!callId) return { ok: true };
 
-    const key = body.idempotency_key ? `${callId}:${body.idempotency_key}` : '';
-    if (key && this.seen.has(key)) return { ok: true };
-    if (key) this.remember(key);
-
     const msg = this.toDataMessage(body);
     if (!msg) return { ok: true };
 
-    const call = await this.calls.load(callId).catch(() => null);
+    let call: Awaited<ReturnType<VoiceCallService['load']>> | null;
+    try {
+      call = await this.calls.load(callId);
+    } catch (e: any) {
+      // VoiceCallService.load бросает NotFoundException для неизвестного звонка:
+      // это «адресата нет», а не сбой — ack.
+      if (e instanceof NotFoundException) return { ok: true };
+      // Не смогли прочитать звонок — это не «звонка нет». Ack потерял бы
+      // событие, а Attendee ретраит именно на 5xx. Payload не логируем.
+      this.logger.error(`[meet] не удалось загрузить звонок, trigger=${body.trigger}: ${e?.message}`);
+      throw new ServiceUnavailableException('voice calls unavailable');
+    }
     // Звонок уже закрыт или не найден — отправлять некуда, комната удалена.
     if (!call || !this.calls.isActive(call)) return { ok: true };
 
-    await this.livekit.send(call.room_name, msg as any).catch((e: any) => {
-      this.logger.warn(`[meet] событие ${body.trigger} не доехало: ${e?.message}`);
-    });
-    return { ok: true };
-  }
-
-  private remember(key: string): void {
-    // Простейшее вытеснение: при переполнении сбрасываем половину самых
-    // старых. Set в JS сохраняет порядок вставки, этого достаточно.
-    //
-    // Множество общее на все одновременные встречи, поэтому одна очень
-    // активная встреча теоретически может вытеснить ключи тихой раньше, чем
-    // у Attendee истечёт окно ретраев — тогда вытесненный ключ вернётся и
-    // событие обработается повторно. Это осознанная защита вторым эшелоном,
-    // а не умолчание: Presence в воркере идемпотентен к повторным
-    // join/leave/speech (повторный join того же uuid не удваивает состав),
-    // то есть повтор деградирует мягко, а не портит состояние встречи.
-    if (this.seen.size >= SEEN_LIMIT) {
-      let drop = Math.floor(SEEN_LIMIT / 2);
-      for (const k of this.seen) {
-        this.seen.delete(k);
-        if (--drop <= 0) break;
-      }
+    try {
+      await this.inbox.enqueue({
+        callId,
+        idempotencyKey: body.idempotency_key || null,
+        trigger: body.trigger,
+        message: msg,
+      });
+    } catch (e: any) {
+      // FK: звонок удалён между load и INSERT — доставлять некуда.
+      if (e?.code === '23503') return { ok: true };
+      this.logger.error(`[meet] inbox недоступен, trigger=${body.trigger}: ${e?.message}`);
+      throw new ServiceUnavailableException('webhook inbox unavailable');
     }
-    this.seen.add(key);
+    // И вставка, и дубликат: прошлая доставка могла не состояться, подтолкнуть
+    // pump безвредно. Не ждём результата.
+    this.delivery.kick();
+    return { ok: true };
   }
 
   private toDataMessage(body: AttendeeHook): Record<string, unknown> | null {

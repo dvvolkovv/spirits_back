@@ -539,6 +539,8 @@ maybe('synthetic deletion lifecycle — полная цепочка против
 
     await migration('chat/action-plans/migrations/001_action_plans.sql');
     await migration('chat/chat-uploads/migrations/001_chat_uploads.sql');
+    // 002: execute chat-upload.purge читает thumb_key (миниатюры загрузок).
+    await migration('chat/chat-uploads/migrations/002_chat_uploads_media_notes.sql');
     await migration('custom-agents/migrations/001_custom_agents.sql');
     await migration('custom-agents/migrations/002_owner_user_id_to_text.sql');
     await migration('video/migrations/001_video_jobs.sql');
@@ -558,6 +560,7 @@ maybe('synthetic deletion lifecycle — полная цепочка против
     await migration('meeting/migrations/003_drop_room_name_unique.sql');
     await migration('meeting/migrations/004_meet_bot.sql');
     await migration('meeting/migrations/005_zoom_url.sql');
+    await migration('meeting/migrations/006_meeting_webhook_events.sql');
     await migration('voice-call/migrations/002_job_tokens.sql');
     await migration('voice-call/migrations/003_call_tokens.sql');
     await migration('voice-call/migrations/003_voice_call_origin.sql');
@@ -790,6 +793,15 @@ maybe('synthetic deletion lifecycle — полная цепочка против
     stack.registry.assertReady();
 
     fixture = await seedSyntheticFixture(stack);
+
+    await pool.query(
+      `INSERT INTO meeting_webhook_events (call_id, idempotency_key, trigger, message)
+       SELECT id,
+              'synthetic-inbox-' || user_id,
+              'bot.state_change',
+              '{"v":1,"type":"meet_bot_state","state":"joined","fatal":false}'::jsonb
+         FROM voice_calls`,
+    );
   });
 
   afterAll(async () => {
@@ -897,6 +909,13 @@ maybe('synthetic deletion lifecycle — полная цепочка против
     expect(await unfinishedJobs(second.deletionId)).toHaveLength(0);
     expect(await externalIdsPresent(fixture.mainUserId)).toBe(false);
     expect(await sharedResources(fixture.otherUserId)).toEqual(fixture.allSharedResources);
+    const inboxOwners = await rows(
+      `SELECT idempotency_key FROM meeting_webhook_events
+        WHERE idempotency_key LIKE 'synthetic-inbox-%' ORDER BY idempotency_key`,
+    );
+    expect(inboxOwners).toEqual([
+      { idempotency_key: `synthetic-inbox-${fixture.otherUserId}` },
+    ]);
 
     // T22-Q3: recapture второго поколения — прямой assert, а не комментарий.
     // chat-file.purge gen2 обязан существовать (посев строки с файлом перед

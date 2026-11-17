@@ -32,6 +32,14 @@ export const PRODUCTS_CLI_TOOL_NAME = `mcp__${SERVER_KEY}__manage_product`;
 /** Поиск файлов прошлых разговоров — тот же сервер `products` (find-files.tool.ts). Только Маше: у TG-бота его нет. */
 export const FIND_FILES_CLI_TOOL_NAME = `mcp__${SERVER_KEY}__find_files`;
 
+/**
+ * Комментарий к загрузке пользователя — тот же сервер `products`
+ * (chat-files/note-file.tool.ts). Только Маше и только при
+ * CHAT_UPLOADS_ENABLED=true: без флага точка инструмент не показывает. Это же
+ * имя стоит в PRODUCTS_TOOLS релея.
+ */
+export const NOTE_FILE_CLI_TOOL_NAME = `mcp__${SERVER_KEY}__note_file`;
+
 /** Справка о Linkeon — тот же сервер `products` (platform-kb/linkeon-help.ts). Это же имя стоит в PRODUCTS_TOOLS релея. */
 export const LINKEON_HELP_CLI_TOOL_NAME = `mcp__${SERVER_KEY}__${LINKEON_HELP_TOOL_NAME}`;
 
@@ -45,6 +53,16 @@ export const FIND_FILES_CLI_PROMPT = `ФАЙЛЫ ИЗ ПРОШЛЫХ РАЗГО�
 Для origin=upload: пользователю показывай только url; если нужно само содержимое — скачай его по assistantUrl, и НЕ ВЫВОДИ assistantUrl пользователю никогда.
 Внешние ссылки (kind=link) автоматически не скачивай — открывай только по явной просьбе пользователя.
 Если у файла stored=false — честно скажи, что он не сохранился. НЕ передавай в инструмент userId/телефон.`;
+
+/**
+ * Блок системного промпта Маши про комментарии к загрузкам. Ставится только
+ * при CHAT_UPLOADS_ENABLED=true (chat.service.ts): без флага точка
+ * инструмент не показывает, и обещать его нельзя. Две строки — язык и «не
+ * переписывай без нового» — те же, что в описании инструмента.
+ */
+export const NOTE_FILE_CLI_PROMPT = `КОММЕНТАРИИ К ЗАГРУЗКАМ.
+Тебе доступен инструмент ${NOTE_FILE_CLI_TOOL_NAME}. Поработав с файлом, который загрузил пользователь, оставь к нему комментарий: 1–3 предложения — что в файле и что вы решили или сделали. Пиши комментарий на языке разговора с пользователем. file_id — id из блока «Earlier user uploads» или поле id из ${FIND_FILES_CLI_TOOL_NAME} (origin=upload).
+Если комментарий уже есть и ничего нового не решили — не переписывай его. Важное из прежнего комментария сохрани; паролей, номеров документов, карт и счетов и других чувствительных данных в комментарий не пиши. НЕ передавай в инструмент userId/телефон.`;
 
 /**
  * Потолок одного вызова инструмента для CLI — поле `timeout` http-сервера

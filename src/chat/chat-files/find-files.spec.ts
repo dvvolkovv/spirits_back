@@ -1,5 +1,5 @@
 import {
-  FIND_FILES_DEFAULT_LIMIT, assistantPart, extractHumanLinks, kindByMime, normalizeForSearch, parseFindFilesInput, plainNote, queryWords, scoreFile, trimUrlTail,
+  FIND_FILES_DEFAULT_LIMIT, assistantPart, extractHumanLinks, kindByMime, normalizeForSearch, parseFindFilesInput, plainNote, queryWords, scoreFile, scoreUpload, trimUrlTail,
 } from './find-files';
 
 describe('parseFindFilesInput', () => {
@@ -105,5 +105,24 @@ describe('trimUrlTail и cap — защита от квадратичной бо
     expect(extractHumanLinks(`смотри ${long} здесь`)[0].url).toBe(long);
     expect(extractHumanLinks('https://ru.wikipedia.org/wiki/Файл_(формат)?oldid=123456#Ссылки')[0].url)
       .toBe('https://ru.wikipedia.org/wiki/Файл_(формат)?oldid=123456#Ссылки');
+  });
+});
+
+describe('scoreUpload — очки загрузки пользователя', () => {
+  it('3 за слово в имени, 2 — за слово в комментарии ассистента', () => {
+    expect(scoreUpload(['диван'], 'диван.jpg', '')).toBe(3);
+    expect(scoreUpload(['диван'], 'IMG_2041.jpg', 'Фото гостиной: серый диван у окна')).toBe(2);
+    expect(scoreUpload(['диван', 'гостиной'], 'IMG_2041.jpg', 'Фото гостиной: серый диван у окна')).toBe(4);
+    expect(scoreUpload(['диван'], 'Диван.jpg', 'серый ДИВАН')).toBe(5);
+    expect(scoreUpload(['отчет'], 'photo.jpg', 'про погоду')).toBe(0);
+  });
+
+  it('ё и регистр в комментарии не мешают', () => {
+    expect(scoreUpload(['отчет'], 'scan.pdf', 'Квартальный ОТЧЁТ')).toBe(2);
+  });
+
+  it('комментарий весит больше текста ответа, веса файлов ассистента прежние', () => {
+    expect(scoreUpload(['договор'], 'scan.pdf', 'черновик договора')).toBe(2);
+    expect(scoreFile(['договор'], 'scan.pdf', 'черновик договора')).toBe(1);
   });
 });

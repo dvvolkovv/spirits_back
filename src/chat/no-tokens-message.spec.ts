@@ -82,10 +82,16 @@ describe('noTokensMessage — магазинная сборка', () => {
 
 /** Сторож: обе точки шлагбаума — через одну функцию, без своей копии текста. */
 describe('шлагбаум нуля без копий текста', () => {
+  // Сначала строки, целиком состоящие из //-комментария, потом блочные
+  // комментарии. В обратном порядке «/*» внутри //-строки (например,
+  // «/webhook/<uuid>/agent/avatar/*» в chat.controller.ts) открывал «блок»,
+  // который закрывался «*/» ближайшего JSDoc ниже, — и регулярка молча
+  // съедала живой код между ними, вместе с вызовом noTokensReply(.
+  // Хвостовые // в строках кода не трогаем: там бывают URL.
   const live = (file: string) =>
     fs.readFileSync(path.join(__dirname, file), 'utf8')
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .split('\n').filter((l) => !/^\s*\/\//.test(l)).join('\n');
+      .split('\n').filter((l) => !l.trim().startsWith('//')).join('\n')
+      .replace(/\/\*[\s\S]*?\*\//g, '');
 
   it.each([['chat.service.ts'], ['chat.controller.ts']])('%s не держит старый текст', (file) => {
     expect(live(file)).not.toContain('Недостаточно токенов');
