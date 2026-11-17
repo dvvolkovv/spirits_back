@@ -262,6 +262,21 @@ describe('Neo4jService — логи без internal_id', () => {
     expect(logs().filter((m) => m.includes('u-k1'))).toEqual([]);
   });
 
+  // Ревью K1b: правило проекта с 02.11 (cb92f71f) — в журналах только вид,
+  // статус и размеры. Сырой ответ модели несёт интересы и убеждения человека.
+  it('нераспознанный ответ модели: в логе длина, а не сырой текст', async () => {
+    const raw = 'not-json SECRET_BELIEF_CANARY';
+    const { svc } = makeService({ cliAnswer: raw, states: ['active'] });
+    const logs = spyLogs(svc);
+
+    await svc.consolidateFromChat('u-k1', '12', 'я люблю шахматы', 'отлично', '');
+
+    const parse = logs().filter((m) => /failed to parse JSON/.test(m));
+    expect(parse).toHaveLength(1);
+    expect(parse[0]).toContain(String(raw.length));
+    expect(logs().filter((m) => m.includes('SECRET_BELIEF_CANARY') || m.includes('not-json'))).toEqual([]);
+  });
+
   it('эмбеддинг и замена сущностей: логи без идентификатора', async () => {
     process.env.OPENAI_API_KEY = 'test-openai-key';
     jest.spyOn(axios, 'post').mockResolvedValue({ data: { data: [{ embedding: [0.1, 0.2, 0.3] }] } });
