@@ -259,19 +259,34 @@ export class ContactsService {
   ): Promise<ContactRequest | null> {
     const targetId = await this.idByPhone(targetPhone);
     if (!targetId) return null;
+    // K6: одобрение раскрывает телефон отправителя, поэтому одобрить можно
+    // только заявку АКТИВНОГО аккаунта. Гейт — в самом UPDATE (EXISTS по
+    // user_id отправителя), без отдельной проверки до него: заявка
+    // удалённого (contacts.stop ещё не прошёл или его не было) или
+    // заблокированного не одобряется, и живой партнёр получает тот же null
+    // (404 not_found_or_not_pending), что и на обработанную заявку.
+    // Отклонение телефона не раскрывает и разрешено для любого отправителя.
     const r = await this.pg.query(
       `UPDATE contact_requests
        SET status = $1, resolved_at = now()
        WHERE id = $2 AND target_id = $3 AND status = 'pending'
+         AND (NOT $4::boolean OR EXISTS (
+           SELECT 1 FROM ai_profiles_consolidated ap
+             JOIN user_id u ON u.internal_id = ap.user_id
+            WHERE ap.id = contact_requests.requester_id AND u.state = 'active'))
        RETURNING *`,
-      [decision, requestId, targetId],
+      [decision, requestId, targetId, decision === 'approved'],
     );
     if (!r.rows[0]) return null;
     const row = r.rows[0];
-    // Если approved — вытаскиваем phone requester'а для возврата.
+    // Если approved — вытаскиваем phone requester'а для возврата. Тот же
+    // active-гейт: отправителя могли удалить между UPDATE и этим чтением —
+    // тогда телефон не выдаётся (null), а не уходит живому партнёру.
     if (row.status === 'approved') {
       const rr = await this.pg.query(
-        `SELECT user_id FROM ai_profiles_consolidated WHERE id = $1`,
+        `SELECT ap.user_id FROM ai_profiles_consolidated ap
+           JOIN user_id u ON u.internal_id = ap.user_id
+          WHERE ap.id = $1 AND u.state = 'active'`,
         [row.requester_id],
       );
       row.requester_phone = rr.rows[0]?.user_id ?? null;
