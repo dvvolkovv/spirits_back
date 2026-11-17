@@ -6,7 +6,8 @@ import { chatSessionId } from './session-id';
 
 /**
  * Панель «Медиа и файлы» в чате с ассистентом. Переписка — только своя:
- * userId из JWT, а не из запроса.
+ * userId из JWT, а не из запроса. Лента одна (spec 2026-11-17-context-reset):
+ * freshTs старых клиентов не читаем — «Чистый лист» файлы не прячет.
  */
 @Controller('chat/files')
 export class ChatFilesController {
@@ -17,10 +18,9 @@ export class ChatFilesController {
   async list(
     @CurrentUser() user: any,
     @Query('assistantId') assistantId?: string,
-    @Query('freshTs') freshTs?: string,
   ) {
     if (!assistantId) throw new BadRequestException('assistantId обязателен');
-    const sessionId = chatSessionId(user.userId, String(assistantId), freshTs);
+    const sessionId = chatSessionId(user.userId, String(assistantId));
     return { items: await this.files.listForSession(user.userId, sessionId) };
   }
 }

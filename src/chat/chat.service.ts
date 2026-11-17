@@ -3801,8 +3801,10 @@ ${LanguageService.buildDirective(userLanguage)}`;
     return textCost;
   }
 
-  async getChatHistory(userId: string, assistantId: string, limit = 30, offset = 0, sessionIdOverride?: string): Promise<{ messages: any[]; hasMore: boolean }> {
-    const sessionId = sessionIdOverride || `${userId}_${assistantId}`;
+  // Лента одна (spec 2026-11-17-context-reset): история — всегда основной
+  // сессии; отдельные fresh-ленты остались только у пингов мониторинга.
+  async getChatHistory(userId: string, assistantId: string, limit = 30, offset = 0): Promise<{ messages: any[]; hasMore: boolean }> {
+    const sessionId = `${userId}_${assistantId}`;
     const res = await this.pg.query(
       `SELECT id, sender_type, content, created_at, tokens_used FROM custom_chat_history
        WHERE session_id = $1

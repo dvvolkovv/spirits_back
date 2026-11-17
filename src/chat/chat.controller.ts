@@ -62,7 +62,7 @@ function chatUploadsSaveBudgetMs(): number {
  * чат: id штатного ассистента числом или пользовательский `custom:<uuid>`
  * (AssistantSelection.tsx, ChatService.resolveAgent). Иное — не та пара.
  */
-const RESET_ASSISTANT_RE = /^(\d{1,12}|custom:[0-9a-f-]{36})$/i;
+const RESET_ASSISTANT_RE = /^(\d{1,12}|custom:[0-9a-fA-F-]{36})$/;
 
 /**
  * Предупреждение об отвергнутой метке старого клиента — не чаще раза в час на
