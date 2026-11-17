@@ -394,12 +394,17 @@ export class VoiceCallService implements OnModuleInit {
     // Участники — отдельным запросом и не под условием на транскрипт: люди
     // входят и тогда, когда никто не говорит. Список у воркера только растёт,
     // поэтому пишем, пока он не короче сохранённого.
+    //
+    // K1b: оба UPDATE gated на живой аккаунт. После voice.stop звонок в
+    // 'interrupted', и status <> 'completed' его пропускал — воркер продолжал
+    // дописывать разговор удалённого. Гейт — по voice_calls.user_id, как в complete().
     const people = cleanParticipants(participants);
     if (people.length) {
       await this.pg.query(
         `UPDATE voice_calls SET participants = $2::jsonb
            WHERE id = $1 AND status <> 'completed'
-             AND jsonb_array_length(COALESCE(participants, '[]'::jsonb)) <= $3`,
+             AND jsonb_array_length(COALESCE(participants, '[]'::jsonb)) <= $3
+             AND EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = voice_calls.user_id AND u.state = 'active')`,
         [callId, JSON.stringify(people), people.length],
       );
     }
@@ -407,7 +412,8 @@ export class VoiceCallService implements OnModuleInit {
     await this.pg.query(
       `UPDATE voice_calls SET transcript = $2::jsonb
          WHERE id = $1 AND status <> 'completed'
-           AND jsonb_array_length(COALESCE(transcript, '[]'::jsonb)) < $3`,
+           AND jsonb_array_length(COALESCE(transcript, '[]'::jsonb)) < $3
+           AND EXISTS (SELECT 1 FROM user_id u WHERE u.internal_id = voice_calls.user_id AND u.state = 'active')`,
       [callId, JSON.stringify(transcript), transcript.length],
     );
   }
@@ -538,9 +544,10 @@ export class VoiceCallService implements OnModuleInit {
     // Список из progress плюс финальный: complete мог прийти и без полного.
     const participants = mergeParticipants(cleanParticipants(call.participants), cleanParticipants(payload.participants));
 
-    // K1: gated на живой аккаунт (UPDATE … AND EXISTS). Звонок удалённого
-    // аккаунта (complete после voice.stop) не перезаписывает транскрипт и
-    // участников. Параметры не сдвинуты — гейт ссылается на voice_calls.user_id.
+    // K1: gated на живой аккаунт (UPDATE … AND EXISTS). Финальный complete
+    // звонка удалённого аккаунта (после voice.stop) не перезаписывает
+    // транскрипт и участников; промежуточные сбросы закрывает тот же гейт в
+    // progress(). Параметры не сдвинуты — гейт ссылается на voice_calls.user_id.
     const saved = await this.pg.query(
       `UPDATE voice_calls SET status = 'completed', ended_at = now(), duration_sec = $1,
          transcript = $2, cost_usd = $3, model = $4, tokens_charged = $5,
