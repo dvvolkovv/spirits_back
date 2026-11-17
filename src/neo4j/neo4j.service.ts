@@ -641,7 +641,10 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
    * '{}', и automaticProfilingAllowed такой профиль пропускает — без проверки
    * ход, начатый до удаления, заново создавал бы граф. Ошибка запроса уходит в
    * catch вызывающего — записи нет.
-   * Остаточное окно: удаление между этим SELECT и Cypher-записью — Postgres и Neo4j одной транзакцией не связать.
+   * Остаточное окно: проверка стоит на группу записей, а не на каждый Cypher. Для сущностей
+   * это N последовательных session.run в updateProfileEntities (по одному на значение), и
+   * удаление может прийти между SELECT и любым из них; счётчик, эмбеддинг и merge компакции —
+   * по одному обращению. Postgres и Neo4j одной транзакцией не связать.
    */
   private async isAccountActive(pg: PgService, userId: string): Promise<boolean> {
     const res = await pg.query(
