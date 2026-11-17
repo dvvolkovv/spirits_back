@@ -1537,6 +1537,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
     // загрузок: без флага точка продуктов инструмент не показывает, а блок про
     // него в промпте обещал бы то, чего нет.
     const uploadNotesOn = process.env.CHAT_UPLOADS_ENABLED === 'true';
+    // Память загрузок — тот же блок, что получают ассистенты релея
+    // (uploadContextBlock): id, имя, вид, дата, комментарий и подписанная
+    // ссылка. Ключ — сырой ключ сессии Postgres этого хода (chatSessionId:
+    // `<userId>_3` или fresh-сессия «Чистого листа»). Пинги мониторинга блок
+    // не везут — как на пути релея. Флаг, отсутствие реестра и сбой БД
+    // разбирает сам uploadContextBlock: во всех трёх случаях пустая строка.
+    const mashaUploadContext = probe ? '' : await this.uploadContextBlock(userId, chatSessionId);
 
     // Ход в полёте — тот же учёт, что у пути релея: deploy.sh перед рестартом
     // ждёт /chat/active-streams до нуля, фронт спрашивает /chat/active-turn.
@@ -1578,9 +1585,13 @@ ${LanguageService.buildDirective(userLanguage)}`;
           // replyLanguageTail выше), а блок написан по-русски.
           // Правило карточек — только клиенту, который их рисует; до хвоста
           // языка, который обязан остаться последним.
+          // Блок загрузок — после волатильной части (подписи чеканятся каждый
+          // ход; стабильный префикс и его кэш они не трогают) и до хвоста
+          // языка, который обязан остаться последней строкой.
           system: stableSystemPrompt + `\n\n${products.promptBlock}\n\n${FIND_FILES_CLI_PROMPT}` +
             (uploadNotesOn ? `\n\n${NOTE_FILE_CLI_PROMPT}` : '') +
-            (ui.ask ? `\n\n${ASK_RULE}` : '') + dispatchVolatileSystemPrompt + replyLanguageTail,
+            (ui.ask ? `\n\n${ASK_RULE}` : '') + dispatchVolatileSystemPrompt +
+            (mashaUploadContext ? `\n\n${mashaUploadContext}` : '') + replyLanguageTail,
           // Модель Маши — общая с остальным чатом, см. common/chat-model.ts
           // (там же цена решения: пин не даунгрейдится при исчерпании лимита, и
           // как откатиться через env без выката). Биллинг юзеру идёт от costUsd.

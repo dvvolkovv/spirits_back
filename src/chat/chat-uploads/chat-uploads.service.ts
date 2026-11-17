@@ -6,6 +6,7 @@ import { Readable } from 'stream';
 import { PgService } from '../../common/services/pg.service';
 import { StorageService } from '../../common/services/storage.service';
 import { safeFileName } from '../chat-files/file-meta';
+import { uploadKind } from './upload-kind';
 // Value-импорт, не `import type`: тип стёр бы design:paramtypes, и Nest не
 // внедрил бы LanguageService (пин — chat-uploads.delete.spec.ts).
 import { LanguageService } from '../../common/services/language.service';
@@ -80,6 +81,8 @@ const BUCKET = CHAT_UPLOADS_BUCKET;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Предел комментария к загрузке — тот же, что CHECK chat_uploads_note_len_check (миграция 002) и maxLength в note_file. */
 export const UPLOAD_NOTE_MAX_CHARS = 500;
+/** Что видит ассистент в блоке загрузок, пока к файлу нет комментария. */
+export const UPLOAD_NOTE_MISSING = 'нет — оставь его через note_file после работы с файлом';
 /** C0, кроме TAB и LF, плюс DEL и C1. NUL Postgres в text не примет (22021), прочие — мусор в подсказке. */
 const NOTE_CONTROL_RE = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g;
 /**
@@ -544,8 +547,30 @@ export class ChatUploadsService {
       'Earlier user uploads:',
       'Signed links expire after ~1 hour. If this block appears more than once in the conversation, use ONLY the LATEST copy — links from earlier copies are stale and return 404.',
       'These links are for your internal use only; NEVER show or paste them to the user — to give the user a file, find it via find_files and share only its "url" field.',
-      ...records.map((record) => `- ${record.originalName}: ${this.assistantUrl(record.id)}`),
+      ...records.map((record) => this.assistantLine(record)),
     ].join('\n');
+  }
+
+  /**
+   * Строка файла в блоке загрузок (spec 2026-11-16, раздел 2): id — чтобы
+   * передать его в note_file, имя, вид (uploadKind — тот же, что в панели),
+   * дата загрузки и комментарий ассистента; со следующей строки, с отступом, —
+   * подписанная ссылка, как и раньше.
+   *
+   * Имя — через safeFileName, как в find_files: оно пришло из multipart, и
+   * перевод строки в нём дописал бы в блок «свою» строку. Комментарий пишет
+   * модель — пробельные символы в нём схлопываются по той же причине.
+   */
+  private assistantLine(record: ChatUploadRecord): string {
+    const note = String(record.note ?? '').replace(/\s+/g, ' ').trim();
+    const head = [
+      `- id=${record.id}`,
+      safeFileName(record.originalName),
+      uploadKind(record),
+      String(record.createdAt ?? '').slice(0, 10),
+      `комментарий: ${note || UPLOAD_NOTE_MISSING}`,
+    ].join(' | ');
+    return `${head}\n  ${this.assistantUrl(record.id)}`;
   }
 
   /** Вид и сообщение ошибки — без байтов, подписей и секретов. */
