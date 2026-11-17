@@ -2,8 +2,9 @@
 -- Одна строка на пару «пользователь + ассистент»: значение имеет только последняя точка.
 DO $$
 BEGIN
-  PERFORM pg_advisory_xact_lock(hashtext('chat-context-resets/001'));
+  -- lock_timeout — до advisory-блокировки: он ограничивает и её ожидание.
   PERFORM set_config('lock_timeout', '5s', true);
+  PERFORM pg_advisory_xact_lock(hashtext('chat-context-resets/001'));
   CREATE TABLE IF NOT EXISTS chat_context_resets (
     user_id text NOT NULL,
     assistant_id text NOT NULL,

@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PgService } from '../../common/services/pg.service';
+import { LEGACY_FRESH_FUTURE_SLACK_MS } from './after-reset';
 
 /**
  * Точка «Чистого листа» на пару «пользователь + ассистент»
@@ -27,7 +28,8 @@ export class ChatContextResetService {
     await this.pg.query(fs.readFileSync(migrationPath, 'utf8'));
   }
 
-  async get(userId: string, assistantId: string): Promise<Date | null> {
+  // assistantId — строкой из query или числом из JSON-тела: в базе всегда текст.
+  async get(userId: string, assistantId: string | number): Promise<Date | null> {
     const { rows } = await this.pg.query(
       'SELECT reset_at FROM chat_context_resets WHERE user_id = $1 AND assistant_id = $2',
       [userId, String(assistantId)],
@@ -40,8 +42,19 @@ export class ChatContextResetService {
    * created_at сообщений) и возвращает действующую. Точка только движется
    * вперёд: два нажатия в разных вкладках или запоздалая метка старого клиента
    * не возвращают ассистенту забытое.
+   *
+   * Явное время из будущего дальше окна или Invalid Date — ошибка, а не запись:
+   * из-за GREATEST точка из будущего вечна и стёрла бы ассистенту память
+   * навсегда, а Invalid Date иначе всплыл бы невнятной ошибкой Postgres.
+   * Не обрезаем до now — почему, см. LEGACY_FRESH_FUTURE_SLACK_MS.
    */
-  async reset(userId: string, assistantId: string, at?: Date): Promise<Date> {
+  async reset(userId: string, assistantId: string | number, at?: Date): Promise<Date> {
+    if (at !== undefined && at !== null) {
+      const t = at.getTime();
+      if (!Number.isFinite(t) || t > Date.now() + LEGACY_FRESH_FUTURE_SLACK_MS) {
+        throw new Error('invalid context reset time');
+      }
+    }
     const { rows } = await this.pg.query(
       `INSERT INTO chat_context_resets (user_id, assistant_id, reset_at)
        VALUES ($1, $2, COALESCE($3::timestamptz, now()))
