@@ -79,8 +79,13 @@ export class AccountDeletionCoordinator implements OnApplicationBootstrap {
           : null;
       } while (after);
     } finally {
-      this.logger.log(safeDeletionTickMessage({ ...totals, durationMs: Date.now() - startedAt }));
-      await lock.release();
+      // Снятие lock не зависит от журнала: бросивший logger иначе оставил бы
+      // advisory lock на соединении, и тики молча пропускались бы до рестарта.
+      try {
+        this.logger.log(safeDeletionTickMessage({ ...totals, durationMs: Date.now() - startedAt }));
+      } finally {
+        await lock.release();
+      }
     }
   }
 }
