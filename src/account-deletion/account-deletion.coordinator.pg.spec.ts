@@ -310,6 +310,34 @@ describe('account deletion worker activation (owner gate D)', () => {
     expect(await job(pending)).toMatchObject({ status: 'done', attempts: 1, leaseUntil: null });
   });
 
+  it('tick() без аргументов (как зовёт cron) держит 30-дневный срок: удалённый минуту назад не тронут, 31 день назад — исполнен', async () => {
+    const fresh = account('u-fresh-deleted', new Date(Date.now() - 60_000));
+    const old = account('u-old-deleted', new Date(Date.now() - 31 * 24 * 60 * 60 * 1000));
+    await insertDeleted(fresh);
+    await insertDeleted(old);
+    const freshJob = await insertJob(fresh, 'routine.stop', 'routine-fresh');
+    const oldJob = await insertJob(old, 'routine.stop', 'routine-old');
+    const { coordinator, planner, executions } = compose({
+      'routine.stop': async () => undefined,
+    });
+
+    await coordinator.tick();
+
+    expect(planner.collect).toHaveBeenCalledTimes(1);
+    expect((planner.collect as unknown as jest.Mock).mock.calls[0][1])
+      .toMatchObject({ userId: old.userId, deletionId: old.deletionId });
+    expect(planner.persist).toHaveBeenCalledTimes(1);
+    expect((planner.persist as unknown as jest.Mock).mock.calls[0][1].userId).toBe(old.userId);
+    expect(executions).toEqual(['routine.stop:routine-old']);
+    expect(await job(oldJob)).toMatchObject({ status: 'done', attempts: 1 });
+    expect(await job(freshJob)).toMatchObject({ status: 'pending', attempts: 0 });
+    const freshJobs = await pool.query(
+      'SELECT count(*)::int AS n FROM account_deletion_jobs WHERE deletion_id=$1',
+      [fresh.deletionId],
+    );
+    expect(freshJobs.rows[0].n).toBe(1);
+  });
+
   it('core ждёт stop даже при более раннем next_attempt_at; нулевое число stop не блокирует', async () => {
     const withStop = account('u-dependencies');
     await insertDeleted(withStop);
