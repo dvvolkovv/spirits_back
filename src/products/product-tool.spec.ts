@@ -1,4 +1,5 @@
 import { Pool } from 'pg';
+import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { MIGRATIONS } from './products.service';
@@ -79,6 +80,13 @@ maybe('инструмент продуктов против живого Postgre
     for (const f of MIGRATIONS) {
       await pool.query(fs.readFileSync(path.join(__dirname, 'migrations', f), 'utf8'));
     }
+    // Account-deletion guard в TurnsService (22ef565e): пустая таблица сохраняет прежнее active-поведение.
+    await pool.query(`CREATE TABLE IF NOT EXISTS user_id (
+      internal_id text PRIMARY KEY,
+      state text,
+      deleted_at timestamptz,
+      deletion_id uuid
+    )`);
     // Гард на чужую базу: beforeEach делает TRUNCATE и адрес не разбирает, а на
     // той же ноде живёт база стенда test.linkeon.io с теми же таблицами.
     const n = await pool.query('SELECT count(*) FROM products');
@@ -452,6 +460,36 @@ maybe('инструмент продуктов против живого Postgre
       expect(out.ok).toBe(false);
       expect(out.reason).toBe('no_tokens');
       expect(out.canTopUp).toBe(true);
+    });
+
+    // 22ef565e: TurnsService.enqueue не ставит ход продукту владельца со
+    // state='deleted' — для него продукт «не найден». Та же строка с 'active'
+    // правку пропускает: отказ даёт именно состояние удаления.
+    it('владелец удалён (state=deleted) — отказ правки, ход не ставится', async () => {
+      await mkProduct({ name: 'Магазин цветов', slug: 'flowers' });
+      await pool.query(
+        `INSERT INTO user_id (internal_id, state, deleted_at, deletion_id)
+         VALUES ($1, 'deleted', now(), $2)`,
+        [OWNER, randomUUID()],
+      );
+      try {
+        const svc = new ProductToolService(pg as any, realTurns(), {} as any);
+        (svc as any).waitMs = 0;
+        const out: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: 'правка' });
+        expect(out.ok).toBe(false);
+        expect(out.reason).toBe('not_found');
+        expect(out.turnId).toBeUndefined();
+        const n = await pool.query('SELECT count(*) FROM product_turns');
+        expect(Number(n.rows[0].count)).toBe(0);
+
+        await pool.query(`UPDATE user_id SET state = 'active' WHERE internal_id = $1`, [OWNER]);
+        const ok: any = await svc.execute(OWNER, { action: 'edit', product: 'цветов', prompt: 'правка' });
+        expect(ok.turnId).toBeTruthy();
+        const m = await pool.query('SELECT count(*) FROM product_turns');
+        expect(Number(m.rows[0].count)).toBe(1);
+      } finally {
+        await pool.query('DELETE FROM user_id WHERE internal_id = $1', [OWNER]);
+      }
     });
 
     it('агент уже занят — отказ, второй ход не ставится', async () => {
